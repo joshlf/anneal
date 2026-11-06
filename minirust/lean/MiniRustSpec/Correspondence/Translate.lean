@@ -510,6 +510,27 @@ def tupleTypeOf (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst
       | _ => none
     | _ => none
 
+/-- The metadata kind of a raw pointer to `pointee`, as `minimize` computes it
+from the pointee's layout (`pointee_info_of(..).layout.meta_kind()`): no
+metadata for the sized scalar pointees integers and `bool`, and an element
+count for slices and `str`. Other pointees are outside the translation. -/
+def rawPtrMetaKind : MirAst.RigidTy → Option Gen.PointerMetaKind
+  | .int _ | .uint _ | .bool => some .None
+  | .slice _ | .str => some .ElementCount
+  | _ => none
+
+/-- `minimize`'s translation of raw pointer types `*const T` and `*mut T`
+(`tooling/minimize/src/ty.rs`), which records only the pointee's metadata
+kind (`rawPtrMetaKind`):
+> "rs::TyKind::RawPtr(ty, _mutbl) => {
+>     let pointee = self.pointee_info_of(*ty, span);
+>     Type::Ptr(PtrType::Raw { meta_kind: pointee.layout.meta_kind() })
+> }" -/
+def rawPtrTypeOf (t : MirAst.Ty) : Option Gen.Type :=
+  match t.kind with
+  | .rawPtr _ pointee => (rawPtrMetaKind pointee).map (fun k => .Ptr (.Raw k))
+  | _ => none
+
 /-- `minimize`'s type translation across the fragment (`tooling/minimize/src/ty.rs`):
 > "rs::TyKind::Bool => Type::Bool,
 >  rs::TyKind::Int(t) => {
@@ -547,7 +568,23 @@ def translateTy (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst
       match tupleTypeOf layouts t with
       | some (fields, size, align) =>
         some ((TupleSpec.tuple fields size align).toMiniRustTy)
-      | none => none
+      | none => rawPtrTypeOf t
+
+/-- The pointee integer type of a thin raw pointer type `*const T` or `*mut T`
+whose pointee `T` is an integer type, with the pointer's mutability. The
+correspondence fragment admits raw pointers only to integer pointees (see
+`ptrDeclOk`). -/
+def ptrPointeeOf (t : MirAst.Ty) : Option (MirAst.Mutability × Gen.IntType) :=
+  match t.kind with
+  | .rawPtr mutbl pointee => (intTyBytes pointee).map (fun (s, n) => (mutbl, ⟨s, ⟨n⟩⟩))
+  | _ => none
+
+/-- Whether a MIR type is a thin raw pointer to an integer (`ptrPointeeOf`). -/
+def isPtrTy (t : MirAst.Ty) : Bool := (ptrPointeeOf t).isSome
+
+/-- The MiniRust type of a thin raw pointer: `rawPtrTypeOf` of a pointer to a
+sized pointee, `Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })`. -/
+def thinRawPtrTy : Gen.Type := .Ptr (.Raw .None)
 
 /-- `minimize`'s `int_from_bits(bits, int_ty)`: interpret a `u128` bit pattern as
 the mathematical integer it encodes at type `int_ty` (two's complement for
@@ -557,6 +594,15 @@ def intFromBits (bits : Nat) (it : Gen.IntType) : Int :=
   | .Unsigned => bits
   | .Signed =>
     if bits < 2 ^ (8 * it.size.bytes - 1) then bits else (bits : Int) - 2 ^ (8 * it.size.bytes)
+
+/-- The translation of the pointee type of a raw pointer type, the type at
+which `minimize` dereferences it (`translate_ty_smir(this_ty, ..)` in
+`translatePlace`): integers and `bool`. -/
+def derefPointeeTy (t : MirAst.Ty) : Option Gen.Type :=
+  match t.kind with
+  | .rawPtr _ .bool => some .Bool
+  | .rawPtr _ pointee => (intTyBytes pointee).map (fun (s, n) => .Int ⟨s, ⟨n⟩⟩)
+  | _ => none
 
 /-- Left-to-right fold translating a chain of `ProjectionElem.field` projections
 into nested `PlaceExpr.Field` expressions (`tooling/minimize/src/rvalue.rs`):
@@ -570,8 +616,8 @@ def translateFieldPlace (root : Gen.PlaceExpr) :
   | .field idx _ :: rest => translateFieldPlace (.Field root (idx : Int)) rest
   | _ => none
 
-/-- `minimize`'s place translation for locals, field projections, and array
-indexing (`tooling/minimize/src/rvalue.rs`):
+/-- `minimize`'s place translation for locals, field projections, array
+indexing, and dereferences of raw pointers (`tooling/minimize/src/rvalue.rs`):
 > "let expr = PlaceExpr::Local(self.local_name_map[&place.local.into()]);
 >  let place_ty = self.locals_smir[place.local].ty;
 >  // Fold over all projections
@@ -583,7 +629,15 @@ indexing (`tooling/minimize/src/rvalue.rs`):
 >                  let indirected = GcCow::new(expr);
 >                  PlaceExpr::Field { root: indirected, field: (*f).into() }
 >              }
->              ..
+>              smir::ProjectionElem::Deref => {
+>                  let x = GcCow::new(expr);
+>                  let x = ValueExpr::Load { source: x };
+>                  let x = GcCow::new(x);
+>
+>                  let ty = self.translate_ty_smir(this_ty, span);
+>
+>                  PlaceExpr::Deref { operand: x, ty }
+>              }
 >              smir::ProjectionElem::Index(loc) => {
 >                  let i = PlaceExpr::Local(self.local_name_map[&(*loc).into()]);
 >                  let i = GcCow::new(i);
@@ -603,9 +657,15 @@ here is an extension rather than a transcription: for
 `ConstantIndex { offset, min_length, from_end }` on a fixed-size array
 `[T; count]`, the index that MIR defines for the projection (`count - offset`
 when `from_end` is true, or `offset` when `from_end` is false) becomes a
-`usize` constant index expression of `PlaceExpr::Index`. -/
+`usize` constant index expression of `PlaceExpr::Index`. A dereference
+`*_j` of a raw pointer local loads the pointer and dereferences it at the
+translation of the pointee type `this_ty` (`derefPointeeTy`). -/
 def translatePlace (decls : List MirAst.LocalDecl := []) : MirAst.Place → Option Gen.PlaceExpr
   | ⟨i, []⟩ => some (.Local (localName i))
+  | ⟨i, [.deref]⟩ => do
+    let d ← decls[i]?
+    let ty ← derefPointeeTy d.ty
+    some (.Deref (.Load (.Local (localName i))) ty)
   | ⟨i, [.index idxLocal]⟩ =>
     some (.Index (.Local (localName i)) (.Load (.Local (localName idxLocal))))
   | ⟨i, [.constantIndex offset minLen fromEnd]⟩ =>
@@ -936,6 +996,41 @@ def translateCheckedBinOp : MirAst.BinOp → Option Gen.IntBinOpWithOverflow
   | .mulWithOverflow => some .Mul
   | _ => none
 
+/-- The pointee integer type (and the mutability) of a raw pointer operand
+`copy _j` or `move _j`, from the declaration of `_j` (`ptrPointeeOf`). -/
+def operandPtrPointee (decls : List MirAst.LocalDecl) :
+    MirAst.Operand → Option (MirAst.Mutability × Gen.IntType)
+  | .copy ⟨j, []⟩ | .move ⟨j, []⟩ => decls[j]? >>= fun d => ptrPointeeOf d.ty
+  | _ => none
+
+/-- `minimize`'s translation of MIR's pointer offset `Offset(l, r)`, which
+counts in units of the pointee (`tooling/minimize/src/rvalue.rs`):
+> "(Offset, Type::Ptr(_)) => {
+>     // We have to convert the units.
+>     let smir::TyKind::RigidTy(smir::RigidTy::RawPtr(pointee, _mutbl)) =
+>         lty_smir.kind()
+>     else {
+>         unreachable!()
+>     };
+>     let pointee = self.rs_layout_of_smir(pointee);
+>     assert!(pointee.is_sized());
+>     let size = Int::from(pointee.size.bytes());
+>     let size = ValueExpr::Constant(Constant::Int(size), rty);
+>     let offset_bytes = build::mul_unchecked(r, size);
+>     build::ptr_offset(l, offset_bytes, build::InBounds::Yes)
+> }"
+where `build::mul_unchecked(l, r)` is
+`ValueExpr::BinOp { operator: BinOp::Int(IntBinOp::MulUnchecked), left: l, right: r }`
+and `build::ptr_offset(l, r, InBounds::Yes)` is
+`ValueExpr::BinOp { operator: BinOp::PtrOffset { inbounds: true }, left: l, right: r }`
+(MiniRust's `tooling/miniutil/src/build/expr.rs` at the pinned commit). The
+byte count is therefore checked for overflow at the count's type `rty` before
+the in-bounds offset checks the whole byte range. `pointeeIt` is the pointee's
+integer type, whose size is its layout size on `x86_64`. -/
+def ptrOffsetExpr (l r : Gen.ValueExpr) (pointeeIt rIt : Gen.IntType) : Gen.ValueExpr :=
+  .BinOp (.PtrOffset true) l
+    (.BinOp (.Int .MulUnchecked) r (.Constant (.Int (pointeeIt.size.bytes : Int)) (.Int rIt)))
+
 /-- `minimize`'s rvalue translation for `Use`, `UnaryOp(Neg | Not)` on
 integers, `UnaryOp(Not)` on `bool`, integer `BinaryOp`s, checked integer
 `BinaryOp`s (`AddWithOverflow | SubWithOverflow | MulWithOverflow`), `bool`
@@ -1031,7 +1126,45 @@ gives the types of locals): integer arithmetic needs an integer left operand,
 `build::bool_or`, or `build::bool_xor` (`boolBitOp`), `Not` means `build::not`
 exactly when the operand is a `bool`, `IntToInt` casts a `bool` by first
 transmuting to `u8` (`boolToU8`) and then applying `CastOp::IntToInt(int_ty)`,
-and the comparisons apply to operands of any type. -/
+and the comparisons apply to operands of any type.
+
+For raw pointers, `&raw const p` and `&raw mut p` become `ValueExpr::AddrOf`
+at the raw pointer type of the place's pointee, which is sized for every place
+`translatePlace` accepts (`tooling/minimize/src/rvalue.rs`):
+> "smir::Rvalue::AddressOf(_mutbl, place) => {
+>     let ty = place.ty(&self.locals_smir).unwrap();
+>     let place = self.translate_place_smir(place, span);
+>     let target = GcCow::new(place);
+>     let meta_kind = self.pointee_info_of_smir(ty, span).layout.meta_kind();
+>
+>     let ptr_ty = PtrType::Raw { meta_kind };
+>
+>     ValueExpr::AddrOf { target, ptr_ty }
+> }"
+a `PtrToPtr` cast between thin raw pointers is the operand itself:
+> "smir::CastKind::PtrToPtr => {
+>     let operand_ty = operand.ty(&self.locals_smir).unwrap();
+>     let Type::Ptr(PtrType::Raw { meta_kind: old_meta_kind }) =
+>         self.translate_ty_smir(operand_ty, span)
+>     else {
+>         rs::span_bug!(span, \"ptr to ptr cast on non-raw-pointer\");
+>     };
+>     let Type::Ptr(PtrType::Raw { meta_kind: new_meta_kind }) =
+>         self.translate_ty_smir(*cast_ty, span)
+>     else {
+>         rs::span_bug!(span, \"ptr to ptr cast to non-raw-pointer\");
+>     };
+>     let operand = self.translate_operand_smir(operand, span);
+>     if old_meta_kind == new_meta_kind {
+>         // Since raw pointers do only know care about the meta kind, no transmute is necessary here.
+>         operand
+>     } else if new_meta_kind == PointerMetaKind::None {
+>         build::get_thin_pointer(operand)
+>     } else {
+>         ..
+>     }
+> }"
+and `Offset(l, r)` becomes `ptrOffsetExpr`. -/
 def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) (targetTy : Option MirAst.Ty := none) :
     MirAst.Rvalue → Option Gen.ValueExpr
@@ -1065,6 +1198,10 @@ def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
         | none =>
           match op with
           | .cmp => pure (translateCmp el er)
+          | .offset => do
+            let (_, pointeeIt) ← operandPtrPointee decls l
+            let rIt ← operandIntType layouts decls r
+            pure (ptrOffsetExpr el er pointeeIt rIt)
           | _ => none
   | .aggregate (.array elemTy) ops => do
     let elemIt ← intTypeOf elemTy
@@ -1097,6 +1234,14 @@ def translateRvalue (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     | some (.Int _) => pure (.UnOp (.Cast (.IntToInt intTy)) operand)
     | some .Bool => pure (.UnOp (.Cast (.IntToInt intTy)) (boolToU8 operand))
     | _ => none
+  | .rawPtr _ place => do
+    let target ← translatePlace decls place
+    pure (.AddrOf target (.Raw .None))
+  | .cast .ptrToPtr op castTy => do
+    let operand ← translateOperand decls op
+    let (_, _) ← operandPtrPointee decls op
+    let (_, _) ← ptrPointeeOf castTy
+    pure operand
   | _ => none
 
 /-- `minimize`'s statement translation for assignments, `StorageLive`,

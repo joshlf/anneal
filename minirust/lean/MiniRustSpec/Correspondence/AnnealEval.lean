@@ -553,7 +553,14 @@ theorem evalOperand_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl)
           (.constantIndex offset minLen fromEnd)
           (by intro _ _ h; cases h) hok borrows globals callerLocals
       | cons _ _ => simp [operandOk, translateOperand, translatePlace] at hok
-    | _ => simp [operandOk, translateOperand, translatePlace] at hok
+    | deref =>
+      cases rest with
+      | nil =>
+        simp only [operandOk, placeOk, projOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+        obtain ⟨⟨_, hok⟩, _⟩ := hok
+        split at hok <;> simp at hok
+      | cons _ _ => simp [operandOk, placeOk] at hok
+    | _ => cases rest <;> simp [operandOk, placeOk, projOk, translateOperand, translatePlace] at hok
   | .constant c, hok =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     exact evalOperand_fragT decls locals hslots hn hT (.constant c)
@@ -2009,7 +2016,14 @@ theorem opBits_lt {layouts : Layout.LayoutTable} (decls : List LocalDecl) (local
                   simp at hb; subst hb
                   exact (he _ (List.mem_of_getElem? hv)).2
       | cons _ _ => simp [operandOk, translateOperand, translatePlace] at hok
-    | _ => simp [operandOk, translateOperand, translatePlace] at hok
+    | deref =>
+      cases rest with
+      | nil =>
+        simp only [operandOk, placeOk, projOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+        obtain ⟨⟨_, hok⟩, _⟩ := hok
+        split at hok <;> simp at hok
+      | cons _ _ => simp [operandOk, placeOk] at hok
+    | _ => cases rest <;> simp [operandOk, placeOk, projOk, translateOperand, translatePlace] at hok
   | .constant c, hok, hb =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     exact opBits_valid decls locals hslots hT (.constant c)
@@ -2143,7 +2157,14 @@ theorem operandTy_of_operandOk (decls : List LocalDecl) (layouts : Layout.Layout
             exact ⟨elemTy, by simp [MirSemantics.operandTy, MirSemantics.placeTy, get?, hd,
               MirSemantics.resolveProjectedTy, helem], hit⟩
       | cons _ _ => simp [operandOk, translateOperand, translatePlace] at hok
-    | _ => simp [operandOk, translateOperand, translatePlace] at hok
+    | deref =>
+      cases rest with
+      | nil =>
+        simp only [operandOk, placeOk, projOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+        obtain ⟨⟨_, hok⟩, _⟩ := hok
+        split at hok <;> simp at hok
+      | cons _ _ => simp [operandOk, placeOk] at hok
+    | _ => cases rest <;> simp [operandOk, placeOk, projOk, translateOperand, translatePlace] at hok
   | .constant c, hok =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     obtain ⟨hty, _⟩ := hok

@@ -334,7 +334,7 @@ fn anchors_match_generated_items_and_cover_interp() {
             "Anchor `{file}`::{name}:{line} ({sha}) not found in generated items for `{file}`"
         );
     }
-    assert_eq!(anchor_count, 59, "expected 59 anchors, found {anchor_count}");
+    assert_eq!(anchor_count, 72, "expected 72 anchors, found {anchor_count}");
 
     let interp_path = minirust_dir().join("lean/MiniRustSpec/Interp.lean");
     let interp_text = std::fs::read_to_string(&interp_path).unwrap();

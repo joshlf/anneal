@@ -3019,7 +3019,14 @@ theorem operandIntType_of_operandOk {layouts : Layout.LayoutTable}
             simp only [ha, Bool.and_eq_true, decide_eq_true_eq, Option.map_some, Option.some.injEq] at hok ⊢
             exact hok.1
       | cons _ _ => simp [operandOk, translateOperand, translatePlace] at h
-    | _ => simp [operandOk, translateOperand, translatePlace] at h
+    | deref =>
+      cases rest with
+      | nil =>
+        simp only [operandOk, placeOk, projOk, Bool.and_eq_true, decide_eq_true_eq] at h
+        obtain ⟨⟨_, hok⟩, _⟩ := h
+        split at hok <;> simp at hok
+      | cons _ _ => simp [operandOk, placeOk] at h
+    | _ => cases rest <;> simp [operandOk, placeOk, projOk, translateOperand, translatePlace] at h
   | .constant _, h =>
     simp only [operandOk, Bool.and_eq_true, decide_eq_true_eq] at h
     exact h.1
@@ -3929,6 +3936,10 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   | .copy ⟨j, [.constantIndex offset minLen fromEnd]⟩, hok, he =>
     exact evalValue_operand_array_proj h it j (.constantIndex offset minLen fromEnd)
       (by intro _ _ hc; cases hc) hok e he
+  | .copy ⟨j, [.deref]⟩, hok, _ =>
+    simp only [operandOk, placeOk, projOk, Bool.and_eq_true, decide_eq_true_eq] at hok
+    obtain ⟨⟨_, hok⟩, _⟩ := hok
+    split at hok <;> simp at hok
   | .copy ⟨j, .field idx fieldTy :: rest⟩, hok, he =>
     have hit := operandIntType_of_operandOk hok
     simp only [operandOk, placeOk, Bool.and_eq_true, decide_eq_true_eq] at hok

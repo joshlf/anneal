@@ -142,8 +142,8 @@ and checks it at the new one),
 `IntBinOpWithOverflow` variants, through `Machine::eval_int_bin_op_with_overflow`
 and `IntType::with_overflow`, returning `(Value::Int(res_wrapped), Value::Bool(res != res_wrapped))` at `ty.with_overflow()`),
 `BinOp::Rel` with `RelOp::{Lt, Gt, Le, Ge, Eq, Ne, Cmp}` (all 7 `RelOp`
-variants, through `Machine::eval_rel_op`) on integers and Booleans (pointer
-comparison is `unsupported`),
+variants, through `Machine::eval_rel_op`) on integers, Booleans, and thin
+pointers (`comparePtr`, which compares addresses),
 `Terminator::{Goto, Switch, Return, Unreachable}` including
 frame teardown and both stack-pop actions, the representation relation
 (`Type::{decode, encode}`) for `Int`, `Bool`, `Array`, sized `Tuple`, `Union`,
@@ -153,6 +153,23 @@ tuples, slices, and trait objects) and `LayoutStrategy::compute_size_and_align`
 / `TupleHeadLayout::full_size_and_align`, `BasicMemory`'s `check_ptr`,
 `dereferenceable`, `signed_dereferenceable`, `load`, `store`, `allocate`, and
 `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+For raw pointers (MR-3.1) it adds `Type::Ptr` with `PtrType::Raw` (layout,
+`decode_ptr` / `encode_ptr` with per-byte provenance fragments, wide pointers
+with `PointerMetaKind::ElementCount` metadata, and `check_value`; safe
+pointers and vtable metadata are `unsupported` because their checks need the
+machine), `ValueExpr::AddrOf` (with `BasicMemory`'s identity `retag_ptr`),
+`PlaceExpr::Deref` (whose `aligned` flag makes a load or store through a
+misaligned pointer UB), `UnOp::GetThinPointer`, `BinOp::PtrOffset` with both
+`inbounds: true` (`Machine::ptr_offset_inbounds`) and `inbounds: false`
+(`ptr_offset_wrapping`), `BinOp::PtrOffsetFrom`,
+`Constant::PointerWithoutProvenance`, and `Terminator::Intrinsic` for
+`IntrinsicOp::{PointerExposeProvenance, PointerWithExposedProvenance}` with
+`IntPtrCast::{expose, int2ptr}` (`spec/mem/intptrcast.md`). `int2ptr` predicts
+a provenance with the angelic choice `predict`; the interpretation picks the
+exposed live allocation whose address range (one-past-the-end included)
+contains the address, returns no provenance when there is none, and reports
+`Stop.unsupported` when several allocations qualify (`int2ptrProvenance`), so
+its successful runs are runs of the spec.
 `BasicMemory::allocate` picks the address with the daemonic choice `pick`,
 which never has a unique solution; the interpretation commits to one valid
 resolution (`BM.pickAddr`): the first multiple of `2^32` in `[2^32, 2^64)`
@@ -172,7 +189,7 @@ comments; `..` marks elided code). Effects are
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 59 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 72 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -268,6 +285,18 @@ latter with `N` copies of `op`), and `Len` of an array to the constant `N`.
 Upstream `minimize` rejects `ConstantIndex` (`span_bug!`); `translateFn` lowers
 it to `PlaceExpr::Index` with the constant `usize` index `offset` (or
 `N - offset` when `from_end`), which is the index MIR defines for it.
+
+`translateFn` also transcribes `minimize`'s raw pointer cases, although
+`inFragment` does not admit them yet (see the gaps): `*const T` / `*mut T`
+become `Type::Ptr(PtrType::Raw { meta_kind })` (`rawPtrTypeOf`),
+`&raw const p` / `&raw mut p` become `ValueExpr::AddrOf` at the thin raw
+pointer type, `*_j` becomes `PlaceExpr::Deref(Load(_j), T)`, a `PtrToPtr` cast
+between thin raw pointers is its operand, and `Offset(l, r)` becomes
+`PtrOffset { inbounds: true }(l, MulUnchecked(r, size_of::<T>()))`
+(`ptrOffsetExpr`). `minimize`'s translation of `PointerExposeProvenance` and
+`PointerWithExposedProvenance` casts, which ends the block with an intrinsic
+call and continues in a fresh block, is not transcribed (`translateFn` returns
+`none`).
 
 ### States
 
@@ -635,8 +664,25 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   and unsized `Tuple` layouts and `specPanic`s (`layout_slice`, ...,
   `checkValue_unsized_panics`).
 
-`Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, and
-`[WITNESS-AUDIT]` lines ending in `sorry_free=true` (via
+`Correspondence/PointerWitness.lean` runs raw pointer programs to completion
+in both semantics (Anneal by `runA_sound` / `faultsA_sound`, MiniRust by
+`decide +kernel` on `minimize`'s translation), on top of the per-construct
+lemmas of `Correspondence/Pointers.lean` (MiniRust's thin pointer bytes
+`ptrBytes` and their `decode`, `encode`, and `check_value`; Anneal's
+`&raw`, `*p`, `Offset`, `PtrToPtr`, and exposure rules). Both semantics agree
+on `ptrRoundTrip` (`&raw mut x`, a read and a write through the pointer, a
+`PtrToPtr` cast, and a read through the cast pointer; `6` for `x = 5`),
+`arrayElemPtr` (`&raw mut a[1]`), and `fieldPtr` (`&raw mut s.1` at byte
+offset `4` of `Padded`), and both raise UB on `dangling` (a read after
+`StorageDead`). The remaining witnesses are the divergences listed under the
+gaps: `offsetDeref` (`*p.offset(1)` reads `a[1] = 7` in MiniRust and
+`a[0] = 5` in Anneal; `offset(2)` then a read, `offset(3)`, and
+`offset(usize::MAX)` are UB in MiniRust and return `5` in Anneal),
+`misaligned` (UB in MiniRust only), `exposeTwice` (`0` in MiniRust, `65536` in
+Anneal), and `directWrite` and `frozenWrite` (UB in Anneal only).
+
+`Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, `[WITNESS-AUDIT]`,
+and `[POINTER-AUDIT]` lines ending in `sorry_free=true` (via
 `#check_theorem_deps`, which also rejects duplicate declaration names and
 non-`theorem` constants) and fails the build if any listed declaration depends
 on `sorryAx` or a non-standard axiom.
@@ -657,8 +703,10 @@ These are deliberate and are the first things to lift:
   allocates it, so the fragment requires that the body never mentions one.
 * **One resolution of the address choice.** `BasicMemory::allocate`'s `pick`
   is resolved by first fit over the multiples of `2^32`; results hold for that
-  resolution, which the fragment cannot observe (it has no pointer-to-integer
-  casts or pointer comparisons).
+  resolution, which the correspondence fragment cannot observe (it has no
+  pointer-to-integer casts or pointer comparisons). The interpretation itself
+  can now observe addresses (`PointerExposeProvenance`, `comparePtr`, and
+  alignment checks), so pointer witnesses hold for this resolution only.
 * **One thread, called from a caller frame.** MiniRust makes it UB for the
   bottom frame of the main thread to return, while Anneal's root body returns
   normally, so the relation places the callee above an arbitrary caller. What
@@ -681,9 +729,9 @@ These are deliberate and are the first things to lift:
   `SwitchInt` on it); `Type::Enum` (beyond `Ordering`) and `Type::Union` are
   interpreted as representations (layout, `decode`, `encode`, `check_value`)
   without `ValueExpr::{Union, Variant, GetDiscriminant}`,
-  `Statement::SetDiscriminant`, or downcast projections. There are no pointers,
-  references, slices, nested arrays, multi-variant ADTs, other casts, calls,
-  drops, or assertions.
+  `Statement::SetDiscriminant`, or downcast projections. There are no raw
+  pointers (below), references, slices, nested arrays, multi-variant ADTs,
+  other casts, calls, drops, or assertions.
 * **`Repeat(copy p, 0)` is excluded (while `Repeat(const c, 0)` is included).**
   Anneal evaluates `op` once before replicating it, while `minimize`'s
   `list![op; 0]` never evaluates `op`, so the models disagree when `op` is a
@@ -714,6 +762,35 @@ These are deliberate and are the first things to lift:
   unsigned types and, for a signed type, as long as `N <= 2^(bits - 1)` (a
   negative index then has a bit pattern `>= N`), which the fragment
   requires.
+* **Raw pointers are interpreted and translated but not yet in the
+  correspondence (MR-3.1).** `inFragment` rejects raw pointer types and the
+  pointer rvalues, places, and casts (`ptrRoundTrip_notInFragment`), so
+  `step_correspondence` says nothing about them; the pointer witnesses are
+  independent runs of both semantics. Any extension must exclude the forms on
+  which Anneal's model accepts executions that MiniRust, the ground truth,
+  rejects or runs differently: a dereference ignores the pointer's
+  `offsetBytes`, so reading through `p.offset(n)` reads `p`'s target
+  (`offsetDeref 1`), misaligned reads succeed (`misaligned`), and pointers
+  past the end of their allocation can be read through (`offsetDeref 2`);
+  `Offset` neither scales its count by the pointee size nor checks bounds or
+  overflow (`offsetDeref 3`, `offsetDeref usizeMax`); and
+  `PointerExposeProvenance` returns `tag * 65536 + offsetBytes` instead of an
+  address, so two pointers to one local expose different integers
+  (`exposeTwice`), and `PointerWithExposedProvenance` decodes that encoding
+  deterministically instead of predicting a provenance. In the other
+  direction, Anneal is stricter than `BasicMemory`, which has no aliasing
+  model: a direct write to a local disables earlier raw pointers to it
+  (`directWrite`), and writing through a `&raw const` pointer is UB
+  (`frozenWrite`). `&raw` of an out-of-bounds `ConstantIndex` succeeds in
+  Anneal and only faults on use, while MiniRust's `AddrOf` evaluates the place
+  and raises UB at once; and since a write through a pointer only requires its
+  target local not to be dead, a pointer to a local becomes writable again in
+  Anneal after `StorageDead` and `StorageLive`, while in MiniRust it keeps
+  pointing to the deallocated storage. The intended
+  extension relates each Anneal tag to a MiniRust pointer through its borrow
+  entry, admits `&raw` only once per address-taken argument local in `bb0`,
+  admits `*p` only on unoffset pointers to integer pointees of matching type,
+  and keeps `Offset` and the exposure casts out of the fragment.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

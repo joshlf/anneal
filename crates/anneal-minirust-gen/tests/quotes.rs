@@ -1932,3 +1932,104 @@ fn mr_2_2_tuple_quotations_are_pinned_and_tamper_checked() {
         );
     }
 }
+
+/// Pins the MR-3.1 raw-pointer transcriptions: thin and wide pointer
+/// representation with provenance fragments, `check_ptr`, `AddrOf`, `Deref`,
+/// pointer arithmetic and comparison, and the integer-pointer cast
+/// intrinsics. Each needle must occur in an extracted block quote citing the
+/// given file, the quote must verify against that file, and a tampered
+/// variant must not.
+#[test]
+fn mr_3_1_pointer_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        ("spec/prelude/target.md", "const PTR_ALIGN: Align = Align::from_bits_const(64).unwrap();"),
+        ("spec/lang/types.md", "pub fn usize_ty<T: Target>() -> Self"),
+        ("spec/lang/types.md", "Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(T::PTR_SIZE, T::PTR_ALIGN),"),
+        ("spec/lang/types.md", "Ptr(_) => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN),"),
+        ("spec/lang/types.md", "LayoutStrategy::Tuple { tail, .. } => tail.meta_kind(),"),
+        ("spec/mem/pointer.md", "pub fn safe_pointee(self) -> Option<PointeeInfo>"),
+        ("spec/mem/pointer.md", "PtrType::Raw { meta_kind, .. } => meta_kind,"),
+        ("spec/mem/interface.md", "pub fn provenance_frag(self) -> Option<ProvenanceFrag<Provenance>>"),
+        ("spec/mem/interface.md", "fn retag_ptr("),
+        ("spec/lang/representation.md", "let provenance = bytes.fold_with_idx("),
+        ("spec/lang/representation.md", "fn decode_ptr<M: Memory>(bytes: List<AbstractByte<M::Provenance>>)"),
+        ("spec/lang/representation.md", "fn encode_ptr<M: Memory>(ptr: ThinPointer<M::Provenance>)"),
+        ("spec/lang/representation.md", "pub fn as_wide_pair<T: Target>(self) -> Option<Type>"),
+        ("spec/lang/representation.md", "fn decode_value<M: Memory>(self, value: Value<M>)"),
+        ("spec/lang/representation.md", "fn encode_as_value<M: Memory>(self, meta: Option<PointerMeta<M::Provenance>>)"),
+        ("spec/lang/representation.md", "fn decode<M: Memory>(Type::Ptr(ptr_type): Self,"),
+        ("spec/lang/representation.md", "fn encode<M: Memory>(Type::Ptr(ptr_type): Self, val: Value<M>)"),
+        ("spec/lang/representation.md", "fn check_ptr_metadata(&self, meta: Option<PointerMeta<M::Provenance>>, kind: PointerMetaKind)"),
+        ("spec/lang/representation.md", "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result"),
+        ("spec/lang/representation.md", "(Value::Ptr(ptr), Type::Ptr(ptr_ty)) => self.check_ptr(ptr, ptr_ty)?,"),
+        ("spec/lang/step/expressions.md", "Constant::PointerWithoutProvenance(addr) =>"),
+        ("spec/lang/step/expressions.md", "ValueExpr::AddrOf { target, ptr_ty }: ValueExpr"),
+        ("spec/lang/step/expressions.md", "PlaceExpr::Deref { operand, ty }: PlaceExpr"),
+        ("spec/lang/step/operators.md", "UnOp::GetThinPointer: UnOp"),
+        ("spec/lang/step/operators.md", "fn compare_ptr(left: Pointer<M::Provenance>, right: Pointer<M::Provenance>)"),
+        ("spec/lang/step/operators.md", "fn ptr_offset_wrapping(&self, ptr: ThinPointer<M::Provenance>, offset: Int)"),
+        ("spec/lang/step/operators.md", "BinOp::PtrOffset { inbounds }: BinOp,"),
+        ("spec/lang/step/operators.md", "BinOp::PtrOffsetFrom { inbounds, nonneg }: BinOp,"),
+        ("spec/lang/machine.md", "fn mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>) -> O) -> O"),
+        ("spec/mem/intptrcast.md", "pub fn expose(&mut self, ptr: ThinPointer<Provenance>)"),
+        ("spec/mem/intptrcast.md", "pub fn int2ptr(&self, addr: Int) -> NdResult<ThinPointer<Provenance>>"),
+        ("spec/lang/step/intrinsics.md", "IntrinsicOp::PointerExposeProvenance: IntrinsicOp,"),
+        ("spec/lang/step/intrinsics.md", "IntrinsicOp::PointerWithExposedProvenance: IntrinsicOp,"),
+        ("spec/lang/step/terminators.md", "Terminator::Intrinsic { intrinsic, arguments, ret: ret_expr, next_block }: Terminator"),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-3.1 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    // Semantic tampers: plausible misreadings of the pointer semantics must not
+    // verify against the vendored specification.
+    let tampers: &[(&str, &str)] = &[
+        (
+            "spec/lang/representation.md",
+            "if let Some(frag) = byte.provenance_frag() && \
+             frag.position == idx || Some(frag.provenance) == acc",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(ptr.thin_pointer.addr.in_bounds(Signed, M::T::PTR_SIZE), \
+             \"Value::Ptr: pointer out-of-bounds\")?;",
+        ),
+        (
+            "spec/lang/step/operators.md",
+            "let offset_ptr = if inbounds { self.ptr_offset_wrapping(left, right) }",
+        ),
+        ("spec/mem/intptrcast.md", "|p| !self.exposed.contains(p),"),
+        (
+            "spec/lang/step/expressions.md",
+            "let aligned = self.compute_align(ptr_type.layout::<M::T>(), ptr.metadata)",
+        ),
+    ];
+    for (cited_file, tampered) in tampers {
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{cited_file}`: {tampered}"
+        );
+    }
+}

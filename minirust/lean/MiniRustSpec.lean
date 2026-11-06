@@ -20,6 +20,8 @@ import MiniRustSpec.Correspondence.AnnealEval
 import MiniRustSpec.Correspondence.Simulation
 import MiniRustSpec.Correspondence.Run
 import MiniRustSpec.Correspondence.Witness
+import MiniRustSpec.Correspondence.Pointers
+import MiniRustSpec.Correspondence.PointerWitness
 import MiniRustSpec.Audit
 
 /-!
@@ -34,7 +36,9 @@ import MiniRustSpec.Audit
   transcribed upstream item to the generated model.
 * `MiniRustSpec.Correspondence.*`: the correspondence between Anneal's MIR
   semantics (`Trusted.Rustc.V2026_06_01`) and that interpretation, with
-  non-vacuity witnesses (`Correspondence.Witness`).
+  non-vacuity witnesses (`Correspondence.Witness`); `Correspondence.Pointers`
+  and `Correspondence.PointerWitness` compare the two semantics on raw
+  pointers.
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

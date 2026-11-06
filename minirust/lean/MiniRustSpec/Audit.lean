@@ -11,6 +11,7 @@ those terms.
 import Lean
 import MiniRustSpec.Anchors
 import MiniRustSpec.Correspondence.Witness
+import MiniRustSpec.Correspondence.PointerWitness
 
 /-!
 # Axiom audit
@@ -25,8 +26,10 @@ axioms of each declaration, so `lake build MiniRustSpec.Audit` doubles as the
 `#check_theorem_deps` (`checkTheoremDeps`) performs the same check on a group
 of declarations and logs one summary line per group, tagged `[ANCHOR-AUDIT]`
 (the anchors of the interpretation), `[SIMULATION-AUDIT]` (the
-correspondence theorems and the lemmas they rest on), or `[WITNESS-AUDIT]`
-(the concrete witnesses), ending in `sorry_free=true`. A group that depends on
+correspondence theorems and the lemmas they rest on), `[WITNESS-AUDIT]`
+(the concrete witnesses), or `[POINTER-AUDIT]` (the raw pointer lemmas of
+`Correspondence.Pointers` and the witnesses of `Correspondence.PointerWitness`),
+ending in `sorry_free=true`. A group that depends on
 `sorryAx` or on any other non-standard axiom fails the build instead.
 -/
 
@@ -1731,6 +1734,69 @@ open MiniRustSpec.Correspondence.Witness in
   nestedTupleCopyUninitUb_minirust_direct
   nestedTupleCopyUninitUb_converse_error
   tuple_encode_decode_place_edge_cases
+
+open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
+#check_theorem_deps "[POINTER-AUDIT]"
+  encodePtrBytes_length
+  ptrBytes_length
+  encodePtrBytes_data
+  decodePtrProvenance_encode
+  decodePtrProvenance_none
+  two_pow_ptrBits
+  inBounds_usize
+  lt_two_pow_64_int
+  encode_usize
+  encodePtr_of_encode
+  encodePtr_eq
+  firstProvenance_encodePtrBytes
+  decodePtr_ptrBytes
+  decodePtrProvenance_mixed
+  layout_thinRawPtr
+  decode_thinRawPtr
+  encode_thinRawPtr
+  checkValue_thinRawPtr
+  checkValue_thinRawPtr_oob
+  resolveBorrowProjectionElems_noIndex
+  evalRvalue_rawPtr_local
+  evalOperand_copy_deref
+  evalOperand_copy_deref_disabled
+  writePlaceValue_deref_frozen
+  writePlaceValue_deref_root
+  evalRvalue_offset
+  evalRvalue_ptrToPtr
+  evalRvalue_expose
+  evalRvalue_withExposed
+  ptrRoundTrip_notInFragment
+  ptrRoundTrip_translate
+  ptrRoundTrip_anneal_ret
+  ptrRoundTrip_minirust_direct
+  arrayElemPtr_anneal_ret
+  arrayElemPtr_minirust_direct
+  fieldPtr_anneal_ret
+  fieldPtr_minirust_direct
+  dangling_anneal_ub
+  dangling_minirust_direct
+  offsetDeref1_translate
+  offsetDeref2_translate
+  offsetDeref3_translate
+  offsetDerefMax_translate
+  offsetDeref_anneal_ret
+  offsetDeref1_minirust_direct
+  offsetDeref2_minirust_direct
+  offsetDeref3_minirust_direct
+  offsetDerefMax_minirust_direct
+  misaligned_anneal_ret
+  misaligned_minirust_direct
+  exposeTwice_translate
+  exposeTwice_anneal_ret
+  exposeTwice_minirust_direct
+  directWrite_anneal_ub
+  directWrite_minirust_direct
+  frozenWrite_anneal_ub
+  frozenWrite_minirust_direct
+  checkPtr_null
+  ptrOffsetWrapping_wraps
+  checkValue_thinRawPtr_bounds
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

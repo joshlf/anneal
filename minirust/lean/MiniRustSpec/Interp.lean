@@ -41,8 +41,8 @@ here.
   `Statement::StorageDead` (through `Machine::try_mutate_cur_frame`,
   `StackFrame::storage_live`, and `StackFrame::storage_dead`)
   (`spec/lang/step/statements.md`, `spec/lang/machine.md`).
-* `PlaceExpr::Local`, `PlaceExpr::Field`, and `PlaceExpr::Index`
-  (`spec/lang/step/expressions.md`),
+* `PlaceExpr::Local`, `PlaceExpr::Field`, `PlaceExpr::Index`, and
+  `PlaceExpr::Deref` (`spec/lang/step/expressions.md`),
   including `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`),
   `ThinPointer::wrapping_offset` and `ThinPointer::widen`
   (`spec/mem/pointer.md`), `Memory::dereferenceable` and
@@ -50,31 +50,43 @@ here.
   `spec/mem/concurrent.md`, `spec/mem/interface.md`), and
   `Machine::vtable_lookup`, `Machine::compute_size`, and
   `Machine::compute_align` (`spec/lang/machine.md`).
-* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`,
-  `ValueExpr::Tuple`, `ValueExpr::Load`,
+* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`/
+  `Constant::PointerWithoutProvenance`, `ValueExpr::Tuple`, `ValueExpr::Load`,
+  `ValueExpr::AddrOf` (with `check_value` at the pointer type and
+  `BasicMemory`'s identity `retag_ptr`),
   `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
-  `CountOnes`) and `UnOp::Cast` (both `CastOp` variants: `IntToInt` and
+  `CountOnes`), `UnOp::Cast` (both `CastOp` variants: `IntToInt` and
   `Transmute`, the latter through `Machine::transmute`, i.e. `encode` at the
   old type followed by `decode` and `check_value` at the new type), and
+  `UnOp::GetThinPointer`, and
   `ValueExpr::BinOp` with `BinOp::Int` (all `IntBinOp` variants: `Add`,
   `AddUnchecked`, `Sub`, `SubUnchecked`, `Mul`, `MulUnchecked`, `Div`,
   `DivExact`, `Rem`, `Shl`, `Shr`, `ShlUnchecked`, `ShrUnchecked`, `BitAnd`,
   `BitOr`, `BitXor`), `BinOp::IntWithOverflow` (all `IntBinOpWithOverflow`
   variants: `Add`, `Sub`, `Mul`, returning `(Value::Int(result), Value::Bool(overflow))`
-  at `IntType::with_overflow`), and `BinOp::Rel` (all `RelOp` variants: `Lt`,
-  `Gt`, `Le`, `Ge`, `Eq`, `Ne`, `Cmp`) on integers and Booleans
+  at `IntType::with_overflow`), `BinOp::Rel` (all `RelOp` variants: `Lt`,
+  `Gt`, `Le`, `Ge`, `Eq`, `Ne`, `Cmp`) on integers, Booleans, and pointers
+  (`Machine::compare_ptr`), and `BinOp::PtrOffset` (in-bounds and wrapping)
+  and `BinOp::PtrOffsetFrom`
   (`spec/lang/step/expressions.md`, `spec/lang/step/operators.md`). MiniRust
   has no Boolean negation operator: `minimize` expresses `!b` with transmutes
   and integer subtraction (see `MiniRustSpec.Correspondence.Translate`), so
   `UnOp::Int` on a `Value::Bool` stays a spec panic, exactly as upstream.
-* `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`, and
+* `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`,
   `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
-  teardown, `storage_dead` of every local, and both stack-pop actions.
+  teardown, `storage_dead` of every local, and both stack-pop actions, and
+  `Terminator::Intrinsic` for the pointer provenance intrinsics
+  `PointerExposeProvenance` and `PointerWithExposedProvenance`
+  (`spec/lang/step/intrinsics.md`, `spec/mem/intptrcast.md`).
 * The representation relation (`Type::{decode, encode}`) for `Type::Int`,
-  `Type::Bool`, sized and unsized `Type::Tuple`, `Type::Array`, `Type::Union`
+  `Type::Bool`, `Type::Ptr` (thin pointers through `decode_ptr` and
+  `encode_ptr`, which carry provenance in `AbstractByte::Init`, and wide
+  pointers through `PtrType::as_wide_pair`), sized and unsized `Type::Tuple`,
+  `Type::Array`, `Type::Union`
   (`Type.encodeUnionChunks`), `Type::Enum` (including `decode_discriminant`
   and `encode_discriminant`), `Type::Slice`, and `Type::TraitObject`, and
-  `Machine::check_value` (with `ensure_else_ub` and `checkUnionChunks`) for
+  `Machine::check_value` (with `ensure_else_ub`, `checkUnionChunks`, and, for
+  raw pointers, `check_ptr` and `check_ptr_metadata`) for
   those types (`spec/lang/representation.md`); `Type::layout` for all of them
   (`spec/lang/types.md`); and `BasicMemory`'s `allocate`, `load`, `store`,
   `deallocate`, and `check_ptr` (`spec/mem/basic.md`), wrapped by
@@ -86,7 +98,9 @@ here.
   `BasicMemory<x86_64>` as the instance of `M`.
 
 Everything else returns `Stop.unsupported`, so the interpretation is partial
-but never silently wrong.
+but never silently wrong. In particular, `check_value` for safe pointers
+(references and boxes) and vtable pointers needs the machine's memory and
+vtables, and is outside the fragment.
 
 ## Effects
 
@@ -100,11 +114,14 @@ specr-lang functions return `Result`/`NdResult`. We use `Except Stop`:
   rather than program behavior,
 * `Stop.unsupported` marks a construct outside the interpreted fragment.
 
-Two non-deterministic operations are reachable from this fragment. The thread
-choice in `Machine::step` has a unique solution here (see
+Three non-deterministic operations are reachable from this fragment. The
+thread choice in `Machine::step` has a unique solution here (see
 `pickActiveThread`). The address choice of `BasicMemory::allocate`, reached
 through `Statement::StorageLive`, never does; `BM.pickAddr` documents the one
-valid resolution the interpretation commits to.
+valid resolution the interpretation commits to. The angelic provenance
+prediction of an integer-to-pointer cast (`IntPtrCast::int2ptr`) does not
+either; `int2ptrProvenance` documents its resolution and which results it
+supports.
 -/
 
 namespace MiniRustSpec.Interp
@@ -372,6 +389,9 @@ def Size.align_to (s : Size) (a : Align) : Size :=
 /-- `x86_64::PTR_SIZE` = 64 bits:
 > "const PTR_SIZE: Size = Size::from_bits_const(64).unwrap();" -/
 def x86_64.PTR_SIZE : Size := ⟨8⟩
+/-- `x86_64::PTR_ALIGN` = 64 bits:
+> "const PTR_ALIGN: Align = Align::from_bits_const(64).unwrap();" -/
+def x86_64.PTR_ALIGN : Align := ⟨8⟩
 /-- `x86_64::INT_MAX_ALIGN` = 128 bits:
 > "const INT_MAX_ALIGN: Align = Align::from_bits_const(128).unwrap();" -/
 def x86_64.INT_MAX_ALIGN : Align := ⟨16⟩
@@ -399,6 +419,14 @@ def IntType.bring_in_bounds (t : IntType) (i : Int) : Int := bringInBounds i t.s
 /-- `IntType::I8`, the result type of `RelOp::Cmp`:
 > "pub const I8: IntType = IntType { signed: Signedness::Signed, size: Size::from_bytes_const(1) };" -/
 def IntType.I8 : IntType := ⟨.Signed, ⟨1⟩⟩
+
+/-- `IntType::usize_ty::<x86_64>` (`spec/lang/types.md`), the type of slice
+lengths in pointer metadata and of the address that
+`PointerExposeProvenance` returns:
+> "pub fn usize_ty<T: Target>() -> Self {
+>     IntType { signed: Signedness::Unsigned, size: T::PTR_SIZE }
+> }" -/
+def IntType.usize_ty : IntType := ⟨.Unsigned, x86_64.PTR_SIZE⟩
 
 /-- `IntType::align::<x86_64>`:
 > "let natural_align = Align::from_bytes(size).unwrap();
@@ -548,10 +576,58 @@ def LayoutStrategy.compute_size_and_align (vtables : Ptr → Interp VTable) :
     pure (TupleHeadLayout.full_size_and_align head tailSize tailAlign)
   | _, _ => specPanic "pointer meta data does not match type"
 
+/-- `LayoutStrategy::meta_kind` (`spec/lang/types.md`), the kind of pointer
+metadata needed to compute the size and alignment of a layout:
+> "pub fn meta_kind(self) -> PointerMetaKind {
+>     match self {
+>         LayoutStrategy::Sized(..) => PointerMetaKind::None,
+>         LayoutStrategy::Slice(..) => PointerMetaKind::ElementCount,
+>         LayoutStrategy::TraitObject(trait_name) => PointerMetaKind::VTablePointer(trait_name),
+>         LayoutStrategy::Tuple { tail, .. } => tail.meta_kind(),
+>     }
+> }" -/
+def LayoutStrategy.meta_kind : LayoutStrategy → PointerMetaKind
+  | .Sized _ _ => .None
+  | .Slice _ _ => .ElementCount
+  | .TraitObject traitName => .VTablePointer traitName
+  | .Tuple _ tail => LayoutStrategy.meta_kind tail
+
+/-- `PtrType::safe_pointee` (`spec/mem/pointer.md`): references and boxes are
+safe pointers and carry pointee information; raw, function, and vtable
+pointers do not:
+> "pub fn safe_pointee(self) -> Option<PointeeInfo> {
+>     match self {
+>         PtrType::Ref { pointee, .. } | PtrType::Box { pointee, .. } => Some(pointee),
+>         PtrType::Raw { .. } | PtrType::FnPtr | PtrType::VTablePtr(_) => None,
+>     }
+> }" -/
+def PtrType.safe_pointee : PtrType → Option PointeeInfo
+  | .Ref _ pointee => some pointee
+  | .Box pointee => some pointee
+  | .Raw _ => none
+  | .FnPtr => none
+  | .VTablePtr _ => none
+
+/-- `PtrType::meta_kind` (`spec/mem/pointer.md`):
+> "pub fn meta_kind(self) -> PointerMetaKind {
+>     match self {
+>         PtrType::Ref { pointee, .. } | PtrType::Box { pointee, .. } => pointee.layout.meta_kind(),
+>         PtrType::Raw { meta_kind, .. } => meta_kind,
+>         PtrType::FnPtr | PtrType::VTablePtr(_) => PointerMetaKind::None,
+>     }
+> }" -/
+def PtrType.meta_kind : PtrType → PointerMetaKind
+  | .Ref _ pointee => LayoutStrategy.meta_kind pointee.layout
+  | .Box pointee => LayoutStrategy.meta_kind pointee.layout
+  | .Raw metaKind => metaKind
+  | .FnPtr => .None
+  | .VTablePtr _ => .None
+
 /-- `Type::layout::<x86_64>` for the interpreted types (`spec/lang/types.md`):
 > "Int(int_type) => Sized(int_type.size, int_type.align::<T>()),
 >  Bool => Sized(Size::from_bytes_const(1), Align::ONE),
->  ..
+>  Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(T::PTR_SIZE, T::PTR_ALIGN),
+>  Ptr(_) => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN),
 >  Union { size, align, .. } | Enum { size, align, .. } => Sized(size, align),
 >  Tuple { sized_head_layout, unsized_field, .. } => match unsized_field {
 >      None => {
@@ -572,10 +648,14 @@ def LayoutStrategy.compute_size_and_align (vtables : Ptr → Interp VTable) :
 >      elem.layout::<T>().expect_align(\"WF ensures array element is sized\"),
 >  ),
 >  TraitObject(trait_name) => LayoutStrategy::TraitObject(trait_name),"
-Pointers are outside the fragment. -/
+A thin pointer (`meta_kind() == None`) is pointer-sized and pointer-aligned;
+a wide pointer is a thin pointer followed by pointer-sized metadata. -/
 def Type.layout : «Type» → Interp LayoutStrategy
   | .Int t => do pure (.Sized t.size (← IntType.align t))
   | .Bool => pure (.Sized ⟨1⟩ ⟨1⟩)
+  | .Ptr p =>
+    if PtrType.meta_kind p = .None then pure (.Sized x86_64.PTR_SIZE x86_64.PTR_ALIGN)
+    else pure (.Sized ⟨2 * x86_64.PTR_SIZE.bytes⟩ x86_64.PTR_ALIGN)
   | .Union _ _ size align => pure (.Sized size align)
   | .Enum _ _ _ size align => pure (.Sized size align)
   | .Tuple _ headLayout none =>
@@ -596,7 +676,6 @@ def Type.layout : «Type» → Interp LayoutStrategy
       "WF ensures array element is sized"
     pure (.Slice size align)
   | .TraitObject traitName => pure (.TraitObject traitName)
-  | _ => unsupported "Type::layout for a pointer type"
 
 /-! ## Representation relation (`spec/lang/representation.md`) -/
 
@@ -610,6 +689,17 @@ def Type.layout : «Type» → Interp LayoutStrategy
 def AbstractByte.data : Byte → Option UInt8
   | .Uninit => none
   | .Init b _ => some b
+
+/-- `AbstractByte::provenance_frag` (`spec/mem/interface.md`):
+> "pub fn provenance_frag(self) -> Option<ProvenanceFrag<Provenance>> {
+>     match self {
+>         AbstractByte::Uninit => None,
+>         AbstractByte::Init(_, frag) => frag,
+>     }
+> }" -/
+def AbstractByte.provenance_frag : Byte → Option (ProvenanceFrag Prov)
+  | .Uninit => none
+  | .Init _ frag => frag
 
 /-- `Type::decode` for `Int` (`spec/lang/representation.md`):
 > "fn decode<M: Memory>(Type::Int(IntType { signed, size }): Self, bytes: ..) -> Option<Value<M>> {
@@ -643,6 +733,245 @@ def Type.encodeInt : IntType → Val → Interp (List Byte)
     | some data => pure (data.map (fun b => .Init b none))
     | none => specPanic "Endianness::encode(..).unwrap()"
   | _, _ => specPanic "encode: Type::Int with a non-Int value"
+
+/-- `ThinPointer::widen` (`spec/mem/pointer.md`):
+> "pub fn widen(self, metadata: Option<PointerMeta<Provenance>>) -> Pointer<Provenance> {
+>     Pointer {
+>         thin_pointer: self,
+>         metadata,
+>     }
+> }" -/
+def ThinPointer.widen (ptr : Ptr) (metadata : Option (PointerMeta Prov)) : Pointer Prov :=
+  { thin_pointer := ptr, metadata := metadata }
+
+/-- The provenance fold of `decode_ptr` (`spec/lang/representation.md`), which
+keeps the provenance `acc` of byte `0` only while every byte `idx` carries a
+fragment of that same provenance at position `idx`:
+> "let provenance = bytes.fold_with_idx(
+>     bytes[0].provenance_frag().map(|frag| frag.provenance),
+>     |acc, idx, byte| {
+>         // Crucially, if `acc` is ever `None`, it remains `None`.
+>         if let Some(frag) = byte.provenance_frag() &&
+>             frag.position == idx && Some(frag.provenance) == acc
+>         {
+>             acc
+>         } else {
+>             None
+>         }
+>     }
+> );"
+`fold_with_idx` visits the bytes in order, passing each one's index; `idx` is
+the index of the first byte of `bytes`. -/
+def decodePtrProvenance : Nat → Option Prov → List Byte → Option Prov
+  | _, acc, [] => acc
+  | idx, acc, byte :: rest =>
+    let acc' : Option Prov :=
+      match AbstractByte.provenance_frag byte with
+      | some frag => if frag.position = (idx : Int) ∧ some frag.provenance = acc then acc else none
+      | none => none
+    decodePtrProvenance (idx + 1) acc' rest
+
+/-- The start value of the provenance fold of `decode_ptr`
+(`spec/lang/representation.md`), the provenance of the first byte's fragment:
+> "bytes[0].provenance_frag().map(|frag| frag.provenance),"
+`decodePtr` checks the length first, so `bytes` is never empty here. -/
+def firstProvenance : List Byte → Option Prov
+  | byte :: _ => (AbstractByte.provenance_frag byte).map (fun frag => frag.provenance)
+  | [] => none
+
+/-- `decode_ptr` (`spec/lang/representation.md`), which reads a thin pointer
+from `PTR_SIZE` bytes: the address from the byte values and the provenance
+from the bytes' provenance fragments (`decodePtrProvenance`):
+> "fn decode_ptr<M: Memory>(bytes: List<AbstractByte<M::Provenance>>) -> Option<ThinPointer<M::Provenance>> {
+>     if bytes.len() != M::T::PTR_SIZE.bytes() { panic!(\"decode of thin pointer with invalid length\"); }
+>     // Convert into list of bytes; fail if any byte is uninitialized.
+>     let bytes_data = bytes.try_map(|b| b.data())?;
+>     let addr = M::T::ENDIANNESS.decode(Unsigned, bytes_data);
+>     ..
+>     ret(ThinPointer { addr, provenance })
+> }" -/
+def decodePtr (bytes : List Byte) : Interp (Option Ptr) :=
+  if bytes.length ≠ x86_64.PTR_SIZE.bytes then specPanic "decode of thin pointer with invalid length"
+  else
+    match bytes.mapM AbstractByte.data with
+    | none => pure none
+    | some data =>
+      let addr := Endianness.decode x86_64.ENDIANNESS .Unsigned data
+      pure (some { addr := addr, provenance := decodePtrProvenance 0 (firstProvenance bytes) bytes })
+
+/-- The bytes of `encode_ptr` (`spec/lang/representation.md`): byte `i` holds
+the address byte `b` and, when the pointer has provenance, the fragment of
+that provenance at position `i`:
+> "bytes_data.map_with_idx(|i, b|
+>     AbstractByte::Init(b, ptr.provenance.map(|provenance|
+>         ProvenanceFrag { provenance, position: i }
+>     ))
+> )"
+`idx` is the index of the first byte of `data`. -/
+def encodePtrBytes (provenance : Option Prov) : Nat → List UInt8 → List Byte
+  | _, [] => []
+  | idx, b :: rest =>
+    .Init b (provenance.map (fun p => { provenance := p, position := (idx : Int) })) ::
+      encodePtrBytes provenance (idx + 1) rest
+
+/-- `encode_ptr` (`spec/lang/representation.md`):
+> "fn encode_ptr<M: Memory>(ptr: ThinPointer<M::Provenance>) -> List<AbstractByte<M::Provenance>> {
+>     let bytes_data = M::T::ENDIANNESS.encode(Unsigned, M::T::PTR_SIZE, ptr.addr).unwrap();
+>     bytes_data.map_with_idx(|i, b|
+>         AbstractByte::Init(b, ptr.provenance.map(|provenance|
+>             ProvenanceFrag { provenance, position: i }
+>         ))
+>     )
+> }"
+`Endianness::encode` fails, and `unwrap` panics, exactly when the address is
+not in `[0, 2^64)`; `check_ptr` (`checkPtr`) rejects such pointers before any
+store. -/
+def encodePtr (ptr : Ptr) : Interp (List Byte) :=
+  match Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE ptr.addr with
+  | some data => pure (encodePtrBytes ptr.provenance 0 data)
+  | none => specPanic "M::T::ENDIANNESS.encode(Unsigned, M::T::PTR_SIZE, ptr.addr).unwrap()"
+
+/-- `PtrType::as_wide_pair::<x86_64>` (`spec/lang/representation.md`), which
+views a wide pointer as the pair of a thin raw pointer and its metadata, or
+returns `None` for a thin pointer:
+> "pub fn as_wide_pair<T: Target>(self) -> Option<Type> {
+>     if self.meta_kind() == PointerMetaKind::None {
+>         return None;
+>     }
+>     let meta_ty = self.meta_kind().ty::<T>();
+>     ..
+>     let thin_pointer_field = (Offset::ZERO, Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None }));
+>     let metadata_field = (T::PTR_SIZE, meta_ty);
+>     ret(Type::Tuple {
+>         sized_fields: list![thin_pointer_field, metadata_field],
+>         sized_head_layout: TupleHeadLayout {
+>             end: Int::from(2) * T::PTR_SIZE,
+>             align: T::PTR_ALIGN,
+>             packed_align: None,
+>         },
+>         unsized_field: None,
+>     })
+> }"
+with `PointerMetaKind::ty::<x86_64>` (`spec/lang/representation.md`):
+> "PointerMetaKind::ElementCount => Type::Int(IntType::usize_ty::<T>()),
+>  PointerMetaKind::VTablePointer(trait_name) => Type::Ptr(PtrType::VTablePtr(trait_name)),"
+Both metadata types are pointer-sized and pointer-aligned on `x86_64`, so the
+elided `assert_eq!`s of `as_wide_pair` hold. -/
+def PtrType.as_wide_pair (p : PtrType) : Option «Type» :=
+  let metaTy : Option «Type» :=
+    match PtrType.meta_kind p with
+    | .None => none
+    | .ElementCount => some (.Int IntType.usize_ty)
+    | .VTablePointer traitName => some (.Ptr (.VTablePtr traitName))
+  metaTy.map (fun metaTy =>
+    .Tuple [(⟨0⟩, .Ptr (.Raw .None)), (x86_64.PTR_SIZE, metaTy)]
+      ⟨⟨2 * x86_64.PTR_SIZE.bytes⟩, x86_64.PTR_ALIGN, none⟩ none)
+
+/-- `PointerMetaKind::decode_value` (`spec/lang/representation.md`):
+> "fn decode_value<M: Memory>(self, value: Value<M>) -> Option<PointerMeta<M::Provenance>> {
+>     match (self, value) {
+>         (PointerMetaKind::None, Value::Tuple(fields)) if fields.is_empty() => None,
+>         (PointerMetaKind::ElementCount, Value::Int(count)) => Some(PointerMeta::ElementCount(count)),
+>         (PointerMetaKind::VTablePointer(_), Value::Ptr(ptr)) if ptr.metadata.is_none() => Some(PointerMeta::VTablePointer(ptr.thin_pointer)),
+>         _ => panic!(\"PointerMeta::decode_value called with invalid value\"),
+>     }
+> }" -/
+def PointerMetaKind.decode_value : PointerMetaKind → Val → Interp (Option (PointerMeta Prov))
+  | .None, .Tuple [] => pure none
+  | .ElementCount, .Int count => pure (some (.ElementCount count))
+  | .VTablePointer _, .Ptr ⟨thin, none⟩ => pure (some (.VTablePointer thin))
+  | _, _ => specPanic "PointerMeta::decode_value called with invalid value"
+
+/-- `PointerMetaKind::encode_as_value` (`spec/lang/representation.md`), for
+the metadata of wide pointers (the thin case, `unit_value()`, is never
+reached from `Type::encode`, which encodes thin pointers with `encode_ptr`):
+> "fn encode_as_value<M: Memory>(self, meta: Option<PointerMeta<M::Provenance>>) -> Value<M> {
+>     match (self, meta) {
+>         (PointerMetaKind::None, None) => unit_value(),
+>         (PointerMetaKind::ElementCount, Some(PointerMeta::ElementCount(count))) => Value::Int(count),
+>         (PointerMetaKind::VTablePointer(_), Some(PointerMeta::VTablePointer(ptr))) => Value::Ptr(ptr.widen(None)),
+>         _ => panic!(\"PointerMeta::encode_as_value called with invalid value\"),
+>     }
+> }" -/
+def PointerMetaKind.encode_as_value : PointerMetaKind → Option (PointerMeta Prov) → Interp Val
+  | .None, none => pure (.Tuple [])
+  | .ElementCount, some (.ElementCount count) => pure (.Int count)
+  | .VTablePointer _, some (.VTablePointer ptr) => pure (.Ptr { thin_pointer := ptr, metadata := none })
+  | _, _ => specPanic "PointerMeta::encode_as_value called with invalid value"
+
+/-- `Type::decode` at a metadata type of `PointerMetaKind::ty::<x86_64>`
+(`spec/lang/representation.md`) other than the unit type:
+> "PointerMetaKind::ElementCount => Type::Int(IntType::usize_ty::<T>()),
+>  PointerMetaKind::VTablePointer(trait_name) => Type::Ptr(PtrType::VTablePtr(trait_name)),"
+`Type::Int(usize)` decodes as an integer (`Type.decodeInt`), and the thin
+pointer type `Type::Ptr(PtrType::VTablePtr(..))` with `decode_ptr` (see
+`Type.decode`). -/
+def decodeMetaField (metaKind : PointerMetaKind) (bytes : List Byte) : Interp (Option Val) :=
+  match metaKind with
+  | .ElementCount => Type.decodeInt IntType.usize_ty bytes
+  | .VTablePointer _ => do
+    match ← decodePtr bytes with
+    | some ptr => pure (some (.Ptr { thin_pointer := ptr, metadata := none }))
+    | none => pure none
+  | .None => specPanic "as_wide_pair always returns a suitable metadata type"
+
+/-- `Type::decode` for a wide pointer type (`spec/lang/representation.md`):
+> "if let Some(pair_ty) = ptr_type.as_wide_pair::<M::T>() {
+>     // This will recursively call this decode function again, but with a thin pointer type.
+>     let Value::Tuple(parts) = pair_ty.decode::<M>(bytes)? else {
+>         panic!(\"as_wide_pair always returns a tuple type\");
+>     };
+>     let Value::Ptr(ptr) = parts[0] else {
+>         panic!(\"as_wide_pair always returns tuple with the first field being a thin pointer\");
+>     };
+>     // This metadata might not be well-formed, but we are allowed to return ill-formed pointers here.
+>     let meta = ptr_type.meta_kind().decode_value(parts[1]);
+>     assert!(meta.is_some(), \"as_wide_pair always returns a suitable metadata type\");
+>     ret(Value::Ptr(ptr.thin_pointer.widen(meta)))
+> }"
+The recursive `pair_ty.decode` is unrolled here so that `Type.decode` stays
+structurally recursive: the pair type (`PtrType.as_wide_pair`) is a tuple of
+size `2 * PTR_SIZE` without padding whose fields are the thin pointer at
+offset `0` and the metadata at offset `PTR_SIZE`, so tuple decoding (a
+length check that panics on a mismatch, followed by `try_map` over the
+fields) checks the length, decodes the first `PTR_SIZE` bytes with
+`decode_ptr`, and then decodes the metadata bytes (`decodeMetaField`). -/
+def decodeWidePtr (metaKind : PointerMetaKind) (bytes : List Byte) : Interp (Option Val) :=
+  if bytes.length ≠ 2 * x86_64.PTR_SIZE.bytes then
+    specPanic "decode of Type::Tuple with invalid length"
+  else do
+    match ← decodePtr (bytes.take x86_64.PTR_SIZE.bytes) with
+    | none => pure none
+    | some thin =>
+      match ← decodeMetaField metaKind (bytes.drop x86_64.PTR_SIZE.bytes) with
+      | none => pure none
+      | some metaVal => do
+        let ptrMeta ← PointerMetaKind.decode_value metaKind metaVal
+        match ptrMeta with
+        | some _ => pure (some (.Ptr (ThinPointer.widen thin ptrMeta)))
+        | none => specPanic "assertion failed: as_wide_pair always returns a suitable metadata type"
+
+/-- `Type::encode` for a wide pointer type (`spec/lang/representation.md`):
+> "if let Some(pair_ty) = ptr_type.as_wide_pair::<M::T>() {
+>     let thin_ptr_value = Value::Ptr(ptr.thin_pointer.widen(None));
+>     let meta_data_value = ptr_type.meta_kind().encode_as_value::<M>(ptr.metadata);
+>     let tuple = Value::Tuple(list![thin_ptr_value, meta_data_value]);
+>
+>     // This will recursively call this encode function again, but with a thin pointer type.
+>     pair_ty.encode::<M>(tuple)
+> }"
+As in `decodeWidePtr`, the recursive `pair_ty.encode` is unrolled: the pair
+has no padding, so its encoding is the thin pointer's `encode_ptr` bytes
+followed by the metadata's encoding (`Type::Int(usize)` for an element count,
+`encode_ptr` for a vtable pointer). -/
+def encodeWidePtr (metaKind : PointerMetaKind) (ptr : Pointer Prov) : Interp (List Byte) := do
+  let metaVal ← PointerMetaKind.encode_as_value metaKind ptr.metadata
+  let thinBytes ← encodePtr ptr.thin_pointer
+  let metaBytes ← match metaKind, metaVal with
+    | .ElementCount, v => Type.encodeInt IntType.usize_ty v
+    | .VTablePointer _, .Ptr ⟨vtablePtr, none⟩ => encodePtr vtablePtr
+    | _, _ => specPanic "as_wide_pair always returns a suitable metadata type"
+  pure (thinBytes ++ metaBytes)
 
 mutual
 
@@ -794,11 +1123,20 @@ mutual
 > "fn decode<M: Memory>(Type::TraitObject(..): Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
 >     panic!(\"decode of Type::TraitObject\")
 > }"
-The fields of a tuple are decoded by `Type.decodeFields` and the data of an
-enum variant by `Type.decodeVariant`. `decode_discriminant` fails only if its
+> "fn decode<M: Memory>(Type::Ptr(ptr_type): Self, bytes: List<AbstractByte<M::Provenance>>) -> Option<Value<M>> {
+>     if let Some(pair_ty) = ptr_type.as_wide_pair::<M::T>() {
+>         ..
+>     } else {
+>         // Handle thin pointers.
+>         let ptr = decode_ptr::<M>(bytes)?;
+>         ret(Value::Ptr(ptr.widen(None)))
+>     }
+> }"
+The fields of a tuple are decoded by `Type.decodeFields`, the data of an
+enum variant by `Type.decodeVariant`, thin pointers by `decodePtr`, and wide
+pointers by `decodeWidePtr`. `decode_discriminant` fails only if its
 accessor does; this accessor fails only by panicking (`subsliceWithLength` out
-of range), so `.unwrap()` is the propagation of that panic. Pointers are
-outside the fragment. -/
+of range), so `.unwrap()` is the propagation of that panic. -/
 def Type.decode : «Type» → List Byte → Interp (Option Val)
   | .Bool, bytes =>
     if bytes.length ≠ 1 then specPanic "decode of Type::Bool with invalid length"
@@ -849,7 +1187,13 @@ def Type.decode : «Type» → List Byte → Interp (Option Val)
         | none => pure none
   | .Slice _, _ => specPanic "decode of Type::Slice"
   | .TraitObject _, _ => specPanic "decode of Type::TraitObject"
-  | _, _ => unsupported "Type::decode for a pointer type"
+  | .Ptr ptrType, bytes =>
+    match PtrType.as_wide_pair ptrType with
+    | some _ => decodeWidePtr (PtrType.meta_kind ptrType) bytes
+    | none => do
+      match ← decodePtr bytes with
+      | some ptr => pure (some (.Ptr (ThinPointer.widen ptr none)))
+      | none => pure none
 
 /-- The fields of `Type::decode` for `Tuple` (`spec/lang/representation.md`),
 each decoded from its own subslice:
@@ -967,9 +1311,21 @@ mutual
 > "fn encode<M: Memory>(Type::TraitObject(..): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
 >     panic!(\"encode of Type::TraitObject\")
 > }"
+> "fn encode<M: Memory>(Type::Ptr(ptr_type): Self, val: Value<M>) -> List<AbstractByte<M::Provenance>> {
+>     let Value::Ptr(ptr) = val else { panic!(\"val is WF for a pointer\") };
+>
+>     if let Some(pair_ty) = ptr_type.as_wide_pair::<M::T>() {
+>         ..
+>     } else {
+>         // Handle thin pointers.
+>         assert!(ptr.metadata.is_none(), \"ptr_type and value have mismatching metadata\");
+>         encode_ptr::<M>(ptr.thin_pointer)
+>     }
+> }"
 The fields of a tuple are encoded by `Type.encodeFields`, the chunks of a
-union by `Type.encodeUnionChunks`, and the variant of an enum by
-`Type.encodeVariant`. Pointers are outside the fragment. -/
+union by `Type.encodeUnionChunks`, the variant of an enum by
+`Type.encodeVariant`, thin pointers by `encodePtr`, and wide pointers by
+`encodeWidePtr`. -/
 def Type.encode : «Type» → Val → Interp (List Byte)
   | .Bool, .Bool b => pure [.Init (if b then 1 else 0) none]
   | .Bool, _ => specPanic "encode: Type::Bool with a non-Bool value"
@@ -1012,7 +1368,16 @@ def Type.encode : «Type» → Val → Interp (List Byte)
     | _ => specPanic "encode: Type::Enum with a non-Variant value"
   | .Slice _, _ => specPanic "encode of Type::Slice"
   | .TraitObject _, _ => specPanic "encode of Type::TraitObject"
-  | _, _ => unsupported "Type::encode for a pointer type"
+  | .Ptr ptrType, val =>
+    match val with
+    | .Ptr ptr =>
+      match PtrType.as_wide_pair ptrType with
+      | some _ => encodeWidePtr (PtrType.meta_kind ptrType) ptr
+      | none =>
+        match ptr.metadata with
+        | none => encodePtr ptr.thin_pointer
+        | some _ => specPanic "assertion failed: ptr_type and value have mismatching metadata"
+    | _ => specPanic "val is WF for a pointer"
 
 /-- The field loop of `Type::encode` for `Tuple`
 (`spec/lang/representation.md`), which writes each field's encoding at its
@@ -1063,6 +1428,66 @@ def checkUnionChunks : List (List Byte) → List (Offset × Size) → Interp Uni
     checkUnionChunks chunkData chunks
   | _, _ => pure ()
 
+/-- `Machine::check_ptr_metadata` (`spec/lang/representation.md`):
+> "fn check_ptr_metadata(&self, meta: Option<PointerMeta<M::Provenance>>, kind: PointerMetaKind) -> Result {
+>     match (meta, kind) {
+>         (None, PointerMetaKind::None) => {}
+>         (Some(PointerMeta::ElementCount(num)), PointerMetaKind::ElementCount) =>
+>             self.check_value(Value::Int(num), Type::Int(IntType::usize_ty::<M::T>()))?,
+>         (Some(PointerMeta::VTablePointer(ptr)), PointerMetaKind::VTablePointer(trait_name)) => {
+>             self.check_ptr(ptr.widen(None), PtrType::VTablePtr(trait_name))?;
+>         }
+>         _ => throw_ub!(\"Value::Ptr: invalid metadata\"),
+>     };
+>
+>     Ok(())
+> }"
+The integer check is `check_value` at `Type::Int`, inlined (it is
+`ensure_else_ub(int_ty.can_represent(i), ..)`, see `checkValue`). Checking a
+vtable pointer needs the machine's vtables (`Machine::vtable_from_ptr`), so it
+is outside the fragment. -/
+def checkPtrMetadata (ptrMeta : Option (PointerMeta Prov)) (kind : PointerMetaKind) : Interp Unit :=
+  match ptrMeta, kind with
+  | none, .None => pure ()
+  | some (.ElementCount num), .ElementCount =>
+    ensureElseUb (IntType.can_represent IntType.usize_ty num) "Value::Int: invalid integer value"
+  | some (.VTablePointer _), .VTablePointer _ =>
+    unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
+  | _, _ => ub "Value::Ptr: invalid metadata"
+
+/-- `Machine::check_ptr` (`spec/lang/representation.md`):
+> "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result {
+>     ensure_else_ub(ptr.thin_pointer.addr.in_bounds(Unsigned, M::T::PTR_SIZE), \"Value::Ptr: pointer out-of-bounds\")?;
+>
+>     // This has to be checked first, to ensure we can e.g. compute size/align below.
+>     self.check_ptr_metadata(ptr.metadata, ptr_ty.meta_kind())?;
+>
+>     // Safe pointer, i.e. references, boxes
+>     if let Some(pointee) = ptr_ty.safe_pointee() {
+>         ..
+>     } else if let PtrType::VTablePtr(trait_name) = ptr_ty {
+>         ..
+>     }
+>
+>     Ok(())
+> }"
+A raw pointer is well formed when its address fits in a `usize` and its
+metadata is well formed; nothing is required of its provenance or of the
+memory it points to. The checks for safe pointers (non-null, aligned,
+dereferenceable) and stand-alone vtable pointers read the machine's memory
+and vtables, which this machine-free transcription of `check_value` does not
+have, so they are outside the fragment. -/
+def checkPtr (ptr : Pointer Prov) (ptrTy : PtrType) : Interp Unit := do
+  ensureElseUb (inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE)
+    "Value::Ptr: pointer out-of-bounds"
+  checkPtrMetadata ptr.metadata (PtrType.meta_kind ptrTy)
+  match PtrType.safe_pointee ptrTy with
+  | some _ => unsupported "check_ptr for a safe pointer (Memory::dereferenceable)"
+  | none =>
+    match ptrTy with
+    | .VTablePtr _ => unsupported "check_ptr for a vtable pointer (Machine::vtable_from_ptr)"
+    | _ => pure ()
+
 mutual
 
 /-- `Machine::check_value` for `Int`, `Bool`, `Tuple`, `Array`, `Union`,
@@ -1071,7 +1496,7 @@ mutual
 >     ensure_else_ub(int_ty.can_represent(i), \"Value::Int: invalid integer value\")?;
 > }
 > (Value::Bool(_), Type::Bool) => {},
-> ..
+> (Value::Ptr(ptr), Type::Ptr(ptr_ty)) => self.check_ptr(ptr, ptr_ty)?,
 > (Value::Tuple(vals), Type::Tuple { sized_fields, unsized_field, .. }) => {
 >     assert!(unsized_field.is_none(), \"Value: unsized structs cannot be represented as values\");
 >     ensure_else_ub(vals.len() == sized_fields.len(), \"Value::Tuple: invalid number of fields\")?;
@@ -1094,12 +1519,13 @@ mutual
 > (_, Type::TraitObject { .. }) => panic!(\"Value: trait objects cannot be represented as values\"),
 > _ => panic!(\"Value: value does not match type\")"
 The fields of a tuple are checked by `checkFields`, the chunks of a union by
-`checkUnionChunks`, and the data of a variant by `checkVariant`. Pointers are
-outside the fragment. -/
+`checkUnionChunks`, the data of a variant by `checkVariant`, and pointers by
+`checkPtr`. -/
 def checkValue : Val → «Type» → Interp Unit
   | .Int i, .Int t =>
     ensureElseUb (IntType.can_represent t i) "Value::Int: invalid integer value"
   | .Bool _, .Bool => pure ()
+  | .Ptr ptr, .Ptr ptrTy => checkPtr ptr ptrTy
   | .Tuple vals, .Tuple fields _ unsizedField =>
     match unsizedField with
     | some _ => specPanic "Value: unsized structs cannot be represented as values"
@@ -1121,7 +1547,7 @@ def checkValue : Val → «Type» → Interp Unit
   | _, .Array _ _ => specPanic "Value: value does not match type"
   | _, .Union _ _ _ _ => specPanic "Value: value does not match type"
   | _, .Enum _ _ _ _ _ => specPanic "Value: value does not match type"
-  | _, _ => unsupported "check_value for a pointer type"
+  | _, .Ptr _ => specPanic "Value: value does not match type"
 
 /-- The field loop of `check_value` for tuples (`spec/lang/representation.md`):
 > "for (val, (_, ty)) in vals.zip(sized_fields) {
@@ -1236,10 +1662,14 @@ candidates `allocCandidate 0`, `allocCandidate 1`, .., that is, of the
 predicate (`BM.allocAddrOk`). An address returned here therefore satisfies
 every test of the upstream predicate; when no candidate does, `BM.allocate`
 reports `Stop.unsupported` rather than inventing an address. Results about
-this interpretation hold for this resolution of the choice; the fragment
-cannot observe addresses (it has no pointer-to-integer casts or pointer
-comparisons), so the resolution affects which addresses locals receive, not
-which values the program computes. -/
+this interpretation hold for this resolution of the choice. A program can
+observe addresses through pointer-to-integer casts
+(`PointerExposeProvenance`), pointer comparisons (`comparePtr`), and the
+alignment check of an access through a pointer whose type demands more
+alignment than its allocation guarantees (the first-fit addresses are
+multiples of `2^32`, so such a check always passes here although it fails
+for other valid addresses); results about such programs hold for the
+first-fit addresses only. -/
 def BM.pickAddr (mem : BM) (size : Size) (align : Align) : Option Int :=
   firstFitAddr mem size align (2 ^ 32 - 1) 0
 
@@ -1380,16 +1810,6 @@ def ThinPointer.wrapping_offset (ptr : Ptr) (offset : Int) : Ptr :=
   let addr := ptr.addr + offset
   let addr := bringInBounds addr .Unsigned x86_64.PTR_SIZE
   { ptr with addr := addr }
-
-/-- `ThinPointer::widen` (`spec/mem/pointer.md`):
-> "pub fn widen(self, metadata: Option<PointerMeta<Provenance>>) -> Pointer<Provenance> {
->     Pointer {
->         thin_pointer: self,
->         metadata,
->     }
-> }" -/
-def ThinPointer.widen (ptr : Ptr) (metadata : Option (PointerMeta Prov)) : Pointer Prov :=
-  { thin_pointer := ptr, metadata := metadata }
 
 /-- `BasicMemory::dereferenceable` (`spec/mem/basic.md`):
 > "fn dereferenceable(&self, ptr: ThinPointer<Self::Provenance>, len: Size) -> Result {
@@ -1766,13 +2186,22 @@ def placeStore (m : Mach) (place : Place BM) (val : Val) (ty : «Type») : Inter
   if !place.aligned then ub "storing to a place based on a misaligned pointer"
   else typedStore m place.ptr.thin_pointer val ty ⟨1⟩ .None
 
-/-- `Machine::eval_constant` for the constants without provenance:
+/-- `Machine::eval_constant` for the constants that need no global, function,
+or vtable pointer of the machine:
 > "Constant::Int(i) => Value::Int(i),
->  Constant::Bool(b) => Value::Bool(b)," -/
+>  Constant::Bool(b) => Value::Bool(b),"
+> "Constant::PointerWithoutProvenance(addr) => {
+>     Value::Ptr(ThinPointer {
+>         addr,
+>         provenance: None,
+>     }.widen(None))
+> }" -/
 def evalConstant : Constant → Interp Val
   | .Int i => pure (.Int i)
   | .Bool b => pure (.Bool b)
-  | _ => unsupported "eval_constant for a pointer constant"
+  | .PointerWithoutProvenance addr =>
+    pure (.Ptr (ThinPointer.widen { addr := addr, provenance := none } none))
+  | _ => unsupported "eval_constant for a global, function, or vtable pointer constant"
 
 /-! ## Operators (`spec/lang/step/operators.md`) -/
 
@@ -1852,7 +2281,8 @@ def evalCastOp (castOp : CastOp) (arg : Val × «Type») : Interp (Val × «Type
       let val ← transmute operand oldTy newTy
       pure (val, newTy)
 
-/-- `Machine::eval_un_op` for `UnOp::Int` and `UnOp::Cast` (`spec/lang/step/operators.md`):
+/-- `Machine::eval_un_op` for `UnOp::Int`, `UnOp::Cast`, and
+`UnOp::GetThinPointer` (`spec/lang/step/operators.md`):
 > "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
 >     let Value::Int(operand) = operand else { panic!(\"non-integer input to integer operation\") };
@@ -1869,6 +2299,15 @@ def evalCastOp (castOp : CastOp) (arg : Val × «Type») : Interp (Val × «Type
 > ..
 > fn eval_un_op(&self, UnOp::Cast(cast_op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     ret(self.eval_cast_op(cast_op, (operand, op_ty))?)
+> }"
+and `UnOp::GetThinPointer`, which `minimize` emits for a `PtrToPtr` cast from
+a wide to a thin raw pointer:
+> "fn eval_un_op(&self, UnOp::GetThinPointer: UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let Value::Ptr(ptr) = operand else { panic!(\"non-pointer GetThinPointer\") };
+>
+>     let thin_ptr = Pointer { metadata: None, ..ptr };
+>     let thin_ptr_ty = PtrType::Raw { meta_kind: PointerMetaKind::None };
+>     ret((Value::Ptr(thin_ptr), Type::Ptr(thin_ptr_ty)))
 > }" -/
 def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
   match op, arg with
@@ -1882,7 +2321,9 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») : Interp (Val × «Type») :=
     | .error _ => specPanic "sanity check: result of UnOp::Int does not fit in the return type"
   | .Int _, _ => specPanic "non-integer input to integer operation"
   | .Cast castOp, arg => evalCastOp castOp arg
-  | _, _ => unsupported "eval_un_op for an operator outside UnOp::Int and UnOp::Cast"
+  | .GetThinPointer, (.Ptr ptr, _) => pure (.Ptr { ptr with metadata := none }, .Ptr (.Raw .None))
+  | .GetThinPointer, _ => specPanic "non-pointer GetThinPointer"
+  | _, _ => unsupported "eval_un_op for an operator outside UnOp::{Int, Cast, GetThinPointer}"
 
 /-- `Machine::eval_int_bin_op` across all `IntBinOp` variants
 (`spec/lang/step/operators.md`):
@@ -2076,6 +2517,30 @@ def evalRelOp (rel : RelOp) (ord : Ordering) : Val × «Type» :=
       | .gt => 1
     (.Int val, .Int IntType.I8)
 
+/-- `Machine::compare_ptr` (`spec/lang/step/operators.md`), which orders
+pointers by address and then by metadata, ignoring provenance:
+> "fn compare_ptr(left: Pointer<M::Provenance>, right: Pointer<M::Provenance>) -> std::cmp::Ordering {
+>     let thin_cmp = left.thin_pointer.addr.cmp(&right.thin_pointer.addr);
+>     let meta_cmp = match (left.metadata, right.metadata) {
+>         (None, None) => std::cmp::Ordering::Equal,
+>         (Some(PointerMeta::ElementCount(l)), Some(PointerMeta::ElementCount(r))) => l.cmp(&r),
+>         (Some(PointerMeta::VTablePointer(l)), Some(PointerMeta::VTablePointer(r))) => l.addr.cmp(&r.addr),
+>         _ => panic!(\"unmatching metadata in wide pointer comparasion\"),
+>     };
+>     // Lexicographically compare on first the thin pointer and then the metadata
+>     thin_cmp.then(meta_cmp)
+> }"
+Rust's `Ordering::then` keeps the first ordering unless it is `Equal`, as
+Lean's `Ordering.then` does. -/
+def comparePtr (left right : Pointer Prov) : Interp Ordering := do
+  let thinCmp := intCmp left.thin_pointer.addr right.thin_pointer.addr
+  let metaCmp ← match left.metadata, right.metadata with
+    | none, none => pure Ordering.eq
+    | some (.ElementCount l), some (.ElementCount r) => pure (intCmp l r)
+    | some (.VTablePointer l), some (.VTablePointer r) => pure (intCmp l.addr r.addr)
+    | _, _ => specPanic "unmatching metadata in wide pointer comparasion"
+  pure (thinCmp.then metaCmp)
+
 /-- `Machine::eval_bin_op` for `BinOp::Int`, `BinOp::IntWithOverflow`, and
 `BinOp::Rel` (`spec/lang/step/operators.md`):
 > "let Type::Int(int_ty) = l_ty else { panic!(\"non-integer input to integer operation\") };
@@ -2134,7 +2599,10 @@ and, for `BinOp::Rel`:
 > }"
 Integers compare as mathematical integers (`intCmp`), so a signed operand is
 ordered by its value, not by its bit pattern; Booleans compare with
-`false < true` (`boolCmp`). Pointer comparison is outside the fragment. -/
+`false < true` (`boolCmp`), and pointers by address and metadata
+(`comparePtr`). The pointer operators `BinOp::PtrOffset` and
+`BinOp::PtrOffsetFrom` read the machine's memory and are evaluated by
+`evalPtrOffset` and `evalPtrOffsetFrom` instead. -/
 def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp (Val × «Type») :=
   match op, l, r with
   | .Int op, (.Int left, .Int intTy), (.Int right, _) => do
@@ -2153,16 +2621,147 @@ def evalBinOp (op : BinOp) (l : Val × «Type») (r : Val × «Type») : Interp 
     match lTy, left, right with
     | .Int _, .Int left, .Int right => pure (evalRelOp relOp (intCmp left right))
     | .Bool, .Bool left, .Bool right => pure (evalRelOp relOp (boolCmp left right))
-    | .Ptr _, .Ptr _, .Ptr _ => unsupported "BinOp::Rel on pointers (compare_ptr)"
+    | .Ptr _, .Ptr left, .Ptr right => do pure (evalRelOp relOp (← comparePtr left right))
     | _, _, _ => specPanic "relational operator on incomparable type or value-type mismatch"
   | _, _, _ => unsupported "eval_bin_op for an operator outside BinOp::Int, BinOp::IntWithOverflow, and BinOp::Rel"
+
+/-! ## Pointer arithmetic (`spec/lang/step/operators.md`) -/
+
+/-- `Machine::ptr_offset_wrapping` (`spec/lang/step/operators.md`):
+> "/// Perform a wrapping offset on the given pointer. (Can never fail.)
+> fn ptr_offset_wrapping(&self, ptr: ThinPointer<M::Provenance>, offset: Int) -> ThinPointer<M::Provenance> {
+>     ptr.wrapping_offset::<M::T>(offset)
+> }" -/
+def ptrOffsetWrapping (ptr : Ptr) (offset : Int) : Ptr :=
+  ThinPointer.wrapping_offset ptr offset
+
+/-- `Machine::eval_bin_op` for `BinOp::PtrOffset` (`spec/lang/step/operators.md`),
+which offsets a thin pointer by a byte count, either checking that the whole
+range stays inside one live allocation (`inbounds`, `ptrOffsetInbounds`) or
+wrapping around the address space (`ptrOffsetWrapping`). The result keeps the
+type of the left operand:
+> "fn eval_bin_op(
+>     &self,
+>     BinOp::PtrOffset { inbounds }: BinOp,
+>     (left, l_ty): (Value<M>, Type),
+>     (right, _r_ty): (Value<M>, Type)
+> ) -> Result<(Value<M>, Type)> {
+>     let Value::Ptr(Pointer { thin_pointer: left, metadata: None }) = left else {
+>         panic!(\"non-thin-pointer left input to `PtrOffset`\")
+>     };
+>     let Value::Int(right) = right else { panic!(\"non-integer right input to `PtrOffset`\") };
+>
+>     let offset_ptr = if inbounds {
+>         self.ptr_offset_inbounds(left, right)?
+>     } else {
+>         self.ptr_offset_wrapping(left, right)
+>     };
+>     ret((Value::Ptr(offset_ptr.widen(None)), l_ty))
+> }"
+`self` is the machine after both operands were evaluated (`evalValue`). -/
+def evalPtrOffset (m : Mach) (inbounds : Bool) (l r : Val × «Type») : Interp (Val × «Type») :=
+  match l, r with
+  | (.Ptr ⟨left, none⟩, lTy), (.Int right, _) => do
+    let offsetPtr ← if inbounds then ptrOffsetInbounds m left right
+      else pure (ptrOffsetWrapping left right)
+    pure (.Ptr (ThinPointer.widen offsetPtr none), lTy)
+  | (.Ptr ⟨_, none⟩, _), _ => specPanic "non-integer right input to `PtrOffset`"
+  | _, _ => specPanic "non-thin-pointer left input to `PtrOffset`"
+
+/-- `Machine::eval_bin_op` for `BinOp::PtrOffsetFrom`
+(`spec/lang/step/operators.md`), the signed byte distance between two thin
+pointers:
+> "fn eval_bin_op(
+>     &self,
+>     BinOp::PtrOffsetFrom { inbounds, nonneg }: BinOp,
+>     (left, l_ty): (Value<M>, Type),
+>     (right, _r_ty): (Value<M>, Type)
+> ) -> Result<(Value<M>, Type)> {
+>     let Value::Ptr(Pointer { thin_pointer: left, metadata: None }) = left else {
+>         panic!(\"non-thin-pointer left input to `PtrOffsetFrom`\")
+>     };
+>     let Value::Ptr(Pointer { thin_pointer: right, metadata: None }) = right else {
+>         panic!(\"non-thin-pointer right input to `PtrOffsetFrom`\")
+>     };
+>
+>     let distance = left.addr - right.addr;
+>     let distance = if inbounds {
+>         // The \"gap\" between the two pointers must be dereferenceable from both of them.
+>         // This check also ensures that the distance is inbounds of `isize`.
+>         self.mem.signed_dereferenceable(left, -distance)?;
+>         self.mem.signed_dereferenceable(right, distance)?;
+>         // All checked!
+>         distance
+>     } else {
+>         distance.bring_in_bounds(Signed, M::T::PTR_SIZE)
+>     };
+>
+>     if nonneg && distance < Int::ZERO {
+>         throw_ub!(\"PtrOffsetFrom: negative result with `nonneg` flag set\");
+>     }
+>
+>     let isize_int = IntType { signed: Signed, size: M::T::PTR_SIZE };
+>     ret((Value::Int(distance), Type::Int(isize_int)))
+> }" -/
+def evalPtrOffsetFrom (m : Mach) (inbounds nonneg : Bool) (l r : Val × «Type») :
+    Interp (Val × «Type») :=
+  match l, r with
+  | (.Ptr ⟨left, none⟩, _), (.Ptr ⟨right, none⟩, _) => do
+    let distance : Int := left.addr - right.addr
+    let distance ← if inbounds then do
+        CM.signed_dereferenceable m.mem left (-distance)
+        CM.signed_dereferenceable m.mem right distance
+        pure distance
+      else pure (bringInBounds distance .Signed x86_64.PTR_SIZE)
+    if nonneg && decide (distance < 0) then
+      ub "PtrOffsetFrom: negative result with `nonneg` flag set"
+    else
+      pure (.Int distance, .Int ⟨.Signed, x86_64.PTR_SIZE⟩)
+  | (.Ptr ⟨_, none⟩, _), _ => specPanic "non-thin-pointer right input to `PtrOffsetFrom`"
+  | _, _ => specPanic "non-thin-pointer left input to `PtrOffsetFrom`"
+
+/-- The retag of `ValueExpr::AddrOf`, `Machine::mutate_cur_frame` applied to
+the memory model's `retag_ptr`. `Machine::mutate_cur_frame`
+(`spec/lang/machine.md`) runs the closure on the active thread's current
+frame:
+> "fn mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>, &mut ConcurrentMemory<M>) -> O) -> O {
+>     self.threads.mutate_at(self.active_thread, |thread| thread.mutate_cur_frame(|frame| f(frame, &mut self.mem)))
+> }"
+> "fn mutate_cur_frame<O>(&mut self, f: impl FnOnce(&mut StackFrame<M>) -> O) -> O {
+>     if self.stack.is_empty() {
+>         panic!(\"`mutate_cur_frame` called on empty stack!\");
+>     }
+>
+>     let last_idx = self.stack.len() - 1;
+>     self.stack.mutate_at(last_idx, f)
+> }"
+and `BasicMemory` does not override the default `retag_ptr` of the `Memory`
+trait (`spec/mem/interface.md`), which returns the pointer unchanged:
+> "fn retag_ptr(
+>     &mut self,
+>     _frame_extra: &mut Self::FrameExtra,
+>     ptr: Pointer<Self::Provenance>,
+>     _ptr_type: PtrType,
+>     _fn_entry: bool,
+>     _fn_implicit_writes: bool,
+>     _vtable_lookup: impl Fn(ThinPointer<Self::Provenance>) -> crate::lang::VTable + 'static,
+> ) -> Result<Pointer<Self::Provenance>> {
+>     ret(ptr)
+> }"
+The closure changes neither the frame nor memory, so the machine is
+unchanged; only the panics of `mutate_at` (an out-of-range active thread) and
+of `Thread::mutate_cur_frame` (an empty stack) remain. -/
+def retagPtrBM (m : Mach) (ptr : Pointer Prov) : Interp (Pointer Prov) := do
+  let t ← listIndex m.threads m.active_thread "self.threads.mutate_at(self.active_thread, ..)"
+  if t.stack.isEmpty then specPanic "`mutate_cur_frame` called on empty stack!"
+  else pure ptr
 
 /-! ## Place and value expressions (`spec/lang/step/expressions.md`) -/
 
 mutual
 
-/-- `Machine::eval_place` for `PlaceExpr::Local`, `PlaceExpr::Field`, and
-`PlaceExpr::Index` (`spec/lang/step/expressions.md`):
+/-- `Machine::eval_place` for `PlaceExpr::Local`, `PlaceExpr::Field`,
+`PlaceExpr::Index`, and `PlaceExpr::Deref` (`spec/lang/step/expressions.md`):
 > "let ty = self.cur_frame().func.locals[name];
 >  let Some(ptr) = self.cur_frame().locals.get(name) else {
 >      throw_ub!(\"access to a dead local\");
@@ -2226,6 +2825,28 @@ mutual
 >
 >     let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
 >     ret((Place { ptr: ptr.widen(None), ..root }, elem_ty))
+> }"
+and for `PlaceExpr::Deref`, which turns a pointer value into a place. The
+place of a raw pointer may be misaligned, null, or dangling: only loads and
+stores through it check the alignment (`placeLoad`, `placeStore`) and the
+memory (`BM.check_ptr`):
+> "fn eval_place(&mut self, PlaceExpr::Deref { operand, ty }: PlaceExpr) -> Result<(Place<M>, Type)> {
+>     let (Value::Ptr(ptr), Type::Ptr(ptr_type)) = self.eval_value(operand)? else {
+>         panic!(\"dereferencing a non-pointer\")
+>     };
+>     // We know the pointer is valid for its type, but make sure safe pointers are also dereferenceable.
+>     // (We don't do a full retag here, this is not considered creating a new pointer.)
+>     if let Some(pointee) = ptr_type.safe_pointee() {
+>         // this was already checked when the value got created
+>         assert!(self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr));
+>         self.mem.dereferenceable(ptr.thin_pointer, self.compute_size(pointee.layout, ptr.metadata))?;
+>     }
+>     // Check whether this pointer is sufficiently aligned.
+>     // Don't error immediately though! Unaligned places can still be turned into raw pointers.
+>     // However, they cannot be loaded from.
+>     let aligned = self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr);
+>
+>     ret((Place { ptr, aligned }, ty))
 > }" -/
 def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
   | .Local name => do
@@ -2286,9 +2907,26 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
         pure (({ root with ptr := ThinPointer.widen ptr none }, elemTy), m)
       else
         specPanic "sanity check: the indexed offset should not be outside what the type allows."
-  | _ => unsupported "eval_place for a place expression other than Local, Field, or Index"
+  | .Deref operand ty => do
+    let ((v, vTy), m) ← evalValue m operand
+    match v, vTy with
+    | .Ptr ptr, .Ptr ptrType => do
+      match PtrType.safe_pointee ptrType with
+      | some pointee => do
+        let pointeeAlign ← computeAlign m pointee.layout ptr.metadata
+        if !Align.is_aligned pointeeAlign ptr.thin_pointer.addr then
+          specPanic "assertion failed: self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr)"
+        else do
+          let pointeeSize ← computeSize m pointee.layout ptr.metadata
+          CM.dereferenceable m.mem ptr.thin_pointer pointeeSize
+      | none => pure ()
+      let align ← computeAlign m (← Type.layout ty) ptr.metadata
+      pure (({ ptr := ptr, aligned := Align.is_aligned align ptr.thin_pointer.addr }, ty), m)
+    | _, _ => specPanic "dereferencing a non-pointer"
+  | _ => unsupported "eval_place for a place expression other than Local, Deref, Field, or Index"
 
-/-- `Machine::eval_value` for `Constant`, `Tuple`, `Load`, `UnOp`, and `BinOp`:
+/-- `Machine::eval_value` for `Constant`, `Tuple`, `Load`, `AddrOf`, `UnOp`, and
+`BinOp`:
 > "fn eval_value(&mut self, ValueExpr::Constant(constant, ty): ValueExpr) -> .. {
 >     ret((self.eval_constant(constant)?, ty))
 > }
@@ -2315,7 +2953,29 @@ def evalPlace (m : Mach) : PlaceExpr → Interp ((Place BM × «Type») × Mach)
 >     let left = self.eval_value(left)?;
 >     let right = self.eval_value(right)?;
 >     ret(self.eval_bin_op(operator, left, right)?)
-> }" -/
+> }"
+and for `ValueExpr::AddrOf`, which turns a place into the pointer it denotes,
+checks that this pointer is a valid value of the pointer type, and lets the
+aliasing model retag it (`retagPtrBM`, the identity for `BasicMemory`):
+> "fn eval_value(&mut self, ValueExpr::AddrOf { target, ptr_ty }: ValueExpr) -> Result<(Value<M>, Type)> {
+>     let (place, _ty) = self.eval_place(target)?;
+>
+>     // Make sure the new pointer has a valid address.
+>     // Remember that places are basically raw pointers so this is not guaranteed!
+>     self.check_value(Value::Ptr(place.ptr), Type::Ptr(ptr_ty))?;
+>
+>     // Let the aliasing model know.
+>     let lookup = self.vtable_lookup();
+>     let ptr = self.mutate_cur_frame(|frame, mem| {
+>         mem.retag_ptr(&mut frame.extra, place.ptr, ptr_ty, /* fn_entry */ false, /* fn_implicit_writes */ true, lookup)
+>     })?;
+>
+>     ret((Value::Ptr(ptr), Type::Ptr(ptr_ty)))
+> }"
+`eval_bin_op` for `BinOp::PtrOffset` and `BinOp::PtrOffsetFrom` reads the
+machine's memory, so those operators are evaluated by `evalPtrOffset` and
+`evalPtrOffsetFrom` on the machine after both operands, and all others by the
+machine-free `evalBinOp`. -/
 def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
   | .Constant c ty => do pure ((← evalConstant c, ty), m)
   | .Tuple exprs ty => do
@@ -2325,9 +2985,22 @@ def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
     let ((place, ty), m) ← evalPlace m source
     let (v, m) ← placeLoad m place ty
     pure ((v, ty), m)
+  | .AddrOf target ptrTy => do
+    let ((place, _), m) ← evalPlace m target
+    checkValue (.Ptr place.ptr) (.Ptr ptrTy)
+    let ptr ← retagPtrBM m place.ptr
+    pure ((.Ptr ptr, .Ptr ptrTy), m)
   | .UnOp operator operand => do
     let (arg, m) ← evalValue m operand
     pure (← evalUnOp operator arg, m)
+  | .BinOp (.PtrOffset inbounds) left right => do
+    let (l, m) ← evalValue m left
+    let (r, m) ← evalValue m right
+    pure (← evalPtrOffset m inbounds l r, m)
+  | .BinOp (.PtrOffsetFrom inbounds nonneg) left right => do
+    let (l, m) ← evalValue m left
+    let (r, m) ← evalValue m right
+    pure (← evalPtrOffsetFrom m inbounds nonneg l r, m)
   | .BinOp operator left right => do
     let (l, m) ← evalValue m left
     let (r, m) ← evalValue m right
@@ -2460,6 +3133,171 @@ def evalStatement (m : Mach) : Statement → Interp Mach
       pure { m with mem := cm }
   | _ => unsupported "eval_statement for a statement other than Assign/PlaceMention/StorageLive/StorageDead/Deinit"
 
+/-! ## Integer-pointer casts (`spec/mem/intptrcast.md`) -/
+
+/-- `IntPtrCast::expose` (`spec/mem/intptrcast.md`), which records the
+provenance of a pointer cast to an integer:
+> "pub fn expose(&mut self, ptr: ThinPointer<Provenance>) {
+>     if let Some(provenance) = ptr.provenance {
+>         // Remember this provenance as having been exposed.
+>         self.exposed.insert(provenance);
+>     }
+> }" -/
+def IntPtrCast.expose (ipc : IntPtrCast Prov) (ptr : Ptr) : IntPtrCast Prov :=
+  match ptr.provenance with
+  | some provenance => { exposed := setInsert ipc.exposed provenance }
+  | none => ipc
+
+/-- The provenances that the prediction in `IntPtrCast::int2ptr`
+(`spec/mem/intptrcast.md`) resolves among (`int2ptrProvenance`). The
+prediction admits only exposed provenances:
+> "|p| self.exposed.contains(p),"
+and of those, these are the ones of live allocations whose address range,
+including the one-past-the-end address, contains `addr`. -/
+def int2ptrCandidates (allocs : List Gen.Allocation) (exposed : Set Prov) (addr : Int) :
+    List Prov :=
+  (allocs.zipIdx.filter (fun (a, i) =>
+      a.live && decide (a.addr ≤ addr) && decide (addr ≤ a.addr + (Allocation.size a).bytes) &&
+        setContains exposed (⟨(i : Int)⟩, ()))).map (fun (_, i) => (⟨(i : Int)⟩, ()))
+
+/-- How the interpretation resolves the angelic prediction of
+`IntPtrCast::int2ptr` (`spec/mem/intptrcast.md`):
+> "pub fn int2ptr(&self, addr: Int) -> NdResult<ThinPointer<Provenance>> {
+>     // Predict a suitable provenance. It must be either `None` or already exposed.
+>     let provenance = predict(|prov: Option<Provenance>| {
+>         prov.map_or(
+>             true, // `None` is always an option
+>             |p| self.exposed.contains(p),
+>         )
+>     })?;
+>
+>     // Construct a pointer with that provenance.
+>     ret(ThinPointer { addr, provenance })
+> }"
+`predict` is an angelic choice: if some admissible provenance makes the rest
+of the execution well-defined, MiniRust picks it. No single choice is right
+for every continuation, so the interpretation commits to one admissible
+resolution, as `BM.pickAddr` does for the daemonic address choice:
+
+* if exactly one exposed provenance belongs to a live allocation whose range
+  `[addr_a, addr_a + size_a]` contains `addr` (`int2ptrCandidates`), that
+  provenance, the only exposed one under which an access at `addr` can be
+  in bounds;
+* if none does, `None`, under which only zero-sized accesses are allowed and
+  which every exposed provenance would refuse as well;
+* if several do (two live allocations that meet at `addr`, one ending and one
+  starting there), `Stop.unsupported`: which one makes the execution
+  well-defined depends on accesses that have not happened yet.
+
+The resolution is sound for successful executions: it always picks an
+admissible provenance, so a run that returns without UB under it is a run of
+the angelic semantics. A UB result reached through an integer-to-pointer
+cast, however, holds for this resolution only. The resolution fails to be
+the angelic one only when a later access through the pointer, after a
+wrapping offset, would be in bounds of a different exposed allocation. -/
+def int2ptrProvenance (m : Mach) (addr : Int) : Interp (Option Prov) :=
+  match int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr with
+  | [] => pure none
+  | [p] => pure (some p)
+  | _ => unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)"
+
+/-- `IntPtrCast::int2ptr` (`spec/mem/intptrcast.md`) with the provenance
+predicted by `int2ptrProvenance`:
+> "// Construct a pointer with that provenance.
+> ret(ThinPointer { addr, provenance })" -/
+def IntPtrCast.int2ptr (m : Mach) (addr : Int) : Interp Ptr := do
+  let provenance ← int2ptrProvenance m addr
+  pure { addr := addr, provenance := provenance }
+
+/-! ## Intrinsics (`spec/lang/step/intrinsics.md`) -/
+
+/-- `Machine::eval_intrinsic` for the pointer provenance intrinsics
+`IntrinsicOp::PointerExposeProvenance` and
+`IntrinsicOp::PointerWithExposedProvenance` (`spec/lang/step/intrinsics.md`),
+to which `minimize` translates MIR's `PointerExposeProvenance` and
+`PointerWithExposedProvenance` casts:
+> "fn eval_intrinsic(&mut self,
+>     IntrinsicOp::PointerExposeProvenance: IntrinsicOp,
+>     arguments: List<(Value<M>, Type)>,
+>     ret_ty: Type,
+> ) -> NdResult<Value<M>> {
+>     if arguments.len() != 1 {
+>         throw_ub!(\"invalid number of arguments for `PointerExposeProvenance` intrinsic\");
+>     }
+>     let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+>         throw_ub!(\"invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer\");
+>     };
+>     if ret_ty != Type::Int(IntType { signed: Unsigned, size: M::T::PTR_SIZE }) {
+>         throw_ub!(\"invalid return type for `PointerExposeProvenance` intrinsic\")
+>     }
+>
+>     self.intptrcast.expose(ptr);
+>     ret(Value::Int(ptr.addr))
+> }
+>
+> fn eval_intrinsic(&mut self,
+>     IntrinsicOp::PointerWithExposedProvenance: IntrinsicOp,
+>     arguments: List<(Value<M>, Type)>,
+>     ret_ty: Type,
+> ) -> NdResult<Value<M>> {
+>     if arguments.len() != 1 {
+>         throw_ub!(\"invalid number of arguments for `PointerWithExposedProvenance` intrinsic\");
+>     }
+>     let Value::Int(addr) = arguments[0].0 else {
+>         throw_ub!(\"invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer\");
+>     };
+>     let Type::Ptr(ret_ptr_ty) = ret_ty else {
+>         throw_ub!(\"invalid return type for `PointerWithExposedProvenance` intrinsic\");
+>     };
+>     if ret_ptr_ty.meta_kind() != PointerMetaKind::None {
+>         throw_ub!(\"unsized pointee requested for `PointerWithExposedProvenance` intrinsic\");
+>     }
+>
+>     let ptr = self.intptrcast.int2ptr(addr)?;
+>     ret(Value::Ptr(ptr.widen(None)))
+> }"
+Every other intrinsic is outside the fragment. -/
+def evalIntrinsic (m : Mach) (intrinsic : IntrinsicOp) (arguments : List (Val × «Type»))
+    (retTy : «Type») : Interp (Val × Mach) :=
+  match intrinsic with
+  | .PointerExposeProvenance =>
+    if arguments.length ≠ 1 then
+      ub "invalid number of arguments for `PointerExposeProvenance` intrinsic"
+    else
+      match arguments with
+      | [(.Ptr ⟨ptr, none⟩, _)] =>
+        match retTy with
+        | .Int ⟨.Unsigned, ⟨8⟩⟩ =>
+          pure (.Int ptr.addr, { m with intptrcast := IntPtrCast.expose m.intptrcast ptr })
+        | _ => ub "invalid return type for `PointerExposeProvenance` intrinsic"
+      | _ => ub "invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer"
+  | .PointerWithExposedProvenance =>
+    if arguments.length ≠ 1 then
+      ub "invalid number of arguments for `PointerWithExposedProvenance` intrinsic"
+    else
+      match arguments with
+      | [(.Int addr, _)] =>
+        match retTy with
+        | .Ptr retPtrTy =>
+          if PtrType.meta_kind retPtrTy ≠ .None then
+            ub "unsized pointee requested for `PointerWithExposedProvenance` intrinsic"
+          else do
+            let ptr ← IntPtrCast.int2ptr m addr
+            pure (.Ptr (ThinPointer.widen ptr none), m)
+        | _ => ub "invalid return type for `PointerWithExposedProvenance` intrinsic"
+      | _ => ub "invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer"
+  | _ => unsupported "eval_intrinsic for an intrinsic other than the pointer provenance intrinsics"
+
+/-- The argument loop of `Terminator::Intrinsic`
+(`spec/lang/step/terminators.md`), which keeps each argument's type:
+> "let arguments = arguments.try_map(|arg| self.eval_value(arg))?;" -/
+def evalArgs (m : Mach) : List ValueExpr → Interp (List (Val × «Type») × Mach)
+  | [] => pure ([], m)
+  | e :: es => do
+    let (arg, m) ← evalValue m e
+    let (args, m) ← evalArgs m es
+    pure (arg :: args, m)
+
 /-! ## Terminators (`spec/lang/step/terminators.md`) -/
 
 /-- The teardown loop of `Terminator::Return`:
@@ -2557,7 +3395,8 @@ def evalReturn (m : Mach) : Interp Mach := do
       | some nb => jumpToBlock m nb
       | none => ub "return from a function where caller did not specify next block"
 
-/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, and `Return`:
+/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, `Return`,
+and `Intrinsic`:
 > "fn eval_terminator(&mut self, Terminator::Goto(block_name): Terminator) -> NdResult {
 >     self.jump_to_block(block_name)?;
 >     ret(())
@@ -2572,6 +3411,33 @@ def evalReturn (m : Mach) : Interp Mach := do
 > ..
 > fn eval_terminator(&mut self, Terminator::Unreachable: Terminator) -> NdResult {
 >     throw_ub!(\"reached unreachable code\");
+> }"
+and for `Intrinsic` (with `evalIntrinsic`):
+> "fn eval_terminator(
+>     &mut self,
+>     Terminator::Intrinsic { intrinsic, arguments, ret: ret_expr, next_block }: Terminator
+> ) -> NdResult {
+>     // First evaluate return place (left-to-right evaluation).
+>     let (ret_place, ret_ty) = self.eval_place(ret_expr)?;
+>
+>     // Evaluate all arguments.
+>     let arguments = arguments.try_map(|arg| self.eval_value(arg))?;
+>
+>     // Run the actual intrinsic.
+>     let value = self.eval_intrinsic(intrinsic, arguments, ret_ty)?;
+>
+>     // Store return value.
+>     // `eval_intrinsic` above must guarantee that `value` has the right type.
+>     self.place_store(ret_place, value, ret_ty)?;
+>
+>     // Jump to next block.
+>     if let Some(next_block) = next_block {
+>         self.jump_to_block(next_block)?;
+>     } else {
+>         throw_ub!(\"return from an intrinsic where caller did not specify next block\");
+>     }
+>
+>     ret(())
 > }" -/
 def evalTerminator (m : Mach) : Terminator → Interp Mach
   | .Goto blockName => jumpToBlock m blockName
@@ -2582,7 +3448,15 @@ def evalTerminator (m : Mach) : Terminator → Interp Mach
     | _ => specPanic "switch on a non-integer"
   | .Unreachable => ub "reached unreachable code"
   | .Return => evalReturn m
-  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Return"
+  | .Intrinsic intrinsic arguments retExpr nextBlock => do
+    let ((retPlace, retTy), m) ← evalPlace m retExpr
+    let (args, m) ← evalArgs m arguments
+    let (value, m) ← evalIntrinsic m intrinsic args retTy
+    let m ← placeStore m retPlace value retTy
+    match nextBlock with
+    | some nb => jumpToBlock m nb
+    | none => ub "return from an intrinsic where caller did not specify next block"
+  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Return/Intrinsic"
 
 /-! ## The step function (`spec/lang/machine.md`) -/
 
