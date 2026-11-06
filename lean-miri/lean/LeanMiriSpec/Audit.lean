@@ -13,7 +13,9 @@ import Miri
 import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
+import LeanMiriSpec.Correspondence.SimLM1_2
 import LeanMiriSpec.Correspondence.Witness
+import LeanMiriSpec.Correspondence.WitLM1_2
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
