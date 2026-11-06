@@ -1978,8 +1978,30 @@ fn call_return_and_multi_fn_quotations_are_pinned() {
             "rs::CanonAbi::C => CallingConvention::Rust,",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
+        (
+            bb,
+            "let abi = self \
+                 .cx \
+                 .tcx \
+                 .fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty()))) \
+                 .unwrap(); \
+             let conv = translate_calling_convention(abi.conv);",
+            ".fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty()))) \
+                 .unwrap(); \
+             let conv = CallingConvention::Rust;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            prog,
+            "pub fn get_fn_name(&mut self, key: rs::Instance<'tcx>) -> FnName { \
+                 let len = self.fn_name_map.len(); \
+                 *self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(len as _))) \
+             }",
+            "*self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(0)))",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
     ];
-    assert_eq!(cases.len(), 18, "expected 18 pinned MR-4.1 quotations");
+    assert_eq!(cases.len(), 20, "expected 20 pinned MR-4.1 quotations");
 
     let mr41_files = [ptr, types, exprs, mach, terms, bb, prog, ty_rs];
     let lean_root = minirust_dir().join("lean");

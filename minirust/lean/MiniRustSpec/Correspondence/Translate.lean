@@ -1011,11 +1011,24 @@ def lookupFnTarget : FnMap → String → Option (Gen.FnName × Gen.CallingConve
 in list order along with each body's translated calling convention (defaulting
 to `CallingConvention.Rust` if `translateCallConv` is `none`, so `fnNameMap`
 remains total while `translateFnInProg` requires `translateCallConv` to return
-`some`), matching `Ctxt::translate` and `Ctxt::get_fn_name`
+`some`). `Ctxt::translate` names `entry` first
 (`tooling/minimize/src/program.rs`):
 > "let entry_name = FnName(Name::from_internal(0));
 >
->  self.fn_name_map.insert(entry_instance, entry_name);" -/
+>  self.fn_name_map.insert(entry_instance, entry_name);"
+and `Ctxt::get_fn_name` names every other function in the order in which
+translation first references it:
+> "pub fn get_fn_name(&mut self, key: rs::Instance<'tcx>) -> FnName {
+>      // Used as the fn name if it is not named yet.
+>      let len = self.fn_name_map.len();
+>
+>      *self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(len as _)))
+>  }"
+The two numberings therefore coincide when `callees` lists the callees in that
+first-reference order, and otherwise differ only by a consistent renaming of
+`FnName`s, which the fragment cannot observe: function names only index
+`prog.functions` and `Machine::fn_ptrs`, and the fragment has no
+pointer-to-integer casts or pointer comparisons. -/
 def fnNameMap (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir) : FnMap :=
   (entry :: callees).zipIdx.map fun (b, idx) =>
     (b.defPath, (fnName idx, (translateCallConv b.fnAbi.conv).getD .Rust))
@@ -1126,9 +1139,19 @@ def translateUnwindAction (nextCleanup : Nat) :
 >      next_block: target.as_ref().map(|t| self.bb_name_map[t]),
 >      unwind_block,
 >  }"
-with the callee's calling convention `conv` (matching `translateFnInProg`).
-Non-call terminators delegate directly to `translateTerminator` and synthesize
-no extra cleanup blocks. -/
+where `minimize` computes the call edge's `conv` from the *callee instance's*
+own ABI:
+> "let abi = self
+>      .cx
+>      .tcx
+>      .fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty())))
+>      .unwrap();
+>  let conv = translate_calling_convention(abi.conv);"
+so `lookupFnTarget` returns the callee's `translateCallConv callee.fnAbi.conv`,
+which is exactly the `calling_convention` that `translateFnInProg` gives the
+callee (and `create_frame`'s calling-convention check never fails on a
+translated direct call). Non-call terminators delegate directly to
+`translateTerminator` and synthesize no extra cleanup blocks. -/
 def translateTerminatorInProg (fnMap : FnMap)
     (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :
     Option (Gen.Terminator × Nat × List (Gen.BbName × Gen.BasicBlock)) :=

@@ -105,6 +105,10 @@ open MiniRustSpec.Correspondence in
   multi_run_ret_from_start
   multi_run_ub
   multi_run_ub_from_start
+  CallStackRel.frames_ne_nil
+  MultiStateRel.not_returnRel
+  multi_run_ub_rel
+  multi_run_ub_rel_from_start
   multi_steps_error
   multi_steps_error_from_start
   multi_mirNoUB_safe
@@ -120,6 +124,7 @@ open MiniRustSpec.Correspondence in
   multi_mirNoUB_diverges_rel_from_start
   mirCallWithCallees_ret
   mirCallWithCallees_ub
+  mirCallWithCallees_ub_rel
   mirCallWithCallees_noUB
   mirCallWithCallees_steps_error
   mirCallWithCallees_progress
@@ -500,6 +505,60 @@ open MiniRustSpec.Correspondence.Witness in
   diamondCall5_noUB
   diamondCall5_minirust_ret
   diamondCall5_minirust_direct
+  no_returnRel_before
+  never_ub_of_nonUb_stop
+  callDestArgAlias_noUB
+  callDestArgAlias_noUB_transfer_fails
+  callProjMoveReuse_noUB
+  callProjMoveReuse_noUB_transfer_fails
+  uninitProjCallDest_ub_transfer_fails
+  liveCallDestSpin_inFragment
+  liveCallDestSpin_translate
+  liveCallDestSpin_translateInProg
+  ctxLiveCallDestSpin_ok
+  liveCallDestSpin_noUB
+  liveCallDestSpin_noRet
+  liveCallDestSpin_minirust_diverges
+  liveCallDestSpin_minirust_diverges_rel
+  liveCallDestSpin_depth3_step20
+  deadCallDestSpin_rejected
+  ctxDeadCallDestSpin_ok
+  deadCallDestSpin_hyps
+  deadCallDestSpin_noUB
+  deadCallDestSpin_noRet
+  deadCallDestSpin_minirust_ub
+  deadCallDestSpin_noUB_transfer_fails
+  abiArgMismatch_rejected
+  abiArgMismatch_translate
+  abiArgMismatch_anneal_ret
+  abiArgMismatch_noUB
+  abiArgMismatch_minirust_ub
+  abiArgMismatch_noUB_transfer_fails
+  abiRetMismatch_rejected
+  abiRetMismatch_translate
+  abiRetMismatch_anneal_ret
+  abiRetMismatch_noUB
+  abiRetMismatch_minirust_ub
+  abiRetMismatch_noUB_transfer_fails
+  argCountMismatch_rejected
+  argCountMismatch_translate
+  argCountMismatch_anneal_ret
+  argCountMismatch_noUB
+  argCountMismatch_minirust_ub
+  argCountMismatch_noUB_transfer_fails
+  stmtMoveThenCallArg_translate
+  stmtMoveThenCallArg_anneal_ub
+  stmtMoveThenCallArg_minirust_ret
+  stmtMoveThenCallArg_ub_transfer_fails
+  calleeRetUninit_inFragment
+  calleeRetUninit_translate
+  calleeRetUninit_translateInProg
+  ctxCalleeRetUninit_ok
+  calleeRetUninit_anneal_ub
+  calleeRetUninit_minirust_ub
+  calleeRetUninit_minirust_ub_rel
+  calleeRetUninit_minirust_direct
+  calleeRetUninit_converse_error
   ctx0_ok1
   ctx0_ok2
   ctxI8_ok2
@@ -1070,6 +1129,10 @@ open MiniRustSpec.Correspondence in
   multi_run_ret_from_start
   multi_run_ub
   multi_run_ub_from_start
+  CallStackRel.frames_ne_nil
+  MultiStateRel.not_returnRel
+  multi_run_ub_rel
+  multi_run_ub_rel_from_start
   multi_steps_error
   multi_steps_error_from_start
   multi_mirNoUB_safe
@@ -1085,6 +1148,7 @@ open MiniRustSpec.Correspondence in
   multi_mirNoUB_diverges_rel_from_start
   mirCallWithCallees_ret
   mirCallWithCallees_ub
+  mirCallWithCallees_ub_rel
   mirCallWithCallees_noUB
   mirCallWithCallees_steps_error
   mirCallWithCallees_progress
@@ -1400,6 +1464,60 @@ open MiniRustSpec.Correspondence.Witness in
   diamondCall5_noUB
   diamondCall5_minirust_ret
   diamondCall5_minirust_direct
+  no_returnRel_before
+  never_ub_of_nonUb_stop
+  callDestArgAlias_noUB
+  callDestArgAlias_noUB_transfer_fails
+  callProjMoveReuse_noUB
+  callProjMoveReuse_noUB_transfer_fails
+  uninitProjCallDest_ub_transfer_fails
+  liveCallDestSpin_inFragment
+  liveCallDestSpin_translate
+  liveCallDestSpin_translateInProg
+  ctxLiveCallDestSpin_ok
+  liveCallDestSpin_noUB
+  liveCallDestSpin_noRet
+  liveCallDestSpin_minirust_diverges
+  liveCallDestSpin_minirust_diverges_rel
+  liveCallDestSpin_depth3_step20
+  deadCallDestSpin_rejected
+  ctxDeadCallDestSpin_ok
+  deadCallDestSpin_hyps
+  deadCallDestSpin_noUB
+  deadCallDestSpin_noRet
+  deadCallDestSpin_minirust_ub
+  deadCallDestSpin_noUB_transfer_fails
+  abiArgMismatch_rejected
+  abiArgMismatch_translate
+  abiArgMismatch_anneal_ret
+  abiArgMismatch_noUB
+  abiArgMismatch_minirust_ub
+  abiArgMismatch_noUB_transfer_fails
+  abiRetMismatch_rejected
+  abiRetMismatch_translate
+  abiRetMismatch_anneal_ret
+  abiRetMismatch_noUB
+  abiRetMismatch_minirust_ub
+  abiRetMismatch_noUB_transfer_fails
+  argCountMismatch_rejected
+  argCountMismatch_translate
+  argCountMismatch_anneal_ret
+  argCountMismatch_noUB
+  argCountMismatch_minirust_ub
+  argCountMismatch_noUB_transfer_fails
+  stmtMoveThenCallArg_translate
+  stmtMoveThenCallArg_anneal_ub
+  stmtMoveThenCallArg_minirust_ret
+  stmtMoveThenCallArg_ub_transfer_fails
+  calleeRetUninit_inFragment
+  calleeRetUninit_translate
+  calleeRetUninit_translateInProg
+  ctxCalleeRetUninit_ok
+  calleeRetUninit_anneal_ub
+  calleeRetUninit_minirust_ub
+  calleeRetUninit_minirust_ub_rel
+  calleeRetUninit_minirust_direct
+  calleeRetUninit_converse_error
   cmpNotSwitch_inFragment
   cmpNotSwitch_translate
   cmpNotNeg1_anneal_ret

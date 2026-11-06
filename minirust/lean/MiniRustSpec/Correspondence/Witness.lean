@@ -118,20 +118,31 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
 * `callerMain`/`calleePair`, `projDestCaller`/`negI8Callee`/`flipBoolCallee`,
   `chainEntry`/`chainMid`/`chainLeaf`, `callArgUbCaller`,
   `calleeDivZeroCaller`/`divTenI8Callee`, `callSpinCaller`/`idU32Callee`,
-  `callMoveReuse`, `callDestArgAlias`, `callProjMoveReuse`,
-  `stmtMoveThenCallArg`, and `recCycleA`/`recCycleB` (MR-4.1): multi-function
+  `callMoveReuse`, `moveReinitByCall`, `condCallMoveJoin`,
+  `cAbiCaller`/`cAbiCallee`, `diamondCallEntry`/`diamondMidA`/`diamondMidB`,
+  `liveCallDestSpinCaller`/`spinU32Callee`,
+  `calleeRetUninitCaller`/`retUninitCallee`, `callDestArgAlias`,
+  `callProjMoveReuse`, `stmtMoveThenCallArg`, `recCycleA`/`recCycleB`,
+  `badCallConvCaller`, `deadCallDestCaller`, `deadCallDestSpinCaller`,
+  `uninitProjCallDestCaller`, `abiArgMismatchCaller`, `abiRetMismatchCaller`,
+  and `argCountMismatchCaller`/`const5Callee` (MR-4.1): multi-function
   `translateProg` and `progInFragment` programs exercising `Terminator::Call`
   (`ByValue` and `InPlace` argument passing, `Constant::FnPointer`,
-  `fn_from_ptr`, `check_abi_compatibility`, `create_frame`, multi-step
+  `fn_from_ptr`, `check_abi_compatibility`, `create_frame` with both
+  `CallingConvention::Rust` and `CallingConvention::C`, multi-step
   `Call + initBlock` entry, and `UnwindAction::{Continue, Unreachable,
   Terminate}`), multi-frame `Terminator::Return` (`StackPopAction::BackToCaller`
-  into root locals and projected `.0` / `.1` tuple fields), 3-deep nested call
-  stacks returning `Ordering`, call-argument, post-call `move` reuse, and
-  callee-body UB propagation, diverging multi-function call loops
-  (`mirCallWithCallees_diverges_rel`), soundness counterexamples for
-  return-place aliasing, projected `move` call arguments, pre-call `move` reuse,
-  and cyclic call graphs, plus ground-truth unit checks of the `MR-4.1`
-  `Interp` definitions.
+  into root locals and projected `.0` / `.1` tuple fields, and UB on a callee's
+  uninitialized `_0`), 3-deep nested and diamond-shaped call graphs,
+  call-argument, post-call `move` reuse, and callee-body UB propagation,
+  diverging multi-function executions (`mirCallWithCallees_diverges_rel`,
+  including a callee that never returns), soundness counterexamples for
+  return-place aliasing, dead and uninitialized return places, argument-type,
+  return-type, and argument-count mismatches, projected `move` call arguments,
+  pre-call `move` reuse, unsupported calling conventions, and cyclic call graphs
+  (where the necessity witnesses also refute the conclusion of
+  `mirCallWithCallees_noUB` or `mirCallWithCallees_ub` outright), plus
+  ground-truth unit checks of the `MR-4.1` `Interp` definitions.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -8772,13 +8783,17 @@ theorem badCallConv_rejected :
     translateProg badCallConvCaller [badCallConvCallee] = none :=
   ⟨rfl, rfl, rfl, by decide, rfl, by decide, by decide, by decide, rfl⟩
 
-/-- Counterexample 5 (`StorageLive(_2); StorageDead(_2); _2 = idU32Callee(copy _1)`):
-calling into a dead return place `_2`. In MiniRust, `Terminator::Call` evaluates
-the return place `_2` and runs `prepare_for_inplace_passing` BEFORE argument
-evaluation or callee entry, faulting on step 4 (after `initBlock` `Goto(bb0)`,
-`StorageLive(_2)`, and `StorageDead(_2)`) with `"access to a dead local"`
-before `idU32Callee` is ever entered. `callDestOk` requires `lv.contains dst`
-and rejects this caller. -/
+/-- Dead return place
+(`StorageLive(_2); StorageDead(_2); _2 = idU32Callee(copy _1)`):
+in MiniRust, `Terminator::Call` evaluates the return place `_2` and runs
+`prepare_for_inplace_passing` BEFORE argument evaluation or callee entry,
+faulting on step 4 (after `initBlock` `Goto(bb0)`, `StorageLive(_2)`, and
+`StorageDead(_2)`) with `"access to a dead local"` before `idU32Callee` is ever
+entered, whereas Anneal enters `idU32Callee` and faults only when `Return`
+writes the dead `_2`. Both semantics fault here, so this caller alone does not
+show that the check is necessary; `deadCallDestSpinCaller` replaces
+`idU32Callee` with a diverging callee, for which Anneal never faults.
+`callDestOk` requires `lv.contains dst` and rejects this caller. -/
 def deadCallDestCaller : CapturedMir where
   defPath := "witness::dead_call_dest_caller"
   phase := .runtimePostCleanup
@@ -9031,5 +9046,769 @@ theorem diamondCall5_minirust_direct :
         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
       some (some { retAlloc with data := scalarBytes u32 31 }, [1]) := by
   decide +kernel
+
+/-! ### Pass `A3` necessity witnesses for `progInFragment`'s call checks
+
+Each rejected caller below refutes the conclusion of a transfer theorem: either
+of `mirCallWithCallees_noUB` (Anneal's tree is `MirNoUBTree`, yet MiniRust stops
+with UB before any root return) or of `mirCallWithCallees_ub` (Anneal reaches
+UB, yet MiniRust never raises UB). So each conjunct of `progInFragment` that
+rejects it (`callDestOk`'s liveness, tuple-initialization, and return-type
+checks, `callArgsOk`'s parameter types, `callTerminatorOk`'s argument count and
+return-place and argument disjointness, root-only `move` call arguments, and
+`termReadsOk`) is necessary. `deadCallDestSpin_hyps` checks that every other
+hypothesis of `mirCallWithCallees_noUB` holds for `deadCallDestSpinCaller`. -/
+
+/-- `ReturnRel` pops MiniRust's active thread back to the single external caller
+frame, so it holds at none of the first `n` steps when every one of them leaves
+a stack whose length is not `1`. -/
+theorem no_returnRel_before {entry : CapturedMir} {ctx : Ctx} {mInit : Mach} {n : Nat}
+    (hdepth : (List.range n).all (fun k =>
+      (Interp.steps k mInit).toOption.map (fun m => m.threads.map (·.stack.length)) !=
+        some [1]) = true)
+    {k : Nat} {s' : MachineState} {v : Value} {mRet : Mach}
+    (hk : k < n) (hsteps : Interp.steps k mInit = .ok mRet) :
+    ¬ ReturnRel entry ctx s' v mRet := by
+  rintro ⟨_, _, _, _, _, _, _, _, hthr, _, _⟩
+  have hk' := List.all_eq_true.mp hdepth k (List.mem_range.mpr hk)
+  simp [hsteps, Except.toOption, hthr, thread1] at hk'
+
+/-- Whether an `Interp` result is a `Stop.ub`. -/
+def isUbStop {α : Type} : Interp α → Bool
+  | .error (.ub _) => true
+  | _ => false
+
+/-- Whether an `Interp` result is a stop other than `Stop.ub`. -/
+def isNonUbStop {α : Type} : Interp α → Bool
+  | .error (.ub _) => false
+  | .error _ => true
+  | .ok _ => false
+
+/-- If MiniRust raises no UB in its first `N` steps and stops with a non-UB
+error at step `N` (for instance a `specPanic` in the witnesses' external caller
+frame, whose `callerFn` has no blocks, right after the root return), it never
+raises UB: `Interp.steps` propagates an error unchanged. -/
+theorem never_ub_of_nonUb_stop {m : Mach} {N : Nat}
+    (hpre : (List.range N).all (fun k => !isUbStop (Interp.steps k m)) = true)
+    (hstop : isNonUbStop (Interp.steps N m) = true) :
+    ¬ ∃ (n : Nat) (msg : String), Interp.steps n m = .error (.ub msg) := by
+  rintro ⟨n, msg, h⟩
+  by_cases hn : n < N
+  · have hk := List.all_eq_true.mp hpre n (List.mem_range.mpr hn)
+    rw [h] at hk
+    simp [isUbStop] at hk
+  · obtain ⟨j, rfl⟩ : ∃ j, n = N + j := ⟨n - N, by omega⟩
+    cases hN : Interp.steps N m with
+    | ok mN => rw [hN] at hstop; simp [isNonUbStop] at hstop
+    | error e =>
+      rw [steps_add, hN, error_bind] at h
+      injection h with he
+      subst he
+      simp [hN, isNonUbStop] at hstop
+
+/-- `callDestArgAlias` (`_1 = idU32Callee(copy _1)`) refutes the conclusion of
+`mirCallWithCallees_noUB` (at `n = 2`): Anneal returns without UB, while
+MiniRust's `prepare_for_inplace_passing` uninitializes `_1` before the argument
+load. -/
+theorem callDestArgAlias_noUB :
+    MirNoUBTree (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) :=
+  runA_noUB callDestArgAlias 10 _ _ _ rfl
+
+theorem callDestArgAlias_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) ∧
+    Interp.steps 2 callDestArgAliasMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k callDestArgAliasMInit = .ok mRet ∧
+      ReturnRel callDestArgAlias ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee])
+        tr (.normal (v, mem)) :=
+  ⟨callDestArgAlias_noUB, callDestArgAlias_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := callDestArgAliasMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- `callProjMoveReuse` (`_2 = idU32Callee(move (_1.0)); _0 = copy (_1.0)`)
+refutes the conclusion of `mirCallWithCallees_noUB` (at `n = 7`). -/
+theorem callProjMoveReuse_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]) :=
+  runA_noUB callProjMoveReuse 10 _ _ _ rfl
+
+theorem callProjMoveReuse_noUB_transfer_fails :
+    MirNoUBTree
+      (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]) ∧
+    Interp.steps 7 callProjMoveReuseMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 7 ∧ Interp.steps k callProjMoveReuseMInit = .ok mRet ∧
+      ReturnRel callProjMoveReuse ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee])
+        tr (.normal (v, mem)) :=
+  ⟨callProjMoveReuse_noUB, callProjMoveReuse_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := callProjMoveReuseMInit) (n := 7) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- `uninitProjCallDestCaller` refutes the conclusion of
+`mirCallWithCallees_ub`: Anneal faults when `Return` writes `_2.0` into the
+uninitialized tuple `_2`, while MiniRust returns `-5i8` at step `9` and then
+stops with a `specPanic` in the external caller frame, never raising UB. -/
+theorem uninitProjCallDest_ub_transfer_fails :
+    (∃ tr u, Reaches
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) tr u ∧
+      FaultNow u) ∧
+    ¬ ∃ (n : Nat) (msg : String), Interp.steps n uninitProjCallDestMInit = .error (.ub msg) :=
+  ⟨uninitProjCallDest_anneal_ub,
+    never_ub_of_nonUb_stop (N := 10) (by decide +kernel) (by decide +kernel)⟩
+
+/-- Diverging callee `fn spin_u32_callee(x: u32) -> u32 { loop {} }`. -/
+def spinU32Callee : CapturedMir where
+  defPath := "witness::spin_u32_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [{ statements := [], terminator := mkTerm (.goto 0), isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Live return place, diverging callee
+(`StorageLive(_2); _2 = spinU32Callee(copy _1); _0 = copy _2; StorageDead(_2)`):
+in `progInFragment`, and both semantics run forever without UB, MiniRust in
+lockstep with a 3-frame stack (`liveCallDestSpin_depth3_step20`). -/
+def liveCallDestSpinCaller : CapturedMir where
+  defPath := "witness::live_call_dest_spin_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::spin_u32_callee")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 2)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem liveCallDestSpin_inFragment :
+    progInFragment liveCallDestSpinCaller [spinU32Callee] = true := by decide
+
+def liveCallDestSpinProg : Gen.Program :=
+  (translateProg liveCallDestSpinCaller [spinU32Callee]).getD emptyProg
+def liveCallDestSpinFn : Gen.Function :=
+  (translateFnInProg (fnNameMap liveCallDestSpinCaller [spinU32Callee])
+    liveCallDestSpinCaller).getD callerFn
+theorem liveCallDestSpin_translate :
+    translateProg liveCallDestSpinCaller [spinU32Callee] = some liveCallDestSpinProg := rfl
+theorem liveCallDestSpin_translateInProg :
+    translateFnInProg (fnNameMap liveCallDestSpinCaller [spinU32Callee]) liveCallDestSpinCaller =
+      some liveCallDestSpinFn := rfl
+
+def callDestSpinArgs : List Value := [.scalar ⟨7, 4⟩]
+def liveCallDestSpinS0 : MachineState :=
+  initMachineStateWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee]
+def liveCallDestSpinMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin liveCallDestSpinProg 2 liveCallDestSpinCaller
+    liveCallDestSpinFn liveCallDestSpinS0.frame.locals liveCallDestSpinFn.start
+
+theorem ctxLiveCallDestSpin_ok : CtxOk liveCallDestSpinCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [liveCallDestSpinCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [liveCallDestSpinCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [liveCallDestSpinCaller] at hi
+  ret := by
+    intro d hd; simp [liveCallDestSpinCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+private def nextLiveSpinState (s : MachineState) : MachineState :=
+  match stepMirFn liveCallDestSpinCaller s with
+  | .tau (.running s') => s'
+  | _ => s
+
+private def liveCallDestSpinS1 : MachineState := nextLiveSpinState liveCallDestSpinS0
+private def liveCallDestSpinS2 : MachineState := nextLiveSpinState liveCallDestSpinS1
+
+/-- Three-state silent-step invariant: `StorageLive(_2)`, the call, and the
+callee's `Goto(bb0)` self-loop. -/
+def LiveCallDestSpinInv (s : MachineState) : Prop :=
+  s = liveCallDestSpinS0 ∨ s = liveCallDestSpinS1 ∨ s = liveCallDestSpinS2
+
+private theorem liveCallDestSpin_step (s : MachineState) (h : LiveCallDestSpinInv s) :
+    ∃ s', stepMirFn liveCallDestSpinCaller s = .tau (.running s') ∧
+      LiveCallDestSpinInv s' := by
+  rcases h with rfl | rfl | rfl
+  · exact ⟨liveCallDestSpinS1, rfl, Or.inr (Or.inl rfl)⟩
+  · exact ⟨liveCallDestSpinS2, rfl, Or.inr (Or.inr rfl)⟩
+  · exact ⟨liveCallDestSpinS2, rfl, Or.inr (Or.inr rfl)⟩
+
+theorem liveCallDestSpin_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee]) :=
+  treeSafe_of_tau_inv liveCallDestSpin_step (Or.inl rfl)
+
+theorem liveCallDestSpin_noRet (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet
+      (mirCallTreeWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee]) tr o :=
+  noRet_of_tau_inv liveCallDestSpin_step (Or.inl rfl) tr o
+
+theorem liveCallDestSpin_minirust_diverges (n : Nat) :
+    ∃ m', Interp.steps n liveCallDestSpinMInit = .ok m' :=
+  mirCallWithCallees_diverges_steps_ok liveCallDestSpin_inFragment liveCallDestSpin_translate
+    liveCallDestSpin_translateInProg ctxCallSpin ctxLiveCallDestSpin_ok callDestSpinArgs
+    (by decide) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    liveCallDestSpin_noUB liveCallDestSpin_noRet n
+
+theorem liveCallDestSpin_minirust_diverges_rel (n : Nat) :
+    ∃ d s' m0 m' tr,
+      Interp.steps (initLen liveCallDestSpinCaller + n) liveCallDestSpinMInit = .ok m0 ∧
+      Interp.steps (initLen liveCallDestSpinCaller + n + d) liveCallDestSpinMInit = .ok m' ∧
+      MultiStateRel liveCallDestSpinCaller [spinU32Callee] liveCallDestSpinProg ctxCallSpin s' m' ∧
+      Reaches (mirCallTreeWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee])
+        tr (mirTree liveCallDestSpinCaller s') :=
+  mirCallWithCallees_diverges_rel liveCallDestSpin_inFragment liveCallDestSpin_translate
+    liveCallDestSpin_translateInProg ctxCallSpin ctxLiveCallDestSpin_ok callDestSpinArgs
+    (by decide) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    liveCallDestSpin_noUB liveCallDestSpin_noRet n
+
+theorem liveCallDestSpin_depth3_step20 :
+    (Interp.steps 20 liveCallDestSpinMInit).toOption.map
+        (fun m => m.threads.map (·.stack.length)) = some [3] := by
+  decide +kernel
+
+/-- Necessity of `callDestOk`'s liveness check (`lv.contains dst`): the same
+caller as `liveCallDestSpinCaller` with one extra `StorageDead(_2)` before the
+call. Every other per-body check passes (`deadCallDestSpin_rejected`), and
+`livenessOk` itself holds (`liveAtEntry` is a valid post-fixed point that simply
+does not contain `_2` at the call), so only `callDestOk` rejects it. Anneal
+pushes `spinU32Callee` without inspecting `_2` and runs forever without UB,
+whereas MiniRust's `prepare_for_inplace_passing` faults on the dead `_2` at
+step 4 (`deadCallDestSpin_noUB_transfer_fails`). -/
+def deadCallDestSpinCaller : CapturedMir where
+  defPath := "witness::dead_call_dest_spin_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2), mkStmt (.storageDead 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::spin_u32_callee")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 0)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem deadCallDestSpin_rejected :
+    (mustLiveBefore deadCallDestSpinCaller 0 2).contains 2 = false ∧
+    callDestOk deadCallDestSpinCaller.localDecls (mustLiveBefore deadCallDestSpinCaller 0 2)
+      (tupleInitBefore deadCallDestSpinCaller 0 2) u32Decl (local_ 2) = false ∧
+    movesOk deadCallDestSpinCaller = true ∧ mentionsOk deadCallDestSpinCaller = true ∧
+    storageDeadOk deadCallDestSpinCaller = true ∧ livenessOk deadCallDestSpinCaller = true ∧
+    tupleInitOk deadCallDestSpinCaller = true ∧
+    progInFragment deadCallDestSpinCaller [spinU32Callee] = false := by
+  decide
+
+def deadCallDestSpinProg : Gen.Program :=
+  (translateProg deadCallDestSpinCaller [spinU32Callee]).getD emptyProg
+def deadCallDestSpinFn : Gen.Function :=
+  (translateFnInProg (fnNameMap deadCallDestSpinCaller [spinU32Callee])
+    deadCallDestSpinCaller).getD callerFn
+def deadCallDestSpinS0 : MachineState :=
+  initMachineStateWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]
+def deadCallDestSpinMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin deadCallDestSpinProg 2 deadCallDestSpinCaller
+    deadCallDestSpinFn deadCallDestSpinS0.frame.locals deadCallDestSpinFn.start
+
+theorem ctxDeadCallDestSpin_ok : CtxOk deadCallDestSpinCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [deadCallDestSpinCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [deadCallDestSpinCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [deadCallDestSpinCaller] at hi
+  ret := by
+    intro d hd; simp [deadCallDestSpinCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- Every hypothesis of `mirCallWithCallees_noUB` other than `hfrag` holds for
+`deadCallDestSpinCaller` (the remaining `hthreads`, `hactive`, and `hallocs`
+hold by `rfl` for `multiMachineWithCtx`). -/
+theorem deadCallDestSpin_hyps :
+    translateProg deadCallDestSpinCaller [spinU32Callee] = some deadCallDestSpinProg ∧
+    translateFnInProg (fnNameMap deadCallDestSpinCaller [spinU32Callee])
+      deadCallDestSpinCaller = some deadCallDestSpinFn ∧
+    CtxOk deadCallDestSpinCaller ctxCallSpin ∧
+    argsOk deadCallDestSpinCaller callDestSpinArgs = true ∧
+    ProgEnvOk deadCallDestSpinProg (fnNameMap deadCallDestSpinCaller [spinU32Callee])
+      deadCallDestSpinMInit :=
+  ⟨rfl, rfl, ctxDeadCallDestSpin_ok, by decide, progEnvOk_fnPtrMap rfl rfl (by decide)⟩
+
+private def nextDeadSpinState (s : MachineState) : MachineState :=
+  match stepMirFn deadCallDestSpinCaller s with
+  | .tau (.running s') => s'
+  | _ => s
+
+private def deadCallDestSpinS1 : MachineState := nextDeadSpinState deadCallDestSpinS0
+private def deadCallDestSpinS2 : MachineState := nextDeadSpinState deadCallDestSpinS1
+private def deadCallDestSpinS3 : MachineState := nextDeadSpinState deadCallDestSpinS2
+
+/-- Four-state silent-step invariant: `StorageLive(_2)`, `StorageDead(_2)`, the
+call (which Anneal performs without reading the dead `_2`), and the callee's
+`Goto(bb0)` self-loop. -/
+def DeadCallDestSpinInv (s : MachineState) : Prop :=
+  s = deadCallDestSpinS0 ∨ s = deadCallDestSpinS1 ∨ s = deadCallDestSpinS2 ∨
+    s = deadCallDestSpinS3
+
+private theorem deadCallDestSpin_step (s : MachineState) (h : DeadCallDestSpinInv s) :
+    ∃ s', stepMirFn deadCallDestSpinCaller s = .tau (.running s') ∧
+      DeadCallDestSpinInv s' := by
+  rcases h with rfl | rfl | rfl | rfl
+  · exact ⟨deadCallDestSpinS1, rfl, Or.inr (Or.inl rfl)⟩
+  · exact ⟨deadCallDestSpinS2, rfl, Or.inr (Or.inr (Or.inl rfl))⟩
+  · exact ⟨deadCallDestSpinS3, rfl, Or.inr (Or.inr (Or.inr rfl))⟩
+  · exact ⟨deadCallDestSpinS3, rfl, Or.inr (Or.inr (Or.inr rfl))⟩
+
+theorem deadCallDestSpin_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]) :=
+  treeSafe_of_tau_inv deadCallDestSpin_step (Or.inl rfl)
+
+theorem deadCallDestSpin_noRet (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet
+      (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]) tr o :=
+  noRet_of_tau_inv deadCallDestSpin_step (Or.inl rfl) tr o
+
+theorem deadCallDestSpin_minirust_ub :
+    Interp.steps 4 deadCallDestSpinMInit = .error (.ub "access to a dead local") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (instantiated at `n = 4`) fails
+for `deadCallDestSpinCaller`, although its tree is `MirNoUBTree`. -/
+theorem deadCallDestSpin_noUB_transfer_fails :
+    MirNoUBTree
+      (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]) ∧
+    Interp.steps 4 deadCallDestSpinMInit = .error (.ub "access to a dead local") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k deadCallDestSpinMInit = .ok mRet ∧
+      ReturnRel deadCallDestSpinCaller ctxCallSpin s' v mRet ∧
+      ReachesRet
+        (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee])
+        tr (.normal (v, mem)) :=
+  ⟨deadCallDestSpin_noUB, deadCallDestSpin_minirust_ub,
+    fun ⟨_, _, _, tr, _, _, _, _, _, hret⟩ => deadCallDestSpin_noRet tr _ hret⟩
+
+/-- Identity callee `fn id_i8_callee(x: i8) -> i8 { x }`. -/
+def idI8Callee : CapturedMir where
+  defPath := "witness::id_i8_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Necessity of `callArgsOk`'s parameter-type check: passing the `u32` local
+`_1` to `idI8Callee`'s `i8` parameter. Anneal's `initLocals` stores the argument
+value without consulting the parameter type, so the call returns `7` without
+UB, whereas MiniRust's `create_frame` finds
+`check_abi_compatibility(u32, i8) = false` and faults at step 2. -/
+def abiArgMismatchCaller : CapturedMir where
+  defPath := "witness::abi_arg_mismatch_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::id_i8_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem abiArgMismatch_rejected :
+    callArgsOk abiArgMismatchCaller.localDecls [i8Decl] [.copy (local_ 1)] = false ∧
+    progInFragment abiArgMismatchCaller [idI8Callee] = false := by
+  decide
+
+def abiArgMismatchProg : Gen.Program :=
+  (translateProg abiArgMismatchCaller [idI8Callee]).getD emptyProg
+def abiArgMismatchFn : Gen.Function :=
+  (translateFnInProg (fnNameMap abiArgMismatchCaller [idI8Callee])
+    abiArgMismatchCaller).getD callerFnI8
+theorem abiArgMismatch_translate :
+    translateProg abiArgMismatchCaller [idI8Callee] = some abiArgMismatchProg := rfl
+def abiArgMismatchArgs : List Value := [.scalar ⟨7, 4⟩]
+def abiArgMismatchS0 : MachineState :=
+  initMachineStateWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]
+def abiArgMismatchMInit : Mach :=
+  multiMachineWithCtx ctxCalleeDivZero abiArgMismatchProg 2 abiArgMismatchCaller
+    abiArgMismatchFn abiArgMismatchS0.frame.locals abiArgMismatchFn.start
+
+theorem abiArgMismatch_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) []
+      (.normal (.scalar ⟨7, 4⟩,
+        { abiArgMismatchS0.memory with activeCallee := some abiArgMismatchCaller })) :=
+  runA_sound abiArgMismatchCaller 10 _ _ _ rfl
+
+theorem abiArgMismatch_noUB :
+    MirNoUBTree (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) :=
+  runA_noUB abiArgMismatchCaller 10 _ _ _ rfl
+
+theorem abiArgMismatch_minirust_ub :
+    Interp.steps 2 abiArgMismatchMInit =
+      .error (.ub "call ABI violation: argument types are not compatible") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (at `n = 2`) fails for
+`abiArgMismatchCaller`: MiniRust's stack still has the entry frame at steps `0`
+and `1`, so no `ReturnRel` precedes the UB. -/
+theorem abiArgMismatch_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) ∧
+    Interp.steps 2 abiArgMismatchMInit =
+      .error (.ub "call ABI violation: argument types are not compatible") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k abiArgMismatchMInit = .ok mRet ∧
+      ReturnRel abiArgMismatchCaller ctxCalleeDivZero s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee])
+        tr (.normal (v, mem)) :=
+  ⟨abiArgMismatch_noUB, abiArgMismatch_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := abiArgMismatchMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- Necessity of `callDestOk`'s return-type check: writing `idI8Callee`'s `i8`
+result into the `u32` return place `_0`. Anneal's `writePlaceValue` replaces the
+root slot without consulting its type, so the call returns `5` without UB,
+whereas MiniRust's `create_frame` finds `check_abi_compatibility(u32, i8) =
+false` for the return types and faults at step 2. -/
+def abiRetMismatchCaller : CapturedMir where
+  defPath := "witness::abi_ret_mismatch_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, i8Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::id_i8_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem abiRetMismatch_rejected :
+    callDestOk abiRetMismatchCaller.localDecls (mustLiveBefore abiRetMismatchCaller 0 0)
+      (tupleInitBefore abiRetMismatchCaller 0 0) i8Decl (local_ 0) = false ∧
+    progInFragment abiRetMismatchCaller [idI8Callee] = false := by
+  decide
+
+def abiRetMismatchProg : Gen.Program :=
+  (translateProg abiRetMismatchCaller [idI8Callee]).getD emptyProg
+def abiRetMismatchFn : Gen.Function :=
+  (translateFnInProg (fnNameMap abiRetMismatchCaller [idI8Callee])
+    abiRetMismatchCaller).getD callerFn
+theorem abiRetMismatch_translate :
+    translateProg abiRetMismatchCaller [idI8Callee] = some abiRetMismatchProg := rfl
+def abiRetMismatchArgs : List Value := [.scalar ⟨5, 1⟩]
+def abiRetMismatchS0 : MachineState :=
+  initMachineStateWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]
+def abiRetMismatchMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin abiRetMismatchProg 2 abiRetMismatchCaller
+    abiRetMismatchFn abiRetMismatchS0.frame.locals abiRetMismatchFn.start
+
+theorem abiRetMismatch_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) []
+      (.normal (.scalar ⟨5, 1⟩,
+        { abiRetMismatchS0.memory with activeCallee := some abiRetMismatchCaller })) :=
+  runA_sound abiRetMismatchCaller 10 _ _ _ rfl
+
+theorem abiRetMismatch_noUB :
+    MirNoUBTree (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) :=
+  runA_noUB abiRetMismatchCaller 10 _ _ _ rfl
+
+theorem abiRetMismatch_minirust_ub :
+    Interp.steps 2 abiRetMismatchMInit =
+      .error (.ub "call ABI violation: return types are not compatible") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (at `n = 2`) fails for
+`abiRetMismatchCaller`. -/
+theorem abiRetMismatch_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) ∧
+    Interp.steps 2 abiRetMismatchMInit =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k abiRetMismatchMInit = .ok mRet ∧
+      ReturnRel abiRetMismatchCaller ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee])
+        tr (.normal (v, mem)) :=
+  ⟨abiRetMismatch_noUB, abiRetMismatch_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := abiRetMismatchMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- Callee ignoring its parameter (`fn const5_callee(_x: u32) -> u32 { 5 }`). -/
+def const5Callee : CapturedMir where
+  defPath := "witness::const5_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 5)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Necessity of `callTerminatorOk`'s argument-count check: calling the unary
+`const5Callee` with no arguments. Anneal's `initLocals` leaves the missing
+parameter `_1` dead, which `const5Callee` never reads, so the call returns `5`
+without UB, whereas MiniRust's `create_frame` faults at step 2 because
+`func.args.len() != caller_args.len()`. -/
+def argCountMismatchCaller : CapturedMir where
+  defPath := "witness::arg_count_mismatch_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::const5_callee") [] (local_ 0) (some 1)
+        .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem argCountMismatch_rejected :
+    callTerminatorOk [const5Callee] argCountMismatchCaller 0
+      (mkTerm (.call (fnDefOp "witness::const5_callee") [] (local_ 0) (some 1) .continue_)) =
+      false ∧
+    progInFragment argCountMismatchCaller [const5Callee] = false := by
+  decide
+
+def argCountMismatchProg : Gen.Program :=
+  (translateProg argCountMismatchCaller [const5Callee]).getD emptyProg
+def argCountMismatchFn : Gen.Function :=
+  (translateFnInProg (fnNameMap argCountMismatchCaller [const5Callee])
+    argCountMismatchCaller).getD callerFn
+theorem argCountMismatch_translate :
+    translateProg argCountMismatchCaller [const5Callee] = some argCountMismatchProg := rfl
+def argCountMismatchS0 : MachineState :=
+  initMachineStateWithCallees argCountMismatchCaller [] [const5Callee]
+def argCountMismatchMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin argCountMismatchProg 2 argCountMismatchCaller
+    argCountMismatchFn argCountMismatchS0.frame.locals argCountMismatchFn.start
+
+theorem argCountMismatch_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) []
+      (.normal (.scalar ⟨5, 4⟩,
+        { argCountMismatchS0.memory with activeCallee := some argCountMismatchCaller })) :=
+  runA_sound argCountMismatchCaller 10 _ _ _ rfl
+
+theorem argCountMismatch_noUB :
+    MirNoUBTree (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) :=
+  runA_noUB argCountMismatchCaller 10 _ _ _ rfl
+
+theorem argCountMismatch_minirust_ub :
+    Interp.steps 2 argCountMismatchMInit =
+      .error (.ub "call ABI violation: number of arguments does not agree") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (at `n = 2`) fails for
+`argCountMismatchCaller`. -/
+theorem argCountMismatch_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) ∧
+    Interp.steps 2 argCountMismatchMInit =
+      .error (.ub "call ABI violation: number of arguments does not agree") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k argCountMismatchMInit = .ok mRet ∧
+      ReturnRel argCountMismatchCaller ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee])
+        tr (.normal (v, mem)) :=
+  ⟨argCountMismatch_noUB, argCountMismatch_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := argCountMismatchMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-! ### Pre-call statement `move` passed as a call argument
+
+`stmtMoveThenCallArg`
+(`StorageLive(_2); _2 = move _1; _0 = idU32Callee(copy _1)`)
+disagrees in the forward direction: Anneal faults reading the moved-out `_1`,
+while MiniRust (whose statement `move` is a plain `Load`) passes the stale `7`
+and returns it, so `termReadsOk`'s `readsOk (dst :: mo) argOps` is necessary
+for `mirCallWithCallees_ub`. -/
+
+def stmtMoveThenCallArgProg : Gen.Program :=
+  (translateProg stmtMoveThenCallArg [idU32Callee]).getD emptyProg
+def stmtMoveThenCallArgFn : Gen.Function :=
+  (translateFnInProg (fnNameMap stmtMoveThenCallArg [idU32Callee])
+    stmtMoveThenCallArg).getD callerFn
+theorem stmtMoveThenCallArg_translate :
+    translateProg stmtMoveThenCallArg [idU32Callee] = some stmtMoveThenCallArgProg := rfl
+def stmtMoveThenCallArgArgs : List Value := [.scalar ⟨7, 4⟩]
+def stmtMoveThenCallArgS0 : MachineState :=
+  initMachineStateWithCallees stmtMoveThenCallArg stmtMoveThenCallArgArgs [idU32Callee]
+def stmtMoveThenCallArgMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin stmtMoveThenCallArgProg 2 stmtMoveThenCallArg
+    stmtMoveThenCallArgFn stmtMoveThenCallArgS0.frame.locals stmtMoveThenCallArgFn.start
+
+theorem stmtMoveThenCallArg_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees stmtMoveThenCallArg stmtMoveThenCallArgArgs [idU32Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound stmtMoveThenCallArg 10 _ (by decide)
+
+theorem stmtMoveThenCallArg_minirust_ret :
+    (Interp.steps 8 stmtMoveThenCallArgMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 7 }, [1]) := by
+  decide +kernel
+
+/-- The conclusion of `mirCallWithCallees_ub` fails for `stmtMoveThenCallArg`:
+Anneal reaches UB, but MiniRust returns `7` at step `8` and then stops with a
+`specPanic` in the external caller frame, never raising UB. -/
+theorem stmtMoveThenCallArg_ub_transfer_fails :
+    (∃ tr u, Reaches
+      (mirCallTreeWithCallees stmtMoveThenCallArg stmtMoveThenCallArgArgs [idU32Callee]) tr u ∧
+      FaultNow u) ∧
+    ¬ ∃ (n : Nat) (msg : String), Interp.steps n stmtMoveThenCallArgMInit = .error (.ub msg) :=
+  ⟨stmtMoveThenCallArg_anneal_ub,
+    never_ub_of_nonUb_stop (N := 9) (by decide +kernel) (by decide +kernel)⟩
+
+/-! ### Callee `Return` UB in a pushed frame (`StackPopAction::BackToCaller`) -/
+
+/-- Callee returning its uninitialized `_0`
+(`fn ret_uninit_callee(x: u32) -> u32` whose only block is `return`). -/
+def retUninitCallee : CapturedMir where
+  defPath := "witness::ret_uninit_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [{ statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Caller `_0 = retUninitCallee(copy _1)`: in `progInFragment`, and both
+semantics fault on the callee's `Return` (Anneal reads the `.uninit` `_0`;
+MiniRust's `typed_load` of the callee's `_0` decodes `Uninit` bytes) before
+`StackPopAction::BackToCaller` writes the caller's return place. -/
+def calleeRetUninitCaller : CapturedMir where
+  defPath := "witness::callee_ret_uninit_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::ret_uninit_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem calleeRetUninit_inFragment :
+    progInFragment calleeRetUninitCaller [retUninitCallee] = true := by decide
+
+def calleeRetUninitProg : Gen.Program :=
+  (translateProg calleeRetUninitCaller [retUninitCallee]).getD emptyProg
+def calleeRetUninitFn : Gen.Function :=
+  (translateFnInProg (fnNameMap calleeRetUninitCaller [retUninitCallee])
+    calleeRetUninitCaller).getD callerFn
+theorem calleeRetUninit_translate :
+    translateProg calleeRetUninitCaller [retUninitCallee] = some calleeRetUninitProg := rfl
+theorem calleeRetUninit_translateInProg :
+    translateFnInProg (fnNameMap calleeRetUninitCaller [retUninitCallee]) calleeRetUninitCaller =
+      some calleeRetUninitFn := rfl
+def calleeRetUninitArgs : List Value := [.scalar ⟨3, 4⟩]
+def calleeRetUninitMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin calleeRetUninitProg 2 calleeRetUninitCaller calleeRetUninitFn
+    (initMachineStateWithCallees calleeRetUninitCaller calleeRetUninitArgs
+      [retUninitCallee]).frame.locals
+    calleeRetUninitFn.start
+
+theorem ctxCalleeRetUninit_ok : CtxOk calleeRetUninitCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [calleeRetUninitCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [calleeRetUninitCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [calleeRetUninitCaller] at hi
+  ret := by
+    intro d hd; simp [calleeRetUninitCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem calleeRetUninit_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees calleeRetUninitCaller calleeRetUninitArgs [retUninitCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound calleeRetUninitCaller 10 _ (by decide)
+
+theorem calleeRetUninit_minirust_ub :
+    ∃ (n : Nat) (msg : String), Interp.steps n calleeRetUninitMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := calleeRetUninit_anneal_ub
+  exact mirCallWithCallees_ub calleeRetUninit_inFragment calleeRetUninit_translate
+    calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
+    (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- The callee-`Return` fault is localized (`mirCallWithCallees_ub_rel`):
+MiniRust reaches a machine still `MultiStateRel`-related to Anneal, hence not a
+`ReturnRel` state, whose next step raises UB. -/
+theorem calleeRetUninit_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n calleeRetUninitMInit = .ok mLast ∧
+      MultiStateRel calleeRetUninitCaller [retUninitCallee] calleeRetUninitProg ctxCallSpin
+        sLast mLast ∧
+      (∀ s' v, ¬ ReturnRel calleeRetUninitCaller ctxCallSpin s' v mLast) ∧
+      Interp.step mLast = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := calleeRetUninit_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, _⟩ :=
+    mirCallWithCallees_ub_rel calleeRetUninit_inFragment calleeRetUninit_translate
+      calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
+      (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, fun _ _ => hrel.not_returnRel, hstep⟩
+
+theorem calleeRetUninit_minirust_direct :
+    Interp.steps 4 calleeRetUninitMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+theorem calleeRetUninit_converse_error :
+    (∃ msg,
+      Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u,
+        Reaches (mirCallTreeWithCallees calleeRetUninitCaller calleeRetUninitArgs
+          [retUninitCallee]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k calleeRetUninitMInit = .ok mRet ∧
+      ReturnRel calleeRetUninitCaller ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees calleeRetUninitCaller calleeRetUninitArgs
+        [retUninitCallee]) tr (.normal (v, mem))) :=
+  mirCallWithCallees_steps_error calleeRetUninit_inFragment calleeRetUninit_translate
+    calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
+    (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    calleeRetUninit_minirust_direct
 
 end MiniRustSpec.Correspondence.Witness

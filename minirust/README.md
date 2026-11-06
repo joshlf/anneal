@@ -196,6 +196,9 @@ restricted to the fragment checked by `inFragment`:
   arguments, and any number of temporaries (fewer than `2^31` locals in all),
   all of integer type (`u8`..`u128`, `i8`..`i128`, `usize`, `isize`), `bool`,
   `core::cmp::Ordering`, or a 2-tuple `(Int, bool)` for any integer type `Int`;
+* the body's ABI calling convention (`body.fnAbi.conv`) is `Rust` or `C`, the
+  two conventions `minimize`'s `translate_calling_convention` supports
+  (`translateCallConv`; `minimize` panics on any other);
 * `StorageLive(_i)` and `StorageDead(_i)` of any local (`StorageDead` only of
   temporaries, as MiniRust's well-formedness check requires), and `Deinit(_i)`
   of a root local, which `minimize` does not translate and we translate to
@@ -254,18 +257,28 @@ restricted to the fragment checked by `inFragment`:
   translating `CallConv.rust` and `CallConv.c` per `minimize`'s
   `translate_calling_convention` and rejecting unsupported ABIs) — direct
   monomorphic `TerminatorKind.call` with `some targetBb` and non-cleanup
-  `UnwindAction` (`Continue`, `Unreachable`, or `Terminate`): `translateCallArg`
-  lowers `Operand::Move` to `ArgumentExpr::InPlace` (writing `Uninit` bytes in
+  `UnwindAction` (`Continue`, `Unreachable`, or `Terminate`): the call edge
+  carries the callee's own calling convention (`lookupFnTarget`, as `minimize`
+  derives it from `fn_abi_of_instance`), `translateCallArg` lowers
+  `Operand::Move` to `ArgumentExpr::InPlace` (writing `Uninit` bytes in
   MiniRust too, restricted by `callArgOk` to root locals `move _j`) and
-  `Copy`/`Constant` to `ArgumentExpr::ByValue`; `livenessOk` and `tupleInitOk`
-  verify by greatest fixed point that `destination` is live (and an initialized
-  `(Int, bool)` tuple when writing `_dst.0` or `_dst.1`) and disjoint from
-  `argOps`; `termReadsOk` checks `readsOk (dst :: mo) argOps` (allowing `_dst ∈
-  mo` on root overwrites `⟨dst, []⟩` while requiring `!mo.contains dst` on
-  projected writes `⟨dst, _ :: _⟩`), and `termMoved` clears root `dst` from
-  `mo`; and `maxStackLocals entry callees < 2^31` bounds worst-case stack
-  allocations across acyclic call graphs; all targets are blocks of the body; no
-  cleanup blocks.
+  `Copy`/`Constant` to `ArgumentExpr::ByValue`; `callArgsOk` and `callDestOk`
+  require each argument and the return place to have the callee's parameter
+  and return types (so `check_abi_compatibility` succeeds); `callDestOk` uses
+  the greatest fixed points verified by `livenessOk` and `tupleInitOk` to
+  require that `destination` is live (and an initialized `(Int, bool)` tuple
+  when writing `_dst.0` or `_dst.1`), and `callTerminatorOk` requires it to be
+  disjoint from `argOps`; `termReadsOk` checks `readsOk (dst :: mo) argOps`
+  (allowing `_dst ∈ mo` on root overwrites `⟨dst, []⟩` while requiring
+  `!mo.contains dst` on projected writes `⟨dst, _ :: _⟩`), and `termMoved`
+  clears root `dst` from `mo`; and `maxStackLocals entry callees < 2^31` bounds
+  worst-case stack allocations across acyclic call graphs; all targets are
+  blocks of the body; no cleanup blocks. For each of the liveness,
+  tuple-initialization, parameter-type, return-type, argument-count,
+  return-place/argument disjointness, root-only `move`, and stale-argument
+  (`termReadsOk`) checks, `Witness.lean` refutes the conclusion of
+  `mirCallWithCallees_noUB` or `mirCallWithCallees_ub` for a caller that the
+  check rejects, so none of them can be dropped.
 
 ### States
 
@@ -316,21 +329,23 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   resumed caller at `targetBb:0`; `k = 1` step on root `Return` to `ReturnRel`,
   ordinary statements/branches, and UB via `MultiStepRel.ub'`).
 * `multi_run_ret`, `multi_run_ret_from_start`, `multi_run_ub`,
-  `multi_run_ub_from_start`, `multi_steps_error`,
-  `multi_steps_error_from_start`, `multi_mirNoUB_safe`,
+  `multi_run_ub_from_start`, `multi_run_ub_rel`, `multi_run_ub_rel_from_start`,
+  `multi_steps_error`, `multi_steps_error_from_start`, `multi_mirNoUB_safe`,
   `multi_mirNoUB_safe_from_start`, `multi_steps_outcome`,
   `multi_steps_outcome_from_start`, `multi_steps_outcome_any_from_start`,
   `multi_mirNoUB_progress`, `multi_mirNoUB_progress_from_start`,
   `multi_mirNoUB_progress_any_from_start`, `multi_mirNoUB_diverges_steps_ok`,
   `multi_mirNoUB_diverges_from_start`, `multi_mirNoUB_diverges_rel_from_start`,
-  and `mirCallWithCallees_{ret, ub, noUB, steps_error, progress, progress_any,
-  outcome, outcome_any, diverges_steps_ok, diverges_rel}` (`Run.lean`): lift
-  `MultiStepRel` (using `steps_ok_mono` so no intermediate error at `j < k`
-  during multi-step `Call + initBlock` can ever hide) to full forward return,
-  forward UB, converse `n`-step error soundness, `MirNoUBTree` safety, arbitrary
-  `n : Nat` outcome trichotomy and forward progress (including startup steps
-  `n ≤ initLen entry`), and diverging call-loop liveness on
-  `mirCallTreeWithCallees entry args callees`.
+  and `mirCallWithCallees_{ret, ub, ub_rel, noUB, steps_error, progress,
+  progress_any, outcome, outcome_any, diverges_steps_ok, diverges_rel}`
+  (`Run.lean`): lift `MultiStepRel` (using `steps_ok_mono` so no intermediate
+  error at `j < k` during multi-step `Call + initBlock` can ever hide) to full
+  forward return, forward UB (localized by the `_rel` variants to a step taken
+  from a `MultiStateRel`-related machine, which `MultiStateRel.not_returnRel`
+  shows is never a `ReturnRel` state), converse `n`-step error soundness,
+  `MirNoUBTree` safety, arbitrary `n : Nat` outcome trichotomy and forward
+  progress (including startup steps `n ≤ initLen entry`), and diverging
+  call-loop liveness on `mirCallTreeWithCallees entry args callees`.
 * `step_correspondence` (`Simulation.lean`): for a single-body fragment, its
   translation, and related states, one step of Anneal's coalgebra
   `stepMirFn body s` and one `Machine::step` satisfy `StepRel`: a silent
@@ -391,7 +406,8 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
 
 * `callerMain`/`calleePair`, `projDestCaller`,
   `chainEntry`/`chainMid`/`chainLeaf`, `callArgUbCaller`, `calleeDivZeroCaller`,
-  `callSpinCaller`, `callMoveReuse`, `moveReinitByCall`, `condCallMoveJoin`,
+  `calleeRetUninitCaller`, `callSpinCaller`, `liveCallDestSpinCaller`,
+  `callMoveReuse`, `moveReinitByCall`, `condCallMoveJoin`,
   `cAbiCaller`/`cAbiCallee`, and `diamondCallEntry`/`diamondMidA`/`diamondMidB`
   (MR-4.1): `callerMain` invokes `calleePair` (`initLen calleePair = 2`, 3-step
   `Call + initBlock` entry) passing `_1` via `ArgumentExpr::ByValue` and
@@ -407,21 +423,33 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   calling convention translation (`cAbi32_*`), while `diamondCallEntry ->
   {diamondMidA, diamondMidB} -> cAbiCallee` exercises a diamond DAG call graph
   with shared leaf `cAbiCallee` (`diamondCall5_*`); `callArgUbCaller`,
-  `calleeDivZeroCaller`, and `callMoveReuse` exercise UB during argument
-  evaluation, inside a pushed callee frame, and on post-call reuse of an
+  `calleeDivZeroCaller`, `calleeRetUninitCaller`, and `callMoveReuse` exercise
+  UB during argument evaluation, inside a pushed callee frame, on a callee's
+  `Return` of an uninitialized `_0`, and on post-call reuse of an
   `InPlace`-moved local via `mirCallWithCallees_ub` and
   `mirCallWithCallees_steps_error`; `callSpinCaller` proves infinite lockstep
-  call/return divergence (`callSpin_minirust_diverges_rel`); `moveReinitByCall`
+  call/return divergence (`callSpin_minirust_diverges_rel`) and
+  `liveCallDestSpinCaller` divergence inside a callee that never returns
+  (`liveCallDestSpin_minirust_diverges_rel`); `moveReinitByCall`
   re-initializes a moved-out local via a root call destination, and
   `condCallMoveJoin` exercises a branch-correlated `InPlace` call move across a
-  CFG join (`condCallMoveJoin1_*`, `condCallMoveJoin0_*`); `callDestArgAlias`,
-  `callProjMoveReuse`, `stmtMoveThenCallArg`, `recCycleA`/`recCycleB`,
-  `badCallConvCallee`/`badCallConvSysvBody`/`badCallConvCaller`,
-  `deadCallDestCaller` (where MiniRust faults in `prepare_for_inplace_passing`
-  before callee entry), and `uninitProjCallDestCaller` (where Anneal faults on
-  writing `_2.0` to an uninitialized 2-tuple while MiniRust's byte store
-  succeeds, motivating `tupleInitOk`) witness the soundness boundaries of
-  `progInFragment`; and
+  CFG join (`condCallMoveJoin1_*`, `condCallMoveJoin0_*`);
+  `deadCallDestSpinCaller` (dead return place), `uninitProjCallDestCaller`
+  (uninitialized tuple under a projected return place), `abiArgMismatchCaller`
+  and `abiRetMismatchCaller` (parameter and return types),
+  `argCountMismatchCaller` (argument count), `callDestArgAlias` (return place
+  read by an argument), `callProjMoveReuse` (projected `move` argument), and
+  `stmtMoveThenCallArg` (stale argument after a statement `move`) are each
+  rejected by `progInFragment` and refute the conclusion of
+  `mirCallWithCallees_noUB` (`*_noUB_transfer_fails`: Anneal's tree is
+  `MirNoUBTree`, yet MiniRust raises UB before any root return, via
+  `no_returnRel_before`) or of `mirCallWithCallees_ub`
+  (`*_ub_transfer_fails`: Anneal reaches UB, yet MiniRust never raises UB, via
+  `never_ub_of_nonUb_stop`), while `deadCallDestCaller`,
+  `recCycleA`/`recCycleB`,
+  and `badCallConvCallee`/`badCallConvSysvBody`/`badCallConvCaller` mark the
+  remaining boundaries (a dead return place with a returning callee, where both
+  semantics fault; cyclic call graphs; unsupported calling conventions); and
   `layout_ptr_and_array_mr41`, `evalConstant_and_fnFromPtr_mr41`,
   `checkAbiCompatibility_all_variants_mr41`, `createFrame_ub_mr41`, and
   `evalReturn_missingNextBlock_and_bottomOfStack_ub` directly verify every
@@ -689,7 +717,26 @@ These are deliberate and are the first things to lift:
   casts or pointer comparisons).
 * **One thread, called from a caller frame.** MiniRust makes it UB for the
   bottom frame of the main thread to return, while Anneal's root body returns
-  normally, so the relation places the root execution above an arbitrary external caller.
+  normally, so the relation places the root execution above an arbitrary
+  external caller. The forward UB theorems `run_ub`, `mirCall_ub`, and
+  `mirCallWithCallees_ub` conclude only that some MiniRust step raises UB; their
+  proofs produce that step before the root return, but the statements do not
+  say so, and for a `ctx` whose caller continuation itself raises UB the
+  conclusion would hold even if the callee returned normally. For
+  multi-function programs, `multi_run_ub_rel` and `mirCallWithCallees_ub_rel`
+  close this gap: the faulting step is taken from a `MultiStateRel`-related
+  machine, which still runs `entry`'s call tree and is never a `ReturnRel`
+  state (`MultiStateRel.not_returnRel`). The single-body theorems keep the
+  weaker statement. The converse theorems (`steps_error`, `mirCall_noUB`,
+  `mirCallWithCallees_steps_error`, `mirCallWithCallees_noUB`) separate the two
+  cases with `ReturnRel`, and the witnesses' external caller (`callerFn`, with
+  no blocks) stops with a `specPanic`, never UB, right after the return
+  (`never_ub_of_nonUb_stop`).
+* **`extern "C"` entry functions.** `mkStartFn` calls the entry with
+  `CallingConvention::Rust`, as `minimize`'s `mk_start_fn` does, so a
+  translated program whose entry has `CallConv.c` would fault in `create_frame`
+  if run from `prog.start`. The correspondence theorems start at
+  `fEntry.start` under an external `rootCtx` and are unaffected.
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.

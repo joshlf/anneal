@@ -1347,6 +1347,101 @@ theorem multi_run_ub_from_start {entry : CapturedMir} {callees : List CapturedMi
   obtain ⟨n, msg, hsteps⟩ := multi_run_ub hfrag hprog rootCtx s m0 hrel0 hreach hfault
   exact ⟨initLen entry + n, msg, by rw [steps_add, hm0, ok_bind, hsteps]⟩
 
+/-- MiniRust's frames below the active one in a `CallStackRel` always include
+the external root caller frame. -/
+theorem CallStackRel.frames_ne_nil {entry : CapturedMir} {callees : List CapturedMir}
+    {fnMap : FnMap} {rootCtx : Ctx} {cs : List SavedCallerFrame} {cfs : List Frame}
+    {curBody : CapturedMir} {curCtx : Ctx} {cb rf : Nat}
+    (h : CallStackRel entry callees fnMap rootCtx cs cfs curBody curCtx cb rf) : cfs ≠ [] := by
+  cases h <;> simp
+
+/-- A `MultiStateRel`-related machine still runs `entry`'s call tree above the
+external root caller (its active stack has at least two frames), so it never
+satisfies `ReturnRel`, which pops back to the external caller alone. -/
+theorem MultiStateRel.not_returnRel {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} {rootCtx : Ctx} {s : MachineState} {m : Mach}
+    (hrel : MultiStateRel entry callees prog rootCtx s m)
+    {body : CapturedMir} {ctx : Ctx} {s' : MachineState} {v : Value} :
+    ¬ ReturnRel body ctx s' v m := by
+  obtain ⟨_, hrelAt⟩ := hrel
+  obtain ⟨callerFrames, curCtx, curFn, curLm, candBound, remFuel, curBudget, hst⟩ := hrelAt.stack
+  obtain ⟨_, _, hcs, _, _, _, _, hthr, _⟩ := hst
+  rintro ⟨_, _, _, _, _, _, _, _, hthr', _, _⟩
+  rw [hthr] at hthr'
+  have hlen := congrArg (fun ts => ts.map (·.stack.length)) hthr'
+  simp [thread1] at hlen
+  exact hcs.frames_ne_nil hlen
+
+/-- **Localized multi-function UB.** If Anneal's multi-frame semantics of
+`entry` can reach UB, MiniRust reaches in `n` steps a machine `mLast` that is
+still `MultiStateRel`-related to an Anneal state `sLast` (so `entry`'s call tree
+is still on MiniRust's stack and `mLast` is not a `ReturnRel` state,
+`MultiStateRel.not_returnRel`), and the very next MiniRust step raises UB.
+Unlike `multi_run_ub`, this attributes the fault to `entry` or one of its
+callees: it cannot be an error of the external caller after the root return. -/
+theorem multi_run_ub_rel {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} (hfrag : progInFragment entry callees = true)
+    (hprog : translateProg entry callees = some prog) (rootCtx : Ctx)
+    (s : MachineState) (m : Mach)
+    (hrel : MultiStateRel entry callees prog rootCtx s m)
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirTree entry s) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n m = .ok mLast ∧ MultiStateRel entry callees prog rootCtx sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧ Interp.steps (n + 1) m = .error (.ub msg) := by
+  obtain ⟨t', i, k, htau, hobs, hfi⟩ := hfault
+  obtain ⟨n1, s1, m1, h1, hrel1, rfl⟩ :=
+    multi_reaches_rel hfrag hprog rootCtx hreach s m rfl hrel
+  obtain ⟨n2, s2, m2, h2, hrel2, rfl⟩ :=
+    multi_reaches_rel hfrag hprog rootCtx (tauStar_reaches htau) s1 m1 rfl hrel1
+  have hsr := multi_step_correspondence entry callees prog hfrag hprog rootCtx s2 m2 hrel2
+  rw [mirTree_observe] at hobs
+  generalize stepMirFn entry s2 = node at hsr hobs
+  cases node with
+  | ret r => simp [ITreeF.map] at hobs
+  | tau x => simp [ITreeF.map] at hobs
+  | vis i0 k0 =>
+    simp only [ITreeF.map] at hobs
+    injection hobs with hi _
+    subst hi
+    cases i0 with
+    | inr b =>
+      cases b with
+      | inl _ => exact False.elim hfi
+      | inr _ => exact False.elim hfi
+    | inl a =>
+      cases a with
+      | fail fk =>
+        cases fk with
+        | unsupported => exact False.elim hsr
+        | outOfFuel => exact False.elim hsr
+        | ub =>
+          obtain ⟨msg, hmsg⟩ := hsr
+          have h12 : Interp.steps (n1 + n2) m = .ok m2 := by
+            rw [steps_add, h1, ok_bind, h2]
+          refine ⟨n1 + n2, s2, m2, msg, h12, hrel2, hmsg, ?_⟩
+          rw [steps_add, h12, ok_bind, Interp.steps, hmsg]
+          rfl
+
+/-- **Localized multi-function UB from `fEntry.start`.** -/
+theorem multi_run_ub_rel_from_start {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} {fEntry : Gen.Function}
+    (hfrag : progInFragment entry callees = true)
+    (hprog : translateProg entry callees = some prog)
+    (rootCtx : Ctx) (s : MachineState) (mInit : Mach)
+    (hstart : MultiStartRel entry callees prog fEntry rootCtx s mInit)
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirTree entry s) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n mInit = .ok mLast ∧ MultiStateRel entry callees prog rootCtx sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧ Interp.steps (n + 1) mInit = .error (.ub msg) := by
+  obtain ⟨m0, hm0, hrel0⟩ := multi_step_start hfrag hstart
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrelLast, hstep, hsteps1⟩ :=
+    multi_run_ub_rel hfrag hprog rootCtx s m0 hrel0 hreach hfault
+  refine ⟨initLen entry + n, sLast, mLast, msg, ?_, hrelLast, hstep, ?_⟩
+  · rw [steps_add, hm0, ok_bind, hsteps]
+  · rw [Nat.add_assoc, steps_add, hm0, ok_bind, hsteps1]
+
 /-- **Multi-function converse error soundness.** If MiniRust stops with *any*
 error `e` within `n` steps of a `MultiStateRel`-related machine, then either
 `e` is UB and Anneal's multi-frame tree reaches UB (`FaultNow`), or MiniRust
@@ -1830,6 +1925,37 @@ theorem mirCallWithCallees_ub {entry : CapturedMir} {callees : List CapturedMir}
     (hreach : Reaches (mirCallTreeWithCallees entry args callees) tr u) (hfault : FaultNow u) :
     ∃ (n : Nat) (msg : String), Interp.steps n mInit = .error (.ub msg) :=
   multi_run_ub_from_start hfrag hprog rootCtx
+    (initMachineStateWithCallees entry args callees) mInit
+    (initMachineStateWithCallees_startRel hfrag hfEntry rootCtx hctx args hargs mInit henv
+      hthreads hactive hallocs)
+    hreach hfault
+
+/-- **Localized multi-function call-tree UB.** If
+`mirCallTreeWithCallees entry args callees` reaches UB, MiniRust started at
+`fEntry.start` reaches a `MultiStateRel`-related machine (still running
+`entry`'s call tree, hence not a `ReturnRel` state) whose next step raises
+UB. -/
+theorem mirCallWithCallees_ub_rel {entry : CapturedMir} {callees : List CapturedMir}
+    {prog : Gen.Program} {fEntry : Gen.Function}
+    (hfrag : progInFragment entry callees = true)
+    (hprog : translateProg entry callees = some prog)
+    (hfEntry : translateFnInProg (fnNameMap entry callees) entry = some fEntry)
+    (rootCtx : Ctx) (hctx : CtxOk entry rootCtx)
+    (args : List Value) (hargs : argsOk entry args = true)
+    (mInit : Mach) (henv : ProgEnvOk prog (fnNameMap entry callees) mInit)
+    (hthreads : mInit.threads =
+      [thread1 rootCtx [rootCtx.caller,
+        { calleeFrame fEntry rootCtx (entry.argCount + 1) 0 0 with next_block := fEntry.start }]])
+    (hactive : mInit.active_thread = 0)
+    (hallocs : mInit.mem.memory.allocations =
+      rootCtx.base ++ localAllocs rootCtx (entry.localDecls.take (entry.argCount + 1))
+        (initMachineStateWithCallees entry args callees).frame.locals)
+    {tr : List (Event MirEffect)} {u : ITree MirEffect MirOutcome}
+    (hreach : Reaches (mirCallTreeWithCallees entry args callees) tr u) (hfault : FaultNow u) :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n mInit = .ok mLast ∧ MultiStateRel entry callees prog rootCtx sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧ Interp.steps (n + 1) mInit = .error (.ub msg) :=
+  multi_run_ub_rel_from_start hfrag hprog rootCtx
     (initMachineStateWithCallees entry args callees) mInit
     (initMachineStateWithCallees_startRel hfrag hfEntry rootCtx hctx args hargs mInit henv
       hthreads hactive hallocs)
