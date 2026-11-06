@@ -220,4 +220,90 @@ theorem evalPlaceProject_scalarPair_field0_field1_simulation
       rfl
 
 
+
+theorem evalCheckedAdd_simulation
+    {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
+    (hsz_eq : sc₁.sizeBytes = sc₂.sizeBytes)
+    (kind : Miri.MIR.IntegerKind)
+    (locals : List LocalSlot) (mem : Memory) :
+    IntegerBinOpResultRel locals mem
+      (evalScalarBinOp .addWithOverflow sc₁ sc₂ locals mem kind.signed)
+      (Miri.Interpreter.IntegerOps.binary .AddWithOverflow
+        ⟨msc₁, ⟨translateSizeBytes sc₁.sizeBytes, kind⟩⟩
+        ⟨msc₂, ⟨translateSizeBytes sc₂.sizeBytes, kind⟩⟩) := by
+  have harith : IsArithmeticOrCmpBinOp .addWithOverflow := by
+    dsimp [IsArithmeticOrCmpBinOp]
+    right; right; right; right; right; right; left; rfl
+  have hop : (translateBinOp .addWithOverflow : Option Miri.MIR.BinOp) = some .AddWithOverflow := rfl
+  exact evalBinOp_arithmetic_simulation harith hop hrel₁ hrel₂ hsz_eq kind locals mem
+
+theorem evalCheckedSub_simulation
+    {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
+    (hsz_eq : sc₁.sizeBytes = sc₂.sizeBytes)
+    (kind : Miri.MIR.IntegerKind)
+    (locals : List LocalSlot) (mem : Memory) :
+    IntegerBinOpResultRel locals mem
+      (evalScalarBinOp .subWithOverflow sc₁ sc₂ locals mem kind.signed)
+      (Miri.Interpreter.IntegerOps.binary .SubWithOverflow
+        ⟨msc₁, ⟨translateSizeBytes sc₁.sizeBytes, kind⟩⟩
+        ⟨msc₂, ⟨translateSizeBytes sc₂.sizeBytes, kind⟩⟩) := by
+  have harith : IsArithmeticOrCmpBinOp .subWithOverflow := by
+    dsimp [IsArithmeticOrCmpBinOp]
+    right; right; right; right; right; right; right; left; rfl
+  have hop : (translateBinOp .subWithOverflow : Option Miri.MIR.BinOp) = some .SubWithOverflow := rfl
+  exact evalBinOp_arithmetic_simulation harith hop hrel₁ hrel₂ hsz_eq kind locals mem
+
+theorem evalCheckedMul_simulation
+    {sc₁ sc₂ : MirAst.ScalarInt} {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁) (hrel₂ : ScalarRel sc₂ msc₂)
+    (hsz_eq : sc₁.sizeBytes = sc₂.sizeBytes)
+    (kind : Miri.MIR.IntegerKind)
+    (locals : List LocalSlot) (mem : Memory) :
+    IntegerBinOpResultRel locals mem
+      (evalScalarBinOp .mulWithOverflow sc₁ sc₂ locals mem kind.signed)
+      (Miri.Interpreter.IntegerOps.binary .MulWithOverflow
+        ⟨msc₁, ⟨translateSizeBytes sc₁.sizeBytes, kind⟩⟩
+        ⟨msc₂, ⟨translateSizeBytes sc₂.sizeBytes, kind⟩⟩) := by
+  have harith : IsArithmeticOrCmpBinOp .mulWithOverflow := by
+    dsimp [IsArithmeticOrCmpBinOp]
+    right; right; right; right; right; right; right; right; left; rfl
+  have hop : (translateBinOp .mulWithOverflow : Option Miri.MIR.BinOp) = some .MulWithOverflow := rfl
+  exact evalBinOp_arithmetic_simulation harith hop hrel₁ hrel₂ hsz_eq kind locals mem
+
+
+
+
+theorem checked_binop_then_assert_simulation
+    {body : CapturedMir} {nonAddrTaken : Nat → Prop}
+    {s0 : MachineState} {m0 : AnnealStepState}
+    {topFrame0 : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (_hframes0 : m0.stack.frames = #[topFrame0])
+    (hstate0 : StateRel body s0 m0)
+    (hloc0 : ValidFrameLocation body s0.frame)
+    (himm0 : NonAddrTakenImmediate body nonAddrTaken m0)
+    (hbody : WellTypedBody body nonAddrTaken)
+    (op : BinOp) (_hop : op = .addWithOverflow ∨ op = .subWithOverflow ∨ op = .mulWithOverflow)
+    (tmp dest : Local) (a b : Operand) (target : BasicBlockIdx)
+    (bb0 bb1 : BasicBlockData)
+    (_hbb0 : get? body.basicBlocks s0.frame.blockIdx = some bb0)
+    (stmt0 : Statement)
+    (_hstmt0_get : get? bb0.statements s0.frame.stmtIdx = some stmt0)
+    (_hstmt0 : stmt0.kind = .assign ⟨tmp, []⟩ (.binaryOp op a b))
+    (_hstmt1 : get? bb0.statements (s0.frame.stmtIdx + 1) = none)
+    (_hterm : bb0.terminator.kind = .assert (.copy ⟨tmp, [ProjectionElem.field 1 { kind := .bool, layoutIdx := 0 }]⟩) false target .unreachable)
+    (_hbb1 : get? body.basicBlocks target = some bb1)
+    (tmpTy : Ty)
+    (_hdecl_tmp : get? body.localDecls tmp = some { mutability := .mut, ty := tmpTy, debugName := none })
+    (destTy : Ty)
+    (_hdecl_dest : get? body.localDecls dest = some { mutability := .mut, ty := destTy, debugName := none })
+    (stmt2 : Statement)
+    (_hstmt2_get : get? bb1.statements 0 = some stmt2)
+    (_hstmt2 : stmt2.kind = .assign ⟨dest, []⟩ (.use (.copy ⟨tmp, [ProjectionElem.field 0 destTy]⟩))) :
+    RunRel body nonAddrTaken (runAnnealBounded body 3 s0) (runMiriBounded body 3 m0) :=
+  run_wellTypedBody_simulation 3 hbody hstate0 hloc0 himm0
+
+
 end LeanMiriSpec.Correspondence
+
