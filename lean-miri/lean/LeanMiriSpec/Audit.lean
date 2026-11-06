@@ -93,11 +93,28 @@ open LeanMiriSpec.Correspondence in
   annealStepHooks_storageLive_eq
   annealStepHooks_storageDead_eq
   annealStepHooks_storageDead_returnPlace
+  annealStepHooks_deinit_ne_ok
+  annealStepHooks_retag_ne_ok
+  ValidFrameLocation.preserved
+  NonAddrTakenImmediate.preserved
+  run_wellTypedBody_simulation
+  run_wellTypedBody_bisim
   Witness.stateRel_init
   Witness.wellTypedBody
   Witness.bisim_applies
   Witness.divByZero_ub_agrees
   Witness.div_returns_agree
+  Witness.run_bisim_divBody
+  Witness.stateRel_signedDiv
+  Witness.wellTyped_signedDiv
+  Witness.run_bisim_signedDiv
+  Witness.signedDiv_intMinNegOne_ub_agrees
+  Witness.signedDiv_returns_agree
+  Witness.stateRel_addWithOverflow
+  Witness.wellTyped_addWithOverflow
+  Witness.run_bisim_addWithOverflow
+  Witness.addWithOverflow_overflows_agrees
+  Witness.addWithOverflow_noOverflow_agrees
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment depends only on Lean's
@@ -180,6 +197,58 @@ example {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable} {m :
     (annealStepHooks localDecls layouts).storageDead () 0 m =
       (m, .error (.stack .cannotMakeReturnPlaceDead)) :=
   annealStepHooks_storageDead_returnPlace hframes
+
+example {body : CapturedMir} {nonAddrTaken : Nat → Prop}
+    (fuel : Nat) {s : MachineState} {m : AnnealStepState}
+    (hbody : WellTypedBody body nonAddrTaken)
+    (hstate : StateRel body s m)
+    (hloc : ValidFrameLocation body s.frame)
+    (himm : NonAddrTakenImmediate body nonAddrTaken m) :
+    ((∃ s', runAnnealBounded body fuel s = .running s') ↔
+      (∃ m', runMiriBounded body fuel m = .running m')) ∧
+    (∀ s' m',
+      runAnnealBounded body fuel s = .running s' →
+      runMiriBounded body fuel m = .running m' →
+      StateRel body s' m') ∧
+    ((∃ retVal mem', runAnnealBounded body fuel s = .returned retVal mem') ↔
+      (∃ m' retImm, runMiriBounded body fuel m = .returned m' (.ok (.immediate retImm)))) ∧
+    (∀ retVal mem' m' retImm,
+      runAnnealBounded body fuel s = .returned retVal mem' →
+      runMiriBounded body fuel m = .returned m' (.ok (.immediate retImm)) →
+      ∃ decl0, get? body.localDecls 0 = some decl0 ∧
+        ImmediateRel decl0.ty body.layouts retVal retImm) ∧
+    (runAnnealBounded body fuel s = .faulted .ub ↔
+      ∃ m' msg, runMiriBounded body fuel m = .error m' (.undefinedBehavior msg)) ∧
+    ((∃ s', runAnnealBounded body fuel s = .running s') ∨
+      (∃ retVal mem', runAnnealBounded body fuel s = .returned retVal mem') ∨
+      runAnnealBounded body fuel s = .faulted .ub) :=
+  run_wellTypedBody_bisim fuel hbody hstate hloc himm
+
+example (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
+    (place : MirAst.Place) (span : String) (m m' : AnnealStepState) :
+    Miri.Interpreter.Step.evalStatement (annealStepHooks localDecls layouts) ()
+      (translateStmt ⟨.deinit place, span⟩) m ≠ (m', .ok ()) :=
+  annealStepHooks_deinit_ne_ok localDecls layouts place span m m'
+
+example (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable)
+    (rk : MirAst.RetagKind) (place : MirAst.Place) (span : String) (m m' : AnnealStepState) :
+    Miri.Interpreter.Step.evalStatement (annealStepHooks localDecls layouts) ()
+      (translateStmt ⟨.retag rk place, span⟩) m ≠ (m', .ok ()) :=
+  annealStepHooks_retag_ne_ok localDecls layouts rk place span m m'
+
+example (divisorBits : Nat) (hd : divisorBits < 256) :
+    WellTypedBody (Witness.signedDivBody divisorBits) ∧
+    StateRel (Witness.signedDivBody divisorBits)
+      (Witness.annealSignedDivInit divisorBits)
+      (Witness.miriSignedDivInit divisorBits) :=
+  ⟨Witness.wellTyped_signedDiv divisorBits hd, Witness.stateRel_signedDiv divisorBits⟩
+
+example (rhs : Nat) (hrhs : rhs < 65536) :
+    WellTypedBody (Witness.addWithOverflowBody rhs) ∧
+    StateRel (Witness.addWithOverflowBody rhs)
+      (Witness.annealAddOvfInit rhs)
+      (Witness.miriAddOvfInit rhs) :=
+  ⟨Witness.wellTyped_addWithOverflow rhs hrhs, Witness.stateRel_addWithOverflow rhs⟩
 
 end StatementPins
 

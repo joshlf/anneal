@@ -169,7 +169,13 @@ end ImmediateRel
 
 /-- Simulation relation between an optional Anneal `Value` (`none` for uninitialized
 storage, `some v` for initialized storage) at type `ty` and a memory-backed
-`Miri.Interpreter.MemPlace AnnealProv` in `mem`. -/
+`Miri.Interpreter.MemPlace AnnealProv` in `mem`.
+
+`relOffset` is the allocation-relative byte offset within `localAlloc.allocation`,
+decoupled from the virtual address `mp.ptr.offset` (`mp.ptr.offset = baseAddr + relOffset`
+under `Miri.Memory.AllocAddresses`) so Phase 2 address-taken locals with non-zero
+virtual base addresses require zero changes to `MemPlaceRel`, `LocalRel`, `FrameRel`,
+or `StateRel`. -/
 inductive MemPlaceRel
     (mem : Miri.Memory.MemoryState AnnealProv Unit Unit)
     (ty : Ty)
@@ -179,19 +185,40 @@ inductive MemPlaceRel
   | mk
       (allocId : Miri.Memory.AllocId)
       (tag : Miri.Memory.BorTag)
+      (relOffset : Miri.ABI.Size)
       (localAlloc : Miri.Memory.LocalAllocation AnnealProv Unit Unit)
       (ptr_prov : mp.ptr.provenance = some (.concrete allocId tag))
       (no_misalign : mp.misaligned = none)
       (thin_meta : mp.metadata = .none)
       (live_lookup : (allocId, localAlloc) ∈ mem.live.toList)
+      (mut_alloc : localAlloc.allocation.mutability = .Mut)
+      (aligned_ptr :
+        mp.ptr.offset.isAligned (translateTy ty layouts).layout.align.abi = .ok true)
+      (offset_le_addr : relOffset.bytes.toNat ≤ mp.ptr.offset.bytes.toNat)
       (in_bounds :
-        mp.ptr.offset.bytes.toNat + (translateTy ty layouts).layout.size.bytes.toNat ≤
+        relOffset.bytes.toNat + (translateTy ty layouts).layout.size.bytes.toNat ≤
           localAlloc.allocation.byteSize.bytes.toNat)
+      (uninit_consistent :
+        optVal = none →
+          (translateTy ty layouts).layout.size ≠ Miri.ABI.Size.ZERO →
+          localAlloc.allocation.initializationMask.isRangeInitialized
+            (Miri.Memory.allocRange relOffset ((translateTy ty layouts).layout.size)) ≠
+              Except.ok (Except.ok ()))
       (val_consistent :
         ∀ v, optVal = some v →
           localAlloc.allocation.initializationMask.isRangeInitialized
-            (Miri.Memory.allocRange mp.ptr.offset ((translateTy ty layouts).layout.size)) =
-              Except.ok (Except.ok ())) :
+            (Miri.Memory.allocRange relOffset ((translateTy ty layouts).layout.size)) =
+              Except.ok (Except.ok ()))
+      (scalar_consistent :
+        ∀ sc, optVal = some (.scalar sc) →
+          (translateTy ty layouts).layout.size = translateSizeBytes sc.sizeBytes ∧
+          (ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) ∧
+          ∃ msc,
+            ScalarRel sc msc ∧
+            localAlloc.allocation.readScalar
+              annealTargetDataLayout
+              (Miri.Memory.allocRange relOffset ((translateTy ty layouts).layout.size))
+              false = .ok (.fromScalarInt msc)) :
       MemPlaceRel mem ty layouts optVal mp
 
 /-- Simulation relation between an Anneal `LocalSlot` and a `Miri.Interpreter.LocalState`

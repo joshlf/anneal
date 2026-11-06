@@ -168,8 +168,11 @@ import re
 import sys
 
 
+CHAR_LIT_RE = re.compile(r"'(?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|\\.|[^'\\\n])'")
+
+
 def code_only(text):
-    """Blank out comments (nested `/- -/`, `--`) and string literals."""
+    """Blank out comments (nested `/- -/`, `--`), string literals, and Lean char literals."""
     out = list(text)
     pos, depth, in_string = 0, 0, False
     while pos < len(text):
@@ -205,6 +208,16 @@ def code_only(text):
             end = len(text) if end < 0 else end
             out[pos:end] = " " * (end - pos)
             pos = end
+        elif text[pos] == "'" and (
+            pos == 0 or (not text[pos - 1].isalnum() and text[pos - 1] not in "_'»")
+        ):
+            m = CHAR_LIT_RE.match(text, pos)
+            if m:
+                span_len = m.end() - pos
+                out[pos:m.end()] = " " * span_len
+                pos = m.end()
+            else:
+                pos += 1
         elif text[pos] == '"':
             in_string = True
             out[pos] = " "
@@ -237,8 +250,12 @@ vendor = pathlib.Path("lean-miri/vendor")
 vendor_files = [vendor / "Miri.lean"] + sorted((vendor / "Miri").rglob("*.lean"))
 trusted_files = sorted(pathlib.Path("trusted/lean").rglob("*.lean"))
 spec_files = sorted(pathlib.Path("lean-miri/lean").rglob("*.lean"))
+correspondence_files = [
+    p for p in spec_files if p != pathlib.Path("lean-miri/lean/LeanMiriSpec/Audit.lean")
+]
 check(vendor_files, ("LeanMiriSpec", "Trusted", "Anneal"), "vendored")
 check(trusted_files, ("LeanMiriSpec", "Miri"), "trusted")
+check(correspondence_files, ("Lean",), "non-audit LeanMiriSpec")
 if not any(m == "Miri" or m.startswith("Miri.") for p in spec_files for m in imports(p)):
     print("ERROR: no LeanMiriSpec file imports Miri", file=sys.stderr)
     sys.exit(1)
@@ -255,23 +272,83 @@ import pathlib
 import re
 import sys
 
-sys.dont_write_bytecode = True
-sys.path.insert(0, "lean-miri/vendor/tools")
-from check_semantic_sources import code_only  # noqa: E402  (pinned upstream helper)
+CHAR_LIT_RE = re.compile(r"'(?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|\\.|[^'\\\n])'")
+
+
+def code_only_char_aware(text):
+    """Blank out comments, string literals, and Lean character literals (`'\"'`, etc.)."""
+    out = list(text)
+    pos, depth, in_string = 0, 0, False
+    while pos < len(text):
+        if depth:
+            if text.startswith("/-", pos):
+                depth += 1
+                out[pos:pos + 2] = "  "
+                pos += 2
+            elif text.startswith("-/", pos):
+                depth -= 1
+                out[pos:pos + 2] = "  "
+                pos += 2
+            else:
+                if text[pos] != "\n":
+                    out[pos] = " "
+                pos += 1
+        elif in_string:
+            if text[pos] == "\\" and pos + 1 < len(text):
+                out[pos:pos + 2] = "  "
+                pos += 2
+            else:
+                if text[pos] == '"':
+                    in_string = False
+                if text[pos] != "\n":
+                    out[pos] = " "
+                pos += 1
+        elif text.startswith("/-", pos):
+            depth = 1
+            out[pos:pos + 2] = "  "
+            pos += 2
+        elif text.startswith("--", pos):
+            end = text.find("\n", pos)
+            end = len(text) if end < 0 else end
+            out[pos:end] = " " * (end - pos)
+            pos = end
+        elif text[pos] == "'" and (
+            pos == 0 or (not text[pos - 1].isalnum() and text[pos - 1] not in "_'»")
+        ):
+            m = CHAR_LIT_RE.match(text, pos)
+            if m:
+                out[pos:m.end()] = " " * (m.end() - pos)
+                pos = m.end()
+            else:
+                pos += 1
+        elif text[pos] == '"':
+            in_string = True
+            out[pos] = " "
+            pos += 1
+        else:
+            pos += 1
+    return "".join(out)
+
 
 # The kernel-level audit in LeanMiriSpec/Audit.lean is authoritative; this scan
 # rejects constructs that could hide unsoundness from it or from reviewers.
 FORBIDDEN = re.compile(
-    r"\b(?:sorry|admit|native_decide|axiom|unsafe|implemented_by|extern|"
+    r"\b(?:sorry|admit|native_decide|axiom|opaque|unsafe|implemented_by|extern|"
     r"ofReduceBool|trustCompiler|skipKernelTC)\b|\+native\b|@\[\s*csimp"
 )
+METAPROG_RE = re.compile(r"\b(?:elab|macro|elab_rules|macro_rules|syntax)\b")
 found = []
 files = sorted(pathlib.Path("lean-miri/lean").rglob("*.lean"))
+audit_file = pathlib.Path("lean-miri/lean/LeanMiriSpec/Audit.lean")
 for path in files:
-    stripped = code_only(path.read_text(encoding="utf-8"))
+    stripped = code_only_char_aware(path.read_text(encoding="utf-8"))
     for match in FORBIDDEN.finditer(stripped):
         line = stripped.count("\n", 0, match.start()) + 1
         found.append(f"{path}:{line}: forbidden construct {match.group()!r}")
+    if path != audit_file:
+        for match in METAPROG_RE.finditer(stripped):
+            line = stripped.count("\n", 0, match.start()) + 1
+            found.append(f"{path}:{line}: metaprogramming construct {match.group()!r} outside Audit.lean")
 if found:
     print("\n".join(found), file=sys.stderr)
     sys.exit(1)
