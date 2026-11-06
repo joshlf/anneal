@@ -7192,7 +7192,19 @@ def ptrAllocByteBound?
                       | .none => inferElemListByteStride subElems
                     | .none => inferElemListByteStride subElems
                   | .none => inferElemListByteStride subElems
-                .some (Nat.mul (length subElems) elemSz)
+                  let subLenOpt : Option Nat :=
+                    match fromEnd with
+                    | false =>
+                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx (length subElems)) with
+                      | true => .some (Nat.sub toIdx fromIdx)
+                      | false => .none
+                    | true =>
+                      match Nat.ble (Nat.add fromIdx toIdx) (length subElems) with
+                      | true => .some (Nat.sub (Nat.sub (length subElems) toIdx) fromIdx)
+                      | false => .none
+                  match subLenOpt with
+                  | .some subLen => .some (Nat.mul subLen elemSz)
+                  | .none => .some 0
               | _ => .some 0
             | .none =>
               let initPlace : Place := {
@@ -7258,7 +7270,14 @@ def ptrAllocByteBound?
                     local_ := entry.targetLocal
                     projection := subInitProj
                   }
-                  match encValOpt with
+                  let subInitValOpt : Option Value :=
+                    match rootValOpt with
+                    | .some rootVal =>
+                      match readProjectedValue locals rootVal subInitProj with
+                      | .ok v => .some v
+                      | _ => .none
+                    | .none => .none
+                  match subInitValOpt with
                   | .some (.aggregate 0 subElems) =>
                     let elemSz :=
                       match placeTy localDecls layouts subInitPlace with
@@ -7270,7 +7289,19 @@ def ptrAllocByteBound?
                           | .none => inferElemListByteStride subElems
                         | .none => inferElemListByteStride subElems
                       | .none => inferElemListByteStride subElems
-                    .some (Nat.mul (length subElems) elemSz)
+                      let subLenOpt : Option Nat :=
+                    match fromEnd with
+                    | false =>
+                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx (length subElems)) with
+                      | true => .some (Nat.sub toIdx fromIdx)
+                      | false => .none
+                    | true =>
+                      match Nat.ble (Nat.add fromIdx toIdx) (length subElems) with
+                      | true => .some (Nat.sub (Nat.sub (length subElems) toIdx) fromIdx)
+                      | false => .none
+                  match subLenOpt with
+                  | .some subLen => .some (Nat.mul subLen elemSz)
+                  | .none => .some 0
                   | .some _ => .some 0
                   | .none =>
                     match placeTy localDecls layouts subInitPlace with
