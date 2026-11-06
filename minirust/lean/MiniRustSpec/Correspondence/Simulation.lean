@@ -2614,7 +2614,7 @@ theorem progInFragment_spec {entry : CapturedMir} {callees : List CapturedMir}
     simp only [hm, decide_eq_true_eq] at hmax
     exact ⟨hnd, hall, rb, hm, hmax⟩
 
-theorem bodyInProgFragment_spec {fnMap : List (String × Gen.FnName)}
+theorem bodyInProgFragment_spec {fnMap : FnMap}
     {callees : List CapturedMir} {body : CapturedMir}
     (h : bodyInProgFragment fnMap callees body = true) :
     body.phase = .runtimePostCleanup ∧
@@ -3478,7 +3478,7 @@ theorem MultiStepRel.ub' {entry : CapturedMir} {callees : List CapturedMir}
   ⟨msg, hm⟩
 
 theorem CallStackRel.payloads {entry : CapturedMir} {callees : List CapturedMir}
-    {fnMap : List (String × Gen.FnName)} {rootCtx : Ctx}
+    {fnMap : FnMap} {rootCtx : Ctx}
     {cs : List SavedCallerFrame} {cfs : List Frame} {curBody : CapturedMir}
     {curCtx : Ctx} {cb rf : Nat}
     (h : CallStackRel entry callees fnMap rootCtx cs cfs curBody curCtx cb rf) :
@@ -3488,7 +3488,7 @@ theorem CallStackRel.payloads {entry : CapturedMir} {callees : List CapturedMir}
   | cons _ _ _ _ _ _ _ hPayloads => exact hPayloads
 
 theorem CallStackRel.nil_body_eq {entry : CapturedMir} {callees : List CapturedMir}
-    {fnMap : List (String × Gen.FnName)} {rootCtx : Ctx}
+    {fnMap : FnMap} {rootCtx : Ctx}
     {cfs : List Frame} {curBody : CapturedMir} {curCtx : Ctx} {cb rf : Nat}
     (h : CallStackRel entry callees fnMap rootCtx [] cfs curBody curCtx cb rf) :
     curBody = entry := by
@@ -3496,7 +3496,7 @@ theorem CallStackRel.nil_body_eq {entry : CapturedMir} {callees : List CapturedM
   rfl
 
 theorem CallStackRel.inv_nil {entry : CapturedMir} {callees : List CapturedMir}
-    {fnMap : List (String × Gen.FnName)} {rootCtx : Ctx}
+    {fnMap : FnMap} {rootCtx : Ctx}
     {callerFrames : List Frame} {curBody : CapturedMir} {curCtx : Ctx}
     {candBound remFuel : Nat}
     (h : CallStackRel entry callees fnMap rootCtx [] callerFrames curBody curCtx
@@ -3508,7 +3508,7 @@ theorem CallStackRel.inv_nil {entry : CapturedMir} {callees : List CapturedMir}
   | nil hBase hRet _ _ _ => exact ⟨rfl, rfl, rfl, rfl, hBase, hRet⟩
 
 theorem CallStackRel.inv_cons {entry : CapturedMir} {callees : List CapturedMir}
-    {fnMap : List (String × Gen.FnName)} {rootCtx : Ctx}
+    {fnMap : FnMap} {rootCtx : Ctx}
     {savedCaller : SavedCallerFrame} {restStack : List SavedCallerFrame}
     {callerFrames : List Frame} {curBody : CapturedMir} {curCtx : Ctx}
     {candBound remFuel : Nat}
@@ -3948,7 +3948,7 @@ private theorem callDestOk_evalSpec {curBody : CapturedMir} {s : MachineState}
   | ⟨_, [.opaqueCast _]⟩, _, hdest | ⟨_, _ :: _ :: _⟩, _, hdest =>
     simp [callDestOk] at hdest
 
-private theorem callTerminatorOk_unpack {fnMap : List (String × Gen.FnName)}
+private theorem callTerminatorOk_unpack {fnMap : FnMap}
     {callees : List CapturedMir} {curBody : CapturedMir} {blk nc1 nc2 : Nat}
     {bb : BasicBlockData} {tbTerm : Gen.Terminator}
     {ex1 : List (Gen.BbName × Gen.BasicBlock)}
@@ -3957,7 +3957,7 @@ private theorem callTerminatorOk_unpack {fnMap : List (String × Gen.FnName)}
     (htr : translateTerminatorInProg fnMap curBody.localDecls nc1 bb.terminator =
       some (tbTerm, nc2, ex1)) :
     ∃ func argOps destination targetBb unwind dp callee calleeRetDecl restDecls
-        fn argExprs retExpr unwindBb,
+        fn conv argExprs retExpr unwindBb,
       bb.terminator.kind = .call func argOps destination (some targetBb) unwind ∧
       extractFnDefPath func = some dp ∧
       MirSemantics.findCallee? callees dp = some callee ∧
@@ -3969,10 +3969,11 @@ private theorem callTerminatorOk_unpack {fnMap : List (String × Gen.FnName)}
       callDestOk curBody.localDecls (mustLiveBefore curBody blk bb.statements.length)
         (tupleInitBefore curBody blk bb.statements.length) calleeRetDecl destination = true ∧
       (∀ op ∈ argOps, opRead op ≠ some destination.local_) ∧
+      lookupFnTarget fnMap dp = some (fn, conv) ∧
       lookupFnName fnMap dp = some fn ∧
       argOps.mapM translateCallArg = some argExprs ∧
       translatePlace destination = some retExpr ∧
-      tbTerm = .Call (fnPtrExpr fn) .Rust argExprs retExpr (some (bbName targetBb))
+      tbTerm = .Call (fnPtrExpr fn) conv argExprs retExpr (some (bbName targetBb))
         (some unwindBb) := by
   unfold callTerminatorOk at hok
   rw [hbb] at hok
@@ -3993,12 +3994,13 @@ private theorem callTerminatorOk_unpack {fnMap : List (String × Gen.FnName)}
           | cons calleeRetDecl restDecls =>
             simp only [hextr, hfind, hcd, Bool.and_eq_true, decide_eq_true_eq,
               List.all_eq_true, bne_iff_ne] at hok
-            obtain ⟨⟨⟨⟨⟨⟨htgtLt, _⟩, hArgLen⟩, hArgBound⟩, hArgsOk⟩, hDestOk⟩, hNotDst⟩ := hok
+            obtain ⟨⟨⟨⟨⟨⟨⟨htgtLt, _⟩, _⟩, hArgLen⟩, hArgBound⟩, hArgsOk⟩, hDestOk⟩, hNotDst⟩ := hok
             simp only [translateTerminatorInProg, htk, hextr, Option.bind_eq_bind,
               Option.bind_some] at htr
-            cases hlk : lookupFnName fnMap dp with
+            cases hlk : lookupFnTarget fnMap dp with
             | none => simp [hlk] at htr
-            | some fn =>
+            | some fnConv =>
+              obtain ⟨fn, conv⟩ := fnConv
               cases htrArgs : argOps.mapM translateCallArg with
               | none => simp [hlk, htrArgs] at htr
               | some argExprs =>
@@ -4008,9 +4010,9 @@ private theorem callTerminatorOk_unpack {fnMap : List (String × Gen.FnName)}
                   simp [hlk, htrArgs, hretTr] at htr
                   obtain ⟨rfl, _, _⟩ := htr
                   exact ⟨func, argOps, destination, targetBb, unwind, dp, callee, calleeRetDecl,
-                    restDecls, fn, argExprs, retExpr, (translateUnwindAction nc1 unwind).1,
+                    restDecls, fn, conv, argExprs, retExpr, (translateUnwindAction nc1 unwind).1,
                     rfl, hextr, hfind, hcd, htgtLt, hArgLen, hArgBound, hArgsOk, hDestOk,
-                    hNotDst, hlk, htrArgs, hretTr, rfl⟩
+                    hNotDst, hlk, lookupFnName_of_lookupFnTarget hlk, htrArgs, hretTr, rfl⟩
   | _ => simp [htk] at hok
 
 private theorem list_mapM_option_spec {α β : Type} (f : α → Option β) :
@@ -4656,16 +4658,15 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
                 exact ⟨savedCaller.callerBody, rfl⟩
     · ------------------------------------------------------------ call terminator
       obtain ⟨func, argOps, destination, targetBb, unwind, dp, callee, calleeRetDecl,
-        restDecls, fn, argExprs, retExpr, unwindBb,
+        restDecls, fn, conv, argExprs, retExpr, unwindBb,
         hk, hextr, hfind, hCalleeDecls, htgtLt, hArgLen, hArgBound, hArgsOk, hDestOk,
-        hNotDst, hlk, htrArgs, hretTr, htt⟩ :=
+        hNotDst, hlkTgt, hlk, htrArgs, hretTr, htt⟩ :=
         callTerminatorOk_unpack hbb hcallOk htermTr
       have hfindS : MirSemantics.findCallee? s.memory.callees dp = some callee := by
         rwa [hrel.calleesEq]
-      obtain ⟨idx, fCallee, hCalleeMem, hlkIdx, hfCallee, hgetCallee⟩ :=
+      obtain ⟨idx, fCallee, hCalleeMem, hlkIdx, hlkTgtIdx, hfCallee, hgetCallee⟩ :=
         (translateProg_spec hnd hprog).2 dp callee hfind
-      have hfnEq : fn = fnName idx := Option.some.inj (hlk.symm.trans hlkIdx)
-      subst hfnEq
+      obtain ⟨rfl, rfl⟩ := Prod.mk.inj (Option.some.inj (hlkTgt.symm.trans hlkTgtIdx))
       have hd0Callee : callee.localDecls[0]? = some calleeRetDecl := by simp [hCalleeDecls]
       have hCalleeArgc : callee.argCount + 1 ≤ callee.localDecls.length := by
         simp [hCalleeDecls]; omega
@@ -4718,7 +4719,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         rw [hTermEq, hACallUb hce]
         obtain ⟨msg, hmsgArgs⟩ := hMArgsUb hce
         have htbTerm : tb.terminator =
-            .Call (fnPtrExpr (fnName idx)) .Rust argExprs retExpr
+            .Call (fnPtrExpr (fnName idx)) fCallee.calling_convention argExprs retExpr
               (some (bbName targetBb)) (some unwindBb) := htt
         have hstep : Interp.step m = .error (.ub msg) := by
           rw [step_callee_stack hshape tb hgetb]
@@ -4743,14 +4744,14 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         have hbase2 : BaseCandBounded m2.mem.memory.allocations
             (candBound + curBody.localDecls.length) :=
           hDest2.baseCandBounded hCurCand (fun i d hd => (hfCur.2 i d hd).1)
-        obtain ⟨hfCalleeSpec, hconvC, hargsC, hstartC, hinitC, _⟩ :=
+        obtain ⟨hfCalleeSpec, _, hargsC, hstartC, hinitC, _⟩ :=
           translateFnInProg_spec fnMap callee fCallee hfCallee
         obtain ⟨calleeLm0, mCall, hmCall, hshCall, hpCall, hfpCall, hloCall0⟩ :=
           evalCall_spec (retPlace := retPlace) (targetBb := bbName targetBb) (unwindBb := unwindBb)
-            hsh2 (.inr ⟨hfCalleeSpec, hconvC, hargsC, hstartC⟩)
+            hsh2 (.inr ⟨hfCalleeSpec, hargsC, hstartC⟩)
             hd0Callee hCalleeArgc hpdsEq hAvLenArgc hAvSlots hbase2 hCandCalleeLt
         have htbTerm : tb.terminator =
-            .Call (fnPtrExpr (fnName idx)) .Rust argExprs retExpr
+            .Call (fnPtrExpr (fnName idx)) fCallee.calling_convention argExprs retExpr
               (some (bbName targetBb)) (some unwindBb) := htt
         have hstep1 : Interp.step m = .ok mCall := by
           rw [step_callee_stack hshape tb hgetb]

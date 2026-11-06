@@ -474,7 +474,7 @@ theorem BaseLow.toBaseCandBounded {ctx : Ctx} (h : BaseLow ctx) :
 /-- Program and function-pointer table agreement on a MiniRust machine: `m.prog`
 is `prog`, and every `(dp, fn)` in `fnMap` has a thin pointer in `m.fn_ptrs`
 whose reverse lookup in `m.fn_ptrs` resolves uniquely back to `fn`. -/
-def ProgEnvOk (prog : Gen.Program) (fnMap : List (String × Gen.FnName))
+def ProgEnvOk (prog : Gen.Program) (fnMap : FnMap)
     (m : Mach) : Prop :=
   m.prog = prog ∧
   ∀ dp fn, lookupFnName fnMap dp = some fn →
@@ -567,7 +567,7 @@ and MiniRust's bottom-first prefix `callerFrames : List Frame` below the active
 body `curBody` (whose active context is `curCtx`, stack-candidate bound is
 `candBound`, and remaining call-graph fuel is `remFuel`). -/
 inductive CallStackRel (entry : CapturedMir) (callees : List CapturedMir)
-    (fnMap : List (String × Gen.FnName)) (rootCtx : Ctx) :
+    (fnMap : FnMap) (rootCtx : Ctx) :
     List SavedCallerFrame → List Frame → CapturedMir → Ctx → Nat → Nat → Prop where
   | nil (hBase : BaseLow rootCtx)
       (hRet : ∀ d, entry.localDecls[0]? = some d → RetPlaceOk rootCtx (tyOf d) (itOf d))

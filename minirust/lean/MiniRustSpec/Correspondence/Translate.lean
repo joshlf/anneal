@@ -889,6 +889,21 @@ def initBlock (body : MirAst.CapturedMir) : Gen.BasicBlock :=
   ⟨(alwaysStorageLiveLocals body).map (fun loc => .StorageLive (localName loc)), .Goto (bbName 0),
     .Regular⟩
 
+/-- `minimize`'s calling-convention translation (`tooling/minimize/src/ty.rs`,
+lines 348-354 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/minimize/src/ty.rs#L348-L354>):
+> "pub fn translate_calling_convention(conv: rs::CanonAbi) -> CallingConvention {
+>      match conv {
+>          rs::CanonAbi::C => CallingConvention::C,
+>          rs::CanonAbi::Rust => CallingConvention::Rust,
+>          ..
+>      }
+>  }" -/
+def translateCallConv : Layout.CallConv → Option Gen.CallingConvention
+  | .c => some .C
+  | .rust => some .Rust
+  | _ => none
+
 /-- `minimize`'s function translation (`tooling/minimize/src/function.rs`),
 specialized to bodies without a spread argument (`spread_arg`, used only by
 closures and the `rust-call` ABI):
@@ -919,11 +934,13 @@ closures and the `rust-call` ABI):
 >      calling_convention: translate_calling_convention(self.abi.conv),
 >      implicit_writes: self.implicit_writes, };"
 
-Without a spread argument, `init_statements` holds exactly the `StorageLive`s
-of `alwaysStorageLiveLocals` (`initBlock`). We take the calling convention to
-be `Rust` and `implicit_writes` to be `true` (the `minimize` default absent
-`#[rustc_no_writable]`); neither is read by the interpreted fragment. -/
+Without a spread argument, `init_statements` holds exactly the
+`StorageLive`s of `alwaysStorageLiveLocals` (`initBlock`). We translate the
+calling convention from `body.fnAbi.conv` via `translateCallConv` and take
+`implicit_writes` to be `true` (the `minimize` default absent
+`#[rustc_no_writable]`). -/
 def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
   let locals ← translateLocals 0 body.localDecls
   let blocks ← translateBlocks body.localDecls 0 body.basicBlocks
   let n := body.basicBlocks.length
@@ -931,7 +948,7 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
     locals := ⟨locals⟩
     args := (List.range body.argCount).map (fun k => localName (k + 1))
     ret := localName 0
-    calling_convention := .Rust
+    calling_convention := conv
     blocks := ⟨blocks ++ [(bbName n, initBlock body)]⟩
     start := bbName n
     implicit_writes := true
@@ -975,21 +992,33 @@ def extractFnDefPath : MirAst.Operand → Option String
     | _ => none
   | _ => none
 
+/-- Program function-table mapping `defPath` to `(FnName, CallingConvention)`. -/
+abbrev FnMap : Type := List (String × (Gen.FnName × Gen.CallingConvention))
+
 /-- Look up the `FnName` assigned to `defPath` in `fnMap`. -/
-def lookupFnName : List (String × Gen.FnName) → String → Option Gen.FnName
+def lookupFnName : FnMap → String → Option Gen.FnName
   | [], _ => none
-  | (dp, fn) :: rest, target =>
+  | (dp, (fn, _)) :: rest, target =>
     if dp == target then some fn else lookupFnName rest target
 
+/-- Look up the `(FnName, CallingConvention)` target assigned to `defPath` in `fnMap`. -/
+def lookupFnTarget : FnMap → String → Option (Gen.FnName × Gen.CallingConvention)
+  | [], _ => none
+  | (dp, entry) :: rest, target =>
+    if dp == target then some entry else lookupFnTarget rest target
+
 /-- Assign `FnName(0)` to `entry` and `FnName(1), FnName(2), ..` to `callees`
-in list order, matching `Ctxt::translate` and `Ctxt::get_fn_name`
+in list order along with each body's translated calling convention (defaulting
+to `CallingConvention.Rust` if `translateCallConv` is `none`, so `fnNameMap`
+remains total while `translateFnInProg` requires `translateCallConv` to return
+`some`), matching `Ctxt::translate` and `Ctxt::get_fn_name`
 (`tooling/minimize/src/program.rs`):
 > "let entry_name = FnName(Name::from_internal(0));
 >
 >  self.fn_name_map.insert(entry_instance, entry_name);" -/
-def fnNameMap (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir) :
-    List (String × Gen.FnName) :=
-  (entry :: callees).zipIdx.map fun (b, idx) => (b.defPath, fnName idx)
+def fnNameMap (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir) : FnMap :=
+  (entry :: callees).zipIdx.map fun (b, idx) =>
+    (b.defPath, (fnName idx, (translateCallConv b.fnAbi.conv).getD .Rust))
 
 /-- `minimize`'s call-argument translation (`tooling/minimize/src/bb.rs`):
 > "match &x.node {
@@ -1097,20 +1126,20 @@ def translateUnwindAction (nextCleanup : Nat) :
 >      next_block: target.as_ref().map(|t| self.bb_name_map[t]),
 >      unwind_block,
 >  }"
-with `CallingConvention::Rust` (matching `translateFn`). Non-call terminators
-delegate directly to `translateTerminator` and synthesize no extra cleanup
-blocks. -/
-def translateTerminatorInProg (fnMap : List (String × Gen.FnName))
+with the callee's calling convention `conv` (matching `translateFnInProg`).
+Non-call terminators delegate directly to `translateTerminator` and synthesize
+no extra cleanup blocks. -/
+def translateTerminatorInProg (fnMap : FnMap)
     (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :
     Option (Gen.Terminator × Nat × List (Gen.BbName × Gen.BasicBlock)) :=
   match t.kind with
   | .call func argOps destination target unwind => do
     let defPath ← extractFnDefPath func
-    let fn ← lookupFnName fnMap defPath
+    let (fn, conv) ← lookupFnTarget fnMap defPath
     let args ← argOps.mapM translateCallArg
     let retPlace ← translatePlace destination
     let (unwindBb, nextCleanup', extra) := translateUnwindAction nextCleanup unwind
-    pure (.Call (fnPtrExpr fn) .Rust args retPlace (target.map bbName) (some unwindBb),
+    pure (.Call (fnPtrExpr fn) conv args retPlace (target.map bbName) (some unwindBb),
       nextCleanup', extra)
   | _ => do
     let term ← translateTerminator decls t
@@ -1119,7 +1148,7 @@ def translateTerminatorInProg (fnMap : List (String × Gen.FnName))
 /-- Translate basic blocks in index order while threading `nextCleanup`
 (starting at `body.basicBlocks.length + 1`, after `init_bb = bbName n` in
 `FnCtxt::translate`) for any synthesized call unwind blocks. -/
-def translateBlocksInProg (fnMap : List (String × Gen.FnName))
+def translateBlocksInProg (fnMap : FnMap)
     (decls : List MirAst.LocalDecl) :
     Nat → Nat → List MirAst.BasicBlockData →
       Option (List (Gen.BbName × Gen.BasicBlock) × List (Gen.BbName × Gen.BasicBlock))
@@ -1137,8 +1166,9 @@ synthesized by `translate_unwind_action` during block translation take
 `bbName (n + 1), bbName (n + 2), ..` (`tooling/minimize/src/function.rs`). When
 `body` contains no `Call` terminators, `extra` is empty and `translateFnInProg`
 produces the exact same `Gen.Function` as `translateFn`. -/
-def translateFnInProg (fnMap : List (String × Gen.FnName))
+def translateFnInProg (fnMap : FnMap)
     (body : MirAst.CapturedMir) : Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
   let locals ← translateLocals 0 body.localDecls
   let n := body.basicBlocks.length
   let (blocks, extra) ← translateBlocksInProg fnMap body.localDecls 0 (n + 1) body.basicBlocks
@@ -1146,7 +1176,7 @@ def translateFnInProg (fnMap : List (String × Gen.FnName))
     locals := ⟨locals⟩
     args := (List.range body.argCount).map (fun k => localName (k + 1))
     ret := localName 0
-    calling_convention := .Rust
+    calling_convention := conv
     blocks := ⟨blocks ++ [(bbName n, initBlock body)] ++ extra⟩
     start := bbName n
     implicit_writes := true
@@ -1180,7 +1210,7 @@ def mkStartFn (entryIdx : Nat) : Gen.Function :=
     implicit_writes := true }
 
 /-- Translate `(entry :: callees)` in index order against `fnMap`. -/
-def translateProgFns (fnMap : List (String × Gen.FnName)) :
+def translateProgFns (fnMap : FnMap) :
     Nat → List MirAst.CapturedMir → Option (List (Gen.FnName × Gen.Function))
   | _, [] => some []
   | idx, b :: bs => do
@@ -1974,6 +2004,7 @@ def callTerminatorOk (callees : List MirAst.CapturedMir) (body : MirAst.Captured
           let ti := tupleInitBefore body blk bb.statements.length
           decide (targetBb < body.basicBlocks.length) &&
           callUnwindOk unwind &&
+          (translateCallConv callee.fnAbi.conv).isSome &&
           decide (argOps.length = callee.argCount) &&
           decide (callee.argCount ≤ restDecls.length) &&
           callArgsOk body.localDecls (restDecls.take callee.argCount) argOps &&
@@ -1990,7 +2021,7 @@ def terminatorInProgOk (callees : List MirAst.CapturedMir) (body : MirAst.Captur
   callTerminatorOk callees body blk t
 
 /-- Per-function fragment check within a multi-function program `(fnMap, callees)`. -/
-def bodyInProgFragment (fnMap : List (String × Gen.FnName))
+def bodyInProgFragment (fnMap : FnMap)
     (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
   decide (body.argCount + 1 ≤ body.localDecls.length) &&

@@ -8612,4 +8612,424 @@ theorem evalReturn_missingNextBlock_and_bottomOfStack_ub :
   ⟨eq_error_ub_of_ubMsg? (by decide +kernel),
    eq_error_ub_of_ubMsg? (by decide +kernel)⟩
 
+/-! ### Pass `B3` hardening witnesses: `CallConv.c` (`extern "C"`), unsupported-ABI rejection,
+dead / uninitialized-tuple return-place counterexamples, and diamond call DAG -/
+
+/-- `extern "C"` single-parameter `u32 -> u32` ABI (`Layout.CallConv.c`). -/
+def fnAbiC1 : FnAbi :=
+  { (fnAbi 1) with conv := .c }
+
+/-- `extern "C"` callee `cAbiCallee(x: u32) -> u32 { x + 10 }`: exercises
+`translateCallConv .c = some .C` in both `translateFn` and `translateFnInProg`. -/
+def cAbiCallee : CapturedMir where
+  defPath := "witness::c_abi_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 1)) (constU32 10)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiC1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Rust-ABI caller invoking `extern "C"` `cAbiCallee` (`CallingConvention.C` on
+the `Terminator::Call` edge while the caller itself has `CallingConvention.Rust`). -/
+def cAbiCaller : CapturedMir where
+  defPath := "witness::c_abi_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::c_abi_callee")
+        [.move (local_ 1)] (local_ 0) (some 1) .unreachable),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem cAbiCallee_conv :
+    (translateFn cAbiCallee).map (·.calling_convention) = some .C ∧
+    (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCallee).map
+      (·.calling_convention) = some .C ∧
+    (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCaller).map
+      (·.calling_convention) = some .Rust :=
+  ⟨rfl, rfl, rfl⟩
+
+theorem cAbi_inFragment :
+    progInFragment cAbiCaller [cAbiCallee] = true := by decide
+
+def cAbiProg : Gen.Program :=
+  (translateProg cAbiCaller [cAbiCallee]).getD emptyProg
+def cAbiCallerFn : Gen.Function :=
+  (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCaller).getD callerFn
+theorem cAbi_translate :
+    translateProg cAbiCaller [cAbiCallee] = some cAbiProg := rfl
+theorem cAbiCaller_translateInProg :
+    translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCaller = some cAbiCallerFn := rfl
+
+theorem ctxCAbiCaller_ok : CtxOk cAbiCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [cAbiCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [cAbiCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [cAbiCaller] at hi
+  ret := by
+    intro d hd; simp [cAbiCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def cAbi32Args : List Value := [.scalar ⟨32, 4⟩]
+def cAbi32S0 : MachineState :=
+  initMachineStateWithCallees cAbiCaller cAbi32Args [cAbiCallee]
+def cAbi32MInit : Mach :=
+  multiMachineWithCtx ctxCallSpin cAbiProg 2 cAbiCaller cAbiCallerFn
+    cAbi32S0.frame.locals cAbiCallerFn.start
+
+theorem cAbi32_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees cAbiCaller cAbi32Args [cAbiCallee]) []
+      (.normal (.scalar ⟨42, 4⟩,
+        { cAbi32S0.memory with activeCallee := some cAbiCaller })) :=
+  runA_sound cAbiCaller 20 _ _ _ rfl
+
+theorem cAbi32_noUB :
+    MirNoUBTree (mirCallTreeWithCallees cAbiCaller cAbi32Args [cAbiCallee]) :=
+  runA_noUB cAbiCaller 20 _ _ _ rfl
+
+theorem cAbi32_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n cAbi32MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads = [thread1 ctxCallSpin
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret cAbi_inFragment cAbi_translate
+      cAbiCaller_translateInProg ctxCallSpin ctxCAbiCaller_ok
+      cAbi32Args (by decide) cAbi32MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      cAbi32_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [cAbiCaller] at hd; subst hd
+  simp [retPtr, ctxCallSpin, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallSpin, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem cAbi32_minirust_direct :
+    (Interp.steps 6 cAbi32MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) := by
+  decide +kernel
+
+/-- Rejection of unsupported calling conventions (`Layout.CallConv.rustIntrinsic`
+and `Layout.CallConv.other "sysv64"`): `translateCallConv = none`, so both
+single-function (`translateFn`, `inFragment`) and multi-function
+(`callTerminatorOk`, `translateProg`, `progInFragment`) checks reject them. -/
+def badCallConvCallee : CapturedMir :=
+  { idU32Callee with
+    defPath := "witness::bad_call_conv_callee",
+    fnAbi := { (fnAbi 1) with conv := .rustIntrinsic } }
+
+def badCallConvSysvBody : CapturedMir :=
+  { idU32Callee with
+    defPath := "witness::bad_sysv_body",
+    fnAbi := { (fnAbi 1) with conv := .other "sysv64" } }
+
+def badCallConvCaller : CapturedMir where
+  defPath := "witness::bad_call_conv_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::bad_call_conv_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem badCallConv_rejected :
+    translateCallConv .rustIntrinsic = none ∧
+    translateCallConv (.other "sysv64") = none ∧
+    translateFn badCallConvCallee = none ∧
+    inFragment badCallConvCallee = false ∧
+    translateFn badCallConvSysvBody = none ∧
+    inFragment badCallConvSysvBody = false ∧
+    callTerminatorOk [badCallConvCallee] badCallConvCaller 0
+      (mkTerm (.call (fnDefOp "witness::bad_call_conv_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_)) = false ∧
+    progInFragment badCallConvCaller [badCallConvCallee] = false ∧
+    translateProg badCallConvCaller [badCallConvCallee] = none :=
+  ⟨rfl, rfl, rfl, by decide, rfl, by decide, by decide, by decide, rfl⟩
+
+/-- Counterexample 5 (`StorageLive(_2); StorageDead(_2); _2 = idU32Callee(copy _1)`):
+calling into a dead return place `_2`. In MiniRust, `Terminator::Call` evaluates
+the return place `_2` and runs `prepare_for_inplace_passing` BEFORE argument
+evaluation or callee entry, faulting on step 4 (after `initBlock` `Goto(bb0)`,
+`StorageLive(_2)`, and `StorageDead(_2)`) with `"access to a dead local"`
+before `idU32Callee` is ever entered. `callDestOk` requires `lv.contains dst`
+and rejects this caller. -/
+def deadCallDestCaller : CapturedMir where
+  defPath := "witness::dead_call_dest_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2), mkStmt (.storageDead 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 0)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem deadCallDest_rejected :
+    callDestOk deadCallDestCaller.localDecls (mustLiveBefore deadCallDestCaller 0 2)
+      (tupleInitBefore deadCallDestCaller 0 2) u32Decl (local_ 2) = false ∧
+    progInFragment deadCallDestCaller [idU32Callee] = false := by
+  decide
+
+def deadCallDestProg : Gen.Program :=
+  (translateProg deadCallDestCaller [idU32Callee]).getD emptyProg
+def deadCallDestFn : Gen.Function :=
+  (translateFnInProg (fnNameMap deadCallDestCaller [idU32Callee]) deadCallDestCaller).getD callerFn
+theorem deadCallDest_translate :
+    translateProg deadCallDestCaller [idU32Callee] = some deadCallDestProg := rfl
+
+def deadCallDestS0 : MachineState :=
+  initMachineStateWithCallees deadCallDestCaller [.scalar ⟨7, 4⟩] [idU32Callee]
+def deadCallDestMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin deadCallDestProg 2 deadCallDestCaller deadCallDestFn
+    deadCallDestS0.frame.locals deadCallDestFn.start
+
+theorem deadCallDest_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees deadCallDestCaller [.scalar ⟨7, 4⟩] [idU32Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound deadCallDestCaller 10 _ (by decide)
+
+theorem deadCallDest_minirust_ub_before_callee :
+    Interp.steps 4 deadCallDestMInit =
+      .error (.ub "access to a dead local") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- Counterexample 6 (`StorageLive(_2); _2.0 = negI8Callee(copy _1); _0 = copy (_2.0);
+StorageDead(_2); Return` where `_2 : (i8, bool)` is live but uninitialized):
+when `negI8Callee(5i8)` returns `-5i8`, Anneal's `writePlaceValue` faults with UB
+because projected field assignment into `.uninit` local `_2` is forbidden in
+Anneal's value-slot model (`uninitProjCallDest_anneal_ub`), whereas MiniRust's
+byte-level stack allocation writes `[-5i8]` to byte `0` of `_2` and returns
+`-5i8` (`251`) cleanly (`uninitProjCallDest_minirust_ret`)! Thus `ti.contains dst`
+(`tupleInitOk`) in `callDestOk` is strictly required for forward UB soundness. -/
+def uninitProjCallDestCaller : CapturedMir where
+  defPath := "witness::uninit_proj_call_dest_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl, i8BoolTupleDecl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::neg_i8_callee")
+        [.copy (local_ 1)] (field0I8 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (field0I8 2)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitProjCallDest_rejected :
+    (mustLiveBefore uninitProjCallDestCaller 0 1).contains 2 = true ∧
+    (tupleInitBefore uninitProjCallDestCaller 0 1).contains 2 = false ∧
+    callDestOk uninitProjCallDestCaller.localDecls (mustLiveBefore uninitProjCallDestCaller 0 1)
+      (tupleInitBefore uninitProjCallDestCaller 0 1) i8Decl (field0I8 2) = false ∧
+    progInFragment uninitProjCallDestCaller [negI8Callee] = false := by
+  decide
+
+def uninitProjCallDestProg : Gen.Program :=
+  (translateProg uninitProjCallDestCaller [negI8Callee]).getD emptyProg
+def uninitProjCallDestFn : Gen.Function :=
+  (translateFnInProg (fnNameMap uninitProjCallDestCaller [negI8Callee])
+    uninitProjCallDestCaller).getD callerFnI8
+theorem uninitProjCallDest_translate :
+    translateProg uninitProjCallDestCaller [negI8Callee] = some uninitProjCallDestProg := rfl
+
+def uninitProjCallDestS0 : MachineState :=
+  initMachineStateWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]
+def uninitProjCallDestMInit : Mach :=
+  multiMachineWithCtx ctxCalleeDivZero uninitProjCallDestProg 2 uninitProjCallDestCaller
+    uninitProjCallDestFn uninitProjCallDestS0.frame.locals uninitProjCallDestFn.start
+
+theorem uninitProjCallDest_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound uninitProjCallDestCaller 15 _ (by decide)
+
+theorem uninitProjCallDest_minirust_ret :
+    (Interp.steps 9 uninitProjCallDestMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 251 }, [1]) := by
+  decide +kernel
+
+/-- Diamond call-graph DAG (`diamondCallEntry -> diamondMidA -> cAbiCallee` and
+`diamondCallEntry -> diamondMidB -> cAbiCallee`) mixing `.Rust` (`diamondCallEntry`,
+`diamondMidA`) and `.C` (`diamondMidB`, `cAbiCallee`) calling conventions across
+shared leaf `cAbiCallee`. -/
+def diamondMidA : CapturedMir where
+  defPath := "witness::diamond_mid_a"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::c_abi_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def diamondMidB : CapturedMir where
+  defPath := "witness::diamond_mid_b"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.binaryOp .add (.copy (local_ 1)) (constU32 1)))],
+      terminator := mkTerm (.call (fnDefOp "witness::c_abi_callee")
+        [.move (local_ 2)] (local_ 0) (some 1) .terminate),
+      isCleanup := false },
+    { statements := [mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiC1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def diamondCallEntry : CapturedMir where
+  defPath := "witness::diamond_call_entry"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2), mkStmt (.storageLive 3)],
+      terminator := mkTerm (.call (fnDefOp "witness::diamond_mid_a")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::diamond_mid_b")
+        [.move (local_ 1)] (local_ 3) (some 2) .unreachable),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.move (local_ 2)) (.move (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem diamondCall_inFragment :
+    progInFragment diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] = true := by
+  decide
+
+theorem diamondCall_maxStackLocals :
+    maxStackLocals diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] = some 9 := rfl
+
+def ctxDiamondCall : Ctx :=
+  ctxWithFns callerFrame retAlloc 4 [128, 256]
+
+theorem ctxDiamondCall_ok : CtxOk diamondCallEntry ctxDiamondCall where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [diamondCallEntry] at hd; subst hd; decide
+    | 1, _, hd => simp [diamondCallEntry] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [diamondCallEntry] at hi
+  ret := by
+    intro d hd; simp [diamondCallEntry] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def diamondCallProg : Gen.Program :=
+  (translateProg diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee]).getD emptyProg
+def diamondCallEntryFn : Gen.Function :=
+  (translateFnInProg (fnNameMap diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee])
+    diamondCallEntry).getD callerFn
+theorem diamondCall_translate :
+    translateProg diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] =
+      some diamondCallProg := rfl
+theorem diamondCallEntry_translateInProg :
+    translateFnInProg (fnNameMap diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee])
+      diamondCallEntry = some diamondCallEntryFn := rfl
+
+def diamondCall5Args : List Value := [.scalar ⟨5, 4⟩]
+def diamondCall5S0 : MachineState :=
+  initMachineStateWithCallees diamondCallEntry diamondCall5Args
+    [diamondMidA, diamondMidB, cAbiCallee]
+def diamondCall5MInit : Mach :=
+  multiMachineWithCtx ctxDiamondCall diamondCallProg 4 diamondCallEntry diamondCallEntryFn
+    diamondCall5S0.frame.locals diamondCallEntryFn.start
+
+theorem diamondCall5_anneal_ret :
+    ReachesRet
+      (mirCallTreeWithCallees diamondCallEntry diamondCall5Args
+        [diamondMidA, diamondMidB, cAbiCallee]) []
+      (.normal (.scalar ⟨31, 4⟩,
+        { diamondCall5S0.memory with activeCallee := some diamondCallEntry })) :=
+  runA_sound diamondCallEntry 35 _ _ _ rfl
+
+theorem diamondCall5_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees diamondCallEntry diamondCall5Args
+        [diamondMidA, diamondMidB, cAbiCallee]) :=
+  runA_noUB diamondCallEntry 35 _ _ _ rfl
+
+theorem diamondCall5_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n diamondCall5MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 31 } ∧
+      m'.threads = [thread1 ctxDiamondCall
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret diamondCall_inFragment diamondCall_translate
+      diamondCallEntry_translateInProg ctxDiamondCall ctxDiamondCall_ok
+      diamondCall5Args (by decide) diamondCall5MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      diamondCall5_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [diamondCallEntry] at hd; subst hd
+  simp [retPtr, ctxDiamondCall, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxDiamondCall, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem diamondCall5_minirust_direct :
+    (Interp.steps 24 diamondCall5MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 31 }, [1]) := by
+  decide +kernel
+
 end MiniRustSpec.Correspondence.Witness

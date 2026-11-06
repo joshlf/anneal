@@ -1796,6 +1796,7 @@ fn call_return_and_multi_fn_quotations_are_pinned() {
     let terms = "spec/lang/step/terminators.md";
     let bb = "tooling/minimize/src/bb.rs";
     let prog = "tooling/minimize/src/program.rs";
+    let ty_rs = "tooling/minimize/src/ty.rs";
 
     let cases: &[(&str, &str, &str, &str)] = &[
         (
@@ -1965,10 +1966,22 @@ fn call_return_and_multi_fn_quotations_are_pinned() {
             "self.functions.insert(start, mk_start_fn(1));",
             "MiniRustSpec/Correspondence/Translate.lean",
         ),
+        (
+            ty_rs,
+            "pub fn translate_calling_convention(conv: rs::CanonAbi) -> CallingConvention { \
+                 match conv { \
+                     rs::CanonAbi::C => CallingConvention::C, \
+                     rs::CanonAbi::Rust => CallingConvention::Rust, \
+                     .. \
+                 } \
+             }",
+            "rs::CanonAbi::C => CallingConvention::Rust,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
     ];
-    assert_eq!(cases.len(), 17, "expected 17 pinned MR-4.1 quotations");
+    assert_eq!(cases.len(), 18, "expected 18 pinned MR-4.1 quotations");
 
-    let mr41_files = [ptr, types, exprs, mach, terms, bb, prog];
+    let mr41_files = [ptr, types, exprs, mach, terms, bb, prog, ty_rs];
     let lean_root = minirust_dir().join("lean");
     for (file, genuine, tampered, lean_file) in cases {
         assert_eq!(

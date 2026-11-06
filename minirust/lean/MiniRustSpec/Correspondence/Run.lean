@@ -1118,7 +1118,9 @@ def fnPtrMap (baseOff n : Nat) : LibSpecr.Map Gen.FnName Ptr :=
 
 private theorem lookupFnName_zipIdx_lt (bs : List CapturedMir) (start : Nat) (dp : String)
     (fn : Gen.FnName)
-    (h : lookupFnName (bs.zipIdx start |>.map fun (b, idx) => (b.defPath, fnName idx)) dp =
+    (h : lookupFnName
+      (bs.zipIdx start |>.map fun (b, idx) =>
+        (b.defPath, (fnName idx, (translateCallConv b.fnAbi.conv).getD .Rust))) dp =
       some fn) :
     ∃ j < bs.length, fn = fnName (start + j) := by
   induction bs generalizing start with

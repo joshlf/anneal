@@ -250,20 +250,22 @@ restricted to the fragment checked by `inFragment`:
   `move (_j.1)`, or constant) with distinct in-range values (`minimize` switches
   on `transmute::<u8>(b)` for a `bool`), `Return`, `Unreachable`, and — in the
   multi-function fragment `progInFragment entry callees` translated by
-  `translateProg` (`translateFnInProg` + `mkStartFn`) — direct monomorphic
-  `TerminatorKind.call` with `some targetBb` and non-cleanup `UnwindAction`
-  (`Continue`, `Unreachable`, or `Terminate`): `translateCallArg` lowers
-  `Operand::Move` to `ArgumentExpr::InPlace` (writing `Uninit` bytes in MiniRust
-  too, restricted by `callArgOk` to root locals `move _j`) and `Copy`/`Constant`
-  to `ArgumentExpr::ByValue`; `livenessOk` and `tupleInitOk` verify by greatest
-  fixed point that `destination` is live (and an initialized `(Int, bool)` tuple
-  when writing `_dst.0` or `_dst.1`) and disjoint from `argOps`; `termReadsOk`
-  checks `readsOk (dst :: mo) argOps` (allowing `_dst ∈ mo` on root overwrites
-  `⟨dst, []⟩` while requiring `!mo.contains dst` on projected writes
-  `⟨dst, _ :: _⟩`), and `termMoved` clears root `dst` from `mo`; and
-  `maxStackLocals entry callees < 2^31` bounds worst-case stack allocations
-  across acyclic call graphs; all targets are blocks of the body; no cleanup
-  blocks.
+  `translateProg` (`translateFnInProg` + `mkStartFn`, with `translateCallConv`
+  translating `CallConv.rust` and `CallConv.c` per `minimize`'s
+  `translate_calling_convention` and rejecting unsupported ABIs) — direct
+  monomorphic `TerminatorKind.call` with `some targetBb` and non-cleanup
+  `UnwindAction` (`Continue`, `Unreachable`, or `Terminate`): `translateCallArg`
+  lowers `Operand::Move` to `ArgumentExpr::InPlace` (writing `Uninit` bytes in
+  MiniRust too, restricted by `callArgOk` to root locals `move _j`) and
+  `Copy`/`Constant` to `ArgumentExpr::ByValue`; `livenessOk` and `tupleInitOk`
+  verify by greatest fixed point that `destination` is live (and an initialized
+  `(Int, bool)` tuple when writing `_dst.0` or `_dst.1`) and disjoint from
+  `argOps`; `termReadsOk` checks `readsOk (dst :: mo) argOps` (allowing `_dst ∈
+  mo` on root overwrites `⟨dst, []⟩` while requiring `!mo.contains dst` on
+  projected writes `⟨dst, _ :: _⟩`), and `termMoved` clears root `dst` from
+  `mo`; and `maxStackLocals entry callees < 2^31` bounds worst-case stack
+  allocations across acyclic call graphs; all targets are blocks of the body; no
+  cleanup blocks.
 
 ### States
 
@@ -389,7 +391,8 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
 
 * `callerMain`/`calleePair`, `projDestCaller`,
   `chainEntry`/`chainMid`/`chainLeaf`, `callArgUbCaller`, `calleeDivZeroCaller`,
-  `callSpinCaller`, `callMoveReuse`, `moveReinitByCall`, and `condCallMoveJoin`
+  `callSpinCaller`, `callMoveReuse`, `moveReinitByCall`, `condCallMoveJoin`,
+  `cAbiCaller`/`cAbiCallee`, and `diamondCallEntry`/`diamondMidA`/`diamondMidB`
   (MR-4.1): `callerMain` invokes `calleePair` (`initLen calleePair = 2`, 3-step
   `Call + initBlock` entry) passing `_1` via `ArgumentExpr::ByValue` and
   `(u32, bool)` tuple `_3` via `ArgumentExpr::InPlace`, exercising
@@ -400,7 +403,11 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   (`UnwindAction.terminate`) of an `(i8, bool)` return place (`projDest127_*`);
   `chainEntry -> chainMid -> chainLeaf` exercises a 3-deep nested call stack
   (`depth 4` at `chainNeg5_depth4_step7`) returning `core::cmp::Ordering` across
-  frames (`chainNeg5_*`); `callArgUbCaller`, `calleeDivZeroCaller`, and `callMoveReuse` exercise UB during argument
+  frames (`chainNeg5_*`); `cAbiCaller`/`cAbiCallee` exercises `CallConv.c`
+  calling convention translation (`cAbi32_*`), while `diamondCallEntry ->
+  {diamondMidA, diamondMidB} -> cAbiCallee` exercises a diamond DAG call graph
+  with shared leaf `cAbiCallee` (`diamondCall5_*`); `callArgUbCaller`,
+  `calleeDivZeroCaller`, and `callMoveReuse` exercise UB during argument
   evaluation, inside a pushed callee frame, and on post-call reuse of an
   `InPlace`-moved local via `mirCallWithCallees_ub` and
   `mirCallWithCallees_steps_error`; `callSpinCaller` proves infinite lockstep
@@ -408,8 +415,13 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   re-initializes a moved-out local via a root call destination, and
   `condCallMoveJoin` exercises a branch-correlated `InPlace` call move across a
   CFG join (`condCallMoveJoin1_*`, `condCallMoveJoin0_*`); `callDestArgAlias`,
-  `callProjMoveReuse`, `stmtMoveThenCallArg`, and `recCycleA`/`recCycleB`
-  witness the soundness boundaries of `progInFragment`; and
+  `callProjMoveReuse`, `stmtMoveThenCallArg`, `recCycleA`/`recCycleB`,
+  `badCallConvCallee`/`badCallConvSysvBody`/`badCallConvCaller`,
+  `deadCallDestCaller` (where MiniRust faults in `prepare_for_inplace_passing`
+  before callee entry), and `uninitProjCallDestCaller` (where Anneal faults on
+  writing `_2.0` to an uninitialized 2-tuple while MiniRust's byte store
+  succeeds, motivating `tupleInitOk`) witness the soundness boundaries of
+  `progInFragment`; and
   `layout_ptr_and_array_mr41`, `evalConstant_and_fnFromPtr_mr41`,
   `checkAbiCompatibility_all_variants_mr41`, `createFrame_ub_mr41`, and
   `evalReturn_missingNextBlock_and_bottomOfStack_ub` directly verify every

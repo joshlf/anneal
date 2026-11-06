@@ -277,24 +277,27 @@ theorem translateFn_spec (body : CapturedMir) (f : Gen.Function) (h : translateF
     (∀ (i : Nat) bb, body.basicBlocks[i]? = some bb →
       ∃ tb, translateBlock body.localDecls bb = some tb ∧ mapGet f.blocks (bbName i) = some tb) := by
   simp only [translateFn, Option.bind_eq_bind] at h
-  cases hL : translateLocals 0 body.localDecls with
-  | none => simp [hL] at h
-  | some L =>
-    cases hB : translateBlocks body.localDecls 0 body.basicBlocks with
-    | none => simp [hL, hB] at h
-    | some B =>
-      simp [hL, hB] at h
-      subst h
-      refine ⟨rfl, ?_, ?_⟩
-      · intro i d hd
-        obtain ⟨T, hT, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
-        rw [tyOf_of_scalarTypeOf hT]; refine ⟨hT, ?_⟩
-        simpa using hget
-      · intro i bb hbb
-        obtain ⟨tb, htb, hget⟩ := translateBlocks_get body.localDecls 0 body.basicBlocks B hB i bb hbb
-        refine ⟨tb, htb, ?_⟩
-        apply mapGet_append_of_some
-        simpa using hget
+  cases hC : translateCallConv body.fnAbi.conv with
+  | none => simp [hC] at h
+  | some conv =>
+    cases hL : translateLocals 0 body.localDecls with
+    | none => simp [hC, hL] at h
+    | some L =>
+      cases hB : translateBlocks body.localDecls 0 body.basicBlocks with
+      | none => simp [hC, hL, hB] at h
+      | some B =>
+        simp [hC, hL, hB] at h
+        subst h
+        refine ⟨rfl, ?_, ?_⟩
+        · intro i d hd
+          obtain ⟨T, hT, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
+          rw [tyOf_of_scalarTypeOf hT]; refine ⟨hT, ?_⟩
+          simpa using hget
+        · intro i bb hbb
+          obtain ⟨tb, htb, hget⟩ := translateBlocks_get body.localDecls 0 body.basicBlocks B hB i bb hbb
+          refine ⟨tb, htb, ?_⟩
+          apply mapGet_append_of_some
+          simpa using hget
 
 theorem translateBlocks_append_get (decls : List LocalDecl) (k : Nat) (bbs : List BasicBlockData)
     (B : List (Gen.BbName × Gen.BasicBlock)) (h : translateBlocks decls k bbs = some B)
@@ -323,16 +326,19 @@ theorem translateFn_start (body : CapturedMir) (f : Gen.Function) (h : translate
     f.start = bbName body.basicBlocks.length ∧
     mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body) := by
   simp only [translateFn, Option.bind_eq_bind] at h
-  cases hL : translateLocals 0 body.localDecls with
-  | none => simp [hL] at h
-  | some L =>
-    cases hB : translateBlocks body.localDecls 0 body.basicBlocks with
-    | none => simp [hL, hB] at h
-    | some B =>
-      simp [hL, hB] at h
-      subst h
-      exact ⟨rfl, translateBlocks_append_get body.localDecls 0 body.basicBlocks B hB
-        body.basicBlocks.length (by omega) (initBlock body)⟩
+  cases hC : translateCallConv body.fnAbi.conv with
+  | none => simp [hC] at h
+  | some conv =>
+    cases hL : translateLocals 0 body.localDecls with
+    | none => simp [hC, hL] at h
+    | some L =>
+      cases hB : translateBlocks body.localDecls 0 body.basicBlocks with
+      | none => simp [hC, hL, hB] at h
+      | some B =>
+        simp [hC, hL, hB] at h
+        subst h
+        exact ⟨rfl, translateBlocks_append_get body.localDecls 0 body.basicBlocks B hB
+          body.basicBlocks.length (by omega) (initBlock body)⟩
 
 /-! ## Multi-function translation lemmas (`translateFnInProg`, `translateProg`) -/
 
@@ -395,7 +401,7 @@ theorem sameFragmentTy_spec {d1 d2 : LocalDecl} (h : sameFragmentTy d1.ty d2.ty 
           ⟨.Int it1, scalarTypeOf_int hi1, scalarTypeOf_int hi2⟩, fun slot => ?_⟩
         rw [declSlotData_of_none hnt1, declSlotData_of_none hnt2, hit1, hit2]
 
-theorem translateBlocksInProg_get (fnMap : List (String × Gen.FnName))
+theorem translateBlocksInProg_get (fnMap : FnMap)
     (decls : List LocalDecl) (k nextC : Nat) (bbs : List BasicBlockData)
     (B extra : List (Gen.BbName × Gen.BasicBlock))
     (h : translateBlocksInProg fnMap decls k nextC bbs = some (B, extra))
@@ -435,7 +441,7 @@ theorem translateBlocksInProg_get (fnMap : List (String × Gen.FnName))
             · next heq => rw [bbName_inj] at heq; omega
             · rw [show k + (j + 1) = k + 1 + j by omega]; exact hget
 
-theorem translateBlocksInProg_append_get (fnMap : List (String × Gen.FnName))
+theorem translateBlocksInProg_append_get (fnMap : FnMap)
     (decls : List LocalDecl) (k nextC : Nat) (bbs : List BasicBlockData)
     (B extra : List (Gen.BbName × Gen.BasicBlock))
     (h : translateBlocksInProg fnMap decls k nextC bbs = some (B, extra))
@@ -470,10 +476,10 @@ theorem translateBlocksInProg_append_get (fnMap : List (String × Gen.FnName))
 /-- What `translateFnInProg` produces: `FnLocalsSpec`, calling convention and
 argument list, `initBlock` at `f.start`, and block lookup for every MIR basic
 block. -/
-theorem translateFnInProg_spec (fnMap : List (String × Gen.FnName))
+theorem translateFnInProg_spec (fnMap : FnMap)
     (body : CapturedMir) (f : Gen.Function) (h : translateFnInProg fnMap body = some f) :
     FnLocalsSpec body f ∧
-    f.calling_convention = .Rust ∧
+    translateCallConv body.fnAbi.conv = some f.calling_convention ∧
     f.args = (List.range body.argCount).map (fun k => localName (k + 1)) ∧
     f.start = bbName body.basicBlocks.length ∧
     mapGet f.blocks (bbName body.basicBlocks.length) = some (initBlock body) ∧
@@ -483,33 +489,36 @@ theorem translateFnInProg_spec (fnMap : List (String × Gen.FnName))
         translateTerminatorInProg fnMap body.localDecls nc1 bb.terminator = some (term, nc2, ex1) ∧
         mapGet f.blocks (bbName i) = some ⟨stmts, term, .Regular⟩) := by
   simp only [translateFnInProg, Option.bind_eq_bind] at h
-  cases hL : translateLocals 0 body.localDecls with
-  | none => simp [hL] at h
-  | some L =>
-    cases hB : translateBlocksInProg fnMap body.localDecls 0 (body.basicBlocks.length + 1)
-        body.basicBlocks with
-    | none => simp [hL, hB] at h
-    | some brep =>
-      obtain ⟨B, extra⟩ := brep
-      simp [hL, hB] at h
-      subst h
-      refine ⟨⟨rfl, ?_⟩, rfl, rfl, rfl, ?_, ?_⟩
-      · intro i d hd
-        obtain ⟨T, hT, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
-        rw [tyOf_of_scalarTypeOf hT]
-        exact ⟨hT, by simpa using hget⟩
-      · simpa using translateBlocksInProg_append_get fnMap body.localDecls 0
-          (body.basicBlocks.length + 1) body.basicBlocks B extra hB
-          body.basicBlocks.length (by omega) (initBlock body) extra
-      · intro i bb hbb
-        obtain ⟨stmts, term, nc1, nc2, ex1, hs, ht, hget⟩ :=
-          translateBlocksInProg_get fnMap body.localDecls 0 (body.basicBlocks.length + 1)
-            body.basicBlocks B extra hB i bb hbb
-        refine ⟨stmts, term, nc1, nc2, ex1, hs, ht, ?_⟩
-        apply mapGet_append_of_some
-        simpa using hget
+  cases hC : translateCallConv body.fnAbi.conv with
+  | none => simp [hC] at h
+  | some conv =>
+    cases hL : translateLocals 0 body.localDecls with
+    | none => simp [hC, hL] at h
+    | some L =>
+      cases hB : translateBlocksInProg fnMap body.localDecls 0 (body.basicBlocks.length + 1)
+          body.basicBlocks with
+      | none => simp [hC, hL, hB] at h
+      | some brep =>
+        obtain ⟨B, extra⟩ := brep
+        simp [hC, hL, hB] at h
+        subst h
+        refine ⟨⟨rfl, ?_⟩, rfl, rfl, rfl, ?_, ?_⟩
+        · intro i d hd
+          obtain ⟨T, hT, hget⟩ := translateLocals_get 0 body.localDecls L hL i d hd
+          rw [tyOf_of_scalarTypeOf hT]
+          exact ⟨hT, by simpa using hget⟩
+        · simpa using translateBlocksInProg_append_get fnMap body.localDecls 0
+            (body.basicBlocks.length + 1) body.basicBlocks B extra hB
+            body.basicBlocks.length (by omega) (initBlock body) extra
+        · intro i bb hbb
+          obtain ⟨stmts, term, nc1, nc2, ex1, hs, ht, hget⟩ :=
+            translateBlocksInProg_get fnMap body.localDecls 0 (body.basicBlocks.length + 1)
+              body.basicBlocks B extra hB i bb hbb
+          refine ⟨stmts, term, nc1, nc2, ex1, hs, ht, ?_⟩
+          apply mapGet_append_of_some
+          simpa using hget
 
-theorem translateProgFns_get (fnMap : List (String × Gen.FnName))
+theorem translateProgFns_get (fnMap : FnMap)
     (k : Nat) (bs : List CapturedMir) (F : List (Gen.FnName × Gen.Function))
     (h : translateProgFns fnMap k bs = some F) (j : Nat) (b : CapturedMir)
     (hb : bs[j]? = some b) :
@@ -585,11 +594,27 @@ theorem findCallee_idx {callees : List CapturedMir} {dp : String} {callee : Capt
       obtain ⟨j, hj, hdp⟩ := ih h
       exact ⟨j + 1, hj, hdp⟩
 
-theorem lookupFnName_zipIdx_aux (bs : List CapturedMir) (k : Nat)
+theorem lookupFnName_of_lookupFnTarget {fnMap : FnMap} {dp : String}
+    {fn : Gen.FnName} {conv : Gen.CallingConvention}
+    (h : lookupFnTarget fnMap dp = some (fn, conv)) :
+    lookupFnName fnMap dp = some fn := by
+  induction fnMap with
+  | nil => simp [lookupFnTarget] at h
+  | cons entry rest ih =>
+    obtain ⟨k, fn', conv'⟩ := entry
+    simp only [lookupFnTarget, lookupFnName] at h ⊢
+    by_cases hif : (k == dp) = true
+    · simp [hif] at h ⊢; exact h.1
+    · simp [hif] at h ⊢; exact ih h
+
+theorem lookupFnTarget_zipIdx_aux (bs : List CapturedMir) (k : Nat)
     (hnd : (bs.map (·.defPath)).Nodup) (j : Nat) (b : CapturedMir)
     (hb : bs[j]? = some b) :
-    lookupFnName (bs.zipIdx k |>.map fun (x, idx) => (x.defPath, fnName idx)) b.defPath =
-      some (fnName (k + j)) := by
+    lookupFnTarget
+      (bs.zipIdx k |>.map fun (x, idx) =>
+        (x.defPath, (fnName idx, (translateCallConv x.fnAbi.conv).getD .Rust)))
+      b.defPath =
+      some (fnName (k + j), (translateCallConv b.fnAbi.conv).getD .Rust) := by
   induction bs generalizing k j with
   | nil => simp at hb
   | cons b' bs ih =>
@@ -597,7 +622,7 @@ theorem lookupFnName_zipIdx_aux (bs : List CapturedMir) (k : Nat)
     cases j with
     | zero =>
       simp at hb; subst hb
-      simp [List.zipIdx_cons, lookupFnName]
+      simp [List.zipIdx_cons, lookupFnTarget]
     | succ j =>
       simp at hb
       have hmem : b.defPath ∈ bs.map (·.defPath) :=
@@ -606,13 +631,24 @@ theorem lookupFnName_zipIdx_aux (bs : List CapturedMir) (k : Nat)
         rw [beq_eq_false_iff_ne]
         intro heq
         exact hnd.1 (heq ▸ hmem)
-      simp only [List.zipIdx_cons, List.map_cons, lookupFnName, hne, Bool.false_eq_true, ↓reduceIte]
+      simp only [List.zipIdx_cons, List.map_cons, lookupFnTarget, hne, Bool.false_eq_true, ↓reduceIte]
       rw [show k + (j + 1) = k + 1 + j by omega]
       exact ih (k + 1) hnd.2 j hb
 
+theorem lookupFnName_zipIdx_aux (bs : List CapturedMir) (k : Nat)
+    (hnd : (bs.map (·.defPath)).Nodup) (j : Nat) (b : CapturedMir)
+    (hb : bs[j]? = some b) :
+    lookupFnName
+      (bs.zipIdx k |>.map fun (x, idx) =>
+        (x.defPath, (fnName idx, (translateCallConv x.fnAbi.conv).getD .Rust)))
+      b.defPath =
+      some (fnName (k + j)) :=
+  lookupFnName_of_lookupFnTarget (lookupFnTarget_zipIdx_aux bs k hnd j b hb)
+
 /-- Specification of `translateProg`: maps `entry` at `fnName 0`, and resolves
 every callee found by Anneal's `findCallee? callees dp` to the corresponding
-translated `Gen.Function` in `prog.functions` via `lookupFnName`. -/
+translated `Gen.Function` in `prog.functions` via `lookupFnName` and
+`lookupFnTarget`. -/
 theorem translateProg_spec {entry : CapturedMir} {callees : List CapturedMir}
     {prog : Gen.Program} (hnd : ((entry :: callees).map (·.defPath)).Nodup)
     (h : translateProg entry callees = some prog) :
@@ -622,6 +658,8 @@ theorem translateProg_spec {entry : CapturedMir} {callees : List CapturedMir}
       ∃ idx fCallee,
         callee ∈ entry :: callees ∧
         lookupFnName (fnNameMap entry callees) dp = some (fnName idx) ∧
+        lookupFnTarget (fnNameMap entry callees) dp =
+          some (fnName idx, fCallee.calling_convention) ∧
         translateFnInProg (fnNameMap entry callees) callee = some fCallee ∧
         mapGet prog.functions (fnName idx) = some fCallee) := by
   simp only [translateProg, Option.bind_eq_bind] at h
@@ -641,10 +679,122 @@ theorem translateProg_spec {entry : CapturedMir} {callees : List CapturedMir}
       have hbj : (entry :: callees)[j + 1]? = some callee := hj
       obtain ⟨fCallee, hfC, hgetC⟩ :=
         translateProgFns_get (fnNameMap entry callees) 0 (entry :: callees) F hF (j + 1) callee hbj
-      have hlk : lookupFnName (fnNameMap entry callees) callee.defPath = some (fnName (j + 1)) := by
-        simpa [fnNameMap] using lookupFnName_zipIdx_aux (entry :: callees) 0 hnd (j + 1) callee hbj
-      refine ⟨j + 1, fCallee, .tail _ (List.mem_of_getElem? hj), hlk, hfC, ?_⟩
+      obtain ⟨_, hconvC, _, _, _, _⟩ := translateFnInProg_spec (fnNameMap entry callees) callee fCallee hfC
+      have hlkTgt : lookupFnTarget (fnNameMap entry callees) callee.defPath =
+          some (fnName (j + 1), fCallee.calling_convention) := by
+        have hraw := lookupFnTarget_zipIdx_aux (entry :: callees) 0 hnd (j + 1) callee hbj
+        simpa [fnNameMap, hconvC] using hraw
+      have hlk : lookupFnName (fnNameMap entry callees) callee.defPath = some (fnName (j + 1)) :=
+        lookupFnName_of_lookupFnTarget hlkTgt
+      refine ⟨j + 1, fCallee, .tail _ (List.mem_of_getElem? hj), hlk, hlkTgt, hfC, ?_⟩
       apply mapGet_append_of_some
       simpa using hgetC
+
+/-- Exact characterization of `translateCallConv`: succeeds iff the MIR calling
+convention is `.c` (`CallingConvention.C`) or `.rust` (`CallingConvention.Rust`). -/
+theorem translateCallConv_eq_some_iff {cc : Layout.CallConv} {conv : Gen.CallingConvention} :
+    translateCallConv cc = some conv ↔
+      (cc = .c ∧ conv = .C) ∨ (cc = .rust ∧ conv = .Rust) := by
+  cases cc <;> cases conv <;> simp [translateCallConv]
+
+/-- Structural characterization of `translateUnwindAction` on any fragment
+call `UnwindAction` (`callUnwindOk unwind = true`): allocates fresh cleanup
+block `bbName nextCleanup`, increments `nextCleanup`, and emits a single
+`BbKind.Cleanup` block with empty statement list and the corresponding unwind
+terminator (`.ResumeUnwind`, `.Unreachable`, or `buildAbort`). -/
+theorem translateUnwindAction_spec (nextCleanup : Nat) (unwind : MirAst.UnwindAction)
+    (hok : callUnwindOk unwind = true) :
+    ∃ term : Gen.Terminator,
+      translateUnwindAction nextCleanup unwind =
+        (bbName nextCleanup, nextCleanup + 1,
+          [(bbName nextCleanup, ⟨[], term, .Cleanup⟩)]) ∧
+      ((unwind = .continue_ ∧ term = .ResumeUnwind) ∨
+       (unwind = .unreachable ∧ term = .Unreachable) ∨
+       (unwind = .terminate ∧ term = buildAbort)) := by
+  cases unwind with
+  | continue_ => exact ⟨.ResumeUnwind, rfl, .inl ⟨rfl, rfl⟩⟩
+  | unreachable => exact ⟨.Unreachable, rfl, .inr (.inl ⟨rfl, rfl⟩)⟩
+  | terminate => exact ⟨buildAbort, rfl, .inr (.inr ⟨rfl, rfl⟩)⟩
+  | cleanup _ => simp [callUnwindOk] at hok
+
+/-- Structural and CFG specification of `mkStartFn entryIdx`: C calling
+convention, 0 arguments, return local `_0 : unitTy`, start block `bb0` calling
+`fnName entryIdx` with next block `bb1` (`IntrinsicOp.Exit`) and unwind block
+`bb2` (`buildAbort`, `BbKind.Catch`). -/
+theorem mkStartFn_spec (entryIdx : Nat) :
+    (mkStartFn entryIdx).calling_convention = .C ∧
+    (mkStartFn entryIdx).args = [] ∧
+    (mkStartFn entryIdx).ret = localName 0 ∧
+    (mkStartFn entryIdx).start = bbName 0 ∧
+    (mkStartFn entryIdx).implicit_writes = true ∧
+    mapGet (mkStartFn entryIdx).locals (localName 0) = some unitTy ∧
+    mapGet (mkStartFn entryIdx).blocks (bbName 0) =
+      some ⟨[], .Call (fnPtrExpr (fnName entryIdx)) .Rust [] buildUnitPlace
+        (some (bbName 1)) (some (bbName 2)), .Regular⟩ ∧
+    mapGet (mkStartFn entryIdx).blocks (bbName 1) =
+      some ⟨[], .Intrinsic .Exit [] buildUnitPlace none, .Regular⟩ ∧
+    mapGet (mkStartFn entryIdx).blocks (bbName 2) =
+      some ⟨[], buildAbort, .Catch⟩ := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- On any non-`.call` terminator, `translateTerminatorInProg` delegates
+directly to `translateTerminator`, leaves `nextCleanup` unchanged, and
+synthesizes no extra cleanup blocks. -/
+theorem translateTerminatorInProg_eq_of_not_call (fnMap : FnMap)
+    (decls : List LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator)
+    (hnc : ∀ func args dst tgt unw, t.kind ≠ .call func args dst tgt unw) :
+    translateTerminatorInProg fnMap decls nextCleanup t =
+      (translateTerminator decls t).map (fun term => (term, nextCleanup, [])) := by
+  unfold translateTerminatorInProg
+  cases hk : t.kind <;> try (cases translateTerminator decls t <;> rfl)
+  case call func args dst tgt unw =>
+    exact absurd hk (hnc func args dst tgt unw)
+
+/-- When `bbs` contains no `.call` terminators, `translateBlocksInProg` agrees
+with `translateBlocks` and synthesizes no extra cleanup blocks (`extra = []`). -/
+theorem translateBlocksInProg_eq_of_no_calls (fnMap : FnMap)
+    (decls : List LocalDecl) (k nextCleanup : Nat) (bbs : List BasicBlockData)
+    (hnc : ∀ bb ∈ bbs, ∀ func args dst tgt unw,
+      bb.terminator.kind ≠ .call func args dst tgt unw) :
+    translateBlocksInProg fnMap decls k nextCleanup bbs =
+      (translateBlocks decls k bbs).map (fun B => (B, [])) := by
+  induction bbs generalizing k nextCleanup with
+  | nil => rfl
+  | cons bb bbs ih =>
+    have hbb := hnc bb List.mem_cons_self
+    have hrest := ih (k + 1) nextCleanup (fun b hb => hnc b (List.mem_cons_of_mem _ hb))
+    unfold translateBlocksInProg translateBlocks translateBlock
+    rw [translateTerminatorInProg_eq_of_not_call fnMap decls nextCleanup bb.terminator hbb]
+    cases bb.statements.mapM (translateStatement decls) with
+    | none => rfl
+    | some stmts =>
+      cases translateTerminator decls bb.terminator with
+      | none => rfl
+      | some term =>
+        dsimp only [Option.bind_eq_bind, Option.map_some, Option.bind_some]
+        rw [hrest]
+        cases translateBlocks decls (k + 1) bbs <;> rfl
+
+/-- When `body` contains no `.call` terminators, `translateFnInProg fnMap body`
+produces the exact same `Option Gen.Function` as single-function `translateFn body`
+ regardless of `fnMap`. -/
+theorem translateFnInProg_eq_translateFn_of_no_calls (fnMap : FnMap)
+    (body : CapturedMir)
+    (hnc : ∀ bb ∈ body.basicBlocks, ∀ func args dst tgt unw,
+      bb.terminator.kind ≠ .call func args dst tgt unw) :
+    translateFnInProg fnMap body = translateFn body := by
+  simp only [translateFnInProg, translateFn,
+    translateBlocksInProg_eq_of_no_calls fnMap body.localDecls 0
+      (body.basicBlocks.length + 1) body.basicBlocks hnc,
+    Option.bind_eq_bind]
+  cases translateCallConv body.fnAbi.conv with
+  | none => rfl
+  | some conv =>
+    cases translateLocals 0 body.localDecls with
+    | none => rfl
+    | some locals =>
+      cases translateBlocks body.localDecls 0 body.basicBlocks with
+      | none => rfl
+      | some B => simp
 
 end MiniRustSpec.Correspondence

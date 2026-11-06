@@ -87,8 +87,16 @@ open MiniRustSpec.Correspondence in
   translateFnInProg_spec
   translateProgFns_get
   findCallee_idx
+  lookupFnName_of_lookupFnTarget
+  lookupFnTarget_zipIdx_aux
   lookupFnName_zipIdx_aux
   translateProg_spec
+  translateCallConv_eq_some_iff
+  translateUnwindAction_spec
+  mkStartFn_spec
+  translateTerminatorInProg_eq_of_not_call
+  translateBlocksInProg_eq_of_no_calls
+  translateFnInProg_eq_translateFn_of_no_calls
   multi_step_correspondence
   multi_step_start
   initMachineStateWithCallees_startRel
@@ -465,6 +473,33 @@ open MiniRustSpec.Correspondence.Witness in
   checkAbiCompatibility_all_variants_mr41
   createFrame_ub_mr41
   evalReturn_missingNextBlock_and_bottomOfStack_ub
+  cAbiCallee_conv
+  cAbi_inFragment
+  cAbi_translate
+  cAbiCaller_translateInProg
+  ctxCAbiCaller_ok
+  cAbi32_anneal_ret
+  cAbi32_noUB
+  cAbi32_minirust_ret
+  cAbi32_minirust_direct
+  badCallConv_rejected
+  deadCallDest_rejected
+  deadCallDest_translate
+  deadCallDest_anneal_ub
+  deadCallDest_minirust_ub_before_callee
+  uninitProjCallDest_rejected
+  uninitProjCallDest_translate
+  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_minirust_ret
+  diamondCall_inFragment
+  diamondCall_maxStackLocals
+  ctxDiamondCall_ok
+  diamondCall_translate
+  diamondCallEntry_translateInProg
+  diamondCall5_anneal_ret
+  diamondCall5_noUB
+  diamondCall5_minirust_ret
+  diamondCall5_minirust_direct
   ctx0_ok1
   ctx0_ok2
   ctxI8_ok2
@@ -1017,8 +1052,16 @@ open MiniRustSpec.Correspondence in
   translateFnInProg_spec
   translateProgFns_get
   findCallee_idx
+  lookupFnName_of_lookupFnTarget
+  lookupFnTarget_zipIdx_aux
   lookupFnName_zipIdx_aux
   translateProg_spec
+  translateCallConv_eq_some_iff
+  translateUnwindAction_spec
+  mkStartFn_spec
+  translateTerminatorInProg_eq_of_not_call
+  translateBlocksInProg_eq_of_no_calls
+  translateFnInProg_eq_translateFn_of_no_calls
   multi_step_correspondence
   multi_step_start
   initMachineStateWithCallees_startRel
@@ -1330,6 +1373,33 @@ open MiniRustSpec.Correspondence.Witness in
   checkAbiCompatibility_all_variants_mr41
   createFrame_ub_mr41
   evalReturn_missingNextBlock_and_bottomOfStack_ub
+  cAbiCallee_conv
+  cAbi_inFragment
+  cAbi_translate
+  cAbiCaller_translateInProg
+  ctxCAbiCaller_ok
+  cAbi32_anneal_ret
+  cAbi32_noUB
+  cAbi32_minirust_ret
+  cAbi32_minirust_direct
+  badCallConv_rejected
+  deadCallDest_rejected
+  deadCallDest_translate
+  deadCallDest_anneal_ub
+  deadCallDest_minirust_ub_before_callee
+  uninitProjCallDest_rejected
+  uninitProjCallDest_translate
+  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_minirust_ret
+  diamondCall_inFragment
+  diamondCall_maxStackLocals
+  ctxDiamondCall_ok
+  diamondCall_translate
+  diamondCallEntry_translateInProg
+  diamondCall5_anneal_ret
+  diamondCall5_noUB
+  diamondCall5_minirust_ret
+  diamondCall5_minirust_direct
   cmpNotSwitch_inFragment
   cmpNotSwitch_translate
   cmpNotNeg1_anneal_ret

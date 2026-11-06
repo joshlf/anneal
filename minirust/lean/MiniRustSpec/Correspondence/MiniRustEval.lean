@@ -4754,7 +4754,7 @@ theorem typedStore_base_localTy {m : Mach} {ctx : Ctx} {frames : List Frame} {L 
 def rethread (m : Mach) (ctx : Ctx) (frames : List Frame) : Mach :=
   { m with threads := [thread1 ctx frames] }
 
-theorem ProgEnvOk.of_eq {prog : Gen.Program} {fnMap : List (String × Gen.FnName)}
+theorem ProgEnvOk.of_eq {prog : Gen.Program} {fnMap : FnMap}
     {m m' : Mach} (h : ProgEnvOk prog fnMap m)
     (hp : m'.prog = m.prog) (hf : m'.fn_ptrs = m.fn_ptrs) :
     ProgEnvOk prog fnMap m' := by
@@ -4763,13 +4763,13 @@ theorem ProgEnvOk.of_eq {prog : Gen.Program} {fnMap : List (String × Gen.FnName
   rw [hp, hf]
   exact ⟨h1, h2⟩
 
-theorem ProgEnvOk.withMem {prog : Gen.Program} {fnMap : List (String × Gen.FnName)}
+theorem ProgEnvOk.withMem {prog : Gen.Program} {fnMap : FnMap}
     {m : Mach} {allocs : List Gen.Allocation} {acc : Gen.Access}
     (h : ProgEnvOk prog fnMap m) :
     ProgEnvOk prog fnMap (withMem m allocs acc) :=
   h.of_eq rfl rfl
 
-theorem ProgEnvOk.rethread {prog : Gen.Program} {fnMap : List (String × Gen.FnName)}
+theorem ProgEnvOk.rethread {prog : Gen.Program} {fnMap : FnMap}
     {m : Mach} {ctx : Ctx} {frames : List Frame}
     (h : ProgEnvOk prog fnMap m) :
     ProgEnvOk prog fnMap (MiniRustSpec.Correspondence.rethread m ctx frames) :=
@@ -5391,7 +5391,7 @@ theorem checkAbiCompatibility_refl_localTy {T : Gen.Type} {it : Gen.IntType}
 
 /-- Evaluating `fnPtrExpr fn` and resolving `fnFromPtr` on a machine satisfying
 `ProgEnvOk`. -/
-theorem evalValue_fnPtr_and_lookup {prog : Gen.Program} {fnMap : List (String × Gen.FnName)}
+theorem evalValue_fnPtr_and_lookup {prog : Gen.Program} {fnMap : FnMap}
     {m : Mach} (henv : ProgEnvOk prog fnMap m) {dp : String} {fn : Gen.FnName}
     {fCallee : Gen.Function} (hlk : lookupFnName fnMap dp = some fn)
     (hfn : mapGet prog.functions fn = some fCallee) :
@@ -6914,7 +6914,6 @@ theorem evalCall_spec {calleeBody : CapturedMir} {calleeFn : Gen.Function}
     (hsh : Shape m rootCtx (callerStack ++ [callerTop]) m.mem.memory.allocations)
     (hCalleeTr : translateFnInProg (fnMap := []) calleeBody = some calleeFn ∨
       (FnLocalsSpec calleeBody calleeFn ∧
-        calleeFn.calling_convention = .Rust ∧
         calleeFn.args = (List.range calleeBody.argCount).map (fun k => localName (k + 1)) ∧
         calleeFn.start = bbName calleeBody.basicBlocks.length))
     (hd0 : calleeBody.localDecls[0]? = some calleeRetDecl)
@@ -6935,7 +6934,7 @@ theorem evalCall_spec {calleeBody : CapturedMir} {calleeFn : Gen.Function}
       retPtr := retPlace.ptr.thin_pointer
     }
     ∃ calleeLm m',
-      evalCall m calleeFn .Rust
+      evalCall m calleeFn calleeFn.calling_convention
         ((paramDecls.zip argVals).map (fun (pd, v) => (valOfValue (tyOf pd) v, tyOf pd)))
         (retPlace, tyOf calleeRetDecl) (some targetBb) (some unwindBb) = .ok m' ∧
       Shape m' rootCtx
@@ -6945,14 +6944,13 @@ theorem evalCall_spec {calleeBody : CapturedMir} {calleeFn : Gen.Function}
       m'.prog = m.prog ∧ m'.fn_ptrs = m.fn_ptrs ∧
       LocalsOkA calleeBody calleeCtx [] (MirSemantics.initLocals calleeBody argVals)
         calleeLm m'.mem.memory.allocations := by
-  have ⟨hf, hconv, hargsEq, hstartEq⟩ :
+  have ⟨hf, hargsEq, hstartEq⟩ :
       FnLocalsSpec calleeBody calleeFn ∧
-      calleeFn.calling_convention = .Rust ∧
       calleeFn.args = (List.range calleeBody.argCount).map (fun k => localName (k + 1)) ∧
       calleeFn.start = bbName calleeBody.basicBlocks.length := by
     rcases hCalleeTr with htr | hpack
-    · obtain ⟨h1, h2, h3, h4, _, _⟩ := translateFnInProg_spec [] calleeBody calleeFn htr
-      exact ⟨h1, h2, h3, h4⟩
+    · obtain ⟨h1, _, h3, h4, _, _⟩ := translateFnInProg_spec [] calleeBody calleeFn htr
+      exact ⟨h1, h3, h4⟩
     · exact hpack
   intro calleeCtx
   let blkStart := calleeBody.basicBlocks.length
@@ -7016,7 +7014,7 @@ theorem evalCall_spec {calleeBody : CapturedMir} {calleeFn : Gen.Function}
     simp [hargsEq, hpdsLen, hlenArgs]
   have hcf : createFrame m calleeFn
       (.BackToCaller (some targetBb) (some unwindBb) retPlace.ptr.thin_pointer)
-      .Rust (tyOf calleeRetDecl)
+      calleeFn.calling_convention (tyOf calleeRetDecl)
       ((paramDecls.zip argVals).map (fun (pd, v) => (valOfValue (tyOf pd) v, tyOf pd))) =
       .ok (calleeFrameL calleeFn calleeCtx lm2 blkStart 0, mInit) := by
     unfold createFrame
@@ -7026,7 +7024,7 @@ theorem evalCall_spec {calleeBody : CapturedMir} {calleeFn : Gen.Function}
     simp only [ok_bind]
     rw [hargsEq1, halArgs]
     simp only [ok_bind]
-    simp only [hconv, ne_eq, not_true_eq_false, ↓reduceIte]
+    simp only [ne_eq, not_true_eq_false, ↓reduceIte]
     rw [hretMi, ok_bind, habiRet, ok_bind]
     simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
     have hneArgs : (((List.range calleeBody.argCount).map (fun r => localName (1 + r))).length ≠
