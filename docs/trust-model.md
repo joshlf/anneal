@@ -55,7 +55,7 @@ and `theory/` (Layer 3):
 | Zone | Directory | Epistemic layer & components | Trust status |
 | :--- | :--- | :--- | :--- |
 | **Trusted foundation** | [`trusted/`](../trusted) | **Layer 1 (Execution TCB):** `trusted/rustc-capture/`, `trusted/audit/`, `trusted/cargo-anneal/`.<br>**Layer 2 (Specification TCB):** `trusted/lean/` (`Trusted.*` MIR AST and reference semantics). | **In the TCB.** Audited by humans (alongside external files pinned by hash manifests inside `trusted/`). |
-| **Proof theory** | `theory/` | **Layer 3 (Untrusted proof layer):** `Anneal.*` IR lowering passes, simulation theorems, weakest-precondition (WP) calculi, separation logic, and proof automation. | **Outside the TCB.** Audited mechanically by `trusted/audit/` in Anneal's CI and checked by the Lean 4 kernel. |
+| **Proof theory** | `theory/` | **Layer 3 (Untrusted proof layer):** `Anneal.*` (`lowerBody`, `lowerBody_simulates`, `proveCrate`, WP & separation-logic lemmas, and proof automation). | **Outside the TCB.** Audited mechanically by `trusted/audit/` in Anneal's CI and checked by the Lean 4 kernel. |
 
 ### Cargo workspace containment
 
@@ -120,9 +120,9 @@ Trusted.Crate`) and one of two static `Proof.lean` templates (beginning with
 `prelude` so Lean cannot inject implicit imports):
 
 - **Template A (default automated path, when `Proof/Main.lean` is absent):**
-  Imports `Trusted`, `Anneal`, and `Mir`, and discharges
-  `theorem Proof.verify_crate : Trusted.CrateTheorem Mir.crate` using Anneal's
-  automated crate verifier in `theory/`. When a crate has no `Spec/*.lean` or
+  Imports `Trusted`, `Anneal`, and `Mir`, and proves
+  `theorem Proof.verify_crate : Trusted.CrateTheorem Mir.crate :=
+  Anneal.proveCrate Mir.crate rfl`. When a crate has no `Spec/*.lean` or
   `Proof/*.lean` files, no user-written Lean code exists at all; checking the
   crate reduces to compiling `Mir.lean` and `Proof.lean` and running the
   incremental kernel check.
@@ -205,7 +205,36 @@ kernel-level audit over `(baseSpec, baseProof, localSpec, localProof)`:
    (`baseEnv.toKernelEnv`) and replays only the constants in the user crate's
    delta (`localSpec ∪ localProof`).
 
-## 3. Staging TCB changes (`vetted` vs. `candidate:<feature>` modules)
+## 3. Staging TCB changes and `.olean` kernel transparency (`trusted/lean/`)
+
+### Keeping `trusted/lean/` transparent at the `.olean` kernel level
+
+Auditing `trusted/lean/` requires confidence not only in the surface `.lean`
+source files, but also in the compiled `.olean` constants replayed by the Lean
+4 kernel. Four design choices in `trusted/lean/` keep its compiled kernel
+environment simple and directly inspectable:
+
+- **Tactic-free definitions (`SourceRole.trusted`):** `TrustedBoundary.lean`
+  forbids `by` tactic blocks across `trusted/lean/`. All trusted definitions and
+  any foundational helper lemmas use explicit functional definitions and term-
+  mode proofs rather than opaque tactic-generated terms.
+- **No `mutual` inductive types (`BodyId` table):** `Trusted/MirAst.lean`
+  stores function bodies in a flat `Crate.bodies` list indexed by `BodyId`
+  rather than nesting `MirBody` inside `Terminator` or `TCBItem`, avoiding the
+  nested mutual recursors that Lean synthesizes for mutual inductive blocks.
+- **Structural fuel-bounded recursion without `WellFounded.fix`:** Recursive
+  semantic functions in `Trusted/StepResult.lean` and
+  `Trusted/MirSemantics.lean` recurse structurally on an explicit `Nat` fuel
+  argument (or on inductive syntax/value trees), avoiding well-founded recursion
+  proof obligations in the kernel environment.
+- **Explicit assumption obligations (`Obligation.assumed`) instead of `opaque`
+  constants:** Trusted waivers (such as `TCBItem.rustcLowering`,
+  `TCBItem.assumedContract`, and `TCBItem.unverifiedFn`) are stated via
+  `Obligation.assumed (id : Id) : Obligation Id := ⟨id, False⟩` in
+  `Trusted/Refinement.lean` rather than declaring dummy `opaque` constants in
+  `Trusted/MirSemantics.lean`.
+
+### Module-level trust tiers (`vetted` vs. `candidate:<feature>`)
 
 Auditing a new semantic rule in `trusted/lean/` to full TCB standards—including
 line-by-line Rust Reference citations and human review—takes deliberate effort.
