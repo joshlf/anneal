@@ -17,247 +17,145 @@ those terms. -->
 > ***If** the code in your TCB audit log is correct, its assumptions are valid,
 > **and** Anneal emits no errors, **then** your code is correct.*
 
-In modern verification workflows, untrusted or reward-hacking AI coding agents
-(as well as external human contributors) author Rust implementations,
-specifications, proof automation, and crate-specific Lean 4 proof scripts. An
-agent optimizing for a passing exit code (`cargo anneal verify` exiting `0`) has
-a strong incentive to make verification succeed without proving the intended
-property of the production Rust code.
+This document defines what Anneal does and does not aim to defend against so
+that promise holds. For how Anneal's architecture implements these defenses, see
+[`docs/trust-model.md`](docs/trust-model.md).
 
-For an incorrect Rust program to appear to pass verification, an untrusted
-actor must subvert one of the three parts of [`PRINCIPLES.md`](PRINCIPLES.md)'s
-promise:
+## 1. Background: adversarial humans and reward-hacking agents
 
-1. **Subvert the execution environment** so *"Anneal emits no errors"* is forged
-   or bypassed—for example, by replacing the `cargo-anneal` binary on a shared
-   workstation, injecting environment variables, or executing a malicious
-   `build.rs` script or procedural macro during compilation.
-2. **Subvert the proof** so *"Anneal emits no errors"* on a false theorem
-   statement—for example, by sneaking `sorry`, custom `axiom`s, `opaque`
-   declarations, native code execution (`native_decide`), compiler overrides
-   (`@[implemented_by]`, `@[extern]`), or elaboration-time I/O (`#eval`,
-   `run_cmd`, `initialize`) into Lean proof files.
-3. **Subvert the specification or scope** so *"the code in your TCB audit log
-   is correct and its assumptions are valid"* silently proves a weaker claim—for
-   example, by weakening a postcondition (`ensures(true)`), shrinking the input
-   domain via a contradictory or over-constrained precondition
-   (`requires(false)` or `requires(len == 0)`), modifying a helper function
-   called by a relational reference function (`spec_fn`), adding
-   `#[anneal::trusted]` waivers, mutating a private invariant field from an
-   unverified function in the same module, or placing undefined behavior (UB)
-   inside uncalled link-level hooks or `static mut` items.
+Unlike testing, which checks that a program behaves as expected on specific
+inputs, formal verification claims that a mathematical proof establishes
+correctness for *all* valid inputs. Because writing specifications and machine-
+checked proofs requires significant effort, projects increasingly rely on
+external contributors and AI coding agents to write Rust code, specifications,
+proof automation, and crate-specific Lean 4 proofs.
 
-This document is the controlling specification for how Anneal defends against
-these three attack surfaces:
+An honest developer uses `cargo anneal` to find genuine bugs in their code or
+proofs. By contrast, a malicious contributor—or a reward-hacking AI coding agent
+optimizing to make `cargo anneal` exit `0`—has an incentive to make verification
+succeed *without* proving the intended property of the Rust code:
 
-- **Section 1** defines the **execution-isolation boundary** (when a
-  verification run is authoritative vs. advisory) and the four requirements of a
-  well-configured CI environment.
-- **Section 2** defines the **three-layer trust partition** and **two-stage
-  boundary audit** that allow Anneal to trust pre-audited toolchain modules
-  without re-auditing them on user machines while mechanically auditing
-  user-supplied Lean files.
-- **Section 3** defines how every class of user-brought artifact is handled and
-  what human reviewers must inspect in the **TCB audit log
-  (`anneal-tcb.lock`)**.
+- An agent stuck on a difficult proof may try to sneak `sorry`, a custom
+  `axiom`, unverified native evaluation (`native_decide`), or a compiler
+  override (`@[implemented_by]`, `@[extern]`) into a Lean proof file.
+- An agent unable to prove a function's specification may weaken the
+  postcondition (`ensures(true)`), add a contradictory precondition
+  (`requires(false)`), modify a helper function called by the specification, or
+  mark the function `#[anneal::trusted]`.
+- An agent running on a developer's machine may bypass verification altogether
+  by modifying or shadowing the `cargo-anneal` binary or its toolchain
+  dependencies so the command exits `0` unconditionally.
 
-For how Anneal's internal codebase (`trusted/` and `trusted/audit/`) implements
-these guarantees, see [`docs/trust-model.md`](docs/trust-model.md).
+Anneal's threat model therefore assumes that repository changes may be authored
+by adversarial humans or reward-hacking AI coding agents rather than assuming
+good-faith inputs.
 
-## 1. Execution-isolation boundary: when verification is authoritative
+## 2. Compromised execution environments and the dev vs. CI boundary
 
-### The Outside-the-Write-Boundary Rule
+The overarching threat that Anneal **does not** aim to defend against is a
+**compromised execution environment**: an environment in which an untrusted
+human or agent can modify or interpose on `cargo-anneal`, its binary
+dependencies (`cargo`, `rustc`, `lean`, or pre-compiled toolchain files), its
+environment variables (`PATH`, `LD_PRELOAD`), its working files during
+verification, or the channel reporting the verification result and TCB audit
+log.
 
-No user-space verifier can defend against a process running concurrently with
-the same operating-system privileges. When an un-sandboxed AI coding agent runs
-under the developer's own OS user account on a workstation, it does not need to
-sneak an axiom past the Lean 4 kernel or exploit a file-descriptor race: it can
-overwrite `~/.cargo/bin/cargo-anneal`, shadow `cargo` on `PATH`, set
-`LD_PRELOAD`, or print fabricated terminal output. Attempting to defend against
-same-UID host tampering inside `cargo-anneal`—such as via per-file
-`lstat`/`fstat` inode checks or re-hashing the installed toolchain directory on
-every invocation—adds complexity without closing the attack.
+This includes host OS tampering executed during compilation or elaboration by
+build-time code inside the repository—such as Cargo `build.rs` build scripts,
+procedural macros, compiler plugins, or Lean 4 elaborator I/O (`#eval`,
+`run_cmd`, `by_elab`, `initialize`). (By contrast, non-malicious Rust code
+generated by a `build.rs` script or procedural macro is compiled by `rustc` and
+verified like any other code in the crate.)
 
-Anneal therefore defines an explicit execution precondition for
-[`PRINCIPLES.md`](PRINCIPLES.md)'s promise:
+**There is no in-principle way for an un-sandboxed user-space tool to defend
+against a compromised execution environment.** If an agent running under the
+same OS user account as `cargo-anneal`—or a `build.rs` script, procedural macro,
+or compiler process invoked during the build—has write access to the host's
+binaries, working directory, or environment, it does not need to find a
+soundness bug in Anneal or the Lean 4 kernel: it can replace `cargo-anneal` (or
+`lean`) or overwrite build outputs on disk so verification reports a clean TCB
+audit log and exits `0`. In-process checks inside `cargo-anneal` cannot defend
+against an actor or child process that can modify the host environment in which
+those checks run; preventing build-time code from tampering with the host
+requires OS-level sandboxing of the build.
 
-> **Outside-the-Write-Boundary Rule:** A verification result and its emitted TCB
-> audit log are authoritative against an untrusted actor if and only if
-> `cargo-anneal` (or `anneal-audit`), the installed Anneal toolchain archive,
-> the verification staging directory, and the channel delivering the TCB audit
-> log execute **outside that actor's OS write, environment-injection, and
-> process-control boundary**.
+**Anneal's threat model therefore assumes an uncompromised execution
+environment:** the operating system, filesystem, environment, and installed
+Anneal toolchain binaries are intact and outside the untrusted actor's write or
+process-control access when verification runs.
 
-This rule classifies execution environments into authoritative gates and
-advisory developer loops:
+This assumption naturally aligns with the standard split between **local
+development environments** and **Continuous Integration (CI)**:
 
-| Execution environment | Actor isolation | Status under `PRINCIPLES.md` |
-| :--- | :--- | :--- |
-| **1. Anneal release CI** | Ephemeral CI runner evaluating a pull request to `joshlf/anneal`. | **Authoritative** for auditing and packaging Anneal toolchain releases. |
-| **2. Downstream project CI** | Ephemeral CI runner evaluating a pull request to a user repository with `cargo anneal verify --locked`. | **Authoritative** for verifying the target crate and gating merges to `main`. |
-| **3. Host-sandboxed local agent** | Workstation where the agent runs inside an unprivileged container, VM, or distinct OS UID, and the host runs `cargo anneal verify` outside that sandbox. | **Authoritative** against the sandboxed agent. |
-| **4. Un-sandboxed same-UID workstation** | Developer machine where an agent shares write access to the user's home directory, binaries, or shell environment. | **Advisory fast-feedback loop only.** Catches accidental errors and naive agent shortcuts (`sorry`, `axiom`), but must be confirmed by CI (or a host sandbox) before trusting the result. |
+- **Local development machines (outside the threat model when shared with an
+  un-sandboxed agent):** When a developer runs an un-sandboxed AI agent under
+  their own user account on a laptop or workstation, the execution environment
+  is potentially compromised. Running `cargo anneal` locally remains useful as a
+  fast feedback loop for catching ordinary mistakes and naive agent shortcuts,
+  but a local pass is not a security guarantee. (A local run satisfies the
+  threat model only when the agent is confined inside a separate OS sandbox,
+  container, or VM while `cargo-anneal` runs outside that sandbox.)
+- **Well-configured CI (within the threat model):** In CI, an untrusted
+  contributor or AI agent cannot touch the runner's binaries or environment
+  directly; their only interface is **proposing changes to repository files in a
+  pull request**. Because software projects already rely on isolated CI runners
+  (with OS-level build sandboxing where untrusted `build.rs` or macro execution
+  is a concern) and human code review to gate merges to `main`, running
+  `cargo anneal` in CI with protected workflow configurations and a pinned
+  Anneal toolchain satisfies the uncompromised execution environment assumption.
 
-### Requirements for a well-configured CI pipeline
+Finally, Anneal does not aim to judge whether a PR-visible change to a
+specification, an assumption in the TCB audit log, or a repository build file
+matches the maintainers' intent. No automated tool can distinguish in principle
+between "the maintainers decided to change this function's specification" and "a
+reward-hacking agent weakened the specification to make proofs pass." Relying on
+humans (or review agents) to audit the pull request diff and TCB audit log is an
+inherent part of the security model.
 
-To satisfy the Outside-the-Write-Boundary Rule in a downstream project's CI
-pipeline (or host sandbox), four conditions must hold:
+## 3. In-scope threats from untrusted repository contents
 
-1. **Immutable verifier and pinned toolchain:** `cargo-anneal` and the Anneal
-   toolchain archive are installed from a pinned release digest (verified once
-   at installation time by `cargo anneal setup`) onto a filesystem path not
-   writable by untrusted code during verification.
-2. **Pre-execution gating of `build.rs` and procedural macros:** During MIR
-   capture, Cargo compiles and executes `build.rs` scripts and procedural macros
-   under the CI runner's own user account. If a pull request introduces or
-   modifies a `build.rs` script or procedural macro that executes before the TCB
-   audit check, that code could compromise the CI runner. Under
-   `cargo anneal verify --locked`, `cargo-anneal` hashes all `build.rs` scripts
-   and non-TCB procedural macros in the resolved build graph and verifies them
-   against the committed `anneal-tcb.lock` **before** compiling or executing
-   them—failing closed prior to execution when any unapproved build hook is
-   present—and stages verification inputs in a private temporary directory
-   outside the repository checkout.
-3. **Scrubbed child-process environment and repository-input hygiene:**
-   `cargo-anneal` clears ambient environment variables when invoking `rustc`,
-   `anneal-rustc-capture`, and `lean` (stripping `LD_PRELOAD`,
-   `DYLD_INSERT_LIBRARIES`, `RUSTC_WRAPPER`, `RUSTFLAGS`,
-   `CARGO_ENCODED_RUSTFLAGS`, `LEAN_PATH`, and unpinned environment variables).
-   Because the checked-out Git repository tree is untrusted input,
-   `cargo-anneal` and `anneal-rustc-capture` also reject symlinks and `..` path
-   traversal inside the crate, ignore or reject pre-compiled `.olean`/`.ir`
-   files and pre-existing `.anneal/` outputs, reject repo-local
-   `rust-toolchain*` and `.cargo/config*` compiler overrides, reject
-   out-of-tree `include!`/`#[path]` files and unpinned `env!`/`option_env!`
-   reads via `rustc` session tracking, and require identical MIR across `debug`
-   and `release` configurations.
-4. **Locked TCB audit log and protected workflows:** CI runs
-   `cargo anneal verify --locked` so any unreviewed change to the crate's TCB or
-   assumptions fails the build, and repository branch protection requires human
-   review on changes to CI workflow configurations, toolchain version pins,
-   `anneal-tcb.lock`, and specifications.
+Within an uncompromised execution environment, Anneal treats the crate's proofs,
+specifications, and Rust source files as untrusted and aims to defend against
+two categories of repository-borne threats:
 
-## 2. Three-layer trust partition and two-stage boundary audit
+### 1. Subverting the proof without proving the theorem
 
-### The three universal trust layers
+An adversarial proof in the crate (`Proof/*.lean`) or in Anneal's own
+proof-automation library (`theory/`) can attempt to make Lean accept a false
+claim—for example, by introducing `sorry` or a custom `axiom`, invoking
+unverified native evaluation (`native_decide`), defining `partial` or `unsafe`
+constants, attaching compiler overrides (`@[implemented_by]`, `@[extern]`,
+`@[csimp]`), or proving a weakened or renamed theorem statement instead of the
+theorem statement generated from the crate's Rust code and specifications.
 
-Every verification run combines artifacts from Anneal itself and from the target
-Rust crate. Both sets of artifacts are governed by the same **three-layer trust
-partition**, defined by each artifact's role in the Lean 4 kernel:
+Anneal aims to prevent any untrusted proof from altering the theorem statement
+or causing a false claim to pass—without restricting legitimate Lean 4 tactics
+or macros—so that **proof files never need to be trusted or reviewed by
+humans**.
 
-| Layer | Role in verification | In Anneal (`joshlf/anneal`) | In a downstream user crate | TCB audit log (`anneal-tcb.lock`) & human review |
-| :--- | :--- | :--- | :--- | :--- |
-| **Layer 1: Execution & foundation TCB** | Executes MIR extraction, Lean elaboration, and kernel typechecking. | Pinned `lean` + `Init.*` prelude (`foundation-lock.json`), `rustc`, `trusted/rustc-capture/`, `trusted/audit/`, `trusted/cargo-anneal/`, `root-manifest.sha256`. | Target triple, Cargo features/cfgs, `[profile]` settings, and any approved `build.rs` or proc-macro hooks (`build_hooks`). | **In the TCB audit log.** Pinned by version/digest; `build_hooks` gated before execution. |
-| **Layer 2: Specification & assumption TCB** | Defines *what* program is verified, *what* theorem statement is claimed, and *what* obligations are waived. | `trusted/lean/` (`Trusted.*` MIR AST and operational semantics, module-tiered as `vetted` or `candidate:<feature>`). | Captured `Mir.lean` (`src/**`, inline `requires`/`ensures`/`invariant` specs, Mode 4 `spec_fn` closures, waivers, unverified functions in private-invariant scopes, ambient items) and user mathematical models (`Spec/*.lean`). | **In the TCB audit log.** Pure, tactic-free, and transparent; reviewed by humans. |
-| **Layer 3: Untrusted proof layer** | Constructs proof terms discharging Layer 2's theorem statement. | `theory/` (`Anneal.*`: IR lowering passes, simulation theorems, WP & separation-logic lemmas, and proof automation). | Crate-specific Lean proof modules (`Proof/*.lean`) and the generated root `Proof.lean` entrypoint. | **Outside the TCB audit log.** Mechanically audited and kernel-checked; **zero human review**. |
+### 2. Vacuous specifications or hidden assumptions
 
-### Statement-Origin Separation
+Even when the proof is mathematically sound in the Lean kernel, a reward-hacking
+agent can pass verification without proving the claim a human reviewer expects:
 
-In the Lean 4 kernel, every compiled theorem has two distinct parts:
+- **Vacuous preconditions:** Adding contradictory preconditions
+  (`requires(false)` or mutually contradictory clauses) so the contract holds
+  vacuously over an empty set of inputs without verifying a single execution of
+  the function.
+- **Indirect specification tampering:** Leaving a function's inline contract
+  unchanged in the pull request diff while modifying a helper Rust function
+  (`spec_fn`), constant (`required_consts`), or Lean mathematical model
+  (`Spec/*.lean`) that the contract depends on, or using `Spec/*.lean`
+  declarations to shadow identifiers in generated verification files.
+- **Unlogged assumptions and invariant-scope gaps:** Bypassing verification of
+  an obligation by adding trust waivers (`#[anneal::trusted]`), calling
+  unverified functions, leaving sibling functions inside a private type
+  invariant's visibility scope unverified (allowing an unverified function in
+  the same module to break the private invariant that verified functions
+  assume), or hiding waivers inside an upstream workspace dependency.
 
-- **The theorem statement (`ConstantInfo.type`):** The proposition claiming
-  *what* holds (Layer 2).
-- **The proof term (`ConstantInfo.value?`):** The lambda term showing *why* that
-  proposition holds (Layer 3).
-
-Anneal enforces **Statement-Origin Separation** across both its own repository
-and downstream crates:
-
-1. **One-way dependency DAG (`Trusted.*` $\to$ `Spec.*` $\to$ `Mir` $\to$
-   `Proof.*`):** Every constant referenced in the target theorem statement
-   (`Trusted.CrateTheorem Mir.crate`)—and every constant referenced by any Layer
-   2 specification module—must originate in Layer 1 (`Init.*`) or Layer 2
-   (`Trusted.*`, user `Spec.*`, and captured `Mir`). No constant from Layer 3
-   (`theory/` or user `Proof.*`) may appear anywhere in Layer 2 or in the
-   theorem statement.
-2. **Mechanical proof purity:** Every Layer 3 module is mechanically verified to
-   be free of elaboration side effects (`#eval`, `run_cmd`, `by_elab`,
-   `initialize`), compiler overrides (`@[implemented_by]`, `@[extern]`,
-   `@[csimp]`), native evaluation (`native_decide`), custom `axiom`s, `sorry`,
-   `opaque`, `partial`, and `unsafe` declarations, and is rechecked by the
-   standalone Lean 4 kernel (`trustLevel := 0`, `loadExts := false`).
-
-Because Layer 3 proofs cannot alter the theorem statement and cannot introduce
-axioms or side effects, a buggy or adversarial proof script in `theory/` or
-`Proof/*.lean` can cause verification to fail, but can never cause a false
-theorem statement to pass.
-
-### Two-stage boundary auditing: Anneal CI vs. user CI
-
-Splitting the boundary audit along the toolchain release boundary explains why
-Anneal does not need to re-audit its own shipped code on user machines, while
-still auditing extra Lean files brought along by the user's crate:
-
-- **Stage A — In Anneal's release CI (`anneal-audit --mode audit`):** Before an
-  Anneal release is packaged, Anneal's CI audits all of Anneal's Layer 2
-  (`trusted/lean/`) and Layer 3 (`theory/`) modules from scratch against the
-  pinned `Init.*` foundation, enforces `vetted` vs. `candidate:<feature>` tier
-  separation, and packages the resulting pre-compiled `.olean` modules and tier
-  metadata (`toolchain-manifest.json`) into the toolchain archive.
-- **Stage B — In downstream crate verification (`cargo anneal verify`):** When
-  verifying a user crate, `cargo-anneal` loads Anneal's pre-audited `.olean`
-  modules from the installed toolchain archive as an immutable base environment
-  (without re-parsing, re-compiling, or re-auditing `trusted/lean/` or
-  `theory/`) and runs syntactic preflight and incremental standalone kernel
-  replay (`--mode audit-delta`) **only on the user crate's delta** (`Mir.lean`,
-  `Proof.lean`, and any user-supplied `Spec/*.lean` or `Proof/*.lean` files).
-
-## 3. User-brought artifacts and the `anneal-tcb.lock` review contract
-
-### How Anneal handles every class of user-brought artifact
-
-To prevent an untrusted agent from subverting verification through the crate's
-source code, specifications, or dependencies without human visibility, Stage B
-enforces the following contract across all five classes of user-brought
-artifacts:
-
-| User-brought artifact | Reward-hacking vector | Mechanical defense & `anneal-tcb.lock` visibility |
-| :--- | :--- | :--- |
-| **1. User proof modules (`Proof/*.lean`)** | Agent sneaks in `sorry`, `axiom`, `#eval`, `@[implemented_by]`, or proves a weakened theorem instead of `Trusted.CrateTheorem Mir.crate`. | **Mechanically audited in Stage B; omitted from `anneal-tcb.lock`.** `anneal-rustc-capture` generates the root `Proof.lean` entrypoint pinning the theorem statement to `Trusted.CrateTheorem Mir.crate`, and Stage B audits `Proof/*.lean` before replaying it in the kernel. Proof edits require **zero human review**. |
-| **2. User specification models (`Spec/*.lean`) & inline contracts (`requires`, `ensures`, `invariant`, Mode 4 `spec_fn`)** | Agent weakens a postcondition (`ensures(true)`), shrinks the domain via a contradictory or over-constrained precondition (`requires(false)`, `requires(x == 0)`, or dead `const` assertions), modifies a helper called by a Mode 4 `spec_fn`, or hides tactics/axioms in `Spec/*.lean`. | **Mechanically checked for transparency & non-vacuity; logged in `anneal-tcb.lock`.** Contradictory preconditions are rejected by existential non-vacuity checks; `Spec/*.lean` must be tactic-free and `opaque`-free; and `anneal-tcb.lock` records every verified function's `requires`, `ensures`, non-empty `required_consts`, `Spec/*.lean` digests, and the normalized bodies/digests of Mode 4 `spec_fn`s **and their entire transitive callee/constant closures**. |
-| **3. Partially verified crates & private-invariant visibility scopes ($\mathcal{V}_T$)** | An unverified function in the same module mutates a private field of a type $T$, breaking $T$'s `#[anneal::invariant]` assumed by verified methods. | **Scoped encapsulation check + explicit waiver in `anneal-tcb.lock`.** For any type $T$ with a private invariant (`allFieldsPubSafe = false`), let $\mathcal{V}_T$ be the union of visibility scopes of $T$'s non-`pubSafe` fields. Any unverified function inside $\mathcal{V}_T$ is recorded as an explicit `unverifiedFn` waiver in `anneal-tcb.lock`, and verified safe functions in $\mathcal{V}_T$ cannot return `&mut` references to non-`pubSafe` invariant fields unless the invariant holds universally on that field type. |
-| **4. Uncalled ambient & link-level items** | Agent places UB or state corruption in `#[no_mangle]`, `#[export_name]`, `#[link_section]`, `#[global_allocator]`, `#[panic_handler]`, `static mut`, interior-mutable `static`s, or `extern` blocks never called by verified functions. | **Inventoried in `anneal-tcb.lock` (`ambient_items`).** `anneal-rustc-capture` scans the crate HIR for link-level entrypoints, global runtime hooks, and mutable statics outside the verified call graph and records them in `anneal-tcb.lock`. |
-| **5. Cross-crate verified dependencies** | Downstream crate `B` consumes a spoofed or stale verification summary from upstream crate `A`, or `A` hides a `#[anneal::trusted]` waiver or `candidate:<feature>` dependency. | **Compositional `UnitId` verification & transitive TCB union.** Workspace dependencies are verified in topological order in private staging, bound by a recursive Merkle digest over compilation inputs (`UnitId`), and their Layer 1/Layer 2 waivers, `Spec.*` models, and `candidate:<feature>` closures propagate transitively into `B`'s `anneal-tcb.lock`. |
-
-### Zero-churn `anneal-tcb.lock` and what human reviewers check
-
-If the git-committed `anneal-tcb.lock` recorded target-crate `src/**/*.rs` file
-hashes, sequential `BodyId` integers, or `file:line:col` source spans, every
-internal refactoring, comment edit, or `cargo fmt` run would produce a lockfile
-diff—training human reviewers to rubber-stamp TCB changes.
-
-Anneal therefore separates volatile compilation digests (used only in ephemeral
-staging certificates during a run) from the committed `anneal-tcb.lock`:
-
-- `anneal-tcb.lock` keys items by canonical module-qualified Rust paths (such as
-  `my_crate::foo::bar`) and records only Layer 1 execution hooks/configuration
-  and Layer 2 specifications, `Spec/*.lean` digests, active
-  `candidate:<feature>` tags, waivers, and unverified/ambient item inventories.
-- **Editing a verified function's implementation body (outside a Mode 4
-  `spec_fn` closure), reformatting Rust code, or rewriting `Proof/*.lean`
-  produces zero diff in `anneal-tcb.lock`.**
-
-When a pull request passes `cargo anneal verify --locked` in a well-configured
-CI pipeline:
-
-- If `anneal-tcb.lock` has **no diff**, the crate's trusted surface,
-  specifications, and assumptions are unchanged; the reviewer does not need to
-  inspect `Proof/*.lean` for soundness.
-- If `anneal-tcb.lock` **has a diff**, the human reviewer inspects that diff
-  against four questions:
-  1. **Preconditions and `required_consts` (no unintended domain shrinking):**
-     Are `requires` clauses and post-monomorphization `required_consts`
-     realistic rather than over-constraining the function to a trivial subset of
-     inputs?
-  2. **Postconditions, `Spec/*.lean`, and Mode 4 `spec_fn` closures (no weakened
-     claims):** Do `ensures` clauses, pure `Spec/*.lean` definitions, and any
-     Mode 4 `spec_fn` (including its transitive helpers) express the intended
-     correctness property?
-  3. **Verification scope (`unverified_functions` and `ambient_items`):** Are
-     any newly added unverified functions (especially those tagged
-     `[contains_unsafe_block]` or `[unsafe_fn]`) or link-level `ambient_items`
-     expected to remain outside verification?
-  4. **Explicit waivers, candidate features, and `build_hooks`:** Are any
-     `#[anneal::trusted]` waivers, unverified-callee waivers (including those in
-     private-invariant scopes $\mathcal{V}_T$), `candidate:<feature>` TCB
-     modules, or `build.rs` / procedural-macro changes justified?
+Because human reviewers rely on the TCB audit log to see what is being proved
+and assumed, Anneal aims to reject contradictory preconditions automatically and
+to ensure that **every** specification, helper closure, and assumption relied
+upon by a proof is surfaced in the TCB audit log—without noise from ordinary
+implementation or proof edits.

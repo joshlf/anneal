@@ -56,9 +56,9 @@ that as well.)
 
 - [`PRINCIPLES.md`](PRINCIPLES.md): Anneal's mission, correctness promise, and
   decision-making priority order.
-- [`THREAT_MODEL.md`](THREAT_MODEL.md): Threat model, execution-isolation
-  boundary, the three-layer trust partition, two-stage CI vs. crate boundary
-  auditing, and the TCB audit log (`anneal-tcb.lock`) review contract.
+- [`THREAT_MODEL.md`](THREAT_MODEL.md): Threat model, why verification assumes
+  an uncompromised execution environment (CI vs. local dev), and what
+  repository-borne threats Anneal aims to defend against.
 - [`DESIGN.md`](DESIGN.md): Durable architectural design contract and invariants.
 - [`docs/design.md`](docs/design.md): Overall system design, end-to-end
   verification workflow, library-centric verification, multi-modal
