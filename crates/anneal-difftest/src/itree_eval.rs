@@ -931,34 +931,53 @@ fn render_trace_collector_source(
     );
     let _ = writeln!(
         out,
-        "use trace_observer::{{EnvSchedule, TraceRecorder, encode_recorded_raw_trace_hex, value_as_raw_bytes}};\n"
+        "use trace_observer::{{EnvSchedule, TraceCapture, TraceRecorder, encode_recorded_raw_trace_hex, value_as_raw_bytes}};\n"
     );
-    let _ = writeln!(out, "fn main() {{");
+    let _ = writeln!(
+        out,
+        "#[inline(never)]\n\
+         fn __anneal_no_instrument_run_trial<R: TraceCapture>(\n\
+         \x20   fn_ident: &str,\n\
+         \x20   def_path: &str,\n\
+         \x20   f: fn(u32, u32) -> R,\n\
+         \x20   a0: u32,\n\
+         \x20   a1: u32,\n\
+         \x20   rec: TraceRecorder,\n\
+         ) {{\n\
+         \x20   let (_res, trace, _rec) = TraceRecorder::observe_root_with_recorder(\n\
+         \x20       rec,\n\
+         \x20       def_path,\n\
+         \x20       vec![value_as_raw_bytes(&a0), value_as_raw_bytes(&a1)],\n\
+         \x20       |_rec| f(a0, a1),\n\
+         \x20   );\n\
+         \x20   println!(\"ANNEAL_TRACE_HEX:{{fn_ident}}:{{}}\", encode_recorded_raw_trace_hex(&trace));\n\
+         }}\n"
+    );
 
     for (staged, trials) in staged_candidates {
         let fn_ident = &staged.root_fn_name;
         let def_path = format!("itree_diff_staged::{fn_ident}");
+        let _ = writeln!(
+            out,
+            "#[inline(never)]\nfn __anneal_no_instrument_trials_{fn_ident}() {{"
+        );
         for trial in trials {
             let magic = trial.magic;
             let payload_len = trial.payload_len;
             let rec_expr = render_trace_recorder_expr(&trial.schedule);
             let _ = writeln!(
                 out,
-                "    {{\n\
-                 \x20       let a0: u32 = {magic}u32;\n\
-                 \x20       let a1: u32 = {payload_len}u32;\n\
-                 \x20       let (_res, trace, _rec) = TraceRecorder::observe_root_with_recorder(\n\
-                 \x20           {rec_expr},\n\
-                 \x20           \"{def_path}\",\n\
-                 \x20           vec![value_as_raw_bytes(&a0), value_as_raw_bytes(&a1)],\n\
-                 \x20           |_rec| itree_diff_staged::{fn_ident}(a0, a1),\n\
-                 \x20       );\n\
-                 \x20       println!(\"ANNEAL_TRACE_HEX:{fn_ident}:{{}}\", encode_recorded_raw_trace_hex(&trace));\n\
-                 \x20   }}"
+                "    __anneal_no_instrument_run_trial(\"{fn_ident}\", \"{def_path}\", itree_diff_staged::{fn_ident}, {magic}u32, {payload_len}u32, {rec_expr});"
             );
         }
+        let _ = writeln!(out, "}}\n");
     }
 
+    let _ = writeln!(out, "fn main() {{");
+    for (staged, _trials) in staged_candidates {
+        let fn_ident = &staged.root_fn_name;
+        let _ = writeln!(out, "    __anneal_no_instrument_trials_{fn_ident}();");
+    }
     let _ = writeln!(out, "}}");
     out
 }
@@ -978,7 +997,7 @@ fn collect_traces_natively(
         .map_err(|e| format!("failed to write {}: {e}", collector_rs.display()))?;
 
     let extern_arg = format!("anneal_trace={}", proc_macro_dylib.display());
-    for (opt_level, bin_path) in [("0", &collector_bin_o0), ("2", &collector_bin_o2)] {
+    let compile_one = |opt_level: &str, bin_path: &Path| -> Result<(), String> {
         let opt_flag = format!("opt-level={opt_level}");
         let compile_out = Command::new(&mir_instrument_bin)
             .args([
@@ -989,6 +1008,8 @@ fn collect_traces_natively(
                 "warnings",
                 "-C",
                 &opt_flag,
+                "-C",
+                "codegen-units=16",
                 "--extern",
                 &extern_arg,
             ])
@@ -1008,7 +1029,20 @@ fn collect_traces_natively(
                 String::from_utf8_lossy(&compile_out.stderr)
             ));
         }
-    }
+        Ok(())
+    };
+    let (res_o0, res_o2) = std::thread::scope(|s| {
+        let h0 = s.spawn(|| compile_one("0", &collector_bin_o0));
+        let h2 = s.spawn(|| compile_one("2", &collector_bin_o2));
+        (
+            h0.join()
+                .unwrap_or_else(|_| Err("panic compiling -O0 trace collector".to_string())),
+            h2.join()
+                .unwrap_or_else(|_| Err("panic compiling -O2 trace collector".to_string())),
+        )
+    });
+    res_o0?;
+    res_o2?;
 
     let parse_collector_stdout =
         |stdout: &[u8]| -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
@@ -1421,17 +1455,22 @@ pub fn evaluate_itree_batches_with_options(
 
         // Build Anneal + all referenced Mir modules once via `lake build`.
         let anneal_dir = staging_dir.join(".anneal");
-        let mut lake_targets: Vec<String> = vec!["Anneal".to_string()];
-        for case in &batch_cases {
-            if !lake_targets.contains(&case.config.root_mir_module) {
-                lake_targets.push(case.config.root_mir_module.clone());
-            }
-            for m in &case.config.callee_sig_modules {
-                if !lake_targets.contains(m) {
-                    lake_targets.push(m.clone());
+        let lake_targets: Vec<String> = if staged_with_trials.len() > 64 {
+            vec!["Anneal".to_string(), "Mir".to_string()]
+        } else {
+            let mut targets = vec!["Anneal".to_string()];
+            for case in &batch_cases {
+                if !targets.contains(&case.config.root_mir_module) {
+                    targets.push(case.config.root_mir_module.clone());
+                }
+                for m in &case.config.callee_sig_modules {
+                    if !targets.contains(m) {
+                        targets.push(m.clone());
+                    }
                 }
             }
-        }
+            targets
+        };
         run_lake_verify_targets(&anneal_dir, &lake_targets)?;
 
         let verify_dir = anneal_dir.join("generated/Verify/ItreeDiffStaged");
@@ -1439,29 +1478,93 @@ pub fn evaluate_itree_batches_with_options(
             .map_err(|e| format!("failed to create {}: {e}", verify_dir.display()))?;
 
         // Stage 1: Probe `diagnoseRawByteTraceFullBounded` across all distinct traces.
+        // For large campaigns, shard into <=192-case probe modules and evaluate in parallel
+        // so individual `lean -M 8192` invocations stay well below memory limits.
         let probe_src =
             render_batch_trace_probe_lean_module("Proof.ItreeDiffBatchProbe", &batch_cases);
         let probe_file = verify_dir.join("ItreeDiffBatchProbe.lean");
         fs::write(&probe_file, &probe_src)
             .map_err(|e| format!("failed to write {}: {e}", probe_file.display()))?;
 
-        let probe_out = Command::new("lake")
-            .args(["env", "lean", "-M", "4096"])
-            .arg(&probe_file)
-            .current_dir(&anneal_dir)
-            .output()
-            .map_err(|e| format!("failed to run `lake env lean` on probe module: {e}"))?;
-        if !probe_out.status.success() {
-            return Err(format!(
-                "`ItreeDiffBatchProbe.lean` failed ({}):\nstdout:\n{}\nstderr:\n{}",
-                probe_out.status,
-                String::from_utf8_lossy(&probe_out.stdout),
-                String::from_utf8_lossy(&probe_out.stderr)
-            ));
+        const PROBE_CHUNK_SIZE: usize = 192;
+        let mut probe_map: BTreeMap<String, (String, String)> = BTreeMap::new();
+        if batch_cases.len() <= PROBE_CHUNK_SIZE {
+            let probe_out = Command::new("lake")
+                .args(["env", "lean", "-M", "8192"])
+                .arg(&probe_file)
+                .current_dir(&anneal_dir)
+                .output()
+                .map_err(|e| format!("failed to run `lake env lean` on probe module: {e}"))?;
+            if !probe_out.status.success() {
+                return Err(format!(
+                    "`ItreeDiffBatchProbe.lean` failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                    probe_out.status,
+                    String::from_utf8_lossy(&probe_out.stdout),
+                    String::from_utf8_lossy(&probe_out.stderr)
+                ));
+            }
+            probe_map =
+                parse_batch_trace_probe_output(&String::from_utf8_lossy(&probe_out.stdout));
+        } else {
+            let chunks: Vec<&[BatchTraceEvalCase]> =
+                batch_cases.chunks(PROBE_CHUNK_SIZE).collect();
+            for wave in chunks.chunks(4) {
+                let wave_res: Vec<Result<BTreeMap<String, (String, String)>, String>> =
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = wave
+                            .iter()
+                            .enumerate()
+                            .map(|(w_idx, chunk)| {
+                                let verify_dir = &verify_dir;
+                                let anneal_dir = &anneal_dir;
+                                s.spawn(move || {
+                                    let ns = format!("Proof.ItreeDiffBatchProbeChunk{w_idx}");
+                                    let src = render_batch_trace_probe_lean_module(&ns, chunk);
+                                    let chunk_file = verify_dir
+                                        .join(format!("ItreeDiffBatchProbeChunk{w_idx}.lean"));
+                                    fs::write(&chunk_file, &src).map_err(|e| {
+                                        format!("failed to write {}: {e}", chunk_file.display())
+                                    })?;
+                                    let out = Command::new("lake")
+                                        .args(["env", "lean", "-M", "8192"])
+                                        .arg(&chunk_file)
+                                        .current_dir(anneal_dir)
+                                        .output()
+                                        .map_err(|e| {
+                                            format!(
+                                                "failed to run `lake env lean` on {}: {e}",
+                                                chunk_file.display()
+                                            )
+                                        })?;
+                                    if !out.status.success() {
+                                        return Err(format!(
+                                            "`{}` failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                                            chunk_file.display(),
+                                            out.status,
+                                            String::from_utf8_lossy(&out.stdout),
+                                            String::from_utf8_lossy(&out.stderr)
+                                        ));
+                                    }
+                                    Ok(parse_batch_trace_probe_output(
+                                        &String::from_utf8_lossy(&out.stdout),
+                                    ))
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| {
+                                h.join().unwrap_or_else(|_| {
+                                    Err("panic in probe chunk worker".to_string())
+                                })
+                            })
+                            .collect()
+                    });
+                for part in wave_res {
+                    probe_map.extend(part?);
+                }
+            }
         }
-
-        let probe_map =
-            parse_batch_trace_probe_output(&String::from_utf8_lossy(&probe_out.stdout));
         for case in &mut batch_cases {
             let (tag, _repr) = probe_map
                 .get(&case.case_ident)
