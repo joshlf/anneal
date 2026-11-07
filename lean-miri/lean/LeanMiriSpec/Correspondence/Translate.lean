@@ -1103,18 +1103,19 @@ def derefPointeeKindHasExactLayout : RigidTy → Bool
   | .bool | .char | .int _ | .uint _ | .float _ | .tuple .nil => true
   | _ => false
 
-/-- Resolve the pointee `LocalLayout` when dereferencing a pointer local
+/-- Resolve the pointee `LocalLayout` when dereferencing a raw-pointer local
 `localId` (`*_p`), consulting `localDecls` when available and falling back to
-`rawPtrPointeeEncodedTyId? ptrLayout.ty`. Pointees without an exact layout
-(`derefPointeeKindHasExactLayout`) resolve to `none`, so the dereference fails
-closed instead of reading with a guessed width. -/
+`rawPtrPointeeEncodedTyId? ptrLayout.ty`. Safe references (`&T` / `&mut T`) and
+pointees without an exact layout (`derefPointeeKindHasExactLayout`) resolve to
+`none`, so the dereference fails closed instead of reading with a guessed width
+or bypassing `PointerPlaceMachine.dereference`'s eager safe-reference checks. -/
 def lookupDerefPointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTable)
     (localId : Miri.MIR.LocalId) (ptrLayout : Miri.Interpreter.LocalLayout) :
     Option Miri.Interpreter.LocalLayout :=
   match get? localDecls localId with
   | some decl =>
       match decl.ty.kind with
-      | .rawPtr _ pointeeKind | .ref _ pointeeKind =>
+      | .rawPtr _ pointeeKind =>
           if derefPointeeKindHasExactLayout pointeeKind then
             some (translateTy { kind := pointeeKind, layoutIdx := 0 } layouts)
           else
@@ -1146,8 +1147,11 @@ def annealScalarReadProvenance (repr : Miri.ABI.BackendRepr) : Option Bool :=
 place (`Validity.lean` / `Place.lean`):
 * `bool` (`tyId = 1`): must be a 1-byte integer scalar equal to `0` or `1`;
 * `char` (`tyId = 2`): must be a 4-byte integer scalar satisfying `isValidCharCode`;
-* every other scalar/pointer `tyId`: every canonical scalar or pointer immediate
-  accepted by `readScalar` / `writeScalar` is valid. -/
+* `&T` / `&mut T` (`tyId = 41`) and `fnPtr` (`tyId = 42`): must be non-null
+  8-byte pointers (`WrappingRange 1..2^64-1` via `pointerLayoutData true`);
+* `!` (`tyId = 50`): uninhabited (`false`);
+* every other scalar/raw-pointer `tyId`: every canonical scalar or pointer
+  immediate accepted by `readScalar` / `writeScalar` is valid. -/
 def annealValidateScalarForTyId (tyId : Miri.MIR.TyId)
     (sc : Miri.Memory.Scalar AnnealProv) : Bool :=
   match tyId with
@@ -1161,6 +1165,11 @@ def annealValidateScalarForTyId (tyId : Miri.MIR.TyId)
     | .ok msc =>
       (msc.size == Miri.ABI.Size.ofBytes 4) && isValidCharCode msc.data.toNat
     | .error _ => false
+  | 41 | 42 =>
+    match sc.toPointer annealTargetDataLayout with
+    | .ok p => p.offset.bytes != 0
+    | .error _ => false
+  | 50 => false
   | _ => true
 
 /-- Read a scalar or zero-sized `Immediate` from a memory-backed `MemPlace`,

@@ -616,7 +616,7 @@ theorem FrameRelLM3_1.lookup_local
     {idx : Nat} {decl : LocalDecl}
     (hdecl : get? body.localDecls idx = some decl) :
     ∃ (slot : LocalSlot) (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout)
-      (_hlt_af : idx < af.locals.length) (hlt_mf : idx < mf.locals.size),
+      (_ : idx < af.locals.length) (hlt_mf : idx < mf.locals.size),
       get? af.locals idx = some slot ∧
       mf.locals[idx]? = some mls ∧
       mf.locals[idx]'hlt_mf = mls ∧
