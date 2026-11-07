@@ -1838,6 +1838,16 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   fieldPtr_minirust_noUB
   fieldPtr_progress
   fieldPtr_minirust_direct
+  nestedFieldPtr_inFragment
+  nestedFieldPtr_translate
+  nestedFieldPtr_anneal_ret
+  nestedFieldPtr_noUB
+  nestedFieldPtr_ctxOk
+  nestedFieldPtr_minirust_ret_from_start
+  nestedFieldPtr_minirust_noUB
+  nestedFieldPtr_progress
+  nestedFieldPtr_minirust_direct
+  nestedFieldPtr_minirust_padding_bytes
   ptrCountdown_inFragment
   ptrCountdown_translate
   ptrCountdown_anneal_ret
@@ -1870,7 +1880,32 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   uninitPtrWriteUb_ctxOk
   uninitPtrWriteUb_minirust_ub_from_start
   uninitPtrWriteUb_converse_error
+  uninitPtrWriteUb_outcome
   uninitPtrWriteUb_minirust_direct
+  deadPtrReadUb_inFragment
+  deadPtrReadUb_translate
+  deadPtrReadUb_anneal_ub
+  deadPtrReadUb_ctxOk
+  deadPtrReadUb_minirust_ub_from_start
+  deadPtrReadUb_converse_error
+  deadPtrReadUb_outcome
+  deadPtrReadUb_minirust_direct
+  uninitPtrOffsetUb_inFragment
+  uninitPtrOffsetUb_translate
+  uninitPtrOffsetUb_anneal_ub
+  uninitPtrOffsetUb_ctxOk
+  uninitPtrOffsetUb_minirust_ub_from_start
+  uninitPtrOffsetUb_converse_error
+  uninitPtrOffsetUb_outcome
+  uninitPtrOffsetUb_minirust_direct
+  derefWriteRhsUb_inFragment
+  derefWriteRhsUb_translate
+  derefWriteRhsUb_anneal_ub
+  derefWriteRhsUb_ctxOk
+  derefWriteRhsUb_minirust_ub_from_start
+  derefWriteRhsUb_converse_error
+  derefWriteRhsUb_outcome
+  derefWriteRhsUb_minirust_direct
   dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct
@@ -1989,6 +2024,16 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   fieldPtr_minirust_noUB
   fieldPtr_progress
   fieldPtr_minirust_direct
+  nestedFieldPtr_inFragment
+  nestedFieldPtr_translate
+  nestedFieldPtr_anneal_ret
+  nestedFieldPtr_noUB
+  nestedFieldPtr_ctxOk
+  nestedFieldPtr_minirust_ret_from_start
+  nestedFieldPtr_minirust_noUB
+  nestedFieldPtr_progress
+  nestedFieldPtr_minirust_direct
+  nestedFieldPtr_minirust_padding_bytes
   ptrCountdown_inFragment
   ptrCountdown_translate
   ptrCountdown_anneal_ret
@@ -2021,7 +2066,32 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   uninitPtrWriteUb_ctxOk
   uninitPtrWriteUb_minirust_ub_from_start
   uninitPtrWriteUb_converse_error
+  uninitPtrWriteUb_outcome
   uninitPtrWriteUb_minirust_direct
+  deadPtrReadUb_inFragment
+  deadPtrReadUb_translate
+  deadPtrReadUb_anneal_ub
+  deadPtrReadUb_ctxOk
+  deadPtrReadUb_minirust_ub_from_start
+  deadPtrReadUb_converse_error
+  deadPtrReadUb_outcome
+  deadPtrReadUb_minirust_direct
+  uninitPtrOffsetUb_inFragment
+  uninitPtrOffsetUb_translate
+  uninitPtrOffsetUb_anneal_ub
+  uninitPtrOffsetUb_ctxOk
+  uninitPtrOffsetUb_minirust_ub_from_start
+  uninitPtrOffsetUb_converse_error
+  uninitPtrOffsetUb_outcome
+  uninitPtrOffsetUb_minirust_direct
+  derefWriteRhsUb_inFragment
+  derefWriteRhsUb_translate
+  derefWriteRhsUb_anneal_ub
+  derefWriteRhsUb_ctxOk
+  derefWriteRhsUb_minirust_ub_from_start
+  derefWriteRhsUb_converse_error
+  derefWriteRhsUb_outcome
+  derefWriteRhsUb_minirust_direct
   dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct

@@ -713,15 +713,24 @@ borrows, that is of `a[0]` and `a[1]`, on an array parameter `a: [u32; 2]`,
 `Offset(p, 0)`, `move` and `StorageDead`/`Deinit` on pointer temporaries, and
 dereference reads and writes through both pointers; `19` for `a = [5, 7]`),
 `arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`), `fieldPtr`
-(`&raw mut s.1` at byte offset `4` of `Padded`; `100`), `ptrCountdown` (a
+(`&raw mut s.1` at byte offset `4` of `Padded`; `100`), `nestedFieldPtr`
+(disjoint `&raw mut t.0.1` at byte offset `4` with pointee `u32` and
+`&raw mut t.1` at byte offset `8` with pointee `u16` on `t: ((u8, u32), u16, ())`,
+reading and writing through both pointers and preserving `.Uninit` padding;
+`59`), `ptrCountdown` (a
 four-block loop that counts `x` down through `&raw mut x`, reading `*p` before
 each `switchInt`, then reads `x` directly; `3` for `x = 3`), and
 `constBorrowLoop` (a fresh `&raw const x` read through and killed by
 `StorageDead` in each iteration of a loop; `15` for `x = 5`), and both raise UB
 on `uninitPtrReadUb` and `uninitPtrWriteUb` (reading or writing through an
-uninitialized raw pointer temporary) and `dangling` (a read after
-`StorageDead`). `ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `ptrCountdown`,
-`constBorrowLoop`, `uninitPtrReadUb`, and `uninitPtrWriteUb` are in the fragment
+uninitialized raw pointer temporary), `deadPtrReadUb` (reading through a pointer
+temporary after its `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on
+an uninitialized pointer temporary), `derefWriteRhsUb` (writing an uninitialized
+rvalue operand through a valid `*mut` pointer), and `dangling` (a read after
+`StorageDead` of the borrowed temporary). `ptrRoundTrip`, `arrayParamPtr`,
+`fieldPtr`, `nestedFieldPtr`, `ptrCountdown`, `constBorrowLoop`,
+`uninitPtrReadUb`, `uninitPtrWriteUb`, `deadPtrReadUb`, `uninitPtrOffsetUb`, and
+`derefWriteRhsUb` are in the fragment
 (`*_inFragment`) and proved end to end through `mirCall_ret`, `mirCall_noUB`, `mirCall_progress_N`, `mirCall_ub`,
 `mirCall_steps_error`, and `mirCall_outcome_N`. The remaining witnesses are the
 divergences listed under the gaps (plus `arrayElemPtr` and `dangling`, which

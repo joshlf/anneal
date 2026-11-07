@@ -74,13 +74,13 @@ unless `MiniRustSpec.Audit` accepts every declaration. Expected audit lines:
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=221 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
 [WITNESS-AUDIT] decls=485 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-[POINTER-AUDIT] decls=148 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 13665 declarations across all MiniRustSpec.* modules
+[POINTER-AUDIT] decls=183 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 13737 declarations across all MiniRustSpec.* modules
 Build completed successfully (70 jobs).
 ```
 
 `[POINTER-AUDIT]` covers 37 theorems of `Correspondence/Pointers.lean`, 19 of
-`Correspondence/PointerStep.lean`, and the 92 theorems of
+`Correspondence/PointerStep.lean`, and the 127 theorems of
 `Correspondence/PointerWitness.lean`. `[SIMULATION-AUDIT]` includes
 `step_correspondence_N`, `step_start_N`, `steps_outcome_N`,
 `mirNoUB_progress_N`, `mirNoUB_diverges_steps_ok_N`, and the `_N` whole-call
@@ -101,10 +101,14 @@ output from its start.
 | `arrayParamPtr` (disjoint `&raw mut a[-2 of 2]` and `&raw mut a[-1 of 2]` on `a: [u32; 2]`, `Offset(p, 0)`, `move`, `StorageDead`/`Deinit`, deref reads/writes; in the fragment) | returns `19` | returns `19`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`) |
 | `arrayElemPtr` (`&raw mut a[1]` on a temporary array; outside the fragment) | returns `12` | returns `12` |
 | `fieldPtr` (`&raw mut s.1` on `Padded(u8, u32, u16)`; in the fragment) | returns `100` | returns `100`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`) |
+| `nestedFieldPtr` (disjoint `&raw mut t.0.1` (`u32`, byte offset `4`) and `&raw mut t.1` (`u16`, byte offset `8`) on `t: ((u8, u32), u16, ())`, preserving `.Uninit` padding; in the fragment) | returns `59` | returns `59`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`, `nestedFieldPtr_minirust_padding_bytes`) |
 | `ptrCountdown` (four-block loop counting `x` down through `&raw mut x`, `*p` read before each `switchInt`, `x` read directly at the end; in the fragment) | returns `3` | returns `3`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`) |
 | `constBorrowLoop` (fresh `&raw const x` in each loop iteration, read through, then `StorageDead`; in the fragment) | returns `15` | returns `15`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`) |
 | `uninitPtrReadUb` (`copy (*_p)` on an uninitialized pointer temporary; in the fragment) | UB | UB: language invariant, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
 | `uninitPtrWriteUb` (`(*_p) = copy _1` on an uninitialized pointer temporary; in the fragment) | UB | UB: language invariant, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
+| `deadPtrReadUb` (`copy (*_p)` after `StorageDead(_p)` on a pointer temporary; in the fragment) | UB | UB: dead local, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
+| `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an uninitialized pointer temporary; in the fragment) | UB | UB: language invariant, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
+| `derefWriteRhsUb` (`(*_p) = copy _uninit` through a valid `*mut` pointer; in the fragment) | UB | UB: language invariant, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
 | `dangling` (read after `StorageDead`) | UB | UB: dead allocation |
 | `offsetDeref 1` (`*a[0..].offset(1)`) | returns `a[0] = 5` | returns `a[1] = 7` |
 | `offsetDeref 2` (read one past the end) | returns `5` | UB: out of bounds |
@@ -126,8 +130,9 @@ terminator followed by a fresh block).
 `minirust/README.md` ("Gaps") describes, and `step_correspondence_N` simulates
 `&raw`, pointer copies, `Offset(p, 0)`, and reads and writes through pointers
 (`Correspondence/PointerStep.lean`); `ptrRoundTrip`, `arrayParamPtr`,
-`fieldPtr`, `ptrCountdown`, `constBorrowLoop`, `uninitPtrReadUb`, and
-`uninitPtrWriteUb` are in the fragment, `ptrCountdown` and `constBorrowLoop`
+`fieldPtr`, `nestedFieldPtr`, `ptrCountdown`, `constBorrowLoop`,
+`uninitPtrReadUb`, `uninitPtrWriteUb`, `deadPtrReadUb`, `uninitPtrOffsetUb`, and
+`derefWriteRhsUb` are in the fragment, `ptrCountdown` and `constBorrowLoop`
 with borrows that outlive the entry block or are taken in a loop. The
 rows where Anneal returns a value and MiniRust a different value or UB, or the
 reverse, are executions on which the models disagree; a correspondence that
