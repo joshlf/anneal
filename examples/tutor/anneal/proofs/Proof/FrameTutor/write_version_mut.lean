@@ -29,9 +29,8 @@ witness for the `.active` mutable borrow tag.
 theorem verified :
     StatefulVerificationResult
       Obligations.FrameTutor.write_version_mut.statefulClaim :=
-  dischargeStatefulEq
+  dischargeStatefulEqFuelFree
     Obligations.FrameTutor.write_version_mut.statefulClaim
-    16
     (List.cons (.ptr { allocId := 1, offsetBytes := 0 } 1)
       (List.cons (.scalar { bits := 2, sizeBytes := 1 }) List.nil))
     writeVersionMem

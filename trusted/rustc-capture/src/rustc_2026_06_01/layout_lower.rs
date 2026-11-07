@@ -189,7 +189,45 @@ impl<'tcx> LayoutTableBuilder<'tcx> {
                                 .map(|fty| self.intern_ty_layout_depth(fty, depth + 1))
                                 .collect();
                         }
+                    }
+                    if lowered.field_layouts.is_empty() {
+                        match *ty_and_layout.ty.kind() {
+                            ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _) => {
+                                if pointee.is_sized(self.tcx, self.typing_env) {
+                                    lowered.field_layouts =
+                                        vec![self.intern_ty_layout_depth(pointee, depth + 1)];
+                                } else if let ty::Slice(elem) = *pointee.kind() {
+                                    lowered.field_layouts =
+                                        vec![self.intern_ty_layout_depth(elem, depth + 1)];
+                                }
+                            }
+                            ty::Array(elem, _) | ty::Slice(elem) => {
+                                lowered.field_layouts =
+                                    vec![self.intern_ty_layout_depth(elem, depth + 1)];
+                            }
+                            ty::Adt(def, args)
+                                if !def.is_union()
+                                    && matches!(
+                                        ty_and_layout.variants,
+                                        Variants::Multiple { .. }
+                                    ) =>
+                            {
+                                let mut variant_field_tys = Vec::new();
+                                for variant in def.variants() {
+                                    for field in &variant.fields {
+                                        variant_field_tys
+                                            .push(field.ty(self.tcx, args).skip_norm_wip());
+                                    }
+                                }
+                                lowered.field_layouts = variant_field_tys
+                                    .into_iter()
+                                    .map(|fty| self.intern_ty_layout_depth(fty, depth + 1))
+                                    .collect();
+                            }
+                            _ => {}
+                        }
                     } else if is_parametric
+
                         && let ty::Array(elem_ty, _) = *ty_and_layout.ty.kind()
                     {
                         lowered.field_layouts =

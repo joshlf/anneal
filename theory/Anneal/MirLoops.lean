@@ -231,6 +231,47 @@ theorem mirWpConverges_forRangeUp {α : Type}
       h_sub
 
 /--
+Call-forbidding (`MirNoCallWpConverges`) variant of `mirWpConverges_forRangeUp`,
+suitable for `verifyStatefulEquivMir_of_wpConverges`.
+-/
+theorem mirNoCallWpConverges_forRangeUp {α : Type}
+    (lo hi : Nat) (init : α) (step : (i : Nat) → lo ≤ i → i < hi → α → α)
+    (body : CapturedMir)
+    (LoopInv : Nat → α → MachineState → Prop)
+    (s₀ : MachineState)
+    (post : MirOutcome → Prop)
+    (h_init : LoopInv lo init s₀)
+    (h_body : ∀ i h_i_le h_i_lt a s, LoopInv i a s →
+      MirStepsConverges body s
+        (fun s' => LoopInv (i + 1) (step i h_i_le h_i_lt a) s')
+        (fun _ => False))
+    (h_exit : ∀ i a s, i ≥ hi → LoopInv i a s →
+      MirNoCallWpConverges body s post) :
+    MirNoCallWpConverges body s₀ post := by
+  generalize h_d : hi - lo = d
+  induction d generalizing lo init step s₀ with
+  | zero =>
+    have h_ge : lo ≥ hi := Nat.le_of_sub_eq_zero h_d
+    exact h_exit lo init s₀ h_ge h_init
+  | succ d ih =>
+    have h_lt : lo < hi := Nat.lt_of_sub_eq_succ h_d
+    have h_step_conv := h_body lo (Nat.le_refl _) h_lt init s₀ h_init
+    have h_step_mono :=
+      MirStepsConverges.mono (post₂ := post) (fun _ h => h)
+        (fun _ h => False.elim h) h_step_conv
+    apply MirNoCallWpConverges.bind h_step_mono
+    intro s' h_mid
+    have h_sub : hi - (lo + 1) = d := by omega
+    exact ih (lo + 1) (step lo (Nat.le_refl _) h_lt init)
+      (fun i h_le' h_lt' a =>
+        step i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a)
+      s'
+      h_mid
+      (fun i h_le' h_lt' a s h_inv =>
+        h_body i (Nat.le_trans (Nat.le_succ _) h_le') h_lt' a s h_inv)
+      h_sub
+
+/--
   Proves convergence of a general `while` loop using a well-founded ranking function.
   The ranking function `rank : α → Nat` must strictly decrease on every iteration.
 -/

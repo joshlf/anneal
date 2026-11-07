@@ -1,3 +1,12 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0>, the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, or the BSD-2-Clause
+// license <LICENSE-BSD or https://opensource.org/license/bsd-2-clause>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+
 //! Miri oracle harness for `miri_diff_corpus`.
 //!
 //! Invoked by `tests/miri-diff/sync_miri_suite.py` (or `cargo +nightly-2026-06-01 miri`)
@@ -149,6 +158,15 @@ fn main() {
         "ub_tb_conflicting_active_mut_borrows" => print_u32(ub_tb_conflicting_active_mut_borrows()),
         "ub_tb_parent_write_disables_shared_ref" => {
             print_u32(ub_tb_parent_write_disables_shared_ref())
+        }
+        "tb_child_write_then_parent_read" => {
+            print_u32(tb_child_write_then_parent_read())
+        }
+        "tb_child_write_then_parent_write" => {
+            print_u32(tb_child_write_then_parent_write())
+        }
+        "safe_reborrow_then_parent_write" => {
+            print_u32(safe_reborrow_then_parent_write())
         }
 
         // Category 7: Control flow, loops & function calls

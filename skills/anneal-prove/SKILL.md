@@ -133,89 +133,207 @@ scales thread count (`LEAN_NUM_THREADS`) by active worktree concurrency
 `MemorySwapMax=0`) and wall-clock timeout so runaway reductions fail fast (`exit
 137` or `124`) with zero swap paging.
 
-### 4. Apply standard Anneal proof patterns
+### 4. Apply standard Anneal proof patterns (lift first, evaluate last)
 
-#### Pattern A: Stateless `verifyByWP` with Rust `#[spec]` / `#[external_spec]` companions
+The primary workflow is to *lift* MIR into fuel-free judgments rather than to
+evaluate a fuel-indexed weakest precondition: `#mir_lift` (Pattern A),
+`#mir_lift_spec` (Pattern B), `forRangeUp` (Pattern C), and
+`Anneal.SepLogicLenses` (Pattern D). Never hand-write `BlockCtx` wrappers or
+pick `fuel` numerals in `Proof/` files.
 
-When `Obligations.<Crate>.<Item>.defaultPre` and `defaultPost` lower Rust
-`requires` and `ensures` clauses via `MirBoolPredicateHolds`, use
-`wpBoolOrExhausted_of_mirBoolPredicateHolds` to extract a bounded step-by-step
-hypothesis from `h_pre` and `mirBoolPredicateHolds_of_wp_bounded` to discharge
-the postcondition:
+`#mir_lift` itself is a command elaborator in the tool module
+`theory/Anneal/MirLift.lean`, which imports `Lean` and sits outside the audited
+`Anneal` umbrella; `TrustedBoundary` parses `Proof/*.lean` with only `Init` and
+`Std` syntax and admits only declaration commands, so `Proof/` files (and
+audited `theory/` modules) apply the lifting *rules* explicitly instead. Never
+widen `trusted/audit/TrustedBoundary.lean` to admit `elab`, `syntax`, `macro`,
+or `macro_rules`.
 
-```lean
-import Trusted
-import Anneal
-import Mir.CanaryPkg.identity_u32
-import Obligations.CanaryPkg.identity_u32
+#### Pattern A: `#mir_lift` rules for call-free, alias-free bodies
 
-namespace Proof.CanaryPkg.identity_u32
-
-open Trusted.MirSemantics
-open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.Lower
-open Anneal.Rustc.V2026_06_01.SymbolicEval
-
-set_option maxHeartbeats 2000000 in
-theorem verified : VerificationResult Obligations.CanaryPkg.identity_u32.claim :=
-  verifyByWP Obligations.CanaryPkg.identity_u32.claim 64 (by
-    intro args h_pre
-    have h_req := wpBoolOrExhausted_of_mirBoolPredicateHolds 64
-      Mir.CanaryPkg.__anodized_fn_requires_identity_u32.body args h_pre.2
-    -- Destructure `args` using `h_pre.1` (`length args = body.argCount`)
-    -- and discharge impossible branches with `nomatch h_req`, then close
-    -- the surviving branch with `mirBoolPredicateHolds_of_wp_bounded`.
-    ...)
-
-end Proof.CanaryPkg.identity_u32
-```
-
-#### Pattern B: Stateless `verifyByWP` with a locked `Specs.<Crate>.<Item>` override
-
-When a locked `Specs.<Crate>.<Item>` module provides a relational `ItemSpec`
-instance (for example, `pre args := args = [.scalar v]` and `post args ret :=
-ret = .scalar ...`), import `Specs.<Crate>.<Item>` so Lean synthesizes that
-normal-priority instance for `Obligations.<Crate>.<Item>.claim`:
+Check `#eval Anneal.PureMirExec.checkPureMir Mir.<Crate>.<Item>.body` in a
+scratch file first. If it is `true`, reduce the obligation to the alias-erased
+executor with
+`verifyMirNoPanic_of_pureExec` (or `verifyMirSafe_of_pureExec`,
+`verifyTotalMir_of_pureExec`, `verifyStatefulMirNoPanic_of_pureExec`), which
+are proved once and for all through `mirWpConverges_of_pureExec`. Then lift the
+body block by block with `lift_PureMirConverges`, `LiftBlock.of_lookup`, and
+`LiftStmtsTerminator.{cons_eval, term_assert, term_switchInt, term_goto,
+term_drop, term_return}`:
 
 ```lean
-import Trusted
-import Anneal
-import Mir.CanaryPkg.const_forty_two
-import Specs.CanaryPkg.const_forty_two
-import Obligations.CanaryPkg.const_forty_two
-
-namespace Proof.CanaryPkg.const_forty_two
-
-open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.Lower
-open Anneal.Rustc.V2026_06_01.SymbolicEval
-
-theorem verified : VerificationResult Obligations.CanaryPkg.const_forty_two.claim :=
-  verifyByWP Obligations.CanaryPkg.const_forty_two.claim 16 (by
-    intro args h_pre
-    subst h_pre
-    exact ⟨rfl, rfl⟩)
-
-end Proof.CanaryPkg.const_forty_two
+theorem verified : VerificationResult Obligations.WireframeDemo.frame_total_len.claim := by
+  refine verifyMirNoPanic_of_pureExec _ rfl fun args h_pre => ?_
+  rcases h_pre with ⟨h_len, h_req⟩
+  obtain ⟨v1, v2, rfl⟩ : ∃ v1 v2, args = [v1, v2] := by
+    rcases args with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
+    all_goals first | exact ⟨_, _, rfl⟩ | nomatch h_len
+  obtain ⟨b1, b2, rfl, rfl, hb1, hb2⟩ := wpReq_inversion v1 v2 h_req
+  -- bb0: `_3 = AddWithOverflow(_1, _2); assert(!_3.1) -> bb1`
+  apply lift_PureMirConverges (by rfl)
+  apply LiftBlock.of_lookup (by rfl)
+  apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.term_assert (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  · change (match Nat.ble 65536 (Nat.add b1 b2) with | true => 1 | false => 0) = 0
+    rw [Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (by change b1 + b2 < 65536; omega)]
+  -- bb1: `_0 = move _3.0; return`
+  apply LiftBlock.of_lookup (by rfl)
+  apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  -- the remaining goal is `claim.post args retVal`
+  ...
 ```
 
-#### Pattern C: Stateful `verifyStatefulByWP` and footprint framing (`wp_frame_disjoint`)
+- Use `apply`, not `refine … (fuel := ?_)`: the step budget is a natural
+  metavariable that each rule instantiates (`term_goto` contributes `fuel + 1`,
+  `term_return` closes it), so no fuel numeral is ever written. A named `?fuel`
+  is synthetic-opaque and blocks this unification.
+- Pass every evaluation premise as a postponed `(by rfl)` block, never as the
+  term `rfl`: the rule must first unify with the goal so that `stmts`,
+  `stmtIdx`, and `env` are known when the premise is checked. The phase
+  premise is `Or.inr rfl` for the `.runtimeOptimized` bodies that
+  `cargo anneal` captures and `Or.inl rfl` for `.runtimePostCleanup` fixtures.
+- `cons_eval`, `term_assert`, and `term_switchInt` evaluate one statement or
+  operand with symbolic values (for example `b1 + b2`). A symbolic `assert`
+  leaves a `match Nat.ble … with` side goal; a symbolic `switchInt` needs a
+  case split before it, passing `(target := …)` and proving the
+  `lookupSwitchTarget` premise with `change` + `rw` (see
+  `Proof/WireframeDemo/clamp_payload_window.lean`).
+- On closed or argument-pinned bodies every premise is concrete, so one loop
+  lifts the whole CFG, including loops it unrolls
+  (`examples/mir/MirVerification.lean`, `countdownTotalClaim_verified`):
 
-For pointer, reference, and mutable-borrow obligations (`StatefulItemSpec` /
-`StatefulVerificationResult`), open `Anneal.SepLogic` and `Anneal.Memory`, and
-apply `verifyStatefulByWP`:
+  ```lean
+  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
+  repeat (first
+    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl))
+  ```
+- Long straight-line blocks: the `rfl` of `cons_eval` assigns the next locals
+  unreduced, and nested `List.set` towers are re-evaluated without sharing, so
+  per-statement cost with repeated `cons_eval` doubles across long basic blocks.
+  Evaluate the rest of a block in one pass with
+  `LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)`, which takes
+  the statement count from the block and flattens the locals with
+  `forcePureEnv?` after each statement, or step one statement with
+  `LiftStmtsTerminator.cons_eval_norm`. For an rvalue that `rfl` cannot
+  evaluate (a transmute of symbolic bytes, say), prove its value in a separate
+  lemma and pass it to `evalPureStmtNorm_assign_local_of_evalRvalue` (see
+  `Proof/WireframeDemo/decode_wire_header.lean`).
+- Split a branching proof into lemmas that each conclude
+  `PureMirConverges body (initPureState body args) post` and begin with
+  `apply lift_PureMirConverges (by rfl)`, so every lemma infers its own step
+  budget. Do not state `LiftBlock … 30`: a fuel numeral in a statement is a
+  manual budget even when every rule below it is fuel-free.
 
-- Use `PtrInvariant`, `UnalignInvariant`, `PointsTo`, `BorrowToken`, and
-  `LifetimeToken` (or their `SepProp` counterparts `PointsToSep`,
-  `BorrowTokenSep`, `LifetimeTokenSep`) to destructure the initial `Memory`
-  hypothesis `h_pre : c.pre args mem`.
-- When proving that a heap or Tree Borrows update preserves disjoint resources
-  `frame : HeapPred` supported by `fp : Footprint` (`SupportedBy frame fp`),
-  apply `wp_frame_disjoint` together with
-  `agreeOnFootprint_of_disjoint_borrow_update`, `supportedBy_pointsTo`,
-  `supportedBy_ptrInvariant`, or `supportedBy_unalignInvariant`.
+#### Pattern B: `#mir_lift_spec` for companion predicates
 
-#### Pattern D: Byte-level validity and `zerocopy` trait obligations (`Anneal.BitValidity`)
+`Anneal.PureMirExec` provides the `#mir_lift_spec` theorems for call-free,
+alias-free companion bodies: `mirBoolPredicateHolds_of_pureExec` and
+`mirBoolPredicateHolds_intro_of_pureExec` (introduction),
+`mirBoolPredicateHolds_elim_of_pureExec` and
+`mirBoolPredicateHolds_elim_of_uniqueTruePath` (elimination of a `requires`
+hypothesis into a Lean proposition `P`), each taking `checkPureMir specBody =
+true` by `rfl` and a `PureMirConverges` proof built with the Pattern A rules
+(`examples/mir/MirVerification.lean`, `example_companion_bool_spec_holds`).
+
+Check purity first: the `__anodized_fn_requires_*` / `__anodized_fn_ensures_*`
+companions that `cargo anneal` generates from `#[anneal_spec::spec]` capture
+their arguments by reference through a closure (`_6 = &_1`, `copy (*_10).0`), so
+they fail `checkPureMir` and the theorems above do not apply. For those, invert
+`requires` with `holdBoolReq_of_mirBool` and prove `ensures` with
+`hold_mirBool_of_blockLinear`; both evaluate the companion with the
+body-derived budget `defaultSpecSteps` (`16 * #blocks + 80`), so they are
+bounded evaluations, not lifts. When a multi-branch companion needs several
+`wpBlockLinear` unfolds across argument or comparison splits, drive one shared
+`dsimp only [...]` list with `repeat (...; first | ...)` instead of repeating
+the unfold list per branch (see `Proof/WireframeDemo/clamp_payload_window.lean`
+and `frame_total_len.lean`). Prefer `repeat` to `iterate k`: it stops when the
+script makes no more progress, so the proof states no round count. For
+concrete arguments,
+`mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl` decides the
+companion by evaluation.
+
+#### Pattern C: bounded loops with `forRangeUp`
+
+Model `for i in lo..hi` / `while i < hi` loops with
+`Anneal.MirLoops.forRangeUp lo hi init step` and reason about the model with
+`forRangeUp_induction`, `forRangeUp_step_of_lt`, and `forRangeUp_eq_init_of_ge`.
+`mirWpConverges_forRangeUp lo hi init step body LoopInv s₀ post h_init h_body
+h_exit` (and its no-call counterpart `mirNoCallWpConverges_forRangeUp`, which
+lifts via `MirWpConverges.of_noCall` and feeds directly into
+`verifyStatefulEquivMir_of_wpConverges`) turns a loop invariant `LoopInv i acc
+s` into a fuel-free convergence proof (combined with `MirWpConverges.bind` /
+`MirNoCallWpConverges.bind` for loop-entry setup and
+`verifyStatefulMirNoPanic_of_wpConverges` or
+`verifyStatefulEquivMir_of_wpConverges` at the top level).
+Discharge every CFG segment with `runCfgToBlock body header cfg`, which steps
+until the evaluator next enters the loop-header block `header`, halts, or
+faults, so the proof never states a step count:
+
+- loop entry and each iteration (`h_body`):
+  `mirStepsConverges_of_runCfgToBlock body mid post rfl header s ?_`;
+- the exit path once `i ≥ hi` (`h_exit`), or a straight-line / unrolled body
+  that halts before re-entering `header`:
+  `mirWpConverges_of_runCfgToBlock body post rfl header s ?_` (or
+  `mirNoCallWpConverges_of_runCfgToBlock`).
+
+Each leaves a `cfgStepsWP mid post (runCfgToBlock …)` (or `cfgStateWP`) goal
+that one `dsimp only [runCfgToBlock, runCfgUntilAux, cfgAtBlock,
+stepCfgState, …]` evaluates without `defaultCfgSteps`. List the claim
+(`Obligations.<Crate>.<item>.statefulClaim` or `equivClaim`) there too, so that
+the body and initial state taken from the goal unfold: a folded
+`statefulClaim.body` leaves the evaluator stuck, and `dsimp` then times out.
+When the body indexes memory by the counter (`frame[2 * i]`), keep the
+accumulator symbolic, split the counter into its concrete values, and run one
+script on every case with `all_goals` (see
+`Proof/WireframeDemo/checksum_frame_safe.lean`; `checksum_frame_fast.lean`
+reuses that loop proof for its equivalence claim). Use
+`mirWpConverges_whileRank` for loops with a decreasing rank instead of a
+counter.
+
+#### Pattern D: `&mut` / `&` arguments with `Anneal.SepLogicLenses`
+
+For a body that reads and writes through reference arguments, describe each
+pointee as a lens binding `(rp, v) : RawPtrVal × Value` backed by
+`SepLensStateInv`, derive `LiftLensBlock body 0 env entries retVal entries'`
+from the `LiftLensStmt` / `LiftDerefRead` / `LiftDerefFieldRead` /
+`LiftDerefWrite` rules, and conclude with `verifyStatefulMir_of_sepLenses` (or
+`mirWpConverges_of_sepLenses`, `verifyTotalMir_of_sepLenses`); the frame
+outside the lenses is preserved by `LensFramePreserved` without destructuring
+`Memory`. `LiftLensBlock` accepts `isRuntimeMirPhase body.phase = true` (`rfl`
+for both `.runtimePostCleanup` fixtures and `.runtimeOptimized` bodies captured
+by `cargo anneal`; see `Proof/WireframeDemo/advance_cursor.lean`). Discharge
+each `set? env loc slot = some env'` premise of a lens rule with
+`set?_of_forcePureEnv? rfl`, which instantiates `env'` with the flat slot list
+rather than an unreduced `List.set` application. Concrete
+pinned-memory contracts can also use `dischargeStatefulEqFuelFree` (a
+fixed-budget wrapper; see Pattern E).
+
+#### Pattern E: bounded fallbacks (`*FuelFree`, `wpBlockLinear`, `runCfgSteps`)
+
+When no lift applies, `Anneal.Rustc.V2026_06_01.SymbolicEval` provides
+wrappers that fix the budget of an existing bounded combinator inside
+`Anneal`: despite their suffix, `dischargeRustEqU32FuelFree`,
+`dischargeRustEq2U8FuelFree`, `verifyByWPFuelFree`, `verifyByWPSafeFuelFree`,
+`dischargeStatefulEqFuelFree`, `mirBoolPredicateHolds_of_wp_fuelFree`, and the
+`verify*MirFuelFree` family evaluate with a fixed `16`/`64`/`128`-step budget
+(`verifyByWPFuelFree c h` is `verifyByWP c 16 h`), and their hypotheses still
+mention `wpMirSym 16`. `Anneal.PureMirExec` provides whole-CFG evaluators
+(`verifyMirNoPanic_of_blockLinear`, `verifyStatefulMirNoPanic_of_cfg`,
+`verifyStatefulMirNoPanic_of_runCfgSteps`) whose budgets `defaultSpecSteps` /
+`defaultCfgSteps` derive from `body.basicBlocks.length`. These are bounded
+evaluators: no fuel numeral appears in the proof, but a body that needs more
+steps than the budget cannot be discharged, and the proofs unfold the
+evaluator with long `dsimp only` lists.
+
+#### Pattern F: Byte-level validity and `zerocopy` traits (`Anneal.BitValidity`)
 
 When discharging `#[anneal_spec::invariant]` or `#[anneal_spec::unsafe_impl]`
 obligations for `TryFromBytes`, `FromZeros`, `FromBytes`, `IntoBytes`, or
@@ -236,53 +354,55 @@ hits `maxHeartbeats`, `maxRecDepth`, or multi-second `rw`/`dsimp` stalls, read
 [`references/proof-scaling-and-bottlenecks.md`](references/proof-scaling-and-bottlenecks.md)
 and apply these nine rules:
 
-1. **Pre-project basic blocks (`BlockCtx` + `itemBB0..itemBBn`):** Never include
-   `Mir.<Crate>.<Item>.body` in a `dsimp` set across a multi-block CFG; unfolding
-   `body` duplicates the entire basic-block list into every step state. Define
-   top-level `itemBBk` constants and `O(1)` `rfl` lookup lemmas
-   (`lookupBlock itemCtx k = some itemBBk`).
-2. **Short-circuit symbolic bit-loops (`bitwiseAndBitsFast`):** Never unfold
-   recursive `bitwiseAndBits` / `bitwiseOrBits` over a symbolic `b : Nat` (which
-   unrolls 8–64 nested `Nat.div · 2` trees and stalls kernel unification for
-   `100s+`). Rewrite masks using closed-form arithmetic (`b % 2`, `b % 256`,
-   `lo * 256 + hi`) or a fast-path wrapper proved equal to `bitwiseAndBits`.
-3. **Shield large symbolic states from `rw` (`Hold` barrier):** Wrap large
+1. **Lift instead of evaluating (Patterns A–D):** Never hand-write
+   `BlockCtx` structures, per-block `itemBB0..itemBBn` boilerplate, or `fuel`
+   numerals. Apply the `#mir_lift` rules (`lift_PureMirConverges`,
+   `LiftBlock.of_lookup`, `LiftStmtsTerminator.*`) under
+   `verifyMirNoPanic_of_pureExec`, which synthesize the step count by
+   unification and never unfold `Mir.<Crate>.<Item>.body` into the goal.
+2. **Use `forRangeUp` and `Anneal.SepLogicLenses` for loops and references:**
+   Model bounded loops with `forRangeUp` and prove them with
+   `mirWpConverges_forRangeUp` (or `mirNoCallWpConverges_forRangeUp`,
+   `mirWpConverges_whileRank`) and a loop
+   invariant (`Proof/WireframeDemo/checksum_frame_safe.lean`); lift
+   reference arguments with `LiftLensBlock` and `verifyStatefulMir_of_sepLenses`
+   / `mirWpConverges_of_sepLenses` (`Proof/WireframeDemo/advance_cursor.lean`).
+3. **Short-circuit symbolic bit-loops (`bitwiseAndBitsFast` & `swap_le_u16_lane`):**
+   Never unfold recursive `bitwiseAndBits` / `bitwiseOrBits` over a symbolic
+   `b : Nat` (which unrolls 8–64 nested `Nat.div · 2` trees and stalls kernel
+   unification for `100s+`). Rewrite masks using closed-form arithmetic (`b % 2`,
+   `b % 256`, `lo * 256 + hi`), `swap_le_u16_lane`, or a fast-path wrapper
+   proved equal to `bitwiseAndBits`.
+4. **Shield large symbolic states from `rw` (`Hold` barrier):** Wrap large
    weakest-precondition terms in `private structure Hold (P : Prop) : Prop where val : P`
    so `rw` does not traverse the full symbolic execution AST before `dsimp only`
    collapses it.
-4. **Factor `#[anneal_spec::spec]` companions into boundary lemmas:** Prove
-   standalone `wpReq_inversion` (extracting pure arithmetic bounds from
-   `MirBoolPredicateHolds __anodized_fn_requires_*`) and `ensures_holds`
-   (discharging `MirBoolPredicateHolds __anodized_fn_ensures_*` from arithmetic
-   bounds) instead of stepping all three MIR bodies inside one proof block.
-5. **Substitute concrete `fuel` only after destructuring `Memory` (`verified_at_fuel`):**
-   In loop proofs (`runCfgSteps ctx state fuel`), parameterize by
-   `(fuel : Nat) (h_fuel : fuel = N)`, `rcases` and `subst` all `Memory` fields
-   first (`activeCallee = none`, `callerLocals`, `borrows`), and `subst h_fuel`
-   last so kernel `whnf` never unfolds `N` steps over an abstract `mem : Memory`.
-6. **Never run `trace.profiler.threshold 1` on symbolic MIR proofs:** Low
+5. **Factor `#[anneal_spec::spec]` companions into boundary lemmas:**
+   Prove a standalone `wpReq_inversion` (from `MirBoolPredicateHolds` of the
+   `requires` companion to arithmetic bounds) and `ensures_holds` (from bounds
+   to `MirBoolPredicateHolds` of the `ensures` companion) instead of stepping
+   all three MIR bodies inside one proof block; use the `#mir_lift_spec`
+   theorems when the companion passes `checkPureMir` (Pattern B).
+6. **Parameterize `evalByteCastAfterOperand` lemmas over `{body : CapturedMir}` with `autoParam`s:**
+   When `dsimp only` unfolds `Mir.<Crate>.<Item>.body` to look up basic blocks,
+   any `evalByteCastAfterOperand` argument containing `body` also unfolds. State
+   byte-cast rewrite lemmas over `{body : CapturedMir}` with
+   `(h_decls : body.localDecls = ... := by rfl)` and
+   `(h_layouts : body.layouts = ... := by rfl)` so `rw` matches any unfolded
+   `CapturedMir` record in `O(1)`.
+7. **Never run `trace.profiler.threshold 1` on symbolic MIR proofs:** Low
    profiler thresholds format huge nested MIR ASTs at thousands of elaborator
    nodes, producing hundreds of megabytes of output and multi-hour stalls. Use
    in-memory `lean_multi_attempt` / `lean_goal` (when `anneal-lean_lsp` is
    available), or keep `trace.profiler.threshold >= 100` with
    `set_option pp.deepTerms false` and `timeout 30s`.
-7. **Step `wpMirSym` with top-down `change` and tight `fuel` bounds—never
-   bottom-up `dsimp`:** Passing `wpMirExecSym` and `stepMirExecSymTree` to
-   `dsimp` unfolds continuation lambdas (`fun st' => wpMirExecSym fuel' ...`)
-   bottom-up over an abstract state `st'`, and including
-   `Trusted.Sequence.length` in `dsimp` corrupts implicit `Decidable` instances
-   inside `@ite`. Use top-down `change` (which evaluates `wpMirSym` lazily in
-   weak-head normal form) and pass tight `fuel` bounds (`#statements + 2`,
-   typically `4`–`6`) on straight-line blocks.
 8. **Escape `whnf` timeouts on `bitwiseOrBits` and stateful `Memory` via
    wildcard `change ... _` + projection `dsimp`:** Spelling out `bitwiseOrBits 32`
    or an explicit post-state `Memory` record inside `change` forces `isDefEq` to
    unify `32` against `{ ... }.sizeBytes.mul 8` and unfolds 32 recursive levels
-   of `bitwiseOrBits`. Instead, write `change match (4294967296 : Nat).ble _ with
-   | true => False | false => claim.post _ _ _ _`, run `dsimp only [advanceStmt,
-   <claim>]` to collapse record projections to `32` and the concrete `Memory`
-   literal without unfolding `bitwiseOrBits`, and then `rw` the shift and
-   bitwise lemmas.
+   of `bitwiseOrBits`. Instead, use wildcard `change ... _`, collapse record
+   projections with a targeted `dsimp only` excluding `bitwiseOrBits`, and then
+   `rw` the shift and bitwise lemmas.
 9. **Follow the interactive LSP threshold heuristic:** Write routine arithmetic
    and known combinator proofs directly via `edit_file` (relying on the
    automatic `PostToolUse` hook), cap `lean_multi_attempt` at 1–2 probes per

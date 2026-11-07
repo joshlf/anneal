@@ -355,9 +355,8 @@ open Specs.FrameTutor.read_version_ref
 theorem verified :
     StatefulVerificationResult
       Obligations.FrameTutor.read_version_ref.statefulClaim :=
-  dischargeStatefulEq
+  dischargeStatefulEqFuelFree
     Obligations.FrameTutor.read_version_ref.statefulClaim
-    16
     (List.cons (.ptr { allocId := 1, offsetBytes := 0 } 1) List.nil)
     versionMem
     (fun _ _ h_pre => h_pre)
@@ -419,6 +418,14 @@ theorem verified : StatefulVerificationResult Obligations.FrameTutor.read_versio
 
 /-- Proposition verified by `Verify.FrameTutor.read_version_ref.verified` for whole-crate rollup. -/
 abbrev Certificate : Prop := StatefulVerificationResult Obligations.FrameTutor.read_version_ref.statefulClaim
+
+/-- Kernel-checked guard: the monomorphic signature-typed claims instantiate
+    `Mir.FrameTutor.read_version_ref.body` at `List.nil`, so they are only meaningful when its
+    signature mentions no uninstantiated generic parameter. Generic items must
+    be verified through `Obligations.FrameTutor.read_version_ref.poly*Claim`. -/
+theorem signatureMonomorphic :
+    Trusted.VerificationResult.signatureIsMonomorphic Mir.FrameTutor.read_version_ref.body = true := by
+  decide
 
 end Verify.FrameTutor.read_version_ref
 ```
@@ -542,9 +549,8 @@ open Specs.FrameTutor.write_version_mut
 theorem verified :
     StatefulVerificationResult
       Obligations.FrameTutor.write_version_mut.statefulClaim :=
-  dischargeStatefulEq
+  dischargeStatefulEqFuelFree
     Obligations.FrameTutor.write_version_mut.statefulClaim
-    16
     (List.cons (.ptr { allocId := 1, offsetBytes := 0 } 1)
       (List.cons (.scalar { bits := 2, sizeBytes := 1 }) List.nil))
     writeVersionMem
@@ -620,9 +626,8 @@ open Anneal.Rustc.V2026_06_01.SymbolicEval
 theorem verified :
     VerificationResult
       Obligations.FrameTutor.__anneal_unsafe_impl_WireHeader_for_FrameLen.claim :=
-  verifyByWP
+  verifyByWPFuelFree
     Obligations.FrameTutor.__anneal_unsafe_impl_WireHeader_for_FrameLen.claim
-    8
     (fun _ _ => True.intro)
 
 @[reducible]

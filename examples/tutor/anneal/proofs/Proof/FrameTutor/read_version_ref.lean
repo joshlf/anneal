@@ -23,9 +23,8 @@ Discharges `StatefulVerificationResult` against
 theorem verified :
     StatefulVerificationResult
       Obligations.FrameTutor.read_version_ref.statefulClaim :=
-  dischargeStatefulEq
+  dischargeStatefulEqFuelFree
     Obligations.FrameTutor.read_version_ref.statefulClaim
-    16
     (List.cons (.ptr { allocId := 1, offsetBytes := 0 } 1) List.nil)
     versionMem
     (fun _ _ h_pre => h_pre)

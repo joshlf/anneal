@@ -194,29 +194,6 @@ private theorem runMirTauToBlock_succ
         | .tau (.running s') => runMirTauToBlock fuel body targetBlock s'
         | _ => none := rfl
 
-private theorem evalRvalue_len_eq
-    (locals : List LocalSlot) (place : Place) (mem : Memory)
-    (localDecls : List LocalDecl) (layouts : LayoutTable) :
-    evalRvalue locals (.len place) mem localDecls layouts =
-      match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
-      | .ok (.aggregate tag elems) locals' =>
-        if Nat.beq tag 0 then
-          .ok (.scalar ⟨length elems, 8⟩) locals' mem
-        else
-          .unsupported
-      | .ok _ _ => .unsupported
-      | .ub => .ub
-      | .unsupported => .unsupported := by
-  unfold evalRvalue
-  dsimp only
-  cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals with
-  | ok v locals' =>
-    cases v with
-    | aggregate tag elems =>
-      cases tag <;> rfl
-    | _ => rfl
-  | _ => rfl
-
 private theorem evalScalarBinOp_add_u32
     {a b : Nat} {locals : List LocalSlot} {mem : Memory}
     (h_lt : a + b < 4294967296) :
@@ -479,30 +456,44 @@ private theorem twoDiamond_bb0_switch (c1 c2 : Bool) (x : Nat) :
       some (c1, c1.toNat,
             twoDiamondPreSwitchState c1 c2 x 1,
             twoDiamondPreSwitchState c1 c2 x 2) := by
-  dsimp only [twoDiamondTupleBody, twoDiamondPreSwitchState, runMirToBinarySwitch, inspectBinarySwitch, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalOperand, readProjectedValue, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
-  rw [not_beq_toNat_zero c1]
+  suffices
+      runMirToBinarySwitch 4 twoDiamondTupleBody
+        (initMachineStateWithMemory twoDiamondTupleBody
+          [.scalar ⟨c1.toNat, 1⟩, .scalar ⟨c2.toNat, 1⟩, .scalar ⟨x, 4⟩]
+          emptyMemory) =
+        some (!c1.toNat.beq 0, c1.toNat,
+              twoDiamondPreSwitchState c1 c2 x 1,
+              twoDiamondPreSwitchState c1 c2 x 2) by
+    rwa [not_beq_toNat_zero c1] at this
+  rfl
 
 private theorem twoDiamond_bb1_join (c1 c2 : Bool) {x : Nat}
     (hx10 : x + 10 < 4294967296) (hx20 : x + 20 < 4294967296) :
     evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
       (twoDiamondPreSwitchState c1 c2 x 1) =
       some (twoDiamondBb3BranchState c1 c2 x (x + 10) (x + 20)) := by
-  dsimp only [twoDiamondTupleBody, twoDiamondPreSwitchState, twoDiamondBb3BranchState, evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-  rw [evalScalarBinOp_add_u32 hx10]
-  dsimp only [twoDiamondTupleBody, evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-  rw [evalScalarBinOp_add_u32 hx20]
-  rfl
+  have h_raw :
+      evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
+        (twoDiamondPreSwitchState c1 c2 x 1) =
+        some (twoDiamondBb3BranchState c1 c2 x
+          (wrapScalarBits (x.add 10) (scalarModulus 4))
+          (wrapScalarBits (x.add 20) (scalarModulus 4))) := rfl
+  rw [h_raw, nat_add_eq, nat_add_eq, scalarModulus_four,
+      wrapScalarBits_of_lt hx10, wrapScalarBits_of_lt hx20]
 
 private theorem twoDiamond_bb2_join (c1 c2 : Bool) {x : Nat}
     (hx1 : x + 1 < 4294967296) (hx2 : x + 2 < 4294967296) :
     evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
       (twoDiamondPreSwitchState c1 c2 x 2) =
       some (twoDiamondBb3BranchState c1 c2 x (x + 1) (x + 2)) := by
-  dsimp only [twoDiamondTupleBody, twoDiamondPreSwitchState, twoDiamondBb3BranchState, evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-  rw [evalScalarBinOp_add_u32 hx1]
-  dsimp only [twoDiamondTupleBody, evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-  rw [evalScalarBinOp_add_u32 hx2]
-  rfl
+  have h_raw :
+      evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
+        (twoDiamondPreSwitchState c1 c2 x 2) =
+        some (twoDiamondBb3BranchState c1 c2 x
+          (wrapScalarBits (x.add 1) (scalarModulus 4))
+          (wrapScalarBits (x.add 2) (scalarModulus 4))) := rfl
+  rw [h_raw, nat_add_eq, nat_add_eq, scalarModulus_four,
+      wrapScalarBits_of_lt hx1, wrapScalarBits_of_lt hx2]
 
 /--
 Core `wpTransPlan` proof for `twoDiamondTupleBody` over symbolic `(c1, c2, x)`.
@@ -527,13 +518,20 @@ theorem wpTransPlan_twoDiamondTuple
   dsimp only []
   rw [twoDiamond_bb1_join c1 c2 hx10 hx20,
       twoDiamond_bb2_join c1 c2 hx1 hx2]
-  dsimp only [twoDiamondBb3BranchState, joinPlanMemConsistent, List.map, ite, dite, decide, Nat.decEq, instDecidableEqNat, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, BEq.beq, instBEqOfDecidableEq, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  dsimp only [twoDiamondBb3BranchState, joinPlanMemConsistent]
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
-  rw [wpTransPlan]; dsimp only [twoDiamondTupleBody, evalPlanToJoin, joinPlanMemConsistent, runMirToBinarySwitch, inspectBinarySwitch, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, placeIsSigned, resolveProjectedTy, tyIsSigned, pointeeTyOf, elemTyOf, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  rw [wpTransPlan]
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
-  rw [wpTransPlan]; dsimp only [twoDiamondTupleBody, runMirTauToRet, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalOperand, readProjectedValue, evalTerminator, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
-  rw [dec_rec_const c2.toNat, not_beq_toNat_zero c2]
-  dsimp only [twoDiamondPure, ite, instDecidableEqBool, Bool.decEq]
+  rw [wpTransPlan]
+  change
+    Outcome.normal
+      (Value.scalar ⟨if (!(if c1 = true then c2.toNat else c2.toNat).beq 0) = true
+                     then (if c1 = true then x + 10 else x + 1)
+                     else (if c1 = true then x + 20 else x + 2), 4⟩,
+       emptyMemory) =
+      Outcome.normal (Value.scalar ⟨twoDiamondPure c1 c2 x, 4⟩, emptyMemory)
+  rw [ite_self, not_beq_toNat_zero c2]
+  rfl
 
 theorem twoDiamondClaim_verified : VerificationResult twoDiamondClaim := by
   refine verifyByTransPlan (ewp := mirNoCallWP)
@@ -672,25 +670,56 @@ private def sumToNBranchState (bb n i cmpBits : Nat) : MachineState :=
     }
     memory := emptyMemory }
 
+private def sumToNBranchRawState
+    (bb n i : Nat) (sc : ScalarInt) : MachineState :=
+  { frame := {
+      blockIdx := bb
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (.scalar ⟨n, 4⟩),
+         .init (.scalar ⟨i, 4⟩),
+         .init (.scalar ⟨arithSum i, 4⟩),
+         .init (.scalar sc)]
+    }
+    memory := emptyMemory }
+
+private theorem sumToN_header_switch_raw
+    (n i : Nat) (cmpOpt : Option Value) :
+    runMirToBinarySwitch 2 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
+      let sc := boolToScalar (!Nat.ble n i)
+      some (!sc.bits.beq 0, sc.bits,
+            sumToNBranchRawState 2 n i sc,
+            sumToNBranchRawState 3 n i sc) := by
+  cases cmpOpt <;> rfl
+
 private theorem sumToN_header_switch_ge
     (i : Nat) (cmpOpt : Option Value) :
     runMirToBinarySwitch 2 sumToNLoopBody (sumToNHeaderState i i cmpOpt) =
       some (false, 0, sumToNBranchState 2 i i 0, sumToNBranchState 3 i i 0) := by
-  cases cmpOpt <;>
-    (dsimp only [sumToNHeaderState, sumToNLoopBody, sumToNBranchState, runMirToBinarySwitch, inspectBinarySwitch, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-     rw [evalScalarBinOp_lt_u32_of_ge (Nat.le_refl i)]
-     dsimp only [runMirToBinarySwitch, inspectBinarySwitch, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalOperand, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-     rfl)
+  rw [sumToN_header_switch_raw, nat_ble_eq_true_of_le (Nat.le_refl i)]
+  rfl
 
 private theorem sumToN_header_switch_lt
     {n i : Nat} (cmpOpt : Option Value) (h_lt : i < n) :
     runMirToBinarySwitch 2 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
       some (true, 1, sumToNBranchState 2 n i 1, sumToNBranchState 3 n i 1) := by
-  cases cmpOpt <;>
-    (dsimp only [sumToNHeaderState, sumToNLoopBody, sumToNBranchState, runMirToBinarySwitch, inspectBinarySwitch, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-     rw [evalScalarBinOp_lt_u32_of_lt h_lt]
-     dsimp only [runMirToBinarySwitch, inspectBinarySwitch, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalOperand, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-     rfl)
+  rw [sumToN_header_switch_raw, nat_ble_eq_false_of_lt h_lt]
+  rfl
+
+private def sumToNHeaderRawState
+    (n iVal accVal : Nat) (cmpOpt : Option Value) : MachineState :=
+  { frame := {
+      blockIdx := 1
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (.scalar ⟨n, 4⟩),
+         .init (.scalar ⟨iVal, 4⟩),
+         .init (.scalar ⟨accVal, 4⟩),
+         optSlot cmpOpt]
+    }
+    memory := emptyMemory }
 
 private theorem sumToN_body_step
     {n i : Nat}
@@ -698,11 +727,14 @@ private theorem sumToN_body_step
     (h_inc_lt : i + 1 < 4294967296) :
     evalPlanToJoin sumToNLoopBody (.jump 1 4) (sumToNBranchState 2 n i 1) =
       some (sumToNHeaderState n (i + 1) (some (.scalar ⟨1, 1⟩))) := by
-  dsimp only [sumToNBranchState, sumToNLoopBody, sumToNHeaderState, evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned, evalTerminator, lookupSwitchTarget, optSlot, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-  rw [evalScalarBinOp_add_u32 h_acc_lt]
-  dsimp only [evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
-  rw [evalScalarBinOp_add_u32 h_inc_lt]
-  dsimp only [evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, evalConstValue, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, evalTerminator, lookupSwitchTarget, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, invalidateConflictingBorrows, emptyMemory]
+  have h_raw :
+      evalPlanToJoin sumToNLoopBody (.jump 1 4) (sumToNBranchState 2 n i 1) =
+        some (sumToNHeaderRawState n
+          (wrapScalarBits (i.add 1) (scalarModulus 4))
+          (wrapScalarBits ((arithSum i).add i) (scalarModulus 4))
+          (some (.scalar ⟨1, 1⟩))) := rfl
+  rw [h_raw, nat_add_eq, nat_add_eq, scalarModulus_four,
+      wrapScalarBits_of_lt h_inc_lt, wrapScalarBits_of_lt h_acc_lt]
   rfl
 
 /--
@@ -1001,52 +1033,103 @@ def advanceCursorMutSpec : MutRefLocalSpec FrameCursor Bool where
     lookupBorrow mem'.borrows 1 =
       some { tag := 1, targetLocal := 1, targetProjection := [], perm := .active }
 
-private def advanceCursorActiveMem : Memory :=
-  { emptyMemory with
-    borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
-    nextTag := 2 }
-
-private def advanceCursorBranchState
-    (c : FrameCursor) (delta : Nat) (bb : BasicBlockIdx) (posVal : Nat) : MachineState :=
+private def advanceCursorMutPreSwitchState
+    (c : FrameCursor) (delta targetBb : Nat) : MachineState :=
   { frame := {
-      blockIdx := bb
+      blockIdx := targetBb
       stmtIdx := 0
       locals :=
         [.uninit,
-         .init (.aggregate 0 [.scalar ⟨posVal, 4⟩, .scalar ⟨c.len, 4⟩]),
+         .init (frameCursorCodec.encode c),
          .init (.scalar ⟨delta, 4⟩),
          .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
          .init (.scalar ⟨c.pos + delta, 4⟩),
          .init (.scalar ⟨(Nat.ble (c.pos + delta) c.len).toNat, 1⟩),
          .uninit]
     }
-    memory := advanceCursorActiveMem }
+    memory :=
+      { emptyMemory with
+        borrows :=
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+        nextTag := 2 } }
+
+private def advanceCursorMutBb3BranchState
+    (c : FrameCursor) (delta newPos : Nat) : MachineState :=
+  { frame := {
+      blockIdx := 3
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (.aggregate 0 [.scalar ⟨newPos, 4⟩, .scalar ⟨c.len, 4⟩]),
+         .init (.scalar ⟨delta, 4⟩),
+         .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+         .init (.scalar ⟨c.pos + delta, 4⟩),
+         .init (.scalar ⟨(Nat.ble (c.pos + delta) c.len).toNat, 1⟩),
+         .uninit]
+    }
+    memory :=
+      { emptyMemory with
+        borrows :=
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+        nextTag := 2 } }
+
+private def advanceCursorMutPreSwitchRawState
+    (c : FrameCursor) (delta sumVal : Nat) (cmpSc : ScalarInt) (targetBb : Nat) :
+    MachineState :=
+  { frame := {
+      blockIdx := targetBb
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (frameCursorCodec.encode c),
+         .init (.scalar ⟨delta, 4⟩),
+         .init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+         .init (.scalar ⟨sumVal, 4⟩),
+         .init (.scalar cmpSc),
+         .uninit]
+    }
+    memory :=
+      { emptyMemory with
+        borrows :=
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+        nextTag := 2 } }
 
 private theorem advanceCursorMut_bb0_switch
     (c : FrameCursor) {delta : Nat} (h_add_lt : c.pos + delta < 4294967296) :
     runMirToBinarySwitch 8 advanceCursorMutMirBody
       (initMachineStateWithMemory advanceCursorMutMirBody
         [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) =
-      some (!((Nat.ble (c.pos + delta) c.len).toNat.beq 0),
+      some (!(Nat.beq (Nat.ble (c.pos + delta) c.len).toNat 0),
             (Nat.ble (c.pos + delta) c.len).toNat,
-            advanceCursorBranchState c delta 1 c.pos,
-            advanceCursorBranchState c delta 2 c.pos) := by
-  dsimp only [frameCursorCodec, advanceCursorMutMirBody, advanceCursorBranchState, advanceCursorActiveMem, runMirToBinarySwitch, inspectBinarySwitch, initMachineStateWithMemory, initMachineState, initLocals, initLocalsAux, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned, pointeeTyOf, evalTerminator, lookupSwitchTarget, ProvenancePtr.tag, lookupBorrow, appendProjections, invalidateConflictingBorrows, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
-  rw [evalScalarBinOp_add_u32 h_add_lt]
-  dsimp only [advanceCursorMutMirBody, runMirToBinarySwitch, inspectBinarySwitch, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned, pointeeTyOf, evalTerminator, lookupSwitchTarget, ProvenancePtr.tag, lookupBorrow, appendProjections, invalidateConflictingBorrows, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
-  rw [evalScalarBinOp_le_u32]
+            advanceCursorMutPreSwitchState c delta 1,
+            advanceCursorMutPreSwitchState c delta 2) := by
+  have h_raw :
+      runMirToBinarySwitch 8 advanceCursorMutMirBody
+        (initMachineStateWithMemory advanceCursorMutMirBody
+          [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) =
+        let sumVal := wrapScalarBits (c.pos.add delta) (scalarModulus 4)
+        let cmpSc := boolToScalar (Nat.ble sumVal c.len)
+        some (!cmpSc.bits.beq 0, cmpSc.bits,
+              advanceCursorMutPreSwitchRawState c delta sumVal cmpSc 1,
+              advanceCursorMutPreSwitchRawState c delta sumVal cmpSc 2) := rfl
+  rw [h_raw]
+  dsimp only []
+  rw [nat_add_eq, scalarModulus_four, wrapScalarBits_of_lt h_add_lt, boolToScalar_eq]
   rfl
 
-private theorem advanceCursorMut_bb1_join (c : FrameCursor) (delta : Nat) :
+private theorem advanceCursorMut_bb1_join
+    (c : FrameCursor) (delta : Nat) :
     evalPlanToJoin advanceCursorMutMirBody (.jump 3 3)
-      (advanceCursorBranchState c delta 1 c.pos) =
-      some (advanceCursorBranchState c delta 3 (c.pos + delta)) := by
-  dsimp only [advanceCursorMutMirBody, advanceCursorBranchState, advanceCursorActiveMem, evalPlanToJoin, runMirToBlock, stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, evalTerminator, ProvenancePtr.tag, lookupBorrow, appendProjections, stripTransparentProjections, projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite, invalidateDerefWriteBorrows, invalidateConflictingBorrowsAtProj, updateBorrowPermAtProj, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
+      (advanceCursorMutPreSwitchState c delta 1) =
+      some (advanceCursorMutBb3BranchState c delta (c.pos + delta)) :=
+  rfl
 
-private theorem advanceCursorMut_bb2_join (c : FrameCursor) (delta : Nat) :
+private theorem advanceCursorMut_bb2_join
+    (c : FrameCursor) (delta : Nat) :
     evalPlanToJoin advanceCursorMutMirBody (.jump 3 2)
-      (advanceCursorBranchState c delta 2 c.pos) =
-      some (advanceCursorBranchState c delta 3 c.pos) := rfl
+      (advanceCursorMutPreSwitchState c delta 2) =
+      some (advanceCursorMutBb3BranchState c delta c.pos) :=
+  rfl
 
 private theorem advanceCursorMut_wpTransPlan
     (c : FrameCursor) {delta : Nat} (h_add_lt : c.pos + delta < 4294967296) :
@@ -1065,15 +1148,14 @@ private theorem advanceCursorMut_wpTransPlan
   dsimp only [advanceCursorMutPlan]
   rw [wpTransPlan, advanceCursorMut_bb0_switch c h_add_lt]
   dsimp only []
-  rw [advanceCursorMut_bb1_join c delta, advanceCursorMut_bb2_join c delta]
-  dsimp only [advanceCursorBranchState, advanceCursorActiveMem, joinPlanMemConsistent, List.map, ite, dite, decide, Nat.decEq, instDecidableEqNat, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, BEq.beq, instBEqOfDecidableEq, zipLocalSlots, zipSymLocals, zipSymSlot, zipSymVal, zipSymValList, SymLocals.ofLocalSlots, SymLocals.denote, SymSlot.ofLocalSlot, SymSlot.denote, SymVal.ofValue, SymVal.ofValueList, SymVal.denote, SymVal.denoteList]
+  rw [advanceCursorMut_bb1_join c delta,
+      advanceCursorMut_bb2_join c delta]
+  dsimp only [advanceCursorMutBb3BranchState, joinPlanMemConsistent]
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
-  rw [wpTransPlan]; dsimp only [advanceCursorMutMirBody, runMirTauToRet, stepMirFn, stepMirState, wpCoalBounded, MirStepNode.step, MirStepNode.retNormal, evalStmt, advanceStmt, evalRvalue, evalOperand, evalOperands, readProjectedValue, evalPlaceWrite, writePlaceValue, writeProjectedValue, evalTerminator, ProvenancePtr.tag, lookupBorrow, appendProjections, invalidateConflictingBorrows, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, Option.getD, List.length, List.set, List.map, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory]
-  rw [dec_rec_const (Nat.ble (c.pos + delta) c.len).toNat,
+  rw [wpTransPlan, zipLocalSlots_eq_ite _ (by rfl),
       not_beq_toNat_zero (Nat.ble (c.pos + delta) c.len)]
-  dsimp only [ValueCodec.pair, frameCursorCodec, ValueCodec.rustBool,
-              FrameCursor.advancePure]
-  cases Nat.ble (c.pos + delta) c.len <;> rfl
+  dsimp only [FrameCursor.advancePure]
+  cases Nat.ble (c.pos + delta) c.len <;> exact (@Eq.refl MirOutcome _)
 
 /--
 Symbolic total & stateful verification of `advanceCursorMutMirBody` against
@@ -1096,178 +1178,5 @@ theorem advanceCursorMutSpec_total_and_stateful_verified :
       (advanceCursorMut_wpTransPlan c h_add_lt)
   exact ⟨h_tot, statefulOfTotalMutRefLocal h_tot⟩
 
-/-! ## Suite 4: Multi-Frame `callees`, Indirect `FnPtr`, and Polymorphic Linking (`Lower`) -/
-
-section Suite4MultiFrameAndPolyCalls
-
-private def usizeFtMirTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
-private def paramTFtMirTy : Ty := { kind := .param 0 "T", layoutIdx := 0 }
-private def sliceRefParamTFtMirTy : Ty :=
-  { kind := .ref .not (.slice (.param 0 "T")), layoutIdx := 0 }
-private def sliceRefU32FtMirTy : Ty :=
-  { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 }
-private def u32FnPtrFtKind : RigidTy :=
-  .fnPtr [.uint .u32] (.uint .u32) .safe .rust
-private def u32FnPtrFtMirTy : Ty := { kind := u32FnPtrFtKind, layoutIdx := 0 }
-
-private def fnConstFtOp (defPath : DefPath) (typeArgs : List RigidTy := []) : Operand :=
-  .constant
-    { ty := { kind := .fnDef defPath typeArgs, layoutIdx := 0 }
-      val := .zeroSized }
-
-private def ftCallerLayouts : LayoutTable := {
-  pointerBits := 64
-  isLittleEndian := true
-  entries := [defaultU32Layout]
-}
-
-/-- Polymorphic `core::slice::<impl [T]>::len` in `s.memory.callees`. -/
-def ftCoreSliceLenMir : CapturedMir := {
-  mkMirBody "core::slice::<impl [T]>::len" 1
-    [mkDecl .mut usizeFtMirTy, mkDecl .not sliceRefParamTFtMirTy]
-    [ { statements :=
-          [ mkStmt (.assign (locPlace 0)
-              (.unaryOp .ptrMetadata (.move (locPlace 1)))) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  typeParamCount := 1
-  genericParams := [{ idx := 0, name := "T" }]
-  layouts := ftCallerLayouts
-}
-
-/-- Callback `fn id_u32_cb(x: u32) -> u32 { x }` invoked via `FnPtr`. -/
-def ftIdU32CallbackMir : CapturedMir := {
-  mkMirBody "test::id_u32_cb" 1
-    [mkDecl .mut u32MirTy, mkDecl .not u32MirTy]
-    [ { statements :=
-          [ mkStmt (.assign (locPlace 0) (.use (.move (locPlace 1)))) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  layouts := ftCallerLayouts
-}
-
-/--
-Caller `ftSliceLenAndFnPtrMir` combining:
-1. Polymorphic call to `core::slice::<impl [T]>::len::<u32>` in `callees`,
-2. `ReifyFnPointer` coercion of `test::id_u32_cb`, and
-3. Indirect `FnPtr` call `move _3(move _2)` in `callees`.
--/
-def ftSliceLenAndFnPtrMir : CapturedMir := {
-  mkMirBody "test::slice_len_and_fn_ptr" 2
-    [ mkDecl .mut usizeFtMirTy
-    , mkDecl .not sliceRefU32FtMirTy
-    , mkDecl .not u32MirTy
-    , mkDecl .mut u32FnPtrFtMirTy
-    , mkDecl .mut u32MirTy ]
-    [ { statements :=
-          [ mkStmt (.storageLive 3)
-          , mkStmt (.storageLive 4)
-          , mkStmt (.assign (locPlace 3)
-              (.cast (.pointerCoercion "ReifyFnPointer")
-                (fnConstFtOp "test::id_u32_cb")
-                u32FnPtrFtMirTy)) ]
-        terminator :=
-          mkTerm (.call
-            (.move (locPlace 3))
-            [.move (locPlace 2)]
-            (locPlace 4)
-            (.some 1)
-            .continue_)
-        isCleanup := false }
-    , { statements := []
-        terminator :=
-          mkTerm (.call
-            (fnConstFtOp "core::slice::<impl [T]>::len" [.uint .u32])
-            [.move (locPlace 1)]
-            (locPlace 0)
-            (.some 2)
-            .continue_)
-        isCleanup := false }
-    , { statements :=
-          [ mkStmt (.storageDead 4)
-          , mkStmt (.storageDead 3) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  layouts := ftCallerLayouts
-}
-
-def ftSliceLenAndFnPtrClaim : Claim where
-  body := ftSliceLenAndFnPtrMir
-  callees := [ftCoreSliceLenMir, ftIdU32CallbackMir]
-  pre args :=
-    ∃ (p : ProvenancePtr) (len x : Nat),
-      args =
-        [ .aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]
-        , .scalar ⟨x, 4⟩ ]
-  post args ret :=
-    ∀ (p : ProvenancePtr) (len x : Nat),
-      args =
-        [ .aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]
-        , .scalar ⟨x, 4⟩ ] →
-      ret = .scalar ⟨len, 8⟩
-
-theorem ftSliceLenAndFnPtr_verified :
-    VerificationResult ftSliceLenAndFnPtrClaim := by
-  refine verifyMirBounded ftSliceLenAndFnPtrClaim 20 ?_
-  rintro _ ⟨p, len, x, rfl⟩
-  rintro retVal mem' h_out p' len' x' h_args
-  injection h_out with h_pair
-  injection h_pair with h_rv _
-  subst h_rv
-  simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
-    Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
-  rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
-  rfl
-
-/-- Trait implementation of `Default::default` for `u32`. -/
-def ftDefaultU32Mir : CapturedMir := {
-  mkMirBody "test::impl_Default_for_u32" 0
-    [mkDecl .mut u32MirTy]
-    [ { statements :=
-          [ mkStmt (.assign (locPlace 0) (.use (u32ConstOp 0))) ]
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  traitImpls :=
-    [ { traitRef := { defPath := "core::default::Default::default", args := [.uint .u32] }
-      , implPath := "test::impl_Default_for_u32" } ]
-  layouts := ftCallerLayouts
-}
-
-/-- Caller `ftTraitCallMir` demonstrating trait-method compositional linking. -/
-def ftTraitCallMir : CapturedMir := {
-  mkMirBody "test::trait_call" 0
-    [mkDecl .mut u32MirTy]
-    [ { statements := []
-        terminator :=
-          mkTerm (.call
-            (fnConstFtOp "core::default::Default::default" [.uint .u32])
-            []
-            (locPlace 0)
-            (.some 1)
-            .continue_)
-        isCleanup := false }
-    , { statements := []
-        terminator := mkTerm .return_
-        isCleanup := false } ] with
-  layouts := ftCallerLayouts
-}
-
-def ftTraitCallClaim : Claim where
-  body := ftTraitCallMir
-  callees := [ftDefaultU32Mir]
-  pre args := args = []
-  post args ret := args = [] → ret = .scalar ⟨0, 4⟩
-
-theorem ftTraitCall_verified :
-    VerificationResult ftTraitCallClaim := by
-  refine verifyMirBounded ftTraitCallClaim 20 ?_
-  rintro _ rfl
-  rintro retVal mem' h_out h_args
-  injection h_out with h_pair
-  injection h_pair with h_rv _
-  subst h_rv
-  rfl
-
-end Suite4MultiFrameAndPolyCalls
 
 end Anneal.FunctionalTranslationTests

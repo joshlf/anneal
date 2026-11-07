@@ -29,6 +29,43 @@ open Anneal.MirLiftCore
 open Anneal.MirFuelFree
 open Anneal.Rustc.V2026_06_01.SymbolicEval (mirNormalPost)
 
+@[simp]
+private theorem endsWithSubslice_norm_field (idx : FieldIdx) (ty : Ty) :
+    endsWithSubslice (normalizeSubsliceProjections (stripTransparentProjections [.field idx ty])) =
+      false := rfl
+
+private theorem resolveDerefWriteFullProj_nil_nil
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    (hP : entry.targetProjection = []) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [] cl = [] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP]; rfl
+
+private theorem resolveDerefWriteFullProj_nil_field
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    {subIdx : FieldIdx} {subTy : Ty}
+    (hP : entry.targetProjection = []) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [.field subIdx subTy] cl =
+      [.field subIdx subTy] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP]; rfl
+
+private theorem resolveDerefWriteFullProj_field_nil
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    {outerIdx : FieldIdx} {outerTy : Ty}
+    (hP : entry.targetProjection = [.field outerIdx outerTy])
+    (hOff : ptrVal.offsetBytes = 0) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [] cl =
+      [.field outerIdx outerTy] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP, hOff]; rfl
+
+private theorem resolveDerefWriteFullProj_field_field
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    {outerIdx subIdx : FieldIdx} {outerTy subTy : Ty}
+    (hP : entry.targetProjection = [.field outerIdx outerTy])
+    (hOff : ptrVal.offsetBytes = 0) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [.field subIdx subTy] cl =
+      [.field outerIdx outerTy, .field subIdx subTy] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP, hOff]; rfl
+
 /-!
 # Separation-Logic-Backed Mutable Lenses & Pure Deref Lifting (`FF-4.1`)
 
@@ -2408,6 +2445,48 @@ def assertBit (expected : Bool) : Nat :=
   | false => 0
 
 /--
+True when `phase` is an executable runtime MIR phase (`runtimePostCleanup` or
+`runtimeOptimized`) accepted by `stepMirFn` (as opposed to `.other _`).
+-/
+def isRuntimeMirPhase : MirPhaseTag → Bool
+  | .runtimePostCleanup => true
+  | .runtimeOptimized => true
+  | .other _ => false
+
+theorem stepMirFn_of_isRuntimeMirPhase (body : CapturedMir)
+    (bbIdx : BasicBlockIdx) (stmtIdx : Nat) (locals : PureEnv) (m : Memory)
+    (hCallee : m.activeCallee = .none)
+    (hPhase : isRuntimeMirPhase body.phase = true)
+    {bb : BasicBlockData} (hBb : get? body.basicBlocks bbIdx = .some bb) :
+    stepMirFn body
+      { frame := { blockIdx := bbIdx, stmtIdx := stmtIdx, locals := locals }
+        memory := m } =
+      match get? bb.statements stmtIdx with
+      | .some stmt =>
+        evalStmt
+          { frame := { blockIdx := bbIdx, stmtIdx := stmtIdx, locals := locals }
+            memory := m }
+          stmt body.localDecls body.layouts
+      | .none =>
+        if (stmtIdx == length bb.statements) = true then
+          evalTerminator
+            { frame := { blockIdx := bbIdx, stmtIdx := stmtIdx, locals := locals }
+              memory := m }
+            bb.terminator (.some body)
+        else
+          .fail .ub := by
+  unfold stepMirFn
+  change
+    let currentBody := m.activeCallee.getD body
+    _ = _
+  rw [hCallee]
+  dsimp only [Option.getD]
+  cases hP : body.phase with
+  | runtimePostCleanup => simp only [hBb]; rfl
+  | runtimeOptimized => simp only [hBb]; rfl
+  | other _ => rw [hP] at hPhase; nomatch hPhase
+
+/--
 Control-flow-graph lens-lifting judgment (`LiftLensBlock`): executing `body`
 from basic block `bbIdx` with locals `env` and pure lens bindings `entries`
 returns `retVal` (read from `_0`) with final lens bindings `entries'`.
@@ -2426,7 +2505,7 @@ inductive LiftLensBlock (body : CapturedMir) :
   | return_
       {bbIdx : BasicBlockIdx} {bb : BasicBlockData} {env env' : PureEnv}
       {entries entries' : List (RawPtrVal × Value)} {retVal : Value} :
-      body.phase = .runtimePostCleanup →
+      isRuntimeMirPhase body.phase = true →
       get? body.basicBlocks bbIdx = .some bb →
       bb.terminator.kind = .return_ →
       LiftLensStmts body.localDecls body.layouts
@@ -2436,7 +2515,7 @@ inductive LiftLensBlock (body : CapturedMir) :
   | goto
       {bbIdx target : BasicBlockIdx} {bb : BasicBlockData} {env env₁ : PureEnv}
       {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
-      body.phase = .runtimePostCleanup →
+      isRuntimeMirPhase body.phase = true →
       get? body.basicBlocks bbIdx = .some bb →
       bb.terminator.kind = .goto target →
       LiftLensStmts body.localDecls body.layouts
@@ -2448,7 +2527,7 @@ inductive LiftLensBlock (body : CapturedMir) :
       {cond : Operand} {expected : Bool} {unwind : UnwindAction}
       {env env₁ env₂ : PureEnv} {sc : ScalarInt}
       {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
-      body.phase = .runtimePostCleanup →
+      isRuntimeMirPhase body.phase = true →
       get? body.basicBlocks bbIdx = .some bb →
       bb.terminator.kind = .assert cond expected target unwind →
       LiftLensStmts body.localDecls body.layouts
@@ -2462,7 +2541,7 @@ inductive LiftLensBlock (body : CapturedMir) :
       {discr : Operand} {targets : SwitchTargets}
       {env env₁ env₂ : PureEnv} {sc : ScalarInt}
       {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
-      body.phase = .runtimePostCleanup →
+      isRuntimeMirPhase body.phase = true →
       get? body.basicBlocks bbIdx = .some bb →
       bb.terminator.kind = .switchInt discr targets →
       LiftLensStmts body.localDecls body.layouts
@@ -2476,7 +2555,7 @@ inductive LiftLensBlock (body : CapturedMir) :
       {loc : Local} {unwind : UnwindAction} {oldSlot : LocalSlot}
       {env env₁ env₂ : PureEnv}
       {entries entries₁ entries' : List (RawPtrVal × Value)} {retVal : Value} :
-      body.phase = .runtimePostCleanup →
+      isRuntimeMirPhase body.phase = true →
       get? body.basicBlocks bbIdx = .some bb →
       bb.terminator.kind =
         .drop { local_ := loc, projection := [] } target unwind →
@@ -3075,8 +3154,7 @@ theorem LiftDerefWrite.evalStmt_field_eq
           exact hWriteCallerOk
         | cons b₂ rest =>
           dsimp only
-          rw [hP]
-          dsimp only [appendProjections]
+          rw [resolveDerefWriteFullProj_nil_field hP]
           have hNoConflict :
               hasProtectedTreeWriteConflict
                 (b₁ :: b₂ :: rest)
@@ -3100,7 +3178,8 @@ theorem LiftDerefWrite.evalStmt_field_eq
         env'
         s.memory.borrows
         { local_ := ptrLoc, projection := [.deref, .field fieldIdx fieldTy] }
-        [.field fieldIdx fieldTy] = s.memory.borrows := by
+        [.field fieldIdx fieldTy]
+        s.memory.callerLocals = s.memory.borrows := by
     unfold invalidateDerefWriteBorrows
     simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
       _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
@@ -3115,8 +3194,8 @@ theorem LiftDerefWrite.evalStmt_field_eq
         dsimp only [ProvenancePtr.tag]
         rw [hLookSingle]
         dsimp only
-        rw [hP]
-        dsimp only [appendProjections]
+        rw [resolveDerefWriteFullProj_nil_field hP]
+        dsimp only
         have hExclSingle :
             ∀ b ∈ [b₁],
               b.targetLocal = rp.allocId →
@@ -3139,7 +3218,7 @@ theorem LiftDerefWrite.evalStmt_field_eq
         dsimp only [ProvenancePtr.tag]
         rw [hLookMany]
         dsimp only
-        rw [hT, ← hB]
+        rw [resolveDerefWriteFullProj_nil_field hP, hT, ← hB]
         exact invalidateTreeBorrowsAtProj_eq_self_of_tree
           s.memory.borrows s.memory.borrows _ _ _
           hExcl.ancestors_active_or_disabled
@@ -3267,8 +3346,7 @@ theorem LiftDerefWrite.evalStmt_eq
             exact hWriteCallerOk
           | cons b₂ rest =>
             dsimp only
-            rw [hP]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_nil_nil hP]
             have hNoConflict :
                 hasProtectedTreeWriteConflict
                   (b₁ :: b₂ :: rest)
@@ -3292,7 +3370,8 @@ theorem LiftDerefWrite.evalStmt_eq
           env'
           s.memory.borrows
           { local_ := ptrLoc, projection := [.deref] }
-          [] = s.memory.borrows := by
+          []
+          s.memory.callerLocals = s.memory.borrows := by
       unfold invalidateDerefWriteBorrows
       simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
       cases hB : s.memory.borrows with
@@ -3306,8 +3385,8 @@ theorem LiftDerefWrite.evalStmt_eq
           dsimp only [ProvenancePtr.tag]
           rw [hLookSingle]
           dsimp only
-          rw [hP, hRL]
-          dsimp only [appendProjections]
+          rw [resolveDerefWriteFullProj_nil_nil hP, hRL]
+          dsimp only
           -- With a single borrow-table entry, `lookupBorrow` forces that
           -- entry to be `rp.tag`'s own active whole-allocation entry, so the
           -- non-tree `invalidateConflictingBorrows` path is the identity.
@@ -3336,7 +3415,7 @@ theorem LiftDerefWrite.evalStmt_eq
           dsimp only [ProvenancePtr.tag]
           rw [hLookMany]
           dsimp only
-          rw [hT, ← hB]
+          rw [resolveDerefWriteFullProj_nil_nil hP, hT, ← hB]
           exact invalidateTreeBorrowsAtProj_eq_self_of_tree
             s.memory.borrows s.memory.borrows _ _ _
             hExcl.ancestors_active_or_disabled
@@ -3514,7 +3593,7 @@ theorem mirWpConverges_of_liftLensStmts
     {stmts : List Statement}
     {env env' : PureEnv}
     {entries₀ entries entries' : List (RawPtrVal × Value)}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hStmts :
       LiftLensStmts body.localDecls body.layouts
@@ -3565,14 +3644,9 @@ theorem mirWpConverges_of_liftLensStmts
     }
     rcases hFirst.evalStmt_step (s := s) rfl hInv hFrame hKeys with
       ⟨m₁, hStepStmt, hLen₁, hInv₁, hFrame₁, hKeys₁⟩
-    apply MirWpConverges.step_tau
-    · unfold stepMirFn
-      change
-        let currentBody := s.memory.activeCallee.getD body
-        _ = MirStepNode.step (advanceStmt s env1_ m₁)
-      rw [hInv.activeCallee_none]
-      dsimp only [Option.getD]
-      simp only [hPhase, hBb]
+    apply MirWpConverges.step_tau (s' := advanceStmt s env1_ m₁)
+    · rw [stepMirFn_of_isRuntimeMirPhase body bbIdx prefixStmts.length env_ m
+        hInv.activeCallee_none hPhase hBb]
       have hGetStmt : get? bb.statements prefixStmts.length = .some stmt := by
         rw [hBbStmts]
         unfold get?
@@ -3596,7 +3670,7 @@ theorem mirWpConverges_of_liftLensStmts
 theorem mirWpConverges_return_of_lens
     {body : CapturedMir} {bbIdx : BasicBlockIdx} {bb : BasicBlockData}
     {env : PureEnv} {m : Memory} {retVal : Value} {Φ : MirOutcome → Prop}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hTerm : bb.terminator.kind = .return_)
     (hRet : get? env 0 = .some (.init retVal))
@@ -3612,10 +3686,8 @@ theorem mirWpConverges_return_of_lens
         memory := m }
       Φ := by
   refine MirWpConverges.ret_of_step ?_ hPost
-  unfold stepMirFn
-  rw [hCallee]
-  dsimp only [Option.getD]
-  simp only [hPhase, hBb]
+  rw [stepMirFn_of_isRuntimeMirPhase body bbIdx bb.statements.length env m
+    hCallee hPhase hBb]
   have hGetNone : get? bb.statements bb.statements.length = .none :=
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
@@ -3629,7 +3701,7 @@ theorem mirWpConverges_return_of_lens
 theorem mirWpConverges_goto_of_lens
     {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
     {env : PureEnv} {m : Memory} {Φ : MirOutcome → Prop}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hTerm : bb.terminator.kind = .goto target)
     (hCallee : m.activeCallee = .none)
@@ -3647,10 +3719,8 @@ theorem mirWpConverges_goto_of_lens
         memory := m }
       Φ := by
   refine MirWpConverges.step_tau ?_ hNext
-  unfold stepMirFn
-  rw [hCallee]
-  dsimp only [Option.getD]
-  simp only [hPhase, hBb]
+  rw [stepMirFn_of_isRuntimeMirPhase body bbIdx bb.statements.length env m
+    hCallee hPhase hBb]
   have hGetNone : get? bb.statements bb.statements.length = .none :=
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
@@ -3668,7 +3738,7 @@ theorem mirWpConverges_assert_of_lens
     {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
     {cond : Operand} {expected : Bool} {unwind : UnwindAction}
     {env env' : PureEnv} {sc : ScalarInt} {m : Memory} {Φ : MirOutcome → Prop}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hTerm : bb.terminator.kind = .assert cond expected target unwind)
     (hCallee : m.activeCallee = .none)
@@ -3690,10 +3760,8 @@ theorem mirWpConverges_assert_of_lens
         memory := m }
       Φ := by
   refine MirWpConverges.step_tau ?_ hNext
-  unfold stepMirFn
-  rw [hCallee]
-  dsimp only [Option.getD]
-  simp only [hPhase, hBb]
+  rw [stepMirFn_of_isRuntimeMirPhase body bbIdx bb.statements.length env m
+    hCallee hPhase hBb]
   have hGetNone : get? bb.statements bb.statements.length = .none :=
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
@@ -3716,7 +3784,7 @@ theorem mirWpConverges_switchInt_of_lens
     {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
     {discr : Operand} {targets : SwitchTargets}
     {env env' : PureEnv} {sc : ScalarInt} {m : Memory} {Φ : MirOutcome → Prop}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hTerm : bb.terminator.kind = .switchInt discr targets)
     (hCallee : m.activeCallee = .none)
@@ -3738,10 +3806,8 @@ theorem mirWpConverges_switchInt_of_lens
         memory := m }
       Φ := by
   refine MirWpConverges.step_emit (obs := .event sc.bits) ?_ hNext
-  unfold stepMirFn
-  rw [hCallee]
-  dsimp only [Option.getD]
-  simp only [hPhase, hBb]
+  rw [stepMirFn_of_isRuntimeMirPhase body bbIdx bb.statements.length env m
+    hCallee hPhase hBb]
   have hGetNone : get? bb.statements bb.statements.length = .none :=
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
@@ -3762,7 +3828,7 @@ theorem mirWpConverges_drop_of_lens
     {body : CapturedMir} {bbIdx target : BasicBlockIdx} {bb : BasicBlockData}
     {loc : Local} {unwind : UnwindAction} {oldSlot : LocalSlot}
     {env env' : PureEnv} {m : Memory} {Φ : MirOutcome → Prop}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hTerm :
       bb.terminator.kind =
@@ -3785,10 +3851,8 @@ theorem mirWpConverges_drop_of_lens
         memory := m }
       Φ := by
   refine MirWpConverges.step_tau ?_ hNext
-  unfold stepMirFn
-  rw [hCallee]
-  dsimp only [Option.getD]
-  simp only [hPhase, hBb]
+  rw [stepMirFn_of_isRuntimeMirPhase body bbIdx bb.statements.length env m
+    hCallee hPhase hBb]
   have hGetNone : get? bb.statements bb.statements.length = .none :=
     get?_eq_none_of_le (Nat.le_refl _)
   simp only [hGetNone]
@@ -6257,7 +6321,7 @@ theorem LiftLensStmts.mirWpConverges_treeLens_views
     {env env' : PureEnv}
     {entries₀ entries entries' : List (RawPtrVal × Value)}
     {m₀ m : Memory} {Φ : MirOutcome → Prop}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hStmts :
       LiftLensStmts body.localDecls body.layouts
@@ -7598,7 +7662,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -7668,7 +7732,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -7755,7 +7819,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -7828,7 +7892,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -8144,7 +8208,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only; rw [resolveDerefWriteFullProj_nil_nil hP]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8158,7 +8222,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               exact hWriteCallerOk
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
-            { local_ := ptrLoc, projection := [.deref] } [] =
+            { local_ := ptrLoc, projection := [.deref] } []
+            s.memory.callerLocals =
             s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
@@ -8174,8 +8239,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookSingle]
             dsimp only
-            rw [hP, hRL]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_nil_nil hP, hRL]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active ∧
@@ -8195,7 +8260,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookMany]
             dsimp only
-            rw [hT, ← hB]
+            rw [resolveDerefWriteFullProj_nil_nil hP, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_tree
               s.memory.borrows s.memory.borrows _ _ _
               hExcl.ancestors_active_or_disabled
@@ -8286,7 +8351,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
           rw [hGetPtr]
-          dsimp only [ProvenancePtr.tag]
+          dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
           rw [hLookB]
           cases hB : s.memory.borrows with
           | nil =>
@@ -8299,7 +8364,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only
+              rw [resolveDerefWriteFullProj_field_nil hP hOff]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8314,7 +8380,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               exact hWriteCallerOk
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
-            { local_ := ptrLoc, projection := [.deref] } [] =
+            { local_ := ptrLoc, projection := [.deref] } []
+            s.memory.callerLocals =
             s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
@@ -8327,11 +8394,11 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookSingle := hLookB
             rw [hB] at hLookSingle
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookSingle]
             dsimp only
-            rw [hP, hRO, hRL]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_nil hP hOff, hRO, hRL]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active) ∨ b.perm = .disabled := by
@@ -8347,11 +8414,10 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookMany := hLookB
             rw [hB] at hLookMany
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookMany]
             dsimp only
-            rw [hP, hRO, hRL, hT, ← hB]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_nil hP hOff, hRO, hRL, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_treeField
               s.memory.borrows s.memory.borrows
               hExcl.ancestors_disjoint_or_disabled
@@ -8440,7 +8506,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only; rw [resolveDerefWriteFullProj_nil_field hP]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8456,7 +8522,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
             { local_ := ptrLoc, projection := [.deref, .field subIdx subTy] }
-            [.field subIdx subTy] = s.memory.borrows := by
+            [.field subIdx subTy]
+            s.memory.callerLocals = s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
@@ -8471,8 +8538,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookSingle]
             dsimp only
-            rw [hP]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_nil_field hP]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active) ∨ b.perm = .disabled := by
@@ -8491,7 +8558,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookMany]
             dsimp only
-            rw [hT, ← hB]
+            rw [resolveDerefWriteFullProj_nil_field hP, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_tree
               s.memory.borrows s.memory.borrows _ _ _
               hExcl.ancestors_active_or_disabled
@@ -8582,7 +8649,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
           rw [hGetPtr]
-          dsimp only [ProvenancePtr.tag]
+          dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
           rw [hLookB]
           cases hB : s.memory.borrows with
           | nil =>
@@ -8595,7 +8662,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only
+              rw [resolveDerefWriteFullProj_field_field hP hOff]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8611,7 +8679,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
             { local_ := ptrLoc, projection := [.deref, .field subIdx subTy] }
-            [.field subIdx subTy] = s.memory.borrows := by
+            [.field subIdx subTy]
+            s.memory.callerLocals = s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
@@ -8623,11 +8692,11 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookSingle := hLookB
             rw [hB] at hLookSingle
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookSingle]
             dsimp only
-            rw [hP, hRO, hRL]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_field hP hOff, hRO, hRL]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active) ∨ b.perm = .disabled := by
@@ -8643,11 +8712,10 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookMany := hLookB
             rw [hB] at hLookMany
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookMany]
             dsimp only
-            rw [hP, hRO, hRL, hT, ← hB]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_field hP hOff, hRO, hRL, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_treeField_prefix
               s.memory.borrows s.memory.borrows [.field subIdx subTy]
               hExcl.ancestors_disjoint_or_disabled
@@ -8945,7 +9013,7 @@ theorem mirWpConverges_of_liftLensStmts_subplace
     {stmts : List Statement}
     {env env' : PureEnv}
     {entries₀ entries entries' : List (RawPtrVal × Value)}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hStmts :
       LiftLensStmts body.localDecls body.layouts
@@ -8996,14 +9064,9 @@ theorem mirWpConverges_of_liftLensStmts_subplace
     }
     rcases hFirst.evalStmt_step_subplace (s := s) rfl hInv hFrame hKeys with
       ⟨m₁, hStepStmt, _, hInv₁, hFrame₁, hKeys₁⟩
-    apply MirWpConverges.step_tau
-    · unfold stepMirFn
-      change
-        let currentBody := s.memory.activeCallee.getD body
-        _ = MirStepNode.step (advanceStmt s env1_ m₁)
-      rw [hInv.activeCallee_none]
-      dsimp only [Option.getD]
-      simp only [hPhase, hBb]
+    apply MirWpConverges.step_tau (s' := advanceStmt s env1_ m₁)
+    · rw [stepMirFn_of_isRuntimeMirPhase body bbIdx prefixStmts.length env_ m
+        hInv.activeCallee_none hPhase hBb]
       have hGetStmt : get? bb.statements prefixStmts.length = .some stmt := by
         rw [hBbStmts]
         unfold get?
@@ -10724,7 +10787,7 @@ theorem LiftLensStmts.mirWpConverges_subplaceTreeLens_views
     {env env' : PureEnv}
     {entries₀ entries entries' : List (RawPtrVal × Value)}
     {m₀ m : Memory} {Φ : MirOutcome → Prop}
-    (hPhase : body.phase = .runtimePostCleanup)
+    (hPhase : isRuntimeMirPhase body.phase = true)
     (hBb : get? body.basicBlocks bbIdx = .some bb)
     (hStmts :
       LiftLensStmts body.localDecls body.layouts

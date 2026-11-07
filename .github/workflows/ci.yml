@@ -46,6 +46,18 @@ jobs:
       - name: Run todo check
         run: ./ci/check_todo.sh
 
+  # FIXME(#87): We must address all blockers listed in #87 before permitting
+  # stable releases.
+  check-non-stable-version:
+    runs-on: ubuntu-latest
+    name: Check for non-stable cargo-anneal version
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify non-stable pre-release version
+        run: ./ci/check_non_stable_version.sh
+
   rust-unit-tests:
     runs-on: ubuntu-latest
     name: Rust workspace unit tests
@@ -54,6 +66,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Run workspace unit tests
         run: cargo test --workspace --lib --bins --locked
 
@@ -104,6 +127,18 @@ jobs:
           key: lake-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('trusted/lean/lean-toolchain', 'trusted/lean/**/*.lean', 'theory/**/*.lean') }}
           restore-keys: |
             lake-artifacts-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Replay the tutor and check its rendered chapters
         env:
@@ -165,13 +200,33 @@ jobs:
           restore-keys: |
             lake-artifacts-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Run end-to-end pipeline and demo user journeys
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run end-to-end pipeline, demo user journeys, and Miri differential suite
         env:
           LAKE: ${{ runner.temp }}/anneal-lean/lean-4.34.1-darwin_aarch64/bin/lake
           LAKE_CACHE_DIR: ${{ runner.temp }}/anneal-lake-cache
+          ANNEAL_ALLOW_MISSING_MIRI: "1"
         run: |
           cargo test -p cargo-anneal --test end_to_end_pipeline --locked
+          cargo test -p cargo-anneal --test end_to_end_itree_diff --locked
+          cargo test -p cargo-anneal --test end_to_end_difftest_oracles --locked
           cargo test -p cargo-anneal --test end_to_end_demo_journeys --locked
+          cargo test -p cargo-anneal --test end_to_end_miri_diff --locked
+          python3 tests/miri-diff/sync_miri_suite.py
+          if [ -d "$HOME/.cache/miri/lib/rustlib" ]; then
+            python3 tests/miri-diff/sync_miri_suite.py --eval-miri
+          fi
 
       - name: Verify clean working tree
         run: |
@@ -187,7 +242,7 @@ jobs:
       # success in branch protection, so this aggregation must fail closed.
       if: ${{ always() }}
       runs-on: ubuntu-latest
-      needs: [check-todo, rust-unit-tests, tutor-chapters, end-to-end-verification]
+      needs: [check-todo, check-non-stable-version, rust-unit-tests, tutor-chapters, end-to-end-verification]
       steps:
         - name: Reject workflow cancellation
           if: ${{ cancelled() }}

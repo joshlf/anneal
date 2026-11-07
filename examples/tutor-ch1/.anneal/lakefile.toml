@@ -1,0 +1,30 @@
+name = "AnnealVerification"
+defaultTargets = ["Verify", "CrateVerify"]
+
+[[lean_lib]]
+name = "Trusted"
+srcDir = "../../../trusted/lean"
+
+[[lean_lib]]
+name = "Anneal"
+srcDir = "../../../theory"
+
+[[lean_lib]]
+name = "Mir"
+srcDir = "generated"
+roots = ["Mir.FrameTutor.advance_offset", "Mir.FrameTutor.magic_version"]
+
+[[lean_lib]]
+name = "Obligations"
+srcDir = "generated"
+roots = ["Obligations.FrameTutor.advance_offset", "Obligations.FrameTutor.magic_version"]
+
+[[lean_lib]]
+name = "Verify"
+srcDir = "generated"
+roots = ["Verify.FrameTutor.advance_offset", "Verify.FrameTutor.magic_version"]
+
+[[lean_lib]]
+name = "CrateVerify"
+srcDir = "generated"
+roots = ["CrateVerify"]

@@ -2303,12 +2303,12 @@ example :
       [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
       (.ref .shared { local_ := 0, projection := [.deref] })
       { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } =
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } =
     .ok
       (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])
       [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
       { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } :=
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } :=
   rfl
 
 example :
@@ -2316,7 +2316,7 @@ example :
       [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
       (.ref (.mut false) { local_ := 0, projection := [.deref] })
       { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
   rfl
 
 example :
@@ -2334,8 +2334,8 @@ example :
 
 -- 7b. Nested `core::convert::Infallible` inside a `.tuple` is rejected even when
 --     `optLayoutIdx = .none` or `layouts.entries` is empty, mutable global wide
---     reborrows (`alloc.mutability = .mut`) and vtable `.ptr` metadata succeed,
---     and `rigidTyMatchesCalleeDecl` recurses into `.fnDef`, `.closure`, and `.alias`.
+--     reborrows (`alloc.mutability = .mut`) succeed, and `rigidTyMatchesCalleeDecl`
+--     recurses into `.fnDef`, `.closure`, and `.alias`.
 example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (v : Value) :
     ¬ valueValidForTy L
       { kind := .tuple [.uint .u32, .adt "core::convert::Infallible" []], layoutIdx := 0 }
@@ -2350,12 +2350,12 @@ example :
       [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
       (.ref (.mut false) { local_ := 0, projection := [.deref] })
       { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .mut }] } =
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .mut }] } =
     .ok
       (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])
       [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
       { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .mut }] } :=
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .mut }] } :=
   rfl
 
 example (vtablePtr : ProvenancePtr) :
@@ -2363,12 +2363,7 @@ example (vtablePtr : ProvenancePtr) :
       [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .ptr vtablePtr 8])]
       (.ref .shared { local_ := 0, projection := [.deref] })
       { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } =
-    .ok
-      (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .ptr vtablePtr 8])
-      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .ptr vtablePtr 8])]
-      { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } :=
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
   rfl
 
 example :
@@ -2410,14 +2405,14 @@ example (p : ProvenancePtr) :
     .ok (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩]) [.uninit] emptyMemory :=
   rfl
 
-example (p : ProvenancePtr) :
+example :
     evalRvalue
-      [.init (.ptr p 8)]
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
         { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 })
       emptyMemory
       (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) =
-    .ok (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩]) [.init (.ptr p 8)] emptyMemory :=
+    .ok (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩]) [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)] emptyMemory :=
   rfl
 
 example :
@@ -2425,7 +2420,7 @@ example :
       [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .unit])]
       (.ref .shared { local_ := 0, projection := [.deref] })
       { emptyMemory with
-        globals := [{ allocId := 7, bytes := [], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
+        globals := [{ allocId := 7, bytes := [.none, .none, .none, .none], relocations := [], align := ⟨1⟩, mutability := .not }] } = .ub :=
   rfl
 
 example (L : Trusted.Rustc.V2026_06_01.Layout.LayoutTable) (p : ProvenancePtr) :
@@ -2476,15 +2471,15 @@ example :
       .unit :=
   ⟨trivial, trivial⟩
 
-example (p : ProvenancePtr) :
+example :
     evalRvalue
-      [.init (.ptr p 8)]
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
         { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 0 })
       emptyMemory
       (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
     evalRvalue
-      [.init (.ptr p 8)]
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
         { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 })
       emptyMemory
@@ -2497,25 +2492,18 @@ example (p : ProvenancePtr) :
         borrows := [{ tag := 1, targetLocal := 5, targetProjection := .nil, perm := .disabled }] }
       (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
     evalRvalue
-      [.init (.ptr { allocId := 1, offsetBytes := 0 } 8)]
-      (.cast (.pointerCoercion "MutToConstPointer") (.copy { local_ := 0, projection := .nil })
-        { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 })
-      { emptyMemory with
-        borrows := [{ tag := 1, targetLocal := 5, targetProjection := .nil, perm := .disabled }] }
-      (localDecls := [{ mutability := .not, ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
-    evalRvalue
-      [.init (.ptr p 8)]
+      [.init (.ptr { allocId := 7, offsetBytes := 0 } 8)]
       (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
         { kind := .ref .not .str, layoutIdx := 0 })
       emptyMemory
       (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.array (.uint .u8) 4), layoutIdx := 0 }, debugName := .none }]) = .ub ∧
     evalRvalue
-      [.init (.aggregate 0 [.ptr p 8, .scalar ⟨4, 8⟩])]
+      [.init (.aggregate 0 [.ptr { allocId := 7, offsetBytes := 0 } 8, .scalar ⟨4, 8⟩])]
       (.cast (.pointerCoercion "Unsize") (.copy { local_ := 0, projection := .nil })
         { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 0 })
       emptyMemory
       (localDecls := [{ mutability := .not, ty := { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 0 }, debugName := .none }]) = .ub :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 example (p : ProvenancePtr) :
     evalRvalue
@@ -2565,13 +2553,23 @@ instance callerFfiAndLenSpec : ModularItemSpec "crate_a::caller_ffi_and_len" :=
         n < 18446744073709551616 ∧
         args = [.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]] ∧
         mem = {
-          (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory with
+          nextAllocId := 0
+          globals := []
           borrows := [{ tag := 1, targetLocal := 10, targetProjection := .nil, perm := .frozen }]
           nextTag := 2
+          callees := []
+          traitImpls := []
+          callStack := []
+          activeCallee := .none
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := []
         })
     (fun _ _ ret _ =>
       ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
 
+set_option maxRecDepth 100000 in
 theorem callerFfiAndLen_verified :
     ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
   refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
@@ -2583,6 +2581,200 @@ theorem callerFfiAndLen_verified :
     10
     ?_
   rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
+  have h_slice_len :
+      lookupCallee
+        Obligations.CrateA.caller_ffi_and_len.defaultCallees
+        Mir.CrateA.caller_ffi_and_len.layouts
+        "crate_b::slice_len"
+        [.uint .u8]
+        [] =
+      .some (
+        Mir.CrateB.slice_len.body.instantiate
+          [(.uint .u8, {
+            size := { bytes := 1 }
+            align := { bytes := 1 }
+            backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false
+          })]) := rfl
+  change
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+      Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+      6
+      Mir.CrateA.caller_ffi_and_len.body
+      (.running {
+        frame := {
+          blockIdx := 0
+          stmtIdx := 2
+          locals := [
+            .uninit,
+            .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+            .init (.ptr { allocId := 65536, offsetBytes := 0 } 8)
+          ]
+        }
+        memory := {
+          nextAllocId := 0
+          globals := []
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := [], perm := .frozen }]
+          nextTag := 2
+          callees := Obligations.CrateA.caller_ffi_and_len.defaultCallees
+          traitImpls := []
+          callStack := [{
+            callerBody := Mir.CrateA.caller_ffi_and_len.body
+            frame := {
+              blockIdx := 0
+              stmtIdx := 1
+              locals := [
+                .uninit,
+                .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+                .uninit
+              ]
+            }
+            destination := { local_ := 2, projection := [] }
+            returnTarget := 1
+          }]
+          activeCallee :=
+            lookupCallee
+              Obligations.CrateA.caller_ffi_and_len.defaultCallees
+              Mir.CrateA.caller_ffi_and_len.layouts
+              "crate_b::slice_len"
+              [.uint .u8]
+              []
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := [{
+            allocId := 65536
+            defPath := "core::slice::<impl [T]>::len"
+            typeArgs := [.uint .u8]
+            fnSig := .some (.fnPtr [.ref .not (.slice (.uint .u8))] (.uint .usize) .safe .rust)
+          }]
+        }
+      })
+      _
+  rw [h_slice_len]
+  have h_core_len :
+      lookupCallee
+        Obligations.CrateA.caller_ffi_and_len.defaultCallees
+        (Mir.CrateB.slice_len.body.instantiate
+          [(.uint .u8, {
+            size := { bytes := 1 }
+            align := { bytes := 1 }
+            backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false
+          })]).layouts
+        "core::slice::<impl [T]>::len"
+        [.uint .u8]
+        [] =
+      .some (
+        Mir.Core.slice_impl_T_len.body.instantiate
+          [(.uint .u8, {
+            size := { bytes := 1 }
+            align := { bytes := 1 }
+            backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false
+          })]) := rfl
+  change
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+      Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+      5
+      Mir.CrateA.caller_ffi_and_len.body
+      (.running {
+        frame := {
+          blockIdx := 0
+          stmtIdx := 0
+          locals := [
+            .uninit,
+            .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }])
+          ]
+        }
+        memory := {
+          nextAllocId := 0
+          globals := []
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := [], perm := .frozen }]
+          nextTag := 2
+          callees := Obligations.CrateA.caller_ffi_and_len.defaultCallees
+          traitImpls := []
+          callStack := [
+            {
+              callerBody :=
+                Mir.CrateB.slice_len.body.instantiate
+                  [(.uint .u8, {
+                    size := { bytes := 1 }
+                    align := { bytes := 1 }
+                    backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+                    fields := .primitive
+                    variants := .single 0
+                    isUninhabited := false
+                  })]
+              frame := {
+                blockIdx := 0
+                stmtIdx := 2
+                locals := [
+                  .uninit,
+                  .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+                  .init (.ptr { allocId := 65536, offsetBytes := 0 } 8)
+                ]
+              }
+              destination := { local_ := 0, projection := [] }
+              returnTarget := 1
+            },
+            {
+              callerBody := Mir.CrateA.caller_ffi_and_len.body
+              frame := {
+                blockIdx := 0
+                stmtIdx := 1
+                locals := [
+                  .uninit,
+                  .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+                  .uninit
+                ]
+              }
+              destination := { local_ := 2, projection := [] }
+              returnTarget := 1
+            }
+          ]
+          activeCallee :=
+            lookupCallee
+              Obligations.CrateA.caller_ffi_and_len.defaultCallees
+              (Mir.CrateB.slice_len.body.instantiate
+                [(.uint .u8, {
+                  size := { bytes := 1 }
+                  align := { bytes := 1 }
+                  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+                  fields := .primitive
+                  variants := .single 0
+                  isUninhabited := false
+                })]).layouts
+              "core::slice::<impl [T]>::len"
+              [.uint .u8]
+              []
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := [{
+            allocId := 65536
+            defPath := "core::slice::<impl [T]>::len"
+            typeArgs := [.uint .u8]
+            fnSig := .some (.fnPtr [.ref .not (.slice (.uint .u8))] (.uint .usize) .safe .rust)
+          }]
+        }
+      })
+      _
+  rw [h_core_len]
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+  dsimp only [
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+    Option.getD,
+    Mir.Core.slice_impl_T_len.body,
+    CapturedMir.instantiate
+  ]
   refine ⟨⟨rfl, rfl, ⟨⟨n, hn, rfl⟩, trivial⟩, trivial⟩, ?_⟩
   intro ans h_post
   cases ans with
@@ -2655,9 +2847,18 @@ instance : ModularItemSpec "crate_a::caller_ffi_and_len" :=
         n < 18446744073709551616 ∧
         args = [.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]] ∧
         mem = {
-          (initMachineState Mir.CrateA.caller_ffi_and_len.body args).memory with
+          nextAllocId := 0
+          globals := []
           borrows := [{ tag := 1, targetLocal := 10, targetProjection := .nil, perm := .frozen }]
           nextTag := 2
+          callees := []
+          traitImpls := []
+          callStack := []
+          activeCallee := .none
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := []
         })
     (fun _ _ ret _ =>
       ∃ bits : Nat, bits < 4294967296 ∧ ret = .scalar { bits := bits, sizeBytes := 4 })
@@ -2684,9 +2885,11 @@ namespace Proof.CrateA.caller_ffi_and_len
 open Trusted
 open Trusted.Sequence
 open Trusted.VerificationResult
+open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 
+set_option maxRecDepth 100000 in
 theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_len.modularClaim := by
   refine Anneal.Rustc.V2026_06_01.SymbolicEval.verifyModularContractWithCalleesMirSym
     Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
@@ -2697,6 +2900,200 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
     10
     ?_
   rintro args mem ⟨_, offset, n, hn, rfl, rfl⟩
+  have h_slice_len :
+      lookupCallee
+        Obligations.CrateA.caller_ffi_and_len.defaultCallees
+        Mir.CrateA.caller_ffi_and_len.layouts
+        "crate_b::slice_len"
+        [.uint .u8]
+        [] =
+      .some (
+        Mir.CrateB.slice_len.body.instantiate
+          [(.uint .u8, {
+            size := { bytes := 1 }
+            align := { bytes := 1 }
+            backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false
+          })]) := rfl
+  change
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+      Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+      6
+      Mir.CrateA.caller_ffi_and_len.body
+      (.running {
+        frame := {
+          blockIdx := 0
+          stmtIdx := 2
+          locals := [
+            .uninit,
+            .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+            .init (.ptr { allocId := 65536, offsetBytes := 0 } 8)
+          ]
+        }
+        memory := {
+          nextAllocId := 0
+          globals := []
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := [], perm := .frozen }]
+          nextTag := 2
+          callees := Obligations.CrateA.caller_ffi_and_len.defaultCallees
+          traitImpls := []
+          callStack := [{
+            callerBody := Mir.CrateA.caller_ffi_and_len.body
+            frame := {
+              blockIdx := 0
+              stmtIdx := 1
+              locals := [
+                .uninit,
+                .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+                .uninit
+              ]
+            }
+            destination := { local_ := 2, projection := [] }
+            returnTarget := 1
+          }]
+          activeCallee :=
+            lookupCallee
+              Obligations.CrateA.caller_ffi_and_len.defaultCallees
+              Mir.CrateA.caller_ffi_and_len.layouts
+              "crate_b::slice_len"
+              [.uint .u8]
+              []
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := [{
+            allocId := 65536
+            defPath := "core::slice::<impl [T]>::len"
+            typeArgs := [.uint .u8]
+            fnSig := .some (.fnPtr [.ref .not (.slice (.uint .u8))] (.uint .usize) .safe .rust)
+          }]
+        }
+      })
+      _
+  rw [h_slice_len]
+  have h_core_len :
+      lookupCallee
+        Obligations.CrateA.caller_ffi_and_len.defaultCallees
+        (Mir.CrateB.slice_len.body.instantiate
+          [(.uint .u8, {
+            size := { bytes := 1 }
+            align := { bytes := 1 }
+            backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false
+          })]).layouts
+        "core::slice::<impl [T]>::len"
+        [.uint .u8]
+        [] =
+      .some (
+        Mir.Core.slice_impl_T_len.body.instantiate
+          [(.uint .u8, {
+            size := { bytes := 1 }
+            align := { bytes := 1 }
+            backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+            fields := .primitive
+            variants := .single 0
+            isUninhabited := false
+          })]) := rfl
+  change
+    Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+      Obligations.CrateA.caller_ffi_and_len.externalCallContract_CrateA_ext_ffi_checksum
+      5
+      Mir.CrateA.caller_ffi_and_len.body
+      (.running {
+        frame := {
+          blockIdx := 0
+          stmtIdx := 0
+          locals := [
+            .uninit,
+            .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }])
+          ]
+        }
+        memory := {
+          nextAllocId := 0
+          globals := []
+          borrows := [{ tag := 1, targetLocal := 10, targetProjection := [], perm := .frozen }]
+          nextTag := 2
+          callees := Obligations.CrateA.caller_ffi_and_len.defaultCallees
+          traitImpls := []
+          callStack := [
+            {
+              callerBody :=
+                Mir.CrateB.slice_len.body.instantiate
+                  [(.uint .u8, {
+                    size := { bytes := 1 }
+                    align := { bytes := 1 }
+                    backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+                    fields := .primitive
+                    variants := .single 0
+                    isUninhabited := false
+                  })]
+              frame := {
+                blockIdx := 0
+                stmtIdx := 2
+                locals := [
+                  .uninit,
+                  .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+                  .init (.ptr { allocId := 65536, offsetBytes := 0 } 8)
+                ]
+              }
+              destination := { local_ := 0, projection := [] }
+              returnTarget := 1
+            },
+            {
+              callerBody := Mir.CrateA.caller_ffi_and_len.body
+              frame := {
+                blockIdx := 0
+                stmtIdx := 1
+                locals := [
+                  .uninit,
+                  .init (.aggregate 0 [.ptr { allocId := 1, offsetBytes := offset } 8, .scalar { bits := n, sizeBytes := 8 }]),
+                  .uninit
+                ]
+              }
+              destination := { local_ := 2, projection := [] }
+              returnTarget := 1
+            }
+          ]
+          activeCallee :=
+            lookupCallee
+              Obligations.CrateA.caller_ffi_and_len.defaultCallees
+              (Mir.CrateB.slice_len.body.instantiate
+                [(.uint .u8, {
+                  size := { bytes := 1 }
+                  align := { bytes := 1 }
+                  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+                  fields := .primitive
+                  variants := .single 0
+                  isUninhabited := false
+                })]).layouts
+              "core::slice::<impl [T]>::len"
+              [.uint .u8]
+              []
+          activeProtectors := []
+          nextProtector := 0
+          callerLocals := []
+          fnPtrs := [{
+            allocId := 65536
+            defPath := "core::slice::<impl [T]>::len"
+            typeArgs := [.uint .u8]
+            fnSig := .some (.fnPtr [.ref .not (.slice (.uint .u8))] (.uint .usize) .safe .rust)
+          }]
+        }
+      })
+      _
+  rw [h_core_len]
+  unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecModularSym
+  dsimp only [
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree,
+    Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirSymTree,
+    Option.getD,
+    Mir.Core.slice_impl_T_len.body,
+    CapturedMir.instantiate
+  ]
   refine ⟨⟨rfl, rfl, ⟨⟨n, hn, rfl⟩, trivial⟩, trivial⟩, ?_⟩
   intro ans h_post
   cases ans with

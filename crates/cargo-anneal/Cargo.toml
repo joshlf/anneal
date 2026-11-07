@@ -1,5 +1,7 @@
 [package]
 name = "cargo-anneal"
+# FIXME(#87): We must address all blockers listed in #87 before permitting
+# stable releases.
 version = "0.1.0-alpha.1"
 edition = "2024"
 description = "Formally verify Rust programs in Lean 4."
@@ -36,3 +38,9 @@ url = "https://example.com/macos-aarch64.tar.zst"
 
 [dependencies]
 anneal-rustc-capture = { version = "0.1.0-alpha.1", path = "../../trusted/rustc-capture" }
+
+[dev-dependencies]
+anneal-trace = { path = "../anneal-trace" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(anneal_trace_ext)', 'cfg(anneal_mir_instrument)'] }

@@ -36,9 +36,8 @@ Finally, `advance_offset_holds_with_safety` unpacks `verified.proof` via
 -/
 
 theorem verified : VerificationResult Obligations.FrameTutor.advance_offset.claim :=
-  verifyByWPSafe
+  verifyByWPSafeFuelFree
     Obligations.FrameTutor.advance_offset.claim
-    16
     (by
       intro args h_safe
       cases h_safe with
@@ -46,8 +45,7 @@ theorem verified : VerificationResult Obligations.FrameTutor.advance_offset.clai
         subst h2
         exact fun _ =>
           And.intro
-            (mirBoolPredicateHolds_of_wp_bounded
-              128
+            (mirBoolPredicateHolds_of_wp_fuelFree
               Mir.FrameTutor.__anodized_fn_ensures_advance_offset.body
               (List.cons (.scalar { bits := 2, sizeBytes := 1 })
                 (List.cons (.scalar { bits := 6, sizeBytes := 1 }) List.nil))

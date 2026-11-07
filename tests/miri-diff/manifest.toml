@@ -82,12 +82,6 @@ category = "scalar_arithmetic"
 upstream_path = "tests/pass/intrinsics/integer.rs"
 miri_verdict = "pass:scalar:12:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "incompleteness_unmodeled_intrinsic_or_call"
-observed_anneal_tag = "externalCall:core::intrinsics::exact_div"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
-summary = "core::intrinsics::exact_div is emitted as a Call terminator rather than lowered to BinOp.div and is not yet interpreted natively by evalCallTerminator."
 
 [[tests]]
 name = "pass_int_widening_and_truncating_casts"
@@ -157,6 +151,7 @@ name = "ub_unchecked_add_overflow_u32"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_add1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:203:14"
 fuel = 128
 
 [[tests]]
@@ -164,6 +159,7 @@ name = "ub_unchecked_add_overflow_i32"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_add2.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:208:14"
 fuel = 128
 
 [[tests]]
@@ -171,6 +167,7 @@ name = "ub_unchecked_sub_underflow_u32"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_sub1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:213:14"
 fuel = 128
 
 [[tests]]
@@ -178,6 +175,7 @@ name = "ub_unchecked_mul_overflow_u16"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_mul1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:218:14"
 fuel = 128
 
 [[tests]]
@@ -185,6 +183,7 @@ name = "ub_unchecked_shl_overflow"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_shl.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:223:14"
 fuel = 128
 
 [[tests]]
@@ -192,6 +191,7 @@ name = "ub_unchecked_shr_overflow"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_shr.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:228:14"
 fuel = 128
 
 [[tests]]
@@ -199,6 +199,7 @@ name = "ub_unchecked_div_by_zero"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/div-by-zero.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:233:14"
 fuel = 128
 
 [[tests]]
@@ -206,6 +207,7 @@ name = "ub_unchecked_div_signed_min_overflow"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/unchecked_div1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:238:14"
 fuel = 128
 
 [[tests]]
@@ -213,6 +215,7 @@ name = "ub_unchecked_rem_by_zero"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/rem-by-zero.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:243:14"
 fuel = 128
 
 [[tests]]
@@ -220,13 +223,8 @@ name = "ub_exact_div_non_multiple"
 category = "scalar_arithmetic"
 upstream_path = "tests/fail/intrinsics/exact_div1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:248:14"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "incompleteness_unmodeled_intrinsic_or_call"
-observed_anneal_tag = "externalCall:core::intrinsics::exact_div"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Terminators"
-summary = "core::intrinsics::exact_div is not yet modeled in evalCallTerminator, so non-multiple division halts on externalCall instead of faulting with FailureKind.ub."
 
 [[tests]]
 name = "pass_bool_transmute_valid"
@@ -268,6 +266,7 @@ name = "ub_transmute_invalid_bool"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_bool.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:294:28"
 fuel = 128
 
 [[tests]]
@@ -275,6 +274,7 @@ name = "ub_transmute_invalid_char_surrogate"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_char.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:300:28"
 fuel = 128
 
 [[tests]]
@@ -282,6 +282,7 @@ name = "ub_transmute_invalid_char_out_of_range"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_char.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:306:28"
 fuel = 128
 
 [[tests]]
@@ -289,6 +290,7 @@ name = "ub_transmute_invalid_enum_tag"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/invalid_enum_tag.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:312:32"
 fuel = 128
 
 [[tests]]
@@ -296,6 +298,7 @@ name = "ub_transmute_invalid_bool_through_ptr"
 category = "type_validity_and_transmute"
 upstream_path = "tests/fail/validity/transmute_through_ptr.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:323:5"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
@@ -317,18 +320,13 @@ category = "uninit_and_padding"
 upstream_path = "tests/pass/move-uninit-primval.rs"
 miri_verdict = "pass:scalar:5:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "Union storage for Uninit<[u8; 4]> is represented as a 1-field unit aggregate rather than raw byte/variant storage, causing copy_nonoverlapping and field assignment on union fields to fault with FailureKind.ub."
 
 [[tests]]
 name = "ub_read_uninit_u32"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/validity/uninit_integer.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:357:14"
 fuel = 128
 
 [[tests]]
@@ -336,6 +334,7 @@ name = "ub_read_uninit_bool"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/validity/invalid_bool_uninit.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:363:14"
 fuel = 128
 
 [[tests]]
@@ -343,6 +342,7 @@ name = "ub_read_uninit_byte_from_array"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/uninit/uninit_byte_read.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:369:14"
 fuel = 128
 
 [[tests]]
@@ -350,6 +350,7 @@ name = "ub_read_struct_padding_byte"
 category = "uninit_and_padding"
 upstream_path = "tests/fail/uninit/padding-struct.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:378:35"
 fuel = 128
 
 [[tests]]
@@ -388,10 +389,10 @@ miri_verdict = "pass:scalar:300:4"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
-bug_class = "completeness_wrong_return_value"
-observed_anneal_tag = "pass:scalar:100:4"
+bug_class = "completeness_false_positive_ub"
+observed_anneal_tag = "ub"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "BinOp.offset updates ProvenancePtr.offsetBytes without updating BorrowEntry.targetProjection, and readPlace ignores ptr.offsetBytes when dereferencing ProvenancePtr, reading field 0 (100) instead of field 1 (300)."
+summary = "Cross-struct-field pointer offset (`offset(&raw const pair.a, 1)`) leaves BorrowEntry.targetProjection pointing to field 0 (`pair.a`), so `resolveStackThinPtrTargetProj?` fails closed with FailureKind.ub on `*p1` instead of resolving adjacent field 1 (`pair.b = 300`)."
 
 [[tests]]
 name = "pass_subslice_pattern_extract"
@@ -412,6 +413,7 @@ name = "ub_deref_null_ptr_read"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/null_pointer_deref.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:445:14"
 fuel = 128
 
 [[tests]]
@@ -419,6 +421,7 @@ name = "ub_deref_null_ptr_write"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/null_pointer_write.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:452:9"
 fuel = 128
 
 [[tests]]
@@ -426,6 +429,7 @@ name = "ub_deref_dead_local_ptr"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/storage_dead_dangling.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:462:14"
 fuel = 128
 
 [[tests]]
@@ -433,52 +437,46 @@ name = "ub_ptr_offset_oob_read"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/out_of_bounds_read.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:471:9"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:scalar:10:4"
+bug_class = "ub_location_mismatch"
+observed_anneal_tag = "ub"
+observed_anneal_ub_span = "src/lib.rs:470:19: 470:39"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "BinOp.offset does not check allocation bounds and readPlace ignores ProvenancePtr.offsetBytes, returning field 0 (10) instead of faulting with FailureKind.ub on an out-of-bounds pointer read."
+summary = "ptrAllocByteBound? bounds-checks `&raw const pair.a` against field `a`'s 4-byte span rather than the enclosing 8-byte `PairU32` allocation, faulting with FailureKind.ub on `offset(base, 2isize)` instead of `*oob`."
 
 [[tests]]
 name = "ub_ptr_offset_oob_write"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/dangling_pointers/out_of_bounds_write.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:481:9"
 fuel = 128
 [tests.known_anneal_bug]
 status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:unit"
+bug_class = "ub_location_mismatch"
+observed_anneal_tag = "ub"
+observed_anneal_ub_span = "src/lib.rs:480:19: 480:39"
 suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "BinOp.offset does not check allocation bounds and writePlaceValue ignores ProvenancePtr.offsetBytes, overwriting field 0 instead of faulting with FailureKind.ub on an out-of-bounds pointer write."
+summary = "ptrAllocByteBound? bounds-checks `&raw mut pair.a` against field `a`'s 4-byte span rather than the enclosing 8-byte `PairU32` allocation, faulting with FailureKind.ub on `offset(base, 2isize)` instead of `*oob = 99`."
 
 [[tests]]
 name = "ub_ptr_offset_negative_before_start"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/intrinsics/ptr_offset_out_of_bounds_neg.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:490:22"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:scalar:10:4"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Operands"
-summary = "BinOp.offset wraps negative isize offsets in unsigned modular arithmetic without checking allocation bounds, and readPlace ignores ProvenancePtr.offsetBytes instead of faulting with FailureKind.ub."
 
 [[tests]]
 name = "ub_unaligned_ptr_read_u32"
 category = "places_projections_and_pointers"
 upstream_path = "tests/fail/unaligned_pointers/unaligned_ptr1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:504:9"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:scalar:67305985:4"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "readPlace ignores ProvenancePtr.offsetBytes (1 byte) and does not check pointer alignment against the target type layout alignment (4 bytes for u32), returning field 0 instead of faulting with FailureKind.ub."
 
 [[tests]]
 name = "pass_assume_true"
@@ -506,6 +504,7 @@ name = "ub_assume_false"
 category = "intrinsics"
 upstream_path = "tests/fail/intrinsics/assume.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:545:9"
 fuel = 128
 
 [[tests]]
@@ -513,6 +512,7 @@ name = "ub_copy_nonoverlapping_overlapping"
 category = "intrinsics"
 upstream_path = "tests/fail/intrinsics/copy_overlapping.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:555:9"
 fuel = 128
 
 [[tests]]
@@ -520,6 +520,7 @@ name = "ub_unreachable_executed"
 category = "intrinsics"
 upstream_path = "tests/fail/unreachable.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:562:14"
 fuel = 128
 
 [[tests]]
@@ -542,18 +543,13 @@ category = "tree_borrows"
 upstream_path = "tests/pass/both_borrows/interior_mutability.rs"
 miri_verdict = "pass:scalar:42:4"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "completeness_false_positive_ub"
-observed_anneal_tag = "ub"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Memory"
-summary = "BorrowKind.shared unconditionally assigns Tree Borrows Permission.frozen without checking whether the pointee type contains UnsafeCell (!Freeze), rejecting valid interior-mutable writes with FailureKind.ub."
 
 [[tests]]
 name = "ub_tb_use_frozen_mut_after_parent_read"
 category = "tree_borrows"
 upstream_path = "tests/fail/both_borrows/outdated_local.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:607:5"
 fuel = 128
 
 [[tests]]
@@ -561,6 +557,7 @@ name = "ub_tb_write_through_shared_ref_cast_mut"
 category = "tree_borrows"
 upstream_path = "tests/fail/both_borrows/shr_frozen_violation1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:617:9"
 fuel = 128
 
 [[tests]]
@@ -568,6 +565,7 @@ name = "ub_tb_conflicting_active_mut_borrows"
 category = "tree_borrows"
 upstream_path = "tests/fail/both_borrows/aliasing_mut1.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:631:5"
 fuel = 128
 
 [[tests]]
@@ -575,6 +573,28 @@ name = "ub_tb_parent_write_disables_shared_ref"
 category = "tree_borrows"
 upstream_path = "tests/fail/tree_borrows/parent_read_freezes_raw_mut.rs"
 miri_verdict = "ub"
+miri_ub_span = "src/lib.rs:642:5"
+fuel = 128
+
+[[tests]]
+name = "tb_child_write_then_parent_read"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reserved.rs"
+miri_verdict = "pass:scalar:1:4"
+fuel = 128
+
+[[tests]]
+name = "tb_child_write_then_parent_write"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reserved.rs"
+miri_verdict = "pass:scalar:3:4"
+fuel = 128
+
+[[tests]]
+name = "safe_reborrow_then_parent_write"
+category = "tree_borrows"
+upstream_path = "tests/pass/tree_borrows/reborrow-is-read.rs"
+miri_verdict = "pass:scalar:7:4"
 fuel = 128
 
 [[tests]]
