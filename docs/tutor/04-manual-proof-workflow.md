@@ -110,10 +110,8 @@ open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
 theorem verified : VerificationResult Obligations.FrameTutor.pin_magic.claim :=
-  dischargeRustEqU32
+  dischargeRustEqU32FuelFree
     Obligations.FrameTutor.pin_magic.claim
-    4
-    64
     Mir.FrameTutor.__anodized_fn_requires_pin_magic.body
     Mir.FrameTutor.__anodized_fn_ensures_pin_magic.body
     7
@@ -183,10 +181,8 @@ open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
 theorem verified : VerificationResult Obligations.FrameTutor.total_frame_len.claim :=
-  dischargeRustEq2U8
+  dischargeRustEq2U8FuelFree
     Obligations.FrameTutor.total_frame_len.claim
-    16
-    64
     Mir.FrameTutor.__anodized_fn_requires_total_frame_len.body
     Mir.FrameTutor.__anodized_fn_ensures_total_frame_len.body
     1
@@ -308,9 +304,8 @@ open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Specs.FrameTutor.advance_offset
 
 theorem verified : VerificationResult Obligations.FrameTutor.advance_offset.claim :=
-  verifyByWPSafe
+  verifyByWPSafeFuelFree
     Obligations.FrameTutor.advance_offset.claim
-    16
     (by
       intro args h_safe
       cases h_safe with
@@ -318,8 +313,7 @@ theorem verified : VerificationResult Obligations.FrameTutor.advance_offset.clai
         subst h2
         exact fun _ =>
           And.intro
-            (mirBoolPredicateHolds_of_wp_bounded
-              128
+            (mirBoolPredicateHolds_of_wp_fuelFree
               Mir.FrameTutor.__anodized_fn_ensures_advance_offset.body
               (List.cons (.scalar { bits := 2, sizeBytes := 1 })
                 (List.cons (.scalar { bits := 6, sizeBytes := 1 }) List.nil))

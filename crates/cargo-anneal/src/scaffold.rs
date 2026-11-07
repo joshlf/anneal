@@ -176,6 +176,31 @@ pub fn scaffold_init_spec_templates(
     Ok(report.created_spec_files)
 }
 
+fn has_lean_ident_token(src: &str, ident: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(rel) = src[offset..].find(ident) {
+        let pos = offset + rel;
+        let prev_ok = !src[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(crate::agent::is_lean_ident_char);
+        let after_pos = pos + ident.len();
+        let next_ok = !src[after_pos..]
+            .chars()
+            .next()
+            .is_some_and(crate::agent::is_lean_ident_char);
+        if prev_ok && next_ok {
+            return true;
+        }
+        offset = pos + 1;
+    }
+    false
+}
+
+fn has_any_lean_ident_token(src: &str, idents: &[&str]) -> bool {
+    idents.iter().any(|id| has_lean_ident_token(src, id))
+}
+
 /// Inspect `anneal/proofs/` on disk to determine which authored modules exist
 /// for `item_rel_path`.
 pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) -> AuthoredItemModules {
@@ -187,88 +212,128 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
     let spec_text = if has_specs {
         fs::read_to_string(&spec_path)
             .ok()
-            .map(|raw| crate::agent::strip_lean_comments(&raw))
+            .map(|raw| strip_lean_comments_and_strings(&raw))
     } else {
         None
     };
-    let has_legacy_specs_defs = spec_text
-        .as_deref()
-        .is_some_and(|text| !text.contains("ItemSpec") && !text.contains("import Obligations."));
+    let has_legacy_specs_defs = spec_text.as_deref().is_some_and(|text| {
+        !has_any_lean_ident_token(
+            text,
+            &[
+                "ItemSpec",
+                "StatefulItemSpec",
+                "TotalItemSpec",
+                "StatefulEquivItemSpec",
+                "ModularItemSpec",
+                "UbExceptionItemSpec",
+            ],
+        ) && !text.contains("import Obligations.")
+    });
 
     let has_proof = proof_path.is_file();
     let proof_text = if has_proof {
         fs::read_to_string(&proof_path)
             .ok()
-            .map(|raw| crate::agent::strip_lean_comments(&raw))
+            .map(|raw| strip_lean_comments_and_strings(&raw))
     } else {
         None
     };
 
     let spec_is_ub_exception = spec_text.as_deref().is_some_and(|text| {
-        text.contains("UbExceptionItemSpec") || text.contains("refineUbExceptionSpec")
+        has_any_lean_ident_token(text, &["UbExceptionItemSpec", "refineUbExceptionSpec"])
     });
     let spec_is_modular = spec_text.as_deref().is_some_and(|text| {
-        text.contains("ModularItemSpec") || text.contains("refineModularSpec")
+        has_any_lean_ident_token(text, &["ModularItemSpec", "refineModularSpec"])
     });
 
     let is_ub_exception = !spec_is_modular
         && (spec_is_ub_exception
             || proof_text.as_deref().is_some_and(|text| {
-                text.contains("UbExceptionVerificationResult")
-                    || text.contains("UbExceptionItemProof")
-                    || ((text.contains("ubExceptionClaim")
-                        || text.contains("polyUbExceptionClaim"))
-                        && !text.contains("ModularVerificationResult"))
+                has_any_lean_ident_token(
+                    text,
+                    &["UbExceptionVerificationResult", "UbExceptionItemProof"],
+                ) || (has_any_lean_ident_token(text, &["ubExceptionClaim", "polyUbExceptionClaim"])
+                    && !has_lean_ident_token(text, "ModularVerificationResult"))
             }));
 
     let is_modular = !is_ub_exception
         && (spec_is_modular
             || proof_text.as_deref().is_some_and(|text| {
-                text.contains("modularClaim")
-                    || text.contains("polyModularClaim")
-                    || text.contains("ModularVerificationResult")
-                    || text.contains("ModularItemProof")
+                has_any_lean_ident_token(
+                    text,
+                    &[
+                        "modularClaim",
+                        "polyModularClaim",
+                        "ModularVerificationResult",
+                        "ModularItemProof",
+                    ],
+                )
             }));
 
     let is_equiv = !is_ub_exception
         && !is_modular
         && (spec_text.as_deref().is_some_and(|text| {
-            text.contains("StatefulEquivItemSpec") || text.contains("refineEquivSpec")
+            has_any_lean_ident_token(text, &["StatefulEquivItemSpec", "refineEquivSpec"])
         }) || proof_text.as_deref().is_some_and(|text| {
-            text.contains("equivClaim")
-                || text.contains("StatefulEquivVerificationResult")
-                || text.contains("StatefulEquivItemProof")
+            has_any_lean_ident_token(
+                text,
+                &[
+                    "equivClaim",
+                    "StatefulEquivVerificationResult",
+                    "StatefulEquivItemProof",
+                ],
+            )
         }));
 
     let is_total = !is_ub_exception
         && !is_modular
         && !is_equiv
         && (spec_text.as_deref().is_some_and(|text| {
-            text.contains("TotalItemSpec") || text.contains("refineTotalSpec")
+            has_any_lean_ident_token(text, &["TotalItemSpec", "refineTotalSpec"])
         }) || proof_text.as_deref().is_some_and(|text| {
-            text.contains("totalClaim")
-                || text.contains("polyTotalClaim")
-                || text.contains("TotalVerificationResult")
-                || text.contains("TotalItemProof")
+            has_any_lean_ident_token(
+                text,
+                &[
+                    "totalClaim",
+                    "polyTotalClaim",
+                    "TotalVerificationResult",
+                    "TotalItemProof",
+                ],
+            )
         }));
 
     let spec_is_stateful = spec_text.as_deref().is_some_and(|text| {
-        text.contains("StatefulItemSpec")
-            || text.contains("refineStatefulSpec")
-            || text.contains("refineSafeStatefulSpec")
+        has_any_lean_ident_token(
+            text,
+            &[
+                "StatefulItemSpec",
+                "refineStatefulSpec",
+                "refineSafeStatefulSpec",
+            ],
+        )
     });
     let proof_is_stateful = proof_text.as_deref().is_some_and(|text| {
-        text.contains("statefulClaim")
-            || text.contains("polyStatefulClaim")
-            || text.contains("StatefulVerificationResult")
-            || text.contains("StatefulItemProof")
+        has_any_lean_ident_token(
+            text,
+            &[
+                "statefulClaim",
+                "polyStatefulClaim",
+                "StatefulVerificationResult",
+                "StatefulItemProof",
+            ],
+        )
     });
     let is_polymorphic = proof_text.as_deref().is_some_and(|text| {
-        text.contains("polyClaim")
-            || text.contains("polyStatefulClaim")
-            || text.contains("polyTotalClaim")
-            || text.contains("polyModularClaim")
-            || text.contains("polyUbExceptionClaim")
+        has_any_lean_ident_token(
+            text,
+            &[
+                "polyClaim",
+                "polyStatefulClaim",
+                "polyTotalClaim",
+                "polyModularClaim",
+                "polyUbExceptionClaim",
+            ],
+        )
     });
 
     AuthoredItemModules {
@@ -516,26 +581,16 @@ pub(crate) fn populate_called_callees(
         trusted_callees: &trusted_callees_by_def_id,
     };
 
-    let fallback_cfg = mir_root
-        .parent()
-        .and_then(|g| g.parent())
-        .and_then(|d| d.parent())
-        .map(ScaffoldConfig::new);
-
     let mut outgoing_cache: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     let mut read_outgoing = |rel_path: &Path| -> Vec<String> {
         if let Some(cached) = outgoing_cache.get(rel_path) {
             return cached.clone();
         }
-        let mir_path = mir_root.join(rel_path);
-        let resolved_path = if mir_path.is_file() {
-            Some(mir_path)
-        } else if let Some(ref cfg) = fallback_cfg
-            && let Some(rec) = record_by_rel_path.get(rel_path)
-        {
-            find_source_mir_file(cfg, rec, rel_path)
+        let resolved_path = if let Some(rec) = record_by_rel_path.get(rel_path) {
+            resolve_workspace_mir_file(mir_root, rec, rel_path)
         } else {
-            None
+            let mir_path = mir_root.join(rel_path);
+            mir_path.is_file().then_some(mir_path)
         };
         let refs = resolved_path
             .and_then(|p| fs::read_to_string(p).ok())
@@ -726,15 +781,11 @@ pub fn scaffold_workspace_with_config(
             report.created_spec_files.push(spec_path);
         }
 
-        let mut authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
-        if !authored.is_ub_exception
-            && !authored.is_modular
-            && bundle.rust_equiv_target_module_suffix().is_some()
-        {
-            authored.is_equiv = true;
-            authored.is_total = false;
-            authored.is_stateful = false;
-        }
+        let mut authored = effective_authored_for_bundle(
+            bundle,
+            detect_authored_item_modules(&proofs_root, &bundle.item_rel_path),
+            None,
+        );
 
         let proof_path = proof_root.join(&bundle.item_rel_path);
         if proof_path.exists() {
@@ -745,7 +796,9 @@ pub fn scaffold_workspace_with_config(
                     format!("failed to create directory {}: {}", parent.display(), err)
                 })?;
             }
-            let proof_contents = render_proof_template_with_options(bundle, authored);
+            let lifting_profile = analyze_workspace_lifting_profile(&mir_root, bundle);
+            let proof_contents =
+                render_proof_template_with_hints(bundle, authored, &lifting_profile);
             fs::write(&proof_path, proof_contents).map_err(|err| {
                 format!(
                     "failed to write proof template {}: {}",
@@ -754,15 +807,11 @@ pub fn scaffold_workspace_with_config(
                 )
             })?;
             report.created_proof_files.push(proof_path);
-            authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
-            if !authored.is_ub_exception
-                && !authored.is_modular
-                && bundle.rust_equiv_target_module_suffix().is_some()
-            {
-                authored.is_equiv = true;
-                authored.is_total = false;
-                authored.is_stateful = false;
-            }
+            authored = effective_authored_for_bundle(
+                bundle,
+                detect_authored_item_modules(&proofs_root, &bundle.item_rel_path),
+                None,
+            );
         }
 
         if bundle.has_rust_trusted_attr() && !authored.has_assumptions && !authored.has_proof {
@@ -938,6 +987,8 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
         };
         if !authored.is_ub_exception
             && !authored.is_modular
+            && !authored.has_proof
+            && !authored.has_specs
             && ob_text_opt
                 .as_deref()
                 .is_some_and(|t| t.contains("instance rustEquivSpec : StatefulEquivItemSpec"))
@@ -992,6 +1043,7 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
                 Some(&obligations_root),
             );
         }
+        authored = effective_authored_for_bundle(&synthetic_bundle, authored, None);
 
         let should_rerender_verify = authored.has_proof
             || authored.has_specs
@@ -1629,6 +1681,860 @@ fn resolve_lean_library_paths(config: &ScaffoldConfig) -> (String, String) {
     }
 
     ("../trusted/lean".to_string(), "../theory".to_string())
+}
+
+/// Static MIR and contract profile classifying which fuel-free lifting
+/// pattern(s) apply to a verification subject.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MirLiftingProfile {
+    /// Whether a captured `Mir/<Item>.lean` module containing a `CapturedMir`
+    /// `body` was available for inspection.
+    pub has_captured_mir: bool,
+    /// Number of basic blocks detected in `body.basicBlocks`.
+    pub basic_block_count: usize,
+    /// Number of generic type parameters (`typeParamCount`) declared on `body`.
+    pub type_param_count: usize,
+    /// Whether `body` dereferences a pointer or reference
+    /// (`ProjectionElem.deref`).
+    pub has_deref_projection: bool,
+    /// Whether `body` takes or forms an exclusive mutable reference
+    /// (`RigidTy.ref Mutability.mut` or `BorrowKind.mut`).
+    pub has_mut_borrow: bool,
+    /// Whether `body` contains memory-dependent operations (`Rvalue.ref`,
+    /// `Rvalue.rawPtr`, `CastKind.ptrToPtr`, `BinOp.offset`,
+    /// `ConstValue.indirect`, or `TerminatorKind.inlineAsm`) rejected by
+    /// `Anneal.PureMirExec.checkPureMir`.
+    pub has_impure_rvalue_or_asm: bool,
+    /// Whether `body` contains a `TerminatorKind.call` or `tailCall`.
+    pub has_call_terminator: bool,
+    /// Whether `body.basicBlocks` has a cyclic control-flow back-edge
+    /// (`bb_i -> bb_j` with `j <= i`), indicating a loop.
+    pub has_cfg_back_edge: bool,
+    /// Whether the bundle attaches inline `#[spec]` `requires` or `ensures`
+    /// boolean companion predicates.
+    pub has_inline_companions: bool,
+    /// Whether any inspected inline `#[spec]` companion body is impure under
+    /// `checkPureMir` (for example, closure-captured `&` upvars).
+    pub has_impure_inline_companions: bool,
+    /// Whether the bundle links concrete callees (`defaultCallees`) or assumes
+    /// modular call contracts (`#[external_spec]` or `#[spec(trusted)]`).
+    pub has_callees_or_modular_contracts: bool,
+}
+
+impl MirLiftingProfile {
+    /// Returns `true` when a captured MIR body was inspected and contains no
+    /// dereferences, memory-dependent rvalues/casts, or call terminators
+    /// (matching `Anneal.PureMirExec.checkPureMir body = true`).
+    pub fn is_pure_call_free_candidate(&self) -> bool {
+        self.has_captured_mir
+            && !self.has_deref_projection
+            && !self.has_impure_rvalue_or_asm
+            && !self.has_call_terminator
+    }
+
+    /// Returns `true` when a captured MIR body is alias-free (`checkPureMir`
+    /// statement/rvalue discipline) apart from function calls.
+    pub fn is_pure_with_callees_candidate(&self) -> bool {
+        self.has_captured_mir && !self.has_deref_projection && !self.has_impure_rvalue_or_asm
+    }
+}
+
+/// Normalize `authored` contract flags against Rust-level attributes on
+/// `bundle` for unauthored items without an existing `Proof/<Item>.lean` or
+/// overriding `Specs/<Item>.lean` (`#[spec(equivalent_to: ...)]`, modular
+/// callees, `#[spec(safe_total)]`, and generic `typeParamCount > 0`
+/// `poly*Claim` surfaces).
+///
+/// When `authored.has_proof` or `authored.has_specs` is `true`,
+/// `detect_authored_item_modules` has already inspected `Specs/<Item>.lean`
+/// and `Proof/<Item>.lean` (for example, distinguishing an `ItemSpec` override
+/// or a stateless `VerificationResult` proof via `rustSafeTotalSpec` on a
+/// `#[spec(safe_total, equivalent_to: ...)]` item), so Rust-attribute defaults
+/// and `is_polymorphic` are never forced over authored modules.
+pub(crate) fn effective_authored_for_bundle(
+    bundle: &SubjectObligationBundle,
+    mut authored: AuthoredItemModules,
+    unauthored_profile: Option<&MirLiftingProfile>,
+) -> AuthoredItemModules {
+    if !authored.is_ub_exception
+        && !authored.is_modular
+        && !authored.has_proof
+        && !authored.is_equiv
+        && !authored.has_specs
+    {
+        if bundle.rust_equiv_target_module_suffix().is_some() {
+            authored.is_equiv = true;
+            authored.is_total = false;
+            authored.is_stateful = false;
+        } else if !authored.is_stateful {
+            if !bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty() {
+                authored.is_modular = true;
+            } else if bundle.has_rust_safe_total_attr() {
+                authored.is_total = true;
+            }
+        }
+    }
+    if !authored.has_proof
+        && !authored.is_equiv
+        && unauthored_profile.is_some_and(|p| p.type_param_count > 0)
+    {
+        authored.is_polymorphic = true;
+    }
+    authored
+}
+
+/// Resolve `rel_item_path` under `mir_root` (`.anneal/generated/Mir`) when its
+/// content matches `record.target.mir_module_sha256` (or no expected SHA is
+/// recorded), falling back to `find_source_mir_file` in
+/// `<workspace>/target/anneal/units` when `.anneal/generated/Mir` is absent or
+/// holds a stale/stub file superseded by a newer unit capture.
+pub(crate) fn resolve_workspace_mir_file(
+    mir_root: &Path,
+    record: &UnitTargetRecord,
+    rel_item_path: &Path,
+) -> Option<PathBuf> {
+    let direct = mir_root.join(rel_item_path);
+    let expected_sha = &record.target.mir_module_sha256;
+    let direct_exists = direct.is_file();
+    if direct_exists
+        && (expected_sha.is_empty()
+            || fs::read(&direct)
+                .ok()
+                .is_some_and(|bytes| &sha256_hex(&bytes) == expected_sha))
+    {
+        return Some(direct);
+    }
+    let fallback_cfg = mir_root
+        .parent()
+        .and_then(|g| g.parent())
+        .and_then(|d| d.parent())
+        .map(ScaffoldConfig::new);
+    if let Some(cfg) = fallback_cfg
+        && let Some(unit_path) = find_source_mir_file(&cfg, record, rel_item_path)
+        && (!direct_exists
+            || (!expected_sha.is_empty()
+                && fs::read(&unit_path)
+                    .ok()
+                    .is_some_and(|bytes| &sha256_hex(&bytes) == expected_sha)))
+    {
+        return Some(unit_path);
+    }
+    direct_exists.then_some(direct)
+}
+
+/// Inspect `mir_root` on disk (with fallback to `target/anneal/units`) for
+/// `bundle`'s subject and inline companion MIR modules and compute its
+/// `MirLiftingProfile`.
+pub fn analyze_workspace_lifting_profile(
+    mir_root: &Path,
+    bundle: &SubjectObligationBundle,
+) -> MirLiftingProfile {
+    let subj_mir = resolve_workspace_mir_file(mir_root, &bundle.subject, &bundle.item_rel_path)
+        .and_then(|p| fs::read_to_string(p).ok());
+    let mut comp_mirs = Vec::new();
+    for comp in bundle.inline_requires.iter().chain(&bundle.inline_ensures) {
+        let rel = module_suffix_to_rel_path(&derive_item_module_suffix(comp));
+        if let Some(txt) =
+            resolve_workspace_mir_file(mir_root, comp, &rel).and_then(|p| fs::read_to_string(p).ok())
+        {
+            comp_mirs.push(txt);
+        }
+    }
+    let comp_refs: Vec<&str> = comp_mirs.iter().map(String::as_str).collect();
+    analyze_mir_lifting_profile(bundle, subj_mir.as_deref(), &comp_refs)
+}
+
+/// Compute a `MirLiftingProfile` from `bundle`, optional subject MIR Lean text,
+/// and any available inline companion MIR Lean texts.
+pub fn analyze_mir_lifting_profile(
+    bundle: &SubjectObligationBundle,
+    subject_mir_text: Option<&str>,
+    companion_mir_texts: &[&str],
+) -> MirLiftingProfile {
+    let mut profile = MirLiftingProfile {
+        has_inline_companions: !bundle.inline_requires.is_empty()
+            || !bundle.inline_ensures.is_empty(),
+        has_callees_or_modular_contracts: !bundle.transitive_callees.is_empty()
+            || !bundle.external_spec_callees.is_empty()
+            || !bundle.called_callees.is_empty(),
+        ..MirLiftingProfile::default()
+    };
+
+    if let Some(mir_src) = subject_mir_text {
+        let scan = scan_captured_mir_body(mir_src);
+        profile.has_captured_mir = scan.has_body;
+        profile.basic_block_count = scan.basic_block_count;
+        profile.type_param_count = scan.type_param_count;
+        profile.has_deref_projection = scan.has_deref_projection;
+        profile.has_mut_borrow = scan.has_mut_borrow;
+        profile.has_impure_rvalue_or_asm = scan.has_impure_rvalue_or_asm;
+        profile.has_call_terminator = scan.has_call_terminator;
+        profile.has_cfg_back_edge = scan.has_cfg_back_edge;
+    }
+
+    for comp_src in companion_mir_texts {
+        let comp_scan = scan_captured_mir_body(comp_src);
+        if comp_scan.has_body
+            && (comp_scan.has_deref_projection
+                || comp_scan.has_impure_rvalue_or_asm
+                || comp_scan.has_call_terminator)
+        {
+            profile.has_impure_inline_companions = true;
+        }
+    }
+
+    profile
+}
+
+#[derive(Default)]
+struct MirBodyScan {
+    has_body: bool,
+    basic_block_count: usize,
+    type_param_count: usize,
+    has_deref_projection: bool,
+    has_mut_borrow: bool,
+    has_impure_rvalue_or_asm: bool,
+    has_call_terminator: bool,
+    has_cfg_back_edge: bool,
+}
+
+fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
+    let clean = strip_lean_comments_and_strings(mir_src);
+    let body_clean = match clean.find("def body : CapturedMir") {
+        Some(idx) => &clean[idx..],
+        None => clean.as_str(),
+    };
+    let Some(bb) = body_clean.find("basicBlocks :=") else {
+        return MirBodyScan::default();
+    };
+    let type_param_count = body_clean[..bb]
+        .find("typeParamCount :=")
+        .and_then(|idx| {
+            body_clean[idx + "typeParamCount :=".len()..bb]
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+                .and_then(|s| s.parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    let local_decls_slice = if let Some(ld) = body_clean.find("localDecls :=") {
+        let after_ld = &body_clean[ld..];
+        let end_idx = ["basicBlocks :=", "fnAbi :=", "layouts :=", "allocations :="]
+            .iter()
+            .filter_map(|kw| after_ld.find(kw))
+            .min()
+            .unwrap_or(after_ld.len());
+        &after_ld[..end_idx]
+    } else {
+        ""
+    };
+    let after_bb = &body_clean[bb..];
+    let end_idx = ["fnAbi :=", "layouts :=", "allocations :="]
+        .iter()
+        .filter_map(|kw| after_bb.find(kw))
+        .min()
+        .unwrap_or(after_bb.len());
+    let blocks_slice = &after_bb[..end_idx];
+
+    let norm_decls = normalize_parens_and_ws(local_decls_slice);
+    let norm_blocks = normalize_parens_and_ws(blocks_slice);
+
+    let has_deref_projection = has_dotted_ctor(&norm_blocks, "deref");
+    let decls_have_mut_ref = norm_decls.contains("RigidTy.ref Mutability.mut")
+        || norm_decls.contains(".ref Mutability.mut")
+        || norm_decls.contains("RigidTy.ref .mut ")
+        || norm_decls.contains(".ref .mut ");
+    let blocks_have_mut_borrow = norm_blocks.contains("BorrowKind.mut")
+        || norm_blocks.contains("Rvalue.ref .mut ")
+        || norm_blocks.contains(" .ref .mut true ")
+        || norm_blocks.contains(" .ref .mut false ")
+        || norm_blocks.contains(" .ref .mut Bool.true ")
+        || norm_blocks.contains(" .ref .mut Bool.false ");
+    let has_mut_borrow = blocks_have_mut_borrow || (has_deref_projection && decls_have_mut_ref);
+
+    let has_rvalue_ref_or_raw = norm_blocks.contains("Rvalue.ref ")
+        || norm_blocks.contains("Rvalue.rawPtr ")
+        || norm_blocks.contains("BorrowKind.shared")
+        || norm_blocks.contains("BorrowKind.mut")
+        || has_shorthand_rvalue_ref_or_rawptr(&norm_blocks);
+    let has_impure_intrinsic = norm_blocks
+        .match_indices("StatementKind.intrinsic ")
+        .chain(norm_blocks.match_indices(" .intrinsic "))
+        .any(|(idx, pat)| {
+            let after = norm_blocks[idx + pat.len()..].trim_start();
+            !after.starts_with("NonDivergingIntrinsic.assume") && !after.starts_with(".assume")
+        });
+    let has_impure_const_slice_ptr = norm_blocks.contains("ConstValue.slice ConstScalar.ptr")
+        || norm_blocks.contains(".slice ConstScalar.ptr")
+        || norm_blocks.contains("ConstValue.slice .ptr")
+        || norm_blocks.contains(".slice .ptr");
+    let has_impure_rvalue_or_asm = has_rvalue_ref_or_raw
+        || has_impure_intrinsic
+        || has_impure_const_slice_ptr
+        || [
+            "unwrapUnsafeBinder",
+            "threadLocalRef",
+            "shallowInitBox",
+            "copyForDeref",
+            "BinOp.offset",
+            "pointerCoercion",
+            "fnPtrToPtr",
+            "ptrToPtr",
+            "ConstValue.indirect",
+            "retag",
+            "backwardIncompatibleDropHint",
+            "inlineAsm",
+        ]
+        .iter()
+        .any(|tok| has_dotted_ctor(&norm_blocks, tok) || norm_blocks.contains(tok))
+        || has_dotted_ctor(&norm_blocks, "offset")
+        || has_dotted_ctor(&norm_blocks, "indirect");
+
+    let has_call_terminator = has_dotted_ctor(&norm_blocks, "call")
+        || has_dotted_ctor(&norm_blocks, "tailCall")
+        || norm_blocks.contains("TerminatorKind.call ")
+        || norm_blocks.contains("TerminatorKind.tailCall ");
+
+    let (basic_block_count, has_cfg_back_edge) = detect_blocks_and_back_edges(blocks_slice);
+
+    MirBodyScan {
+        has_body: true,
+        basic_block_count,
+        type_param_count,
+        has_deref_projection,
+        has_mut_borrow,
+        has_impure_rvalue_or_asm,
+        has_call_terminator,
+        has_cfg_back_edge,
+    }
+}
+
+/// Strip Lean `--` line comments, nested `/- ... -/` block comments, and
+/// `"..."` string literal payloads in a single lexical pass so comment markers
+/// inside string literals (`"--"` or `"/-"`) cannot truncate strings and quotes
+/// inside comments cannot invert string literal polarity.
+fn strip_lean_comments_and_strings(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut block_depth = 0usize;
+    let mut in_str = false;
+    let mut prev_ch: Option<char> = None;
+
+    while i < bytes.len() {
+        if block_depth > 0 {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
+                block_depth += 1;
+                i += 2;
+            } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'/' {
+                block_depth -= 1;
+                i += 2;
+                if block_depth == 0 {
+                    out.push(' ');
+                    prev_ch = None;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if in_str {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if let Some(ch) = src[i..].chars().next() {
+                    i += ch.len_utf8();
+                }
+            } else if bytes[i] == b'"' {
+                in_str = false;
+                out.push_str("\"\"");
+                i += 1;
+                prev_ch = None;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'"' {
+            in_str = true;
+            i += 1;
+            prev_ch = None;
+            continue;
+        }
+
+        if let Some(char_len) = crate::agent::lean_char_literal_len(src, i, prev_ch) {
+            out.push(' ');
+            i += char_len;
+            prev_ch = None;
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
+            block_depth = 1;
+            i += 2;
+            prev_ch = None;
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            prev_ch = None;
+            continue;
+        }
+
+        if let Some(ch) = src[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+            prev_ch = Some(ch);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn normalize_parens_and_ws(src: &str) -> String {
+    let mut spaced = String::with_capacity(src.len() + 2);
+    spaced.push(' ');
+    for ch in src.chars() {
+        if matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',') {
+            spaced.push(' ');
+        } else {
+            spaced.push(ch);
+        }
+    }
+    spaced.push(' ');
+    let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(" {collapsed} ")
+}
+
+fn has_dotted_ctor(norm: &str, ctor: &str) -> bool {
+    let needle = format!(".{ctor}");
+    let mut rest = norm;
+    while let Some(pos) = rest.find(&needle) {
+        let after = &rest[pos + needle.len()..];
+        let boundary_after = after
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '\'');
+        if boundary_after {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Detect shorthand `Rvalue.ref` (`.ref .shared` / `.ref .mut <bool>`) and
+/// `Rvalue.rawPtr` (`.rawPtr <Mutability> { local_ := ... }`) without
+/// false-triggering on `RigidTy.ref`, `RigidTy.rawPtr` inside compound types,
+/// or pure `AggregateKind.rawPtr <Ty> <Mutability>`.
+fn has_shorthand_rvalue_ref_or_rawptr(norm_blocks: &str) -> bool {
+    if norm_blocks.contains(" .ref .shared ")
+        || norm_blocks.contains(" .ref .mut true ")
+        || norm_blocks.contains(" .ref .mut false ")
+        || norm_blocks.contains(" .ref .mut Bool.true ")
+        || norm_blocks.contains(" .ref .mut Bool.false ")
+    {
+        return true;
+    }
+    for m in ["Mutability.not", "Mutability.mut", ".not", ".mut"] {
+        let pat = format!(" .rawPtr {m} local_ := ");
+        if norm_blocks.contains(&pat) {
+            return true;
+        }
+    }
+    false
+}
+
+fn detect_blocks_and_back_edges(blocks_slice: &str) -> (usize, bool) {
+    let parts: Vec<&str> = blocks_slice.split("terminator :=").collect();
+    if parts.len() <= 1 {
+        return (0, false);
+    }
+    let count = parts.len() - 1;
+    let mut back_edge = false;
+    for (bb_idx, raw_part) in parts.iter().skip(1).enumerate() {
+        let end = raw_part
+            .find("isCleanup :=")
+            .or_else(|| raw_part.find("statements :="))
+            .unwrap_or(raw_part.len());
+        let term_before_span = match raw_part[..end].rfind("span :=") {
+            Some(sp) => &raw_part[..sp],
+            None => &raw_part[..end],
+        };
+        let term = normalize_parens_and_ws(term_before_span);
+        for target in extract_terminator_targets(&term) {
+            if target <= bb_idx {
+                back_edge = true;
+            }
+        }
+    }
+    (count, back_edge)
+}
+
+fn is_unwind_action_tok(tok: &str) -> bool {
+    matches!(
+        tok,
+        "UnwindAction.cleanup"
+            | ".cleanup"
+            | "UnwindAction.unreachable"
+            | ".unreachable"
+            | "UnwindAction.terminate"
+            | ".terminate"
+            | "UnwindAction.continue_"
+            | ".continue_"
+    )
+}
+
+fn extract_terminator_targets(norm_term: &str) -> Vec<usize> {
+    let tokens: Vec<&str> = norm_term.split_whitespace().collect();
+    let mut targets = Vec::new();
+
+    // Locate the terminator constructor after `kind :=` (or at index 0).
+    let kind_pos = tokens
+        .windows(2)
+        .position(|w| w[0] == "kind" && w[1] == ":=")
+        .map(|p| p + 2)
+        .unwrap_or(0);
+    let Some(&head) = tokens.get(kind_pos) else {
+        return targets;
+    };
+
+    if head == "TerminatorKind.goto" || head == ".goto" {
+        if let Some(n) = tokens.get(kind_pos + 1).and_then(|s| s.parse::<usize>().ok()) {
+            targets.push(n);
+        }
+        return targets;
+    }
+
+    if head == "TerminatorKind.switchInt" || head == ".switchInt" {
+        if let Some(br_idx) = norm_term.find("branches :=") {
+            let after_br = &norm_term[br_idx + "branches :=".len()..];
+            let br_end = after_br.find("otherwise :=").unwrap_or(after_br.len());
+            // Switch branch discriminants are `u128` bit patterns (`0..=u128::MAX`);
+            // parsing both elements as `u128` keeps `(val, target_bb)` pairs aligned
+            // even when `val > usize::MAX`.
+            let nums: Vec<u128> = after_br[..br_end]
+                .split_whitespace()
+                .filter_map(|t| t.parse::<u128>().ok())
+                .collect();
+            for pair in nums.chunks_exact(2) {
+                if let Ok(target_bb) = usize::try_from(pair[1]) {
+                    targets.push(target_bb);
+                }
+            }
+        }
+        for i in kind_pos..tokens.len() {
+            if tokens[i] == "otherwise"
+                && tokens.get(i + 1) == Some(&":=")
+                && let Some(n) = tokens.get(i + 2).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(n);
+            }
+        }
+        return targets;
+    }
+
+    // `drop`, `assert`, `call`, and `inlineAsm` all end with `UnwindAction`
+    // right before `span :=`. Anchoring on that trailing `UnwindAction` avoids
+    // false matches on inner `Option.some` or boolean literals inside operands.
+    let unwind_pos = (kind_pos + 1..tokens.len())
+        .rev()
+        .find(|&i| is_unwind_action_tok(tokens[i]));
+
+    if head == "TerminatorKind.drop"
+        || head == ".drop"
+        || head == "TerminatorKind.assert"
+        || head == ".assert"
+    {
+        if let Some(u) = unwind_pos {
+            if u > kind_pos
+                && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(n);
+            }
+            if matches!(tokens[u], "UnwindAction.cleanup" | ".cleanup")
+                && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(cleanup_bb);
+            }
+        }
+    } else if head == "TerminatorKind.call" || head == ".call" {
+        if let Some(u) = unwind_pos {
+            if u >= kind_pos + 2
+                && matches!(tokens[u - 2], "Option.some" | ".some" | "some")
+                && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(n);
+            }
+            if matches!(tokens[u], "UnwindAction.cleanup" | ".cleanup")
+                && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(cleanup_bb);
+            }
+        }
+    } else if head == "TerminatorKind.inlineAsm" || head == ".inlineAsm" {
+        let end = unwind_pos.unwrap_or(tokens.len());
+        for tok in &tokens[kind_pos + 1..end] {
+            if let Ok(n) = tok.parse::<usize>() {
+                targets.push(n);
+            }
+        }
+        if let Some(u) = unwind_pos
+            && matches!(tokens[u], "UnwindAction.cleanup" | ".cleanup")
+            && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
+        {
+            targets.push(cleanup_bb);
+        }
+    }
+
+    targets
+}
+
+/// Render 80-column-wrapped `--` Lean comment hints recommending the fuel-free
+/// proof lifting strategy for `bundle`, `authored`, and `profile`.
+///
+/// Emits pure `--` line comments compatible with `TrustedBoundary.lean` and
+/// stripped by `detect_authored_item_modules` and `check_specs_non_vacuous`.
+pub fn render_scaffold_lifting_hints(
+    bundle: &SubjectObligationBundle,
+    authored: AuthoredItemModules,
+    profile: &MirLiftingProfile,
+) -> String {
+    let effective = effective_authored_for_bundle(bundle, authored, Some(profile));
+    let is_equiv = effective.is_equiv;
+    let is_modular = effective.is_modular;
+    let is_polymorphic = effective.is_polymorphic;
+    let is_bit_validity_item = matches!(
+        bundle.subject.item_kind,
+        anneal_rustc_capture::CapturedItemKind::TypeInvariant
+            | anneal_rustc_capture::CapturedItemKind::UnsafeTraitImpl
+    );
+    let mut bullets: Vec<String> = Vec::new();
+
+    if is_bit_validity_item {
+        bullets.push(
+            "Bit-validity (`open Anneal.BitValidity`): use `ValidityMode`, \
+             `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, \
+             `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, \
+             `checkFromZeros_sound`, `checkFromBytes_sound`, \
+             `checkIntoBytes_sound`, and \
+             `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`."
+                .to_string(),
+        );
+    }
+
+    if is_polymorphic {
+        bullets.push(
+            "Polymorphic MIR (`open Trusted.MirAst Anneal.PureMirExec \
+             Anneal.MirLiftCore`; plus `Anneal.SepLogicLenses` or \
+             `Anneal.MirFuelFree` for stateful/loop bodies): `intro typeArgs \
+             h_len` on `poly*Claim`, where `*ClaimFor typeArgs` instantiates \
+             `Mir.<Item>.body.instantiate typeArgs` (`CapturedMir.instantiate` \
+             and `LayoutTable.instantiateForBody`), then discharge `*ClaimFor \
+             typeArgs` with fuel-free lifting theorems \
+             (`verifyMirNoPanic_of_pureExec`, \
+             `verifyStatefulMir_of_sepLenses`, or \
+             `verifyStatefulMirNoPanic_of_wpConverges`)."
+                .to_string(),
+        );
+    }
+
+    if profile.has_cfg_back_edge {
+        bullets.push(
+            "Loops (`open Anneal.MirLoops Anneal.PureMirExec \
+             Anneal.MirFuelFree`): model bounded loops with `forRangeUp` \
+             (`forRangeUp_induction`, `mirWpConverges_forRangeUp`, \
+             `mirNoCallWpConverges_forRangeUp`, or \
+             `mirWpConverges_whileRank`) and step entry, body, and exit via \
+             `runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, \
+             `mirNoCallWpConverges_of_runCfgToBlock`) without step numerals."
+                .to_string(),
+        );
+    }
+
+    if profile.has_mut_borrow {
+        bullets.push(
+            "References (`open Anneal.SepLogicLenses \
+             Anneal.FunctionalTranslation Anneal.MirLiftCore`): erase `&mut` \
+             borrow/heap aliasing via `SepLensStateInv` \
+             (`ActiveTypedMutBorrow`) or sibling-field \
+             `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`), derive \
+             `LiftLensBlock` (`set?_of_forcePureEnv? rfl`), and close with \
+             `verifyStatefulMir_of_sepLenses` or \
+             `verifyStatefulMir_of_sepSubplaceLenses`."
+                .to_string(),
+        );
+    } else if profile.has_deref_projection {
+        bullets.push(
+            "Shared `&` / pointer reads (`open Anneal.PureMirExec \
+             Anneal.MirFuelFree Anneal.Rustc.V2026_06_01.SymbolicEval`): \
+             `ActiveTypedMutBorrow` requires `&mut` borrows; step read-only \
+             dereferences via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, \
+             `verifyStatefulMirNoPanic_of_wpConverges`) or \
+             `dischargeStatefulEqFuelFree` on concrete pinned memory."
+                .to_string(),
+        );
+    }
+
+    if is_modular || profile.has_callees_or_modular_contracts || profile.has_call_terminator {
+        bullets.push(
+            "Callees / modular (`open Anneal.PureMirExec`): for linked pure \
+             callees use `checkPureMirWithCallees` with \
+             `verifyStatefulMirNoPanic_of_pureExecWithCallees_any` or \
+             `PureMirConverges.call_summary`; for modular call contracts use \
+             `PureMirModularConverges` and \
+             `verifyModularMir_of_pureModularExec_any`."
+                .to_string(),
+        );
+    }
+
+    if profile.is_pure_call_free_candidate() && !profile.has_cfg_back_edge && !is_modular {
+        bullets.push(
+            "Pure MIR (`#mir_lift` rules; `open Anneal.PureMirExec \
+             Anneal.MirLiftCore`): apply `verifyMirNoPanic_of_pureExec` (or \
+             `verifyTotalMir_of_pureExec` / \
+             `verifyStatefulMirNoPanic_of_pureExec`), \
+             `lift_PureMirConverges (by rfl)`, `LiftBlock.of_lookup (by rfl)`, \
+             and `LiftStmtsTerminator.{cons_eval, cons_eval_norm, eval_rest, \
+             term_assert, term_switchInt, term_goto, term_drop, term_return}`."
+                .to_string(),
+        );
+    } else if !profile.has_captured_mir {
+        bullets.push(
+            "Body lifting (`#mir_lift` / `forRangeUp` / `SepLogicLenses`): \
+             check `Anneal.PureMirExec.checkPureMir` first (`*_of_pureExec` + \
+             `LiftBlock` / `LiftStmtsTerminator`); use `Anneal.MirLoops` \
+             (`forRangeUp` + `runCfgToBlock`) on loops and \
+             `Anneal.SepLogicLenses` (`LiftLensBlock`) on `&mut` borrows."
+                .to_string(),
+        );
+    }
+
+    if is_equiv {
+        bullets.push(
+            "Equivalence (`#[spec(equivalent_to: ...)]`; `open \
+             Anneal.PureMirExec Anneal.MirFuelFree`): discharge \
+             `StatefulEquivVerificationResult` with \
+             `verifyStatefulEquivMir_of_wpConverges` and \
+             `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference \
+             specification's `MirNoCallWpConverges` theorem."
+                .to_string(),
+        );
+    }
+
+    if effective.is_ub_exception {
+        bullets.push(
+            "Scoped UB-exception (`open Anneal.PureMirExec \
+             Anneal.MirFuelFree`): discharge `UbExceptionVerificationResult` \
+             via `verifyUbExceptionMir_of_wpConverges` and \
+             `mirWpConverges_of_runCfgToBlock`."
+                .to_string(),
+        );
+    }
+
+    if profile.has_inline_companions {
+        if profile.has_impure_inline_companions {
+            bullets.push(
+                "Companion specs (`#mir_lift_spec` / closure-upvar fallback; \
+                 `open Anneal.PureMirExec`): inline companions capture `&` \
+                 upvars (`checkPureMir = false`); invert `requires` via \
+                 `holdBoolReq_of_mirBool` with count-free `repeat`, prove \
+                 `ensures` via `hold_mirBool_of_blockLinear` \
+                 (`defaultSpecSteps`), or lift pure companions via \
+                 `mirBoolPredicateHolds_elim_of_pureExec`."
+                    .to_string(),
+            );
+        } else {
+            bullets.push(
+                "Companion specs (`#mir_lift_spec` theorems; `open \
+                 Anneal.PureMirExec`): when `checkPureMir` holds on a \
+                 companion, use `mirBoolPredicateHolds_of_pureExec` and \
+                 `mirBoolPredicateHolds_elim_of_pureExec`; if closure `&` \
+                 upvars make `checkPureMir = false`, use \
+                 `holdBoolReq_of_mirBool` (with `repeat`) and \
+                 `hold_mirBool_of_blockLinear` (`defaultSpecSteps`)."
+                    .to_string(),
+            );
+        }
+    }
+
+    bullets.push(
+        "Boundary rule: `#mir_lift` (`Anneal.MirLift`, emitting \
+         `<item>_model`, `<item>_lift_sound`, and `<item>_verified`, or \
+         `LiftResidualBlock` under `residual := true`) is a closed-body \
+         (`argCount = 0`) elaborator outside `TrustedBoundary`; in \
+         `Proof/*.lean`, apply `Anneal` theorems directly with zero \
+         `BlockCtx` records and zero manual fuel or `iterate k` counts."
+            .to_string(),
+    );
+
+    let mut out =
+        String::from("-- Proof lifting strategy hints (lift first, evaluate last):\n");
+    for bullet in &bullets {
+        out.push_str(&wrap_lean_line_comment("-- * ", "--   ", bullet, 80));
+    }
+    out
+}
+
+fn wrap_lean_line_comment(
+    first_prefix: &str,
+    cont_prefix: &str,
+    text: &str,
+    max_cols: usize,
+) -> String {
+    let mut out = String::new();
+    let mut cur_prefix = first_prefix;
+    let mut line = String::from(cur_prefix);
+
+    for word in text.split_whitespace() {
+        let base_len = cur_prefix.chars().count();
+        let cur_len = line.chars().count();
+        let word_len = word.chars().count();
+        if cur_len == base_len {
+            line.push_str(word);
+        } else if cur_len + 1 + word_len <= max_cols {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            out.push_str(&line);
+            out.push('\n');
+            cur_prefix = cont_prefix;
+            line = String::from(cur_prefix);
+            line.push_str(word);
+        }
+    }
+    if line.chars().count() > cur_prefix.chars().count() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Render a context-aware starter `anneal/proofs/Proof/<Item>.lean` template
+/// enriched with 80-column-wrapped `--` lifting strategy hints derived from
+/// `profile`.
+pub fn render_proof_template_with_hints(
+    bundle: &SubjectObligationBundle,
+    authored: AuthoredItemModules,
+    profile: &MirLiftingProfile,
+) -> String {
+    let effective = effective_authored_for_bundle(bundle, authored, Some(profile));
+    let base = render_proof_template_with_options(bundle, effective);
+    let hints = render_scaffold_lifting_hints(bundle, effective, profile);
+    if let Some(doc_idx) = base.find("\n/-- ") {
+        let mut enriched = String::with_capacity(base.len() + hints.len() + 2);
+        enriched.push_str(&base[..doc_idx + 1]);
+        enriched.push_str(&hints);
+        enriched.push('\n');
+        enriched.push_str(&base[doc_idx + 1..]);
+        enriched
+    } else {
+        format!("{hints}\n{base}")
+    }
 }
 
 #[cfg(test)]
@@ -2392,5 +3298,696 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn scaffold_init_proofs_surfaces_tailored_lifting_hints_within_80_cols() {
+        let workspace = unique_temp_dir("lifting-hints");
+        let unit_dir = workspace.join("target/anneal/units/my_crate-01");
+        fs::create_dir_all(unit_dir.join("Mir/MyCrate")).expect("create Mir/MyCrate");
+
+        // 1. Pure scalar function with an impure closure-capturing companion.
+        let pure_mir = r#"import Trusted
+namespace Mir.MyCrate.pure_add
+def body : CapturedMir :=
+  {
+    defPath := "my_crate::pure_add",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 2,
+    localDecls := List.nil,
+    basicBlocks := (List.cons { statements := List.nil, terminator := { kind := (TerminatorKind.goto 1), span := "ProjectionElem.deref" }, isCleanup := false } (List.cons { statements := List.nil, terminator := { kind := TerminatorKind.return_, span := "" }, isCleanup := false } List.nil)),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.MyCrate.pure_add
+"#;
+        let comp_mir = r#"import Trusted
+namespace Mir.MyCrate.__anodized_fn_requires_pure_add
+def body : CapturedMir :=
+  {
+    defPath := "my_crate::__anodized_fn_requires_pure_add",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.requires,
+    argCount := 2,
+    localDecls := List.nil,
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 3, projection := List.nil } (Rvalue.ref BorrowKind.shared { local_ := 1, projection := List.nil })), span := "" } List.nil), terminator := { kind := TerminatorKind.return_, span := "" }, isCleanup := false } List.nil),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.MyCrate.__anodized_fn_requires_pure_add
+"#;
+
+        // 2. Mutable-borrow function (`RigidTy.ref Mutability.mut` + `ProjectionElem.deref`).
+        let lens_mir = r#"import Trusted
+namespace Mir.MyCrate.bump_cursor
+def body : CapturedMir :=
+  {
+    defPath := "my_crate::bump_cursor",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.ref Mutability.mut (RigidTy.uint UintTy.u16)), layoutIdx := 0 }, debugName := Option.none } List.nil),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 1, projection := (List.cons ProjectionElem.deref List.nil) } (Rvalue.use (Operand.copy { local_ := 1, projection := (List.cons ProjectionElem.deref List.nil) }))), span := "" } List.nil), terminator := { kind := TerminatorKind.return_, span := "" }, isCleanup := false } List.nil),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.MyCrate.bump_cursor
+"#;
+
+        // 3. Loop function with CFG back-edge (`bb0 -> bb1 -> bb2 -> bb1`).
+        let loop_mir = r#"import Trusted
+namespace Mir.MyCrate.sum_loop
+def body : CapturedMir :=
+  {
+    defPath := "my_crate::sum_loop",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := List.nil,
+    basicBlocks := (List.cons { statements := List.nil, terminator := { kind := (TerminatorKind.goto 1), span := "" }, isCleanup := false } (List.cons { statements := List.nil, terminator := { kind := (TerminatorKind.switchInt (Operand.copy { local_ := 1, projection := List.nil }) { branches := (List.cons (0, 3) List.nil), otherwise := 2 }), span := "" }, isCleanup := false } (List.cons { statements := List.nil, terminator := { kind := (TerminatorKind.goto 1), span := "" }, isCleanup := false } (List.cons { statements := List.nil, terminator := { kind := TerminatorKind.return_, span := "" }, isCleanup := false } List.nil)))),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.MyCrate.sum_loop
+"#;
+
+        for (rel, txt) in [
+            ("Mir/MyCrate/pure_add.lean", pure_mir),
+            ("Mir/MyCrate/__anodized_fn_requires_pure_add.lean", comp_mir),
+            ("Mir/MyCrate/bump_cursor.lean", lens_mir),
+            ("Mir/MyCrate/sum_loop.lean", loop_mir),
+        ] {
+            fs::write(unit_dir.join(rel), txt).expect("write synthetic mir");
+        }
+
+        let rec = |def_id: &str, rel: &str, module: &str, kind, assoc: Option<&str>| {
+            let hash = sha256_hex(
+                fs::read_to_string(unit_dir.join(rel))
+                    .expect("read mir")
+                    .as_bytes(),
+            );
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: def_id.to_string(),
+                    mir_module_path: rel.to_string(),
+                    mir_module_sha256: hash,
+                },
+                lean_module_name: module.to_string(),
+                item_kind: kind,
+                associated_subject_def_id: assoc.map(str::to_string),
+                trait_impls: Vec::new(),
+            }
+        };
+
+        let records = vec![
+            rec(
+                "my_crate::pure_add",
+                "Mir/MyCrate/pure_add.lean",
+                "Mir.MyCrate.pure_add",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            rec(
+                "my_crate::__anodized_fn_requires_pure_add",
+                "Mir/MyCrate/__anodized_fn_requires_pure_add.lean",
+                "Mir.MyCrate.__anodized_fn_requires_pure_add",
+                CapturedItemKind::InlineSpecRequires,
+                Some("my_crate::pure_add"),
+            ),
+            rec(
+                "my_crate::bump_cursor",
+                "Mir/MyCrate/bump_cursor.lean",
+                "Mir.MyCrate.bump_cursor",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            rec(
+                "my_crate::sum_loop",
+                "Mir/MyCrate/sum_loop.lean",
+                "Mir.MyCrate.sum_loop",
+                CapturedItemKind::Subject,
+                None,
+            ),
+        ];
+
+        let cfg = ScaffoldConfig::new(&workspace);
+        scaffold_init_proof_templates(&cfg, &records).expect("init proof templates with hints");
+
+        let pure_proof = fs::read_to_string(workspace.join("anneal/proofs/Proof/MyCrate/pure_add.lean"))
+            .expect("read pure_add proof");
+        assert!(pure_proof.contains("#mir_lift"));
+        assert!(pure_proof.contains("verifyMirNoPanic_of_pureExec"));
+        assert!(pure_proof.contains("#mir_lift_spec"));
+        assert!(pure_proof.contains("holdBoolReq_of_mirBool"));
+        assert!(!pure_proof.contains("SepLogicLenses"));
+
+        let lens_proof =
+            fs::read_to_string(workspace.join("anneal/proofs/Proof/MyCrate/bump_cursor.lean"))
+                .expect("read bump_cursor proof");
+        assert!(lens_proof.contains("Anneal.SepLogicLenses"));
+        assert!(lens_proof.contains("Anneal.FunctionalTranslation"));
+        assert!(lens_proof.contains("verifyStatefulMir_of_sepLenses"));
+
+        let loop_proof = fs::read_to_string(workspace.join("anneal/proofs/Proof/MyCrate/sum_loop.lean"))
+            .expect("read sum_loop proof");
+        assert!(loop_proof.contains("forRangeUp"));
+        assert!(loop_proof.contains("runCfgToBlock"));
+
+        for (name, proof_src) in [
+            ("pure_add", &pure_proof),
+            ("bump_cursor", &lens_proof),
+            ("sum_loop", &loop_proof),
+        ] {
+            for line in proof_src.lines().filter(|l| l.starts_with("--")) {
+                assert!(
+                    line.chars().count() <= 80,
+                    "comment line in {name} exceeded 80 cols ({}): {line}",
+                    line.chars().count()
+                );
+            }
+            let detected = detect_authored_item_modules(
+                &workspace.join("anneal/proofs"),
+                Path::new(&format!("MyCrate/{name}.lean")),
+            );
+            assert!(
+                !detected.is_stateful && !detected.is_modular && !detected.is_equiv,
+                "hint comments in {name} must not trigger false contract detection: {detected:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn mir_lifting_profile_handles_strings_slice_ptrs_u128_and_cleanup() {
+        let mk_bundle = |def_id: &str, kind: CapturedItemKind| SubjectObligationBundle {
+            subject: UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: def_id.to_string(),
+                    mir_module_path: "Mir/Demo/item.lean".to_string(),
+                    mir_module_sha256: "0".repeat(64),
+                },
+                lean_module_name: "Mir.Demo.item".to_string(),
+                item_kind: kind,
+                associated_subject_def_id: None,
+                trait_impls: Vec::new(),
+            },
+            item_module_suffix: "Demo.item".to_string(),
+            item_rel_path: PathBuf::from("Demo/item.lean"),
+            inline_requires: Vec::new(),
+            inline_ensures: Vec::new(),
+            inline_qualifiers: Vec::new(),
+            external_specs: Vec::new(),
+            transitive_callees: Vec::new(),
+            external_spec_callees: Vec::new(),
+            called_callees: Vec::new(),
+            spec_callees: Vec::new(),
+            spec_companions_with_calls: BTreeSet::new(),
+        };
+
+        // 1. `"--"` and `"/-"` inside `span` string literals must NOT invert quote
+        //    polarity and blind `scan_captured_mir_body` to `ProjectionElem.deref`.
+        let str_comment_mir = r#"import Trusted
+def body : CapturedMir :=
+  {
+    defPath := "demo::str_--_/-_item",
+    localDecls := List.nil,
+    basicBlocks := (List.cons {
+      statements := (List.cons {
+        kind := (StatementKind.assign { local_ := 0, projection := List.nil }
+          (Rvalue.use (Operand.copy { local_ := 1, projection := (List.cons ProjectionElem.deref List.nil) }))),
+        span := "src/foo--bar.rs:1:1"
+      } List.nil),
+      terminator := { kind := TerminatorKind.return_, span := "src/a/-b.rs:2:1" },
+      isCleanup := false
+    } List.nil),
+    allocations := List.nil
+  }
+"#;
+        let prof_str =
+            analyze_mir_lifting_profile(&mk_bundle("demo::item", CapturedItemKind::Subject), Some(str_comment_mir), &[]);
+        assert!(
+            prof_str.has_deref_projection && !prof_str.is_pure_call_free_candidate(),
+            "comment tokens inside string literals must not hide ProjectionElem.deref"
+        );
+        assert!(
+            !prof_str.has_mut_borrow,
+            "shared deref without &mut must not set has_mut_borrow"
+        );
+
+        let shared_hints = render_scaffold_lifting_hints(
+            &mk_bundle("demo::item", CapturedItemKind::Subject),
+            AuthoredItemModules::default(),
+            &prof_str,
+        );
+        assert!(shared_hints.contains("Shared `&` / pointer reads"));
+        assert!(!shared_hints.contains("verifyStatefulMir_of_sepLenses"));
+
+        // 2. Pointer-backed `ConstValue.slice (ConstScalar.ptr ...)` fails `checkPureMir`,
+        //    whereas `ConstValue.slice (ConstScalar.int ...)` and nested compound types
+        //    (`{ kind := .tuple [.ref .not ...], ... }` / `AggregateKind.rawPtr`) remain pure.
+        let slice_ptr_mir = r#"def body : CapturedMir := {
+            localDecls := List.nil,
+            basicBlocks := (List.cons {
+              statements := (List.cons {
+                kind := (StatementKind.assign { local_ := 0, projection := List.nil }
+                  (Rvalue.use (Operand.constant { ty := { kind := (RigidTy.ref Mutability.not RigidTy.str), layoutIdx := 0 }, val := (ConstValue.slice (ConstScalar.ptr { allocId := 1, offsetBytes := 0 } 8) 5) }))),
+                span := ""
+              } List.nil),
+              terminator := { kind := TerminatorKind.return_, span := "" },
+              isCleanup := false
+            } List.nil)
+          }"#;
+        let prof_slice_ptr = analyze_mir_lifting_profile(
+            &mk_bundle("demo::slice_ptr", CapturedItemKind::Subject),
+            Some(slice_ptr_mir),
+            &[],
+        );
+        assert!(
+            prof_slice_ptr.has_impure_rvalue_or_asm && !prof_slice_ptr.is_pure_call_free_candidate(),
+            "ConstValue.slice (ConstScalar.ptr ...) must be classified as impure"
+        );
+
+        let pure_nested_ty_mir = r#"def body : CapturedMir := {
+            localDecls := List.nil,
+            basicBlocks := [
+              { statements := [
+                  { kind := .assign { local_ := 0, projection := [.field 0 { kind := .tuple [.ref .not (.uint .u32)], layoutIdx := 1 }] }
+                      (.aggregate (.rawPtr { kind := .uint .u8, layoutIdx := 0 } .not) []),
+                    span := "" }
+                ],
+                terminator := {
+                  kind := .switchInt (.copy { local_ := 1, projection := [.subslice 0 1 false] })
+                    { branches := [(340282366920938463463374607431768211455, 1), (0, 1)], otherwise := 1 },
+                  span := ""
+                },
+                isCleanup := false },
+              { statements := [],
+                terminator := {
+                  kind := .assert (.copy { local_ := 1, projection := [.constantIndex 0 1 false] }) true 2 .unreachable,
+                  span := ""
+                },
+                isCleanup := false },
+              { statements := [],
+                terminator := { kind := .return_, span := "" },
+                isCleanup := false }
+            ]
+          }"#;
+        let prof_nested = analyze_mir_lifting_profile(
+            &mk_bundle("demo::nested", CapturedItemKind::Subject),
+            Some(pure_nested_ty_mir),
+            &[],
+        );
+        assert!(
+            prof_nested.is_pure_call_free_candidate(),
+            "nested RigidTy.ref and AggregateKind.rawPtr must remain pure: {prof_nested:?}"
+        );
+        assert!(
+            !prof_nested.has_cfg_back_edge,
+            "u128::MAX switch arm (u128::MAX, 1) followed by (0, 1) and assert subslice/constantIndex must not invent a back-edge"
+        );
+
+        // 3. `u128::MAX` switch arm jumping back to `bb0` IS detected as a back-edge,
+        //    and `TypeInvariant` surfaces `Anneal.BitValidity` within 80 columns.
+        let u128_backedge_mir = r#"def body : CapturedMir := {
+            localDecls := List.nil,
+            basicBlocks := [
+              { statements := [],
+                terminator := {
+                  kind := .switchInt (.copy { local_ := 1, projection := [] })
+                    { branches := [(340282366920938463463374607431768211455, 0)], otherwise := 1 },
+                  span := ""
+                },
+                isCleanup := false },
+              { statements := [], terminator := { kind := .return_, span := "" }, isCleanup := false }
+            ]
+          }"#;
+        let inv_bundle = mk_bundle("demo::__anneal_type_invariant_hdr", CapturedItemKind::TypeInvariant);
+        let prof_u128_loop = analyze_mir_lifting_profile(&inv_bundle, Some(u128_backedge_mir), &[]);
+        assert!(prof_u128_loop.has_cfg_back_edge);
+        let inv_hints =
+            render_scaffold_lifting_hints(&inv_bundle, AuthoredItemModules::default(), &prof_u128_loop);
+        assert!(inv_hints.contains("Anneal.BitValidity"));
+        assert!(inv_hints.contains("open Anneal.MirLoops Anneal.PureMirExec"));
+        assert!(inv_hints.contains("Anneal.MirFuelFree"));
+        for line in inv_hints.lines() {
+            assert!(line.chars().count() <= 80, "line > 80 cols: {line}");
+        }
+
+        // 4. Non-inline `def body : CapturedMir := aliasBody` (no `basicBlocks :=`)
+        //    must NOT be misclassified as a 0-block pure candidate.
+        let alias_body_mir = "import Trusted\ndef body : CapturedMir := otherBody\n";
+        let prof_alias = analyze_mir_lifting_profile(
+            &mk_bundle("demo::alias", CapturedItemKind::Subject),
+            Some(alias_body_mir),
+            &[],
+        );
+        assert!(
+            !prof_alias.has_captured_mir && !prof_alias.is_pure_call_free_candidate(),
+            "non-inline alias CapturedMir must not report has_captured_mir: {prof_alias:?}"
+        );
+
+        // 5. `UnwindAction.cleanup 0` on `assert` and `typeParamCount := 2` are detected,
+        //    and maximal `AuthoredItemModules` combinations respect `<= 80` cols and
+        //    ground-truth namespaces.
+        let cleanup_poly_mir = r#"def body : CapturedMir := {
+            typeParamCount := 2,
+            localDecls := [],
+            basicBlocks := [
+              { statements := [],
+                terminator := { kind := .assert (.copy { local_ := 1, projection := [] }) true 1 (.cleanup 0), span := "" },
+                isCleanup := false },
+              { statements := [], terminator := { kind := .return_, span := "" }, isCleanup := false }
+            ]
+          }"#;
+        let poly_bundle = mk_bundle("demo::poly_cleanup", CapturedItemKind::Subject);
+        let mut prof_poly = analyze_mir_lifting_profile(&poly_bundle, Some(cleanup_poly_mir), &[]);
+        assert_eq!(prof_poly.type_param_count, 2);
+        assert!(
+            prof_poly.has_cfg_back_edge,
+            "UnwindAction.cleanup 0 on bb0 must register as a CFG back-edge"
+        );
+        prof_poly.has_inline_companions = true;
+        prof_poly.has_impure_inline_companions = true;
+        prof_poly.has_deref_projection = true;
+        let max_authored = AuthoredItemModules {
+            is_equiv: true,
+            is_ub_exception: true,
+            is_polymorphic: true,
+            ..AuthoredItemModules::default()
+        };
+        let max_hints = render_scaffold_lifting_hints(&poly_bundle, max_authored, &prof_poly);
+        assert!(max_hints.contains("CapturedMir.instantiate"));
+        assert!(max_hints.contains("open Trusted.MirAst Anneal.PureMirExec"));
+        assert!(!max_hints.contains("Trusted.Layout"));
+        assert!(!max_hints.contains("Body.instantiate"));
+        assert!(!max_hints.contains("verifyPoly"));
+        assert!(max_hints.contains("#[spec(equivalent_to: ...)]"));
+        assert!(!max_hints.contains("#[spec(equiv ="));
+        assert!(max_hints.contains("verifyStatefulEquivMir_of_wpConverges"));
+        assert!(max_hints.contains("verifyUbExceptionMir_of_wpConverges"));
+        assert!(max_hints.contains("<item>_lift_sound"));
+        for line in max_hints.lines() {
+            assert!(line.chars().count() <= 80, "line > 80 cols: {line}");
+        }
+
+        // 6. An unused `&mut` local without `.deref` or `BorrowKind.mut` stays pure
+        //    (`has_mut_borrow == false`), and `analyze_workspace_lifting_profile`
+        //    falls back to `target/anneal/units` before `.anneal/generated/Mir` exists.
+        let unused_mut_mir = r#"def body : CapturedMir := {
+            localDecls := [{ mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }, debugName := .none }],
+            basicBlocks := [{ statements := [], terminator := { kind := .return_, span := "" }, isCleanup := false }]
+          }"#;
+        let prof_unused_mut = analyze_mir_lifting_profile(
+            &mk_bundle("demo::unused_mut", CapturedItemKind::Subject),
+            Some(unused_mut_mir),
+            &[],
+        );
+        assert!(
+            prof_unused_mut.is_pure_call_free_candidate() && !prof_unused_mut.has_mut_borrow,
+            "unused &mut in localDecls without deref or BorrowKind.mut must remain pure: {prof_unused_mut:?}"
+        );
+
+        let fallback_ws = unique_temp_dir("profile_units_fallback");
+        let fallback_unit = fallback_ws.join("target/anneal/units/u0/Mir/Demo");
+        fs::create_dir_all(&fallback_unit).expect("create fallback unit dir");
+        fs::write(fallback_unit.join("item.lean"), cleanup_poly_mir)
+            .expect("write fallback unit mir");
+        let mut fallback_bundle = mk_bundle("demo::item", CapturedItemKind::Subject);
+        fallback_bundle.subject.target.mir_module_sha256.clear();
+        let prof_fallback = analyze_workspace_lifting_profile(
+            &fallback_ws.join(".anneal/generated/Mir"),
+            &fallback_bundle,
+        );
+        assert!(
+            prof_fallback.has_captured_mir
+                && prof_fallback.type_param_count == 2
+                && prof_fallback.has_cfg_back_edge,
+            "analyze_workspace_lifting_profile must fall back to target/anneal/units: {prof_fallback:?}"
+        );
+
+        // 7. When `.anneal/generated/Mir/<Item>.lean` holds a stale stub whose SHA
+        //    mismatches `record.target.mir_module_sha256` while `target/anneal/units`
+        //    holds the fresh capture matching `mir_module_sha256`, `resolve_workspace_mir_file`
+        //    and `analyze_workspace_lifting_profile` must read the fresh unit capture.
+        let stale_mir_dir = fallback_ws.join(".anneal/generated/Mir/Demo");
+        fs::create_dir_all(&stale_mir_dir).expect("create stale Mir/Demo");
+        fs::write(
+            stale_mir_dir.join("item.lean"),
+            "prelude\nimport Init.Core\nimport Trusted\nnamespace Mir.Demo.item\nend Mir.Demo.item\n",
+        )
+        .expect("write stale stub Mir/Demo/item.lean");
+        fallback_bundle.subject.target.mir_module_sha256 = sha256_hex(cleanup_poly_mir.as_bytes());
+        let prof_fresh_unit = analyze_workspace_lifting_profile(
+            &fallback_ws.join(".anneal/generated/Mir"),
+            &fallback_bundle,
+        );
+        assert!(
+            prof_fresh_unit.has_captured_mir
+                && prof_fresh_unit.type_param_count == 2
+                && prof_fresh_unit.has_cfg_back_edge,
+            "stale .anneal/generated/Mir stub must be superseded by SHA-matching unit capture: {prof_fresh_unit:?}"
+        );
+        let _ = fs::remove_dir_all(&fallback_ws);
+
+        // 8. Identifier primes (`c'`) adjacent to `'"'` and UTF-8 char literals (`'α'`)
+        //    must not invert string polarity or hide real `.deref` / `.ref (.mut Bool.true)`.
+        let prime_mir = r#"-- helper: if c'<'"' then 'α' else '\x22'
+          def body : CapturedMir := {
+            localDecls := [],
+            basicBlocks := [{
+              statements := [{
+                kind := .assign { local_ := 1, projection := [] } (.ref (.mut Bool.true) { local_ := 2, projection := [] }),
+                span := "s" -- .deref comment after c'<'"'
+              }],
+              terminator := { kind := .return_, span := "" },
+              isCleanup := false
+            }]
+          }"#;
+        let prof_prime = analyze_mir_lifting_profile(
+            &mk_bundle("demo::prime", CapturedItemKind::Subject),
+            Some(prime_mir),
+            &[],
+        );
+        assert!(
+            prof_prime.has_captured_mir
+                && prof_prime.has_mut_borrow
+                && prof_prime.has_impure_rvalue_or_asm
+                && !prof_prime.has_deref_projection,
+            "prime-identifier comment before body must not invert string polarity: {prof_prime:?}"
+        );
+    }
+
+    #[test]
+    fn scaffold_init_proofs_promotes_safe_total_equiv_and_polymorphic_templates() {
+        let ws = unique_temp_dir("init_proofs_poly_total_equiv");
+        let unit_dir = ws.join("target/anneal/units/u0/Mir/Demo");
+        fs::create_dir_all(&unit_dir).expect("create unit Mir/Demo");
+
+        let mono_mir = "import Trusted\nnamespace Mir.Demo.mono\ndef body : CapturedMir := { defPath := \"demo::mono\", typeParamCount := 0, localDecls := [], basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\nend Mir.Demo.mono\n";
+        let poly_mir = "import Trusted\nnamespace Mir.Demo.poly_id\ndef body : CapturedMir := { defPath := \"demo::poly_id\", typeParamCount := 1, localDecls := [], basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\nend Mir.Demo.poly_id\n";
+
+        fs::write(unit_dir.join("safe_tot.lean"), mono_mir).expect("write safe_tot.lean");
+        fs::write(unit_dir.join("fast_eq.lean"), mono_mir).expect("write fast_eq.lean");
+        fs::write(unit_dir.join("poly_id.lean"), poly_mir).expect("write poly_id.lean");
+
+        let mk_subj = |def_id: &str, name: &str, src: &str| UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: def_id.to_string(),
+                mir_module_path: format!("Mir/Demo/{name}.lean"),
+                mir_module_sha256: sha256_hex(src.as_bytes()),
+            },
+            lean_module_name: format!("Mir.Demo.{name}"),
+            item_kind: CapturedItemKind::Subject,
+            associated_subject_def_id: None,
+            trait_impls: Vec::new(),
+        };
+
+        let records = vec![
+            mk_subj("demo::safe_tot", "safe_tot", mono_mir),
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_safe_tot"
+                        .to_string(),
+                    mir_module_path: String::new(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: String::new(),
+                item_kind: CapturedItemKind::ExternalSpec,
+                associated_subject_def_id: Some("demo::safe_tot".to_string()),
+                trait_impls: Vec::new(),
+            },
+            mk_subj("demo::fast_eq", "fast_eq", mono_mir),
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id:
+                        "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_safe_tot__for__fast_eq"
+                            .to_string(),
+                    mir_module_path: String::new(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: String::new(),
+                item_kind: CapturedItemKind::ExternalSpec,
+                associated_subject_def_id: Some("demo::fast_eq".to_string()),
+                trait_impls: Vec::new(),
+            },
+            mk_subj("demo::poly_id", "poly_id", poly_mir),
+        ];
+
+        let cfg = ScaffoldConfig::new(&ws);
+        scaffold_init_proof_templates(&cfg, &records).expect("init proof templates");
+
+        let tot_proof =
+            fs::read_to_string(ws.join("anneal/proofs/Proof/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_proof.contains(
+                "theorem verified : TotalVerificationResult Obligations.Demo.safe_tot.totalClaim"
+            ),
+            "#[spec(safe_total)] starter template must target TotalVerificationResult: {tot_proof}"
+        );
+        let tot_verify =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(tot_verify.contains("TotalVerificationResult Obligations.Demo.safe_tot.totalClaim"));
+
+        let eq_proof =
+            fs::read_to_string(ws.join("anneal/proofs/Proof/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            eq_proof.contains(
+                "theorem verified : StatefulEquivVerificationResult Obligations.Demo.fast_eq.equivClaim"
+            ),
+            "#[spec(equivalent_to: ...)] starter template must target StatefulEquivVerificationResult: {eq_proof}"
+        );
+
+        let poly_proof =
+            fs::read_to_string(ws.join("anneal/proofs/Proof/Demo/poly_id.lean")).unwrap();
+        assert!(
+            poly_proof.contains("theorem verified : Obligations.Demo.poly_id.polyClaim"),
+            "generic typeParamCount > 0 starter template must target polyClaim: {poly_proof}"
+        );
+        let poly_verify =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/poly_id.lean")).unwrap();
+        assert!(poly_verify.contains("mkPolyVerificationResult"));
+        assert!(!poly_verify.contains("signatureMonomorphic"));
+
+        // Regression check: an authored stateless `VerificationResult` proof on a
+        // `#[spec(safe_total)]` item (using `rustSafeTotalSpec : ItemSpec`) must NOT
+        // be overwritten to `TotalVerificationResult` by `scaffold` or `refresh_workspace_assembly`.
+        let tot_proof_path = ws.join("anneal/proofs/Proof/Demo/safe_tot.lean");
+        fs::write(
+            &tot_proof_path,
+            "import Trusted\nimport Obligations.Demo.safe_tot\nnamespace Proof.Demo.safe_tot\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.safe_tot.claim := by sorry\nend Proof.Demo.safe_tot\n",
+        )
+        .expect("write authored stateless safe_tot proof");
+
+        let cfg_no_init = ScaffoldConfig::new(&ws);
+        scaffold_workspace_with_config(&cfg_no_init, &records)
+            .expect("re-scaffold with authored stateless safe_tot proof");
+        let tot_verify_stateless =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_verify_stateless
+                .contains("theorem verified : VerificationResult Obligations.Demo.safe_tot.claim"),
+            "authored stateless VerificationResult on #[spec(safe_total)] must be preserved: {tot_verify_stateless}"
+        );
+        assert!(!tot_verify_stateless.contains("TotalVerificationResult"));
+
+        refresh_workspace_assembly(&ws)
+            .expect("refresh_workspace_assembly with authored stateless safe_tot proof");
+        let tot_verify_refreshed =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_verify_refreshed
+                .contains("theorem verified : VerificationResult Obligations.Demo.safe_tot.claim"),
+            "refresh_workspace_assembly must preserve stateless VerificationResult: {tot_verify_refreshed}"
+        );
+
+        fs::remove_file(&tot_proof_path).expect("delete safe_tot proof");
+        refresh_workspace_assembly(&ws)
+            .expect("refresh_workspace_assembly after deleting safe_tot proof");
+        let tot_verify_restored =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_verify_restored
+                .contains("TotalVerificationResult Obligations.Demo.safe_tot.totalClaim"),
+            "deleting Proof/Demo/safe_tot.lean must restore default TotalVerificationResult: {tot_verify_restored}"
+        );
+
+        // Regression check: an authored stateless `Proof/Demo/fast_eq.lean` or overriding
+        // `Specs/Demo/fast_eq.lean` on a `#[spec(safe_total, equivalent_to: ...)]` item must
+        // NOT be clobbered to `StatefulEquivVerificationResult` by `scaffold` or
+        // `refresh_workspace_assembly`.
+        let eq_proof_path = ws.join("anneal/proofs/Proof/Demo/fast_eq.lean");
+        fs::write(
+            &eq_proof_path,
+            "import Trusted\nimport Obligations.Demo.fast_eq\nnamespace Proof.Demo.fast_eq\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.fast_eq.claim := by sorry\nend Proof.Demo.fast_eq\n",
+        )
+        .expect("write authored stateless fast_eq proof");
+        scaffold_workspace_with_config(&cfg_no_init, &records)
+            .expect("re-scaffold with authored stateless fast_eq proof");
+        let eq_verify_stateless =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            eq_verify_stateless
+                .contains("theorem verified : VerificationResult Obligations.Demo.fast_eq.claim"),
+            "authored stateless VerificationResult on equivalent_to item must be preserved: {eq_verify_stateless}"
+        );
+        refresh_workspace_assembly(&ws)
+            .expect("refresh_workspace_assembly with authored stateless fast_eq proof");
+        let eq_verify_refreshed =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            eq_verify_refreshed
+                .contains("theorem verified : VerificationResult Obligations.Demo.fast_eq.claim"),
+            "refresh_workspace_assembly must preserve stateless VerificationResult on equivalent_to item: {eq_verify_refreshed}"
+        );
+
+        fs::remove_file(&eq_proof_path).expect("delete fast_eq proof");
+        let specs_demo_dir = ws.join("anneal/proofs/Specs/Demo");
+        fs::create_dir_all(&specs_demo_dir).expect("create Specs/Demo");
+        fs::write(
+            specs_demo_dir.join("fast_eq.lean"),
+            "import Trusted\nimport Obligations.Demo.fast_eq\nnamespace Specs.Demo.fast_eq\nopen Trusted.VerificationResult\ninstance : ItemSpec \"demo::fast_eq\" where\n  pre _ := True\n  post _ _ := True\nend Specs.Demo.fast_eq\n",
+        )
+        .expect("write overriding ItemSpec for fast_eq");
+        scaffold_workspace_with_config(&cfg_no_init, &records)
+            .expect("re-scaffold with overriding Specs/Demo/fast_eq.lean");
+        let eq_verify_specs_override =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            !eq_verify_specs_override.contains("StatefulEquivVerificationResult"),
+            "overriding ItemSpec on equivalent_to item must not emit nonexistent equivClaim: {eq_verify_specs_override}"
+        );
+
+        // Regression check: contract class/claim substrings inside `def_id` string
+        // literals (`ItemSpec "demo::StatefulItemSpec::get"`) or identifier names
+        // (`polyClaim_helper`) must not false-trigger `is_stateful` or `is_polymorphic`.
+        let sub_rel = Path::new("Demo/polyClaim_helper.lean");
+        fs::write(
+            ws.join("anneal/proofs/Specs").join(sub_rel),
+            "import Trusted\nimport Obligations.Demo.polyClaim_helper\nnamespace Specs.Demo.StatefulItemSpec_get\nopen Trusted.VerificationResult\ninstance : ItemSpec \"demo::StatefulItemSpec::get\" where\n  pre _ := True\n  post _ _ := True\nend Specs.Demo.StatefulItemSpec_get\n",
+        )
+        .expect("write substring spec");
+        fs::write(
+            ws.join("anneal/proofs/Proof").join(sub_rel),
+            "import Trusted\nimport Obligations.Demo.polyClaim_helper\nnamespace Proof.Demo.polyClaim_helper\nopen Trusted.VerificationResult\ndef totalClaim_note : String := \"polyClaim StatefulItemSpec\"\ntheorem verified : VerificationResult Obligations.Demo.polyClaim_helper.claim := by sorry\nend Proof.Demo.polyClaim_helper\n",
+        )
+        .expect("write substring proof");
+        let sub_authored = detect_authored_item_modules(&ws.join("anneal/proofs"), sub_rel);
+        assert!(
+            sub_authored.has_specs
+                && !sub_authored.has_legacy_specs_defs
+                && sub_authored.has_proof
+                && !sub_authored.is_stateful
+                && !sub_authored.is_total
+                && !sub_authored.is_polymorphic,
+            "string literals and identifier substrings must not false-trigger contract flags: {sub_authored:?}"
+        );
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }

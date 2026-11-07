@@ -235,6 +235,23 @@ def defaultPre (args : List Value) : Prop :=
 def defaultPost (args : List Value) (ret : Value) : Prop :=
   True
 
+/-- Polymorphic default precondition for `frame_tutor::magic_version` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def defaultPreFor
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value) : Prop :=
+  True
+
+/-- Polymorphic default postcondition for `frame_tutor::magic_version` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def defaultPostFor
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value)
+    (ret : Value) : Prop :=
+  True
+
 /-- Trusted `requires` predicate lowered from companion `#[spec]` and
     `#[external_spec]` items for `frame_tutor::magic_version`. -/
 abbrev rustRequires : List Value → Prop := defaultPre
@@ -261,33 +278,64 @@ instance (priority := low) defaultSpec : ItemSpec "frame_tutor::magic_version" w
   pre := defaultPre
   post := defaultPost
 
+/-- Signature-typed stateful precondition for `frame_tutor::magic_version` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def sigPre
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value)
+    (mem : Memory) : Prop :=
+  And (defaultPreFor typeArgs args)
+      (Trusted.VerificationResult.argsMatchSignature
+        (Mir.FrameTutor.magic_version.body.instantiate typeArgs) args mem)
+
+/-- Signature-typed stateful postcondition for `frame_tutor::magic_version` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def sigPost
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value)
+    (ret : Value)
+    (mem : Memory) : Prop :=
+  And (defaultPostFor typeArgs args ret)
+      (Trusted.VerificationResult.retMatchesSignature
+        (Mir.FrameTutor.magic_version.body.instantiate typeArgs) ret mem)
+
 /-- Low-priority default `StatefulItemSpec` instance for `frame_tutor::magic_version`. -/
 instance (priority := low) defaultStatefulSpec :
     StatefulItemSpec "frame_tutor::magic_version" where
-  pre := fun args _ => defaultPre args
-  post := fun args _ ret _ => defaultPost args ret
+  pre := fun args mem => sigPre List.nil args mem
+  post := fun args _ ret mem => sigPost List.nil args ret mem
 
 /-- Low-priority default `TotalItemSpec` instance for `frame_tutor::magic_version`. -/
 instance (priority := low) defaultTotalSpec :
     TotalItemSpec "frame_tutor::magic_version" where
   pre := fun args mem =>
-    And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.magic_version.body args).memory)
+    And (And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.magic_version.body args).memory))
+    (Trusted.VerificationResult.argsMatchSignature (Mir.FrameTutor.magic_version.body.instantiate List.nil) args mem)
   post := fun args _ ret _ => defaultPost args ret
+
+/-- Default transitive callee table (`s.memory.callees`) for `frame_tutor::magic_version`,
+    containing all reachable captured MIR bodies without an explicit
+    `#[external_spec]` override. -/
+def defaultCallees : List CapturedMir :=
+  .nil
 
 /-- Low-priority default `ModularItemSpec` instance for `frame_tutor::magic_version`. -/
 instance (priority := low) defaultModularSpec :
     ModularItemSpec "frame_tutor::magic_version" where
   envAssumed := fun _ => True
   pre := fun args mem =>
-    And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.magic_version.body args).memory)
+    And (And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.magic_version.body args).memory))
+    (Trusted.VerificationResult.argsMatchSignature (Mir.FrameTutor.magic_version.body.instantiate List.nil) args mem)
   post := fun args _ ret _ => defaultPost args ret
 
 /-- Low-priority default `UbExceptionItemSpec` instance for `frame_tutor::magic_version`. -/
 instance (priority := low) defaultUbExceptionSpec :
     UbExceptionItemSpec "frame_tutor::magic_version" where
-  pre := fun args _ => defaultPre args
+  pre := fun args mem => sigPre List.nil args mem
   strictSafetyPre := fun _ _ => False
-  post := fun args _ ret _ => defaultPost args ret
+  post := fun args _ ret mem => sigPost List.nil args ret mem
 
 /-- Refine `defaultSpec` by conjoining additional Lean `extraPre` and
     `extraPost` clauses while preserving `rustRequires` and `rustEnsures`. -/
@@ -393,32 +441,144 @@ instance (priority := low) defaultUbExceptionSpec :
 /-- Canonical verification claim for `frame_tutor::magic_version` synthesized from
     `ItemSpec "frame_tutor::magic_version"`. -/
 def claim [spec : ItemSpec "frame_tutor::magic_version"] : Claim :=
-  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical stateful verification claim for `frame_tutor::magic_version` synthesized
     from `StatefulItemSpec "frame_tutor::magic_version"`. -/
 def statefulClaim [spec : StatefulItemSpec "frame_tutor::magic_version"] : StatefulClaim :=
-  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical total-correctness verification claim for `frame_tutor::magic_version` synthesized
     from `TotalItemSpec "frame_tutor::magic_version"`. -/
 def totalClaim [spec : TotalItemSpec "frame_tutor::magic_version"] : TotalClaim :=
-  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical program-to-program equivalence claim for `frame_tutor::magic_version` synthesized
     from `StatefulEquivItemSpec "frame_tutor::magic_version"`. -/
 def equivClaim [spec : StatefulEquivItemSpec "frame_tutor::magic_version"] : StatefulEquivClaim :=
-  { implBody := Mir.FrameTutor.magic_version.body, specBody := spec.specBody, pre := spec.pre, post := spec.post }
+  { implBody := Mir.FrameTutor.magic_version.body, specBody := spec.specBody, pre := spec.pre, post := spec.post, implCallees := defaultCallees, specCallees := defaultCallees }
 
 /-- Canonical modular verification claim for `frame_tutor::magic_version` synthesized
     from `ModularItemSpec "frame_tutor::magic_version"`. -/
 def modularClaim [spec : ModularItemSpec "frame_tutor::magic_version"] : ModularClaim :=
-  { body := Mir.FrameTutor.magic_version.body, envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.magic_version.body, envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical scoped UB-exception verification claim for `frame_tutor::magic_version` synthesized
     from `UbExceptionItemSpec "frame_tutor::magic_version"`. -/
 def ubExceptionClaim [spec : UbExceptionItemSpec "frame_tutor::magic_version"] : UbExceptionClaim :=
-  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post }
+  { body := Mir.FrameTutor.magic_version.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post, callees := defaultCallees }
+
+/-- Verification claim for `frame_tutor::magic_version` instantiated at `typeArgs`. -/
+def claimFor
+    [spec : ItemSpec "frame_tutor::magic_version"]
+    (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=
+  { body := Mir.FrameTutor.magic_version.body.instantiate typeArgs
+    pre := fun args =>
+      And (spec.pre args)
+          (Trusted.VerificationResult.argsMatchSignature
+            (Mir.FrameTutor.magic_version.body.instantiate typeArgs)
+            args
+            (initMachineState (Mir.FrameTutor.magic_version.body.instantiate typeArgs) args).memory)
+    post := fun args ret =>
+      And (spec.post args ret)
+          (Trusted.VerificationResult.retMatchesSignature
+            (Mir.FrameTutor.magic_version.body.instantiate typeArgs)
+            ret
+            (initMachineState (Mir.FrameTutor.magic_version.body.instantiate typeArgs) args).memory)
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic verification proposition for `frame_tutor::magic_version`
+    over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.magic_version.body.typeParamCount`. -/
+def polyClaim [spec : ItemSpec "frame_tutor::magic_version"] : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.magic_version.body.typeParamCount →
+      VerificationResult (claimFor typeArgs)
+
+/-- Stateful verification claim for `frame_tutor::magic_version` instantiated at `typeArgs`. -/
+def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim :=
+  { body := Mir.FrameTutor.magic_version.body.instantiate typeArgs
+    pre := fun args mem => sigPre typeArgs args mem
+    post := fun args _ ret mem => sigPost typeArgs args ret mem
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic stateful verification proposition for
+    `frame_tutor::magic_version` over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.magic_version.body.typeParamCount`. -/
+def polyStatefulClaim : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.magic_version.body.typeParamCount →
+      StatefulVerificationResult (statefulClaimFor typeArgs)
+
+/-- Total-correctness verification claim for `frame_tutor::magic_version` instantiated at
+    `typeArgs`. -/
+def totalClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : TotalClaim :=
+  { body := Mir.FrameTutor.magic_version.body.instantiate typeArgs
+    pre := fun args mem =>
+      And (And (defaultPreFor typeArgs args)
+                (mem = (initMachineState (Mir.FrameTutor.magic_version.body.instantiate typeArgs) args).memory))
+          (Trusted.VerificationResult.argsMatchSignature
+            (Mir.FrameTutor.magic_version.body.instantiate typeArgs) args mem)
+    post := fun args _ ret mem => sigPost typeArgs args ret mem
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic total-correctness verification
+    proposition for `frame_tutor::magic_version` over all `typeArgs : Trusted.MirAst.TypeSubst`
+    of length `Mir.FrameTutor.magic_version.body.typeParamCount`. -/
+def polyTotalClaim : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.magic_version.body.typeParamCount →
+      TotalVerificationResult (totalClaimFor typeArgs)
+
+/-- Modular verification claim for `frame_tutor::magic_version` instantiated at `typeArgs`. -/
+def modularClaimFor
+    [spec : ModularItemSpec "frame_tutor::magic_version"]
+    (typeArgs : Trusted.MirAst.TypeSubst) : ModularClaim :=
+  { body := Mir.FrameTutor.magic_version.body.instantiate typeArgs
+    envAssumed := spec.envAssumed
+    pre := fun args mem => sigPre typeArgs args mem
+    post := fun args _ ret m1 => sigPost typeArgs args ret m1
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic modular verification proposition for
+    `frame_tutor::magic_version` over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.magic_version.body.typeParamCount`. -/
+def polyModularClaim [spec : ModularItemSpec "frame_tutor::magic_version"] : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.magic_version.body.typeParamCount →
+      ModularVerificationResult (modularClaimFor typeArgs)
+
+/-- Scoped UB-exception verification claim for `frame_tutor::magic_version` instantiated at
+    `typeArgs`. -/
+def ubExceptionClaimFor
+    [spec : UbExceptionItemSpec "frame_tutor::magic_version"]
+    (typeArgs : Trusted.MirAst.TypeSubst) : UbExceptionClaim :=
+  { body := Mir.FrameTutor.magic_version.body.instantiate typeArgs
+    pre := fun args mem => sigPre typeArgs args mem
+    strictSafetyPre := spec.strictSafetyPre
+    post := fun args _ ret m1 => sigPost typeArgs args ret m1
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic UB-exception verification proposition
+    for `frame_tutor::magic_version` over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.magic_version.body.typeParamCount`. -/
+def polyUbExceptionClaim [spec : UbExceptionItemSpec "frame_tutor::magic_version"] : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.magic_version.body.typeParamCount →
+      UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)
+
+/-- Audited artifact identity for `frame_tutor::magic_version`. -/
+def artifactIdentity : ArtifactIdentity where
+  defPath := "frame_tutor::magic_version"
+  mirDialect := "V2026_06_01"
+  mirModuleSha256 := "780c6631a4b040182b8b8c398f7ce24a8a01877cb69bc48bae439ab8242d7450"
+
+/-- Package a polymorphic item proposition `P` into a single-item
+    `CrateClaim` for `Verify.FrameTutor.magic_version.verified` auditing. -/
+def polyCertificate (P : Prop) : CrateClaim where
+  crateName := "frame_tutor::magic_version"
+  mirDialect := "V2026_06_01"
+  items := [{ identity := artifactIdentity, certificate := P }]
 
 end Obligations.FrameTutor.magic_version
 ```
@@ -510,15 +670,10 @@ open Trusted.VerificationResult
     disk. -/
 instance (priority := low) defaultProof :
     ItemProof "frame_tutor::magic_version" Obligations.FrameTutor.magic_version.claim where
-  verified := by
-    first
-      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractAuto
-          Obligations.FrameTutor.magic_version.claim 64 64 Option.none Option.none
-      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.FrameTutor.magic_version.claim 64 (by
-          intro _ _
-          first
-          | simp; try omega
-          | exact True.intro)
+  verified :=
+    Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.FrameTutor.magic_version.claim 64 (by
+      intro _ _
+      exact True.intro)
 
 /-- Kernel-checked verification certificate for `frame_tutor::magic_version`. -/
 theorem verified : VerificationResult Obligations.FrameTutor.magic_version.claim :=
@@ -698,13 +853,14 @@ after which `cargo anneal` reports the failed build and exits with status `1`:
 ```text
 cargo-anneal error: lake build failed with status exit status: 1 in examples/tutor-ch1/.anneal:
 stdout:
-error: generated/Verify/FrameTutor/advance_offset.lean:32:12: Type mismatch
+error: generated/Verify/FrameTutor/advance_offset.lean:27:6: Type mismatch
   True.intro
 has type
   True
 but is expected to have type
   Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirSym 64 Obligations.FrameTutor.advance_offset.claim.body
-    (Trusted.Rustc.V2026_06_01.MirSemantics.initMachineState Obligations.FrameTutor.advance_offset.claim.body args✝)
+    (Trusted.Rustc.V2026_06_01.MirSemantics.initMachineStateWithCallees Obligations.FrameTutor.advance_offset.claim.body
+      args✝ Obligations.FrameTutor.advance_offset.claim.callees)
     (Anneal.Rustc.V2026_06_01.SymbolicEval.mirNormalPost fun retVal x =>
       Obligations.FrameTutor.advance_offset.claim.post args✝ retVal)
 - Verify.FrameTutor.advance_offset

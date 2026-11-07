@@ -25,9 +25,8 @@ via `verifyByWP`, and proves the companion `Anneal.BitValidity` layout theorems
 theorem verified :
     VerificationResult
       Obligations.FrameTutor.__anneal_unsafe_impl_WireHeader_for_FrameLen.claim :=
-  verifyByWP
+  verifyByWPFuelFree
     Obligations.FrameTutor.__anneal_unsafe_impl_WireHeader_for_FrameLen.claim
-    8
     (fun _ _ => True.intro)
 
 @[reducible]

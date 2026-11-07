@@ -1724,6 +1724,7 @@ structure SymState : Type where
 def concretizeSymMemory (body : CapturedMir) (st : SymState) : Memory :=
   { nextAllocId := length body.allocations
     globals := body.allocations
+    traitImpls := body.traitImpls
     borrows := st.borrows
     nextTag := st.nextTag
     callees := .nil
@@ -2732,8 +2733,12 @@ theorem symFinishPinEq_branch_ok_sound
                  .step (advanceStmt (concretizeSymState body args st) locals₂ {
                    nextAllocId := length body.allocations
                    globals := body.allocations
+                   traitImpls := body.traitImpls
                    borrows := borrows₂
                    nextTag := st.nextTag
+                   callees := .nil
+                   callStack := .nil
+                   activeCallee := .none
                  })
                | .none => .fail .ub) := by
             rcases concretizeSymSlot_eq_of_not_dead args dstSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
@@ -4253,8 +4258,12 @@ theorem symExtractUpperBound1_sound
                                                         (concretizeSymSlots args slots2)
                                                         { nextAllocId := length body.allocations
                                                           globals := body.allocations
+                                                          traitImpls := body.traitImpls
                                                           borrows := st.borrows
-                                                          nextTag := st.nextTag }
+                                                          nextTag := st.nextTag
+                                                          callees := .nil
+                                                          callStack := .nil
+                                                          activeCallee := .none }
                                                         hOp hActSz0 hSzEq] at hHold
                                                       have ⟨_, hScEq, hBranch⟩ :=
                                                         symFinishPinEq_branch_ok_sound
@@ -5567,8 +5576,12 @@ theorem symFinishEnsTrue_ok_sound
                .step (advanceStmt (concretizeSymState body args st) locals₂ {
                  nextAllocId := length body.allocations
                  globals := body.allocations
+                 traitImpls := body.traitImpls
                  borrows := borrows₂
                  nextTag := st.nextTag
+                 callees := .nil
+                 callStack := .nil
+                 activeCallee := .none
                })
              | .none => .fail .ub) := by
           rw [set?_concretizeSymSlots_concrete args (.init (.scalar ⟨1, 1⟩)) slots₂ dstLoc, hSetT]
@@ -5766,8 +5779,12 @@ theorem symExtractEnsuresUpperBound1_sound
                                             (concretizeSymSlots args slots2)
                                             { nextAllocId := length body.allocations
                                               globals := body.allocations
+                                              traitImpls := body.traitImpls
                                               borrows := st.borrows
-                                              nextTag := st.nextTag }
+                                              nextTag := st.nextTag
+                                              callees := .nil
+                                              callStack := .nil
+                                              activeCallee := .none }
                                             hUbOp hSz0 hSzEq]
                                           rw [evalUnsignedUpperBoundCmp_eq_true_of_ble op r sc0.bits hOp hBle]
                                           exact hStepTrue
@@ -7118,4 +7135,180 @@ theorem wrapScalarBits_eq_of_lt {val modulus : Nat} (h : val < modulus) :
     | true => exact absurd (Nat.le_of_ble_eq_true h_eq) (Nat.not_le_of_lt h)
   rw [hble]
 
+theorem swap_le_u16_lane {lo hi : Nat} (hlo : lo < 256) (hhi : hi < 256) :
+    bitwiseOrBits 16
+      (wrapScalarBits (bitwiseAndBits 16 (lo + 256 * hi) 255 * 256) 65536)
+      (wrapScalarBits ((lo + 256 * hi).div 256) 65536) =
+    lo * 256 + hi := by
+  have h_mod : (lo + 256 * hi) % 256 = lo := by omega
+  have h_div : (lo + 256 * hi).div 256 = hi := by
+    change (lo + 256 * hi) / 256 = hi
+    omega
+  rw [bitwiseAndBits_16_255, h_mod, h_div]
+  rw [wrapScalarBits_eq_of_lt (by omega), wrapScalarBits_eq_of_lt (by omega)]
+  exact bitwiseOrBits_16_mul256_add hlo hhi
+
+/-- Fuel-free 1-argument scalar equality `#[spec]` discharge combinator. -/
+theorem dischargeRustEqScalar1FuelFree
+    (width : Nat) (c : Claim) (reqBody ensBody : CapturedMir) (constVal : Nat)
+    (h_pre : ∀ args : List Value, c.pre args →
+      And (Trusted.Sequence.length args = 1) (MirBoolPredicateHolds reqBody args) := by
+      intro _ h; exact h)
+    (h_pins :
+      checkMirRequiresPinsScalars 64 reqBody [{ bits := constVal, sizeBytes := width }] =
+        true := by rfl)
+    (h_check :
+      checkMirRustPinnedSpecWithCallees 16 64 c.body ensBody c.callees
+        [.scalar { bits := constVal, sizeBytes := width }] = true := by rfl)
+    (h_post : ∀ ret : Value,
+      MirBoolPredicateHoldsWithCallees ensBody c.callees
+        ([.scalar { bits := constVal, sizeBytes := width }] ++ [ret]) →
+      c.post [.scalar { bits := constVal, sizeBytes := width }] ret := by
+      intro _ h; exact h) :
+    VerificationResult c :=
+  dischargeRustEqScalar1 width c 16 64 reqBody ensBody constVal h_pre h_pins h_check h_post
+
+abbrev dischargeRustEqU8FuelFree := @dischargeRustEqScalar1FuelFree 1
+abbrev dischargeRustEqU16FuelFree := @dischargeRustEqScalar1FuelFree 2
+abbrev dischargeRustEqU32FuelFree := @dischargeRustEqScalar1FuelFree 4
+abbrev dischargeRustEqU64FuelFree := @dischargeRustEqScalar1FuelFree 8
+abbrev dischargeRustEqUsizeFuelFree := @dischargeRustEqU64FuelFree
+
+/-- Fuel-free 2-argument scalar equality `#[spec]` discharge combinator. -/
+theorem dischargeRustEqScalar2FuelFree
+    (w1 w2 : Nat) (c : Claim) (reqBody ensBody : CapturedMir) (c1 c2 : Nat)
+    (h_pre : ∀ args : List Value, c.pre args →
+      And (Trusted.Sequence.length args = 2) (MirBoolPredicateHolds reqBody args) := by
+      intro _ h; exact h)
+    (h_pins :
+      checkMirRequiresPinsScalars 64 reqBody
+        [{ bits := c1, sizeBytes := w1 }, { bits := c2, sizeBytes := w2 }] =
+        true := by rfl)
+    (h_check :
+      checkMirRustPinnedSpecWithCallees 16 64 c.body ensBody c.callees
+        [.scalar { bits := c1, sizeBytes := w1 },
+         .scalar { bits := c2, sizeBytes := w2 }] = true := by rfl)
+    (h_post : ∀ ret : Value,
+      MirBoolPredicateHoldsWithCallees ensBody c.callees
+        ([.scalar { bits := c1, sizeBytes := w1 },
+          .scalar { bits := c2, sizeBytes := w2 }] ++ [ret]) →
+      c.post
+        [.scalar { bits := c1, sizeBytes := w1 },
+         .scalar { bits := c2, sizeBytes := w2 }] ret := by
+      intro _ h; exact h) :
+    VerificationResult c :=
+  dischargeRustEqScalar2 w1 w2 c 16 64 reqBody ensBody c1 c2 h_pre h_pins h_check h_post
+
+abbrev dischargeRustEq2U8FuelFree := @dischargeRustEqScalar2FuelFree 1 1
+
+/-- Fuel-free safe-panic symbolic WP discharge combinator. -/
+theorem verifyByWPSafeFuelFree
+    (c : Claim)
+    (h_wp : ∀ args : List Value, c.pre args →
+      wpMirSym 16 c.body (initMachineStateWithCallees c.body args c.callees)
+        (mirSafePost (fun retVal _ => c.post args retVal))) :
+    VerificationResult c :=
+  verifyByWPSafe c 16 h_wp
+
+/-- Fuel-free panic-forbidding symbolic WP discharge combinator. -/
+theorem verifyByWPFuelFree
+    (c : Claim)
+    (h_wp : ∀ args : List Value, c.pre args →
+      wpMirSym 16 c.body (initMachineStateWithCallees c.body args c.callees)
+        (mirNormalPost (fun retVal _ => c.post args retVal))) :
+    VerificationResult c :=
+  verifyByWP c 16 h_wp
+
+/-- Fuel-free pinned stateful equality discharge combinator. -/
+theorem dischargeStatefulEqFuelFree
+    (c : StatefulClaim) (expectedArgs : List Value) (expectedMem : Memory)
+    (h_pre : ∀ (args : List Value) (mem : Memory),
+      c.pre args mem → args = expectedArgs ∧ mem = expectedMem)
+    (h_eval :
+      wpMirSym 16 c.body
+        (initMachineStateWithMemoryAndCallees c.body expectedArgs expectedMem c.callees)
+        (mirNormalPost (c.post expectedArgs expectedMem))) :
+    StatefulVerificationResult c :=
+  dischargeStatefulEq c 16 expectedArgs expectedMem h_pre h_eval
+
+/-- Fuel-free boolean companion predicate checker (`rfl`-discharged). -/
+theorem mirBoolPredicateHolds_of_wp_fuelFree
+    (specBody : CapturedMir) (args : List Value)
+    (h : checkMirBoolBounded 128 specBody args = true := by rfl) :
+    MirBoolPredicateHolds specBody args :=
+  mirBoolPredicateHolds_of_checkBounded 128 specBody args h
+
 end Anneal.Rustc.V2026_06_01.SymbolicEval
+
+namespace Anneal.Rustc.V2026_06_01.Lower
+
+open Trusted.Refinement
+open Trusted.Effect
+open Trusted.ITree
+open Trusted.Rustc.V2026_06_01.MirAst
+open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.VerificationResult
+open Anneal.EffectWP
+open Anneal.ITreeWP
+
+/-- Fuel-free stateless `VerificationResult` combinator. -/
+theorem verifyMirFuelFree
+    (c : Claim)
+    (h_wp : ∀ args : List Value, c.pre args →
+      wpMirBounded 16 c.body (initMachineStateWithCallees c.body args c.callees)
+        (fun out => ∀ retVal mem', out = .normal (retVal, mem') → c.post args retVal)) :
+    VerificationResult c :=
+  verifyMirBounded c 16 h_wp
+
+/-- Fuel-free `MirBoolPredicateHolds` combinator. -/
+theorem mirBoolPredicateHolds_of_fuelFree
+    (specBody : CapturedMir) (args : List Value)
+    (h_wp : wpMirBounded 16 specBody (initMachineState specBody args)
+      (fun out => ∀ retVal mem',
+        out = .normal (retVal, mem') → retVal = .scalar { bits := 1, sizeBytes := 1 })) :
+    MirBoolPredicateHolds specBody args :=
+  mirBoolPredicateHolds_of_bounded 16 specBody args h_wp
+
+/-- Fuel-free `StatefulVerificationResult` combinator. -/
+theorem verifyStatefulMirFuelFree
+    (c : StatefulClaim)
+    (h_wp : ∀ args mem, c.pre args mem →
+      wpMirBounded 16 c.body (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
+        (fun out => ∀ retVal mem', out = .normal (retVal, mem') → c.post args mem retVal mem')) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirBounded c 16 h_wp
+
+/-- Fuel-free `TraceVerificationResult` combinator. -/
+theorem verifyTraceMirFuelFree
+    (c : TraceClaim)
+    (h_wp : ∀ args mem, c.pre args mem →
+      wpMirTraceBounded 16 c.body
+        (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
+        (fun tr out => c.post args mem tr out)) :
+    TraceVerificationResult c :=
+  verifyTraceMirBounded c 16 h_wp
+
+/-- Fuel-free `TotalVerificationResult` combinator. -/
+theorem verifyTotalMirFuelFree
+    (c : TotalClaim)
+    (h_wp : ∀ args mem, c.pre args mem →
+      wpMirBounded 16 c.body (initMachineStateWithMemoryAndCallees c.body args mem c.callees)
+        (fun out => ∃ retVal mem',
+          out = .normal (retVal, mem') ∧ c.post args mem retVal mem')) :
+    TotalVerificationResult c :=
+  verifyTotalMirBounded c 16 h_wp
+
+/-- Fuel-free `ModularVerificationResult` combinator. -/
+theorem verifyModularMirFuelFree
+    (C : CallContract MirCallReq (fun _ => MirCallAns))
+    (body : CapturedMir)
+    (pre : List Value → Memory → Prop)
+    (post : List Value → Memory → Value → Memory → Prop)
+    (h_wp : ∀ args mem, pre args mem →
+      wpMirModularBounded 16 C body (initMachineStateWithMemory body args mem)
+        (fun out => ∀ retVal mem', out = .normal (retVal, mem') → post args mem retVal mem')) :
+    ModularVerificationResult
+      { body, envAssumed := envSatisfiesContract C, pre, post } :=
+  verifyModularMirBounded C body pre post 16 h_wp
+
+end Anneal.Rustc.V2026_06_01.Lower

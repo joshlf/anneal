@@ -5,6 +5,7 @@ import Anneal.ITree
 import Anneal.Pass
 import Anneal.EffectWP
 import Anneal.ITreeWP
+import Anneal.MirLoops
 import Anneal.Scalars
 import Anneal.Memory
 import Anneal.BitValidity
@@ -15,6 +16,11 @@ import Anneal.Rustc.V2026_06_01.SymbolicEval
 import Anneal.Rustc.V2026_06_01.SymReflect
 import Anneal.Rustc.V2026_06_01.TraceCheck
 import Anneal.FunctionalTranslation
+import Anneal.MirFuelFree
+import Anneal.PureMirExec
+import Anneal.MirLiftCore
+import Anneal.MirLiftBench
+import Anneal.SepLogicLenses
 
 namespace Anneal
 
