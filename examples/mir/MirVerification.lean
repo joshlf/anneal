@@ -144,15 +144,33 @@ def addU32TotalClaim : TotalClaim where
   post _ _ ret _ := ret = .scalar ⟨42, 4⟩
 
 theorem addU32SafeClaim_verified : VerificationResult addU32SafeClaim := by
-  refine verifyMirFuelFree addU32SafeClaim ?_
-  rintro _ rfl retVal _ h_out
-  injection h_out with h_pair; injection h_pair with h_ret _
-  exact h_ret.symm
+  refine Anneal.PureMirExec.verifyMirNoPanic_of_pureExec addU32SafeClaim rfl ?_
+  rintro _ rfl
+  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
+  repeat (first
+    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl))
+  rfl
 
 theorem addU32TotalClaim_verified : TotalVerificationResult addU32TotalClaim := by
-  refine verifyTotalMirFuelFree addU32TotalClaim ?_
+  refine Anneal.PureMirExec.verifyTotalMir_of_pureExec addU32TotalClaim rfl
+    (fun _ _ h => h.2 ▸ Anneal.PureMirExec.rootActiveMemory_emptyMemory) ?_
   rintro _ _ ⟨rfl, rfl⟩
-  exact ⟨.scalar ⟨42, 4⟩, _, rfl, rfl⟩
+  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
+  repeat (first
+    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl))
+  rfl
 
 def overflowAddU32Claim : Claim where
   body := addU32UncheckedMirBody
@@ -193,10 +211,18 @@ def eq42BoolSpecMirBody : CapturedMir :=
 
 theorem example_companion_bool_spec_holds :
     MirBoolPredicateHolds eq42BoolSpecMirBody [.scalar ⟨42, 4⟩] := by
-  refine mirBoolPredicateHolds_of_fuelFree eq42BoolSpecMirBody [.scalar ⟨42, 4⟩] ?_
-  intro retVal _ h_out
-  injection h_out with h_pair; injection h_pair with h_ret _
-  exact h_ret.symm
+  -- `#mir_lift_spec` introduction for a call-free, alias-free companion body.
+  refine Anneal.PureMirExec.mirBoolPredicateHolds_of_pureExec _ _ rfl ?_
+  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
+  repeat (first
+    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl))
+  rfl
 
 /-! ## 3. Trace-Aware `switchInt` Verification (`TraceVerificationResult`) -/
 
@@ -358,9 +384,21 @@ def countdownTotalClaim : TotalClaim where
   post _ _ ret _ := ret = .scalar ⟨0, 4⟩
 
 theorem countdownTotalClaim_verified : TotalVerificationResult countdownTotalClaim := by
-  refine verifyTotalMirFuelFree countdownTotalClaim ?_
+  refine Anneal.PureMirExec.verifyTotalMir_of_pureExec countdownTotalClaim rfl
+    (fun _ _ h => h.2 ▸ Anneal.PureMirExec.rootActiveMemory_emptyMemory) ?_
   rintro _ _ ⟨rfl, rfl⟩
-  exact ⟨.scalar ⟨0, 4⟩, _, rfl, rfl⟩
+  -- The lifting rules unroll the three loop iterations; the step budget is
+  -- synthesized by the rules rather than chosen by hand.
+  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
+  repeat (first
+    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl))
+  rfl
 
 def infiniteLoopMirBody : CapturedMir :=
   mkMirBody "demo::infinite_loop" 0
@@ -587,7 +625,11 @@ theorem calleeAddOne_satisfies_contract :
     | normal rv => rcases rv with ⟨retVal, mem'⟩; rcases h_out with ⟨rfl, rfl⟩; rfl
     | panic => exact h_out.elim
     | abort => exact h_out.elim
-  · exact ⟨Anneal.PureMirExec.defaultCfgSteps calleeAddOneMirBody, by rfl⟩
+  · apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
+    apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
+    apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+    exact Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
+      (by rfl) rfl
 
 def rejectOtherCallsHandler : ExternalCallHandler :=
   fun _ => ITree.fail (E := MirClosedEffect) FailureKind.unsupported
@@ -953,10 +995,18 @@ def polySwapPairU32Claim : Claim where
   post _ ret := ret = .aggregate 0 [.scalar ⟨20, 4⟩, .scalar ⟨10, 4⟩]
 
 theorem polySwapPairU32Claim_verified : VerificationResult polySwapPairU32Claim := by
-  refine verifyMirFuelFree polySwapPairU32Claim ?_
-  rintro _ rfl retVal _ h_out
-  injection h_out with h_pair; injection h_pair with h_ret _
-  exact h_ret.symm
+  refine Anneal.PureMirExec.verifyMirNoPanic_of_pureExec polySwapPairU32Claim rfl ?_
+  rintro _ rfl
+  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
+  repeat (first
+    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl) (by rfl)
+    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
+        (by rfl))
+  rfl
 
 @[reducible]
 def defaultBoolTypeLayout : TypeLayout := {

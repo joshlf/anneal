@@ -17,6 +17,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.Scalars
 open Anneal.PureMirExec
+open Anneal.MirLiftCore
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Specs.WireframeDemo.parse_compression_flag
@@ -82,18 +83,6 @@ private theorem ensures_holds_zero :
       [.scalar { bits := 0, sizeBytes := 1 }, .scalar { bits := 0, sizeBytes := 1 }] :=
   mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl
 
-private theorem ensures_holds_of_eq_one (b : Nat) (hb1 : b = 1) :
-    MirBoolPredicateHolds
-      Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.body
-      [.scalar { bits := b, sizeBytes := 1 }, .scalar { bits := 1, sizeBytes := 1 }] :=
-  hb1 ▸ ensures_holds_one
-
-private theorem ensures_holds_of_eq_zero (b : Nat) (hb0 : b = 0) :
-    MirBoolPredicateHolds
-      Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.body
-      [.scalar { bits := b, sizeBytes := 1 }, .scalar { bits := 0, sizeBytes := 1 }] :=
-  hb0 ▸ ensures_holds_zero
-
 private theorem compressionFlagPost_one (b : Nat) (hb1 : b = 1) :
     compressionFlagPost
       [.scalar { bits := b, sizeBytes := 1 }]
@@ -118,52 +107,25 @@ private theorem compressionFlagPost_zero (b : Nat) (hb0 : b = 0) :
   subst h_bits
   rfl
 
-/-- Total-safety + functional verification certificate for `parse_compression_flag`. -/
+/-- Total-safety + functional verification certificate for
+`parse_compression_flag`.
+
+The body is call-free and alias-free (`checkPureMir`), so it is lifted with the
+`#mir_lift` rules applied explicitly over all `256` inputs (the step budget is
+synthesized structurally by the rules; no fuel constant appears in this proof).
+Only the guarded functional postcondition consults `rustRequires`. -/
 theorem verified : VerificationResult Obligations.WireframeDemo.parse_compression_flag.claim := by
-  refine verifyMirNoPanic_of_blockLinear _ rfl rfl rfl ?_
-  intro args h_pre
-  rcases h_pre with ⟨b, _hb, h_args⟩
-  rw [h_args]
-  dsimp only [
-    Obligations.WireframeDemo.parse_compression_flag.claim,
-    Obligations.WireframeDemo.parse_compression_flag.refineSafeSpec,
-    Obligations.WireframeDemo.parse_compression_flag.rustEnsures,
-    Obligations.WireframeDemo.parse_compression_flag.defaultPost,
-    ItemSpec.post,
-    Mir.WireframeDemo.parse_compression_flag.body,
-    Mir.WireframeDemo.parse_compression_flag.layouts,
-    defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-    wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-    stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-    finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
-    evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-    evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm,
-    rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy,
-    pointeeTyOf, elemTyOf, tyIsSigned, evalTerminatorSymTreeFast,
-    lookupSwitchTargetTree, applyUnwindAction, MirStepNode.step,
-    MirStepNode.retNormal, SymTree.bind, initMachineState, initLocals,
-    initLocalsAux, emptyMemory, mirNormalPost, readProjectedValue_nil,
-    readProjectedValue_field, invalidateConflictingBorrows, boolToScalar,
-    GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-    HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-    List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or,
-    bitwiseAndBits_one_one, bitwiseAndBits_one_zero,
-    ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-    Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-  by_cases h_odd : b % 2 = 1
-  · rw [beq_mod2_zero_of_odd h_odd]
-    exact ⟨fun h_req_pair =>
-      let hb1 : b = 1 :=
-        eq_one_of_zero_or_one_and_odd
-          (rustRequires_imp_zero_or_one b h_req_pair.1) h_odd
-      ⟨ensures_holds_of_eq_one b hb1, compressionFlagPost_one b hb1⟩⟩
-  · rw [beq_mod2_zero_of_not_odd h_odd]
-    exact ⟨fun h_req_pair =>
-      let hb0 : b = 0 :=
-        eq_zero_of_zero_or_one_and_not_odd
-          (rustRequires_imp_zero_or_one b h_req_pair.1) h_odd
-      ⟨ensures_holds_of_eq_zero b hb0, compressionFlagPost_zero b hb0⟩⟩
+  refine verifyMirNoPanic_of_pureExec _ rfl fun args h_pre => ?_
+  obtain ⟨b, -, rfl⟩ := h_pre
+  -- bb0: `_2 = BitAnd(_1, const 1_u8); _0 = Ne(move _2, const 0_u8); return`
+  apply lift_PureMirConverges (by rfl)
+  apply LiftBlock.of_lookup (by rfl)
+  repeat apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  rintro ⟨h_req, -⟩
+  rcases rustRequires_imp_zero_or_one b h_req with rfl | rfl
+  · exact ⟨ensures_holds_zero, compressionFlagPost_zero 0 rfl⟩
+  · exact ⟨ensures_holds_one, compressionFlagPost_one 1 rfl⟩
 
 /-- Non-vacuity witness confirming `parse_compression_flag`'s functional
 `rustRequires` contract is satisfiable (`flags_byte = 1`). -/

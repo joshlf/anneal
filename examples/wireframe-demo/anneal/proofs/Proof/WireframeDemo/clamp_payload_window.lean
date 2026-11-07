@@ -16,6 +16,7 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.Scalars
 open Anneal.PureMirExec
+open Anneal.MirLiftCore
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
@@ -261,62 +262,46 @@ private theorem wpReq_inversion (v1 v2 : Value)
   · intro h; exact False.elim h.val
 
 /-- Universal verification certificate for `clamp_payload_window` across all
-`requested : u16` and `max_window ≤ 1024`. -/
+`requested : u16` and `max_window ≤ 1024`.
+
+The body is call-free and alias-free (`checkPureMir`), so it is lifted with the
+`#mir_lift` rules applied explicitly; the `switchInt` on `requested <=
+max_window` is resolved by a case split, and the step budget is synthesized
+structurally by the rules (no fuel constant appears in this proof). -/
 theorem verified : VerificationResult Obligations.WireframeDemo.clamp_payload_window.claim := by
-  refine verifyMirNoPanic_of_blockLinear _ rfl rfl rfl ?_
-  intro args h_pre
+  refine verifyMirNoPanic_of_pureExec _ rfl fun args h_pre => ?_
   rcases h_pre with ⟨h_len, h_req⟩
-  rcases args with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
-  · nomatch h_len
-  · nomatch h_len
-  · rcases wpReq_inversion v1 v2 h_req with ⟨b1, b2, hv1, hv2, _hb1, _hb2⟩
-    subst hv1; subst hv2
-    dsimp only [
-      Obligations.WireframeDemo.clamp_payload_window.claim,
-      Obligations.WireframeDemo.clamp_payload_window.defaultSpec,
-      Obligations.WireframeDemo.clamp_payload_window.defaultPost,
-      ItemSpec.post,
-      Mir.WireframeDemo.clamp_payload_window.layouts,
-      Mir.WireframeDemo.clamp_payload_window.body,
-      defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-      wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-      stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-      finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
-      evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-      mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree, operandIsSigned, operandTy,
-      sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy,
-      resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
-      scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-      mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-      evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-      MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-      initMachineState, initLocals, initLocalsAux, emptyMemory, mirNormalPost,
-      readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag, lookupBorrow,
-      appendProjections, stripTransparentProjections, projectionsOverlap,
-      projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
-      borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
-      natListContainsBool, invalidateConflictingBorrows,
-      invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-      freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
-      updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
-      isBorrowDescendantOrSelfAux, boolToScalar,
-      GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-      HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-      List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-      get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
-      ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-      Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-    cases h_ble : Nat.ble b1 b2 with
-    | true =>
-      exact ⟨ensures_holds b1 b2 b1 (Or.inl ⟨Nat.le_of_ble_eq_true h_ble, rfl⟩)⟩
-    | false =>
-      have h_gt : b2 < b1 := by
-        have hnot : ¬ b1 ≤ b2 := fun hle => by
-          rw [Nat.ble_eq_true_of_le hle] at h_ble
-          nomatch h_ble
-        omega
-      exact ⟨ensures_holds b1 b2 b2 (Or.inr ⟨h_gt, rfl⟩)⟩
-  · nomatch h_len
+  obtain ⟨v1, v2, rfl⟩ : ∃ v1 v2, args = [v1, v2] := by
+    rcases args with _ | ⟨v1, _ | ⟨v2, _ | _⟩⟩
+    all_goals first | exact ⟨_, _, rfl⟩ | nomatch h_len
+  obtain ⟨b1, b2, rfl, rfl, -, -⟩ := wpReq_inversion v1 v2 h_req
+  -- bb0: `_3 = Le(_1, _2); switchInt(_3) -> [0: bb2, otherwise: bb1]`
+  apply lift_PureMirConverges (by rfl)
+  apply LiftBlock.of_lookup (by rfl)
+  repeat apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  by_cases h : b1 ≤ b2
+  · -- `requested <= max_window`: bb1 `_0 = copy _1; goto bb3`; bb3 `return`.
+    apply LiftStmtsTerminator.term_switchInt (target := 1) (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    · change 1 = lookupSwitchTarget (boolToScalar (Nat.ble b1 b2)).bits [(0, 2)] 1
+      rw [Nat.ble_eq_true_of_le h]
+      rfl
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    exact ensures_holds b1 b2 b1 (Or.inl ⟨h, rfl⟩)
+  · -- `requested > max_window`: bb2 `_0 = copy _2; goto bb3`; bb3 `return`.
+    apply LiftStmtsTerminator.term_switchInt (target := 2) (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    · change 2 = lookupSwitchTarget (boolToScalar (Nat.ble b1 b2)).bits [(0, 2)] 1
+      rw [Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (Nat.lt_of_not_le h)]
+      rfl
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
+    apply LiftBlock.of_lookup (by rfl)
+    apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    exact ensures_holds b1 b2 b2 (Or.inr ⟨Nat.lt_of_not_le h, rfl⟩)
 
 /-- Non-vacuity witness confirming `clamp_payload_window`'s `requires` contract
 is satisfiable (`requested = 512`, `max_window = 1024`). -/

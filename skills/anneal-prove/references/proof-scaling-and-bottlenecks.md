@@ -33,23 +33,30 @@ symbolic state.
 
 ### Solution
 Never hand-roll `BlockCtx` structures or manual `fuel` bounds in proof files.
-Instead, use the shared fuel-free combinators in `Anneal.PureMirExec`,
-`Anneal.MirLiftCore`, and `Anneal.MirFuelFree`:
-1. **Stateless branching CFGs & `#[spec]` companions:** Use `#mir_lift`,
-   `#mir_lift_spec`, `verifyMirNoPanic_of_blockLinear`,
-   `evalMirSpecBool_true_of_holds`, and
-   `mirBoolPredicateHolds_of_evalMirSpecBool_true`, which evaluate basic blocks
-   via `wpBlockLinear` / `evalMirSpecBool` with an automatic step bound derived
-   from `body.basicBlocks.length`.
-2. **Stateful branching CFGs:** Use `verifyStatefulMirNoPanic_of_cfg` (backed by
-   `wpStatefulBlockLinear`).
-3. **Stateful bounded loops:** Use `forRangeUp` (`forRangeUp_step`,
-   `forRangeUp_done`, `forRangeUp_invariant`), `mirWpConverges_of_sepLenses`, or
+Instead, lift the body so that `Mir.<Crate>.<Item>.body` stays an opaque
+constant in every goal:
+1. **Call-free, alias-free bodies (`checkPureMir` holds):** Use
+   `verifyMirNoPanic_of_pureExec` with the `#mir_lift` rules
+   (`lift_PureMirConverges`, `LiftBlock.of_lookup`, `LiftStmtsTerminator.*`);
+   each rule evaluates one statement or terminator by `rfl` and the step count
+   is synthesized by unification (`SKILL.md`, Pattern A). For companion bodies
+   that pass `checkPureMir`, use the `#mir_lift_spec` theorems
+   (`mirBoolPredicateHolds_of_pureExec`,
+   `mirBoolPredicateHolds_elim_of_pureExec`).
+2. **Bounded loops:** Use `forRangeUp` with `forRangeUp_induction` and
+   `mirWpConverges_forRangeUp` (or `mirWpConverges_whileRank`) so that the
+   proof is independent of the iteration count.
+3. **Reference arguments:** Use `LiftLensBlock` with
+   `mirWpConverges_of_sepLenses` / `verifyStatefulMir_of_sepLenses` (currently
+   restricted to `.runtimePostCleanup` bodies).
+4. **Fallback when no lift applies:** `verifyMirNoPanic_of_blockLinear`,
+   `holdBoolReq_of_mirBool`, `hold_mirBool_of_blockLinear`,
+   `verifyStatefulMirNoPanic_of_cfg`, and
    `verifyStatefulMirNoPanic_of_runCfgSteps` /
-   `verifyStatefulEquivMir_of_runCfgSteps` (backed by `runCfgStepsWith`, which
-   caches `localDecls` and `layouts` while keeping `body` opaque during
-   statement stepping).
-4. **Byte-cast rewrites after `body` unfolding:** Parameterize
+   `verifyStatefulEquivMir_of_runCfgSteps` evaluate whole blocks with the
+   body-derived budgets `defaultSpecSteps` / `defaultCfgSteps`. They remove
+   `BlockCtx` boilerplate but remain bounded evaluators.
+5. **Byte-cast rewrites after `body` unfolding:** Parameterize
    `evalByteCastAfterOperand` helper lemmas over `{body : CapturedMir}` with
    `(h_decls : body.localDecls = ... := by rfl)` and
    `(h_layouts : body.layouts = ... := by rfl)` so `rw` matches even after
@@ -147,6 +154,10 @@ Factor the proof into three cleanly separated theorems:
 ---
 
 ## 5. Fuel-Bounded Loop Unrolling and `subst h_fuel` Ordering (`verified_at_fuel` Pattern)
+
+*Legacy pattern for proofs that still unroll a loop at a fixed fuel. New loop
+proofs should use `forRangeUp` with `mirWpConverges_forRangeUp` (or
+`mirWpConverges_whileRank`), which needs no fuel at all.*
 
 ### Symptom
 In a loop proof (`runCfgSteps ctx state 120` or `wpCoalBounded ... 120`), all

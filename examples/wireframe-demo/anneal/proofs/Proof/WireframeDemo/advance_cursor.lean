@@ -18,29 +18,7 @@ open Anneal.ITreeWP
 open Anneal.PureMirExec
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
-open Anneal.FunctionalTranslation
 open Specs.WireframeDemo.advance_cursor
-
-/-- Pure `ValueCodec` for `FrameCursor { offset: u16, limit: u16 }`. -/
-def frameCursorCodec : ValueCodec (Nat × Nat) :=
-  ValueCodec.pair (ValueCodec.scalarNat 2) (ValueCodec.scalarNat 2)
-
-/-- Pure functional `MutUpdate` model of `advance_cursor(&mut FrameCursor, step)`. -/
-def advanceCursorUpdate (step : Nat) : MutUpdate (Nat × Nat) Bool :=
-  fun (offset, limit) =>
-    if step ≤ limit - offset then
-      ((offset + step, limit), true)
-    else
-      ((offset, limit), false)
-
-/-- Pure invariant preservation theorem for `advanceCursorUpdate`: whenever
-`offset <= limit`, the updated cursor satisfies `newOffset <= limit`. -/
-theorem advanceCursorUpdate_preserves_invariant
-    (offset limit step : Nat) (h_inv : offset ≤ limit) :
-    (advanceCursorUpdate step (offset, limit)).1.1 ≤
-      (advanceCursorUpdate step (offset, limit)).1.2 := by
-  dsimp [advanceCursorUpdate]
-  split <;> (dsimp; omega)
 
 /-- Stateful verification certificate for `wireframe_demo::advance_cursor`. -/
 theorem verified :
