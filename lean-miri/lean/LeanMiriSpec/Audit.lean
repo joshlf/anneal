@@ -271,6 +271,14 @@ open LeanMiriSpec.Correspondence in
   CanReserveAllocId
   annealEnsureAllocated_indirect
   stepPreservesNodup_of_write_local
+  arraySliceMetaTyId
+  annealPointerResolver
+  annealPointerArithmetic
+  annealLiveAllocationLookup
+  projectionMemoryOffset_inbounds_of_memPlaceRel
+  annealReadImmediate_whole_array_unsupported
+  ArrayConstructDestReady
+  inplaceMachine
   evalProjection_index_simulation
   evalProjection_constantIndex_simulation
   evalRvalue_len_array_simulation
@@ -281,6 +289,9 @@ open LeanMiriSpec.Correspondence in
   step_assign_array_element_simulation
   WellTypedLM2_1ArrayStmt
   step_stmt_lm2_1_array_simulation
+  step_storageLive_establishes_immediate
+  step_scalar_preserves_nodup
+  step_lm1_4_preserves_nodup_and_immediate
   WellTypedLM2_1Stmt
   step_stmt_lm2_1_simulation
   Witness.lm21Body
@@ -309,6 +320,11 @@ open LeanMiriSpec.Correspondence in
   Witness.lm21_index_uninit_ub
   Witness.lm21_constantIndex_oob_ub
   Witness.lm21_chain_steps
+  Witness.lm21_whole_array_read_unsupported
+  Witness.lm21_indirect_index_read_steps
+  Witness.lm21_indirect_index_uninit_ub
+  Witness.lm21MixedBody
+  Witness.lm21_mixed_reassign_chain_steps
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -1129,6 +1145,35 @@ example
   hslice.writeScalar_set hlt hrel hsz hbool hchar
 
 example
+    {mach : AnnealMachine} {ty : MirAst.Ty} {layouts : Layout.LayoutTable} {optVal : Option Value}
+    {mp : Miri.Interpreter.MemPlace AnnealProv} {offset : Miri.ABI.Size}
+    (hnodup : LiveAllocsNodup mach)
+    (hmp : MemPlaceRel mach ty layouts optVal mp)
+    (hoff_le : offset.bytes.toNat ≤ (translateTy ty layouts).layout.size.bytes.toNat)
+    (hoff_i64 : offset.bytes.toNat < 2 ^ 63) :
+    Miri.Interpreter.projectionMemoryOffset
+      annealPointerArithmetic
+      (annealPointerResolver mach)
+      (annealLiveAllocationLookup mach)
+      mp offset .inbounds .none =
+      .ok
+        { mp with
+          ptr := { mp.ptr with offset := Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes + offset.bytes) }
+          metadata := .none } :=
+  projectionMemoryOffset_inbounds_of_memPlaceRel hnodup hmp hoff_le hoff_i64
+
+example
+    {m : AnnealStepState} {layouts : Layout.LayoutTable}
+    {arrTy : MirAst.Ty} {elemKind : MirAst.RigidTy} {count : Nat} {optVal : Option Value}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (hwf : WellTypedArrayTy layouts arrTy elemKind count)
+    (hnodup : LiveAllocsNodup m.machine)
+    (hmp : MemPlaceRel m.machine arrTy layouts optVal mp) :
+    annealReadImmediate ⟨.indirect mp, translateTy arrTy layouts⟩ m =
+      .error (.unsupported "whole-array immediate read not supported") m :=
+  annealReadImmediate_whole_array_unsupported hwf hnodup hmp
+
+example
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     (hrel : StateRel body s m)
@@ -1140,9 +1185,8 @@ example
     (hwf : WellTypedArrayTy body.layouts arrTy elemKind count)
     (hmp : MemPlaceRel m.machine arrTy body.layouts (some (.aggregate 0 elems)) mp)
     (hidx_decl : get? body.localDecls idxLocal = some idxDecl)
-    (hidx_ty : idxDecl.ty = { kind := .uint .usize, layoutIdx := 0 })
-    (hidx_imm : IsImmediateFrameLocal topFrame idxLocal) :
-    let cx := annealProjectionCx topFrame body.layouts
+    (hidx_ty : idxDecl.ty = { kind := .uint .usize, layoutIdx := 0 }) :
+    let cx := annealProjectionCx topFrame body.layouts m.machine
     let base : Miri.Interpreter.OpTy AnnealProv :=
       ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : MirAst.Ty := { kind := elemKind, layoutIdx := 0 }
@@ -1194,7 +1238,7 @@ example
       ∃ msg,
         (annealProjectList cx base [.Index idxLocal]).mapError annealLiftProjectionError =
           .error (.undefinedBehavior msg)) :=
-  evalProjection_index_simulation hrel hframes hnodup hwf hmp hidx_decl hidx_ty hidx_imm
+  evalProjection_index_simulation hrel hframes hnodup hwf hmp hidx_decl hidx_ty
 
 example
     {body : CapturedMir} {locals : List LocalSlot} {m : AnnealStepState}
@@ -1211,7 +1255,7 @@ example
     (hwf_const :
       (fromEnd = false → offset < minLength) ∧
       (fromEnd = true → 0 < offset ∧ offset ≤ minLength)) :
-    let cx := annealProjectionCx topFrame body.layouts
+    let cx := annealProjectionCx topFrame body.layouts m.machine
     let base : Miri.Interpreter.OpTy AnnealProv :=
       ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : MirAst.Ty := { kind := elemKind, layoutIdx := 0 }
@@ -1302,11 +1346,11 @@ example
       some ⟨.assign ⟨dstIdx, .nil⟩ (.repeat op count), span⟩)
     (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
     (hwf : WellTypedArrayTy body.layouts dstDecl.ty elemKind count)
-    (hdst_imm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx)
+    (hdst_ready : ∀ topFrame, m.stack.frames = #[topFrame] →
+      ArrayConstructDestReady s m topFrame dstIdx)
     (hop : ∀ topFrame, m.stack.frames = #[topFrame] →
       WellTypedScalarOperand body topFrame op { kind := elemKind, layoutIdx := 0 })
-    (hprim : IsPrimScalarTy { kind := elemKind, layoutIdx := 0 })
-    (hcan_res : CanReserveAllocId m.machine.memory) :
+    (hprim : IsPrimScalarTy { kind := elemKind, layoutIdx := 0 }) :
     StepRel body m
       (evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.repeat op count), span⟩ body.localDecls body.layouts)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
@@ -1314,7 +1358,7 @@ example
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     StepPreservesImmediate m (fun j => j ≠ dstIdx)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
-  evalRvalue_repeat_simulation hrel hnodup hbb hstmt hdecl_dst hwf hdst_imm hop hprim hcan_res
+  evalRvalue_repeat_simulation hrel hnodup hbb hstmt hdecl_dst hwf hdst_ready hop hprim
 
 example
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -1329,11 +1373,11 @@ example
     (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
     (hwf : WellTypedArrayTy body.layouts dstDecl.ty elemKind count)
     (hlen_ops : ops.length = count)
-    (hdst_imm : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx)
+    (hdst_ready : ∀ topFrame, m.stack.frames = #[topFrame] →
+      ArrayConstructDestReady s m topFrame dstIdx)
     (hops : ∀ topFrame, m.stack.frames = #[topFrame] →
       ∀ op ∈ ops, WellTypedScalarOperand body topFrame op { kind := elemKind, layoutIdx := 0 })
-    (hprim : IsPrimScalarTy { kind := elemKind, layoutIdx := 0 })
-    (hcan_res : CanReserveAllocId m.machine.memory) :
+    (hprim : IsPrimScalarTy { kind := elemKind, layoutIdx := 0 }) :
     StepRel body m
       (evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.array elemTy) ops), span⟩
         body.localDecls body.layouts)
@@ -1342,8 +1386,8 @@ example
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     StepPreservesImmediate m (fun j => j ≠ dstIdx)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
-  evalRvalue_aggregate_array_simulation hrel hnodup hbb hstmt hdecl_dst hwf hlen_ops hdst_imm
-    hops hprim hcan_res
+  evalRvalue_aggregate_array_simulation hrel hnodup hbb hstmt hdecl_dst hwf hlen_ops hdst_ready
+    hops hprim
 
 example
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -1386,6 +1430,22 @@ example
 example
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
+    {bb : MirAst.BasicBlockData} {loc : MirAst.Local} {decl : MirAst.LocalDecl} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageLive loc, span⟩)
+    (hdecl : get? body.localDecls loc = some decl)
+    (hok : (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 =
+      .ok true)
+    {tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (htf' :
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) ()
+          m).1.stack.frames = #[tf']) :
+    IsImmediateFrameLocal tf' loc :=
+  step_storageLive_establishes_immediate hstate hbb hstmt hdecl hok htf'
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m)
     (hnodup : LiveAllocsNodup m.machine)
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : MirAst.BasicBlockData} {stmt : MirAst.Statement}
@@ -1395,6 +1455,10 @@ example
       WellTypedLM2_1Stmt body s m topFrame stmt) :
     StepRel body m
       (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesImmediate m (fun j => arrayConstructDest? stmt ≠ some j)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
   step_stmt_lm2_1_simulation hstate hnodup hphase hbb hstmt hwt
 
@@ -1503,7 +1567,8 @@ example :
       annealProjectList
         (annealProjectionCx
           (Witness.lm21ArrMiriFrame 4 (.scalar (.fromScalarInt Witness.lm21Usize1)))
-          Witness.lm21Body.layouts)
+          Witness.lm21Body.layouts
+          (Witness.witnessMachineOf Witness.lm21ArrAlloc))
         ⟨.indirect Witness.witnessMemPlace,
           translateTy Witness.lm21U16Arr3Ty Witness.lm21Body.layouts⟩
         [.Index 2] =
@@ -1519,7 +1584,8 @@ example :
 example :
     ∃ msc,
       annealProjectList
-        (annealProjectionCx (Witness.lm21ArrMiriFrame 7 .uninit) Witness.lm21Body.layouts)
+        (annealProjectionCx (Witness.lm21ArrMiriFrame 7 .uninit) Witness.lm21Body.layouts
+          (Witness.witnessMachineOf Witness.lm21ArrAlloc))
         ⟨.indirect Witness.witnessMemPlace,
           translateTy Witness.lm21U16Arr3Ty Witness.lm21Body.layouts⟩
         [.ConstantIndex 2 3 true] =
@@ -1687,6 +1753,76 @@ example :
         StateRel Witness.lm21Body s₅ m₅ ∧
         LiveAllocsNodup m₅.machine :=
   Witness.lm21_chain_steps
+
+example :
+    annealReadImmediate
+      ⟨.indirect Witness.witnessMemPlace,
+        translateTy Witness.lm21U16Arr3Ty Witness.lm21Body.layouts⟩
+      (Witness.lm21ArrMiri 3 .uninit) =
+      .error (.unsupported "whole-array immediate read not supported")
+        (Witness.lm21ArrMiri 3 .uninit) :=
+  Witness.lm21_whole_array_read_unsupported
+
+example :
+    let s₀ := Witness.lm21ArrAnneal 4 (.init (.scalar ⟨1, 8⟩))
+    let m₀ := Witness.lm21IndIdxMiri 4 Witness.lm21IdxInitAlloc1
+    let s' : MachineState :=
+      { frame :=
+          { blockIdx := 0
+            stmtIdx := 5
+            locals :=
+              [.init (.scalar ⟨0x0304, 2⟩), .init (.aggregate 0 Witness.lm21ArrElems),
+               .init (.scalar ⟨1, 8⟩), .uninit] }
+        memory := (initMachineState Witness.lm21Body []).memory }
+    stepMirFn Witness.lm21Body s₀ = .step s' ∧
+      ∃ m', Miri.Interpreter.Step.step
+          (annealStepHooks Witness.lm21Body.localDecls Witness.lm21Body.layouts) () m₀ =
+          (m', .ok true) ∧
+        StateRel Witness.lm21Body s' m' :=
+  Witness.lm21_indirect_index_read_steps
+
+example :
+    let s₀ := Witness.lm21ArrAnneal 4 .uninit
+    let m₀ := Witness.lm21IndIdxMiri 4 Witness.lm21IdxUninitAlloc
+    stepMirFn Witness.lm21Body s₀ = .fail .ub ∧
+      ∃ m' msg, Miri.Interpreter.Step.step
+          (annealStepHooks Witness.lm21Body.localDecls Witness.lm21Body.layouts) () m₀ =
+          (m', .error (.undefinedBehavior msg)) :=
+  Witness.lm21_indirect_index_uninit_ub
+
+example :
+    let hooks := annealStepHooks Witness.lm21MixedBody.localDecls Witness.lm21MixedBody.layouts
+    let repElems : List Value := [.scalar ⟨0x0708, 2⟩, .scalar ⟨0x0708, 2⟩, .scalar ⟨0x0708, 2⟩]
+    let newElems : List Value := [.scalar ⟨0x090A, 2⟩, .scalar ⟨0x0B0C, 2⟩, .scalar ⟨0x0D0E, 2⟩]
+    let mkState (k : Nat) (locals : List LocalSlot) : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := k, locals := locals }
+        memory := (initMachineState Witness.lm21MixedBody []).memory }
+    let s₁ := mkState 1 [.uninit, .uninit, .uninit]
+    let s₂ := mkState 2 [.uninit, .init (.aggregate 0 Witness.lm21ArrElems), .uninit]
+    let s₃ := mkState 3 [.uninit, .init (.aggregate 0 repElems), .uninit]
+    let s₄ := mkState 4 [.uninit, .init (.aggregate 0 newElems), .uninit]
+    let s₅ := mkState 5 [.uninit, .init (.aggregate 0 newElems), .init (.scalar ⟨2, 8⟩)]
+    let s₆ := mkState 6
+      [.init (.scalar ⟨0x0D0E, 2⟩), .init (.aggregate 0 newElems), .init (.scalar ⟨2, 8⟩)]
+    let s₇ := mkState 7 [.init (.scalar ⟨0x0D0E, 2⟩), .dead, .init (.scalar ⟨2, 8⟩)]
+    stepMirFn Witness.lm21MixedBody Witness.lm21MixedInitAnneal = .step s₁ ∧
+      stepMirFn Witness.lm21MixedBody s₁ = .step s₂ ∧
+      stepMirFn Witness.lm21MixedBody s₂ = .step s₃ ∧
+      stepMirFn Witness.lm21MixedBody s₃ = .step s₄ ∧
+      stepMirFn Witness.lm21MixedBody s₄ = .step s₅ ∧
+      stepMirFn Witness.lm21MixedBody s₅ = .step s₆ ∧
+      stepMirFn Witness.lm21MixedBody s₆ = .step s₇ ∧
+      ∃ m₁ m₂ m₃ m₄ m₅ m₆ m₇,
+        Miri.Interpreter.Step.step hooks () Witness.lm21MixedInitMiri = (m₁, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₅ = (m₆, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₆ = (m₇, .ok true) ∧
+        StateRel Witness.lm21MixedBody s₇ m₇ ∧
+        LiveAllocsNodup m₇.machine :=
+  Witness.lm21_mixed_reassign_chain_steps
 
 end StatementPins
 
