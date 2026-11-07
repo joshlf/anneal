@@ -260,29 +260,36 @@ Model `for i in lo..hi` / `while i < hi` loops with
 `Anneal.MirLoops.forRangeUp lo hi init step` and reason about the model with
 `forRangeUp_induction`, `forRangeUp_step_of_lt`, and `forRangeUp_eq_init_of_ge`.
 `mirWpConverges_forRangeUp lo hi init step body LoopInv s₀ post h_init h_body
-h_exit` turns a loop invariant `LoopInv i acc s` into a fuel-free
-`MirWpConverges` proof (combined with `MirWpConverges.bind` for loop-entry
-setup and `verifyStatefulMirNoPanic_of_wpConverges` at the top level).
+h_exit` (and its no-call counterpart `mirNoCallWpConverges_forRangeUp`, which
+lifts via `MirWpConverges.of_noCall` and feeds directly into
+`verifyStatefulEquivMir_of_wpConverges`) turns a loop invariant `LoopInv i acc
+s` into a fuel-free convergence proof (combined with `MirWpConverges.bind` /
+`MirNoCallWpConverges.bind` for loop-entry setup and
+`verifyStatefulMirNoPanic_of_wpConverges` or
+`verifyStatefulEquivMir_of_wpConverges` at the top level).
 Discharge every CFG segment with `runCfgToBlock body header cfg`, which steps
 until the evaluator next enters the loop-header block `header`, halts, or
 faults, so the proof never states a step count:
 
 - loop entry and each iteration (`h_body`):
   `mirStepsConverges_of_runCfgToBlock body mid post rfl header s ?_`;
-- the exit path once `i ≥ hi` (`h_exit`):
-  `mirWpConverges_of_runCfgToBlock body post rfl header s ?_`.
+- the exit path once `i ≥ hi` (`h_exit`), or a straight-line / unrolled body
+  that halts before re-entering `header`:
+  `mirWpConverges_of_runCfgToBlock body post rfl header s ?_` (or
+  `mirNoCallWpConverges_of_runCfgToBlock`).
 
 Each leaves a `cfgStepsWP mid post (runCfgToBlock …)` (or `cfgStateWP`) goal
 that one `dsimp only [runCfgToBlock, runCfgUntilAux, cfgAtBlock,
-defaultCfgSteps, stepCfgState, …]` evaluates. List the claim
-(`Obligations.<Crate>.<item>.statefulClaim`) there too, so that the body and
-initial state taken from the goal unfold: a folded `statefulClaim.body`
-leaves the evaluator stuck, and `dsimp` then times out. When the body indexes
-memory by the counter (`frame[2 * i]`), keep the accumulator symbolic, split
-the counter into its concrete values, and run one script on every case with
-`all_goals` (see `Proof/WireframeDemo/checksum_frame_safe.lean`). Use
-`mirWpConverges_whileRank` for loops with a decreasing rank instead of a
-counter.
+stepCfgState, …]` evaluates without `defaultCfgSteps`. List the claim
+(`Obligations.<Crate>.<item>.statefulClaim` or `equivClaim`) there too, so that
+the body and initial state taken from the goal unfold: a folded
+`statefulClaim.body` leaves the evaluator stuck, and `dsimp` then times out.
+When the body indexes memory by the counter (`frame[2 * i]`), keep the
+accumulator symbolic, split the counter into its concrete values, and run one
+script on every case with `all_goals` (see
+`Proof/WireframeDemo/checksum_frame_safe.lean` and
+`Proof/WireframeDemo/checksum_frame_fast.lean`). Use `mirWpConverges_whileRank`
+for loops with a decreasing rank instead of a counter.
 
 #### Pattern D: `&mut` / `&` arguments with `Anneal.SepLogicLenses`
 

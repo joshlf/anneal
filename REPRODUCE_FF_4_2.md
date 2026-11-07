@@ -30,15 +30,16 @@ than trusting this file.
   conditional verification. The wireframe-demo and tutor crates verify
   `UNCONDITIONAL`, with `TrustedBoundary kernel replay: PASS`.
 - No `BlockCtx`, no fuel numeral, and no step or statement count in any
-  migrated proof file (Section 6, step 3 greps for them). The bounded
-  evaluations that remain use budgets derived from the CFG size
-  (`defaultSpecSteps`, `defaultCfgSteps`) or the fixed-budget `*FuelFree`
-  wrappers inside `Anneal` (Section 2).
-- Proof LOC in `Proof/WireframeDemo/*.lean`: `8,009 → 1,899` (−76.3%) against
-  the last complete proof corpus `a6bebfc2`, and `4,264 → 1,899` (−55.5%)
+  migrated proof file (Section 6, step 3 greps for them). `defaultCfgSteps`
+  and `runCfgSteps` are now zero across all seven `Proof/WireframeDemo/*.lean`
+  files; the bounded evaluations that remain use `defaultSpecSteps` (on the
+  three impure `#[spec]` companions) or the fixed-budget `*FuelFree` wrappers
+  inside `Anneal` (Section 2).
+- Proof LOC in `Proof/WireframeDemo/*.lean`: `8,009 → 1,664` (−79.2%) against
+  the last complete proof corpus `a6bebfc2`, and `4,264 → 1,664` (−61.0%)
   against `0d3242d3` (whose `clamp_payload_window`, `frame_total_len`, and
   `parse_compression_flag` files are 33/33/158-line stubs without `verified`,
-  see Section 3). The migration added `+2,905` net LOC of shared theory
+  see Section 3). The migration added `+2,972` net LOC of shared theory
   (Section 3.2).
 
 ## 2. Which lifting API each proof uses
@@ -50,8 +51,8 @@ than trusting this file.
 | `WireframeDemo/parse_compression_flag` | `verifyMirNoPanic_of_pureExec` + rules | body | — (companions impure) | — | — | `requires`: `defaultSpecSteps` |
 | `WireframeDemo/decode_wire_header` | `verifyMirNoPanic_of_pureExec` + rules (`eval_rest`, `cons_eval_norm`) | body | n/a | — | — | none |
 | `WireframeDemo/advance_cursor` | `verifyStatefulMir_of_sepLenses` + `LiftLensBlock` | — | n/a | — | yes | none |
-| `WireframeDemo/checksum_frame_safe` | `verifyStatefulMirNoPanic_of_wpConverges` + `mirWpConverges_forRangeUp` + `runCfgToBlock` | — | n/a | yes | — | none in the proof (`runCfgToBlock` recursion bound `defaultCfgSteps`) |
-| `WireframeDemo/checksum_frame_fast` | `verifyStatefulEquivMir_of_runCfgSteps` | — | n/a | — | — | `defaultCfgSteps` |
+| `WireframeDemo/checksum_frame_safe` | `verifyStatefulMirNoPanic_of_wpConverges` + `mirNoCallWpConverges_forRangeUp` + `runCfgToBlock` | — | n/a | yes | — | none |
+| `WireframeDemo/checksum_frame_fast` | `verifyStatefulEquivMir_of_wpConverges` + `mirNoCallWpConverges_of_runCfgToBlock` + `safe_noCallWpConverges` | — | n/a | yes (spec) | — | none |
 | `MirVerification` (6 pure examples¹) | `*_of_pureExec` + rules | yes | `example_companion_bool_spec_holds` | — | — | none |
 | `MirVerification` (trace/stateful/modular²) | `*FuelFree` wrappers | — | — | — | — | fixed `16` |
 | `FrameTutor/*` (6 files) | `*FuelFree` wrappers | — | — | — | — | fixed `16`/`64`/`128` |
@@ -65,21 +66,28 @@ unroll its three loop iterations), `calleeAddOne_satisfies_contract`, and
 stateful unaligned-set example.
 
 "Budget" names any remaining bounded evaluation: `defaultSpecSteps body =
-16 * #blocks + 80` and `defaultCfgSteps body = 16 * #blocks + 40` are derived
-from the CFG size, and the `*FuelFree` wrappers in
+16 * #blocks + 80` is derived from the CFG size for impure companion
+predicates, and the `*FuelFree` wrappers in
 `Anneal.Rustc.V2026_06_01.SymbolicEval` fix the budget inside `Anneal`.
 `decode_wire_header` (pure `#mir_lift` rules; `eval_rest` takes each block's
 statement count from the block) and `advance_cursor`
 (`verifyStatefulMir_of_sepLenses` + `LiftLensBlock`) have no step budget at
 all. `checksum_frame_safe` proves its `while i < 4` loop with `forRangeUp` and
-`mirWpConverges_forRangeUp`; the entry segment, each iteration, and the exit
+`mirNoCallWpConverges_forRangeUp` (lifted to `MirWpConverges` via
+`MirWpConverges.of_noCall`); the entry segment, each iteration, and the exit
 are discharged by `mirStepsConverges_of_runCfgToBlock` /
-`mirWpConverges_of_runCfgToBlock`, which evaluate until the next entry into the
-loop header `bb1` (or the return). `runCfgToBlock` stops as soon as it reaches
-the target, so `defaultCfgSteps` only bounds its recursion and the proof states
-no step count.
+`mirNoCallWpConverges_of_runCfgToBlock`, which evaluate until the next entry
+into the loop header `bb1` (or the return). `runCfgToBlock` checks `cfgAtBlock`
+before every step and stops as soon as it reaches `target`, `.halted`, or
+`.faulted`, so its internal recursion bound (`#blocks + 256`) is never reached
+and no proof mentions `defaultCfgSteps` or a step count. `checksum_frame_fast`
+discharges `verified` via `verifyStatefulEquivMir_of_wpConverges`: it steps
+`checksum_frame_fast.body` to return with `mirNoCallWpConverges_of_runCfgToBlock`
+and reuses `safe_noCallWpConverges` from `Proof.WireframeDemo.checksum_frame_safe`
+for the reference specification body instead of re-unrolling
+`checksum_frame_safe.body`.
 
-Known blocker for the remaining companion and equivalence rows:
+Known blocker for the remaining companion rows:
 
 - The generated `__anodized_fn_requires_*` / `__anodized_fn_ensures_*`
   companions capture their arguments by reference through a closure
@@ -99,34 +107,36 @@ their `wpReq_inversion` lemma, call the `mir_lift_spec` tactic that the
 `Anneal` umbrella never imports, and define no `verified` theorem, so the
 `0d3242d3` column understates the cost of a complete proof.
 
-| Proof | `a6bebfc2` | `0d3242d3` | `[adv B1]` `a6aae5b8` | `[adv A1]` `07b582eb` | `[adv B2]` `ecdf04bf` | this revision | vs `a6bebfc2` |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `advance_cursor.lean` | 227 | 227 | 171 | 149 | 258 | 231 | +1.8% |
-| `checksum_frame_fast.lean` | 1,592 | 1,592 | 433 | 433 | 433 | 432 | −72.9% |
-| `checksum_frame_safe.lean` | 1,242 | 1,242 | 196 | 196 | 569 | 250 | −79.9% |
-| `clamp_payload_window.lean` | 1,595 | 33 (stub) | 330 | 315 | 315 | 315 | −80.3% |
-| `decode_wire_header.lean` | 979 | 979 | 425 | 425 | 336 | 272 | −72.2% |
-| `frame_total_len.lean` | 1,268 | 33 (stub) | 287 | 261 | 261 | 261 | −79.4% |
-| `parse_compression_flag.lean` | 1,106 | 158 (stub) | 176 | 138 | 138 | 138 | −87.5% |
-| **Total** | **8,009** | **4,264** | **2,018** | **1,917** | **2,310** | **1,899** | **−76.3%** |
+| Proof | `a6bebfc2` | `0d3242d3` | `[adv B1]` `a6aae5b8` | `[adv A1]` `07b582eb` | `[adv B2]` `ecdf04bf` | `[adv A2]` `fbd40894` | this revision | vs `a6bebfc2` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `advance_cursor.lean` | 227 | 227 | 171 | 149 | 258 | 231 | 231 | +1.8% |
+| `checksum_frame_fast.lean` | 1,592 | 1,592 | 433 | 433 | 433 | 432 | 174 | −89.1% |
+| `checksum_frame_safe.lean` | 1,242 | 1,242 | 196 | 196 | 569 | 250 | 275 | −77.9% |
+| `clamp_payload_window.lean` | 1,595 | 33 (stub) | 330 | 315 | 315 | 315 | 315 | −80.3% |
+| `decode_wire_header.lean` | 979 | 979 | 425 | 425 | 336 | 272 | 272 | −72.2% |
+| `frame_total_len.lean` | 1,268 | 33 (stub) | 287 | 261 | 261 | 261 | 259 | −79.6% |
+| `parse_compression_flag.lean` | 1,106 | 158 (stub) | 176 | 138 | 138 | 138 | 138 | −87.5% |
+| **Total** | **8,009** | **4,264** | **2,018** | **1,917** | **2,310** | **1,899** | **1,664** | **−79.2%** |
 
-Against `0d3242d3` the total falls by `55.5%` (`4,264 → 1,899`). Lines that
+Against `0d3242d3` the total falls by `61.0%` (`4,264 → 1,664`). Lines that
 mention `BlockCtx`: `111` at `a6bebfc2` (28/26/26/23/8 in `checksum_frame_fast`,
 `checksum_frame_safe`, `clamp_payload_window`, `frame_total_len`,
-`parse_compression_flag`), `0` now.
+`parse_compression_flag`), `0` now. Lines that mention `defaultCfgSteps` or
+`runCfgSteps`: `0` now across all seven files.
 
 ### 3.2 Shared theory added by the migration (`0d3242d3 → this revision`)
 
 | Module | `0d3242d3` | now | Δ | Contents |
 | :--- | ---: | ---: | ---: | :--- |
-| `theory/Anneal/MirLiftCore.lean` | 1,594 | 4,454 | +2,860 | fast evaluators, `wpBlockLinear`, `runCfgSteps`, `eval_n`/`eval_rest`/`cons_eval_norm`, `cfgStepsWP`, `runCfgToBlock` and its `mirStepsConverges`/`mirWpConverges` theorems, `#mir_lift_spec` theorems moved from `MirSpecLift.lean` |
+| `theory/Anneal/MirLiftCore.lean` | 1,594 | 4,480 | +2,886 | fast evaluators, `wpBlockLinear`, `runCfgSteps`, `eval_n`/`eval_rest`/`cons_eval_norm`, `cfgStepsWP`, `runCfgToBlock` and its `mirStepsConverges`/`mirNoCallWpConverges`/`mirWpConverges` theorems, `#mir_lift_spec` theorems moved from `MirSpecLift.lean` |
+| `theory/Anneal/MirLoops.lean` | 651 | 692 | +41 | `mirNoCallWpConverges_forRangeUp` for fuel-free `verifyStatefulEquivMir_of_wpConverges` loop specs |
 | `theory/Anneal/SepLogicLenses.lean` | 13,655 | 13,677 | +22 | generalized `LiftLensBlock` and `verifyStatefulMir_of_sepLenses` to `isRuntimeMirPhase body.phase = true` |
 | `theory/Anneal/Rustc/V2026_06_01/SymReflect.lean` | 7,125 | 7,301 | +176 | `swap_le_u16_lane`, fixed-budget `*FuelFree` wrappers |
 | `theory/Anneal/MirSpecLift.lean` | 139 | — | −139 | removed (never imported by `Anneal`, not in `DOWNSTREAM_TARGETS`) |
 | `theory/Anneal/PureMirExec.lean` | 18,475 | 18,461 | −14 | `sup/ff-4` `18c85931` (`I-10`) plus unused-binder fixes |
-| **Net** | | | **+2,905** | |
+| **Net** | | | **+2,972** | |
 
-The WireframeDemo proofs shrink by `6,110` lines against `a6bebfc2`; less than
+The WireframeDemo proofs shrink by `6,345` lines against `a6bebfc2`; less than
 half of that moved into reusable theory.
 
 ### 3.3 Tutor and `MirVerification`
@@ -145,15 +155,15 @@ sets `maxHeartbeats` itself; no file raises it above `800,000`. The host ran
 other Lean jobs during both measurements, so differences of a few seconds on
 unchanged files (`clamp_payload_window`, `frame_total_len`) are noise.
 
-| Proof | `maxHeartbeats` | `[adv B2]` | this revision | Dominated by |
-| :--- | ---: | ---: | ---: | :--- |
-| `advance_cursor.lean` | 400,000 | 2.5 s | 1.5 s | `verifyStatefulMir_of_sepLenses` + `LiftLensBlock` |
-| `checksum_frame_fast.lean` | 800,000 | 56.6 s | 57.1 s | `runCfgSteps` unrolling of both bodies |
-| `checksum_frame_safe.lean` | 400,000 | 34.4 s | 13.5 s | four `runCfgToBlock` iterations (about 1.8 s of `dsimp` each) |
-| `clamp_payload_window.lean` | 800,000 | 23.2 s | 27.1 s | companion lemmas |
-| `decode_wire_header.lean` | 400,000 | 7.8 s | 4.1 s | `LiftStmtsTerminator.eval_rest` + `cons_eval_norm` |
-| `frame_total_len.lean` | 800,000 | 32.6 s | 38.5 s | companion lemmas |
-| `parse_compression_flag.lean` | 800,000 | 11.4 s | 12.3 s | `requires` companion lemma |
+| Proof | `maxHeartbeats` | `[adv B2]` | `[adv A2]` | this revision | Dominated by |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| `advance_cursor.lean` | 400,000 | 2.5 s | 1.5 s | 1.5 s | `verifyStatefulMir_of_sepLenses` + `LiftLensBlock` |
+| `checksum_frame_fast.lean` | 800,000 | 56.6 s | 57.1 s | 15.2 s | single `runCfgToBlock` of `checksum_frame_fast.body` (reuses `safe_noCallWpConverges`) |
+| `checksum_frame_safe.lean` | 400,000 | 34.4 s | 13.5 s | 12.0 s | four `runCfgToBlock` iterations (about 1.8 s of `dsimp` each) |
+| `clamp_payload_window.lean` | 800,000 | 23.2 s | 27.1 s | 27.1 s | companion lemmas |
+| `decode_wire_header.lean` | 400,000 | 7.8 s | 4.1 s | 4.1 s | `LiftStmtsTerminator.eval_rest` + `cons_eval_norm` |
+| `frame_total_len.lean` | 800,000 | 32.6 s | 38.5 s | 32.5 s | companion lemmas |
+| `parse_compression_flag.lean` | 800,000 | 11.4 s | 12.3 s | 12.3 s | `requires` companion lemma |
 
 The `#mir_lift` part is cheap: with the companion lemmas replaced by `sorry`
 in a scratch copy, the whole of `frame_total_len.lean`, including `import`
@@ -161,7 +171,30 @@ time, elaborates in `1.5 s` (`clamp_payload_window.lean`: `1.4 s`,
 `parse_compression_flag.lean`: `3.2 s`), and `decode_wire_header.lean`
 elaborates in `4.1 s` (`18.8 s` under `wpBlockLinear` at `[adv A1]`).
 
-## 5. Changes across passes (`[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]`)
+## 5. Changes across passes (`[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]` → `[adv B3]`)
+
+- `checksum_frame_fast`, `checksum_frame_safe`, `MirLiftCore`, `MirLoops`
+  (`[adv B3]`):
+  1. Fixed `cfgAtBlock` in `theory/Anneal/MirLiftCore.lean` to return `true` on
+     `.halted _ _` and `.faulted` (matching its docstring) so `runCfgUntilAux`
+     stops immediately on return/fault instead of spinning through the remaining
+     recursion budget, and replaced `defaultCfgSteps body` in `runCfgToBlock`
+     with `Nat.add (length body.basicBlocks) 256` so callers never include
+     `defaultCfgSteps` in `dsimp only`.
+  2. Added `mirNoCallWpConverges_forRangeUp` to `theory/Anneal/MirLoops.lean`
+     and `mirNoCallWpConverges_of_cfgStateWP` /
+     `mirNoCallWpConverges_of_runCfgToBlock` to `theory/Anneal/MirLiftCore.lean`.
+  3. Exported `safe_noCallWpConverges` and `frame8_post_holds` from
+     `Proof/WireframeDemo/checksum_frame_safe.lean` (`12.0 s`, `275` lines) and
+     migrated `Proof/WireframeDemo/checksum_frame_fast.lean` off
+     `verifyStatefulEquivMir_of_runCfgSteps` (`57.1 s`, `432` lines) onto
+     `verifyStatefulEquivMir_of_wpConverges` +
+     `mirNoCallWpConverges_of_runCfgToBlock` + `safe_noCallWpConverges`
+     (`15.2 s`, `174` lines), eliminating the duplicate 4-iteration unrolling of
+     `checksum_frame_safe.body` and reducing `defaultCfgSteps` / `runCfgSteps`
+     occurrences across `Proof/WireframeDemo/*.lean` to `0`.
+  4. Removed 5 duplicated lines in `dsimp only` in
+     `Proof/WireframeDemo/frame_total_len.lean` (`261 → 259` lines).
 
 - `checksum_frame_safe` (`[adv A2]`): the `[adv B2]` loop proof passed exact
   step counts (`29` for the entry, `36` per iteration, `5` for the exit) to

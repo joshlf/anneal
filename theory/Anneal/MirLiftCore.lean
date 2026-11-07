@@ -4322,6 +4322,20 @@ theorem mirStepsConverges_of_runCfgSteps_none
     MirStepsConverges body s mid post :=
   mirStepsConverges_of_runCfgSteps body mid post h_phase fuel .none s cur' s' trivial h_eq h_mid
 
+theorem mirNoCallWpConverges_of_cfgStateWP
+    (body : CapturedMir) (post : MirOutcome → Prop)
+    (h_phase : body.phase = .runtimeOptimized)
+    (fuel : Nat)
+    (cur : Option (Nat × Nat × List Statement × Terminator))
+    (s : MachineState)
+    (h_cur : CurValid body cur)
+    (h_wp : cfgStateWP post (runCfgSteps body (.running true cur s) fuel)) :
+    MirNoCallWpConverges body s post := by
+  refine ⟨fuel + 1, ?_⟩
+  rw [wpMirNoCallSym_eq_wpMirNoCallBounded]
+  exact wpCoalBounded_of_runCfgSteps body post h_phase fuel
+    (.running true cur s) (.running s) ⟨rfl, h_cur⟩ h_wp
+
 theorem mirWpConverges_of_cfgStateWP
     (body : CapturedMir) (post : MirOutcome → Prop)
     (h_phase : body.phase = .runtimeOptimized)
@@ -4330,13 +4344,9 @@ theorem mirWpConverges_of_cfgStateWP
     (s : MachineState)
     (h_cur : CurValid body cur)
     (h_wp : cfgStateWP post (runCfgSteps body (.running true cur s) fuel)) :
-    MirWpConverges body s post := by
-  refine ⟨fuel + 1, ?_⟩
-  unfold wpMirSym
-  rw [wpMirExecSym_eq_wpCoalBounded]
-  exact wpCoalBounded_default_of_noCall (fuel + 1) body post (.running s)
-    (wpCoalBounded_of_runCfgSteps body post h_phase fuel
-      (.running true cur s) (.running s) ⟨rfl, h_cur⟩ h_wp)
+    MirWpConverges body s post :=
+  MirWpConverges.of_noCall
+    (mirNoCallWpConverges_of_cfgStateWP body post h_phase fuel cur s h_cur h_wp)
 
 theorem mirWpConverges_of_cfgStateWP_none
     (body : CapturedMir) (post : MirOutcome → Prop)
@@ -4375,18 +4385,21 @@ next enters basic block `target` (a running state with no cached block at
 statement 0 of `target`), halts, or faults. The first step is always taken,
 so a loop header reaches itself again one iteration later. Proofs therefore
 never state how many steps a loop iteration or a straight-line segment
-takes; `defaultCfgSteps body` only bounds the recursion.
+takes; `length body.basicBlocks + 256` only bounds the recursion.
 
-`runCfgUntilAux` checks for the target before each step and returns as soon
-as it is reached, so `dsimp` neither evaluates a step past the target nor
-unfolds the unused part of the bound.
+`runCfgUntilAux` checks `cfgAtBlock` before each step and returns as soon as
+`target`, `.halted`, or `.faulted` is reached, so `dsimp` neither evaluates
+a step past the target/halt nor unfolds the unused part of the bound.
 -/
 
-/-- Whether `cfg` is about to dispatch basic block `target`. -/
+/-- Whether `cfg` is about to dispatch basic block `target` or has halted /
+faulted. -/
 def cfgAtBlock (target : Nat) : CfgExecState → Bool
   | .running _ .none s =>
     Nat.beq s.frame.blockIdx target && Nat.beq s.frame.stmtIdx 0
-  | _ => false
+  | .running _ (.some _) _ => false
+  | .halted _ _ => true
+  | .faulted => true
 
 /-- Step from `cfg` until `atTarget = cfgAtBlock target cfg` holds, taking
 at most `budget` steps. -/
@@ -4399,11 +4412,12 @@ def runCfgUntilAux (body : CapturedMir) (target : Nat) :
       (cfgAtBlock target (stepCfgState body cfg))
 
 /-- Evaluate from `cfg` until the next entry into block `target`, a halt, or
-a fault, taking at least one and at most `defaultCfgSteps body + 1` steps. -/
+a fault, taking at least one and at most `length body.basicBlocks + 256 + 1`
+steps. -/
 def runCfgToBlock (body : CapturedMir) (target : Nat) (cfg : CfgExecState) :
     CfgExecState :=
-  runCfgUntilAux body target (defaultCfgSteps body) (stepCfgState body cfg)
-    (cfgAtBlock target (stepCfgState body cfg))
+  runCfgUntilAux body target (Nat.add (length body.basicBlocks) 256)
+    (stepCfgState body cfg) (cfgAtBlock target (stepCfgState body cfg))
 
 theorem runCfgUntilAux_eq_runCfgSteps (body : CapturedMir) (target : Nat) :
     ∀ budget cfg atTarget, ∃ k,
@@ -4420,7 +4434,7 @@ theorem runCfgToBlock_eq_runCfgSteps (body : CapturedMir) (target : Nat)
     (cfg : CfgExecState) :
     ∃ k, runCfgToBlock body target cfg = runCfgSteps body cfg k := by
   obtain ⟨k, hk⟩ := runCfgUntilAux_eq_runCfgSteps body target
-    (defaultCfgSteps body) (stepCfgState body cfg)
+    (Nat.add (length body.basicBlocks) 256) (stepCfgState body cfg)
     (cfgAtBlock target (stepCfgState body cfg))
   exact ⟨k + 1, by rw [runCfgToBlock, hk, runCfgSteps_step]⟩
 
@@ -4438,6 +4452,20 @@ theorem mirStepsConverges_of_runCfgToBlock
   exact mirStepsConverges_of_cfgStepsWP body mid post h_phase k .none s
     trivial h_wp
 
+/-- `mirNoCallWpConverges_of_cfgStateWP` without a step count, for a segment
+that halts before it re-enters block `target`. -/
+theorem mirNoCallWpConverges_of_runCfgToBlock
+    (body : CapturedMir) (post : MirOutcome → Prop)
+    (h_phase : body.phase = .runtimeOptimized) (target : Nat) (s : MachineState)
+    (h_wp : cfgStateWP post
+      (runCfgToBlock body target (.running true .none s))) :
+    MirNoCallWpConverges body s post := by
+  obtain ⟨k, hk⟩ :=
+    runCfgToBlock_eq_runCfgSteps body target (.running true .none s)
+  rw [hk] at h_wp
+  exact mirNoCallWpConverges_of_cfgStateWP body post h_phase k .none s
+    trivial h_wp
+
 /-- `mirWpConverges_of_cfgStateWP_none` without a step count, for a segment
 that halts before it re-enters block `target`. -/
 theorem mirWpConverges_of_runCfgToBlock
@@ -4445,10 +4473,8 @@ theorem mirWpConverges_of_runCfgToBlock
     (h_phase : body.phase = .runtimeOptimized) (target : Nat) (s : MachineState)
     (h_wp : cfgStateWP post
       (runCfgToBlock body target (.running true .none s))) :
-    MirWpConverges body s post := by
-  obtain ⟨k, hk⟩ :=
-    runCfgToBlock_eq_runCfgSteps body target (.running true .none s)
-  rw [hk] at h_wp
-  exact mirWpConverges_of_cfgStateWP body post h_phase k .none s trivial h_wp
+    MirWpConverges body s post :=
+  MirWpConverges.of_noCall
+    (mirNoCallWpConverges_of_runCfgToBlock body post h_phase target s h_wp)
 
 end Anneal.PureMirExec

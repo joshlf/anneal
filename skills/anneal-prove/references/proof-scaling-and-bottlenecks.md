@@ -47,13 +47,16 @@ constant in every goal:
    `checkPureMir`, use the `#mir_lift_spec` theorems
    (`mirBoolPredicateHolds_of_pureExec`,
    `mirBoolPredicateHolds_elim_of_pureExec`).
-2. **Bounded loops:** Use `forRangeUp` with `forRangeUp_induction` and
-   `mirWpConverges_forRangeUp` (or `mirWpConverges_whileRank`) together with
-   `mirStepsConverges_of_runCfgToBlock` and `mirWpConverges_of_runCfgToBlock`,
-   which evaluate from the loop header to its next entry (or to the return)
-   without a step count, so that the proof is structured around a loop
-   invariant at the loop header
-   (`Proof/WireframeDemo/checksum_frame_safe.lean`).
+2. **Bounded loops and equivalence proofs:** Use `forRangeUp` with
+   `forRangeUp_induction` and `mirWpConverges_forRangeUp` (or
+   `mirNoCallWpConverges_forRangeUp`, `mirWpConverges_whileRank`) together with
+   `mirStepsConverges_of_runCfgToBlock`, `mirWpConverges_of_runCfgToBlock`, and
+   `mirNoCallWpConverges_of_runCfgToBlock`, which evaluate from the loop header
+   to its next entry (or to the return) without a step count, so that the proof
+   is structured around a loop invariant at the loop header and reusable across
+   `verifyStatefulEquivMir_of_wpConverges`
+   (`Proof/WireframeDemo/checksum_frame_safe.lean` and
+   `Proof/WireframeDemo/checksum_frame_fast.lean`).
 3. **Reference arguments:** Use `LiftLensBlock` with
    `mirWpConverges_of_sepLenses` / `verifyStatefulMir_of_sepLenses` (which
    accepts `isRuntimeMirPhase body.phase = true` for both `.runtimePostCleanup`

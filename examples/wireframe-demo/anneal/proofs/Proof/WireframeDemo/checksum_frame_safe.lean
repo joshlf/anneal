@@ -34,27 +34,44 @@ return) are each evaluated by `runCfgToBlock` with target `bb1`, so the proof
 states no step counts.
 -/
 
-private theorem mul_0_2 : Nat.mul 0 2 = 0 := rfl
-private theorem mul_1_2 : Nat.mul 1 2 = 2 := rfl
-private theorem mul_2_2 : Nat.mul 2 2 = 4 := rfl
-private theorem mul_3_2 : Nat.mul 3 2 = 6 := rfl
-private theorem wrap8_0 : wrapScalarBits 0 18446744073709551616 = 0 := rfl
-private theorem wrap8_1 : wrapScalarBits 1 18446744073709551616 = 1 := rfl
-private theorem wrap8_2 : wrapScalarBits 2 18446744073709551616 = 2 := rfl
-private theorem wrap8_3 : wrapScalarBits 3 18446744073709551616 = 3 := rfl
-private theorem wrap8_4 : wrapScalarBits 4 18446744073709551616 = 4 := rfl
-private theorem wrap8_5 : wrapScalarBits 5 18446744073709551616 = 5 := rfl
-private theorem wrap8_6 : wrapScalarBits 6 18446744073709551616 = 6 := rfl
-private theorem wrap8_7 : wrapScalarBits 7 18446744073709551616 = 7 := rfl
-private theorem wrap4_8 : wrapScalarBits 8 4294967296 = 8 := rfl
+theorem mul_0_2 : Nat.mul 0 2 = 0 := rfl
+theorem mul_1_2 : Nat.mul 1 2 = 2 := rfl
+theorem mul_2_2 : Nat.mul 2 2 = 4 := rfl
+theorem mul_3_2 : Nat.mul 3 2 = 6 := rfl
+theorem wrap8_0 : wrapScalarBits 0 18446744073709551616 = 0 := rfl
+theorem wrap8_1 : wrapScalarBits 1 18446744073709551616 = 1 := rfl
+theorem wrap8_2 : wrapScalarBits 2 18446744073709551616 = 2 := rfl
+theorem wrap8_3 : wrapScalarBits 3 18446744073709551616 = 3 := rfl
+theorem wrap8_4 : wrapScalarBits 4 18446744073709551616 = 4 := rfl
+theorem wrap8_5 : wrapScalarBits 5 18446744073709551616 = 5 := rfl
+theorem wrap8_6 : wrapScalarBits 6 18446744073709551616 = 6 := rfl
+theorem wrap8_7 : wrapScalarBits 7 18446744073709551616 = 7 := rfl
+theorem wrap4_8 : wrapScalarBits 8 4294967296 = 8 := rfl
 
-private theorem get?_frame8CallerLocals (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
+theorem get?_frame8CallerLocals (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
     get? (frame8CallerLocals b0 b1 b2 b3 b4 b5 b6 b7) frame8SlotIdx =
       some (.init (frame8Value b0 b1 b2 b3 b4 b5 b6 b7)) := rfl
 
-private theorem get?Internal_frame8CallerLocals (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
+theorem get?Internal_frame8CallerLocals (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) :
     List.get?Internal (frame8CallerLocals b0 b1 b2 b3 b4 b5 b6 b7) 69 =
       some (.init (frame8Value b0 b1 b2 b3 b4 b5 b6 b7)) := rfl
+
+/-- Total functional model computing `(ret, mem)` for any `&[u8; 8]` frame. -/
+def checksumModel (_args : List Value) (mem : Memory) : Value × Memory :=
+  match get? mem.callerLocals frame8SlotIdx with
+  | .some (.init (.aggregate 0
+      [.scalar s0, .scalar s1, .scalar s2, .scalar s3,
+       .scalar s4, .scalar s5, .scalar s6, .scalar s7])) =>
+    (.scalar ⟨bigEndianWordSum4 s0.bits s1.bits s2.bits s3.bits
+      s4.bits s5.bits s6.bits s7.bits, 4⟩, mem)
+  | _ => (.scalar ⟨0, 4⟩, mem)
+
+theorem checksumModel_eq_of_callerLocals
+    (args : List Value) (mem : Memory) (b0 b1 b2 b3 b4 b5 b6 b7 : Nat)
+    (h_caller : mem.callerLocals = frame8CallerLocals b0 b1 b2 b3 b4 b5 b6 b7) :
+    checksumModel args mem =
+      (.scalar ⟨bigEndianWordSum4 b0 b1 b2 b3 b4 b5 b6 b7, 4⟩, mem) := by
+  unfold checksumModel; rw [h_caller, get?_frame8CallerLocals]; rfl
 
 /-- Big-endian word read at loop iteration `i ∈ {0, 1, 2, 3}`. -/
 def checksumWordAt (b0 b1 b2 b3 b4 b5 b6 b7 i : Nat) : Nat :=
@@ -131,7 +148,7 @@ def checksumLoopInv (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) (mem : Memory)
     s = checksumLoopState mem i a
       v6 v8 v9 v10 v12 v14 v15 v16 v17 v18 v20 v21 v25 v26 v27
 
-private theorem frame8_post_holds (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) (mem₀ : Memory)
+theorem frame8_post_holds (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) (mem₀ : Memory)
     (h_caller : mem₀.callerLocals = frame8CallerLocals b0 b1 b2 b3 b4 b5 b6 b7) :
     Obligations.WireframeDemo.checksum_frame_safe.statefulClaim.post
       [.ptr rootFrame8Ptr 8] mem₀
@@ -143,12 +160,19 @@ private theorem frame8_post_holds (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) (mem₀ : Memo
   obtain ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩ := h_slot
   rfl
 
-/-- Universal stateful verification certificate for `checksum_frame_safe`. -/
-theorem verified :
-    StatefulVerificationResult
-      Obligations.WireframeDemo.checksum_frame_safe.statefulClaim := by
-  refine verifyStatefulMirNoPanic_of_wpConverges _ ?_
-  intro args mem h_pre
+/-- Fuel-free call-forbidding convergence of `checksum_frame_safe` to
+`checksumModel`, shared with the `checksum_frame_fast` equivalence proof. -/
+theorem safe_noCallWpConverges
+    (args : List Value) (mem : Memory)
+    (h_pre : Obligations.WireframeDemo.checksum_frame_safe.statefulClaim.pre args mem) :
+    MirNoCallWpConverges Mir.WireframeDemo.checksum_frame_safe.body
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        Mir.WireframeDemo.checksum_frame_safe.body args mem
+        Obligations.WireframeDemo.checksum_frame_safe.defaultCallees)
+      (fun out =>
+        out = .normal (checksumModel args mem) ∧
+        Obligations.WireframeDemo.checksum_frame_safe.statefulClaim.post args mem
+          (checksumModel args mem).1 (checksumModel args mem).2) := by
   rcases h_pre with
     ⟨_, b0, b1, b2, b3, b4, b5, b6, b7,
       hb0, hb1, hb2, hb3, hb4, hb5, hb6, hb7,
@@ -159,23 +183,16 @@ theorem verified :
   dsimp at h_callee h_stack h_borrows h_caller
   subst h_callee h_stack h_borrows h_caller
   let mem₀ : Memory :=
-    { nextAllocId := nextAllocId
-      globals := globals
-      borrows := [sharedFrame8Borrow rootFrame8Ptr]
-      nextTag := nextTag
-      callees := callees
-      traitImpls := traitImpls
-      callStack := []
-      activeCallee := none
-      activeProtectors := activeProtectors
-      nextProtector := nextProtector
-      callerLocals := frame8CallerLocals b0 b1 b2 b3 b4 b5 b6 b7
-      fnPtrs := fnPtrs }
-  refine MirWpConverges.bind
+    { nextAllocId, globals, borrows := [sharedFrame8Borrow rootFrame8Ptr],
+      nextTag, callees, traitImpls, callStack := [], activeCallee := none,
+      activeProtectors, nextProtector,
+      callerLocals := frame8CallerLocals b0 b1 b2 b3 b4 b5 b6 b7, fnPtrs }
+  rw [checksumModel_eq_of_callerLocals _ _ b0 b1 b2 b3 b4 b5 b6 b7 rfl]
+  refine Anneal.MirFuelFree.MirNoCallWpConverges.bind
     (mirStepsConverges_of_runCfgToBlock (target := 1)
       Mir.WireframeDemo.checksum_frame_safe.body
       (checksumLoopInv b0 b1 b2 b3 b4 b5 b6 b7 mem₀ 0 0) _ rfl _ ?entry)
-    (fun s₀ h_init => mirWpConverges_forRangeUp 0 4 0
+    (fun s₀ h_init => mirNoCallWpConverges_forRangeUp 0 4 0
       (checksumWordStep b0 b1 b2 b3 b4 b5 b6 b7) _
       (checksumLoopInv b0 b1 b2 b3 b4 b5 b6 b7 mem₀) s₀ _ h_init ?iter ?exit)
   case' iter =>
@@ -192,11 +209,11 @@ theorem verified :
     obtain rfl : i = 4 := by omega
     rw [checksumPrefix_four] at h_a
     subst h_a
-    refine mirWpConverges_of_runCfgToBlock (target := 1) _ _ rfl _ ?_
+    refine mirNoCallWpConverges_of_runCfgToBlock (target := 1) _ _ rfl _ ?_
   all_goals -- evaluate every segment (entry, iterations, exit) to `bb1`
     dsimp only [
       cfgStepsWP, cfgStateWP, checksumLoopState, mem₀,
-      runCfgToBlock, runCfgUntilAux, cfgAtBlock, defaultCfgSteps,
+      runCfgToBlock, runCfgUntilAux, cfgAtBlock,
       Obligations.WireframeDemo.checksum_frame_safe.statefulClaim,
       Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
       Obligations.WireframeDemo.checksum_frame_safe.defaultCallees,
@@ -240,11 +257,19 @@ theorem verified :
       .aggregate 0 [], .aggregate 0 [], .aggregate 0 [], .aggregate 0 [],
       .aggregate 0 [], .aggregate 0 [], .aggregate 0 [], .aggregate 0 [],
       .aggregate 0 [], rfl⟩
-  case exit => exact ⟨rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 mem₀ rfl⟩
+  case exit => exact ⟨rfl, rfl, frame8_post_holds b0 b1 b2 b3 b4 b5 b6 b7 mem₀ rfl⟩
   all_goals -- iterations: `omega` discharges the symbolic overflow checks
     simp (disch := omega) only [Nat.add_eq, Nat.mul_eq, wrapScalarBits_eq_of_lt,
       bitwiseOrBits_32_mul256_add, nat_ble_eq_false_of_lt]
     exact ⟨rfl, by omega, by rw [h_a]; rfl,
       _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, rfl⟩
+
+/-- Universal stateful verification certificate for `checksum_frame_safe`. -/
+theorem verified :
+    StatefulVerificationResult
+      Obligations.WireframeDemo.checksum_frame_safe.statefulClaim :=
+  verifyStatefulMirNoPanic_of_wpConverges _ fun args mem h_pre =>
+    (MirWpConverges.of_noCall (safe_noCallWpConverges args mem h_pre)).mono
+      fun _ ⟨h_out, h_post⟩ => h_out ▸ h_post
 
 end Proof.WireframeDemo.checksum_frame_safe
