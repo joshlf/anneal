@@ -422,6 +422,23 @@ def defaultPre (args : List Value) : Prop :=
 def defaultPost (args : List Value) (ret : Value) : Prop :=
   MirBoolPredicateHolds Mir.FrameTutor.__anodized_fn_ensures_pin_magic.body (List.append args (List.cons ret List.nil))
 
+/-- Polymorphic default precondition for `frame_tutor::pin_magic` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def defaultPreFor
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value) : Prop :=
+  And (Trusted.Sequence.length args = (Mir.FrameTutor.pin_magic.body.instantiate typeArgs).argCount) (MirBoolPredicateHolds (Mir.FrameTutor.__anodized_fn_requires_pin_magic.body.instantiate typeArgs) args)
+
+/-- Polymorphic default postcondition for `frame_tutor::pin_magic` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def defaultPostFor
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value)
+    (ret : Value) : Prop :=
+  MirBoolPredicateHolds (Mir.FrameTutor.__anodized_fn_ensures_pin_magic.body.instantiate typeArgs) (List.append args (List.cons ret List.nil))
+
 /-- Trusted `requires` predicate lowered from companion `#[spec]` and
     `#[external_spec]` items for `frame_tutor::pin_magic`. -/
 abbrev rustRequires : List Value → Prop := defaultPre
@@ -448,33 +465,64 @@ instance (priority := low) defaultSpec : ItemSpec "frame_tutor::pin_magic" where
   pre := defaultPre
   post := defaultPost
 
+/-- Signature-typed stateful precondition for `frame_tutor::pin_magic` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def sigPre
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value)
+    (mem : Memory) : Prop :=
+  And (defaultPreFor typeArgs args)
+      (Trusted.VerificationResult.argsMatchSignature
+        (Mir.FrameTutor.pin_magic.body.instantiate typeArgs) args mem)
+
+/-- Signature-typed stateful postcondition for `frame_tutor::pin_magic` instantiated at
+    `typeArgs : Trusted.MirAst.TypeSubst`. -/
+@[reducible, simp]
+def sigPost
+    (typeArgs : Trusted.MirAst.TypeSubst)
+    (args : List Value)
+    (ret : Value)
+    (mem : Memory) : Prop :=
+  And (defaultPostFor typeArgs args ret)
+      (Trusted.VerificationResult.retMatchesSignature
+        (Mir.FrameTutor.pin_magic.body.instantiate typeArgs) ret mem)
+
 /-- Low-priority default `StatefulItemSpec` instance for `frame_tutor::pin_magic`. -/
 instance (priority := low) defaultStatefulSpec :
     StatefulItemSpec "frame_tutor::pin_magic" where
-  pre := fun args _ => defaultPre args
-  post := fun args _ ret _ => defaultPost args ret
+  pre := fun args mem => sigPre List.nil args mem
+  post := fun args _ ret mem => sigPost List.nil args ret mem
 
 /-- Low-priority default `TotalItemSpec` instance for `frame_tutor::pin_magic`. -/
 instance (priority := low) defaultTotalSpec :
     TotalItemSpec "frame_tutor::pin_magic" where
   pre := fun args mem =>
-    And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.pin_magic.body args).memory)
+    And (And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.pin_magic.body args).memory))
+    (Trusted.VerificationResult.argsMatchSignature (Mir.FrameTutor.pin_magic.body.instantiate List.nil) args mem)
   post := fun args _ ret _ => defaultPost args ret
+
+/-- Default transitive callee table (`s.memory.callees`) for `frame_tutor::pin_magic`,
+    containing all reachable captured MIR bodies without an explicit
+    `#[external_spec]` override. -/
+def defaultCallees : List CapturedMir :=
+  .nil
 
 /-- Low-priority default `ModularItemSpec` instance for `frame_tutor::pin_magic`. -/
 instance (priority := low) defaultModularSpec :
     ModularItemSpec "frame_tutor::pin_magic" where
   envAssumed := fun _ => True
   pre := fun args mem =>
-    And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.pin_magic.body args).memory)
+    And (And (defaultPre args) (mem = (initMachineState Mir.FrameTutor.pin_magic.body args).memory))
+    (Trusted.VerificationResult.argsMatchSignature (Mir.FrameTutor.pin_magic.body.instantiate List.nil) args mem)
   post := fun args _ ret _ => defaultPost args ret
 
 /-- Low-priority default `UbExceptionItemSpec` instance for `frame_tutor::pin_magic`. -/
 instance (priority := low) defaultUbExceptionSpec :
     UbExceptionItemSpec "frame_tutor::pin_magic" where
-  pre := fun args _ => defaultPre args
+  pre := fun args mem => sigPre List.nil args mem
   strictSafetyPre := fun _ _ => False
-  post := fun args _ ret _ => defaultPost args ret
+  post := fun args _ ret mem => sigPost List.nil args ret mem
 
 /-- Refine `defaultSpec` by conjoining additional Lean `extraPre` and
     `extraPost` clauses while preserving `rustRequires` and `rustEnsures`. -/
@@ -580,32 +628,144 @@ instance (priority := low) defaultUbExceptionSpec :
 /-- Canonical verification claim for `frame_tutor::pin_magic` synthesized from
     `ItemSpec "frame_tutor::pin_magic"`. -/
 def claim [spec : ItemSpec "frame_tutor::pin_magic"] : Claim :=
-  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical stateful verification claim for `frame_tutor::pin_magic` synthesized
     from `StatefulItemSpec "frame_tutor::pin_magic"`. -/
 def statefulClaim [spec : StatefulItemSpec "frame_tutor::pin_magic"] : StatefulClaim :=
-  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical total-correctness verification claim for `frame_tutor::pin_magic` synthesized
     from `TotalItemSpec "frame_tutor::pin_magic"`. -/
 def totalClaim [spec : TotalItemSpec "frame_tutor::pin_magic"] : TotalClaim :=
-  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical program-to-program equivalence claim for `frame_tutor::pin_magic` synthesized
     from `StatefulEquivItemSpec "frame_tutor::pin_magic"`. -/
 def equivClaim [spec : StatefulEquivItemSpec "frame_tutor::pin_magic"] : StatefulEquivClaim :=
-  { implBody := Mir.FrameTutor.pin_magic.body, specBody := spec.specBody, pre := spec.pre, post := spec.post }
+  { implBody := Mir.FrameTutor.pin_magic.body, specBody := spec.specBody, pre := spec.pre, post := spec.post, implCallees := defaultCallees, specCallees := defaultCallees }
 
 /-- Canonical modular verification claim for `frame_tutor::pin_magic` synthesized
     from `ModularItemSpec "frame_tutor::pin_magic"`. -/
 def modularClaim [spec : ModularItemSpec "frame_tutor::pin_magic"] : ModularClaim :=
-  { body := Mir.FrameTutor.pin_magic.body, envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post }
+  { body := Mir.FrameTutor.pin_magic.body, envAssumed := spec.envAssumed, pre := spec.pre, post := spec.post, callees := defaultCallees }
 
 /-- Canonical scoped UB-exception verification claim for `frame_tutor::pin_magic` synthesized
     from `UbExceptionItemSpec "frame_tutor::pin_magic"`. -/
 def ubExceptionClaim [spec : UbExceptionItemSpec "frame_tutor::pin_magic"] : UbExceptionClaim :=
-  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post }
+  { body := Mir.FrameTutor.pin_magic.body, pre := spec.pre, strictSafetyPre := spec.strictSafetyPre, post := spec.post, callees := defaultCallees }
+
+/-- Verification claim for `frame_tutor::pin_magic` instantiated at `typeArgs`. -/
+def claimFor
+    [spec : ItemSpec "frame_tutor::pin_magic"]
+    (typeArgs : Trusted.MirAst.TypeSubst) : Claim :=
+  { body := Mir.FrameTutor.pin_magic.body.instantiate typeArgs
+    pre := fun args =>
+      And (spec.pre args)
+          (Trusted.VerificationResult.argsMatchSignature
+            (Mir.FrameTutor.pin_magic.body.instantiate typeArgs)
+            args
+            (initMachineState (Mir.FrameTutor.pin_magic.body.instantiate typeArgs) args).memory)
+    post := fun args ret =>
+      And (spec.post args ret)
+          (Trusted.VerificationResult.retMatchesSignature
+            (Mir.FrameTutor.pin_magic.body.instantiate typeArgs)
+            ret
+            (initMachineState (Mir.FrameTutor.pin_magic.body.instantiate typeArgs) args).memory)
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic verification proposition for `frame_tutor::pin_magic`
+    over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.pin_magic.body.typeParamCount`. -/
+def polyClaim [spec : ItemSpec "frame_tutor::pin_magic"] : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.pin_magic.body.typeParamCount →
+      VerificationResult (claimFor typeArgs)
+
+/-- Stateful verification claim for `frame_tutor::pin_magic` instantiated at `typeArgs`. -/
+def statefulClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : StatefulClaim :=
+  { body := Mir.FrameTutor.pin_magic.body.instantiate typeArgs
+    pre := fun args mem => sigPre typeArgs args mem
+    post := fun args _ ret mem => sigPost typeArgs args ret mem
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic stateful verification proposition for
+    `frame_tutor::pin_magic` over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.pin_magic.body.typeParamCount`. -/
+def polyStatefulClaim : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.pin_magic.body.typeParamCount →
+      StatefulVerificationResult (statefulClaimFor typeArgs)
+
+/-- Total-correctness verification claim for `frame_tutor::pin_magic` instantiated at
+    `typeArgs`. -/
+def totalClaimFor (typeArgs : Trusted.MirAst.TypeSubst) : TotalClaim :=
+  { body := Mir.FrameTutor.pin_magic.body.instantiate typeArgs
+    pre := fun args mem =>
+      And (And (defaultPreFor typeArgs args)
+                (mem = (initMachineState (Mir.FrameTutor.pin_magic.body.instantiate typeArgs) args).memory))
+          (Trusted.VerificationResult.argsMatchSignature
+            (Mir.FrameTutor.pin_magic.body.instantiate typeArgs) args mem)
+    post := fun args _ ret mem => sigPost typeArgs args ret mem
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic total-correctness verification
+    proposition for `frame_tutor::pin_magic` over all `typeArgs : Trusted.MirAst.TypeSubst`
+    of length `Mir.FrameTutor.pin_magic.body.typeParamCount`. -/
+def polyTotalClaim : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.pin_magic.body.typeParamCount →
+      TotalVerificationResult (totalClaimFor typeArgs)
+
+/-- Modular verification claim for `frame_tutor::pin_magic` instantiated at `typeArgs`. -/
+def modularClaimFor
+    [spec : ModularItemSpec "frame_tutor::pin_magic"]
+    (typeArgs : Trusted.MirAst.TypeSubst) : ModularClaim :=
+  { body := Mir.FrameTutor.pin_magic.body.instantiate typeArgs
+    envAssumed := spec.envAssumed
+    pre := fun args mem => sigPre typeArgs args mem
+    post := fun args _ ret m1 => sigPost typeArgs args ret m1
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic modular verification proposition for
+    `frame_tutor::pin_magic` over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.pin_magic.body.typeParamCount`. -/
+def polyModularClaim [spec : ModularItemSpec "frame_tutor::pin_magic"] : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.pin_magic.body.typeParamCount →
+      ModularVerificationResult (modularClaimFor typeArgs)
+
+/-- Scoped UB-exception verification claim for `frame_tutor::pin_magic` instantiated at
+    `typeArgs`. -/
+def ubExceptionClaimFor
+    [spec : UbExceptionItemSpec "frame_tutor::pin_magic"]
+    (typeArgs : Trusted.MirAst.TypeSubst) : UbExceptionClaim :=
+  { body := Mir.FrameTutor.pin_magic.body.instantiate typeArgs
+    pre := fun args mem => sigPre typeArgs args mem
+    strictSafetyPre := spec.strictSafetyPre
+    post := fun args _ ret m1 => sigPost typeArgs args ret m1
+    callees := defaultCallees }
+
+/-- Universally quantified polymorphic UB-exception verification proposition
+    for `frame_tutor::pin_magic` over all `typeArgs : Trusted.MirAst.TypeSubst` of length
+    `Mir.FrameTutor.pin_magic.body.typeParamCount`. -/
+def polyUbExceptionClaim [spec : UbExceptionItemSpec "frame_tutor::pin_magic"] : Prop :=
+  ∀ (typeArgs : Trusted.MirAst.TypeSubst),
+    typeArgs.length = Mir.FrameTutor.pin_magic.body.typeParamCount →
+      UbExceptionVerificationResult (ubExceptionClaimFor typeArgs)
+
+/-- Audited artifact identity for `frame_tutor::pin_magic`. -/
+def artifactIdentity : ArtifactIdentity where
+  defPath := "frame_tutor::pin_magic"
+  mirDialect := "V2026_06_01"
+  mirModuleSha256 := "f6f79bee8cd5b77e10375c34d1c3b706015bacdb0feaa8bb39415528afb0359e"
+
+/-- Package a polymorphic item proposition `P` into a single-item
+    `CrateClaim` for `Verify.FrameTutor.pin_magic.verified` auditing. -/
+def polyCertificate (P : Prop) : CrateClaim where
+  crateName := "frame_tutor::pin_magic"
+  mirDialect := "V2026_06_01"
+  items := [{ identity := artifactIdentity, certificate := P }]
 
 end Obligations.FrameTutor.pin_magic
 ```

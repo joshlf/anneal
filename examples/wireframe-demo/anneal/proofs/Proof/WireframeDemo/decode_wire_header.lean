@@ -87,7 +87,7 @@ private theorem evalByteCastAfterOperand_wireHeader
   have h_enc :
       encodeValueToBytes defaultCodecFuel
         Mir.WireframeDemo.decode_wire_header.layouts
-        { kind := .array (.uint .u8) 4, layoutIdx := 1 }
+        { kind := .array (.uint .u8) 4, layoutIdx := 2 }
         (.aggregate 0
           [ .scalar { bits := 1, sizeBytes := 1 }
           , .scalar { bits := b1, sizeBytes := 1 }
@@ -103,12 +103,12 @@ private theorem evalByteCastAfterOperand_wireHeader
         { kind := .adt "wireframe_demo::WireHeader" [], layoutIdx := 5 } = some 4 := rfl
   have h_src :
       rigidTyByteSize Mir.WireframeDemo.decode_wire_header.layouts
-        { kind := .array (.uint .u8) 4, layoutIdx := 1 } = some 4 := rfl
+        { kind := .array (.uint .u8) 4, layoutIdx := 2 } = some 4 := rfl
   have h_op :
       operandTy Mir.WireframeDemo.decode_wire_header.body.localDecls
         Mir.WireframeDemo.decode_wire_header.layouts
         (.copy { local_ := 1, projection := [] }) =
-      some { kind := .array (.uint .u8) 4, layoutIdx := 1 } := rfl
+      some { kind := .array (.uint .u8) 4, layoutIdx := 2 } := rfl
   have h_lay :
       Mir.WireframeDemo.decode_wire_header.body.layouts =
         Mir.WireframeDemo.decode_wire_header.layouts := rfl

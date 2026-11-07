@@ -29,10 +29,13 @@ use anneal_rustc_capture::manifest::{escape_json, sha256_hex};
 use anneal_rustc_capture::{CapturedItemKind, CapturedTarget, UnitTargetRecord};
 
 use crate::obligations::{
-    SubjectObligationBundle, group_subject_obligations, render_obligations_module_with_options,
-    render_proof_template_with_options,
+    AuthoredItemModules, SubjectObligationBundle, group_subject_obligations,
+    render_obligations_module_with_options,
 };
-use crate::scaffold::detect_authored_item_modules;
+use crate::scaffold::{
+    MirLiftingProfile, analyze_workspace_lifting_profile, detect_authored_item_modules,
+    render_proof_template_with_hints,
+};
 
 /// Schema identifier stored in `.anneal/spec-lock.json`.
 pub const SPEC_LOCK_SCHEMA_V1: &str = "anneal.spec-lock.v1";
@@ -1306,11 +1309,63 @@ fn detect_tautological_ensures_weakening(stripped_lean_src: &str) -> Option<&'st
     None
 }
 
+pub(crate) fn is_lean_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '\''
+}
+
+/// Return the byte length of a Lean 4 character literal starting at byte `i`
+/// (`src.as_bytes()[i] == b'\''`), or `None` when `'` is an identifier prime
+/// (`c'`, `s''`) or an unclosed apostrophe.
+pub(crate) fn lean_char_literal_len(
+    src: &str,
+    i: usize,
+    prev_ch: Option<char>,
+) -> Option<usize> {
+    if src.as_bytes().get(i).copied() != Some(b'\'') {
+        return None;
+    }
+    if prev_ch.is_some_and(is_lean_ident_char) {
+        return None;
+    }
+    let after_open = src.get(i + 1..)?;
+    let first = after_open.chars().next()?;
+    if first == '\'' || first == '\n' || first == '\r' {
+        return None;
+    }
+    if first != '\\' {
+        let rest = &after_open[first.len_utf8()..];
+        return rest.starts_with('\'').then_some(1 + first.len_utf8() + 1);
+    }
+    let after_slash = &after_open[1..];
+    if let Some(hex_rest) = after_slash.strip_prefix('x') {
+        let hex = hex_rest.get(..2)?;
+        if hex.bytes().all(|b| b.is_ascii_hexdigit()) && hex_rest[2..].starts_with('\'') {
+            return Some(6);
+        }
+        return None;
+    }
+    if let Some(uni_rest) = after_slash.strip_prefix('u') {
+        let hex = uni_rest.get(..4)?;
+        if hex.bytes().all(|b| b.is_ascii_hexdigit()) && uni_rest[4..].starts_with('\'') {
+            return Some(8);
+        }
+        return None;
+    }
+    let esc = after_slash.chars().next()?;
+    if esc == '\n' || esc == '\r' {
+        return None;
+    }
+    let rest = &after_slash[esc.len_utf8()..];
+    rest.starts_with('\'').then_some(2 + esc.len_utf8() + 1)
+}
+
 pub(crate) fn strip_lean_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let mut block_depth = 0usize;
+    let mut in_str = false;
+    let mut prev_ch: Option<char> = None;
 
     while i < bytes.len() {
         if block_depth > 0 {
@@ -1320,16 +1375,59 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
             } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'/' {
                 block_depth -= 1;
                 i += 2;
-                out.push(' ');
+                if block_depth == 0 {
+                    out.push(' ');
+                    prev_ch = None;
+                }
             } else {
                 i += 1;
             }
             continue;
         }
 
+        if in_str {
+            if bytes[i] == b'\\' {
+                out.push('\\');
+                i += 1;
+                if let Some(ch) = input[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if bytes[i] == b'"' {
+                in_str = false;
+                out.push('"');
+                i += 1;
+                prev_ch = None;
+            } else if let Some(ch) = input[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            prev_ch = None;
+            continue;
+        }
+
+        // Preserve character literals (`'"'`, `'-'`, `'α'`, `'\x22'`) without
+        // misclassifying identifier primes (`if c'<'"' then`).
+        if let Some(char_len) = lean_char_literal_len(input, i, prev_ch) {
+            out.push_str(&input[i..i + char_len]);
+            i += char_len;
+            prev_ch = None;
+            continue;
+        }
+
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
             block_depth = 1;
             i += 2;
+            prev_ch = None;
             continue;
         }
 
@@ -1337,12 +1435,14 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
+            prev_ch = None;
             continue;
         }
 
         if let Some(ch) = input[i..].chars().next() {
             out.push(ch);
             i += ch.len_utf8();
+            prev_ch = Some(ch);
         } else {
             break;
         }
@@ -1445,6 +1545,7 @@ pub fn render_agent_context(
            - Assumption modules (`anneal/proofs/Assumptions/<Crate>/<Item>.lean`). Adding unauthorized `axiom` declarations is rejected by `verify_spec_lock` and `TrustedBoundary`.\n  \
            - Disposable generated modules (`.anneal/generated/Mir/**`, `.anneal/generated/Obligations/**`, `.anneal/generated/Verify/**`, `.anneal/lakefile.toml`, `.anneal/spec-lock.json`), which are deterministically overwritten before verification.\n\n",
     );
+    out.push_str(render_lifting_strategy_guide_section());
 
     for bundle in bundles {
         let def_id = &bundle.subject.target.def_id;
@@ -1455,18 +1556,34 @@ pub fn render_agent_context(
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        let authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
+        let mir_root = generated_root.join("Mir");
+        let lifting_profile = analyze_workspace_lifting_profile(&mir_root, bundle);
+        let raw_authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
+        let authored = crate::scaffold::effective_authored_for_bundle(
+            bundle,
+            raw_authored,
+            Some(&lifting_profile),
+        );
         let proof_status = if authored.has_proof {
             "Present"
         } else {
             "Missing"
         };
-        let is_effectively_modular = authored.is_modular
-            || (!authored.has_specs
-                && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
-        let contract_surface = if authored.is_ub_exception {
+        let contract_surface = if authored.is_polymorphic {
+            if authored.is_ub_exception {
+                "polymorphic ub_exception (`polyUbExceptionClaim` / `CrateVerificationResult`)"
+            } else if authored.is_modular {
+                "polymorphic modular (`polyModularClaim` / `CrateVerificationResult`)"
+            } else if authored.is_total {
+                "polymorphic total (`polyTotalClaim` / `CrateVerificationResult`)"
+            } else if authored.is_stateful {
+                "polymorphic stateful (`polyStatefulClaim` / `CrateVerificationResult`)"
+            } else {
+                "polymorphic (`polyClaim` / `CrateVerificationResult`)"
+            }
+        } else if authored.is_ub_exception {
             "ub_exception (`UbExceptionItemSpec` / `UbExceptionVerificationResult`)"
-        } else if is_effectively_modular {
+        } else if authored.is_modular {
             "modular (`ModularItemSpec` / `ModularVerificationResult`)"
         } else if authored.is_equiv {
             "equiv (`StatefulEquivItemSpec` / `StatefulEquivVerificationResult`)"
@@ -1520,8 +1637,11 @@ pub fn render_agent_context(
             ));
         }
 
-        let mir_disk = generated_root.join("Mir").join(&bundle.item_rel_path);
-        if mir_disk.is_file() {
+        if let Some(mir_disk) = crate::scaffold::resolve_workspace_mir_file(
+            &mir_root,
+            &bundle.subject,
+            &bundle.item_rel_path,
+        ) {
             let mir_text = fs::read_to_string(&mir_disk).map_err(|err| {
                 format!("failed to read {}: {}", mir_disk.display(), err)
             })?;
@@ -1530,6 +1650,12 @@ pub fn render_agent_context(
                 mir_text.trim_end()
             ));
         }
+
+        out.push_str(&render_item_lifting_guidance(
+            bundle,
+            authored,
+            &lifting_profile,
+        ));
 
         let proof_disk = proofs_root.join("Proof").join(&bundle.item_rel_path);
         if proof_disk.is_file() {
@@ -1541,7 +1667,7 @@ pub fn render_agent_context(
                 proof_text.trim_end()
             ));
         } else {
-            let starter = render_proof_template_with_options(bundle, authored);
+            let starter = render_proof_template_with_hints(bundle, authored, &lifting_profile);
             out.push_str(&format!(
                 "### Starter Proof Template (`anneal/proofs/Proof/{rel_lean}`)\n\n```lean\n{}\n```\n\n",
                 starter.trim_end()
@@ -1550,6 +1676,121 @@ pub fn render_agent_context(
     }
 
     Ok(out)
+}
+
+fn render_lifting_strategy_guide_section() -> &'static str {
+    "## Proof Lifting Strategy Guide (Lift First, Evaluate Last)\n\n\
+     - **`TrustedBoundary` & Zero-Fuel Discipline**:\n  \
+       - `Proof/<Crate>/<Item>.lean` is re-parsed under `Init`/`Std` syntax by `TrustedBoundary.lean` (`elab`, `macro`, `syntax`, `sorry`, `native_decide`, and unauthorized `axiom` are rejected).\n  \
+       - `#mir_lift` (`Anneal.MirLift`, emitting `<item>_model`, `<item>_lift_sound`, and `<item>_verified` or `LiftResidualBlock` under `residual := true`) is an interactive elaborator for closed (`argCount = 0`) bodies outside `TrustedBoundary`; inside `Proof/*.lean`, import `Anneal`, open the exact lifting namespaces (`open Anneal.PureMirExec Anneal.MirLiftCore`, plus `Anneal.MirFuelFree`, `Anneal.MirLoops`, or `Anneal.SepLogicLenses` as needed), and apply the lifting theorems directly with zero `BlockCtx` records and zero manual fuel or `iterate k` counts.\n\
+     - **Pattern A — Pure Scalar/ADT/Array MIR (`#mir_lift` rules in `Anneal.PureMirExec` + `Anneal.MirLiftCore`)**:\n  \
+       - Check `#eval Anneal.PureMirExec.checkPureMir Mir.<Item>.body`. When `true`, `open Anneal.PureMirExec Anneal.MirLiftCore` and bridge with `verifyMirNoPanic_of_pureExec`, `verifyMirSafe_of_pureExec`, `verifyTotalMir_of_pureExec`, or `verifyStatefulMirNoPanic_of_pureExec`.\n  \
+       - Step blocks structurally via `lift_PureMirConverges (by rfl)`, `LiftBlock.of_lookup (by rfl)`, and `LiftStmtsTerminator.{cons_eval, cons_eval_norm, eval_rest, term_assert, term_switchInt, term_goto, term_drop, term_return}` (`eval_rest` / `cons_eval_norm` normalize `PureEnv` updates via `forcePureEnv?`).\n  \
+       - For linked pure callees or modular call contracts, `open Anneal.PureMirExec` and use `checkPureMirWithCallees` (`verifyStatefulMirNoPanic_of_pureExecWithCallees_any`, `PureMirConverges.call_summary`) or `PureMirModularConverges` (`verifyModularMir_of_pureModularExec_any`).\n\
+     - **Pattern B — Companion `#[spec]` Predicates (`#mir_lift_spec` theorems in `Anneal.PureMirExec`)**:\n  \
+       - `open Anneal.PureMirExec`. When `checkPureMir` holds on a companion body, use the `#mir_lift_spec` theorem family (`mirBoolPredicateHolds_of_pureExec`, `mirBoolPredicateHolds_intro_of_pureExec`, `mirBoolPredicateHolds_elim_of_pureExec`, or `mirBoolPredicateHolds_elim_of_uniqueTruePath`, and `mirBoolPredicateHoldsWithCallees_of_checkPureMirBoolPredWithCallees` with `defaultSpecCallees`).\n  \
+       - When a `#[spec]` companion captures arguments by `&` reference (`Rvalue.ref` / `ProjectionElem.deref`, so `checkPureMir = false`), invert `requires` via `holdBoolReq_of_mirBool` with count-free `repeat`, discharge `ensures` via `hold_mirBool_of_blockLinear` (`defaultSpecSteps`), and prove concrete witnesses via `mirBoolPredicateHolds_of_evalMirSpecBool_true`.\n\
+     - **Pattern C — Loops (`forRangeUp` + `runCfgToBlock` in `Anneal.MirLoops` + `Anneal.PureMirExec` + `Anneal.MirFuelFree`)**:\n  \
+       - `open Anneal.MirLoops Anneal.PureMirExec Anneal.MirFuelFree` and model `for i in lo..hi` / `while i < hi` loops with `forRangeUp` (`forRangeUp_induction`, `mirWpConverges_forRangeUp`, `mirNoCallWpConverges_forRangeUp`, or `mirWpConverges_whileRank` for rank-decreasing loops).\n  \
+       - Step loop entry, single iterations, and exit to the loop-header block without step numerals via `runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, `mirWpConverges_of_runCfgToBlock`, `mirNoCallWpConverges_of_runCfgToBlock`), and close with `verifyStatefulMirNoPanic_of_wpConverges`, `verifyStatefulEquivMir_of_wpConverges`, or `verifyUbExceptionMir_of_wpConverges`.\n\
+     - **Pattern D — `&mut` References (`Anneal.SepLogicLenses`) & Shared `&` Reads**:\n  \
+       - For `&mut` borrows, `open Anneal.SepLogicLenses Anneal.FunctionalTranslation Anneal.MirLiftCore`, erase Tree Borrows and `Memory` aliasing via whole-slot `SepLensStateInv` (`ActiveTypedMutBorrow`, `treeMemoryPtrMutLens`) or sibling-field `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`, `treeFieldMemoryPtrMutLens`, `subplaceTreeMutLens`), derive `LiftLensBlock` (`LiftLensStmts`, `set?_of_forcePureEnv? rfl`), and conclude with `verifyStatefulMir_of_sepLenses`, `verifyStatefulMir_of_sepSubplaceLenses`, `mirWpConverges_of_sepLenses`, or `verifyTotalMir_of_sepLenses`.\n  \
+       - For shared `&T` / `*const T` reads without `&mut` borrows, `open Anneal.PureMirExec Anneal.MirFuelFree Anneal.Rustc.V2026_06_01.SymbolicEval` and step intraprocedurally via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, `verifyStatefulMirNoPanic_of_wpConverges`) or `dischargeStatefulEqFuelFree` on concrete pinned memory.\n\
+     - **Pattern E — Polymorphic MIR (`CapturedMir.instantiate`) & Bit-Validity (`Anneal.BitValidity`)**:\n  \
+       - For generic items (`typeParamCount > 0` / `poly*Claim`), `open Trusted.MirAst Anneal.PureMirExec Anneal.MirLiftCore` (plus `Anneal.SepLogicLenses` or `Anneal.MirFuelFree` for stateful/loop bodies), introduce `typeArgs` and `h_len` (`*ClaimFor typeArgs` instantiates `Mir.<Item>.body.instantiate typeArgs` via `CapturedMir.instantiate` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` (`claimFor`, `statefulClaimFor`, `totalClaimFor`, `modularClaimFor`, `ubExceptionClaimFor`) with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n  \
+       - For `#[invariant]` and `#[unsafe_impl]` layout/transmutation proofs, `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, `checkFromZeros_sound`, `checkFromBytes_sound`, `checkIntoBytes_sound`, and `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`.\n\n"
+}
+
+fn render_item_lifting_guidance(
+    bundle: &SubjectObligationBundle,
+    authored: AuthoredItemModules,
+    profile: &MirLiftingProfile,
+) -> String {
+    let item = &bundle.item_module_suffix;
+    let effective = crate::scaffold::effective_authored_for_bundle(bundle, authored, Some(profile));
+    let is_equiv = effective.is_equiv;
+    let is_modular = effective.is_modular;
+    let is_polymorphic = effective.is_polymorphic;
+    let is_bit_validity_item = matches!(
+        bundle.subject.item_kind,
+        anneal_rustc_capture::CapturedItemKind::TypeInvariant
+            | anneal_rustc_capture::CapturedItemKind::UnsafeTraitImpl
+    );
+
+    let mut out = String::from("### Recommended Lifting Strategy\n\n");
+    if profile.has_captured_mir {
+        out.push_str(&format!(
+            "- **Detected MIR Profile**: {} basic block(s), `typeParamCount`: `{}`, `checkPureMir` candidate: `{}`, loops/back-edges: `{}`, deref projections: `{}`, mutable borrows: `{}`\n",
+            profile.basic_block_count,
+            profile.type_param_count,
+            profile.is_pure_call_free_candidate(),
+            profile.has_cfg_back_edge,
+            profile.has_deref_projection,
+            profile.has_mut_borrow,
+        ));
+    }
+
+    if is_bit_validity_item {
+        out.push_str(&format!(
+            "- **Bit-Validity / Trait Route (`Anneal.BitValidity`)**: `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, `checkFromZeros_sound`, `checkFromBytes_sound`, `checkIntoBytes_sound`, and `transmute_sound_of_into_from_bytes` over `Mir.{item}.layouts`.\n"
+        ));
+    }
+    if is_polymorphic {
+        out.push_str(&format!(
+            "- **Polymorphic MIR Route (`CapturedMir.instantiate`)**: `Mir.{item}.body` is generic (`typeParamCount > 0` or `poly*Claim`); `open Trusted.MirAst Anneal.PureMirExec Anneal.MirLiftCore` (plus `Anneal.SepLogicLenses` or `Anneal.MirFuelFree` for stateful/loop bodies), `intro typeArgs h_len` (`*ClaimFor typeArgs` instantiates `Mir.{item}.body.instantiate typeArgs` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n"
+        ));
+    }
+    if profile.has_cfg_back_edge {
+        out.push_str(&format!(
+            "- **Primary Loop Route (`forRangeUp` + `runCfgToBlock`)**: `Mir.{item}.body` contains a CFG back-edge; `open Anneal.MirLoops Anneal.PureMirExec Anneal.MirFuelFree`, model loop state with `forRangeUp` (`mirWpConverges_forRangeUp` or `mirNoCallWpConverges_forRangeUp`), and discharge entry/step/exit segments via `runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, `mirNoCallWpConverges_of_runCfgToBlock`).\n"
+        ));
+    }
+    if profile.has_mut_borrow {
+        out.push_str(&format!(
+            "- **Reference / Borrow Route (`Anneal.SepLogicLenses`)**: `Mir.{item}.body` mutates or borrows `&mut` places; `open Anneal.SepLogicLenses Anneal.FunctionalTranslation Anneal.MirLiftCore`, establish `SepLensStateInv` (`ActiveTypedMutBorrow`) or `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`), prove `LiftLensBlock Mir.{item}.body 0 ...` using `set?_of_forcePureEnv? rfl`, and apply `verifyStatefulMir_of_sepLenses` (or `verifyStatefulMir_of_sepSubplaceLenses`).\n"
+        ));
+    } else if profile.has_deref_projection {
+        out.push_str(&format!(
+            "- **Shared-Reference / Pointer Read Route (`Anneal.PureMirExec` + `Anneal.MirFuelFree`)**: `Mir.{item}.body` dereferences shared `&` or pointer places without `&mut` borrows (`ActiveTypedMutBorrow` requires `.active` `&mut` permission); `open Anneal.PureMirExec Anneal.MirFuelFree Anneal.Rustc.V2026_06_01.SymbolicEval` and step via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, `verifyStatefulMirNoPanic_of_wpConverges`) or `dischargeStatefulEqFuelFree` on pinned concrete memory.\n"
+        ));
+    }
+    if is_modular || profile.has_callees_or_modular_contracts || profile.has_call_terminator {
+        out.push_str(
+            "- **Callee / Modular Route (`Anneal.PureMirExec`)**: `open Anneal.PureMirExec` and use `checkPureMirWithCallees` (`verifyStatefulMirNoPanic_of_pureExecWithCallees_any`, `PureMirConverges.call_summary`) for linked pure callees, or `PureMirModularConverges` + `verifyModularMir_of_pureModularExec_any` when modular call contracts are active.\n",
+        );
+    }
+    if profile.is_pure_call_free_candidate() && !profile.has_cfg_back_edge && !is_modular {
+        out.push_str(&format!(
+            "- **Primary Pure Route (`#mir_lift` rules)**: `Mir.{item}.body` is a pure call-free candidate (`checkPureMir`); `open Anneal.PureMirExec Anneal.MirLiftCore` and apply `verifyMirNoPanic_of_pureExec` (or `verifyTotalMir_of_pureExec` / `verifyStatefulMirNoPanic_of_pureExec`), `lift_PureMirConverges (by rfl)`, `LiftBlock.of_lookup (by rfl)`, and `LiftStmtsTerminator.{{cons_eval, cons_eval_norm, eval_rest, term_*}}`.\n"
+        ));
+    } else if !profile.has_captured_mir {
+        out.push_str(&format!(
+            "- **Body Route**: test `#eval Anneal.PureMirExec.checkPureMir Mir.{item}.body`; lift pure bodies with `#mir_lift` rules (`open Anneal.PureMirExec Anneal.MirLiftCore`), loops with `forRangeUp` + `runCfgToBlock` (`open Anneal.MirLoops Anneal.PureMirExec Anneal.MirFuelFree`), and `&mut` borrows with `Anneal.SepLogicLenses`.\n"
+        ));
+    }
+    if is_equiv {
+        out.push_str(
+            "- **Equivalence Route (`#[spec(equivalent_to: ...)]`)**: `open Anneal.PureMirExec Anneal.MirFuelFree` and apply `verifyStatefulEquivMir_of_wpConverges` with `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference specification's `MirNoCallWpConverges` theorem.\n",
+        );
+    }
+    if effective.is_ub_exception {
+        out.push_str(
+            "- **Scoped UB-Exception Route (`UbExceptionItemSpec`)**: `open Anneal.PureMirExec Anneal.MirFuelFree` and discharge `UbExceptionVerificationResult` via `verifyUbExceptionMir_of_wpConverges` and `mirWpConverges_of_runCfgToBlock`.\n",
+        );
+    }
+    if profile.has_inline_companions {
+        if profile.has_impure_inline_companions {
+            out.push_str(
+                "- **Companion Spec Route (`#mir_lift_spec` / closure-upvar fallback)**: inline `#[spec]` companions capture `&` upvars (`checkPureMir = false`); `open Anneal.PureMirExec`, invert `requires` with `holdBoolReq_of_mirBool` + count-free `repeat`, and prove `ensures` with `hold_mirBool_of_blockLinear` (`defaultSpecSteps`).\n",
+            );
+        } else {
+            out.push_str(
+                "- **Companion Spec Route (`#mir_lift_spec`)**: `open Anneal.PureMirExec` and lift pure `requires` / `ensures` companions via `mirBoolPredicateHolds_of_pureExec` and `mirBoolPredicateHolds_elim_of_pureExec` (or fall back to `holdBoolReq_of_mirBool` + `repeat` and `hold_mirBool_of_blockLinear` when closure `&` upvars make `checkPureMir = false`).\n",
+            );
+        }
+    }
+    out.push('\n');
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2346,5 +2587,305 @@ mod tests {
             .expect("preserving both external and sibling callee contracts must pass Check 4b");
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn render_agent_context_surfaces_mir_lift_spec_loops_and_sep_logic_lenses_guidance() {
+        let ws = unique_temp_dir("lifting-guidance");
+        let mir_dir = ws.join(".anneal/generated/Mir/Demo");
+        fs::create_dir_all(&mir_dir).expect("create Mir/Demo");
+
+        let pure_mir = r#"import Trusted
+namespace Mir.Demo.pure_fn
+def body : CapturedMir :=
+  {
+    defPath := "demo::pure_fn",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := List.nil,
+    basicBlocks := (List.cons { statements := List.nil, terminator := { kind := TerminatorKind.return_, span := "" }, isCleanup := false } List.nil),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.Demo.pure_fn
+"#;
+        let pure_comp_mir = r#"import Trusted
+namespace Mir.Demo.__anodized_fn_ensures_pure_fn
+def body : CapturedMir :=
+  {
+    defPath := "demo::__anodized_fn_ensures_pure_fn",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.ensures,
+    argCount := 2,
+    localDecls := List.nil,
+    basicBlocks := (List.cons { statements := List.nil, terminator := { kind := TerminatorKind.return_, span := "" }, isCleanup := false } List.nil),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.Demo.__anodized_fn_ensures_pure_fn
+"#;
+        let mut_mir = r#"import Trusted
+namespace Mir.Demo.mut_fn
+def body : CapturedMir :=
+  {
+    defPath := "demo::mut_fn",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := (List.cons { mutability := Mutability.not, ty := { kind := (RigidTy.ref Mutability.mut (RigidTy.uint UintTy.u32)), layoutIdx := 0 }, debugName := Option.none } List.nil),
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 1, projection := (List.cons ProjectionElem.deref List.nil) } (Rvalue.use (Operand.copy { local_ := 1, projection := (List.cons ProjectionElem.deref List.nil) }))), span := "" } List.nil), terminator := { kind := TerminatorKind.return_, span := "" }, isCleanup := false } List.nil),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.Demo.mut_fn
+"#;
+        let loop_mir = r#"import Trusted
+namespace Mir.Demo.loop_fn
+def body : CapturedMir :=
+  {
+    defPath := "demo::loop_fn",
+    phase := MirPhaseTag.runtimeOptimized,
+    role := ContractRole.subject,
+    argCount := 1,
+    localDecls := List.nil,
+    basicBlocks := (List.cons { statements := List.nil, terminator := { kind := (TerminatorKind.goto 1), span := "" }, isCleanup := false } (List.cons { statements := List.nil, terminator := { kind := (TerminatorKind.goto 1), span := "" }, isCleanup := false } List.nil)),
+    fnAbi := dummyAbi,
+    layouts := layouts,
+    allocations := List.nil
+  }
+end Mir.Demo.loop_fn
+"#;
+
+        fs::write(mir_dir.join("pure_fn.lean"), pure_mir).expect("write pure_fn.lean");
+        fs::write(
+            mir_dir.join("__anodized_fn_ensures_pure_fn.lean"),
+            pure_comp_mir,
+        )
+        .expect("write ensures companion");
+        fs::write(mir_dir.join("mut_fn.lean"), mut_mir).expect("write mut_fn.lean");
+        fs::write(mir_dir.join("loop_fn.lean"), loop_mir).expect("write loop_fn.lean");
+
+        let mk_rec = |def_id: &str, rel: &str, module: &str, kind, assoc: Option<&str>| {
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: def_id.to_string(),
+                    mir_module_path: rel.to_string(),
+                    mir_module_sha256: "a".repeat(64),
+                },
+                lean_module_name: module.to_string(),
+                item_kind: kind,
+                associated_subject_def_id: assoc.map(str::to_string),
+                trait_impls: Vec::new(),
+            }
+        };
+
+        let records = vec![
+            mk_rec(
+                "demo::pure_fn",
+                "Mir/Demo/pure_fn.lean",
+                "Mir.Demo.pure_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            mk_rec(
+                "demo::__anodized_fn_ensures_pure_fn",
+                "Mir/Demo/__anodized_fn_ensures_pure_fn.lean",
+                "Mir.Demo.__anodized_fn_ensures_pure_fn",
+                CapturedItemKind::InlineSpecEnsures,
+                Some("demo::pure_fn"),
+            ),
+            mk_rec(
+                "demo::mut_fn",
+                "Mir/Demo/mut_fn.lean",
+                "Mir.Demo.mut_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            mk_rec(
+                "demo::loop_fn",
+                "Mir/Demo/loop_fn.lean",
+                "Mir.Demo.loop_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+        ];
+
+        let ctx_pure = render_agent_context(&ws, &records, Some("demo::pure_fn"))
+            .expect("render context for pure_fn");
+        assert!(ctx_pure.contains("## Proof Lifting Strategy Guide (Lift First, Evaluate Last)"));
+        assert!(ctx_pure.contains("### Recommended Lifting Strategy"));
+        assert!(ctx_pure.contains("Primary Pure Route (`#mir_lift` rules)"));
+        assert!(ctx_pure.contains("Companion Spec Route (`#mir_lift_spec`)"));
+        assert!(ctx_pure.contains("mirBoolPredicateHolds_elim_of_pureExec"));
+        assert!(ctx_pure.contains("<item>_lift_sound"));
+        assert!(ctx_pure.contains("LiftResidualBlock"));
+        assert!(ctx_pure.contains("CapturedMir.instantiate"));
+        assert!(ctx_pure.contains("open Trusted.MirAst Anneal.PureMirExec Anneal.MirLiftCore"));
+        assert!(!ctx_pure.contains("Trusted.Layout"));
+        assert!(ctx_pure.contains("Anneal.BitValidity"));
+        assert!(ctx_pure.contains("checkFromBytes_sound"));
+        assert!(!ctx_pure.contains("Body.instantiate"));
+        assert!(!ctx_pure.contains("verifyPoly"));
+
+        // Verify pre-scaffold fallback from `target/anneal/units` when `.anneal/generated/Mir`
+        // has not been materialized yet.
+        let units_ws = unique_temp_dir("lifting-guidance-units-fallback");
+        let unit_mir_dir = units_ws.join("target/anneal/units/u0/Mir/Demo");
+        fs::create_dir_all(&unit_mir_dir).expect("create unit Mir/Demo");
+        fs::write(unit_mir_dir.join("loop_fn.lean"), loop_mir).expect("write unit loop_fn.lean");
+        let mut unit_rec = mk_rec(
+            "demo::loop_fn",
+            "Mir/Demo/loop_fn.lean",
+            "Mir.Demo.loop_fn",
+            CapturedItemKind::Subject,
+            None,
+        );
+        unit_rec.target.mir_module_sha256.clear();
+        let ctx_units = render_agent_context(&units_ws, &[unit_rec], Some("demo::loop_fn"))
+            .expect("render context from target/anneal/units");
+        assert!(ctx_units.contains("### Captured MIR Module"));
+        assert!(ctx_units.contains("Primary Loop Route (`forRangeUp` + `runCfgToBlock`)"));
+        let _ = fs::remove_dir_all(&units_ws);
+
+        let ctx_mut = render_agent_context(&ws, &records, Some("demo::mut_fn"))
+            .expect("render context for mut_fn");
+        assert!(ctx_mut.contains("Reference / Borrow Route (`Anneal.SepLogicLenses`)"));
+        assert!(ctx_mut.contains("Anneal.FunctionalTranslation"));
+        assert!(ctx_mut.contains("verifyStatefulMir_of_sepLenses"));
+
+        let ctx_loop = render_agent_context(&ws, &records, Some("demo::loop_fn"))
+            .expect("render context for loop_fn");
+        assert!(ctx_loop.contains("Primary Loop Route (`forRangeUp` + `runCfgToBlock`)"));
+        assert!(ctx_loop.contains("open Anneal.MirLoops Anneal.PureMirExec Anneal.MirFuelFree"));
+        assert!(ctx_loop.contains("mirNoCallWpConverges_forRangeUp"));
+
+        // Verify `UnsafeTraitImpl` formats `Mir.<Item>.layouts` with the concrete item module,
+        // and unauthored `safe_total`, `equivalent_to`, and `typeParamCount > 0` items report
+        // accurate contract surfaces and starter proof templates.
+        let poly_mir = "import Trusted\nnamespace Mir.Demo.poly_fn\ndef body : CapturedMir := { defPath := \"demo::poly_fn\", typeParamCount := 1, localDecls := [], basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\nend Mir.Demo.poly_fn\n";
+        fs::write(mir_dir.join("impl_from_bytes.lean"), pure_mir)
+            .expect("write impl_from_bytes.lean");
+        fs::write(mir_dir.join("tot_fn.lean"), pure_mir).expect("write tot_fn.lean");
+        fs::write(mir_dir.join("fast_fn.lean"), pure_mir).expect("write fast_fn.lean");
+        fs::write(mir_dir.join("poly_fn.lean"), poly_mir).expect("write poly_fn.lean");
+        let extra_records = vec![
+            mk_rec(
+                "demo::impl_from_bytes",
+                "Mir/Demo/impl_from_bytes.lean",
+                "Mir.Demo.impl_from_bytes",
+                CapturedItemKind::UnsafeTraitImpl,
+                None,
+            ),
+            mk_rec(
+                "demo::tot_fn",
+                "Mir/Demo/tot_fn.lean",
+                "Mir.Demo.tot_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            mk_rec(
+                "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_tot_fn",
+                "",
+                "",
+                CapturedItemKind::ExternalSpec,
+                Some("demo::tot_fn"),
+            ),
+            mk_rec(
+                "demo::fast_fn",
+                "Mir/Demo/fast_fn.lean",
+                "Mir.Demo.fast_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            mk_rec(
+                "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_tot_fn__for__fast_fn",
+                "",
+                "",
+                CapturedItemKind::ExternalSpec,
+                Some("demo::fast_fn"),
+            ),
+            mk_rec(
+                "demo::poly_fn",
+                "Mir/Demo/poly_fn.lean",
+                "Mir.Demo.poly_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+        ];
+        let ctx_trait = render_agent_context(&ws, &extra_records, Some("demo::impl_from_bytes"))
+            .expect("render context for impl_from_bytes");
+        assert!(ctx_trait.contains("over `Mir.Demo.impl_from_bytes.layouts`"));
+
+        let ctx_tot = render_agent_context(&ws, &extra_records, Some("demo::tot_fn"))
+            .expect("render context for tot_fn");
+        assert!(ctx_tot.contains("- **`is_stateful`**: total (`TotalItemSpec` / `TotalVerificationResult`)"));
+        assert!(ctx_tot.contains("theorem verified : TotalVerificationResult Obligations.Demo.tot_fn.totalClaim"));
+
+        let ctx_equiv = render_agent_context(&ws, &extra_records, Some("demo::fast_fn"))
+            .expect("render context for fast_fn");
+        assert!(ctx_equiv.contains("- **`is_stateful`**: equiv (`StatefulEquivItemSpec` / `StatefulEquivVerificationResult`)"));
+        assert!(ctx_equiv.contains("theorem verified : StatefulEquivVerificationResult Obligations.Demo.fast_fn.equivClaim"));
+
+        let ctx_poly = render_agent_context(&ws, &extra_records, Some("demo::poly_fn"))
+            .expect("render context for poly_fn");
+        assert!(ctx_poly.contains(
+            "- **`is_stateful`**: polymorphic (`polyClaim` / `CrateVerificationResult`)"
+        ));
+        assert!(ctx_poly.contains("theorem verified : Obligations.Demo.poly_fn.polyClaim"));
+
+        // When an authored stateless `Proof/Demo/tot_fn.lean` (`VerificationResult`) or
+        // `Proof/Demo/fast_fn.lean` (on a `#[spec(safe_total, equivalent_to: ...)]` item)
+        // exists, `render_agent_context` must report the authored surface without clobbering.
+        let proof_demo_dir = ws.join("anneal/proofs/Proof/Demo");
+        fs::create_dir_all(&proof_demo_dir).expect("create Proof/Demo");
+        fs::write(
+            proof_demo_dir.join("tot_fn.lean"),
+            "import Trusted\nimport Obligations.Demo.tot_fn\nnamespace Proof.Demo.tot_fn\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.tot_fn.claim := by sorry\nend Proof.Demo.tot_fn\n",
+        )
+        .expect("write stateless Proof/Demo/tot_fn.lean");
+        fs::write(
+            proof_demo_dir.join("fast_fn.lean"),
+            "import Trusted\nimport Obligations.Demo.fast_fn\nnamespace Proof.Demo.fast_fn\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.fast_fn.claim := by sorry\nend Proof.Demo.fast_fn\n",
+        )
+        .expect("write stateless Proof/Demo/fast_fn.lean");
+        let ctx_tot_authored = render_agent_context(&ws, &extra_records, Some("demo::tot_fn"))
+            .expect("render context for authored stateless tot_fn");
+        assert!(ctx_tot_authored.contains("- **Proof Status**: Present"));
+        assert!(ctx_tot_authored.contains("- **`is_stateful`**: false (`ItemSpec` / `VerificationResult`)"));
+
+        let ctx_fast_authored = render_agent_context(&ws, &extra_records, Some("demo::fast_fn"))
+            .expect("render context for authored stateless fast_fn");
+        assert!(ctx_fast_authored.contains("- **Proof Status**: Present"));
+        assert!(
+            ctx_fast_authored
+                .contains("- **`is_stateful`**: false (`ItemSpec` / `VerificationResult`)"),
+            "authored stateless proof on equivalent_to item must not be clobbered to equiv: {ctx_fast_authored}"
+        );
+        assert!(!ctx_fast_authored.contains("Equivalence Route"));
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn strip_lean_comments_preserves_comment_markers_inside_string_literals() {
+        let src = "instance : ItemSpec \"demo::fn--with/-markers\" where\n  -- real comment with \"quote\n  post _ _ := True\n";
+        let stripped = strip_lean_comments(src);
+        assert!(stripped.contains("\"demo::fn--with/-markers\""));
+        assert!(stripped.contains("post _ _ := True"));
+        assert!(!stripped.contains("real comment"));
+
+        // Identifier primes (`c'`) adjacent to `'"'` must not misparse `'<'` as a
+        // char literal and open an unclosed string literal across later lines.
+        let prime_src =
+            r#"def f (c' : Char) := if c'<'"' then 'α' else '\x22' -- strip me
+  pre := False
+"#;
+        let prime_stripped = strip_lean_comments(prime_src);
+        assert!(!prime_stripped.contains("strip me"));
+        assert!(prime_stripped.contains("pre := False"));
     }
 }
