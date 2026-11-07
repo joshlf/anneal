@@ -42,8 +42,12 @@ MiniRust `Machine<BasicMemory<x86_64>>` in which:
   de-initialized while MiniRust, whose `move` is a plain load, still holds the
   old bytes (`StaleOk`); the fragment check `movesOk` guarantees that no such
   local is read before it is written again;
-* the Anneal state has no borrows, protectors, call stack, active callee, or
-  caller-owned referents (the fragment cannot create any).
+* in the borrow-free specialization `StateRel` below, the Anneal state has no
+  borrows, protectors, call stack, active callee, or caller-owned referents;
+  `Simulation.StateRelN` lifts the `borrows = []` restriction across thin raw
+  pointers (`*const T`, `*mut T`) and references (`&T`, `&mut T`) by coupling
+  Anneal's `s.memory.borrows` to MiniRust target `(addr, prov)` pairs via
+  `Pointers.BorrowsOk` and `ctxWithBorrows`.
 
 The relation deliberately says nothing about the rest of the MiniRust machine
 (program, globals, function pointers, the access log, ...), which the fragment
@@ -97,6 +101,7 @@ def tyBytes : Gen.Type → Nat
   | .Tuple _ ⟨end_, _, _⟩ _ => end_.bytes
   | .Array (.Int elemIt) count => count.toNat * elemIt.size.bytes
   | .Ptr (.Raw .None) => 8
+  | .Ptr (.Ref _ _) => 8
   | _ => 1
 
 /-- Whether a MiniRust type is `intBoolTupleTy it`, returning `it`. -/
@@ -401,10 +406,15 @@ def thread1 (ctx : Ctx) (frames : List Frame) : Gen.Thread BM :=
   { stack := frames, state := .Enabled, unwind_payloads := ctx.payloads }
 
 /-- Address well-formedness for local `_i` of storage integer type `it`:
-aligned to `it.size.bytes` and within `[0, 2^64)` so field-projection
-`ptr_offset_inbounds` does not wrap around `2^64`. -/
+aligned to `it.size.bytes`, strictly positive (`0 < addr`, matching
+`BM.allocAddrOk` so safe pointers to stack allocations are non-null), and within
+`(0, 2^64)` so field-projection `ptr_offset_inbounds` does not wrap around
+`2^64`. -/
 @[reducible] def AddrOk (addr : Int) (it : Gen.IntType) : Prop :=
-  addr % (it.size.bytes : Int) = 0 ∧ 0 ≤ addr ∧ addr + (it.size.bytes : Int) < 2 ^ 64
+  addr % (it.size.bytes : Int) = 0 ∧ 0 < addr ∧ addr + (it.size.bytes : Int) < 2 ^ 64
+
+theorem AddrOk.nonneg {addr : Int} {it : Gen.IntType} (h : AddrOk addr it) : 0 ≤ addr :=
+  Int.le_of_lt h.2.1
 
 /-- Where the callee's locals may live: below `2^32` (where the caller
 allocated the return place and the arguments), or at a first-fit candidate

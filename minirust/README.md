@@ -120,10 +120,14 @@ executable meaning of the fragment is `Interp.lean`.
 ## The interpretation
 
 `Interp.lean` transcribes, against the *generated* types, the specr-lang
-functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
+functions needed to run the fragment below on both `Machine<BasicMemory<x86_64>>`
+(`Mach`) and polymorphic `Machine<M>` (`MemoryOps M`, instantiated on both
+`BasicMemory<x86_64>` and `TreeBorrowsMemory<x86_64>`, `MachTB`, via `stepM` /
+`stepsM` and `stepTB` / `stepsTB`):
 `Machine::step` (single enabled thread),
-`Statement::{Assign, PlaceMention, StorageLive, StorageDead, Deinit}` (with
-`StackFrame::{storage_live, storage_dead}` and `ConcurrentMemory::deinit`),
+`Statement::{Assign, PlaceMention, Validate, StorageLive, StorageDead, Deinit}`
+(with `StackFrame::{storage_live, storage_dead}`, `ConcurrentMemory::deinit`,
+and `Machine::{retag_val, retag_ptr}`),
 `PlaceExpr::{Local, Field, Index}` (`Field` indexing `(offset, field_ty)` on
 `Type::Tuple` and `Type::Union`, and `Index` on `Type::Array` and `Type::Slice`,
 with `Machine::ptr_offset_inbounds`, `Memory::{dereferenceable,
@@ -153,11 +157,23 @@ tuples, slices, and trait objects) and `LayoutStrategy::compute_size_and_align`
 / `TupleHeadLayout::full_size_and_align`, `BasicMemory`'s `check_ptr`,
 `dereferenceable`, `signed_dereferenceable`, `load`, `store`, `allocate`, and
 `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
-For raw pointers (MR-3.1) it adds `Type::Ptr` with `PtrType::Raw` (layout,
-`decode_ptr` / `encode_ptr` with per-byte provenance fragments, wide pointers
-with `PointerMetaKind::ElementCount` metadata, and `check_value`; safe
-pointers and vtable metadata are `unsupported` because their checks need the
-machine), `ValueExpr::AddrOf` (with `BasicMemory`'s identity `retag_ptr`),
+For raw pointers (MR-3.1) and references (MR-3.2) it adds `Type::Ptr` with
+`PtrType::Raw`, `PtrType::Ref`, and `PtrType::Box` (layout, `decode_ptr` /
+`encode_ptr` with per-byte provenance fragments, wide pointers with
+`PointerMetaKind::ElementCount` metadata, and `check_value` / `check_ptr` —
+including safe-pointer non-null, pointee-alignment, inhabitedness, and
+`ConcurrentMemory::dereferenceable` checks via the machine's live allocations;
+`PointerMetaKind::VTablePointer` metadata remains `unsupported`),
+`ValueExpr::AddrOf` (with `BasicMemory`'s identity `retag_ptr`),
+`Statement::Validate` (`Machine::retag_val` across `Ptr`, `Tuple`, `Array`, and
+scalar values), the full 6-module Tree Borrows memory model
+(`spec/mem/tree_borrows/{reborrow_settings,state_machine_unprotected,state_machine_protected,state_machine,tree,memory}.md`:
+`ReborrowSettings::new` / `perm`, `UnsafeCellStrategy::freeze_mask`,
+`PermissionUnprot`, `PermissionProt`, `Permission`, `Node`,
+`TreeBorrowsFrameExtra`, and `TreeBorrowsMemory` — `new`, `allocate`,
+`deallocate`, `load`, `store`, `dereferenceable`, `retag_ptr`, `reborrow`,
+`new_call`, `end_call`, `release_protector`, and `leak_check`, backed by
+polymorphic `BasicMemory<x86_64, ProvExtra, AllocExtra>`),
 `PlaceExpr::Deref` (whose `aligned` flag makes a load or store through a
 misaligned pointer UB), `UnOp::GetThinPointer`, `BinOp::PtrOffset` with both
 `inbounds: true` (`Machine::ptr_offset_inbounds`) and `inbounds: false`
@@ -185,11 +201,12 @@ vendored source file, and `crates/anneal-minirust-gen/tests/quotes.rs` parses
 every Lean doc comment (`/-! ... -/` and `/-- ... -/`) and checks each quoted
 substring against its cited vendored file (ignoring only whitespace and `//`
 comments; `..` marks elided code). Effects are
-`Except Stop` with `Stop.ub` (`throw_ub!`), `Stop.deadlock`, `Stop.specPanic`
+`Except Stop` with `Stop.ub` (`throw_ub!`), `Stop.deadlock`,
+`Stop.memoryLeak` (`throw_memory_leak!`), `Stop.specPanic`
 (a panic in the spec, which upstream calls a spec bug), and
 `Stop.unsupported` (outside the interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 72 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 90 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -209,18 +226,19 @@ restricted to the fragment checked by `inFragment`:
   < 2^31`); the return place `_0` has integer type (`u8`..`u128`, `i8`..`i128`,
   `usize`, `isize`), `bool`, `core::cmp::Ordering`, or a 2-tuple `(Int, bool)`,
   each temporary (`argCount < i`) has one of those scalar-family types or a thin
-  raw pointer type `*const T` / `*mut T` to an integer pointee `T`
-  (`ptrPointeeOf`), and each argument local additionally may be a homogeneous
+  raw pointer or reference type `*const T` / `*mut T` / `&T` / `&mut T` to an
+  integer pointee `T` (`ptrPointeeOf`, `isRefLocal`), and each argument local
+  additionally may be a homogeneous
   one-dimensional integer array `[T; N]` whose byte size `N * size_of::<T>()` is
   below `2^63` or a well-formed nested tuple or single-variant struct
   (`TupleSpec`: `RigidTy::Tuple` or `RigidTy::Adt` with `FieldsShape::Arbitrary`,
   `VariantsShape::Single(0)`, integer leaf fields or `()`, and explicit
   inter-field and trailing padding);
-* `StorageLive(_i)` and `StorageDead(_i)` of scalar-family or thin raw pointer
-  locals (`StorageDead` only of temporaries, as MiniRust's well-formedness check
-  requires), and `Deinit(_i)` of a scalar-family or thin raw pointer root local,
-  which `minimize` does not translate and we translate to
-  `Statement::Deinit(PlaceExpr::Local(_i))`;
+* `StorageLive(_i)` and `StorageDead(_i)` of scalar-family or thin pointer /
+  reference locals (`StorageDead` only of temporaries, as MiniRust's
+  well-formedness check requires), and `Deinit(_i)` of a scalar-family or thin
+  pointer / reference root local, which `minimize` does not translate and we
+  translate to `Statement::Deinit(PlaceExpr::Local(_i))`;
 * scalar-family operands may be `copy` or `move` of `_j`, `_j.0`, or `_j.1` (and
   integer operands may also `copy` an array element `_j[p]` or a nested
   tuple/struct scalar field chain `_j.f1...fk`). `minimize` translates `move`
@@ -274,20 +292,37 @@ restricted to the fragment checked by `inFragment`:
   nested sub-tuple/struct field chain `_i.f1...fk`): `dst = Use(copy p)` of a
   place of the same `TupleSpec`, or
   `dst = Aggregate(Tuple | Adt(_, 0, None), [op_0, .., op_{M-1}])`;
-* for a thin raw pointer temporary `_i : *const T` / `*mut T`:
-  `_i = &raw const q` / `_i = &raw mut q` of the same mutability, where `q` is a
-  borrow target of pointee type `T` (`ptrTargetSpec`: an integer parameter, an
-  in-bounds `ConstantIndex` element of an array parameter, or a scalar field
-  chain of a `TupleSpec` parameter), `_i = Use(copy _p | move _p)` of a pointer
-  local of the same type, `_i = Cast(PtrToPtr, copy _p, _)` of a pointer to `T`
-  that does not add mutability, and `_i = BinaryOp(Offset, copy _p, const 0)`;
+* for a thin raw pointer or reference temporary `_i : *const T | *mut T | &T | &mut T`:
+  `_i = &raw const q` / `_i = &raw mut q` (for raw pointer destinations) and
+  `_i = &q` / `_i = &mut q` / `_i = &two_phase mut q` (any `BorrowKind`:
+  `.shared`, `.mut false`, or `.mut true`, for reference destinations) of the
+  same mutability, where `q` is
+  either a direct parameter borrow target of pointee type `T` (`ptrTargetSpec`:
+  an integer parameter, an in-bounds `ConstantIndex` element of an array
+  parameter, or a scalar field chain of a `TupleSpec` parameter) or a reborrow
+  `(*_p)` of a raw pointer or reference local `_p` to `T` that does not add
+  mutability, `_i = Use(copy _p | move _p)` or `_i = CopyForDeref(_p)` of a
+  pointer/reference local of the exact same type (`isRefLocal _p = isRefLocal _i`),
+  `_i = Cast(PtrToPtr, copy _p, _)` between raw pointers to `T` that does not add
+  mutability, `_i = Cast(Transmute, copy _p | move _p, dstTy)` between any thin
+  raw pointer or reference types (`*const T` / `*mut T` / `&T` / `&mut T`) to `T`
+  that does not add mutability, and `_i = BinaryOp(Offset, copy _p, const 0)` on
+  a raw pointer `_p`;
   an integer local `_i : T` may also be assigned `Use(copy (*_p) | move (*_p))`
-  through a pointer `_p` to `T` (`ptrDerefReadOk`), and `(*_p) = rv` writes an
-  integer rvalue `rv` of type `T` (checked like an integer destination's
-  rvalue) through a `*mut T` local `_p`; every borrowed parameter is subject to
-  `ptrAliasingOk` (see the gaps);
+  or `CopyForDeref(*_p)` through a raw pointer or reference `_p` to `T`
+  (`ptrDerefReadOk`), and `(*_p) = rv` writes an integer rvalue `rv` of type `T`
+  (including `move` operands via `copyRv rv`, as well as pointer-to-pointer
+  dereference copies `(*_w) = Use(copy (*_r) | move (*_r))` and
+  `(*_w) = CopyForDeref(*_r)` through a raw pointer or reference `_r` to `T`)
+  through a `*mut T` or `&mut T` local `_p`; every borrowed parameter and
+  pointer/reference flow across the CFG is subject to the flow-sensitive borrow
+  discipline `ptrAliasingOk` (see the gaps);
 * `PlaceMention(p)` on any unprojected local `_i`, `(Int, bool)` field `_i.0` /
-  `_i.1`, or `TupleSpec` field chain `_i.f1...fk`;
+  `_i.1`, or `TupleSpec` field chain `_i.f1...fk`, and `Retag(kind, _i)` with
+  non-`FnEntry` `RetagKind` (`.default`, `.twoPhase`, or `.raw`, which
+  `minimize` lowers to `Statement::Validate { place: Local(_i), fn_entry: false }`)
+  on any thin raw pointer or reference root local `_i` whose abstract borrow
+  state in `ptrAliasingOk` is not `.disabled`;
 * terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
   with distinct in-range values (`minimize` switches on `transmute::<u8>(b)` for
   a `bool`), `Return`, and `Unreachable`; all targets are blocks of the body; no
@@ -301,17 +336,25 @@ Upstream `minimize` rejects `ConstantIndex` (`span_bug!`); `translateFn` lowers
 it to `PlaceExpr::Index` with the constant `usize` index `offset` (or
 `N - offset` when `from_end`), which is the index MIR defines for it.
 
-`translateFn` also transcribes `minimize`'s raw pointer cases, and `inFragment`
-admits thin raw pointer temporaries (`*const T` / `*mut T` to integer pointees)
-under `ptrAliasingOk` (see the gaps for excluded raw pointer constructs):
+`translateFn` also transcribes `minimize`'s raw pointer and reference cases, and
+`inFragment` admits thin raw pointer and reference temporaries
+(`*const T` / `*mut T` / `&T` / `&mut T` to integer pointees) under
+`ptrAliasingOk` (see the gaps for excluded pointer and reference constructs):
 `*const T` / `*mut T` become `Type::Ptr(PtrType::Raw { meta_kind })`
-(`rawPtrTypeOf`), `&raw const p` / `&raw mut p` on parameter places
-(`ptrTargetSpec`: an integer parameter local `_k`, an in-bounds `ConstantIndex`
-element of an array parameter, or a scalar field chain of a `TupleSpec`
-parameter) become `ValueExpr::AddrOf` at the thin raw pointer type, `*_j`
-becomes `PlaceExpr::Deref(Load(_j), T)`, a `PtrToPtr` cast between thin raw
-pointers is its operand (admitted by `inFragment` when pointee types match and
-mutability is not added), and `Offset(l, r)` becomes
+(`rawPtrTypeOf`), `&T` / `&mut T` become
+`Type::Ptr(PtrType::Ref { mutbl, pointee })` and `alloc::boxed::Box<T>` becomes
+`Type::Ptr(PtrType::Box { pointee })` (`refTypeOf` / `boxTypeOf`, computing
+`PointeeInfo` across integer types, `bool`, `Ordering`, `(Int, bool)`, arrays,
+tuples/structs, nested references/boxes, raw pointers, and `core::cell::UnsafeCell<T>`
+with `unsafe_cells = Sized([(0, sizeof(T))])` and `freeze = false`), `&raw const q` /
+`&raw mut q` and `&q` / `&mut q` / `&two_phase mut q` on parameter places
+(`ptrTargetSpec`) or reborrow places `(*_p)` become `ValueExpr::AddrOf` at
+`PtrType::Raw` or `PtrType::Ref`, `*_j` becomes `PlaceExpr::Deref(Load(_j), T)`,
+a `PtrToPtr` cast between thin raw pointers is its operand (admitted by
+`inFragment` when pointee types match and mutability is not added), a
+`CastKind::Transmute` cast becomes `UnOp::Cast(CastOp::Transmute(ty))`
+(admitted by `inFragment` between thin raw pointers and references to the same
+integer pointee `T` when mutability is not added), and `Offset(l, r)` becomes
 `PtrOffset { inbounds: true }(l, MulUnchecked(r, size_of::<T>()))`
 (`ptrOffsetExpr`, admitted by `inFragment` when `r` is the constant `0` via
 `zeroOffsetConstOk`). `minimize`'s translation of `PointerExposeProvenance` and
@@ -698,14 +741,31 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   and unsized `Tuple` layouts and `specPanic`s (`layout_slice`, ...,
   `checkValue_unsized_panics`).
 
-`Correspondence/PointerWitness.lean` runs raw pointer programs to completion
-in both semantics (Anneal by `runA_sound` / `faultsA_sound`, MiniRust by
-`decide +kernel` on `minimize`'s translation), on top of the per-construct
-lemmas of `Correspondence/Pointers.lean` (MiniRust's thin pointer bytes
-`ptrBytes` and their `decode`, `encode`, and `check_value`; Anneal's
-`&raw`, `*p`, `Offset`, `PtrToPtr`, and exposure rules) and the
-statement-level lemmas of `Correspondence/PointerStep.lean` on which
-`step_correspondence_N` rests for raw pointers.
+`Correspondence/PointerWitness.lean`, `Correspondence/RefWitness.lean`, and
+`Correspondence/TbWitness.lean` run raw pointer, reference, reborrowing,
+`Retag`/`Validate`, `CastKind.transmute`, `Box<T>`, `UnsafeCell<T>`,
+`IntPtrCast`, and Tree Borrows programs to completion across Anneal (`runA_sound`
+/ `faultsA_sound`), MiniRust `Machine<BasicMemory<x86_64>>` (`Mach`, via
+`retAfter` / `ubAfter` on `minimize`'s translation), and MiniRust
+`Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`, via `retAfterTB` / `ubAfterTB`
+running `stepsTB` directly on `minimize`'s translation), on top of the
+per-construct lemmas of `Correspondence/Pointers.lean` (MiniRust's thin pointer
+bytes `ptrBytes` and their `decode`, `encode`, and `check_value` at both
+`PtrType::Raw` and `PtrType::Ref`; Anneal's `&raw`, `&`, `&mut`, reborrowing,
+`*p`, `Offset`, `PtrToPtr`, and exposure rules; symbolic Tree Borrows
+state-machine, `ReborrowSettings`, and `TreeBorrowsMemory` structural invariants
+`Permission.prevents_deallocation_iff_foreign_write_err`,
+`Permission.transition_preserves_matches_protector`,
+`Permission.transition_no_specPanic`, `ReborrowSettings.new_matches_protector`,
+`reborrow_childPermissions_matches_protector`, `Permission.unprotect_matches_no`,
+`Node.access_wf`, `Node.access_no_specPanic`,
+`TreeBorrowsMemory.{new_wf,allocate_wf,load_wf,store_wf,deallocate_wf,reborrow_wf,retag_ptr_wf}`,
+`TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
+`TreeBorrowsMemory.{release_protector_wfLive,end_call_wfLive}`; and the
+unconditional polymorphic specialization theorems `stepM_bm_eq` and
+`stepsM_bm_eq` proving `stepM (M := BM) = step` and `stepsM (M := BM) = steps`)
+and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
+`step_correspondence_N` rests for raw pointers and references.
 
 * In the fragment (`*_inFragment`), and proved end to end through
   `mirCall_ret`, `mirCall_noUB`, and `mirCall_progress_N` (returns),
@@ -725,21 +785,57 @@ statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `ptrCountdown` (a four-block loop that counts `x` down through
   `&raw mut x`, reading `*p` before each `switchInt`, then reads `x` directly;
   `3` for `x = 3`), `constBorrowLoop` (a fresh `&raw const x` read through and
-  killed by `StorageDead` in each iteration of a loop; `15` for `x = 5`), and
+  killed by `StorageDead` in each iteration of a loop; `15` for `x = 5`),
   `repointPtr` (`&raw mut a[0 of 2]` and `&raw mut a[1 of 2]`, a read through
   a copy of the first pointer, then the same initialized pointer local
   overwritten with the second pointer and written through; `105` for
-  `a = [5, 7]`); both diverge in lockstep (`StateRelN` + `Reaches`) on
-  `ptrSpinLoop` (`_2 = &raw mut _1` in `bb0`, then `PlaceMention(_2)`,
-  self-assignment `_2 = Offset(copy _2, const 0_usize)`, `_0 = copy (*_2)`,
-  and `(*_2) = copy _0` in `bb1`); and both raise UB on `uninitPtrReadUb` and
+  `a = [5, 7]`), `refSharedRead` (`&x`, reference `copy`/`move`, and a
+  dereference read; `5` for `x = 5`), `refMutRoundTrip` (`&mut x`, a read and
+  write through `r`, shared reborrow `&*r`, raw reborrow `&raw const *s`, and
+  read; `6` for `x = 5`), `refArrayReborrowChain` (disjoint `&mut a[0]` and
+  `&mut a[1]`, writes through both, and a five-step reborrowing chain
+  `&mut -> &mut -> & -> & -> *const` and `&mut -> *mut`; `42` for
+  `a = [5, 7]`), `refPaddedStructReborrow` (disjoint `&mut s.1` and `&s.2`
+  on `Padded`, a dereference write, shared reborrows of both references, and
+  preserved `.Uninit` padding; `1641`), `refMutReborrowWrite` (`r = &mut x`,
+  `CopyForDeref` reborrow `r2 = &mut (*tmp)`, dereference write `*r2 = 42`
+  disabling `r`'s tag while keeping `r2` active, then NLL sequential `&x`;
+  `42`), `refDisjointReborrowWrite` (`r0 = &mut a[0]` and `r1 = &mut a[1]`,
+  mutable reborrow + write through `r0_sub` leaving disjoint `r1` active for a
+  subsequent write and read; `30`), and `refLoopCountdown` (multi-block loop
+  with repeated `&mut x`, `CopyForDeref` mutable reborrow `&mut (*tmp)`,
+  dereference write, and sequential `&x` in the loop exit block; `6` for
+  `x = 3`), `refTwoPhaseBorrowRoundTrip` (`r = &two_phase mut x` in `Reserved`,
+  foreign shared borrow `s = &x` and read `*s` while `r` stays `Reserved`, then
+  dereference write `*r = *s + 37` activating `r` to `Active` and disabling `s`;
+  `42` for `x = 5`), `retagRefReborrowChain` (`r = &mut x` followed by
+  `Retag(Default, r)`, raw/reference reborrow chain `&mut -> *mut -> &mut -> &`
+  with `Retag(Raw)` / `Retag(Default)` / `Retag(TwoPhase)` and dereference write;
+  `12` for `x = 5`), and `refRawTransmuteChain` (`&mut u32 -> *mut u32` via
+  `Operand::Move`, dereference read and write through `*mut u32`, then
+  `*mut u32 -> &u32 -> *const u32` via `CastKind::Transmute`; `15` for `x = 5`),
+  and `swapRefs` (2-argument `(u32, u32) -> u32` swap via pointer-to-pointer
+  dereference copy `(*_3) = copy (*_4)`, `move`-operand dereference write
+  `(*_4) = move _5`, shared reborrows, `move (*_6)`, and `CopyForDeref(*_7)`;
+  `940` for `(40, 9)` across Anneal, `Mach`, and `MachTB`);
+  both diverge in lockstep (`StateRelN` + `Reaches`) on `ptrSpinLoop`
+  (`_2 = &raw mut _1` in `bb0`, then `PlaceMention(_2)`, self-assignment
+  `_2 = Offset(copy _2, const 0_usize)`, `_0 = copy (*_2)`, and
+  `(*_2) = copy _0` in `bb1`); and both raise UB on `uninitPtrReadUb` and
   `uninitPtrWriteUb` (reading or writing through an uninitialized pointer
   temporary), `deadPtrReadUb` (reading through a pointer temporary after its
-  `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an
-  uninitialized pointer temporary), and `derefWriteRhsUb`,
-  `derefIdxWriteRhsUb`, and `derefFieldWriteRhsUb` (writing an uninitialized
-  rvalue operand through a valid `*mut` pointer to an integer local, to a
-  `ConstantIndex` array element, or to a `TupleSpec` scalar field chain).
+  `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an uninitialized
+  pointer temporary), `uninitRefReadUb`, `uninitRefReborrowUb`,
+  `retagUninitRefUb`, and `transmuteUninitRefUb` (reading, reborrowing `&(*_p)`,
+  executing `Retag(Default, _p)` / `Statement::Validate`, or transmuting an
+  uninitialized reference temporary), `derefCopyUninitSrcUb` and
+  `derefWriteMoveUninitUb` (`(*_2) = copy (*_3)` from an uninitialized `&mut u32`
+  and `(*_2) = move _3` from an uninitialized `u32`),
+  `refMutDivZeroUb` (division by zero inside `(*r) = (*r) / y` through `&mut x`),
+  and `derefWriteRhsUb`, `derefIdxWriteRhsUb`, and `derefFieldWriteRhsUb`
+  (writing an uninitialized rvalue operand through a valid `*mut` pointer to an
+  integer local, to a `ConstantIndex` array element, or to a `TupleSpec` scalar
+  field chain).
 * Outside the fragment (`*_notInFragment`), both semantics agree on
   `arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`) and `dangling`
   (UB on a read after `StorageDead` of the borrowed temporary), and they
@@ -747,14 +843,82 @@ statement-level lemmas of `Correspondence/PointerStep.lean` on which
   (`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in Anneal;
   `offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB in
   MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
-  `exposeTwice` (`0` in MiniRust, `65536` in Anneal), and `directWrite` and
-  `frozenWrite` (UB in Anneal only).
+  `misalignedRef` (`"Value::Ptr: unaligned safe pointer"` on merely forming
+  `&*q` without reading in MiniRust, vs returning `5` in Anneal), `danglingRef`
+  (`"Value::Ptr: non-dereferenceable safe pointer"` on copying a dangling `&u32`
+  without dereferencing in MiniRust, vs returning `5` in Anneal),
+  `exposeTwice` (`0` in MiniRust, `65536` in Anneal), `directWrite` and
+  `frozenWrite` (UB in Anneal only, while returning `9` on both `BasicMemory`
+  and `MachTB` because `PtrType::Raw` has `safe_pointee = None` so
+  `ReborrowSettings::new` is `None`), `twoPhaseForeignWriteDiscrepancy` and
+  `twoPhaseDirectWriteTreeBorrowsGap` (foreign dereference write faulting in
+  both Anneal and `MachTB` vs returning `99` in `BasicMemory`, and direct write
+  `_1 = 99` returning `99` in both Anneal — whose `updateBorrowPerm` leaves
+  `.reserved` unchanged when `writerTag = .none` — and `BasicMemory`, while
+  faulting on `MachTB` with `"Tree Borrows: local read of Disabled reference"`),
+  `frozenRefMutReborrow`, `frozenRefMutReborrowWrite`, and
+  `disabledRefReborrow` (`frozenRefMutReborrow` faulting eagerly at `&mut (*_2)`
+  in Anneal while returning `5` on both `BasicMemory` and `MachTB` because lazy
+  `Reserved` is never written, whereas `frozenRefMutReborrowWrite` faults in
+  both Anneal and `MachTB` — `"Tree Borrows: local write of Frozen reference"` —
+  while returning `9` on `BasicMemory`, and `disabledRefReborrow` faults at the
+  reborrow in both Anneal and `MachTB` while returning `9` on `BasicMemory`),
+  `childReborrowWriteDisablesParent` (UB in Anneal's flat `List BorrowEntry`
+  model because writing through a child `&mut` disables its parent entry, vs
+  returning `9` on both `BasicMemory` and `MachTB`),
+  `retagFnEntryProtectorWrite`, `retagDisabledRefDiscrepancy`,
+  `retagTrulyDisabledRefUb`, `retagFnEntryLocalDeallocUb`, and
+  `retagScalarDiscrepancy` (`retagFnEntryProtectorWrite` faulting at `_1 = 9` in
+  both Anneal and `MachTB` while returning `9` on `BasicMemory`;
+  `retagDisabledRefDiscrepancy` faulting in Anneal after a child write while
+  returning `9` on both `BasicMemory` and `MachTB`, contrasted with
+  `retagTrulyDisabledRefUb` where a foreign direct write disables `_2` so both
+  Anneal and `MachTB` fault at `Retag(Default, _2)`;
+  `retagFnEntryLocalDeallocUb` returning `5` in both Anneal and `BasicMemory`
+  while faulting at `Terminator::Return` on `MachTB` because `deallocAllM`
+  deallocates the strongly protected callee local `_1` before `end_call`; and
+  `Retag(Default, _1)` on a `u32` scalar local faulting in Anneal while
+  `Machine::retag_val` treats `Value::Int` as a no-op on both `BasicMemory` and
+  `MachTB`), and `transmuteSharedRefToMutWriteDiscrepancy` /
+  `transmuteDanglingIntToRefDiscrepancy` (transmuting `&u32` to `&mut u32` and
+  writing faulting on `Frozen` in both Anneal and `MachTB` vs returning `77` on
+  `BasicMemory`, and transmuting `4_usize` to `&u32` without dereferencing
+  returning `5` in Anneal vs raising `"Value::Ptr: non-dereferenceable safe pointer"`
+  on both `BasicMemory` and `MachTB`);
+  alongside ground-truth checks `checkValue_refTy_safe_ptr_ub`,
+  `transmute_refTy_machine_checks`, `validate_refTy_machine_checks`,
+  `retagTupleFields_machine_checks`, `reborrowSettings_u32_examples`, and
+  executable `TreeBorrowsMemory` trace witnesses
+  `treeBorrowsChildWritePreservesParent`, `treeBorrowsFrozenAndDisabledUb`,
+  `treeBorrowsDirectWriteDisablesUnprotReserved`, and
+  `treeBorrowsProtectorEndAndDeallocChecks`, and the 3-way `TbWitness.lean`
+  witnesses: `pairSplitReborrowOk` vs. `pairParentWriteDisablesChild` (`(u32, u32)`
+  disjoint field `&mut` reborrows succeeding across all three vs. parent write
+  disabling child `p0` on Anneal and `MachTB`), `unsafeCellUnprotInteriorMut`
+  (`77` across all three) vs. `unsafeCellProtectedInteriorMut` (`Retag([fn entry], r)`
+  on `&UnsafeCell<u32>` returning `77` on `Mach` and `MachTB` via `PermissionProt::Cell`
+  with `prevents_deallocation = false` while faulting in Anneal's
+  `hasProtectedWriteConflict`), `exposeSingleRefMutRoundTrip` (`88` across all
+  three), `exposeSharedRefWriteUb` (UB on Anneal and `MachTB` vs. `88` on `Mach`),
+  `exposeTwoRefMutAngelicUnsupported` (`88` on Anneal and `Mach` vs.
+  `Stop.unsupported` on `MachTB` when two live `&mut` tags meet at `int2ptr`),
+  `boolMutRefToggle` and `boolInvalidByteRefUb`, and two upstream MiniRust
+  specification findings (`zstWrappingSubReborrow_tb_specPanic` /
+  `nonZstWrappingSubReborrow_bm_and_tb_ub`, where reborrowing a negative-offset
+  `ptr_offset_wrapping(-8)` pointer at ZST `&()` passes `BasicMemory::check_ptr`
+  and panics `Offset::from_bytes(ptr.addr - allocation.addr).unwrap()` on `MachTB`,
+  and `treeBorrowsWeakBoxDeallocAndDeadRelease`, where deallocating a weakly
+  protected `Box<u32>` before `end_call` leaves `child.protected = Weak` with
+  `Unprot` permissions on the dead allocation after `release_protector`'s early
+  `!allocation.live` return).
 
 `Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, `[WITNESS-AUDIT]`,
-and `[POINTER-AUDIT]` lines ending in `sorry_free=true` (via
-`#check_theorem_deps`, which also rejects duplicate declaration names and
-non-`theorem` constants) and fails the build if any listed declaration depends
-on `sorryAx` or a non-standard axiom.
+`[POINTER-AUDIT]`, `[REF-AUDIT]`, and `[TB-AUDIT]` lines ending in
+`sorry_free=true` (via `#check_theorem_deps`, which also rejects duplicate
+declaration names and non-`theorem` constants) and fails the build if any listed
+declaration (or any declaration in any `MiniRustSpec.*` module via
+`#assert_all_minirustspec_standard_axioms`) depends on `sorryAx` or a
+non-standard axiom.
 
 ### Gaps
 
@@ -798,8 +962,8 @@ These are deliberate and are the first things to lift:
   `SwitchInt` on it); `Type::Enum` (beyond `Ordering`) and `Type::Union` are
   interpreted as representations (layout, `decode`, `encode`, `check_value`)
   without `ValueExpr::{Union, Variant, GetDiscriminant}`,
-  `Statement::SetDiscriminant`, or downcast projections. Raw pointers are
-  restricted (below); there are no references, slices, nested arrays,
+  `Statement::SetDiscriminant`, or downcast projections. Raw pointers and
+  references are restricted (below); there are no slices, nested arrays,
   multi-variant ADTs, other casts, calls, drops, or assertions.
 * **`Repeat(copy p, 0)` is excluded (while `Repeat(const c, 0)` is included).**
   Anneal evaluates `op` once before replicating it, while `minimize`'s
@@ -831,44 +995,104 @@ These are deliberate and are the first things to lift:
   unsigned types and, for a signed type, as long as `N <= 2^(bits - 1)` (a
   negative index then has a bit pattern `>= N`), which the fragment
   requires.
-* **Raw pointers are in the correspondence only under a borrow discipline
-  (MR-3.1).** The fragment admits thin raw pointer temporaries to integer
-  pointees; `_i = &raw const q` / `&raw mut q` of a parameter `q` that is an
-  integer local, an in-bounds `ConstantIndex` element of an array, or a scalar
-  field chain of a `TupleSpec` (`ptrTargetSpec`); pointer copies (`copy _p`,
-  `move _p`, `PtrToPtr` between equal pointee types that never adds
-  mutability, and `Offset(_p, 0)`); reads `copy (*_p)` through any such
-  pointer and writes `(*_p) = rv` through `*mut` pointers, both at the pointee
-  type; and storage statements on pointer temporaries. `ptrAliasingOk` requires every borrowed
-  local to be a parameter that is never written directly, deinitialized,
-  storage-cycled, or moved, and, once any `&raw mut` exists, all borrows of
-  mutably borrowed locals to happen in an entry block without incoming edges
-  at pairwise non-overlapping projections. `StateRelN` relates each Anneal
-  borrow tag to the MiniRust address of its target (`BorrowsOk`, and
-  `LocalsOk` at `ctxWithBorrows`), and `step_correspondence_N` simulates every
-  such statement (`Correspondence/PointerStep.lean`). The fragment excludes
-  the forms on which Anneal's model accepts executions that MiniRust, the
-  ground truth, rejects or runs differently: a dereference ignores the pointer's
-  `offsetBytes`, so reading through `p.offset(n)` reads `p`'s target
-  (`offsetDeref 1`), misaligned reads succeed (`misaligned`), and pointers
-  past the end of their allocation can be read through (`offsetDeref 2`);
-  `Offset` neither scales its count by the pointee size nor checks bounds or
-  overflow (`offsetDeref 3`, `offsetDeref usizeMax`); and
-  `PointerExposeProvenance` returns `tag * 65536 + offsetBytes` instead of an
-  address, so two pointers to one local expose different integers
-  (`exposeTwice`), and `PointerWithExposedProvenance` decodes that encoding
-  deterministically instead of predicting a provenance. In the other
-  direction, Anneal is stricter than `BasicMemory`, which has no aliasing
-  model: a direct write to a local disables earlier raw pointers to it
-  (`directWrite`), and writing through a `&raw const` pointer is UB
-  (`frozenWrite`). `&raw` of an out-of-bounds `ConstantIndex` succeeds in
-  Anneal and only faults on use, while MiniRust's `AddrOf` evaluates the place
-  and raises UB at once; and since a write through a pointer only requires its
-  target local not to be dead, a pointer to a local becomes writable again in
-  Anneal after `StorageDead` and `StorageLive`, while in MiniRust it keeps
-  pointing to the deallocated storage. Hence the fragment borrows parameters
-  only, admits `*p` only on unoffset pointers to integer pointees of matching
-  type, and keeps nonzero `Offset` and the exposure casts out.
+* **Raw pointers and references are in the correspondence under a borrow and
+  reborrow discipline (MR-3.1, MR-3.2).** The fragment admits thin raw pointer
+  and reference temporaries (`*const T`, `*mut T`, `&T`, `&mut T`) to integer
+  pointees; `_i = &raw const q` / `&raw mut q` and `_i = &q` / `&mut q` /
+  `&two_phase mut q` (any `BorrowKind`: `.shared`, `.mut false`, or `.mut true`)
+  of either a parameter `q` that is
+  an integer local, an in-bounds `ConstantIndex` element of an array, or a
+  scalar field chain of a `TupleSpec` (`ptrTargetSpec`), or a reborrow `(*_p)`
+  of a pointer/reference local `_p` to `T` that does not add mutability;
+  pointer/reference copies (`Use(copy _p | move _p)`, `CopyForDeref(_p)`), raw
+  `PtrToPtr` casts between equal pointee types that never add mutability,
+  `CastKind::Transmute` casts (`copy _p` or `move _p`) between any thin raw
+  pointer or reference types to `T` that never add mutability, and raw
+  `Offset(_p, 0)`; reads `Use(copy (*_p) | move (*_p))` or `CopyForDeref(*_p)`
+  through any such pointer or reference and writes `(*_p) = rv` through `*mut` /
+  `&mut` locals (including `move` operands via `copyRv rv` and pointer-to-pointer
+  dereference copies `(*_w) = copy (*_r) | move (*_r) | CopyForDeref(*_r)`), both
+  at the pointee type; non-`FnEntry` `Retag` statements
+  (`Statement::Validate { fn_entry: false }`) on pointer/reference temporaries;
+  and storage statements on pointer/reference temporaries. `ptrAliasingOk`
+  requires every borrowed local to be a parameter that is never written
+  directly, deinitialized, storage-cycled, or moved, and computes the least
+  fixed point (`ptrEnvAtEntry`, proved to converge unconditionally in
+  `B * n * (n + 3) + 1` iterations by `iterPtrAliasEntries_stabilizes`,
+  characterized by `ptrAliasingOk_iff_blockPtrAliasOk`, and proved least by
+  `ptrEnvAtEntry_least`) of the flow-sensitive join-semilattice `PtrLocalState`
+  (`.empty` `⊥`, `.live target peers`, `.disabled` `⊤`) across the CFG: direct
+  borrows set `.live (some (k, borrowProjSteps projs)) [i]`, copies/casts/zero-offsets
+  add the destination to the source's tag-peer set `peers`, reborrows allocate a
+  fresh singleton peer set `[i]` inheriting the parent's target, and dereference
+  writes keep every local in `wPeers` or with a provably disjoint target
+  (`targetsDefinitelyDisjoint`) `.live` while invalidating all other `.live`
+  locals to `.disabled`, admitting mutable reborrows followed by dereference
+  writes, NLL sequential shared/mutable borrows, and multi-block / loop borrows
+  without falsely invalidating disjoint sibling borrows. `AddrOk` requires parameter allocations to be non-null
+  (`0 < a`), aligned, and in-bounds so every `PtrType::Ref` value satisfies
+  MiniRust's safe-pointer validity invariant (`checkValue_refTy`, including
+  `CastOp::Transmute` and `Statement::Validate` on reference types with live machine state). `StateRelN` relates each Anneal
+  borrow tag to the MiniRust address and provenance of its target (`BorrowsOk`,
+  and `LocalsOk` at `ctxWithBorrows`), and `step_correspondence_N` simulates
+  every such statement (`Correspondence/PointerStep.lean`). The fragment
+  excludes the forms on which Anneal's model and MiniRust (`BasicMemory` /
+  Tree Borrows) diverge:
+  - *Safe-pointer validity without dereferencing*: MiniRust's `checkPtr` checks
+    non-null, alignment, inhabitedness, and `dereferenceable` on every load or
+    store of a `PtrType::Ref`, so forming an unused misaligned `&u32`
+    (`misalignedRef`) or copying a dangling `&u32` (`danglingRef`) is
+    immediate UB in MiniRust, whereas Anneal stores `(tag, offset)` pairs and
+    checks liveness only on dereference.
+  - *Flat borrow list vs. Tree Borrows parent-child tree*: Anneal's
+    `MirSemantics` stores a flat `List BorrowEntry` without parent pointers;
+    reborrowing `(*_p)` appends an entry targeting `_p`'s root `(local, proj)`
+    after checking `parentEntry.perm`, and writing `(*_child) = rv` runs
+    `invalidateDerefWriteBorrows`, which disables every overlapping entry whose
+    `tag ≠ child.tag` — including the *parent* `&mut` entry
+    (`childReborrowWriteDisablesParent`, `retagDisabledRefDiscrepancy`), whereas
+    Tree Borrows (`MachTB` and `treeBorrowsChildWritePreservesParent`) and
+    `BasicMemory` permit parent reuse after child writes. Polymorphic
+    `Machine<M>` (`MemoryOps M`) in `Interp.lean` runs both `BasicMemory<x86_64>`
+    (`stepM_bm_eq` / `stepsM_bm_eq` proving unconditional equality with `step` /
+    `steps`) and the full 6-module `TreeBorrowsMemory<x86_64>` (`MachTB`,
+    `stepTB` / `stepsTB`): on `MachTB`, raw pointers (`directWrite`,
+    `frozenWrite`) keep root provenance (`safe_pointee = None`) and return `9`,
+    read-only mutable reborrows from `&T` (`frozenRefMutReborrow`) stay in lazy
+    `Reserved` and return `5`, and scalar `Retag` (`retagScalarDiscrepancy`) is
+    a no-op, whereas writing through a mutable reborrow or transmute of `&T`
+    (`frozenRefMutReborrowWrite`, `transmuteSharedRefToMutWriteDiscrepancy`),
+    reading or reborrowing/retagging a foreign-invalidated reference
+    (`twoPhaseForeignWriteDiscrepancy`, `disabledRefReborrow`,
+    `retagTrulyDisabledRefUb`), writing directly while a function-entry protector
+    is active (`retagFnEntryProtectorWrite`), writing directly to a local with an
+    unprotected `Freeze` `Reserved` two-phase borrow
+    (`twoPhaseDirectWriteTreeBorrowsGap`, where Anneal's `writerTag = .none`
+    unsoundly preserves `.reserved`), and returning with a function-entry
+    protector attached to a callee-owned local (`retagFnEntryLocalDeallocUb`,
+    where `deallocAllM` runs `StorageDead` before `end_call` while Anneal skips
+    local-teardown protector checks) all raise ground-truth Tree Borrows UB on
+    `MachTB`, whereas on `!Freeze` `&UnsafeCell<T>` with `Retag([fn entry], r)`
+    (`unsafeCellProtectedInteriorMut`), `MachTB` uses `PermissionProt::Cell`
+    (`prevents_deallocation = false`) and succeeds while Anneal's
+    `hasProtectedWriteConflict` over-approximates `writerTag = some _` as
+    conflicting even for `!Freeze` `.reserved` entries.
+  - *Raw-pointer offsets, integer-to-pointer transmutes, and provenance exposure*:
+    Anneal ignores `offsetBytes`
+    on dereference (`offsetDeref 1`, `misaligned`, `offsetDeref 2`), does not
+    scale or bounds-check `Offset` (`offsetDeref 3`, `offsetDeref usizeMax`),
+    checks only `bits != 0` when decoding provenance-free integer bytes at `&T`
+    (`transmuteDanglingIntToRefDiscrepancy`), and encodes
+    `PointerExposeProvenance` as `tag * 65536 + offsetBytes` (`exposeTwice`;
+    conversely, exposing two distinct live `&mut` tags at one address stops with
+    `Stop.unsupported` on `MachTB`'s angelic `int2ptr` choice in
+    `exposeTwoRefMutAngelicUnsupported`),
+    while `Retag(FnEntry)` / reference arguments and reference returns remain
+    outside `inFragment`. Two upstream MiniRust `TreeBorrowsMemory` edge cases
+    are also exhibited and isolated (`zstWrappingSubReborrow_tb_specPanic` vs.
+    `TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
+    `treeBorrowsWeakBoxDeallocAndDeadRelease` vs.
+    `TreeBorrowsMemory.end_call_wfLive`).
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

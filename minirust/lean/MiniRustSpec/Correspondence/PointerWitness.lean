@@ -14,10 +14,13 @@ import MiniRustSpec.Correspondence.Pointers
 /-!
 # Raw pointer witnesses (MR-3.1)
 
-Concrete MIR bodies with raw pointers, each run to completion in Anneal's
-semantics (`runA_sound`, `faultsA_sound`) and, after `minimize`'s translation
-(`translateFn`), in the MiniRust interpretation (`Interp.steps`), both by kernel
-computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`).
+Concrete MIR bodies with raw pointers (`*const T`, `*mut T`), each run to
+completion in Anneal's semantics (`runA_sound`, `faultsA_sound`) and, after
+`minimize`'s translation (`translateFn`), in the MiniRust interpretation
+(`Interp.steps`), both by kernel computation (`rfl`, `decide`, `decide +kernel`;
+no `native_decide`). Reference, reborrowing, two-phase borrow, `Retag`,
+`CastKind.transmute`, and Tree Borrows witnesses live in
+`MiniRustSpec.Correspondence.RefWitness`.
 
 `ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `nestedFieldPtr`, `ptrCountdown`,
 `constBorrowLoop`, `repointPtr`, `ptrSpinLoop`, `uninitPtrReadUb`,
@@ -28,13 +31,7 @@ fragment (`*_inFragment`), so the end-to-end correspondence theorems
 `mirCall_steps_error`, `mirCall_outcome_N`, `mirCall_diverges_steps_ok`,
 `mirCall_diverges_rel_N`) apply to them directly. `arrayElemPtr` (borrowing a
 non-parameter `[u32; 2]` temporary), `dangling`, and every divergent witness
-below lie outside the fragment
-(`*_notInFragment`): the fragment borrows (`&raw`) only parameters,
-which it never writes directly (`directWrite`) nor kills (`dangling`), casts
-pointers (`PtrToPtr`) only between equal pointee types and never from `*const`
-to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
-(`offsetDeref`, `misaligned`), and has no pointer-integer casts
-(`exposeTwice`).
+below lie outside the fragment (`*_notInFragment`).
 
 **Agreement.** Both semantics return the same value (or diverge in lockstep) for
 

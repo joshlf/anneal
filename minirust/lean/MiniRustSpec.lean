@@ -23,6 +23,8 @@ import MiniRustSpec.Correspondence.Witness
 import MiniRustSpec.Correspondence.Pointers
 import MiniRustSpec.Correspondence.PointerStep
 import MiniRustSpec.Correspondence.PointerWitness
+import MiniRustSpec.Correspondence.RefWitness
+import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Audit
 
 /-!
@@ -39,9 +41,16 @@ import MiniRustSpec.Audit
   semantics (`Trusted.Rustc.V2026_06_01`) and that interpretation, with
   non-vacuity witnesses (`Correspondence.Witness`); `Correspondence.Pointers`
   and `Correspondence.PointerStep` relate the two semantics on the raw pointer
-  statements the fragment admits (`&raw`, pointer copies, and reads and writes
-  through pointers), and `Correspondence.PointerWitness` compares them on
-  concrete raw pointer programs.
+  and reference statements the fragment admits (`&raw`, `&`, `&mut`,
+  reborrowing `&*_p` / `&mut *_p` / `&raw *_p`, pointer copies, and reads and
+  writes through pointers and references, including `move` rvalues and
+  pointer-to-pointer dereference copies) and prove structural Tree Borrows
+  (`TreeBorrowsMemory.wf` / `wfLive` and panic-freedom) invariants, while
+  `Correspondence.PointerWitness`, `Correspondence.RefWitness`, and
+  `Correspondence.TbWitness` compare Anneal, `Machine<BasicMemory>`, and
+  `Machine<TreeBorrowsMemory>` on concrete raw pointer, reference, reborrowing,
+  safe-pointer validity, `CastKind.transmute`, `Box<T>`, `UnsafeCell<T>`,
+  `IntPtrCast`, and Tree Borrows programs.
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

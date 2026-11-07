@@ -268,7 +268,7 @@ theorem not_other_of_ptrPointeeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty}
       scalarTypeOf t = none := by
   unfold ptrPointeeOf at h
   cases hk : t.kind with
-  | rawPtr m pointee =>
+  | rawPtr m pointee | ref m pointee =>
     have hb : isBoolTy t = false := by simp [isBoolTy, hk]
     have ho : isOrderingTy t = false := by simp [isOrderingTy, hk]
     have htup : intBoolTupleOf t = none := by simp [intBoolTupleOf, hk]
@@ -322,26 +322,107 @@ theorem isPtrTy_false_of_tupleTypeOf {layouts : Layout.LayoutTable} {t : MirAst.
     rw [hnone] at h
     cases h
 
-theorem rawPtrTypeOf_of_ptrPointeeOf {t : MirAst.Ty} {mutbl : MirAst.Mutability}
-    {it : Gen.IntType} (h : ptrPointeeOf t = some (mutbl, it)) :
-    rawPtrTypeOf t = some thinRawPtrTy := by
+theorem ptrPointeeOf_of_rawPtrPointeeOf {t : MirAst.Ty} {mutbl : MirAst.Mutability}
+    {it : Gen.IntType} (h : rawPtrPointeeOf t = some (mutbl, it)) :
+    ptrPointeeOf t = some (mutbl, it) ∧ isRefTy t = false := by
+  unfold rawPtrPointeeOf at h
+  cases hk : t.kind <;> simp_all [ptrPointeeOf, isRefTy, refPointeeOf]
+
+theorem ptrPointeeOf_of_refPointeeOf {t : MirAst.Ty} {mutbl : MirAst.Mutability}
+    {it : Gen.IntType} (h : refPointeeOf t = some (mutbl, it)) :
+    ptrPointeeOf t = some (mutbl, it) ∧ isRefTy t = true := by
+  refine ⟨?_, by simp [isRefTy, h]⟩
+  unfold refPointeeOf at h
+  cases hk : t.kind <;> simp_all [ptrPointeeOf]
+
+theorem declPtrTy_of_rawPtrPointeeOf {t : MirAst.Ty} {mutbl : MirAst.Mutability}
+    {it : Gen.IntType} (h : rawPtrPointeeOf t = some (mutbl, it)) :
+    declPtrTy t = thinRawPtrTy := by
+  unfold rawPtrPointeeOf at h
+  cases hk : t.kind <;> simp_all [declPtrTy]
+
+theorem declPtrTy_of_refPointeeOf {t : MirAst.Ty} {mutbl : MirAst.Mutability}
+    {it : Gen.IntType} (h : refPointeeOf t = some (mutbl, it)) :
+    declPtrTy t = refTy mutbl it := by
+  unfold refPointeeOf at h
+  cases hk : t.kind with
+  | ref m pointee =>
+    simp only [hk, Option.map_eq_some_iff] at h
+    obtain ⟨⟨s, n⟩, hb, heq⟩ := h
+    injection heq with hm hit
+    subst hm; subst hit
+    simp [declPtrTy, hk, hb]
+  | _ => simp [hk] at h
+
+theorem declPtrTy_of_isRefTy_false {t : MirAst.Ty} {mutbl : MirAst.Mutability}
+    {it : Gen.IntType} (h : ptrPointeeOf t = some (mutbl, it)) (href : isRefTy t = false) :
+    rawPtrPointeeOf t = some (mutbl, it) ∧ declPtrTy t = thinRawPtrTy := by
+  unfold ptrPointeeOf at h
+  unfold isRefTy refPointeeOf at href
+  cases hk : t.kind with
+  | rawPtr m pointee =>
+    simp [hk] at h
+    exact ⟨by simp [rawPtrPointeeOf, hk, h], by simp [declPtrTy, hk]⟩
+  | ref m pointee =>
+    rw [hk] at h href
+    cases hb : intTyBytes pointee <;> simp [hb] at h href
+  | _ => simp [hk] at h
+
+theorem declPtrTy_of_isRefTy_true {t : MirAst.Ty} {mutbl : MirAst.Mutability}
+    {it : Gen.IntType} (h : ptrPointeeOf t = some (mutbl, it)) (href : isRefTy t = true) :
+    refPointeeOf t = some (mutbl, it) ∧ declPtrTy t = refTy mutbl it := by
+  unfold ptrPointeeOf at h
+  unfold isRefTy refPointeeOf at href
+  cases hk : t.kind with
+  | rawPtr m pointee => simp [hk] at href
+  | ref m pointee =>
+    simp [hk] at h
+    have hr : refPointeeOf t = some (mutbl, it) := by simp [refPointeeOf, hk, h]
+    exact ⟨hr, declPtrTy_of_refPointeeOf hr⟩
+  | _ => simp [hk] at h
+
+theorem declPtrTy_cases (t : MirAst.Ty) :
+    declPtrTy t = thinRawPtrTy ∨
+      ∃ mutbl it, refPointeeOf t = some (mutbl, it) ∧ declPtrTy t = refTy mutbl it := by
+  unfold declPtrTy
+  cases hk : t.kind with
+  | ref mutbl pointee =>
+    simp only []
+    cases hb : intTyBytes pointee with
+    | none => exact .inl rfl
+    | some p =>
+      obtain ⟨s, n⟩ := p
+      exact .inr ⟨mutbl, ⟨s, ⟨n⟩⟩, by simp [refPointeeOf, hk, hb], rfl⟩
+  | _ => exact .inl rfl
+
+@[simp] theorem tyBytes_declPtrTy (t : MirAst.Ty) : tyBytes (declPtrTy t) = 8 := by
+  rcases declPtrTy_cases t with h | ⟨mutbl, it, _, h⟩
+  · rw [h]; rfl
+  · rw [h]; rfl
+
+theorem translateTy_of_ptrPointeeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty}
+    {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (h : ptrPointeeOf t = some (mutbl, it)) :
+    translateTy layouts t = some (declPtrTy t) := by
+  obtain ⟨_, _, _, _, harr, htspec, hsc⟩ := not_other_of_ptrPointeeOf (layouts := layouts) h
   unfold ptrPointeeOf at h
   cases hk : t.kind with
   | rawPtr m pointee =>
     simp only [hk, Option.map_eq_some_iff] at h
     obtain ⟨⟨s, n⟩, hb, _⟩ := h
-    unfold intTyBytes at hb
-    unfold rawPtrTypeOf rawPtrMetaOf rawPtrMetaKind thinRawPtrTy
-    rw [hk]
-    cases pointee <;> simp_all
+    have hraw : rawPtrTypeOf t = some thinRawPtrTy := by
+      unfold intTyBytes at hb
+      unfold rawPtrTypeOf rawPtrMetaOf rawPtrMetaKind thinRawPtrTy
+      rw [hk]
+      cases pointee <;> simp_all
+    simp [translateTy, hsc, harr, htspec, hraw, declPtrTy, hk]
+  | ref m pointee =>
+    simp only [hk, Option.map_eq_some_iff] at h
+    obtain ⟨⟨s, n⟩, hb, _⟩ := h
+    have hraw : rawPtrTypeOf t = none := by simp [rawPtrTypeOf, rawPtrMetaOf, hk]
+    have href : refTypeOf t = some (refTy m ⟨s, ⟨n⟩⟩) := by simp [refTypeOf, hk, hb]
+    simp [translateTy, hsc, harr, htspec, hraw, href, declPtrTy, hk, hb]
   | _ => simp [hk] at h
-
-theorem translateTy_of_ptrPointeeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty}
-    {mutbl : MirAst.Mutability} {it : Gen.IntType}
-    (h : ptrPointeeOf t = some (mutbl, it)) :
-    translateTy layouts t = some thinRawPtrTy := by
-  obtain ⟨_, _, _, _, harr, htspec, hsc⟩ := not_other_of_ptrPointeeOf (layouts := layouts) h
-  simp [translateTy, hsc, harr, htspec, rawPtrTypeOf_of_ptrPointeeOf h]
 
 theorem translateTy_of_scalarTypeOf {layouts : Layout.LayoutTable} {t : MirAst.Ty} {T : Gen.Type}
     (h : scalarTypeOf t = some T) : translateTy layouts t = some T := by
@@ -412,7 +493,7 @@ theorem tyOf_tupleSpec {d : LocalDecl} {layouts : Layout.LayoutTable}
 theorem tyOf_ptr {d : LocalDecl} {layouts : Layout.LayoutTable}
     {mutbl : MirAst.Mutability} {it : Gen.IntType}
     (h : ptrPointeeOf d.ty = some (mutbl, it)) :
-    tyOf d layouts = thinRawPtrTy ∧ itOf d layouts = usizeIt := by
+    tyOf d layouts = declPtrTy d.ty ∧ itOf d layouts = usizeIt := by
   obtain ⟨hb, ho, htup, hit, harr, htspec, _⟩ := not_other_of_ptrPointeeOf (layouts := layouts) h
   have hp : isPtrTy d.ty = true := by simp [isPtrTy, h]
   refine ⟨tyOf_of_translateTy (translateTy_of_ptrPointeeOf h), ?_⟩
@@ -420,7 +501,7 @@ theorem tyOf_ptr {d : LocalDecl} {layouts : Layout.LayoutTable}
 
 theorem tyOf_isPtrTy {d : LocalDecl} {layouts : Layout.LayoutTable}
     (h : isPtrTy d.ty = true) :
-    tyOf d layouts = thinRawPtrTy ∧ itOf d layouts = usizeIt := by
+    tyOf d layouts = declPtrTy d.ty ∧ itOf d layouts = usizeIt := by
   unfold isPtrTy at h
   obtain ⟨⟨mutbl, it⟩, hp⟩ := Option.isSome_iff_exists.mp h
   exact tyOf_ptr hp

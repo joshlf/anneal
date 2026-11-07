@@ -4178,10 +4178,11 @@ theorem evalOperands_move (mo : List Nat) (locals : List LocalSlot) (ops : List 
       | unsupported => rfl
 
 /-- The rvalue kinds whose evaluation `evalRvalue_move` reduces: those of
-the fragment (including the thin raw pointer cast `PtrToPtr`). -/
+the fragment (including `CopyForDeref` and the cast kinds `IntToInt`,
+`PtrToPtr`, and `Transmute`). -/
 def moveKind : Rvalue → Bool
-  | .use _ | .repeat _ _ | .len _ | .unaryOp .not _ | .unaryOp .neg _
-  | .binaryOp _ _ _ | .cast .intToInt _ _ | .cast .ptrToPtr _ _
+  | .use _ | .copyForDeref _ | .repeat _ _ | .len _ | .unaryOp .not _ | .unaryOp .neg _
+  | .binaryOp _ _ _ | .cast .intToInt _ _ | .cast .ptrToPtr _ _ | .cast .transmute _ _
   | .aggregate .tuple _ | .aggregate (.array _) _ | .aggregate (.adt _ 0 none) _ => true
   | _ => false
 
@@ -4204,6 +4205,18 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
     rw [evalOperand_move locals op hs]
     cases evalOperand locals (copyOp op) mem.borrows mem.globals layouts mem.callerLocals <;> rfl
+  | .copyForDeref p, _ =>
+    obtain ⟨hs, _⟩ := hspec (.copy p) (by simp [rvOperands])
+    have hcopy := evalOperand_copy_frame locals locals (.copy p) hs (fun _ _ => rfl)
+      mem.borrows mem.globals layouts mem.callerLocals
+    have hpost : opPost locals (.copy p) = locals := rfl
+    simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl, hpost]
+    cases hc : evalOperand locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals with
+    | ok v L1 =>
+      rw [opResult_locals hcopy hc]
+      rfl
+    | ub => rfl
+    | unsupported => rfl
   | .repeat op c, _ =>
     obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
     simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
@@ -4299,6 +4312,16 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
           rfl
     | ub => rfl
     | unsupported => rfl
+  | .cast .transmute op ty, _ =>
+    obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
+    simp only [evalRvalue, evalByteCast, copyRv, rvPost, opsPost, rvOperands, List.foldl]
+    rw [evalOperand_move locals op hs, operandTy_copyOp]
+    cases evalOperand locals (copyOp op) mem.borrows mem.globals layouts mem.callerLocals with
+    | ok v L1 =>
+      simp only [opWithLocals]
+      repeat (first | rfl | split | dsimp only [])
+    | ub => rfl
+    | unsupported => rfl
   | .aggregate .tuple ops, _ =>
     simp only [evalRvalue, copyRv, rvPost, rvOperands]
     rw [(evalOperands_move [] locals ops hr mem.borrows mem.globals layouts mem.callerLocals).1]
@@ -4317,7 +4340,7 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
 
 theorem copyRv_copyRv (rv : Rvalue) : copyRv (copyRv rv) = copyRv rv := by
   have hop : ∀ op : Operand, copyOp (copyOp op) = copyOp op := by intro op; cases op <;> rfl
-  cases rv <;> simp [copyRv, hop]
+  cases rv <;> first | rfl | simp [copyRv, hop]
 
 theorem rvOperands_copyRv (rv : Rvalue) : rvOperands (copyRv rv) = (rvOperands rv).map copyOp := by
   cases rv <;> simp [copyRv, rvOperands, copyOp]
@@ -4336,8 +4359,10 @@ theorem simpleOp_copyOp (op : Operand) : simpleOp (copyOp op) = simpleOp op := b
 
 theorem moveKind_copyRv {rv : Rvalue} (h : moveKind rv = true) : moveKind (copyRv rv) = true := by
   match rv, h with
-  | .use _, _ | .repeat _ _, _ | .len _, _ | .unaryOp .not _, _ | .unaryOp .neg _, _
+  | .use _, _ | .copyForDeref _, _ | .repeat _ _, _ | .len _, _
+  | .unaryOp .not _, _ | .unaryOp .neg _, _
   | .binaryOp _ _ _, _ | .cast .intToInt _ _, _ | .cast .ptrToPtr _ _, _
+  | .cast .transmute _ _, _
   | .aggregate .tuple _, _ | .aggregate (.array _) _, _ | .aggregate (.adt _ 0 none) _, _ => rfl
 
 theorem readsOk_copy {mo : List Nat} {ops : List Operand} (h : readsOk mo ops = true) :

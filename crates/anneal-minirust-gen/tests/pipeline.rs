@@ -334,7 +334,7 @@ fn anchors_match_generated_items_and_cover_interp() {
             "Anchor `{file}`::{name}:{line} ({sha}) not found in generated items for `{file}`"
         );
     }
-    assert_eq!(anchor_count, 72, "expected 72 anchors, found {anchor_count}");
+    assert_eq!(anchor_count, 90, "expected 90 anchors, found {anchor_count}");
 
     let interp_path = minirust_dir().join("lean/MiniRustSpec/Interp.lean");
     let interp_text = std::fs::read_to_string(&interp_path).unwrap();
@@ -357,11 +357,18 @@ fn anchors_match_generated_items_and_cover_interp() {
         }
     }
 
-    // Every `theorem` in `Anchors.lean` and `Correspondence/Witness.lean` must be
-    // explicitly listed in `Audit.lean` so `lake build MiniRustSpec` logs its axioms.
+    // Every `theorem` in `Anchors.lean`, `Correspondence/Witness.lean`,
+    // `Correspondence/PointerWitness.lean`, and `Correspondence/RefWitness.lean`
+    // must be explicitly listed in `Audit.lean` so `lake build MiniRustSpec`
+    // logs its axioms.
     let audit_text =
         std::fs::read_to_string(minirust_dir().join("lean/MiniRustSpec/Audit.lean")).unwrap();
-    for rel in ["lean/MiniRustSpec/Anchors.lean", "lean/MiniRustSpec/Correspondence/Witness.lean"] {
+    for rel in [
+        "lean/MiniRustSpec/Anchors.lean",
+        "lean/MiniRustSpec/Correspondence/Witness.lean",
+        "lean/MiniRustSpec/Correspondence/PointerWitness.lean",
+        "lean/MiniRustSpec/Correspondence/RefWitness.lean",
+    ] {
         let text = std::fs::read_to_string(minirust_dir().join(rel)).unwrap();
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("theorem ") {

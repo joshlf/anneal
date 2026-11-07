@@ -4416,7 +4416,7 @@ theorem cappedTailAlign_and_computeSizeAndAlign_all_branches :
       (.Tuple ⟨⟨5⟩, ⟨4⟩, none⟩ (.Slice ⟨2⟩ ⟨2⟩)) (some (.ElementCount 3)) =
       .ok (⟨12⟩, ⟨4⟩) ∧
     LayoutStrategy.compute_size_and_align
-      (fun _ => .ok { trait_name := ⟨⟨0⟩⟩, size := ⟨24⟩, align := ⟨8⟩, cells := [], methods := ⟨[]⟩ })
+      (fun _ : Ptr => .ok { trait_name := ⟨⟨0⟩⟩, size := ⟨24⟩, align := ⟨8⟩, cells := [], methods := ⟨[]⟩ })
       (.TraitObject ⟨⟨0⟩⟩)
       (some (.VTablePointer { addr := 64, provenance := none })) =
       .ok (⟨24⟩, ⟨8⟩) ∧
@@ -6150,15 +6150,15 @@ theorem storageLiveArgRet_translate :
     translateFn storageLiveArgRet = some storageLiveArgRetFn := rfl
 
 theorem ctx0_ok_u32_3 {body : CapturedMir}
-    (h : body.localDecls = [u32Decl, u32Decl, u32Decl]) : CtxOk body ctx0 where
+    (h : body.localDecls = [u32Decl, u32Decl, u32Decl])
+    (ha : body.argCount = 1 := by rfl) : CtxOk body ctx0 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d _ hd; rw [h] at hd
-    match i, hd with
-    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
-    | 1, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
-    | 2, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
-    | _ + 3, hd => simp at hd
+    intro i d hi hd; rw [h] at hd; rw [ha] at hi
+    match i, hd, hi with
+    | 0, hd, _ => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd, _ => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | _ + 2, _, hi => omega
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
     exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
@@ -6338,16 +6338,16 @@ diamond witnesses. -/
 def ctx0_2 : Ctx := { ctx0 with addrs := [128, 256, 384] }
 
 theorem ctx0_2_ok_bool_u32 {body : CapturedMir}
-    (h : body.localDecls = [u32Decl, boolDecl, u32Decl, u32Decl]) : CtxOk body ctx0_2 where
+    (h : body.localDecls = [u32Decl, boolDecl, u32Decl, u32Decl])
+    (ha : body.argCount = 2 := by rfl) : CtxOk body ctx0_2 where
   baseLow := by unfold BaseLow; decide
   addrs := by
-    intro i d _ hd; rw [h] at hd
-    match i, hd with
-    | 0, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
-    | 1, hd => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
-    | 2, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
-    | 3, hd => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
-    | _ + 4, hd => simp at hd
+    intro i d hi hd; rw [h] at hd; rw [ha] at hi
+    match i, hd, hi with
+    | 0, hd, _ => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd, _ => simp at hd; subst hd; rw [boolDecl, boolTy, itOf_bool, tyOf_bool]; decide
+    | 2, hd, _ => simp at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | _ + 3, _, hi => omega
   ret := by
     intro d hd; rw [h] at hd; simp at hd; subst hd
     exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩

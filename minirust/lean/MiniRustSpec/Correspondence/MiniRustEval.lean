@@ -396,11 +396,13 @@ theorem canRepresent_intFromBits (it : Gen.IntType) (bits : Nat) (hgood : GoodSi
   rw [inBounds_iff _ _ _ (by simpa [Size.bits] using hn)]
   simpa [Size.bits] using intFromBits_window bits it hn hb
 
-theorem checkValue_int {t : Gen.IntType} {i : Int} (h : IntType.can_represent t i = true) :
-    checkValue (.Int i) (.Int t) = .ok () := by
+theorem checkValue_int {t : Gen.IntType} {i : Int} {m? : Option Mach}
+    (h : IntType.can_represent t i = true) :
+    checkValue (.Int i) (.Int t) m? = .ok () := by
   simp only [checkValue, ensureElseUb, h]; rfl
 
-theorem checkValue_bool (b : Bool) : checkValue (.Bool b) .Bool = .ok () := rfl
+theorem checkValue_bool (b : Bool) {m? : Option Mach} :
+    checkValue (.Bool b) .Bool m? = .ok () := rfl
 
 /-- Encoding an in-window integer at an integer type yields the little-endian
 bytes of its residue. -/
@@ -509,7 +511,7 @@ theorem typedStore_local {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List 
   obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
   have hblen : (scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat).length = it.size.bytes := by
     simp [scalarBytes, leBytes_length]
-  have hck : checkValue (.Int v) (.Int it) = .ok () := checkValue_int hv
+  have hck : checkValue (.Int v) (.Int it) (some m) = .ok () := checkValue_int hv
   have hne : scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat ≠ [] :=
     List.ne_nil_of_length_pos (by omega)
   simp only [typedStore, hck, encode_int it v hgood hv, CM.store, BM.store, hal, BM.check_ptr,
@@ -582,7 +584,7 @@ theorem typedStore_local_bool {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
             ⟨.Store, .None, ctx.addrs.getD i 0, u8Ty.size⟩) := by
   obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
   have hu8 : u8Ty.size.bytes = 1 := rfl
-  have hck : checkValue (.Bool b) .Bool = .ok () := rfl
+  have hck : checkValue (.Bool b) .Bool (some m) = .ok () := rfl
   have hblen : (scalarBytes u8Ty (if b then 1 else 0)).length = u8Ty.size.bytes := by
     simp [scalarBytes, leBytes_length]
   have hne : scalarBytes u8Ty (if b then 1 else 0) ≠ [] :=
@@ -605,7 +607,8 @@ computed for each of the three tags. -/
 theorem typedLoad_local_byte {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
     (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) (T : Gen.Type) (bits : Nat) (v : Val)
     (hlay : Type.layout T = .ok (.Sized u8Ty.size ⟨u8Ty.size.bytes⟩))
-    (hdec : Type.decode T (scalarBytes u8Ty bits) = .ok (some v)) (hck : checkValue v T = .ok ())
+    (hdec : Type.decode T (scalarBytes u8Ty bits) = .ok (some v))
+    (hck : ∀ {m? : Option Mach}, checkValue v T m? = .ok ())
     (hL : L[i]? = some (localAlloc ctx i u8Ty (scalarBytes u8Ty bits)))
     (align : Align) (hal : Align.is_aligned align (ctx.addrs.getD i 0) = true) :
     ∃ m', typedLoad m (localPtr ctx i) T align .None = .ok (v, m') ∧
@@ -641,7 +644,7 @@ theorem typedLoad_local_byte_uninit {m : Mach} {ctx : Ctx} {frames : List Frame}
 
 theorem typedStore_local_byte {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
     (h : Shape m ctx frames (ctx.base ++ L)) (i : Nat) (T : Gen.Type) (data : List Byte) (v : Val)
-    (bits : Nat) (hck : checkValue v T = .ok ())
+    (bits : Nat) (hck : ∀ {m? : Option Mach}, checkValue v T m? = .ok ())
     (henc : Type.encode T v = .ok (scalarBytes u8Ty bits))
     (hL : L[i]? = some (localAlloc ctx i u8Ty data)) (hlen : data.length = u8Ty.size.bytes)
     (align : Align) (hal : Align.is_aligned align (ctx.addrs.getD i 0) = true) :
@@ -723,8 +726,8 @@ theorem decode_ordering {bits : Nat} (hb : ValidBits orderingTy bits) :
     Type.decode orderingTy (scalarBytes u8Ty bits) = .ok (some (valOf orderingTy bits)) := by
   rcases (validBits_ordering bits).mp hb with rfl | rfl | rfl <;> rfl
 
-theorem checkValue_ordering {bits : Nat} (hb : ValidBits orderingTy bits) :
-    checkValue (valOf orderingTy bits) orderingTy = .ok () := by
+theorem checkValue_ordering {bits : Nat} {m? : Option Mach} (hb : ValidBits orderingTy bits) :
+    checkValue (valOf orderingTy bits) orderingTy m? = .ok () := by
   rcases (validBits_ordering bits).mp hb with rfl | rfl | rfl <;> rfl
 
 theorem encode_ordering {bits : Nat} (hb : ValidBits orderingTy bits) :
@@ -852,8 +855,8 @@ theorem typedStore_local_frag {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
       (encode_ordering hb) hL hlen align hal
 
 /-- All fragment local types (scalar `FragTy`, 2-tuples `intBoolTupleTy it`,
-homogeneous arrays, layout-backed tuples/structs, and thin raw pointers) and
-their alignment storage integer types. -/
+homogeneous arrays, layout-backed tuples/structs, thin raw pointers, and thin
+scalar references) and their alignment storage integer types. -/
 inductive LocalTy : Gen.Type → Gen.IntType → Prop
   | frag {T : Gen.Type} {it : Gen.IntType} (h : FragTy T it) : LocalTy T it
   | tuple (it : Gen.IntType) (h : GoodSize it.size.bytes) : LocalTy (intBoolTupleTy it) it
@@ -863,6 +866,19 @@ inductive LocalTy : Gen.Type → Gen.IntType → Prop
       (hwf : (TupleSpec.tuple fields size align).wf = true) :
       LocalTy ((TupleSpec.tuple fields size align).toMiniRustTy) ⟨.Unsigned, ⟨align⟩⟩
   | rawPtr : LocalTy thinRawPtrTy usizeIt
+  | refPtr (mutbl : MirAst.Mutability) (it : Gen.IntType) (hgood : GoodSize it.size.bytes) :
+      LocalTy (refTy mutbl it) usizeIt
+
+theorem refPointeeOf_good {t : MirAst.Ty} {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (h : refPointeeOf t = some (mutbl, it)) : GoodSize it.size.bytes := by
+  unfold refPointeeOf at h
+  cases hk : t.kind with
+  | ref pointee mutbl' =>
+    simp only [hk, Option.map_eq_some_iff] at h
+    obtain ⟨⟨s, n⟩, hit, hEq⟩ := h
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj hEq
+    exact intTyBytes_good hit
+  | _ => simp [hk] at h
 
 theorem LocalTy.good {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
     GoodSize it.size.bytes := by
@@ -874,6 +890,7 @@ theorem LocalTy.good {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
     simp only [TupleSpec.wf, Bool.and_eq_true] at hwf
     exact (goodAlignBytes_iff align).mp hwf.1.1.1
   | rawPtr => simp [GoodSize, usizeIt]
+  | refPtr _ _ _ => simp [GoodSize, usizeIt]
 
 theorem LocalTy.layout {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
     Type.layout T = .ok (.Sized ⟨tyBytes T⟩ ⟨it.size.bytes⟩) := by
@@ -886,6 +903,7 @@ theorem LocalTy.layout {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it) :
     simpa [TupleSpec.toMiniRustTy, TupleSpec.size, TupleSpec.align, tyBytes] using
       layout_tupleSpec (.tuple fields size align) hwf
   | rawPtr => rfl
+  | refPtr _ _ _ => rfl
 
 /-- Storage integer type associated with a `LocalTy` type `T`. -/
 def storageIt : Gen.Type → Gen.IntType
@@ -899,6 +917,7 @@ def storageIt : Gen.Type → Gen.IntType
       ⟨.Unsigned, ⟨head.align.bytes⟩⟩
   | .Array (.Int elemIt) _ => elemIt
   | .Ptr (.Raw .None) => usizeIt
+  | .Ptr (.Ref _ _) => usizeIt
   | _ => u8Ty
 
 theorem TupleSpec.toMiniRustTy_ne_bool (s : TupleSpec) : s.toMiniRustTy ≠ .Bool := by
@@ -923,6 +942,7 @@ theorem LocalTy.storageIt_eq {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it
           have hne := TupleSpec.toMiniRustTy_ne_bool f1.2
           cases hf1 : f1.2.toMiniRustTy <;> simp_all [TupleSpec.toMiniRustTy, TupleSpec.fieldsToMiniRust, storageIt]
   | rawPtr => rfl
+  | refPtr _ _ _ => rfl
 
 theorem LocalTy.unique {T : Gen.Type} {it it' : Gen.IntType} (h : LocalTy T it)
     (h' : LocalTy T it') : it = it' := by
@@ -936,6 +956,7 @@ theorem LocalTy.of_validBits {T : Gen.Type} {it : Gen.IntType} (h : LocalTy T it
   | array _ _ _ => simp [ValidBits] at hb
   | tupleSpec _ _ _ _ => simp [TupleSpec.toMiniRustTy, ValidBits] at hb
   | rawPtr => simp [thinRawPtrTy, ValidBits] at hb
+  | refPtr _ _ _ => simp [refTy, ValidBits] at hb
 
 /-- A scalar-family fragment local's declared MiniRust type is a `LocalTy`
 aligned like `itOf d layouts`. -/
@@ -973,7 +994,9 @@ theorem localTy_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTable}
         simp only [ht, Bool.or_false] at hdok
         obtain ⟨h1, h2⟩ := tyOf_isPtrTy (layouts := layouts) hdok
         rw [h1, h2]
-        exact .rawPtr
+        rcases declPtrTy_cases d.ty with hraw | ⟨mutbl, it, href, h1'⟩
+        · rw [hraw]; exact .rawPtr
+        · rw [h1']; exact .refPtr mutbl it (refPointeeOf_good href)
       | some p =>
         obtain ⟨fields, size, align⟩ := p
         simp only [ht] at hdok
@@ -1045,7 +1068,7 @@ theorem declSlotData_length_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTa
       | none =>
         simp only [ht, Bool.or_false] at hdok
         obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok
-        rw [declSlotData_of_isPtrTy hdok, h1, slotData_length]
+        rw [declSlotData_of_isPtrTy hdok, h1, slotData_length, tyBytes_declPtrTy]
         rfl
       | some p =>
         obtain ⟨fields, size, align⟩ := p
@@ -1067,8 +1090,8 @@ def tupleVal (it : Gen.IntType) (bits b : Nat) : Val :=
   .Tuple [.Int (intFromBits bits it), .Bool (decide (b = 1))]
 
 theorem checkValue_tuple (it : Gen.IntType) (bits b : Nat) (hgood : GoodSize it.size.bytes)
-    (hbits : bits < 2 ^ (8 * it.size.bytes)) :
-    checkValue (tupleVal it bits b) (intBoolTupleTy it) = .ok () := by
+    (hbits : bits < 2 ^ (8 * it.size.bytes)) {m? : Option Mach} :
+    checkValue (tupleVal it bits b) (intBoolTupleTy it) m? = .ok () := by
   simp [tupleVal, intBoolTupleTy, checkValue, ensureElseUb, checkFields,
     canRepresent_intFromBits it bits hgood hbits]
 
@@ -1204,7 +1227,8 @@ theorem typedStore_local_tuple {m : Mach} {ctx : Ctx} {frames : List Frame} {L :
   have hpos := hgood.pos
   obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
   have hblen := tupleBytes_length it bits b hpos
-  have hck := checkValue_tuple it bits b hgood hbits
+  have hck : checkValue (tupleVal it bits b) (intBoolTupleTy it) (some m) = .ok () :=
+    checkValue_tuple it bits b hgood hbits
   have henc := encode_tuple it bits b hgood hbits hb
   have hne : tupleBytes it bits b ≠ [] := List.ne_nil_of_length_pos (by omega)
   have hdrop : data.drop (it.size.bytes + it.size.bytes) = [] := List.drop_eq_nil_of_le (by omega)
@@ -1394,7 +1418,7 @@ theorem evalPlace_field0L {m : Mach} {ctx : Ctx} {f : Gen.Function}
   have hloc := evalPlace_local_some h i (intBoolTupleTy it) hT p hp
   have hin0 : inBounds (0 : Int) .Signed x86_64.PTR_SIZE = true := by decide
   have hinAddr : inBounds p.addr .Unsigned x86_64.PTR_SIZE = true :=
-    inBounds_unsigned_ptrSize _ haddr.2.1 (by have := haddr.2.2; omega)
+    inBounds_unsigned_ptrSize _ haddr.nonneg (by have := haddr.2.2; omega)
   have hptr : ptrOffsetInbounds m p 0 = .ok p := by
     simp [ptrOffsetInbounds, CM.signed_dereferenceable, BM.signed_dereferenceable,
       BM.dereferenceable, BM.check_ptr, hin0, hinAddr]
@@ -1418,7 +1442,7 @@ theorem evalPlace_field1L {m : Mach} {ctx : Ctx} {f : Gen.Function}
   have hloc := evalPlace_local_some h i (intBoolTupleTy it) hT p hp
   have hbounds : ¬ ((it.size.bytes : Int) + it.size.bytes < it.size.bytes) := by omega
   have hinAddr : inBounds (p.addr + (it.size.bytes : Int)) .Unsigned x86_64.PTR_SIZE = true :=
-    inBounds_unsigned_ptrSize _ (by have := haddr.2.1; omega) haddr.2.2
+    inBounds_unsigned_ptrSize _ (by have := haddr.nonneg; omega) haddr.2.2
   have hptr : ptrOffsetInbounds m p (it.size.bytes : Int) = .ok (field1Ptr p it) := by
     simp only [ptrOffsetInbounds, CM.signed_dereferenceable, BM.signed_dereferenceable,
       Int.toNat_natCast, BM.dereferenceable]
@@ -1820,8 +1844,8 @@ theorem decode_valBytes (elemIt : Gen.IntType) (v : Value) (hv : ElemOk elemIt v
     x86_64.ENDIANNESS, decode_leBytes signed k sc.bits hb]
 
 theorem checkValue_valToMiniRust (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
-    (v : Value) (hv : ElemOk elemIt v) :
-    checkValue (valToMiniRust elemIt v) (.Int elemIt) = .ok () := by
+    (v : Value) (hv : ElemOk elemIt v) {m? : Option Mach} :
+    checkValue (valToMiniRust elemIt v) (.Int elemIt) m? = .ok () := by
   cases v <;> simp [ElemOk] at hv
   rename_i sc
   obtain ⟨_, hb⟩ := hv
@@ -1918,23 +1942,24 @@ theorem decode_array (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
   rfl
 
 theorem checkValue_forM_valToMiniRust (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
-    (elems : List Value) (he : ∀ v ∈ elems, ElemOk elemIt v) :
-    (elems.map (valToMiniRust elemIt)).forM (fun v => checkValue v (.Int elemIt)) = .ok () := by
+    (elems : List Value) (he : ∀ v ∈ elems, ElemOk elemIt v) {m? : Option Mach} :
+    (elems.map (valToMiniRust elemIt)).forM (fun v => checkValue v (.Int elemIt) m?) = .ok () := by
   induction elems with
   | nil => rfl
   | cons v vs ih =>
-    have hv := checkValue_valToMiniRust elemIt hgood v (he v (by simp))
+    have hv : checkValue (valToMiniRust elemIt v) (.Int elemIt) m? = .ok () :=
+      checkValue_valToMiniRust elemIt hgood v (he v (by simp))
     have ih' := ih (fun x hx => he x (by simp [hx]))
     rw [List.map_cons]
-    change (do checkValue (valToMiniRust elemIt v) (.Int elemIt); (vs.map (valToMiniRust elemIt)).forM (fun v => checkValue v (.Int elemIt))) = .ok ()
+    change (do checkValue (valToMiniRust elemIt v) (.Int elemIt) m?; (vs.map (valToMiniRust elemIt)).forM (fun v => checkValue v (.Int elemIt) m?)) = .ok ()
     rw [hv, ok_bind, ih']
 
 theorem checkValue_array (elemIt : Gen.IntType) (hgood : GoodSize elemIt.size.bytes)
     (elems : List Value) (count : Nat) (hlen : elems.length = count)
-    (he : ∀ v ∈ elems, ElemOk elemIt v) :
+    (he : ∀ v ∈ elems, ElemOk elemIt v) {m? : Option Mach} :
     checkValue (.Tuple (elems.map (valToMiniRust elemIt)))
-        (.Array (.Int elemIt) (count : Int)) = .ok () := by
-  have hm := checkValue_forM_valToMiniRust elemIt hgood elems he
+        (.Array (.Int elemIt) (count : Int)) m? = .ok () := by
+  have hm := checkValue_forM_valToMiniRust elemIt hgood elems he (m? := m?)
   unfold checkValue
   simp [hlen, hm]
 
@@ -1987,7 +2012,6 @@ theorem typedLoad_array_local {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
     rw [flatten_map_length (valBytes elemIt) elemIt.size.bytes elems (fun x _ => valBytes_length elemIt x), hlen]
   have hset := set_self_of_getElem? L j _ hL
   have hdec := decode_array elemIt hgood elems count hlen he
-  have hck := checkValue_array elemIt hgood elems count hlen he
   have hload : CM.load m.mem (localPtr ctx j) ⟨count * elemIt.size.bytes⟩ ⟨1⟩ .None =
       .ok ((elems.map (valBytes elemIt)).flatten,
         (withMem m (ctx.base ++ L) ⟨.Load, .None, ctx.addrs.getD j 0, ⟨count * elemIt.size.bytes⟩⟩).mem) := by
@@ -2012,7 +2036,7 @@ theorem typedLoad_array_local {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
   rw [hload]
   simp only [ok_bind]
   rw [hdec]
-  simp only [ok_bind, hck, pure_ok]
+  simp only [ok_bind, checkValue_array elemIt hgood elems count hlen he, pure_ok]
   cases m; rfl
 
 theorem typedStore_array_local {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
@@ -2029,7 +2053,7 @@ theorem typedStore_array_local {m : Mach} {ctx : Ctx} {frames : List Frame} {L :
   obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
   have hblen : ((elems.map (valBytes elemIt)).flatten).length = count * elemIt.size.bytes := by
     rw [flatten_map_length (valBytes elemIt) elemIt.size.bytes elems (fun x _ => valBytes_length elemIt x), hlen]
-  have hck := checkValue_array elemIt hgood elems count hlen he
+  have hck := checkValue_array elemIt hgood elems count hlen he (m? := some m)
   have henc := encode_array elemIt hgood elems count hlen he
   have hstore : CM.store m.mem (localPtr ctx i) ((elems.map (valBytes elemIt)).flatten) ⟨1⟩ .None =
       .ok (withMem m (ctx.base ++ L.set i
@@ -2113,7 +2137,7 @@ theorem typedStore_array_elem {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
   have hpos := hgood.pos
   obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
   have hrep := canRepresent_intFromBits ⟨signed, ⟨bytes⟩⟩ r hgood hr
-  have hck : checkValue (.Int (intFromBits r ⟨signed, ⟨bytes⟩⟩)) (.Int ⟨signed, ⟨bytes⟩⟩) = .ok () := by
+  have hck : checkValue (.Int (intFromBits r ⟨signed, ⟨bytes⟩⟩)) (.Int ⟨signed, ⟨bytes⟩⟩) (some m) = .ok () := by
     simp [checkValue, hrep]
   have hblen : ((elems.map (valBytes ⟨signed, ⟨bytes⟩⟩)).flatten).length = count * bytes := by
     rw [flatten_map_length (valBytes ⟨signed, ⟨bytes⟩⟩) bytes elems (fun x _ => valBytes_length ⟨signed, ⟨bytes⟩⟩ x), hlen]
@@ -2269,8 +2293,8 @@ end
 mutual
 
 theorem checkValue_tupleSpec (s : TupleSpec) (v : Value)
-    (hwf : s.wf = true) (hv : s.valOk v = true) :
-    checkValue (s.toMiniRustVal v) s.toMiniRustTy = .ok () := by
+    (hwf : s.wf = true) (hv : s.valOk v = true) {m? : Option Mach} :
+    checkValue (s.toMiniRustVal v) s.toMiniRustTy m? = .ok () := by
   cases s with
   | scalar it =>
     simp only [TupleSpec.wf] at hwf
@@ -2280,7 +2304,7 @@ theorem checkValue_tupleSpec (s : TupleSpec) (v : Value)
       simp only [TupleSpec.valOk, Bool.and_eq_true, decide_eq_true_eq] at hv
       obtain ⟨hsz, hb⟩ := hv
       simpa [TupleSpec.toMiniRustVal, TupleSpec.toMiniRustTy, valToMiniRust] using
-        checkValue_valToMiniRust it hgood (.scalar sc) ⟨hsz, hb⟩
+        checkValue_valToMiniRust it hgood (.scalar sc) ⟨hsz, hb⟩ (m? := m?)
     | _ => simp [TupleSpec.valOk] at hv
   | tuple fields size align =>
     cases v with
@@ -2294,7 +2318,7 @@ theorem checkValue_tupleSpec (s : TupleSpec) (v : Value)
         obtain ⟨_, hfwf⟩ := hwf
         have hlen_m := TupleSpec.fieldsToMiniRustVal_length fields vals
         have hlen_f := TupleSpec.fieldsToMiniRust_length fields
-        have hchk := checkTupleFields_spec size align fields vals hfwf hfwv
+        have hchk := checkTupleFields_spec size align fields vals hfwf hfwv (m? := m?)
         unfold TupleSpec.toMiniRustVal TupleSpec.toMiniRustTy checkValue
         simp [hlen_m, hlen_f, hlen_v, hchk]
     | _ => simp [TupleSpec.valOk] at hv
@@ -2302,9 +2326,9 @@ theorem checkValue_tupleSpec (s : TupleSpec) (v : Value)
 theorem checkTupleFields_spec (size align : Nat) (fields : List (Nat × TupleSpec))
     (vals : List Value)
     (hfwf : TupleSpec.fieldsWf size align fields = true)
-    (hv : TupleSpec.fieldsValOk fields vals = true) :
+    (hv : TupleSpec.fieldsValOk fields vals = true) {m? : Option Mach} :
     checkFields (TupleSpec.fieldsToMiniRustVal fields vals)
-      (TupleSpec.fieldsToMiniRust fields) = .ok () := by
+      (TupleSpec.fieldsToMiniRust fields) m? = .ok () := by
   cases fields with
   | nil =>
     cases vals <;> simp [TupleSpec.fieldsValOk] at hv
@@ -2318,8 +2342,8 @@ theorem checkTupleFields_spec (size align : Nat) (fields : List (Nat × TupleSpe
       obtain ⟨⟨⟨⟨⟨hfswf, _⟩, _⟩, _⟩, _⟩, hrestWf⟩ := hfwf
       simp only [TupleSpec.fieldsValOk, Bool.and_eq_true] at hv
       obtain ⟨hvv, hrestV⟩ := hv
-      have hhead := checkValue_tupleSpec fs v hfswf hvv
-      have htail := checkTupleFields_spec size align restF restV hrestWf hrestV
+      have hhead := checkValue_tupleSpec fs v hfswf hvv (m? := m?)
+      have htail := checkTupleFields_spec size align restF restV hrestWf hrestV (m? := m?)
       unfold TupleSpec.fieldsToMiniRustVal TupleSpec.fieldsToMiniRust checkFields
       rw [hhead, ok_bind, htail]
 
@@ -2526,7 +2550,6 @@ theorem typedLoad_tuple_slice {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
   obtain ⟨hj, hLj⟩ := List.getElem?_eq_some_iff.mp hL
   have hlay := layout_tupleSpec subSpec hwf
   have hdec := decode_tupleSpec subSpec subVal hwf hv
-  have hck := checkValue_tupleSpec subSpec subVal hwf hv
   have hset := set_self_of_getElem? L j _ hL
   have hload : CM.load m.mem (fieldPtr ctx j off) ⟨subSpec.size⟩ ⟨1⟩ .None =
       .ok (subSpec.encodeVal subVal,
@@ -2546,7 +2569,7 @@ theorem typedLoad_tuple_slice {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
     ?_, withMem_shape h _⟩
   unfold typedLoad
   rw [hlay]
-  simp only [expect_size_sized, ok_bind, hload, hdec, hck, pure_ok]
+  simp only [expect_size_sized, ok_bind, hload, hdec, checkValue_tupleSpec subSpec subVal hwf hv, pure_ok]
   simp [withMem]
 
 theorem typedStore_tuple_slice {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List Gen.Allocation}
@@ -2560,7 +2583,7 @@ theorem typedStore_tuple_slice {m : Mach} {ctx : Ctx} {frames : List Frame} {L :
               (localAlloc ctx i allocIt (spliceAt data off (subSpec.encodeVal subVal))))
             ⟨.Store, .None, (fieldPtr ctx i off).addr, ⟨subSpec.size⟩⟩) := by
   obtain ⟨hi, hLi⟩ := List.getElem?_eq_some_iff.mp hL
-  have hck := checkValue_tupleSpec subSpec subVal hwf hv
+  have hck := checkValue_tupleSpec subSpec subVal hwf hv (m? := some m)
   have henc := encode_tupleSpec subSpec subVal hwf hv
   have hlen_e := TupleSpec.encodeVal_length subSpec subVal hwf
   have hstore : CM.store m.mem (fieldPtr ctx i off) (subSpec.encodeVal subVal) ⟨1⟩ .None =
@@ -3249,7 +3272,7 @@ theorem LocalsOkA.storage_any {body : CapturedMir} {ctx : Ctx} {al : List Nat}
       obtain ⟨pv, rfl⟩ := (DeclSlotOk_of_isPtrTy hp_ty (.init v)).mp hsl
       obtain ⟨tAddr, tProv, _, _, hA'⟩ := hA
       exact ⟨id, ptrBytes tAddr tProv, hpid, hb, ha, hmax, hc,
-        by rw [ptrBytes_length, hTd]; rfl, hA'⟩
+        by rw [ptrBytes_length, hTd, tyBytes_declPtrTy], hA'⟩
 
 /-- A local that `LocalsOk` keeps out of the locals map is dead. -/
 theorem LocalsOk.dead_of_none {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
@@ -3836,7 +3859,7 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
             rw [hTd] at haddrMax
             simp only [tyBytes, Int.ofNat_eq_natCast, Int.toNat_natCast] at haddrMax
             have hptr := ptrOffsetInbounds_ptr_elem h1.shape p k hpk bits elemIt
-              (declSlotData d slot body.layouts) hA1 hoff_le hoff_bound haddr.2.1
+              (declSlotData d slot body.layouts) hA1 hoff_le hoff_bound haddr.nonneg
               (by rw [hdlen]; exact haddrMax)
             have hsz : bits * elemIt.size.bytes ≤ count * elemIt.size.bytes :=
               Nat.mul_le_mul_right _ (by omega)
@@ -3893,7 +3916,7 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       rw [hTd] at haddrMax
       simp only [tyBytes, Int.ofNat_eq_natCast, Int.toNat_natCast] at haddrMax
       have hptr := ptrOffsetInbounds_ptr_elem h.shape p k hpk idx elemIt
-        (declSlotData d slot body.layouts) hA hoff_le hoff_bound haddr.2.1
+        (declSlotData d slot body.layouts) hA hoff_le hoff_bound haddr.nonneg
         (by rw [hdlen]; exact haddrMax)
       have hsz : idx * elemIt.size.bytes ≤ count * elemIt.size.bytes :=
         Nat.mul_le_mul_right _ (by omega)
@@ -3969,7 +3992,7 @@ theorem evalPlace_constantIndex_same {body : CapturedMir} {f : Gen.Function} {ct
     rw [hTd] at haddrMax
     simp only [tyBytes, Int.ofNat_eq_natCast, Int.toNat_natCast] at haddrMax
     have hptr := ptrOffsetInbounds_ptr_elem h.shape p k hpk idx' elemIt
-      (declSlotData d slot body.layouts) hA hoff_le hoff_bound haddr.2.1
+      (declSlotData d slot body.layouts) hA hoff_le hoff_bound haddr.nonneg
       (by rw [hdlen]; exact haddrMax)
     have hsz : idx' * elemIt.size.bytes ≤ count * elemIt.size.bytes :=
       Nat.mul_le_mul_right _ (by omega)
@@ -4181,7 +4204,7 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
                     simpa using hplaceBase
                   have hpeEval := evalPlace_ptr_fieldPath h.shape p k hpk
                     (itOf d body.layouts) ((TupleSpec.tuple fields size align).encodeVal rootVal) hA
-                    (by rw [hdlen]; exact hbound) haddr.2.1 (by rw [hdlen]; exact haddrMax)
+                    (by rw [hdlen]; exact hbound) haddr.nonneg (by rw [hdlen]; exact haddrMax)
                     (.Local (localName j)) 0 (.tuple fields size align) hrootEval hrootWf
                     (by simp [TupleSpec.size, hdlen]) (.field idx fieldTy :: rest) pe hpe
                     relOff (.scalar leafIt) hres
@@ -4855,7 +4878,7 @@ theorem evalPlace_tuplePlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     simpa using hplaceBase
   have hpeEval := evalPlace_ptr_fieldPath h.shape ptr k hpk
     (itOf d body.layouts) ((TupleSpec.tuple rootFields rootSize rootAlign).encodeVal rootVal) hA
-    (by rw [hdlen]; exact hbound) haddr.2.1 (by rw [hdlen]; exact haddrMax)
+    (by rw [hdlen]; exact hbound) haddr.nonneg (by rw [hdlen]; exact haddrMax)
     (.Local (localName pl.local_)) 0 (.tuple rootFields rootSize rootAlign) hrootEval hrootWf
     (by simp [TupleSpec.size, hdlen]) pl.projection pe hpe
     relOff (.tuple fields size align) hres
@@ -5291,7 +5314,9 @@ theorem FragTy.not_isPtrTy {d : LocalDecl} {layouts : Layout.LayoutTable}
   · rfl
   · have hT := (tyOf_isPtrTy (layouts := layouts) hp).1
     rw [hT] at h
-    cases h
+    rcases declPtrTy_cases d.ty with hraw | ⟨mutbl, it, _, href⟩
+    · rw [hraw] at h; cases h
+    · rw [href] at h; cases h
 
 theorem FragTy.declSlotOk {d : LocalDecl} {layouts : Layout.LayoutTable}
     (h : FragTy (tyOf d layouts) (itOf d layouts)) (slot : LocalSlot) :
@@ -5636,7 +5661,7 @@ theorem evalStatement_assign_field_scalar {body : CapturedMir} {f : Gen.Function
           simpa using hplaceBase
         have hpeEval := evalPlace_ptr_fieldPath h.shape ptr k hpk (itOf d body.layouts)
           ((TupleSpec.tuple rootFields rootSize rootAlign).encodeVal rootVal) hA
-          (by rw [hdlen]; exact hbound) haddr.2.1 (by rw [hdlen]; exact haddrMax)
+          (by rw [hdlen]; exact hbound) haddr.nonneg (by rw [hdlen]; exact haddrMax)
           (.Local (localName i)) 0 (.tuple rootFields rootSize rootAlign) hrootEval hrootWf
           (by simp [TupleSpec.size, hdlen]) (.field idx fieldTy :: rest) pe hpe
           relOff (.scalar leafIt) hres
@@ -5788,7 +5813,7 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
           simpa using hplaceBase
         have hpeEval := evalPlace_ptr_fieldPath h.shape q k hqk (itOf d body.layouts)
           ((TupleSpec.tuple fields size align).encodeVal rootVal) hA
-          (by rw [hdlen]; exact hbound) haddr.2.1 (by rw [hdlen]; exact haddrMax)
+          (by rw [hdlen]; exact hbound) haddr.nonneg (by rw [hdlen]; exact haddrMax)
           (.Local (localName i)) 0 (.tuple fields size align) hrootEval hrootWf
           (by simp [TupleSpec.size, hdlen]) (.field idx fieldTy :: rest) pe hpe
           relOff leafSpec hres
@@ -6810,7 +6835,7 @@ theorem scalar_tyBytes_pos {d : LocalDecl} {layouts : Layout.LayoutTable}
     · obtain ⟨h1, _⟩ := tyOf_tuple (layouts := layouts) ht
       rw [h1]; simp only [intBoolTupleTy, tyBytes]; have := (intBoolTupleOf_good ht).pos; omega
   · obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hp
-    rw [h1]; decide
+    rw [h1, tyBytes_declPtrTy]; decide
 
 theorem scalar_size_le_tyBytes {d : LocalDecl} {layouts : Layout.LayoutTable}
     (h : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) :
@@ -6831,7 +6856,7 @@ theorem scalar_size_le_tyBytes {d : LocalDecl} {layouts : Layout.LayoutTable}
     · obtain ⟨h1, h2⟩ := tyOf_tuple (layouts := layouts) ht
       rw [h1, h2]; simp only [intBoolTupleTy, tyBytes]; omega
   · obtain ⟨h1, h2⟩ := tyOf_isPtrTy (layouts := layouts) hp
-    rw [h1, h2]; decide
+    rw [h1, h2, tyBytes_declPtrTy]; decide
 
 theorem scalar_tyBytes_le {d : LocalDecl} {layouts : Layout.LayoutTable}
     (h : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true) :
@@ -6853,7 +6878,7 @@ theorem scalar_tyBytes_le {d : LocalDecl} {layouts : Layout.LayoutTable}
       rw [h1]; simp only [intBoolTupleTy, tyBytes]
       rcases intBoolTupleOf_good ht with hg | hg | hg | hg | hg <;> omega
   · obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hp
-    rw [h1]; decide
+    rw [h1, tyBytes_declPtrTy]; decide
 
 theorem declSlotOk_dead (d : LocalDecl) (layouts : Layout.LayoutTable) :
     DeclSlotOk d .dead layouts := by
@@ -6913,7 +6938,7 @@ theorem declSlotData_uninit_of_declOk {d : LocalDecl} {layouts : Layout.LayoutTa
       | none =>
         simp only [ht, Bool.or_false] at hdok
         obtain ⟨h1, _⟩ := tyOf_isPtrTy (layouts := layouts) hdok
-        rw [declSlotData_of_isPtrTy hdok, h1]
+        rw [declSlotData_of_isPtrTy hdok, h1, tyBytes_declPtrTy]
         rfl
       | some p =>
         obtain ⟨fields, size, align⟩ := p
@@ -7920,7 +7945,7 @@ theorem typedStore_base {m : Mach} {ctx : Ctx} {frames : List Frame} {L : List G
   obtain ⟨hri, hai⟩ := List.getElem?_eq_some_iff.mp hr
   have hblen : (scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat).length = it.size.bytes := by
     simp [scalarBytes, leBytes_length]
-  have hck : checkValue (.Int v) (.Int it) = .ok () := checkValue_int hv
+  have hck : checkValue (.Int v) (.Int it) (some m) = .ok () := checkValue_int hv
   have hne : scalarBytes it (v % 2 ^ (8 * it.size.bytes)).toNat ≠ [] :=
     List.ne_nil_of_length_pos (by omega)
   have hdrop : a.data.drop it.size.bytes = [] := List.drop_eq_nil_of_le (by omega)
@@ -7941,7 +7966,7 @@ theorem typedStore_base_bool {m : Mach} {ctx : Ctx} {frames : List Frame} {L : L
             ⟨.Store, .None, p.addr, u8Ty.size⟩) := by
   obtain ⟨hri, hai⟩ := List.getElem?_eq_some_iff.mp hr
   have hu8 : u8Ty.size.bytes = 1 := rfl
-  have hck : checkValue (.Bool b) .Bool = .ok () := rfl
+  have hck : checkValue (.Bool b) .Bool (some m) = .ok () := rfl
   have hblen : (scalarBytes u8Ty (if b then 1 else 0)).length = u8Ty.size.bytes := by
     simp [scalarBytes, leBytes_length]
   have hne : scalarBytes u8Ty (if b then 1 else 0) ≠ [] :=
@@ -7957,7 +7982,7 @@ theorem typedStore_base_byte {m : Mach} {ctx : Ctx} {frames : List Frame} {L : L
     (h : Shape m ctx frames (ctx.base ++ L)) (p : Ptr) (r : Nat) (a : Gen.Allocation)
     (hp : p.provenance = some (⟨(r : Int)⟩, ())) (hr : ctx.base[r]? = some a) (hlive : a.live = true)
     (haddr : a.addr = p.addr) (hlen : a.data.length = u8Ty.size.bytes) (T : Gen.Type) (v : Val)
-    (bits : Nat) (hck : checkValue v T = .ok ())
+    (bits : Nat) (hck : ∀ {m? : Option Mach}, checkValue v T m? = .ok ())
     (henc : Type.encode T v = .ok (scalarBytes u8Ty bits))
     (align : Align) (hal : Align.is_aligned align p.addr = true) :
     typedStore m p v T align .None =
@@ -8020,7 +8045,8 @@ theorem typedStore_base_tuple {m : Mach} {ctx : Ctx} {frames : List Frame} {L : 
   have hpos := hgood.pos
   obtain ⟨hri, hai⟩ := List.getElem?_eq_some_iff.mp hr
   have hblen := tupleBytes_length it bits b hpos
-  have hck := checkValue_tuple it bits b hgood hbits
+  have hck : checkValue (tupleVal it bits b) (intBoolTupleTy it) (some m) = .ok () :=
+    checkValue_tuple it bits b hgood hbits
   have henc := encode_tuple it bits b hgood hbits hb
   have hne : tupleBytes it bits b ≠ [] := List.ne_nil_of_length_pos (by omega)
   have hdrop : a.data.drop (it.size.bytes + it.size.bytes) = [] := List.drop_eq_nil_of_le (by omega)

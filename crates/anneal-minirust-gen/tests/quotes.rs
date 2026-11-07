@@ -2013,6 +2013,7 @@ fn mr_3_1_pointer_quotations_are_pinned_and_tamper_checked() {
         ("tooling/minimize/src/rvalue.rs", "(Offset, Type::Ptr(_)) =>"),
         ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::AddressOf(_mutbl, place) =>"),
         ("tooling/minimize/src/rvalue.rs", "smir::CastKind::PtrToPtr =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::CastKind::Transmute"),
         (
             "tooling/minimize/src/bb.rs",
             "rs::Rvalue::Cast(rs::CastKind::PointerExposeProvenance, operand, _) =>",
@@ -2064,6 +2065,234 @@ fn mr_3_1_pointer_quotations_are_pinned_and_tamper_checked() {
         (
             "spec/lang/step/expressions.md",
             "let aligned = self.compute_align(ptr_type.layout::<M::T>(), ptr.metadata)",
+        ),
+    ];
+    for (cited_file, tampered) in tampers {
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{cited_file}`: {tampered}"
+        );
+    }
+}
+
+/// Every MR-3.2 reference, validation, and Tree Borrows `ReborrowSettings`
+/// definition in `Interp.lean` and `Translate.lean` carries a verbatim
+/// upstream quotation pinned to its vendored file, and mutating any of those
+/// quotations (or flipping key reference/permission invariants) fails
+/// verification.
+#[test]
+fn mr_3_2_reference_quotations_are_pinned_and_tamper_checked() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let lean_root = minirust_dir().join("lean");
+
+    let interp_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Interp.lean")).unwrap();
+    let interp_quotes = extract_quotes(&interp_text, &valid_paths).unwrap();
+    let expected_interp: &[(&str, &str)] = &[
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(ptr.thin_pointer.addr != 0, \"Value::Ptr: null safe pointer\")?;",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(align.is_aligned(ptr.thin_pointer.addr), \"Value::Ptr: unaligned safe pointer\")?;",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(pointee.inhabited, \"Value::Ptr: safe pointer to uninhabited type\")?;",
+        ),
+        (
+            "spec/lang/representation.md",
+            "\"Value::Ptr: non-dereferenceable safe pointer\"",
+        ),
+        (
+            "spec/lang/step/statements.md",
+            "Statement::Validate { place, fn_entry }: Statement",
+        ),
+        (
+            "spec/lang/step/statements.md",
+            "let val = self.mutate_cur_frame(|frame, mem| { mem.retag_ptr(&mut frame.extra, ptr, ptr_type, fn_entry, frame.func.implicit_writes, lookup) })?;",
+        ),
+        ("spec/mem/tree_borrows/tree.md", "fn yes(self) -> bool"),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "fn cells_to_freeze_mask(cells: List<(Offset, Size)>, size: Size) -> List<bool>",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "(UnsafeCellStrategy::Sized { cells }, LayoutStrategy::Sized(size, _align), ..)",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "mk_perm(PermissionUnprot::Frozen, PermissionProt::Frozen { had_local_read: false })",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "Permission::Prot(PermissionProt::Unique)",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "Some(ReborrowSettings { protected, inside, outside })",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_unprotected.md",
+            "PermissionUnprot::Disabled => throw_ub!(\"Tree Borrows: local read of Disabled reference\")",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_unprotected.md",
+            "PermissionUnprot::Frozen => throw_ub!(\"Tree Borrows: local write of Frozen reference\")",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_protected.md",
+            "throw_ub!(\"Tree Borrows: local write to protected Reserved reference that had a foreign read\")",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_protected.md",
+            "PermissionProt::Unique => (PermissionUnprot::Unique, Some(AccessKind::Write))",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine.md",
+            "fn matches_protector(&self, protected: Protected) -> bool",
+        ),
+        (
+            "spec/mem/tree_borrows/tree.md",
+            "fn contains_strong_protector_preventing_deallocation(&self) -> bool",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "assert!(child_node.permissions.all(|x| x.matches_protector(child_node.protected)));",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "throw_ub!(\"Tree Borrows: deallocating strongly protected allocation\")",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "self.reborrow(ptr.thin_pointer, perms, frame_extra)?.widen(ptr.metadata)",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "extra.protectors.try_map(|provenance| self.release_protector(provenance))?;",
+        ),
+        (
+            "spec/mem/concurrent.md",
+            "self.memory.retag_ptr(frame_extra, ptr, ptr_type, fn_entry, fn_implicit_writes, vtable_lookup)",
+        ),
+        (
+            "spec/mem/concurrent.md",
+            "self.memory.end_call(extra)",
+        ),
+        (
+            "spec/lang/representation.md",
+            "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result",
+        ),
+        (
+            "spec/lang/step/terminators.md",
+            "self.mem.end_call(frame.extra)?;",
+        ),
+    ];
+    for (cited_file, needle) in expected_interp {
+        let matched = interp_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!("Interp.lean missing MR-3.2 quotation `{needle}` cited to `{cited_file}`")
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Interp.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let translate_text =
+        std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
+            .unwrap();
+    let translate_quotes = extract_quotes(&translate_text, &valid_paths).unwrap();
+    let expected_translate: &[(&str, &str)] = &[
+        (
+            "tooling/minimize/src/ty.rs",
+            "pub fn translate_mutbl_smir(mutbl: smir::Mutability) -> Mutability",
+        ),
+        (
+            "tooling/minimize/src/ty.rs",
+            "pub fn pointee_info_of(&mut self, ty: rs::Ty<'tcx>, span: rs::Span) -> PointeeInfo",
+        ),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Ref(_, ty, mutbl) =>"),
+        (
+            "tooling/minimize/src/ty.rs",
+            "pub fn cells_in_sized_ty(&mut self, ty: rs::Ty<'tcx>, span: rs::Span) -> Vec<(Offset, Size)>",
+        ),
+        ("tooling/minimize/src/ty.rs", "rs::TyKind::Adt(adt_def, _) if adt_def.is_box() =>"),
+        ("tooling/minimize/src/rvalue.rs", "smir::Rvalue::Ref(_, bkind, place) =>"),
+    ];
+    for (cited_file, needle) in expected_translate {
+        let matched = translate_quotes
+            .iter()
+            .find(|q| q.cited_file == *cited_file && squash(&q.text).contains(&squash(needle)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Translate.lean missing MR-3.2 quotation `{needle}` cited to `{cited_file}`"
+                )
+            });
+        assert_eq!(
+            missing_piece_in(&corpus, Some(cited_file), &matched.text),
+            None,
+            "Translate.lean quotation `{needle}` failed upstream verification"
+        );
+        let mutated = format!("{}__TAMPERED__", matched.text);
+        assert!(
+            missing_piece_in(&corpus, Some(cited_file), &mutated).is_some(),
+            "tampered quotation for `{needle}` unexpectedly matched `{cited_file}`"
+        );
+    }
+
+    let tampers: &[(&str, &str)] = &[
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(ptr.thin_pointer.addr >= 0, \"Value::Ptr: null safe pointer\")?;",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "PtrType::Box { .. } => Protected::Strong,",
+        ),
+        (
+            "spec/mem/tree_borrows/reborrow_settings.md",
+            "mk_perm(PermissionUnprot::Cell, PermissionProt::Frozen { had_local_read: false })",
+        ),
+        (
+            "tooling/minimize/src/ty.rs",
+            "smir::Mutability::Mut => Mutability::Immutable,",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_unprotected.md",
+            "PermissionUnprot::Reserved => ret(PermissionUnprot::Frozen),",
+        ),
+        (
+            "spec/mem/tree_borrows/state_machine_protected.md",
+            "PermissionProt::Unique => (PermissionUnprot::Unique, Some(AccessKind::Read)),",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "permissions: list![Permission::Unprot(PermissionUnprot::Frozen); size.bytes()],",
+        ),
+        (
+            "spec/mem/tree_borrows/memory.md",
+            "self.reborrow(ptr.thin_pointer, perms, frame_extra)?.widen(None)",
+        ),
+        (
+            "spec/lang/representation.md",
+            "ensure_else_ub(!pointee.inhabited, \"Value::Ptr: safe pointer to uninhabited type\")?;",
+        ),
+        (
+            "tooling/minimize/src/ty.rs",
+            "rs::TyKind::Adt(adt_def, _) if adt_def.is_unsafe_cell() => Vec::new(),",
         ),
     ];
     for (cited_file, tampered) in tampers {
