@@ -49,10 +49,10 @@ Work unit `FF-4.3` delivers:
   `analyze_workspace_lifting_profile`, which inspect inline `basicBlocks :=`
   definitions in `Mir/<Item>.lean` (falling back to `target/anneal/units` before
   `scaffold` runs and skipping non-inline alias wrappers) using single-pass
-  string- and char-literal-aware comment/literal stripping
-  (`strip_lean_comments_and_strings`, preventing `"--"` or `"/-"` inside `span`
-  or `defPath` strings from inverting string polarity) to mirror
-  `Anneal.PureMirExec.checkPureMir` across five axes:
+  string-, char-literal-, and identifier-prime-aware (`c'<'"'`) comment/literal
+  stripping (`strip_lean_comments_and_strings`, preventing `"--"` or `"/-"`
+  inside `span` or `defPath` strings or primed identifiers from inverting string
+  polarity) to mirror `Anneal.PureMirExec.checkPureMir` across five axes:
   1. `is_pure_call_free_candidate`: absence of `.deref`, `.unwrapUnsafeBinder`,
      `BinOp.offset`, `Rvalue.{ref, rawPtr, threadLocalRef, shallowInitBox,
      copyForDeref}` (without false-triggering on nested `RigidTy.{ref, rawPtr}`
@@ -88,10 +88,10 @@ Work unit `FF-4.3` delivers:
   targets honor `#[spec(safe_total)]` (`TotalVerificationResult`),
   `#[spec(equivalent_to: ...)]` (`StatefulEquivVerificationResult`), modular
   callees, and generic `typeParamCount > 0` (`poly*Claim` +
-  `mkPolyVerificationResult`) without overwriting authored stateless
-  `VerificationResult` proofs (`rustSafeTotalSpec`), and prefer fresh
-  SHA-matching `target/anneal/units` captures over stale `.anneal/generated/Mir`
-  stubs.
+  `mkPolyVerificationResult`) without overwriting authored `Specs/<Item>.lean`
+  overrides or authored stateless `VerificationResult` proofs
+  (`rustSafeTotalSpec`), and prefer fresh SHA-matching `target/anneal/units`
+  captures over stale `.anneal/generated/Mir` stubs.
 - Added `render_scaffold_lifting_hints` and `render_proof_template_with_hints`
   (re-exported from `crates/cargo-anneal/src/lib.rs`), emitting `<= 80`-column
   `--` Lean comment blocks with verified `open` namespaces (`Trusted.MirAst`,
@@ -103,8 +103,10 @@ Work unit `FF-4.3` delivers:
 
 ### 1.2 `agent-context` Strategy Guide (`crates/cargo-anneal/src/agent.rs`)
 
-- Made `strip_lean_comments` string- and char-literal-aware so `"--"` or `"/-"`
-  inside `ItemSpec "..."` string literals never truncates spec declarations.
+- Made `strip_lean_comments` (`lean_char_literal_len`) string-, char-literal-,
+  and identifier-prime-aware so `"--"` or `"/-"` inside `ItemSpec "..."` string
+  literals or primed identifiers (`c'<'"'`) never truncates or masks spec
+  declarations.
 - Updated `render_agent_context` (including pre-scaffold fallback to
   `target/anneal/units`) to include:
   - A top-level `## Proof Lifting Strategy Guide (Lift First, Evaluate Last)`

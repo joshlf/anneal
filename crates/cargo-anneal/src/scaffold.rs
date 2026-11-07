@@ -922,6 +922,8 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
         };
         if !authored.is_ub_exception
             && !authored.is_modular
+            && !authored.has_proof
+            && !authored.has_specs
             && ob_text_opt
                 .as_deref()
                 .is_some_and(|t| t.contains("instance rustEquivSpec : StatefulEquivItemSpec"))
@@ -1673,31 +1675,33 @@ impl MirLiftingProfile {
 }
 
 /// Normalize `authored` contract flags against Rust-level attributes on
-/// `bundle` (`#[spec(equivalent_to: ...)]`, and for unauthored items without
-/// an existing `Proof/<Item>.lean`, modular callees, `#[spec(safe_total)]`,
-/// and generic `typeParamCount > 0` `poly*Claim` surfaces).
+/// `bundle` for unauthored items without an existing `Proof/<Item>.lean` or
+/// overriding `Specs/<Item>.lean` (`#[spec(equivalent_to: ...)]`, modular
+/// callees, `#[spec(safe_total)]`, and generic `typeParamCount > 0`
+/// `poly*Claim` surfaces).
 ///
-/// When `authored.has_proof` is `true`, `detect_authored_item_modules` has
-/// already inspected `Proof/<Item>.lean` (for example, distinguishing a
-/// stateless `VerificationResult` proof via `rustSafeTotalSpec` from a
-/// `TotalVerificationResult` proof on a `#[spec(safe_total)]` item), so
-/// `safe_total`, fallback `is_modular`, and `is_polymorphic` are never forced
-/// over an existing proof file.
+/// When `authored.has_proof` or `authored.has_specs` is `true`,
+/// `detect_authored_item_modules` has already inspected `Specs/<Item>.lean`
+/// and `Proof/<Item>.lean` (for example, distinguishing an `ItemSpec` override
+/// or a stateless `VerificationResult` proof via `rustSafeTotalSpec` on a
+/// `#[spec(safe_total, equivalent_to: ...)]` item), so Rust-attribute defaults
+/// and `is_polymorphic` are never forced over authored modules.
 pub(crate) fn effective_authored_for_bundle(
     bundle: &SubjectObligationBundle,
     mut authored: AuthoredItemModules,
     unauthored_profile: Option<&MirLiftingProfile>,
 ) -> AuthoredItemModules {
-    if !authored.is_ub_exception && !authored.is_modular {
+    if !authored.is_ub_exception
+        && !authored.is_modular
+        && !authored.has_proof
+        && !authored.is_equiv
+        && !authored.has_specs
+    {
         if bundle.rust_equiv_target_module_suffix().is_some() {
             authored.is_equiv = true;
             authored.is_total = false;
             authored.is_stateful = false;
-        } else if !authored.has_proof
-            && !authored.is_equiv
-            && !authored.has_specs
-            && !authored.is_stateful
-        {
+        } else if !authored.is_stateful {
             if !bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty() {
                 authored.is_modular = true;
             } else if bundle.has_rust_safe_total_attr() {
@@ -1877,7 +1881,9 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let blocks_have_mut_borrow = norm_blocks.contains("BorrowKind.mut")
         || norm_blocks.contains("Rvalue.ref .mut ")
         || norm_blocks.contains(" .ref .mut true ")
-        || norm_blocks.contains(" .ref .mut false ");
+        || norm_blocks.contains(" .ref .mut false ")
+        || norm_blocks.contains(" .ref .mut Bool.true ")
+        || norm_blocks.contains(" .ref .mut Bool.false ");
     let has_mut_borrow = blocks_have_mut_borrow || (has_deref_projection && decls_have_mut_ref);
 
     let has_rvalue_ref_or_raw = norm_blocks.contains("Rvalue.ref ")
@@ -1947,6 +1953,7 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
     let mut i = 0usize;
     let mut block_depth = 0usize;
     let mut in_str = false;
+    let mut prev_ch: Option<char> = None;
 
     while i < bytes.len() {
         if block_depth > 0 {
@@ -1958,6 +1965,7 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
                 i += 2;
                 if block_depth == 0 {
                     out.push(' ');
+                    prev_ch = None;
                 }
             } else {
                 i += 1;
@@ -1967,11 +1975,15 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
 
         if in_str {
             if bytes[i] == b'\\' {
-                i = (i + 2).min(bytes.len());
+                i += 1;
+                if let Some(ch) = src[i..].chars().next() {
+                    i += ch.len_utf8();
+                }
             } else if bytes[i] == b'"' {
                 in_str = false;
                 out.push_str("\"\"");
                 i += 1;
+                prev_ch = None;
             } else {
                 i += 1;
             }
@@ -1981,25 +1993,21 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
         if bytes[i] == b'"' {
             in_str = true;
             i += 1;
+            prev_ch = None;
             continue;
         }
 
-        if bytes[i] == b'\'' {
-            if i + 2 < bytes.len() && bytes[i + 1] != b'\\' && bytes[i + 2] == b'\'' {
-                out.push(' ');
-                i += 3;
-                continue;
-            }
-            if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
-                out.push(' ');
-                i += 4;
-                continue;
-            }
+        if let Some(char_len) = crate::agent::lean_char_literal_len(src, i, prev_ch) {
+            out.push(' ');
+            i += char_len;
+            prev_ch = None;
+            continue;
         }
 
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
             block_depth = 1;
             i += 2;
+            prev_ch = None;
             continue;
         }
 
@@ -2007,12 +2015,14 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
+            prev_ch = None;
             continue;
         }
 
         if let Some(ch) = src[i..].chars().next() {
             out.push(ch);
             i += ch.len_utf8();
+            prev_ch = Some(ch);
         } else {
             break;
         }
@@ -2060,6 +2070,8 @@ fn has_shorthand_rvalue_ref_or_rawptr(norm_blocks: &str) -> bool {
     if norm_blocks.contains(" .ref .shared ")
         || norm_blocks.contains(" .ref .mut true ")
         || norm_blocks.contains(" .ref .mut false ")
+        || norm_blocks.contains(" .ref .mut Bool.true ")
+        || norm_blocks.contains(" .ref .mut Bool.false ")
     {
         return true;
     }
@@ -2227,12 +2239,10 @@ pub fn render_scaffold_lifting_hints(
     authored: AuthoredItemModules,
     profile: &MirLiftingProfile,
 ) -> String {
-    let is_equiv = authored.is_equiv || bundle.rust_equiv_target_module_suffix().is_some();
-    let is_modular = authored.is_modular
-        || (!authored.has_proof
-            && !authored.has_specs
-            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
-    let is_polymorphic = authored.is_polymorphic || (!is_equiv && profile.type_param_count > 0);
+    let effective = effective_authored_for_bundle(bundle, authored, Some(profile));
+    let is_equiv = effective.is_equiv;
+    let is_modular = effective.is_modular;
+    let is_polymorphic = effective.is_polymorphic;
     let is_bit_validity_item = matches!(
         bundle.subject.item_kind,
         anneal_rustc_capture::CapturedItemKind::TypeInvariant
@@ -2351,7 +2361,7 @@ pub fn render_scaffold_lifting_hints(
         );
     }
 
-    if authored.is_ub_exception {
+    if effective.is_ub_exception {
         bullets.push(
             "Scoped UB-exception (`open Anneal.PureMirExec \
              Anneal.MirFuelFree`): discharge `UbExceptionVerificationResult` \
@@ -3679,6 +3689,33 @@ def body : CapturedMir :=
             "stale .anneal/generated/Mir stub must be superseded by SHA-matching unit capture: {prof_fresh_unit:?}"
         );
         let _ = fs::remove_dir_all(&fallback_ws);
+
+        // 8. Identifier primes (`c'`) adjacent to `'"'` and UTF-8 char literals (`'α'`)
+        //    must not invert string polarity or hide real `.deref` / `.ref (.mut Bool.true)`.
+        let prime_mir = r#"-- helper: if c'<'"' then 'α' else '\x22'
+          def body : CapturedMir := {
+            localDecls := [],
+            basicBlocks := [{
+              statements := [{
+                kind := .assign { local_ := 1, projection := [] } (.ref (.mut Bool.true) { local_ := 2, projection := [] }),
+                span := "s" -- .deref comment after c'<'"'
+              }],
+              terminator := { kind := .return_, span := "" },
+              isCleanup := false
+            }]
+          }"#;
+        let prof_prime = analyze_mir_lifting_profile(
+            &mk_bundle("demo::prime", CapturedItemKind::Subject),
+            Some(prime_mir),
+            &[],
+        );
+        assert!(
+            prof_prime.has_captured_mir
+                && prof_prime.has_mut_borrow
+                && prof_prime.has_impure_rvalue_or_asm
+                && !prof_prime.has_deref_projection,
+            "prime-identifier comment before body must not invert string polarity: {prof_prime:?}"
+        );
     }
 
     #[test]
@@ -3813,6 +3850,52 @@ def body : CapturedMir :=
             tot_verify_restored
                 .contains("TotalVerificationResult Obligations.Demo.safe_tot.totalClaim"),
             "deleting Proof/Demo/safe_tot.lean must restore default TotalVerificationResult: {tot_verify_restored}"
+        );
+
+        // Regression check: an authored stateless `Proof/Demo/fast_eq.lean` or overriding
+        // `Specs/Demo/fast_eq.lean` on a `#[spec(safe_total, equivalent_to: ...)]` item must
+        // NOT be clobbered to `StatefulEquivVerificationResult` by `scaffold` or
+        // `refresh_workspace_assembly`.
+        let eq_proof_path = ws.join("anneal/proofs/Proof/Demo/fast_eq.lean");
+        fs::write(
+            &eq_proof_path,
+            "import Trusted\nimport Obligations.Demo.fast_eq\nnamespace Proof.Demo.fast_eq\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.fast_eq.claim := by sorry\nend Proof.Demo.fast_eq\n",
+        )
+        .expect("write authored stateless fast_eq proof");
+        scaffold_workspace_with_config(&cfg_no_init, &records)
+            .expect("re-scaffold with authored stateless fast_eq proof");
+        let eq_verify_stateless =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            eq_verify_stateless
+                .contains("theorem verified : VerificationResult Obligations.Demo.fast_eq.claim"),
+            "authored stateless VerificationResult on equivalent_to item must be preserved: {eq_verify_stateless}"
+        );
+        refresh_workspace_assembly(&ws)
+            .expect("refresh_workspace_assembly with authored stateless fast_eq proof");
+        let eq_verify_refreshed =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            eq_verify_refreshed
+                .contains("theorem verified : VerificationResult Obligations.Demo.fast_eq.claim"),
+            "refresh_workspace_assembly must preserve stateless VerificationResult on equivalent_to item: {eq_verify_refreshed}"
+        );
+
+        fs::remove_file(&eq_proof_path).expect("delete fast_eq proof");
+        let specs_demo_dir = ws.join("anneal/proofs/Specs/Demo");
+        fs::create_dir_all(&specs_demo_dir).expect("create Specs/Demo");
+        fs::write(
+            specs_demo_dir.join("fast_eq.lean"),
+            "import Trusted\nimport Obligations.Demo.fast_eq\nnamespace Specs.Demo.fast_eq\nopen Trusted.VerificationResult\ninstance : ItemSpec \"demo::fast_eq\" where\n  pre _ := True\n  post _ _ := True\nend Specs.Demo.fast_eq\n",
+        )
+        .expect("write overriding ItemSpec for fast_eq");
+        scaffold_workspace_with_config(&cfg_no_init, &records)
+            .expect("re-scaffold with overriding Specs/Demo/fast_eq.lean");
+        let eq_verify_specs_override =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            !eq_verify_specs_override.contains("StatefulEquivVerificationResult"),
+            "overriding ItemSpec on equivalent_to item must not emit nonexistent equivClaim: {eq_verify_specs_override}"
         );
 
         let _ = fs::remove_dir_all(&ws);

@@ -1309,12 +1309,63 @@ fn detect_tautological_ensures_weakening(stripped_lean_src: &str) -> Option<&'st
     None
 }
 
+pub(crate) fn is_lean_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '\''
+}
+
+/// Return the byte length of a Lean 4 character literal starting at byte `i`
+/// (`src.as_bytes()[i] == b'\''`), or `None` when `'` is an identifier prime
+/// (`c'`, `s''`) or an unclosed apostrophe.
+pub(crate) fn lean_char_literal_len(
+    src: &str,
+    i: usize,
+    prev_ch: Option<char>,
+) -> Option<usize> {
+    if src.as_bytes().get(i).copied() != Some(b'\'') {
+        return None;
+    }
+    if prev_ch.is_some_and(is_lean_ident_char) {
+        return None;
+    }
+    let after_open = src.get(i + 1..)?;
+    let first = after_open.chars().next()?;
+    if first == '\'' || first == '\n' || first == '\r' {
+        return None;
+    }
+    if first != '\\' {
+        let rest = &after_open[first.len_utf8()..];
+        return rest.starts_with('\'').then_some(1 + first.len_utf8() + 1);
+    }
+    let after_slash = &after_open[1..];
+    if let Some(hex_rest) = after_slash.strip_prefix('x') {
+        let hex = hex_rest.get(..2)?;
+        if hex.bytes().all(|b| b.is_ascii_hexdigit()) && hex_rest[2..].starts_with('\'') {
+            return Some(6);
+        }
+        return None;
+    }
+    if let Some(uni_rest) = after_slash.strip_prefix('u') {
+        let hex = uni_rest.get(..4)?;
+        if hex.bytes().all(|b| b.is_ascii_hexdigit()) && uni_rest[4..].starts_with('\'') {
+            return Some(8);
+        }
+        return None;
+    }
+    let esc = after_slash.chars().next()?;
+    if esc == '\n' || esc == '\r' {
+        return None;
+    }
+    let rest = &after_slash[esc.len_utf8()..];
+    rest.starts_with('\'').then_some(2 + esc.len_utf8() + 1)
+}
+
 pub(crate) fn strip_lean_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let mut block_depth = 0usize;
     let mut in_str = false;
+    let mut prev_ch: Option<char> = None;
 
     while i < bytes.len() {
         if block_depth > 0 {
@@ -1326,6 +1377,7 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
                 i += 2;
                 if block_depth == 0 {
                     out.push(' ');
+                    prev_ch = None;
                 }
             } else {
                 i += 1;
@@ -1345,6 +1397,7 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
                 in_str = false;
                 out.push('"');
                 i += 1;
+                prev_ch = None;
             } else if let Some(ch) = input[i..].chars().next() {
                 out.push(ch);
                 i += ch.len_utf8();
@@ -1358,27 +1411,23 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
             in_str = true;
             out.push('"');
             i += 1;
+            prev_ch = None;
             continue;
         }
 
-        // Preserve character literals such as `'"'` or `'-'` so they never
-        // start a string literal or line comment.
-        if bytes[i] == b'\'' {
-            if i + 2 < bytes.len() && bytes[i + 1] != b'\\' && bytes[i + 2] == b'\'' {
-                out.push_str(&input[i..i + 3]);
-                i += 3;
-                continue;
-            }
-            if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
-                out.push_str(&input[i..i + 4]);
-                i += 4;
-                continue;
-            }
+        // Preserve character literals (`'"'`, `'-'`, `'α'`, `'\x22'`) without
+        // misclassifying identifier primes (`if c'<'"' then`).
+        if let Some(char_len) = lean_char_literal_len(input, i, prev_ch) {
+            out.push_str(&input[i..i + char_len]);
+            i += char_len;
+            prev_ch = None;
+            continue;
         }
 
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
             block_depth = 1;
             i += 2;
+            prev_ch = None;
             continue;
         }
 
@@ -1386,12 +1435,14 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
+            prev_ch = None;
             continue;
         }
 
         if let Some(ch) = input[i..].chars().next() {
             out.push(ch);
             i += ch.len_utf8();
+            prev_ch = Some(ch);
         } else {
             break;
         }
@@ -1656,12 +1707,10 @@ fn render_item_lifting_guidance(
     profile: &MirLiftingProfile,
 ) -> String {
     let item = &bundle.item_module_suffix;
-    let is_equiv = authored.is_equiv || bundle.rust_equiv_target_module_suffix().is_some();
-    let is_modular = authored.is_modular
-        || (!authored.has_proof
-            && !authored.has_specs
-            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
-    let is_polymorphic = authored.is_polymorphic || (!is_equiv && profile.type_param_count > 0);
+    let effective = crate::scaffold::effective_authored_for_bundle(bundle, authored, Some(profile));
+    let is_equiv = effective.is_equiv;
+    let is_modular = effective.is_modular;
+    let is_polymorphic = effective.is_polymorphic;
     let is_bit_validity_item = matches!(
         bundle.subject.item_kind,
         anneal_rustc_capture::CapturedItemKind::TypeInvariant
@@ -1724,7 +1773,7 @@ fn render_item_lifting_guidance(
             "- **Equivalence Route (`#[spec(equivalent_to: ...)]`)**: `open Anneal.PureMirExec Anneal.MirFuelFree` and apply `verifyStatefulEquivMir_of_wpConverges` with `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference specification's `MirNoCallWpConverges` theorem.\n",
         );
     }
-    if authored.is_ub_exception {
+    if effective.is_ub_exception {
         out.push_str(
             "- **Scoped UB-Exception Route (`UbExceptionItemSpec`)**: `open Anneal.PureMirExec Anneal.MirFuelFree` and discharge `UbExceptionVerificationResult` via `verifyUbExceptionMir_of_wpConverges` and `mirWpConverges_of_runCfgToBlock`.\n",
         );
@@ -2788,8 +2837,9 @@ end Mir.Demo.loop_fn
         ));
         assert!(ctx_poly.contains("theorem verified : Obligations.Demo.poly_fn.polyClaim"));
 
-        // When an authored stateless `Proof/Demo/tot_fn.lean` (`VerificationResult`) exists on
-        // a `#[spec(safe_total)]` item, `render_agent_context` must report the authored surface.
+        // When an authored stateless `Proof/Demo/tot_fn.lean` (`VerificationResult`) or
+        // `Proof/Demo/fast_fn.lean` (on a `#[spec(safe_total, equivalent_to: ...)]` item)
+        // exists, `render_agent_context` must report the authored surface without clobbering.
         let proof_demo_dir = ws.join("anneal/proofs/Proof/Demo");
         fs::create_dir_all(&proof_demo_dir).expect("create Proof/Demo");
         fs::write(
@@ -2797,10 +2847,25 @@ end Mir.Demo.loop_fn
             "import Trusted\nimport Obligations.Demo.tot_fn\nnamespace Proof.Demo.tot_fn\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.tot_fn.claim := by sorry\nend Proof.Demo.tot_fn\n",
         )
         .expect("write stateless Proof/Demo/tot_fn.lean");
+        fs::write(
+            proof_demo_dir.join("fast_fn.lean"),
+            "import Trusted\nimport Obligations.Demo.fast_fn\nnamespace Proof.Demo.fast_fn\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.fast_fn.claim := by sorry\nend Proof.Demo.fast_fn\n",
+        )
+        .expect("write stateless Proof/Demo/fast_fn.lean");
         let ctx_tot_authored = render_agent_context(&ws, &extra_records, Some("demo::tot_fn"))
             .expect("render context for authored stateless tot_fn");
         assert!(ctx_tot_authored.contains("- **Proof Status**: Present"));
         assert!(ctx_tot_authored.contains("- **`is_stateful`**: false (`ItemSpec` / `VerificationResult`)"));
+
+        let ctx_fast_authored = render_agent_context(&ws, &extra_records, Some("demo::fast_fn"))
+            .expect("render context for authored stateless fast_fn");
+        assert!(ctx_fast_authored.contains("- **Proof Status**: Present"));
+        assert!(
+            ctx_fast_authored
+                .contains("- **`is_stateful`**: false (`ItemSpec` / `VerificationResult`)"),
+            "authored stateless proof on equivalent_to item must not be clobbered to equiv: {ctx_fast_authored}"
+        );
+        assert!(!ctx_fast_authored.contains("Equivalence Route"));
 
         let _ = fs::remove_dir_all(&ws);
     }
@@ -2812,5 +2877,15 @@ end Mir.Demo.loop_fn
         assert!(stripped.contains("\"demo::fn--with/-markers\""));
         assert!(stripped.contains("post _ _ := True"));
         assert!(!stripped.contains("real comment"));
+
+        // Identifier primes (`c'`) adjacent to `'"'` must not misparse `'<'` as a
+        // char literal and open an unclosed string literal across later lines.
+        let prime_src =
+            r#"def f (c' : Char) := if c'<'"' then 'α' else '\x22' -- strip me
+  pre := False
+"#;
+        let prime_stripped = strip_lean_comments(prime_src);
+        assert!(!prime_stripped.contains("strip me"));
+        assert!(prime_stripped.contains("pre := False"));
     }
 }
