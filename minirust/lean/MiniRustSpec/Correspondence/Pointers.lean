@@ -1387,10 +1387,9 @@ theorem evalTargetPlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       offsetPtr (localPtr ctx q.local_) relOff ∧
     Align.is_aligned ⟨pointeeIt.size.bytes⟩ (offsetPtr (localPtr ctx q.local_) relOff).addr = true ∧
     (∀ targetPe, translatePlace body.localDecls q = some targetPe →
-      ∃ m1, evalPlace m targetPe =
+      evalPlace m targetPe =
         .ok (({ ptr := { thin_pointer := offsetPtr (localPtr ctx q.local_) relOff, metadata := none },
-                 aligned := true }, .Int pointeeIt), m1) ∧
-      FrameOk body f (ctxWithBorrows body ctx s.memory.borrows) view lm m1 blk stmt) := by
+                 aligned := true }, .Int pointeeIt), m)) := by
   obtain ⟨hnd_k, hlm_k, hd_k⟩ := hb.target_ptrs hfrag q.local_ hk_addr
   rcases q with ⟨k, projs⟩
   simp only [] at hk_addr hnd_k hlm_k hd_k ⊢
@@ -1433,7 +1432,7 @@ theorem evalTargetPlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         have hloc := ((translateFn_spec body f h.hf).2.1 k d hdk).2
         rw [hTd] at hloc
         have hev := evalPlace_local_some h.shape k (.Int pointeeIt) hloc (localPtr ctx k) hlm_k
-        exact ⟨m, by simpa [offsetPtr] using hev, h⟩
+        simpa [offsetPtr] using hev
     · simp at hspec
   | cons p1 prest =>
     cases p1 with
@@ -1505,10 +1504,8 @@ theorem evalTargetPlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
                 have hprojIdx : projIdx view count (.constantIndex offset minLen fromEnd) = some idx := by
                   have hnot_lt : ¬ (count < minLen) := by omega
                   simp [projIdx, hnot_lt, idx, hidx_lt]
-                obtain ⟨_, m1, hm1, h1⟩ :=
-                  (evalPlace_proj h k d hdk pointeeIt count ha (localPtr ctx k) hlm_k
-                    (.constantIndex offset minLen fromEnd) hprojOk targetPe hpe).1 idx hprojIdx
-                exact ⟨m1, hm1, h1⟩
+                exact evalPlace_constantIndex_same h k d hdk pointeeIt count ha (localPtr ctx k) hlm_k
+                  offset minLen fromEnd hprojOk targetPe hpe idx hprojIdx
               · simp [hc_bounds] at hspec
         · simp at hspec
       | cons _ _ => simp [ptrTargetSpec] at hspec
@@ -1592,7 +1589,7 @@ theorem evalTargetPlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
                   (.Local (localName k)) 0 (.tuple fields size align) hrootEval hrootWf
                   (by simp [TupleSpec.size, hdlen]) (.field idx fieldTy :: prest) targetPe hpe
                   relOff (.scalar pointeeIt) hres
-                exact ⟨m, by simpa [TupleSpec.toMiniRustTy] using hpeEval, h⟩
+                simpa [TupleSpec.toMiniRustTy] using hpeEval
       · simp at hspec
     | _ => simp [ptrTargetSpec] at hspec
 

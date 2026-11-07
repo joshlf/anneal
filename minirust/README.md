@@ -669,17 +669,23 @@ in both semantics (Anneal by `runA_sound` / `faultsA_sound`, MiniRust by
 `decide +kernel` on `minimize`'s translation), on top of the per-construct
 lemmas of `Correspondence/Pointers.lean` (MiniRust's thin pointer bytes
 `ptrBytes` and their `decode`, `encode`, and `check_value`; Anneal's
-`&raw`, `*p`, `Offset`, `PtrToPtr`, and exposure rules). Both semantics agree
+`&raw`, `*p`, `Offset`, `PtrToPtr`, and exposure rules) and the
+statement-level lemmas of `Correspondence/PointerStep.lean` on which
+`step_correspondence_N` rests for raw pointers. Both semantics agree
 on `ptrRoundTrip` (`&raw mut x`, a read and a write through the pointer, a
 `PtrToPtr` cast, and a read through the cast pointer; `6` for `x = 5`),
 `arrayElemPtr` (`&raw mut a[1]`), and `fieldPtr` (`&raw mut s.1` at byte
 offset `4` of `Padded`), and both raise UB on `dangling` (a read after
-`StorageDead`). The remaining witnesses are the divergences listed under the
-gaps: `offsetDeref` (`*p.offset(1)` reads `a[1] = 7` in MiniRust and
-`a[0] = 5` in Anneal; `offset(2)` then a read, `offset(3)`, and
-`offset(usize::MAX)` are UB in MiniRust and return `5` in Anneal),
-`misaligned` (UB in MiniRust only), `exposeTwice` (`0` in MiniRust, `65536` in
-Anneal), and `directWrite` and `frozenWrite` (UB in Anneal only).
+`StorageDead`). `ptrRoundTrip` and `fieldPtr` are in the fragment
+(`ptrRoundTrip_inFragment`, `fieldPtr_inFragment`), and
+`ptrRoundTrip_minirust_ret_from_start` derives MiniRust's return from Anneal's
+through `mirCall_ret`. The remaining witnesses are the divergences listed under
+the gaps, each outside the fragment (`*_notInFragment`): `offsetDeref`
+(`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in Anneal;
+`offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB in
+MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
+`exposeTwice` (`0` in MiniRust, `65536` in Anneal), and `directWrite` and
+`frozenWrite` (UB in Anneal only).
 
 `Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, `[WITNESS-AUDIT]`,
 and `[POINTER-AUDIT]` lines ending in `sorry_free=true` (via
@@ -729,9 +735,9 @@ These are deliberate and are the first things to lift:
   `SwitchInt` on it); `Type::Enum` (beyond `Ordering`) and `Type::Union` are
   interpreted as representations (layout, `decode`, `encode`, `check_value`)
   without `ValueExpr::{Union, Variant, GetDiscriminant}`,
-  `Statement::SetDiscriminant`, or downcast projections. There are no raw
-  pointers (below), references, slices, nested arrays, multi-variant ADTs,
-  other casts, calls, drops, or assertions.
+  `Statement::SetDiscriminant`, or downcast projections. Raw pointers are
+  restricted (below); there are no references, slices, nested arrays,
+  multi-variant ADTs, other casts, calls, drops, or assertions.
 * **`Repeat(copy p, 0)` is excluded (while `Repeat(const c, 0)` is included).**
   Anneal evaluates `op` once before replicating it, while `minimize`'s
   `list![op; 0]` never evaluates `op`, so the models disagree when `op` is a
@@ -762,13 +768,24 @@ These are deliberate and are the first things to lift:
   unsigned types and, for a signed type, as long as `N <= 2^(bits - 1)` (a
   negative index then has a bit pattern `>= N`), which the fragment
   requires.
-* **Raw pointers are interpreted and translated but not yet in the
-  correspondence (MR-3.1).** `inFragment` rejects raw pointer types and the
-  pointer rvalues, places, and casts (`ptrRoundTrip_notInFragment`), so
-  `step_correspondence` says nothing about them; the pointer witnesses are
-  independent runs of both semantics. Any extension must exclude the forms on
-  which Anneal's model accepts executions that MiniRust, the ground truth,
-  rejects or runs differently: a dereference ignores the pointer's
+* **Raw pointers are in the correspondence only under a borrow discipline
+  (MR-3.1).** The fragment admits thin raw pointer temporaries to integer
+  pointees; `_i = &raw const q` / `&raw mut q` of a parameter `q` that is an
+  integer local, an in-bounds `ConstantIndex` element of an array, or a scalar
+  field chain of a `TupleSpec` (`ptrTargetSpec`); pointer copies (`copy _p`,
+  `move _p`, `PtrToPtr` between equal pointee types that never adds
+  mutability, and `Offset(_p, 0)`); reads `copy (*_p)` and writes
+  `(*_p) = rv` through `*mut` pointers at the pointee type; and storage
+  statements on pointer temporaries. `ptrAliasingOk` requires every borrowed
+  local to be a parameter that is never written directly, deinitialized,
+  storage-cycled, or moved, and, once any `&raw mut` exists, all borrows of
+  mutably borrowed locals to happen in an entry block without incoming edges
+  at pairwise non-overlapping projections. `StateRelN` relates each Anneal
+  borrow tag to the MiniRust address of its target (`BorrowsOk`, and
+  `LocalsOk` at `ctxWithBorrows`), and `step_correspondence_N` simulates every
+  such statement (`Correspondence/PointerStep.lean`). The fragment excludes
+  the forms on which Anneal's model accepts executions that MiniRust, the
+  ground truth, rejects or runs differently: a dereference ignores the pointer's
   `offsetBytes`, so reading through `p.offset(n)` reads `p`'s target
   (`offsetDeref 1`), misaligned reads succeed (`misaligned`), and pointers
   past the end of their allocation can be read through (`offsetDeref 2`);
@@ -786,11 +803,9 @@ These are deliberate and are the first things to lift:
   and raises UB at once; and since a write through a pointer only requires its
   target local not to be dead, a pointer to a local becomes writable again in
   Anneal after `StorageDead` and `StorageLive`, while in MiniRust it keeps
-  pointing to the deallocated storage. The intended
-  extension relates each Anneal tag to a MiniRust pointer through its borrow
-  entry, admits `&raw` only once per address-taken argument local in `bb0`,
-  admits `*p` only on unoffset pointers to integer pointees of matching type,
-  and keeps `Offset` and the exposure casts out of the fragment.
+  pointing to the deallocated storage. Hence the fragment borrows parameters
+  only, admits `*p` only on unoffset pointers to integer pointees of matching
+  type, and keeps nonzero `Offset` and the exposure casts out.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

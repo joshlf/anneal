@@ -21,6 +21,7 @@ import MiniRustSpec.Correspondence.Simulation
 import MiniRustSpec.Correspondence.Run
 import MiniRustSpec.Correspondence.Witness
 import MiniRustSpec.Correspondence.Pointers
+import MiniRustSpec.Correspondence.PointerStep
 import MiniRustSpec.Correspondence.PointerWitness
 import MiniRustSpec.Audit
 
@@ -37,8 +38,10 @@ import MiniRustSpec.Audit
 * `MiniRustSpec.Correspondence.*`: the correspondence between Anneal's MIR
   semantics (`Trusted.Rustc.V2026_06_01`) and that interpretation, with
   non-vacuity witnesses (`Correspondence.Witness`); `Correspondence.Pointers`
-  and `Correspondence.PointerWitness` compare the two semantics on raw
-  pointers.
+  and `Correspondence.PointerStep` relate the two semantics on the raw pointer
+  statements the fragment admits (`&raw`, pointer copies, and reads and writes
+  through pointers), and `Correspondence.PointerWitness` compares them on
+  concrete raw pointer programs.
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

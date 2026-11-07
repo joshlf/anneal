@@ -4178,10 +4178,10 @@ theorem evalOperands_move (mo : List Nat) (locals : List LocalSlot) (ops : List 
       | unsupported => rfl
 
 /-- The rvalue kinds whose evaluation `evalRvalue_move` reduces: those of
-the fragment. -/
+the fragment (including the thin raw pointer cast `PtrToPtr`). -/
 def moveKind : Rvalue → Bool
   | .use _ | .repeat _ _ | .len _ | .unaryOp .not _ | .unaryOp .neg _
-  | .binaryOp _ _ _ | .cast .intToInt _ _
+  | .binaryOp _ _ _ | .cast .intToInt _ _ | .cast .ptrToPtr _ _
   | .aggregate .tuple _ | .aggregate (.array _) _ | .aggregate (.adt _ 0 none) _ => true
   | _ => false
 
@@ -4281,6 +4281,24 @@ theorem evalRvalue_move (locals : List LocalSlot) (rv : Rvalue) (hk : moveKind r
       · split <;> rfl
     | ub => rfl
     | unsupported => rfl
+  | .cast .ptrToPtr op ty, _ =>
+    obtain ⟨hs, _⟩ := hspec op (by simp [rvOperands])
+    simp only [evalRvalue, copyRv, rvPost, opsPost, rvOperands, List.foldl]
+    rw [evalOperand_move locals op hs]
+    cases evalOperand locals (copyOp op) mem.borrows mem.globals layouts mem.callerLocals with
+    | ok v L1 =>
+      simp only [opWithLocals]
+      rcases v with _ | _ | _ | ⟨idx, fields⟩
+      · rfl
+      · rfl
+      · rfl
+      · rcases fields with _ | ⟨e1, _ | ⟨e2, _ | ⟨e3, rest⟩⟩⟩ <;>
+          rcases idx with _ | idx <;>
+          (try rcases e1 with _ | _ | _ | _) <;>
+          (try rcases e2 with _ | _ | _ | _) <;>
+          rfl
+    | ub => rfl
+    | unsupported => rfl
   | .aggregate .tuple ops, _ =>
     simp only [evalRvalue, copyRv, rvPost, rvOperands]
     rw [(evalOperands_move [] locals ops hr mem.borrows mem.globals layouts mem.callerLocals).1]
@@ -4319,7 +4337,7 @@ theorem simpleOp_copyOp (op : Operand) : simpleOp (copyOp op) = simpleOp op := b
 theorem moveKind_copyRv {rv : Rvalue} (h : moveKind rv = true) : moveKind (copyRv rv) = true := by
   match rv, h with
   | .use _, _ | .repeat _ _, _ | .len _, _ | .unaryOp .not _, _ | .unaryOp .neg _, _
-  | .binaryOp _ _ _, _ | .cast .intToInt _ _, _
+  | .binaryOp _ _ _, _ | .cast .intToInt _ _, _ | .cast .ptrToPtr _ _, _
   | .aggregate .tuple _, _ | .aggregate (.array _) _, _ | .aggregate (.adt _ 0 none) _, _ => rfl
 
 theorem readsOk_copy {mo : List Nat} {ops : List Operand} (h : readsOk mo ops = true) :

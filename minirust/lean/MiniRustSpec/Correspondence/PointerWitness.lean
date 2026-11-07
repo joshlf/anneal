@@ -17,10 +17,19 @@ import MiniRustSpec.Correspondence.Pointers
 Concrete MIR bodies with raw pointers, each run to completion in Anneal's
 semantics (`runA_sound`, `faultsA_sound`) and, after `minimize`'s translation
 (`translateFn`), in the MiniRust interpretation (`Interp.steps`), both by kernel
-computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`). The
-correspondence fragment (`inFragment`) does not admit raw pointers yet
-(`ptrRoundTrip_notInFragment`), so these are independent executions of the two
-semantics rather than instances of `step_correspondence`.
+computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`).
+
+`ptrRoundTrip` and `fieldPtr` lie in the correspondence fragment
+(`ptrRoundTrip_inFragment`, `fieldPtr_inFragment`), so the correspondence
+theorems apply to them: `ptrRoundTrip_minirust_ret_from_start` derives
+MiniRust's return from Anneal's through `mirCall_ret` rather than by running
+MiniRust. Every divergent witness below, and `dangling`, lies outside the
+fragment (`*_notInFragment`): the fragment borrows (`&raw`) only parameters,
+which it never writes directly (`directWrite`) nor kills (`dangling`), casts
+pointers (`PtrToPtr`) only between equal pointee types and never from `*const`
+to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
+(`offsetDeref`, `misaligned`), and has no pointer-integer casts
+(`exposeTwice`).
 
 **Agreement.** Both semantics return the same value for
 
@@ -153,8 +162,10 @@ def ptrRoundTrip : CapturedMir :=
      .assign (local_ 4) (.cast .ptrToPtr (.copy (local_ 2)) ptrConstU32Ty),
      .assign (local_ 0) (.use (.copy (derefPlace 4)))]
 
-/-- The correspondence fragment does not admit raw pointers yet. -/
-theorem ptrRoundTrip_notInFragment : inFragment ptrRoundTrip = false := by decide
+/-- `ptrRoundTrip` lies in the correspondence fragment: `_1` is a parameter
+borrowed only by `&raw mut _1`, never written directly, and every pointer
+statement is one that `statementOk` admits. -/
+theorem ptrRoundTrip_inFragment : inFragment ptrRoundTrip = true := by decide
 
 /-- The MiniRust function `minimize` produces for `ptrRoundTrip`: `&raw mut _1`
 becomes `AddrOf` at the thin raw pointer type, `*_2` becomes
@@ -198,6 +209,55 @@ theorem ptrRoundTrip_minirust_direct :
     retAfter ptrRoundTrip [.scalar ⟨5, 4⟩] 10 =
       some (some { retAlloc with data := scalarBytes u32 6 }, [1]) := by
   decide +kernel
+
+private theorem itOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
+      itOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
+
+private theorem tyOf_uint (m : MirAst.Mutability) (ut : UintTy) (l : Nat) (n : Option String)
+    (layouts : LayoutTable) :
+    tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } layouts =
+      tyOf { mutability := m, ty := { kind := .uint ut, layoutIdx := l }, debugName := n } := rfl
+
+theorem ptrRoundTrip_ctxOk : CtxOk ptrRoundTrip ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    match i, hd, hi1 with
+    | 0, hd, _ =>
+      simp [ptrRoundTrip, ptrBody] at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | 1, hd, _ =>
+      simp [ptrRoundTrip, ptrBody] at hd; subst hd; rw [u32Decl, u32Ty, itOf_uint, tyOf_uint]; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd; simp [ptrRoundTrip, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by rw [u32Decl, u32Ty, itOf_uint]; decide⟩
+
+/-- MiniRust at `minimize`'s init block (the function's `start`). -/
+def ptrRoundTripMInit : Mach :=
+  machine ptrRoundTrip ptrRoundTripFn ptrRoundTripS0.frame.locals ptrRoundTripFn.start
+
+/-- MiniRust returns `6` as well, now derived from Anneal's return
+(`ptrRoundTrip_anneal_ret`) by the correspondence theorem (`mirCall_ret`), which
+covers `&raw mut`, the read and the write through the pointer, and the
+`PtrToPtr` copy. -/
+theorem ptrRoundTrip_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n ptrRoundTripMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 6 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret ptrRoundTrip_inFragment ptrRoundTrip_translate ctx0 ptrRoundTrip_ctxOk
+      [.scalar ⟨5, 4⟩] (by decide) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [ptrRoundTrip, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
 
 /-! ## `&raw mut a[1]` on an array -/
 
@@ -254,6 +314,9 @@ def fieldPtr : CapturedMir :=
        .assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)])))] with
     fnAbi := fnAbiPaddedArg, layouts := paddedLayouts }
 
+/-- `fieldPtr` lies in the correspondence fragment. -/
+theorem fieldPtr_inFragment : inFragment fieldPtr = true := by decide
+
 theorem fieldPtr_anneal_ret :
     ∃ mem, ReachesRet (mirTree fieldPtr (initMachineState fieldPtr [initPaddedStruct])) []
       (.normal (.scalar ⟨100, 4⟩, mem)) :=
@@ -278,6 +341,8 @@ def dangling : CapturedMir :=
      .storageLive 3, .assign (local_ 3) (.rawPtr .not (local_ 2)),
      .storageDead 2,
      .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem dangling_notInFragment : inFragment dangling = false := by decide +kernel
 
 theorem dangling_anneal_ub :
     ∃ tr u, Reaches (mirTree dangling (initMachineState dangling [.scalar ⟨5, 4⟩])) tr u ∧
@@ -347,6 +412,9 @@ theorem offsetDerefMax_translate :
 /-- Anneal returns `a[0] = x` for every offset `k ∈ {0, 1, 2, 3, usize::MAX}`:
 `Offset` adds the raw count to the pointer's `offsetBytes`, and the
 dereference reads the borrow entry's place `_2[0 of 2]` regardless. -/
+theorem offsetDeref_notInFragment :
+    ∀ k ∈ [0, 1, 2, 3, usizeMax], inFragment (offsetDeref k) = false := by decide +kernel
+
 theorem offsetDeref_anneal_ret (k : Nat) (hk : k ∈ [0, 1, 2, 3, usizeMax]) :
     ∃ mem, ReachesRet (mirTree (offsetDeref k) (initMachineState (offsetDeref k) [.scalar ⟨5, 4⟩]))
       [] (.normal (.scalar ⟨5, 4⟩, mem)) := by
@@ -407,6 +475,8 @@ def misaligned : CapturedMir :=
      .storageLive 5, .assign (local_ 5) (.cast .ptrToPtr (.copy (local_ 4)) ptrConstU32Ty),
      .assign (local_ 0) (.use (.copy (derefPlace 5)))]
 
+theorem misaligned_notInFragment : inFragment misaligned = false := by decide +kernel
+
 /-- Anneal returns `x`. -/
 theorem misaligned_anneal_ret :
     ∃ mem, ReachesRet (mirTree misaligned (initMachineState misaligned [.scalar ⟨5, 4⟩])) []
@@ -446,6 +516,8 @@ def exposeTwice : CapturedMir :=
 
 /-- `translateFn` does not translate `PointerExposeProvenance`. -/
 theorem exposeTwice_translate : (translateFn exposeTwice).isNone = true := by decide +kernel
+
+theorem exposeTwice_notInFragment : inFragment exposeTwice = false := by decide +kernel
 
 set_option maxRecDepth 200000 in
 /-- Anneal returns `65536`: the two pointers carry the borrow tags `1` and `2`,
@@ -509,6 +581,8 @@ def directWrite : CapturedMir :=
      .assign (local_ 1) (.use (constU32 9)),
      .assign (local_ 0) (.use (.copy (derefPlace 2)))]
 
+theorem directWrite_notInFragment : inFragment directWrite = false := by decide +kernel
+
 /-- Anneal: the direct write to `_1` disables the entry of `_2`, so the read
 through `_2` is UB. -/
 theorem directWrite_anneal_ub :
@@ -534,6 +608,8 @@ def frozenWrite : CapturedMir :=
      .storageLive 3, .assign (local_ 3) (.cast .ptrToPtr (.copy (local_ 2)) ptrMutU32Ty),
      .assign (derefPlace 3) (.use (constU32 9)),
      .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+theorem frozenWrite_notInFragment : inFragment frozenWrite = false := by decide +kernel
 
 /-- Anneal: the write through the `Frozen` entry of `&raw const _1` is UB. -/
 theorem frozenWrite_anneal_ub :

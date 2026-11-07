@@ -3908,6 +3908,77 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
       rw [evalPlace]
       simp [hplaceBase, evalValue, evalConstant, hle_cnt, ub]
 
+/-- `evalPlace_proj` for an in-bounds `ConstantIndex` projection: the index is
+a constant, so evaluating the place leaves the machine unchanged. -/
+theorem evalPlace_constantIndex_same {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
+    (h : FrameOk body f ctx locals lm m blk stmt)
+    (j : Nat) (d : LocalDecl) (hd : body.localDecls[j]? = some d)
+    (elemIt : Gen.IntType) (count : Nat) (ha : arrayTypeOf d.ty = some (elemIt, count))
+    (p : Ptr) (hp : mapGet lm (localName j) = some p)
+    (offset minLength : Nat) (fromEnd : Bool)
+    (hproj : projOk body.localDecls count (.constantIndex offset minLength fromEnd) = true)
+    (pe : Gen.PlaceExpr)
+    (hpe : translatePlace body.localDecls ⟨j, [.constantIndex offset minLength fromEnd]⟩ = some pe)
+    (idx : Nat) (hidx : projIdx locals count (.constantIndex offset minLength fromEnd) = some idx) :
+    evalPlace m pe =
+      .ok (({ ptr := { thin_pointer := offsetPtr p (idx * elemIt.size.bytes), metadata := none },
+               aligned := true }, .Int elemIt), m) := by
+  have hj : j < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
+  have hgood := arrayTypeOf_good ha
+  have hbound := h.array_bound j d elemIt count hd ha
+  obtain ⟨hTd, hitd⟩ := tyOf_array (layouts := body.layouts) ha
+  have hloc := ((translateFn_spec body f h.hf).2.1 j d hd).2
+  rw [hTd] at hloc
+  have hplaceBase := evalPlace_local_some h.shape j _ hloc p hp
+  obtain ⟨_, slot, hd', hs⟩ := h.slot_exists j hj
+  rw [hd] at hd'; cases hd'
+  have hslot := h.slots j d slot hd hs
+  have hdlen : (declSlotData d slot body.layouts).length = count * elemIt.size.bytes := by
+    have hlen' := declSlotData_length_of_declOk (h.declsOk d (List.mem_of_getElem? hd)) hslot
+    rw [hTd] at hlen'
+    simpa [tyBytes] using hlen'
+  simp only [projOk, Bool.and_eq_true, decide_eq_true_eq] at hproj
+  obtain ⟨⟨hmin, hoffBound⟩, hfe⟩ := hproj
+  have hcond : minLength ≤ count ∧ (!fromEnd = true ∨ 1 ≤ offset ∧ offset ≤ count) := by
+    refine ⟨hmin, ?_⟩
+    cases fromEnd <;> simp at hfe ⊢
+    exact hfe
+  simp only [translatePlace, hd, Option.bind_eq_bind, Option.bind_some, ha,
+    Bool.or_eq_true, Bool.not_eq_true', decide_eq_true_eq] at hpe
+  have hcond' : minLength ≤ count ∧ (fromEnd = false ∨ 1 ≤ offset ∧ offset ≤ count) := by
+    simpa using hcond
+  simp [hcond'] at hpe
+  subst hpe
+  have hnot_min : ¬ (count < minLength) := by omega
+  generalize hidx_eq : (if fromEnd = true then count - offset else offset) = idx'
+  by_cases hidx_lt : idx' < count
+  · simp only [projIdx, hnot_min, ↓reduceIte, hidx_eq, hidx_lt, Option.some.injEq] at hidx
+    subst hidx
+    have hnot_le : ¬ (count ≤ idx') := Nat.not_le.mpr hidx_lt
+    have hoff_le : idx' * elemIt.size.bytes ≤ (declSlotData d slot body.layouts).length := by
+      rw [hdlen]
+      exact Nat.mul_le_mul_right _ (by omega)
+    have hoff_bound : idx' * elemIt.size.bytes < 2 ^ 63 := by
+      have : idx' * elemIt.size.bytes ≤ count * elemIt.size.bytes :=
+        Nat.mul_le_mul_right _ (by omega)
+      omega
+    obtain ⟨k, hpk, _, haddr, haddrMax, _, hA⟩ :=
+      h.locs.storage_nonptr j d slot p hd hs hp (isPtrTy_false_of_arrayTypeOf ha)
+    rw [hitd] at hA
+    rw [hTd] at haddrMax
+    simp only [tyBytes, Int.ofNat_eq_natCast, Int.toNat_natCast] at haddrMax
+    have hptr := ptrOffsetInbounds_ptr_elem h.shape p k hpk idx' elemIt
+      (declSlotData d slot body.layouts) hA hoff_le hoff_bound haddr.2.1
+      (by rw [hdlen]; exact haddrMax)
+    have hsz : idx' * elemIt.size.bytes ≤ count * elemIt.size.bytes :=
+      Nat.mul_le_mul_right _ (by omega)
+    rw [evalPlace]
+    simp [hplaceBase, evalValue, evalConstant, hnot_le, layout_eq _ hgood,
+      layout_array_eq _ _ hgood, computeSize, LayoutStrategy.compute_size_and_align,
+      hsz, hptr, ThinPointer.widen]
+  · simp [projIdx, hnot_min, hidx_eq, hidx_lt] at hidx
+
 theorem placeOk_single_nonfield {layouts : Layout.LayoutTable} {decls : List LocalDecl}
     {it : Gen.IntType} {j : Nat} {proj : ProjectionElem}
     (hnf : ∀ idx fieldTy, proj ≠ .field idx fieldTy) :
@@ -7480,7 +7551,8 @@ theorem evalStatement_storageLive {body : CapturedMir} {f : Gen.Function} {ctx :
     (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
     (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) :
     ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
-      FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt := by
+      FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt ∧
+      (∀ j, j ≠ i → mapGet lm' (localName j) = mapGet lm (localName j)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have hspec := (translateFn_spec body f h.hf).2.1 i d hd
   have hlt := h.decl_localTy i d hd
@@ -7535,15 +7607,21 @@ theorem evalStatement_storageLive {body : CapturedMir} {f : Gen.Function} {ctx :
     rfl
   have htm := tryMutateCurFrame_callee h.shape
     (fun fr cm => storageLive fr cm (localName i)) _ _ hsl
-  refine ⟨_, ⟨lm2.entries ++ [(localName i, newPtr)]⟩, by simp only [evalStatement]; exact htm, ?_⟩
-  have hns3 : NonScalarLive body (locals.set i .uninit) ⟨lm2.entries ++ [(localName i, newPtr)]⟩ :=
-    (h.nonScalar.filter_scalar hd hscalar .uninit).append_scalar hd hscalar
-      (filter_key_not_mem _ _) newPtr
-  refine FrameOk.mk' h.hf ⟨rfl, h.shape.active, rfl⟩ ?_ h.declsOk hns3
-  have hlo3 := hlo2.alloc i d hd hs2 hp2 (allocCandidate k) haddr haddrMax
-    (Or.inr ⟨by omega, k, rfl⟩)
-  rw [List.set_set] at hlo3
-  exact hlo3
+  refine ⟨_, ⟨lm2.entries ++ [(localName i, newPtr)]⟩, by simp only [evalStatement]; exact htm, ?_, ?_⟩
+  · have hns3 : NonScalarLive body (locals.set i .uninit) ⟨lm2.entries ++ [(localName i, newPtr)]⟩ :=
+      (h.nonScalar.filter_scalar hd hscalar .uninit).append_scalar hd hscalar
+        (filter_key_not_mem _ _) newPtr
+    refine FrameOk.mk' h.hf ⟨rfl, h.shape.active, rfl⟩ ?_ h.declsOk hns3
+    have hlo3 := hlo2.alloc i d hd hs2 hp2 (allocCandidate k) haddr haddrMax
+      (Or.inr ⟨by omega, k, rfl⟩)
+    rw [List.set_set] at hlo3
+    exact hlo3
+  · intro j hji
+    have hne : localName j ≠ localName i := by simp [localName_inj, hji]
+    rw [mapGet_append_single _ _ _ _ (filter_key_not_mem _ _)]
+    simp only [hne, ↓reduceIte]
+    rw [mapGet_filter_key]
+    simp [hne]
 
 /-- `StorageLive(_i)` of `minimize`'s init block for a temporary `_i` of
 `alwaysStorageLiveLocals`, which Anneal keeps dead and which is not yet in the
@@ -7562,7 +7640,8 @@ theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {
     ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
       Shape m' ctx [ctx.caller, calleeFrameL f ctx lm' blk stmt] m'.mem.memory.allocations ∧
       LocalsOkA body ctx (al ++ [i]) locals lm' m'.mem.memory.allocations ∧
-      NonScalarLive body locals lm' := by
+      NonScalarLive body locals lm' ∧
+      (∀ j, j ≠ i → mapGet lm' (localName j) = mapGet lm (localName j)) := by
   have hspec := (translateFn_spec body f hf).2.1 i d hd
   have hlt := localTy_of_declOk (hdeclsOk d (List.mem_of_getElem? hd))
   have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hsi).1
@@ -7607,16 +7686,19 @@ theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {
   have htm := tryMutateCurFrame_callee hsh
     (fun fr cm => storageLive fr cm (localName i)) _ _ hsl
   refine ⟨_, ⟨lm.entries ++ [(localName i, newPtr)]⟩, by simp only [evalStatement]; exact htm, ?_⟩
-  refine ⟨⟨rfl, hsh.active, rfl⟩, ?_, hns.append_scalar hd hscalar hnot newPtr⟩
-  have hlo3 := hlo.alloc' (al' := al ++ [i]) i d hd hsi hp (allocCandidate k) haddr haddrMax
-    (Or.inr ⟨by omega, k, rfl⟩) .dead (declSlotOk_dead d body.layouts) (.inr (by simp))
-    (.inr (by simp)) (fun j hj => by simp [hj])
-  have hset : locals.set i .dead = locals := by
-    have h1 := List.set_getElem_self (as := locals) hil
-    rwa [show locals[i] = .dead from
-      Option.some.inj ((List.getElem?_eq_getElem hil).symm.trans hsi)] at h1
-  rw [hset] at hlo3
-  exact hlo3
+  refine ⟨⟨rfl, hsh.active, rfl⟩, ?_, hns.append_scalar hd hscalar hnot newPtr, fun j hji => ?_⟩
+  · have hlo3 := hlo.alloc' (al' := al ++ [i]) i d hd hsi hp (allocCandidate k) haddr haddrMax
+      (Or.inr ⟨by omega, k, rfl⟩) .dead (declSlotOk_dead d body.layouts) (.inr (by simp))
+      (.inr (by simp)) (fun j hj => by simp [hj])
+    have hset : locals.set i .dead = locals := by
+      have h1 := List.set_getElem_self (as := locals) hil
+      rwa [show locals[i] = .dead from
+        Option.some.inj ((List.getElem?_eq_getElem hil).symm.trans hsi)] at h1
+    rw [hset] at hlo3
+    exact hlo3
+  · have hne : localName j ≠ localName i := by simp [localName_inj, hji]
+    rw [mapGet_append_single _ _ _ _ hnot]
+    simp [hne]
 
 /-! ## `Return` -/
 

@@ -11,10 +11,11 @@ those terms.
 # Reproduction Guide — `MR-3.1`: Raw Pointers (`PtrType::Raw`, `AddrOf`, `PlaceExpr::Deref`, `BinOp::PtrOffset`, Int/Ptr Casts)
 
 This guide reproduces the `MR-3.1` changes: the MiniRust interpretation of raw
-pointers, `minimize`'s translation of raw pointer MIR, and kernel-checked runs
+pointers, `minimize`'s translation of raw pointer MIR, kernel-checked runs
 of raw pointer programs in both Anneal's MIR semantics and the MiniRust
-interpretation. The correspondence theorem (`step_correspondence`) does not
-cover raw pointers yet; see "Scope" below.
+interpretation, and the extension of the correspondence theorems
+(`step_correspondence_N`, `step_correspondence`, `step_start_N`) to the raw
+pointer statements that `inFragment` admits; see "Scope" below.
 
 ## 1. Environment
 
@@ -64,21 +65,25 @@ cd examples && anneal-lean-run --mode build --concurrency 3 -- lake build MiniRu
 ```
 
 The build includes `MiniRustSpec.Correspondence.Pointers` (lemmas about both
-semantics' raw pointers) and `MiniRustSpec.Correspondence.PointerWitness` (the
-witnesses), and fails unless `MiniRustSpec.Audit` accepts every declaration.
-Expected audit lines:
+semantics' raw pointers), `MiniRustSpec.Correspondence.PointerStep` (the raw
+pointer statements in both semantics, on which `step_correspondence_N` rests),
+and `MiniRustSpec.Correspondence.PointerWitness` (the witnesses), and fails
+unless `MiniRustSpec.Audit` accepts every declaration. Expected audit lines:
 
 ```text
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=214 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
 [WITNESS-AUDIT] decls=485 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-[POINTER-AUDIT] decls=60 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 12732 declarations across all MiniRustSpec.* modules
-Build completed successfully (69 jobs).
+[POINTER-AUDIT] decls=96 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 13548 declarations across all MiniRustSpec.* modules
+Build completed successfully (70 jobs).
 ```
 
-`[POINTER-AUDIT]` covers the 29 theorems of `Correspondence/Pointers.lean` and
-the 31 theorems of `Correspondence/PointerWitness.lean`.
+`[POINTER-AUDIT]` covers 37 theorems of `Correspondence/Pointers.lean`, 19 of
+`Correspondence/PointerStep.lean`, and the 40 theorems of
+`Correspondence/PointerWitness.lean`. `[SIMULATION-AUDIT]` includes
+`step_correspondence_N` and `step_start_N`, which now depend on the raw
+pointer lemmas.
 
 ## 5. What the witnesses show
 
@@ -89,9 +94,9 @@ output from its start.
 
 | Witness | Anneal | MiniRust |
 | --- | --- | --- |
-| `ptrRoundTrip` (`&raw mut x`, `*p` read and write, `PtrToPtr`, read through the cast) | returns `6` | returns `6` |
+| `ptrRoundTrip` (`&raw mut x`, `*p` read and write, `PtrToPtr`, read through the cast; in the fragment) | returns `6` | returns `6`, also derived by `mirCall_ret` |
 | `arrayElemPtr` (`&raw mut a[1]`) | returns `12` | returns `12` |
-| `fieldPtr` (`&raw mut s.1` on `Padded(u8, u32, u16)`) | returns `100` | returns `100` |
+| `fieldPtr` (`&raw mut s.1` on `Padded(u8, u32, u16)`; in the fragment) | returns `100` | returns `100` |
 | `dangling` (read after `StorageDead`) | UB | UB: dead allocation |
 | `offsetDeref 1` (`*a[0..].offset(1)`) | returns `a[0] = 5` | returns `a[1] = 7` |
 | `offsetDeref 2` (read one past the end) | returns `5` | UB: out of bounds |
@@ -109,10 +114,11 @@ terminator followed by a fresh block).
 
 ## 6. Scope
 
-`inFragment` rejects every raw pointer form (`ptrRoundTrip_notInFragment`), so
-the correspondence theorems are unchanged. The rows where Anneal returns a
-value and MiniRust a different value or UB are executions that Anneal's model
-accepts but the ground truth does not; a correspondence that covered them
-would be false, so the fragment must keep them out when it is extended.
-`minirust/README.md` ("Gaps") lists these divergences and the intended
-extension.
+`inFragment` admits raw pointers under the borrow discipline that
+`minirust/README.md` ("Gaps") describes, and `step_correspondence_N` simulates
+`&raw`, pointer copies, and reads and writes through pointers
+(`Correspondence/PointerStep.lean`); `ptrRoundTrip` and `fieldPtr` are in the
+fragment. The rows where Anneal returns a value and MiniRust a different value
+or UB, or the reverse, are executions on which the models disagree; a
+correspondence that covered them would be false, and each of them, as well as
+`dangling`, lies outside the fragment (`*_notInFragment`).

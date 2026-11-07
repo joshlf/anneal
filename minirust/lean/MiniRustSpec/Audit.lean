@@ -28,7 +28,8 @@ of declarations and logs one summary line per group, tagged `[ANCHOR-AUDIT]`
 (the anchors of the interpretation), `[SIMULATION-AUDIT]` (the
 correspondence theorems and the lemmas they rest on), `[WITNESS-AUDIT]`
 (the concrete witnesses), or `[POINTER-AUDIT]` (the raw pointer lemmas of
-`Correspondence.Pointers` and the witnesses of `Correspondence.PointerWitness`),
+`Correspondence.Pointers` and `Correspondence.PointerStep` and the witnesses of
+`Correspondence.PointerWitness`),
 ending in `sorry_free=true`. A group that depends on
 `sorryAx` or on any other non-standard axiom fails the build instead.
 -/
@@ -1766,16 +1767,48 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   evalRvalue_ptrToPtr
   evalRvalue_expose
   evalRvalue_withExposed
-  ptrRoundTrip_notInFragment
+  ptrAliasingOk_spec
+  StaleOk.addrTaken_eq
+  evalTargetPlace
+  evalPtrLoad
+  BorrowsOk.start
+  BorrowsOk.advance_keep
+  BorrowsOk.advance_set_nonptr
+  BorrowsOk.advance_set_ptr
+  BorrowsOk.advance_storage
+  BorrowsOk.jump
+  BorrowsOk.rawPtr
+  BorrowsOk.invalidateDeref_noop
+  LocalsOk.rawPtr_extend
+  evalStmt_assign_rawPtr
+  evalStmt_assign_derefWrite
+  evalOperand_deref_eq_target
+  evalRvalue_ptrRvalue
+  evalRvalue_derefRead_eq
+  evalPlace_deref
+  evalValue_addrOf
+  evalStatement_assign_rawPtr_mr
+  evalStatement_assign_ptrRvalue_mr
+  evalValue_ptrOffset_zero
+  derefWrite_target
+  statementOk_rawPtr_spec
+  statementOk_derefRead
+  ptrTargetSpec_cases
+  ptrRoundTrip_inFragment
   ptrRoundTrip_translate
   ptrRoundTrip_anneal_ret
   ptrRoundTrip_minirust_direct
+  ptrRoundTrip_ctxOk
+  ptrRoundTrip_minirust_ret_from_start
   arrayElemPtr_anneal_ret
   arrayElemPtr_minirust_direct
+  fieldPtr_inFragment
   fieldPtr_anneal_ret
   fieldPtr_minirust_direct
+  dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct
+  offsetDeref_notInFragment
   offsetDeref1_translate
   offsetDeref2_translate
   offsetDeref3_translate
@@ -1785,13 +1818,17 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   offsetDeref2_minirust_direct
   offsetDeref3_minirust_direct
   offsetDerefMax_minirust_direct
+  misaligned_notInFragment
   misaligned_anneal_ret
   misaligned_minirust_direct
   exposeTwice_translate
+  exposeTwice_notInFragment
   exposeTwice_anneal_ret
   exposeTwice_minirust_direct
+  directWrite_notInFragment
   directWrite_anneal_ub
   directWrite_minirust_direct
+  frozenWrite_notInFragment
   frozenWrite_anneal_ub
   frozenWrite_minirust_direct
   checkPtr_null
