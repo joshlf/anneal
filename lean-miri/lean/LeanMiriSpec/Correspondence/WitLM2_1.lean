@@ -1188,6 +1188,19 @@ theorem lm21_whole_array_read_unsupported :
   annealReadImmediate_whole_array_unsupported
     lm21_wf_u16Arr3 lm21_nodup_arr lm21_memPlaceRel
 
+/-- A partial subslice (`_1[1..3]` on `[u16; 3]`) is not tagged with
+`arraySliceMetaTyId`: `annealProjectionCx.subsliceLayout` rejects it, so the
+projection fails closed with `StepError.unsupported` instead of producing the
+`(address, length)` pair reserved for `Rvalue.len`. -/
+theorem lm21_partial_subslice_unsupported :
+    (annealProjectList
+      (annealProjectionCx (lm21ArrMiriFrame 3 .uninit) lm21Body.layouts
+        (witnessMachineOf lm21ArrAlloc))
+      ⟨.indirect witnessMemPlace, translateTy lm21U16Arr3Ty lm21Body.layouts⟩
+      [.Subslice 1 3 false]).mapError annealLiftProjectionError =
+      .error (.unsupported "partial array subslice in annealProjectionCx") := by
+  with_unfolding_all rfl
+
 def lm21IdxAllocId : Miri.Memory.AllocId := ⟨2, by decide⟩
 def lm21IdxBaseAddr : UInt64 := 0x2000
 
@@ -1669,9 +1682,9 @@ theorem lm21_mixed_reassign_chain_steps :
       annealStepHooks_storageLive_any_eq (m := lm21MixedInitMiri) rfl (by decide) ⟨_, rfl⟩ nofun
     rw [miri_step_at_statement_ok hooks (body := lm21MixedBody)
       rfl rfl rfl rfl rfl hm₀ rfl rfl]
-  have hsl_imm := fun hok tf' htf' =>
+  have hsl_imm := fun tf' htf' =>
     step_storageLive_establishes_immediate lm21_mixed_init_stateRel
-      (loc := 1) (decl := lm21U16Arr3Decl) rfl rfl rfl hok (tf' := tf') htf'
+      (loc := 1) (decl := lm21U16Arr3Decl) rfl rfl rfl (tf' := tf') htf'
   obtain ⟨hsim₁, hnd₁, him₁⟩ := step_stmt_lm2_1_simulation lm21_mixed_init_stateRel
     lm21_nodup_empty lm21_mixed_phase rfl rfl
     (fun _ _ => .lm14Stmt (.storageLive 1 lm21U16Arr3Decl _ rfl))
@@ -1681,7 +1694,7 @@ theorem lm21_mixed_reassign_chain_steps :
   cases hsim₁ with
   | step _ m₁ hrel₁ =>
   have himm₁_1 : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 1 :=
-    fun tf htf => hsl_imm rfl tf htf
+    fun tf htf => hsl_imm tf htf
   have himm₁_all : ∀ j, ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf j :=
     fun j tf htf => him₁ rfl _ tf rfl htf j (fun h => nomatch h) (lm21_mixedInitFrame_imm j)
   have hcanRes₁ : CanReserveAllocId m₁.machine.memory := by

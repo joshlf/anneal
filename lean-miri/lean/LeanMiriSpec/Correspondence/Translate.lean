@@ -631,11 +631,16 @@ def untranslatableConstOperand (ty : Ty) : Miri.MIR.ConstOperand :=
     userType := none
     value := .Unevaluated { definition := 0, arguments := #[], promoted := none } (encodeTyId ty) }
 
-/-- Synthetic `Miri.MIR.TyId` produced only by `annealProjectionCx.subsliceLayout`
-when projecting an array for `Rvalue.len` (`Subslice 0 0 true`). Disjoint from all
-`encodeTyId` outputs (`1, 2, 10..15, 20..25, 30..33, 40..42, 50, 51`, and `≥ 100`),
-so `annealReadImmediate` rejects unprojected whole-array reads (`ty ≠ 60`) with
-`StepError.unsupported` while still extracting slice length metadata for `Rvalue.len`. -/
+/-- Synthetic `Miri.MIR.TyId` that `annealProjectionCx.subsliceLayout` assigns to a
+whole-array subslice, such as the `Subslice 0 0 true` that `translateRvalue`
+appends for `Rvalue.len`. It is disjoint from every `encodeTyId` output (`1, 2,
+10..15, 20..25, 30..33, 40..42, 50, 51`, and `≥ 100`), so `annealReadImmediate`
+extracts `(address, length)` metadata only from such a subslice and rejects
+other whole-array reads (`ty ≠ 60`) with `StepError.unsupported`.
+`subsliceLayout` rejects partial subslices, so a partial subslice read never
+yields that metadata. A whole-array subslice that the source program itself
+writes is indistinguishable from the `Rvalue.len` device and is read the same
+way. -/
 def arraySliceMetaTyId : Miri.MIR.TyId := 60
 
 /-- Translate an Anneal `Rvalue` to `Miri.MIR.Rvalue`.
@@ -647,12 +652,13 @@ The pinned rustc MIR (`Miri.MIR.Rvalue`) has no `Rvalue::Len`,
   `ProjectionElem.Subslice 0 0 true` to `translatePlace place`. This is a
   modeling device, not rustc's lowering: rustc applies `PtrMetadata` to a
   pointer (for slices, a `&raw const (fake)` borrow of the place) and uses a
-  constant for arrays. Here `Miri.Interpreter.projectSubslice` tags the array
-  place with `arraySliceMetaTyId` after `annealEvalOperand` checks that an
-  immediate local is initialized and every byte of a memory-backed array is
-  initialized; `annealReadImmediate` then reads `(address, length)` only for
-  `arraySliceMetaTyId` (rejecting ordinary whole-array reads with
-  `StepError.unsupported`), and `PtrMetadata` extracts the length. This matches
+  constant for arrays. Here `Miri.Interpreter.projectSubslice` tags the
+  whole-array place with `arraySliceMetaTyId` after `annealEvalOperand` checks
+  that an immediate local is initialized and every byte of a memory-backed
+  array is initialized; `annealReadImmediate` then reads `(address, length)`
+  only for `arraySliceMetaTyId` (rejecting other whole-array reads, and
+  `subsliceLayout` rejecting partial subslices, with `StepError.unsupported`),
+  and `PtrMetadata` extracts the length. This matches
   Anneal's `evalRvalue (.len place)`, except for an uninitialized memory-backed
   zero-length array, which has no bytes whose initialization could be checked.
 * Rather than invent a meaning for `shallowInitBox` and the unsupported nullary
@@ -1008,7 +1014,7 @@ local has been moved into stack memory) as a 64-bit `usize`, raising
 `StepError.undefinedBehavior` if the index local is `.dead` or `.uninit`. -/
 def annealLocalIndex
     (frame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
-    (mach : AnnealMachine := AnnealMachine.empty)
+    (mach : AnnealMachine)
     (localId : Miri.MIR.LocalId) :
     Except Miri.Interpreter.ProjectionError UInt64 :=
   match frame.getLocalOperand localId with
@@ -1089,8 +1095,8 @@ checks allocation bounds in `mach.memory.live` while `OffsetMode.wrapping` wraps
 at target pointer width. -/
 def annealProjectionCx
     (frame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
-    (layouts : LayoutTable := emptyLayoutTable)
-    (mach : AnnealMachine := AnnealMachine.empty) :
+    (layouts : LayoutTable)
+    (mach : AnnealMachine) :
     Miri.Interpreter.ProjectionCx AnnealProv where
   target := annealTargetDataLayout
   maxSizeOfVal := Miri.ABI.Size.ofBytes 0x7fff_ffff_ffff_ffff
@@ -1111,14 +1117,11 @@ def annealProjectionCx
       (annealLiveAllocationLookup mach)
   subsliceLayout := fun baseLay count =>
     match baseLay.layout.fields with
-    | .Array stride _ =>
-        .ok
-          ({ ty := arraySliceMetaTyId
-             layout :=
-               { baseLay.layout with
-                 fields := .Array stride count
-                 size := Miri.ABI.Size.ofBytes (UInt64.ofNat (count.toNat * stride.bytes.toNat)) } },
-           .none)
+    | .Array _ baseCount =>
+        if count == baseCount then
+          .ok ({ ty := arraySliceMetaTyId, layout := baseLay.layout }, .none)
+        else
+          .error (.obligation "partial array subslice in annealProjectionCx")
     | _ => .error (.invariant "subslice on non-array")
   layoutOf := fun tyId => .ok (layoutOfEncodedTyId tyId layouts)
   deref := fun _ => .error (.obligation "deref in annealProjectionCx")
@@ -1138,7 +1141,14 @@ def annealProjectList
 
 /-- Check that the byte slice `[relOffset, relOffset + size)` of an indirect
 `MemPlace` is initialized in `mach.memory.live`, raising
-`StepError.undefinedBehavior` if uninitialized. -/
+`StepError.undefinedBehavior` if uninitialized.
+
+`annealEvalOperand` and `annealEvalPlace` run this check on a whole
+memory-backed local before projecting into it. That is stricter than Miri,
+which checks only the bytes an access reads and none for a write. The check
+mirrors Anneal's `MirSemantics`, where a projected read or write of a local
+requires the local's whole value to be initialized, so both machines report UB
+for an element access into an uninitialized array. -/
 def annealCheckIndirectInitialized
     (mach : AnnealMachine)
     (mp : Miri.Interpreter.MemPlace AnnealProv)

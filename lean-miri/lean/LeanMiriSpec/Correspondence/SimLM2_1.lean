@@ -1342,20 +1342,14 @@ theorem projectSubslice_zero_zero_true_of_array_memPlaceRel
       simp [Miri.ABI.Size.ofBytes, Miri.ABI.Size.ZERO]
     have hsub0 : UInt64.ofNat count - 0 = UInt64.ofNat count := by simp
     simp [hmul0, hsub0, Except.mapError, bind, Except.bind, pure, Except.pure]
-  have hlay_eq :
-      { (translateTy arrTy layouts).layout with
-        fields := .Array elemSize (UInt64.ofNat count)
-        size := Miri.ABI.Size.ofBytes (UInt64.ofNat ((UInt64.ofNat count).toNat * elemSize.bytes.toNat)) } =
-      (translateTy arrTy layouts).layout := by
-    rw [hwf.uint64_ofNat_count_toNat, ← hwf.arr_size, ← hwf.arr_fields]
   have hsublay : cx.subsliceLayout base.layout (UInt64.ofNat count) =
       .ok ({ ty := arraySliceMetaTyId, layout := (translateTy arrTy layouts).layout }, .none) := by
     change (match base.layout.layout.fields with
-      | .Array stride _ => _
+      | .Array _ baseCount => _
       | _ => _) = _
     rw [hfields]
-    dsimp only [base]
-    rw [hlay_eq]
+    simp only [beq_self_eq_true, ↓reduceIte]
+    rfl
   have hmem_zero := projectionMemoryOffset_inbounds_of_memPlaceRel
     (offset := Miri.ABI.Size.ZERO) hnodup hmp
     (by simp [Miri.ABI.Size.ZERO]) (by simp [Miri.ABI.Size.ZERO])
@@ -2300,7 +2294,14 @@ theorem evalScalarOperand_preserves_array_local
 - `dstIdx` is immediate (`IsImmediateFrameLocal`) and `CanReserveAllocId` holds
   (`lean-miri` allocates a fresh stack allocation via `annealEnsureAllocated`), or
 - `dstIdx` already holds `.init (.aggregate 0 oldElems)` (`lean-miri` reuses the
-  existing `.indirect mp` allocation in place without reserving a new `AllocId`). -/
+  existing `.indirect mp` allocation in place without reserving a new `AllocId`).
+
+An uninitialized memory-backed destination is not covered: writing elements
+into an allocation whose mask is not the lazy all-initialized mask materializes
+the mask, which `ArraySliceRel` does not describe. No theorem re-establishes
+`CanReserveAllocId` after a step, so a chain needs a separate argument (such as
+the concrete memory in `Witness.lm21_mixed_reassign_chain_steps`) before each
+fresh allocation after the first. -/
 def ArrayConstructDestReady
     (s : MachineState) (m : AnnealStepState)
     (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
@@ -6189,7 +6190,8 @@ theorem LiveAllocsNodup.deallocLocalMemory
 
 /-- Executing `StorageLive(loc)` on any declared local establishes
 `IsImmediateFrameLocal tf' loc` in the resulting `lean-miri` frame (even if `loc`
-previously held a memory-backed allocation). -/
+previously held a memory-backed allocation). The step always succeeds, so the
+lemma needs no hypothesis about its outcome. -/
 theorem step_storageLive_establishes_immediate
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
@@ -6197,7 +6199,6 @@ theorem step_storageLive_establishes_immediate
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageLive loc, span⟩)
     (hdecl : get? body.localDecls loc = some decl)
-    (_hok : (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).2 = .ok true)
     {tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     (htf' : (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.stack.frames = #[tf']) :
     IsImmediateFrameLocal tf' loc := by
@@ -6830,10 +6831,12 @@ storage/move statements) steps Anneal (`stepMirFn`) and `lean-miri` (`Step.step`
 exact lockstep (`StepRel`), preserving `StateRel` (including `ArraySliceRel` and
 `MemoryAllocDisjoint`), `LiveAllocsNodup` (`StepPreservesNodup`), and
 `IsImmediateFrameLocal` across every local except an array-construction destination
-(`StepPreservesImmediate`), so `step_stmt_lm2_1_simulation` composes directly across
-mixed sequences of array, scalar, and storage/move statements. Both machines agree on
-UB when array/index/operand/destination locals are dead or uninitialized or indices
-are out of bounds. -/
+(`StepPreservesImmediate`), so `step_stmt_lm2_1_simulation` composes across mixed
+sequences of array, scalar, and storage/move statements; a fresh array allocation
+after the first additionally needs `CanReserveAllocId` for the current memory (see
+`ArrayConstructDestReady`). Both machines agree on UB when
+array/index/operand/destination locals are dead or uninitialized or indices are out
+of bounds. -/
 theorem step_stmt_lm2_1_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
