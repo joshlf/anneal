@@ -1673,10 +1673,16 @@ impl MirLiftingProfile {
 }
 
 /// Normalize `authored` contract flags against Rust-level attributes on
-/// `bundle` (`#[spec(equivalent_to: ...)]`, `#[spec(safe_total)]`, modular
-/// callees) and, when rendering a starter template for an item without an
-/// existing `Proof/<Item>.lean`, promote generic (`typeParamCount > 0`) bodies
-/// to `is_polymorphic`.
+/// `bundle` (`#[spec(equivalent_to: ...)]`, and for unauthored items without
+/// an existing `Proof/<Item>.lean`, modular callees, `#[spec(safe_total)]`,
+/// and generic `typeParamCount > 0` `poly*Claim` surfaces).
+///
+/// When `authored.has_proof` is `true`, `detect_authored_item_modules` has
+/// already inspected `Proof/<Item>.lean` (for example, distinguishing a
+/// stateless `VerificationResult` proof via `rustSafeTotalSpec` from a
+/// `TotalVerificationResult` proof on a `#[spec(safe_total)]` item), so
+/// `safe_total`, fallback `is_modular`, and `is_polymorphic` are never forced
+/// over an existing proof file.
 pub(crate) fn effective_authored_for_bundle(
     bundle: &SubjectObligationBundle,
     mut authored: AuthoredItemModules,
@@ -1687,12 +1693,16 @@ pub(crate) fn effective_authored_for_bundle(
             authored.is_equiv = true;
             authored.is_total = false;
             authored.is_stateful = false;
-        } else if !authored.is_equiv
+        } else if !authored.has_proof
+            && !authored.is_equiv
             && !authored.has_specs
             && !authored.is_stateful
-            && bundle.has_rust_safe_total_attr()
         {
-            authored.is_total = true;
+            if !bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty() {
+                authored.is_modular = true;
+            } else if bundle.has_rust_safe_total_attr() {
+                authored.is_total = true;
+            }
         }
     }
     if !authored.has_proof
@@ -1700,12 +1710,6 @@ pub(crate) fn effective_authored_for_bundle(
         && unauthored_profile.is_some_and(|p| p.type_param_count > 0)
     {
         authored.is_polymorphic = true;
-        if !authored.is_ub_exception
-            && !authored.has_specs
-            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty())
-        {
-            authored.is_modular = true;
-        }
     }
     authored
 }
@@ -2225,9 +2229,10 @@ pub fn render_scaffold_lifting_hints(
 ) -> String {
     let is_equiv = authored.is_equiv || bundle.rust_equiv_target_module_suffix().is_some();
     let is_modular = authored.is_modular
-        || (!authored.has_specs
+        || (!authored.has_proof
+            && !authored.has_specs
             && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
-    let is_polymorphic = authored.is_polymorphic || profile.type_param_count > 0;
+    let is_polymorphic = authored.is_polymorphic || (!is_equiv && profile.type_param_count > 0);
     let is_bit_validity_item = matches!(
         bundle.subject.item_kind,
         anneal_rustc_capture::CapturedItemKind::TypeInvariant
@@ -3766,6 +3771,49 @@ def body : CapturedMir :=
             fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/poly_id.lean")).unwrap();
         assert!(poly_verify.contains("mkPolyVerificationResult"));
         assert!(!poly_verify.contains("signatureMonomorphic"));
+
+        // Regression check: an authored stateless `VerificationResult` proof on a
+        // `#[spec(safe_total)]` item (using `rustSafeTotalSpec : ItemSpec`) must NOT
+        // be overwritten to `TotalVerificationResult` by `scaffold` or `refresh_workspace_assembly`.
+        let tot_proof_path = ws.join("anneal/proofs/Proof/Demo/safe_tot.lean");
+        fs::write(
+            &tot_proof_path,
+            "import Trusted\nimport Obligations.Demo.safe_tot\nnamespace Proof.Demo.safe_tot\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.safe_tot.claim := by sorry\nend Proof.Demo.safe_tot\n",
+        )
+        .expect("write authored stateless safe_tot proof");
+
+        let cfg_no_init = ScaffoldConfig::new(&ws);
+        scaffold_workspace_with_config(&cfg_no_init, &records)
+            .expect("re-scaffold with authored stateless safe_tot proof");
+        let tot_verify_stateless =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_verify_stateless
+                .contains("theorem verified : VerificationResult Obligations.Demo.safe_tot.claim"),
+            "authored stateless VerificationResult on #[spec(safe_total)] must be preserved: {tot_verify_stateless}"
+        );
+        assert!(!tot_verify_stateless.contains("TotalVerificationResult"));
+
+        refresh_workspace_assembly(&ws)
+            .expect("refresh_workspace_assembly with authored stateless safe_tot proof");
+        let tot_verify_refreshed =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_verify_refreshed
+                .contains("theorem verified : VerificationResult Obligations.Demo.safe_tot.claim"),
+            "refresh_workspace_assembly must preserve stateless VerificationResult: {tot_verify_refreshed}"
+        );
+
+        fs::remove_file(&tot_proof_path).expect("delete safe_tot proof");
+        refresh_workspace_assembly(&ws)
+            .expect("refresh_workspace_assembly after deleting safe_tot proof");
+        let tot_verify_restored =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_verify_restored
+                .contains("TotalVerificationResult Obligations.Demo.safe_tot.totalClaim"),
+            "deleting Proof/Demo/safe_tot.lean must restore default TotalVerificationResult: {tot_verify_restored}"
+        );
 
         let _ = fs::remove_dir_all(&ws);
     }

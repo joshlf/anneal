@@ -1518,12 +1518,21 @@ pub fn render_agent_context(
         } else {
             "Missing"
         };
-        let is_effectively_modular = authored.is_modular
-            || (!authored.has_specs
-                && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
-        let contract_surface = if authored.is_ub_exception {
+        let contract_surface = if authored.is_polymorphic {
+            if authored.is_ub_exception {
+                "polymorphic ub_exception (`polyUbExceptionClaim` / `CrateVerificationResult`)"
+            } else if authored.is_modular {
+                "polymorphic modular (`polyModularClaim` / `CrateVerificationResult`)"
+            } else if authored.is_total {
+                "polymorphic total (`polyTotalClaim` / `CrateVerificationResult`)"
+            } else if authored.is_stateful {
+                "polymorphic stateful (`polyStatefulClaim` / `CrateVerificationResult`)"
+            } else {
+                "polymorphic (`polyClaim` / `CrateVerificationResult`)"
+            }
+        } else if authored.is_ub_exception {
             "ub_exception (`UbExceptionItemSpec` / `UbExceptionVerificationResult`)"
-        } else if is_effectively_modular {
+        } else if authored.is_modular {
             "modular (`ModularItemSpec` / `ModularVerificationResult`)"
         } else if authored.is_equiv {
             "equiv (`StatefulEquivItemSpec` / `StatefulEquivVerificationResult`)"
@@ -1649,9 +1658,10 @@ fn render_item_lifting_guidance(
     let item = &bundle.item_module_suffix;
     let is_equiv = authored.is_equiv || bundle.rust_equiv_target_module_suffix().is_some();
     let is_modular = authored.is_modular
-        || (!authored.has_specs
+        || (!authored.has_proof
+            && !authored.has_specs
             && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
-    let is_polymorphic = authored.is_polymorphic || profile.type_param_count > 0;
+    let is_polymorphic = authored.is_polymorphic || (!is_equiv && profile.type_param_count > 0);
     let is_bit_validity_item = matches!(
         bundle.subject.item_kind,
         anneal_rustc_capture::CapturedItemKind::TypeInvariant
@@ -2773,7 +2783,24 @@ end Mir.Demo.loop_fn
 
         let ctx_poly = render_agent_context(&ws, &extra_records, Some("demo::poly_fn"))
             .expect("render context for poly_fn");
+        assert!(ctx_poly.contains(
+            "- **`is_stateful`**: polymorphic (`polyClaim` / `CrateVerificationResult`)"
+        ));
         assert!(ctx_poly.contains("theorem verified : Obligations.Demo.poly_fn.polyClaim"));
+
+        // When an authored stateless `Proof/Demo/tot_fn.lean` (`VerificationResult`) exists on
+        // a `#[spec(safe_total)]` item, `render_agent_context` must report the authored surface.
+        let proof_demo_dir = ws.join("anneal/proofs/Proof/Demo");
+        fs::create_dir_all(&proof_demo_dir).expect("create Proof/Demo");
+        fs::write(
+            proof_demo_dir.join("tot_fn.lean"),
+            "import Trusted\nimport Obligations.Demo.tot_fn\nnamespace Proof.Demo.tot_fn\nopen Trusted.VerificationResult\ntheorem verified : VerificationResult Obligations.Demo.tot_fn.claim := by sorry\nend Proof.Demo.tot_fn\n",
+        )
+        .expect("write stateless Proof/Demo/tot_fn.lean");
+        let ctx_tot_authored = render_agent_context(&ws, &extra_records, Some("demo::tot_fn"))
+            .expect("render context for authored stateless tot_fn");
+        assert!(ctx_tot_authored.contains("- **Proof Status**: Present"));
+        assert!(ctx_tot_authored.contains("- **`is_stateful`**: false (`ItemSpec` / `VerificationResult`)"));
 
         let _ = fs::remove_dir_all(&ws);
     }

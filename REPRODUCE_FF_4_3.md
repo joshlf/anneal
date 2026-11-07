@@ -84,12 +84,14 @@ Work unit `FF-4.3` delivers:
      (`Rvalue.ref` + `.deref`) that use `holdBoolReq_of_mirBool` + count-free
      `repeat` and `hold_mirBool_of_blockLinear` (`defaultSpecSteps`).
 - Added `effective_authored_for_bundle` and SHA-aware
-  `resolve_workspace_mir_file` so `--init-proofs` and `agent-context` honor
-  `#[spec(safe_total)]` (`TotalVerificationResult`),
-  `#[spec(equivalent_to: ...)]` (`StatefulEquivVerificationResult`), and generic
-  `typeParamCount > 0` (`poly*Claim` + `mkPolyVerificationResult`), and prefer
-  fresh SHA-matching `target/anneal/units` captures over stale
-  `.anneal/generated/Mir` stubs.
+  `resolve_workspace_mir_file` so unauthored `--init-proofs` and `agent-context`
+  targets honor `#[spec(safe_total)]` (`TotalVerificationResult`),
+  `#[spec(equivalent_to: ...)]` (`StatefulEquivVerificationResult`), modular
+  callees, and generic `typeParamCount > 0` (`poly*Claim` +
+  `mkPolyVerificationResult`) without overwriting authored stateless
+  `VerificationResult` proofs (`rustSafeTotalSpec`), and prefer fresh
+  SHA-matching `target/anneal/units` captures over stale `.anneal/generated/Mir`
+  stubs.
 - Added `render_scaffold_lifting_hints` and `render_proof_template_with_hints`
   (re-exported from `crates/cargo-anneal/src/lib.rs`), emitting `<= 80`-column
   `--` Lean comment blocks with verified `open` namespaces (`Trusted.MirAst`,
@@ -159,7 +161,7 @@ Committed **locally only** on branch `adv/ff-4-3-reference` in
   findings `F-01`–`F-08`, and explicit `Boundaries` classifications
   (`unsupported`, `known not to apply`, `not examined`, `unknown`).
 - `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/support/`:
-  - `FuelFreeMirLiftingAndLensesProbe.lean`: 910-line self-contained Lean
+  - `FuelFreeMirLiftingAndLensesProbe.lean`: 938-line self-contained Lean
     `v4.34.1` mechanization (`Init`-only, zero `sorry`, constructive axioms
     only) proving 18 exported theorems: `evalFuel_mono`, `StepsTo.bind_wp`,
     `checkPureProg_rejects_deref`, `stepPure_simulates`,
@@ -198,9 +200,11 @@ cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4-3
 ./ci/check_todo.sh
 python3 trusted/audit/check_trusted.py --fast
 
-# 2. Full cargo-anneal unit + integration test suite & Anneal theory build
+# 2. Warm Anneal + MiniRust theory & Miri sysroot, then run cargo-anneal tests
+(cd examples && \
+  anneal-lean-run --mode build --concurrency 1 -- lake build Anneal MiniRust)
+anneal-lean-run --mode build --concurrency 1 -- cargo miri setup
 anneal-lean-run --mode build --concurrency 1 -- cargo test -p cargo-anneal
-cd examples && anneal-lean-run --mode build --concurrency 1 -- lake build Anneal
 
 # 3. Reference corpus catalog, structural check, unit tests, and Lean probe
 cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference
