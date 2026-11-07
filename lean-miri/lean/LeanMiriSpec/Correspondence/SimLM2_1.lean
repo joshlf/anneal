@@ -34,8 +34,13 @@ Proves the forward lockstep simulation theorems for `LM-2.1`:
 7. `step_assign_array_element_simulation`: indexed array element read (`dst = arr[i]`) and
    indexed array element write (`arr[i] = op`) for both `.index` and `.constantIndex`,
    preserving all `j ≠ idx` elements and `MemoryAllocDisjoint`, plus OOB/uninit/dead UB.
-8. `step_stmt_lm2_1_simulation`: master statement-level lockstep simulation theorem for
-   the `LM-2.1` statement fragment.
+8. `step_stmt_lm2_1_array_simulation`: statement-level lockstep simulation for the
+   `LM-2.1` array statements that also re-establishes the invariants outside
+   `StateRel` that the next array statement needs (`StepPreservesNodup`,
+   `StepPreservesImmediate`), so that the theorem chains across statements.
+9. `step_stmt_lm2_1_simulation`: master statement-level lockstep simulation theorem for
+   the `LM-2.1` array statements together with the `LM-1.1` scalar and `LM-1.4`
+   storage/move statements.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -144,6 +149,92 @@ theorem uint64_add_add_sub_cancel_left (a b c : UInt64) : a + b + c - a = b + c 
 /-- Live allocation IDs in `mach.memory.live` are pairwise distinct. -/
 def LiveAllocsNodup (mach : AnnealMachine) : Prop :=
   (mach.memory.live.toList.map Prod.fst).Nodup
+
+/-- A `lean-miri` step result whose normal completion (`.ok true`) leaves the
+post-state's live allocation IDs pairwise distinct.
+
+`StateRel` says nothing about duplicate allocation IDs, yet the `LM-2.1` hooks
+locate an array local's allocation with `find?` and `findIdx?`, which return the
+allocation that `MemPlaceRel` describes only when IDs are unique
+(`LiveAllocsNodup`). Each `LM-2.1` array theorem therefore assumes
+`LiveAllocsNodup` before the step and re-establishes it after a normal step,
+so that the theorems chain across consecutive statements. -/
+def StepPreservesNodup (r : Miri.Interpreter.StepResult AnnealStepState Bool) : Prop :=
+  r.2 = .ok true → LiveAllocsNodup r.1.machine
+
+/-- A failing `lean-miri` step trivially satisfies `StepPreservesNodup`. -/
+theorem StepPreservesNodup.of_error {st : AnnealStepState} {e : Miri.Interpreter.StepError} :
+    StepPreservesNodup (st, .error e) := by
+  intro h
+  cases h
+
+/-- A step whose post-state already satisfies `LiveAllocsNodup` satisfies
+`StepPreservesNodup`. -/
+theorem StepPreservesNodup.of_nodup {st : AnnealStepState}
+    {r : Except Miri.Interpreter.StepError Bool}
+    (h : LiveAllocsNodup st.machine) : StepPreservesNodup (st, r) :=
+  fun _ => h
+
+/-- A `lean-miri` step result from `m` whose normal completion (`.ok true`)
+keeps every local `j` with `keep j` that is immediate in `m`'s single frame
+immediate in the post-state's single frame.
+
+Like `LiveAllocsNodup`, immediacy of scalar locals is not part of `StateRel`,
+yet the `LM-2.1` theorems require scalar destinations and index locals to be
+immediate (`IsImmediateFrameLocal`). Re-establishing it lets the theorems chain
+across consecutive statements. -/
+def StepPreservesImmediate (m : AnnealStepState) (keep : Nat → Prop)
+    (r : Miri.Interpreter.StepResult AnnealStepState Bool) : Prop :=
+  r.2 = .ok true →
+    ∀ tf tf', m.stack.frames = #[tf] → r.1.stack.frames = #[tf'] →
+      ∀ j, keep j → IsImmediateFrameLocal tf j → IsImmediateFrameLocal tf' j
+
+/-- A failing `lean-miri` step trivially satisfies `StepPreservesImmediate`. -/
+theorem StepPreservesImmediate.of_error {m st : AnnealStepState} {keep : Nat → Prop}
+    {e : Miri.Interpreter.StepError} :
+    StepPreservesImmediate m keep (st, .error e) := by
+  intro h
+  cases h
+
+/-- `StepPreservesImmediate` for more locals implies it for fewer. -/
+theorem StepPreservesImmediate.mono {m : AnnealStepState} {keep keep' : Nat → Prop}
+    {r : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (hkeep : ∀ j, keep' j → keep j) (h : StepPreservesImmediate m keep r) :
+    StepPreservesImmediate m keep' r :=
+  fun hok tf tf' htf htf' j hj => h hok tf tf' htf htf' j (hkeep j hj)
+
+/-- The destination local of an array-constructing assignment
+(`Rvalue.aggregate (.array _)` or `Rvalue.repeat`), which `lean-miri` moves from
+an immediate local into a fresh allocation. -/
+def arrayConstructDest? (stmt : Statement) : Option Local :=
+  match stmt.kind with
+  | .assign ⟨dst, .nil⟩ (.aggregate (.array _) _) => some dst
+  | .assign ⟨dst, .nil⟩ (.repeat _ _) => some dst
+  | _ => none
+
+/-- Reserving a fresh `AllocId` and pushing onto `live` in `stackAllocMachine`
+preserves `LiveAllocsNodup`. -/
+theorem LiveAllocsNodup.stackAllocMachine
+    {mach : AnnealMachine} {mem' : AnnealMemory} {id : Miri.Memory.AllocId}
+    (alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree))
+    (hnodup : LiveAllocsNodup mach)
+    (hres : mach.memory.reserveAllocId = (mem', .ok id)) :
+    LiveAllocsNodup (Correspondence.stackAllocMachine mach mem' id alloc) := by
+  obtain ⟨hlive_eq, hfresh⟩ := reserveAllocId_ok_live hres
+  unfold LiveAllocsNodup Correspondence.stackAllocMachine
+  simp only [Array.toList_push, List.map_append, List.map_singleton, hlive_eq]
+  rw [List.nodup_append]
+  refine ⟨hnodup, by simp, ?_⟩
+  intro x hx y hy heq
+  subst heq
+  simp only [List.mem_singleton] at hy
+  subst hy
+  rcases List.mem_map.mp hx with ⟨⟨a, la⟩, hmem, rfl⟩
+  obtain ⟨i, hi, hget⟩ := List.mem_iff_getElem.mp hmem
+  have := (Array.any_eq_false.mp hfresh) i (by simpa using hi)
+  simp only [Array.getElem_toList] at hget
+  rw [hget] at this
+  simp at this
 
 theorem list_find?_of_nodup_fst {α β : Type} [BEq α] [LawfulBEq α]
     {l : List (α × β)} (hnodup : (l.map Prod.fst).Nodup)
@@ -436,17 +527,16 @@ theorem evalProjection_index_simulation
     (hrel : StateRel body s m)
     (hframes : m.stack.frames = #[topFrame])
     (hnodup : LiveAllocsNodup m.machine)
-    {arrLocal idxLocal : Local} {arrDecl idxDecl : LocalDecl}
+    {idxLocal : Local} {arrTy : Ty} {idxDecl : LocalDecl}
     {elemKind : RigidTy} {count : Nat} {elems : List Value}
     {mp : Miri.Interpreter.MemPlace AnnealProv}
-    (_harr_decl : get? body.localDecls arrLocal = some arrDecl)
-    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
-    (hmp : MemPlaceRel m.machine arrDecl.ty body.layouts (some (.aggregate 0 elems)) mp)
+    (hwf : WellTypedArrayTy body.layouts arrTy elemKind count)
+    (hmp : MemPlaceRel m.machine arrTy body.layouts (some (.aggregate 0 elems)) mp)
     (hidx_decl : get? body.localDecls idxLocal = some idxDecl)
     (hidx_ty : idxDecl.ty = { kind := .uint .usize, layoutIdx := 0 })
     (hidx_imm : IsImmediateFrameLocal topFrame idxLocal) :
     let cx := annealProjectionCx topFrame body.layouts
-    let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩
+    let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
     ((get? s.frame.locals idxLocal = some .dead ∨ get? s.frame.locals idxLocal = some .uninit) →
@@ -672,17 +762,14 @@ for both `fromEnd = false` (`idx = offset`) and `fromEnd = true` (`idx = count -
    `writeProjectedValue`) and Miri (`annealProjectList` lifted via `annealLiftProjectionError`)
    raise a bounds-check UB fault. -/
 theorem evalProjection_constantIndex_simulation
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
-    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    (_hrel : StateRel body s m)
-    (_hframes : m.stack.frames = #[topFrame])
+    {body : CapturedMir} {locals : List LocalSlot} {m : AnnealStepState}
+    (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
     (hnodup : LiveAllocsNodup m.machine)
-    {arrLocal : Local} {arrDecl : LocalDecl}
+    {arrTy : Ty}
     {elemKind : RigidTy} {count : Nat} {elems : List Value}
     {mp : Miri.Interpreter.MemPlace AnnealProv}
-    (_harr_decl : get? body.localDecls arrLocal = some arrDecl)
-    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
-    (hmp : MemPlaceRel m.machine arrDecl.ty body.layouts (some (.aggregate 0 elems)) mp)
+    (hwf : WellTypedArrayTy body.layouts arrTy elemKind count)
+    (hmp : MemPlaceRel m.machine arrTy body.layouts (some (.aggregate 0 elems)) mp)
     (offset minLength : Nat) (fromEnd : Bool)
     (hoff_bound : offset < 2 ^ 64)
     (hmin_bound : minLength < 2 ^ 64)
@@ -690,7 +777,7 @@ theorem evalProjection_constantIndex_simulation
       (fromEnd = false → offset < minLength) ∧
       (fromEnd = true → 0 < offset ∧ offset ≤ minLength)) :
     let cx := annealProjectionCx topFrame body.layouts
-    let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩
+    let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
     let idx := if fromEnd then count - offset else offset
@@ -698,7 +785,7 @@ theorem evalProjection_constantIndex_simulation
       ∃ elemVal sc msc,
         get? elems idx = some elemVal ∧
         elemVal = .scalar sc ∧
-        readProjectedValue s.frame.locals (.aggregate 0 elems)
+        readProjectedValue locals (.aggregate 0 elems)
           [.constantIndex offset minLength fromEnd] = ProjReadResult.ok elemVal ∧
         annealProjectList cx base [.ConstantIndex offset minLength fromEnd] =
           Except.ok
@@ -726,10 +813,10 @@ theorem evalProjection_constantIndex_simulation
             translateTy elemTy body.layouts⟩
           m = EStateM.Result.ok ⟨.scalar (.fromScalarInt msc), translateTy elemTy body.layouts⟩ m) ∧
     (count < minLength →
-      readProjectedValue s.frame.locals (.aggregate 0 elems)
+      readProjectedValue locals (.aggregate 0 elems)
         [.constantIndex offset minLength fromEnd] = .ub ∧
       (∀ v,
-        writeProjectedValue s.frame.locals (.aggregate 0 elems)
+        writeProjectedValue locals (.aggregate 0 elems)
           [.constantIndex offset minLength fromEnd] v = .ub) ∧
       ∃ msg,
         (annealProjectList cx base [.ConstantIndex offset minLength fromEnd]).mapError
@@ -924,6 +1011,68 @@ theorem annealReadImmediate_of_array_memPlaceRel
     unfold Miri.Interpreter.ScalarOps.unary annealScalarOpsHooks
     rfl
 
+/-- A `lean-miri` statement that ends by writing an immediate into the
+immediate local `dstIdx` (`annealWriteImmediate` on `.local 0 dstIdx none id0`)
+either fails or keeps `m.machine`, so it preserves `LiveAllocsNodup`. -/
+theorem stepPreservesNodup_of_write_local
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {tf₀ topFrame₁ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {dstIdx : Nat} {imm : Miri.Interpreter.Immediate AnnealProv}
+    {id0 : Miri.Interpreter.LocalsIdentity} {dstLay : Miri.Interpreter.LocalLayout}
+    {bb : BasicBlockData} {stmt : Statement}
+    (hnodup : LiveAllocsNodup m.machine)
+    (hframes : m.stack.frames = #[tf₀])
+    (hbody₀ : tf₀.body = translateBody body)
+    (hloc₀ : tf₀.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx⟩)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hloc₁ : topFrame₁.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx⟩)
+    (hlt : dstIdx < topFrame₁.locals.size)
+    (himm : IsImmediateFrameLocal topFrame₁ dstIdx)
+    (heval_m : Miri.Interpreter.Step.evalStatement
+      (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
+      Miri.Interpreter.runRvalue
+        (annealWriteImmediate imm ⟨.local 0 dstIdx none id0, dstLay⟩)
+        { m with stack := ⟨#[topFrame₁]⟩ }) :
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  have hsome : topFrame₁.locals[dstIdx]? = some (topFrame₁.locals[dstIdx]'hlt) :=
+    Array.getElem?_eq_getElem hlt
+  cases hmls : topFrame₁.locals[dstIdx]'hlt with
+  | mk val lay =>
+    rw [hmls] at hsome
+    have hget := frame_getLocal_of_getElem? topFrame₁ dstIdx _ hsome
+    cases val with
+    | dead =>
+      have hm_err : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
+          ({ m with stack := ⟨#[topFrame₁]⟩ }, .error (.undefinedBehavior "write to dead local")) := by
+        rw [heval_m]
+        unfold Miri.Interpreter.runRvalue
+        rw [annealWriteImmediate_dead (topFrame := topFrame₁) rfl hget]
+      rw [miri_step_at_statement_error _ hframes hbody₀ hloc₀ hbb hstmt hm_err]
+      exact StepPreservesNodup.of_error
+    | live op =>
+      cases op with
+      | indirect mp => exact absurd rfl (himm _ hsome mp)
+      | immediate oldImm =>
+        have hw := annealWriteImmediate_live (m := { m with stack := ⟨#[topFrame₁]⟩ })
+          (val := imm) (dstLay := dstLay) (id0 := id0) rfl hlt hget
+        have hm_ok : Miri.Interpreter.Step.evalStatement
+            (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
+            ({ m with
+                stack :=
+                  ⟨#[{ topFrame₁ with
+                        locals := topFrame₁.locals.set dstIdx
+                          { topFrame₁.locals[dstIdx]'hlt with value := .live (.immediate imm) }
+                          hlt }]⟩ },
+              .ok ()) := by
+          rw [heval_m]
+          unfold Miri.Interpreter.runRvalue
+          rw [hw]
+        rw [miri_step_at_statement_ok _ hframes hbody₀ hloc₀ hbb hstmt hm_ok rfl hloc₁]
+        exact StepPreservesNodup.of_nodup hnodup
+
 /-- **`evalRvalue_len_array_simulation`** (`LM-2.1`):
 Statement-level simulation of `dst = Len(arr)` (`StatementKind.assign ⟨dstIdx, .nil⟩ (.len ⟨arrIdx, .nil⟩)`)
 for a fixed-size homogeneous array local `arrIdx` (`WellTypedArrayTy body.layouts arrDecl.ty elemKind count`):
@@ -931,8 +1080,15 @@ for a fixed-size homogeneous array local `arrIdx` (`WellTypedArrayTy body.layout
   report an undefined-behavior fault (`StepRel.ub`).
 - When `arrIdx` holds `.init (.aggregate 0 elems)` and `dstIdx` is `.dead`, both report UB (`StepRel.ub`).
 - When `arrIdx` holds `.init (.aggregate 0 elems)` and `dstIdx` is live, both step to
-  `StateRel`-related states with `dstIdx` storing `.scalar ⟨count, 8⟩` (`StepRel.step`)
-  while preserving `LiveAllocsNodup`. -/
+  `StateRel`-related states with `dstIdx` storing `.scalar ⟨count, 8⟩`
+  (`StepRel.step`).
+- A normal `lean-miri` step preserves `LiveAllocsNodup` (`StepPreservesNodup`)
+  and the immediacy of every local (`StepPreservesImmediate`).
+
+The uninitialized case excludes a memory-backed zero-length array (`count = 0`
+with `arrIdx` not immediate): it has no bytes whose initialization `lean-miri`
+could check, so `lean-miri` returns `0` where Anneal reports UB (see
+`translateRvalue`). -/
 theorem evalRvalue_len_array_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
@@ -955,6 +1111,10 @@ theorem evalRvalue_len_array_simulation
       ∃ elems, get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems))) :
     StepRel body m
       (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesImmediate m (fun _ => True)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   rcases hstate with
     ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
@@ -1048,7 +1208,7 @@ theorem evalRvalue_len_array_simulation
           (annealEvalOperand_copy_dead rfl hlt_arr hdecl_arr hmls_arr_eq (fun l hl => hcl l hl)))]
       rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
         hstmt hm_err]
-      exact .ub _ _
+      exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
     | immediate _ _ _ _ himm =>
       rcases himm with ⟨h, _⟩ | ⟨_, h, _⟩ <;> cases h
     | indirect _ _ _ _ hnot_dead _ =>
@@ -1083,7 +1243,7 @@ theorem evalRvalue_len_array_simulation
           rw [EStateM.bind_eq_error hAR]
         rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
           hstmt hm_err]
-        exact .ub _ _
+        exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
       · cases hv
     | indirect _ mp cl hcl _ hmp =>
       rcases hcount_or_imm with hpos | himm_arr
@@ -1143,7 +1303,7 @@ theorem evalRvalue_len_array_simulation
             rw [EStateM.bind_eq_error hAR]
           rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
             hstmt hm_err]
-          exact .ub _ _
+          exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
       · exact absurd rfl (hmono₀ arrIdx (himm_arr topFrame hframes) _ hmls_arr mp)
   · -- Case 3: `arrIdx` holds `.init (.aggregate 0 elems)`
     rw [hinit_elems] at hslot_arr; injection hslot_arr with hslot_eq; subst hslot_eq
@@ -1222,10 +1382,19 @@ theorem evalRvalue_len_array_simulation
     have himm_dst' : ImmediateRel dstDecl.ty body.layouts (.scalar ⟨count, 8⟩)
         (.scalar (.fromScalarInt countSc)) := by
       rw [hdst_ty]; exact himm_count
-    exact (write_after_rvalue_simulation_ext (tf₀ := topFrame) (topFrame₁ := topFrame₁)
+    obtain ⟨_, _, _, hlt_dst₁, _, _, _, _⟩ := hframe₁.lookup_local hdecl_dst
+    have hext := write_after_rvalue_simulation_ext (tf₀ := topFrame) (topFrame₁ := topFrame₁)
       hretCont ⟨retLay, hretPlace⟩ hcal hstack hbor hprot hcaller
       hframes hframe.body_eq hframe.location_eq hmono₁ hbb hstmt hframe₁ hdisj₁
-      hdecl_dst (hmono₁ dstIdx hdst_imm_tf) himm_dst' ha_ok hm_write).1
+      hdecl_dst (hmono₁ dstIdx hdst_imm_tf) himm_dst' ha_ok hm_write
+    refine ⟨hext.1,
+      stepPreservesNodup_of_write_local hnodup hframes hframe.body_eq hframe.location_eq hbb hstmt
+        hframe₁.location_eq hlt_dst₁ (hmono₁ dstIdx hdst_imm_tf) hm_write, ?_⟩
+    intro hok tf tf' htf htf' j _ hj
+    rw [hframes] at htf
+    have htf_eq : tf = topFrame := by simpa using htf.symm
+    subst htf_eq
+    exact hext.2 j hj tf' htf' hok
 
 /-! ## 4. `annealEnsureAllocated` Helpers & `Rvalue.Repeat` Simulation (`evalRvalue_repeat_simulation`) -/
 
@@ -1328,6 +1497,18 @@ def setFrameLocalIndirect
     locals := tf.locals.set idx
       { tf.locals[idx]'hlt with value := .live (.indirect mp) } hlt }
 
+theorem IsImmediateFrameLocal.setFrameLocalIndirect_ne
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {dstIdx idx : Nat} (hlt : dstIdx < tf.locals.size)
+    (mp : Miri.Interpreter.MemPlace AnnealProv)
+    (hne : idx ≠ dstIdx)
+    (h : IsImmediateFrameLocal tf idx) :
+    IsImmediateFrameLocal (setFrameLocalIndirect tf dstIdx hlt mp) idx := by
+  intro mls hmls
+  dsimp only [setFrameLocalIndirect] at hmls
+  rw [Array.getElem?_set_ne _ hne.symm] at hmls
+  exact h mls hmls
+
 /-- `annealEnsureAllocated` on an `.immediate` destination local allocates a
 fresh zeroed mutable stack allocation satisfying `ArraySliceRel elemKind 0`. -/
 theorem annealEnsureAllocated_immediate
@@ -1378,8 +1559,29 @@ theorem annealEnsureAllocated_immediate
     Nat.zero_lt_one, ↓reduceDIte, set, MonadStateOf.set, EStateM.set, pure, EStateM.pure]
   rfl
 
-/-- Once `dstIdx` holds `.live (.indirect (stackAllocPlace allocId))` in
-`stackAllocMachine mach mem' allocId alloc` with an all-initialized mask,
+/-- `annealEnsureAllocated` on a memory-backed (`.indirect`) destination local
+returns its `MemPlace` without modifying the state, mirroring
+`Miri.Interpreter.forceAllocation`. -/
+theorem annealEnsureAllocated_indirect
+    {st : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {dstIdx : Nat} {id : Miri.Interpreter.LocalsIdentity} {lay : Miri.Interpreter.LocalLayout}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (hframes : st.stack.frames = #[tf])
+    (hlt : dstIdx < tf.locals.size)
+    (hind : (tf.locals[dstIdx]'hlt).value = .live (.indirect mp)) :
+    annealEnsureAllocated ⟨.local 0 dstIdx none id, lay⟩ st = .ok mp st := by
+  have hgop : tf.getLocalOperand dstIdx = .ok (.indirect mp) := by
+    unfold Miri.Interpreter.Frame.getLocalOperand Miri.Interpreter.Frame.getLocal
+      Miri.Interpreter.LocalState.access
+    simp [hlt, hind, bind, Except.bind, pure, Except.pure, Except.mapError]
+  unfold annealEnsureAllocated
+  simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
+    stack_currentFrame?_singleton st.stack tf hframes, hframes, Array.size, List.length_singleton,
+    Nat.sub_self, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hgop]
+  rfl
+
+/-- Once `dstIdx` holds `.live (.indirect (stackAllocPlace allocId))`,
 `annealEnsureAllocated` returns `stackAllocPlace allocId` without modifying the state. -/
 theorem annealEnsureAllocated_stackAlloc_idempotent
     {mach : AnnealMachine} {mem' : AnnealMemory} {allocId : Miri.Memory.AllocId}
@@ -1387,31 +1589,12 @@ theorem annealEnsureAllocated_stackAlloc_idempotent
     {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     {dstIdx : Nat} {id : Miri.Interpreter.LocalsIdentity} {lay : Miri.Interpreter.LocalLayout}
     (hlt : dstIdx < tf.locals.size)
-    (hind : (tf.locals[dstIdx]'hlt).value = .live (.indirect (stackAllocPlace allocId)))
-    (hfresh : mem'.live.any (fun entry => entry.1 == allocId) = false)
-    (hmask : alloc.initializationMask = Miri.Memory.InitMask.new alloc.byteSize true) :
+    (hind : (tf.locals[dstIdx]'hlt).value = .live (.indirect (stackAllocPlace allocId))) :
     let st : AnnealStepState :=
       { stack := ⟨#[tf]⟩, machine := stackAllocMachine mach mem' allocId alloc }
     annealEnsureAllocated ⟨.local 0 dstIdx none id, lay⟩ st =
-      .ok (stackAllocPlace allocId) st := by
-  dsimp only
-  have hgop : tf.getLocalOperand dstIdx = .ok (.indirect (stackAllocPlace allocId)) := by
-    unfold Miri.Interpreter.Frame.getLocalOperand Miri.Interpreter.Frame.getLocal
-      Miri.Interpreter.LocalState.access
-    simp [hlt, hind, bind, Except.bind, pure, Except.pure, Except.mapError]
-  have hidx := findIdx?_push_fresh mem'.live allocId
-    ({ kind := .stack, allocation := alloc } : Miri.Memory.LocalAllocation AnnealProv
-      (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind) hfresh
-  have hlive : (stackAllocMachine mach mem' allocId alloc).memory.live =
-      mem'.live.push (allocId, ⟨.stack, alloc⟩) := rfl
-  have hsz1 : (#[tf]).size = 1 := rfl
-  unfold annealEnsureAllocated
-  simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
-    stack_currentFrame?_singleton ⟨#[tf]⟩ tf rfl, hsz1, Nat.sub_self,
-    bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
-    hgop, stackAllocPlace, Option.bind, Miri.Memory.Provenance.getAllocId,
-    hlive, hidx, Array.getElem?_push_size, hmask, beq_self_eq_true, pure]
-  rfl
+      .ok (stackAllocPlace allocId) st :=
+  annealEnsureAllocated_indirect rfl hlt hind
 
 /-- Writing `.scalar (.fromScalarInt msc)` to element `k` of `stackAllocPlace allocId`
 in `stackAllocMachine mach mem' allocId alloc` appends `.scalar sc` to `ArraySliceRel`. -/
@@ -1487,7 +1670,8 @@ private def localStateIndirect?
 
 /-- Concluding `StepRel` after an array Rvalue (`Repeat` or `Aggregate`) allocates
 `(allocId, alloc_final)` satisfying `ArraySliceRel elemKind count` and updates
-`dstIdx` to `.live (.indirect (stackAllocPlace allocId))`. -/
+`dstIdx` to `.live (.indirect (stackAllocPlace allocId))`. Because `allocId` is
+fresh, the step also preserves `LiveAllocsNodup`. -/
 theorem write_array_after_rvalue_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {tf₀ topFrame₁ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
@@ -1523,15 +1707,33 @@ theorem write_array_after_rvalue_simulation
       (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
       ({ stack := ⟨#[setFrameLocalIndirect topFrame₁ dstIdx hlt_mf (stackAllocPlace allocId)]⟩,
          machine := stackAllocMachine m.machine mem' allocId alloc_final },
-       .ok ())) :
+       .ok ()))
+    (hnodup : LiveAllocsNodup m.machine)
+    (hmono : ∀ j, IsImmediateFrameLocal tf₀ j → IsImmediateFrameLocal topFrame₁ j) :
     StepRel body m
       (evalStmt s stmt body.localDecls body.layouts)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesImmediate m (fun j => j ≠ dstIdx)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   let topFrame₂ := setFrameLocalIndirect topFrame₁ dstIdx hlt_mf (stackAllocPlace allocId)
   have hloc₂ : topFrame₂.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx⟩ :=
     hframe₁.location_eq
   rw [ha_step, miri_step_at_statement_ok _ hframes hbody₀ hloc₀ hbb hstmt hm_step rfl hloc₂]
-  apply StepRel.step
+  refine ⟨StepRel.step _ _ ?_,
+    StepPreservesNodup.of_nodup (LiveAllocsNodup.stackAllocMachine alloc_final hnodup hres),
+    ?himm⟩
+  case himm =>
+    intro _ tf tf' htf htf' j hne hj
+    rw [hframes] at htf
+    have htf_eq : tf = tf₀ := by simpa using htf.symm
+    subst htf_eq
+    have htf'_eq : tf' = { topFrame₂ with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ } := by
+      simpa using htf'.symm
+    subst htf'_eq
+    exact IsImmediateFrameLocal.setFrameLocalIndirect_ne hlt_mf (stackAllocPlace allocId) hne
+      (hmono j hj)
   obtain ⟨hlive, hfreshne, hbase⟩ :=
     stackAllocMachine_live_base (mach := m.machine) alloc_final hres
   have hfr₁' := hframe₁.of_live_base hlive hbase
@@ -1806,12 +2008,15 @@ theorem replicateValue_eq_replicate (n : Nat) (v : Value) :
 /-- Full single-step correspondence for `_dst = [op; count]` (`Rvalue.repeat`):
 handles source operand UB (dead/uninitialized local), destination `.dead` UB,
 and in-bounds array allocation + element population establishing `ArraySliceRel`
-and preserving `StateRel` (including `MemoryAllocDisjoint`). -/
+and preserving `StateRel` (including `MemoryAllocDisjoint`). A normal
+`lean-miri` step also preserves `LiveAllocsNodup` (`StepPreservesNodup`) and the
+immediacy of every local other than `dstIdx` (`StepPreservesImmediate`). -/
 theorem evalRvalue_repeat_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {bb : BasicBlockData} {dstIdx : Local} {dstDecl : LocalDecl}
     {elemKind : RigidTy} {count : Nat} {op : MirAst.Operand} {span : String}
     (hrel : StateRel body s m)
+    (hnodup : LiveAllocsNodup m.machine)
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨dstIdx, .nil⟩ (.repeat op count), span⟩)
@@ -1824,6 +2029,10 @@ theorem evalRvalue_repeat_simulation
     (hcan_res : CanReserveAllocId m.machine.memory) :
     StepRel body m
       (evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.repeat op count), span⟩ body.localDecls body.layouts)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesImmediate m (fun j => j ≠ dstIdx)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   rcases hrel with ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
     hcal, hstack, hbor, hprot, hcaller, hdisj⟩
@@ -1903,7 +2112,7 @@ theorem evalRvalue_repeat_simulation
       rw [EStateM.bind_eq_error heval_agg_err]
     rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
       hstmt hm_err]
-    exact .ub _ _
+    exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
   | ok v locals₁ topFrame₁ imm hframe₁ himm hmono₁ htf₁_eq hdisj_imp =>
     have hdisj₁ : MemoryAllocDisjoint topFrame₁ := hdisj_imp hdisj₀
     obtain ⟨sc, msc, rfl, rfl, hrel_sc, hsz_sc, hbool_sc, hchar_sc⟩ :=
@@ -1962,7 +2171,7 @@ theorem evalRvalue_repeat_simulation
         rw [EStateM.bind_eq_error hforce_err]
       rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
         hstmt hm_err]
-      exact .ub _ _
+      exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
     | indirect _ mp _ _ _ _ =>
       exact False.elim (himm_dst₁ _ hmls_dst₁ mp rfl)
     | immediate slot_dst₁ imm_dst _ _ hval =>
@@ -2046,21 +2255,10 @@ theorem evalRvalue_repeat_simulation
       exact write_array_after_rvalue_simulation (tf₀ := topFrame) (topFrame₁ := topFrame₁)
         hretCont₁ hretPlace₁ hcal hstack hbor hprot hcaller
         hframes hframe.body_eq hframe.location_eq hbb hstmt hframe₁ hdisj₁
-        hdecl_dst hwf hlt_dst₁ hres hsize_final hslice_final ha_step hm_step
+        hdecl_dst hwf hlt_dst₁ hres hsize_final hslice_final ha_step hm_step hnodup
+        (fun j hj => hmono₁ j (hmono₀ j hj))
 
 /-! ## 5. `Rvalue.Aggregate (.array _)` Simulation (`evalRvalue_aggregate_array_simulation`) -/
-
-theorem IsImmediateFrameLocal.setFrameLocalIndirect_ne
-    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    {dstIdx idx : Nat} (hlt : dstIdx < tf.locals.size)
-    (mp : Miri.Interpreter.MemPlace AnnealProv)
-    (hne : idx ≠ dstIdx)
-    (h : IsImmediateFrameLocal tf idx) :
-    IsImmediateFrameLocal (setFrameLocalIndirect tf dstIdx hlt mp) idx := by
-  intro mls hmls
-  dsimp only [setFrameLocalIndirect] at hmls
-  rw [Array.getElem?_set_ne _ hne.symm] at hmls
-  exact h mls hmls
 
 theorem WellTypedScalarOperand.ne_array_local
     {body : CapturedMir}
@@ -2418,14 +2616,12 @@ theorem writeAggregate_pre_eq_alloc0
     {alloc₀ : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
     (hwf : WellTypedArrayTy body.layouts arrTy elemKind count)
     (hlt : dstIdx < tf.locals.size)
-    (hfresh : mem'.live.any (fun entry => entry.1 == allocId) = false)
     (hens_pre :
       annealEnsureAllocated ⟨.local 0 dstIdx none id, translateTy arrTy body.layouts⟩
         { stack := ⟨#[tf]⟩, machine := mach } =
       .ok (stackAllocPlace allocId)
         { stack := ⟨#[setFrameLocalIndirect tf dstIdx hlt (stackAllocPlace allocId)]⟩,
           machine := stackAllocMachine mach mem' allocId alloc₀ })
-    (hmask₀ : alloc₀.initializationMask = Miri.Memory.InitMask.new alloc₀.byteSize true)
     (elemTyId : Miri.MIR.TyId) (operands : Array Miri.MIR.Operand) :
     let dest : Miri.Interpreter.RuntimePlace AnnealProv :=
       ⟨.local 0 dstIdx none id, translateTy arrTy body.layouts⟩
@@ -2460,7 +2656,7 @@ theorem writeAggregate_pre_eq_alloc0
   have hens_id := annealEnsureAllocated_stackAlloc_idempotent
     (mach := mach) (mem' := mem') (allocId := allocId) (alloc := alloc₀)
     (tf := tf_ind) (id := id) (lay := translateTy arrTy body.layouts)
-    hlt_ind hind_val hfresh hmask₀
+    hlt_ind hind_val
   dsimp only at hens_id
   rw [writeAggregate_array_def, Std.Legacy.Range.forIn_eq_forIn_range']
   simp only [Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
@@ -2538,6 +2734,7 @@ theorem writeAggregate_loop_spec
                  machine := stackAllocMachine mach mem' allocId alloc_final } ∧
       FrameRel body mach af tf_final ∧
       MemoryAllocDisjoint tf_final ∧
+      (∀ j, IsImmediateFrameLocal tf_k j → IsImmediateFrameLocal tf_final j) ∧
       tf_final = { tf_k with locals := tf_final.locals } ∧
       alloc_final.byteSize = (translateTy dstDecl.ty body.layouts).layout.size ∧
       ArraySliceRel elemKind count body.layouts (elems_k ++ vals) Miri.ABI.Size.ZERO alloc_final) := by
@@ -2559,9 +2756,9 @@ theorem writeAggregate_loop_spec
     have hens_id := annealEnsureAllocated_stackAlloc_idempotent
       (mach := mach) (mem' := mem') (allocId := allocId) (alloc := alloc_k)
       (tf := tf_ind) (id := id) (lay := translateTy dstDecl.ty body.layouts)
-      hlt_ind hind_val hfresh hslice_k.alloc_mask
+      hlt_ind hind_val
     dsimp only at hens_id
-    refine ⟨[], tf_k, hlt_k, alloc_k, rfl, ?_, hframe_k, hdisj_k, rfl, hsize_k,
+    refine ⟨[], tf_k, hlt_k, alloc_k, rfl, ?_, hframe_k, hdisj_k, fun _ hj => hj, rfl, hsize_k,
       by simpa using hslice_k⟩
     simp only [List.range', List.forIn_nil, pure_bind]
     dsimp only [annealAggregateHooks]
@@ -2589,7 +2786,7 @@ theorem writeAggregate_loop_spec
     have hens_id := annealEnsureAllocated_stackAlloc_idempotent
       (mach := mach) (mem' := mem') (allocId := allocId) (alloc := alloc_k)
       (tf := tf_ind) (id := id) (lay := translateTy dstDecl.ty body.layouts)
-      hlt_ind hind_val hfresh hslice_k.alloc_mask
+      hlt_ind hind_val
     dsimp only at hens_id
     let elemLay := translateTy { kind := elemKind, layoutIdx := 0 } body.layouts
     let elemSize := elemLay.layout.size
@@ -2674,7 +2871,7 @@ theorem writeAggregate_loop_spec
           hk_len1 hops_arr1 hframe_k1 (hdisj_imp1 hdisj_k) hops_k1 hsize_k1 hslice_k1 with
         ⟨ha_rest_ub, m', msg, hm_rest_err⟩ |
         ⟨vs, tf_final, hlt_final, alloc_final, ha_rest_ok, hm_rest_ok,
-          hframe_final, hdisj_final, htf_eq_final, hsize_final, hslice_final⟩
+          hframe_final, hdisj_final, hmono_final, htf_eq_final, hsize_final, hslice_final⟩
       · left
         refine ⟨by simp [evalOperands, ha_ok, ha_rest_ub], m', msg, ?_⟩
         rw [List.range'_succ]
@@ -2690,7 +2887,8 @@ theorem writeAggregate_loop_spec
           simpa [List.append_assoc] using hslice_final
         refine ⟨.scalar sc :: vs, tf_final, hlt_final, alloc_final,
           by simp [evalOperands, ha_ok, ha_rest_ok], ?_,
-          hframe_final, hdisj_final, htf_eq_tot, hsize_final, hslice_tot⟩
+          hframe_final, hdisj_final, fun j hj => hmono_final j (hmono_1 j hj), htf_eq_tot,
+          hsize_final, hslice_tot⟩
         rw [List.range'_succ]
         simp only [List.forIn_cons]
         rw [← EStateM.bind_assoc_apply, EStateM.bind_eq_ok hstep_ok]
@@ -2700,13 +2898,16 @@ theorem writeAggregate_loop_spec
 (`Rvalue.aggregate (.array elemTy) ops`):
 handles destination `.dead` UB, source operand UB (dead/uninitialized local at any
 position in `ops`), and in-bounds stack allocation + element-by-element writes
-establishing `ArraySliceRel` and preserving `StateRel` (including `MemoryAllocDisjoint`). -/
+establishing `ArraySliceRel` and preserving `StateRel` (including `MemoryAllocDisjoint`).
+A normal `lean-miri` step also preserves `LiveAllocsNodup` (`StepPreservesNodup`)
+and the immediacy of every local other than `dstIdx` (`StepPreservesImmediate`). -/
 theorem evalRvalue_aggregate_array_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {bb : BasicBlockData} {dstIdx : Local} {dstDecl : LocalDecl}
     {elemTy : Ty} {elemKind : RigidTy} {count : Nat}
     {ops : List MirAst.Operand} {span : String}
     (hrel : StateRel body s m)
+    (hnodup : LiveAllocsNodup m.machine)
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.array elemTy) ops), span⟩)
@@ -2721,6 +2922,10 @@ theorem evalRvalue_aggregate_array_simulation
     StepRel body m
       (evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.array elemTy) ops), span⟩
         body.localDecls body.layouts)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesImmediate m (fun j => j ≠ dstIdx)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   rcases hrel with ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
     hcal, hstack, hbor, hprot, hcaller, hdisj⟩
@@ -2803,7 +3008,7 @@ theorem evalRvalue_aggregate_array_simulation
       rw [hw_err]
     rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
       hstmt hm_err]
-    exact .ub _ _
+    exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
   | indirect _ mp _ _ _ _ =>
     exact False.elim (himm_dst₀ _ hmls_dst₀ mp rfl)
   | immediate slot_dst₀ imm_dst _ _ hval =>
@@ -2812,7 +3017,7 @@ theorem evalRvalue_aggregate_array_simulation
     obtain ⟨mem', allocId, hres⟩ := hcan_res
     have himm_val : (topFrame₀.locals[dstIdx]'hlt_dst₀).value = .live (.immediate imm_dst) := by
       rw [hmls_dst₀_eq]
-    obtain ⟨alloc₀, hens_ok, hsize₀, _, _, hmask₀, hslice₀⟩ :=
+    obtain ⟨alloc₀, hens_ok, hsize₀, _, _, _, hslice₀⟩ :=
       annealEnsureAllocated_immediate
         (m := { stack := ⟨#[topFrame₀]⟩, machine := m.machine }) (tf := topFrame₀)
         (id := topFrame.localsIdentity) (arrTy := dstDecl.ty)
@@ -2821,14 +3026,12 @@ theorem evalRvalue_aggregate_array_simulation
     obtain ⟨hlive_eq, hfresh₀⟩ := reserveAllocId_ok_live hres
     have hfresh : mem'.live.any (fun entry => entry.1 == allocId) = false := by
       rw [hlive_eq]; exact hfresh₀
-    have hmask₀' : alloc₀.initializationMask = Miri.Memory.InitMask.new alloc₀.byteSize true := by
-      rw [hsize₀]; exact hmask₀
     have hm₀_eq : m₀ = { stack := ⟨#[topFrame₀]⟩, machine := m.machine } := rfl
     have hpre_eq := writeAggregate_pre_eq_alloc0 (body := body) (mach := m.machine)
       (tf := topFrame₀) (id := topFrame.localsIdentity)
       (arrTy := dstDecl.ty) (elemKind := elemKind) (count := count)
       (mem' := mem') (allocId := allocId) (alloc₀ := alloc₀)
-      hwf hlt_dst₀ hfresh hens_ok hmask₀' (encodeTyId elemTy) operands
+      hwf hlt_dst₀ hens_ok (encodeTyId elemTy) operands
     have hops_arr : ∀ i (hi : i < ops.length),
         operands[0 + i]? = some (translateOperand (ops[i]'hi)) := by
       intro i hi
@@ -2842,7 +3045,7 @@ theorem evalRvalue_aggregate_array_simulation
         (by simpa using hlen_ops) hops_arr hframe₀ hdisj₀ hops₀ hsize₀ hslice₀ with
       ⟨ha_ub_ops, m', msg, hm_loop_err⟩ |
       ⟨vals, tf_final, hlt_final, alloc_final, ha_ok_ops, hm_loop_ok,
-        hframe_final, hdisj_final, htf_eq_final, hsize_final, hslice_final⟩
+        hframe_final, hdisj_final, hmono_final, htf_eq_final, hsize_final, hslice_final⟩
     · have ha_ub : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.array elemTy) ops), span⟩
           body.localDecls body.layouts = MirStepNode.fail .ub := by
         unfold evalStmt evalRvalue
@@ -2859,7 +3062,7 @@ theorem evalRvalue_aggregate_array_simulation
         rw [hm_loop_err]
       rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
         hstmt hm_err]
-      exact .ub _ _
+      exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
     · have hset_ok : set? s.frame.locals dstIdx (.init (.aggregate 0 vals)) =
           some (s.frame.locals.set dstIdx (.init (.aggregate 0 vals))) :=
         set?_eq_some_set hlt_af_dst _
@@ -2909,6 +3112,7 @@ theorem evalRvalue_aggregate_array_simulation
         hretCont_f hretPlace_f hcal hstack hbor hprot hcaller
         hframes hframe.body_eq hframe.location_eq hbb hstmt hframe_final' hdisj_final
         hdecl_dst hwf hlt_final hres hsize_final (by simpa using hslice_final) ha_step hm_step
+        hnodup (fun j hj => hmono_final j (hmono₀ j hj))
 
 /-! ## 6. Array Element Read/Write (`step_assign_array_element_simulation`) & Master `LM-2.1` Simulation (`step_stmt_lm2_1_simulation`) -/
 
@@ -2970,30 +3174,6 @@ theorem array_findIdx?_of_nodup_fst
       simp [hlt]
     rw [hset_eq, Array.toList_set]
     exact hset_l localAlloc'
-
-/-- Reserving a fresh `AllocId` and pushing onto `live` in `stackAllocMachine`
-preserves `LiveAllocsNodup`. -/
-theorem LiveAllocsNodup.stackAllocMachine
-    {mach : AnnealMachine} {mem' : AnnealMemory} {id : Miri.Memory.AllocId}
-    (alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree))
-    (hnodup : LiveAllocsNodup mach)
-    (hres : mach.memory.reserveAllocId = (mem', .ok id)) :
-    LiveAllocsNodup (Correspondence.stackAllocMachine mach mem' id alloc) := by
-  obtain ⟨hlive_eq, hfresh⟩ := reserveAllocId_ok_live hres
-  unfold LiveAllocsNodup Correspondence.stackAllocMachine
-  simp only [Array.toList_push, List.map_append, List.map_singleton, hlive_eq]
-  rw [List.nodup_append]
-  refine ⟨hnodup, by simp, ?_⟩
-  intro x hx y hy heq
-  subst heq
-  simp only [List.mem_singleton] at hy
-  subst hy
-  rcases List.mem_map.mp hx with ⟨⟨a, la⟩, hmem, rfl⟩
-  obtain ⟨i, hi, hget⟩ := List.mem_iff_getElem.mp hmem
-  have := (Array.any_eq_false.mp hfresh) i (by simpa using hi)
-  simp only [Array.getElem_toList] at hget
-  rw [hget] at this
-  simp at this
 
 /-- Well-typed single array-element projection (`ProjectionElem.index idxLocal` or
 `ProjectionElem.constantIndex offset minLength fromEnd`). -/
@@ -3223,7 +3403,7 @@ theorem annealEvalOperand_projected_array_simulation
     cases hproj' with
     | index idxLocal idxDecl hidx_decl hidx_ty hidx_imm =>
       have ⟨hdead_idx, hin_idx, hoob_idx⟩ :=
-        evalProjection_index_simulation (m := m') hstate' rfl hnodup hdecl_arr hwf hmp
+        evalProjection_index_simulation (m := m') hstate' rfl hnodup hwf hmp
           hidx_decl hidx_ty hidx_imm
       obtain ⟨slot_idx, mls_idx, _, _, hslot_idx, hmls_idx, _, hloc_idx⟩ :=
         hframe'.lookup_local hidx_decl
@@ -3326,8 +3506,8 @@ theorem annealEvalOperand_projected_array_simulation
             exact ⟨ha_ub, m', msg, EStateM.bind_eq_error hm_err⟩
     | constantIndex offset minLength fromEnd hoff hmin hwf_c =>
       have ⟨hin_c, hoob_c⟩ :=
-        evalProjection_constantIndex_simulation (m := m') hstate' rfl hnodup hdecl_arr hwf hmp
-          offset minLength fromEnd hoff hmin hwf_c
+        evalProjection_constantIndex_simulation (m := m') (locals := s.frame.locals) topFrame'
+          hnodup hwf hmp offset minLength fromEnd hoff hmin hwf_c
       by_cases hle_min : minLength ≤ count
       · right
         obtain ⟨elemVal, sc_e, msc_e, _, rfl, hr_ok, hpl_ok, himm_e, hread_e⟩ := hin_c hle_min
@@ -3572,7 +3752,7 @@ theorem annealEvalPlace_projected_array_simulation
     cases hproj' with
     | index idxLocal idxDecl hidx_decl hidx_ty hidx_imm =>
       have ⟨hdead_idx, hin_idx, hoob_idx⟩ :=
-        evalProjection_index_simulation (m := m') hstate' rfl hnodup hdecl_arr hwf hmp
+        evalProjection_index_simulation (m := m') hstate' rfl hnodup hwf hmp
           hidx_decl hidx_ty hidx_imm
       obtain ⟨slot_idx, mls_idx, _, _, hslot_idx, hmls_idx, _, hloc_idx⟩ :=
         hframe'.lookup_local hidx_decl
@@ -3637,8 +3817,8 @@ theorem annealEvalPlace_projected_array_simulation
                 MonadExceptOf.throw, EStateM.throw]
     | constantIndex offset minLength fromEnd hoff hmin hwf_c =>
       have ⟨hin_c, hoob_c⟩ :=
-        evalProjection_constantIndex_simulation (m := m') hstate' rfl hnodup hdecl_arr hwf hmp
-          offset minLength fromEnd hoff hmin hwf_c
+        evalProjection_constantIndex_simulation (m := m') (locals := s.frame.locals) topFrame'
+          hnodup hwf hmp offset minLength fromEnd hoff hmin hwf_c
       have hlen_seq : Trusted.Sequence.length elems = count := by
         have hseq : ∀ xs : List Value, Trusted.Sequence.length xs = xs.length := by
           intro xs; induction xs with
@@ -3856,6 +4036,7 @@ theorem evalScalarOperand_preserves_array_local
       tf'.locals[arrIdx]? = tf.locals[arrIdx]? ∧
       FrameRel body mach af tf' ∧
       MemoryAllocDisjoint tf' ∧
+      (∀ j, IsImmediateFrameLocal tf j → IsImmediateFrameLocal tf' j) ∧
       tf' = { tf with locals := tf'.locals } ∧
       ScalarRel sc msc ∧
       (translateTy elemTy body.layouts).layout.size = translateSizeBytes sc.sizeBytes ∧
@@ -3871,7 +4052,7 @@ theorem evalScalarOperand_preserves_array_local
   cases hsim with
   | ub m' msg =>
     exact Or.inl ⟨rfl, m', msg, rfl⟩
-  | ok v locals₁ tf' imm hframe' himm _ htf'_eq hdisj_imp =>
+  | ok v locals₁ tf' imm hframe' himm hmono' htf'_eq hdisj_imp =>
     have hloc_eq := hop.evalOperand_locals_eq heval_a
     subst hloc_eq
     obtain ⟨sc, msc, rfl, rfl, hrel, hsz, hbool, hchar⟩ := himm.of_primitive_scalar hprim
@@ -3930,7 +4111,7 @@ theorem evalScalarOperand_preserves_array_local
             unfold cacheFrameLocalLayout
             rw [Array.getElem?_set]
             simp [hne]
-    exact Or.inr ⟨sc, msc, tf', rfl, rfl, harr_eq, hframe', hdisj_imp hdisj, htf'_eq,
+    exact Or.inr ⟨sc, msc, tf', rfl, rfl, harr_eq, hframe', hdisj_imp hdisj, hmono', htf'_eq,
       hrel, hsz, hbool, hchar⟩
 
 /-- Well-typed array element read or write `Statement` (`_dst = copy/move _arr[proj]`
@@ -4004,7 +4185,10 @@ and array element writes (`_arr[proj] = srcOp`) across both `ProjectionElem.inde
 - dead/uninitialized source operand or dead destination local UB,
 - in-bounds scalar element read, and
 - in-bounds scalar element overwrite (`elems.set idx (.scalar sc)` vs byte-slice overwrite
-  preserving all `j ≠ idx` elements, `LiveAllocsNodup`, and `MemoryAllocDisjoint`). -/
+  preserving all `j ≠ idx` elements and `MemoryAllocDisjoint`).
+
+A normal `lean-miri` step also preserves `LiveAllocsNodup` (`StepPreservesNodup`)
+and the immediacy of every local (`StepPreservesImmediate`). -/
 theorem step_assign_array_element_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
@@ -4017,6 +4201,10 @@ theorem step_assign_array_element_simulation
       WellTypedArrayElemAssign body s topFrame stmt) :
     StepRel body m
       (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesImmediate m (fun _ => True)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   have hstate_copy := hstate
   rcases hstate with
@@ -4109,7 +4297,7 @@ theorem step_assign_array_element_simulation
         rw [EStateM.bind_eq_error hm_err_op]
       rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
         hstmt hm_err]
-      exact .ub _ _
+      exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
     · have ha_ok : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.use readOp), span⟩
           body.localDecls body.layouts =
           match get? s.frame.locals dstIdx with
@@ -4146,10 +4334,19 @@ theorem step_assign_array_element_simulation
       have hretPlace₁ : ∃ retLay, topFrame₁.returnPlace =
           .frameLocal 0 0 none retLay topFrame₁.localsIdentity := by
         rw [htf₁_eq]; exact ⟨retLay, hretPlace⟩
-      exact (write_after_rvalue_simulation_ext (tf₀ := topFrame) (topFrame₁ := topFrame₁)
+      obtain ⟨_, _, _, hlt_dst₁, _, _, _, _⟩ := hframe₁.lookup_local hdecl_dst
+      have hext := write_after_rvalue_simulation_ext (tf₀ := topFrame) (topFrame₁ := topFrame₁)
         hretCont₁ hretPlace₁ hcal hstack hbor hprot hcaller
         hframes hframe.body_eq hframe.location_eq hmono_tot hbb hstmt hframe₁ hdisj₁
-        hdecl_dst (hmono_tot dstIdx hdst_imm) himm_dst ha_ok hm_write).1
+        hdecl_dst (hmono_tot dstIdx hdst_imm) himm_dst ha_ok hm_write
+      refine ⟨hext.1,
+        stepPreservesNodup_of_write_local hnodup hframes hframe.body_eq hframe.location_eq hbb
+          hstmt hframe₁.location_eq hlt_dst₁ (hmono_tot dstIdx hdst_imm) hm_write, ?_⟩
+      intro hok tf tf' htf htf' j _ hj
+      rw [hframes] at htf
+      have htf_eq : tf = topFrame := by simpa using htf.symm
+      subst htf_eq
+      exact hext.2 j hj tf' htf' hok
   | writeElem arrIdx arrDecl elemKind count proj srcOp span
       hdecl_arr hwf hprim hproj hop harr_slot =>
     have huse_src := evalRvalue_use_scalar_eq hop hbor hcaller
@@ -4190,7 +4387,7 @@ theorem step_assign_array_element_simulation
         rw [EStateM.bind_eq_error hevalPlace_err]
       rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
         hstmt hm_err]
-      exact .ub _ _
+      exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
     · -- Destination array place is in-bounds at `idx < count`; now evaluate `srcOp`.
       let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
       let elemLay := translateTy elemTy body.layouts
@@ -4227,7 +4424,7 @@ theorem step_assign_array_element_simulation
       rcases evalScalarOperand_preserves_array_local hframe₀ hdisj₀ hdecl_arr hwf hprim hop₀
           s.memory.globals (some elemLay) with
         ⟨ha_src_ub, m', msg, hm_src_err⟩ |
-        ⟨sc, msc, topFrame₁, ha_src_ok, hm_src_ok, harr_eq₁, hframe₁, hdisj₁,
+        ⟨sc, msc, topFrame₁, ha_src_ok, hm_src_ok, harr_eq₁, hframe₁, hdisj₁, hmono₁,
           htf₁_eq, hrel_sc, hsz_sc, hbool_sc, hchar_sc⟩
       · have ha_ub : evalStmt s ⟨.assign ⟨arrIdx, [proj]⟩ (.use srcOp), span⟩
             body.localDecls body.layouts = MirStepNode.fail .ub := by
@@ -4243,11 +4440,11 @@ theorem step_assign_array_element_simulation
           rw [EStateM.bind_eq_error hm_src_err]
         rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb
           hstmt hm_err]
-        exact .ub _ _
+        exact ⟨.ub _ _, StepPreservesNodup.of_error, StepPreservesImmediate.of_error⟩
       · have hmls_arr₁ : topFrame₁.locals[arrIdx]? =
             some ⟨.live (.indirect mp), some (translateTy arrDecl.ty body.layouts)⟩ := by
           rw [harr_eq₁]; exact hmls_arr₀
-        obtain ⟨mach', hw_ok, _, _, hframe'⟩ :=
+        obtain ⟨mach', hw_ok, hnodup', _, hframe'⟩ :=
           annealWriteImmediate_array_elem_set hframe₁ hdisj₁ hnodup hdecl_arr hwf hmls_arr₁
             hmp hlt_idx hrel_sc hsz_sc hbool_sc hchar_sc
         obtain ⟨_, _, hlt_af_arr, _, _, _, _, _⟩ := hframe.lookup_local hdecl_arr
@@ -4283,7 +4480,17 @@ theorem step_assign_array_element_simulation
           hframe₁.location_eq
         rw [ha_step, miri_step_at_statement_ok _ hframes hframe.body_eq hframe.location_eq
           hbb hstmt hm_step rfl hloc₁]
-        apply StepRel.step
+        refine ⟨StepRel.step _ _ ?_, StepPreservesNodup.of_nodup hnodup', ?himm⟩
+        case himm =>
+          intro _ tf tf' htf htf' j _ hj
+          rw [hframes] at htf
+          have htf_eq : tf = topFrame := by simpa using htf.symm
+          subst htf_eq
+          have htf'_eq : tf' =
+              { topFrame₁ with location := .mir ⟨s.frame.blockIdx, s.frame.stmtIdx + 1⟩ } := by
+            simpa using htf'.symm
+          subst htf'_eq
+          exact hmono₁ j (hmono₀ j hj)
         have hretCont₁ : topFrame₁.returnContinuation = .stop false := by
           rw [htf₁_eq, htf₀_eq]; exact hretCont
         have hretPlace₁ : topFrame₁.returnPlace =
@@ -4298,16 +4505,14 @@ theorem step_assign_array_element_simulation
           (fun i j mp_i mp_j lay_i lay_j hij hi hj =>
             hdisj₁ i j mp_i mp_j lay_i lay_j hij hi hj)
 
-/-- Well-typed statement covered by the composed `LM-2.1` statement simulation
-(`step_stmt_lm2_1_simulation`), uniting:
+/-- Well-typed `LM-2.1` array statement covered by
+`step_stmt_lm2_1_array_simulation`:
 1. Homogeneous array literal construction (`Rvalue.aggregate (.array elemTy) ops`),
 2. Homogeneous array repeat construction (`Rvalue.repeat op count`),
-3. Array length query (`Rvalue.len ⟨arrIdx, .nil⟩`),
+3. Array length query (`Rvalue.len ⟨arrIdx, .nil⟩`), and
 4. Bounds-checked array element reads and writes (`ProjectionElem.index` and
-   `ProjectionElem.constantIndex` with `fromEnd = false` and `fromEnd = true`),
-5. `LM-1.1` scalar statements (`WellTypedScalarStmt`), and
-6. `LM-1.4` storage/move statements (`WellTypedLM1_4Stmt`). -/
-inductive WellTypedLM2_1Stmt
+   `ProjectionElem.constantIndex` with `fromEnd = false` and `fromEnd = true`). -/
+inductive WellTypedLM2_1ArrayStmt
     (body : CapturedMir)
     (s : MachineState)
     (m : AnnealStepState)
@@ -4324,7 +4529,7 @@ inductive WellTypedLM2_1Stmt
       (∀ op ∈ ops, WellTypedScalarOperand body topFrame op { kind := elemKind, layoutIdx := 0 }) →
       IsPrimScalarTy { kind := elemKind, layoutIdx := 0 } →
       CanReserveAllocId m.machine.memory →
-      WellTypedLM2_1Stmt body s m topFrame
+      WellTypedLM2_1ArrayStmt body s m topFrame
         ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.array elemTy) ops), span⟩
   | repeatArray
       (dstIdx : Local) (dstDecl : LocalDecl)
@@ -4336,7 +4541,7 @@ inductive WellTypedLM2_1Stmt
       WellTypedScalarOperand body topFrame op { kind := elemKind, layoutIdx := 0 } →
       IsPrimScalarTy { kind := elemKind, layoutIdx := 0 } →
       CanReserveAllocId m.machine.memory →
-      WellTypedLM2_1Stmt body s m topFrame
+      WellTypedLM2_1ArrayStmt body s m topFrame
         ⟨.assign ⟨dstIdx, .nil⟩ (.repeat op count), span⟩
   | lenArray
       (dstIdx arrIdx : Local) (dstDecl arrDecl : LocalDecl)
@@ -4350,10 +4555,109 @@ inductive WellTypedLM2_1Stmt
         (get? s.frame.locals arrIdx = some .uninit ∧
           (0 < count ∨ IsImmediateFrameLocal topFrame arrIdx)) ∨
         ∃ elems, get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems))) →
-      WellTypedLM2_1Stmt body s m topFrame
+      WellTypedLM2_1ArrayStmt body s m topFrame
         ⟨.assign ⟨dstIdx, .nil⟩ (.len ⟨arrIdx, .nil⟩), span⟩
   | elemAssign {stmt : Statement} :
       WellTypedArrayElemAssign body s topFrame stmt →
+      WellTypedLM2_1ArrayStmt body s m topFrame stmt
+
+/-- **`step_stmt_lm2_1_array_simulation`** (`LM-2.1` array statement simulation):
+From any `StateRel`-related pair of states `(s, m)` with `LiveAllocsNodup m.machine`,
+executing any `WellTypedLM2_1ArrayStmt` (array `Aggregate`, `Repeat`, `Len`, and
+`Index`/`ConstantIndex` element reads and writes) steps Anneal (`stepMirFn`) and
+`lean-miri` (`Step.step`) in exact lockstep (`StepRel`). Normal steps preserve
+`StateRel` (including `ArraySliceRel` and `MemoryAllocDisjoint`),
+`LiveAllocsNodup` (`StepPreservesNodup`), and the immediacy of every local except
+the destination of an array construction (`StepPreservesImmediate`), so the
+theorem applies again to the next array statement; both machines report UB when
+an array, index, operand, or destination local is dead or uninitialized or an
+index is out of bounds. -/
+theorem step_stmt_lm2_1_array_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hnodup : LiveAllocsNodup m.machine)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {stmt : Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedLM2_1ArrayStmt body s m topFrame stmt) :
+    StepRel body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesNodup
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    StepPreservesImmediate m (fun j => arrayConstructDest? stmt ≠ some j)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  have hstate_copy := hstate
+  rcases hstate with ⟨topFrame, hframes, _, _, _, hcal, _, _, _, _, _⟩
+  have htf_eq : ∀ tf, m.stack.frames = #[tf] → tf = topFrame := by
+    intro tf h
+    rw [hframes] at h
+    simpa using h.symm
+  cases hwt topFrame hframes with
+  | aggregateArray dstIdx dstDecl elemTy elemKind count ops span
+      hdecl_dst hwf hlen_ops hdst_imm hops hprim hcan_res =>
+    rw [stepMirFn_eq_of_not_other body s hcal hphase]
+    simp only [hbb, hstmt]
+    obtain ⟨hrel', hnd', him'⟩ := evalRvalue_aggregate_array_simulation hstate_copy hnodup hbb
+      hstmt hdecl_dst hwf hlen_ops
+      (fun tf htf => htf_eq tf htf ▸ hdst_imm)
+      (fun tf htf => htf_eq tf htf ▸ hops)
+      hprim hcan_res
+    refine ⟨hrel', hnd', him'.mono fun j hj => ?_⟩
+    intro hjd
+    apply hj
+    show some dstIdx = some j
+    rw [hjd]
+  | repeatArray dstIdx dstDecl elemKind count op span
+      hdecl_dst hwf hdst_imm hop hprim hcan_res =>
+    rw [stepMirFn_eq_of_not_other body s hcal hphase]
+    simp only [hbb, hstmt]
+    obtain ⟨hrel', hnd', him'⟩ := evalRvalue_repeat_simulation hstate_copy hnodup hbb hstmt
+      hdecl_dst hwf
+      (fun tf htf => htf_eq tf htf ▸ hdst_imm)
+      (fun tf htf => htf_eq tf htf ▸ hop)
+      hprim hcan_res
+    refine ⟨hrel', hnd', him'.mono fun j hj => ?_⟩
+    intro hjd
+    apply hj
+    show some dstIdx = some j
+    rw [hjd]
+  | lenArray dstIdx arrIdx dstDecl arrDecl elemKind count span
+      hdecl_arr hwf hdecl_dst hdst_ty hdst_imm harr_slot =>
+    have harr_slot' :
+        get? s.frame.locals arrIdx = some .dead ∨
+        (get? s.frame.locals arrIdx = some .uninit ∧
+          (0 < count ∨
+            ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame arrIdx)) ∨
+        ∃ elems, get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems)) := by
+      rcases harr_slot with hd | ⟨hu, hpos | himm_a⟩ | he
+      · exact Or.inl hd
+      · exact Or.inr (Or.inl ⟨hu, Or.inl hpos⟩)
+      · exact Or.inr (Or.inl ⟨hu, Or.inr (fun tf htf => htf_eq tf htf ▸ himm_a)⟩)
+      · exact Or.inr (Or.inr he)
+    obtain ⟨hrel', hnd', him'⟩ := evalRvalue_len_array_simulation hstate_copy hnodup hphase hbb
+      hstmt hdecl_arr hwf hdecl_dst hdst_ty (fun tf htf => htf_eq tf htf ▸ hdst_imm) harr_slot'
+    exact ⟨hrel', hnd', him'.mono fun _ _ => trivial⟩
+  | elemAssign helem =>
+    obtain ⟨hrel', hnd', him'⟩ := step_assign_array_element_simulation hstate_copy hnodup hphase
+      hbb hstmt (fun tf htf => htf_eq tf htf ▸ helem)
+    exact ⟨hrel', hnd', him'.mono fun _ _ => trivial⟩
+
+/-- Well-typed statement covered by the composed `LM-2.1` statement simulation
+(`step_stmt_lm2_1_simulation`), uniting:
+1. `LM-2.1` array statements (`WellTypedLM2_1ArrayStmt`),
+2. `LM-1.1` scalar statements (`WellTypedScalarStmt`), and
+3. `LM-1.4` storage/move statements (`WellTypedLM1_4Stmt`). -/
+inductive WellTypedLM2_1Stmt
+    (body : CapturedMir)
+    (s : MachineState)
+    (m : AnnealStepState)
+    (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) :
+    Statement → Prop where
+  | arrayStmt {stmt : Statement} :
+      WellTypedLM2_1ArrayStmt body s m topFrame stmt →
       WellTypedLM2_1Stmt body s m topFrame stmt
   | scalarStmt {stmt : Statement} :
       WellTypedScalarStmt body topFrame stmt →
@@ -4369,7 +4673,11 @@ executing any `WellTypedLM2_1Stmt` (array `Aggregate`, `Repeat`, `Len`, `Index` 
 storage/move statements) steps Anneal (`stepMirFn`) and `lean-miri` (`Step.step`) in
 exact lockstep (`StepRel`), preserving `StateRel` (including `ArraySliceRel` and
 `MemoryAllocDisjoint`) on normal steps and agreeing on UB when array/index/operand/dest
-locals are dead or uninitialized or indices are out of bounds. -/
+locals are dead or uninitialized or indices are out of bounds.
+
+For array statements, `step_stmt_lm2_1_array_simulation` additionally shows that
+a normal step preserves `LiveAllocsNodup`; the `LM-1.1` and `LM-1.4` theorems do
+not expose their `lean-miri` post-states, so this theorem does not claim it. -/
 theorem step_stmt_lm2_1_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
@@ -4384,41 +4692,15 @@ theorem step_stmt_lm2_1_simulation
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   have hstate_copy := hstate
-  rcases hstate with ⟨topFrame, hframes, _, _, _, hcal, _, _, _, _, _⟩
+  rcases hstate with ⟨topFrame, hframes, _, _, _, _, _, _, _, _, _⟩
   have htf_eq : ∀ tf, m.stack.frames = #[tf] → tf = topFrame := by
     intro tf h
     rw [hframes] at h
     simpa using h.symm
   cases hwt topFrame hframes with
-  | aggregateArray dstIdx dstDecl elemTy elemKind count ops span
-      hdecl_dst hwf hlen_ops hdst_imm hops hprim hcan_res =>
-    rw [stepMirFn_eq_of_not_other body s hcal hphase]
-    simp only [hbb, hstmt]
-    exact evalRvalue_aggregate_array_simulation hstate_copy hbb hstmt hdecl_dst hwf hlen_ops
-      (fun tf htf => htf_eq tf htf ▸ hdst_imm)
-      (fun tf htf => htf_eq tf htf ▸ hops)
-      hprim hcan_res
-  | repeatArray dstIdx dstDecl elemKind count op span
-      hdecl_dst hwf hdst_imm hop hprim hcan_res =>
-    rw [stepMirFn_eq_of_not_other body s hcal hphase]
-    simp only [hbb, hstmt]
-    exact evalRvalue_repeat_simulation hstate_copy hbb hstmt hdecl_dst hwf
-      (fun tf htf => htf_eq tf htf ▸ hdst_imm)
-      (fun tf htf => htf_eq tf htf ▸ hop)
-      hprim hcan_res
-  | lenArray dstIdx arrIdx dstDecl arrDecl elemKind count span
-      hdecl_arr hwf hdecl_dst hdst_ty hdst_imm harr_slot =>
-    refine evalRvalue_len_array_simulation hstate_copy hnodup hphase hbb hstmt
-      hdecl_arr hwf hdecl_dst hdst_ty
-      (fun tf htf => htf_eq tf htf ▸ hdst_imm) ?_
-    rcases harr_slot with hd | ⟨hu, hpos | himm_a⟩ | he
-    · exact Or.inl hd
-    · exact Or.inr (Or.inl ⟨hu, Or.inl hpos⟩)
-    · exact Or.inr (Or.inl ⟨hu, Or.inr (fun tf htf => htf_eq tf htf ▸ himm_a)⟩)
-    · exact Or.inr (Or.inr he)
-  | elemAssign helem =>
-    exact step_assign_array_element_simulation hstate_copy hnodup hphase hbb hstmt
-      (fun tf htf => htf_eq tf htf ▸ helem)
+  | arrayStmt harr =>
+    exact (step_stmt_lm2_1_array_simulation hstate_copy hnodup hphase hbb hstmt
+      (fun tf htf => htf_eq tf htf ▸ harr)).1
   | scalarStmt hsc =>
     exact step_assign_scalar_simulation hstate_copy hphase hbb hstmt
       (fun tf htf => htf_eq tf htf ▸ hsc)

@@ -633,12 +633,23 @@ def untranslatableConstOperand (ty : Ty) : Miri.MIR.ConstOperand :=
 
 /-- Translate an Anneal `Rvalue` to `Miri.MIR.Rvalue`.
 
-The pinned rustc MIR (`Miri.MIR.Rvalue`) lowers `Rvalue::Len(place)` to
-`UnaryOp(UnOp::PtrMetadata, Operand::Copy(place))` and has neither
-`Rvalue::ShallowInitBox` nor `NullOp::{SizeOf, AlignOf, OffsetOf}`. Rather than
-invent a meaning for those unsupported operators, the translation maps
-`shallowInitBox` and those nullary operators to an unevaluated constant (which
-`evalMirConstImmediate` rejects with `unsupported`). -/
+The pinned rustc MIR (`Miri.MIR.Rvalue`) has no `Rvalue::Len`,
+`Rvalue::ShallowInitBox`, or `NullOp::{SizeOf, AlignOf, OffsetOf}`.
+
+* `len place` becomes `UnaryOp(PtrMetadata, Copy(place))`. This is a modeling
+  device, not rustc's lowering: rustc applies `PtrMetadata` to a pointer (for
+  slices, a `&raw const (fake)` borrow of the place) and uses a constant for
+  arrays. Here `annealReadImmediate` reads an initialized memory-backed array
+  operand as an `(address, length)` pair whose metadata `PtrMetadata` returns,
+  and reports undefined behavior if any byte of the array is uninitialized.
+  This matches Anneal's `evalRvalue (.len place)`, which copies the place (UB
+  when it is uninitialized) and returns its element count, except for a
+  memory-backed zero-length array: it has no bytes whose initialization could
+  be checked, so `annealReadImmediate` succeeds even when Anneal's local is
+  uninitialized.
+* Rather than invent a meaning for `shallowInitBox` and the unsupported nullary
+  operators, the translation maps them to an unevaluated constant, which
+  `evalMirConstImmediate` rejects with `unsupported`. -/
 def translateRvalue : Rvalue → Miri.MIR.Rvalue
   | .use op => .Use (translateOperand op) .No
   | .repeat op count =>
@@ -1512,11 +1523,27 @@ def annealPlaceHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
   enforceValidity := fun _ _ => pure true
   validate := fun _ _ => pure ()
 
-/-- Ensure that an unprojected array destination `RuntimePlace` is backed by a
-live mutable `MemPlace` in `AnnealMachine.memory` with an initialized
-`InitMask.new size true` mask, allocating a fresh stack allocation if the local
-currently holds `.immediate` and raising `StepError.undefinedBehavior` if the
-destination local is `.dead`. -/
+/-- Materialize an unprojected array destination `RuntimePlace` in memory,
+mirroring `Miri.Interpreter.forceAllocation` (`Miri/Interpreter/Place.lean`):
+
+* A `.memory` place, or a local that is already memory-backed (`.indirect`), is
+  returned unchanged. As in `forceAllocation`, the existing allocation and its
+  bytes and initialization mask are reused as they are.
+* A `.dead` local raises `StepError.undefinedBehavior` (rustc's `DeadLocal`).
+* An `.immediate` local moves into a fresh mutable stack allocation with the
+  destination layout's size and alignment, which becomes the local's
+  `MemPlace`.
+
+The fresh allocation differs from `Miri.Interpreter.placeAllocateStack`, which
+allocates with `.Uninit`: it is zero-filled and initialized
+(`Allocation.fromBytes`), so its mask is the lazy `InitMask.new size true`. Its
+callers in `annealAggregateHooks` complete normally only for zero-sized
+aggregates and primitive scalar arrays, and for the latter `writeAggregate` and
+`writeRepeat` overwrite every element of a padding-free layout. On normal
+completion the bytes and per-byte initialization therefore agree with Miri's;
+only the mask representation (lazy rather than materialized) differs. The old
+immediate value is not copied because an initialized array local is never
+immediate (`LocalRel.array_init_is_indirect`). -/
 def annealEnsureAllocated (dest : Miri.Interpreter.RuntimePlace AnnealProv) :
     Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.MemPlace AnnealProv) := do
   let st ← get
@@ -1532,27 +1559,7 @@ def annealEnsureAllocated (dest : Miri.Interpreter.RuntimePlace AnnealProv) :
           throw (.undefinedBehavior "write to dead local")
       | .error e =>
           throw (.stack e)
-      | .ok (.indirect mp) =>
-          let some id := mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
-            | throw (.unsupported "indirect local without allocation id")
-          match st.machine.memory.live.findIdx? (fun (k, _) => k == id) with
-          | some allocIdx =>
-              match st.machine.memory.live[allocIdx]? with
-              | some (k, ⟨kind, alloc⟩) =>
-                  if alloc.initializationMask == Miri.Memory.InitMask.new alloc.byteSize true then
-                    return mp
-                  else
-                    let freshAlloc ←
-                      match Miri.Memory.Allocation.fromBytes
-                          (Array.replicate alloc.byteSize.bytes.toNat 0) alloc.align .Mut with
-                      | .ok a => pure (a.withExtra none)
-                      | .error _ => throw (.unsupported "fresh array allocation failed")
-                    set { st with machine := { st.machine with
-                      memory := { st.machine.memory with
-                        live := st.machine.memory.live.set! allocIdx (k, ⟨kind, freshAlloc⟩) } } }
-                    return mp
-              | none => throw (.unsupported "indirect allocation not found")
-          | none => throw (.unsupported "indirect allocation not found")
+      | .ok (.indirect mp) => return mp
       | .ok (.immediate _) =>
           let sz := dest.layout.layout.size
           let al := dest.layout.layout.align.abi

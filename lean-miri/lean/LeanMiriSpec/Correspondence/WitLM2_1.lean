@@ -17,10 +17,11 @@ import LeanMiriSpec.Correspondence.Witness
 The `LM-2.1` theorems in `SimLM2_1` (`evalRvalue_aggregate_array_simulation`,
 `evalRvalue_repeat_simulation`, `evalRvalue_len_array_simulation`,
 `evalProjection_index_simulation`, `evalProjection_constantIndex_simulation`,
-`step_assign_array_element_simulation`, and `step_stmt_lm2_1_simulation`) would
-hold vacuously if their hypotheses (`StateRel`, `LiveAllocsNodup`,
-`WellTypedArrayTy`, `ArraySliceRel`, `CanReserveAllocId`, and
-`WellTypedLM2_1Stmt`) could not be satisfied simultaneously.
+`step_assign_array_element_simulation`, `step_stmt_lm2_1_array_simulation`, and
+`step_stmt_lm2_1_simulation`) would hold vacuously if their hypotheses
+(`StateRel`, `LiveAllocsNodup`, `WellTypedArrayTy`, `ArraySliceRel`,
+`CanReserveAllocId`, and `WellTypedLM2_1ArrayStmt`) could not be satisfied
+simultaneously.
 
 This module constructs concrete `Runtime(PostCleanup)` MIR states over a
 multi-byte stride array `[u16; 3]` (`stride = 2` bytes) backed by a stack
@@ -50,7 +51,13 @@ zero-length `Repeat`, and proves kernel-checked execution agreement for:
    behavior in both machines (`lm21_index_oob_ub`, `lm21_index_write_oob_ub`,
    `lm21_index_uninit_ub`, `lm21_constantIndex_oob_ub`), plus direct
    instantiations of `evalProjection_index_simulation` and
-   `evalProjection_constantIndex_simulation`.
+   `evalProjection_constantIndex_simulation`, and
+7. A chained five-statement run (`lm21_chain_steps`): array construction, two
+   `ConstantIndex` writes into the same allocation, a `ConstantIndex` read, and
+   `Len`, where every step after the first applies
+   `step_stmt_lm2_1_array_simulation` to the previous step's `lean-miri`
+   post-state using only the `StateRel`, `LiveAllocsNodup`, and immediacy facts
+   that the earlier steps re-established.
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness
@@ -240,7 +247,10 @@ theorem lm21_nodup_arr : LiveAllocsNodup (witnessMachineOf lm21ArrAlloc) :=
 - `stmt 6`: `_0 = copy _1[2 of 3]` (`fromEnd = false`)
 - `stmt 7`: `_0 = copy _1[-2 of 3]` (`fromEnd = true`, `3 - 2 = 1`)
 - `stmt 8`: `_1[-1 of 3] = const 0x0B0C_u16` (`fromEnd = true`, `3 - 1 = 2`)
-- `stmt 9`: `_0 = copy _1[0 of 4]` (`ConstantIndex` OOB `minLength = 4 > 3`) -/
+- `stmt 9`: `_0 = copy _1[0 of 4]` (`ConstantIndex` OOB `minLength = 4 > 3`)
+- `stmt 10..14`: the chained run `_1 = [0x0102, 0x0304, 0x0506]`,
+  `_1[-1 of 3] = const 0x0B0C_u16`, `_1[0 of 3] = const 0x0D0E_u16`,
+  `_0 = copy _1[2 of 3]`, `_2 = Len(_1)` (`lm21_chain_steps`) -/
 def lm21Body : CapturedMir where
   defPath := "lm_2_1_witness::arrays"
   phase := .runtimePostCleanup
@@ -260,7 +270,14 @@ def lm21Body : CapturedMir where
         mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.constantIndex 2 3 false]⟩))),
         mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.constantIndex 2 3 true]⟩))),
         mkStmt (.assign ⟨1, [.constantIndex 1 3 true]⟩ (.use (.constant (lm21ConstU16 0x0B0C)))),
-        mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.constantIndex 0 4 false]⟩)))],
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.constantIndex 0 4 false]⟩))),
+        mkStmt (.assign (local_ 1) (.aggregate (.array lm21U16Ty)
+          [.constant (lm21ConstU16 0x0102), .constant (lm21ConstU16 0x0304),
+           .constant (lm21ConstU16 0x0506)])),
+        mkStmt (.assign ⟨1, [.constantIndex 1 3 true]⟩ (.use (.constant (lm21ConstU16 0x0B0C)))),
+        mkStmt (.assign ⟨1, [.constantIndex 0 3 false]⟩ (.use (.constant (lm21ConstU16 0x0D0E)))),
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.constantIndex 2 3 false]⟩))),
+        mkStmt (.assign (local_ 2) (.len (local_ 1)))],
       terminator := mkTerm .return_, isCleanup := false }]
   fnAbi := lm21FnAbi
   layouts := emptyLayoutTable
@@ -486,7 +503,7 @@ theorem lm21_aggregate_array_steps :
   intro s'
   have hstep : stepMirFn lm21Body (lm21InitAnneal 0) = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation (lm21_init_stateRel 0) lm21_nodup_empty lm21_phase
+  have hsim := step_stmt_lm2_1_array_simulation (lm21_init_stateRel 0) lm21_nodup_empty lm21_phase
     rfl rfl (fun tf htf => by
       obtain rfl := lm21_initFrame_eq htf
       refine .aggregateArray 1 lm21U16Arr3Decl lm21U16Ty (.uint .u16) 3 _ _
@@ -499,6 +516,7 @@ theorem lm21_aggregate_array_steps :
         · exact lm21_constU16_wt _ 0x0102 (by decide)
         · exact lm21_constU16_wt _ 0x0304 (by decide)
         · exact lm21_constU16_wt _ 0x0506 (by decide))
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () (lm21InitMiri 0) = r at hsim ⊢
@@ -524,7 +542,7 @@ theorem lm21_repeat_array_steps :
   intro repElems s'
   have hstep : stepMirFn lm21Body (lm21InitAnneal 1) = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation (lm21_init_stateRel 1) lm21_nodup_empty lm21_phase
+  have hsim := step_stmt_lm2_1_array_simulation (lm21_init_stateRel 1) lm21_nodup_empty lm21_phase
     rfl rfl (fun tf htf => by
       obtain rfl := lm21_initFrame_eq htf
       refine .repeatArray 1 lm21U16Arr3Decl (.uint .u16) 3 _ _
@@ -532,6 +550,7 @@ theorem lm21_repeat_array_steps :
         lm21_isPrim_u16 lm21_canReserve_empty
       intro mls hmls mp hv
       simp [lm21InitMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () (lm21InitMiri 1) = r at hsim ⊢
@@ -555,7 +574,7 @@ theorem lm21_repeat_zero_steps :
   intro s'
   have hstep : stepMirFn lm21Body (lm21InitAnneal 2) = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation (lm21_init_stateRel 2) lm21_nodup_empty lm21_phase
+  have hsim := step_stmt_lm2_1_array_simulation (lm21_init_stateRel 2) lm21_nodup_empty lm21_phase
     rfl rfl (fun tf htf => by
       obtain rfl := lm21_initFrame_eq htf
       refine .repeatArray 3 lm21U16Arr0Decl (.uint .u16) 0 _ _
@@ -563,6 +582,7 @@ theorem lm21_repeat_zero_steps :
         lm21_isPrim_u16 lm21_canReserve_empty
       intro mls hmls mp hv
       simp [lm21InitMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () (lm21InitMiri 2) = r at hsim ⊢
@@ -583,7 +603,7 @@ theorem lm21_len_array_steps :
   intro s'
   have hstep : stepMirFn lm21Body (lm21ArrAnneal 3 .uninit) = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 3 .uninit .uninit (Or.inl ⟨rfl, rfl⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
       obtain rfl := lm21_arrFrame_eq htf
@@ -591,6 +611,7 @@ theorem lm21_len_array_steps :
         rfl lm21_wf_u16Arr3 rfl rfl ?_ (Or.inr (Or.inr ⟨lm21ArrElems, rfl⟩))
       intro mls hmls mp hv
       simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () (lm21ArrMiri 3 .uninit) = r at hsim ⊢
@@ -606,13 +627,14 @@ theorem lm21_len_uninit_ub :
           (m', .error (.undefinedBehavior msg)) := by
   have hstep : stepMirFn lm21Body (lm21InitAnneal 3) = .fail .ub := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation (lm21_init_stateRel 3) lm21_nodup_empty lm21_phase
+  have hsim := step_stmt_lm2_1_array_simulation (lm21_init_stateRel 3) lm21_nodup_empty lm21_phase
     rfl rfl (fun tf htf => by
       obtain rfl := lm21_initFrame_eq htf
       refine .lenArray 2 1 lm21UsizeDecl lm21U16Arr3Decl (.uint .u16) 3 _
         rfl lm21_wf_u16Arr3 rfl rfl ?_ (Or.inr (Or.inl ⟨rfl, Or.inl (by decide)⟩))
       intro mls hmls mp hv
       simp [lm21InitMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () (lm21InitMiri 3) = r at hsim ⊢
@@ -644,7 +666,7 @@ theorem lm21_evalProjection_index_witness :
     (.scalar (.fromScalarInt lm21Usize1))
     (Or.inr ⟨.scalar ⟨1, 8⟩, rfl, lm21_idxRel_1⟩)
   have ⟨_, hin, _⟩ := evalProjection_index_simulation hstate rfl lm21_nodup_arr
-    (arrLocal := 1) (idxLocal := 2) rfl lm21_wf_u16Arr3 lm21_memPlaceRel rfl rfl
+    (idxLocal := 2) lm21_wf_u16Arr3 lm21_memPlaceRel rfl rfl
     (fun mls hmls mp hv => by simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
   obtain ⟨elemVal, sc, msc, hget, rfl, _, hpl, himm, _⟩ :=
     hin ⟨1, 8⟩ rfl (by decide)
@@ -670,9 +692,10 @@ theorem lm21_evalProjection_constantIndex_witness :
             translateTy lm21U16Ty lm21Body.layouts⟩ ∧
       ImmediateRel lm21U16Ty lm21Body.layouts (.scalar ⟨0x0304, 2⟩)
         (.scalar (.fromScalarInt msc)) := by
-  have hstate := lm21_arr_stateRel 7 .uninit .uninit (Or.inl ⟨rfl, rfl⟩)
-  have ⟨hin, _⟩ := evalProjection_constantIndex_simulation hstate rfl lm21_nodup_arr
-    (arrLocal := 1) rfl lm21_wf_u16Arr3 lm21_memPlaceRel
+  have ⟨hin, _⟩ := evalProjection_constantIndex_simulation
+    (body := lm21Body) (locals := (lm21ArrAnneal 7 .uninit).frame.locals)
+    (m := lm21ArrMiri 7 .uninit) (lm21ArrMiriFrame 7 .uninit) lm21_nodup_arr
+    lm21_wf_u16Arr3 lm21_memPlaceRel
     2 3 true (by decide) (by decide) ⟨(fun h => nomatch h), (fun _ => ⟨by decide, by decide⟩)⟩
   obtain ⟨_, sc, msc, hget, rfl, _, hpl, himm, _⟩ := hin (by decide)
   have hsc : sc = ⟨0x0304, 2⟩ := by
@@ -704,7 +727,7 @@ theorem lm21_index_read_steps :
   intro s₀ m₀ s'
   have hstep : stepMirFn lm21Body s₀ = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 4 (.init (.scalar ⟨1, 8⟩)) (.scalar (.fromScalarInt lm21Usize1))
       (Or.inr ⟨.scalar ⟨1, 8⟩, rfl, lm21_idxRel_1⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
@@ -716,6 +739,7 @@ theorem lm21_index_read_steps :
       · refine .index 2 lm21UsizeDecl rfl rfl ?_
         intro mls hmls mp hv
         simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -746,7 +770,7 @@ theorem lm21_index_write_steps :
   intro s₀ m₀ updatedElems s'
   have hstep : stepMirFn lm21Body s₀ = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 5 (.init (.scalar ⟨1, 8⟩)) (.scalar (.fromScalarInt lm21Usize1))
       (Or.inr ⟨.scalar ⟨1, 8⟩, rfl, lm21_idxRel_1⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
@@ -759,6 +783,7 @@ theorem lm21_index_write_steps :
       refine .index 2 lm21UsizeDecl rfl rfl ?_
       intro mls hmls mp hv
       simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -786,7 +811,7 @@ theorem lm21_constantIndex_fromStart_steps :
   intro s₀ m₀ s'
   have hstep : stepMirFn lm21Body s₀ = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 6 .uninit .uninit (Or.inl ⟨rfl, rfl⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
       obtain rfl := lm21_arrFrame_eq htf
@@ -798,6 +823,7 @@ theorem lm21_constantIndex_fromStart_steps :
         (Or.inr (Or.inr ⟨lm21ArrElems, rfl⟩)))
       intro mls hmls mp hv
       simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -825,7 +851,7 @@ theorem lm21_constantIndex_fromEnd_read_steps :
   intro s₀ m₀ s'
   have hstep : stepMirFn lm21Body s₀ = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 7 .uninit .uninit (Or.inl ⟨rfl, rfl⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
       obtain rfl := lm21_arrFrame_eq htf
@@ -837,6 +863,7 @@ theorem lm21_constantIndex_fromEnd_read_steps :
         (Or.inr (Or.inr ⟨lm21ArrElems, rfl⟩)))
       intro mls hmls mp hv
       simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -866,7 +893,7 @@ theorem lm21_constantIndex_fromEnd_write_steps :
   intro s₀ m₀ updatedElems s'
   have hstep : stepMirFn lm21Body s₀ = .step s' := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 8 .uninit .uninit (Or.inl ⟨rfl, rfl⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
       obtain rfl := lm21_arrFrame_eq htf
@@ -877,6 +904,7 @@ theorem lm21_constantIndex_fromEnd_write_steps :
           ⟨(fun h => nomatch h), (fun _ => ⟨by decide, by decide⟩)⟩)
         (lm21_constU16_wt _ 0x0B0C (by decide))
         (Or.inr (Or.inr ⟨lm21ArrElems, rfl⟩))))
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -895,7 +923,7 @@ theorem lm21_index_oob_ub :
   intro s₀ m₀
   have hstep : stepMirFn lm21Body s₀ = .fail .ub := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 4 (.init (.scalar ⟨3, 8⟩)) (.scalar (.fromScalarInt lm21Usize3))
       (Or.inr ⟨.scalar ⟨3, 8⟩, rfl, lm21_idxRel_3⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
@@ -907,6 +935,7 @@ theorem lm21_index_oob_ub :
       · refine .index 2 lm21UsizeDecl rfl rfl ?_
         intro mls hmls mp hv
         simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -925,7 +954,7 @@ theorem lm21_index_write_oob_ub :
   intro s₀ m₀
   have hstep : stepMirFn lm21Body s₀ = .fail .ub := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 5 (.init (.scalar ⟨3, 8⟩)) (.scalar (.fromScalarInt lm21Usize3))
       (Or.inr ⟨.scalar ⟨3, 8⟩, rfl, lm21_idxRel_3⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
@@ -938,6 +967,7 @@ theorem lm21_index_write_oob_ub :
       refine .index 2 lm21UsizeDecl rfl rfl ?_
       intro mls hmls mp hv
       simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -956,7 +986,7 @@ theorem lm21_index_uninit_ub :
   intro s₀ m₀
   have hstep : stepMirFn lm21Body s₀ = .fail .ub := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 4 .uninit .uninit (Or.inl ⟨rfl, rfl⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
       obtain rfl := lm21_arrFrame_eq htf
@@ -967,6 +997,7 @@ theorem lm21_index_uninit_ub :
       · refine .index 2 lm21UsizeDecl rfl rfl ?_
         intro mls hmls mp hv
         simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
@@ -986,7 +1017,7 @@ theorem lm21_constantIndex_oob_ub :
   intro s₀ m₀
   have hstep : stepMirFn lm21Body s₀ = .fail .ub := rfl
   refine ⟨hstep, ?_⟩
-  have hsim := step_stmt_lm2_1_simulation
+  have hsim := step_stmt_lm2_1_array_simulation
     (lm21_arr_stateRel 9 .uninit .uninit (Or.inl ⟨rfl, rfl⟩))
     lm21_nodup_arr lm21_phase rfl rfl (fun tf htf => by
       obtain rfl := lm21_arrFrame_eq htf
@@ -998,10 +1029,148 @@ theorem lm21_constantIndex_oob_ub :
         (Or.inr (Or.inr ⟨lm21ArrElems, rfl⟩)))
       intro mls hmls mp hv
       simp [lm21ArrMiriFrame] at hmls; subst hmls; cases hv)
+  replace hsim := hsim.1
   rw [hstep] at hsim
   generalize Miri.Interpreter.Step.step
     (annealStepHooks lm21Body.localDecls lm21Body.layouts) () m₀ = r at hsim ⊢
   cases hsim with
   | ub m' msg => exact ⟨m', msg, rfl⟩
+
+/-! ## 7. Chained Multi-Step Witness (`stmt 10..14`) -/
+
+/-- Every local of `lm21InitMiriFrame k` is immediate. -/
+private theorem lm21_initFrame_imm (k j : Nat) : IsImmediateFrameLocal (lm21InitMiriFrame k) j := by
+  intro mls hmls mp hv
+  match j with
+  | 0 | 1 | 2 | 3 =>
+    simp [lm21InitMiriFrame] at hmls; subst hmls; cases hv
+  | _ + 4 => simp [lm21InitMiriFrame] at hmls
+
+/-- Chained five-statement run from the all-uninitialized state, applying
+`step_stmt_lm2_1_array_simulation` to each successive `lean-miri` post-state:
+`stmt 10` builds `_1 = [0x0102, 0x0304, 0x0506]` in a fresh allocation, `stmt 11`
+writes `_1[-1 of 3] = 0x0B0C` and `stmt 12` writes `_1[0 of 3] = 0x0D0E` into that
+allocation, `stmt 13` reads `_0 = copy _1[2 of 3]` (`0x0B0C`), and `stmt 14`
+computes `_2 = Len(_1)` (`3`). Each step after the first uses only the
+`StateRel`, `LiveAllocsNodup` (`StepPreservesNodup`), and scalar-local immediacy
+(`StepPreservesImmediate`) that the preceding steps re-established. -/
+theorem lm21_chain_steps :
+    let hooks := annealStepHooks lm21Body.localDecls lm21Body.layouts
+    let elems₂ : List Value := [.scalar ⟨0x0102, 2⟩, .scalar ⟨0x0304, 2⟩, .scalar ⟨0x0B0C, 2⟩]
+    let elems₃ : List Value := [.scalar ⟨0x0D0E, 2⟩, .scalar ⟨0x0304, 2⟩, .scalar ⟨0x0B0C, 2⟩]
+    let mkState (k : Nat) (locals : List LocalSlot) : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := k, locals := locals }
+        memory := (initMachineState lm21Body []).memory }
+    let s₁ := mkState 11 [.uninit, .init (.aggregate 0 lm21ArrElems), .uninit, .uninit]
+    let s₂ := mkState 12 [.uninit, .init (.aggregate 0 elems₂), .uninit, .uninit]
+    let s₃ := mkState 13 [.uninit, .init (.aggregate 0 elems₃), .uninit, .uninit]
+    let s₄ := mkState 14 [.init (.scalar ⟨0x0B0C, 2⟩), .init (.aggregate 0 elems₃), .uninit, .uninit]
+    let s₅ := mkState 15
+      [.init (.scalar ⟨0x0B0C, 2⟩), .init (.aggregate 0 elems₃), .init (.scalar ⟨3, 8⟩), .uninit]
+    stepMirFn lm21Body (lm21InitAnneal 10) = .step s₁ ∧
+      stepMirFn lm21Body s₁ = .step s₂ ∧
+      stepMirFn lm21Body s₂ = .step s₃ ∧
+      stepMirFn lm21Body s₃ = .step s₄ ∧
+      stepMirFn lm21Body s₄ = .step s₅ ∧
+      ∃ m₁ m₂ m₃ m₄ m₅,
+        Miri.Interpreter.Step.step hooks () (lm21InitMiri 10) = (m₁, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+        StateRel lm21Body s₅ m₅ ∧
+        LiveAllocsNodup m₅.machine := by
+  intro hooks elems₂ elems₃ mkState s₁ s₂ s₃ s₄ s₅
+  have h₁ : stepMirFn lm21Body (lm21InitAnneal 10) = .step s₁ := rfl
+  have h₂ : stepMirFn lm21Body s₁ = .step s₂ := rfl
+  have h₃ : stepMirFn lm21Body s₂ = .step s₃ := rfl
+  have h₄ : stepMirFn lm21Body s₃ = .step s₄ := rfl
+  have h₅ : stepMirFn lm21Body s₄ = .step s₅ := rfl
+  refine ⟨h₁, h₂, h₃, h₄, h₅, ?_⟩
+  -- `stmt 10`: array construction from the initial state.
+  obtain ⟨hsim₁, hnd₁, him₁⟩ := step_stmt_lm2_1_array_simulation (lm21_init_stateRel 10)
+    lm21_nodup_empty lm21_phase rfl rfl (fun tf htf => by
+      obtain rfl := lm21_initFrame_eq htf
+      refine .aggregateArray 1 lm21U16Arr3Decl lm21U16Ty (.uint .u16) 3 _ _
+        rfl lm21_wf_u16Arr3 rfl (lm21_initFrame_imm 10 1) ?_ lm21_isPrim_u16
+        lm21_canReserve_empty
+      intro op hop
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
+      rcases hop with rfl | rfl | rfl
+      · exact lm21_constU16_wt _ 0x0102 (by decide)
+      · exact lm21_constU16_wt _ 0x0304 (by decide)
+      · exact lm21_constU16_wt _ 0x0506 (by decide))
+  rw [h₁] at hsim₁
+  generalize Miri.Interpreter.Step.step hooks () (lm21InitMiri 10) = r₁ at hsim₁ hnd₁ him₁ ⊢
+  cases hsim₁ with
+  | step _ m₁ hrel₁ =>
+  -- Locals `_0` and `_2` stay immediate: `stmt 10` moves only `_1` into memory.
+  have himm₁ : ∀ j, j ≠ 1 → ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf j :=
+    fun j hj tf htf => him₁ rfl _ tf rfl htf j (fun h => hj (by injection h with h; exact h.symm))
+      (lm21_initFrame_imm 10 j)
+  -- `stmt 11`: `ConstantIndex` (`fromEnd = true`) write into the allocation of `stmt 10`.
+  obtain ⟨hsim₂, hnd₂, him₂⟩ := step_stmt_lm2_1_array_simulation hrel₁ (hnd₁ rfl) lm21_phase
+    rfl rfl (fun tf _ =>
+      .elemAssign (.writeElem 1 lm21U16Arr3Decl (.uint .u16) 3 (.constantIndex 1 3 true)
+        (.constant (lm21ConstU16 0x0B0C)) _ rfl lm21_wf_u16Arr3 lm21_isPrim_u16
+        (.constantIndex 1 3 true (by decide) (by decide)
+          ⟨(fun h => nomatch h), (fun _ => ⟨by decide, by decide⟩)⟩)
+        (lm21_constU16_wt tf 0x0B0C (by decide))
+        (Or.inr (Or.inr ⟨_, rfl⟩))))
+  rw [h₂] at hsim₂
+  generalize hr₂ : Miri.Interpreter.Step.step hooks () m₁ = r₂ at hsim₂ hnd₂ him₂
+  cases hsim₂ with
+  | step _ m₂ hrel₂ =>
+  have himm₂ : ∀ j, j ≠ 1 → ∀ tf, m₂.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+    intro j hj tf htf
+    obtain ⟨tf₁, htf₁⟩ : ∃ tf₁, m₁.stack.frames = #[tf₁] := by
+      obtain ⟨tf₁, htf₁, _⟩ := hrel₁; exact ⟨tf₁, htf₁⟩
+    exact him₂ rfl tf₁ tf htf₁ htf j (fun h => nomatch h) (himm₁ j hj tf₁ htf₁)
+  -- `stmt 12`: `ConstantIndex` (`fromEnd = false`) write into the same allocation.
+  obtain ⟨hsim₃, hnd₃, him₃⟩ := step_stmt_lm2_1_array_simulation hrel₂ (hnd₂ rfl) lm21_phase
+    rfl rfl (fun tf _ =>
+      .elemAssign (.writeElem 1 lm21U16Arr3Decl (.uint .u16) 3 (.constantIndex 0 3 false)
+        (.constant (lm21ConstU16 0x0D0E)) _ rfl lm21_wf_u16Arr3 lm21_isPrim_u16
+        (.constantIndex 0 3 false (by decide) (by decide)
+          ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+        (lm21_constU16_wt tf 0x0D0E (by decide))
+        (Or.inr (Or.inr ⟨_, rfl⟩))))
+  rw [h₃] at hsim₃
+  generalize hr₃ : Miri.Interpreter.Step.step hooks () m₂ = r₃ at hsim₃ hnd₃ him₃
+  cases hsim₃ with
+  | step _ m₃ hrel₃ =>
+  have himm₃ : ∀ j, j ≠ 1 → ∀ tf, m₃.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+    intro j hj tf htf
+    obtain ⟨tf₂, htf₂⟩ : ∃ tf₂, m₂.stack.frames = #[tf₂] := by
+      obtain ⟨tf₂, htf₂, _⟩ := hrel₂; exact ⟨tf₂, htf₂⟩
+    exact him₃ rfl tf₂ tf htf₂ htf j (fun h => nomatch h) (himm₂ j hj tf₂ htf₂)
+  -- `stmt 13`: `ConstantIndex` (`fromEnd = false`) read of the element `stmt 11` wrote.
+  obtain ⟨hsim₄, hnd₄, him₄⟩ := step_stmt_lm2_1_array_simulation hrel₃ (hnd₃ rfl) lm21_phase
+    rfl rfl (fun tf htf =>
+      .elemAssign (.readElem 0 1 lm21U16Decl lm21U16Arr3Decl (.uint .u16) 3
+        (.constantIndex 2 3 false) false _ rfl lm21_wf_u16Arr3 rfl rfl
+        (himm₃ 0 (by decide) tf htf)
+        (.constantIndex 2 3 false (by decide) (by decide)
+          ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+        (Or.inr (Or.inr ⟨_, rfl⟩))))
+  rw [h₄] at hsim₄
+  generalize hr₄ : Miri.Interpreter.Step.step hooks () m₃ = r₄ at hsim₄ hnd₄ him₄
+  cases hsim₄ with
+  | step _ m₄ hrel₄ =>
+  have himm₄ : ∀ tf, m₄.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 := by
+    intro tf htf
+    obtain ⟨tf₃, htf₃⟩ : ∃ tf₃, m₃.stack.frames = #[tf₃] := by
+      obtain ⟨tf₃, htf₃, _⟩ := hrel₃; exact ⟨tf₃, htf₃⟩
+    exact him₄ rfl tf₃ tf htf₃ htf 2 (fun h => nomatch h) (himm₃ 2 (by decide) tf₃ htf₃)
+  -- `stmt 14`: `Len(_1)` of the twice-updated array.
+  obtain ⟨hsim₅, hnd₅, -⟩ := step_stmt_lm2_1_array_simulation hrel₄ (hnd₄ rfl) lm21_phase
+    rfl rfl (fun tf htf =>
+      .lenArray 2 1 lm21UsizeDecl lm21U16Arr3Decl (.uint .u16) 3 _
+        rfl lm21_wf_u16Arr3 rfl rfl (himm₄ tf htf) (Or.inr (Or.inr ⟨_, rfl⟩)))
+  rw [h₅] at hsim₅
+  generalize hr₅ : Miri.Interpreter.Step.step hooks () m₄ = r₅ at hsim₅ hnd₅
+  cases hsim₅ with
+  | step _ m₅ hrel₅ =>
+  exact ⟨m₁, m₂, m₃, m₄, m₅, rfl, hr₂, hr₃, hr₄, hr₅, hrel₅, hnd₅ rfl⟩
 
 end LeanMiriSpec.Correspondence.Witness

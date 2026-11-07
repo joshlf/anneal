@@ -74,7 +74,9 @@ import LeanMiriSpec.Audit
   arrays `[T; N]`, `Aggregate (.array _)`, `Rvalue.Repeat`, `Rvalue.Len`, and
   `Index`/`ConstantIndex` projections (`fromEnd = false` and `fromEnd = true`),
   including out-of-bounds and uninitialized/dead index UB equivalence
-  (`step_stmt_lm2_1_simulation`).
+  (`step_stmt_lm2_1_simulation`), with `step_stmt_lm2_1_array_simulation`
+  re-establishing `LiveAllocsNodup` and local immediacy so that array statements
+  chain.
 * `LeanMiriSpec.Correspondence.WitLM2_1`: non-vacuity witnesses for `LM-2.1`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
