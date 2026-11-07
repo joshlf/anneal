@@ -206,18 +206,21 @@ restricted to the fragment checked by `inFragment`:
 
 * the body is `Runtime(PostCleanup)` MIR and declares the return place, the
   arguments, and any number of temporaries (`argCount + 1 <= localDecls.length
-  < 2^31`); the return place `_0` and every temporary (`argCount < i`) have
-  integer type (`u8`..`u128`, `i8`..`i128`, `usize`, `isize`), `bool`,
-  `core::cmp::Ordering`, or a 2-tuple `(Int, bool)`, and each argument local
-  additionally may be a homogeneous one-dimensional integer array `[T; N]`
-  whose byte size `N * size_of::<T>()` is below `2^63` or a well-formed nested
-  tuple or single-variant struct (`TupleSpec`: `RigidTy::Tuple` or
-  `RigidTy::Adt` with `FieldsShape::Arbitrary`, `VariantsShape::Single(0)`,
-  integer leaf fields or `()`, and explicit inter-field and trailing padding);
-* `StorageLive(_i)` and `StorageDead(_i)` of scalar-family locals (`StorageDead`
-  only of temporaries, as MiniRust's well-formedness check requires), and
-  `Deinit(_i)` of a scalar-family root local, which `minimize` does not
-  translate and we translate to `Statement::Deinit(PlaceExpr::Local(_i))`;
+  < 2^31`); the return place `_0` has integer type (`u8`..`u128`, `i8`..`i128`,
+  `usize`, `isize`), `bool`, `core::cmp::Ordering`, or a 2-tuple `(Int, bool)`,
+  each temporary (`argCount < i`) has one of those scalar-family types or a thin
+  raw pointer type `*const T` / `*mut T` to an integer pointee `T`
+  (`ptrPointeeOf`), and each argument local additionally may be a homogeneous
+  one-dimensional integer array `[T; N]` whose byte size `N * size_of::<T>()` is
+  below `2^63` or a well-formed nested tuple or single-variant struct
+  (`TupleSpec`: `RigidTy::Tuple` or `RigidTy::Adt` with `FieldsShape::Arbitrary`,
+  `VariantsShape::Single(0)`, integer leaf fields or `()`, and explicit
+  inter-field and trailing padding);
+* `StorageLive(_i)` and `StorageDead(_i)` of scalar-family or thin raw pointer
+  locals (`StorageDead` only of temporaries, as MiniRust's well-formedness check
+  requires), and `Deinit(_i)` of a scalar-family or thin raw pointer root local,
+  which `minimize` does not translate and we translate to
+  `Statement::Deinit(PlaceExpr::Local(_i))`;
 * scalar-family operands may be `copy` or `move` of `_j`, `_j.0`, or `_j.1` (and
   integer operands may also `copy` an array element `_j[p]` or a nested
   tuple/struct scalar field chain `_j.f1...fk`). `minimize` translates `move`
@@ -286,14 +289,20 @@ Upstream `minimize` rejects `ConstantIndex` (`span_bug!`); `translateFn` lowers
 it to `PlaceExpr::Index` with the constant `usize` index `offset` (or
 `N - offset` when `from_end`), which is the index MIR defines for it.
 
-`translateFn` also transcribes `minimize`'s raw pointer cases, although
-`inFragment` does not admit them yet (see the gaps): `*const T` / `*mut T`
-become `Type::Ptr(PtrType::Raw { meta_kind })` (`rawPtrTypeOf`),
-`&raw const p` / `&raw mut p` become `ValueExpr::AddrOf` at the thin raw
-pointer type, `*_j` becomes `PlaceExpr::Deref(Load(_j), T)`, a `PtrToPtr` cast
-between thin raw pointers is its operand, and `Offset(l, r)` becomes
+`translateFn` also transcribes `minimize`'s raw pointer cases, and `inFragment`
+admits thin raw pointer temporaries (`*const T` / `*mut T` to integer pointees)
+under `ptrAliasingOk` (see the gaps for excluded raw pointer constructs):
+`*const T` / `*mut T` become `Type::Ptr(PtrType::Raw { meta_kind })`
+(`rawPtrTypeOf`), `&raw const p` / `&raw mut p` on parameter places
+(`ptrTargetSpec`: an integer parameter local `_k`, an in-bounds `ConstantIndex`
+element of an array parameter, or a scalar field chain of a `TupleSpec`
+parameter) become `ValueExpr::AddrOf` at the thin raw pointer type, `*_j`
+becomes `PlaceExpr::Deref(Load(_j), T)`, a `PtrToPtr` cast between thin raw
+pointers is its operand (admitted by `inFragment` when pointee types match and
+mutability is not added), and `Offset(l, r)` becomes
 `PtrOffset { inbounds: true }(l, MulUnchecked(r, size_of::<T>()))`
-(`ptrOffsetExpr`). `minimize`'s translation of `PointerExposeProvenance` and
+(`ptrOffsetExpr`, admitted by `inFragment` when `r` is the constant `0` via
+`zeroOffsetConstOk`). `minimize`'s translation of `PointerExposeProvenance` and
 `PointerWithExposedProvenance` casts, which ends the block with an intrinsic
 call and continues in a fresh block, is not transcribed (`translateFn` returns
 `none`).
@@ -302,7 +311,11 @@ call and continues in a fresh block, is not transcribed (`translateFn` returns
 
 `Correspondence/Relation.lean` defines `StateRel body f ctx s m` (for execution
 within MIR blocks) and `StartRel body f ctx s mInit` (for entry at `minimize`'s
-synthesized `f.start` block without requiring a phantom `bb0` machine): the
+synthesized `f.start` block without requiring a phantom `bb0` machine), and
+`Correspondence/Simulation.lean` defines `StateRelN body f ctx s m` (bundling
+`StateRelAt` with `NonScalarLive`, `BorrowsOk`, and `LocalsOk` at
+`ctxWithBorrows body ctx s.memory.borrows` so each Anneal borrow tag is tied to
+the MiniRust address and provenance of its target place): the
 MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
 callee runs `f` at the corresponding program point; a MIR local `_i` is in the
 callee's locals map exactly when Anneal's slot is live (or `_i` is a
@@ -310,37 +323,41 @@ temporary that the init block allocated), pointing to its own `Stack`
 allocation whose bytes are the encoding of a slot (`Uninit` bytes for an
 uninitialized slot, little-endian bytes for an initialized scalar, only `0` or
 `1` for an initialized `bool`, only the tags `255`, `0`, or `1` for an
-initialized `Ordering`, concatenated element encodings for an initialized
-`[T; N]` array, and field encodings placed at compiler layout offsets with
-`AbstractByte::Uninit` preserved at all inter-field and trailing padding bytes
-for `(Int, bool)` and `TupleSpec` tuples/structs; `LocalsOk`, with non-scalar
-array and `TupleSpec` arguments remaining live and initialized under
-`StateRelN`); MiniRust's bytes encode Anneal's slots except for locals that
-Anneal's `move` de-initialized and that `movesOk` keeps unread (`StaleOk`); the
-caller's return place is a live, large-enough, aligned allocation and the
-caller's allocations and initial argument allocations lie below `2^32`, clear
-of `BM.pickAddr`'s candidates (`CtxOk`); and Anneal's memory has no borrows,
-protectors, call stack, or caller-owned referents. `ctx` fixes everything the
-callee does not determine: caller frame, unwind payloads, the allocations below
-the callee's locals, the addresses of the return place and the arguments
-(arbitrary below `2^32`, subject to alignment and in-bounds size), and the
-caller's continuation.
+initialized `Ordering`, 8-byte `ptrBytes` carrying the target allocation's
+provenance and byte address for an initialized thin raw pointer, concatenated
+element encodings for an initialized `[T; N]` array, and field encodings placed
+at compiler layout offsets with `AbstractByte::Uninit` preserved at all
+inter-field and trailing padding bytes for `(Int, bool)` and `TupleSpec`
+tuples/structs; `LocalsOk`, with non-scalar array and `TupleSpec` arguments
+remaining live and initialized under `StateRelN`); MiniRust's bytes encode
+Anneal's slots except for locals that Anneal's `move` de-initialized and that
+`movesOk` keeps unread (`StaleOk`, with address-taken locals never moved so
+`StaleOk.addrTaken_eq` holds); the caller's return place is a live,
+large-enough, aligned allocation and the caller's allocations and initial
+argument allocations lie below `2^32`, clear of `BM.pickAddr`'s candidates
+(`CtxOk`); and Anneal's memory has no protectors, call stack, or caller-owned
+referents, while its borrow table satisfies `BorrowsOk` (empty for all-scalar
+bodies). `ctx` fixes everything the callee does not determine: caller frame,
+unwind payloads, the allocations below the callee's locals, the addresses of
+the return place and the arguments (arbitrary below `2^32`, subject to
+alignment and in-bounds size), and the caller's continuation.
 
 ### Theorems
 
 All proofs are complete; `Audit.lean` fails the build unless each of the
 following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 
-* `step_correspondence` (`Simulation.lean`): for a fragment body, its
-  translation, and related states, one step of Anneal's coalgebra
-  `stepMirFn body s` and one `Machine::step` satisfy `StepRel`: a silent
-  Anneal step and an Anneal branch observation (the `switchInt` leakage tag)
-  match a MiniRust step to a related state; an Anneal normal return of `v`
-  matches a MiniRust step that pops the callee, writes the encoding of `v`
-  to the caller's return place, deallocates every callee local, and continues
-  the caller (`ReturnRel`); Anneal UB matches MiniRust UB (`throw_ub!`, never a
-  spec panic, deadlock, or unsupported construct); every other Anneal outcome,
-  including `unsupported`, is impossible.
+* `step_correspondence_N`, `step_correspondence` (`Simulation.lean`): for a
+  fragment body, its translation, and `StateRelN`-related states (or `StateRel`
+  for all-scalar bodies), one step of Anneal's coalgebra
+  `stepMirFn body s` and one `Machine::step` satisfy `StepRelN` / `StepRel`: a
+  silent Anneal step and an Anneal branch observation (the `switchInt` leakage
+  tag) match a MiniRust step to a `StateRelN`-related state; an Anneal normal
+  return of `v` matches a MiniRust step that pops the callee, writes the
+  encoding of `v` to the caller's return place, deallocates every callee local,
+  and continues the caller (`ReturnRel`); Anneal UB matches MiniRust UB
+  (`throw_ub!`, never a spec panic, deadlock, or unsupported construct); every
+  other Anneal outcome, including `unsupported`, is impossible.
 * `iterMovedEntries_stabilizes`, `movesOk_iff_blockMovesOk`,
   `movedAtEntry_least`, `blockMovesOk_antitone`, `movesOk_of_preFixedPoint`,
   `movesOk_iff_exists_preFixedPoint` (`Simulation.lean`): unconditional
@@ -348,40 +365,45 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   Knaster–Tarski least fixed-point optimality, antitonicity of `blockMovesOk`,
   and Park-induction soundness and completeness for inductive pre-fixed-point
   certificates on well-typed CFGs.
-* `step_start`, `initMachineState_startRel` (`Simulation.lean`): proves for
-  every translated function `f` that `initMachineState body args` (with
-  `argsOk body args = true` and `CtxOk body ctx`) satisfies `StartRel` at
+* `step_start_N`, `step_start`, `initMachineState_startRel` (`Simulation.lean`):
+  proves for every translated function `f` that `initMachineState body args`
+  (with `argsOk body args = true` and `CtxOk body ctx`) satisfies `StartRel` at
   `f.start`, and that `minimize`'s synthesized entry block
   (`f.start = bbName body.basicBlocks.length`: `StorageLive` of each temporary
   of `alwaysStorageLiveLocals`, then `Goto(bb0)`) runs in `initLen body` steps
-  to `StateRel`.
-* `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start`,
-  `mirCall_ret`, `mirCall_ub` (`Run.lean`): lifted to Anneal's interaction
-  trees `mirTree body s` and `mirCallTree body args`: if Anneal returns `v` (or
-  can reach UB), then MiniRust started either at `bb0` or at `f.start` performs
-  the corresponding return (or raises UB) within finitely many steps.
-* `steps_error`, `steps_error_from_start`, `mirCall_steps_error` (`Run.lean`):
-  conversely, if MiniRust stops with *any* error within `n` steps from
-  `StateRel`, `StartRel`, or `mirCallTree body args`, either the error is UB and
-  Anneal can reach UB, or MiniRust already completed the callee's return
-  (`ReturnRel`, matching an Anneal `ReachesRet`) in `k < n` steps and only
-  errored later inside the unmodeled caller frame.
-* `mirNoUB_safe`, `mirNoUB_safe_from_start`, `mirCall_noUB`, `runA_noUB`
-  (`Run.lean`): if Anneal's interaction tree satisfies `MirNoUBTree`
+  to `StateRelN` (and `StateRel`).
+* `reaches_rel_N`, `reaches_rel`, `run_ret_N`, `run_ret`, `run_ub_N`, `run_ub`,
+  `run_ret_from_start`, `run_ub_from_start`, `mirCall_ret`, `mirCall_ub`
+  (`Run.lean`): lifted to Anneal's interaction trees `mirTree body s` and
+  `mirCallTree body args`: if Anneal returns `v` (or can reach UB), then
+  MiniRust started either at `bb0` or at `f.start` performs the corresponding
+  return (or raises UB) within finitely many steps.
+* `steps_error_N`, `steps_error`, `steps_error_from_start`,
+  `mirCall_steps_error` (`Run.lean`): conversely, if MiniRust stops with *any*
+  error within `n` steps from `StateRelN`, `StateRel`, `StartRel`, or
+  `mirCallTree body args`, either the error is UB and Anneal can reach UB, or
+  MiniRust already completed the callee's return (`ReturnRel`, matching an
+  Anneal `ReachesRet`) in `k < n` steps and only errored later inside the
+  unmodeled caller frame.
+* `mirNoUB_safe_N`, `mirNoUB_safe`, `mirNoUB_safe_from_start`, `mirCall_noUB`,
+  `runA_noUB` (`Run.lean`): if Anneal's interaction tree satisfies `MirNoUBTree`
   (`TreeSafe`), MiniRust never stops with any error (`.ub`, `.specPanic`,
   `.deadlock`, or `.unsupported`) anywhere during the callee's execution.
-* `steps_outcome`, `steps_outcome_from_start`, `mirCall_outcome`,
-  `mirNoUB_progress`, `mirNoUB_progress_from_start`, `mirCall_progress`,
-  `mirNoUB_diverges_steps_ok`, `mirNoUB_diverges_from_start`,
+* `steps_outcome_N`, `steps_outcome`, `steps_outcome_N_from_start`,
+  `steps_outcome_from_start`, `mirCall_outcome_N`, `mirCall_outcome`,
+  `mirNoUB_progress_N`, `mirNoUB_progress`, `mirNoUB_progress_N_from_start`,
+  `mirNoUB_progress_from_start`, `mirCall_progress_N`, `mirCall_progress`,
+  `mirNoUB_diverges_steps_ok_N`, `mirNoUB_diverges_steps_ok`,
+  `mirNoUB_diverges_from_start`, `mirNoUB_diverges_rel_N_from_start`,
   `mirNoUB_diverges_rel_from_start`, `mirCall_diverges_steps_ok`,
-  `mirCall_diverges_rel`, `treeSafe_of_step_inv`, `noRet_of_step_inv`,
-  `treeSafe_of_tau_inv`, `noRet_of_tau_inv` (`Run.lean`): total `n`-step
-  outcome trichotomy and forward progress for all `n : Nat` (either still
-  running in lockstep `StateRel`, already returned via `ReturnRel` in `k ≤ n`
-  steps, or stopped with `.ub` matching `FaultNow`), specializing under
-  `MirNoUBTree` and non-termination to prove that diverging UB-free loops
-  (both silent-step and branch-observing) step forever in lockstep
-  `StateRel` + `Reaches`.
+  `mirCall_diverges_rel_N`, `mirCall_diverges_rel`, `treeSafe_of_step_inv`,
+  `noRet_of_step_inv`, `treeSafe_of_tau_inv`, `noRet_of_tau_inv` (`Run.lean`):
+  total `n`-step outcome trichotomy and forward progress for all `n : Nat`
+  (either still running in lockstep `StateRelN` / `StateRel`, already returned
+  via `ReturnRel` in `k ≤ n` steps, or stopped with `.ub` matching `FaultNow`),
+  specializing under `MirNoUBTree` and non-termination to prove that diverging
+  UB-free loops (both silent-step and branch-observing) step forever in lockstep
+  `StateRelN` / `StateRel` + `Reaches`.
 
 ### Witnesses
 
@@ -674,16 +696,23 @@ statement-level lemmas of `Correspondence/PointerStep.lean` on which
 `step_correspondence_N` rests for raw pointers. Both semantics agree
 on `ptrRoundTrip` (`&raw mut x`, a read and a write through the pointer, a
 `PtrToPtr` cast, and a read through the cast pointer; `6` for `x = 5`),
-`arrayElemPtr` (`&raw mut a[1]`), and `fieldPtr` (`&raw mut s.1` at byte
-offset `4` of `Padded`), and both raise UB on `dangling` (a read after
-`StorageDead`). `ptrRoundTrip` and `fieldPtr` are in the fragment
-(`ptrRoundTrip_inFragment`, `fieldPtr_inFragment`), and
-`ptrRoundTrip_minirust_ret_from_start` derives MiniRust's return from Anneal's
-through `mirCall_ret`. The remaining witnesses are the divergences listed under
-the gaps, each outside the fragment (`*_notInFragment`): `offsetDeref`
-(`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in Anneal;
-`offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB in
-MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
+`arrayParamPtr` (disjoint `&raw mut a[-2]` and `&raw mut a[-1]` borrows on an
+array parameter `a: [u32; 2]` with `fromEnd = true`, `Offset(p, 0)`, `move`
+and `StorageDead`/`Deinit` on pointer temporaries, and dereference reads and
+writes through both pointers; `19` for `a = [5, 7]`), `arrayElemPtr`
+(`&raw mut a[1]` on a temporary array; `12`), and `fieldPtr` (`&raw mut s.1`
+at byte offset `4` of `Padded`; `100`), and both raise UB on
+`uninitPtrReadUb` and `uninitPtrWriteUb` (reading or writing through an
+uninitialized raw pointer temporary) and `dangling` (a read after
+`StorageDead`). `ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `uninitPtrReadUb`,
+and `uninitPtrWriteUb` are in the fragment (`*_inFragment`) and proved end to
+end through `mirCall_ret`, `mirCall_noUB`, `mirCall_progress_N`, `mirCall_ub`,
+`mirCall_steps_error`, and `mirCall_outcome_N`. The remaining witnesses are the
+divergences listed under the gaps (plus `arrayElemPtr` and `dangling`, which
+borrow temporaries), each outside the fragment (`*_notInFragment`):
+`offsetDeref` (`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in
+Anneal; `offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB
+in MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
 `exposeTwice` (`0` in MiniRust, `65536` in Anneal), and `directWrite` and
 `frozenWrite` (UB in Anneal only).
 

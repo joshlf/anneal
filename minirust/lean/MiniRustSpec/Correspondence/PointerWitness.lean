@@ -19,12 +19,13 @@ semantics (`runA_sound`, `faultsA_sound`) and, after `minimize`'s translation
 (`translateFn`), in the MiniRust interpretation (`Interp.steps`), both by kernel
 computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`).
 
-`ptrRoundTrip` and `fieldPtr` lie in the correspondence fragment
-(`ptrRoundTrip_inFragment`, `fieldPtr_inFragment`), so the correspondence
-theorems apply to them: `ptrRoundTrip_minirust_ret_from_start` derives
-MiniRust's return from Anneal's through `mirCall_ret` rather than by running
-MiniRust. Every divergent witness below, and `dangling`, lies outside the
-fragment (`*_notInFragment`): the fragment borrows (`&raw`) only parameters,
+`ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `uninitPtrReadUb`, and
+`uninitPtrWriteUb` lie in the correspondence fragment (`*_inFragment`), so the
+end-to-end correspondence theorems (`mirCall_ret`, `mirCall_ub`, `mirCall_noUB`,
+`mirCall_progress_N`, `mirCall_steps_error`, `mirCall_outcome_N`) apply to them
+directly. `arrayElemPtr` (borrowing a non-parameter `[u32; 2]` temporary),
+`dangling`, and every divergent witness below lie outside the fragment
+(`*_notInFragment`): the fragment borrows (`&raw`) only parameters,
 which it never writes directly (`directWrite`) nor kills (`dangling`), casts
 pointers (`PtrToPtr`) only between equal pointee types and never from `*const`
 to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
@@ -35,13 +36,20 @@ to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
 
 * `ptrRoundTrip`: `&raw mut x`, a read and a write through the pointer, a
   `PtrToPtr` cast to `*const u32`, and a read through the cast pointer;
+* `arrayParamPtr`: two disjoint `&raw mut` borrows (`&raw mut a[0]` and
+  `&raw mut a[-1]` with `fromEnd = true`) on a `[u32; 2]` parameter `a`,
+  `Offset(p, 0)`, `move` of a pointer temporary, `StorageDead` and `Deinit` on
+  pointer temporaries, `copy (*p)` and `move (*p)`, and writes through both
+  `*mut` pointers confirming neither disables the other's borrow tag;
 * `arrayElemPtr`: `&raw mut a[1]` (`ConstantIndex`) on a `[u32; 2]` temporary,
   read and written through the pointer;
 * `fieldPtr`: `&raw mut s.1` on the padded struct `Padded(u8, u32, u16)` (field
   at byte offset `4`), read and written through the pointer;
 
-and both raise UB for `dangling`, a read through a pointer to a temporary after
-its `StorageDead`.
+and both raise UB for `uninitPtrReadUb` (reading through an uninitialized
+pointer temporary), `uninitPtrWriteUb` (writing through an uninitialized `*mut`
+pointer temporary), and `dangling` (a read through a pointer to a temporary
+after its `StorageDead`).
 
 **Divergence, Anneal unsound.** Anneal returns a value where MiniRust, the
 ground truth, returns a different value or raises UB:
@@ -203,6 +211,10 @@ theorem ptrRoundTrip_anneal_ret :
         { ptrRoundTripS0.memory with borrows := [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
   runA_sound ptrRoundTrip 30 _ _ _ rfl
 
+theorem ptrRoundTrip_noUB :
+    MirNoUBTree (mirCallTree ptrRoundTrip [.scalar ⟨5, 4⟩]) :=
+  runA_noUB ptrRoundTrip 30 _ _ _ rfl
+
 /-- MiniRust returns `6` too, after ten steps (the init block's `Goto`, nine
 statements, and `Return`). -/
 theorem ptrRoundTrip_minirust_direct :
@@ -259,7 +271,186 @@ theorem ptrRoundTrip_minirust_ret_from_start :
   refine ⟨n, m', hsteps, ?_, hthr⟩
   rw [hallocs]; rfl
 
-/-! ## `&raw mut a[1]` on an array -/
+theorem ptrRoundTrip_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n ptrRoundTripMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k ptrRoundTripMInit = .ok mRet ∧
+      ReturnRel ptrRoundTrip ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree ptrRoundTrip [.scalar ⟨5, 4⟩]) tr (.normal (v, mem)) :=
+  mirCall_noUB ptrRoundTrip_inFragment ptrRoundTrip_translate ctx0 ptrRoundTrip_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_noUB herr
+
+theorem ptrRoundTrip_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) ptrRoundTripMInit = .ok m' ∧
+      StateRelN ptrRoundTrip ptrRoundTripFn ctx0 s' m' ∧
+      Reaches (mirCallTree ptrRoundTrip [.scalar ⟨5, 4⟩]) tr (mirTree ptrRoundTrip s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k ptrRoundTripMInit = .ok mRet ∧
+      ReturnRel ptrRoundTrip ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree ptrRoundTrip [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress_N ptrRoundTrip_inFragment ptrRoundTrip_translate ctx0 ptrRoundTrip_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) ptrRoundTripMInit rfl rfl rfl ptrRoundTrip_noUB n
+
+/-! ## `&raw mut a[-2]` and `&raw mut a[-1]` on an array parameter -/
+
+def arrU32_2Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiArrU32_2Arg : FnAbi :=
+  { args := [{ layout := arrU32_2Layout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- MIR of a function taking `mut a: [u32; 2]` and exercising:
+* two disjoint `&raw mut` borrows on `_1` in `bb0`:
+  `_2 = &raw mut _1[-2 of 2]` (`fromEnd = true`, `offset = 2`, `minLen = 2`,
+  resolving to index `2 - 2 = 0` at byte offset `0`) and
+  `_3 = &raw mut _1[-1 of 2]` (`fromEnd = true`, `offset = 1`, `minLen = 2`,
+  resolving to index `2 - 1 = 1` at byte offset `4`);
+* `Offset(copy _3, const 0_usize)` (`zeroOffsetConstOk`);
+* `move _2` of a pointer temporary;
+* `StorageDead(_2)` and `Deinit(_3)` on pointer temporaries;
+* `copy (*_5)` and `move (*_4)`;
+* dereference writes through both `*mut` pointers (`(*_5) = ...` and
+  `(*_4) = ...`), confirming that writing through tag `0` does not disable tag `1`. -/
+def arrayParamPtr : CapturedMir :=
+  { ptrBody "witness::array_param_ptr"
+      [u32Decl, arrU32_2Decl, ptrMutU32Decl, ptrMutU32Decl, ptrMutU32Decl,
+       ptrMutU32Decl, u32Decl, u32Decl, u32Decl]
+      [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+       .storageLive 6, .storageLive 7, .storageLive 8,
+       .assign (local_ 2) (.rawPtr .mut (placeConstIdx 1 2 2 true)),
+       .assign (local_ 3) (.rawPtr .mut (placeConstIdx 1 1 2 true)),
+       .assign (local_ 4) (.binaryOp .offset (.copy (local_ 3)) (constUsize 0)),
+       .assign (local_ 5) (.use (.move (local_ 2))),
+       .storageDead 2,
+       .deinit (local_ 3),
+       .assign (local_ 6) (.use (.copy (derefPlace 5))),
+       .assign (local_ 7) (.use (.move (derefPlace 4))),
+       .assign (derefPlace 5) (.binaryOp .add (.copy (local_ 6)) (.copy (local_ 7))),
+       .assign (local_ 8) (.use (.copy (derefPlace 5))),
+       .assign (derefPlace 4) (.binaryOp .add (.copy (local_ 8)) (.copy (local_ 7))),
+       .assign (local_ 0) (.use (.copy (derefPlace 4)))] with
+    fnAbi := fnAbiArrU32_2Arg }
+
+theorem arrayParamPtr_inFragment : inFragment arrayParamPtr = true := by decide
+
+def arrayParamPtrFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Array (.Int u32) 2),
+    (localName 2, thinRawPtrTy), (localName 3, thinRawPtrTy),
+    (localName 4, thinRawPtrTy), (localName 5, thinRawPtrTy),
+    (localName 6, .Int u32), (localName 7, .Int u32), (localName 8, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4), .StorageLive (localName 5),
+      .StorageLive (localName 6), .StorageLive (localName 7), .StorageLive (localName 8),
+      .Assign (.Local (localName 2))
+        (.AddrOf (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))) (.Raw .None)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Index (.Local (localName 1)) (.Constant (.Int 1) (.Int usizeIt))) (.Raw .None)),
+      .Assign (.Local (localName 4))
+        (.BinOp (.PtrOffset true) (.Load (.Local (localName 3)))
+          (.BinOp (.Int .MulUnchecked) (.Constant (.Int 0) (.Int usizeIt))
+            (.Constant (.Int 4) (.Int usizeIt)))),
+      .Assign (.Local (localName 5)) (.Load (.Local (localName 2))),
+      .StorageDead (localName 2),
+      .Deinit (.Local (localName 3)),
+      .Assign (.Local (localName 6)) (.Load (.Deref (.Load (.Local (localName 5))) (.Int u32))),
+      .Assign (.Local (localName 7)) (.Load (.Deref (.Load (.Local (localName 4))) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 5))) (.Int u32))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 6))) (.Load (.Local (localName 7)))),
+      .Assign (.Local (localName 8)) (.Load (.Deref (.Load (.Local (localName 5))) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 4))) (.Int u32))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 8))) (.Load (.Local (localName 7)))),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 4))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem arrayParamPtr_translate : translateFn arrayParamPtr = some arrayParamPtrFn := rfl
+
+def initArrU32_2 : Value := .aggregate 0 [.scalar ⟨5, 4⟩, .scalar ⟨7, 4⟩]
+
+def arrayParamPtrS0 : MachineState := initMachineState arrayParamPtr [initArrU32_2]
+
+theorem arrayParamPtr_anneal_ret :
+    ReachesRet (mirTree arrayParamPtr arrayParamPtrS0) []
+      (.normal (.scalar ⟨19, 4⟩,
+        { arrayParamPtrS0.memory with
+          borrows := [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 true),
+                      rawPtrEntry 1 .mut (placeConstIdx 1 2 2 true)],
+          nextTag := 3 })) :=
+  runA_sound arrayParamPtr 40 _ _ _ rfl
+
+theorem arrayParamPtr_noUB :
+    MirNoUBTree (mirCallTree arrayParamPtr [initArrU32_2]) :=
+  runA_noUB arrayParamPtr 40 _ _ _ rfl
+
+theorem arrayParamPtr_ctxOk : CtxOk arrayParamPtr ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : arrayParamPtr.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [arrayParamPtr, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [arrayParamPtr, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : arrayParamPtr.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [arrayParamPtr, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def arrayParamPtrMInit : Mach :=
+  machine arrayParamPtr arrayParamPtrFn arrayParamPtrS0.frame.locals arrayParamPtrFn.start
+
+theorem arrayParamPtr_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n arrayParamPtrMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 19 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret arrayParamPtr_inFragment arrayParamPtr_translate ctx0 arrayParamPtr_ctxOk
+      [initArrU32_2] (by decide) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [arrayParamPtr, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem arrayParamPtr_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n arrayParamPtrMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k arrayParamPtrMInit = .ok mRet ∧
+      ReturnRel arrayParamPtr ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree arrayParamPtr [initArrU32_2]) tr (.normal (v, mem)) :=
+  mirCall_noUB arrayParamPtr_inFragment arrayParamPtr_translate ctx0 arrayParamPtr_ctxOk
+    [initArrU32_2] (by decide) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_noUB herr
+
+theorem arrayParamPtr_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) arrayParamPtrMInit = .ok m' ∧
+      StateRelN arrayParamPtr arrayParamPtrFn ctx0 s' m' ∧
+      Reaches (mirCallTree arrayParamPtr [initArrU32_2]) tr (mirTree arrayParamPtr s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k arrayParamPtrMInit = .ok mRet ∧
+      ReturnRel arrayParamPtr ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree arrayParamPtr [initArrU32_2]) tr (.normal (v, mem))) :=
+  mirCall_progress_N arrayParamPtr_inFragment arrayParamPtr_translate ctx0 arrayParamPtr_ctxOk
+    [initArrU32_2] (by decide) arrayParamPtrMInit rfl rfl rfl arrayParamPtr_noUB n
+
+theorem arrayParamPtr_minirust_direct :
+    retAfter arrayParamPtr [initArrU32_2] 21 =
+      some (some { retAlloc with data := scalarBytes u32 19 }, [1]) := by
+  decide +kernel
+
+/-! ## `&raw mut a[1]` on an array temporary (outside fragment) -/
 
 /-- MIR of
 ```rust
@@ -279,6 +470,10 @@ def arrayElemPtr : CapturedMir :=
      .storageLive 4, .assign (local_ 4) (.use (.copy (derefPlace 3))),
      .assign (derefPlace 3) (.binaryOp .add (.copy (local_ 4)) (.copy (local_ 1))),
      .assign (local_ 0) (.use (.copy (placeConstIdx 2 1 2 false)))]
+
+/-- `arrayElemPtr` borrows the non-parameter array temporary `_2`, so it lies
+outside the fragment (`ptrTargetSpec` requires `1 ≤ k ≤ argCount`). -/
+theorem arrayElemPtr_notInFragment : inFragment arrayElemPtr = false := by decide +kernel
 
 theorem arrayElemPtr_anneal_ret :
     ∃ mem, ReachesRet (mirTree arrayElemPtr (initMachineState arrayElemPtr [.scalar ⟨5, 4⟩])) []
@@ -317,14 +512,266 @@ def fieldPtr : CapturedMir :=
 /-- `fieldPtr` lies in the correspondence fragment. -/
 theorem fieldPtr_inFragment : inFragment fieldPtr = true := by decide
 
+def fieldPtrFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, paddedMiniRustTy),
+    (localName 2, thinRawPtrTy), (localName 3, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.AddrOf (.Field (.Local (localName 1)) 1) (.Raw .None)),
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 3)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 3))) (.Constant (.Int 1) (.Int u32))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem fieldPtr_translate : translateFn fieldPtr = some fieldPtrFn := rfl
+
+def fieldPtrS0 : MachineState := initMachineState fieldPtr [initPaddedStruct]
+
 theorem fieldPtr_anneal_ret :
-    ∃ mem, ReachesRet (mirTree fieldPtr (initMachineState fieldPtr [initPaddedStruct])) []
-      (.normal (.scalar ⟨100, 4⟩, mem)) :=
-  ⟨_, runA_sound fieldPtr 30 _ _ _ rfl⟩
+    ReachesRet (mirTree fieldPtr fieldPtrS0) []
+      (.normal (.scalar ⟨100, 4⟩,
+        { fieldPtrS0.memory with
+          borrows := [rawPtrEntry 1 .mut (placeField 1 [(1, u32Ty)])], nextTag := 2 })) :=
+  runA_sound fieldPtr 30 _ _ _ rfl
+
+theorem fieldPtr_noUB :
+    MirNoUBTree (mirCallTree fieldPtr [initPaddedStruct]) :=
+  runA_noUB fieldPtr 30 _ _ _ rfl
+
+theorem fieldPtr_ctxOk : CtxOk fieldPtr ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : fieldPtr.layouts = paddedLayouts := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [fieldPtr, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [fieldPtr, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : fieldPtr.layouts = paddedLayouts := rfl
+    rw [hlay]
+    simp [fieldPtr, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def fieldPtrMInit : Mach :=
+  machine fieldPtr fieldPtrFn fieldPtrS0.frame.locals fieldPtrFn.start
+
+theorem fieldPtr_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n fieldPtrMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 100 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret fieldPtr_inFragment fieldPtr_translate ctx0 fieldPtr_ctxOk
+      [initPaddedStruct] (by decide) fieldPtrMInit rfl rfl rfl fieldPtr_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [fieldPtr, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem fieldPtr_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n fieldPtrMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k fieldPtrMInit = .ok mRet ∧
+      ReturnRel fieldPtr ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree fieldPtr [initPaddedStruct]) tr (.normal (v, mem)) :=
+  mirCall_noUB fieldPtr_inFragment fieldPtr_translate ctx0 fieldPtr_ctxOk
+    [initPaddedStruct] (by decide) fieldPtrMInit rfl rfl rfl fieldPtr_noUB herr
+
+theorem fieldPtr_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) fieldPtrMInit = .ok m' ∧
+      StateRelN fieldPtr fieldPtrFn ctx0 s' m' ∧
+      Reaches (mirCallTree fieldPtr [initPaddedStruct]) tr (mirTree fieldPtr s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k fieldPtrMInit = .ok mRet ∧
+      ReturnRel fieldPtr ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree fieldPtr [initPaddedStruct]) tr (.normal (v, mem))) :=
+  mirCall_progress_N fieldPtr_inFragment fieldPtr_translate ctx0 fieldPtr_ctxOk
+    [initPaddedStruct] (by decide) fieldPtrMInit rfl rfl rfl fieldPtr_noUB n
 
 theorem fieldPtr_minirust_direct :
     retAfter fieldPtr [initPaddedStruct] 8 =
       some (some { retAlloc with data := scalarBytes u32 100 }, [1]) := by
+  decide +kernel
+
+/-! ## Uninitialized pointer dereference UB (in fragment) -/
+
+/-- Reading through an uninitialized `*const u32` pointer temporary `_2`:
+```text
+StorageLive(_2); _0 = copy (*_2); return
+```
+-/
+def uninitPtrReadUb : CapturedMir :=
+  ptrBody "witness::uninit_ptr_read_ub" [u32Decl, u32Decl, ptrConstU32Decl]
+    [.storageLive 2,
+     .assign (local_ 0) (.use (.copy (derefPlace 2)))]
+
+theorem uninitPtrReadUb_inFragment : inFragment uninitPtrReadUb = true := by decide
+
+def uninitPtrReadUbFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitPtrReadUb_translate : translateFn uninitPtrReadUb = some uninitPtrReadUbFn := rfl
+
+def uninitPtrReadUbS0 : MachineState := initMachineState uninitPtrReadUb [.scalar ⟨5, 4⟩]
+def uninitPtrReadUbMInit : Mach :=
+  machine uninitPtrReadUb uninitPtrReadUbFn uninitPtrReadUbS0.frame.locals uninitPtrReadUbFn.start
+
+theorem uninitPtrReadUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uninitPtrReadUb 10 _ (by decide)
+
+theorem uninitPtrReadUb_ctxOk : CtxOk uninitPtrReadUb ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : uninitPtrReadUb.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [uninitPtrReadUb, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [uninitPtrReadUb, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : uninitPtrReadUb.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [uninitPtrReadUb, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem uninitPtrReadUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitPtrReadUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitPtrReadUb_anneal_ub
+  exact mirCall_ub uninitPtrReadUb_inFragment uninitPtrReadUb_translate ctx0 uninitPtrReadUb_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) uninitPtrReadUbMInit rfl rfl rfl hr hf
+
+theorem uninitPtrReadUb_converse_error {n : Nat} {e : Stop}
+    (herr : Interp.steps n uninitPtrReadUbMInit = .error e) :
+    (∃ msg, e = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k uninitPtrReadUbMInit = .ok mRet ∧
+      ReturnRel uninitPtrReadUb ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_steps_error uninitPtrReadUb_inFragment uninitPtrReadUb_translate ctx0 uninitPtrReadUb_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) uninitPtrReadUbMInit rfl rfl rfl herr
+
+theorem uninitPtrReadUb_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) uninitPtrReadUbMInit = .ok m' ∧
+      StateRelN uninitPtrReadUb uninitPtrReadUbFn ctx0 s' m' ∧
+      Reaches (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr (mirTree uninitPtrReadUb s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k uninitPtrReadUbMInit = .ok mRet ∧
+      ReturnRel uninitPtrReadUb ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (1 + n) uninitPtrReadUbMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree uninitPtrReadUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) :=
+  mirCall_outcome_N uninitPtrReadUb_inFragment uninitPtrReadUb_translate ctx0 uninitPtrReadUb_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) uninitPtrReadUbMInit rfl rfl rfl n
+
+theorem uninitPtrReadUb_minirust_direct :
+    ubAfter uninitPtrReadUb [.scalar ⟨5, 4⟩] 3 =
+      some "load at type but the data in memory violates the language invariant" := by
+  decide +kernel
+
+/-- Writing through an uninitialized `*mut u32` pointer temporary `_2`:
+```text
+StorageLive(_2); (*_2) = copy _1; _0 = copy _1; return
+```
+-/
+def uninitPtrWriteUb : CapturedMir :=
+  ptrBody "witness::uninit_ptr_write_ub" [u32Decl, u32Decl, ptrMutU32Decl]
+    [.storageLive 2,
+     .assign (derefPlace 2) (.use (.copy (local_ 1))),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+theorem uninitPtrWriteUb_inFragment : inFragment uninitPtrWriteUb = true := by decide
+
+def uninitPtrWriteUbFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32)) (.Load (.Local (localName 1))),
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 1)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem uninitPtrWriteUb_translate : translateFn uninitPtrWriteUb = some uninitPtrWriteUbFn := rfl
+
+def uninitPtrWriteUbS0 : MachineState := initMachineState uninitPtrWriteUb [.scalar ⟨5, 4⟩]
+def uninitPtrWriteUbMInit : Mach :=
+  machine uninitPtrWriteUb uninitPtrWriteUbFn uninitPtrWriteUbS0.frame.locals uninitPtrWriteUbFn.start
+
+theorem uninitPtrWriteUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree uninitPtrWriteUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound uninitPtrWriteUb 10 _ (by decide)
+
+theorem uninitPtrWriteUb_ctxOk : CtxOk uninitPtrWriteUb ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : uninitPtrWriteUb.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [uninitPtrWriteUb, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [uninitPtrWriteUb, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : uninitPtrWriteUb.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [uninitPtrWriteUb, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem uninitPtrWriteUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n uninitPtrWriteUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := uninitPtrWriteUb_anneal_ub
+  exact mirCall_ub uninitPtrWriteUb_inFragment uninitPtrWriteUb_translate ctx0 uninitPtrWriteUb_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) uninitPtrWriteUbMInit rfl rfl rfl hr hf
+
+theorem uninitPtrWriteUb_converse_error {n : Nat} {e : Stop}
+    (herr : Interp.steps n uninitPtrWriteUbMInit = .error e) :
+    (∃ msg, e = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree uninitPtrWriteUb [.scalar ⟨5, 4⟩]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k uninitPtrWriteUbMInit = .ok mRet ∧
+      ReturnRel uninitPtrWriteUb ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree uninitPtrWriteUb [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_steps_error uninitPtrWriteUb_inFragment uninitPtrWriteUb_translate ctx0 uninitPtrWriteUb_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) uninitPtrWriteUbMInit rfl rfl rfl herr
+
+theorem uninitPtrWriteUb_minirust_direct :
+    ubAfter uninitPtrWriteUb [.scalar ⟨5, 4⟩] 3 =
+      some "load at type but the data in memory violates the language invariant" := by
   decide +kernel
 
 /-! ## Dangling pointers -/

@@ -365,8 +365,15 @@ open MiniRustSpec.Correspondence in
   run_ub_N
   steps_error_N
   steps_outcome_N
+  steps_outcome_N_from_start
   mirNoUB_safe_N
   mirNoUB_progress_N
+  mirNoUB_progress_N_from_start
+  mirNoUB_diverges_steps_ok_N
+  mirNoUB_diverges_rel_N_from_start
+  mirCall_progress_N
+  mirCall_outcome_N
+  mirCall_diverges_rel_N
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
@@ -1245,8 +1252,15 @@ open MiniRustSpec.Correspondence in
   run_ub_N
   steps_error_N
   steps_outcome_N
+  steps_outcome_N_from_start
   mirNoUB_safe_N
   mirNoUB_progress_N
+  mirNoUB_progress_N_from_start
+  mirNoUB_diverges_steps_ok_N
+  mirNoUB_diverges_rel_N_from_start
+  mirCall_progress_N
+  mirCall_outcome_N
+  mirCall_diverges_rel_N
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
@@ -1737,6 +1751,139 @@ open MiniRustSpec.Correspondence.Witness in
   tuple_encode_decode_place_edge_cases
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
+#assert_standard_axioms
+  encodePtrBytes_length
+  ptrBytes_length
+  encodePtrBytes_data
+  decodePtrProvenance_encode
+  decodePtrProvenance_none
+  two_pow_ptrBits
+  inBounds_usize
+  lt_two_pow_64_int
+  encode_usize
+  encodePtr_of_encode
+  encodePtr_eq
+  firstProvenance_encodePtrBytes
+  decodePtr_ptrBytes
+  decodePtrProvenance_mixed
+  layout_thinRawPtr
+  decode_thinRawPtr
+  encode_thinRawPtr
+  checkValue_thinRawPtr
+  checkValue_thinRawPtr_oob
+  resolveBorrowProjectionElems_noIndex
+  evalRvalue_rawPtr_local
+  evalOperand_copy_deref
+  evalOperand_copy_deref_disabled
+  writePlaceValue_deref_frozen
+  writePlaceValue_deref_root
+  evalRvalue_offset
+  evalRvalue_ptrToPtr
+  evalRvalue_expose
+  evalRvalue_withExposed
+  ptrAliasingOk_spec
+  StaleOk.addrTaken_eq
+  evalTargetPlace
+  evalPtrLoad
+  BorrowsOk.start
+  BorrowsOk.advance_keep
+  BorrowsOk.advance_set_nonptr
+  BorrowsOk.advance_set_ptr
+  BorrowsOk.advance_storage
+  BorrowsOk.jump
+  BorrowsOk.rawPtr
+  BorrowsOk.invalidateDeref_noop
+  LocalsOk.rawPtr_extend
+  evalStmt_assign_rawPtr
+  evalStmt_assign_derefWrite
+  evalOperand_deref_eq_target
+  evalRvalue_ptrRvalue
+  evalRvalue_derefRead_eq
+  evalPlace_deref
+  evalValue_addrOf
+  evalStatement_assign_rawPtr_mr
+  evalStatement_assign_ptrRvalue_mr
+  evalValue_ptrOffset_zero
+  derefWrite_target
+  statementOk_rawPtr_spec
+  statementOk_derefRead
+  ptrTargetSpec_cases
+  ptrRoundTrip_inFragment
+  ptrRoundTrip_translate
+  ptrRoundTrip_anneal_ret
+  ptrRoundTrip_noUB
+  ptrRoundTrip_minirust_direct
+  ptrRoundTrip_ctxOk
+  ptrRoundTrip_minirust_ret_from_start
+  ptrRoundTrip_minirust_noUB
+  ptrRoundTrip_progress
+  arrayParamPtr_inFragment
+  arrayParamPtr_translate
+  arrayParamPtr_anneal_ret
+  arrayParamPtr_noUB
+  arrayParamPtr_ctxOk
+  arrayParamPtr_minirust_ret_from_start
+  arrayParamPtr_minirust_noUB
+  arrayParamPtr_progress
+  arrayParamPtr_minirust_direct
+  arrayElemPtr_notInFragment
+  arrayElemPtr_anneal_ret
+  arrayElemPtr_minirust_direct
+  fieldPtr_inFragment
+  fieldPtr_translate
+  fieldPtr_anneal_ret
+  fieldPtr_noUB
+  fieldPtr_ctxOk
+  fieldPtr_minirust_ret_from_start
+  fieldPtr_minirust_noUB
+  fieldPtr_progress
+  fieldPtr_minirust_direct
+  uninitPtrReadUb_inFragment
+  uninitPtrReadUb_translate
+  uninitPtrReadUb_anneal_ub
+  uninitPtrReadUb_ctxOk
+  uninitPtrReadUb_minirust_ub_from_start
+  uninitPtrReadUb_converse_error
+  uninitPtrReadUb_outcome
+  uninitPtrReadUb_minirust_direct
+  uninitPtrWriteUb_inFragment
+  uninitPtrWriteUb_translate
+  uninitPtrWriteUb_anneal_ub
+  uninitPtrWriteUb_ctxOk
+  uninitPtrWriteUb_minirust_ub_from_start
+  uninitPtrWriteUb_converse_error
+  uninitPtrWriteUb_minirust_direct
+  dangling_notInFragment
+  dangling_anneal_ub
+  dangling_minirust_direct
+  offsetDeref_notInFragment
+  offsetDeref1_translate
+  offsetDeref2_translate
+  offsetDeref3_translate
+  offsetDerefMax_translate
+  offsetDeref_anneal_ret
+  offsetDeref1_minirust_direct
+  offsetDeref2_minirust_direct
+  offsetDeref3_minirust_direct
+  offsetDerefMax_minirust_direct
+  misaligned_notInFragment
+  misaligned_anneal_ret
+  misaligned_minirust_direct
+  exposeTwice_translate
+  exposeTwice_notInFragment
+  exposeTwice_anneal_ret
+  exposeTwice_minirust_direct
+  directWrite_notInFragment
+  directWrite_anneal_ub
+  directWrite_minirust_direct
+  frozenWrite_notInFragment
+  frozenWrite_anneal_ub
+  frozenWrite_minirust_direct
+  checkPtr_null
+  ptrOffsetWrapping_wraps
+  checkValue_thinRawPtr_bounds
+
+open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
 #check_theorem_deps "[POINTER-AUDIT]"
   encodePtrBytes_length
   ptrBytes_length
@@ -1797,14 +1944,48 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   ptrRoundTrip_inFragment
   ptrRoundTrip_translate
   ptrRoundTrip_anneal_ret
+  ptrRoundTrip_noUB
   ptrRoundTrip_minirust_direct
   ptrRoundTrip_ctxOk
   ptrRoundTrip_minirust_ret_from_start
+  ptrRoundTrip_minirust_noUB
+  ptrRoundTrip_progress
+  arrayParamPtr_inFragment
+  arrayParamPtr_translate
+  arrayParamPtr_anneal_ret
+  arrayParamPtr_noUB
+  arrayParamPtr_ctxOk
+  arrayParamPtr_minirust_ret_from_start
+  arrayParamPtr_minirust_noUB
+  arrayParamPtr_progress
+  arrayParamPtr_minirust_direct
+  arrayElemPtr_notInFragment
   arrayElemPtr_anneal_ret
   arrayElemPtr_minirust_direct
   fieldPtr_inFragment
+  fieldPtr_translate
   fieldPtr_anneal_ret
+  fieldPtr_noUB
+  fieldPtr_ctxOk
+  fieldPtr_minirust_ret_from_start
+  fieldPtr_minirust_noUB
+  fieldPtr_progress
   fieldPtr_minirust_direct
+  uninitPtrReadUb_inFragment
+  uninitPtrReadUb_translate
+  uninitPtrReadUb_anneal_ub
+  uninitPtrReadUb_ctxOk
+  uninitPtrReadUb_minirust_ub_from_start
+  uninitPtrReadUb_converse_error
+  uninitPtrReadUb_outcome
+  uninitPtrReadUb_minirust_direct
+  uninitPtrWriteUb_inFragment
+  uninitPtrWriteUb_translate
+  uninitPtrWriteUb_anneal_ub
+  uninitPtrWriteUb_ctxOk
+  uninitPtrWriteUb_minirust_ub_from_start
+  uninitPtrWriteUb_converse_error
+  uninitPtrWriteUb_minirust_direct
   dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct
