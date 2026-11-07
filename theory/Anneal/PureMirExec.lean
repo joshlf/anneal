@@ -359,7 +359,7 @@ def isPureRvalue : Rvalue → Bool
   | .discriminant p => isPurePlace p
   | .aggregate _ ops => ops.all isPureOperand
   | .shallowInitBox _ _ => false
-  | .copyForDeref p => false
+  | .copyForDeref _p => false
   | .wrapUnsafeBinder op _ => isPureOperand op
 
 /--
@@ -735,7 +735,7 @@ theorem evalRvalue_pure_eq_withMem
       try rw [evalOperands_pure_eq locals ops emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       repeat' (first | rfl | split)
   | shallowInitBox _ _ => cases h_pure
-  | copyForDeref p => cases h_pure
+  | copyForDeref _ => cases h_pure
   | wrapUnsafeBinder _ _ => rfl
 
 /-- Replace the `Memory` in a normal `MirOutcome` with `mem`. -/

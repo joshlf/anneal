@@ -16,59 +16,64 @@ that eliminate them.
 
 ---
 
-## 1. Whole-Body `CapturedMir` Duplication Across Multi-Block CFGs (`BlockCtx` Pattern)
+## 1. Fuel-Free CFG Lifting vs. Whole-Body `CapturedMir` Duplication (`Anneal.PureMirExec` Pattern)
 
 ### Symptom
 Unfolding `Mir.<Crate>.<Item>.body` inside `dsimp` or `simp` across a function
-with multiple basic blocks causes `maxHeartbeats` or `maxRecDepth` timeouts after
-a few block transitions.
+with multiple basic blocks or loops causes `maxHeartbeats` or `maxRecDepth`
+timeouts, or requires hundreds of lines of manual `BlockCtx` / `itemBB0..itemBBn`
+boilerplate.
 
 ### Root Cause
-Every MIR stepping function (`stepMirState`, `dispatchBlock`, `evalStmt`,
-`evalRvalue`) takes `body : CapturedMir` (or `body.localDecls` and
-`body.layouts`). When `Mir.<Crate>.<Item>.body` is unfolded in place, Lean
-substitutes the literal AST of **all** basic blocks (`BB0..BBn`) into every
-intermediate symbolic state. Across $k$ basic-block jumps or branch splits, the
-term size grows polynomially or exponentially.
+Every raw MIR stepping function (`stepMirState`, `evalStmt`, `evalRvalue`) takes
+`body : CapturedMir` (or `body.localDecls` and `body.layouts`). When
+`Mir.<Crate>.<Item>.body` is unfolded inside every statement step of a loop,
+Lean substitutes the literal AST of all basic blocks into every intermediate
+symbolic state.
 
 ### Solution
-Never unfold `body` inside recursive CFG stepping. Instead:
-1. Wrap `{ localDecls, layouts, body }` in a small `BlockCtx` structure.
-2. Pre-project each basic block `0..n` into a top-level definition (`itemBB0`,
-   `itemBB1`, ...).
-3. Prove `O(1)` `rfl` lookup lemmas (`itemCtx_bb1 : lookupBlock itemCtx 1 = some itemBB1`,
-   `itemCtx_localDecls`, `itemCtx_layouts`, `itemCtx_phase`).
-4. Pass `itemCtx_bb1 .. itemCtx_bbn` and `itemBB0 .. itemBBn`—not `body`—to
-   `dsimp only [...]` or `rw`.
-
-```lean
-private structure BlockCtx where
-  localDecls : List LocalDecl
-  layouts : LayoutTable
-  body : CapturedMir
-
-private def dummyBB : BasicBlockData :=
-  { statements := [], terminator := { kind := .unreachable, span := "" }, isCleanup := false }
-
-private def itemBB0 : BasicBlockData :=
-  (get? Mir.MyCrate.my_fn.body.basicBlocks 0).getD dummyBB
-private def itemBB1 : BasicBlockData :=
-  (get? Mir.MyCrate.my_fn.body.basicBlocks 1).getD dummyBB
-
-private def itemCtx : BlockCtx :=
-  { localDecls := Mir.MyCrate.my_fn.body.localDecls
-    layouts := Mir.MyCrate.my_fn.body.layouts
-    body := Mir.MyCrate.my_fn.body }
-
-private theorem itemCtx_localDecls :
-    itemCtx.localDecls = Mir.MyCrate.my_fn.body.localDecls := rfl
-private theorem itemCtx_layouts :
-    itemCtx.layouts = Mir.MyCrate.my_fn.body.layouts := rfl
-private theorem itemCtx_phase :
-    itemCtx.body.phase = .runtimeOptimized := rfl
-private theorem itemCtx_bb1 :
-    lookupBlock itemCtx 1 = some itemBB1 := rfl
-```
+Never hand-roll `BlockCtx` structures or manual `fuel` bounds in proof files.
+Instead, lift the body so that `Mir.<Crate>.<Item>.body` stays an opaque
+constant in every goal:
+1. **Call-free, alias-free bodies (`checkPureMir` holds):** Use
+   `verifyMirNoPanic_of_pureExec` with the `#mir_lift` rules
+   (`lift_PureMirConverges`, `LiftBlock.of_lookup`,
+   `LiftStmtsTerminator.{eval_rest, cons_eval_norm, cons_eval, term_*}`);
+   each rule evaluates statements or a terminator by `rfl` (`eval_rest` steps
+   the rest of a block in one pass, taking the statement count from the block,
+   and `cons_eval_norm` normalizes `PureEnv` via `forcePureEnv?` to prevent
+   `List.set` tower blowup on long blocks) and the step count is synthesized
+   by unification (`SKILL.md`, Pattern A). For companion bodies that pass
+   `checkPureMir`, use the `#mir_lift_spec` theorems
+   (`mirBoolPredicateHolds_of_pureExec`,
+   `mirBoolPredicateHolds_elim_of_pureExec`).
+2. **Bounded loops and equivalence proofs:** Use `forRangeUp` with
+   `forRangeUp_induction` and `mirWpConverges_forRangeUp` (or
+   `mirNoCallWpConverges_forRangeUp`, `mirWpConverges_whileRank`) together with
+   `mirStepsConverges_of_runCfgToBlock`, `mirWpConverges_of_runCfgToBlock`, and
+   `mirNoCallWpConverges_of_runCfgToBlock`, which evaluate from the loop header
+   to its next entry (or to the return) without a step count, so that the proof
+   is structured around a loop invariant at the loop header and reusable across
+   `verifyStatefulEquivMir_of_wpConverges`
+   (`Proof/WireframeDemo/checksum_frame_safe.lean` and
+   `Proof/WireframeDemo/checksum_frame_fast.lean`).
+3. **Reference arguments:** Use `LiftLensBlock` with
+   `mirWpConverges_of_sepLenses` / `verifyStatefulMir_of_sepLenses` (which
+   accepts `isRuntimeMirPhase body.phase = true` for both `.runtimePostCleanup`
+   and `.runtimeOptimized` bodies; see
+   `Proof/WireframeDemo/advance_cursor.lean`).
+4. **Fallback when no lift applies:** `verifyMirNoPanic_of_blockLinear`,
+   `holdBoolReq_of_mirBool`, `hold_mirBool_of_blockLinear`,
+   `verifyStatefulMirNoPanic_of_cfg`, and
+   `verifyStatefulMirNoPanic_of_runCfgSteps` /
+   `verifyStatefulEquivMir_of_runCfgSteps` evaluate whole blocks with the
+   body-derived budgets `defaultSpecSteps` / `defaultCfgSteps`. They remove
+   `BlockCtx` boilerplate but remain bounded evaluators.
+5. **Byte-cast rewrites after `body` unfolding:** Parameterize
+   `evalByteCastAfterOperand` helper lemmas over `{body : CapturedMir}` with
+   `(h_decls : body.localDecls = ... := by rfl)` and
+   `(h_layouts : body.layouts = ... := by rfl)` so `rw` matches even after
+   `dsimp only` unfolds `Mir.<Crate>.<Item>.body`.
 
 ---
 
@@ -151,7 +156,12 @@ Factor the proof into three cleanly separated theorems:
    that takes `MirBoolPredicateHolds __anodized_fn_requires_<item>.body args` and
    returns pure Lean arithmetic hypotheses (e.g.,
    `∃ b1 b2, v1 = .scalar ⟨b1, 2⟩ ∧ v2 = .scalar ⟨b2, 2⟩ ∧ b1 ≤ 16 ∧ b2 ≤ 1024`),
-   discharging impossible branches with `nomatch`.
+   discharging impossible branches with `nomatch`. When short-circuiting
+   `&&`/`||` checks require multiple `wpBlockLinear` unfolds across argument and
+   comparison splits, drive one shared `dsimp only [...]` list with
+   `repeat (...; first | ...)` rather than duplicating the unfold list per
+   branch (`Proof/WireframeDemo/clamp_payload_window.lean`,
+   `frame_total_len.lean`).
 2. **`ensures_holds` (Forward Postcondition Discharge):** A standalone theorem
    that takes pure arithmetic bounds on `b1, b2, ret` and proves
    `MirBoolPredicateHolds __anodized_fn_ensures_<item>.body [v1, v2, ret]`.
@@ -162,6 +172,10 @@ Factor the proof into three cleanly separated theorems:
 ---
 
 ## 5. Fuel-Bounded Loop Unrolling and `subst h_fuel` Ordering (`verified_at_fuel` Pattern)
+
+*Legacy pattern for proofs that still unroll a loop at a fixed fuel. New loop
+proofs should use `forRangeUp` with `mirWpConverges_forRangeUp` (or
+`mirWpConverges_whileRank`), which needs no fuel at all.*
 
 ### Symptom
 In a loop proof (`runCfgSteps ctx state 120` or `wpCoalBounded ... 120`), all
