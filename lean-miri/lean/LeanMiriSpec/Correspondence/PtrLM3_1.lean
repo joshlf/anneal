@@ -41,56 +41,7 @@ open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 
-/-! ## 1. Pointer Resolution & Live Allocation Lookup Callbacks -/
-
-/-- 64-bit target pointer arithmetic context (`pointerSize = 8` bytes). -/
-def annealPointerArithmetic : Miri.Memory.PointerArithmetic :=
-  { pointerSize := Miri.ABI.Size.ofBytes 8 }
-
-/-- Resolve a `Miri.Memory.Pointer (Option AnnealProv)` against the cached base
-addresses in `mach.addresses` (`Miri.Memory.PointerResolver`).
-
-* A pointer without provenance (`ptr.provenance = none`, such as a null or
-  integer-cast pointer) fails with `.error ptr.offset.bytes`, which
-  `Miri.Memory.checkAndDerefPtr` reports as
-  `AccessError.danglingIntegerPointer`.
-* A pointer with concrete provenance `some (.concrete allocId borTag)` resolves
-  to allocation-relative offset `ptr.offset.bytes - baseAddr` when
-  `mach.lookupBaseAddr allocId = some baseAddr` and `baseAddr ≤ ptr.offset.bytes`. -/
-def annealResolvePtr (mach : AnnealMachine) :
-    Miri.Memory.PointerResolver AnnealProv Miri.Memory.BorTag :=
-  fun ptr _signedSize =>
-    match ptr.provenance with
-    | none => .error ptr.offset.bytes
-    | some (.concrete allocId borTag) =>
-      match mach.lookupBaseAddr allocId with
-      | some baseAddr =>
-        if baseAddr ≤ ptr.offset.bytes then
-          .ok ⟨allocId, Miri.ABI.Size.ofBytes (ptr.offset.bytes - baseAddr), borTag⟩
-        else
-          .error ptr.offset.bytes
-      | none => .error ptr.offset.bytes
-    | some .wildcard => .error ptr.offset.bytes
-
-/-- Look up live allocation metadata for `allocId` in `mach.memory.live`
-(`Miri.Memory.LiveAllocationLookup`).
-
-If `allocId` has been deallocated (for example, by `StorageDead`), it is absent
-from `mach.memory.live` and this lookup returns
-`.error (.deadAllocation allocId)`, which `Miri.Memory.checkAndDerefPtr`
-reports as `AccessError.allocationLookup (.deadAllocation allocId)`. -/
-def annealLookupAlloc (mach : AnnealMachine) : Miri.Memory.LiveAllocationLookup :=
-  fun allocId =>
-    match mach.memory.live.find? (fun entry => entry.1 == allocId) with
-    | some (_, localAlloc) =>
-      .ok
-        { size := localAlloc.allocation.byteSize
-          align := localAlloc.allocation.align
-          kind := .liveData
-          mutability := localAlloc.allocation.mutability }
-    | none => .error (.deadAllocation allocId)
-
-/-! ## 2. `AllocMapRel` and `PtrRel` Invariants -/
+/-! ## 1. `AllocMapRel` and `PtrRel` Invariants -/
 
 /-- Entry in the `(localIdx ↔ allocId)` correspondence table relating an Anneal
 address-taken local `localIdx` (and its borrow tag `tag` in `s.memory.borrows`)
@@ -100,6 +51,84 @@ structure AllocMapEntry where
   localIdx : Local
   allocId : Miri.Memory.AllocId
   perm : TreeBorrowPerm
+
+namespace AllocMapEntry
+
+/-- Convert an `AllocMapEntry` to the corresponding root `BorrowEntry` in
+`s.memory.borrows` (whole local, no projection, no parent, unranged). -/
+def toBorrowEntry (e : AllocMapEntry) : BorrowEntry :=
+  { tag := e.tag
+    targetLocal := e.localIdx
+    targetProjection := .nil
+    perm := e.perm }
+
+/-- Update `e.perm` on a write to `targetLocal` (either directly when
+`writerTag = none`, or through pointer tag `some wTag`), mirroring
+`MirSemantics.updateBorrowPerm`. -/
+def updateOnWrite (e : AllocMapEntry) (targetLocal : Local)
+    (writerTag : Option Nat) : AllocMapEntry :=
+  { e with perm := (updateBorrowPerm e.toBorrowEntry targetLocal writerTag).perm }
+
+/-- Update `e.perm` on a deref read of `targetLocal` through pointer tag `rTag`,
+freezing foreign `.active` borrows to `.frozen` while leaving self reads and
+non-`.active` borrows unchanged, mirroring `updateBorrowPermOnReadAtProj`. -/
+def updateOnRead (e : AllocMapEntry) (targetLocal : Local) (rTag : Nat) :
+    AllocMapEntry :=
+  match Nat.beq e.localIdx targetLocal with
+  | false => e
+  | true =>
+    match Nat.beq rTag e.tag with
+    | true => e
+    | false =>
+      match e.perm with
+      | .active => { e with perm := .frozen }
+      | _ => e
+
+theorem toBorrowEntry_updateOnWrite (e : AllocMapEntry) (targetLocal : Local)
+    (writerTag : Option Nat) :
+    (e.updateOnWrite targetLocal writerTag).toBorrowEntry =
+      updateBorrowPerm e.toBorrowEntry targetLocal writerTag := by
+  unfold updateOnWrite toBorrowEntry updateBorrowPerm
+  dsimp only
+  cases Nat.beq e.localIdx targetLocal with
+  | false => rfl
+  | true =>
+    dsimp only
+    cases writerTag with
+    | none => cases e.perm <;> rfl
+    | some wTag =>
+      dsimp only
+      cases Nat.beq e.tag wTag with
+      | false => rfl
+      | true => cases e.perm <;> rfl
+
+end AllocMapEntry
+
+/-- Map `AllocMapEntry.updateOnWrite` across `allocMap`. -/
+def updateAllocMapOnWrite (allocMap : List AllocMapEntry) (targetLocal : Local)
+    (writerTag : Option Nat) : List AllocMapEntry :=
+  allocMap.map (fun e => e.updateOnWrite targetLocal writerTag)
+
+/-- Map `AllocMapEntry.updateOnRead` across `allocMap` when `allocMap` has two
+or more entries (matching `MirSemantics.evalRvalue`, which runs
+`freezeDerefReadBorrowsAt` on `b₁ :: b₂ :: _`). -/
+def updateAllocMapOnDerefRead (allocMap : List AllocMapEntry)
+    (targetLocal : Local) (rTag : Nat) : List AllocMapEntry :=
+  match allocMap with
+  | e₁ :: e₂ :: rest =>
+    (e₁ :: e₂ :: rest).map (fun e => e.updateOnRead targetLocal rTag)
+  | _ => allocMap
+
+/-- Shape invariant for a `lean-miri` stack allocation backing a primitive
+scalar local of size `sz`: mutable, exact byte size `sz`, empty provenance map,
+and lazy whole-range initialization mask (`InitMask.new sz b` for `b : Bool`). -/
+structure StackScalarAllocShape {P E : Type} (sz : Miri.ABI.Size)
+    (alloc : Miri.Memory.Allocation P E) : Prop where
+  byteSize_eq : alloc.byteSize = sz
+  len_eq : alloc.len = sz.bytes.toNat
+  mutability_eq : alloc.mutability = .Mut
+  provenanceMap_eq : alloc.provenanceMap = Miri.Memory.ProvenanceMap.new
+  initMask_lazy : ∃ b : Bool, alloc.initializationMask = Miri.Memory.InitMask.new sz b
 
 /-- Lookup the `AllocMapEntry` for borrow tag `tag` in `allocMap`. -/
 def lookupAllocMapByTag : List AllocMapEntry → Nat → Option AllocMapEntry
@@ -114,20 +143,26 @@ def lookupAllocMapByLocal : List AllocMapEntry → Local → Option Miri.Memory.
 /-- Bijection and synchronization invariant between Anneal's borrow/local table
 and `lean-miri`'s stack allocations in `m`:
 
-1. **Local-to-AllocId functional consistency**: Any two entries in `allocMap`
+1. **Tag uniqueness**: Every entry in `allocMap` has a distinct borrow `tag`.
+2. **Local-to-AllocId functional consistency**: Any two entries in `allocMap`
    for the same `localIdx` name the same `allocId`.
-2. **AllocId-to-Local injectivity**: Any two entries in `allocMap` naming the
+3. **AllocId-to-Local injectivity**: Any two entries in `allocMap` naming the
    same `allocId` refer to the same `localIdx`.
-3. **Valid base address (`id <<< 32`)**: Every `e ∈ allocMap` has
+4. **Declared primitive-scalar target**: Every `e ∈ allocMap` targets a declared
+   local of primitive scalar type (`IsPrimScalarTy`).
+5. **Valid base address (`id <<< 32`)**: Every `e ∈ allocMap` has
    `e.allocId.value.toNat < 2 ^ 32` and
    `m.machine.lookupBaseAddr e.allocId = some (annealStackBaseAddr e.allocId)`.
-4. **Borrow-table synchronization**: For every `e ∈ allocMap`,
-   `lookupBorrow s.memory.borrows e.tag = some { tag := e.tag, targetLocal := e.localIdx, targetProjection := .nil, perm := e.perm }`
-   and `e.tag < s.memory.nextTag`.
-5. **Live vs. Dead local synchronization**: For every `e ∈ allocMap` and root
-   frame `topFrame` (`m.stack.frames = #[topFrame]`):
+6. **Borrow-table synchronization**: For every `e ∈ allocMap`,
+   `lookupBorrow s.memory.borrows e.tag = some e.toBorrowEntry` and
+   `e.tag < s.memory.nextTag`.
+7. **Live vs. Dead local & stack allocation synchronization**: For every
+   `e ∈ allocMap` and root frame `topFrame` (`m.stack.frames = #[topFrame]`):
+   * `e.allocId` appears at most once in `m.machine.memory.live`.
    * If `get? s.frame.locals e.localIdx = some slot` with `slot ≠ .dead`, then
-     `topFrame.locals[e.localIdx]? = some ⟨.live (.indirect (stackAllocPlace e.allocId)), lay⟩`.
+     `topFrame.locals[e.localIdx]? = some ⟨.live (.indirect (stackAllocPlace e.allocId)), lay⟩`
+     and `m.machine.memory.live.find? (·.1 == e.allocId) = some (e.allocId, localAlloc)`
+     with `StackScalarAllocShape` on `localAlloc.allocation`.
    * If `get? s.frame.locals e.localIdx = some .dead`, then
      `m.machine.memory.live.find? (fun x => x.1 == e.allocId) = none`. -/
 structure AllocMapRel
@@ -135,17 +170,23 @@ structure AllocMapRel
     (s : MachineState)
     (m : AnnealStepState)
     (allocMap : List AllocMapEntry) : Prop where
+  /-- Distinct borrow tags across `allocMap`. -/
+  tags_nodup : (allocMap.map AllocMapEntry.tag).Nodup
   /-- Functional consistency from `localIdx` to `allocId`. -/
   local_to_alloc_unique :
     ∀ e₁ ∈ allocMap, ∀ e₂ ∈ allocMap, e₁.localIdx = e₂.localIdx → e₁.allocId = e₂.allocId
   /-- Injectivity from `allocId` to `localIdx`. -/
   alloc_to_local_injective :
     ∀ e₁ ∈ allocMap, ∀ e₂ ∈ allocMap, e₁.allocId = e₂.allocId → e₁.localIdx = e₂.localIdx
-  /-- Every mapped `allocId` fits below `2^32` and has its `id <<< 32` base
-  address cached in `m.machine.addresses`. -/
+  /-- Every mapped local is a declared primitive-scalar local in `body`. -/
+  target_decl :
+    ∀ e ∈ allocMap, ∃ decl, get? body.localDecls e.localIdx = some decl ∧ IsPrimScalarTy decl.ty
+  /-- Every mapped `allocId` fits below `2^32` and `nextAllocId` and has its
+  `id <<< 32` base address cached in `m.machine.addresses`. -/
   base_addr_valid :
     ∀ e ∈ allocMap,
       e.allocId.value.toNat < 2 ^ 32 ∧
+      e.allocId.value.toNat < m.machine.memory.nextAllocId.toNat ∧
       m.machine.lookupBaseAddr e.allocId = some (annealStackBaseAddr e.allocId)
   /-- Every entry in `allocMap` resolves in `s.memory.borrows` to the same
   `targetLocal` and `perm`, with `tag < s.memory.nextTag`. -/
@@ -154,14 +195,30 @@ structure AllocMapRel
       e.tag < s.memory.nextTag ∧
       lookupBorrow s.memory.borrows e.tag =
         some { tag := e.tag, targetLocal := e.localIdx, targetProjection := .nil, perm := e.perm }
-  /-- Live locals are backed by `stackAllocPlace e.allocId` in `topFrame`; dead
-  locals have `e.allocId` absent from `m.machine.memory.live`. -/
+  /-- Each mapped `allocId` has at most one entry in `m.machine.memory.live`. -/
+  live_key_unique :
+    ∀ e ∈ allocMap, ∀ la₁ la₂,
+      (e.allocId, la₁) ∈ m.machine.memory.live.toList →
+      (e.allocId, la₂) ∈ m.machine.memory.live.toList →
+      la₁ = la₂
+  /-- Live locals are backed by `stackAllocPlace e.allocId` in `topFrame` and by
+  a `StackScalarAllocShape` entry in `m.machine.memory.live`; dead locals have
+  `e.allocId` absent from `m.machine.memory.live`. -/
   local_alloc_sync :
     ∀ topFrame, m.stack.frames = #[topFrame] →
       ∀ e ∈ allocMap,
         (∀ slot, get? s.frame.locals e.localIdx = some slot → slot ≠ .dead →
-          ∃ lay, topFrame.locals[e.localIdx]? =
+          (∃ lay, topFrame.locals[e.localIdx]? =
             some ⟨.live (.indirect (stackAllocPlace e.allocId)), lay⟩) ∧
+          (∀ v, slot = .init v → ∃ sc, v = .scalar sc) ∧
+          (∀ decl, get? body.localDecls e.localIdx = some decl →
+            ∃ localAlloc,
+              m.machine.memory.live.find? (fun x => x.1 == e.allocId) =
+                some (e.allocId, localAlloc) ∧
+              localAlloc.kind = .stack ∧
+              localAlloc.allocation.align = (translateTy decl.ty body.layouts).layout.align.abi ∧
+              StackScalarAllocShape (translateTy decl.ty body.layouts).layout.size
+                localAlloc.allocation)) ∧
         (get? s.frame.locals e.localIdx = some .dead →
           m.machine.memory.live.find? (fun x => x.1 == e.allocId) = none)
 
@@ -170,10 +227,13 @@ namespace AllocMapRel
 /-- The empty `AllocMap` trivially satisfies `AllocMapRel` in any state. -/
 theorem nil (body : CapturedMir) (s : MachineState) (m : AnnealStepState) :
     AllocMapRel body s m [] where
+  tags_nodup := by simp
   local_to_alloc_unique := by intro _ h; cases h
   alloc_to_local_injective := by intro _ h; cases h
+  target_decl := by intro _ h; cases h
   base_addr_valid := by intro _ h; cases h
   borrow_sync := by intro _ h; cases h
+  live_key_unique := by intro _ h; cases h
   local_alloc_sync := by intro _ _ _ h; cases h
 
 end AllocMapRel
@@ -301,6 +361,22 @@ theorem resolvePtr_concrete_eq
   unfold annealResolvePtr
   simp [hbase, hle, hsub]
 
+/-- `PtrRel` survives any transformation of `allocMap` that preserves `.tag`
+and `.allocId` on every entry. -/
+theorem map_preserve {allocMap : List AllocMapEntry}
+    (f : AllocMapEntry → AllocMapEntry)
+    (htag : ∀ e, (f e).tag = e.tag)
+    (halloc : ∀ e, (f e).allocId = e.allocId)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+    (h : PtrRel allocMap p mptr) : PtrRel (allocMap.map f) p mptr := by
+  cases h with
+  | mk allocId borTag hprov hid hoff haddr htarget =>
+    obtain ⟨e, he, het, hea⟩ := htarget
+    refine .mk allocId borTag hprov hid hoff haddr
+      ⟨f e, List.mem_map_of_mem he, ?_, ?_⟩
+    · rw [htag, het]
+    · rw [halloc, hea]
+
 end PtrRel
 
 /-! ## 3. Pointer-Aware Local, Frame, and State Relations -/
@@ -365,8 +441,9 @@ pushes a borrow entry, so no state reached by taking an address satisfies
 `StateRel`. `StateRelLM3_1` keeps every other `StateRel` field and replaces
 `borrows_nil` by:
 
-* `borrows_tracked`: each borrow entry is the root borrow of an `allocMap`
-  entry (whole local, no projection, default range and parent), and
+* `borrows_eq`: `s.memory.borrows = allocMap.map AllocMapEntry.toBorrowEntry`
+  (every borrow entry is the root borrow of the corresponding `allocMap` entry:
+  whole local, no projection, default range and parent), and
 * `alloc_rel`: `AllocMapRel`, which ties each entry's tag, local, permission,
   allocation, and base address together across the two machines.
 
@@ -389,13 +466,24 @@ inductive StateRelLM3_1
       (callStack_nil : s.memory.callStack = .nil)
       (activeProtectors_nil : s.memory.activeProtectors = .nil)
       (callerLocals_nil : s.memory.callerLocals = .nil)
-      (borrows_tracked :
-        ∀ b ∈ s.memory.borrows, ∃ e ∈ allocMap,
-          b = { tag := e.tag, targetLocal := e.localIdx, targetProjection := .nil,
-                perm := e.perm })
+      (borrows_eq : s.memory.borrows = allocMap.map AllocMapEntry.toBorrowEntry)
       (alloc_rel : AllocMapRel body s m allocMap)
       (memoryAllocDisjoint : MemoryAllocDisjoint topFrame) :
       StateRelLM3_1 body s m allocMap
+
+namespace StateRelLM3_1
+
+/-- Every borrow entry in `s.memory.borrows` comes from an `allocMap` entry. -/
+theorem borrows_tracked {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} (h : StateRelLM3_1 body s m allocMap) :
+    ∀ b ∈ s.memory.borrows, ∃ e ∈ allocMap, b = e.toBorrowEntry := by
+  rcases h with ⟨_, _, _, _, _, _, _, _, _, hbor, _, _⟩
+  intro b hb
+  rw [hbor] at hb
+  obtain ⟨e, he, rfl⟩ := List.mem_map.mp hb
+  exact ⟨e, he, rfl⟩
+
+end StateRelLM3_1
 
 /-- Outcome correspondence for one step between `StateRelLM3_1`-related
 states, mirroring `StepRel`: both machines take a normal step to states related
@@ -444,29 +532,255 @@ theorem LocalRelLM3_1.toLocalRel_nil {mach : AnnealMachine} {decl : LocalDecl}
   | base h => exact h
   | rawPtr _ _ _ _ _ _ _ hptr => exact absurd hptr PtrRel.not_nil
 
+/-- Cached layout in a `LocalRelLM3_1`-related `LocalState` always agrees with
+`translateTy decl.ty layouts`. -/
+theorem LocalRelLM3_1.layout_eq {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach allocMap decl layouts slot mls) :
+    ∀ l, mls.layout = some l → l = translateTy decl.ty layouts := by
+  cases h with
+  | base hb => exact hb.layout_eq
+  | rawPtr _ _ _ _ _ hc _ _ => exact hc
+
+/-- Cached layout membership version of `LocalRelLM3_1.layout_eq`. -/
+theorem LocalRelLM3_1.cachedLayout_eq {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach allocMap decl layouts slot mls) :
+    ∀ l ∈ mls.layout, l = translateTy decl.ty layouts := by
+  cases h with
+  | base hb => exact hb.cachedLayout_eq
+  | rawPtr _ _ _ _ _ hc _ _ => exact hc
+
+/-- `LocalRelLM3_1` survives extending `allocMap` with another entry. -/
+theorem LocalRelLM3_1.mono_cons {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (e : AllocMapEntry) {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach allocMap decl layouts slot mls) :
+    LocalRelLM3_1 mach (e :: allocMap) decl layouts slot mls := by
+  cases h with
+  | base hb => exact .base hb
+  | rawPtr p mptr cl mutability pointeeKind hc hty hptr =>
+    exact .rawPtr p mptr cl mutability pointeeKind hc hty (hptr.mono_cons e)
+
+/-- `LocalRelLM3_1` survives any `allocMap` map that preserves `.tag` and
+`.allocId`. -/
+theorem LocalRelLM3_1.map_preserve {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (f : AllocMapEntry → AllocMapEntry)
+    (htag : ∀ e, (f e).tag = e.tag)
+    (halloc : ∀ e, (f e).allocId = e.allocId)
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach allocMap decl layouts slot mls) :
+    LocalRelLM3_1 mach (allocMap.map f) decl layouts slot mls := by
+  cases h with
+  | base hb => exact .base hb
+  | rawPtr p mptr cl mutability pointeeKind hc hty hptr =>
+    exact .rawPtr p mptr cl mutability pointeeKind hc hty (hptr.map_preserve f htag halloc)
+
+/-- A local related by `LocalRelLM3_1` owns, if anything, a live allocation. -/
+theorem LocalRelLM3_1.allocLive {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach allocMap decl layouts slot mls) :
+    LocalAllocLive mach.memory mls.value := by
+  cases h with
+  | base hb => exact hb.allocLive
+  | rawPtr _ _ _ _ _ _ _ _ =>
+    intro mp hv
+    cases hv
+
+/-- Deallocating the allocation of one local keeps the `LocalRelLM3_1` of every
+local that owns a different allocation. -/
+theorem LocalRelLM3_1.of_dealloc {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    {v : Miri.Interpreter.LocalValue AnnealProv}
+    (h : LocalRelLM3_1 mach allocMap decl layouts slot mls)
+    (hdisj : ∀ mp mp', v = .live (.indirect mp) → mls.value = .live (.indirect mp') →
+      mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId ≠
+        mp'.ptr.provenance.bind Miri.Memory.Provenance.getAllocId) :
+    LocalRelLM3_1 { mach with memory := deallocLocalMemory mach.memory v }
+      allocMap decl layouts slot mls := by
+  cases h with
+  | base hb => exact .base (hb.of_dealloc hdisj)
+  | rawPtr p mptr cl mutability pointeeKind hc hty hptr =>
+    exact .rawPtr p mptr cl mutability pointeeKind hc hty hptr
+
+/-- Look up a declared local in `FrameRelLM3_1`-related frames. -/
+theorem FrameRelLM3_1.lookup_local
+    {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_1 body mach allocMap af mf)
+    {idx : Nat} {decl : LocalDecl}
+    (hdecl : get? body.localDecls idx = some decl) :
+    ∃ (slot : LocalSlot) (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout)
+      (_hlt_af : idx < af.locals.length) (hlt_mf : idx < mf.locals.size),
+      get? af.locals idx = some slot ∧
+      mf.locals[idx]? = some mls ∧
+      mf.locals[idx]'hlt_mf = mls ∧
+      LocalRelLM3_1 mach allocMap decl body.layouts slot mls := by
+  have hlt_body : idx < body.localDecls.length := by
+    rw [get?_eq_getElem?] at hdecl
+    exact (List.getElem?_eq_some_iff.mp hdecl).1
+  have hlt_af : idx < af.locals.length := by
+    rw [hfr.af_locals_len]; exact hlt_body
+  have hlt_mf : idx < mf.locals.size := by
+    rw [hfr.mf_locals_size]; exact hlt_body
+  have hslot : get? af.locals idx = some (af.locals[idx]'hlt_af) := by
+    rw [get?_eq_getElem?, List.getElem?_eq_getElem hlt_af]
+  have hmls : mf.locals[idx]? = some (mf.locals[idx]'hlt_mf) :=
+    Array.getElem?_eq_getElem hlt_mf
+  exact ⟨af.locals[idx]'hlt_af, mf.locals[idx]'hlt_mf, hlt_af, hlt_mf, hslot, hmls, rfl,
+    hfr.locals_rel idx decl _ _ hdecl hslot hmls⟩
+
+/-- Memoizing a local's layout preserves `FrameRelLM3_1`. -/
+theorem FrameRelLM3_1.cache_local_layout
+    {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_1 body mach allocMap af mf)
+    {idx : Nat} {decl : LocalDecl}
+    (hdecl : get? body.localDecls idx = some decl)
+    (hlt : idx < mf.locals.size) :
+    FrameRelLM3_1 body mach allocMap af
+      (cacheFrameLocalLayout mf idx hlt (translateTy decl.ty body.layouts)) where
+  body_eq := hfr.body_eq
+  location_eq := hfr.location_eq
+  af_locals_len := hfr.af_locals_len
+  mf_locals_size := by rw [cacheFrameLocalLayout_size, hfr.mf_locals_size]
+  locals_rel i decl_i slot_i mls_i hdecl_i hslot_i hmls_i := by
+    dsimp only [cacheFrameLocalLayout] at hmls_i
+    rw [Array.getElem?_set] at hmls_i
+    by_cases h_eq : idx = i
+    · subst h_eq
+      simp only [↓reduceIte, Option.some.injEq] at hmls_i
+      have hdecl_eq : decl = decl_i := by
+        rw [hdecl] at hdecl_i; exact Option.some.inj hdecl_i
+      subst hdecl_eq hmls_i
+      generalize hls0 : (mf.locals[idx]'hlt) = mls0
+      have hmls0 : mf.locals[idx]? = some mls0 := by
+        rw [← hls0]; exact Array.getElem?_eq_getElem hlt
+      have hrel0 := hfr.locals_rel idx decl slot_i mls0 hdecl hslot_i hmls0
+      cases hrel0 with
+      | base hb =>
+        cases hb with
+        | dead _ _ =>
+          exact .base (.dead _ (fun _ hl => (Option.some.inj hl).symm))
+        | immediate _ imm _ _ hv =>
+          exact .base (.immediate slot_i imm _ (fun _ hl => (Option.some.inj hl).symm) hv)
+        | indirect _ mp _ _ hne hmp =>
+          exact .base (.indirect slot_i mp _ (fun _ hl => (Option.some.inj hl).symm) hne hmp)
+      | rawPtr p mptr _ mutability pointeeKind _ hty hptr =>
+        exact .rawPtr p mptr _ mutability pointeeKind
+          (fun _ hl => (Option.some.inj hl).symm) hty hptr
+    · simp only [h_eq, ↓reduceIte] at hmls_i
+      exact hfr.locals_rel i decl_i slot_i mls_i hdecl_i hslot_i hmls_i
+
+/-- `FrameRelLM3_1` survives any `allocMap` map that preserves `.tag` and
+`.allocId`. -/
+theorem FrameRelLM3_1.map_preserve
+    {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (f : AllocMapEntry → AllocMapEntry)
+    (htag : ∀ e, (f e).tag = e.tag)
+    (halloc : ∀ e, (f e).allocId = e.allocId)
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_1 body mach allocMap af mf) :
+    FrameRelLM3_1 body mach (allocMap.map f) af mf where
+  body_eq := hfr.body_eq
+  location_eq := hfr.location_eq
+  af_locals_len := hfr.af_locals_len
+  mf_locals_size := hfr.mf_locals_size
+  locals_rel i decl slot mls hdecl hslot hmls :=
+    (hfr.locals_rel i decl slot mls hdecl hslot hmls).map_preserve f htag halloc
+
+/-- `FrameRelLM3_1` survives extending `allocMap` with another entry. -/
+theorem FrameRelLM3_1.mono_cons
+    {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (e : AllocMapEntry)
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_1 body mach allocMap af mf) :
+    FrameRelLM3_1 body mach (e :: allocMap) af mf where
+  body_eq := hfr.body_eq
+  location_eq := hfr.location_eq
+  af_locals_len := hfr.af_locals_len
+  mf_locals_size := hfr.mf_locals_size
+  locals_rel i decl slot mls hdecl hslot hmls :=
+    (hfr.locals_rel i decl slot mls hdecl hslot hmls).mono_cons e
+
+/-- `StateRelLM3_1` survives memoizing a local's declared layout in the root
+frame, as `annealEvalPlace` and `annealEvalOperand` do. -/
+theorem StateRelLM3_1.cache_layout
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {idx : Nat} {decl : LocalDecl} (hdecl : get? body.localDecls idx = some decl)
+    (hlt : idx < tf.locals.size) :
+    StateRelLM3_1 body s
+      { m with stack := ⟨#[cacheFrameLocalLayout tf idx hlt
+          (translateTy decl.ty body.layouts)]⟩ }
+      allocMap := by
+  rcases hstate with
+    ⟨tf₀, hframes₀, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, hbor, halloc, hdisj⟩
+  rw [hframes] at hframes₀
+  injection hframes₀ with h₀
+  injection h₀ with htf
+  subst htf
+  refine .mk _ rfl hretCont hretPlace (hfr.cache_local_layout hdecl hlt) hcal hstack hprot
+    hcaller hbor ?_ ?_
+  · refine ⟨halloc.tags_nodup, halloc.local_to_alloc_unique, halloc.alloc_to_local_injective,
+      halloc.target_decl, halloc.base_addr_valid, halloc.borrow_sync, halloc.live_key_unique, ?_⟩
+    intro topFrame htop e he
+    injection htop with h₁
+    injection h₁ with h₂
+    subst h₂
+    obtain ⟨hlive_e, hdead_e⟩ := halloc.local_alloc_sync tf hframes e he
+    refine ⟨fun slot hslot hne => ?_, hdead_e⟩
+    obtain ⟨⟨lay, hlay⟩, hshape⟩ := hlive_e slot hslot hne
+    refine ⟨?_, hshape⟩
+    by_cases hk : idx = e.localIdx
+    · subst hk
+      refine ⟨some (translateTy decl.ty body.layouts), ?_⟩
+      dsimp only [cacheFrameLocalLayout]
+      rw [Array.getElem?_set_self]
+      have hget : tf.locals[e.localIdx]? = some (tf.locals[e.localIdx]'hlt) :=
+        Array.getElem?_eq_getElem hlt
+      rw [hget] at hlay
+      injection hlay with hls
+      rw [hls]
+    · refine ⟨lay, ?_⟩
+      dsimp only [cacheFrameLocalLayout]
+      rw [Array.getElem?_set_ne _ hk]
+      exact hlay
+  · apply MemoryAllocDisjoint.mono_layout hdisj
+    intro k
+    by_cases hk : k = idx
+    · subst hk
+      refine ⟨translateTy decl.ty body.layouts, ?_⟩
+      dsimp only [cacheFrameLocalLayout]
+      rw [Array.getElem?_set_self, Array.getElem?_eq_getElem hlt]
+      rfl
+    · refine ⟨(tf.locals[k]?).bind (fun x => x.layout), ?_⟩
+      dsimp only [cacheFrameLocalLayout]
+      rw [Array.getElem?_set_ne _ (Ne.symm hk)]
+      cases tf.locals[k]? <;> rfl
+
 /-- `StateRel` embeds into `StateRelLM3_1` with the empty `allocMap`. -/
 theorem StateRel.toLM3_1 {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (h : StateRel body s m) : StateRelLM3_1 body s m [] := by
   rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hbor, hprot, hcaller,
     hdisj⟩
-  refine .mk tf hframes hretCont hretPlace (hfr.toLM3_1 []) hcal hstack hprot hcaller ?_
+  exact .mk tf hframes hretCont hretPlace (hfr.toLM3_1 []) hcal hstack hprot hcaller hbor
     (AllocMapRel.nil body s m) hdisj
-  intro b hb
-  rw [hbor] at hb
-  cases hb
 
 /-- `StateRelLM3_1` with the empty `allocMap` is `StateRel`: the extension is
 conservative. -/
 theorem StateRelLM3_1.toStateRel {body : CapturedMir} {s : MachineState}
     {m : AnnealStepState} (h : StateRelLM3_1 body s m []) : StateRel body s m := by
-  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, htracked,
+  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, hbor,
     _, hdisj⟩
-  have hbor : s.memory.borrows = .nil := by
-    cases hb : s.memory.borrows with
-    | nil => rfl
-    | cons b rest =>
-      obtain ⟨_, he, _⟩ := htracked b (by rw [hb]; exact List.Mem.head _)
-      cases he
   exact .mk tf hframes hretCont hretPlace
     ⟨hfr.body_eq, hfr.location_eq, hfr.af_locals_len, hfr.mf_locals_size,
       fun i decl slot mls hdecl hslot hmls =>
@@ -1241,5 +1555,713 @@ theorem size_isAligned_eight_of_misaligned
       Miri.ABI.Align.EIGHT = .ok false := by
   rw [annealStackBaseAddr_add_isAligned_eight allocId offsetBytes hid hoff]
   rw [beq_false_of_ne hmis]
+
+/-! ## 5. Borrow-Table Synchronization & `StackScalarAllocShape` Lemmas -/
+
+/-- Under `(allocMap.map AllocMapEntry.tag).Nodup`, `lookupBorrow` on
+`allocMap.map AllocMapEntry.toBorrowEntry` resolves every `e ∈ allocMap` to
+`some e.toBorrowEntry`. -/
+theorem lookupBorrow_map_toBorrowEntry_of_nodup
+    {allocMap : List AllocMapEntry}
+    (hnodup : (allocMap.map AllocMapEntry.tag).Nodup)
+    {e : AllocMapEntry} (he : e ∈ allocMap) :
+    lookupBorrow (allocMap.map AllocMapEntry.toBorrowEntry) e.tag =
+      some e.toBorrowEntry := by
+  induction allocMap with
+  | nil => cases he
+  | cons hd tl ih =>
+    simp only [List.map_cons, List.nodup_cons] at hnodup
+    obtain ⟨hnot_mem, htl_nodup⟩ := hnodup
+    cases he with
+    | head _ =>
+      show (match Nat.beq e.tag e.tag with
+        | true => some e.toBorrowEntry
+        | false => lookupBorrow (tl.map AllocMapEntry.toBorrowEntry) e.tag) =
+        some e.toBorrowEntry
+      rw [Nat.beq_refl]
+    | tail _ hmem =>
+      have hne : hd.tag ≠ e.tag := fun heq =>
+        hnot_mem (heq ▸ List.mem_map_of_mem hmem)
+      have hbeq : Nat.beq hd.tag e.tag = false := by
+        cases h : Nat.beq hd.tag e.tag
+        · rfl
+        · exact absurd (Nat.eq_of_beq_eq_true h) hne
+      show (match Nat.beq hd.tag e.tag with
+        | true => some hd.toBorrowEntry
+        | false => lookupBorrow (tl.map AllocMapEntry.toBorrowEntry) e.tag) =
+        some e.toBorrowEntry
+      rw [hbeq]
+      exact ih htl_nodup hmem
+
+/-- `invalidateConflictingBorrows` on `allocMap.map AllocMapEntry.toBorrowEntry`
+equals `(updateAllocMapOnWrite allocMap targetLocal writerTag).map AllocMapEntry.toBorrowEntry`. -/
+theorem invalidateConflictingBorrows_map_toBorrowEntry
+    (allocMap : List AllocMapEntry) (targetLocal : Local) (writerTag : Option Nat) :
+    invalidateConflictingBorrows (allocMap.map AllocMapEntry.toBorrowEntry) targetLocal writerTag =
+      (updateAllocMapOnWrite allocMap targetLocal writerTag).map AllocMapEntry.toBorrowEntry := by
+  induction allocMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, invalidateConflictingBorrows_cons, updateAllocMapOnWrite,
+      AllocMapEntry.toBorrowEntry_updateOnWrite, ih]
+
+/-- For a root borrow list `borrows` where every entry has `parentTag = none`,
+`isBorrowDescendantOrSelf borrows wTag ancTag` equals `Nat.beq wTag ancTag`. -/
+theorem isBorrowDescendantOrSelf_root_eq_beq
+    {borrows : List BorrowEntry}
+    (hroot : ∀ b ∈ borrows, b.parentTag = none)
+    (wTag ancTag : Nat) :
+    isBorrowDescendantOrSelf borrows wTag ancTag = Nat.beq wTag ancTag := by
+  unfold isBorrowDescendantOrSelf
+  cases hlen : length borrows with
+  | zero => rfl
+  | succ fuel =>
+    unfold isBorrowDescendantOrSelfAux
+    cases hbeq : Nat.beq wTag ancTag
+    · dsimp only
+      cases hlook : lookupBorrow borrows wTag with
+      | none => rfl
+      | some entry =>
+        have hmem : entry ∈ borrows := by
+          clear hlen hroot
+          induction borrows with
+          | nil => cases hlook
+          | cons hd tl ih =>
+            unfold lookupBorrow at hlook
+            cases hb : Nat.beq hd.tag wTag
+            · rw [hb] at hlook
+              exact List.mem_cons_of_mem hd (ih hlook)
+            · rw [hb] at hlook
+              injection hlook with h
+              subst h
+              exact List.Mem.head _
+        dsimp only
+        rw [hroot entry hmem]
+    · rfl
+
+theorem parentTag_toBorrowEntry (e : AllocMapEntry) :
+    e.toBorrowEntry.parentTag = none := rfl
+
+theorem targetProjection_toBorrowEntry (e : AllocMapEntry) :
+    e.toBorrowEntry.targetProjection = .nil := rfl
+
+/-- `invalidateTreeBorrowsAtProj` on root borrows at `.nil` (`0`, `0`) coincides
+with `invalidateConflictingBorrows`. -/
+theorem invalidateTreeBorrowsAtProj_map_toBorrowEntry
+    (allMap subMap : List AllocMapEntry) (targetLocal : Local) (wTag : Nat) :
+    invalidateTreeBorrowsAtProj
+      (allMap.map AllocMapEntry.toBorrowEntry)
+      (subMap.map AllocMapEntry.toBorrowEntry)
+      targetLocal (some wTag) .nil 0 0 =
+      (updateAllocMapOnWrite subMap targetLocal (some wTag)).map AllocMapEntry.toBorrowEntry := by
+  have hroot : ∀ b ∈ allMap.map AllocMapEntry.toBorrowEntry, b.parentTag = none := by
+    intro b hb
+    obtain ⟨e, _, rfl⟩ := List.mem_map.mp hb
+    rfl
+  induction subMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, updateAllocMapOnWrite]
+    unfold invalidateTreeBorrowsAtProj updateBorrowPermTreeAtProj resolveTreeBorrowWriterTag
+    dsimp only
+    rw [show hd.toBorrowEntry.tag = hd.tag from rfl,
+      isBorrowDescendantOrSelf_root_eq_beq hroot wTag hd.tag]
+    cases h : Nat.beq wTag hd.tag with
+    | false =>
+      dsimp only
+      rw [updateBorrowPermAtProj_nil_eq_updateBorrowPerm _ _ _ rfl,
+        ← AllocMapEntry.toBorrowEntry_updateOnWrite, ih]
+      rfl
+    | true =>
+      dsimp only
+      rw [← Nat.eq_of_beq_eq_true h, updateBorrowPermAtProj_nil_eq_updateBorrowPerm _ _ _ rfl,
+        ← AllocMapEntry.toBorrowEntry_updateOnWrite, ih]
+      rfl
+
+/-- `invalidateDerefWriteBorrows` at `⟨ptrLoc, [.deref]⟩` (`restProj = []`) on
+`allocMap.map AllocMapEntry.toBorrowEntry` equals
+`(updateAllocMapOnWrite allocMap e.localIdx (some ptrVal.tag)).map AllocMapEntry.toBorrowEntry`. -/
+theorem invalidateDerefWriteBorrows_map_toBorrowEntry
+    (locals₁ : List LocalSlot) (allocMap : List AllocMapEntry)
+    (hnodup : (allocMap.map AllocMapEntry.tag).Nodup)
+    (ptrLoc : Local) (ptrVal : ProvenancePtr) (sz : Nat)
+    (e : AllocMapEntry) (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hptr : get? locals₁ ptrLoc = some (.init (.ptr ptrVal sz))) :
+    invalidateDerefWriteBorrows locals₁ (allocMap.map AllocMapEntry.toBorrowEntry)
+      ⟨ptrLoc, [.deref]⟩ .nil =
+      (updateAllocMapOnWrite allocMap e.localIdx (some ptrVal.tag)).map
+        AllocMapEntry.toBorrowEntry := by
+  have hlook := lookupBorrow_map_toBorrowEntry_of_nodup hnodup he
+  rw [htag] at hlook
+  match allocMap with
+  | [] => cases he
+  | [single] =>
+    unfold invalidateDerefWriteBorrows
+    simp only [List.map_cons, List.map_nil] at hlook ⊢
+    rw [hptr]
+    dsimp only
+    rw [hlook]
+    dsimp only [AllocMapEntry.toBorrowEntry, appendProjections]
+    exact invalidateConflictingBorrows_map_toBorrowEntry [single] e.localIdx (some ptrVal.tag)
+  | e₁ :: e₂ :: rest =>
+    unfold invalidateDerefWriteBorrows
+    simp only [List.map_cons] at hlook ⊢
+    rw [hptr]
+    dsimp only
+    rw [hlook]
+    dsimp only [AllocMapEntry.toBorrowEntry, appendProjections]
+    exact invalidateTreeBorrowsAtProj_map_toBorrowEntry (e₁ :: e₂ :: rest) (e₁ :: e₂ :: rest)
+      e.localIdx ptrVal.tag
+
+/-- `freezeTreeBorrowsOnReadAtProj` on root borrows at `.nil` (`0`, `0`) maps
+`AllocMapEntry.updateOnRead`. -/
+theorem freezeTreeBorrowsOnReadAtProj_map_toBorrowEntry
+    (allMap subMap : List AllocMapEntry) (targetLocal : Local) (rTag : Nat) :
+    freezeTreeBorrowsOnReadAtProj
+      (allMap.map AllocMapEntry.toBorrowEntry)
+      (subMap.map AllocMapEntry.toBorrowEntry)
+      targetLocal (some rTag) .nil 0 0 =
+      (subMap.map (fun e => e.updateOnRead targetLocal rTag)).map
+        AllocMapEntry.toBorrowEntry := by
+  have hroot : ∀ b ∈ allMap.map AllocMapEntry.toBorrowEntry, b.parentTag = none := by
+    intro b hb
+    obtain ⟨e, _, rfl⟩ := List.mem_map.mp hb
+    rfl
+  induction subMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons]
+    unfold freezeTreeBorrowsOnReadAtProj updateBorrowPermOnReadAtProj
+    rw [ ← ih]
+    congr 1
+    unfold AllocMapEntry.updateOnRead
+    have hoverlap : borrowEntryOverlapsWrite hd.toBorrowEntry .nil 0 0 = true := rfl
+    have htl_eq : hd.toBorrowEntry.targetLocal = hd.localIdx := rfl
+    have htag_eq : hd.toBorrowEntry.tag = hd.tag := rfl
+    rw [htl_eq]
+    cases Nat.beq hd.localIdx targetLocal with
+    | false => rfl
+    | true =>
+      dsimp only
+      rw [hoverlap]
+      dsimp only
+      rw [htag_eq, isBorrowDescendantOrSelf_root_eq_beq hroot rTag hd.tag]
+      cases Nat.beq rTag hd.tag with
+      | true => rfl
+      | false =>
+        rcases hd with ⟨_, _, _, perm⟩
+        cases perm <;> rfl
+
+/-- `freezeDerefReadBorrowsAt` on `e₁ :: e₂ :: rest` matches
+`updateAllocMapOnDerefRead`. -/
+theorem freezeDerefReadBorrowsAt_map_toBorrowEntry
+    (locals : List LocalSlot) (e₁ e₂ : AllocMapEntry) (rest : List AllocMapEntry)
+    (hnodup : ((e₁ :: e₂ :: rest).map AllocMapEntry.tag).Nodup)
+    (ptrLoc : Local) (ptrVal : ProvenancePtr) (sz : Nat)
+    (e : AllocMapEntry) (he : e ∈ (e₁ :: e₂ :: rest)) (htag : e.tag = ptrVal.tag)
+    (hptr : get? locals ptrLoc = some (.init (.ptr ptrVal sz))) :
+    freezeDerefReadBorrowsAt locals ptrLoc .nil
+      ((e₁ :: e₂ :: rest).map AllocMapEntry.toBorrowEntry) =
+      (updateAllocMapOnDerefRead (e₁ :: e₂ :: rest) e.localIdx ptrVal.tag).map
+        AllocMapEntry.toBorrowEntry := by
+  have hlook := lookupBorrow_map_toBorrowEntry_of_nodup hnodup he
+  rw [htag] at hlook
+  unfold freezeDerefReadBorrowsAt updateAllocMapOnDerefRead
+  rw [hptr]
+  dsimp only
+  rw [hlook]
+  dsimp only [AllocMapEntry.toBorrowEntry, appendProjections]
+  exact freezeTreeBorrowsOnReadAtProj_map_toBorrowEntry (e₁ :: e₂ :: rest) (e₁ :: e₂ :: rest)
+    e.localIdx ptrVal.tag
+
+/-! ### `StackScalarAllocShape`, Scalar Overwrite, and Uninitialized Read Lemmas -/
+
+private def ptrAlloc_raw {P E : Type} (a : Miri.Memory.Allocation P E) : Array UInt8 :=
+  Miri.Memory.Allocation.casesOn (motive := fun _ => Array UInt8) a
+    (fun raw _ _ _ _ _ _ _ => raw)
+
+private def ptrAlloc_pointerSize (layout : Miri.ABI.TargetDataLayout) : Miri.ABI.Size :=
+  Miri.ABI.Size.fromBits layout.pointerWidth.bits
+
+private def ptrAlloc_targetUIntBytes (layout : Miri.ABI.TargetDataLayout)
+    (size : Miri.ABI.Size) (bits : Miri.ABI.U128) :
+    Except Miri.Memory.AllocError (Array UInt8) := do
+  if size.bytes > 16 then throw (.scalarBytesTooWide size)
+  let count := size.bytes.toNat
+  let mut result := #[]
+  for index in [:count] do
+    let valueIndex := if layout.endian == .little then index else count - index - 1
+    let byte := (bits.toNat / 2 ^ (8 * valueIndex)) % 256
+    result := result.push (UInt8.ofNat byte)
+  return result
+
+private def ptrAlloc_readTargetUInt (layout : Miri.ABI.TargetDataLayout)
+    (bytes : Array UInt8) : Except Miri.Memory.AllocError Miri.ABI.U128 := do
+  if bytes.size > 16 then
+    throw (.scalarBytesTooWide (Miri.ABI.Size.ofBytes (UInt64.ofNat bytes.size)))
+  let mut value := 0
+  for index in [:bytes.size] do
+    let some byte := bytes[index]? | throw (.invalidSliceEndpoints index (index + 1) bytes.size)
+    let valueIndex := if layout.endian == .little then index else bytes.size - index - 1
+    value := value + byte.toNat * 2 ^ (8 * valueIndex)
+  return BitVec.ofNat 128 value
+
+private def ptrAlloc_checkedSlice {P E : Type} (allocation : Miri.Memory.Allocation P E)
+    (range : Miri.Memory.AllocRange) : Except Miri.Memory.AllocError (Array UInt8) := do
+  if (ptrAlloc_raw allocation).size != allocation.byteSize.bytes.toNat then
+    throw (.storageLengthMismatch allocation.byteSize (ptrAlloc_raw allocation).size)
+  let finish ← range.endExclusive |>.mapError Miri.Memory.AllocError.memory
+  if range.start.bytes > finish.bytes || finish.bytes > allocation.byteSize.bytes then
+    throw (.outOfBounds range allocation.byteSize)
+  return (ptrAlloc_raw allocation).extract range.start.bytes.toNat finish.bytes.toNat
+
+private theorem ptrAlloc_getBytesUnchecked_eq {P E : Type}
+    (allocation : Miri.Memory.Allocation P E) (range : Miri.Memory.AllocRange) :
+    Miri.Memory.Allocation.getBytesUnchecked allocation range =
+      ptrAlloc_checkedSlice allocation range := rfl
+
+private def ptrAlloc_readScalar {P E : Type} [DecidableEq P] [Miri.Memory.PointerProvenance P]
+    (allocation : Miri.Memory.Allocation P E) (layout : Miri.ABI.TargetDataLayout)
+    (range : Miri.Memory.AllocRange) (readProvenance : Bool) :
+    Except Miri.Memory.AllocError (Miri.Memory.Scalar P) := do
+  match ← (allocation.initializationMask.isRangeInitialized range).mapError
+      Miri.Memory.AllocError.memory with
+  | .error bad => throw (.invalidUninitBytes (some ⟨range, bad⟩))
+  | .ok () => pure ()
+  let bytes ← Miri.Memory.Allocation.getBytesUnchecked allocation range
+  let bits ← ptrAlloc_readTargetUInt layout bytes
+  if readProvenance then
+    let targetSize := ptrAlloc_pointerSize layout
+    if range.size != targetSize then
+      throw (.scalarPointerNotTargetSized range.size targetSize)
+    let provenance ← match allocation.provenanceMap.readPtr range.start targetSize with
+      | .ok provenance => pure provenance
+      | .error (.readPartialPointer offset) => throw (.readPartialPointer offset)
+      | .error reason => throw (.provenance reason)
+    match provenance with
+    | some provenance =>
+      if bits.toNat > 18446744073709551615 then
+        throw (.pointerBitsDoNotFitOffset bits)
+      return Miri.Memory.Scalar.fromPointer layout
+        (Miri.Memory.Pointer.new provenance (Miri.ABI.Size.ofBytes (UInt64.ofNat bits.toNat)))
+    | none =>
+      let scalar ← (Miri.Memory.Scalar.fromUInt bits range.size).mapError
+        Miri.Memory.AllocError.scalar
+      return scalar
+  else
+    if Miri.Memory.PointerProvenance.offsetIsAddr (Prov := P) then
+      let scalar ← (Miri.Memory.Scalar.fromUInt bits range.size).mapError
+        Miri.Memory.AllocError.scalar
+      return scalar
+    let isEmpty ←
+      (allocation.provenanceMap.rangeEmpty range (ptrAlloc_pointerSize layout)).mapError
+        Miri.Memory.AllocError.provenance
+    if isEmpty then
+      let scalar ← (Miri.Memory.Scalar.fromUInt bits range.size).mapError
+        Miri.Memory.AllocError.scalar
+      return scalar
+    throw (.readPointerAsInt none)
+
+private theorem ptrAlloc_readScalar_eq {P E : Type} [DecidableEq P]
+    [Miri.Memory.PointerProvenance P]
+    (allocation : Miri.Memory.Allocation P E) (layout : Miri.ABI.TargetDataLayout)
+    (range : Miri.Memory.AllocRange) (readProvenance : Bool) :
+    allocation.readScalar layout range readProvenance =
+      ptrAlloc_readScalar allocation layout range readProvenance := rfl
+
+private def ptrAlloc_leBytes (x n : Nat) : Array UInt8 :=
+  ((List.range' 0 n).map fun i => UInt8.ofNat ((x / 2 ^ (8 * i)) % 256)).toArray
+
+private theorem ptrAlloc_leBytes_size (x n : Nat) : (ptrAlloc_leBytes x n).size = n := by
+  simp [ptrAlloc_leBytes]
+
+private theorem ptrAlloc_encode_loop (x : Nat) (l : List Nat) (acc : Array UInt8) :
+    forIn (m := Except Miri.Memory.AllocError) l acc
+        (fun index (r : Array UInt8) => pure (ForInStep.yield
+          (r.push (UInt8.ofNat (x / 2 ^ (8 * index) % 256))))) =
+      .ok (acc ++ (l.map fun i => UInt8.ofNat (x / 2 ^ (8 * i) % 256)).toArray) := by
+  induction l generalizing acc with
+  | nil => simp [pure, Except.pure]
+  | cons i l ih =>
+    rw [List.forIn_cons, pure_bind]
+    simp only
+    rw [ih]
+    congr 1
+    apply Array.toList_inj.mp
+    simp
+
+private theorem ptrAlloc_targetUIntBytes_spec (size : Miri.ABI.Size) (bits : Miri.ABI.U128)
+    (hle : size.bytes.toNat ≤ 16) :
+    ptrAlloc_targetUIntBytes annealTargetDataLayout size bits =
+      .ok (ptrAlloc_leBytes bits.toNat size.bytes.toNat) := by
+  have small : ¬ size.bytes > 16 := by
+    simp only [GT.gt, UInt64.lt_iff_toNat_lt]
+    simpa using Nat.not_lt.mpr hle
+  have hendian : (annealTargetDataLayout.endian == Miri.ABI.Endian.little) = true := rfl
+  unfold ptrAlloc_targetUIntBytes
+  simp only [small, ↓reduceIte, Std.Legacy.Range.forIn_eq_forIn_range', hendian,
+    Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one, bind_pure]
+  rw [ptrAlloc_encode_loop]
+  simp [ptrAlloc_leBytes]
+
+private def ptrAlloc_leSum (x k : Nat) : Nat → Nat
+  | 0 => 0
+  | m + 1 => x / 2 ^ (8 * k) % 256 * 2 ^ (8 * k) + ptrAlloc_leSum x (k + 1) m
+
+private theorem ptrAlloc_leSum_spec (x : Nat) :
+    ∀ m k, x % 2 ^ (8 * k) + ptrAlloc_leSum x k m = x % 2 ^ (8 * (k + m)) := by
+  intro m
+  induction m with
+  | zero => intro k; simp [ptrAlloc_leSum]
+  | succ m ih =>
+    intro k
+    have hstep : x % 2 ^ (8 * k) + x / 2 ^ (8 * k) % 256 * 2 ^ (8 * k) =
+        x % 2 ^ (8 * (k + 1)) := by
+      rw [show 8 * (k + 1) = 8 * k + 8 by omega, Nat.pow_add, Nat.mod_mul]
+      simp only [show (2 : Nat) ^ 8 = 256 by rfl]
+      rw [Nat.mul_comm (2 ^ (8 * k))]
+    simp only [ptrAlloc_leSum]
+    rw [← Nat.add_assoc, hstep, ih (k + 1), show k + 1 + m = k + (m + 1) by omega]
+
+private theorem ptrAlloc_decode_loop (x n : Nat)
+    (f : Nat → Nat → Except Miri.Memory.AllocError (ForInStep Nat))
+    (hf : ∀ index s, index < n →
+      f index s = .ok (.yield (s + x / 2 ^ (8 * index) % 256 * 2 ^ (8 * index)))) :
+    ∀ m k acc, k + m ≤ n →
+      forIn (List.range' k m) acc f = .ok (acc + ptrAlloc_leSum x k m) := by
+  intro m
+  induction m with
+  | zero => intro k acc _; simp [ptrAlloc_leSum, pure, Except.pure]
+  | succ m ih =>
+    intro k acc hkm
+    rw [List.range'_succ, List.forIn_cons, hf k acc (by omega)]
+    simp only [ptrAlloc_leSum]
+    rw [show (Except.ok (ForInStep.yield (acc + x / 2 ^ (8 * k) % 256 * 2 ^ (8 * k))) :
+        Except Miri.Memory.AllocError (ForInStep Nat)) = pure (ForInStep.yield _) from rfl,
+      pure_bind]
+    simp only
+    rw [ih (k + 1) _ (by omega), Nat.add_assoc]
+
+private theorem ptrAlloc_readTargetUInt_leBytes (x n : Nat) (hn : n ≤ 16) :
+    ptrAlloc_readTargetUInt annealTargetDataLayout (ptrAlloc_leBytes x n) =
+      .ok (BitVec.ofNat 128 (x % 2 ^ (8 * n))) := by
+  have small : ¬ n > 16 := by omega
+  have hendian : (annealTargetDataLayout.endian == Miri.ABI.Endian.little) = true := rfl
+  have hlsize : (ptrAlloc_leBytes x n).size = n := by simp [ptrAlloc_leBytes]
+  unfold ptrAlloc_readTargetUInt
+  simp only [hlsize, small, ↓reduceIte, Std.Legacy.Range.forIn_eq_forIn_range',
+    hendian, Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+  rw [ptrAlloc_decode_loop x n _ ?hf n 0 0 (by omega)]
+  · have := ptrAlloc_leSum_spec x n 0
+    simp only [Nat.mul_zero, Nat.pow_zero, Nat.mod_one, Nat.zero_add] at this
+    simp [this, pure, Except.pure, bind, Except.bind]
+  · intro index s hi
+    have hb : (x / 2 ^ (8 * index) % 256) < 256 := Nat.mod_lt _ (by decide)
+    simp [ptrAlloc_leBytes, hi, pure, Except.pure, Nat.mod_eq_of_lt hb]
+
+private theorem ptrAlloc_allocRange_end (size : Miri.ABI.Size) :
+    (Miri.Memory.allocRange Miri.ABI.Size.ZERO size).endExclusive = .ok size := by
+  cases size
+  simp [Miri.Memory.AllocRange.endExclusive, Miri.Memory.AllocRange.end, Miri.Memory.allocRange,
+    Miri.ABI.Size.ZERO, Miri.ABI.Size.add, Miri.ABI.Size.ofBytes, Except.mapError]
+
+private theorem ptrAlloc_scalarModulus_eq_two_pow (sz : Nat) :
+    scalarModulus sz = 2 ^ (8 * sz) := by
+  induction sz with
+  | zero => rfl
+  | succ k ih =>
+    show 256 * scalarModulus k = 2 ^ (8 * (k + 1))
+    rw [ih, show 8 * (k + 1) = 8 * k + 8 by omega, Nat.pow_add, Nat.mul_comm]
+
+private theorem ptrAlloc_fromUInt {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) :
+    Miri.Memory.Scalar.fromUInt (Prov := AnnealProv) (BitVec.ofNat 128 sc.bits)
+        (translateSizeBytes sc.sizeBytes) = .ok (Miri.Memory.Scalar.fromScalarInt msc) := by
+  obtain ⟨msc', htry, hrel'⟩ := tryFromUInt_of_valid_canonical hrel.validBytes hrel.canonical
+  have heq : msc' = msc := by
+    cases msc'; cases msc
+    have hd := hrel'.data_eq.trans hrel.data_eq.symm
+    have hs := hrel'.size_eq.trans hrel.size_eq.symm
+    simp only [Miri.Memory.ScalarInt.data, Miri.Memory.ScalarInt.size] at hd hs
+    subst hd hs; rfl
+  subst heq
+  unfold Miri.Memory.Scalar.fromUInt
+  simp [htry, Except.mapError, bind, Except.bind, pure, Except.pure]
+
+namespace StackScalarAllocShape
+
+/-- A fresh `Allocation.tryNew size align .Uninit annealZeroedStorage` tagged
+with `extra` satisfies `StackScalarAllocShape size` and has alignment `align`. -/
+theorem of_tryNew {E : Type} {size : Miri.ABI.Size} {align : Miri.ABI.Align}
+    {allocation : Miri.Memory.Allocation AnnealProv Unit} (extra : E)
+    (h : Miri.Memory.Allocation.tryNew size align .Uninit annealZeroedStorage = .ok allocation) :
+    (allocation.withExtra extra).align = align ∧
+    StackScalarAllocShape size (allocation.withExtra extra) := by
+  have h' : Miri.Memory.Allocation.tryNew size align .Uninit
+      (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok allocation := h
+  obtain ⟨hprov, hmask⟩ := Miri.Memory.Allocation.tryNew_uninit_shape size align allocation h'
+  have hspec := freshStackAlloc_spec h
+  have halloc_eq :
+      (allocation.withExtra extra).len = size.bytes.toNat ∧
+      (allocation.withExtra extra).align = align := by
+    have h1 := h
+    unfold Miri.Memory.Allocation.tryNew at h1
+    simp only [bind, Except.bind] at h1
+    split at h1
+    · cases h1
+    · rename_i v hv
+      change (do
+        let bytes ← (Miri.ABI.Align.bytes align).mapError Miri.Memory.AllocError.alignment
+        let normalized ← (Miri.ABI.Align.fromBytes bytes).mapError Miri.Memory.AllocError.alignment
+        if normalized == align then return align
+        throw (Miri.Memory.AllocError.alignment (.tooLarge bytes))) = .ok v at hv
+      cases hb : Miri.ABI.Align.bytes align with
+      | error _ => simp [hb, bind, Except.bind, Except.mapError] at hv
+      | ok b =>
+        cases hf : Miri.ABI.Align.fromBytes b with
+        | error _ => simp [hb, hf, bind, Except.bind, Except.mapError] at hv
+        | ok n =>
+          simp only [hb, hf, bind, Except.bind, Except.mapError, pure, Except.pure] at hv
+          by_cases hn : n = align
+          · subst hn
+            obtain ⟨a0, h0, _, hlen0, _, _, halign0⟩ :=
+              Miri.Memory.Allocation.tryNew_replicate_full (P := AnnealProv) size n b hb hf
+            rw [h'] at h0
+            injection h0 with ha
+            subst ha
+            cases allocation
+            exact ⟨hlen0, halign0⟩
+          · simp [hn, throw, throwThe, MonadExceptOf.throw] at hv
+  exact ⟨halloc_eq.2, ⟨hspec.1, halloc_eq.1, hspec.2.1, hprov, ⟨false, hmask⟩⟩⟩
+
+/-- Overwriting a `StackScalarAllocShape` allocation at offset `0` with a
+`ScalarRel`-related scalar succeeds, preserves `StackScalarAllocShape` and
+`align`, marks the whole range initialized, and reads back `.fromScalarInt msc`. -/
+theorem writeScalar_readScalar {E : Type} {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape (translateSizeBytes sc.sizeBytes) A) :
+    ∃ alloc' : Miri.Memory.Allocation AnnealProv E,
+      Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO msc.size)
+          (Miri.Memory.Scalar.fromScalarInt msc) A = .ok () alloc' ∧
+      alloc'.align = A.align ∧
+      StackScalarAllocShape (translateSizeBytes sc.sizeBytes) alloc' ∧
+      alloc'.initializationMask.isRangeInitialized
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes sc.sizeBytes)) =
+        .ok (.ok ()) ∧
+      alloc'.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes sc.sizeBytes)) false =
+        .ok (Miri.Memory.Scalar.fromScalarInt msc) := by
+  rcases hshape with ⟨hsz, hlen, hmut, hprov, ⟨initBool, hmask⟩⟩
+  have hn : (translateSizeBytes sc.sizeBytes).bytes.toNat = sc.sizeBytes := by
+    rcases hrel.validBytes with h | h | h | h | h <;> rw [h] <;> rfl
+  have hn16 : (translateSizeBytes sc.sizeBytes).bytes.toNat ≤ 16 := by
+    rw [hn]; rcases hrel.validBytes with h | h | h | h | h <;> omega
+  have hrange :
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes sc.sizeBytes)).size =
+        translateSizeBytes sc.sizeBytes := rfl
+  have hconv :
+      (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toBitsOrPtrInternal
+          (translateSizeBytes sc.sizeBytes) = .ok (.bits (BitVec.ofNat 128 sc.bits)) := by
+    unfold Miri.Memory.Scalar.toBitsOrPtrInternal
+    simp only [Miri.Memory.Scalar.fromScalarInt, hrel.toBits_eq, Except.mapError, bind,
+      Except.bind, pure, Except.pure]
+  have hend := ptrAlloc_allocRange_end (translateSizeBytes sc.sizeBytes)
+  have hraw : (ptrAlloc_raw A).size = (translateSizeBytes sc.sizeBytes).bytes.toNat := hlen
+  have hslice : Miri.Memory.Allocation.getBytesUnchecked A
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes sc.sizeBytes)) =
+      .ok ((ptrAlloc_raw A).extract 0 (translateSizeBytes sc.sizeBytes).bytes.toNat) := by
+    change ptrAlloc_checkedSlice A _ = _
+    unfold ptrAlloc_checkedSlice
+    simp only [hraw, hsz, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hend,
+      Except.mapError, bind, Except.bind]
+    simp [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, pure, Except.pure]
+  unfold Miri.Memory.Allocation.getBytesUnchecked at hslice
+  have hmask2 : A.initializationMask.setRange
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes sc.sizeBytes)) true =
+      .ok (Miri.Memory.InitMask.new (translateSizeBytes sc.sizeBytes) true) := by
+    rw [hmask]
+    exact Miri.Memory.InitMask.full_overwrite_stays_lazy _ _ initBool true _ hend rfl
+      (UInt64.le_refl _)
+  unfold Miri.Memory.Allocation.initializationMask at hmask2
+  unfold Miri.Memory.Allocation.provenanceMap at hprov
+  have htoNat : (BitVec.ofNat 128 sc.bits).toNat = sc.bits := by
+    rw [BitVec.toNat_ofNat]
+    apply Nat.mod_eq_of_lt
+    have hle128 : scalarModulus sc.sizeBytes ≤ 2 ^ 128 := by
+      rw [ptrAlloc_scalarModulus_eq_two_pow]
+      exact Nat.pow_le_pow_right (by decide)
+        (by rcases hrel.validBytes with h | h | h | h | h <;> omega)
+    have hcan := hrel.canonical
+    omega
+  obtain ⟨alloc', hw, halign', hsz', hlen_out, hmut', hprov', hmask', hraw'⟩ :
+      ∃ alloc' : Miri.Memory.Allocation AnnealProv E,
+        Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+            (Miri.Memory.allocRange Miri.ABI.Size.ZERO msc.size)
+            (Miri.Memory.Scalar.fromScalarInt msc) A = .ok () alloc' ∧
+        alloc'.align = A.align ∧
+        alloc'.byteSize = translateSizeBytes sc.sizeBytes ∧
+        alloc'.len = (translateSizeBytes sc.sizeBytes).bytes.toNat ∧
+        alloc'.mutability = .Mut ∧
+        alloc'.provenanceMap = Miri.Memory.ProvenanceMap.new ∧
+        alloc'.initializationMask =
+          Miri.Memory.InitMask.new (translateSizeBytes sc.sizeBytes) true ∧
+        ptrAlloc_raw alloc' =
+          ptrAlloc_leBytes sc.bits (translateSizeBytes sc.sizeBytes).bytes.toNat := by
+    rw [hrel.size_eq]
+    unfold Miri.Memory.Allocation.writeScalar
+    simp only [hmut, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hrange, hconv, pure_bind]
+    rw [hslice]
+    simp only [hmask2]
+    rw [hprov, Miri.Memory.ProvenanceMap.clear_new _ _ _ _ ?pos hend]
+    case pos => decide
+    simp only []
+    split
+    · rename_i data hdata
+      have hdata' : ptrAlloc_targetUIntBytes annealTargetDataLayout
+          (translateSizeBytes sc.sizeBytes) (BitVec.ofNat 128 sc.bits) = .ok data := hdata
+      rw [ptrAlloc_targetUIntBytes_spec _ _ hn16] at hdata'
+      cases hdata'
+      have hstart : (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+          (translateSizeBytes sc.sizeBytes)).start.bytes.toNat = 0 := rfl
+      have hlbytes : (ptrAlloc_leBytes (BitVec.ofNat 128 sc.bits).toNat
+          (translateSizeBytes sc.sizeBytes).bytes.toNat).size =
+          (translateSizeBytes sc.sizeBytes).bytes.toNat := by simp [ptrAlloc_leBytes]
+      have hlen' := hlen; unfold Miri.Memory.Allocation.len at hlen'
+      have hsz_u := hsz; unfold Miri.Memory.Allocation.byteSize at hsz_u
+      simp only [hstart, hlbytes, hlen', hsz_u, Array.size_append, Array.size_extract,
+        Nat.min_self, Nat.zero_add, Nat.sub_self, Nat.add_zero, Nat.zero_min,
+        bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+      refine ⟨_, rfl, rfl, rfl, ?_, rfl, rfl, rfl, ?_⟩
+      · simp [Miri.Memory.Allocation.len, ptrAlloc_leBytes, hlen']
+      · simp [ptrAlloc_raw, htoNat, hlen']
+    · rename_i err herr
+      have herr' : ptrAlloc_targetUIntBytes annealTargetDataLayout
+          (translateSizeBytes sc.sizeBytes) (BitVec.ofNat 128 sc.bits) = .error err := herr
+      rw [ptrAlloc_targetUIntBytes_spec _ _ hn16] at herr'
+      cases herr'
+  refine ⟨alloc', hw, halign', ⟨hsz', hlen_out, hmut', hprov', ⟨true, hmask'⟩⟩, ?_, ?_⟩
+  · rw [hmask']
+    exact Miri.Memory.InitMask.lazy_initialized_query _ _ _ hend (UInt64.le_refl _)
+  · have hslice_read : ptrAlloc_checkedSlice alloc'
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes sc.sizeBytes)) =
+        .ok (ptrAlloc_leBytes sc.bits (translateSizeBytes sc.sizeBytes).bytes.toNat) := by
+      have hrawsize : (ptrAlloc_raw alloc').size =
+          (translateSizeBytes sc.sizeBytes).bytes.toNat := by
+        rw [hraw', ptrAlloc_leBytes_size]
+      unfold ptrAlloc_checkedSlice
+      simp only [hrawsize, hsz', bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hend,
+        Except.mapError, bind, Except.bind]
+      simp [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, pure, Except.pure, hraw',
+        ptrAlloc_leBytes_size]
+    have hoff : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+    have hmod : sc.bits % 2 ^ (8 * (translateSizeBytes sc.sizeBytes).bytes.toNat) = sc.bits := by
+      rw [hn, ← ptrAlloc_scalarModulus_eq_two_pow]
+      exact Nat.mod_eq_of_lt hrel.canonical
+    rw [ptrAlloc_readScalar_eq]
+    unfold ptrAlloc_readScalar
+    rw [hmask', Miri.Memory.InitMask.lazy_initialized_query _ _ _ hend (UInt64.le_refl _)]
+    simp only [Except.mapError, bind, Except.bind]
+    rw [ptrAlloc_getBytesUnchecked_eq, hslice_read]
+    simp only []
+    rw [ptrAlloc_readTargetUInt_leBytes _ _ hn16, hmod]
+    simp only [Bool.false_eq_true, ↓reduceIte, hoff, hrange, ptrAlloc_fromUInt hrel]
+
+/-- Reading an uninitialized `StackScalarAllocShape` allocation (where
+`isRangeInitialized ≠ .ok (.ok ())` and `sz ≠ ZERO`) fails `readScalar` with
+`.error (.invalidUninitBytes _)`. -/
+theorem uninit_readScalar_err {E : Type} {sz : Miri.ABI.Size}
+    {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape sz A)
+    (huninit : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO sz) ≠ .ok (.ok ()))
+    (readProvenance : Bool) :
+    ∃ info, A.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO sz) readProvenance =
+      .error (.invalidUninitBytes info) := by
+  rcases hshape with ⟨_, _, _, _, ⟨b, hmask⟩⟩
+  have hend := ptrAlloc_allocRange_end sz
+  cases b with
+  | true =>
+    exfalso
+    apply huninit
+    rw [hmask]
+    exact Miri.Memory.InitMask.lazy_initialized_query _ _ _ hend (UInt64.le_refl _)
+  | false =>
+    change ∃ info, ptrAlloc_readScalar A annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO sz) readProvenance =
+      .error (.invalidUninitBytes info)
+    unfold ptrAlloc_readScalar
+    rw [hmask, Miri.Memory.InitMask.lazy_uninitialized_query sz _ sz hend (UInt64.le_refl _)]
+    exact ⟨_, rfl⟩
+
+end StackScalarAllocShape
+
+/-- Updating `id`'s allocation in `mach.memory.live` via `setLiveAllocation`
+preserves `MemPlaceRel` on any `MemPlace` pointing to a distinct allocation
+`allocId ≠ id`. -/
+theorem MemPlaceRel.of_setLiveAllocation_ne
+    {mach : AnnealMachine} {id : Miri.Memory.AllocId}
+    {localAlloc :
+      Miri.Memory.LocalAllocation
+        AnnealProv
+        (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind}
+    {alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    {newMem : AnnealMemory}
+    (hfind : mach.memory.live.find? (fun x => x.1 == id) = some (id, localAlloc))
+    (hset : mach.memory.setLiveAllocation id alloc' = .ok newMem)
+    {ty : Ty} {layouts : LayoutTable} {optVal : Option Value}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (hmp : MemPlaceRel mach ty layouts optVal mp)
+    (hne : mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId ≠ some id) :
+    MemPlaceRel { mach with memory := newMem } ty layouts optVal mp := by
+  have hmem_eq := Miri.Memory.MemoryState.setLiveAllocation_of_find
+    mach.memory id localAlloc alloc' hfind
+  rw [hmem_eq] at hset
+  injection hset with hnm
+  subst hnm
+  cases hmp with
+  | mk allocId tag baseAddr relOffset la hprov hmis hmeta hl hb hovf hptr hmut halign
+      hbounds huninit hval hscalar =>
+    have hne_id : allocId ≠ id := by
+      intro heq
+      apply hne
+      rw [hprov, heq]; rfl
+    refine .mk allocId tag baseAddr relOffset la hprov hmis hmeta ?_ hb hovf hptr hmut
+      halign hbounds huninit hval hscalar
+    simp only [Array.toList_push, List.mem_append, Array.toList_filter, List.mem_filter]
+    exact Or.inl ⟨hl, by simp [hne_id]⟩
+
+/-- Updating `id`'s allocation in `mach.memory.live` via `setLiveAllocation`
+preserves `LocalRelLM3_1` for any local that does not own `id`. -/
+theorem LocalRelLM3_1.of_setLiveAllocation_ne
+    {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {id : Miri.Memory.AllocId}
+    {localAlloc :
+      Miri.Memory.LocalAllocation
+        AnnealProv
+        (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind}
+    {alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    {newMem : AnnealMemory}
+    (hfind : mach.memory.live.find? (fun x => x.1 == id) = some (id, localAlloc))
+    (hset : mach.memory.setLiveAllocation id alloc' = .ok newMem)
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach allocMap decl layouts slot mls)
+    (hne : ∀ mp, mls.value = .live (.indirect mp) →
+      mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId ≠ some id) :
+    LocalRelLM3_1 { mach with memory := newMem } allocMap decl layouts slot mls := by
+  cases h with
+  | rawPtr p mptr cl mutability pointeeKind hc hty hptr =>
+    exact .rawPtr p mptr cl mutability pointeeKind hc hty hptr
+  | base hb =>
+    cases hb with
+    | dead cl hc => exact .base (.dead cl hc)
+    | immediate slot imm cl hc hv => exact .base (.immediate slot imm cl hc hv)
+    | indirect slot mp cl hc hnd hmp =>
+      exact .base (.indirect slot mp cl hc hnd
+        (hmp.of_setLiveAllocation_ne hfind hset (hne mp rfl)))
 
 end LeanMiriSpec.Correspondence

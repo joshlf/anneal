@@ -71,9 +71,12 @@ import LeanMiriSpec.Audit
   validation (`checkAndDerefPtr`), and `Miri.Interpreter.ptrOffsetInbounds` (`LM-3.1`).
 * `LeanMiriSpec.Correspondence.SimLM3_1`: `LM-3.1` correspondence for `Rvalue.RawPtr`
   (`&raw const`/`&raw mut`) with `forceAllocation`, `PlaceElem.Deref` (`*ptr`) reads,
-  writes, and UB, `BinOp.Offset` (`inbounds` vs. `wrapping`), `CastKind.PtrToPtr`,
-  and pointer/integer exposure casts (`step_stmt_lm3_1_simulation`).
-* `LeanMiriSpec.Correspondence.WitLM3_1`: non-vacuity witnesses for `LM-3.1`.
+  writes, and UB, `StorageLive`/`StorageDead` on address-taken locals,
+  `BinOp.Offset` (`inbounds` vs. `wrapping`), `CastKind.PtrToPtr`, and
+  pointer/integer exposure casts (`step_stmt_lm3_1_simulation`,
+  `step_stmt_lm3_1_state_simulation`).
+* `LeanMiriSpec.Correspondence.WitLM3_1`: standalone and end-to-end real-step
+  (`Miri.Interpreter.Step.step`) witnesses for `LM-3.1`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
