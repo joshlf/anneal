@@ -1883,6 +1883,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   ptrSpinLoop_ctxOk
   ptrSpinLoop_minirust_steps_ok
   ptrSpinLoop_minirust_diverges_rel
+  ptrSpinLoop_minirust_direct
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub
@@ -2102,6 +2103,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   ptrSpinLoop_ctxOk
   ptrSpinLoop_minirust_steps_ok
   ptrSpinLoop_minirust_diverges_rel
+  ptrSpinLoop_minirust_direct
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub

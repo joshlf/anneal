@@ -26,8 +26,9 @@ computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`).
 fragment (`*_inFragment`), so the end-to-end correspondence theorems
 (`mirCall_ret`, `mirCall_ub`, `mirCall_noUB`, `mirCall_progress_N`,
 `mirCall_steps_error`, `mirCall_outcome_N`, `mirCall_diverges_steps_ok`,
-`mirCall_diverges_rel_N`) apply to them directly. `arrayElemPtr` (borrowing a non-parameter `[u32; 2]` temporary),
-`dangling`, and every divergent witness below lie outside the fragment
+`mirCall_diverges_rel_N`) apply to them directly. `arrayElemPtr` (borrowing a
+non-parameter `[u32; 2]` temporary), `dangling`, and every divergent witness
+below lie outside the fragment
 (`*_notInFragment`): the fragment borrows (`&raw`) only parameters,
 which it never writes directly (`directWrite`) nor kills (`dangling`), casts
 pointers (`PtrToPtr`) only between equal pointee types and never from `*const`
@@ -1459,6 +1460,17 @@ theorem ptrSpinLoop_minirust_diverges_rel (n : Nat) :
       Reaches (mirCallTree ptrSpinLoop [.scalar ⟨5, 4⟩]) tr (mirTree ptrSpinLoop s') :=
   mirCall_diverges_rel_N ptrSpinLoop_inFragment ptrSpinLoop_translate ctx0 ptrSpinLoop_ctxOk
     [.scalar ⟨5, 4⟩] (by decide) ptrSpinLoopMInit rfl rfl rfl ptrSpinLoop_noUB ptrSpinLoop_diverges n
+
+/-- MiniRust, run directly rather than through the correspondence: after
+`1 + 4 + 4 * 5 = 25` steps (the init block's `Goto`, `bb0`, and four iterations
+of `bb1`), the callee is still running (the stack holds the caller and the
+callee) and `x` (allocation `2`) still holds `5`, which every iteration reads
+through the pointer and writes back. -/
+theorem ptrSpinLoop_minirust_direct :
+    (Interp.steps 25 ptrSpinLoopMInit).toOption.map
+        (fun m => (m.threads.map (·.stack.length), (m.mem.memory.allocations[2]?).map (·.data))) =
+      some ([2], some (scalarBytes u32 5)) := by
+  decide +kernel
 
 /-! ## Uninitialized pointer dereference UB (in fragment) -/
 

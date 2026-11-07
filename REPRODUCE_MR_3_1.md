@@ -74,13 +74,13 @@ unless `MiniRustSpec.Audit` accepts every declaration. Expected audit lines:
 [ANCHOR-AUDIT] decls=2 axioms=[] sorry_free=true
 [SIMULATION-AUDIT] decls=221 axioms=[propext, Classical.choice, Quot.sound] sorry_free=true
 [WITNESS-AUDIT] decls=485 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-[POINTER-AUDIT] decls=216 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
-MiniRustSpec.Audit: exhaustively verified standard axioms for 13811 declarations across all MiniRustSpec.* modules
+[POINTER-AUDIT] decls=217 axioms=[propext, Quot.sound, Classical.choice] sorry_free=true
+MiniRustSpec.Audit: exhaustively verified standard axioms for 13813 declarations across all MiniRustSpec.* modules
 Build completed successfully (70 jobs).
 ```
 
 `[POINTER-AUDIT]` covers 37 theorems of `Correspondence/Pointers.lean`, 19 of
-`Correspondence/PointerStep.lean`, and the 160 theorems of
+`Correspondence/PointerStep.lean`, and the 161 theorems of
 `Correspondence/PointerWitness.lean`. `[SIMULATION-AUDIT]` includes
 `step_correspondence_N`, `step_start_N`, `steps_outcome_N`,
 `mirNoUB_progress_N`, `mirNoUB_diverges_steps_ok_N`, and the `_N` whole-call
@@ -105,7 +105,7 @@ stepping the machine that runs `translateFn`'s output from its start.
 | `ptrCountdown` (four-block loop counting `x` down through `&raw mut x`, `*p` read before each `switchInt`, `x` read directly at the end; in the fragment) | returns `3` | returns `3`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`) |
 | `constBorrowLoop` (fresh `&raw const x` in each loop iteration, read through, then `StorageDead`; in the fragment) | returns `15` | returns `15`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`) |
 | `repointPtr` (`&raw mut a[0 of 2]` and `&raw mut a[1 of 2]`, an initialized pointer local overwritten with the second pointer and written through; in the fragment) | returns `105` | returns `105`, also derived by `mirCall_ret` (`mirCall_noUB`, `mirCall_progress_N`) |
-| `ptrSpinLoop` (`&raw mut x` in `bb0`, then `PlaceMention(_2)`, self-assignment `_2 = Offset(copy _2, 0)`, `_0 = copy (*_2)`, and `(*_2) = copy _0` in `bb1`; in the fragment) | diverges (`MirNoUBTree`, `¬ ReachesRet`) | diverges in lockstep `StateRelN` + `Reaches`, derived by `mirCall_diverges_steps_ok` and `mirCall_diverges_rel_N` |
+| `ptrSpinLoop` (`&raw mut x` in `bb0`, then `PlaceMention(_2)`, self-assignment `_2 = Offset(copy _2, 0)`, `_0 = copy (*_2)`, and `(*_2) = copy _0` in `bb1`; in the fragment) | diverges (`MirNoUBTree`, `¬ ReachesRet`) | diverges in lockstep `StateRelN` + `Reaches`, derived by `mirCall_diverges_steps_ok` and `mirCall_diverges_rel_N`; still running with `x = 5` after 25 direct steps (`ptrSpinLoop_minirust_direct`) |
 | `uninitPtrReadUb` (`copy (*_p)` on an uninitialized pointer temporary; in the fragment) | UB | UB: language invariant, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
 | `uninitPtrWriteUb` (`(*_p) = copy _1` on an uninitialized pointer temporary; in the fragment) | UB | UB: language invariant, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
 | `deadPtrReadUb` (`copy (*_p)` after `StorageDead(_p)` on a pointer temporary; in the fragment) | UB | UB: dead local, also derived by `mirCall_ub` (`mirCall_steps_error`, `mirCall_outcome_N`) |
