@@ -11,7 +11,11 @@ those terms.
 import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
+import LeanMiriSpec.Correspondence.SimLM1_2
 import LeanMiriSpec.Correspondence.Witness
+import LeanMiriSpec.Correspondence.WitLM1_2
+import LeanMiriSpec.Correspondence.SimLM1_3
+import LeanMiriSpec.Correspondence.WitLM1_3
 import LeanMiriSpec.Correspondence.AllocLM1_4
 import LeanMiriSpec.Correspondence.SimLM1_4
 import LeanMiriSpec.Correspondence.WitLM1_4
@@ -40,6 +44,19 @@ import LeanMiriSpec.Audit
   signed `INT_MIN / -1`, OOB and negative signed shifts, `AddUnchecked`
   overflow, `Unreachable`), `(u16, bool)` scalar pairs, Unicode `char`, indirect
   `MemPlaceRel` allocations, `IntToInt` casts, and `SwitchInt` hooks.
+* `LeanMiriSpec.Correspondence.SimLM1_2`: `LM-1.2` value- and step-level
+  correspondence for boolean `Not`, `Eq`..`Ge` on `bool`/signed/unsigned
+  operands, three-way `Cmp`, `IntToInt` casts, and `SwitchInt`
+  (`step_stmt_lm1_2_simulation`, `step_terminator_lm1_2_simulation`).
+* `LeanMiriSpec.Correspondence.WitLM1_2`: `LM-1.2` non-vacuity witnesses and
+  concrete runs on which both machines agree.
+* `LeanMiriSpec.Correspondence.SimLM1_3`: `LM-1.3` correspondence for `Assert`
+  terminators (`step_terminator_assert_simulation`), `Field` projections of
+  scalar pairs, and checked `Add`/`Sub`/`Mul` followed by their overflow
+  `Assert` (`checked_binop_then_assert_simulation`).
+* `LeanMiriSpec.Correspondence.WitLM1_3`: `LM-1.3` witnesses that run a checked
+  `(u16, bool)` `AddWithOverflow` body to the same result in both machines,
+  with and without overflow.
 * `LeanMiriSpec.Correspondence.AllocLM1_4`: fresh stack allocations of
   `forceAllocation` (shape, and the scalar write/read round trip).
 * `LeanMiriSpec.Correspondence.SimLM1_4`: `StorageLive`/`StorageDead` of any

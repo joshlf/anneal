@@ -580,7 +580,7 @@ theorem annealEvalOperand_move_live
     (.live (.immediate .uninit))
   with_unfolding_all
     unfold annealEvalOperand
-    simp only [Array.isEmpty_empty, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    simp only [Bool.false_eq_true, ↓reduceIte,
       get, getThe, MonadStateOf.get, EStateM.get, set, MonadStateOf.set,
       Bind.bind, EStateM.bind, Pure.pure,
       stack_currentFrame?_singleton m.stack topFrame hframes,
@@ -614,7 +614,7 @@ theorem annealEvalOperand_move_dead
   have hgop := frame_getLocalOperand_dead _ hget_c
   with_unfolding_all
     unfold annealEvalOperand
-    simp only [Array.isEmpty_empty, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    simp only [Bool.false_eq_true, ↓reduceIte,
       get, getThe, MonadStateOf.get, EStateM.get, Bind.bind, EStateM.bind,
       Pure.pure, stack_currentFrame?_singleton m.stack topFrame hframes,
       Option.isNone_some, hres, hgop]

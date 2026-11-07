@@ -13,7 +13,11 @@ import Miri
 import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
+import LeanMiriSpec.Correspondence.SimLM1_2
 import LeanMiriSpec.Correspondence.Witness
+import LeanMiriSpec.Correspondence.WitLM1_2
+import LeanMiriSpec.Correspondence.SimLM1_3
+import LeanMiriSpec.Correspondence.WitLM1_3
 import LeanMiriSpec.Correspondence.AllocLM1_4
 import LeanMiriSpec.Correspondence.SimLM1_4
 import LeanMiriSpec.Correspondence.WitLM1_4
@@ -45,6 +49,11 @@ weakened theorem keeps its name:
 * `annealEvalOperand_move_live`: on `Move`, the hooks deinitialize the
   moved-from local, implementing the runtime-MIR `Operand::Move` semantics that
   Anneal implements and that the pinned Miri interpreter leaves unimplemented;
+* `LM-1.2`: the value-level `bool`/comparison/`Cmp`/`IntToInt`/`SwitchInt`
+  results, the step theorems `step_stmt_lm1_2_simulation` (`StepRel`) and
+  `step_terminator_lm1_2_simulation` (`StepObsRel`), and the `WitLM1_2`
+  witnesses that their premises hold for concrete bodies on which both machines
+  agree;
 * the `LM-1.4` theorems: `StorageLive`/`StorageDead`/`PlaceMention`, destructive
   moves (`evalOperand_move_simulation`), their composition
   (`step_stmt_lm1_4_simulation`), and the representation coalescing theorem
@@ -109,6 +118,31 @@ open LeanMiriSpec.Correspondence in
   evalUnOp_neg_not_simulation
   step_assign_scalar_simulation
   step_terminator_goto_return_simulation
+  evalUnOp_bool_not_simulation
+  evalScalarBinOp_rel_eq
+  integerOps_binary_rel_eq
+  evalBinOp_rel_simulation
+  evalBinOp_cmp_simulation
+  scalarOps_cmp_simulation
+  evalCast_intToInt_simulation
+  cast_intToInt_uninit
+  compareSwitchCase_simulation
+  evalTerminator_switchInt_ok
+  evalTerminator_switchInt_error
+  step_terminator_switchInt_simulation
+  evalOperand_scalar_simulation_opTy
+  scalarOps_binary_boolCmp_simulation
+  step_assign_lm1_2_simulation
+  step_stmt_lm1_2_simulation
+  step_terminator_lm1_2_simulation
+  Witness.lm12Switch_step_applies
+  Witness.lm12Switch_case_agrees
+  Witness.lm12Switch_otherwise_agrees
+  Witness.lm12BoolCmp_step_applies
+  Witness.lm12BoolCmp_returns_agree
+  Witness.lm12Cast_step_applies
+  Witness.lm12Cast_returns_agree
+  Witness.lm12Cast_shapes_agree
   WellTypedBody
   step_wellTypedBody_simulation
   step_wellTypedBody_bisim
@@ -424,6 +458,374 @@ example :
         (runMiriBounded Witness.unaryBitwiseBody 6 Witness.miriUnaryBitwiseInit) = some 0x2A) :=
   ⟨Witness.wellTyped_unaryBitwise, Witness.stateRel_unaryBitwise, Witness.unaryBitwise_returns_agree⟩
 
+/-! ### `LM-1.2` -/
+
+example
+    {sc : MirAst.ScalarInt}
+    {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc)
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List MirAst.LocalDecl)
+    (layouts : Layout.LayoutTable)
+    (ty : Ty)
+    (hty : ty.kind = .bool)
+    (hsz : sc.sizeBytes = 1)
+    (hbits : sc.bits = 0 ∨ sc.bits = 1) :
+    ∃ sc' msc',
+      evalUnaryNot sc (some ty) locals mem = .ok (.scalar sc') locals mem ∧
+      Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooks localDecls layouts) () .Not
+        ⟨.scalar (.fromScalarInt msc), translateTy ty layouts⟩ =
+        .ok ⟨.scalar (.fromScalarInt msc'), translateTy ty layouts⟩ ∧
+      ScalarRel sc' msc' ∧
+      sc'.sizeBytes = 1 ∧ (sc'.bits = 0 ∨ sc'.bits = 1) :=
+  evalUnOp_bool_not_simulation hrel locals mem localDecls layouts ty hty hsz hbits
+
+example
+    (op : MirAst.BinOp)
+    (hop : op = .eq ∨ op = .ne ∨ op = .lt ∨ op = .le ∨ op = .gt ∨ op = .ge)
+    {sc₁ sc₂ : MirAst.ScalarInt}
+    {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁)
+    (hrel₂ : ScalarRel sc₂ msc₂)
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List MirAst.LocalDecl)
+    (layouts : Layout.LayoutTable)
+    (ty : Ty)
+    (hty : ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k))
+    (hsz : sc₁.sizeBytes = sc₂.sizeBytes)
+    (hsz_ty : sc₁.sizeBytes = match ty.kind with | .bool => 1 | .int k => k.byteWidth 64 | .uint k => k.byteWidth 64 | _ => sc₁.sizeBytes)
+    (hbits₁ : ty.kind = .bool → sc₁.bits = 0 ∨ sc₁.bits = 1)
+    (hbits₂ : ty.kind = .bool → sc₂.bits = 0 ∨ sc₂.bits = 1)
+    (mop : Miri.MIR.BinOp)
+    (hmop : translateBinOp op = some mop) :
+    ∃ b : Bool,
+      evalScalarBinOp op sc₁ sc₂ locals mem (tyIsSigned ty) =
+        .ok (.scalar (boolToScalar b)) locals mem ∧
+      Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooks localDecls layouts) () mop
+        ⟨.scalar (.fromScalarInt msc₁), translateTy ty layouts⟩
+        ⟨.scalar (.fromScalarInt msc₂), translateTy ty layouts⟩ =
+        .ok ⟨.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofBool b)),
+          translateTy { kind := .bool, layoutIdx := 0 } emptyLayoutTable⟩ :=
+  evalBinOp_rel_simulation op hop hrel₁ hrel₂ locals mem localDecls layouts ty hty hsz hsz_ty hbits₁ hbits₂ mop hmop
+
+example
+    {sc₁ sc₂ : MirAst.ScalarInt}
+    {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁)
+    (hrel₂ : ScalarRel sc₂ msc₂)
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (isSigned : Bool)
+    (kind : Miri.MIR.IntegerKind)
+    (hsz : sc₁.sizeBytes = sc₂.sizeBytes)
+    (hsigned : kind.signed = isSigned) :
+    ∃ o : Ordering,
+      evalScalarBinOp .cmp sc₁ sc₂ locals mem isSigned =
+        .ok (.scalar ⟨orderingI8Bits o, 1⟩) locals mem ∧
+      Miri.Interpreter.IntegerOps.binary .Cmp
+        ⟨msc₁, ⟨translateSizeBytes sc₁.sizeBytes, kind⟩⟩
+        ⟨msc₂, ⟨translateSizeBytes sc₂.sizeBytes, kind⟩⟩ =
+        .ok (.ordering o) :=
+  evalBinOp_cmp_simulation hrel₁ hrel₂ locals mem isSigned kind hsz hsigned
+
+example
+    {sc₁ sc₂ : MirAst.ScalarInt}
+    {msc₁ msc₂ : Miri.Memory.ScalarInt}
+    (hrel₁ : ScalarRel sc₁ msc₁)
+    (hrel₂ : ScalarRel sc₂ msc₂)
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List MirAst.LocalDecl)
+    (layouts : Layout.LayoutTable)
+    {ty : Ty}
+    {kind : Miri.MIR.IntegerKind}
+    (hty : IsIntegralTy ty kind)
+    (hsz_ty : (translateTy ty layouts).layout.size = translateSizeBytes sc₁.sizeBytes)
+    (hsz : sc₁.sizeBytes = sc₂.sizeBytes) :
+    ∃ (o : Ordering) (msc'' : Miri.Memory.ScalarInt),
+      o = compare (decodeBitsInt kind.signed sc₁.sizeBytes sc₁.bits)
+        (decodeBitsInt kind.signed sc₁.sizeBytes sc₂.bits) ∧
+      evalScalarBinOp .cmp sc₁ sc₂ locals mem (tyIsSigned ty) =
+        .ok (.scalar ⟨orderingI8Bits o, 1⟩) locals mem ∧
+      Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooks localDecls layouts) () .Cmp
+        ⟨.scalar (.fromScalarInt msc₁), translateTy ty layouts⟩
+        ⟨.scalar (.fromScalarInt msc₂), translateTy ty layouts⟩ =
+        .ok ⟨.scalar (.fromScalarInt msc''),
+          translateTy { kind := .int .i8, layoutIdx := 0 } emptyLayoutTable⟩ ∧
+      ScalarRel ⟨orderingI8Bits o, 1⟩ msc'' :=
+  scalarOps_cmp_simulation hrel₁ hrel₂ locals mem localDecls layouts hty hsz_ty hsz
+
+example
+    {sc : MirAst.ScalarInt}
+    {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc)
+    {locals locals' : List LocalSlot}
+    {mem : Memory}
+    {localDecls : List MirAst.LocalDecl}
+    {layouts : Layout.LayoutTable}
+    {op : MirAst.Operand}
+    {srcTy dstTy : Ty}
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok (.scalar sc) locals')
+    (hopTy : operandTy localDecls layouts op = some srcTy)
+    (hsrc : srcTy.kind = .bool ∨ (∃ k, srcTy.kind = .int k) ∨ (∃ k, srcTy.kind = .uint k))
+    (hdst : (∃ k, dstTy.kind = .int k) ∨ (∃ k, dstTy.kind = .uint k))
+    (hsz_src : sc.sizeBytes = match srcTy.kind with | .bool => 1 | .int k => k.byteWidth 64 | .uint k => k.byteWidth 64 | _ => sc.sizeBytes)
+    (hbits_src : srcTy.kind = .bool → sc.bits = 0 ∨ sc.bits = 1)
+    (h_dest : dest.layout = translateTy dstTy layouts) :
+    ∃ msc',
+      evalRvalue locals (.cast .intToInt op dstTy) mem localDecls layouts =
+        .ok (.scalar ⟨(decodeBitsInt (tyIsSigned srcTy) sc.sizeBytes sc.bits %
+          (2 : Int) ^ (8 * boolOrIntByteWidth dstTy)).toNat, boolOrIntByteWidth dstTy⟩) locals' mem ∧
+      Miri.Interpreter.Cast.castFromIntLike (annealCastHooks layouts) ()
+        (.fromScalarInt msc) (translateTy srcTy layouts) (translateTy dstTy layouts) =
+        .ok ⟨.scalar (.fromScalarInt msc'), translateTy dstTy layouts⟩ ∧
+      Miri.Interpreter.Cast.cast (annealCastHooks layouts) () 16
+        ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy layouts⟩ .IntToInt
+        (encodeTyId dstTy) dest =
+        annealWriteImmediate (.scalar (.fromScalarInt msc')) dest ∧
+      ScalarRel ⟨(decodeBitsInt (tyIsSigned srcTy) sc.sizeBytes sc.bits %
+          (2 : Int) ^ (8 * boolOrIntByteWidth dstTy)).toNat, boolOrIntByteWidth dstTy⟩ msc' :=
+  evalCast_intToInt_simulation hrel dest hop hopTy hsrc hdst hsz_src hbits_src h_dest
+
+example
+    (layouts : Layout.LayoutTable)
+    (srcTy dstTy : Ty)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (hsrc : srcTy.kind = .bool ∨ (∃ k, srcTy.kind = .int k) ∨ (∃ k, srcTy.kind = .uint k))
+    (hdst : (∃ k, dstTy.kind = .int k) ∨ (∃ k, dstTy.kind = .uint k))
+    (h_dest : dest.layout = translateTy dstTy layouts)
+    (st : AnnealStepState) :
+    Miri.Interpreter.Cast.cast (annealCastHooks layouts) () 16
+      ⟨.immediate .uninit, translateTy srcTy layouts⟩ .IntToInt (encodeTyId dstTy) dest st =
+      .error (.undefinedBehavior "read of uninitialized local") st :=
+  cast_intToInt_uninit layouts srcTy dstTy dest hsrc hdst h_dest st
+
+example
+    {sc : MirAst.ScalarInt}
+    {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc)
+    (localDecls : List MirAst.LocalDecl)
+    (layouts : Layout.LayoutTable)
+    (ty : Ty)
+    (hty : ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k))
+    (hsz_ty : sc.sizeBytes = match ty.kind with | .bool => 1 | .int k => k.byteWidth 64 | .uint k => k.byteWidth 64 | _ => sc.sizeBytes)
+    (hbits : ty.kind = .bool → sc.bits = 0 ∨ sc.bits = 1)
+    (caseVal : Nat)
+    (hcase_lt : caseVal < scalarModulus sc.sizeBytes)
+    (hcase_bool : ty.kind = .bool → caseVal = 0 ∨ caseVal = 1)
+    (state : AnnealStepState) :
+    (annealTerminatorHooks localDecls layouts).compareSwitchCase ()
+      ⟨.scalar (.fromScalarInt msc), translateTy ty layouts⟩ caseVal state =
+      (state, .ok (Nat.beq sc.bits caseVal)) :=
+  compareSwitchCase_simulation hrel localDecls layouts ty hty hsz_ty hbits caseVal hcase_lt hcase_bool state
+
+example
+    {P L E M C Op Imm : Type}
+    (hooks : Miri.Interpreter.TerminatorHooks P L E M C Op Imm)
+    (choice : C)
+    (si : Miri.MIR.SourceInfo)
+    (discr : Miri.MIR.Operand)
+    (targets : SwitchTargets)
+    (state state' : Miri.Interpreter.StepState P L E M)
+    (value : Imm)
+    (bits : Nat)
+    (hdisc : hooks.evalDiscriminant choice discr state = (state', .ok value))
+    (hcmp : ∀ v b, (v, b) ∈ targets.branches →
+      hooks.compareSwitchCase choice value v state' = (state', .ok (Nat.beq bits v))) :
+    Miri.Interpreter.ControlFlow.evalTerminator hooks choice
+        { sourceInfo := si, kind := .SwitchInt discr (translateSwitchTargets targets) } state =
+      Miri.Interpreter.ControlFlow.goToBlock
+        (lookupSwitchTarget bits targets.branches targets.otherwise) state' :=
+  evalTerminator_switchInt_ok hooks choice si discr targets state state' value bits hdisc hcmp
+
+example
+    {body : CapturedMir}
+    {s : MachineState}
+    {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    {discr : MirAst.Operand}
+    {targets : SwitchTargets}
+    {ty : Ty}
+    (hterm : bb.terminator.kind = .switchInt discr targets)
+    (hty : ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k))
+    (hdiscr : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame discr ty)
+    (hcases : SwitchCasesFit ty targets) :
+    StepObsRel body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_terminator_switchInt_simulation hstate hphase hbb hstmt_none hstmt_len hterm hty hdiscr hcases
+
+example
+    {body : CapturedMir}
+    {s : MachineState}
+    {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    {stmt : Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] → WellTypedLM12Stmt body topFrame stmt) :
+    StepRel body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_lm1_2_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir}
+    {s : MachineState}
+    {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    {stmt : Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarStmt body topFrame stmt ∨ WellTypedLM12Stmt body topFrame stmt) :
+    StepRel body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_stmt_lm1_2_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir}
+    {s : MachineState}
+    {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hterm :
+      ((∃ target, bb.terminator.kind = .goto target) ∨
+        (bb.terminator.kind = .return_ ∧
+          ∃ decl0,
+            get? body.localDecls 0 = some decl0 ∧
+            (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO ∧
+            ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame 0) ∨
+        bb.terminator.kind = .unreachable) ∨
+      (∃ discr targets ty,
+        bb.terminator.kind = .switchInt discr targets ∧
+        (ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k)) ∧
+        (∀ topFrame, m.stack.frames = #[topFrame] →
+          WellTypedScalarOperand body topFrame discr ty) ∧
+        SwitchCasesFit ty targets)) :
+    StepObsRel body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_terminator_lm1_2_simulation hstate hphase hbb hstmt_none hstmt_len hcleanup hterm
+
+open Witness in
+example
+    (d : Nat)
+    (hd : d < 256) :
+    StepObsRel (lm12SwitchBody d) (lm12MiriInit (lm12SwitchBody d) u8Ty)
+      (stepMirFn (lm12SwitchBody d) (initMachineState (lm12SwitchBody d) []))
+      (Miri.Interpreter.Step.step
+        (annealStepHooks (lm12SwitchBody d).localDecls (lm12SwitchBody d).layouts) ()
+        (lm12MiriInit (lm12SwitchBody d) u8Ty)) :=
+  lm12Switch_step_applies d hd
+
+open Witness in
+example
+     :
+    annealOutcomeScalarBits 1
+        (runAnnealBounded (lm12SwitchBody 7) 4 (initMachineState (lm12SwitchBody 7) [])) =
+      some 20 ∧
+    miriOutcomeScalarBits 1
+        (runMiriBounded (lm12SwitchBody 7) 4 (lm12MiriInit (lm12SwitchBody 7) u8Ty)) =
+      some 20 :=
+  lm12Switch_case_agrees
+
+open Witness in
+example
+     :
+    annealOutcomeScalarBits 1
+        (runAnnealBounded (lm12SwitchBody 9) 4 (initMachineState (lm12SwitchBody 9) [])) =
+      some 30 ∧
+    miriOutcomeScalarBits 1
+        (runMiriBounded (lm12SwitchBody 9) 4 (lm12MiriInit (lm12SwitchBody 9) u8Ty)) =
+      some 30 :=
+  lm12Switch_otherwise_agrees
+
+open Witness in
+example
+     :
+    StepRel lm12BoolCmpBody (lm12MiriInit lm12BoolCmpBody boolTy)
+      (stepMirFn lm12BoolCmpBody (initMachineState lm12BoolCmpBody []))
+      (Miri.Interpreter.Step.step
+        (annealStepHooks lm12BoolCmpBody.localDecls lm12BoolCmpBody.layouts) ()
+        (lm12MiriInit lm12BoolCmpBody boolTy)) :=
+  lm12BoolCmp_step_applies
+
+open Witness in
+example
+     :
+    annealOutcomeScalarBits 1
+        (runAnnealBounded lm12BoolCmpBody 3 (initMachineState lm12BoolCmpBody [])) = some 1 ∧
+    miriOutcomeScalarBits 1
+        (runMiriBounded lm12BoolCmpBody 3 (lm12MiriInit lm12BoolCmpBody boolTy)) = some 1 :=
+  lm12BoolCmp_returns_agree
+
+open Witness in
+example
+     :
+    StepRel lm12CastBody (lm12MiriInit lm12CastBody lm12I16Ty)
+      (stepMirFn lm12CastBody (initMachineState lm12CastBody []))
+      (Miri.Interpreter.Step.step
+        (annealStepHooks lm12CastBody.localDecls lm12CastBody.layouts) ()
+        (lm12MiriInit lm12CastBody lm12I16Ty)) :=
+  lm12Cast_step_applies
+
+open Witness in
+example
+     :
+    annealOutcomeScalarBits 2
+        (runAnnealBounded lm12CastBody 3 (initMachineState lm12CastBody [])) = some 0xFFFF ∧
+    miriOutcomeScalarBits 2
+        (runMiriBounded lm12CastBody 3 (lm12MiriInit lm12CastBody lm12I16Ty)) = some 0xFFFF :=
+  lm12Cast_returns_agree
+
+open Witness in
+example
+     :
+    (annealOutcomeScalarBits 1
+        (runAnnealBounded (lm12CastBodyOf (constU16 0x1234) u8Decl u8Layout) 3
+          (initMachineState (lm12CastBodyOf (constU16 0x1234) u8Decl u8Layout) [])) = some 0x34 ∧
+      miriOutcomeScalarBits 1
+        (runMiriBounded (lm12CastBodyOf (constU16 0x1234) u8Decl u8Layout) 3
+          (lm12MiriInit (lm12CastBodyOf (constU16 0x1234) u8Decl u8Layout) u8Ty)) = some 0x34) ∧
+    (annealOutcomeScalarBits 2
+        (runAnnealBounded (lm12CastBodyOf (constU8 0xFF) u16Decl lm12I16Layout) 3
+          (initMachineState (lm12CastBodyOf (constU8 0xFF) u16Decl lm12I16Layout) [])) =
+        some 0x00FF ∧
+      miriOutcomeScalarBits 2
+        (runMiriBounded (lm12CastBodyOf (constU8 0xFF) u16Decl lm12I16Layout) 3
+          (lm12MiriInit (lm12CastBodyOf (constU8 0xFF) u16Decl lm12I16Layout) u16Ty)) =
+        some 0x00FF) ∧
+    (annealOutcomeScalarBits 4
+        (runAnnealBounded (lm12CastBodyOf (lm12ConstBool true) lm12I32Decl lm12I32Layout) 3
+          (initMachineState (lm12CastBodyOf (lm12ConstBool true) lm12I32Decl lm12I32Layout) [])) =
+        some 1 ∧
+      miriOutcomeScalarBits 4
+        (runMiriBounded (lm12CastBodyOf (lm12ConstBool true) lm12I32Decl lm12I32Layout) 3
+          (lm12MiriInit (lm12CastBodyOf (lm12ConstBool true) lm12I32Decl lm12I32Layout)
+            lm12I32Ty)) =
+        some 1) :=
+  lm12Cast_shapes_agree
 
 /-! ### `LM-1.4` statement pins -/
 
