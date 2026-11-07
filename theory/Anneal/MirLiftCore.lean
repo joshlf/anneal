@@ -655,9 +655,13 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
       | .ok rootVal' =>
         match set? locals dst.local_ (.init rootVal') with
         | some locals' =>
+          let resolvedLocalProj :=
+            match resolveBorrowProjectionElems locals (proj :: rest) with
+            | some rp => rp
+            | none => proj :: rest
           some (locals',
             invalidateConflictingBorrowsAtProj borrows dst.local_ .none
-              (proj :: rest))
+              resolvedLocalProj)
         | none => none
       | _ => none
     | _ => none
@@ -936,7 +940,8 @@ constants (including generic items and trait methods resolved through
 `callIndirect`/`tailCallIndirect` for calls through a reified function pointer
 or `ClosureFnPointer`-coerced non-capturing closure resolved via
 `Memory.fnPtrs`, and `callExactDiv` for direct calls to
-`core::intrinsics::exact_div` evaluated inline by `evalCallTerminator`.
+`core::intrinsics::exact_div` evaluated inline by `evalTerminator`'s call
+branch.
 
 There are deliberately no rules for diverging calls (`target = none`), failed
 assertions, or `TerminatorKind.unwindResume`: in MIR that rustc emits, none of
@@ -1089,14 +1094,16 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .call func argOps destination (some targetBb) unwind, span := span }
   /--
   Inline `core::intrinsics::exact_div` call (`isDirectExactDivTarget`): when no
-  linked override exists in `mem.callees`, `evalCallTerminator` evaluates
-  `evalExactDiv` on the two scalar arguments and writes `.scalar retScalar` to
-  `destination` in the current frame.
+  linked override exists in `mem.callees`, `evalTerminator`'s call branch
+  evaluates `evalExactDiv` on the two scalar arguments, with the signedness
+  that `resolveIntrinsicIsSigned` reads from the call's type arguments, and
+  writes `.scalar retScalar` to `destination` in the current frame.
   -/
   | callExactDiv {func lhsOp : Operand} {rhsOps : List Operand}
       {destination : Place} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
       {span : String} {resolvedTarget : ResolvedCallTarget}
-      {envAfterFunc env' updatedEnv : PureEnv} {lhs rhs retScalar : ScalarInt} :
+      {envAfterFunc env' updatedEnv : PureEnv}
+      {isSigned : Bool} {lhs rhs retScalar : ScalarInt} :
       resolveCallTarget
           (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
           func (length (lhsOp :: rhsOps)) cur.localDecls cur.layouts =
@@ -1107,9 +1114,9 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       lookupCallee mem.callees cur.layouts resolvedTarget.defPath
           resolvedTarget.typeArgs mem.traitImpls = none →
       isDirectExactDivTarget resolvedTarget = true →
-      evalExactDiv lhs rhs
-          (operandIsSigned cur.localDecls lhsOp cur.layouts) =
-        some retScalar →
+      resolveIntrinsicIsSigned resolvedTarget cur.localDecls cur.layouts
+          (lhsOp :: rhsOps) = some isSigned →
+      evalExactDiv lhs rhs isSigned = some retScalar →
       writePlaceValue env' mem.borrows destination (.scalar retScalar) =
         .ok updatedEnv →
       post (.frame targetBb 0 updatedEnv mem) →
@@ -1643,8 +1650,8 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
         calleeBody h_res h_args h_ctx h_target
     rw [← evalTerminatorSymTree_eval, h_tree]
     exact h_next
-  | callExactDiv h_res h_args h_lookup h_exact h_div h_write h_next =>
-    unfold evalTerminator evalCallTerminator
+  | callExactDiv h_res h_args h_lookup h_exact h_signed h_div h_write h_next =>
+    unfold evalTerminator
     dsimp only [bodyLocalDeclsOf]
     rw [h_res]
     dsimp only [PureState.toMachineState]
@@ -1653,6 +1660,8 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
     rw [h_lookup]
     dsimp only []
     rw [h_exact]
+    dsimp only []
+    rw [h_signed]
     dsimp only []
     rw [h_div]
     dsimp only []
@@ -2028,17 +2037,37 @@ def evalOperandFallback (locals : List LocalSlot) (op : Operand)
 
 def evalDerefGlobalFallback
     (globals : List CapturedAllocation) (ptrVal : ProvenancePtr) (sz : Nat)
-    (locals : List LocalSlot) (restProj : List ProjectionElem) : PlaceReadResult :=
+    (locals : List LocalSlot) (restProj : List ProjectionElem)
+    (layouts : LayoutTable) : PlaceReadResult :=
   match lookupGlobalAlloc globals ptrVal.allocId with
   | .some alloc =>
-    match readGlobalScalar alloc ptrVal.offsetBytes sz with
-    | .some sc =>
-      match readProjectedValue locals (.scalar sc) restProj with
+    evalGlobalDerefRead locals alloc ptrVal.offsetBytes sz restProj layouts .none
+  | .none => .ub
+
+def evalThinPtrElemDerefReadFallback
+    (locals callerLocals : List LocalSlot) (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr) (restProj : List ProjectionElem) : PlaceReadResult :=
+  match get? locals entry.targetLocal with
+  | .some (.init targetRootVal) =>
+    match resolveStackThinPtrTargetProj? locals targetRootVal entry ptrVal restProj with
+    | .none => .ub
+    | .some fullProj =>
+      match readProjectedValue locals targetRootVal fullProj with
       | .ok fieldVal => .ok fieldVal locals
       | .ub => .ub
       | .unsupported => .unsupported
-    | .none => .ub
-  | .none => .ub
+  | .some _ => .ub
+  | .none =>
+    match get? callerLocals entry.targetLocal with
+    | .some (.init targetRootVal) =>
+      match resolveStackThinPtrTargetProj? locals targetRootVal entry ptrVal restProj with
+      | .none => .ub
+      | .some fullProj =>
+        match readProjectedValue locals targetRootVal fullProj with
+        | .ok fieldVal => .ok fieldVal locals
+        | .ub => .ub
+        | .unsupported => .unsupported
+    | _ => .ub
 
 def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
@@ -2048,10 +2077,9 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
     match c.val with
     | .indirect _ _ =>
       evalOperandFallback locals (.constant c) borrows globals body.layouts callerLocals
-    | .slice _ _ =>
-      evalOperandFallback locals (.constant c) borrows globals body.layouts callerLocals
+    | .unevaluated _ => .unsupported
     | cv =>
-      match evalConstValue cv with
+      match evalConstValue cv c.ty globals body.layouts with
       | .some v => .ok v locals
       | .none => .unsupported
   | .copy p =>
@@ -2064,19 +2092,18 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
           match entry.perm with
           | .disabled => .ub
           | _ =>
-            match get? locals entry.targetLocal with
-            | .some (.init targetRootVal) =>
-              let fullProj :=
-                match entry.targetProjection with
-                | .nil => restProj
-                | ph :: pt => ph :: appendProjections pt restProj
-              match readProjectedValue locals targetRootVal fullProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .some _ => .ub
-            | .none =>
-              match get? callerLocals entry.targetLocal with
+            let needsElemRes :=
+              match entry.targetProjection with
+              | .nil => false
+              | pHead :: pTail =>
+                let norm :=
+                  normalizeSubsliceProjections (stripTransparentProjections (pHead :: pTail))
+                match endsWithSubslice norm with
+                | true => true
+                | false => Bool.not (Nat.beq ptrVal.offsetBytes 0)
+            match needsElemRes with
+            | false =>
+              match get? locals entry.targetLocal with
               | .some (.init targetRootVal) =>
                 let fullProj :=
                   match entry.targetProjection with
@@ -2086,8 +2113,25 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
                 | .ok fieldVal => .ok fieldVal locals
                 | .ub => .ub
                 | .unsupported => .unsupported
-              | _ => .ub
-        | .none => evalDerefGlobalFallback globals ptrVal sz locals restProj
+              | .some _ => .ub
+              | .none =>
+                match get? callerLocals entry.targetLocal with
+                | .some (.init targetRootVal) =>
+                  let fullProj :=
+                    match entry.targetProjection with
+                    | .nil => restProj
+                    | ph :: pt => ph :: appendProjections pt restProj
+                  match readProjectedValue locals targetRootVal fullProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | _ => .ub
+            | true =>
+              evalThinPtrElemDerefReadFallback locals callerLocals entry ptrVal restProj
+        | .none => evalDerefGlobalFallback globals ptrVal sz locals restProj body.layouts
+      | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
+        evalSliceFatPtrDerefRead locals ptrVal ptrSz lenSc restProj borrows globals
+          body.layouts callerLocals .none
       | _ => .ub
     | _ =>
       match get? locals p.local_ with
@@ -2130,12 +2174,7 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
   cases op with
   | constant c =>
     rcases c with ⟨ty, val⟩
-    cases val with
-    | scalar _ => rfl
-    | zeroSized => rfl
-    | slice sc _ => cases sc <;> rfl
-    | indirect _ _ => rfl
-    | unevaluated => rfl
+    cases val <;> rfl
   | copy p =>
     rcases p with ⟨loc, proj⟩
     cases proj with
@@ -2325,8 +2364,7 @@ def evalRvalueFast
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .ok (.ptr { ptrVal with offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits } sz)
-              locals₂ mem
+            evalPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp ptrVal sz offsetSc
           | _ => .unsupported
         | _, _ => .unsupported
       | .ub => .ub
@@ -2469,9 +2507,8 @@ def evalRvalueSymTreeFast
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
-            .leaf
-              (.ok (.ptr { ptrVal with offsetBytes := Nat.add ptrVal.offsetBytes offsetSc.bits } sz)
-                locals₂ mem)
+            evalPtrOffsetBinOpSymTree locals₂ mem body.localDecls body.layouts
+              lhsOp ptrVal sz offsetSc
           | _ => .leaf .unsupported
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub

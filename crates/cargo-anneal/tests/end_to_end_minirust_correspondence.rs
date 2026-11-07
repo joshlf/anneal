@@ -491,30 +491,56 @@ fn gate3_cross_check_real_miri_diff_manifest() {
         "expected non-empty test corpus in tests/miri-diff/manifest.toml"
     );
 
-    // Valid cross-ref (`pass_tb_unsafe_cell_shared_mutation` has an open known_anneal_bug in manifest.toml).
-    let valid_registry = parse_correspondence_gaps(baseline_valid_gaps_toml()).unwrap();
+    // Valid cross-ref (`pass_ptr_offset_within_array` has an open known_anneal_bug in manifest.toml).
+    let valid_xref_toml = baseline_valid_gaps_toml().replace(
+        "miri_diff_cross_ref = \"pass_tb_unsafe_cell_shared_mutation\"",
+        "miri_diff_cross_ref = \"pass_ptr_offset_within_array\"",
+    );
+    let valid_registry = parse_correspondence_gaps(&valid_xref_toml).unwrap();
     let cross_report = cross_check_miri_diff(&miri_manifest, &valid_registry)
         .expect("valid cross-reference against real manifest.toml must succeed");
-    assert!(cross_report.total_miri_known_bugs >= 10);
+    assert_eq!(cross_report.total_miri_known_bugs, 6);
     assert_eq!(
         cross_report.matched_cross_refs,
         vec![(
             "GAP-MR-0001".to_string(),
-            "pass_tb_unsafe_cell_shared_mutation".to_string()
+            "pass_ptr_offset_within_array".to_string()
         )]
     );
 
-    // Mutate cross-ref to point to a test that ALREADY PASSES (`pass_integer_arith_basic`): must fail!
-    let stale_xref_toml = baseline_valid_gaps_toml().replace(
+    // Cross-referencing `pass_tb_unsafe_cell_shared_mutation` (now fixed!) or
+    // `pass_integer_arith_basic` as an `"open"` gap must fail!
+    for passing_test in [
+        "pass_tb_unsafe_cell_shared_mutation",
+        "pass_integer_arith_basic",
+    ] {
+        let stale_xref_toml = baseline_valid_gaps_toml().replace(
+            "miri_diff_cross_ref = \"pass_tb_unsafe_cell_shared_mutation\"",
+            &format!("miri_diff_cross_ref = \"{passing_test}\""),
+        );
+        let stale_xref_reg = parse_correspondence_gaps(&stale_xref_toml).unwrap();
+        let xref_err = cross_check_miri_diff(&miri_manifest, &stale_xref_reg)
+            .expect_err("cross-referencing a passing Miri test without known_anneal_bug must fail");
+        assert!(
+            xref_err.contains(passing_test) && xref_err.contains("stale bug entry"),
+            "unexpected stale Miri cross-ref error for {passing_test}: {xref_err}"
+        );
+    }
+
+    // Cross-referencing an open known_anneal_bug from a "closed" gap must fail!
+    let closed_xref_toml = baseline_valid_gaps_toml().replace(
+        "status = \"open\"",
+        "status = \"closed\"",
+    ).replace(
         "miri_diff_cross_ref = \"pass_tb_unsafe_cell_shared_mutation\"",
-        "miri_diff_cross_ref = \"pass_integer_arith_basic\"",
+        "miri_diff_cross_ref = \"pass_ptr_offset_within_array\"",
     );
-    let stale_xref_reg = parse_correspondence_gaps(&stale_xref_toml).unwrap();
-    let xref_err = cross_check_miri_diff(&miri_manifest, &stale_xref_reg)
-        .expect_err("cross-referencing a passing Miri test without known_anneal_bug must fail");
+    let closed_xref_reg = parse_correspondence_gaps(&closed_xref_toml).unwrap();
+    let closed_xref_err = cross_check_miri_diff(&miri_manifest, &closed_xref_reg)
+        .expect_err("cross-referencing an open Miri test from a closed gap must fail");
     assert!(
-        xref_err.contains("pass_integer_arith_basic") && xref_err.contains("stale bug entry"),
-        "unexpected stale Miri cross-ref error: {xref_err}"
+        closed_xref_err.contains("pass_ptr_offset_within_array") && closed_xref_err.contains("still carries a known_anneal_bug"),
+        "unexpected error for closed gap cross-ref: {closed_xref_err}"
     );
 }
 

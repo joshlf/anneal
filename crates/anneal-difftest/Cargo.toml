@@ -5,8 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
+anneal-trace = { path = "../anneal-trace" }
 arbitrary = { version = "1.4.2", features = ["derive"] }
 arbtest = "0.3.2"
+cargo-anneal = { path = "../cargo-anneal" }
 syn = { version = "2.0.119", features = ["full", "visit", "visit-mut", "extra-traits"] }
 quote = "1.0.47"
 prettyplease = "0.2.37"

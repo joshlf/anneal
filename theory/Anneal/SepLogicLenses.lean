@@ -29,6 +29,43 @@ open Anneal.MirLiftCore
 open Anneal.MirFuelFree
 open Anneal.Rustc.V2026_06_01.SymbolicEval (mirNormalPost)
 
+@[simp]
+private theorem endsWithSubslice_norm_field (idx : FieldIdx) (ty : Ty) :
+    endsWithSubslice (normalizeSubsliceProjections (stripTransparentProjections [.field idx ty])) =
+      false := rfl
+
+private theorem resolveDerefWriteFullProj_nil_nil
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    (hP : entry.targetProjection = []) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [] cl = [] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP]; rfl
+
+private theorem resolveDerefWriteFullProj_nil_field
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    {subIdx : FieldIdx} {subTy : Ty}
+    (hP : entry.targetProjection = []) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [.field subIdx subTy] cl =
+      [.field subIdx subTy] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP]; rfl
+
+private theorem resolveDerefWriteFullProj_field_nil
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    {outerIdx : FieldIdx} {outerTy : Ty}
+    (hP : entry.targetProjection = [.field outerIdx outerTy])
+    (hOff : ptrVal.offsetBytes = 0) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [] cl =
+      [.field outerIdx outerTy] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP, hOff]; rfl
+
+private theorem resolveDerefWriteFullProj_field_field
+    {il tl cl : List LocalSlot} {ptrVal : ProvenancePtr} {sz : Nat} {entry : BorrowEntry}
+    {outerIdx subIdx : FieldIdx} {outerTy subTy : Ty}
+    (hP : entry.targetProjection = [.field outerIdx outerTy])
+    (hOff : ptrVal.offsetBytes = 0) :
+    resolveDerefWriteFullProj il tl (.ptr ptrVal sz) entry [.field subIdx subTy] cl =
+      [.field outerIdx outerTy, .field subIdx subTy] := by
+  unfold resolveDerefWriteFullProj; dsimp only; rw [hP, hOff]; rfl
+
 /-!
 # Separation-Logic-Backed Mutable Lenses & Pure Deref Lifting (`FF-4.1`)
 
@@ -3117,8 +3154,7 @@ theorem LiftDerefWrite.evalStmt_field_eq
           exact hWriteCallerOk
         | cons b₂ rest =>
           dsimp only
-          rw [hP]
-          dsimp only [appendProjections]
+          rw [resolveDerefWriteFullProj_nil_field hP]
           have hNoConflict :
               hasProtectedTreeWriteConflict
                 (b₁ :: b₂ :: rest)
@@ -3142,7 +3178,8 @@ theorem LiftDerefWrite.evalStmt_field_eq
         env'
         s.memory.borrows
         { local_ := ptrLoc, projection := [.deref, .field fieldIdx fieldTy] }
-        [.field fieldIdx fieldTy] = s.memory.borrows := by
+        [.field fieldIdx fieldTy]
+        s.memory.callerLocals = s.memory.borrows := by
     unfold invalidateDerefWriteBorrows
     simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
       _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
@@ -3157,8 +3194,8 @@ theorem LiftDerefWrite.evalStmt_field_eq
         dsimp only [ProvenancePtr.tag]
         rw [hLookSingle]
         dsimp only
-        rw [hP]
-        dsimp only [appendProjections]
+        rw [resolveDerefWriteFullProj_nil_field hP]
+        dsimp only
         have hExclSingle :
             ∀ b ∈ [b₁],
               b.targetLocal = rp.allocId →
@@ -3181,7 +3218,7 @@ theorem LiftDerefWrite.evalStmt_field_eq
         dsimp only [ProvenancePtr.tag]
         rw [hLookMany]
         dsimp only
-        rw [hT, ← hB]
+        rw [resolveDerefWriteFullProj_nil_field hP, hT, ← hB]
         exact invalidateTreeBorrowsAtProj_eq_self_of_tree
           s.memory.borrows s.memory.borrows _ _ _
           hExcl.ancestors_active_or_disabled
@@ -3309,8 +3346,7 @@ theorem LiftDerefWrite.evalStmt_eq
             exact hWriteCallerOk
           | cons b₂ rest =>
             dsimp only
-            rw [hP]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_nil_nil hP]
             have hNoConflict :
                 hasProtectedTreeWriteConflict
                   (b₁ :: b₂ :: rest)
@@ -3334,7 +3370,8 @@ theorem LiftDerefWrite.evalStmt_eq
           env'
           s.memory.borrows
           { local_ := ptrLoc, projection := [.deref] }
-          [] = s.memory.borrows := by
+          []
+          s.memory.callerLocals = s.memory.borrows := by
       unfold invalidateDerefWriteBorrows
       simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
       cases hB : s.memory.borrows with
@@ -3348,8 +3385,8 @@ theorem LiftDerefWrite.evalStmt_eq
           dsimp only [ProvenancePtr.tag]
           rw [hLookSingle]
           dsimp only
-          rw [hP, hRL]
-          dsimp only [appendProjections]
+          rw [resolveDerefWriteFullProj_nil_nil hP, hRL]
+          dsimp only
           -- With a single borrow-table entry, `lookupBorrow` forces that
           -- entry to be `rp.tag`'s own active whole-allocation entry, so the
           -- non-tree `invalidateConflictingBorrows` path is the identity.
@@ -3378,7 +3415,7 @@ theorem LiftDerefWrite.evalStmt_eq
           dsimp only [ProvenancePtr.tag]
           rw [hLookMany]
           dsimp only
-          rw [hT, ← hB]
+          rw [resolveDerefWriteFullProj_nil_nil hP, hT, ← hB]
           exact invalidateTreeBorrowsAtProj_eq_self_of_tree
             s.memory.borrows s.memory.borrows _ _ _
             hExcl.ancestors_active_or_disabled
@@ -7625,7 +7662,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -7695,7 +7732,7 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -7782,7 +7819,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -7855,7 +7892,7 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
         rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
         rw [hEnvNone, hT, hCaller]
         dsimp only [appendProjections, readProjectedValue]
         rw [hEl]
@@ -8171,7 +8208,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only; rw [resolveDerefWriteFullProj_nil_nil hP]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8185,7 +8222,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               exact hWriteCallerOk
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
-            { local_ := ptrLoc, projection := [.deref] } [] =
+            { local_ := ptrLoc, projection := [.deref] } []
+            s.memory.callerLocals =
             s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
@@ -8201,8 +8239,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookSingle]
             dsimp only
-            rw [hP, hRL]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_nil_nil hP, hRL]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active ∧
@@ -8222,7 +8260,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookMany]
             dsimp only
-            rw [hT, ← hB]
+            rw [resolveDerefWriteFullProj_nil_nil hP, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_tree
               s.memory.borrows s.memory.borrows _ _ _
               hExcl.ancestors_active_or_disabled
@@ -8313,7 +8351,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
           rw [hGetPtr]
-          dsimp only [ProvenancePtr.tag]
+          dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
           rw [hLookB]
           cases hB : s.memory.borrows with
           | nil =>
@@ -8326,7 +8364,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only
+              rw [resolveDerefWriteFullProj_field_nil hP hOff]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8341,7 +8380,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               exact hWriteCallerOk
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
-            { local_ := ptrLoc, projection := [.deref] } [] =
+            { local_ := ptrLoc, projection := [.deref] } []
+            s.memory.callerLocals =
             s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
@@ -8354,11 +8394,11 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookSingle := hLookB
             rw [hB] at hLookSingle
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookSingle]
             dsimp only
-            rw [hP, hRO, hRL]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_nil hP hOff, hRO, hRL]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active) ∨ b.perm = .disabled := by
@@ -8374,11 +8414,10 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookMany := hLookB
             rw [hB] at hLookMany
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookMany]
             dsimp only
-            rw [hP, hRO, hRL, hT, ← hB]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_nil hP hOff, hRO, hRL, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_treeField
               s.memory.borrows s.memory.borrows
               hExcl.ancestors_disjoint_or_disabled
@@ -8467,7 +8506,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only; rw [resolveDerefWriteFullProj_nil_field hP]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8483,7 +8522,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
             { local_ := ptrLoc, projection := [.deref, .field subIdx subTy] }
-            [.field subIdx subTy] = s.memory.borrows := by
+            [.field subIdx subTy]
+            s.memory.callerLocals = s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
@@ -8498,8 +8538,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookSingle]
             dsimp only
-            rw [hP]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_nil_field hP]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active) ∨ b.perm = .disabled := by
@@ -8518,7 +8558,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             dsimp only [ProvenancePtr.tag]
             rw [hLookMany]
             dsimp only
-            rw [hT, ← hB]
+            rw [resolveDerefWriteFullProj_nil_field hP, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_tree
               s.memory.borrows s.memory.borrows _ _ _
               hExcl.ancestors_active_or_disabled
@@ -8609,7 +8649,7 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
           simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
             _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
           rw [hGetPtr]
-          dsimp only [ProvenancePtr.tag]
+          dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
           rw [hLookB]
           cases hB : s.memory.borrows with
           | nil =>
@@ -8622,7 +8662,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
               rw [hasProtectedWriteConflict_singleton_eq_false hLookSingle]
               dsimp only; rw [← hB]; exact hWriteCallerOk
             | cons b₂ rest =>
-              dsimp only; rw [hP]; dsimp only [appendProjections]
+              dsimp only
+              rw [resolveDerefWriteFullProj_field_field hP hOff]
               have hNoConflict :
                   hasProtectedTreeWriteConflict
                     (b₁ :: b₂ :: rest) (b₁ :: b₂ :: rest) (pHead :: pTail)
@@ -8638,7 +8679,8 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
       have hInvalEq :
           invalidateDerefWriteBorrows env' s.memory.borrows
             { local_ := ptrLoc, projection := [.deref, .field subIdx subTy] }
-            [.field subIdx subTy] = s.memory.borrows := by
+            [.field subIdx subTy]
+            s.memory.callerLocals = s.memory.borrows := by
         unfold invalidateDerefWriteBorrows
         simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
           _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
@@ -8650,11 +8692,11 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookSingle := hLookB
             rw [hB] at hLookSingle
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookSingle]
             dsimp only
-            rw [hP, hRO, hRL]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_field hP hOff, hRO, hRL]
+            dsimp only
             have hExclSingle :
                 ∀ b ∈ [b₁], b.targetLocal = rp.allocId →
                   (b.tag = rp.tag ∧ b.perm = .active) ∨ b.perm = .disabled := by
@@ -8670,11 +8712,10 @@ theorem LiftDerefWrite.evalStmt_eq_subplace
             have hLookMany := hLookB
             rw [hB] at hLookMany
             rw [hGetPtr]
-            dsimp only [ProvenancePtr.tag]
+            dsimp only [ProvenancePtr.tag, ProvenancePtr.offsetBytes]
             rw [hLookMany]
             dsimp only
-            rw [hP, hRO, hRL, hT, ← hB]
-            dsimp only [appendProjections]
+            rw [resolveDerefWriteFullProj_field_field hP hOff, hRO, hRL, hT, ← hB]
             exact invalidateTreeBorrowsAtProj_eq_self_of_treeField_prefix
               s.memory.borrows s.memory.borrows [.field subIdx subTy]
               hExcl.ancestors_disjoint_or_disabled

@@ -964,6 +964,14 @@ pub fn cross_check_miri_diff(
                     gap.id
                 ));
             }
+            if gap.status.trim().eq_ignore_ascii_case("closed")
+                && known_bug_set.contains(miri_ref.as_str())
+            {
+                return Err(format!(
+                    "gap '{}' is marked 'closed' but cross-references Miri test '{miri_ref}', which still carries a known_anneal_bug in manifest.toml",
+                    gap.id
+                ));
+            }
             linked_miri_names.insert(miri_ref.clone());
             matched_cross_refs.push((gap.id.clone(), miri_ref.clone()));
         }

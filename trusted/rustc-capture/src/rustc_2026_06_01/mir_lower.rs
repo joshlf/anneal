@@ -19,9 +19,10 @@ use rustc_middle::mir::interpret::{AllocId, GlobalAlloc, Scalar, alloc_range};
 use rustc_middle::mir::{
     AggregateKind, BasicBlockData, BinOp, Body, BorrowKind, CastKind, Const, ConstOperand,
     ConstValue, LocalDecl, MirPhase, MutBorrowKind, NonDivergingIntrinsic, Operand, Place,
-    ProjectionElem, RawPtrKind, RuntimePhase, Rvalue, Statement, StatementKind, SwitchTargets,
-    Terminator, TerminatorKind, UnOp, UnwindAction, VarDebugInfoContents, WithRetag,
+    ProjectionElem, RawPtrKind, RuntimeChecks, RuntimePhase, Rvalue, Statement, StatementKind,
+    SwitchTargets, Terminator, TerminatorKind, UnOp, UnwindAction, VarDebugInfoContents, WithRetag,
 };
+use rustc_middle::ty::print::with_no_visible_paths;
 use rustc_middle::ty::{FloatTy, IntTy, Mutability, ScalarInt, Ty, TyCtxt, TyKind, UintTy};
 use rustc_span::DUMMY_SP;
 
@@ -48,6 +49,42 @@ pub use crate::rustc_2026_06_01::specs::{
 /// Returns the canonical crate-qualified `DefId` path for `def_id` (for
 /// example, `"demo::answer"`, `"demo::Wrapper::get"`,
 /// `"demo::<Wrapper<u32>>::get"`, or `"demo::<TypeA as MyTrait>::method"`).
+///
+/// For an item of another crate, `tcx.def_path_str` prints the path through
+/// which the item is visible from the crate being compiled, preferring public
+/// re-exports:
+///
+/// > ```text
+/// > /// Prevent selection of visible paths. `Display` impl of DefId will prefer
+/// > /// visible (public) reexports of types as paths.
+/// > fn with_no_visible_paths(NoVisibleGuard, NO_VISIBLE_PATH);
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/print/pretty.rs#L120-L122
+///
+/// Because `std` re-exports `core::intrinsics` as `std::intrinsics`, a crate
+/// that links `std` therefore sees `core::intrinsics::ctpop` as
+/// `std::intrinsics::ctpop`, while a `#![no_std]` crate sees
+/// `core::intrinsics::ctpop`. The MIR semantics recognize compiler intrinsics
+/// (`tcx.intrinsic(def_id)` is `Some`) by their defining paths
+/// (`classifyRustIntrinsic?`, `isDirectExactDivTarget`), so this function
+/// prints an intrinsic's path with visible-path selection disabled, which skips
+/// the re-export lookup:
+///
+/// > ```text
+/// > fn try_print_visible_def_path(&mut self, def_id: DefId) -> Result<bool, PrintError> {
+/// >     if with_no_visible_paths() {
+/// >         return Ok(false);
+/// >     }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/print/pretty.rs#L362-L365
+///
+/// Non-intrinsic items defined in `core` or `alloc` have visible `std::`
+/// re-export prefixes normalized to their defining crate (`core::` or
+/// `alloc::`, for example `core::option::Option` and
+/// `core::hint::unreachable_unchecked`) so `std` and `#![no_std]` crates emit
+/// consistent canonical paths across cross-crate call boundaries.
 pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     if let Some(parent_id) = tcx.opt_parent(def_id)
         && let DefKind::Impl { of_trait: false } = tcx.def_kind(parent_id)
@@ -101,7 +138,11 @@ pub fn canonical_def_path(tcx: TyCtxt<'_>, def_id: DefId) -> String {
         }
     }
 
-    let raw = tcx.def_path_str(def_id);
+    let raw = if tcx.intrinsic(def_id).is_some() {
+        with_no_visible_paths!(tcx.def_path_str(def_id))
+    } else {
+        tcx.def_path_str(def_id)
+    };
     if def_id.is_local() {
         let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
         if raw.is_empty() {
@@ -176,6 +217,131 @@ pub fn should_capture_mir_item(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> boo
 /// path ending with `"::_"`).
 pub fn is_unnamed_const_def_path(def_path_str: &str) -> bool {
     def_path_str == "_" || def_path_str.ends_with("::_")
+}
+
+/// Returns the boolean that Anneal's verification semantics assigns to an
+/// `Operand::RuntimeChecks(checks)` operand: `true` for `UbChecks`, and
+/// `session_value(checks)` (the compiling session's flag) for
+/// `ContractChecks` and `OverflowChecks`.
+///
+/// `rustc`'s `LowerIntrinsics` pass, which runs before `optimized_mir` (the
+/// MIR this crate captures), replaces every call to the `ub_checks`,
+/// `contract_checks`, and `overflow_checks` intrinsics with this operand:
+///
+/// > ```text
+/// > sym::ub_checks | sym::overflow_checks | sym::contract_checks => {
+/// >     let op = match intrinsic.name {
+/// >         sym::ub_checks => RuntimeChecks::UbChecks,
+/// >         sym::contract_checks => RuntimeChecks::ContractChecks,
+/// >         sym::overflow_checks => RuntimeChecks::OverflowChecks,
+/// >         _ => unreachable!(),
+/// >     };
+/// >     let target = target.unwrap();
+/// >     block.statements.push(Statement::new(
+/// >         terminator.source_info,
+/// >         StatementKind::Assign(Box::new((
+/// >             *destination,
+/// >             Rvalue::Use(Operand::RuntimeChecks(op), WithRetag::Yes),
+/// >         ))),
+/// >     ));
+/// >     terminator.kind = TerminatorKind::Goto { target };
+/// > }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_mir_transform/src/lower_intrinsics.rs#L26-L42
+///
+/// Codegen evaluates the operand from the session's flags, and
+/// `Session::ub_checks` follows `-Zub-checks`, defaulting to
+/// `-Cdebug-assertions`:
+///
+/// > ```text
+/// > impl RuntimeChecks {
+/// >     pub fn value(self, sess: &rustc_session::Session) -> bool {
+/// >         match self {
+/// >             Self::UbChecks => sess.ub_checks(),
+/// >             Self::ContractChecks => sess.contract_checks(),
+/// >             Self::OverflowChecks => sess.overflow_checks(),
+/// >         }
+/// >     }
+/// > }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1591-L1599
+///
+/// > ```text
+/// > pub fn ub_checks(&self) -> bool {
+/// >     self.opts.unstable_opts.ub_checks.unwrap_or(self.opts.debug_assertions)
+/// > }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_session/src/session.rs#L728-L730
+///
+/// Using the capture session's value would therefore make the meaning of
+/// `core`'s `assert_unsafe_precondition!` checks depend on how the capture was
+/// invoked: with debug assertions disabled, as in the Miri differential
+/// harness, every check would be skipped. Anneal instead fixes `UbChecks` to
+/// `true`, so the captured `core` bodies always execute these checks and a
+/// proof must show that they pass. This is the value `rustc` already gives the
+/// intrinsic during constant evaluation:
+///
+/// > ```text
+/// > /// In consteval, this function currently returns `true`. This is because the value of the `ub_checks`
+/// > /// configuration can differ across crates, but we need this function to always return the same
+/// > /// value in consteval in order to avoid unsoundness.
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs#L2591-L2593
+///
+/// A failed check calls a non-unwinding panic, so the model aborts where a
+/// build without UB checks would continue into the undefined behavior that the
+/// check guards against. Claims that permit aborts therefore describe builds
+/// with UB checks enabled, which is the default for debug builds.
+///
+/// The operand reaches this function only in bodies whose crate preserves it.
+/// `core` does, through `#![rustc_preserve_ub_checks]` (`library/core/src/lib.rs`
+/// line 77 at the pinned commit), so this policy applies to every captured
+/// `core` body. For any other crate, `InstSimplify` folds the operand to the
+/// session's value at `-Zmir-opt-level=1` and above, before this crate reads
+/// `optimized_mir`:
+///
+/// > ```text
+/// > fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+/// >     let preserve_ub_checks = find_attr!(tcx.hir_krate_attrs(), RustcPreserveUbChecks);
+/// >     if !preserve_ub_checks {
+/// >         SimplifyUbCheck { tcx }.visit_body(body);
+/// >     }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_mir_transform/src/instsimplify.rs#L32-L36
+///
+/// > ```text
+/// > fn visit_operand(&mut self, operand: &mut Operand<'tcx>, _: Location) {
+/// >     if let Operand::RuntimeChecks(RuntimeChecks::UbChecks) = operand {
+/// >         *operand = Operand::Constant(Box::new(ConstOperand {
+/// >             span: rustc_span::DUMMY_SP,
+/// >             user_ty: None,
+/// >             const_: Const::Val(
+/// >                 ConstValue::from_bool(self.tcx.sess.ub_checks()),
+/// >                 self.tcx.types.bool,
+/// >             ),
+/// >         }));
+/// >     }
+/// > }
+/// > ```
+///
+/// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_mir_transform/src/instsimplify.rs#L460-L472
+///
+/// Such a crate's own `ub_checks()` calls are rare, because
+/// `assert_unsafe_precondition!` is internal to the standard library, and they
+/// keep the capture session's value.
+pub fn verification_runtime_check_value(
+    checks: RuntimeChecks,
+    session_value: impl FnOnce(RuntimeChecks) -> bool,
+) -> bool {
+    match checks {
+        RuntimeChecks::UbChecks => true,
+        RuntimeChecks::ContractChecks | RuntimeChecks::OverflowChecks => session_value(checks),
+    }
 }
 
 /// Queries the post-cleanup runtime MIR body for functions and methods
@@ -787,7 +953,8 @@ impl<'tcx> MirLowerCtx<'tcx> {
             Operand::Move(place) => IrOperand::Move(self.lower_place(*place)),
             Operand::Constant(const_op) => IrOperand::Constant(self.lower_const_operand(const_op)),
             Operand::RuntimeChecks(checks) => {
-                let flag = checks.value(self.tcx.sess);
+                let flag =
+                    verification_runtime_check_value(*checks, |c| c.value(self.tcx.sess));
                 let bool_ty = self.lower_ty(self.tcx.types.bool);
                 IrOperand::Constant(IrConstOperand {
                     ty: bool_ty,

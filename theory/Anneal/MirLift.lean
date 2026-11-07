@@ -180,7 +180,7 @@ macro_rules
          | apply Anneal.MirLiftCore.LiftTerminator.callIndirect (by rfl) (by rfl)
              (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.callExactDiv (by rfl) (by rfl)
-             (by rfl) (by rfl) (by rfl) (by rfl)
+             (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallDirect (by rfl)
              (by rfl) (by rfl)
          | apply Anneal.MirLiftCore.LiftTerminator.tailCallFnItem (by rfl)
