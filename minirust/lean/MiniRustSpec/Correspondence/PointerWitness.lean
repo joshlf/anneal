@@ -19,9 +19,9 @@ semantics (`runA_sound`, `faultsA_sound`) and, after `minimize`'s translation
 (`translateFn`), in the MiniRust interpretation (`Interp.steps`), both by kernel
 computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`).
 
-`ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `uninitPtrReadUb`, and
-`uninitPtrWriteUb` lie in the correspondence fragment (`*_inFragment`), so the
-end-to-end correspondence theorems (`mirCall_ret`, `mirCall_ub`, `mirCall_noUB`,
+`ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `ptrCountdown`, `constBorrowLoop`,
+`uninitPtrReadUb`, and `uninitPtrWriteUb` lie in the correspondence fragment
+(`*_inFragment`), so the end-to-end correspondence theorems (`mirCall_ret`, `mirCall_ub`, `mirCall_noUB`,
 `mirCall_progress_N`, `mirCall_steps_error`, `mirCall_outcome_N`) apply to them
 directly. `arrayElemPtr` (borrowing a non-parameter `[u32; 2]` temporary),
 `dangling`, and every divergent witness below lie outside the fragment
@@ -36,15 +36,25 @@ to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
 
 * `ptrRoundTrip`: `&raw mut x`, a read and a write through the pointer, a
   `PtrToPtr` cast to `*const u32`, and a read through the cast pointer;
-* `arrayParamPtr`: two disjoint `&raw mut` borrows (`&raw mut a[0]` and
-  `&raw mut a[-1]` with `fromEnd = true`) on a `[u32; 2]` parameter `a`,
-  `Offset(p, 0)`, `move` of a pointer temporary, `StorageDead` and `Deinit` on
-  pointer temporaries, `copy (*p)` and `move (*p)`, and writes through both
-  `*mut` pointers confirming neither disables the other's borrow tag;
+* `arrayParamPtr`: two disjoint `&raw mut` borrows (`&raw mut a[-2 of 2]`,
+  that is `a[0]`, and `&raw mut a[-1 of 2]`, that is `a[1]`; `fromEnd = true`)
+  on a `[u32; 2]` parameter `a`, `Offset(p, 0)`, `move` of a pointer
+  temporary, `StorageDead` and `Deinit` on pointer temporaries, `copy (*p)` and
+  `move (*p)`, and writes through both `*mut` pointers confirming neither
+  disables the other's borrow tag;
 * `arrayElemPtr`: `&raw mut a[1]` (`ConstantIndex`) on a `[u32; 2]` temporary,
   read and written through the pointer;
 * `fieldPtr`: `&raw mut s.1` on the padded struct `Padded(u8, u32, u16)` (field
   at byte offset `4`), read and written through the pointer;
+* `ptrCountdown`: a loop over four blocks that counts `x` down to `0` through
+  `&raw mut x`, reading `*p` before each `switchInt` and writing `*p` in the
+  loop body, then reads `x` directly; the correspondence carries the `Active`
+  borrow out of the entry block across `Goto` and `SwitchInt` edges
+  (`BorrowsOk.jump`);
+* `constBorrowLoop`: a fresh `&raw const x` in every iteration of a loop, read
+  through and then killed by `StorageDead`, so Anneal's borrow table grows by
+  one `Frozen` entry per iteration while the pointer temporary is re-allocated
+  in MiniRust;
 
 and both raise UB for `uninitPtrReadUb` (reading through an uninitialized
 pointer temporary), `uninitPtrWriteUb` (writing through an uninitialized `*mut`
@@ -310,7 +320,8 @@ def fnAbiArrU32_2Arg : FnAbi :=
 * `StorageDead(_2)` and `Deinit(_3)` on pointer temporaries;
 * `copy (*_5)` and `move (*_4)`;
 * dereference writes through both `*mut` pointers (`(*_5) = ...` and
-  `(*_4) = ...`), confirming that writing through tag `0` does not disable tag `1`. -/
+  `(*_4) = ...`), confirming that writing through either of the borrow tags `1`
+  (`_2`, copied to `_5`) and `2` (`_3`, offset to `_4`) disables neither. -/
 def arrayParamPtr : CapturedMir :=
   { ptrBody "witness::array_param_ptr"
       [u32Decl, arrU32_2Decl, ptrMutU32Decl, ptrMutU32Decl, ptrMutU32Decl,
@@ -606,6 +617,334 @@ theorem fieldPtr_progress (n : Nat) :
 theorem fieldPtr_minirust_direct :
     retAfter fieldPtr [initPaddedStruct] 8 =
       some (some { retAlloc with data := scalarBytes u32 100 }, [1]) := by
+  decide +kernel
+
+/-! ## A loop through a `*mut` pointer -/
+
+/-- MIR of
+```rust
+fn ptr_countdown(mut x: u32) -> u32 {
+    let p = &raw mut x;           // bb0: _2 = &raw mut _1; _4 = const 0_u32; goto -> bb1
+    let mut steps = 0;
+    while unsafe { *p } != 0 {    // bb1: _3 = copy (*_2); switchInt(copy _3) -> [0: bb3, otherwise: bb2]
+        unsafe { *p = *p - 1 };   // bb2: (*_2) = Sub(copy _3, const 1_u32);
+        steps += 1;               //      _4 = Add(copy _4, const 1_u32); goto -> bb1
+    }
+    steps + x                     // bb3: _0 = Add(copy _4, copy _1); return
+}
+```
+The `&raw mut` borrow is taken in `bb0`, which no edge enters, and stays
+`Active` while the loop reads and writes through it in `bb1` and `bb2`; `bb3`
+then reads the borrowed parameter `_1` directly, which the writes through the
+pointer have counted down to `0`. -/
+def ptrCountdown : CapturedMir where
+  defPath := "witness::ptr_countdown"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, ptrMutU32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2), mkStmt (.storageLive 3), mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1))),
+        mkStmt (.assign (local_ 4) (.use (constU32 0)))],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 3) (.use (.copy (derefPlace 2))))],
+      terminator := mkTerm (.switchInt (.copy (local_ 3)) { branches := [(0, 3)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (derefPlace 2) (.binaryOp .sub (.copy (local_ 3)) (constU32 1))),
+        mkStmt (.assign (local_ 4) (.binaryOp .add (.copy (local_ 4)) (constU32 1)))],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 4)) (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem ptrCountdown_inFragment : inFragment ptrCountdown = true := by decide
+
+def ptrCountdownFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy),
+    (localName 3, .Int u32), (localName 4, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3), .StorageLive (localName 4),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (.Raw .None)),
+      .Assign (.Local (localName 4)) (.Constant (.Int 0) (.Int u32))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 3)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32)))],
+      .Switch (.Load (.Local (localName 3))) ⟨[(0, bbName 3)]⟩ (bbName 2), .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32))
+        (.BinOp (.Int .Sub) (.Load (.Local (localName 3))) (.Constant (.Int 1) (.Int u32))),
+      .Assign (.Local (localName 4))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 4))) (.Constant (.Int 1) (.Int u32)))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 4))) (.Load (.Local (localName 1))))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem ptrCountdown_translate : translateFn ptrCountdown = some ptrCountdownFn := rfl
+
+def ptrCountdownS0 : MachineState := initMachineState ptrCountdown [.scalar ⟨3, 4⟩]
+
+/-- The branch observations of `ptr_countdown(3)`: the value read through the
+pointer before each `switchInt`. -/
+def ptrCountdownTrace : List (Event MirEffect) :=
+  [3, 2, 1, 0].map (fun b => ⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩)
+
+/-- Anneal returns `3` (three iterations, and `x` is `0` afterwards); its borrow
+table still holds the `Active` entry of `&raw mut _1`. -/
+theorem ptrCountdown_anneal_ret :
+    ReachesRet (mirTree ptrCountdown ptrCountdownS0) ptrCountdownTrace
+      (.normal (.scalar ⟨3, 4⟩,
+        { ptrCountdownS0.memory with borrows := [rawPtrEntry 1 .mut (local_ 1)], nextTag := 2 })) :=
+  runA_sound ptrCountdown 40 _ _ _ rfl
+
+theorem ptrCountdown_noUB : MirNoUBTree (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) :=
+  runA_noUB ptrCountdown 40 _ _ _ rfl
+
+theorem ptrCountdown_ctxOk : CtxOk ptrCountdown ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : ptrCountdown.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [ptrCountdown] at hd; subst hd; decide
+    | 1, hd, _ => simp [ptrCountdown] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : ptrCountdown.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [ptrCountdown] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MiniRust at `minimize`'s init block (the function's `start`). -/
+def ptrCountdownMInit : Mach :=
+  machine ptrCountdown ptrCountdownFn ptrCountdownS0.frame.locals ptrCountdownFn.start
+
+/-- MiniRust returns `3` as well, derived from Anneal's return by the
+correspondence theorem (`mirCall_ret`) through every iteration of the loop. -/
+theorem ptrCountdown_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n ptrCountdownMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 3 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret ptrCountdown_inFragment ptrCountdown_translate ctx0 ptrCountdown_ctxOk
+      [.scalar ⟨3, 4⟩] (by decide) ptrCountdownMInit rfl rfl rfl ptrCountdown_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [ptrCountdown] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem ptrCountdown_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n ptrCountdownMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k ptrCountdownMInit = .ok mRet ∧
+      ReturnRel ptrCountdown ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) tr (.normal (v, mem)) :=
+  mirCall_noUB ptrCountdown_inFragment ptrCountdown_translate ctx0 ptrCountdown_ctxOk
+    [.scalar ⟨3, 4⟩] (by decide) ptrCountdownMInit rfl rfl rfl ptrCountdown_noUB herr
+
+theorem ptrCountdown_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) ptrCountdownMInit = .ok m' ∧
+      StateRelN ptrCountdown ptrCountdownFn ctx0 s' m' ∧
+      Reaches (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) tr (mirTree ptrCountdown s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k ptrCountdownMInit = .ok mRet ∧
+      ReturnRel ptrCountdown ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree ptrCountdown [.scalar ⟨3, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress_N ptrCountdown_inFragment ptrCountdown_translate ctx0 ptrCountdown_ctxOk
+    [.scalar ⟨3, 4⟩] (by decide) ptrCountdownMInit rfl rfl rfl ptrCountdown_noUB n
+
+/-- MiniRust's return, computed directly: 26 steps (the init block's `Goto`,
+six steps of `bb0`, four visits of `bb1`, three of `bb2`, and `bb3`). -/
+theorem ptrCountdown_minirust_direct :
+    retAfter ptrCountdown [.scalar ⟨3, 4⟩] 26 =
+      some (some { retAlloc with data := scalarBytes u32 3 }, [1]) := by
+  decide +kernel
+
+/-! ## `&raw const` in a loop -/
+
+/-- MIR of
+```rust
+fn const_borrow_loop(x: u32) -> u32 {
+    let mut acc = 0;              // bb0: _3 = const 0_u32; _4 = const 3_u32; goto -> bb1
+    let mut n = 3;
+    while n != 0 {                // bb1: switchInt(copy _4) -> [0: bb3, otherwise: bb2]
+        let p = &raw const x;     // bb2: StorageLive(_2); _2 = &raw const _1;
+        acc += unsafe { *p };     //      _5 = copy (*_2); StorageDead(_2);
+        n -= 1;                   //      _3 = Add(copy _3, copy _5); _4 = Sub(copy _4, const 1_u32);
+    }                             //      goto -> bb1
+    acc                           // bb3: _0 = copy _3; return
+}
+```
+Each iteration takes a fresh `&raw const` borrow of the parameter `_1` outside
+the entry block (allowed because `_1` has no `&raw mut` borrow), reads through
+it, and ends the pointer temporary's storage, so Anneal's borrow table
+accumulates one `Frozen` entry per iteration while MiniRust re-allocates the
+pointer temporary each time. -/
+def constBorrowLoop : CapturedMir where
+  defPath := "witness::const_borrow_loop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, ptrConstU32Decl, u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 3), mkStmt (.storageLive 4), mkStmt (.storageLive 5),
+        mkStmt (.assign (local_ 3) (.use (constU32 0))),
+        mkStmt (.assign (local_ 4) (.use (constU32 3)))],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 4)) { branches := [(0, 3)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 5) (.use (.copy (derefPlace 2)))),
+        mkStmt (.storageDead 2),
+        mkStmt (.assign (local_ 3) (.binaryOp .add (.copy (local_ 3)) (.copy (local_ 5)))),
+        mkStmt (.assign (local_ 4) (.binaryOp .sub (.copy (local_ 4)) (constU32 1)))],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 3))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem constBorrowLoop_inFragment : inFragment constBorrowLoop = true := by decide
+
+def constBorrowLoopFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy),
+    (localName 3, .Int u32), (localName 4, .Int u32), (localName 5, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 3), .StorageLive (localName 4), .StorageLive (localName 5),
+      .Assign (.Local (localName 3)) (.Constant (.Int 0) (.Int u32)),
+      .Assign (.Local (localName 4)) (.Constant (.Int 3) (.Int u32))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[], .Switch (.Load (.Local (localName 4))) ⟨[(0, bbName 3)]⟩ (bbName 2),
+      .Regular⟩),
+    (bbName 2, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (.Raw .None)),
+      .Assign (.Local (localName 5)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32))),
+      .StorageDead (localName 2),
+      .Assign (.Local (localName 3))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 3))) (.Load (.Local (localName 5)))),
+      .Assign (.Local (localName 4))
+        (.BinOp (.Int .Sub) (.Load (.Local (localName 4))) (.Constant (.Int 1) (.Int u32)))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 3, ⟨[.Assign (.Local (localName 0)) (.Load (.Local (localName 3)))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem constBorrowLoop_translate : translateFn constBorrowLoop = some constBorrowLoopFn := rfl
+
+def constBorrowLoopS0 : MachineState := initMachineState constBorrowLoop [.scalar ⟨5, 4⟩]
+
+/-- The branch observations of `const_borrow_loop(5)`: the loop counter at each
+`switchInt`. -/
+def constBorrowLoopTrace : List (Event MirEffect) :=
+  [3, 2, 1, 0].map (fun b => ⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩)
+
+/-- Anneal returns `15`; its borrow table holds the three `Frozen` entries, with
+the tags `1`, `2`, and `3`, of the three iterations' `&raw const _1`. -/
+theorem constBorrowLoop_anneal_ret :
+    ReachesRet (mirTree constBorrowLoop constBorrowLoopS0) constBorrowLoopTrace
+      (.normal (.scalar ⟨15, 4⟩,
+        { constBorrowLoopS0.memory with
+          borrows := [rawPtrEntry 3 .not (local_ 1), rawPtrEntry 2 .not (local_ 1),
+                      rawPtrEntry 1 .not (local_ 1)],
+          nextTag := 4 })) :=
+  runA_sound constBorrowLoop 50 _ _ _ rfl
+
+theorem constBorrowLoop_noUB : MirNoUBTree (mirCallTree constBorrowLoop [.scalar ⟨5, 4⟩]) :=
+  runA_noUB constBorrowLoop 50 _ _ _ rfl
+
+theorem constBorrowLoop_ctxOk : CtxOk constBorrowLoop ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : constBorrowLoop.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [constBorrowLoop] at hd; subst hd; decide
+    | 1, hd, _ => simp [constBorrowLoop] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : constBorrowLoop.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [constBorrowLoop] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MiniRust at `minimize`'s init block (the function's `start`). -/
+def constBorrowLoopMInit : Mach :=
+  machine constBorrowLoop constBorrowLoopFn constBorrowLoopS0.frame.locals constBorrowLoopFn.start
+
+/-- MiniRust returns `15` as well, derived from Anneal's return by the
+correspondence theorem (`mirCall_ret`). -/
+theorem constBorrowLoop_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n constBorrowLoopMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 15 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret constBorrowLoop_inFragment constBorrowLoop_translate ctx0 constBorrowLoop_ctxOk
+      [.scalar ⟨5, 4⟩] (by decide) constBorrowLoopMInit rfl rfl rfl constBorrowLoop_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [constBorrowLoop] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem constBorrowLoop_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n constBorrowLoopMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k constBorrowLoopMInit = .ok mRet ∧
+      ReturnRel constBorrowLoop ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree constBorrowLoop [.scalar ⟨5, 4⟩]) tr (.normal (v, mem)) :=
+  mirCall_noUB constBorrowLoop_inFragment constBorrowLoop_translate ctx0 constBorrowLoop_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) constBorrowLoopMInit rfl rfl rfl constBorrowLoop_noUB herr
+
+theorem constBorrowLoop_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) constBorrowLoopMInit = .ok m' ∧
+      StateRelN constBorrowLoop constBorrowLoopFn ctx0 s' m' ∧
+      Reaches (mirCallTree constBorrowLoop [.scalar ⟨5, 4⟩]) tr (mirTree constBorrowLoop s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k constBorrowLoopMInit = .ok mRet ∧
+      ReturnRel constBorrowLoop ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree constBorrowLoop [.scalar ⟨5, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress_N constBorrowLoop_inFragment constBorrowLoop_translate ctx0
+    constBorrowLoop_ctxOk [.scalar ⟨5, 4⟩] (by decide) constBorrowLoopMInit rfl rfl rfl
+    constBorrowLoop_noUB n
+
+/-- MiniRust's return, computed directly: 34 steps (the init block's `Goto`,
+six steps of `bb0`, four visits of `bb1`, three of `bb2`, and `bb3`). -/
+theorem constBorrowLoop_minirust_direct :
+    retAfter constBorrowLoop [.scalar ⟨5, 4⟩] 34 =
+      some (some { retAlloc with data := scalarBytes u32 15 }, [1]) := by
   decide +kernel
 
 /-! ## Uninitialized pointer dereference UB (in fragment) -/

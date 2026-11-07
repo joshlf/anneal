@@ -274,6 +274,18 @@ restricted to the fragment checked by `inFragment`:
   nested sub-tuple/struct field chain `_i.f1...fk`): `dst = Use(copy p)` of a
   place of the same `TupleSpec`, or
   `dst = Aggregate(Tuple | Adt(_, 0, None), [op_0, .., op_{M-1}])`;
+* for a thin raw pointer temporary `_i : *const T` / `*mut T`:
+  `_i = &raw const q` / `_i = &raw mut q` of the same mutability, where `q` is a
+  borrow target of pointee type `T` (`ptrTargetSpec`: an integer parameter, an
+  in-bounds `ConstantIndex` element of an array parameter, or a scalar field
+  chain of a `TupleSpec` parameter), `_i = Use(copy _p | move _p)` of a pointer
+  local of the same type, `_i = Cast(PtrToPtr, copy _p, _)` of a pointer to `T`
+  that does not add mutability, and `_i = BinaryOp(Offset, copy _p, const 0)`;
+  an integer local `_i : T` may also be assigned `Use(copy (*_p) | move (*_p))`
+  through a pointer `_p` to `T` (`ptrDerefReadOk`), and `(*_p) = rv` writes an
+  integer rvalue `rv` of type `T` (checked like an integer destination's
+  rvalue) through a `*mut T` local `_p`; every borrowed parameter is subject to
+  `ptrAliasingOk` (see the gaps);
 * `PlaceMention(p)` on any unprojected local `_i`, `(Int, bool)` field `_i.0` /
   `_i.1`, or `TupleSpec` field chain `_i.f1...fk`;
 * terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
@@ -696,17 +708,21 @@ statement-level lemmas of `Correspondence/PointerStep.lean` on which
 `step_correspondence_N` rests for raw pointers. Both semantics agree
 on `ptrRoundTrip` (`&raw mut x`, a read and a write through the pointer, a
 `PtrToPtr` cast, and a read through the cast pointer; `6` for `x = 5`),
-`arrayParamPtr` (disjoint `&raw mut a[-2]` and `&raw mut a[-1]` borrows on an
-array parameter `a: [u32; 2]` with `fromEnd = true`, `Offset(p, 0)`, `move`
-and `StorageDead`/`Deinit` on pointer temporaries, and dereference reads and
-writes through both pointers; `19` for `a = [5, 7]`), `arrayElemPtr`
-(`&raw mut a[1]` on a temporary array; `12`), and `fieldPtr` (`&raw mut s.1`
-at byte offset `4` of `Padded`; `100`), and both raise UB on
-`uninitPtrReadUb` and `uninitPtrWriteUb` (reading or writing through an
+`arrayParamPtr` (disjoint `&raw mut a[-2 of 2]` and `&raw mut a[-1 of 2]`
+borrows, that is of `a[0]` and `a[1]`, on an array parameter `a: [u32; 2]`,
+`Offset(p, 0)`, `move` and `StorageDead`/`Deinit` on pointer temporaries, and
+dereference reads and writes through both pointers; `19` for `a = [5, 7]`),
+`arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`), `fieldPtr`
+(`&raw mut s.1` at byte offset `4` of `Padded`; `100`), `ptrCountdown` (a
+four-block loop that counts `x` down through `&raw mut x`, reading `*p` before
+each `switchInt`, then reads `x` directly; `3` for `x = 3`), and
+`constBorrowLoop` (a fresh `&raw const x` read through and killed by
+`StorageDead` in each iteration of a loop; `15` for `x = 5`), and both raise UB
+on `uninitPtrReadUb` and `uninitPtrWriteUb` (reading or writing through an
 uninitialized raw pointer temporary) and `dangling` (a read after
-`StorageDead`). `ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `uninitPtrReadUb`,
-and `uninitPtrWriteUb` are in the fragment (`*_inFragment`) and proved end to
-end through `mirCall_ret`, `mirCall_noUB`, `mirCall_progress_N`, `mirCall_ub`,
+`StorageDead`). `ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `ptrCountdown`,
+`constBorrowLoop`, `uninitPtrReadUb`, and `uninitPtrWriteUb` are in the fragment
+(`*_inFragment`) and proved end to end through `mirCall_ret`, `mirCall_noUB`, `mirCall_progress_N`, `mirCall_ub`,
 `mirCall_steps_error`, and `mirCall_outcome_N`. The remaining witnesses are the
 divergences listed under the gaps (plus `arrayElemPtr` and `dangling`, which
 borrow temporaries), each outside the fragment (`*_notInFragment`):
@@ -803,9 +819,9 @@ These are deliberate and are the first things to lift:
   integer local, an in-bounds `ConstantIndex` element of an array, or a scalar
   field chain of a `TupleSpec` (`ptrTargetSpec`); pointer copies (`copy _p`,
   `move _p`, `PtrToPtr` between equal pointee types that never adds
-  mutability, and `Offset(_p, 0)`); reads `copy (*_p)` and writes
-  `(*_p) = rv` through `*mut` pointers at the pointee type; and storage
-  statements on pointer temporaries. `ptrAliasingOk` requires every borrowed
+  mutability, and `Offset(_p, 0)`); reads `copy (*_p)` through any such
+  pointer and writes `(*_p) = rv` through `*mut` pointers, both at the pointee
+  type; and storage statements on pointer temporaries. `ptrAliasingOk` requires every borrowed
   local to be a parameter that is never written directly, deinitialized,
   storage-cycled, or moved, and, once any `&raw mut` exists, all borrows of
   mutably borrowed locals to happen in an entry block without incoming edges

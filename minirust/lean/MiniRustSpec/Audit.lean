@@ -1838,6 +1838,24 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   fieldPtr_minirust_noUB
   fieldPtr_progress
   fieldPtr_minirust_direct
+  ptrCountdown_inFragment
+  ptrCountdown_translate
+  ptrCountdown_anneal_ret
+  ptrCountdown_noUB
+  ptrCountdown_ctxOk
+  ptrCountdown_minirust_ret_from_start
+  ptrCountdown_minirust_noUB
+  ptrCountdown_progress
+  ptrCountdown_minirust_direct
+  constBorrowLoop_inFragment
+  constBorrowLoop_translate
+  constBorrowLoop_anneal_ret
+  constBorrowLoop_noUB
+  constBorrowLoop_ctxOk
+  constBorrowLoop_minirust_ret_from_start
+  constBorrowLoop_minirust_noUB
+  constBorrowLoop_progress
+  constBorrowLoop_minirust_direct
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub
@@ -1971,6 +1989,24 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   fieldPtr_minirust_noUB
   fieldPtr_progress
   fieldPtr_minirust_direct
+  ptrCountdown_inFragment
+  ptrCountdown_translate
+  ptrCountdown_anneal_ret
+  ptrCountdown_noUB
+  ptrCountdown_ctxOk
+  ptrCountdown_minirust_ret_from_start
+  ptrCountdown_minirust_noUB
+  ptrCountdown_progress
+  ptrCountdown_minirust_direct
+  constBorrowLoop_inFragment
+  constBorrowLoop_translate
+  constBorrowLoop_anneal_ret
+  constBorrowLoop_noUB
+  constBorrowLoop_ctxOk
+  constBorrowLoop_minirust_ret_from_start
+  constBorrowLoop_minirust_noUB
+  constBorrowLoop_progress
+  constBorrowLoop_minirust_direct
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub
