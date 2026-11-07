@@ -1220,6 +1220,125 @@ private theorem lookup_from_raw_1 :
       sliceCallerLayouts "core::slice::from_raw_parts_mut" [.uint .u8] [] =
     .some coreSliceFromRawPartsMutU8Mir := rfl
 
+private theorem evalOperands_nil
+    (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) :
+    evalOperands locals [] borrows globals layouts callerLocals = .ok [] locals := rfl
+
+private theorem evalOperands_cons
+    (locals : List LocalSlot) (op : Operand) (rest : List Operand)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot) :
+    evalOperands locals (op :: rest) borrows globals layouts callerLocals =
+      match evalOperand locals op borrows globals layouts callerLocals with
+      | .ok v locals₁ =>
+        match evalOperands locals₁ rest borrows globals layouts callerLocals with
+        | .ok vs locals₂ => .ok (v :: vs) locals₂
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported := rfl
+
+private theorem evalRvalue_aggregate_tuple
+    (locals : List LocalSlot) (ops : List Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.aggregate .tuple ops) mem localDecls layouts =
+      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
+      | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
+      | .ub => .ub
+      | .unsupported => .unsupported := rfl
+
+private theorem evalRvalue_aggregate_rawPtr
+    (locals : List LocalSlot) (elemTy : Ty) (mutability : Mutability)
+    (ops : List Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.aggregate (.rawPtr elemTy mutability) ops) mem localDecls layouts =
+      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
+      | .ok (.ptr ptrVal _ :: .unit :: .nil) locals' =>
+        .ok (.ptr ptrVal 8) locals' mem
+      | .ok (.ptr ptrVal _ :: .aggregate 0 .nil :: .nil) locals' =>
+        .ok (.ptr ptrVal 8) locals' mem
+      | .ok (.scalar addrSc :: .unit :: .nil) locals' =>
+        .ok (.ptr { allocId := Nat.div addrSc.bits 65536, offsetBytes := Nat.mod addrSc.bits 65536 } 8) locals' mem
+      | .ok (.scalar addrSc :: .aggregate 0 .nil :: .nil) locals' =>
+        .ok (.ptr { allocId := Nat.div addrSc.bits 65536, offsetBytes := Nat.mod addrSc.bits 65536 } 8) locals' mem
+      | .ok (.ptr ptrVal _ :: .scalar metaSc :: .nil) locals' =>
+        .ok (.aggregate 0 (.ptr ptrVal 8 :: .scalar ⟨metaSc.bits, 8⟩ :: .nil)) locals' mem
+      | .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals' =>
+        .ok (.aggregate 0 (.ptr { allocId := Nat.div addrSc.bits 65536, offsetBytes := Nat.mod addrSc.bits 65536 } 8 :: .scalar ⟨metaSc.bits, 8⟩ :: .nil)) locals' mem
+      | .ok _ _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported := rfl
+
+private theorem evalRvalue_unaryOp_ptrMetadata
+    (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
+      let ptrBytes := layoutPointerBytes layouts
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      | .ok (.aggregate 0 (.ptr _ ptrSz :: .scalar metaSc :: .nil)) locals' =>
+        match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
+        | true => .ok (.scalar ⟨metaSc.bits, metaSc.sizeBytes⟩) locals' mem
+        | false => .ub
+      | .ok (.aggregate 0 elems) locals' =>
+        .ok (.scalar ⟨Trusted.Sequence.length elems, ptrBytes⟩) locals' mem
+      | .ok (.ptr _ ptrSz) locals' =>
+        match Nat.beq ptrSz ptrBytes with
+        | true => .ok .unit locals' mem
+        | false => .ub
+      | .ok _ _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported := rfl
+
+private theorem evalRvalue_cast_ptrToPtr
+    (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      | .ok (.ptr ptrVal sz) locals' =>
+        match targetTy.kind with
+        | .rawPtr _ (.slice _) => .ub
+        | .rawPtr _ .str => .ub
+        | .rawPtr _ (.dynamic _) => .ub
+        | .rawPtr _ dstElem =>
+          let arrayCastLenOpt : Option Nat :=
+            match operandTy localDecls layouts op with
+            | .some { kind := .rawPtr _ (.array srcElem arrLen), .. } =>
+              match rigidTyEq srcElem dstElem with
+              | true => .some arrLen
+              | false => .none
+            | .some { kind := .ref _ (.array srcElem arrLen), .. } =>
+              match rigidTyEq srcElem dstElem with
+              | true => .some arrLen
+              | false => .none
+            | _ => .none
+          match arrayCastLenOpt, lookupBorrow mem.borrows ptrVal.tag with
+          | .some arrLen, .some parentEntry =>
+            match Nat.beq sz 8 with
+            | true => deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some arrLen)
+            | false => .ub
+          | _, _ => .ok (.ptr ptrVal sz) locals' mem
+        | _ => .ok (.ptr ptrVal sz) locals' mem
+      | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
+        match Bool.and (Nat.beq sz 8) (Nat.beq metaSc.sizeBytes 8) with
+        | false => .ub
+        | true =>
+          match isThinRawPtrTy targetTy with
+          | true =>
+            match lookupBorrow mem.borrows ptrVal.tag with
+            | .some parentEntry =>
+              deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some metaSc.bits)
+            | .none => .ok (.ptr ptrVal sz) locals' mem
+          | false =>
+            match targetTy.kind with
+            | .rawPtr _ _ =>
+              .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+            | _ => .ub
+      | .ok _ _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported := rfl
+
 set_option maxHeartbeats 800000 in
 /--
 Kernel-checked symbolic verification of `sliceLenAsPtrFromRawPartsMir` stepping
@@ -1265,8 +1384,10 @@ theorem sliceLenAsPtrFromRawParts_verified :
     initLocals, initLocalsAux, emptyMemory,
     wpExecFast, evalSymNodeTree, stepMirSymTree,
     evalStmtSymTree, evalStmt, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTree, evalRvalue, evalRvalueWithMemory, isThinRawPtrTy,
-    evalOperand, evalOperands, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
+    evalRvalueSymTree, evalRvalueWithMemory,
+    evalRvalue_aggregate_tuple, evalRvalue_aggregate_rawPtr,
+    evalRvalue_unaryOp_ptrMetadata, evalRvalue_cast_ptrToPtr, isThinRawPtrTy,
+    evalOperand, evalOperands_nil, evalOperands_cons, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
     lookup_len_1, lookup_as_ptr_1, lookup_from_raw_1,
     evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf,
     resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs,
@@ -1416,12 +1537,14 @@ theorem sliceHelperPipeline_verified :
       initLocals, initLocalsAux, emptyMemory,
       wpExecFast, evalSymNodeTree, stepMirSymTree,
       evalStmtSymTree, evalStmt, finishAssignStmtNode, advanceStmt,
-      evalRvalueSymTree, evalRvalue, evalRvalueWithMemory, isThinRawPtrTy,
+      evalRvalueSymTree, evalRvalueWithMemory,
+      evalRvalue_aggregate_tuple, evalRvalue_aggregate_rawPtr,
+      evalRvalue_unaryOp_ptrMetadata, evalRvalue_cast_ptrToPtr, isThinRawPtrTy,
       evalPtrOffsetBinOpSymTree, evalBinOpOffsetSymTree, finishBinOpOffsetSymTree,
       pointeeElemByteStride, ptrAllocByteBound?, pointeeTyOf, elemTyOf, rigidTyKindByteSize, intCastTargetBytes,
       rigidTyByteSize, UintTy.byteWidth, IntTy.byteWidth, FloatTy.byteWidth, lookupGlobalAlloc,
       evalScalarBinOpSymTree, isSignedNegative, h_mod, h_half,
-      evalOperand, evalOperands, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
+      evalOperand, evalOperands_nil, evalOperands_cons, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
       lookup_split_2, lookup_len_2, lookup_from_raw_2,
       evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf,
       resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs,

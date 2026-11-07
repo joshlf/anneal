@@ -1031,6 +1031,158 @@ theorem memory_with_borrows_nil_eq {mem : Memory} (h : mem.borrows = []) :
   subst h
   rfl
 
+private def evalAssignNonDeref
+    (s : MachineState) (dstLoc : Local) (proj : List ProjectionElem)
+    (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory) : MirStepNode :=
+  match get? locals₁ dstLoc with
+  | .some (.init rootVal) =>
+    match writeProjectedValue locals₁ rootVal proj val with
+    | .ok rootVal' =>
+      match set? locals₁ dstLoc (.init rootVal') with
+      | .some locals₂ =>
+        let resolvedLocalProj :=
+          match resolveBorrowProjectionElems locals₁ proj with
+          | .some rp => rp
+          | .none => proj
+        match mem₁.activeProtectors with
+        | .nil =>
+          let borrows' :=
+            invalidateConflictingBorrowsAtProj
+              mem₁.borrows dstLoc .none resolvedLocalProj
+          MirStepNode.step
+            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        | protHead :: protTail =>
+          match
+            hasProtectedWriteConflict
+              mem₁.borrows (protHead :: protTail) dstLoc .none resolvedLocalProj
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            let borrows' :=
+              invalidateConflictingBorrowsAtProj
+                mem₁.borrows dstLoc .none resolvedLocalProj
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+      | .none => MirStepNode.fail .ub
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
+  | .some .uninit => MirStepNode.fail .ub
+  | .some .dead => MirStepNode.fail .ub
+  | .none => MirStepNode.fail .ub
+
+private def evalAssignDst
+    (s : MachineState) (dst : Place) (val : Value)
+    (locals₁ : List LocalSlot) (mem₁ : Memory) : MirStepNode :=
+  match dst.projection with
+  | .nil =>
+    match get? locals₁ dst.local_ with
+    | .some .dead => MirStepNode.fail .ub
+    | .some _ =>
+      match set? locals₁ dst.local_ (.init val) with
+      | .some locals₂ =>
+        match mem₁.activeProtectors with
+        | .nil =>
+          let borrows' :=
+            invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+          MirStepNode.step
+            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        | protHead :: protTail =>
+          match
+            hasProtectedWriteConflict
+              mem₁.borrows (protHead :: protTail) dst.local_ .none .nil
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            let borrows' :=
+              invalidateConflictingBorrows mem₁.borrows dst.local_ .none
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+      | .none => MirStepNode.fail .ub
+    | .none => MirStepNode.fail .ub
+  | .deref :: restProj =>
+    match evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors with
+    | .ok locals₂ =>
+      let borrows' := invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+      MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+    | .ub =>
+      match mem₁.callerLocals with
+      | .nil => MirStepNode.fail .ub
+      | _ :: _ =>
+        match
+          evalCallerPlaceWrite
+            locals₁ mem₁.callerLocals mem₁.borrows dst val mem₁.activeProtectors
+        with
+        | .ok callerLocals' =>
+          let borrows' :=
+            invalidateDerefWriteBorrows
+              locals₁ mem₁.borrows dst restProj mem₁.callerLocals
+          MirStepNode.step
+            (advanceStmt s locals₁
+              { mem₁ with borrows := borrows', callerLocals := callerLocals' })
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
+    | .unsupported => MirStepNode.unsupported
+  | hd :: tl =>
+    evalAssignNonDeref s dst.local_ (hd :: tl) val locals₁ mem₁
+
+private theorem evalStmt_assign_eq
+    (s : MachineState) (dst : Place) (rv : Rvalue) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
+      match evalRvalue s.frame.locals rv s.memory localDecls layouts with
+      | .ok val locals₁ mem₁ => evalAssignDst s dst val locals₁ mem₁
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported := by
+  unfold evalStmt
+  dsimp only
+  cases evalRvalue s.frame.locals rv s.memory localDecls layouts with
+  | ub => rfl
+  | unsupported => rfl
+  | ok val locals₁ mem₁ =>
+    rcases dst with ⟨dstLoc, dstProj⟩
+    cases dstProj with
+    | nil => rfl
+    | cons hd tl => cases hd <;> rfl
+
+private theorem evalAssignDst_nonDeref
+    (s : MachineState) (dstLoc : Local) (hd : ProjectionElem)
+    (tl : List ProjectionElem) (val : Value)
+    (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (h_nd : hd ≠ .deref) :
+    evalAssignDst s ⟨dstLoc, hd :: tl⟩ val locals₁ mem₁ =
+      evalAssignNonDeref s dstLoc (hd :: tl) val locals₁ mem₁ := by
+  cases hd with
+  | deref => exact False.elim (h_nd rfl)
+  | _ => rfl
+
+private theorem ne_deref_of_isPureProjElem
+    {hd : ProjectionElem} (h : isPureProjElem hd = true) : hd ≠ .deref := by
+  intro h_eq; subst h_eq; cases h
+
+private def isOtherPhase : MirPhaseTag → Bool
+  | .other _ => true
+  | _ => false
+
+private theorem stepMirFn_eq_ite (body : CapturedMir) (s : MachineState) :
+    stepMirFn body s =
+      let currentBody := s.memory.activeCallee.getD body
+      if isOtherPhase currentBody.phase then
+        MirStepNode.unsupported
+      else
+        match get? currentBody.basicBlocks s.frame.blockIdx with
+        | none => MirStepNode.fail .ub
+        | some bb =>
+          match get? bb.statements s.frame.stmtIdx with
+          | some stmt => evalStmt s stmt currentBody.localDecls currentBody.layouts
+          | none =>
+            if s.frame.stmtIdx == length bb.statements then
+              evalTerminator s bb.terminator (some currentBody)
+            else
+              MirStepNode.fail .ub := by
+  unfold stepMirFn
+  dsimp only
+  cases (s.memory.activeCallee.getD body).phase <;> rfl
+
 /--
 Evaluating a pure `Statement` from `ps.toMachineState mem₀` produces the exact
 same transition as evaluating from `ps.toMachineState emptyMemory` and
@@ -1121,7 +1273,7 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
   | assign dst rv =>
     simp only [isPureStatement, Bool.and_eq_true] at h_pure
     rcases h_pure with ⟨h_dst, h_rv⟩
-    unfold evalStmt
+    rw [evalStmt_assign_eq, evalStmt_assign_eq]
     dsimp only [PureState.toMachineState]
     rw [evalRvalue_pure_eq_withMem ps.env rv mem₀ localDecls layouts h_rv]
     have h_emp := evalRvalue_pure_eq_withMem ps.env rv emptyMemory localDecls layouts h_rv
@@ -1138,6 +1290,7 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
       rcases dst with ⟨dstLoc, dstProj⟩
       cases dstProj with
       | nil =>
+        unfold evalAssignDst
         dsimp only
         cases get? locals₁ dstLoc with
         | none => rw [MirStepNode.withMem_fail]
@@ -1174,35 +1327,36 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
               rfl
       | cons hd tl =>
         simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
-        cases hd <;>
-          try exact False.elim (Bool.false_ne_true h_dst.1)
-        all_goals
-          dsimp only
-          cases get? locals₁ dstLoc with
-          | none => rw [MirStepNode.withMem_fail]
-          | some slot =>
-            cases slot with
-            | uninit => rfl
-            | dead => rfl
-            | init rootVal =>
+        have h_nd := ne_deref_of_isPureProjElem h_dst.1
+        rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd,
+            evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd]
+        unfold evalAssignNonDeref
+        dsimp only
+        cases get? locals₁ dstLoc with
+        | none => rw [MirStepNode.withMem_fail]
+        | some slot =>
+          cases slot with
+          | uninit => rfl
+          | dead => rfl
+          | init rootVal =>
+            dsimp only
+            cases writeProjectedValue locals₁ rootVal _ val with
+            | ub => rfl
+            | unsupported => rfl
+            | ok rootVal' =>
               dsimp only
-              cases writeProjectedValue locals₁ rootVal _ val with
-              | ub => rfl
-              | unsupported => rfl
-              | ok rootVal' =>
-                dsimp only
-                cases set? locals₁ dstLoc (.init rootVal') with
-                | none => rw [MirStepNode.withMem_fail]
-                | some locals₂ =>
-                  try rw [h_prot, h_borrows]
-                  try rfl
-                  dsimp only [emptyMemory, invalidateConflictingBorrowsAtProj,
-                    MirStepNode.step, advanceStmt, MirStepNode.withMem,
-                    MirExecState.withMem]
-                  cases mem₀
-                  subst h_borrows
-                  subst h_prot
-                  rfl
+              cases set? locals₁ dstLoc (.init rootVal') with
+              | none => rw [MirStepNode.withMem_fail]
+              | some locals₂ =>
+                try rw [h_prot, h_borrows]
+                try rfl
+                dsimp only [emptyMemory, invalidateConflictingBorrowsAtProj,
+                  MirStepNode.step, advanceStmt, MirStepNode.withMem,
+                  MirExecState.withMem]
+                cases mem₀
+                subst h_borrows
+                subst h_prot
+                rfl
 
 /--
 Evaluating a pure `Statement` from `ps.toMachineState mem₀` under
@@ -3304,6 +3458,438 @@ theorem advanceStmt_pushBaseStack_borrows_callerLocals
         (advanceStmt s locs { s.memory with borrows := bs, callerLocals := cl }) :=
   rfl
 
+private def IsStmtNode (n : MirStepNode) : Prop :=
+  (∃ nextSt : MachineState, n = MirStepNode.step nextSt) ∨
+  (∃ fk : FailureKind, n = MirStepNode.fail fk) ∨
+  n = MirStepNode.unsupported
+
+private def copyWriteDstVal
+    (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
+    (dstLoc : Local) (dstTag : Nat) (newVal : Value) : MirStepNode :=
+  match writePlaceValue locals₃ s.memory.borrows dstPlace newVal with
+  | .ok locals₄ =>
+    let borrows' := invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag)
+    MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
+  | .unsupported => MirStepNode.unsupported
+  | .ub =>
+    match get? locals₃ dstPlace.local_ with
+    | .some _ => MirStepNode.fail .ub
+    | .none =>
+      let callerIdx :=
+        match get? s.memory.callerLocals dstPlace.local_ with
+        | .some _ => dstPlace.local_
+        | .none => Nat.sub dstPlace.local_ (length locals₃)
+      let callerWriteRes : PlaceWriteResult :=
+        match dstPlace.projection with
+        | .nil =>
+          match get? s.memory.callerLocals callerIdx with
+          | .some .dead => .ub
+          | .some _ =>
+            match set? s.memory.callerLocals callerIdx (.init newVal) with
+            | .some callerLocals' => .ok callerLocals'
+            | .none => .ub
+          | .none => .ub
+        | .deref :: _ => .ub
+        | proj :: rest =>
+          match get? s.memory.callerLocals callerIdx with
+          | .some (.init rootVal) =>
+            match writeProjectedValue locals₃ rootVal (proj :: rest) newVal with
+            | .ok rootVal' =>
+              match set? s.memory.callerLocals callerIdx (.init rootVal') with
+              | .some callerLocals' => .ok callerLocals'
+              | .none => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | _ => .ub
+      match callerWriteRes with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok callerLocals' =>
+        let borrows' := invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag)
+        MirStepNode.step
+          (advanceStmt s locals₃
+            { s.memory with borrows := borrows', callerLocals := callerLocals' })
+
+private def copyViaBytesBody
+    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
+    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) : MirStepNode :=
+  let n := countBits
+  let srcStart := srcPtr.offsetBytes
+  let dstStart := dstPtr.offsetBytes
+  let overlaps :=
+    match Nat.beq srcPtr.tag dstPtr.tag with
+    | true => true
+    | false =>
+      match Nat.beq srcEntry.targetLocal dstEntry.targetLocal with
+      | false => false
+      | true => projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection
+  match overlaps with
+  | true => MirStepNode.fail .ub
+  | false =>
+    let srcSliceVal : Option Value :=
+      match srcSubVal with
+      | .aggregate 0 srcElems =>
+        match Nat.ble (Nat.add srcStart n) (length srcElems) with
+        | true => .some (.aggregate 0 (takeValues n (dropValues srcStart srcElems)))
+        | false =>
+          match Nat.beq srcStart 0 with
+          | true => .some srcSubVal
+          | false => .none
+      | _ => .some srcSubVal
+    let dstTargetTyOpt : Option Ty :=
+      match dstLocalPlaceTy with
+      | .some t => .some t
+      | .none => operandPointeeTy localDecls layouts dst
+    match srcSliceVal with
+    | .none => MirStepNode.fail .ub
+    | .some sVal =>
+      match encodeUntypedValueToBytes defaultCodecFuel sVal with
+      | .none => MirStepNode.unsupported
+      | .some bs =>
+        let spliceBytesToDstArray : Option Value :=
+          match Bool.not dstIsAdt, dstSubVal with
+          | true, .aggregate 0 dstElems =>
+            match Nat.ble (Nat.add dstStart (length bs)) (length dstElems) with
+            | false => .none
+            | true =>
+              match decodeArrayChunksWith
+                  (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
+                  1 (length bs) bs with
+              | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstStart dstElems))
+              | .none => .none
+          | _, _ => .none
+        let preferSplicedArray : Bool :=
+          match dstLocalPlaceTy, dstSubVal with
+          | .none, .aggregate 0 _ => true
+          | _, _ => false
+        match preferSplicedArray, spliceBytesToDstArray with
+        | true, .some splicedVal =>
+          copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+        | _, _ =>
+          match dstTargetTyOpt with
+          | .some dstPt =>
+            match rigidTyByteSize layouts dstPt with
+            | .some dstBytes =>
+              match Nat.beq (length bs) dstBytes with
+              | true =>
+                match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
+                | .some decodedVal =>
+                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag decodedVal
+                | .none =>
+                  match spliceBytesToDstArray with
+                  | .some splicedVal =>
+                    copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+                  | .none => MirStepNode.fail .ub
+              | false =>
+                match spliceBytesToDstArray with
+                | .some splicedVal =>
+                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+                | .none => MirStepNode.unsupported
+            | .none =>
+              match spliceBytesToDstArray with
+              | .some splicedVal =>
+                copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+              | .none => MirStepNode.unsupported
+          | .none =>
+            match spliceBytesToDstArray with
+            | .some splicedVal =>
+              copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal
+            | .none => MirStepNode.fail .ub
+
+private def evalCopyNonOverlappingPermOk
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) : MirStepNode :=
+  let n := countBits
+  let srcStart := srcPtr.offsetBytes
+  let dstStart := dstPtr.offsetBytes
+  let isSingleDirect :=
+    Bool.and (Nat.beq n 1) (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+  match isSingleDirect with
+  | true =>
+    evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
+  | false =>
+    let srcRootSlot : Option LocalSlot :=
+      match get? locals₃ srcEntry.targetLocal with
+      | .some slot => .some slot
+      | .none =>
+        match get? s.memory.callerLocals srcEntry.targetLocal with
+        | .some slot => .some slot
+        | .none => get? s.memory.callerLocals (Nat.sub srcEntry.targetLocal (length locals₃))
+    let dstRootSlot : Option LocalSlot :=
+      match get? locals₃ dstEntry.targetLocal with
+      | .some slot => .some slot
+      | .none =>
+        match get? s.memory.callerLocals dstEntry.targetLocal with
+        | .some slot => .some slot
+        | .none => get? s.memory.callerLocals (Nat.sub dstEntry.targetLocal (length locals₃))
+    match srcRootSlot, dstRootSlot with
+    | .some (.init srcRootVal), .some (.init dstRootVal) =>
+      let dstPlace : Place := {
+        local_ := dstEntry.targetLocal
+        projection := dstEntry.targetProjection
+      }
+      let dstLocalPlaceTy : Option Ty :=
+        match get? locals₃ dstPlace.local_ with
+        | .some _ => placeTy localDecls layouts dstPlace
+        | .none => .none
+      let dstIsAdt : Bool :=
+        match dstLocalPlaceTy with
+        | .some { kind := .adt _ _, .. } => true
+        | _ => false
+      match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
+            readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
+      | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
+        let inBounds :=
+          Bool.and (Bool.not dstIsAdt)
+            (Bool.and (Nat.ble (Nat.add srcStart n) (length srcElems))
+              (Nat.ble (Nat.add dstStart n) (length dstElems)))
+        match inBounds with
+        | false =>
+          match Bool.and (Nat.beq dstStart 0) (Nat.ble (Nat.add srcStart n) (length srcElems)) with
+          | true =>
+            copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+              countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt
+              (.aggregate 0 srcElems) (.aggregate 0 dstElems)
+          | false => MirStepNode.fail .ub
+        | true =>
+          let sameContainer :=
+            Bool.and (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+              (projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection)
+          let disjoint :=
+            match Nat.beq srcPtr.tag dstPtr.tag with
+            | true => false
+            | false =>
+              match sameContainer with
+              | false => true
+              | true =>
+                Bool.or (Nat.ble (Nat.add srcStart n) dstStart)
+                  (Nat.ble (Nat.add dstStart n) srcStart)
+          match disjoint with
+          | false => MirStepNode.fail .ub
+          | true =>
+            let copiedSlice := takeValues n (dropValues srcStart srcElems)
+            let dstElems' := spliceValues copiedSlice dstStart dstElems
+            copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag
+              (.aggregate 0 dstElems')
+      | .ok srcSubVal, .ok dstSubVal =>
+        copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+          countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal
+      | .ok srcSubVal, .ub =>
+        match Nat.beq dstStart 0 with
+        | true =>
+          copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+            countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal .unit
+        | false => MirStepNode.fail .ub
+      | .ub, _ =>
+        match srcRootVal, dstRootVal, srcEntry.targetProjection, dstEntry.targetProjection with
+        | .aggregate _ srcFields,
+          .aggregate dstVar dstFields,
+          .field _ srcFieldTy :: .nil,
+          .field _ dstFieldTy :: .nil =>
+          let overlaps :=
+            match Nat.beq srcPtr.tag dstPtr.tag with
+            | true => true
+            | false => Nat.beq srcEntry.targetLocal dstEntry.targetLocal
+          match overlaps with
+          | true => MirStepNode.fail .ub
+          | false =>
+            let elemBytesOpt : Option Nat :=
+              match operandPointeeTy localDecls layouts src with
+              | .some pt => rigidTyByteSize layouts pt
+              | .none => .some 1
+            match elemBytesOpt, rigidTyByteSize layouts srcFieldTy, rigidTyByteSize layouts dstFieldTy with
+            | .some elemSz, .some srcPlaceBytes, .some dstPlaceBytes =>
+              let copyByteLen := Nat.mul n elemSz
+              let inBounds :=
+                Bool.and (Nat.ble (Nat.add srcStart copyByteLen) srcPlaceBytes)
+                  (Nat.ble (Nat.add dstStart copyByteLen) dstPlaceBytes)
+              match inBounds with
+              | false => MirStepNode.fail .ub
+              | true =>
+                match encodeUnionFieldsWith (encodeUntypedValueToBytes defaultCodecFuel) srcPlaceBytes srcFields with
+                | .none => MirStepNode.fail .ub
+                | .some srcUnionBytes =>
+                  match sliceAbstractBytes srcUnionBytes srcStart copyByteLen with
+                  | .none => MirStepNode.fail .ub
+                  | .some copiedBytes =>
+                    match Bool.and (Nat.beq dstStart 0) (Nat.beq copyByteLen dstPlaceBytes),
+                          decodeValueFromBytes defaultCodecFuel layouts dstFieldTy copiedBytes with
+                    | true, .some decodedVal =>
+                      copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag decodedVal
+                    | _, _ =>
+                      let dstIsUnion : Bool :=
+                        match get? localDecls dstEntry.targetLocal with
+                        | .some decl =>
+                          match LayoutTable.lookup layouts decl.ty.layoutIdx with
+                          | .some l =>
+                            match l.fields with
+                            | .union _ => true
+                            | _ => false
+                          | .none => false
+                        | .none => false
+                      match dstIsUnion with
+                      | false => MirStepNode.fail .ub
+                      | true =>
+                        let resetUnion := Value.aggregate dstVar (takeValues 1 dstFields)
+                        match set? locals₃ dstEntry.targetLocal (.init resetUnion) with
+                        | .some locals₄ =>
+                          let borrows' :=
+                            invalidateConflictingBorrows s.memory.borrows dstEntry.targetLocal (.some dstPtr.tag)
+                          MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
+                        | .none => MirStepNode.fail .ub
+            | _, _, _ => MirStepNode.fail .ub
+        | _, _, _, _ => MirStepNode.fail .ub
+      | _, _ => MirStepNode.fail .ub
+    | _, _ => MirStepNode.fail .ub
+
+private theorem evalCopyNonOverlappingWithCount_eq
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
+    evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits locals₃ =
+      match Nat.beq countBits 0 with
+      | true => MirStepNode.step (advanceStmt s locals₃)
+      | false =>
+        match srcVal, dstVal with
+        | .ptr srcPtr _, .ptr dstPtr _ =>
+          match lookupBorrow s.memory.borrows srcPtr.tag, lookupBorrow s.memory.borrows dstPtr.tag with
+          | .some srcEntry, .some dstEntry =>
+            match srcEntry.perm, dstEntry.perm with
+            | .disabled, _ => MirStepNode.fail .ub
+            | _, .frozen => MirStepNode.fail .ub
+            | _, .disabled => MirStepNode.fail .ub
+            | _, _ =>
+              evalCopyNonOverlappingPermOk s src dst localDecls layouts srcPtr dstPtr
+                srcEntry dstEntry countBits locals₃
+          | _, _ => MirStepNode.fail .ub
+        | _, _ => MirStepNode.fail .ub := by
+  unfold evalCopyNonOverlappingWithCount
+  cases Nat.beq countBits 0 with
+  | true => rfl
+  | false =>
+    cases srcVal with
+    | ptr srcPtr _ =>
+      cases dstVal with
+      | ptr dstPtr _ =>
+        cases lookupBorrow s.memory.borrows srcPtr.tag with
+        | none => rfl
+        | some srcEntry =>
+          cases lookupBorrow s.memory.borrows dstPtr.tag with
+          | none => rfl
+          | some dstEntry =>
+            cases srcEntry.perm <;> cases dstEntry.perm <;> rfl
+      | _ => rfl
+    | _ => rfl
+
+private theorem copyWriteDstVal_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
+    (dstLoc : Local) (dstTag : Nat) (newVal : Value) :
+    copyWriteDstVal (MachineState.pushBaseStack calleeBody baseStack s)
+        locals₃ dstPlace dstLoc dstTag newVal =
+      MirStepNode.pushBaseStack calleeBody baseStack
+        (copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal) := by
+  unfold copyWriteDstVal
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  repeat' (first | rfl | split)
+
+private theorem copyWriteDstVal_isStmtNode
+    (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
+    (dstLoc : Local) (dstTag : Nat) (newVal : Value) :
+    IsStmtNode (copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal) := by
+  unfold copyWriteDstVal
+  dsimp only
+  repeat' (first
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
+
+private theorem copyViaBytesBody_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
+    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) :
+    copyViaBytesBody (MachineState.pushBaseStack calleeBody baseStack s)
+        dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits
+        locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal =
+      MirStepNode.pushBaseStack calleeBody baseStack
+        (copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+          countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal) := by
+  unfold copyViaBytesBody
+  dsimp only
+  repeat' (first | rfl | exact copyWriteDstVal_pushBaseStack .. | split)
+
+private theorem copyViaBytesBody_isStmtNode
+    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
+    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) :
+    IsStmtNode (copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+      countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal) := by
+  unfold copyViaBytesBody
+  dsimp only
+  repeat' (first
+    | exact copyWriteDstVal_isStmtNode ..
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
+
+private theorem evalCopySingleDirect_isStmtNode
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (locals₃ : List LocalSlot) :
+    IsStmtNode (evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃) := by
+  unfold evalCopySingleDirect
+  dsimp only
+  repeat' (first
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
+
+private theorem evalCopyNonOverlappingPermOk_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat) (locals₃ : List LocalSlot) :
+    evalCopyNonOverlappingPermOk
+        (MachineState.pushBaseStack calleeBody baseStack s)
+        src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
+      MirStepNode.pushBaseStack calleeBody baseStack
+        (evalCopyNonOverlappingPermOk
+          s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃) := by
+  unfold evalCopyNonOverlappingPermOk
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  repeat' (first
+    | rfl
+    | exact evalCopySingleDirect_pushBaseStack ..
+    | exact copyViaBytesBody_pushBaseStack ..
+    | exact copyWriteDstVal_pushBaseStack ..
+    | split)
+
+private theorem evalCopyNonOverlappingPermOk_isStmtNode
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat) (locals₃ : List LocalSlot) :
+    IsStmtNode
+      (evalCopyNonOverlappingPermOk
+        s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃) := by
+  unfold evalCopyNonOverlappingPermOk
+  dsimp only
+  repeat' (first
+    | exact evalCopySingleDirect_isStmtNode ..
+    | exact copyViaBytesBody_isStmtNode ..
+    | exact copyWriteDstVal_isStmtNode ..
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
+
 theorem evalCopyNonOverlappingWithCount_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (s : MachineState) (src dst : Operand)
@@ -3315,1381 +3901,84 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
       MirStepNode.pushBaseStack calleeBody baseStack
         (evalCopyNonOverlappingWithCount
           s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
-  unfold evalCopyNonOverlappingWithCount
+  rw [evalCopyNonOverlappingWithCount_eq, evalCopyNonOverlappingWithCount_eq]
   cases Nat.beq countBits 0 with
   | true => rfl
   | false =>
     cases srcVal with
-    | ptr srcPtr srcSz =>
+    | ptr srcPtr _ =>
       cases dstVal with
-      | ptr dstPtr dstSz =>
-        dsimp only [MachineState.pushBaseStack_memory, Memory.pushBaseStack_borrows,
-          Memory.pushBaseStack_callerLocals]
+      | ptr dstPtr _ =>
+        dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
         cases lookupBorrow s.memory.borrows srcPtr.tag with
         | none => rfl
         | some srcEntry =>
           cases lookupBorrow s.memory.borrows dstPtr.tag with
           | none => rfl
           | some dstEntry =>
-            rcases srcEntry with ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt, sTagParent⟩
-            rcases dstEntry with ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt, dTagParent⟩
             dsimp only
-            have h_perm_ok :
-                (sPerm = .disabled ∨ dPerm = .frozen ∨ dPerm = .disabled) ∨
-                ((sPerm = .active ∨ sPerm = .reserved ∨ sPerm = .frozen) ∧
-                 (dPerm = .active ∨ dPerm = .reserved)) := by
-              cases sPerm <;> cases dPerm <;> simp
-            rcases h_perm_ok with h_bad | h_good
-            · rcases h_bad with rfl | rfl | rfl
-              · rfl
-              · cases sPerm <;> rfl
-              · cases sPerm <;> rfl
-            · suffices
-                  (match Bool.and (Nat.beq countBits 1)
-                      (Bool.and (Nat.beq srcPtr.offsetBytes 0)
-                        (Nat.beq dstPtr.offsetBytes 0)) with
-                   | true =>
-                    evalCopySingleDirect
-                      (MachineState.pushBaseStack calleeBody baseStack s)
-                      src dst localDecls layouts srcPtr dstPtr
-                      ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt, sTagParent⟩
-                      ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt, dTagParent⟩ locals₃
-                   | false =>
-                    let srcRootSlot : Option LocalSlot :=
-                      match get? locals₃ sLoc with
-                      | .some slot => .some slot
-                      | .none =>
-                        match get? s.memory.callerLocals sLoc with
-                        | .some slot => .some slot
-                        | .none => get? s.memory.callerLocals (Nat.sub sLoc (length locals₃))
-                    let dstRootSlot : Option LocalSlot :=
-                      match get? locals₃ dLoc with
-                      | .some slot => .some slot
-                      | .none =>
-                        match get? s.memory.callerLocals dLoc with
-                        | .some slot => .some slot
-                        | .none => get? s.memory.callerLocals (Nat.sub dLoc (length locals₃))
-                    match srcRootSlot, dstRootSlot with
-                    | .some (.init srcRootVal), .some (.init dstRootVal) =>
-                      let dstPlace : Place := { local_ := dLoc, projection := dProj }
-                      let dstLocalPlaceTy : Option Ty :=
-                        match get? locals₃ dstPlace.local_ with
-                        | .some _ => placeTy localDecls layouts dstPlace
-                        | .none => .none
-                      let dstIsAdt : Bool :=
-                        match dstLocalPlaceTy with
-                        | .some { kind := .adt _ _, .. } => true
-                        | _ => false
-                      let writeDstVal (newVal : Value) : MirStepNode :=
-                        match writePlaceValue locals₃ s.memory.borrows dstPlace newVal with
-                        | .ok locals₄ =>
-                          let borrows' :=
-                            invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag)
-                          MirStepNode.step
-                            (advanceStmt (MachineState.pushBaseStack calleeBody baseStack s)
-                              locals₄
-                              { Memory.pushBaseStack calleeBody baseStack s.memory with
-                                borrows := borrows' })
-                        | .unsupported => MirStepNode.unsupported
-                        | .ub =>
-                          match get? locals₃ dstPlace.local_ with
-                          | .some _ => MirStepNode.fail .ub
-                          | .none =>
-                            let callerIdx :=
-                              match get? s.memory.callerLocals dstPlace.local_ with
-                              | .some _ => dstPlace.local_
-                              | .none => Nat.sub dstPlace.local_ (length locals₃)
-                            let callerWriteRes : PlaceWriteResult :=
-                              match dstPlace.projection with
-                              | .nil =>
-                                match get? s.memory.callerLocals callerIdx with
-                                | .some .dead => .ub
-                                | .some _ =>
-                                  match set? s.memory.callerLocals callerIdx (.init newVal) with
-                                  | .some callerLocals' => .ok callerLocals'
-                                  | .none => .ub
-                                | .none => .ub
-                              | .deref :: _ => .ub
-                              | proj :: rest =>
-                                match get? s.memory.callerLocals callerIdx with
-                                | .some (.init rootVal) =>
-                                  match writeProjectedValue locals₃ rootVal (proj :: rest) newVal with
-                                  | .ok rootVal' =>
-                                    match set? s.memory.callerLocals callerIdx (.init rootVal') with
-                                    | .some callerLocals' => .ok callerLocals'
-                                    | .none => .ub
-                                  | .ub => .ub
-                                  | .unsupported => .unsupported
-                                | _ => .ub
-                            match callerWriteRes with
-                            | .ub => MirStepNode.fail .ub
-                            | .unsupported => MirStepNode.unsupported
-                            | .ok callerLocals' =>
-                              let borrows' :=
-                                invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag)
-                              MirStepNode.step
-                                (advanceStmt (MachineState.pushBaseStack calleeBody baseStack s)
-                                  locals₃
-                                  { Memory.pushBaseStack calleeBody baseStack s.memory with
-                                    borrows := borrows'
-                                    callerLocals := callerLocals' })
-                      let copyViaBytes (srcSubVal dstSubVal : Value) : MirStepNode :=
-                        let overlaps :=
-                          match Nat.beq srcPtr.tag dstPtr.tag with
-                          | true => true
-                          | false =>
-                            match Nat.beq sLoc dLoc with
-                            | false => false
-                            | true => projectionsOverlap sProj dProj
-                        match overlaps with
-                        | true => MirStepNode.fail .ub
-                        | false =>
-                          let srcSliceVal : Option Value :=
-                            match srcSubVal with
-                            | .aggregate 0 srcElems =>
-                              match Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems) with
-                              | true => .some (.aggregate 0 (takeValues countBits (dropValues srcPtr.offsetBytes srcElems)))
-                              | false =>
-                                match Nat.beq srcPtr.offsetBytes 0 with
-                                | true => .some srcSubVal
-                                | false => .none
-                            | _ => .some srcSubVal
-                          let dstTargetTyOpt : Option Ty :=
-                            match dstLocalPlaceTy with
-                            | .some t => .some t
-                            | .none => operandPointeeTy localDecls layouts dst
-                          match srcSliceVal with
-                          | .none => MirStepNode.fail .ub
-                          | .some sVal =>
-                            match encodeUntypedValueToBytes defaultCodecFuel sVal with
-                            | .none => MirStepNode.unsupported
-                            | .some bs =>
-                              let spliceBytesToDstArray : Option Value :=
-                                match Bool.not dstIsAdt, dstSubVal with
-                                | true, .aggregate 0 dstElems =>
-                                  match Nat.ble (Nat.add dstPtr.offsetBytes (length bs)) (length dstElems) with
-                                  | false => .none
-                                  | true =>
-                                    match decodeArrayChunksWith
-                                        (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                                        1 (length bs) bs with
-                                    | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstPtr.offsetBytes dstElems))
-                                    | .none => .none
-                                | _, _ => .none
-                              let preferSplicedArray : Bool :=
-                                match dstLocalPlaceTy, dstSubVal with
-                                | .none, .aggregate 0 _ => true
-                                | _, _ => false
-                              match preferSplicedArray, spliceBytesToDstArray with
-                              | true, .some splicedVal => writeDstVal splicedVal
-                              | _, _ =>
-                                match dstTargetTyOpt with
-                                | .some dstPt =>
-                                  match rigidTyByteSize layouts dstPt with
-                                  | .some dstBytes =>
-                                    match Nat.beq (length bs) dstBytes with
-                                    | true =>
-                                      match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                                      | .some decodedVal => writeDstVal decodedVal
-                                      | .none =>
-                                        match spliceBytesToDstArray with
-                                        | .some splicedVal => writeDstVal splicedVal
-                                        | .none => MirStepNode.fail .ub
-                                    | false =>
-                                      match spliceBytesToDstArray with
-                                      | .some splicedVal => writeDstVal splicedVal
-                                      | .none => MirStepNode.unsupported
-                                  | .none =>
-                                    match spliceBytesToDstArray with
-                                    | .some splicedVal => writeDstVal splicedVal
-                                    | .none => MirStepNode.unsupported
-                                | .none =>
-                                  match spliceBytesToDstArray with
-                                  | .some splicedVal => writeDstVal splicedVal
-                                  | .none => MirStepNode.fail .ub
-                      match readProjectedValue locals₃ srcRootVal sProj,
-                            readProjectedValue locals₃ dstRootVal dProj with
-                      | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
-                        let inBounds :=
-                          Bool.and (Bool.not dstIsAdt)
-                            (Bool.and (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems))
-                              (Nat.ble (Nat.add dstPtr.offsetBytes countBits) (length dstElems)))
-                        match inBounds with
-                        | false =>
-                          match Bool.and (Nat.beq dstPtr.offsetBytes 0)
-                              (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems)) with
-                          | true => copyViaBytes (.aggregate 0 srcElems) (.aggregate 0 dstElems)
-                          | false => MirStepNode.fail .ub
-                        | true =>
-                          let sameContainer := Bool.and (Nat.beq sLoc dLoc) (projectionsOverlap sProj dProj)
-                          let disjoint :=
-                            match Nat.beq srcPtr.tag dstPtr.tag with
-                            | true => false
-                            | false =>
-                              match sameContainer with
-                              | false => true
-                              | true =>
-                                Bool.or (Nat.ble (Nat.add srcPtr.offsetBytes countBits) dstPtr.offsetBytes)
-                                  (Nat.ble (Nat.add dstPtr.offsetBytes countBits) srcPtr.offsetBytes)
-                          match disjoint with
-                          | false => MirStepNode.fail .ub
-                          | true =>
-                            writeDstVal (.aggregate 0
-                              (spliceValues (takeValues countBits (dropValues srcPtr.offsetBytes srcElems))
-                                dstPtr.offsetBytes dstElems))
-                      | .ok srcSubVal, .ok dstSubVal => copyViaBytes srcSubVal dstSubVal
-                      | .ok srcSubVal, .ub =>
-                        match Nat.beq dstPtr.offsetBytes 0 with
-                        | true => copyViaBytes srcSubVal .unit
-                        | false => MirStepNode.fail .ub
-                      | .ub, _ =>
-                        match (generalizing := false)
-                          srcRootVal,
-                          dstRootVal,
-                          sProj,
-                          dProj
-                        with
-                        | .aggregate _ srcFields,
-                          .aggregate dstVar dstFields,
-                          .field _ srcFieldTy :: .nil,
-                          .field _ dstFieldTy :: .nil =>
-                          let overlaps :=
-                            match Nat.beq srcPtr.tag dstPtr.tag with
-                            | true => true
-                            | false =>
-                              Nat.beq sLoc dLoc
-                          match overlaps with
-                          | true => MirStepNode.fail .ub
-                          | false =>
-                            let elemBytesOpt : Option Nat :=
-                              match operandPointeeTy localDecls layouts src with
-                              | .some pt => rigidTyByteSize layouts pt
-                              | .none => .some 1
-                            match
-                              elemBytesOpt,
-                              rigidTyByteSize layouts srcFieldTy,
-                              rigidTyByteSize layouts dstFieldTy
-                            with
-                            | .some elemSz, .some srcPlaceBytes, .some dstPlaceBytes =>
-                              let copyByteLen := Nat.mul countBits elemSz
-                              let inBounds :=
-                                Bool.and
-                                  (Nat.ble (Nat.add srcPtr.offsetBytes copyByteLen) srcPlaceBytes)
-                                  (Nat.ble (Nat.add dstPtr.offsetBytes copyByteLen) dstPlaceBytes)
-                              match inBounds with
-                              | false => MirStepNode.fail .ub
-                              | true =>
-                                match
-                                  encodeUnionFieldsWith
-                                    (encodeUntypedValueToBytes defaultCodecFuel)
-                                    srcPlaceBytes
-                                    srcFields
-                                with
-                                | .none => MirStepNode.fail .ub
-                                | .some srcUnionBytes =>
-                                  match
-                                    sliceAbstractBytes srcUnionBytes srcPtr.offsetBytes copyByteLen
-                                  with
-                                  | .none => MirStepNode.fail .ub
-                                  | .some copiedBytes =>
-                                    match
-                                      Bool.and
-                                        (Nat.beq dstPtr.offsetBytes 0)
-                                        (Nat.beq copyByteLen dstPlaceBytes),
-                                      decodeValueFromBytes
-                                        defaultCodecFuel
-                                        layouts
-                                        dstFieldTy
-                                        copiedBytes
-                                    with
-                                    | true, .some decodedVal => writeDstVal decodedVal
-                                    | _, _ =>
-                                      let dstIsUnion : Bool :=
-                                        match get? localDecls dLoc with
-                                        | .some decl =>
-                                          match
-                                            LayoutTable.lookup layouts decl.ty.layoutIdx
-                                          with
-                                          | .some l =>
-                                            match l.fields with
-                                            | .union _ => true
-                                            | _ => false
-                                          | .none => false
-                                        | .none => false
-                                      match dstIsUnion with
-                                      | false => MirStepNode.fail .ub
-                                      | true =>
-                                        let resetUnion :=
-                                          Value.aggregate dstVar (takeValues 1 dstFields)
-                                        match
-                                          set?
-                                            locals₃
-                                            dLoc
-                                            (.init resetUnion)
-                                        with
-                                        | .some locals₄ =>
-                                          let borrows' :=
-                                            invalidateConflictingBorrows
-                                              s.memory.borrows
-                                              dLoc
-                                              (.some dstPtr.tag)
-                                          MirStepNode.step
-                                            (advanceStmt
-                                              (MachineState.pushBaseStack calleeBody baseStack s)
-                                              locals₄
-                                              { Memory.pushBaseStack calleeBody baseStack s.memory with borrows := borrows' })
-                                        | .none => MirStepNode.fail .ub
-                            | _, _, _ => MirStepNode.fail .ub
-                        | _, _, _, _ => MirStepNode.fail .ub
-                      | _, _ => MirStepNode.fail .ub
-                    | _, _ => MirStepNode.fail .ub) =
-                  MirStepNode.pushBaseStack calleeBody baseStack
-                    (match Bool.and (Nat.beq countBits 1)
-                        (Bool.and (Nat.beq srcPtr.offsetBytes 0)
-                          (Nat.beq dstPtr.offsetBytes 0)) with
-                     | true =>
-                      evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr
-                        ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt, sTagParent⟩
-                        ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt, dTagParent⟩ locals₃
-                     | false =>
-                      let srcRootSlot : Option LocalSlot :=
-                        match get? locals₃ sLoc with
-                        | .some slot => .some slot
-                        | .none =>
-                          match get? s.memory.callerLocals sLoc with
-                          | .some slot => .some slot
-                          | .none => get? s.memory.callerLocals (Nat.sub sLoc (length locals₃))
-                      let dstRootSlot : Option LocalSlot :=
-                        match get? locals₃ dLoc with
-                        | .some slot => .some slot
-                        | .none =>
-                          match get? s.memory.callerLocals dLoc with
-                          | .some slot => .some slot
-                          | .none => get? s.memory.callerLocals (Nat.sub dLoc (length locals₃))
-                      match srcRootSlot, dstRootSlot with
-                      | .some (.init srcRootVal), .some (.init dstRootVal) =>
-                        let dstPlace : Place := { local_ := dLoc, projection := dProj }
-                        let dstLocalPlaceTy : Option Ty :=
-                          match get? locals₃ dstPlace.local_ with
-                          | .some _ => placeTy localDecls layouts dstPlace
-                          | .none => .none
-                        let dstIsAdt : Bool :=
-                          match dstLocalPlaceTy with
-                          | .some { kind := .adt _ _, .. } => true
-                          | _ => false
-                        let writeDstVal (newVal : Value) : MirStepNode :=
-                          match writePlaceValue locals₃ s.memory.borrows dstPlace newVal with
-                          | .ok locals₄ =>
-                            let borrows' :=
-                              invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag)
-                            MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
-                          | .unsupported => MirStepNode.unsupported
-                          | .ub =>
-                            match get? locals₃ dstPlace.local_ with
-                            | .some _ => MirStepNode.fail .ub
-                            | .none =>
-                              let callerIdx :=
-                                match get? s.memory.callerLocals dstPlace.local_ with
-                                | .some _ => dstPlace.local_
-                                | .none => Nat.sub dstPlace.local_ (length locals₃)
-                              let callerWriteRes : PlaceWriteResult :=
-                                match dstPlace.projection with
-                                | .nil =>
-                                  match get? s.memory.callerLocals callerIdx with
-                                  | .some .dead => .ub
-                                  | .some _ =>
-                                    match set? s.memory.callerLocals callerIdx (.init newVal) with
-                                    | .some callerLocals' => .ok callerLocals'
-                                    | .none => .ub
-                                  | .none => .ub
-                                | .deref :: _ => .ub
-                                | proj :: rest =>
-                                  match get? s.memory.callerLocals callerIdx with
-                                  | .some (.init rootVal) =>
-                                    match writeProjectedValue locals₃ rootVal (proj :: rest) newVal with
-                                    | .ok rootVal' =>
-                                      match set? s.memory.callerLocals callerIdx (.init rootVal') with
-                                      | .some callerLocals' => .ok callerLocals'
-                                      | .none => .ub
-                                    | .ub => .ub
-                                    | .unsupported => .unsupported
-                                  | _ => .ub
-                              match callerWriteRes with
-                              | .ub => MirStepNode.fail .ub
-                              | .unsupported => MirStepNode.unsupported
-                              | .ok callerLocals' =>
-                                let borrows' :=
-                                  invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag)
-                                MirStepNode.step
-                                  (advanceStmt s locals₃
-                                    { s.memory with borrows := borrows', callerLocals := callerLocals' })
-                        let copyViaBytes (srcSubVal dstSubVal : Value) : MirStepNode :=
-                          let overlaps :=
-                            match Nat.beq srcPtr.tag dstPtr.tag with
-                            | true => true
-                            | false =>
-                              match Nat.beq sLoc dLoc with
-                              | false => false
-                              | true => projectionsOverlap sProj dProj
-                          match overlaps with
-                          | true => MirStepNode.fail .ub
-                          | false =>
-                            let srcSliceVal : Option Value :=
-                              match srcSubVal with
-                              | .aggregate 0 srcElems =>
-                                match Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems) with
-                                | true => .some (.aggregate 0 (takeValues countBits (dropValues srcPtr.offsetBytes srcElems)))
-                                | false =>
-                                  match Nat.beq srcPtr.offsetBytes 0 with
-                                  | true => .some srcSubVal
-                                  | false => .none
-                              | _ => .some srcSubVal
-                            let dstTargetTyOpt : Option Ty :=
-                              match dstLocalPlaceTy with
-                              | .some t => .some t
-                              | .none => operandPointeeTy localDecls layouts dst
-                            match srcSliceVal with
-                            | .none => MirStepNode.fail .ub
-                            | .some sVal =>
-                              match encodeUntypedValueToBytes defaultCodecFuel sVal with
-                              | .none => MirStepNode.unsupported
-                              | .some bs =>
-                                let spliceBytesToDstArray : Option Value :=
-                                  match Bool.not dstIsAdt, dstSubVal with
-                                  | true, .aggregate 0 dstElems =>
-                                    match Nat.ble (Nat.add dstPtr.offsetBytes (length bs)) (length dstElems) with
-                                    | false => .none
-                                    | true =>
-                                      match decodeArrayChunksWith
-                                          (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                                          1 (length bs) bs with
-                                      | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstPtr.offsetBytes dstElems))
-                                      | .none => .none
-                                  | _, _ => .none
-                                let preferSplicedArray : Bool :=
-                                  match dstLocalPlaceTy, dstSubVal with
-                                  | .none, .aggregate 0 _ => true
-                                  | _, _ => false
-                                match preferSplicedArray, spliceBytesToDstArray with
-                                | true, .some splicedVal => writeDstVal splicedVal
-                                | _, _ =>
-                                  match dstTargetTyOpt with
-                                  | .some dstPt =>
-                                    match rigidTyByteSize layouts dstPt with
-                                    | .some dstBytes =>
-                                      match Nat.beq (length bs) dstBytes with
-                                      | true =>
-                                        match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                                        | .some decodedVal => writeDstVal decodedVal
-                                        | .none =>
-                                          match spliceBytesToDstArray with
-                                          | .some splicedVal => writeDstVal splicedVal
-                                          | .none => MirStepNode.fail .ub
-                                      | false =>
-                                        match spliceBytesToDstArray with
-                                        | .some splicedVal => writeDstVal splicedVal
-                                        | .none => MirStepNode.unsupported
-                                    | .none =>
-                                      match spliceBytesToDstArray with
-                                      | .some splicedVal => writeDstVal splicedVal
-                                      | .none => MirStepNode.unsupported
-                                  | .none =>
-                                    match spliceBytesToDstArray with
-                                    | .some splicedVal => writeDstVal splicedVal
-                                    | .none => MirStepNode.fail .ub
-                        match readProjectedValue locals₃ srcRootVal sProj,
-                              readProjectedValue locals₃ dstRootVal dProj with
-                        | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
-                          let inBounds :=
-                            Bool.and (Bool.not dstIsAdt)
-                              (Bool.and (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems))
-                                (Nat.ble (Nat.add dstPtr.offsetBytes countBits) (length dstElems)))
-                          match inBounds with
-                          | false =>
-                            match Bool.and (Nat.beq dstPtr.offsetBytes 0)
-                                (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems)) with
-                            | true => copyViaBytes (.aggregate 0 srcElems) (.aggregate 0 dstElems)
-                            | false => MirStepNode.fail .ub
-                          | true =>
-                            let sameContainer := Bool.and (Nat.beq sLoc dLoc) (projectionsOverlap sProj dProj)
-                            let disjoint :=
-                              match Nat.beq srcPtr.tag dstPtr.tag with
-                              | true => false
-                              | false =>
-                                match sameContainer with
-                                | false => true
-                                | true =>
-                                  Bool.or (Nat.ble (Nat.add srcPtr.offsetBytes countBits) dstPtr.offsetBytes)
-                                    (Nat.ble (Nat.add dstPtr.offsetBytes countBits) srcPtr.offsetBytes)
-                            match disjoint with
-                            | false => MirStepNode.fail .ub
-                            | true =>
-                              writeDstVal (.aggregate 0
-                                (spliceValues (takeValues countBits (dropValues srcPtr.offsetBytes srcElems))
-                                  dstPtr.offsetBytes dstElems))
-                        | .ok srcSubVal, .ok dstSubVal => copyViaBytes srcSubVal dstSubVal
-                        | .ok srcSubVal, .ub =>
-                          match Nat.beq dstPtr.offsetBytes 0 with
-                          | true => copyViaBytes srcSubVal .unit
-                          | false => MirStepNode.fail .ub
-                        | .ub, _ =>
-                          match (generalizing := false)
-                            srcRootVal,
-                            dstRootVal,
-                            sProj,
-                            dProj
-                          with
-                          | .aggregate _ srcFields,
-                            .aggregate dstVar dstFields,
-                            .field _ srcFieldTy :: .nil,
-                            .field _ dstFieldTy :: .nil =>
-                            let overlaps :=
-                              match Nat.beq srcPtr.tag dstPtr.tag with
-                              | true => true
-                              | false =>
-                                Nat.beq sLoc dLoc
-                            match overlaps with
-                            | true => MirStepNode.fail .ub
-                            | false =>
-                              let elemBytesOpt : Option Nat :=
-                                match operandPointeeTy localDecls layouts src with
-                                | .some pt => rigidTyByteSize layouts pt
-                                | .none => .some 1
-                              match
-                                elemBytesOpt,
-                                rigidTyByteSize layouts srcFieldTy,
-                                rigidTyByteSize layouts dstFieldTy
-                              with
-                              | .some elemSz, .some srcPlaceBytes, .some dstPlaceBytes =>
-                                let copyByteLen := Nat.mul countBits elemSz
-                                let inBounds :=
-                                  Bool.and
-                                    (Nat.ble (Nat.add srcPtr.offsetBytes copyByteLen) srcPlaceBytes)
-                                    (Nat.ble (Nat.add dstPtr.offsetBytes copyByteLen) dstPlaceBytes)
-                                match inBounds with
-                                | false => MirStepNode.fail .ub
-                                | true =>
-                                  match
-                                    encodeUnionFieldsWith
-                                      (encodeUntypedValueToBytes defaultCodecFuel)
-                                      srcPlaceBytes
-                                      srcFields
-                                  with
-                                  | .none => MirStepNode.fail .ub
-                                  | .some srcUnionBytes =>
-                                    match
-                                      sliceAbstractBytes srcUnionBytes srcPtr.offsetBytes copyByteLen
-                                    with
-                                    | .none => MirStepNode.fail .ub
-                                    | .some copiedBytes =>
-                                      match
-                                        Bool.and
-                                          (Nat.beq dstPtr.offsetBytes 0)
-                                          (Nat.beq copyByteLen dstPlaceBytes),
-                                        decodeValueFromBytes
-                                          defaultCodecFuel
-                                          layouts
-                                          dstFieldTy
-                                          copiedBytes
-                                      with
-                                      | true, .some decodedVal => writeDstVal decodedVal
-                                      | _, _ =>
-                                        let dstIsUnion : Bool :=
-                                          match get? localDecls dLoc with
-                                          | .some decl =>
-                                            match
-                                              LayoutTable.lookup layouts decl.ty.layoutIdx
-                                            with
-                                            | .some l =>
-                                              match l.fields with
-                                              | .union _ => true
-                                              | _ => false
-                                            | .none => false
-                                          | .none => false
-                                        match dstIsUnion with
-                                        | false => MirStepNode.fail .ub
-                                        | true =>
-                                          let resetUnion :=
-                                            Value.aggregate dstVar (takeValues 1 dstFields)
-                                          match
-                                            set?
-                                              locals₃
-                                              dLoc
-                                              (.init resetUnion)
-                                          with
-                                          | .some locals₄ =>
-                                            let borrows' :=
-                                              invalidateConflictingBorrows
-                                                s.memory.borrows
-                                                dLoc
-                                                (.some dstPtr.tag)
-                                            MirStepNode.step
-                                              (advanceStmt
-                                                s
-                                                locals₄
-                                                { s.memory with borrows := borrows' })
-                                          | .none => MirStepNode.fail .ub
-                              | _, _, _ => MirStepNode.fail .ub
-                          | _, _, _, _ => MirStepNode.fail .ub
-                        | _, _ => MirStepNode.fail .ub
-                      | _, _ => MirStepNode.fail .ub) by
-                rcases h_good with ⟨rfl | rfl | rfl, rfl | rfl⟩ <;> exact this
-              cases h_sd :
-                  Bool.and (Nat.beq countBits 1)
-                    (Bool.and (Nat.beq srcPtr.offsetBytes 0)
-                      (Nat.beq dstPtr.offsetBytes 0)) with
-              | true =>
-                exact evalCopySingleDirect_pushBaseStack calleeBody baseStack
-                  s src dst localDecls layouts srcPtr dstPtr _ _ locals₃
-              | false =>
-                dsimp only
-                cases (match get? locals₃ sLoc with
-                  | some slot => some slot
-                  | none =>
-                    match get? s.memory.callerLocals sLoc with
-                    | some slot => some slot
-                    | none => get? s.memory.callerLocals (Nat.sub sLoc (length locals₃))) with
-                | none => rfl
-                | some sSlot =>
-                  cases sSlot with
-                  | uninit => rfl
-                  | dead => rfl
-                  | init srcRootVal =>
-                    cases (match get? locals₃ dLoc with
-                      | some slot => some slot
-                      | none =>
-                        match get? s.memory.callerLocals dLoc with
-                        | some slot => some slot
-                        | none => get? s.memory.callerLocals (Nat.sub dLoc (length locals₃))) with
-                    | none => rfl
-                    | some dSlot =>
-                      cases dSlot with
-                      | uninit => rfl
-                      | dead => rfl
-                      | init dstRootVal =>
-                        dsimp only
-                        let wdvRhs : Value → MirStepNode := fun newVal =>
-                          match writePlaceValue locals₃ s.memory.borrows { local_ := dLoc, projection := dProj } newVal with
-                          | .ok locals₄ =>
-                            MirStepNode.step
-                              (advanceStmt s locals₄
-                                { s.memory with borrows := invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag) })
-                          | .unsupported => MirStepNode.unsupported
-                          | .ub =>
-                            match get? locals₃ dLoc with
-                            | .some _ => MirStepNode.fail .ub
-                            | .none =>
-                              let callerIdx :=
-                                match get? s.memory.callerLocals dLoc with
-                                | .some _ => dLoc
-                                | .none => Nat.sub dLoc (length locals₃)
-                              let callerWriteRes : PlaceWriteResult :=
-                                match dProj with
-                                | .nil =>
-                                  match get? s.memory.callerLocals callerIdx with
-                                  | .some .dead => .ub
-                                  | .some _ =>
-                                    match set? s.memory.callerLocals callerIdx (.init newVal) with
-                                    | .some callerLocals' => .ok callerLocals'
-                                    | .none => .ub
-                                  | .none => .ub
-                                | .deref :: _ => .ub
-                                | proj :: rest =>
-                                  match get? s.memory.callerLocals callerIdx with
-                                  | .some (.init rootVal) =>
-                                    match writeProjectedValue locals₃ rootVal (proj :: rest) newVal with
-                                    | .ok rootVal' =>
-                                      match set? s.memory.callerLocals callerIdx (.init rootVal') with
-                                      | .some callerLocals' => .ok callerLocals'
-                                      | .none => .ub
-                                    | .ub => .ub
-                                    | .unsupported => .unsupported
-                                  | _ => .ub
-                              match callerWriteRes with
-                              | .ub => MirStepNode.fail .ub
-                              | .unsupported => MirStepNode.unsupported
-                              | .ok callerLocals' =>
-                                MirStepNode.step
-                                  (advanceStmt s locals₃
-                                    { s.memory with
-                                      borrows := invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag)
-                                      callerLocals := callerLocals' })
-                        have h_wdv_eq :
-                            (fun (newVal : Value) =>
-                              match writePlaceValue locals₃ s.memory.borrows { local_ := dLoc, projection := dProj } newVal with
-                              | .ok locals₄ =>
-                                MirStepNode.step
-                                  (advanceStmt (MachineState.pushBaseStack calleeBody baseStack s) locals₄
-                                    { (MachineState.pushBaseStack calleeBody baseStack s).memory with
-                                      borrows := invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag) })
-                              | .unsupported => MirStepNode.unsupported
-                              | .ub =>
-                                match get? locals₃ dLoc with
-                                | .some _ => MirStepNode.fail .ub
-                                | .none =>
-                                  let callerIdx :=
-                                    match get? s.memory.callerLocals dLoc with
-                                    | .some _ => dLoc
-                                    | .none => Nat.sub dLoc (length locals₃)
-                                  let callerWriteRes : PlaceWriteResult :=
-                                    match dProj with
-                                    | .nil =>
-                                      match get? s.memory.callerLocals callerIdx with
-                                      | .some .dead => .ub
-                                      | .some _ =>
-                                        match set? s.memory.callerLocals callerIdx (.init newVal) with
-                                        | .some callerLocals' => .ok callerLocals'
-                                        | .none => .ub
-                                      | .none => .ub
-                                    | .deref :: _ => .ub
-                                    | proj :: rest =>
-                                      match get? s.memory.callerLocals callerIdx with
-                                      | .some (.init rootVal) =>
-                                        match writeProjectedValue locals₃ rootVal (proj :: rest) newVal with
-                                        | .ok rootVal' =>
-                                          match set? s.memory.callerLocals callerIdx (.init rootVal') with
-                                          | .some callerLocals' => .ok callerLocals'
-                                          | .none => .ub
-                                        | .ub => .ub
-                                        | .unsupported => .unsupported
-                                      | _ => .ub
-                                  match callerWriteRes with
-                                  | .ub => MirStepNode.fail .ub
-                                  | .unsupported => MirStepNode.unsupported
-                                  | .ok callerLocals' =>
-                                    MirStepNode.step
-                                      (advanceStmt (MachineState.pushBaseStack calleeBody baseStack s) locals₃
-                                        { (MachineState.pushBaseStack calleeBody baseStack s).memory with
-                                          borrows := invalidateConflictingBorrows s.memory.borrows dLoc (.some dstPtr.tag)
-                                          callerLocals := callerLocals' })) =
-                            (fun newVal => MirStepNode.pushBaseStack calleeBody baseStack (wdvRhs newVal)) := by
-                          funext newVal
-                          dsimp only [wdvRhs]
-                          cases writePlaceValue locals₃ s.memory.borrows { local_ := dLoc, projection := dProj } newVal with
-                          | ok _ => rfl
-                          | unsupported => rfl
-                          | ub =>
-                            cases get? locals₃ dLoc with
-                            | some _ => rfl
-                            | none =>
-                              dsimp only
-                              repeat' (first | rfl | split)
-                        have h_body :
-                            ∀ (wL wR : Value → MirStepNode),
-                              (∀ v, wL v = MirStepNode.pushBaseStack calleeBody baseStack (wR v)) →
-                              (let dstPlace : Place := { local_ := dLoc, projection := dProj }
-                               let dstLocalPlaceTy : Option Ty :=
-                                 match get? locals₃ dstPlace.local_ with
-                                 | .some _ => placeTy localDecls layouts dstPlace
-                                 | .none => .none
-                               let dstIsAdt : Bool :=
-                                 match dstLocalPlaceTy with
-                                 | .some { kind := .adt _ _, .. } => true
-                                 | _ => false
-                               let copyViaBytes (srcSubVal dstSubVal : Value) : MirStepNode :=
-                                 let overlaps :=
-                                   match Nat.beq srcPtr.tag dstPtr.tag with
-                                   | true => true
-                                   | false =>
-                                     match Nat.beq sLoc dLoc with
-                                     | false => false
-                                     | true => projectionsOverlap sProj dProj
-                                 match overlaps with
-                                 | true => MirStepNode.fail .ub
-                                 | false =>
-                                   let srcSliceVal : Option Value :=
-                                     match srcSubVal with
-                                     | .aggregate 0 srcElems =>
-                                       match Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems) with
-                                       | true => .some (.aggregate 0 (takeValues countBits (dropValues srcPtr.offsetBytes srcElems)))
-                                       | false =>
-                                         match Nat.beq srcPtr.offsetBytes 0 with
-                                         | true => .some srcSubVal
-                                         | false => .none
-                                     | _ => .some srcSubVal
-                                   let dstTargetTyOpt : Option Ty :=
-                                     match dstLocalPlaceTy with
-                                     | .some t => .some t
-                                     | .none => operandPointeeTy localDecls layouts dst
-                                   match srcSliceVal with
-                                   | .none => MirStepNode.fail .ub
-                                   | .some sVal =>
-                                     match encodeUntypedValueToBytes defaultCodecFuel sVal with
-                                     | .none => MirStepNode.unsupported
-                                     | .some bs =>
-                                       let spliceBytesToDstArray : Option Value :=
-                                         match Bool.not dstIsAdt, dstSubVal with
-                                         | true, .aggregate 0 dstElems =>
-                                           match Nat.ble (Nat.add dstPtr.offsetBytes (length bs)) (length dstElems) with
-                                           | false => .none
-                                           | true =>
-                                             match decodeArrayChunksWith
-                                                 (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                                                 1 (length bs) bs with
-                                             | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstPtr.offsetBytes dstElems))
-                                             | .none => .none
-                                         | _, _ => .none
-                                       let preferSplicedArray : Bool :=
-                                         match dstLocalPlaceTy, dstSubVal with
-                                         | .none, .aggregate 0 _ => true
-                                         | _, _ => false
-                                       match preferSplicedArray, spliceBytesToDstArray with
-                                       | true, .some splicedVal => wL splicedVal
-                                       | _, _ =>
-                                         match dstTargetTyOpt with
-                                         | .some dstPt =>
-                                           match rigidTyByteSize layouts dstPt with
-                                           | .some dstBytes =>
-                                             match Nat.beq (length bs) dstBytes with
-                                             | true =>
-                                               match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                                               | .some decodedVal => wL decodedVal
-                                               | .none =>
-                                                 match spliceBytesToDstArray with
-                                                 | .some splicedVal => wL splicedVal
-                                                 | .none => MirStepNode.fail .ub
-                                             | false =>
-                                               match spliceBytesToDstArray with
-                                               | .some splicedVal => wL splicedVal
-                                               | .none => MirStepNode.unsupported
-                                           | .none =>
-                                             match spliceBytesToDstArray with
-                                             | .some splicedVal => wL splicedVal
-                                             | .none => MirStepNode.unsupported
-                                         | .none =>
-                                           match spliceBytesToDstArray with
-                                           | .some splicedVal => wL splicedVal
-                                           | .none => MirStepNode.fail .ub
-                               match readProjectedValue locals₃ srcRootVal sProj,
-                                     readProjectedValue locals₃ dstRootVal dProj with
-                               | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
-                                 let inBounds :=
-                                   Bool.and (Bool.not dstIsAdt)
-                                     (Bool.and (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems))
-                                       (Nat.ble (Nat.add dstPtr.offsetBytes countBits) (length dstElems)))
-                                 match inBounds with
-                                 | false =>
-                                   match Bool.and (Nat.beq dstPtr.offsetBytes 0)
-                                       (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems)) with
-                                   | true => copyViaBytes (.aggregate 0 srcElems) (.aggregate 0 dstElems)
-                                   | false => MirStepNode.fail .ub
-                                 | true =>
-                                   let sameContainer := Bool.and (Nat.beq sLoc dLoc) (projectionsOverlap sProj dProj)
-                                   let disjoint :=
-                                     match Nat.beq srcPtr.tag dstPtr.tag with
-                                     | true => false
-                                     | false =>
-                                       match sameContainer with
-                                       | false => true
-                                       | true =>
-                                         Bool.or (Nat.ble (Nat.add srcPtr.offsetBytes countBits) dstPtr.offsetBytes)
-                                           (Nat.ble (Nat.add dstPtr.offsetBytes countBits) srcPtr.offsetBytes)
-                                   match disjoint with
-                                   | false => MirStepNode.fail .ub
-                                   | true =>
-                                     wL (.aggregate 0
-                                       (spliceValues (takeValues countBits (dropValues srcPtr.offsetBytes srcElems))
-                                         dstPtr.offsetBytes dstElems))
-                               | .ok srcSubVal, .ok dstSubVal => copyViaBytes srcSubVal dstSubVal
-                               | .ok srcSubVal, .ub =>
-                                 match Nat.beq dstPtr.offsetBytes 0 with
-                                 | true => copyViaBytes srcSubVal .unit
-                                 | false => MirStepNode.fail .ub
-                               | .ub, _ =>
-                                 match (generalizing := false)
-                                   srcRootVal,
-                                   dstRootVal,
-                                   sProj,
-                                   dProj
-                                 with
-                                 | .aggregate _ srcFields,
-                                   .aggregate dstVar dstFields,
-                                   .field _ srcFieldTy :: .nil,
-                                   .field _ dstFieldTy :: .nil =>
-                                   let overlaps :=
-                                     match Nat.beq srcPtr.tag dstPtr.tag with
-                                     | true => true
-                                     | false =>
-                                       Nat.beq sLoc dLoc
-                                   match overlaps with
-                                   | true => MirStepNode.fail .ub
-                                   | false =>
-                                     let elemBytesOpt : Option Nat :=
-                                       match operandPointeeTy localDecls layouts src with
-                                       | .some pt => rigidTyByteSize layouts pt
-                                       | .none => .some 1
-                                     match
-                                       elemBytesOpt,
-                                       rigidTyByteSize layouts srcFieldTy,
-                                       rigidTyByteSize layouts dstFieldTy
-                                     with
-                                     | .some elemSz, .some srcPlaceBytes, .some dstPlaceBytes =>
-                                       let copyByteLen := Nat.mul countBits elemSz
-                                       let inBounds :=
-                                         Bool.and
-                                           (Nat.ble (Nat.add srcPtr.offsetBytes copyByteLen) srcPlaceBytes)
-                                           (Nat.ble (Nat.add dstPtr.offsetBytes copyByteLen) dstPlaceBytes)
-                                       match inBounds with
-                                       | false => MirStepNode.fail .ub
-                                       | true =>
-                                         match
-                                           encodeUnionFieldsWith
-                                             (encodeUntypedValueToBytes defaultCodecFuel)
-                                             srcPlaceBytes
-                                             srcFields
-                                         with
-                                         | .none => MirStepNode.fail .ub
-                                         | .some srcUnionBytes =>
-                                           match
-                                             sliceAbstractBytes srcUnionBytes srcPtr.offsetBytes copyByteLen
-                                           with
-                                           | .none => MirStepNode.fail .ub
-                                           | .some copiedBytes =>
-                                             match
-                                               Bool.and
-                                                 (Nat.beq dstPtr.offsetBytes 0)
-                                                 (Nat.beq copyByteLen dstPlaceBytes),
-                                               decodeValueFromBytes
-                                                 defaultCodecFuel
-                                                 layouts
-                                                 dstFieldTy
-                                                 copiedBytes
-                                             with
-                                             | true, .some decodedVal => wL decodedVal
-                                             | _, _ =>
-                                               let dstIsUnion : Bool :=
-                                                 match get? localDecls dLoc with
-                                                 | .some decl =>
-                                                   match
-                                                     LayoutTable.lookup layouts decl.ty.layoutIdx
-                                                   with
-                                                   | .some l =>
-                                                     match l.fields with
-                                                     | .union _ => true
-                                                     | _ => false
-                                                   | .none => false
-                                                 | .none => false
-                                               match dstIsUnion with
-                                               | false => MirStepNode.fail .ub
-                                               | true =>
-                                                 let resetUnion :=
-                                                   Value.aggregate dstVar (takeValues 1 dstFields)
-                                                 match
-                                                   set?
-                                                     locals₃
-                                                     dLoc
-                                                     (.init resetUnion)
-                                                 with
-                                                 | .some locals₄ =>
-                                                   let borrows' :=
-                                                     invalidateConflictingBorrows
-                                                       s.memory.borrows
-                                                       dLoc
-                                                       (.some dstPtr.tag)
-                                                   MirStepNode.step
-                                                     (advanceStmt
-                                                       (MachineState.pushBaseStack calleeBody baseStack s)
-                                                       locals₄
-                                                       { Memory.pushBaseStack calleeBody baseStack s.memory with borrows := borrows' })
-                                                 | .none => MirStepNode.fail .ub
-                                     | _, _, _ => MirStepNode.fail .ub
-                                 | _, _, _, _ => MirStepNode.fail .ub
-                               | _, _ => MirStepNode.fail .ub) =
-                              MirStepNode.pushBaseStack calleeBody baseStack
-                                (let dstPlace : Place := { local_ := dLoc, projection := dProj }
-                                 let dstLocalPlaceTy : Option Ty :=
-                                   match get? locals₃ dstPlace.local_ with
-                                   | .some _ => placeTy localDecls layouts dstPlace
-                                   | .none => .none
-                                 let dstIsAdt : Bool :=
-                                   match dstLocalPlaceTy with
-                                   | .some { kind := .adt _ _, .. } => true
-                                   | _ => false
-                                 let copyViaBytes (srcSubVal dstSubVal : Value) : MirStepNode :=
-                                   let overlaps :=
-                                     match Nat.beq srcPtr.tag dstPtr.tag with
-                                     | true => true
-                                     | false =>
-                                       match Nat.beq sLoc dLoc with
-                                       | false => false
-                                       | true => projectionsOverlap sProj dProj
-                                   match overlaps with
-                                   | true => MirStepNode.fail .ub
-                                   | false =>
-                                     let srcSliceVal : Option Value :=
-                                       match srcSubVal with
-                                       | .aggregate 0 srcElems =>
-                                         match Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems) with
-                                         | true => .some (.aggregate 0 (takeValues countBits (dropValues srcPtr.offsetBytes srcElems)))
-                                         | false =>
-                                           match Nat.beq srcPtr.offsetBytes 0 with
-                                           | true => .some srcSubVal
-                                           | false => .none
-                                       | _ => .some srcSubVal
-                                     let dstTargetTyOpt : Option Ty :=
-                                       match dstLocalPlaceTy with
-                                       | .some t => .some t
-                                       | .none => operandPointeeTy localDecls layouts dst
-                                     match srcSliceVal with
-                                     | .none => MirStepNode.fail .ub
-                                     | .some sVal =>
-                                       match encodeUntypedValueToBytes defaultCodecFuel sVal with
-                                       | .none => MirStepNode.unsupported
-                                       | .some bs =>
-                                         let spliceBytesToDstArray : Option Value :=
-                                           match Bool.not dstIsAdt, dstSubVal with
-                                           | true, .aggregate 0 dstElems =>
-                                             match Nat.ble (Nat.add dstPtr.offsetBytes (length bs)) (length dstElems) with
-                                             | false => .none
-                                             | true =>
-                                               match decodeArrayChunksWith
-                                                   (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                                                   1 (length bs) bs with
-                                               | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstPtr.offsetBytes dstElems))
-                                               | .none => .none
-                                           | _, _ => .none
-                                         let preferSplicedArray : Bool :=
-                                           match dstLocalPlaceTy, dstSubVal with
-                                           | .none, .aggregate 0 _ => true
-                                           | _, _ => false
-                                         match preferSplicedArray, spliceBytesToDstArray with
-                                         | true, .some splicedVal => wR splicedVal
-                                         | _, _ =>
-                                           match dstTargetTyOpt with
-                                           | .some dstPt =>
-                                             match rigidTyByteSize layouts dstPt with
-                                             | .some dstBytes =>
-                                               match Nat.beq (length bs) dstBytes with
-                                               | true =>
-                                                 match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                                                 | .some decodedVal => wR decodedVal
-                                                 | .none =>
-                                                   match spliceBytesToDstArray with
-                                                   | .some splicedVal => wR splicedVal
-                                                   | .none => MirStepNode.fail .ub
-                                               | false =>
-                                                 match spliceBytesToDstArray with
-                                                 | .some splicedVal => wR splicedVal
-                                                 | .none => MirStepNode.unsupported
-                                             | .none =>
-                                               match spliceBytesToDstArray with
-                                               | .some splicedVal => wR splicedVal
-                                               | .none => MirStepNode.unsupported
-                                           | .none =>
-                                             match spliceBytesToDstArray with
-                                             | .some splicedVal => wR splicedVal
-                                             | .none => MirStepNode.fail .ub
-                                 match readProjectedValue locals₃ srcRootVal sProj,
-                                       readProjectedValue locals₃ dstRootVal dProj with
-                                 | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
-                                   let inBounds :=
-                                     Bool.and (Bool.not dstIsAdt)
-                                       (Bool.and (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems))
-                                         (Nat.ble (Nat.add dstPtr.offsetBytes countBits) (length dstElems)))
-                                   match inBounds with
-                                   | false =>
-                                     match Bool.and (Nat.beq dstPtr.offsetBytes 0)
-                                         (Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems)) with
-                                     | true => copyViaBytes (.aggregate 0 srcElems) (.aggregate 0 dstElems)
-                                     | false => MirStepNode.fail .ub
-                                   | true =>
-                                     let sameContainer := Bool.and (Nat.beq sLoc dLoc) (projectionsOverlap sProj dProj)
-                                     let disjoint :=
-                                       match Nat.beq srcPtr.tag dstPtr.tag with
-                                       | true => false
-                                       | false =>
-                                         match sameContainer with
-                                         | false => true
-                                         | true =>
-                                           Bool.or (Nat.ble (Nat.add srcPtr.offsetBytes countBits) dstPtr.offsetBytes)
-                                             (Nat.ble (Nat.add dstPtr.offsetBytes countBits) srcPtr.offsetBytes)
-                                     match disjoint with
-                                     | false => MirStepNode.fail .ub
-                                     | true =>
-                                       wR (.aggregate 0
-                                         (spliceValues (takeValues countBits (dropValues srcPtr.offsetBytes srcElems))
-                                           dstPtr.offsetBytes dstElems))
-                                 | .ok srcSubVal, .ok dstSubVal => copyViaBytes srcSubVal dstSubVal
-                                 | .ok srcSubVal, .ub =>
-                                   match Nat.beq dstPtr.offsetBytes 0 with
-                                   | true => copyViaBytes srcSubVal .unit
-                                   | false => MirStepNode.fail .ub
-                                 | .ub, _ =>
-                                   match (generalizing := false)
-                                     srcRootVal,
-                                     dstRootVal,
-                                     sProj,
-                                     dProj
-                                   with
-                                   | .aggregate _ srcFields,
-                                     .aggregate dstVar dstFields,
-                                     .field _ srcFieldTy :: .nil,
-                                     .field _ dstFieldTy :: .nil =>
-                                     let overlaps :=
-                                       match Nat.beq srcPtr.tag dstPtr.tag with
-                                       | true => true
-                                       | false =>
-                                         Nat.beq sLoc dLoc
-                                     match overlaps with
-                                     | true => MirStepNode.fail .ub
-                                     | false =>
-                                       let elemBytesOpt : Option Nat :=
-                                         match operandPointeeTy localDecls layouts src with
-                                         | .some pt => rigidTyByteSize layouts pt
-                                         | .none => .some 1
-                                       match
-                                         elemBytesOpt,
-                                         rigidTyByteSize layouts srcFieldTy,
-                                         rigidTyByteSize layouts dstFieldTy
-                                       with
-                                       | .some elemSz, .some srcPlaceBytes, .some dstPlaceBytes =>
-                                         let copyByteLen := Nat.mul countBits elemSz
-                                         let inBounds :=
-                                           Bool.and
-                                             (Nat.ble (Nat.add srcPtr.offsetBytes copyByteLen) srcPlaceBytes)
-                                             (Nat.ble (Nat.add dstPtr.offsetBytes copyByteLen) dstPlaceBytes)
-                                         match inBounds with
-                                         | false => MirStepNode.fail .ub
-                                         | true =>
-                                           match
-                                             encodeUnionFieldsWith
-                                               (encodeUntypedValueToBytes defaultCodecFuel)
-                                               srcPlaceBytes
-                                               srcFields
-                                           with
-                                           | .none => MirStepNode.fail .ub
-                                           | .some srcUnionBytes =>
-                                             match
-                                               sliceAbstractBytes srcUnionBytes srcPtr.offsetBytes copyByteLen
-                                             with
-                                             | .none => MirStepNode.fail .ub
-                                             | .some copiedBytes =>
-                                               match
-                                                 Bool.and
-                                                   (Nat.beq dstPtr.offsetBytes 0)
-                                                   (Nat.beq copyByteLen dstPlaceBytes),
-                                                 decodeValueFromBytes
-                                                   defaultCodecFuel
-                                                   layouts
-                                                   dstFieldTy
-                                                   copiedBytes
-                                               with
-                                               | true, .some decodedVal => wR decodedVal
-                                               | _, _ =>
-                                                 let dstIsUnion : Bool :=
-                                                   match get? localDecls dLoc with
-                                                   | .some decl =>
-                                                     match
-                                                       LayoutTable.lookup layouts decl.ty.layoutIdx
-                                                     with
-                                                     | .some l =>
-                                                       match l.fields with
-                                                       | .union _ => true
-                                                       | _ => false
-                                                     | .none => false
-                                                   | .none => false
-                                                 match dstIsUnion with
-                                                 | false => MirStepNode.fail .ub
-                                                 | true =>
-                                                   let resetUnion :=
-                                                     Value.aggregate dstVar (takeValues 1 dstFields)
-                                                   match
-                                                     set?
-                                                       locals₃
-                                                       dLoc
-                                                       (.init resetUnion)
-                                                   with
-                                                   | .some locals₄ =>
-                                                     let borrows' :=
-                                                       invalidateConflictingBorrows
-                                                         s.memory.borrows
-                                                         dLoc
-                                                         (.some dstPtr.tag)
-                                                     MirStepNode.step
-                                                       (advanceStmt
-                                                         s
-                                                         locals₄
-                                                         { s.memory with borrows := borrows' })
-                                                   | .none => MirStepNode.fail .ub
-                                       | _, _, _ => MirStepNode.fail .ub
-                                   | _, _, _, _ => MirStepNode.fail .ub
-                                 | _, _ => MirStepNode.fail .ub) := by
-                          intro wL wR hw
-                          have h_cvb :
-                              ∀ (a b : Value),
-                                (let dstPlace : Place := { local_ := dLoc, projection := dProj }
-                                 let dstLocalPlaceTy : Option Ty :=
-                                   match get? locals₃ dstPlace.local_ with
-                                   | .some _ => placeTy localDecls layouts dstPlace
-                                   | .none => .none
-                                 let dstIsAdt : Bool :=
-                                   match dstLocalPlaceTy with
-                                   | .some { kind := .adt _ _, .. } => true
-                                   | _ => false
-                                 let overlaps :=
-                                   match Nat.beq srcPtr.tag dstPtr.tag with
-                                   | true => true
-                                   | false =>
-                                     match Nat.beq sLoc dLoc with
-                                     | false => false
-                                     | true => projectionsOverlap sProj dProj
-                                 match overlaps with
-                                 | true => MirStepNode.fail .ub
-                                 | false =>
-                                   let srcSliceVal : Option Value :=
-                                     match a with
-                                     | .aggregate 0 srcElems =>
-                                       match Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems) with
-                                       | true => .some (.aggregate 0 (takeValues countBits (dropValues srcPtr.offsetBytes srcElems)))
-                                       | false =>
-                                         match Nat.beq srcPtr.offsetBytes 0 with
-                                         | true => .some a
-                                         | false => .none
-                                     | _ => .some a
-                                   let dstTargetTyOpt : Option Ty :=
-                                     match dstLocalPlaceTy with
-                                     | .some t => .some t
-                                     | .none => operandPointeeTy localDecls layouts dst
-                                   match srcSliceVal with
-                                   | .none => MirStepNode.fail .ub
-                                   | .some sVal =>
-                                     match encodeUntypedValueToBytes defaultCodecFuel sVal with
-                                     | .none => MirStepNode.unsupported
-                                     | .some bs =>
-                                       let spliceBytesToDstArray : Option Value :=
-                                         match Bool.not dstIsAdt, b with
-                                         | true, .aggregate 0 dstElems =>
-                                           match Nat.ble (Nat.add dstPtr.offsetBytes (length bs)) (length dstElems) with
-                                           | false => .none
-                                           | true =>
-                                             match decodeArrayChunksWith
-                                                 (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                                                 1 (length bs) bs with
-                                             | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstPtr.offsetBytes dstElems))
-                                             | .none => .none
-                                         | _, _ => .none
-                                       let preferSplicedArray : Bool :=
-                                         match dstLocalPlaceTy, b with
-                                         | .none, .aggregate 0 _ => true
-                                         | _, _ => false
-                                       match preferSplicedArray, spliceBytesToDstArray with
-                                       | true, .some splicedVal => wL splicedVal
-                                       | _, _ =>
-                                         match dstTargetTyOpt with
-                                         | .some dstPt =>
-                                           match rigidTyByteSize layouts dstPt with
-                                           | .some dstBytes =>
-                                             match Nat.beq (length bs) dstBytes with
-                                             | true =>
-                                               match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                                               | .some decodedVal => wL decodedVal
-                                               | .none =>
-                                                 match spliceBytesToDstArray with
-                                                 | .some splicedVal => wL splicedVal
-                                                 | .none => MirStepNode.fail .ub
-                                             | false =>
-                                               match spliceBytesToDstArray with
-                                               | .some splicedVal => wL splicedVal
-                                               | .none => MirStepNode.unsupported
-                                           | .none =>
-                                             match spliceBytesToDstArray with
-                                             | .some splicedVal => wL splicedVal
-                                             | .none => MirStepNode.unsupported
-                                         | .none =>
-                                           match spliceBytesToDstArray with
-                                           | .some splicedVal => wL splicedVal
-                                           | .none => MirStepNode.fail .ub) =
-                                MirStepNode.pushBaseStack calleeBody baseStack
-                                  (let dstPlace : Place := { local_ := dLoc, projection := dProj }
-                                   let dstLocalPlaceTy : Option Ty :=
-                                     match get? locals₃ dstPlace.local_ with
-                                     | .some _ => placeTy localDecls layouts dstPlace
-                                     | .none => .none
-                                   let dstIsAdt : Bool :=
-                                     match dstLocalPlaceTy with
-                                     | .some { kind := .adt _ _, .. } => true
-                                     | _ => false
-                                   let overlaps :=
-                                     match Nat.beq srcPtr.tag dstPtr.tag with
-                                     | true => true
-                                     | false =>
-                                       match Nat.beq sLoc dLoc with
-                                       | false => false
-                                       | true => projectionsOverlap sProj dProj
-                                   match overlaps with
-                                   | true => MirStepNode.fail .ub
-                                   | false =>
-                                     let srcSliceVal : Option Value :=
-                                       match a with
-                                       | .aggregate 0 srcElems =>
-                                         match Nat.ble (Nat.add srcPtr.offsetBytes countBits) (length srcElems) with
-                                         | true => .some (.aggregate 0 (takeValues countBits (dropValues srcPtr.offsetBytes srcElems)))
-                                         | false =>
-                                           match Nat.beq srcPtr.offsetBytes 0 with
-                                           | true => .some a
-                                           | false => .none
-                                       | _ => .some a
-                                     let dstTargetTyOpt : Option Ty :=
-                                       match dstLocalPlaceTy with
-                                       | .some t => .some t
-                                       | .none => operandPointeeTy localDecls layouts dst
-                                     match srcSliceVal with
-                                     | .none => MirStepNode.fail .ub
-                                     | .some sVal =>
-                                       match encodeUntypedValueToBytes defaultCodecFuel sVal with
-                                       | .none => MirStepNode.unsupported
-                                       | .some bs =>
-                                         let spliceBytesToDstArray : Option Value :=
-                                           match Bool.not dstIsAdt, b with
-                                           | true, .aggregate 0 dstElems =>
-                                             match Nat.ble (Nat.add dstPtr.offsetBytes (length bs)) (length dstElems) with
-                                             | false => .none
-                                             | true =>
-                                               match decodeArrayChunksWith
-                                                   (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                                                   1 (length bs) bs with
-                                               | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstPtr.offsetBytes dstElems))
-                                               | .none => .none
-                                           | _, _ => .none
-                                         let preferSplicedArray : Bool :=
-                                           match dstLocalPlaceTy, b with
-                                           | .none, .aggregate 0 _ => true
-                                           | _, _ => false
-                                         match preferSplicedArray, spliceBytesToDstArray with
-                                         | true, .some splicedVal => wR splicedVal
-                                         | _, _ =>
-                                           match dstTargetTyOpt with
-                                           | .some dstPt =>
-                                             match rigidTyByteSize layouts dstPt with
-                                             | .some dstBytes =>
-                                               match Nat.beq (length bs) dstBytes with
-                                               | true =>
-                                                 match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                                                 | .some decodedVal => wR decodedVal
-                                                 | .none =>
-                                                   match spliceBytesToDstArray with
-                                                   | .some splicedVal => wR splicedVal
-                                                   | .none => MirStepNode.fail .ub
-                                               | false =>
-                                                 match spliceBytesToDstArray with
-                                                 | .some splicedVal => wR splicedVal
-                                                 | .none => MirStepNode.unsupported
-                                             | .none =>
-                                               match spliceBytesToDstArray with
-                                               | .some splicedVal => wR splicedVal
-                                               | .none => MirStepNode.unsupported
-                                           | .none =>
-                                             match spliceBytesToDstArray with
-                                             | .some splicedVal => wR splicedVal
-                                             | .none => MirStepNode.fail .ub) := by
-                            intro a b
-                            dsimp only
-                            repeat' (first | rfl | exact hw _ | split)
-                          dsimp only
-                          repeat' (first | rfl | exact hw _ | exact h_cvb _ _ | split)
-                        exact h_body _ wdvRhs (fun v => congrFun h_wdv_eq v)
+            cases srcEntry.perm <;> cases dstEntry.perm <;>
+              first
+              | rfl
+              | exact evalCopyNonOverlappingPermOk_pushBaseStack calleeBody baseStack
+                  s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃
       | _ => rfl
     | _ => rfl
+
+private theorem evalCopyNonOverlappingWithCount_isStmtNode
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
+    IsStmtNode
+      (evalCopyNonOverlappingWithCount
+        s src dst localDecls layouts srcVal dstVal countBits locals₃) := by
+  rw [evalCopyNonOverlappingWithCount_eq]
+  cases Nat.beq countBits 0 with
+  | true => exact Or.inl ⟨_, rfl⟩
+  | false =>
+    cases srcVal with
+    | ptr srcPtr _ =>
+      cases dstVal with
+      | ptr dstPtr _ =>
+        dsimp only
+        cases lookupBorrow s.memory.borrows srcPtr.tag with
+        | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
+        | some srcEntry =>
+          cases lookupBorrow s.memory.borrows dstPtr.tag with
+          | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
+          | some dstEntry =>
+            dsimp only
+            cases srcEntry.perm <;> cases dstEntry.perm <;>
+              first
+              | exact Or.inr (Or.inl ⟨_, rfl⟩)
+              | exact evalCopyNonOverlappingPermOk_isStmtNode ..
+      | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
+
+private theorem evalCopyNonOverlapping_isStmtNode
+    (s : MachineState) (src dst count : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    IsStmtNode (evalCopyNonOverlapping s src dst count localDecls layouts) := by
+  unfold evalCopyNonOverlapping
+  cases evalOperand s.frame.locals src s.memory.borrows s.memory.globals layouts s.memory.callerLocals with
+  | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
+  | unsupported => exact Or.inr (Or.inr rfl)
+  | ok srcVal locals₁ =>
+    dsimp only
+    cases evalOperand locals₁ dst s.memory.borrows s.memory.globals layouts s.memory.callerLocals with
+    | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | unsupported => exact Or.inr (Or.inr rfl)
+    | ok dstVal locals₂ =>
+      dsimp only
+      cases evalOperand locals₂ count s.memory.borrows s.memory.globals layouts s.memory.callerLocals with
+      | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
+      | unsupported => exact Or.inr (Or.inr rfl)
+      | ok countVal locals₃ =>
+        cases countVal with
+        | scalar countSc =>
+          exact evalCopyNonOverlappingWithCount_isStmtNode s src dst localDecls layouts
+            srcVal dstVal countSc.bits locals₃
+        | _ => exact Or.inr (Or.inl ⟨_, rfl⟩)
 
 theorem evalCopyNonOverlapping_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -4774,7 +4063,7 @@ theorem evalStmt_pushBaseStack
     dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
     repeat' (first | rfl | split)
   | assign dst rv =>
-    unfold evalStmt
+    rw [evalStmt_assign_eq, evalStmt_assign_eq]
     dsimp only [MachineState.pushBaseStack]
     rw [evalRvalue_pushBaseStack calleeBody baseStack
       s.frame.locals rv s.memory localDecls layouts]
@@ -4786,12 +4075,78 @@ theorem evalStmt_pushBaseStack
       rcases dst with ⟨dstLoc, dstProj⟩
       cases dstProj with
       | nil =>
-        dsimp only
+        unfold evalAssignDst
+        dsimp only [Memory.pushBaseStack]
         repeat' (first | rfl | split)
       | cons hd tl =>
-        cases hd <;>
-          (dsimp only; repeat' (first | rfl | split))
+        by_cases h_d : hd = .deref
+        · subst h_d
+          unfold evalAssignDst
+          dsimp only [Memory.pushBaseStack]
+          repeat' (first | rfl | split)
+        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d,
+              evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d]
+          unfold evalAssignNonDeref
+          dsimp only [Memory.pushBaseStack]
+          repeat' (first | rfl | split)
   | _ => rfl
+
+private theorem evalStmt_isStmtNode
+    (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    IsStmtNode (evalStmt s stmt localDecls layouts) := by
+  rcases stmt with ⟨kind, _⟩
+  cases kind with
+  | intrinsic intr =>
+    cases intr with
+    | assume _ =>
+      unfold evalStmt; dsimp only
+      repeat' (first
+        | exact Or.inl ⟨_, rfl⟩
+        | exact Or.inr (Or.inl ⟨_, rfl⟩)
+        | exact Or.inr (Or.inr rfl)
+        | split)
+    | copyNonOverlapping src dst count =>
+      exact evalCopyNonOverlapping_isStmtNode s src dst count localDecls layouts
+  | assign dst rv =>
+    rw [evalStmt_assign_eq]
+    cases evalRvalue s.frame.locals rv s.memory localDecls layouts with
+    | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | unsupported => exact Or.inr (Or.inr rfl)
+    | ok val locals₁ mem₁ =>
+      dsimp only
+      rcases dst with ⟨dstLoc, dstProj⟩
+      cases dstProj with
+      | nil =>
+        unfold evalAssignDst; dsimp only
+        repeat' (first
+          | exact Or.inl ⟨_, rfl⟩
+          | exact Or.inr (Or.inl ⟨_, rfl⟩)
+          | exact Or.inr (Or.inr rfl)
+          | split)
+      | cons hd tl =>
+        by_cases h_d : hd = .deref
+        · subst h_d
+          unfold evalAssignDst; dsimp only
+          repeat' (first
+            | exact Or.inl ⟨_, rfl⟩
+            | exact Or.inr (Or.inl ⟨_, rfl⟩)
+            | exact Or.inr (Or.inr rfl)
+            | split)
+        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d]
+          unfold evalAssignNonDeref; dsimp only
+          repeat' (first
+            | exact Or.inl ⟨_, rfl⟩
+            | exact Or.inr (Or.inl ⟨_, rfl⟩)
+            | exact Or.inr (Or.inr rfl)
+            | split)
+  | _ =>
+    unfold evalStmt; dsimp only
+    repeat' (first
+      | exact Or.inl ⟨_, rfl⟩
+      | exact Or.inr (Or.inl ⟨_, rfl⟩)
+      | exact Or.inr (Or.inr rfl)
+      | split)
 
 @[simp]
 theorem resolveCallTarget_pushBaseStack
@@ -4888,6 +4243,1098 @@ theorem applyUnwindAction_pushBaseStack_of_ne_panic
     dsimp only [applyUnwindAction, Memory.pushBaseStack] at h_no_panic ⊢
     exact unwindFromCallStack_pushBaseStack_of_ne_panic
       calleeBody baseStack s.memory.callStack s.memory h_no_panic
+
+private def IsIntrinsicCallFamily
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (f : MachineState → MirStepNode) : Prop :=
+  (∃ retVal,
+    ∀ s : MachineState,
+      f s = writeIntrinsicReturn s locals' destination targetBb retVal) ∨
+  (∃ fk, ∀ s : MachineState, f s = MirStepNode.fail fk) ∨
+  (∀ s : MachineState, f s = MirStepNode.unsupported)
+
+private theorem IsIntrinsicCallFamily.of_eq
+    {locals' : List LocalSlot} {destination : Place} {targetBb : BasicBlockIdx}
+    {f g : MachineState → MirStepNode}
+    (h_eq : ∀ s, f s = g s)
+    (h : IsIntrinsicCallFamily locals' destination targetBb g) :
+    IsIntrinsicCallFamily locals' destination targetBb f := by
+  rcases h with ⟨retVal, hr⟩ | ⟨fk, hf⟩ | hu
+  · exact Or.inl ⟨retVal, fun s => (h_eq s).trans (hr s)⟩
+  · exact Or.inr (Or.inl ⟨fk, fun s => (h_eq s).trans (hf s)⟩)
+  · exact Or.inr (Or.inr fun s => (h_eq s).trans (hu s))
+
+private theorem writeIntrinsicScalarResult_cases
+    (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (resOpt : Option ScalarInt) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s => writeIntrinsicScalarResult s locals' destination targetBb resOpt) := by
+  cases resOpt with
+  | some sc => exact Or.inl ⟨.scalar sc, fun _ => rfl⟩
+  | none => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+
+private theorem intrinsicUnresolvedLayoutStep_cases
+    (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (ty : RigidTy) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun _ => intrinsicUnresolvedLayoutStep ty) := by
+  unfold intrinsicUnresolvedLayoutStep
+  cases isUnsizedRigidTy 8 ty with
+  | true => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  | false => exact Or.inr (Or.inr fun _ => rfl)
+
+private theorem intrinsicWidePointeeStep_cases
+    (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (ty : RigidTy) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun _ => intrinsicWidePointeeStep ty) := by
+  unfold intrinsicWidePointeeStep
+  cases intrinsicTailMayBeUnsized 8 ty with
+  | true => exact Or.inr (Or.inr fun _ => rfl)
+  | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+
+private theorem intrinsicMissingPointeeStep_cases
+    (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun _ => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps) := by
+  unfold intrinsicMissingPointeeStep
+  cases argOps with
+  | nil => exact Or.inr (Or.inr fun _ => rfl)
+  | cons ptrOp _ =>
+    dsimp only
+    cases operandTy bodyLocalDecls bodyLayouts ptrOp with
+    | some _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    | none => exact Or.inr (Or.inr fun _ => rfl)
+
+private theorem unaryScalarIntrinsic_family
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (argVals : List Value) (g : ScalarInt → Option ScalarInt) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        match argVals with
+        | .scalar sc :: .nil =>
+          writeIntrinsicScalarResult s locals' destination targetBb (g sc)
+        | _ => MirStepNode.fail .ub) := by
+  rcases argVals with _ | ⟨_ | sc | _ | _, _ | _⟩ <;>
+    try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  exact writeIntrinsicScalarResult_cases locals' destination targetBb (g sc)
+
+private theorem binaryScalarIntrinsic_family
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (argVals : List Value)
+    (body : ScalarInt → ScalarInt → MachineState → MirStepNode)
+    (h : ∀ lhs rhs, IsIntrinsicCallFamily locals' destination targetBb (body lhs rhs)) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        match argVals with
+        | .scalar lhs :: .scalar rhs :: .nil => body lhs rhs s
+        | _ => MirStepNode.fail .ub) := by
+  rcases argVals with _ | ⟨_ | lhs | _ | _, _ | ⟨_ | rhs | _ | _, _ | _⟩⟩ <;>
+    try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  exact h lhs rhs
+
+private theorem optSignedBinaryScalarIntrinsic_family
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (argVals : List Value) (optSigned : Option Bool)
+    (op : ScalarInt → ScalarInt → Bool → Option ScalarInt) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        match argVals with
+        | .scalar lhs :: .scalar rhs :: .nil =>
+          match optSigned with
+          | .some flag =>
+            writeIntrinsicScalarResult s locals' destination targetBb (op lhs rhs flag)
+          | .none => MirStepNode.unsupported
+        | _ => MirStepNode.fail .ub) := by
+  refine binaryScalarIntrinsic_family locals' destination targetBb argVals
+    (fun lhs rhs s =>
+      match optSigned with
+      | .some flag =>
+        writeIntrinsicScalarResult s locals' destination targetBb (op lhs rhs flag)
+      | .none => MirStepNode.unsupported)
+    fun lhs rhs => ?_
+  cases optSigned with
+  | none => exact Or.inr (Or.inr fun _ => rfl)
+  | some flag =>
+    exact writeIntrinsicScalarResult_cases locals' destination targetBb (op lhs rhs flag)
+
+private theorem arithOffsetIntrinsic_family
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        match argVals with
+        | .ptr ptrVal ptrSz :: .scalar countSc :: .nil =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+            | .some pointeeTy =>
+              match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+              | .some elemSz =>
+                match evalArithOffset ptrVal ptrSz countSc elemSz with
+                | .some retPtrVal =>
+                  writeIntrinsicReturn s locals' destination targetBb (.ptr retPtrVal 8)
+                | .none => MirStepNode.fail .ub
+              | .none => intrinsicUnresolvedLayoutStep pointeeTy
+            | .none => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+        | _ => MirStepNode.fail .ub) := by
+  rcases argVals with _ | ⟨_ | _ | ⟨ptrVal, ptrSz⟩ | _, _ | ⟨_ | countSc | _ | _, _ | _⟩⟩ <;>
+    try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  dsimp only
+  cases Nat.beq ptrSz 8 with
+  | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  | true =>
+    dsimp only
+    cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+    | none =>
+      exact intrinsicMissingPointeeStep_cases locals' destination targetBb
+        bodyLocalDecls bodyLayouts argOps
+    | some pointeeTy =>
+      dsimp only
+      cases intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+      | none =>
+        exact intrinsicUnresolvedLayoutStep_cases locals' destination targetBb pointeeTy
+      | some elemSz =>
+        dsimp only
+        cases evalArithOffset ptrVal ptrSz countSc elemSz with
+        | none => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+        | some retPtrVal => exact Or.inl ⟨.ptr retPtrVal 8, fun _ => rfl⟩
+
+private theorem wideSliceIntrinsic_family
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrArgVal : Value) (body : ScalarInt → MachineState → MirStepNode)
+    (h : ∀ lenSc, IsIntrinsicCallFamily locals' destination targetBb (body lenSc)) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true => body lenSc s
+        | _ => MirStepNode.fail .ub) := by
+  cases ptrArgVal with
+  | aggregate varIdx flds =>
+    cases varIdx with
+    | succ _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    | zero =>
+      rcases flds with _ | ⟨_ | _ | ⟨_, ptrSz⟩ | _, _ | ⟨_ | lenSc | _ | _, _ | _⟩⟩ <;>
+        try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+      simp only [Nat.zero_eq]
+      cases Nat.beq ptrSz 8 with
+      | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+      | true => exact h lenSc
+  | _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+
+private theorem wideMetaOnlyIntrinsic_family
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrArgVal : Value) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun _ =>
+        match ptrArgVal with
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+          | false => MirStepNode.fail .ub
+          | true => MirStepNode.unsupported
+        | _ => MirStepNode.fail .ub) := by
+  cases ptrArgVal with
+  | aggregate varIdx flds =>
+    cases varIdx with
+    | succ _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    | zero =>
+      rcases flds with _ | ⟨_ | _ | ⟨_, ptrSz⟩ | _, _ | ⟨metaVal, _ | _⟩⟩ <;>
+        try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+      simp only [Nat.zero_eq]
+      cases Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+      | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+      | true => exact Or.inr (Or.inr fun _ => rfl)
+  | _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+
+private theorem thinOrWideMetaIntrinsic_family
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptrArgVal : Value)
+    (thinBody : MachineState → MirStepNode)
+    (wideBody : MachineState → MirStepNode)
+    (h_thin : IsIntrinsicCallFamily locals' destination targetBb thinBody)
+    (h_wide : IsIntrinsicCallFamily locals' destination targetBb wideBody) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        match ptrArgVal with
+        | .ptr _ ptrSz =>
+          match Nat.beq ptrSz 8 with
+          | false => MirStepNode.fail .ub
+          | true => thinBody s
+        | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+          match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+          | false => MirStepNode.fail .ub
+          | true => wideBody s
+        | _ => MirStepNode.fail .ub) := by
+  cases ptrArgVal with
+  | ptr _ ptrSz =>
+    dsimp only
+    cases Nat.beq ptrSz 8 with
+    | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    | true => exact h_thin
+  | aggregate varIdx flds =>
+    cases varIdx with
+    | succ _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    | zero =>
+      rcases flds with _ | ⟨_ | _ | ⟨_, ptrSz⟩ | _, _ | ⟨metaVal, _ | _⟩⟩ <;>
+        try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+      simp only [Nat.zero_eq]
+      cases Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+      | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+      | true => exact h_wide
+  | _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+
+private def sizeOfValOneArg
+    (s : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (ptrArgVal : Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptOpt : Option RigidTy) : MirStepNode :=
+  match ptOpt with
+  | .some (.slice elemTy) =>
+    match ptrArgVal with
+    | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy with
+        | .some elemSz =>
+          writeIntrinsicScalarResult s locals' destination targetBb
+            (evalSliceSizeOfVal elemSz lenSc)
+        | .none => intrinsicUnresolvedLayoutStep elemTy
+    | _ => MirStepNode.fail .ub
+  | .some .str =>
+    match ptrArgVal with
+    | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        writeIntrinsicScalarResult s locals' destination targetBb
+          (evalSliceSizeOfVal 1 lenSc)
+    | _ => MirStepNode.fail .ub
+  | .some (.dynamic _) =>
+    match ptrArgVal with
+    | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+      match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+      | false => MirStepNode.fail .ub
+      | true => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .some pointeeTy =>
+    match ptrArgVal with
+    | .ptr _ ptrSz =>
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match intrinsicTailIsExtern 8 pointeeTy with
+        | true => MirStepNode.unsupported
+        | false =>
+          match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+          | .some sz =>
+            match Nat.ble (signedHalfModulus 8) sz with
+            | true => MirStepNode.fail .ub
+            | false =>
+              writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
+          | .none => intrinsicUnresolvedLayoutStep pointeeTy
+    | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+      match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+      | false => MirStepNode.fail .ub
+      | true => intrinsicWidePointeeStep pointeeTy
+    | _ => MirStepNode.fail .ub
+  | .none =>
+    match isValidIntrinsicPtrArgVal ptrArgVal with
+    | false => MirStepNode.fail .ub
+    | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+
+private theorem evalSizeOfVal_oneArg_eq
+    (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (ptrArgVal : Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts
+        argOps [ptrArgVal] locals' destination targetBb =
+      sizeOfValOneArg s bodyLocalDecls bodyLayouts argOps ptrArgVal
+        locals' destination targetBb
+        (resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps) := by
+  unfold evalNonSelectIntrinsicCall sizeOfValOneArg
+  dsimp only
+  cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+  | none => rfl
+  | some pt => cases pt <;> rfl
+
+private theorem evalSizeOfValIntrinsicCall_cases
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        evalNonSelectIntrinsicCall .sizeOfVal s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  rcases argVals with _ | ⟨ptrArgVal, _ | _⟩ <;>
+    try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  refine IsIntrinsicCallFamily.of_eq
+    (fun s => evalSizeOfVal_oneArg_eq s target bodyLocalDecls bodyLayouts argOps
+      ptrArgVal locals' destination targetBb) ?_
+  cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+  | none =>
+    unfold sizeOfValOneArg
+    cases isValidIntrinsicPtrArgVal ptrArgVal with
+    | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    | true =>
+      exact intrinsicMissingPointeeStep_cases locals' destination targetBb
+        bodyLocalDecls bodyLayouts argOps
+  | some pointeeTy =>
+    by_cases h_sl : ∃ elemTy, pointeeTy = .slice elemTy
+    · rcases h_sl with ⟨elemTy, rfl⟩
+      unfold sizeOfValOneArg
+      refine wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
+        (fun lenSc s =>
+          match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy with
+          | .some elemSz =>
+            writeIntrinsicScalarResult s locals' destination targetBb
+              (evalSliceSizeOfVal elemSz lenSc)
+          | .none => intrinsicUnresolvedLayoutStep elemTy)
+        fun lenSc => ?_
+      cases intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy with
+      | none =>
+        exact intrinsicUnresolvedLayoutStep_cases locals' destination targetBb elemTy
+      | some elemSz =>
+        exact writeIntrinsicScalarResult_cases locals' destination targetBb
+          (evalSliceSizeOfVal elemSz lenSc)
+    · by_cases h_str : pointeeTy = .str
+      · subst h_str
+        unfold sizeOfValOneArg
+        exact wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
+          (fun lenSc s =>
+            writeIntrinsicScalarResult s locals' destination targetBb
+              (evalSliceSizeOfVal 1 lenSc))
+          fun lenSc =>
+            writeIntrinsicScalarResult_cases locals' destination targetBb
+              (evalSliceSizeOfVal 1 lenSc)
+      · by_cases h_dyn : ∃ preds, pointeeTy = .dynamic preds
+        · rcases h_dyn with ⟨_, rfl⟩
+          unfold sizeOfValOneArg
+          exact wideMetaOnlyIntrinsic_family locals' destination targetBb ptrArgVal
+        · refine IsIntrinsicCallFamily.of_eq (g := fun s =>
+            match ptrArgVal with
+            | .ptr _ ptrSz =>
+              match Nat.beq ptrSz 8 with
+              | false => MirStepNode.fail .ub
+              | true =>
+                match intrinsicTailIsExtern 8 pointeeTy with
+                | true => MirStepNode.unsupported
+                | false =>
+                  match intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+                  | .some sz =>
+                    match Nat.ble (signedHalfModulus 8) sz with
+                    | true => MirStepNode.fail .ub
+                    | false =>
+                      writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨sz, 8⟩)
+                  | .none => intrinsicUnresolvedLayoutStep pointeeTy
+            | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+              match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+              | false => MirStepNode.fail .ub
+              | true => intrinsicWidePointeeStep pointeeTy
+            | _ => MirStepNode.fail .ub) (fun s => ?_) ?_
+          · unfold sizeOfValOneArg
+            cases pointeeTy <;>
+              first
+              | exact False.elim (h_sl ⟨_, rfl⟩)
+              | exact False.elim (h_str rfl)
+              | exact False.elim (h_dyn ⟨_, rfl⟩)
+              | rfl
+          · refine thinOrWideMetaIntrinsic_family locals' destination targetBb ptrArgVal _ _ ?_
+              (intrinsicWidePointeeStep_cases locals' destination targetBb pointeeTy)
+            cases intrinsicTailIsExtern 8 pointeeTy with
+            | true => exact Or.inr (Or.inr fun _ => rfl)
+            | false =>
+              dsimp only
+              cases intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts pointeeTy with
+              | none =>
+                exact intrinsicUnresolvedLayoutStep_cases locals' destination targetBb pointeeTy
+              | some sz =>
+                dsimp only
+                cases Nat.ble (signedHalfModulus 8) sz with
+                | true => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+                | false => exact Or.inl ⟨.scalar ⟨sz, 8⟩, fun _ => rfl⟩
+
+private def alignOfValOneArg
+    (s : MachineState) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (ptrArgVal : Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (ptOpt : Option RigidTy) : MirStepNode :=
+  match ptOpt with
+  | .some (.slice elemTy) =>
+    match ptrArgVal with
+    | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match
+          intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
+          intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
+        with
+        | .some elemSz, .some alignBytes =>
+          match evalSliceSizeOfVal elemSz lenSc with
+          | .some _ =>
+            writeIntrinsicReturn s locals' destination targetBb
+              (.scalar ⟨alignBytes, 8⟩)
+          | .none => MirStepNode.fail .ub
+        | _, _ => intrinsicUnresolvedLayoutStep elemTy
+    | _ => MirStepNode.fail .ub
+  | .some .str =>
+    match ptrArgVal with
+    | .aggregate 0 (.ptr _ ptrSz :: .scalar lenSc :: .nil) =>
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match evalSliceSizeOfVal 1 lenSc with
+        | .some _ =>
+          writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
+        | .none => MirStepNode.fail .ub
+    | _ => MirStepNode.fail .ub
+  | .some (.dynamic _) =>
+    match ptrArgVal with
+    | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+      match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+      | false => MirStepNode.fail .ub
+      | true => MirStepNode.unsupported
+    | _ => MirStepNode.fail .ub
+  | .some pointeeTy =>
+    match ptrArgVal with
+    | .ptr _ ptrSz =>
+      match Nat.beq ptrSz 8 with
+      | false => MirStepNode.fail .ub
+      | true =>
+        match intrinsicTailIsExtern 8 pointeeTy with
+        | true => MirStepNode.unsupported
+        | false =>
+          match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts pointeeTy with
+          | .some alignBytes =>
+            writeIntrinsicReturn s locals' destination targetBb
+              (.scalar ⟨alignBytes, 8⟩)
+          | .none => intrinsicUnresolvedLayoutStep pointeeTy
+    | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+      match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+      | false => MirStepNode.fail .ub
+      | true => intrinsicWidePointeeStep pointeeTy
+    | _ => MirStepNode.fail .ub
+  | .none =>
+    match isValidIntrinsicPtrArgVal ptrArgVal with
+    | false => MirStepNode.fail .ub
+    | true => intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps
+
+private theorem evalAlignOfVal_oneArg_eq
+    (s : MachineState) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (ptrArgVal : Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts
+        argOps [ptrArgVal] locals' destination targetBb =
+      alignOfValOneArg s bodyLocalDecls bodyLayouts argOps ptrArgVal
+        locals' destination targetBb
+        (resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps) := by
+  unfold evalNonSelectIntrinsicCall alignOfValOneArg
+  dsimp only
+  cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+  | none => rfl
+  | some pt => cases pt <;> rfl
+
+private theorem evalAlignOfValIntrinsicCall_cases
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    IsIntrinsicCallFamily locals' destination targetBb
+      (fun s =>
+        evalNonSelectIntrinsicCall .alignOfVal s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb) := by
+  rcases argVals with _ | ⟨ptrArgVal, _ | _⟩ <;>
+    try exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  refine IsIntrinsicCallFamily.of_eq
+    (fun s => evalAlignOfVal_oneArg_eq s target bodyLocalDecls bodyLayouts argOps
+      ptrArgVal locals' destination targetBb) ?_
+  cases resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps with
+  | none =>
+    unfold alignOfValOneArg
+    cases isValidIntrinsicPtrArgVal ptrArgVal with
+    | false => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+    | true =>
+      exact intrinsicMissingPointeeStep_cases locals' destination targetBb
+        bodyLocalDecls bodyLayouts argOps
+  | some pointeeTy =>
+    by_cases h_sl : ∃ elemTy, pointeeTy = .slice elemTy
+    · rcases h_sl with ⟨elemTy, rfl⟩
+      unfold alignOfValOneArg
+      refine wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
+        (fun lenSc s =>
+          match
+            intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy,
+            intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy
+          with
+          | .some elemSz, .some alignBytes =>
+            match evalSliceSizeOfVal elemSz lenSc with
+            | .some _ =>
+              writeIntrinsicReturn s locals' destination targetBb
+                (.scalar ⟨alignBytes, 8⟩)
+            | .none => MirStepNode.fail .ub
+          | _, _ => intrinsicUnresolvedLayoutStep elemTy)
+        fun lenSc => ?_
+      cases intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts elemTy with
+      | none =>
+        exact intrinsicUnresolvedLayoutStep_cases locals' destination targetBb elemTy
+      | some elemSz =>
+        cases intrinsicRigidTyAlign bodyLocalDecls bodyLayouts elemTy with
+        | none =>
+          exact intrinsicUnresolvedLayoutStep_cases locals' destination targetBb elemTy
+        | some alignBytes =>
+          dsimp only
+          cases evalSliceSizeOfVal elemSz lenSc with
+          | none => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+          | some _ => exact Or.inl ⟨.scalar ⟨alignBytes, 8⟩, fun _ => rfl⟩
+    · by_cases h_str : pointeeTy = .str
+      · subst h_str
+        unfold alignOfValOneArg
+        refine wideSliceIntrinsic_family locals' destination targetBb ptrArgVal
+          (fun lenSc s =>
+            match evalSliceSizeOfVal 1 lenSc with
+            | .some _ =>
+              writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 8⟩)
+            | .none => MirStepNode.fail .ub)
+          fun lenSc => ?_
+        cases evalSliceSizeOfVal 1 lenSc with
+        | none => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+        | some _ => exact Or.inl ⟨.scalar ⟨1, 8⟩, fun _ => rfl⟩
+      · by_cases h_dyn : ∃ preds, pointeeTy = .dynamic preds
+        · rcases h_dyn with ⟨_, rfl⟩
+          unfold alignOfValOneArg
+          exact wideMetaOnlyIntrinsic_family locals' destination targetBb ptrArgVal
+        · refine IsIntrinsicCallFamily.of_eq (g := fun s =>
+            match ptrArgVal with
+            | .ptr _ ptrSz =>
+              match Nat.beq ptrSz 8 with
+              | false => MirStepNode.fail .ub
+              | true =>
+                match intrinsicTailIsExtern 8 pointeeTy with
+                | true => MirStepNode.unsupported
+                | false =>
+                  match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts pointeeTy with
+                  | .some alignBytes =>
+                    writeIntrinsicReturn s locals' destination targetBb
+                      (.scalar ⟨alignBytes, 8⟩)
+                  | .none => intrinsicUnresolvedLayoutStep pointeeTy
+            | .aggregate 0 (.ptr _ ptrSz :: metaVal :: .nil) =>
+              match Bool.and (Nat.beq ptrSz 8) (isValidWidePtrMetaVal metaVal) with
+              | false => MirStepNode.fail .ub
+              | true => intrinsicWidePointeeStep pointeeTy
+            | _ => MirStepNode.fail .ub) (fun s => ?_) ?_
+          · unfold alignOfValOneArg
+            cases pointeeTy <;>
+              first
+              | exact False.elim (h_sl ⟨_, rfl⟩)
+              | exact False.elim (h_str rfl)
+              | exact False.elim (h_dyn ⟨_, rfl⟩)
+              | rfl
+          · refine thinOrWideMetaIntrinsic_family locals' destination targetBb ptrArgVal _ _ ?_
+              (intrinsicWidePointeeStep_cases locals' destination targetBb pointeeTy)
+            cases intrinsicTailIsExtern 8 pointeeTy with
+            | true => exact Or.inr (Or.inr fun _ => rfl)
+            | false =>
+              dsimp only
+              cases intrinsicRigidTyAlign bodyLocalDecls bodyLayouts pointeeTy with
+              | none =>
+                exact intrinsicUnresolvedLayoutStep_cases locals' destination targetBb pointeeTy
+              | some alignBytes =>
+                exact Or.inl ⟨.scalar ⟨alignBytes, 8⟩, fun _ => rfl⟩
+
+private theorem evalNonSelectIntrinsicCall_cases
+    (kind : RustIntrinsicKind)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    (∃ retVal,
+      ∀ s : MachineState,
+        evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb =
+          writeIntrinsicReturn s locals' destination targetBb retVal) ∨
+    (∃ fk, ∀ s : MachineState,
+      evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb = MirStepNode.fail fk) ∨
+    (∀ s : MachineState,
+      evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb = MirStepNode.unsupported) := by
+  change IsIntrinsicCallFamily locals' destination targetBb
+    (fun s =>
+      evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb)
+  cases kind with
+  | ubChecks =>
+    cases argVals with
+    | nil => exact Or.inl ⟨.scalar ⟨1, 1⟩, fun _ => rfl⟩
+    | cons _ _ => exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  | constEvalSelect =>
+    exact Or.inr (Or.inl ⟨.ub, fun _ => rfl⟩)
+  | ctlz =>
+    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtlz
+  | ctlzNonzero =>
+    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtlzNonzero
+  | cttz =>
+    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCttz
+  | cttzNonzero =>
+    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCttzNonzero
+  | ctpop =>
+    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalCtpop
+  | bswap =>
+    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalBswap
+  | bitreverse =>
+    exact unaryScalarIntrinsic_family locals' destination targetBb argVals evalBitreverse
+  | wrappingAdd =>
+    exact binaryScalarIntrinsic_family locals' destination targetBb argVals
+      (fun lhs rhs s =>
+        writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingAdd lhs rhs))
+      fun lhs rhs =>
+        writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingAdd lhs rhs)
+  | wrappingSub =>
+    exact binaryScalarIntrinsic_family locals' destination targetBb argVals
+      (fun lhs rhs s =>
+        writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingSub lhs rhs))
+      fun lhs rhs =>
+        writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingSub lhs rhs)
+  | wrappingMul =>
+    exact binaryScalarIntrinsic_family locals' destination targetBb argVals
+      (fun lhs rhs s =>
+        writeIntrinsicScalarResult s locals' destination targetBb (evalWrappingMul lhs rhs))
+      fun lhs rhs =>
+        writeIntrinsicScalarResult_cases locals' destination targetBb (evalWrappingMul lhs rhs)
+  | saturatingAdd =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => Trusted.Rustc.V2026_06_01.MirSemantics.evalSaturatingAdd lhs rhs flag)
+  | saturatingSub =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => Trusted.Rustc.V2026_06_01.MirSemantics.evalSaturatingSub lhs rhs flag)
+  | uncheckedShl =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => evalUncheckedShl lhs rhs flag)
+  | uncheckedShr =>
+    refine binaryScalarIntrinsic_family locals' destination targetBb argVals
+      (fun lhs rhs s =>
+        match
+          resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (sameRhsTy := false),
+          resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps
+        with
+        | .some lhsSigned, .some rhsSigned =>
+          writeIntrinsicScalarResult s locals' destination targetBb
+            (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
+        | _, _ => MirStepNode.unsupported)
+      fun lhs rhs => ?_
+    cases resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (sameRhsTy := false) with
+    | none => exact Or.inr (Or.inr fun _ => rfl)
+    | some lhsSigned =>
+      cases resolveIntrinsicShiftSigned target bodyLocalDecls bodyLayouts argOps with
+      | none => exact Or.inr (Or.inr fun _ => rfl)
+      | some rhsSigned =>
+        exact writeIntrinsicScalarResult_cases locals' destination targetBb
+          (evalUncheckedShr lhs rhs lhsSigned rhsSigned)
+  | uncheckedAdd =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => evalUncheckedAdd lhs rhs flag)
+  | uncheckedSub =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => evalUncheckedSub lhs rhs flag)
+  | uncheckedMul =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => evalUncheckedMul lhs rhs flag)
+  | uncheckedDiv =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => evalUncheckedDiv lhs rhs flag)
+  | uncheckedRem =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps)
+      (fun lhs rhs flag => evalUncheckedRem lhs rhs flag)
+  | threeWayCompare =>
+    exact optSignedBinaryScalarIntrinsic_family locals' destination targetBb argVals
+      (resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps (allowChar := true))
+      (fun lhs rhs flag => evalThreeWayCompare lhs rhs flag)
+  | arithOffset =>
+    exact arithOffsetIntrinsic_family target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
+  | sizeOfVal =>
+    exact evalSizeOfValIntrinsicCall_cases target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
+  | alignOfVal =>
+    exact evalAlignOfValIntrinsicCall_cases target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb
+
+private theorem writeIntrinsicReturn_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (ms : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (retVal : Value)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (writeIntrinsicReturn ms locals' destination targetBb retVal)) :
+    ∃ nextSt : MachineState,
+      writeIntrinsicReturn ms locals' destination targetBb retVal =
+        MirStepNode.step nextSt ∧
+      writeIntrinsicReturn (MachineState.pushBaseStack calleeBody baseStack ms)
+        locals' destination targetBb retVal =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  unfold writeIntrinsicReturn at h_st ⊢
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  cases h_wr : writePlaceValue locals' ms.memory.borrows destination retVal with
+  | ub => rw [h_wr] at h_st; exact False.elim h_st
+  | unsupported => rw [h_wr] at h_st; exact False.elim h_st
+  | ok updL =>
+    exact ⟨{ frame := { ms.frame with blockIdx := targetBb, stmtIdx := 0, locals := updL }
+             memory := ms.memory }, rfl, rfl⟩
+
+private theorem evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (kind : RustIntrinsicKind) (ms : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_st :
+      evalNodeNoCallWP Q (mirNormalPost P)
+        (evalNonSelectIntrinsicCall kind ms target bodyLocalDecls bodyLayouts
+          argOps argVals locals' destination targetBb)) :
+    ∃ nextSt : MachineState,
+      evalNonSelectIntrinsicCall kind ms target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb =
+        MirStepNode.step nextSt ∧
+      evalNonSelectIntrinsicCall kind
+        (MachineState.pushBaseStack calleeBody baseStack ms) target
+        bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb =
+        MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt) := by
+  rcases evalNonSelectIntrinsicCall_cases kind target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb with ⟨retVal, h_wr⟩ | ⟨fk, h_fl⟩ | h_un
+  · rw [h_wr ms] at h_st ⊢
+    rw [h_wr (MachineState.pushBaseStack calleeBody baseStack ms)]
+    exact writeIntrinsicReturn_pushBaseStack_of_noCallWP calleeBody baseStack
+      ms locals' destination targetBb retVal h_st
+  · rw [h_fl ms] at h_st; exact False.elim h_st
+  · rw [h_un ms] at h_st; exact False.elim h_st
+
+@[reducible]
+def selectTupleTyOpt : List RigidTy → Option RigidTy
+  | firstTy :: _ => some firstTy
+  | [] => none
+
+@[reducible]
+def selectRtFnOpOpt : List Operand → Option Operand
+  | _ :: _ :: rtOp :: _ => some rtOp
+  | _ => none
+
+private def evalConstEvalSelectThree
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (tupleArgVal rtFnVal : Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction) :
+    MirStepNode :=
+  let tupleTyOpt := selectTupleTyOpt target.typeArgs
+  match unpackConstEvalSelectArgs? tupleArgVal tupleTyOpt with
+  | .none => MirStepNode.fail .ub
+  | .some unpackedArgs =>
+    match
+      resolveConstEvalSelectTarget? s target bodyLocalDecls bodyLayouts
+        (selectRtFnOpOpt argOps) rtFnVal (length unpackedArgs)
+    with
+    | .none => MirStepNode.fail .ub
+    | .some rtTarget =>
+      match lookupCallee s.memory.callees bodyLayouts rtTarget.defPath rtTarget.typeArgs s.memory.traitImpls with
+      | .some calleeBody =>
+        match
+          Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+            (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+              (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs)))
+        with
+        | false => MirStepNode.fail .ub
+        | true =>
+          match currentBody with
+          | .none => MirStepNode.unsupported
+          | .some callerBody =>
+            MirStepNode.step
+              (pushCalleeFrame s callerBody locals' destination targetBb calleeBody unpackedArgs unwind)
+      | .none =>
+        match rtTarget.isIndirect with
+        | true =>
+          MirStepNode.extCall
+            { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
+            (resumeExternalCall s locals' destination targetBb unwind)
+        | false =>
+          let selectArgOps := constEvalSelectTupleArgOps tupleTyOpt
+          match isDirectExactDivTarget rtTarget with
+          | true =>
+            match unpackedArgs with
+            | .scalar lhs :: .scalar rhs :: .nil =>
+              let rtTarget' := withConstEvalSelectIntrinsicTypeArgs rtTarget tupleTyOpt false
+              match resolveIntrinsicIsSigned rtTarget' bodyLocalDecls bodyLayouts selectArgOps with
+              | .none => MirStepNode.unsupported
+              | .some isSigned =>
+                writeIntrinsicScalarResult s locals' destination targetBb (evalExactDiv lhs rhs isSigned)
+            | _ => MirStepNode.fail .ub
+          | false =>
+            match classifyRustIntrinsic? rtTarget.defPath with
+            | .some .constEvalSelect => MirStepNode.fail .ub
+            | .some rtKind =>
+              let rtTarget' :=
+                withConstEvalSelectIntrinsicTypeArgs rtTarget tupleTyOpt (isPtrPointeeIntrinsicKind rtKind)
+              evalNonSelectIntrinsicCall rtKind s rtTarget' bodyLocalDecls bodyLayouts
+                selectArgOps unpackedArgs locals' destination targetBb
+            | .none =>
+              match isUnreachableCallTarget rtTarget.defPath with
+              | true => MirStepNode.fail .ub
+              | false =>
+                match isAbortingPanicDefPath rtTarget.defPath with
+                | true => MirStepNode.retOutcome .abort
+                | false =>
+                  match isUnwindingPanicDefPath rtTarget.defPath with
+                  | true =>
+                    match applyUnwindAction s locals' s.memory unwind with
+                    | .running nextState => MirStepNode.step nextState
+                    | .halted out => MirStepNode.retOutcome out
+                    | .faulted fk => MirStepNode.fail fk
+                  | false =>
+                    MirStepNode.extCall
+                      { defPath := rtTarget.defPath, typeArgs := rtTarget.typeArgs, args := unpackedArgs, memory := s.memory }
+                      (resumeExternalCall s locals' destination targetBb unwind)
+
+private theorem evalDirectRustIntrinsic?_constEvalSelect_three
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (tupleArgVal ctFnVal rtFnVal : Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (h_cl : classifyRustIntrinsic? target.defPath = some .constEvalSelect) :
+    evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+      argOps [tupleArgVal, ctFnVal, rtFnVal] locals' destination targetBb unwind =
+    some (evalConstEvalSelectThree s currentBody target bodyLocalDecls bodyLayouts
+      argOps tupleArgVal rtFnVal locals' destination targetBb unwind) := by
+  unfold evalDirectRustIntrinsic? evalConstEvalSelectThree
+  rw [h_cl]
+  rcases target.typeArgs with _ | ⟨_, _⟩ <;>
+    (rcases argOps with _ | ⟨_, _ | ⟨_, _ | ⟨_, _⟩⟩⟩ <;> rfl)
+
+private theorem evalDirectRustIntrinsic?_nonSelect
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {rk : RustIntrinsicKind}
+    (h_cl : classifyRustIntrinsic? target.defPath = some rk)
+    (h_ne : rk ≠ .constEvalSelect) :
+    evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb unwind =
+    some (evalNonSelectIntrinsicCall rk s target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb) := by
+  unfold evalDirectRustIntrinsic?
+  rw [h_cl]
+  cases rk <;> first | exact False.elim (h_ne rfl) | rfl
+
+private theorem evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (ms : MachineState) (curBody : CapturedMir)
+    (target : ResolvedCallTarget) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (stepNode : MirStepNode)
+    {Q : MirExecState → Prop} {P : Value → Memory → Prop}
+    (h_di :
+      evalDirectRustIntrinsic? ms (some curBody) target
+        curBody.localDecls curBody.layouts argOps argVals locals'
+        destination targetBb unwind = some stepNode)
+    (h_st : evalNodeNoCallWP Q (mirNormalPost P) stepNode) :
+    ∃ nextSt : MachineState,
+      stepNode = MirStepNode.step nextSt ∧
+      evalDirectRustIntrinsic? (MachineState.pushBaseStack calleeBody baseStack ms)
+        (some curBody) target curBody.localDecls curBody.layouts argOps
+        argVals locals' destination targetBb unwind =
+        some (MirStepNode.step (MachineState.pushBaseStack calleeBody baseStack nextSt)) := by
+  cases h_cl : classifyRustIntrinsic? target.defPath with
+  | none =>
+    unfold evalDirectRustIntrinsic? at h_di
+    rw [h_cl] at h_di
+    cases h_di
+  | some rk =>
+    by_cases h_cs : rk = .constEvalSelect
+    · subst h_cs
+      rcases argVals with _ | ⟨tupleArgVal, _ | ⟨ctFnVal, _ | ⟨rtFnVal, _ | _⟩⟩⟩
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; exact False.elim h_st
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; exact False.elim h_st
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; exact False.elim h_st
+      · rw [evalDirectRustIntrinsic?_constEvalSelect_three _ _ _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di ⊢
+        injection h_di with h_sn
+        subst h_sn
+        revert h_st
+        unfold evalConstEvalSelectThree
+        dsimp only
+        cases unpackConstEvalSelectArgs? tupleArgVal (selectTupleTyOpt target.typeArgs) with
+        | none => intro h_st; exact False.elim h_st
+        | some unpackedArgs =>
+          dsimp only
+          have h_res_eq :
+              resolveConstEvalSelectTarget?
+                (MachineState.pushBaseStack calleeBody baseStack ms) target
+                curBody.localDecls curBody.layouts
+                (selectRtFnOpOpt argOps) rtFnVal (length unpackedArgs) =
+              resolveConstEvalSelectTarget? ms target curBody.localDecls
+                curBody.layouts (selectRtFnOpOpt argOps) rtFnVal
+                (length unpackedArgs) := rfl
+          rw [h_res_eq]
+          cases
+            resolveConstEvalSelectTarget? ms target curBody.localDecls
+              curBody.layouts (selectRtFnOpOpt argOps) rtFnVal
+              (length unpackedArgs) with
+          | none => intro h_st; exact False.elim h_st
+          | some rtTarget =>
+            dsimp only
+            have h_lk_eq :
+                lookupCallee
+                  (MachineState.pushBaseStack calleeBody baseStack ms).memory.callees
+                  curBody.layouts rtTarget.defPath rtTarget.typeArgs
+                  (MachineState.pushBaseStack calleeBody baseStack ms).memory.traitImpls =
+                lookupCallee ms.memory.callees curBody.layouts rtTarget.defPath
+                  rtTarget.typeArgs ms.memory.traitImpls := rfl
+            rw [h_lk_eq]
+            cases
+              lookupCallee ms.memory.callees curBody.layouts
+                rtTarget.defPath rtTarget.typeArgs ms.memory.traitImpls with
+            | some subCallee =>
+              dsimp only
+              cases
+                Bool.and (Nat.beq subCallee.argCount (length unpackedArgs))
+                  (Bool.and (Bool.not (callConvEq subCallee.fnAbi.conv .rustIntrinsic))
+                    (checkCalleeTargetCompatible rtTarget subCallee (length unpackedArgs))) with
+              | false => intro h_st; exact False.elim h_st
+              | true =>
+                intro _
+                exact ⟨pushCalleeFrame ms curBody locals' destination targetBb
+                  subCallee unpackedArgs unwind, rfl, rfl⟩
+            | none =>
+              dsimp only
+              cases rtTarget.isIndirect with
+              | true => intro h_st; exact False.elim h_st
+              | false =>
+                dsimp only
+                cases isDirectExactDivTarget rtTarget with
+                | true =>
+                  dsimp only
+                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _, _ | ⟨_ | rhs | _ | _, _ | _⟩⟩ <;>
+                    try (intro h_st; exact False.elim h_st)
+                  dsimp only
+                  cases
+                    resolveIntrinsicIsSigned
+                      (withConstEvalSelectIntrinsicTypeArgs rtTarget
+                        (selectTupleTyOpt target.typeArgs) false)
+                      curBody.localDecls curBody.layouts
+                      (constEvalSelectTupleArgOps (selectTupleTyOpt target.typeArgs)) with
+                  | none => intro h_st; exact False.elim h_st
+                  | some isSigned =>
+                    dsimp only [writeIntrinsicScalarResult]
+                    cases evalExactDiv lhs rhs isSigned with
+                    | none => intro h_st; exact False.elim h_st
+                    | some retSc =>
+                      intro h_st
+                      rcases writeIntrinsicReturn_pushBaseStack_of_noCallWP
+                          calleeBody baseStack ms locals' destination targetBb
+                          (.scalar retSc) h_st with ⟨nextSt, h1, h2⟩
+                      exact ⟨nextSt, h1, congrArg some h2⟩
+                | false =>
+                  dsimp only
+                  cases classifyRustIntrinsic? rtTarget.defPath with
+                  | some rtKind =>
+                    cases rtKind <;>
+                      first
+                      | (intro h_st; exact False.elim h_st)
+                      | (dsimp only
+                         intro h_st
+                         rcases evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP
+                             calleeBody baseStack _ ms _ curBody.localDecls
+                             curBody.layouts _ unpackedArgs locals' destination targetBb h_st with
+                           ⟨nextSt, h1, h2⟩
+                         exact ⟨nextSt, h1, congrArg some h2⟩)
+                  | none =>
+                    dsimp only
+                    cases isUnreachableCallTarget rtTarget.defPath with
+                    | true => intro h_st; exact False.elim h_st
+                    | false =>
+                      dsimp only
+                      cases isAbortingPanicDefPath rtTarget.defPath with
+                      | true => intro h_st; exact False.elim h_st
+                      | false =>
+                        dsimp only
+                        cases isUnwindingPanicDefPath rtTarget.defPath with
+                        | false => intro h_st; exact False.elim h_st
+                        | true =>
+                          dsimp only
+                          intro h_st
+                          have h_np :
+                              applyUnwindAction ms locals' ms.memory unwind ≠
+                                .halted .panic := by
+                            intro hp; rw [hp] at h_st; exact h_st
+                          have h_ap_eq := applyUnwindAction_pushBaseStack_of_ne_panic
+                            calleeBody baseStack ms locals' unwind h_np
+                          change
+                            applyUnwindAction
+                              (MachineState.pushBaseStack calleeBody baseStack ms)
+                              locals'
+                              (MachineState.pushBaseStack calleeBody baseStack ms).memory
+                              unwind = _ at h_ap_eq
+                          rw [h_ap_eq]
+                          cases h_ap : applyUnwindAction ms locals' ms.memory unwind with
+                          | running nextSt => exact ⟨nextSt, rfl, rfl⟩
+                          | halted out =>
+                            rw [h_ap] at h_st
+                            cases out with
+                            | panic => exact False.elim h_st
+                            | abort => exact False.elim h_st
+                            | normal rv =>
+                              exact False.elim
+                                (applyUnwindAction_ne_normal ms locals' ms.memory unwind rv h_ap)
+                          | faulted _ => rw [h_ap] at h_st; exact False.elim h_st
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; exact False.elim h_st
+    · rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs] at h_di ⊢
+      injection h_di with h_sn
+      subst h_sn
+      rcases evalNonSelectIntrinsicCall_pushBaseStack_of_noCallWP calleeBody
+          baseStack rk ms target curBody.localDecls curBody.layouts argOps
+          argVals locals' destination targetBb h_st with ⟨nextSt, h1, h2⟩
+      exact ⟨nextSt, h1, congrArg some h2⟩
 
 /--
 Core stack-frame suffix simulation theorem (`wpMirExecNoCallSym_pushCalleeFrame`):
@@ -5128,40 +5575,25 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
               curBody.localDecls curBody.layouts] at h_step_body
             cases h_ev : evalStmt ms stmt curBody.localDecls curBody.layouts with
             | ret out =>
-              rw [h_ev] at h_st
-              exfalso
-              rcases stmt with ⟨sk, _⟩
-              cases sk <;>
-                (try cases ‹NonDivergingIntrinsic›) <;>
-                dsimp only [evalStmt, evalCopyNonOverlapping,
-                  evalCopyNonOverlappingWithCount, evalCopySingleDirect] at h_ev <;>
-                repeat' (first | cases h_ev | split at h_ev)
+              rcases evalStmt_isStmtNode ms stmt curBody.localDecls curBody.layouts with
+                ⟨_, h_sh⟩ | ⟨_, h_sh⟩ | h_sh <;> rw [h_sh] at h_ev <;> cases h_ev
             | tau st' =>
               rw [h_ev] at h_st h_step_body
               dsimp only [MirStepNode.pushBaseStack, evalNodeNoCallWP] at h_st h_step_body
               refine liftTau h_step_body h_st (fun rv m h_halt => ?_)
-              rcases stmt with ⟨sk, _⟩
-              cases sk <;>
-                (try cases ‹NonDivergingIntrinsic›) <;>
-                dsimp only [evalStmt, evalCopyNonOverlapping,
-                  evalCopyNonOverlappingWithCount, evalCopySingleDirect,
-                  MirStepNode.step] at h_ev <;>
-                repeat' (first
-                  | (rw [h_halt] at h_ev; cases h_ev)
-                  | split at h_ev
-                  | cases h_ev)
+              rcases evalStmt_isStmtNode ms stmt curBody.localDecls curBody.layouts with
+                ⟨_, h_sh⟩ | ⟨_, h_sh⟩ | h_sh
+              · rw [h_sh, h_halt] at h_ev; cases h_ev
+              · rw [h_sh] at h_ev; cases h_ev
+              · rw [h_sh] at h_ev; cases h_ev
             | vis i k =>
               rw [h_ev] at h_st h_step_body
               rcases i with fk | (obs | req)
               · exact False.elim h_st
               · dsimp only [MirStepNode.pushBaseStack, evalNodeNoCallWP] at h_st h_step_body
                 refine liftObs (k_un := k) h_step_body h_st (fun rv m h_halt => ?_)
-                rcases stmt with ⟨sk, _⟩
-                cases sk <;>
-                  (try cases ‹NonDivergingIntrinsic›) <;>
-                  dsimp only [evalStmt, evalCopyNonOverlapping,
-                    evalCopyNonOverlappingWithCount, evalCopySingleDirect] at h_ev <;>
-                  repeat' (first | cases h_ev | split at h_ev)
+                rcases evalStmt_isStmtNode ms stmt curBody.localDecls curBody.layouts with
+                  ⟨_, h_sh⟩ | ⟨_, h_sh⟩ | h_sh <;> rw [h_sh] at h_ev <;> cases h_ev
               · exact False.elim h_st
           | none =>
             rw [h_stmt] at h_st h_step_body
@@ -5395,19 +5827,18 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                           (st_un := .running (enterTailCalleeFrame ms.memory subCallee aVals))
                           h_step_body h_st (fun _ _ h => by cases h)
               | call func argOps cDest cTarget cUnwind =>
-                simp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
-                  resolveCallTarget_pushBaseStack, MachineState.pushBaseStack_memory,
-                  Memory.pushBaseStack_borrows, Memory.pushBaseStack_globals,
-                  Memory.pushBaseStack_callerLocals, Memory.pushBaseStack_callees,
-                  Memory.pushBaseStack_traitImpls] at h_st h_step_body
-                cases h_rt : resolveCallTarget ms func (length argOps) curBody.localDecls curBody.layouts with
-                | ub => rw [h_rt] at h_st; exact False.elim h_st
-                | unsupported => rw [h_rt] at h_st; exact False.elim h_st
-                | ok rTarget localsAfterFunc =>
-                  rw [h_rt] at h_st h_step_body
-                  dsimp only at h_st h_step_body
-                  cases cTarget with
-                  | none =>
+                cases cTarget with
+                | none =>
+                  simp only [evalTerminator, bodyLocalDeclsOf,
+                    resolveCallTarget_pushBaseStack, MachineState.pushBaseStack_memory,
+                    Memory.pushBaseStack_borrows, Memory.pushBaseStack_globals,
+                    Memory.pushBaseStack_callerLocals, Memory.pushBaseStack_callees,
+                    Memory.pushBaseStack_traitImpls] at h_st h_step_body
+                  cases h_rt : resolveCallTarget ms func (length argOps) curBody.localDecls curBody.layouts with
+                  | ub => rw [h_rt] at h_st; exact False.elim h_st
+                  | unsupported => rw [h_rt] at h_st; exact False.elim h_st
+                  | ok rTarget localsAfterFunc =>
+                    rw [h_rt] at h_st h_step_body
                     dsimp only at h_st h_step_body
                     cases h_ops : evalOperands localsAfterFunc argOps ms.memory.borrows
                         ms.memory.globals curBody.layouts ms.memory.callerLocals with
@@ -5476,7 +5907,17 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                                 | faulted _ =>
                                   rw [h_ap] at h_st
                                   exact False.elim h_st
-                  | some cTargetBb =>
+                | some cTargetBb =>
+                  simp only [evalTerminator, bodyLocalDeclsOf,
+                    resolveCallTarget_pushBaseStack, MachineState.pushBaseStack_memory,
+                    Memory.pushBaseStack_borrows, Memory.pushBaseStack_globals,
+                    Memory.pushBaseStack_callerLocals, Memory.pushBaseStack_callees,
+                    Memory.pushBaseStack_traitImpls] at h_st h_step_body
+                  cases h_rt : resolveCallTarget ms func (length argOps) curBody.localDecls curBody.layouts with
+                  | ub => rw [h_rt] at h_st; exact False.elim h_st
+                  | unsupported => rw [h_rt] at h_st; exact False.elim h_st
+                  | ok rTarget localsAfterFunc =>
+                    rw [h_rt] at h_st h_step_body
                     dsimp only at h_st h_step_body
                     cases h_ops : evalOperands localsAfterFunc argOps ms.memory.borrows
                         ms.memory.globals curBody.layouts ms.memory.callerLocals with
@@ -5503,7 +5944,31 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                         rw [h_lk] at h_st h_step_body
                         dsimp only at h_st h_step_body
                         cases h_ed : isDirectExactDivTarget rTarget with
-                        | false => rw [h_ed] at h_st; exact False.elim h_st
+                        | false =>
+                          rw [h_ed] at h_st h_step_body
+                          dsimp only at h_st h_step_body
+                          cases h_ind : rTarget.isIndirect with
+                          | true => rw [h_ind] at h_st; exact False.elim h_st
+                          | false =>
+                            rw [h_ind] at h_st h_step_body
+                            dsimp only at h_st h_step_body
+                            cases h_di :
+                              evalDirectRustIntrinsic? ms (some curBody) rTarget
+                                curBody.localDecls curBody.layouts argOps aVals
+                                cLocals' cDest cTargetBb cUnwind with
+                            | none => rw [h_di] at h_st; exact False.elim h_st
+                            | some stepNode =>
+                              rw [h_di] at h_st
+                              dsimp only at h_st
+                              rcases evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
+                                  calleeBody baseStack ms curBody rTarget argOps
+                                  aVals cLocals' cDest cTargetBb cUnwind stepNode
+                                  h_di h_st with
+                                ⟨nextSt, rfl, h_m2⟩
+                              rw [h_m2] at h_step_body
+                              dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st h_step_body
+                              exact liftTau (st_un := .running nextSt) h_step_body h_st
+                                (fun _ _ h => by cases h)
                         | true =>
                           rw [h_ed] at h_st h_step_body
                           dsimp only at h_st h_step_body
@@ -5519,51 +5984,25 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                               | cons _ _ => exact False.elim h_st
                               | nil =>
                                 rename_i lhsSc rhsSc
-                                have h_ed_branch :
-                                    ∀ isSigned : Bool,
-                                      evalNodeNoCallWP
-                                        (fun st' => wpMirExecNoCallSym f' calleeBody st' (mirNormalPost P))
-                                        (mirNormalPost P)
-                                        (match evalExactDiv lhsSc rhsSc isSigned with
-                                         | some retSc =>
-                                           match writePlaceValue cLocals' ms.memory.borrows cDest (.scalar retSc) with
-                                           | .ok updL =>
-                                             MirStepNode.step
-                                               { ms with frame := { ms.frame with blockIdx := cTargetBb, stmtIdx := 0, locals := updL } }
-                                           | .ub => MirStepNode.fail .ub
-                                           | .unsupported => MirStepNode.unsupported
-                                         | none => MirStepNode.fail .ub) →
-                                      stepMirFn outerBody (MachineState.pushBaseStack calleeBody baseStack ms) =
-                                        (match evalExactDiv lhsSc rhsSc isSigned with
-                                         | some retSc =>
-                                           match writePlaceValue cLocals' ms.memory.borrows cDest (.scalar retSc) with
-                                           | .ok updL =>
-                                             MirStepNode.step
-                                               { frame := { blockIdx := cTargetBb, stmtIdx := 0, locals := updL }
-                                                 memory := Memory.pushBaseStack calleeBody baseStack ms.memory }
-                                           | .ub => MirStepNode.fail .ub
-                                           | .unsupported => MirStepNode.unsupported
-                                         | none => MirStepNode.fail .ub) →
-                                      ∃ f_out : Nat,
-                                        wpMirExecStepsSym f_out outerBody
-                                          (.running (MachineState.pushBaseStack calleeBody baseStack ms))
-                                          (fun
-                                            | .running ms' => mid ms'
-                                            | .halted out => post out
-                                            | .faulted _ => False)
-                                          post := by
-                                  intro isSigned h_st_d h_sb_d
+                                dsimp only at h_st h_step_body
+                                cases h_sig :
+                                  resolveIntrinsicIsSigned rTarget curBody.localDecls
+                                    curBody.layouts argOps with
+                                | none => rw [h_sig] at h_st; exact False.elim h_st
+                                | some isSigned =>
+                                  rw [h_sig] at h_st h_step_body
+                                  dsimp only at h_st h_step_body
                                   cases h_div : evalExactDiv lhsSc rhsSc isSigned with
-                                  | none => rw [h_div] at h_st_d; exact False.elim h_st_d
+                                  | none => rw [h_div] at h_st; exact False.elim h_st
                                   | some retSc =>
-                                    rw [h_div] at h_st_d h_sb_d
-                                    dsimp only at h_st_d h_sb_d
+                                    rw [h_div] at h_st h_step_body
+                                    dsimp only at h_st h_step_body
                                     cases h_wr : writePlaceValue cLocals' ms.memory.borrows cDest (.scalar retSc) with
-                                    | ub => rw [h_wr] at h_st_d; exact False.elim h_st_d
-                                    | unsupported => rw [h_wr] at h_st_d; exact False.elim h_st_d
+                                    | ub => rw [h_wr] at h_st; exact False.elim h_st
+                                    | unsupported => rw [h_wr] at h_st; exact False.elim h_st
                                     | ok updL =>
-                                      rw [h_wr] at h_st_d h_sb_d
-                                      dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st_d h_sb_d
+                                      rw [h_wr] at h_st h_step_body
+                                      dsimp only [MirStepNode.step, evalNodeNoCallWP] at h_st h_step_body
                                       exact liftTau
                                         (st_un := .running {
                                           ms with frame := {
@@ -5571,13 +6010,7 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                                             blockIdx := cTargetBb
                                             stmtIdx := 0
                                             locals := updL } })
-                                        h_sb_d h_st_d (fun _ _ h => by cases h)
-                                cases argOps with
-                                | nil => exact h_ed_branch false h_st h_step_body
-                                | cons lhsOp _ =>
-                                  exact h_ed_branch
-                                    (operandIsSigned curBody.localDecls lhsOp curBody.layouts)
-                                    h_st h_step_body
+                                        h_step_body h_st (fun _ _ h => by cases h)
               | return_ =>
                 simp only [evalTerminator, MachineState.pushBaseStack_frame,
                   MachineState.pushBaseStack_memory, Memory.pushBaseStack_callStack,
@@ -5724,12 +6157,8 @@ private theorem evalStmt_not_extCall
     (c : MirCallE.I) (k : MirCallE.O c → MirExecState) :
     evalStmt s stmt decls layouts ≠ .vis (.inr (.inr c)) k := by
   intro h_ev
-  rcases stmt with ⟨sk, _⟩
-  cases sk <;>
-    (try cases ‹NonDivergingIntrinsic›) <;>
-    dsimp only [evalStmt, evalCopyNonOverlapping,
-      evalCopyNonOverlappingWithCount, evalCopySingleDirect] at h_ev <;>
-    repeat' (first | cases h_ev | split at h_ev)
+  rcases evalStmt_isStmtNode s stmt decls layouts with
+    ⟨_, h_sh⟩ | ⟨_, h_sh⟩ | h_sh <;> rw [h_sh] at h_ev <;> cases h_ev
 
 private def extCallAbortsProp : MirStepNode → Prop
   | .vis (.inr (.inr _)) k => k .aborted = .halted .abort
@@ -5779,21 +6208,152 @@ private theorem evalStmt_extCall_aborts_prop
     · trivial
     · exact False.elim (evalStmt_not_extCall s stmt localDecls layouts c k h_ev)
 
+private theorem extCallAbortsProp_writeIntrinsicReturn
+    (s : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (retVal : Value) :
+    extCallAbortsProp
+      (writeIntrinsicReturn s locals' destination targetBb retVal) := by
+  unfold writeIntrinsicReturn
+  cases writePlaceValue locals' s.memory.borrows destination retVal <;> trivial
+
+private theorem extCallAbortsProp_writeIntrinsicScalarResult
+    (s : MachineState) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (res : Option ScalarInt) :
+    extCallAbortsProp
+      (writeIntrinsicScalarResult s locals' destination targetBb res) := by
+  cases res with
+  | none => trivial
+  | some sc =>
+    exact extCallAbortsProp_writeIntrinsicReturn s locals' destination targetBb (.scalar sc)
+
+private theorem extCallAbortsProp_evalNonSelectIntrinsicCall
+    (kind : RustIntrinsicKind) (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    extCallAbortsProp
+      (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb) := by
+  rcases evalNonSelectIntrinsicCall_cases kind target bodyLocalDecls bodyLayouts
+      argOps argVals locals' destination targetBb with ⟨retVal, h_wr⟩ | ⟨fk, h_fl⟩ | h_un
+  · rw [h_wr s]; exact extCallAbortsProp_writeIntrinsicReturn s locals' destination targetBb retVal
+  · rw [h_fl s]; trivial
+  · rw [h_un s]; trivial
+
+private theorem extCallAbortsProp_evalDirectRustIntrinsic?
+    (s : MachineState) (currentBody : Option CapturedMir)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    (stepNode : MirStepNode)
+    (h_di :
+      evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts
+        argOps argVals locals' destination targetBb unwind = some stepNode) :
+    extCallAbortsProp stepNode := by
+  cases h_cl : classifyRustIntrinsic? target.defPath with
+  | none =>
+    unfold evalDirectRustIntrinsic? at h_di
+    rw [h_cl] at h_di
+    cases h_di
+  | some rk =>
+    by_cases h_cs : rk = .constEvalSelect
+    · subst h_cs
+      rcases argVals with _ | ⟨tupleArgVal, _ | ⟨ctFnVal, _ | ⟨rtFnVal, _ | _⟩⟩⟩
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; trivial
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; trivial
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; trivial
+      · rw [evalDirectRustIntrinsic?_constEvalSelect_three _ _ _ _ _ _ _ _ _ _ _ _ _ h_cl] at h_di
+        injection h_di with h_sn
+        subst h_sn
+        unfold evalConstEvalSelectThree
+        dsimp only
+        cases unpackConstEvalSelectArgs? tupleArgVal (selectTupleTyOpt target.typeArgs) with
+        | none => trivial
+        | some unpackedArgs =>
+          dsimp only
+          cases resolveConstEvalSelectTarget? s target bodyLocalDecls bodyLayouts
+              (selectRtFnOpOpt argOps) rtFnVal (length unpackedArgs) with
+          | none => trivial
+          | some rtTarget =>
+            dsimp only
+            cases lookupCallee s.memory.callees bodyLayouts rtTarget.defPath
+                rtTarget.typeArgs s.memory.traitImpls with
+            | some calleeBody =>
+              dsimp only
+              cases Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+                  (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+                    (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) with
+              | false => trivial
+              | true => dsimp only; cases currentBody <;> trivial
+            | none =>
+              dsimp only
+              cases rtTarget.isIndirect with
+              | true => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
+              | false =>
+                dsimp only
+                cases isDirectExactDivTarget rtTarget with
+                | true =>
+                  dsimp only
+                  rcases unpackedArgs with _ | ⟨_ | lhs | _ | _, _ | ⟨_ | rhs | _ | _, _ | _⟩⟩ <;>
+                    try trivial
+                  dsimp only
+                  cases resolveIntrinsicIsSigned
+                      (withConstEvalSelectIntrinsicTypeArgs rtTarget
+                        (selectTupleTyOpt target.typeArgs) false)
+                      bodyLocalDecls bodyLayouts
+                      (constEvalSelectTupleArgOps (selectTupleTyOpt target.typeArgs)) with
+                  | none => trivial
+                  | some isSigned =>
+                    exact extCallAbortsProp_writeIntrinsicScalarResult s locals'
+                      destination targetBb (evalExactDiv lhs rhs isSigned)
+                | false =>
+                  dsimp only
+                  cases classifyRustIntrinsic? rtTarget.defPath with
+                  | some rtKind =>
+                    cases rtKind <;>
+                      first
+                      | trivial
+                      | exact extCallAbortsProp_evalNonSelectIntrinsicCall _ s _
+                          bodyLocalDecls bodyLayouts _ unpackedArgs locals' destination targetBb
+                  | none =>
+                    dsimp only
+                    cases isUnreachableCallTarget rtTarget.defPath with
+                    | true => trivial
+                    | false =>
+                      dsimp only
+                      cases isAbortingPanicDefPath rtTarget.defPath with
+                      | true => trivial
+                      | false =>
+                        dsimp only
+                        cases isUnwindingPanicDefPath rtTarget.defPath with
+                        | true =>
+                          dsimp only
+                          cases applyUnwindAction s locals' s.memory unwind <;> trivial
+                        | false => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
+      · unfold evalDirectRustIntrinsic? at h_di; rw [h_cl] at h_di
+        injection h_di with h_sn; subst h_sn; trivial
+    · rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ h_cl h_cs] at h_di
+      injection h_di with h_sn
+      subst h_sn
+      exact extCallAbortsProp_evalNonSelectIntrinsicCall rk s target
+        bodyLocalDecls bodyLayouts argOps argVals locals' destination targetBb
+
 private theorem stepMirFn_extCall_aborts_prop
     (body : CapturedMir) (s : MachineState) :
     extCallAbortsProp (stepMirFn body s) := by
-  unfold stepMirFn
-  cases h_ph : (s.memory.activeCallee.getD body).phase with
-  | other _ =>
-    change extCallAbortsProp
-      (match (s.memory.activeCallee.getD body).phase with | .other _ => _ | _ => _)
-    rw [h_ph]
+  rw [stepMirFn_eq_ite]
+  dsimp only
+  cases isOtherPhase (s.memory.activeCallee.getD body).phase with
+  | true =>
+    simp only [ite_true]
     trivial
-  | _ =>
-    change extCallAbortsProp
-      (match (s.memory.activeCallee.getD body).phase with | .other _ => _ | _ => _)
-    rw [h_ph]
-    dsimp only
+  | false =>
+    simp only [Bool.false_eq_true, ite_false]
     cases get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx with
     | none => trivial
     | some bb =>
@@ -5808,21 +6368,187 @@ private theorem stepMirFn_extCall_aborts_prop
         by_cases h_len : (s.frame.stmtIdx == length bb.statements) = true
         · simp only [h_len, ite_true]
           rcases bb with ⟨_, ⟨tkind, _⟩, _⟩
-          cases tkind <;>
-            dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf,
-              evalDirectRustIntrinsic?, evalNonSelectIntrinsicCall,
-              writeIntrinsicReturn, writeIntrinsicScalarResult] <;>
-            repeat' (first
-              | exact extCallAbortsProp_step _
-              | exact extCallAbortsProp_fail _
-              | exact extCallAbortsProp_unsupported
-              | exact extCallAbortsProp_emitStep _ _
-              | exact extCallAbortsProp_retNormal _ _
-              | exact extCallAbortsProp_retOutcome _
-              | exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
-              | exact extCallAbortsProp_extCall_diverging _ _ _ _
-              | exact extCallAbortsProp_extCall_tail _
-              | split)
+          cases tkind with
+          | call func argOps destination targetOpt unwind =>
+            cases targetOpt with
+            | none =>
+              dsimp only [evalTerminator, bodyLocalDeclsOf]
+              cases resolveCallTarget s func (length argOps) _ _ with
+              | ub => trivial
+              | unsupported => trivial
+              | ok target localsAfterFunc =>
+                dsimp only
+                cases evalOperands localsAfterFunc argOps _ _ _ _ with
+                | ub => trivial
+                | unsupported => trivial
+                | ok argVals locals' =>
+                  dsimp only
+                  cases lookupCallee _ _ _ _ _ with
+                  | some calleeBody =>
+                    dsimp only
+                    cases checkCalleeTargetCompatible target calleeBody (length argVals) <;> trivial
+                  | none =>
+                    dsimp only
+                    cases target.isIndirect with
+                    | true => exact extCallAbortsProp_extCall_diverging _ _ _ _
+                    | false =>
+                      dsimp only
+                      cases isUnreachableCallTarget target.defPath with
+                      | true => trivial
+                      | false =>
+                        dsimp only
+                        cases isAbortingPanicDefPath target.defPath with
+                        | true => trivial
+                        | false =>
+                          dsimp only
+                          cases isUnwindingPanicDefPath target.defPath with
+                          | true =>
+                            dsimp only
+                            cases applyUnwindAction s locals' s.memory unwind <;> trivial
+                          | false => exact extCallAbortsProp_extCall_diverging _ _ _ _
+            | some targetBb =>
+              dsimp only [evalTerminator, bodyLocalDeclsOf]
+              cases resolveCallTarget s func (length argOps) _ _ with
+              | ub => trivial
+              | unsupported => trivial
+              | ok target localsAfterFunc =>
+                dsimp only
+                cases evalOperands localsAfterFunc argOps _ _ _ _ with
+                | ub => trivial
+                | unsupported => trivial
+                | ok argVals locals' =>
+                  dsimp only
+                  cases lookupCallee _ _ _ _ _ with
+                  | some calleeBody =>
+                    dsimp only
+                    cases checkCalleeTargetCompatible target calleeBody (length argVals) <;> trivial
+                  | none =>
+                    dsimp only
+                    cases isDirectExactDivTarget target with
+                    | true =>
+                      dsimp only
+                      rcases argVals with _ | ⟨_ | lhs | _ | _, _ | ⟨_ | rhs | _ | _, _ | _⟩⟩ <;>
+                        try trivial
+                      dsimp only
+                      cases resolveIntrinsicIsSigned target _ _ argOps with
+                      | none => trivial
+                      | some isSigned =>
+                        dsimp only
+                        cases evalExactDiv lhs rhs isSigned with
+                        | none => trivial
+                        | some sc =>
+                          dsimp only
+                          cases writePlaceValue locals' s.memory.borrows destination (.scalar sc) <;> trivial
+                    | false =>
+                      dsimp only
+                      cases target.isIndirect with
+                      | true => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
+                      | false =>
+                        dsimp only
+                        cases h_di :
+                          evalDirectRustIntrinsic? s _ target _ _ argOps argVals
+                            locals' destination targetBb unwind with
+                        | none => exact extCallAbortsProp_extCall_resume _ _ _ _ _ _
+                        | some stepNode =>
+                          exact extCallAbortsProp_evalDirectRustIntrinsic? s _ target
+                            _ _ argOps argVals locals' destination targetBb unwind
+                            stepNode h_di
+          | goto _ => exact extCallAbortsProp_step _
+          | switchInt discr _ =>
+            dsimp only [evalTerminator]
+            cases evalOperand s.frame.locals discr s.memory.borrows
+                s.memory.globals _ s.memory.callerLocals with
+            | ub => trivial
+            | unsupported => trivial
+            | ok v _ => cases v <;> trivial
+          | unwindResume =>
+            dsimp only [evalTerminator]
+            cases unwindFromCallStack s.memory.callStack s.memory <;> trivial
+          | unwindTerminate => trivial
+          | return_ =>
+            dsimp only [evalTerminator]
+            cases get? s.frame.locals 0 with
+            | none => trivial
+            | some slot =>
+              cases slot with
+              | dead => trivial
+              | uninit => trivial
+              | init retVal =>
+                cases s.memory.callStack with
+                | nil => trivial
+                | cons caller _ =>
+                  dsimp only
+                  cases caller.isDiverging with
+                  | true => trivial
+                  | false =>
+                    dsimp only
+                    cases writePlaceValue caller.frame.locals s.memory.borrows
+                      caller.destination retVal <;> trivial
+          | unreachable => trivial
+          | drop place _ _ =>
+            dsimp only [evalTerminator]
+            cases get? s.frame.locals place.local_ with
+            | none => trivial
+            | some slot =>
+              cases slot with
+              | dead => trivial
+              | uninit =>
+                cases place.projection with
+                | nil =>
+                  dsimp only
+                  cases set? s.frame.locals place.local_ .uninit <;> trivial
+                | cons _ _ => trivial
+              | init rootVal =>
+                cases place.projection with
+                | nil =>
+                  dsimp only
+                  cases set? s.frame.locals place.local_ .uninit <;> trivial
+                | cons _ _ =>
+                  dsimp only
+                  cases readProjectedValue s.frame.locals rootVal _ <;> trivial
+          | tailCall func argOps =>
+            dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
+            cases resolveCallTarget s func (length argOps) _ _ with
+            | ub => trivial
+            | unsupported => trivial
+            | ok target localsAfterFunc =>
+              dsimp only
+              cases evalOperands localsAfterFunc argOps _ _ _ _ with
+              | ub => trivial
+              | unsupported => trivial
+              | ok argVals _ =>
+                dsimp only
+                cases lookupCallee _ _ _ _ _ with
+                | some calleeBody =>
+                  dsimp only
+                  cases checkCalleeTargetCompatible target calleeBody (length argVals) <;> trivial
+                | none => exact extCallAbortsProp_extCall_tail _
+          | assert cond expected _ unwind =>
+            dsimp only [evalTerminator]
+            cases evalOperand s.frame.locals cond s.memory.borrows
+                s.memory.globals _ s.memory.callerLocals with
+            | ub => trivial
+            | unsupported => trivial
+            | ok v locals' =>
+              cases v with
+              | scalar sc =>
+                cases expected with
+                | false =>
+                  dsimp only
+                  cases Nat.beq sc.bits 0 with
+                  | true => trivial
+                  | false =>
+                    dsimp only
+                    cases applyUnwindAction s locals' s.memory unwind <;> trivial
+                | true =>
+                  dsimp only
+                  cases Nat.beq sc.bits 1 with
+                  | true => trivial
+                  | false =>
+                    dsimp only
+                    cases applyUnwindAction s locals' s.memory unwind <;> trivial
+              | _ => trivial
+          | inlineAsm _ _ _ => trivial
         · simp only [h_len]; trivial
 
 /--
@@ -6076,13 +6802,8 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
               evalStmt_pushBaseStack body [] ms stmt curBody.localDecls curBody.layouts
             cases h_ev : evalStmt ms stmt curBody.localDecls curBody.layouts with
             | ret out =>
-              exfalso
-              rcases stmt with ⟨sk, _⟩
-              cases sk <;>
-                (try cases ‹NonDivergingIntrinsic›) <;>
-                dsimp only [evalStmt, evalCopyNonOverlapping,
-                  evalCopyNonOverlappingWithCount, evalCopySingleDirect] at h_ev <;>
-                repeat' (first | cases h_ev | split at h_ev)
+              rcases evalStmt_isStmtNode ms stmt curBody.localDecls curBody.layouts with
+                ⟨_, h_sh⟩ | ⟨_, h_sh⟩ | h_sh <;> rw [h_sh] at h_ev <;> cases h_ev
             | tau st1 =>
               rw [h_ev] at h_st h_es
               dsimp only [MirStepNode.pushBaseStack, evalNodeNoCallWP] at h_st h_es
@@ -6298,20 +7019,19 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                         rw [h_eq_tc]
                         exact ih h_st
               | call func argOps cDest cTarget cUnw =>
-                simp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
-                  resolveCallTarget_pushBaseStack,
-                  MachineState.pushBaseStack_memory, Memory.pushBaseStack_borrows,
-                  Memory.pushBaseStack_globals, Memory.pushBaseStack_callees,
-                  Memory.pushBaseStack_traitImpls,
-                  Memory.pushBaseStack_callerLocals] at h_st h_step_body
-                cases h_rt : resolveCallTarget ms func (length argOps) curBody.localDecls curBody.layouts with
-                | ub => rw [h_rt] at h_st; exact False.elim h_st
-                | unsupported => rw [h_rt] at h_st; exact False.elim h_st
-                | ok target locsF =>
-                  rw [h_rt] at h_st h_step_body
-                  dsimp only at h_st h_step_body
-                  cases cTarget with
-                  | none =>
+                cases cTarget with
+                | none =>
+                  simp only [evalTerminator, bodyLocalDeclsOf,
+                    resolveCallTarget_pushBaseStack,
+                    MachineState.pushBaseStack_memory, Memory.pushBaseStack_borrows,
+                    Memory.pushBaseStack_globals, Memory.pushBaseStack_callees,
+                    Memory.pushBaseStack_traitImpls,
+                    Memory.pushBaseStack_callerLocals] at h_st h_step_body
+                  cases h_rt : resolveCallTarget ms func (length argOps) curBody.localDecls curBody.layouts with
+                  | ub => rw [h_rt] at h_st; exact False.elim h_st
+                  | unsupported => rw [h_rt] at h_st; exact False.elim h_st
+                  | ok target locsF =>
+                    rw [h_rt] at h_st h_step_body
                     dsimp only at h_st h_step_body
                     cases h_ops : evalOperands locsF argOps ms.memory.borrows ms.memory.globals curBody.layouts ms.memory.callerLocals with
                     | ub => rw [h_ops] at h_st; exact False.elim h_st
@@ -6373,7 +7093,18 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                                   rw [h_a] at h_st h_au
                                   rw [h_step_body, h_au]
                                   exact ih h_st
-                  | some cTargetBb =>
+                | some cTargetBb =>
+                  simp only [evalTerminator, bodyLocalDeclsOf,
+                    resolveCallTarget_pushBaseStack,
+                    MachineState.pushBaseStack_memory, Memory.pushBaseStack_borrows,
+                    Memory.pushBaseStack_globals, Memory.pushBaseStack_callees,
+                    Memory.pushBaseStack_traitImpls,
+                    Memory.pushBaseStack_callerLocals] at h_st h_step_body
+                  cases h_rt : resolveCallTarget ms func (length argOps) curBody.localDecls curBody.layouts with
+                  | ub => rw [h_rt] at h_st; exact False.elim h_st
+                  | unsupported => rw [h_rt] at h_st; exact False.elim h_st
+                  | ok target locsF =>
+                    rw [h_rt] at h_st h_step_body
                     dsimp only at h_st h_step_body
                     cases h_ops : evalOperands locsF argOps ms.memory.borrows ms.memory.globals curBody.layouts ms.memory.callerLocals with
                     | ub => rw [h_ops] at h_st; exact False.elim h_st
@@ -6401,7 +7132,29 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                         rw [h_lk] at h_st h_step_body
                         dsimp only at h_st h_step_body
                         cases h_ed : isDirectExactDivTarget target with
-                        | false => rw [h_ed] at h_st; exact False.elim h_st
+                        | false =>
+                          rw [h_ed] at h_st h_step_body
+                          dsimp only at h_st h_step_body
+                          cases h_ind : target.isIndirect with
+                          | true => rw [h_ind] at h_st; exact False.elim h_st
+                          | false =>
+                            rw [h_ind] at h_st h_step_body
+                            dsimp only at h_st h_step_body
+                            cases h_di :
+                              evalDirectRustIntrinsic? ms (some curBody) target
+                                curBody.localDecls curBody.layouts argOps avs
+                                cLocals' cDest cTargetBb cUnw with
+                            | none => rw [h_di] at h_st; exact False.elim h_st
+                            | some stepNode =>
+                              rw [h_di] at h_st
+                              dsimp only at h_st
+                              rcases evalDirectRustIntrinsic?_pushBaseStack_of_noCallWP
+                                  body [] ms curBody target argOps avs cLocals'
+                                  cDest cTargetBb cUnw stepNode h_di h_st with
+                                ⟨nextSt, rfl, h_m2⟩
+                              rw [h_m2] at h_step_body
+                              rw [h_step_body]
+                              exact ih h_st
                         | true =>
                           rw [h_ed] at h_st h_step_body
                           dsimp only at h_st h_step_body
@@ -6417,56 +7170,26 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                               | cons _ _ => exact False.elim h_st
                               | nil =>
                                 rename_i lhsSc rhsSc
-                                have h_ed_branch :
-                                    ∀ isSigned : Bool,
-                                      evalNodeNoCallWP
-                                        (fun st' => wpMirExecNoCallSym f' body st' (mirNormalPost P))
-                                        (mirNormalPost P)
-                                        (match evalExactDiv lhsSc rhsSc isSigned with
-                                         | some retSc =>
-                                           match writePlaceValue cLocals' ms.memory.borrows cDest (.scalar retSc) with
-                                           | .ok updL =>
-                                             MirStepNode.step
-                                               { ms with frame := { ms.frame with blockIdx := cTargetBb, stmtIdx := 0, locals := updL } }
-                                           | .ub => MirStepNode.fail .ub
-                                           | .unsupported => MirStepNode.unsupported
-                                         | none => MirStepNode.fail .ub) →
-                                      stepMirFn outerBody (MachineState.pushBaseStack body [] ms) =
-                                        (match evalExactDiv lhsSc rhsSc isSigned with
-                                         | some retSc =>
-                                           match writePlaceValue cLocals' ms.memory.borrows cDest (.scalar retSc) with
-                                           | .ok updL =>
-                                             MirStepNode.step
-                                               { frame := { blockIdx := cTargetBb, stmtIdx := 0, locals := updL }
-                                                 memory := Memory.pushBaseStack body [] ms.memory }
-                                           | .ub => MirStepNode.fail .ub
-                                           | .unsupported => MirStepNode.unsupported
-                                         | none => MirStepNode.fail .ub) →
-                                      evalNodeNoCallWP
-                                        (fun st' =>
-                                          wpMirExecNoCallSym f' outerBody st'
-                                            (mirNormalPost (fun retVal mem' => ∃ mem₀, mem' = Memory.pushBaseStack body [] mem₀ ∧ P retVal mem₀)))
-                                        (mirNormalPost (fun retVal mem' => ∃ mem₀, mem' = Memory.pushBaseStack body [] mem₀ ∧ P retVal mem₀))
-                                        (stepMirFn outerBody (MachineState.pushBaseStack body [] ms)) := by
-                                  intro isSigned h_st_d h_sb_d
+                                dsimp only at h_st h_step_body
+                                cases h_sig :
+                                  resolveIntrinsicIsSigned target curBody.localDecls
+                                    curBody.layouts argOps with
+                                | none => rw [h_sig] at h_st; exact False.elim h_st
+                                | some isSigned =>
+                                  rw [h_sig] at h_st h_step_body
+                                  dsimp only at h_st h_step_body
                                   cases h_div : evalExactDiv lhsSc rhsSc isSigned with
-                                  | none => rw [h_div] at h_st_d; exact False.elim h_st_d
+                                  | none => rw [h_div] at h_st; exact False.elim h_st
                                   | some retSc =>
-                                    rw [h_div] at h_st_d h_sb_d
-                                    dsimp only at h_st_d h_sb_d
+                                    rw [h_div] at h_st h_step_body
+                                    dsimp only at h_st h_step_body
                                     cases h_wr : writePlaceValue cLocals' ms.memory.borrows cDest (.scalar retSc) with
-                                    | ub => rw [h_wr] at h_st_d; exact False.elim h_st_d
-                                    | unsupported => rw [h_wr] at h_st_d; exact False.elim h_st_d
+                                    | ub => rw [h_wr] at h_st; exact False.elim h_st
+                                    | unsupported => rw [h_wr] at h_st; exact False.elim h_st
                                     | ok updL =>
-                                      rw [h_wr] at h_st_d h_sb_d
-                                      rw [h_sb_d]
-                                      exact ih h_st_d
-                                cases argOps with
-                                | nil => exact h_ed_branch false h_st h_step_body
-                                | cons lhsOp _ =>
-                                  exact h_ed_branch
-                                    (operandIsSigned curBody.localDecls lhsOp curBody.layouts)
-                                    h_st h_step_body
+                                      rw [h_wr] at h_st h_step_body
+                                      rw [h_step_body]
+                                      exact ih h_st
               | return_ =>
                 simp only [evalTerminator, MachineState.pushBaseStack_frame,
                   MachineState.pushBaseStack_memory, Memory.pushBaseStack_callStack,
@@ -7819,10 +8542,9 @@ theorem PureMirConvergesWithCallees.call_exact_div
         resolvedTarget.defPath resolvedTarget.typeArgs traitImpls = none)
     (h_exact : isDirectExactDivTarget resolvedTarget = true)
     (h_div :
-      evalExactDiv lhsSc rhsSc
-        (match argOps with
-         | lhsOp :: _ => operandIsSigned body.localDecls lhsOp body.layouts
-         | [] => false) = some retSc)
+      (match resolveIntrinsicIsSigned resolvedTarget body.localDecls body.layouts argOps with
+       | some isSigned => evalExactDiv lhsSc rhsSc isSigned
+       | none => none) = some retSc)
     (h_wr : writePurePlaceValue envAfterArgs destination (.scalar retSc) = .ok updatedEnv)
     (h_after :
       PureMirConvergesWithCallees body callees
@@ -7851,7 +8573,7 @@ theorem PureMirConvergesWithCallees.call_exact_div
     dsimp only [PureState.toMachineState] at h_resolve
     unfold evalPureOperands at h_args
     unfold writePurePlaceValue at h_wr
-    dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
+    dsimp only [evalTerminator, bodyLocalDeclsOf,
       pureCalleeMemory_borrows, pureCalleeMemory_globals,
       pureCalleeMemory_callerLocals, pureCalleeMemory_callees,
       pureCalleeMemory_traitImpls]
@@ -7863,8 +8585,17 @@ theorem PureMirConvergesWithCallees.call_exact_div
     dsimp only
     rw [h_exact]
     dsimp only
-    cases argOps <;>
-      (dsimp only at h_div ⊢; rw [h_div]; dsimp only; rw [h_wr]; exact ⟨rfl, h_after⟩)
+    generalize h_sig :
+      resolveIntrinsicIsSigned resolvedTarget body.localDecls body.layouts argOps =
+        sigOpt at h_div ⊢
+    cases sigOpt with
+    | none => nomatch h_div
+    | some isSigned =>
+      dsimp only at h_div ⊢
+      rw [h_div]
+      dsimp only
+      rw [h_wr]
+      exact ⟨rfl, h_after⟩
 
 /--
 1-step root `.return_` terminator rule for `PureMirConvergesWithCallees` over
@@ -8884,6 +9615,142 @@ private theorem evalStmt_preserves_pureCalleeMachineInv
       | running s' => exact h_inv
     · exact False.elim (h_no_ext c k h_emp)
 
+private def evalCallTerminatorUnified
+    (s : MachineState)
+    (func : Operand)
+    (argOps : List Operand)
+    (destination : Place)
+    (targetOpt : Option BasicBlockIdx)
+    (unwind : UnwindAction)
+    (currentBody : Option CapturedMir) :
+    MirStepNode :=
+  let bodyLocalDecls := bodyLocalDeclsOf currentBody
+  let bodyLayouts : LayoutTable :=
+    match currentBody with
+    | .some b => b.layouts
+    | .none => emptyLayoutTable
+  match resolveCallTarget s func (length argOps) bodyLocalDecls bodyLayouts with
+  | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
+  | .ok target localsAfterFunc =>
+    match
+      evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+        bodyLayouts s.memory.callerLocals
+    with
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported
+    | .ok argVals locals' =>
+      match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
+      | .some calleeBody =>
+        match targetOpt with
+        | .some targetBb =>
+          match checkCalleeTargetCompatible target calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushCalleeFrame s callerBody locals' destination targetBb calleeBody argVals unwind)
+        | .none =>
+          match checkCalleeTargetCompatible target calleeBody (length argVals) with
+          | false => MirStepNode.fail .ub
+          | true =>
+            match currentBody with
+            | .none => MirStepNode.unsupported
+            | .some callerBody =>
+              MirStepNode.step
+                (pushDivergingCalleeFrame s callerBody locals' destination unwind calleeBody argVals)
+      | .none =>
+        match targetOpt with
+        | .some targetBb =>
+          match isDirectExactDivTarget target with
+          | true =>
+            match argVals with
+            | .scalar lhs :: .scalar rhs :: .nil =>
+              match resolveIntrinsicIsSigned target bodyLocalDecls bodyLayouts argOps with
+              | .none => MirStepNode.unsupported
+              | .some isSigned =>
+                match evalExactDiv lhs rhs isSigned with
+                | .some retScalar =>
+                  match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
+                  | .ok updatedLocals =>
+                    MirStepNode.step {
+                      frame := {
+                        s.frame with
+                        blockIdx := targetBb
+                        stmtIdx := 0
+                        locals := updatedLocals
+                      }
+                      memory := s.memory
+                    }
+                  | .ub => MirStepNode.fail .ub
+                  | .unsupported => MirStepNode.unsupported
+                | .none => MirStepNode.fail .ub
+            | _ => MirStepNode.fail .ub
+          | false =>
+            match target.isIndirect with
+            | true =>
+              MirStepNode.extCall
+                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                (resumeExternalCall s locals' destination targetBb unwind)
+            | false =>
+              match
+                evalDirectRustIntrinsic? s currentBody target bodyLocalDecls
+                  bodyLayouts argOps argVals locals' destination targetBb unwind
+              with
+              | .some stepNode => stepNode
+              | .none =>
+                MirStepNode.extCall
+                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                  (resumeExternalCall s locals' destination targetBb unwind)
+        | .none =>
+          match target.isIndirect with
+          | false =>
+            match isUnreachableCallTarget target.defPath with
+            | true => MirStepNode.fail .ub
+            | false =>
+              match isAbortingPanicDefPath target.defPath with
+              | true => MirStepNode.retOutcome .abort
+              | false =>
+                match isUnwindingPanicDefPath target.defPath with
+                | true =>
+                  match applyUnwindAction s locals' s.memory unwind with
+                  | .running nextState => MirStepNode.step nextState
+                  | .halted out => MirStepNode.retOutcome out
+                  | .faulted fk => MirStepNode.fail fk
+                | false =>
+                  MirStepNode.extCall
+                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+                    (resumeExternalDivergingCall s locals' unwind)
+          | true =>
+            MirStepNode.extCall
+              { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
+              (resumeExternalDivergingCall s locals' unwind)
+
+private theorem evalTerminator_call_eq_unified
+    (s : MachineState) (func : Operand) (argOps : List Operand)
+    (destination : Place) (targetOpt : Option BasicBlockIdx)
+    (unwind : UnwindAction) (sp : String) (currentBody : Option CapturedMir) :
+    evalTerminator s { kind := .call func argOps destination targetOpt unwind, span := sp } currentBody =
+      evalCallTerminatorUnified s func argOps destination targetOpt unwind currentBody := by
+  cases targetOpt <;>
+    (dsimp only [evalTerminator, evalCallTerminatorUnified];
+     cases resolveCallTarget s func (length argOps) (bodyLocalDeclsOf currentBody)
+         (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable) with
+     | ub => rfl
+     | unsupported => rfl
+     | ok target localsAfterFunc =>
+       cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+           (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
+           s.memory.callerLocals with
+       | ub => rfl
+       | unsupported => rfl
+       | ok argVals locals' =>
+         cases lookupCallee s.memory.callees
+             (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
+             target.defPath target.typeArgs s.memory.traitImpls <;> rfl)
+
 /--
 Core one-step lockstep theorem for `checkPureMirWithCallees`:
 under `PureCalleeMachineInv callees traitImpls body s` and a caller memory
@@ -8907,13 +9774,14 @@ private theorem stepMirFn_pureCallee_step_and_replaceRoot
   rcases h_inv with ⟨h_bor, h_glob, h_cloc, h_ap, h_cal, h_tr, h_act, h_stack⟩
   have h_inv_full : PureCalleeMachineInv callees traitImpls body s :=
     ⟨h_bor, h_glob, h_cloc, h_ap, h_cal, h_tr, h_act, h_stack⟩
-  unfold stepMirFn
+  rw [stepMirFn_eq_ite, stepMirFn_eq_ite]
   dsimp only [MachineState.replaceRoot, Memory.replaceRoot]
-  cases h_ph : (s.memory.activeCallee.getD body).phase with
-  | other _ =>
+  cases isOtherPhase (s.memory.activeCallee.getD body).phase with
+  | true =>
+    simp only [ite_true]
     exact ⟨trivial, rfl⟩
-  | _ =>
-    dsimp only
+  | false =>
+    simp only [Bool.false_eq_true, ite_false]
     cases h_bb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx with
     | none => exact ⟨trivial, rfl⟩
     | some bb =>
@@ -9139,7 +10007,8 @@ private theorem stepMirFn_pureCallee_step_and_replaceRoot
                 rcases dt with ⟨defPath, typeArgs⟩
                 rw [h_def] at h_ext
                 dsimp only at h_ext
-                dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+                simp only [evalTerminator_call_eq_unified]
+                dsimp only [evalCallTerminatorUnified, bodyLocalDeclsOf]
                 have h_res_rep :=
                   resolveCallTarget_eq_of_extractPureCalleeTarget
                     ({ s with memory :=
@@ -9246,22 +10115,30 @@ private theorem stepMirFn_pureCallee_step_and_replaceRoot
                                 | cons _ _ => exact ⟨trivial, rfl⟩
                                 | nil =>
                                   dsimp only
-                                  cases evalExactDiv lhsSc rhsSc _ with
+                                  cases resolveIntrinsicIsSigned
+                                      { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+                                      (s.memory.activeCallee.getD body).localDecls
+                                      (s.memory.activeCallee.getD body).layouts
+                                      argOps with
                                   | none => exact ⟨trivial, rfl⟩
-                                  | some retSc =>
+                                  | some isSigned =>
                                     dsimp only
-                                    rw [h_mem_bor, h_bor]
-                                    cases writePlaceValue locals' [] destination
-                                        (.scalar retSc) with
-                                    | ub => exact ⟨trivial, rfl⟩
-                                    | unsupported => exact ⟨trivial, rfl⟩
-                                    | ok updLocals =>
-                                      refine ⟨h_inv_full, ?_⟩
-                                      dsimp only [MirStepNode.replaceRoot,
-                                        MirExecState.replaceRoot,
-                                        MachineState.replaceRoot,
-                                        Memory.replaceRoot, MirStepNode.step]
-                                      simp only [h_mem_bor, h_mem_cal, h_mem_tr]
+                                    cases evalExactDiv lhsSc rhsSc isSigned with
+                                    | none => exact ⟨trivial, rfl⟩
+                                    | some retSc =>
+                                      dsimp only
+                                      rw [h_mem_bor, h_bor]
+                                      cases writePlaceValue locals' [] destination
+                                          (.scalar retSc) with
+                                      | ub => exact ⟨trivial, rfl⟩
+                                      | unsupported => exact ⟨trivial, rfl⟩
+                                      | ok updLocals =>
+                                        refine ⟨h_inv_full, ?_⟩
+                                        dsimp only [MirStepNode.replaceRoot,
+                                          MirExecState.replaceRoot,
+                                          MachineState.replaceRoot,
+                                          Memory.replaceRoot, MirStepNode.step]
+                                        simp only [h_mem_bor, h_mem_cal, h_mem_tr]
                               | _ => exact ⟨trivial, rfl⟩
                           | _ => exact ⟨trivial, rfl⟩
                       | none =>
@@ -11605,7 +12482,8 @@ theorem PureMirModularConverges.step_stmt
     | assign dst rv =>
       simp only [isPureStatement, Bool.and_eq_true] at h_pure
       rcases h_pure with ⟨h_dst, h_rv⟩
-      unfold evalStmt at h_eval ⊢
+      rw [evalStmt_assign_eq] at h_eval
+      rw [evalStmt_assign_eq]
       dsimp only [PureState.toMachineState] at h_eval ⊢
       rw [evalRvalue_pure_eq_withMem ps.env rv m body.localDecls body.layouts h_rv]
       have h_emp := evalRvalue_pure_eq_withMem ps.env rv emptyMemory body.localDecls body.layouts h_rv
@@ -11621,6 +12499,7 @@ theorem PureMirModularConverges.step_stmt
         rcases dst with ⟨dstLoc, dstProj⟩
         cases dstProj with
         | nil =>
+          unfold evalAssignDst at h_eval ⊢
           dsimp only at h_eval ⊢
           cases h_g : get? l1 dstLoc with
           | none => rw [h_g] at h_eval; nomatch h_eval
@@ -11650,33 +12529,35 @@ theorem PureMirModularConverges.step_stmt
                 exact ⟨invalidateConflictingBorrows m.borrows dstLoc .none, rfl⟩
         | cons hd tl =>
           simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
-          cases hd <;> try exact False.elim (Bool.false_ne_true h_dst.1)
-          all_goals
-            dsimp only at h_eval ⊢
-            cases h_g : get? l1 dstLoc with
-            | none => rw [h_g] at h_eval; nomatch h_eval
-            | some sl =>
-              rw [h_g] at h_eval
-              cases sl with
-              | uninit => nomatch h_eval
-              | dead => nomatch h_eval
-              | init rootVal =>
+          have h_nd := ne_deref_of_isPureProjElem h_dst.1
+          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd] at h_eval
+          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd]
+          unfold evalAssignNonDeref at h_eval ⊢
+          dsimp only at h_eval ⊢
+          cases h_g : get? l1 dstLoc with
+          | none => rw [h_g] at h_eval; nomatch h_eval
+          | some sl =>
+            rw [h_g] at h_eval
+            cases sl with
+            | uninit => nomatch h_eval
+            | dead => nomatch h_eval
+            | init rootVal =>
+              dsimp only at h_eval ⊢
+              generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_eval ⊢
+              cases wpvRes with
+              | ub => nomatch h_eval
+              | unsupported => nomatch h_eval
+              | ok rootVal' =>
                 dsimp only at h_eval ⊢
-                generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_eval ⊢
-                cases wpvRes with
-                | ub => nomatch h_eval
-                | unsupported => nomatch h_eval
-                | ok rootVal' =>
-                  dsimp only at h_eval ⊢
-                  cases h_s : set? l1 dstLoc (.init rootVal') with
-                  | none => rw [h_s] at h_eval; nomatch h_eval
-                  | some l2 =>
-                    rw [h_s] at h_eval
-                    dsimp only [emptyMemory] at h_eval
-                    rw [h_ap]
-                    injection h_eval with h_se; injection h_se with h_eq
-                    subst h_eq
-                    exact ⟨invalidateConflictingBorrowsAtProj m.borrows dstLoc .none _, rfl⟩
+                cases h_s : set? l1 dstLoc (.init rootVal') with
+                | none => rw [h_s] at h_eval; nomatch h_eval
+                | some l2 =>
+                  rw [h_s] at h_eval
+                  dsimp only [emptyMemory] at h_eval
+                  rw [h_ap]
+                  injection h_eval with h_se; injection h_se with h_eq
+                  subst h_eq
+                  exact ⟨invalidateConflictingBorrowsAtProj m.borrows dstLoc .none _, rfl⟩
   rcases h_step_m with ⟨bs, h_eval_m⟩
   change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
   rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
@@ -11898,7 +12779,8 @@ theorem PureMirModularConverges.call_modular
         ∃ updatedEnv : List SlotState,
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
@@ -11930,8 +12812,7 @@ theorem PureMirModularConverges.call_modular
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
-        resolveCallTarget]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
       rw [h_def]
       dsimp only
       rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
@@ -11942,6 +12823,8 @@ theorem PureMirModularConverges.call_modular
       rw [hm.1, hm.2.1, h_lookup]
       dsimp only [isDirectExactDivTarget]
       rw [h_not_exact]
+      dsimp only [evalDirectRustIntrinsic?]
+      rw [h_not_intrinsic]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -12021,7 +12904,8 @@ theorem PureMirModularConverges.call_poly_external_spec
             (polyExternalSpecCallContract targetDefPath expectedTypeArgs
               sidecarBody extraPre extraPost)
             body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
     PureMirModularConverges
       (polyExternalSpecCallContract targetDefPath expectedTypeArgs
         sidecarBody extraPre extraPost)
@@ -12040,6 +12924,7 @@ theorem PureMirModularConverges.call_poly_external_spec
       · exact False.elim hp
       · rw [hp.1.2.1, hm.2.2.1])
     h_after
+    h_not_intrinsic
   rcases h_unwind with hu | hu | h_nu
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -12097,7 +12982,8 @@ theorem PureMirModularConverges.call_external_spec
           PureMirModularConverges
             (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
             body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr') :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr')
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
     PureMirModularConverges
       (externalSpecCallContract targetDefPath sidecarBody extraPre extraPost)
       body callees ps post traitImpls := by
@@ -12131,8 +13017,7 @@ theorem PureMirModularConverges.call_external_spec
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
-        resolveCallTarget]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
       rw [h_def]
       dsimp only
       rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
@@ -12143,6 +13028,8 @@ theorem PureMirModularConverges.call_external_spec
       rw [hm.1, hm.2.1, h_lookup]
       dsimp only [isDirectExactDivTarget]
       rw [h_not_exact]
+      dsimp only [evalDirectRustIntrinsic?]
+      rw [h_not_intrinsic]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -12226,7 +13113,8 @@ theorem PureMirModularConverges.call_intrinsic
       PureMirModularConverges
         (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
         body callees
-        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
     PureMirModularConverges
       (pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
       body callees ps post traitImpls := by
@@ -12248,6 +13136,7 @@ theorem PureMirModularConverges.call_intrinsic
     (fun rv h_eq => by
       subst h_eq
       exact ⟨updatedEnv, h_wr, h_after⟩)
+    h_not_intrinsic
 
 /--
 1-step modular call rule parameterized by a subsumed sub-contract `subContract`
@@ -12329,7 +13218,8 @@ theorem PureMirModularConverges.call_modular_sub
         ∃ updatedEnv : List SlotState,
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   refine PureMirModularConverges.call_modular
     h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args h_lookup
@@ -12342,6 +13232,7 @@ theorem PureMirModularConverges.call_modular_sub
     (fun m panicMem hm hp =>
       h_panic_stack m panicMem hm ((h_sub _ (h_contract_pre m hm)).2 _ hp))
     h_after
+    h_not_intrinsic
   rcases h_contract_panic with hu | hu | h_np
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -12402,7 +13293,8 @@ theorem PureMirModularConverges.call_poly_external_spec_sub
         ∃ updatedEnv : List SlotState,
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   refine PureMirModularConverges.call_modular_sub h_sub
     h_phase h_bb h_end h_term h_dst_pure h_args_pure h_def h_args
@@ -12418,6 +13310,7 @@ theorem PureMirModularConverges.call_poly_external_spec_sub
       · exact False.elim hp
       · rw [hp.1.2.1, hm.2.2.1])
     h_after
+    h_not_intrinsic
   rcases h_unwind with hu | hu | h_nu
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -12478,7 +13371,8 @@ theorem PureMirModularConverges.call_external_spec_sub
         ∃ updatedEnv : List SlotState,
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr') :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post tr')
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
@@ -12510,8 +13404,7 @@ theorem PureMirModularConverges.call_external_spec_sub
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
-        resolveCallTarget]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
       rw [h_def]
       dsimp only
       rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
@@ -12522,6 +13415,8 @@ theorem PureMirModularConverges.call_external_spec_sub
       rw [hm.1, hm.2.1, h_lookup]
       dsimp only [isDirectExactDivTarget]
       rw [h_not_exact]
+      dsimp only [evalDirectRustIntrinsic?]
+      rw [h_not_intrinsic]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -12570,7 +13465,8 @@ theorem PureMirModularConverges.call_external_spec_sub
 /--
 Subsumption-aware 1-step pure `CallConv.rustIntrinsic` call rule inside modular
 callers (`PureMirModularConverges.call_intrinsic_sub`), usable directly under
-`combineMirCallContracts` via `MirCallContract.Subsumes`.
+`combineMirCallContracts` via `MirCallContract.Subsumes` for external intrinsic
+aliases (`classifyRustIntrinsic? defPath = none`, e.g. `std::intrinsics::*`).
 -/
 theorem PureMirModularConverges.call_intrinsic_sub
     {contract : MirCallContract}
@@ -12617,7 +13513,8 @@ theorem PureMirModularConverges.call_intrinsic_sub
     (h_wr : writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv)
     (h_after :
       PureMirModularConverges contract body callees
-        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   refine PureMirModularConverges.call_modular_sub
     (calleePost := (· = retVal))
@@ -12637,6 +13534,243 @@ theorem PureMirModularConverges.call_intrinsic_sub
     (fun rv h_eq => by
       subst h_eq
       exact ⟨updatedEnv, h_wr, h_after⟩)
+    h_not_intrinsic
+
+private theorem bswapLoop_eq_pureBswapLoop (n b a : Nat) :
+    bswapLoop n b a = pureBswapLoop n b a := by
+  induction n generalizing b a with
+  | zero => rfl
+  | succ n ih =>
+    dsimp only [bswapLoop, pureBswapLoop]
+    exact ih _ _
+
+private theorem ctpopLoop_eq_pureCtpopLoop (n b : Nat) :
+    ctpopLoop n b = pureCtpopLoop n b := by
+  induction n generalizing b with
+  | zero => rfl
+  | succ n ih =>
+    dsimp only [ctpopLoop, pureCtpopLoop]
+    rw [ih]
+
+private theorem wrapScalarBits_u32_of_lt {v : Nat} (hv : v < 4294967296) :
+    wrapScalarBits v (scalarModulus 4) = v := by
+  have hm : scalarModulus 4 = 4294967296 := rfl
+  rw [hm]
+  unfold wrapScalarBits
+  cases h : Nat.ble 4294967296 v with
+  | false => rfl
+  | true =>
+    have hle := Nat.le_of_ble_eq_true h
+    omega
+
+private theorem evalBswap_u32_eq {v : Nat} (hv : v < 4294967296) :
+    evalBswap ⟨v, 4⟩ = some ⟨pureBswapLoop 4 v 0, 4⟩ := by
+  unfold evalBswap
+  dsimp only
+  rw [wrapScalarBits_u32_of_lt hv, bswapLoop_eq_pureBswapLoop]
+
+private theorem evalCtpop_u32_eq {v : Nat} (hv : v < 4294967296) :
+    evalCtpop ⟨v, 4⟩ = some ⟨pureCtpopLoop 32 v, 4⟩ := by
+  unfold evalCtpop
+  dsimp only
+  rw [wrapScalarBits_u32_of_lt hv, ctpopLoop_eq_pureCtpopLoop]
+  rfl
+
+private theorem evalDirectRustIntrinsic_bswap_u32
+    (s : MachineState) (curBody : Option CapturedMir)
+    (typeArgs : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (locals' : List SlotState)
+    (dst : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {v : Nat} (hv : v < 4294967296) :
+    evalDirectRustIntrinsic? s curBody
+      { defPath := "core::intrinsics::bswap", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+      decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
+    some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureBswapLoop 4 v 0, 4⟩)) := by
+  change some (writeIntrinsicScalarResult s locals' dst targetBb (evalBswap ⟨v, 4⟩)) = _
+  rw [evalBswap_u32_eq hv]
+
+private theorem evalDirectRustIntrinsic_ctpop_u32
+    (s : MachineState) (curBody : Option CapturedMir)
+    (typeArgs : List RigidTy) (decls : List LocalDecl) (layouts : LayoutTable)
+    (argOps : List Operand) (locals' : List SlotState)
+    (dst : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {v : Nat} (hv : v < 4294967296) :
+    evalDirectRustIntrinsic? s curBody
+      { defPath := "core::intrinsics::ctpop", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+      decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
+    some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureCtpopLoop 32 v, 4⟩)) := by
+  change some (writeIntrinsicScalarResult s locals' dst targetBb (evalCtpop ⟨v, 4⟩)) = _
+  rw [evalCtpop_u32_eq hv]
+
+private theorem evalDirectRustIntrinsic_constEvalSelect_ctpop_u32
+    (s : MachineState) (curBody : Option CapturedMir)
+    (decls : List LocalDecl) (layouts : LayoutTable)
+    (op0 op1 rtOp : Operand) (locals' : List SlotState)
+    (dst : Place) (targetBb : BasicBlockIdx) (unwind : UnwindAction)
+    {sc : ScalarInt}
+    (h_rt_def : extractCalleeDefPath? rtOp = some "core::intrinsics::ctpop")
+    (h_rt_targs : extractCalleeTypeArgs rtOp = [.uint .u32])
+    (h_rt_lk :
+      lookupCallee s.memory.callees layouts "core::intrinsics::ctpop"
+        [.uint .u32] s.memory.traitImpls = none)
+    (h_sz : sc.sizeBytes = 4)
+    (h_lt : sc.bits < 4294967296) :
+    evalDirectRustIntrinsic? s curBody
+      { defPath := "core::intrinsics::const_eval_select"
+        typeArgs := [
+          .tuple [.uint .u32],
+          .fnDef "core::intrinsics::ctpop" [.uint .u32],
+          .fnDef "core::intrinsics::ctpop" [.uint .u32],
+          .uint .u32
+        ]
+        fnSig := .none
+        isIndirect := false }
+      decls layouts [op0, op1, rtOp] [.aggregate 0 [.scalar sc], .unit, .unit]
+      locals' dst targetBb unwind =
+    some (writeIntrinsicReturn s locals' dst targetBb
+      (.scalar ⟨pureCtpopLoop 32 sc.bits, 4⟩)) := by
+  rcases sc with ⟨v, sz⟩
+  dsimp only at h_sz h_lt ⊢
+  subst h_sz
+  have hc_sel : classifyRustIntrinsic? "core::intrinsics::const_eval_select" = some .constEvalSelect := rfl
+  have hc_pop : classifyRustIntrinsic? "core::intrinsics::ctpop" = some .ctpop := rfl
+  have h_unp :
+      unpackConstEvalSelectArgs? (.aggregate 0 [.scalar ⟨v, 4⟩]) (some (.tuple [.uint .u32])) =
+        some [.scalar ⟨v, 4⟩] := rfl
+  have h_res :
+      resolveConstEvalSelectTarget? s
+        { defPath := "core::intrinsics::const_eval_select"
+          typeArgs := [
+            .tuple [.uint .u32],
+            .fnDef "core::intrinsics::ctpop" [.uint .u32],
+            .fnDef "core::intrinsics::ctpop" [.uint .u32],
+            .uint .u32
+          ]
+          fnSig := .none
+          isIndirect := false }
+        decls layouts (some rtOp) .unit 1 =
+      some { defPath := "core::intrinsics::ctpop"
+             typeArgs := [.uint .u32]
+             fnSig := .none
+             isIndirect := false } := by
+    unfold resolveConstEvalSelectTarget?
+    dsimp only
+    rw [h_rt_def, h_rt_targs]
+  unfold evalDirectRustIntrinsic?
+  dsimp only
+  rw [hc_sel]
+  dsimp only
+  rw [h_unp]
+  dsimp only [length]
+  rw [h_res]
+  dsimp only
+  rw [h_rt_lk]
+  dsimp only [isDirectExactDivTarget]
+  have h_ne : stringEq "core::intrinsics::ctpop" "core::intrinsics::exact_div" = false := rfl
+  rw [h_ne]
+  dsimp only
+  rw [hc_pop]
+  change some (writeIntrinsicScalarResult s locals' dst targetBb (evalCtpop ⟨v, 4⟩)) = _
+  rw [evalCtpop_u32_eq h_lt]
+
+/--
+1-step inline `CallConv.rustIntrinsic` `.call` rule for `PureMirModularConverges`
+when `evalDirectRustIntrinsic?` evaluates inline to `writeIntrinsicReturn`
+(covering all 22 inline scalar/layout intrinsics as well as `const_eval_select`
+dispatching to an unlinked inline intrinsic, for any modular `contract`).
+-/
+theorem PureMirModularConverges.call_inline_intrinsic
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs updatedEnv : List SlotState}
+    {argVals : List Value}
+    {retVal : Value}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_args : evalPureOperands ps.env argOps body.layouts = .ok argVals envAfterArgs)
+    (h_lookup :
+      lookupCallee callees body.layouts defPath
+        (extractCalleeTypeArgs func) traitImpls = none)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_eval :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        evalDirectRustIntrinsic? (ps.toMachineState m) (some body)
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            fnSig := .none
+            isIndirect := false }
+          body.localDecls body.layouts argOps argVals envAfterArgs
+          destination targetBb unwind =
+          some (writeIntrinsicReturn (ps.toMachineState m) envAfterArgs
+            destination targetBb retVal))
+    (h_wr : writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv)
+    (h_after :
+      PureMirModularConverges contract body callees
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  intro m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.step
+          (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState m) := by
+    have h_ev := h_eval m hm
+    dsimp only [PureState.toMachineState] at h_ev
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_not_exact]
+      dsimp only
+      rw [h_ev]
+      dsimp only [writeIntrinsicReturn]
+      rw [writePlaceValue_pure_eq envAfterArgs m.borrows destination retVal h_dst_pure]
+      unfold writePurePlaceValue at h_wr
+      rw [h_wr]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  exact h_after m hm
 
 private def SameCallFrameAndTraits (m₁ m₂ : Memory) : Prop :=
   m₂.callees = m₁.callees ∧
@@ -12743,16 +13877,16 @@ private theorem sameExceptBorrows_step_noCall
         have h_inv_full : PureCalleeMachineInv callees traitImpls body s₁ :=
           ⟨h_bor, h_glob, h_cloc, h_ap, h_cal, h_tr, h_act, h_stack⟩
         dsimp only [stepMirState] at h_wp ⊢
-        unfold stepMirFn at h_wp ⊢
+        rw [stepMirFn_eq_ite] at h_wp
+        rw [stepMirFn_eq_ite]
         dsimp only at h_wp ⊢
         rw [mf_ac, h_fr]
-        cases h_ph : (s₁.memory.activeCallee.getD body).phase with
-        | other _ =>
-          rw [h_ph] at h_wp
+        cases h_ph : isOtherPhase (s₁.memory.activeCallee.getD body).phase with
+        | true =>
+          simp only [h_ph, ite_true] at h_wp
           exact False.elim h_wp
-        | _ =>
-          rw [h_ph] at h_wp
-          dsimp only at h_wp ⊢
+        | false =>
+          simp only [h_ph, Bool.false_eq_true, ite_false] at h_wp ⊢
           cases h_bb : get? (s₁.memory.activeCallee.getD body).basicBlocks s₁.frame.blockIdx with
           | none =>
             rw [h_bb] at h_wp
@@ -12964,7 +14098,8 @@ private theorem sameExceptBorrows_step_noCall
               | assign dst rv =>
                 simp only [isPureStatement, Bool.and_eq_true] at h_s
                 rcases h_s with ⟨h_dst, h_rv⟩
-                dsimp only [evalStmt] at h_wp h_inv_next ⊢
+                rw [evalStmt_assign_eq] at h_wp h_inv_next
+                rw [evalStmt_assign_eq]
                 rw [h_fr]
                 rw [evalRvalue_pure_eq_withMem s₁.frame.locals rv s₂.memory
                   (s₁.memory.activeCallee.getD body).localDecls
@@ -12983,6 +14118,7 @@ private theorem sameExceptBorrows_step_noCall
                   rcases dst with ⟨dstLoc, dstProj⟩
                   cases dstProj with
                   | nil =>
+                    unfold evalAssignDst at h_wp h_inv_next ⊢
                     dsimp only at h_wp h_inv_next ⊢
                     cases h_g : get? l1 dstLoc with
                     | none => rw [h_g] at h_wp; exact False.elim h_wp
@@ -13014,34 +14150,36 @@ private theorem sameExceptBorrows_step_noCall
                             ⟨h_adv_m _ _ _, ⟨mf_cal, mf_tr, mf_cs, mf_ac, rfl⟩⟩ h_wp
                   | cons hd tl =>
                     simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
-                    cases hd <;> try exact False.elim (Bool.false_ne_true h_dst.1)
-                    all_goals
-                      dsimp only at h_wp h_inv_next ⊢
-                      cases h_g : get? l1 dstLoc with
-                      | none => rw [h_g] at h_wp; exact False.elim h_wp
-                      | some sl =>
-                        rw [h_g] at h_wp h_inv_next
-                        cases sl with
-                        | uninit => exact False.elim h_wp
-                        | dead => exact False.elim h_wp
-                        | init rootVal =>
+                    have h_nd := ne_deref_of_isPureProjElem h_dst.1
+                    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd] at h_wp h_inv_next
+                    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd]
+                    unfold evalAssignNonDeref at h_wp h_inv_next ⊢
+                    dsimp only at h_wp h_inv_next ⊢
+                    cases h_g : get? l1 dstLoc with
+                    | none => rw [h_g] at h_wp; exact False.elim h_wp
+                    | some sl =>
+                      rw [h_g] at h_wp h_inv_next
+                      cases sl with
+                      | uninit => exact False.elim h_wp
+                      | dead => exact False.elim h_wp
+                      | init rootVal =>
+                        dsimp only at h_wp h_inv_next ⊢
+                        generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_wp h_inv_next ⊢
+                        cases wpvRes with
+                        | ub => exact False.elim h_wp
+                        | unsupported => exact False.elim h_wp
+                        | ok rootVal' =>
                           dsimp only at h_wp h_inv_next ⊢
-                          generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_wp h_inv_next ⊢
-                          cases wpvRes with
-                          | ub => exact False.elim h_wp
-                          | unsupported => exact False.elim h_wp
-                          | ok rootVal' =>
+                          cases h_set : set? l1 dstLoc (.init rootVal') with
+                          | none => rw [h_set] at h_wp; exact False.elim h_wp
+                          | some l2 =>
+                            rw [h_set] at h_wp h_inv_next
                             dsimp only at h_wp h_inv_next ⊢
-                            cases h_set : set? l1 dstLoc (.init rootVal') with
-                            | none => rw [h_set] at h_wp; exact False.elim h_wp
-                            | some l2 =>
-                              rw [h_set] at h_wp h_inv_next
-                              dsimp only at h_wp h_inv_next ⊢
-                              rw [h_ap] at h_wp h_inv_next
-                              rw [mf_ap, h_ap]
-                              exact ih_run ⟨h_inv_next, by
-                                rw [h_bor]; exact h_dst_stk⟩
-                                ⟨h_adv_m _ _ _, ⟨mf_cal, mf_tr, mf_cs, mf_ac, rfl⟩⟩ h_wp
+                            rw [h_ap] at h_wp h_inv_next
+                            rw [mf_ap, h_ap]
+                            exact ih_run ⟨h_inv_next, by
+                              rw [h_bor]; exact h_dst_stk⟩
+                              ⟨h_adv_m _ _ _, ⟨mf_cal, mf_tr, mf_cs, mf_ac, rfl⟩⟩ h_wp
             | none =>
               rw [h_stmt] at h_wp
               dsimp only at h_wp ⊢
@@ -13053,10 +14191,9 @@ private theorem sameExceptBorrows_step_noCall
                   stepMirFn_pureCallee_step_and_replaceRoot
                     (mem₀ := pureCalleeMemory callees traitImpls)
                     h_inv_full rfl rfl rfl
-                unfold stepMirFn at h_step_inv
+                rw [stepMirFn_eq_ite] at h_step_inv
                 dsimp only at h_step_inv
-                rw [h_ph] at h_step_inv
-                dsimp only at h_step_inv
+                simp only [h_ph, Bool.false_eq_true, ite_false] at h_step_inv
                 rw [h_bb] at h_step_inv
                 dsimp only at h_step_inv
                 rw [h_stmt] at h_step_inv
@@ -13331,7 +14468,8 @@ private theorem sameExceptBorrows_step_noCall
                       rcases dt with ⟨defPath, typeArgs⟩
                       rw [h_def] at h_ext
                       dsimp only at h_ext
-                      dsimp only [evalTerminator, evalCallTerminator,
+                      simp only [evalTerminator_call_eq_unified] at h_wp h_step_inv ⊢
+                      dsimp only [evalCallTerminatorUnified,
                         bodyLocalDeclsOf] at h_wp h_step_inv ⊢
                       have h_res₂ :=
                         resolveCallTarget_eq_of_extractPureCalleeTarget
@@ -13466,24 +14604,33 @@ private theorem sameExceptBorrows_step_noCall
                                       | cons _ _ => exact False.elim h_wp
                                       | nil =>
                                         dsimp only at h_wp h_step_inv ⊢
-                                        cases h_d : evalExactDiv lhsSc rhsSc _ with
-                                        | none => rw [h_d] at h_wp; exact False.elim h_wp
-                                        | some retSc =>
-                                          rw [h_d] at h_wp h_step_inv
+                                        cases h_sgn : resolveIntrinsicIsSigned
+                                            { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+                                            (s₁.memory.activeCallee.getD body).localDecls
+                                            (s₁.memory.activeCallee.getD body).layouts
+                                            argOps with
+                                        | none => rw [h_sgn] at h_wp; exact False.elim h_wp
+                                        | some isSigned =>
+                                          rw [h_sgn] at h_wp h_step_inv
                                           dsimp only at h_wp h_step_inv ⊢
-                                          rw [writePlaceValue_pure_eq locals'
-                                            s₂.memory.borrows destination
-                                            (.scalar retSc) h_dst]
-                                          rw [writePlaceValue_pure_eq locals'
-                                            s₁.memory.borrows destination
-                                            (.scalar retSc) h_dst] at h_wp h_step_inv
-                                          cases h_w : writePlaceValue locals' []
-                                              destination (.scalar retSc) with
-                                          | ub => rw [h_w] at h_wp; exact False.elim h_wp
-                                          | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
-                                          | ok updL =>
-                                            rw [h_w] at h_wp h_step_inv
-                                            exact ih_run ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq⟩ h_wp
+                                          cases h_d : evalExactDiv lhsSc rhsSc isSigned with
+                                          | none => rw [h_d] at h_wp; exact False.elim h_wp
+                                          | some retSc =>
+                                            rw [h_d] at h_wp h_step_inv
+                                            dsimp only at h_wp h_step_inv ⊢
+                                            rw [writePlaceValue_pure_eq locals'
+                                              s₂.memory.borrows destination
+                                              (.scalar retSc) h_dst]
+                                            rw [writePlaceValue_pure_eq locals'
+                                              s₁.memory.borrows destination
+                                              (.scalar retSc) h_dst] at h_wp h_step_inv
+                                            cases h_w : writePlaceValue locals' []
+                                                destination (.scalar retSc) with
+                                            | ub => rw [h_w] at h_wp; exact False.elim h_wp
+                                            | unsupported => rw [h_w] at h_wp; exact False.elim h_wp
+                                            | ok updL =>
+                                              rw [h_w] at h_wp h_step_inv
+                                              exact ih_run ⟨h_step_inv, h_dst_stk⟩ ⟨rfl, h_meq⟩ h_wp
                                     | _ => exact False.elim h_wp
                                 | _ => exact False.elim h_wp
                   | tailCall func argOps =>
@@ -14063,9 +15210,12 @@ theorem PureMirModularConverges.call_exact_div
     (h_lookup :
       lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
     (h_signed :
-      (match argOps with
-       | lhsOp :: _ => operandIsSigned body.localDecls lhsOp body.layouts
-       | [] => false) = isSigned := by rfl)
+      resolveIntrinsicIsSigned
+        { defPath := defPath
+          typeArgs := extractCalleeTypeArgs func
+          fnSig := .none
+          isIndirect := false }
+        body.localDecls body.layouts argOps = some isSigned := by rfl)
     (h_div : evalExactDiv lhs rhs isSigned = some retScalar)
     (h_wr :
       writePurePlaceValue envAfterArgs destination (.scalar retScalar) =
@@ -14075,55 +15225,52 @@ theorem PureMirModularConverges.call_exact_div
         { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
-  rcases argOps with _ | ⟨lhsOp, restOps⟩
-  · unfold evalPureOperands at h_args
-    nomatch h_args
-  · dsimp only at h_signed
-    have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
-      rw [h_end]; exact get?_length_eq_none bb.statements
-    have h_step_eq :
-        stepMirFn body (ps.toMachineState m) =
-          MirStepNode.step
-            (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState m) := by
-      unfold stepMirFn
-      dsimp only [PureState.toMachineState]
-      rw [ModularRootMemory.activeCallee_getD hm]
-      cases h_ph : body.phase with
-      | other tag => exact False.elim (h_phase tag h_ph)
-      | _ =>
-        rw [h_bb]
-        dsimp only
-        rw [h_stmt_none]
-        dsimp only
-        have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
-        simp only [h_beq, ite_true]
-        rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
-        dsimp only at h_term
-        rw [h_term]
-        dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
-          resolveCallTarget]
-        rw [h_def]
-        dsimp only
-        rw [evalOperands_pure_eq ps.env (lhsOp :: restOps) m.borrows m.globals body.layouts
-          m.callerLocals h_args_pure]
-        unfold evalPureOperands at h_args
-        rw [h_args]
-        dsimp only
-        rw [hm.1, hm.2.1, h_lookup]
-        dsimp only [isDirectExactDivTarget]
-        rw [h_exact_path]
-        dsimp only
-        rw [h_signed, h_div]
-        dsimp only
-        rw [writePlaceValue_pure_eq envAfterArgs m.borrows destination
-          (.scalar retScalar) h_dst_pure]
-        unfold writePurePlaceValue at h_wr
-        rw [h_wr]
-    change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
-    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
-    dsimp only [stepMirState]
-    rw [h_step_eq]
-    exact h_next m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.step
+          (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState m) := by
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals body.layouts
+        m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_exact_path]
+      dsimp only
+      rw [h_signed]
+      dsimp only
+      rw [h_div]
+      dsimp only
+      rw [writePlaceValue_pure_eq envAfterArgs m.borrows destination
+        (.scalar retScalar) h_dst_pure]
+      unfold writePurePlaceValue at h_wr
+      rw [h_wr]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  exact h_next m hm
 
 /--
 Generalized 1-step inlined-callee summary rule inside modular callers
@@ -14210,7 +15357,7 @@ theorem PureMirModularConverges.call_summary_resolved
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+      dsimp only [evalTerminator, bodyLocalDeclsOf]
       rw [h_res_m]
       dsimp only
       rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
@@ -14234,6 +15381,179 @@ theorem PureMirModularConverges.call_summary_resolved
       (st₁ := .running ((initPureState calleeBody argVals).toMachineState
         (pureCalleeMemory callees traitImpls)))
       ⟨PureCalleeMachineInv.init (initPureState calleeBody argVals)
+        ⟨maxCallDepth, h_callee_pure⟩, fun _ hf => nomatch hf⟩
+      ⟨rfl, hm.1, hm.2.1, rfl, rfl, hm.2.2.2.2⟩
+      h_wp_c⟩
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) (.running s0)) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  dsimp only [MirStepNode.step, Trusted.ITree.ITreeF.map]
+  refine dwp_modular_bind_steps
+    (mid := fun s' =>
+      ∃ (updatedEnv : List SlotState) (m' : Memory),
+        s' = PureState.toMachineState { bb := targetBb, stmtIdx := 0, env := updatedEnv } m' ∧
+        ModularRootMemory body callees traitImpls m' ∧
+        PureMirModularConverges contract body callees
+          { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    ?_ ?_
+  · refine wpMirExecNoCallSym_pushCalleeFrame
+      (outerBody := body) (callerBody := body) (calleeBody := calleeBody)
+      (s := s0) h_callee_m hm.2.2.2.2 ?_
+    intro retVal memOut ⟨h_mod_out, h_cp⟩
+    rcases h_after retVal h_cp with ⟨updEnv, h_wr_pure, h_next_mod⟩
+    refine ⟨updEnv, ?_, ⟨updEnv,
+      { memOut with
+        callStack := s0.memory.callStack
+        activeCallee := some body
+        activeProtectors := [] },
+      rfl, ⟨h_mod_out.1, h_mod_out.2.1, hm.2.2.1, Or.inr rfl, rfl⟩, h_next_mod⟩⟩
+    rw [writePlaceValue_pure_eq envAfterArgs memOut.borrows destination retVal h_dst_pure]
+    exact h_wr_pure
+  · rintro s' ⟨updEnv, m', rfl, hm', h_next_mod⟩
+    exact h_next_mod m' hm'
+
+/--
+1-step inlined-callee summary rule for `core::intrinsics::const_eval_select`
+inside modular callers (`PureMirModularConverges.call_const_eval_select_summary`):
+when `const_eval_select` is un-shadowed in `callees` (`lookupCallee = none`) and
+its runtime target `rtTarget` resolves in `callees` (`lookupCallee = some calleeBody`),
+`evalDirectRustIntrinsic?` steps via `pushCalleeFrame` and composes with
+`calleeBody`'s `PureMirConvergesWithCallees` summary in 1 step.
+-/
+theorem PureMirModularConverges.call_const_eval_select_summary
+    {contract : MirCallContract}
+    {body : CapturedMir}
+    {callees : List CapturedMir}
+    {ps : PureState}
+    {bb : BasicBlockData}
+    {func : Operand}
+    {argOps : List Operand}
+    {destination : Place}
+    {targetBb : BasicBlockIdx}
+    {unwind : UnwindAction}
+    {defPath : DefPath}
+    {envAfterArgs : List SlotState}
+    {tupleArgVal ctFnVal rtFnVal : Value}
+    {unpackedArgs : List Value}
+    {rtTarget : ResolvedCallTarget}
+    {calleeBody : CapturedMir}
+    {calleePost : Value → Prop}
+    {post : Value → Prop}
+    {traitImpls : List TraitImplEntry}
+    {maxCallDepth : Nat}
+    (h_phase : ∀ tag, body.phase ≠ .other tag)
+    (h_bb : get? body.basicBlocks ps.bb = some bb)
+    (h_end : ps.stmtIdx = length bb.statements)
+    (h_term : bb.terminator.kind = .call func argOps destination (.some targetBb) unwind)
+    (h_depth : 0 < maxCallDepth := by
+      first | decide | exact Nat.zero_lt_succ 31)
+    (h_dst_pure : isPurePlace destination = true)
+    (h_args_pure : argOps.all isPureOperand = true)
+    (h_def : extractCalleeDefPath? func = some defPath)
+    (h_select_path : classifyRustIntrinsic? defPath = some .constEvalSelect := by rfl)
+    (h_not_exact : stringEq defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_args :
+      evalPureOperands ps.env argOps body.layouts =
+        .ok [tupleArgVal, ctFnVal, rtFnVal] envAfterArgs)
+    (h_lookup_select :
+      lookupCallee callees body.layouts defPath (extractCalleeTypeArgs func) traitImpls = none)
+    (h_unpack :
+      unpackConstEvalSelectArgs? tupleArgVal
+        (selectTupleTyOpt (extractCalleeTypeArgs func)) = .some unpackedArgs)
+    (h_resolve_rt :
+      ∀ m : Memory,
+        ModularRootMemory body callees traitImpls m →
+        resolveConstEvalSelectTarget? (ps.toMachineState m)
+          { defPath := defPath
+            typeArgs := extractCalleeTypeArgs func
+            fnSig := .none
+            isIndirect := false }
+          body.localDecls body.layouts
+          (selectRtFnOpOpt argOps)
+          rtFnVal (length unpackedArgs) = .some rtTarget)
+    (h_lookup_rt :
+      lookupCallee callees body.layouts rtTarget.defPath rtTarget.typeArgs traitImpls =
+        some calleeBody)
+    (h_compat_rt :
+      Bool.and (Nat.beq calleeBody.argCount (length unpackedArgs))
+        (Bool.and (Bool.not (callConvEq calleeBody.fnAbi.conv .rustIntrinsic))
+          (checkCalleeTargetCompatible rtTarget calleeBody (length unpackedArgs))) = true := by rfl)
+    (h_callee_pure :
+      checkPureMirWithCallees callees calleeBody maxCallDepth traitImpls = true)
+    (h_callee_summary :
+      PureMirConvergesWithCallees calleeBody callees
+        (initPureState calleeBody unpackedArgs) calleePost traitImpls)
+    (h_after :
+      ∀ (retVal : Value),
+        calleePost retVal →
+        ∃ updatedEnv : List SlotState,
+          writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
+          PureMirModularConverges contract body callees
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+    PureMirModularConverges contract body callees ps post traitImpls := by
+  let _ := h_depth
+  intro m hm
+  let s0 := ps.toMachineState m
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body s0 =
+        MirStepNode.step
+          (pushCalleeFrame s0 body envAfterArgs destination targetBb
+            calleeBody unpackedArgs unwind) := by
+    have h_res_rt_m := h_resolve_rt m hm
+    dsimp only [PureState.toMachineState] at h_res_rt_m
+    unfold stepMirFn
+    dsimp only [s0, PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget]
+      rw [h_def]
+      dsimp only
+      rw [evalOperands_pure_eq ps.env argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup_select]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_not_exact]
+      dsimp only
+      rw [evalDirectRustIntrinsic?_constEvalSelect_three _ _ _ _ _ _ _ _ _ _ _ _ _ h_select_path]
+      unfold evalConstEvalSelectThree
+      dsimp only
+      rw [h_unpack]
+      dsimp only
+      rw [h_res_rt_m]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup_rt]
+      dsimp only
+      rw [h_compat_rt]
+  rcases h_callee_summary with ⟨fuel_c, h_wp_c⟩
+  have h_callee_m :
+      MirNoCallWpConverges calleeBody
+        (initMachineStateWithMemory calleeBody unpackedArgs
+          { m with callStack := [], activeCallee := none })
+        (mirNormalPost
+          (fun retVal memOut =>
+            ModularCalleeOutMemory callees traitImpls memOut ∧
+            calleePost retVal)) :=
+    ⟨fuel_c, sameExceptBorrows_step_noCall
+      (st₁ := .running ((initPureState calleeBody unpackedArgs).toMachineState
+        (pureCalleeMemory callees traitImpls)))
+      ⟨PureCalleeMachineInv.init (initPureState calleeBody unpackedArgs)
         ⟨maxCallDepth, h_callee_pure⟩, fun _ hf => nomatch hf⟩
       ⟨rfl, hm.1, hm.2.1, rfl, rfl, hm.2.2.2.2⟩
       h_wp_c⟩
@@ -15387,7 +16707,11 @@ theorem PureMirModularConverges.call_modular_resolved
         ∃ updatedEnv : List SlotState,
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic :
+      resolvedTarget.isIndirect = true ∨
+      classifyRustIntrinsic? resolvedTarget.defPath = none := by
+      first | exact Or.inr (by decide) | exact Or.inl (by decide)) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
@@ -15421,7 +16745,7 @@ theorem PureMirModularConverges.call_modular_resolved
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+      dsimp only [evalTerminator, bodyLocalDeclsOf]
       rw [h_res_m]
       dsimp only
       rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
@@ -15432,6 +16756,15 @@ theorem PureMirModularConverges.call_modular_resolved
       rw [hm.1, hm.2.1, h_lookup]
       dsimp only
       rw [h_not_exact]
+      dsimp only
+      cases h_ind : resolvedTarget.isIndirect with
+      | true => rfl
+      | false =>
+        rcases h_not_intrinsic with h_ind_t | h_ni
+        · rw [h_ind] at h_ind_t
+          exact False.elim (Bool.false_ne_true h_ind_t)
+        · dsimp only [evalDirectRustIntrinsic?]
+          rw [h_ni]
   rw [h_step_eq]
   dsimp only [MirStepNode.extCall, Trusted.ITree.ITreeF.map, mirModularWP,
     MirCallContract.toCallContract]
@@ -15532,7 +16865,8 @@ theorem PureMirModularConverges.call_poly_external_spec_pureTarget
         ∃ updatedEnv : List SlotState,
           writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv ∧
           PureMirModularConverges contract body callees
-            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+            { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? targetDefPath = none := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
@@ -15555,6 +16889,7 @@ theorem PureMirModularConverges.call_poly_external_spec_pureTarget
       · exact False.elim hp
       · rw [hp.1.2.1, hm.2.2.1])
     h_after
+    (Or.inr h_not_intrinsic)
   rcases h_unwind with hu | hu | h_nu | ⟨cleanupBb, h_cl, h_clean_wp⟩
   · exact Or.inl hu
   · exact Or.inr (Or.inl hu)
@@ -15623,7 +16958,8 @@ theorem PureMirModularConverges.call_intrinsic_pureTarget
     (h_wr : writePurePlaceValue envAfterArgs destination retVal = .ok updatedEnv)
     (h_after :
       PureMirModularConverges contract body callees
-        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls) :
+        { bb := targetBb, stmtIdx := 0, env := updatedEnv } post traitImpls)
+    (h_not_intrinsic : classifyRustIntrinsic? defPath = none := by decide) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
@@ -15651,6 +16987,7 @@ theorem PureMirModularConverges.call_intrinsic_pureTarget
     (fun rv h_eq => by
       subst h_eq
       exact ⟨updatedEnv, h_wr, h_after⟩)
+    (Or.inr h_not_intrinsic)
 
 /--
 1-step inline `core::intrinsics::exact_div` call rule supporting both constant
@@ -15687,9 +17024,12 @@ theorem PureMirModularConverges.call_exact_div_pureTarget
     (h_lookup :
       lookupCallee callees body.layouts defPath typeArgs traitImpls = none)
     (h_signed :
-      (match argOps with
-       | lhsOp :: _ => operandIsSigned body.localDecls lhsOp body.layouts
-       | [] => false) = isSigned := by rfl)
+      resolveIntrinsicIsSigned
+        { defPath := defPath
+          typeArgs := typeArgs
+          fnSig := .none
+          isIndirect := false }
+        body.localDecls body.layouts argOps = some isSigned := by rfl)
     (h_div : evalExactDiv lhs rhs isSigned = some retScalar)
     (h_wr :
       writePurePlaceValue envAfterArgs destination (.scalar retScalar) =
@@ -15701,64 +17041,62 @@ theorem PureMirModularConverges.call_exact_div_pureTarget
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
   intro m hm
-  rcases argOps with _ | ⟨lhsOp, restOps⟩
-  · unfold evalPureOperands at h_args
-    nomatch h_args
-  · dsimp only at h_signed
-    have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
-      rw [h_end]; exact get?_length_eq_none bb.statements
-    have h_step_eq :
-        stepMirFn body (ps.toMachineState m) =
-          MirStepNode.step
-            (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState m) := by
-      have h_res_m :
-          resolveCallTarget (ps.toMachineState m) func (length (lhsOp :: restOps))
-            body.localDecls body.layouts =
-            .ok { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
-              envAfterFunc := by
-        rw [resolveCallTarget_eq_of_extractPureCalleeTarget
-          (ps.toMachineState m) func (length (lhsOp :: restOps))
-          body.localDecls body.layouts h_ext]
-        exact h_res_pure
-      dsimp only [PureState.toMachineState] at h_res_m
-      unfold stepMirFn
-      dsimp only [PureState.toMachineState]
-      rw [ModularRootMemory.activeCallee_getD hm]
-      cases h_ph : body.phase with
-      | other tag => exact False.elim (h_phase tag h_ph)
-      | _ =>
-        rw [h_bb]
-        dsimp only
-        rw [h_stmt_none]
-        dsimp only
-        have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
-        simp only [h_beq, ite_true]
-        rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
-        dsimp only at h_term
-        rw [h_term]
-        dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
-        rw [h_res_m]
-        dsimp only
-        rw [evalOperands_pure_eq envAfterFunc (lhsOp :: restOps) m.borrows m.globals
-          body.layouts m.callerLocals h_args_pure]
-        unfold evalPureOperands at h_args
-        rw [h_args]
-        dsimp only
-        rw [hm.1, hm.2.1, h_lookup]
-        dsimp only [isDirectExactDivTarget]
-        rw [h_exact_path]
-        dsimp only
-        rw [h_signed, h_div]
-        dsimp only
-        rw [writePlaceValue_pure_eq envAfterArgs m.borrows destination
-          (.scalar retScalar) h_dst_pure]
-        unfold writePurePlaceValue at h_wr
-        rw [h_wr]
-    change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
-    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
-    dsimp only [stepMirState]
-    rw [h_step_eq]
-    exact h_next m hm
+  have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
+    rw [h_end]; exact get?_length_eq_none bb.statements
+  have h_step_eq :
+      stepMirFn body (ps.toMachineState m) =
+        MirStepNode.step
+          (({ bb := targetBb, stmtIdx := 0, env := updatedEnv } : PureState).toMachineState m) := by
+    have h_res_m :
+        resolveCallTarget (ps.toMachineState m) func (length argOps)
+          body.localDecls body.layouts =
+          .ok { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false }
+            envAfterFunc := by
+      rw [resolveCallTarget_eq_of_extractPureCalleeTarget
+        (ps.toMachineState m) func (length argOps)
+        body.localDecls body.layouts h_ext]
+      exact h_res_pure
+    dsimp only [PureState.toMachineState] at h_res_m
+    unfold stepMirFn
+    dsimp only [PureState.toMachineState]
+    rw [ModularRootMemory.activeCallee_getD hm]
+    cases h_ph : body.phase with
+    | other tag => exact False.elim (h_phase tag h_ph)
+    | _ =>
+      rw [h_bb]
+      dsimp only
+      rw [h_stmt_none]
+      dsimp only
+      have h_beq : (ps.stmtIdx == length bb.statements) = true := by simp [h_end]
+      simp only [h_beq, ite_true]
+      rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
+      dsimp only at h_term
+      rw [h_term]
+      dsimp only [evalTerminator, bodyLocalDeclsOf]
+      rw [h_res_m]
+      dsimp only
+      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+        body.layouts m.callerLocals h_args_pure]
+      unfold evalPureOperands at h_args
+      rw [h_args]
+      dsimp only
+      rw [hm.1, hm.2.1, h_lookup]
+      dsimp only [isDirectExactDivTarget]
+      rw [h_exact_path]
+      dsimp only
+      rw [h_signed]
+      dsimp only
+      rw [h_div]
+      dsimp only
+      rw [writePlaceValue_pure_eq envAfterArgs m.borrows destination
+        (.scalar retScalar) h_dst_pure]
+      unfold writePurePlaceValue at h_wr
+      rw [h_wr]
+  change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
+  rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+  dsimp only [stepMirState]
+  rw [h_step_eq]
+  exact h_next m hm
 
 /--
 Generalized subsumption-aware 1-step external `tailCall` rule
@@ -15941,7 +17279,11 @@ theorem PureMirModularConverges.tailCall_poly_external_spec_pureTarget
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
-  exact PureMirModularConverges.tailCall_modular_resolved h_sub
+  exact PureMirModularConverges.tailCall_modular_resolved
+    (subContract := polyExternalSpecCallContract targetDefPath expectedTypeArgs
+      sidecarBody extraPre extraPost)
+    (resolvedTarget := { defPath := targetDefPath, typeArgs := expectedTypeArgs, fnSig := .none, isIndirect := false })
+    h_sub
     h_phase h_bb h_end h_term h_args_pure
     (fun m _ => by
       rw [resolveCallTarget_eq_of_extractPureCalleeTarget
@@ -16009,7 +17351,10 @@ theorem PureMirModularConverges.tailCall_intrinsic_pureTarget
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
-  exact PureMirModularConverges.tailCall_modular_resolved h_sub
+  exact PureMirModularConverges.tailCall_modular_resolved
+    (subContract := pureRustIntrinsicContract pointerBytes ubChecksEnabled rtEval)
+    (resolvedTarget := { defPath := defPath, typeArgs := typeArgs, fnSig := .none, isIndirect := false })
+    h_sub
     h_phase h_bb h_end h_term h_args_pure
     (fun m _ => by
       rw [resolveCallTarget_eq_of_extractPureCalleeTarget
@@ -16707,7 +18052,27 @@ theorem scaleSwapAndDiv_compositional
       [] := by
   -- bb0 stmt 0 (StorageLive(_2)), then 1-step compositional call to
   -- poly_swap_pair::<u32>
-  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  have h_init :
+      initPureState scaleSwapAndDivBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] = {
+        bb := 0
+        stmtIdx := 0
+        env := [
+          .uninit,
+          .init (.aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ]),
+          .dead, .dead, .dead, .dead
+        ]
+      } := rfl
+  rw [h_init]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirConverges.call_leaf_summary
     (maxCallDepth := 64)
     (calleeBody := polySwapPairU32Body)
@@ -16720,17 +18085,23 @@ theorem scaleSwapAndDiv_compositional
   rintro _ rfl
   refine ⟨_, rfl, ?_⟩
   -- bb1 stmts (StorageLive(_3), StorageLive(_4), _3 = _2.1 * 2)
-  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
-  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
-  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   -- bb1 terminator: 1-step inline core::intrinsics::exact_div(_3, 2)
   refine PureMirConvergesWithCallees.call_exact_div
     (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
     (evalExactDiv_double_u32 hx) rfl ?_
   -- bb2 stmts (StorageLive(_5), _5 = _2.0 + 1, _0 = (_5, _4)) and return_
-  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
-  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
-  refine PureMirConvergesWithCallees.step ⟨rfl, ?_⟩
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+  refine PureMirConvergesWithCallees.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   exact PureMirConvergesWithCallees.step ⟨Or.inl rfl, rfl⟩
 
 /--
@@ -16999,12 +18370,17 @@ theorem nestedMultiCalleeCaller_inline
        | none => MirStepNode.fail .ub) = .tau (.running s10)
     rw [evalExactDiv_double_u32 hx]
     rfl
+  have h_run9 : runPureTauSteps 9 nestedMultiCalleeCallerBody s0 = some s9 := rfl
+  have h_run7 : runPureTauSteps 7 nestedMultiCalleeCallerBody s10 = some s17 := rfl
+  have h_ret17 :
+      stepMirFn nestedMultiCalleeCallerBody s17 =
+        .ret (.normal (nestedCallerExpected x y, s17.memory)) := rfl
   refine ⟨18, ?_⟩
   unfold wpPureMirExecWithCallees
-  exact wpMirExecNoCallSym_of_runPureTauSteps (n := 9) (fuel := 9) (s' := s9) rfl
+  exact wpMirExecNoCallSym_of_runPureTauSteps (n := 9) (fuel := 9) h_run9
     (wpMirExecNoCallSym_of_step_eq (fuel := 8) h_step10
-      (wpMirExecNoCallSym_of_runPureTauSteps (n := 7) (fuel := 1) (s' := s17) rfl
-        (wpMirExecNoCallSym_of_retNormal rfl ⟨Or.inr ⟨_, rfl⟩, rfl⟩)))
+      (wpMirExecNoCallSym_of_runPureTauSteps (n := 7) (fuel := 1) h_run7
+        (wpMirExecNoCallSym_of_retNormal h_ret17 ⟨Or.inr ⟨_, rfl⟩, rfl⟩)))
 
 /-- Stateless `Claim` for `nestedMultiCalleeCallerBody` with `demoCallees`. -/
 def nestedMultiCalleeStatelessClaim : Claim where
@@ -17386,31 +18762,23 @@ theorem pureIntrinsicCaller_modularConverges
       isCanonicalScalarOfSize
         { bits := pureBswapLoop 4 x 0, sizeBytes := 4 } 4 = true :=
     isCanonicalScalarOfSize_four h_bswap_lt
-  -- bb0: StorageLive(_2), then 1-step intrinsic bswap::<u32>(_1)
+  -- bb0: StorageLive(_2), then 1-step inline intrinsic bswap::<u32>(_1)
   refine PureMirModularConverges.step_stmt
     (fun _ h => nomatch h) rfl rfl rfl rfl ?_
-  refine PureMirModularConverges.call_intrinsic
-    (kind := .bswap)
+  refine PureMirModularConverges.call_inline_intrinsic
     (retVal := .scalar ⟨pureBswapLoop 4 x 0, 4⟩)
     (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
-    (lookupCallee_nil _ _ _ _) (by decide) rfl
-    (by
-      dsimp only [evalPureRustIntrinsicWithRuntime, evalPureScalarIntrinsic,
-        extractCalleeTypeArgs, fnItemOperand, intrinsicScalarTyInfo?]
-      rw [h_canon_x]
-      rfl)
+    (lookupCallee_nil _ _ _ _) (by decide)
+    (fun _ _ => evalDirectRustIntrinsic_bswap_u32 _ _ _ _ _ _ _ _ _ _ hx)
     rfl ?_
-  -- bb1: 1-step intrinsic ctpop::<u32>(_2)
-  refine PureMirModularConverges.call_intrinsic
-    (kind := .ctpop)
+  -- bb1: 1-step inline intrinsic ctpop::<u32>(_2)
+  refine PureMirModularConverges.call_inline_intrinsic
     (retVal := expectedBswapPopU32 x)
     (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
-    (lookupCallee_nil _ _ _ _) (by decide) rfl
-    (by
-      dsimp only [evalPureRustIntrinsicWithRuntime, evalPureScalarIntrinsic,
-        extractCalleeTypeArgs, fnItemOperand, intrinsicScalarTyInfo?]
-      rw [h_canon_bs]
-      exact congrArg some (expectedBswapPopU32_def x))
+    (lookupCallee_nil _ _ _ _) (by decide)
+    (fun _ _ => by
+      rw [← expectedBswapPopU32_def x]
+      exact evalDirectRustIntrinsic_ctpop_u32 _ _ _ _ _ _ _ _ _ _ h_bswap_lt)
     rfl ?_
   exact PureMirModularConverges.return_ (fun _ h => nomatch h) rfl rfl rfl rfl rfl
 
@@ -17996,9 +19364,59 @@ private theorem combinedModularPipeline_from_bb3
         (.scalar { bits := x, sizeBytes := 4 })))
     (fun _ h => h)
 
+private theorem combinedModularPipeline_from_bb2
+    (x y : Nat) (hx : x < 2147483648) :
+    PureMirModularConverges
+      combinedIntrinsicAndExtContract
+      combinedModularPipelineBody
+      [polySwapPairBody]
+      { bb := 2
+        stmtIdx := 0
+        env := [
+          .uninit,
+          .init (.aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ]),
+          .init (.scalar { bits := x + 1, sizeBytes := 4 }),
+          .init (.scalar (bswapScalarU32 (x + 1))),
+          .uninit,
+          .uninit,
+          .uninit,
+          .uninit,
+          .uninit,
+          .uninit
+        ] }
+      (· = .aggregate 0 [
+        .scalar { bits := x, sizeBytes := 4 },
+        expectedBswapPopU32 (x + 1)
+      ])
+      [] := by
+  -- bb2 stmt 0: _5 = (_3,)
+  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  -- bb2 terminator: const_eval_select((_3,), ctpop::<u32>, ctpop::<u32>)
+  refine PureMirModularConverges.call_inline_intrinsic
+    (retVal := expectedBswapPopU32 (x + 1))
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl (by decide)
+    (fun m hm => by
+      have h_sz_bs : (bswapScalarU32 (x + 1)).sizeBytes = 4 := by
+        rw [← bswapScalarU32_def]
+      have h_bits_bs : (bswapScalarU32 (x + 1)).bits = pureBswapLoop 4 (x + 1) 0 := by
+        rw [← bswapScalarU32_def]
+      have h_lt_bs : (bswapScalarU32 (x + 1)).bits < 4294967296 := by
+        rw [h_bits_bs]
+        exact pureBswapLoop_four_lt (x + 1)
+      rw [← expectedBswapPopU32_def (x + 1), ← h_bits_bs]
+      exact evalDirectRustIntrinsic_constEvalSelect_ctpop_u32
+        _ _ _ _ _ _ _ _ _ _ _ rfl rfl
+        (by dsimp only [PureState.toMachineState]; rw [hm.1, hm.2.1]; rfl)
+        h_sz_bs h_lt_bs)
+    rfl
+    (combinedModularPipeline_from_bb3 x y hx)
+
 /--
 Compositional modular proof for `combinedModularPipelineBody`, combining
-`call_poly_external_spec_sub`, `call_intrinsic_sub` (`bswap` +
+`call_poly_external_spec_sub`, `call_inline_intrinsic` (`bswap` +
 `const_eval_select(ctpop)`), `step_assert`, `call_exact_div`, and
 `tailCall_summary` in a single caller under `combinedIntrinsicAndExtContract`.
 -/
@@ -18021,22 +19439,42 @@ theorem combinedModularPipeline_modularConverges
       [] := by
   have hx1_lt : x + 1 < 4294967296 :=
     Nat.lt_trans (Nat.succ_lt_succ hx) (by decide)
-  have h_canon_x1 :
-      isCanonicalScalarOfSize { bits := x + 1, sizeBytes := 4 } 4 = true :=
-    isCanonicalScalarOfSize_four hx1_lt
-  have h_canon_bs :
-      isCanonicalScalarOfSize (bswapScalarU32 (x + 1)) 4 = true := by
-    rw [← bswapScalarU32_def]
-    exact isCanonicalScalarOfSize_four (pureBswapLoop_four_lt (x + 1))
   -- bb0: StorageLive(_2.._9)
+  have h_init :
+      initPureState combinedModularPipelineBody [
+        .aggregate 0 [
+          .scalar { bits := x, sizeBytes := 4 },
+          .scalar { bits := y, sizeBytes := 4 }
+        ]
+      ] = {
+        bb := 0
+        stmtIdx := 0
+        env := [
+          .uninit,
+          .init (.aggregate 0 [
+            .scalar { bits := x, sizeBytes := 4 },
+            .scalar { bits := y, sizeBytes := 4 }
+          ]),
+          .dead, .dead, .dead, .dead, .dead, .dead, .dead, .dead
+        ]
+      } := rfl
+  rw [h_init]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   -- bb0 terminator: ext::checked_inc::<u32>(_1.0) via call_poly_external_spec_sub
   refine PureMirModularConverges.call_poly_external_spec_sub
     (targetDefPath := "ext::checked_inc")
@@ -18050,50 +19488,27 @@ theorem combinedModularPipeline_modularConverges
         retVal = .scalar { bits := x + 1, sizeBytes := 4 })
     (MirCallContract.Subsumes.combine_right
       defaultPureRustIntrinsicContract extCheckedIncContract)
-    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl
     ⟨⟨x, Nat.lt_trans hx (by decide), rfl⟩, trivial⟩
     ⟨x, Nat.lt_trans hx (by decide), rfl⟩
     (Or.inl rfl)
     ?_
+    rfl
   rintro retVal ⟨_, h_ext_post⟩
   have h_rv : retVal = .scalar { bits := x + 1, sizeBytes := 4 } :=
     h_ext_post x rfl
   subst h_rv
   refine ⟨_, rfl, ?_⟩
-  -- bb1: core::intrinsics::bswap::<u32>(_2) via call_intrinsic_sub
-  refine PureMirModularConverges.call_intrinsic_sub
-    (pointerBytes := 8)
-    (ubChecksEnabled := true)
-    (rtEval := fun _ _ _ => none)
-    (kind := .bswap)
+  -- bb1: core::intrinsics::bswap::<u32>(_2) via call_inline_intrinsic
+  refine PureMirModularConverges.call_inline_intrinsic
     (retVal := .scalar (bswapScalarU32 (x + 1)))
-    (MirCallContract.Subsumes.combine_left
-      defaultPureRustIntrinsicContract extCheckedIncContract)
-    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl
-    (by
-      dsimp only [evalPureRustIntrinsicWithRuntime, evalPureScalarIntrinsic,
-        extractCalleeTypeArgs, fnItemOperand, intrinsicScalarTyInfo?]
-      rw [h_canon_x1, bswapScalarU32_def]
-      rfl)
-    rfl ?_
-  -- bb2 stmt 0: _5 = (_3,)
-  refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
-  -- bb2 terminator: const_eval_select((_3,), ctpop::<u32>, ctpop::<u32>)
-  refine PureMirModularConverges.call_intrinsic_sub
-    (pointerBytes := 8)
-    (ubChecksEnabled := true)
-    (rtEval := fun _ _ _ => none)
-    (kind := .constEvalSelect)
-    (retVal := expectedBswapPopU32 (x + 1))
-    (MirCallContract.Subsumes.combine_left
-      defaultPureRustIntrinsicContract extCheckedIncContract)
-    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl (by decide) rfl
-    (by
-      dsimp only [extractCalleeTypeArgs, fnItemOperand]
-      rw [evalConstEvalSelect_ctpop_u32 _ h_canon_bs, ← bswapScalarU32_def]
-      exact congrArg some (expectedBswapPopU32_def (x + 1)))
+    (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl rfl
+    ?_
     rfl
-    (combinedModularPipeline_from_bb3 x y hx)
+    (combinedModularPipeline_from_bb2 x y hx)
+  intro _ _
+  rw [← bswapScalarU32_def]
+  exact evalDirectRustIntrinsic_bswap_u32 _ _ _ _ _ _ _ _ _ _ hx1_lt
 
 /-- Non-vacuity witness for `combinedModularPipelineBody`'s precondition. -/
 theorem combinedModularPipeline_modularPre_nonVacuous :
@@ -18804,22 +20219,37 @@ theorem verify_calleeBackedConstEvalAndIntrinsicTail :
     calleeBackedModularContract _ rfl (Or.inl (by decide))
     (fun _ _ hp => ⟨hp.1, hp.2.1, hp.2.2.1⟩)
     (fun args _ hp => ?_)
+  simp only [List.isEmpty, Bool.false_eq_true, ↓reduceIte]
   rcases hp.2.2.2 with rfl | rfl
   · -- Case 1: y = 0x0F0F0005 -> const_eval_select -> switchInt -> tailCall ctpop = 10
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
-    refine PureMirModularConverges.call_intrinsic_sub
-      (MirCallContract.Subsumes.combine_left _ _)
-      (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl
-      (by decide) rfl rfl rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.call_const_eval_select_summary
+      (maxCallDepth := 1)
+      (calleeBody := polySwapPairU32Body)
+      (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl (by decide)
+      rfl rfl rfl (fun _ _ => rfl) rfl rfl (by decide)
+      (PureMirConvergesWithCallees.of_pureMirConverges
+        checkPureMir_polySwapPairU32Body
+        (polySwapPairU32_pureConverges
+          (.scalar { bits := 7, sizeBytes := 4 })
+          (.scalar { bits := 0x0F0F0005, sizeBytes := 4 })))
+      ?_
+    rintro _ rfl
+    refine ⟨_, rfl, ?_⟩
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_switchInt
       (fun _ h => nomatch h) rfl rfl rfl rfl rfl ?_
     exact PureMirModularConverges.tailCall_intrinsic_sub
@@ -18828,26 +20258,41 @@ theorem verify_calleeBackedConstEvalAndIntrinsicTail :
       (fun _ _ => rfl)
   · -- Case 2: y = 0 -> const_eval_select -> switchInt -> diverging panic guard
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
-    refine PureMirModularConverges.call_intrinsic_sub
-      (MirCallContract.Subsumes.combine_left _ _)
-      (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl
-      (by decide) rfl rfl rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
+    refine PureMirModularConverges.call_const_eval_select_summary
+      (maxCallDepth := 1)
+      (calleeBody := polySwapPairU32Body)
+      (fun _ h => nomatch h) rfl rfl rfl (by decide) rfl rfl rfl rfl (by decide)
+      rfl rfl rfl (fun _ _ => rfl) rfl rfl (by decide)
+      (PureMirConvergesWithCallees.of_pureMirConverges
+        checkPureMir_polySwapPairU32Body
+        (polySwapPairU32_pureConverges
+          (.scalar { bits := 7, sizeBytes := 4 })
+          (.scalar { bits := 0, sizeBytes := 4 })))
+      ?_
+    rintro _ rfl
+    refine ⟨_, rfl, ?_⟩
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     refine PureMirModularConverges.step_switchInt
       (fun _ h => nomatch h) rfl rfl rfl rfl rfl ?_
     refine PureMirModularConverges.step_stmt
-      (fun _ h => nomatch h) rfl rfl (by decide) rfl ?_
+      (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
     exact PureMirModularConverges.call_diverging_panic
-      (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl (by decide)
-      (Or.inr ⟨by decide, Or.inl rfl⟩)
+      (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl
+      (Or.inr ⟨rfl, Or.inl rfl⟩)
 
 /-!
 ### 10H. Capture-Free Closure & Arity-Validated `const_eval_select` +
@@ -19174,9 +20619,20 @@ theorem localFnItemAndCleanup_modularConverges
       isCanonicalScalarOfSize { bits := x + 1, sizeBytes := 4 } 4 = true :=
     isCanonicalScalarOfSize_four hx1_lt
   -- bb0: StorageLive(_4), StorageLive(_5), _4 = Copy(_1)
+  have h_init :
+      initPureState localFnItemAndCleanupModularBody
+        [.scalar { bits := x, sizeBytes := 4 }, .unit, .unit] =
+        { bb := 0
+          stmtIdx := 0
+          env := [.uninit, .init (.scalar { bits := x, sizeBytes := 4 }),
+            .init .unit, .init .unit, .dead, .dead] } := rfl
+  rw [h_init]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+  dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set, Nat.add]
   -- bb0 terminator: (Move(_2))(_4) -> [return: bb1, unwind: cleanup(bb2)]
   refine PureMirModularConverges.call_poly_external_spec_pureTarget
     (targetDefPath := "ext::unwinding_inc")
@@ -19192,15 +20648,18 @@ theorem localFnItemAndCleanup_modularConverges
       defaultPureRustIntrinsicContract extUnwindingIncContract)
     (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl rfl
     (lookupCallee_nil _ _ _ _)
-    (by decide) rfl
+    rfl rfl
     ⟨⟨x, Nat.lt_trans hx (by decide), rfl⟩, trivial⟩
     ⟨x, hx, rfl⟩
     (Or.inr (Or.inr (Or.inr ⟨2, rfl, ?_⟩)))
     ?_
+    rfl
   · -- Cleanup landing pad bb2 -> bb3: StorageDead(_5), drop(_4), StorageDead(_4), unwindResume
     refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set]
     refine PureMirModularConverges.step_drop (fun _ h => nomatch h) rfl rfl rfl rfl ?_
     refine PureMirModularConverges.step_stmt (fun _ h => nomatch h) rfl rfl rfl rfl ?_
+    dsimp only [PureState.ofMachineState, PureState.toMachineState, advanceStmt, set?, List.set]
     exact PureMirModularConverges.step_unwindResume
       (fun _ h => nomatch h) rfl rfl rfl
   · -- Normal return path bb1: tailCall (Copy(_3))(_5) -> ctpop::<u32>(x + 1)
@@ -19209,7 +20668,7 @@ theorem localFnItemAndCleanup_modularConverges
       h_ext_post x rfl
     subst h_rv
     refine ⟨_, rfl, ?_⟩
-    exact PureMirModularConverges.tailCall_intrinsic_pureTarget
+    refine PureMirModularConverges.tailCall_intrinsic_pureTarget
       (pointerBytes := 8)
       (ubChecksEnabled := true)
       (rtEval := fun _ _ _ => none)
@@ -19220,12 +20679,12 @@ theorem localFnItemAndCleanup_modularConverges
       (fun _ h => nomatch h) rfl rfl rfl rfl rfl rfl rfl
       (lookupCallee_nil _ _ _ _)
       rfl
-      (by
-        dsimp only [evalPureRustIntrinsicWithRuntime, evalPureScalarIntrinsic,
-          intrinsicScalarTyInfo?]
-        rw [h_canon_x1]
-        exact congrArg some (expectedCtpopU32_def (x + 1)))
+      ?_
       rfl
+    dsimp only [evalPureRustIntrinsicWithRuntime, evalPureScalarIntrinsic,
+      intrinsicScalarTyInfo?]
+    rw [h_canon_x1]
+    exact congrArg some (expectedCtpopU32_def (x + 1))
 
 /--
 Audited `ModularVerificationResult` for `localFnItemAndCleanupModularBody` via

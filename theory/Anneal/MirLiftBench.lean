@@ -1135,7 +1135,7 @@ theorem liftClosureAndTraitCaller_lift :
   -- bb2 terminator: `_0 = exact_div::<u32>(move _4, const 2_u32) -> bb3`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.callExactDiv (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-    (by rfl)
+    (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, List.set]
   -- bb3 terminator: `drop(_2) -> bb4`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)

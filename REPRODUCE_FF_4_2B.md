@@ -15,13 +15,14 @@ Work unit `FF-4.2b` merges `sup/brief-4` (`087b015b`: BRIEF-0..4, the
 `sup/ff-4` (`1642f8aa`: FF-1..FF-4.2, the fuel-free lifting theory and the
 migrated `WireframeDemo`, `FrameTutor`, and `MirVerification` proofs).
 
-> [!WARNING]
-> Status at `[adv A0]`: the merge itself is complete and passes both hard
-> gates of the brief (Section 5), but the build is **not green**. The FF
-> theory was written against the pre-`087b015b` trusted semantics, and
-> `087b015b` changes `evalTerminator`, `evalRvalue`, and
-> `evalCopyNonOverlappingWithCount`. Section 4.2 lists the proofs that still
-> fail and why. Later passes must finish the port before this unit is done.
+> [!IMPORTANT]
+> Status at `[adv B1]`: **100% GREEN** across all Rust tests (`56 passed`),
+> `lake build Anneal MirVerification` (including `Anneal.MirLift`),
+> `python3 trusted/audit/check_trusted.py --fast` (`PASS`, `40` Trusted modules,
+> `9,589` Trusted kernel declarations, `24,294` replayed declarations), and
+> both `cargo-anneal verify` suites (`wireframe-demo`: `9 unconditional`,
+> `tutor`: `7 unconditional`, `Proof/WireframeDemo/*.lean` untouched at `1,421`
+> LOC with zero `BlockCtx` and zero manual `fuel`).
 
 ## 1. Merge protocol
 
@@ -124,75 +125,78 @@ equals an older merge-base blob, while `087b015b`'s blob is the newer one.
   [evalTerminator_call_eq, evalCallTerminatorB]` and keep their case order.
 - `stepMirFn_extCall_aborts_prop` unfolds the intrinsic helpers.
 
-### 4.2 Still failing (exact list from `lake env lean`)
+### 4.2 Adversarial critique of `[adv A0]` & fixes in `[adv B1]`
 
-`Anneal.PureMirExec`, 12 theorems, all in the call step:
+`[adv A0]` (`2109bdec`) executed the merge-base protocol cleanly, but left an
+uncompilable tree with six distinct classes of failures that `[adv B1]`
+resolved:
 
-| Theorem | Line | Needed |
-| :--- | :--- | :--- |
-| `wpMirExecNoCallSym_pushCalleeFrame` | 5404 | (a), (c), (d) |
-| `stepMirFn_extCall_aborts_prop` | 5809 | finish the brute-force split over the new call branch |
-| `wpMirExecNoCallSym_pushBaseStack_nil_outer` | 6308 | (a), (c), (d) |
-| `PureMirConvergesWithCallees.call_exact_div` | 7867 | (a), (c) |
-| `stepMirFn_pureCallee_step_and_replaceRoot` | 9159 | (a), (c) |
-| `PureMirModularConverges.call_modular` | 11923 | (a), (b) |
-| `PureMirModularConverges.call_external_spec` | 12124 | (a), (b) |
-| `PureMirModularConverges.call_external_spec_sub` | 12503 | (a), (b) |
-| `sameExceptBorrows_step_noCall` | 13347 | (a), (c) |
-| `PureMirModularConverges.call_exact_div` | 14116 | (a), (c) |
-| `PureMirModularConverges.call_modular_resolved` | 15414 | (a), (b) |
-| `PureMirModularConverges.call_exact_div_pureTarget` | 15751 | (a), (c) |
+1. **12 broken call-step theorems & example proofs in `Anneal.PureMirExec`**:
+   Ported `wpMirExecNoCallSym_pushCalleeFrame`,
+   `stepMirFn_extCall_aborts_prop`,
+   `wpMirExecNoCallSym_pushBaseStack_nil_outer`,
+   `PureMirConvergesWithCallees.call_exact_div`,
+   `stepMirFn_pureCallee_step_and_replaceRoot`,
+   `PureMirModularConverges.{call_modular,call_external_spec,`
+   `call_external_spec_sub,call_exact_div,call_modular_resolved,`
+   `call_exact_div_pureTarget}`, `sameExceptBorrows_step_noCall`, and the
+   downstream modular example proofs to `087b015b`'s `evalTerminator` /
+   `evalDirectRustIntrinsic?` / `resolveIntrinsicIsSigned` semantics (adding
+   `classifyRustIntrinsic? defPath = none` preconditions on external-call rules
+   and `pushBaseStack` commutation across all direct Rust intrinsic families).
+2. **`check_trusted.py --fast` 60s child-process timeout on `Anneal.PureMirExec`
+   (`85s` -> `51s`)**: Introduced `IsIntrinsicCallFamily` with generic
+   scalar/wide-pointer `pushBaseStack` combinators, `evalStmt_assign_eq` +
+   `evalAssignDst_nonDeref`, `stepMirFn_eq_ite` (eliminating 2x `MirPhaseTag`
+   proof duplication), explicit `TerminatorKind` dispatch in
+   `stepMirFn_extCall_aborts_prop`, and `change`-based reduction in
+   `evalDirectRustIntrinsic_*`, cutting standalone compile time from `85s` to
+   `51s` and `.olean` size from `38 MB` to `32 MB`.
+3. **Unported `MirLiftCore`, `MirLift`, and `MirLiftBench` + symbolic
+   `activeProtectors` regression**: Ported `evalStmt_assign_of_evalRvalue`,
+   `LiftTerminator.evalNodeWP_of`, `evalOperandFast_eq`, `evalRvalueFast_eq`,
+   `evalRvalueSymTreeFast_eq`, `MirLift.lean` (`#mir_lift` / `#mir_lift_spec`
+   external-call intrinsic guards), and `MirLiftBench.lean`. Preserved
+   `hasProtectedWriteConflict mem₁.borrows mem₁.activeProtectors ...` in
+   `finishAssignStmtNodeFast` (via `hasProtectedWriteConflict_nil`) so proofs
+   with symbolic `activeProtectors` (`WireframeDemo.checksum_frame_safe` and
+   `FrameTutor`) verify with zero changes to `examples/`.
+4. **5 broken deref subplace theorems & 4 `-DwarningAsError=true` lint errors
+   in `Anneal.SepLogicLenses`**: Ported `LiftDerefWrite.{evalStmt_field_eq,`
+   `evalStmt_eq,evalStmt_eq_subplace}`,
+   `LiftDerefRead.evalOperand_and_freeze_eq_subplace`, and
+   `LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace` to
+   `needsThinPtrElemResolution` / `resolveDerefWriteFullProj` /
+   `invalidateDerefWriteBorrows`, and removed 4 unused
+   `ProvenancePtr.offsetBytes` `simp` arguments.
+5. **60s child-process timeouts in `FunctionalTranslationTests` (`53s` -> `5s`)
+   and `FunctionalTranslationEquivTests` (`-> 17s`)**: Replaced 80-symbol
+   `dsimp only` calls (which rebuilt `SimpTheorems` discrimination trees across
+   ~400 `087b015b` equation lemmas on every step) with WHNF `rfl` raw-state
+   transitions and minimal local-step `dsimp only` lists.
+6. **`downstream-audit` foreign-dependency collision in `SymbolicEvalTests`**:
+   Both `SymbolicEvalTests` and `PureMirExec`/`MirFuelFree` lazily realized
+   `evalOperands.eq_def` and `evalRvalue.eq_28` with module-private
+   `_private.<Mod>.0.*` splitter helpers, causing `importModules` in
+   `downstream-audit` to overwrite the stored proof bodies with
+   `SymbolicEvalTests` helpers. Replaced bare `evalRvalue`/`evalOperands` in
+   two `SymbolicEvalTests.lean` `simp only` blocks with six constructor-specific
+   `rfl` lemmas (`0` collisions across all `31` downstream targets).
 
-- (a) Replace `evalTerminator, evalCallTerminator` by
-  `evalTerminator_call_eq, evalCallTerminatorB` in the call case (`dsimp`
-  sets must become `simp only`, since the equation is not `rfl`).
-- (b) The external-call rules now need the callee to be no Rust intrinsic:
-  add `classifyRustIntrinsic? defPath = none` (or `isIndirect = true`) so
-  `evalDirectRustIntrinsic?` returns `none` and the step is still `extCall`.
-- (c) `exact_div` signedness is `resolveIntrinsicIsSigned target localDecls
-  layouts argOps` (`none` gives `unsupported`), and a wrong argument shape is
-  now `fail .ub` instead of `unsupported`. The pure-callee checks already
-  force `isDirectExactDivTarget = true` when `lookupCallee` misses.
-- (d) The two lifting lemmas must handle `evalDirectRustIntrinsic? = some
-  node` for arbitrary callees: prove that `evalNonSelectIntrinsicCall` and the
-  `const_eval_select` branch commute with `MachineState.pushBaseStack` on
-  every node that is not an `extCall` (an `extCall` already falsifies the
-  no-call WP).
+## 5. Receipts at `[adv B1]`
 
-The `[adv A0]` diagnostic sweep (failing theorems temporarily replaced by
-`sorry` in scratch builds only; nothing of it is committed) found further
-breakage downstream:
-
-- `Anneal.MirLiftCore`: `evalStmt_assign_of_evalRvalue` (assignment now
-  invalidates borrows at `resolveBorrowProjectionElems`),
-  `LiftTerminator.evalNodeWP_of` (unfolds `evalCallTerminator`), and
-  `evalOperandFast_eq`, `evalRvalueFast_eq`, `evalRvalueSymTreeFast_eq` (the
-  fast evaluators must mirror `087b015b`'s `evalOperand` constants and deref
-  branch and `evalPtrOffsetBinOp`).
-- `Anneal.SepLogicLenses`: `LiftDerefWrite.evalStmt_field_eq`,
-  `LiftDerefWrite.evalStmt_eq`, `LiftDerefWrite.evalStmt_eq_subplace`,
-  `LiftDerefRead.evalOperand_and_freeze_eq_subplace`, and
-  `LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace`, with possible
-  follow-on failures in the `treeLens`/`treeFieldLens` lemmas.
-- `Anneal.MirLift` failed only on its `#guard_msgs` axiom lists because of
-  the scratch `sorry`s; it depends on the `PureMirExec` call rules above.
-- `MirVerification`, the `WireframeDemo` and `FrameTutor` proofs, and
-  `check_trusted.py` could not be checked yet because they import the
-  failing modules.
-
-## 5. Receipts at `[adv A0]`
-
-See the `[A0 -> B1]` board post for the verbatim outputs.
+See the `[B1 -> A1]` board post for the verbatim outputs.
 
 | Check | Result |
 | :--- | :--- |
 | `087b015b` and `1642f8aa` are ancestors of `HEAD` | pass |
 | `git diff --stat 087b015b..HEAD -- crates/ docs/ ci/ .github/ .gemini/ Cargo.toml Cargo.lock FRAMEWORK_PRINCIPLES.md FRAMEWORK_PRINCIPLES_DESIGN.md README.md scripts/ theory/Correspondence/` | empty (pass) |
 | `git diff 087b015b..HEAD -- trusted/lean/` | only the two `traitImpls := body.traitImpls` lines (pass) |
-| `./ci/check_todo.sh` | exit 0 |
-| `cargo test -p cargo-anneal --lib --bins` | 55 passed, 1 failed (`multi_crate_transitive_callees_and_external_spec_override_end_to_end` needs `Anneal.SepLogicLenses`) |
-| `lake build Anneal MirVerification` | fails in `Anneal.PureMirExec` (Section 4.2) |
-| `check_trusted.py --fast`, both `cargo-anneal verify` runs | fail (they build the theory) |
+| `./ci/check_todo.sh` | exit 0 (pass) |
+| `cargo test -p cargo-anneal --lib --bins` | 56 passed, 0 failed (pass) |
+| `lake build Anneal MirVerification` (and `MirLift`) | pass |
+| `python3 trusted/audit/check_trusted.py --fast` | PASS (`40` Trusted modules, `9,589` Trusted decls, `24,294` replayed decls) |
+| `cargo-anneal verify` (`wireframe-demo` and `tutor`) | PASS (`9` + `7` unconditional, `0` conditional, kernel replay PASS) |
 
 No `sorry`, `admit`, `sorryAx`, `axiom`, `#[trusted]`, or `native_decide` was
 added, and `trusted/` differs from `087b015b` only as the brief allows.
@@ -213,9 +217,8 @@ anneal-lean-run --mode build --concurrency 1 -- \
   cargo test -p cargo-anneal --lib --bins
 (cd examples && anneal-lean-run --mode build --concurrency 1 -- \
   lake build Anneal MirVerification)
-# Fast single-module loop for the remaining PureMirExec work:
-(cd examples && anneal-lean-run --mode file --concurrency 1 --timeout 900 \
-  -- lake env lean ../theory/Anneal/PureMirExec.lean)
+(cd examples && anneal-lean-run --mode file --concurrency 1 \
+  -- lake env lean ../theory/Anneal/MirLift.lean)
 python3 trusted/audit/check_trusted.py --fast
 anneal-lean-run --mode build --concurrency 1 -- \
   cargo-anneal verify --manifest-path examples/wireframe-demo/Cargo.toml
