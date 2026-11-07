@@ -11,27 +11,26 @@ those terms.
 import LeanMiriSpec.Correspondence.SimLM1_4
 
 /-!
-# Pointer & Allocation Correspondence (`AllocMapRel`, `PtrRel`) for `LM-3.1`
+# Pointer & Allocation Correspondence for `LM-3.1`
 
 Connects Anneal's raw-pointer and local-allocation representation in
 `Trusted.Rustc.V2026_06_01.MirSemantics` (`ProvenancePtr`, `Value.ptr`,
-`BorrowEntry`) to `lean-miri`'s `Miri.Memory.Pointer AnnealProv`,
-`Miri.Memory.checkAndDerefPtr`, `Miri.Memory.checkPtrAlign`, and
-`Miri.Interpreter.ptrOffsetInbounds`.
+`BorrowEntry`) to `lean-miri`'s `Miri.Memory.Pointer AnnealProv` and stack
+allocations.
 
-* `AllocMapRel`: Bijection invariant between address-taken Anneal local indices
-  `localIdx : Local` and `lean-miri` stack allocation IDs
-  `allocId : Miri.Memory.AllocId` with cached virtual base address
-  `annealStackBaseAddr allocId = allocId.value <<< 32`. Tracks both live
-  `.indirect` stack allocations and deallocated stack allocations after
-  `StorageDead`.
-* `PtrRel`: Relates an Anneal `ProvenancePtr` (`allocId`, `offsetBytes`) to a
-  `lean-miri` `Miri.Memory.Pointer AnnealProv` (`offset`, `provenance`) at a
-  concrete `AllocId` and `BorTag`.
-* `stackAlloc_writeScalar_readScalar_any`: Proves that writing any
-  `ScalarRel`-related scalar at offset `0` of a mutable stack allocation
-  (whether previously uninitialized or already initialized by an earlier write)
-  succeeds, marks the range initialized, and reads back to the same scalar.
+* `AllocMapRel`: ties each address-taken Anneal local (through the borrow tag of
+  a pointer to it) to its `lean-miri` stack allocation `allocId`, whose base
+  address is `annealStackBaseAddr allocId = allocId.value <<< 32`.
+* `PtrRel`: relates an Anneal `ProvenancePtr` whose tag names an `allocMap`
+  entry to the `lean-miri` pointer at the same offset into that entry's
+  allocation.
+* `LocalRelLM3_1`, `FrameRelLM3_1`, `StateRelLM3_1`, `StepRelLM3_1`: `LocalRel`,
+  `FrameRel`, `StateRel`, and `StepRel` extended with raw-pointer locals and
+  with the borrow entries those pointers own. With an empty `allocMap`,
+  `StateRelLM3_1` is exactly `StateRel` (`StateRel.toLM3_1`,
+  `StateRelLM3_1.toStateRel`), and `StepRel.toLM3_1` lifts every `LM-1.x` step.
+* Exact characterizations of `Miri.Memory.checkAndDerefPtr` and
+  `Miri.Interpreter.ptrOffsetInbounds` on pointers into stack allocations.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -183,10 +182,16 @@ end AllocMapRel
 `offsetBytes`) and a `lean-miri` `Miri.Memory.Pointer AnnealProv` (`offset`,
 `provenance`).
 
-`mptr.provenance` is `.concrete allocId borTag`, `allocId.value.toNat < 2^32`,
-`p.offsetBytes < 2^32`, and `mptr.offset` is
+Anneal records a raw pointer's borrow tag in `p.allocId` (`p.tag`), so the
+tag must name an `allocMap` entry, and `mptr` must point into that entry's
+`lean-miri` stack allocation: `mptr.provenance` is `.concrete allocId borTag`,
+`allocId.value.toNat < 2^32`, `p.offsetBytes < 2^32`, and `mptr.offset` is
 `Size.ofBytes (annealStackBaseAddr allocId + UInt64.ofNat p.offsetBytes)`
-(i.e. `(allocId.value <<< 32) + p.offsetBytes`, with no 64-bit wraparound). -/
+(that is, `(allocId.value <<< 32) + p.offsetBytes`, with no 64-bit
+wraparound). A tag outside `allocMap` relates to no `lean-miri` pointer: such a
+tag has no borrow entry in Anneal (`StateRelLM3_1.borrows_tracked`), so
+relating it to some allocation that `lean-miri` might still consider live
+would let a dereference succeed in `lean-miri` that fails in Anneal. -/
 inductive PtrRel
     (allocMap : List AllocMapEntry)
     (p : ProvenancePtr)
@@ -200,12 +205,30 @@ inductive PtrRel
       (addr_eq :
         mptr.offset =
           Miri.ABI.Size.ofBytes (annealStackBaseAddr allocId + UInt64.ofNat p.offsetBytes))
-      (target_rel :
-        (∃ e ∈ allocMap, e.tag = p.tag ∧ e.allocId = allocId) ∨
-          (lookupAllocMapByTag allocMap p.tag = none ∧ allocId.value = UInt64.ofNat p.allocId)) :
+      (target_rel : ∃ e ∈ allocMap, e.tag = p.tag ∧ e.allocId = allocId) :
       PtrRel allocMap p mptr
 
 namespace PtrRel
+
+/-- `PtrRel` survives extending `allocMap` with another entry. -/
+theorem mono_cons {allocMap : List AllocMapEntry} {p : ProvenancePtr}
+    {mptr : Miri.Memory.Pointer AnnealProv} (e : AllocMapEntry)
+    (h : PtrRel allocMap p mptr) : PtrRel (e :: allocMap) p mptr := by
+  cases h with
+  | mk allocId borTag hprov hid hoff haddr htarget =>
+    obtain ⟨e', he', htag, halloc⟩ := htarget
+    exact .mk allocId borTag hprov hid hoff haddr
+      ⟨e', List.mem_cons_of_mem e he', htag, halloc⟩
+
+/-- No `lean-miri` pointer is related to an Anneal pointer when `allocMap` is
+empty. -/
+theorem not_nil {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv} :
+    ¬ PtrRel [] p mptr := by
+  intro h
+  cases h with
+  | mk _ _ _ _ _ _ htarget =>
+    obtain ⟨_, he, _⟩ := htarget
+    cases he
 
 /-- A pointer freshly created at offset `0` from `stackAllocPlace id` satisfies
 `PtrRel` with `{ allocId := e.tag, offsetBytes := 0 }` whenever `e ∈ allocMap`. -/
@@ -219,7 +242,7 @@ theorem of_stackAllocPlace
         .concrete e.allocId Miri.Memory.BorTag.one⟩ :=
   .mk e.allocId Miri.Memory.BorTag.one rfl hlt (by show 0 < 2 ^ 32; decide)
     (by simp [UInt64.add_zero])
-    (Or.inl ⟨e, he, rfl, rfl⟩)
+    ⟨e, he, rfl, rfl⟩
 
 /-- No 64-bit addition overflow occurs in `annealStackBaseAddr allocId + offsetBytes`
 when `allocId.value.toNat < 2^32` and `offsetBytes < 2^32`. -/
@@ -280,7 +303,222 @@ theorem resolvePtr_concrete_eq
 
 end PtrRel
 
-/-! ## 3. Exact `checkAndDerefPtr`, `checkPtrAlign`, and `ptrOffsetInbounds` Lemmas -/
+/-! ## 3. Pointer-Aware Local, Frame, and State Relations -/
+
+/-- `LocalRel` extended with raw-pointer locals.
+
+`LM-1.x` relates every immediate local through `ImmediateRel`, which has no
+pointer case, so no state in which a local holds a raw pointer satisfies
+`StateRel`. `LocalRelLM3_1` adds exactly that case: an initialized local of
+raw-pointer type holds `.ptr p 8` in Anneal and the immediate scalar
+`Scalar.fromPointer annealTargetDataLayout mptr` in `lean-miri`, with
+`PtrRel allocMap p mptr`. Every other local is related by `LocalRel` itself, so
+the `LM-1.x` facts about it carry over unchanged. -/
+inductive LocalRelLM3_1
+    (mach : AnnealMachine) (allocMap : List AllocMapEntry)
+    (decl : LocalDecl) (layouts : LayoutTable) :
+    LocalSlot → Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout → Prop where
+  /-- A local related by `LocalRel`. -/
+  | base {slot : LocalSlot}
+      {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout} :
+      LocalRel mach decl layouts slot mls →
+      LocalRelLM3_1 mach allocMap decl layouts slot mls
+  /-- An immediate raw-pointer local. -/
+  | rawPtr (p : ProvenancePtr) (mptr : Miri.Memory.Pointer AnnealProv)
+      (cachedLayout : Option Miri.Interpreter.LocalLayout)
+      (mutability : Mutability) (pointeeKind : RigidTy) :
+      (∀ l ∈ cachedLayout, l = translateTy decl.ty layouts) →
+      decl.ty.kind = .rawPtr mutability pointeeKind →
+      PtrRel allocMap p mptr →
+      LocalRelLM3_1 mach allocMap decl layouts (.init (.ptr p 8))
+        ⟨.live (.immediate
+            (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))),
+          cachedLayout⟩
+
+/-- `FrameRel` with locals related by `LocalRelLM3_1`. -/
+structure FrameRelLM3_1
+    (body : CapturedMir) (mach : AnnealMachine) (allocMap : List AllocMapEntry)
+    (af : StackFrame)
+    (mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) : Prop where
+  /-- `mf.body` is the translation of `body`. -/
+  body_eq : mf.body = translateBody body
+  /-- `mf.location` is `.mir ⟨af.blockIdx, af.stmtIdx⟩`. -/
+  location_eq : mf.location = .mir ⟨af.blockIdx, af.stmtIdx⟩
+  /-- `af.locals` has one slot per declared local. -/
+  af_locals_len : af.locals.length = body.localDecls.length
+  /-- `mf.locals` has one state per declared local. -/
+  mf_locals_size : mf.locals.size = body.localDecls.length
+  /-- Pointwise correspondence of every local via `LocalRelLM3_1`. -/
+  locals_rel :
+    ∀ (i : Nat) (decl : LocalDecl) (slot : LocalSlot)
+      (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout),
+      get? body.localDecls i = some decl →
+      get? af.locals i = some slot →
+      mf.locals[i]? = some mls →
+      LocalRelLM3_1 mach allocMap decl body.layouts slot mls
+
+/-- Simulation relation between an Anneal `MachineState` and a single-frame
+`AnnealStepState` in which locals may hold raw pointers to address-taken locals.
+
+`StateRel` requires `s.memory.borrows = .nil`, but Anneal's `Rvalue.rawPtr`
+pushes a borrow entry, so no state reached by taking an address satisfies
+`StateRel`. `StateRelLM3_1` keeps every other `StateRel` field and replaces
+`borrows_nil` by:
+
+* `borrows_tracked`: each borrow entry is the root borrow of an `allocMap`
+  entry (whole local, no projection, default range and parent), and
+* `alloc_rel`: `AllocMapRel`, which ties each entry's tag, local, permission,
+  allocation, and base address together across the two machines.
+
+With `allocMap = []` both fields force `borrows = .nil` and every pointer
+local is impossible, so `StateRelLM3_1 body s m []` is equivalent to
+`StateRel body s m` (`StateRel.toLM3_1` and `StateRelLM3_1.toStateRel`). -/
+inductive StateRelLM3_1
+    (body : CapturedMir) (s : MachineState) (m : AnnealStepState)
+    (allocMap : List AllocMapEntry) : Prop where
+  | mk
+      (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (frames_eq : m.stack.frames = #[topFrame])
+      (returnContinuation_eq : topFrame.returnContinuation = .stop false)
+      (returnPlace_eq :
+        ∃ retLay,
+          topFrame.returnPlace =
+            .frameLocal 0 0 none retLay topFrame.localsIdentity)
+      (frame_rel : FrameRelLM3_1 body m.machine allocMap s.frame topFrame)
+      (activeCallee_none : s.memory.activeCallee = none)
+      (callStack_nil : s.memory.callStack = .nil)
+      (activeProtectors_nil : s.memory.activeProtectors = .nil)
+      (callerLocals_nil : s.memory.callerLocals = .nil)
+      (borrows_tracked :
+        ∀ b ∈ s.memory.borrows, ∃ e ∈ allocMap,
+          b = { tag := e.tag, targetLocal := e.localIdx, targetProjection := .nil,
+                perm := e.perm })
+      (alloc_rel : AllocMapRel body s m allocMap)
+      (memoryAllocDisjoint : MemoryAllocDisjoint topFrame) :
+      StateRelLM3_1 body s m allocMap
+
+/-- Outcome correspondence for one step between `StateRelLM3_1`-related
+states, mirroring `StepRel`: both machines take a normal step to states related
+under `allocMap`, both return from the root frame with related return values,
+or both report undefined behavior. -/
+inductive StepRelLM3_1 (body : CapturedMir) (m : AnnealStepState)
+    (allocMap : List AllocMapEntry) :
+    MirStepNode → Miri.Interpreter.StepResult AnnealStepState Bool → Prop where
+  /-- Normal intra-frame step to `StateRelLM3_1`-related states. -/
+  | step (s' : MachineState) (m' : AnnealStepState) :
+      StateRelLM3_1 body s' m' allocMap →
+      StepRelLM3_1 body m allocMap (MirStepNode.step s') (m', .ok true)
+  /-- Normal root-frame return, as in `StepRel.retRoot`. -/
+  | retRoot (decl0 : LocalDecl) (retVal : Value)
+      (imm0 : Miri.Interpreter.Immediate AnnealProv)
+      (mem' : Memory) (m' : AnnealStepState) :
+      get? body.localDecls 0 = some decl0 →
+      annealControlHooks.returnOperand () m = (m, .ok (.immediate imm0)) →
+      ImmediateRel decl0.ty body.layouts retVal imm0 →
+      m' = { m with stack := ⟨#[]⟩ } →
+      StepRelLM3_1 body m allocMap (MirStepNode.retNormal retVal mem') (m', .ok true)
+  /-- Both machines report undefined behavior. -/
+  | ub (m' : AnnealStepState) (msg : String) :
+      StepRelLM3_1 body m allocMap (MirStepNode.fail .ub)
+        (m', .error (.undefinedBehavior msg))
+
+/-- Every `FrameRel` is a `FrameRelLM3_1` for any `allocMap`. -/
+theorem FrameRel.toLM3_1 {body : CapturedMir} {mach : AnnealMachine}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : FrameRel body mach af mf) (allocMap : List AllocMapEntry) :
+    FrameRelLM3_1 body mach allocMap af mf where
+  body_eq := h.body_eq
+  location_eq := h.location_eq
+  af_locals_len := h.af_locals_len
+  mf_locals_size := h.mf_locals_size
+  locals_rel i decl slot mls hdecl hslot hmls :=
+    .base (h.locals_rel i decl slot mls hdecl hslot hmls)
+
+/-- With an empty `allocMap`, `LocalRelLM3_1` is `LocalRel`. -/
+theorem LocalRelLM3_1.toLocalRel_nil {mach : AnnealMachine} {decl : LocalDecl}
+    {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_1 mach [] decl layouts slot mls) :
+    LocalRel mach decl layouts slot mls := by
+  cases h with
+  | base h => exact h
+  | rawPtr _ _ _ _ _ _ _ hptr => exact absurd hptr PtrRel.not_nil
+
+/-- `StateRel` embeds into `StateRelLM3_1` with the empty `allocMap`. -/
+theorem StateRel.toLM3_1 {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (h : StateRel body s m) : StateRelLM3_1 body s m [] := by
+  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hbor, hprot, hcaller,
+    hdisj⟩
+  refine .mk tf hframes hretCont hretPlace (hfr.toLM3_1 []) hcal hstack hprot hcaller ?_
+    (AllocMapRel.nil body s m) hdisj
+  intro b hb
+  rw [hbor] at hb
+  cases hb
+
+/-- `StateRelLM3_1` with the empty `allocMap` is `StateRel`: the extension is
+conservative. -/
+theorem StateRelLM3_1.toStateRel {body : CapturedMir} {s : MachineState}
+    {m : AnnealStepState} (h : StateRelLM3_1 body s m []) : StateRel body s m := by
+  rcases h with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, htracked,
+    _, hdisj⟩
+  have hbor : s.memory.borrows = .nil := by
+    cases hb : s.memory.borrows with
+    | nil => rfl
+    | cons b rest =>
+      obtain ⟨_, he, _⟩ := htracked b (by rw [hb]; exact List.Mem.head _)
+      cases he
+  exact .mk tf hframes hretCont hretPlace
+    ⟨hfr.body_eq, hfr.location_eq, hfr.af_locals_len, hfr.mf_locals_size,
+      fun i decl slot mls hdecl hslot hmls =>
+        (hfr.locals_rel i decl slot mls hdecl hslot hmls).toLocalRel_nil⟩
+    hcal hstack hbor hprot hcaller hdisj
+
+/-- `StepRel` between pointer-free states is `StepRelLM3_1` with the empty
+`allocMap`. -/
+theorem StepRel.toLM3_1 {body : CapturedMir} {m : AnnealStepState}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepRel body m aRes mRes) : StepRelLM3_1 body m [] aRes mRes := by
+  cases h with
+  | step s' m' hrel => exact .step s' m' (StateRel.toLM3_1 hrel)
+  | retRoot decl0 retVal imm0 mem' m' hdecl hret himm hm =>
+    exact .retRoot decl0 retVal imm0 mem' m' hdecl hret himm hm
+  | ub m' msg => exact .ub m' msg
+
+/-- Replace one local of `FrameRelLM3_1`-related frames by `LocalRelLM3_1`-related
+values. -/
+theorem FrameRelLM3_1.update_local
+    {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hrel : FrameRelLM3_1 body mach allocMap af mf)
+    {idx : Nat} {decl : LocalDecl}
+    (hdecl : get? body.localDecls idx = some decl)
+    {hlt_mf : idx < mf.locals.size}
+    (newSlot : LocalSlot) (newVal : Miri.Interpreter.LocalValue AnnealProv)
+    (hnew : LocalRelLM3_1 mach allocMap decl body.layouts newSlot
+      { mf.locals[idx]'hlt_mf with value := newVal }) :
+    FrameRelLM3_1 body mach allocMap
+      { af with locals := af.locals.set idx newSlot }
+      { mf with locals := mf.locals.set idx { mf.locals[idx]'hlt_mf with value := newVal } hlt_mf } where
+  body_eq := hrel.body_eq
+  location_eq := hrel.location_eq
+  af_locals_len := by rw [List.length_set, hrel.af_locals_len]
+  mf_locals_size := by rw [Array.size_set, hrel.mf_locals_size]
+  locals_rel i decl_i slot_i mls_i hdecl_i hslot_i hmls_i := by
+    have hlt_af : idx < af.locals.length := by
+      rw [hrel.af_locals_len, ← hrel.mf_locals_size]; exact hlt_mf
+    rw [get?_eq_getElem?, List.getElem?_set] at hslot_i
+    rw [Array.getElem?_set] at hmls_i
+    by_cases h_eq : idx = i
+    · subst h_eq
+      simp only [↓reduceIte, hlt_af, Option.some.injEq] at hslot_i hmls_i
+      have hdecl_eq : decl_i = decl := by
+        rw [hdecl] at hdecl_i; exact Option.some.inj hdecl_i.symm
+      subst hdecl_eq hslot_i hmls_i
+      exact hnew
+    · simp only [h_eq, ↓reduceIte] at hslot_i hmls_i
+      exact hrel.locals_rel i decl_i slot_i mls_i hdecl_i hslot_i hmls_i
+
+/-! ## 4. Exact `checkAndDerefPtr`, `checkPtrAlign`, and `ptrOffsetInbounds` Lemmas -/
 
 /-- Public mirror of `Miri.Memory.fitsI64` (which is `private` in `Miri.Memory.Access`
 but definitionally equal). -/

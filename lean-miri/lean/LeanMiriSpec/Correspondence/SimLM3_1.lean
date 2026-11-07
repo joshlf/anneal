@@ -14,39 +14,41 @@ import LeanMiriSpec.Correspondence.PtrLM3_1
 /-!
 # `LM-3.1`: Raw Pointers, `AddrOf` + `forceAllocation`, `Deref`, `BinOp.Offset`, `PtrToPtr` & Expose Casts
 
-Correspondence theorems between Anneal's `Trusted.Rustc.V2026_06_01.MirSemantics`
-and `lean-miri` for the raw-pointer fragment (`LM-3.1`):
+Correspondence results between Anneal's `Trusted.Rustc.V2026_06_01.MirSemantics`
+and `lean-miri` for the raw-pointer fragment (`LM-3.1`). They are stated over
+`StateRelLM3_1` and `StepRelLM3_1` (`PtrLM3_1`), the pointer-aware extensions of
+`StateRel` and `StepRel`: `StateRel` itself admits neither a borrow entry nor a
+local holding a pointer, so no state reached by taking an address satisfies it.
 
-1. **`Rvalue.RawPtr` (`&raw const p` / `&raw mut p`) and `.immediate → .indirect`
-   Coalescing (`evalRvalue_rawPtr_addrOf_simulation`)**:
-   Taking the address of a live local promotes an immediate local to a memory-backed
-   stack allocation (`Miri.Interpreter.forceAllocation` via
-   `forceAllocation_preserves_StateRel`), records the `(tag, localIdx, allocId, perm)`
-   correspondence in `AllocMapRel`, and produces `PtrRel`-related raw pointers at
-   offset `0` (while a dead target local raises UB in both semantics).
-2. **`PlaceElem.Deref` (`*ptr`) Reads, Writes, and UB (`evalProjection_deref_simulation`)**:
-   Dereferencing a pointer (`_d = copy *_p`, `_d = move *_p`, and `*_p = rv`)
-   succeeds in lockstep when the pointer is live, in-bounds, and aligned, and
-   triggers UB in both semantics on:
-   - dangling / dead allocations after `StorageDead` (`deadAllocation`),
-   - out-of-bounds offsets (`pointerOutOfBounds`),
-   - misaligned accesses (`Size.isAligned = .ok false`), and
-   - null / provenance-less integer pointers (`danglingIntegerPointer`).
-3. **`BinOp.Offset` (`inbounds` vs. `wrapping`) (`evalBinOp_offset_inbounds_simulation`)**:
-   In-bounds pointer offset (`Miri.Interpreter.ptrOffsetInbounds`) succeeds if and
-   only if the pointer has valid provenance and `[offsetBytes, offsetBytes + deltaBytes]`
-   lies within `[0, alloc.byteSize]` without address-space wraparound (including
-   zero-offset / ZST edge cases), preserving `PtrRel` with Anneal's `.binaryOp .offset`
-   and raising UB when out-of-bounds, dangling, or provenance-less; wrapping offset
-   (`Pointer.wrappingSignedOffset`) computes the modular address without bounds or
-   liveness checks.
-4. **`CastKind.PtrToPtr` and Pointer/Integer Exposure Casts (`evalCast_ptrToPtr_simulation`)**:
-   Raw pointer casts (`CastKind.PtrToPtr` via `Miri.Interpreter.Cast.ptrToPtr`)
-   preserve `PtrRel` and pointer provenance across `*const T` / `*mut U`, and
-   `PointerExposeProvenance` / `PointerWithExposedProvenance` round-trip pointer
-   values in both semantics.
-5. **Composed `LM-3.1` Statement Simulation (`step_stmt_lm3_1_simulation`)**:
-   Combines the `LM-3.1` statement forms into a unified step theorem.
+1. **`_d = &raw (const|mut) _t` (`step_rawPtr_addrOf_simulation`)**: one real
+   step of `stepMirFn` and of `Miri.Interpreter.Step.step` under
+   `annealStepHooks`, from a pointer-free `StateRel` state. `forceAllocation`
+   moves an immediate `_t` into the fresh allocation `nextAllocId`
+   (`forceAllocation_promote_eq`, then `LM-1.4`'s
+   `forceAllocation_preserves_StateRel`), `MemPlace.toRef` produces the pointer,
+   and the resulting states are related by `StateRelLM3_1` under the new
+   `allocMap` entry; a dead `_t` or `_d` is undefined behavior in both machines.
+2. **`PlaceElem.Deref` (`evalProjection_deref_simulation`)**: lemmas relating
+   Anneal's dereferencing reads and writes to `evalDerefReadScalarMiri` and
+   `evalDerefWriteScalarMiri`. These two functions compose `lean-miri`'s memory
+   checks (`checkAndDerefPtr`, `Size.isAligned`, `Allocation.readScalar` /
+   `writeScalar`) but are not the interpreter's own `Deref` place path, which
+   `annealStepHooks` does not yet implement; the successful cases take the
+   `lean-miri` read or write result as a premise.
+3. **`BinOp.Offset` (`evalBinOp_offset_inbounds_simulation`)**: Anneal's offset
+   and `lean-miri`'s `ptrOffsetInbounds` on byte deltas. Anneal never reports
+   undefined behavior for `Offset` (it adds the raw count to `offsetBytes`, with
+   neither a bounds check nor scaling by the pointee size), whereas `lean-miri`
+   reports it for out-of-bounds offsets; see `WitLM3_1` for a kernel-checked
+   consequence.
+4. **`CastKind.PtrToPtr` (`evalCast_ptrToPtr_simulation`)**: Anneal's cast and
+   `Miri.Interpreter.Cast.ptrToPtr` both keep the pointer. The exposure casts
+   are related only on the Anneal side (`evalRvalue_expose_withExposed_roundtrip`):
+   Anneal's exposed address `allocId * 65536 + offsetBytes` is not `lean-miri`'s
+   address `(allocId <<< 32) + offset`.
+5. **Composed step (`step_stmt_lm3_1_simulation`)**: the `LM-1.4` statement forms
+   (lifted to `StepRelLM3_1 []`) and the address-of form, as one real-step
+   theorem.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -84,33 +86,17 @@ inductive ImmediateRelLM3_1
 
 namespace ImmediateRelLM3_1
 
-/-- Monotonicity of `ImmediateRelLM3_1` when extending `allocMap` with a fresh entry
-whose tag was not previously mapped. -/
-theorem of_cons_fresh
-    {allocMap : List AllocMapEntry} {e : AllocMapEntry}
+/-- `ImmediateRelLM3_1` survives extending `allocMap` with another entry. -/
+theorem mono_cons
+    {allocMap : List AllocMapEntry} (e : AllocMapEntry)
     {ty : Ty} {layouts : LayoutTable}
     {v : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
-    (hfresh : ∀ p : ProvenancePtr, v = .ptr p 8 → e.tag ≠ p.tag)
     (h : ImmediateRelLM3_1 allocMap ty layouts v imm) :
     ImmediateRelLM3_1 (e :: allocMap) ty layouts v imm := by
   cases h with
   | of_immediateRel himm => exact .of_immediateRel himm
   | rawPtr mutability pointeeKind p mptr hty hptr =>
-    refine .rawPtr mutability pointeeKind p mptr hty ?_
-    cases hptr with
-    | mk allocId borTag hprov hid hoff haddr htarget =>
-      refine .mk allocId borTag hprov hid hoff haddr ?_
-      rcases htarget with ⟨e', he', htag, halloc⟩ | ⟨hnone, halloc⟩
-      · exact Or.inl ⟨e', List.mem_cons_of_mem e he', htag, halloc⟩
-      · right
-        refine ⟨?_, halloc⟩
-        unfold lookupAllocMapByTag
-        have hne : Nat.beq e.tag p.tag = false := by
-          cases hbeq : Nat.beq e.tag p.tag
-          · rfl
-          · exact absurd (Nat.eq_of_beq_eq_true hbeq) (hfresh p rfl)
-        rw [hne]
-        exact hnone
+    exact .rawPtr mutability pointeeKind p mptr hty (hptr.mono_cons e)
 
 end ImmediateRelLM3_1
 
@@ -127,8 +113,13 @@ def castTypeInfoOfEncodedTyIdLM3_1 (tyId : Miri.MIR.TyId) :
   | 42 => .ok .fnPointer
   | _ => castTypeInfoOfEncodedTyId tyId
 
-/-- `CastHooks` extended for `LM-3.1` with raw pointer type classification
-(`castTypeInfoOfEncodedTyIdLM3_1`) and provenance exposure hooks. -/
+/-- `annealCastHooks` with `castTypeInfoOfEncodedTyIdLM3_1` as the type
+classifier, so that `Miri.Interpreter.Cast.ptrToPtr` recognizes raw pointers.
+The pointee argument of `.rawPointer` is a placeholder: `encodeTyId` maps every
+raw pointer type to `TyId = 40`, so the pointee is not recoverable, and
+`ptrToPtr` does not inspect it. The provenance-exposure leaves stay those of
+`annealCastHooks`, which fail closed: Anneal's exposed addresses
+(`allocId * 65536 + offsetBytes`) do not correspond to `lean-miri` addresses. -/
 def annealCastHooksLM3_1 (layouts : LayoutTable := emptyLayoutTable) :
     Miri.Interpreter.CastHooks
       AnnealProv
@@ -139,32 +130,7 @@ def annealCastHooksLM3_1 (layouts : LayoutTable := emptyLayoutTable) :
     typeInfo := fun _ tyId =>
       match castTypeInfoOfEncodedTyIdLM3_1 tyId with
       | .ok info => pure info
-      | .error err => throw err
-    exposeProvenance := fun _ _ => pure ()
-    pointerFromExposedAddress := fun _ addr =>
-      let allocIdVal := addr >>> 32
-      if h : allocIdVal = 0 then
-        pure (Miri.Memory.Pointer.withoutProvenance addr)
-      else
-        pure ⟨Miri.ABI.Size.ofBytes addr,
-          some (.concrete ⟨allocIdVal, h⟩ Miri.Memory.BorTag.one)⟩ }
-
-/-- Evaluate `Rvalue.RawPtr` (`&raw const local` / `&raw mut local`) in `lean-miri`:
-resolves the local place via `annealEvalPlace`, materializes its stack allocation
-if currently immediate via `Miri.Interpreter.forceAllocation`, and returns the
-resulting pointer immediate `Scalar.fromPointer annealTargetDataLayout mplace.mplace.ptr`. -/
-def evalRawPtrAddrOfMiri
-    (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (targetIdx : Miri.MIR.LocalId) (ptrTy : Ty) :
-    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.RvalueImmTy AnnealProv) := do
-  let place ← annealEvalPlace localDecls layouts { localId := targetIdx, projection := #[] }
-  let mplace ← Miri.Interpreter.forceAllocation (annealPlaceHooks localDecls layouts) () place
-  let someProv ← match mplace.mplace.ptr.provenance with
-    | some prov => pure prov
-    | none => throw (.invalidProgram "forceAllocation returned provenance-less stack pointer")
-  let ptr : Miri.Memory.Pointer AnnealProv := ⟨mplace.mplace.ptr.offset, someProv⟩
-  return ⟨.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout ptr),
-    translateTy ptrTy layouts⟩
+      | .error err => throw err }
 
 /-- Evaluate a dereference read (`*ptr`) in `lean-miri`:
 1. Validates pointer bounds and liveness via `Miri.Memory.checkAndDerefPtr`;
@@ -294,196 +260,721 @@ theorem evalRvalue_rawPtr_dead_eq
   dsimp only []
   rw [hdead]
 
-/-- **`evalRvalue_rawPtr_addrOf_simulation` (`LM-3.1` Deliverable 1)**:
-Simulation of `Rvalue.RawPtr` (`&raw const _target` / `&raw mut _target`) between
-Anneal's `MirSemantics.evalRvalue` and `lean-miri`'s `evalRawPtrAddrOfMiri`
-(which invokes `Miri.Interpreter.forceAllocation` via `forceAllocation_preserves_StateRel`):
+/-! ### Allocator and type premises for moving a local into memory -/
 
-1. **Coalescing & Address-Of on Live Locals**: When `targetIdx` is live (including
-   when it is `.immediate` in `lean-miri` and promoted to `.indirect (stackAllocPlace allocId)`
-   by `forceAllocation`), `forceAllocation` preserves `StateRel`, the target local
-   in `m'` is memory-backed at `mplace.mplace` with concrete provenance `(allocId, .one)`
-   at base address `annealStackBaseAddr allocId`, Anneal's `evalRvalue` returns
-   `.ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8)`, and the two
-   resulting pointers are related by `PtrRel` and `ImmediateRelLM3_1` under the
-   extended `allocMap' := ⟨s.memory.nextTag, targetIdx, allocId, perm⟩ :: allocMap`!
-2. **Dead-Local UB Agreement**: When `targetIdx` is `.dead`, Anneal's `evalRvalue`
-   returns `.ub` and `lean-miri`'s `evalRawPtrAddrOfMiri` fails (never returning `.ok`). -/
-theorem evalRvalue_rawPtr_addrOf_simulation
-    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
-    (allocMap : List AllocMapEntry)
+/-- Well-formedness of `lean-miri`'s allocation-id supply under which
+`MemoryState.reserveAllocId` issues `nextAllocId` (the premises of
+`Miri.Memory.MemoryState.reserve_of_highWater`), together with the bound
+`nextAllocId < 2^32` under which the base address `annealStackBaseAddr id`
+(`id <<< 32`) of the issued id neither wraps nor overlaps another stack
+allocation.
+
+These are facts about the `lean-miri` memory, not about the statement being
+executed: `MemoryState.empty` satisfies them (`AllocIdSupplyReady.empty`), and
+they fail only once `2^32 - 1` allocation ids have been issued. -/
+structure AllocIdSupplyReady (mem : AnnealMemory) : Prop where
+  /-- The id supply is not exhausted. -/
+  available : mem.idSupplyExhausted = false
+  /-- The next id is a valid (non-zero) `AllocId`. -/
+  nonzero : mem.nextAllocId ≠ 0
+  /-- The optional source-id world is not exhausted. -/
+  sourceAvailable : mem.sourceAllocIdWorldActive = true → mem.sourceAllocIdExhausted = false
+  /-- The optional source-id world has a non-zero next id. -/
+  sourceNonzero : mem.sourceAllocIdWorldActive = true → mem.sourceAllocIdNext ≠ 0
+  /-- Every issued id lies below the high-water mark. -/
+  issued : ∀ id ∈ mem.issuedIds, id.value.toNat < mem.nextAllocId.toNat
+  /-- Every live allocation id lies below the high-water mark. -/
+  live : ∀ row ∈ mem.live, row.1.value.toNat < mem.nextAllocId.toNat
+  /-- Every global allocation id lies below the high-water mark. -/
+  global : ∀ row ∈ mem.globals, row.allocId.value.toNat < mem.nextAllocId.toNat
+  /-- Every dead allocation id lies below the high-water mark. -/
+  dead : ∀ row ∈ mem.dead, row.allocId.value.toNat < mem.nextAllocId.toNat
+  /-- The next id leaves room for its `id <<< 32` base address. -/
+  below_2pow32 : mem.nextAllocId.toNat < 2 ^ 32
+
+namespace AllocIdSupplyReady
+
+/-- `reserveAllocId` issues `nextAllocId`. -/
+theorem reserve_eq {mem : AnnealMemory} (h : AllocIdSupplyReady mem) :
+    ∃ mem', mem.reserveAllocId = (mem', .ok ⟨mem.nextAllocId, h.nonzero⟩) :=
+  Miri.Memory.MemoryState.reserve_of_highWater mem h.available h.nonzero h.sourceAvailable
+    h.sourceNonzero h.issued h.live h.global h.dead
+
+/-- The empty `lean-miri` memory is ready to issue allocation ids. -/
+theorem empty : AllocIdSupplyReady (Miri.Memory.MemoryState.empty : AnnealMemory) where
+  available := rfl
+  nonzero := by decide
+  sourceAvailable := by decide
+  sourceNonzero := by decide
+  issued := by decide
+  live := by decide
+  global := by decide
+  dead := by decide
+  below_2pow32 := by decide
+
+end AllocIdSupplyReady
+
+/-- The layout of a primitive scalar type (`bool`, `char`, or an integer type)
+is sized, and `Allocation.tryNew` creates a fresh zeroed allocation for it. -/
+theorem IsPrimScalarTy.layout_ok {ty : Ty} {layouts : LayoutTable} (h : IsPrimScalarTy ty) :
+    (translateTy ty layouts).layout.isSized = true ∧
+    ∃ allocation : Miri.Memory.Allocation AnnealProv Unit,
+      Miri.Memory.Allocation.tryNew (translateTy ty layouts).layout.size
+        (translateTy ty layouts).layout.align.abi .Uninit annealZeroedStorage = .ok allocation := by
+  rcases h with h | h | ⟨it, h⟩ | ⟨ut, h⟩
+  · simp only [translateTy, h]
+    exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 1 rfl rfl).imp
+      fun _ h => h.1⟩
+  · simp only [translateTy, h]
+    exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 4 rfl rfl).imp
+      fun _ h => h.1⟩
+  · cases it <;> simp only [translateTy, h]
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 1 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 2 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 4 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 8 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 16 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 8 rfl rfl).imp
+        fun _ h => h.1⟩
+  · cases ut <;> simp only [translateTy, h]
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 1 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 2 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 4 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 8 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 16 rfl rfl).imp
+        fun _ h => h.1⟩
+    · exact ⟨rfl, (Miri.Memory.Allocation.tryNew_replicate_full _ _ 8 rfl rfl).imp
+        fun _ h => h.1⟩
+
+/-! ### Forward evaluation of `forceAllocation` on an immediate local -/
+
+/-- `annealPlaceHooks.allocateStack` succeeds once `Allocation.tryNew` and
+`reserveAllocId` do, returning `stackAllocPlace id`. -/
+theorem annealPlaceHooks_allocateStack_ok {ld : List LocalDecl} {ly : LayoutTable}
+    {stk : Miri.Interpreter.Stack AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {mach : AnnealMachine} {layout : Miri.Interpreter.LocalLayout}
+    {allocation : Miri.Memory.Allocation AnnealProv Unit} {mem' : AnnealMemory}
+    {id : Miri.Memory.AllocId}
+    (htry : Miri.Memory.Allocation.tryNew layout.layout.size layout.layout.align.abi .Uninit
+      annealZeroedStorage = .ok allocation)
+    (hres : mach.memory.reserveAllocId = (mem', .ok id)) :
+    (annealPlaceHooks ld ly).allocateStack () layout ⟨stk, mach⟩ =
+      .ok ⟨stackAllocPlace id, layout⟩
+        ⟨stk, stackAllocMachine mach mem' id (allocation.withExtra none)⟩ := by
+  simp only [annealPlaceHooks, htry, hres, bind, EStateM.bind, get, getThe, MonadStateOf.get,
+    EStateM.get, set, MonadStateOf.set, EStateM.set, pure, EStateM.pure]
+  rfl
+
+/-- `annealPlaceHooks.writeMemoryNoValidate` of a scalar into the fresh
+allocation `id` stores the result of `Allocation.writeScalar` at offset `0`. -/
+theorem annealPlaceHooks_writeMemoryNoValidate_ok {ld : List LocalDecl} {ly : LayoutTable}
+    {stk : Miri.Interpreter.Stack AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {mach : AnnealMachine} {mem' : AnnealMemory} {id : Miri.Memory.AllocId}
+    {a0 alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    {layout : Miri.Interpreter.LocalLayout} {sc : Miri.Memory.Scalar AnnealProv}
+    (hfresh : mem'.live.any (fun entry => entry.1 == id) = false)
+    (hw : Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO sc.size) sc a0 = .ok () alloc') :
+    (annealPlaceHooks ld ly).writeMemoryNoValidate () (.scalar sc) ⟨stackAllocPlace id, layout⟩
+        ⟨stk, stackAllocMachine mach mem' id a0⟩ =
+      .ok () ⟨stk, stackAllocMachine mach mem' id alloc'⟩ := by
+  have hbase := lookupBaseAddr_stackAllocMachine_self mach mem' id a0
+  have hidx := findIdx?_push_fresh mem'.live id
+    ({ kind := .stack, allocation := a0 } : Miri.Memory.LocalAllocation AnnealProv
+      (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind) hfresh
+  have hlive : (stackAllocMachine mach mem' id a0).memory.live =
+      mem'.live.push (id, ⟨.stack, a0⟩) := rfl
+  have hoff : Miri.ABI.Size.ofBytes
+      ((Miri.ABI.Size.ofBytes (annealStackBaseAddr id)).bytes - annealStackBaseAddr id) =
+      Miri.ABI.Size.ZERO := by
+    simp [Miri.ABI.Size.ofBytes, Miri.ABI.Size.ZERO]
+  simp only [annealPlaceHooks]
+  simp only [bind, EStateM.bind, get, getThe, MonadStateOf.get, EStateM.get, stackAllocPlace,
+    Option.bind, Miri.Memory.Provenance.getAllocId, hbase, hlive, hidx,
+    Array.getElem?_push_size, hoff, hw, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set,
+    array_push_set!_size]
+  rfl
+
+/-- Forward evaluation of `Miri.Interpreter.forceAllocation` under
+`annealPlaceHooks` on a live immediate local whose layout is already cached:
+it reserves `id`, creates the fresh stack allocation `alloc'` (holding the
+local's scalar, if it has one), and makes the local memory-backed at
+`stackAllocPlace id`, leaving every other local unchanged. -/
+theorem forceAllocation_promote_eq
+    {body : CapturedMir} {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {idx : Nat} {decl : LocalDecl} (hdecl : get? body.localDecls idx = some decl)
+    (hlt : idx < tf.locals.size)
+    (hlay : (tf.locals[idx]'hlt).layout = some (translateTy decl.ty body.layouts))
+    {value : Miri.Interpreter.Immediate AnnealProv}
+    (hval : (tf.locals[idx]'hlt).value = .live (.immediate value))
+    (hsized : (translateTy decl.ty body.layouts).layout.isSized = true)
+    {allocation : Miri.Memory.Allocation AnnealProv Unit}
+    (htry : Miri.Memory.Allocation.tryNew (translateTy decl.ty body.layouts).layout.size
+      (translateTy decl.ty body.layouts).layout.align.abi .Uninit annealZeroedStorage =
+        .ok allocation)
+    {mem' : AnnealMemory} {id : Miri.Memory.AllocId}
+    (hres : m.machine.memory.reserveAllocId = (mem', .ok id))
+    {alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    (hfill : (value = .uninit ∧ alloc' = allocation.withExtra none) ∨
+      ∃ sc, value = .scalar sc ∧
+        Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO sc.size) sc (allocation.withExtra none) =
+          .ok () alloc') :
+    Miri.Interpreter.forceAllocation (annealPlaceHooks body.localDecls body.layouts) ()
+        ⟨.local 0 idx none tf.localsIdentity, translateTy decl.ty body.layouts⟩ m =
+      .ok ⟨stackAllocPlace id, translateTy decl.ty body.layouts⟩
+        { stack := ⟨#[{ tf with
+            locals := tf.locals.set idx
+              { tf.locals[idx]'hlt with value := .live (.indirect (stackAllocPlace id)) } hlt }]⟩
+          machine := stackAllocMachine m.machine mem' id alloc' } := by
+  rcases m with ⟨⟨frames⟩, mach⟩
+  dsimp only at hframes hres ⊢
+  subst hframes
+  have hcache : ∀ l, (tf.locals[idx]'hlt).layout = some l →
+      l = translateTy decl.ty body.layouts := by
+    intro l h; rw [hlay] at h; exact (Option.some.inj h).symm
+  have hgo : tf.getLocalOperand idx = .ok (.immediate value) := by
+    unfold Miri.Interpreter.Frame.getLocalOperand Miri.Interpreter.Frame.getLocal
+      Miri.Interpreter.LocalState.access
+    simp [hlt, hval, bind, Except.bind, pure, Except.pure, Except.mapError]
+  have hpl := placeLayoutOfLocal_eq (m := ⟨⟨#[tf]⟩, mach⟩) rfl hlt hdecl hcache
+  rw [cacheFrameLocalLayout_of_cached tf hlt hlay] at hpl
+  have hfresh := (reserveAllocId_ok_live hres).2
+  rw [← (reserveAllocId_ok_live hres).1] at hfresh
+  unfold Miri.Interpreter.forceAllocation
+  simp only [Miri.Interpreter.requireCurrent_eq,
+    Miri.Interpreter.checkLocalIdentity_debugOff (annealPlaceHooks _ _) _ rfl,
+    bind, EStateM.bind, annealPlaceHooks_frameIndex_eq (m := ⟨⟨#[tf]⟩, mach⟩) rfl]
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, pure, EStateM.pure,
+    annealPlaceHooks_getFrame_eq (m := ⟨⟨#[tf]⟩, mach⟩) rfl]
+  rw [hgo, Miri.Interpreter.stackLift_ok]
+  simp only [pure, EStateM.pure]
+  rw [EStateM.bind_apply_ok hpl]
+  simp only [hsized, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+  rw [EStateM.bind_apply_ok (annealPlaceHooks_allocateStack_ok htry hres)]
+  rcases hfill with ⟨rfl, rfl⟩ | ⟨sc, rfl, hw⟩
+  · simp only [EStateM.bind, pure, EStateM.pure, annealPlaceHooks_afterLocalMovedToMemory_eq,
+      annealPlaceHooks_getFrame_mk, frame_setLocalOperand_live hlt hval,
+      Miri.Interpreter.stackLift_ok, annealPlaceHooks_setFrame_mk]
+  · dsimp only
+    rw [EStateM.bind_apply_ok (annealPlaceHooks_writeMemoryNoValidate_ok hfresh hw)]
+    simp only [EStateM.bind, pure, EStateM.pure, annealPlaceHooks_afterLocalMovedToMemory_eq,
+      annealPlaceHooks_getFrame_mk, frame_setLocalOperand_live hlt hval,
+      Miri.Interpreter.stackLift_ok, annealPlaceHooks_setFrame_mk]
+
+/-! ### The `RawPtr` arm of `evalRvalueIntoPlace` under `annealRvalueHooks` -/
+
+/-- `evalRvalueIntoPlace` of `Rvalue.RawPtr` under `annealRvalueHooks`, once the
+destination and source places are evaluated and `annealForceAllocation` moves
+the source into memory: `MemPlace.toRef` turns the memory place into a pointer
+immediate and `annealWriteImmediate` stores it in the destination.
+`annealRvalueHooks.retagPtrValue` returns `none`, so the pointer is written
+unchanged; Tree Borrows retagging is outside this fragment. -/
+theorem evalRvalueIntoPlace_rawPtr_ok
+    {ld : List LocalDecl} {ly : LayoutTable} {kind : Miri.MIR.RawPtrKind}
+    (hkind : kind ≠ .FakeForPtrMetadata)
+    {dst src : Miri.MIR.Place} {m m₁ m₂ m₃ : AnnealStepState}
+    {dest srcPlace : Miri.Interpreter.RuntimePlace AnnealProv}
+    {mp : Miri.Interpreter.MemPlace AnnealProv} {imm : Miri.Interpreter.Immediate AnnealProv}
+    (hdst : annealEvalPlace ld ly dst m = .ok dest m₁)
+    (hsrc : annealEvalPlace ld ly src m₁ = .ok srcPlace m₂)
+    (hforce : annealForceAllocation ld ly srcPlace m₂ = .ok mp m₃)
+    (href : mp.toRef annealTargetDataLayout = .ok imm) :
+    Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks ld ly) () (.RawPtr kind src) dst m =
+      annealWriteImmediate imm dest m₃ := by
+  have hkind' : (kind != .FakeForPtrMetadata) = true := by simpa using hkind
+  unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
+  simp only [bind, EStateM.bind, hdst, pure, EStateM.pure, hsrc, hforce, href, hkind',
+    Bool.not_false, Bool.true_and, ↓reduceIte, Option.getD_none]
+
+/-- `evalRvalueIntoPlace` of `Rvalue.RawPtr` under `annealRvalueHooks` fails
+with the error, and keeps the state, of a failing `annealForceAllocation`. -/
+theorem evalRvalueIntoPlace_rawPtr_force_error
+    {ld : List LocalDecl} {ly : LayoutTable} {kind : Miri.MIR.RawPtrKind}
+    {dst src : Miri.MIR.Place} {m m₁ m₂ m₃ : AnnealStepState}
+    {dest srcPlace : Miri.Interpreter.RuntimePlace AnnealProv}
+    {err : Miri.Interpreter.StepError}
+    (hdst : annealEvalPlace ld ly dst m = .ok dest m₁)
+    (hsrc : annealEvalPlace ld ly src m₁ = .ok srcPlace m₂)
+    (hforce : annealForceAllocation ld ly srcPlace m₂ = .error err m₃) :
+    Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks ld ly) () (.RawPtr kind src) dst m =
+      .error err m₃ := by
+  unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
+  simp only [bind, EStateM.bind, hdst, pure, EStateM.pure, hsrc, hforce]
+
+/-- `annealForceAllocation` of a dead local reports undefined behavior and
+keeps the state: `forceAllocation`'s `StackError.localExpectedLive` is
+rustc's `err_ub!(DeadLocal)`. -/
+theorem annealForceAllocation_dead_eq
+    {ld : List LocalDecl} {ly : LayoutTable} {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {idx : Nat} (hlt : idx < tf.locals.size)
+    (hdead : (tf.locals[idx]'hlt).value = .dead)
+    (lay : Miri.Interpreter.LocalLayout) :
+    annealForceAllocation ld ly ⟨.local 0 idx none tf.localsIdentity, lay⟩ m =
+      .error (.undefinedBehavior "address of dead local") m := by
+  have hgo : tf.getLocalOperand idx = .error (.localExpectedLive idx) := by
+    unfold Miri.Interpreter.Frame.getLocalOperand Miri.Interpreter.Frame.getLocal
+      Miri.Interpreter.LocalState.access
+    simp [hlt, hdead, bind, Except.bind, pure, Except.pure, Except.mapError]
+  unfold annealForceAllocation Miri.Interpreter.forceAllocation
+  simp only [Miri.Interpreter.requireCurrent_eq,
+    Miri.Interpreter.checkLocalIdentity_debugOff (annealPlaceHooks _ _) _ rfl,
+    bind, EStateM.bind, annealPlaceHooks_frameIndex_eq hframes, bne_self_eq_false,
+    Bool.false_eq_true, ↓reduceIte, pure, EStateM.pure, annealPlaceHooks_getFrame_eq hframes,
+    hgo]
+  rfl
+
+/-- `MemPlace.toRef` of `stackAllocPlace id` is the thin pointer scalar to the
+base of `id` with tag `BorTag.one`. -/
+theorem stackAllocPlace_toRef (id : Miri.Memory.AllocId) :
+    (stackAllocPlace id).toRef annealTargetDataLayout =
+      .ok (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id), .concrete id Miri.Memory.BorTag.one⟩)) :=
+  rfl
+
+/-! ### Layout memoization preserves `StateRel` -/
+
+/-- `StateRel` survives memoizing a local's declared layout in the root frame,
+as `annealEvalPlace` does. -/
+theorem StateRel.cache_layout {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m)
-    (mutability : Mutability) (pointeeKind : RigidTy) (ptrTy : Ty)
-    (hptrTy : ptrTy.kind = .rawPtr mutability pointeeKind)
-    {targetIdx : Local} {targetDecl : LocalDecl}
-    (hdecl : get? body.localDecls targetIdx = some targetDecl) :
-    (get? s.frame.locals targetIdx = some .dead →
-      evalRvalue s.frame.locals (.rawPtr mutability ⟨targetIdx, .nil⟩)
-        s.memory body.localDecls body.layouts = .ub ∧
-      ∀ imm m', evalRawPtrAddrOfMiri body.localDecls body.layouts targetIdx ptrTy m ≠ .ok imm m') ∧
-    (∀ imm m' allocId,
-      evalRawPtrAddrOfMiri body.localDecls body.layouts targetIdx ptrTy m = .ok imm m' →
-      (∃ mptr, imm.imm = .scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr) ∧
-        mptr.provenance = .concrete allocId Miri.Memory.BorTag.one ∧
-        mptr.offset = Miri.ABI.Size.ofBytes (annealStackBaseAddr allocId)) →
-      allocId.value.toNat < 2 ^ 32 →
-      let perm : TreeBorrowPerm := rawPtrPerm body.localDecls body.layouts mutability targetIdx
-      let entry : AllocMapEntry :=
-        { tag := s.memory.nextTag
-          localIdx := targetIdx
-          allocId := allocId
-          perm := perm }
-      let bEntry : BorrowEntry :=
-        { tag := s.memory.nextTag
-          targetLocal := targetIdx
-          targetProjection := .nil
-          perm := perm }
-      StateRel body s m' ∧
-      evalRvalue s.frame.locals (.rawPtr mutability ⟨targetIdx, .nil⟩)
-        s.memory body.localDecls body.layouts =
-        .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8)
-          s.frame.locals
-          { s.memory with
-            borrows := .cons bEntry s.memory.borrows
-            nextTag := s.memory.nextTag + 1 } ∧
-      ImmediateRelLM3_1 (entry :: allocMap) ptrTy body.layouts
-        (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8)
-        imm.imm) := by
-  constructor
-  · intro hdead
-    refine ⟨evalRvalue_rawPtr_dead_eq s body.localDecls body.layouts mutability targetIdx hdead, ?_⟩
-    intro imm m' hok
-    rcases hstate with ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _⟩
-    obtain ⟨slot, mls, _, hlt_mf, hslot, _, hmls_eq, hloc⟩ := hfr.lookup_local hdecl
-    rw [hdead] at hslot
-    injection hslot with hslot
-    subst hslot
-    cases hloc with
-    | dead c hc =>
-      have hc' : ∀ l, (tf.locals[targetIdx]'hlt_mf).layout = some l →
-          l = translateTy targetDecl.ty body.layouts := by
-        rw [hmls_eq]; exact hc
-      unfold evalRawPtrAddrOfMiri at hok
-      dsimp only [bind] at hok
-      rw [EStateM.bind_apply_ok (annealEvalPlace_unprojected hframes hlt_mf hdecl hc')] at hok
-      unfold Miri.Interpreter.forceAllocation at hok
-      have hcf_frames :
-          ({ m with stack := ⟨#[cacheFrameLocalLayout tf targetIdx hlt_mf
-              (translateTy targetDecl.ty body.layouts)]⟩ } : AnnealStepState).stack.frames =
-            #[cacheFrameLocalLayout tf targetIdx hlt_mf
-              (translateTy targetDecl.ty body.layouts)] := rfl
-      simp only [Miri.Interpreter.requireCurrent_eq,
-        Miri.Interpreter.checkLocalIdentity_debugOff (annealPlaceHooks _ _) _ rfl,
-        bind, EStateM.bind,
-        annealPlaceHooks_frameIndex_eq hcf_frames, bne_self_eq_false, Bool.false_eq_true,
-        ↓reduceIte, pure, EStateM.pure, annealPlaceHooks_getFrame_eq hcf_frames] at hok
-      have hgo_dead :
-          (cacheFrameLocalLayout tf targetIdx hlt_mf
-            (translateTy targetDecl.ty body.layouts)).getLocalOperand targetIdx =
-            .error (.localExpectedLive targetIdx) := by
-        unfold Miri.Interpreter.Frame.getLocalOperand Miri.Interpreter.Frame.getLocal
-          Miri.Interpreter.LocalState.access
-        have hlt' : targetIdx < (cacheFrameLocalLayout tf targetIdx hlt_mf
-            (translateTy targetDecl.ty body.layouts)).locals.size := by
-          rw [cacheFrameLocalLayout_size]; exact hlt_mf
-        have hval_dead : ((cacheFrameLocalLayout tf targetIdx hlt_mf
-            (translateTy targetDecl.ty body.layouts)).locals[targetIdx]'hlt').value = .dead := by
-          simp [cacheFrameLocalLayout, hmls_eq]
-        simp [hlt', hval_dead, Except.mapError]
-      rw [hgo_dead] at hok
-      cases hok
-    | immediate _ _ _ _ hv =>
-      rcases hv with ⟨h, _⟩ | ⟨_, h, _⟩ <;> cases h
-    | indirect _ _ _ _ hne _ =>
-      exact absurd rfl hne
-  · intro imm m' allocId hok ⟨mptr, himm, hprov, haddr⟩ hid_lt
-    unfold evalRawPtrAddrOfMiri at hok
-    dsimp only [bind] at hok
-    rcases id hstate with ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
-    obtain ⟨slot, mls, _, hlt_mf, hslot, _, hmls_eq, hloc⟩ := hfr.lookup_local hdecl
-    have hc : ∀ l, (tf.locals[targetIdx]'hlt_mf).layout = some l →
-        l = translateTy targetDecl.ty body.layouts := by
-      rw [hmls_eq]; exact hloc.layout_eq
-    rw [EStateM.bind_apply_ok (annealEvalPlace_unprojected hframes hlt_mf hdecl hc)] at hok
-    have hstate₁ : StateRel body s
-        { m with stack := ⟨#[cacheFrameLocalLayout tf targetIdx hlt_mf
-            (translateTy targetDecl.ty body.layouts)]⟩ } := by
-      refine StateRel.mk _ rfl hretCont hretPlace (hfr.cache_local_layout hdecl hlt_mf)
-        hcal hstack hbor hprot hcaller ?_
-      intro i j mp_i mp_j lay_i lay_j hij hi hj
-      unfold cacheFrameLocalLayout at hi hj
-      have hval_eq : ∀ (k : Nat) mp lay,
-          (tf.locals.set targetIdx
-            { tf.locals[targetIdx]'hlt_mf with
-              layout := some (translateTy targetDecl.ty body.layouts) } hlt_mf)[k]? =
-            some ({ value := .live (.indirect mp), layout := lay } :
-              Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) →
-          ∃ lay', tf.locals[k]? =
-            some ({ value := .live (.indirect mp), layout := lay' } :
-              Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) := by
-        intro k mp lay hk
-        rw [Array.getElem?_set] at hk
-        by_cases htk : targetIdx = k
-        · subst htk
-          simp only [↓reduceIte, Option.some.injEq] at hk
-          injection hk with hval_k _
-          exact ⟨(tf.locals[targetIdx]'hlt_mf).layout, by
-            rw [Array.getElem?_eq_getElem hlt_mf]
-            rcases hmk : tf.locals[targetIdx]'hlt_mf with ⟨v, l⟩
-            rw [hmk] at hval_k
-            subst hval_k
-            rfl⟩
-        · simp only [htk, ↓reduceIte] at hk
-          exact ⟨lay, hk⟩
-      obtain ⟨lay_i', hi'⟩ := hval_eq i mp_i lay_i hi
-      obtain ⟨lay_j', hj'⟩ := hval_eq j mp_j lay_j hj
-      exact hdisj i j mp_i mp_j lay_i' lay_j' hij hi' hj'
-    cases hforce : Miri.Interpreter.forceAllocation (annealPlaceHooks body.localDecls body.layouts) ()
-        ⟨.local 0 targetIdx none tf.localsIdentity,
-          translateTy targetDecl.ty body.layouts⟩
-        { m with stack := ⟨#[cacheFrameLocalLayout tf targetIdx hlt_mf
-            (translateTy targetDecl.ty body.layouts)]⟩ } with
-    | error e s' =>
-      rw [EStateM.bind_apply_error hforce] at hok
-      cases hok
-    | ok mplace m₂ =>
-      rw [EStateM.bind_apply_ok hforce] at hok
-      obtain ⟨hstate₂, hlocal_ind⟩ := forceAllocation_preserves_StateRel hstate₁ hforce
-      cases hprov_mp : mplace.mplace.ptr.provenance with
-      | none =>
-        simp [hprov_mp, EStateM.bind, throw, throwThe, MonadExceptOf.throw, EStateM.throw]
-          at hok
-      | some prov =>
-        simp only [hprov_mp, EStateM.bind, pure, EStateM.pure] at hok
-        injection hok with himm_eq hm₂_eq
-        subst hm₂_eq
-        obtain ⟨tf', lay', hframes', hloc'⟩ := hlocal_ind 0 targetIdx _ rfl
-        rcases id hstate₂ with ⟨tf₂, hframes₂, _, _, hfr₂, _, _, _, _, _, _⟩
-        rw [hframes'] at hframes₂
-        injection hframes₂ with htf_eq
-        injection htf_eq with htf_eq'
-        subst htf_eq'
-        obtain ⟨slot', mls', _, _, hslot', hmls', _, hloc_rel'⟩ := hfr₂.lookup_local hdecl
-        rw [hslot] at hslot'
-        injection hslot' with hslot_eq
-        subst hslot_eq
-        rw [hloc'] at hmls'
-        injection hmls' with hmls_eq'
-        subst hmls_eq'
-        have hlive_slot : slot ≠ .dead := by
-          cases hloc_rel' with
-          | indirect _ _ _ _ hne _ => exact hne
-        refine ⟨hstate₂,
-          evalRvalue_rawPtr_live_eq s body.localDecls body.layouts mutability targetIdx slot
-            hslot hlive_slot, ?_⟩
-        rw [himm]
-        refine .rawPtr mutability pointeeKind
-          { allocId := s.memory.nextTag, offsetBytes := 0 } mptr hptrTy ?_
-        have hzero : (annealStackBaseAddr allocId + UInt64.ofNat 0) =
-            annealStackBaseAddr allocId := by simp
-        refine .mk allocId Miri.Memory.BorTag.one hprov hid_lt (by show 0 < 2 ^ 32; decide)
-          (by rw [haddr, hzero]) ?_
-        exact Or.inl ⟨_, List.Mem.head _, rfl, rfl⟩
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {idx : Nat} {decl : LocalDecl} (hdecl : get? body.localDecls idx = some decl)
+    (hlt : idx < tf.locals.size) :
+    StateRel body s
+      { m with stack := ⟨#[cacheFrameLocalLayout tf idx hlt
+          (translateTy decl.ty body.layouts)]⟩ } := by
+  rcases hstate with
+    ⟨tf₀, hframes₀, hretCont, hretPlace, hfr, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
+  rw [hframes] at hframes₀
+  injection hframes₀ with h₀
+  injection h₀ with htf
+  subst htf
+  refine StateRel.mk _ rfl hretCont hretPlace (hfr.cache_local_layout hdecl hlt) hcal hstack hbor
+    hprot hcaller ?_
+  apply MemoryAllocDisjoint.mono_layout hdisj
+  intro k
+  by_cases hk : k = idx
+  · subst hk
+    refine ⟨translateTy decl.ty body.layouts, ?_⟩
+    dsimp only [cacheFrameLocalLayout]
+    rw [Array.getElem?_set_self, Array.getElem?_eq_getElem hlt]
+    rfl
+  · refine ⟨(tf.locals[k]?).bind (fun x => x.layout), ?_⟩
+    dsimp only [cacheFrameLocalLayout]
+    rw [Array.getElem?_set_ne _ (Ne.symm hk)]
+    cases tf.locals[k]? <;> rfl
+
+/-- `FrameRelLM3_1` survives advancing both machines to the next statement. -/
+theorem FrameRelLM3_1.advance
+    {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : FrameRelLM3_1 body mach allocMap af mf) :
+    FrameRelLM3_1 body mach allocMap
+      { af with stmtIdx := Nat.add af.stmtIdx 1 }
+      { mf with location := .mir ⟨af.blockIdx, af.stmtIdx + 1⟩ } where
+  body_eq := h.body_eq
+  location_eq := rfl
+  af_locals_len := h.af_locals_len
+  mf_locals_size := h.mf_locals_size
+  locals_rel := h.locals_rel
+
+/-! ### Step simulation for `_d = &raw (const|mut) _t` -/
+
+/-- The borrow entry that Anneal's `Rvalue.rawPtr` pushes for
+`&raw (const|mut) _target` at tag `tag`. -/
+def rawPtrBorrowEntry (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (mutability : Mutability) (targetIdx : Local) (tag : Nat) : BorrowEntry :=
+  { tag := tag
+    targetLocal := targetIdx
+    targetProjection := .nil
+    perm := rawPtrPerm localDecls layouts mutability targetIdx }
+
+/-- The `allocMap` entry that records `&raw (const|mut) _target` at tag `tag`
+as pointing into the `lean-miri` allocation `allocId`. -/
+def rawPtrAllocMapEntry (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (mutability : Mutability) (targetIdx : Local) (tag : Nat)
+    (allocId : Miri.Memory.AllocId) : AllocMapEntry :=
+  { tag := tag
+    localIdx := targetIdx
+    allocId := allocId
+    perm := rawPtrPerm localDecls layouts mutability targetIdx }
+
+/-- **`step_rawPtr_addrOf_simulation` (`LM-3.1` Deliverable 1)**: one real step
+of `_d = &raw (const|mut) _t` in both machines, from a pointer-free state
+(`StateRel`, in particular no borrows) whose `_t` is an immediate local of
+primitive scalar type.
+
+Anneal's `stepMirFn` and `lean-miri`'s `Miri.Interpreter.Step.step` under
+`annealStepHooks` (whose `RawPtr` arm runs `annealForceAllocation` and
+`MemPlace.toRef`) are related by `StepRelLM3_1`:
+
+* If `_t` is live, `forceAllocation` moves it into the fresh allocation
+  `id = nextAllocId` (`forceAllocation_promote_eq`, after which
+  `forceAllocation_preserves_StateRel` relates every local again), Anneal pushes
+  the root borrow with tag `nextTag`, and both machines store the new pointer in
+  `_d`. The resulting states are related by `StateRelLM3_1` under the single
+  `allocMap` entry `(nextTag, _t, id, perm)`: `_d` is a `PtrRel`-related raw
+  pointer to offset `0` of `id`, and `_t` is memory-backed at
+  `stackAllocPlace id`. If `_d` is dead, both machines instead report undefined
+  behavior.
+* If `_t` is dead, both machines report undefined behavior.
+
+No outcome of either machine is assumed. `hsupply` is a well-formedness fact
+about `lean-miri`'s allocation-id supply that `MemoryState.empty` satisfies. -/
+theorem step_rawPtr_addrOf_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx targetIdx : Local} {mutability : Mutability} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩)
+    {dstDecl targetDecl : LocalDecl} {pointeeKind : RigidTy}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_tgt : get? body.localDecls targetIdx = some targetDecl)
+    (hdst_ty : dstDecl.ty.kind = .rawPtr mutability pointeeKind)
+    (htgt_ty : IsPrimScalarTy targetDecl.ty)
+    (hne : dstIdx ≠ targetIdx)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame targetIdx)
+    (hsupply : AllocIdSupplyReady m.machine.memory) :
+    StepRelLM3_1 body m
+      [rawPtrAllocMapEntry body.localDecls body.layouts mutability targetIdx s.memory.nextTag
+        ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩]
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  obtain ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hbor, hprot, hcaller, hdisj⟩ :=
+    id hstate
+  obtain ⟨himm_dst, himm_tgt⟩ := himm tf hframes
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  simp only [hbb, hstmt]
+  -- `annealEvalPlace` memoizes the layouts of `_d` and then `_t`.
+  obtain ⟨slot_d, mls_d, hlt_af_d, hlt_d, hslot_d, hmls_d, hmls_d_eq, hloc_d⟩ :=
+    hfr.lookup_local hdecl_dst
+  have hcache_d : ∀ l, (tf.locals[dstIdx]'hlt_d).layout = some l →
+      l = translateTy dstDecl.ty body.layouts := by
+    rw [hmls_d_eq]; exact hloc_d.layout_eq
+  have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+  let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
+  have hfra : FrameRel body m.machine s.frame tfa := hfr.cache_local_layout hdecl_dst hlt_d
+  have hstate_a : StateRel body s { m with stack := ⟨#[tfa]⟩ } :=
+    hstate.cache_layout hframes hdecl_dst hlt_d
+  obtain ⟨slot_t, mls_t, hlt_af_t, hlt_t, hslot_t, hmls_t, hmls_t_eq, hloc_t⟩ :=
+    hfra.lookup_local hdecl_tgt
+  have hcache_t : ∀ l, (tfa.locals[targetIdx]'hlt_t).layout = some l →
+      l = translateTy targetDecl.ty body.layouts := by
+    rw [hmls_t_eq]; exact hloc_t.layout_eq
+  have htgt_eval := annealEvalPlace_unprojected (m := { m with stack := ⟨#[tfa]⟩ }) rfl hlt_t
+    hdecl_tgt hcache_t
+  let tfb := cacheFrameLocalLayout tfa targetIdx hlt_t (translateTy targetDecl.ty body.layouts)
+  have hstate_b : StateRel body s { m with stack := ⟨#[tfb]⟩ } :=
+    hstate_a.cache_layout rfl hdecl_tgt hlt_t
+  have hkind : translateRawPtrKind mutability ≠ .FakeForPtrMetadata := by
+    cases mutability <;> decide
+  have hm_stmt : Miri.Interpreter.Step.evalStatement
+      (annealStepHooks body.localDecls body.layouts) ()
+      (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩) m =
+      Miri.Interpreter.runRvalue
+        (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks body.localDecls body.layouts) ()
+          (.RawPtr (translateRawPtrKind mutability) ⟨targetIdx, #[]⟩) ⟨dstIdx, #[]⟩) m := rfl
+  have hval_tb : (tfb.locals[targetIdx]'(by rw [cacheFrameLocalLayout_size]; exact hlt_t)).value =
+      mls_t.value := by
+    simp [tfb, cacheFrameLocalLayout, hmls_t_eq]
+  cases hloc_t with
+  | indirect _ mp _ _ _ _ =>
+    exact absurd rfl (himm_tgt.cache_layout hlt_d _ _ hmls_t mp)
+  | dead cl _ =>
+    -- `_t` is dead: both machines report undefined behavior.
+    have ha : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩
+        body.localDecls body.layouts = MirStepNode.fail .ub := by
+      unfold evalStmt
+      dsimp only
+      rw [evalRvalue_rawPtr_dead_eq s body.localDecls body.layouts mutability targetIdx hslot_t]
+    have hforce := annealForceAllocation_dead_eq (ld := body.localDecls) (ly := body.layouts)
+      (m := { m with stack := ⟨#[tfb]⟩ }) rfl
+      (by rw [cacheFrameLocalLayout_size]; exact hlt_t) hval_tb
+      (translateTy targetDecl.ty body.layouts)
+    have hm_err : Miri.Interpreter.Step.evalStatement
+        (annealStepHooks body.localDecls body.layouts) ()
+        (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩) m =
+        ({ m with stack := ⟨#[tfb]⟩ }, .error (.undefinedBehavior "address of dead local")) := by
+      rw [hm_stmt]
+      unfold Miri.Interpreter.runRvalue
+      rw [evalRvalueIntoPlace_rawPtr_force_error hdst_eval htgt_eval hforce]
+    rw [ha, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err]
+    exact .ub _ _
+  | immediate slot imm cl hcl hval =>
+    -- `_t` is live: `forceAllocation` moves it into the fresh allocation `id`.
+    have hslot_ne_dead : slot_t ≠ .dead := by
+      rcases hval with ⟨rfl, _⟩ | ⟨v, rfl, _⟩ <;> simp
+    have hlt_tb : targetIdx < tfb.locals.size := by
+      rw [cacheFrameLocalLayout_size]; exact hlt_t
+    have hlay_tb : (tfb.locals[targetIdx]'hlt_tb).layout =
+        some (translateTy targetDecl.ty body.layouts) := by
+      simp [tfb, cacheFrameLocalLayout]
+    obtain ⟨hsized, allocation, htry⟩ := htgt_ty.layout_ok (layouts := body.layouts)
+    obtain ⟨mem', hres⟩ := hsupply.reserve_eq
+    obtain ⟨alloc', hfill⟩ : ∃ alloc' : Miri.Memory.Allocation AnnealProv
+          (Option Miri.TreeBorrows.BorrowTree),
+        (imm = .uninit ∧ alloc' = allocation.withExtra none) ∨
+        ∃ sc, imm = .scalar sc ∧
+          Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+            (Miri.Memory.allocRange Miri.ABI.Size.ZERO sc.size) sc (allocation.withExtra none) =
+            .ok () alloc' := by
+      rcases hval with ⟨_, rfl⟩ | ⟨v, _, himmRel⟩
+      · exact ⟨_, Or.inl ⟨rfl, rfl⟩⟩
+      · obtain ⟨sc, msc, _, rfl, hrel, hsz, _, _⟩ := himmRel.of_primitive_scalar htgt_ty
+        have htry' : Miri.Memory.Allocation.tryNew (translateSizeBytes sc.sizeBytes)
+            (translateTy targetDecl.ty body.layouts).layout.align.abi .Uninit
+            annealZeroedStorage = .ok allocation := by
+          rw [← hsz]; exact htry
+        obtain ⟨alloc'', hw, -⟩ := freshStackAlloc_writeScalar_readScalar hrel htry'
+        exact ⟨alloc'', Or.inr ⟨_, rfl, hw⟩⟩
+    have hforce₀ := forceAllocation_promote_eq (m := { m with stack := ⟨#[tfb]⟩ }) rfl hdecl_tgt
+      hlt_tb hlay_tb hval_tb hsized htry hres hfill
+    -- LM-1.4's coalescing theorem relates every local of the new state again.
+    obtain ⟨hstate_c, -⟩ := forceAllocation_preserves_StateRel hstate_b hforce₀
+    obtain ⟨tfc, hframes_c, -, -, hfrc, -, -, -, -, -, hdisj_c⟩ := hstate_c
+    injection hframes_c with hfc₁
+    injection hfc₁ with hfc₂
+    subst hfc₂
+    have hforce : annealForceAllocation body.localDecls body.layouts
+        ⟨.local 0 targetIdx none tfa.localsIdentity, translateTy targetDecl.ty body.layouts⟩
+        { m with stack := ⟨#[tfb]⟩ } =
+        .ok (stackAllocPlace ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)
+          { stack := ⟨#[{ tfb with
+              locals := tfb.locals.set targetIdx
+                { tfb.locals[targetIdx]'hlt_tb with
+                  value := .live (.indirect
+                    (stackAllocPlace ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)) }
+                hlt_tb }]⟩
+            machine := stackAllocMachine m.machine mem'
+              ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩ alloc' } := by
+      unfold annealForceAllocation
+      erw [hforce₀]
+    have hrv := evalRvalueIntoPlace_rawPtr_ok hkind hdst_eval htgt_eval hforce
+      (stackAllocPlace_toRef ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)
+    have hdc_eq₀ : ({ tfb with
+        locals := tfb.locals.set targetIdx
+          { tfb.locals[targetIdx]'hlt_tb with
+            value := .live (.indirect
+              (stackAllocPlace ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)) }
+          hlt_tb } : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit).locals[dstIdx]? =
+        some { mls_d with layout := some (translateTy dstDecl.ty body.layouts) } := by
+      simp only [tfb, tfa, cacheFrameLocalLayout]
+      rw [Array.getElem?_set_ne _ (Ne.symm hne), Array.getElem?_set_ne _ (Ne.symm hne),
+        Array.getElem?_set_self, hmls_d_eq]
+    have htgt_c : ({ tfb with
+        locals := tfb.locals.set targetIdx
+          { tfb.locals[targetIdx]'hlt_tb with
+            value := .live (.indirect
+              (stackAllocPlace ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)) }
+          hlt_tb } : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit).locals[targetIdx]? =
+        some ⟨.live (.indirect (stackAllocPlace ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)),
+          some (translateTy targetDecl.ty body.layouts)⟩ := by
+      simp only [Array.getElem?_set_self]
+      rw [← hlay_tb]
+    generalize htfc : ({ tfb with
+        locals := tfb.locals.set targetIdx
+          { tfb.locals[targetIdx]'hlt_tb with
+            value := .live (.indirect
+              (stackAllocPlace ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)) }
+          hlt_tb } : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) = tfc
+      at hrv hfrc hdisj_c hdc_eq₀ htgt_c
+    generalize hmachc : stackAllocMachine m.machine mem'
+      ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩ alloc' = machc at hrv hfrc
+    -- `_d` is untouched by the promotion of `_t`.
+    have hdc_eq := hdc_eq₀
+    obtain ⟨hlt_dc, -⟩ := Array.getElem?_eq_some_iff.mp hdc_eq
+    cases hloc_d with
+    | indirect _ mp _ _ _ _ =>
+      exact absurd rfl (himm_dst _ hmls_d mp)
+    | dead cld _ =>
+      -- `_d` is dead: both machines report undefined behavior at the write.
+      have hget_dc := frame_getLocal_of_getElem? tfc dstIdx _ hdc_eq
+      have ha : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩
+          body.localDecls body.layouts = MirStepNode.fail .ub := by
+        unfold evalStmt
+        dsimp only
+        rw [evalRvalue_rawPtr_live_eq s body.localDecls body.layouts mutability targetIdx slot_t
+          hslot_t hslot_ne_dead]
+        dsimp only
+        rw [hslot_d]
+      have hm_err : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩) m =
+          (⟨⟨#[tfc]⟩, machc⟩, .error (.undefinedBehavior "write to dead local")) := by
+        rw [hm_stmt]
+        unfold Miri.Interpreter.runRvalue
+        rw [hrv, annealWriteImmediate_dead (m := ⟨⟨#[tfc]⟩, machc⟩) rfl hget_dc]
+      rw [ha, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err]
+      exact .ub _ _
+    | immediate _ oldImm cld _ hvald =>
+      -- `_d` is live: both machines store the new pointer in `_d` and step.
+      have hget_dc := frame_getLocal_of_getElem? tfc dstIdx _ hdc_eq
+      have hw := annealWriteImmediate_live
+        (val := .scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes
+              (annealStackBaseAddr ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩),
+            .concrete ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩ Miri.Memory.BorTag.one⟩))
+        (m := ⟨⟨#[tfc]⟩, machc⟩) (id0 := tf.localsIdentity)
+        (dstLay := translateTy dstDecl.ty body.layouts) rfl hlt_dc hget_dc
+      have hm_ok : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩) m =
+          ({ (⟨⟨#[tfc]⟩, machc⟩ : AnnealStepState) with
+              stack := ⟨#[{ tfc with
+                locals := tfc.locals.set dstIdx
+                  { tfc.locals[dstIdx]'hlt_dc with
+                    value := .live (.immediate (.scalar
+                      (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+                        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr
+                            ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩),
+                          .concrete ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩
+                            Miri.Memory.BorTag.one⟩))) }
+                  hlt_dc }]⟩ },
+            .ok ()) := by
+        rw [hm_stmt]
+        unfold Miri.Interpreter.runRvalue
+        rw [hrv, hw]
+      have hloc_c : tfc.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx⟩ := hfrc.location_eq
+      rw [miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_ok rfl
+        hloc_c]
+      have hslot_d_ne : slot_d ≠ .dead := by
+        rcases hvald with ⟨rfl, _⟩ | ⟨v, rfl, _⟩ <;> simp
+      have ha : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩
+          body.localDecls body.layouts =
+          MirStepNode.step
+            (advanceStmt s
+              (s.frame.locals.set dstIdx (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8)))
+              { s.memory with
+                borrows :=
+                  [rawPtrBorrowEntry body.localDecls body.layouts mutability targetIdx
+                    s.memory.nextTag]
+                nextTag := s.memory.nextTag + 1 }) := by
+        unfold evalStmt
+        dsimp only
+        rw [evalRvalue_rawPtr_live_eq s body.localDecls body.layouts mutability targetIdx slot_t
+          hslot_t hslot_ne_dead]
+        dsimp only
+        rw [hslot_d]
+        have hbeq : Nat.beq targetIdx dstIdx = false := by
+          cases h : Nat.beq targetIdx dstIdx
+          · rfl
+          · exact absurd (Nat.eq_of_beq_eq_true h).symm hne
+        rcases hvald with ⟨rfl, _⟩ | ⟨v, rfl, _⟩ <;>
+        · simp only [set?_eq_some_set hlt_af_d, hprot, hbor, invalidateConflictingBorrows_cons,
+            invalidateConflictingBorrows_nil, updateBorrowPerm, hbeq, rawPtrBorrowEntry]
+      rw [ha]
+      apply StepRelLM3_1.step
+      have hretCont_c : tfc.returnContinuation = .stop false := by
+        rw [← htfc]; exact hretCont
+      have hretPlace_c : ∃ retLay,
+          tfc.returnPlace = .frameLocal 0 0 none retLay tfc.localsIdentity := by
+        rw [← htfc]; exact hretPlace
+      have hptr := PtrRel.of_stackAllocPlace
+        (allocMap := [rawPtrAllocMapEntry body.localDecls body.layouts mutability targetIdx
+          s.memory.nextTag ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩])
+        (e := rawPtrAllocMapEntry body.localDecls body.layouts mutability targetIdx
+          s.memory.nextTag ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩)
+        (List.Mem.head []) hsupply.below_2pow32
+      have hdc' : tfc.locals[dstIdx]'hlt_dc =
+          ⟨.live (.immediate oldImm), some (translateTy dstDecl.ty body.layouts)⟩ := by
+        have h := Array.getElem?_eq_getElem hlt_dc
+        rw [hdc_eq] at h
+        exact (Option.some.inj h).symm
+      have hnew : LocalRelLM3_1 machc
+          [rawPtrAllocMapEntry body.localDecls body.layouts mutability targetIdx
+            s.memory.nextTag ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩]
+          dstDecl body.layouts (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8))
+          { tfc.locals[dstIdx]'hlt_dc with
+            value := .live (.immediate (.scalar
+              (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+                ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr
+                    ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩),
+                  .concrete ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩
+                    Miri.Memory.BorTag.one⟩))) } := by
+        rw [hdc']
+        exact .rawPtr _ _ _ mutability pointeeKind (fun l hl => (Option.some.inj hl).symm)
+          hdst_ty hptr
+      have hfrd := (hfrc.toLM3_1 [rawPtrAllocMapEntry body.localDecls body.layouts mutability
+        targetIdx s.memory.nextTag ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩]).update_local
+        hdecl_dst _ _ hnew
+      refine .mk _ rfl hretCont_c hretPlace_c hfrd.advance hcal hstack hprot hcaller ?_ ?_ ?_
+      · -- The only borrow is the new root borrow.
+        intro b hb
+        have hb' : b = rawPtrBorrowEntry body.localDecls body.layouts mutability targetIdx
+            s.memory.nextTag := by
+          simpa [advanceStmt] using hb
+        subst hb'
+        exact ⟨_, List.Mem.head _, rfl⟩
+      · refine ⟨?_, ?_, ?_, ?_, ?_⟩
+        · intro e₁ h₁ e₂ h₂ _
+          rw [List.mem_singleton] at h₁ h₂
+          rw [h₁, h₂]
+        · intro e₁ h₁ e₂ h₂ _
+          rw [List.mem_singleton] at h₁ h₂
+          rw [h₁, h₂]
+        · intro e he
+          rw [List.mem_singleton] at he
+          subst he
+          refine ⟨hsupply.below_2pow32, ?_⟩
+          show machc.lookupBaseAddr _ = _
+          rw [← hmachc]
+          exact lookupBaseAddr_stackAllocMachine_self _ _ _ _
+        · intro e he
+          rw [List.mem_singleton] at he
+          subst he
+          refine ⟨Nat.lt_succ_self _, ?_⟩
+          simp [advanceStmt, lookupBorrow, rawPtrBorrowEntry, rawPtrAllocMapEntry]
+        · intro topFrame htop e he
+          rw [List.mem_singleton] at he
+          subst he
+          injection htop with h₁
+          injection h₁ with h₂
+          subst h₂
+          refine ⟨fun _ _ _ => ⟨some (translateTy targetDecl.ty body.layouts), ?_⟩,
+            fun hdead => ?_⟩
+          · show (tfc.locals.set dstIdx _ hlt_dc)[targetIdx]? = _
+            rw [Array.getElem?_set_ne _ hne]
+            exact htgt_c
+          · exfalso
+            have h' : get? (s.frame.locals.set dstIdx
+                (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8))) targetIdx =
+                some .dead := hdead
+            rw [get?_eq_getElem?, List.getElem?_set_ne hne, ← get?_eq_getElem?, hslot_t] at h'
+            exact hslot_ne_dead (Option.some.inj h')
+      · apply MemoryAllocDisjoint.mono_immediate hdisj_c
+        intro k
+        by_cases hk : k = dstIdx
+        · subst hk
+          right
+          refine ⟨.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+              ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr
+                  ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩),
+                .concrete ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩
+                  Miri.Memory.BorTag.one⟩),
+            some (translateTy dstDecl.ty body.layouts), ?_⟩
+          show (tfc.locals.set k _ hlt_dc)[k]? = _
+          rw [Array.getElem?_set_self, hdc']
+        · left
+          show (tfc.locals.set dstIdx _ hlt_dc)[k]? = _
+          rw [Array.getElem?_set_ne _ (Ne.symm hk)]
 
 /-! ## 4. Deliverable 2: `PlaceElem.Deref` (`*ptr`) Reads, Writes, and UB Simulation -/
 
@@ -512,14 +1003,12 @@ theorem evalProjection_deref_read_ok
     (he : e ∈ allocMap)
     (htag : e.tag = ptrVal.tag)
     (hperm : e.perm ≠ .disabled)
-    (_hoff0 : ptrVal.offsetBytes = 0)
     (hmptr : mptr = ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
       .concrete e.allocId Miri.Memory.BorTag.one⟩)
     (htarget_slot : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
     (hfind : m.machine.memory.live.find? (fun entry => entry.1 == e.allocId) =
       some (e.allocId, localAlloc))
     (hsz_alloc : localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 8)
-    (_hsc : ScalarRel sc msc)
     (hread_sc : localAlloc.allocation.readScalar annealTargetDataLayout
       (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)) false =
       .ok (.fromScalarInt msc)) :
@@ -597,7 +1086,6 @@ theorem evalProjection_deref_write_ok
     (he : e ∈ allocMap)
     (htag : e.tag = ptrVal.tag)
     (hperm : e.perm = .active)
-    (_hoff0 : ptrVal.offsetBytes = 0)
     (hmptr : mptr = ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
       .concrete e.allocId Miri.Memory.BorTag.one⟩)
     (htarget_slot : get? s.frame.locals e.localIdx = some oldSlot)
@@ -606,7 +1094,6 @@ theorem evalProjection_deref_write_ok
     (hfind : m.machine.memory.live.find? (fun entry => entry.1 == e.allocId) =
       some (e.allocId, localAlloc))
     (hsz_alloc : localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 8)
-    (_hsc : ScalarRel sc msc)
     (hwrite_sc : Miri.Memory.Allocation.writeScalar annealTargetDataLayout
       (Miri.Memory.allocRange Miri.ABI.Size.ZERO msc.size)
       (.fromScalarInt msc) localAlloc.allocation = .ok () alloc') :
@@ -799,35 +1286,27 @@ theorem evalProjection_deref_misaligned_ub
   dsimp only []
   rw [hal]
 
-/-- **`evalProjection_deref_simulation` (`LM-3.1` Deliverable 2)**:
-Simulation of `PlaceElem.Deref` (`*ptr`) across reads, writes, and all four UB
-categories between Anneal's `MirSemantics` and `lean-miri`:
+/-- **`evalProjection_deref_simulation` (`LM-3.1` Deliverable 2)**: the
+dereference lemmas below, bundled. Every clause compares Anneal's
+`evalOperand` / `writePlaceValue` with the stand-ins `evalDerefReadScalarMiri` /
+`evalDerefWriteScalarMiri`, not with `Miri.Interpreter.Step.step`.
 
-1. **Deref Read (`_d = copy *_p` / `_d = move *_p`) & Deref Write (`*_p = val`)**:
-   When `ptrLoc` holds `.ptr ptrVal 8` related by `PtrRel allocMap ptrVal mptr` at
-   `ptrVal.offsetBytes = 0` to an entry `e ∈ allocMap` under `AllocMapRel body s m allocMap`
-   whose target local holds an initialized scalar `.init (.scalar sc)` in a
-   memory-backed allocation `localAlloc` (`MemPlaceRel`), Anneal's
-   `evalOperand (.copy ⟨ptrLoc, [.deref]⟩)` returns `.ok (.scalar sc) s.frame.locals`
-   and `lean-miri`'s `evalDerefReadScalarMiri` succeeds with `.ok (.fromScalarInt msc)`
-   satisfying `ScalarRel sc msc`. Similarly, when `e.perm = .active`, Anneal's
-   `writePlaceValue s.frame.locals s.memory.borrows ⟨ptrLoc, [.deref]⟩ (.scalar newSc)`
-   succeeds with `.ok (s.frame.locals.set e.localIdx (.init (.scalar newSc)))`.
-2. **Dangling / Use-After-`StorageDead` Deref UB**:
-   When `ptrVal` resolves to an allocation `allocId` whose target local is `.dead`
-   in Anneal (`get? s.frame.locals entry.targetLocal = some .dead`) and deallocated
-   in `lean-miri` (`m.machine.memory.live.find? (fun x => x.1 == allocId) = none`),
-   Anneal's `evalOperand (.copy ⟨ptrLoc, [.deref]⟩)` returns `.ub` and `lean-miri`'s
-   `evalDerefReadScalarMiri` fails with `.error (.undefinedBehavior _)`.
-3. **Out-of-Bounds Deref UB**:
-   When `ptrVal` points to an allocation of size `< ptrVal.offsetBytes + 8`,
-   Anneal's `evalOperand (.copy ⟨ptrLoc, [.deref]⟩)` returns `.ub` and `lean-miri`'s
-   `evalDerefReadScalarMiri` fails with `.error (.undefinedBehavior _)`.
-4. **Misaligned & Provenance-less / Null Deref UB**:
-   When `ptrVal.offsetBytes % 8 ≠ 0` on an 8-byte aligned type, `evalDerefReadScalarMiri`
-   fails with `.error (.undefinedBehavior _)`; when `mptr` has no concrete provenance
-   (`Pointer.withoutProvenance addr`), `Miri.Memory.checkAndDerefPtr` fails with
-   `.error (.danglingIntegerPointer addr 8 .memoryAccess)`. -/
+1. **Read and write of an 8-byte scalar local through its `allocMap` entry**:
+   Anneal reads `.scalar sc` (or writes through an `.active` entry); the stand-in
+   returns the `lean-miri` read or write result that the clause takes as a
+   premise. The clauses fix `mptr` to the base of `e.allocId` rather than
+   deriving it from `PtrRel` and `StateRelLM3_1`, and they do not relate `sc` to
+   the `lean-miri` scalar.
+2. **Dangling read**: Anneal's target local is `.dead` and `lean-miri`'s
+   allocation is absent from `memory.live`; both report undefined behavior.
+3. **Unknown tag**: Anneal finds neither a borrow nor a global for the tag, and
+   the stand-in rejects a read past the end of a live allocation. The two
+   pointers are not related by `PtrRel`; in particular this is not an
+   out-of-bounds read through one pointer. Anneal's dereference of a tracked
+   stack pointer ignores `offsetBytes`, so it does not report out-of-bounds
+   reads at all (`WitLM3_1.wit_lm3_1_anneal_offset_deref_divergence`).
+4. **Misaligned read**: the stand-in rejects a misaligned 8-byte read (no
+   Anneal counterpart is stated). -/
 theorem evalProjection_deref_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -848,14 +1327,12 @@ theorem evalProjection_deref_simulation
       e ∈ allocMap →
       e.tag = ptrVal.tag →
       e.perm ≠ .disabled →
-      ptrVal.offsetBytes = 0 →
       mptr = ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
         .concrete e.allocId Miri.Memory.BorTag.one⟩ →
       get? s.frame.locals e.localIdx = some (.init (.scalar sc)) →
       m.machine.memory.live.find? (fun entry => entry.1 == e.allocId) =
         some (e.allocId, localAlloc) →
       localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 8 →
-      ScalarRel sc msc →
       localAlloc.allocation.readScalar annealTargetDataLayout
         (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)) false =
         .ok (.fromScalarInt msc) →
@@ -878,7 +1355,6 @@ theorem evalProjection_deref_simulation
       e ∈ allocMap →
       e.tag = ptrVal.tag →
       e.perm = .active →
-      ptrVal.offsetBytes = 0 →
       mptr = ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
         .concrete e.allocId Miri.Memory.BorTag.one⟩ →
       get? s.frame.locals e.localIdx = some oldSlot →
@@ -887,7 +1363,6 @@ theorem evalProjection_deref_simulation
       m.machine.memory.live.find? (fun entry => entry.1 == e.allocId) =
         some (e.allocId, localAlloc) →
       localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 8 →
-      ScalarRel sc msc →
       Miri.Memory.Allocation.writeScalar annealTargetDataLayout
         (Miri.Memory.allocRange Miri.ABI.Size.ZERO msc.size)
         (.fromScalarInt msc) localAlloc.allocation = .ok () alloc' →
@@ -984,29 +1459,23 @@ theorem evalRvalue_binOp_offset_eq
   rfl
 
 /-- **`evalBinOp_offset_inbounds_simulation` (`LM-3.1` Deliverable 3)**:
-Simulation of `BinOp.Offset` (`inbounds` vs. `wrapping`) between Anneal's
-`MirSemantics` and `lean-miri`'s `Miri.Interpreter.ptrOffsetInbounds` /
-`Miri.Memory.Pointer.wrappingSignedOffset`:
+`BinOp.Offset` by a byte count `deltaBytes` in Anneal, against `lean-miri`'s
+`Miri.Interpreter.ptrOffsetInbounds` and `Pointer.wrappingSignedOffset`, for a
+`PtrRel`-related pointer into the live allocation `localAlloc`:
 
-1. **In-Bounds Offset Equivalence (`iff`)**:
-   For any pointer `PtrRel allocMap ptrVal mptr` pointing into a live allocation
-   `localAlloc` at `ptrVal.offsetBytes ≤ localAlloc.allocation.byteSize.bytes.toNat`
-   and any non-negative offset `deltaBytes < 2^32`, `lean-miri`'s
-   `Miri.Interpreter.ptrOffsetInbounds` succeeds if and only if
-   `ptrVal.offsetBytes + deltaBytes ≤ localAlloc.allocation.byteSize.bytes.toNat`
-   (including the zero-offset / ZST edge case `deltaBytes = 0`).
-2. **In-Bounds `PtrRel` Preservation**:
-   When `ptrVal.offsetBytes + deltaBytes ≤ localAlloc.allocation.byteSize.bytes.toNat`
-   and `ptrVal.offsetBytes + deltaBytes < 2^32`, Anneal's
-   `evalRvalue (.binaryOp .offset ...)` produces
-   `.ok (.ptr { ptrVal with offsetBytes := ptrVal.offsetBytes + deltaBytes } 8)` and
-   `lean-miri`'s `ptrOffsetInbounds` produces `.ok ⟨mptr'.offset, some mptr'.provenance⟩`
-   such that `PtrRel allocMap { ptrVal with offsetBytes := ptrVal.offsetBytes + deltaBytes } mptr'`
-   holds!
-3. **Out-of-Bounds & Dangling UB vs. Wrapping Offset**:
-   When `localAlloc.allocation.byteSize.bytes.toNat < ptrVal.offsetBytes + deltaBytes`,
-   `ptrOffsetInbounds` fails with `.error (.access (.pointerOutOfBounds ...))` (while
-   `wrappingSignedOffset` succeeds without bounds/liveness checks). -/
+1. `ptrOffsetInbounds` succeeds exactly when
+   `ptrVal.offsetBytes + deltaBytes ≤ localAlloc.allocation.byteSize`
+   (including `deltaBytes = 0`).
+2. In that case Anneal's `evalRvalue (.binaryOp .offset ...)` and
+   `ptrOffsetInbounds` produce `PtrRel`-related pointers.
+3. Otherwise `ptrOffsetInbounds` reports `pointerOutOfBounds`, while
+   `wrappingSignedOffset` computes the wrapped address.
+
+The theorem does not run `lean-miri`'s `BinaryOp` arm, which first scales the
+count by the pointee size and reports overflow; `annealScalarOpsHooks` does not
+yet implement `pointerBinary`. Anneal itself adds the unscaled count and never
+reports undefined behavior, so for an out-of-bounds offset the two semantics
+disagree (`WitLM3_1.wit_lm3_1_anneal_offset_deref_divergence`). -/
 theorem evalBinOp_offset_inbounds_simulation
     {s : MachineState} {mach : AnnealMachine}
     {allocMap : List AllocMapEntry}
@@ -1190,20 +1659,13 @@ theorem evalRvalue_expose_withExposed_roundtrip
       rw [hcomm, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hoff]
     rw [hdiv, hmod]
 
-/-- **`evalCast_ptrToPtr_simulation` (`LM-3.1` Deliverable 4)**:
-Simulation of `CastKind.PtrToPtr` (and pointer/integer expose/withExposed casts)
-between Anneal's `MirSemantics.evalRvalue` and `lean-miri`'s
-`Miri.Interpreter.Cast.ptrToPtr` under `annealCastHooksLM3_1`:
-
-1. **`PtrToPtr` Simulation**: Casting a raw pointer `.ptr ptrVal 8` related by
-   `ImmediateRelLM3_1 allocMap srcTy layouts` from `srcTy` (`*const T` or `*mut T`)
-   to `dstTy` (`*const U` or `*mut U`) succeeds in both Anneal and `lean-miri`,
-   preserving the exact pointer provenance and address and establishing
-   `ImmediateRelLM3_1 allocMap dstTy layouts (.ptr ptrVal 8) res.imm`.
-2. **Expose / WithExposed Provenance Round-Trip**: Exposing a pointer's provenance
-   to an integer and reconstructing a pointer from that exposed integer address
-   round-trips `ProvenancePtr` in Anneal (`offsetBytes < 65536`) and reconstructs
-   the concrete `Miri.Memory.Pointer` via `(annealCastHooksLM3_1 layouts).pointerFromExposedAddress`. -/
+/-- **`evalCast_ptrToPtr_simulation` (`LM-3.1` Deliverable 4)**: casting a
+raw pointer `.ptr ptrVal 8` from `srcTy` to `dstTy` (both raw-pointer types)
+keeps the pointer in Anneal's `evalRvalue` and in
+`Miri.Interpreter.Cast.ptrToPtr` under `annealCastHooksLM3_1`, so the results
+stay related by `ImmediateRelLM3_1`. This is `lean-miri`'s cast leaf, not
+`Miri.Interpreter.Step.step`: `annealRvalueHooks.cast` still uses
+`annealCastHooks`, whose classifier rejects raw pointers. -/
 theorem evalCast_ptrToPtr_simulation
     {allocMap : List AllocMapEntry}
     (locals : List LocalSlot) (mem : Memory)
@@ -1238,188 +1700,58 @@ theorem evalCast_ptrToPtr_simulation
 
 /-! ## 7. Deliverable 5: Composed `LM-3.1` Statement Simulation (`step_stmt_lm3_1_simulation`) -/
 
-/-- Well-typed `LM-3.1` statement forms covered by `step_stmt_lm3_1_simulation`:
-- `rawPtrAddrOf`: `_dst = &raw (const|mut) _target`
-- `derefRead`: `_dst = copy *_ptr`
-- `ptrOffset`: `_dst = Offset(copy _ptr, copy _off)`
-- `ptrToPtrCast`: `_dst = copy _src as *const/*mut U (PtrToPtr)` -/
-inductive WellTypedLM3_1Stmt (body : CapturedMir) (s : MachineState) (m : AnnealStepState)
-    (allocMap : List AllocMapEntry) : Statement → Prop where
+/-- Statement forms covered by `step_stmt_lm3_1_simulation` from a pointer-free
+root frame:
+
+* `lm1_4`: every `LM-1.4` statement form (`StorageLive`, `StorageDead` other
+  than `_0`, `PlaceMention` of a live local, and `_d = move _s` between
+  immediate locals), whose `StepRel` step lifts to `StepRelLM3_1 []`;
+* `rawPtrAddrOf`: `_d = &raw (const|mut) _t` into an immediate raw-pointer local
+  `_d` from an immediate local `_t` of primitive scalar type
+  (`step_rawPtr_addrOf_simulation`). -/
+inductive WellTypedLM3_1Stmt (body : CapturedMir) (m : AnnealStepState) : Statement → Prop where
+  | lm1_4 {stmt : Statement} :
+      (∀ topFrame, m.stack.frames = #[topFrame] → WellTypedLM1_4Stmt body topFrame stmt) →
+      WellTypedLM3_1Stmt body m stmt
   | rawPtrAddrOf
       (dstIdx targetIdx : Local) (mutability : Mutability) (pointeeKind : RigidTy)
-      (dstDecl targetDecl : LocalDecl) (span : String)
-      (imm : Miri.Interpreter.RvalueImmTy AnnealProv) (m' : AnnealStepState)
-      (allocId : Miri.Memory.AllocId) (mptr : Miri.Memory.Pointer AnnealProv) :
+      (dstDecl targetDecl : LocalDecl) (span : String) :
       get? body.localDecls dstIdx = some dstDecl →
       get? body.localDecls targetIdx = some targetDecl →
       dstDecl.ty.kind = .rawPtr mutability pointeeKind →
-      evalRawPtrAddrOfMiri body.localDecls body.layouts targetIdx dstDecl.ty m = .ok imm m' →
-      imm.imm = .scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr) →
-      mptr.provenance = .concrete allocId Miri.Memory.BorTag.one →
-      mptr.offset = Miri.ABI.Size.ofBytes (annealStackBaseAddr allocId) →
-      allocId.value.toNat < 2 ^ 32 →
-      WellTypedLM3_1Stmt body s m allocMap
+      IsPrimScalarTy targetDecl.ty →
+      dstIdx ≠ targetIdx →
+      (∀ topFrame, m.stack.frames = #[topFrame] →
+        IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame targetIdx) →
+      WellTypedLM3_1Stmt body m
         ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩
-  | derefRead
-      (dstIdx ptrLoc : Local) (ptrVal : ProvenancePtr)
-      (mptr : Miri.Memory.Pointer AnnealProv) (pointeeTy : Ty)
-      (e : AllocMapEntry) (sc : MirAst.ScalarInt) (msc : Miri.Memory.ScalarInt)
-      (localAlloc :
-        Miri.Memory.LocalAllocation
-          AnnealProv
-          (Option Miri.TreeBorrows.BorrowTree)
-          Miri.Memory.MiriMemoryKind)
-      (span : String) :
-      AllocMapRel body s m allocMap →
-      get? s.frame.locals ptrLoc = some (.init (.ptr ptrVal 8)) →
-      (translateTy pointeeTy body.layouts).layout.size = Miri.ABI.Size.ofBytes 8 →
-      (translateTy pointeeTy body.layouts).layout.align.abi = Miri.ABI.Align.EIGHT →
-      e ∈ allocMap →
-      e.tag = ptrVal.tag →
-      e.perm ≠ .disabled →
-      ptrVal.offsetBytes = 0 →
-      mptr = ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
-        .concrete e.allocId Miri.Memory.BorTag.one⟩ →
-      get? s.frame.locals e.localIdx = some (.init (.scalar sc)) →
-      m.machine.memory.live.find? (fun entry => entry.1 == e.allocId) =
-        some (e.allocId, localAlloc) →
-      localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 8 →
-      sc.sizeBytes = 8 →
-      ScalarRel sc msc →
-      localAlloc.allocation.readScalar annealTargetDataLayout
-        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)) false =
-        .ok (.fromScalarInt msc) →
-      WellTypedLM3_1Stmt body s m allocMap
-        ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨ptrLoc, .cons .deref .nil⟩)), span⟩
-  | ptrOffset
-      (dstIdx ptrLoc offLoc : Local) (ptrVal : ProvenancePtr)
-      (mptr : Miri.Memory.Pointer AnnealProv) (deltaBytes : Nat) (offsetSc : MirAst.ScalarInt)
-      (allocId : Miri.Memory.AllocId) (borTag : Miri.Memory.BorTag)
-      (localAlloc :
-        Miri.Memory.LocalAllocation
-          AnnealProv
-          (Option Miri.TreeBorrows.BorrowTree)
-          Miri.Memory.MiriMemoryKind)
-      (span : String) :
-      PtrRel allocMap ptrVal mptr →
-      mptr.provenance = .concrete allocId borTag →
-      m.machine.lookupBaseAddr allocId = some (annealStackBaseAddr allocId) →
-      m.machine.memory.live.find? (fun entry => entry.1 == allocId) = some (allocId, localAlloc) →
-      ptrVal.offsetBytes ≤ localAlloc.allocation.byteSize.bytes.toNat →
-      deltaBytes < 2 ^ 32 →
-      ptrVal.offsetBytes + deltaBytes ≤ localAlloc.allocation.byteSize.bytes.toNat →
-      ptrVal.offsetBytes + deltaBytes < 2 ^ 32 →
-      offsetSc.bits = deltaBytes →
-      get? s.frame.locals ptrLoc = some (.init (.ptr ptrVal 8)) →
-      get? s.frame.locals offLoc = some (.init (.scalar offsetSc)) →
-      WellTypedLM3_1Stmt body s m allocMap
-        ⟨.assign ⟨dstIdx, .nil⟩
-          (.binaryOp .offset (.copy ⟨ptrLoc, .nil⟩) (.copy ⟨offLoc, .nil⟩)), span⟩
-  | ptrToPtrCast
-      (dstIdx srcLoc : Local) (ptrVal : ProvenancePtr)
-      (mptr : Miri.Memory.Pointer AnnealProv)
-      (srcMut dstMut : Mutability) (srcPointee dstPointee : RigidTy)
-      (srcTy dstTy : Ty) (span : String) :
-      srcTy.kind = .rawPtr srcMut srcPointee →
-      dstTy.kind = .rawPtr dstMut dstPointee →
-      get? s.frame.locals srcLoc = some (.init (.ptr ptrVal 8)) →
-      PtrRel allocMap ptrVal mptr →
-      WellTypedLM3_1Stmt body s m allocMap
-        ⟨.assign ⟨dstIdx, .nil⟩ (.cast .ptrToPtr (.copy ⟨srcLoc, .nil⟩) dstTy), span⟩
 
-/-- **`step_stmt_lm3_1_simulation` (`LM-3.1` Deliverable 5)**:
-Composed `LM-3.1` statement-level simulation theorem dispatching across
-`WellTypedLM3_1Stmt`:
-- `rawPtrAddrOf` (`_dst = &raw (const|mut) _target`),
-- `derefRead` (`_dst = copy *_ptr`),
-- `ptrOffset` (`_dst = Offset(copy _ptr, copy _off)`), and
-- `ptrToPtrCast` (`_dst = copy _src as *const/*mut U`).
-
-In every case, Anneal's Rvalue/Operand evaluator and `lean-miri`'s corresponding
-evaluator (`evalRawPtrAddrOfMiri`, `evalDerefReadScalarMiri`,
-`Miri.Interpreter.ptrOffsetInbounds`, `Miri.Interpreter.Cast.ptrToPtr`) succeed
-in lockstep and produce `ImmediateRelLM3_1`-related values. -/
+/-- **`step_stmt_lm3_1_simulation` (`LM-3.1` Deliverable 5)**: every statement
+satisfying `WellTypedLM3_1Stmt` at the current location of a `StateRel`-related
+pointer-free state steps in lockstep under `Miri.Interpreter.Step.step`
+(`annealStepHooks`) and Anneal's `stepMirFn`, landing in `StateRelLM3_1`-related
+states (or reporting undefined behavior in both machines). The `LM-1.4` forms
+keep the empty `allocMap`; `_d = &raw (const|mut) _t` extends it by the entry
+for the new pointer. -/
 theorem step_stmt_lm3_1_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
-    {allocMap : List AllocMapEntry} {stmt : Statement}
     (hstate : StateRel body s m)
-    (hwt : WellTypedLM3_1Stmt body s m allocMap stmt) :
-    ∃ (dstIdx : Local) (rv : Rvalue) (span : String)
-      (v : Value) (locals' : List LocalSlot) (mem' : Memory)
-      (allocMap' : List AllocMapEntry) (ty : Ty) (imm : Miri.Interpreter.Immediate AnnealProv),
-      stmt = ⟨.assign ⟨dstIdx, .nil⟩ rv, span⟩ ∧
-      evalRvalue s.frame.locals rv s.memory body.localDecls body.layouts =
-        .ok v locals' mem' ∧
-      ImmediateRelLM3_1 allocMap' ty body.layouts v imm := by
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {stmt : Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hwt : WellTypedLM3_1Stmt body m stmt)
+    (hsupply : AllocIdSupplyReady m.machine.memory) :
+    ∃ allocMap : List AllocMapEntry,
+      StepRelLM3_1 body m allocMap
+        (stepMirFn body s)
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
   cases hwt with
+  | lm1_4 hwt =>
+    exact ⟨[], (step_stmt_lm1_4_simulation hstate hphase hbb hstmt hwt).toLM3_1⟩
   | rawPtrAddrOf dstIdx targetIdx mutability pointeeKind dstDecl targetDecl span
-      imm m' allocId mptr _ htargetDecl hptrTy hok himm hprov haddr hid_lt =>
-    have hsim := (evalRvalue_rawPtr_addrOf_simulation allocMap hstate mutability pointeeKind
-      dstDecl.ty hptrTy htargetDecl).2 imm m' allocId hok ⟨mptr, himm, hprov, haddr⟩ hid_lt
-    obtain ⟨_, heval, hrel⟩ := hsim
-    exact ⟨dstIdx, .rawPtr mutability ⟨targetIdx, .nil⟩, span, _, _, _, _, dstDecl.ty, imm.imm,
-      rfl, heval, hrel⟩
-  | derefRead dstIdx ptrLoc ptrVal mptr pointeeTy e sc msc localAlloc span
-      hmap hptr_slot hsz8 halign8 he htag hperm hoff0 hmptr htarget_slot hfind hsz_alloc
-      hsc_sz hsc_rel hread_sc =>
-    have hderef := (evalProjection_deref_simulation hmap ptrLoc ptrVal mptr
-      pointeeTy hptr_slot hsz8 halign8).1 e sc msc localAlloc he htag hperm hoff0 hmptr
-      htarget_slot hfind hsz_alloc hsc_rel hread_sc
-    obtain ⟨hop, _⟩ := hderef
-    rcases id hstate with ⟨_, _, _, _, _, _, _, hbor_nil, _, _, _⟩
-    have heval :
-        evalRvalue s.frame.locals (.use (.copy ⟨ptrLoc, .cons .deref .nil⟩))
-          s.memory body.localDecls body.layouts =
-          .ok (.scalar sc) s.frame.locals s.memory := by
-      unfold evalRvalue
-      dsimp only []
-      rw [hop, hbor_nil]
-    have hty_bool : pointeeTy.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1) := by
-      intro hbool
-      have : (translateTy pointeeTy body.layouts).layout.size = Miri.ABI.Size.ofBytes 1 := by
-        unfold translateTy; rw [hbool]; rfl
-      rw [hsz8] at this
-      cases this
-    have hty_char : pointeeTy.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true := by
-      intro hchar
-      have : (translateTy pointeeTy body.layouts).layout.size = Miri.ABI.Size.ofBytes 4 := by
-        unfold translateTy; rw [hchar]; rfl
-      rw [hsz8] at this
-      cases this
-    have hsz_sc : (translateTy pointeeTy body.layouts).layout.size =
-        translateSizeBytes sc.sizeBytes := by
-      rw [hsz8, hsc_sz]
-      rfl
-    exact ⟨dstIdx, .use (.copy ⟨ptrLoc, .cons .deref .nil⟩), span, .scalar sc,
-      s.frame.locals, s.memory, allocMap, pointeeTy, .scalar (.fromScalarInt msc),
-      rfl, heval, .of_immediateRel (.scalar sc msc hsc_rel hsz_sc hty_bool hty_char)⟩
-  | ptrOffset dstIdx ptrLoc offLoc ptrVal mptr deltaBytes offsetSc allocId borTag localAlloc span
-      hptr_rel hprov hbase hlive hoff_in hdelta hinbounds hsum_lt hsc_bits hptr_slot hoff_slot =>
-    have hoff_sim := (evalBinOp_offset_inbounds_simulation ptrLoc offLoc ptrVal mptr
-      deltaBytes offsetSc allocId borTag localAlloc hptr_rel hprov hbase hlive hoff_in
-      hdelta hsc_bits hptr_slot hoff_slot).2.1 hinbounds hsum_lt
-    obtain ⟨_, _, hptr_rel'⟩ := hoff_sim
-    have heval := evalRvalue_binOp_offset_eq s.frame.locals s.memory body.localDecls body.layouts
-      ptrLoc offLoc ptrVal offsetSc hptr_slot hoff_slot
-    rw [hsc_bits] at heval
-    let ptrTy : Ty := { kind := .rawPtr .mut (.int .i64), layoutIdx := 0 }
-    exact ⟨dstIdx, .binaryOp .offset (.copy ⟨ptrLoc, .nil⟩) (.copy ⟨offLoc, .nil⟩), span,
-      .ptr { ptrVal with offsetBytes := ptrVal.offsetBytes + deltaBytes } 8,
-      s.frame.locals, s.memory, allocMap, ptrTy,
-      .scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
-        ⟨Miri.ABI.Size.ofBytes
-          (annealStackBaseAddr allocId + UInt64.ofNat (ptrVal.offsetBytes + deltaBytes)),
-          .concrete allocId borTag⟩),
-      rfl, heval, .rawPtr .mut (.int .i64) _ _ rfl hptr_rel'⟩
-  | ptrToPtrCast dstIdx srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy span
-      hsrcTy hdstTy hsrc_slot hptr_rel =>
-    have hcast := evalCast_ptrToPtr_simulation s.frame.locals s.memory body.localDecls body.layouts
-      m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy
-      hsrc_slot hptr_rel
-    obtain ⟨heval, _, hrel⟩ := hcast
-    exact ⟨dstIdx, .cast .ptrToPtr (.copy ⟨srcLoc, .nil⟩) dstTy, span,
-      .ptr ptrVal 8, s.frame.locals, s.memory, allocMap, dstTy,
-      .scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr),
-      rfl, heval, hrel⟩
+      hdecl_dst hdecl_tgt hdst_ty htgt_ty hne himm =>
+    exact ⟨_, step_rawPtr_addrOf_simulation hstate hphase hbb hstmt hdecl_dst hdecl_tgt hdst_ty
+      htgt_ty hne himm hsupply⟩
 
 end LeanMiriSpec.Correspondence

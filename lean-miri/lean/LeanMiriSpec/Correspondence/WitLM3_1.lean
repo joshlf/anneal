@@ -12,33 +12,30 @@ import LeanMiriSpec.Correspondence.SimLM3_1
 import LeanMiriSpec.Correspondence.WitLM1_4
 
 /-!
-# Non-Vacuity Witnesses for the `LM-3.1` Correspondence
+# Witnesses for the `LM-3.1` Correspondence
 
-This module provides concrete, kernel-checked witnesses demonstrating that all
-`LM-3.1` definitions and theorems in `PtrLM3_1` and `SimLM3_1` are non-vacuous
-and their hypotheses are jointly satisfiable:
+Concrete, kernel-checked instances of the `LM-3.1` results:
 
-1. **`wit_lm3_1_addrOf_write_read_deref`**:
-   Taking `&raw mut _1` on an immediate scalar local `_1 = 42_u64` (promoting
-   `_1` to a stack allocation via `Miri.Interpreter.forceAllocation` and
-   establishing `AllocMapRel` and `PtrRel`), writing `*_2 = 99_u64` through the
-   raw pointer via `writePlaceValue` / `evalDerefWriteScalarMiri`, and reading
-   back `_0 = *_2` via `evalOperand` / `evalDerefReadScalarMiri` (producing
-   `99_u64` in both Anneal and `lean-miri`), together with `CastKind.PtrToPtr`
-   and `PointerExposeProvenance` / `PointerWithExposedProvenance` round-trip on
-   the resulting pointer.
-2. **`wit_lm3_1_binOp_offset_inbounds_and_oob`**:
-   `BinOp.Offset` in-bounds success (at `delta = 0` and one-past-end `delta = 8`
-   on an 8-byte allocation, preserving `PtrRel`) versus out-of-bounds UB
-   (`delta = 9 > 8`, triggering `StepError.undefinedBehavior` in
-   `Miri.Interpreter.ptrOffsetInbounds` and `.ub` / `.undefinedBehavior` on
-   dereference in both Anneal and `lean-miri`), alongside `wrappingSignedOffset`.
-3. **`wit_lm3_1_use_after_storageDead_ub`**:
-   Use-after-`StorageDead` dangling dereference UB: taking `_2 = &raw const _1`,
-   executing `StorageDead(_1)` (marking `_1 = .dead` in Anneal and freeing
-   `allocId` in `lean-miri`), and dereferencing `*_2` triggers undefined
-   behavior in both Anneal (`runAnnealBounded` and `evalOperand = .ub`) and
-   `lean-miri` (`evalDerefReadScalarMiri = .error (.undefinedBehavior _)`).
+1. **`wit_lm3_1_rawPtr_step`**: `step_rawPtr_addrOf_simulation` applies to
+   `_2 = &raw mut _1` on the immediate scalar `_1 = 42_u64`; both machines take
+   the step (`lean-miri` moving `_1` into a stack allocation), and the resulting
+   states satisfy `StateRelLM3_1` under a non-empty `allocMap`.
+2. **`wit_lm3_1_addrOf_write_read_deref`**: Anneal runs the address-of, write,
+   and read-back body to `99_u64`; the address-of step is item 1; and the
+   dereference stand-ins write and read `99_u64` on an allocation of the promoted
+   shape (a hand-built machine, not the state that item 1 reaches).
+3. **`wit_lm3_1_binOp_offset_inbounds_and_oob`**: `lean-miri`'s
+   `ptrOffsetInbounds` accepts the one-past-end offset `8` and rejects `9` on an
+   8-byte allocation, and the dereference stand-in rejects a read at offset `8`.
+   It states no Anneal behavior.
+4. **`wit_lm3_1_anneal_offset_deref_divergence`**: Anneal returns `42` from a
+   body that dereferences a pointer one element past its local, while
+   `lean-miri`'s access check rejects that access: Anneal's trusted semantics is
+   more permissive than Miri here.
+5. **`wit_lm3_1_use_after_storageDead_ub`**: Anneal reports undefined behavior
+   for a dereference after `StorageDead`, and the dereference stand-in does so on
+   a hand-built machine whose allocation was freed (its frame is not related to
+   the Anneal state).
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness
@@ -234,181 +231,85 @@ theorem lm31AddrOf_stateRel_pre :
   | n + 3 =>
     simp [lm31AddrOfBody, get?] at hdecl
 
-private theorem lm31_allocateStack_ok {ld : List LocalDecl} {ly : LayoutTable}
-    {m : AnnealStepState} {layout : Miri.Interpreter.LocalLayout}
-    {allocation : Miri.Memory.Allocation AnnealProv Unit} {mem' : AnnealMemory}
-    {id : Miri.Memory.AllocId}
-    (htry : Miri.Memory.Allocation.tryNew layout.layout.size layout.layout.align.abi .Uninit
-      annealZeroedStorage = .ok allocation)
-    (hres : m.machine.memory.reserveAllocId = (mem', .ok id)) :
-    (annealPlaceHooks ld ly).allocateStack () layout m =
-      .ok ⟨stackAllocPlace id, layout⟩
-        { m with machine := stackAllocMachine m.machine mem' id (allocation.withExtra none) } := by
-  simp only [annealPlaceHooks, htry, hres, bind, EStateM.bind, get, getThe, MonadStateOf.get,
-    EStateM.get, set, MonadStateOf.set, EStateM.set, pure, EStateM.pure]
-  rfl
+/-- `_1` and `_2` are immediate in `lm31AddrOfMiriPre`. -/
+theorem lm31AddrOf_immediate_pre :
+    ∀ topFrame, lm31AddrOfMiriPre.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame 2 ∧ IsImmediateFrameLocal topFrame 1 := by
+  intro topFrame h
+  injection h with h₁
+  injection h₁ with h₂
+  subst h₂
+  refine ⟨?_, ?_⟩ <;> intro mls hmls mp hmp <;>
+    simp [lm31AddrOfMiriFramePre] at hmls <;> subst hmls <;> cases hmp
 
-private theorem lm31_writeMemoryNoValidate_ok {ld : List LocalDecl} {ly : LayoutTable}
-    {m : AnnealStepState} {mem' : AnnealMemory} {id : Miri.Memory.AllocId}
-    {a0 alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
-    {layout : Miri.Interpreter.LocalLayout} {s : Miri.Memory.Scalar AnnealProv}
-    (hfresh : mem'.live.any (fun entry => entry.1 == id) = false)
-    (hw : Miri.Memory.Allocation.writeScalar annealTargetDataLayout
-      (Miri.Memory.allocRange Miri.ABI.Size.ZERO s.size) s a0 = .ok () alloc') :
-    (annealPlaceHooks ld ly).writeMemoryNoValidate () (.scalar s) ⟨stackAllocPlace id, layout⟩
-        { m with machine := stackAllocMachine m.machine mem' id a0 } =
-      .ok () { m with machine := stackAllocMachine m.machine mem' id alloc' } := by
-  have hbase := lookupBaseAddr_stackAllocMachine_self m.machine mem' id a0
-  have hidx := findIdx?_push_fresh mem'.live id
-    ({ kind := .stack, allocation := a0 } : Miri.Memory.LocalAllocation AnnealProv
-      (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind) hfresh
-  have hlive : (stackAllocMachine m.machine mem' id a0).memory.live =
-      mem'.live.push (id, ⟨.stack, a0⟩) := rfl
-  have hoff : Miri.ABI.Size.ofBytes
-      ((Miri.ABI.Size.ofBytes (annealStackBaseAddr id)).bytes - annealStackBaseAddr id) =
-      Miri.ABI.Size.ZERO := by
-    simp [Miri.ABI.Size.ofBytes, Miri.ABI.Size.ZERO]
-  simp only [annealPlaceHooks]
-  simp only [bind, EStateM.bind, get, getThe, MonadStateOf.get, EStateM.get, stackAllocPlace,
-    Option.bind, Miri.Memory.Provenance.getAllocId, hbase, hlive, hidx,
-    Array.getElem?_push_size, hoff, hw, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set,
-    array_push_set!_size]
-  rfl
-
-/-- `evalRawPtrAddrOfMiri` succeeds on `lm31AddrOfMiriPre`, promoting immediate
-local `_1 = 42_u64` into a fresh stack allocation via `forceAllocation` and
-returning a raw pointer scalar to `lm31AllocId1`. -/
-theorem lm31AddrOf_evalRawPtr_ok :
-    ∃ (m' : AnnealStepState),
-      evalRawPtrAddrOfMiri lm31AddrOfBody.localDecls lm31AddrOfBody.layouts
-        1 rawPtrMutU64Ty lm31AddrOfMiriPre =
-        .ok
-          ⟨.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
-            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
-              .concrete lm31AllocId1 Miri.Memory.BorTag.one⟩),
-            translateTy rawPtrMutU64Ty lm31AddrOfBody.layouts⟩
-          m' := by
-  have hframes : lm31AddrOfMiriPre.stack.frames = #[lm31AddrOfMiriFramePre] := rfl
-  have hlt : 1 < lm31AddrOfMiriFramePre.locals.size := by simp [lm31AddrOfMiriFramePre]
-  have hdecl : get? lm31AddrOfBody.localDecls 1 = some u64Decl := rfl
-  have hcache : ∀ l, (lm31AddrOfMiriFramePre.locals[1]'hlt).layout = some l →
-      l = translateTy u64Decl.ty lm31AddrOfBody.layouts := by
-    intro l h
-    simp [lm31AddrOfMiriFramePre] at h
-    exact h.symm
-  have hgo : lm31AddrOfMiriFramePre.getLocalOperand 1 =
-      .ok (.immediate (.scalar (.fromScalarInt lm31Scalar42))) := rfl
-  obtain ⟨mem', hres⟩ := Miri.Memory.MemoryState.reserve_of_highWater
-    (Miri.Memory.MemoryState.empty : AnnealMemory) rfl (by decide) (by decide) (by decide)
-    (by decide) (by decide) (by decide) (by decide)
-  have hfresh := (reserveAllocId_ok_live hres).2
-  rw [← (reserveAllocId_ok_live hres).1] at hfresh
-  obtain ⟨allocation, htry0, -⟩ :=
-    Miri.Memory.Allocation.tryNew_replicate_full (P := AnnealProv) (translateSizeBytes 8)
-      ⟨3⟩ 8 rfl rfl
-  have htry : Miri.Memory.Allocation.tryNew
-      (translateSizeBytes (⟨42, 8⟩ : MirAst.ScalarInt).sizeBytes) ⟨3⟩ .Uninit
-      annealZeroedStorage = .ok allocation := htry0
-  obtain ⟨alloc', hw, -⟩ := freshStackAlloc_writeScalar_readScalar lm31_scalarRel42 htry
-  have htryL : Miri.Memory.Allocation.tryNew
-      (translateTy u64Decl.ty lm31AddrOfBody.layouts).layout.size
-      (translateTy u64Decl.ty lm31AddrOfBody.layouts).layout.align.abi .Uninit
-      annealZeroedStorage = .ok allocation := htry0
-  have hlt' : 1 < (cacheFrameLocalLayout lm31AddrOfMiriFramePre 1 hlt
-      (translateTy u64Decl.ty lm31AddrOfBody.layouts)).locals.size := by
-    rw [cacheFrameLocalLayout_size]; exact hlt
-  have hval' : ((cacheFrameLocalLayout lm31AddrOfMiriFramePre 1 hlt
-      (translateTy u64Decl.ty lm31AddrOfBody.layouts)).locals[1]'hlt').value =
-      .live (.immediate (.scalar (.fromScalarInt lm31Scalar42))) := by
-    simp [cacheFrameLocalLayout, lm31AddrOfMiriFramePre]
-  have hsized : (translateTy u64Decl.ty lm31AddrOfBody.layouts).layout.isSized = true := by decide
-  have hevalPlace := annealEvalPlace_unprojected hframes hlt hdecl hcache
-  have hcache_eq :
-      { lm31AddrOfMiriPre with
-        stack := ⟨#[cacheFrameLocalLayout lm31AddrOfMiriFramePre 1 hlt
-          (translateTy u64Decl.ty lm31AddrOfBody.layouts)]⟩ } = lm31AddrOfMiriPre := rfl
-  rw [hcache_eq] at hevalPlace
-  have hforce :
-      Miri.Interpreter.forceAllocation
-        (annealPlaceHooks lm31AddrOfBody.localDecls lm31AddrOfBody.layouts) ()
-        ⟨.local 0 1 none lm31AddrOfMiriFramePre.localsIdentity,
-          translateTy u64Decl.ty lm31AddrOfBody.layouts⟩
-        lm31AddrOfMiriPre =
-      .ok ⟨stackAllocPlace lm31AllocId1, translateTy u64Decl.ty lm31AddrOfBody.layouts⟩
-        { lm31AddrOfMiriPre with
-          machine := stackAllocMachine lm31AddrOfMiriPre.machine mem' lm31AllocId1 alloc'
-          stack := ⟨#[Miri.Interpreter.Frame.setLocalOperand
-            (cacheFrameLocalLayout lm31AddrOfMiriFramePre 1 hlt
-              (translateTy u64Decl.ty lm31AddrOfBody.layouts)) 1
-            (.indirect (stackAllocPlace lm31AllocId1))
-            |>.toOption.getD lm31AddrOfMiriFramePre]⟩ } := by
-    unfold Miri.Interpreter.forceAllocation
-    simp only [Miri.Interpreter.requireCurrent_eq,
-      Miri.Interpreter.checkLocalIdentity_debugOff (annealPlaceHooks _ _) _ rfl,
-      bind, EStateM.bind, annealPlaceHooks_frameIndex_eq hframes]
-    simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, pure, EStateM.pure,
-      annealPlaceHooks_getFrame_eq hframes]
-    rw [hgo, Miri.Interpreter.stackLift_ok]
-    simp only [pure, EStateM.pure]
-    rw [EStateM.bind_apply_ok (placeLayoutOfLocal_eq hframes hlt hdecl hcache)]
-    simp only [hsized, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-    rw [EStateM.bind_apply_ok (lm31_allocateStack_ok htryL hres)]
-    rw [EStateM.bind_apply_ok (lm31_writeMemoryNoValidate_ok
-      (m := { lm31AddrOfMiriPre with stack := ⟨#[cacheFrameLocalLayout lm31AddrOfMiriFramePre 1 hlt
-        (translateTy u64Decl.ty lm31AddrOfBody.layouts)]⟩ })
-      (s := .fromScalarInt lm31Scalar42) hfresh hw)]
-    simp only [EStateM.bind, pure, EStateM.pure, annealPlaceHooks_afterLocalMovedToMemory_eq,
-      annealPlaceHooks_getFrame_mk, frame_setLocalOperand_live hlt' hval',
-      Miri.Interpreter.stackLift_ok, annealPlaceHooks_setFrame_mk]
-    rfl
-  unfold evalRawPtrAddrOfMiri
-  dsimp only [bind]
-  rw [EStateM.bind_apply_ok hevalPlace]
-  rw [EStateM.bind_apply_ok hforce]
-  exact ⟨_, rfl⟩
+/-- **`wit_lm3_1_rawPtr_step`**: `step_rawPtr_addrOf_simulation` applies to
+statement 3 (`_2 = &raw mut _1`) of `lm31AddrOfBody` from the pointer-free
+states of `lm31AddrOf_stateRel_pre`, and both machines really take the step:
+Anneal's `stepMirFn` steps, `lean-miri`'s `Miri.Interpreter.Step.step` succeeds
+(moving `_1` into the fresh allocation `lm31AllocId1`), and the two resulting
+states are related by `StateRelLM3_1` under the non-empty `allocMap` entry
+`(tag 1, _1, lm31AllocId1, .active)`. `StateRelLM3_1` with a non-empty
+`allocMap` is therefore satisfiable. -/
+theorem wit_lm3_1_rawPtr_step :
+    ∃ (s' : MachineState) (m' : AnnealStepState),
+      stepMirFn lm31AddrOfBody lm31AddrOfAnnealPre = .step s' ∧
+      Miri.Interpreter.Step.step
+          (annealStepHooks lm31AddrOfBody.localDecls lm31AddrOfBody.layouts) ()
+          lm31AddrOfMiriPre = (m', .ok true) ∧
+      StateRelLM3_1 lm31AddrOfBody s' m'
+        [rawPtrAllocMapEntry lm31AddrOfBody.localDecls lm31AddrOfBody.layouts .mut 1 1
+          lm31AllocId1] := by
+  have hsim := step_rawPtr_addrOf_simulation (body := lm31AddrOfBody)
+    (s := lm31AddrOfAnnealPre) (m := lm31AddrOfMiriPre) lm31AddrOf_stateRel_pre
+    (by intro p h; cases h) (dstIdx := 2) (targetIdx := 1) (mutability := .mut)
+    rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    lm31AddrOf_immediate_pre AllocIdSupplyReady.empty
+  have hstep : (match stepMirFn lm31AddrOfBody lm31AddrOfAnnealPre with
+      | .tau (.running _) => true
+      | _ => false) = true := by decide
+  generalize hA : stepMirFn lm31AddrOfBody lm31AddrOfAnnealPre = aRes at hsim hstep
+  generalize hres : Miri.Interpreter.Step.step
+    (annealStepHooks lm31AddrOfBody.localDecls lm31AddrOfBody.layouts) ()
+    lm31AddrOfMiriPre = res at hsim
+  cases hsim with
+  | step s' m' hrel =>
+    have htag : lm31AddrOfAnnealPre.memory.nextTag = 1 := by decide
+    have hid : (⟨lm31AddrOfMiriPre.machine.memory.nextAllocId,
+        AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = lm31AllocId1 := rfl
+    rw [htag, hid] at hrel
+    exact ⟨s', m', rfl, rfl, hrel⟩
+  | retRoot _ _ _ _ _ _ _ _ _ => simp [MirStepNode.retNormal] at hstep
+  | ub _ _ => simp [MirStepNode.fail] at hstep
 
 /-- **`wit_lm3_1_addrOf_write_read_deref`**:
 Kernel-checked witness for `LM-3.1` Scenario (a):
 1. Running `lm31AddrOfBody` to completion in Anneal (`&raw mut _1`, `*_2 = 99_u64`,
    `_0 = copy *_2`, `StorageDead`, `return`) produces `99_u64` (`some 99`);
-2. Starting from `lm31AddrOf_stateRel_pre` where `_1 = 42_u64` is an immediate
-   scalar local, `evalRvalue_rawPtr_addrOf_simulation` applies to `evalRawPtrAddrOfMiri`,
-   promoting `_1` via `forceAllocation` while preserving `StateRel` and producing
-   `ImmediateRelLM3_1`;
-3. Writing `99_u64` through `*_2` and reading back `*_2` succeeds in both
-   Anneal (`writePlaceValue` / `evalOperand`) and `lean-miri`
-   (`evalDerefWriteScalarMiri` / `evalDerefReadScalarMiri`) and returns `99_u64`
-   (`lm31Scalar99`). -/
+2. the address-of step `_2 = &raw mut _1` runs in lockstep through
+   `Miri.Interpreter.Step.step`, promoting the immediate local `_1` into the
+   stack allocation `lm31AllocId1` and reaching `StateRelLM3_1`-related states
+   (`wit_lm3_1_rawPtr_step`);
+3. on an allocation of that shape (8 bytes at `annealStackBaseAddr lm31AllocId1`),
+   `evalDerefWriteScalarMiri` writes `99_u64` through the pointer and
+   `evalDerefReadScalarMiri` reads it back.
+
+Item 3 exercises the `LM-3.1` dereference stand-ins on a hand-built machine
+rather than on the state that item 2 reaches; the interpreter's own `Deref`
+place path is not yet wired into `annealStepHooks`. -/
 theorem wit_lm3_1_addrOf_write_read_deref :
     -- (1) Full bounded execution of `lm31AddrOfBody` in Anneal returns `99_u64`
     annealOutcomeScalarBits 8
       (runAnnealBounded lm31AddrOfBody 9 (initMachineState lm31AddrOfBody [])) = some 99 ∧
-    -- (2) `evalRvalue_rawPtr_addrOf_simulation` applies non-vacuously to `_2 = &raw mut _1`
-    (∃ (imm : Miri.Interpreter.RvalueImmTy AnnealProv) (m' : AnnealStepState)
-       (allocId : Miri.Memory.AllocId),
-      StateRel lm31AddrOfBody lm31AddrOfAnnealPre m' ∧
-      evalRvalue lm31AddrOfAnnealPre.frame.locals (.rawPtr .mut ⟨1, .nil⟩)
-        lm31AddrOfAnnealPre.memory lm31AddrOfBody.localDecls lm31AddrOfBody.layouts =
-        .ok (.ptr { allocId := lm31AddrOfAnnealPre.memory.nextTag, offsetBytes := 0 } 8)
-          lm31AddrOfAnnealPre.frame.locals
-          { lm31AddrOfAnnealPre.memory with
-            borrows :=
-              { tag := lm31AddrOfAnnealPre.memory.nextTag
-                targetLocal := 1
-                targetProjection := .nil
-                perm := rawPtrPerm lm31AddrOfBody.localDecls lm31AddrOfBody.layouts .mut 1 } ::
-              lm31AddrOfAnnealPre.memory.borrows
-            nextTag := lm31AddrOfAnnealPre.memory.nextTag + 1 } ∧
-      ImmediateRelLM3_1
-        [{ localIdx := 1
-           allocId := allocId
-           tag := lm31AddrOfAnnealPre.memory.nextTag
-           perm := rawPtrPerm lm31AddrOfBody.localDecls lm31AddrOfBody.layouts .mut 1 }]
-        rawPtrMutU64Ty
-        lm31AddrOfBody.layouts
-        (.ptr { allocId := lm31AddrOfAnnealPre.memory.nextTag, offsetBytes := 0 } 8)
-        imm.imm) ∧
-    -- (3) Writing `99_u64` through `*_2` and reading back `*_2` succeeds in both machines
+    -- (2) The address-of step runs in lockstep to `StateRelLM3_1`-related states
+    (∃ (s' : MachineState) (m' : AnnealStepState),
+      stepMirFn lm31AddrOfBody lm31AddrOfAnnealPre = .step s' ∧
+      Miri.Interpreter.Step.step
+          (annealStepHooks lm31AddrOfBody.localDecls lm31AddrOfBody.layouts) ()
+          lm31AddrOfMiriPre = (m', .ok true) ∧
+      StateRelLM3_1 lm31AddrOfBody s' m'
+        [rawPtrAllocMapEntry lm31AddrOfBody.localDecls lm31AddrOfBody.layouts .mut 1 1
+          lm31AllocId1]) ∧
+    -- (3) Writing `99_u64` through the pointer and reading it back
     (∃ (alloc42 alloc99 : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
       let mptr : Miri.Memory.Pointer AnnealProv :=
         ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
@@ -419,13 +320,7 @@ theorem wit_lm3_1_addrOf_write_read_deref :
       evalDerefReadScalarMiri (mkSingleAllocMachine lm31AllocId1 alloc99) mptr
         (Miri.ABI.Size.ofBytes 8) Miri.ABI.Align.EIGHT =
         .ok (.fromScalarInt lm31Scalar99)) := by
-  refine ⟨by decide, ?_, ?_⟩
-  · obtain ⟨m', hok⟩ := lm31AddrOf_evalRawPtr_ok
-    have hsim := (evalRvalue_rawPtr_addrOf_simulation
-      (targetIdx := 1) (targetDecl := u64Decl)
-      [] lm31AddrOf_stateRel_pre .mut (.uint .u64) rawPtrMutU64Ty rfl rfl).2
-      _ m' lm31AllocId1 hok ⟨_, rfl, rfl, rfl⟩ (by decide)
-    exact ⟨_, m', lm31AllocId1, hsim⟩
+  refine ⟨by decide, wit_lm3_1_rawPtr_step, ?_⟩
   · obtain ⟨allocation, htry0, -⟩ :=
       Miri.Memory.Allocation.tryNew_replicate_full (P := AnnealProv) (translateSizeBytes 8)
         ⟨3⟩ 8 rfl rfl
@@ -501,18 +396,12 @@ theorem wit_lm3_1_addrOf_write_read_deref :
 
 /-! ## 3. Witness (b): `BinOp.Offset` In-Bounds vs. Out-of-Bounds UB -/
 
-/-- **`wit_lm3_1_binOp_offset_inbounds_and_oob`**:
-Kernel-checked witness for `LM-3.1` Scenario (b) (`BinOp.Offset` in-bounds vs.
-out-of-bounds UB):
-1. On an 8-byte stack allocation `lm31AllocId1`, `Miri.Interpreter.ptrOffsetInbounds`
-   at base offset `0` succeeds for `delta = 0` and one-past-end `delta = 8`,
-   preserving `PtrRel` with Anneal's `evalRvalue (.binaryOp .offset ...)`;
-2. On the same 8-byte stack allocation, `Miri.Interpreter.ptrOffsetInbounds`
-   fails with `.error (.undefinedBehavior _)` for `delta = 9` (`9 > 8`), while
-   `Pointer.wrappingSignedOffset` succeeds without UB;
-3. Dereferencing the out-of-bounds pointer at offset `8` (requiring bytes `[8, 16)`
-   in an 8-byte allocation) triggers undefined behavior in both Anneal
-   (`evalOperand = .ub`) and `lean-miri` (`evalDerefReadScalarMiri = .error (.undefinedBehavior _)`). -/
+/-- **`wit_lm3_1_binOp_offset_inbounds_and_oob`**: on an 8-byte stack allocation
+`lm31AllocId1`, `lean-miri`'s `ptrOffsetInbounds` at base offset `0` accepts the
+one-past-end delta `8` and rejects `9`, and `evalDerefReadScalarMiri` rejects an
+8-byte read at offset `8`. These are `lean-miri` facts only: Anneal's `Offset`
+never reports undefined behavior, and its dereference of a stack pointer
+ignores the offset (`wit_lm3_1_anneal_offset_deref_divergence`). -/
 theorem wit_lm3_1_binOp_offset_inbounds_and_oob :
     ∃ (alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
       let mach : AnnealMachine := mkSingleAllocMachine lm31AllocId1 alloc
@@ -576,6 +465,85 @@ theorem wit_lm3_1_binOp_offset_inbounds_and_oob :
     refine ⟨"pointer dereference check failed", ?_⟩
     rw [hchk]
 
+/-! ## 3b. Divergence: Anneal Dereferences a Pointer Offset Past Its Local -/
+
+/-- `usize` type. -/
+def usizeTyLM31 : Ty := { kind := .uint .usize, layoutIdx := 0 }
+
+/-- Constant `usize` operand. -/
+def constUsizeLM31 (n : Nat) : ConstOperand :=
+  { ty := usizeTyLM31, val := .scalar (.int ⟨n, 8⟩) }
+
+/-- `Runtime(PostCleanup)` MIR body that offsets a pointer to `_1` by one
+element and dereferences the result:
+```text
+bb0: StorageLive(_1); StorageLive(_2); StorageLive(_3);
+     _1 = const 42_u64;
+     _2 = &raw const _1;
+     _3 = Offset(copy _2, const 1_usize);
+     _0 = copy *_3;
+     return
+```
+In Rust (and in Miri) the dereference is undefined behavior: `_3` points one
+`u64` past the end of `_1`. -/
+def lm31OffsetDerefBody : CapturedMir where
+  defPath := "lm_3_1_witness::offset_deref_past_end"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, u64Decl, rawPtrConstU64Decl, rawPtrConstU64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 1) (.use (.constant (constU64 42)))),
+        mkStmt (.assign (local_ 2) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 3)
+          (.binaryOp .offset (.copy (local_ 2)) (.constant (constUsizeLM31 1)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (derefLocal 3))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_1_anneal_offset_deref_divergence`**: Anneal's `MirSemantics`
+gives `lm31OffsetDerefBody` a defined result, although the program dereferences
+a pointer past the end of `_1`:
+
+1. Anneal runs the body to completion and returns `42`: its `Offset` adds the
+   unscaled count `1` to `offsetBytes` without a bounds check, and its
+   dereference of a tracked stack pointer reads the borrowed local while
+   ignoring `offsetBytes`.
+2. `lean-miri` rejects the corresponding access: `Offset(_2, 1)` on a `*const u64`
+   moves the address by `8` bytes, and `Miri.Memory.checkAndDerefPtr` reports an
+   8-byte access at offset `8` of the 8-byte stack allocation of `_1` as out of
+   bounds.
+
+So `LM-3.1` cannot prove "out-of-bounds offsets are undefined behavior in both
+semantics" as long as Anneal's trusted semantics keeps this behavior. -/
+theorem wit_lm3_1_anneal_offset_deref_divergence :
+    annealOutcomeScalarBits 8
+      (runAnnealBounded lm31OffsetDerefBody 10 (initMachineState lm31OffsetDerefBody [])) =
+      some 42 ∧
+    ∃ alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree),
+      alloc.byteSize = Miri.ABI.Size.ofBytes 8 ∧
+      ∃ err, Miri.Memory.checkAndDerefPtr annealPointerArithmetic
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1 + UInt64.ofNat 8),
+          some (.concrete lm31AllocId1 Miri.Memory.BorTag.one)⟩
+        ((8 : Nat) : Int) .memoryAccess
+        (annealResolvePtr (mkSingleAllocMachine lm31AllocId1 alloc))
+        (annealLookupAlloc (mkSingleAllocMachine lm31AllocId1 alloc)) = .error err := by
+  refine ⟨by decide, ?_⟩
+  obtain ⟨allocation, htry0, -⟩ :=
+    Miri.Memory.Allocation.tryNew_replicate_full (P := AnnealProv) (translateSizeBytes 8)
+      ⟨3⟩ 8 rfl rfl
+  obtain ⟨hsz, _, _, _⟩ := freshStackAlloc_spec htry0
+  refine ⟨allocation.withExtra none, hsz, _,
+    checkAndDerefPtr_live_oob_err lm31AllocId1 Miri.Memory.BorTag.one 8 8
+      ⟨.stack, allocation.withExtra none⟩ .memoryAccess (by decide) (by decide) rfl rfl
+      (by decide) eight_lt_two_pow_63 (by rw [hsz]; decide)⟩
+
 /-! ## 4. Witness (c): Use-After-`StorageDead` Dangling Dereference UB -/
 
 /-- `Runtime(PostCleanup)` MIR body that takes `_2 = &raw const _1`, kills `_1`
@@ -607,16 +575,19 @@ def lm31DanglingBody : CapturedMir where
   layouts := emptyLayoutTable
   allocations := []
 
-/-- **`wit_lm3_1_use_after_storageDead_ub`**:
-Kernel-checked witness for `LM-3.1` Scenario (c) (use-after-`StorageDead`
-dangling dereference UB):
-1. Running `lm31DanglingBody` in Anneal diagnoses undefined behavior at the
-   dangling dereference `_0 = copy *_2` after `StorageDead(_1)`;
-2. At statement 5 (`_0 = copy *_2`), where `_1` is `.dead` in Anneal and
-   `lm31AllocId1` has been deallocated from `m.machine.memory.live` in
-   `lean-miri`, `evalProjection_deref_deadAlloc_ub` (`evalProjection_deref_simulation`
-   clause 3) proves that Anneal's `evalOperand (.copy ⟨2, [.deref]⟩)` returns `.ub`
-   and `lean-miri`'s `evalDerefReadScalarMiri` returns `.error (.undefinedBehavior _)`. -/
+/-- **`wit_lm3_1_use_after_storageDead_ub`**: use-after-`StorageDead`
+dereference.
+
+1. Running `lm31DanglingBody` in Anneal reports undefined behavior at
+   `_0 = copy *_2` after `StorageDead(_1)`.
+2. In the Anneal state at that statement (`_1` dead, `_2` holding the raw
+   pointer with tag `1`), `evalOperand (.copy ⟨2, [.deref]⟩)` is `.ub`, and on a
+   `lean-miri` machine whose allocation `lm31AllocId1` has been freed,
+   `evalDerefReadScalarMiri` reports undefined behavior
+   (`evalProjection_deref_deadAlloc_ub`). The `lean-miri` frame here is
+   `lm31AddrOfMiriFramePre` and is not related to the Anneal state; relating the
+   two states requires stepping both machines through `StorageDead` of an
+   address-taken local, which is not yet proved. -/
 theorem wit_lm3_1_use_after_storageDead_ub :
     -- (1) Full bounded execution of `lm31DanglingBody` in Anneal diagnoses UB
     annealOutcomeIsUB
@@ -626,15 +597,15 @@ theorem wit_lm3_1_use_after_storageDead_ub :
       { frame :=
           { blockIdx := 0
             stmtIdx := 5
-            locals := [.uninit, .dead, .init (.ptr { allocId := 0, offsetBytes := 0 } 8)] }
+            locals := [.uninit, .dead, .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
         memory :=
           { (initMachineState lm31DanglingBody []).memory with
             borrows :=
-              [{ tag := 0
+              [{ tag := 1
                  targetLocal := 1
                  targetProjection := .nil
                  perm := .frozen }]
-            nextTag := 1 } }
+            nextTag := 2 } }
      let mDead : AnnealStepState :=
       { stack := ⟨#[lm31AddrOfMiriFramePre]⟩
         machine :=
@@ -654,12 +625,12 @@ theorem wit_lm3_1_use_after_storageDead_ub :
   refine ⟨by decide, ?_⟩
   exact evalProjection_deref_deadAlloc_ub
     (body := lm31DanglingBody)
-    2 { allocId := 0, offsetBytes := 0 }
+    2 { allocId := 1, offsetBytes := 0 }
     ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1 + UInt64.ofNat 0),
       .concrete lm31AllocId1 Miri.Memory.BorTag.one⟩
     u64Ty
     rfl rfl
-    { tag := 0, targetLocal := 1, targetProjection := .nil, perm := .frozen }
+    { tag := 1, targetLocal := 1, targetProjection := .nil, perm := .frozen }
     lm31AllocId1 Miri.Memory.BorTag.one
     rfl (by intro h; cases h) rfl rfl (by decide) (by decide) rfl rfl
 

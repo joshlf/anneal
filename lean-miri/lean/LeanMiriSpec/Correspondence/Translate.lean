@@ -1216,7 +1216,35 @@ def annealPlaceHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
   enforceValidity := fun _ _ => pure true
   validate := fun _ _ => pure ()
 
-/-- `RvalueHooks` instantiated for Anneal's single-threaded machine. -/
+/-- Run `Miri.Interpreter.forceAllocation` under `annealPlaceHooks`, reporting a
+dead local as undefined behavior.
+
+`forceAllocation` reads the local through `Frame.getLocalOperand`, which fails
+with `StackError.localExpectedLive` on a dead local; `lean-miri` wraps that as
+`StepError.stack`, for which `RunLoop.reportsUB` is `false`. rustc instead
+raises `err_ub!(DeadLocal)` from `LocalState::access_mut` when `force_allocation`
+reaches a dead local (for example in `&raw const _1` after `StorageDead(_1)`),
+and Anneal's `MirSemantics.evalRvalue` returns `.ub` for `Rvalue.rawPtr` and
+`Rvalue.ref` of a dead local. This wrapper reclassifies exactly that error, as
+`annealEvalOperand` does for reads of dead locals, and leaves every other
+outcome and every resulting state unchanged. -/
+def annealForceAllocation (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (place : Miri.Interpreter.RuntimePlace AnnealProv) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.MemPlace AnnealProv) :=
+  fun st =>
+    match Miri.Interpreter.forceAllocation (annealPlaceHooks localDecls layouts) () place st with
+    | .ok res st' => .ok res.mplace st'
+    | .error (.stack (.localExpectedLive _)) st' =>
+        .error (.undefinedBehavior "address of dead local") st'
+    | .error e st' => .error e st'
+
+/-- `RvalueHooks` instantiated for Anneal's single-threaded machine.
+
+`forceAllocation` is `annealForceAllocation`. `toRef` turns a memory place into
+the pointer immediate that refers to it exactly as `lean-miri`'s own machine
+bindings (`PlaceMachine` and `ExecutionMachine`) do: through `MemPlace.toRef`
+(rustc's `MPlaceTy::to_ref`), reporting a malformed place as
+`StepError.invalidProgram`. -/
 def annealRvalueHooks (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) :
     Miri.Interpreter.RvalueHooks
@@ -1243,10 +1271,11 @@ def annealRvalueHooks (localDecls : List LocalDecl := .nil)
   unaryOp := fun c op v => Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooks localDecls layouts) c op v
   writeAggregate := fun _ _ _ _ => throw (.unsupported "writeAggregate")
   writeRepeat := fun _ _ _ => throw (.unsupported "writeRepeat")
-  forceAllocation := fun c v => do
-    let res ← Miri.Interpreter.forceAllocation (annealPlaceHooks localDecls layouts) c v
-    pure res.mplace
-  toRef := fun _ _ => throw (.unsupported "toRef")
+  forceAllocation := fun _ v => annealForceAllocation localDecls layouts v
+  toRef := fun _ mp =>
+    match mp.toRef annealTargetDataLayout with
+    | .ok value => pure value
+    | .error error => throw (.invalidProgram s!"place reference: {repr error}")
   enforceValidity := fun _ _ => pure true
   retagPtrValue := fun _ _ _ => pure none
   placeBaseRaw := fun _ _ => pure false
