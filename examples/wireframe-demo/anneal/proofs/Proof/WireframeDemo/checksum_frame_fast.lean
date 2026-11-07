@@ -52,7 +52,7 @@ private theorem evalByteCastAfterOperand_frame8
     evalByteCastAfterOperand
       Mir.WireframeDemo.checksum_frame_fast.body
       (.move { local_ := 3, projection := .nil })
-      { kind := .array (.uint .u16) 4, layoutIdx := 2 }
+      { kind := .array (.uint .u16) 4, layoutIdx := 5 }
       (frame8Value b0 b1 b2 b3 b4 b5 b6 b7)
       locals' mem =
     .ok (frame4WordsLE b0 b1 b2 b3 b4 b5 b6 b7) locals' mem := rfl
@@ -65,17 +65,17 @@ private theorem evalByteCastAfterOperand_frame8_any
     evalByteCastAfterOperand
       body
       (.move { local_ := 3, projection := .nil })
-      { kind := .array (.uint .u16) 4, layoutIdx := 2 }
+      { kind := .array (.uint .u16) 4, layoutIdx := 5 }
       (frame8Value b0 b1 b2 b3 b4 b5 b6 b7)
       locals' mem =
     .ok (frame4WordsLE b0 b1 b2 b3 b4 b5 b6 b7) locals' mem := by
   have h_eq :
       evalByteCastAfterOperand body (.move { local_ := 3, projection := .nil })
-        { kind := .array (.uint .u16) 4, layoutIdx := 2 }
+        { kind := .array (.uint .u16) 4, layoutIdx := 5 }
         (frame8Value b0 b1 b2 b3 b4 b5 b6 b7) locals' mem =
       evalByteCastAfterOperand Mir.WireframeDemo.checksum_frame_fast.body
         (.move { local_ := 3, projection := .nil })
-        { kind := .array (.uint .u16) 4, layoutIdx := 2 }
+        { kind := .array (.uint .u16) 4, layoutIdx := 5 }
         (frame8Value b0 b1 b2 b3 b4 b5 b6 b7) locals' mem := by
     unfold evalByteCastAfterOperand
     rw [h_decls, h_layouts]

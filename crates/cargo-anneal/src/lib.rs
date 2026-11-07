@@ -96,9 +96,11 @@ pub use obligations::{
     render_verify_module_with_options,
 };
 pub use scaffold::{
-    LEAN_TOOLCHAIN, ScaffoldConfig, ScaffoldReport, detect_authored_item_modules,
-    refresh_workspace_assembly, render_lakefile_toml, scaffold_init_proof_templates,
-    scaffold_init_spec_templates, scaffold_workspace, scaffold_workspace_with_config,
+    LEAN_TOOLCHAIN, MirLiftingProfile, ScaffoldConfig, ScaffoldReport,
+    analyze_mir_lifting_profile, analyze_workspace_lifting_profile, detect_authored_item_modules,
+    refresh_workspace_assembly, render_lakefile_toml, render_proof_template_with_hints,
+    render_scaffold_lifting_hints, scaffold_init_proof_templates, scaffold_init_spec_templates,
+    scaffold_workspace, scaffold_workspace_with_config,
 };
 pub use trace_observer::{
     __anneal_mir_rt_branch, __anneal_mir_rt_call_begin, __anneal_mir_rt_call_end_normal,

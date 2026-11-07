@@ -19,10 +19,8 @@ generated `defaultSpec` using `dischargeRustEqU32` without a `Specs` override.
 -/
 
 theorem verified : VerificationResult Obligations.FrameTutor.pin_magic.claim :=
-  dischargeRustEqU32
+  dischargeRustEqU32FuelFree
     Obligations.FrameTutor.pin_magic.claim
-    4
-    64
     Mir.FrameTutor.__anodized_fn_requires_pin_magic.body
     Mir.FrameTutor.__anodized_fn_ensures_pin_magic.body
     7
