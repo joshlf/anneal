@@ -37,18 +37,25 @@ Instead, lift the body so that `Mir.<Crate>.<Item>.body` stays an opaque
 constant in every goal:
 1. **Call-free, alias-free bodies (`checkPureMir` holds):** Use
    `verifyMirNoPanic_of_pureExec` with the `#mir_lift` rules
-   (`lift_PureMirConverges`, `LiftBlock.of_lookup`, `LiftStmtsTerminator.*`);
-   each rule evaluates one statement or terminator by `rfl` and the step count
-   is synthesized by unification (`SKILL.md`, Pattern A). For companion bodies
-   that pass `checkPureMir`, use the `#mir_lift_spec` theorems
+   (`lift_PureMirConverges`, `LiftBlock.of_lookup`,
+   `LiftStmtsTerminator.{eval_n, cons_eval_norm, cons_eval, term_*}`);
+   each rule evaluates statements or a terminator by `rfl` (`eval_n` steps `n`
+   statements in one pass and `cons_eval_norm` normalizes `PureEnv` via
+   `forcePureEnv?` to prevent `List.set` tower blowup on long blocks) and the
+   step count is synthesized by unification (`SKILL.md`, Pattern A). For
+   companion bodies that pass `checkPureMir`, use the `#mir_lift_spec` theorems
    (`mirBoolPredicateHolds_of_pureExec`,
    `mirBoolPredicateHolds_elim_of_pureExec`).
 2. **Bounded loops:** Use `forRangeUp` with `forRangeUp_induction` and
-   `mirWpConverges_forRangeUp` (or `mirWpConverges_whileRank`) so that the
-   proof is independent of the iteration count.
+   `mirWpConverges_forRangeUp` (or `mirWpConverges_whileRank`) together with
+   `mirStepsConverges_of_cfgStepsWP_none` and `mirWpConverges_of_runCfgSteps_none`
+   so that the proof is structured around a loop invariant at the loop header
+   (`Proof/WireframeDemo/checksum_frame_safe.lean`).
 3. **Reference arguments:** Use `LiftLensBlock` with
-   `mirWpConverges_of_sepLenses` / `verifyStatefulMir_of_sepLenses` (currently
-   restricted to `.runtimePostCleanup` bodies).
+   `mirWpConverges_of_sepLenses` / `verifyStatefulMir_of_sepLenses` (which
+   accepts `isRuntimeMirPhase body.phase = true` for both `.runtimePostCleanup`
+   and `.runtimeOptimized` bodies; see
+   `Proof/WireframeDemo/advance_cursor.lean`).
 4. **Fallback when no lift applies:** `verifyMirNoPanic_of_blockLinear`,
    `holdBoolReq_of_mirBool`, `hold_mirBool_of_blockLinear`,
    `verifyStatefulMirNoPanic_of_cfg`, and

@@ -217,10 +217,13 @@ theorem verified : VerificationResult Obligations.WireframeDemo.frame_total_len.
   ```
 - Long straight-line blocks: the `rfl` of `cons_eval` assigns the next locals
   unreduced, and nested `List.set` towers are re-evaluated without sharing, so
-  per-statement cost doubles (measured `0.17 s → 8.3 s` over six statements of
-  `decode_wire_header`'s `bb0`). Keep lifted blocks short, or normalize after
-  each statement with `dsimp only [advanceStmt, PureState.toMachineState]` and
-  start from a literal initial locals list.
+  per-statement cost with repeated `cons_eval` doubles across long basic blocks.
+  For straight-line prefixes of `n` pure statements, use
+  `LiftStmtsTerminator.eval_n n (by rfl) (Or.inr rfl) (by rfl)` to evaluate all
+  `n` statements in one pass, or use `LiftStmtsTerminator.cons_eval_norm`
+  (which normalizes `env'` via `forcePureEnv?` after each statement so
+  subsequent steps index into a flat list; see
+  `Proof/WireframeDemo/decode_wire_header.lean`).
 
 #### Pattern B: `#mir_lift_spec` for companion predicates
 
@@ -251,11 +254,14 @@ Model `for i in lo..hi` / `while i < hi` loops with
 `forRangeUp_induction`, `forRangeUp_step_of_lt`, and `forRangeUp_eq_init_of_ge`.
 `mirWpConverges_forRangeUp lo hi init step body LoopInv s₀ post h_init h_body
 h_exit` turns a loop invariant `LoopInv i acc s` into a fuel-free
-`MirWpConverges` proof: `h_body` proves one iteration (`MirStepsConverges` from
-the loop head back to the loop head at `i + 1`), and `h_exit` proves the exit
-path once `i ≥ hi`. Use `mirWpConverges_whileRank` for loops with a decreasing
-rank instead of a counter. The proof is independent of the iteration count,
-unlike unrolling the loop through `runCfgSteps`.
+`MirWpConverges` proof (combined with `MirWpConverges.bind` for loop-entry
+setup and `verifyStatefulMirNoPanic_of_wpConverges` at the top level):
+`h_body` proves one iteration (`MirStepsConverges` from the loop head back to
+the loop head at `i + 1`, discharged via `mirStepsConverges_of_cfgStepsWP_none`),
+and `h_exit` proves the exit path once `i ≥ hi` (discharged via
+`mirWpConverges_of_runCfgSteps_none`; see
+`Proof/WireframeDemo/checksum_frame_safe.lean`). Use `mirWpConverges_whileRank`
+for loops with a decreasing rank instead of a counter.
 
 #### Pattern D: `&mut` / `&` arguments with `Anneal.SepLogicLenses`
 
@@ -266,11 +272,11 @@ from the `LiftLensStmt` / `LiftDerefRead` / `LiftDerefFieldRead` /
 `LiftDerefWrite` rules, and conclude with `verifyStatefulMir_of_sepLenses` (or
 `mirWpConverges_of_sepLenses`, `verifyTotalMir_of_sepLenses`); the frame
 outside the lenses is preserved by `LensFramePreserved` without destructuring
-`Memory`. `LiftLensBlock` currently requires `body.phase =
-.runtimePostCleanup`, while `cargo anneal` captures `.runtimeOptimized` bodies,
-so captured items cannot use it until that premise is generalized (as
-`LiftStmtsTerminator` does with `h_phase`). Concrete pinned-memory contracts can
-use `dischargeStatefulEqFuelFree` (a fixed-budget wrapper; see Pattern E).
+`Memory`. `LiftLensBlock` accepts `isRuntimeMirPhase body.phase = true` (`rfl`
+for both `.runtimePostCleanup` fixtures and `.runtimeOptimized` bodies captured
+by `cargo anneal`; see `Proof/WireframeDemo/advance_cursor.lean`). Concrete
+pinned-memory contracts can also use `dischargeStatefulEqFuelFree` (a
+fixed-budget wrapper; see Pattern E).
 
 #### Pattern E: bounded fallbacks (`*FuelFree`, `wpBlockLinear`, `runCfgSteps`)
 
@@ -319,9 +325,9 @@ and apply these nine rules:
 2. **Use `forRangeUp` and `Anneal.SepLogicLenses` for loops and references:**
    Model bounded loops with `forRangeUp` and prove them with
    `mirWpConverges_forRangeUp` (or `mirWpConverges_whileRank`) and a loop
-   invariant, so the proof does not grow with the iteration count; lift
-   reference arguments with `LiftLensBlock` and `mirWpConverges_of_sepLenses`
-   (subject to the `.runtimePostCleanup` phase premise noted in Pattern D).
+   invariant (`Proof/WireframeDemo/checksum_frame_safe.lean`); lift
+   reference arguments with `LiftLensBlock` and `verifyStatefulMir_of_sepLenses`
+   / `mirWpConverges_of_sepLenses` (`Proof/WireframeDemo/advance_cursor.lean`).
 3. **Short-circuit symbolic bit-loops (`bitwiseAndBitsFast` & `swap_le_u16_lane`):**
    Never unfold recursive `bitwiseAndBits` / `bitwiseOrBits` over a symbolic
    `b : Nat` (which unrolls 8–64 nested `Nat.div · 2` trees and stalls kernel
