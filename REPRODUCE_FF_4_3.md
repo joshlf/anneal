@@ -98,8 +98,9 @@ Work unit `FF-4.3` delivers:
   `Anneal.PureMirExec`, `Anneal.MirLiftCore`, `Anneal.MirFuelFree`,
   `Anneal.MirLoops`, `Anneal.SepLogicLenses`, `Anneal.FunctionalTranslation`,
   `Anneal.BitValidity`, and `Anneal.Rustc.V2026_06_01.SymbolicEval`), compatible
-  with `TrustedBoundary.lean` and ignored by comment-stripping checks in
-  `detect_authored_item_modules` and `check_specs_non_vacuous`.
+  with `TrustedBoundary.lean` and ignored by string-literal-, comment-, and
+  identifier-boundary-aware checks in `detect_authored_item_modules` and
+  `check_specs_non_vacuous`.
 
 ### 1.2 `agent-context` Strategy Guide (`crates/cargo-anneal/src/agent.rs`)
 

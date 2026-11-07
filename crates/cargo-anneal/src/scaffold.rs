@@ -176,6 +176,31 @@ pub fn scaffold_init_spec_templates(
     Ok(report.created_spec_files)
 }
 
+fn has_lean_ident_token(src: &str, ident: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(rel) = src[offset..].find(ident) {
+        let pos = offset + rel;
+        let prev_ok = !src[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(crate::agent::is_lean_ident_char);
+        let after_pos = pos + ident.len();
+        let next_ok = !src[after_pos..]
+            .chars()
+            .next()
+            .is_some_and(crate::agent::is_lean_ident_char);
+        if prev_ok && next_ok {
+            return true;
+        }
+        offset = pos + 1;
+    }
+    false
+}
+
+fn has_any_lean_ident_token(src: &str, idents: &[&str]) -> bool {
+    idents.iter().any(|id| has_lean_ident_token(src, id))
+}
+
 /// Inspect `anneal/proofs/` on disk to determine which authored modules exist
 /// for `item_rel_path`.
 pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) -> AuthoredItemModules {
@@ -187,88 +212,128 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
     let spec_text = if has_specs {
         fs::read_to_string(&spec_path)
             .ok()
-            .map(|raw| crate::agent::strip_lean_comments(&raw))
+            .map(|raw| strip_lean_comments_and_strings(&raw))
     } else {
         None
     };
-    let has_legacy_specs_defs = spec_text
-        .as_deref()
-        .is_some_and(|text| !text.contains("ItemSpec") && !text.contains("import Obligations."));
+    let has_legacy_specs_defs = spec_text.as_deref().is_some_and(|text| {
+        !has_any_lean_ident_token(
+            text,
+            &[
+                "ItemSpec",
+                "StatefulItemSpec",
+                "TotalItemSpec",
+                "StatefulEquivItemSpec",
+                "ModularItemSpec",
+                "UbExceptionItemSpec",
+            ],
+        ) && !text.contains("import Obligations.")
+    });
 
     let has_proof = proof_path.is_file();
     let proof_text = if has_proof {
         fs::read_to_string(&proof_path)
             .ok()
-            .map(|raw| crate::agent::strip_lean_comments(&raw))
+            .map(|raw| strip_lean_comments_and_strings(&raw))
     } else {
         None
     };
 
     let spec_is_ub_exception = spec_text.as_deref().is_some_and(|text| {
-        text.contains("UbExceptionItemSpec") || text.contains("refineUbExceptionSpec")
+        has_any_lean_ident_token(text, &["UbExceptionItemSpec", "refineUbExceptionSpec"])
     });
     let spec_is_modular = spec_text.as_deref().is_some_and(|text| {
-        text.contains("ModularItemSpec") || text.contains("refineModularSpec")
+        has_any_lean_ident_token(text, &["ModularItemSpec", "refineModularSpec"])
     });
 
     let is_ub_exception = !spec_is_modular
         && (spec_is_ub_exception
             || proof_text.as_deref().is_some_and(|text| {
-                text.contains("UbExceptionVerificationResult")
-                    || text.contains("UbExceptionItemProof")
-                    || ((text.contains("ubExceptionClaim")
-                        || text.contains("polyUbExceptionClaim"))
-                        && !text.contains("ModularVerificationResult"))
+                has_any_lean_ident_token(
+                    text,
+                    &["UbExceptionVerificationResult", "UbExceptionItemProof"],
+                ) || (has_any_lean_ident_token(text, &["ubExceptionClaim", "polyUbExceptionClaim"])
+                    && !has_lean_ident_token(text, "ModularVerificationResult"))
             }));
 
     let is_modular = !is_ub_exception
         && (spec_is_modular
             || proof_text.as_deref().is_some_and(|text| {
-                text.contains("modularClaim")
-                    || text.contains("polyModularClaim")
-                    || text.contains("ModularVerificationResult")
-                    || text.contains("ModularItemProof")
+                has_any_lean_ident_token(
+                    text,
+                    &[
+                        "modularClaim",
+                        "polyModularClaim",
+                        "ModularVerificationResult",
+                        "ModularItemProof",
+                    ],
+                )
             }));
 
     let is_equiv = !is_ub_exception
         && !is_modular
         && (spec_text.as_deref().is_some_and(|text| {
-            text.contains("StatefulEquivItemSpec") || text.contains("refineEquivSpec")
+            has_any_lean_ident_token(text, &["StatefulEquivItemSpec", "refineEquivSpec"])
         }) || proof_text.as_deref().is_some_and(|text| {
-            text.contains("equivClaim")
-                || text.contains("StatefulEquivVerificationResult")
-                || text.contains("StatefulEquivItemProof")
+            has_any_lean_ident_token(
+                text,
+                &[
+                    "equivClaim",
+                    "StatefulEquivVerificationResult",
+                    "StatefulEquivItemProof",
+                ],
+            )
         }));
 
     let is_total = !is_ub_exception
         && !is_modular
         && !is_equiv
         && (spec_text.as_deref().is_some_and(|text| {
-            text.contains("TotalItemSpec") || text.contains("refineTotalSpec")
+            has_any_lean_ident_token(text, &["TotalItemSpec", "refineTotalSpec"])
         }) || proof_text.as_deref().is_some_and(|text| {
-            text.contains("totalClaim")
-                || text.contains("polyTotalClaim")
-                || text.contains("TotalVerificationResult")
-                || text.contains("TotalItemProof")
+            has_any_lean_ident_token(
+                text,
+                &[
+                    "totalClaim",
+                    "polyTotalClaim",
+                    "TotalVerificationResult",
+                    "TotalItemProof",
+                ],
+            )
         }));
 
     let spec_is_stateful = spec_text.as_deref().is_some_and(|text| {
-        text.contains("StatefulItemSpec")
-            || text.contains("refineStatefulSpec")
-            || text.contains("refineSafeStatefulSpec")
+        has_any_lean_ident_token(
+            text,
+            &[
+                "StatefulItemSpec",
+                "refineStatefulSpec",
+                "refineSafeStatefulSpec",
+            ],
+        )
     });
     let proof_is_stateful = proof_text.as_deref().is_some_and(|text| {
-        text.contains("statefulClaim")
-            || text.contains("polyStatefulClaim")
-            || text.contains("StatefulVerificationResult")
-            || text.contains("StatefulItemProof")
+        has_any_lean_ident_token(
+            text,
+            &[
+                "statefulClaim",
+                "polyStatefulClaim",
+                "StatefulVerificationResult",
+                "StatefulItemProof",
+            ],
+        )
     });
     let is_polymorphic = proof_text.as_deref().is_some_and(|text| {
-        text.contains("polyClaim")
-            || text.contains("polyStatefulClaim")
-            || text.contains("polyTotalClaim")
-            || text.contains("polyModularClaim")
-            || text.contains("polyUbExceptionClaim")
+        has_any_lean_ident_token(
+            text,
+            &[
+                "polyClaim",
+                "polyStatefulClaim",
+                "polyTotalClaim",
+                "polyModularClaim",
+                "polyUbExceptionClaim",
+            ],
+        )
     });
 
     AuthoredItemModules {
@@ -3896,6 +3961,31 @@ def body : CapturedMir :=
         assert!(
             !eq_verify_specs_override.contains("StatefulEquivVerificationResult"),
             "overriding ItemSpec on equivalent_to item must not emit nonexistent equivClaim: {eq_verify_specs_override}"
+        );
+
+        // Regression check: contract class/claim substrings inside `def_id` string
+        // literals (`ItemSpec "demo::StatefulItemSpec::get"`) or identifier names
+        // (`polyClaim_helper`) must not false-trigger `is_stateful` or `is_polymorphic`.
+        let sub_rel = Path::new("Demo/polyClaim_helper.lean");
+        fs::write(
+            ws.join("anneal/proofs/Specs").join(sub_rel),
+            "import Trusted\nimport Obligations.Demo.polyClaim_helper\nnamespace Specs.Demo.StatefulItemSpec_get\nopen Trusted.VerificationResult\ninstance : ItemSpec \"demo::StatefulItemSpec::get\" where\n  pre _ := True\n  post _ _ := True\nend Specs.Demo.StatefulItemSpec_get\n",
+        )
+        .expect("write substring spec");
+        fs::write(
+            ws.join("anneal/proofs/Proof").join(sub_rel),
+            "import Trusted\nimport Obligations.Demo.polyClaim_helper\nnamespace Proof.Demo.polyClaim_helper\nopen Trusted.VerificationResult\ndef totalClaim_note : String := \"polyClaim StatefulItemSpec\"\ntheorem verified : VerificationResult Obligations.Demo.polyClaim_helper.claim := by sorry\nend Proof.Demo.polyClaim_helper\n",
+        )
+        .expect("write substring proof");
+        let sub_authored = detect_authored_item_modules(&ws.join("anneal/proofs"), sub_rel);
+        assert!(
+            sub_authored.has_specs
+                && !sub_authored.has_legacy_specs_defs
+                && sub_authored.has_proof
+                && !sub_authored.is_stateful
+                && !sub_authored.is_total
+                && !sub_authored.is_polymorphic,
+            "string literals and identifier substrings must not false-trigger contract flags: {sub_authored:?}"
         );
 
         let _ = fs::remove_dir_all(&ws);
