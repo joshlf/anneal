@@ -562,6 +562,75 @@ theorem wit_lm3_1_anneal_offset_deref_divergence :
       ⟨.stack, allocation.withExtra none⟩ .memoryAccess (by decide) (by decide) rfl rfl
       (by decide) eight_lt_two_pow_63 (by rw [hsz]; decide)⟩
 
+/-! ## 3c. Divergence: Anneal Accesses a Revived Local Through a Stale Pointer -/
+
+/-- `Runtime(PostCleanup)` MIR body that writes and reads through a raw pointer
+after its pointee's storage has ended and restarted:
+```text
+bb0: StorageLive(_1); StorageLive(_2);
+     _1 = const 42_u64;
+     _2 = &raw mut _1;
+     StorageDead(_1);
+     StorageLive(_1);
+     *_2 = const 7_u64;
+     _0 = copy *_2;
+     return
+```
+In Rust (and in Miri), `StorageDead(_1)` ends the allocation that `_2` points
+into, so `*_2 = 7` uses a dangling pointer. -/
+def lm31ReviveBody : CapturedMir where
+  defPath := "lm_3_1_witness::write_through_pointer_into_revived_local"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, u64Decl, rawPtrMutU64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 1) (.use (.constant (constU64 42)))),
+        mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1))),
+        mkStmt (.storageDead 1),
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (derefLocal 2) (.use (.constant (constU64 7)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (derefLocal 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_1_anneal_storage_revive_divergence`**: Anneal's `MirSemantics`
+gives `lm31ReviveBody` a defined result, although the program writes through a
+dangling pointer:
+
+1. Anneal runs the body to completion and returns `7`: `StorageDead` and
+   `StorageLive` only reset `_1`'s slot and leave `_2`'s borrow entry in place,
+   so the write and the read through `_2` reach the revived `_1`.
+2. `lean-miri` rejects the access: once `StorageDead(_1)` has freed `_1`'s stack
+   allocation (`annealLocalStorageHooks.deallocateStack` keeps only its cached
+   base address), `checkAndDerefPtr` reports the access through `_2` as an
+   access to a dead allocation.
+
+`AllocMapRel.local_alloc_sync` therefore cannot be kept across `StorageLive` of
+a local that a pointer still targets; such states fall outside `StateRelLM3_1`. -/
+theorem wit_lm3_1_anneal_storage_revive_divergence :
+    annealOutcomeScalarBits 8
+      (runAnnealBounded lm31ReviveBody 10 (initMachineState lm31ReviveBody [])) = some 7 ∧
+    Miri.Memory.checkAndDerefPtr annealPointerArithmetic
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1 + UInt64.ofNat 0),
+        some (.concrete lm31AllocId1 Miri.Memory.BorTag.one)⟩
+      ((8 : Nat) : Int) .memoryAccess
+      (annealResolvePtr { AnnealMachine.empty with
+        addresses := { AnnealMachine.empty.addresses with
+          baseAddr := #[⟨lm31AllocId1, annealStackBaseAddr lm31AllocId1⟩] } })
+      (annealLookupAlloc { AnnealMachine.empty with
+        addresses := { AnnealMachine.empty.addresses with
+          baseAddr := #[⟨lm31AllocId1, annealStackBaseAddr lm31AllocId1⟩] } }) =
+      .error (.allocationLookup (.deadAllocation lm31AllocId1)) :=
+  ⟨by decide,
+    checkAndDerefPtr_deadAlloc_err lm31AllocId1 Miri.Memory.BorTag.one 0 ((8 : Nat) : Int)
+      .memoryAccess (by decide) (by decide) rfl rfl (by decide) eight_lt_two_pow_63⟩
+
 /-! ## 4. Witness (c): Use-After-`StorageDead` Dangling Dereference UB -/
 
 /-- `Runtime(PostCleanup)` MIR body that takes `_2 = &raw const _1`, kills `_1`
@@ -2600,5 +2669,50 @@ theorem wit_lm3_1_deref_oob_and_misaligned_real_steps :
       (ptrVal := { allocId := 1, offsetBytes := 2 })
       rfl (.head _) rfl hfind_la hinb (by decide)
     exact ⟨s₄, m₄, m₅, msg, hrel₄, rfl, rfl, hm₅⟩
+
+/-! ## 6. Divergence: Anneal Dereferences Through a Narrowing Pointer Cast -/
+
+/-- `Runtime(PostCleanup)` MIR body that reads a `u64` local through a
+`*const u32`:
+```text
+bb0: StorageLive(_1); StorageLive(_2); StorageLive(_3);
+     _1 = const 4294967301_u64;          // 2^32 + 5
+     _2 = &raw const _1;
+     _3 = copy _2 as *const u32 (PtrToPtr);
+     _0 = copy *_3;                      // _0 : u32
+     return
+```
+In Rust (and in Miri) `*_3` reads the four low-order bytes of `_1` on this
+little-endian target, so the function returns `5_u32`. -/
+def lm31TypePunBody : CapturedMir where
+  defPath := "lm_3_1_witness::deref_through_narrowing_cast"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32DeclLM31, u64Decl, rawPtrConstU64Decl, rawPtrConstU32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 1) (.use (.constant (constU64 4294967301)))),
+        mkStmt (.assign (local_ 2) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 3) (.cast .ptrToPtr (.copy (local_ 2)) rawPtrConstU32Ty)),
+        mkStmt (.assign (local_ 0) (.use (.copy (derefLocal 3))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_1_anneal_deref_type_pun_divergence`**: Anneal's `MirSemantics`
+returns the 8-byte scalar `4294967301` from `lm31TypePunBody`, whose return
+place has type `u32`: its dereference of a tracked stack pointer returns the
+borrowed local's whole value regardless of the pointee type of the pointer
+(`*const u32`). No `u32` holds `4294967301`; Rust and Miri return `5_u32`. -/
+theorem wit_lm3_1_anneal_deref_type_pun_divergence :
+    annealOutcomeScalarBits 8
+      (runAnnealBounded lm31TypePunBody 10 (initMachineState lm31TypePunBody [])) =
+      some 4294967301 := by
+  decide
 
 end LeanMiriSpec.Correspondence.Witness

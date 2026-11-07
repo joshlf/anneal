@@ -301,9 +301,11 @@ def encodeRawPtrTyId : RigidTy → Miri.MIR.TyId
   | .fnPtr _ _ _ _ => 82
   | _ => 40
 
-/-- Recover the encoded pointee `Miri.MIR.TyId` from a `60..82` raw-pointer
+/-- Recover the encoded pointee `Miri.MIR.TyId` from a `60..79` raw-pointer
 `TyId` produced by `encodeRawPtrTyId`. Aggregate-pointee raw pointers (`40`)
-return `none` so `BinOp.Offset` fails closed rather than guessing a stride. -/
+and pointer-pointee raw pointers (`80..82`, whose inner pointer may be fat)
+return `none`, so `BinOp.Offset` and dereferences fail closed rather than
+guessing a stride or a width. -/
 def rawPtrPointeeEncodedTyId? : Miri.MIR.TyId → Option Miri.MIR.TyId
   | 60 => some 51
   | 61 => some 1
@@ -324,9 +326,6 @@ def rawPtrPointeeEncodedTyId? : Miri.MIR.TyId → Option Miri.MIR.TyId
   | 77 => some 31
   | 78 => some 32
   | 79 => some 33
-  | 80 => some 40
-  | 81 => some 41
-  | 82 => some 42
   | _ => none
 
 /-- Encode an Anneal `Ty` into a canonical `Miri.MIR.TyId` that injectively
@@ -1083,9 +1082,21 @@ def annealResolveAndCacheLocalLayout (localDecls : List LocalDecl) (layouts : La
       else
         throw (.stack .emptyStack)
 
+/-- Whether `translateTy` gives a pointee of kind `k` its exact layout without
+consulting a layout table: `bool`, `char`, the integer and float types, and the
+unit type. Every other pointee (an aggregate, whose layout lives at an index
+that a raw pointer type does not record; an unsized slice, `str`, or trait
+object; or a pointer, which may itself be fat) has no layout that a dereference
+can trust. -/
+def derefPointeeKindHasExactLayout : RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _ | .tuple .nil => true
+  | _ => false
+
 /-- Resolve the pointee `LocalLayout` when dereferencing a pointer local
 `localId` (`*_p`), consulting `localDecls` when available and falling back to
-`rawPtrPointeeEncodedTyId? ptrLayout.ty`. -/
+`rawPtrPointeeEncodedTyId? ptrLayout.ty`. Pointees without an exact layout
+(`derefPointeeKindHasExactLayout`) resolve to `none`, so the dereference fails
+closed instead of reading with a guessed width. -/
 def lookupDerefPointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTable)
     (localId : Miri.MIR.LocalId) (ptrLayout : Miri.Interpreter.LocalLayout) :
     Option Miri.Interpreter.LocalLayout :=
@@ -1093,7 +1104,10 @@ def lookupDerefPointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTabl
   | some decl =>
       match decl.ty.kind with
       | .rawPtr _ pointeeKind | .ref _ pointeeKind =>
-          some (translateTy { kind := pointeeKind, layoutIdx := 0 } layouts)
+          if derefPointeeKindHasExactLayout pointeeKind then
+            some (translateTy { kind := pointeeKind, layoutIdx := 0 } layouts)
+          else
+            none
       | _ => none
   | none =>
       (rawPtrPointeeEncodedTyId? ptrLayout.ty).map (layoutOfEncodedTyId · layouts)
@@ -1222,7 +1236,16 @@ scalar-pair local, or a constant `Miri.MIR.Operand` in the top frame of
    pair, such as a component of a checked-arithmetic result. Even under `Move`
    it leaves the local unchanged, because Anneal's `MirSemantics.evalOperand`
    keeps the parent aggregate initialized on projected reads. Every other
-   projection fails closed with `StepError.unsupported`. -/
+   projection fails closed with `StepError.unsupported`.
+
+Known infidelity: `Move` of a memory-backed (`.indirect`) local replaces the
+local by `.live (.immediate .uninit)` instead of writing uninitialized bytes to
+its allocation. The allocation then stays live but no longer belongs to the
+local, so `Frame.deallocateLocal` never frees it, and pointers into it keep
+reading the old bytes, even after `StorageDead`. rustc and Anneal deinitialize
+the bytes in place. Before `annealReadImmediate` read `.indirect` operands this
+path failed closed; no theorem covers it now, and `annealEvalOperand_move_live`
+(an `LM-1.4` statement pin) fixes the current behavior for every operand. -/
 def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
     (op : Miri.MIR.Operand) (known : Option Miri.Interpreter.LocalLayout) :
     Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do

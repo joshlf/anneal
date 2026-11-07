@@ -2912,6 +2912,39 @@ theorem step_rawPtr_addrOf_lm3_1_simulation
             rcases hvald with ⟨rfl, _⟩ | ⟨v, rfl, _⟩ <;> simp
           exact hlive_dst_step oldImm rfl hslot_d_ne
 
+/-- **`evalRvalue_rawPtr_addrOf_simulation` (`LM-3.1` Deliverable 1)**: the
+brief's name for the address-of step theorem, `step_rawPtr_addrOf_lm3_1_simulation`:
+from any `StateRelLM3_1` state, `_d = &raw (const|mut) _t` on an immediate local
+`_t` of primitive scalar type steps in lockstep under `Miri.Interpreter.Step.step`
+and `stepMirFn`, promoting `_t` to the fresh allocation `nextAllocId` through
+`forceAllocation`, extending `allocMap` by the new pointer's entry, or reporting
+undefined behavior in both machines. -/
+theorem evalRvalue_rawPtr_addrOf_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx targetIdx : Local} {mutability : Mutability} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.rawPtr mutability ⟨targetIdx, .nil⟩), span⟩)
+    {dstDecl targetDecl : LocalDecl} {pointeeKind : RigidTy}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_tgt : get? body.localDecls targetIdx = some targetDecl)
+    (hdst_ty : dstDecl.ty.kind = .rawPtr mutability pointeeKind)
+    (htgt_ty : IsPrimScalarTy targetDecl.ty)
+    (hne : dstIdx ≠ targetIdx)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame targetIdx)
+    (hsupply : AllocIdSupplyReady m.machine.memory) :
+    StepRelLM3_1 body m
+      (rawPtrAllocMapEntry body.localDecls body.layouts mutability targetIdx s.memory.nextTag
+        ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩ :: allocMap)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_rawPtr_addrOf_lm3_1_simulation hstate hphase hbb hstmt hdecl_dst hdecl_tgt hdst_ty
+    htgt_ty hne himm hsupply
+
 /-! ## 8. Real-Step `PlaceElem.Deref` (`*ptr`) Reads, Writes, and UB Simulation -/
 
 theorem IsPrimScalarTy.translateTy_layoutIdx {ty : Ty} (h : IsPrimScalarTy ty)
@@ -2971,13 +3004,19 @@ theorem lookupDerefPointeeLayout_rawPtr_eq
     {mutability : Mutability} {pointeeKind : RigidTy}
     (hdecl : get? localDecls ptrIdx = some ptrDecl)
     (hty : ptrDecl.ty.kind = .rawPtr mutability pointeeKind)
+    (hpk : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
     (ptrLay : Miri.Interpreter.LocalLayout) :
     lookupDerefPointeeLayout localDecls layouts ptrIdx ptrLay =
       some (translateTy { kind := pointeeKind, layoutIdx := 0 } layouts) := by
+  have hexact : derefPointeeKindHasExactLayout pointeeKind = true := by
+    rcases hpk with h | h | ⟨_, h⟩ | ⟨_, h⟩ <;> (dsimp only at h; rw [h]; rfl)
   unfold lookupDerefPointeeLayout
   rw [hdecl]
   dsimp only []
   rw [hty]
+  dsimp only []
+  rw [hexact]
+  rfl
 
 theorem annealOffsetMisalignment_ok_of_pow2
     (offset : Miri.ABI.Size) (align : Miri.ABI.Align) (hpow : align.pow2 ≤ 29) :
@@ -3251,11 +3290,12 @@ theorem annealDerefOperandToMemPlace_uninit
     {mutability : Mutability} {pointeeKind : RigidTy}
     (hdecl : get? ld ptrIdx = some ptrDecl)
     (hty : ptrDecl.ty.kind = .rawPtr mutability pointeeKind)
+    (hpk : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
     (ptrLay : Miri.Interpreter.LocalLayout) (st : AnnealStepState) :
     annealDerefOperandToMemPlace ld ly ptrIdx (.immediate .uninit) ptrLay st =
       .error (.undefinedBehavior "read of uninitialized local") st := by
   unfold annealDerefOperandToMemPlace
-  rw [lookupDerefPointeeLayout_rawPtr_eq hdecl hty ptrLay]
+  rw [lookupDerefPointeeLayout_rawPtr_eq hdecl hty hpk ptrLay]
   rfl
 
 theorem annealDerefOperandToMemPlace_scalarInt
@@ -3278,7 +3318,7 @@ theorem annealDerefOperandToMemPlace_scalarInt
     (Miri.Memory.Pointer.withoutProvenance (UInt64.ofNat sc.bits)).offset _ hpow
   refine ⟨mismatch, ?_⟩
   unfold annealDerefOperandToMemPlace
-  rw [lookupDerefPointeeLayout_rawPtr_eq hdecl hty ptrLay]
+  rw [lookupDerefPointeeLayout_rawPtr_eq hdecl hty hprim ptrLay]
   simp only [annealReadImmediate, Miri.Interpreter.Immediate.toScalar,
     scalar_fromScalarInt_toPointer_eq hrel hsz8,
     Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
@@ -3291,6 +3331,7 @@ theorem annealDerefOperandToMemPlace_pointer
     {mutability : Mutability} {pointeeKind : RigidTy}
     (hdecl : get? ld ptrIdx = some ptrDecl)
     (hty : ptrDecl.ty.kind = .rawPtr mutability pointeeKind)
+    (hpk : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
     (mptr : Miri.Memory.Pointer AnnealProv)
     {mismatch : Option Miri.Memory.Misalignment}
     (hmis : annealOffsetMisalignment mptr.offset
@@ -3302,7 +3343,7 @@ theorem annealDerefOperandToMemPlace_pointer
       .ok (⟨mptr.withOptionalProvenance, .none, mismatch⟩,
         translateTy { kind := pointeeKind, layoutIdx := 0 } ly) st := by
   unfold annealDerefOperandToMemPlace
-  rw [lookupDerefPointeeLayout_rawPtr_eq hdecl hty ptrLay]
+  rw [lookupDerefPointeeLayout_rawPtr_eq hdecl hty hpk ptrLay]
   simp only [annealReadImmediate, Miri.Interpreter.Immediate.toScalar,
     scalar_fromPointer_toPointer_eq mptr,
     Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
@@ -4116,7 +4157,7 @@ theorem step_deref_read_simulation
     have hop_un := annealEvalOperand_deref_live hopKind (m := { m with stack := ⟨#[tfa]⟩ })
       rfl hlt_p hdecl_ptr hmls_un hcache_p
       (known := some (translateTy dstDecl.ty body.layouts))
-    have hder_un := annealDerefOperandToMemPlace_uninit (ly := body.layouts) hdecl_ptr hptr_ty
+    have hder_un := annealDerefOperandToMemPlace_uninit (ly := body.layouts) hdecl_ptr hptr_ty hdst_prim
       (translateTy ptrDecl.ty body.layouts) { m with stack := ⟨#[tfb]⟩ }
     have hm_err : Miri.Interpreter.Step.evalStatement
         (annealStepHooks body.localDecls body.layouts) ()
@@ -4207,7 +4248,7 @@ theorem step_deref_read_simulation
         rw [hop_ub]
       obtain ⟨_, _, _, _, hpow, _⟩ := hprim0.size_align_ok body.layouts
       obtain ⟨mismatch, hmis⟩ := annealOffsetMisalignment_ok_of_pow2 mptr.offset _ hpow
-      have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty mptr hmis
+      have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty hdst_prim mptr hmis
         (translateTy ptrDecl.ty body.layouts) { m with stack := ⟨#[tfb]⟩ }
       rw [hlay0_eq] at hder_ok
       have hmptr_opt : mptr.withOptionalProvenance =
@@ -4261,7 +4302,7 @@ theorem step_deref_read_simulation
           .ok none := by
         rw [hlay0_eq, hmptr_zero]
         exact annealOffsetMisalignment_stackBase_eq_none e.allocId _ hpow
-      have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty mptr hmis0
+      have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty hdst_prim mptr hmis0
         (translateTy ptrDecl.ty body.layouts) { m with stack := ⟨#[tfb]⟩ }
       rw [hlay0_eq] at hder_ok
       have hmptr_opt : mptr.withOptionalProvenance =
@@ -4991,6 +5032,7 @@ theorem step_deref_write_simulation
       rw [hmls_p_eq]; rcases mls_p with ⟨v0, l0⟩; dsimp only at hmp_un; subst hmp_un; rfl
     have hdst_live := annealEvalPlace_deref_live hframes hlt_p hdecl_ptr hmls_p' hcache_p
     have hder_err := annealDerefOperandToMemPlace_uninit (ly := body.layouts) hdecl_ptr hptr_ty
+      (by unfold IsPrimScalarTy at hval_prim ⊢; rw [← hval_kind]; exact hval_prim)
       (translateTy ptrDecl.ty body.layouts) { m with stack := ⟨#[tfa]⟩ }
     have hdst_err : annealEvalPlace body.localDecls body.layouts
         (translatePlace ⟨ptrIdx, .cons .deref .nil⟩) m =
@@ -5069,7 +5111,8 @@ theorem step_deref_write_simulation
     obtain ⟨_, _, _, _, hpow_pt, _⟩ := hpt_prim.size_align_ok body.layouts
     obtain ⟨mismatch_any, hmis_any⟩ := annealOffsetMisalignment_ok_of_pow2 mptr.offset
       (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.align.abi hpow_pt
-    have hder_any := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty mptr hmis_any
+    have hder_any := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty
+      (by unfold IsPrimScalarTy at hval_prim ⊢; rw [← hval_kind]; exact hval_prim) mptr hmis_any
       (translateTy ptrDecl.ty body.layouts) { m with stack := ⟨#[tfa]⟩ }
     rw [hlay0_eq] at hder_any
     have hdst_any : annealEvalPlace body.localDecls body.layouts
@@ -5342,7 +5385,7 @@ theorem step_deref_oob_miri_ub
     obtain ⟨mismatch, hmis⟩ := annealOffsetMisalignment_ok_of_pow2 mptr.offset
       (translateTy { kind := dstDecl.ty.kind, layoutIdx := 0 } body.layouts).layout.align.abi
       (hlay0_eq ▸ hpow)
-    have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty mptr hmis
+    have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty hdst_prim mptr hmis
       (translateTy ptrDecl.ty body.layouts) { m with stack := ⟨#[tfb]⟩ }
     rw [hlay0_eq] at hder_ok
     have hmptr_opt : mptr.withOptionalProvenance =
@@ -5464,7 +5507,7 @@ theorem step_deref_misaligned_miri_ub
           (translateTy dstDecl.ty body.layouts).layout.align.abi⟩) := by
       rw [hlay0_eq, hmptr_off]
       exact annealOffsetMisalignment_of_misaligned _ _ hmis
-    have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty mptr hmis_eq
+    have hder_ok := annealDerefOperandToMemPlace_pointer hdecl_ptr hptr_ty hdst_prim mptr hmis_eq
       (translateTy ptrDecl.ty body.layouts) { m with stack := ⟨#[tfb]⟩ }
     rw [hlay0_eq] at hder_ok
     have hmptr_opt : mptr.withOptionalProvenance =
@@ -5500,6 +5543,101 @@ theorem step_deref_misaligned_miri_ub
       rw [EStateM.bind_eq_error hread_err]
     exact ⟨_, _, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt
       hm_err⟩
+
+/-- **`step_deref_oob_divergence`**: in `StateRelLM3_1`-related states where
+`_d = copy *_p` reads past the end of the pointee's allocation, Anneal's
+`stepMirFn` takes a normal step that stores the pointee local's whole value in
+`_d`, while `lean-miri`'s `Miri.Interpreter.Step.step` reports undefined
+behavior (`step_deref_oob_miri_ub`). Anneal's dereference of a tracked stack
+pointer reads the borrowed local and ignores both `offsetBytes` and the pointee
+type, so this out-of-bounds read is defined in Anneal's trusted semantics but
+undefined in Rust. -/
+theorem step_deref_oob_divergence
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨ptrIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl ptrDecl : LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hdst_prim : IsPrimScalarTy dstDecl.ty)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr mutability dstDecl.ty.kind)
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry}
+    {localAlloc :
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hfind_la : m.machine.memory.live.find? (fun x => x.1 == e.allocId) =
+      some (e.allocId, localAlloc))
+    (hoob : localAlloc.allocation.byteSize.bytes.toNat <
+      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)
+    (hperm : e.perm ≠ .disabled)
+    {sc : MirAst.ScalarInt}
+    (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead) :
+    (∃ s', stepMirFn body s = .step s' ∧
+      get? s'.frame.locals dstIdx = some (.init (.scalar sc))) ∧
+    ∃ m' msg,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior msg)) := by
+  refine ⟨?_, step_deref_oob_miri_ub hstate (opKind := MirAst.Operand.copy) (Or.inl rfl) hbb
+    hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob⟩
+  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, halloc, _⟩ := id hstate
+  have hlookup := (halloc.borrow_sync e he).2
+  rw [htag] at hlookup
+  obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
+  have hsd_ne : slot_d ≠ .dead := fun hd => hdst_live (hslot_d.trans (congrArg some hd))
+  have hread : evalOperand s.frame.locals (.copy ⟨ptrIdx, .cons .deref .nil⟩)
+      s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals =
+      .ok (.scalar sc) s.frame.locals := by
+    unfold evalOperand
+    dsimp only []
+    rw [hslot_p]
+    dsimp only []
+    rw [hlookup]
+    dsimp only []
+    cases hp : e.perm with
+    | disabled => exact absurd hp hperm
+    | _ => simp only [htarget]; rfl
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  simp only [hbb, hstmt]
+  unfold evalStmt
+  dsimp only []
+  unfold evalRvalue
+  dsimp only []
+  rw [hread]
+  dsimp only []
+  have hset := set?_eq_some_set hlt_af_d (LocalSlot.init (.scalar sc))
+  have hget_set : get? (s.frame.locals.set dstIdx (.init (.scalar sc))) dstIdx =
+      some (.init (.scalar sc)) := by
+    rw [get?_eq_getElem?, List.getElem?_set_self hlt_af_d]
+  cases hb : s.memory.borrows with
+  | nil =>
+    simp only [hslot_d]
+    cases slot_d with
+    | dead => exact absurd rfl hsd_ne
+    | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+    | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+  | cons b₁ rest =>
+    cases rest with
+    | nil =>
+      simp only [hslot_d]
+      cases slot_d with
+      | dead => exact absurd rfl hsd_ne
+      | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+      | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+    | cons b₂ rest' =>
+      simp only [hslot_d]
+      cases slot_d with
+      | dead => exact absurd rfl hsd_ne
+      | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+      | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
 
 /-! ## 9. Deliverable 5: Composed `LM-3.1` Statement Simulation (`step_stmt_lm3_1_simulation`) -/
 
@@ -6907,7 +7045,18 @@ raw pointers and memory-backed locals):
 * `derefRead`: `_d = (copy|move) *_p`
 * `derefWrite`: `*_p = .use op`
 * `castPtrToPtr`: `_d = _s as *(const|mut) V` (`CastKind.PtrToPtr`)
-* `binOpOffset`: `_d = Offset(copy _p, rhsOp)` (in-bounds / zero-offset). -/
+* `binOpOffset`: `_d = Offset(copy _p, rhsOp)` (in-bounds / zero-offset).
+
+Despite its name, this predicate is not a typing judgment: besides types, its
+constructors carry conditions on the current Anneal state (pointer offset `0`,
+non-disabled permissions, in-bounds or zero `Offset` counts, `u8`/`i8` pointees
+for `Offset`, unmapped `StorageLive` targets, immediate targets for `&raw`).
+These conditions exclude exactly the states where Anneal's trusted semantics and
+`lean-miri` diverge (`step_deref_oob_divergence`,
+`step_binOp_offset_oob_dangling_miri_ub`, and the `WitLM3_1` divergence
+witnesses), so the theorem says nothing about such states. It also has no arm
+for the `LM-1.x` scalar statements once `allocMap` is non-empty, nor for `&raw`
+of an already memory-backed local. -/
 inductive WellTypedLM3_1StateStmt
     (body : CapturedMir) (s : MachineState) (m : AnnealStepState)
     (allocMap : List AllocMapEntry) : Statement → Prop where
