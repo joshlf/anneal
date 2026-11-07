@@ -16,11 +16,11 @@ Work unit `FF-4.2b` merges `sup/brief-4` (`087b015b`: BRIEF-0..4, the
 migrated `WireframeDemo`, `FrameTutor`, and `MirVerification` proofs).
 
 > [!IMPORTANT]
-> Status at `[adv A1]` (unchanged from `[adv B1]`): **100% GREEN** across all
-> Rust tests (`56 passed`),
-> `lake build Anneal MirVerification` (including `Anneal.MirLift`),
+> Status at `[adv B2]`: **100% GREEN** across all Rust tests (`56 passed`),
+> `lake build Anneal MirVerification` (including `Anneal.MirLift`; standalone
+> `Anneal.PureMirExec` compile reduced from `85s` -> `51s` -> **`35.1s`**),
 > `python3 trusted/audit/check_trusted.py --fast` (`PASS`, `40` Trusted modules,
-> `9,589` Trusted kernel declarations, `24,294` replayed declarations), and
+> `9,589` Trusted kernel declarations, `24,183` replayed declarations), and
 > both `cargo-anneal verify` suites (`wireframe-demo`: `9 unconditional`,
 > `tutor`: `7 unconditional`, `Proof/WireframeDemo/*.lean` untouched at `1,421`
 > LOC with zero `BlockCtx` and zero manual `fuel`).
@@ -124,8 +124,9 @@ equals an older merge-base blob, while `087b015b`'s blob is the newer one.
   the call target before splitting on the return block. Proofs written
   against the old `evalCallTerminator` shape can `simp only
   [evalTerminator_call_eq, evalCallTerminatorB]` and keep their case order.
-  `[adv B1]` instead added the private `evalCallTerminatorUnified`, so nothing
-  references this pair any more, but see Section 4.3, item 1.
+  `[adv B1]` instead added the private `evalCallTerminatorUnified`, and
+  `[adv B2]` deleted `evalCallTerminatorB` and `evalTerminator_call_eq`
+  completely (Section 4.4, item 1).
 - `stepMirFn_extCall_aborts_prop` unfolds the intrinsic helpers.
 
 ### 4.2 Adversarial critique of `[adv A0]` & fixes in `[adv B1]`
@@ -218,9 +219,56 @@ resolved:
    `PureMirConvergesWithCallees.call_exact_div`. `087b015b`'s semantics
    require both.
 
-## 5. Receipts at `[adv A1]`
+### 4.4 Adversarial critique of `[adv A1]` & fixes in `[adv B2]`
 
-See the `[A1 -> B2]` board post for the verbatim outputs.
+1. **Root-cause diagnosis & deletion of dead `evalCallTerminatorB` /
+   `evalTerminator_call_eq` (`−155` net lines in `PureMirExec.lean`) + 7 stale
+   `evalCallTerminator` `dsimp` entries.** `[adv A1]` identified that nothing
+   referenced `evalCallTerminatorB` or `evalTerminator_call_eq`, yet kept all
+   187 lines (`PureMirExec.lean:533–719`) and all seven stale
+   `evalCallTerminator` `dsimp` entries because deleting them failed `rfl` in
+   `evalTerminator_toMachineState_eq_withMem` (`assert` branch) and
+   `evalTerminator_call_eq_unified`. Inspection of the Lean 4 error state
+   showed that neither proof needed an equation lemma from
+   `evalTerminator_call_eq`: both `cases` tactics elaborated an inline `match`
+   inside their scrutinee (`match expected with | true => 1 | false => 0` and
+   `match currentBody with | .some b => b.layouts | .none => emptyLayoutTable`),
+   whose local auxiliary matcher failed `kabstract` against `Trusted`'s
+   compiled auxiliary matcher in `evalTerminator`, leaving the LHS unabstracted
+   before `rfl`. `[adv B2]` cased on `expected` and `currentBody` first—iota-
+   reducing the inner `match` on both sides before `cases`—and deleted
+   `evalCallTerminatorB`, `evalTerminator_call_eq`, and all seven stale
+   `evalCallTerminator` `dsimp` entries.
+2. **Widening the `PureMirExec.lean` standalone compile margin (`51s` ->
+   `35.1s` vs `check_trusted.py`'s `60s` child timeout).** `[adv A1]` noted the
+   `9s` margin (`51s` vs `60s`) without changing `PureMirExec.lean`.
+   Deleting `def evalCallTerminatorB` + `evalTerminator_call_eq` eliminated
+   `~11s` of synchronous main-thread nested-`match` elaboration under
+   `-DElab.async=true`. Profiling (`-Dprofiler=true -Dprofiler.threshold=150`)
+   also identified three concentrated tactic bottlenecks that `[adv B2]`
+   eliminated:
+   - Five `unfold stepMirFn; change … (match curBody.phase with …)` higher-order
+     unification steps (`~5.5s` CPU) replaced with `stepMirFn_eq_ite` +
+     `isOtherPhase`.
+   - Full `evalDirectRustIntrinsic?` WHNF string-comparison `change` / `unfold`
+     steps in `evalDirectRustIntrinsic_{bswap,ctpop,constEvalSelect_ctpop}_u32`
+     (`~2.8s` CPU) replaced with `evalDirectRustIntrinsic?_nonSelect` and
+     `evalDirectRustIntrinsic?_constEvalSelect_three`.
+   - `simp only […, evalPureScalarIntrinsic, …]` in
+     `evalConstEvalSelect_ctpop_u32` (`1.81s` CPU, synthesizing 23 equation
+     lemmas for one concrete `.ctpop` step) replaced with a direct `change` +
+     `rw [hv]`.
+   Standalone `lake env lean -DwarningAsError=true ../theory/Anneal/PureMirExec.lean`
+   now completes in **`35.1s`** (`~25s` / `41%` headroom under `60s`).
+3. **Cross-tree audit of `[adv A1]`.** Verified `[adv A1]`'s `MirLiftCore` and
+   `MirLiftBench` docstring fixes, confirmed zero remaining references to
+   `evalCallTerminatorB`, `evalTerminator_call_eq`, or stale `evalCallTerminator`
+   across all FF-modified files, and confirmed `Proof/WireframeDemo/*.lean`
+   remains untouched at `1,421` LOC with zero `BlockCtx` and zero manual `fuel`.
+
+## 5. Receipts at `[adv B2]`
+
+See the `[B2 -> A2]` board post for the verbatim outputs.
 
 | Check | Result |
 | :--- | :--- |
@@ -230,7 +278,7 @@ See the `[A1 -> B2]` board post for the verbatim outputs.
 | `./ci/check_todo.sh` | exit 0 (pass) |
 | `cargo test -p cargo-anneal --lib --bins` | 56 passed, 0 failed (pass) |
 | `lake build Anneal MirVerification` (and `MirLift`) | pass |
-| `python3 trusted/audit/check_trusted.py --fast` | PASS (`40` Trusted modules, `9,589` Trusted decls, `24,294` replayed decls) |
+| `python3 trusted/audit/check_trusted.py --fast` | PASS (`40` Trusted modules, `9,589` Trusted decls, `24,183` replayed decls) |
 | `cargo-anneal verify` (`wireframe-demo` and `tutor`) | PASS (`9` + `7` unconditional, `0` conditional, kernel replay PASS) |
 
 No `sorry`, `admit`, `sorryAx`, `axiom`, `#[trusted]`, or `native_decide` was

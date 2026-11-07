@@ -530,193 +530,6 @@ theorem writePlaceValue_pure_eq
     simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
     cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
 
-/--
-`evalTerminator` on a `TerminatorKind.call`, restated so that it resolves the
-call target before it splits on the return block `targetOpt`.
-
-`Trusted`'s `evalTerminator` splits on `targetOpt` first and inlines each call
-branch; `evalTerminator_call_eq` proves the two forms equal, which lets proofs
-written against the resolve-first shape (the pre-`087b015b`
-`evalCallTerminator`) case on `resolveCallTarget` before `targetOpt`.
--/
-def evalCallTerminatorB (s : MachineState) (func : Operand) (argOps : List Operand)
-    (destination : Place) (targetOpt : Option BasicBlockIdx) (unwind : UnwindAction)
-    (currentBody : Option CapturedMir) : MirStepNode :=
-  let bodyLocalDecls := bodyLocalDeclsOf currentBody
-  let bodyLayouts : LayoutTable :=
-    match currentBody with
-    | .some b => b.layouts
-    | .none => emptyLayoutTable
-  match
-    resolveCallTarget
-      s
-      func
-      (length argOps)
-      bodyLocalDecls
-      bodyLayouts
-  with
-  | .ub => MirStepNode.fail .ub
-  | .unsupported => MirStepNode.unsupported
-  | .ok target localsAfterFunc =>
-    match targetOpt with
-    | .some targetBb =>
-        match
-          evalOperands
-            localsAfterFunc
-            argOps
-            s.memory.borrows
-            s.memory.globals
-            bodyLayouts
-            s.memory.callerLocals
-        with
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-        | .ok argVals locals' =>
-          match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
-          | .some calleeBody =>
-            match checkCalleeTargetCompatible target calleeBody (length argVals) with
-            | false => MirStepNode.fail .ub
-            | true =>
-              match currentBody with
-              | .none => MirStepNode.unsupported
-              | .some callerBody =>
-                MirStepNode.step
-                  (pushCalleeFrame
-                    s
-                    callerBody
-                    locals'
-                    destination
-                    targetBb
-                    calleeBody
-                    argVals
-                    unwind)
-          | .none =>
-            match isDirectExactDivTarget target with
-            | true =>
-              match argVals with
-              | .scalar lhs :: .scalar rhs :: .nil =>
-                match
-                  resolveIntrinsicIsSigned
-                    target
-                    bodyLocalDecls
-                    bodyLayouts
-                    argOps
-                with
-                | .none => MirStepNode.unsupported
-                | .some isSigned =>
-                  match evalExactDiv lhs rhs isSigned with
-                  | .some retScalar =>
-                    match writePlaceValue locals' s.memory.borrows destination (.scalar retScalar) with
-                    | .ok updatedLocals =>
-                      MirStepNode.step {
-                        frame := {
-                          s.frame with
-                          blockIdx := targetBb
-                          stmtIdx := 0
-                          locals := updatedLocals
-                        }
-                        memory := s.memory
-                      }
-                    | .ub => MirStepNode.fail .ub
-                    | .unsupported => MirStepNode.unsupported
-                  | .none => MirStepNode.fail .ub
-              | _ => MirStepNode.fail .ub
-            | false =>
-              match target.isIndirect with
-              | true =>
-                MirStepNode.extCall
-                  { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                  (resumeExternalCall s locals' destination targetBb unwind)
-              | false =>
-                match
-                  evalDirectRustIntrinsic?
-                    s
-                    currentBody
-                    target
-                    bodyLocalDecls
-                    bodyLayouts
-                    argOps
-                    argVals
-                    locals'
-                    destination
-                    targetBb
-                    unwind
-                with
-                | .some stepNode => stepNode
-                | .none =>
-                  MirStepNode.extCall
-                    { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                    (resumeExternalCall s locals' destination targetBb unwind)
-    | .none =>
-        match
-          evalOperands
-            localsAfterFunc
-            argOps
-            s.memory.borrows
-            s.memory.globals
-            bodyLayouts
-            s.memory.callerLocals
-        with
-        | .ub => MirStepNode.fail .ub
-        | .unsupported => MirStepNode.unsupported
-        | .ok argVals locals' =>
-          match lookupCallee s.memory.callees bodyLayouts target.defPath target.typeArgs s.memory.traitImpls with
-          | .some calleeBody =>
-            match checkCalleeTargetCompatible target calleeBody (length argVals) with
-            | false => MirStepNode.fail .ub
-            | true =>
-              match currentBody with
-              | .none => MirStepNode.unsupported
-              | .some callerBody =>
-                MirStepNode.step
-                  (pushDivergingCalleeFrame
-                    s
-                    callerBody
-                    locals'
-                    destination
-                    unwind
-                    calleeBody
-                    argVals)
-          | .none =>
-            -- A diverging call to `core::intrinsics::const_eval_select` (one whose
-            -- `called_at_rt` returns `!`) is not unpacked here; like any other
-            -- unlinked callee it becomes an external call, which constrains
-            -- nothing. Captured MIR never contains one, because `rustc` replaces
-            -- every `const_eval_select` call with a direct call to `called_at_rt`
-            -- before `optimized_mir` (`withConstEvalSelectIntrinsicTypeArgs`).
-            match target.isIndirect with
-            | false =>
-              match isUnreachableCallTarget target.defPath with
-              | true => MirStepNode.fail .ub
-              | false =>
-                match isAbortingPanicDefPath target.defPath with
-                | true => MirStepNode.retOutcome .abort
-                | false =>
-                  match isUnwindingPanicDefPath target.defPath with
-                  | true =>
-                    match applyUnwindAction s locals' s.memory unwind with
-                    | .running nextState => MirStepNode.step nextState
-                    | .halted out => MirStepNode.retOutcome out
-                    | .faulted fk => MirStepNode.fail fk
-                  | false =>
-                    MirStepNode.extCall
-                      { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                      (resumeExternalDivergingCall s locals' unwind)
-            | true =>
-              MirStepNode.extCall
-                { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
-                (resumeExternalDivergingCall s locals' unwind)
-
-theorem evalTerminator_call_eq (s : MachineState) (func : Operand)
-    (argOps : List Operand) (destination : Place)
-    (targetOpt : Option BasicBlockIdx) (unwind : UnwindAction) (span : String)
-    (currentBody : Option CapturedMir) :
-    evalTerminator s
-        { kind := .call func argOps destination targetOpt unwind, span := span }
-        currentBody =
-      evalCallTerminatorB s func argOps destination targetOpt unwind currentBody := by
-  cases targetOpt <;> rfl
-
 /-- Replace the `Memory` in an `RvalueEvalResult` with `mem`. -/
 def RvalueEvalResult.withMem (mem : Memory) : RvalueEvalResult → RvalueEvalResult
   | .ok v locals' _ => .ok v locals' mem
@@ -1183,6 +996,18 @@ private theorem stepMirFn_eq_ite (body : CapturedMir) (s : MachineState) :
   dsimp only
   cases (s.memory.activeCallee.getD body).phase <;> rfl
 
+private theorem isOtherPhase_eq_false {ph : MirPhaseTag}
+    (h : ∀ tag, ph ≠ .other tag) : isOtherPhase ph = false := by
+  cases ph with
+  | other tag => exact False.elim (h tag rfl)
+  | _ => rfl
+
+private theorem isOtherPhase_eq_true_iff {ph : MirPhaseTag} :
+    isOtherPhase ph = true → ∃ tag, ph = .other tag := by
+  cases ph with
+  | other tag => intro _; exact ⟨tag, rfl⟩
+  | _ => intro h; cases h
+
 /--
 Evaluating a pure `Statement` from `ps.toMachineState mem₀` produces the exact
 same transition as evaluating from `ps.toMachineState emptyMemory` and
@@ -1431,12 +1256,19 @@ theorem evalTerminator_toMachineState_eq_withMem
     | ok v locals' =>
       cases v with
       | scalar sc =>
-        dsimp only
-        cases Nat.beq sc.bits (match expected with | true => 1 | false => 0) with
-        | true => rfl
-        | false =>
-          dsimp only [applyUnwindAction]
-          cases unwind <;> (try rw [h_stack]) <;> rfl
+        cases expected
+        · dsimp only
+          cases Nat.beq sc.bits 0 with
+          | true => rfl
+          | false =>
+            dsimp only [applyUnwindAction]
+            cases unwind <;> (try rw [h_stack]) <;> rfl
+        · dsimp only
+          cases Nat.beq sc.bits 1 with
+          | true => rfl
+          | false =>
+            dsimp only [applyUnwindAction]
+            cases unwind <;> (try rw [h_stack]) <;> rfl
       | _ => rfl
   | call _ _ _ _ _ => cases h_pure
   | tailCall _ _ => cases h_pure
@@ -5472,9 +5304,9 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
       have h_act :
           (MachineState.pushBaseStack calleeBody baseStack ms).memory.activeCallee.getD outerBody =
             ms.memory.activeCallee.getD calleeBody := rfl
-      unfold stepMirFn at h_st
       let curBody := ms.memory.activeCallee.getD calleeBody
-      change evalNodeNoCallWP _ _ (match curBody.phase with | .other _ => _ | _ => _) at h_st
+      rw [stepMirFn_eq_ite] at h_st
+      dsimp only at h_st
       have liftTau :
           ∀ {st_un : MirExecState},
             stepMirFn outerBody (MachineState.pushBaseStack calleeBody baseStack ms) =
@@ -5544,15 +5376,14 @@ theorem wpMirExecNoCallSym_pushCalleeFrame
                     evalTerminator (MachineState.pushBaseStack calleeBody baseStack ms)
                       bb.terminator (some curBody)
                   else MirStepNode.fail .ub) := by
-        cases h_ph : curBody.phase with
-        | other tag => exact Or.inl ⟨tag, rfl⟩
-        | _ =>
+        cases h_ph : isOtherPhase curBody.phase with
+        | true => exact Or.inl (isOtherPhase_eq_true_iff h_ph)
+        | false =>
           refine Or.inr ⟨?_, ?_⟩
           · rw [h_ph] at h_st; exact h_st
-          · unfold stepMirFn
-            rw [h_act]
-            change (match curBody.phase with | .other _ => _ | _ => _) = _
-            rw [h_ph]
+          · rw [stepMirFn_eq_ite]
+            dsimp only
+            rw [h_act, h_ph]
             rfl
       rcases h_phase_or with ⟨tag, h_ph⟩ | ⟨h_st_body, h_step_body⟩
       · rw [h_ph] at h_st
@@ -6745,9 +6576,9 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
       have h_act :
           (MachineState.pushBaseStack body [] ms).memory.activeCallee.getD outerBody =
             ms.memory.activeCallee.getD body := rfl
-      unfold stepMirFn at h
       let curBody := ms.memory.activeCallee.getD body
-      change evalNodeNoCallWP _ _ (match curBody.phase with | .other _ => _ | _ => _) at h
+      rw [stepMirFn_eq_ite] at h
+      dsimp only at h
       have h_phase_or :
           (∃ tag, curBody.phase = .other tag) ∨
           (evalNodeNoCallWP
@@ -6776,15 +6607,14 @@ theorem wpMirExecNoCallSym_pushBaseStack_nil_outer
                     evalTerminator (MachineState.pushBaseStack body [] ms)
                       bb.terminator (some curBody)
                   else MirStepNode.fail .ub) := by
-        cases h_ph : curBody.phase with
-        | other tag => exact Or.inl ⟨tag, rfl⟩
-        | _ =>
+        cases h_ph : isOtherPhase curBody.phase with
+        | true => exact Or.inl (isOtherPhase_eq_true_iff h_ph)
+        | false =>
           refine Or.inr ⟨?_, ?_⟩
           · rw [h_ph] at h; exact h
-          · unfold stepMirFn
-            rw [h_act]
-            change (match curBody.phase with | .other _ => _ | _ => _) = _
-            rw [h_ph]
+          · rw [stepMirFn_eq_ite]
+            dsimp only
+            rw [h_act, h_ph]
             rfl
       rcases h_phase_or with ⟨tag, h_oth⟩ | ⟨h_st, h_step_body⟩
       · rw [h_oth] at h; exact False.elim h
@@ -7591,12 +7421,12 @@ theorem MirWpConverges.call_summary
         MirStepNode.step
           (pushCalleeFrame s curBody localsAfterArgs destination targetBb
             calleeBody argVals unwind) := by
-    unfold stepMirFn
-    change (match curBody.phase with | .other _ => _ | _ => _) = _
-    cases h_ph : curBody.phase with
-    | other tag => exact False.elim (h_phase tag h_ph)
-    | _ =>
-      dsimp only
+    rw [stepMirFn_eq_ite]
+    dsimp only
+    cases h_ph : isOtherPhase curBody.phase with
+    | true => exact False.elim (Bool.noConfusion (h_ph.symm.trans (isOtherPhase_eq_false h_phase)))
+    | false =>
+      simp only [Bool.false_eq_true, ite_false]
       rw [h_bb]
       dsimp only
       rw [h_stmt_none]
@@ -7607,7 +7437,7 @@ theorem MirWpConverges.call_summary
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+      dsimp only [evalTerminator, bodyLocalDeclsOf]
       rw [h_resolve]
       dsimp only
       rw [h_args]
@@ -7730,12 +7560,12 @@ theorem MirWpConverges.tailCall_summary
   have h_step_eq :
       stepMirFn outerBody s =
         MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals) := by
-    unfold stepMirFn
-    change (match curBody.phase with | .other _ => _ | _ => _) = _
-    cases h_ph : curBody.phase with
-    | other tag => exact False.elim (h_phase tag h_ph)
-    | _ =>
-      dsimp only
+    rw [stepMirFn_eq_ite]
+    dsimp only
+    cases h_ph : isOtherPhase curBody.phase with
+    | true => exact False.elim (Bool.noConfusion (h_ph.symm.trans (isOtherPhase_eq_false h_phase)))
+    | false =>
+      simp only [Bool.false_eq_true, ite_false]
       rw [h_bb]
       dsimp only
       rw [h_stmt_none]
@@ -7886,12 +7716,12 @@ theorem MirWpConverges.tailCall_nested_summary
   have h_step_eq :
       stepMirFn outerBody s =
         MirStepNode.step (enterTailCalleeFrame s.memory calleeBody argVals) := by
-    unfold stepMirFn
-    change (match curBody.phase with | .other _ => _ | _ => _) = _
-    cases h_ph : curBody.phase with
-    | other tag => exact False.elim (h_phase tag h_ph)
-    | _ =>
-      dsimp only
+    rw [stepMirFn_eq_ite]
+    dsimp only
+    cases h_ph : isOtherPhase curBody.phase with
+    | true => exact False.elim (Bool.noConfusion (h_ph.symm.trans (isOtherPhase_eq_false h_phase)))
+    | false =>
+      simp only [Bool.false_eq_true, ite_false]
       rw [h_bb]
       dsimp only
       rw [h_stmt_none]
@@ -8089,7 +7919,7 @@ theorem PureMirConvergesWithCallees.call_summary
       rw [h_term]
       dsimp only [PureState.toMachineState] at h_resolve
       unfold evalPureOperands at h_args
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
+      dsimp only [evalTerminator, bodyLocalDeclsOf,
         pureCalleeMemory_borrows, pureCalleeMemory_globals,
         pureCalleeMemory_callerLocals, pureCalleeMemory_callees,
         pureCalleeMemory_traitImpls]
@@ -9734,22 +9564,35 @@ private theorem evalTerminator_call_eq_unified
     (unwind : UnwindAction) (sp : String) (currentBody : Option CapturedMir) :
     evalTerminator s { kind := .call func argOps destination targetOpt unwind, span := sp } currentBody =
       evalCallTerminatorUnified s func argOps destination targetOpt unwind currentBody := by
-  cases targetOpt <;>
-    (dsimp only [evalTerminator, evalCallTerminatorUnified];
-     cases resolveCallTarget s func (length argOps) (bodyLocalDeclsOf currentBody)
-         (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable) with
-     | ub => rfl
-     | unsupported => rfl
-     | ok target localsAfterFunc =>
-       cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-           (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
-           s.memory.callerLocals with
+  cases currentBody with
+  | none =>
+    cases targetOpt <;>
+      (dsimp only [evalTerminator, evalCallTerminatorUnified, bodyLocalDeclsOf];
+       cases resolveCallTarget s func (length argOps) [] emptyLayoutTable with
        | ub => rfl
        | unsupported => rfl
-       | ok argVals locals' =>
-         cases lookupCallee s.memory.callees
-             (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
-             target.defPath target.typeArgs s.memory.traitImpls <;> rfl)
+       | ok target localsAfterFunc =>
+         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+             emptyLayoutTable s.memory.callerLocals with
+         | ub => rfl
+         | unsupported => rfl
+         | ok argVals locals' =>
+           cases lookupCallee s.memory.callees emptyLayoutTable
+               target.defPath target.typeArgs s.memory.traitImpls <;> rfl)
+  | some b =>
+    cases targetOpt <;>
+      (dsimp only [evalTerminator, evalCallTerminatorUnified, bodyLocalDeclsOf];
+       cases resolveCallTarget s func (length argOps) b.localDecls b.layouts with
+       | ub => rfl
+       | unsupported => rfl
+       | ok target localsAfterFunc =>
+         cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
+             b.layouts s.memory.callerLocals with
+         | ub => rfl
+         | unsupported => rfl
+         | ok argVals locals' =>
+           cases lookupCallee s.memory.callees b.layouts
+               target.defPath target.typeArgs s.memory.traitImpls <;> rfl)
 
 /--
 Core one-step lockstep theorem for `checkPureMirWithCallees`:
@@ -13586,6 +13429,7 @@ private theorem evalDirectRustIntrinsic_bswap_u32
       { defPath := "core::intrinsics::bswap", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
       decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
     some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureBswapLoop 4 v 0, 4⟩)) := by
+  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .bswap) rfl (by rintro ⟨⟩)]
   change some (writeIntrinsicScalarResult s locals' dst targetBb (evalBswap ⟨v, 4⟩)) = _
   rw [evalBswap_u32_eq hv]
 
@@ -13599,6 +13443,7 @@ private theorem evalDirectRustIntrinsic_ctpop_u32
       { defPath := "core::intrinsics::ctpop", typeArgs := typeArgs, fnSig := .none, isIndirect := false }
       decls layouts argOps [.scalar ⟨v, 4⟩] locals' dst targetBb unwind =
     some (writeIntrinsicReturn s locals' dst targetBb (.scalar ⟨pureCtpopLoop 32 v, 4⟩)) := by
+  rw [evalDirectRustIntrinsic?_nonSelect _ _ _ _ _ _ _ _ _ _ _ (rk := .ctpop) rfl (by rintro ⟨⟩)]
   change some (writeIntrinsicScalarResult s locals' dst targetBb (evalCtpop ⟨v, 4⟩)) = _
   rw [evalCtpop_u32_eq hv]
 
@@ -13656,17 +13501,16 @@ private theorem evalDirectRustIntrinsic_constEvalSelect_ctpop_u32
     unfold resolveConstEvalSelectTarget?
     dsimp only
     rw [h_rt_def, h_rt_targs]
-  unfold evalDirectRustIntrinsic?
-  dsimp only
-  rw [hc_sel]
-  dsimp only
+  rw [evalDirectRustIntrinsic?_constEvalSelect_three _ _ _ _ _ _ _ _ _ _ _ _ _ hc_sel]
+  unfold evalConstEvalSelectThree
+  dsimp only [selectTupleTyOpt, selectRtFnOpOpt]
   rw [h_unp]
   dsimp only [length]
   rw [h_res]
   dsimp only
   rw [h_rt_lk]
   dsimp only [isDirectExactDivTarget]
-  have h_ne : stringEq "core::intrinsics::ctpop" "core::intrinsics::exact_div" = false := rfl
+  have h_ne : stringEq "core::intrinsics::ctpop" "core::intrinsics::exact_div" = false := by decide
   rw [h_ne]
   dsimp only
   rw [hc_pop]
@@ -14781,7 +14625,7 @@ theorem PureMirModularConverges.call_summary
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
+      dsimp only [evalTerminator, bodyLocalDeclsOf,
         resolveCallTarget]
       rw [h_def]
       dsimp only
@@ -16273,7 +16117,7 @@ theorem PureMirModularConverges.call_diverging_panic
     rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
     dsimp only at h_term
     rw [h_term]
-    dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
+    dsimp only [evalTerminator, bodyLocalDeclsOf,
       resolveCallTarget]
     rw [h_def]
     dsimp only
@@ -16423,7 +16267,7 @@ theorem PureMirModularConverges.call_diverging_modular_sub
       rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
       dsimp only at h_term
       rw [h_term]
-      dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf,
+      dsimp only [evalTerminator, bodyLocalDeclsOf,
         resolveCallTarget]
       rw [h_def]
       dsimp only
@@ -17454,7 +17298,7 @@ theorem PureMirModularConverges.call_diverging_panic_pureTarget
     rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
     dsimp only at h_term
     rw [h_term]
-    dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+    dsimp only [evalTerminator, bodyLocalDeclsOf]
     rw [h_res_m]
     dsimp only
     rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
@@ -17608,7 +17452,7 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
     rcases bb with ⟨stmts, ⟨tk, tsp⟩, isCl⟩
     dsimp only at h_term
     rw [h_term]
-    dsimp only [evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
+    dsimp only [evalTerminator, bodyLocalDeclsOf]
     rw [h_res_m]
     dsimp only
     rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
@@ -19289,8 +19133,9 @@ private theorem evalConstEvalSelect_ctpop_u32 (v : ScalarInt)
   rw [h_unp]
   dsimp only
   rw [h_cls]
-  simp only [List.isEmpty, Bool.false_eq_true, ite_false, evalPureScalarIntrinsic,
-    intrinsicScalarTyInfo?, hv, ite_true]
+  change (if isCanonicalScalarOfSize v 4 then some (Value.scalar ⟨pureCtpopLoop 32 v.bits, 4⟩) else none) = _
+  rw [hv]
+  rfl
 
 private theorem pureBswapLoop_four_lt (v : Nat) :
     pureBswapLoop 4 v 0 < 4294967296 := by
