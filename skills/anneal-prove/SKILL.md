@@ -287,9 +287,10 @@ the body and initial state taken from the goal unfold: a folded
 When the body indexes memory by the counter (`frame[2 * i]`), keep the
 accumulator symbolic, split the counter into its concrete values, and run one
 script on every case with `all_goals` (see
-`Proof/WireframeDemo/checksum_frame_safe.lean` and
-`Proof/WireframeDemo/checksum_frame_fast.lean`). Use `mirWpConverges_whileRank`
-for loops with a decreasing rank instead of a counter.
+`Proof/WireframeDemo/checksum_frame_safe.lean`; `checksum_frame_fast.lean`
+reuses that loop proof for its equivalence claim). Use
+`mirWpConverges_whileRank` for loops with a decreasing rank instead of a
+counter.
 
 #### Pattern D: `&mut` / `&` arguments with `Anneal.SepLogicLenses`
 

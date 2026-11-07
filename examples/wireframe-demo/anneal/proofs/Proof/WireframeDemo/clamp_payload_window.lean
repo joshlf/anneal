@@ -19,6 +19,13 @@ open Anneal.PureMirExec
 open Anneal.MirLiftCore
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
+open Anneal.FunctionalTranslation
+
+private theorem nat_beq_eq_false_of_ne {a b : Nat} (h : a ≠ b) :
+    Nat.beq a b = false := by
+  cases hb : Nat.beq a b
+  · rfl
+  · exact absurd (Nat.eq_of_beq_eq_true hb) h
 
 private theorem ensures_holds (b1 b2 ret : Nat)
     (h_ret : (b1 ≤ b2 ∧ ret = b1) ∨ (b2 < b1 ∧ ret = b2)) :
@@ -29,59 +36,10 @@ private theorem ensures_holds (b1 b2 ret : Nat)
        .scalar { bits := ret, sizeBytes := 2 }] := by
   apply Hold.val
   refine hold_mirBool_of_blockLinear _ _ rfl rfl ?_
-  rcases h_ret with ⟨h_le, h_ret_eq⟩ | ⟨h_gt, h_ret_eq⟩
-  · rw [h_ret_eq]
-    have h1 : Nat.ble b1 b2 = true := Nat.ble_eq_true_of_le h_le
-    have h2 : Nat.ble b1 b1 = true := Nat.ble_eq_true_of_le (Nat.le_refl b1)
-    have h3 : Nat.beq b1 b1 = true := Nat.beq_refl b1
-    iterate 3 (
-      dsimp only [
-        Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.layouts,
-        Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.body,
-        defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-        wpBlockLinear, wpCfgStep, dispatchBlock,
-        evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-        finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
-        evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-        mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree, operandIsSigned, operandTy,
-        sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy,
-        resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
-        scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-        mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-        evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-        MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-        initMachineState, initLocals, initLocalsAux, emptyMemory,
-        readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag, lookupBorrow,
-        appendProjections, stripTransparentProjections, projectionsOverlap,
-        projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
-        borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
-        natListContainsBool, invalidateConflictingBorrows,
-        invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-        freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
-        updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
-        isBorrowDescendantOrSelfAux, boolToScalar,
-        GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-        HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-        List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-        get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, Bool.not,
-        ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-        Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-      first | rw [h1] | rw [h2] | rw [h3])
-    dsimp only [wpBlockLinear, wpCfgStep, dispatchBlock,
-      evalSymNodeTree, evalTerminatorSymTreeFast,
-      MirStepNode.retNormal, SymTree.bind, readProjectedValue_nil,
-      GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, get?]
-    exact ⟨boolTruePost_normal_one _⟩
-  · rw [h_ret_eq]
-    have h1 : Nat.ble b2 b2 = true := Nat.ble_eq_true_of_le (Nat.le_refl b2)
-    have h2 : Nat.ble b2 b1 = true := Nat.ble_eq_true_of_le (Nat.le_of_lt h_gt)
-    have h3 : Nat.beq b2 b1 = false := by
-      cases h : Nat.beq b2 b1
-      · rfl
-      · have := Nat.eq_of_beq_eq_true h; omega
-    have h4 : Nat.beq b2 b2 = true := Nat.beq_refl b2
+  rcases h_ret with ⟨h_le, rfl⟩ | ⟨h_gt, rfl⟩
+  all_goals
     iterate 4 (
-      dsimp only [
+      try dsimp only [
         Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.layouts,
         Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.body,
         defaultSpecSteps, entryBB, dummyBB, lookupBlock,
@@ -112,11 +70,8 @@ private theorem ensures_holds (b1 b2 ret : Nat)
         get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, Bool.not,
         ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
         Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-      first | rw [h1] | rw [h2] | rw [h3] | rw [h4])
-    dsimp only [wpBlockLinear, wpCfgStep, dispatchBlock,
-      evalSymNodeTree, evalTerminatorSymTreeFast,
-      MirStepNode.retNormal, SymTree.bind, readProjectedValue_nil,
-      GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, get?]
+      try simp (disch := omega) only [nat_ble_eq_true_of_le, Nat.beq_refl,
+        nat_beq_eq_false_of_ne])
     exact ⟨boolTruePost_normal_one _⟩
 
 private theorem wpReq_inversion (v1 v2 : Value)

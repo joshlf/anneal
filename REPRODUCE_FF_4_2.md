@@ -35,12 +35,15 @@ than trusting this file.
   files; the bounded evaluations that remain use `defaultSpecSteps` (on the
   three impure `#[spec]` companions) or the fixed-budget `*FuelFree` wrappers
   inside `Anneal` (Section 2).
-- Proof LOC in `Proof/WireframeDemo/*.lean`: `8,009 → 1,664` (−79.2%) against
-  the last complete proof corpus `a6bebfc2`, and `4,264 → 1,664` (−61.0%)
+- Proof LOC in `Proof/WireframeDemo/*.lean`: `8,009 → 1,619` (−79.8%) against
+  the last complete proof corpus `a6bebfc2`, and `4,264 → 1,619` (−62.0%)
   against `0d3242d3` (whose `clamp_payload_window`, `frame_total_len`, and
   `parse_compression_flag` files are 33/33/158-line stubs without `verified`,
   see Section 3). The migration added `+2,972` net LOC of shared theory
   (Section 3.2).
+- Measured elaboration heartbeats for the seven proofs fall from `1,388,934`
+  to `666,246` thousand (−52.0%) against their `[adv B2]` versions
+  (Section 4.2).
 
 ## 2. Which lifting API each proof uses
 
@@ -82,10 +85,10 @@ before every step and stops as soon as it reaches `target`, `.halted`, or
 `.faulted`, so its internal recursion bound (`#blocks + 256`) is never reached
 and no proof mentions `defaultCfgSteps` or a step count. `checksum_frame_fast`
 discharges `verified` via `verifyStatefulEquivMir_of_wpConverges`: it steps
-`checksum_frame_fast.body` to return with `mirNoCallWpConverges_of_runCfgToBlock`
-and reuses `safe_noCallWpConverges` from `Proof.WireframeDemo.checksum_frame_safe`
-for the reference specification body instead of re-unrolling
-`checksum_frame_safe.body`.
+`checksum_frame_fast.body` to return with
+`mirNoCallWpConverges_of_runCfgToBlock` and reuses `safe_noCallWpConverges`
+from `Proof.WireframeDemo.checksum_frame_safe` for the reference specification
+body instead of re-unrolling `checksum_frame_safe.body`.
 
 Known blocker for the remaining companion rows:
 
@@ -107,18 +110,18 @@ their `wpReq_inversion` lemma, call the `mir_lift_spec` tactic that the
 `Anneal` umbrella never imports, and define no `verified` theorem, so the
 `0d3242d3` column understates the cost of a complete proof.
 
-| Proof | `a6bebfc2` | `0d3242d3` | `[adv B1]` `a6aae5b8` | `[adv A1]` `07b582eb` | `[adv B2]` `ecdf04bf` | `[adv A2]` `fbd40894` | this revision | vs `a6bebfc2` |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `advance_cursor.lean` | 227 | 227 | 171 | 149 | 258 | 231 | 231 | +1.8% |
-| `checksum_frame_fast.lean` | 1,592 | 1,592 | 433 | 433 | 433 | 432 | 174 | −89.1% |
-| `checksum_frame_safe.lean` | 1,242 | 1,242 | 196 | 196 | 569 | 250 | 275 | −77.9% |
-| `clamp_payload_window.lean` | 1,595 | 33 (stub) | 330 | 315 | 315 | 315 | 315 | −80.3% |
-| `decode_wire_header.lean` | 979 | 979 | 425 | 425 | 336 | 272 | 272 | −72.2% |
-| `frame_total_len.lean` | 1,268 | 33 (stub) | 287 | 261 | 261 | 261 | 259 | −79.6% |
-| `parse_compression_flag.lean` | 1,106 | 158 (stub) | 176 | 138 | 138 | 138 | 138 | −87.5% |
-| **Total** | **8,009** | **4,264** | **2,018** | **1,917** | **2,310** | **1,899** | **1,664** | **−79.2%** |
+| Proof | `a6bebfc2` | `0d3242d3` | `[adv B1]` `a6aae5b8` | `[adv A1]` `07b582eb` | `[adv B2]` `ecdf04bf` | `[adv A2]` `fbd40894` | `[adv B3]` `faf8961c` | this revision | vs `a6bebfc2` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `advance_cursor.lean` | 227 | 227 | 171 | 149 | 258 | 231 | 231 | 231 | +1.8% |
+| `checksum_frame_fast.lean` | 1,592 | 1,592 | 433 | 433 | 433 | 432 | 174 | 174 | −89.1% |
+| `checksum_frame_safe.lean` | 1,242 | 1,242 | 196 | 196 | 569 | 250 | 275 | 275 | −77.9% |
+| `clamp_payload_window.lean` | 1,595 | 33 (stub) | 330 | 315 | 315 | 315 | 315 | 270 | −83.1% |
+| `decode_wire_header.lean` | 979 | 979 | 425 | 425 | 336 | 272 | 272 | 272 | −72.2% |
+| `frame_total_len.lean` | 1,268 | 33 (stub) | 287 | 261 | 261 | 261 | 259 | 259 | −79.6% |
+| `parse_compression_flag.lean` | 1,106 | 158 (stub) | 176 | 138 | 138 | 138 | 138 | 138 | −87.5% |
+| **Total** | **8,009** | **4,264** | **2,018** | **1,917** | **2,310** | **1,899** | **1,664** | **1,619** | **−79.8%** |
 
-Against `0d3242d3` the total falls by `61.0%` (`4,264 → 1,664`). Lines that
+Against `0d3242d3` the total falls by `62.0%` (`4,264 → 1,619`). Lines that
 mention `BlockCtx`: `111` at `a6bebfc2` (28/26/26/23/8 in `checksum_frame_fast`,
 `checksum_frame_safe`, `clamp_payload_window`, `frame_total_len`,
 `parse_compression_flag`), `0` now. Lines that mention `defaultCfgSteps` or
@@ -136,7 +139,7 @@ mention `BlockCtx`: `111` at `a6bebfc2` (28/26/26/23/8 in `checksum_frame_fast`,
 | `theory/Anneal/PureMirExec.lean` | 18,475 | 18,461 | −14 | `sup/ff-4` `18c85931` (`I-10`) plus unused-binder fixes |
 | **Net** | | | **+2,972** | |
 
-The WireframeDemo proofs shrink by `6,345` lines against `a6bebfc2`; less than
+The WireframeDemo proofs shrink by `6,390` lines against `a6bebfc2`; less than
 half of that moved into reusable theory.
 
 ### 3.3 Tutor and `MirVerification`
@@ -148,22 +151,24 @@ half of that moved into reusable theory.
 
 ## 4. Elaboration cost
 
+### 4.1 Wall clock
+
 Wall-clock time of one sequential `lake env lean` per file (Section 6, step 6)
 on `cpl-direct-electron-37838` with `anneal-lean-run --mode file
 --concurrency 1`, after `cargo-anneal verify` has built the imports. Each file
 sets `maxHeartbeats` itself; no file raises it above `800,000`. The host ran
-other Lean jobs during both measurements, so differences of a few seconds on
-unchanged files (`clamp_payload_window`, `frame_total_len`) are noise.
+other Lean jobs during every measurement, so differences of a few seconds on
+unchanged files are noise; Section 4.2 gives a load-independent measure.
 
-| Proof | `maxHeartbeats` | `[adv B2]` | `[adv A2]` | this revision | Dominated by |
-| :--- | ---: | ---: | ---: | ---: | :--- |
-| `advance_cursor.lean` | 400,000 | 2.5 s | 1.5 s | 1.5 s | `verifyStatefulMir_of_sepLenses` + `LiftLensBlock` |
-| `checksum_frame_fast.lean` | 800,000 | 56.6 s | 57.1 s | 15.2 s | single `runCfgToBlock` of `checksum_frame_fast.body` (reuses `safe_noCallWpConverges`) |
-| `checksum_frame_safe.lean` | 400,000 | 34.4 s | 13.5 s | 12.0 s | four `runCfgToBlock` iterations (about 1.8 s of `dsimp` each) |
-| `clamp_payload_window.lean` | 800,000 | 23.2 s | 27.1 s | 27.1 s | companion lemmas |
-| `decode_wire_header.lean` | 400,000 | 7.8 s | 4.1 s | 4.1 s | `LiftStmtsTerminator.eval_rest` + `cons_eval_norm` |
-| `frame_total_len.lean` | 800,000 | 32.6 s | 38.5 s | 32.5 s | companion lemmas |
-| `parse_compression_flag.lean` | 800,000 | 11.4 s | 12.3 s | 12.3 s | `requires` companion lemma |
+| Proof | `maxHeartbeats` | `[adv B2]` | `[adv A2]` | `[adv B3]` | this revision | Dominated by |
+| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| `advance_cursor.lean` | 400,000 | 2.5 s | 1.5 s | 1.5 s | 3.6 s | `verifyStatefulMir_of_sepLenses` + `LiftLensBlock` |
+| `checksum_frame_fast.lean` | 800,000 | 56.6 s | 57.1 s | 15.2 s | 18.8 s | single `runCfgToBlock` of `checksum_frame_fast.body` (reuses `safe_noCallWpConverges`) |
+| `checksum_frame_safe.lean` | 400,000 | 34.4 s | 13.5 s | 12.0 s | 12.5 s | four `runCfgToBlock` iterations (about 1.8 s of `dsimp` each) |
+| `clamp_payload_window.lean` | 800,000 | 23.2 s | 27.1 s | 27.1 s | 22.2 s | companion lemmas |
+| `decode_wire_header.lean` | 400,000 | 7.8 s | 4.1 s | 4.1 s | 3.9 s | `LiftStmtsTerminator.eval_rest` + `cons_eval_norm` |
+| `frame_total_len.lean` | 800,000 | 32.6 s | 38.5 s | 32.5 s | 31.8 s | companion lemmas |
+| `parse_compression_flag.lean` | 800,000 | 11.4 s | 12.3 s | 12.3 s | 11.5 s | `requires` companion lemma |
 
 The `#mir_lift` part is cheap: with the companion lemmas replaced by `sorry`
 in a scratch copy, the whole of `frame_total_len.lean`, including `import`
@@ -171,19 +176,53 @@ time, elaborates in `1.5 s` (`clamp_payload_window.lean`: `1.4 s`,
 `parse_compression_flag.lean`: `3.2 s`), and `decode_wire_header.lean`
 elaborates in `4.1 s` (`18.8 s` under `wpBlockLinear` at `[adv A1]`).
 
-## 5. Changes across passes (`[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]` → `[adv B3]`)
+### 4.2 Heartbeats
+
+Heartbeats spent elaborating each file's declarations, in thousands (the unit
+of `maxHeartbeats`), read with `IO.getNumHeartbeats` before and after the file
+body under `Elab.async false` (Section 6, step 7). Heartbeats count small
+allocations, so unlike wall clock they do not depend on host load. The
+`[adv B2]` column elaborates that revision's proof file against the current
+theory and generated modules; `parse_compression_flag.lean` has not changed
+since `[adv A1]`. The `a6bebfc2` proofs were written against that revision's
+theory and generated modules and are not measured here.
+
+| Proof | `[adv B2]` | this revision | Change |
+| :--- | ---: | ---: | ---: |
+| `advance_cursor.lean` | 5,771 | 5,414 | −6.2% |
+| `checksum_frame_fast.lean` | 655,752 | 71,712 | −89.1% |
+| `checksum_frame_safe.lean` | 180,914 | 64,596 | −64.3% |
+| `clamp_payload_window.lean` | 187,030 | 186,984 | −0.0% |
+| `decode_wire_header.lean` | 44,866 | 22,947 | −48.9% |
+| `frame_total_len.lean` | 249,768 | 249,760 | −0.0% |
+| `parse_compression_flag.lean` | 64,833 | 64,833 | (same file) |
+| **Total** | **1,388,934** | **666,246** | **−52.0%** |
+
+## 5. Changes across passes (`[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]` → `[adv B3]` → `[adv A3]`)
+
+- `clamp_payload_window` (`[adv A3]`): `ensures_holds` evaluated its two
+  `ret` cases with two copies of a 31-line `dsimp only` list and
+  case-specific `Nat.ble` / `Nat.beq` rewrites. One `all_goals` script now
+  handles both cases and discharges the comparisons with
+  `simp (disch := omega)` (`315 → 270` lines).
+- `REPRODUCE_FF_4_2.md` and `SKILL.md` (`[adv A3]`): corrected two `[adv B3]`
+  entries below (the `cfgAtBlock` change and the size of the
+  `frame_total_len` edit) and the Pattern C reference to
+  `checksum_frame_fast.lean`, and added measured heartbeats (Section 4.2,
+  Section 6 step 7).
 
 - `checksum_frame_fast`, `checksum_frame_safe`, `MirLiftCore`, `MirLoops`
   (`[adv B3]`):
-  1. Fixed `cfgAtBlock` in `theory/Anneal/MirLiftCore.lean` to return `true` on
-     `.halted _ _` and `.faulted` (matching its docstring) so `runCfgUntilAux`
-     stops immediately on return/fault instead of spinning through the remaining
-     recursion budget, and replaced `defaultCfgSteps body` in `runCfgToBlock`
-     with `Nat.add (length body.basicBlocks) 256` so callers never include
-     `defaultCfgSteps` in `dsimp only`.
+  1. Changed `cfgAtBlock` in `theory/Anneal/MirLiftCore.lean` to also return
+     `true` on `.halted _ _` and `.faulted`, so `runCfgUntilAux` stops at a
+     return or fault instead of stepping the absorbing state through the rest
+     of its recursion bound, and replaced `defaultCfgSteps body` in
+     `runCfgToBlock` with `Nat.add (length body.basicBlocks) 256` so callers
+     never include `defaultCfgSteps` in `dsimp only`.
   2. Added `mirNoCallWpConverges_forRangeUp` to `theory/Anneal/MirLoops.lean`
      and `mirNoCallWpConverges_of_cfgStateWP` /
-     `mirNoCallWpConverges_of_runCfgToBlock` to `theory/Anneal/MirLiftCore.lean`.
+     `mirNoCallWpConverges_of_runCfgToBlock` to
+     `theory/Anneal/MirLiftCore.lean`.
   3. Exported `safe_noCallWpConverges` and `frame8_post_holds` from
      `Proof/WireframeDemo/checksum_frame_safe.lean` (`12.0 s`, `275` lines) and
      migrated `Proof/WireframeDemo/checksum_frame_fast.lean` off
@@ -193,7 +232,7 @@ elaborates in `4.1 s` (`18.8 s` under `wpBlockLinear` at `[adv A1]`).
      (`15.2 s`, `174` lines), eliminating the duplicate 4-iteration unrolling of
      `checksum_frame_safe.body` and reducing `defaultCfgSteps` / `runCfgSteps`
      occurrences across `Proof/WireframeDemo/*.lean` to `0`.
-  4. Removed 5 duplicated lines in `dsimp only` in
+  4. Removed a duplicated two-line group from a `dsimp only` list in
      `Proof/WireframeDemo/frame_total_len.lean` (`261 → 259` lines).
 
 - `checksum_frame_safe` (`[adv A2]`): the `[adv B2]` loop proof passed exact
@@ -315,5 +354,19 @@ anneal-lean-run --mode build --concurrency 1 -- \
   time anneal-lean-run --mode file --concurrency 1 -- lake env lean "$f"
 done)
 
-# 7. Remove the untracked build artifacts before committing.
+# 7. Heartbeats per file (Section 4.2): elaborate a /tmp copy that prints
+#    IO.getNumHeartbeats before and after the file body, synchronously.
+(cd examples/wireframe-demo/.anneal && for f in ../anneal/proofs/Proof/WireframeDemo/*.lean; do
+  p=/tmp/hb_$(basename "$f")
+  { sed -n '/^import /p' "$f"
+    echo 'set_option Elab.async false'
+    echo '#eval show IO Unit from do IO.println s!"HB {← IO.getNumHeartbeats}"'
+    sed '/^import /d' "$f"
+    echo '#eval show IO Unit from do IO.println s!"HB {← IO.getNumHeartbeats}"'
+  } > "$p"
+  echo "$f: $(anneal-lean-run --mode file --concurrency 1 -- lake env lean "$p" |
+    awk '/^HB /{v[n++]=$2} END{print int((v[1]-v[0])/1000)}') thousand heartbeats"
+done)
+
+# 8. Remove the untracked build artifacts before committing.
 git status --porcelain   # `examples/*/.anneal/` and `examples/*/Cargo.lock`
