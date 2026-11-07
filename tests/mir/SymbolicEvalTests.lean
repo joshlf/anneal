@@ -1096,6 +1096,130 @@ def sliceLenAsPtrFromRawPartsClaim : Claim where
   post args ret :=
     args = [ret]
 
+private def wpExecFast (body : CapturedMir) (post : MirOutcome → Prop) :
+    Nat → MirExecState → Prop
+  | 0, _ => False
+  | fuel' + 1, .running s =>
+    evalSymNodeTree (wpExecFast body post fuel') post (stepMirSymTree body s)
+  | _ + 1, .halted out => post out
+  | _ + 1, .faulted _ => False
+
+private theorem wpExecFast_eq
+    (fuel : Nat) (body : CapturedMir) (st : MirExecState) (post : MirOutcome → Prop) :
+    wpMirExecSym fuel body st post = wpExecFast body post fuel st := by
+  induction fuel generalizing st with
+  | zero => rfl
+  | succ fuel' ih =>
+    have h_fn : (fun st' => wpMirExecSym fuel' body st' post) = wpExecFast body post fuel' :=
+      funext (fun st' => ih st')
+    cases st with
+    | running s =>
+      dsimp only [wpMirExecSym, stepMirExecSymTree, wpExecFast]
+      rw [h_fn]
+    | halted out =>
+      dsimp only [wpMirExecSym, stepMirExecSymTree, evalSymNodeTree, wpExecFast]
+    | faulted fk =>
+      cases fk <;>
+        dsimp only [wpMirExecSym, stepMirExecSymTree, evalSymNodeTree, MirStepNode.fail, wpExecFast]
+
+private def scalarU8TypeLayout : TypeLayout := {
+  size := { bytes := 1 }
+  align := { bytes := 1 }
+  backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+private def scalarPtrTypeLayout : TypeLayout := {
+  size := { bytes := 8 }
+  align := { bytes := 8 }
+  backendRepr :=
+    .scalar (.initialized (.pointer 0) { start := 0, end_ := 18446744073709551615 })
+  fields := .primitive
+  variants := .single 0
+  isUninhabited := false
+}
+
+private def monomorphizedSliceLayouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [defaultU8TypeLayout, scalarU8TypeLayout]
+}
+
+private def monomorphizedAsPtrLayouts : LayoutTable := {
+  pointerBits := 64
+  isLittleEndian := true
+  entries := [scalarPtrTypeLayout, scalarU8TypeLayout]
+}
+
+private def coreSliceLenU8Mir : CapturedMir := {
+  mkMirBody "core::slice::<impl [T]>::len" 1
+    [mkDecl .mut usizeMirTy, mkDecl .not sliceRefU8MirTy]
+    [ { statements :=
+          [ mkStmt (.assign { local_ := 0, projection := [] }
+              (.unaryOp .ptrMetadata (.move { local_ := 1, projection := [] }))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  layouts := monomorphizedSliceLayouts
+}
+
+private def coreSliceAsPtrU8Mir : CapturedMir := {
+  mkMirBody "core::slice::<impl [T]>::as_ptr" 1
+    [ mkDecl .mut rawConstPtrU8MirTy
+    , mkDecl .not sliceRefU8MirTy ]
+    [ { statements :=
+          [ mkStmt (.assign { local_ := 0, projection := [] }
+              (.cast .ptrToPtr
+                (.move { local_ := 1, projection := [] })
+                rawConstPtrU8MirTy)) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  fnAbi := {
+    args := []
+    ret := { layout := scalarPtrTypeLayout, mode := .direct }
+    conv := .rust
+    canUnwind := true
+  }
+  layouts := monomorphizedAsPtrLayouts
+}
+
+private def coreSliceFromRawPartsMutU8Mir : CapturedMir := {
+  mkMirBody "core::slice::from_raw_parts_mut" 2
+    [ mkDecl .mut sliceMutRefU8MirTy
+    , mkDecl .not rawMutPtrU8MirTy
+    , mkDecl .not usizeMirTy ]
+    [ { statements :=
+          [ mkStmt (.assign { local_ := 0, projection := [] }
+              (.aggregate (.rawPtr { kind := .slice (.uint .u8), layoutIdx := 0 } .mut)
+                [ .copy { local_ := 1, projection := [] }
+                , .copy { local_ := 2, projection := [] } ])) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ] with
+  layouts := monomorphizedSliceLayouts
+}
+
+private def sliceRoundtripCallees : List CapturedMir :=
+  [coreSliceLenMir, coreSliceAsPtrMir, coreSliceFromRawPartsMutMir]
+
+private theorem sliceCallerLayouts_pointerBits : sliceCallerLayouts.pointerBits = 64 := rfl
+private theorem sliceCallerLayouts_entries : sliceCallerLayouts.entries = [defaultU8TypeLayout] := rfl
+
+private theorem lookup_len_1 :
+    lookupCallee sliceRoundtripCallees
+      sliceCallerLayouts "core::slice::<impl [T]>::len" [.uint .u8] [] =
+    .some coreSliceLenU8Mir := rfl
+
+private theorem lookup_as_ptr_1 :
+    lookupCallee sliceRoundtripCallees
+      sliceCallerLayouts "core::slice::<impl [T]>::as_ptr" [.uint .u8] [] =
+    .some coreSliceAsPtrU8Mir := rfl
+
+private theorem lookup_from_raw_1 :
+    lookupCallee sliceRoundtripCallees
+      sliceCallerLayouts "core::slice::from_raw_parts_mut" [.uint .u8] [] =
+    .some coreSliceFromRawPartsMutU8Mir := rfl
+
 set_option maxHeartbeats 800000 in
 /--
 Kernel-checked symbolic verification of `sliceLenAsPtrFromRawPartsMir` stepping
@@ -1107,7 +1231,57 @@ theorem sliceLenAsPtrFromRawParts_verified :
     VerificationResult sliceLenAsPtrFromRawPartsClaim := by
   refine verifyMirNoPanicSym sliceLenAsPtrFromRawPartsClaim 24 ?_
   rintro _ ⟨p, len, rfl⟩
-  rfl
+  change wpMirSym 24 sliceLenAsPtrFromRawPartsMir
+    (initMachineStateWithCallees sliceLenAsPtrFromRawPartsMir _ sliceRoundtripCallees) _
+  have h_init :
+      initMachineStateWithCallees sliceLenAsPtrFromRawPartsMir
+        [.aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }]]
+        sliceRoundtripCallees =
+      { frame :=
+          { blockIdx := 0
+            stmtIdx := 0
+            locals := initLocalsAux 0 sliceLenAsPtrFromRawPartsMir.localDecls
+              [.aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }]] }
+        memory :=
+          { nextAllocId := 0
+            globals := []
+            borrows := []
+            nextTag := 1
+            callees := sliceRoundtripCallees
+            callStack := []
+            activeCallee := none
+            traitImpls := [] } } := rfl
+  rw [h_init]
+  unfold wpMirSym
+  rw [wpExecFast_eq]
+  set_option linter.unusedSimpArgs false in
+  simp only [sliceLenAsPtrFromRawPartsClaim, sliceLenAsPtrFromRawPartsMir,
+    coreSliceLenU8Mir, coreSliceAsPtrU8Mir, coreSliceFromRawPartsMutU8Mir,
+    sliceCallerLayouts_pointerBits, sliceCallerLayouts_entries,
+    monomorphizedSliceLayouts, monomorphizedAsPtrLayouts,
+    defaultU8TypeLayout, scalarU8TypeLayout, scalarPtrTypeLayout, defaultTestFnAbi,
+    usizeMirTy, sliceRefU8MirTy, sliceMutRefU8MirTy, rawConstPtrU8MirTy, rawMutPtrU8MirTy,
+    fnConstOp, mkMirBody, mkDecl, mkStmt, mkTerm, emptyLayoutTable,
+    initLocals, initLocalsAux, emptyMemory,
+    wpExecFast, evalSymNodeTree, stepMirSymTree,
+    evalStmtSymTree, evalStmt, finishAssignStmtNode, advanceStmt,
+    evalRvalueSymTree, evalRvalue, evalRvalueWithMemory, isThinRawPtrTy,
+    evalOperand, evalOperands, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
+    lookup_len_1, lookup_as_ptr_1, lookup_from_raw_1,
+    evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf,
+    resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs,
+    checkCalleeTargetCompatible, pushCalleeFrame, restoreCallerProtectors,
+    SymTree.bind, SymTree.run, evalNodeWP,
+    MirStepNode.step, MirStepNode.retNormal, mirNormalPost,
+    readProjectedValue, writePlaceValue, invalidateConflictingBorrows, lookupBorrow, ProvenancePtr.tag,
+    operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned,
+    GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
+    HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
+    List.replicate, List.append, List.length, List.set, List.map, Option.getD,
+    Trusted.Sequence.get?, Trusted.Sequence.set?, Trusted.Sequence.length,
+    Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
+    ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
+    Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
 
 /--
 Caller `sliceSplitAtMutCallerMir` that invokes `core::slice::<impl [T]>::split_at_mut`
@@ -1141,7 +1315,7 @@ def sliceHelperPipelineClaim : Claim where
   callees := [coreSliceFromRawPartsMutMir, coreSliceLenMir, coreSliceSplitAtMutMir]
   pre args :=
     ∃ (p : ProvenancePtr) (len mid : Nat),
-      mid ≤ len ∧ len < 18446744073709551616 ∧
+      p.allocId ≠ 0 ∧ mid ≤ len ∧ p.offsetBytes + len < 9223372036854775808 ∧
       args =
         [ .aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }]
         , .scalar { bits := mid, sizeBytes := 8 } ]
@@ -1157,6 +1331,24 @@ def sliceHelperPipelineClaim : Claim where
               [ .ptr { p with offsetBytes := p.offsetBytes + mid } 8
               , .scalar { bits := len - mid, sizeBytes := 8 } ] ]
 
+private def slicePipelineCallees : List CapturedMir :=
+  [coreSliceFromRawPartsMutMir, coreSliceLenMir, coreSliceSplitAtMutMir]
+
+private theorem lookup_split_2 :
+    lookupCallee slicePipelineCallees
+      sliceCallerLayouts "core::slice::<impl [T]>::split_at_mut" [] [] =
+    .some coreSliceSplitAtMutMir := rfl
+
+private theorem lookup_len_2 :
+    lookupCallee slicePipelineCallees
+      sliceCallerLayouts "core::slice::<impl [T]>::len" [.uint .u8] [] =
+    .some coreSliceLenU8Mir := rfl
+
+private theorem lookup_from_raw_2 :
+    lookupCallee slicePipelineCallees
+      sliceCallerLayouts "core::slice::from_raw_parts_mut" [.uint .u8] [] =
+    .some coreSliceFromRawPartsMutU8Mir := rfl
+
 set_option maxHeartbeats 800000 in
 /--
 Kernel-checked symbolic verification of `sliceSplitAtMutCallerMir` stepping
@@ -1166,20 +1358,91 @@ stack frames (`callStack` depth 2) in a single `verifyMirNoPanicSym` pass.
 theorem sliceHelperPipeline_verified :
     VerificationResult sliceHelperPipelineClaim := by
   refine verifyMirNoPanicSym sliceHelperPipelineClaim 28 ?_
-  rintro _ ⟨p, len, mid, h_le, h_len, rfl⟩
-  have h_ble : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
-  have h_sub : len - mid < 18446744073709551616 := by omega
-  (conv => whnf)
-  split
-  · (conv => whnf)
+  rintro _ ⟨⟨allocId, offsetBytes⟩, len, mid, h_alloc, h_le, h_len, rfl⟩
+  cases allocId with
+  | zero => exact False.elim (h_alloc rfl)
+  | succ allocId =>
+    dsimp only at h_len
+    have h_ble : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
+    have h_mod : scalarModulus 8 = 18446744073709551616 := rfl
+    have h_half : signedHalfModulus 8 = 9223372036854775808 := rfl
+    have h_ble_mod : Nat.ble 18446744073709551616 mid = false :=
+      (nat_ble_eq_false_iff _ _).2 (by omega)
+    have h_ble_sub : Nat.ble 18446744073709551616 (len - mid) = false :=
+      (nat_ble_eq_false_iff _ _).2 (by omega)
+    have h_wrap : wrapScalarBits mid 18446744073709551616 = mid := by
+      unfold wrapScalarBits
+      rw [h_ble_mod]
+    have h1 : Nat.ble 9223372036854775808 mid = false :=
+      (nat_ble_eq_false_iff _ _).2 (by omega)
+    have h2 : Nat.ble 9223372036854775808 (Nat.mul mid 1) = false := by
+      change Nat.ble 9223372036854775808 (mid * 1) = false
+      exact (nat_ble_eq_false_iff _ _).2 (by omega)
+    have h3 : Nat.ble 9223372036854775808 (Nat.add offsetBytes (Nat.mul mid 1)) = false := by
+      change Nat.ble 9223372036854775808 (offsetBytes + mid * 1) = false
+      exact (nat_ble_eq_false_iff _ _).2 (by omega)
+    have h4 : Nat.ble 9223372036854775808 offsetBytes = false :=
+      (nat_ble_eq_false_iff _ _).2 (by omega)
+    let initArgs : List Value :=
+      [ .aggregate 0
+          [ .ptr { allocId := allocId + 1, offsetBytes := offsetBytes } 8
+          , .scalar { bits := len, sizeBytes := 8 } ]
+      , .scalar { bits := mid, sizeBytes := 8 } ]
+    have h_init :
+        initMachineStateWithCallees sliceHelperPipelineClaim.body initArgs sliceHelperPipelineClaim.callees =
+        { frame :=
+            { blockIdx := 0
+              stmtIdx := 0
+              locals := initLocalsAux 0 sliceSplitAtMutCallerMir.localDecls initArgs }
+          memory :=
+            { nextAllocId := 0
+              globals := []
+              borrows := []
+              nextTag := 1
+              callees := slicePipelineCallees
+              callStack := []
+              activeCallee := none
+              traitImpls := [] } } := rfl
+    rw [h_init]
+    unfold wpMirSym
+    rw [wpExecFast_eq]
+    set_option linter.unusedSimpArgs false in
+    simp only [initArgs, sliceHelperPipelineClaim, sliceSplitAtMutCallerMir, coreSliceSplitAtMutMir,
+      coreSliceLenU8Mir, coreSliceFromRawPartsMutU8Mir,
+      sliceCallerLayouts_pointerBits, sliceCallerLayouts_entries, monomorphizedSliceLayouts,
+      defaultU8TypeLayout, scalarU8TypeLayout, defaultTestFnAbi,
+      usizeMirTy, sliceRefU8MirTy, sliceMutRefU8MirTy, rawMutPtrU8MirTy, splitTupleU8MirTy,
+      fnConstOp, mkMirBody, mkDecl, mkStmt, mkTerm, emptyLayoutTable,
+      initLocals, initLocalsAux, emptyMemory,
+      wpExecFast, evalSymNodeTree, stepMirSymTree,
+      evalStmtSymTree, evalStmt, finishAssignStmtNode, advanceStmt,
+      evalRvalueSymTree, evalRvalue, evalRvalueWithMemory, isThinRawPtrTy,
+      evalPtrOffsetBinOpSymTree, evalBinOpOffsetSymTree, finishBinOpOffsetSymTree,
+      pointeeElemByteStride, ptrAllocByteBound?, pointeeTyOf, elemTyOf, rigidTyKindByteSize, intCastTargetBytes,
+      rigidTyByteSize, UintTy.byteWidth, IntTy.byteWidth, FloatTy.byteWidth, lookupGlobalAlloc,
+      evalScalarBinOpSymTree, isSignedNegative, h_mod, h_half,
+      evalOperand, evalOperands, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
+      lookup_split_2, lookup_len_2, lookup_from_raw_2,
+      evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf,
+      resolveCallTarget, extractCalleeDefPath?, extractCalleeTypeArgs,
+      checkCalleeTargetCompatible, pushCalleeFrame, restoreCallerProtectors,
+      SymTree.bind, SymTree.run, evalNodeWP,
+      MirStepNode.step, MirStepNode.retNormal, mirNormalPost,
+      readProjectedValue, writePlaceValue, invalidateConflictingBorrows, lookupBorrow, ProvenancePtr.tag,
+      operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned,
+      GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
+      HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
+      List.replicate, List.append, List.length, List.set, List.map, Option.getD,
+      Trusted.Sequence.get?, Trusted.Sequence.set?, Trusted.Sequence.length,
+      Nat.add, Nat.beq, Bool.and, Bool.or, not, Bool.not, Bool.rec, Bool.casesOn, Nat.ble,
+      ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
+      Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq,
+      h_ble, h_ble_mod, h_ble_sub, h_wrap, h1, h2, h3, h4]
     intro p' len' mid' h_args
     simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
       Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
     rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
-    simp; exact h_sub
-  · rename_i h_false
-    rw [h_ble] at h_false
-    cases h_false
+    simp [wrapScalarBits, scalarModulus, h_ble_mod, h_ble_sub]
 
 /--
 `core::ops::range::<impl RangeBounds<usize> for Range<usize>>::contains`:
@@ -1276,8 +1539,13 @@ theorem rangeBoundsTraitDispatch_verified :
     VerificationResult rangeBoundsCallerClaim := by
   refine verifyMirNoPanicSym rangeBoundsCallerClaim 16 ?_
   rintro _ ⟨start, end_, idx, h_lo, h_hi, rfl⟩
-  (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-  all_goals (try simp_all; try omega)
+  have h_ble1 : Nat.ble start idx = true := Nat.ble_eq_true_of_le h_lo
+  have h_ble2 : Nat.ble end_ idx = false := (nat_ble_eq_false_iff end_ idx).2 h_hi
+  (conv => whnf); split
+  · (conv => whnf); split
+    · rename_i h; rw [h_ble2] at h; cases h
+    · (conv => whnf)
+  · rename_i h; rw [h_ble1] at h; cases h
 
 /-! ## 9. Indirect `FnPtr` Calls (`ReifyFnPointer`, `fnPtrToPtr`, `TerminatorKind.call`, `TerminatorKind.tailCall`, `s.memory.fnPtrs`, and UB Refutation) -/
 

@@ -510,10 +510,15 @@ open Trusted.VerificationResult
     disk. -/
 instance (priority := low) defaultProof :
     ItemProof "frame_tutor::magic_version" Obligations.FrameTutor.magic_version.claim where
-  verified :=
-    Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.FrameTutor.magic_version.claim 64 (by
-      intro _ _
-      exact True.intro)
+  verified := by
+    first
+      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeRustPinnedContractAuto
+          Obligations.FrameTutor.magic_version.claim 64 64 Option.none Option.none
+      | exact Anneal.Rustc.V2026_06_01.SymbolicEval.verifyByWP Obligations.FrameTutor.magic_version.claim 64 (by
+          intro _ _
+          first
+          | simp; try omega
+          | exact True.intro)
 
 /-- Kernel-checked verification certificate for `frame_tutor::magic_version`. -/
 theorem verified : VerificationResult Obligations.FrameTutor.magic_version.claim :=
@@ -691,7 +696,9 @@ after which `cargo anneal` reports the failed build and exits with status `1`:
 
 <!-- tutor: errors step=ch1-advance-offset-verify-fails -->
 ```text
-error: generated/Verify/FrameTutor/advance_offset.lean:27:6: Type mismatch
+cargo-anneal error: lake build failed with status exit status: 1 in examples/tutor-ch1/.anneal:
+stdout:
+error: generated/Verify/FrameTutor/advance_offset.lean:32:12: Type mismatch
   True.intro
 has type
   True
@@ -700,8 +707,9 @@ but is expected to have type
     (Trusted.Rustc.V2026_06_01.MirSemantics.initMachineState Obligations.FrameTutor.advance_offset.claim.body args✝)
     (Anneal.Rustc.V2026_06_01.SymbolicEval.mirNormalPost fun retVal x =>
       Obligations.FrameTutor.advance_offset.claim.post args✝ retVal)
+- Verify.FrameTutor.advance_offset
+stderr:
 error: build failed
-cargo-anneal error: lake build failed with status exit status: 1 in examples/tutor-ch1/.anneal
 ```
 
 How to read this error:

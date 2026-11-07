@@ -91,6 +91,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # FIXME(#87): We must address all blockers listed in #87 before permitting
+      # stable releases.
+      - name: Verify non-stable pre-release version
+        run: ./ci/check_non_stable_version.sh
+
       - name: Smoke-test remote exocrate toolchain installation
         run: |
           set -euo pipefail

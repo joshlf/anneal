@@ -1,3 +1,12 @@
+// Copyright 2026 The Fuchsia Authors
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0>, the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, or the BSD-2-Clause
+// license <LICENSE-BSD or https://opensource.org/license/bsd-2-clause>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+
 //! Hermetic differential test corpus derived from upstream Miri (`pass/`,
 //! `panic/`, and `fail/` suites at `rustc 1.98.0-nightly (14210df0e 2026-05-31)`,
 //! commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`).
@@ -631,6 +640,42 @@ pub fn ub_tb_parent_write_disables_shared_ref() -> u32 {
         *root = 20; // Parent write disables `Frozen` shared borrow `shr` (`Frozen -> Disabled`).
     }
     *shr // Reading through `Disabled` `shr` is UB!
+}
+
+/// Upstream source: `tests/pass/tree_borrows/reserved.rs`
+pub fn tb_child_write_then_parent_read() -> u32 {
+    let mut x: u32 = 0;
+    let root: *mut u32 = &raw mut x;
+    let r: &mut u32 = unsafe { &mut *root };
+    *r = 1; // Child write activates `r` without disabling ancestor `root`.
+    let y = unsafe { *root }; // Foreign read through parent freezes `r`, returning 1.
+    y
+}
+
+/// Upstream source: `tests/pass/tree_borrows/reserved.rs`
+pub fn tb_child_write_then_parent_write() -> u32 {
+    let mut x: u32 = 1;
+    let p1: *mut u32 = &raw mut x;
+    let r2: &mut u32 = unsafe { &mut *p1 };
+    *r2 = 2; // Child write activates `r2` without disabling ancestor `p1`.
+    unsafe {
+        // Parent write disables child `r2` (`Active -> Disabled`), which is
+        // valid if `r2` is not used again.
+        *p1 = 3;
+    }
+    unsafe { *p1 }
+}
+
+/// Upstream source: `tests/pass/tree_borrows/reborrow-is-read.rs`
+pub fn safe_reborrow_then_parent_write() -> u32 {
+    let mut x: u32 = 5;
+    let p: &mut u32 = &mut x;
+    {
+        let q: &mut u32 = &mut *p;
+        *q = 6;
+    }
+    *p = 7;
+    *p
 }
 
 // ============================================================================

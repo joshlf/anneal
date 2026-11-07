@@ -252,15 +252,22 @@ theorem evalRvalue_offset_of_validSliceRange
         .ok (.ptr rp.toProvenancePtr sz) locals)
     (hRhs :
       evalOperand locals rhsOp mem.borrows mem.globals emptyLayoutTable mem.callerLocals =
-        .ok (.scalar ⟨delta, 8⟩) locals) :
+        .ok (.scalar ⟨delta, 8⟩) locals)
+    (hLookup : lookupBorrow mem.borrows rp.toProvenancePtr.tag = .none)
+    (hStride : pointeeElemByteStride localDecls emptyLayoutTable lhsOp = .some 1)
+    (hOffset :
+      evalBinOpOffset rp.toProvenancePtr sz ⟨delta, 8⟩ 1
+        (ptrAllocByteBound? locals mem localDecls emptyLayoutTable rp.toProvenancePtr) =
+        .some { rp.toProvenancePtr with
+                offsetBytes := rp.toProvenancePtr.offsetBytes + delta }) :
     evalRvalue locals (.binaryOp .offset lhsOp rhsOp) mem localDecls =
       .ok (.ptr { rp.toProvenancePtr with
                   offsetBytes := rp.toProvenancePtr.offsetBytes + delta } sz)
           locals mem ∧
     rp.offset + delta ≤ totalLen := by
   refine ⟨?_, hRange⟩
-  unfold evalRvalue
-  simp [hLhs, hRhs]
+  unfold evalRvalue evalPtrOffsetBinOp
+  simp [hLhs, hRhs, hLookup, hStride, hOffset]
 
 theorem nonOverlappingPtrs_zero (src dst : RawPtrVal) :
     NonOverlappingPtrs src dst 0 :=

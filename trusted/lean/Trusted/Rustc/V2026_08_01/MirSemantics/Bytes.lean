@@ -326,7 +326,9 @@ def globalAllocSliceToAbstractBytes
     (alloc : CapturedAllocation)
     (offset len : Nat) :
     Option (List AbstractByte) :=
-  globalAllocBytesAux alloc.bytes alloc.relocations offset len
+  match Nat.ble offset (length alloc.bytes) with
+  | false => .none
+  | true => globalAllocBytesAux alloc.bytes alloc.relocations offset len
 
 /--
 Test whether `code` is a valid Unicode scalar value (`0x0000..=0xD7FF` or
@@ -1074,7 +1076,10 @@ def encodeValueToBytes :
                   match l.fields with
                   | .array stride _ => .some stride.bytes
                   | _ => .none
-                | .none => .none
+                | .none =>
+                  match elemKind with
+                  | .tuple ks => tupleFieldsByteSize ks
+                  | _ => .none
             match elemSzOpt with
             | .none => .none
             | .some elemSz =>
@@ -1405,7 +1410,10 @@ def decodeValueFromBytes :
               match l.fields with
               | .array stride _ => .some stride.bytes
               | _ => .none
-            | .none => .none
+            | .none =>
+              match elemKind with
+              | .tuple ks => tupleFieldsByteSize ks
+              | _ => .none
         match elemSzOpt with
         | .none => .none
         | .some elemSz =>

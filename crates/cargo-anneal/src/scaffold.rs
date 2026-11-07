@@ -296,7 +296,7 @@ pub fn detect_authored_item_modules(proofs_root: &Path, item_rel_path: &Path) ->
 fn extract_called_fn_defs(mir_text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
-    for marker in [".fnDef \"", "implPath := \""] {
+    for marker in [".fnDef \"", "RigidTy.fnDef \"", "implPath := \""] {
         let mut rest = mir_text;
         while let Some(pos) = rest.find(marker) {
             let after = &rest[pos + marker.len()..];
