@@ -19,6 +19,9 @@ import LeanMiriSpec.Correspondence.WitLM1_3
 import LeanMiriSpec.Correspondence.AllocLM1_4
 import LeanMiriSpec.Correspondence.SimLM1_4
 import LeanMiriSpec.Correspondence.WitLM1_4
+import LeanMiriSpec.Correspondence.AllocLM2_1
+import LeanMiriSpec.Correspondence.SimLM2_1
+import LeanMiriSpec.Correspondence.WitLM2_1
 import LeanMiriSpec.Audit
 
 /-!
@@ -63,6 +66,18 @@ import LeanMiriSpec.Audit
   local, `PlaceMention`, destructive moves, and the representation coalescing
   theorem `forceAllocation_preserves_StateRel` (`LM-1.4`).
 * `LeanMiriSpec.Correspondence.WitLM1_4`: non-vacuity witnesses for `LM-1.4`.
+* `LeanMiriSpec.Correspondence.AllocLM2_1`: contiguous scalar byte-slice round
+  trips and `ArraySliceRel` preservation (`nil`, `readScalar_get`,
+  `writeScalar_snoc`, `writeScalar_set`, `writeScalarRepeatedly_spec`) for
+  `LM-2.1`.
+* `LeanMiriSpec.Correspondence.SimLM2_1`: `LM-2.1` correspondence for homogeneous
+  arrays `[T; N]`, `Aggregate (.array _)`, `Rvalue.Repeat`, `Rvalue.Len`, and
+  `Index`/`ConstantIndex` projections (`fromEnd = false` and `fromEnd = true`),
+  including out-of-bounds and uninitialized/dead index UB equivalence
+  (`step_stmt_lm2_1_simulation`), with `step_stmt_lm2_1_array_simulation`
+  re-establishing `LiveAllocsNodup` and local immediacy so that array statements
+  chain.
+* `LeanMiriSpec.Correspondence.WitLM2_1`: non-vacuity witnesses for `LM-2.1`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
