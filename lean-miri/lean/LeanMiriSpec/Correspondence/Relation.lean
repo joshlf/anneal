@@ -182,7 +182,14 @@ storage, `some v` for initialized storage) at type `ty` and a memory-backed
 equation `mp.ptr.offset = Size.ofBytes (baseAddr + relOffset.bytes)` uniquely
 pins `relOffset.bytes.toNat = mp.ptr.offset.bytes.toNat - baseAddr.toNat`
 (proved in `MemPlaceRel.relOffset_bytes_eq`, with concrete uninitialized and
-initialized `LocalRel.indirect` witnesses in `Witness.lean`). -/
+initialized `LocalRel.indirect` witnesses in `Witness.lean`).
+
+`uninit_consistent` and `val_consistent` constrain the initialization mask only
+for values of non-zero size. A zero-sized range carries no initialization
+state: `InitMask.isRangeInitialized` reports even an empty range of a lazily
+uninitialized mask as uninitialized, exactly as rustc's
+`InitMask::is_range_initialized` does, while rustc never consults the mask for
+zero-sized values. -/
 inductive MemPlaceRel
     (mach : AnnealMachine)
     (ty : Ty)
@@ -220,6 +227,7 @@ inductive MemPlaceRel
               Except.ok (Except.ok ()))
       (val_consistent :
         ∀ v, optVal = some v →
+          (translateTy ty layouts).layout.size ≠ Miri.ABI.Size.ZERO →
           localAlloc.allocation.initializationMask.isRangeInitialized
             (Miri.Memory.allocRange relOffset ((translateTy ty layouts).layout.size)) =
               Except.ok (Except.ok ()))
@@ -341,26 +349,39 @@ structure FrameRel
       mf.locals[i]? = some mls →
       LocalRel mach decl body.layouts slot mls
 
-/-- Disjointness & monotonicity invariant for locals. -/
-def MemoryAllocDisjoint (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) : Prop :=
-  ∀ (i j : Nat) (mplace_i mplace_j : Miri.Interpreter.MemPlace AnnealProv) (lay_i lay_j : Option Miri.Interpreter.LocalLayout),
+/-- Distinct memory-backed locals of `topFrame` own distinct allocations: the
+`AllocId`s that their pointers' provenances name differ.
+
+`forceAllocation` reserves a fresh `AllocId` for every local it moves into
+memory, so it preserves this invariant, and deallocating one local's allocation
+leaves the allocations of all other `.indirect` locals live. -/
+def MemoryAllocDisjoint
+    (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) : Prop :=
+  ∀ (i j : Nat) (mplace_i mplace_j : Miri.Interpreter.MemPlace AnnealProv)
+    (lay_i lay_j : Option Miri.Interpreter.LocalLayout),
     i ≠ j →
     topFrame.locals[i]? = some { value := .live (.indirect mplace_i), layout := lay_i } →
     topFrame.locals[j]? = some { value := .live (.indirect mplace_j), layout := lay_j } →
-    mplace_i.ptr.provenance ≠ mplace_j.ptr.provenance
+    mplace_i.ptr.provenance.bind Miri.Memory.Provenance.getAllocId ≠
+      mplace_j.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
 
+/-- A frame without memory-backed locals satisfies `MemoryAllocDisjoint`. -/
 theorem MemoryAllocDisjoint.of_no_indirect
     (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
-    (h_no_indirect : ∀ (k : Nat) (x : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout), tf.locals[k]? = some x → ∀ mplace, x.value ≠ .live (.indirect mplace)) :
+    (h_no_indirect : ∀ (k : Nat)
+      (x : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout),
+      tf.locals[k]? = some x → ∀ mplace, x.value ≠ .live (.indirect mplace)) :
     MemoryAllocDisjoint tf := by
   intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
   have hi' := h_no_indirect i _ hi mplace_i
   contradiction
 
+/-- `MemoryAllocDisjoint` survives replacing locals by immediate values. -/
 theorem MemoryAllocDisjoint.mono_immediate
     {tf tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     (h : MemoryAllocDisjoint tf)
-    (h_locals : ∀ (k : Nat), tf'.locals[k]? = tf.locals[k]? ∨ ∃ imm lay, tf'.locals[k]? = some { value := .live (.immediate imm), layout := lay }) :
+    (h_locals : ∀ (k : Nat), tf'.locals[k]? = tf.locals[k]? ∨
+      ∃ imm lay, tf'.locals[k]? = some { value := .live (.immediate imm), layout := lay }) :
     MemoryAllocDisjoint tf' := by
   intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
   rcases h_locals i with eq_i | ⟨imm_i, lay_i', heq_i⟩
@@ -370,10 +391,12 @@ theorem MemoryAllocDisjoint.mono_immediate
     · rw [heq_j] at hj; cases hj
   · rw [heq_i] at hi; cases hi
 
+/-- `MemoryAllocDisjoint` survives marking locals dead. -/
 theorem MemoryAllocDisjoint.mono_dead
     {tf tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     (h : MemoryAllocDisjoint tf)
-    (h_locals : ∀ (k : Nat), tf'.locals[k]? = tf.locals[k]? ∨ ∃ lay, tf'.locals[k]? = some { value := .dead, layout := lay }) :
+    (h_locals : ∀ (k : Nat), tf'.locals[k]? = tf.locals[k]? ∨
+      ∃ lay, tf'.locals[k]? = some { value := .dead, layout := lay }) :
     MemoryAllocDisjoint tf' := by
   intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
   rcases h_locals i with eq_i | heq_i
@@ -383,10 +406,12 @@ theorem MemoryAllocDisjoint.mono_dead
     · rcases heq_j with ⟨lay, heq_j⟩; rw [heq_j] at hj; cases hj
   · rcases heq_i with ⟨lay, heq_i⟩; rw [heq_i] at hi; cases hi
 
+/-- `MemoryAllocDisjoint` survives changing the cached layouts of locals. -/
 theorem MemoryAllocDisjoint.mono_layout
     {tf tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     (h : MemoryAllocDisjoint tf)
-    (h_locals : ∀ (k : Nat), ∃ lay_k, tf'.locals[k]? = (tf.locals[k]?).map (fun x => { value := x.value, layout := lay_k })) :
+    (h_locals : ∀ (k : Nat), ∃ lay_k,
+      tf'.locals[k]? = (tf.locals[k]?).map (fun x => { value := x.value, layout := lay_k })) :
     MemoryAllocDisjoint tf' := by
   intro i j mplace_i mplace_j lay_i lay_j hneq hi hj
   rcases h_locals i with ⟨lay_i', heq_i⟩
@@ -406,11 +431,14 @@ theorem MemoryAllocDisjoint.mono_layout
       injection hval_i with hv_i hl_i
       injection hj with hval_j
       injection hval_j with hv_j hl_j
-      have hi2 : tf.locals[i]? = some { value := .live (.indirect mplace_i), layout := x_i.layout } := by
+      have hi2 : tf.locals[i]? =
+          some { value := .live (.indirect mplace_i), layout := x_i.layout } := by
         rw [h_i]; cases x_i; simp_all
-      have hj2 : tf.locals[j]? = some { value := .live (.indirect mplace_j), layout := x_j.layout } := by
+      have hj2 : tf.locals[j]? =
+          some { value := .live (.indirect mplace_j), layout := x_j.layout } := by
         rw [h_j]; cases x_j; simp_all
       exact h i j mplace_i mplace_j _ _ hneq hi2 hj2
+
 /-- Simulation relation between an Anneal `MachineState` (`s`) and a single-threaded
 `AnnealStepState` (`m`) executing `body`. -/
 inductive StateRel
@@ -705,8 +733,9 @@ theorem ub_iff {body : CapturedMir} {m : AnnealStepState}
 
 end StepObsRel
 
-/-- Retrieve the memory allocation disjointness invariant. -/
-def StateRel.memoryAllocDisjoint {body : CapturedMir} {s : MachineState} {m : Miri.Interpreter.StepState AnnealProv Miri.Interpreter.LocalLayout Unit AnnealMachine} (h : StateRel body s m) :
+/-- Every `StateRel` carries `MemoryAllocDisjoint` for its root frame. -/
+theorem StateRel.memoryAllocDisjoint {body : CapturedMir} {s : MachineState}
+    {m : AnnealStepState} (h : StateRel body s m) :
     ∀ top, m.stack.frames = #[top] → MemoryAllocDisjoint top := by
   cases h with
   | mk top hframes _ _ _ _ _ _ _ _ hd =>

@@ -1,4 +1,3 @@
-import LeanMiriSpec.Correspondence.WitLM1_4
 /-
 Copyright 2026 The Fuchsia Authors
 
@@ -816,7 +815,7 @@ theorem indirect_localRel_uninit_witness :
     (by decide)
     (by decide)
     (fun _ _ => by decide)
-    (fun _ h => nomatch h)
+    (fun _ h _ => nomatch h)
     (fun _ h => nomatch h)
 
 /-- Concrete `LocalRel.indirect` witness for an initialized `42_u8` scalar slot at
@@ -842,7 +841,7 @@ theorem indirect_localRel_scalar_witness :
     (by decide)
     (by decide)
     (fun h _ => nomatch h)
-    (fun _ _ => by decide)
+    (fun _ _ _ => by decide)
     ?_
   intro sc h
   injection h with hv

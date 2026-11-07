@@ -1,5 +1,3 @@
-import LeanMiriSpec.Correspondence.SimLM1_4
-import LeanMiriSpec.Correspondence.WitLM1_4
 /-
 Copyright 2026 The Fuchsia Authors
 
@@ -16,6 +14,9 @@ import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
 import LeanMiriSpec.Correspondence.Witness
+import LeanMiriSpec.Correspondence.AllocLM1_4
+import LeanMiriSpec.Correspondence.SimLM1_4
+import LeanMiriSpec.Correspondence.WitLM1_4
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -39,9 +40,18 @@ weakened theorem keeps its name:
 * `Witness.bisim_applies`: a concrete body and initial states satisfy every
   premise, so the correspondence is not vacuous (`Witness.divByZero_ub_agrees`
   and `Witness.div_returns_agree` additionally run both machines on it);
-* `annealEvalOperand_move_eq_copy` and `annealStepHooks_storageDead_returnPlace`:
-  the hooks keep `lean-miri`'s source behavior for `Move` operands and for
-  `StorageDead(_0)` rather than imitating Anneal.
+* `annealStepHooks_storageDead_returnPlace`: the hooks keep `lean-miri`'s source
+  behavior for `StorageDead(_0)` rather than imitating Anneal;
+* `annealEvalOperand_move_live`: on `Move`, the hooks deinitialize the
+  moved-from local, implementing the runtime-MIR `Operand::Move` semantics that
+  Anneal implements and that the pinned Miri interpreter leaves unimplemented;
+* the `LM-1.4` theorems: `StorageLive`/`StorageDead`/`PlaceMention`, destructive
+  moves (`evalOperand_move_simulation`), their composition
+  (`step_stmt_lm1_4_simulation`), and the representation coalescing theorem
+  `forceAllocation_preserves_StateRel`, together with the `WitLM1_4` witnesses
+  showing that these premises can be met, that `forceAllocation` really
+  promotes an immediate local to memory, and that storage statements then free
+  that memory in lockstep.
 -/
 
 namespace LeanMiriSpec.Audit
@@ -149,6 +159,65 @@ open LeanMiriSpec.Correspondence in
   Witness.stateRel_unaryBitwise
   Witness.wellTyped_unaryBitwise
   Witness.unaryBitwise_returns_agree
+  annealZeroedStorage
+  annealStackBaseAddr
+  annealPlaceHooks
+  MemoryAllocDisjoint
+  StateRel.memoryAllocDisjoint
+  freshStackAlloc_spec
+  freshStackAlloc_writeScalar_readScalar
+  IsLiveFrameLocal
+  WellTypedLM1_4Stmt
+  deallocLocalMemory
+  LocalAllocLive
+  annealLocalStorageHooks_deallocateLocal_eq
+  LocalRel.allocLive
+  MemPlaceRel.of_filter_live
+  LocalRel.of_dealloc
+  FrameRel.update_local_dealloc
+  annealStepHooks_storageLive_any_eq
+  annealStepHooks_storageDead_any_eq
+  step_storageLive_simulation
+  step_storageDead_simulation
+  evalStatement_placeMention_eq
+  step_placeMention_simulation
+  annealEvalOperand_move_live
+  annealEvalOperand_move_dead
+  evalOperand_move_simulation
+  reserveAllocId_ok_live
+  placeLayoutOfLocal_eq
+  annealPlaceHooks_allocateStack_inv
+  annealPlaceHooks_writeMemoryNoValidate_fresh_inv
+  annealStackBaseAddr_isAligned
+  MemPlaceRel.of_live_base
+  LocalRel.of_live_base
+  FrameRel.of_live_base
+  stackAllocMachine_live_base
+  stackAlloc_memPlaceRel
+  stackAlloc_stateRel
+  forceAllocation_preserves_StateRel
+  step_stmt_lm1_4_simulation
+  Witness.lm14Scalar42
+  Witness.lm14_scalarRel42
+  Witness.lm14MoveBody
+  Witness.lm14MoveAnneal
+  Witness.lm14MovedAnneal
+  Witness.lm14MoveMiriFrame
+  Witness.lm14MoveMiri
+  Witness.lm14_stateRel
+  Witness.lm14_phase
+  Witness.lm14_move_wellTyped
+  Witness.lm14_move_stepRel
+  Witness.lm14_move_anneal_step
+  Witness.lm14_move_steps
+  Witness.lm14_placeMention_wellTyped
+  Witness.lm14_placeMention_stepRel
+  Witness.lm14_placeMention_steps
+  Witness.lm14_forceAllocation_witness
+  Witness.lm14LiveAnneal
+  Witness.lm14DeadAnneal
+  Witness.lm14_storageLive_indirect_steps
+  Witness.lm14_storageDead_indirect_steps
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -354,6 +423,201 @@ example :
       Witness.miriOutcomeScalarBits 1
         (runMiriBounded Witness.unaryBitwiseBody 6 Witness.miriUnaryBitwiseInit) = some 0x2A) :=
   ⟨Witness.wellTyped_unaryBitwise, Witness.stateRel_unaryBitwise, Witness.unaryBitwise_returns_agree⟩
+
+
+/-! ### `LM-1.4` statement pins -/
+
+example {body : CapturedMir} {topFrame : Miri.Interpreter.Frame AnnealProv
+      Miri.Interpreter.LocalLayout Unit}
+    {loc : MirAst.Local} {decl : MirAst.LocalDecl} {span : String}
+    (hdecl : get? body.localDecls loc = some decl) :
+    WellTypedLM1_4Stmt body topFrame ⟨.storageLive loc, span⟩ :=
+  .storageLive loc decl span hdecl
+
+example {body : CapturedMir} {topFrame : Miri.Interpreter.Frame AnnealProv
+      Miri.Interpreter.LocalLayout Unit}
+    {loc : MirAst.Local} {decl : MirAst.LocalDecl} {span : String}
+    (hdecl : get? body.localDecls loc = some decl) (hne : loc ≠ 0) :
+    WellTypedLM1_4Stmt body topFrame ⟨.storageDead loc, span⟩ :=
+  .storageDead loc decl span hdecl hne
+
+example {body : CapturedMir} {topFrame : Miri.Interpreter.Frame AnnealProv
+      Miri.Interpreter.LocalLayout Unit}
+    {loc : MirAst.Local} {decl : MirAst.LocalDecl} {span : String}
+    (hdecl : get? body.localDecls loc = some decl) (hlive : IsLiveFrameLocal topFrame loc) :
+    WellTypedLM1_4Stmt body topFrame ⟨.placeMention ⟨loc, .nil⟩, span⟩ :=
+  .placeMention loc decl span hdecl hlive
+
+example {body : CapturedMir} {topFrame : Miri.Interpreter.Frame AnnealProv
+      Miri.Interpreter.LocalLayout Unit}
+    {dstIdx srcIdx : MirAst.Local} {dstDecl srcDecl : MirAst.LocalDecl} {span : String}
+    (hdst : get? body.localDecls dstIdx = some dstDecl)
+    (hsrc : get? body.localDecls srcIdx = some srcDecl)
+    (hty : dstDecl.ty = srcDecl.ty)
+    (hsz : (translateTy srcDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (himm_src : IsImmediateFrameLocal topFrame srcIdx)
+    (himm_dst : IsImmediateFrameLocal topFrame dstIdx) :
+    WellTypedLM1_4Stmt body topFrame
+      ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩ :=
+  .assignMove dstIdx srcIdx dstDecl srcDecl span hdst hsrc hty hsz himm_src himm_dst
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : MirAst.BasicBlockData} {loc : MirAst.Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageLive loc, span⟩)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedLM1_4Stmt body topFrame ⟨.storageLive loc, span⟩) :
+    StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_storageLive_simulation hstate hphase hbb hstmt hwt
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : MirAst.BasicBlockData} {loc : MirAst.Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.storageDead loc, span⟩)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedLM1_4Stmt body topFrame ⟨.storageDead loc, span⟩) :
+    StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_storageDead_simulation hstate hphase hbb hstmt hwt
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : MirAst.BasicBlockData} {loc : MirAst.Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some ⟨.placeMention ⟨loc, .nil⟩, span⟩)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedLM1_4Stmt body topFrame ⟨.placeMention ⟨loc, .nil⟩, span⟩) :
+    StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_placeMention_simulation hstate hphase hbb hstmt hwt
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : MirAst.BasicBlockData} {dstIdx srcIdx : MirAst.Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedLM1_4Stmt body topFrame
+        ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩) :
+    StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  evalOperand_move_simulation hstate hphase hbb hstmt hwt
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : MirAst.BasicBlockData} {stmt : MirAst.Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hwt : ∀ topFrame, m.stack.frames = #[topFrame] → WellTypedLM1_4Stmt body topFrame stmt) :
+    StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_stmt_lm1_4_simulation hstate hphase hbb hstmt hwt
+
+example {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {place : Miri.Interpreter.RuntimePlace AnnealProv}
+    {mplace : Miri.Interpreter.MPlaceTy AnnealProv}
+    (hstate : StateRel body s m)
+    (hforce : Miri.Interpreter.forceAllocation (annealPlaceHooks body.localDecls body.layouts) ()
+      place m = .ok mplace m') :
+    StateRel body s m' ∧
+    ∀ frameIndex localId identity,
+      place.ref = .local frameIndex localId none identity →
+      ∃ tf' lay, m'.stack.frames = #[tf'] ∧
+        tf'.locals[localId]? = some ⟨.live (.indirect mplace.mplace), lay⟩ :=
+  forceAllocation_preserves_StateRel hstate hforce
+
+example {body : CapturedMir} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {idx : Nat} {decl : MirAst.LocalDecl}
+    {opVal : Miri.Interpreter.Operand AnnealProv}
+    {lay known : Option Miri.Interpreter.LocalLayout}
+    (hframes : m.stack.frames = #[topFrame])
+    (hlt : idx < topFrame.locals.size)
+    (hdecl : get? body.localDecls idx = some decl)
+    (hmls : topFrame.locals[idx]'hlt = ⟨.live opVal, lay⟩)
+    (hcache : ∀ l, lay = some l → l = translateTy decl.ty body.layouts) :
+    annealEvalOperand body.localDecls body.layouts (.Move ⟨idx, #[]⟩) known m =
+      .ok ⟨opVal, translateTy decl.ty body.layouts⟩
+        { m with
+          stack := ⟨#[deinitFrameLocal
+            (cacheFrameLocalLayout topFrame idx hlt (translateTy decl.ty body.layouts)) idx
+            (by rw [cacheFrameLocalLayout_size]; exact hlt)]⟩ } :=
+  annealEvalOperand_move_live hframes hlt hdecl hmls hcache
+
+/-! ### `LM-1.4` witness pins -/
+
+example :
+    StateRel Witness.lm14MoveBody (Witness.lm14MoveAnneal 3) (Witness.lm14MoveMiri 3) ∧
+    StepRel Witness.lm14MoveBody (Witness.lm14MoveMiri 3)
+      (stepMirFn Witness.lm14MoveBody (Witness.lm14MoveAnneal 3))
+      (Miri.Interpreter.Step.step
+        (annealStepHooks Witness.lm14MoveBody.localDecls Witness.lm14MoveBody.layouts) ()
+        (Witness.lm14MoveMiri 3)) :=
+  ⟨Witness.lm14_stateRel 3, Witness.lm14_move_stepRel⟩
+
+example :
+    stepMirFn Witness.lm14MoveBody (Witness.lm14MoveAnneal 3) =
+      .step Witness.lm14MovedAnneal ∧
+    ∃ m', Miri.Interpreter.Step.step
+        (annealStepHooks Witness.lm14MoveBody.localDecls Witness.lm14MoveBody.layouts) ()
+        (Witness.lm14MoveMiri 3) = (m', .ok true) ∧
+      StateRel Witness.lm14MoveBody Witness.lm14MovedAnneal m' :=
+  ⟨Witness.lm14_move_anneal_step, Witness.lm14_move_steps⟩
+
+example :
+    stepMirFn Witness.lm14MoveBody (Witness.lm14MoveAnneal 2) =
+      .step (Witness.lm14MoveAnneal 3) ∧
+    ∃ m', Miri.Interpreter.Step.step
+        (annealStepHooks Witness.lm14MoveBody.localDecls Witness.lm14MoveBody.layouts) ()
+        (Witness.lm14MoveMiri 2) = (m', .ok true) ∧
+      StateRel Witness.lm14MoveBody (Witness.lm14MoveAnneal 3) m' :=
+  Witness.lm14_placeMention_steps
+
+example :
+    (Witness.lm14MoveMiriFrame 3).locals[1]? =
+      some ⟨.live (.immediate (.scalar (.fromScalarInt Witness.lm14Scalar42))), none⟩ ∧
+    ∃ (mplace : Miri.Interpreter.MPlaceTy AnnealProv) (m' : AnnealStepState),
+      Miri.Interpreter.forceAllocation
+          (annealPlaceHooks Witness.lm14MoveBody.localDecls Witness.lm14MoveBody.layouts) ()
+          ⟨.local 0 1 none (Witness.lm14MoveMiriFrame 3).localsIdentity,
+            translateTy Witness.u8Ty⟩
+          (Witness.lm14MoveMiri 3) = .ok mplace m' ∧
+      (∃ tf' lay', m'.stack.frames = #[tf'] ∧
+        tf'.locals[1]? = some ⟨.live (.indirect mplace.mplace), lay'⟩) ∧
+      StateRel Witness.lm14MoveBody (Witness.lm14MoveAnneal 3) m' :=
+  ⟨rfl, Witness.lm14_forceAllocation_witness 3⟩
+
+example :
+    ∃ (m : AnnealStepState) (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (lay : Option Miri.Interpreter.LocalLayout),
+      m.stack.frames = #[tf] ∧ tf.locals[1]? = some ⟨.live (.indirect mp), lay⟩ ∧
+      StateRel Witness.lm14MoveBody (Witness.lm14MoveAnneal 0) m ∧
+      stepMirFn Witness.lm14MoveBody (Witness.lm14MoveAnneal 0) =
+        .step Witness.lm14LiveAnneal ∧
+      ∃ m', Miri.Interpreter.Step.step
+          (annealStepHooks Witness.lm14MoveBody.localDecls Witness.lm14MoveBody.layouts) () m =
+          (m', .ok true) ∧
+        StateRel Witness.lm14MoveBody Witness.lm14LiveAnneal m' :=
+  Witness.lm14_storageLive_indirect_steps
+
+example :
+    ∃ (m : AnnealStepState) (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (lay : Option Miri.Interpreter.LocalLayout),
+      m.stack.frames = #[tf] ∧ tf.locals[1]? = some ⟨.live (.indirect mp), lay⟩ ∧
+      StateRel Witness.lm14MoveBody (Witness.lm14MoveAnneal 4) m ∧
+      stepMirFn Witness.lm14MoveBody (Witness.lm14MoveAnneal 4) =
+        .step Witness.lm14DeadAnneal ∧
+      ∃ m', Miri.Interpreter.Step.step
+          (annealStepHooks Witness.lm14MoveBody.localDecls Witness.lm14MoveBody.layouts) () m =
+          (m', .ok true) ∧
+        StateRel Witness.lm14MoveBody Witness.lm14DeadAnneal m' :=
+  Witness.lm14_storageDead_indirect_steps
 
 end StatementPins
 

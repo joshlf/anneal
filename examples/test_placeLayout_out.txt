@@ -1,3 +1,0 @@
-../test_placeLayout.lean:13:30: error(lean.unknownIdentifier): Unknown identifier `split_bind`
-../test_placeLayout.lean:13:7: error: Invalid `⟨...⟩` notation: The expected type of this term could not be determined
-../test_placeLayout.lean:14:2: error: No goals to be solved

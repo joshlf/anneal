@@ -886,12 +886,18 @@ def annealResolveAndCacheLocalLayout (localDecls : List LocalDecl) (layouts : La
 1. Memoizes the resolved `LocalLayout` into `frame.locals[localId].layout` via
    `Frame.getOrCacheLocalLayout` before checking liveness, matching `lean-miri`'s
    `LocalAccess.localToOp`.
-2. `Copy` and `Move` share one branch, exactly as in `lean-miri`'s source operand
+2. `Copy` and `Move` read the local exactly as `lean-miri`'s source operand
    evaluators (`Miri.Interpreter.OperandMachine.evalOperand` and
-   `Miri.Interpreter.evalOperand`): the pinned rustc leaves move invalidation
-   unimplemented, so reading `Move place` leaves the source local unchanged. This
-   differs from Anneal's `MirSemantics.evalOperand`, which deinitializes a root
-   local on `Operand.move`; that divergence is deliberately not papered over here.
+   `Miri.Interpreter.evalOperand`) do. `Move` then deinitializes an unprojected
+   moved-from local, implementing the runtime-MIR semantics that the pinned
+   rustc documents for `Operand::Move` and that Anneal's
+   `MirSemantics.evalOperand` implements: "in runtime MIR, this marks the place
+   as deinitialized (i.e. writes `uninit` to all bytes of the place)"
+   (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+   `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`). The pinned Miri interpreter, and
+   hence upstream `lean-miri`, leaves this invalidation unimplemented, so on
+   moves these hooks are deliberately stricter than upstream: afterwards the
+   moved-from local reads as uninitialized in both machines.
 3. Out-of-bounds `localId`s propagate `StepError.stack (.invalidLocal ...)`.
    Reading a `.dead` local (`StackError.localExpectedLive` from
    `Frame.getLocalOperand`) raises `StepError.undefinedBehavior`, matching rustc's
@@ -1079,8 +1085,44 @@ def annealCastHooks (layouts : LayoutTable := emptyLayoutTable) :
   eraseSelfTraitRef := fun _ _ => throw (.unsupported "eraseSelfTraitRef in cast")
   normalizePrincipal := fun _ _ => throw (.unsupported "normalizePrincipal in cast")
 
-/-- `RvalueHooks` instantiated for Anneal's single-threaded machine. -/
+/-- Zeroed host storage for a fresh `size`-byte allocation: the `zeroedStorage`
+callback of `Miri.Memory.Allocation.tryNew`, which models rustc's
+`AllocBytes::zeroed`. Anneal's machine never runs out of host memory, so the
+callback always succeeds. -/
+def annealZeroedStorage (size : Miri.ABI.Size) (_align : Miri.ABI.Align) :
+    Option (Array UInt8) :=
+  some (Array.replicate size.bytes.toNat 0)
 
+/-- Base address that Anneal's machine assigns to the fresh stack allocation
+`id`, namely `id * 2^32`.
+
+Miri draws base addresses from an address generator with random slack. Nothing
+in this fragment observes a numeric address, so a deterministic choice
+suffices. Every multiple of `2^32` satisfies every alignment that
+`Miri.ABI.Align.fromBytes` accepts (at most `2^29` bytes). While allocation ids
+stay below `2^32`, the address is also non-null and allocations smaller than
+4 GiB do not overlap. -/
+def annealStackBaseAddr (id : Miri.Memory.AllocId) : UInt64 :=
+  id.value <<< 32
+
+/-- `PlaceHooks` instantiated for Anneal's single-threaded machine. They are the
+memory leaves of `Miri.Interpreter.forceAllocation`, which moves an immediate
+local into a fresh stack allocation.
+
+* `allocateStack` follows rustc's `allocate_ptr`: it creates an uninitialized
+  allocation with zeroed backing storage (`Allocation.tryNew`), reserves a
+  fresh `AllocId`, records the allocation as live, caches the base address
+  `annealStackBaseAddr id` in `mach.addresses` (the cache that
+  `AnnealMachine.lookupBaseAddr` reads), and returns a pointer to that address
+  with concrete provenance. Because `PointerProvenance.offsetIsAddr` holds for
+  `Miri.Memory.Provenance`, a pointer's offset is its absolute address.
+* `writeMemoryNoValidate` follows rustc's `ptr_get_alloc`: it subtracts the
+  allocation's base address from the pointer address to obtain the
+  allocation-relative offset that `Allocation.writeScalar` and
+  `Allocation.writeUninit` expect.
+
+Projections, dereferences, and writes of scalar pairs fail closed with
+`StepError.unsupported`. -/
 def annealPlaceHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
     Miri.Interpreter.PlaceHooks AnnealProv AnnealStepState Unit Unit where
   getFrame := do
@@ -1108,9 +1150,9 @@ def annealPlaceHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
   deref := fun _ _ _ => throw (.unsupported "deref")
   checkPlaceType := fun _ _ _ => throw (.unsupported "checkPlaceType")
   allocateStack := fun _ layout => do
-    let size := layout.layout.size
-    let align := layout.layout.align.abi
-    let allocation ← match Miri.Memory.Allocation.tryNew size align .Uninit (fun _ _ => none) with
+    let allocation ←
+      match Miri.Memory.Allocation.tryNew layout.layout.size layout.layout.align.abi .Uninit
+          annealZeroedStorage with
       | .ok allocation => pure allocation
       | .error _ => throw (.unsupported "stack allocation storage")
     let state ← get
@@ -1118,36 +1160,43 @@ def annealPlaceHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
     let id ← match reserved with
       | .ok id => pure id
       | .error _ => throw (.unsupported "stack allocation ID")
-    let memory := {memory with live := memory.live.push (id, ⟨.stack, allocation.withExtra none⟩)}
-    set {state with machine := {state.machine with memory := memory}}
-    let pointer : Miri.Memory.Pointer (Option AnnealProv) := ⟨⟨0⟩, none⟩
+    let base := annealStackBaseAddr id
+    let memory := { memory with live := memory.live.push (id, ⟨.stack, allocation.withExtra none⟩) }
+    let addresses := { state.machine.addresses with
+      baseAddr := #[⟨id, base⟩] ++ state.machine.addresses.baseAddr }
+    set { state with machine := { state.machine with memory := memory, addresses := addresses } }
+    let pointer : Miri.Memory.Pointer (Option AnnealProv) :=
+      ⟨Miri.ABI.Size.ofBytes base, some (.concrete id Miri.Memory.BorTag.one)⟩
     return ⟨⟨pointer, .none, none⟩, layout⟩
   writeMemoryNoValidate := fun _ value mplace => do
     let state ← get
-    let mut memory := state.machine.memory
-    let id? := mplace.mplace.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
-    let some id := id? | throw (.unsupported "no alloc id")
-    let offset := mplace.mplace.ptr.offset
+    let memory := state.machine.memory
+    let some id := mplace.mplace.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
+      | throw (.unsupported "memory write through a pointer without an allocation")
+    let some base := state.machine.lookupBaseAddr id
+      | throw (.unsupported "memory write to an allocation without a base address")
+    let offset := Miri.ABI.Size.ofBytes (mplace.mplace.ptr.offset.bytes - base)
     match memory.live.findIdx? (fun (k, _) => k == id) with
     | some idx =>
       match memory.live[idx]? with
       | some (k, ⟨kind, alloc⟩) =>
-        let ptrSize := Miri.ABI.Size.ofBytes 8
         let alloc' ← match value with
-        | .uninit =>
-            match Miri.Memory.Allocation.writeUninit (Miri.Memory.allocRange offset mplace.layout.layout.size) ptrSize alloc with
-            | EStateM.Result.ok _ a => pure a
-            | EStateM.Result.error _ _ => throw (.unsupported "size error in writeUninit")
-        | .scalar s =>
-            match Miri.Memory.Allocation.writeScalar annealTargetDataLayout (Miri.Memory.allocRange offset s.size) s alloc with
-            | EStateM.Result.ok _ a => pure a
-            | EStateM.Result.error _ _ => throw (.unsupported "size error in writeScalar")
-        | .scalarPair s1 s2 =>
-            throw (.unsupported "scalarPair in writeMemoryNoValidate")
-        let memory' := { memory with live := memory.live.set! idx (k, ⟨kind, alloc'⟩) }
-        set { state with machine := { state.machine with memory := memory' } }
-        pure ()
-      | none => pure ()
+          | .uninit =>
+              match Miri.Memory.Allocation.writeUninit
+                  (Miri.Memory.allocRange offset mplace.layout.layout.size)
+                  (Miri.ABI.Size.ofBytes 8) alloc with
+              | EStateM.Result.ok _ a => pure a
+              | EStateM.Result.error _ _ => throw (.unsupported "writeUninit failed")
+          | .scalar s =>
+              match Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+                  (Miri.Memory.allocRange offset s.size) s alloc with
+              | EStateM.Result.ok _ a => pure a
+              | EStateM.Result.error _ _ => throw (.unsupported "writeScalar failed")
+          | .scalarPair _ _ =>
+              throw (.unsupported "scalarPair in writeMemoryNoValidate")
+        set { state with machine := { state.machine with
+          memory := { memory with live := memory.live.set! idx (k, ⟨kind, alloc'⟩) } } }
+      | none => throw (.unsupported "allocation not found")
     | none => throw (.unsupported "allocation not found")
   afterLocalMovedToMemory := fun _ _ _ => pure ()
   memoryOffset := fun _ _ _ _ _ => throw (.unsupported "memoryOffset")
@@ -1155,6 +1204,7 @@ def annealPlaceHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
   enforceValidity := fun _ _ => pure true
   validate := fun _ _ => pure ()
 
+/-- `RvalueHooks` instantiated for Anneal's single-threaded machine. -/
 def annealRvalueHooks (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) :
     Miri.Interpreter.RvalueHooks
@@ -1318,10 +1368,17 @@ Anneal's single-threaded machine.
   unsized locals, so `storage_live_dyn` never needs a layout or metadata.
 * `afterLocalWrite` has nothing to do: data-race clocks exist only for
   multi-threaded machines.
-* `allocateDyn` (unsized locals) and `deallocateStack` (memory-backed locals)
-  report `StackError` failures. Locals become memory-backed only through
-  `forceAllocation`, which `annealRvalueHooks` does not support, so neither
-  leaf is reachable from a state whose locals are all immediate. -/
+* `allocateDyn` reports a `StackError` failure: `Runtime(PostCleanup)` MIR has
+  no unsized locals.
+* `deallocateStack` frees the allocation of a memory-backed local, which only
+  `forceAllocation` creates. Like rustc's `deallocate_ptr`, it requires the
+  pointer's provenance to name a live allocation, and then removes that
+  allocation from `memory.live`. rustc's remaining checks (allocation kind,
+  protectors, and the offset of the pointer) cannot fail for these fresh stack
+  allocations, so they are not modeled. Nor does the hook record the freed
+  allocation in `memory.dead` or release its base address, as rustc does for
+  later dangling-pointer diagnostics and address reuse: no pointer to a local
+  escapes in this fragment, so nothing can observe either record. -/
 def annealLocalStorageHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
     Miri.Interpreter.LocalStorageHooks
       AnnealProv
@@ -1337,7 +1394,14 @@ def annealLocalStorageHooks (localDecls : List LocalDecl) (layouts : LayoutTable
   afterLocalWrite := fun st _ _ => ⟨st, .ok ()⟩
   allocateDyn := fun st _ _ =>
     ⟨st, .error (.allocationFailure "unsized locals are outside the scalar fragment")⟩
-  deallocateStack := fun st _ => ⟨st, .ok ()⟩
+  deallocateStack := fun st ptr =>
+    match ptr.provenance.bind Miri.Memory.Provenance.getAllocId with
+    | some id =>
+        if st.live.any (fun entry => entry.1 == id) then
+          ⟨{ st with live := st.live.filter (fun entry => entry.1 != id) }, .ok ()⟩
+        else
+          ⟨st, .error (.deallocationFailure "stack allocation is not live")⟩
+    | none => ⟨st, .error (.deallocationFailure "stack pointer has no allocation provenance")⟩
 
 /-- Run a current-frame storage operation (`Frame.storageLive` or
 `Frame.storageDead`), writing back the resulting frame and memory even when the

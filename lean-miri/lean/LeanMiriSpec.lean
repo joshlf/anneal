@@ -1,5 +1,3 @@
-import LeanMiriSpec.Correspondence.SimLM1_4
-import LeanMiriSpec.Correspondence.WitLM1_4
 /-
 Copyright 2026 The Fuchsia Authors
 
@@ -14,6 +12,9 @@ import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
 import LeanMiriSpec.Correspondence.Simulation
 import LeanMiriSpec.Correspondence.Witness
+import LeanMiriSpec.Correspondence.AllocLM1_4
+import LeanMiriSpec.Correspondence.SimLM1_4
+import LeanMiriSpec.Correspondence.WitLM1_4
 import LeanMiriSpec.Audit
 
 /-!
@@ -23,10 +24,11 @@ import LeanMiriSpec.Audit
   from Anneal's `Trusted.Rustc.V2026_06_01.MirAst` to `Miri.MIR`, together with
   single-threaded `AnnealMachine` and `annealStepHooks` (`RvalueHooks`,
   `ScalarOpsHooks`, `CastHooks`, `ControlHooks`, `TerminatorHooks`,
-  `LocalStorageHooks`, `StepHooks`).
+  `LocalStorageHooks`, `PlaceHooks`, `StepHooks`).
 * `LeanMiriSpec.Correspondence.Relation`: dual immediate/indirect simulation
   relations (`ScalarRel`, `ImmediateRel`, `MemPlaceRel`, `LocalRel`, `FrameRel`,
-  `StateRel`, `RvalueResultRel`, `StepRel`, `StepObsRel`).
+  `MemoryAllocDisjoint`, `StateRel`, `RvalueResultRel`, `StepRel`,
+  `StepObsRel`).
 * `LeanMiriSpec.Correspondence.Simulation`: single-step and fuel-bounded
   multi-step lockstep simulation and bisimulation theorems for scalar constants,
   copies, arithmetic (wrapping, checked `WithOverflow`, and `Unchecked`),
@@ -38,6 +40,12 @@ import LeanMiriSpec.Audit
   signed `INT_MIN / -1`, OOB and negative signed shifts, `AddUnchecked`
   overflow, `Unreachable`), `(u16, bool)` scalar pairs, Unicode `char`, indirect
   `MemPlaceRel` allocations, `IntToInt` casts, and `SwitchInt` hooks.
+* `LeanMiriSpec.Correspondence.AllocLM1_4`: fresh stack allocations of
+  `forceAllocation` (shape, and the scalar write/read round trip).
+* `LeanMiriSpec.Correspondence.SimLM1_4`: `StorageLive`/`StorageDead` of any
+  local, `PlaceMention`, destructive moves, and the representation coalescing
+  theorem `forceAllocation_preserves_StateRel` (`LM-1.4`).
+* `LeanMiriSpec.Correspondence.WitLM1_4`: non-vacuity witnesses for `LM-1.4`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
