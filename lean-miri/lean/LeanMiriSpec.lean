@@ -10,10 +10,10 @@ those terms.
 
 import LeanMiriSpec.Correspondence.Translate
 import LeanMiriSpec.Correspondence.Relation
-import LeanMiriSpec.Correspondence.SimLM1_2
 import LeanMiriSpec.Correspondence.Simulation
-import LeanMiriSpec.Correspondence.WitLM1_2
+import LeanMiriSpec.Correspondence.SimLM1_2
 import LeanMiriSpec.Correspondence.Witness
+import LeanMiriSpec.Correspondence.WitLM1_2
 import LeanMiriSpec.Audit
 
 /-!
@@ -38,6 +38,12 @@ import LeanMiriSpec.Audit
   signed `INT_MIN / -1`, OOB and negative signed shifts, `AddUnchecked`
   overflow, `Unreachable`), `(u16, bool)` scalar pairs, Unicode `char`, indirect
   `MemPlaceRel` allocations, `IntToInt` casts, and `SwitchInt` hooks.
+* `LeanMiriSpec.Correspondence.SimLM1_2`: `LM-1.2` value- and step-level
+  correspondence for boolean `Not`, `Eq`..`Ge` on `bool`/signed/unsigned
+  operands, three-way `Cmp`, `IntToInt` casts, and `SwitchInt`
+  (`step_stmt_lm1_2_simulation`, `step_terminator_lm1_2_simulation`).
+* `LeanMiriSpec.Correspondence.WitLM1_2`: `LM-1.2` non-vacuity witnesses and
+  concrete runs on which both machines agree.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

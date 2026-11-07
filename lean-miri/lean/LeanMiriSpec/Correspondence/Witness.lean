@@ -9,7 +9,6 @@ those terms.
 -/
 
 import LeanMiriSpec.Correspondence.Simulation
-import LeanMiriSpec.Correspondence.WitLM1_2
 
 /-!
 # Non-Vacuity Witness for the `LM-1.1` Correspondence
