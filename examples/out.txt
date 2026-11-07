@@ -1,4 +1,1394 @@
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:249:21: warning: This simp argument is unused:
+⚠ [29/518] Replayed Miri.DataStructures.DedupRangeMap
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:404:8: automatically included section variable(s) unused in theorem `_private.Miri.DataStructures.DedupRangeMap.0.Miri.DataStructures.DedupRangeMap.findOffset_new_zero`:
+  [DecidableEq A]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq A] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:407:44: This simp argument is unused:
+  Size.ofBytes
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [positive, beq_iff_eq, ↓reduceIte, Id.run, bind, Bind.bind, pure, Pure.pure, ForIn.forIn]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:409:43: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [segmentAt?, positive, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:409:48: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [segmentAt?, positive, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:429:34: This simp argument is unused:
+  segmentAt?
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, splitIndex, Id.run, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:429:45: This simp argument is unused:
+  Id.run
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, splitIndex, segmentAt?, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:431:21: This simp argument is unused:
+  Size.ZERO
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [checkedEnd, Size.ofBytes, Size.add, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure,
+    Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:433:23: This simp argument is unused:
+  Size.ofBytes
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Size.ZERO, positive, beq_iff_eq, ↓reduceIte]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:445:54: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [scan, new, positive, segmentAt?, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:445:59: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [scan, new, positive, segmentAt?, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:447:10: This simp argument is unused:
+  scan
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, segmentAt?, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:447:15: This simp argument is unused:
+  new
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [scan, positive, segmentAt?, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:447:19: This simp argument is unused:
+  positive
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [scan, new, segmentAt?, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:447:28: This simp argument is unused:
+  segmentAt?
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [scan, new, positive, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:449:32: This simp argument is unused:
+  segmentAt?
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, splitIndex, selectedSlice, Id.run, bind, Bind.bind, pure, Pure.pure, Except.bind,
+    Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:449:57: This simp argument is unused:
+  Id.run
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, splitIndex, segmentAt?, selectedSlice, bind, Bind.bind, pure, Pure.pure, Except.bind,
+    Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:450:4: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, splitIndex, segmentAt?, selectedSlice, Id.run, Bind.bind, pure, Pure.pure, Except.bind,
+    Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:450:9: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, splitIndex, segmentAt?, selectedSlice, Id.run, bind, pure, Pure.pure, Except.bind,
+    Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:450:34: This simp argument is unused:
+  Except.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, positive, splitIndex, segmentAt?, selectedSlice, Id.run, bind, Bind.bind, pure, Pure.pure,
+    Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [34/518] Replayed Miri.TreeBorrows.TreeState
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2202:4: This simp argument is unused:
+  ← Array.forIn_toList
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [freshNormal, freshLocation, BorrowTree.new, rootIndex, nodeAt, UniIndex.ofNat?, UniIndex.toNat,
+    UniValMap.insert, UniValMap.get, UniValMap.extendTo, Id.run, bind, Bind.bind, pure, Pure.pure]
+
+Note: Simp arguments with `←` have the additional effect of removing the other direction from the simp set, even if the simp argument itself is unused. If the hint above does not work, try replacing `←` with `-` to only get that effect and silence this warning.
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2211:33: This simp argument is unused:
+  nodeAt
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [BorrowTree.new, rootIndex, UniIndex.ofNat?, UniIndex.toNat, UniValMap.insert, UniValMap.get,
+    UniValMap.extendTo, Id.run, bind, Bind.bind, pure, Pure.pure, ← Array.forIn_toList]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2213:4: This simp argument is unused:
+  ← Array.forIn_toList
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [BorrowTree.new, rootIndex, nodeAt, UniIndex.ofNat?, UniIndex.toNat, UniValMap.insert, UniValMap.get,
+    UniValMap.extendTo, Id.run, bind, Bind.bind, pure, Pure.pure]
+
+Note: Simp arguments with `←` have the additional effect of removing the other direction from the simp set, even if the simp argument itself is unused. If the hint above does not work, try replacing `←` with `-` to only get that effect and silence this warning.
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2223:6: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [BorrowTree.indexOfTag, BorrowTree.new, rootIndex, UniKeyMap.get, Id.run, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2223:11: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [BorrowTree.indexOfTag, BorrowTree.new, rootIndex, UniKeyMap.get, Id.run, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2235:15: This simp argument is unused:
+  Id.run
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2241:15: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2241:20: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2241:30: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2241:35: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2247:10: This simp argument is unused:
+  locations
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [Id.run, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2247:20: This simp argument is unused:
+  Id.run
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [locations, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2247:27: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [locations, Id.run, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2247:32: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [locations, Id.run, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2247:42: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [locations, Id.run, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2247:47: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [locations, Id.run, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [43/518] Replayed Miri.Memory.ProvenanceMap
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:340:31: This simp argument is unused:
+  Bool.false_eq_true
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [zero, beq_iff_eq, ↓reduceIte]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:342:21: This simp argument is unused:
+  positive
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [endEq, ↓reduceIte]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:342:30: This simp argument is unused:
+  ↓reduceIte
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [endEq, positive]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:343:143: This simp argument is unused:
+  zero
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [new, bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure, EStateM.get, EStateM.set,
+    Except.mapError, Except.bind, Except.pure, positive]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:365:4: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [checked, empty, new, insertEntry, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, Pure.pure,
+    EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:365:9: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [checked, empty, new, insertEntry, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, pure,
+    EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:365:19: This simp argument is unused:
+  EStateM.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [checked, empty, new, insertEntry, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, pure,
+    Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:399:50: This simp argument is unused:
+  zero
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [endEq, noPointers, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, pure, Pure.pure,
+    EStateM.pure, Except.mapError]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:414:74: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [checked, empty, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, Pure.pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:414:79: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [checked, empty, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:414:89: This simp argument is unused:
+  EStateM.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [checked, empty, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [46/518] Replayed Miri.Memory.Allocation
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:809:18: This simp argument is unused:
+  eta
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:817:40: This simp argument is unused:
+  Size.ofBytes
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [allocRange, Size.ZERO]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:818:55: This simp argument is unused:
+  ↓reduceIte
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [UInt64.not_lt_zero, UInt64.lt_irrefl]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:821:40: This simp argument is unused:
+  Size.ofBytes
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [allocRange, Size.ZERO] at maskEq
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:825:37: This simp argument is unused:
+  Except.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [zero, ↓reduceIte, Except.mapError, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:825:49: This simp argument is unused:
+  Except.mapError
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [zero, ↓reduceIte, Except.bind, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:825:65: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [zero, ↓reduceIte, Except.bind, Except.mapError, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:825:70: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [zero, ↓reduceIte, Except.bind, Except.mapError, pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:825:80: This simp argument is unused:
+  Except.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [zero, ↓reduceIte, Except.bind, Except.mapError, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:828:42: This simp argument is unused:
+  Size.ofBytes
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [allocRange, Size.ZERO] at cleared
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:21: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, Bind.bind, Except.bind, Except.mapError, pure, Pure.pure, Except.pure, Id.run]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:26: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, bind, Except.bind, Except.mapError, pure, Pure.pure, Except.pure, Id.run]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:36: This simp argument is unused:
+  Except.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, bind, Bind.bind, Except.mapError, pure, Pure.pure, Except.pure, Id.run]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:48: This simp argument is unused:
+  Except.mapError
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure, Id.run]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:64: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, bind, Bind.bind, Except.bind, Except.mapError, Pure.pure, Except.pure, Id.run]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:69: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, bind, Bind.bind, Except.bind, Except.mapError, pure, Except.pure, Id.run]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:79: This simp argument is unused:
+  Except.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, bind, Bind.bind, Except.bind, Except.mapError, pure, Pure.pure, Id.run]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:830:91: This simp argument is unused:
+  Id.run
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [zero, bind, Bind.bind, Except.bind, Except.mapError, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:852:29: This simp argument is unused:
+  beq_self_eq_true
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [step, atHead, Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, Pure.pure, bind, Bind.bind]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:852:46: This simp argument is unused:
+  Bool.not_true
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [step, atHead, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte, pure, Pure.pure, bind, Bind.bind]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:852:60: This simp argument is unused:
+  Bool.false_eq_true
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [step, atHead, beq_self_eq_true, Bool.not_true, ↓reduceIte, pure, Pure.pure, bind, Bind.bind]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:852:79: This simp argument is unused:
+  ↓reduceIte
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [step, atHead, beq_self_eq_true, Bool.not_true, Bool.false_eq_true, pure, Pure.pure, bind,
+    Bind.bind]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:923:18: This simp argument is unused:
+  Nat.add_assoc
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [Nat.add_comm, Nat.add_left_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:999:28: This simp argument is unused:
+  Nat.min_eq_left (by omega : range.start.bytes.toNat + range.size.bytes.toNat ≤ allocation.rawBytes.size)
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bytes, Array.size_append, Array.size_extract, Nat.min_eq_left startBound, Nat.min_self,
+    Nat.sub_zero, dataSize]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1009:62: This simp argument is unused:
+  bound
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [storage, endpoint, finishNat, UInt64.lt_iff_toNat_lt, bind, Bind.bind, Except.bind, Except.mapError,
+    pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1017:15: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1017:20: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1017:30: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1017:35: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1019:15: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1019:20: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1019:30: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1019:35: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1026:41: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [insert, updated, bytes, mutable, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1026:46: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [insert, updated, bytes, mutable, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1026:56: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [insert, updated, bytes, mutable, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:1026:61: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [insert, updated, bytes, mutable, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [48/518] Replayed Miri.Memory.KeyedArray
+warning: ../lean-miri/vendor/Miri/Memory/KeyedArray.lean:104:8: automatically included section variable(s) unused in theorem `_private.Miri.Memory.KeyedArray.0.Miri.Memory.KeyedArray.map_modify_preserves`:
+  [BEq K]
+  [Hashable K]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [BEq K] [Hashable K] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: ../lean-miri/vendor/Miri/Memory/KeyedArray.lean:199:8: automatically included section variable(s) unused in theorem `_private.Miri.Memory.KeyedArray.0.Miri.Memory.KeyedArray.canonical_size`:
+  [LawfulBEq K]
+  [LawfulHashable K]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [LawfulBEq K] [LawfulHashable K] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+⚠ [62/518] Replayed Miri.Memory.AllocationAccess
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:183:13: This simp argument is unused:
+  nonzero
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bne_iff_ne, ↓reduceIte]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:189:13: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:189:18: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:189:28: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:189:33: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:190:13: This simp argument is unused:
+  nonzero
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [↓reduceIte, Bool.not_false, Option.map_some]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:195:22: This simp argument is unused:
+  cache
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:195:28: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [cache, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:195:33: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [cache, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:195:43: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [cache, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:195:48: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [cache, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [63/518] Replayed Miri.Interpreter.MemoryOperand
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:547:53: This simp argument is unused:
+  Bool.false_eq_true
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, Except.pure, ↓reduceIte, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:547:72: This simp argument is unused:
+  ↓reduceIte
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, Except.pure, Bool.false_eq_true, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:547:83: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, Except.pure, Bool.false_eq_true, ↓reduceIte, Bind.bind, pure,
+    Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:547:88: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, Except.pure, Bool.false_eq_true, ↓reduceIte, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:547:98: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, Except.pure, Bool.false_eq_true, ↓reduceIte, bind, Bind.bind,
+    Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:547:103: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, Except.pure, Bool.false_eq_true, ↓reduceIte, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:600:29: This simp argument is unused:
+  Except.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:600:41: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:600:46: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:600:56: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:600:61: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Except.bind, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:641:8: This simp argument is unused:
+  contained
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:641:18: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [contained, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:641:23: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [contained, bind, Except.bind, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:641:33: This simp argument is unused:
+  Except.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [contained, bind, Bind.bind, pure, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:641:45: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [contained, bind, Bind.bind, Except.bind, Pure.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:641:50: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [contained, bind, Bind.bind, Except.bind, pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:641:60: This simp argument is unused:
+  Except.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [contained, bind, Bind.bind, Except.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:644:8: automatically included section variable(s) unused in theorem `_private.Miri.Interpreter.MemoryOperand.0.Miri.Interpreter.primitive_matches`:
+  [DecidableEq P]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq P] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:652:8: automatically included section variable(s) unused in theorem `_private.Miri.Interpreter.MemoryOperand.0.Miri.Interpreter.scalar_at_of_write`:
+  [DecidableEq P]
+  [PointerProvenance P]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq P] [PointerProvenance P] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:663:29: This simp argument is unused:
+  Id.run
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:663:36: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Id.run, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:663:41: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Id.run, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:663:51: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Id.run, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:663:56: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Except.mapError, Id.run, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:720:13: This simp argument is unused:
+  backend
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [offsetPositive, bne_iff_ne, beq_iff_eq, ↓reduceIte]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:720:36: This simp argument is unused:
+  bne_iff_ne
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [backend, offsetPositive, beq_iff_eq, ↓reduceIte]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [76/518] Replayed Miri.Interpreter.Call
+warning: ../lean-miri/vendor/Miri/Interpreter/Call.lean:611:51: This simp argument is unused:
+  EStateM.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [bind, Bind.bind, EStateM.bind, pure, Pure.pure, immediate]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/Call.lean:653:51: This simp argument is unused:
+  EStateM.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [bind, Bind.bind, EStateM.bind, pure, Pure.pure, indirect]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+ℹ [99/518] Replayed Miri.Concurrency.GlobalStateVerification
+info: ../lean-miri/vendor/Miri/Concurrency/GlobalStateVerification.lean:24:0: 'Miri.Concurrency.GlobalStateVerification.single_thread_fence_is_noop' depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/vendor/Miri/Concurrency/GlobalStateVerification.lean:25:0: 'Miri.Concurrency.GlobalStateVerification.single_thread_sync_operation_is_skipped' depends on axioms: [propext,
+ Quot.sound]
+ℹ [102/518] Replayed Miri.Concurrency.WeakMemoryVerification
+info: ../lean-miri/vendor/Miri/Concurrency/WeakMemoryVerification.lean:18:0: 'Miri.Concurrency.WeakMemoryVerification.source_fetch_has_candidate' depends on axioms: [propext, Quot.sound]
+ℹ [108/518] Replayed Miri.Concurrency.SyncVerification
+info: ../lean-miri/vendor/Miri/Concurrency/SyncVerification.lean:24:0: 'rwlock_writer_lock_none_contract' depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/vendor/Miri/Concurrency/SyncVerification.lean:25:0: 'mutex_callback_is_pending' depends on axioms: [propext, Quot.sound]
+⚠ [125/518] Replayed Miri.Input.DecoderValues
+warning: ../lean-miri/vendor/Miri/Input/DecoderValues.lean:754:12: Variable name `fields` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _fields
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/DecoderValues.lean:773:31: Variable name `fields` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _fields
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/DecoderValues.lean:780:27: Variable name `fields` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _fields
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/DecoderValues.lean:787:28: Variable name `fields` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _fields
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/DecoderValues.lean:794:24: Variable name `fields` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _fields
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [137/518] Replayed Miri.Interpreter.PlaceMachine
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:369:20: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Id.run, Bind.bind, pure, Pure.pure, MachineHooks.memoryRaceAccess, noClocks]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:369:25: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Id.run, bind, pure, Pure.pure, MachineHooks.memoryRaceAccess, noClocks]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:372:18: This simp argument is unused:
+  tracked
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [sync, bind, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:372:31: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [tracked, sync, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:372:36: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [tracked, sync, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:372:46: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [tracked, sync, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:372:51: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [tracked, sync, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:375:15: This simp argument is unused:
+  tracked
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [allocRange, ↓reduceIte]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:378:15: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [sync, Bind.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:378:20: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [sync, bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:378:30: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [sync, bind, Bind.bind, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:378:35: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [sync, bind, Bind.bind, pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:403:32: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [commit, finish, retain, modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, pure, Pure.pure,
+    EStateM.pure, Bind.bind, EStateM.bind]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:403:37: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [commit, finish, retain, modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, pure, Pure.pure,
+    EStateM.pure, bind, EStateM.bind]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:403:47: This simp argument is unused:
+  EStateM.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [commit, finish, retain, modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, pure, Pure.pure,
+    EStateM.pure, bind, Bind.bind]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [152/518] Replayed Miri.Interpreter.ValidityVisitor
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:525:15: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Bind.bind, EStateM.bind, padding, pure, Pure.pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:525:21: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, EStateM.bind, padding, pure, Pure.pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:525:55: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, EStateM.bind, padding, Pure.pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:525:61: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, EStateM.bind, padding, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:580:91: This simp argument is unused:
+  EStateM.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [resetPadding, ranges, forced, dynamic, size, bind, Bind.bind, EStateM.bind, pure, Pure.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:583:15: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [Bind.bind, EStateM.bind, padding, pure, Pure.pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:583:20: This simp argument is unused:
+  Bind.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, EStateM.bind, padding, pure, Pure.pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:583:51: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, EStateM.bind, padding, Pure.pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:583:56: This simp argument is unused:
+  Pure.pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp only [bind, Bind.bind, EStateM.bind, padding, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [157/518] Replayed Miri.Interpreter.FrameRelevance
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:125:44: This simp argument is unused:
+  EStateM.modifyGet
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [afterStackPush, MachineHooks.currentFrame, Stack.currentFrame?, active, setCache, current, cached,
+    selected, pushedMachine, get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, modify,
+    modifyGet, MonadStateOf.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:126:22: This simp argument is unused:
+  get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, modify, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:126:26: This simp argument is unused:
+  getThe
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [get, MonadStateOf.get, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, modify, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:126:33: This simp argument is unused:
+  MonadStateOf.get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [get, getThe, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, modify, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:126:62: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [get, getThe, MonadStateOf.get, EStateM.get, EStateM.bind, pure, EStateM.pure, modify, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:126:80: This simp argument is unused:
+  pure
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, EStateM.pure, modify, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:127:4: This simp argument is unused:
+  modify
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:127:11: This simp argument is unused:
+  modifyGet
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, modify,
+    MonadStateOf.modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:127:21: This simp argument is unused:
+  MonadStateOf.modifyGet
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, modify,
+    modifyGet, EStateM.modifyGet]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [194/518] Replayed Miri.Interpreter.ExecutionChoices
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:416:4: This simp argument is unused:
+  get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [index, source, consume, current, supported, nonzero, getThe, MonadStateOf.get, EStateM.get, modify,
+    modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:416:8: This simp argument is unused:
+  getThe
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [index, source, consume, current, supported, nonzero, get, MonadStateOf.get, EStateM.get, modify,
+    modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:416:15: This simp argument is unused:
+  MonadStateOf.get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [index, source, consume, current, supported, nonzero, get, getThe, EStateM.get, modify, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:416:32: This simp argument is unused:
+  EStateM.get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [index, source, consume, current, supported, nonzero, get, getThe, MonadStateOf.get, modify, modifyGet,
+    MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:429:4: This simp argument is unused:
+  get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [bernoulli, source, consume, current, probability, supported, getThe, MonadStateOf.get, EStateM.get,
+    modify, modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:429:8: This simp argument is unused:
+  getThe
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [bernoulli, source, consume, current, probability, supported, get, MonadStateOf.get, EStateM.get, modify,
+    modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:429:15: This simp argument is unused:
+  MonadStateOf.get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [bernoulli, source, consume, current, probability, supported, get, getThe, EStateM.get, modify,
+    modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:429:32: This simp argument is unused:
+  EStateM.get
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [bernoulli, source, consume, current, probability, supported, get, getThe, MonadStateOf.get, modify,
+    modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [320/518] Replayed Miri.Interpreter.ExecutionCast
+warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionCast.lean:59:46: Variable name `allocation` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _allocation
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [375/518] Replayed Miri.Interpreter.UnixForeign
+warning: ../lean-miri/vendor/Miri/Interpreter/UnixForeign.lean:171:25: Variable name `env` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _env
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [404/518] Replayed Miri.Input.CompilerFrameMetadata
+warning: ../lean-miri/vendor/Miri/Input/CompilerFrameMetadata.lean:72:71: This simp argument is unused:
+  Except.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [FrameMetadata.userRelevance, hooks, lift, definitionCrate, inline, track, found, resolvedRank, bind,
+    EStateM.bind, pure, EStateM.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: ../lean-miri/vendor/Miri/Input/CompilerFrameMetadata.lean:73:32: This simp argument is unused:
+  bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp_all [EStateM.bind, EStateM.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [407/518] Replayed Miri.Input.CompilerLifecycle
+warning: ../lean-miri/vendor/Miri/Input/CompilerLifecycle.lean:141:4: This simp argument is unused:
+  Except.bind
+
+Hint: Omit it from the simp argument list.
+  [apply] simp [requiredConstants, entry, lift, row, contents, evidence, MachineHooks.currentFrame, Stack.currentFrame?,
+    identity, function, get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, pure, EStateM.pure, Except.pure]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [574/635] Replayed Miri.Input.EvalCallDispatchConstruction
+warning: ../lean-miri/vendor/Miri/Input/EvalCallDispatchConstruction.lean:716:6: Variable name `event` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _event
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [590/635] Replayed Miri.Input.EvalRunConstruction
+warning: ../lean-miri/vendor/Miri/Input/EvalRunConstruction.lean:279:5: Variable name `clock` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _clock
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalRunConstruction.lean:281:5: Variable name `systemDurationSince` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _systemDurationSince
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [600/635] Replayed Miri.Input.EvalSourceRunConstruction
+warning: ../lean-miri/vendor/Miri/Input/EvalSourceRunConstruction.lean:163:58: Variable name `Raw` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _Raw
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalSourceRunConstruction.lean:163:62: Variable name `Listener` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _Listener
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalSourceRunConstruction.lean:163:71: Variable name `TcpStream` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _TcpStream
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalSourceRunConstruction.lean:163:81: Variable name `Error` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _Error
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalSourceRunConstruction.lean:214:31: Variable name `ClockHost` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _ClockHost
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalSourceRunConstruction.lean:541:40: Variable name `selected` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _selected
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [619/635] Replayed Miri.Input.EvalWindowsConnectedSourceAssembly
+warning: ../lean-miri/vendor/Miri/Input/EvalWindowsConnectedSourceAssembly.lean:123:35: Variable name `Zone` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _Zone
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalWindowsConnectedSourceAssembly.lean:123:40: Variable name `Timestamp` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _Timestamp
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/vendor/Miri/Input/EvalWindowsConnectedSourceAssembly.lean:126:5: Variable name `options` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _options
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [627/635] Replayed LeanMiriSpec.Correspondence.Translate
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Translate.lean:1145:22: Variable name `s1` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _s1
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Translate.lean:1145:25: Variable name `s2` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _s2
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [628/635] Replayed LeanMiriSpec.Correspondence.Relation
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Relation.lean:708:0: Definition `StateRel.memoryAllocDisjoint` is a proposition; use `theorem` instead of `def`
+
+Note: This linter can be disabled with `set_option linter.defProp false`
+✖ [630/635] Building LeanMiriSpec.Correspondence.SimLM1_4 (2.5s)
+trace: .> LEAN_PATH=/usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/lib/lean /usr/local/google/home/markdittmer/.elan/toolchains/leanprover--lean4---v4.34.1/bin/lean /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean -o /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/lib/lean/LeanMiriSpec/Correspondence/SimLM1_4.olean -i /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/lib/lean/LeanMiriSpec/Correspondence/SimLM1_4.ilean -c /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/ir/LeanMiriSpec/Correspondence/SimLM1_4.c --setup /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/ir/LeanMiriSpec/Correspondence/SimLM1_4.setup.json --json
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:249:21: This simp argument is unused:
   pure_bind
 
 Hint: Omit it from the simp argument list.
@@ -7,7 +1397,7 @@ Hint: Omit it from the simp argument list.
     ↓reduceIte]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:249:39: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:249:39: This simp argument is unused:
   not_false_eq_true
 
 Hint: Omit it from the simp argument list.
@@ -15,13 +1405,13 @@ Hint: Omit it from the simp argument list.
     annealLocalStorageHooks_deallocateLocal_eq, Id.run, hframes, pure_bind, h_beq, Bool.false_eq_true, ↓reduceIte]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:365:5: warning: Variable name `hdecl` is not explicitly referenced.
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:365:5: Variable name `hdecl` is not explicitly referenced.
 
 Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
   [apply] _hdecl
 
 Note: This linter can be disabled with `set_option linter.unusedVariables false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:604:71: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:604:71: This simp argument is unused:
   EStateM.set
 
 Hint: Omit it from the simp argument list.
@@ -34,7 +1424,7 @@ Hint: Omit it from the simp argument list.
     size_singleton_sub_one, set_singleton_sub_one]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:606:4: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:606:4: This simp argument is unused:
   Option.getD
 
 Hint: Omit it from the simp argument list.
@@ -47,7 +1437,7 @@ Hint: Omit it from the simp argument list.
     size_singleton_sub_one, set_singleton_sub_one]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:606:47: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:606:47: This simp argument is unused:
   Option.map
 
 Hint: Omit it from the simp argument list.
@@ -60,7 +1450,7 @@ Hint: Omit it from the simp argument list.
     size_singleton_sub_one, set_singleton_sub_one]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:606:59: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:606:59: This simp argument is unused:
   Option.bind
 
 Hint: Omit it from the simp argument list.
@@ -73,42 +1463,42 @@ Hint: Omit it from the simp argument list.
     size_singleton_sub_one, set_singleton_sub_one]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:610:15: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:610:15: This simp argument is unused:
   hc
 
 Hint: Omit it from the simp argument list.
   [apply] simp only [↓reduceIte]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:610:19: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:610:19: This simp argument is unused:
   ↓reduceIte
 
 Hint: Omit it from the simp argument list.
   [apply] simp only [hc]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:614:15: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:614:15: This simp argument is unused:
   hc
 
 Hint: Omit it from the simp argument list.
   [apply] simp only [↓reduceIte]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:614:19: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:614:19: This simp argument is unused:
   ↓reduceIte
 
 Hint: Omit it from the simp argument list.
   [apply] simp only [hc]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:706:21: warning: This simp argument is unused:
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:706:21: This simp argument is unused:
   hlt_af
 
 Hint: Omit it from the simp argument list.
   [apply] simp only [↓reduceIte, Option.some.injEq] at hmls_i
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-def Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand : List LocalSlot →
+info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:756:0: def Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand : List LocalSlot →
   Operand →
     optParam (List BorrowEntry) [] →
       optParam (List CapturedAllocation) [] →
@@ -285,12 +1675,142 @@ fun locals op borrows globals layouts callerLocals =>
       | some LocalSlot.uninit => PlaceReadResult.ub
       | some LocalSlot.dead => PlaceReadResult.ub
       | none => PlaceReadResult.ub
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:757:8: warning: declaration uses `sorry`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:850:8: warning: declaration uses `sorry`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:856:8: warning: declaration uses `sorry`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:862:8: warning: declaration uses `sorry`
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:868:8: warning: declaration uses `sorry`
-case local.isFalse.ok.immediate.isFalse.scalar
+info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:810:8: body : CapturedMir
+s : MachineState
+m : AnnealStepState
+hphase : ∀ (p : String), body.phase ≠ MirPhaseTag.other p
+bb : BasicBlockData
+dstIdx : Local
+srcPlace : Place
+span : String
+hbb : get? body.basicBlocks s.frame.blockIdx = some bb
+hstmt :
+  get? bb.statements s.frame.stmtIdx =
+    some
+      { kind := StatementKind.assign { local_ := dstIdx, projection := [] } (Rvalue.use (Operand.move srcPlace)),
+        span := span }
+hwt :
+  ∀ (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
+    m.stack.frames = #[topFrame] →
+      WellTypedLM1_4Stmt body topFrame
+        { kind := StatementKind.assign { local_ := dstIdx, projection := [] } (Rvalue.use (Operand.move srcPlace)),
+          span := span }
+topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit
+hframes : m.stack.frames = #[topFrame]
+ht_ret : topFrame.returnContinuation = Miri.Interpreter.ReturnContinuation.stop false
+ht_retp :
+  ∃ retLay, topFrame.returnPlace = Miri.Interpreter.RuntimeStackPlace.frameLocal 0 0 none retLay topFrame.localsIdentity
+hfr : FrameRel body m.machine s.frame topFrame
+hcal_none : s.memory.activeCallee = none
+ht_stack : s.memory.callStack = []
+ht_bor : s.memory.borrows = []
+ht_prot : s.memory.activeProtectors = []
+ht_caller : s.memory.callerLocals = []
+hdisj : MemoryAllocDisjoint topFrame
+dstDecl srcDecl : LocalDecl
+hty : dstDecl.ty = srcDecl.ty
+hdst : get? body.localDecls dstIdx = some dstDecl
+hsrc : get? body.localDecls srcPlace.local_ = some srcDecl
+hproj : srcPlace.projection = []
+hlt_body_src : srcPlace.local_ < body.localDecls.length
+hlt_af_src : srcPlace.local_ < s.frame.locals.length
+hlt_mf_src : srcPlace.local_ < topFrame.locals.size
+slot_src : LocalSlot
+hslot_src : get? s.frame.locals srcPlace.local_ = some slot_src
+mls_src : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout
+hmls_src : topFrame.locals[srcPlace.local_]? = some mls_src
+hlt_body_dst : dstIdx < body.localDecls.length
+hlt_af_dst : dstIdx < s.frame.locals.length
+hlt_mf_dst : dstIdx < topFrame.locals.size
+slot_dst : LocalSlot
+hslot_dst : get? s.frame.locals dstIdx = some slot_dst
+mls_dst : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout
+hmls_dst : topFrame.locals[dstIdx]? = some mls_dst
+h_getElem_src? : topFrame.locals[srcPlace.local_]? = some topFrame.locals[srcPlace.local_]
+heq_mls_src : topFrame.locals[srcPlace.local_] = mls_src
+hrel_src : LocalRel m.machine srcDecl body.layouts slot_src mls_src
+h_slot_src_eq : slot_src = LocalSlot.dead
+⊢ (match evalRvalue s.frame.locals (Rvalue.use (Operand.move srcPlace)) s.memory body.localDecls body.layouts with
+    | RvalueEvalResult.ok val locals₁ mem₁ =>
+      match get? locals₁ dstIdx with
+      | some LocalSlot.dead => MirStepNode.fail Trusted.Effect.FailureKind.ub
+      | some val_1 =>
+        match set? locals₁ dstIdx (LocalSlot.init val) with
+        | some locals₂ =>
+          match mem₁.activeProtectors with
+          | [] =>
+            MirStepNode.step
+              (advanceStmt s locals₂
+                { nextAllocId := mem₁.nextAllocId, globals := mem₁.globals,
+                  borrows := invalidateConflictingBorrows mem₁.borrows dstIdx none, nextTag := mem₁.nextTag,
+                  callees := mem₁.callees, callStack := mem₁.callStack, activeCallee := mem₁.activeCallee,
+                  activeProtectors := mem₁.activeProtectors, nextProtector := mem₁.nextProtector,
+                  callerLocals := mem₁.callerLocals })
+          | protHead :: protTail =>
+            match hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx none with
+            | true => MirStepNode.fail Trusted.Effect.FailureKind.ub
+            | false =>
+              MirStepNode.step
+                (advanceStmt s locals₂
+                  { nextAllocId := mem₁.nextAllocId, globals := mem₁.globals,
+                    borrows := invalidateConflictingBorrows mem₁.borrows dstIdx none, nextTag := mem₁.nextTag,
+                    callees := mem₁.callees, callStack := mem₁.callStack, activeCallee := mem₁.activeCallee,
+                    activeProtectors := mem₁.activeProtectors, nextProtector := mem₁.nextProtector,
+                    callerLocals := mem₁.callerLocals })
+        | none => MirStepNode.fail Trusted.Effect.FailureKind.ub
+      | none => MirStepNode.fail Trusted.Effect.FailureKind.ub
+    | RvalueEvalResult.ub => MirStepNode.fail Trusted.Effect.FailureKind.ub
+    | RvalueEvalResult.unsupported => MirStepNode.unsupported) =
+    MirStepNode.fail Trusted.Effect.FailureKind.ub
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:757:8: declaration uses `sorry`
+error: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:877:22: Application type mismatch: The argument
+  body.localDecls
+has type
+  List LocalDecl
+but is expected to have type
+  Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit
+in the application
+  MemoryAllocDisjoint body.localDecls
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:880:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:881:3: Variable name `hstate` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hstate
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:882:3: Variable name `hset` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hset
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:886:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:887:3: Variable name `hstate` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hstate
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:888:3: Variable name `hwrite` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hwrite
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:892:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:893:3: Variable name `hstate` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hstate
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:894:3: Variable name `hoffset` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hoffset
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:990:12: case local.isFalse.ok.immediate.isFalse.scalar
 body : CapturedMir
 s : MachineState
 m : AnnealStepState
@@ -899,7 +2419,7 @@ hforce6 :
     EStateM.Result.ok mplace m'
 hval : val = Miri.Interpreter.Immediate.scalar sc
 ⊢ StateRel body s m'
-case local.isFalse.ok.immediate.isFalse.scalarPair
+info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:994:12: case local.isFalse.ok.immediate.isFalse.scalarPair
 body : CapturedMir
 s : MachineState
 m : AnnealStepState
@@ -1508,4 +3028,13 @@ hforce6 :
     EStateM.Result.ok mplace m'
 hval : val = Miri.Interpreter.Immediate.scalarPair sc1 sc2
 ⊢ StateRel body s m'
-../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:874:8: warning: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:898:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:903:5: Variable name `loc` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _loc
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+Some required targets logged failures:
+- LeanMiriSpec.Correspondence.SimLM1_4
+error: build failed

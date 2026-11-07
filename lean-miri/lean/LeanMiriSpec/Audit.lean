@@ -359,6 +359,6 @@ end StatementPins
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.
--- #assert_all_leanmirispec_and_miri_standard_axioms
+#assert_all_leanmirispec_and_miri_standard_axioms
 
 end LeanMiriSpec.Audit

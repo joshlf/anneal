@@ -1,4 +1,4 @@
-⚠ [29/500] Replayed Miri.DataStructures.DedupRangeMap
+⚠ [29/491] Replayed Miri.DataStructures.DedupRangeMap
 warning: ../lean-miri/vendor/Miri/DataStructures/DedupRangeMap.lean:404:8: automatically included section variable(s) unused in theorem `_private.Miri.DataStructures.DedupRangeMap.0.Miri.DataStructures.DedupRangeMap.findOffset_new_zero`:
   [DecidableEq A]
 consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
@@ -137,7 +137,7 @@ Hint: Omit it from the simp argument list.
     Except.pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [34/500] Replayed Miri.TreeBorrows.TreeState
+⚠ [34/491] Replayed Miri.TreeBorrows.TreeState
 warning: ../lean-miri/vendor/Miri/TreeBorrows/TreeState.lean:2202:4: This simp argument is unused:
   ← Array.forIn_toList
 
@@ -257,7 +257,7 @@ Hint: Omit it from the simp argument list.
   [apply] simp [locations, Id.run, bind, Bind.bind, pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [43/500] Replayed Miri.Memory.ProvenanceMap
+⚠ [43/491] Replayed Miri.Memory.ProvenanceMap
 warning: ../lean-miri/vendor/Miri/Memory/ProvenanceMap.lean:340:31: This simp argument is unused:
   Bool.false_eq_true
 
@@ -340,7 +340,7 @@ Hint: Omit it from the simp argument list.
   [apply] simp [checked, empty, bind, Bind.bind, EStateM.bind, EStateM.get, EStateM.set, pure, Pure.pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [46/500] Replayed Miri.Memory.Allocation
+⚠ [46/491] Replayed Miri.Memory.Allocation
 warning: ../lean-miri/vendor/Miri/Memory/Allocation.lean:809:18: This simp argument is unused:
   eta
 
@@ -603,7 +603,7 @@ Hint: Omit it from the simp argument list.
   [apply] simp [insert, updated, bytes, mutable, bind, Bind.bind, pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [48/500] Replayed Miri.Memory.KeyedArray
+⚠ [48/491] Replayed Miri.Memory.KeyedArray
 warning: ../lean-miri/vendor/Miri/Memory/KeyedArray.lean:104:8: automatically included section variable(s) unused in theorem `_private.Miri.Memory.KeyedArray.0.Miri.Memory.KeyedArray.map_modify_preserves`:
   [BEq K]
   [Hashable K]
@@ -618,7 +618,7 @@ consider restructuring your `variable` declarations so that the variables are no
   omit [LawfulBEq K] [LawfulHashable K] in theorem ...
 
 Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
-⚠ [62/500] Replayed Miri.Memory.AllocationAccess
+⚠ [62/491] Replayed Miri.Memory.AllocationAccess
 warning: ../lean-miri/vendor/Miri/Memory/AllocationAccess.lean:183:13: This simp argument is unused:
   nonzero
 
@@ -696,7 +696,7 @@ Hint: Omit it from the simp argument list.
   [apply] simp_all [cache, bind, Bind.bind, pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [63/500] Replayed Miri.Interpreter.MemoryOperand
+⚠ [63/491] Replayed Miri.Interpreter.MemoryOperand
 warning: ../lean-miri/vendor/Miri/Interpreter/MemoryOperand.lean:547:53: This simp argument is unused:
   Bool.false_eq_true
 
@@ -887,7 +887,7 @@ Hint: Omit it from the simp argument list.
   [apply] simp only [backend, offsetPositive, beq_iff_eq, ↓reduceIte]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [76/500] Replayed Miri.Interpreter.Call
+⚠ [76/491] Replayed Miri.Interpreter.Call
 warning: ../lean-miri/vendor/Miri/Interpreter/Call.lean:611:51: This simp argument is unused:
   EStateM.pure
 
@@ -902,16 +902,16 @@ Hint: Omit it from the simp argument list.
   [apply] simp [bind, Bind.bind, EStateM.bind, pure, Pure.pure, indirect]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-ℹ [99/500] Replayed Miri.Concurrency.GlobalStateVerification
+ℹ [99/491] Replayed Miri.Concurrency.GlobalStateVerification
 info: ../lean-miri/vendor/Miri/Concurrency/GlobalStateVerification.lean:24:0: 'Miri.Concurrency.GlobalStateVerification.single_thread_fence_is_noop' depends on axioms: [propext, Quot.sound]
 info: ../lean-miri/vendor/Miri/Concurrency/GlobalStateVerification.lean:25:0: 'Miri.Concurrency.GlobalStateVerification.single_thread_sync_operation_is_skipped' depends on axioms: [propext,
  Quot.sound]
-ℹ [102/500] Replayed Miri.Concurrency.WeakMemoryVerification
+ℹ [102/491] Replayed Miri.Concurrency.WeakMemoryVerification
 info: ../lean-miri/vendor/Miri/Concurrency/WeakMemoryVerification.lean:18:0: 'Miri.Concurrency.WeakMemoryVerification.source_fetch_has_candidate' depends on axioms: [propext, Quot.sound]
-ℹ [108/500] Replayed Miri.Concurrency.SyncVerification
+ℹ [108/491] Replayed Miri.Concurrency.SyncVerification
 info: ../lean-miri/vendor/Miri/Concurrency/SyncVerification.lean:24:0: 'rwlock_writer_lock_none_contract' depends on axioms: [propext, Quot.sound]
 info: ../lean-miri/vendor/Miri/Concurrency/SyncVerification.lean:25:0: 'mutex_callback_is_pending' depends on axioms: [propext, Quot.sound]
-⚠ [125/500] Replayed Miri.Input.DecoderValues
+⚠ [125/491] Replayed Miri.Input.DecoderValues
 warning: ../lean-miri/vendor/Miri/Input/DecoderValues.lean:754:12: Variable name `fields` is not explicitly referenced.
 
 Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
@@ -942,7 +942,7 @@ Hint: The binding can be removed (if unused) or named `_` (if used implicitly). 
   [apply] _fields
 
 Note: This linter can be disabled with `set_option linter.unusedVariables false`
-⚠ [137/500] Replayed Miri.Interpreter.PlaceMachine
+⚠ [137/491] Replayed Miri.Interpreter.PlaceMachine
 warning: ../lean-miri/vendor/Miri/Interpreter/PlaceMachine.lean:369:20: This simp argument is unused:
   bind
 
@@ -1051,7 +1051,7 @@ Hint: Omit it from the simp argument list.
     EStateM.pure, bind, Bind.bind]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [152/500] Replayed Miri.Interpreter.ValidityVisitor
+⚠ [152/491] Replayed Miri.Interpreter.ValidityVisitor
 warning: ../lean-miri/vendor/Miri/Interpreter/ValidityVisitor.lean:525:15: This simp argument is unused:
   bind
 
@@ -1115,7 +1115,7 @@ Hint: Omit it from the simp argument list.
   [apply] simp only [bind, Bind.bind, EStateM.bind, padding, pure, EStateM.pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [157/500] Replayed Miri.Interpreter.FrameRelevance
+⚠ [157/491] Replayed Miri.Interpreter.FrameRelevance
 warning: ../lean-miri/vendor/Miri/Interpreter/FrameRelevance.lean:125:44: This simp argument is unused:
   EStateM.modifyGet
 
@@ -1189,7 +1189,7 @@ Hint: Omit it from the simp argument list.
     modifyGet, EStateM.modifyGet]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [194/500] Replayed Miri.Interpreter.ExecutionChoices
+⚠ [194/491] Replayed Miri.Interpreter.ExecutionChoices
 warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionChoices.lean:416:4: This simp argument is unused:
   get
 
@@ -1254,21 +1254,21 @@ Hint: Omit it from the simp argument list.
     modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, bind, EStateM.bind, pure, EStateM.pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [320/500] Replayed Miri.Interpreter.ExecutionCast
+⚠ [320/491] Replayed Miri.Interpreter.ExecutionCast
 warning: ../lean-miri/vendor/Miri/Interpreter/ExecutionCast.lean:59:46: Variable name `allocation` is not explicitly referenced.
 
 Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
   [apply] _allocation
 
 Note: This linter can be disabled with `set_option linter.unusedVariables false`
-⚠ [375/500] Replayed Miri.Interpreter.UnixForeign
+⚠ [375/491] Replayed Miri.Interpreter.UnixForeign
 warning: ../lean-miri/vendor/Miri/Interpreter/UnixForeign.lean:171:25: Variable name `env` is not explicitly referenced.
 
 Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
   [apply] _env
 
 Note: This linter can be disabled with `set_option linter.unusedVariables false`
-⚠ [404/500] Replayed Miri.Input.CompilerFrameMetadata
+⚠ [404/491] Replayed Miri.Input.CompilerFrameMetadata
 warning: ../lean-miri/vendor/Miri/Input/CompilerFrameMetadata.lean:72:71: This simp argument is unused:
   Except.bind
 
@@ -1284,7 +1284,7 @@ Hint: Omit it from the simp argument list.
   [apply] simp_all [EStateM.bind, EStateM.pure]
 
 Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
-⚠ [407/500] Replayed Miri.Input.CompilerLifecycle
+⚠ [407/491] Replayed Miri.Input.CompilerLifecycle
 warning: ../lean-miri/vendor/Miri/Input/CompilerLifecycle.lean:141:4: This simp argument is unused:
   Except.bind
 
@@ -1386,8 +1386,7 @@ Note: This linter can be disabled with `set_option linter.unusedVariables false`
 warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Relation.lean:708:0: Definition `StateRel.memoryAllocDisjoint` is a proposition; use `theorem` instead of `def`
 
 Note: This linter can be disabled with `set_option linter.defProp false`
-✖ [630/635] Building LeanMiriSpec.Correspondence.SimLM1_4 (4.0s)
-trace: .> LEAN_PATH=/usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/lib/lean /usr/local/google/home/markdittmer/.elan/toolchains/leanprover--lean4---v4.34.1/bin/lean /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean -o /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/lib/lean/LeanMiriSpec/Correspondence/SimLM1_4.olean -i /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/lib/lean/LeanMiriSpec/Correspondence/SimLM1_4.ilean -c /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/ir/LeanMiriSpec/Correspondence/SimLM1_4.c --setup /usr/local/google/Projects/anneal-workspace/anneal-wt-lm-1-4/examples/.lake/build/ir/LeanMiriSpec/Correspondence/SimLM1_4.setup.json --json
+⚠ [630/635] Built LeanMiriSpec.Correspondence.SimLM1_4 (2.7s)
 warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:249:21: This simp argument is unused:
   pure_bind
 
@@ -1675,68 +1674,147 @@ fun locals op borrows globals layouts callerLocals =>
       | some LocalSlot.uninit => PlaceReadResult.ub
       | some LocalSlot.dead => PlaceReadResult.ub
       | none => PlaceReadResult.ub
+info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:810:8: body : CapturedMir
+s : MachineState
+m : AnnealStepState
+hphase : ∀ (p : String), body.phase ≠ MirPhaseTag.other p
+bb : BasicBlockData
+dstIdx : Local
+srcPlace : Place
+span : String
+hbb : get? body.basicBlocks s.frame.blockIdx = some bb
+hstmt :
+  get? bb.statements s.frame.stmtIdx =
+    some
+      { kind := StatementKind.assign { local_ := dstIdx, projection := [] } (Rvalue.use (Operand.move srcPlace)),
+        span := span }
+hwt :
+  ∀ (topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
+    m.stack.frames = #[topFrame] →
+      WellTypedLM1_4Stmt body topFrame
+        { kind := StatementKind.assign { local_ := dstIdx, projection := [] } (Rvalue.use (Operand.move srcPlace)),
+          span := span }
+topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit
+hframes : m.stack.frames = #[topFrame]
+ht_ret : topFrame.returnContinuation = Miri.Interpreter.ReturnContinuation.stop false
+ht_retp :
+  ∃ retLay, topFrame.returnPlace = Miri.Interpreter.RuntimeStackPlace.frameLocal 0 0 none retLay topFrame.localsIdentity
+hfr : FrameRel body m.machine s.frame topFrame
+hcal_none : s.memory.activeCallee = none
+ht_stack : s.memory.callStack = []
+ht_bor : s.memory.borrows = []
+ht_prot : s.memory.activeProtectors = []
+ht_caller : s.memory.callerLocals = []
+hdisj : MemoryAllocDisjoint topFrame
+dstDecl srcDecl : LocalDecl
+hty : dstDecl.ty = srcDecl.ty
+hdst : get? body.localDecls dstIdx = some dstDecl
+hsrc : get? body.localDecls srcPlace.local_ = some srcDecl
+hproj : srcPlace.projection = []
+hlt_body_src : srcPlace.local_ < body.localDecls.length
+hlt_af_src : srcPlace.local_ < s.frame.locals.length
+hlt_mf_src : srcPlace.local_ < topFrame.locals.size
+slot_src : LocalSlot
+hslot_src : get? s.frame.locals srcPlace.local_ = some slot_src
+mls_src : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout
+hmls_src : topFrame.locals[srcPlace.local_]? = some mls_src
+hlt_body_dst : dstIdx < body.localDecls.length
+hlt_af_dst : dstIdx < s.frame.locals.length
+hlt_mf_dst : dstIdx < topFrame.locals.size
+slot_dst : LocalSlot
+hslot_dst : get? s.frame.locals dstIdx = some slot_dst
+mls_dst : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout
+hmls_dst : topFrame.locals[dstIdx]? = some mls_dst
+h_getElem_src? : topFrame.locals[srcPlace.local_]? = some topFrame.locals[srcPlace.local_]
+heq_mls_src : topFrame.locals[srcPlace.local_] = mls_src
+hrel_src : LocalRel m.machine srcDecl body.layouts slot_src mls_src
+h_slot_src_eq : slot_src = LocalSlot.dead
+⊢ (match evalRvalue s.frame.locals (Rvalue.use (Operand.move srcPlace)) s.memory body.localDecls body.layouts with
+    | RvalueEvalResult.ok val locals₁ mem₁ =>
+      match get? locals₁ dstIdx with
+      | some LocalSlot.dead => MirStepNode.fail Trusted.Effect.FailureKind.ub
+      | some val_1 =>
+        match set? locals₁ dstIdx (LocalSlot.init val) with
+        | some locals₂ =>
+          match mem₁.activeProtectors with
+          | [] =>
+            MirStepNode.step
+              (advanceStmt s locals₂
+                { nextAllocId := mem₁.nextAllocId, globals := mem₁.globals,
+                  borrows := invalidateConflictingBorrows mem₁.borrows dstIdx none, nextTag := mem₁.nextTag,
+                  callees := mem₁.callees, callStack := mem₁.callStack, activeCallee := mem₁.activeCallee,
+                  activeProtectors := mem₁.activeProtectors, nextProtector := mem₁.nextProtector,
+                  callerLocals := mem₁.callerLocals })
+          | protHead :: protTail =>
+            match hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstIdx none with
+            | true => MirStepNode.fail Trusted.Effect.FailureKind.ub
+            | false =>
+              MirStepNode.step
+                (advanceStmt s locals₂
+                  { nextAllocId := mem₁.nextAllocId, globals := mem₁.globals,
+                    borrows := invalidateConflictingBorrows mem₁.borrows dstIdx none, nextTag := mem₁.nextTag,
+                    callees := mem₁.callees, callStack := mem₁.callStack, activeCallee := mem₁.activeCallee,
+                    activeProtectors := mem₁.activeProtectors, nextProtector := mem₁.nextProtector,
+                    callerLocals := mem₁.callerLocals })
+        | none => MirStepNode.fail Trusted.Effect.FailureKind.ub
+      | none => MirStepNode.fail Trusted.Effect.FailureKind.ub
+    | RvalueEvalResult.ub => MirStepNode.fail Trusted.Effect.FailureKind.ub
+    | RvalueEvalResult.unsupported => MirStepNode.unsupported) =
+    MirStepNode.fail Trusted.Effect.FailureKind.ub
 warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:757:8: declaration uses `sorry`
-warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:972:8: declaration uses `sorry`
-warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:978:8: declaration uses `sorry`
-warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:985:3: Variable name `hstate` is not explicitly referenced.
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:873:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:874:3: Variable name `hstate` is not explicitly referenced.
 
 Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
   [apply] _hstate
 
 Note: This linter can be disabled with `set_option linter.unusedVariables false`
-error: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:1214:24: Type mismatch
-  rfl
-has type
-  ?m.1994 = ?m.1994
-but is expected to have type
-  { stack := { frames := #[res_sl] },
-          machine :=
-            {
-              memory :=
-                { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                  issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                  live :=
-                    mem_new.live.push
-                      (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                  dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                  importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                  importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                  extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                  vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                  byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                  sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                  sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                  sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                  sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                  runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                  opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                  sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-              addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } }.stack.frames =
-    #[frame_new]
-error: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:1215:24: Type mismatch
-  hret6
-has type
-  topFrame6.returnContinuation = Miri.Interpreter.ReturnContinuation.stop false
-but is expected to have type
-  frame_new.returnContinuation = Miri.Interpreter.ReturnContinuation.stop false
-error: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:1216:24: Type mismatch
-  hret_p6
-has type
-  ∃ retLay,
-    topFrame6.returnPlace = Miri.Interpreter.RuntimeStackPlace.frameLocal 0 0 none retLay topFrame6.localsIdentity
-but is expected to have type
-  ∃ retLay,
-    frame_new.returnPlace = Miri.Interpreter.RuntimeStackPlace.frameLocal 0 0 none retLay frame_new.localsIdentity
-error: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:1218:45: Unknown identifier `h_alloc`
-error: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:1375:60: Application type mismatch: The argument
-  hdisj6
-has type
-  MemoryAllocDisjoint topFrame6
-but is expected to have type
-  MemoryAllocDisjoint frame_new
-in the application
-  MemoryAllocDisjoint_mono_live hdisj6
-info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:1169:16: case local.isFalse.ok.immediate.isFalse.ok.mk.ok.uninit.mk
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:875:3: Variable name `h_alloc` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _h_alloc
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:879:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:880:3: Variable name `hstate` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hstate
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:881:3: Variable name `hset` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hset
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:885:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:886:3: Variable name `hstate` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hstate
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:887:3: Variable name `hwrite` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hwrite
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:891:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:892:3: Variable name `hstate` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hstate
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:893:3: Variable name `hoffset` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _hoffset
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:989:12: case local.isFalse.ok.immediate.isFalse.scalar
 body : CapturedMir
 s : MachineState
 m : AnnealStepState
@@ -1856,9 +1934,9 @@ hforce :
 hpref : place.ref = Miri.Interpreter.RuntimePlaceRef.local frameIndex localId offset identity
 res_req : Unit
 a_req : Nat
-a_eq✝³ : m.stack.frames.size - 1 = a_req
+a_eq✝² : m.stack.frames.size - 1 = a_req
 h✝¹ : ¬(a_req != frameIndex) = true
-a_eq✝² : () = res_req
+a_eq✝¹ : () = res_req
 h_require :
   ((annealPlaceHooks body.localDecls body.layouts).frameIndex >>= fun __do_lift =>
         if (__do_lift != frameIndex) = true then
@@ -1964,7 +2042,7 @@ hforce1 :
       m =
     EStateM.Result.ok mplace m'
 res_check : Unit
-a_eq✝¹ : () = res_check
+a_eq✝ : () = res_check
 hforce2 :
   ((annealPlaceHooks body.localDecls body.layouts).getFrame >>= fun __do_lift => do
         let old ← Miri.Interpreter.stackLift✝ (__do_lift.getLocalOperand localId)
@@ -2317,62 +2395,21 @@ hforce5 :
               EStateM.pure { mplace := mplace, layout := place.layout })
       m5 =
     EStateM.Result.ok mplace m'
-right✝ : True
-allocation : Miri.Memory.Allocation AnnealProv
-h_alloc_new :
-  (Miri.Memory.Allocation.tryNew layout.layout.size layout.layout.align.abi Miri.Memory.AllocInit.Uninit fun size x =>
-      some (Array.replicate size.bytes.toNat 0)) =
-    Except.ok allocation
-mem_new : Miri.Memory.MemoryState AnnealProv (Option Miri.TreeBorrows.BorrowTree) Miri.Memory.MiriMemoryKind
-res : Except Miri.Memory.AllocationIdError Miri.Memory.AllocId
-h_res : Miri.Memory.MemoryState.reserveAllocId m5.machine.memory = (mem_new, res)
-id : Miri.Memory.AllocId
-h_id : res = Except.ok id
-hframes6 :
-  { stack := m5.stack,
-          machine :=
-            {
-              memory :=
-                { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                  issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                  live :=
-                    mem_new.live.push
-                      (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                  dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                  importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                  importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                  extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                  vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                  byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                  sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                  sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                  sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                  sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                  runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                  opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                  sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-              addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } }.stack.frames =
-    m5.stack.frames
+allocated : Miri.Interpreter.MPlaceTy AnnealProv
+m6 : AnnealStepState
+h_alloc : (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout m5 = EStateM.Result.ok allocated m6
+sc : Miri.Memory.Scalar AnnealProv
 hforce6 :
-  ((annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId
-          {
-            mplace :=
-              { ptr := { offset := { bytes := 0 }, provenance := none }, metadata := Miri.Interpreter.MemPlaceMeta.none,
-                misaligned := none },
-            layout := layout } >>=
+  ((annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () (Miri.Interpreter.Immediate.scalar sc)
+          allocated >>=
         fun __r => do
+        (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
         let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
         let updated ←
           Miri.Interpreter.stackLift✝
-              (__do_lift.setLocalOperand localId
-                (Miri.Interpreter.Operand.indirect
-                  { ptr := { offset := { bytes := 0 }, provenance := none },
-                    metadata := Miri.Interpreter.MemPlaceMeta.none, misaligned := none }))
+              (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
         (annealPlaceHooks body.localDecls body.layouts).setFrame updated
-        let whole ←
-          EStateM.pure
-              { ptr := { offset := { bytes := 0 }, provenance := none }, metadata := Miri.Interpreter.MemPlaceMeta.none,
-                misaligned := none }
+        let whole ← EStateM.pure allocated.mplace
         match offset with
           | none => do
             let mplace ← EStateM.pure whole
@@ -2382,46 +2419,606 @@ hforce6 :
               (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
                   Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
             EStateM.pure { mplace := mplace, layout := place.layout })
-      { stack := m5.stack,
-        machine :=
-          {
-            memory :=
-              { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                live :=
-                  mem_new.live.push
-                    (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-            addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } } =
+      m6 =
     EStateM.Result.ok mplace m'
-hval : val = Miri.Interpreter.Immediate.uninit
-res_after : Unit
-a_eq✝ : () = res_after
-hforce7 :
+hval : val = Miri.Interpreter.Immediate.scalar sc
+⊢ StateRel body s m'
+info: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:993:12: case local.isFalse.ok.immediate.isFalse.scalarPair
+body : CapturedMir
+s : MachineState
+m : AnnealStepState
+hstate : StateRel body s m
+topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit
+hframes : m.stack.frames = #[topFrame]
+loc : Local
+place : Miri.Interpreter.RuntimePlace AnnealProv
+m' : AnnealStepState
+mplace : Miri.Interpreter.MPlaceTy AnnealProv
+frameIndex localId : Nat
+offset : Option Miri.ABI.Size
+identity : Miri.Interpreter.LocalsIdentity
+hforce :
+  ((do
+          let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).frameIndex
+          if (__do_lift != frameIndex) = true then
+              throw (Miri.Interpreter.StepError.invalidProgram "place refers to another frame")
+            else pure ()) >>=
+        fun __r => do
+        pure ()
+        let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+        let old ← Miri.Interpreter.stackLift✝ (__do_lift.getLocalOperand localId)
+        match old with
+          | Miri.Interpreter.Operand.indirect mplace => do
+            let whole ← pure mplace
+            match offset with
+              | none => do
+                let mplace ← pure whole
+                pure { mplace := mplace, layout := place.layout }
+              | some offset => do
+                let mplace ←
+                  (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                      Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                pure { mplace := mplace, layout := place.layout }
+          | Miri.Interpreter.Operand.immediate value => do
+            let layout ← Miri.Interpreter.placeLayoutOfLocal (annealPlaceHooks body.localDecls body.layouts) () localId
+            if (!layout.layout.isSized) = true then do
+                throw (Miri.Interpreter.StepError.invalidProgram "unsized immediate local allocation")
+                let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+                match value with
+                  | Miri.Interpreter.Immediate.uninit => do
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+                  | x => do
+                    (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+              else do
+                let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+                match value with
+                  | Miri.Interpreter.Immediate.uninit => do
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+                  | x => do
+                    (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout })
+      m =
+    EStateM.Result.ok mplace m'
+hpref : place.ref = Miri.Interpreter.RuntimePlaceRef.local frameIndex localId offset identity
+res_req : Unit
+a_req : Nat
+a_eq✝² : m.stack.frames.size - 1 = a_req
+h✝¹ : ¬(a_req != frameIndex) = true
+a_eq✝¹ : () = res_req
+h_require :
+  ((annealPlaceHooks body.localDecls body.layouts).frameIndex >>= fun __do_lift =>
+        if (__do_lift != frameIndex) = true then
+          throw (Miri.Interpreter.StepError.invalidProgram "place refers to another frame")
+        else pure ())
+      m =
+    EStateM.Result.ok res_req m
+hforce1 :
+  (pure () >>= fun __r => do
+        let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+        let old ← Miri.Interpreter.stackLift✝ (__do_lift.getLocalOperand localId)
+        match old with
+          | Miri.Interpreter.Operand.indirect mplace => do
+            let whole ← pure mplace
+            match offset with
+              | none => do
+                let mplace ← pure whole
+                pure { mplace := mplace, layout := place.layout }
+              | some offset => do
+                let mplace ←
+                  (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                      Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                pure { mplace := mplace, layout := place.layout }
+          | Miri.Interpreter.Operand.immediate value => do
+            let layout ← Miri.Interpreter.placeLayoutOfLocal (annealPlaceHooks body.localDecls body.layouts) () localId
+            if (!layout.layout.isSized) = true then do
+                throw (Miri.Interpreter.StepError.invalidProgram "unsized immediate local allocation")
+                let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+                match value with
+                  | Miri.Interpreter.Immediate.uninit => do
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+                  | x => do
+                    (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+              else do
+                let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+                match value with
+                  | Miri.Interpreter.Immediate.uninit => do
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+                  | x => do
+                    (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout })
+      m =
+    EStateM.Result.ok mplace m'
+res_check : Unit
+a_eq✝ : () = res_check
+hforce2 :
   ((annealPlaceHooks body.localDecls body.layouts).getFrame >>= fun __do_lift => do
+        let old ← Miri.Interpreter.stackLift✝ (__do_lift.getLocalOperand localId)
+        match old with
+          | Miri.Interpreter.Operand.indirect mplace => do
+            let whole ← pure mplace
+            match offset with
+              | none => do
+                let mplace ← pure whole
+                pure { mplace := mplace, layout := place.layout }
+              | some offset => do
+                let mplace ←
+                  (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                      Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                pure { mplace := mplace, layout := place.layout }
+          | Miri.Interpreter.Operand.immediate value => do
+            let layout ← Miri.Interpreter.placeLayoutOfLocal (annealPlaceHooks body.localDecls body.layouts) () localId
+            if (!layout.layout.isSized) = true then do
+                throw (Miri.Interpreter.StepError.invalidProgram "unsized immediate local allocation")
+                let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+                match value with
+                  | Miri.Interpreter.Immediate.uninit => do
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+                  | x => do
+                    (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+              else do
+                let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+                match value with
+                  | Miri.Interpreter.Immediate.uninit => do
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout }
+                  | x => do
+                    (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                    (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                    let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                    let updated ←
+                      Miri.Interpreter.stackLift✝
+                          (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                    (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                    let whole ← pure allocated.mplace
+                    match offset with
+                      | none => do
+                        let mplace ← pure whole
+                        pure { mplace := mplace, layout := place.layout }
+                      | some offset => do
+                        let mplace ←
+                          (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                              Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                        pure { mplace := mplace, layout := place.layout })
+      m =
+    EStateM.Result.ok mplace m'
+res_frame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit
+h_res_frame : #[topFrame][#[topFrame].size - 1] = res_frame
+h_frame : (annealPlaceHooks body.localDecls body.layouts).1 m = EStateM.Result.ok res_frame m
+hforce3 :
+  (Miri.Interpreter.stackLift✝ (res_frame.getLocalOperand localId) >>= fun old =>
+        match old with
+        | Miri.Interpreter.Operand.indirect mplace => do
+          let whole ← pure mplace
+          match offset with
+            | none => do
+              let mplace ← pure whole
+              pure { mplace := mplace, layout := place.layout }
+            | some offset => do
+              let mplace ←
+                (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                    Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+              pure { mplace := mplace, layout := place.layout }
+        | Miri.Interpreter.Operand.immediate value => do
+          let layout ← Miri.Interpreter.placeLayoutOfLocal (annealPlaceHooks body.localDecls body.layouts) () localId
+          if (!layout.layout.isSized) = true then do
+              throw (Miri.Interpreter.StepError.invalidProgram "unsized immediate local allocation")
+              let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+              match value with
+                | Miri.Interpreter.Immediate.uninit => do
+                  (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                  let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                  let updated ←
+                    Miri.Interpreter.stackLift✝
+                        (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                  (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                  let whole ← pure allocated.mplace
+                  match offset with
+                    | none => do
+                      let mplace ← pure whole
+                      pure { mplace := mplace, layout := place.layout }
+                    | some offset => do
+                      let mplace ←
+                        (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                            Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                      pure { mplace := mplace, layout := place.layout }
+                | x => do
+                  (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                  (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                  let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                  let updated ←
+                    Miri.Interpreter.stackLift✝
+                        (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                  (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                  let whole ← pure allocated.mplace
+                  match offset with
+                    | none => do
+                      let mplace ← pure whole
+                      pure { mplace := mplace, layout := place.layout }
+                    | some offset => do
+                      let mplace ←
+                        (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                            Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                      pure { mplace := mplace, layout := place.layout }
+            else do
+              let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+              match value with
+                | Miri.Interpreter.Immediate.uninit => do
+                  (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                  let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                  let updated ←
+                    Miri.Interpreter.stackLift✝
+                        (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                  (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                  let whole ← pure allocated.mplace
+                  match offset with
+                    | none => do
+                      let mplace ← pure whole
+                      pure { mplace := mplace, layout := place.layout }
+                    | some offset => do
+                      let mplace ←
+                        (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                            Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                      pure { mplace := mplace, layout := place.layout }
+                | x => do
+                  (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () value allocated
+                  (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+                  let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+                  let updated ←
+                    Miri.Interpreter.stackLift✝
+                        (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+                  (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+                  let whole ← pure allocated.mplace
+                  match offset with
+                    | none => do
+                      let mplace ← pure whole
+                      pure { mplace := mplace, layout := place.layout }
+                    | some offset => do
+                      let mplace ←
+                        (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                            Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                      pure { mplace := mplace, layout := place.layout })
+      m =
+    EStateM.Result.ok mplace m'
+old a✝ : Miri.Interpreter.Operand AnnealProv
+h_op : res_frame.getLocalOperand localId = Except.ok a✝
+h_old : a✝ = old
+val : Miri.Interpreter.Immediate AnnealProv
+hforce4 :
+  ((do
+          let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+          let state ← Miri.Interpreter.stackLift✝ (__do_lift.getLocal localId)
+          match state.layout with
+            | some layout => pure layout
+            | x => do
+              let layout ← (annealPlaceHooks body.localDecls body.layouts).resolveLayout () localId
+              let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+              let __x ← Miri.Interpreter.stackLift✝ (__do_lift.getOrCacheLocalLayout localId layout)
+              match __x with
+                | (frame, cached) => do
+                  (annealPlaceHooks body.localDecls body.layouts).setFrame frame
+                  pure cached) >>=
+        fun layout =>
+        if (!layout.layout.isSized) = true then do
+          throw (Miri.Interpreter.StepError.invalidProgram "unsized immediate local allocation")
+          let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+          match val with
+            | Miri.Interpreter.Immediate.uninit => do
+              (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+              let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+              let updated ←
+                Miri.Interpreter.stackLift✝
+                    (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+              (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+              let whole ← pure allocated.mplace
+              match offset with
+                | none => do
+                  let mplace ← pure whole
+                  pure { mplace := mplace, layout := place.layout }
+                | some offset => do
+                  let mplace ←
+                    (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                        Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                  pure { mplace := mplace, layout := place.layout }
+            | x => do
+              (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () val allocated
+              (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+              let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+              let updated ←
+                Miri.Interpreter.stackLift✝
+                    (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+              (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+              let whole ← pure allocated.mplace
+              match offset with
+                | none => do
+                  let mplace ← pure whole
+                  pure { mplace := mplace, layout := place.layout }
+                | some offset => do
+                  let mplace ←
+                    (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                        Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                  pure { mplace := mplace, layout := place.layout }
+        else do
+          let allocated ← (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout
+          match val with
+            | Miri.Interpreter.Immediate.uninit => do
+              (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+              let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+              let updated ←
+                Miri.Interpreter.stackLift✝
+                    (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+              (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+              let whole ← pure allocated.mplace
+              match offset with
+                | none => do
+                  let mplace ← pure whole
+                  pure { mplace := mplace, layout := place.layout }
+                | some offset => do
+                  let mplace ←
+                    (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                        Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                  pure { mplace := mplace, layout := place.layout }
+            | x => do
+              (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () val allocated
+              (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+              let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+              let updated ←
+                Miri.Interpreter.stackLift✝
+                    (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+              (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+              let whole ← pure allocated.mplace
+              match offset with
+                | none => do
+                  let mplace ← pure whole
+                  pure { mplace := mplace, layout := place.layout }
+                | some offset => do
+                  let mplace ←
+                    (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                        Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+                  pure { mplace := mplace, layout := place.layout })
+      m =
+    EStateM.Result.ok mplace m'
+h_old_match : old = Miri.Interpreter.Operand.immediate val
+layout : Miri.Interpreter.LocalLayout
+m5 : AnnealStepState
+h_layout :
+  ((annealPlaceHooks body.localDecls body.layouts).getFrame >>= fun __do_lift => do
+        let state ← Miri.Interpreter.stackLift✝ (__do_lift.getLocal localId)
+        match state.layout with
+          | some layout => pure layout
+          | x => do
+            let layout ← (annealPlaceHooks body.localDecls body.layouts).resolveLayout () localId
+            let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+            let __x ← Miri.Interpreter.stackLift✝ (__do_lift.getOrCacheLocalLayout localId layout)
+            match __x with
+              | (frame, cached) => do
+                (annealPlaceHooks body.localDecls body.layouts).setFrame frame
+                pure cached)
+      m =
+    EStateM.Result.ok layout m5
+hstate5 : StateRel body s m5
+h✝ : ¬(!layout.layout.isSized) = true
+hforce5 :
+  ((annealPlaceHooks body.localDecls body.layouts).allocateStack () layout >>= fun allocated =>
+        match val with
+        | Miri.Interpreter.Immediate.uninit => do
+          (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+          let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+          let updated ←
+            Miri.Interpreter.stackLift✝
+                (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+          (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+          let whole ← EStateM.pure allocated.mplace
+          match offset with
+            | none => do
+              let mplace ← EStateM.pure whole
+              EStateM.pure { mplace := mplace, layout := place.layout }
+            | some offset => do
+              let mplace ←
+                (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                    Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+              EStateM.pure { mplace := mplace, layout := place.layout }
+        | x => do
+          (annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate () val allocated
+          (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+          let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
+          let updated ←
+            Miri.Interpreter.stackLift✝
+                (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
+          (annealPlaceHooks body.localDecls body.layouts).setFrame updated
+          let whole ← EStateM.pure allocated.mplace
+          match offset with
+            | none => do
+              let mplace ← EStateM.pure whole
+              EStateM.pure { mplace := mplace, layout := place.layout }
+            | some offset => do
+              let mplace ←
+                (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
+                    Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
+              EStateM.pure { mplace := mplace, layout := place.layout })
+      m5 =
+    EStateM.Result.ok mplace m'
+allocated : Miri.Interpreter.MPlaceTy AnnealProv
+m6 : AnnealStepState
+h_alloc : (annealPlaceHooks body.localDecls body.layouts).allocateStack () layout m5 = EStateM.Result.ok allocated m6
+sc1 sc2 : Miri.Memory.Scalar AnnealProv
+hforce6 :
+  ((annealPlaceHooks body.localDecls body.layouts).writeMemoryNoValidate ()
+          (Miri.Interpreter.Immediate.scalarPair sc1 sc2) allocated >>=
+        fun __r => do
+        (annealPlaceHooks body.localDecls body.layouts).afterLocalMovedToMemory () localId allocated
+        let __do_lift ← (annealPlaceHooks body.localDecls body.layouts).getFrame
         let updated ←
           Miri.Interpreter.stackLift✝
-              (__do_lift.setLocalOperand localId
-                (Miri.Interpreter.Operand.indirect
-                  { ptr := { offset := { bytes := 0 }, provenance := none },
-                    metadata := Miri.Interpreter.MemPlaceMeta.none, misaligned := none }))
+              (__do_lift.setLocalOperand localId (Miri.Interpreter.Operand.indirect allocated.mplace))
         (annealPlaceHooks body.localDecls body.layouts).setFrame updated
-        let whole ←
-          EStateM.pure
-              { ptr := { offset := { bytes := 0 }, provenance := none }, metadata := Miri.Interpreter.MemPlaceMeta.none,
-                misaligned := none }
+        let whole ← EStateM.pure allocated.mplace
         match offset with
           | none => do
             let mplace ← EStateM.pure whole
@@ -2431,196 +3028,134 @@ hforce7 :
               (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
                   Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
             EStateM.pure { mplace := mplace, layout := place.layout })
-      { stack := m5.stack,
-        machine :=
-          {
-            memory :=
-              { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                live :=
-                  mem_new.live.push
-                    (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-            addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } } =
+      m6 =
     EStateM.Result.ok mplace m'
-res_f2 : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit
-m8 : AnnealStepState
-h_f2 :
-  (annealPlaceHooks body.localDecls body.layouts).1
-      { stack := m5.stack,
-        machine :=
-          {
-            memory :=
-              { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                live :=
-                  mem_new.live.push
-                    (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-            addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } } =
-    EStateM.Result.ok res_f2 m8
-hforce8 :
-  (Miri.Interpreter.stackLift✝
-          (res_f2.setLocalOperand localId
-            (Miri.Interpreter.Operand.indirect
-              { ptr := { offset := { bytes := 0 }, provenance := none }, metadata := Miri.Interpreter.MemPlaceMeta.none,
-                misaligned := none })) >>=
-        fun updated => do
-        (annealPlaceHooks body.localDecls body.layouts).setFrame updated
-        let whole ←
-          EStateM.pure
-              { ptr := { offset := { bytes := 0 }, provenance := none }, metadata := Miri.Interpreter.MemPlaceMeta.none,
-                misaligned := none }
-        match offset with
-          | none => do
-            let mplace ← EStateM.pure whole
-            EStateM.pure { mplace := mplace, layout := place.layout }
-          | some offset => do
-            let mplace ←
-              (annealPlaceHooks body.localDecls body.layouts).memoryOffset () whole offset
-                  Miri.Interpreter.OffsetMode.wrapping Miri.Interpreter.MemPlaceMeta.none
-            EStateM.pure { mplace := mplace, layout := place.layout })
-      m8 =
-    EStateM.Result.ok mplace m'
-h_get_rest :
-  (match
-        { stack := m5.stack,
-                machine :=
-                  {
-                    memory :=
-                      { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                        issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                        live :=
-                          mem_new.live.push
-                            (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                        dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                        importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                        importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                        extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                        vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new,
-                        byteGlobalKeys := mem_new.byteGlobalKeys, byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                        sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                        sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                        sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                        sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                        runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                        opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                        sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-                    addresses := m5.machine.addresses,
-                    borrowTracker := m5.machine.borrowTracker } }.stack.frames.back? with
-      | some frame => pure frame
-      | none => throw (Miri.Interpreter.StepError.stack Miri.Interpreter.StackError.emptyStack))
-      { stack := m5.stack,
-        machine :=
-          {
-            memory :=
-              { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                live :=
-                  mem_new.live.push
-                    (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-            addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } } =
-    EStateM.Result.ok res_f2 m8
-topFrame6 : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit
-hframes_m6 :
-  { stack := m5.stack,
-          machine :=
-            {
-              memory :=
-                { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                  issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                  live :=
-                    mem_new.live.push
-                      (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                  dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                  importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                  importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                  extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                  vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                  byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                  sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                  sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                  sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                  sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                  runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                  opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                  sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-              addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } }.stack.frames =
-    #[topFrame6]
-hret6 : topFrame6.returnContinuation = Miri.Interpreter.ReturnContinuation.stop false
-hret_p6 :
-  ∃ retLay,
-    topFrame6.returnPlace = Miri.Interpreter.RuntimeStackPlace.frameLocal 0 0 none retLay topFrame6.localsIdentity
-hfr6 :
-  FrameRel body
-    { stack := m5.stack,
-        machine :=
-          {
-            memory :=
-              { nextAllocId := mem_new.nextAllocId, idSupplyExhausted := mem_new.idSupplyExhausted,
-                issuedIdTable := Miri.Memory.MemoryState.issuedIdTable✝ mem_new,
-                live :=
-                  mem_new.live.push
-                    (id, { kind := Miri.Memory.MemoryKind.stack, allocation := allocation.withExtra none }),
-                dead := mem_new.dead, globalTable := Miri.Memory.MemoryState.globalTable✝ mem_new,
-                importedGlobalTable := Miri.Memory.MemoryState.importedGlobalTable✝ mem_new,
-                importedGlobalRuntimeTable := Miri.Memory.MemoryState.importedGlobalRuntimeTable✝ mem_new,
-                extraFnPtrTable := Miri.Memory.MemoryState.extraFnPtrTable✝ mem_new,
-                vaListTable := Miri.Memory.MemoryState.vaListTable✝ mem_new, byteGlobalKeys := mem_new.byteGlobalKeys,
-                byteGlobalKeysReady := mem_new.byteGlobalKeysReady,
-                sourceAllocIdWorldActive := mem_new.sourceAllocIdWorldActive,
-                sourceAllocIdNext := mem_new.sourceAllocIdNext,
-                sourceAllocIdExhausted := mem_new.sourceAllocIdExhausted,
-                sourceAllocIdByRuntimeTable := Miri.Memory.MemoryState.sourceAllocIdByRuntimeTable✝ mem_new,
-                runtimeBySourceAllocIdTable := Miri.Memory.MemoryState.runtimeBySourceAllocIdTable✝ mem_new,
-                opaqueSourceGlobalIds := mem_new.opaqueSourceGlobalIds,
-                sourceByteImageFamilyComplete := mem_new.sourceByteImageFamilyComplete },
-            addresses := m5.machine.addresses, borrowTracker := m5.machine.borrowTracker } }.machine
-    s.frame topFrame6
-hcal6 : s.memory.activeCallee = none
-hstack6 : s.memory.callStack = []
-hbor6 : s.memory.borrows = []
-hprot6 : s.memory.activeProtectors = []
-hcaller6 : s.memory.callerLocals = []
-hdisj6 : MemoryAllocDisjoint topFrame6
+hval : val = Miri.Interpreter.Immediate.scalarPair sc1 sc2
 ⊢ StateRel body s m'
-Some required targets logged failures:
-- LeanMiriSpec.Correspondence.SimLM1_4
-error: build failed
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:897:8: declaration uses `sorry`
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/SimLM1_4.lean:902:5: Variable name `loc` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _loc
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [631/635] Built LeanMiriSpec.Correspondence.Simulation (12s)
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Simulation.lean:3168:18: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Simulation.lean:3965:16: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Simulation.lean:4591:16: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Simulation.lean:4641:16: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: ../lean-miri/lean/LeanMiriSpec/Correspondence/Simulation.lean:4661:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [632/635] Built LeanMiriSpec.Correspondence.Witness (2.6s)
+ℹ [633/635] Built LeanMiriSpec.Audit (1.5s)
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translateTy depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translatePlace depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translateOperand depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translatePointerCoercion depends on axioms: []
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translateCastKind depends on axioms: []
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translateRvalue depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translateStmt depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translateTerminator depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.translateBody depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.AnnealMachine depends on axioms: []
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.AnnealMachine.lookupBaseAddr depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealCastHooks depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealStepHooks depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.ScalarRel depends on axioms: []
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.ImmediateRel depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.MemPlaceRel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.MemPlaceRel.relOffset_bytes_eq depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.LocalRel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.FrameRel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StateRel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.RvalueResultRel depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepRel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepRel.step_iff depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepRel.retNormal_iff depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepRel.retNormal_rel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepRel.ub_iff depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepRel.toStepObsRel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepObsRel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepObsRel.emitStep_iff depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepObsRel.retNormal_iff depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepObsRel.retNormal_rel depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.StepObsRel.ub_iff depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.evalBinOp_arithmetic_simulation depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.evalBinOp_bitwise_simulation depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.evalBinOp_shift_simulation depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.evalUnOp_neg_not_simulation depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.step_assign_scalar_simulation depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.step_terminator_goto_return_simulation depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.WellTypedBody depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.step_wellTypedBody_simulation depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.step_wellTypedBody_bisim depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealLocalStorageHooks depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealStepHooks_storageLive_eq depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealStepHooks_storageDead_eq depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealStepHooks_storageDead_returnPlace depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealStepHooks_deinit_ne_ok depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.annealStepHooks_retag_ne_ok depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.ValidFrameLocation.preserved depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.NonAddrTakenImmediate.preserved depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.runAnnealBounded_emitStep depends on axioms: [propext]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.run_wellTypedBody_simulation depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.run_wellTypedBody_bisim depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_init depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTypedBody depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.bisim_applies depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.divByZero_ub_agrees depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.div_returns_agree depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.run_bisim_divBody depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_signedDiv depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTyped_signedDiv depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.run_bisim_signedDiv depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.signedDiv_intMinNegOne_ub_agrees depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.signedDiv_returns_agree depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_addWithOverflow depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTyped_addWithOverflow depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.run_bisim_addWithOverflow depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.addWithOverflow_overflows_agrees depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.addWithOverflow_noOverflow_agrees depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.indirect_localRel_uninit_witness depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.indirect_localRel_scalar_witness depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_unreachable depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTyped_unreachable depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.run_bisim_unreachable depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.unreachable_ub_agrees depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_charCopy depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTyped_charCopy depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.charCopy_returns_agree depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_shiftUnchecked depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTyped_shiftUnchecked depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.shiftUnchecked_witness_agrees depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_addUncheckedNop depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTyped_addUncheckedNop depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.addUncheckedNop_witness_agrees depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.annealCast_intToInt_fidelity depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.annealSwitchInt_fidelity depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.stateRel_unaryBitwise depends on axioms: [propext, Classical.choice, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.wellTyped_unaryBitwise depends on axioms: [propext, Quot.sound]
+info: ../lean-miri/lean/LeanMiriSpec/Audit.lean:63:0: LeanMiriSpec.Correspondence.Witness.unaryBitwise_returns_agree depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+✔ [634/635] Built LeanMiriSpec (947ms)
+Build completed successfully (635 jobs).
