@@ -272,10 +272,20 @@ def zstLayoutData : Miri.ABI.LayoutData :=
     reprC := false
     randomizationSeed := 0 }
 
-/-- Encode the pointee `RigidTy` of a thin raw pointer (`*const T` / `*mut T`)
-into a `Miri.MIR.TyId` strictly below `100` (disjoint from `100 + ty.layoutIdx`
-aggregate IDs and `900 + ...` overflow-pair IDs): `60..82` for unit, primitive
-scalars, floats, and thin pointers, and `40` for aggregate or other pointees. -/
+/-- Whether a pointee `RigidTy` is syntactically known to be `Sized` without
+consulting `LayoutTable`, so `*const T` / `*mut T` is guaranteed to be a thin
+8-byte pointer rather than a 16-byte wide pointer carrying slice length or
+trait-object vtable metadata. -/
+def isThinRawPtrPointee : RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _ | .never
+  | .tuple .nil | .fnDef _ _ | .rawPtr _ _ | .ref _ _ | .fnPtr _ _ _ _ => true
+  | _ => false
+
+/-- Encode the pointee `RigidTy` of a raw pointer (`*const T` / `*mut T`) into a
+`Miri.MIR.TyId` strictly below `100` (disjoint from `100 + ty.layoutIdx`
+aggregate IDs and `900 + ...` overflow-pair IDs): `60..82` for syntactically
+known-sized pointees (`isThinRawPtrPointee`), and `40` for unsized or aggregate
+pointees (which fail closed in `Deref`, `BinOp.Offset`, and `CastKind.PtrToPtr`). -/
 def encodeRawPtrTyId : RigidTy → Miri.MIR.TyId
   | .tuple .nil | .fnDef _ _ => 60
   | .bool => 61
@@ -286,6 +296,7 @@ def encodeRawPtrTyId : RigidTy → Miri.MIR.TyId
   | .int .i64 => 66
   | .int .i128 => 67
   | .int .isize => 68
+  | .never => 69
   | .uint .u8 => 70
   | .uint .u16 => 71
   | .uint .u32 => 72
@@ -379,7 +390,7 @@ def classifyEncodedTyId (tyId : Miri.MIR.TyId) :
   | 24 => .ok (.integer .u128)
   | 25 => .ok (.integer .usize)
   | 30 | 31 | 32 | 33 => .ok .floating
-  | 40 | 41 | 60 | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 68
+  | 40 | 41 | 60 | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 68 | 69
   | 70 | 71 | 72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 => .ok .pointer
   | 42 => .ok .functionPointer
   | _ => .error (.invalidProgram s!"non-scalar TyId {tyId} in ScalarOps")
@@ -433,7 +444,7 @@ def layoutOfEncodedTyId (tyId : Miri.MIR.TyId) (layouts : LayoutTable := emptyLa
   | 31 => translateTy { kind := .float .f32, layoutIdx := 0 }
   | 32 => translateTy { kind := .float .f64, layoutIdx := 0 }
   | 33 => translateTy { kind := .float .f128, layoutIdx := 0 }
-  | 40 | 60 | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 68
+  | 40 | 60 | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 68 | 69
   | 70 | 71 | 72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 =>
       { ty := tyId, layout := pointerLayoutData false }
   | 41 => translateTy { kind := .ref .not .bool, layoutIdx := 0 }
@@ -1131,10 +1142,32 @@ def annealScalarReadProvenance (repr : Miri.ABI.BackendRepr) : Option Bool :=
   | .Scalar (.Initialized (value := .Float _) ..) => some false
   | _ => none
 
+/-- Check scalar bit-pattern validity when reading or writing a memory-backed
+place (`Validity.lean` / `Place.lean`):
+* `bool` (`tyId = 1`): must be a 1-byte integer scalar equal to `0` or `1`;
+* `char` (`tyId = 2`): must be a 4-byte integer scalar satisfying `isValidCharCode`;
+* every other scalar/pointer `tyId`: every canonical scalar or pointer immediate
+  accepted by `readScalar` / `writeScalar` is valid. -/
+def annealValidateScalarForTyId (tyId : Miri.MIR.TyId)
+    (sc : Miri.Memory.Scalar AnnealProv) : Bool :=
+  match tyId with
+  | 1 =>
+    match sc.toScalarInt with
+    | .ok msc =>
+      (msc.size == Miri.ABI.Size.ofBytes 1) && (msc.data.toNat == 0 || msc.data.toNat == 1)
+    | .error _ => false
+  | 2 =>
+    match sc.toScalarInt with
+    | .ok msc =>
+      (msc.size == Miri.ABI.Size.ofBytes 4) && isValidCharCode msc.data.toNat
+    | .error _ => false
+  | _ => true
+
 /-- Read a scalar or zero-sized `Immediate` from a memory-backed `MemPlace`,
 enforcing `Miri.Memory.checkAndDerefPtr` bounds/liveness/provenance first,
-cached `mplace.misaligned` alignment second, and `Allocation.readScalar`
-initialization third (`MemoryOperand.lean:103-143, 278-315`). -/
+cached `mplace.misaligned` alignment second, `Allocation.readScalar`
+initialization third, and `bool`/`char` bit-pattern validity fourth
+(`MemoryOperand.lean:103-143, 278-315`, `Place.lean:188-191`). -/
 @[irreducible]
 def annealReadMemoryPlace (mplace : Miri.Interpreter.MemPlace AnnealProv)
     (lay : Miri.Interpreter.LocalLayout) :
@@ -1164,7 +1197,11 @@ def annealReadMemoryPlace (mplace : Miri.Interpreter.MemPlace AnnealProv)
               | some (_, localAlloc) =>
                 match localAlloc.allocation.readScalar annealTargetDataLayout
                     (Miri.Memory.allocRange access.pointer.offset size) readProv with
-                | .ok sc => .ok ⟨.scalar sc, lay⟩ st
+                | .ok sc =>
+                  if annealValidateScalarForTyId lay.ty sc then
+                    .ok ⟨.scalar sc, lay⟩ st
+                  else
+                    .error (.undefinedBehavior "reading invalid value") st
                 | .error (.invalidUninitBytes _) =>
                   .error (.undefinedBehavior "read of uninitialized memory") st
                 | .error (.readPointerAsInt _) | .error (.readPartialPointer _) =>
@@ -1377,6 +1414,8 @@ def annealWriteMemoryPlace (val : Miri.Interpreter.Immediate AnnealProv)
                 | .scalar sc =>
                   if sc.size != size then
                     .error (.invalidProgram "scalar size mismatch in memory write") st
+                  else if !annealValidateScalarForTyId lay.ty sc then
+                    .error (.undefinedBehavior "writing invalid value") st
                   else
                     match Miri.Memory.Allocation.writeScalar annealTargetDataLayout
                         (Miri.Memory.allocRange access.pointer.offset size) sc
@@ -1455,7 +1494,7 @@ def castTypeInfoOfEncodedTyId (tyId : Miri.MIR.TyId) :
   | 23 => .ok (.integer .u64)
   | 24 => .ok (.integer .u128)
   | 25 => .ok (.integer .usize)
-  | 40 | 60 => .ok (.rawPointer 51)
+  | 60 => .ok (.rawPointer 51)
   | 61 => .ok (.rawPointer 1)
   | 62 => .ok (.rawPointer 2)
   | 63 => .ok (.rawPointer 10)
@@ -1464,6 +1503,7 @@ def castTypeInfoOfEncodedTyId (tyId : Miri.MIR.TyId) :
   | 66 => .ok (.rawPointer 13)
   | 67 => .ok (.rawPointer 14)
   | 68 => .ok (.rawPointer 15)
+  | 69 => .ok (.rawPointer 50)
   | 70 => .ok (.rawPointer 20)
   | 71 => .ok (.rawPointer 21)
   | 72 => .ok (.rawPointer 22)
