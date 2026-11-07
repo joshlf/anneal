@@ -144,13 +144,13 @@ def addU32TotalClaim : TotalClaim where
   post _ _ ret _ := ret = .scalar ⟨42, 4⟩
 
 theorem addU32SafeClaim_verified : VerificationResult addU32SafeClaim := by
-  refine verifyMirBounded addU32SafeClaim 4 ?_
+  refine verifyMirFuelFree addU32SafeClaim ?_
   rintro _ rfl retVal _ h_out
   injection h_out with h_pair; injection h_pair with h_ret _
   exact h_ret.symm
 
 theorem addU32TotalClaim_verified : TotalVerificationResult addU32TotalClaim := by
-  refine verifyTotalMirBounded addU32TotalClaim 4 ?_
+  refine verifyTotalMirFuelFree addU32TotalClaim ?_
   rintro _ _ ⟨rfl, rfl⟩
   exact ⟨.scalar ⟨42, 4⟩, _, rfl, rfl⟩
 
@@ -193,7 +193,7 @@ def eq42BoolSpecMirBody : CapturedMir :=
 
 theorem example_companion_bool_spec_holds :
     MirBoolPredicateHolds eq42BoolSpecMirBody [.scalar ⟨42, 4⟩] := by
-  refine mirBoolPredicateHolds_of_bounded 4 eq42BoolSpecMirBody [.scalar ⟨42, 4⟩] ?_
+  refine mirBoolPredicateHolds_of_fuelFree eq42BoolSpecMirBody [.scalar ⟨42, 4⟩] ?_
   intro retVal _ h_out
   injection h_out with h_pair; injection h_pair with h_ret _
   exact h_ret.symm
@@ -231,7 +231,7 @@ def branchObsTraceClaim : TraceClaim where
 
 theorem example_branch_obs_trace_verified :
     TraceVerificationResult branchObsTraceClaim := by
-  refine verifyTraceMirBounded branchObsTraceClaim 5 ?_
+  refine verifyTraceMirFuelFree branchObsTraceClaim ?_
   rintro _ _ ⟨(rfl | rfl), rfl⟩
   · refine ⟨fun hf => hf, fun o => ?_⟩
     cases o
@@ -267,7 +267,7 @@ def reborrowWriteStatefulClaim : StatefulClaim where
 
 theorem reborrowWriteStatefulClaim_verified :
     StatefulVerificationResult reborrowWriteStatefulClaim := by
-  refine verifyStatefulMirBounded reborrowWriteStatefulClaim 10 ?_
+  refine verifyStatefulMirFuelFree reborrowWriteStatefulClaim ?_
   rintro _ _ ⟨rfl, rfl⟩ retVal mem' h_out
   injection h_out with h_pair; injection h_pair with h_ret h_m
   subst h_ret h_m
@@ -358,7 +358,7 @@ def countdownTotalClaim : TotalClaim where
   post _ _ ret _ := ret = .scalar ⟨0, 4⟩
 
 theorem countdownTotalClaim_verified : TotalVerificationResult countdownTotalClaim := by
-  refine verifyTotalMirBounded countdownTotalClaim 16 ?_
+  refine verifyTotalMirFuelFree countdownTotalClaim ?_
   rintro _ _ ⟨rfl, rfl⟩
   exact ⟨.scalar ⟨0, 4⟩, _, rfl, rfl⟩
 
@@ -503,9 +503,9 @@ theorem pureConstFfiModularClaim_verified :
         envAssumed := envSatisfiesContract pureConstSevenContract
         pre := fun args mem => args = [] ∧ mem = emptyMemory
         post := fun _ _ ret _ => ret = .scalar ⟨1, 4⟩ } := by
-  refine verifyModularMirBounded pureConstSevenContract ffiDoubleCallMirBody
+  refine verifyModularMirFuelFree pureConstSevenContract ffiDoubleCallMirBody
     (fun args mem => args = [] ∧ mem = emptyMemory)
-    (fun _ _ ret _ => ret = .scalar ⟨1, 4⟩) 11 ?_
+    (fun _ _ ret _ => ret = .scalar ⟨1, 4⟩) ?_
   rintro _ _ ⟨rfl, rfl⟩
   refine ⟨⟨rfl, rfl⟩, fun ans₁ h_ans₁ => ?_⟩
   subst h_ans₁
@@ -560,9 +560,9 @@ theorem callerAddTwoModular_verified :
         envAssumed := envSatisfiesContract addOneAt40Contract
         pre := fun args mem => args = [.scalar ⟨40, 4⟩] ∧ mem = emptyMemory
         post := fun _ _ ret _ => ret = .scalar ⟨42, 4⟩ } := by
-  refine verifyModularMirBounded addOneAt40Contract callerAddTwoMirBody
+  refine verifyModularMirFuelFree addOneAt40Contract callerAddTwoMirBody
     (fun args mem => args = [.scalar ⟨40, 4⟩] ∧ mem = emptyMemory)
-    (fun _ _ ret _ => ret = .scalar ⟨42, 4⟩) 6 ?_
+    (fun _ _ ret _ => ret = .scalar ⟨42, 4⟩) ?_
   rintro _ _ ⟨rfl, rfl⟩
   refine ⟨⟨rfl, rfl, rfl⟩, fun ans h_ans => ?_⟩
   subst h_ans
@@ -587,7 +587,7 @@ theorem calleeAddOne_satisfies_contract :
     | normal rv => rcases rv with ⟨retVal, mem'⟩; rcases h_out with ⟨rfl, rfl⟩; rfl
     | panic => exact h_out.elim
     | abort => exact h_out.elim
-  · exact ⟨4, by rfl⟩
+  · exact ⟨Anneal.PureMirExec.defaultCfgSteps calleeAddOneMirBody, by rfl⟩
 
 def rejectOtherCallsHandler : ExternalCallHandler :=
   fun _ => ITree.fail (E := MirClosedEffect) FailureKind.unsupported
@@ -666,7 +666,7 @@ def unalignSetStatefulClaim : StatefulClaim where
 
 theorem unalign_set_mir_verified :
     StatefulVerificationResult unalignSetStatefulClaim := by
-  refine verifyStatefulMirBounded unalignSetStatefulClaim 5 ?_
+  refine verifyStatefulMirFuelFree unalignSetStatefulClaim ?_
   rintro _ _ ⟨oldVal, rfl, rfl⟩ retVal mem' h_out
   injection h_out with h_pair; injection h_pair with h_ret h_m
   subst h_ret h_m
@@ -953,7 +953,7 @@ def polySwapPairU32Claim : Claim where
   post _ ret := ret = .aggregate 0 [.scalar ⟨20, 4⟩, .scalar ⟨10, 4⟩]
 
 theorem polySwapPairU32Claim_verified : VerificationResult polySwapPairU32Claim := by
-  refine verifyMirBounded polySwapPairU32Claim 6 ?_
+  refine verifyMirFuelFree polySwapPairU32Claim ?_
   rintro _ rfl retVal _ h_out
   injection h_out with h_pair; injection h_pair with h_ret _
   exact h_ret.symm

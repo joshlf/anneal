@@ -133,87 +133,135 @@ scales thread count (`LEAN_NUM_THREADS`) by active worktree concurrency
 `MemorySwapMax=0`) and wall-clock timeout so runaway reductions fail fast (`exit
 137` or `124`) with zero swap paging.
 
-### 4. Apply standard Anneal proof patterns
+### 4. Apply standard fuel-free Anneal proof patterns
 
-#### Pattern A: Stateless `verifyByWP` with Rust `#[spec]` / `#[external_spec]` companions
+Anneal provides fuel-free functional lifting (`Anneal.MirLiftCore`,
+`Anneal.PureMirExec`, `Anneal.MirFuelFree`) and fuel-free symbolic WP
+combinators (`Anneal.Rustc.V2026_06_01.SymbolicEval`) as the **primary
+recommended proof workflow**. Proofs under `anneal/proofs/Proof/` should never
+hand-code `BlockCtx` wrappers or manual `fuel` step counts.
 
-When `Obligations.<Crate>.<Item>.defaultPre` and `defaultPost` lower Rust
-`requires` and `ensures` clauses via `MirBoolPredicateHolds`, use
-`wpBoolOrExhausted_of_mirBoolPredicateHolds` to extract a bounded step-by-step
-hypothesis from `h_pre` and `mirBoolPredicateHolds_of_wp_bounded` to discharge
-the postcondition:
+#### Pattern A: Fuel-free lifting with `#mir_lift`, `#mir_lift_spec`, and `mirWpConverges_of_pureExec`
+
+For straight-line and branching MIR bodies (as well as `#[anneal_spec::spec]`
+`requires` / `ensures` companions), use `#mir_lift` / `#mir_lift_spec` (in
+interactive exploration or `Anneal.*` modules) and the fuel-free
+`Anneal.PureMirExec` combinators (`verifyMirNoPanic_of_blockLinear`,
+`mirWpConverges_of_pureExec`, `evalMirSpecBool_true_of_holds`, and
+`mirBoolPredicateHolds_of_evalMirSpecBool_true`) which automatically derive step
+budgets from `body.basicBlocks.length` (`defaultSpecSteps` / `defaultCfgSteps`):
 
 ```lean
 import Trusted
 import Anneal
-import Mir.CanaryPkg.identity_u32
-import Obligations.CanaryPkg.identity_u32
+import Mir.WireframeDemo.frame_total_len
+import Obligations.WireframeDemo.frame_total_len
 
-namespace Proof.CanaryPkg.identity_u32
+namespace Proof.WireframeDemo.frame_total_len
+
+open Trusted.MirSemantics
+open Trusted.VerificationResult
+open Anneal.PureMirExec
+
+-- 1. Invert `requires` companion via `evalMirSpecBool_true_of_holds`:
+private theorem req_inversion {v1 v2 : Value}
+    (h_holds : MirBoolPredicateHolds
+      Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.body [v1, v2]) :
+    ∃ b1 b2, v1 = .scalar ⟨b1, 2⟩ ∧ v2 = .scalar ⟨b2, 2⟩ ∧ b1 ≤ 16 ∧ b2 ≤ 1024 := by
+  have h_eval := evalMirSpecBool_true_of_holds h_holds
+  ...
+
+-- 2. Discharge `ensures` companion via `mirBoolPredicateHolds_of_evalMirSpecBool_true`:
+private theorem ensures_holds (b1 b2 : Nat) (h1 : b1 ≤ 16) (h2 : b2 ≤ 1024) :
+    MirBoolPredicateHolds
+      Mir.WireframeDemo.__anodized_fn_ensures_frame_total_len.body
+      [.scalar ⟨b1, 2⟩, .scalar ⟨b2, 2⟩, .scalar ⟨b1 + b2, 2⟩] := by
+  apply mirBoolPredicateHolds_of_evalMirSpecBool_true
+  ...
+
+-- 3. Discharge the subject obligation fuel-free via `verifyMirNoPanic_of_blockLinear`:
+theorem verified : VerificationResult Obligations.WireframeDemo.frame_total_len.claim := by
+  refine verifyMirNoPanic_of_blockLinear Obligations.WireframeDemo.frame_total_len.claim ?_
+  intro args h_pre
+  ...
+
+end Proof.WireframeDemo.frame_total_len
+```
+
+For pin-style `#[spec]` obligations (`x == c && result == d`), use the
+one-line fuel-free combinators `dischargeRustEqU8FuelFree ..
+dischargeRustEqUsizeFuelFree` and `dischargeRustEq2U8FuelFree`:
+
+```lean
+theorem verified : VerificationResult Obligations.FrameTutor.pin_magic.claim :=
+  dischargeRustEqU32FuelFree
+    Obligations.FrameTutor.pin_magic.claim
+    Mir.FrameTutor.__anodized_fn_requires_pin_magic.body
+    Mir.FrameTutor.__anodized_fn_ensures_pin_magic.body
+    7
+```
+
+#### Pattern B: Stateless `verifyByWPFuelFree` with a locked `Specs.<Crate>.<Item>` override
+
+When a locked `Specs.<Crate>.<Item>` module provides a relational `ItemSpec`
+instance (or `refineSafeSpec` safety precondition), import
+`Specs.<Crate>.<Item>` and apply `verifyByWPFuelFree` or
+`verifyByWPSafeFuelFree` paired with `mirBoolPredicateHolds_of_wp_fuelFree`:
+
+```lean
+import Trusted
+import Anneal
+import Anneal.Rustc.V2026_06_01.SymbolicEval
+import Mir.FrameTutor.advance_offset
+import Specs.FrameTutor.advance_offset
+import Obligations.FrameTutor.advance_offset
+
+namespace Proof.FrameTutor.advance_offset
 
 open Trusted.MirSemantics
 open Trusted.VerificationResult
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-set_option maxHeartbeats 2000000 in
-theorem verified : VerificationResult Obligations.CanaryPkg.identity_u32.claim :=
-  verifyByWP Obligations.CanaryPkg.identity_u32.claim 64 (by
-    intro args h_pre
-    have h_req := wpBoolOrExhausted_of_mirBoolPredicateHolds 64
-      Mir.CanaryPkg.__anodized_fn_requires_identity_u32.body args h_pre.2
-    -- Destructure `args` using `h_pre.1` (`length args = body.argCount`)
-    -- and discharge impossible branches with `nomatch h_req`, then close
-    -- the surviving branch with `mirBoolPredicateHolds_of_wp_bounded`.
-    ...)
+theorem verified : VerificationResult Obligations.FrameTutor.advance_offset.claim :=
+  verifyByWPSafeFuelFree
+    Obligations.FrameTutor.advance_offset.claim
+    (by
+      intro args h_safe
+      cases h_safe with
+      | inl h2 =>
+        subst h2
+        exact fun _ =>
+          And.intro
+            (mirBoolPredicateHolds_of_wp_fuelFree
+              Mir.FrameTutor.__anodized_fn_ensures_advance_offset.body
+              [.scalar ⟨2, 1⟩, .scalar ⟨6, 1⟩]
+              rfl)
+            rfl
+      | inr h255 =>
+        subst h255
+        exact True.intro)
 
-end Proof.CanaryPkg.identity_u32
+end Proof.FrameTutor.advance_offset
 ```
 
-#### Pattern B: Stateless `verifyByWP` with a locked `Specs.<Crate>.<Item>` override
+#### Pattern C: Stateful obligations, `mirWpConverges_of_sepLenses`, and `forRangeUp` loop lifting
 
-When a locked `Specs.<Crate>.<Item>` module provides a relational `ItemSpec`
-instance (for example, `pre args := args = [.scalar v]` and `post args ret :=
-ret = .scalar ...`), import `Specs.<Crate>.<Item>` so Lean synthesizes that
-normal-priority instance for `Obligations.<Crate>.<Item>.claim`:
+For pointer, reference, mutable-borrow, and bounded-loop obligations
+(`StatefulItemSpec` / `StatefulVerificationResult`), use:
 
-```lean
-import Trusted
-import Anneal
-import Mir.CanaryPkg.const_forty_two
-import Specs.CanaryPkg.const_forty_two
-import Obligations.CanaryPkg.const_forty_two
-
-namespace Proof.CanaryPkg.const_forty_two
-
-open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.Lower
-open Anneal.Rustc.V2026_06_01.SymbolicEval
-
-theorem verified : VerificationResult Obligations.CanaryPkg.const_forty_two.claim :=
-  verifyByWP Obligations.CanaryPkg.const_forty_two.claim 16 (by
-    intro args h_pre
-    subst h_pre
-    exact ⟨rfl, rfl⟩)
-
-end Proof.CanaryPkg.const_forty_two
-```
-
-#### Pattern C: Stateful `verifyStatefulByWP` and footprint framing (`wp_frame_disjoint`)
-
-For pointer, reference, and mutable-borrow obligations (`StatefulItemSpec` /
-`StatefulVerificationResult`), open `Anneal.SepLogic` and `Anneal.Memory`, and
-apply `verifyStatefulByWP`:
-
-- Use `PtrInvariant`, `UnalignInvariant`, `PointsTo`, `BorrowToken`, and
-  `LifetimeToken` (or their `SepProp` counterparts `PointsToSep`,
-  `BorrowTokenSep`, `LifetimeTokenSep`) to destructure the initial `Memory`
-  hypothesis `h_pre : c.pre args mem`.
-- When proving that a heap or Tree Borrows update preserves disjoint resources
-  `frame : HeapPred` supported by `fp : Footprint` (`SupportedBy frame fp`),
-  apply `wp_frame_disjoint` together with
-  `agreeOnFootprint_of_disjoint_borrow_update`, `supportedBy_pointsTo`,
-  `supportedBy_ptrInvariant`, or `supportedBy_unalignInvariant`.
+- **`dischargeStatefulEqFuelFree`** for concrete reference/borrow equality
+  contracts;
+- **`verifyStatefulMirNoPanic_of_cfg`** (and
+  `verifyStatefulMirNoPanic_of_runCfgSteps` /
+  `verifyStatefulEquivMir_of_runCfgSteps` with `runCfgStepsWith`) for general
+  stateful CFG execution without `BlockCtx` boilerplate;
+- **`mirWpConverges_of_sepLenses`** and **`forRangeUp`** (`forRangeUp_step`,
+  `forRangeUp_done`, `forRangeUp_invariant`) for loops and separated memory
+  lenses (`SepLens` / `DisjointSepLenses`);
+- **`PtrInvariant`**, **`UnalignInvariant`**, **`PointsTo`**,
+  **`BorrowToken`**, and **`LifetimeToken`** (`Anneal.SepLogic`) to destructure
+  initial `Memory` states and frame disjoint footprints via `wp_frame_disjoint`.
 
 #### Pattern D: Byte-level validity and `zerocopy` trait obligations (`Anneal.BitValidity`)
 
@@ -236,50 +284,53 @@ hits `maxHeartbeats`, `maxRecDepth`, or multi-second `rw`/`dsimp` stalls, read
 [`references/proof-scaling-and-bottlenecks.md`](references/proof-scaling-and-bottlenecks.md)
 and apply these nine rules:
 
-1. **Use `#mir_lift` and `#mir_lift_spec`:** For straight-line code and simple contracts, use `#mir_lift_spec` or `mirWpConverges_of_pureExec` and `lift_frame` to evaluate MIR directly. Do not use manual explicit bounds like `fuel`.
-2. **Loop Abstractions (`forRangeUp` and `mirWpConverges_of_sepLenses`):** For loop bodies, use structural combinators rather than unrolling or explicitly executing multi-block CFGs.
-2. **Short-circuit symbolic bit-loops (`bitwiseAndBitsFast`):** Never unfold
-   recursive `bitwiseAndBits` / `bitwiseOrBits` over a symbolic `b : Nat` (which
-   unrolls 8–64 nested `Nat.div · 2` trees and stalls kernel unification for
-   `100s+`). Rewrite masks using closed-form arithmetic (`b % 2`, `b % 256`,
-   `lo * 256 + hi`) or a fast-path wrapper proved equal to `bitwiseAndBits`.
-3. **Shield large symbolic states from `rw` (`Hold` barrier):** Wrap large
+1. **Use fuel-free lifting (`#mir_lift`, `#mir_lift_spec`, `mirWpConverges_of_pureExec`, `verifyMirNoPanic_of_blockLinear`, `verifyStatefulMirNoPanic_of_cfg`):**
+   Never hand-write `BlockCtx` structures, per-block `itemBB0..itemBBn`
+   boilerplate, or manual `fuel` numerals. Use `Anneal.PureMirExec` and
+   `Anneal.MirLiftCore` combinators (`#mir_lift`, `#mir_lift_spec`,
+   `mirWpConverges_of_pureExec`, `lift_frame`, `verifyMirNoPanic_of_blockLinear`,
+   `verifyStatefulMirNoPanic_of_cfg`) which derive step counts automatically
+   from the CFG structure.
+2. **Use `forRangeUp` and `mirWpConverges_of_sepLenses` for loops and stateful lenses:**
+   Model bounded range loops via `forRangeUp` (`forRangeUp_step`,
+   `forRangeUp_done`, `forRangeUp_invariant`) and separated mutable places via
+   `mirWpConverges_of_sepLenses` or `runCfgStepsWith` (which holds `body` opaque
+   during statement execution so `Mir.<Crate>.<Item>.body` is never duplicated
+   across loop iterations).
+3. **Short-circuit symbolic bit-loops (`bitwiseAndBitsFast` & `swap_le_u16_lane`):**
+   Never unfold recursive `bitwiseAndBits` / `bitwiseOrBits` over a symbolic
+   `b : Nat` (which unrolls 8–64 nested `Nat.div · 2` trees and stalls kernel
+   unification for `100s+`). Rewrite masks using closed-form arithmetic (`b % 2`,
+   `b % 256`, `lo * 256 + hi`), `swap_le_u16_lane`, or a fast-path wrapper
+   proved equal to `bitwiseAndBits`.
+4. **Shield large symbolic states from `rw` (`Hold` barrier):** Wrap large
    weakest-precondition terms in `private structure Hold (P : Prop) : Prop where val : P`
    so `rw` does not traverse the full symbolic execution AST before `dsimp only`
    collapses it.
-4. **Factor `#[anneal_spec::spec]` companions into boundary lemmas:** Prove
-   standalone `wpReq_inversion` (extracting pure arithmetic bounds from
-   `MirBoolPredicateHolds __anodized_fn_requires_*`) and `ensures_holds`
-   (discharging `MirBoolPredicateHolds __anodized_fn_ensures_*` from arithmetic
-   bounds) instead of stepping all three MIR bodies inside one proof block.
-5. **Substitute concrete `fuel` only after destructuring `Memory` (`verified_at_fuel`):**
-   In loop proofs (`runCfgSteps ctx state fuel`), parameterize by
-   `(fuel : Nat) (h_fuel : fuel = N)`, `rcases` and `subst` all `Memory` fields
-   first (`activeCallee = none`, `callerLocals`, `borrows`), and `subst h_fuel`
-   last so kernel `whnf` never unfolds `N` steps over an abstract `mem : Memory`.
-6. **Never run `trace.profiler.threshold 1` on symbolic MIR proofs:** Low
+5. **Factor `#[anneal_spec::spec]` companions into fuel-free boundary lemmas:**
+   Prove standalone `wpReq_inversion` (via `evalMirSpecBool_true_of_holds`) and
+   `ensures_holds` (via `mirBoolPredicateHolds_of_evalMirSpecBool_true`) instead
+   of stepping all three MIR bodies inside one proof block.
+6. **Parameterize `evalByteCastAfterOperand` lemmas over `{body : CapturedMir}` with `autoParam`s:**
+   When `dsimp only` unfolds `Mir.<Crate>.<Item>.body` to look up basic blocks,
+   any `evalByteCastAfterOperand` argument containing `body` also unfolds. State
+   byte-cast rewrite lemmas over `{body : CapturedMir}` with
+   `(h_decls : body.localDecls = ... := by rfl)` and
+   `(h_layouts : body.layouts = ... := by rfl)` so `rw` matches any unfolded
+   `CapturedMir` record in `O(1)`.
+7. **Never run `trace.profiler.threshold 1` on symbolic MIR proofs:** Low
    profiler thresholds format huge nested MIR ASTs at thousands of elaborator
    nodes, producing hundreds of megabytes of output and multi-hour stalls. Use
    in-memory `lean_multi_attempt` / `lean_goal` (when `anneal-lean_lsp` is
    available), or keep `trace.profiler.threshold >= 100` with
    `set_option pp.deepTerms false` and `timeout 30s`.
-7. **Step `wpMirSym` with top-down `change` and tight `fuel` bounds—never
-   bottom-up `dsimp`:** Passing `wpMirExecSym` and `stepMirExecSymTree` to
-   `dsimp` unfolds continuation lambdas (`fun st' => wpMirExecSym fuel' ...`)
-   bottom-up over an abstract state `st'`, and including
-   `Trusted.Sequence.length` in `dsimp` corrupts implicit `Decidable` instances
-   inside `@ite`. Use top-down `change` (which evaluates `wpMirSym` lazily in
-   weak-head normal form) and pass tight `fuel` bounds (`#statements + 2`,
-   typically `4`–`6`) on straight-line blocks.
 8. **Escape `whnf` timeouts on `bitwiseOrBits` and stateful `Memory` via
    wildcard `change ... _` + projection `dsimp`:** Spelling out `bitwiseOrBits 32`
    or an explicit post-state `Memory` record inside `change` forces `isDefEq` to
    unify `32` against `{ ... }.sizeBytes.mul 8` and unfolds 32 recursive levels
-   of `bitwiseOrBits`. Instead, write `change match (4294967296 : Nat).ble _ with
-   | true => False | false => claim.post _ _ _ _`, run `dsimp only [advanceStmt,
-   <claim>]` to collapse record projections to `32` and the concrete `Memory`
-   literal without unfolding `bitwiseOrBits`, and then `rw` the shift and
-   bitwise lemmas.
+   of `bitwiseOrBits`. Instead, use wildcard `change ... _`, collapse record
+   projections with a targeted `dsimp only` excluding `bitwiseOrBits`, and then
+   `rw` the shift and bitwise lemmas.
 9. **Follow the interactive LSP threshold heuristic:** Write routine arithmetic
    and known combinator proofs directly via `edit_file` (relying on the
    automatic `PostToolUse` hook), cap `lean_multi_attempt` at 1–2 probes per

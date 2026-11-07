@@ -16,59 +16,44 @@ that eliminate them.
 
 ---
 
-## 1. Whole-Body `CapturedMir` Duplication Across Multi-Block CFGs (`BlockCtx` Pattern)
+## 1. Fuel-Free CFG Lifting vs. Whole-Body `CapturedMir` Duplication (`Anneal.PureMirExec` Pattern)
 
 ### Symptom
 Unfolding `Mir.<Crate>.<Item>.body` inside `dsimp` or `simp` across a function
-with multiple basic blocks causes `maxHeartbeats` or `maxRecDepth` timeouts after
-a few block transitions.
+with multiple basic blocks or loops causes `maxHeartbeats` or `maxRecDepth`
+timeouts, or requires hundreds of lines of manual `BlockCtx` / `itemBB0..itemBBn`
+boilerplate.
 
 ### Root Cause
-Every MIR stepping function (`stepMirState`, `dispatchBlock`, `evalStmt`,
-`evalRvalue`) takes `body : CapturedMir` (or `body.localDecls` and
-`body.layouts`). When `Mir.<Crate>.<Item>.body` is unfolded in place, Lean
-substitutes the literal AST of **all** basic blocks (`BB0..BBn`) into every
-intermediate symbolic state. Across $k$ basic-block jumps or branch splits, the
-term size grows polynomially or exponentially.
+Every raw MIR stepping function (`stepMirState`, `evalStmt`, `evalRvalue`) takes
+`body : CapturedMir` (or `body.localDecls` and `body.layouts`). When
+`Mir.<Crate>.<Item>.body` is unfolded inside every statement step of a loop,
+Lean substitutes the literal AST of all basic blocks into every intermediate
+symbolic state.
 
 ### Solution
-Never unfold `body` inside recursive CFG stepping. Instead:
-1. Wrap `{ localDecls, layouts, body }` in a small `BlockCtx` structure.
-2. Pre-project each basic block `0..n` into a top-level definition (`itemBB0`,
-   `itemBB1`, ...).
-3. Prove `O(1)` `rfl` lookup lemmas (`itemCtx_bb1 : lookupBlock itemCtx 1 = some itemBB1`,
-   `itemCtx_localDecls`, `itemCtx_layouts`, `itemCtx_phase`).
-4. Pass `itemCtx_bb1 .. itemCtx_bbn` and `itemBB0 .. itemBBn`—not `body`—to
-   `dsimp only [...]` or `rw`.
-
-```lean
-private structure BlockCtx where
-  localDecls : List LocalDecl
-  layouts : LayoutTable
-  body : CapturedMir
-
-private def dummyBB : BasicBlockData :=
-  { statements := [], terminator := { kind := .unreachable, span := "" }, isCleanup := false }
-
-private def itemBB0 : BasicBlockData :=
-  (get? Mir.MyCrate.my_fn.body.basicBlocks 0).getD dummyBB
-private def itemBB1 : BasicBlockData :=
-  (get? Mir.MyCrate.my_fn.body.basicBlocks 1).getD dummyBB
-
-private def itemCtx : BlockCtx :=
-  { localDecls := Mir.MyCrate.my_fn.body.localDecls
-    layouts := Mir.MyCrate.my_fn.body.layouts
-    body := Mir.MyCrate.my_fn.body }
-
-private theorem itemCtx_localDecls :
-    itemCtx.localDecls = Mir.MyCrate.my_fn.body.localDecls := rfl
-private theorem itemCtx_layouts :
-    itemCtx.layouts = Mir.MyCrate.my_fn.body.layouts := rfl
-private theorem itemCtx_phase :
-    itemCtx.body.phase = .runtimeOptimized := rfl
-private theorem itemCtx_bb1 :
-    lookupBlock itemCtx 1 = some itemBB1 := rfl
-```
+Never hand-roll `BlockCtx` structures or manual `fuel` bounds in proof files.
+Instead, use the shared fuel-free combinators in `Anneal.PureMirExec`,
+`Anneal.MirLiftCore`, and `Anneal.MirFuelFree`:
+1. **Stateless branching CFGs & `#[spec]` companions:** Use `#mir_lift`,
+   `#mir_lift_spec`, `verifyMirNoPanic_of_blockLinear`,
+   `evalMirSpecBool_true_of_holds`, and
+   `mirBoolPredicateHolds_of_evalMirSpecBool_true`, which evaluate basic blocks
+   via `wpBlockLinear` / `evalMirSpecBool` with an automatic step bound derived
+   from `body.basicBlocks.length`.
+2. **Stateful branching CFGs:** Use `verifyStatefulMirNoPanic_of_cfg` (backed by
+   `wpStatefulBlockLinear`).
+3. **Stateful bounded loops:** Use `forRangeUp` (`forRangeUp_step`,
+   `forRangeUp_done`, `forRangeUp_invariant`), `mirWpConverges_of_sepLenses`, or
+   `verifyStatefulMirNoPanic_of_runCfgSteps` /
+   `verifyStatefulEquivMir_of_runCfgSteps` (backed by `runCfgStepsWith`, which
+   caches `localDecls` and `layouts` while keeping `body` opaque during
+   statement stepping).
+4. **Byte-cast rewrites after `body` unfolding:** Parameterize
+   `evalByteCastAfterOperand` helper lemmas over `{body : CapturedMir}` with
+   `(h_decls : body.localDecls = ... := by rfl)` and
+   `(h_layouts : body.layouts = ... := by rfl)` so `rw` matches even after
+   `dsimp only` unfolds `Mir.<Crate>.<Item>.body`.
 
 ---
 

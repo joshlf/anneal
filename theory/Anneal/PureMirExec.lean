@@ -359,7 +359,7 @@ def isPureRvalue : Rvalue → Bool
   | .discriminant p => isPurePlace p
   | .aggregate _ ops => ops.all isPureOperand
   | .shallowInitBox _ _ => false
-  | .copyForDeref p => isPurePlace p
+  | .copyForDeref _p => false
   | .wrapUnsafeBinder op _ => isPureOperand op
 
 /--
@@ -723,21 +723,7 @@ theorem evalRvalue_pure_eq_withMem
       try rw [evalOperands_pure_eq locals ops emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       repeat' (first | rfl | split)
   | shallowInitBox _ _ => cases h_pure
-  | copyForDeref p =>
-    dsimp only [isPureRvalue] at h_pure
-    dsimp only [evalRvalue]
-    rw [evalOperand_pure_eq locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals h_pure]
-    rw [evalOperand_pure_eq locals (.copy p) emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    cases evalOperand locals (.copy p) [] [] layouts [] with
-    | ub => rfl
-    | unsupported => rfl
-    | ok v locals' =>
-      rcases p with ⟨loc, proj⟩
-      cases proj with
-      | nil => rfl
-      | cons hd tl =>
-        simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
-        cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
+  | copyForDeref _ => cases h_pure
   | wrapUnsafeBinder _ _ => rfl
 
 /-- Replace the `Memory` in a normal `MirOutcome` with `mem`. -/
@@ -2727,11 +2713,11 @@ theorem evalRvalue_pushBaseStack
         (evalRvalue locals rv mem localDecls layouts) := by
   cases rv with
   | use op =>
-    dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> repeat' (first | rfl | split)
+    cases op
+    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | rfl | split))
   | «repeat» op count =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> repeat' (first | rfl | split)
+    cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals <;> rfl
   | ref bk place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
     repeat' (first | rfl | split)
@@ -2959,8 +2945,8 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
           cases lookupBorrow s.memory.borrows dstPtr.tag with
           | none => rfl
           | some dstEntry =>
-            rcases srcEntry with ⟨sTag, sLoc, sProj, sPerm, sRangeOff, sRangeLen, sProt, sParent⟩
-            rcases dstEntry with ⟨dTag, dLoc, dProj, dPerm, dRangeOff, dRangeLen, dProt, dParent⟩
+            rcases srcEntry with ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt, sTagParent⟩
+            rcases dstEntry with ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt, dTagParent⟩
             dsimp only
             have h_perm_ok :
                 (sPerm = .disabled ∨ dPerm = .frozen ∨ dPerm = .disabled) ∨
@@ -2980,8 +2966,8 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
                     evalCopySingleDirect
                       (MachineState.pushBaseStack calleeBody baseStack s)
                       src dst localDecls layouts srcPtr dstPtr
-                      ⟨sTag, sLoc, sProj, sPerm, sRangeOff, sRangeLen, sProt, sParent⟩
-                      ⟨dTag, dLoc, dProj, dPerm, dRangeOff, dRangeLen, dProt, dParent⟩ locals₃
+                      ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt, sTagParent⟩
+                      ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt, dTagParent⟩ locals₃
                    | false =>
                     let srcRootSlot : Option LocalSlot :=
                       match get? locals₃ sLoc with
@@ -3174,8 +3160,8 @@ theorem evalCopyNonOverlappingWithCount_pushBaseStack
                           (Nat.beq dstPtr.offsetBytes 0)) with
                      | true =>
                       evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr
-                        ⟨sTag, sLoc, sProj, sPerm, sRangeOff, sRangeLen, sProt, sParent⟩
-                        ⟨dTag, dLoc, dProj, dPerm, dRangeOff, dRangeLen, dProt, dParent⟩ locals₃
+                        ⟨sTag, sLoc, sProj, sPerm, sParent, sRange, sProt, sTagParent⟩
+                        ⟨dTag, dLoc, dProj, dPerm, dParent, dRange, dProt, dTagParent⟩ locals₃
                      | false =>
                       let srcRootSlot : Option LocalSlot :=
                         match get? locals₃ sLoc with
