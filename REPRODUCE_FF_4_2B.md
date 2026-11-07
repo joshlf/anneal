@@ -266,6 +266,29 @@ resolved:
    across all FF-modified files, and confirmed `Proof/WireframeDemo/*.lean`
    remains untouched at `1,421` LOC with zero `BlockCtx` and zero manual `fuel`.
 
+
+### 4.5 Adversarial critique of `[adv B2]` & `[adv A2]` sign-off
+
+`[adv A2]` checked `[adv B2]` (`b03dcfa7`) and found no defects:
+
+- Nothing in `PureMirExec` changed its statement. The only declarations
+  removed are the unreferenced `evalCallTerminatorB` and
+  `evalTerminator_call_eq`. The root cause of Section 4.3, item 1 holds up:
+  each `cases` scrutinee contained an inline `match`, whose local matcher did
+  not `kabstract` against `Trusted`'s matcher in `evalTerminator`. Casing on
+  `expected` and `currentBody` first removes the hidden dependency, and with
+  it the seven stale `evalCallTerminator` `dsimp` entries.
+- The diff adds no `sorry`, `admit`, `sorryAx`, `native_decide`, or `axiom`.
+  `Proof/WireframeDemo/*.lean` is untouched at `1,421` lines, with no
+  `BlockCtx` and no manual fuel.
+- The receipts in Section 5 hold on the final commit. The commit chain is
+  `2109bdec` (`[adv A0]` merge, parents `1642f8aa` and `087b015b`) →
+  `36ae7001` (`[adv B1]`) → `8cd564ba` (`[adv A1]`) → `b03dcfa7`
+  (`[adv B2]`) → `[adv A2]`.
+
+Every pass ran with reduced model diversity (Section 7). A 3rd-party
+(different-model) audit is still required before this unit lands.
+
 ## 5. Receipts at `[adv B2]`
 
 See the `[B2 -> A2]` board post for the verbatim outputs.
