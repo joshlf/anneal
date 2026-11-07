@@ -874,8 +874,8 @@ def liftExactDivU32FnDefTy : Ty :=
 
 /--
 Calling `core::intrinsics::exact_div::<u32>(7_u32, 2_u32)` with a non-zero
-remainder (`7 % 2 != 0`): `evalExactDiv` returns `none`, so `evalCallTerminator`
-faults with `.ub`.
+remainder (`7 % 2 != 0`): `evalExactDiv` returns `none`, so the call branch of
+`evalTerminator` faults with `.ub`.
 -/
 def liftBadExactDivMir : CapturedMir :=
   mkMirBody "ff33::bad_exact_div" 0

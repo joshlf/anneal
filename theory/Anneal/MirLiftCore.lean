@@ -940,7 +940,8 @@ constants (including generic items and trait methods resolved through
 `callIndirect`/`tailCallIndirect` for calls through a reified function pointer
 or `ClosureFnPointer`-coerced non-capturing closure resolved via
 `Memory.fnPtrs`, and `callExactDiv` for direct calls to
-`core::intrinsics::exact_div` evaluated inline by `evalCallTerminator`.
+`core::intrinsics::exact_div` evaluated inline by `evalTerminator`'s call
+branch.
 
 There are deliberately no rules for diverging calls (`target = none`), failed
 assertions, or `TerminatorKind.unwindResume`: in MIR that rustc emits, none of
@@ -1093,9 +1094,10 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .call func argOps destination (some targetBb) unwind, span := span }
   /--
   Inline `core::intrinsics::exact_div` call (`isDirectExactDivTarget`): when no
-  linked override exists in `mem.callees`, `evalCallTerminator` evaluates
-  `evalExactDiv` on the two scalar arguments and writes `.scalar retScalar` to
-  `destination` in the current frame.
+  linked override exists in `mem.callees`, `evalTerminator`'s call branch
+  evaluates `evalExactDiv` on the two scalar arguments, with the signedness
+  that `resolveIntrinsicIsSigned` reads from the call's type arguments, and
+  writes `.scalar retScalar` to `destination` in the current frame.
   -/
   | callExactDiv {func lhsOp : Operand} {rhsOps : List Operand}
       {destination : Place} {targetBb : BasicBlockIdx} {unwind : UnwindAction}

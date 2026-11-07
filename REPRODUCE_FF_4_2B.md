@@ -16,7 +16,8 @@ Work unit `FF-4.2b` merges `sup/brief-4` (`087b015b`: BRIEF-0..4, the
 migrated `WireframeDemo`, `FrameTutor`, and `MirVerification` proofs).
 
 > [!IMPORTANT]
-> Status at `[adv B1]`: **100% GREEN** across all Rust tests (`56 passed`),
+> Status at `[adv A1]` (unchanged from `[adv B1]`): **100% GREEN** across all
+> Rust tests (`56 passed`),
 > `lake build Anneal MirVerification` (including `Anneal.MirLift`),
 > `python3 trusted/audit/check_trusted.py --fast` (`PASS`, `40` Trusted modules,
 > `9,589` Trusted kernel declarations, `24,294` replayed declarations), and
@@ -123,6 +124,8 @@ equals an older merge-base blob, while `087b015b`'s blob is the newer one.
   the call target before splitting on the return block. Proofs written
   against the old `evalCallTerminator` shape can `simp only
   [evalTerminator_call_eq, evalCallTerminatorB]` and keep their case order.
+  `[adv B1]` instead added the private `evalCallTerminatorUnified`, so nothing
+  references this pair any more, but see Section 4.3, item 1.
 - `stepMirFn_extCall_aborts_prop` unfolds the intrinsic helpers.
 
 ### 4.2 Adversarial critique of `[adv A0]` & fixes in `[adv B1]`
@@ -183,9 +186,41 @@ resolved:
    two `SymbolicEvalTests.lean` `simp only` blocks with six constructor-specific
    `rfl` lemmas (`0` collisions across all `31` downstream targets).
 
-## 5. Receipts at `[adv B1]`
+### 4.3 Adversarial critique of `[adv B1]` & fixes in `[adv A1]`
 
-See the `[B1 -> A1]` board post for the verbatim outputs.
+1. **Two restatements of the trusted call step, one of them load-bearing
+   without a reference.** `PureMirExec` carries both `[adv A0]`'s public
+   `evalCallTerminatorB`/`evalTerminator_call_eq` and `[adv B1]`'s private
+   `evalCallTerminatorUnified`/`evalTerminator_call_eq_unified`. Nothing names
+   the first pair, yet deleting it (−186 lines) breaks `rfl` at
+   `PureMirExec.lean:1249`, `1252`, and `9554`–`9565`. The likely cause:
+   elaborating it realizes `evalTerminator` equation or matcher lemmas that
+   later `dsimp`/`rfl` steps depend on. `[adv A1]` restored the pair, because
+   the build needs it. Next step: realize the needed lemma explicitly next to
+   the proofs that rely on it, then delete the pair.
+2. **Stale `evalCallTerminator` references.** `087b015b`'s `evalTerminator`
+   inlines its call branches, so `evalCallTerminator` is no longer the
+   evaluator. Two `MirLiftCore` docstrings and one `MirLiftBench` docstring
+   still said it was. `[adv A1]` fixed them; the `MirLiftCore` one now names
+   `resolveIntrinsicIsSigned` as the source of `exact_div` signedness.
+   (`[adv A1]` also tried deleting the seven `evalCallTerminator` entries in
+   `PureMirExec` `dsimp` lists. That was reverted together with item 1, so
+   they stay until item 1 is understood.)
+3. **Timeout margin.** `[adv B1]` reports `51 s` for a standalone
+   `PureMirExec` compile, against `check_trusted.py`'s `60 s` child limit; on
+   a loaded host this margin is thin. `[adv A1]` did not change
+   `PureMirExec`.
+4. Checked and found accurate: every `tests/mir` statement is unchanged
+   (`[adv B1]` only rewrote proofs and added helpers), no declaration was
+   removed, and the only statement changes are the
+   `classifyRustIntrinsic? … = none := by decide` premises on the four
+   external-call rules and `resolveIntrinsicIsSigned` in
+   `PureMirConvergesWithCallees.call_exact_div`. `087b015b`'s semantics
+   require both.
+
+## 5. Receipts at `[adv A1]`
+
+See the `[A1 -> B2]` board post for the verbatim outputs.
 
 | Check | Result |
 | :--- | :--- |
