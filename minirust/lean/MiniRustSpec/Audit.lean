@@ -1875,6 +1875,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   repointPtr_minirust_noUB
   repointPtr_progress
   repointPtr_minirust_direct
+  ptrSpinLoop_inFragment
+  ptrSpinLoop_translate
+  ptrSpinLoop_step_inv
+  ptrSpinLoop_noUB
+  ptrSpinLoop_diverges
+  ptrSpinLoop_ctxOk
+  ptrSpinLoop_minirust_steps_ok
+  ptrSpinLoop_minirust_diverges_rel
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub
@@ -1923,6 +1931,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   derefIdxWriteRhsUb_converse_error
   derefIdxWriteRhsUb_outcome
   derefIdxWriteRhsUb_minirust_direct
+  derefFieldWriteRhsUb_inFragment
+  derefFieldWriteRhsUb_translate
+  derefFieldWriteRhsUb_anneal_ub
+  derefFieldWriteRhsUb_ctxOk
+  derefFieldWriteRhsUb_minirust_ub_from_start
+  derefFieldWriteRhsUb_converse_error
+  derefFieldWriteRhsUb_outcome
+  derefFieldWriteRhsUb_minirust_direct
   dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct
@@ -2078,6 +2094,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   repointPtr_minirust_noUB
   repointPtr_progress
   repointPtr_minirust_direct
+  ptrSpinLoop_inFragment
+  ptrSpinLoop_translate
+  ptrSpinLoop_step_inv
+  ptrSpinLoop_noUB
+  ptrSpinLoop_diverges
+  ptrSpinLoop_ctxOk
+  ptrSpinLoop_minirust_steps_ok
+  ptrSpinLoop_minirust_diverges_rel
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub
@@ -2126,6 +2150,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   derefIdxWriteRhsUb_converse_error
   derefIdxWriteRhsUb_outcome
   derefIdxWriteRhsUb_minirust_direct
+  derefFieldWriteRhsUb_inFragment
+  derefFieldWriteRhsUb_translate
+  derefFieldWriteRhsUb_anneal_ub
+  derefFieldWriteRhsUb_ctxOk
+  derefFieldWriteRhsUb_minirust_ub_from_start
+  derefFieldWriteRhsUb_converse_error
+  derefFieldWriteRhsUb_outcome
+  derefFieldWriteRhsUb_minirust_direct
   dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct

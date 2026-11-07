@@ -708,7 +708,8 @@ statement-level lemmas of `Correspondence/PointerStep.lean` on which
 `step_correspondence_N` rests for raw pointers.
 
 * In the fragment (`*_inFragment`), and proved end to end through
-  `mirCall_ret`, `mirCall_noUB`, and `mirCall_progress_N` (returns) or
+  `mirCall_ret`, `mirCall_noUB`, and `mirCall_progress_N` (returns),
+  `mirCall_diverges_steps_ok` and `mirCall_diverges_rel_N` (divergence), or
   `mirCall_ub`, `mirCall_steps_error`, and `mirCall_outcome_N` (UB) besides the
   direct runs, both semantics return the same value on `ptrRoundTrip`
   (`&raw mut x`, a read and a write through the pointer, a `PtrToPtr` cast,
@@ -728,13 +729,17 @@ statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `repointPtr` (`&raw mut a[0 of 2]` and `&raw mut a[1 of 2]`, a read through
   a copy of the first pointer, then the same initialized pointer local
   overwritten with the second pointer and written through; `105` for
-  `a = [5, 7]`), and both raise UB on `uninitPtrReadUb` and `uninitPtrWriteUb`
-  (reading or writing through an uninitialized pointer temporary),
-  `deadPtrReadUb` (reading through a pointer temporary after its
+  `a = [5, 7]`); both diverge in lockstep (`StateRelN` + `Reaches`) on
+  `ptrSpinLoop` (`_2 = &raw mut _1` in `bb0`, then `PlaceMention(_2)`,
+  self-assignment `_2 = Offset(copy _2, const 0_usize)`, `_0 = copy (*_2)`,
+  and `(*_2) = copy _0` in `bb1`); and both raise UB on `uninitPtrReadUb` and
+  `uninitPtrWriteUb` (reading or writing through an uninitialized pointer
+  temporary), `deadPtrReadUb` (reading through a pointer temporary after its
   `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an
-  uninitialized pointer temporary), and `derefWriteRhsUb` and
-  `derefIdxWriteRhsUb` (writing an uninitialized rvalue operand through a valid
-  `*mut` pointer to an integer local or to a `ConstantIndex` array element).
+  uninitialized pointer temporary), and `derefWriteRhsUb`,
+  `derefIdxWriteRhsUb`, and `derefFieldWriteRhsUb` (writing an uninitialized
+  rvalue operand through a valid `*mut` pointer to an integer local, to a
+  `ConstantIndex` array element, or to a `TupleSpec` scalar field chain).
 * Outside the fragment (`*_notInFragment`), both semantics agree on
   `arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`) and `dangling`
   (UB on a read after `StorageDead` of the borrowed temporary), and they

@@ -20,12 +20,13 @@ semantics (`runA_sound`, `faultsA_sound`) and, after `minimize`'s translation
 computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`).
 
 `ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `nestedFieldPtr`, `ptrCountdown`,
-`constBorrowLoop`, `repointPtr`, `uninitPtrReadUb`, `uninitPtrWriteUb`,
-`deadPtrReadUb`, `uninitPtrOffsetUb`, `derefWriteRhsUb`, and
-`derefIdxWriteRhsUb` lie in the correspondence fragment (`*_inFragment`), so
-the end-to-end correspondence theorems (`mirCall_ret`, `mirCall_ub`,
-`mirCall_noUB`, `mirCall_progress_N`, `mirCall_steps_error`,
-`mirCall_outcome_N`) apply to them directly. `arrayElemPtr` (borrowing a non-parameter `[u32; 2]` temporary),
+`constBorrowLoop`, `repointPtr`, `ptrSpinLoop`, `uninitPtrReadUb`,
+`uninitPtrWriteUb`, `deadPtrReadUb`, `uninitPtrOffsetUb`, `derefWriteRhsUb`,
+`derefIdxWriteRhsUb`, and `derefFieldWriteRhsUb` lie in the correspondence
+fragment (`*_inFragment`), so the end-to-end correspondence theorems
+(`mirCall_ret`, `mirCall_ub`, `mirCall_noUB`, `mirCall_progress_N`,
+`mirCall_steps_error`, `mirCall_outcome_N`, `mirCall_diverges_steps_ok`,
+`mirCall_diverges_rel_N`) apply to them directly. `arrayElemPtr` (borrowing a non-parameter `[u32; 2]` temporary),
 `dangling`, and every divergent witness below lie outside the fragment
 (`*_notInFragment`): the fragment borrows (`&raw`) only parameters,
 which it never writes directly (`directWrite`) nor kills (`dangling`), casts
@@ -34,7 +35,7 @@ to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
 (`offsetDeref`, `misaligned`), and has no pointer-integer casts
 (`exposeTwice`).
 
-**Agreement.** Both semantics return the same value for
+**Agreement.** Both semantics return the same value (or diverge in lockstep) for
 
 * `ptrRoundTrip`: `&raw mut x`, a read and a write through the pointer, a
   `PtrToPtr` cast to `*const u32`, and a read through the cast pointer;
@@ -67,15 +68,22 @@ to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
   false`) on a `[u32; 2]` parameter, a read through a copy of the first
   pointer, then the same initialized pointer local overwritten with the second
   pointer and written through, which reaches `a[1]`;
+* `ptrSpinLoop`: a diverging UB-free loop that takes `_2 = &raw mut _1` in
+  `bb0` and repeatedly executes `PlaceMention(_2)`, self-assignment
+  `_2 = Offset(copy _2, const 0_usize)`, `_0 = copy (*_2)`, and
+  `(*_2) = copy _0` in `bb1`, staying in lockstep `StateRelN` + `Reaches`
+  for every step count `1 + n` (`mirCall_diverges_steps_ok`,
+  `mirCall_diverges_rel_N`);
 
 and both raise UB for `uninitPtrReadUb` (reading through an uninitialized
 pointer temporary), `uninitPtrWriteUb` (writing through an uninitialized `*mut`
 pointer temporary), `deadPtrReadUb` (reading through a pointer temporary after
 its `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an
-uninitialized pointer temporary), `derefWriteRhsUb` and `derefIdxWriteRhsUb`
-(writing an uninitialized rvalue operand through a valid `*mut` pointer to an
-integer local or to a `ConstantIndex` array element), and `dangling` (a read
-through a pointer to a temporary after its `StorageDead`).
+uninitialized pointer temporary), `derefWriteRhsUb`, `derefIdxWriteRhsUb`, and
+`derefFieldWriteRhsUb` (writing an uninitialized rvalue operand through a valid
+`*mut` pointer to an integer local, to a `ConstantIndex` array element, or to a
+`TupleSpec` scalar field chain), and `dangling` (a read through a pointer to a
+temporary after its `StorageDead`).
 
 **Divergence, Anneal unsound.** Anneal returns a value where MiniRust, the
 ground truth, returns a different value or raises UB:
@@ -1292,6 +1300,166 @@ theorem repointPtr_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 105 }, [1]) := by
   decide +kernel
 
+/-! ## Diverging UB-free raw-pointer loop (`ptrSpinLoop`) -/
+
+/-- MIR of a diverging raw-pointer loop:
+```rust
+fn ptr_spin_loop(mut x: u32) -> u32 {
+    let mut p = &raw mut x;           // bb0: StorageLive(_2); _2 = &raw mut _1
+    let mut acc = unsafe { *p };      //      _0 = copy (*_2); goto -> bb1
+    loop {                            // bb1: PlaceMention(_2)
+        p = unsafe { p.offset(0) };   //      _2 = Offset(copy _2, const 0_usize)
+        acc = unsafe { *p };          //      _0 = copy (*_2)
+        unsafe { *p = acc };          //      (*_2) = copy _0; goto -> bb1
+    }
+}
+```
+Exercises:
+- `PlaceMention(_2)` on an initialized raw-pointer local;
+- self-assignment `_2 = Offset(copy _2, const 0_usize)` where a pointer local
+  is updated in place from itself;
+- repeated dereference reads `_0 = copy (*_2)` and dereference writes
+  `(*_2) = copy _0` across an infinite loop; and
+- the non-scalar / raw-pointer diverging correspondence theorems
+  `mirCall_diverges_steps_ok` and `mirCall_diverges_rel_N` (`StateRelN`). -/
+def ptrSpinLoop : CapturedMir where
+  defPath := "witness::ptr_spin_loop"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, ptrMutU32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.rawPtr .mut (local_ 1))),
+        mkStmt (.assign (local_ 0) (.use (.copy (derefPlace 2))))],
+      terminator := mkTerm (.goto 1),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.placeMention (local_ 2)),
+        mkStmt (.assign (local_ 2) (.binaryOp .offset (.copy (local_ 2)) (constUsize 0))),
+        mkStmt (.assign (local_ 0) (.use (.copy (derefPlace 2)))),
+        mkStmt (.assign (derefPlace 2) (.use (.copy (local_ 0))))],
+      terminator := mkTerm (.goto 1),
+      isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem ptrSpinLoop_inFragment : inFragment ptrSpinLoop = true := by decide
+
+def ptrSpinLoopFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, thinRawPtrTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (.Raw .None)),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32)))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .PlaceMention (.Local (localName 2)),
+      .Assign (.Local (localName 2))
+        (.BinOp (.PtrOffset true) (.Load (.Local (localName 2)))
+          (.BinOp (.Int .MulUnchecked) (.Constant (.Int 0) (.Int usizeIt))
+            (.Constant (.Int 4) (.Int usizeIt)))),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32)) (.Load (.Local (localName 0)))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 2, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 2
+  implicit_writes := true
+
+theorem ptrSpinLoop_translate : translateFn ptrSpinLoop = some ptrSpinLoopFn := rfl
+
+def ptrSpinLoopS0 : MachineState := initMachineState ptrSpinLoop [.scalar ⟨5, 4⟩]
+
+/-- Advance `s` by `k` silent `.tau` steps of `ptrSpinLoop`. -/
+def stepPtrSpinN : Nat → MachineState → MachineState
+  | 0, s => s
+  | k + 1, s =>
+    match stepMirFn ptrSpinLoop s with
+    | .tau (.running s') => stepPtrSpinN k s'
+    | _ => s
+
+/-- The 9 reachable Anneal states of `ptrSpinLoop` (4 in `bb0` and 5 cycling in `bb1`). -/
+def PtrSpinInv (s : MachineState) : Prop :=
+  s = stepPtrSpinN 0 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 1 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 2 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 3 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 4 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 5 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 6 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 7 ptrSpinLoopS0 ∨
+  s = stepPtrSpinN 8 ptrSpinLoopS0
+
+theorem ptrSpinLoop_step_inv :
+    ∀ s, PtrSpinInv s → ∃ s', stepMirFn ptrSpinLoop s = .tau (.running s') ∧ PtrSpinInv s' := by
+  intro s hinv
+  rcases hinv with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · exact ⟨stepPtrSpinN 1 ptrSpinLoopS0, rfl, Or.inr (Or.inl rfl)⟩
+  · exact ⟨stepPtrSpinN 2 ptrSpinLoopS0, rfl, Or.inr (Or.inr (Or.inl rfl))⟩
+  · exact ⟨stepPtrSpinN 3 ptrSpinLoopS0, rfl, Or.inr (Or.inr (Or.inr (Or.inl rfl)))⟩
+  · exact ⟨stepPtrSpinN 4 ptrSpinLoopS0, rfl, Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))⟩
+  · exact ⟨stepPtrSpinN 5 ptrSpinLoopS0, rfl,
+      Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))⟩
+  · exact ⟨stepPtrSpinN 6 ptrSpinLoopS0, rfl,
+      Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))))⟩
+  · exact ⟨stepPtrSpinN 7 ptrSpinLoopS0, rfl,
+      Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))))⟩
+  · exact ⟨stepPtrSpinN 8 ptrSpinLoopS0, rfl,
+      Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr rfl)))))))⟩
+  · exact ⟨stepPtrSpinN 4 ptrSpinLoopS0, rfl, Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))⟩
+
+/-- `ptrSpinLoop(5)` is UB-free across its infinite interaction tree. -/
+theorem ptrSpinLoop_noUB : MirNoUBTree (mirCallTree ptrSpinLoop [.scalar ⟨5, 4⟩]) :=
+  treeSafe_of_tau_inv ptrSpinLoop_step_inv (Or.inl rfl)
+
+/-- `ptrSpinLoop(5)` never reaches a return outcome. -/
+theorem ptrSpinLoop_diverges (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet (mirCallTree ptrSpinLoop [.scalar ⟨5, 4⟩]) tr o :=
+  noRet_of_tau_inv ptrSpinLoop_step_inv (Or.inl rfl) tr o
+
+theorem ptrSpinLoop_ctxOk : CtxOk ptrSpinLoop ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : ptrSpinLoop.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [ptrSpinLoop] at hd; subst hd; decide
+    | 1, hd, _ => simp [ptrSpinLoop] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : ptrSpinLoop.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [ptrSpinLoop] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def ptrSpinLoopMInit : Mach :=
+  machine ptrSpinLoop ptrSpinLoopFn ptrSpinLoopS0.frame.locals ptrSpinLoopFn.start
+
+/-- MiniRust started at `ptrSpinLoopFn.start` succeeds for every step count `n : Nat`. -/
+theorem ptrSpinLoop_minirust_steps_ok (n : Nat) :
+    ∃ m', Interp.steps n ptrSpinLoopMInit = .ok m' :=
+  mirCall_diverges_steps_ok ptrSpinLoop_inFragment ptrSpinLoop_translate ctx0 ptrSpinLoop_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) ptrSpinLoopMInit rfl rfl rfl ptrSpinLoop_noUB ptrSpinLoop_diverges n
+
+/-- Stronger lockstep divergence witness via `mirCall_diverges_rel_N`: for every
+`n : Nat`, `1 + n` MiniRust steps from `ptrSpinLoopFn.start` stay in `StateRelN`
+with an Anneal state reachable via `Reaches (mirCallTree ptrSpinLoop [5])`. -/
+theorem ptrSpinLoop_minirust_diverges_rel (n : Nat) :
+    ∃ s' m' tr, Interp.steps (1 + n) ptrSpinLoopMInit = .ok m' ∧
+      StateRelN ptrSpinLoop ptrSpinLoopFn ctx0 s' m' ∧
+      Reaches (mirCallTree ptrSpinLoop [.scalar ⟨5, 4⟩]) tr (mirTree ptrSpinLoop s') :=
+  mirCall_diverges_rel_N ptrSpinLoop_inFragment ptrSpinLoop_translate ctx0 ptrSpinLoop_ctxOk
+    [.scalar ⟨5, 4⟩] (by decide) ptrSpinLoopMInit rfl rfl rfl ptrSpinLoop_noUB ptrSpinLoop_diverges n
+
 /-! ## Uninitialized pointer dereference UB (in fragment) -/
 
 /-- Reading through an uninitialized `*const u32` pointer temporary `_2`:
@@ -1851,6 +2019,113 @@ theorem derefIdxWriteRhsUb_outcome (n : Nat) :
 
 theorem derefIdxWriteRhsUb_minirust_direct :
     ubAfter derefIdxWriteRhsUb [initArrU32_2] 5 =
+      some "load at type but the data in memory violates the language invariant" := by
+  decide +kernel
+
+/-- Writing an uninitialized rvalue through a valid `*mut` pointer to the
+scalar field `_1.1: u32` of a `TupleSpec` struct parameter (`Padded`):
+```text
+StorageLive(_2); StorageLive(_3); _2 = &raw mut (_1.1: u32); (*_2) = copy _3;
+_0 = copy (_1.1: u32); return
+```
+Completes the 3-way target case split of `derefWrite_target` alongside
+`derefWriteRhsUb` (whole integer local) and `derefIdxWriteRhsUb` (`ConstantIndex`
+array element): both semantics fault on the uninitialized RHS in the
+`TupleSpec` field-chain branch of `derefWrite_target`. -/
+def derefFieldWriteRhsUb : CapturedMir :=
+  { ptrBody "witness::deref_field_write_rhs_ub"
+      [u32Decl, paddedStructDecl, ptrMutU32Decl, u32Decl]
+      [.storageLive 2, .storageLive 3,
+       .assign (local_ 2) (.rawPtr .mut (placeField 1 [(1, u32Ty)])),
+       .assign (derefPlace 2) (.use (.copy (local_ 3))),
+       .assign (local_ 0) (.use (.copy (placeField 1 [(1, u32Ty)])))] with
+    fnAbi := fnAbiPaddedArg, layouts := paddedLayouts }
+
+theorem derefFieldWriteRhsUb_inFragment : inFragment derefFieldWriteRhsUb = true := by decide
+
+def derefFieldWriteRhsUbFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, paddedMiniRustTy),
+    (localName 2, thinRawPtrTy), (localName 3, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .Assign (.Local (localName 2)) (.AddrOf (.Field (.Local (localName 1)) 1) (.Raw .None)),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32)) (.Load (.Local (localName 3))),
+      .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem derefFieldWriteRhsUb_translate :
+    translateFn derefFieldWriteRhsUb = some derefFieldWriteRhsUbFn := rfl
+
+def derefFieldWriteRhsUbS0 : MachineState :=
+  initMachineState derefFieldWriteRhsUb [initPaddedStruct]
+def derefFieldWriteRhsUbMInit : Mach :=
+  machine derefFieldWriteRhsUb derefFieldWriteRhsUbFn derefFieldWriteRhsUbS0.frame.locals
+    derefFieldWriteRhsUbFn.start
+
+theorem derefFieldWriteRhsUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr u ∧ FaultNow u :=
+  faultsA_sound derefFieldWriteRhsUb 10 _ (by decide)
+
+theorem derefFieldWriteRhsUb_ctxOk : CtxOk derefFieldWriteRhsUb ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : derefFieldWriteRhsUb.layouts = paddedLayouts := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [derefFieldWriteRhsUb, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [derefFieldWriteRhsUb, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : derefFieldWriteRhsUb.layouts = paddedLayouts := rfl
+    rw [hlay]
+    simp [derefFieldWriteRhsUb, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem derefFieldWriteRhsUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n derefFieldWriteRhsUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := derefFieldWriteRhsUb_anneal_ub
+  exact mirCall_ub derefFieldWriteRhsUb_inFragment derefFieldWriteRhsUb_translate ctx0
+    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide) derefFieldWriteRhsUbMInit rfl rfl rfl
+    hr hf
+
+theorem derefFieldWriteRhsUb_converse_error {n : Nat} {e : Stop}
+    (herr : Interp.steps n derefFieldWriteRhsUbMInit = .error e) :
+    (∃ msg, e = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k derefFieldWriteRhsUbMInit = .ok mRet ∧
+      ReturnRel derefFieldWriteRhsUb ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr (.normal (v, mem))) :=
+  mirCall_steps_error derefFieldWriteRhsUb_inFragment derefFieldWriteRhsUb_translate ctx0
+    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide) derefFieldWriteRhsUbMInit rfl rfl rfl
+    herr
+
+theorem derefFieldWriteRhsUb_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) derefFieldWriteRhsUbMInit = .ok m' ∧
+      StateRelN derefFieldWriteRhsUb derefFieldWriteRhsUbFn ctx0 s' m' ∧
+      Reaches (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr
+        (mirTree derefFieldWriteRhsUb s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k derefFieldWriteRhsUbMInit = .ok mRet ∧
+      ReturnRel derefFieldWriteRhsUb ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (1 + n) derefFieldWriteRhsUbMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree derefFieldWriteRhsUb [initPaddedStruct]) tr u ∧ FaultNow u) :=
+  mirCall_outcome_N derefFieldWriteRhsUb_inFragment derefFieldWriteRhsUb_translate ctx0
+    derefFieldWriteRhsUb_ctxOk [initPaddedStruct] (by decide) derefFieldWriteRhsUbMInit rfl rfl rfl
+    n
+
+theorem derefFieldWriteRhsUb_minirust_direct :
+    ubAfter derefFieldWriteRhsUb [initPaddedStruct] 5 =
       some "load at type but the data in memory violates the language invariant" := by
   decide +kernel
 
