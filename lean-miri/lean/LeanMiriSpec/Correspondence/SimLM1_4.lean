@@ -159,14 +159,14 @@ theorem MemPlaceRel.of_filter_live {mach : AnnealMachine} {id : Miri.Memory.Allo
       ty layouts optVal mp := by
   cases h with
   | mk allocId tag baseAddr relOffset localAlloc hprov hmis hmeta hl hb hovf hptr hmut halign
-      hbounds huninit hval hscalar =>
+      hbounds huninit hval hscalar harray =>
     have hne' : allocId ≠ id := by
       intro heq
       apply hne
       rw [hprov, heq]
       rfl
     refine .mk allocId tag baseAddr relOffset localAlloc hprov hmis hmeta ?_ hb hovf hptr hmut
-      halign hbounds huninit hval hscalar
+      halign hbounds huninit hval hscalar harray
     simp only [Array.toList_filter, List.mem_filter]
     exact ⟨hl, by simp [hne']⟩
 
@@ -1139,9 +1139,9 @@ theorem MemPlaceRel.of_live_base {mach mach' : AnnealMachine} {ty : Ty} {layouts
     MemPlaceRel mach' ty layouts optVal mp := by
   cases h with
   | mk allocId tag baseAddr relOffset localAlloc hprov hmis hmeta hl hb hovf hptr hmut halign
-      hbounds huninit hval hscalar =>
+      hbounds huninit hval hscalar harray =>
     exact .mk allocId tag baseAddr relOffset localAlloc hprov hmis hmeta (hlive _ hl)
-      (by rw [hbase _ _ hl]; exact hb) hovf hptr hmut halign hbounds huninit hval hscalar
+      (by rw [hbase _ _ hl]; exact hb) hovf hptr hmut halign hbounds huninit hval hscalar harray
 
 /-- `MemPlaceRel.of_live_base` lifted to `LocalRel`. -/
 theorem LocalRel.of_live_base {mach mach' : AnnealMachine} {decl : LocalDecl}
@@ -1323,7 +1323,21 @@ theorem stackAlloc_memPlaceRel {mach : AnnealMachine} {mem' : AnnealMemory}
       ∃ msc, ScalarRel sc msc ∧
         alloc'.readScalar annealTargetDataLayout
           (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateTy ty layouts).layout.size)
-          false = .ok (.fromScalarInt msc)) :
+          false = .ok (.fromScalarInt msc))
+    (harray : ∀ elemKind count elems,
+      ty.kind = .array elemKind count →
+      optVal = some (.aggregate 0 elems) →
+      (translateTy ty layouts).layout.fields =
+        .Array (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size
+          (UInt64.ofNat count) ∧
+      (translateTy ty layouts).layout.size =
+        Miri.ABI.Size.ofBytes
+          (UInt64.ofNat
+            (count *
+              (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size.bytes.toNat)) ∧
+      (translateTy ty layouts).layout.align =
+        (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.align ∧
+      ArraySliceRel elemKind count layouts elems Miri.ABI.Size.ZERO alloc') :
     MemPlaceRel (stackAllocMachine mach mem' id alloc') ty layouts optVal (stackAllocPlace id) :=
   .mk id .one (annealStackBaseAddr id) Miri.ABI.Size.ZERO ⟨.stack, alloc'⟩ rfl rfl rfl
     (by simp [stackAllocMachine])
@@ -1333,7 +1347,7 @@ theorem stackAlloc_memPlaceRel {mach : AnnealMachine} {mem' : AnnealMemory}
     hmut
     (annealStackBaseAddr_isAligned id _ halign)
     (by simp [Miri.ABI.Size.ZERO, hsize])
-    huninit hval hscalar
+    huninit hval hscalar harray
 
 /-- `StateRel` after `forceAllocation` moves the immediate local `idx` into the
 fresh allocation `id`, given the new local's `LocalRel.indirect`. -/
@@ -1562,6 +1576,11 @@ theorem forceAllocation_preserves_StateRel
                   · cases hv
                   · cases himm with
                     | unit hzero => cases hv
+                · intro _ _ _ _ hv
+                  rcases hslotv with ⟨rfl, _⟩ | ⟨v', rfl, himm⟩
+                  · cases hv
+                  · cases himm with
+                    | unit hzero => cases hv
               refine ⟨stackAlloc_stateRel hretCont hretPlace hfr hcal hstack hbor hprot hcaller hdisj
                 hdecl hlt hslot hres hlt' hnew, ?_⟩
               intro fi' li' id' href
@@ -1623,6 +1642,7 @@ theorem forceAllocation_preserves_StateRel
                         injection hv with hv
                         subst hv
                         exact ⟨hsz, hbool, hchar, msc, hrel, by rw [hsz]; exact hread''⟩
+                      · intro _ _ _ _ hv; cases hv
                     refine ⟨stackAlloc_stateRel hretCont hretPlace hfr hcal hstack hbor hprot hcaller
                       hdisj hdecl hlt hslot hres hlt' hnew, ?_⟩
                     intro fi' li' id' href

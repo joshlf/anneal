@@ -596,6 +596,7 @@ theorem indirect_localRel_uninit_witness :
     (fun _ _ => by decide)
     (fun _ h _ => nomatch h)
     (fun _ h => nomatch h)
+    (fun _ _ _ _ h => nomatch h)
 
 /-- Concrete `LocalRel.indirect` witness for an initialized `42_u8` scalar slot at
 non-zero `baseAddr = 0x1000` and `relOffset = 4` (`mp.ptr.offset = 0x1004`). -/
@@ -622,6 +623,7 @@ theorem indirect_localRel_scalar_witness :
     (fun h _ => nomatch h)
     (fun _ _ _ => by decide)
     ?_
+    (fun _ _ _ _ h => nomatch h)
   intro sc h
   injection h with hv
   injection hv with hsc

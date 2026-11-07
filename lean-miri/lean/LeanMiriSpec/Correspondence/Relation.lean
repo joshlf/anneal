@@ -168,7 +168,61 @@ theorem of_primitive_scalar
 
 end ImmediateRel
 
-/-! ## 2. Memory-Backed Place & Local Storage Correspondence (`MemPlaceRel`, `LocalRel`) -/
+/-! ## 2. Memory-Backed Place & Local Storage Correspondence (`ArraySliceRel`, `MemPlaceRel`, `LocalRel`) -/
+
+/-- Byte-slice correspondence between an Anneal homogeneous scalar array value
+`Value.aggregate 0 elems` for type `RigidTy.array elemKind count` (with element
+type `elemTy := { kind := elemKind, layoutIdx := 0 }` and element stride
+`elemSize := (translateTy elemTy layouts).layout.size`) and a contiguous
+allocation slice starting at allocation-relative offset `relOffset` inside
+`alloc`.
+
+Every element `k < count` (`elems[k] = .scalar sc`) has stride-aligned offset
+`elemOff := Size.ofBytes (relOffset.bytes + UInt64.ofNat (k * elemSize.bytes.toNat))`,
+satisfies scalar domain validity (`bool` / `char` / byte width), and decodes via
+`alloc.readScalar` to a `ScalarRel`-related `ScalarInt`. -/
+structure ArraySliceRel
+    (elemKind : RigidTy)
+    (count : Nat)
+    (layouts : LayoutTable)
+    (elems : List Value)
+    (relOffset : Miri.ABI.Size)
+    (alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)) : Prop where
+  /-- The Anneal element list has length `count`. -/
+  elems_len : elems.length = count
+  /-- The backing byte array has length equal to `alloc.byteSize.bytes.toNat`. -/
+  alloc_len : alloc.len = alloc.byteSize.bytes.toNat
+  /-- The allocation is mutable. -/
+  alloc_mut : alloc.mutability = .Mut
+  /-- Homogeneous scalar array allocations carry no pointer provenance entries. -/
+  alloc_prov : alloc.provenanceMap = Miri.Memory.ProvenanceMap.new
+  /-- Array allocations have an initialized lazy mask (`InitMask.new alloc.byteSize true`). -/
+  alloc_mask :
+    alloc.initializationMask = Miri.Memory.InitMask.new alloc.byteSize true
+  /-- The contiguous slice `[relOffset, relOffset + count * elemSize)` fits in `alloc`. -/
+  slice_in_bounds :
+    relOffset.bytes.toNat +
+      count * (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size.bytes.toNat ≤
+        alloc.byteSize.bytes.toNat
+  /-- Every element `k < count` is a scalar whose contiguous slice at
+  `relOffset + k * elemSize` decodes via `alloc.readScalar` to a `ScalarRel`-matching
+  `ScalarInt`. -/
+  elem_rel :
+    ∀ (k : Nat) (elemVal : Value),
+      get? elems k = some elemVal →
+      let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
+      let elemLay := (translateTy elemTy layouts).layout
+      let elemOff := Miri.ABI.Size.ofBytes (relOffset.bytes + UInt64.ofNat (k * elemLay.size.bytes.toNat))
+      ∃ sc msc,
+        elemVal = .scalar sc ∧
+        elemLay.size = translateSizeBytes sc.sizeBytes ∧
+        (elemKind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) ∧
+        (elemKind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true) ∧
+        ScalarRel sc msc ∧
+        alloc.readScalar
+          annealTargetDataLayout
+          (Miri.Memory.allocRange elemOff elemLay.size)
+          false = .ok (.fromScalarInt msc)
 
 /-- Simulation relation between an optional Anneal `Value` (`none` for uninitialized
 storage, `some v` for initialized storage) at type `ty` and a memory-backed
@@ -241,7 +295,22 @@ inductive MemPlaceRel
             localAlloc.allocation.readScalar
               annealTargetDataLayout
               (Miri.Memory.allocRange relOffset ((translateTy ty layouts).layout.size))
-              false = .ok (.fromScalarInt msc)) :
+              false = .ok (.fromScalarInt msc))
+      (array_consistent :
+        ∀ elemKind count elems,
+          ty.kind = .array elemKind count →
+          optVal = some (.aggregate 0 elems) →
+          (translateTy ty layouts).layout.fields =
+            .Array (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size
+              (UInt64.ofNat count) ∧
+          (translateTy ty layouts).layout.size =
+            Miri.ABI.Size.ofBytes
+              (UInt64.ofNat
+                (count *
+                  (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size.bytes.toNat)) ∧
+          (translateTy ty layouts).layout.align =
+            (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.align ∧
+          ArraySliceRel elemKind count layouts elems relOffset localAlloc.allocation) :
       MemPlaceRel mach ty layouts optVal mp
 
 namespace MemPlaceRel
