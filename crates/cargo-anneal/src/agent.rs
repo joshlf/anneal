@@ -1314,6 +1314,7 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let mut block_depth = 0usize;
+    let mut in_str = false;
 
     while i < bytes.len() {
         if block_depth > 0 {
@@ -1323,11 +1324,56 @@ pub(crate) fn strip_lean_comments(input: &str) -> String {
             } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'/' {
                 block_depth -= 1;
                 i += 2;
-                out.push(' ');
+                if block_depth == 0 {
+                    out.push(' ');
+                }
             } else {
                 i += 1;
             }
             continue;
+        }
+
+        if in_str {
+            if bytes[i] == b'\\' {
+                out.push('\\');
+                i += 1;
+                if let Some(ch) = input[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if bytes[i] == b'"' {
+                in_str = false;
+                out.push('"');
+                i += 1;
+            } else if let Some(ch) = input[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+
+        // Preserve character literals such as `'"'` or `'-'` so they never
+        // start a string literal or line comment.
+        if bytes[i] == b'\'' {
+            if i + 2 < bytes.len() && bytes[i + 1] != b'\\' && bytes[i + 2] == b'\'' {
+                out.push_str(&input[i..i + 3]);
+                i += 3;
+                continue;
+            }
+            if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
+                out.push_str(&input[i..i + 4]);
+                i += 4;
+                continue;
+            }
         }
 
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
@@ -1568,20 +1614,20 @@ fn render_lifting_strategy_guide_section() -> &'static str {
     "## Proof Lifting Strategy Guide (Lift First, Evaluate Last)\n\n\
      - **`TrustedBoundary` & Zero-Fuel Discipline**:\n  \
        - `Proof/<Crate>/<Item>.lean` is re-parsed under `Init`/`Std` syntax by `TrustedBoundary.lean` (`elab`, `macro`, `syntax`, `sorry`, `native_decide`, and unauthorized `axiom` are rejected).\n  \
-       - `#mir_lift` (`Anneal.MirLift`) is an interactive elaborator outside `TrustedBoundary`; inside `Proof/*.lean`, import `Anneal` and apply the lifting theorems directly with zero `BlockCtx` records and zero manual fuel or `iterate k` counts.\n\
+       - `#mir_lift` (`Anneal.MirLift`) is an interactive elaborator for closed (`argCount = 0`) bodies outside `TrustedBoundary`; inside `Proof/*.lean`, import `Anneal`, open the lifting namespaces (`open Anneal.PureMirExec Anneal.MirLiftCore`, plus `Anneal.MirLoops` / `Anneal.SepLogicLenses` as needed), and apply the lifting theorems directly with zero `BlockCtx` records and zero manual fuel or `iterate k` counts.\n\
      - **Pattern A — Pure Scalar/ADT/Array MIR (`#mir_lift` rules in `Anneal.PureMirExec` + `Anneal.MirLiftCore`)**:\n  \
-       - Check `#eval Anneal.PureMirExec.checkPureMir Mir.<Item>.body`. When `true`, bridge with `verifyMirNoPanic_of_pureExec`, `verifyMirSafe_of_pureExec`, `verifyTotalMir_of_pureExec`, or `verifyStatefulMirNoPanic_of_pureExec`.\n  \
+       - Check `#eval Anneal.PureMirExec.checkPureMir Mir.<Item>.body`. When `true`, `open Anneal.PureMirExec Anneal.MirLiftCore` and bridge with `verifyMirNoPanic_of_pureExec`, `verifyMirSafe_of_pureExec`, `verifyTotalMir_of_pureExec`, or `verifyStatefulMirNoPanic_of_pureExec`.\n  \
        - Step blocks structurally via `lift_PureMirConverges (by rfl)`, `LiftBlock.of_lookup (by rfl)`, and `LiftStmtsTerminator.{cons_eval, cons_eval_norm, eval_rest, term_assert, term_switchInt, term_goto, term_drop, term_return}` (`eval_rest` / `cons_eval_norm` normalize `PureEnv` updates via `forcePureEnv?`).\n  \
        - For linked pure callees or modular call contracts, use `checkPureMirWithCallees` (`verifyStatefulMirNoPanic_of_pureExecWithCallees_any`, `PureMirConverges.call_summary`) or `PureMirModularConverges` (`verifyModularMir_of_pureModularExec_any`).\n\
-     - **Pattern B — Companion `#[spec]` Predicates (`#mir_lift_spec` in `Anneal.PureMirExec` + `Anneal.MirLiftCore`)**:\n  \
-       - When `checkPureMir` holds on a companion body, use `mirBoolPredicateHolds_of_pureExec`, `mirBoolPredicateHolds_intro_of_pureExec`, `mirBoolPredicateHolds_elim_of_pureExec`, or `mirBoolPredicateHolds_elim_of_uniqueTruePath` (or `mirBoolPredicateHoldsWithCallees_of_checkPureMirBoolPredWithCallees` with `defaultSpecCallees`).\n  \
+     - **Pattern B — Companion `#[spec]` Predicates (`#mir_lift_spec` theorems in `Anneal.PureMirExec` + `Anneal.MirLiftCore`)**:\n  \
+       - When `checkPureMir` holds on a companion body, use the `#mir_lift_spec` theorem family (`mirBoolPredicateHolds_of_pureExec`, `mirBoolPredicateHolds_intro_of_pureExec`, `mirBoolPredicateHolds_elim_of_pureExec`, or `mirBoolPredicateHolds_elim_of_uniqueTruePath`, and `mirBoolPredicateHoldsWithCallees_of_checkPureMirBoolPredWithCallees` with `defaultSpecCallees`).\n  \
        - When a `#[spec]` companion captures arguments by `&` reference (`Rvalue.ref` / `ProjectionElem.deref`, so `checkPureMir = false`), invert `requires` via `holdBoolReq_of_mirBool` with count-free `repeat`, discharge `ensures` via `hold_mirBool_of_blockLinear` (`defaultSpecSteps`), and prove concrete witnesses via `mirBoolPredicateHolds_of_evalMirSpecBool_true`.\n\
      - **Pattern C — Loops (`forRangeUp` + `runCfgToBlock` in `Anneal.MirLoops` + `Anneal.MirLiftCore`)**:\n  \
-       - Model `for i in lo..hi` / `while i < hi` loops with `Anneal.MirLoops.forRangeUp` (`forRangeUp_induction`, `mirWpConverges_forRangeUp`, `mirNoCallWpConverges_forRangeUp`, or `mirWpConverges_whileRank` for rank-decreasing loops).\n  \
-       - Step loop entry, single iterations, and exit to the loop-header block without step numerals via `Anneal.MirLiftCore.runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, `mirWpConverges_of_runCfgToBlock`, `mirNoCallWpConverges_of_runCfgToBlock`), and close with `verifyStatefulMirNoPanic_of_wpConverges` or `verifyStatefulEquivMir_of_wpConverges`.\n\
-     - **Pattern D — `&mut` / `&` References (`Anneal.SepLogicLenses`)**:\n  \
-       - Erase Tree Borrows and `Memory` aliasing via whole-slot `SepLensStateInv` (`ActiveTypedMutBorrow`, `treeMemoryPtrMutLens`) or sibling-field `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`, `treeFieldMemoryPtrMutLens`, `subplaceTreeMutLens`).\n  \
-       - Derive `LiftLensBlock` (`LiftLensStmts`, `set?_of_forcePureEnv? rfl`) and conclude with `verifyStatefulMir_of_sepLenses`, `verifyStatefulMir_of_sepSubplaceLenses`, `mirWpConverges_of_sepLenses`, or `verifyTotalMir_of_sepLenses`.\n\n"
+       - `open Anneal.MirLoops Anneal.MirLiftCore` and model `for i in lo..hi` / `while i < hi` loops with `forRangeUp` (`forRangeUp_induction`, `mirWpConverges_forRangeUp`, `mirNoCallWpConverges_forRangeUp`, or `mirWpConverges_whileRank` for rank-decreasing loops).\n  \
+       - Step loop entry, single iterations, and exit to the loop-header block without step numerals via `runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, `mirWpConverges_of_runCfgToBlock`, `mirNoCallWpConverges_of_runCfgToBlock`), and close with `verifyStatefulMirNoPanic_of_wpConverges` or `verifyStatefulEquivMir_of_wpConverges`.\n\
+     - **Pattern D — `&mut` References (`Anneal.SepLogicLenses`) & Shared `&` Reads**:\n  \
+       - For `&mut` borrows, `open Anneal.SepLogicLenses Anneal.MirLiftCore`, erase Tree Borrows and `Memory` aliasing via whole-slot `SepLensStateInv` (`ActiveTypedMutBorrow`, `treeMemoryPtrMutLens`) or sibling-field `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`, `treeFieldMemoryPtrMutLens`, `subplaceTreeMutLens`), derive `LiftLensBlock` (`LiftLensStmts`, `set?_of_forcePureEnv? rfl`), and conclude with `verifyStatefulMir_of_sepLenses`, `verifyStatefulMir_of_sepSubplaceLenses`, `mirWpConverges_of_sepLenses`, or `verifyTotalMir_of_sepLenses`.\n  \
+       - For shared `&T` / `*const T` reads without `&mut` borrows, step intraprocedurally via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, `verifyStatefulMirNoPanic_of_wpConverges`) or `dischargeStatefulEqFuelFree` on concrete pinned memory.\n\n"
 }
 
 fn render_item_lifting_guidance(
@@ -1594,6 +1640,11 @@ fn render_item_lifting_guidance(
     let is_modular = authored.is_modular
         || (!authored.has_specs
             && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
+    let is_bit_validity_item = matches!(
+        bundle.subject.item_kind,
+        anneal_rustc_capture::CapturedItemKind::TypeInvariant
+            | anneal_rustc_capture::CapturedItemKind::UnsafeTraitImpl
+    );
 
     let mut out = String::from("### Recommended Lifting Strategy\n\n");
     if profile.has_captured_mir {
@@ -1607,43 +1658,52 @@ fn render_item_lifting_guidance(
         ));
     }
 
+    if is_bit_validity_item {
+        out.push_str(
+            "- **Bit-Validity / Trait Route (`Anneal.BitValidity`)**: `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, and `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`.\n",
+        );
+    }
     if profile.has_cfg_back_edge {
         out.push_str(&format!(
-            "- **Primary Loop Route (`forRangeUp` + `runCfgToBlock`)**: `Mir.{item}.body` contains a CFG back-edge; model loop state with `Anneal.MirLoops.forRangeUp` (`mirWpConverges_forRangeUp` or `mirNoCallWpConverges_forRangeUp`) and discharge entry/step/exit segments via `Anneal.MirLiftCore.runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, `mirNoCallWpConverges_of_runCfgToBlock`).\n"
+            "- **Primary Loop Route (`forRangeUp` + `runCfgToBlock`)**: `Mir.{item}.body` contains a CFG back-edge; `open Anneal.MirLoops Anneal.MirLiftCore`, model loop state with `forRangeUp` (`mirWpConverges_forRangeUp` or `mirNoCallWpConverges_forRangeUp`), and discharge entry/step/exit segments via `runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, `mirNoCallWpConverges_of_runCfgToBlock`).\n"
         ));
     }
-    if profile.has_mut_borrow || (profile.has_deref_projection && !profile.has_cfg_back_edge) {
+    if profile.has_mut_borrow {
         out.push_str(&format!(
-            "- **Reference / Borrow Route (`Anneal.SepLogicLenses`)**: `Mir.{item}.body` accesses pointer/reference places; establish `SepLensStateInv` (`ActiveTypedMutBorrow`) or `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`), prove `LiftLensBlock Mir.{item}.body 0 ...` using `set?_of_forcePureEnv? rfl`, and apply `verifyStatefulMir_of_sepLenses` (or `verifyStatefulMir_of_sepSubplaceLenses`).\n"
+            "- **Reference / Borrow Route (`Anneal.SepLogicLenses`)**: `Mir.{item}.body` mutates or borrows `&mut` places; `open Anneal.SepLogicLenses Anneal.MirLiftCore`, establish `SepLensStateInv` (`ActiveTypedMutBorrow`) or `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`), prove `LiftLensBlock Mir.{item}.body 0 ...` using `set?_of_forcePureEnv? rfl`, and apply `verifyStatefulMir_of_sepLenses` (or `verifyStatefulMir_of_sepSubplaceLenses`).\n"
+        ));
+    } else if profile.has_deref_projection && !profile.has_cfg_back_edge {
+        out.push_str(&format!(
+            "- **Shared-Reference / Pointer Read Route (`Anneal.MirLiftCore`)**: `Mir.{item}.body` dereferences shared `&` or pointer places without `&mut` borrows (`ActiveTypedMutBorrow` requires `.active` `&mut` permission); `open Anneal.MirLiftCore` and step via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, `verifyStatefulMirNoPanic_of_wpConverges`) or `dischargeStatefulEqFuelFree` on pinned concrete memory.\n"
         ));
     }
     if is_modular || profile.has_callees_or_modular_contracts || profile.has_call_terminator {
         out.push_str(
-            "- **Callee / Modular Route (`Anneal.PureMirExec`)**: use `checkPureMirWithCallees` (`verifyStatefulMirNoPanic_of_pureExecWithCallees_any`, `PureMirConverges.call_summary`) for linked pure callees, or `PureMirModularConverges` + `verifyModularMir_of_pureModularExec_any` when modular call contracts are active.\n",
+            "- **Callee / Modular Route (`Anneal.PureMirExec`)**: `open Anneal.PureMirExec` and use `checkPureMirWithCallees` (`verifyStatefulMirNoPanic_of_pureExecWithCallees_any`, `PureMirConverges.call_summary`) for linked pure callees, or `PureMirModularConverges` + `verifyModularMir_of_pureModularExec_any` when modular call contracts are active.\n",
         );
     }
     if profile.is_pure_call_free_candidate() && !profile.has_cfg_back_edge && !is_modular {
         out.push_str(&format!(
-            "- **Primary Pure Route (`#mir_lift` rules)**: `Mir.{item}.body` is a pure call-free candidate (`checkPureMir`); apply `verifyMirNoPanic_of_pureExec` (or `verifyTotalMir_of_pureExec` / `verifyStatefulMirNoPanic_of_pureExec`), `lift_PureMirConverges (by rfl)`, `LiftBlock.of_lookup (by rfl)`, and `LiftStmtsTerminator.{{cons_eval, cons_eval_norm, eval_rest, term_*}}`.\n"
+            "- **Primary Pure Route (`#mir_lift` rules)**: `Mir.{item}.body` is a pure call-free candidate (`checkPureMir`); `open Anneal.PureMirExec Anneal.MirLiftCore` and apply `verifyMirNoPanic_of_pureExec` (or `verifyTotalMir_of_pureExec` / `verifyStatefulMirNoPanic_of_pureExec`), `lift_PureMirConverges (by rfl)`, `LiftBlock.of_lookup (by rfl)`, and `LiftStmtsTerminator.{{cons_eval, cons_eval_norm, eval_rest, term_*}}`.\n"
         ));
     } else if !profile.has_captured_mir {
         out.push_str(&format!(
-            "- **Body Route**: test `#eval Anneal.PureMirExec.checkPureMir Mir.{item}.body`; lift pure bodies with `#mir_lift` rules (`LiftBlock` / `LiftStmtsTerminator`), loops with `forRangeUp` + `runCfgToBlock`, and `&mut` / `&` borrows with `Anneal.SepLogicLenses`.\n"
+            "- **Body Route**: test `#eval Anneal.PureMirExec.checkPureMir Mir.{item}.body`; lift pure bodies with `#mir_lift` rules (`open Anneal.PureMirExec Anneal.MirLiftCore`), loops with `forRangeUp` + `runCfgToBlock` (`open Anneal.MirLoops`), and `&mut` borrows with `Anneal.SepLogicLenses`.\n"
         ));
     }
     if is_equiv {
         out.push_str(
-            "- **Equivalence Route (`#[spec(equiv = ...)]`)**: apply `verifyStatefulEquivMir_of_wpConverges` with `mirNoCallWpConverges_of_runCfgToBlock` and reuse the reference specification's `MirNoCallWpConverges` theorem.\n",
+            "- **Equivalence Route (`#[spec(equiv = ...)]`)**: `open Anneal.MirLiftCore` and apply `verifyStatefulEquivMir_of_wpConverges` with `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference specification's `MirNoCallWpConverges` theorem.\n",
         );
     }
     if profile.has_inline_companions {
         if profile.has_impure_inline_companions {
             out.push_str(
-                "- **Companion Spec Route (`#mir_lift_spec` / closure-upvar fallback)**: inline `#[spec]` companions capture `&` upvars (`checkPureMir = false`); invert `requires` with `holdBoolReq_of_mirBool` + count-free `repeat`, and prove `ensures` with `hold_mirBool_of_blockLinear` (`defaultSpecSteps`).\n",
+                "- **Companion Spec Route (`#mir_lift_spec` / closure-upvar fallback)**: inline `#[spec]` companions capture `&` upvars (`checkPureMir = false`); `open Anneal.MirLiftCore`, invert `requires` with `holdBoolReq_of_mirBool` + count-free `repeat`, and prove `ensures` with `hold_mirBool_of_blockLinear` (`defaultSpecSteps`).\n",
             );
         } else {
             out.push_str(
-                "- **Companion Spec Route (`#mir_lift_spec`)**: lift pure `requires` / `ensures` companions via `mirBoolPredicateHolds_of_pureExec` and `mirBoolPredicateHolds_elim_of_pureExec` (or fall back to `holdBoolReq_of_mirBool` + `repeat` and `hold_mirBool_of_blockLinear` when closure `&` upvars make `checkPureMir = false`).\n",
+                "- **Companion Spec Route (`#mir_lift_spec`)**: `open Anneal.PureMirExec Anneal.MirLiftCore` and lift pure `requires` / `ensures` companions via `mirBoolPredicateHolds_of_pureExec` and `mirBoolPredicateHolds_elim_of_pureExec` (or fall back to `holdBoolReq_of_mirBool` + `repeat` and `hold_mirBool_of_blockLinear` when closure `&` upvars make `checkPureMir = false`).\n",
             );
         }
     }
@@ -2591,5 +2651,14 @@ end Mir.Demo.loop_fn
         assert!(ctx_loop.contains("mirNoCallWpConverges_forRangeUp"));
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn strip_lean_comments_preserves_comment_markers_inside_string_literals() {
+        let src = "instance : ItemSpec \"demo::fn--with/-markers\" where\n  -- real comment with \"quote\n  post _ _ := True\n";
+        let stripped = strip_lean_comments(src);
+        assert!(stripped.contains("\"demo::fn--with/-markers\""));
+        assert!(stripped.contains("post _ _ := True"));
+        assert!(!stripped.contains("real comment"));
     }
 }

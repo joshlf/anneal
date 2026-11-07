@@ -17,7 +17,7 @@ Work unit `FF-4.3` delivers:
    `#mir_lift`, `#mir_lift_spec`, `forRangeUp` / `runCfgToBlock`, and
    `Anneal.SepLogicLenses` strategy selection surfaced in both starter
    `Proof/<Item>.lean` files (`--init-proofs`) and `cargo anneal agent-context`.
-2. **Self-Contained `zerocopy-reference` Convergence & Benchmark Report Package**
+2. **Self-Contained `zerocopy-reference` Convergence & Benchmark Report**
    (`reports/anneal-fuel-free-mir-lifting-and-alias-erasure/` on local branch
    `adv/ff-4-3-reference` in
    `/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference`):
@@ -47,64 +47,78 @@ Work unit `FF-4.3` delivers:
 
 - Added `MirLiftingProfile`, `analyze_mir_lifting_profile`, and
   `analyze_workspace_lifting_profile`, which inspect the generated
-  `Mir/<Item>.lean` module (after stripping `--` line comments, nested `/- ...
-  -/` block comments, and double-quoted string literals so user string constants
-  cannot spoof AST tokens) to mirror `Anneal.PureMirExec.checkPureMir` and
-  classify each verification target along four axes:
+  `Mir/<Item>.lean` module using single-pass string- and char-literal-aware
+  comment/literal stripping (`strip_lean_comments_and_strings`, preventing
+  `"--"` or `"/-"` inside `span` or `defPath` strings from inverting string
+  polarity) to mirror `Anneal.PureMirExec.checkPureMir` and classify each
+  verification target along four axes:
   1. `body_appears_pure`: absence of `.deref`, `.unwrapUnsafeBinder`,
      `BinOp.offset`, `Rvalue.{ref, rawPtr, threadLocalRef, shallowInitBox,
-     copyForDeref}`, `CastKind.{pointerCoercion, fnPtrToPtr, ptrToPtr}`,
-     `ConstValue.indirect`, `ConstSlice.ptr`, `StatementKind.{fakeRead, retag,
-     backwardIncompatibleDropHint}`, non-`assume` intrinsics, and
-     `TerminatorKind.{call, tailCall, inlineAsm}`.
-  2. `has_mut_ref`: presence of mutable reference types or borrows
-     (`RigidTy.ref Mutability.mut`, `BorrowKind.mut`) indicating Tier 2
+     copyForDeref}` (without false-triggering on nested `RigidTy.{ref, rawPtr}`
+     or pure `AggregateKind.rawPtr`), `CastKind.{pointerCoercion, fnPtrToPtr,
+     ptrToPtr}`, `ConstValue.indirect`, `ConstValue.slice (ConstScalar.ptr ..)`,
+     `StatementKind.{fakeRead, retag, backwardIncompatibleDropHint}`,
+     non-`assume` intrinsics, and `TerminatorKind.{call, tailCall, inlineAsm}`.
+  2. `has_mut_ref` vs. `has_shared_ref`: separates mutable `&mut` borrows
+     (`RigidTy.ref Mutability.mut`, `BorrowKind.mut`) targeting Tier 2
      `Anneal.SepLogicLenses` (`MutLens`, `SepLensStateInv`,
-     `SepSubplaceLensStateInv`, `LiftLensBlock`, `verifyStatefulMir_of_sepLenses`).
+     `SepSubplaceLensStateInv`, `LiftLensBlock`, and
+     `verifyStatefulMir_of_sepLenses`) from read-only shared `&T` borrows
+     (`runCfgToBlock` + `MirWpConverges`).
   3. `has_loop_backedge`: presence of a CFG edge `bb_i -> bb_j` with `j <= i`
-     indicating fuel-free loop invariants via `Anneal.MirLoops.forRangeUp`
-     (`mirNoCallWpConverges_forRangeUp`) and `Anneal.MirLiftCore.runCfgToBlock`.
+     (supporting full `u128` `SwitchTargets` discriminants and `UnwindAction`
+     terminator anchoring) indicating fuel-free loop invariants via
+     `Anneal.MirLoops.forRangeUp` (`mirNoCallWpConverges_forRangeUp`) and
+     `Anneal.MirLiftCore.runCfgToBlock`.
   4. `companions_appear_pure` vs. `has_impure_companion`: distinguishes
-     `#[requires]` / `#[ensures]` companion bodies eligible for
-     `#mir_lift_spec` + `holdBoolReq_of_mirBool` from closure-capturing
-     companions (`Rvalue.ref` + `.deref`) that require `defaultSpecSteps` and
-     count-free `repeat` unfolding.
+     `#[requires]` / `#[ensures]` companion bodies eligible for the
+     `#mir_lift_spec` theorem family (`mirBoolPredicateHolds_*_of_pureExec`)
+     from closure-capturing companions (`Rvalue.ref` + `.deref`) that use
+     `holdBoolReq_of_mirBool` + count-free `repeat` and
+     `hold_mirBool_of_blockLinear` (`defaultSpecSteps`).
 - Added `render_scaffold_lifting_hints` and `render_proof_template_with_hints`
   (re-exported from `crates/cargo-anneal/src/lib.rs`), emitting `<= 80`-column
-  `--` Lean comment blocks compatible with `TrustedBoundary.lean` and ignored by
-  comment-stripping checks in `detect_authored_item_modules` and
-  `check_specs_non_vacuous`.
+  `--` Lean comment blocks with explicit `open` namespaces (including
+  `Anneal.BitValidity` for `TypeInvariant` and `UnsafeTraitImpl` targets),
+  compatible with `TrustedBoundary.lean` and ignored by comment-stripping
+  checks in `detect_authored_item_modules` and `check_specs_non_vacuous`.
 
 ### 1.2 `agent-context` Strategy Guide (`crates/cargo-anneal/src/agent.rs`)
 
+- Made `strip_lean_comments` string- and char-literal-aware so `"--"` or `"/-"`
+  inside `ItemSpec "..."` string literals never truncates spec declarations.
 - Updated `render_agent_context` to include:
   - A top-level `## Proof Lifting Strategy Guide (Lift First, Evaluate Last)`
-    documenting Patterns A (`#mir_lift` + `#mir_lift_spec`), B (`forRangeUp` +
-    `runCfgToBlock`), C (`Anneal.SepLogicLenses`), D (stateful/interprocedural
-    `MirWpConverges`), and `TrustedBoundary` zero-fuel / count-free `repeat`
+    documenting `#mir_lift` (`argCount = 0` closed-body elaborator) vs.
+    parametric `Proof/*.lean` `LiftBlock` rules, `#mir_lift_spec` companion
+    theorems, `forRangeUp` + `runCfgToBlock`, `Anneal.SepLogicLenses`,
+    `Anneal.BitValidity`, and `TrustedBoundary` zero-fuel / count-free `repeat`
     discipline;
   - A per-target `### Recommended Lifting Strategy` subsection tailored to that
-    item's `MirLiftingProfile`; and
+    item's `MirLiftingProfile` and `CapturedItemKind`; and
   - Hint-enriched `### Starter Proof Template` blocks matching `--init-proofs`.
 - Added unit tests in `scaffold.rs`
-  (`scaffold_init_proofs_surfaces_tailored_lifting_hints_within_80_cols`) and
-  `agent.rs`
-  (`render_agent_context_surfaces_mir_lift_spec_loops_and_sep_logic_lenses_guidance`).
+  (`scaffold_init_proofs_surfaces_tailored_lifting_hints_within_80_cols`,
+  `mir_lifting_profile_handles_string_comments_slice_ptrs_u128_switches_and_nested_tys`)
+  and `agent.rs`
+  (`render_agent_context_surfaces_mir_lift_spec_loops_and_sep_logic_lenses_guidance`,
+  `strip_lean_comments_preserves_comment_markers_inside_string_literals`).
 
-### 1.3 Post-`FF-4.2b` Integration Sync (`WireframeDemo` `layoutIdx` & `Tutor` Chapters)
+### 1.3 Post-`FF-4.2b` Integration Sync (`WireframeDemo` & `Tutor`)
 
-- Updated `examples/wireframe-demo/anneal/proofs/Proof/WireframeDemo/{decode_wire_header,checksum_frame_fast}.lean`
-  to match the fresh `layoutIdx` numbering emitted by post-`087b015b`
-  `anneal-rustc-capture` (`[u8; 4]` `layoutIdx := 1 -> 2` in
-  `decode_wire_header.lean`; `[u16; 4]` `layoutIdx := 2 -> 5` in
-  `checksum_frame_fast.lean`), keeping `Proof/WireframeDemo/*.lean` at `1,421`
-  LOC (`0` `BlockCtx`, `0` fuel) and restoring `end_to_end_demo_journeys`.
-- Synchronized `examples/tutor-ch4/anneal/proofs/Proof/FrameTutor/{advance_offset,pin_magic,total_frame_len}.lean`
-  with `examples/tutor`'s `*FuelFree` wrappers and regenerated
-  `docs/tutor/{01,02,04,05}-*.md` via `python3 docs/tutor/workflow/tutor_workflow.py render`
-  (reflecting both `*FuelFree` tutor proofs and the new `--init-proofs`
-  lifting hints in Chapter 4), restoring all 4 `end_to_end_tutor` tests (`96
-  passed; 0 failed` across all 11 `cargo test -p cargo-anneal` suites).
+- Updated `WireframeDemo/{decode_wire_header,checksum_frame_fast}.lean` under
+  `examples/wireframe-demo/anneal/proofs/Proof/` to match the fresh `layoutIdx`
+  numbering emitted by post-`087b015b` `anneal-rustc-capture` (`[u8; 4]`
+  `layoutIdx := 1 -> 2` in `decode_wire_header.lean`; `[u16; 4]` `layoutIdx :=
+  2 -> 5` in `checksum_frame_fast.lean`), keeping `Proof/WireframeDemo/*.lean`
+  at `1,421` LOC (`0` `BlockCtx`, `0` fuel) and restoring
+  `end_to_end_demo_journeys`.
+- Synchronized `FrameTutor/{advance_offset,pin_magic,total_frame_len}.lean`
+  under `examples/tutor-ch4/anneal/proofs/Proof/` with `examples/tutor`'s
+  `*FuelFree` wrappers and regenerated `docs/tutor/{01,02,04,05}-*.md` via
+  `python3 docs/tutor/workflow/tutor_workflow.py render`, restoring all 4
+  `end_to_end_tutor` tests (`98 passed; 0 failed` across all 11 `cargo test -p
+  cargo-anneal` suites).
 
 ---
 
@@ -117,28 +131,32 @@ Committed **locally only** on branch `adv/ff-4-3-reference` in
 - `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/REPORT.json`:
   canonical topic namespaces (`anneal/*`, `lean/*`, `rust/*`, `verification/*`),
   12 durable upstream `subjects` (`leanprover/lean4` `v4.34.1`, `rust-lang/rust`
-  `1.98.0-nightly`, `joshlf/anneal` `origin/main` revisions `5fc1139f`,
-  `f2bc17e9`, `c065b55a`, and primary PL/verification papers), and
-  `"observed_at": "2026-11-07"`.
+  `1.98.0-nightly`, `joshlf/anneal` revisions `5fc1139f`, `f2bc17e9`,
+  `c065b55a`, and primary PL/verification papers), and `"observed_at":
+  "2026-11-07"`.
 - `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/REPORT.md`:
-  self-contained cold-reader technical report with all six canonical H2 sections
-  (`Summary`, `Applicability`, `Findings`, `Boundaries`, `Evidence`,
-  `Revalidation`), explicit `Basis:` roles on findings `F-01`–`F-08`, and
-  explicit `Boundaries` classifications (`unsupported`, `known not to apply`,
-  `not examined`, `unknown`).
+  self-contained cold-reader technical report (`<= 80`-column prose) with all
+  six canonical H2 sections (`Summary`, `Applicability`, `Findings`,
+  `Boundaries`, `Evidence`, `Revalidation`), explicit `Basis:` roles on
+  findings `F-01`–`F-08`, and explicit `Boundaries` classifications
+  (`unsupported`, `known not to apply`, `not examined`, `unknown`).
 - `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/support/`:
-  - `FuelFreeMirLiftingAndLensesProbe.lean`: 502-line self-contained Lean
+  - `FuelFreeMirLiftingAndLensesProbe.lean`: 595-line self-contained Lean
     `v4.34.1` mechanization (`Init`-only, zero `sorry`, constructive axioms
-    only) proving `evalFuel_mono`, `StepsTo.bind_wp`, `stepPure_simulates`,
+    only) proving 12 exported theorems: `evalFuel_mono`, `StepsTo.bind_wp`,
+    `checkPureProg_rejects_deref`, `stepPure_simulates`,
     `wpConverges_of_pureExec`, `chained_sets_collapse_rfl`,
     `forRangeUp_induction`, `wpConverges_forRangeUp`,
+    `no_uniform_fuel_countUp`, `countUp_wpConverges_all_n`,
     `subplaceFieldLens_disjoint`, and `liftLens_twoBorrowAdd_sound`.
   - `wireframe_benchmark_metrics.json`: verified per-function LOC (`8,009 ->
     1,421`, `-82.3%`), `BlockCtx` (`111 -> 0`), deterministic heartbeats
-    (`1,388,934k -> 665,228k`, `-52.1%`), shared-theory amortization (`+2,972`
-    net LOC), and `PureMirExec` scaling (`85 s -> 35.1 s`).
-  - `verify_probes.py`: automated verifier running Lean `v4.34.1`, `#print
-    axioms` audit, and dataset cross-checks.
+    (`1,388,934k -> 665,228k`, `-52.1%`), `uses_mir_lift_rules` classification,
+    shared-theory migration delta (`+2,972` net LOC), and post-integration
+    module LOC (`PureMirExec.lean` `20,564` LOC, `85 s -> 35.1 s`).
+  - `verify_probes.py`: automated verifier checking 80-column formatting, Lean
+    `v4.34.1` compilation, `#print axioms` on all 12 theorems, and dataset
+    cross-checks.
 - `CATALOG.json`: deterministically regenerated by `python3 tools/reference.py
   catalog` (`166` reports).
 
@@ -146,7 +164,8 @@ Committed **locally only** on branch `adv/ff-4-3-reference` in
 
 ## 3. Exact Verification Commands
 
-Run from `/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4-3`:
+Run from the worktree root
+(`/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4-3`):
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
@@ -191,7 +210,7 @@ Confirm `origin/reference` is still `64e9b5c4d` (or the latest upstream tip) and
 that only `CATALOG.json` and
 `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/` differ.
 
-### Step 2: Export the Candidate Package to Shared x20 Staging (Optional if Publishing from Cloudtop)
+### Step 2: Export Candidate Package to Shared x20 Staging (Optional)
 
 If publishing from your personal Cloudtop checkout of `google/zerocopy` rather
 than directly via Capsule sync, archive the validated report directory to x20
@@ -208,7 +227,7 @@ tar -C /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference 
 rm -f /tmp/ff43-reference-report.tar.gz
 ```
 
-### Step 3: Atomic Single-Parent Fast-Forward Publication to `refs/heads/reference`
+### Step 3: Atomic Single-Parent Fast-Forward Publication to `reference`
 
 Following `zerocopy-reference/AGENTS.md` ("Publication", Steps 1–7), on your
 authenticated `google/zerocopy` `reference` worktree on Cloudtop:
@@ -231,14 +250,14 @@ python3 tools/reference.py catalog
 python3 tools/reference.py check
 git status --short
 
-# 4. Create a single coherent linear commit whose sole parent is origin/reference
+# 4. Create a single linear commit whose sole parent is origin/reference
 git add CATALOG.json reports/anneal-fuel-free-mir-lifting-and-alias-erasure
-git commit -m "[reference] Add fuel-free MIR lifting and alias-erasure report"
+git commit -m "[reference] Add fuel-free MIR lifting and alias-erasure report" \
+  -m "Agent-authored-by: AI agent acting on Mark Dittmer's behalf"
 
-# 5. Fast-forward push to refs/heads/reference (never --force, never merge)
-#    If another writer advanced origin/reference, fetch, git rebase origin/reference,
-#    rerun 'python3 tools/reference.py catalog && python3 tools/reference.py check',
-#    and retry.
+# 5. Fast-forward push to refs/heads/reference (never --force, never merge).
+#    If another writer advanced origin/reference, fetch, rebase onto
+#    origin/reference, rerun catalog + check, and retry.
 git push origin HEAD:refs/heads/reference
 
 # 6. Read back the remote tip and verify clean linear history
