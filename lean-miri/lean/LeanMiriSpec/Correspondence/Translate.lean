@@ -927,100 +927,159 @@ def annealLookupAlloc (mach : AnnealMachine) : Miri.Memory.LiveAllocationLookup 
           mutability := localAlloc.allocation.mutability }
     | none => .error (.deadAllocation allocId)
 
-/-- Pointer binary operations (`BinOp.Offset`) for Anneal's single-threaded
-machine, matching `Miri.Interpreter.ExecutionScalar` (`ExecutionScalar.lean`)
-and `Miri.Interpreter.ptrOffsetInbounds`:
-1. Extracts the pointer scalar (`toPointer`) and resolves the pointee layout
-   via `rawPtrPointeeEncodedTyId?` and `layoutOfEncodedTyId`.
-2. Scales the count operand `right` by `pointeeLay.layout.size` using checked
-   multiplication (`IntegerOps.binary .MulWithOverflow`), reporting
-   `StepError.undefinedBehavior "PointerArithOverflow"` on multiplication
-   overflow, `isize` conversion overflow, or an unsigned byte delta `>= 2^63`
-   (`!signed && offset.toInt < 0`).
-3. Runs `Miri.Interpreter.ptrOffsetInbounds` against `annealResolvePtr` and
-   `annealLookupAlloc`, reporting `StepError.undefinedBehavior` on dangling or
-   without-provenance pointers (when `offset != 0`), deallocated targets, or
-   out-of-bounds offsets. -/
+/-- Compiler-only scalar leaves (`Miri.Interpreter.ExecutionScalar.Leaves`) for
+Anneal's single-threaded machine, passed to
+`Miri.Interpreter.ExecutionScalar.pointerBinary`. -/
+def annealExecutionScalarLeaves (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.ExecutionScalar.Leaves AnnealStepState Unit where
+  classify := fun _ tyId =>
+    match classifyEncodedTyId tyId with
+    | .ok cls => pure cls
+    | .error err => throw err
+  boolLayout := fun _ => pure (translateTy { kind := .bool, layoutIdx := 0 })
+  orderingLayout := fun _ => pure (translateTy { kind := .int .i8, layoutIdx := 0 })
+  overflowLayout := fun _ lay => pure (findOverflowTupleLayout localDecls layouts lay)
+  metadataLayout := fun _ _ => pure (translateTy { kind := .uint .usize, layoutIdx := 0 })
+  unitLayout := fun _ => pure (translateTy { kind := .tuple .nil, layoutIdx := 0 })
+
+/-- Pointer binary operations (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge` and `BinOp.Offset`)
+for Anneal's single-threaded machine, matching
+`Miri.Interpreter.ExecutionScalar` (`ExecutionScalar.lean`) and
+`Miri.Interpreter.ptrOffsetInbounds`:
+1. Relational pointer comparisons (`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`) delegate
+   directly to `Miri.Interpreter.ExecutionScalar.pointerBinary`, comparing
+   64-bit addresses via `Scalar.toBits` on `AnnealProv` (`offsetIsAddr = true`).
+2. `BinOp.Offset` extracts the pointer scalar (`toPointer`), resolves the
+   pointee layout via `rawPtrPointeeEncodedTyId?` and `layoutOfEncodedTyId`,
+   scales `right` by `pointeeLay.layout.size` via checked multiplication
+   (`IntegerOps.binary .MulWithOverflow`, reporting `StepError.undefinedBehavior
+   "PointerArithOverflow"` on overflow or unsigned delta `>= 2^63`), and runs
+   `Miri.Interpreter.ptrOffsetInbounds` against `annealResolvePtr` and
+   `annealLookupAlloc`.
+3. Atomic-pointer arithmetic (`Add`, `Sub`, `BitOr`, `BitAnd`, `BitXor`) fails
+   closed with `StepError.unsupported`. -/
 @[irreducible]
 def annealPointerBinary (layouts : LayoutTable) (op : Miri.MIR.BinOp)
     (left right : Miri.Interpreter.RvalueImmTy AnnealProv) :
     Miri.Interpreter.RvalueM AnnealStepState
       (Miri.Interpreter.RvalueImmTy AnnealProv) :=
   fun st =>
-    if op != .Offset then
-      .error (.unsupported "pointerBinary not supported in scalar/pointer fragment") st
-    else
-      match left.imm.toScalar with
-      | .error err => .error (Miri.Interpreter.ScalarOps.immediateError err) st
-      | .ok leftSc =>
-        match leftSc.toPointer annealTargetDataLayout with
-        | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err) st
-        | .ok pointer =>
-          match rawPtrPointeeEncodedTyId? left.layout.ty with
-          | none => .error (.unsupported "BinOp.Offset pointee layout not encoded") st
-          | some pointeeTyId =>
-            let pointeeLay := layoutOfEncodedTyId pointeeTyId layouts
-            if !(pointeeLay.layout.isSized && pointeeLay.layout.size.bytes.toNat < 2 ^ 63) then
-              .error (.invalidProgram "pointer Offset requires sized pointee fitting i64") st
-            else
-              match classifyEncodedTyId right.layout.ty with
-              | .error err => .error err st
-              | .ok (.integer rightKind) =>
-                match right.imm.toScalar with
-                | .error err => .error (Miri.Interpreter.ScalarOps.immediateError err) st
-                | .ok rightSc =>
-                  match rightSc.toScalarInt with
-                  | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err) st
-                  | .ok rightInt =>
-                    match rightInt.toBits right.layout.layout.size with
-                    | .error err => .error (Miri.Interpreter.ScalarOps.scalarIntError err) st
-                    | .ok _ =>
-                      match Miri.Memory.Scalar.fromInt (Prov := AnnealProv)
-                          (Int.ofNat pointeeLay.layout.size.bytes.toNat)
-                          right.layout.layout.size with
-                      | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err) st
-                      | .ok strideSc =>
-                        match strideSc.toScalarInt with
+    match op with
+    | .Eq | .Ne | .Lt | .Le | .Gt | .Ge =>
+      Miri.Interpreter.ExecutionScalar.pointerBinary
+        annealTargetDataLayout
+        (annealExecutionScalarLeaves .nil layouts)
+        (fun _ tyId => pure (decide (60 ≤ tyId ∧ tyId ≤ 82)))
+        (fun _ => pure (translateTy { kind := .uint .usize, layoutIdx := 0 }))
+        () op left right st
+    | _ =>
+      if op != .Offset then
+        .error (.unsupported "pointerBinary not supported in scalar/pointer fragment") st
+      else
+        match left.imm.toScalar with
+        | .error err => .error (Miri.Interpreter.ScalarOps.immediateError err) st
+        | .ok leftSc =>
+          match leftSc.toPointer annealTargetDataLayout with
+          | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err) st
+          | .ok pointer =>
+            match rawPtrPointeeEncodedTyId? left.layout.ty with
+            | none => .error (.unsupported "BinOp.Offset pointee layout not encoded") st
+            | some pointeeTyId =>
+              let pointeeLay := layoutOfEncodedTyId pointeeTyId layouts
+              if !(pointeeLay.layout.isSized && pointeeLay.layout.size.bytes.toNat < 2 ^ 63) then
+                .error (.invalidProgram "pointer Offset requires sized pointee fitting i64") st
+              else
+                match classifyEncodedTyId right.layout.ty with
+                | .error err => .error err st
+                | .ok (.integer rightKind) =>
+                  match right.imm.toScalar with
+                  | .error err => .error (Miri.Interpreter.ScalarOps.immediateError err) st
+                  | .ok rightSc =>
+                    match rightSc.toScalarInt with
+                    | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err) st
+                    | .ok rightInt =>
+                      match rightInt.toBits right.layout.layout.size with
+                      | .error err => .error (Miri.Interpreter.ScalarOps.scalarIntError err) st
+                      | .ok _ =>
+                        match Miri.Memory.Scalar.fromInt (Prov := AnnealProv)
+                            (Int.ofNat pointeeLay.layout.size.bytes.toNat)
+                            right.layout.layout.size with
                         | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err) st
-                        | .ok strideInt =>
-                          match Miri.Interpreter.IntegerOps.binary .MulWithOverflow
-                              ⟨rightInt, ⟨right.layout.layout.size, rightKind⟩⟩
-                              ⟨strideInt, ⟨right.layout.layout.size, rightKind⟩⟩ with
-                          | .error err => .error (Miri.Interpreter.ScalarOps.integerError err) st
-                          | .ok (.withOverflow scaledInt overflow) =>
-                            if overflow then
-                              .error (.undefinedBehavior "PointerArithOverflow") st
-                            else
-                              match (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv)
-                                  scaledInt).toTargetIsize annealPointerArithmetic.pointerSize with
-                              | .error err =>
-                                .error (Miri.Interpreter.ScalarOps.scalarError err) st
-                              | .ok offset =>
-                                match right.layout.layout.backendRepr.isSigned with
-                                | .error _ =>
-                                  .error (.invalidProgram "pointer Offset RHS signedness") st
-                                | .ok signed =>
-                                  if !signed && offset.toInt < 0 then
-                                    .error (.undefinedBehavior "PointerArithOverflow") st
-                                  else
-                                    match Miri.Interpreter.ptrOffsetInbounds
-                                        annealPointerArithmetic pointer offset
-                                        (annealResolvePtr st.machine)
-                                        (annealLookupAlloc st.machine) with
-                                    | .error (.access _) =>
-                                      .error (.undefinedBehavior "pointer Offset out of bounds") st
-                                    | .error (.pointer _) =>
-                                      .error (.invalidProgram "pointer Offset arithmetic error") st
-                                    | .ok nextPtr =>
-                                      match Miri.Memory.Scalar.fromMaybePointer
-                                          annealTargetDataLayout nextPtr with
-                                      | .error err =>
-                                        .error (Miri.Interpreter.ScalarOps.scalarError err) st
-                                      | .ok result => .ok ⟨.scalar result, left.layout⟩ st
-                          | .ok _ =>
-                            .error (.invalidProgram
-                              "MulWithOverflow returned non-overflow result") st
-              | .ok _ => .error (.invalidProgram "pointer Offset RHS is not integral") st
+                        | .ok strideSc =>
+                          match strideSc.toScalarInt with
+                          | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err) st
+                          | .ok strideInt =>
+                            match Miri.Interpreter.IntegerOps.binary .MulWithOverflow
+                                ⟨rightInt, ⟨right.layout.layout.size, rightKind⟩⟩
+                                ⟨strideInt, ⟨right.layout.layout.size, rightKind⟩⟩ with
+                            | .error err => .error (Miri.Interpreter.ScalarOps.integerError err) st
+                            | .ok (.withOverflow scaledInt overflow) =>
+                              if overflow then
+                                .error (.undefinedBehavior "PointerArithOverflow") st
+                              else
+                                match (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv)
+                                    scaledInt).toTargetIsize annealPointerArithmetic.pointerSize with
+                                | .error err =>
+                                  .error (Miri.Interpreter.ScalarOps.scalarError err) st
+                                | .ok offset =>
+                                  match right.layout.layout.backendRepr.isSigned with
+                                  | .error _ =>
+                                    .error (.invalidProgram "pointer Offset RHS signedness") st
+                                  | .ok signed =>
+                                    if !signed && offset.toInt < 0 then
+                                      .error (.undefinedBehavior "PointerArithOverflow") st
+                                    else
+                                      match Miri.Interpreter.ptrOffsetInbounds
+                                          annealPointerArithmetic pointer offset
+                                          (annealResolvePtr st.machine)
+                                          (annealLookupAlloc st.machine) with
+                                      | .error (.access _) =>
+                                        .error (.undefinedBehavior "pointer Offset out of bounds") st
+                                      | .error (.pointer _) =>
+                                        .error (.invalidProgram "pointer Offset arithmetic error") st
+                                      | .ok nextPtr =>
+                                        match Miri.Memory.Scalar.fromMaybePointer
+                                            annealTargetDataLayout nextPtr with
+                                        | .error err =>
+                                          .error (Miri.Interpreter.ScalarOps.scalarError err) st
+                                        | .ok result => .ok ⟨.scalar result, left.layout⟩ st
+                            | .ok _ =>
+                              .error (.invalidProgram
+                                "MulWithOverflow returned non-overflow result") st
+                | .ok _ => .error (.invalidProgram "pointer Offset RHS is not integral") st
+
+/-- Validate thin-raw-pointer dereference well-formedness for
+`ScalarOpsHooks.derefValidity` (invoked by `ScalarOps.unary .PtrMetadata`,
+matching `Miri.Interpreter.PointerPlaceMachine.dereference` on `kind == .raw`
+with a `Sized` pointee):
+1. Accepts only thin `Sized` raw-pointer `TyId`s (`rawPtrPointeeEncodedTyId?`
+   returning `some pointeeTyId` with `isSized = true`); non-thin raw pointers
+   (`TyId = 40`) and safe references (`TyId = 41`, which require eager non-null,
+   bounds, and alignment checks) fail closed with `StepError.unsupported`.
+2. Extracts the thin pointer scalar (`toScalarAndMeta` with `.none` metadata,
+   then `Scalar.toPointer`) without touching memory, so null and dangling thin
+   raw pointers succeed as in Rust's `ptr::metadata`. -/
+def annealDerefValidity (layouts : LayoutTable := emptyLayoutTable)
+    (value : Miri.Interpreter.RvalueImmTy AnnealProv) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit :=
+  match rawPtrPointeeEncodedTyId? value.layout.ty with
+  | none =>
+    throw (.unsupported
+      s!"derefValidity not supported for non-thin or safe-reference TyId {value.layout.ty}")
+  | some pointeeTyId =>
+    let pointeeLay := layoutOfEncodedTyId pointeeTyId layouts
+    if !pointeeLay.layout.isSized then
+      throw (.unsupported "derefValidity unsized raw pointer")
+    else
+      match value.imm.toScalarAndMeta with
+      | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err)
+      | .ok (sc, .none) =>
+        match sc.toPointer annealTargetDataLayout with
+        | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err)
+        | .ok _ => pure ()
+      | .ok (_, .metadata _) =>
+        throw (.invalidProgram "sized raw pointer immediate carries metadata")
 
 /-- `ScalarOpsHooks` instantiated for Anneal's single-threaded machine. -/
 def annealScalarOpsHooks (localDecls : List LocalDecl := .nil)
@@ -1041,7 +1100,7 @@ def annealScalarOpsHooks (localDecls : List LocalDecl := .nil)
     annealPointerBinary layouts op left right
   floatUnary := fun _ op _ =>
     throw (.unsupported s!"floatUnary not supported: {repr op}")
-  derefValidity := fun _ _ => pure ()
+  derefValidity := fun _ value => annealDerefValidity layouts value
 
 /-- Read a `Miri.MIR.ConstOperand` directly into a `Miri.Interpreter.RvalueImmTy AnnealProv`. -/
 def evalMirConstImmediate (layouts : LayoutTable) (c : Miri.MIR.ConstOperand) :

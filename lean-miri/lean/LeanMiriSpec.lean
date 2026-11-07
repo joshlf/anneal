@@ -72,9 +72,11 @@ import LeanMiriSpec.Audit
 * `LeanMiriSpec.Correspondence.SimLM3_1`: `LM-3.1` correspondence for `Rvalue.RawPtr`
   (`&raw const`/`&raw mut`) with `forceAllocation`, `PlaceElem.Deref` (`*ptr`) reads,
   writes, and UB, `StorageLive`/`StorageDead` on address-taken locals,
-  `BinOp.Offset` (`inbounds` vs. `wrapping`), `CastKind.PtrToPtr`, and
-  pointer/integer exposure casts (`step_stmt_lm3_1_simulation`,
-  `step_stmt_lm3_1_state_simulation`).
+  `BinOp.Offset` (`inbounds` vs. `wrapping`, including zero-count offsets across
+  all exact-layout pointee strides), relational raw-pointer comparisons (`Eq`..`Ge`),
+  `UnOp.PtrMetadata`, `CastKind.PtrToPtr`, pointer/integer exposure casts, and
+  `StateRelLM3_1` root-frame terminators (`Goto`, scalar and raw-pointer `Return`,
+  `Unreachable`, `SwitchInt`, and `Assert`).
 * `LeanMiriSpec.Correspondence.WitLM3_1`: standalone and end-to-end real-step
   (`Miri.Interpreter.Step.step`) witnesses for `LM-3.1`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
