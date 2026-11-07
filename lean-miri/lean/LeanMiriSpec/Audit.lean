@@ -389,7 +389,7 @@ example
     (locals : List LocalSlot) (mem : Memory)
     (ty : Ty) (hty : ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k))
     (hsz : sc₁.sizeBytes = sc₂.sizeBytes)
-    (hsz_ty : sc₁.sizeBytes = match ty.kind with | .bool => 1 | _ => sc₁.sizeBytes)
+    (hsz_ty : sc₁.sizeBytes = match ty.kind with | .bool => 1 | .int k => k.byteWidth 64 | .uint k => k.byteWidth 64 | _ => sc₁.sizeBytes)
     (hbits₁ : ty.kind = .bool → sc₁.bits = 0 ∨ sc₁.bits = 1)
     (hbits₂ : ty.kind = .bool → sc₂.bits = 0 ∨ sc₂.bits = 1)
     (mop : Miri.MIR.BinOp) (hmop : translateBinOp op = some mop) :
@@ -415,7 +415,9 @@ example
       Miri.Interpreter.IntegerOps.binary .Cmp
         ⟨msc₁, ⟨translateSizeBytes sc₁.sizeBytes, kind⟩⟩
         ⟨msc₂, ⟨translateSizeBytes sc₂.sizeBytes, kind⟩⟩ =
-        .ok (.ordering msc'') ∧ True :=
+        .ok (.ordering msc'') ∧
+      (kind.signed = isSigned →
+        sc'' = ⟨match msc'' with | .lt => 255 | .eq => 0 | .gt => 1, 1⟩) :=
   evalBinOp_cmp_simulation hrel₁ hrel₂ locals mem isSigned kind hsz
 
 example
@@ -423,18 +425,22 @@ example
     (hrel : ScalarRel sc msc) (locals : List LocalSlot) (mem : Memory)
     (srcTy dstTy : Ty) (destPlace : Miri.Interpreter.RuntimePlace AnnealProv)
     (hsrc : srcTy.kind = .bool ∨ (∃ k, srcTy.kind = .int k) ∨ (∃ k, srcTy.kind = .uint k))
-    (hdst : dstTy.kind = .bool ∨ (∃ k, dstTy.kind = .int k) ∨ (∃ k, dstTy.kind = .uint k))
-    (hsz : rigidTyByteSize emptyLayoutTable srcTy = rigidTyByteSize emptyLayoutTable dstTy)
+    (hdst : (∃ k, dstTy.kind = .int k) ∨ (∃ k, dstTy.kind = .uint k))
+    (hsz_src : sc.sizeBytes = match srcTy.kind with | .bool => 1 | .int k => k.byteWidth 64 | .uint k => k.byteWidth 64 | _ => sc.sizeBytes)
+    (hbits_src : srcTy.kind = .bool → sc.bits = 0 ∨ sc.bits = 1)
     (h_dest : destPlace.layout = translateTy dstTy emptyLayoutTable) :
     ∃ sc' msc',
-      evalByteCast locals (.constant ⟨srcTy, .scalar (.int sc)⟩) dstTy mem [] emptyLayoutTable =
+      evalRvalue locals (.cast .intToInt (.constant ⟨srcTy, .scalar (.int sc)⟩) dstTy) mem [] emptyLayoutTable =
         .ok (.scalar sc') locals mem ∧
+      Miri.Interpreter.Cast.castFromIntLike (annealCastHooks emptyLayoutTable) ()
+        (.fromScalarInt msc) (translateTy srcTy emptyLayoutTable) (translateTy dstTy emptyLayoutTable) =
+        .ok ⟨.scalar (.fromScalarInt msc'), translateTy dstTy emptyLayoutTable⟩ ∧
       Miri.Interpreter.Cast.cast (annealCastHooks emptyLayoutTable) () 16
         ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy srcTy emptyLayoutTable⟩ .IntToInt
         (encodeTyId dstTy) destPlace =
-        .ok () ∧
+        annealWriteImmediate (.scalar (.fromScalarInt msc')) destPlace ∧
       ScalarRel sc' msc' :=
-  evalCast_intToInt_simulation hrel locals mem srcTy dstTy destPlace hsrc hdst hsz h_dest
+  evalCast_intToInt_simulation hrel locals mem srcTy dstTy destPlace hsrc hdst hsz_src hbits_src h_dest
 
 example
     {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
@@ -442,8 +448,24 @@ example
     (ty : Ty) (targets : SwitchTargets) :
     ∃ bb : BasicBlockIdx,
       lookupSwitchTarget sc.bits targets.branches targets.otherwise = bb ∧
-      (bb = (translateSwitchTargets targets).otherwise ∨ (∃ c, bb = c)) :=
+      (bb = (translateSwitchTargets targets).otherwise ∨
+        ∃ v, Miri.MIR.SwitchTarget.Case v bb ∈ (translateSwitchTargets targets).cases.toList) :=
   step_terminator_switchInt_simulation hrel locals mem ty targets
+
+example
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (mem : Memory)
+    (ty : Ty) (hty : ty.kind = .bool ∨ (∃ k, ty.kind = .int k) ∨ (∃ k, ty.kind = .uint k))
+    (hsz_ty : sc.sizeBytes = match ty.kind with | .bool => 1 | .int k => k.byteWidth 64 | .uint k => k.byteWidth 64 | _ => sc.sizeBytes)
+    (hbits : ty.kind = .bool → sc.bits = 0 ∨ sc.bits = 1)
+    (caseVal : Nat)
+    (hcase_lt : caseVal < scalarModulus sc.sizeBytes)
+    (hcase_bool : ty.kind = .bool → caseVal = 0 ∨ caseVal = 1)
+    (state : AnnealStepState) :
+    (annealTerminatorHooks [] emptyLayoutTable).compareSwitchCase ()
+      ⟨.scalar (.fromScalarInt msc), translateTy ty emptyLayoutTable⟩ caseVal state =
+      (state, .ok (Nat.beq sc.bits caseVal)) :=
+  compareSwitchCase_simulation hrel mem ty hty hsz_ty hbits caseVal hcase_lt hcase_bool state
 
 example : True := step_stmt_lm1_2_simulation
 example : True := step_terminator_lm1_2_simulation

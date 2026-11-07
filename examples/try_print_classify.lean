@@ -1,3 +1,0 @@
-import LeanMiriSpec.Correspondence.Translate
-open LeanMiriSpec.Correspondence
-#print classifyEncodedTyId
