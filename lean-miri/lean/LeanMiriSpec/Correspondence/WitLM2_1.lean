@@ -2300,4 +2300,592 @@ theorem lm21_aggregate_move_then_copy_ub :
   | ub m₂ msg =>
     exact ⟨m₁, m₂, msg, rfl, hr₂⟩
 
+/-! ## 11. Uninitialized Indirect `[u16; 0]` UB, Direct Element Copy/Move (`copyElem`), & Malformed `ConstantIndex` Witnesses -/
+
+/-- MIR body exercising:
+- `bb 0` (6 statements): intra-array element copy (`_1[2 of 3] = copy _1[0 of 3]`)
+  and inter-array element move (`_2[_3] = move _1[-1 of 3]`) via
+  `WellTypedArrayElemAssign.copyElem`, followed by readback (`_0 = copy _2[_3]`).
+- `bb 1` (3 statements): `copyElem` source-OOB UB (`_2[0 of 2] = copy _1[0 of 4]`)
+  when the destination element place is valid and in bounds.
+- `bb 2` (2 statements): element read (`_0 = copy _4[_3]`) and element write
+  (`_4[0 of 1] = const 0x090A_u16`) on an uninitialized memory-backed zero-length
+  array `_4 : [u16; 0]`, where `annealCheckIndirectInitialized` returns `.ok ()`
+  because `Size.ZERO` spans `0` bytes yet both machines still agree on UB. -/
+def lm21CopyZeroBody : CapturedMir where
+  defPath := "lm_2_1_witness::copy_elem_and_zero_arr"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [
+    lm21U16Decl,      -- `_0 : u16`
+    lm21U16Arr3Decl,  -- `_1 : [u16; 3]`
+    lm21U16Arr2Decl,  -- `_2 : [u16; 2]`
+    lm21UsizeDecl,    -- `_3 : usize`
+    lm21U16Arr0Decl   -- `_4 : [u16; 0]`
+  ]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 1) (.aggregate (.array lm21U16Ty)
+          [.constant (lm21ConstU16 0x1122), .constant (lm21ConstU16 0x3344),
+           .constant (lm21ConstU16 0x5566)])),
+        mkStmt (.assign (local_ 2) (.repeat (.constant (lm21ConstU16 0x7788)) 2)),
+        mkStmt (.assign (local_ 3) (.use (.constant (lm21ConstUsize 1)))),
+        mkStmt (.assign ⟨1, [.constantIndex 2 3 false]⟩
+          (.use (.copy ⟨1, [.constantIndex 0 3 false]⟩))),
+        mkStmt (.assign ⟨2, [.index 3]⟩
+          (.use (.move ⟨1, [.constantIndex 1 3 true]⟩))),
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨2, [.index 3]⟩)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 1) (.aggregate (.array lm21U16Ty)
+          [.constant (lm21ConstU16 0x1122), .constant (lm21ConstU16 0x3344),
+           .constant (lm21ConstU16 0x5566)])),
+        mkStmt (.assign (local_ 2) (.repeat (.constant (lm21ConstU16 0x7788)) 2)),
+        mkStmt (.assign ⟨2, [.constantIndex 0 2 false]⟩
+          (.use (.copy ⟨1, [.constantIndex 0 4 false]⟩)))],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨4, [.index 3]⟩))),
+        mkStmt (.assign ⟨4, [.constantIndex 0 1 false]⟩
+          (.use (.constant (lm21ConstU16 0x090A))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := lm21FnAbi
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem lm21_copyZero_phase : ∀ p, lm21CopyZeroBody.phase ≠ .other p := by
+  intro p h; cases h
+
+def lm21CopyZeroInitAnneal (bbIdx : Nat) : MachineState :=
+  { frame :=
+      { blockIdx := bbIdx
+        stmtIdx := 0
+        locals := [.uninit, .uninit, .uninit, .uninit, .uninit] }
+    memory := (initMachineState lm21CopyZeroBody []).memory }
+
+def lm21CopyZeroInitMiriFrame (bbIdx : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody lm21CopyZeroBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy lm21U16Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨bbIdx, 0⟩ }
+
+def lm21CopyZeroInitMiri (bbIdx : Nat) : AnnealStepState :=
+  { stack := ⟨#[lm21CopyZeroInitMiriFrame bbIdx]⟩, machine := AnnealMachine.empty }
+
+theorem lm21_copyZero_init_stateRel (bbIdx : Nat) :
+    StateRel lm21CopyZeroBody (lm21CopyZeroInitAnneal bbIdx) (lm21CopyZeroInitMiri bbIdx) := by
+  refine StateRel.mk (lm21CopyZeroInitMiriFrame bbIdx) rfl rfl ⟨translateTy lm21U16Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+    (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 | 1 | 2 | 3 | 4 => rintro ⟨⟩
+      | _ + 5 => rintro ⟨⟩)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 | 1 | 2 | 3 | 4 =>
+    have hs : slot = .uninit := by simpa [lm21CopyZeroInitAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [lm21CopyZeroInitMiriFrame] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | _ + 5 =>
+    simp [lm21CopyZeroBody, get?] at hdecl
+
+private theorem lm21_copyZeroInitFrame_imm (bbIdx j : Nat) :
+    IsImmediateFrameLocal (lm21CopyZeroInitMiriFrame bbIdx) j := by
+  intro mls hmls mp hv
+  match j with
+  | 0 | 1 | 2 | 3 | 4 =>
+    simp [lm21CopyZeroInitMiriFrame] at hmls; subst hmls; cases hv
+  | _ + 5 => simp [lm21CopyZeroInitMiriFrame] at hmls
+
+private theorem lm21_copyZeroInitFrame_eq {bbIdx : Nat}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : (lm21CopyZeroInitMiri bbIdx).stack.frames = #[tf]) :
+    tf = lm21CopyZeroInitMiriFrame bbIdx := by
+  simp only [lm21CopyZeroInitMiri, List.toArray, Array.mk.injEq, List.cons.injEq, and_true] at h
+  exact h.symm
+
+private theorem lm21_copyZero_constU16_wt
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (n : Nat) (hn : n < 65536) :
+    WellTypedLM2_1ScalarOperand lm21CopyZeroBody tf (.constant (lm21ConstU16 n)) lm21U16Ty :=
+  .ofScalar (.constScalar (lm21ConstU16 n) ⟨n, 2⟩ rfl lm21_isPrim_u16 (Or.inr (Or.inl rfl))
+    (by simpa [scalarModulus] using hn) rfl (fun h => nomatch h) (fun h => nomatch h))
+
+private theorem lm21_copyZero_constUsize_scalar_wt
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (n : Nat) (hn : n < 2 ^ 64) :
+    WellTypedScalarOperand lm21CopyZeroBody tf (.constant (lm21ConstUsize n)) lm21UsizeTy :=
+  .constScalar (lm21ConstUsize n) ⟨n, 8⟩ rfl (Or.inr (Or.inr (Or.inr ⟨.usize, rfl⟩)))
+    (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+    (by simpa [scalarModulus] using hn) rfl (fun h => nomatch h) (fun h => nomatch h)
+
+/-- Six-step execution exercising `WellTypedArrayElemAssign.copyElem` for both
+intra-array (`_1[2 of 3] = copy _1[0 of 3]`, `dstArr = srcArr = 1`) and
+inter-array (`_2[_3] = move _1[-1 of 3]`, `dstArr = 2, srcArr = 1`), followed
+by dynamic `Index` readback (`_0 = copy _2[_3]` -> `0x1122_u16`), preserving
+`StateRel`, `LiveAllocsNodup`, and `MemoryHighWater` across all 6 steps. -/
+theorem lm21_intra_and_inter_array_copyElem_steps :
+    let hooks := annealStepHooks lm21CopyZeroBody.localDecls lm21CopyZeroBody.layouts
+    let arr1_0 : List Value := [.scalar ⟨0x1122, 2⟩, .scalar ⟨0x3344, 2⟩, .scalar ⟨0x5566, 2⟩]
+    let arr2_0 : List Value := [.scalar ⟨0x7788, 2⟩, .scalar ⟨0x7788, 2⟩]
+    let arr1_1 : List Value := [.scalar ⟨0x1122, 2⟩, .scalar ⟨0x3344, 2⟩, .scalar ⟨0x1122, 2⟩]
+    let arr2_1 : List Value := [.scalar ⟨0x7788, 2⟩, .scalar ⟨0x1122, 2⟩]
+    let mkState (k : Nat) (locals : List LocalSlot) : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := k, locals := locals }
+        memory := (initMachineState lm21CopyZeroBody []).memory }
+    let s₁ := mkState 1 [.uninit, .init (.aggregate 0 arr1_0), .uninit, .uninit, .uninit]
+    let s₂ := mkState 2 [.uninit, .init (.aggregate 0 arr1_0), .init (.aggregate 0 arr2_0), .uninit, .uninit]
+    let s₃ := mkState 3 [.uninit, .init (.aggregate 0 arr1_0), .init (.aggregate 0 arr2_0), .init (.scalar ⟨1, 8⟩), .uninit]
+    let s₄ := mkState 4 [.uninit, .init (.aggregate 0 arr1_1), .init (.aggregate 0 arr2_0), .init (.scalar ⟨1, 8⟩), .uninit]
+    let s₅ := mkState 5 [.uninit, .init (.aggregate 0 arr1_1), .init (.aggregate 0 arr2_1), .init (.scalar ⟨1, 8⟩), .uninit]
+    let s₆ := mkState 6 [.init (.scalar ⟨0x1122, 2⟩), .init (.aggregate 0 arr1_1), .init (.aggregate 0 arr2_1), .init (.scalar ⟨1, 8⟩), .uninit]
+    stepMirFn lm21CopyZeroBody (lm21CopyZeroInitAnneal 0) = .step s₁ ∧
+      stepMirFn lm21CopyZeroBody s₁ = .step s₂ ∧
+      stepMirFn lm21CopyZeroBody s₂ = .step s₃ ∧
+      stepMirFn lm21CopyZeroBody s₃ = .step s₄ ∧
+      stepMirFn lm21CopyZeroBody s₄ = .step s₅ ∧
+      stepMirFn lm21CopyZeroBody s₅ = .step s₆ ∧
+      ∃ m₁ m₂ m₃ m₄ m₅ m₆,
+        Miri.Interpreter.Step.step hooks () (lm21CopyZeroInitMiri 0) = (m₁, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₅ = (m₆, .ok true) ∧
+        StateRel lm21CopyZeroBody s₆ m₆ ∧
+        LiveAllocsNodup m₆.machine ∧
+        MemoryHighWater m₆.machine.memory := by
+  intro hooks arr1_0 arr2_0 arr1_1 arr2_1 mkState s₁ s₂ s₃ s₄ s₅ s₆
+  have h₁ : stepMirFn lm21CopyZeroBody (lm21CopyZeroInitAnneal 0) = .step s₁ := rfl
+  have h₂ : stepMirFn lm21CopyZeroBody s₁ = .step s₂ := rfl
+  have h₃ : stepMirFn lm21CopyZeroBody s₂ = .step s₃ := rfl
+  have h₄ : stepMirFn lm21CopyZeroBody s₃ = .step s₄ := rfl
+  have h₅ : stepMirFn lm21CopyZeroBody s₄ = .step s₅ := rfl
+  have h₆ : stepMirFn lm21CopyZeroBody s₅ = .step s₆ := rfl
+  refine ⟨h₁, h₂, h₃, h₄, h₅, h₆, ?_⟩
+  have h0_next : (lm21CopyZeroInitMiri 0).machine.memory.nextAllocId.toNat = 1 := rfl
+  -- `stmt 0`: `_1 = [0x1122, 0x3344, 0x5566]`
+  obtain ⟨hsim₁, hnd₁, him₁, hhw₁⟩ := step_stmt_lm2_1_simulation (lm21_copyZero_init_stateRel 0)
+    lm21_nodup_empty lm21_copyZero_phase rfl rfl (fun tf htf => by
+      obtain rfl := lm21_copyZeroInitFrame_eq htf
+      refine .arrayStmt (.aggregateArray 1 lm21U16Arr3Decl lm21U16Ty (.uint .u16) 3 _ _
+        rfl lm21_wf_u16Arr3 rfl (Or.inr (Or.inl ⟨lm21_copyZeroInitFrame_imm 0 1, lm21_canReserve_empty⟩))
+        ?_ lm21_isPrim_u16)
+      intro op hop
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
+      rcases hop with rfl | rfl | rfl
+      · exact lm21_copyZero_constU16_wt _ 0x1122 (by decide)
+      · exact lm21_copyZero_constU16_wt _ 0x3344 (by decide)
+      · exact lm21_copyZero_constU16_wt _ 0x5566 (by decide))
+  rw [h₁] at hsim₁
+  generalize Miri.Interpreter.Step.step hooks () (lm21CopyZeroInitMiri 0) = r₁
+    at hsim₁ hnd₁ him₁ hhw₁ ⊢
+  cases hsim₁ with
+  | step _ m₁ hrel₁ =>
+  have himm₁ : ∀ j, j ≠ 1 → ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf j :=
+    fun j hj tf htf => him₁ rfl _ tf rfl htf j (fun h => hj (by injection h with h; exact h.symm))
+      (lm21_copyZeroInitFrame_imm 0 j)
+  obtain ⟨hw₁, hb₁⟩ := hhw₁ rfl MemoryHighWater.empty (by decide)
+  rw [h0_next] at hb₁
+  simp only [arrayConstructDest?, mkStmt, local_, Option.isSome, ↓reduceIte] at hb₁
+  -- `stmt 1`: `_2 = [0x7788; 2]`
+  obtain ⟨hsim₂, hnd₂, him₂, hhw₂⟩ := step_stmt_lm2_1_simulation hrel₁ (hnd₁ rfl)
+    lm21_copyZero_phase rfl rfl (fun tf htf =>
+      .arrayStmt (.repeatArray 2 lm21U16Arr2Decl (.uint .u16) 2 _ _
+        rfl lm21_wf_u16Arr2 (Or.inr (Or.inl ⟨himm₁ 2 (by decide) tf htf, hw₁.canReserveAllocId⟩))
+        (lm21_copyZero_constU16_wt tf 0x7788 (by decide)) lm21_isPrim_u16))
+  rw [h₂] at hsim₂
+  generalize hr₂ : Miri.Interpreter.Step.step hooks () m₁ = r₂ at hsim₂ hnd₂ him₂ hhw₂
+  cases hsim₂ with
+  | step _ m₂ hrel₂ =>
+  have himm₂ : ∀ j, j ≠ 1 → j ≠ 2 → ∀ tf, m₂.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+    intro j hj₁ hj₂ tf htf; obtain ⟨tf₁, htf₁, _⟩ := hrel₁
+    exact him₂ rfl tf₁ tf htf₁ htf j (fun h => hj₂ (by injection h with h; exact h.symm))
+      (himm₁ j hj₁ tf₁ htf₁)
+  obtain ⟨hw₂, hb₂⟩ := hhw₂ rfl hw₁ (by
+    simp only [arrayConstructDest?, mkStmt, local_, Option.isSome, ↓reduceIte]; omega)
+  simp only [arrayConstructDest?, mkStmt, local_, Option.isSome, ↓reduceIte] at hb₂
+  -- `stmt 2`: `_3 = const 1_usize`
+  obtain ⟨hsim₃, hnd₃, him₃, hhw₃⟩ := step_stmt_lm2_1_simulation hrel₂ (hnd₂ rfl)
+    lm21_copyZero_phase rfl rfl (fun tf htf =>
+      .scalarStmt (.assign _ 3 lm21UsizeDecl _ rfl rfl (himm₂ 3 (by decide) (by decide) tf htf)
+        (.use _ lm21UsizeTy (lm21_copyZero_constUsize_scalar_wt tf 1 (by decide)))))
+  rw [h₃] at hsim₃
+  generalize hr₃ : Miri.Interpreter.Step.step hooks () m₂ = r₃ at hsim₃ hnd₃ him₃ hhw₃
+  cases hsim₃ with
+  | step _ m₃ hrel₃ =>
+  have himm₃ : ∀ j, j ≠ 1 → j ≠ 2 → ∀ tf, m₃.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+    intro j hj₁ hj₂ tf htf; obtain ⟨tf₂, htf₂, _⟩ := hrel₂
+    exact him₃ rfl tf₂ tf htf₂ htf j (fun h => nomatch h) (himm₂ j hj₁ hj₂ tf₂ htf₂)
+  obtain ⟨hw₃, hb₃⟩ := hhw₃ rfl hw₂ (by
+    simp only [arrayConstructDest?, mkStmt, local_, Option.isSome, Bool.false_eq_true, ↓reduceIte, Nat.add_zero]; omega)
+  simp only [arrayConstructDest?, mkStmt, local_, Option.isSome, Bool.false_eq_true, ↓reduceIte, Nat.add_zero] at hb₃
+  -- `stmt 3`: intra-array `_1[2 of 3] = copy _1[0 of 3]` (`copyElem`, `dstArr = srcArr = 1`)
+  obtain ⟨hsim₄, hnd₄, him₄, hhw₄⟩ := step_stmt_lm2_1_simulation hrel₃ (hnd₃ rfl)
+    lm21_copyZero_phase rfl rfl (fun _ _ =>
+      .arrayStmt (.elemAssign (.copyElem 1 1 lm21U16Arr3Decl lm21U16Arr3Decl (.uint .u16) 3 3
+        (.constantIndex 2 3 false) (.constantIndex 0 3 false) false _
+        rfl lm21_wf_u16Arr3 rfl lm21_wf_u16Arr3 lm21_isPrim_u16
+        (.constantIndex 2 3 false (by decide) (by decide)
+          ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+        (.constantIndex 0 3 false (by decide) (by decide)
+          ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+        (Or.inr (Or.inr ⟨arr1_0, rfl⟩))
+        (Or.inr (Or.inr ⟨arr1_0, rfl⟩)))))
+  rw [h₄] at hsim₄
+  generalize hr₄ : Miri.Interpreter.Step.step hooks () m₃ = r₄ at hsim₄ hnd₄ him₄ hhw₄
+  cases hsim₄ with
+  | step _ m₄ hrel₄ =>
+  have himm₄ : ∀ j, j ≠ 1 → j ≠ 2 → ∀ tf, m₄.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+    intro j hj₁ hj₂ tf htf; obtain ⟨tf₃, htf₃, _⟩ := hrel₃
+    exact him₄ rfl tf₃ tf htf₃ htf j (fun h => nomatch h) (himm₃ j hj₁ hj₂ tf₃ htf₃)
+  obtain ⟨hw₄, hb₄⟩ := hhw₄ rfl hw₃ (by
+    simp only [arrayConstructDest?, mkStmt, Option.isSome, Bool.false_eq_true, ↓reduceIte, Nat.add_zero]; omega)
+  simp only [arrayConstructDest?, mkStmt, Option.isSome, Bool.false_eq_true, ↓reduceIte, Nat.add_zero] at hb₄
+  -- `stmt 4`: inter-array `_2[_3] = move _1[-1 of 3]` (`copyElem`, `dstArr = 2, srcArr = 1`)
+  obtain ⟨hsim₅, hnd₅, him₅, hhw₅⟩ := step_stmt_lm2_1_simulation hrel₄ (hnd₄ rfl)
+    lm21_copyZero_phase rfl rfl (fun tf htf =>
+      .arrayStmt (.elemAssign (.copyElem 2 1 lm21U16Arr2Decl lm21U16Arr3Decl (.uint .u16) 2 3
+        (.index 3) (.constantIndex 1 3 true) true _
+        rfl lm21_wf_u16Arr2 rfl lm21_wf_u16Arr3 lm21_isPrim_u16
+        (.index 3 lm21UsizeDecl rfl rfl (Or.inl (himm₄ 3 (by decide) (by decide) tf htf)))
+        (.constantIndex 1 3 true (by decide) (by decide)
+          ⟨(fun h => nomatch h), (fun _ => ⟨by decide, by decide⟩)⟩)
+        (Or.inr (Or.inr ⟨arr2_0, rfl⟩))
+        (Or.inr (Or.inr ⟨arr1_1, rfl⟩)))))
+  rw [h₅] at hsim₅
+  generalize hr₅ : Miri.Interpreter.Step.step hooks () m₄ = r₅ at hsim₅ hnd₅ him₅ hhw₅
+  cases hsim₅ with
+  | step _ m₅ hrel₅ =>
+  have himm₅ : ∀ j, j ≠ 1 → j ≠ 2 → ∀ tf, m₅.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+    intro j hj₁ hj₂ tf htf; obtain ⟨tf₄, htf₄, _⟩ := hrel₄
+    exact him₅ rfl tf₄ tf htf₄ htf j (fun h => nomatch h) (himm₄ j hj₁ hj₂ tf₄ htf₄)
+  obtain ⟨hw₅, hb₅⟩ := hhw₅ rfl hw₄ (by
+    simp only [arrayConstructDest?, mkStmt, Option.isSome, Bool.false_eq_true, ↓reduceIte, Nat.add_zero]; omega)
+  simp only [arrayConstructDest?, mkStmt, Option.isSome, Bool.false_eq_true, ↓reduceIte, Nat.add_zero] at hb₅
+  -- `stmt 5`: `_0 = copy _2[_3]` -> `0x1122_u16`
+  obtain ⟨hsim₆, hnd₆, -, hhw₆⟩ := step_stmt_lm2_1_simulation hrel₅ (hnd₅ rfl)
+    lm21_copyZero_phase rfl rfl (fun tf htf =>
+      .arrayStmt (.elemAssign (.readElem 0 2 lm21U16Decl lm21U16Arr2Decl (.uint .u16) 2
+        (.index 3) false _ rfl lm21_wf_u16Arr2 rfl rfl
+        (himm₅ 0 (by decide) (by decide) tf htf)
+        (.index 3 lm21UsizeDecl rfl rfl (Or.inl (himm₅ 3 (by decide) (by decide) tf htf)))
+        (Or.inr (Or.inr ⟨arr2_1, rfl⟩)))))
+  rw [h₆] at hsim₆
+  generalize hr₆ : Miri.Interpreter.Step.step hooks () m₅ = r₆ at hsim₆ hnd₆ hhw₆
+  cases hsim₆ with
+  | step _ m₆ hrel₆ =>
+  obtain ⟨hw₆, _⟩ := hhw₆ rfl hw₅ (by
+    simp only [arrayConstructDest?, mkStmt, local_, Option.isSome, Bool.false_eq_true, ↓reduceIte, Nat.add_zero]; omega)
+  exact ⟨m₁, m₂, m₃, m₄, m₅, m₆, rfl, hr₂, hr₃, hr₄, hr₅, hr₆, hrel₆, hnd₆ rfl, hw₆⟩
+
+/-- Source-OOB UB witness for `WellTypedArrayElemAssign.copyElem` (`bb 1`):
+after initializing `_1 : [u16; 3]` and `_2 : [u16; 2]`, `_2[0 of 2] = copy _1[0 of 4]`
+resolves the in-bounds destination `_2[0 of 2]` and then fails with out-of-bounds UB
+on `_1[0 of 4]` in both Anneal and `lean-miri`. -/
+theorem lm21_copyElem_src_oob_ub :
+    let hooks := annealStepHooks lm21CopyZeroBody.localDecls lm21CopyZeroBody.layouts
+    let arr1_0 : List Value := [.scalar ⟨0x1122, 2⟩, .scalar ⟨0x3344, 2⟩, .scalar ⟨0x5566, 2⟩]
+    let arr2_0 : List Value := [.scalar ⟨0x7788, 2⟩, .scalar ⟨0x7788, 2⟩]
+    let mkState (k : Nat) (locals : List LocalSlot) : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := k, locals := locals }
+        memory := (initMachineState lm21CopyZeroBody []).memory }
+    let s₁ := mkState 1 [.uninit, .init (.aggregate 0 arr1_0), .uninit, .uninit, .uninit]
+    let s₂ := mkState 2 [.uninit, .init (.aggregate 0 arr1_0), .init (.aggregate 0 arr2_0), .uninit, .uninit]
+    stepMirFn lm21CopyZeroBody (lm21CopyZeroInitAnneal 1) = .step s₁ ∧
+      stepMirFn lm21CopyZeroBody s₁ = .step s₂ ∧
+      stepMirFn lm21CopyZeroBody s₂ = .fail .ub ∧
+      ∃ m₁ m₂ m₃ msg,
+        Miri.Interpreter.Step.step hooks () (lm21CopyZeroInitMiri 1) = (m₁, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+        Miri.Interpreter.Step.step hooks () m₂ = (m₃, .error (.undefinedBehavior msg)) := by
+  intro hooks arr1_0 arr2_0 mkState s₁ s₂
+  have h₁ : stepMirFn lm21CopyZeroBody (lm21CopyZeroInitAnneal 1) = .step s₁ := rfl
+  have h₂ : stepMirFn lm21CopyZeroBody s₁ = .step s₂ := rfl
+  have h₃ : stepMirFn lm21CopyZeroBody s₂ = .fail .ub := rfl
+  refine ⟨h₁, h₂, h₃, ?_⟩
+  obtain ⟨hsim₁, hnd₁, him₁, hhw₁⟩ := step_stmt_lm2_1_simulation (lm21_copyZero_init_stateRel 1)
+    lm21_nodup_empty lm21_copyZero_phase rfl rfl (fun tf htf => by
+      obtain rfl := lm21_copyZeroInitFrame_eq htf
+      refine .arrayStmt (.aggregateArray 1 lm21U16Arr3Decl lm21U16Ty (.uint .u16) 3 _ _
+        rfl lm21_wf_u16Arr3 rfl (Or.inr (Or.inl ⟨lm21_copyZeroInitFrame_imm 1 1, lm21_canReserve_empty⟩))
+        ?_ lm21_isPrim_u16)
+      intro op hop
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
+      rcases hop with rfl | rfl | rfl
+      · exact lm21_copyZero_constU16_wt _ 0x1122 (by decide)
+      · exact lm21_copyZero_constU16_wt _ 0x3344 (by decide)
+      · exact lm21_copyZero_constU16_wt _ 0x5566 (by decide))
+  rw [h₁] at hsim₁
+  generalize Miri.Interpreter.Step.step hooks () (lm21CopyZeroInitMiri 1) = r₁
+    at hsim₁ hnd₁ him₁ hhw₁ ⊢
+  cases hsim₁ with
+  | step _ m₁ hrel₁ =>
+  have himm₁ : ∀ j, j ≠ 1 → ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf j :=
+    fun j hj tf htf => him₁ rfl _ tf rfl htf j (fun h => hj (by injection h with h; exact h.symm))
+      (lm21_copyZeroInitFrame_imm 1 j)
+  obtain ⟨hw₁, _⟩ := hhw₁ rfl MemoryHighWater.empty (by decide)
+  obtain ⟨hsim₂, hnd₂, -, -⟩ := step_stmt_lm2_1_simulation hrel₁ (hnd₁ rfl)
+    lm21_copyZero_phase rfl rfl (fun tf htf =>
+      .arrayStmt (.repeatArray 2 lm21U16Arr2Decl (.uint .u16) 2 _ _
+        rfl lm21_wf_u16Arr2 (Or.inr (Or.inl ⟨himm₁ 2 (by decide) tf htf, hw₁.canReserveAllocId⟩))
+        (lm21_copyZero_constU16_wt tf 0x7788 (by decide)) lm21_isPrim_u16))
+  rw [h₂] at hsim₂
+  generalize hr₂ : Miri.Interpreter.Step.step hooks () m₁ = r₂ at hsim₂ hnd₂
+  cases hsim₂ with
+  | step _ m₂ hrel₂ =>
+  obtain ⟨hsim₃, -, -, -⟩ := step_stmt_lm2_1_simulation hrel₂ (hnd₂ rfl)
+    lm21_copyZero_phase rfl rfl (fun _ _ =>
+      .arrayStmt (.elemAssign (.copyElem 2 1 lm21U16Arr2Decl lm21U16Arr3Decl (.uint .u16) 2 3
+        (.constantIndex 0 2 false) (.constantIndex 0 4 false) false _
+        rfl lm21_wf_u16Arr2 rfl lm21_wf_u16Arr3 lm21_isPrim_u16
+        (.constantIndex 0 2 false (by decide) (by decide)
+          ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+        (.constantIndex 0 4 false (by decide) (by decide)
+          ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+        (Or.inr (Or.inr ⟨arr2_0, rfl⟩))
+        (Or.inr (Or.inr ⟨arr1_0, rfl⟩)))))
+  rw [h₃] at hsim₃
+  generalize hr₃ : Miri.Interpreter.Step.step hooks () m₂ = r₃ at hsim₃
+  cases hsim₃ with
+  | ub m₃ msg =>
+    exact ⟨m₁, m₂, m₃, msg, rfl, hr₂, hr₃⟩
+
+/-- Zero-byte stack allocation backing an uninitialized indirect `_4 : [u16; 0]`. -/
+def lm21ZeroArrAlloc :
+    Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  (extractExceptOk
+    (Miri.Memory.Allocation.fromBytes (Prov := AnnealProv)
+      #[] (translateAlignBytes 2) .Mut)
+    (by decide)).withExtra none
+
+/-- `MemPlace` at `0x1000` (`relOffset = 0`) inside `lm21ZeroArrAlloc`. -/
+def lm21ZeroArrMemPlace : Miri.Interpreter.MemPlace AnnealProv :=
+  { ptr := ⟨Miri.ABI.Size.ofBytes witnessBaseAddr, some (.concrete witnessAllocId witnessTag)⟩
+    metadata := .none
+    misaligned := none }
+
+def lm21Usize0 : Miri.Memory.ScalarInt := Miri.Memory.ScalarInt.ofUInt64 0
+
+theorem lm21_idxRel_0 :
+    ImmediateRel lm21UsizeTy emptyLayoutTable (.scalar ⟨0, 8⟩)
+      (.scalar (.fromScalarInt lm21Usize0)) :=
+  .scalar ⟨0, 8⟩ lm21Usize0 ⟨Or.inr (Or.inr (Or.inr (Or.inl rfl))), by decide, rfl, rfl⟩
+    rfl (fun h => nomatch h) (fun h => nomatch h)
+
+/-- `lm21ZeroArrMemPlace` satisfies `MemPlaceRel` for uninitialized (`none`)
+`[u16; 0]` in `witnessMachineOf lm21ZeroArrAlloc`. -/
+theorem lm21_zeroArr_uninit_memPlaceRel :
+    MemPlaceRel (witnessMachineOf lm21ZeroArrAlloc) lm21U16Arr0Ty emptyLayoutTable
+      none lm21ZeroArrMemPlace :=
+  MemPlaceRel.mk
+    witnessAllocId witnessTag witnessBaseAddr Miri.ABI.Size.ZERO
+    { kind := .stack, allocation := lm21ZeroArrAlloc }
+    rfl rfl rfl (List.Mem.head _)
+    (by decide) (by decide) (by decide) (by decide)
+    (show lm21ZeroArrMemPlace.ptr.offset.isAligned (translateAlignBytes 2) = .ok true by decide)
+    (show Miri.ABI.Size.ZERO.bytes.toNat + 0 ≤ lm21ZeroArrAlloc.byteSize.bytes.toNat by decide)
+    (fun _ hsz => absurd rfl hsz)
+    (fun _ h => nomatch h)
+    (fun _ h => nomatch h)
+    (fun _ _ _ _ h => nomatch h)
+
+def lm21ZeroArrAnneal (k : Nat) : MachineState :=
+  { frame :=
+      { blockIdx := 2
+        stmtIdx := k
+        locals := [.uninit, .uninit, .uninit, .init (.scalar ⟨0, 8⟩), .uninit] }
+    memory := (initMachineState lm21CopyZeroBody []).memory }
+
+def lm21ZeroArrMiriFrame (k : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody lm21CopyZeroBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy lm21U16Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt lm21Usize0))), layout := none },
+      { value := .live (.indirect lm21ZeroArrMemPlace), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨2, k⟩ }
+
+def lm21ZeroArrMiri (k : Nat) : AnnealStepState :=
+  { stack := ⟨#[lm21ZeroArrMiriFrame k]⟩, machine := witnessMachineOf lm21ZeroArrAlloc }
+
+theorem lm21_zeroArr_stateRel (k : Nat) :
+    StateRel lm21CopyZeroBody (lm21ZeroArrAnneal k) (lm21ZeroArrMiri k) := by
+  refine StateRel.mk (lm21ZeroArrMiriFrame k) rfl rfl ⟨translateTy lm21U16Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+    (by
+      intro i j mp_i mp_j _ _ hneq hi hj
+      match i, j with
+      | 0, _ | 1, _ | 2, _ | 3, _ => simp [lm21ZeroArrMiriFrame] at hi
+      | _ + 5, _ => simp [lm21ZeroArrMiriFrame] at hi
+      | 4, 0 | 4, 1 | 4, 2 | 4, 3 => simp [lm21ZeroArrMiriFrame] at hj
+      | 4, 4 => exact absurd rfl hneq
+      | 4, _ + 5 => simp [lm21ZeroArrMiriFrame] at hj)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 | 1 | 2 =>
+    have hs : slot = .uninit := by simpa [lm21ZeroArrAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [lm21ZeroArrMiriFrame] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 3 =>
+    have hd : decl = lm21UsizeDecl := by simpa [lm21CopyZeroBody, get?] using hdecl.symm
+    have hs : slot = .init (.scalar ⟨0, 8⟩) := by simpa [lm21ZeroArrAnneal, get?] using hslot.symm
+    have hm : mls =
+        { value := .live (.immediate (.scalar (.fromScalarInt lm21Usize0))), layout := none } := by
+      simpa [lm21ZeroArrMiriFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ none (fun _ h => nomatch h) (Or.inr ⟨_, rfl, lm21_idxRel_0⟩)
+  | 4 =>
+    have hd : decl = lm21U16Arr0Decl := by simpa [lm21CopyZeroBody, get?] using hdecl.symm
+    have hs : slot = .uninit := by simpa [lm21ZeroArrAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.indirect lm21ZeroArrMemPlace), layout := none } := by
+      simpa [lm21ZeroArrMiriFrame] using hmls.symm
+    subst hd hs hm
+    exact .indirect _ lm21ZeroArrMemPlace none (fun _ h => nomatch h) nofun
+      lm21_zeroArr_uninit_memPlaceRel
+  | _ + 5 =>
+    simp [lm21CopyZeroBody, get?] at hdecl
+
+private theorem lm21_zeroArrFrame_eq {k : Nat}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : (lm21ZeroArrMiri k).stack.frames = #[tf]) :
+    tf = lm21ZeroArrMiriFrame k := by
+  simp only [lm21ZeroArrMiri, List.toArray, Array.mk.injEq, List.cons.injEq, and_true] at h
+  exact h.symm
+
+/-- Reading `_0 = copy _4[_3]` when `_4 : [u16; 0]` is `.uninit` in Anneal and
+memory-backed (`.indirect lm21ZeroArrMemPlace`) in `lean-miri` — even though
+`annealCheckIndirectInitialized` returns `.ok ()` on `Size.ZERO` — reports
+undefined behavior in both machines via `step_stmt_lm2_1_simulation`. -/
+theorem lm21_uninit_indirect_zero_array_read_ub :
+    annealCheckIndirectInitialized (witnessMachineOf lm21ZeroArrAlloc) lm21ZeroArrMemPlace
+        (translateTy lm21U16Arr0Ty emptyLayoutTable).layout.size = .ok () ∧
+      stepMirFn lm21CopyZeroBody (lm21ZeroArrAnneal 0) = .fail .ub ∧
+      ∃ m' msg,
+        Miri.Interpreter.Step.step
+          (annealStepHooks lm21CopyZeroBody.localDecls lm21CopyZeroBody.layouts) ()
+          (lm21ZeroArrMiri 0) = (m', .error (.undefinedBehavior msg)) := by
+  have hchk :
+      annealCheckIndirectInitialized (witnessMachineOf lm21ZeroArrAlloc) lm21ZeroArrMemPlace
+        (translateTy lm21U16Arr0Ty emptyLayoutTable).layout.size = .ok () := by decide
+  have hstep : stepMirFn lm21CopyZeroBody (lm21ZeroArrAnneal 0) = .fail .ub := rfl
+  refine ⟨hchk, hstep, ?_⟩
+  have hnd : LiveAllocsNodup (witnessMachineOf lm21ZeroArrAlloc) :=
+    List.Pairwise.cons (fun _ h => nomatch h) List.Pairwise.nil
+  obtain ⟨hsim, -, -, -⟩ := step_stmt_lm2_1_simulation (lm21_zeroArr_stateRel 0) hnd
+    lm21_copyZero_phase rfl rfl (fun tf htf => by
+      obtain rfl := lm21_zeroArrFrame_eq htf
+      refine .arrayStmt (.elemAssign (.readElem 0 4 lm21U16Decl lm21U16Arr0Decl (.uint .u16) 0
+        (.index 3) false _ rfl lm21_wf_u16Arr0 rfl rfl ?_ ?_ (Or.inr (Or.inl rfl))))
+      · intro mls hmls mp hv
+        simp [lm21ZeroArrMiriFrame] at hmls; subst hmls; cases hv
+      · refine .index 3 lm21UsizeDecl rfl rfl (Or.inl ?_)
+        intro mls hmls mp hv
+        simp [lm21ZeroArrMiriFrame] at hmls; subst hmls; cases hv)
+  rw [hstep] at hsim
+  generalize Miri.Interpreter.Step.step
+    (annealStepHooks lm21CopyZeroBody.localDecls lm21CopyZeroBody.layouts) ()
+    (lm21ZeroArrMiri 0) = r at hsim ⊢
+  cases hsim with
+  | ub m' msg => exact ⟨m', msg, rfl⟩
+
+/-- Writing `_4[0 of 1] = const 0x090A_u16` when `_4 : [u16; 0]` is `.uninit` in
+Anneal and memory-backed (`.indirect lm21ZeroArrMemPlace`) in `lean-miri` — even
+though `annealCheckIndirectInitialized` returns `.ok ()` on `Size.ZERO` — reports
+undefined behavior in both machines via `step_stmt_lm2_1_simulation`. -/
+theorem lm21_uninit_indirect_zero_array_write_ub :
+    annealCheckIndirectInitialized (witnessMachineOf lm21ZeroArrAlloc) lm21ZeroArrMemPlace
+        (translateTy lm21U16Arr0Ty emptyLayoutTable).layout.size = .ok () ∧
+      stepMirFn lm21CopyZeroBody (lm21ZeroArrAnneal 1) = .fail .ub ∧
+      ∃ m' msg,
+        Miri.Interpreter.Step.step
+          (annealStepHooks lm21CopyZeroBody.localDecls lm21CopyZeroBody.layouts) ()
+          (lm21ZeroArrMiri 1) = (m', .error (.undefinedBehavior msg)) := by
+  have hchk :
+      annealCheckIndirectInitialized (witnessMachineOf lm21ZeroArrAlloc) lm21ZeroArrMemPlace
+        (translateTy lm21U16Arr0Ty emptyLayoutTable).layout.size = .ok () := by decide
+  have hstep : stepMirFn lm21CopyZeroBody (lm21ZeroArrAnneal 1) = .fail .ub := rfl
+  refine ⟨hchk, hstep, ?_⟩
+  have hnd : LiveAllocsNodup (witnessMachineOf lm21ZeroArrAlloc) :=
+    List.Pairwise.cons (fun _ h => nomatch h) List.Pairwise.nil
+  obtain ⟨hsim, -, -, -⟩ := step_stmt_lm2_1_simulation (lm21_zeroArr_stateRel 1) hnd
+    lm21_copyZero_phase rfl rfl (fun tf htf => by
+      obtain rfl := lm21_zeroArrFrame_eq htf
+      exact .arrayStmt (.elemAssign (.writeElem 4 lm21U16Arr0Decl (.uint .u16) 0
+        (.constantIndex 0 1 false) (.constant (lm21ConstU16 0x090A)) _
+        rfl lm21_wf_u16Arr0 lm21_isPrim_u16
+        (.constantIndex 0 1 false (by decide) (by decide)
+          ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+        (lm21_copyZero_constU16_wt _ 0x090A (by decide))
+        (fun _ h => nomatch h)
+        (Or.inr (Or.inl rfl)))))
+  rw [hstep] at hsim
+  generalize Miri.Interpreter.Step.step
+    (annealStepHooks lm21CopyZeroBody.localDecls lm21CopyZeroBody.layouts) ()
+    (lm21ZeroArrMiri 1) = r at hsim ⊢
+  cases hsim with
+  | ub m' msg => exact ⟨m', msg, rfl⟩
+
+/-- Concrete non-vacuity witness for `projectConstantIndex_malformed_invariant` on
+`[u16; 3]` (`witnessMemPlace`), confirming fail-closed `ProjectionError.invariant`
+rejection across `offset ≥ 2^64`, `minLength ≥ 2^64`, `fromEnd = false` with
+`minLength ≤ offset`, and `fromEnd = true` with `offset = 0` or `minLength < offset`. -/
+theorem lm21_malformed_constantIndex_invariant :
+    let cx := annealProjectionCx (lm21ArrMiriFrame 7 .uninit) lm21Body.layouts
+      (witnessMachineOf lm21ArrAlloc)
+    let base : Miri.Interpreter.OpTy AnnealProv :=
+      ⟨.indirect witnessMemPlace, translateTy lm21U16Arr3Ty lm21Body.layouts⟩
+    (∃ msg, annealProjectList cx base [.ConstantIndex (2 ^ 64) 3 false] =
+      .error (.invariant msg)) ∧
+    (∃ msg, annealProjectList cx base [.ConstantIndex 0 (2 ^ 64) false] =
+      .error (.invariant msg)) ∧
+    (∃ msg, annealProjectList cx base [.ConstantIndex 3 3 false] =
+      .error (.invariant msg)) ∧
+    (∃ msg, annealProjectList cx base [.ConstantIndex 0 3 true] =
+      .error (.invariant msg)) ∧
+    (∃ msg, annealProjectList cx base [.ConstantIndex 4 3 true] =
+      .error (.invariant msg)) :=
+  ⟨projectConstantIndex_malformed_invariant (lm21ArrMiriFrame 7 .uninit) lm21_wf_u16Arr3
+      (2 ^ 64) 3 false (Or.inl (Nat.le_refl _)),
+   projectConstantIndex_malformed_invariant (lm21ArrMiriFrame 7 .uninit) lm21_wf_u16Arr3
+      0 (2 ^ 64) false (Or.inr (Or.inl (Nat.le_refl _))),
+   projectConstantIndex_malformed_invariant (lm21ArrMiriFrame 7 .uninit) lm21_wf_u16Arr3
+      3 3 false (Or.inr (Or.inr ⟨by decide, Or.inl ⟨rfl, by decide⟩⟩)),
+   projectConstantIndex_malformed_invariant (lm21ArrMiriFrame 7 .uninit) lm21_wf_u16Arr3
+      0 3 true (Or.inr (Or.inr ⟨by decide, Or.inr ⟨rfl, Or.inl rfl⟩⟩)),
+   projectConstantIndex_malformed_invariant (lm21ArrMiriFrame 7 .uninit) lm21_wf_u16Arr3
+      4 3 true (Or.inr (Or.inr ⟨by decide, Or.inr ⟨rfl, Or.inr (by decide)⟩⟩))⟩
+
 end LeanMiriSpec.Correspondence.Witness
