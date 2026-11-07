@@ -47,8 +47,9 @@ Work unit `FF-4.3` delivers:
 
 - Added `MirLiftingProfile`, `analyze_mir_lifting_profile`, and
   `analyze_workspace_lifting_profile`, which inspect inline `basicBlocks :=`
-  definitions in `Mir/<Item>.lean` (skipping non-inline alias wrappers) using
-  single-pass string- and char-literal-aware comment/literal stripping
+  definitions in `Mir/<Item>.lean` (falling back to `target/anneal/units` before
+  `scaffold` runs and skipping non-inline alias wrappers) using single-pass
+  string- and char-literal-aware comment/literal stripping
   (`strip_lean_comments_and_strings`, preventing `"--"` or `"/-"` inside `span`
   or `defPath` strings from inverting string polarity) to mirror
   `Anneal.PureMirExec.checkPureMir` across five axes:
@@ -57,13 +58,14 @@ Work unit `FF-4.3` delivers:
      copyForDeref}` (without false-triggering on nested `RigidTy.{ref, rawPtr}`
      or pure `AggregateKind.rawPtr`), `CastKind.{pointerCoercion, fnPtrToPtr,
      ptrToPtr}`, `ConstValue.indirect`, `ConstValue.slice (ConstScalar.ptr ..)`,
-     `StatementKind.{fakeRead, retag, backwardIncompatibleDropHint}`,
-     non-`assume` intrinsics, and `TerminatorKind.{call, tailCall, inlineAsm}`.
+     `StatementKind.{retag, backwardIncompatibleDropHint}`, non-`assume`
+     intrinsics, and `TerminatorKind.{call, tailCall, inlineAsm}`.
   2. `has_mut_borrow` vs. `has_deref_projection`: separates exclusive `&mut`
-     borrows (`RigidTy.ref Mutability.mut`, `BorrowKind.mut`) targeting Tier 2
-     `Anneal.SepLogicLenses` (`SepLensStateInv`, `SepSubplaceLensStateInv`,
-     `LiftLensBlock`, `verifyStatefulMir_of_sepLenses`) from read-only shared
-     `&T` or raw-pointer dereferences (`Anneal.PureMirExec.runCfgToBlock` +
+     borrows (`BorrowKind.mut`, or `ProjectionElem.deref` with `&mut` locals)
+     targeting Tier 2 `Anneal.SepLogicLenses` (`SepLensStateInv`,
+     `SepSubplaceLensStateInv`, `LiftLensBlock`, and
+     `verifyStatefulMir_of_sepLenses`) from read-only shared `&T` or
+     raw-pointer dereferences (`Anneal.PureMirExec.runCfgToBlock` +
      `Anneal.MirFuelFree.verifyStatefulMirNoPanic_of_wpConverges` or
      `Anneal.Rustc.V2026_06_01.SymbolicEval.dischargeStatefulEqFuelFree`).
   3. `has_cfg_back_edge`: presence of a CFG edge `bb_i -> bb_j` with `j <= i`
@@ -72,8 +74,9 @@ Work unit `FF-4.3` delivers:
      `Anneal.MirLoops.forRangeUp` (`mirNoCallWpConverges_forRangeUp`) and
      `Anneal.PureMirExec.runCfgToBlock`.
   4. `type_param_count`: generic `CapturedMir` bodies (`CapturedMir.instantiate`
-     / `LayoutTable.instantiateForBody` via `open Trusted.MirAst Trusted.Layout`
-     and fuel-free lifting of `*ClaimFor typeArgs`).
+     / `LayoutTable.instantiateForBody` via `open Trusted.MirAst
+     Anneal.PureMirExec Anneal.MirLiftCore` and fuel-free lifting of `*ClaimFor
+     typeArgs`).
   5. `has_inline_companions` & `has_impure_inline_companions`: distinguishes
      `#[spec]` `requires` / `ensures` companion bodies eligible for the
      `#mir_lift_spec` theorem family in `Anneal.PureMirExec`
@@ -83,18 +86,18 @@ Work unit `FF-4.3` delivers:
 - Added `render_scaffold_lifting_hints` and `render_proof_template_with_hints`
   (re-exported from `crates/cargo-anneal/src/lib.rs`), emitting `<= 80`-column
   `--` Lean comment blocks with verified `open` namespaces (`Trusted.MirAst`,
-  `Trusted.Layout`, `Anneal.PureMirExec`, `Anneal.MirLiftCore`,
-  `Anneal.MirFuelFree`, `Anneal.MirLoops`, `Anneal.SepLogicLenses`,
-  `Anneal.FunctionalTranslation`, `Anneal.BitValidity`, and
-  `Anneal.Rustc.V2026_06_01.SymbolicEval`), compatible with
-  `TrustedBoundary.lean` and ignored by comment-stripping checks in
+  `Anneal.PureMirExec`, `Anneal.MirLiftCore`, `Anneal.MirFuelFree`,
+  `Anneal.MirLoops`, `Anneal.SepLogicLenses`, `Anneal.FunctionalTranslation`,
+  `Anneal.BitValidity`, and `Anneal.Rustc.V2026_06_01.SymbolicEval`), compatible
+  with `TrustedBoundary.lean` and ignored by comment-stripping checks in
   `detect_authored_item_modules` and `check_specs_non_vacuous`.
 
 ### 1.2 `agent-context` Strategy Guide (`crates/cargo-anneal/src/agent.rs`)
 
 - Made `strip_lean_comments` string- and char-literal-aware so `"--"` or `"/-"`
   inside `ItemSpec "..."` string literals never truncates spec declarations.
-- Updated `render_agent_context` to include:
+- Updated `render_agent_context` (including pre-scaffold fallback to
+  `target/anneal/units`) to include:
   - A top-level `## Proof Lifting Strategy Guide (Lift First, Evaluate Last)`
     documenting `#mir_lift` (`argCount = 0` closed-body elaborator) vs.
     parametric `Proof/*.lean` `LiftBlock` rules, `#mir_lift_spec` companion
@@ -148,14 +151,15 @@ Committed **locally only** on branch `adv/ff-4-3-reference` in
   findings `F-01`–`F-08`, and explicit `Boundaries` classifications
   (`unsupported`, `known not to apply`, `not examined`, `unknown`).
 - `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/support/`:
-  - `FuelFreeMirLiftingAndLensesProbe.lean`: 798-line self-contained Lean
+  - `FuelFreeMirLiftingAndLensesProbe.lean`: 837-line self-contained Lean
     `v4.34.1` mechanization (`Init`-only, zero `sorry`, constructive axioms
-    only) proving 15 exported theorems: `evalFuel_mono`, `StepsTo.bind_wp`,
+    only) proving 17 exported theorems: `evalFuel_mono`, `StepsTo.bind_wp`,
     `checkPureProg_rejects_deref`, `stepPure_simulates`,
     `wpConverges_of_pureExec`, `chained_sets_collapse_rfl`,
     `forRangeUp_induction`, `wpConverges_forRangeUp`,
     `stepsTo_of_runToTarget_reached`, `wpConverges_of_runToTarget_halted`,
-    `runToTarget_mono_bound`, `no_uniform_fuel_countUp`,
+    `runToTarget_mono_bound`, `stepsTo_of_runCfgToBlock_reached`,
+    `wpConverges_of_runCfgToBlock_halted`, `no_uniform_fuel_countUp`,
     `countUp_wpConverges_all_n`, `subplaceFieldLens_disjoint`, and
     `liftLens_twoBorrowAdd_sound`.
   - `wireframe_benchmark_metrics.json`: verified per-function LOC (`8,009 ->
@@ -164,9 +168,10 @@ Committed **locally only** on branch `adv/ff-4-3-reference` in
     shared-theory migration delta (`+2,972` net LOC), and post-integration
     module LOC (`PureMirExec.lean` `20,564` LOC, `85 s -> 35.1 s`).
   - `verify_probes.py`: automated verifier checking 80-column formatting, Lean
-    `v4.34.1` compilation, `#print axioms` on all 15 theorems, report prose
-    width / theorem-declaration line-range citations / public-hygiene checks,
-    and dataset cross-checks.
+    `v4.34.1` compilation, `#print axioms` on all 17 theorems, zero step/fuel
+    numerals in `countUp_wpConverges_all_n`, report prose width /
+    theorem-declaration line-range citations / public-hygiene checks, and
+    dataset cross-checks.
 - `CATALOG.json`: deterministically regenerated by `python3 tools/reference.py
   catalog` (`166` reports).
 

@@ -1689,17 +1689,41 @@ impl MirLiftingProfile {
     }
 }
 
-/// Inspect `mir_root` on disk for `bundle`'s subject and inline companion MIR
-/// modules and compute its `MirLiftingProfile`.
+/// Resolve `rel_item_path` under `mir_root` (`.anneal/generated/Mir`) first,
+/// falling back to `find_source_mir_file` in `<workspace>/target/anneal/units`
+/// when `.anneal/generated/Mir` has not been materialized yet.
+pub(crate) fn resolve_workspace_mir_file(
+    mir_root: &Path,
+    record: &UnitTargetRecord,
+    rel_item_path: &Path,
+) -> Option<PathBuf> {
+    let direct = mir_root.join(rel_item_path);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let fallback_cfg = mir_root
+        .parent()
+        .and_then(|g| g.parent())
+        .and_then(|d| d.parent())
+        .map(ScaffoldConfig::new)?;
+    find_source_mir_file(&fallback_cfg, record, rel_item_path)
+}
+
+/// Inspect `mir_root` on disk (with fallback to `target/anneal/units`) for
+/// `bundle`'s subject and inline companion MIR modules and compute its
+/// `MirLiftingProfile`.
 pub fn analyze_workspace_lifting_profile(
     mir_root: &Path,
     bundle: &SubjectObligationBundle,
 ) -> MirLiftingProfile {
-    let subj_mir = fs::read_to_string(mir_root.join(&bundle.item_rel_path)).ok();
+    let subj_mir = resolve_workspace_mir_file(mir_root, &bundle.subject, &bundle.item_rel_path)
+        .and_then(|p| fs::read_to_string(p).ok());
     let mut comp_mirs = Vec::new();
     for comp in bundle.inline_requires.iter().chain(&bundle.inline_ensures) {
         let rel = module_suffix_to_rel_path(&derive_item_module_suffix(comp));
-        if let Ok(txt) = fs::read_to_string(mir_root.join(rel)) {
+        if let Some(txt) =
+            resolve_workspace_mir_file(mir_root, comp, &rel).and_then(|p| fs::read_to_string(p).ok())
+        {
             comp_mirs.push(txt);
         }
     }
@@ -1802,14 +1826,15 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let norm_blocks = normalize_parens_and_ws(blocks_slice);
 
     let has_deref_projection = has_dotted_ctor(&norm_blocks, "deref");
-    let has_mut_borrow = norm_decls.contains("RigidTy.ref Mutability.mut")
+    let decls_have_mut_ref = norm_decls.contains("RigidTy.ref Mutability.mut")
         || norm_decls.contains(".ref Mutability.mut")
         || norm_decls.contains("RigidTy.ref .mut ")
-        || norm_decls.contains(".ref .mut ")
-        || norm_blocks.contains("BorrowKind.mut")
+        || norm_decls.contains(".ref .mut ");
+    let blocks_have_mut_borrow = norm_blocks.contains("BorrowKind.mut")
         || norm_blocks.contains("Rvalue.ref .mut ")
         || norm_blocks.contains(" .ref .mut true ")
         || norm_blocks.contains(" .ref .mut false ");
+    let has_mut_borrow = blocks_have_mut_borrow || (has_deref_projection && decls_have_mut_ref);
 
     let has_rvalue_ref_or_raw = norm_blocks.contains("Rvalue.ref ")
         || norm_blocks.contains("Rvalue.rawPtr ")
@@ -1840,7 +1865,6 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
             "fnPtrToPtr",
             "ptrToPtr",
             "ConstValue.indirect",
-            "fakeRead",
             "retag",
             "backwardIncompatibleDropHint",
             "inlineAsm",
@@ -2185,12 +2209,13 @@ pub fn render_scaffold_lifting_hints(
 
     if is_polymorphic {
         bullets.push(
-            "Polymorphic MIR (`open Trusted.MirAst Trusted.Layout \
-             Anneal.PureMirExec`): `intro typeArgs h_len` on `poly*Claim`, \
-             where `*ClaimFor typeArgs` instantiates \
+            "Polymorphic MIR (`open Trusted.MirAst Anneal.PureMirExec \
+             Anneal.MirLiftCore`; plus `Anneal.SepLogicLenses` or \
+             `Anneal.MirFuelFree` for stateful/loop bodies): `intro typeArgs \
+             h_len` on `poly*Claim`, where `*ClaimFor typeArgs` instantiates \
              `Mir.<Item>.body.instantiate typeArgs` (`CapturedMir.instantiate` \
-             and `LayoutTable.instantiateForBody`), then discharge \
-             `*ClaimFor typeArgs` with fuel-free lifting theorems \
+             and `LayoutTable.instantiateForBody`), then discharge `*ClaimFor \
+             typeArgs` with fuel-free lifting theorems \
              (`verifyMirNoPanic_of_pureExec`, \
              `verifyStatefulMir_of_sepLenses`, or \
              `verifyStatefulMirNoPanic_of_wpConverges`)."
@@ -3537,6 +3562,8 @@ def body : CapturedMir :=
         };
         let max_hints = render_scaffold_lifting_hints(&poly_bundle, max_authored, &prof_poly);
         assert!(max_hints.contains("CapturedMir.instantiate"));
+        assert!(max_hints.contains("open Trusted.MirAst Anneal.PureMirExec"));
+        assert!(!max_hints.contains("Trusted.Layout"));
         assert!(!max_hints.contains("Body.instantiate"));
         assert!(!max_hints.contains("verifyPoly"));
         assert!(max_hints.contains("#[spec(equivalent_to: ...)]"));
@@ -3547,5 +3574,41 @@ def body : CapturedMir :=
         for line in max_hints.lines() {
             assert!(line.chars().count() <= 80, "line > 80 cols: {line}");
         }
+
+        // 6. An unused `&mut` local without `.deref` or `BorrowKind.mut` stays pure
+        //    (`has_mut_borrow == false`), and `analyze_workspace_lifting_profile`
+        //    falls back to `target/anneal/units` before `.anneal/generated/Mir` exists.
+        let unused_mut_mir = r#"def body : CapturedMir := {
+            localDecls := [{ mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 0 }, debugName := .none }],
+            basicBlocks := [{ statements := [], terminator := { kind := .return_, span := "" }, isCleanup := false }]
+          }"#;
+        let prof_unused_mut = analyze_mir_lifting_profile(
+            &mk_bundle("demo::unused_mut", CapturedItemKind::Subject),
+            Some(unused_mut_mir),
+            &[],
+        );
+        assert!(
+            prof_unused_mut.is_pure_call_free_candidate() && !prof_unused_mut.has_mut_borrow,
+            "unused &mut in localDecls without deref or BorrowKind.mut must remain pure: {prof_unused_mut:?}"
+        );
+
+        let fallback_ws = unique_temp_dir("profile_units_fallback");
+        let fallback_unit = fallback_ws.join("target/anneal/units/u0/Mir/Demo");
+        fs::create_dir_all(&fallback_unit).expect("create fallback unit dir");
+        fs::write(fallback_unit.join("item.lean"), cleanup_poly_mir)
+            .expect("write fallback unit mir");
+        let mut fallback_bundle = mk_bundle("demo::item", CapturedItemKind::Subject);
+        fallback_bundle.subject.target.mir_module_sha256.clear();
+        let prof_fallback = analyze_workspace_lifting_profile(
+            &fallback_ws.join(".anneal/generated/Mir"),
+            &fallback_bundle,
+        );
+        assert!(
+            prof_fallback.has_captured_mir
+                && prof_fallback.type_param_count == 2
+                && prof_fallback.has_cfg_back_edge,
+            "analyze_workspace_lifting_profile must fall back to target/anneal/units: {prof_fallback:?}"
+        );
+        let _ = fs::remove_dir_all(&fallback_ws);
     }
 }

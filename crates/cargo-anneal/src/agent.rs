@@ -1570,8 +1570,12 @@ pub fn render_agent_context(
             ));
         }
 
-        let mir_disk = generated_root.join("Mir").join(&bundle.item_rel_path);
-        if mir_disk.is_file() {
+        let mir_root = generated_root.join("Mir");
+        if let Some(mir_disk) = crate::scaffold::resolve_workspace_mir_file(
+            &mir_root,
+            &bundle.subject,
+            &bundle.item_rel_path,
+        ) {
             let mir_text = fs::read_to_string(&mir_disk).map_err(|err| {
                 format!("failed to read {}: {}", mir_disk.display(), err)
             })?;
@@ -1581,8 +1585,7 @@ pub fn render_agent_context(
             ));
         }
 
-        let lifting_profile =
-            analyze_workspace_lifting_profile(&generated_root.join("Mir"), bundle);
+        let lifting_profile = analyze_workspace_lifting_profile(&mir_root, bundle);
         out.push_str(&render_item_lifting_guidance(
             bundle,
             authored,
@@ -1629,7 +1632,7 @@ fn render_lifting_strategy_guide_section() -> &'static str {
        - For `&mut` borrows, `open Anneal.SepLogicLenses Anneal.FunctionalTranslation Anneal.MirLiftCore`, erase Tree Borrows and `Memory` aliasing via whole-slot `SepLensStateInv` (`ActiveTypedMutBorrow`, `treeMemoryPtrMutLens`) or sibling-field `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`, `treeFieldMemoryPtrMutLens`, `subplaceTreeMutLens`), derive `LiftLensBlock` (`LiftLensStmts`, `set?_of_forcePureEnv? rfl`), and conclude with `verifyStatefulMir_of_sepLenses`, `verifyStatefulMir_of_sepSubplaceLenses`, `mirWpConverges_of_sepLenses`, or `verifyTotalMir_of_sepLenses`.\n  \
        - For shared `&T` / `*const T` reads without `&mut` borrows, `open Anneal.PureMirExec Anneal.MirFuelFree Anneal.Rustc.V2026_06_01.SymbolicEval` and step intraprocedurally via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, `verifyStatefulMirNoPanic_of_wpConverges`) or `dischargeStatefulEqFuelFree` on concrete pinned memory.\n\
      - **Pattern E — Polymorphic MIR (`CapturedMir.instantiate`) & Bit-Validity (`Anneal.BitValidity`)**:\n  \
-       - For generic items (`typeParamCount > 0` / `poly*Claim`), `open Trusted.MirAst Trusted.Layout Anneal.PureMirExec`, introduce `typeArgs` and `h_len` (`*ClaimFor typeArgs` instantiates `Mir.<Item>.body.instantiate typeArgs` via `CapturedMir.instantiate` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n  \
+       - For generic items (`typeParamCount > 0` / `poly*Claim`), `open Trusted.MirAst Anneal.PureMirExec Anneal.MirLiftCore` (plus `Anneal.SepLogicLenses` or `Anneal.MirFuelFree` for stateful/loop bodies), introduce `typeArgs` and `h_len` (`*ClaimFor typeArgs` instantiates `Mir.<Item>.body.instantiate typeArgs` via `CapturedMir.instantiate` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` (`claimFor`, `statefulClaimFor`, `totalClaimFor`, `modularClaimFor`, `ubExceptionClaimFor`) with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n  \
        - For `#[invariant]` and `#[unsafe_impl]` layout/transmutation proofs, `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, `checkFromZeros_sound`, `checkFromBytes_sound`, `checkIntoBytes_sound`, and `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`.\n\n"
 }
 
@@ -1670,7 +1673,7 @@ fn render_item_lifting_guidance(
     }
     if is_polymorphic {
         out.push_str(&format!(
-            "- **Polymorphic MIR Route (`CapturedMir.instantiate`)**: `Mir.{item}.body` is generic (`typeParamCount > 0` or `poly*Claim`); `open Trusted.MirAst Trusted.Layout Anneal.PureMirExec`, `intro typeArgs h_len` (`*ClaimFor typeArgs` instantiates `Mir.{item}.body.instantiate typeArgs` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n"
+            "- **Polymorphic MIR Route (`CapturedMir.instantiate`)**: `Mir.{item}.body` is generic (`typeParamCount > 0` or `poly*Claim`); `open Trusted.MirAst Anneal.PureMirExec Anneal.MirLiftCore` (plus `Anneal.SepLogicLenses` or `Anneal.MirFuelFree` for stateful/loop bodies), `intro typeArgs h_len` (`*ClaimFor typeArgs` instantiates `Mir.{item}.body.instantiate typeArgs` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n"
         ));
     }
     if profile.has_cfg_back_edge {
@@ -2657,10 +2660,32 @@ end Mir.Demo.loop_fn
         assert!(ctx_pure.contains("<item>_lift_sound"));
         assert!(ctx_pure.contains("LiftResidualBlock"));
         assert!(ctx_pure.contains("CapturedMir.instantiate"));
+        assert!(ctx_pure.contains("open Trusted.MirAst Anneal.PureMirExec Anneal.MirLiftCore"));
+        assert!(!ctx_pure.contains("Trusted.Layout"));
         assert!(ctx_pure.contains("Anneal.BitValidity"));
         assert!(ctx_pure.contains("checkFromBytes_sound"));
         assert!(!ctx_pure.contains("Body.instantiate"));
         assert!(!ctx_pure.contains("verifyPoly"));
+
+        // Verify pre-scaffold fallback from `target/anneal/units` when `.anneal/generated/Mir`
+        // has not been materialized yet.
+        let units_ws = unique_temp_dir("lifting-guidance-units-fallback");
+        let unit_mir_dir = units_ws.join("target/anneal/units/u0/Mir/Demo");
+        fs::create_dir_all(&unit_mir_dir).expect("create unit Mir/Demo");
+        fs::write(unit_mir_dir.join("loop_fn.lean"), loop_mir).expect("write unit loop_fn.lean");
+        let mut unit_rec = mk_rec(
+            "demo::loop_fn",
+            "Mir/Demo/loop_fn.lean",
+            "Mir.Demo.loop_fn",
+            CapturedItemKind::Subject,
+            None,
+        );
+        unit_rec.target.mir_module_sha256.clear();
+        let ctx_units = render_agent_context(&units_ws, &[unit_rec], Some("demo::loop_fn"))
+            .expect("render context from target/anneal/units");
+        assert!(ctx_units.contains("### Captured MIR Module"));
+        assert!(ctx_units.contains("Primary Loop Route (`forRangeUp` + `runCfgToBlock`)"));
+        let _ = fs::remove_dir_all(&units_ws);
 
         let ctx_mut = render_agent_context(&ws, &records, Some("demo::mut_fn"))
             .expect("render context for mut_fn");
