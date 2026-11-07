@@ -71,41 +71,16 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
   | true =>
     exact eq_zero_or_one_of_mod2_eq (Nat.eq_of_beq_eq_true h_eq).symm
 
-private theorem ensures_holds_one :
-    MirBoolPredicateHolds
-      Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.body
-      [.scalar { bits := 1, sizeBytes := 1 }, .scalar { bits := 1, sizeBytes := 1 }] :=
-  mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl
-
-private theorem ensures_holds_zero :
-    MirBoolPredicateHolds
-      Mir.WireframeDemo.__anodized_fn_ensures_parse_compression_flag.body
-      [.scalar { bits := 0, sizeBytes := 1 }, .scalar { bits := 0, sizeBytes := 1 }] :=
-  mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl
-
-private theorem compressionFlagPost_one (b : Nat) (hb1 : b = 1) :
+private theorem compressionFlagPost_bit (b : Nat) (hb : b = 0 ∨ b = 1) :
     compressionFlagPost
       [.scalar { bits := b, sizeBytes := 1 }]
-      (.scalar { bits := 1, sizeBytes := 1 }) := by
-  subst hb1
+      (.scalar { bits := b, sizeBytes := 1 }) := by
   intro b' h_eq
   injection h_eq with h_hd _
   injection h_hd with h_sc
   injection h_sc with h_bits _
   subst h_bits
-  rfl
-
-private theorem compressionFlagPost_zero (b : Nat) (hb0 : b = 0) :
-    compressionFlagPost
-      [.scalar { bits := b, sizeBytes := 1 }]
-      (.scalar { bits := 0, sizeBytes := 1 }) := by
-  subst hb0
-  intro b' h_eq
-  injection h_eq with h_hd _
-  injection h_hd with h_sc
-  injection h_sc with h_bits _
-  subst h_bits
-  rfl
+  rcases hb with rfl | rfl <;> rfl
 
 /-- Total-safety + functional verification certificate for
 `parse_compression_flag`.
@@ -123,9 +98,9 @@ theorem verified : VerificationResult Obligations.WireframeDemo.parse_compressio
   repeat apply LiftStmtsTerminator.cons_eval (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   rintro ⟨h_req, -⟩
-  rcases rustRequires_imp_zero_or_one b h_req with rfl | rfl
-  · exact ⟨ensures_holds_zero, compressionFlagPost_zero 0 rfl⟩
-  · exact ⟨ensures_holds_one, compressionFlagPost_one 1 rfl⟩
+  rcases rustRequires_imp_zero_or_one b h_req with rfl | rfl <;>
+    exact ⟨mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl,
+      compressionFlagPost_bit _ (by decide)⟩
 
 /-- Non-vacuity witness confirming `parse_compression_flag`'s functional
 `rustRequires` contract is satisfiable (`flags_byte = 1`). -/

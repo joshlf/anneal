@@ -156,7 +156,12 @@ Factor the proof into three cleanly separated theorems:
    that takes `MirBoolPredicateHolds __anodized_fn_requires_<item>.body args` and
    returns pure Lean arithmetic hypotheses (e.g.,
    `∃ b1 b2, v1 = .scalar ⟨b1, 2⟩ ∧ v2 = .scalar ⟨b2, 2⟩ ∧ b1 ≤ 16 ∧ b2 ≤ 1024`),
-   discharging impossible branches with `nomatch`.
+   discharging impossible branches with `nomatch`. When short-circuiting
+   `&&`/`||` checks require multiple `wpBlockLinear` unfolds across argument and
+   comparison splits, drive one shared `dsimp only [...]` list with
+   `iterate k (...; first | ...)` rather than duplicating the unfold list per
+   branch (`Proof/WireframeDemo/clamp_payload_window.lean`,
+   `frame_total_len.lean`).
 2. **`ensures_holds` (Forward Postcondition Discharge):** A standalone theorem
    that takes pure arithmetic bounds on `b1, b2, ret` and proves
    `MirBoolPredicateHolds __anodized_fn_ensures_<item>.body [v1, v2, ret]`.

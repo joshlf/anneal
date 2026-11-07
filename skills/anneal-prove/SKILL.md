@@ -250,7 +250,12 @@ they fail `checkPureMir` and the theorems above do not apply. For those, invert
 `requires` with `holdBoolReq_of_mirBool` and prove `ensures` with
 `hold_mirBool_of_blockLinear`; both evaluate the companion with the
 body-derived budget `defaultSpecSteps` (`16 * #blocks + 80`), so they are
-bounded evaluations, not lifts. For concrete arguments,
+bounded evaluations, not lifts. When a multi-branch companion needs several
+`wpBlockLinear` unfolds across argument or comparison splits, drive one shared
+`dsimp only [...]` list with `iterate k (...; first | ...)` instead of
+repeating the unfold list per branch (see
+`Proof/WireframeDemo/clamp_payload_window.lean` and `frame_total_len.lean`).
+For concrete arguments,
 `mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl` decides the
 companion by evaluation.
 
@@ -356,7 +361,8 @@ and apply these nine rules:
    unification and never unfold `Mir.<Crate>.<Item>.body` into the goal.
 2. **Use `forRangeUp` and `Anneal.SepLogicLenses` for loops and references:**
    Model bounded loops with `forRangeUp` and prove them with
-   `mirWpConverges_forRangeUp` (or `mirWpConverges_whileRank`) and a loop
+   `mirWpConverges_forRangeUp` (or `mirNoCallWpConverges_forRangeUp`,
+   `mirWpConverges_whileRank`) and a loop
    invariant (`Proof/WireframeDemo/checksum_frame_safe.lean`); lift
    reference arguments with `LiftLensBlock` and `verifyStatefulMir_of_sepLenses`
    / `mirWpConverges_of_sepLenses` (`Proof/WireframeDemo/advance_cursor.lean`).

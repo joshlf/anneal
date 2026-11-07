@@ -27,7 +27,7 @@ open Specs.WireframeDemo.checksum_frame_safe
 
 /-!
 Stateful loop proof for `wireframe_demo::checksum_frame_safe`. The
-`while i < 4` loop is proved with `mirWpConverges_forRangeUp` over the
+`while i < 4` loop is proved with `mirNoCallWpConverges_forRangeUp` over the
 invariant `checksumLoopInv`; the entry segment (`bb0` to the loop header
 `bb1`), every iteration (`bb1` back to `bb1`), and the exit (`bb1` to the
 return) are each evaluated by `runCfgToBlock` with target `bb1`, so the proof
@@ -139,7 +139,7 @@ def checksumLoopState (mem : Memory) (i a : Nat)
         .uninit, t v20, t v21, .uninit, .uninit, .uninit, t v25, t v26, t v27] }
     memory := mem }
 
-/-- Loop invariant at `bb1` for `mirWpConverges_forRangeUp`. -/
+/-- Loop invariant at `bb1` for `mirNoCallWpConverges_forRangeUp`. -/
 def checksumLoopInv (b0 b1 b2 b3 b4 b5 b6 b7 : Nat) (mem : Memory)
     (i : Nat) (a : Nat) (s : MachineState) : Prop :=
   i ≤ 4 ∧

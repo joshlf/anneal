@@ -86,135 +86,50 @@ private theorem wpReq_inversion (v1 v2 : Value)
       Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body
       [v1, v2] rfl rfl h_req
   revert h_hold
-  dsimp only [
-    Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.layouts,
-    Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body,
-    defaultSpecSteps, entryBB, dummyBB, lookupBlock,
-    wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-    stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-    finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
-    evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-    mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree, operandIsSigned, operandTy,
-    sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy,
-    resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
-    scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-    mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-    evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-    MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
-    initMachineState, initLocals, initLocalsAux, emptyMemory, mirSafePost,
-    readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag, lookupBorrow,
-    appendProjections, stripTransparentProjections, projectionsOverlap,
-    projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
-    borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
-    natListContainsBool, invalidateConflictingBorrows,
-    invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-    freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
-    updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
-    isBorrowDescendantOrSelfAux, boolToScalar,
-    GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-    HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-    List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-    get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
-    ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-    Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-  rcases v1 with _ | ⟨b1, sz1⟩ | ⟨p1, psz1⟩ | ⟨vid1, flds1⟩
-  · intro h; exact False.elim h.val
-  · dsimp only [finishAssignSymTree, evalSymNodeTree]
-    cases h_sz1_0 : Nat.beq sz1 0 with
-    | true => intro h; exact False.elim h.val
-    | false =>
-      cases h_sz1_2 : Nat.beq sz1 2 with
-      | false => intro h; exact False.elim h.val
-      | true =>
-        cases h_ble1 : Nat.ble b1 65535 <;>
-          dsimp only [
-            Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.layouts,
-            Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body,
-            lookupBlock, wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-            stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-            finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
-            evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-            mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree, operandIsSigned, operandTy,
-            sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy,
-            resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
-            scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-            mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-            evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-            MirStepNode.step, MirStepNode.retNormal, SymTree.bind, mirSafePost,
-            readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag, lookupBorrow,
-            appendProjections, stripTransparentProjections, projectionsOverlap,
-            projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
-            borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
-            natListContainsBool, invalidateConflictingBorrows,
-            invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-            freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
-            updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
-            isBorrowDescendantOrSelfAux, boolToScalar,
-            GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-            HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-            List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-            get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
-            ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
-            Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-        · rintro ⟨h_val⟩
-          injection h_val with h_sc
-          injection h_sc with h_bits _
-          nomatch h_bits
-        · rcases v2 with _ | ⟨b2, sz2⟩ | ⟨p2, psz2⟩ | ⟨vid2, flds2⟩
-          · intro h; exact False.elim h.val
-          · dsimp only [finishAssignSymTree, evalSymNodeTree]
-            cases h_sz2_0 : Nat.beq sz2 0 with
-            | true => intro h; exact False.elim h.val
-            | false =>
-              cases h_sz2_2 : Nat.beq sz2 2 with
-              | false => intro h; exact False.elim h.val
-              | true =>
-                cases h_ble2 : Nat.ble b2 1024 with
-                | false =>
-                  dsimp only [
-                    Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.layouts,
-                    Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body,
-                    lookupBlock, wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
-                    stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-                    finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
-                    evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
-                    mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
-                    scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-                    mul_1_8, mul_2_8, mul_4_8, mul_8_8,
-                    evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
-                    MirStepNode.step, MirStepNode.retNormal, SymTree.bind, mirSafePost,
-                    readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag,
-                    lookupBorrow, appendProjections, stripTransparentProjections,
-                    projectionsOverlap, projectionsOverlapAux, borrowEntryOverlapsWrite,
-                    byteRangesOverlapBool, borrowEntryWriteConflicts, hasProtectedWriteConflict,
-                    isBorrowProtected, natListContainsBool, invalidateConflictingBorrows,
-                    invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
-                    freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
-                    updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
-                    isBorrowDescendantOrSelfAux, sharedBorrowPerm, placeTy, resolveProjectedTy,
-                    pointeeTyOf, elemTyOf, tyIsFreeze, rigidTyIsFreeze, stringEq, boolToScalar,
-                    GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
-                    HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
-                    List.replicate, List.append, List.length, List.set, List.map, Option.getD,
-                    get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or,
-                    Bool.not, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
-                    instDecidableEqNat, Bool.decEq, instDecidableEqBool, BEq.beq,
-                    instBEqOfDecidableEq]
-                  rintro ⟨h_val⟩
-                  injection h_val with h_sc
-                  injection h_sc with h_bits _
-                  nomatch h_bits
-                | true =>
-                  intro _
-                  exact ⟨b1, b2,
-                    by rw [Nat.eq_of_beq_eq_true h_sz1_2],
-                    by rw [Nat.eq_of_beq_eq_true h_sz2_2],
-                    Nat.le_of_ble_eq_true h_ble1,
-                    Nat.le_of_ble_eq_true h_ble2⟩
-          · intro h; exact False.elim h.val
-          · intro h; exact False.elim h.val
-  · intro h; exact False.elim h.val
-  · intro h; exact False.elim h.val
+  iterate 4 (
+    dsimp only [
+      Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.layouts,
+      Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body,
+      defaultSpecSteps, entryBB, dummyBB, lookupBlock,
+      wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
+      stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
+      finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
+      evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
+      mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree, operandIsSigned, operandTy,
+      sharedBorrowPerm, rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy,
+      resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
+      scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
+      mul_1_8, mul_2_8, mul_4_8, mul_8_8,
+      evalTerminatorSymTreeFast, lookupSwitchTargetTree, applyUnwindAction,
+      MirStepNode.step, MirStepNode.retNormal, SymTree.bind,
+      initMachineState, initLocals, initLocalsAux, emptyMemory, mirSafePost,
+      readProjectedValue_nil, readProjectedValue_field, ProvenancePtr.tag, lookupBorrow,
+      appendProjections, stripTransparentProjections, projectionsOverlap,
+      projectionsOverlapAux, borrowEntryOverlapsWrite, byteRangesOverlapBool,
+      borrowEntryWriteConflicts, hasProtectedWriteConflict, isBorrowProtected,
+      natListContainsBool, invalidateConflictingBorrows,
+      invalidateConflictingBorrowsAtProj, updateBorrowPerm, updateBorrowPermAtProj,
+      freezeDerefReadBorrowsAt, freezeTreeBorrowsOnReadAtProj,
+      updateBorrowPermOnReadAtProj, isBorrowDescendantOrSelf,
+      isBorrowDescendantOrSelfAux, boolToScalar,
+      GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
+      HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
+      List.replicate, List.append, List.length, List.set, List.map, Option.getD,
+      get?, set?, length, Nat.add, Nat.mul, Nat.ble, Nat.beq, Bool.and, Bool.or, Bool.not,
+      ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
+      Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
+    first
+    | (rintro ⟨h_val⟩; injection h_val with h_sc; injection h_sc with h_bits _; nomatch h_bits)
+    | (rcases v1 with _ | ⟨b1, _ | _ | _ | sz1⟩ | _ | _ <;>
+        (dsimp only [finishAssignSymTree, evalSymNodeTree, Nat.beq]; try rintro ⟨⟨⟩⟩);
+       cases h_ble1 : Nat.ble b1 65535)
+    | (rcases v2 with _ | ⟨b2, _ | _ | _ | sz2⟩ | _ | _ <;>
+        (dsimp only [finishAssignSymTree, evalSymNodeTree, Nat.beq]; try rintro ⟨⟨⟩⟩);
+       cases h_ble2 : Nat.ble b2 1024;
+       case true =>
+         intro _
+         exact ⟨b1, b2, rfl, rfl,
+           Nat.le_of_ble_eq_true h_ble1, Nat.le_of_ble_eq_true h_ble2⟩))
 
 /-- Universal verification certificate for `clamp_payload_window` across all
 `requested : u16` and `max_window ≤ 1024`.

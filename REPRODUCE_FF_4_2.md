@@ -35,14 +35,14 @@ than trusting this file.
   files; the bounded evaluations that remain use `defaultSpecSteps` (on the
   three impure `#[spec]` companions) or the fixed-budget `*FuelFree` wrappers
   inside `Anneal` (Section 2).
-- Proof LOC in `Proof/WireframeDemo/*.lean`: `8,009 → 1,619` (−79.8%) against
-  the last complete proof corpus `a6bebfc2`, and `4,264 → 1,619` (−62.0%)
-  against `0d3242d3` (whose `clamp_payload_window`, `frame_total_len`, and
-  `parse_compression_flag` files are 33/33/158-line stubs without `verified`,
-  see Section 3). The migration added `+2,972` net LOC of shared theory
-  (Section 3.2).
+- Proof LOC in `Proof/WireframeDemo/*.lean`: `8,009 → 1,417` (−82.3%)
+  against the last complete proof corpus `a6bebfc2`, and `4,264 → 1,417`
+  (−66.8%) against `0d3242d3` (whose `clamp_payload_window`,
+  `frame_total_len`, and `parse_compression_flag` files are 33/33/158-line
+  stubs without `verified`, see Section 3). The migration added `+2,972` net
+  LOC of shared theory (Section 3.2).
 - Measured elaboration heartbeats for the seven proofs fall from `1,388,934`
-  to `666,246` thousand (−52.0%) against their `[adv B2]` versions
+  to `665,351` thousand (−52.1%) against their `[adv B2]` versions
   (Section 4.2).
 
 ## 2. Which lifting API each proof uses
@@ -110,18 +110,18 @@ their `wpReq_inversion` lemma, call the `mir_lift_spec` tactic that the
 `Anneal` umbrella never imports, and define no `verified` theorem, so the
 `0d3242d3` column understates the cost of a complete proof.
 
-| Proof | `a6bebfc2` | `0d3242d3` | `[adv B1]` `a6aae5b8` | `[adv A1]` `07b582eb` | `[adv B2]` `ecdf04bf` | `[adv A2]` `fbd40894` | `[adv B3]` `faf8961c` | this revision | vs `a6bebfc2` |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `advance_cursor.lean` | 227 | 227 | 171 | 149 | 258 | 231 | 231 | 231 | +1.8% |
-| `checksum_frame_fast.lean` | 1,592 | 1,592 | 433 | 433 | 433 | 432 | 174 | 174 | −89.1% |
-| `checksum_frame_safe.lean` | 1,242 | 1,242 | 196 | 196 | 569 | 250 | 275 | 275 | −77.9% |
-| `clamp_payload_window.lean` | 1,595 | 33 (stub) | 330 | 315 | 315 | 315 | 315 | 270 | −83.1% |
-| `decode_wire_header.lean` | 979 | 979 | 425 | 425 | 336 | 272 | 272 | 272 | −72.2% |
-| `frame_total_len.lean` | 1,268 | 33 (stub) | 287 | 261 | 261 | 261 | 259 | 259 | −79.6% |
-| `parse_compression_flag.lean` | 1,106 | 158 (stub) | 176 | 138 | 138 | 138 | 138 | 138 | −87.5% |
-| **Total** | **8,009** | **4,264** | **2,018** | **1,917** | **2,310** | **1,899** | **1,664** | **1,619** | **−79.8%** |
+| Proof | `a6bebfc2` | `0d3242d3` | `[adv B1]` `a6aae5b8` | `[adv A1]` `07b582eb` | `[adv B2]` `ecdf04bf` | `[adv A2]` `fbd40894` | `[adv B3]` `faf8961c` | `[adv A3]` `ceb78044` | this revision | vs `a6bebfc2` |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `advance_cursor.lean` | 227 | 227 | 171 | 149 | 258 | 231 | 231 | 231 | 231 | +1.8% |
+| `checksum_frame_fast.lean` | 1,592 | 1,592 | 433 | 433 | 433 | 432 | 174 | 174 | 174 | −89.1% |
+| `checksum_frame_safe.lean` | 1,242 | 1,242 | 196 | 196 | 569 | 250 | 275 | 275 | 275 | −77.9% |
+| `clamp_payload_window.lean` | 1,595 | 33 (stub) | 330 | 315 | 315 | 315 | 315 | 270 | 185 | −88.4% |
+| `decode_wire_header.lean` | 979 | 979 | 425 | 425 | 336 | 272 | 272 | 272 | 272 | −72.2% |
+| `frame_total_len.lean` | 1,268 | 33 (stub) | 287 | 261 | 261 | 261 | 259 | 259 | 167 | −86.8% |
+| `parse_compression_flag.lean` | 1,106 | 158 (stub) | 176 | 138 | 138 | 138 | 138 | 138 | 113 | −89.8% |
+| **Total** | **8,009** | **4,264** | **2,018** | **1,917** | **2,310** | **1,899** | **1,664** | **1,619** | **1,417** | **−82.3%** |
 
-Against `0d3242d3` the total falls by `62.0%` (`4,264 → 1,619`). Lines that
+Against `0d3242d3` the total falls by `66.8%` (`4,264 → 1,417`). Lines that
 mention `BlockCtx`: `111` at `a6bebfc2` (28/26/26/23/8 in `checksum_frame_fast`,
 `checksum_frame_safe`, `clamp_payload_window`, `frame_total_len`,
 `parse_compression_flag`), `0` now. Lines that mention `defaultCfgSteps` or
@@ -139,7 +139,7 @@ mention `BlockCtx`: `111` at `a6bebfc2` (28/26/26/23/8 in `checksum_frame_fast`,
 | `theory/Anneal/PureMirExec.lean` | 18,475 | 18,461 | −14 | `sup/ff-4` `18c85931` (`I-10`) plus unused-binder fixes |
 | **Net** | | | **+2,972** | |
 
-The WireframeDemo proofs shrink by `6,390` lines against `a6bebfc2`; less than
+The WireframeDemo proofs shrink by `6,592` lines against `a6bebfc2`; well under
 half of that moved into reusable theory.
 
 ### 3.3 Tutor and `MirVerification`
@@ -160,45 +160,62 @@ sets `maxHeartbeats` itself; no file raises it above `800,000`. The host ran
 other Lean jobs during every measurement, so differences of a few seconds on
 unchanged files are noise; Section 4.2 gives a load-independent measure.
 
-| Proof | `maxHeartbeats` | `[adv B2]` | `[adv A2]` | `[adv B3]` | this revision | Dominated by |
-| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
-| `advance_cursor.lean` | 400,000 | 2.5 s | 1.5 s | 1.5 s | 3.6 s | `verifyStatefulMir_of_sepLenses` + `LiftLensBlock` |
-| `checksum_frame_fast.lean` | 800,000 | 56.6 s | 57.1 s | 15.2 s | 18.8 s | single `runCfgToBlock` of `checksum_frame_fast.body` (reuses `safe_noCallWpConverges`) |
-| `checksum_frame_safe.lean` | 400,000 | 34.4 s | 13.5 s | 12.0 s | 12.5 s | four `runCfgToBlock` iterations (about 1.8 s of `dsimp` each) |
-| `clamp_payload_window.lean` | 800,000 | 23.2 s | 27.1 s | 27.1 s | 22.2 s | companion lemmas |
-| `decode_wire_header.lean` | 400,000 | 7.8 s | 4.1 s | 4.1 s | 3.9 s | `LiftStmtsTerminator.eval_rest` + `cons_eval_norm` |
-| `frame_total_len.lean` | 800,000 | 32.6 s | 38.5 s | 32.5 s | 31.8 s | companion lemmas |
-| `parse_compression_flag.lean` | 800,000 | 11.4 s | 12.3 s | 12.3 s | 11.5 s | `requires` companion lemma |
+| Proof | `maxHeartbeats` | `[adv B2]` | `[adv A2]` | `[adv B3]` | `[adv A3]` | this revision | Dominated by |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `advance_cursor.lean` | 400,000 | 2.5 s | 1.5 s | 1.5 s | 3.6 s | 1.6 s | `verifyStatefulMir_of_sepLenses` + `LiftLensBlock` |
+| `checksum_frame_fast.lean` | 800,000 | 56.6 s | 57.1 s | 15.2 s | 18.8 s | 15.7 s | single `runCfgToBlock` of `checksum_frame_fast.body` (reuses `safe_noCallWpConverges`) |
+| `checksum_frame_safe.lean` | 400,000 | 34.4 s | 13.5 s | 12.0 s | 12.5 s | 13.0 s | four `runCfgToBlock` iterations (about 1.8 s of `dsimp` each) |
+| `clamp_payload_window.lean` | 800,000 | 23.2 s | 27.1 s | 27.1 s | 22.2 s | 23.3 s | companion lemmas |
+| `decode_wire_header.lean` | 400,000 | 7.8 s | 4.1 s | 4.1 s | 3.9 s | 4.0 s | `LiftStmtsTerminator.eval_rest` + `cons_eval_norm` |
+| `frame_total_len.lean` | 800,000 | 32.6 s | 38.5 s | 32.5 s | 31.8 s | 33.7 s | companion lemmas |
+| `parse_compression_flag.lean` | 800,000 | 11.4 s | 12.3 s | 12.3 s | 11.5 s | 12.1 s | `requires` companion lemma |
 
 The `#mir_lift` part is cheap: with the companion lemmas replaced by `sorry`
 in a scratch copy, the whole of `frame_total_len.lean`, including `import`
 time, elaborates in `1.5 s` (`clamp_payload_window.lean`: `1.4 s`,
 `parse_compression_flag.lean`: `3.2 s`), and `decode_wire_header.lean`
-elaborates in `4.1 s` (`18.8 s` under `wpBlockLinear` at `[adv A1]`).
+elaborates in `4.0 s` (`18.8 s` under `wpBlockLinear` at `[adv A1]`).
 
 ### 4.2 Heartbeats
 
 Heartbeats spent elaborating each file's declarations, in thousands (the unit
 of `maxHeartbeats`), read with `IO.getNumHeartbeats` before and after the file
 body under `Elab.async false` (Section 6, step 7). Heartbeats count small
-allocations, so unlike wall clock they do not depend on host load. The
-`[adv B2]` column elaborates that revision's proof file against the current
-theory and generated modules; `parse_compression_flag.lean` has not changed
-since `[adv A1]`. The `a6bebfc2` proofs were written against that revision's
-theory and generated modules and are not measured here.
+allocations, so unlike wall clock they do not depend on host load. Both the
+`[adv B2]` and `[adv A3]` columns elaborate that revision's proof file against
+the current theory and generated modules. The `a6bebfc2` proofs were written
+against that revision's theory and generated modules and are not measured
+here.
 
-| Proof | `[adv B2]` | this revision | Change |
-| :--- | ---: | ---: | ---: |
-| `advance_cursor.lean` | 5,771 | 5,414 | −6.2% |
-| `checksum_frame_fast.lean` | 655,752 | 71,712 | −89.1% |
-| `checksum_frame_safe.lean` | 180,914 | 64,596 | −64.3% |
-| `clamp_payload_window.lean` | 187,030 | 186,984 | −0.0% |
-| `decode_wire_header.lean` | 44,866 | 22,947 | −48.9% |
-| `frame_total_len.lean` | 249,768 | 249,760 | −0.0% |
-| `parse_compression_flag.lean` | 64,833 | 64,833 | (same file) |
-| **Total** | **1,388,934** | **666,246** | **−52.0%** |
+| Proof | `[adv B2]` | `[adv A3]` | this revision | vs `[adv B2]` |
+| :--- | ---: | ---: | ---: | ---: |
+| `advance_cursor.lean` | 5,771 | 5,414 | 5,414 | −6.2% |
+| `checksum_frame_fast.lean` | 655,752 | 71,712 | 71,712 | −89.1% |
+| `checksum_frame_safe.lean` | 180,914 | 64,596 | 64,596 | −64.3% |
+| `clamp_payload_window.lean` | 187,030 | 186,984 | 187,584 | +0.3% |
+| `decode_wire_header.lean` | 44,866 | 22,947 | 22,947 | −48.9% |
+| `frame_total_len.lean` | 249,768 | 249,760 | 250,113 | +0.1% |
+| `parse_compression_flag.lean` | 64,833 | 64,833 | 62,985 | −2.9% |
+| **Total** | **1,388,934** | **666,246** | **665,351** | **−52.1%** |
 
-## 5. Changes across passes (`[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]` → `[adv B3]` → `[adv A3]`)
+## 5. Changes across passes (`[adv B1]` → `[adv B4]`)
+
+- `clamp_payload_window`, `frame_total_len`, `parse_compression_flag`,
+  `checksum_frame_safe` (`[adv B4]`):
+  1. Collapsed the three copies of the ~30-line `dsimp only` unfold list in
+     `wpReq_inversion` of `clamp_payload_window.lean` (`270 → 185` lines) and
+     `frame_total_len.lean` (`259 → 167` lines) into a single `iterate 4
+     (dsimp only [...]; first | ...)` block, and simplified `ensures_holds` in
+     `frame_total_len.lean` with `simp (disch := omega)`.
+  2. Replaced the four concrete `0`/`1` helper lemmas in
+     `parse_compression_flag.lean` with a single `compressionFlagPost_bit`
+     lemma and inlined `mirBoolPredicateHolds_of_evalMirSpecBool_true`
+     (`138 → 113` lines, `64,833 → 62,985` thousand heartbeats).
+  3. Updated two stale comments in `checksum_frame_safe.lean` from
+     `mirWpConverges_forRangeUp` to `mirNoCallWpConverges_forRangeUp`, added
+     the `iterate` companion-unfold tip to `SKILL.md` (Pattern B) and
+     `references/proof-scaling-and-bottlenecks.md`, and tightened Section 6
+     greps and `/tmp/hb_*` cleanup in `REPRODUCE_FF_4_2.md`.
 
 - `clamp_payload_window` (`[adv A3]`): `ensures_holds` evaluated its two
   `ret` cases with two copies of a 31-line `dsimp only` list and
@@ -331,10 +348,11 @@ for rev in a6bebfc2 0d3242d3; do
 done
 wc -l $D/*.lean
 grep -c BlockCtx $D/*.lean
-grep -c -E 'defaultCfgSteps|defaultSpecSteps' $D/*.lean
+grep -c -E 'defaultCfgSteps|runCfgSteps' $D/*.lean
+grep -c defaultSpecSteps $D/*.lean
 #    No fuel numeral, step count, or statement count (expect no output):
 grep -nE 'LiftBlock .* [0-9]+ :=|^\s*[0-9]+ := by|\(n := [0-9]+\)|\brfl [0-9]+\b' $D/*.lean
-grep -n -E 'lift_PureMirConverges|LiftStmtsTerminator|verifyStatefulMir_of_sepLenses|mirWpConverges_forRangeUp|runCfgToBlock' $D/*.lean examples/mir/MirVerification.lean
+grep -n -E 'lift_PureMirConverges|LiftStmtsTerminator|verifyStatefulMir_of_sepLenses|mir(NoCall)?WpConverges_forRangeUp|runCfgToBlock' $D/*.lean examples/mir/MirVerification.lean
 
 # 4. Build the theory and the MirVerification examples.
 (cd examples && anneal-lean-run --mode build --concurrency 1 -- lake build Anneal MirVerification)
@@ -366,6 +384,7 @@ done)
   } > "$p"
   echo "$f: $(anneal-lean-run --mode file --concurrency 1 -- lake env lean "$p" |
     awk '/^HB /{v[n++]=$2} END{print int((v[1]-v[0])/1000)}') thousand heartbeats"
+  rm -f "$p"
 done)
 
 # 8. Remove the untracked build artifacts before committing.
