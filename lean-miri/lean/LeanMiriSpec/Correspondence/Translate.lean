@@ -631,16 +631,15 @@ def untranslatableConstOperand (ty : Ty) : Miri.MIR.ConstOperand :=
     userType := none
     value := .Unevaluated { definition := 0, arguments := #[], promoted := none } (encodeTyId ty) }
 
-/-- Synthetic `Miri.MIR.TyId` that `annealProjectionCx.subsliceLayout` assigns to a
-whole-array subslice, such as the `Subslice 0 0 true` that `translateRvalue`
-appends for `Rvalue.len`. It is disjoint from every `encodeTyId` output (`1, 2,
-10..15, 20..25, 30..33, 40..42, 50, 51`, and `≥ 100`), so `annealReadImmediate`
-extracts `(address, length)` metadata only from such a subslice and rejects
-other whole-array reads (`ty ≠ 60`) with `StepError.unsupported`.
-`subsliceLayout` rejects partial subslices, so a partial subslice read never
-yields that metadata. A whole-array subslice that the source program itself
-writes is indistinguishable from the `Rvalue.len` device and is read the same
-way. -/
+/-- Synthetic `Miri.MIR.TyId` that `annealProjectList` assigns to
+`ProjectionElem.UnwrapUnsafeBinder arraySliceMetaTyId` when `translateRvalue`
+lowers `Rvalue.len place`. It is disjoint from every `encodeTyId` output (`1, 2,
+10..15, 20..25, 30..33, 40..42, 50, 51`, and `≥ 100`), so no source-MIR
+`ProjectionElem` (`translateProjectionElem`) can produce it.
+`annealReadImmediate` extracts `(address, length)` metadata only for
+`arraySliceMetaTyId` and rejects all other whole-array immediate reads (`ty ≠ 60`)
+with `StepError.unsupported`, while `annealProjectionCx.subsliceLayout` rejects
+all array subslices (both partial and whole-array) with `StepError.unsupported`. -/
 def arraySliceMetaTyId : Miri.MIR.TyId := 60
 
 /-- Translate an Anneal `Rvalue` to `Miri.MIR.Rvalue`.
@@ -648,17 +647,20 @@ def arraySliceMetaTyId : Miri.MIR.TyId := 60
 The pinned rustc MIR (`Miri.MIR.Rvalue`) has no `Rvalue::Len`,
 `Rvalue::ShallowInitBox`, or `NullOp::{SizeOf, AlignOf, OffsetOf}`.
 
-* `len place` becomes `UnaryOp(PtrMetadata, Copy(place[0..0]))`, appending
-  `ProjectionElem.Subslice 0 0 true` to `translatePlace place`. This is a
-  modeling device, not rustc's lowering: rustc applies `PtrMetadata` to a
-  pointer (for slices, a `&raw const (fake)` borrow of the place) and uses a
-  constant for arrays. Here `Miri.Interpreter.projectSubslice` tags the
-  whole-array place with `arraySliceMetaTyId` after `annealEvalOperand` checks
-  that an immediate local is initialized and every byte of a memory-backed
-  array is initialized; `annealReadImmediate` then reads `(address, length)`
-  only for `arraySliceMetaTyId` (rejecting other whole-array reads, and
-  `subsliceLayout` rejecting partial subslices, with `StepError.unsupported`),
-  and `PtrMetadata` extracts the length. This matches
+* `len place` becomes `UnaryOp(PtrMetadata, Copy(place.UnwrapUnsafeBinder(arraySliceMetaTyId)))`,
+  appending `ProjectionElem.UnwrapUnsafeBinder arraySliceMetaTyId` to
+  `translatePlace place`. This is a modeling device, not rustc's lowering:
+  rustc applies `PtrMetadata` to a pointer (for slices, a `&raw const (fake)`
+  borrow of the place) and uses a constant for arrays. Because `encodeTyId`
+  never returns `arraySliceMetaTyId` (`60`), no source-MIR projection can forge
+  this tag (`translateProjectionElem`). `annealEvalOperand` first checks that an
+  immediate local is initialized and every byte of a memory-backed array is
+  initialized; `annealProjectList` then transmutes an array place's `LocalLayout`
+  to `{ ty := arraySliceMetaTyId, layout := base.layout.layout }` (failing closed
+  on non-arrays), `annealReadImmediate` reads `(address, length)` exclusively for
+  `arraySliceMetaTyId` (while `subsliceLayout` rejects all array subslices and
+  `annealReadImmediate` rejects all other whole-array reads with
+  `StepError.unsupported`), and `PtrMetadata` extracts the length. This matches
   Anneal's `evalRvalue (.len place)`, except for an uninitialized memory-backed
   zero-length array, which has no bytes whose initialization could be checked.
 * Rather than invent a meaning for `shallowInitBox` and the unsupported nullary
@@ -678,7 +680,8 @@ def translateRvalue : Rvalue → Miri.MIR.Rvalue
   | .rawPtr mutability place => .RawPtr (translateRawPtrKind mutability) (translatePlace place)
   | .len place =>
       let mp := translatePlace place
-      .UnaryOp .PtrMetadata (.Copy { mp with projection := mp.projection.push (.Subslice 0 0 true) })
+      .UnaryOp .PtrMetadata
+        (.Copy { mp with projection := mp.projection.push (.UnwrapUnsafeBinder arraySliceMetaTyId) })
   | .cast kind op targetTy =>
       .Cast (translateCastKind kind) (translateOperand op) (encodeTyId targetTy)
   | .binaryOp op lhs rhs =>
@@ -1115,19 +1118,18 @@ def annealProjectionCx
       annealPointerArithmetic
       (annealPointerResolver mach)
       (annealLiveAllocationLookup mach)
-  subsliceLayout := fun baseLay count =>
+  subsliceLayout := fun baseLay _ =>
     match baseLay.layout.fields with
-    | .Array _ baseCount =>
-        if count == baseCount then
-          .ok ({ ty := arraySliceMetaTyId, layout := baseLay.layout }, .none)
-        else
-          .error (.obligation "partial array subslice in annealProjectionCx")
+    | .Array _ _ => .error (.obligation "array subslice in annealProjectionCx")
     | _ => .error (.invariant "subslice on non-array")
   layoutOf := fun tyId => .ok (layoutOfEncodedTyId tyId layouts)
   deref := fun _ => .error (.obligation "deref in annealProjectionCx")
   localIndex := annealLocalIndex frame mach
 
-/-- Sequentially apply a list of `Miri.MIR.ProjectionElem`s via `Miri.Interpreter.project`. -/
+/-- Sequentially apply a list of `Miri.MIR.ProjectionElem`s via `Miri.Interpreter.project`.
+When `elem` is the synthetic `Rvalue.len` projection `.UnwrapUnsafeBinder arraySliceMetaTyId`,
+`cxElem.layoutOf` preserves an `.Array` operand's `LayoutData` under `arraySliceMetaTyId`
+and rejects non-array operands with `.obligation "len on non-array"`. -/
 def annealProjectList
     (cx : Miri.Interpreter.ProjectionCx AnnealProv)
     (base : Miri.Interpreter.OpTy AnnealProv)
@@ -1136,7 +1138,18 @@ def annealProjectList
   match projs with
   | [] => .ok base
   | elem :: rest => do
-      let next ← Miri.Interpreter.project cx base elem
+      let cxElem :=
+        match elem with
+        | .UnwrapUnsafeBinder ty =>
+            if ty == arraySliceMetaTyId then
+              { cx with
+                layoutOf := fun _ =>
+                  match base.layout.layout.fields with
+                  | .Array _ _ => .ok { ty := arraySliceMetaTyId, layout := base.layout.layout }
+                  | _ => .error (.obligation "len on non-array") }
+            else cx
+        | _ => cx
+      let next ← Miri.Interpreter.project cxElem base elem
       annealProjectList cx next rest
 
 /-- Check that the byte slice `[relOffset, relOffset + size)` of an indirect
