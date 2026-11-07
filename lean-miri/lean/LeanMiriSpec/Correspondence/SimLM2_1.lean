@@ -1384,8 +1384,8 @@ theorem evalProjection_constantIndex_simulation
 
 /-- Ordinary unprojected whole-array immediate reads (`ty ≠ arraySliceMetaTyId`) fail closed
 with `StepError.unsupported "whole-array immediate read not supported"`, ensuring only
-`Rvalue.len`'s `Subslice 0 0 true` projection (`ty = arraySliceMetaTyId`) extracts `(ptr, len)`
-metadata. -/
+`Rvalue.len`'s `UnwrapUnsafeBinder arraySliceMetaTyId` projection
+(`ty = arraySliceMetaTyId`) extracts `(ptr, len)` metadata. -/
 theorem annealReadImmediate_whole_array_unsupported
     {m : AnnealStepState} {layouts : LayoutTable}
     {arrTy : Ty} {elemKind : RigidTy} {count : Nat} {optVal : Option Value}
@@ -7900,8 +7900,10 @@ exact lockstep (`StepRel`), preserving `StateRel` (including `ArraySliceRel` and
 `IsImmediateFrameLocal` across every local except an array-construction destination
 (`StepPreservesImmediate`), and `MemoryHighWater` (`StepPreservesHighWater`, advancing
 `nextAllocId` by at most `1` on array-constructing statements and `0` on all others),
-so `step_stmt_lm2_1_simulation` composes across arbitrary multi-allocation chains of
-array, scalar, and storage/move statements via `MemoryHighWater.canReserveAllocId`.
+so `step_stmt_lm2_1_simulation` composes across multi-allocation chains of array,
+scalar, and storage/move statements via `MemoryHighWater.canReserveAllocId`, as long
+as `nextAllocId` plus the number of remaining array constructions stays below
+`2 ^ 64`.
 Both machines agree on UB when array/index/operand/destination locals are dead or
 uninitialized or indices are out of bounds. -/
 theorem step_stmt_lm2_1_simulation
