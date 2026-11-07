@@ -1866,6 +1866,15 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   constBorrowLoop_minirust_noUB
   constBorrowLoop_progress
   constBorrowLoop_minirust_direct
+  repointPtr_inFragment
+  repointPtr_translate
+  repointPtr_anneal_ret
+  repointPtr_noUB
+  repointPtr_ctxOk
+  repointPtr_minirust_ret_from_start
+  repointPtr_minirust_noUB
+  repointPtr_progress
+  repointPtr_minirust_direct
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub
@@ -1906,6 +1915,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   derefWriteRhsUb_converse_error
   derefWriteRhsUb_outcome
   derefWriteRhsUb_minirust_direct
+  derefIdxWriteRhsUb_inFragment
+  derefIdxWriteRhsUb_translate
+  derefIdxWriteRhsUb_anneal_ub
+  derefIdxWriteRhsUb_ctxOk
+  derefIdxWriteRhsUb_minirust_ub_from_start
+  derefIdxWriteRhsUb_converse_error
+  derefIdxWriteRhsUb_outcome
+  derefIdxWriteRhsUb_minirust_direct
   dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct
@@ -2052,6 +2069,15 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   constBorrowLoop_minirust_noUB
   constBorrowLoop_progress
   constBorrowLoop_minirust_direct
+  repointPtr_inFragment
+  repointPtr_translate
+  repointPtr_anneal_ret
+  repointPtr_noUB
+  repointPtr_ctxOk
+  repointPtr_minirust_ret_from_start
+  repointPtr_minirust_noUB
+  repointPtr_progress
+  repointPtr_minirust_direct
   uninitPtrReadUb_inFragment
   uninitPtrReadUb_translate
   uninitPtrReadUb_anneal_ub
@@ -2092,6 +2118,14 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   derefWriteRhsUb_converse_error
   derefWriteRhsUb_outcome
   derefWriteRhsUb_minirust_direct
+  derefIdxWriteRhsUb_inFragment
+  derefIdxWriteRhsUb_translate
+  derefIdxWriteRhsUb_anneal_ub
+  derefIdxWriteRhsUb_ctxOk
+  derefIdxWriteRhsUb_minirust_ub_from_start
+  derefIdxWriteRhsUb_converse_error
+  derefIdxWriteRhsUb_outcome
+  derefIdxWriteRhsUb_minirust_direct
   dangling_notInFragment
   dangling_anneal_ub
   dangling_minirust_direct

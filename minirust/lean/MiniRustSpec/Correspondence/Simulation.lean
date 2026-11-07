@@ -23,6 +23,17 @@ states, both perform a related function return, or both raise UB.
 `step_start` runs `minimize`'s init block (`initLen body` MiniRust steps) from
 the entry relation `StartRel` into `StateRel`.
 `MiniRustSpec.Correspondence.Run` lifts these to whole executions.
+
+`step_correspondence_N` and `step_start_N` state the same for `StateRelN`,
+which adds what array, `TupleSpec`, and raw pointer locals need:
+`NonScalarLive`; `BorrowsOk` (every entry of Anneal's borrow table is the
+`rawPtrEntry` of an admissible borrow target, a parameter that stays live at
+its caller-allocated address, and every initialized raw pointer local holds
+the tag of such an entry at offset `0`, `Active` for a `*mut` local); and
+`LocalsOk` at `ctxWithBorrows` (the MiniRust bytes of every initialized raw
+pointer local encode the address and provenance of its tag's target).
+`step_correspondence` is the all-scalar special case. The raw pointer
+statements rest on `MiniRustSpec.Correspondence.PointerStep`.
 -/
 
 namespace MiniRustSpec.Correspondence
@@ -3484,8 +3495,9 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
 /-- **Correspondence theorem (one step).** For a fragment body `body`, its
 `minimize`-style translation `f`, and related states (`StateRel`, when all
 local declarations of `body` are scalar-family; see `step_correspondence_N` for
-general `StateRelN` states with non-scalar locals), one Anneal MIR step and one
-MiniRust `Machine::step` correspond in the sense of `StepRel`. -/
+general `StateRelN` states with array, `TupleSpec`, or raw pointer locals), one
+Anneal MIR step and one MiniRust `Machine::step` correspond in the sense of
+`StepRel`. -/
 theorem step_correspondence (body : CapturedMir) (f : Gen.Function) (hfrag : inFragment body = true)
     (hf : translateFn body = some f) (ctx : Ctx) (s : MachineState) (m : Mach)
     (hrel : StateRel body f ctx s m)

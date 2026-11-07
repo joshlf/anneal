@@ -705,41 +705,45 @@ lemmas of `Correspondence/Pointers.lean` (MiniRust's thin pointer bytes
 `ptrBytes` and their `decode`, `encode`, and `check_value`; Anneal's
 `&raw`, `*p`, `Offset`, `PtrToPtr`, and exposure rules) and the
 statement-level lemmas of `Correspondence/PointerStep.lean` on which
-`step_correspondence_N` rests for raw pointers. Both semantics agree
-on `ptrRoundTrip` (`&raw mut x`, a read and a write through the pointer, a
-`PtrToPtr` cast, and a read through the cast pointer; `6` for `x = 5`),
-`arrayParamPtr` (disjoint `&raw mut a[-2 of 2]` and `&raw mut a[-1 of 2]`
-borrows, that is of `a[0]` and `a[1]`, on an array parameter `a: [u32; 2]`,
-`Offset(p, 0)`, `move` and `StorageDead`/`Deinit` on pointer temporaries, and
-dereference reads and writes through both pointers; `19` for `a = [5, 7]`),
-`arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`), `fieldPtr`
-(`&raw mut s.1` at byte offset `4` of `Padded`; `100`), `nestedFieldPtr`
-(disjoint `&raw mut t.0.1` at byte offset `4` with pointee `u32` and
-`&raw mut t.1` at byte offset `8` with pointee `u16` on `t: ((u8, u32), u16, ())`,
-reading and writing through both pointers and preserving `.Uninit` padding;
-`59`), `ptrCountdown` (a
-four-block loop that counts `x` down through `&raw mut x`, reading `*p` before
-each `switchInt`, then reads `x` directly; `3` for `x = 3`), and
-`constBorrowLoop` (a fresh `&raw const x` read through and killed by
-`StorageDead` in each iteration of a loop; `15` for `x = 5`), and both raise UB
-on `uninitPtrReadUb` and `uninitPtrWriteUb` (reading or writing through an
-uninitialized raw pointer temporary), `deadPtrReadUb` (reading through a pointer
-temporary after its `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on
-an uninitialized pointer temporary), `derefWriteRhsUb` (writing an uninitialized
-rvalue operand through a valid `*mut` pointer), and `dangling` (a read after
-`StorageDead` of the borrowed temporary). `ptrRoundTrip`, `arrayParamPtr`,
-`fieldPtr`, `nestedFieldPtr`, `ptrCountdown`, `constBorrowLoop`,
-`uninitPtrReadUb`, `uninitPtrWriteUb`, `deadPtrReadUb`, `uninitPtrOffsetUb`, and
-`derefWriteRhsUb` are in the fragment
-(`*_inFragment`) and proved end to end through `mirCall_ret`, `mirCall_noUB`, `mirCall_progress_N`, `mirCall_ub`,
-`mirCall_steps_error`, and `mirCall_outcome_N`. The remaining witnesses are the
-divergences listed under the gaps (plus `arrayElemPtr` and `dangling`, which
-borrow temporaries), each outside the fragment (`*_notInFragment`):
-`offsetDeref` (`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in
-Anneal; `offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB
-in MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
-`exposeTwice` (`0` in MiniRust, `65536` in Anneal), and `directWrite` and
-`frozenWrite` (UB in Anneal only).
+`step_correspondence_N` rests for raw pointers.
+
+* In the fragment (`*_inFragment`), and proved end to end through
+  `mirCall_ret`, `mirCall_noUB`, and `mirCall_progress_N` (returns) or
+  `mirCall_ub`, `mirCall_steps_error`, and `mirCall_outcome_N` (UB) besides the
+  direct runs, both semantics return the same value on `ptrRoundTrip`
+  (`&raw mut x`, a read and a write through the pointer, a `PtrToPtr` cast,
+  and a read through the cast pointer; `6` for `x = 5`), `arrayParamPtr`
+  (disjoint `&raw mut a[-2 of 2]` and `&raw mut a[-1 of 2]` borrows, that is
+  of `a[0]` and `a[1]`, on an array parameter `a: [u32; 2]`, `Offset(p, 0)`,
+  `move` and `StorageDead`/`Deinit` on pointer temporaries, and dereference
+  reads and writes through both pointers; `19` for `a = [5, 7]`), `fieldPtr`
+  (`&raw mut s.1` at byte offset `4` of `Padded`; `100`), `nestedFieldPtr`
+  (disjoint `&raw mut t.0.1` at byte offset `4` with pointee `u32` and
+  `&raw mut t.1` at byte offset `8` with pointee `u16` on
+  `t: ((u8, u32), u16, ())`, preserving `.Uninit` padding; `59`),
+  `ptrCountdown` (a four-block loop that counts `x` down through
+  `&raw mut x`, reading `*p` before each `switchInt`, then reads `x` directly;
+  `3` for `x = 3`), `constBorrowLoop` (a fresh `&raw const x` read through and
+  killed by `StorageDead` in each iteration of a loop; `15` for `x = 5`), and
+  `repointPtr` (`&raw mut a[0 of 2]` and `&raw mut a[1 of 2]`, a read through
+  a copy of the first pointer, then the same initialized pointer local
+  overwritten with the second pointer and written through; `105` for
+  `a = [5, 7]`), and both raise UB on `uninitPtrReadUb` and `uninitPtrWriteUb`
+  (reading or writing through an uninitialized pointer temporary),
+  `deadPtrReadUb` (reading through a pointer temporary after its
+  `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an
+  uninitialized pointer temporary), and `derefWriteRhsUb` and
+  `derefIdxWriteRhsUb` (writing an uninitialized rvalue operand through a valid
+  `*mut` pointer to an integer local or to a `ConstantIndex` array element).
+* Outside the fragment (`*_notInFragment`), both semantics agree on
+  `arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`) and `dangling`
+  (UB on a read after `StorageDead` of the borrowed temporary), and they
+  disagree on the divergences listed under the gaps: `offsetDeref`
+  (`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in Anneal;
+  `offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB in
+  MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
+  `exposeTwice` (`0` in MiniRust, `65536` in Anneal), and `directWrite` and
+  `frozenWrite` (UB in Anneal only).
 
 `Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, `[WITNESS-AUDIT]`,
 and `[POINTER-AUDIT]` lines ending in `sorry_free=true` (via

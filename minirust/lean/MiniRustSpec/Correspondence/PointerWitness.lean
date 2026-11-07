@@ -20,11 +20,12 @@ semantics (`runA_sound`, `faultsA_sound`) and, after `minimize`'s translation
 computation (`rfl`, `decide`, `decide +kernel`; no `native_decide`).
 
 `ptrRoundTrip`, `arrayParamPtr`, `fieldPtr`, `nestedFieldPtr`, `ptrCountdown`,
-`constBorrowLoop`, `uninitPtrReadUb`, `uninitPtrWriteUb`, `deadPtrReadUb`,
-`uninitPtrOffsetUb`, and `derefWriteRhsUb` lie in the correspondence fragment
-(`*_inFragment`), so the end-to-end correspondence theorems (`mirCall_ret`, `mirCall_ub`, `mirCall_noUB`,
-`mirCall_progress_N`, `mirCall_steps_error`, `mirCall_outcome_N`) apply to them
-directly. `arrayElemPtr` (borrowing a non-parameter `[u32; 2]` temporary),
+`constBorrowLoop`, `repointPtr`, `uninitPtrReadUb`, `uninitPtrWriteUb`,
+`deadPtrReadUb`, `uninitPtrOffsetUb`, `derefWriteRhsUb`, and
+`derefIdxWriteRhsUb` lie in the correspondence fragment (`*_inFragment`), so
+the end-to-end correspondence theorems (`mirCall_ret`, `mirCall_ub`,
+`mirCall_noUB`, `mirCall_progress_N`, `mirCall_steps_error`,
+`mirCall_outcome_N`) apply to them directly. `arrayElemPtr` (borrowing a non-parameter `[u32; 2]` temporary),
 `dangling`, and every divergent witness below lie outside the fragment
 (`*_notInFragment`): the fragment borrows (`&raw`) only parameters,
 which it never writes directly (`directWrite`) nor kills (`dangling`), casts
@@ -62,14 +63,19 @@ to `*mut` (`frozenWrite`, `misaligned`), offsets pointers only by `0`
   through and then killed by `StorageDead`, so Anneal's borrow table grows by
   one `Frozen` entry per iteration while the pointer temporary is re-allocated
   in MiniRust;
+* `repointPtr`: `&raw mut a[0 of 2]` and `&raw mut a[1 of 2]` (`fromEnd =
+  false`) on a `[u32; 2]` parameter, a read through a copy of the first
+  pointer, then the same initialized pointer local overwritten with the second
+  pointer and written through, which reaches `a[1]`;
 
 and both raise UB for `uninitPtrReadUb` (reading through an uninitialized
 pointer temporary), `uninitPtrWriteUb` (writing through an uninitialized `*mut`
 pointer temporary), `deadPtrReadUb` (reading through a pointer temporary after
 its `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an
-uninitialized pointer temporary), `derefWriteRhsUb` (writing an uninitialized
-rvalue operand through a valid `*mut` pointer), and `dangling` (a read through a
-pointer to a temporary after its `StorageDead`).
+uninitialized pointer temporary), `derefWriteRhsUb` and `derefIdxWriteRhsUb`
+(writing an uninitialized rvalue operand through a valid `*mut` pointer to an
+integer local or to a `ConstantIndex` array element), and `dangling` (a read
+through a pointer to a temporary after its `StorageDead`).
 
 **Divergence, Anneal unsound.** Anneal returns a value where MiniRust, the
 ground truth, returns a different value or raises UB:
@@ -1142,6 +1148,150 @@ theorem constBorrowLoop_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 15 }, [1]) := by
   decide +kernel
 
+/-! ## Re-pointing an initialized pointer local -/
+
+/-- MIR of
+```rust
+fn repoint_ptr(mut a: [u32; 2]) -> u32 {
+    let p = &raw mut a[0];        // _2 = &raw mut _1[0 of 2]
+    let q = &raw mut a[1];        // _3 = &raw mut _1[1 of 2]
+    let mut r = p;                // _4 = copy _2
+    let x = unsafe { *r };        // _5 = copy (*_4)
+    r = q;                        // _4 = copy _3
+    unsafe { *r = x + 100 };      // (*_4) = Add(copy _5, const 100_u32)
+    a[1]                          // _0 = copy _1[1 of 2]
+}
+```
+borrowing `ConstantIndex` elements counted from the start (`fromEnd = false`),
+overwriting the initialized pointer local `_4`, which holds the tag of `_2`,
+with the tag of `_3`, and writing through the re-pointed local, which must
+reach `a[1]` and not `a[0]`. -/
+def repointPtr : CapturedMir :=
+  { ptrBody "witness::repoint_ptr"
+      [u32Decl, arrU32_2Decl, ptrMutU32Decl, ptrMutU32Decl, ptrMutU32Decl, u32Decl]
+      [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+       .assign (local_ 2) (.rawPtr .mut (placeConstIdx 1 0 2 false)),
+       .assign (local_ 3) (.rawPtr .mut (placeConstIdx 1 1 2 false)),
+       .assign (local_ 4) (.use (.copy (local_ 2))),
+       .assign (local_ 5) (.use (.copy (derefPlace 4))),
+       .assign (local_ 4) (.use (.copy (local_ 3))),
+       .assign (derefPlace 4) (.binaryOp .add (.copy (local_ 5)) (constU32 100)),
+       .assign (local_ 0) (.use (.copy (placeConstIdx 1 1 2 false)))] with
+    fnAbi := fnAbiArrU32_2Arg }
+
+theorem repointPtr_inFragment : inFragment repointPtr = true := by decide
+
+def repointPtrFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Array (.Int u32) 2),
+    (localName 2, thinRawPtrTy), (localName 3, thinRawPtrTy), (localName 4, thinRawPtrTy),
+    (localName 5, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .StorageLive (localName 4), .StorageLive (localName 5),
+      .Assign (.Local (localName 2))
+        (.AddrOf (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))) (.Raw .None)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Index (.Local (localName 1)) (.Constant (.Int 1) (.Int usizeIt))) (.Raw .None)),
+      .Assign (.Local (localName 4)) (.Load (.Local (localName 2))),
+      .Assign (.Local (localName 5)) (.Load (.Deref (.Load (.Local (localName 4))) (.Int u32))),
+      .Assign (.Local (localName 4)) (.Load (.Local (localName 3))),
+      .Assign (.Deref (.Load (.Local (localName 4))) (.Int u32))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 5))) (.Constant (.Int 100) (.Int u32))),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Constant (.Int 1) (.Int usizeIt))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem repointPtr_translate : translateFn repointPtr = some repointPtrFn := rfl
+
+def repointPtrS0 : MachineState := initMachineState repointPtr [initArrU32_2]
+
+/-- On `a = [5, 7]`, Anneal reads `5` through tag `1` and writes `105` through
+tag `2`, so `a[1]` is `105`; both `Active` entries remain in the borrow table. -/
+theorem repointPtr_anneal_ret :
+    ReachesRet (mirTree repointPtr repointPtrS0) []
+      (.normal (.scalar ⟨105, 4⟩,
+        { repointPtrS0.memory with
+          borrows := [rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
+                      rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false)],
+          nextTag := 3 })) :=
+  runA_sound repointPtr 30 _ _ _ rfl
+
+theorem repointPtr_noUB : MirNoUBTree (mirCallTree repointPtr [initArrU32_2]) :=
+  runA_noUB repointPtr 30 _ _ _ rfl
+
+theorem repointPtr_ctxOk : CtxOk repointPtr ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : repointPtr.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [repointPtr, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [repointPtr, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : repointPtr.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [repointPtr, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- MiniRust at `minimize`'s init block (the function's `start`). -/
+def repointPtrMInit : Mach :=
+  machine repointPtr repointPtrFn repointPtrS0.frame.locals repointPtrFn.start
+
+/-- MiniRust returns `105` as well, derived from Anneal's return by the
+correspondence theorem (`mirCall_ret`). -/
+theorem repointPtr_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n repointPtrMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 105 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret repointPtr_inFragment repointPtr_translate ctx0 repointPtr_ctxOk
+      [initArrU32_2] (by decide) repointPtrMInit rfl rfl rfl repointPtr_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [repointPtr, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem repointPtr_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n repointPtrMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k repointPtrMInit = .ok mRet ∧
+      ReturnRel repointPtr ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree repointPtr [initArrU32_2]) tr (.normal (v, mem)) :=
+  mirCall_noUB repointPtr_inFragment repointPtr_translate ctx0 repointPtr_ctxOk
+    [initArrU32_2] (by decide) repointPtrMInit rfl rfl rfl repointPtr_noUB herr
+
+theorem repointPtr_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) repointPtrMInit = .ok m' ∧
+      StateRelN repointPtr repointPtrFn ctx0 s' m' ∧
+      Reaches (mirCallTree repointPtr [initArrU32_2]) tr (mirTree repointPtr s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k repointPtrMInit = .ok mRet ∧
+      ReturnRel repointPtr ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree repointPtr [initArrU32_2]) tr (.normal (v, mem))) :=
+  mirCall_progress_N repointPtr_inFragment repointPtr_translate ctx0 repointPtr_ctxOk
+    [initArrU32_2] (by decide) repointPtrMInit rfl rfl rfl repointPtr_noUB n
+
+/-- MiniRust's return, computed directly: 13 steps (the init block's `Goto`,
+eleven statements, and `Return`). -/
+theorem repointPtr_minirust_direct :
+    retAfter repointPtr [initArrU32_2] 13 =
+      some (some { retAlloc with data := scalarBytes u32 105 }, [1]) := by
+  decide +kernel
+
 /-! ## Uninitialized pointer dereference UB (in fragment) -/
 
 /-- Reading through an uninitialized `*const u32` pointer temporary `_2`:
@@ -1599,6 +1749,108 @@ theorem derefWriteRhsUb_outcome (n : Nat) :
 
 theorem derefWriteRhsUb_minirust_direct :
     ubAfter derefWriteRhsUb [.scalar ⟨5, 4⟩] 5 =
+      some "load at type but the data in memory violates the language invariant" := by
+  decide +kernel
+
+/-- Writing an uninitialized rvalue through a valid `*mut` pointer to the
+`ConstantIndex` element `_1[1 of 2]` of an array parameter:
+```text
+StorageLive(_2); StorageLive(_3); _2 = &raw mut _1[1 of 2]; (*_2) = copy _3;
+_0 = copy _1[0 of 2]; return
+```
+Unlike `derefWriteRhsUb`, whose pointer targets a whole integer local, the
+write targets a projected place, so both semantics fault on the rvalue in the
+`ConstantIndex` branch of `derefWrite_target`. -/
+def derefIdxWriteRhsUb : CapturedMir :=
+  { ptrBody "witness::deref_idx_write_rhs_ub" [u32Decl, arrU32_2Decl, ptrMutU32Decl, u32Decl]
+      [.storageLive 2, .storageLive 3,
+       .assign (local_ 2) (.rawPtr .mut (placeConstIdx 1 1 2 false)),
+       .assign (derefPlace 2) (.use (.copy (local_ 3))),
+       .assign (local_ 0) (.use (.copy (placeConstIdx 1 0 2 false)))] with
+    fnAbi := fnAbiArrU32_2Arg }
+
+theorem derefIdxWriteRhsUb_inFragment : inFragment derefIdxWriteRhsUb = true := by decide
+
+def derefIdxWriteRhsUbFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Array (.Int u32) 2),
+    (localName 2, thinRawPtrTy), (localName 3, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .Assign (.Local (localName 2))
+        (.AddrOf (.Index (.Local (localName 1)) (.Constant (.Int 1) (.Int usizeIt))) (.Raw .None)),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32)) (.Load (.Local (localName 3))),
+      .Assign (.Local (localName 0))
+        (.Load (.Index (.Local (localName 1)) (.Constant (.Int 0) (.Int usizeIt))))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem derefIdxWriteRhsUb_translate :
+    translateFn derefIdxWriteRhsUb = some derefIdxWriteRhsUbFn := rfl
+
+def derefIdxWriteRhsUbS0 : MachineState := initMachineState derefIdxWriteRhsUb [initArrU32_2]
+def derefIdxWriteRhsUbMInit : Mach :=
+  machine derefIdxWriteRhsUb derefIdxWriteRhsUbFn derefIdxWriteRhsUbS0.frame.locals
+    derefIdxWriteRhsUbFn.start
+
+theorem derefIdxWriteRhsUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr u ∧ FaultNow u :=
+  faultsA_sound derefIdxWriteRhsUb 10 _ (by decide)
+
+theorem derefIdxWriteRhsUb_ctxOk : CtxOk derefIdxWriteRhsUb ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : derefIdxWriteRhsUb.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [derefIdxWriteRhsUb, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [derefIdxWriteRhsUb, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : derefIdxWriteRhsUb.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [derefIdxWriteRhsUb, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem derefIdxWriteRhsUb_minirust_ub_from_start :
+    ∃ (n : Nat) (msg : String), Interp.steps n derefIdxWriteRhsUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := derefIdxWriteRhsUb_anneal_ub
+  exact mirCall_ub derefIdxWriteRhsUb_inFragment derefIdxWriteRhsUb_translate ctx0
+    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide) derefIdxWriteRhsUbMInit rfl rfl rfl hr hf
+
+theorem derefIdxWriteRhsUb_converse_error {n : Nat} {e : Stop}
+    (herr : Interp.steps n derefIdxWriteRhsUbMInit = .error e) :
+    (∃ msg, e = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < n ∧ Interp.steps k derefIdxWriteRhsUbMInit = .ok mRet ∧
+      ReturnRel derefIdxWriteRhsUb ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr (.normal (v, mem))) :=
+  mirCall_steps_error derefIdxWriteRhsUb_inFragment derefIdxWriteRhsUb_translate ctx0
+    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide) derefIdxWriteRhsUbMInit rfl rfl rfl herr
+
+theorem derefIdxWriteRhsUb_outcome (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) derefIdxWriteRhsUbMInit = .ok m' ∧
+      StateRelN derefIdxWriteRhsUb derefIdxWriteRhsUbFn ctx0 s' m' ∧
+      Reaches (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr (mirTree derefIdxWriteRhsUb s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k derefIdxWriteRhsUbMInit = .ok mRet ∧
+      ReturnRel derefIdxWriteRhsUb ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (1 + n) derefIdxWriteRhsUbMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTree derefIdxWriteRhsUb [initArrU32_2]) tr u ∧ FaultNow u) :=
+  mirCall_outcome_N derefIdxWriteRhsUb_inFragment derefIdxWriteRhsUb_translate ctx0
+    derefIdxWriteRhsUb_ctxOk [initArrU32_2] (by decide) derefIdxWriteRhsUbMInit rfl rfl rfl n
+
+theorem derefIdxWriteRhsUb_minirust_direct :
+    ubAfter derefIdxWriteRhsUb [initArrU32_2] 5 =
       some "load at type but the data in memory violates the language invariant" := by
   decide +kernel
 
