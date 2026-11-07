@@ -1642,12 +1642,13 @@ pub struct MirLiftingProfile {
     pub has_captured_mir: bool,
     /// Number of basic blocks detected in `body.basicBlocks`.
     pub basic_block_count: usize,
+    /// Number of generic type parameters (`typeParamCount`) declared on `body`.
+    pub type_param_count: usize,
     /// Whether `body` dereferences a pointer or reference
     /// (`ProjectionElem.deref`).
     pub has_deref_projection: bool,
-    /// Whether `body` takes or forms a mutable reference or raw pointer
-    /// (`RigidTy.ref Mutability.mut`, `BorrowKind.mut`, or
-    /// `Rvalue.rawPtr Mutability.mut`).
+    /// Whether `body` takes or forms an exclusive mutable reference
+    /// (`RigidTy.ref Mutability.mut` or `BorrowKind.mut`).
     pub has_mut_borrow: bool,
     /// Whether `body` contains memory-dependent operations (`Rvalue.ref`,
     /// `Rvalue.rawPtr`, `CastKind.ptrToPtr`, `BinOp.offset`,
@@ -1726,6 +1727,7 @@ pub fn analyze_mir_lifting_profile(
         let scan = scan_captured_mir_body(mir_src);
         profile.has_captured_mir = scan.has_body;
         profile.basic_block_count = scan.basic_block_count;
+        profile.type_param_count = scan.type_param_count;
         profile.has_deref_projection = scan.has_deref_projection;
         profile.has_mut_borrow = scan.has_mut_borrow;
         profile.has_impure_rvalue_or_asm = scan.has_impure_rvalue_or_asm;
@@ -1751,6 +1753,7 @@ pub fn analyze_mir_lifting_profile(
 struct MirBodyScan {
     has_body: bool,
     basic_block_count: usize,
+    type_param_count: usize,
     has_deref_projection: bool,
     has_mut_borrow: bool,
     has_impure_rvalue_or_asm: bool,
@@ -1760,31 +1763,40 @@ struct MirBodyScan {
 
 fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let clean = strip_lean_comments_and_strings(mir_src);
-    let body_start = clean.find("def body : CapturedMir");
-    if body_start.is_none() && !clean.contains("basicBlocks :=") {
-        return MirBodyScan::default();
-    }
-    let body_clean = match body_start {
+    let body_clean = match clean.find("def body : CapturedMir") {
         Some(idx) => &clean[idx..],
         None => clean.as_str(),
     };
-    let blocks_idx = body_clean.find("basicBlocks :=");
-    let local_decls_slice = match (body_clean.find("localDecls :="), blocks_idx) {
-        (Some(ld), Some(bb)) if ld < bb => &body_clean[ld..bb],
-        (Some(ld), _) => &body_clean[ld..],
-        _ => "",
+    let Some(bb) = body_clean.find("basicBlocks :=") else {
+        return MirBodyScan::default();
     };
-    let blocks_slice = if let Some(bb) = blocks_idx {
-        let after_bb = &body_clean[bb..];
-        let end_idx = ["fnAbi :=", "layouts :=", "allocations :="]
+    let type_param_count = body_clean[..bb]
+        .find("typeParamCount :=")
+        .and_then(|idx| {
+            body_clean[idx + "typeParamCount :=".len()..bb]
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+                .and_then(|s| s.parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    let local_decls_slice = if let Some(ld) = body_clean.find("localDecls :=") {
+        let after_ld = &body_clean[ld..];
+        let end_idx = ["basicBlocks :=", "fnAbi :=", "layouts :=", "allocations :="]
             .iter()
-            .filter_map(|kw| after_bb.find(kw))
+            .filter_map(|kw| after_ld.find(kw))
             .min()
-            .unwrap_or(after_bb.len());
-        &after_bb[..end_idx]
+            .unwrap_or(after_ld.len());
+        &after_ld[..end_idx]
     } else {
-        body_clean
+        ""
     };
+    let after_bb = &body_clean[bb..];
+    let end_idx = ["fnAbi :=", "layouts :=", "allocations :="]
+        .iter()
+        .filter_map(|kw| after_bb.find(kw))
+        .min()
+        .unwrap_or(after_bb.len());
+    let blocks_slice = &after_bb[..end_idx];
 
     let norm_decls = normalize_parens_and_ws(local_decls_slice);
     let norm_blocks = normalize_parens_and_ws(blocks_slice);
@@ -1848,6 +1860,7 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     MirBodyScan {
         has_body: true,
         basic_block_count,
+        type_param_count,
         has_deref_projection,
         has_mut_borrow,
         has_impure_rvalue_or_asm,
@@ -2092,19 +2105,31 @@ fn extract_terminator_targets(norm_term: &str) -> Vec<usize> {
         || head == "TerminatorKind.assert"
         || head == ".assert"
     {
-        if let Some(u) = unwind_pos
-            && u > kind_pos
-            && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
-        {
-            targets.push(n);
+        if let Some(u) = unwind_pos {
+            if u > kind_pos
+                && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(n);
+            }
+            if matches!(tokens[u], "UnwindAction.cleanup" | ".cleanup")
+                && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(cleanup_bb);
+            }
         }
     } else if head == "TerminatorKind.call" || head == ".call" {
-        if let Some(u) = unwind_pos
-            && u >= kind_pos + 2
-            && matches!(tokens[u - 2], "Option.some" | ".some" | "some")
-            && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
-        {
-            targets.push(n);
+        if let Some(u) = unwind_pos {
+            if u >= kind_pos + 2
+                && matches!(tokens[u - 2], "Option.some" | ".some" | "some")
+                && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(n);
+            }
+            if matches!(tokens[u], "UnwindAction.cleanup" | ".cleanup")
+                && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
+            {
+                targets.push(cleanup_bb);
+            }
         }
     } else if head == "TerminatorKind.inlineAsm" || head == ".inlineAsm" {
         let end = unwind_pos.unwrap_or(tokens.len());
@@ -2112,6 +2137,12 @@ fn extract_terminator_targets(norm_term: &str) -> Vec<usize> {
             if let Ok(n) = tok.parse::<usize>() {
                 targets.push(n);
             }
+        }
+        if let Some(u) = unwind_pos
+            && matches!(tokens[u], "UnwindAction.cleanup" | ".cleanup")
+            && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
+        {
+            targets.push(cleanup_bb);
         }
     }
 
@@ -2132,6 +2163,7 @@ pub fn render_scaffold_lifting_hints(
     let is_modular = authored.is_modular
         || (!authored.has_specs
             && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty()));
+    let is_polymorphic = authored.is_polymorphic || profile.type_param_count > 0;
     let is_bit_validity_item = matches!(
         bundle.subject.item_kind,
         anneal_rustc_capture::CapturedItemKind::TypeInvariant
@@ -2149,12 +2181,24 @@ pub fn render_scaffold_lifting_hints(
         );
     }
 
+    if is_polymorphic {
+        bullets.push(
+            "Polymorphic MIR (`open Anneal.PureMirExec \
+             Anneal.Rustc.V2026_06_01.SymbolicEval`): instantiate generic \
+             `Mir.<Item>.body` via `Body.instantiate typeArgs` (recomputing \
+             layouts via `LayoutTable.instantiateForBody`), then lift the \
+             instantiated body or apply `verifyPoly*MirSym`."
+                .to_string(),
+        );
+    }
+
     if profile.has_cfg_back_edge {
         bullets.push(
-            "Loops (`open Anneal.MirLoops Anneal.MirLiftCore`): model bounded \
-             loops with `forRangeUp` (`forRangeUp_induction`, \
-             `mirWpConverges_forRangeUp`, `mirNoCallWpConverges_forRangeUp`, \
-             or `mirWpConverges_whileRank`) and step entry, body, and exit via \
+            "Loops (`open Anneal.MirLoops Anneal.PureMirExec \
+             Anneal.MirFuelFree`): model bounded loops with `forRangeUp` \
+             (`forRangeUp_induction`, `mirWpConverges_forRangeUp`, \
+             `mirNoCallWpConverges_forRangeUp`, or \
+             `mirWpConverges_whileRank`) and step entry, body, and exit via \
              `runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, \
              `mirNoCallWpConverges_of_runCfgToBlock`) without step numerals."
                 .to_string(),
@@ -2172,9 +2216,10 @@ pub fn render_scaffold_lifting_hints(
              `verifyStatefulMir_of_sepSubplaceLenses`."
                 .to_string(),
         );
-    } else if profile.has_deref_projection && !profile.has_cfg_back_edge {
+    } else if profile.has_deref_projection {
         bullets.push(
-            "Shared `&` / pointer reads (`open Anneal.MirLiftCore`): \
+            "Shared `&` / pointer reads (`open Anneal.PureMirExec \
+             Anneal.MirFuelFree Anneal.Rustc.V2026_06_01.SymbolicEval`): \
              `ActiveTypedMutBorrow` requires `&mut` borrows; step read-only \
              dereferences via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, \
              `verifyStatefulMirNoPanic_of_wpConverges`) or \
@@ -2219,11 +2264,21 @@ pub fn render_scaffold_lifting_hints(
 
     if is_equiv {
         bullets.push(
-            "Equivalence (`#[spec(equiv = ...)]`; `open Anneal.MirLiftCore`): \
-             discharge `StatefulEquivVerificationResult` with \
-             `verifyStatefulEquivMir_of_wpConverges` and \
+            "Equivalence (`#[spec(equiv = ...)]`; `open Anneal.PureMirExec \
+             Anneal.MirFuelFree`): discharge `StatefulEquivVerificationResult` \
+             with `verifyStatefulEquivMir_of_wpConverges` and \
              `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference \
              specification's `MirNoCallWpConverges` theorem."
+                .to_string(),
+        );
+    }
+
+    if authored.is_ub_exception {
+        bullets.push(
+            "Scoped UB-exception (`open Anneal.PureMirExec \
+             Anneal.MirFuelFree`): discharge `UbExceptionVerificationResult` \
+             via `verifyUbExceptionMir_of_wpConverges` and \
+             `mirWpConverges_of_runCfgToBlock`."
                 .to_string(),
         );
     }
@@ -2232,7 +2287,7 @@ pub fn render_scaffold_lifting_hints(
         if profile.has_impure_inline_companions {
             bullets.push(
                 "Companion specs (`#mir_lift_spec` / closure-upvar fallback; \
-                 `open Anneal.MirLiftCore`): inline companions capture `&` \
+                 `open Anneal.PureMirExec`): inline companions capture `&` \
                  upvars (`checkPureMir = false`); invert `requires` via \
                  `holdBoolReq_of_mirBool` with count-free `repeat`, prove \
                  `ensures` via `hold_mirBool_of_blockLinear` \
@@ -2243,9 +2298,9 @@ pub fn render_scaffold_lifting_hints(
         } else {
             bullets.push(
                 "Companion specs (`#mir_lift_spec` theorems; `open \
-                 Anneal.PureMirExec Anneal.MirLiftCore`): when `checkPureMir` \
-                 holds on a companion, use `mirBoolPredicateHolds_of_pureExec` \
-                 and `mirBoolPredicateHolds_elim_of_pureExec`; if closure `&` \
+                 Anneal.PureMirExec`): when `checkPureMir` holds on a \
+                 companion, use `mirBoolPredicateHolds_of_pureExec` and \
+                 `mirBoolPredicateHolds_elim_of_pureExec`; if closure `&` \
                  upvars make `checkPureMir = false`, use \
                  `holdBoolReq_of_mirBool` (with `repeat`) and \
                  `hold_mirBool_of_blockLinear` (`defaultSpecSteps`)."
@@ -2255,10 +2310,12 @@ pub fn render_scaffold_lifting_hints(
     }
 
     bullets.push(
-        "Boundary rule: `#mir_lift` (`Anneal.MirLift`) is a closed-body \
+        "Boundary rule: `#mir_lift` (`Anneal.MirLift`, emitting \
+         `<item>_model`, `<item>_lift_sound`, and `<item>_verified`, or \
+         `LiftResidualBlock` under `residual := true`) is a closed-body \
          (`argCount = 0`) elaborator outside `TrustedBoundary`; in \
-         `Proof/*.lean`, apply `Anneal` theorems directly with zero `BlockCtx` \
-         records and zero manual fuel or `iterate k` counts."
+         `Proof/*.lean`, apply `Anneal` theorems directly with zero \
+         `BlockCtx` records and zero manual fuel or `iterate k` counts."
             .to_string(),
     );
 
@@ -3272,7 +3329,7 @@ end Mir.MyCrate.sum_loop
     }
 
     #[test]
-    fn mir_lifting_profile_handles_string_comments_slice_ptrs_u128_switches_and_nested_tys() {
+    fn mir_lifting_profile_handles_strings_slice_ptrs_u128_and_cleanup() {
         let mk_bundle = |def_id: &str, kind: CapturedItemKind| SubjectObligationBundle {
             subject: UnitTargetRecord {
                 target: CapturedTarget {
@@ -3421,7 +3478,61 @@ def body : CapturedMir :=
         let inv_hints =
             render_scaffold_lifting_hints(&inv_bundle, AuthoredItemModules::default(), &prof_u128_loop);
         assert!(inv_hints.contains("Anneal.BitValidity"));
+        assert!(inv_hints.contains("open Anneal.MirLoops Anneal.PureMirExec"));
+        assert!(inv_hints.contains("Anneal.MirFuelFree"));
         for line in inv_hints.lines() {
+            assert!(line.chars().count() <= 80, "line > 80 cols: {line}");
+        }
+
+        // 4. Non-inline `def body : CapturedMir := aliasBody` (no `basicBlocks :=`)
+        //    must NOT be misclassified as a 0-block pure candidate.
+        let alias_body_mir = "import Trusted\ndef body : CapturedMir := otherBody\n";
+        let prof_alias = analyze_mir_lifting_profile(
+            &mk_bundle("demo::alias", CapturedItemKind::Subject),
+            Some(alias_body_mir),
+            &[],
+        );
+        assert!(
+            !prof_alias.has_captured_mir && !prof_alias.is_pure_call_free_candidate(),
+            "non-inline alias CapturedMir must not report has_captured_mir: {prof_alias:?}"
+        );
+
+        // 5. `UnwindAction.cleanup 0` on `assert` and `typeParamCount := 2` are detected,
+        //    and maximal `AuthoredItemModules` combinations respect `<= 80` cols and
+        //    ground-truth namespaces.
+        let cleanup_poly_mir = r#"def body : CapturedMir := {
+            typeParamCount := 2,
+            localDecls := [],
+            basicBlocks := [
+              { statements := [],
+                terminator := { kind := .assert (.copy { local_ := 1, projection := [] }) true 1 (.cleanup 0), span := "" },
+                isCleanup := false },
+              { statements := [], terminator := { kind := .return_, span := "" }, isCleanup := false }
+            ]
+          }"#;
+        let poly_bundle = mk_bundle("demo::poly_cleanup", CapturedItemKind::Subject);
+        let mut prof_poly = analyze_mir_lifting_profile(&poly_bundle, Some(cleanup_poly_mir), &[]);
+        assert_eq!(prof_poly.type_param_count, 2);
+        assert!(
+            prof_poly.has_cfg_back_edge,
+            "UnwindAction.cleanup 0 on bb0 must register as a CFG back-edge"
+        );
+        prof_poly.has_inline_companions = true;
+        prof_poly.has_impure_inline_companions = true;
+        prof_poly.has_deref_projection = true;
+        let max_authored = AuthoredItemModules {
+            is_equiv: true,
+            is_ub_exception: true,
+            is_polymorphic: true,
+            ..AuthoredItemModules::default()
+        };
+        let max_hints = render_scaffold_lifting_hints(&poly_bundle, max_authored, &prof_poly);
+        assert!(max_hints.contains("Body.instantiate typeArgs"));
+        assert!(max_hints.contains("verifyStatefulEquivMir_of_wpConverges"));
+        assert!(max_hints.contains("verifyUbExceptionMir_of_wpConverges"));
+        assert!(max_hints.contains("<item>_lift_sound"));
+        assert!(!max_hints.contains("Equivalence (`#[spec(equiv = ...)]`; `open Anneal.MirLiftCore`)"));
+        for line in max_hints.lines() {
             assert!(line.chars().count() <= 80, "line > 80 cols: {line}");
         }
     }
