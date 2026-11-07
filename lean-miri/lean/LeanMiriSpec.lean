@@ -19,6 +19,9 @@ import LeanMiriSpec.Correspondence.WitLM1_3
 import LeanMiriSpec.Correspondence.AllocLM1_4
 import LeanMiriSpec.Correspondence.SimLM1_4
 import LeanMiriSpec.Correspondence.WitLM1_4
+import LeanMiriSpec.Correspondence.PtrLM3_1
+import LeanMiriSpec.Correspondence.SimLM3_1
+import LeanMiriSpec.Correspondence.WitLM3_1
 import LeanMiriSpec.Audit
 
 /-!
@@ -63,6 +66,14 @@ import LeanMiriSpec.Audit
   local, `PlaceMention`, destructive moves, and the representation coalescing
   theorem `forceAllocation_preserves_StateRel` (`LM-1.4`).
 * `LeanMiriSpec.Correspondence.WitLM1_4`: non-vacuity witnesses for `LM-1.4`.
+* `LeanMiriSpec.Correspondence.PtrLM3_1`: raw pointer and allocation-map invariants
+  (`AllocMapRel`, `PtrRel`), pointer resolution (`annealResolvePtr`), bounds/alignment
+  validation (`checkAndDerefPtr`), and `Miri.Interpreter.ptrOffsetInbounds` (`LM-3.1`).
+* `LeanMiriSpec.Correspondence.SimLM3_1`: `LM-3.1` correspondence for `Rvalue.RawPtr`
+  (`&raw const`/`&raw mut`) with `forceAllocation`, `PlaceElem.Deref` (`*ptr`) reads,
+  writes, and UB, `BinOp.Offset` (`inbounds` vs. `wrapping`), `CastKind.PtrToPtr`,
+  and pointer/integer exposure casts (`step_stmt_lm3_1_simulation`).
+* `LeanMiriSpec.Correspondence.WitLM3_1`: non-vacuity witnesses for `LM-3.1`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
