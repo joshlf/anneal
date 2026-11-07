@@ -995,13 +995,22 @@ def annealResolveAndCacheLocalLayout (localDecls : List LocalDecl) (layouts : La
       else
         throw (.stack .emptyStack)
 
-/-- Map a `Miri.Interpreter.ProjectionError` to a `Miri.Interpreter.StepError`,
-matching `Miri.Interpreter.liftProjectionError` and rustc's bounds/index UB. -/
+/-- Map a `Miri.Interpreter.ProjectionError` to a `Miri.Interpreter.StepError`.
+
+The vendored interpreter has no such lifting for operand projections (its
+`projectionLift` in `Place.lean` reports every non-machine error as a
+callback), so this mapping follows rustc's interpreter instead. An out-of-bounds
+index (`.bounds`) is undefined behavior (`BoundsCheckFailed`), as are an
+out-of-bounds in-bounds offset and pointer arithmetic overflow. An unmet hook
+obligation is unsupported. A violated projection invariant, such as a malformed
+`ConstantIndex`, means ill-formed MIR, on which rustc reports a compiler bug
+rather than UB, so it is an invalid program, like layout, size, alignment,
+other offset, immediate, and scalar errors. -/
 def annealLiftProjectionError :
     Miri.Interpreter.ProjectionError → Miri.Interpreter.StepError
   | .machineError err => err
   | .obligation op => .unsupported op
-  | .invariant msg => .undefinedBehavior msg
+  | .invariant msg => .invalidProgram msg
   | .bounds len index => .undefinedBehavior s!"bounds check failed: index {index} >= len {len}"
   | .pointerArithOverflow => .undefinedBehavior "pointer arithmetic overflow in projection"
   | .layout err => .invalidProgram (reprStr err)

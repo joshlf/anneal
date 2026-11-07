@@ -1387,7 +1387,7 @@ theorem evalProjection_constantIndex_simulation
 `fromEnd = false` with `minLength ≤ offset` when `minLength ≤ count`, or `fromEnd = true`
 with `offset = 0 ∨ minLength < offset` when `minLength ≤ count`) fails closed in
 `annealProjectList` with `ProjectionError.invariant msg` (which `annealLiftProjectionError`
-maps to `StepError.undefinedBehavior msg`, never silently truncating or succeeding). -/
+maps to `StepError.invalidProgram msg`, never silently truncating or succeeding). -/
 theorem projectConstantIndex_malformed_invariant
     {mach : AnnealMachine}
     (frame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
