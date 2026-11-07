@@ -252,10 +252,11 @@ they fail `checkPureMir` and the theorems above do not apply. For those, invert
 body-derived budget `defaultSpecSteps` (`16 * #blocks + 80`), so they are
 bounded evaluations, not lifts. When a multi-branch companion needs several
 `wpBlockLinear` unfolds across argument or comparison splits, drive one shared
-`dsimp only [...]` list with `iterate k (...; first | ...)` instead of
-repeating the unfold list per branch (see
-`Proof/WireframeDemo/clamp_payload_window.lean` and `frame_total_len.lean`).
-For concrete arguments,
+`dsimp only [...]` list with `repeat (...; first | ...)` instead of repeating
+the unfold list per branch (see `Proof/WireframeDemo/clamp_payload_window.lean`
+and `frame_total_len.lean`). Prefer `repeat` to `iterate k`: it stops when the
+script makes no more progress, so the proof states no round count. For
+concrete arguments,
 `mirBoolPredicateHolds_of_evalMirSpecBool_true _ _ rfl rfl` decides the
 companion by evaluation.
 

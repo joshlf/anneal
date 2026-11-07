@@ -77,7 +77,9 @@ private theorem wpReq_inversion (v1 v2 : Value)
       Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.body
       [v1, v2] rfl rfl h_req
   revert h_hold
-  iterate 4 (
+  -- Each round unfolds the companion further, then refutes a branch or splits
+  -- `v1` / `v2` on its shape and bound.
+  repeat (
     dsimp only [
       Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.layouts,
       Mir.WireframeDemo.__anodized_fn_requires_frame_total_len.body,

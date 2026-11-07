@@ -159,7 +159,7 @@ Factor the proof into three cleanly separated theorems:
    discharging impossible branches with `nomatch`. When short-circuiting
    `&&`/`||` checks require multiple `wpBlockLinear` unfolds across argument and
    comparison splits, drive one shared `dsimp only [...]` list with
-   `iterate k (...; first | ...)` rather than duplicating the unfold list per
+   `repeat (...; first | ...)` rather than duplicating the unfold list per
    branch (`Proof/WireframeDemo/clamp_payload_window.lean`,
    `frame_total_len.lean`).
 2. **`ensures_holds` (Forward Postcondition Discharge):** A standalone theorem

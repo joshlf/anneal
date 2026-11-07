@@ -72,7 +72,7 @@ private theorem advance_cursor_lift
   · rfl
   · rfl
   · rfl
-  · iterate 7 (apply LiftLensStmts.cons; · exact .storageLive (.mk rfl (set?_of_forcePureEnv? rfl)))
+  · repeat (apply LiftLensStmts.cons; · exact .storageLive (.mk rfl (set?_of_forcePureEnv? rfl)))
     apply LiftLensStmts.cons
     · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
     apply LiftLensStmts.cons

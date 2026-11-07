@@ -38,8 +38,8 @@ private theorem ensures_holds (b1 b2 ret : Nat)
   refine hold_mirBool_of_blockLinear _ _ rfl rfl ?_
   rcases h_ret with ⟨h_le, rfl⟩ | ⟨h_gt, rfl⟩
   all_goals
-    iterate 4 (
-      try dsimp only [
+    repeat (first
+      | dsimp only [
         Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.layouts,
         Mir.WireframeDemo.__anodized_fn_ensures_clamp_payload_window.body,
         defaultSpecSteps, entryBB, dummyBB, lookupBlock,
@@ -70,7 +70,7 @@ private theorem ensures_holds (b1 b2 ret : Nat)
         get?, set?, length, Nat.add, Nat.mul, Nat.beq, Bool.and, Bool.or, Bool.not,
         ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat,
         Bool.decEq, instDecidableEqBool, BEq.beq, instBEqOfDecidableEq]
-      try simp (disch := omega) only [nat_ble_eq_true_of_le, Nat.beq_refl,
+      | simp (disch := omega) only [nat_ble_eq_true_of_le, Nat.beq_refl,
         nat_beq_eq_false_of_ne])
     exact ⟨boolTruePost_normal_one _⟩
 
@@ -86,7 +86,9 @@ private theorem wpReq_inversion (v1 v2 : Value)
       Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body
       [v1, v2] rfl rfl h_req
   revert h_hold
-  iterate 4 (
+  -- Each round unfolds the companion further, then refutes a branch or splits
+  -- `v1` / `v2` on its shape and bound.
+  repeat (
     dsimp only [
       Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.layouts,
       Mir.WireframeDemo.__anodized_fn_requires_clamp_payload_window.body,

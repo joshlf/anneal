@@ -110,7 +110,7 @@ private theorem impl_verified
       callerLocals := frame8CallerLocals b0 b1 b2 b3 b4 b5 b6 b7, fnPtrs }
   rw [checksumModel_eq_of_callerLocals _ _ b0 b1 b2 b3 b4 b5 b6 b7 rfl]
   refine mirNoCallWpConverges_of_runCfgToBlock (target := 0) _ _ rfl _ ?_
-  iterate 2 (
+  repeat (
     dsimp only [
       cfgStateWP, mem₀, runCfgToBlock, runCfgUntilAux, cfgAtBlock,
       Obligations.WireframeDemo.checksum_frame_fast.equivClaim,
