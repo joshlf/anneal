@@ -1094,13 +1094,13 @@ def annealResolveAndCacheLocalLayout (localDecls : List LocalDecl) (layouts : La
         throw (.stack .emptyStack)
 
 /-- Whether `translateTy` gives a pointee of kind `k` its exact layout without
-consulting a layout table: `bool`, `char`, the integer and float types, and the
-unit type. Every other pointee (an aggregate, whose layout lives at an index
-that a raw pointer type does not record; an unsized slice, `str`, or trait
-object; or a pointer, which may itself be fat) has no layout that a dereference
-can trust. -/
+consulting a layout table: `bool`, `char`, the integer and float types, the
+unit type `()`, and zero-sized function-item types (`RigidTy.fnDef`). Every
+other pointee (an aggregate, whose layout lives at an index that a raw pointer
+type does not record; `!`; an unsized slice, `str`, or trait object; or a
+pointer, which may itself be fat) has no layout that a dereference can trust. -/
 def derefPointeeKindHasExactLayout : RigidTy → Bool
-  | .bool | .char | .int _ | .uint _ | .float _ | .tuple .nil => true
+  | .bool | .char | .int _ | .uint _ | .float _ | .tuple .nil | .fnDef _ _ => true
   | _ => false
 
 /-- Resolve the pointee `LocalLayout` when dereferencing a raw-pointer local
