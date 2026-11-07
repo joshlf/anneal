@@ -51,8 +51,6 @@ private theorem mul_0_2 : Nat.mul 0 2 = 0 := rfl
 private theorem mul_1_2 : Nat.mul 1 2 = 2 := rfl
 private theorem mul_2_2 : Nat.mul 2 2 = 4 := rfl
 private theorem mul_3_2 : Nat.mul 3 2 = 6 := rfl
-private theorem mul_12_16 : Nat.mul 12 16 = 192 := rfl
-private theorem mul_20_16 : Nat.mul 20 16 = 320 := rfl
 private theorem wrap8_0 : wrapScalarBits 0 18446744073709551616 = 0 := rfl
 private theorem wrap8_1 : wrapScalarBits 1 18446744073709551616 = 1 := rfl
 private theorem wrap8_2 : wrapScalarBits 2 18446744073709551616 = 2 := rfl
@@ -195,7 +193,7 @@ private theorem impl_verified :
         tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
         intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
         scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-        mul_1_8, mul_2_8, mul_4_8, mul_8_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2, mul_20_16,
+        mul_1_8, mul_2_8, mul_4_8, mul_8_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2,
         wrap8_0, wrap8_1, wrap8_2, wrap8_3, wrap8_4, wrap8_5, wrap8_6, wrap8_7, wrap4_8,
         get?_frame8CallerLocals, get?Internal_frame8CallerLocals,
         lookupSwitchTarget, applyUnwindAction, MirStepNode.step, MirStepNode.retNormal,
@@ -336,7 +334,7 @@ private theorem spec_verified :
     tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
     intCastTargetBytes, shiftLeftBits, shiftRightUnsignedBits, scalarPow2_eight,
     scalarModulus_1, scalarModulus_2, scalarModulus_4, scalarModulus_8,
-    mul_1_8, mul_2_8, mul_4_8, mul_8_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2, mul_12_16,
+    mul_1_8, mul_2_8, mul_4_8, mul_8_8, mul_0_2, mul_1_2, mul_2_2, mul_3_2,
     wrap8_0, wrap8_1, wrap8_2, wrap8_3, wrap8_4, wrap8_5, wrap8_6, wrap8_7, wrap4_8,
     get?_frame8CallerLocals, get?Internal_frame8CallerLocals,
     lookupSwitchTarget, applyUnwindAction,
@@ -421,7 +419,8 @@ private theorem spec_verified :
   simp only [h_ovf1, h_w1, h_ovf2, h_w2, h_ovf3, h_w3, h_ovf4, h_w4]
   rfl
 
-/-- Behavioral-equivalence and total-correctness certificate for `checksum_frame_fast`. -/
+/-- Behavioral-equivalence and total-correctness certificate for
+`checksum_frame_fast`. -/
 theorem verified :
     StatefulEquivVerificationResult Obligations.WireframeDemo.checksum_frame_fast.equivClaim :=
   verifyStatefulEquivMir_of_runCfgSteps

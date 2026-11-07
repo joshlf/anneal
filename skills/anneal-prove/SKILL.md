@@ -218,12 +218,19 @@ theorem verified : VerificationResult Obligations.WireframeDemo.frame_total_len.
 - Long straight-line blocks: the `rfl` of `cons_eval` assigns the next locals
   unreduced, and nested `List.set` towers are re-evaluated without sharing, so
   per-statement cost with repeated `cons_eval` doubles across long basic blocks.
-  For straight-line prefixes of `n` pure statements, use
-  `LiftStmtsTerminator.eval_n n (by rfl) (Or.inr rfl) (by rfl)` to evaluate all
-  `n` statements in one pass, or use `LiftStmtsTerminator.cons_eval_norm`
-  (which normalizes `env'` via `forcePureEnv?` after each statement so
-  subsequent steps index into a flat list; see
+  Evaluate the rest of a block in one pass with
+  `LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)`, which takes
+  the statement count from the block and flattens the locals with
+  `forcePureEnv?` after each statement, or step one statement with
+  `LiftStmtsTerminator.cons_eval_norm`. For an rvalue that `rfl` cannot
+  evaluate (a transmute of symbolic bytes, say), prove its value in a separate
+  lemma and pass it to `evalPureStmtNorm_assign_local_of_evalRvalue` (see
   `Proof/WireframeDemo/decode_wire_header.lean`).
+- Split a branching proof into lemmas that each conclude
+  `PureMirConverges body (initPureState body args) post` and begin with
+  `apply lift_PureMirConverges (by rfl)`, so every lemma infers its own step
+  budget. Do not state `LiftBlock … 30`: a fuel numeral in a statement is a
+  manual budget even when every rule below it is fuel-free.
 
 #### Pattern B: `#mir_lift_spec` for companion predicates
 
@@ -255,13 +262,27 @@ Model `for i in lo..hi` / `while i < hi` loops with
 `mirWpConverges_forRangeUp lo hi init step body LoopInv s₀ post h_init h_body
 h_exit` turns a loop invariant `LoopInv i acc s` into a fuel-free
 `MirWpConverges` proof (combined with `MirWpConverges.bind` for loop-entry
-setup and `verifyStatefulMirNoPanic_of_wpConverges` at the top level):
-`h_body` proves one iteration (`MirStepsConverges` from the loop head back to
-the loop head at `i + 1`, discharged via `mirStepsConverges_of_cfgStepsWP_none`),
-and `h_exit` proves the exit path once `i ≥ hi` (discharged via
-`mirWpConverges_of_runCfgSteps_none`; see
-`Proof/WireframeDemo/checksum_frame_safe.lean`). Use `mirWpConverges_whileRank`
-for loops with a decreasing rank instead of a counter.
+setup and `verifyStatefulMirNoPanic_of_wpConverges` at the top level).
+Discharge every CFG segment with `runCfgToBlock body header cfg`, which steps
+until the evaluator next enters the loop-header block `header`, halts, or
+faults, so the proof never states a step count:
+
+- loop entry and each iteration (`h_body`):
+  `mirStepsConverges_of_runCfgToBlock body mid post rfl header s ?_`;
+- the exit path once `i ≥ hi` (`h_exit`):
+  `mirWpConverges_of_runCfgToBlock body post rfl header s ?_`.
+
+Each leaves a `cfgStepsWP mid post (runCfgToBlock …)` (or `cfgStateWP`) goal
+that one `dsimp only [runCfgToBlock, runCfgUntilAux, cfgAtBlock,
+defaultCfgSteps, stepCfgState, …]` evaluates. List the claim
+(`Obligations.<Crate>.<item>.statefulClaim`) there too, so that the body and
+initial state taken from the goal unfold: a folded `statefulClaim.body`
+leaves the evaluator stuck, and `dsimp` then times out. When the body indexes
+memory by the counter (`frame[2 * i]`), keep the accumulator symbolic, split
+the counter into its concrete values, and run one script on every case with
+`all_goals` (see `Proof/WireframeDemo/checksum_frame_safe.lean`). Use
+`mirWpConverges_whileRank` for loops with a decreasing rank instead of a
+counter.
 
 #### Pattern D: `&mut` / `&` arguments with `Anneal.SepLogicLenses`
 
@@ -274,7 +295,10 @@ from the `LiftLensStmt` / `LiftDerefRead` / `LiftDerefFieldRead` /
 outside the lenses is preserved by `LensFramePreserved` without destructuring
 `Memory`. `LiftLensBlock` accepts `isRuntimeMirPhase body.phase = true` (`rfl`
 for both `.runtimePostCleanup` fixtures and `.runtimeOptimized` bodies captured
-by `cargo anneal`; see `Proof/WireframeDemo/advance_cursor.lean`). Concrete
+by `cargo anneal`; see `Proof/WireframeDemo/advance_cursor.lean`). Discharge
+each `set? env loc slot = some env'` premise of a lens rule with
+`set?_of_forcePureEnv? rfl`, which instantiates `env'` with the flat slot list
+rather than an unreduced `List.set` application. Concrete
 pinned-memory contracts can also use `dischargeStatefulEqFuelFree` (a
 fixed-budget wrapper; see Pattern E).
 

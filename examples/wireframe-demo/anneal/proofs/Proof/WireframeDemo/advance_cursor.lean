@@ -17,43 +17,13 @@ open Anneal.Scalars
 open Anneal.UnsafeObligations
 open Anneal.SepLogic
 open Anneal.SepLogicLenses
+open Anneal.MirLiftCore
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 open Specs.WireframeDemo.advance_cursor
 
 /-- Separation-logic lens pointer for the caller-frame `FrameCursor` slot. -/
 abbrev cursorRp : RawPtrVal :=
   { allocId := cursorSlotIdx, offset := 0, tag := 1 }
-
-/-- Spine-normalizer for `List LocalSlot` so `set?_of_forceEnv rfl` unifies metavariables
-    with flat `[.uninit, .init _, ...]` lists instead of unreduced `List.set` chains. -/
-private def forceEnv : List LocalSlot → Option (List LocalSlot)
-  | [] => some []
-  | .uninit :: tl =>
-    match forceEnv tl with
-    | some tl' => some (.uninit :: tl')
-    | none => none
-  | .dead :: tl =>
-    match forceEnv tl with
-    | some tl' => some (.dead :: tl')
-    | none => none
-  | .init v :: tl =>
-    match forceEnv tl with
-    | some tl' => some (.init v :: tl')
-    | none => none
-
-private theorem forceEnv_eq_some (env : List LocalSlot) : forceEnv env = some env := by
-  induction env with
-  | nil => rfl
-  | cons hd tl ih => cases hd <;> simp [forceEnv, ih]
-
-private theorem set?_of_forceEnv {env env' : List LocalSlot} {loc : Local} {s : LocalSlot}
-    (h : (set? env loc s).bind forceEnv = some env') :
-    set? env loc s = some env' := by
-  cases hSet : set? env loc s with
-  | none => rw [hSet] at h; nomatch h
-  | some e =>
-    rw [hSet, Option.bind_some, forceEnv_eq_some] at h
-    exact h
 
 private theorem cursor_sepLensStateInv
     (offset limit : Nat) (mem : Memory)
@@ -96,16 +66,17 @@ private theorem advance_cursor_lift
   have h_ble_inv : Nat.ble offset limit = true := Nat.ble_eq_true_of_le h_inv
   have h_sub_wrap : wrapScalarBits (Nat.sub limit offset) (scalarModulus 2) = limit - offset :=
     wrapScalarBits_eq_of_lt (by change limit - offset < 65536; omega)
-  -- bb0: read limit & offset through `cursorRp`, checked sub `limit - offset`, assert no overflow
+  -- bb0: read `limit` and `offset` through `cursorRp`, compute the checked
+  -- `limit - offset`, and assert that it does not overflow.
   apply LiftLensBlock.assert (sc := ⟨0, 1⟩)
   · rfl
   · rfl
   · rfl
-  · iterate 7 (apply LiftLensStmts.cons; · exact .storageLive (.mk rfl (set?_of_forceEnv rfl)))
+  · iterate 7 (apply LiftLensStmts.cons; · exact .storageLive (.mk rfl (set?_of_forcePureEnv? rfl)))
     apply LiftLensStmts.cons
-    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
     apply LiftLensStmts.cons
-    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
     apply LiftLensStmts.cons
     · exact .pureAssign (.mk (.binaryOp (v := .aggregate 0 [.scalar ⟨limit - offset, 2⟩, .scalar ⟨0, 1⟩])
         (.pure (.copy_local rfl)) (.pure (.copy_local rfl))
@@ -116,7 +87,7 @@ private theorem advance_cursor_lift
                   [Value.scalar { bits := wrapScalarBits (Nat.sub limit offset) (scalarModulus 2), sizeBytes := 2 },
                    Value.scalar { bits := 0, sizeBytes := 1 }]) _ _
             | false => _) = _
-          rw [h_ble_inv, h_sub_wrap])) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+          rw [h_ble_inv, h_sub_wrap])) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
     exact .nil
   · exact .pure (.move_field rfl rfl)
   · rfl
@@ -136,20 +107,21 @@ private theorem advance_cursor_lift
       · rfl
       · rfl
       · apply LiftLensStmts.cons
-        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl)) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         apply LiftLensStmts.cons
-        · exact .pureAssign (.mk (.binaryOp (.pure (.copy_local rfl)) (.pure (.copy_local rfl)) (fun _ => rfl)) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+        · exact .pureAssign (.mk (.binaryOp (.pure (.copy_local rfl)) (.pure (.copy_local rfl)) (fun _ => rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         exact .nil
-      · exact .pure (.move_local rfl (set?_of_forceEnv rfl))
+      · exact .pure (.move_local rfl (set?_of_forcePureEnv? rfl))
       · change lookupSwitchTarget (boolToScalar (Nat.ble step (limit - offset))).bits [(0, 4)] 2 = 2
         rw [h_ble_step]; rfl
-      · -- bb2: `_8 = copy ((*_1).0); _9 = AddWithOverflow(copy _8, copy _2); assert(!move (_9.1))`
+      · -- bb2: `_8 = copy ((*_1).0); _9 = AddWithOverflow(copy _8, copy _2);
+        -- assert(!move (_9.1))`
         apply LiftLensBlock.assert (sc := ⟨0, 1⟩)
         · rfl
         · rfl
         · rfl
         · apply LiftLensStmts.cons
-          · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+          · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
           apply LiftLensStmts.cons
           · exact .pureAssign (.mk (.binaryOp (v := .aggregate 0 [.scalar ⟨offset + step, 2⟩, .scalar ⟨0, 1⟩])
               (.pure (.copy_local rfl)) (.pure (.copy_local rfl))
@@ -160,7 +132,7 @@ private theorem advance_cursor_lift
                      Value.scalar { bits := match Nat.ble (scalarModulus 2) (Nat.add offset step) with
                         | true => 1
                         | false => 0, sizeBytes := 1 }]) _ _ = _
-                rw [h_no_ovf, h_add_wrap])) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+                rw [h_no_ovf, h_add_wrap])) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
           exact .nil
         · exact .pure (.move_field rfl rfl)
         · rfl
@@ -174,7 +146,7 @@ private theorem advance_cursor_lift
                 (.use_pure (.move_field rfl rfl))
                 (rp := cursorRp) rfl rfl rfl)
             apply LiftLensStmts.cons
-            · exact .pureAssign (.mk (.use_pure .const_scalar) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+            · exact .pureAssign (.mk (.use_pure .const_scalar) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
             exact .nil
           · -- bb5: `return`
             exact LiftLensBlock.return_ rfl rfl rfl .nil rfl
@@ -188,11 +160,11 @@ private theorem advance_cursor_lift
       · rfl
       · rfl
       · apply LiftLensStmts.cons
-        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl)) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         apply LiftLensStmts.cons
-        · exact .pureAssign (.mk (.binaryOp (.pure (.copy_local rfl)) (.pure (.copy_local rfl)) (fun _ => rfl)) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+        · exact .pureAssign (.mk (.binaryOp (.pure (.copy_local rfl)) (.pure (.copy_local rfl)) (fun _ => rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         exact .nil
-      · exact .pure (.move_local rfl (set?_of_forceEnv rfl))
+      · exact .pure (.move_local rfl (set?_of_forcePureEnv? rfl))
       · change lookupSwitchTarget (boolToScalar (Nat.ble step (limit - offset))).bits [(0, 4)] 2 = 4
         rw [h_ble_step]; rfl
       · -- bb4: `_0 = const false; goto -> bb5`
@@ -201,12 +173,13 @@ private theorem advance_cursor_lift
         · rfl
         · rfl
         · apply LiftLensStmts.cons
-          · exact .pureAssign (.mk (.use_pure .const_scalar) rfl (fun h => nomatch h) (set?_of_forceEnv rfl))
+          · exact .pureAssign (.mk (.use_pure .const_scalar) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
           exact .nil
         · -- bb5: `return`
           exact LiftLensBlock.return_ rfl rfl rfl .nil rfl
 
-/-- Stateful verification certificate for `wireframe_demo::advance_cursor` via `SepLogicLenses`. -/
+/-- Stateful verification certificate for `wireframe_demo::advance_cursor`
+via `SepLogicLenses`. -/
 theorem verified :
     StatefulVerificationResult Obligations.WireframeDemo.advance_cursor.statefulClaim := by
   refine verifyStatefulMir_of_sepLenses

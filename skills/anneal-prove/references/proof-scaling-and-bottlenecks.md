@@ -38,18 +38,21 @@ constant in every goal:
 1. **Call-free, alias-free bodies (`checkPureMir` holds):** Use
    `verifyMirNoPanic_of_pureExec` with the `#mir_lift` rules
    (`lift_PureMirConverges`, `LiftBlock.of_lookup`,
-   `LiftStmtsTerminator.{eval_n, cons_eval_norm, cons_eval, term_*}`);
-   each rule evaluates statements or a terminator by `rfl` (`eval_n` steps `n`
-   statements in one pass and `cons_eval_norm` normalizes `PureEnv` via
-   `forcePureEnv?` to prevent `List.set` tower blowup on long blocks) and the
-   step count is synthesized by unification (`SKILL.md`, Pattern A). For
-   companion bodies that pass `checkPureMir`, use the `#mir_lift_spec` theorems
+   `LiftStmtsTerminator.{eval_rest, cons_eval_norm, cons_eval, term_*}`);
+   each rule evaluates statements or a terminator by `rfl` (`eval_rest` steps
+   the rest of a block in one pass, taking the statement count from the block,
+   and `cons_eval_norm` normalizes `PureEnv` via `forcePureEnv?` to prevent
+   `List.set` tower blowup on long blocks) and the step count is synthesized
+   by unification (`SKILL.md`, Pattern A). For companion bodies that pass
+   `checkPureMir`, use the `#mir_lift_spec` theorems
    (`mirBoolPredicateHolds_of_pureExec`,
    `mirBoolPredicateHolds_elim_of_pureExec`).
 2. **Bounded loops:** Use `forRangeUp` with `forRangeUp_induction` and
    `mirWpConverges_forRangeUp` (or `mirWpConverges_whileRank`) together with
-   `mirStepsConverges_of_cfgStepsWP_none` and `mirWpConverges_of_runCfgSteps_none`
-   so that the proof is structured around a loop invariant at the loop header
+   `mirStepsConverges_of_runCfgToBlock` and `mirWpConverges_of_runCfgToBlock`,
+   which evaluate from the loop header to its next entry (or to the return)
+   without a step count, so that the proof is structured around a loop
+   invariant at the loop header
    (`Proof/WireframeDemo/checksum_frame_safe.lean`).
 3. **Reference arguments:** Use `LiftLensBlock` with
    `mirWpConverges_of_sepLenses` / `verifyStatefulMir_of_sepLenses` (which

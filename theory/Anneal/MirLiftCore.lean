@@ -379,6 +379,18 @@ theorem forcePureEnv?_eq_some (env : PureEnv) : forcePureEnv? env = some env := 
   | nil => rfl
   | cons s rest ih => cases s <;> dsimp [forcePureEnv?] <;> rw [ih]
 
+/-- `set?_of_forcePureEnv? rfl` proves `set? env loc s = some env'` while
+instantiating `env'` with the flat slot list that `forcePureEnv?` computes,
+not with an unreduced `List.set` application. -/
+theorem set?_of_forcePureEnv? {env env' : PureEnv} {loc : Local}
+    {s : SlotState} (h : (set? env loc s).bind forcePureEnv? = some env') :
+    set? env loc s = some env' := by
+  cases hSet : set? env loc s with
+  | none => rw [hSet] at h; nomatch h
+  | some e =>
+    rw [hSet, Option.bind_some, forcePureEnv?_eq_some] at h
+    exact h
+
 /--
 Evaluates a single pure statement and normalizes the resulting `PureEnv` list
 spine via `forcePureEnv?`.
@@ -411,6 +423,39 @@ theorem LiftStmtsTerminator.cons_eval_norm {body : CapturedMir} {bbIdx : BasicBl
     LiftStmtsTerminator body bbIdx stmtIdx env stmts term post (fuel + 1) := by
   rw [evalPureStmtNorm_eq_evalPureStmt] at h_eval
   exact LiftStmtsTerminator.cons_eval h_bb h_phase h_get h_eval h_next
+
+/-- `cons_eval_norm` premise for `dst = rv` when `rv` is evaluated by a
+separate lemma `h_rv`, for rvalues (such as transmutes of symbolic bytes)
+that `rfl` cannot evaluate. -/
+theorem evalPureStmtNorm_assign_local_of_evalRvalue
+    {body : CapturedMir} {bbIdx : BasicBlockIdx} {stmtIdx : Nat}
+    {env env' : PureEnv} {dstLoc : Local} {rv : Rvalue} {span : String}
+    {val : Value} {oldSlot : LocalSlot}
+    (h_pure : isPureStatement
+      (.assign { local_ := dstLoc, projection := [] } rv) = true)
+    (h_rv : evalRvalue env rv emptyMemory body.localDecls body.layouts =
+      .ok val env emptyMemory)
+    (h_get : get? env dstLoc = some oldSlot)
+    (h_live : oldSlot ≠ .dead)
+    (h_set : (set? env dstLoc (.init val)).bind forcePureEnv? = some env') :
+    evalPureStmtNorm body bbIdx stmtIdx env
+      { kind := .assign { local_ := dstLoc, projection := [] } rv,
+        span := span } = some env' := by
+  dsimp only [evalPureStmtNorm, evalPureStmt]
+  rw [h_pure]
+  dsimp only [↓reduceIte, evalStmt, PureState.toMachineState]
+  rw [h_rv]
+  dsimp only [emptyMemory]
+  rw [h_get]
+  cases oldSlot with
+  | dead => exact False.elim (h_live rfl)
+  | uninit | init _ =>
+    dsimp only
+    cases hSet : set? env dstLoc (.init val) with
+    | none => rw [hSet] at h_set; nomatch h_set
+    | some locals₂ =>
+      rw [hSet] at h_set
+      exact h_set
 
 /--
 Evaluates `n` consecutive pure statements starting at `stmtIdx` in `stmts`,
@@ -468,6 +513,24 @@ theorem LiftStmtsTerminator.eval_n {body : CapturedMir} {bbIdx : BasicBlockIdx}
         have h_fuel : (fuel + k) + 1 = fuel + (k + 1) := by omega
         rw [← h_fuel]
         exact h_one
+
+/-- `eval_n` over every remaining statement of the block. The count
+`List.length stmts - stmtIdx` comes from the block, so a proof that lifts a
+straight-line block never states how many statements it has. -/
+theorem LiftStmtsTerminator.eval_rest {body : CapturedMir}
+    {bbIdx : BasicBlockIdx} {stmtIdx : Nat} {env env' : PureEnv}
+    {stmts : List Statement} {term : Terminator} {post : Value → Prop}
+    {fuel : Nat}
+    (h_bb : Trusted.Sequence.get? body.basicBlocks bbIdx =
+      some { statements := stmts, terminator := term, isCleanup := false })
+    (h_phase : body.phase = .runtimePostCleanup ∨ body.phase = .runtimeOptimized)
+    (h_eval : evalPureStmtsN body bbIdx stmts (List.length stmts - stmtIdx)
+      stmtIdx env = some env')
+    (h_next : LiftStmtsTerminator body bbIdx
+      (stmtIdx + (List.length stmts - stmtIdx)) env' stmts term post fuel) :
+    LiftStmtsTerminator body bbIdx stmtIdx env stmts term post
+      (fuel + (List.length stmts - stmtIdx)) :=
+  LiftStmtsTerminator.eval_n h_bb h_phase h_eval h_next
 
 
 
@@ -4304,5 +4367,88 @@ theorem mirWpConverges_of_runCfgSteps_none
     (h_post : post out) :
     MirWpConverges body s post :=
   mirWpConverges_of_runCfgSteps body post h_phase fuel .none s out trivial h_eq h_post
+
+/-! ### Running to the next block entry without a step count
+
+`runCfgToBlock body target cfg` steps the CFG evaluator from `cfg` until it
+next enters basic block `target` (a running state with no cached block at
+statement 0 of `target`), halts, or faults. The first step is always taken,
+so a loop header reaches itself again one iteration later. Proofs therefore
+never state how many steps a loop iteration or a straight-line segment
+takes; `defaultCfgSteps body` only bounds the recursion.
+
+`runCfgUntilAux` checks for the target before each step and returns as soon
+as it is reached, so `dsimp` neither evaluates a step past the target nor
+unfolds the unused part of the bound.
+-/
+
+/-- Whether `cfg` is about to dispatch basic block `target`. -/
+def cfgAtBlock (target : Nat) : CfgExecState → Bool
+  | .running _ .none s =>
+    Nat.beq s.frame.blockIdx target && Nat.beq s.frame.stmtIdx 0
+  | _ => false
+
+/-- Step from `cfg` until `atTarget = cfgAtBlock target cfg` holds, taking
+at most `budget` steps. -/
+def runCfgUntilAux (body : CapturedMir) (target : Nat) :
+    Nat → CfgExecState → Bool → CfgExecState
+  | _, cfg, true => cfg
+  | 0, cfg, false => cfg
+  | budget + 1, cfg, false =>
+    runCfgUntilAux body target budget (stepCfgState body cfg)
+      (cfgAtBlock target (stepCfgState body cfg))
+
+/-- Evaluate from `cfg` until the next entry into block `target`, a halt, or
+a fault, taking at least one and at most `defaultCfgSteps body + 1` steps. -/
+def runCfgToBlock (body : CapturedMir) (target : Nat) (cfg : CfgExecState) :
+    CfgExecState :=
+  runCfgUntilAux body target (defaultCfgSteps body) (stepCfgState body cfg)
+    (cfgAtBlock target (stepCfgState body cfg))
+
+theorem runCfgUntilAux_eq_runCfgSteps (body : CapturedMir) (target : Nat) :
+    ∀ budget cfg atTarget, ∃ k,
+      runCfgUntilAux body target budget cfg atTarget = runCfgSteps body cfg k
+  | _, cfg, true => ⟨0, by cases ‹Nat› <;> rfl⟩
+  | 0, cfg, false => ⟨0, rfl⟩
+  | budget + 1, cfg, false => by
+    obtain ⟨k, hk⟩ := runCfgUntilAux_eq_runCfgSteps body target budget
+      (stepCfgState body cfg) (cfgAtBlock target (stepCfgState body cfg))
+    exact ⟨k + 1, by rw [runCfgUntilAux, hk, runCfgSteps_step]⟩
+
+/-- Every `runCfgToBlock` run is a prefix of `runCfgSteps`. -/
+theorem runCfgToBlock_eq_runCfgSteps (body : CapturedMir) (target : Nat)
+    (cfg : CfgExecState) :
+    ∃ k, runCfgToBlock body target cfg = runCfgSteps body cfg k := by
+  obtain ⟨k, hk⟩ := runCfgUntilAux_eq_runCfgSteps body target
+    (defaultCfgSteps body) (stepCfgState body cfg)
+    (cfgAtBlock target (stepCfgState body cfg))
+  exact ⟨k + 1, by rw [runCfgToBlock, hk, runCfgSteps_step]⟩
+
+/-- `mirStepsConverges_of_cfgStepsWP_none` without a step count: the segment
+from `s` ends at the next entry into block `target`, or halts. -/
+theorem mirStepsConverges_of_runCfgToBlock
+    (body : CapturedMir) (mid : MachineState → Prop) (post : MirOutcome → Prop)
+    (h_phase : body.phase = .runtimeOptimized) (target : Nat) (s : MachineState)
+    (h_wp : cfgStepsWP mid post
+      (runCfgToBlock body target (.running true .none s))) :
+    MirStepsConverges body s mid post := by
+  obtain ⟨k, hk⟩ :=
+    runCfgToBlock_eq_runCfgSteps body target (.running true .none s)
+  rw [hk] at h_wp
+  exact mirStepsConverges_of_cfgStepsWP body mid post h_phase k .none s
+    trivial h_wp
+
+/-- `mirWpConverges_of_cfgStateWP_none` without a step count, for a segment
+that halts before it re-enters block `target`. -/
+theorem mirWpConverges_of_runCfgToBlock
+    (body : CapturedMir) (post : MirOutcome → Prop)
+    (h_phase : body.phase = .runtimeOptimized) (target : Nat) (s : MachineState)
+    (h_wp : cfgStateWP post
+      (runCfgToBlock body target (.running true .none s))) :
+    MirWpConverges body s post := by
+  obtain ⟨k, hk⟩ :=
+    runCfgToBlock_eq_runCfgSteps body target (.running true .none s)
+  rw [hk] at h_wp
+  exact mirWpConverges_of_cfgStateWP body post h_phase k .none s trivial h_wp
 
 end Anneal.PureMirExec
