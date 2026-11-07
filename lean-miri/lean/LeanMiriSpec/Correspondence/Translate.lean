@@ -1214,10 +1214,19 @@ or a constant `Miri.MIR.Operand` in the top frame of `AnnealStepState`.
    `StepError.stack (.localExpectedLive _)`, for which `RunLoop.reportsUB` is
    `false`).
 4. A single `Field` projection reads one scalar of a local that holds a scalar
-   pair, such as a component of a checked-arithmetic result. Even under `Move`
-   it leaves the local unchanged, because Anneal's `MirSemantics.evalOperand`
-   keeps the parent aggregate initialized on projected reads. Every other
-   projection fails closed with `StepError.unsupported`. -/
+   pair, such as a component of a checked-arithmetic result. On a memory-backed
+   (`.indirect`) local whose whole allocation passes
+   `annealCheckIndirectInitialized`, non-`Field` projections (`Index`,
+   `ConstantIndex`, and synthetic `.UnwrapUnsafeBinder arraySliceMetaTyId` for
+   `Rvalue.len`) delegate to `annealProjectList` and lift projection errors via
+   `annealLiftProjectionError` (`StepError.undefinedBehavior` on out-of-bounds
+   or dead/uninitialized index, `StepError.invalidProgram` on violated
+   projection invariants such as a malformed `ConstantIndex`, and
+   `StepError.unsupported` on unmet obligations such as array subslices). Even
+   under `Move`, projected reads leave the parent local initialized, matching
+   Anneal's `MirSemantics.evalOperand`. Projected reads on `.immediate .uninit`
+   report `StepError.undefinedBehavior`, and all other immediate projections
+   fail closed with `StepError.unsupported`. -/
 def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
     (op : Miri.MIR.Operand) (known : Option Miri.Interpreter.LocalLayout) :
     Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do
@@ -1998,8 +2007,9 @@ Anneal's single-threaded machine.
   multi-threaded machines.
 * `allocateDyn` reports a `StackError` failure: `Runtime(PostCleanup)` MIR has
   no unsized locals.
-* `deallocateStack` frees the allocation of a memory-backed local, which only
-  `forceAllocation` creates. Like rustc's `deallocate_ptr`, it requires the
+* `deallocateStack` frees the allocation of a memory-backed local, which
+  `forceAllocation` and `annealEnsureAllocated` create. Like rustc's
+  `deallocate_ptr`, it requires the
   pointer's provenance to name a live allocation, and then removes that
   allocation from `memory.live`. rustc's remaining checks (allocation kind,
   protectors, and the offset of the pointer) cannot fail for these fresh stack

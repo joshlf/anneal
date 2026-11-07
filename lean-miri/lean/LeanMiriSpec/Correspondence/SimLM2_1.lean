@@ -22,11 +22,16 @@ Proves the forward lockstep simulation theorems for `LM-2.1`:
    element read correspondence, and out-of-bounds (`idx ≥ count`) / uninitialized / dead
    `idxLocal` UB equivalence across both immediate and memory-backed (`indirect`) `usize`
    index locals.
-3. `evalProjection_constantIndex_simulation` & `projectConstantIndex_malformed_invariant`:
+3. `evalProjection_constantIndex_simulation`, `projectConstantIndex_malformed_invariant`,
+   `annealEvalOperand_malformed_constantIndex_invalidProgram`,
+   `annealEvalPlace_malformed_constantIndex_invalidProgram`, &
+   `step_assign_malformed_constantIndex_invalidProgram`:
    `ProjectionElem.constantIndex offset minLength fromEnd` for both `fromEnd = false`
    (`idx = offset`) and `fromEnd = true` (`idx = count - offset`), covering in-bounds offset
    calculation (`minLength ≤ count`), out-of-bounds (`count < minLength`) UB equivalence, and
-   fail-closed `ProjectionError.invariant` rejection on malformed `ConstantIndex` fields.
+   end-to-end fail-closed `StepError.invalidProgram` (`RunLoop.reportsUB = false`) rejection
+   on malformed `ConstantIndex` fields through `annealEvalOperand`, `annealEvalPlace`, and
+   `Step.step`.
 4. `evalRvalue_len_array_simulation`, `projectSubslice_array_unsupported`, &
    `annealReadImmediate_whole_array_unsupported`:
    `Rvalue.len place` on `[T; N]` via unforgeable `.UnwrapUnsafeBinder arraySliceMetaTyId`
@@ -6681,6 +6686,272 @@ theorem annealEvalPlace_projected_array_simulation
             EStateM.bind, hnot_empty, hres_arr, hgop, hchk_ok, hpl, hpl_err, throw, throwThe,
             MonadExceptOf.throw, EStateM.throw]
 
+/-- Evaluating a projected read operand `copy/move _arr[.constantIndex offset minLength fromEnd]`
+on an initialized array local `arrIdx` with malformed `ConstantIndex` parameters fails closed
+in `annealEvalOperand` with `StepError.invalidProgram msg` (for which
+`Miri.Interpreter.RunLoop.reportsUB` is `false`, distinguishing ill-formed MIR from UB). -/
+theorem annealEvalOperand_malformed_constantIndex_invalidProgram
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hstate : StateRel body s m)
+    (hframes : m.stack.frames = #[topFrame])
+    (hnodup : LiveAllocsNodup m.machine)
+    {arrIdx : Local} {arrDecl : LocalDecl}
+    {elemKind : RigidTy} {count : Nat} {elems : List Value}
+    (isMove : Bool)
+    (known : Option Miri.Interpreter.LocalLayout)
+    (hdecl_arr : get? body.localDecls arrIdx = some arrDecl)
+    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
+    (hinit_elems : get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems)))
+    (offset minLength : Nat) (fromEnd : Bool)
+    (hmal :
+      2 ^ 64 ≤ offset ∨
+      2 ^ 64 ≤ minLength ∨
+      (minLength ≤ count ∧
+        ((fromEnd = false ∧ minLength ≤ offset) ∨
+         (fromEnd = true ∧ (offset = 0 ∨ minLength < offset))))) :
+    ∃ m' msg,
+      annealEvalOperand body.localDecls body.layouts
+        (translateOperand
+          (arrayElemReadOperand isMove arrIdx (.constantIndex offset minLength fromEnd)))
+        known m = .error (.invalidProgram msg) m' ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false := by
+  rcases hstate with
+    ⟨tf_s, hframes_s, _, _, hframe, _, _, _, _, _, _⟩
+  have htf_eq : tf_s = topFrame := by
+    rw [hframes] at hframes_s
+    simpa using hframes_s.symm
+  cases htf_eq
+  obtain ⟨slot_arr, mls_arr, _, hlt_arr, hslot_arr, _, hmls_arr_eq, hloc_arr⟩ :=
+    hframe.lookup_local hdecl_arr
+  rw [hinit_elems] at hslot_arr
+  injection hslot_arr with hslot_eq
+  subst hslot_eq
+  let topFrame' :=
+    cacheFrameLocalLayout topFrame arrIdx hlt_arr (translateTy arrDecl.ty body.layouts)
+  let m' : AnnealStepState := { m with stack := ⟨#[topFrame']⟩ }
+  have hcache_arr : ∀ l, (topFrame.locals[arrIdx]'hlt_arr).layout = some l →
+      l = translateTy arrDecl.ty body.layouts := by
+    rw [hmls_arr_eq]; exact hloc_arr.layout_eq
+  have hres_arr : annealResolveAndCacheLocalLayout body.localDecls body.layouts arrIdx known m =
+      .ok (topFrame', translateTy arrDecl.ty body.layouts) m' :=
+    annealResolveAndCacheLocalLayout_eq (known := known) hframes hlt_arr hdecl_arr hcache_arr
+  have hlt_arr' : arrIdx < topFrame'.locals.size := by
+    unfold topFrame' cacheFrameLocalLayout; simp [hlt_arr]
+  have hval_arr' : (topFrame'.locals[arrIdx]'hlt_arr').value = mls_arr.value := by
+    have hget : topFrame'.locals[arrIdx]? =
+        some { topFrame.locals[arrIdx]'hlt_arr with layout := some (translateTy arrDecl.ty body.layouts) } := by
+      unfold topFrame' cacheFrameLocalLayout; rw [Array.getElem?_set]; simp
+    rw [Array.getElem?_eq_getElem hlt_arr'] at hget
+    injection hget with hget_eq
+    rw [hget_eq, hmls_arr_eq]
+  have hnot_empty : m.stack.currentFrame?.isNone = false := by
+    rw [stack_currentFrame?_singleton m.stack topFrame hframes]; rfl
+  obtain ⟨mp, _, rfl, _, hmp⟩ := hloc_arr.array_init_is_indirect hwf.arr_kind
+  have hgop : topFrame'.getLocalOperand arrIdx = .ok (.indirect mp) := by
+    unfold Miri.Interpreter.Frame.getLocalOperand Miri.Interpreter.Frame.getLocal
+      Miri.Interpreter.LocalState.access
+    simp [hlt_arr', hval_arr', bind, Except.bind, pure, Except.pure, Except.mapError]
+  have hchk_ok : annealCheckIndirectInitialized m'.machine mp
+      (translateTy arrDecl.ty body.layouts).layout.size = .ok () :=
+    annealCheckIndirectInitialized_of_array_memPlaceRel hwf hnodup hmp
+  obtain ⟨msg, hpl_inv⟩ :=
+    projectConstantIndex_malformed_invariant (mach := m'.machine) topFrame'
+      (mp := mp) hwf offset minLength fromEnd hmal
+  refine ⟨m', msg, ?_, rfl⟩
+  cases isMove <;>
+    (dsimp only [arrayElemReadOperand, translateOperand, translatePlace];
+     unfold annealEvalOperand;
+     simp [translateProjectionElem, get, getThe, MonadStateOf.get, EStateM.get, bind,
+       EStateM.bind, pure, EStateM.pure, hnot_empty, hres_arr, hgop, hchk_ok, hpl_inv,
+       annealLiftProjectionError, throw, throwThe, MonadExceptOf.throw, EStateM.throw])
+
+/-- Evaluating a projected destination place `_arr[.constantIndex offset minLength fromEnd]`
+on an initialized array local `arrIdx` with malformed `ConstantIndex` parameters fails closed
+in `annealEvalPlace` with `StepError.invalidProgram msg` (`RunLoop.reportsUB = false`). -/
+theorem annealEvalPlace_malformed_constantIndex_invalidProgram
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hstate : StateRel body s m)
+    (hframes : m.stack.frames = #[topFrame])
+    (hnodup : LiveAllocsNodup m.machine)
+    {arrIdx : Local} {arrDecl : LocalDecl}
+    {elemKind : RigidTy} {count : Nat} {elems : List Value}
+    (hdecl_arr : get? body.localDecls arrIdx = some arrDecl)
+    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
+    (hinit_elems : get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems)))
+    (offset minLength : Nat) (fromEnd : Bool)
+    (hmal :
+      2 ^ 64 ≤ offset ∨
+      2 ^ 64 ≤ minLength ∨
+      (minLength ≤ count ∧
+        ((fromEnd = false ∧ minLength ≤ offset) ∨
+         (fromEnd = true ∧ (offset = 0 ∨ minLength < offset))))) :
+    ∃ m' msg,
+      annealEvalPlace body.localDecls body.layouts
+        (translatePlace ⟨arrIdx, [.constantIndex offset minLength fromEnd]⟩) m =
+        .error (.invalidProgram msg) m' ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false := by
+  rcases hstate with
+    ⟨tf_s, hframes_s, _, _, hframe, _, _, _, _, _, _⟩
+  have htf_eq : tf_s = topFrame := by
+    rw [hframes] at hframes_s
+    simpa using hframes_s.symm
+  cases htf_eq
+  obtain ⟨slot_arr, mls_arr, _, hlt_arr, hslot_arr, _, hmls_arr_eq, hloc_arr⟩ :=
+    hframe.lookup_local hdecl_arr
+  rw [hinit_elems] at hslot_arr
+  injection hslot_arr with hslot_eq
+  subst hslot_eq
+  let topFrame' :=
+    cacheFrameLocalLayout topFrame arrIdx hlt_arr (translateTy arrDecl.ty body.layouts)
+  let m' : AnnealStepState := { m with stack := ⟨#[topFrame']⟩ }
+  have hcache_arr : ∀ l, (topFrame.locals[arrIdx]'hlt_arr).layout = some l →
+      l = translateTy arrDecl.ty body.layouts := by
+    rw [hmls_arr_eq]; exact hloc_arr.layout_eq
+  have hres_arr : annealResolveAndCacheLocalLayout body.localDecls body.layouts arrIdx none m =
+      .ok (topFrame', translateTy arrDecl.ty body.layouts) m' :=
+    annealResolveAndCacheLocalLayout_eq (known := none) hframes hlt_arr hdecl_arr hcache_arr
+  have hlt_arr' : arrIdx < topFrame'.locals.size := by
+    unfold topFrame' cacheFrameLocalLayout; simp [hlt_arr]
+  have hval_arr' : (topFrame'.locals[arrIdx]'hlt_arr').value = mls_arr.value := by
+    have hget : topFrame'.locals[arrIdx]? =
+        some { topFrame.locals[arrIdx]'hlt_arr with layout := some (translateTy arrDecl.ty body.layouts) } := by
+      unfold topFrame' cacheFrameLocalLayout; rw [Array.getElem?_set]; simp
+    rw [Array.getElem?_eq_getElem hlt_arr'] at hget
+    injection hget with hget_eq
+    rw [hget_eq, hmls_arr_eq]
+  have hnot_empty : m.stack.currentFrame?.isNone = false := by
+    rw [stack_currentFrame?_singleton m.stack topFrame hframes]; rfl
+  obtain ⟨mp, _, rfl, _, hmp⟩ := hloc_arr.array_init_is_indirect hwf.arr_kind
+  have hgop : topFrame'.getLocalOperand arrIdx = .ok (.indirect mp) := by
+    unfold Miri.Interpreter.Frame.getLocalOperand Miri.Interpreter.Frame.getLocal
+      Miri.Interpreter.LocalState.access
+    simp [hlt_arr', hval_arr', bind, Except.bind, pure, Except.pure, Except.mapError]
+  have hchk_ok : annealCheckIndirectInitialized m'.machine mp
+      (translateTy arrDecl.ty body.layouts).layout.size = .ok () :=
+    annealCheckIndirectInitialized_of_array_memPlaceRel hwf hnodup hmp
+  obtain ⟨msg, hpl_inv⟩ :=
+    projectConstantIndex_malformed_invariant (mach := m'.machine) topFrame'
+      (mp := mp) hwf offset minLength fromEnd hmal
+  refine ⟨m', msg, ?_, rfl⟩
+  dsimp only [translatePlace]
+  unfold annealEvalPlace
+  simp [translateProjectionElem, get, getThe, MonadStateOf.get, EStateM.get, bind,
+    EStateM.bind, hnot_empty, hres_arr, hgop, hchk_ok, hpl_inv, annealLiftProjectionError,
+    throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+
+/-- End-to-end statement-step rejection (`Step.step` returning `StepError.invalidProgram msg`
+with `RunLoop.reportsUB = false`) for both element reads
+(`_dst = copy/move _arr[.constantIndex offset minLength fromEnd]`) and element writes
+(`_arr[.constantIndex offset minLength fromEnd] = .use srcOp`) on an initialized array local
+`arrIdx` when the `ConstantIndex` projection is malformed. -/
+theorem step_assign_malformed_constantIndex_invalidProgram
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hnodup : LiveAllocsNodup m.machine)
+    {bb : BasicBlockData} {stmt : Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    {arrIdx : Local} {arrDecl : LocalDecl}
+    {elemKind : RigidTy} {count : Nat} {elems : List Value}
+    (hdecl_arr : get? body.localDecls arrIdx = some arrDecl)
+    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
+    (hinit_elems : get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems)))
+    (offset minLength : Nat) (fromEnd : Bool)
+    (hmal :
+      2 ^ 64 ≤ offset ∨
+      2 ^ 64 ≤ minLength ∨
+      (minLength ≤ count ∧
+        ((fromEnd = false ∧ minLength ≤ offset) ∨
+         (fromEnd = true ∧ (offset = 0 ∨ minLength < offset)))))
+    (hshape :
+      (∃ dstIdx dstDecl isMove span,
+        get? body.localDecls dstIdx = some dstDecl ∧
+        stmt =
+          ⟨.assign ⟨dstIdx, .nil⟩
+            (.use (arrayElemReadOperand isMove arrIdx (.constantIndex offset minLength fromEnd))),
+           span⟩) ∨
+      (∃ srcOp span,
+        stmt =
+          ⟨.assign ⟨arrIdx, [.constantIndex offset minLength fromEnd]⟩ (.use srcOp), span⟩)) :
+    ∃ m' msg,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.invalidProgram msg)) ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false := by
+  have hstate_copy := hstate
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hcal, hstack, hbor, hprot, hcaller, hdisj⟩
+  rcases hshape with ⟨dstIdx, dstDecl, isMove, span, hdecl_dst, rfl⟩ | ⟨srcOp, span, rfl⟩
+  · obtain ⟨_, mls_dst0, _, hlt_dst0, _, _, hmls_dst_eq, hloc_dst0⟩ :=
+      hframe.lookup_local hdecl_dst
+    let topFrame₀ :=
+      cacheFrameLocalLayout topFrame dstIdx hlt_dst0 (translateTy dstDecl.ty body.layouts)
+    let m₀ : AnnealStepState := { m with stack := ⟨#[topFrame₀]⟩ }
+    let destPlace : Miri.Interpreter.RuntimePlace AnnealProv :=
+      ⟨.local 0 dstIdx none topFrame.localsIdentity, translateTy dstDecl.ty body.layouts⟩
+    have hevalPlace_dst : annealEvalPlace body.localDecls body.layouts ⟨dstIdx, #[]⟩ m =
+        .ok destPlace m₀ :=
+      annealEvalPlace_unprojected hframes hlt_dst0 hdecl_dst
+        (by rw [hmls_dst_eq]; exact hloc_dst0.layout_eq)
+    have hframe₀ : FrameRel body m.machine s.frame topFrame₀ :=
+      hframe.cache_local_layout hdecl_dst hlt_dst0
+    have hdisj₀ : MemoryAllocDisjoint topFrame₀ :=
+      hdisj.cache_layout hlt_dst0 _
+    have hstate₀ : StateRel body s m₀ :=
+      StateRel.mk topFrame₀ rfl hretCont ⟨retLay, hretPlace⟩ hframe₀
+        hcal hstack hbor hprot hcaller hdisj₀
+    let readOp := arrayElemReadOperand isMove arrIdx (.constantIndex offset minLength fromEnd)
+    obtain ⟨m', msg, hop_err, hrep⟩ :=
+      annealEvalOperand_malformed_constantIndex_invalidProgram hstate₀ rfl hnodup isMove
+        (some (translateTy dstDecl.ty body.layouts)) hdecl_arr hwf hinit_elems
+        offset minLength fromEnd hmal
+    have hm_eval : Miri.Interpreter.Step.evalStatement
+        (annealStepHooks body.localDecls body.layouts) ()
+        (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use readOp), span⟩) m =
+        Miri.Interpreter.runRvalue
+          ((annealEvalOperand body.localDecls body.layouts (translateOperand readOp)
+              (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) >>=
+            fun imm => annealWriteImmediate imm.imm destPlace) m₀ := by
+      unfold Miri.Interpreter.Step.evalStatement translateStmt
+      dsimp only [translateStmtKind, translatePlace, List.map, List.toArray,
+        translateRvalue, annealStepHooks]
+      apply runRvalue_eq_of_eq
+      unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
+      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+      rw [EStateM.bind_eq_ok hevalPlace_dst]
+      exact EStateM.bind_assoc_apply _ _ _ m₀
+    have hm_err_op :
+        (annealEvalOperand body.localDecls body.layouts (translateOperand readOp)
+          (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) m₀ =
+        .error (.invalidProgram msg) m' :=
+      EStateM.bind_eq_error hop_err
+    have hm_err : Miri.Interpreter.Step.evalStatement
+        (annealStepHooks body.localDecls body.layouts) ()
+        (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use readOp), span⟩) m =
+        (m', .error (.invalidProgram msg)) := by
+      rw [hm_eval]
+      unfold Miri.Interpreter.runRvalue
+      rw [EStateM.bind_eq_error hm_err_op]
+    refine ⟨m', msg, ?_, hrep⟩
+    exact miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb hstmt hm_err
+  · obtain ⟨m', msg, hevalPlace_err, hrep⟩ :=
+      annealEvalPlace_malformed_constantIndex_invalidProgram hstate_copy hframes hnodup
+        hdecl_arr hwf hinit_elems offset minLength fromEnd hmal
+    have hm_err : Miri.Interpreter.Step.evalStatement
+        (annealStepHooks body.localDecls body.layouts) ()
+        (translateStmt
+          ⟨.assign ⟨arrIdx, [.constantIndex offset minLength fromEnd]⟩ (.use srcOp), span⟩) m =
+        (m', .error (.invalidProgram msg)) := by
+      unfold Miri.Interpreter.Step.evalStatement translateStmt
+      dsimp only [translateStmtKind, translateRvalue, annealStepHooks]
+      unfold Miri.Interpreter.runRvalue Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
+      dsimp only
+      rw [EStateM.bind_eq_error hevalPlace_err]
+    refine ⟨m', msg, ?_, hrep⟩
+    exact miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb hstmt hm_err
+
 /-- Writing a `ScalarRel`-related scalar into projected element `idx < count` of an
 array local `arrIdx` via `annealWriteImmediate`:
 updates the backing `Allocation` in `mach.memory.live` via `ArraySliceRel.writeScalar_set`,
@@ -8419,5 +8690,50 @@ theorem step_stmt_lm2_1_simulation
     obtain ⟨hnd, himm, hhw⟩ := step_lm1_4_preserves_nodup_and_immediate hstate_copy hnodup hbb hstmt
       (fun tf htf => htf_eq tf htf ▸ hlm14)
     exact ⟨hrel', hnd, himm.mono fun _ _ => trivial, hhw.mono_budget (Nat.zero_le _)⟩
+
+/-- Advancing `runMiriBounded` across a single normal statement/terminator step that
+remains in a `StateRel`-related root frame (`m'.stack.frames = #[tf']`). -/
+theorem runMiriBounded_step_of_stateRel
+    {body : CapturedMir} {s' : MachineState} {m m' : AnnealStepState}
+    (fuel : Nat)
+    (hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+      (m', .ok true))
+    (hrel : StateRel body s' m') :
+    runMiriBounded body (fuel + 1) m = runMiriBounded body fuel m' := by
+  rcases hrel with ⟨tf', hframes', _, _, _, _, _, _, _, _, _⟩
+  conv => lhs; unfold runMiriBounded
+  rw [hstep]
+  have hemp : m'.stack.frames.isEmpty = false := by rw [hframes']; rfl
+  simp [hemp]
+
+/-- Advancing `runAnnealBounded` and `runMiriBounded` across a root-frame `return_`
+terminator whose `StepRel` holds and whose Anneal step halts normally with `(retVal, mem')`. -/
+theorem runBounded_of_stepRel_retRoot
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {retVal : Value} {mem' : Memory}
+    (fuel : Nat)
+    (ha : stepMirFn body s = .ret (.normal (retVal, mem')))
+    (hrel : StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m)) :
+    runAnnealBounded body (fuel + 1) s = .returned retVal mem' ∧
+    ∃ decl0 m' retImm,
+      get? body.localDecls 0 = some decl0 ∧
+      ImmediateRel decl0.ty body.layouts retVal retImm ∧
+      m'.stack.frames = #[] ∧
+      runMiriBounded body (fuel + 1) m = .returned m' (.ok (.immediate retImm)) := by
+  have ha_run : runAnnealBounded body (fuel + 1) s = .returned retVal mem' := by
+    conv => lhs; unfold runAnnealBounded
+    rw [ha]
+  refine ⟨ha_run, ?_⟩
+  rw [ha] at hrel
+  generalize hm :
+    Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mRes at hrel
+  cases hrel with
+  | retRoot decl0 _ retImm _ m' hdecl0 hop0 himmRel hm'_eq =>
+    subst hm'_eq
+    refine ⟨decl0, { m with stack := ⟨#[]⟩ }, retImm, hdecl0, himmRel, rfl, ?_⟩
+    conv => lhs; unfold runMiriBounded
+    rw [hm]
+    simp [hop0]
 
 end LeanMiriSpec.Correspondence

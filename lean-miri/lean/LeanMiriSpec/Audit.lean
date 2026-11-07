@@ -360,6 +360,20 @@ open LeanMiriSpec.Correspondence in
   Witness.lm21_uninit_indirect_zero_array_read_ub
   Witness.lm21_uninit_indirect_zero_array_write_ub
   Witness.lm21_malformed_constantIndex_invariant
+  annealEvalOperand_malformed_constantIndex_invalidProgram
+  annealEvalPlace_malformed_constantIndex_invalidProgram
+  step_assign_malformed_constantIndex_invalidProgram
+  runMiriBounded_step_of_stateRel
+  runBounded_of_stepRel_retRoot
+  Witness.lm21MalformedConstBody
+  Witness.lm21_mal_arr_stateRel
+  Witness.lm21_malformed_constantIndex_step_invalidProgram
+  Witness.lm21_wf_i32Arr3
+  Witness.lm21_wf_boolArr2
+  Witness.lm21_wf_charArr2
+  Witness.lm21FullFnBody
+  Witness.lm21_fullFn_init_stateRel
+  Witness.lm21_signed_bool_char_runBounded_return
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -1755,6 +1769,121 @@ example
   .copyElem dstArr srcArr dstDecl srcDecl elemKind dstCount srcCount dstProj srcProj isMove span
     hdst hwf_dst hsrc hwf_src hprim hproj_dst hproj_src hslot_dst hslot_src
 
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hstate : StateRel body s m)
+    (hframes : m.stack.frames = #[topFrame])
+    (hnodup : LiveAllocsNodup m.machine)
+    {arrIdx : MirAst.Local} {arrDecl : MirAst.LocalDecl}
+    {elemKind : MirAst.RigidTy} {count : Nat} {elems : List Value}
+    (isMove : Bool)
+    (known : Option Miri.Interpreter.LocalLayout)
+    (hdecl_arr : get? body.localDecls arrIdx = some arrDecl)
+    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
+    (hinit_elems : get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems)))
+    (offset minLength : Nat) (fromEnd : Bool)
+    (hmal :
+      2 ^ 64 ≤ offset ∨
+      2 ^ 64 ≤ minLength ∨
+      (minLength ≤ count ∧
+        ((fromEnd = false ∧ minLength ≤ offset) ∨
+         (fromEnd = true ∧ (offset = 0 ∨ minLength < offset))))) :
+    ∃ m' msg,
+      annealEvalOperand body.localDecls body.layouts
+        (translateOperand
+          (arrayElemReadOperand isMove arrIdx (.constantIndex offset minLength fromEnd)))
+        known m = .error (.invalidProgram msg) m' ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false :=
+  annealEvalOperand_malformed_constantIndex_invalidProgram
+    hstate hframes hnodup isMove known hdecl_arr hwf hinit_elems offset minLength fromEnd hmal
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hstate : StateRel body s m)
+    (hframes : m.stack.frames = #[topFrame])
+    (hnodup : LiveAllocsNodup m.machine)
+    {arrIdx : MirAst.Local} {arrDecl : MirAst.LocalDecl}
+    {elemKind : MirAst.RigidTy} {count : Nat} {elems : List Value}
+    (hdecl_arr : get? body.localDecls arrIdx = some arrDecl)
+    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
+    (hinit_elems : get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems)))
+    (offset minLength : Nat) (fromEnd : Bool)
+    (hmal :
+      2 ^ 64 ≤ offset ∨
+      2 ^ 64 ≤ minLength ∨
+      (minLength ≤ count ∧
+        ((fromEnd = false ∧ minLength ≤ offset) ∨
+         (fromEnd = true ∧ (offset = 0 ∨ minLength < offset))))) :
+    ∃ m' msg,
+      annealEvalPlace body.localDecls body.layouts
+        (translatePlace ⟨arrIdx, [.constantIndex offset minLength fromEnd]⟩) m =
+        .error (.invalidProgram msg) m' ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false :=
+  annealEvalPlace_malformed_constantIndex_invalidProgram
+    hstate hframes hnodup hdecl_arr hwf hinit_elems offset minLength fromEnd hmal
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRel body s m)
+    (hnodup : LiveAllocsNodup m.machine)
+    {bb : MirAst.BasicBlockData} {stmt : MirAst.Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    {arrIdx : MirAst.Local} {arrDecl : MirAst.LocalDecl}
+    {elemKind : MirAst.RigidTy} {count : Nat} {elems : List Value}
+    (hdecl_arr : get? body.localDecls arrIdx = some arrDecl)
+    (hwf : WellTypedArrayTy body.layouts arrDecl.ty elemKind count)
+    (hinit_elems : get? s.frame.locals arrIdx = some (.init (.aggregate 0 elems)))
+    (offset minLength : Nat) (fromEnd : Bool)
+    (hmal :
+      2 ^ 64 ≤ offset ∨
+      2 ^ 64 ≤ minLength ∨
+      (minLength ≤ count ∧
+        ((fromEnd = false ∧ minLength ≤ offset) ∨
+         (fromEnd = true ∧ (offset = 0 ∨ minLength < offset)))))
+    (hshape :
+      (∃ dstIdx dstDecl isMove span,
+        get? body.localDecls dstIdx = some dstDecl ∧
+        stmt =
+          ⟨.assign ⟨dstIdx, .nil⟩
+            (.use (arrayElemReadOperand isMove arrIdx (.constantIndex offset minLength fromEnd))),
+           span⟩) ∨
+      (∃ srcOp span,
+        stmt =
+          ⟨.assign ⟨arrIdx, [.constantIndex offset minLength fromEnd]⟩ (.use srcOp), span⟩)) :
+    ∃ m' msg,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.invalidProgram msg)) ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false :=
+  step_assign_malformed_constantIndex_invalidProgram
+    hstate hnodup hbb hstmt hdecl_arr hwf hinit_elems offset minLength fromEnd hmal hshape
+
+example
+    {body : CapturedMir} {s' : MachineState} {m m' : AnnealStepState}
+    (fuel : Nat)
+    (hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+      (m', .ok true))
+    (hrel : StateRel body s' m') :
+    runMiriBounded body (fuel + 1) m = runMiriBounded body fuel m' :=
+  runMiriBounded_step_of_stateRel fuel hstep hrel
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {retVal : Value} {mem' : Memory}
+    (fuel : Nat)
+    (ha : stepMirFn body s = .ret (.normal (retVal, mem')))
+    (hrel : StepRel body m (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m)) :
+    runAnnealBounded body (fuel + 1) s = .returned retVal mem' ∧
+    ∃ decl0 m' retImm,
+      get? body.localDecls 0 = some decl0 ∧
+      ImmediateRel decl0.ty body.layouts retVal retImm ∧
+      m'.stack.frames = #[] ∧
+      runMiriBounded body (fuel + 1) m = .returned m' (.ok (.immediate retImm)) :=
+  runBounded_of_stepRel_retRoot fuel ha hrel
+
 /-! ### `LM-2.1` witness pins -/
 
 example :
@@ -2280,6 +2409,43 @@ example :
     (∃ msg, annealProjectList cx base [.ConstantIndex 4 3 true] =
       .error (.invariant msg)) :=
   Witness.lm21_malformed_constantIndex_invariant
+
+example :
+    let hooks :=
+      annealStepHooks Witness.lm21MalformedConstBody.localDecls
+        Witness.lm21MalformedConstBody.layouts
+    (∃ m' msg,
+      Miri.Interpreter.Step.step hooks () (Witness.lm21MalArrMiri 0) =
+        (m', .error (.invalidProgram msg)) ∧
+      runMiriBounded Witness.lm21MalformedConstBody 1 (Witness.lm21MalArrMiri 0) =
+        .error m' (.invalidProgram msg) ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false) ∧
+    (∃ m' msg,
+      Miri.Interpreter.Step.step hooks () (Witness.lm21MalArrMiri 1) =
+        (m', .error (.invalidProgram msg)) ∧
+      runMiriBounded Witness.lm21MalformedConstBody 1 (Witness.lm21MalArrMiri 1) =
+        .error m' (.invalidProgram msg) ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false) :=
+  Witness.lm21_malformed_constantIndex_step_invalidProgram
+
+example :
+    WellTypedArrayTy emptyLayoutTable Witness.lm21I32Arr3Ty (.int .i32) 3 ∧
+    WellTypedArrayTy emptyLayoutTable Witness.lm21BoolArr2Ty .bool 2 ∧
+    WellTypedArrayTy emptyLayoutTable Witness.lm21CharArr2Ty .char 2 :=
+  ⟨Witness.lm21_wf_i32Arr3, Witness.lm21_wf_boolArr2, Witness.lm21_wf_charArr2⟩
+
+example :
+    ∃ mem' m',
+      m'.stack.frames = #[] ∧
+      runAnnealBounded Witness.lm21FullFnBody 21
+        (initMachineState Witness.lm21FullFnBody []) =
+        .returned (.scalar ⟨22, 4⟩) mem' ∧
+      runMiriBounded Witness.lm21FullFnBody 21 Witness.lm21FullFnInitMiri =
+        .returned m'
+          (.ok (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22))))) ∧
+      ImmediateRel Witness.lm21I32Ty emptyLayoutTable (.scalar ⟨22, 4⟩)
+        (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22))) :=
+  Witness.lm21_signed_bool_char_runBounded_return
 
 end StatementPins
 

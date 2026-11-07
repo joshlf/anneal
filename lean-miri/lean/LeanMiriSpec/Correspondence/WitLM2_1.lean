@@ -2888,4 +2888,745 @@ theorem lm21_malformed_constantIndex_invariant :
    projectConstantIndex_malformed_invariant (lm21ArrMiriFrame 7 .uninit) lm21_wf_u16Arr3
       4 3 true (Or.inr (Or.inr ⟨by decide, Or.inr ⟨rfl, Or.inr (by decide)⟩⟩))⟩
 
+/-! ## 12. End-to-End `StepError.invalidProgram` Malformed `ConstantIndex` Witness & Multi-Domain Full-Function `runBounded` Witness -/
+
+/-- Ill-formed `Runtime(PostCleanup)` MIR body exercising both malformed
+`ConstantIndex` read (`_0 = copy _1[3 of 3]`, `fromEnd = false` with
+`minLength ≤ offset`) and malformed `ConstantIndex` write
+(`_1[-0 of 3] = const 0x090A_u16`, `fromEnd = true` with `offset = 0`) on
+initialized `_1 : [u16; 3]`. -/
+def lm21MalformedConstBody : CapturedMir where
+  defPath := "lm_2_1_witness::malformed_const_index"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [lm21U16Decl, lm21U16Arr3Decl, lm21UsizeDecl, lm21U16Arr0Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy ⟨1, [.constantIndex 3 3 false]⟩))),
+        mkStmt (.assign ⟨1, [.constantIndex 0 3 true]⟩
+          (.use (.constant (lm21ConstU16 0x090A))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := lm21FnAbi
+  layouts := emptyLayoutTable
+  allocations := []
+
+def lm21MalArrAnneal (k : Nat) : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := k
+        locals := [.uninit, .init (.aggregate 0 lm21ArrElems), .uninit, .uninit] }
+    memory := (initMachineState lm21MalformedConstBody []).memory }
+
+def lm21MalArrMiriFrame (k : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody lm21MalformedConstBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy lm21U16Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.indirect witnessMemPlace), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, k⟩ }
+
+def lm21MalArrMiri (k : Nat) : AnnealStepState :=
+  { stack := ⟨#[lm21MalArrMiriFrame k]⟩, machine := witnessMachineOf lm21ArrAlloc }
+
+theorem lm21_mal_arr_stateRel (k : Nat) :
+    StateRel lm21MalformedConstBody (lm21MalArrAnneal k) (lm21MalArrMiri k) := by
+  refine StateRel.mk (lm21MalArrMiriFrame k) rfl rfl ⟨translateTy lm21U16Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+    (by
+      intro i j _ _ _ _ hneq hi hj
+      match i, j with
+      | 0, _ | 2, _ | 3, _ | _ + 4, _ => simp [lm21MalArrMiriFrame] at hi
+      | 1, 0 | 1, 2 | 1, 3 | 1, _ + 4 => simp [lm21MalArrMiriFrame] at hj
+      | 1, 1 => exact absurd rfl hneq)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 | 2 | 3 =>
+    have hs : slot = .uninit := by simpa [lm21MalArrAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [lm21MalArrMiriFrame] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = lm21U16Arr3Decl := by
+      simpa [lm21MalformedConstBody, get?] using hdecl.symm
+    have hs : slot = .init (.aggregate 0 lm21ArrElems) := by
+      simpa [lm21MalArrAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.indirect witnessMemPlace), layout := none } := by
+      simpa [lm21MalArrMiriFrame] using hmls.symm
+    subst hd hs hm
+    exact .indirect _ witnessMemPlace none (fun _ h => nomatch h) nofun lm21_memPlaceRel
+  | _ + 4 =>
+    simp [lm21MalformedConstBody, get?] at hdecl
+
+/-- Concrete statement-level and `runMiriBounded` witness for
+`step_assign_malformed_constantIndex_invalidProgram`: both malformed
+`ConstantIndex` element reads (`stmt 0`: `offset = 3, minLength = 3, fromEnd = false`)
+and malformed `ConstantIndex` element writes (`stmt 1`: `offset = 0, minLength = 3,
+fromEnd = true`) halt `Step.step` and `runMiriBounded` with
+`StepError.invalidProgram msg` (`RunLoop.reportsUB = false`), never misclassifying
+compiler-invariant violations as undefined behavior. -/
+theorem lm21_malformed_constantIndex_step_invalidProgram :
+    let hooks :=
+      annealStepHooks lm21MalformedConstBody.localDecls lm21MalformedConstBody.layouts
+    (∃ m' msg,
+      Miri.Interpreter.Step.step hooks () (lm21MalArrMiri 0) =
+        (m', .error (.invalidProgram msg)) ∧
+      runMiriBounded lm21MalformedConstBody 1 (lm21MalArrMiri 0) =
+        .error m' (.invalidProgram msg) ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false) ∧
+    (∃ m' msg,
+      Miri.Interpreter.Step.step hooks () (lm21MalArrMiri 1) =
+        (m', .error (.invalidProgram msg)) ∧
+      runMiriBounded lm21MalformedConstBody 1 (lm21MalArrMiri 1) =
+        .error m' (.invalidProgram msg) ∧
+      Miri.Interpreter.RunLoop.reportsUB (.invalidProgram msg) = false) := by
+  intro hooks
+  constructor
+  · obtain ⟨m', msg, hstep, hrep⟩ :=
+      step_assign_malformed_constantIndex_invalidProgram
+        (arrIdx := 1) (arrDecl := lm21U16Arr3Decl) (elemKind := .uint .u16) (count := 3)
+        (lm21_mal_arr_stateRel 0) lm21_nodup_arr rfl rfl rfl lm21_wf_u16Arr3 rfl
+        3 3 false (Or.inr (Or.inr ⟨by decide, Or.inl ⟨rfl, by decide⟩⟩))
+        (Or.inl ⟨0, lm21U16Decl, false, "lm-1.1-witness", rfl, rfl⟩)
+    refine ⟨m', msg, hstep, ?_, hrep⟩
+    unfold runMiriBounded
+    rw [hstep]
+  · obtain ⟨m', msg, hstep, hrep⟩ :=
+      step_assign_malformed_constantIndex_invalidProgram
+        (arrIdx := 1) (arrDecl := lm21U16Arr3Decl) (elemKind := .uint .u16) (count := 3)
+        (lm21_mal_arr_stateRel 1) lm21_nodup_arr rfl rfl rfl lm21_wf_u16Arr3 rfl
+        0 3 true (Or.inr (Or.inr ⟨by decide, Or.inr ⟨rfl, Or.inl rfl⟩⟩))
+        (Or.inr ⟨.constant (lm21ConstU16 0x090A), "lm-1.1-witness", rfl⟩)
+    refine ⟨m', msg, hstep, ?_, hrep⟩
+    unfold runMiriBounded
+    rw [hstep]
+
+def lm21I32Ty : Ty := { kind := .int .i32, layoutIdx := 0 }
+def lm21I32Decl : LocalDecl := { mutability := .mut, ty := lm21I32Ty, debugName := none }
+
+def lm21BoolTy : Ty := { kind := .bool, layoutIdx := 0 }
+def lm21BoolDecl : LocalDecl := { mutability := .mut, ty := lm21BoolTy, debugName := none }
+
+def lm21CharTy : Ty := { kind := .char, layoutIdx := 0 }
+def lm21CharDecl : LocalDecl := { mutability := .mut, ty := lm21CharTy, debugName := none }
+
+def lm21I32Arr3Ty : Ty := { kind := .array (.int .i32) 3, layoutIdx := 0 }
+def lm21I32Arr3Decl : LocalDecl := { mutability := .mut, ty := lm21I32Arr3Ty, debugName := none }
+
+def lm21BoolArr2Ty : Ty := { kind := .array .bool 2, layoutIdx := 0 }
+def lm21BoolArr2Decl : LocalDecl := { mutability := .mut, ty := lm21BoolArr2Ty, debugName := none }
+
+def lm21CharArr2Ty : Ty := { kind := .array .char 2, layoutIdx := 0 }
+def lm21CharArr2Decl : LocalDecl := { mutability := .mut, ty := lm21CharArr2Ty, debugName := none }
+
+def lm21ConstI32 (bits : Nat) : ConstOperand := { ty := lm21I32Ty, val := .scalar (.int ⟨bits, 4⟩) }
+def lm21ConstBool (b : Bool) : ConstOperand :=
+  { ty := lm21BoolTy, val := .scalar (.int ⟨if b then 1 else 0, 1⟩) }
+def lm21ConstChar (cp : Nat) : ConstOperand := { ty := lm21CharTy, val := .scalar (.int ⟨cp, 4⟩) }
+
+def lm21I32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def lm21I32FnAbi : FnAbi :=
+  { args := [], ret := { layout := lm21I32Layout, mode := .direct }, conv := .rust,
+    canUnwind := false }
+
+private theorem lm21_i32_elemLayout_eq (c : Nat) :
+    arrayElemLayoutOf emptyLayoutTable
+      (translateTy { kind := .array (.int .i32) c, layoutIdx := 0 } emptyLayoutTable)
+      (translateTy { kind := .int .i32, layoutIdx := 0 } emptyLayoutTable).layout.size =
+    translateTy { kind := .int .i32, layoutIdx := 0 } emptyLayoutTable := by
+  have hty :
+      (translateTy { kind := .array (.int .i32) c, layoutIdx := 0 } emptyLayoutTable).ty = 1012 :=
+    rfl
+  unfold arrayElemLayoutOf
+  rw [hty]
+  have hge : (1012 : Nat) ≥ 1000 := by decide
+  have hmod : (1012 - 1000) % 100 = 12 := by decide
+  simp only [hge, ↓reduceIte, hmod, layoutOfEncodedTyId]
+
+private theorem lm21_bool_elemLayout_eq (c : Nat) :
+    arrayElemLayoutOf emptyLayoutTable
+      (translateTy { kind := .array .bool c, layoutIdx := 0 } emptyLayoutTable)
+      (translateTy { kind := .bool, layoutIdx := 0 } emptyLayoutTable).layout.size =
+    translateTy { kind := .bool, layoutIdx := 0 } emptyLayoutTable := by
+  have hty :
+      (translateTy { kind := .array .bool c, layoutIdx := 0 } emptyLayoutTable).ty = 1001 :=
+    rfl
+  unfold arrayElemLayoutOf
+  rw [hty]
+  have hge : (1001 : Nat) ≥ 1000 := by decide
+  have hmod : (1001 - 1000) % 100 = 1 := by decide
+  simp only [hge, ↓reduceIte, hmod, layoutOfEncodedTyId]
+
+private theorem lm21_char_elemLayout_eq (c : Nat) :
+    arrayElemLayoutOf emptyLayoutTable
+      (translateTy { kind := .array .char c, layoutIdx := 0 } emptyLayoutTable)
+      (translateTy { kind := .char, layoutIdx := 0 } emptyLayoutTable).layout.size =
+    translateTy { kind := .char, layoutIdx := 0 } emptyLayoutTable := by
+  have hty :
+      (translateTy { kind := .array .char c, layoutIdx := 0 } emptyLayoutTable).ty = 1002 :=
+    rfl
+  unfold arrayElemLayoutOf
+  rw [hty]
+  have hge : (1002 : Nat) ≥ 1000 := by decide
+  have hmod : (1002 - 1000) % 100 = 2 := by decide
+  simp only [hge, ↓reduceIte, hmod, layoutOfEncodedTyId]
+
+/-- `[i32; 3]` satisfies `WellTypedArrayTy` (`stride = 4`, signed `i32` domain). -/
+theorem lm21_wf_i32Arr3 : WellTypedArrayTy emptyLayoutTable lm21I32Arr3Ty (.int .i32) 3 :=
+  ⟨rfl, Or.inr (Or.inr (Or.inl ⟨.i32, rfl⟩)), rfl, rfl, rfl, rfl, rfl,
+    lm21_i32_elemLayout_eq 3,
+    show 0 < 4 by decide, show 4 ≤ 16 by decide, show 3 * 4 < 2 ^ 32 by decide⟩
+
+/-- `[bool; 2]` satisfies `WellTypedArrayTy` (`stride = 1`, `bool` domain). -/
+theorem lm21_wf_boolArr2 : WellTypedArrayTy emptyLayoutTable lm21BoolArr2Ty .bool 2 :=
+  ⟨rfl, Or.inl rfl, rfl, rfl, rfl, rfl, rfl,
+    lm21_bool_elemLayout_eq 2,
+    show 0 < 1 by decide, show 1 ≤ 16 by decide, show 2 * 1 < 2 ^ 32 by decide⟩
+
+/-- `[char; 2]` satisfies `WellTypedArrayTy` (`stride = 4`, Unicode `char` domain). -/
+theorem lm21_wf_charArr2 : WellTypedArrayTy emptyLayoutTable lm21CharArr2Ty .char 2 :=
+  ⟨rfl, Or.inr (Or.inl rfl), rfl, rfl, rfl, rfl, rfl,
+    lm21_char_elemLayout_eq 2,
+    show 0 < 4 by decide, show 4 ≤ 16 by decide, show 2 * 4 < 2 ^ 32 by decide⟩
+
+theorem lm21_isPrim_i32 : IsPrimScalarTy lm21I32Ty :=
+  Or.inr (Or.inr (Or.inl ⟨.i32, rfl⟩))
+
+theorem lm21_isPrim_bool : IsPrimScalarTy lm21BoolTy :=
+  Or.inl rfl
+
+theorem lm21_isPrim_char : IsPrimScalarTy lm21CharTy :=
+  Or.inr (Or.inl rfl)
+
+/-- Complete `Runtime(PostCleanup)` MIR function exercising signed `[i32; 3]`
+(including negative two's-complement `i32`s `-10` and `-3`), `[bool; 2]`, and
+`[char; 2]` from `initMachineState` through `StorageDead` and `return_`
+(`25_i32 + (-3_i32) = 22_i32`):
+```text
+bb0:
+  StorageLive(_1); _1 = [-10_i32, 25_i32, -3_i32];
+  StorageLive(_2); _2 = [true; 2]; _2[-1 of 2] = false;
+  StorageLive(_3); _3 = ['A'; 2];
+  StorageLive(_6); _6 = copy _2[0 of 2];
+  StorageLive(_7); _7 = copy _3[1 of 2];
+  StorageLive(_4); _4 = const 1_usize;
+  StorageLive(_5); _5 = copy _1[_4];
+  _0 = move _1[-1 of 3];
+  _0 = Add(copy _5, copy _0);
+  StorageDead(_3); StorageDead(_2); StorageDead(_1);
+  return
+``` -/
+def lm21FullFnBody : CapturedMir where
+  defPath := "lm_2_1_witness::signed_bool_char_fn"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [
+    lm21I32Decl, lm21I32Arr3Decl, lm21BoolArr2Decl, lm21CharArr2Decl,
+    lm21UsizeDecl, lm21I32Decl, lm21BoolDecl, lm21CharDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 1),
+        mkStmt (.assign (local_ 1) (.aggregate (.array lm21I32Ty)
+          [.constant (lm21ConstI32 0xFFFF_FFF6),
+           .constant (lm21ConstI32 25),
+           .constant (lm21ConstI32 0xFFFF_FFFD)])),
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.repeat (.constant (lm21ConstBool true)) 2)),
+        mkStmt (.assign ⟨2, [.constantIndex 1 2 true]⟩ (.use (.constant (lm21ConstBool false)))),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.repeat (.constant (lm21ConstChar 0x41)) 2)),
+        mkStmt (.storageLive 6),
+        mkStmt (.assign (local_ 6) (.use (.copy ⟨2, [.constantIndex 0 2 false]⟩))),
+        mkStmt (.storageLive 7),
+        mkStmt (.assign (local_ 7) (.use (.copy ⟨3, [.constantIndex 1 2 false]⟩))),
+        mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 4) (.use (.constant (lm21ConstUsize 1)))),
+        mkStmt (.storageLive 5),
+        mkStmt (.assign (local_ 5) (.use (.copy ⟨1, [.index 4]⟩))),
+        mkStmt (.assign (local_ 0) (.use (.move ⟨1, [.constantIndex 1 3 true]⟩))),
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 5)) (.copy (local_ 0)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2),
+        mkStmt (.storageDead 1)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := lm21I32FnAbi
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem lm21_fullFn_phase : ∀ p, lm21FullFnBody.phase ≠ .other p := by
+  intro p h; cases h
+
+def lm21FullFnInitMiriFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody lm21FullFnBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy lm21I32Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .dead, layout := none },
+      { value := .dead, layout := none },
+      { value := .dead, layout := none },
+      { value := .dead, layout := none },
+      { value := .dead, layout := none },
+      { value := .dead, layout := none },
+      { value := .dead, layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 0⟩ }
+
+def lm21FullFnInitMiri : AnnealStepState :=
+  { stack := ⟨#[lm21FullFnInitMiriFrame]⟩, machine := AnnealMachine.empty }
+
+theorem lm21_fullFn_init_stateRel :
+    StateRel lm21FullFnBody (initMachineState lm21FullFnBody []) lm21FullFnInitMiri := by
+  refine StateRel.mk lm21FullFnInitMiriFrame rfl rfl ⟨translateTy lm21I32Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl
+    (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => rintro ⟨⟩
+      | _ + 8 => rintro ⟨⟩)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hs : slot = .uninit := by
+      simpa [initMachineState, lm21FullFnBody, initLocalsAux, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [lm21FullFnInitMiriFrame] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 | 2 | 3 | 4 | 5 | 6 | 7 =>
+    have hs : slot = .dead := by
+      simpa [initMachineState, lm21FullFnBody, initLocalsAux, get?] using hslot.symm
+    have hm : mls = { value := .dead, layout := none } := by
+      simpa [lm21FullFnInitMiriFrame] using hmls.symm
+    subst hs hm
+    exact .dead none (fun _ h => nomatch h)
+  | _ + 8 =>
+    simp [lm21FullFnBody, get?] at hdecl
+
+private theorem lm21_fullFnInitFrame_imm (j : Nat) :
+    IsImmediateFrameLocal lm21FullFnInitMiriFrame j := by
+  intro mls hmls mp hv
+  match j with
+  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 =>
+    simp [lm21FullFnInitMiriFrame] at hmls; subst hmls; cases hv
+  | _ + 8 => simp [lm21FullFnInitMiriFrame] at hmls
+
+private theorem lm21_fullFn_constI32_wt
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (bits : Nat) (hbits : bits < 2 ^ 32) :
+    WellTypedLM2_1ScalarOperand lm21FullFnBody tf (.constant (lm21ConstI32 bits)) lm21I32Ty :=
+  .ofScalar (.constScalar (lm21ConstI32 bits) ⟨bits, 4⟩ rfl lm21_isPrim_i32
+    (Or.inr (Or.inr (Or.inl rfl))) (by simpa [scalarModulus] using hbits) rfl
+    (fun h => nomatch h) (fun h => nomatch h))
+
+private theorem lm21_fullFn_constBool_wt
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (b : Bool) :
+    WellTypedLM2_1ScalarOperand lm21FullFnBody tf (.constant (lm21ConstBool b)) lm21BoolTy := by
+  cases b
+  · exact .ofScalar (.constScalar (lm21ConstBool false) ⟨0, 1⟩ rfl lm21_isPrim_bool
+      (Or.inl rfl) (by decide) rfl (fun _ => ⟨rfl, Or.inl rfl⟩) (fun h => nomatch h))
+  · exact .ofScalar (.constScalar (lm21ConstBool true) ⟨1, 1⟩ rfl lm21_isPrim_bool
+      (Or.inl rfl) (by decide) rfl (fun _ => ⟨rfl, Or.inr rfl⟩) (fun h => nomatch h))
+
+private theorem lm21_fullFn_constChar_wt
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (cp : Nat) (hcp : cp < 2 ^ 32) (hchar : isValidCharCode cp = true) :
+    WellTypedLM2_1ScalarOperand lm21FullFnBody tf (.constant (lm21ConstChar cp)) lm21CharTy :=
+  .ofScalar (.constScalar (lm21ConstChar cp) ⟨cp, 4⟩ rfl lm21_isPrim_char
+    (Or.inr (Or.inr (Or.inl rfl))) (by simpa [scalarModulus] using hcp) rfl
+    (fun h => nomatch h) (fun _ => ⟨rfl, hchar⟩))
+
+private theorem lm21_fullFn_constUsize_scalar_wt
+    (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (n : Nat) (hn : n < 2 ^ 64) :
+    WellTypedScalarOperand lm21FullFnBody tf (.constant (lm21ConstUsize n)) lm21UsizeTy :=
+  .constScalar (lm21ConstUsize n) ⟨n, 8⟩ rfl (Or.inr (Or.inr (Or.inr ⟨.usize, rfl⟩)))
+    (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+    (by simpa [scalarModulus] using hn) rfl (fun h => nomatch h) (fun h => nomatch h)
+
+private theorem lm21_step_runBounded
+    {body : CapturedMir} {bb : BasicBlockData} {stmt : Statement}
+    {s s' : MachineState} {m : AnnealStepState} {P Q : Nat → Prop}
+    {optDest : Option Nat} {prevBudget nextBudget fuel : Nat}
+    (hphase : ∀ p, body.phase ≠ .other p)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hdest : arrayConstructDest? stmt = optDest)
+    (hrel : StateRel body s m)
+    (hnd : LiveAllocsNodup m.machine)
+    (hhw : MemoryHighWater m.machine.memory)
+    (hm_next : m.machine.memory.nextAllocId.toNat ≤ prevBudget)
+    (hb : prevBudget + (if optDest.isSome then 1 else 0) ≤ nextBudget)
+    (hb_lim : nextBudget < 2 ^ 64)
+    (hq : ∀ j, Q j → P j ∧ optDest ≠ some j)
+    (hp : ∀ j, P j → ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf j)
+    (hwt : ∀ tf, m.stack.frames = #[tf] → WellTypedLM2_1Stmt body s m tf stmt)
+    (ha : stepMirFn body s = .step s') :
+    ∃ m',
+      runAnnealBounded body (fuel + 1) s = runAnnealBounded body fuel s' ∧
+      runMiriBounded body (fuel + 1) m = runMiriBounded body fuel m' ∧
+      StateRel body s' m' ∧
+      LiveAllocsNodup m'.machine ∧
+      MemoryHighWater m'.machine.memory ∧
+      m'.machine.memory.nextAllocId.toNat ≤ nextBudget ∧
+      (∀ j, Q j → ∀ tf', m'.stack.frames = #[tf'] → IsImmediateFrameLocal tf' j) := by
+  obtain ⟨hsim, hnd', him', hhw'⟩ :=
+    step_stmt_lm2_1_simulation hrel hnd hphase hbb hstmt hwt
+  rw [hdest] at him' hhw'
+  rw [ha] at hsim
+  generalize hr :
+    Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = r
+    at hsim hnd' him' hhw'
+  cases hsim with
+  | step _ m' hrel' =>
+    have ha_run : runAnnealBounded body (fuel + 1) s = runAnnealBounded body fuel s' :=
+      runAnnealBounded_emitStep body fuel s s' .silent ha
+    have hm_run : runMiriBounded body (fuel + 1) m = runMiriBounded body fuel m' :=
+      runMiriBounded_step_of_stateRel fuel hr hrel'
+    have hbudget :
+        m.machine.memory.nextAllocId.toNat +
+          (if optDest.isSome then 1 else 0) < 2 ^ 64 :=
+      Nat.lt_of_le_of_lt
+        (Nat.le_trans (Nat.add_le_add_right hm_next _) hb)
+        hb_lim
+    obtain ⟨hw', hb'⟩ := hhw' rfl hhw hbudget
+    have hm_next' : m'.machine.memory.nextAllocId.toNat ≤ nextBudget :=
+      Nat.le_trans hb' (Nat.le_trans (Nat.add_le_add_right hm_next _) hb)
+    refine ⟨m', ha_run, hm_run, hrel', hnd' rfl, hw', hm_next', ?_⟩
+    intro j hqj tf' htf'
+    obtain ⟨hpj, hne⟩ := hq j hqj
+    obtain ⟨tf, htf, _⟩ := hrel
+    exact him' rfl tf tf' htf htf' j hne (hp j hpj tf htf)
+
+private def lm21FullFnI32Arr : List Value :=
+  [.scalar ⟨0xFFFF_FFF6, 4⟩, .scalar ⟨25, 4⟩, .scalar ⟨0xFFFF_FFFD, 4⟩]
+private def lm21FullFnBoolArr0 : List Value := [.scalar ⟨1, 1⟩, .scalar ⟨1, 1⟩]
+private def lm21FullFnBoolArr1 : List Value := [.scalar ⟨1, 1⟩, .scalar ⟨0, 1⟩]
+private def lm21FullFnCharArr : List Value := [.scalar ⟨0x41, 4⟩, .scalar ⟨0x41, 4⟩]
+
+private def lm21FullFnState (k : Nat) (locs : List LocalSlot) : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := k, locals := locs }
+    memory := (initMachineState lm21FullFnBody []).memory }
+
+/-- Full-function fuel-bounded execution witness (`runAnnealBounded` and
+`runMiriBounded`) from `initMachineState lm21FullFnBody []` through
+`StorageLive`, signed `[i32; 3]` (`[-10_i32, 25_i32, -3_i32]`), `[bool; 2]`,
+`[char; 2]`, element reads/writes, `BinaryOp.add` (`25 + (-3) = 22_i32`),
+`StorageDead`, and `TerminatorKind.return_`. -/
+theorem lm21_signed_bool_char_runBounded_return :
+    ∃ mem' m',
+      m'.stack.frames = #[] ∧
+      runAnnealBounded lm21FullFnBody 21 (initMachineState lm21FullFnBody []) =
+        .returned (.scalar ⟨22, 4⟩) mem' ∧
+      runMiriBounded lm21FullFnBody 21 lm21FullFnInitMiri =
+        .returned m'
+          (.ok (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22))))) ∧
+      ImmediateRel lm21I32Ty emptyLayoutTable (.scalar ⟨22, 4⟩)
+        (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22))) := by
+  have hlim1 : (1 : Nat) < 2 ^ 64 := by decide
+  have hlim2 : (2 : Nat) < 2 ^ 64 := by decide
+  have hlim3 : (3 : Nat) < 2 ^ 64 := by decide
+  have hlim4 : (4 : Nat) < 2 ^ 64 := by decide
+  have himm₀ : ∀ j, True → ∀ tf, lm21FullFnInitMiri.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+    intro j _ tf htf
+    have htf_eq : tf = lm21FullFnInitMiriFrame := by
+      simp only [lm21FullFnInitMiri, List.toArray, Array.mk.injEq, List.cons.injEq, and_true] at htf
+      exact htf.symm
+    subst htf_eq
+    exact lm21_fullFnInitFrame_imm j
+  -- `stmt 0`: `StorageLive(1)`
+  obtain ⟨m₁, ha₁, hm₁, hrel₁, hnd₁, hhw₁, hb₁, himm₁⟩ :=
+    lm21_step_runBounded (Q := fun _ => True) (optDest := none) (prevBudget := 1) (nextBudget := 1) (fuel := 20)
+      lm21_fullFn_phase rfl rfl rfl lm21_fullFn_init_stateRel lm21_nodup_empty MemoryHighWater.empty
+      (by decide) (Nat.le_refl _) hlim1 (fun _ _ => ⟨trivial, nofun⟩) himm₀
+      (fun _ _ => .lm14Stmt (.storageLive 1 lm21I32Arr3Decl _ rfl))
+      (rfl : stepMirFn lm21FullFnBody (initMachineState lm21FullFnBody []) =
+        .step (lm21FullFnState 1 [.uninit, .uninit, .dead, .dead, .dead, .dead, .dead, .dead]))
+  clear himm₀
+  -- `stmt 1`: `_1 = [-10_i32, 25_i32, -3_i32]`
+  obtain ⟨m₂, ha₂, hm₂, hrel₂, hnd₂, hhw₂, hb₂, himm₂⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1) (optDest := some 1) (prevBudget := 1) (nextBudget := 2) (fuel := 19)
+      lm21_fullFn_phase rfl rfl rfl hrel₁ hnd₁ hhw₁ hb₁ (Nat.le_refl _) hlim2
+      (fun _ hj => ⟨trivial, fun h => hj (Option.some.inj h).symm⟩) himm₁
+      (fun tf htf => by
+        refine .arrayStmt (.aggregateArray 1 lm21I32Arr3Decl lm21I32Ty (.int .i32) 3 _ _
+          rfl lm21_wf_i32Arr3 rfl (Or.inr (Or.inl ⟨himm₁ 1 trivial tf htf, hhw₁.canReserveAllocId⟩))
+          ?_ lm21_isPrim_i32)
+        intro op hop
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
+        rcases hop with rfl | rfl | rfl
+        · exact lm21_fullFn_constI32_wt tf 0xFFFF_FFF6 (by decide)
+        · exact lm21_fullFn_constI32_wt tf 25 (by decide)
+        · exact lm21_fullFn_constI32_wt tf 0xFFFF_FFFD (by decide))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 2 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .dead, .dead, .dead, .dead, .dead, .dead]))
+  clear hrel₁ hnd₁ hhw₁ hb₁ himm₁
+  -- `stmt 2`: `StorageLive(2)`
+  obtain ⟨m₃, ha₃, hm₃, hrel₃, hnd₃, hhw₃, hb₃, himm₃⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1) (optDest := none) (prevBudget := 2) (nextBudget := 2) (fuel := 18)
+      lm21_fullFn_phase rfl rfl rfl hrel₂ hnd₂ hhw₂ hb₂ (Nat.le_refl _) hlim2
+      (fun _ hj => ⟨hj, nofun⟩) himm₂
+      (fun _ _ => .lm14Stmt (.storageLive 2 lm21BoolArr2Decl _ rfl))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 3 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .uninit, .dead, .dead, .dead, .dead, .dead]))
+  clear hrel₂ hnd₂ hhw₂ hb₂ himm₂
+  -- `stmt 3`: `_2 = [true; 2]`
+  obtain ⟨m₄, ha₄, hm₄, hrel₄, hnd₄, hhw₄, hb₄, himm₄⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2) (optDest := some 2) (prevBudget := 2) (nextBudget := 3) (fuel := 17)
+      lm21_fullFn_phase rfl rfl rfl hrel₃ hnd₃ hhw₃ hb₃ (Nat.le_refl _) hlim3
+      (fun _ ⟨hj₁, hj₂⟩ => ⟨hj₁, fun h => hj₂ (Option.some.inj h).symm⟩) himm₃
+      (fun tf htf =>
+        .arrayStmt (.repeatArray 2 lm21BoolArr2Decl .bool 2 _ _
+          rfl lm21_wf_boolArr2 (Or.inr (Or.inl ⟨himm₃ 2 (by decide) tf htf, hhw₃.canReserveAllocId⟩))
+          (lm21_fullFn_constBool_wt tf true) lm21_isPrim_bool))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 4 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr0), .dead, .dead, .dead, .dead, .dead]))
+  clear hrel₃ hnd₃ hhw₃ hb₃ himm₃
+  -- `stmt 4`: `_2[-1 of 2] = const false`
+  obtain ⟨m₅, ha₅, hm₅, hrel₅, hnd₅, hhw₅, hb₅, himm₅⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2) (optDest := none) (prevBudget := 3) (nextBudget := 3) (fuel := 16)
+      lm21_fullFn_phase rfl rfl rfl hrel₄ hnd₄ hhw₄ hb₄ (Nat.le_refl _) hlim3
+      (fun _ hj => ⟨hj, nofun⟩) himm₄
+      (fun tf _ =>
+        .arrayStmt (.elemAssign (.writeElem 2 lm21BoolArr2Decl .bool 2
+          (.constantIndex 1 2 true) (.constant (lm21ConstBool false)) _
+          rfl lm21_wf_boolArr2 lm21_isPrim_bool
+          (.constantIndex 1 2 true (by decide) (by decide)
+            ⟨(fun h => nomatch h), (fun _ => ⟨by decide, by decide⟩)⟩)
+          (lm21_fullFn_constBool_wt tf false)
+          (fun _ h => nomatch h)
+          (Or.inr (Or.inr ⟨lm21FullFnBoolArr0, rfl⟩)))))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 5 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .dead, .dead, .dead, .dead, .dead]))
+  clear hrel₄ hnd₄ hhw₄ hb₄ himm₄
+  -- `stmt 5`: `StorageLive(3)`
+  obtain ⟨m₆, ha₆, hm₆, hrel₆, hnd₆, hhw₆, hb₆, himm₆⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2) (optDest := none) (prevBudget := 3) (nextBudget := 3) (fuel := 15)
+      lm21_fullFn_phase rfl rfl rfl hrel₅ hnd₅ hhw₅ hb₅ (Nat.le_refl _) hlim3
+      (fun _ hj => ⟨hj, nofun⟩) himm₅
+      (fun _ _ => .lm14Stmt (.storageLive 3 lm21CharArr2Decl _ rfl))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 6 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .uninit, .dead, .dead, .dead, .dead]))
+  clear hrel₅ hnd₅ hhw₅ hb₅ himm₅
+  -- `stmt 6`: `_3 = ['A'; 2]`
+  obtain ⟨m₇, ha₇, hm₇, hrel₇, hnd₇, hhw₇, hb₇, himm₇⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := some 3) (prevBudget := 3) (nextBudget := 4) (fuel := 14)
+      lm21_fullFn_phase rfl rfl rfl hrel₆ hnd₆ hhw₆ hb₆ (Nat.le_refl _) hlim4
+      (fun _ ⟨hj₁, hj₂, hj₃⟩ => ⟨⟨hj₁, hj₂⟩, fun h => hj₃ (Option.some.inj h).symm⟩) himm₆
+      (fun tf htf =>
+        .arrayStmt (.repeatArray 3 lm21CharArr2Decl .char 2 _ _
+          rfl lm21_wf_charArr2 (Or.inr (Or.inl ⟨himm₆ 3 ⟨by decide, by decide⟩ tf htf, hhw₆.canReserveAllocId⟩))
+          (lm21_fullFn_constChar_wt tf 0x41 (by decide) (by decide)) lm21_isPrim_char))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 7 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .dead, .dead, .dead, .dead]))
+  clear hrel₆ hnd₆ hhw₆ hb₆ himm₆
+  -- `stmt 7`: `StorageLive(6)`
+  obtain ⟨m₈, ha₈, hm₈, hrel₈, hnd₈, hhw₈, hb₈, himm₈⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 13)
+      lm21_fullFn_phase rfl rfl rfl hrel₇ hnd₇ hhw₇ hb₇ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₇
+      (fun _ _ => .lm14Stmt (.storageLive 6 lm21BoolDecl _ rfl))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 8 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .dead, .dead, .uninit, .dead]))
+  clear hrel₇ hnd₇ hhw₇ hb₇ himm₇
+  -- `stmt 8`: `_6 = copy _2[0 of 2]`
+  obtain ⟨m₉, ha₉, hm₉, hrel₉, hnd₉, hhw₉, hb₉, himm₉⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 12)
+      lm21_fullFn_phase rfl rfl rfl hrel₈ hnd₈ hhw₈ hb₈ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₈
+      (fun tf htf =>
+        .arrayStmt (.elemAssign (.readElem 6 2 lm21BoolDecl lm21BoolArr2Decl .bool 2
+          (.constantIndex 0 2 false) false _
+          rfl lm21_wf_boolArr2 rfl rfl
+          (himm₈ 6 ⟨by decide, by decide, by decide⟩ tf htf)
+          (.constantIndex 0 2 false (by decide) (by decide)
+            ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+          (Or.inr (Or.inr ⟨lm21FullFnBoolArr1, rfl⟩)))))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 9 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .dead, .dead, .init (.scalar ⟨1, 1⟩), .dead]))
+  clear hrel₈ hnd₈ hhw₈ hb₈ himm₈
+  -- `stmt 9`: `StorageLive(7)`
+  obtain ⟨m₁₀, ha₁₀, hm₁₀, hrel₁₀, hnd₁₀, hhw₁₀, hb₁₀, himm₁₀⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 11)
+      lm21_fullFn_phase rfl rfl rfl hrel₉ hnd₉ hhw₉ hb₉ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₉
+      (fun _ _ => .lm14Stmt (.storageLive 7 lm21CharDecl _ rfl))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 10 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .dead, .dead, .init (.scalar ⟨1, 1⟩), .uninit]))
+  clear hrel₉ hnd₉ hhw₉ hb₉ himm₉
+  -- `stmt 10`: `_7 = copy _3[1 of 2]`
+  obtain ⟨m₁₁, ha₁₁, hm₁₁, hrel₁₁, hnd₁₁, hhw₁₁, hb₁₁, himm₁₁⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 10)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₀ hnd₁₀ hhw₁₀ hb₁₀ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₀
+      (fun tf htf =>
+        .arrayStmt (.elemAssign (.readElem 7 3 lm21CharDecl lm21CharArr2Decl .char 2
+          (.constantIndex 1 2 false) false _
+          rfl lm21_wf_charArr2 rfl rfl
+          (himm₁₀ 7 ⟨by decide, by decide, by decide⟩ tf htf)
+          (.constantIndex 1 2 false (by decide) (by decide)
+            ⟨(fun _ => by decide), (fun h => nomatch h)⟩)
+          (Or.inr (Or.inr ⟨lm21FullFnCharArr, rfl⟩)))))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 11 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .dead, .dead, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₀ hnd₁₀ hhw₁₀ hb₁₀ himm₁₀
+  -- `stmt 11`: `StorageLive(4)`
+  obtain ⟨m₁₂, ha₁₂, hm₁₂, hrel₁₂, hnd₁₂, hhw₁₂, hb₁₂, himm₁₂⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 9)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₁ hnd₁₁ hhw₁₁ hb₁₁ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₁
+      (fun _ _ => .lm14Stmt (.storageLive 4 lm21UsizeDecl _ rfl))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 12 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .uninit, .dead, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₁ hnd₁₁ hhw₁₁ hb₁₁ himm₁₁
+  -- `stmt 12`: `_4 = const 1_usize`
+  obtain ⟨m₁₃, ha₁₃, hm₁₃, hrel₁₃, hnd₁₃, hhw₁₃, hb₁₃, himm₁₃⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 8)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₂ hnd₁₂ hhw₁₂ hb₁₂ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₂
+      (fun tf htf =>
+        .scalarStmt (.assign _ 4 lm21UsizeDecl _ rfl rfl
+          (himm₁₂ 4 ⟨by decide, by decide, by decide⟩ tf htf)
+          (.use _ lm21UsizeTy (lm21_fullFn_constUsize_scalar_wt tf 1 (by decide)))))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 13 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .init (.scalar ⟨1, 8⟩), .dead, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₂ hnd₁₂ hhw₁₂ hb₁₂ himm₁₂
+  -- `stmt 13`: `StorageLive(5)`
+  obtain ⟨m₁₄, ha₁₄, hm₁₄, hrel₁₄, hnd₁₄, hhw₁₄, hb₁₄, himm₁₄⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 7)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₃ hnd₁₃ hhw₁₃ hb₁₃ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₃
+      (fun _ _ => .lm14Stmt (.storageLive 5 lm21I32Decl _ rfl))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 14 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .init (.scalar ⟨1, 8⟩), .uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₃ hnd₁₃ hhw₁₃ hb₁₃ himm₁₃
+  -- `stmt 14`: `_5 = copy _1[_4]`
+  obtain ⟨m₁₅, ha₁₅, hm₁₅, hrel₁₅, hnd₁₅, hhw₁₅, hb₁₅, himm₁₅⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 6)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₄ hnd₁₄ hhw₁₄ hb₁₄ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₄
+      (fun tf htf =>
+        .arrayStmt (.elemAssign (.readElem 5 1 lm21I32Decl lm21I32Arr3Decl (.int .i32) 3
+          (.index 4) false _
+          rfl lm21_wf_i32Arr3 rfl rfl
+          (himm₁₄ 5 ⟨by decide, by decide, by decide⟩ tf htf)
+          (.index 4 lm21UsizeDecl rfl rfl
+            (Or.inl (himm₁₄ 4 ⟨by decide, by decide, by decide⟩ tf htf)))
+          (Or.inr (Or.inr ⟨lm21FullFnI32Arr, rfl⟩)))))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 15 [.uninit, .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .init (.scalar ⟨1, 8⟩), .init (.scalar ⟨25, 4⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₄ hnd₁₄ hhw₁₄ hb₁₄ himm₁₄
+  -- `stmt 15`: `_0 = move _1[-1 of 3]`
+  obtain ⟨m₁₆, ha₁₆, hm₁₆, hrel₁₆, hnd₁₆, hhw₁₆, hb₁₆, himm₁₆⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 5)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₅ hnd₁₅ hhw₁₅ hb₁₅ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₅
+      (fun tf htf =>
+        .arrayStmt (.elemAssign (.readElem 0 1 lm21I32Decl lm21I32Arr3Decl (.int .i32) 3
+          (.constantIndex 1 3 true) true _
+          rfl lm21_wf_i32Arr3 rfl rfl
+          (himm₁₅ 0 ⟨by decide, by decide, by decide⟩ tf htf)
+          (.constantIndex 1 3 true (by decide) (by decide)
+            ⟨(fun h => nomatch h), (fun _ => ⟨by decide, by decide⟩)⟩)
+          (Or.inr (Or.inr ⟨lm21FullFnI32Arr, rfl⟩)))))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 16 [.init (.scalar ⟨0xFFFF_FFFD, 4⟩), .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .init (.scalar ⟨1, 8⟩), .init (.scalar ⟨25, 4⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₅ hnd₁₅ hhw₁₅ hb₁₅ himm₁₅
+  -- `stmt 16`: `_0 = Add(copy _5, copy _0)` (`25 + (-3) = 22_i32`)
+  obtain ⟨m₁₇, ha₁₇, hm₁₇, hrel₁₇, hnd₁₇, hhw₁₇, hb₁₇, himm₁₇⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 4)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₆ hnd₁₆ hhw₁₆ hb₁₆ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₆
+      (fun tf htf =>
+        .scalarStmt (.assign _ 0 lm21I32Decl _ rfl rfl
+          (himm₁₆ 0 ⟨by decide, by decide, by decide⟩ tf htf)
+          (.binaryOp .add _ _ lm21I32Ty lm21I32Ty lm21I32Ty
+            (.copyLocal 5 lm21I32Decl rfl (by decide) (himm₁₆ 5 ⟨by decide, by decide, by decide⟩ tf htf))
+            (.copyLocal 0 lm21I32Decl rfl (by decide) (himm₁₆ 0 ⟨by decide, by decide, by decide⟩ tf htf))
+            (.intArithOrBitwise .add lm21I32Ty lm21I32Ty lm21I32Ty (translateIntTy .i32)
+              (Or.inl rfl) (.int .i32 rfl) (.int .i32 rfl) (.int .i32 rfl)))))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 17 [.init (.scalar ⟨22, 4⟩), .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .init (.aggregate 0 lm21FullFnCharArr), .init (.scalar ⟨1, 8⟩), .init (.scalar ⟨25, 4⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₆ hnd₁₆ hhw₁₆ hb₁₆ himm₁₆
+  -- `stmt 17`: `StorageDead(3)`
+  obtain ⟨m₁₈, ha₁₈, hm₁₈, hrel₁₈, hnd₁₈, hhw₁₈, hb₁₈, himm₁₈⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 3)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₇ hnd₁₇ hhw₁₇ hb₁₇ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₇
+      (fun _ _ => .lm14Stmt (.storageDead 3 lm21CharArr2Decl _ rfl (by decide)))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 18 [.init (.scalar ⟨22, 4⟩), .init (.aggregate 0 lm21FullFnI32Arr), .init (.aggregate 0 lm21FullFnBoolArr1), .dead, .init (.scalar ⟨1, 8⟩), .init (.scalar ⟨25, 4⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₇ hnd₁₇ hhw₁₇ hb₁₇ himm₁₇
+  -- `stmt 18`: `StorageDead(2)`
+  obtain ⟨m₁₉, ha₁₉, hm₁₉, hrel₁₉, hnd₁₉, hhw₁₉, hb₁₉, himm₁₉⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 2)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₈ hnd₁₈ hhw₁₈ hb₁₈ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₈
+      (fun _ _ => .lm14Stmt (.storageDead 2 lm21BoolArr2Decl _ rfl (by decide)))
+      (rfl : stepMirFn lm21FullFnBody _ =
+        .step (lm21FullFnState 19 [.init (.scalar ⟨22, 4⟩), .init (.aggregate 0 lm21FullFnI32Arr), .dead, .dead, .init (.scalar ⟨1, 8⟩), .init (.scalar ⟨25, 4⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]))
+  clear hrel₁₈ hnd₁₈ hhw₁₈ hb₁₈ himm₁₈
+  -- `stmt 19`: `StorageDead(1)`
+  let s₂₀ := lm21FullFnState 20
+    [.init (.scalar ⟨22, 4⟩), .dead, .dead, .dead, .init (.scalar ⟨1, 8⟩), .init (.scalar ⟨25, 4⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0x41, 4⟩)]
+  obtain ⟨m₂₀, ha₂₀, hm₂₀, hrel₂₀, _, _, _, himm₂₀⟩ :=
+    lm21_step_runBounded (Q := fun j => j ≠ 1 ∧ j ≠ 2 ∧ j ≠ 3) (optDest := none) (prevBudget := 4) (nextBudget := 4) (fuel := 1)
+      lm21_fullFn_phase rfl rfl rfl hrel₁₉ hnd₁₉ hhw₁₉ hb₁₉ (Nat.le_refl _) hlim4
+      (fun _ hj => ⟨hj, nofun⟩) himm₁₉
+      (fun _ _ => .lm14Stmt (.storageDead 1 lm21I32Arr3Decl _ rfl (by decide)))
+      (rfl : stepMirFn lm21FullFnBody _ = .step s₂₀)
+  clear hrel₁₉ hnd₁₉ hhw₁₉ hb₁₉ himm₁₉
+  -- `terminator` (`stmtIdx = 20`): `return_`
+  have ha_ret :
+      stepMirFn lm21FullFnBody s₂₀ = .ret (.normal (.scalar ⟨22, 4⟩, s₂₀.memory)) := rfl
+  have hsim_ret :=
+    step_terminator_goto_return_simulation hrel₂₀ lm21_fullFn_phase rfl rfl rfl rfl
+      (Or.inr (Or.inl ⟨rfl, lm21I32Decl, rfl, (by decide),
+        fun tf htf => himm₂₀ 0 ⟨by decide, by decide, by decide⟩ tf htf⟩))
+  obtain ⟨ha_end, decl0, m_ret, retImm, hdecl0, himmRel, hframes_empty, hm_end⟩ :=
+    runBounded_of_stepRel_retRoot 0 ha_ret hsim_ret
+  have hdecl0_eq : decl0 = lm21I32Decl := by
+    simpa [lm21FullFnBody, get?] using hdecl0.symm
+  subst hdecl0_eq
+  cases himmRel with
+  | scalar _ msc hsc hsz hbool hchar =>
+    have hmsc : msc = Miri.Memory.ScalarInt.ofUInt32 22 := by
+      have hd := hsc.data_eq
+      have hs := hsc.size_eq
+      with_unfolding_all
+        rcases msc with ⟨rawData, byteSize⟩
+        dsimp only [Miri.Memory.ScalarInt.data, Miri.Memory.ScalarInt.size] at hd hs
+        subst hd hs
+        rfl
+    subst hmsc
+    refine ⟨s₂₀.memory, m_ret, hframes_empty, ?_, ?_,
+      .scalar ⟨22, 4⟩ (Miri.Memory.ScalarInt.ofUInt32 22) hsc hsz hbool hchar⟩
+    · rw [ha₁, ha₂, ha₃, ha₄, ha₅, ha₆, ha₇, ha₈, ha₉, ha₁₀, ha₁₁, ha₁₂, ha₁₃, ha₁₄, ha₁₅, ha₁₆, ha₁₇, ha₁₈, ha₁₉, ha₂₀, ha_end]
+    · rw [hm₁, hm₂, hm₃, hm₄, hm₅, hm₆, hm₇, hm₈, hm₉, hm₁₀, hm₁₁, hm₁₂, hm₁₃, hm₁₄, hm₁₅, hm₁₆, hm₁₇, hm₁₈, hm₁₉, hm₂₀, hm_end]
+
 end LeanMiriSpec.Correspondence.Witness
