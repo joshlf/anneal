@@ -1505,7 +1505,14 @@ pub fn render_agent_context(
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        let authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
+        let mir_root = generated_root.join("Mir");
+        let lifting_profile = analyze_workspace_lifting_profile(&mir_root, bundle);
+        let raw_authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
+        let authored = crate::scaffold::effective_authored_for_bundle(
+            bundle,
+            raw_authored,
+            Some(&lifting_profile),
+        );
         let proof_status = if authored.has_proof {
             "Present"
         } else {
@@ -1570,7 +1577,6 @@ pub fn render_agent_context(
             ));
         }
 
-        let mir_root = generated_root.join("Mir");
         if let Some(mir_disk) = crate::scaffold::resolve_workspace_mir_file(
             &mir_root,
             &bundle.subject,
@@ -1585,7 +1591,6 @@ pub fn render_agent_context(
             ));
         }
 
-        let lifting_profile = analyze_workspace_lifting_profile(&mir_root, bundle);
         out.push_str(&render_item_lifting_guidance(
             bundle,
             authored,
@@ -1667,9 +1672,9 @@ fn render_item_lifting_guidance(
     }
 
     if is_bit_validity_item {
-        out.push_str(
-            "- **Bit-Validity / Trait Route (`Anneal.BitValidity`)**: `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, `checkFromZeros_sound`, `checkFromBytes_sound`, `checkIntoBytes_sound`, and `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`.\n",
-        );
+        out.push_str(&format!(
+            "- **Bit-Validity / Trait Route (`Anneal.BitValidity`)**: `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, `checkFromZeros_sound`, `checkFromBytes_sound`, `checkIntoBytes_sound`, and `transmute_sound_of_into_from_bytes` over `Mir.{item}.layouts`.\n"
+        ));
     }
     if is_polymorphic {
         out.push_str(&format!(
@@ -2698,6 +2703,77 @@ end Mir.Demo.loop_fn
         assert!(ctx_loop.contains("Primary Loop Route (`forRangeUp` + `runCfgToBlock`)"));
         assert!(ctx_loop.contains("open Anneal.MirLoops Anneal.PureMirExec Anneal.MirFuelFree"));
         assert!(ctx_loop.contains("mirNoCallWpConverges_forRangeUp"));
+
+        // Verify `UnsafeTraitImpl` formats `Mir.<Item>.layouts` with the concrete item module,
+        // and unauthored `safe_total`, `equivalent_to`, and `typeParamCount > 0` items report
+        // accurate contract surfaces and starter proof templates.
+        let poly_mir = "import Trusted\nnamespace Mir.Demo.poly_fn\ndef body : CapturedMir := { defPath := \"demo::poly_fn\", typeParamCount := 1, localDecls := [], basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\nend Mir.Demo.poly_fn\n";
+        fs::write(mir_dir.join("impl_from_bytes.lean"), pure_mir)
+            .expect("write impl_from_bytes.lean");
+        fs::write(mir_dir.join("tot_fn.lean"), pure_mir).expect("write tot_fn.lean");
+        fs::write(mir_dir.join("fast_fn.lean"), pure_mir).expect("write fast_fn.lean");
+        fs::write(mir_dir.join("poly_fn.lean"), poly_mir).expect("write poly_fn.lean");
+        let extra_records = vec![
+            mk_rec(
+                "demo::impl_from_bytes",
+                "Mir/Demo/impl_from_bytes.lean",
+                "Mir.Demo.impl_from_bytes",
+                CapturedItemKind::UnsafeTraitImpl,
+                None,
+            ),
+            mk_rec(
+                "demo::tot_fn",
+                "Mir/Demo/tot_fn.lean",
+                "Mir.Demo.tot_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            mk_rec(
+                "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_tot_fn",
+                "",
+                "",
+                CapturedItemKind::ExternalSpec,
+                Some("demo::tot_fn"),
+            ),
+            mk_rec(
+                "demo::fast_fn",
+                "Mir/Demo/fast_fn.lean",
+                "Mir.Demo.fast_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+            mk_rec(
+                "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_tot_fn__for__fast_fn",
+                "",
+                "",
+                CapturedItemKind::ExternalSpec,
+                Some("demo::fast_fn"),
+            ),
+            mk_rec(
+                "demo::poly_fn",
+                "Mir/Demo/poly_fn.lean",
+                "Mir.Demo.poly_fn",
+                CapturedItemKind::Subject,
+                None,
+            ),
+        ];
+        let ctx_trait = render_agent_context(&ws, &extra_records, Some("demo::impl_from_bytes"))
+            .expect("render context for impl_from_bytes");
+        assert!(ctx_trait.contains("over `Mir.Demo.impl_from_bytes.layouts`"));
+
+        let ctx_tot = render_agent_context(&ws, &extra_records, Some("demo::tot_fn"))
+            .expect("render context for tot_fn");
+        assert!(ctx_tot.contains("- **`is_stateful`**: total (`TotalItemSpec` / `TotalVerificationResult`)"));
+        assert!(ctx_tot.contains("theorem verified : TotalVerificationResult Obligations.Demo.tot_fn.totalClaim"));
+
+        let ctx_equiv = render_agent_context(&ws, &extra_records, Some("demo::fast_fn"))
+            .expect("render context for fast_fn");
+        assert!(ctx_equiv.contains("- **`is_stateful`**: equiv (`StatefulEquivItemSpec` / `StatefulEquivVerificationResult`)"));
+        assert!(ctx_equiv.contains("theorem verified : StatefulEquivVerificationResult Obligations.Demo.fast_fn.equivClaim"));
+
+        let ctx_poly = render_agent_context(&ws, &extra_records, Some("demo::poly_fn"))
+            .expect("render context for poly_fn");
+        assert!(ctx_poly.contains("theorem verified : Obligations.Demo.poly_fn.polyClaim"));
 
         let _ = fs::remove_dir_all(&ws);
     }

@@ -516,26 +516,16 @@ pub(crate) fn populate_called_callees(
         trusted_callees: &trusted_callees_by_def_id,
     };
 
-    let fallback_cfg = mir_root
-        .parent()
-        .and_then(|g| g.parent())
-        .and_then(|d| d.parent())
-        .map(ScaffoldConfig::new);
-
     let mut outgoing_cache: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     let mut read_outgoing = |rel_path: &Path| -> Vec<String> {
         if let Some(cached) = outgoing_cache.get(rel_path) {
             return cached.clone();
         }
-        let mir_path = mir_root.join(rel_path);
-        let resolved_path = if mir_path.is_file() {
-            Some(mir_path)
-        } else if let Some(ref cfg) = fallback_cfg
-            && let Some(rec) = record_by_rel_path.get(rel_path)
-        {
-            find_source_mir_file(cfg, rec, rel_path)
+        let resolved_path = if let Some(rec) = record_by_rel_path.get(rel_path) {
+            resolve_workspace_mir_file(mir_root, rec, rel_path)
         } else {
-            None
+            let mir_path = mir_root.join(rel_path);
+            mir_path.is_file().then_some(mir_path)
         };
         let refs = resolved_path
             .and_then(|p| fs::read_to_string(p).ok())
@@ -726,15 +716,11 @@ pub fn scaffold_workspace_with_config(
             report.created_spec_files.push(spec_path);
         }
 
-        let mut authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
-        if !authored.is_ub_exception
-            && !authored.is_modular
-            && bundle.rust_equiv_target_module_suffix().is_some()
-        {
-            authored.is_equiv = true;
-            authored.is_total = false;
-            authored.is_stateful = false;
-        }
+        let mut authored = effective_authored_for_bundle(
+            bundle,
+            detect_authored_item_modules(&proofs_root, &bundle.item_rel_path),
+            None,
+        );
 
         let proof_path = proof_root.join(&bundle.item_rel_path);
         if proof_path.exists() {
@@ -756,15 +742,11 @@ pub fn scaffold_workspace_with_config(
                 )
             })?;
             report.created_proof_files.push(proof_path);
-            authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
-            if !authored.is_ub_exception
-                && !authored.is_modular
-                && bundle.rust_equiv_target_module_suffix().is_some()
-            {
-                authored.is_equiv = true;
-                authored.is_total = false;
-                authored.is_stateful = false;
-            }
+            authored = effective_authored_for_bundle(
+                bundle,
+                detect_authored_item_modules(&proofs_root, &bundle.item_rel_path),
+                None,
+            );
         }
 
         if bundle.has_rust_trusted_attr() && !authored.has_assumptions && !authored.has_proof {
@@ -994,6 +976,7 @@ pub fn refresh_workspace_assembly(workspace_root: &Path) -> Result<(), String> {
                 Some(&obligations_root),
             );
         }
+        authored = effective_authored_for_bundle(&synthetic_bundle, authored, None);
 
         let should_rerender_verify = authored.has_proof
             || authored.has_specs
@@ -1689,24 +1672,81 @@ impl MirLiftingProfile {
     }
 }
 
-/// Resolve `rel_item_path` under `mir_root` (`.anneal/generated/Mir`) first,
-/// falling back to `find_source_mir_file` in `<workspace>/target/anneal/units`
-/// when `.anneal/generated/Mir` has not been materialized yet.
+/// Normalize `authored` contract flags against Rust-level attributes on
+/// `bundle` (`#[spec(equivalent_to: ...)]`, `#[spec(safe_total)]`, modular
+/// callees) and, when rendering a starter template for an item without an
+/// existing `Proof/<Item>.lean`, promote generic (`typeParamCount > 0`) bodies
+/// to `is_polymorphic`.
+pub(crate) fn effective_authored_for_bundle(
+    bundle: &SubjectObligationBundle,
+    mut authored: AuthoredItemModules,
+    unauthored_profile: Option<&MirLiftingProfile>,
+) -> AuthoredItemModules {
+    if !authored.is_ub_exception && !authored.is_modular {
+        if bundle.rust_equiv_target_module_suffix().is_some() {
+            authored.is_equiv = true;
+            authored.is_total = false;
+            authored.is_stateful = false;
+        } else if !authored.is_equiv
+            && !authored.has_specs
+            && !authored.is_stateful
+            && bundle.has_rust_safe_total_attr()
+        {
+            authored.is_total = true;
+        }
+    }
+    if !authored.has_proof
+        && !authored.is_equiv
+        && unauthored_profile.is_some_and(|p| p.type_param_count > 0)
+    {
+        authored.is_polymorphic = true;
+        if !authored.is_ub_exception
+            && !authored.has_specs
+            && (!bundle.external_spec_callees.is_empty() || !bundle.called_callees.is_empty())
+        {
+            authored.is_modular = true;
+        }
+    }
+    authored
+}
+
+/// Resolve `rel_item_path` under `mir_root` (`.anneal/generated/Mir`) when its
+/// content matches `record.target.mir_module_sha256` (or no expected SHA is
+/// recorded), falling back to `find_source_mir_file` in
+/// `<workspace>/target/anneal/units` when `.anneal/generated/Mir` is absent or
+/// holds a stale/stub file superseded by a newer unit capture.
 pub(crate) fn resolve_workspace_mir_file(
     mir_root: &Path,
     record: &UnitTargetRecord,
     rel_item_path: &Path,
 ) -> Option<PathBuf> {
     let direct = mir_root.join(rel_item_path);
-    if direct.is_file() {
+    let expected_sha = &record.target.mir_module_sha256;
+    let direct_exists = direct.is_file();
+    if direct_exists
+        && (expected_sha.is_empty()
+            || fs::read(&direct)
+                .ok()
+                .is_some_and(|bytes| &sha256_hex(&bytes) == expected_sha))
+    {
         return Some(direct);
     }
     let fallback_cfg = mir_root
         .parent()
         .and_then(|g| g.parent())
         .and_then(|d| d.parent())
-        .map(ScaffoldConfig::new)?;
-    find_source_mir_file(&fallback_cfg, record, rel_item_path)
+        .map(ScaffoldConfig::new);
+    if let Some(cfg) = fallback_cfg
+        && let Some(unit_path) = find_source_mir_file(&cfg, record, rel_item_path)
+        && (!direct_exists
+            || (!expected_sha.is_empty()
+                && fs::read(&unit_path)
+                    .ok()
+                    .is_some_and(|bytes| &sha256_hex(&bytes) == expected_sha)))
+    {
+        return Some(unit_path);
+    }
+    direct_exists.then_some(direct)
 }
 
 /// Inspect `mir_root` on disk (with fallback to `target/anneal/units`) for
@@ -2402,8 +2442,9 @@ pub fn render_proof_template_with_hints(
     authored: AuthoredItemModules,
     profile: &MirLiftingProfile,
 ) -> String {
-    let base = render_proof_template_with_options(bundle, authored);
-    let hints = render_scaffold_lifting_hints(bundle, authored, profile);
+    let effective = effective_authored_for_bundle(bundle, authored, Some(profile));
+    let base = render_proof_template_with_options(bundle, effective);
+    let hints = render_scaffold_lifting_hints(bundle, effective, profile);
     if let Some(doc_idx) = base.find("\n/-- ") {
         let mut enriched = String::with_capacity(base.len() + hints.len() + 2);
         enriched.push_str(&base[..doc_idx + 1]);
@@ -3609,6 +3650,123 @@ def body : CapturedMir :=
                 && prof_fallback.has_cfg_back_edge,
             "analyze_workspace_lifting_profile must fall back to target/anneal/units: {prof_fallback:?}"
         );
+
+        // 7. When `.anneal/generated/Mir/<Item>.lean` holds a stale stub whose SHA
+        //    mismatches `record.target.mir_module_sha256` while `target/anneal/units`
+        //    holds the fresh capture matching `mir_module_sha256`, `resolve_workspace_mir_file`
+        //    and `analyze_workspace_lifting_profile` must read the fresh unit capture.
+        let stale_mir_dir = fallback_ws.join(".anneal/generated/Mir/Demo");
+        fs::create_dir_all(&stale_mir_dir).expect("create stale Mir/Demo");
+        fs::write(
+            stale_mir_dir.join("item.lean"),
+            "prelude\nimport Init.Core\nimport Trusted\nnamespace Mir.Demo.item\nend Mir.Demo.item\n",
+        )
+        .expect("write stale stub Mir/Demo/item.lean");
+        fallback_bundle.subject.target.mir_module_sha256 = sha256_hex(cleanup_poly_mir.as_bytes());
+        let prof_fresh_unit = analyze_workspace_lifting_profile(
+            &fallback_ws.join(".anneal/generated/Mir"),
+            &fallback_bundle,
+        );
+        assert!(
+            prof_fresh_unit.has_captured_mir
+                && prof_fresh_unit.type_param_count == 2
+                && prof_fresh_unit.has_cfg_back_edge,
+            "stale .anneal/generated/Mir stub must be superseded by SHA-matching unit capture: {prof_fresh_unit:?}"
+        );
         let _ = fs::remove_dir_all(&fallback_ws);
+    }
+
+    #[test]
+    fn scaffold_init_proofs_promotes_safe_total_equiv_and_polymorphic_templates() {
+        let ws = unique_temp_dir("init_proofs_poly_total_equiv");
+        let unit_dir = ws.join("target/anneal/units/u0/Mir/Demo");
+        fs::create_dir_all(&unit_dir).expect("create unit Mir/Demo");
+
+        let mono_mir = "import Trusted\nnamespace Mir.Demo.mono\ndef body : CapturedMir := { defPath := \"demo::mono\", typeParamCount := 0, localDecls := [], basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\nend Mir.Demo.mono\n";
+        let poly_mir = "import Trusted\nnamespace Mir.Demo.poly_id\ndef body : CapturedMir := { defPath := \"demo::poly_id\", typeParamCount := 1, localDecls := [], basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\nend Mir.Demo.poly_id\n";
+
+        fs::write(unit_dir.join("safe_tot.lean"), mono_mir).expect("write safe_tot.lean");
+        fs::write(unit_dir.join("fast_eq.lean"), mono_mir).expect("write fast_eq.lean");
+        fs::write(unit_dir.join("poly_id.lean"), poly_mir).expect("write poly_id.lean");
+
+        let mk_subj = |def_id: &str, name: &str, src: &str| UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: def_id.to_string(),
+                mir_module_path: format!("Mir/Demo/{name}.lean"),
+                mir_module_sha256: sha256_hex(src.as_bytes()),
+            },
+            lean_module_name: format!("Mir.Demo.{name}"),
+            item_kind: CapturedItemKind::Subject,
+            associated_subject_def_id: None,
+            trait_impls: Vec::new(),
+        };
+
+        let records = vec![
+            mk_subj("demo::safe_tot", "safe_tot", mono_mir),
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id: "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_safe_total_safe_tot"
+                        .to_string(),
+                    mir_module_path: String::new(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: String::new(),
+                item_kind: CapturedItemKind::ExternalSpec,
+                associated_subject_def_id: Some("demo::safe_tot".to_string()),
+                trait_impls: Vec::new(),
+            },
+            mk_subj("demo::fast_eq", "fast_eq", mono_mir),
+            UnitTargetRecord {
+                target: CapturedTarget {
+                    def_id:
+                        "demo::__ANNEAL_EXT_SPEC_TARGET___anneal_attr_equiv_safe_tot__for__fast_eq"
+                            .to_string(),
+                    mir_module_path: String::new(),
+                    mir_module_sha256: String::new(),
+                },
+                lean_module_name: String::new(),
+                item_kind: CapturedItemKind::ExternalSpec,
+                associated_subject_def_id: Some("demo::fast_eq".to_string()),
+                trait_impls: Vec::new(),
+            },
+            mk_subj("demo::poly_id", "poly_id", poly_mir),
+        ];
+
+        let cfg = ScaffoldConfig::new(&ws);
+        scaffold_init_proof_templates(&cfg, &records).expect("init proof templates");
+
+        let tot_proof =
+            fs::read_to_string(ws.join("anneal/proofs/Proof/Demo/safe_tot.lean")).unwrap();
+        assert!(
+            tot_proof.contains(
+                "theorem verified : TotalVerificationResult Obligations.Demo.safe_tot.totalClaim"
+            ),
+            "#[spec(safe_total)] starter template must target TotalVerificationResult: {tot_proof}"
+        );
+        let tot_verify =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/safe_tot.lean")).unwrap();
+        assert!(tot_verify.contains("TotalVerificationResult Obligations.Demo.safe_tot.totalClaim"));
+
+        let eq_proof =
+            fs::read_to_string(ws.join("anneal/proofs/Proof/Demo/fast_eq.lean")).unwrap();
+        assert!(
+            eq_proof.contains(
+                "theorem verified : StatefulEquivVerificationResult Obligations.Demo.fast_eq.equivClaim"
+            ),
+            "#[spec(equivalent_to: ...)] starter template must target StatefulEquivVerificationResult: {eq_proof}"
+        );
+
+        let poly_proof =
+            fs::read_to_string(ws.join("anneal/proofs/Proof/Demo/poly_id.lean")).unwrap();
+        assert!(
+            poly_proof.contains("theorem verified : Obligations.Demo.poly_id.polyClaim"),
+            "generic typeParamCount > 0 starter template must target polyClaim: {poly_proof}"
+        );
+        let poly_verify =
+            fs::read_to_string(ws.join(".anneal/generated/Verify/Demo/poly_id.lean")).unwrap();
+        assert!(poly_verify.contains("mkPolyVerificationResult"));
+        assert!(!poly_verify.contains("signatureMonomorphic"));
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }

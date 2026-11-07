@@ -83,6 +83,13 @@ Work unit `FF-4.3` delivers:
      (`mirBoolPredicateHolds_*_of_pureExec`) from closure-capturing companions
      (`Rvalue.ref` + `.deref`) that use `holdBoolReq_of_mirBool` + count-free
      `repeat` and `hold_mirBool_of_blockLinear` (`defaultSpecSteps`).
+- Added `effective_authored_for_bundle` and SHA-aware
+  `resolve_workspace_mir_file` so `--init-proofs` and `agent-context` honor
+  `#[spec(safe_total)]` (`TotalVerificationResult`),
+  `#[spec(equivalent_to: ...)]` (`StatefulEquivVerificationResult`), and generic
+  `typeParamCount > 0` (`poly*Claim` + `mkPolyVerificationResult`), and prefer
+  fresh SHA-matching `target/anneal/units` captures over stale
+  `.anneal/generated/Mir` stubs.
 - Added `render_scaffold_lifting_hints` and `render_proof_template_with_hints`
   (re-exported from `crates/cargo-anneal/src/lib.rs`), emitting `<= 80`-column
   `--` Lean comment blocks with verified `open` namespaces (`Trusted.MirAst`,
@@ -109,8 +116,9 @@ Work unit `FF-4.3` delivers:
   - Hint-enriched `### Starter Proof Template` blocks matching `--init-proofs`.
 - Added unit tests in `scaffold.rs`
   (`scaffold_init_proofs_surfaces_tailored_lifting_hints_within_80_cols`,
-  `mir_lifting_profile_handles_strings_slice_ptrs_u128_and_cleanup`) and
-  `agent.rs`
+  `mir_lifting_profile_handles_strings_slice_ptrs_u128_and_cleanup`,
+  `scaffold_init_proofs_promotes_safe_total_equiv_and_polymorphic_templates`)
+  and `agent.rs`
   (`strip_lean_comments_preserves_comment_markers_inside_string_literals`
   and `render_agent_context` lifting-strategy coverage).
 
@@ -127,7 +135,7 @@ Work unit `FF-4.3` delivers:
   under `examples/tutor-ch4/anneal/proofs/Proof/` with `examples/tutor`'s
   `*FuelFree` wrappers and regenerated `docs/tutor/{01,02,04,05}-*.md` via
   `python3 docs/tutor/workflow/tutor_workflow.py render`, restoring all 4
-  `end_to_end_tutor` tests (`98 passed; 0 failed` across all 11 `cargo test -p
+  `end_to_end_tutor` tests (`99 passed; 0 failed` across all 11 `cargo test -p
   cargo-anneal` suites).
 
 ---
@@ -151,24 +159,24 @@ Committed **locally only** on branch `adv/ff-4-3-reference` in
   findings `F-01`–`F-08`, and explicit `Boundaries` classifications
   (`unsupported`, `known not to apply`, `not examined`, `unknown`).
 - `reports/anneal-fuel-free-mir-lifting-and-alias-erasure/support/`:
-  - `FuelFreeMirLiftingAndLensesProbe.lean`: 837-line self-contained Lean
+  - `FuelFreeMirLiftingAndLensesProbe.lean`: 910-line self-contained Lean
     `v4.34.1` mechanization (`Init`-only, zero `sorry`, constructive axioms
-    only) proving 17 exported theorems: `evalFuel_mono`, `StepsTo.bind_wp`,
+    only) proving 18 exported theorems: `evalFuel_mono`, `StepsTo.bind_wp`,
     `checkPureProg_rejects_deref`, `stepPure_simulates`,
-    `wpConverges_of_pureExec`, `chained_sets_collapse_rfl`,
-    `forRangeUp_induction`, `wpConverges_forRangeUp`,
-    `stepsTo_of_runToTarget_reached`, `wpConverges_of_runToTarget_halted`,
-    `runToTarget_mono_bound`, `stepsTo_of_runCfgToBlock_reached`,
-    `wpConverges_of_runCfgToBlock_halted`, `no_uniform_fuel_countUp`,
-    `countUp_wpConverges_all_n`, `subplaceFieldLens_disjoint`, and
-    `liftLens_twoBorrowAdd_sound`.
+    `wpConverges_of_pureExec`, `liftBlock_diamond_shared`,
+    `chained_sets_collapse_rfl`, `forRangeUp_induction`,
+    `wpConverges_forRangeUp`, `stepsTo_of_runToTarget_reached`,
+    `wpConverges_of_runToTarget_halted`, `runToTarget_mono_bound`,
+    `stepsTo_of_runCfgToBlock_reached`, `wpConverges_of_runCfgToBlock_halted`,
+    `no_uniform_fuel_countUp`, `countUp_wpConverges_all_n`,
+    `subplaceFieldLens_disjoint`, and `liftLens_twoBorrowAdd_sound`.
   - `wireframe_benchmark_metrics.json`: verified per-function LOC (`8,009 ->
     1,421`, `-82.3%`), `BlockCtx` (`111 -> 0`), deterministic heartbeats
     (`1,388,934k -> 665,228k`, `-52.1%`), `uses_mir_lift_rules` classification,
     shared-theory migration delta (`+2,972` net LOC), and post-integration
     module LOC (`PureMirExec.lean` `20,564` LOC, `85 s -> 35.1 s`).
   - `verify_probes.py`: automated verifier checking 80-column formatting, Lean
-    `v4.34.1` compilation, `#print axioms` on all 17 theorems, zero step/fuel
+    `v4.34.1` compilation, `#print axioms` on all 18 theorems, zero step/fuel
     numerals in `countUp_wpConverges_all_n`, report prose width /
     theorem-declaration line-range citations / public-hygiene checks, and
     dataset cross-checks.
