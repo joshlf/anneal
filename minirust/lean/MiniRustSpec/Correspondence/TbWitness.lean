@@ -11,7 +11,7 @@ those terms.
 import MiniRustSpec.Correspondence.RefWitness
 
 /-!
-# Tree Borrows, dereference-copy/move correspondence, `UnsafeCell`, `Box`, and spec-edge witnesses (MR-3.2 B4)
+# Tree Borrows, dereference-copy/move correspondence, `UnsafeCell`, `Box`, and spec-edge witnesses (MR-3.2 B4–A4)
 
 Concrete MIR bodies and ground-truth execution witnesses extending `RefWitness`
 across Anneal's MIR semantics, MiniRust `Machine<BasicMemory<x86_64>>` (`Mach`),
@@ -72,6 +72,18 @@ and MiniRust `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`):
    `MachTB` — whereas any non-ZST reference (`&u32`, `settings.inside.length > 0`)
    cleanly reports `Stop.ub "Value::Ptr: non-dereferenceable safe pointer"` on
    both `Mach` and `MachTB` (matching `TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`).
+7. **End-to-end `MachTB.wfLive` preservation across `stepsTB`, self-deref vs. parent-deref
+   copy aliasing, cyclic CFG loop reference correspondence, and `std::cmp::Ordering` / `()`
+   pointees (`liftMachToTB_wfLive`, `startMachineTB_stepsTB_wfLive`, `selfDerefCopyOk`,
+   `parentDerefCopyDisablesChild`, `loopDerefCopyCountdown`, `stdOrderingMutRefCmp`,
+   `unitTupleMutRefRoundTrip`)**:
+   connects `liftMachToTB` and `startMachineTB` directly to `stepsTB_wfLive` for
+   arbitrary `n`-step `MachTB` runs; proves in-fragment correspondence for
+   self-aliasing `(*r) = copy (*r)` vs. child-disabling parent deref copy
+   `(*r) = copy (*s)`; proves full correspondence across a 4-block cyclic CFG loop
+   with disjoint `&mut` borrows, `move`-operand deref writes, loop-carried
+   `.disabled` reborrow reset, and exit deref copy; and verifies 3-way agreement
+   for `&mut std::cmp::Ordering` and zero-sized `&mut ()` / `&()`.
 -/
 
 namespace MiniRustSpec.Correspondence.TbWitness
@@ -1063,5 +1075,508 @@ theorem nonZstWrappingSubReborrow_bm_and_tb_ub :
      | .ok _ => none) =
       some (.ub "Value::Ptr: non-dereferenceable safe pointer") :=
   ⟨by decide +kernel, by decide +kernel⟩
+
+/-! ## 7. End-to-end `MachTB.wfLive` preservation, self-deref vs. parent-deref copy, loop correspondence, and `std::cmp::Ordering` / `()` pointees (MR-3.2 A4) -/
+
+/-- Every allocation produced by `liftAllocTB` has a well-formed unprotected
+`.Unique` root node whose `permissions` list matches `(Allocation.size _).bytes`. -/
+theorem liftAllocTB_wf (a : Gen.Allocation) :
+    Node.wf (Allocation.size (liftAllocTB a)).bytes (liftAllocTB a).extra.root := by
+  refine ⟨by simp [liftAllocTB, Allocation.size], fun p hp => ?_, trivial⟩
+  rw [List.eq_of_mem_replicate hp]
+  rfl
+
+/-- `liftMachToTB` always produces a globally well-formed `TreeBorrowsMemory`
+(`TreeBorrowsMemory.wf`). -/
+theorem liftMachToTB_wf (m : Mach) :
+    TreeBorrowsMemory.wf (liftMachToTB m).mem.memory := by
+  intro alloc hm
+  obtain ⟨a, _, rfl⟩ := List.mem_map.mp hm
+  exact liftAllocTB_wf a
+
+/-- `liftMachToTB` always satisfies the machine-level live-allocation borrow-tree
+invariant `MachTB.wfLive`. -/
+theorem liftMachToTB_wfLive (m : Mach) :
+    MachTB.wfLive (liftMachToTB m) :=
+  fun alloc hm _ => liftMachToTB_wf m alloc hm
+
+/-- Any `n`-step `MachTB` execution (`Interp.stepsTB`) starting from `liftMachToTB m`
+preserves `MachTB.wfLive` across all statement, intrinsic, retag, deallocation,
+and call-return protector-release transitions. -/
+theorem liftMachToTB_stepsTB_wfLive {n : Nat} {m : Mach} {m' : MachTB}
+    (h : Interp.stepsTB n (liftMachToTB m) = .ok m') :
+    MachTB.wfLive m' :=
+  stepsTB_wfLive (liftMachToTB_wfLive m) h
+
+/-- Any `n`-step `MachTB` execution starting from `startMachineTB body args`
+preserves `MachTB.wfLive`. -/
+theorem startMachineTB_stepsTB_wfLive {body : CapturedMir} {args : List Value}
+    {m0 m' : MachTB} {n : Nat}
+    (hstart : startMachineTB body args = some m0)
+    (hsteps : Interp.stepsTB n m0 = .ok m') :
+    MachTB.wfLive m' := by
+  unfold startMachineTB at hstart
+  rcases hsm : startMachine body args with _ | m
+  · simp [hsm] at hstart
+  · simp [hsm] at hstart
+    subst hstart
+    exact liftMachToTB_stepsTB_wfLive hsteps
+
+/-- UB message after `n` `MachTB` steps under `ctx0_2`, if step `n` raises UB. -/
+def ubAfterTB2 (body : CapturedMir) (args : List Value) (n : Nat) : Option String :=
+  (startMachineTB2 body args).bind fun m =>
+    match Interp.stepsTB n m with
+    | .error (.ub msg) => some msg
+    | _ => none
+
+/-- Self-aliasing pointer-to-pointer dereference copy `(*r) = copy (*r)` on
+`r: &mut u32` (`_2 = &mut _1; (*_2) = copy (*_2); _3 = &(*_2); _0 = copy (*_3)`):
+lies in `inFragment` (`stepDerefWrite` preserves `_2` in its own peer set `[2]`),
+performs only local `Read`/`Write` accesses on node `[0]` in `MachTB` (keeping
+`Unprot .Unique` active), and returns `42` across Anneal, `Mach`, and `MachTB`. -/
+def selfDerefCopyOk : CapturedMir :=
+  ptrBody "witness::self_deref_copy_ok"
+    [u32Decl, u32Decl, refMutU32Decl, refSharedU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .assign (derefPlace 2) (.use (.copy (derefPlace 2))),
+     .assign (local_ 3) (.ref .shared (derefPlace 2)),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem selfDerefCopyOk_inFragment : inFragment selfDerefCopyOk = true := by decide
+
+def selfDerefCopyOkFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, refTy .not u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32))
+        (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32))),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (refPtrType .not u32)),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 3))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem selfDerefCopyOk_translate : translateFn selfDerefCopyOk = some selfDerefCopyOkFn := rfl
+
+def selfDerefCopyOkS0 : MachineState := initMachineState selfDerefCopyOk [.scalar ⟨42, 4⟩]
+def selfDerefCopyOkMInit : Mach :=
+  machine selfDerefCopyOk selfDerefCopyOkFn selfDerefCopyOkS0.frame.locals selfDerefCopyOkFn.start
+
+theorem selfDerefCopyOk_anneal_ret :
+    ∃ mem, ReachesRet (mirTree selfDerefCopyOk selfDerefCopyOkS0) []
+      (.normal (.scalar ⟨42, 4⟩, mem)) :=
+  ⟨_, runA_sound selfDerefCopyOk 25 _ _ _ rfl⟩
+
+theorem selfDerefCopyOk_noUB :
+    MirNoUBTree (mirCallTree selfDerefCopyOk [.scalar ⟨42, 4⟩]) :=
+  runA_noUB selfDerefCopyOk 25 _ _ _ rfl
+
+theorem selfDerefCopyOk_ctxOk : CtxOk selfDerefCopyOk ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : selfDerefCopyOk.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [selfDerefCopyOk, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [selfDerefCopyOk, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : selfDerefCopyOk.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [selfDerefCopyOk, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem selfDerefCopyOk_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n selfDerefCopyOkMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨mem, hretA⟩ := selfDerefCopyOk_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret selfDerefCopyOk_inFragment selfDerefCopyOk_translate ctx0 selfDerefCopyOk_ctxOk
+      [.scalar ⟨42, 4⟩] (by decide) selfDerefCopyOkMInit rfl rfl rfl hretA
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [selfDerefCopyOk, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem selfDerefCopyOk_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n selfDerefCopyOkMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k selfDerefCopyOkMInit = .ok mRet ∧
+      ReturnRel selfDerefCopyOk ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree selfDerefCopyOk [.scalar ⟨42, 4⟩]) tr (.normal (v, mem)) :=
+  mirCall_noUB selfDerefCopyOk_inFragment selfDerefCopyOk_translate ctx0 selfDerefCopyOk_ctxOk
+    [.scalar ⟨42, 4⟩] (by decide) selfDerefCopyOkMInit rfl rfl rfl selfDerefCopyOk_noUB herr
+
+theorem selfDerefCopyOk_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) selfDerefCopyOkMInit = .ok m' ∧
+      StateRelN selfDerefCopyOk selfDerefCopyOkFn ctx0 s' m' ∧
+      Reaches (mirCallTree selfDerefCopyOk [.scalar ⟨42, 4⟩]) tr
+        (mirTree selfDerefCopyOk s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k selfDerefCopyOkMInit = .ok mRet ∧
+      ReturnRel selfDerefCopyOk ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree selfDerefCopyOk [.scalar ⟨42, 4⟩]) tr (.normal (v, mem))) :=
+  mirCall_progress_N selfDerefCopyOk_inFragment selfDerefCopyOk_translate ctx0
+    selfDerefCopyOk_ctxOk [.scalar ⟨42, 4⟩] (by decide) selfDerefCopyOkMInit rfl rfl rfl
+    selfDerefCopyOk_noUB n
+
+theorem selfDerefCopyOk_minirust_direct :
+    retAfter selfDerefCopyOk [.scalar ⟨42, 4⟩] 8 =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) := by
+  decide +kernel
+
+theorem selfDerefCopyOk_tb_direct :
+    retAfterTB selfDerefCopyOk [.scalar ⟨42, 4⟩] 8 = tbRetU32 42 := by
+  decide +kernel
+
+/-- Contrast with a pointer-to-pointer dereference copy through a parent `&mut u32`
+(`_3 = &mut _1; _4 = &mut _2; _5 = &mut (*_3); (*_3) = copy (*_4); _0 = copy (*_5)`):
+`ptrAliasingOk` marks child `_5` `.disabled` upon `(*_3) = copy (*_4)` (so
+`inFragment = false`), Anneal and `MachTB` both raise UB when reading `*_5`
+(`"Tree Borrows: local read of Disabled reference"`), and flat `BasicMemory`
+(`Mach`) returns `99`. -/
+def parentDerefCopyDisablesChild : CapturedMir where
+  defPath := "witness::parent_deref_copy_disables_child"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, u32Decl, refMutU32Decl, refMutU32Decl, refMutU32Decl]
+  basicBlocks := [{
+    statements := ([
+      .storageLive 3, .storageLive 4, .storageLive 5,
+      .assign (local_ 3) (.ref (.mut false) (local_ 1)),
+      .assign (local_ 4) (.ref (.mut false) (local_ 2)),
+      .assign (local_ 5) (.ref (.mut false) (derefPlace 3)),
+      .assign (derefPlace 3) (.use (.copy (derefPlace 4))),
+      .assign (local_ 0) (.use (.copy (derefPlace 5)))
+    ] : List StatementKind).map mkStmt
+    terminator := mkTerm .return_
+    isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem parentDerefCopyDisablesChild_notInFragment :
+    inFragment parentDerefCopyDisablesChild = false := by decide
+
+theorem parentDerefCopyDisablesChild_translate :
+    (translateFn parentDerefCopyDisablesChild).isSome = true := by decide +kernel
+
+theorem parentDerefCopyDisablesChild_anneal_ub :
+    ∃ tr u, Reaches (mirCallTree parentDerefCopyDisablesChild
+      [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩]) tr u ∧ FaultNow u :=
+  faultsA_sound parentDerefCopyDisablesChild 25 _ (by decide)
+
+theorem parentDerefCopyDisablesChild_minirust_direct :
+    retAfter2 parentDerefCopyDisablesChild [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩] 10 =
+      some (some { retAlloc with data := scalarBytes u32 99 }, [1]) := by
+  decide +kernel
+
+theorem parentDerefCopyDisablesChild_tb_direct :
+    ubAfterTB2 parentDerefCopyDisablesChild [.scalar ⟨10, 4⟩, .scalar ⟨99, 4⟩] 9 =
+      some "Tree Borrows: local read of Disabled reference" := by
+  decide +kernel
+
+/-- Four-block cyclic CFG loop in `inFragment` (`bb0 -> bb1 <-> bb2, bb1 -> bb3`)
+combining disjoint `&mut u32` borrows (`_3 = &mut _1`, `_4 = &mut _2`),
+reborrowed `&u32` loop-header reads (`_5 = &(*_3)` — invalidated to `.disabled`
+at the end of `bb2` by `(*_3) = move _7` and re-initialized cleanly at the top
+of `bb1`), `CopyForDeref(*_4)`, `move`-operand dereference writes, and an exit
+pointer-to-pointer dereference copy `(*_3) = copy (*_5)` followed by
+`_0 = move (*_3)`. On `(3, 10)`, computes `10 + 3 + 2 + 1 = 16`. -/
+def loopDerefCopyCountdown : CapturedMir where
+  defPath := "witness::loop_deref_copy_countdown"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, u32Decl, refMutU32Decl, refMutU32Decl,
+    refSharedU32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := ([
+        .storageLive 3, .storageLive 4, .storageLive 5, .storageLive 6, .storageLive 7,
+        .assign (local_ 3) (.ref (.mut false) (local_ 1)),
+        .assign (local_ 4) (.ref (.mut false) (local_ 2))
+      ] : List StatementKind).map mkStmt
+      terminator := mkTerm (.goto 1)
+      isCleanup := false },
+    { statements := ([
+        .assign (local_ 5) (.ref .shared (derefPlace 3)),
+        .assign (local_ 6) (.use (.copy (derefPlace 5)))
+      ] : List StatementKind).map mkStmt
+      terminator := mkTerm (.switchInt (.copy (local_ 6)) { branches := [(0, 3)], otherwise := 2 })
+      isCleanup := false },
+    { statements := ([
+        .assign (local_ 7) (.copyForDeref (derefPlace 4)),
+        .assign (local_ 7) (.binaryOp .add (.move (local_ 7)) (.copy (local_ 6))),
+        .assign (derefPlace 4) (.use (.move (local_ 7))),
+        .assign (local_ 7) (.binaryOp .sub (.copy (local_ 6)) (constU32 1)),
+        .assign (derefPlace 3) (.use (.move (local_ 7)))
+      ] : List StatementKind).map mkStmt
+      terminator := mkTerm (.goto 1)
+      isCleanup := false },
+    { statements := ([
+        .assign (local_ 5) (.ref .shared (derefPlace 4)),
+        .assign (derefPlace 3) (.use (.copy (derefPlace 5))),
+        .assign (local_ 0) (.use (.move (derefPlace 3)))
+      ] : List StatementKind).map mkStmt
+      terminator := mkTerm .return_
+      isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem loopDerefCopyCountdown_inFragment :
+    inFragment loopDerefCopyCountdown = true := by decide
+
+def loopDerefCopyCountdownFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Int u32),
+    (localName 3, refTy .mut u32), (localName 4, refTy .mut u32),
+    (localName 5, refTy .not u32), (localName 6, .Int u32), (localName 7, .Int u32)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 3), .StorageLive (localName 4), .StorageLive (localName 5),
+      .StorageLive (localName 6), .StorageLive (localName 7),
+      .Assign (.Local (localName 3)) (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Assign (.Local (localName 4)) (.AddrOf (.Local (localName 2)) (refPtrType .mut u32))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 5))
+        (.AddrOf (.Deref (.Load (.Local (localName 3))) (.Int u32)) (refPtrType .not u32)),
+      .Assign (.Local (localName 6)) (.Load (.Deref (.Load (.Local (localName 5))) (.Int u32)))],
+      .Switch (.Load (.Local (localName 6))) ⟨[(0, bbName 3)]⟩ (bbName 2), .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 7)) (.Load (.Deref (.Load (.Local (localName 4))) (.Int u32))),
+      .Assign (.Local (localName 7))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 7))) (.Load (.Local (localName 6)))),
+      .Assign (.Deref (.Load (.Local (localName 4))) (.Int u32)) (.Load (.Local (localName 7))),
+      .Assign (.Local (localName 7))
+        (.BinOp (.Int .Sub) (.Load (.Local (localName 6))) (.Constant (.Int 1) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 3))) (.Int u32)) (.Load (.Local (localName 7)))],
+      .Goto (bbName 1), .Regular⟩),
+    (bbName 3, ⟨[
+      .Assign (.Local (localName 5))
+        (.AddrOf (.Deref (.Load (.Local (localName 4))) (.Int u32)) (refPtrType .not u32)),
+      .Assign (.Deref (.Load (.Local (localName 3))) (.Int u32))
+        (.Load (.Deref (.Load (.Local (localName 5))) (.Int u32))),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 3))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 4, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 4
+  implicit_writes := true
+
+theorem loopDerefCopyCountdown_translate :
+    translateFn loopDerefCopyCountdown = some loopDerefCopyCountdownFn := rfl
+
+def loopDerefCopyCountdownArgs : List Value := [.scalar ⟨3, 4⟩, .scalar ⟨10, 4⟩]
+def loopDerefCopyCountdownS0 : MachineState :=
+  initMachineState loopDerefCopyCountdown loopDerefCopyCountdownArgs
+def loopDerefCopyCountdownMInit : Mach :=
+  machine2 loopDerefCopyCountdown loopDerefCopyCountdownFn
+    loopDerefCopyCountdownS0.frame.locals loopDerefCopyCountdownFn.start
+
+def loopDerefCopyCountdownTrace : List (Event MirEffect) :=
+  [3, 2, 1, 0].map (fun b => ⟨.inr (.inl (.emit (.event b))), PUnit.unit⟩)
+
+theorem loopDerefCopyCountdown_anneal_ret :
+    ∃ mem, ReachesRet (mirTree loopDerefCopyCountdown loopDerefCopyCountdownS0)
+      loopDerefCopyCountdownTrace (.normal (.scalar ⟨16, 4⟩, mem)) :=
+  ⟨_, runA_sound loopDerefCopyCountdown 80 _ _ _ rfl⟩
+
+theorem loopDerefCopyCountdown_noUB :
+    MirNoUBTree (mirCallTree loopDerefCopyCountdown loopDerefCopyCountdownArgs) :=
+  runA_noUB loopDerefCopyCountdown 80 _ _ _ rfl
+
+theorem loopDerefCopyCountdown_ctxOk : CtxOk loopDerefCopyCountdown ctx0_2 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi2 : i ≤ 2 := hi
+    have hlay : loopDerefCopyCountdown.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi2 with
+    | 0, hd, _ => simp [loopDerefCopyCountdown] at hd; subst hd; decide
+    | 1, hd, _ => simp [loopDerefCopyCountdown] at hd; subst hd; decide
+    | 2, hd, _ => simp [loopDerefCopyCountdown] at hd; subst hd; decide
+    | _ + 3, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : loopDerefCopyCountdown.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [loopDerefCopyCountdown] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem loopDerefCopyCountdown_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n loopDerefCopyCountdownMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 16 } ∧
+      m'.threads = [thread1 ctx0_2 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨mem, hretA⟩ := loopDerefCopyCountdown_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret loopDerefCopyCountdown_inFragment loopDerefCopyCountdown_translate ctx0_2
+      loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide)
+      loopDerefCopyCountdownMInit rfl rfl rfl hretA
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [loopDerefCopyCountdown] at hd; subst hd
+  simp [retPtr, ctx0_2, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0_2, ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem loopDerefCopyCountdown_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n loopDerefCopyCountdownMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k loopDerefCopyCountdownMInit = .ok mRet ∧
+      ReturnRel loopDerefCopyCountdown ctx0_2 s' v mRet ∧
+      ReachesRet (mirCallTree loopDerefCopyCountdown loopDerefCopyCountdownArgs) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB loopDerefCopyCountdown_inFragment loopDerefCopyCountdown_translate ctx0_2
+    loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide)
+    loopDerefCopyCountdownMInit rfl rfl rfl loopDerefCopyCountdown_noUB herr
+
+theorem loopDerefCopyCountdown_progress (n : Nat) :
+    (∃ s' m' tr, Interp.steps (1 + n) loopDerefCopyCountdownMInit = .ok m' ∧
+      StateRelN loopDerefCopyCountdown loopDerefCopyCountdownFn ctx0_2 s' m' ∧
+      Reaches (mirCallTree loopDerefCopyCountdown loopDerefCopyCountdownArgs) tr
+        (mirTree loopDerefCopyCountdown s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ 1 + n ∧ Interp.steps k loopDerefCopyCountdownMInit = .ok mRet ∧
+      ReturnRel loopDerefCopyCountdown ctx0_2 s' v mRet ∧
+      ReachesRet (mirCallTree loopDerefCopyCountdown loopDerefCopyCountdownArgs) tr
+        (.normal (v, mem))) :=
+  mirCall_progress_N loopDerefCopyCountdown_inFragment loopDerefCopyCountdown_translate ctx0_2
+    loopDerefCopyCountdown_ctxOk loopDerefCopyCountdownArgs (by decide)
+    loopDerefCopyCountdownMInit rfl rfl rfl loopDerefCopyCountdown_noUB n
+
+theorem loopDerefCopyCountdown_minirust_direct :
+    retAfter2 loopDerefCopyCountdown loopDerefCopyCountdownArgs 43 =
+      some (some { retAlloc with data := scalarBytes u32 16 }, [1]) := by
+  decide +kernel
+
+theorem loopDerefCopyCountdown_tb_direct :
+    retAfterTB2 loopDerefCopyCountdown loopDerefCopyCountdownArgs 43 = tbRetU32 16 := by
+  decide +kernel
+
+def stdOrderingTy : Ty := { kind := .adt "std::cmp::Ordering" [], layoutIdx := 0 }
+def refMutStdOrderingTy : Ty := { kind := .ref .mut (.adt "std::cmp::Ordering" []), layoutIdx := 0 }
+def refSharedStdOrderingTy : Ty := { kind := .ref .not (.adt "std::cmp::Ordering" []), layoutIdx := 0 }
+def stdOrderingDecl : LocalDecl := { mutability := .mut, ty := stdOrderingTy, debugName := none }
+def refMutStdOrderingDecl : LocalDecl :=
+  { mutability := .mut, ty := refMutStdOrderingTy, debugName := none }
+def refSharedStdOrderingDecl : LocalDecl :=
+  { mutability := .mut, ty := refSharedStdOrderingTy, debugName := none }
+
+def stdOrderingLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [i8Layout] }
+
+/-- `&mut std::cmp::Ordering` and `&std::cmp::Ordering` (using the `"std::cmp::Ordering"`
+`defPath` alias alongside `"core::cmp::Ordering"` in `pointeeInfoOfRigidTy` and
+`translatePointeeRigidTy`): writes `10.cmp(&x)` through `r: &mut std::cmp::Ordering`,
+reborrows `s: &std::cmp::Ordering = &*r`, reads `*s`, transmutes to `u8`, and casts
+to `u32` (`5 -> Greater = 1`, `20 -> Less = 255`) across Anneal, `Mach`, and `MachTB`. -/
+def stdOrderingMutRefCmp : CapturedMir :=
+  { ptrBody "witness::std_ordering_mut_ref_cmp"
+      [u32Decl, u32Decl, stdOrderingDecl, refMutStdOrderingDecl,
+       stdOrderingDecl, refSharedStdOrderingDecl, u8Decl]
+      [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5, .storageLive 6,
+       .assign (local_ 2) (.binaryOp .cmp (.copy (local_ 1)) (constU32 10)),
+       .assign (local_ 3) (.ref (.mut false) (local_ 2)),
+       .assign (local_ 4) (.binaryOp .cmp (constU32 10) (.copy (local_ 1))),
+       .assign (derefPlace 3) (.use (.move (local_ 4))),
+       .assign (local_ 5) (.ref .shared (derefPlace 3)),
+       .assign (local_ 4) (.use (.copy (derefPlace 5))),
+       .assign (local_ 6) (.cast .transmute (.move (local_ 4)) u8Decl.ty),
+       .assign (local_ 0) (.cast .intToInt (.move (local_ 6)) u32Ty)] with
+    layouts := stdOrderingLayouts }
+
+theorem stdOrderingMutRefCmp_translate :
+    (translateFn stdOrderingMutRefCmp).isSome = true := by decide +kernel
+
+set_option maxRecDepth 16384 in
+theorem stdOrderingMutRefCmp_five_three_way :
+    (∃ mem, ReachesRet (mirTree stdOrderingMutRefCmp
+      (initMachineState stdOrderingMutRefCmp [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨1, 4⟩, mem))) ∧
+    retAfter stdOrderingMutRefCmp [.scalar ⟨5, 4⟩] 15 =
+      some (some { retAlloc with data := scalarBytes u32 1 }, [1]) ∧
+    retAfterTB stdOrderingMutRefCmp [.scalar ⟨5, 4⟩] 15 = tbRetU32 1 :=
+  ⟨⟨_, runA_sound stdOrderingMutRefCmp 30 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+
+set_option maxRecDepth 16384 in
+theorem stdOrderingMutRefCmp_twenty_three_way :
+    (∃ mem, ReachesRet (mirTree stdOrderingMutRefCmp
+      (initMachineState stdOrderingMutRefCmp [.scalar ⟨20, 4⟩])) []
+      (.normal (.scalar ⟨255, 4⟩, mem))) ∧
+    retAfter stdOrderingMutRefCmp [.scalar ⟨20, 4⟩] 15 =
+      some (some { retAlloc with data := scalarBytes u32 255 }, [1]) ∧
+    retAfterTB stdOrderingMutRefCmp [.scalar ⟨20, 4⟩] 15 = tbRetU32 255 :=
+  ⟨⟨_, runA_sound stdOrderingMutRefCmp 30 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+
+def unitTupleLayout : TypeLayout :=
+  { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+    fields := .arbitrary [] [],
+    variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+
+def unitTupleLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true, entries := [unitTupleLayout] }
+
+def unitTupleTy : Ty := { kind := .tuple [], layoutIdx := 0 }
+def refMutUnitTupleTy : Ty := { kind := .ref .mut (.tuple []), layoutIdx := 0 }
+def refSharedUnitTupleTy : Ty := { kind := .ref .not (.tuple []), layoutIdx := 0 }
+def unitTupleDecl : LocalDecl := { mutability := .mut, ty := unitTupleTy, debugName := none }
+def refMutUnitTupleDecl : LocalDecl :=
+  { mutability := .mut, ty := refMutUnitTupleTy, debugName := none }
+def refSharedUnitTupleDecl : LocalDecl :=
+  { mutability := .mut, ty := refSharedUnitTupleTy, debugName := none }
+
+/-- Zero-sized `&mut ()` and `&()` borrow, dereference read, dereference write,
+and shared reborrow (`_2 = (); _3 = &mut _2; _4 = copy (*_3); (*_3) = move _4;
+_5 = &(*_3); _6 = copy (*_5); _0 = copy _1`) at valid offset `0` of stack local
+`_2`: translates cleanly via `pointeeInfoOfRigidTy (.tuple [])` and
+`translatePointeeRigidTy (.tuple [])` and returns `42` in Anneal, `Mach`, and
+`MachTB` without triggering the negative-offset ZST `specPanic` of Section 6. -/
+def unitTupleMutRefRoundTrip : CapturedMir :=
+  { ptrBody "witness::unit_tuple_mut_ref_round_trip"
+      [u32Decl, u32Decl, unitTupleDecl, refMutUnitTupleDecl,
+       unitTupleDecl, refSharedUnitTupleDecl, unitTupleDecl]
+      [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5, .storageLive 6,
+       .assign (local_ 2) (.aggregate .tuple []),
+       .assign (local_ 3) (.ref (.mut false) (local_ 2)),
+       .assign (local_ 4) (.use (.copy (derefPlace 3))),
+       .assign (derefPlace 3) (.use (.move (local_ 4))),
+       .assign (local_ 5) (.ref .shared (derefPlace 3)),
+       .assign (local_ 6) (.use (.copy (derefPlace 5))),
+       .assign (local_ 0) (.use (.copy (local_ 1)))] with
+    layouts := unitTupleLayouts }
+
+theorem unitTupleMutRefRoundTrip_translate :
+    (translateFn unitTupleMutRefRoundTrip).isSome = true := by decide +kernel
+
+theorem unitTupleMutRefRoundTrip_three_way :
+    (∃ mem, ReachesRet (mirTree unitTupleMutRefRoundTrip
+      (initMachineState unitTupleMutRefRoundTrip [.scalar ⟨42, 4⟩])) []
+      (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    retAfter unitTupleMutRefRoundTrip [.scalar ⟨42, 4⟩] 14 =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    retAfterTB unitTupleMutRefRoundTrip [.scalar ⟨42, 4⟩] 14 = tbRetU32 42 :=
+  ⟨⟨_, runA_sound unitTupleMutRefRoundTrip 30 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
 
 end MiniRustSpec.Correspondence.TbWitness

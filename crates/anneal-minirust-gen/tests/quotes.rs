@@ -2211,6 +2211,33 @@ fn mr_3_2_reference_quotations_are_pinned_and_tamper_checked() {
         );
     }
 
+    // Per-definition check on `def checkPtrM` (a flat `interp_quotes` search
+    // alone would let monomorphic `checkPtr`'s doc comment mask a copy-pasted
+    // `fn check_ptr_metadata` quotation on polymorphic `checkPtrM`).
+    let before_check_ptr_m = interp_text
+        .split_once("\ndef checkPtrM ")
+        .expect("Interp.lean missing `def checkPtrM`")
+        .0;
+    let check_ptr_m_doc = &before_check_ptr_m[before_check_ptr_m
+        .rfind("/--")
+        .expect("`def checkPtrM` missing doc comment")..];
+    let check_ptr_m_quotes = extract_quotes(check_ptr_m_doc, &valid_paths).unwrap();
+    assert!(
+        check_ptr_m_quotes.iter().any(|q| {
+            q.cited_file == "spec/lang/representation.md"
+                && squash(&q.text).contains(&squash(
+                    "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result",
+                ))
+        }),
+        "`def checkPtrM` doc comment must quote `fn check_ptr(...)` from `spec/lang/representation.md`"
+    );
+    assert!(
+        !check_ptr_m_quotes
+            .iter()
+            .any(|q| squash(&q.text).contains(&squash("fn check_ptr_metadata("))),
+        "`def checkPtrM` doc comment must not quote `fn check_ptr_metadata`"
+    );
+
     let translate_text =
         std::fs::read_to_string(lean_root.join("MiniRustSpec/Correspondence/Translate.lean"))
             .unwrap();

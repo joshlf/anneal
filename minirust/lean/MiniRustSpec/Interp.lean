@@ -6086,16 +6086,33 @@ def checkPtrMetadataM {Provenance : Type} (ptrMeta : Option (PointerMeta Provena
   | _, _ => ub "Value::Ptr: invalid metadata"
 
 /-- Polymorphic `Machine::check_ptr` (`spec/lang/representation.md`); see `checkPtr`:
-> "fn check_ptr_metadata(&self, meta: Option<PointerMeta<M::Provenance>>, kind: PointerMetaKind) -> Result {
->     match (meta, kind) {
->         (None, PointerMetaKind::None) => {}
->         (Some(PointerMeta::ElementCount(num)), PointerMetaKind::ElementCount) =>
->             self.check_value(Value::Int(num), Type::Int(IntType::usize_ty::<M::T>()))?,
->         (Some(PointerMeta::VTablePointer(ptr)), PointerMetaKind::VTablePointer(trait_name)) => {
->             self.check_ptr(ptr.widen(None), PtrType::VTablePtr(trait_name))?;
->         }
->         _ => throw_ub!(\"Value::Ptr: invalid metadata\"),
->     };
+> "fn check_ptr(&self, ptr: Pointer<M::Provenance>, ptr_ty: PtrType) -> Result {
+>     ensure_else_ub(ptr.thin_pointer.addr.in_bounds(Unsigned, M::T::PTR_SIZE), \"Value::Ptr: pointer out-of-bounds\")?;
+>
+>     // This has to be checked first, to ensure we can e.g. compute size/align below.
+>     self.check_ptr_metadata(ptr.metadata, ptr_ty.meta_kind())?;
+>
+>     // Safe pointer, i.e. references, boxes
+>     if let Some(pointee) = ptr_ty.safe_pointee() {
+>         let size = self.compute_size(pointee.layout, ptr.metadata);
+>         let align = self.compute_align(pointee.layout, ptr.metadata);
+>         // The total size must be at most `isize::MAX`.
+>         ensure_else_ub(size.bytes().in_bounds(Signed, M::T::PTR_SIZE), \"Value::Ptr: total size exeeds isize::MAX\")?;
+>
+>         // Safe pointers need to be non-null, aligned, dereferenceable, and not point to an uninhabited type.
+>         // (Think: uninhabited types have impossible alignment.)
+>         ensure_else_ub(ptr.thin_pointer.addr != 0, \"Value::Ptr: null safe pointer\")?;
+>         ensure_else_ub(align.is_aligned(ptr.thin_pointer.addr), \"Value::Ptr: unaligned safe pointer\")?;
+>         ensure_else_ub(pointee.inhabited, \"Value::Ptr: safe pointer to uninhabited type\")?;
+>         ensure_else_ub(
+>             self.mem.dereferenceable(ptr.thin_pointer, size).is_ok(),
+>             \"Value::Ptr: non-dereferenceable safe pointer\"
+>         )?;
+>
+>         // However, we do not care about the data stored wherever this pointer points to.
+>     } else if let PtrType::VTablePtr(trait_name) = ptr_ty {
+>         ..
+>     }
 >
 >     Ok(())
 > }" -/

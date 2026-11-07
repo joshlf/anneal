@@ -48,9 +48,10 @@ The translation is defined only on the fragment checked by `inFragment`:
     of `dst`'s integer type `it` or of any integer type `rhsIt` for the shift
     operators `Shl, Shr, ShlUnchecked, ShrUnchecked`),
     `Cast(IntToInt, a, targetTy)` (from any integer type `srcIt` or `bool`),
-    `Len(_j)` of an array local `_j` (into a `usize` destination), or on root
-    destinations `_i = copy/move (*_p)` / `_i = CopyForDeref(*_p)` reading
-    through a thin raw pointer or reference `_p`;
+    `Len(_j)` of an array local `_j` (into a `usize` destination), or dereference
+    reads `copy/move (*_r)` / `CopyForDeref(*_r)` through a thin raw pointer or
+    reference `_r` into either a root destination `_i` or a mutable pointer /
+    reference dereference `(*_w)` (`ptrDerefReadOk`);
   - thin raw pointer and reference assignments `_i = rv` to a pointer or
     reference local `_i`, where `rv` is `Use(copy/move _p)`, `CopyForDeref(_p)`,
     direct borrows (`&raw const q`, `&raw mut q`, `&q`, `&mut q`) of a parameter
@@ -636,7 +637,7 @@ def pointeeInfoOfRigidTyAux : Nat → MirAst.RigidTy → Option Gen.PointeeInfo
       | .bool =>
         some { layout := .Sized ⟨1⟩ ⟨1⟩, inhabited := true,
                unsafe_cells := .Sized [], freeze := true, unpin := true }
-      | .adt "core::cmp::Ordering" [] =>
+      | .adt "core::cmp::Ordering" [] | .adt "std::cmp::Ordering" [] =>
         some { layout := .Sized ⟨1⟩ ⟨1⟩, inhabited := true,
                unsafe_cells := .Sized [], freeze := true, unpin := true }
       | .adt defPath (inner :: _) =>
@@ -655,6 +656,9 @@ def pointeeInfoOfRigidTyAux : Nat → MirAst.RigidTy → Option Gen.PointeeInfo
                    unsafe_cells := .Sized [], freeze := true, unpin := true }
           | _ => none
         else none
+      | .tuple [] =>
+        some { layout := .Sized ⟨0⟩ ⟨1⟩, inhabited := true,
+               unsafe_cells := .Sized [], freeze := true, unpin := true }
       | .tuple [elem, .bool] =>
         (intTyBytes elem).map fun (_, n) =>
           { layout := .Sized ⟨n + n⟩ ⟨n⟩, inhabited := true,
@@ -862,11 +866,11 @@ def intFromBits (bits : Nat) (it : Gen.IntType) : Int :=
     if bits < 2 ^ (8 * it.size.bytes - 1) then bits else (bits : Int) - 2 ^ (8 * it.size.bytes)
 
 /-- Translation of a `RigidTy` pointee without needing a layout-table entry:
-`bool`, integers, `core::cmp::Ordering`, `UnsafeCell<T>` (translated as a
-single-field `#[repr(transparent)]` tuple struct `[(0, inner)]`), `Box<T>`,
-`(Int, bool)` 2-tuples, equal-width integer 2-tuples `(T0, T1)`, homogeneous 1D
-integer arrays `[Int; N]`, nested raw pointers `*const U` / `*mut U`, and nested
-references `&U` / `&mut U`. -/
+`bool`, integers, `core::cmp::Ordering` / `std::cmp::Ordering`, `UnsafeCell<T>`
+(translated as a single-field `#[repr(transparent)]` tuple struct `[(0, inner)]`),
+`Box<T>`, unit `()`, `(Int, bool)` 2-tuples, equal-width integer 2-tuples `(T0, T1)`,
+homogeneous 1D integer arrays `[Int; N]`, nested raw pointers `*const U` / `*mut U`,
+and nested references `&U` / `&mut U`. -/
 def translatePointeeRigidTyAux : Nat → MirAst.RigidTy → Option Gen.Type
   | 0, _ => none
   | fuel + 1, pointee =>
@@ -875,7 +879,7 @@ def translatePointeeRigidTyAux : Nat → MirAst.RigidTy → Option Gen.Type
     | none =>
       match pointee with
       | .bool => some .Bool
-      | .adt "core::cmp::Ordering" [] => some orderingTy
+      | .adt "core::cmp::Ordering" [] | .adt "std::cmp::Ordering" [] => some orderingTy
       | .adt defPath (inner :: _) =>
         if isUnsafeCellPath defPath then do
           let innerTy ← translatePointeeRigidTyAux fuel inner
@@ -887,6 +891,8 @@ def translatePointeeRigidTyAux : Nat → MirAst.RigidTy → Option Gen.Type
         else if isBoxPath defPath then
           (pointeeInfoOfRigidTy inner).map fun info => .Ptr (.Box info)
         else none
+      | .tuple [] =>
+        some (.Tuple [] { «end» := ⟨0⟩, align := ⟨1⟩, packed_align := none } none)
       | .tuple [elem, .bool] => (intTyBytes elem).map (fun (s, n) => intBoolTupleTy ⟨s, ⟨n⟩⟩)
       | .tuple [t0, t1] =>
         (eqAlignIntPairOf (.tuple [t0, t1])).map fun (it0, it1) =>
@@ -2439,13 +2445,15 @@ def isDeclPtrLocal (decls : List MirAst.LocalDecl) (i : Nat) : Bool :=
 
 /-- Fragment statements, type-checked against the destination's type:
 scalar-family root assignments (`bool`, `Ordering`, `(it, bool)`, and `Int`,
-including raw-pointer dereference reads `*_p`) check `copyRv rv`; thin raw
-pointer root assignments check `ptrRvalueOk` on `copyRv rv`; array root
-assignments check `arrayRvalueOk`; `TupleSpec` root and field assignments check
-`tupleRvalueOk` / `rvalueOk`; mutable raw pointer dereference writes `(*_p) = rv`
-check `rvalueOk`; array element assignments check `projOk` and `rvalueOk`;
+including raw-pointer and reference dereference reads `*_p`) check `copyRv rv`;
+thin raw pointer and reference root assignments check `ptrRvalueOk` on `copyRv rv`;
+array root assignments check `arrayRvalueOk`; `TupleSpec` root and field
+assignments check `tupleRvalueOk` / `rvalueOk`; mutable raw pointer and `&mut`
+reference dereference writes `(*_p) = rv` check `rvalueOk` on `copyRv rv` or
+pointer-to-pointer dereference reads `ptrDerefReadOk` on `copyRv rv`; array
+element assignments check `projOk` and `rvalueOk`;
 `PlaceMention` checks `mentionPlaceOk`; and `StorageLive`, `StorageDead`, and
-root `Deinit` take a declared scalar-family or thin raw pointer local
+root `Deinit` take a declared scalar-family or thin pointer/reference local
 (`spec/lang/well-formed.md`:
 > "Deinit { place } => {
 >      let ty = place.check_wf::<T>(func.locals, prog)?;

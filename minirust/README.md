@@ -1056,15 +1056,25 @@ These are deliberate and are the first things to lift:
     `Machine<M>` (`MemoryOps M`) in `Interp.lean` runs both `BasicMemory<x86_64>`
     (`stepM_bm_eq` / `stepsM_bm_eq` proving unconditional equality with `step` /
     `steps`) and the full 6-module `TreeBorrowsMemory<x86_64>` (`MachTB`,
-    `stepTB` / `stepsTB`): on `MachTB`, raw pointers (`directWrite`,
+    `stepTB` / `stepsTB`, with `stepTB_wfLive` / `stepsTB_wfLive` /
+    `startMachineTB_stepsTB_wfLive` proving machine-level live-allocation
+    borrow-tree well-formedness `MachTB.wfLive` across arbitrary multi-step
+    runs and `TreeBorrowsMemory.{allocate,load,store,deallocate}_no_specPanic`
+    proving freedom from `Stop.specPanic` whenever pointer `AllocId`s are valid):
+    on `MachTB`, raw pointers (`directWrite`,
     `frozenWrite`) keep root provenance (`safe_pointee = None`) and return `9`,
     read-only mutable reborrows from `&T` (`frozenRefMutReborrow`) stay in lazy
-    `Reserved` and return `5`, and scalar `Retag` (`retagScalarDiscrepancy`) is
-    a no-op, whereas writing through a mutable reborrow or transmute of `&T`
+    `Reserved` and return `5`, scalar `Retag` (`retagScalarDiscrepancy`) is a
+    no-op, self-aliasing `(*r) = copy (*r)` (`selfDerefCopyOk`) and cyclic loop
+    reference deref-copy/move chains (`loopDerefCopyCountdown`) satisfy full
+    in-fragment correspondence across Anneal, `Mach`, and `MachTB`, and
+    `&mut std::cmp::Ordering` (`stdOrderingMutRefCmp`) and zero-sized
+    `&mut ()` / `&()` (`unitTupleMutRefRoundTrip`) agree 3-way, whereas writing
+    through a mutable reborrow or transmute of `&T`
     (`frozenRefMutReborrowWrite`, `transmuteSharedRefToMutWriteDiscrepancy`),
     reading or reborrowing/retagging a foreign-invalidated reference
     (`twoPhaseForeignWriteDiscrepancy`, `disabledRefReborrow`,
-    `retagTrulyDisabledRefUb`), writing directly while a function-entry protector
+    `retagTrulyDisabledRefUb`, `parentDerefCopyDisablesChild`), writing directly while a function-entry protector
     is active (`retagFnEntryProtectorWrite`), writing directly to a local with an
     unprotected `Freeze` `Reserved` two-phase borrow
     (`twoPhaseDirectWriteTreeBorrowsGap`, where Anneal's `writerTag = .none`

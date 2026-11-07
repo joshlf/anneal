@@ -7577,4 +7577,1294 @@ theorem TreeBorrowsMemory.end_call_wfLive {tbm tbm' : Gen.TreeBorrowsMemory Gen.
       exact ih (TreeBorrowsMemory.release_protector_wfLive hacc hr) hf
   exact key extra.protectors hwf h
 
+/-- Every provenance carried by `ptr` refers to an existing allocation slot in `tbm`
+(`spec/mem/basic.md`: "since AllocId cannot be faked"). -/
+def TreeBorrowsMemory.validPtrAlloc (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
+    (ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance) : Prop :=
+  ∀ id p, ptr.provenance = some (id, p) →
+    0 ≤ id._0 ∧ id._0.toNat < tbm.mem.allocations.length
+
+private theorem check_ptr_tb_no_specPanic {tbm : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} (len : Size) (msg : String)
+    (hvalid : TreeBorrowsMemory.validPtrAlloc tbm ptr) :
+    BasicMemory.check_ptr tbm.mem ptr len ≠ .error (.specPanic msg) := by
+  intro h
+  unfold BasicMemory.check_ptr at h
+  split at h
+  · cases h
+  · cases hprov : ptr.provenance with
+    | none => simp only [hprov] at h; cases h
+    | some pair =>
+      rcases pair with ⟨id, provExtra⟩
+      simp only [hprov] at h
+      obtain ⟨hge, hlt⟩ := hvalid id provExtra hprov
+      obtain ⟨alloc, hget⟩ : ∃ a, tbm.mem.allocations[id._0.toNat]? = some a :=
+        ⟨_, List.getElem?_eq_getElem hlt⟩
+      have hidx : listIndex tbm.mem.allocations id._0 "self.allocations[id.0]" = .ok alloc := by
+        simp [listIndex, hge, hget, pure, Except.pure]
+      rw [hidx] at h
+      dsimp only [bind, Except.bind] at h
+      split at h
+      · cases h
+      · split at h <;> cases h
+
+private theorem check_ptr_tb_some_ok {tbm : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {len : Size}
+    {id : Gen.AllocId} {provExtra : Gen.Path} {offset : Size}
+    (hck : BasicMemory.check_ptr tbm.mem ptr len = .ok (some (id, provExtra, offset))) :
+    ∃ allocation,
+      0 ≤ id._0 ∧ id._0.toNat < tbm.mem.allocations.length ∧
+      tbm.mem.allocations[id._0.toNat]? = some allocation ∧
+      listIndex tbm.mem.allocations id._0 "self.allocations[id.0]" = .ok allocation ∧
+      allocation.live = true ∧
+      offset.bytes + len.bytes ≤ allocation.data.length := by
+  unfold BasicMemory.check_ptr at hck
+  split at hck
+  · cases hck
+  · cases hprov : ptr.provenance with
+    | none => simp only [hprov] at hck; cases hck
+    | some pair =>
+      rcases pair with ⟨id0, pe0⟩
+      simp only [hprov] at hck
+      obtain ⟨allocation, hidx, hck⟩ := bind_ok hck
+      obtain ⟨hge, hlt, hget⟩ := listIndex_ok hidx
+      cases hlive : allocation.live with
+      | false =>
+        simp only [hlive, Bool.not_false, ↓reduceIte] at hck
+        cases hck
+      | true =>
+        simp only [hlive, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hck
+        dsimp only [Allocation.size] at hck
+        by_cases hbounds :
+            ptr.addr - allocation.addr < 0 ∨
+              ptr.addr - allocation.addr + (len.bytes : Int) > (allocation.data.length : Int)
+        · simp only [hbounds, ↓reduceIte] at hck; cases hck
+        · simp only [hbounds, ↓reduceIte] at hck
+          have hnn : (0 : Int) ≤ ptr.addr - allocation.addr :=
+            Int.not_lt.mp fun hlt => hbounds (.inl hlt)
+          have hle : ptr.addr - allocation.addr + (len.bytes : Int) ≤ (allocation.data.length : Int) :=
+            Int.not_lt.mp fun hgt => hbounds (.inr hgt)
+          have hinj := Option.some.inj (interp_pure_ok hck)
+          obtain ⟨rfl, hpair⟩ := Prod.mk.inj hinj
+          obtain ⟨rfl, rfl⟩ := Prod.mk.inj hpair
+          refine ⟨allocation, hge, hlt, hget, hidx, hlive, ?_⟩
+          dsimp only
+          cases hdiff : ptr.addr - allocation.addr with
+          | ofNat k =>
+            rw [hdiff] at hle
+            exact Int.ofNat_le.mp hle
+          | negSucc k =>
+            rw [hdiff] at hnn
+            cases hnn
+
+/-- `TreeBorrowsMemory.allocate` never raises `Stop.specPanic`. -/
+theorem TreeBorrowsMemory.allocate_no_specPanic (tbm : Gen.TreeBorrowsMemory Gen.x86_64)
+    (kind : Gen.AllocationKind) (size : Size) (align : Align) (msg : String) :
+    TreeBorrowsMemory.allocate tbm kind size align ≠ .error (.specPanic msg) := by
+  intro h
+  unfold TreeBorrowsMemory.allocate BasicMemory.allocate at h
+  rcases bind_err h with ha | ⟨_, _, hp⟩
+  · split at ha
+    · cases ha
+    · split at ha <;> cases ha
+  · cases hp
+
+/-- On a `wfLive` Tree Borrows memory, `TreeBorrowsMemory.load` on any pointer
+with a valid allocation ID never raises `Stop.specPanic` (every misaligned,
+provenance-less, dangling, out-of-bounds, or permission-violating read cleanly
+raises `Stop.ub`). -/
+theorem TreeBorrowsMemory.load_no_specPanic {tbm : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} (len : Size) (align : Align)
+    (msg : String)
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (hvalid : TreeBorrowsMemory.validPtrAlloc tbm ptr) :
+    TreeBorrowsMemory.load tbm ptr len align ≠ .error (.specPanic msg) := by
+  intro h
+  unfold TreeBorrowsMemory.load BasicMemory.load at h
+  rcases bind_err h with hload | ⟨_, _, hp⟩
+  · split at hload
+    · cases hload
+    · rcases bind_err hload with hck_err | ⟨opt, hck, hload⟩
+      · exact check_ptr_tb_no_specPanic len msg hvalid hck_err
+      · cases opt with
+        | none => cases hload
+        | some triple =>
+          rcases triple with ⟨id, provExtra, offset⟩
+          obtain ⟨allocation, hge, hlt, hget, hidx, hlive, hbounds⟩ :=
+            check_ptr_tb_some_ok hck
+          dsimp only at hload
+          rw [hidx] at hload
+          dsimp only [bind, Except.bind] at hload
+          rcases bind_err hload with hextra_err | ⟨extra', _, hload⟩
+          · rcases bind_err hextra_err with hacc_err | ⟨_, _, hp⟩
+            · exact Node.access_no_specPanic _ _ .Read offset len msg
+                (hwf allocation (List.mem_of_getElem? hget) hlive) hbounds hacc_err
+            · cases hp
+          · have hset : listSet tbm.mem.allocations id._0
+                { allocation with extra := extra' } "set" =
+                .ok (tbm.mem.allocations.set id._0.toNat { allocation with extra := extra' }) := by
+              simp [listSet, hge, hlt, pure, Except.pure]
+            rw [hset] at hload
+            dsimp only [bind, Except.bind] at hload
+            have hsub : subsliceWithLength allocation.data (offset.bytes : Int) (len.bytes : Int) =
+                .ok ((allocation.data.drop (offset.bytes : Int).toNat).take
+                  (len.bytes : Int).toNat) := by
+              unfold subsliceWithLength
+              have hcond : (0 : Int) ≤ offset.bytes ∧ (0 : Int) ≤ len.bytes ∧
+                  (offset.bytes : Int) + (len.bytes : Int) ≤ allocation.data.length :=
+                ⟨by omega, by omega, by omega⟩
+              simp only [hcond, and_self, ↓reduceIte]
+              rfl
+            rw [hsub] at hload
+            cases hload
+  · cases hp
+
+/-- On a `wfLive` Tree Borrows memory, `TreeBorrowsMemory.store` on any pointer
+with a valid allocation ID never raises `Stop.specPanic`. -/
+theorem TreeBorrowsMemory.store_no_specPanic {tbm : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance}
+    (bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)) (align : Align)
+    (msg : String)
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (hvalid : TreeBorrowsMemory.validPtrAlloc tbm ptr) :
+    TreeBorrowsMemory.store tbm ptr bytes align ≠ .error (.specPanic msg) := by
+  intro h
+  unfold TreeBorrowsMemory.store BasicMemory.store at h
+  rcases bind_err h with hstore | ⟨_, _, hp⟩
+  · split at hstore
+    · cases hstore
+    · rcases bind_err hstore with hck_err | ⟨opt, hck, hstore⟩
+      · exact check_ptr_tb_no_specPanic ⟨bytes.length⟩ msg hvalid hck_err
+      · cases opt with
+        | none => cases hstore
+        | some triple =>
+          rcases triple with ⟨id, provExtra, offset⟩
+          obtain ⟨allocation, hge, hlt, hget, hidx, hlive, hbounds⟩ :=
+            check_ptr_tb_some_ok hck
+          dsimp only at hbounds
+          dsimp only at hstore
+          rw [hidx] at hstore
+          dsimp only [bind, Except.bind] at hstore
+          rcases bind_err hstore with hextra_err | ⟨extra', _, hstore⟩
+          · rcases bind_err hextra_err with hacc_err | ⟨_, _, hp⟩
+            · exact Node.access_no_specPanic _ _ .Write offset ⟨bytes.length⟩ msg
+                (hwf allocation (List.mem_of_getElem? hget) hlive) hbounds hacc_err
+            · cases hp
+          · have hws : writeSubsliceAtIndex allocation.data (offset.bytes : Int) bytes =
+                .ok (allocation.data.take (offset.bytes : Int).toNat ++ bytes ++
+                  allocation.data.drop ((offset.bytes : Int).toNat + bytes.length)) := by
+              unfold writeSubsliceAtIndex
+              have hcond : (0 : Int) ≤ offset.bytes ∧
+                  (offset.bytes : Int) + (bytes.length : Int) ≤ allocation.data.length :=
+                ⟨by omega, by omega⟩
+              simp only [hcond, and_self, ↓reduceIte]
+              rfl
+            rw [hws] at hstore
+            dsimp only [bind, Except.bind] at hstore
+            have hset : listSet tbm.mem.allocations id._0
+                { allocation with
+                  data := allocation.data.take (offset.bytes : Int).toNat ++ bytes ++
+                    allocation.data.drop ((offset.bytes : Int).toNat + bytes.length),
+                  extra := extra' } "set" =
+                .ok (tbm.mem.allocations.set id._0.toNat
+                  { allocation with
+                    data := allocation.data.take (offset.bytes : Int).toNat ++ bytes ++
+                      allocation.data.drop ((offset.bytes : Int).toNat + bytes.length),
+                    extra := extra' }) := by
+              simp [listSet, hge, hlt, pure, Except.pure]
+            rw [hset] at hstore
+            cases hstore
+  · cases hp
+
+/-- On a `wfLive` Tree Borrows memory, `TreeBorrowsMemory.deallocate` on any
+pointer with a valid allocation ID never raises `Stop.specPanic`. -/
+theorem TreeBorrowsMemory.deallocate_no_specPanic {tbm : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} (kind : Gen.AllocationKind)
+    (size : Size) (align : Align) (msg : String)
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (hvalid : TreeBorrowsMemory.validPtrAlloc tbm ptr) :
+    TreeBorrowsMemory.deallocate tbm ptr kind size align ≠ .error (.specPanic msg) := by
+  intro h
+  unfold TreeBorrowsMemory.deallocate BasicMemory.deallocate at h
+  rcases bind_err h with hd | ⟨_, _, hp⟩
+  · cases hprov : ptr.provenance with
+    | none => simp only [hprov] at hd; cases hd
+    | some pair =>
+      rcases pair with ⟨id, provExtra⟩
+      simp only [hprov] at hd
+      obtain ⟨hge, hlt⟩ := hvalid id provExtra hprov
+      obtain ⟨allocation, hget⟩ : ∃ a, tbm.mem.allocations[id._0.toNat]? = some a :=
+        ⟨_, List.getElem?_eq_getElem hlt⟩
+      have hidx : listIndex tbm.mem.allocations id._0 "self.allocations[id.0]" =
+          .ok allocation := by
+        simp [listIndex, hge, hget, pure, Except.pure]
+      rw [hidx] at hd
+      dsimp only [bind, Except.bind] at hd
+      cases hlive : allocation.live with
+      | false =>
+        simp only [hlive, Bool.not_false, ↓reduceIte] at hd
+        cases hd
+      | true =>
+        simp only [hlive, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hd
+        split at hd; · cases hd
+        split at hd; · dsimp only [ub] at hd; cases hd
+        by_cases hsz : size = Allocation.size allocation
+        · simp only [hsz, ne_eq, not_true_eq_false, ↓reduceIte] at hd
+          split at hd; · cases hd
+          rcases bind_err hd with hextra_err | ⟨extra', _, hd⟩
+          · rcases bind_err hextra_err with hacc_err | ⟨root', _, hextra_err⟩
+            · exact Node.access_no_specPanic _ _ .Write ⟨0⟩ (Allocation.size allocation) msg
+                (hwf allocation (List.mem_of_getElem? hget) hlive)
+                (by change 0 + allocation.data.length ≤ allocation.data.length; omega) hacc_err
+            · split at hextra_err <;> cases hextra_err
+          · have hset : listSet tbm.mem.allocations id._0
+                { allocation with live := false, extra := extra' } "set" =
+                .ok (tbm.mem.allocations.set id._0.toNat
+                  { allocation with live := false, extra := extra' }) := by
+              simp [listSet, hge, hlt, pure, Except.pure]
+            rw [hset] at hd
+            cases hd
+        · simp only [ne_eq, hsz, not_false_eq_true, ↓reduceIte] at hd; cases hd
+  · cases hp
+
+/-- `TreeBorrowsMemory.new` satisfies `TreeBorrowsMemory.wfLive`. -/
+theorem TreeBorrowsMemory.new_wfLive (params : Gen.TreeBorrowsParams) :
+    TreeBorrowsMemory.wfLive (TreeBorrowsMemory.new params) :=
+  TreeBorrowsMemory.wfLive_of_wf (TreeBorrowsMemory.new_wf params)
+
+/-- `TreeBorrowsMemory.allocate` preserves `TreeBorrowsMemory.wfLive`. -/
+theorem TreeBorrowsMemory.allocate_wfLive {tbm tbm' : Gen.TreeBorrowsMemory Gen.x86_64}
+    {kind : Gen.AllocationKind} {size : Size} {align : Align}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance}
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (h : TreeBorrowsMemory.allocate tbm kind size align = .ok (ptr, tbm')) :
+    TreeBorrowsMemory.wfLive tbm' := by
+  unfold TreeBorrowsMemory.allocate BasicMemory.allocate at h
+  obtain ⟨⟨ptr1, mem'⟩, halloc, h⟩ := bind_ok h
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+  split at halloc
+  · cases halloc
+  · cases hpick : BasicMemory.pickAddr tbm.mem size align with
+    | none => simp only [hpick] at halloc; cases halloc
+    | some addr =>
+      simp only [hpick] at halloc
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok halloc)
+      intro alloc hm hlive
+      rcases List.mem_append.mp hm with hm | hm
+      · exact hwf alloc hm hlive
+      · rw [List.mem_singleton.mp hm]
+        refine ⟨by simp [Allocation.size], fun p hp => ?_, trivial⟩
+        rw [List.eq_of_mem_replicate hp]
+        rfl
+
+/-- `TreeBorrowsMemory.load` preserves `TreeBorrowsMemory.wfLive`. -/
+theorem TreeBorrowsMemory.load_wfLive {tbm tbm' : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {len : Size} {align : Align}
+    {bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)}
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (h : TreeBorrowsMemory.load tbm ptr len align = .ok (bytes, tbm')) :
+    TreeBorrowsMemory.wfLive tbm' := by
+  unfold TreeBorrowsMemory.load BasicMemory.load at h
+  obtain ⟨⟨bs, mem'⟩, hload, h⟩ := bind_ok h
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+  split at hload
+  · cases hload
+  · obtain ⟨opt, _, hload⟩ := bind_ok hload
+    cases opt with
+    | none =>
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok hload)
+      exact hwf
+    | some triple =>
+      rcases triple with ⟨id, provExtra, offset⟩
+      obtain ⟨allocation, hidx, hload⟩ := bind_ok hload
+      obtain ⟨extra', hextra, hload⟩ := bind_ok hload
+      obtain ⟨allocations', hset, hload⟩ := bind_ok hload
+      obtain ⟨_, _, hload⟩ := bind_ok hload
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok hload)
+      obtain ⟨root', hacc, hextra⟩ := bind_ok hextra
+      obtain rfl := interp_pure_ok hextra
+      obtain ⟨_, _, rfl⟩ := listSet_ok hset
+      obtain ⟨_, _, hget⟩ := listIndex_ok hidx
+      intro alloc hm hlive
+      rcases mem_set_or hm with rfl | hm'
+      · exact Node.access_wf (hwf allocation (List.mem_of_getElem? hget) hlive) hacc
+      · exact hwf alloc hm' hlive
+
+/-- `TreeBorrowsMemory.store` preserves `TreeBorrowsMemory.wfLive`. -/
+theorem TreeBorrowsMemory.store_wfLive {tbm tbm' : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance}
+    {bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)} {align : Align}
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (h : TreeBorrowsMemory.store tbm ptr bytes align = .ok tbm') :
+    TreeBorrowsMemory.wfLive tbm' := by
+  unfold TreeBorrowsMemory.store BasicMemory.store at h
+  obtain ⟨mem', hstore, h⟩ := bind_ok h
+  obtain rfl := interp_pure_ok h
+  split at hstore
+  · cases hstore
+  · obtain ⟨opt, _, hstore⟩ := bind_ok hstore
+    cases opt with
+    | none =>
+      obtain rfl := interp_pure_ok hstore
+      exact hwf
+    | some triple =>
+      rcases triple with ⟨id, provExtra, offset⟩
+      obtain ⟨allocation, hidx, hstore⟩ := bind_ok hstore
+      obtain ⟨extra', hextra, hstore⟩ := bind_ok hstore
+      obtain ⟨data', hws, hstore⟩ := bind_ok hstore
+      obtain ⟨allocations', hset, hstore⟩ := bind_ok hstore
+      obtain rfl := interp_pure_ok hstore
+      obtain ⟨root', hacc, hextra⟩ := bind_ok hextra
+      obtain rfl := interp_pure_ok hextra
+      obtain ⟨_, _, rfl⟩ := listSet_ok hset
+      obtain ⟨_, _, hget⟩ := listIndex_ok hidx
+      have hdata_len := (writeSubsliceAtIndex_ok hws).2.2.1
+      intro alloc hm hlive
+      rcases mem_set_or hm with rfl | hm'
+      · dsimp only [Allocation.size]
+        rw [hdata_len]
+        exact Node.access_wf (hwf allocation (List.mem_of_getElem? hget) hlive) hacc
+      · exact hwf alloc hm' hlive
+
+/-- `TreeBorrowsMemory.deallocate` preserves `TreeBorrowsMemory.wfLive` (the
+deallocated slot is marked `live := false`). -/
+theorem TreeBorrowsMemory.deallocate_wfLive {tbm tbm' : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {kind : Gen.AllocationKind}
+    {size : Size} {align : Align}
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (h : TreeBorrowsMemory.deallocate tbm ptr kind size align = .ok tbm') :
+    TreeBorrowsMemory.wfLive tbm' := by
+  unfold TreeBorrowsMemory.deallocate BasicMemory.deallocate at h
+  obtain ⟨mem', hdealloc, h⟩ := bind_ok h
+  obtain rfl := interp_pure_ok h
+  cases hprov : ptr.provenance with
+  | none => simp only [hprov] at hdealloc; cases hdealloc
+  | some pair =>
+    rcases pair with ⟨id, provExtra⟩
+    simp only [hprov] at hdealloc
+    obtain ⟨allocation, _, hdealloc⟩ := bind_ok hdealloc
+    split at hdealloc; · cases hdealloc
+    split at hdealloc; · cases hdealloc
+    split at hdealloc; · dsimp only [ub] at hdealloc; cases hdealloc
+    split at hdealloc; · cases hdealloc
+    split at hdealloc; · cases hdealloc
+    obtain ⟨extra', _, hdealloc⟩ := bind_ok hdealloc
+    obtain ⟨allocations', hset, hdealloc⟩ := bind_ok hdealloc
+    obtain rfl := interp_pure_ok hdealloc
+    obtain ⟨_, _, rfl⟩ := listSet_ok hset
+    intro alloc hm hlive
+    rcases mem_set_or hm with rfl | hm'
+    · simp at hlive
+    · exact hwf alloc hm' hlive
+
+/-- `TreeBorrowsMemory.reborrow` preserves `TreeBorrowsMemory.wfLive` (including
+for zero-sized reborrows, since `reborrow` preserves `allocation.live` and
+`allocation.data`). -/
+theorem TreeBorrowsMemory.reborrow_wfLive {tbm tbm' : Gen.TreeBorrowsMemory Gen.x86_64}
+    {ptr ptr' : Gen.ThinPointer Gen.TreeBorrowsProvenance} {settings : Gen.ReborrowSettings}
+    {fe fe' : Gen.TreeBorrowsFrameExtra}
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (h : TreeBorrowsMemory.reborrow tbm ptr settings fe = .ok (ptr', tbm', fe')) :
+    TreeBorrowsMemory.wfLive tbm' := by
+  unfold TreeBorrowsMemory.reborrow at h
+  dsimp only at h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  cases hprov : ptr.provenance with
+  | none =>
+    simp only [hprov] at h
+    split at h
+    · cases h
+    · obtain ⟨_, h⟩ := Prod.mk.inj (interp_pure_ok h)
+      obtain ⟨rfl, _⟩ := Prod.mk.inj h
+      exact hwf
+  | some pair =>
+    rcases pair with ⟨allocId, parentPath⟩
+    simp only [hprov] at h
+    obtain ⟨⟨childPath, allocations'⟩, hm, h⟩ := bind_ok h
+    dsimp only at h
+    obtain ⟨_, h⟩ := Prod.mk.inj (interp_pure_ok h)
+    obtain ⟨rfl, _⟩ := Prod.mk.inj h
+    obtain ⟨allocation, alloc', _, _, hget, hf, rfl⟩ := listMutateAt_ok hm
+    cases hoff : Size.from_bytes (ptr.addr - allocation.addr) with
+    | none => simp [hoff, specPanic, bind, Except.bind] at hf
+    | some offset =>
+      simp only [hoff, pure, Except.pure, bind, Except.bind] at hf
+      have hbody : ∀ (permissions : List Gen.Permission),
+          permissions.length = (Allocation.size allocation).bytes →
+          (let childNode : Gen.Node :=
+            { children := [], permissions := permissions, «protected» := settings.«protected» }
+           if (!childNode.permissions.all fun x =>
+               Permission.matches_protector x childNode.«protected») = true then
+             specPanic
+               "assertion failed: child_node.permissions.all(|x| x.matches_protector(child_node.protected))"
+           else do
+             let (cp, root1) ← Node.add_node allocation.extra.root parentPath childNode
+             let root2 ← TreeBorrowsMemory.reborrowInitAccess cp offset 0 settings.inside root1
+             pure (cp, { data := allocation.data, addr := allocation.addr, align := allocation.align,
+                         kind := allocation.kind, live := allocation.live, extra := { root := root2 } })) =
+            .ok (childPath, alloc') →
+          TreeBorrowsMemory.wfLive
+            { params := tbm.params,
+              mem := { allocations := tbm.mem.allocations.set allocId._0.toNat alloc',
+                       _phantom := tbm.mem._phantom } } := by
+        intro permissions hplen hfb
+        dsimp only at hfb
+        cases hall : permissions.all (fun x => Permission.matches_protector x settings.«protected») with
+        | false =>
+          simp only [hall, Bool.not_false, ↓reduceIte] at hfb
+          cases hfb
+        | true =>
+          simp only [hall, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hfb
+          obtain ⟨⟨cp, root1⟩, hadd, hfb⟩ := bind_ok hfb
+          dsimp only at hfb
+          obtain ⟨root2, hinit, hfb⟩ := bind_ok hfb
+          obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok hfb)
+          have hchild_wf : Node.wf (Allocation.size allocation).bytes
+              { children := [], permissions := permissions, «protected» := settings.«protected» } :=
+            ⟨hplen, List.all_eq_true.mp hall, trivial⟩
+          intro alloc hm' hlive
+          rcases mem_set_or hm' with rfl | hm''
+          · have hr1 := Node.add_node_wf
+              (hwf allocation (List.mem_of_getElem? hget) hlive) hchild_wf hadd
+            exact TreeBorrowsMemory.reborrowInitAccess_wf cp offset 0 settings.inside hr1 hinit
+          · exact hwf alloc hm'' hlive
+      by_cases hgt : settings.inside.length > 0
+      · simp only [hgt, ↓reduceIte] at hf
+        obtain ⟨permissions, hps, hf⟩ := bind_ok hf
+        exact hbody permissions
+          ((writeSubsliceAtIndex_ok hps).2.2.1.trans (List.length_replicate ..)) hf
+      · simp only [hgt, ↓reduceIte] at hf
+        exact hbody _ (List.length_replicate ..) hf
+
+/-- `TreeBorrowsMemory.retag_ptr` preserves `TreeBorrowsMemory.wfLive`. -/
+theorem TreeBorrowsMemory.retag_ptr_wfLive {tbm tbm' : Gen.TreeBorrowsMemory Gen.x86_64}
+    {fe fe' : Gen.TreeBorrowsFrameExtra} {ptr ptr' : Gen.Pointer Gen.TreeBorrowsProvenance}
+    {ptrType : Gen.PtrType} {fnEntry fnImplicitWrites : Bool}
+    {vtableLookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable}
+    (hwf : TreeBorrowsMemory.wfLive tbm)
+    (h : TreeBorrowsMemory.retag_ptr tbm fe ptr ptrType fnEntry fnImplicitWrites vtableLookup =
+      .ok (ptr', tbm', fe')) :
+    TreeBorrowsMemory.wfLive tbm' := by
+  unfold TreeBorrowsMemory.retag_ptr at h
+  obtain ⟨opt, _, h⟩ := bind_ok h
+  cases opt with
+  | none =>
+    obtain ⟨_, h⟩ := Prod.mk.inj (interp_pure_ok h)
+    obtain ⟨rfl, _⟩ := Prod.mk.inj h
+    exact hwf
+  | some perms =>
+    obtain ⟨⟨thin', tbm1, fe1⟩, hreb, h⟩ := bind_ok h
+    obtain ⟨_, h⟩ := Prod.mk.inj (interp_pure_ok h)
+    obtain ⟨rfl, _⟩ := Prod.mk.inj h
+    exact TreeBorrowsMemory.reborrow_wfLive hwf hreb
+
+/-- Machine-level Tree Borrows live-allocation invariant on `MachTB`
+(`Machine<TreeBorrowsMemory<x86_64>>`): every live allocation in `m` carries a
+well-formed borrow tree (`Node.wf`). -/
+def MachTB.wfLive (m : MachTB) : Prop :=
+  TreeBorrowsMemory.wfLive m.mem.memory
+
+private theorem cm_tb_load_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {len : Size} {align : Align}
+    {atomicity : Gen.Atomicity}
+    {bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.load cm ptr len align atomicity = .ok (bytes, cm')) :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold ConcurrentMemory.load at h
+  obtain ⟨⟨_, mem'⟩, hload, h⟩ := bind_ok h
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+  exact TreeBorrowsMemory.load_wfLive hwf hload
+
+private theorem cm_tb_store_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance}
+    {bytes : List (Gen.AbstractByte Gen.TreeBorrowsProvenance)} {align : Align}
+    {atomicity : Gen.Atomicity}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.store cm ptr bytes align atomicity = .ok cm') :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold ConcurrentMemory.store at h
+  obtain ⟨mem', hstore, h⟩ := bind_ok h
+  obtain rfl := interp_pure_ok h
+  exact TreeBorrowsMemory.store_wfLive hwf hstore
+
+private theorem cm_tb_deinit_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {len : Size} {align : Align}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.deinit cm ptr len align = .ok cm') :
+    TreeBorrowsMemory.wfLive cm'.memory :=
+  cm_tb_store_wfLive hwf h
+
+private theorem cm_tb_allocate_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {kind : Gen.AllocationKind} {size : Size} {align : Align}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.allocate cm kind size align = .ok (ptr, cm')) :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold ConcurrentMemory.allocate at h
+  obtain ⟨⟨_, mem'⟩, halloc, h⟩ := bind_ok h
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+  exact TreeBorrowsMemory.allocate_wfLive hwf halloc
+
+private theorem cm_tb_deallocate_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {kind : Gen.AllocationKind}
+    {size : Size} {align : Align}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.deallocate cm ptr kind size align = .ok cm') :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold ConcurrentMemory.deallocate at h
+  obtain ⟨mem', hdealloc, h⟩ := bind_ok h
+  obtain rfl := interp_pure_ok h
+  exact TreeBorrowsMemory.deallocate_wfLive hwf hdealloc
+
+private theorem cm_tb_retag_ptr_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {fe fe' : Gen.TreeBorrowsFrameExtra} {ptr ptr' : Gen.Pointer Gen.TreeBorrowsProvenance}
+    {ptrType : Gen.PtrType} {fnEntry fnImplicitWrites : Bool}
+    {vtableLookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.retag_ptr cm fe ptr ptrType fnEntry fnImplicitWrites vtableLookup =
+      .ok (ptr', cm', fe')) :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold ConcurrentMemory.retag_ptr at h
+  obtain ⟨⟨_, mem', _⟩, hret, h⟩ := bind_ok h
+  obtain ⟨_, h⟩ := Prod.mk.inj (interp_pure_ok h)
+  obtain ⟨rfl, _⟩ := Prod.mk.inj h
+  exact TreeBorrowsMemory.retag_ptr_wfLive hwf hret
+
+private theorem cm_tb_end_call_wfLive {cm cm' : Gen.ConcurrentMemory TBM}
+    {extra : Gen.TreeBorrowsFrameExtra}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : ConcurrentMemory.end_call cm extra = .ok cm') :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold ConcurrentMemory.end_call at h
+  obtain ⟨mem', hend, h⟩ := bind_ok h
+  obtain rfl := interp_pure_ok h
+  exact TreeBorrowsMemory.end_call_wfLive hwf hend
+
+private theorem mutateCurFrameM_tb_wfLive {m m' : MachTB}
+    {f : Gen.StackFrame TBM → Gen.StackFrame TBM}
+    (hwf : MachTB.wfLive m) (h : mutateCurFrameM m f = .ok m') :
+    MachTB.wfLive m' := by
+  unfold mutateCurFrameM at h
+  obtain ⟨t, _, h⟩ := bind_ok h
+  cases hlast : t.stack.getLast? with
+  | none => simp only [hlast] at h; cases h
+  | some fr =>
+    simp only [hlast] at h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain rfl := interp_pure_ok h
+    exact hwf
+
+private theorem jumpToBlockM_tb_wfLive {m m' : MachTB} {b : Gen.BbName}
+    (hwf : MachTB.wfLive m) (h : jumpToBlockM m b = .ok m') :
+    MachTB.wfLive m' :=
+  mutateCurFrameM_tb_wfLive hwf h
+
+private theorem terminateActiveThreadM_tb_wfLive {m m' : MachTB}
+    (hwf : MachTB.wfLive m) (h : terminateActiveThreadM m = .ok m') :
+    MachTB.wfLive m' := by
+  unfold terminateActiveThreadM at h
+  dsimp only at h
+  by_cases ha : m.active_thread = 0
+  · simp only [ha, ↓reduceIte] at h; cases h
+  · simp only [ha, ↓reduceIte] at h
+    obtain ⟨t, _, h⟩ := bind_ok h
+    by_cases hst : t.stack.length = 0
+    · simp only [hst, ne_eq, not_true_eq_false, ↓reduceIte] at h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain rfl := interp_pure_ok h
+      exact hwf
+    · simp only [ne_eq, hst, not_false_eq_true, ↓reduceIte] at h; cases h
+
+private theorem mutateCurFrameOutM_tb_wfLive {α : Type} {m m' : MachTB} {out : α}
+    {f : Gen.StackFrame TBM → Gen.ConcurrentMemory TBM →
+      Interp (α × Gen.StackFrame TBM × Gen.ConcurrentMemory TBM)}
+    (hf : ∀ fr o fr' cm', f fr m.mem = .ok (o, fr', cm') → TreeBorrowsMemory.wfLive cm'.memory)
+    (h : mutateCurFrameOutM m f = .ok (out, m')) :
+    MachTB.wfLive m' := by
+  unfold mutateCurFrameOutM at h
+  obtain ⟨t, _, h⟩ := bind_ok h
+  cases hlast : t.stack.getLast? with
+  | none => simp only [hlast] at h; cases h
+  | some fr =>
+    simp only [hlast] at h
+    obtain ⟨⟨o, fr', cm'⟩, hfr, h⟩ := bind_ok h
+    dsimp only at h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hf fr o fr' cm' hfr
+
+private theorem tryMutateCurFrameM_tb_wfLive {m m' : MachTB}
+    {f : Gen.StackFrame TBM → Gen.ConcurrentMemory TBM →
+      Interp (Gen.StackFrame TBM × Gen.ConcurrentMemory TBM)}
+    (hf : ∀ fr fr' cm', f fr m.mem = .ok (fr', cm') → TreeBorrowsMemory.wfLive cm'.memory)
+    (h : tryMutateCurFrameM m f = .ok m') :
+    MachTB.wfLive m' := by
+  unfold tryMutateCurFrameM at h
+  obtain ⟨t, _, h⟩ := bind_ok h
+  cases hlast : t.stack.getLast? with
+  | none => simp only [hlast] at h; cases h
+  | some fr =>
+    simp only [hlast] at h
+    obtain ⟨⟨fr', cm'⟩, hfr, h⟩ := bind_ok h
+    dsimp only at h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain rfl := interp_pure_ok h
+    exact hf fr fr' cm' hfr
+
+/-- `typedLoadM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem typedLoadM_tb_wfLive {m m' : MachTB}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {ty : Gen.Type}
+    {align : Align} {atomicity : Gen.Atomicity} {val : Gen.Value TBM}
+    (hwf : MachTB.wfLive m)
+    (h : typedLoadM m ptr ty align atomicity = .ok (val, m')) :
+    MachTB.wfLive m' := by
+  unfold typedLoadM at h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨⟨bytes, cm⟩, hload, h⟩ := bind_ok h
+  dsimp only at h
+  have hcm := cm_tb_load_wfLive hwf hload
+  obtain ⟨opt, _, h⟩ := bind_ok h
+  cases opt with
+  | none => cases h
+  | some v =>
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hcm
+
+/-- `typedStoreM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem typedStoreM_tb_wfLive {m m' : MachTB}
+    {ptr : Gen.ThinPointer Gen.TreeBorrowsProvenance} {val : Gen.Value TBM}
+    {ty : Gen.Type} {align : Align} {atomicity : Gen.Atomicity}
+    (hwf : MachTB.wfLive m)
+    (h : typedStoreM m ptr val ty align atomicity = .ok m') :
+    MachTB.wfLive m' := by
+  unfold typedStoreM at h
+  dsimp only at h
+  rcases hcv : checkValueM val ty (some m) with _ | ⟨⟩
+  · simp only [hcv] at h; cases h
+  · simp only [hcv] at h
+    obtain ⟨bytes, _, h⟩ := bind_ok h
+    obtain ⟨cm, hstore, h⟩ := bind_ok h
+    obtain rfl := interp_pure_ok h
+    exact cm_tb_store_wfLive hwf hstore
+
+/-- `placeLoadM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem placeLoadM_tb_wfLive {m m' : MachTB} {place : Gen.Place TBM}
+    {ty : Gen.Type} {val : Gen.Value TBM}
+    (hwf : MachTB.wfLive m) (h : placeLoadM m place ty = .ok (val, m')) :
+    MachTB.wfLive m' := by
+  unfold placeLoadM at h
+  cases hpa : place.aligned with
+  | false => simp only [hpa, Bool.not_false, ↓reduceIte] at h; cases h
+  | true => simp only [hpa, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h; exact typedLoadM_tb_wfLive hwf h
+
+/-- `placeStoreM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem placeStoreM_tb_wfLive {m m' : MachTB} {place : Gen.Place TBM}
+    {val : Gen.Value TBM} {ty : Gen.Type}
+    (hwf : MachTB.wfLive m) (h : placeStoreM m place val ty = .ok m') :
+    MachTB.wfLive m' := by
+  unfold placeStoreM at h
+  cases hpa : place.aligned with
+  | false => simp only [hpa, Bool.not_false, ↓reduceIte] at h; cases h
+  | true => simp only [hpa, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h; exact typedStoreM_tb_wfLive hwf h
+
+mutual
+
+/-- `evalPlaceM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem evalPlaceM_tb_wfLive :
+    ∀ (pe : Gen.PlaceExpr) {m m' : MachTB} {out : Gen.Place TBM × Gen.Type},
+      MachTB.wfLive m → evalPlaceM m pe = .ok (out, m') → MachTB.wfLive m'
+  | .Local name, m, _, _, hwf, h => by
+    unfold evalPlaceM at h
+    obtain ⟨fr, _, h⟩ := bind_ok h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    cases hmg : mapGet fr.locals name with
+    | none => simp only [hmg] at h; cases h
+    | some _ =>
+      simp only [hmg] at h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+      exact hwf
+  | .Field root field, _, _, _, hwf, h => by
+    unfold evalPlaceM at h
+    obtain ⟨⟨⟨rootPl, ty⟩, m1⟩, hr, h⟩ := bind_ok h
+    dsimp only at h
+    have hm1 := evalPlaceM_tb_wfLive root hwf hr
+    cases ty with
+    | Tuple sizedFields sizedHeadLayout unsizedField =>
+      dsimp only at h
+      by_cases h1 : 0 ≤ field ∧ field < (sizedFields.length : Int)
+      · simp only [h1] at h
+        obtain ⟨⟨offset, fieldTy⟩, _, h⟩ := bind_ok h
+        dsimp only at h
+        obtain ⟨_, _, h⟩ := bind_ok h
+        obtain ⟨rootSize, _, h⟩ := bind_ok h
+        by_cases hle : offset.bytes ≤ rootSize.bytes
+        · simp only [hle, decide_true, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+          obtain ⟨_, _, h⟩ := bind_ok h
+          obtain ⟨_, _, h⟩ := bind_ok h
+          obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+          exact hm1
+        · simp only [hle, decide_false, Bool.not_false, ↓reduceIte] at h; cases h
+      · simp only [h1, ↓reduceIte] at h
+        by_cases h2 : field = (sizedFields.length : Int)
+        · simp only [h2, ↓reduceIte] at h
+          cases unsizedField with
+          | none => cases h
+          | some tailTy =>
+            dsimp only at h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨tailAlign, _, h⟩ := bind_ok h
+            dsimp only [pure, Except.pure, bind, Except.bind] at h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨rootSize, _, h⟩ := bind_ok h
+            by_cases hle : (TupleHeadLayout.tail_offset sizedHeadLayout tailAlign).bytes ≤ rootSize.bytes
+            · simp only [hle, decide_true, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+              obtain ⟨_, _, h⟩ := bind_ok h
+              obtain ⟨_, _, h⟩ := bind_ok h
+              obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+              exact hm1
+            · simp only [hle, decide_false, Bool.not_false, ↓reduceIte] at h; cases h
+        · simp only [h2, ↓reduceIte] at h; cases h
+    | Union fields _ _ _ =>
+      dsimp only at h
+      obtain ⟨⟨offset, fieldTy⟩, _, h⟩ := bind_ok h
+      dsimp only at h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨rootSize, _, h⟩ := bind_ok h
+      by_cases hle : offset.bytes ≤ rootSize.bytes
+      · simp only [hle, decide_true, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+        obtain ⟨_, _, h⟩ := bind_ok h
+        obtain ⟨_, _, h⟩ := bind_ok h
+        obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+        exact hm1
+      · simp only [hle, decide_false, Bool.not_false, ↓reduceIte] at h; cases h
+    | _ => cases h
+  | .Index root index, _, _, _, hwf, h => by
+    unfold evalPlaceM at h
+    obtain ⟨⟨⟨rootPl, ty⟩, m1⟩, hr, h⟩ := bind_ok h
+    dsimp only at h
+    obtain ⟨⟨⟨idxVal, _⟩, m2⟩, hi, h⟩ := bind_ok h
+    dsimp only at h
+    have hm2 := evalValueM_tb_wfLive index (evalPlaceM_tb_wfLive root hwf hr) hi
+    cases idxVal with
+    | Int idx =>
+      dsimp only [pure, Except.pure, bind, Except.bind] at h
+      cases ty with
+      | Array elemTy count =>
+        dsimp only [pure, Except.pure, bind, Except.bind] at h
+        by_cases hob : idx < 0 ∨ idx ≥ count
+        · simp only [hob, ↓reduceIte] at h; cases h
+        · simp only [hob, ↓reduceIte] at h
+          obtain ⟨_, _, h⟩ := bind_ok h
+          obtain ⟨_, _, h⟩ := bind_ok h
+          obtain ⟨offset, _, h⟩ := bind_ok h
+          obtain ⟨_, _, h⟩ := bind_ok h
+          obtain ⟨rootSize, _, h⟩ := bind_ok h
+          by_cases hle : offset.bytes ≤ rootSize.bytes
+          · simp only [hle, ↓reduceIte] at h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+            exact hm2
+          · simp only [hle, ↓reduceIte] at h; cases h
+      | Slice elemTy =>
+        dsimp only at h
+        rcases hmeta : rootPl.ptr.metadata with _ | (count | _) <;> simp only [hmeta] at h
+        · cases h
+        · by_cases hob : idx < 0 ∨ idx ≥ count
+          · simp only [hob, ↓reduceIte] at h; cases h
+          · simp only [hob, ↓reduceIte] at h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨offset, _, h⟩ := bind_ok h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨rootSize, _, h⟩ := bind_ok h
+            by_cases hle : offset.bytes ≤ rootSize.bytes
+            · simp only [hle, ↓reduceIte] at h
+              obtain ⟨_, _, h⟩ := bind_ok h
+              obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+              exact hm2
+            · simp only [hle, ↓reduceIte] at h; cases h
+        · cases h
+      | _ => cases h
+    | _ => cases h
+  | .Deref operand _, _, _, _, hwf, h => by
+    unfold evalPlaceM at h
+    obtain ⟨⟨⟨v, vTy⟩, m1⟩, hv, h⟩ := bind_ok h
+    dsimp only at h
+    have hm1 := evalValueM_tb_wfLive operand hwf hv
+    cases v with
+    | Ptr ptr =>
+      cases vTy with
+      | Ptr ptrType =>
+        dsimp only at h
+        cases hsp : PtrType.safe_pointee ptrType with
+        | none =>
+          simp only [hsp, pure, Except.pure, bind, Except.bind] at h
+          obtain ⟨_, _, h⟩ := bind_ok h
+          obtain ⟨_, _, h⟩ := bind_ok h
+          obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+          exact hm1
+        | some pointee =>
+          simp only [hsp] at h
+          obtain ⟨pointeeAlign, _, h⟩ := bind_ok h
+          cases hal : Align.is_aligned pointeeAlign ptr.thin_pointer.addr with
+          | false => simp only [hal, Bool.not_false, ↓reduceIte] at h; cases h
+          | true =>
+            simp only [hal, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨_, _, h⟩ := bind_ok h
+            obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+            exact hm1
+      | _ => cases h
+    | _ => cases h
+  | .Downcast _ _, _, _, _, _, h => by
+    unfold evalPlaceM at h; cases h
+
+/-- `evalValueM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem evalValueM_tb_wfLive :
+    ∀ (ve : Gen.ValueExpr) {m m' : MachTB} {out : Gen.Value TBM × Gen.Type},
+      MachTB.wfLive m → evalValueM m ve = .ok (out, m') → MachTB.wfLive m'
+  | .Constant _ _, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  | .Tuple exprs _, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    obtain ⟨⟨_, m1⟩, hes, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact evalValuesM_tb_wfLive exprs hwf hes
+  | .Load source, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    obtain ⟨⟨⟨place, ty⟩, m1⟩, hp, h⟩ := bind_ok h
+    obtain ⟨⟨_, m2⟩, hl, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact placeLoadM_tb_wfLive (evalPlaceM_tb_wfLive source hwf hp) hl
+  | .AddrOf target _, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    obtain ⟨⟨_, m1⟩, hp, h⟩ := bind_ok h
+    have hm1 := evalPlaceM_tb_wfLive target hwf hp
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain ⟨⟨_, m2⟩, hm, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    refine mutateCurFrameOutM_tb_wfLive (fun fr o fr' cm' hfr => ?_) hm
+    obtain ⟨⟨_, cm1, _⟩, hret, hfr⟩ := bind_ok hfr
+    obtain ⟨_, hfr⟩ := Prod.mk.inj (interp_pure_ok hfr)
+    obtain ⟨_, rfl⟩ := Prod.mk.inj hfr
+    exact cm_tb_retag_ptr_wfLive hm1 hret
+  | .UnOp _ operand, _, _, _, hwf, h => by
+    unfold evalValueM at h
+    obtain ⟨⟨_, m1⟩, ho, h⟩ := bind_ok h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact evalValueM_tb_wfLive operand hwf ho
+  | .BinOp operator left right, _, _, _, hwf, h => by
+    cases operator <;> {
+      unfold evalValueM at h
+      obtain ⟨⟨_, m1⟩, hl, h⟩ := bind_ok h
+      obtain ⟨⟨_, m2⟩, hr, h⟩ := bind_ok h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+      exact evalValueM_tb_wfLive right (evalValueM_tb_wfLive left hwf hl) hr
+    }
+  | .Union _ _ _, _, _, _, _, h => by unfold evalValueM at h; cases h
+  | .Variant _ _ _, _, _, _, _, h => by unfold evalValueM at h; cases h
+  | .GetDiscriminant _, _, _, _, _, h => by unfold evalValueM at h; cases h
+
+/-- `evalValuesM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem evalValuesM_tb_wfLive :
+    ∀ (es : List Gen.ValueExpr) {m m' : MachTB} {vals : List (Gen.Value TBM)},
+      MachTB.wfLive m → evalValuesM m es = .ok (vals, m') → MachTB.wfLive m'
+  | [], _, _, _, hwf, h => by
+    unfold evalValuesM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  | e :: es, _, _, _, hwf, h => by
+    unfold evalValuesM at h
+    obtain ⟨⟨_, m1⟩, he, h⟩ := bind_ok h
+    obtain ⟨⟨_, m2⟩, hes, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact evalValuesM_tb_wfLive es (evalValueM_tb_wfLive e hwf he) hes
+
+end
+
+/-- `storageDeadM` on `TBM` preserves `TreeBorrowsMemory.wfLive`. -/
+theorem storageDeadM_tb_wfLive {fr fr' : Gen.StackFrame TBM}
+    {cm cm' : Gen.ConcurrentMemory TBM} {local_ : Gen.LocalName}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : storageDeadM fr cm local_ = .ok (fr', cm')) :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold storageDeadM at h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  rcases hrem : mapRemove fr.locals local_ with ⟨_ | ptr, locals⟩
+  · simp only [hrem] at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  · simp only [hrem] at h
+    obtain ⟨cm1, hd, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact cm_tb_deallocate_wfLive hwf hd
+
+/-- `storageLiveM` on `TBM` preserves `TreeBorrowsMemory.wfLive`. -/
+theorem storageLiveM_tb_wfLive {fr fr' : Gen.StackFrame TBM}
+    {cm cm' : Gen.ConcurrentMemory TBM} {local_ : Gen.LocalName}
+    (hwf : TreeBorrowsMemory.wfLive cm.memory)
+    (h : storageLiveM fr cm local_ = .ok (fr', cm')) :
+    TreeBorrowsMemory.wfLive cm'.memory := by
+  unfold storageLiveM at h
+  obtain ⟨⟨fr2, cm2⟩, hsd, h⟩ := bind_ok h
+  have hcm2 := storageDeadM_tb_wfLive hwf hsd
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨⟨_, cm3⟩, ha, h⟩ := bind_ok h
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+  exact cm_tb_allocate_wfLive hcm2 ha
+
+mutual
+
+/-- `retagValM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem retagValM_tb_wfLive :
+    ∀ (val : Gen.Value TBM) (ty : Gen.Type) {m m' : MachTB} {fnEntry : Bool}
+      {val' : Gen.Value TBM},
+      MachTB.wfLive m → retagValM m fnEntry val ty = .ok (val', m') → MachTB.wfLive m'
+  | .Int _, _, _, _, _, _, hwf, h => by
+    unfold retagValM at h; obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf
+  | .Bool _, _, _, _, _, _, hwf, h => by
+    unfold retagValM at h; obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf
+  | .Union _, _, _, _, _, _, hwf, h => by
+    unfold retagValM at h; obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf
+  | .Ptr ptr, .Ptr ptrType, _, _, _, _, hwf, h => by
+    unfold retagValM at h
+    obtain ⟨⟨_, m1⟩, hm, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    refine mutateCurFrameOutM_tb_wfLive (fun fr o fr' cm' hfr => ?_) hm
+    obtain ⟨⟨_, cm1, _⟩, hret, hfr⟩ := bind_ok hfr
+    obtain ⟨_, hfr⟩ := Prod.mk.inj (interp_pure_ok hfr)
+    obtain ⟨_, rfl⟩ := Prod.mk.inj hfr
+    exact cm_tb_retag_ptr_wfLive hwf hret
+  | .Ptr _, .Int _, _, _, _, _, _, h | .Ptr _, .Bool, _, _, _, _, _, h
+  | .Ptr _, .Union _ _ _ _, _, _, _, _, _, h | .Ptr _, .Tuple _ _ _, _, _, _, _, _, h
+  | .Ptr _, .Array _ _, _, _, _, _, _, h | .Ptr _, .Enum _ _ _ _ _, _, _, _, _, _, h
+  | .Ptr _, .Slice _, _, _, _, _, _, h | .Ptr _, .TraitObject _, _, _, _, _, _, h => by
+    unfold retagValM at h; cases h
+  | .Tuple vals, .Tuple sizedFields _ _, _, _, _, _, hwf, h => by
+    unfold retagValM at h
+    obtain ⟨⟨_, m1⟩, ht, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact retagTupleFieldsM_tb_wfLive vals sizedFields hwf ht
+  | .Tuple vals, .Array elemTy _, _, _, _, _, hwf, h => by
+    unfold retagValM at h
+    obtain ⟨⟨_, m1⟩, ha, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact retagArrayElemsM_tb_wfLive elemTy vals hwf ha
+  | .Tuple _, .Int _, _, _, _, _, _, h | .Tuple _, .Bool, _, _, _, _, _, h
+  | .Tuple _, .Union _ _ _ _, _, _, _, _, _, h | .Tuple _, .Ptr _, _, _, _, _, _, h
+  | .Tuple _, .Enum _ _ _ _ _, _, _, _, _, _, h | .Tuple _, .Slice _, _, _, _, _, _, h
+  | .Tuple _, .TraitObject _, _, _, _, _, _, h => by
+    unfold retagValM at h; cases h
+  | .Variant discriminant data, .Enum variants _ _ _ _, _, _, _, _, hwf, h => by
+    unfold retagValM at h
+    obtain ⟨variant, _, h⟩ := bind_ok h
+    obtain ⟨⟨_, m1⟩, hr, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact retagValM_tb_wfLive data variant.ty hwf hr
+  | .Variant _ _, .Int _, _, _, _, _, _, h | .Variant _ _, .Bool, _, _, _, _, _, h
+  | .Variant _ _, .Union _ _ _ _, _, _, _, _, _, h | .Variant _ _, .Ptr _, _, _, _, _, _, h
+  | .Variant _ _, .Tuple _ _ _, _, _, _, _, _, h | .Variant _ _, .Array _ _, _, _, _, _, _, h
+  | .Variant _ _, .Slice _, _, _, _, _, _, h | .Variant _ _, .TraitObject _, _, _, _, _, _, h => by
+    unfold retagValM at h; cases h
+
+/-- `retagTupleFieldsM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem retagTupleFieldsM_tb_wfLive :
+    ∀ (vals : List (Gen.Value TBM)) (fields : List (Gen.Offset × Gen.Type))
+      {m m' : MachTB} {fnEntry : Bool} {vals' : List (Gen.Value TBM)},
+      MachTB.wfLive m → retagTupleFieldsM m fnEntry vals fields = .ok (vals', m') →
+      MachTB.wfLive m'
+  | [], [], _, _, _, _, hwf, h => by
+    unfold retagTupleFieldsM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  | [], _ :: _, _, _, _, _, _, h => by unfold retagTupleFieldsM at h; cases h
+  | _ :: _, [], _, _, _, _, _, h => by unfold retagTupleFieldsM at h; cases h
+  | val :: vals, (_, ty) :: fields, _, _, _, _, hwf, h => by
+    unfold retagTupleFieldsM at h
+    obtain ⟨⟨_, m1⟩, hv, h⟩ := bind_ok h
+    obtain ⟨⟨_, m2⟩, hvs, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact retagTupleFieldsM_tb_wfLive vals fields (retagValM_tb_wfLive val ty hwf hv) hvs
+
+/-- `retagArrayElemsM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem retagArrayElemsM_tb_wfLive (elemTy : Gen.Type) :
+    ∀ (vals : List (Gen.Value TBM)) {m m' : MachTB} {fnEntry : Bool}
+      {vals' : List (Gen.Value TBM)},
+      MachTB.wfLive m → retagArrayElemsM m fnEntry elemTy vals = .ok (vals', m') →
+      MachTB.wfLive m'
+  | [], _, _, _, _, hwf, h => by
+    unfold retagArrayElemsM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  | val :: vals, _, _, _, _, hwf, h => by
+    unfold retagArrayElemsM at h
+    obtain ⟨⟨_, m1⟩, hv, h⟩ := bind_ok h
+    obtain ⟨⟨_, m2⟩, hvs, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact retagArrayElemsM_tb_wfLive elemTy vals (retagValM_tb_wfLive val elemTy hwf hv) hvs
+
+end
+
+/-- `evalStatementM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem evalStatementM_tb_wfLive {m m' : MachTB} {stmt : Gen.Statement}
+    (hwf : MachTB.wfLive m) (h : evalStatementM m stmt = .ok m') :
+    MachTB.wfLive m' := by
+  cases stmt with
+  | Assign dst src =>
+    unfold evalStatementM at h
+    obtain ⟨⟨⟨place, ty⟩, m1⟩, hp, h⟩ := bind_ok h
+    obtain ⟨⟨⟨val, _⟩, m2⟩, hv, h⟩ := bind_ok h
+    exact placeStoreM_tb_wfLive
+      (evalValueM_tb_wfLive src (evalPlaceM_tb_wfLive dst hwf hp) hv) h
+  | PlaceMention place =>
+    unfold evalStatementM at h
+    obtain ⟨⟨_, m1⟩, hp, h⟩ := bind_ok h
+    obtain rfl := interp_pure_ok h
+    exact evalPlaceM_tb_wfLive place hwf hp
+  | Validate place fnEntry =>
+    unfold evalStatementM at h
+    obtain ⟨⟨⟨p, ty⟩, m1⟩, hp, h⟩ := bind_ok h
+    obtain ⟨⟨val, m2⟩, hl, h⟩ := bind_ok h
+    obtain ⟨⟨val', m3⟩, hr, h⟩ := bind_ok h
+    exact placeStoreM_tb_wfLive
+      (retagValM_tb_wfLive val ty
+        (placeLoadM_tb_wfLive (evalPlaceM_tb_wfLive place hwf hp) hl) hr) h
+  | StorageLive local_ =>
+    unfold evalStatementM at h
+    exact tryMutateCurFrameM_tb_wfLive (fun _ _ _ hfr => storageLiveM_tb_wfLive hwf hfr) h
+  | StorageDead local_ =>
+    unfold evalStatementM at h
+    exact tryMutateCurFrameM_tb_wfLive (fun _ _ _ hfr => storageDeadM_tb_wfLive hwf hfr) h
+  | Deinit place =>
+    unfold evalStatementM at h
+    obtain ⟨⟨⟨p, ty⟩, m1⟩, hp, h⟩ := bind_ok h
+    dsimp only at h
+    have hm1 := evalPlaceM_tb_wfLive place hwf hp
+    cases hpa : p.aligned with
+    | false => simp only [hpa, Bool.not_false, ↓reduceIte] at h; cases h
+    | true =>
+      simp only [hpa, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨cm, hd, h⟩ := bind_ok h
+      obtain rfl := interp_pure_ok h
+      exact cm_tb_deinit_wfLive hm1 hd
+  | _ =>
+    unfold evalStatementM at h; cases h
+
+/-- `evalIntrinsicM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem evalIntrinsicM_tb_wfLive {m m' : MachTB} {intrinsic : Gen.IntrinsicOp}
+    {arguments : List (Gen.Value TBM × Gen.Type)} {retTy : Gen.Type} {val : Gen.Value TBM}
+    (hwf : MachTB.wfLive m) (h : evalIntrinsicM m intrinsic arguments retTy = .ok (val, m')) :
+    MachTB.wfLive m' := by
+  cases intrinsic with
+  | PointerExposeProvenance =>
+    dsimp only [evalIntrinsicM] at h
+    by_cases hlen : arguments.length = 1
+    · simp only [hlen, ne_eq, not_true_eq_false, ↓reduceIte] at h
+      rcases arguments with _ | ⟨⟨v, _⟩, _ | ⟨_, _⟩⟩
+      · simp at hlen
+      · rcases v with _ | _ | ⟨ptr, _ | _⟩ | _ | _
+        · dsimp only [ub] at h; cases h
+        · dsimp only [ub] at h; cases h
+        · rcases retTy with ⟨_ | _, ⟨sz⟩⟩ | _ | _ | _ | _ | _ | _ | _
+          · by_cases hsz : sz = 8
+            · subst hsz
+              dsimp only at h
+              obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+              exact hwf
+            · simp [hsz, ub] at h
+          all_goals (dsimp only [ub] at h; cases h)
+        all_goals (dsimp only [ub] at h; cases h)
+      · simp at hlen
+    · simp only [ne_eq, hlen, not_false_eq_true, ↓reduceIte, ub] at h; cases h
+  | PointerWithExposedProvenance =>
+    dsimp only [evalIntrinsicM] at h
+    by_cases hlen : arguments.length = 1
+    · simp only [hlen, ne_eq, not_true_eq_false, ↓reduceIte] at h
+      rcases arguments with _ | ⟨⟨v, _⟩, _ | ⟨_, _⟩⟩
+      · simp at hlen
+      · rcases v with addr | _ | _ | _ | _
+        · cases retTy with
+          | Ptr retPtrTy =>
+            dsimp only at h
+            by_cases hmk : PtrType.meta_kind retPtrTy = .None
+            · simp only [hmk, not_true_eq_false, ↓reduceIte] at h
+              obtain ⟨_, _, h⟩ := bind_ok h
+              obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+              exact hwf
+            · simp only [hmk, not_false_eq_true, ↓reduceIte] at h
+              dsimp only [ub] at h; cases h
+          | _ => dsimp only [ub] at h; cases h
+        all_goals (dsimp only [ub] at h; cases h)
+      · simp at hlen
+    · simp only [ne_eq, hlen, not_false_eq_true, ↓reduceIte, ub] at h; cases h
+  | _ =>
+    dsimp only [evalIntrinsicM, unsupported] at h; cases h
+
+/-- `evalArgsM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem evalArgsM_tb_wfLive :
+    ∀ (es : List Gen.ValueExpr) {m m' : MachTB} {args : List (Gen.Value TBM × Gen.Type)},
+      MachTB.wfLive m → evalArgsM m es = .ok (args, m') → MachTB.wfLive m'
+  | [], _, _, _, hwf, h => by
+    unfold evalArgsM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  | e :: es, _, _, _, hwf, h => by
+    unfold evalArgsM at h
+    obtain ⟨⟨_, m1⟩, he, h⟩ := bind_ok h
+    obtain ⟨⟨_, m2⟩, hes, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact evalArgsM_tb_wfLive es (evalValueM_tb_wfLive e hwf he) hes
+
+/-- `deallocAllM` on `TBM` preserves `TreeBorrowsMemory.wfLive`. -/
+theorem deallocAllM_tb_wfLive :
+    ∀ (fuel : Nat) {fr fr' : Gen.StackFrame TBM} {cm cm' : Gen.ConcurrentMemory TBM},
+      TreeBorrowsMemory.wfLive cm.memory →
+      deallocAllM fuel fr cm = .ok (fr', cm') →
+      TreeBorrowsMemory.wfLive cm'.memory
+  | 0, fr, _, _, _, hwf, h => by
+    unfold deallocAllM at h
+    rcases hent : fr.locals.entries with _ | ⟨⟨_, _⟩, _⟩ <;> simp only [hent] at h
+    · obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf
+    · cases h
+  | fuel + 1, fr, _, _, _, hwf, h => by
+    unfold deallocAllM at h
+    rcases hent : fr.locals.entries with _ | ⟨⟨local_, _⟩, _⟩ <;> simp only [hent] at h
+    · obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf
+    · obtain ⟨⟨fr1, cm1⟩, hsd, h⟩ := bind_ok h
+      exact deallocAllM_tb_wfLive fuel (storageDeadM_tb_wfLive hwf hsd) h
+
+/-- `evalReturnM` on `MachTB` preserves `MachTB.wfLive` across return-value
+loading, local teardown (`deallocAllM`), and frame protector release (`end_call`). -/
+theorem evalReturnM_tb_wfLive {m m' : MachTB}
+    (hwf : MachTB.wfLive m) (h : evalReturnM m = .ok m') :
+    MachTB.wfLive m' := by
+  unfold evalReturnM at h
+  obtain ⟨t, _, h⟩ := bind_ok h
+  dsimp only at h
+  cases hlast : t.stack.getLast? with
+  | none => simp only [hlast] at h; cases h
+  | some f =>
+    simp only [hlast] at h
+    obtain ⟨frame, hfr, h⟩ := bind_ok h
+    cases interp_pure_ok hfr
+    obtain ⟨threads, _, h⟩ := bind_ok h
+    obtain ⟨calleeTy, _, h⟩ := bind_ok h
+    obtain ⟨lay, _, h⟩ := bind_ok h
+    obtain ⟨align, _, h⟩ := bind_ok h
+    obtain ⟨retPtr, _, h⟩ := bind_ok h
+    obtain ⟨⟨retVal, m1⟩, hload, h⟩ := bind_ok h
+    have hm1 := typedLoadM_tb_wfLive (m := { m with threads := threads }) hwf hload
+    obtain ⟨⟨frame1, cm1⟩, hdealloc, h⟩ := bind_ok h
+    dsimp only at h
+    have hcm1 := deallocAllM_tb_wfLive f.locals.entries.length hm1 hdealloc
+    obtain ⟨cm2, hend, h⟩ := bind_ok h
+    have hcm2 : MachTB.wfLive { m1 with mem := cm2 } := cm_tb_end_call_wfLive hcm1 hend
+    cases hspa : frame1.stack_pop_action with
+    | BottomOfStack =>
+      simp only [hspa] at h
+      exact terminateActiveThreadM_tb_wfLive hcm2 h
+    | BackToCaller nextBlock _ callerRetPtr =>
+      simp only [hspa] at h
+      obtain ⟨t2, _, h⟩ := bind_ok h
+      by_cases hst : t2.stack.length = 0
+      · simp only [hst, ↓reduceIte] at h; cases h
+      · simp only [hst, ↓reduceIte] at h
+        obtain ⟨m2, hstore, h⟩ := bind_ok h
+        have hm2 := typedStoreM_tb_wfLive hcm2 hstore
+        cases nextBlock with
+        | none => cases h
+        | some nb => exact jumpToBlockM_tb_wfLive hm2 h
+
+/-- `evalTerminatorM` on `MachTB` preserves `MachTB.wfLive`. -/
+theorem evalTerminatorM_tb_wfLive {m m' : MachTB} {term : Gen.Terminator}
+    (hwf : MachTB.wfLive m) (h : evalTerminatorM m term = .ok m') :
+    MachTB.wfLive m' := by
+  cases term with
+  | Goto blockName => exact jumpToBlockM_tb_wfLive hwf h
+  | Switch value cases fallback =>
+    unfold evalTerminatorM at h
+    obtain ⟨⟨⟨v, _⟩, m1⟩, hv, h⟩ := bind_ok h
+    dsimp only at h
+    have hm1 := evalValueM_tb_wfLive value hwf hv
+    cases v with
+    | Int i => exact jumpToBlockM_tb_wfLive hm1 h
+    | _ => cases h
+  | Unreachable => unfold evalTerminatorM at h; cases h
+  | Return => exact evalReturnM_tb_wfLive hwf h
+  | Intrinsic intrinsic arguments retExpr nextBlock =>
+    unfold evalTerminatorM at h
+    obtain ⟨⟨⟨retPlace, retTy⟩, m1⟩, hp, h⟩ := bind_ok h
+    obtain ⟨⟨args, m2⟩, ha, h⟩ := bind_ok h
+    obtain ⟨⟨val, m3⟩, hi, h⟩ := bind_ok h
+    obtain ⟨m4, hs, h⟩ := bind_ok h
+    have hm4 := placeStoreM_tb_wfLive
+      (evalIntrinsicM_tb_wfLive
+        (evalArgsM_tb_wfLive arguments (evalPlaceM_tb_wfLive retExpr hwf hp) ha) hi) hs
+    cases nextBlock with
+    | none => cases h
+    | some nb => exact jumpToBlockM_tb_wfLive hm4 h
+  | _ => unfold evalTerminatorM at h; cases h
+
+/-- Every single step of `MachTB` (`stepTB`) preserves `MachTB.wfLive`. -/
+theorem stepTB_wfLive {m m' : MachTB}
+    (hwf : MachTB.wfLive m) (h : stepTB m = .ok m') :
+    MachTB.wfLive m' := by
+  unfold stepTB stepM at h
+  cases hany : m.threads.any (fun t => decide (t.state = .Enabled)) with
+  | false => simp only [hany, Bool.not_false, ↓reduceIte] at h; cases h
+  | true =>
+    simp only [hany, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+    dsimp only [resetDataRaceTrackingM] at h
+    obtain ⟨tid, _, h⟩ := bind_ok h
+    obtain ⟨frame, _, h⟩ := bind_ok h
+    obtain ⟨block, _, h⟩ := bind_ok h
+    have hm0 : MachTB.wfLive
+        { { m with mem := { m.mem with accesses := [] } } with active_thread := tid } := hwf
+    by_cases hns : frame.next_stmt = (block.statements.length : Int)
+    · simp only [hns, ↓reduceIte] at h
+      obtain ⟨m2, hterm, h⟩ := bind_ok h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain rfl := interp_pure_ok h
+      exact evalTerminatorM_tb_wfLive hm0 hterm
+    · simp only [hns, ↓reduceIte] at h
+      obtain ⟨stmt, _, h⟩ := bind_ok h
+      obtain ⟨m1, hev, h⟩ := bind_ok h
+      obtain ⟨m2, hmut, h⟩ := bind_ok h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain rfl := interp_pure_ok h
+      exact mutateCurFrameM_tb_wfLive (evalStatementM_tb_wfLive hm0 hev) hmut
+
+/-- Arbitrary multi-step execution of `MachTB` (`stepsTB n`) preserves
+`MachTB.wfLive` across every `n : Nat` (statements, reborrows, `Validate`/`Retag`,
+`StorageLive`/`StorageDead`, `Box` deallocations, loops, and `Return`/`end_call`). -/
+theorem stepsTB_wfLive :
+    ∀ {n : Nat} {m m' : MachTB},
+      MachTB.wfLive m → stepsTB n m = .ok m' → MachTB.wfLive m'
+  | 0, _, _, hwf, h => by
+    unfold stepsTB stepsM at h
+    obtain rfl := interp_pure_ok h
+    exact hwf
+  | _ + 1, _, _, hwf, h => by
+    unfold stepsTB stepsM at h
+    obtain ⟨m1, hs, h⟩ := bind_ok h
+    exact stepsTB_wfLive (stepTB_wfLive hwf hs) h
+
 end MiniRustSpec.Correspondence
