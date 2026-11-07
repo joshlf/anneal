@@ -1626,8 +1626,11 @@ fn render_lifting_strategy_guide_section() -> &'static str {
        - `open Anneal.MirLoops Anneal.PureMirExec Anneal.MirFuelFree` and model `for i in lo..hi` / `while i < hi` loops with `forRangeUp` (`forRangeUp_induction`, `mirWpConverges_forRangeUp`, `mirNoCallWpConverges_forRangeUp`, or `mirWpConverges_whileRank` for rank-decreasing loops).\n  \
        - Step loop entry, single iterations, and exit to the loop-header block without step numerals via `runCfgToBlock` (`mirStepsConverges_of_runCfgToBlock`, `mirWpConverges_of_runCfgToBlock`, `mirNoCallWpConverges_of_runCfgToBlock`), and close with `verifyStatefulMirNoPanic_of_wpConverges`, `verifyStatefulEquivMir_of_wpConverges`, or `verifyUbExceptionMir_of_wpConverges`.\n\
      - **Pattern D — `&mut` References (`Anneal.SepLogicLenses`) & Shared `&` Reads**:\n  \
-       - For `&mut` borrows, `open Anneal.SepLogicLenses Anneal.MirLiftCore`, erase Tree Borrows and `Memory` aliasing via whole-slot `SepLensStateInv` (`ActiveTypedMutBorrow`, `treeMemoryPtrMutLens`) or sibling-field `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`, `treeFieldMemoryPtrMutLens`, `subplaceTreeMutLens`), derive `LiftLensBlock` (`LiftLensStmts`, `set?_of_forcePureEnv? rfl`), and conclude with `verifyStatefulMir_of_sepLenses`, `verifyStatefulMir_of_sepSubplaceLenses`, `mirWpConverges_of_sepLenses`, or `verifyTotalMir_of_sepLenses`.\n  \
-       - For shared `&T` / `*const T` reads without `&mut` borrows, `open Anneal.PureMirExec Anneal.MirFuelFree Anneal.Rustc.V2026_06_01.SymbolicEval` and step intraprocedurally via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, `verifyStatefulMirNoPanic_of_wpConverges`) or `dischargeStatefulEqFuelFree` on concrete pinned memory.\n\n"
+       - For `&mut` borrows, `open Anneal.SepLogicLenses Anneal.FunctionalTranslation Anneal.MirLiftCore`, erase Tree Borrows and `Memory` aliasing via whole-slot `SepLensStateInv` (`ActiveTypedMutBorrow`, `treeMemoryPtrMutLens`) or sibling-field `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`, `treeFieldMemoryPtrMutLens`, `subplaceTreeMutLens`), derive `LiftLensBlock` (`LiftLensStmts`, `set?_of_forcePureEnv? rfl`), and conclude with `verifyStatefulMir_of_sepLenses`, `verifyStatefulMir_of_sepSubplaceLenses`, `mirWpConverges_of_sepLenses`, or `verifyTotalMir_of_sepLenses`.\n  \
+       - For shared `&T` / `*const T` reads without `&mut` borrows, `open Anneal.PureMirExec Anneal.MirFuelFree Anneal.Rustc.V2026_06_01.SymbolicEval` and step intraprocedurally via `runCfgToBlock` (`mirWpConverges_of_runCfgToBlock`, `verifyStatefulMirNoPanic_of_wpConverges`) or `dischargeStatefulEqFuelFree` on concrete pinned memory.\n\
+     - **Pattern E — Polymorphic MIR (`CapturedMir.instantiate`) & Bit-Validity (`Anneal.BitValidity`)**:\n  \
+       - For generic items (`typeParamCount > 0` / `poly*Claim`), `open Trusted.MirAst Trusted.Layout Anneal.PureMirExec`, introduce `typeArgs` and `h_len` (`*ClaimFor typeArgs` instantiates `Mir.<Item>.body.instantiate typeArgs` via `CapturedMir.instantiate` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n  \
+       - For `#[invariant]` and `#[unsafe_impl]` layout/transmutation proofs, `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, `checkFromZeros_sound`, `checkFromBytes_sound`, `checkIntoBytes_sound`, and `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`.\n\n"
 }
 
 fn render_item_lifting_guidance(
@@ -1662,12 +1665,12 @@ fn render_item_lifting_guidance(
 
     if is_bit_validity_item {
         out.push_str(
-            "- **Bit-Validity / Trait Route (`Anneal.BitValidity`)**: `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, and `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`.\n",
+            "- **Bit-Validity / Trait Route (`Anneal.BitValidity`)**: `open Anneal.BitValidity` and use `ValidityMode`, `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, `checkFromZeros_sound`, `checkFromBytes_sound`, `checkIntoBytes_sound`, and `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`.\n",
         );
     }
     if is_polymorphic {
         out.push_str(&format!(
-            "- **Polymorphic MIR Route (`Body.instantiate`)**: `Mir.{item}.body` is generic (`typeParamCount > 0` or polymorphic claim); `open Anneal.PureMirExec Anneal.Rustc.V2026_06_01.SymbolicEval`, instantiate `Mir.{item}.body.instantiate typeArgs` (`LayoutTable.instantiateForBody`), and lift the instantiated body or apply `verifyPoly*MirSym`.\n"
+            "- **Polymorphic MIR Route (`CapturedMir.instantiate`)**: `Mir.{item}.body` is generic (`typeParamCount > 0` or `poly*Claim`); `open Trusted.MirAst Trusted.Layout Anneal.PureMirExec`, `intro typeArgs h_len` (`*ClaimFor typeArgs` instantiates `Mir.{item}.body.instantiate typeArgs` and `LayoutTable.instantiateForBody`), and discharge `*ClaimFor typeArgs` with the fuel-free lifting theorems (`verifyMirNoPanic_of_pureExec`, `verifyStatefulMir_of_sepLenses`, or `verifyStatefulMirNoPanic_of_wpConverges`).\n"
         ));
     }
     if profile.has_cfg_back_edge {
@@ -1677,7 +1680,7 @@ fn render_item_lifting_guidance(
     }
     if profile.has_mut_borrow {
         out.push_str(&format!(
-            "- **Reference / Borrow Route (`Anneal.SepLogicLenses`)**: `Mir.{item}.body` mutates or borrows `&mut` places; `open Anneal.SepLogicLenses Anneal.MirLiftCore`, establish `SepLensStateInv` (`ActiveTypedMutBorrow`) or `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`), prove `LiftLensBlock Mir.{item}.body 0 ...` using `set?_of_forcePureEnv? rfl`, and apply `verifyStatefulMir_of_sepLenses` (or `verifyStatefulMir_of_sepSubplaceLenses`).\n"
+            "- **Reference / Borrow Route (`Anneal.SepLogicLenses`)**: `Mir.{item}.body` mutates or borrows `&mut` places; `open Anneal.SepLogicLenses Anneal.FunctionalTranslation Anneal.MirLiftCore`, establish `SepLensStateInv` (`ActiveTypedMutBorrow`) or `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`), prove `LiftLensBlock Mir.{item}.body 0 ...` using `set?_of_forcePureEnv? rfl`, and apply `verifyStatefulMir_of_sepLenses` (or `verifyStatefulMir_of_sepSubplaceLenses`).\n"
         ));
     } else if profile.has_deref_projection {
         out.push_str(&format!(
@@ -1700,7 +1703,7 @@ fn render_item_lifting_guidance(
     }
     if is_equiv {
         out.push_str(
-            "- **Equivalence Route (`#[spec(equiv = ...)]`)**: `open Anneal.PureMirExec Anneal.MirFuelFree` and apply `verifyStatefulEquivMir_of_wpConverges` with `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference specification's `MirNoCallWpConverges` theorem.\n",
+            "- **Equivalence Route (`#[spec(equivalent_to: ...)]`)**: `open Anneal.PureMirExec Anneal.MirFuelFree` and apply `verifyStatefulEquivMir_of_wpConverges` with `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference specification's `MirNoCallWpConverges` theorem.\n",
         );
     }
     if authored.is_ub_exception {
@@ -2653,10 +2656,16 @@ end Mir.Demo.loop_fn
         assert!(ctx_pure.contains("mirBoolPredicateHolds_elim_of_pureExec"));
         assert!(ctx_pure.contains("<item>_lift_sound"));
         assert!(ctx_pure.contains("LiftResidualBlock"));
+        assert!(ctx_pure.contains("CapturedMir.instantiate"));
+        assert!(ctx_pure.contains("Anneal.BitValidity"));
+        assert!(ctx_pure.contains("checkFromBytes_sound"));
+        assert!(!ctx_pure.contains("Body.instantiate"));
+        assert!(!ctx_pure.contains("verifyPoly"));
 
         let ctx_mut = render_agent_context(&ws, &records, Some("demo::mut_fn"))
             .expect("render context for mut_fn");
         assert!(ctx_mut.contains("Reference / Borrow Route (`Anneal.SepLogicLenses`)"));
+        assert!(ctx_mut.contains("Anneal.FunctionalTranslation"));
         assert!(ctx_mut.contains("verifyStatefulMir_of_sepLenses"));
 
         let ctx_loop = render_agent_context(&ws, &records, Some("demo::loop_fn"))

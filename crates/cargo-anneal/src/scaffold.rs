@@ -2175,7 +2175,9 @@ pub fn render_scaffold_lifting_hints(
         bullets.push(
             "Bit-validity (`open Anneal.BitValidity`): use `ValidityMode`, \
              `ByteSeqValid`, `IsUnaligned`, `IsFromZeros`, `IsFromBytes`, \
-             `IsIntoBytes`, `IsTryFromBytes`, and \
+             `IsIntoBytes`, `IsTryFromBytes`, `checkUnaligned_sound`, \
+             `checkFromZeros_sound`, `checkFromBytes_sound`, \
+             `checkIntoBytes_sound`, and \
              `transmute_sound_of_into_from_bytes` over `Mir.<Item>.layouts`."
                 .to_string(),
         );
@@ -2183,11 +2185,15 @@ pub fn render_scaffold_lifting_hints(
 
     if is_polymorphic {
         bullets.push(
-            "Polymorphic MIR (`open Anneal.PureMirExec \
-             Anneal.Rustc.V2026_06_01.SymbolicEval`): instantiate generic \
-             `Mir.<Item>.body` via `Body.instantiate typeArgs` (recomputing \
-             layouts via `LayoutTable.instantiateForBody`), then lift the \
-             instantiated body or apply `verifyPoly*MirSym`."
+            "Polymorphic MIR (`open Trusted.MirAst Trusted.Layout \
+             Anneal.PureMirExec`): `intro typeArgs h_len` on `poly*Claim`, \
+             where `*ClaimFor typeArgs` instantiates \
+             `Mir.<Item>.body.instantiate typeArgs` (`CapturedMir.instantiate` \
+             and `LayoutTable.instantiateForBody`), then discharge \
+             `*ClaimFor typeArgs` with fuel-free lifting theorems \
+             (`verifyMirNoPanic_of_pureExec`, \
+             `verifyStatefulMir_of_sepLenses`, or \
+             `verifyStatefulMirNoPanic_of_wpConverges`)."
                 .to_string(),
         );
     }
@@ -2207,8 +2213,9 @@ pub fn render_scaffold_lifting_hints(
 
     if profile.has_mut_borrow {
         bullets.push(
-            "References (`open Anneal.SepLogicLenses Anneal.MirLiftCore`): \
-             erase `&mut` borrow/heap aliasing via `SepLensStateInv` \
+            "References (`open Anneal.SepLogicLenses \
+             Anneal.FunctionalTranslation Anneal.MirLiftCore`): erase `&mut` \
+             borrow/heap aliasing via `SepLensStateInv` \
              (`ActiveTypedMutBorrow`) or sibling-field \
              `SepSubplaceLensStateInv` (`ActiveTypedFieldMutBorrow`), derive \
              `LiftLensBlock` (`set?_of_forcePureEnv? rfl`), and close with \
@@ -2264,9 +2271,10 @@ pub fn render_scaffold_lifting_hints(
 
     if is_equiv {
         bullets.push(
-            "Equivalence (`#[spec(equiv = ...)]`; `open Anneal.PureMirExec \
-             Anneal.MirFuelFree`): discharge `StatefulEquivVerificationResult` \
-             with `verifyStatefulEquivMir_of_wpConverges` and \
+            "Equivalence (`#[spec(equivalent_to: ...)]`; `open \
+             Anneal.PureMirExec Anneal.MirFuelFree`): discharge \
+             `StatefulEquivVerificationResult` with \
+             `verifyStatefulEquivMir_of_wpConverges` and \
              `mirNoCallWpConverges_of_runCfgToBlock`, reusing the reference \
              specification's `MirNoCallWpConverges` theorem."
                 .to_string(),
@@ -3296,6 +3304,7 @@ end Mir.MyCrate.sum_loop
             fs::read_to_string(workspace.join("anneal/proofs/Proof/MyCrate/bump_cursor.lean"))
                 .expect("read bump_cursor proof");
         assert!(lens_proof.contains("Anneal.SepLogicLenses"));
+        assert!(lens_proof.contains("Anneal.FunctionalTranslation"));
         assert!(lens_proof.contains("verifyStatefulMir_of_sepLenses"));
 
         let loop_proof = fs::read_to_string(workspace.join("anneal/proofs/Proof/MyCrate/sum_loop.lean"))
@@ -3527,11 +3536,14 @@ def body : CapturedMir :=
             ..AuthoredItemModules::default()
         };
         let max_hints = render_scaffold_lifting_hints(&poly_bundle, max_authored, &prof_poly);
-        assert!(max_hints.contains("Body.instantiate typeArgs"));
+        assert!(max_hints.contains("CapturedMir.instantiate"));
+        assert!(!max_hints.contains("Body.instantiate"));
+        assert!(!max_hints.contains("verifyPoly"));
+        assert!(max_hints.contains("#[spec(equivalent_to: ...)]"));
+        assert!(!max_hints.contains("#[spec(equiv ="));
         assert!(max_hints.contains("verifyStatefulEquivMir_of_wpConverges"));
         assert!(max_hints.contains("verifyUbExceptionMir_of_wpConverges"));
         assert!(max_hints.contains("<item>_lift_sound"));
-        assert!(!max_hints.contains("Equivalence (`#[spec(equiv = ...)]`; `open Anneal.MirLiftCore`)"));
         for line in max_hints.lines() {
             assert!(line.chars().count() <= 80, "line > 80 cols: {line}");
         }
