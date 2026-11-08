@@ -47,6 +47,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import posixpath
 import shutil
 import signal
 import subprocess
@@ -562,14 +563,26 @@ def format_cgroup_probe_line(limits: dict[str, Any]) -> str:
 
 def format_cgroup_diagnostic_snapshot(
     cg: dict[str, Any] | None = None,
+    pid: int | None = None,
 ) -> str:
     """Formats a post-mortem cgroup v2 memory snapshot for timeout/OOM stderr diagnostics.
 
+    When `pid` is provided (e.g. a timed-out child before `SIGKILL`), probes
+    `/proc/<pid>/cgroup` first so transient `systemd-run --user --scope` stats
+    are captured while the scope is still alive, falling back to `/proc/self/cgroup`.
     Never raises, so a telemetry failure can never turn a structured `124` /
     `137` diagnostic into a Python traceback with exit code `1`.
     """
     try:
-        info = cg if cg is not None else probe_cgroup_v2_memory()
+        info = cg
+        if info is None and pid is not None and pid > 0:
+            pid_cg = Path(f"/proc/{pid}/cgroup")
+            if pid_cg.is_file():
+                cand = probe_cgroup_v2_memory(proc_cgroup_path=pid_cg)
+                if cand.get("cgroup_v2"):
+                    info = cand
+        if info is None:
+            info = probe_cgroup_v2_memory()
         if not info.get("cgroup_v2"):
             return ""
         anon_shmem = info.get("cgroup_anon_shmem_mib")
@@ -790,9 +803,9 @@ def run_bounded_command(
             proc.wait()
             return 128 + caught.signum
         except subprocess.TimeoutExpired:
+            cg_snap = format_cgroup_diagnostic_snapshot(pid=proc.pid)
             terminate_process_group(proc.pid)
             proc.wait()
-            cg_snap = format_cgroup_diagnostic_snapshot()
             sys.stderr.write(
                 f"\n[anneal-lean-run] ERROR: Command timed out after "
                 f"{timeout_sec}s (mode={mode}, MemoryMax={memory_max_mb}M, "
@@ -833,17 +846,37 @@ def run_bounded_command(
 def is_x20_path(bundle_path: str | Path) -> bool:
     """Returns True if `bundle_path` is an `/x20/` URI or `/google/data/r{w,o}/` path."""
     s = str(bundle_path).strip()
-    return s.startswith(X20_URI_PREFIX) or any(
-        s.startswith(p) for p in X20_FUSE_PREFIXES
+    if not s.startswith("/"):
+        return False
+    norm = posixpath.normpath(s)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    return (
+        norm == "/x20"
+        or norm.startswith(X20_URI_PREFIX)
+        or any(
+            norm == p.rstrip("/") or norm.startswith(p)
+            for p in X20_FUSE_PREFIXES
+        )
     )
 
 
 def to_x20_uri(bundle_path: str | Path) -> str:
-    """Translates `/google/data/r{w,o}/...` FUSE paths to `/x20/...` URIs."""
+    """Translates `/google/data/r{w,o}/...` FUSE paths to normalized `/x20/...` URIs."""
     s = str(bundle_path).strip()
-    for prefix in X20_FUSE_PREFIXES:
-        if s.startswith(prefix):
-            return X20_URI_PREFIX + s[len(prefix) :]
+    if not s:
+        return s
+    if is_x20_path(s):
+        norm = posixpath.normpath(s)
+        if norm.startswith("//"):
+            norm = "/" + norm.lstrip("/")
+        for prefix in X20_FUSE_PREFIXES:
+            base = prefix.rstrip("/")
+            if norm == base:
+                return "/x20"
+            if norm.startswith(prefix):
+                return posixpath.normpath(X20_URI_PREFIX + norm[len(prefix) :])
+        return norm
     return s
 
 
@@ -994,13 +1027,27 @@ def _x20_source_for(raw_str: str) -> str | None:
     """Returns the x20 path to stage via `fileutil`, or None for plain local files.
 
     Besides literal `/x20/` URIs and `/google/data/r{w,o}/` paths, this also
-    catches local symlinks (e.g. `~/x20 -> /google/data/rw/users/...`) whose
-    target lives on the `x20fsd` FUSE mount, so their contents are never read
-    through FUSE's stale cached `st_size`.
+    catches local symlinks (e.g. `~/x20 -> /google/data/rw/users/...` or
+    `~/bundle.bundle -> /x20/teams/...`) whose target lives on x20 or the
+    `x20fsd` FUSE mount, so their contents are never read through FUSE's stale
+    cached `st_size`.
     """
     if is_x20_path(raw_str):
         return raw_str
     try:
+        cur = Path(raw_str)
+        for _ in range(40):
+            cur_str = str(cur)
+            if is_x20_path(cur_str):
+                return cur_str
+            if not cur.is_symlink():
+                break
+            target = os.readlink(cur)
+            if is_x20_path(target):
+                return target
+            cur = Path(
+                os.path.normpath(os.path.join(os.path.dirname(cur_str), target))
+            )
         real = os.path.realpath(raw_str)
     except (OSError, ValueError):
         return None
@@ -1154,7 +1201,11 @@ def parse_bundle_heads(
     repository's hash algorithm rather than whatever repository happens to
     contain the caller's working directory.
     """
-    res = _run_git(["bundle", "list-heads", str(bundle_file)], cwd=cwd)
+    try:
+        bundle_arg = str(Path(bundle_file).resolve())
+    except OSError:
+        bundle_arg = str(bundle_file)
+    res = _run_git(["bundle", "list-heads", "--", bundle_arg], cwd=cwd)
     if res.returncode != 0:
         detail = (
             res.stderr.strip()
@@ -1193,11 +1244,74 @@ def parse_bundle_heads(
 
 
 def _resolve_commit(repo_path: Path, rev: str) -> str | None:
+    if not rev or rev.startswith("-"):
+        return None
     res = _run_git(
         ["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=repo_path
     )
     out = res.stdout.strip().lower()
     return out if (res.returncode == 0 and out) else None
+
+
+def _worktree_git_dir(wt_path: Path) -> Path | None:
+    """Resolves the per-worktree git directory for `wt_path`."""
+    try:
+        dot_git = wt_path / ".git"
+        if dot_git.is_dir():
+            return dot_git.resolve()
+        if dot_git.is_file():
+            raw = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+            if raw.startswith("gitdir:"):
+                gd_str = raw[len("gitdir:") :].strip()
+                gd_path = Path(gd_str)
+                if not gd_path.is_absolute():
+                    gd_path = wt_path / gd_path
+                return gd_path.resolve()
+    except OSError:
+        pass
+    res = _run_git(["rev-parse", "--git-dir"], cwd=wt_path)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    gd_path = Path(res.stdout.strip())
+    if not gd_path.is_absolute():
+        gd_path = wt_path / gd_path
+    try:
+        return gd_path.resolve()
+    except OSError:
+        return gd_path
+
+
+def _worktree_detached_target_ref(git_dir: Path) -> str | None:
+    """Returns the normalized branch ref being rebased/bisected in `git_dir`, if any."""
+    for rel in ("rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"):
+        p = git_dir / rel
+        try:
+            if p.is_file():
+                val = p.read_text(encoding="utf-8", errors="replace").strip()
+                if val:
+                    return normalize_git_ref(val)
+        except OSError:
+            continue
+    return None
+
+
+def _worktree_in_progress_operation(git_dir: Path) -> str | None:
+    """Returns the name of any in-progress git sequencer/merge operation in `git_dir`."""
+    for marker in (
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "BISECT_START",
+        "rebase-merge",
+        "rebase-apply",
+    ):
+        try:
+            if (git_dir / marker).exists():
+                return marker
+        except OSError:
+            continue
+    return None
 
 
 def _sync_local_ref_to_remote(
@@ -1260,8 +1374,6 @@ def _sync_local_ref_to_remote(
     )
     synced_via_checkout = False
     for entry in stanzas:
-        if entry.get("branch") != normalized_ref:
-            continue
         wt_str = entry.get("worktree", "")
         if not wt_str:
             continue
@@ -1270,11 +1382,31 @@ def _sync_local_ref_to_remote(
         except OSError:
             return (False, f"Cannot resolve worktree path {wt_str}")
 
+        wt_git_dir = _worktree_git_dir(wt_path)
+        if wt_git_dir is not None:
+            detached_ref = _worktree_detached_target_ref(wt_git_dir)
+            if detached_ref == normalized_ref:
+                return (
+                    False,
+                    f"{normalized_ref} has an active rebase or bisect in worktree {wt_path}",
+                )
+
+        if entry.get("branch") != normalized_ref:
+            continue
+
         if current_toplevel is None or wt_path != current_toplevel:
             return (
                 False,
                 f"{normalized_ref} is checked out in linked worktree {wt_path}",
             )
+
+        if wt_git_dir is not None:
+            op_marker = _worktree_in_progress_operation(wt_git_dir)
+            if op_marker is not None:
+                return (
+                    False,
+                    f"{normalized_ref} has an in-progress git operation ({op_marker}) in worktree {current_toplevel}",
+                )
 
         st_res = _run_git(["status", "--porcelain"], cwd=current_toplevel)
         if st_res.returncode != 0 or st_res.stdout.strip():
@@ -1285,7 +1417,7 @@ def _sync_local_ref_to_remote(
 
         if old_tip is not None:
             ff_res = _run_git(
-                ["merge", "--ff-only", new_tip], cwd=current_toplevel
+                ["merge", "--ff-only", "--", new_tip], cwd=current_toplevel
             )
         else:
             # `<ref>` is the unborn branch of a clean worktree.
@@ -1306,6 +1438,7 @@ def _sync_local_ref_to_remote(
                 "update-ref",
                 "-m",
                 reflog_msg,
+                "--",
                 normalized_ref,
                 new_tip,
                 old_tip if old_tip is not None else "",
@@ -1464,7 +1597,7 @@ def verify_bundle_ff(
                 )
 
             fetch_res = _run_git(
-                ["fetch", "--no-tags", "--quiet", str(staged_path), normalized_ref],
+                ["fetch", "--no-tags", "--quiet", "--", str(staged_path), normalized_ref],
                 cwd=repo_path,
             )
             has_obj = (
@@ -1574,7 +1707,7 @@ def verify_bundle_ff(
                 )
 
             fetch_res = _run_git(
-                ["fetch", "--no-tags", "--quiet", str(staged_path), normalized_ref],
+                ["fetch", "--no-tags", "--quiet", "--", str(staged_path), normalized_ref],
                 cwd=repo_path,
             )
             has_remote_obj = (

@@ -890,6 +890,46 @@ class TestCliAndLimits(unittest.TestCase):
             err,
         )
 
+    def test_timeout_captures_cgroup_snapshot_before_terminating_process(self) -> None:
+        """On timeout, the live child scope (`pid=proc.pid`) must be sampled before `terminate_process_group`."""
+        events: list[tuple[str, int | None]] = []
+        orig_snap = alr.format_cgroup_diagnostic_snapshot
+        orig_term = alr.terminate_process_group
+
+        def spy_snap(
+            cg: dict[str, Any] | None = None, pid: int | None = None
+        ) -> str:
+            events.append(("snap", pid))
+            return orig_snap(cg=dict(FAKE_CGROUP_INFO), pid=pid)
+
+        def spy_term(pid: int) -> None:
+            events.append(("term", pid))
+            orig_term(pid)
+
+        err_buf = io.StringIO()
+        with mock.patch("sys.stderr", err_buf), mock.patch.object(
+            alr, "format_cgroup_diagnostic_snapshot", side_effect=spy_snap
+        ), mock.patch.object(
+            alr, "terminate_process_group", side_effect=spy_term
+        ):
+            rc = alr.main(
+                [
+                    "--mode",
+                    "file",
+                    "--timeout",
+                    "1",
+                    "--no-slot-lock",
+                    "--",
+                    "python3",
+                    "-c",
+                    "import time; time.sleep(10)",
+                ]
+            )
+        self.assertEqual(rc, 124)
+        self.assertEqual([e[0] for e in events], ["snap", "term"])
+        self.assertIsNotNone(events[0][1])
+        self.assertEqual(events[0][1], events[1][1])
+
     def test_oom_exit_137_diagnostic_includes_cgroup_snapshot(self) -> None:
         err_buf = io.StringIO()
         with mock.patch("sys.stderr", err_buf), mock.patch.object(
@@ -1390,6 +1430,86 @@ class TestVerifyBundleFF(unittest.TestCase):
             self.assertEqual(v_sync["status"], "synced_fast_forward")
             self.assertEqual(_rev(repo, "refs/heads/unstable"), c2)
 
+    def test_sync_if_behind_blocks_active_rebase_bisect_and_sequencer_state(self) -> None:
+        """A worktree mid-rebase, mid-bisect, or mid-merge on `<ref>` must not have `<ref>` moved underneath it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            repo = tmp_p / "repo"
+            _init_repo(repo)
+            c1 = _commit_file(repo, "a.txt", "1\n", "c1")
+            c2 = _commit_file(repo, "a.txt", "2\n", "c2")
+            _git(repo, "branch", "unstable", c2)
+            bundle = _make_bundle(repo, tmp_p / "b.bundle", "refs/heads/unstable")
+            _git(repo, "branch", "-f", "unstable", c1)
+
+            # 1. Linked worktree has detached HEAD while rebasing `refs/heads/unstable`.
+            wt = tmp_p / "wt-rebase"
+            _git(repo, "worktree", "add", "-q", "--detach", str(wt), c1)
+            wt_git_dir = alr._worktree_git_dir(wt)
+            self.assertIsNotNone(wt_git_dir)
+            assert wt_git_dir is not None
+            rb_dir = wt_git_dir / "rebase-merge"
+            rb_dir.mkdir(parents=True)
+            (rb_dir / "head-name").write_text("refs/heads/unstable\n", encoding="utf-8")
+
+            v_rb = alr.verify_bundle_ff(bundle, repo_dir=repo, sync_if_behind=True)
+            self.assertFalse(v_rb["ok"])
+            self.assertEqual(v_rb["status"], "stale_behind")
+            self.assertIn("active rebase or bisect", v_rb["message"])
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
+            (rb_dir / "head-name").unlink()
+            rb_dir.rmdir()
+
+            # 2. Linked worktree has detached HEAD while bisecting `unstable`.
+            (wt_git_dir / "BISECT_START").write_text("unstable\n", encoding="utf-8")
+            v_bi = alr.verify_bundle_ff(bundle, repo_dir=repo, sync_if_behind=True)
+            self.assertFalse(v_bi["ok"])
+            self.assertEqual(v_bi["status"], "stale_behind")
+            self.assertIn("active rebase or bisect", v_bi["message"])
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
+            (wt_git_dir / "BISECT_START").unlink()
+            _git(repo, "worktree", "remove", "--force", str(wt))
+
+            # 3. Checked-out worktree on `unstable` has an in-progress MERGE_HEAD.
+            _git(repo, "checkout", "-q", "unstable")
+            main_git_dir = alr._worktree_git_dir(repo)
+            assert main_git_dir is not None
+            (main_git_dir / "MERGE_HEAD").write_text(f"{c2}\n", encoding="utf-8")
+            v_mh = alr.verify_bundle_ff(bundle, repo_dir=repo, sync_if_behind=True)
+            self.assertFalse(v_mh["ok"])
+            self.assertEqual(v_mh["status"], "stale_behind")
+            self.assertIn("in-progress git operation (MERGE_HEAD)", v_mh["message"])
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
+            (main_git_dir / "MERGE_HEAD").unlink()
+
+    def test_option_injection_and_relative_bundle_path_hardening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            repo = tmp_p / "repo"
+            _init_repo(repo)
+            c1 = _commit_file(repo, "a.txt", "1\n", "c1")
+            _git(repo, "branch", "unstable", c1)
+            bundle = _make_bundle(repo, tmp_p / "b.bundle", "refs/heads/unstable")
+
+            # Leading-dash `--local-rev` values must not be interpreted as git flags.
+            for bad_rev in ("-n", "--branches", "--all"):
+                v_bad = alr.verify_bundle_ff(bundle, repo_dir=repo, local_rev=bad_rev)
+                self.assertFalse(v_bad["ok"], bad_rev)
+                self.assertEqual(v_bad["status"], "missing_local_ref", bad_rev)
+
+            # Relative bundle_file passed to `parse_bundle_heads` when `cwd` is `repo`
+            # must resolve against the caller's cwd rather than `repo`.
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(tmp_p)
+                ok_rel, heads_rel, err_rel = alr.parse_bundle_heads(
+                    Path("b.bundle"), cwd=repo
+                )
+            finally:
+                os.chdir(prev_cwd)
+            self.assertTrue(ok_rel, err_rel)
+            self.assertEqual(heads_rel.get("refs/heads/unstable"), c1)
+
 
 # ---------------------------------------------------------------------------
 # x20 staging via `fileutil` (never through the `x20fsd` FUSE mount)
@@ -1519,6 +1639,8 @@ class TestX20Staging(unittest.TestCase):
             "/google/data/rw/teams/anneal-agent/markdittmer/anneal.bundle",
             "/google/data/ro/teams/anneal-agent/markdittmer/anneal.bundle",
             "/x20/teams/anneal-agent/markdittmer/anneal.bundle",
+            "/google/data/rw//teams//anneal-agent/markdittmer//anneal.bundle",
+            "/x20//teams//anneal-agent/markdittmer/anneal.bundle",
         ):
             self.assertTrue(alr.is_x20_path(path), path)
             self.assertEqual(
@@ -1568,8 +1690,9 @@ class TestX20Staging(unittest.TestCase):
         bundle_path: str,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         log_file = tmp_p / f"log-{mode}.jsonl"
+        log_file.unlink(missing_ok=True)
         scratch = tmp_p / f"scratch-{mode}"
-        scratch.mkdir()
+        scratch.mkdir(exist_ok=True)
         real_run = subprocess.run
         fileutil_kwargs: list[dict[str, Any]] = []
 
@@ -1659,23 +1782,26 @@ class TestX20Staging(unittest.TestCase):
             self.assertEqual(verdict["status"], "up_to_date")
             self.assertEqual(calls[0]["argv"][3], self.X20_URI)
 
-            # A local symlink whose target lives on the x20 FUSE mount must be
-            # staged through fileutil rather than read via FUSE.
-            link = tmp_p / "x20link.bundle"
-            link.symlink_to(self.FUSE_PATH)
-            real_realpath = os.path.realpath
-
-            def fake_realpath(p: Any, *a: Any, **kw: Any) -> str:
-                if str(p) == str(link):
-                    return self.FUSE_PATH
-                return real_realpath(p, *a, **kw)
-
-            with mock.patch.object(alr.os.path, "realpath", side_effect=fake_realpath):
-                verdict_link, calls_link, _ = self._run_case(
-                    tmp_p, repo, real_bundle, mock_fileutil, "not_found", str(link)
-                )
+            # A local symlink (or multi-hop symlink chain) whose target is an x20
+            # URI or FUSE path must be staged through fileutil without relying on
+            # `os.path.realpath` mocks.
+            link1 = tmp_p / "x20link1.bundle"
+            link1.symlink_to(self.FUSE_PATH)
+            link2 = tmp_p / "x20link2.bundle"
+            link2.symlink_to("x20link1.bundle")
+            verdict_link, calls_link, _ = self._run_case(
+                tmp_p, repo, real_bundle, mock_fileutil, "not_found", str(link2)
+            )
             self.assertEqual(verdict_link["status"], "no_remote_bundle")
             self.assertEqual(calls_link[0]["argv"][1:4], ["cp", "-f", self.X20_URI])
+
+            # Redundant slashes in a FUSE path normalize to the canonical `/x20/` URI.
+            slashed_fuse = "/google/data/rw//teams//anneal-agent/testuser//anneal.bundle"
+            verdict_slashed, calls_slashed, _ = self._run_case(
+                tmp_p, repo, real_bundle, mock_fileutil, "not_found", slashed_fuse
+            )
+            self.assertEqual(verdict_slashed["status"], "no_remote_bundle")
+            self.assertEqual(calls_slashed[0]["argv"][1:4], ["cp", "-f", self.X20_URI])
 
     def test_unrunnable_fileutil_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
