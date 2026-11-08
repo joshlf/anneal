@@ -4890,6 +4890,68 @@ def checkDerefAlign
         Nat.beq rem 0
 
 /--
+Address-level alignment check for an access whose required alignment is that of
+`tyOpt`, through a stack pointer `ptrVal` whose `BorrowEntry` `entry` targets the
+place `(entry.targetLocal, entry.targetProjection)` described by `targetDecls`
+(the active frame's `LocalDecl`s; `.nil` for caller-frame targets, whose
+declarations are not in scope, skips the check).
+
+`checkDerefAlign` only checks `ptrVal.offsetBytes`, which is relative to the
+borrowed place. The accessed address is `base + placeOff + ptrVal.offsetBytes`,
+where:
+- `base` is the allocation address of `entry.targetLocal`, an arbitrary multiple
+  of the local's alignment `localAlign`;
+- `placeOff` is the byte offset of `entry.targetProjection` within the local
+  (`projectionChainByteOffset?`).
+
+The access is aligned in every execution iff `reqAlign ≤ localAlign` and
+`(placeOff + ptrVal.offsetBytes) % reqAlign = 0` (alignments are powers of two).
+So reading a `u32` through `buf.as_ptr() as *const u32` with `buf : [u8; 8]` is
+undefined behavior even at offset `0`. When `placeOff` cannot be computed, only
+the `reqAlign ≤ localAlign` part is checked.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Accessing (loading from or storing to) a place that is dangling or based on
+> a misaligned pointer."
+-/
+def checkTargetPlaceAlign
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (tyOpt : Option Ty)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (targetRootValOpt : Option Value) :
+    Bool :=
+  match tyOpt, get? targetDecls entry.targetLocal with
+  | .some ty, .some decl =>
+    let reqAlign := tyByteAlign targetDecls layouts ty
+    match Nat.ble reqAlign 1 with
+    | true => true
+    | false =>
+      let localAlign := tyByteAlign targetDecls layouts decl.ty
+      match Nat.ble reqAlign localAlign with
+      | false => false
+      | true =>
+        match
+          projectionChainByteOffset?
+            layouts
+            (.some decl.ty)
+            targetRootValOpt
+            .none
+            0
+            targetDecls
+            entry.targetProjection
+        with
+        | .none => true
+        | .some placeOff =>
+          let absOff := Nat.add placeOff ptrVal.offsetBytes
+          let (_, rem) := divModBytesAux absOff absOff reqAlign 0
+          Nat.beq rem 0
+  | _, _ => true
+
+/--
 Validate that runtime `Value` `v` satisfies the bit-level validity invariant of
 static type `tyOpt`:
 - `RigidTy.bool`: `v` is `.scalar sc` with `sc.sizeBytes == 1 ∧ sc.bits ≤ 1`.
@@ -5187,7 +5249,17 @@ def evalStackThinPtrTypedDerefRead
     | .some pt, _ => .some pt
     | .none, .nil => resolvedAccTyOpt
     | .none, _ :: _ => .none
-  match checkDerefAlign localDecls layouts alignTyOpt ptrVal.offsetBytes with
+  match
+    Bool.and
+      (checkDerefAlign localDecls layouts alignTyOpt ptrVal.offsetBytes)
+      (checkTargetPlaceAlign
+        targetDecls
+        layouts
+        alignTyOpt
+        entry
+        ptrVal
+        (.some targetRootVal))
+  with
   | false => .ub
   | true =>
     let rawFullProj :=
@@ -6457,10 +6529,22 @@ def writeStackThinPtrTypedDeref
     | .some pt, _ => .some pt
     | .none, .nil => resolvedAccTyOpt
     | .none, _ :: _ => .none
+  let targetRootValOpt : Option Value :=
+    match get? targetLocals entry.targetLocal with
+    | .some (.init v) => .some v
+    | _ => .none
   match
     Bool.and
       (checkDerefAlign localDecls layouts alignTyOpt ptrVal.offsetBytes)
-      (validateValueForTy? layouts resolvedAccTyOpt val)
+      (Bool.and
+        (checkTargetPlaceAlign
+          targetDecls
+          layouts
+          alignTyOpt
+          entry
+          ptrVal
+          targetRootValOpt)
+        (validateValueForTy? layouts resolvedAccTyOpt val))
   with
   | false => .ub
   | true =>
@@ -10521,7 +10605,7 @@ offset/width (`ub`), `.some .none` on `.unsupported` projection read, and
 `.some (.some (fullProj, residualOffset))` when the reborrow target is live and
 in bounds.
 -/
-def resolveRefDerefTarget?
+def resolveRefDerefTargetCore?
     (locals : List LocalSlot)
     (targetRootVal : Value)
     (parentEntry : BorrowEntry)
@@ -10597,6 +10681,54 @@ def resolveRefDerefTarget?
       match widthOk with
       | false => .none
       | true => .some (.some (fullProj, residualOffset))
+
+/--
+Reference-reborrow target resolution (`Rvalue.ref _ (*ptr ...)`) with the
+address-level alignment check `checkTargetPlaceAlign`: a reference must be
+aligned for its pointee type in every execution. The check uses the pointee
+type when it is known, else the accessed type of a bare `*ptr`. It returns
+`.none` (`ub`) when the borrowed place cannot guarantee that alignment, and
+otherwise defers to `resolveRefDerefTargetCore?`.
+-/
+def resolveRefDerefTarget?
+    (locals : List LocalSlot)
+    (targetRootVal : Value)
+    (parentEntry : BorrowEntry)
+    (parentPtr : ProvenancePtr)
+    (resolvedRest : List ProjectionElem)
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (effPointeeTyOpt : Option Ty)
+    (accessedTyOpt : Option Ty)
+    (isSyntheticFieldOnScalarPointee : Bool := false) :
+    Option (Option (List ProjectionElem × Nat)) :=
+  let alignTyOpt : Option Ty :=
+    match effPointeeTyOpt, resolvedRest with
+    | .some pt, _ => .some pt
+    | .none, .nil => accessedTyOpt
+    | .none, _ :: _ => .none
+  match
+    checkTargetPlaceAlign
+      targetDecls
+      layouts
+      alignTyOpt
+      parentEntry
+      parentPtr
+      (.some targetRootVal)
+  with
+  | false => .none
+  | true =>
+    resolveRefDerefTargetCore?
+      locals
+      targetRootVal
+      parentEntry
+      parentPtr
+      resolvedRest
+      targetDecls
+      layouts
+      effPointeeTyOpt
+      accessedTyOpt
+      isSyntheticFieldOnScalarPointee
 
 /--
 Resolve the effective target projection path `(fullProj, residualOffset)` for a
