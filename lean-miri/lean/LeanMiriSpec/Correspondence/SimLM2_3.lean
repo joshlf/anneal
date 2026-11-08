@@ -56,8 +56,14 @@ inductive WellTypedLM2_3SetDiscriminant
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (place : Place) (variantIdx : VariantIdx) : Prop where
   | mk (decl : LocalDecl)
+       (defPath : DefPath)
+       (fields : List StructFieldDesc)
+       (paths : List (List ProjectionElem))
        (decl_lookup : get? body.localDecls place.local_ = some decl)
        (proj_nil : place.projection = [])
+       (env_lookup : env decl.ty = some (fields, paths))
+       (is_adt : ∃ args, decl.ty.kind = .adt defPath args)
+       (valid_layout : ValidStructLayout (translateTy decl.ty body.layouts).layout fields)
 
 theorem step_setDiscriminant_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -79,20 +85,26 @@ theorem step_setDiscriminant_simulation
   simp only [hbb, hstmt]
   cases hwt with
   | mk decl decl_lookup =>
-    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.setDiscriminant place variantIdx, span⟩) m = (sorry, .ok ()) := by sorry
-    have ha_ok : evalStmt s ⟨.setDiscriminant place variantIdx, span⟩ body.localDecls body.layouts = .step sorry := by sorry
+    obtain ⟨s', ha_ok⟩ : ∃ s', evalStmt s ⟨.setDiscriminant place variantIdx, span⟩ body.localDecls body.layouts = .step s' := by sorry
+    obtain ⟨m', hm_ok⟩ : ∃ m', Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.setDiscriminant place variantIdx, span⟩) m = (m', .ok ()) := by sorry
     rw [ha_ok]
-    have hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = (sorry, .ok true) := by sorry
+    have hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true) := by sorry
     rw [hstep]
-    sorry
+    exact StepRelLM2_2.step s' m' sorry
 
 inductive WellTypedLM2_3DiscriminantRead
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (dstIdx : Local) (place : Place) : Prop where
   | mk (decl : LocalDecl)
        (placeDecl : LocalDecl)
+       (defPath : DefPath)
+       (fields : List StructFieldDesc)
+       (paths : List (List ProjectionElem))
        (decl_lookup : get? body.localDecls dstIdx = some decl)
        (place_lookup : get? body.localDecls place.local_ = some placeDecl)
+       (env_lookup : env placeDecl.ty = some (fields, paths))
+       (is_adt : ∃ args, placeDecl.ty.kind = .adt defPath args)
+       (valid_layout : ValidStructLayout (translateTy placeDecl.ty body.layouts).layout fields)
 
 theorem evalRvalue_discriminant_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
