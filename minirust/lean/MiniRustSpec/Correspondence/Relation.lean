@@ -662,4 +662,174 @@ def StepRel (body : CapturedMir) (f : Gen.Function) (ctx : Ctx) (s : MachineStat
   | .vis (.inl (.fail .ub)) _ => ∃ msg, r = .error (.ub msg)
   | _ => False
 
+/-! ## Provenance & Exposed-Set Relation (`IntPtrCast.exposed`) (MR-3.3) -/
+
+/-- MiniRust `BasicMemory` provenance `(AllocId(ctx.base.length + targetLocal), ())`
+of a callee local `targetLocal` under caller context `ctx`. -/
+def targetProv (ctx : Ctx) (targetLocal : Nat) : Prov :=
+  (⟨((ctx.base.length + targetLocal : Nat) : Int)⟩, ())
+
+theorem targetProv_inj (ctx : Ctx) {k1 k2 : Nat} :
+    targetProv ctx k1 = targetProv ctx k2 ↔ k1 = k2 := by
+  constructor
+  · intro h
+    have h1 : ((ctx.base.length + k1 : Nat) : Int) = ((ctx.base.length + k2 : Nat) : Int) := by
+      simpa [targetProv] using congrArg (fun p : Prov => p.1._0) h
+    omega
+  · intro h
+    subst h
+    rfl
+
+@[simp] theorem IntPtrCast.expose_none (ipc : Gen.IntPtrCast Prov) (addr : Int) :
+    IntPtrCast.expose ipc { addr := addr, provenance := none } = ipc :=
+  rfl
+
+@[simp] theorem IntPtrCast.expose_some (ipc : Gen.IntPtrCast Prov) (addr : Int) (p : Prov) :
+    IntPtrCast.expose ipc { addr := addr, provenance := some p } =
+      { exposed := setInsert ipc.exposed p } :=
+  rfl
+
+@[simp] theorem IntPtrCast.exposeM_none {P : Type} [DecidableEq P]
+    (ipc : Gen.IntPtrCast P) (addr : Int) :
+    IntPtrCast.exposeM ipc { addr := addr, provenance := none } = ipc :=
+  rfl
+
+@[simp] theorem IntPtrCast.exposeM_some {P : Type} [DecidableEq P]
+    (ipc : Gen.IntPtrCast P) (addr : Int) (p : P) :
+    IntPtrCast.exposeM ipc { addr := addr, provenance := some p } =
+      { exposed := setInsert ipc.exposed p } :=
+  rfl
+
+theorem setContains_iff_mem {α : Type} [DecidableEq α] (s : LibSpecr.Set α) (x : α) :
+    setContains s x = true ↔ x ∈ s.elems := by
+  simp [setContains]
+
+theorem setContains_setInsert_iff {α : Type} [DecidableEq α] (s : LibSpecr.Set α) (x y : α) :
+    setContains (setInsert s x) y = true ↔ y = x ∨ setContains s y = true := by
+  simp only [setInsert]
+  split
+  · next hc =>
+    have hx : x ∈ s.elems := (setContains_iff_mem s x).mp hc
+    rw [setContains_iff_mem]
+    exact ⟨fun hy => .inr hy, fun h => h.elim (fun h1 => h1 ▸ hx) id⟩
+  · simp only [setContains_iff_mem, List.mem_append, List.mem_singleton]
+    exact Or.comm
+
+theorem setInsert_nodup {α : Type} [DecidableEq α] {s : LibSpecr.Set α} (x : α)
+    (hnd : s.elems.Nodup) : (setInsert s x).elems.Nodup := by
+  simp only [setInsert]
+  split
+  · exact hnd
+  · next hc =>
+    have hnx : x ∉ s.elems := fun hm => hc ((setContains_iff_mem s x).mpr hm)
+    exact List.nodup_append.mpr ⟨hnd, List.nodup_cons.mpr ⟨List.not_mem_nil, List.Pairwise.nil⟩,
+      fun a ha b hb => by simp only [List.mem_singleton] at hb; subst hb; exact fun h => hnx (h ▸ ha)⟩
+
+theorem IntPtrCast.expose_nodup {ipc : Gen.IntPtrCast Prov} (ptr : Ptr)
+    (hnd : ipc.exposed.elems.Nodup) :
+    (IntPtrCast.expose ipc ptr).exposed.elems.Nodup := by
+  rcases ptr with ⟨addr, _ | p⟩
+  · exact hnd
+  · exact setInsert_nodup p hnd
+
+theorem IntPtrCast.exposeM_nodup {P : Type} [DecidableEq P] {ipc : Gen.IntPtrCast P}
+    (ptr : Gen.ThinPointer P) (hnd : ipc.exposed.elems.Nodup) :
+    (IntPtrCast.exposeM ipc ptr).exposed.elems.Nodup := by
+  rcases ptr with ⟨addr, _ | p⟩
+  · exact hnd
+  · exact setInsert_nodup p hnd
+
+theorem setContains_expose_some_iff (ipc : Gen.IntPtrCast Prov) (addr : Int) (p q : Prov) :
+    setContains (IntPtrCast.expose ipc { addr := addr, provenance := some p }).exposed q = true ↔
+      q = p ∨ setContains ipc.exposed q = true := by
+  simp [setContains_setInsert_iff]
+
+theorem setContains_exposeM_some_iff {P : Type} [DecidableEq P]
+    (ipc : Gen.IntPtrCast P) (addr : Int) (p q : P) :
+    setContains (IntPtrCast.exposeM ipc { addr := addr, provenance := some p }).exposed q = true ↔
+      q = p ∨ setContains ipc.exposed q = true := by
+  simp [setContains_setInsert_iff]
+
+/-- Whether provenance `p` points to a live allocation in `allocs`. -/
+def ExposedAllocOk (allocs : List Gen.Allocation) (p : Prov) : Prop :=
+  ∃ (idx : Nat) (a : Gen.Allocation),
+    p = (⟨(idx : Int)⟩, ()) ∧ allocs[idx]? = some a ∧ a.live = true
+
+/-- Coupling between an Anneal borrow tag `tag` and its MiniRust target
+provenance `p` and live allocation in `allocs`. -/
+def ExposedTargetOk (body : CapturedMir) (ctx : Ctx) (s : MachineState)
+    (allocs : List Gen.Allocation) (tag : Nat) (p : Prov) : Prop :=
+  ∃ (entry : BorrowEntry) (pointeeIt : Gen.IntType) (relOff : Nat) (alloc : Gen.Allocation),
+    lookupBorrow s.memory.borrows tag = some entry ∧
+    entry.targetLocal ∈ bodyAddrTakenLocals body ∧
+    ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+      some (pointeeIt, relOff) ∧
+    p = targetProv ctx entry.targetLocal ∧
+    allocs[ctx.base.length + entry.targetLocal]? = some alloc ∧
+    alloc.live = true ∧
+    alloc.addr = ctx.addrs.getD entry.targetLocal 0 ∧
+    relOff + pointeeIt.size.bytes ≤ (Allocation.size alloc).bytes
+
+theorem ExposedTargetOk.toExposedAllocOk {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {allocs : List Gen.Allocation} {tag : Nat} {p : Prov}
+    (h : ExposedTargetOk body ctx s allocs tag p) :
+    ExposedAllocOk allocs p := by
+  obtain ⟨entry, _, _, alloc, _, _, _, rfl, halloc, hlive, _, _⟩ := h
+  exact ⟨ctx.base.length + entry.targetLocal, alloc, rfl, halloc, hlive⟩
+
+/-- Synchronized provenance and exposed-set invariant relating Anneal's exposed
+borrow tags `exposedTags` and MiniRust's `m.intptrcast.exposed`. -/
+structure ProvenanceRel (body : CapturedMir) (ctx : Ctx) (s : MachineState)
+    (m : Mach) (exposedTags : List Nat) : Prop where
+  nodup : m.intptrcast.exposed.elems.Nodup
+  sound : ∀ p, setContains m.intptrcast.exposed p = true →
+    ∃ tag ∈ exposedTags, ExposedTargetOk body ctx s m.mem.memory.allocations tag p
+  complete : ∀ tag ∈ exposedTags,
+    ∃ p, setContains m.intptrcast.exposed p = true ∧
+      ExposedTargetOk body ctx s m.mem.memory.allocations tag p
+
+theorem ProvenanceRel.empty (body : CapturedMir) (ctx : Ctx) (s : MachineState) (m : Mach)
+    (hempty : m.intptrcast.exposed.elems = []) :
+    ProvenanceRel body ctx s m [] where
+  nodup := by rw [hempty]; exact List.Pairwise.nil
+  sound p hp := by
+    rw [setContains_iff_mem, hempty] at hp
+    cases hp
+  complete _ hmem := by cases hmem
+
+theorem ProvenanceRel.expose_none {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {m : Mach} {exposedTags : List Nat} (addr : Int)
+    (hrel : ProvenanceRel body ctx s m exposedTags) :
+    ProvenanceRel body ctx s
+      { m with intptrcast := IntPtrCast.expose m.intptrcast { addr := addr, provenance := none } }
+      exposedTags :=
+  hrel
+
+theorem ProvenanceRel.expose_some {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {m : Mach} {exposedTags : List Nat} {tag : Nat} {p : Prov} (addr : Int)
+    (hrel : ProvenanceRel body ctx s m exposedTags)
+    (htgt : ExposedTargetOk body ctx s m.mem.memory.allocations tag p) :
+    ProvenanceRel body ctx s
+      { m with intptrcast := IntPtrCast.expose m.intptrcast { addr := addr, provenance := some p } }
+      (tag :: exposedTags) where
+  nodup := IntPtrCast.expose_nodup { addr := addr, provenance := some p } hrel.nodup
+  sound q hq := by
+    rw [setContains_expose_some_iff] at hq
+    rcases hq with rfl | hq_old
+    · exact ⟨tag, List.mem_cons_self .., htgt⟩
+    · obtain ⟨t', ht', htgt'⟩ := hrel.sound q hq_old
+      exact ⟨t', List.mem_cons_of_mem tag ht', htgt'⟩
+  complete t ht := by
+    rcases List.mem_cons.mp ht with rfl | ht_old
+    · exact ⟨p, (setContains_expose_some_iff m.intptrcast addr p p).mpr (.inl rfl), htgt⟩
+    · obtain ⟨q, hq, htgt'⟩ := hrel.complete t ht_old
+      exact ⟨q, (setContains_expose_some_iff m.intptrcast addr p q).mpr (.inr hq), htgt'⟩
+
+theorem ProvenanceRel.exposed_alloc_live {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {m : Mach} {exposedTags : List Nat} (hrel : ProvenanceRel body ctx s m exposedTags)
+    {p : Prov} (hp : setContains m.intptrcast.exposed p = true) :
+    ExposedAllocOk m.mem.memory.allocations p := by
+  obtain ⟨tag, _, htgt⟩ := hrel.sound p hp
+  exact htgt.toExposedAllocOk
+
 end MiniRustSpec.Correspondence

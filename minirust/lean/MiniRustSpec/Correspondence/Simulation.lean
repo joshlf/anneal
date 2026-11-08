@@ -4650,4 +4650,58 @@ theorem initMachineState_startRel {body : CapturedMir} {f : Gen.Function}
         simp only [List.getElem?_cons_succ]
         exact hdead k (by omega) (by rw [hdecls] at hi2; simpa using hi2)
 
+/-! ## Provenance-tracked state relation (`MR-3.3`) -/
+
+/-- `StateRelN` extended with `ProvenanceRel` tracking the correspondence
+between Anneal's exposed borrow tags `exposedTags` and MiniRust's
+`m.intptrcast.exposed` provenance set (`spec/mem/intptrcast.md`). -/
+def StateRelNProv (body : CapturedMir) (f : Gen.Function) (ctx : Ctx)
+    (s : MachineState) (m : Mach) (exposedTags : List Nat) : Prop :=
+  StateRelN body f ctx s m ∧ ProvenanceRel body ctx s m exposedTags
+
+theorem StateRelNProv.empty {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {s : MachineState} {m : Mach}
+    (hrel : StateRelN body f ctx s m) (hexp : m.intptrcast.exposed.elems = []) :
+    StateRelNProv body f ctx s m [] :=
+  ⟨hrel, ProvenanceRel.empty body ctx s m hexp⟩
+
+/-- Under `StateRelN`, every borrow entry `entry` found by `lookupBorrow`
+targets an address-taken local `entry.targetLocal ∈ bodyAddrTakenLocals body`
+with a valid `ptrTargetSpec`. -/
+theorem StateRelN.expose_provenance_rel {body : CapturedMir} {f : Gen.Function}
+    {ctx : Ctx} {s : MachineState} {m : Mach} {exposedTags : List Nat}
+    (hrel : StateRelN body f ctx s m)
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    {tag : Nat} {p : Prov} (addr : Int)
+    (htgt : ExposedTargetOk body ctx s m.mem.memory.allocations tag p) :
+    ∃ entry,
+      lookupBorrow s.memory.borrows tag = some entry ∧
+      entry.targetLocal ∈ bodyAddrTakenLocals body ∧
+      ProvenanceRel body ctx s
+        { m with intptrcast := IntPtrCast.expose m.intptrcast { addr := addr, provenance := some p } }
+        (tag :: exposedTags) := by
+  obtain ⟨_, _, _, _, _, _, _⟩ := hrel
+  have htgt' := htgt
+  obtain ⟨entry, _, _, _, hlk, hk, _⟩ := htgt'
+  exact ⟨entry, hlk, hk, hprov.expose_some addr htgt⟩
+
+/-- Under `StateRelNProv` on an `inFragment` body, every provenance `prov` in
+`m.intptrcast.exposed` is `targetProv ctx k` for an address-taken local
+`k ∈ bodyAddrTakenLocals body` mapped to `localPtr ctx k` in the callee frame. -/
+theorem StateRelNProv.exposed_target_localPtr {body : CapturedMir} {f : Gen.Function}
+    {ctx : Ctx} {s : MachineState} {m : Mach} {exposedTags : List Nat}
+    (h : StateRelNProv body f ctx s m exposedTags)
+    (hfrag : inFragment body = true)
+    {prov : Prov} (hc : setContains m.intptrcast.exposed prov = true) :
+    ∃ k ∈ bodyAddrTakenLocals body,
+      prov = targetProv ctx k ∧
+      ∃ (view : List LocalSlot) (lm : Map Gen.LocalName Ptr),
+        m.threads = [thread1 ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx s.frame.stmtIdx]] ∧
+        view[k]? ≠ some LocalSlot.dead ∧
+        mapGet lm (localName k) = some (localPtr ctx k) := by
+  obtain ⟨⟨view, lm, _, hthr, _, _, hbo⟩, hprov⟩ := h
+  obtain ⟨_, _, entry, _, _, _, _, hk, _, rfl, _⟩ := hprov.sound prov hc
+  obtain ⟨hnd, hlmk, _⟩ := hbo.target_ptrs hfrag entry.targetLocal hk
+  exact ⟨entry.targetLocal, hk, rfl, view, lm, hthr, hnd, hlmk⟩
+
 end MiniRustSpec.Correspondence

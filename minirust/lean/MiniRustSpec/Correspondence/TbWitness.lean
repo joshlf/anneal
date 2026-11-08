@@ -88,6 +88,8 @@ and MiniRust `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`):
 
 namespace MiniRustSpec.Correspondence.TbWitness
 
+set_option Elab.async false
+
 open Trusted.Effect
 open Trusted.ITree
 open Trusted.Rustc.V2026_06_01
@@ -1578,5 +1580,157 @@ theorem unitTupleMutRefRoundTrip_three_way :
       some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
     retAfterTB unitTupleMutRefRoundTrip [.scalar ⟨42, 4⟩] 14 = tbRetU32 42 :=
   ⟨⟨_, runA_sound unitTupleMutRefRoundTrip 30 _ _ _ rfl⟩, by decide +kernel, by decide +kernel⟩
+
+/-! ## 8. MR-3.3 Provenance & `IntPtrCast` (`PointerExposeProvenance` / `PointerWithExposedProvenance`) 3-Way Witnesses -/
+
+/-- Stop reason (`Stop`) after `n` `Mach` steps under `translateFnWithIntrinsics`. -/
+def stopAfterIntr (body : CapturedMir) (args : List Value) (n : Nat) : Option Stop :=
+  (startMachineIntr body args).bind fun m =>
+    match Interp.steps n m with
+    | .error e => some e
+    | .ok _ => none
+
+/-- `translateFnWithIntrinsics` lowers `exposeTwice` by splitting blocks at both
+`PointerExposeProvenance` casts. -/
+theorem exposeTwice_translateIntr :
+    (translateFnWithIntrinsics exposeTwice).isSome = true := by decide +kernel
+
+theorem exposeSingleRefMutRoundTrip_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics exposeSingleRefMutRoundTrip = true := by decide +kernel
+
+theorem exposeSharedRefWriteUb_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics exposeSharedRefWriteUb = true := by decide +kernel
+
+theorem exposeTwoRefMutAngelicUnsupported_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics exposeTwoRefMutAngelicUnsupported = true := by decide +kernel
+
+/-- Raw-pointer `PointerExposeProvenance` → `usize` → `PointerWithExposedProvenance`
+round-trip (`_2 = &raw mut _1; _3 = expose(_2); _4 = with_exposed(_3); (*_4) = 77; _0 = (*_4)`):
+lies in `inFragmentWithIntrinsics`, translates via `translateFnWithIntrinsics`, and
+returns `77` across Anneal, `Mach`, and `MachTB`. -/
+def int2ptrRawRoundTripOk : CapturedMir :=
+  ptrBody "witness::int2ptr_raw_round_trip_ok"
+    [u32Decl, u32Decl, ptrMutU32Decl, usizeDecl, ptrMutU32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (local_ 2) (.rawPtr .mut (local_ 1)),
+     .assign (local_ 3) (.cast .pointerExposeProvenance (.copy (local_ 2)) usizeTy),
+     .assign (local_ 4) (.cast .pointerWithExposedProvenance (.copy (local_ 3)) ptrMutU32Ty),
+     .assign (derefPlace 4) (.use (constU32 77)),
+     .assign (local_ 0) (.use (.copy (derefPlace 4)))]
+
+theorem int2ptrRawRoundTripOk_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics int2ptrRawRoundTripOk = true := by decide +kernel
+
+theorem int2ptrRawRoundTripOk_translateIntr :
+    (translateFnWithIntrinsics int2ptrRawRoundTripOk).isSome = true := by decide +kernel
+
+theorem int2ptrRawRoundTripOk_minirust_direct :
+    retAfterIntr int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩] 10 =
+      some (some { retAlloc with data := scalarBytes u32 77 }, [1]) := by
+  decide +kernel
+
+theorem int2ptrRawRoundTripOk_tb_direct :
+    retAfterIntrTB int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩] 10 = tbRetU32 77 := by
+  decide +kernel
+
+/-- Constructing a `*const u32` via `PointerWithExposedProvenance` from an integer
+address (`256`, the stack address of `_1` under `ctx0`) when `exposed = ∅`:
+`IntPtrCast.int2ptr` yields `{ addr := 256, provenance := none }`, and dereferencing
+`*_3` raises `Stop.ub "dereferencing pointer without provenance"` on both `Mach`
+and `MachTB` (and faults in Anneal because `256 / 65536 = 0` has no borrow entry). -/
+def int2ptrUnexposedDerefUb : CapturedMir :=
+  ptrBody "witness::int2ptr_unexposed_deref_ub"
+    [u32Decl, u32Decl, usizeDecl, ptrConstU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (local_ 2) (.use (constUsize 256)),
+     .assign (local_ 3) (.cast .pointerWithExposedProvenance (.copy (local_ 2)) ptrConstU32Ty),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem int2ptrUnexposedDerefUb_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics int2ptrUnexposedDerefUb = true := by decide +kernel
+
+theorem int2ptrUnexposedDerefUb_translateIntr :
+    (translateFnWithIntrinsics int2ptrUnexposedDerefUb).isSome = true := by decide +kernel
+
+theorem int2ptrUnexposedDerefUb_minirust_direct :
+    stopAfterIntr int2ptrUnexposedDerefUb [.scalar ⟨5, 4⟩] 6 =
+      some (.ub "dereferencing pointer without provenance") := by
+  decide +kernel
+
+theorem int2ptrUnexposedDerefUb_tb_direct :
+    stopAfterIntrTB int2ptrUnexposedDerefUb [.scalar ⟨5, 4⟩] 6 =
+      some (.ub "dereferencing pointer without provenance") := by
+  decide +kernel
+
+/-- Exposing pointers to two distinct live stack allocations (`_1` and `_2`) so
+`m.intptrcast.exposed` has two elements (`p1 :: p2 :: []`), then calling
+`PointerWithExposedProvenance` on an out-of-bounds integer address (`1024`) where
+`candidates = []`: both `Mach` and `MachTB` stop with
+`Stop.unsupported "int2ptr: no exposed allocation is in-bounds of the address (angelic choice)"`,
+and when two live exposed `BasicMemory` allocations `[128..132]` and `[132..136]`
+meet at boundary address `132`, `IntPtrCast.int2ptr` stops with
+`Stop.unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)"`. -/
+def int2ptrMultiAllocBoundaryUnsupported : CapturedMir :=
+  ptrBody "witness::int2ptr_multi_alloc_boundary_unsupported"
+    [u32Decl, u32Decl, u32Decl, ptrConstU32Decl, ptrConstU32Decl,
+     usizeDecl, usizeDecl, usizeDecl, ptrConstU32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .storageLive 6, .storageLive 7, .storageLive 8,
+     .assign (local_ 2) (.use (constU32 9)),
+     .assign (local_ 3) (.rawPtr .not (local_ 1)),
+     .assign (local_ 4) (.rawPtr .not (local_ 2)),
+     .assign (local_ 5) (.cast .pointerExposeProvenance (.copy (local_ 3)) usizeTy),
+     .assign (local_ 6) (.cast .pointerExposeProvenance (.copy (local_ 4)) usizeTy),
+     .assign (local_ 7) (.use (constUsize 1024)),
+     .assign (local_ 8) (.cast .pointerWithExposedProvenance (.copy (local_ 7)) ptrConstU32Ty),
+     .assign (local_ 0) (.use (.copy (derefPlace 8)))]
+
+theorem int2ptrMultiAllocBoundaryUnsupported_translateIntr :
+    (translateFnWithIntrinsics int2ptrMultiAllocBoundaryUnsupported).isSome = true := by decide +kernel
+
+theorem int2ptrMultiAllocOutOfBounds_bm :
+    let a0 : Gen.Allocation :=
+      { data := scalarBytes u32 1, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+    let a1 : Gen.Allocation :=
+      { data := scalarBytes u32 2, addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+    int2ptrCandidates [a0, a1] ⟨[(⟨0⟩, ()), (⟨1⟩, ())]⟩ 1024 = [] :=
+  rfl
+
+theorem int2ptrAdjacentBoundaryMeeting_bm :
+    let a0 : Gen.Allocation :=
+      { data := scalarBytes u32 1, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+    let a1 : Gen.Allocation :=
+      { data := scalarBytes u32 2, addr := 132, align := ⟨4⟩, kind := .Stack, live := true, extra := () }
+    int2ptrCandidates [a0, a1] ⟨[(⟨0⟩, ()), (⟨1⟩, ())]⟩ 132 = [(⟨0⟩, ()), (⟨1⟩, ())] :=
+  rfl
+
+/-- Exposing a pointer to temporary local `_2`, reconstructing `*const u32` via
+`PointerWithExposedProvenance` while `_2` is still live, then executing
+`StorageDead(_2)` to deallocate `_2` (`a.live = false`) before dereferencing `*_5`:
+all three semantics (`Anneal`, `Mach`, and `MachTB`) raise UB
+(`"dereferencing pointer to dead allocation"` on `Mach` and `MachTB`). -/
+def int2ptrDeadAllocDerefUb : CapturedMir :=
+  ptrBody "witness::int2ptr_dead_alloc_deref_ub"
+    [u32Decl, u32Decl, u32Decl, ptrConstU32Decl, usizeDecl, ptrConstU32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .assign (local_ 2) (.use (constU32 42)),
+     .assign (local_ 3) (.rawPtr .not (local_ 2)),
+     .assign (local_ 4) (.cast .pointerExposeProvenance (.copy (local_ 3)) usizeTy),
+     .assign (local_ 5) (.cast .pointerWithExposedProvenance (.copy (local_ 4)) ptrConstU32Ty),
+     .storageDead 2,
+     .assign (local_ 0) (.use (.copy (derefPlace 5)))]
+
+theorem int2ptrDeadAllocDerefUb_translateIntr :
+    (translateFnWithIntrinsics int2ptrDeadAllocDerefUb).isSome = true := by decide +kernel
+
+theorem int2ptrDeadAllocDerefUb_minirust_direct :
+    stopAfterIntr int2ptrDeadAllocDerefUb [.scalar ⟨5, 4⟩] 11 =
+      some (.ub "dereferencing pointer to dead allocation") := by
+  decide +kernel
+
+theorem int2ptrDeadAllocDerefUb_tb_direct :
+    stopAfterIntrTB int2ptrDeadAllocDerefUb [.scalar ⟨5, 4⟩] 11 =
+      some (.ub "dereferencing pointer to dead allocation") := by
+  decide +kernel
 
 end MiniRustSpec.Correspondence.TbWitness

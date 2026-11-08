@@ -3210,4 +3210,367 @@ def inFragment (body : MirAst.CapturedMir) : Bool :=
   storageDeadOk body && movesOk body && mentionsOk body && ptrAliasingOk body &&
   (translateFn body).isSome
 
+/-! ## Provenance-Cast In-Fragment Lowering & Block-Splitting Specifications (MR-3.3) -/
+
+/-- Whether a MIR statement is an assignment of a provenance cast
+(`CastKind::PointerExposeProvenance` or `CastKind::PointerWithExposedProvenance`). -/
+def isProvCastStmt (s : MirAst.Statement) : Bool :=
+  match s.kind with
+  | .assign _ (.cast .pointerExposeProvenance _ _) => true
+  | .assign _ (.cast .pointerWithExposedProvenance _ _) => true
+  | _ => false
+
+/-- Fragment rvalue check for `CastKind::PointerExposeProvenance(op, targetTy)`
+(inspected after `copyRv`) assigned to an integer local of type `it`:
+`it` and `targetTy` must both be `usize` (`usizeIt`), and `op` must read a
+declared thin pointer or reference local `⟨p, []⟩`. -/
+def exposeCastOk (decls : List MirAst.LocalDecl) (it : Gen.IntType) : MirAst.Rvalue → Bool
+  | .cast .pointerExposeProvenance (.copy ⟨p, []⟩) targetTy =>
+    decide (it = usizeIt) &&
+    decide (intTypeOf targetTy = some usizeIt) &&
+    decide (p < decls.length) &&
+    (decls[p]? >>= (ptrPointeeOf ·.ty)).isSome
+  | _ => false
+
+/-- Fragment rvalue check for `CastKind::PointerWithExposedProvenance(op, targetTy)`
+(inspected after `copyRv`) assigned to a thin raw pointer local (`isRef = false`)
+of mutability `mutbl` and pointee integer type `pointeeIt`:
+`targetTy` must be a thin raw pointer of `(mutbl, pointeeIt)` and `op` must be a
+valid `usize` operand (`operandOk layouts decls usizeIt op`). -/
+def withExposedCastOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
+    (decls : List MirAst.LocalDecl) (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType)
+    (isRef : Bool := false) : MirAst.Rvalue → Bool
+  | .cast .pointerWithExposedProvenance op targetTy =>
+    !isRef &&
+    decide (rawPtrPointeeOf targetTy = some (mutbl, pointeeIt)) &&
+    operandOk layouts decls usizeIt op
+  | _ => false
+
+/-- Well-formedness check for a root provenance-cast statement
+`_i = Cast(PointerExposeProvenance, op, usize)` or
+`_i = Cast(PointerWithExposedProvenance, op, *const T / *mut T)`. -/
+def provCastStmtOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
+  match s.kind with
+  | .assign ⟨i, []⟩ rv =>
+    match decls[i]? with
+    | none => false
+    | some d =>
+      match intTypeOf d.ty with
+      | some it => exposeCastOk decls it (copyRv rv)
+      | none =>
+        match ptrPointeeOf d.ty with
+        | some (mutbl, pointeeIt) =>
+          withExposedCastOk layouts decls mutbl pointeeIt (isRefTy d.ty) (copyRv rv)
+        | none => false
+  | _ => false
+
+/-- Statement well-formedness extended with provenance-cast statements lowered
+to `Terminator::Intrinsic` blocks by `translateStmtOrIntrinsic`. -/
+def statementOkWithIntrinsics (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
+  statementOk decls s layouts || provCastStmtOk decls s layouts
+
+/-- Decidable fragment extended with `CastKind::PointerExposeProvenance` and
+`CastKind::PointerWithExposedProvenance` statements lowered via
+`translateFnWithIntrinsics`. -/
+def inFragmentWithIntrinsics (body : MirAst.CapturedMir) : Bool :=
+  body.isRuntimePostCleanup &&
+  decide (body.argCount + 1 ≤ body.localDecls.length) &&
+  decide (body.localDecls.length < 2 ^ 31) &&
+  (body.localDecls[0]? >>= (scalarTypeOf ·.ty)).isSome &&
+  body.localDecls.all (localDeclOk body.layouts) &&
+  ((body.localDecls.drop 1).take body.argCount).all (fun d => !isPtrTy d.ty) &&
+  (body.localDecls.drop (body.argCount + 1)).all
+    (fun d => (scalarTypeOf d.ty).isSome || isPtrTy d.ty) &&
+  decide (body.basicBlocks ≠ []) &&
+  body.basicBlocks.all (fun bb =>
+    !bb.isCleanup &&
+    bb.statements.all (statementOkWithIntrinsics body.localDecls · body.layouts) &&
+    terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator) &&
+  storageDeadOk body && movesOk body && mentionsOk body &&
+  (translateFnWithIntrinsics body).isSome
+
+/-- Number of `.intrinsic` entries in a `StmtTranslation` list. -/
+def countIntrinsics : List StmtTranslation → Nat
+  | [] => 0
+  | .stmt _ :: rest => countIntrinsics rest
+  | .intrinsic _ _ _ :: rest => 1 + countIntrinsics rest
+
+theorem translateStmtOrIntrinsic_expose (decls : List MirAst.LocalDecl)
+    (dst : MirAst.Place) (op : MirAst.Operand) (ty : MirAst.Ty) (span : String)
+    (layouts : Layout.LayoutTable) :
+    translateStmtOrIntrinsic decls ⟨.assign dst (.cast .pointerExposeProvenance op ty), span⟩ layouts =
+      (do
+        let destination ← translatePlace decls dst
+        let operand ← translateOperand decls op
+        pure (.intrinsic .PointerExposeProvenance destination [operand])) :=
+  rfl
+
+theorem translateStmtOrIntrinsic_withExposed (decls : List MirAst.LocalDecl)
+    (dst : MirAst.Place) (op : MirAst.Operand) (ty : MirAst.Ty) (span : String)
+    (layouts : Layout.LayoutTable) :
+    translateStmtOrIntrinsic decls ⟨.assign dst (.cast .pointerWithExposedProvenance op ty), span⟩ layouts =
+      (do
+        let destination ← translatePlace decls dst
+        let operand ← translateOperand decls op
+        pure (.intrinsic .PointerWithExposedProvenance destination [operand])) :=
+  rfl
+
+theorem translateStmtOrIntrinsic_of_not_provCast (decls : List MirAst.LocalDecl)
+    (s : MirAst.Statement) (layouts : Layout.LayoutTable)
+    (hnp : isProvCastStmt s = false) :
+    translateStmtOrIntrinsic decls s layouts = (translateStatement decls s layouts).map .stmt := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    cases rv with
+    | cast ck op ty =>
+      cases ck <;> first | rfl | simp [isProvCastStmt] at hnp
+    | _ => rfl
+  | _ => rfl
+
+theorem translateStmtOrIntrinsic_of_translateStatement (decls : List MirAst.LocalDecl)
+    (s : MirAst.Statement) (layouts : Layout.LayoutTable) (st' : Gen.Statement)
+    (h : translateStatement decls s layouts = some st') :
+    translateStmtOrIntrinsic decls s layouts = some (.stmt st') := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    cases rv with
+    | cast ck op ty =>
+      cases ck with
+      | pointerExposeProvenance =>
+        simp [translateStatement, translateRvalue, copyRv] at h
+      | pointerWithExposedProvenance =>
+        simp [translateStatement, translateRvalue, copyRv] at h
+      | _ => simp [translateStmtOrIntrinsic, h]
+    | _ => simp [translateStmtOrIntrinsic, h]
+  | _ => simp [translateStmtOrIntrinsic, h]
+
+theorem provCastStmtOk_some (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable) (h : provCastStmtOk decls s layouts = true) :
+    ∃ op dst args, translateStmtOrIntrinsic decls s layouts = some (.intrinsic op dst args) := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    rcases dst with ⟨i, projs⟩
+    cases projs with
+    | cons _ _ => simp [provCastStmtOk] at h
+    | nil =>
+      simp only [provCastStmtOk] at h
+      cases hd : decls[i]? with
+      | none => simp [hd] at h
+      | some d =>
+        simp only [hd] at h
+        cases hit : intTypeOf d.ty with
+        | some it =>
+          simp only [hit] at h
+          cases rv with
+          | cast ck op targetTy =>
+            cases ck with
+            | pointerExposeProvenance =>
+              cases op with
+              | copy pl =>
+                rcases pl with ⟨p, pprojs⟩
+                cases pprojs with
+                | nil =>
+                  exact ⟨.PointerExposeProvenance, .Local (localName i), [.Load (.Local (localName p))], rfl⟩
+                | cons _ _ => simp [copyRv, copyOp, exposeCastOk] at h
+              | move pl =>
+                rcases pl with ⟨p, pprojs⟩
+                cases pprojs with
+                | nil =>
+                  exact ⟨.PointerExposeProvenance, .Local (localName i), [.Load (.Local (localName p))], rfl⟩
+                | cons _ _ => simp [copyRv, copyOp, exposeCastOk] at h
+              | constant _ => simp [copyRv, copyOp, exposeCastOk] at h
+            | _ => simp [copyRv, exposeCastOk] at h
+          | _ => simp [copyRv, exposeCastOk] at h
+        | none =>
+          simp only [hit] at h
+          cases hpt : ptrPointeeOf d.ty with
+          | none => simp [hpt] at h
+          | some pr =>
+            obtain ⟨mutbl, pointeeIt⟩ := pr
+            simp only [hpt] at h
+            cases rv with
+            | cast ck op targetTy =>
+              cases ck with
+              | pointerWithExposedProvenance =>
+                simp only [copyRv, withExposedCastOk, Bool.and_eq_true] at h
+                obtain ⟨_, hop⟩ := h
+                have hsome : (translateOperand decls op).isSome = true := by
+                  cases op with
+                  | copy p =>
+                    simp only [copyOp, operandOk, Bool.and_eq_true] at hop
+                    exact hop.2
+                  | move p =>
+                    simp only [copyOp, operandOk, Bool.and_eq_true] at hop
+                    simpa [translateOperand] using hop.2
+                  | constant c =>
+                    simp only [copyOp, operandOk, Bool.and_eq_true] at hop
+                    exact hop.2
+                obtain ⟨ve, hve⟩ := Option.isSome_iff_exists.mp hsome
+                refine ⟨.PointerWithExposedProvenance, .Local (localName i), [ve], ?_⟩
+                simp [translateStmtOrIntrinsic, translatePlace, hve]
+              | _ => simp [copyRv, withExposedCastOk] at h
+            | _ => simp [copyRv, withExposedCastOk] at h
+  | _ => simp [provCastStmtOk] at h
+
+theorem splitBlockAtIntrinsics_no_intrinsics (curName : Gen.BbName)
+    (accStmts : List Gen.Statement) (finalTerm : Gen.Terminator) (kind : Gen.BbKind)
+    (nextFresh : Nat) (stmts : List Gen.Statement) :
+    splitBlockAtIntrinsics curName accStmts finalTerm kind nextFresh (stmts.map .stmt) =
+      ([(curName, ⟨accStmts ++ stmts, finalTerm, kind⟩)], nextFresh) := by
+  induction stmts generalizing accStmts with
+  | nil => simp [splitBlockAtIntrinsics]
+  | cons st rest ih =>
+    simp only [List.map_cons, splitBlockAtIntrinsics, ih, List.append_assoc, List.singleton_append]
+
+theorem splitBlockAtIntrinsics_fresh_eq (curName : Gen.BbName)
+    (accStmts : List Gen.Statement) (finalTerm : Gen.Terminator) (kind : Gen.BbKind)
+    (nextFresh : Nat) (trs : List StmtTranslation) :
+    (splitBlockAtIntrinsics curName accStmts finalTerm kind nextFresh trs).2 =
+      nextFresh + countIntrinsics trs := by
+  induction trs generalizing curName accStmts nextFresh with
+  | nil => simp [splitBlockAtIntrinsics, countIntrinsics]
+  | cons tr rest ih =>
+    cases tr with
+    | stmt st =>
+      simp only [splitBlockAtIntrinsics, countIntrinsics]
+      exact ih curName (accStmts ++ [st]) nextFresh
+    | intrinsic op dst args =>
+      simp only [splitBlockAtIntrinsics, countIntrinsics]
+      rw [ih (bbName nextFresh) [] (nextFresh + 1)]
+      omega
+
+theorem splitBlockAtIntrinsics_length (curName : Gen.BbName)
+    (accStmts : List Gen.Statement) (finalTerm : Gen.Terminator) (kind : Gen.BbKind)
+    (nextFresh : Nat) (trs : List StmtTranslation) :
+    (splitBlockAtIntrinsics curName accStmts finalTerm kind nextFresh trs).1.length =
+      1 + countIntrinsics trs := by
+  induction trs generalizing curName accStmts nextFresh with
+  | nil => simp [splitBlockAtIntrinsics, countIntrinsics]
+  | cons tr rest ih =>
+    cases tr with
+    | stmt st =>
+      simp only [splitBlockAtIntrinsics, countIntrinsics]
+      exact ih curName (accStmts ++ [st]) nextFresh
+    | intrinsic op dst args =>
+      simp only [splitBlockAtIntrinsics, countIntrinsics, List.length_cons]
+      rw [ih (bbName nextFresh) [] (nextFresh + 1)]
+      omega
+
+theorem splitBlockAtIntrinsics_single_intrinsic (curName : Gen.BbName)
+    (accStmts pre post : List Gen.Statement) (op : Gen.IntrinsicOp) (dst : Gen.PlaceExpr)
+    (args : List Gen.ValueExpr) (finalTerm : Gen.Terminator) (kind : Gen.BbKind)
+    (nextFresh : Nat) :
+    splitBlockAtIntrinsics curName accStmts finalTerm kind nextFresh
+        (pre.map .stmt ++ [.intrinsic op dst args] ++ post.map .stmt) =
+      ([(curName, ⟨accStmts ++ pre, .Intrinsic op args dst (some (bbName nextFresh)), kind⟩),
+        (bbName nextFresh, ⟨post, finalTerm, kind⟩)], nextFresh + 1) := by
+  induction pre generalizing accStmts with
+  | nil =>
+    simp only [List.map_nil, List.nil_append, List.singleton_append, splitBlockAtIntrinsics,
+      List.append_nil, splitBlockAtIntrinsics_no_intrinsics]
+  | cons st rest ih =>
+    simp only [List.map_cons, List.cons_append, splitBlockAtIntrinsics]
+    rw [ih (accStmts ++ [st])]
+    simp [List.append_assoc]
+
+theorem mapM_translateStmtOrIntrinsic_of_translateStatements (decls : List MirAst.LocalDecl)
+    (layouts : Layout.LayoutTable) :
+    ∀ (ss : List MirAst.Statement) (stmts : List Gen.Statement),
+      ss.mapM (translateStatement decls · layouts) = some stmts →
+      ss.mapM (translateStmtOrIntrinsic decls · layouts) = some (stmts.map .stmt)
+  | [], _, h => by
+    simp only [List.mapM_nil, Option.pure_def, Option.some.injEq] at h
+    subst h
+    rfl
+  | s :: ss, _, h => by
+    simp only [List.mapM_cons, Option.bind_eq_bind] at h
+    cases hs : translateStatement decls s layouts with
+    | none => simp [hs] at h
+    | some st' =>
+      simp only [hs, Option.bind_some] at h
+      cases hss : ss.mapM (translateStatement decls · layouts) with
+      | none => simp [hss] at h
+      | some rest' =>
+        simp only [hss, Option.bind_some, Option.pure_def, Option.some.injEq] at h
+        subst h
+        have h1 := translateStmtOrIntrinsic_of_translateStatement decls s layouts st' hs
+        have h2 := mapM_translateStmtOrIntrinsic_of_translateStatements decls layouts ss rest' hss
+        simp [List.mapM_cons, h1, h2]
+
+theorem translateBlocksWithIntrinsics_of_translateBlocks (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) :
+    ∀ (i nextFresh : Nat) (bbs : List MirAst.BasicBlockData)
+      (blks : List (Gen.BbName × Gen.BasicBlock)),
+      (∀ bb ∈ bbs, bb.isCleanup = false) →
+      translateBlocks layouts decls i bbs = some blks →
+      translateBlocksWithIntrinsics layouts decls i nextFresh bbs = some (blks, nextFresh)
+  | _, nextFresh, [], _, _, h => by
+    simp only [translateBlocks, Option.some.injEq] at h
+    subst h
+    rfl
+  | i, nextFresh, bb :: bbs, _, hclean, h => by
+    simp only [translateBlocks, translateBlock, Option.bind_eq_bind] at h
+    have hbb_clean : bb.isCleanup = false := hclean bb (List.mem_cons_self ..)
+    cases hss : bb.statements.mapM (translateStatement decls · layouts) with
+    | none => simp [hss] at h
+    | some stmts =>
+      simp only [hss, Option.bind_some] at h
+      cases hterm : translateTerminator layouts decls bb.terminator with
+      | none => simp [hterm] at h
+      | some term =>
+        simp only [hterm, Option.bind_some, Option.pure_def] at h
+        cases hrest : translateBlocks layouts decls (i + 1) bbs with
+        | none => simp [hrest] at h
+        | some restBlks =>
+          simp only [hrest, Option.bind_some, Option.some.injEq] at h
+          subst h
+          have hm := mapM_translateStmtOrIntrinsic_of_translateStatements decls layouts
+            bb.statements stmts hss
+          have ih := translateBlocksWithIntrinsics_of_translateBlocks layouts decls
+            (i + 1) nextFresh bbs restBlks
+            (fun b hb => hclean b (List.mem_cons_of_mem bb hb)) hrest
+          simp [translateBlocksWithIntrinsics, hm, hterm, hbb_clean,
+            splitBlockAtIntrinsics_no_intrinsics, ih]
+
+/-- Every non-cleanup function that `translateFn` translates (with no
+block-splitting intrinsics) is translated identically by `translateFnWithIntrinsics`. -/
+theorem translateFnWithIntrinsics_of_translateFn {body : MirAst.CapturedMir} {f : Gen.Function}
+    (hclean : ∀ bb ∈ body.basicBlocks, bb.isCleanup = false)
+    (h : translateFn body = some f) :
+    translateFnWithIntrinsics body = some f := by
+  simp only [translateFn, Option.bind_eq_bind] at h
+  cases hloc : translateLocals body.layouts 0 body.localDecls with
+  | none => simp [hloc] at h
+  | some locals =>
+    simp only [hloc, Option.bind_some] at h
+    cases hblks : translateBlocks body.layouts body.localDecls 0 body.basicBlocks with
+    | none => simp [hblks] at h
+    | some blocks =>
+      simp only [hblks, Option.bind_some, Option.pure_def, Option.some.injEq] at h
+      subst h
+      have hbi := translateBlocksWithIntrinsics_of_translateBlocks body.layouts body.localDecls
+        0 body.basicBlocks.length body.basicBlocks blocks hclean hblks
+      simp [translateFnWithIntrinsics, hloc, hbi]
+
+/-- `inFragment` embeds into `inFragmentWithIntrinsics`. -/
+theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
+    (h : inFragment body = true) :
+    inFragmentWithIntrinsics body = true := by
+  simp only [inFragment, inFragmentWithIntrinsics, Bool.and_eq_true, List.all_eq_true] at h ⊢
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, h12⟩, _⟩, h14⟩ := h
+  obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp h14
+  have hclean : ∀ bb ∈ body.basicBlocks, bb.isCleanup = false := by
+    intro bb hbb
+    simpa using (h9 bb hbb).1.1
+  have hfi := translateFnWithIntrinsics_of_translateFn hclean hf
+  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, ?_⟩, h10⟩, h11⟩, h12⟩, by simp [hfi]⟩
+  intro bb hbb
+  obtain ⟨⟨hc, hst⟩, htm⟩ := h9 bb hbb
+  exact ⟨⟨hc, fun s hs => by simp [statementOkWithIntrinsics, hst s hs]⟩, htm⟩
+
 end MiniRustSpec.Correspondence

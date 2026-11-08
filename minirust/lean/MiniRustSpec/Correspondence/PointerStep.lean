@@ -3208,4 +3208,326 @@ theorem evalStatement_validate_local_mr {body : CapturedMir} {f : Gen.Function} 
     exact ⟨ptrVal, entry, m1, hsi, hlookup, hm1,
       FrameOk.mk' h.hf hs1 h.locs h.declsOk h.nonScalar⟩
 
+/-! ## `PointerExposeProvenance` & `PointerWithExposedProvenance` (`IntPtrCast`) Correspondence (MR-3.3) -/
+
+/-- When `m.intptrcast.exposed` is empty (`[]`), `int2ptrProvenance` deterministically
+predicts `none` (unexposed integer-to-pointer cast). -/
+theorem int2ptrProvenance_empty {m : Mach} (addr : Int)
+    (hempty : m.intptrcast.exposed.elems = []) :
+    int2ptrProvenance m addr = .ok none := by
+  simp [int2ptrProvenance, hempty, pure, Except.pure]
+
+theorem IntPtrCast.int2ptr_empty {m : Mach} (addr : Int)
+    (hempty : m.intptrcast.exposed.elems = []) :
+    IntPtrCast.int2ptr m addr = .ok { addr := addr, provenance := none } := by
+  simp [IntPtrCast.int2ptr, int2ptrProvenance_empty addr hempty, bind, Except.bind, pure, Except.pure]
+
+theorem int2ptrProvenanceM_empty {M : Type} [Gen.Memory M] [MemoryOps M] {m : Gen.Machine M}
+    (addr : Int) (hempty : m.intptrcast.exposed.elems = []) :
+    int2ptrProvenanceM m addr = .ok none := by
+  simp [int2ptrProvenanceM, hempty, pure, Except.pure]
+
+theorem IntPtrCast.int2ptrM_empty {M : Type} [Gen.Memory M] [MemoryOps M] {m : Gen.Machine M}
+    (addr : Int) (hempty : m.intptrcast.exposed.elems = []) :
+    IntPtrCast.int2ptrM m addr = .ok { addr := addr, provenance := none } := by
+  simp [IntPtrCast.int2ptrM, int2ptrProvenanceM_empty addr hempty, bind, Except.bind, pure, Except.pure]
+
+/-- When `m.intptrcast.exposed` holds a single provenance `[p]`, `int2ptrProvenance`
+deterministically predicts `some p`. -/
+theorem int2ptrProvenance_singleton {m : Mach} (addr : Int) (p : Prov)
+    (hsingle : m.intptrcast.exposed.elems = [p]) :
+    int2ptrProvenance m addr = .ok (some p) := by
+  simp [int2ptrProvenance, hsingle, pure, Except.pure]
+
+theorem IntPtrCast.int2ptr_singleton {m : Mach} (addr : Int) (p : Prov)
+    (hsingle : m.intptrcast.exposed.elems = [p]) :
+    IntPtrCast.int2ptr m addr = .ok { addr := addr, provenance := some p } := by
+  simp [IntPtrCast.int2ptr, int2ptrProvenance_singleton addr p hsingle, bind, Except.bind, pure, Except.pure]
+
+theorem int2ptrProvenanceM_singleton {M : Type} [Gen.Memory M] [MemoryOps M] {m : Gen.Machine M}
+    (addr : Int) (p : Gen.Memory.Provenance M) (hsingle : m.intptrcast.exposed.elems = [p]) :
+    int2ptrProvenanceM m addr = .ok (some p) := by
+  simp [int2ptrProvenanceM, hsingle, pure, Except.pure]
+
+theorem IntPtrCast.int2ptrM_singleton {M : Type} [Gen.Memory M] [MemoryOps M] {m : Gen.Machine M}
+    (addr : Int) (p : Gen.Memory.Provenance M) (hsingle : m.intptrcast.exposed.elems = [p]) :
+    IntPtrCast.int2ptrM m addr = .ok { addr := addr, provenance := some p } := by
+  simp [IntPtrCast.int2ptrM, int2ptrProvenanceM_singleton addr p hsingle, bind, Except.bind, pure, Except.pure]
+
+/-- When `m.intptrcast.exposed` holds `≥ 2` provenances and `int2ptrCandidates`
+finds a unique live exposed allocation `[p]` containing `addr`, `int2ptrProvenance`
+deterministically resolves to `some p`. -/
+theorem int2ptrProvenance_multi_unique {m : Mach} (addr : Int)
+    (p1 p2 : Prov) (rest : List Prov) (p : Prov)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr = [p]) :
+    int2ptrProvenance m addr = .ok (some p) := by
+  simp [int2ptrProvenance, hmulti, hcand, pure, Except.pure]
+
+theorem IntPtrCast.int2ptr_multi_unique {m : Mach} (addr : Int)
+    (p1 p2 : Prov) (rest : List Prov) (p : Prov)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr = [p]) :
+    IntPtrCast.int2ptr m addr = .ok { addr := addr, provenance := some p } := by
+  simp [IntPtrCast.int2ptr, int2ptrProvenance_multi_unique addr p1 p2 rest p hmulti hcand,
+    bind, Except.bind, pure, Except.pure]
+
+theorem int2ptrProvenanceM_multi_unique {M : Type} [Gen.Memory M] [MemoryOps M] {m : Gen.Machine M}
+    (addr : Int) (p1 p2 : Gen.Memory.Provenance M) (rest : List (Gen.Memory.Provenance M))
+    (p : Gen.Memory.Provenance M)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : MemoryOps.exposedInBounds m.mem.memory m.intptrcast.exposed addr = [p]) :
+    int2ptrProvenanceM m addr = .ok (some p) := by
+  simp [int2ptrProvenanceM, hmulti, hcand, pure, Except.pure]
+
+theorem IntPtrCast.int2ptrM_multi_unique {M : Type} [Gen.Memory M] [MemoryOps M] {m : Gen.Machine M}
+    (addr : Int) (p1 p2 : Gen.Memory.Provenance M) (rest : List (Gen.Memory.Provenance M))
+    (p : Gen.Memory.Provenance M)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : MemoryOps.exposedInBounds m.mem.memory m.intptrcast.exposed addr = [p]) :
+    IntPtrCast.int2ptrM m addr = .ok { addr := addr, provenance := some p } := by
+  simp [IntPtrCast.int2ptrM, int2ptrProvenanceM_multi_unique addr p1 p2 rest p hmulti hcand,
+    bind, Except.bind, pure, Except.pure]
+
+/-- When `m.intptrcast.exposed` holds `≥ 2` provenances and no live exposed
+allocation contains `addr` (`int2ptrCandidates = []`), `int2ptrProvenance`
+halts with `Stop.unsupported` (angelic choice). -/
+theorem int2ptrProvenance_multi_none_unsupported {m : Mach} (addr : Int)
+    (p1 p2 : Prov) (rest : List Prov)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr = []) :
+    int2ptrProvenance m addr =
+      .error (.unsupported "int2ptr: multiple exposed allocations and none contains the address (angelic choice)") := by
+  simp [int2ptrProvenance, hmulti, hcand, unsupported]
+
+theorem IntPtrCast.int2ptr_multi_none_unsupported {m : Mach} (addr : Int)
+    (p1 p2 : Prov) (rest : List Prov)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr = []) :
+    IntPtrCast.int2ptr m addr =
+      .error (.unsupported "int2ptr: multiple exposed allocations and none contains the address (angelic choice)") := by
+  simp [IntPtrCast.int2ptr, int2ptrProvenance_multi_none_unsupported addr p1 p2 rest hmulti hcand,
+    bind, Except.bind]
+
+theorem int2ptrProvenanceM_multi_none_unsupported {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m : Gen.Machine M} (addr : Int)
+    (p1 p2 : Gen.Memory.Provenance M) (rest : List (Gen.Memory.Provenance M))
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : MemoryOps.exposedInBounds m.mem.memory m.intptrcast.exposed addr = []) :
+    int2ptrProvenanceM m addr =
+      .error (.unsupported "int2ptr: multiple exposed allocations and none contains the address (angelic choice)") := by
+  simp [int2ptrProvenanceM, hmulti, hcand, unsupported]
+
+/-- When `m.intptrcast.exposed` holds `≥ 2` provenances and multiple live exposed
+allocations meet at `addr` (`int2ptrCandidates = c1 :: c2 :: cs`),
+`int2ptrProvenance` halts with `Stop.unsupported` (angelic choice). -/
+theorem int2ptrProvenance_multi_ambiguous_unsupported {m : Mach} (addr : Int)
+    (p1 p2 : Prov) (rest : List Prov) (c1 c2 : Prov) (cs : List Prov)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr = c1 :: c2 :: cs) :
+    int2ptrProvenance m addr =
+      .error (.unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)") := by
+  simp [int2ptrProvenance, hmulti, hcand, unsupported]
+
+theorem IntPtrCast.int2ptr_multi_ambiguous_unsupported {m : Mach} (addr : Int)
+    (p1 p2 : Prov) (rest : List Prov) (c1 c2 : Prov) (cs : List Prov)
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed addr = c1 :: c2 :: cs) :
+    IntPtrCast.int2ptr m addr =
+      .error (.unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)") := by
+  simp [IntPtrCast.int2ptr,
+    int2ptrProvenance_multi_ambiguous_unsupported addr p1 p2 rest c1 c2 cs hmulti hcand,
+    bind, Except.bind]
+
+theorem int2ptrProvenanceM_multi_ambiguous_unsupported {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m : Gen.Machine M} (addr : Int)
+    (p1 p2 : Gen.Memory.Provenance M) (rest : List (Gen.Memory.Provenance M))
+    (c1 c2 : Gen.Memory.Provenance M) (cs : List (Gen.Memory.Provenance M))
+    (hmulti : m.intptrcast.exposed.elems = p1 :: p2 :: rest)
+    (hcand : MemoryOps.exposedInBounds m.mem.memory m.intptrcast.exposed addr = c1 :: c2 :: cs) :
+    int2ptrProvenanceM m addr =
+      .error (.unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)") := by
+  simp [int2ptrProvenanceM, hmulti, hcand, unsupported]
+
+/-- Exact characterization of membership in `int2ptrCandidates`. -/
+theorem mem_int2ptrCandidates_iff (allocs : List Gen.Allocation)
+    (exposed : LibSpecr.Set Prov) (addr : Int) (p : Prov) :
+    p ∈ int2ptrCandidates allocs exposed addr ↔
+      ∃ (a : Gen.Allocation) (i : Nat),
+        (a, i) ∈ allocs.zipIdx ∧
+        a.live = true ∧
+        a.addr ≤ addr ∧
+        addr ≤ a.addr + (Allocation.size a).bytes ∧
+        setContains exposed (⟨(i : Int)⟩, ()) = true ∧
+        p = (⟨(i : Int)⟩, ()) := by
+  simp only [int2ptrCandidates, List.mem_map, List.mem_filter, Prod.exists,
+    Bool.and_eq_true, decide_eq_true_eq]
+  constructor
+  · rintro ⟨a, i, ⟨hzip, ⟨⟨hlive, hlo⟩, hhi⟩, hexp⟩, rfl⟩
+    exact ⟨a, i, hzip, hlive, hlo, hhi, hexp, rfl⟩
+  · rintro ⟨a, i, hzip, hlive, hlo, hhi, hexp, rfl⟩
+    exact ⟨a, i, ⟨hzip, ⟨⟨hlive, hlo⟩, hhi⟩, hexp⟩, rfl⟩
+
+/-- `evalIntrinsic` on `.PointerExposeProvenance` for a thin pointer argument
+and `usize` return type exposes `ptr`'s provenance and returns `Value.Int ptr.addr`. -/
+@[simp] theorem evalIntrinsic_expose_ok (m : Mach) (ptr : Ptr) (argTy : Gen.Type) :
+    evalIntrinsic m .PointerExposeProvenance [(.Ptr ⟨ptr, none⟩, argTy)] (.Int usizeIt) =
+      .ok (.Int ptr.addr, { m with intptrcast := IntPtrCast.expose m.intptrcast ptr }) :=
+  rfl
+
+@[simp] theorem evalIntrinsicM_expose_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (ptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (argTy : Gen.Type) :
+    evalIntrinsicM m .PointerExposeProvenance [(.Ptr ⟨ptr, none⟩, argTy)] (.Int usizeIt) =
+      .ok (.Int ptr.addr, { m with intptrcast := IntPtrCast.exposeM m.intptrcast ptr }) :=
+  rfl
+
+/-- `evalIntrinsic` on `.PointerWithExposedProvenance` for an integer address
+argument and thin pointer return type (`meta_kind = .None`). -/
+theorem evalIntrinsic_withExposed_eq (m : Mach) (addr : Int) (argTy : Gen.Type)
+    (retPtrTy : Gen.PtrType) (hmk : PtrType.meta_kind retPtrTy = .None) :
+    evalIntrinsic m .PointerWithExposedProvenance [(.Int addr, argTy)] (.Ptr retPtrTy) =
+      (do
+        let ptr ← IntPtrCast.int2ptr m addr
+        pure (.Ptr (ThinPointer.widen ptr none), m)) := by
+  simp [evalIntrinsic, hmk]
+
+theorem evalIntrinsic_withExposed_ok {m : Mach} {addr : Int} {argTy : Gen.Type}
+    {retPtrTy : Gen.PtrType} {ptr : Ptr}
+    (hmk : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptr m addr = .ok ptr) :
+    evalIntrinsic m .PointerWithExposedProvenance [(.Int addr, argTy)] (.Ptr retPtrTy) =
+      .ok (.Ptr ⟨ptr, none⟩, m) := by
+  simp [evalIntrinsic, hmk, hint, ThinPointer.widen, bind, Except.bind, pure, Except.pure]
+
+theorem evalIntrinsic_withExposed_err {m : Mach} {addr : Int} {argTy : Gen.Type}
+    {retPtrTy : Gen.PtrType} {e : Stop}
+    (hmk : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptr m addr = .error e) :
+    evalIntrinsic m .PointerWithExposedProvenance [(.Int addr, argTy)] (.Ptr retPtrTy) =
+      .error e := by
+  simp [evalIntrinsic, hmk, hint, bind, Except.bind]
+
+theorem evalIntrinsicM_withExposed_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m : Gen.Machine M} {addr : Int} {argTy : Gen.Type}
+    {retPtrTy : Gen.PtrType} {ptr : Gen.ThinPointer (Gen.Memory.Provenance M)}
+    (hmk : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptrM m addr = .ok ptr) :
+    evalIntrinsicM m .PointerWithExposedProvenance [(.Int addr, argTy)] (.Ptr retPtrTy) =
+      .ok (.Ptr ⟨ptr, none⟩, m) := by
+  simp [evalIntrinsicM, hmk, hint, ThinPointer.widen, bind, Except.bind, pure, Except.pure]
+
+theorem evalIntrinsicM_withExposed_err {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m : Gen.Machine M} {addr : Int} {argTy : Gen.Type}
+    {retPtrTy : Gen.PtrType} {e : Stop}
+    (hmk : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptrM m addr = .error e) :
+    evalIntrinsicM m .PointerWithExposedProvenance [(.Int addr, argTy)] (.Ptr retPtrTy) =
+      .error e := by
+  simp [evalIntrinsicM, hmk, hint, bind, Except.bind]
+
+/-- Dereferencing a pointer with `provenance = none` (for example after an
+unexposed `PointerWithExposedProvenance` cast) at any positive size (`size.bytes > 0`)
+raises `Stop.ub "dereferencing pointer without provenance"`. -/
+theorem checkPtr_none_ub (bm : BM) (addr : Int) (size : Size)
+    (hpos : 0 < size.bytes) :
+    BM.check_ptr bm { addr := addr, provenance := none } size =
+      .error (.ub "dereferencing pointer without provenance") := by
+  have hne : size.bytes ≠ 0 := by omega
+  simp [BM.check_ptr, hne, ub]
+
+/-- Dereferencing a pointer whose provenance `(AllocId(idx), ())` points to a
+dead allocation (`a.live = false`) at any positive size (`size.bytes > 0`)
+raises `Stop.ub "dereferencing pointer to dead allocation"`. -/
+theorem checkPtr_dead_ub (bm : BM) (addr : Int) (idx : Nat) (a : Gen.Allocation)
+    (size : Size)
+    (hpos : 0 < size.bytes)
+    (hget : bm.allocations[idx]? = some a) (hdead : a.live = false) :
+    BM.check_ptr bm { addr := addr, provenance := some (⟨(idx : Int)⟩, ()) } size =
+      .error (.ub "dereferencing pointer to dead allocation") := by
+  have hne : size.bytes ≠ 0 := by omega
+  obtain ⟨hlt, hidx⟩ := List.getElem?_eq_some_iff.mp hget
+  simp [BM.check_ptr, hne, listIndex, hlt, hidx, hdead, ub, bind, Except.bind]
+
+/-- Anneal's execution of `_i = Cast(PointerExposeProvenance, copy _p, usize)`
+into a live local `_i`: when `_p` holds `.init (.ptr pv 8)`, stores
+`.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩` into `_i`; when `_p` is
+`.uninit` or `.dead`, raises UB. -/
+theorem evalStmt_assign_expose (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (i p : Nat) (targetTy : MirAst.Ty) (span : String)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = []) :
+    (∀ (pv : ProvenancePtr),
+      s.frame.locals[p]? = some (.init (.ptr pv 8)) →
+      s.frame.locals[i]? ≠ some .dead →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance (.copy ⟨p, []⟩) targetTy), span⟩
+          decls layouts =
+        .tau (.running (advanceStmt s
+          (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))
+          s.memory))) ∧
+    ((s.frame.locals[p]? = some .uninit ∨ s.frame.locals[p]? = some .dead) →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance (.copy ⟨p, []⟩) targetTy), span⟩
+          decls layouts = MirStepNode.fail .ub) := by
+  have hav := evalStmt_assign_val s decls layouts i
+    (.cast .pointerExposeProvenance (.copy ⟨p, []⟩) targetTy) span hi hbor_i hprot
+  refine ⟨fun pv hp hnd => ?_, fun hu => ?_⟩
+  · have hop : evalOperand s.frame.locals (.copy ⟨p, []⟩) s.memory.borrows s.memory.globals
+        layouts s.memory.callerLocals = .ok (.ptr pv 8) s.frame.locals := by
+      simp [evalOperand, get?, hp, readProjectedValue]
+    have hrv := evalRvalue_expose s.frame.locals (.copy ⟨p, []⟩) targetTy s.memory decls layouts
+      pv 8 s.frame.locals hop
+    exact (hav.1 _ hrv).1 hnd
+  · refine hav.2 ?_
+    rcases hu with hu | hu <;>
+      simp [evalRvalue, evalOperand, get?, hu]
+
+/-- Anneal's execution of `_i = Cast(PointerWithExposedProvenance, copy _u, targetTy)`
+into a live local `_i`: when `_u` holds `.init (.scalar sc)`, stores
+`.ptr { allocId := sc.bits / 65536, offsetBytes := sc.bits % 65536 } 8` into `_i`;
+when `_u` is `.uninit` or `.dead`, raises UB. -/
+theorem evalStmt_assign_withExposed (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (i u : Nat) (targetTy : MirAst.Ty) (span : String)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = []) :
+    (∀ (sc : ScalarInt),
+      s.frame.locals[u]? = some (.init (.scalar sc)) →
+      s.frame.locals[i]? ≠ some .dead →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance (.copy ⟨u, []⟩) targetTy), span⟩
+          decls layouts =
+        .tau (.running (advanceStmt s
+          (s.frame.locals.set i
+            (.init (.ptr { allocId := sc.bits / 65536, offsetBytes := sc.bits % 65536 } 8)))
+          s.memory))) ∧
+    ((s.frame.locals[u]? = some .uninit ∨ s.frame.locals[u]? = some .dead) →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance (.copy ⟨u, []⟩) targetTy), span⟩
+          decls layouts = MirStepNode.fail .ub) := by
+  have hav := evalStmt_assign_val s decls layouts i
+    (.cast .pointerWithExposedProvenance (.copy ⟨u, []⟩) targetTy) span hi hbor_i hprot
+  refine ⟨fun sc hu hnd => ?_, fun hu => ?_⟩
+  · have hop : evalOperand s.frame.locals (.copy ⟨u, []⟩) s.memory.borrows s.memory.globals
+        layouts s.memory.callerLocals = .ok (.scalar sc) s.frame.locals := by
+      simp [evalOperand, get?, hu, readProjectedValue]
+    have hrv := evalRvalue_withExposed s.frame.locals (.copy ⟨u, []⟩) targetTy s.memory decls layouts
+      sc s.frame.locals hop
+    exact (hav.1 _ hrv).1 hnd
+  · refine hav.2 ?_
+    rcases hu with hu | hu <;>
+      simp [evalRvalue, evalOperand, get?, hu]
+
+/-- Anneal's `expose_provenance` -> `with_exposed_provenance` round-trip identity:
+any `ProvenancePtr` with `pv.offsetBytes < 65536` (in particular `pv.offsetBytes = 0`)
+recovers `pv` identically after `PointerExposeProvenance` followed by
+`PointerWithExposedProvenance`. -/
+theorem expose_withExposed_roundtrip (pv : ProvenancePtr) (hoff : pv.offsetBytes < 65536) :
+    ({ allocId := (pv.allocId * 65536 + pv.offsetBytes) / 65536,
+       offsetBytes := (pv.allocId * 65536 + pv.offsetBytes) % 65536 } : ProvenancePtr) = pv := by
+  rcases pv with ⟨allocId, offsetBytes⟩
+  change Nat at allocId
+  dsimp only at hoff ⊢
+  simp only [ProvenancePtr.mk.injEq]
+  change (allocId * 65536 + offsetBytes) / 65536 = (allocId : Nat) ∧
+    (allocId * 65536 + offsetBytes) % 65536 = offsetBytes
+  exact ⟨by omega, by omega⟩
+
 end MiniRustSpec.Correspondence
