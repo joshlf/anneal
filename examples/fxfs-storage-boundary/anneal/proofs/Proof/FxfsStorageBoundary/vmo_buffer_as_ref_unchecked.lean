@@ -11,7 +11,6 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.MirFuelFree
 open Anneal.PureMirExec
-open Anneal.FunctionalTranslation
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
 /-- Closes a step that halts immediately (such as a violated `assume` raising a
@@ -35,7 +34,7 @@ private theorem trusted_converges (vs off len : Nat)
   mirWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, by
     rintro _ _ _ _ ⟨⟩
     change Value.scalar ⟨wrapScalarBits (off + len) 18446744073709551616, 8⟩ = _
-    simp [wrapScalarBits, nat_ble_eq_false_of_lt
+    rw [wrapScalarBits_of_lt
       (Nat.lt_of_le_of_lt (Nat.add_comm len off ▸ Nat.add_le_of_le_sub h_off h_len) h_vs)]⟩
 
 theorem verified : UbExceptionVerificationResult Obligations.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.ubExceptionClaim := by

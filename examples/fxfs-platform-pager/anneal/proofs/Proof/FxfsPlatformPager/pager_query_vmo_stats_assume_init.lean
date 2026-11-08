@@ -13,11 +13,11 @@ theorem verified : StatefulVerificationResult Obligations.FxfsPlatformPager.page
   refine verifyStatefulMirNoPanic_of_wpConverges _ ?_
   rintro _ _ ⟨⟨ok, rw_val, h_ok, h_rw, rfl⟩, rfl⟩
   -- `bb2` takes raw pointers to `_2` and `_3` and copies through them, so
-  -- `checkPureMir` is `false`; step the four concrete `(status_ok, rw)` pairs
+  -- `checkPureMir` is `false`; step the concrete `(status_ok, rw)` cases
   -- directly on `MachineState`.
-  rcases (by omega : ok = 0 ∨ ok = 1) with rfl | rfl <;>
-    rcases (by omega : rw_val = 0 ∨ rw_val = 1) with rfl | rfl <;>
-  · refine MirWpConverges.step ?_
+  match ok, rw_val, h_ok, h_rw with
+  | 0, _, _, _ | 1, 0, _, _ | 1, 1, _, _ =>
+    refine MirWpConverges.step ?_
     repeat refine MirExecWpConverges.step ?_
     exact rfl
 

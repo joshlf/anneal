@@ -13,7 +13,6 @@ open Trusted.VerificationResult
 open Anneal.MirFuelFree
 open Anneal.PureMirExec
 open Anneal.MirLiftCore
-open Anneal.FunctionalTranslation
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
@@ -31,14 +30,20 @@ private theorem modularWpConverges_step_to {contract : MirCallContract}
 
 private def forceNat? : Nat → Option Nat
   | 0 => some 0
-  | n + 1 => (forceNat? n).map (· + 1)
+  | n + 1 =>
+    match forceNat? n with
+    | some k => some (k + 1)
+    | none => none
 
 private theorem forceNat?_eq_some : ∀ n, forceNat? n = some n
   | 0 => rfl
-  | n + 1 => by simp [forceNat?, forceNat?_eq_some n]
+  | n + 1 => by rw [forceNat?, forceNat?_eq_some n]
 
 /-- Call-free step that normalizes `blockIdx`, `stmtIdx`, and `locals` so nested
-`advanceStmt` and `List.set` terms do not accumulate across symbolic steps. -/
+`advanceStmt` and `List.set` terms do not accumulate across symbolic steps.
+Forcing `blockIdx` and `stmtIdx` via `forceNat?` prevents `switchInt` from
+unifying `?bb` with an unreduced `lookupSwitchTarget` term that retains the
+prior frame. -/
 private theorem modularStepNorm {contract : MirCallContract} {body : CapturedMir}
     {s : MachineState} {bb stmt : Nat} {locals : List LocalSlot}
     {post : MirOutcome → Prop}
@@ -56,7 +61,7 @@ private theorem modularStepNorm {contract : MirCallContract} {body : CapturedMir
     MirModularWpConverges contract body s post := by
   refine MirModularWpConverges.step
     (evalSymNodeTreeNoCall_mono ?_ (fun _ h => h) h_step)
-  rintro (⟨⟨b, st, loc⟩, mem⟩ | _ | _)
+  rintro (⟨⟨_, _, loc⟩, _⟩ | _ | _)
   · rintro ⟨rfl, hb, hst, hloc⟩
     rw [forceNat?_eq_some] at hb hst
     rw [forcePureEnv?_eq_some] at hloc
@@ -68,33 +73,27 @@ private theorem modularStepNorm {contract : MirCallContract} {body : CapturedMir
 theorem verified : ModularVerificationResult Obligations.FxfsStorageBoundary.data_object_handle_verify_data_unfixed.modularClaim := by
   refine verifyModularContractMir_of_wpConverges _ _ _ _ ?_
   rintro _ _ ⟨vs, off, len, t, h_vs, -, -, h_t, rfl, rfl⟩
-  repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
-  refine MirModularWpConverges.step ?_
+  refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ (MirModularWpConverges.step ?_)
   show (match Nat.ble off vs with | true => _ | false => _)
   cases h_le1 : Nat.ble off vs
-  · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
-    refine MirModularWpConverges.of_noCall
-      (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
+  · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩
+      (.of_noCall (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩))
     rintro _ _ _ _ ⟨⟩
-    rw [ite_eq_right fun h => by simp [Nat.ble_eq_true_of_le h.1] at h_le1]
+    simp [Nat.not_le.mpr (by simpa using h_le1)]
   · have h1 := Nat.le_of_ble_eq_true h_le1
     repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
     refine MirModularWpConverges.step ?_
     show (match Nat.ble off vs with | true => _ | false => _)
     rw [h_le1]
-    repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
-    refine MirModularWpConverges.step ?_
+    refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ (MirModularWpConverges.step ?_)
     show (match Nat.ble len (wrapScalarBits (vs - off) 18446744073709551616) with
       | true => _ | false => _)
-    rw [show wrapScalarBits (vs - off) 18446744073709551616 = vs - off by
-      simp [wrapScalarBits,
-        nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le _ _) h_vs)]]
+    rw [wrapScalarBits_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le _ _) h_vs)]
     cases h_le2 : Nat.ble len (vs - off)
-    · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
-      refine MirModularWpConverges.of_noCall
-        (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
+    · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩
+        (.of_noCall (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩))
       rintro _ _ _ _ ⟨⟩
-      rw [ite_eq_right fun h => by simp [Nat.ble_eq_true_of_le h.2] at h_le2]
+      simp [Nat.not_le.mpr (by simpa using h_le2)]
     · have h2 := Nat.le_of_ble_eq_true h_le2
       repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
       refine modularWpConverges_step_to (s' := ?s')
@@ -104,7 +103,7 @@ theorem verified : ModularVerificationResult Obligations.FxfsStorageBoundary.dat
         obtain rfl := h_ret vs off len t rfl
         exact hc
       case h_next =>
-        refine MirModularWpConverges.of_noCall
+        refine .of_noCall
           (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
         rintro _ _ _ _ ⟨⟩
         rw [ite_eq_left ⟨h1, h2⟩]
