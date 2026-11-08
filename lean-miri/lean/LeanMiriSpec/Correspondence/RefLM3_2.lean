@@ -877,7 +877,11 @@ def annealValidityPlaceHooks :
     throw (.unsupported "validity place: writeMemoryNoValidate")
   afterLocalMovedToMemory := fun _ _ _ =>
     throw (.unsupported "validity place: afterLocalMovedToMemory")
-  memoryOffset := fun _ _ _ _ _ => throw (.unsupported "validity place: memoryOffset")
+  memoryOffset := fun _ mplace amount _ metaVal =>
+    if amount == Miri.ABI.Size.ZERO then
+      pure { mplace with metadata := metaVal }
+    else
+      throw (.unsupported "validity place: nonzero memoryOffset")
   writeLocalImmediate := fun _ _ _ _ =>
     throw (.unsupported "validity place: writeLocalImmediate")
   enforceValidity := fun _ _ => throw (.unsupported "validity place: enforceValidity")
@@ -933,8 +937,134 @@ def annealValidityClassify (c : Ty) (tyId : Miri.MIR.TyId) :
     pure (.rawPointer tyId true)
   | _ => throw (.unsupported "validity of a type outside the scalar and reference fragment")
 
+/-- Encoded integer `TyId` (`10..14` signed, `20..24` unsigned) for an enum tag
+primitive of `widthBytes` bytes (`1, 2, 4, 8, 16`) and signedness `signed`. -/
+def annealTagIntTyId (widthBytes : Nat) (signed : Bool) : Option Miri.MIR.TyId :=
+  match widthBytes, signed with
+  | 1, false => some 20
+  | 2, false => some 21
+  | 4, false => some 22
+  | 8, false => some 23
+  | 16, false => some 24
+  | 1, true => some 10
+  | 2, true => some 11
+  | 4, true => some 12
+  | 8, true => some 13
+  | 16, true => some 14
+  | _, _ => none
+
+/-- Full-range integer `LocalLayout` for an enum discriminant tag scalar `tag`
+(`Miri.ABI.Scalar`), preserving its byte width and signedness so
+`annealReadImmediate` reads raw initialized tag bytes without prematurely
+clipping to `validRange` before `Discriminant.readDiscriminant` checks
+`validRange` and `variantForDiscriminant`. -/
+def annealAbiTagRawIntLayout (tag : Miri.ABI.Scalar) :
+    Option Miri.Interpreter.LocalLayout :=
+  match tag.primitive with
+  | .Int intKind signed =>
+    let w : Nat :=
+      match intKind with
+      | .I8 => 1
+      | .I16 => 2
+      | .I32 => 4
+      | .I64 => 8
+      | .I128 => 16
+    match annealTagIntTyId w signed with
+    | some tyId => some { ty := tyId, layout := scalarLayoutData w signed }
+    | none => none
+  | _ => none
+
+/-- Classify an aggregate `TyId` (`100 + layoutIdx`, `100 ≤ tyId < 900`) against
+`layouts`: zero-variant (`VariantsShape.empty`) and multi-variant
+(`VariantsShape.multiple`) enums classify as `.aggregate false false true`;
+all other aggregates fail closed with `StepError.unsupported`. -/
+def annealValidityClassifyAdt (layouts : LayoutTable) (tyId : Miri.MIR.TyId) :
+    EStateM Miri.Interpreter.StepError AnnealStepState
+      Miri.Interpreter.ValidityVisitor.TypeKind :=
+  if 100 ≤ tyId ∧ tyId < 900 then
+    match LayoutTable.lookup layouts (tyId - 100) with
+    | some tl =>
+      match tl.variants with
+      | .empty | .multiple .. => pure (.aggregate false false true)
+      | .single _ => throw (.unsupported "validity of a non-enum aggregate")
+    | none => throw (.unsupported "validity of an aggregate without layout")
+  else
+    throw (.unsupported "validity of a type outside the scalar, reference, and enum fragment")
+
+/-- Operational inhabitedness of an encoded `TyId` (`100 ≤ tyId < 900`) against
+`layouts`: `false` when `tl.isUninhabited` or `tl.variants = .empty`, and `true`
+otherwise. -/
+def annealAdtTyIdInhabited (layouts : LayoutTable) (tyId : Miri.MIR.TyId) : Bool :=
+  if 100 ≤ tyId ∧ tyId < 900 then
+    match LayoutTable.lookup layouts (tyId - 100) with
+    | some tl =>
+      !tl.isUninhabited &&
+        match tl.variants with
+        | .empty => false
+        | _ => true
+    | none => true
+  else
+    true
+
+/-- Projection dictionary for `annealValidityHooks` supporting offset-`0` enum
+discriminant tag field projection and fieldless enum variant downcasts to unit
+layout `{ ty := 51, layout := zstLayoutData }`. -/
+def annealValidityProjectionHooksWithLayouts (layouts : LayoutTable) :
+    Miri.Interpreter.PlaceProjectionHooks AnnealProv AnnealStepState Ty Unit :=
+  { annealValidityProjectionHooks with
+    field := fun _ baseLay index =>
+      match baseLay.layout.fields.offset index, baseLay.layout.variants with
+      | .ok off, .Multiple tag _ tagField _ =>
+        if off == Miri.ABI.Size.ZERO && index == tagField then
+          match annealAbiTagRawIntLayout tag with
+          | some tagLay => pure tagLay
+          | none => throw (.unsupported "validity projection: non-integer enum tag")
+        else
+          throw (.unsupported "validity projection: nonzero or non-tag enum field")
+      | _, _ => throw (.unsupported "validity projection: field")
+    variant := fun _ baseLay variant =>
+      if 100 ≤ baseLay.ty ∧ baseLay.ty < 900 then
+        match LayoutTable.lookup layouts (baseLay.ty - 100) with
+        | some tl =>
+          match tl.variants with
+          | .multiple _ _ variantShapes =>
+            match get? variantShapes variant with
+            | some (.arbitrary .nil .nil) =>
+              pure { ty := 51, layout := zstLayoutData }
+            | _ => throw (.unsupported "validity projection: payload enum variant")
+          | _ => throw (.unsupported "validity projection: non-multiple variant")
+        | none => throw (.unsupported "validity projection: unknown enum layout")
+      else
+        throw (.unsupported "validity projection: variant") }
+
+/-- Resolve the pointee layout of a safe reference `&MyEnum` / `&mut MyEnum`
+(`c.kind = .ref _ (.adt defPath args)`), consulting `refTl.fieldLayouts` from
+`rustc-capture` when available and falling back to `layoutIdx = 0`
+(`MirSemantics.pointeeTyOf`). -/
+def annealRefEnumPointeeLayout (layouts : LayoutTable) (c : Ty) :
+    Option Miri.Interpreter.LocalLayout :=
+  match c.kind with
+  | .ref _ (.adt defPath args) =>
+    let candidateIdx : Nat :=
+      match LayoutTable.lookup layouts c.layoutIdx with
+      | some refTl =>
+        match refTl.fieldLayouts with
+        | ptIdx :: _ => ptIdx
+        | .nil => 0
+      | none => 0
+    match LayoutTable.lookup layouts candidateIdx with
+    | some ptTl =>
+      match ptTl.variants with
+      | .empty | .multiple .. =>
+        some (translateTy { kind := .adt defPath args, layoutIdx := candidateIdx } layouts)
+      | .single _ => none
+    | none => none
+  | _ => none
+
 /-- The pointee layout of a safe reference of Anneal type `c`, for the pointees
-whose layout `translateTy` gives exactly (`derefPointeeKindHasExactLayout`). -/
+whose layout `translateTy` gives exactly (`derefPointeeKindHasExactLayout` and
+`!`) as well as zero-variant and multi-variant enum pointees
+(`annealRefEnumPointeeLayout`). -/
 def annealValidityPointeeLayout (layouts : LayoutTable) (c : Ty) :
     Option Miri.Interpreter.LocalLayout :=
   match c.kind with
@@ -942,12 +1072,14 @@ def annealValidityPointeeLayout (layouts : LayoutTable) (c : Ty) :
     if derefPointeeKindHasExactLayout pointeeKind then
       some (translateTy { kind := pointeeKind, layoutIdx := 0 } layouts)
     else
-      none
+      match pointeeKind with
+      | .never => some (translateTy { kind := .never, layoutIdx := 0 } layouts)
+      | _ => annealRefEnumPointeeLayout layouts c
   | _ => none
 
 /-- The operand that a validated place denotes in the current frame: an
-unprojected local's value or a memory place. Dead locals are undefined behavior;
-projected local places fail closed. -/
+unprojected (or offset-`0` projected) local's value or a memory place. Dead
+locals are undefined behavior; nonzero-offset projected local places fail closed. -/
 @[irreducible]
 def annealValidityPlaceOperand (place : Miri.Interpreter.RuntimePlace AnnealProv) :
     EStateM Miri.Interpreter.StepError AnnealStepState
@@ -962,7 +1094,14 @@ def annealValidityPlaceOperand (place : Miri.Interpreter.RuntimePlace AnnealProv
     | .error (.localExpectedLive _) => throw (.undefinedBehavior "validation of a dead local")
     | .error e => throw (.stack e)
   | .memory mplace => pure (.indirect mplace)
-  | _ => throw (.unsupported "validation of a projected local place")
+  | .local _ localId (some off) _ =>
+    if off == Miri.ABI.Size.ZERO then
+      match frame.getLocalOperand localId with
+      | .ok op => pure op
+      | .error (.localExpectedLive _) => throw (.undefinedBehavior "validation of a dead local")
+      | .error e => throw (.stack e)
+    else
+      throw (.unsupported "validation of a projected local place")
 
 /-- The dereferenceability check of `ValidityMachine.checkPointerAccessResult`
 against the cached base addresses: an access of `size` bytes at `ptr` must lie
@@ -990,16 +1129,19 @@ context (`annealValidityClassify`, `annealValidityPointeeLayout`).
 * `checkPointerAccess`, `checkPointerAlignResult`, and `scalarMayBeNull`
   are the address-based checks of `ValidityMachine` against the cached base
   addresses (`annealResolvePtr`, `annealLookupAlloc`, `annealOffsetMisalignment`).
+* `discriminant` and `projection` validate zero-variant (`VariantsShape.empty`)
+  and scalar-tagged multi-variant (`VariantsShape.multiple`) enums against
+  `layouts`.
 * Retagging (`retagPointer`), provenance and padding resets, and ghost
   validation are no-ops: Tree Borrows retags are `LM-3.3`'s subject, and the
   scalar and reference fragment has neither provenance-carrying integers nor
   padding.
-* Everything else that only aggregates, slices, trait objects, boxes, or
+* Everything else that only general structs, slices, trait objects, boxes, or
   constant evaluation reach fails closed with `StepError.unsupported`. -/
 def annealValidityHooks (layouts : LayoutTable) :
     Miri.Interpreter.ValidityVisitor.Hooks AnnealProv AnnealStepState Ty Unit Unit Unit Unit where
   target := annealRuntimeDataLayout
-  projection := annealValidityProjectionHooks
+  projection := annealValidityProjectionHooksWithLayouts layouts
   vtable :=
     { target := annealTargetDataLayout
       isDynamic := fun _ _ => throw (.unsupported "validity vtable: isDynamic")
@@ -1023,27 +1165,77 @@ def annealValidityHooks (layouts : LayoutTable) :
         throw (.unsupported "validity vtable: assertVirtualInstanceMatches") }
   discriminant :=
     { runtimeTarget := annealRuntimeDataLayout
-      discriminantLayout := fun _ _ => throw (.unsupported "validity discriminant: layout")
-      tagLayout := fun _ _ => throw (.unsupported "validity discriminant: tagLayout")
-      discriminantValue := fun _ _ _ => throw (.unsupported "validity discriminant: value")
-      variantForDiscriminant := fun _ _ _ =>
-        throw (.unsupported "validity discriminant: variantForDiscriminant")
-      adtVariantCount := fun _ _ => throw (.unsupported "validity discriminant: adtVariantCount")
-      projectRead := fun _ _ _ => throw (.unsupported "validity discriminant: projectRead")
-      readImmediate := fun _ _ => throw (.unsupported "validity discriminant: readImmediate")
+      discriminantLayout := fun _ _ =>
+        pure { ty := 23, layout := scalarLayoutData 8 false }
+      tagLayout := fun _ tag =>
+        match annealAbiTagRawIntLayout tag with
+        | some tagLay => pure tagLay
+        | none => throw (.unsupported "validity discriminant: non-integer tagLayout")
+      discriminantValue := fun _ _ variant =>
+        pure (some (23, BitVec.ofNat 128 variant))
+      variantForDiscriminant := fun _ tyId discrBits =>
+        if 100 ≤ tyId ∧ tyId < 900 then
+          match LayoutTable.lookup layouts (tyId - 100) with
+          | some tl =>
+            match tl.variants with
+            | .multiple _ _ variantShapes =>
+              if discrBits.toNat < variantShapes.length then
+                pure (some discrBits.toNat)
+              else
+                pure none
+            | _ => throw (.unsupported "validity discriminant: non-multiple enum")
+          | none => throw (.unsupported "validity discriminant: unknown enum layout")
+        else
+          throw (.unsupported "validity discriminant: non-ADT tyId")
+      adtVariantCount := fun _ tyId =>
+        if 100 ≤ tyId ∧ tyId < 900 then
+          match LayoutTable.lookup layouts (tyId - 100) with
+          | some tl =>
+            match tl.variants with
+            | .multiple _ _ variantShapes => pure variantShapes.length
+            | .empty => pure 0
+            | .single _ => pure 1
+          | none => throw (.unsupported "validity discriminant: unknown ADT layout")
+        else
+          throw (.unsupported "validity discriminant: non-ADT tyId")
+      projectRead := fun _ op fieldIdx =>
+        match op.layout.layout.fields.offset fieldIdx, op.layout.layout.variants with
+        | .ok off, .Multiple tag _ tagField _ =>
+          if off == Miri.ABI.Size.ZERO && fieldIdx == tagField then
+            match annealAbiTagRawIntLayout tag with
+            | some tagLay => pure ⟨op.op, tagLay⟩
+            | none => throw (.unsupported "validity discriminant: non-integer tag")
+          else
+            throw (.unsupported "validity discriminant: nonzero or non-tag field")
+        | _, _ => throw (.unsupported "validity discriminant: projectRead")
+      readImmediate := fun _ op => annealReadImmediate op
       destLayout := fun v => v.layout
       projectWrite := fun _ _ _ => throw (.unsupported "validity discriminant: projectWrite")
       writeScalar := fun _ _ _ => throw (.unsupported "validity discriminant: writeScalar")
-      toOp := fun _ _ => throw (.unsupported "validity discriminant: toOp")
-      scalarMayBeNull := fun _ _ => throw (.unsupported "validity discriminant: scalarMayBeNull") }
+      toOp := fun _ place => do
+        let op ← annealValidityPlaceOperand place
+        pure ⟨op, place.layout⟩
+      scalarMayBeNull := fun _ sc =>
+        match sc.tryToScalarInt with
+        | .ok (.integer integer) => pure integer.isNull
+        | .ok _ => throw (.invalidProgram "absolute Miri pointer erased its address")
+        | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err) }
   debugAssertions := false
-  classify := annealValidityClassify
+  classify := fun c tyId =>
+    if tyId < 100 then
+      if tyId == 51 then pure (.aggregate false false false) else annealValidityClassify c tyId
+    else
+      annealValidityClassifyAdt layouts tyId
   unitLayout := fun _ => pure (translateTy { kind := .tuple .nil, layoutIdx := 0 })
   typeName := fun _ _ => pure ""
-  opsemInhabited := fun _ tyId => pure (tyId != 50)
+  opsemInhabited := fun _ tyId =>
+    if tyId < 100 then
+      pure (tyId != 50)
+    else
+      pure (annealAdtTyIdInhabited layouts tyId)
   isFreeze := fun _ _ => pure true
-  fieldPath := fun _ _ _ _ => throw (.unsupported "validity fieldPath")
-  variantPath := fun _ _ _ => throw (.unsupported "validity variantPath")
+  fieldPath := fun _ _ _ _ => pure .enumTag
+  variantPath := fun _ _ variant => pure (.variant (toString variant))
   projectBox := fun _ _ => throw (.unsupported "validity projectBox")
   toOp := fun _ place => do
     let op ← annealValidityPlaceOperand place
@@ -1155,6 +1347,25 @@ theorem annealValidityClassify_prim (layouts : LayoutTable) (c : Ty) {ty : Ty}
   · cases it <;> (simp only [translateTy, encodeTyId, hk]; rfl)
   · cases ut <;> (simp only [translateTy, encodeTyId, hk]; rfl)
   · simp only [translateTy, encodeTyId, hk]; rfl
+
+private theorem annealValidityHooks_classify_prim (layouts : LayoutTable) (c : Ty) {ty : Ty}
+    (st : AnnealStepState) :
+    (ty.kind = .bool →
+      (annealValidityHooks layouts).classify c (translateTy ty layouts).ty st = .ok .boolean st) ∧
+    (ty.kind = .char →
+      (annealValidityHooks layouts).classify c (translateTy ty layouts).ty st = .ok .character st) ∧
+    (∀ it, ty.kind = .int it →
+      (annealValidityHooks layouts).classify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+    (∀ ut, ty.kind = .uint ut →
+      (annealValidityHooks layouts).classify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+    (ty.kind = .never →
+      (annealValidityHooks layouts).classify c (translateTy ty layouts).ty st = .ok .never st) := by
+  refine ⟨fun hk => ?_, fun hk => ?_, fun it hk => ?_, fun ut hk => ?_, fun hk => ?_⟩
+  · simp only [annealValidityHooks, translateTy, encodeTyId, hk]; rfl
+  · simp only [annealValidityHooks, translateTy, encodeTyId, hk]; rfl
+  · cases it <;> (simp only [annealValidityHooks, translateTy, encodeTyId, hk]; rfl)
+  · cases ut <;> (simp only [annealValidityHooks, translateTy, encodeTyId, hk]; rfl)
+  · simp only [annealValidityHooks, translateTy, encodeTyId, hk]; rfl
 
 /-- The `bool` check of the validity visitor (`Scalar.toBool`) on a one-byte
 scalar accepts exactly the bit patterns `0` and `1` that Anneal's `bool`
@@ -2151,7 +2362,7 @@ theorem validatePlace_prim_scalar_simulation
       refTracking := none, dataBytes := none }
   have hv := visit_primitive_cases (annealValidityHooks layouts) ty fuel initSession place m rfl
   have hvp := validatePlace_annealValidityHooks_nonrecursive_eq layouts ty (fuel + 1) place m
-  obtain ⟨hcb, hcc, hci, hcu, hcn⟩ := annealValidityClassify_prim layouts ty (ty := ty) m
+  obtain ⟨hcb, hcc, hci, hcu, hcn⟩ := annealValidityHooks_classify_prim layouts ty (ty := ty) m
   refine ⟨fun hk => ?_, fun hprim hdead => ?_, fun hprim hun => ?_,
     fun {sc msc} hprim hrel hsz hval => ?_⟩
   · exact hvp.2 _ _ (hv.1 (hcn hk))
@@ -2645,7 +2856,7 @@ theorem visit_ref_recursive_pointee_simulation
       hfields
   have hv_child := visit_primitive_cases (annealValidityHooks body.layouts) refTy fuel childSession
     childPlace m rfl
-  obtain ⟨hcb, hcc, hci, hcu, _⟩ := annealValidityClassify_prim body.layouts refTy
+  obtain ⟨hcb, hcc, hci, hcu, _⟩ := annealValidityHooks_classify_prim body.layouts refTy
     (ty := targetDecl.ty) m
   have hroot_ok : Miri.Interpreter.ValidityVisitor.visit (annealValidityHooks body.layouts) refTy
       (fuel + 1) rootSession rootPlace m =
@@ -3001,5 +3212,1487 @@ theorem validatePlace_ref_unit_zst_simulation
       simp only [ptPlace, annealValidityHooks, hmis]; rfl
     have hv_ok := (((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).2 hnull).2 hinh
     exact hvp.1 initSession m (hv_ok.2 hal) rfl
+
+/-! ## 5. Uninhabited Safe-Reference (`&!`), Enum Discriminant, and Tree-Reborrow Relations -/
+
+/-- **Uninhabited `&!` / `&mut !` `ValidityVisitor.validatePlace` simulation
+(`LM-3.2`)**: for a safe reference to `!` (`refTy.kind = .ref refMut .never`):
+1. **Dead local (`.dead`)**: rejected with `"validation of a dead local"`.
+2. **Uninitialized local (`.uninit`)**: rejected with
+   `"read of uninitialized local"`.
+3. **Null integer scalar (`sc.bits = 0`)**: `checkPointerAccess` skips
+   resolution on `sizeof(!) = 0`, and `scalarMayBeNull` rejects the null
+   reference with `"validation: null or maybe-null safe pointer"`.
+4. **Non-null integer scalar (`sc.bits ≠ 0`, `sc.bits < 2 ^ 64`)**: passes
+   `checkPointerAccess` and `scalarMayBeNull`, and `opsemInhabited` (`tyId = 50`)
+   rejects the reference with `"validation: safe pointer to uninhabited type"`.
+5. **Any stack pointer `p` (`PtrRel allocMap p mptr`, `e ∈ allocMap`)**:
+   rejected by `opsemInhabited` with
+   `"validation: safe pointer to uninhabited type"`. -/
+theorem validatePlace_ref_never_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {refIdx : Nat} (hlt : refIdx < tf.locals.size)
+    {refTy : Ty} {refMut : Mutability}
+    (hrefTy : refTy.kind = .ref refMut .never)
+    (fuel : Nat) :
+    let place : Miri.Interpreter.RuntimePlace AnnealProv :=
+      ⟨.local 0 refIdx none tf.localsIdentity, translateTy refTy body.layouts⟩
+    ((tf.locals[refIdx]'hlt).value = .dead →
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (annealValidityHooks body.layouts) refTy (fuel + 1) place false false m =
+        .error (.undefinedBehavior "validation of a dead local") m) ∧
+    ((tf.locals[refIdx]'hlt).value = .live (.immediate .uninit) →
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (annealValidityHooks body.layouts) refTy (fuel + 1) place false false m =
+        .error (.undefinedBehavior "read of uninitialized local") m) ∧
+    (∀ {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt},
+      ScalarRel sc msc → sc.sizeBytes = 8 → sc.bits < 2 ^ 64 →
+      (tf.locals[refIdx]'hlt).value =
+        .live (.immediate (.scalar (.fromScalarInt msc))) →
+      (sc.bits = 0 →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks body.layouts) refTy (fuel + 1) place false false m =
+          .error (.undefinedBehavior
+            "validation: null or maybe-null safe pointer") m) ∧
+      (sc.bits ≠ 0 →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks body.layouts) refTy (fuel + 1) place false false m =
+          .error (.undefinedBehavior
+            "validation: safe pointer to uninhabited type") m)) ∧
+    (∀ {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+        {e : AllocMapEntry},
+      PtrRel allocMap p mptr → e ∈ allocMap → e.tag = p.tag →
+      (tf.locals[refIdx]'hlt).value =
+        .live (.immediate (.scalar (.fromPointer annealTargetDataLayout mptr))) →
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (annealValidityHooks body.layouts) refTy (fuel + 1) place false false m =
+        .error (.undefinedBehavior
+          "validation: safe pointer to uninhabited type") m) := by
+  intro place
+  let initSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+    { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+      refTracking := none, dataBytes := none }
+  let mutBool : Bool := match refMut with | .mut => true | .not => false
+  let neverLay : Miri.Interpreter.LocalLayout :=
+    translateTy { kind := .never, layoutIdx := 0 } body.layouts
+  have hcl : (annealValidityHooks body.layouts).classify refTy
+      (translateTy refTy body.layouts).ty m = .ok (.reference mutBool) m := by
+    cases refMut <;> (simp only [annealValidityHooks, annealValidityClassify,
+      translateTy, encodeTyId, hrefTy, mutBool]; rfl)
+  have hvr := visit_reference_cases (annealValidityHooks body.layouts) refTy fuel
+    initSession place m mutBool hcl rfl rfl rfl
+  have hvp := validatePlace_annealValidityHooks_nonrecursive_eq body.layouts refTy
+    (fuel + 1) place m
+  have hptLay : annealValidityPointeeLayout body.layouts refTy = some neverLay := by
+    unfold annealValidityPointeeLayout
+    rw [hrefTy]; rfl
+  have hsized : neverLay.layout.isSized = true := rfl
+  have huninh : (annealValidityHooks body.layouts).opsemInhabited refTy
+      neverLay.ty m = .ok false m := rfl
+  have hneverAlign : neverLay.layout.align.abi = Miri.ABI.Align.ONE := rfl
+  have hneverSize : neverLay.layout.size = Miri.ABI.Size.ZERO := rfl
+  refine ⟨fun hdead => ?_, fun hun => ?_,
+    fun {sc msc} hrel hsz8 hlt64 hval => ?_,
+    fun {p mptr e} hptr he htag hval => ?_⟩
+  · have hrd := annealValidityHooks_readImmediate_dead_local body.layouts refTy
+      hframes hlt hdead (translateTy refTy body.layouts) .reference
+    exact hvp.2 _ _ (hvr.1 _ hrd)
+  · have hrd := annealValidityHooks_readImmediate_uninit_local body.layouts refTy
+      hframes hlt hun (translateTy refTy body.layouts) .reference
+    exact hvp.2 _ _ (hvr.1 _ hrd)
+  · have hrd := annealValidityHooks_readImmediate_local body.layouts refTy hframes
+      hlt hval (translateTy refTy body.layouts) .reference
+    have hmis : annealOffsetMisalignment
+        (Miri.Memory.Pointer.withoutProvenance (Prov := AnnealProv)
+          (UInt64.ofNat sc.bits)).offset
+        neverLay.layout.align.abi = .ok none := by
+      rw [hneverAlign]
+      exact annealOffsetMisalignment_align_one _
+    let ptPlace : Miri.Interpreter.MPlaceTy AnnealProv :=
+      ⟨⟨Miri.Memory.Pointer.withoutProvenance (UInt64.ofNat sc.bits), .none, none⟩,
+        neverLay⟩
+    have hptr_p : (annealValidityHooks body.layouts).ptrToPlace refTy
+        ⟨.scalar (.fromScalarInt msc), translateTy refTy body.layouts⟩ m =
+        .ok ptPlace m := by
+      show (do _ : EStateM _ _ _) m = .ok ptPlace m
+      simp only [annealValidityHooks, hptLay, Miri.Interpreter.Immediate.toScalar,
+        scalar_fromScalarInt_toPointer_eq hrel hsz8, hmis, bind, EStateM.bind,
+        pure, EStateM.pure]
+      rfl
+    have hdyn : (annealValidityHooks body.layouts).sizeAndAlign refTy ptPlace m =
+        .ok (some (ptPlace.layout.layout.size, ptPlace.layout.layout.align.abi)) m :=
+      rfl
+    have hacc : (annealValidityHooks body.layouts).checkPointerAccess refTy
+        ptPlace.mplace.ptr ptPlace.layout.layout.size m = .ok (.ok ()) m := by
+      simp only [ptPlace]
+      rw [annealValidityHooks_checkPointerAccess_eq, hneverSize,
+        annealValidityAccessCheck_zero]
+    have hsc_m : Miri.Memory.Scalar.fromMaybePointer
+        (annealValidityHooks body.layouts).target.base ptPlace.mplace.ptr =
+        .ok (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits))) := by
+      with_unfolding_all
+        change ((do
+            let scalar ← (Miri.Memory.ScalarInt.tryFromUInt
+              (BitVec.ofNat 128 (UInt64.ofNat sc.bits).toNat)
+              (Miri.ABI.Size.ofBytes 8)).mapError
+              (fun e => Miri.Memory.ScalarError.scalarInt e)
+            match scalar with
+            | some scalar => pure (.fromScalarInt scalar)
+            | none => throw (.pointerOffsetDoesNotFit
+                (Miri.ABI.Size.ofBytes (UInt64.ofNat sc.bits))
+                (Miri.ABI.Size.ofBytes 8))) :
+            Except Miri.Memory.ScalarError (Miri.Memory.Scalar AnnealProv)) =
+          .ok (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits)))
+        rw [tryFromUInt_8_of_u64]
+        rfl
+    refine ⟨fun h0 => ?_, fun hne => ?_⟩
+    · have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+          (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits))) m = .ok true m := by
+        rw [h0]
+        with_unfolding_all rfl
+      have herr := ((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).1 hnull
+      rw [hvp.2 _ _ herr]
+      rfl
+    · have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+          (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits))) m = .ok false m := by
+        have hne_bv : (BitVec.ofNat 128 sc.bits == 0) = false := by
+          cases h : (BitVec.ofNat 128 sc.bits == 0) with
+          | false => rfl
+          | true =>
+            have heq := congrArg BitVec.toNat (beq_iff_eq.mp h)
+            have hlt128 : sc.bits < 2 ^ 128 := by omega
+            simp only [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt128] at heq
+            exact absurd heq hne
+        have hu64 : (UInt64.ofNat sc.bits).toNat = sc.bits := Nat.mod_eq_of_lt hlt64
+        show EStateM.Result.ok
+          ((Miri.Memory.ScalarInt.ofUInt64 (UInt64.ofNat sc.bits)).isNull) m =
+          .ok false m
+        with_unfolding_all
+          show EStateM.Result.ok
+            (BitVec.ofNat 128 (UInt64.ofNat sc.bits).toNat == 0) m = .ok false m
+          rw [hu64, hne_bv]
+      have herr := (((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).2
+        hnull).1 huninh
+      rw [hvp.2 _ _ herr]
+      rfl
+  · obtain ⟨tf₀, hframes₀, _, _, _, _, _, _, _, _, halloc, _⟩ := id hstate
+    rw [hframes] at hframes₀; injection hframes₀ with h0
+    injection h0 with htf; subst htf
+    obtain ⟨borTag, hmptr, hoff_lt⟩ := PtrRel.allocId_of_entry halloc hptr he htag
+    obtain ⟨hid, _, _⟩ := halloc.base_addr_valid e he
+    have hrd := annealValidityHooks_readImmediate_local body.layouts refTy hframes
+      hlt hval (translateTy refTy body.layouts) .reference
+    have hmis : annealOffsetMisalignment mptr.withOptionalProvenance.offset
+        neverLay.layout.align.abi = .ok none := by
+      rw [hneverAlign]
+      exact annealOffsetMisalignment_align_one _
+    let ptPlace : Miri.Interpreter.MPlaceTy AnnealProv :=
+      ⟨⟨mptr.withOptionalProvenance, .none, none⟩, neverLay⟩
+    have hptr_p : (annealValidityHooks body.layouts).ptrToPlace refTy
+        ⟨.scalar (.fromPointer annealTargetDataLayout mptr),
+          translateTy refTy body.layouts⟩ m = .ok ptPlace m := by
+      show (do _ : EStateM _ _ _) m = .ok ptPlace m
+      simp only [annealValidityHooks, hptLay, Miri.Interpreter.Immediate.toScalar,
+        scalar_fromPointer_toPointer_eq, hmis, bind, EStateM.bind, pure, EStateM.pure]
+      rfl
+    have hdyn : (annealValidityHooks body.layouts).sizeAndAlign refTy ptPlace m =
+        .ok (some (ptPlace.layout.layout.size, ptPlace.layout.layout.align.abi)) m :=
+      rfl
+    have hacc : (annealValidityHooks body.layouts).checkPointerAccess refTy
+        ptPlace.mplace.ptr ptPlace.layout.layout.size m = .ok (.ok ()) m := by
+      simp only [ptPlace]
+      rw [annealValidityHooks_checkPointerAccess_eq, hneverSize,
+        annealValidityAccessCheck_zero]
+    have hsc_m : Miri.Memory.Scalar.fromMaybePointer
+        (annealValidityHooks body.layouts).target.base ptPlace.mplace.ptr =
+        .ok (.fromPointer annealTargetDataLayout mptr) := by
+      simp only [ptPlace, hmptr, Miri.Memory.Pointer.withOptionalProvenance,
+        Miri.Memory.Scalar.fromMaybePointer, annealValidityHooks,
+        annealRuntimeDataLayout]
+      rfl
+    have hnn := annealStackBaseAddr_add_ne_zero e.allocId p.offsetBytes hid hoff_lt
+    have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+        (.fromPointer annealTargetDataLayout mptr) m = .ok false m := by
+      rw [hmptr]
+      exact fromPointer_scalarMayBeNull_eq body.layouts refTy _ _ m hnn
+    have herr := (((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).2
+      hnull).1 huninh
+    rw [hvp.2 _ _ herr]
+    rfl
+
+/-- **No valid immediate `&!` / `&mut !` local exists in `StateRelLM3_2`
+(`LM-3.2`)**: in any `StateRelLM3_2` state, EVERY non-memory-backed local
+`refIdx` (`IsImmediateFrameLocal tf refIdx`) declared with safe-reference type
+`&!` or `&mut !` (`decl.ty.kind = .ref refMut .never`) fails
+`ValidityVisitor.validatePlace` with `StepError.undefinedBehavior`, regardless
+of whether the local is dead, uninitialized, an integer scalar, or a stack
+pointer. -/
+theorem validatePlace_ref_never_always_ub
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {refIdx : Nat} {decl : LocalDecl}
+    (hdecl : get? body.localDecls refIdx = some decl)
+    {refMut : Mutability}
+    (hrefTy : decl.ty.kind = .ref refMut .never)
+    (himm_loc : IsImmediateFrameLocal tf refIdx)
+    (fuel : Nat) :
+    ∃ msg,
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (annealValidityHooks body.layouts) decl.ty (fuel + 1)
+        ⟨.local 0 refIdx none tf.localsIdentity, translateTy decl.ty body.layouts⟩
+        false false m =
+        .error (.undefinedBehavior msg) m := by
+  have hfr := hstate.frame_rel_singleton hframes
+  obtain ⟨slot, mls, _, hlt, _, hmls, hmls_eq, hloc⟩ := hfr.lookup_local hdecl
+  have hsim := validatePlace_ref_never_simulation hstate hframes hlt hrefTy fuel
+  rcases hloc with hloc1 | ⟨p, mptr, cl, _, _, _, _, hptr⟩
+  · rcases hloc1 with hb | ⟨_, _, _, _, _, _, hty_r, _⟩
+    · rcases hb with ⟨cl, _⟩ | ⟨_, imm, cl, _, himm⟩ | ⟨_, mp, cl, _, _, _⟩
+      · exact ⟨_, hsim.1 (by rw [hmls_eq])⟩
+      · rcases himm with ⟨_, rfl⟩ | ⟨v, _, himm_rel⟩
+        · exact ⟨_, hsim.2.1 (by rw [hmls_eq])⟩
+        · cases himm_rel with
+          | unit hz =>
+            exfalso
+            have h8 : (translateTy decl.ty body.layouts).layout.size =
+                Miri.ABI.Size.ofBytes 8 := by
+              simp [translateTy, hrefTy, pointerLayoutData]
+            rw [h8] at hz
+            cases hz
+          | scalar sc msc hrel hsz _ _ =>
+            have h8 : (translateTy decl.ty body.layouts).layout.size =
+                Miri.ABI.Size.ofBytes 8 := by
+              simp [translateTy, hrefTy, pointerLayoutData]
+            rw [h8] at hsz
+            have hsz_b : (8 : UInt64) = UInt64.ofNat sc.sizeBytes :=
+              congrArg Miri.ABI.Size.bytes hsz
+            have hsz8 : sc.sizeBytes = 8 := by
+              rcases hrel.validBytes with h | h | h | h | h <;>
+                (rw [h] at hsz_b; first | exact h | cases hsz_b)
+            have hcan := hrel.canonical
+            rw [hsz8] at hcan
+            have hlt64 : sc.bits < 2 ^ 64 := by
+              have : scalarModulus 8 = 2 ^ 64 := by decide
+              omega
+            have hval : (tf.locals[refIdx]'hlt).value =
+                .live (.immediate (.scalar (.fromScalarInt msc))) := by
+              rw [hmls_eq]
+            by_cases h0 : sc.bits = 0
+            · exact ⟨_, (hsim.2.2.1 hrel hsz8 hlt64 hval).1 h0⟩
+            · exact ⟨_, (hsim.2.2.1 hrel hsz8 hlt64 hval).2 h0⟩
+          | scalarPair _ _ _ _ _ _ hagg _ =>
+            exfalso
+            rcases hagg with ⟨_, ht⟩ | ⟨_, _, ht⟩ <;> (rw [hrefTy] at ht; cases ht)
+      · exact False.elim (himm_loc ⟨.live (.indirect mp), cl⟩ hmls mp rfl)
+    · rw [hrefTy] at hty_r; cases hty_r
+  · obtain ⟨_, _, _, _, _, _, e, he, htag, _⟩ := id hptr
+    exact ⟨_, hsim.2.2.2 hptr he htag (by rw [hmls_eq])⟩
+
+/-! ### Zero-Variant and Multi-Variant Enum Discriminant Validation (`LM-3.2`) -/
+
+private theorem annealValidityPlaceOperand_local_zero_offset
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) {idx : Nat}
+    (lay : Miri.Interpreter.LocalLayout) :
+    annealValidityPlaceOperand
+        ⟨.local 0 idx (some Miri.ABI.Size.ZERO) tf.localsIdentity, lay⟩ m =
+      annealValidityPlaceOperand ⟨.local 0 idx none tf.localsIdentity, lay⟩ m := by
+  unfold annealValidityPlaceOperand
+  simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
+    stack_currentFrame?_singleton m.stack tf hframes, BEq.rfl, ↓reduceIte]
+
+private theorem translateWrappingRange_contains_eq
+    (r : Layout.WrappingRange) (v : Nat)
+    (hs : r.start < 2 ^ 128) (he : r.end_ < 2 ^ 128) (hv : v < 2 ^ 128) :
+    (translateWrappingRange r).contains (BitVec.ofNat 128 v) =
+      wrappingRangeContains r v := by
+  have hs_bv : (BitVec.ofNat 128 r.start).toNat = r.start := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hs]
+  have he_bv : (BitVec.ofNat 128 r.end_).toNat = r.end_ := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt he]
+  have hv_bv : (BitVec.ofNat 128 v).toNat = v := by
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hv]
+  have hble_se : Nat.ble r.start r.end_ = decide (r.start ≤ r.end_) := by
+    rw [Bool.eq_iff_iff, Nat.ble_eq, decide_eq_true_eq]
+  have hble_sv : Nat.ble r.start v = decide (r.start ≤ v) := by
+    rw [Bool.eq_iff_iff, Nat.ble_eq, decide_eq_true_eq]
+  have hble_ve : Nat.ble v r.end_ = decide (v ≤ r.end_) := by
+    rw [Bool.eq_iff_iff, Nat.ble_eq, decide_eq_true_eq]
+  unfold translateWrappingRange Miri.ABI.WrappingRange.contains wrappingRangeContains
+  simp only [hs_bv, he_bv, hv_bv, hble_se, hble_sv, hble_ve]
+  by_cases h : r.start ≤ r.end_ <;> simp [h]
+
+private theorem u64_truncate_lt_u64 (v : Nat) (hv : v < 2 ^ 64) :
+    (Miri.ABI.Size.ofBytes 8).truncate (BitVec.ofNat 128 v) =
+      .ok (BitVec.ofNat 128 v) := by
+  have hlt128 : v < 2 ^ 128 := by omega
+  have htr := size_truncate_translateSizeBytes (sz := 8)
+    (by simp [ValidScalarBytes]) (BitVec.ofNat 128 v)
+  change (translateSizeBytes 8).truncate (BitVec.ofNat 128 v) = _
+  rw [htr, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt128, Nat.mod_eq_of_lt hv]
+
+private theorem adt_tyId_bounds {n : Nat} (hn : n < 800) :
+    ¬ ((100 + n : Miri.MIR.TyId) < 100) ∧
+    (100 ≤ (100 + n : Miri.MIR.TyId) ∧ (100 + n : Miri.MIR.TyId) < 900) := by
+  unfold Miri.MIR.TyId
+  omega
+
+private theorem forIn'_singleton_estate {ε σ α β : Type}
+    (x : α) (b : β) (f : (a : α) → a ∈ #[x] → β → EStateM ε σ (ForInStep β)) :
+    forIn' #[x] b f =
+      (f x (by simp) b >>= fun step =>
+        match step with
+        | .done b' => pure b'
+        | .yield b' => pure b') := rfl
+
+private theorem estate_bind_assoc {ε σ α β γ : Type}
+    (ma : EStateM ε σ α) (kb : α → EStateM ε σ β) (kc : β → EStateM ε σ γ) :
+    ((ma >>= kb) >>= kc) = (ma >>= fun a => kb a >>= kc) := by
+  funext s; dsimp [Bind.bind, EStateM.bind]; cases ma s <;> rfl
+
+private theorem estate_pure_bind {ε σ α β : Type}
+    (a : α) (k : α → EStateM ε σ β) :
+    (pure a >>= k : EStateM ε σ β) = k a := rfl
+
+private theorem estate_bind_congr_cont {ε σ α β : Type}
+    (ma : EStateM ε σ α) {kb kc : α → EStateM ε σ β}
+    (h : ∀ a s', kb a s' = kc a s') (s : σ) :
+    (ma >>= kb) s = (ma >>= kc) s := by
+  dsimp [Bind.bind, EStateM.bind]
+  cases ma s with
+  | ok a s' => exact h a s'
+  | error e s' => rfl
+
+/-- **Zero-variant enum (`VariantsShape.empty`) `ValidityVisitor.validatePlace`
+and `&Void` reference simulation (`LM-3.2`)**:
+1. Any place `place` whose layout is a zero-variant enum `enumTy`
+   (`enumTy.kind = .adt defPath args`, `enumTy.layoutIdx < 800`,
+   `LayoutTable.lookup layouts enumTy.layoutIdx = some tl`,
+   `tl.variants = .empty`, `tl.fields = .arbitrary .nil .nil`) is rejected by
+   `ValidityVisitor.validatePlace` with
+   `"validation: zero-variant enum value"`, matching
+   `Bytes.decodeValueFromBytes (dFuel + 1) layouts enumTy bytes = none` on
+   every byte sequence `bytes`.
+2. Every byte sequence `bytes` fails `decodeValueFromBytes` for `enumTy`. -/
+theorem validatePlace_zero_variant_enum_simulation
+    (layouts : LayoutTable) {enumTy : Ty} {defPath : String} {args : List RigidTy}
+    (hk : enumTy.kind = .adt defPath args)
+    (hidx : enumTy.layoutIdx < 800)
+    {tl : Layout.TypeLayout}
+    (hlook : LayoutTable.lookup layouts enumTy.layoutIdx = some tl)
+    (hvar : tl.variants = .empty)
+    (hfields : tl.fields = .arbitrary .nil .nil)
+    (fuel : Nat) :
+    (∀ (place : Miri.Interpreter.RuntimePlace AnnealProv) (m : AnnealStepState),
+      place.layout = translateTy enumTy layouts →
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (annealValidityHooks layouts) enumTy (fuel + 1) place false false m =
+        .error (.undefinedBehavior "validation: zero-variant enum value") m) ∧
+    (∀ (dFuel : Nat) (bytes : List AbstractByte),
+      decodeValueFromBytes (dFuel + 1) layouts enumTy bytes = none) := by
+  obtain ⟨hb_not_lt, hb_in⟩ := adt_tyId_bounds hidx
+  refine ⟨fun place m hlay => ?_, fun dFuel bytes => ?_⟩
+  · let initSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+      { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    have hvp := validatePlace_annealValidityHooks_nonrecursive_eq layouts enumTy
+      (fuel + 1) place m
+    have htyId : place.layout.ty = 100 + enumTy.layoutIdx := by
+      rw [hlay]; simp [translateTy, encodeTyId, hk]
+    have hcl : (annealValidityHooks layouts).classify enumTy place.layout.ty m =
+        .ok (.aggregate false false true) m := by
+      simp only [annealValidityHooks, htyId, ite_false_eq hb_not_lt,
+        annealValidityClassifyAdt, ite_true_eq hb_in,
+        Nat.add_sub_cancel_left, hlook, hvar]
+      rfl
+    have hfl : place.layout.layout.fields = .Arbitrary #[] #[] := by
+      rw [hlay]
+      simp [translateTy, hk, hlook, translateTypeLayout, hfields, translateFieldsShape]
+    have hvr : place.layout.layout.variants = .Empty := by
+      rw [hlay]
+      simp [translateTy, hk, hlook, translateTypeLayout, hvar, translateVariantsShape]
+    have hv : Miri.Interpreter.ValidityVisitor.visit (annealValidityHooks layouts)
+        enumTy (fuel + 1) initSession place m =
+        .error (.undefinedBehavior "validation: zero-variant enum value") m := by
+      unfold Miri.Interpreter.ValidityVisitor.visit
+      rw [estate_bind_ok _ _ _ _ _ hcl]
+      refine (estate_bind_ok _ _ _ _ none rfl).trans ?_
+      simp only [initSession, hfl, hvr]
+      rfl
+    exact hvp.2 _ _ hv
+  · unfold decodeValueFromBytes
+    simp only [hk, hlook, hvar]
+    cases (Bool.or tl.isUninhabited (Bool.not (Nat.beq (length bytes) tl.size.bytes))) <;>
+      rfl
+
+/-- **Fieldless `u8`-tagged enum discriminant `ValidityVisitor.validatePlace`
+vs. `Bytes.decodeValueFromBytes` simulation (`LM-3.2`)**: for a multi-variant
+C-like enum `enumTy` (`enumTy.kind = .adt defPath args`,
+`enumTy.layoutIdx < 800`, `LayoutTable.lookup layouts enumTy.layoutIdx = some tl`)
+with 1-byte `u8` tag scalar `tagSl = .initialized (.int 8 false) validRange`
+at field `0` (`tl.size = ⟨1⟩`, `tl.isUninhabited = false`,
+`tl.fields = .arbitrary [⟨0⟩] [0]`,
+`tl.variants = .multiple tagSl 0 variantShapes`, and every variant in
+`variantShapes` fieldless `.arbitrary .nil .nil`):
+
+1. **Dead local (`.dead`)**: `validatePlace` raises undefined behavior
+   (`"validation of a dead local"`).
+2. **Uninitialized local (`.uninit`)**: `validatePlace` raises undefined
+   behavior (`"read of uninitialized local"`), matching
+   `decodeValueFromBytes (dFuel + 1) layouts enumTy [.uninit] = none`.
+3. **Initialized `u8` discriminant byte (`ScalarRel sc msc`, `sc.sizeBytes = 1`)**:
+   - if `wrappingRangeContains validRange sc.bits = false`, `validatePlace`
+     raises `.error (.undefinedBehavior "InvalidTag(outside valid range)") m`
+     and `decodeValueFromBytes ... [.init (UInt8.ofNat sc.bits) none] = none`;
+   - if `wrappingRangeContains validRange sc.bits = true` and
+     `variantShapes.length ≤ sc.bits` (undeclared discriminant gap inside
+     `validRange`), `validatePlace` raises
+     `.error (.undefinedBehavior "InvalidTag(no declared discriminant)") m`
+     and `decodeValueFromBytes ... [.init (UInt8.ofNat sc.bits) none] = none`;
+   - if `wrappingRangeContains validRange sc.bits = true` and
+     `sc.bits < variantShapes.length`, `validatePlace` succeeds (`.ok () m`)
+     and `decodeValueFromBytes ... [.init (UInt8.ofNat sc.bits) none] =
+     some (.aggregate sc.bits .nil)`. -/
+theorem validatePlace_enum_discriminant_simulation
+    (layouts : LayoutTable) {enumTy : Ty} {defPath : String} {args : List RigidTy}
+    (hk : enumTy.kind = .adt defPath args)
+    (hidx : enumTy.layoutIdx < 800)
+    {tl : Layout.TypeLayout}
+    (hlook : LayoutTable.lookup layouts enumTy.layoutIdx = some tl)
+    {validRange : Layout.WrappingRange}
+    (hr_start : validRange.start < 2 ^ 128)
+    (hr_end : validRange.end_ < 2 ^ 128)
+    {variantShapes : List Layout.FieldsShape}
+    (hsz1 : tl.size = ⟨1⟩)
+    (hinh : tl.isUninhabited = false)
+    (hfields : tl.fields = .arbitrary [⟨0⟩] [0])
+    (hvars : tl.variants =
+      .multiple (.initialized (.int 8 false) validRange) 0 variantShapes)
+    (hv_fieldless : ∀ v < variantShapes.length,
+      get? variantShapes v = some (.arbitrary .nil .nil))
+    (fuel dFuel : Nat)
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) {idx : Nat} (hlt : idx < tf.locals.size) :
+    let place : Miri.Interpreter.RuntimePlace AnnealProv :=
+      ⟨.local 0 idx none tf.localsIdentity, translateTy enumTy layouts⟩
+    ((tf.locals[idx]'hlt).value = .dead →
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+        .error (.undefinedBehavior "validation of a dead local") m) ∧
+    ((tf.locals[idx]'hlt).value = .live (.immediate .uninit) →
+      Miri.Interpreter.ValidityVisitor.validatePlace
+        (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+        .error (.undefinedBehavior "read of uninitialized local") m ∧
+      decodeValueFromBytes (dFuel + 1) layouts enumTy [.uninit] = none) ∧
+    (∀ {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt},
+      ScalarRel sc msc → sc.sizeBytes = 1 →
+      (tf.locals[idx]'hlt).value =
+        .live (.immediate (.scalar (.fromScalarInt msc))) →
+      (wrappingRangeContains validRange sc.bits = false →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+          .error (.undefinedBehavior "InvalidTag(outside valid range)") m ∧
+        decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] = none) ∧
+      (wrappingRangeContains validRange sc.bits = true →
+        variantShapes.length ≤ sc.bits →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+          .error (.undefinedBehavior "InvalidTag(no declared discriminant)") m ∧
+        decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] = none) ∧
+      (wrappingRangeContains validRange sc.bits = true →
+        sc.bits < variantShapes.length →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+          .ok () m ∧
+        decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] =
+          some (.aggregate sc.bits .nil)) ∧
+      (Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+          .ok () m ↔
+        ∃ v, decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] = some v)) := by
+  intro place
+  obtain ⟨hb_not_lt, hb_in⟩ := adt_tyId_bounds hidx
+  let initSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+    { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+      refTracking := none, dataBytes := none }
+  let u8Lay : Miri.Interpreter.LocalLayout :=
+    { ty := 20, layout := scalarLayoutData 1 false }
+  let tagPlace : Miri.Interpreter.RuntimePlace AnnealProv :=
+    ⟨.local 0 idx (some Miri.ABI.Size.ZERO) tf.localsIdentity, u8Lay⟩
+  have hvp := validatePlace_annealValidityHooks_nonrecursive_eq layouts enumTy
+    (fuel + 2) place m
+  have htyId : (translateTy enumTy layouts).ty = 100 + enumTy.layoutIdx := by
+    simp [translateTy, encodeTyId, hk]
+  have hcl : (annealValidityHooks layouts).classify enumTy
+      (translateTy enumTy layouts).ty m =
+      .ok (.aggregate false false true) m := by
+    simp only [annealValidityHooks, htyId, ite_false_eq hb_not_lt,
+      annealValidityClassifyAdt, ite_true_eq hb_in,
+      Nat.add_sub_cancel_left, hlook, hvars]
+    rfl
+  have hinh_hook : (annealValidityHooks layouts).opsemInhabited enumTy
+      (translateTy enumTy layouts).ty m = .ok true m := by
+    simp only [annealValidityHooks, htyId, ite_false_eq hb_not_lt,
+      annealAdtTyIdInhabited, ite_true_eq hb_in,
+      Nat.add_sub_cancel_left, hlook, hinh, hvars]
+    rfl
+  have hlay_eq : (translateTy enumTy layouts).layout = translateTypeLayout tl := by
+    simp [translateTy, hk, hlook]
+  have hfl : (translateTy enumTy layouts).layout.fields =
+      .Arbitrary #[Miri.ABI.Size.ZERO] #[0] := by
+    rw [hlay_eq]
+    unfold translateTypeLayout
+    rw [hfields]
+    rfl
+  have hvr : (translateTy enumTy layouts).layout.variants =
+      .Multiple (translateScalarLayout (.initialized (.int 8 false) validRange))
+        .Direct 0 (variantShapes.map translateVariantFieldsShape).toArray := by
+    rw [hlay_eq]
+    simp [translateTypeLayout, hvars, translateVariantsShape]
+  have hp_size : (translateTy enumTy layouts).layout.size = Miri.ABI.Size.ofBytes 1 := by
+    rw [hlay_eq]
+    simp [translateTypeLayout, hsz1, translateSize, translateSizeBytes]
+  have hp_field : Miri.Interpreter.PlaceDynamic.field
+      (annealValidityHooks layouts).projection enumTy place 0 m =
+      .ok tagPlace m := by
+    with_unfolding_all
+      unfold Miri.Interpreter.PlaceDynamic.field
+        Miri.Interpreter.PlaceDynamic.offsetWithMeta
+        Miri.Interpreter.ValidityVisitor.Hooks.projection
+        annealValidityHooks annealValidityProjectionHooksWithLayouts
+      simp only [place, hfl, hvr, hp_size]
+      rfl
+  let tagSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+    { initSession with path := ⟨"", #[.enumTag]⟩ }
+  have hv_tag := visit_primitive_cases (annealValidityHooks layouts) enumTy fuel
+    tagSession tagPlace m rfl
+  have hcl_u8 : (annealValidityHooks layouts).classify enumTy tagPlace.layout.ty m =
+      .ok .integer m := rfl
+  have hfp : (annealValidityHooks layouts).fieldPath enumTy place.layout 0
+      tagPlace.layout.ty m = .ok .enumTag m := rfl
+  refine ⟨fun hdead => ?_, fun hun => ?_,
+    fun {sc msc} hrel hsc_sz1 hval => ?_⟩
+  · have hop_dead : annealValidityPlaceOperand tagPlace m =
+        .error (.undefinedBehavior "validation of a dead local") m := by
+      exact (annealValidityPlaceOperand_local_zero_offset hframes u8Lay).trans
+        (annealValidityPlaceOperand_dead_local hframes hlt hdead u8Lay)
+    have hrd_dead : (annealValidityHooks layouts).readImmediate enumTy tagPlace
+        .integer m =
+        .error (.undefinedBehavior "validation of a dead local") m :=
+      estate_bind_err _ _ _ _ _ hop_dead
+    have htag_err := hv_tag.2.1 .integer (Or.inr (Or.inr rfl)) hcl_u8 _ hrd_dead
+    have hvisit_err : Miri.Interpreter.ValidityVisitor.visit
+        (annealValidityHooks layouts) enumTy (fuel + 2) initSession place m =
+        .error (.undefinedBehavior "validation of a dead local") m := by
+      unfold Miri.Interpreter.ValidityVisitor.visit
+      rw [estate_bind_ok _ _ _ _ _ hcl]
+      refine (estate_bind_ok _ _ _ _ none rfl).trans ?_
+      have hf_eq : place.layout.layout.fields = .Arbitrary #[Miri.ABI.Size.ZERO] #[0] := hfl
+      rw [hf_eq]
+      dsimp only [initSession, forIn]
+      rw [forIn'_singleton_estate]
+      refine estate_bind_err _ _ _ _ _ (estate_bind_err _ _ _ _ _ ?_)
+      refine (estate_bind_ok _ _ _ _ _ hp_field).trans ?_
+      refine (estate_bind_ok _ _ _ _ _ hfp).trans ?_
+      exact estate_bind_err _ _ _ _ _ htag_err
+    exact hvp.2 _ _ hvisit_err
+  · have hop_un : annealValidityPlaceOperand tagPlace m =
+        .ok (.immediate .uninit) m :=
+      (annealValidityPlaceOperand_local_zero_offset hframes u8Lay).trans
+        (annealValidityPlaceOperand_local hframes hlt hun u8Lay)
+    have hrd_un : (annealValidityHooks layouts).readImmediate enumTy tagPlace
+        .integer m =
+        .error (.undefinedBehavior "read of uninitialized local") m :=
+      (estate_bind_ok _ _ _ _ _ hop_un).trans rfl
+    have htag_err := hv_tag.2.1 .integer (Or.inr (Or.inr rfl)) hcl_u8 _ hrd_un
+    have hvisit_err : Miri.Interpreter.ValidityVisitor.visit
+        (annealValidityHooks layouts) enumTy (fuel + 2) initSession place m =
+        .error (.undefinedBehavior "read of uninitialized local") m := by
+      unfold Miri.Interpreter.ValidityVisitor.visit
+      rw [estate_bind_ok _ _ _ _ _ hcl]
+      refine (estate_bind_ok _ _ _ _ none rfl).trans ?_
+      have hf_eq : place.layout.layout.fields = .Arbitrary #[Miri.ABI.Size.ZERO] #[0] := hfl
+      rw [hf_eq]
+      dsimp only [initSession, forIn]
+      rw [forIn'_singleton_estate]
+      refine estate_bind_err _ _ _ _ _ (estate_bind_err _ _ _ _ _ ?_)
+      refine (estate_bind_ok _ _ _ _ _ hp_field).trans ?_
+      refine (estate_bind_ok _ _ _ _ _ hfp).trans ?_
+      exact estate_bind_err _ _ _ _ _ htag_err
+    have hdec_un : decodeValueFromBytes (dFuel + 1) layouts enumTy [.uninit] = none := by
+      unfold decodeValueFromBytes
+      rw [hk, hlook]; dsimp only []
+      rw [hinh, hsz1, hvars, hfields]
+      rfl
+    exact ⟨hvp.2 _ _ hvisit_err, hdec_un⟩
+  · have hcan := hrel.canonical
+    rw [hsc_sz1] at hcan
+    have hlt256 : sc.bits < 256 := by
+      have : scalarModulus 1 = 256 := by decide
+      omega
+    have htb : msc.toBits (Miri.ABI.Size.ofBytes 1) =
+        .ok (BitVec.ofNat 128 sc.bits) := by
+      have hb := hrel.toBits_eq
+      rw [hsc_sz1] at hb
+      exact hb
+    have hop_ok : annealValidityPlaceOperand place m =
+        .ok (.immediate (.scalar (.fromScalarInt msc))) m :=
+      annealValidityPlaceOperand_local hframes hlt hval place.layout
+    have hop_tag : annealValidityPlaceOperand tagPlace m =
+        .ok (.immediate (.scalar (.fromScalarInt msc))) m :=
+      (annealValidityPlaceOperand_local_zero_offset hframes u8Lay).trans
+        (annealValidityPlaceOperand_local hframes hlt hval u8Lay)
+    have hrd_ok : (annealValidityHooks layouts).readImmediate enumTy tagPlace
+        .integer m =
+        .ok ⟨.scalar (.fromScalarInt msc), u8Lay⟩ m :=
+      (estate_bind_ok _ _ _ _ _ hop_tag).trans rfl
+    have htag_ok : Miri.Interpreter.ValidityVisitor.visit
+        (annealValidityHooks layouts) enumTy (fuel + 1) tagSession tagPlace m =
+        .ok tagSession m :=
+      hv_tag.2.2.1 hcl_u8 _ hrd_ok
+    have hr_eq := translateWrappingRange_contains_eq validRange sc.bits hr_start
+      hr_end (by omega)
+    have htr64 := u64_truncate_lt_u64 sc.bits (by omega)
+    have hbv_nat : (BitVec.ofNat 128 sc.bits).toNat = sc.bits := by
+      rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega : sc.bits < 2 ^ 128)]
+    have hu8_nat : (UInt8.ofNat sc.bits).toBitVec.toNat = sc.bits := by
+      simp [UInt8.ofNat, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt256]
+    have hdsl :
+        decodeScalarLayoutBytes (.initialized (.int 8 false) validRange)
+          [.init (UInt8.ofNat sc.bits) none] =
+          (if wrappingRangeContains validRange sc.bits then
+             some (.scalar ⟨sc.bits, 1⟩)
+           else
+             none) := by
+      change (match wrappingRangeContains validRange
+                (UInt8.ofNat sc.bits).toBitVec.toNat with
+              | false => none
+              | true =>
+                some (Value.scalar ⟨(UInt8.ofNat sc.bits).toBitVec.toNat, 1⟩)) = _
+      rw [hu8_nat]
+      cases wrappingRangeContains validRange sc.bits <;> rfl
+    have hdec_eq :
+        decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] =
+          (match decodeScalarLayoutBytes (.initialized (.int 8 false) validRange)
+                  [.init (UInt8.ofNat sc.bits) none] with
+           | some (.scalar tagSc) =>
+             match get? variantShapes tagSc.bits with
+             | some (.arbitrary varOffsets _) =>
+               match decodeFieldsBySpan [.init (UInt8.ofNat sc.bits) none] 1 varOffsets with
+               | some vals => some (.aggregate tagSc.bits vals)
+               | none => none
+             | _ => none
+           | _ => none) := by
+      unfold decodeValueFromBytes
+      rw [hk, hlook]; dsimp only []
+      rw [hinh, hsz1, hvars, hfields]
+      rfl
+    have hdiscr :
+        Miri.Interpreter.Discriminant.readDiscriminant
+          (annealValidityHooks layouts).discriminant enumTy
+          ⟨.immediate (.scalar (.fromScalarInt msc)), place.layout⟩ m =
+          (if wrappingRangeContains validRange sc.bits == false then
+             .error (.undefinedBehavior "InvalidTag(outside valid range)") m
+           else if sc.bits < variantShapes.length then
+             .ok sc.bits m
+           else
+             .error (.undefinedBehavior "InvalidTag(no declared discriminant)") m) := by
+      let rawTag := translateScalarLayout (.initialized (.int 8 false) validRange)
+      have hproj_rd :
+          (annealValidityHooks layouts).discriminant.projectRead enumTy
+            ⟨.immediate (.scalar (.fromScalarInt msc)), place.layout⟩ 0 m =
+            .ok ⟨.immediate (.scalar (.fromScalarInt msc)), u8Lay⟩ m := by
+        simp only [annealValidityHooks, place, hfl, hvr]
+        rfl
+      have hvfd :
+          (annealValidityHooks layouts).discriminant.variantForDiscriminant enumTy
+            place.layout.ty (BitVec.ofNat 128 sc.bits) m =
+            (if sc.bits < variantShapes.length then
+               .ok (some sc.bits) m
+             else
+               .ok none m) := by
+        simp only [annealValidityHooks, place, htyId, ite_true_eq hb_in,
+          Nat.add_sub_cancel_left, hlook, hvars, hbv_nat]
+        split <;> rfl
+      with_unfolding_all
+        unfold Miri.Interpreter.Discriminant.readDiscriminant Miri.Interpreter.RvalueM
+        repeat rw [estate_pure_bind]
+        refine (estate_bind_ok _ _ _ _
+          ({ ty := 23, layout := scalarLayoutData 8 false } : Miri.Interpreter.LocalLayout)
+          rfl).trans ?_
+        have hvr_eq :
+            place.layout.layout.variants =
+              .Multiple rawTag .Direct 0
+                (variantShapes.map translateVariantFieldsShape).toArray := hvr
+        rw [hvr_eq]
+        dsimp only []
+        refine (estate_bind_ok _ _ _ _ u8Lay rfl).trans ?_
+        refine (estate_bind_ok _ _ _ _ _ hproj_rd).trans ?_
+        refine (estate_bind_ok _ _ _ _
+          (⟨.scalar (.fromScalarInt msc), u8Lay⟩ : Miri.Interpreter.RvalueImmTy AnnealProv)
+          rfl).trans ?_
+        dsimp only []
+        repeat rw [estate_bind_assoc]
+        repeat rw [estate_pure_bind]
+        refine (estate_bind_ok _ _ _ _ false rfl).trans ?_
+        refine (estate_bind_ok _ _ _ _ false rfl).trans ?_
+        repeat rw [estate_bind_assoc]
+        repeat rw [estate_pure_bind]
+        refine (estate_bind_ok _ _ _ _
+          (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc) rfl).trans ?_
+        refine (estate_bind_ok _ _ _ _
+          (Miri.Memory.ScalarIntCastResult.integer msc) rfl).trans ?_
+        refine (estate_bind_ok _ _ _ _ (BitVec.ofNat 128 sc.bits) (by
+          dsimp [u8Lay, scalarLayoutData, translateSizeBytes]
+          rw [htb]; rfl)).trans ?_
+        repeat rw [estate_bind_assoc]
+        refine (estate_bind_ok _ _ _ _ (translateWrappingRange validRange) rfl).trans ?_
+        rw [hr_eq]
+        by_cases hrc : wrappingRangeContains validRange sc.bits = true
+        · rw [hrc, show (!true) = false from rfl, ite_false_eq (by decide)]
+          repeat rw [estate_pure_bind]
+          refine (estate_bind_ok _ _ _ _ (BitVec.ofNat 128 sc.bits) (by
+            dsimp [scalarLayoutData, translateSizeBytes]; rw [htr64]; rfl)).trans ?_
+          by_cases hlt_v : sc.bits < variantShapes.length
+          · have hvfd_ok :
+                (annealValidityHooks layouts).discriminant.variantForDiscriminant enumTy
+                  place.layout.ty (BitVec.ofNat 128 sc.bits) m = .ok (some sc.bits) m := by
+              rw [hvfd, ite_true_eq hlt_v]
+            refine (estate_bind_ok _ _ _ _ _ hvfd_ok).trans ?_
+            dsimp only []
+            repeat rw [estate_pure_bind]
+            rw [ite_true_eq hlt_v]
+            have huninh : place.layout.layout.isVariantUninhabited sc.bits = false := by
+              unfold Miri.ABI.LayoutData.isVariantUninhabited
+              rw [hvr]
+              dsimp only []
+              have harr :
+                  (variantShapes.map translateVariantFieldsShape).toArray[sc.bits]? =
+                    some (translateVariantFieldsShape (.arbitrary .nil .nil)) := by
+                rw [List.getElem?_toArray, List.getElem?_map,
+                  ← get?_eq_getElem?, hv_fieldless sc.bits hlt_v]
+                rfl
+              rw [harr]
+              rfl
+            rw [huninh]
+            rfl
+          · have hvfd_none :
+                (annealValidityHooks layouts).discriminant.variantForDiscriminant enumTy
+                  place.layout.ty (BitVec.ofNat 128 sc.bits) m = .ok none m := by
+              rw [hvfd, ite_false_eq hlt_v]
+            refine (estate_bind_ok _ _ _ _ _ hvfd_none).trans ?_
+            rw [ite_false_eq hlt_v]
+            rfl
+        · have hrf : wrappingRangeContains validRange sc.bits = false :=
+            Bool.eq_false_iff.mpr hrc
+          rw [hrf]
+          rfl
+    have hstep_after_tag :
+        Miri.Interpreter.ValidityVisitor.visit
+          (annealValidityHooks layouts) enumTy (fuel + 2) initSession place m =
+          (do
+            let variant ← Miri.Interpreter.Discriminant.readDiscriminant
+              (annealValidityHooks layouts).discriminant enumTy
+              ⟨.immediate (.scalar (.fromScalarInt msc)), place.layout⟩
+            let child ← Miri.Interpreter.PlaceDynamic.downcast
+              (annealValidityHooks layouts).projection enumTy place variant
+            let s2 ← Miri.Interpreter.ValidityVisitor.visit
+              (annealValidityHooks layouts) enumTy (fuel + 1)
+              { initSession with path := initSession.path.push (.variant (toString variant)) }
+              child
+            let s3 := { s2 with path := ⟨"", #[]⟩, flags := { s2.flags with mayDangle := false } }
+            let inh ← (annealValidityHooks layouts).opsemInhabited enumTy place.layout.ty
+            if !inh then throw (.invalidProgram "uninhabited type passed validity")
+            pure s3 : EStateM _ _ _) m := by
+      conv => lhs; unfold Miri.Interpreter.ValidityVisitor.visit Miri.Interpreter.ValidityVisitor.M
+      repeat rw [estate_bind_assoc]
+      repeat rw [estate_pure_bind]
+      rw [estate_bind_ok _ _ _ _ _ hcl]
+      refine (estate_bind_ok _ _ _ _ none rfl).trans ?_
+      have hf_eq : place.layout.layout.fields = .Arbitrary #[Miri.ABI.Size.ZERO] #[0] := hfl
+      have hv_eq : place.layout.layout.variants =
+          .Multiple (translateScalarLayout (.initialized (.int 8 false) validRange))
+            .Direct 0 (variantShapes.map translateVariantFieldsShape).toArray := hvr
+      have hbox :
+          (Miri.Interpreter.ValidityVisitor.TypeKind.aggregate false false true == .box) =
+            false := rfl
+      dsimp +zetaHave only [initSession, Bool.false_or]
+      rw [hbox, ite_false_eq (by decide)]
+      repeat rw [estate_bind_assoc]
+      repeat rw [estate_pure_bind]
+      rw [hf_eq, hv_eq]
+      dsimp +zetaHave only [forIn]
+      rw [forIn'_singleton_estate]
+      repeat rw [estate_bind_assoc]
+      repeat rw [estate_pure_bind]
+      have htoOp : (annealValidityHooks layouts).toOp enumTy place m =
+          .ok ⟨.immediate (.scalar (.fromScalarInt msc)), place.layout⟩ m :=
+        (estate_bind_ok _ _ _ _ _ hop_ok).trans rfl
+      have hdbg : (annealValidityHooks layouts).debugAssertions = false := rfl
+      rw [estate_bind_ok _ _ _ _ _ hp_field]
+      repeat rw [estate_bind_assoc]
+      rw [estate_bind_ok _ _ _ _ _ hfp]
+      repeat rw [estate_bind_assoc]
+      change (Miri.Interpreter.ValidityVisitor.visit (annealValidityHooks layouts)
+          enumTy (fuel + 1) tagSession tagPlace >>= _) m = _
+      rw [estate_bind_ok _ _ _ _ _ htag_ok]
+      dsimp +zetaHave only []
+      repeat rw [estate_pure_bind]
+      rw [estate_bind_ok _ _ _ _ _ htoOp]
+      repeat rw [estate_bind_assoc]
+      apply estate_bind_congr_cont; intro variant m1
+      repeat rw [estate_bind_assoc]
+      repeat rw [estate_pure_bind]
+      apply estate_bind_congr_cont; intro child m2
+      dsimp +zetaHave only [initSession]
+      have hvp_v :
+          (annealValidityHooks layouts).variantPath enumTy place.layout variant =
+            pure (.variant (toString variant)) := rfl
+      rw [hvp_v]
+      dsimp +zetaHave only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+        initSession, hdbg]
+      cases Miri.Interpreter.ValidityVisitor.visit (annealValidityHooks layouts)
+          enumTy (fuel + 1)
+          { path := (Miri.Memory.ValidationPath.mk "" #[]).push (.variant (toString variant))
+            flags := ⟨false, false⟩
+            ctfeMode := none
+            refTracking := none
+            dataBytes := none } child m2 with
+      | error _ _ => rfl
+      | ok s2 m3 =>
+        dsimp only []
+        cases (annealValidityHooks layouts).opsemInhabited enumTy place.layout.ty m3 with
+        | error _ _ => rfl
+        | ok inh m4 => cases inh <;> rfl
+    have hcase_oob :
+        wrappingRangeContains validRange sc.bits = false →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+          .error (.undefinedBehavior "InvalidTag(outside valid range)") m ∧
+        decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] = none := by
+      intro hrf
+      have hd_err : Miri.Interpreter.Discriminant.readDiscriminant
+          (annealValidityHooks layouts).discriminant enumTy
+          ⟨.immediate (.scalar (.fromScalarInt msc)), place.layout⟩ m =
+          .error (.undefinedBehavior "InvalidTag(outside valid range)") m := by
+        rw [hdiscr, hrf]; rfl
+      have hv_err : Miri.Interpreter.ValidityVisitor.visit
+          (annealValidityHooks layouts) enumTy (fuel + 2) initSession place m =
+          .error (.undefinedBehavior "InvalidTag(outside valid range)") m := by
+        rw [hstep_after_tag, estate_bind_err _ _ _ _ _ hd_err]
+      have hdec : decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] = none := by
+        rw [hdec_eq, hdsl, hrf]; rfl
+      exact ⟨hvp.2 _ _ hv_err, hdec⟩
+    have hcase_gap :
+        wrappingRangeContains validRange sc.bits = true →
+        variantShapes.length ≤ sc.bits →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+          .error (.undefinedBehavior "InvalidTag(no declared discriminant)") m ∧
+        decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] = none := by
+      intro hrt hge
+      have hd_err : Miri.Interpreter.Discriminant.readDiscriminant
+          (annealValidityHooks layouts).discriminant enumTy
+          ⟨.immediate (.scalar (.fromScalarInt msc)), place.layout⟩ m =
+          .error (.undefinedBehavior "InvalidTag(no declared discriminant)") m := by
+        rw [hdiscr, hrt, ite_false_eq (by omega : ¬ (sc.bits < variantShapes.length))]
+        rfl
+      have hv_err : Miri.Interpreter.ValidityVisitor.visit
+          (annealValidityHooks layouts) enumTy (fuel + 2) initSession place m =
+          .error (.undefinedBehavior "InvalidTag(no declared discriminant)") m := by
+        rw [hstep_after_tag, estate_bind_err _ _ _ _ _ hd_err]
+      have hget_none : get? variantShapes sc.bits = none := by
+        rw [get?_eq_getElem?]
+        exact List.getElem?_eq_none hge
+      have hdec : decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] = none := by
+        rw [hdec_eq, hdsl, ite_true_eq hrt]; dsimp only []; rw [hget_none]
+      exact ⟨hvp.2 _ _ hv_err, hdec⟩
+    have hcase_ok :
+        wrappingRangeContains validRange sc.bits = true →
+        sc.bits < variantShapes.length →
+        Miri.Interpreter.ValidityVisitor.validatePlace
+          (annealValidityHooks layouts) enumTy (fuel + 2) place false false m =
+          .ok () m ∧
+        decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] =
+          some (.aggregate sc.bits .nil) := by
+      intro hrt hlt_v
+      have hd_ok : Miri.Interpreter.Discriminant.readDiscriminant
+          (annealValidityHooks layouts).discriminant enumTy
+          ⟨.immediate (.scalar (.fromScalarInt msc)), place.layout⟩ m =
+          .ok sc.bits m := by
+        rw [hdiscr, hrt, ite_true_eq hlt_v]; rfl
+      let zstLay : Miri.Interpreter.LocalLayout := { ty := 51, layout := zstLayoutData }
+      let vPlace : Miri.Interpreter.RuntimePlace AnnealProv :=
+        ⟨.local 0 idx (some Miri.ABI.Size.ZERO) tf.localsIdentity, zstLay⟩
+      have hdown : Miri.Interpreter.PlaceDynamic.downcast
+          (annealValidityHooks layouts).projection enumTy place sc.bits m =
+          .ok vPlace m := by
+        with_unfolding_all
+          unfold Miri.Interpreter.PlaceDynamic.downcast
+            Miri.Interpreter.ValidityVisitor.Hooks.projection
+            annealValidityHooks annealValidityProjectionHooksWithLayouts
+          simp only [place, htyId, ite_true_eq hb_in,
+            Nat.add_sub_cancel_left, hlook, hvars, hv_fieldless sc.bits hlt_v]
+          rfl
+      let vSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+        { initSession with path := initSession.path.push (.variant (toString sc.bits)) }
+      have hv_zst : Miri.Interpreter.ValidityVisitor.visit
+          (annealValidityHooks layouts) enumTy (fuel + 1) vSession vPlace m =
+          .ok vSession m :=
+        Miri.Interpreter.ValidityVisitor.visit_fieldless
+          (annealValidityHooks layouts) enumTy fuel vSession vPlace m 0
+          rfl rfl rfl rfl rfl rfl
+      have hv_ok : Miri.Interpreter.ValidityVisitor.visit
+          (annealValidityHooks layouts) enumTy (fuel + 2) initSession place m =
+          .ok initSession m := by
+        rw [hstep_after_tag, estate_bind_ok _ _ _ _ _ hd_ok,
+          estate_bind_ok _ _ _ _ _ hdown,
+          estate_bind_ok _ _ _ _ _ hv_zst,
+          estate_bind_ok _ _ _ _ _ hinh_hook]
+        rfl
+      have hdec : decodeValueFromBytes (dFuel + 1) layouts enumTy
+          [.init (UInt8.ofNat sc.bits) none] =
+          some (.aggregate sc.bits .nil) := by
+        rw [hdec_eq, hdsl, ite_true_eq hrt]; dsimp only []
+        rw [hv_fieldless sc.bits hlt_v]
+      exact ⟨hvp.1 initSession m hv_ok rfl, hdec⟩
+    refine ⟨hcase_oob, hcase_gap, hcase_ok, ?_⟩
+    cases hrc : wrappingRangeContains validRange sc.bits with
+    | false =>
+      obtain ⟨he, hd⟩ := hcase_oob hrc
+      rw [he]
+      exact ⟨(fun h => nomatch h), fun ⟨_, h⟩ => by rw [hd] at h; cases h⟩
+    | true =>
+      by_cases hlt_v : sc.bits < variantShapes.length
+      · obtain ⟨he, hd⟩ := hcase_ok hrc hlt_v
+        rw [he]
+        exact ⟨fun _ => ⟨_, hd⟩, fun _ => rfl⟩
+      · obtain ⟨he, hd⟩ := hcase_gap hrc (by omega)
+        rw [he]
+        exact ⟨(fun h => nomatch h), fun ⟨_, h⟩ => by rw [hd] at h; cases h⟩
+
+/-- Converse of `annealValidateScalarForTyId_of_scalarRel`: when a canonical
+scalar `sc` (`ScalarRel sc msc`) of the exact byte width of primitive scalar
+type `ty` violates `AnnealScalarValid ty sc` (e.g. `2_u8` for `bool` or
+`0xD800_u32` for `char`), `annealValidateScalarForTyId (translateTy ty ly).ty
+(.fromScalarInt msc)` evaluates to `false`. -/
+theorem annealValidateScalarForTyId_false_of_not_scalarValid
+    {ty : Ty} (ly : LayoutTable) {sc : MirAst.ScalarInt}
+    {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc)
+    (hsz : (translateTy ty ly).layout.size = translateSizeBytes sc.sizeBytes)
+    (hinv : ¬ AnnealScalarValid ty sc) :
+    annealValidateScalarForTyId (translateTy ty ly).ty (.fromScalarInt msc) = false := by
+  have htoSi : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toScalarInt =
+      .ok msc := rfl
+  cases hv : annealValidateScalarForTyId (translateTy ty ly).ty (.fromScalarInt msc) with
+  | false => rfl
+  | true =>
+    exfalso
+    apply hinv
+    refine ⟨fun hb => ?_, fun hc => ?_⟩
+    · have hsz1 : sc.sizeBytes = 1 := by
+        have hp_sz : (translateTy ty ly).layout.size = Miri.ABI.Size.ofBytes 1 := by
+          simp [translateTy, hb, scalarLayoutData, translateSizeBytes]
+        have hb_eq : (1 : UInt64) = UInt64.ofNat sc.sizeBytes :=
+          congrArg Miri.ABI.Size.bytes (hp_sz.symm.trans hsz)
+        rcases hrel.validBytes with h | h | h | h | h <;>
+          (rw [h] at hb_eq; first | exact h | cases hb_eq)
+      have hty1 : (translateTy ty ly).ty = 1 := by simp [translateTy, encodeTyId, hb]
+      have hmsc_sz : msc.size = Miri.ABI.Size.ofBytes 1 := by
+        rw [hrel.size_eq, hsz1]; rfl
+      have hlt128 : sc.bits < 2 ^ 128 := by
+        have hcan := hrel.canonical
+        rw [hsz1] at hcan
+        have : scalarModulus 1 = 256 := rfl
+        omega
+      have hdata_nat : msc.data.toNat = sc.bits := by
+        rw [hrel.data_eq, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt128]
+      rw [hty1] at hv
+      simp only [annealValidateScalarForTyId, htoSi, hmsc_sz, hdata_nat, BEq.rfl,
+        Bool.true_and, Bool.or_eq_true, beq_iff_eq] at hv
+      exact hv
+    · have hsz4 : sc.sizeBytes = 4 := by
+        have hp_sz : (translateTy ty ly).layout.size = Miri.ABI.Size.ofBytes 4 := by
+          simp [translateTy, hc, scalarLayoutData, translateSizeBytes]
+        have hb_eq : (4 : UInt64) = UInt64.ofNat sc.sizeBytes :=
+          congrArg Miri.ABI.Size.bytes (hp_sz.symm.trans hsz)
+        rcases hrel.validBytes with h | h | h | h | h <;>
+          (rw [h] at hb_eq; first | exact h | cases hb_eq)
+      have hty2 : (translateTy ty ly).ty = 2 := by simp [translateTy, encodeTyId, hc]
+      have hmsc_sz : msc.size = Miri.ABI.Size.ofBytes 4 := by
+        rw [hrel.size_eq, hsz4]; rfl
+      have hlt128 : sc.bits < 2 ^ 128 := by
+        have hcan := hrel.canonical
+        rw [hsz4] at hcan
+        have : scalarModulus 4 = 2 ^ 32 := rfl
+        omega
+      have hdata_nat : msc.data.toNat = sc.bits := by
+        rw [hrel.data_eq, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt128]
+      rw [hty2] at hv
+      simp only [annealValidateScalarForTyId, htoSi, hmsc_sz, hdata_nat, BEq.rfl,
+        Bool.true_and] at hv
+      exact hv
+
+/-- **Recursive safe-reference pointee validation at invalid `bool`/`char`
+bit patterns (`LM-3.2`)**: in any `StateRelLM3_2` state (`m.stack.frames = #[tf]`),
+when a safe reference `_r : &P` / `&mut P` (`P` is `bool` or `char`) points at
+offset `0` of a live stack allocation `e.localIdx` of same-width integer type
+`allocDecl.ty` (`u8`/`i8` for `bool`, `u32`/`i32` for `char`) holding a scalar
+`.init (.scalar sc)` that violates `AnnealScalarValid P sc` (e.g. `2_u8` for
+`&bool` or `0xD800_u32` for `&char`):
+1. Root `ValidityVisitor.visit` (`refTracking := some .empty`) passes
+   dereferenceability, non-null, inhabitedness, and alignment checks and queues
+   the pointee `ptKey` at `".[deref]"`.
+2. Child `ValidityVisitor.visit` on `⟨.memory ptKey.mplace, ptKey.layout⟩`
+   reads the pointee at layout `P` (`annealReadMemoryPlace`) and rejects the
+   invalid bit pattern with `.error (.undefinedBehavior "reading invalid value") m`. -/
+theorem visit_ref_recursive_invalid_scalar_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {refIdx : Nat} (hlt : refIdx < tf.locals.size)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+    (hptr : PtrRel allocMap p mptr) (hoff0 : p.offsetBytes = 0)
+    {e : AllocMapEntry} (he : e ∈ allocMap) (htag : e.tag = p.tag)
+    {allocDecl : LocalDecl}
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    {pointeeTy : Ty} (hprim_p : IsPrimScalarTy pointeeTy)
+    (hsz_eq : (translateTy pointeeTy body.layouts).layout.size =
+      (translateTy allocDecl.ty body.layouts).layout.size)
+    {refTy : Ty} {refMut : Mutability}
+    (hrefTy : refTy.kind = .ref refMut pointeeTy.kind)
+    (hval : (tf.locals[refIdx]'hlt).value =
+      .live (.immediate (.scalar (.fromPointer annealTargetDataLayout mptr))))
+    {sc : MirAst.ScalarInt}
+    (hslot : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hinv : ¬ AnnealScalarValid pointeeTy sc)
+    (fuel : Nat) :
+    let rootPlace : Miri.Interpreter.RuntimePlace AnnealProv :=
+      ⟨.local 0 refIdx none tf.localsIdentity, translateTy refTy body.layouts⟩
+    let rootSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+      { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := some .empty, dataBytes := none }
+    let ptKey : Miri.Interpreter.ValidityVisitor.Key AnnealProv :=
+      ⟨⟨mptr.withOptionalProvenance, .none, none⟩,
+        translateTy pointeeTy body.layouts⟩
+    let childPath : Miri.Memory.ValidationPath := ⟨"", #[.deref]⟩
+    let tracked : Miri.Memory.Validity.RefTracking
+        (Miri.Interpreter.ValidityVisitor.Key AnnealProv) Miri.Memory.ValidationPath :=
+      ⟨#[ptKey], #[(ptKey, childPath)]⟩
+    let childSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+      { path := childPath, flags := ⟨false, true⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    let childPlace : Miri.Interpreter.RuntimePlace AnnealProv :=
+      ⟨.memory ptKey.mplace, ptKey.layout⟩
+    Miri.Interpreter.ValidityVisitor.visit (annealValidityHooks body.layouts)
+        refTy (fuel + 1) rootSession rootPlace m =
+      .ok { rootSession with refTracking := some tracked } m ∧
+    Miri.Interpreter.ValidityVisitor.visit (annealValidityHooks body.layouts)
+        refTy (fuel + 1) childSession childPlace m =
+      .error (.undefinedBehavior "reading invalid value") m := by
+  intro rootPlace rootSession ptKey childPath tracked childSession childPlace
+  obtain ⟨tf₀, hframes₀, _, _, hfr, _, _, _, _, _, halloc, _⟩ := id hstate
+  rw [hframes] at hframes₀; injection hframes₀ with h0
+  injection h0 with htf; subst htf
+  obtain ⟨borTag, hmptr, _⟩ := PtrRel.allocId_of_entry halloc hptr he htag
+  obtain ⟨hid, _, hbase⟩ := halloc.base_addr_valid e he
+  obtain ⟨hsized, _, _⟩ := hprim_p.layout_ok (layouts := body.layouts)
+  obtain ⟨hsize, hpos, hfit, _, hpow, _⟩ := hprim_p.size_align_ok body.layouts
+  have hpos_nat : 0 < (translateTy pointeeTy body.layouts).layout.size.bytes.toNat := by
+    exact_mod_cast hpos
+  let mutBool : Bool := match refMut with | .mut => true | .not => false
+  have hcl_ref : (annealValidityHooks body.layouts).classify refTy
+      (translateTy refTy body.layouts).ty m = .ok (.reference mutBool) m := by
+    cases refMut <;> (simp only [annealValidityHooks, annealValidityClassify,
+      translateTy, encodeTyId, hrefTy, mutBool]; rfl)
+  have hptLay : annealValidityPointeeLayout body.layouts refTy =
+      some (translateTy pointeeTy body.layouts) := by
+    have hexact : derefPointeeKindHasExactLayout pointeeTy.kind = true := by
+      rcases hprim_p with h | h | ⟨_, h⟩ | ⟨_, h⟩ <;> rw [h] <;> rfl
+    unfold annealValidityPointeeLayout
+    rw [hrefTy]; dsimp only []; rw [hexact]
+    simp only [↓reduceIte, Option.some.injEq]
+    exact hprim_p.translateTy_layoutIdx body.layouts
+  have hm0 : mptr.withOptionalProvenance =
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+        some (.concrete e.allocId borTag)⟩ := by
+    rw [hmptr, hoff0]
+    simp [Miri.Memory.Pointer.withOptionalProvenance]
+  have hmis0 : annealOffsetMisalignment mptr.withOptionalProvenance.offset
+      (translateTy pointeeTy body.layouts).layout.align.abi = .ok none := by
+    rw [hm0]
+    exact annealOffsetMisalignment_stackBase_eq_none e.allocId _ hpow
+  have hrd_root := annealValidityHooks_readImmediate_local body.layouts refTy
+    hframes hlt hval (translateTy refTy body.layouts) .reference
+  let ptPlace : Miri.Interpreter.MPlaceTy AnnealProv :=
+    ⟨⟨mptr.withOptionalProvenance, .none, none⟩,
+      translateTy pointeeTy body.layouts⟩
+  have hptr_p : (annealValidityHooks body.layouts).ptrToPlace refTy
+      ⟨.scalar (.fromPointer annealTargetDataLayout mptr),
+        translateTy refTy body.layouts⟩ m = .ok ptPlace m := by
+    show (do _ : EStateM _ _ _) m = .ok ptPlace m
+    simp only [annealValidityHooks, hptLay, Miri.Interpreter.Immediate.toScalar,
+      scalar_fromPointer_toPointer_eq, hmis0, bind, EStateM.bind, pure, EStateM.pure]
+    rfl
+  have hdyn : (annealValidityHooks body.layouts).sizeAndAlign refTy ptPlace m =
+      .ok (some (ptPlace.layout.layout.size, ptPlace.layout.layout.align.abi)) m := by
+    simp only [annealValidityHooks, ptPlace, hsized, ↓reduceIte]; rfl
+  obtain ⟨hlive_e, _⟩ := halloc.local_alloc_sync tf hframes e he
+  obtain ⟨⟨lay_t, hlay_t⟩, _, hshape⟩ :=
+    hlive_e (.init (.scalar sc)) hslot (by intro h; cases h)
+  obtain ⟨la, hfind, _, _, hsh⟩ := hshape allocDecl hdecl_a
+  have hbyte_eq :
+      la.allocation.byteSize = (translateTy pointeeTy body.layouts).layout.size := by
+    rw [hsh.byteSize_eq, hsz_eq]
+  have hin : 0 + (translateTy pointeeTy body.layouts).layout.size.bytes.toNat ≤
+      la.allocation.byteSize.bytes.toNat := by
+    rw [hbyte_eq]; omega
+  have hacc_ok := (annealValidityAccessCheck_stack m.machine e.allocId borTag 0
+    (translateTy pointeeTy body.layouts).layout.size hid (by decide) hbase hsize
+    hpos_nat hfit).1 la hfind hin
+  have hm : mptr.withOptionalProvenance =
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat 0),
+        some (.concrete e.allocId borTag)⟩ := by
+    rw [hmptr, hoff0]; rfl
+  have hacc : (annealValidityHooks body.layouts).checkPointerAccess refTy
+      ptPlace.mplace.ptr ptPlace.layout.layout.size m = .ok (.ok ()) m := by
+    simp only [ptPlace]; rw [hm, annealValidityHooks_checkPointerAccess_eq, hacc_ok]
+  have hsc_m : Miri.Memory.Scalar.fromMaybePointer
+      (annealValidityHooks body.layouts).target.base ptPlace.mplace.ptr =
+      .ok (.fromPointer annealTargetDataLayout mptr) := by
+    simp only [ptPlace, hmptr, Miri.Memory.Pointer.withOptionalProvenance,
+      Miri.Memory.Scalar.fromMaybePointer, annealValidityHooks,
+      annealRuntimeDataLayout]
+    rfl
+  have hnn := annealStackBaseAddr_add_ne_zero e.allocId 0 hid (by decide)
+  have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+      (.fromPointer annealTargetDataLayout mptr) m = .ok false m := by
+    rw [hmptr, hoff0]
+    exact fromPointer_scalarMayBeNull_eq body.layouts refTy _ _ m hnn
+  have hinh := prim_opsemInhabited_true body.layouts refTy hprim_p m
+  have hal : (annealValidityHooks body.layouts).checkPointerAlignResult refTy
+      ptPlace.mplace.ptr ptPlace.layout.layout.align.abi m = .ok (.ok ()) m := by
+    simp only [ptPlace, hm0, annealValidityHooks,
+      annealOffsetMisalignment_stackBase_eq_none e.allocId _ hpow]
+    rfl
+  have hvr := visit_reference_cases (annealValidityHooks body.layouts) refTy fuel
+    rootSession rootPlace m mutBool hcl_ref rfl rfl rfl
+  have hv_root := (((hvr.2 _ ptPlace hrd_root hptr_p hsized hdyn).2 _ hacc hsc_m).2
+    hnull).2 hinh
+  have hroot_ok : Miri.Interpreter.ValidityVisitor.visit
+      (annealValidityHooks body.layouts) refTy (fuel + 1) rootSession rootPlace m =
+      .ok { rootSession with refTracking := some tracked } m := by
+    have h1 := hv_root.2 hal
+    have htr : Miri.Memory.Validity.RefTracking.empty.track ptKey
+        (fun _ => rootSession.path.push .deref) = tracked := by
+      simp [Miri.Memory.Validity.RefTracking.track,
+        Miri.Memory.Validity.RefTracking.empty,
+        Miri.Memory.ValidationPath.push, rootSession, tracked, childPath]
+    simpa [rootSession, ptPlace, ptKey, htr] using h1
+  -- Child read fails `annealValidateScalarForTyId` because `¬ AnnealScalarValid`:
+  obtain ⟨slot_t', mls_t, _, _, hslot_t', hmls_t, _, hloc_t⟩ :=
+    hfr.lookup_local hdecl_a
+  rw [hslot] at hslot_t'; injection hslot_t' with hseq; subst hseq
+  rw [hlay_t] at hmls_t
+  have hmls_eq : mls_t = ⟨.live (.indirect (stackAllocPlace e.allocId)), lay_t⟩ :=
+    Option.some.inj hmls_t.symm
+  have hloc_t_b :
+      LocalRelLM3_1 m.machine allocMap allocDecl body.layouts (.init (.scalar sc)) mls_t := by
+    rw [hmls_eq] at hloc_t ⊢
+    exact hloc_t.indirect_base
+  have hnz_sz :
+      (translateTy allocDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO := by
+    intro hz
+    rw [hsz_eq, hz] at hpos_nat
+    exact Nat.lt_irrefl 0 hpos_nat
+  obtain ⟨_, hsc_la⟩ := hloc_t_b.indirect_stackAllocPlace_spec hmls_eq hbase hfind
+    (halloc.live_key_unique e he) hnz_sz
+  obtain ⟨hsc_sz, _, _, msc, hrel, hread_ok⟩ := hsc_la sc rfl
+  have hread_ok' :
+      la.allocation.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+          (translateTy pointeeTy body.layouts).layout.size) false =
+        .ok (.fromScalarInt msc) := by
+    rw [hsz_eq]; exact hread_ok
+  have hread_mem_eq := annealReadMemoryPlace_zero_offset_eq hprim_p hid hbase
+    hfind hbyte_eq (borTag := borTag) (st := m)
+  have hval_false :
+      annealValidateScalarForTyId (translateTy pointeeTy body.layouts).ty
+        (.fromScalarInt msc) = false :=
+    annealValidateScalarForTyId_false_of_not_scalarValid body.layouts hrel
+      (hsz_eq.trans hsc_sz) hinv
+  have hrm : annealReadMemoryPlace ptKey.mplace ptKey.layout m =
+      .error (.undefinedBehavior "reading invalid value") m := by
+    simp only [ptKey, hm0]
+    rw [hread_mem_eq, hread_ok']
+    dsimp only []
+    rw [hval_false]
+    rfl
+  have hfields := prim_layout_fields_eq body.layouts hprim_p
+  have hrd_child : ∀ ev,
+      (annealValidityHooks body.layouts).readImmediate refTy childPlace ev m =
+        annealReadMemoryPlace ptKey.mplace ptKey.layout m :=
+    annealValidityHooks_readImmediate_memory body.layouts refTy hframes
+      ptKey.mplace ptKey.layout hfields
+  have hv_child := visit_primitive_cases (annealValidityHooks body.layouts) refTy
+    fuel childSession childPlace m rfl
+  obtain ⟨hcb, hcc, hci, hcu, _⟩ := annealValidityHooks_classify_prim body.layouts
+    refTy (ty := pointeeTy) m
+  refine ⟨hroot_ok, ?_⟩
+  rcases hprim_p with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
+  · exact hv_child.2.1 .boolean (Or.inl rfl) (hcb hk) _
+      ((hrd_child .boolean).trans hrm)
+  · exact hv_child.2.1 .character (Or.inr (Or.inl rfl)) (hcc hk) _
+      ((hrd_child .character).trans hrm)
+  · exact hv_child.2.1 .integer (Or.inr (Or.inr rfl)) (hci it hk) _
+      ((hrd_child .integer).trans hrm)
+  · exact hv_child.2.1 .integer (Or.inr (Or.inr rfl)) (hcu ut hk) _
+      ((hrd_child .integer).trans hrm)
+
+/-! ### Composable Reborrow-Hierarchy State Relation (`StateRelLM3_2Tree`) -/
+
+/-- Entry in a Tree Borrows reborrow hierarchy mapping an Anneal provenance tag
+`tag` (which may be either a root borrow `parentTag = none` or a reborrow child
+`parentTag = some pTag`) to its target local `localIdx`, backing `lean-miri`
+stack allocation `allocId`, and current `TreeBorrowPerm`. -/
+structure ReborrowMapEntry where
+  /-- Anneal provenance tag (`BorrowEntry.tag`). -/
+  tag : Nat
+  /-- Root stack local targeted by this borrow (`BorrowEntry.targetLocal`). -/
+  localIdx : Local
+  /-- Backing `lean-miri` stack `AllocId` for `localIdx`. -/
+  allocId : Miri.Memory.AllocId
+  /-- Current Tree Borrows access permission (`BorrowEntry.perm`). -/
+  perm : TreeBorrowPerm
+  /-- Optional parent tag in the reborrow tree (`BorrowEntry.parentTag`). -/
+  parentTag : Option Nat := none
+
+namespace ReborrowMapEntry
+
+/-- Project a `ReborrowMapEntry` to its flat `AllocMapEntry` view (dropping
+`parentTag`, which `lean-miri`'s memory-only interpreter does not consult). -/
+def toAllocMapEntry (e : ReborrowMapEntry) : AllocMapEntry :=
+  { tag := e.tag
+    localIdx := e.localIdx
+    allocId := e.allocId
+    perm := e.perm }
+
+/-- Embed a root `AllocMapEntry` into `ReborrowMapEntry` (`parentTag := none`). -/
+def ofRoot (e : AllocMapEntry) : ReborrowMapEntry :=
+  { tag := e.tag
+    localIdx := e.localIdx
+    allocId := e.allocId
+    perm := e.perm
+    parentTag := none }
+
+/-- Project a `ReborrowMapEntry` to the exact `MirSemantics.BorrowEntry` stored
+in `s.memory.borrows` (retaining `parentTag`). -/
+def toBorrowEntry (e : ReborrowMapEntry) : BorrowEntry :=
+  { tag := e.tag
+    targetLocal := e.localIdx
+    targetProjection := .nil
+    perm := e.perm
+    parentTag := e.parentTag }
+
+@[simp]
+theorem toAllocMapEntry_ofRoot (e : AllocMapEntry) :
+    (ofRoot e).toAllocMapEntry = e := rfl
+
+@[simp]
+theorem toBorrowEntry_ofRoot (e : AllocMapEntry) :
+    (ofRoot e).toBorrowEntry = e.toBorrowEntry := rfl
+
+theorem map_toAllocMapEntry_ofRoot (allocMap : List AllocMapEntry) :
+    (allocMap.map ofRoot).map toAllocMapEntry = allocMap := by
+  induction allocMap with
+  | nil => rfl
+  | cons _ _ ih => simp only [List.map_cons, toAllocMapEntry_ofRoot, ih]
+
+theorem map_toBorrowEntry_ofRoot (allocMap : List AllocMapEntry) :
+    (allocMap.map ofRoot).map toBorrowEntry =
+      allocMap.map AllocMapEntry.toBorrowEntry := by
+  induction allocMap with
+  | nil => rfl
+  | cons _ _ ih => simp only [List.map_cons, toBorrowEntry_ofRoot, ih]
+
+theorem map_toBorrowEntry_of_noParents :
+    ∀ {treeMap : List ReborrowMapEntry},
+      (∀ e ∈ treeMap, e.parentTag = none) →
+      (treeMap.map toAllocMapEntry).map AllocMapEntry.toBorrowEntry =
+        treeMap.map toBorrowEntry
+  | [], _ => rfl
+  | e :: es, hnop => by
+    have he0 : e.parentTag = none := hnop e (List.mem_cons_self ..)
+    have hes : ∀ x ∈ es, x.parentTag = none :=
+      fun x hx => hnop x (List.mem_cons_of_mem _ hx)
+    simp only [List.map_cons, toAllocMapEntry, AllocMapEntry.toBorrowEntry,
+      toBorrowEntry, he0, map_toBorrowEntry_of_noParents hes]
+
+end ReborrowMapEntry
+
+/-- Replace `s.memory.borrows` with the `parentTag = none` view of `treeMap`
+while keeping `s.frame`, `s.memory.nextTag`, and all other machine fields
+identical. -/
+def eraseBorrowParents (s : MachineState)
+    (treeMap : List ReborrowMapEntry) : MachineState :=
+  { s with
+    memory :=
+      { s.memory with
+        borrows :=
+          (treeMap.map ReborrowMapEntry.toAllocMapEntry).map
+            AllocMapEntry.toBorrowEntry } }
+
+/-- Composable post-reborrow simulation relation (`LM-3.2`) extending
+`StateRelLM3_2` to arbitrary parent/child Tree Borrows hierarchies `treeMap`
+(`BorrowEntry.parentTag = some pTag` created by `Rvalue.ref` reborrows `&*_r`
+and `&mut *_r`).
+
+Every local, frame, and `lean-miri` stack allocation invariant of
+`StateRelLM3_2` holds on `eraseBorrowParents s treeMap` against
+`treeMap.map ReborrowMapEntry.toAllocMapEntry`, while `s.memory.borrows`
+retains the exact `parentTag` tree (`treeMap.map ReborrowMapEntry.toBorrowEntry`)
+so child writes (`*_r_child = v`) and parent reads (`copy *_r_parent`) execute
+Anneal's `isBorrowDescendantOrSelf` local/foreign transitions and preserve
+`StateRelLM3_2Tree` across multi-step traces. -/
+structure StateRelLM3_2Tree
+    (body : CapturedMir) (s : MachineState) (m : AnnealStepState)
+    (treeMap : List ReborrowMapEntry) : Prop where
+  /-- Flat local/frame/allocation relation on the parent-erased view. -/
+  erased_rel :
+    StateRelLM3_2 body (eraseBorrowParents s treeMap) m
+      (treeMap.map ReborrowMapEntry.toAllocMapEntry)
+  /-- Exact `parentTag`-preserving borrow list in `s.memory.borrows`. -/
+  borrows_eq :
+    s.memory.borrows = treeMap.map ReborrowMapEntry.toBorrowEntry
+
+/-- One-step outcome correspondence under `StateRelLM3_2Tree`, allowing a step
+(such as reborrow, deref write, or deref read) to evolve `treeMap` to
+`treeMap'`. -/
+inductive StepRelLM3_2Tree (body : CapturedMir) (m : AnnealStepState) :
+    List ReborrowMapEntry →
+    MirStepNode → Miri.Interpreter.StepResult AnnealStepState Bool → Prop where
+  /-- Normal intra-frame step to `StateRelLM3_2Tree`-related states under
+  `treeMap'`. -/
+  | step (s' : MachineState) (m' : AnnealStepState)
+      (treeMap' : List ReborrowMapEntry) :
+      StateRelLM3_2Tree body s' m' treeMap' →
+      StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)
+  /-- Normal root-frame return with `ImmediateRelLM3_2`-related return values. -/
+  | retRoot (treeMap : List ReborrowMapEntry)
+      (decl0 : LocalDecl) (retVal : Value)
+      (imm0 : Miri.Interpreter.Immediate AnnealProv)
+      (mem' : Memory) (m' : AnnealStepState) :
+      get? body.localDecls 0 = some decl0 →
+      annealControlHooks.returnOperand () m = (m, .ok (.immediate imm0)) →
+      ImmediateRelLM3_2 (treeMap.map ReborrowMapEntry.toAllocMapEntry)
+        decl0.ty body.layouts retVal imm0 →
+      m' = { m with stack := ⟨#[]⟩ } →
+      StepRelLM3_2Tree body m treeMap
+        (MirStepNode.retNormal retVal mem') (m', .ok true)
+  /-- Both machines report undefined behavior. -/
+  | ub (treeMap : List ReborrowMapEntry)
+      (m' : AnnealStepState) (msg : String) :
+      StepRelLM3_2Tree body m treeMap (MirStepNode.fail .ub)
+        (m', .error (.undefinedBehavior msg))
+
+/-- Embed any root-borrow `StateRelLM3_2` state into `StateRelLM3_2Tree` with
+`allocMap.map ReborrowMapEntry.ofRoot`. -/
+theorem StateRelLM3_2.toTree
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap) :
+    StateRelLM3_2Tree body s m (allocMap.map ReborrowMapEntry.ofRoot) := by
+  have hmap_alloc := ReborrowMapEntry.map_toAllocMapEntry_ofRoot allocMap
+  have hmap_bor := ReborrowMapEntry.map_toBorrowEntry_ofRoot allocMap
+  obtain ⟨_, _, _, _, _, _, _, _, _, hbor, _, _⟩ := id hstate
+  have herase : eraseBorrowParents s (allocMap.map ReborrowMapEntry.ofRoot) = s := by
+    unfold eraseBorrowParents
+    rw [hmap_alloc, ← hbor]
+  refine ⟨?_, ?_⟩
+  · rw [herase, hmap_alloc]; exact hstate
+  · rw [hmap_bor]; exact hbor
+
+/-- Any `StateRelLM3_2Tree` in which every entry has `parentTag = none`
+collapses directly back to `StateRelLM3_2`. -/
+theorem StateRelLM3_2Tree.toFlatOfNoParents
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hnop : ∀ e ∈ treeMap, e.parentTag = none) :
+    StateRelLM3_2 body s m (treeMap.map ReborrowMapEntry.toAllocMapEntry) := by
+  have hbor_eq := ReborrowMapEntry.map_toBorrowEntry_of_noParents hnop
+  have herase : eraseBorrowParents s treeMap = s := by
+    unfold eraseBorrowParents
+    rw [hbor_eq, ← htree.borrows_eq]
+  simpa [herase] using htree.erased_rel
+
+def lookupTreeMapByTag (treeMap : List ReborrowMapEntry) (tag : Nat) : Option ReborrowMapEntry :=
+  treeMap.find? (fun e => e.tag == tag)
+
+def reborrowTreeMapNext (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (ptrIdx : Local) (newTag : Nat) (allocId : Miri.Memory.AllocId) : List ReborrowMapEntry :=
+  match Trusted.Sequence.get? locals ptrIdx with
+  | some (.init (.ptr ptrVal 8)) =>
+    match lookupTreeMapByTag treeMap ptrVal.tag with
+    | some e =>
+        let newEntry : ReborrowMapEntry := {
+          allocId := allocId,
+          tag := newTag,
+          localIdx := e.localIdx,
+          perm := .active,
+          parentTag := some ptrVal.tag
+        }
+        treeMap ++ [newEntry]
+    | none => treeMap
+  | _ => treeMap
+
+def derefReadNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (ptrIdx : Local) : List ReborrowMapEntry :=
+  match Trusted.Sequence.get? locals ptrIdx with
+  | some (.init (.ptr ptrVal 8)) =>
+    match lookupTreeMapByTag treeMap ptrVal.tag with
+    | some e => treeMap.map (fun x =>
+        if x.localIdx == e.localIdx && x.tag != ptrVal.tag then
+          { x with perm := match x.perm with | .active => .frozen | p => p }
+        else x)
+    | none => treeMap
+  | _ => treeMap
+
+def derefWriteNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (ptrIdx : Local) : List ReborrowMapEntry :=
+  match Trusted.Sequence.get? locals ptrIdx with
+  | some (.init (.ptr ptrVal 8)) =>
+    match lookupTreeMapByTag treeMap ptrVal.tag with
+    | some e => treeMap.map (fun x =>
+        if x.localIdx == e.localIdx then
+          if x.tag == ptrVal.tag then
+            { x with perm := .active }
+          else
+            { x with perm := .disabled }
+        else x)
+    | none => treeMap
+  | _ => treeMap
 
 end LeanMiriSpec.Correspondence

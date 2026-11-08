@@ -549,6 +549,14 @@ open LeanMiriSpec.Correspondence in
   step_terminator_lm3_1_state_simulation
   step_mir_lm3_1_state_simulation
   Witness.wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps
+  step_safeRef_deref_read_invalid_scalar_divergence
+  evalRvalue_reborrow_safeRef_tree_simulation
+  step_safeRef_deref_read_tree_simulation
+  step_safeRef_deref_write_tree_simulation
+  step_terminator_goto_return_tree_simulation
+  Witness.wit_lm3_2_ref_never_and_enum_discriminant_validity
+  Witness.wit_lm3_2_invalid_bool_deref_read_divergence_real_steps
+  Witness.wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
