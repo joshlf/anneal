@@ -26,6 +26,7 @@ import LeanMiriSpec.Correspondence.LayoutLM2_2
 import LeanMiriSpec.Correspondence.ProjLM2_2
 import LeanMiriSpec.Correspondence.SimLM2_2
 import LeanMiriSpec.Correspondence.WitLM2_2
+import LeanMiriSpec.Correspondence.EnumLM2_3
 import LeanMiriSpec.Correspondence.SimLM2_3
 import LeanMiriSpec.Correspondence.WitLM2_3
 import LeanMiriSpec.Correspondence.UnionLM2_4
@@ -120,6 +121,24 @@ import LeanMiriSpec.Audit
   tuple/struct-returning root functions (`fn() -> PaddedOuter`), root `return`
   with live padded memory, and `> 64`-byte multi-block `InitMask` `#[repr(C)]`
   structs (`80` bytes across two 64-bit `InitMask` words).
+* `LeanMiriSpec.Correspondence.EnumLM2_3`: `LM-2.3` multi-variant direct-tagged
+  enum overlay (`annealStepHooksLM2_3`, proved conservatively extending
+  `annealStepHooks` via `step_LM2_3_eq_of_bodyFree`), `ValidEnumLayout`
+  (`Variants.Multiple` + `TagEncoding.Direct`), `EnumMemRel`, `UninitEnumMemRel`,
+  `EnumLocalByteUninit`, `StateRelLM2_3`, `StepRelLM2_3`, and entry bridges
+  (`StateRel.toLM2_3_empty`, `StateRel.toLM2_3`).
+* `LeanMiriSpec.Correspondence.SimLM2_3`: `LM-2.3` lockstep simulation for
+  multi-variant enum `Rvalue.Aggregate` (`evalRvalue_aggregate_enum_simulation`),
+  `StatementKind.SetDiscriminant` (`step_setDiscriminant_simulation`),
+  `Rvalue.Discriminant` (`evalRvalue_discriminant_simulation`), `Downcast` +
+  `Field` payload reads including inactive-variant uninitialized-byte UB
+  (`evalProjection_downcast_field_simulation`), `Terminator.SwitchInt` match
+  dispatch (`enum_match_switchInt_simulation`), and `Goto`/`Return` helpers.
+* `LeanMiriSpec.Correspondence.WitLM2_3`: kernel-checked `LM-2.3` multi-variant
+  execution witnesses covering an 8-step end-to-end `Lm23Enum` pipeline,
+  inactive-variant `Downcast` + `Field` UB before and after `SetDiscriminant`,
+  `SwitchInt` `otherwise` fallback + `Goto`, `.uninit`/`.dead` UB traps, and
+  `BodyFreeOfLM2_3`.
 * `LeanMiriSpec.Correspondence.UnionLM2_4`: the `LM-2.4` union and `Subslice`
   hooks (`annealStepHooksLM2_4`, a conservative extension of `annealStepHooks`),
   the union initialization masks of `I-11` (`unionPrefixMask`, certified against
