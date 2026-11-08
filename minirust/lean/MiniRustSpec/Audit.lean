@@ -4444,8 +4444,16 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   translateStmtOrIntrinsic_assume
   termPreservesAddrTaken_call_spec
   progStatementOk_of_statementOk
+  translateStmtResultWithIntrinsics_eq_of_not_provCast
+  translateStmtResult_not_provCast
+  translateFnInProgWithIntrinsics_eq_of_no_provCast
+  callArgsOkWithIntrinsics_of_callArgsOk
+  callTerminatorOkWithIntrinsics_of_callTerminatorOk
+  terminatorInProgOkWithIntrinsics_of_terminatorInProgOk
+  LocalsOkA.store_decl
   FrameOkWithIntrinsics.toFrameOk
   FrameOkWithIntrinsics.assume_step
+  ProvenanceRel.assume_step_from_frameOk
   assumeReborrowExposeRoundTrip_inFragmentWithIntrinsics
   assumeReborrowExposeRoundTrip_singleExposeSiteOk
   assumeReborrowExposeRoundTrip_anneal_ret
@@ -4457,9 +4465,22 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   assumeReborrowFalseUb_minirust_direct
   assumeReborrowFalseUb_tb_direct
   assumeReborrowFalseUb_three_way
+  callRefMutProtected_inFragmentWithIntrinsics
+  callerRefMutProtectedBadCallDst_notInFragmentWithIntrinsics
+  callRefMutProtected_translateProgWithIntrinsics
+  callRefMutProtected_anneal_ret
   callRefMutProtectedRoundTrip_mach_and_tb
+  callRefMutProtectedRoundTrip_three_way
+  callProtectorConflict_inFragmentWithIntrinsics
+  callProtectorConflict_translateProgWithIntrinsics
+  callProtectorConflict_anneal_ub
   callRefMutProtectorViolation_mach_vs_tb
+  callRefMutProtectorViolation_three_way
+  callCrossFrameExpose_inFragmentWithIntrinsics
+  callCrossFrameExpose_translateProgWithIntrinsics
+  callCrossFrameExpose_anneal_ret
   callCrossFrameExposeWithExposed_mach_and_tb
+  callCrossFrameExposeWithExposed_three_way
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -4747,8 +4768,16 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   translateStmtOrIntrinsic_assume
   termPreservesAddrTaken_call_spec
   progStatementOk_of_statementOk
+  translateStmtResultWithIntrinsics_eq_of_not_provCast
+  translateStmtResult_not_provCast
+  translateFnInProgWithIntrinsics_eq_of_no_provCast
+  callArgsOkWithIntrinsics_of_callArgsOk
+  callTerminatorOkWithIntrinsics_of_callTerminatorOk
+  terminatorInProgOkWithIntrinsics_of_terminatorInProgOk
+  LocalsOkA.store_decl
   FrameOkWithIntrinsics.toFrameOk
   FrameOkWithIntrinsics.assume_step
+  ProvenanceRel.assume_step_from_frameOk
   assumeReborrowExposeRoundTrip_inFragmentWithIntrinsics
   assumeReborrowExposeRoundTrip_singleExposeSiteOk
   assumeReborrowExposeRoundTrip_anneal_ret
@@ -4760,9 +4789,22 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   assumeReborrowFalseUb_minirust_direct
   assumeReborrowFalseUb_tb_direct
   assumeReborrowFalseUb_three_way
+  callRefMutProtected_inFragmentWithIntrinsics
+  callerRefMutProtectedBadCallDst_notInFragmentWithIntrinsics
+  callRefMutProtected_translateProgWithIntrinsics
+  callRefMutProtected_anneal_ret
   callRefMutProtectedRoundTrip_mach_and_tb
+  callRefMutProtectedRoundTrip_three_way
+  callProtectorConflict_inFragmentWithIntrinsics
+  callProtectorConflict_translateProgWithIntrinsics
+  callProtectorConflict_anneal_ub
   callRefMutProtectorViolation_mach_vs_tb
+  callRefMutProtectorViolation_three_way
+  callCrossFrameExpose_inFragmentWithIntrinsics
+  callCrossFrameExpose_translateProgWithIntrinsics
+  callCrossFrameExpose_anneal_ret
   callCrossFrameExposeWithExposed_mach_and_tb
+  callCrossFrameExposeWithExposed_three_way
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"

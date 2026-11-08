@@ -1974,22 +1974,6 @@ inductive StmtTranslation : Type where
   | stmt (s : Gen.Statement)
   | intrinsic (op : Gen.IntrinsicOp) (dst : Gen.PlaceExpr) (args : List Gen.ValueExpr)
 
-/-- MiniRust's unit type `()`, used by `build::unit_place()` and `mk_start_fn`. -/
-def unitTy : Gen.Type :=
-  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
-
-/-- `build::unit_place()`, a dangling aligned raw-pointer dereference of unit
-type (`tooling/miniutil/src/build/expr.rs`, lines 55-65 at the pinned commit:
-<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L55-L65>). -/
-def buildUnitPlace : Gen.PlaceExpr :=
-  .Deref (.Constant (.PointerWithoutProvenance 1) (.Ptr (.Raw .None))) unitTy
-
-/-- `build::abort()`, `Terminator::Intrinsic { intrinsic: IntrinsicOp::Abort, .. }`
-(`tooling/miniutil/src/build/bb.rs`, lines 28-35 at the pinned commit:
-<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/bb.rs#L28-L35>). -/
-def buildAbort : Gen.Terminator :=
-  .Intrinsic .Abort [] buildUnitPlace none
-
 /-- `build::raw_void_ptr_ty()`, the thin raw pointer type with no metadata
 (`Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })`). -/
 def rawVoidPtrTy : Gen.Type := .Ptr (.Raw .None)
@@ -2020,6 +2004,16 @@ def unitPlace : Gen.PlaceExpr :=
 >  }" -/
 def abortTerminator : Gen.Terminator :=
   .Intrinsic .Abort [] unitPlace none
+
+/-- MiniRust's unit type `()`, alias for `Interp.unitType` used by `mkStartFn`. -/
+abbrev unitTy : Gen.Type := Interp.unitType
+
+/-- `build::unit_place()`, alias for `unitPlace` used by `mkStartFn`. -/
+abbrev buildUnitPlace : Gen.PlaceExpr := unitPlace
+
+/-- `build::abort()`, alias for `abortTerminator` used by `mkStartFn` and
+`translateUnwindAction`. -/
+abbrev buildAbort : Gen.Terminator := abortTerminator
 
 /-- Whether a MIR statement is
 `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))`, which
@@ -5049,6 +5043,353 @@ def progInFragment (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedM
    | some bound => decide (bound < 2 ^ 31)
    | none => false) &&
   (translateProg entry callees).isSome
+
+/-! ### Unified multi-function program translation and fragment check with intrinsics (MR-4.3 Pass B3) -/
+
+/-- Convert `StmtTranslation` (`translateStmtOrIntrinsic`) to `StatementResult`
+(`splitStmts`). -/
+def StmtTranslation.toStatementResult : StmtTranslation → StatementResult
+  | .stmt s => .statement s
+  | .intrinsic op dst args => .intrinsic op dst args
+
+/-- Statement translation for multi-function programs with intrinsics
+(`Assume`, `PointerExposeProvenance`, `PointerWithExposedProvenance`). -/
+def translateStmtResultWithIntrinsics (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Option StatementResult :=
+  (translateStmtOrIntrinsic decls s layouts).map StmtTranslation.toStatementResult
+
+theorem translateStmtResultWithIntrinsics_eq_of_not_provCast (decls : List MirAst.LocalDecl)
+    (s : MirAst.Statement) (layouts : Layout.LayoutTable)
+    (hnp : isProvCastStmt s = false) :
+    translateStmtResultWithIntrinsics decls s layouts =
+      translateStmtResult decls s layouts := by
+  by_cases ha : isAssume s = true
+  · obtain ⟨kind, span⟩ := s
+    cases kind with
+    | intrinsic intr =>
+      cases intr with
+      | assume op =>
+        simp only [translateStmtResultWithIntrinsics, translateStmtResult, translateStmtOrIntrinsic]
+        cases translateOperand decls op <;> rfl
+      | _ => simp [isAssume] at ha
+    | _ => simp [isAssume] at ha
+  · have hna : isAssume s = false := Bool.eq_false_iff.mpr ha
+    have htr := translateStmtOrIntrinsic_of_not_provCast decls s layouts hnp hna
+    obtain ⟨kind, span⟩ := s
+    cases kind with
+    | intrinsic intr =>
+      cases intr with
+      | assume _ => simp [isAssume] at hna
+      | _ =>
+        simp only [translateStmtResultWithIntrinsics, translateStmtResult, htr, Option.map_map]
+        rfl
+    | _ =>
+      simp only [translateStmtResultWithIntrinsics, translateStmtResult, htr, Option.map_map]
+      rfl
+
+theorem translateStmtResult_not_provCast {decls : List MirAst.LocalDecl}
+    {s : MirAst.Statement} {layouts : Layout.LayoutTable} {res : StatementResult}
+    (h : translateStmtResult decls s layouts = some res) :
+    isProvCastStmt s = false := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    simp only [translateStmtResult, Option.map_eq_some_iff] at h
+    obtain ⟨st, hst, _⟩ := h
+    exact translateStatement_not_provCast hst
+  | _ => simp [isProvCastStmt]
+
+/-- Multi-function basic-block translation extended with block-splitting
+lowering of `Assume`, `PointerExposeProvenance`, and
+`PointerWithExposedProvenance` alongside `Call` terminators. -/
+def translateBlocksInProgWithIntrinsics (fnMap : FnMap) (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) :
+    Nat → Nat → List MirAst.BasicBlockData →
+      Option (List (Gen.BbName × Gen.BasicBlock) × List (Gen.BbName × Gen.BasicBlock))
+  | _, _, [] => some ([], [])
+  | i, nextCleanup, bb :: bbs => do
+    let results ← bb.statements.mapM (translateStmtResultWithIntrinsics decls · layouts)
+    let sp := splitStmts (bbName i) [] nextCleanup results
+    let (term, nextCleanup', extra1) ←
+      translateTerminatorInProg fnMap layouts decls sp.2.2.2 bb.terminator
+    let (rest, extraRest) ←
+      translateBlocksInProgWithIntrinsics fnMap layouts decls (i + 1) nextCleanup' bbs
+    pure (sp.2.2.1 ++ [(sp.1, ⟨sp.2.1, term, .Regular⟩)] ++ rest, extra1 ++ extraRest)
+
+/-- `FnCtxt::translate` for a function in a multi-function program with
+`Assume`, `PointerExposeProvenance`, and `PointerWithExposedProvenance`
+intrinsics (`translateBlocksInProgWithIntrinsics`). -/
+def translateFnInProgWithIntrinsics (fnMap : FnMap)
+    (body : MirAst.CapturedMir) : Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
+  let locals ← translateLocals body.layouts 0 body.localDecls
+  let n := body.basicBlocks.length
+  let (blocks, extra) ←
+    translateBlocksInProgWithIntrinsics fnMap body.layouts body.localDecls 0 (n + 1) body.basicBlocks
+  pure {
+    locals := ⟨locals⟩
+    args := (List.range body.argCount).map (fun k => localName (k + 1))
+    ret := localName 0
+    calling_convention := conv
+    blocks := ⟨blocks ++ [(bbName n, initBlock body)] ++ extra⟩
+    start := bbName n
+    implicit_writes := true
+  }
+
+/-- Translate `(entry :: callees)` in index order using
+`translateFnInProgWithIntrinsics`. -/
+def translateProgFnsWithIntrinsics (fnMap : FnMap) :
+    Nat → List MirAst.CapturedMir → Option (List (Gen.FnName × Gen.Function))
+  | _, [] => some []
+  | idx, b :: bs => do
+    let f ← translateFnInProgWithIntrinsics fnMap b
+    let rest ← translateProgFnsWithIntrinsics fnMap (idx + 1) bs
+    pure ((fnName idx, f) :: rest)
+
+/-- Multi-function program translation (`entry :: callees` + `mkStartFn 0`)
+supporting `Call` terminators together with block-splitting `Assume`,
+`PointerExposeProvenance`, and `PointerWithExposedProvenance` statements. -/
+def translateProgWithIntrinsics (entry : MirAst.CapturedMir)
+    (callees : List MirAst.CapturedMir) : Option Gen.Program := do
+  let fnMap := fnNameMap entry callees
+  let fns ← translateProgFnsWithIntrinsics fnMap 0 (entry :: callees)
+  let startFn := fnName (1 + callees.length)
+  pure {
+    functions := ⟨fns ++ [(startFn, mkStartFn 0)]⟩
+    start := startFn
+    globals := ⟨[]⟩
+    vtables := ⟨[]⟩
+    traits := ⟨[]⟩
+  }
+
+theorem mapM_translateStmtResultWithIntrinsics_eq_of_no_provCast
+    (decls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) :
+    ∀ (ss : List MirAst.Statement),
+      (∀ s ∈ ss, isProvCastStmt s = false) →
+      ss.mapM (translateStmtResultWithIntrinsics decls · layouts) =
+        ss.mapM (translateStmtResult decls · layouts)
+  | [], _ => rfl
+  | s :: ss, hnp => by
+    have hs := translateStmtResultWithIntrinsics_eq_of_not_provCast decls s layouts
+      (hnp s (List.mem_cons_self ..))
+    have hss := mapM_translateStmtResultWithIntrinsics_eq_of_no_provCast decls layouts ss
+      (fun s' hs' => hnp s' (List.mem_cons_of_mem s hs'))
+    simp [List.mapM_cons, hs, hss]
+
+theorem translateBlocksInProgWithIntrinsics_eq_of_no_provCast
+    (fnMap : FnMap) (layouts : Layout.LayoutTable) (decls : List MirAst.LocalDecl) :
+    ∀ (i nextCleanup : Nat) (bbs : List MirAst.BasicBlockData),
+      (∀ bb ∈ bbs, ∀ s ∈ bb.statements, isProvCastStmt s = false) →
+      translateBlocksInProgWithIntrinsics fnMap layouts decls i nextCleanup bbs =
+        translateBlocksInProg fnMap layouts decls i nextCleanup bbs
+  | _, _, [], _ => rfl
+  | i, nextCleanup, bb :: bbs, hnp => by
+    have hbb := mapM_translateStmtResultWithIntrinsics_eq_of_no_provCast decls layouts
+      bb.statements (hnp bb (List.mem_cons_self ..))
+    simp only [translateBlocksInProgWithIntrinsics, translateBlocksInProg, hbb]
+    cases bb.statements.mapM (translateStmtResult decls · layouts) with
+    | none => rfl
+    | some results =>
+      simp only [Option.bind_eq_bind, Option.bind_some]
+      cases translateTerminatorInProg fnMap layouts decls
+          (splitStmts (bbName i) [] nextCleanup results).2.2.2 bb.terminator with
+      | none => rfl
+      | some tre =>
+        obtain ⟨term, nextCleanup', extra1⟩ := tre
+        have hrest := translateBlocksInProgWithIntrinsics_eq_of_no_provCast
+          fnMap layouts decls (i + 1) nextCleanup' bbs
+          (fun bb' hbb' => hnp bb' (List.mem_cons_of_mem bb hbb'))
+        simp [hrest]
+
+theorem translateFnInProgWithIntrinsics_eq_of_no_provCast
+    (fnMap : FnMap) (body : MirAst.CapturedMir)
+    (hnp : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements, isProvCastStmt s = false) :
+    translateFnInProgWithIntrinsics fnMap body = translateFnInProg fnMap body := by
+  simp only [translateFnInProgWithIntrinsics, translateFnInProg,
+    translateBlocksInProgWithIntrinsics_eq_of_no_provCast fnMap body.layouts
+      body.localDecls 0 (body.basicBlocks.length + 1) body.basicBlocks hnp]
+
+/-- Whether a call argument `op` is well-typed in a multi-function program with
+pointer/reference parameters (`ptrPointeeOf paramDecl.ty`). -/
+def callArgOkWithIntrinsics (layouts : Layout.LayoutTable) (decls : List MirAst.LocalDecl)
+    (paramDecl : MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+  callArgOk layouts decls paramDecl op ||
+  match op with
+  | .copy ⟨p, []⟩ | .move ⟨p, []⟩ =>
+    decide (p < decls.length) &&
+    match decls[p]?, ptrPointeeOf paramDecl.ty with
+    | some dp, some (mutbl, pointeeIt) =>
+      if isRefTy paramDecl.ty then
+        decide (refPointeeOf dp.ty = some (mutbl, pointeeIt))
+      else
+        decide (rawPtrPointeeOf dp.ty = some (mutbl, pointeeIt))
+    | _, _ => false
+  | _ => false
+
+def callArgsOkWithIntrinsics (layouts : Layout.LayoutTable) (decls : List MirAst.LocalDecl) :
+    List MirAst.LocalDecl → List MirAst.Operand → Bool
+  | [], [] => true
+  | pd :: pds, op :: ops =>
+    callArgOkWithIntrinsics layouts decls pd op && callArgsOkWithIntrinsics layouts decls pds ops
+  | _, _ => false
+
+theorem callArgsOkWithIntrinsics_of_callArgsOk {layouts : Layout.LayoutTable}
+    {decls : List MirAst.LocalDecl} :
+    ∀ (pds : List MirAst.LocalDecl) (ops : List MirAst.Operand),
+      callArgsOk layouts decls pds ops = true →
+      callArgsOkWithIntrinsics layouts decls pds ops = true
+  | [], [], _ => rfl
+  | pd :: pds, op :: ops, h => by
+    simp only [callArgsOk, Bool.and_eq_true] at h
+    simp [callArgsOkWithIntrinsics, callArgOkWithIntrinsics, h.1,
+      callArgsOkWithIntrinsics_of_callArgsOk pds ops h.2]
+
+/-- Whether two MIR types translate to the same MiniRust type in the
+pointer/reference-extended multi-function fragment. -/
+def sameFragmentTyWithIntrinsics (t1 t2 : MirAst.Ty) : Bool :=
+  sameFragmentTy t1 t2 ||
+  (match ptrPointeeOf t1, ptrPointeeOf t2 with
+   | some (m1, it1), some (m2, it2) =>
+     decide (m1 = m2) && decide (it1 = it2) && decide (isRefTy t1 = isRefTy t2)
+   | _, _ => false)
+
+def callDestOkWithIntrinsics (decls : List MirAst.LocalDecl) (lv ti : List Nat)
+    (calleeRetDecl : MirAst.LocalDecl) (destination : MirAst.Place) : Bool :=
+  callDestOk decls lv ti calleeRetDecl destination ||
+  match destination with
+  | ⟨dst, []⟩ =>
+    decide (dst < decls.length) && lv.contains dst &&
+    match decls[dst]? with
+    | some d => sameFragmentTyWithIntrinsics d.ty calleeRetDecl.ty
+    | none => false
+  | _ => false
+
+def callTerminatorOkWithIntrinsics (callees : List MirAst.CapturedMir)
+    (body : MirAst.CapturedMir) (blk : Nat) (t : MirAst.Terminator) : Bool :=
+  match t.kind, body.basicBlocks[blk]? with
+  | .call func argOps destination (some targetBb) unwind, some bb =>
+    match extractFnDefPath func with
+    | none => false
+    | some defPath =>
+      match translateIntrinsicOrNone body.localDecls defPath argOps destination (some targetBb) with
+      | some _ => false
+      | none =>
+        match MirSemantics.findCallee? callees defPath with
+        | none => false
+        | some callee =>
+          match callee.localDecls with
+          | [] => false
+          | retDecl :: restDecls =>
+            let lv := mustLiveBefore body blk bb.statements.length
+            let ti := tupleInitBefore body blk bb.statements.length
+            decide (targetBb < body.basicBlocks.length) &&
+            callUnwindOk unwind &&
+            (translateCallConv callee.fnAbi.conv).isSome &&
+            decide (argOps.length = callee.argCount) &&
+            decide (callee.argCount ≤ restDecls.length) &&
+            callArgsOkWithIntrinsics body.layouts body.localDecls
+              (restDecls.take callee.argCount) argOps &&
+            callDestOkWithIntrinsics body.localDecls lv ti retDecl destination &&
+            argOps.all (fun op => opRead op != some destination.local_)
+  | _, _ => false
+
+def terminatorInProgOkWithIntrinsics (callees : List MirAst.CapturedMir)
+    (body : MirAst.CapturedMir) (blk : Nat) (t : MirAst.Terminator) : Bool :=
+  terminatorOk body.layouts body.localDecls body.basicBlocks.length t ||
+  callTerminatorOkWithIntrinsics callees body blk t
+
+theorem callTerminatorOkWithIntrinsics_of_callTerminatorOk
+    {callees : List MirAst.CapturedMir} {body : MirAst.CapturedMir}
+    {blk : Nat} {t : MirAst.Terminator}
+    (h : callTerminatorOk callees body blk t = true) :
+    callTerminatorOkWithIntrinsics callees body blk t = true := by
+  unfold callTerminatorOk at h
+  unfold callTerminatorOkWithIntrinsics
+  split at h
+  · next func argOps destination targetBb unwind bb hkind hbb =>
+    cases hex : extractFnDefPath func with
+    | none => simp [hex] at h
+    | some defPath =>
+      simp only [hex] at h ⊢
+      cases hint : translateIntrinsicOrNone body.localDecls defPath argOps destination (some targetBb) with
+      | some _ => simp [hint] at h
+      | none =>
+        simp only [hint] at h ⊢
+        cases hcal : MirSemantics.findCallee? callees defPath with
+        | none => simp [hcal] at h
+        | some callee =>
+          simp only [hcal] at h ⊢
+          cases hdecls : callee.localDecls with
+          | nil => simp [hdecls] at h
+          | cons retDecl restDecls =>
+            simp only [hdecls, Bool.and_eq_true] at h ⊢
+            rcases h with ⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩
+            refine ⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩,
+              callArgsOkWithIntrinsics_of_callArgsOk _ _ h6⟩, ?_⟩, h8⟩
+            simp [callDestOkWithIntrinsics, h7]
+  · simp at h
+
+theorem terminatorInProgOkWithIntrinsics_of_terminatorInProgOk
+    {callees : List MirAst.CapturedMir} {body : MirAst.CapturedMir}
+    {blk : Nat} {t : MirAst.Terminator}
+    (h : terminatorInProgOk callees body blk t = true) :
+    terminatorInProgOkWithIntrinsics callees body blk t = true := by
+  simp only [terminatorInProgOk, Bool.or_eq_true] at h
+  rcases h with h1 | h2
+  · simp [terminatorInProgOkWithIntrinsics, h1]
+  · simp [terminatorInProgOkWithIntrinsics,
+      callTerminatorOkWithIntrinsics_of_callTerminatorOk h2]
+
+/-- Per-statement well-formedness in a multi-function program with
+pointer/reference parameters, `Assume`, and provenance-cast intrinsics:
+admits `statementOkWithIntrinsics` plus `Retag([fn entry], _i)` on parameter
+pointer/reference locals (`1 ≤ i ≤ argCount`). -/
+def progStmtOkWithIntrinsics (argCount : Nat) (decls : List MirAst.LocalDecl)
+    (s : MirAst.Statement) (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
+  statementOkWithIntrinsics decls s layouts ||
+  match s.kind with
+  | .retag .fnEntry ⟨i, []⟩ =>
+    decide (1 ≤ i ∧ i ≤ argCount) && decide (i < decls.length) && isDeclPtrLocal decls i
+  | _ => false
+
+/-- Per-function fragment check within a multi-function program with
+pointer/reference parameters, `Assume`, `PointerExposeProvenance`, and
+`PointerWithExposedProvenance` intrinsics, enforcing address-taken target
+preservation (`stmtPreservesAddrTaken` and `termPreservesAddrTaken`) across
+statements and `Call` terminators. -/
+def bodyInProgFragmentWithIntrinsics (fnMap : FnMap)
+    (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir) : Bool :=
+  let addrLocals := bodyAddrTakenLocals body
+  body.isRuntimePostCleanup &&
+  decide (body.argCount + 1 ≤ body.localDecls.length) &&
+  decide (body.localDecls.length < 2 ^ 31) &&
+  body.localDecls.all (localDeclOk body.layouts) &&
+  decide (body.basicBlocks ≠ []) &&
+  (List.range body.basicBlocks.length).all (fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb =>
+      !bb.isCleanup &&
+      bb.statements.all (progStmtOkWithIntrinsics body.argCount body.localDecls · body.layouts) &&
+      bb.statements.all (stmtPreservesAddrTaken addrLocals) &&
+      termPreservesAddrTaken addrLocals bb.terminator &&
+      terminatorInProgOkWithIntrinsics callees body blk bb.terminator
+    | none => true) &&
+  addrLocals.all (fun k => decide (1 ≤ k ∧ k ≤ body.argCount)) &&
+  storageDeadOk body && movesOk body && mentionsOk body &&
+  livenessOk body && tupleInitOk body &&
+  (translateFnInProgWithIntrinsics fnMap body).isSome
+
+/-- Decidable multi-function fragment check with pointer/reference parameters,
+`Assume`, and provenance-cast intrinsics. -/
+def progInFragmentWithIntrinsics (entry : MirAst.CapturedMir)
+    (callees : List MirAst.CapturedMir) : Bool :=
+  let fnMap := fnNameMap entry callees
+  ((entry :: callees).map (·.defPath)).Nodup &&
+  (entry :: callees).all (bodyInProgFragmentWithIntrinsics fnMap callees) &&
+  (match maxStackLocals entry callees with
+   | some bound => decide (bound < 2 ^ 31)
+   | none => false) &&
+  (translateProgWithIntrinsics entry callees).isSome
 
 
 

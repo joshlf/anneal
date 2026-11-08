@@ -10678,15 +10678,103 @@ theorem FrameOkWithIntrinsics.toFrameOk {body : CapturedMir} {f : Gen.Function} 
     FrameOk body f ctx locals lm m blk stmt :=
   ⟨translateFnWithIntrinsics_locals h.hf, h.shape, h.locs, h.declsOk, h.nonScalar⟩
 
+private theorem evalPlace_operandOkB_derefFree {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} {p : Place} {pe : Gen.PlaceExpr}
+    (hokB : operandOkB layouts decls (.copy p) = true)
+    (hpe : translatePlace decls p = some pe) :
+    derefFreePlace pe = true := by
+  refine translatePlace_derefFree hpe ?_
+  rcases p with ⟨j, projs⟩
+  rcases projs with _ | ⟨e, _ | _⟩
+  · simp
+  · cases e with
+    | field idx fTy => simp
+    | _ => simp [operandOkB] at hokB
+  · simp [operandOkB] at hokB
+
+private theorem translateOperand_const_shape {decls : List LocalDecl}
+    {c : MirAst.ConstOperand} {op' : Gen.ValueExpr}
+    (h : translateOperand decls (.constant c) = some op') :
+    ∃ cst ty, op' = .Constant cst ty := by
+  dsimp only [translateOperand] at h
+  rcases c with ⟨ty, val⟩
+  dsimp only at h
+  cases hbool : isBoolTy ty <;> simp only [hbool, Bool.false_eq_true, ↓reduceIte] at h
+  · cases val with
+    | scalar sv =>
+      cases sv with
+      | int sc =>
+        rcases sc with ⟨bits, sz⟩
+        cases hit : intTypeOf ty with
+        | none => simp [hit] at h
+        | some it =>
+          simp only [hit] at h
+          by_cases hcond : sz = it.size.bytes ∧ bits < 2 ^ (8 * sz)
+          · simp [hcond] at h
+            exact ⟨_, _, h.2.symm⟩
+          · simp [hcond] at h
+      | ptr => simp at h
+    | _ => simp at h
+  · cases val with
+    | scalar sv =>
+      cases sv with
+      | int sc =>
+        rcases sc with ⟨bits, sz⟩
+        by_cases hcond : sz = 1 ∧ bits < 2
+        · simp [hcond] at h
+          exact ⟨_, _, h.symm⟩
+        · simp [hcond] at h
+      | ptr => simp at h
+    | _ => simp at h
+
+/-- Evaluating a translated `operandOkB` operand preserves `mem.memory` and
+`intptrcast` on `.ok`. -/
+private theorem evalValue_operandOkB_mem_eq {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} {op : Operand} {op' : Gen.ValueExpr}
+    {m m2 : Mach} {vt : Val × Gen.Type}
+    (hokB : operandOkB layouts decls (copyOp op) = true)
+    (hop : translateOperand decls op = some op')
+    (hev : evalValue m op' = .ok (vt, m2)) :
+    m2.mem.memory = m.mem.memory ∧ m2.intptrcast = m.intptrcast := by
+  have hopCopy : translateOperand decls (copyOp op) = some op' := by
+    rw [translateOperand_copyOp]; exact hop
+  have hdf_or_const :
+      (∃ pe, op' = .Load pe ∧ derefFreePlace pe = true) ∨
+      (∃ cst ty, op' = .Constant cst ty) := by
+    rcases op with ⟨p⟩ | ⟨p⟩ | c
+    · simp only [copyOp, translateOperand, Option.map_eq_some_iff] at hokB hopCopy
+      obtain ⟨pe, hpe, rfl⟩ := hopCopy
+      exact .inl ⟨pe, rfl, evalPlace_operandOkB_derefFree hokB hpe⟩
+    · simp only [copyOp, translateOperand, Option.map_eq_some_iff] at hokB hopCopy
+      obtain ⟨pe, hpe, rfl⟩ := hopCopy
+      exact .inl ⟨pe, rfl, evalPlace_operandOkB_derefFree hokB hpe⟩
+    · simp only [copyOp] at hopCopy
+      exact .inr (translateOperand_const_shape hopCopy)
+  rcases hdf_or_const with ⟨pe, rfl, hdf⟩ | ⟨cst, ty, rfl⟩
+  · unfold evalValue at hev
+    obtain ⟨⟨⟨pl, pty⟩, m1⟩, hep, hev⟩ := interpBind_ok hev
+    obtain ⟨⟨v, m2'⟩, hld, hev⟩ := interpBind_ok hev
+    simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hev
+    obtain ⟨_, rfl⟩ := hev
+    have hm1 := evalPlace_derefFree_mach pe hdf m _ _ hep
+    subst hm1
+    exact ⟨(placeLoad_mem_eq hld).1, (placeLoad_mem_eq hld).2.1⟩
+  · unfold evalValue at hev
+    obtain ⟨v, _, hev⟩ := interpBind_ok hev
+    simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hev
+    obtain ⟨_, rfl⟩ := hev
+    exact ⟨rfl, rfl⟩
+
 /-- Self-contained `Intrinsic(Assume(op))` simulation step on `FrameOkWithIntrinsics`
 in a borrow-enabled context `ctxWithBorrows body ctx s.memory.borrows`:
 - when `opBits view (copyOp op) = none` (uninitialized/dead condition), both Anneal
   and MiniRust raise UB;
 - when `opBits view (copyOp op) = some 0` (`false` condition), both Anneal and
-  MiniRust raise UB (`"Assume intrinsic called on condition that is violated"`);
+  MiniRust raise UB (`"`Assume` intrinsic called on condition that is violated"`);
 - when `opBits view (copyOp op) = some 1` (`true` condition), Anneal steps to
   `advanceStmt s (opPost s.frame.locals op)` and MiniRust steps to segment
-  `(nextSeg, 0)` while preserving `FrameOkWithIntrinsics` and `AddrTakenTargetsOk`. -/
+  `(nextSeg, 0)` while preserving `FrameOkWithIntrinsics`, `AddrTakenTargetsOk`,
+  `m4.mem.memory = m.mem.memory`, and `m4.intptrcast = m.intptrcast`. -/
 theorem FrameOkWithIntrinsics.assume_step {body : CapturedMir} {f : Gen.Function}
     {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
     {m : Mach} {curSeg segStmt nextSeg : Nat} {op : Operand} {op' : Gen.ValueExpr}
@@ -10716,6 +10804,8 @@ theorem FrameOkWithIntrinsics.assume_step {body : CapturedMir} {f : Gen.Function
       ∃ m4,
         Interp.evalTerminator m
           (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) = .ok m4 ∧
+        m4.mem.memory = m.mem.memory ∧
+        m4.intptrcast = m.intptrcast ∧
         FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s.memory.borrows)
           view lm m4 nextSeg 0) := by
   let ctx' := ctxWithBorrows body ctx s.memory.borrows
@@ -10730,17 +10820,95 @@ theorem FrameOkWithIntrinsics.assume_step {body : CapturedMir} {f : Gen.Function
       exact fun j hj => hstale.agree ((readsOk_spec hreads op (by simp)).2 j hj))
   obtain ⟨hAnone, hA0, hA1⟩ :=
     evalStmt_assume_anneal s body.localDecls body.layouts op span hslotsA hnA hsimple hokB
-  have hframeR : FrameOk body f ctx' view lm
-      (rethread m ctx' [ctx'.caller, calleeFrameL f ctx' lm curSeg segStmt]) curSeg segStmt :=
-    ⟨translateFnWithIntrinsics_locals hframe.hf, ⟨rfl, hframe.shape.active, rfl⟩,
-      hframe.locs, hframe.declsOk, hframe.nonScalar⟩
-  obtain ⟨hMnone, hM0, hM1⟩ :=
-    evalTerminator_assume_spec (rootCtx := ctx') (curCtx := ctx')
-      (callerFrames := [ctx'.caller]) (nextSeg := nextSeg) hframe.shape hframeR hokB hop
-  refine ⟨fun hnone => ⟨hAnone (hbitsEq.trans hnone), hMnone hnone⟩,
-    fun h0 => ⟨hA0 (hbitsEq.trans h0), hM0 h0⟩,
+  have hopCopy : translateOperand body.localDecls (copyOp op) = some op' := by
+    rw [translateOperand_copyOp]; exact hop
+  obtain ⟨hMok, hMnone⟩ :=
+    evalValue_operandT hframe.toFrameOk (.bool : FragTy .Bool u8Ty) (copyOp op)
+      (operandOkB_T hokB) op' hopCopy
+  refine ⟨fun hnone => ⟨hAnone (hbitsEq.trans hnone), ?_⟩,
+    fun h0 => ⟨hA0 (hbitsEq.trans h0), ?_⟩,
     fun h1 => ⟨hA1 (hbitsEq.trans h1), hat.opPost op, ?_⟩⟩
-  obtain ⟨m4, hm4, hsh4, _, _, hlo4⟩ := hM1 1 h1 (by decide)
-  exact ⟨m4, hm4, ⟨hframe.hf, hsh4, hlo4, hframe.declsOk, hframe.nonScalar⟩⟩
+  · obtain ⟨msg, hmsg⟩ := hMnone hnone
+    exact ⟨msg, by simp [Interp.evalTerminator, evalPlace_unitPlace, evalArgs, hmsg]⟩
+  · obtain ⟨_, m3, hm3, _⟩ := hMok 0 h0
+    simp [Interp.evalTerminator, evalPlace_unitPlace, evalArgs, hm3, valOf,
+      evalIntrinsic, Interp.unitType, ub]
+  · obtain ⟨_, m3, hm3, h3⟩ := hMok 1 h1
+    obtain ⟨hmem3, hipc3⟩ := evalValue_operandOkB_mem_eq hokB hop hm3
+    have hev : evalIntrinsic m3 .Assume [(valOf .Bool 1, .Bool)] Interp.unitType =
+        .ok (Interp.unitValue, m3) := rfl
+    let mSt : Mach := withMem m3 m3.mem.memory.allocations ⟨.Store, .None, 1, ⟨0⟩⟩
+    have hshSt : Shape mSt ctx'
+        ([ctx'.caller] ++ [calleeFrameL f ctx' lm curSeg segStmt])
+        m3.mem.memory.allocations := ⟨h3.shape.threads, h3.shape.active, rfl⟩
+    have hjmp := jumpToBlock_append hshSt nextSeg
+    have hm4 : Interp.evalTerminator m
+        (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) =
+        .ok (rethread mSt ctx' ([ctx'.caller] ++ [calleeFrameL f ctx' lm nextSeg 0])) := by
+      simp only [Interp.evalTerminator, evalPlace_unitPlace, ok_bind,
+        evalArgs, hm3, pure_ok]
+      rw [hev, ok_bind, placeStore_unitValue, ok_bind]
+      exact hjmp
+    have hwm : mSt.mem.memory = m3.mem.memory := rfl
+    refine ⟨rethread mSt ctx' ([ctx'.caller] ++ [calleeFrameL f ctx' lm nextSeg 0]),
+      hm4, by dsimp [rethread]; rw [hwm, hmem3], by dsimp [rethread, mSt, withMem]; exact hipc3,
+      ⟨hframe.hf, ⟨rfl, h3.shape.active, rfl⟩, h3.locs, hframe.declsOk, hframe.nonScalar⟩⟩
+
+/-- Full cross-feature simulation step for `Intrinsic(Assume(op))` preserving
+`FrameOkWithIntrinsics`, `StaleOk`, `BorrowsOk` (active borrow tags and
+reborrowing permissions), `AddrTakenTargetsOk`, and `ProvenanceRel` (exposed
+provenances in `IntPtrCast`). -/
+theorem ProvenanceRel.assume_step_from_frameOk {body : CapturedMir} {f : Gen.Function}
+    {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    {m : Mach} {exposedTags : List Nat} {curSeg segStmt nextSeg : Nat}
+    {bb : BasicBlockData} {st : Statement} {op : Operand} {op' : Gen.ValueExpr}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hframe : FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s.memory.borrows)
+      view lm m curSeg segStmt)
+    (hb : BorrowsOk body ctx view s lm)
+    (hat : AddrTakenTargetsOk body ctx s.frame.locals lm)
+    (hstale : StaleOk body s.frame.locals view s.frame.blockIdx s.frame.stmtIdx)
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some st)
+    (hk : st.kind = .intrinsic (.assume op))
+    (hreads : readsOk (movedBefore body s.frame.blockIdx s.frame.stmtIdx) [op] = true)
+    (hokB : operandOkB body.layouts body.localDecls (copyOp op) = true)
+    (hop : translateOperand body.localDecls op = some op') :
+    (opBits view (copyOp op) = none →
+      evalStmt s st body.localDecls body.layouts = MirStepNode.fail .ub ∧
+      ∃ msg, Interp.evalTerminator m
+        (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) = .error (.ub msg)) ∧
+    (opBits view (copyOp op) = some 0 →
+      evalStmt s st body.localDecls body.layouts = MirStepNode.fail .ub ∧
+      Interp.evalTerminator m
+        (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) =
+        .error (.ub "`Assume` intrinsic called on condition that is violated")) ∧
+    (opBits view (copyOp op) = some 1 →
+      let s' := advanceStmt s (opPost s.frame.locals op)
+      evalStmt s st body.localDecls body.layouts = MirStepNode.step s' ∧
+      StaleOk body s'.frame.locals view s'.frame.blockIdx s'.frame.stmtIdx ∧
+      BorrowsOk body ctx view s' lm ∧
+      AddrTakenTargetsOk body ctx s'.frame.locals lm ∧
+      ∃ m4,
+        Interp.evalTerminator m
+          (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) = .ok m4 ∧
+        ProvenanceRel body ctx s' m4 exposedTags ∧
+        FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s'.memory.borrows)
+          view lm m4 nextSeg 0) := by
+  obtain ⟨stKind, stSpan⟩ := st
+  dsimp only at hk
+  subst hk
+  obtain ⟨hnone, h0, h1⟩ :=
+    hframe.assume_step (nextSeg := nextSeg) (span := stSpan) hat hstale hreads hokB hop
+  refine ⟨hnone, h0, fun hbits1 => ?_⟩
+  obtain ⟨hA1, hat1, m4, hm4, hmem4, hipc4, hframe4⟩ := h1 hbits1
+  have hstale1 : StaleOk body (opPost s.frame.locals op) view
+      s.frame.blockIdx (s.frame.stmtIdx + 1) :=
+    hstale.assume hbb hst rfl
+  have hb1 : BorrowsOk body ctx view (advanceStmt s (opPost s.frame.locals op)) lm :=
+    hb.advance_keep hbb hst (by simp [ptrStmtStep])
+  have hprov1 : ProvenanceRel body ctx (advanceStmt s (opPost s.frame.locals op)) m4 exposedTags :=
+    (hprov.of_shape hipc4 (by rw [← hmem4]; exact AllocShapeEq.refl _)).of_advanceStmt _
+  exact ⟨hA1, hstale1, hb1, hat1, m4, hm4, hprov1, hframe4⟩
 
 end MiniRustSpec.Correspondence

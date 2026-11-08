@@ -5209,151 +5209,18 @@ theorem declSlotOk_of_slotOk_tyOf {d : LocalDecl} {L : Layout.LayoutTable} {slot
             exact h
 
 /-- Writing the live slot `slot'` into the live local `_i`, whose allocation is
-`k`, keeps `LocalsOkA`. -/
-theorem LocalsOkA.store {body : CapturedMir} {ctx : Ctx} {al : List Nat} {locals : List LocalSlot}
-    {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
-    (hlo : LocalsOkA body ctx al locals lm A)
-    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (slot slot' : LocalSlot)
-    (hs : locals[i]? = some slot) (hlive' : slot' ≠ .dead)
-    (hslot' : SlotOk (tyOf d body.layouts) slot')
-    (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
-    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) :
-    LocalsOkA body ctx al (locals.set i slot') lm
-      (A.set k (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot' body.layouts))) := by
-  have hdsl : DeclSlotOk d slot' body.layouts := declSlotOk_of_slotOk_tyOf hslot'
-  have hnp : ∀ pv, slot' ≠ .init (.ptr pv 8) := by
-    intro pv heq; subst heq; simp [SlotOk] at hslot'
-  have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hs).1
-  obtain ⟨id0, hpid0, hbase, haddr, haddrMax, hcls, hA0⟩ := hlo.storage i d slot p hd hs hp
-  have hid0 : id0 = k := (prov_inj id0 k).mp (hpid0.symm.trans hpk)
-  subst id0
-  have hk : k < A.length := by
-    cases hp_ty : isPtrTy d.ty with
-    | false =>
-      simp only [hp_ty, Bool.false_eq_true, ↓reduceIte] at hA0
-      exact (List.getElem?_eq_some_iff.mp hA0).1
-    | true =>
-      simp only [hp_ty, ↓reduceIte] at hA0
-      split at hA0
-      · obtain ⟨_, _, _, _, hAk⟩ := hA0
-        exact (List.getElem?_eq_some_iff.mp hAk).1
-      · exact (List.getElem?_eq_some_iff.mp hA0).1
-  refine {
-    nlocals := by simp [hlo.nlocals]
-    slots := ?_
-    base := ?_
-    keysNodup := hlo.keysNodup
-    keysLocal := hlo.keysLocal
-    live := ?_
-    storage := ?_
-    inj := hlo.inj
-    owned := ?_ }
-  · intro j dj sj hdj hsj
-    by_cases hij : i = j
-    · subst hij
-      rw [hd] at hdj; cases hdj
-      rw [List.getElem?_set_self hil] at hsj; cases hsj
-      exact hdsl
-    · rw [List.getElem?_set_ne hij] at hsj
-      exact hlo.slots j dj sj hdj hsj
-  · obtain ⟨R, hR⟩ := hlo.base
-    refine ⟨R.set (k - ctx.base.length)
-        (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot' body.layouts)), ?_⟩
-    rw [hR, List.set_append_right _ _ hbase]
-  · intro j sj hsj
-    by_cases hij : i = j
-    · subst hij
-      rw [List.getElem?_set_self hil] at hsj; cases hsj
-      simp [hp, hlive']
-    · rw [List.getElem?_set_ne hij] at hsj
-      exact hlo.live j sj hsj
-  · intro j dj sj q hdj hsj hq
-    by_cases hij : i = j
-    · subst hij
-      rw [hd] at hdj; cases hdj
-      rw [hp] at hq; cases hq
-      rw [List.getElem?_set_self hil] at hsj; cases hsj
-      refine ⟨k, hpk, hbase, haddr, haddrMax, hcls, ?_⟩
-      cases hp_ty : isPtrTy d.ty with
-      | false =>
-        simp [List.getElem?_set_self hk]
-      | true =>
-        simp only [↓reduceIte]
-        first
-        | exact List.getElem?_set_self hk
-        | (split
-           · next pv => exact False.elim (hnp pv rfl)
-           · exact List.getElem?_set_self hk)
-    · rw [List.getElem?_set_ne hij] at hsj
-      obtain ⟨id, hqid, hb', ha', hmax', hc', hA'⟩ := hlo.storage j dj sj q hdj hsj hq
-      have hne : k ≠ id := fun hki => hij (hlo.inj i j p q hp hq (by subst hki; rw [hpk, hqid]))
-      refine ⟨id, hqid, hb', ha', hmax', hc', ?_⟩
-      simpa only [List.getElem?_set_ne hne] using hA'
-  · intro id a ha hlivea hb
-    by_cases hki : k = id
-    · subst hki
-      exact ⟨i, p, hp, hpk⟩
-    · rw [List.getElem?_set_ne hki] at ha
-      exact hlo.owned id a ha hlivea hb
-
-/-- The allocation behind any well-typed local (including raw-pointer locals)
-is the one its pointer's provenance names. -/
-theorem LocalsOkA.storage_any_id {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+`k`, keeps `LocalsOkA` whenever `DeclSlotOk` holds and `slot'` is not a pointer
+slot on a non-pointer declaration (`hnp`). -/
+theorem LocalsOkA.store_decl {body : CapturedMir} {ctx : Ctx} {al : List Nat}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
     (hlo : LocalsOkA body ctx al locals lm A)
-    {i : Nat} {d : LocalDecl} {slot : LocalSlot} {p : Ptr} (hd : body.localDecls[i]? = some d)
-    (hs : locals[i]? = some slot) (hp : mapGet lm (localName i) = some p) {k : Nat}
-    (hpk : p.provenance = some (⟨(k : Int)⟩, ()))
-    (hdok : localDeclOk body.layouts d = true) :
-    ∃ data : List Byte,
-      ctx.base.length ≤ k ∧ AddrOk p.addr (itOf d body.layouts) ∧
-      p.addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64 ∧
-      AddrClass p.addr (tyBytes (tyOf d body.layouts)) ∧
-      data.length = tyBytes (tyOf d body.layouts) ∧
-      A[k]? = some (stackAlloc p.addr (itOf d body.layouts) data) := by
-  obtain ⟨id, data, hpid, hb, ha, hmax, hc, hlen, hA⟩ := hlo.storage_any hd hs hp hdok
-  have : id = k := (prov_inj id k).mp (hpid.symm.trans hpk)
-  subst this
-  exact ⟨data, hb, ha, hmax, hc, hlen, hA⟩
-
-/-- Writing the live non-pointer slot `slot'` (or `.uninit` on any local) into
-the live local `_i`, whose allocation is `k`, keeps `LocalsOk`. -/
-theorem LocalStorage.congr_getElem? {ctx : Ctx} {A A' : List Gen.Allocation}
-    {d : LocalDecl} {slot : LocalSlot} {p : Ptr} {layouts : Layout.LayoutTable}
-    (h : LocalStorage ctx A d slot p layouts)
-    (heq : ∀ (id : Nat), p.provenance = some (⟨(id : Int)⟩, ()) → A'[id]? = A[id]?) :
-    LocalStorage ctx A' d slot p layouts := by
-  obtain ⟨id, hpid, hb, ha, hmax, hc, hA⟩ := h
-  refine ⟨id, hpid, hb, ha, hmax, hc, ?_⟩
-  simpa only [heq id hpid] using hA
-
-/-- The allocation number behind a local's storage is in range. -/
-theorem LocalStorage.exists_id_lt {ctx : Ctx} {A : List Gen.Allocation} {d : LocalDecl}
-    {slot : LocalSlot} {p : Ptr} {layouts : Layout.LayoutTable}
-    (h : LocalStorage ctx A d slot p layouts) :
-    ∃ id : Nat, p.provenance = some (⟨(id : Int)⟩, ()) ∧ id < A.length := by
-  obtain ⟨id, hpid, _, _, _, _, hA⟩ := h
-  refine ⟨id, hpid, ?_⟩
-  cases hp_ty : isPtrTy d.ty with
-  | false =>
-    simp only [hp_ty, Bool.false_eq_true, ↓reduceIte] at hA
-    exact (List.getElem?_eq_some_iff.mp hA).1
-  | true =>
-    simp only [hp_ty, ↓reduceIte] at hA
-    split at hA
-    · obtain ⟨_, _, _, _, hAk⟩ := hA
-      exact (List.getElem?_eq_some_iff.mp hAk).1
-    · exact (List.getElem?_eq_some_iff.mp hA).1
-
-theorem LocalsOk.store {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
-    {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation} (hlo : LocalsOk body ctx locals lm A)
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (slot slot' : LocalSlot)
     (hs : locals[i]? = some slot) (hlive' : slot' ≠ .dead)
     (hslot' : DeclSlotOk d slot' body.layouts)
     (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
     (hpk : p.provenance = some (⟨(k : Int)⟩, ()))
     (hnp : isPtrTy d.ty = false ∨ (∀ pv, slot' ≠ .init (.ptr pv 8))) :
-    LocalsOk body ctx (locals.set i slot') lm
+    LocalsOkA body ctx al (locals.set i slot') lm
       (A.set k (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot' body.layouts))) := by
   have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hs).1
   obtain ⟨id0, hpid0, hbase, haddr, haddrMax, hcls, hA0⟩ := hlo.storage i d slot p hd hs hp
@@ -5417,15 +5284,92 @@ theorem LocalsOk.store {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot
           · next pv => exact False.elim (hnotPtr pv rfl)
           · exact List.getElem?_set_self hk
     · rw [List.getElem?_set_ne hij] at hsj
-      refine (hlo.storage j dj sj q hdj hsj hq).congr_getElem? (fun id hqid => ?_)
+      obtain ⟨id, hqid, hb', ha', hmax', hc', hA'⟩ := hlo.storage j dj sj q hdj hsj hq
       have hne : k ≠ id := fun hki => hij (hlo.inj i j p q hp hq (by subst hki; rw [hpk, hqid]))
-      exact List.getElem?_set_ne hne
+      refine ⟨id, hqid, hb', ha', hmax', hc', ?_⟩
+      simpa only [List.getElem?_set_ne hne] using hA'
   · intro id a ha hlivea hb
     by_cases hki : k = id
     · subst hki
       exact ⟨i, p, hp, hpk⟩
     · rw [List.getElem?_set_ne hki] at ha
       exact hlo.owned id a ha hlivea hb
+
+/-- Writing the live slot `slot'` into the live local `_i`, whose allocation is
+`k`, keeps `LocalsOkA`. -/
+theorem LocalsOkA.store {body : CapturedMir} {ctx : Ctx} {al : List Nat} {locals : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
+    (hlo : LocalsOkA body ctx al locals lm A)
+    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (slot slot' : LocalSlot)
+    (hs : locals[i]? = some slot) (hlive' : slot' ≠ .dead)
+    (hslot' : SlotOk (tyOf d body.layouts) slot')
+    (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) :
+    LocalsOkA body ctx al (locals.set i slot') lm
+      (A.set k (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot' body.layouts))) :=
+  hlo.store_decl i d hd slot slot' hs hlive' (declSlotOk_of_slotOk_tyOf hslot') p hp k hpk
+    (.inr fun pv heq => by subst heq; simp [SlotOk] at hslot')
+
+/-- The allocation behind any well-typed local (including raw-pointer locals)
+is the one its pointer's provenance names. -/
+theorem LocalsOkA.storage_any_id {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
+    (hlo : LocalsOkA body ctx al locals lm A)
+    {i : Nat} {d : LocalDecl} {slot : LocalSlot} {p : Ptr} (hd : body.localDecls[i]? = some d)
+    (hs : locals[i]? = some slot) (hp : mapGet lm (localName i) = some p) {k : Nat}
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ()))
+    (hdok : localDeclOk body.layouts d = true) :
+    ∃ data : List Byte,
+      ctx.base.length ≤ k ∧ AddrOk p.addr (itOf d body.layouts) ∧
+      p.addr + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64 ∧
+      AddrClass p.addr (tyBytes (tyOf d body.layouts)) ∧
+      data.length = tyBytes (tyOf d body.layouts) ∧
+      A[k]? = some (stackAlloc p.addr (itOf d body.layouts) data) := by
+  obtain ⟨id, data, hpid, hb, ha, hmax, hc, hlen, hA⟩ := hlo.storage_any hd hs hp hdok
+  have : id = k := (prov_inj id k).mp (hpid.symm.trans hpk)
+  subst this
+  exact ⟨data, hb, ha, hmax, hc, hlen, hA⟩
+
+/-- Writing the live non-pointer slot `slot'` (or `.uninit` on any local) into
+the live local `_i`, whose allocation is `k`, keeps `LocalsOk`. -/
+theorem LocalStorage.congr_getElem? {ctx : Ctx} {A A' : List Gen.Allocation}
+    {d : LocalDecl} {slot : LocalSlot} {p : Ptr} {layouts : Layout.LayoutTable}
+    (h : LocalStorage ctx A d slot p layouts)
+    (heq : ∀ (id : Nat), p.provenance = some (⟨(id : Int)⟩, ()) → A'[id]? = A[id]?) :
+    LocalStorage ctx A' d slot p layouts := by
+  obtain ⟨id, hpid, hb, ha, hmax, hc, hA⟩ := h
+  refine ⟨id, hpid, hb, ha, hmax, hc, ?_⟩
+  simpa only [heq id hpid] using hA
+
+/-- The allocation number behind a local's storage is in range. -/
+theorem LocalStorage.exists_id_lt {ctx : Ctx} {A : List Gen.Allocation} {d : LocalDecl}
+    {slot : LocalSlot} {p : Ptr} {layouts : Layout.LayoutTable}
+    (h : LocalStorage ctx A d slot p layouts) :
+    ∃ id : Nat, p.provenance = some (⟨(id : Int)⟩, ()) ∧ id < A.length := by
+  obtain ⟨id, hpid, _, _, _, _, hA⟩ := h
+  refine ⟨id, hpid, ?_⟩
+  cases hp_ty : isPtrTy d.ty with
+  | false =>
+    simp only [hp_ty, Bool.false_eq_true, ↓reduceIte] at hA
+    exact (List.getElem?_eq_some_iff.mp hA).1
+  | true =>
+    simp only [hp_ty, ↓reduceIte] at hA
+    split at hA
+    · obtain ⟨_, _, _, _, hAk⟩ := hA
+      exact (List.getElem?_eq_some_iff.mp hAk).1
+    · exact (List.getElem?_eq_some_iff.mp hA).1
+
+theorem LocalsOk.store {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation} (hlo : LocalsOk body ctx locals lm A)
+    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d) (slot slot' : LocalSlot)
+    (hs : locals[i]? = some slot) (hlive' : slot' ≠ .dead)
+    (hslot' : DeclSlotOk d slot' body.layouts)
+    (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ()))
+    (hnp : isPtrTy d.ty = false ∨ (∀ pv, slot' ≠ .init (.ptr pv 8))) :
+    LocalsOk body ctx (locals.set i slot') lm
+      (A.set k (stackAlloc p.addr (itOf d body.layouts) (declSlotData d slot' body.layouts))) :=
+  hlo.store_decl i d hd slot slot' hs hlive' hslot' p hp k hpk hnp
 
 /-- Writing an initialized thin raw pointer `.init (.ptr ptrVal 8)` backed by
 `ptrBytes tAddr tProv` (`tAddr < 2 ^ 64`) into raw-pointer local `_i`, whose

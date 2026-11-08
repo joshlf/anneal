@@ -1523,23 +1523,39 @@ These are deliberate and are the first things to lift:
   Pass B2 (MR-4.3) unifies `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
   into `translateStmtOrIntrinsic`, `statementOkWithIntrinsics` (via
   `progStatementOk`), and `inFragmentWithIntrinsics`, and proves the one-step
-  lemma `FrameOkWithIntrinsics.assume_step`: when the condition is
-  uninitialized or `false` (`opBits view (copyOp op)` is `none` or `some 0`),
-  both Anneal and MiniRust raise UB, and when it is `true`, Anneal advances
-  while MiniRust jumps to the continuation block, preserving
-  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` (the lemma states nothing
-  about `BorrowsOk` or `ProvenanceRel`). `termPreservesAddrTaken` rejects a
-  `TerminatorKind.call` whose destination or moved argument is address-taken
-  (`termPreservesAddrTaken_call_spec`), although no fragment yet admits both
-  calls and `ptrAliasingOk`. The witnesses `assumeReborrowExposeRoundTrip_three_way`
-  and `assumeReborrowFalseUb_three_way` run Anneal, `Mach`, and `MachTB` on
-  `Assume` combined with `&mut` reborrowing and provenance casts, while
-  `callRefMutProtectedRoundTrip_mach_and_tb`,
-  `callRefMutProtectorViolation_mach_vs_tb`, and
-  `callCrossFrameExposeWithExposed_mach_and_tb` run hand-written multi-function
-  MiniRust programs (with no Anneal side and no `translateProg`) that combine
-  `Terminator::Call` with `&mut u32` function-entry protectors and cross-frame
-  provenance casts on `Mach` and `MachTB`. Threading
+  lemma `FrameOkWithIntrinsics.assume_step`; Pass B3 strengthens it to
+  `ProvenanceRel.assume_step_from_frameOk`, proving that when `opBits view (copyOp op) = some 1`,
+  Anneal advances and MiniRust jumps to the continuation block while preserving
+  `FrameOkWithIntrinsics`, `StaleOk` (`StaleOk.assume`), `BorrowsOk`
+  (`BorrowsOk.advance_keep`), `AddrTakenTargetsOk` (`AddrTakenTargetsOk.opPost`),
+  and `ProvenanceRel` (`m4.mem.memory = m.mem.memory` and `m4.intptrcast = m.intptrcast`).
+  Pass B3 also unifies multi-function translation and fragment checking with
+  intrinsics and pointer/reference parameters in `translateFnInProgWithIntrinsics`,
+  `translateProgWithIntrinsics`, `bodyInProgFragmentWithIntrinsics`, and
+  `progInFragmentWithIntrinsics` (agreeing with `translateFnInProg` on
+  provenance-cast-free bodies via `translateFnInProgWithIntrinsics_eq_of_no_provCast`,
+  admitting `Retag([fn entry], _i)` on reference parameters `1 ≤ i ≤ argCount`
+  via `progStmtOkWithIntrinsics`, and enforcing `termPreservesAddrTaken` on
+  `TerminatorKind.call`, witnessed by `callerRefMutProtectedBadCallDstMir` in
+  `callerRefMutProtectedBadCallDst_notInFragmentWithIntrinsics`). The witnesses
+  `assumeReborrowExposeRoundTrip_three_way` and `assumeReborrowFalseUb_three_way`
+  run Anneal, `Mach`, and `MachTB` on `Assume` combined with `&mut` reborrowing
+  and provenance casts, while `callRefMutProtectedRoundTrip_three_way`,
+  `callRefMutProtectorViolation_three_way`, and
+  `callCrossFrameExposeWithExposed_three_way` check `progInFragmentWithIntrinsics = true`,
+  translate concrete multi-function `CapturedMir` pairs via
+  `translateProgWithIntrinsics`, and run them 3-way across Anneal
+  (`mirCallTreeWithCallees`), `Mach` (`BasicMemory`), and `MachTB`
+  (`TreeBorrowsMemory`) on `Terminator::Call` with `&mut u32` function-entry
+  protectors and cross-frame provenance casts (`callCrossFrameExposeWithExposed_three_way`
+  returns `88` on all three semantics; `callRefMutProtectorViolation_three_way`
+  faults on Anneal and `MachTB` while returning `20` on `Mach`; and
+  `callRefMutProtectedRoundTrip_three_way` witnesses why `progInFragment`
+  requires scalar parameters for `multi_step_correspondence`: Anneal's
+  `Terminators.evalTerminator` saves caller locals on `s.memory.callStack`
+  without rebinding `BorrowEntry.targetLocal` across frames, so dereferencing a
+  caller-local reference inside a pushed callee frame faults in Anneal while
+  `Mach` and `MachTB` return `84`). Threading
   `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across the
   continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
   from `step_correspondence_N`. A single exposure site in a loop
@@ -1552,13 +1568,17 @@ These are deliberate and are the first things to lift:
   worst-case stack-local budget satisfies `maxStackLocals < 2^31`; recursive
   call cycles, indirect function-pointer or virtual calls, and unwinding across
   stack frames (`UnwindResume` / cleanup blocks) remain outside the fragment.
-* **The multi-function fragment is scalar-family only.** `progInFragment`
-  (`bodyInProgFragment`) admits only integer, `bool`, `Ordering`, and
-  `(Int, bool)` locals, so the multi-function correspondence
-  (`multi_step_correspondence`) does not yet cover calls whose frames hold
-  raw pointers, references, arrays, or `TupleSpec` aggregates, which the
-  single-function correspondence (`step_correspondence_N`) covers; both
-  translations share `translateStatement` and `translateTerminator`. The
+* **Multi-function correspondence (`multi_step_correspondence`) vs. unified
+  multi-function translation (`translateProgWithIntrinsics`).** `progInFragment`
+  (`bodyInProgFragment`) admits integer, `bool`, `Ordering`, and `(Int, bool)`
+  locals for the symbolic `multi_step_correspondence` induction, while
+  `progInFragmentWithIntrinsics` (`bodyInProgFragmentWithIntrinsics` and
+  `translateProgWithIntrinsics`) extends multi-function translation and fragment
+  checking to pointer/reference parameters, `Retag(FnEntry)` on parameter
+  locals, `Assume`, `PointerExposeProvenance`, and
+  `PointerWithExposedProvenance` (`translateFnInProgWithIntrinsics_eq_of_no_provCast`
+  proves that `translateFnInProgWithIntrinsics` coincides with `translateFnInProg`
+  whenever a body has no provenance casts). The
   multi-frame relations (`MultiStartRel`, `CallStackRel`) state per-local facts
   at the default layout table, and `itOf_scalar_layouts`,
   `tyOf_scalar_layouts`, `declSlotData_scalar_layouts`, and
@@ -1566,12 +1586,6 @@ These are deliberate and are the first things to lift:
   at `body.layouts`; the call and return lemmas (`callArgOk_cases`,
   `evalArguments_spec`, `evalCall_spec`, `evalReturn_caller_spec`) take the
   scalar-only hypothesis explicitly.
-* **Two block-splitting translations.** `translateFnWithIntrinsics` splits a
-  block after each `PointerExposeProvenance`, `PointerWithExposedProvenance`, or
-  `Assume` statement (single-function, `FrameOkWithIntrinsics`), while
-  `translateFnInProg` splits it after each `Assume` and translates
-  `TerminatorKind.call` in a multi-function program (`SegChain`, `SegPc`);
-  `translateFnInProg` does not lower provenance casts.
 * **Compiler call intrinsics and pointer/target intrinsics (MR-4.2).**
   `progInFragment` admits `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
   directly in the multi-function simulation (`SegChain`, `SegPc`), and
