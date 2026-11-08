@@ -415,12 +415,7 @@ private theorem arithSum_le_sq : ∀ k : Nat, arithSum k ≤ k * k
   | 0 => Nat.le_refl 0
   | k + 1 => by
     have ih := arithSum_le_sq k
-    calc
-      arithSum (k + 1) = arithSum k + k := rfl
-      _ ≤ k * k + k := Nat.add_le_add_right ih k
-      _ ≤ (k + 1) * (k + 1) := by
-        rw [Nat.add_mul, Nat.mul_add, Nat.one_mul, Nat.mul_one]
-        omega
+    rw [arithSum, Nat.add_mul, Nat.mul_add]; omega
 
 /-- `sumToNLoopBody` state at `(bb, 0)` with counter `i`, accumulator `acc`, and slot `_4`. -/
 private def sumToNState (bb n i acc : Nat) (cmp : LocalSlot) : MachineState :=

@@ -323,13 +323,11 @@ private theorem prefixSum_succ (elems : List Nat) (k : Nat) :
     prefixSum elems (k + 1) = prefixSum elems k + elems.getD k 0 := rfl
 
 private theorem prefixSum_mono (elems : List Nat) :
-    ∀ {i j : Nat}, i ≤ j → prefixSum elems i ≤ prefixSum elems j := by
-  intro i j h_le
-  induction h_le with
-  | refl => exact Nat.le_refl _
-  | @step m _ ih =>
-    rw [prefixSum_succ]
-    omega
+    ∀ {i j : Nat}, i ≤ j → prefixSum elems i ≤ prefixSum elems j
+  | _, _, .refl => Nat.le_refl _
+  | _, _ + 1, .step h => by
+    have := prefixSum_mono elems h
+    rw [prefixSum_succ]; omega
 
 /-- Exact `MirEffect` event trace emitted by `n` iterations of `while i < n`. -/
 def sliceLoopTrace (n : Nat) : List (Event MirEffect) :=

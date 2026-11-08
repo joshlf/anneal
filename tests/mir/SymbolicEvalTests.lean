@@ -802,8 +802,8 @@ def clampAddOne1000Claim : Claim where
   post args ret :=
     MirBoolPredicateHolds clampAddOneEns1000Mir (args ++ [ret])
 
-theorem clampAddOne1000_verified : VerificationResult clampAddOne1000Claim := by
-  exact dischargeRustSymRange1Auto
+theorem clampAddOne1000_verified : VerificationResult clampAddOne1000Claim :=
+  dischargeRustSymRange1Auto
     clampAddOne1000Claim 16 16
     clampAddOneReq1000Mir
     (.some clampAddOneEns1000Mir)
@@ -1301,13 +1301,8 @@ theorem rangeBoundsTraitDispatch_verified :
     VerificationResult rangeBoundsCallerClaim := by
   refine verifyByWPFuelFree rangeBoundsCallerClaim ?_
   rintro _ ⟨start, end_, idx, h_lo, h_hi, rfl⟩
-  have h_ble1 : Nat.ble start idx = true := Nat.ble_eq_true_of_le h_lo
-  have h_ble2 : Nat.ble end_ idx = false := (nat_ble_eq_false_iff end_ idx).2 h_hi
-  (conv => whnf); split
-  · (conv => whnf); split
-    · rename_i h; rw [h_ble2] at h; cases h
-    · (conv => whnf)
-  · rename_i h; rw [h_ble1] at h; cases h
+  (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+  all_goals simp_all <;> omega
 
 /-! ## 9. Indirect `FnPtr` Calls (`ReifyFnPointer`, `fnPtrToPtr`, `TerminatorKind.call`, `TerminatorKind.tailCall`, `s.memory.fnPtrs`, and UB Refutation) -/
 
@@ -1455,8 +1450,8 @@ def indirectCallDanglingFnPtrClaim : StatefulClaim where
   post _ _ _ _ := True
 
 theorem indirectCallDanglingFnPtr_refuted :
-    ¬ indirectCallDanglingFnPtrClaim.holds := by
-  exact refuteStatefulClaimByBoundedUB
+    ¬ indirectCallDanglingFnPtrClaim.holds :=
+  refuteStatefulClaimByBoundedUB
     indirectCallDanglingFnPtrClaim 8
     [ .ptr { allocId := 99999, offsetBytes := 0 } 8
     , .scalar { bits := 7, sizeBytes := 1 } ]
@@ -1549,12 +1544,11 @@ theorem guardedSliceLenSub_verified :
     VerificationResult guardedSliceLenSubClaim := by
   refine verifyByWPFuelFree guardedSliceLenSubClaim ?_
   rintro _ ⟨p, len, mid, h_le, h_len, rfl⟩
-  have h_ble : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · rintro _ _ _ ⟨⟩
     simp; omega
   · simp_all
-  · simp_all
+  · simp_all; omega
 
 /--
 `guardedPanicCallMir`: calls `core::slice::<impl [T]>::len::<u8>(_1)` and if
@@ -1956,8 +1950,8 @@ subject body and its `ensures` companion predicate invoke a linked callee in
 `callees` / `specCallees`.
 -/
 theorem pinnedWithSpecCallees_verified :
-    VerificationResult pinnedWithSpecCalleesClaim := by
-  exact dischargeRustPinnedContractWithSpecCalleesAuto
+    VerificationResult pinnedWithSpecCalleesClaim :=
+  dischargeRustPinnedContractWithSpecCalleesAuto
     pinnedWithSpecCalleesClaim 16 16
     [incU8CallbackMir]
     (.some companionPinnedReqMir)
@@ -1978,8 +1972,8 @@ Kernel-checked total verification of `pinnedWithSpecCalleesTotalClaim` via
 `dischargeRustTotalPinnedContractWithSpecCalleesAuto`.
 -/
 theorem pinnedWithSpecCalleesTotal_verified :
-    TotalVerificationResult pinnedWithSpecCalleesTotalClaim := by
-  exact dischargeRustTotalPinnedContractWithSpecCalleesAuto
+    TotalVerificationResult pinnedWithSpecCalleesTotalClaim :=
+  dischargeRustTotalPinnedContractWithSpecCalleesAuto
     pinnedWithSpecCalleesTotalClaim 16 16
     [incU8CallbackMir]
     (.some companionPinnedReqMir)
@@ -2293,7 +2287,7 @@ theorem confirm_tag_ub_transmute_invalid_enum_tag__b7_c29 :
     evalMirDiffTagBounded 64 ubTransmuteInvalidEnumTagB7C29Body
       (initMachineStateWithMemory
         ubTransmuteInvalidEnumTagB7C29Body [] emptyMemory) =
-      MirDiffTag.normalScalar 1 1 := by
+      MirDiffTag.normalScalar 1 1 :=
   rfl
 
 /--
@@ -2306,7 +2300,7 @@ theorem confirm_probe_ub_transmute_invalid_enum_tag__b7_c29 :
       (.running
         (initMachineStateWithMemory
           ubTransmuteInvalidEnumTagB7C29Body [] emptyMemory)) =
-      (MirDiffTag.normalScalar 1 1, "none") := by
+      (MirDiffTag.normalScalar 1 1, "none") :=
   rfl
 
 /--
@@ -2344,8 +2338,8 @@ theorem confirm_ub_transmute_invalid_enum_tag_out_of_range :
       (.running
         (initMachineStateWithMemory
           ubTransmuteInvalidEnumTagOutOfRangeBody [] emptyMemory)) =
-      (MirDiffTag.ub, "src/lib.rs:5006:32: 5006:46") := by
-  exact ⟨rfl, rfl⟩
+      (MirDiffTag.ub, "src/lib.rs:5006:32: 5006:46") :=
+  ⟨rfl, rfl⟩
 
 /--
 Adversarial edge-case bodies for scalar-represented enum return classification:
@@ -2537,8 +2531,8 @@ theorem scalar_enum_return_edge_cases_confirmed :
     probeMirDiffBounded 16 nicheOptionBoolNoneBody
       (initMachineStateWithMemory
         nicheOptionBoolNoneBody [] emptyMemory) =
-      (MirDiffTag.normalOther, "none") := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      (MirDiffTag.normalOther, "none") :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 Kernel-checked `TotalVerificationResult` certification for
@@ -2871,8 +2865,8 @@ theorem scalar_enum_return_b1_hardening_confirmed :
     probeMirDiffBounded 16 outOfWidthRangeScalarEnumBody
       (initMachineStateWithMemory
         outOfWidthRangeScalarEnumBody [] emptyMemory) =
-      (MirDiffTag.normalOther, "none") := by
-  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      (MirDiffTag.normalOther, "none") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
@@ -2885,7 +2879,6 @@ Namespace-shadowing regression check verifying that generated modules (such as
 -/
 namespace MiriOracleShadowCompatCheck
 
-open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
@@ -2931,7 +2924,7 @@ theorem local_and_qualified_probe_resolve :
           Anneal.Rustc.V2026_06_01.SymbolicEvalTests.ubTransmuteInvalidEnumTagB7C29Body
           []
           emptyMemory)) =
-      (MirDiffTag.normalScalar 1 1, "none") := by
-  exact ⟨rfl, rfl⟩
+      (MirDiffTag.normalScalar 1 1, "none") :=
+  ⟨rfl, rfl⟩
 
 end MiriOracleShadowCompatCheck

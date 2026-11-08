@@ -362,21 +362,19 @@ theorem infiniteLoopPartialClaim_verified :
     VerificationResult infiniteLoopPartialClaim := by
   refine verifyByDWLP infiniteLoopPartialClaim ?_
   rintro _ rfl
-  let t₀ := mirCallTree infiniteLoopMirBody []
-  refine DWLP.coinduct (fun t _ => t = t₀) ?_ rfl
-  rintro t _ rfl
-  have h_obs : t₀.observe = .tau t₀ := ITree.observe_cofix _ _
-  simp only [h_obs]
+  refine DWLP.coinduct (fun t _ => t = mirCallTree infiniteLoopMirBody []) ?_ rfl
+  rintro _ _ rfl
+  rw [show (mirCallTree infiniteLoopMirBody []).observe = .tau _ from ITree.observe_cofix _ _]
+  rfl
 
 theorem not_infiniteLoopTotalClaim_holds : ¬ infiniteLoopTotalClaim.holds := by
   intro h_total
-  let t₀ := mirStatefulTree infiniteLoopMirBody [] emptyMemory
-  have h_obs : t₀.observe = .tau t₀ := ITree.observe_cofix _ _
-  have h_div : Diverges t₀ :=
-    Diverges.coinduct (fun x => x = t₀)
-      (fun x hx => by subst hx; simp only [h_obs])
-      t₀ rfl
-  exact (h_total [] emptyMemory rfl).2.2.1 ⟨[], t₀, .refl t₀, h_div⟩
+  refine (h_total [] emptyMemory rfl).2.2.1 ⟨[], _, .refl _,
+    Diverges.coinduct (· = mirStatefulTree infiniteLoopMirBody [] emptyMemory) ?_ _ rfl⟩
+  rintro _ rfl
+  rw [show (mirStatefulTree infiniteLoopMirBody [] emptyMemory).observe = .tau _ from
+    ITree.observe_cofix _ _]
+  rfl
 
 theorem example_loops_total_vs_coinductive_partial :
     TotalVerificationResult countdownTotalClaim ∧
@@ -474,7 +472,7 @@ private theorem reachesUBAnswering_not_treeSafe (body : CapturedMir) (fuel : Nat
 theorem not_impureFfiDoubleCallClaim_holds : ¬ impureFfiDoubleCallClaim.holds :=
   fun h_holds =>
     reachesUBAnswering_not_treeSafe ffiDoubleCallMirBody 7
-      [.scalar ⟨0, 4⟩, .scalar ⟨1, 4⟩] _ (by rfl) (h_holds [] rfl).1
+      [.scalar ⟨0, 4⟩, .scalar ⟨1, 4⟩] _ rfl (h_holds [] rfl).1
 
 def pureConstSevenContract : CallContract MirCallReq (fun _ => MirCallAns) where
   pre req := req.defPath = "ffi::rand_u32" ∧ req.args = []
@@ -576,10 +574,10 @@ theorem example_horizontal_caller_callee_linking :
       MirClosedStatefulContractSpec
         (fun args mem => args = [.scalar ⟨40, 4⟩] ∧ mem = emptyMemory)
         (fun args mem => args = [.scalar ⟨40, 4⟩] ∧ mem = emptyMemory)
-        (fun _ _ ret _ => ret = .scalar ⟨42, 4⟩) := by
-  refine linkVerifiedMirCallee callerAddTwoModular_verified
-    calleeAddOneMirBody rejectOtherCallsHandler calleeAddOne_satisfies_contract ?_
-  exact fun _ _ h_ne h_pre _ => (h_ne h_pre.1).elim
+        (fun _ _ ret _ => ret = .scalar ⟨42, 4⟩) :=
+  linkVerifiedMirCallee callerAddTwoModular_verified
+    calleeAddOneMirBody rejectOtherCallsHandler calleeAddOne_satisfies_contract
+    (fun _ _ h_ne h_pre _ => (h_ne h_pre.1).elim)
 
 /-! ## 7. Disjoint-Footprint Separation-Logic Framing & Exclusivity -/
 
