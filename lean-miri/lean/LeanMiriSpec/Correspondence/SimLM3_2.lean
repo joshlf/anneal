@@ -3475,18 +3475,88 @@ theorem annealReadImmediate_indirect_prim_eq₂
   dsimp only
   rw [hf]
 
+/-- Dereferencing a `PtrRel`-related safe-reference local `_r : &(mut) T` at
+offset `0` into a live pointee local `e.localIdx` whose stack allocation size
+matches `sizeof(T)` succeeds in `annealDerefOperandToMemPlace` even when
+`allocDecl.ty.kind ≠ T` (e.g. a transmuted `&bool` pointing at a `u8` local). -/
+theorem annealDerefOperandToMemPlace_safeRef_ptr_same_size
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {refIdx : Local} {refDecl allocDecl : LocalDecl}
+    {mutability : Mutability} {pointeeKind : RigidTy}
+    (hdecl : get? body.localDecls refIdx = some refDecl)
+    (hty : refDecl.ty.kind = .ref mutability pointeeKind)
+    (hpk : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    {ptrVal : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+    {e : AllocMapEntry} {borTag : Miri.Memory.BorTag}
+    (hprov_eq : mptr.provenance = .concrete e.allocId borTag)
+    (hmptr_off : mptr.offset =
+      Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes))
+    (he : e ∈ allocMap)
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    (hlive_t : get? s.frame.locals e.localIdx ≠ some .dead)
+    (hsize : (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size =
+      (translateTy allocDecl.ty body.layouts).layout.size)
+    (ptrLay : Miri.Interpreter.LocalLayout)
+    {st : AnnealStepState} (hmach : st.machine = m.machine) :
+    annealDerefOperandToMemPlace body.localDecls body.layouts refIdx
+        (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)))
+        ptrLay st =
+      .ok (⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+            some (.concrete e.allocId borTag)⟩, .none, none⟩,
+        translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts) st := by
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨slot_t, _, _, _, hslot_t, _, _, _⟩ := hfr.lookup_local hdecl_a
+  have ht_ne_dead : slot_t ≠ .dead := fun hd => hlive_t (hslot_t.trans (congrArg some hd))
+  obtain ⟨_, _, hshape_fn⟩ := (halloc.local_alloc_sync tf hframes e he).1 slot_t hslot_t ht_ne_dead
+  obtain ⟨localAlloc, hfind_la, _, _, hshape_la⟩ := hshape_fn allocDecl hdecl_a
+  obtain ⟨hid_lt, _, hbase⟩ := halloc.base_addr_valid e he
+  obtain ⟨hsz, hpos, hfit, _, hpow, _⟩ := hpk.size_align_ok body.layouts
+  have hinbounds : 0 +
+      (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.size.bytes.toNat ≤
+      localAlloc.allocation.byteSize.bytes.toNat := by
+    rw [Nat.zero_add, hshape_la.byteSize_eq, hsize]
+    exact Nat.le_refl _
+  have h0_add : annealStackBaseAddr e.allocId + UInt64.ofNat 0 = annealStackBaseAddr e.allocId := by
+    simp
+  have haligned : annealOffsetMisalignment
+      (Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat 0))
+      (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts).layout.align.abi =
+      .ok none := by
+    rw [h0_add]
+    exact annealOffsetMisalignment_stackBase_eq_none e.allocId _ hpow
+  have hmptr_eq : mptr =
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat 0),
+        .concrete e.allocId borTag⟩ := by
+    rcases mptr with ⟨off, prov⟩
+    dsimp only at hprov_eq hmptr_off; subst hprov_eq hmptr_off; rw [hoff0]
+  have hck := annealSafeRefDerefCheck_live_ok (mach := m.machine) e.allocId borTag 0
+    (translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts) localAlloc
+    hid_lt (by decide) hbase hfind_la hsz (by exact_mod_cast hpos) hfit hinbounds haligned
+  rw [annealDerefOperandToMemPlace_safeRef_pointer_eq hdecl hty hpk mptr ptrLay st,
+    hmach, hmptr_eq, hck, h0_add]
+
 /-- **`step_safeRef_deref_read_invalid_scalar_divergence` (`LM-3.2` Safe-Reference Deref Read Invalid Scalar)**:
-from any `StateRelLM3_2` state, reading an invalid primitive scalar (e.g. `bool` out of bounds)
-through an immediate safe-reference local `_d = (copy|move) *_r` reports UB in `lean-miri`
-but steps in `stepMirFn`. -/
+from any `StateRelLM3_2` state where `_r : &(mut) T` (`T` primitive scalar, e.g.
+`bool` or `char`) points at offset `0` with non-disabled permission to a live
+stack local `e.localIdx` of equal byte size (e.g. `u8` holding `2` or `u32`
+holding `0xD800`) whose scalar `sc` violates `AnnealScalarValid dstDecl.ty sc`,
+executing `_d = (copy|move) *_r` into a live destination `dstIdx` diverges:
+1. Anneal's `stepMirFn` does not re-validate scalar bit-patterns on typed place
+   reads, stepping normally and storing `.init (.scalar sc)` in `dstIdx`;
+2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) rejects the
+   load in `annealReadMemoryPlace` (`annealValidateScalarForTyId = false`) with
+   `.error (.undefinedBehavior "reading invalid value")`. -/
 theorem step_safeRef_deref_read_invalid_scalar_divergence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : BasicBlockData} {dstIdx refIdx : Local}
-    {opKind : Place → Operand} {span : String}
-    (hopKind : opKind = Operand.copy ∨ opKind = Operand.move)
+    {opKind : Place → MirAst.Operand} {span : String}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩)
@@ -3495,91 +3565,117 @@ theorem step_safeRef_deref_read_invalid_scalar_divergence
     (hdecl_ref : get? body.localDecls refIdx = some refDecl)
     (href_ty : refDecl.ty.kind = .ref mutability dstDecl.ty.kind)
     (hdst_prim : IsPrimScalarTy dstDecl.ty)
-    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
-      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
-    (hlive_ref : ∀ ptrVal, get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
-      ∀ e ∈ allocMap, e.tag = ptrVal.tag →
-        get? body.localDecls e.localIdx = some allocDecl ∧
-        allocDecl.ty.kind = dstDecl.ty.kind ∧
-              (translateTy dstDecl.ty body.layouts).layout.size = (translateTy allocDecl.ty body.layouts).layout.size ∧
-        (∃ sc, get? s.frame.locals e.localIdx = some (.init (.scalar sc)) ∧
-        ¬ AnnealScalarValid dstDecl.ty sc) ∧
-        ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
-        get? s.frame.locals dstIdx ≠ some .dead) :
-    ∀ s', stepMirFn body s = MirStepNode.step s' →
-      ∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
-      (m', .error (.undefinedBehavior msg)) := by
-  intro s' hstep
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hslot_r : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (hperm : e.perm ≠ .disabled)
+    (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hsize : (translateTy dstDecl.ty body.layouts).layout.size =
+      (translateTy allocDecl.ty body.layouts).layout.size)
+    (hinvalid : ¬ AnnealScalarValid dstDecl.ty sc)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead) :
+    (∃ s', stepMirFn body s = .step s' ∧
+      get? s'.frame.locals dstIdx = some (.init (.scalar sc))) ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "reading invalid value")) := by
   obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, halloc, _⟩ := id hstate
-  have himm_r := (himm tf hframes).2
-  have himm_d := (himm tf hframes).1
-  obtain ⟨slot_r, mls_r, _, hlt_af_r, hs_slot_r, hmls_r_opt, hm_slot_r, hrel_r⟩ := hfr.lookup_local hdecl_ref
-  rcases hrel_r.ref_immediate_cases href_ty (himm_r mls_r hmls_r_opt) with
-    ⟨h, _⟩ | ⟨h, _⟩ | ⟨_, _, h, _⟩ | ⟨ptrVal, mptr, hp_eq, hptrRel, hmr_ptr⟩
-  · rcases h with ⟨rfl, _⟩; rw [stepMirFn_eq_of_not_other body s hcal hphase] at hstep; simp only [hbb, hstmt] at hstep; unfold evalStmt evalRvalue at hstep; rcases hopKind with rfl | rfl <;> (unfold evalOperand readProjectedValue at hstep; dsimp only [] at hstep; rw [hs_slot_r] at hstep; dsimp only [] at hstep; contradiction)
-  · rcases h with ⟨rfl, _⟩; rw [stepMirFn_eq_of_not_other body s hcal hphase] at hstep; simp only [hbb, hstmt] at hstep; unfold evalStmt evalRvalue at hstep; rcases hopKind with rfl | rfl <;> (unfold evalOperand readProjectedValue at hstep; dsimp only [] at hstep; rw [hs_slot_r] at hstep; dsimp only [] at hstep; contradiction)
-  · rcases h with ⟨sc, msc, rfl, _⟩; rw [stepMirFn_eq_of_not_other body s hcal hphase] at hstep; simp only [hbb, hstmt] at hstep; unfold evalStmt evalRvalue at hstep; rcases hopKind with rfl | rfl <;> (unfold evalOperand readProjectedValue at hstep; dsimp only [] at hstep; rw [hs_slot_r] at hstep; dsimp only [] at hstep; contradiction)
-  subst hp_eq
-  rcases hptrRel with ⟨allocId, borTag, hprov, hid, hoff, haddr, ⟨e_ptr, he_ptr, htag_ptr, hea⟩⟩
-  obtain ⟨hdecl_a, htarget_kind, hsize, ⟨sc, htarget, hvalid⟩, hzero, hperm, hdst_live⟩ := hlive_ref ptrVal hs_slot_r e_ptr he_ptr htag_ptr
-  have hmsg : ∃ m', Miri.Interpreter.Step.evalStatement
-      (annealStepHooks body.localDecls body.layouts) ()
-      (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩) m =
-      (m', .error (.undefinedBehavior "reading invalid value")) := by
-    obtain ⟨slot_d, mls_d, _, hlt_d, hslot_df, hmls_d, hmls_d_eq, hloc_d⟩ :=
-      hfr.lookup_local hdecl_dst
-    have hcache_d : ∀ l, tf.locals[dstIdx].layout = some l → l = translateTy dstDecl.ty body.layouts := by
-      intro l hl
-      rw [hmls_d_eq] at hl
-      exact hloc_d.cachedLayout_eq l hl
-    have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+  refine ⟨?_, ?_⟩
+  · have hlookup := (halloc.borrow_sync e he).2
+    rw [htag] at hlookup
+    obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
+    have hsd_ne : slot_d ≠ .dead := fun hd => hdst_live (hslot_d.trans (congrArg some hd))
+    have hread : evalOperand s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
+        s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals =
+        .ok (.scalar sc) s.frame.locals := by
+      rcases hopKind with rfl | rfl <;>
+      · unfold evalOperand readProjectedValue; dsimp only []
+        rw [hslot_r]; dsimp only []; rw [hlookup]; dsimp only []
+        cases hp : e.perm
+        · rw [htarget]
+        · rw [htarget]
+        · rw [htarget]
+        · exact absurd hp hperm
+    rw [stepMirFn_eq_of_not_other body s hcal hphase]
+    simp only [hbb, hstmt]
+    unfold evalStmt evalRvalue; dsimp only []; rw [hread]
+    have hset := set?_eq_some_set hlt_af_d (LocalSlot.init (.scalar sc))
+    have hget_set : get? (s.frame.locals.set dstIdx (.init (.scalar sc))) dstIdx =
+        some (.init (.scalar sc)) := by
+      rw [get?_eq_getElem?, List.getElem?_set_self hlt_af_d]
+    rcases hopKind with rfl | rfl <;>
+    · dsimp only []
+      cases s.memory.borrows with
+      | nil =>
+        simp only [hslot_d]
+        cases slot_d with
+        | dead => exact absurd rfl hsd_ne
+        | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+        | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+      | cons b₁ rest =>
+        cases rest with
+        | nil =>
+          simp only [hslot_d]
+          cases slot_d with
+          | dead => exact absurd rfl hsd_ne
+          | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+          | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+        | cons b₂ rest' =>
+          simp only [hslot_d]
+          cases slot_d with
+          | dead => exact absurd rfl hsd_ne
+          | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+          | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
+  · have himm_r := himm_ref tf hframes
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
       ⟨dstIdx, .nil⟩ (opKind ⟨refIdx, .cons .deref .nil⟩) span m
-    rw [hm_stmt]
-    rcases hopKind with rfl | rfl
-    · dsimp [translateRvalue, Miri.Interpreter.runRvalue, Miri.Interpreter.evalRvalueIntoPlace]
-      simp only [translatePlace, List.map_nil]
-      rw [EStateM.bind_eq_ok hdst_eval]
-      let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
-      have hframes_a : { stack := { frames := #[tfa] }, machine := m.machine : AnnealStepState }.stack.frames = #[tfa] := rfl
-      have hlt_r_a : refIdx < tfa.locals.size := by
-        dsimp [tfa, cacheFrameLocalLayout]
-        rw [Array.size_set]
-        exact hlt_af_r
-      have hmls_r_a : tfa.locals[refIdx]'hlt_r_a = tf.locals[refIdx]'hlt_af_r := by
-        have hdne : dstIdx ≠ refIdx := by
-          intro heq
-          have hdecl_eq : dstDecl = refDecl := by
-            subst heq
-            rw [hdecl_dst] at hdecl_ref
-            injection hdecl_ref
-          rw [hdecl_eq] at hdst_prim
-          rcases hdst_prim with h | h | ⟨w, h⟩ | ⟨w, h⟩
-          · rw [h] at href_ty; contradiction
-          · rw [h] at href_ty; contradiction
-          · rw [h] at href_ty; contradiction
-          · rw [h] at href_ty; contradiction
-        dsimp [tfa, cacheFrameLocalLayout]
-        have hne : dstIdx ≠ refIdx := hdne
-        exact Array.getElem_set_ne hlt_d hlt_af_r hne
-      have hm_slot_r_tfa : tfa.locals[refIdx]'hlt_r_a = ⟨mls_r.value, mls_r.layout⟩ := by
-        rw [hmls_r_a, hm_slot_r]
-      have hmls_r' : tfa.locals[refIdx]'hlt_r_a =
-          ⟨.live (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))), mls_r.layout⟩ := by
-        rw [hm_slot_r_tfa, hmr_ptr]
-      have hstate_a := hstate.cache_layout hframes hdecl_dst hlt_d
-      have hfra := hstate_a.frame_rel_singleton rfl
-      obtain ⟨_, mls_ra, _, _, _, _, hmls_ra_eq, hloc_ra⟩ := hfra.lookup_local hdecl_ref
-      have hcache_r : ∀ l, mls_r.layout = some l → l = translateTy refDecl.ty body.layouts := by
-        intro l hl
-        have hl' : mls_ra.layout = some l := by
-          rw [← hmls_ra_eq]
-          rw [hm_slot_r_tfa]
-          exact hl
-        exact hloc_ra.cachedLayout_eq l hl'
-      have hop_ptr := annealEvalOperand_deref_live (opKind := .copy) (by exact Or.inl rfl)
-        (known := some (translateTy dstDecl.ty body.layouts)) (m := { m with stack := ⟨#[tfa]⟩ })
-        rfl hlt_r_a hdecl_ref hmls_r' hcache_r
+    obtain ⟨_, mls_d, _, hlt_d, _, _, hmls_d_eq, hloc_d⟩ := hfr.lookup_local hdecl_dst
+    have hcache_d : ∀ l, (tf.locals[dstIdx]'hlt_d).layout = some l →
+        l = translateTy dstDecl.ty body.layouts := by
+      rw [hmls_d_eq]; exact hloc_d.cachedLayout_eq
+    have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+    let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
+    have hstate_a := hstate.cache_layout hframes hdecl_dst hlt_d
+    have hfra := hstate_a.frame_rel_singleton rfl
+    obtain ⟨slot_r, mls_r, _, hlt_ra, hslot_r', hmls_r, hmls_r_eq, hloc_r⟩ :=
+      hfra.lookup_local hdecl_ref
+    have hcache_r : ∀ l, mls_r.layout = some l → l = translateTy refDecl.ty body.layouts :=
+      hloc_r.cachedLayout_eq
+    have himm_ra : ∀ mp, mls_r.value ≠ .live (.indirect mp) :=
+      himm_r.cache_layout hlt_d _ mls_r hmls_r
+    have hsr_eq : slot_r = .init (.ptr ptrVal 8) :=
+      Option.some.inj (hslot_r'.symm.trans hslot_r)
+    rcases hloc_r.ref_immediate_cases href_ty himm_ra with
+      ⟨hs, _⟩ | ⟨hs, _⟩ | ⟨_, _, hs, _⟩ | ⟨ptrVal', mptr, hs, hptrRel, hmr_ptr⟩
+    · rw [hsr_eq] at hs; cases hs
+    · rw [hsr_eq] at hs; cases hs
+    · rw [hsr_eq] at hs; cases hs
+    · rw [hsr_eq] at hs; injection hs with hv; injection hv with hp_eq _; subst hp_eq
+      obtain ⟨_, borTag, hprov_eq, _, _, hmptr_off, ⟨e', he', htag', rfl⟩⟩ := hptrRel
+      have he_eq : e' = e :=
+        Option.some.inj ((lookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he' htag').symm.trans
+          (lookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he htag))
+      subst he_eq
+      have hmls_r' : tfa.locals[refIdx]'hlt_ra =
+          ⟨.live (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))),
+            mls_r.layout⟩ := by
+        rw [hmls_r_eq]; rcases mls_r with ⟨v0, l0⟩; dsimp only at hmr_ptr; subst hmr_ptr; rfl
+      let tfb := cacheFrameLocalLayout tfa refIdx hlt_ra (translateTy refDecl.ty body.layouts)
+      have hop_ptr : annealEvalOperand body.localDecls body.layouts
+          (translateOperand (opKind ⟨refIdx, .cons .deref .nil⟩))
+          (some (translateTy dstDecl.ty body.layouts)) { m with stack := ⟨#[tfa]⟩ } =
+          (annealDerefOperandToMemPlace body.localDecls body.layouts refIdx
+            (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)))
+            (translateTy refDecl.ty body.layouts) >>= fun (mp, lay) => pure ⟨.indirect mp, lay⟩)
+            { m with stack := ⟨#[tfb]⟩ } := by
+        rcases hopKind with rfl | rfl
+        · exact annealEvalOperand_deref_live (m := { m with stack := ⟨#[tfa]⟩ })
+            (Or.inl rfl) rfl hlt_ra hdecl_ref hmls_r' hcache_r
+        · exact annealEvalOperand_deref_live (m := { m with stack := ⟨#[tfa]⟩ })
+            (Or.inr rfl) rfl hlt_ra hdecl_ref hmls_r' hcache_r
       have hprim0 : IsPrimScalarTy { kind := dstDecl.ty.kind, layoutIdx := 0 } := by
         rcases hdst_prim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
         · exact Or.inl hk
@@ -3589,230 +3685,78 @@ theorem step_safeRef_deref_read_invalid_scalar_divergence
       have hlay0_eq : translateTy { kind := dstDecl.ty.kind, layoutIdx := 0 } body.layouts =
           translateTy dstDecl.ty body.layouts :=
         hdst_prim.translateTy_layoutIdx body.layouts
-      have ht_ne_some_dead : get? s.frame.locals e_ptr.localIdx ≠ some .dead := by
+      have ht_ne_some_dead : get? s.frame.locals e'.localIdx ≠ some .dead := by
         rw [htarget]; simp
-      have htgt_kind : ∀ tgtDecl, get? body.localDecls e_ptr.localIdx = some tgtDecl → tgtDecl.ty.kind = dstDecl.ty.kind := by
-        intro tgtDecl htgt_decl; rw [htgt_decl] at hdecl_a; injection hdecl_a with hdecl_eq; rw [hdecl_eq]; exact htarget_kind
-      have hprov_eq : mptr.provenance = .concrete e_ptr.allocId borTag := by
-        rw [← hea] at hprov; exact hprov
-      have hmptr_off : mptr.offset = Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId + UInt64.ofNat ptrVal.offsetBytes) := by
-        rw [← hea] at haddr; exact haddr
-      have hder_ok := annealDerefOperandToMemPlace_safeRef_ptr_live hstate_a hdecl_ref href_ty
-        hprim0 hprov_eq hmptr_off he_ptr hzero ht_ne_some_dead htgt_kind
-        (translateTy refDecl.ty body.layouts) (st := { stack := ⟨#[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)]⟩, machine := m.machine }) rfl
+      have hsize0 :
+          (translateTy { kind := dstDecl.ty.kind, layoutIdx := 0 } body.layouts).layout.size =
+            (translateTy allocDecl.ty body.layouts).layout.size := by
+        rw [hlay0_eq]; exact hsize
+      have hder_ok := annealDerefOperandToMemPlace_safeRef_ptr_same_size hstate_a hdecl_ref
+        href_ty hprim0 hprov_eq hmptr_off he' hoff0 hdecl_a ht_ne_some_dead hsize0
+        (translateTy refDecl.ty body.layouts) (st := { m with stack := ⟨#[tfb]⟩ }) rfl
       rw [hlay0_eq] at hder_ok
-      have hop_ok : annealEvalOperand body.localDecls body.layouts (translateOperand (Operand.copy ⟨refIdx, .cons .deref .nil⟩)) (some (translateTy dstDecl.ty body.layouts)) { stack := { frames := #[cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)] }, machine := m.machine } = .ok ⟨.indirect ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId), some (.concrete e_ptr.allocId borTag)⟩, .none, none⟩, translateTy dstDecl.ty body.layouts⟩ { stack := { frames := #[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)] }, machine := m.machine } := by
-        rw [hop_ptr, EStateM.bind_eq_ok hder_ok]
-        rfl
-      obtain ⟨tf_a, hframes_tf_a, _, _, _, _, _, _, _, _, halloc_a, _⟩ := id hstate_a
-      have hid_a := (halloc_a.base_addr_valid e_ptr he_ptr).1
-      have hbase_a' := (halloc_a.base_addr_valid e_ptr he_ptr).2.2
-      obtain ⟨hloc_sync, _⟩ := halloc_a.local_alloc_sync tfa rfl e_ptr he_ptr
-      obtain ⟨_, _, hfind_decl⟩ := hloc_sync (.init (.scalar sc)) htarget (by intro h; contradiction)
-      obtain ⟨localAlloc, hfind_la, hkind_la, halign_la, hshape_la⟩ := hfind_decl allocDecl hdecl_a
-      have hsz_eq : localAlloc.allocation.byteSize = (translateTy dstDecl.ty body.layouts).layout.size := by
-        rw [hshape_la.byteSize_eq]
-        exact hsize.symm
-      have halloc_prim : IsPrimScalarTy allocDecl.ty := by
-        rcases hdst_prim with h | h | ⟨w, h⟩ | ⟨w, h⟩
-        · exact Or.inl (by rw [htarget_kind, h])
-        · exact Or.inr (Or.inl (by rw [htarget_kind, h]))
-        · exact Or.inr (Or.inr (Or.inl ⟨w, by rw [htarget_kind, h]⟩))
-        · exact Or.inr (Or.inr (Or.inr ⟨w, by rw [htarget_kind, h]⟩))
-      have hlay_eq2 : translateTy allocDecl.ty body.layouts = translateTy dstDecl.ty body.layouts := by
-        have h1 : allocDecl.ty.kind = dstDecl.ty.kind := htarget_kind
-        revert hdst_prim h1
-        rcases allocDecl.ty with ⟨kind_a, lidx_a⟩
-        rcases dstDecl.ty with ⟨kind_d, lidx_d⟩
-        intro hdst_prim h1
-        change kind_a = kind_d at h1
-        subst h1
-        rcases hdst_prim with h|h|⟨w,h⟩|⟨w,h⟩ <;> subst h <;> (try cases w) <;> rfl
-
-
-
-
-      have hsz_eq2 : localAlloc.allocation.byteSize = (translateTy allocDecl.ty body.layouts).layout.size := by
-        rw [hsz_eq]
-        rw [hlay_eq2]
-      have hread_mem_eq := annealReadMemoryPlace_zero_offset_eq halloc_prim hid_a hbase_a' hfind_la hsz_eq2 (borTag := borTag) (st := { stack := ⟨#[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)]⟩, machine := m.machine })
-      obtain ⟨slot_t, mls_t, _, _, hs_slot_t, hmls_t_opt, _, hloc_t⟩ := hfra.lookup_local hdecl_a
-      have hslot_t_eq : slot_t = .init (.scalar sc) := by
-        have ht := htarget
-        rw [hs_slot_t] at ht
-        injection ht
-      have hloc_t_1 : LocalRelLM3_1 m.machine allocMap allocDecl body.layouts (.init (.scalar sc)) mls_t := by
-        subst hslot_t_eq
-        cases hloc_t
-        · case lm3_1 hloc_t_1 => exact hloc_t_1
-      obtain ⟨⟨lay_a, hlay_a⟩, _, hfind_decl⟩ := hloc_sync (.init (.scalar sc)) htarget (by intro h; contradiction)
-      have hmls_t_a : mls_t = ⟨.live (.indirect (stackAllocPlace e_ptr.allocId)), lay_a⟩ := by
-        have htmp := hmls_t_opt
-        rw [hlay_a] at htmp
-        injection htmp with htmp_eq
-        exact htmp_eq.symm
-      obtain ⟨localAlloc2, hfind_la2, hkind_la, halign_la, hshape_la⟩ := hfind_decl allocDecl hdecl_a
-      have hmm := LocalRelLM3_1.indirect_stackAllocPlace_spec hloc_t_1 hmls_t_a hbase_a' hfind_la (halloc_a.live_key_unique e_ptr he_ptr) (by
-        rw [← hsize]
-        exact hdst_prim.size_ne_zero)
+      have hop_ok : annealEvalOperand body.localDecls body.layouts
+          (translateOperand (opKind ⟨refIdx, .cons .deref .nil⟩))
+          (some (translateTy dstDecl.ty body.layouts)) { m with stack := ⟨#[tfa]⟩ } =
+          .ok ⟨.indirect ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e'.allocId),
+              some (.concrete e'.allocId borTag)⟩, .none, none⟩,
+            translateTy dstDecl.ty body.layouts⟩ { m with stack := ⟨#[tfb]⟩ } := by
+        rw [hop_ptr, EStateM.bind_eq_ok hder_ok]; rfl
+      obtain ⟨hid_a, _, hbase_a'⟩ := halloc.base_addr_valid e' he'
+      obtain ⟨hloc_sync, _⟩ := halloc.local_alloc_sync tf hframes e' he'
+      obtain ⟨⟨lay_a, hlay_a⟩, _, hfind_decl⟩ :=
+        hloc_sync (.init (.scalar sc)) htarget (by simp)
+      obtain ⟨localAlloc, hfind_la, _, _, hshape_la⟩ := hfind_decl allocDecl hdecl_a
+      have hsz_eq : localAlloc.allocation.byteSize =
+          (translateTy dstDecl.ty body.layouts).layout.size :=
+        hshape_la.byteSize_eq.trans hsize.symm
+      obtain ⟨slot_t, mls_t, _, _, hs_slot_t, hmls_t_opt, _, hloc_t⟩ :=
+        hfr.lookup_local hdecl_a
+      have hslot_t_eq : slot_t = .init (.scalar sc) :=
+        Option.some.inj (hs_slot_t.symm.trans htarget)
+      subst hslot_t_eq
+      rw [hlay_a] at hmls_t_opt
+      have hmls_t_eq : mls_t = ⟨.live (.indirect (stackAllocPlace e'.allocId)), lay_a⟩ :=
+        Option.some.inj hmls_t_opt.symm
+      have hloc_t_1 :
+          LocalRelLM3_1 m.machine allocMap allocDecl body.layouts (.init (.scalar sc)) mls_t := by
+        rw [hmls_t_eq] at hloc_t ⊢
+        exact hloc_t.indirect_base
+      have hmm := LocalRelLM3_1.indirect_stackAllocPlace_spec hloc_t_1 hmls_t_eq hbase_a'
+        hfind_la (halloc.live_key_unique e' he') (hsize ▸ hdst_prim.size_ne_zero)
       obtain ⟨hsz_msc, _, _, msc, hsc_rel, hread_msc⟩ := hmm.2 sc rfl
-      have hvalid_alloc : ¬ AnnealScalarValid allocDecl.ty sc := by
-        intro h
-        apply hvalid
-        dsimp only [AnnealScalarValid] at h ⊢
-        rw [← htarget_kind]
-        exact h
-      have hval_false := annealValidateScalarForTyId_false_of_not_scalarValid body.layouts hsc_rel hsz_msc hvalid_alloc
-      have hread_imm := annealReadImmediate_indirect_prim_eq₂ (ty := dstDecl.ty) (ly := body.layouts) hdst_prim ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId), some (.concrete e_ptr.allocId borTag)⟩, .none, none⟩
-      rw [EStateM.bind_eq_ok hop_ok]
-      have hcomb : annealReadImmediate ⟨.indirect ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId), some (.concrete e_ptr.allocId borTag)⟩, .none, none⟩, translateTy dstDecl.ty body.layouts⟩ { stack := { frames := #[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)] }, machine := m.machine } = .error (.undefinedBehavior "reading invalid value") { stack := { frames := #[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)] }, machine := m.machine } := by
-        rw [hread_imm]
-        rw [← hlay_eq2]
-        rw [hread_mem_eq]
-        rw [hread_msc]
+      have hread_msc' :
+          localAlloc.allocation.readScalar annealTargetDataLayout
+            (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+              (translateTy dstDecl.ty body.layouts).layout.size) false =
+            .ok (.fromScalarInt msc) := by
+        rw [hsize]; exact hread_msc
+      have hread_mem_eq := annealReadMemoryPlace_zero_offset_eq hdst_prim hid_a hbase_a'
+        hfind_la hsz_eq (borTag := borTag) (st := { m with stack := ⟨#[tfb]⟩ })
+      have hval_false := annealValidateScalarForTyId_false_of_not_scalarValid body.layouts
+        hsc_rel (hsize.trans hsz_msc) hinvalid
+      have hread_err : annealReadImmediate
+          ⟨.indirect ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e'.allocId),
+            some (.concrete e'.allocId borTag)⟩, .none, none⟩,
+            translateTy dstDecl.ty body.layouts⟩
+          { m with stack := ⟨#[tfb]⟩ } =
+          .error (.undefinedBehavior "reading invalid value") { m with stack := ⟨#[tfb]⟩ } := by
+        rw [annealReadImmediate_indirect_prim_eq₂ hdst_prim, hread_mem_eq, hread_msc']
         dsimp only []
         rw [hval_false]
         rfl
-      exact ⟨_, by rw [EStateM.bind_eq_error hcomb]⟩
-    · dsimp [translateRvalue, Miri.Interpreter.runRvalue, Miri.Interpreter.evalRvalueIntoPlace]
-      simp only [translatePlace, List.map_nil]
-      rw [EStateM.bind_eq_ok hdst_eval]
-      let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
-      have hframes_a : { stack := { frames := #[tfa] }, machine := m.machine : AnnealStepState }.stack.frames = #[tfa] := rfl
-      have hlt_r_a : refIdx < tfa.locals.size := by
-        dsimp [tfa, cacheFrameLocalLayout]
-        rw [Array.size_set]
-        exact hlt_af_r
-      have hmls_r_a : tfa.locals[refIdx]'hlt_r_a = tf.locals[refIdx]'hlt_af_r := by
-        have hdne : dstIdx ≠ refIdx := by
-          intro heq
-          have hdecl_eq : dstDecl = refDecl := by
-            subst heq
-            rw [hdecl_dst] at hdecl_ref
-            injection hdecl_ref
-          rw [hdecl_eq] at hdst_prim
-          rcases hdst_prim with h | h | ⟨w, h⟩ | ⟨w, h⟩
-          · rw [h] at href_ty; contradiction
-          · rw [h] at href_ty; contradiction
-          · rw [h] at href_ty; contradiction
-          · rw [h] at href_ty; contradiction
-        dsimp [tfa, cacheFrameLocalLayout]
-        have hne : dstIdx ≠ refIdx := hdne
-        exact Array.getElem_set_ne hlt_d hlt_af_r hne
-      have hm_slot_r_tfa : tfa.locals[refIdx]'hlt_r_a = ⟨mls_r.value, mls_r.layout⟩ := by
-        rw [hmls_r_a, hm_slot_r]
-      have hmls_r' : tfa.locals[refIdx]'hlt_r_a =
-          ⟨.live (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))), mls_r.layout⟩ := by
-        rw [hm_slot_r_tfa, hmr_ptr]
-      have hstate_a := hstate.cache_layout hframes hdecl_dst hlt_d
-      have hfra := hstate_a.frame_rel_singleton rfl
-      obtain ⟨_, mls_ra, _, _, _, _, hmls_ra_eq, hloc_ra⟩ := hfra.lookup_local hdecl_ref
-      have hcache_r : ∀ l, mls_r.layout = some l → l = translateTy refDecl.ty body.layouts := by
-        intro l hl
-        have hl' : mls_ra.layout = some l := by
-          rw [← hmls_ra_eq]
-          rw [hm_slot_r_tfa]
-          exact hl
-        exact hloc_ra.cachedLayout_eq l hl'
-      have hop_ptr := annealEvalOperand_deref_live (opKind := .move) (by exact Or.inr rfl)
-        (known := some (translateTy dstDecl.ty body.layouts)) (m := { m with stack := ⟨#[tfa]⟩ })
-        rfl hlt_r_a hdecl_ref hmls_r' hcache_r
-      have hprim0 : IsPrimScalarTy { kind := dstDecl.ty.kind, layoutIdx := 0 } := by
-        rcases hdst_prim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
-        · exact Or.inl hk
-        · exact Or.inr (Or.inl hk)
-        · exact Or.inr (Or.inr (Or.inl ⟨it, hk⟩))
-        · exact Or.inr (Or.inr (Or.inr ⟨ut, hk⟩))
-      have hlay0_eq : translateTy { kind := dstDecl.ty.kind, layoutIdx := 0 } body.layouts =
-          translateTy dstDecl.ty body.layouts :=
-        hdst_prim.translateTy_layoutIdx body.layouts
-      have ht_ne_some_dead : get? s.frame.locals e_ptr.localIdx ≠ some .dead := by
-        rw [htarget]; simp
-      have htgt_kind : ∀ tgtDecl, get? body.localDecls e_ptr.localIdx = some tgtDecl → tgtDecl.ty.kind = dstDecl.ty.kind := by
-        intro tgtDecl htgt_decl; rw [htgt_decl] at hdecl_a; injection hdecl_a with hdecl_eq; rw [hdecl_eq]; exact htarget_kind
-      have hprov_eq : mptr.provenance = .concrete e_ptr.allocId borTag := by
-        rw [← hea] at hprov; exact hprov
-      have hmptr_off : mptr.offset = Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId + UInt64.ofNat ptrVal.offsetBytes) := by
-        rw [← hea] at haddr; exact haddr
-      have hder_ok := annealDerefOperandToMemPlace_safeRef_ptr_live hstate_a hdecl_ref href_ty
-        hprim0 hprov_eq hmptr_off he_ptr hzero ht_ne_some_dead htgt_kind
-        (translateTy refDecl.ty body.layouts) (st := { stack := ⟨#[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)]⟩, machine := m.machine }) rfl
-      rw [hlay0_eq] at hder_ok
-      have hop_ok : annealEvalOperand body.localDecls body.layouts (translateOperand (Operand.move ⟨refIdx, .cons .deref .nil⟩)) (some (translateTy dstDecl.ty body.layouts)) { stack := { frames := #[cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)] }, machine := m.machine } = .ok ⟨.indirect ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId), some (.concrete e_ptr.allocId borTag)⟩, .none, none⟩, translateTy dstDecl.ty body.layouts⟩ { stack := { frames := #[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)] }, machine := m.machine } := by
-        rw [hop_ptr, EStateM.bind_eq_ok hder_ok]
-        rfl
-      obtain ⟨tf_a, hframes_tf_a, _, _, _, _, _, _, _, _, halloc_a, _⟩ := id hstate_a
-      have hid_a := (halloc_a.base_addr_valid e_ptr he_ptr).1
-      have hbase_a' := (halloc_a.base_addr_valid e_ptr he_ptr).2.2
-      obtain ⟨hloc_sync, _⟩ := halloc_a.local_alloc_sync tfa rfl e_ptr he_ptr
-      obtain ⟨_, _, hfind_decl⟩ := hloc_sync (.init (.scalar sc)) htarget (by intro h; contradiction)
-      obtain ⟨localAlloc, hfind_la, hkind_la, halign_la, hshape_la⟩ := hfind_decl allocDecl hdecl_a
-      have hsz_eq : localAlloc.allocation.byteSize = (translateTy dstDecl.ty body.layouts).layout.size := by
-        rw [hshape_la.byteSize_eq]
-        exact hsize.symm
-      have halloc_prim : IsPrimScalarTy allocDecl.ty := by
-        rcases hdst_prim with h | h | ⟨w, h⟩ | ⟨w, h⟩
-        · exact Or.inl (by rw [htarget_kind, h])
-        · exact Or.inr (Or.inl (by rw [htarget_kind, h]))
-        · exact Or.inr (Or.inr (Or.inl ⟨w, by rw [htarget_kind, h]⟩))
-        · exact Or.inr (Or.inr (Or.inr ⟨w, by rw [htarget_kind, h]⟩))
-      have hlay_eq2 : translateTy allocDecl.ty body.layouts = translateTy dstDecl.ty body.layouts := by
-        have h1 : allocDecl.ty.kind = dstDecl.ty.kind := htarget_kind
-        revert hdst_prim h1
-        rcases allocDecl.ty with ⟨kind_a, lidx_a⟩
-        rcases dstDecl.ty with ⟨kind_d, lidx_d⟩
-        intro hdst_prim h1
-        change kind_a = kind_d at h1
-        subst h1
-        rcases hdst_prim with h|h|⟨w,h⟩|⟨w,h⟩ <;> subst h <;> (try cases w) <;> rfl
-
-
-
-
-      have hsz_eq2 : localAlloc.allocation.byteSize = (translateTy allocDecl.ty body.layouts).layout.size := by
-        rw [hsz_eq]
-        rw [hlay_eq2]
-      have hread_mem_eq := annealReadMemoryPlace_zero_offset_eq halloc_prim hid_a hbase_a' hfind_la hsz_eq2 (borTag := borTag) (st := { stack := ⟨#[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)]⟩, machine := m.machine })
-      obtain ⟨slot_t, mls_t, _, _, hs_slot_t, hmls_t_opt, _, hloc_t⟩ := hfra.lookup_local hdecl_a
-      have hslot_t_eq : slot_t = .init (.scalar sc) := by
-        have ht := htarget
-        rw [hs_slot_t] at ht
-        injection ht
-      have hloc_t_1 : LocalRelLM3_1 m.machine allocMap allocDecl body.layouts (.init (.scalar sc)) mls_t := by
-        subst hslot_t_eq
-        cases hloc_t
-        · case lm3_1 hloc_t_1 => exact hloc_t_1
-      obtain ⟨⟨lay_a, hlay_a⟩, _, hfind_decl⟩ := hloc_sync (.init (.scalar sc)) htarget (by intro h; contradiction)
-      have hmls_t_a : mls_t = ⟨.live (.indirect (stackAllocPlace e_ptr.allocId)), lay_a⟩ := by
-        have htmp := hmls_t_opt
-        rw [hlay_a] at htmp
-        injection htmp with htmp_eq
-        exact htmp_eq.symm
-      obtain ⟨localAlloc2, hfind_la2, hkind_la, halign_la, hshape_la⟩ := hfind_decl allocDecl hdecl_a
-      have hmm := LocalRelLM3_1.indirect_stackAllocPlace_spec hloc_t_1 hmls_t_a hbase_a' hfind_la (halloc_a.live_key_unique e_ptr he_ptr) (by
-        rw [← hsize]
-        exact hdst_prim.size_ne_zero)
-      obtain ⟨hsz_msc, _, _, msc, hsc_rel, hread_msc⟩ := hmm.2 sc rfl
-      have hvalid_alloc : ¬ AnnealScalarValid allocDecl.ty sc := by
-        intro h
-        apply hvalid
-        dsimp only [AnnealScalarValid] at h ⊢
-        rw [← htarget_kind]
-        exact h
-      have hval_false := annealValidateScalarForTyId_false_of_not_scalarValid body.layouts hsc_rel hsz_msc hvalid_alloc
-      have hread_imm := annealReadImmediate_indirect_prim_eq₂ (ty := dstDecl.ty) (ly := body.layouts) hdst_prim ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId), some (.concrete e_ptr.allocId borTag)⟩, .none, none⟩
-      rw [EStateM.bind_eq_ok hop_ok]
-      have hcomb : annealReadImmediate ⟨.indirect ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e_ptr.allocId), some (.concrete e_ptr.allocId borTag)⟩, .none, none⟩, translateTy dstDecl.ty body.layouts⟩ { stack := { frames := #[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)] }, machine := m.machine } = .error (.undefinedBehavior "reading invalid value") { stack := { frames := #[cacheFrameLocalLayout tfa refIdx hlt_r_a (translateTy refDecl.ty body.layouts)] }, machine := m.machine } := by
-        rw [hread_imm]
-        rw [← hlay_eq2]
-        rw [hread_mem_eq]
-        rw [hread_msc]
-        dsimp only []
-        rw [hval_false]
-        rfl
-      exact ⟨_, by rw [EStateM.bind_eq_error hcomb]⟩
-  obtain ⟨m', hmsg_eq⟩ := hmsg
-  refine ⟨m', _, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hmsg_eq⟩
+      have hm_err : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt
+            ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩) m =
+          ({ m with stack := ⟨#[tfb]⟩ },
+            .error (.undefinedBehavior "reading invalid value")) := by
+        have htr_dst : translatePlace ⟨dstIdx, .nil⟩ = ⟨dstIdx, #[]⟩ := rfl
+        rw [hm_stmt, htr_dst]; unfold Miri.Interpreter.runRvalue
+        rw [EStateM.bind_eq_ok hdst_eval, EStateM.bind_eq_ok hop_ok,
+          EStateM.bind_eq_error hread_err]
+      exact ⟨_, miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb
+        hstmt hm_err⟩
 
 /-- **`step_safeRef_deref_read_simulation_explicit` (`LM-3.2` Safe-Reference Deref Read)**:
 from any `StateRelLM3_2` state, reading a primitive scalar through an immediate
@@ -8584,6 +8528,768 @@ theorem step_mir_lm3_2_state_simulation
   · exact ⟨allocMap,
       step_terminator_lm3_2_state_simulation hstate hphase hbb hstmt_none hstmt_len hwt_term⟩
 
+/-! ## 9. Multi-Step `StateRelLM3_2Tree` Hierarchy Simulations (`LM-3.2`) -/
+
+/-- Same `(tag, localIdx, allocId)` skeleton between two `AllocMapEntry` lists. -/
+inductive SameAllocSkeleton : List AllocMapEntry → List AllocMapEntry → Prop where
+  | nil : SameAllocSkeleton [] []
+  | cons {a b : AllocMapEntry} {am₁ am₂ : List AllocMapEntry}
+      (h : a.tag = b.tag ∧ a.localIdx = b.localIdx ∧ a.allocId = b.allocId)
+      (htl : SameAllocSkeleton am₁ am₂) :
+      SameAllocSkeleton (a :: am₁) (b :: am₂)
+
+private theorem SameAllocSkeleton.refl (am : List AllocMapEntry) : SameAllocSkeleton am am := by
+  induction am with
+  | nil => exact .nil
+  | cons hd tl ih => exact .cons ⟨rfl, rfl, rfl⟩ ih
+
+private theorem SameAllocSkeleton.symm {am₁ am₂ : List AllocMapEntry}
+    (h : SameAllocSkeleton am₁ am₂) : SameAllocSkeleton am₂ am₁ := by
+  induction h with
+  | nil => exact .nil
+  | cons hhd _ ih => exact .cons ⟨hhd.1.symm, hhd.2.1.symm, hhd.2.2.symm⟩ ih
+
+private theorem SameAllocSkeleton.mem_left {am₁ am₂ : List AllocMapEntry}
+    (h : SameAllocSkeleton am₁ am₂) {a : AllocMapEntry} (ha : a ∈ am₁) :
+    ∃ b ∈ am₂, a.tag = b.tag ∧ a.localIdx = b.localIdx ∧ a.allocId = b.allocId := by
+  induction h with
+  | nil => cases ha
+  | @cons x y xs ys hxy _ ih =>
+    rcases List.mem_cons.mp ha with rfl | hmem
+    · exact ⟨y, List.Mem.head _, hxy⟩
+    · obtain ⟨b, hb, hrel⟩ := ih hmem
+      exact ⟨b, List.mem_cons_of_mem y hb, hrel⟩
+
+private theorem SameAllocSkeleton.tags_eq {am₁ am₂ : List AllocMapEntry}
+    (h : SameAllocSkeleton am₁ am₂) :
+    am₁.map AllocMapEntry.tag = am₂.map AllocMapEntry.tag := by
+  induction h with
+  | nil => rfl
+  | cons hxy _ ih => simp only [List.map_cons, hxy.1, ih]
+
+private theorem SameAllocSkeleton.of_tree_maps
+    (treeMap : List ReborrowMapEntry)
+    (f : AllocMapEntry → AllocMapEntry)
+    (hf_tag : ∀ x, (f x).tag = x.tag)
+    (hf_loc : ∀ x, (f x).localIdx = x.localIdx)
+    (hf_aid : ∀ x, (f x).allocId = x.allocId)
+    (g : ReborrowMapEntry → ReborrowMapEntry)
+    (hg_tag : ∀ x, (g x).tag = x.tag)
+    (hg_loc : ∀ x, (g x).localIdx = x.localIdx)
+    (hg_aid : ∀ x, (g x).allocId = x.allocId) :
+    SameAllocSkeleton
+      ((treeMap.map ReborrowMapEntry.toAllocMapEntry).map f)
+      ((treeMap.map g).map ReborrowMapEntry.toAllocMapEntry) := by
+  induction treeMap with
+  | nil => exact .nil
+  | cons hd tl ih =>
+    simp only [List.map_cons]
+    refine .cons ⟨?_, ?_, ?_⟩ ih
+    · rw [hf_tag]; simp [ReborrowMapEntry.toAllocMapEntry, hg_tag]
+    · rw [hf_loc]; simp [ReborrowMapEntry.toAllocMapEntry, hg_loc]
+    · rw [hf_aid]; simp [ReborrowMapEntry.toAllocMapEntry, hg_aid]
+
+private theorem SameAllocSkeleton.of_map_right
+    (xs : List ReborrowMapEntry)
+    (g : ReborrowMapEntry → ReborrowMapEntry)
+    (hg_tag : ∀ x, (g x).tag = x.tag)
+    (hg_loc : ∀ x, (g x).localIdx = x.localIdx)
+    (hg_aid : ∀ x, (g x).allocId = x.allocId) :
+    SameAllocSkeleton
+      (xs.map ReborrowMapEntry.toAllocMapEntry)
+      ((xs.map g).map ReborrowMapEntry.toAllocMapEntry) := by
+  induction xs with
+  | nil => exact .nil
+  | cons hd tl ih =>
+    refine .cons ⟨?_, ?_, ?_⟩ ih
+    · dsimp only [ReborrowMapEntry.toAllocMapEntry]; exact (hg_tag hd).symm
+    · dsimp only [ReborrowMapEntry.toAllocMapEntry]; exact (hg_loc hd).symm
+    · dsimp only [ReborrowMapEntry.toAllocMapEntry]; exact (hg_aid hd).symm
+
+private theorem PtrRel.of_skeleton {am₁ am₂ : List AllocMapEntry}
+    (hskel : SameAllocSkeleton am₁ am₂) {p : ProvenancePtr}
+    {mptr : Miri.Memory.Pointer AnnealProv}
+    (h : PtrRel am₁ p mptr) : PtrRel am₂ p mptr := by
+  rcases h with ⟨allocId, borTag, hprov, hid, hoff, haddr, ⟨e₁, he₁, htag₁, haid₁⟩⟩
+  obtain ⟨e₂, he₂, htag_eq, _, haid_eq⟩ := hskel.mem_left he₁
+  exact .mk allocId borTag hprov hid hoff haddr
+    ⟨e₂, he₂, htag_eq.symm.trans htag₁, haid_eq.symm.trans haid₁⟩
+
+private theorem LocalRelLM3_2.of_skeleton {mach : AnnealMachine}
+    {am₁ am₂ : List AllocMapEntry} (hskel : SameAllocSkeleton am₁ am₂)
+    {decl : LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_2 mach am₁ decl layouts slot mls) :
+    LocalRelLM3_2 mach am₂ decl layouts slot mls := by
+  cases h with
+  | lm3_1 h1 =>
+    cases h1 with
+    | base hb => exact .lm3_1 (.base hb)
+    | rawPtr p mptr cl mutability pk hc hty hptr =>
+      exact .lm3_1 (.rawPtr p mptr cl mutability pk hc hty (hptr.of_skeleton hskel))
+  | ref p mptr cl mutability pk hc hty hptr =>
+    exact .ref p mptr cl mutability pk hc hty (hptr.of_skeleton hskel)
+
+/-- Replacing `am₁` with `am₂` of the same `(tag, localIdx, allocId)` skeleton
+and updating `s.memory.borrows := am₂.map AllocMapEntry.toBorrowEntry` preserves
+`StateRelLM3_2`. -/
+theorem StateRelLM3_2.replace_borrows_skeleton
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {am₁ am₂ : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m am₁)
+    (hskel : SameAllocSkeleton am₁ am₂) :
+    StateRelLM3_2 body
+      { s with memory := { s.memory with borrows := am₂.map AllocMapEntry.toBorrowEntry } }
+      m am₂ := by
+  rcases hstate with
+    ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, _, halloc, hdisj⟩
+  have hnodup₂ : (am₂.map AllocMapEntry.tag).Nodup := by
+    rw [← hskel.tags_eq]; exact halloc.tags_nodup
+  have hfr₂ : FrameRelLM3_2 body m.machine am₂ s.frame tf :=
+    ⟨hfr.body_eq, hfr.location_eq, hfr.af_locals_len, hfr.mf_locals_size,
+      fun i decl slot mls hd hs hm =>
+        (hfr.locals_rel i decl slot mls hd hs hm).of_skeleton hskel⟩
+  refine .mk tf hframes hretCont hretPlace hfr₂ hcal hstack hprot hcaller rfl ?_ hdisj
+  refine ⟨hnodup₂, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro b₁ hb₁ b₂ hb₂ hloc
+    obtain ⟨a₁, ha₁, _, hl₁, hid₁⟩ := hskel.symm.mem_left hb₁
+    obtain ⟨a₂, ha₂, _, hl₂, hid₂⟩ := hskel.symm.mem_left hb₂
+    rw [hid₁, hid₂]
+    exact halloc.local_to_alloc_unique a₁ ha₁ a₂ ha₂ (hl₁.symm.trans (hloc.trans hl₂))
+  · intro b₁ hb₁ b₂ hb₂ hid
+    obtain ⟨a₁, ha₁, _, hl₁, hid₁⟩ := hskel.symm.mem_left hb₁
+    obtain ⟨a₂, ha₂, _, hl₂, hid₂⟩ := hskel.symm.mem_left hb₂
+    rw [hl₁, hl₂]
+    exact halloc.alloc_to_local_injective a₁ ha₁ a₂ ha₂ (hid₁.symm.trans (hid.trans hid₂))
+  · intro b hb
+    obtain ⟨a, ha, _, hl, _⟩ := hskel.symm.mem_left hb
+    rw [hl]; exact halloc.target_decl a ha
+  · intro b hb
+    obtain ⟨a, ha, _, _, hid⟩ := hskel.symm.mem_left hb
+    rw [hid]; exact halloc.base_addr_valid a ha
+  · intro b hb
+    obtain ⟨a, ha, ht, _, _⟩ := hskel.symm.mem_left hb
+    refine ⟨?_, ?_⟩
+    · dsimp only []; rw [ht]; exact (halloc.borrow_sync a ha).1
+    · dsimp only []; exact lookupBorrow_map_toBorrowEntry_of_nodup hnodup₂ hb
+  · intro b hb
+    obtain ⟨a, ha, _, _, hid⟩ := hskel.symm.mem_left hb
+    rw [hid]; exact halloc.live_key_unique a ha
+  · intro tf' htf' b hb
+    obtain ⟨a, ha, _, hl, hid⟩ := hskel.symm.mem_left hb
+    dsimp only []; rw [hl, hid]
+    exact halloc.local_alloc_sync tf' htf' a ha
+
+/-- Build `StateRelLM3_2Tree` directly from a parent-erased `StateRelLM3_2` state
+`s_e` whose borrow skeleton matches `treeMap'`. -/
+theorem StateRelLM3_2Tree.of_erased_skeleton
+    {body : CapturedMir} {s_e : MachineState} {m : AnnealStepState}
+    {am₁ : List AllocMapEntry} {treeMap' : List ReborrowMapEntry}
+    (hrel : StateRelLM3_2 body s_e m am₁)
+    (hskel : SameAllocSkeleton am₁ (treeMap'.map ReborrowMapEntry.toAllocMapEntry)) :
+    StateRelLM3_2Tree body
+      { s_e with memory := { s_e.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry } }
+      m treeMap' :=
+  ⟨hrel.replace_borrows_skeleton hskel, rfl⟩
+
+theorem lookupAllocMapByTag_map_toAllocMapEntry
+    (treeMap : List ReborrowMapEntry) (tag : Nat) :
+    lookupAllocMapByTag (treeMap.map ReborrowMapEntry.toAllocMapEntry) tag =
+      (lookupTreeMapByTag treeMap tag).map ReborrowMapEntry.toAllocMapEntry := by
+  induction treeMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, lookupAllocMapByTag, lookupTreeMapByTag,
+      ReborrowMapEntry.toAllocMapEntry]
+    cases Nat.beq hd.tag tag
+    · exact ih
+    · rfl
+
+private theorem evalOperand_treeMap_eq
+    (locals : List LocalSlot) (op : MirAst.Operand)
+    (treeMap : List ReborrowMapEntry)
+    (globals : List CapturedAllocation) (layouts : LayoutTable)
+    (callerLocals : List LocalSlot) :
+    evalOperand locals op (treeMap.map ReborrowMapEntry.toBorrowEntry)
+        globals layouts callerLocals =
+      evalOperand locals op
+        ((treeMap.map ReborrowMapEntry.toAllocMapEntry).map AllocMapEntry.toBorrowEntry)
+        globals layouts callerLocals := by
+  cases op with
+  | constant _ => rfl
+  | copy p =>
+    cases hp : p.projection with
+    | nil => simp [evalOperand, hp]
+    | cons hd tl =>
+      cases hd <;> simp only [evalOperand, hp]
+      cases get? locals p.local_ with
+      | none => rfl
+      | some slot =>
+        cases slot with
+        | dead => rfl
+        | uninit => rfl
+        | init v =>
+          cases v with
+          | unit => rfl
+          | scalar _ => rfl
+          | aggregate _ _ => rfl
+          | ptr ptrVal sz =>
+            dsimp only []
+            rw [lookupBorrow_map_toBorrowEntry_treeMap, lookupBorrow_erased_treeMap]
+            cases lookupTreeMapByTag treeMap ptrVal.tag <;> rfl
+  | move p =>
+    cases hp : p.projection with
+    | nil => simp [evalOperand, hp]
+    | cons hd tl =>
+      cases hd <;> simp only [evalOperand, hp]
+      cases get? locals p.local_ with
+      | none => rfl
+      | some slot =>
+        cases slot with
+        | dead => rfl
+        | uninit => rfl
+        | init v =>
+          cases v with
+          | unit => rfl
+          | scalar _ => rfl
+          | aggregate _ _ => rfl
+          | ptr ptrVal sz =>
+            dsimp only []
+            rw [lookupBorrow_map_toBorrowEntry_treeMap, lookupBorrow_erased_treeMap]
+            cases lookupTreeMapByTag treeMap ptrVal.tag <;> rfl
+
+private theorem writePlaceValue_treeMap_eq
+    (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (dst : Place) (val : Value) :
+    writePlaceValue locals (treeMap.map ReborrowMapEntry.toBorrowEntry) dst val =
+      writePlaceValue locals
+        ((treeMap.map ReborrowMapEntry.toAllocMapEntry).map AllocMapEntry.toBorrowEntry)
+        dst val := by
+  cases hp : dst.projection with
+  | nil => simp [writePlaceValue, hp]
+  | cons hd tl =>
+    cases hd <;> simp only [writePlaceValue, hp]
+    cases get? locals dst.local_ with
+    | none => rfl
+    | some slot =>
+      cases slot with
+      | dead => rfl
+      | uninit => rfl
+      | init v =>
+        cases v with
+        | unit => rfl
+        | scalar _ => rfl
+        | aggregate _ _ => rfl
+        | ptr ptrVal sz =>
+          dsimp only []
+          rw [lookupBorrow_map_toBorrowEntry_treeMap, lookupBorrow_erased_treeMap]
+          cases lookupTreeMapByTag treeMap ptrVal.tag <;> rfl
+
+private theorem invalidateConflictingBorrows_treeMap_eq_of_not_mem
+    (treeMap : List ReborrowMapEntry) (targetLocal : Local)
+    (hnot : ∀ e ∈ treeMap, e.localIdx ≠ targetLocal) :
+    invalidateConflictingBorrows (treeMap.map ReborrowMapEntry.toBorrowEntry)
+        targetLocal none =
+      treeMap.map ReborrowMapEntry.toBorrowEntry := by
+  induction treeMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    have hne : Nat.beq hd.localIdx targetLocal = false := by
+      cases h : Nat.beq hd.localIdx targetLocal
+      · rfl
+      · exact absurd (Nat.eq_of_beq_eq_true h) (hnot hd (List.Mem.head tl))
+    simp only [List.map_cons, invalidateConflictingBorrows, updateBorrowPerm,
+      ReborrowMapEntry.toBorrowEntry, hne,
+      ih (fun e he => hnot e (List.mem_cons_of_mem hd he))]
+
+private theorem freezeDerefRead_treeMap_eq
+    (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (hnodup : (treeMap.map ReborrowMapEntry.tag).Nodup)
+    (ptrIdx : Local) (ptrVal : ProvenancePtr)
+    {e : ReborrowMapEntry} (he : e ∈ treeMap) (htag : e.tag = ptrVal.tag)
+    (hget : get? locals ptrIdx = some (.init (.ptr ptrVal 8))) :
+    (match treeMap.map ReborrowMapEntry.toBorrowEntry with
+     | b₁ :: b₂ :: restBorrows =>
+       freezeDerefReadBorrowsAt locals ptrIdx .nil (b₁ :: b₂ :: restBorrows)
+     | other => other) =
+      (derefReadNextTreeMap locals treeMap ptrIdx).map ReborrowMapEntry.toBorrowEntry := by
+  have hlook_tm := lookupTreeMapByTag_of_mem_nodup hnodup he htag
+  have hlook_bor :
+      lookupBorrow (treeMap.map ReborrowMapEntry.toBorrowEntry) ptrVal.tag =
+        some e.toBorrowEntry := by
+    rw [lookupBorrow_map_toBorrowEntry_treeMap, hlook_tm]; rfl
+  have hdr :
+      derefReadNextTreeMap locals treeMap ptrIdx =
+        treeMap.map (derefReadMapFnTree treeMap e.localIdx ptrVal.tag) := by
+    simp [derefReadNextTreeMap, hget, hlook_tm]
+  rw [hdr]
+  cases treeMap with
+  | nil => cases he
+  | cons x₁ rest =>
+    cases rest with
+    | nil =>
+      simp [derefReadMapFnTree]
+    | cons x₂ rest₂ =>
+      simp only [List.map_cons] at hlook_bor ⊢
+      unfold freezeDerefReadBorrowsAt
+      rw [hget]; dsimp only []
+      rw [hlook_bor]; dsimp only []
+      have hproj : appendProjections e.toBorrowEntry.targetProjection .nil = .nil := rfl
+      have hro : e.toBorrowEntry.rangeOffset = 0 := rfl
+      have hrl : e.toBorrowEntry.rangeLen = 0 := rfl
+      have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
+      rw [hproj, hro, hrl, htl]
+      have hfrz := freezeTreeBorrowsOnReadAtProj_map_toBorrowEntry_tree
+        ((x₁ :: x₂ :: rest₂).map ReborrowMapEntry.toBorrowEntry)
+        (x₁ :: x₂ :: rest₂) e.localIdx ptrVal.tag
+      dsimp only [List.map_cons, derefReadMapFnTree] at hfrz ⊢
+      exact hfrz
+
+/-- **`step_reborrow_safeRef_tree_simulation_explicit` (`LM-3.2` Tree Borrows Reborrow)**:
+computable `StepRelLM3_2Tree` step simulation for reborrowing `_d = &bk (*_r)`
+with post-step borrow hierarchy `reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx s.memory.nextTag`
+recording `parentTag = some ptrVal.tag` on the newly minted child tag `nextTag`. -/
+theorem step_reborrow_safeRef_tree_simulation_explicit
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {dstDecl refDecl : LocalDecl}
+    {bk : BorrowKind} {refMut dstMut : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
+    {pointeeKind dstPointee : RigidTy}
+    {span : String}
+    (hbb : Trusted.Sequence.get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : Trusted.Sequence.get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨refIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : Trusted.Sequence.get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : Trusted.Sequence.get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref refMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
+    (hlive_zero_perm : ∀ ptrVal e,
+      Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead ∧
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
+      (∀ tgtDecl, Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
+        tgtDecl.ty.kind = pointeeKind)) :
+    StepRelLM3_2Tree body m
+      (reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx
+        s.memory.nextTag)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  let s_e := eraseBorrowParents s treeMap
+  let am := treeMap.map ReborrowMapEntry.toAllocMapEntry
+  let treeMap' :=
+    reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx
+      s.memory.nextTag
+  have hstate_e : StateRelLM3_2 body s_e m am := htree.erased_rel
+  have hbor_s : s.memory.borrows = treeMap.map ReborrowMapEntry.toBorrowEntry := htree.borrows_eq
+  obtain ⟨tf, hframes, hretCont, hretPlace, hfr, hcal_e, hstack_e, hprot_e, hcaller_e,
+    hbor_e, halloc_e, hdisj⟩ := id hstate_e
+  have hcal : s.memory.activeCallee = none := hcal_e
+  have hstack : s.memory.callStack = .nil := hstack_e
+  have hprot : s.memory.activeProtectors = .nil := hprot_e
+  have hcaller : s.memory.callerLocals = .nil := hcaller_e
+  have hnodup_tm : (treeMap.map ReborrowMapEntry.tag).Nodup := by
+    have htags : am.map AllocMapEntry.tag = treeMap.map ReborrowMapEntry.tag := by
+      dsimp only [am]; rw [List.map_map]; rfl
+    rw [← htags]; exact halloc_e.tags_nodup
+  have hflat_ub := (evalRvalue_reborrow_safeRef_simulation hstate_e hphase hbb hstmt
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm (by
+      intro ptrVal e' hget he' htag'
+      obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+      exact hlive_zero_perm ptrVal e hget he htag')).1
+  obtain ⟨himm_d, himm_r⟩ := himm tf hframes
+  obtain ⟨slot_d, mls_d, hlt_af_d, hlt_d, hslot_d, hmls_d, hmls_d_eq, hloc_d⟩ :=
+    hfr.lookup_local hdecl_dst
+  have hcache_d : ∀ l, (tf.locals[dstIdx]'hlt_d).layout = some l →
+      l = translateTy dstDecl.ty body.layouts := by
+    rw [hmls_d_eq]; exact hloc_d.cachedLayout_eq
+  have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+  let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
+  have hstate_a := hstate_e.cache_layout hframes hdecl_dst hlt_d
+  have hfra := hstate_a.frame_rel_singleton rfl
+  obtain ⟨slot_r, mls_r, _, hlt_ra, hslot_ra, hmls_ra, hmls_ra_eq, hloc_r⟩ :=
+    hfra.lookup_local hdecl_ref
+  have hcache_r : ∀ l, mls_r.layout = some l → l = translateTy refDecl.ty body.layouts :=
+    hloc_r.cachedLayout_eq
+  have himm_ra : ∀ mp, mls_r.value ≠ .live (.indirect mp) :=
+    himm_r.cache_layout hlt_d _ mls_r hmls_ra
+  have hslot_d_s : get? s.frame.locals dstIdx = some slot_d := hslot_d
+  have hslot_ra_s : get? s.frame.locals refIdx = some slot_r := hslot_ra
+  rcases hloc_r.ref_immediate_cases href_ty himm_ra with
+    ⟨hsr_dead, _⟩ | ⟨hsr_un, _⟩ | ⟨sc_r, _, hsr_sc, _⟩ |
+    ⟨ptrVal, mptr, hsr_ptr, hptrRel, hmr_ptr⟩
+  · have ha_s : stepMirFn body s = MirStepNode.fail .ub := by
+      rw [stepMirFn_eq_of_not_other body s hcal hphase]
+      simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []
+      rw [hslot_ra_s, hsr_dead]
+    have ha_e : stepMirFn body s_e = MirStepNode.fail .ub := by
+      rw [stepMirFn_eq_of_not_other body s_e hcal_e hphase]
+      dsimp only [s_e, eraseBorrowParents]
+      simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []
+      rw [hslot_ra_s, hsr_dead]
+    obtain ⟨m', msg, hm_err⟩ := hflat_ub.mp ha_e
+    rw [ha_s, hm_err]; exact .ub _ _ _
+  · have ha_s : stepMirFn body s = MirStepNode.fail .ub := by
+      rw [stepMirFn_eq_of_not_other body s hcal hphase]
+      simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []
+      rw [hslot_ra_s, hsr_un]
+    have ha_e : stepMirFn body s_e = MirStepNode.fail .ub := by
+      rw [stepMirFn_eq_of_not_other body s_e hcal_e hphase]
+      dsimp only [s_e, eraseBorrowParents]
+      simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []
+      rw [hslot_ra_s, hsr_un]
+    obtain ⟨m', msg, hm_err⟩ := hflat_ub.mp ha_e
+    rw [ha_s, hm_err]; exact .ub _ _ _
+  · have ha_s : stepMirFn body s = MirStepNode.fail .ub := by
+      rw [stepMirFn_eq_of_not_other body s hcal hphase]
+      simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []
+      rw [hslot_ra_s, hsr_sc]
+    have ha_e : stepMirFn body s_e = MirStepNode.fail .ub := by
+      rw [stepMirFn_eq_of_not_other body s_e hcal_e hphase]
+      dsimp only [s_e, eraseBorrowParents]
+      simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []
+      rw [hslot_ra_s, hsr_sc]
+    obtain ⟨m', msg, hm_err⟩ := hflat_ub.mp ha_e
+    rw [ha_s, hm_err]; exact .ub _ _ _
+  · have hsr_full : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) :=
+      hslot_ra_s.trans (congrArg some hsr_ptr)
+    have hsr_full_e : get? s_e.frame.locals refIdx = some (.init (.ptr ptrVal 8)) := hsr_full
+    obtain ⟨_, borTag, hprov_eq, hid_lt, _, hmptr_off, ⟨e_am, he_am, htag_am, rfl⟩⟩ := id hptrRel
+    obtain ⟨e, he, he_to⟩ := List.mem_map.mp he_am
+    subst he_to
+    have htag : e.tag = ptrVal.tag := htag_am
+    obtain ⟨hlive_t, hoff0, hne_dis, hnot_fmut, htgt_kind⟩ :=
+      hlive_zero_perm ptrVal e hsr_full he htag
+    have hlook_tm := lookupTreeMapByTag_of_mem_nodup hnodup_tm he htag
+    have hlook_s : lookupBorrow s.memory.borrows ptrVal.tag = some e.toBorrowEntry := by
+      rw [hbor_s, lookupBorrow_map_toBorrowEntry_treeMap, hlook_tm]; rfl
+    have hlook_e : lookupBorrow s_e.memory.borrows ptrVal.tag =
+        some e.toAllocMapEntry.toBorrowEntry := by
+      rw [hbor_e, lookupBorrow_erased_treeMap, hlook_tm]; rfl
+    have htm'_eq :
+        treeMap' =
+          { tag := s.memory.nextTag
+            localIdx := e.localIdx
+            allocId := e.allocId
+            perm := reborrowPermOf body.localDecls body.layouts bk refIdx
+            parentTag := some ptrVal.tag } ::
+            treeMap.map
+              (ReborrowMapEntry.updateOnRead (treeMap.map ReborrowMapEntry.toBorrowEntry)
+                e.localIdx ptrVal.tag) := by
+      dsimp only [treeMap']; simp [reborrowTreeMapNext, hsr_full, hlook_tm]
+    have hrv_s :
+        evalRvalue s.frame.locals (.ref bk ⟨refIdx, .cons .deref .nil⟩)
+          s.memory body.localDecls body.layouts =
+          .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8) s.frame.locals
+            { s.memory with
+              borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry
+              nextTag := s.memory.nextTag + 1 } := by
+      have hfrz := freezeTreeBorrowsOnReadAtProj_map_toBorrowEntry_tree
+        (treeMap.map ReborrowMapEntry.toBorrowEntry) treeMap e.localIdx ptrVal.tag
+      unfold evalRvalue; dsimp only []
+      rw [hsr_full]; dsimp only []
+      rw [hlook_s]; dsimp only [ReborrowMapEntry.toBorrowEntry]
+      rw [hbor_s, htm'_eq]; dsimp only [List.map_cons, ReborrowMapEntry.toBorrowEntry, reborrowPermOf]
+      cases hp : e.perm <;> rcases hm : bk with _ | ⟨_ | _⟩
+      · rw [hfrz]; rfl
+      · rw [hfrz]; rfl
+      · rw [hfrz]; rfl
+      · rw [hfrz]; rfl
+      · rw [hfrz]; rfl
+      · rw [hfrz]; rfl
+      · rw [hfrz]; rfl
+      · exact absurd ⟨hp, by rw [hm]; exact fun h => BorrowKind.noConfusion h⟩ hnot_fmut
+      · exact absurd ⟨hp, by rw [hm]; exact fun h => BorrowKind.noConfusion h⟩ hnot_fmut
+      · exact absurd hp hne_dis
+      · exact absurd hp hne_dis
+      · exact absurd hp hne_dis
+    by_cases hsd_dead : slot_d = .dead
+    · have ha_s : stepMirFn body s = MirStepNode.fail .ub := by
+        rw [stepMirFn_eq_of_not_other body s hcal hphase]
+        simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
+        rw [hrv_s]; dsimp only []
+        rw [hslot_d_s, hsd_dead]
+      have hrv_e :
+          ∃ mem₁, evalRvalue s_e.frame.locals (.ref bk ⟨refIdx, .cons .deref .nil⟩)
+            s_e.memory body.localDecls body.layouts =
+            .ok (.ptr { allocId := s_e.memory.nextTag, offsetBytes := 0 } 8) s_e.frame.locals mem₁ := by
+        unfold evalRvalue; dsimp only []
+        rw [hsr_full_e]; dsimp only []; rw [hlook_e]
+        dsimp only [ReborrowMapEntry.toAllocMapEntry, AllocMapEntry.toBorrowEntry]
+        cases hp : e.perm <;> rcases hm : bk with _ | ⟨_ | _⟩
+        · exact ⟨_, rfl⟩
+        · exact ⟨_, rfl⟩
+        · exact ⟨_, rfl⟩
+        · exact ⟨_, rfl⟩
+        · exact ⟨_, rfl⟩
+        · exact ⟨_, rfl⟩
+        · exact ⟨_, rfl⟩
+        · exact absurd ⟨hp, by rw [hm]; exact fun h => BorrowKind.noConfusion h⟩ hnot_fmut
+        · exact absurd ⟨hp, by rw [hm]; exact fun h => BorrowKind.noConfusion h⟩ hnot_fmut
+        · exact absurd hp hne_dis
+        · exact absurd hp hne_dis
+        · exact absurd hp hne_dis
+      obtain ⟨mem₁, hrv_e_eq⟩ := hrv_e
+      have ha_e : stepMirFn body s_e = MirStepNode.fail .ub := by
+        rw [stepMirFn_eq_of_not_other body s_e hcal_e hphase]
+        dsimp only [s_e, eraseBorrowParents] at hrv_e_eq ⊢
+        simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
+        rw [hrv_e_eq]; dsimp only []; rw [hslot_d_s, hsd_dead]
+      obtain ⟨m', msg, hm_err⟩ := hflat_ub.mp ha_e
+      rw [ha_s, hm_err]; exact .ub _ _ _
+    · -- Live immediate `dstIdx`: both machines step cleanly!
+      have hnot_dst_am : ∀ x ∈ am, x.localIdx ≠ dstIdx :=
+        hstate_e.immediate_not_in_allocMap hframes hslot_d hsd_dead himm_d
+      have hnot_dst_tm : ∀ x ∈ treeMap, x.localIdx ≠ dstIdx :=
+        fun x hx => hnot_dst_am x.toAllocMapEntry (List.mem_map_of_mem hx)
+      have hnot_dst_tm' : ∀ x ∈ treeMap', x.localIdx ≠ dstIdx := by
+        rw [htm'_eq]
+        intro x hx
+        rcases List.mem_cons.mp hx with rfl | hmem
+        · exact hnot_dst_tm e he
+        · obtain ⟨y, hy, rfl⟩ := List.mem_map.mp hmem
+          rw [ReborrowMapEntry.updateOnRead_localIdx]
+          exact hnot_dst_tm y hy
+      have hinv_tm' := invalidateConflictingBorrows_treeMap_eq_of_not_mem treeMap' dstIdx hnot_dst_tm'
+      have hlt_af_d_s : dstIdx < s.frame.locals.length := hlt_af_d
+      have ha_s :
+          stepMirFn body s =
+            MirStepNode.step
+              (advanceStmt s
+                (s.frame.locals.set dstIdx
+                  (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8)))
+                { s.memory with
+                  borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry
+                  nextTag := s.memory.nextTag + 1 }) := by
+        rw [stepMirFn_eq_of_not_other body s hcal hphase]
+        simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
+        rw [hrv_s]; dsimp only []
+        rw [hslot_d_s]
+        cases slot_d with
+        | dead => exact absurd rfl hsd_dead
+        | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_tm']
+        | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_tm']
+      have hmls_ra' : tfa.locals[refIdx]'hlt_ra =
+          ⟨.live (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))),
+            mls_r.layout⟩ := by
+        rw [hmls_ra_eq]; rcases mls_r with ⟨v0, l0⟩; dsimp only at hmr_ptr; subst hmr_ptr; rfl
+      let tfb := cacheFrameLocalLayout tfa refIdx hlt_ra (translateTy refDecl.ty body.layouts)
+      have hsrc_live := annealEvalPlace_deref_live (m := { m with stack := ⟨#[tfa]⟩ })
+        rfl hlt_ra hdecl_ref hmls_ra' hcache_r
+      have hder_ptr := annealDerefOperandToMemPlace_safeRef_ptr_live hstate_e hdecl_ref href_ty
+        hpk_prim hprov_eq hmptr_off he_am hoff0 hlive_t htgt_kind
+        (translateTy refDecl.ty body.layouts) (st := { m with stack := ⟨#[tfb]⟩ }) rfl
+      dsimp only [ReborrowMapEntry.toAllocMapEntry] at hder_ptr hid_lt hmptr_off hprov_eq
+      have hsrc_eval : annealEvalPlace body.localDecls body.layouts
+          (translatePlace ⟨refIdx, .cons .deref .nil⟩) { m with stack := ⟨#[tfa]⟩ } =
+          .ok ⟨.memory ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+                some (.concrete e.allocId borTag)⟩, .none, none⟩,
+              translateTy { kind := pointeeKind, layoutIdx := 0 } body.layouts⟩
+            { m with stack := ⟨#[tfb]⟩ } := by
+        rw [hsrc_live, EStateM.bind_eq_ok hder_ptr]; rfl
+      have hmptr_eq : mptr =
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId), .concrete e.allocId borTag⟩ := by
+        rcases mptr with ⟨off, prov⟩
+        dsimp only at hprov_eq hmptr_off; subst hprov_eq hmptr_off; rw [hoff0]; simp
+      have href : (⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+            some (.concrete e.allocId borTag)⟩, .none, none⟩ :
+            Miri.Interpreter.MemPlace AnnealProv).toRef annealTargetDataLayout =
+          .ok (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)) := by
+        rw [hmptr_eq]; rfl
+      have hrv_m := evalRvalueIntoPlace_ref_ok (region := .Erased)
+        (borrow := translateBorrowKind bk) hdst_eval hsrc_eval
+        (annealForceAllocation_memory_eq _ _ _ _ _) href
+      have hstate_b := hstate_a.cache_layout rfl hdecl_ref hlt_ra
+      have hfrb := hstate_b.frame_rel_singleton rfl
+      obtain ⟨slot_db, mls_db, _, hlt_db, hslot_db, hmls_db, _, hloc_db⟩ :=
+        hfrb.lookup_local hdecl_dst
+      have hsdb_eq : slot_db = slot_d := Option.some.inj (hslot_db.symm.trans hslot_d)
+      rw [hsdb_eq] at hloc_db
+      have himm_db : ∀ mp, mls_db.value ≠ .live (.indirect mp) :=
+        ((himm_d.cache_layout hlt_d _).cache_layout hlt_ra _) mls_db hmls_db
+      have hex_old : ∃ oldImm, mls_db.value = .live (.immediate oldImm) := by
+        rcases hloc_db.ref_immediate_cases hdst_ty himm_db with
+          ⟨hsd, _⟩ | ⟨_, hmd⟩ | ⟨_, _, _, _, _, hmd⟩ | ⟨_, _, _, _, hmd⟩
+        · exact absurd hsd hsd_dead
+        · exact ⟨_, hmd⟩
+        · exact ⟨_, hmd⟩
+        · exact ⟨_, hmd⟩
+      obtain ⟨oldImm, hmdb_imm⟩ := hex_old
+      have hdb_imm : tfb.locals[dstIdx]? = some ⟨.live (.immediate oldImm), mls_db.layout⟩ := by
+        rw [hmls_db]; rcases mls_db with ⟨v0, l0⟩; dsimp only at hmdb_imm; subst hmdb_imm; rfl
+      have hget_db := frame_getLocal_of_getElem? tfb dstIdx _ hdb_imm
+      have hw := annealWriteImmediate_live
+        (val := .scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
+        (m := { m with stack := ⟨#[tfb]⟩ }) (id0 := tf.localsIdentity)
+        (dstLay := translateTy dstDecl.ty body.layouts) rfl hlt_db hget_db
+      have hm_stmt : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨dstIdx, .nil⟩
+            (.ref bk ⟨refIdx, .cons .deref .nil⟩), span⟩) m =
+          Miri.Interpreter.runRvalue
+            (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks body.localDecls body.layouts)
+              () (.Ref .Erased (translateBorrowKind bk)
+                (translatePlace ⟨refIdx, .cons .deref .nil⟩)) ⟨dstIdx, #[]⟩) m := rfl
+      have hm_ok : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨dstIdx, .nil⟩
+            (.ref bk ⟨refIdx, .cons .deref .nil⟩), span⟩) m =
+          ({ m with stack := ⟨#[{ tfb with
+              locals := tfb.locals.set dstIdx
+                { tfb.locals[dstIdx]'hlt_db with
+                  value := .live (.immediate (.scalar
+                    (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))) }
+                hlt_db }]⟩ }, .ok ()) := by
+        rw [hm_stmt]; unfold Miri.Interpreter.runRvalue; rw [hrv_m, hw]
+      rw [ha_s, miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_ok
+        rfl hfrb.location_eq]
+      apply StepRelLM3_2Tree.step
+      -- Build `StateRelLM3_2Tree` on `(advanceStmt s ..., m', treeMap')`:
+      let am_read :=
+        (treeMap.map
+          (ReborrowMapEntry.updateOnRead (treeMap.map ReborrowMapEntry.toBorrowEntry)
+            e.localIdx ptrVal.tag)).map ReborrowMapEntry.toAllocMapEntry
+      let newAllocEntry : AllocMapEntry :=
+        { tag := s.memory.nextTag
+          localIdx := e.localIdx
+          allocId := e.allocId
+          perm := reborrowPermOf body.localDecls body.layouts bk refIdx }
+      have ham'_eq : treeMap'.map ReborrowMapEntry.toAllocMapEntry = newAllocEntry :: am_read := by
+        rw [htm'_eq]; rfl
+      have hskel_read : SameAllocSkeleton am am_read :=
+        SameAllocSkeleton.of_map_right treeMap
+          (ReborrowMapEntry.updateOnRead (treeMap.map ReborrowMapEntry.toBorrowEntry)
+            e.localIdx ptrVal.tag)
+          (fun x => ReborrowMapEntry.updateOnRead_tag _ _ _ x)
+          (fun x => ReborrowMapEntry.updateOnRead_localIdx _ _ _ x)
+          (fun x => ReborrowMapEntry.updateOnRead_allocId _ _ _ x)
+      have hstate_read := hstate_b.replace_borrows_skeleton hskel_read
+      obtain ⟨tfb', hfb', hretCont_b, hretPlace_b, hfr_read, _, _, _, _, _, halloc_read, hdisj_b⟩ :=
+        id hstate_read
+      injection hfb' with h₁; injection h₁ with h₂; subst h₂
+      obtain ⟨e_r, he_r, _, hl_er, ha_er⟩ := hskel_read.mem_left he_am
+      have he_r_loc : e_r.localIdx = e.localIdx := hl_er.symm
+      have he_r_aid : e_r.allocId = e.allocId := ha_er.symm
+      have hptr_new :
+          PtrRel (newAllocEntry :: am_read)
+            { allocId := s.memory.nextTag, offsetBytes := 0 } mptr :=
+        .mk e.allocId borTag hprov_eq hid_lt (show (0 : Nat) < 2 ^ 32 by decide)
+          (by rw [hmptr_eq]; simp)
+          ⟨newAllocEntry, List.Mem.head _, rfl, rfl⟩
+      have hdb_elem : tfb.locals[dstIdx]'hlt_db = ⟨.live (.immediate oldImm), mls_db.layout⟩ :=
+        Option.some.inj ((Array.getElem?_eq_getElem hlt_db).symm.trans hdb_imm)
+      have hnew_d :
+          LocalRelLM3_2 m.machine (newAllocEntry :: am_read) dstDecl body.layouts
+            (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8))
+            { tfb.locals[dstIdx]'hlt_db with
+              value := .live (.immediate (.scalar
+                (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))) } := by
+        rw [hdb_elem]
+        exact .ref _ _ _ dstMut dstPointee hloc_db.cachedLayout_eq hdst_ty hptr_new
+      have hfr_final := ((hfr_read.mono_cons newAllocEntry).update_local hdecl_dst _ _ hnew_d).advance
+      have hnodup_new : ((newAllocEntry :: am_read).map AllocMapEntry.tag).Nodup := by
+        simp only [List.map_cons, List.nodup_cons]
+        refine ⟨?_, halloc_read.tags_nodup⟩
+        intro hmem
+        obtain ⟨x, hx, htag_eq⟩ := List.mem_map.mp hmem
+        have hlt_tag : x.tag < s.memory.nextTag := (halloc_read.borrow_sync x hx).1
+        dsimp only [newAllocEntry] at htag_eq
+        omega
+      refine ⟨?_, rfl⟩
+      rw [ham'_eq]
+      refine .mk _ rfl hretCont_b hretPlace_b hfr_final hcal hstack hprot hcaller
+        (by dsimp only [eraseBorrowParents, advanceStmt]; rw [ham'_eq]) ?_ ?_
+      · refine ⟨hnodup_new, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+        · intro x₁ hx₁ x₂ hx₂ hloc_eq
+          rcases List.mem_cons.mp hx₁ with rfl | hm₁ <;>
+            rcases List.mem_cons.mp hx₂ with rfl | hm₂
+          · rfl
+          · dsimp only [newAllocEntry]; rw [← he_r_aid]
+            exact halloc_read.local_to_alloc_unique e_r he_r x₂ hm₂ (he_r_loc.trans hloc_eq)
+          · symm; dsimp only [newAllocEntry]; rw [← he_r_aid]
+            exact halloc_read.local_to_alloc_unique e_r he_r x₁ hm₁
+              (he_r_loc.trans hloc_eq.symm)
+          · exact halloc_read.local_to_alloc_unique x₁ hm₁ x₂ hm₂ hloc_eq
+        · intro x₁ hx₁ x₂ hx₂ hid_eq
+          rcases List.mem_cons.mp hx₁ with rfl | hm₁ <;>
+            rcases List.mem_cons.mp hx₂ with rfl | hm₂
+          · rfl
+          · exact he_r_loc.symm.trans (halloc_read.alloc_to_local_injective e_r he_r x₂ hm₂
+              (he_r_aid.trans hid_eq))
+          · exact (halloc_read.alloc_to_local_injective x₁ hm₁ e_r he_r
+              (hid_eq.trans he_r_aid.symm)).trans he_r_loc
+          · exact halloc_read.alloc_to_local_injective x₁ hm₁ x₂ hm₂ hid_eq
+        · intro x hx
+          rcases List.mem_cons.mp hx with rfl | hm
+          · dsimp only [newAllocEntry]; rw [← he_r_loc]; exact halloc_read.target_decl e_r he_r
+          · exact halloc_read.target_decl x hm
+        · intro x hx
+          rcases List.mem_cons.mp hx with rfl | hm
+          · dsimp only [newAllocEntry]; rw [← he_r_aid]; exact halloc_read.base_addr_valid e_r he_r
+          · exact halloc_read.base_addr_valid x hm
+        · intro x hx
+          have hlook_all := lookupBorrow_map_toBorrowEntry_of_nodup hnodup_new hx
+          rcases List.mem_cons.mp hx with rfl | hm
+          · refine ⟨Nat.lt_succ_self _, ?_⟩
+            dsimp only [eraseBorrowParents, advanceStmt]; rw [ham'_eq]; exact hlook_all
+          · have hlt_x : x.tag < s.memory.nextTag := (halloc_read.borrow_sync x hm).1
+            refine ⟨Nat.lt_trans hlt_x (Nat.lt_succ_self _), ?_⟩
+            dsimp only [eraseBorrowParents, advanceStmt]; rw [ham'_eq]; exact hlook_all
+        · intro x hx
+          rcases List.mem_cons.mp hx with rfl | hm
+          · dsimp only [newAllocEntry]; rw [← he_r_aid]; exact halloc_read.live_key_unique e_r he_r
+          · exact halloc_read.live_key_unique x hm
+        · intro tf' htf' x hx
+          injection htf' with h₁'; injection h₁' with h₂'; subst h₂'
+          have hex_orig : ∃ x₀ ∈ am_read, x.localIdx = x₀.localIdx ∧ x.allocId = x₀.allocId := by
+            rcases List.mem_cons.mp hx with rfl | hm
+            · exact ⟨e_r, he_r, he_r_loc.symm, he_r_aid.symm⟩
+            · exact ⟨x, hm, rfl, rfl⟩
+          obtain ⟨x₀, hx₀, hx_loc, hx_aid⟩ := hex_orig
+          rw [hx_loc, hx_aid]
+          obtain ⟨a₀, ha₀, _, hl₀, _⟩ := hskel_read.symm.mem_left hx₀
+          have hne_d : dstIdx ≠ x₀.localIdx :=
+            Ne.symm (hl₀ ▸ hnot_dst_am a₀ ha₀)
+          obtain ⟨hlive_x, hdead_x⟩ := halloc_read.local_alloc_sync tfb rfl x₀ hx₀
+          have hslot_after :
+              get? (eraseBorrowParents
+                (advanceStmt s
+                  (s.frame.locals.set dstIdx
+                    (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8)))
+                  { s.memory with
+                    borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry
+                    nextTag := s.memory.nextTag + 1 }) treeMap').frame.locals x₀.localIdx =
+              get? s.frame.locals x₀.localIdx := by
+            dsimp only [eraseBorrowParents, advanceStmt]
+            rw [get?_eq_getElem?, List.getElem?_set_ne hne_d, ← get?_eq_getElem?]
+          refine ⟨fun slot hslot hne_dead => ?_, fun hdead => ?_⟩
+          · rw [hslot_after] at hslot
+            obtain ⟨⟨lay_x, hlay_x⟩, hsc_x, hshape_x⟩ := hlive_x slot hslot hne_dead
+            refine ⟨⟨lay_x, ?_⟩, hsc_x, hshape_x⟩
+            show (tfb.locals.set dstIdx _ hlt_db)[x₀.localIdx]? = _
+            rw [Array.getElem?_set_ne _ hne_d]
+            exact hlay_x
+          · rw [hslot_after] at hdead
+            exact hdead_x hdead
+      · apply MemoryAllocDisjoint.mono_immediate hdisj_b
+        intro k
+        by_cases hk : k = dstIdx
+        · subst hk
+          right
+          refine ⟨.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr),
+            mls_db.layout, ?_⟩
+          show (tfb.locals.set k _ hlt_db)[k]? = _
+          rw [Array.getElem?_set_self, hdb_elem]
+        · left
+          show (tfb.locals.set dstIdx _ hlt_db)[k]? = _
+          rw [Array.getElem?_set_ne _ (Ne.symm hk)]
+
 theorem evalRvalue_reborrow_safeRef_tree_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -8591,7 +9297,8 @@ theorem evalRvalue_reborrow_safeRef_tree_simulation
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : BasicBlockData} {dstIdx refIdx : Local}
     {dstDecl refDecl : LocalDecl}
-    {bk : BorrowKind} {refMut dstMut : Trusted.Rustc.V2026_06_01.MirAst.Mutability} {pointeeKind dstPointee : RigidTy}
+    {bk : BorrowKind} {refMut dstMut : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
+    {pointeeKind dstPointee : RigidTy}
     {span : String}
     (hbb : Trusted.Sequence.get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : Trusted.Sequence.get? bb.statements s.frame.stmtIdx =
@@ -8618,148 +9325,18 @@ theorem evalRvalue_reborrow_safeRef_tree_simulation
       stepMirFn body s = MirStepNode.step s' →
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .ok true) →
-      ∃ (treeMap' : List ReborrowMapEntry), StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) := by
-  sorry
-theorem lookupAllocMapByTag_map_toAllocMapEntry (treeMap : List ReborrowMapEntry) (tag : Nat) :
-  lookupAllocMapByTag (treeMap.map ReborrowMapEntry.toAllocMapEntry) tag = (lookupTreeMapByTag treeMap tag).map ReborrowMapEntry.toAllocMapEntry := by
-  induction treeMap with | nil => rfl | cons hd tl ih =>
-    simp [lookupAllocMapByTag, lookupTreeMapByTag]
-    by_cases h : hd.tag = tag <;> simp [ReborrowMapEntry.toAllocMapEntry, h]
-    · exact ih
+      ∃ (treeMap' : List ReborrowMapEntry),
+        StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) := by
+  have hsim := step_reborrow_safeRef_tree_simulation_explicit htree hphase hbb hstmt
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm
+  generalize ha : stepMirFn body s = an at hsim ⊢
+  generalize hm : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+    mr at hsim ⊢
+  refine ⟨⟨fun hub => ?_, fun ⟨m', msg, herr⟩ => ?_⟩, fun s' m' hs' hm' => ?_⟩
+  · subst hub; cases hsim; exact ⟨_, _, rfl⟩
+  · subst herr; cases hsim; rfl
+  · subst hs' hm'; exact ⟨_, hsim⟩
 
-
-theorem derefReadNextTreeMap_map_toAllocMapEntry (locals : List LocalSlot) (treeMap : List ReborrowMapEntry) (ptrIdx : Local) :
-  (derefReadNextTreeMap locals treeMap ptrIdx).map ReborrowMapEntry.toAllocMapEntry =
-  derefReadNextAllocMap locals (treeMap.map ReborrowMapEntry.toAllocMapEntry) ptrIdx := by
-  have h_seq : Trusted.Sequence.get? locals ptrIdx = get? locals ptrIdx := rfl
-  unfold derefReadNextTreeMap derefReadNextAllocMap
-  rw [h_seq]
-  cases h : get? locals ptrIdx
-  · rfl
-  · rename_i slot
-    cases slot
-    · rfl
-    · rfl
-    · rename_i val
-      cases val <;> try rfl
-      case ptr ptrVal size =>
-        split
-        · rename_i ptrVal' heq
-          cases heq
-          change _ = match lookupAllocMapByTag (List.map ReborrowMapEntry.toAllocMapEntry treeMap) ptrVal.tag with
-                     | some e => List.map (derefReadMapFn (List.map ReborrowMapEntry.toAllocMapEntry treeMap) e.localIdx ptrVal.tag) (List.map ReborrowMapEntry.toAllocMapEntry treeMap)
-                     | none => List.map ReborrowMapEntry.toAllocMapEntry treeMap
-          rw [lookupAllocMapByTag_map_toAllocMapEntry]
-          cases h_lookup : lookupTreeMapByTag treeMap ptrVal.tag
-          · dsimp only [Option.map]
-          · rename_i e
-            dsimp only [Option.map]
-            rw [List.map_map, List.map_map]
-            apply List.map_congr_left
-            intro x hx
-            cases h_len : treeMap.map ReborrowMapEntry.toAllocMapEntry with
-            | nil =>
-              have : treeMap = [] := List.map_eq_nil_iff.mp h_len
-              subst this
-              contradiction
-            | cons hd tl =>
-              cases tl with
-              | nil =>
-                unfold derefReadMapFn
-                dsimp
-                have h_lookup' := h_lookup
-                unfold lookupTreeMapByTag at h_lookup'
-                cases h_tree : treeMap with
-                | nil => rw [h_tree] at h_len; contradiction
-                | cons hd_tree tl_tree =>
-                  cases tl_tree with
-                  | nil =>
-                    cases h_tag : hd_tree.tag == ptrVal.tag
-                    · have h_find : List.find? (fun e => e.tag == ptrVal.tag) treeMap = none := by rw [h_tree]; dsimp [List.find?]; rw [h_tag]
-                      rw [h_find] at h_lookup'
-                      contradiction
-                    · have h_find : List.find? (fun e => e.tag == ptrVal.tag) treeMap = some hd_tree := by rw [h_tree]; dsimp [List.find?]; rw [h_tag]
-                      rw [h_find] at h_lookup'
-                      injection h_lookup' with h_eq
-                      subst e
-                      rw [h_tree] at hx
-                      cases hx
-                      · have h_eq2 : x.tag = ptrVal.tag := beq_iff_eq.mp h_tag
-                        dsimp [ReborrowMapEntry.toAllocMapEntry]
-                        simp [h_eq2]
-                      · contradiction
-                  | cons _ _ =>
-                    have h_len_contra : (treeMap.map ReborrowMapEntry.toAllocMapEntry).length = 1 := by rw [h_len]; rfl
-                    rw [h_tree] at h_len_contra
-                    revert h_len_contra
-                    simp
-              | cons hd2 tl2 =>
-                unfold derefReadMapFn
-                dsimp
-                unfold AllocMapEntry.updateOnRead
-                by_cases h_loc : e.localIdx = x.localIdx
-                · by_cases h_tag : ptrVal.tag = x.tag
-                  · have hl : (x.localIdx == e.localIdx) = true := by rw [h_loc]; exact beq_self_eq_true _
-                    have ht : (x.tag == ptrVal.tag) = true := by rw [h_tag]; exact beq_self_eq_true _
-                    have ht_neq : (x.tag != ptrVal.tag) = false := by change (!(x.tag == ptrVal.tag)) = _; rw [ht]; rfl
-                    change (if _ then _ else x).toAllocMapEntry = _
-                    rw [hl, ht_neq]
-                    dsimp
-                    have h_nat_l : Nat.beq x.toAllocMapEntry.localIdx e.toAllocMapEntry.localIdx = true := by dsimp [ReborrowMapEntry.toAllocMapEntry]; rw [h_loc]; exact Nat.beq_refl _
-                    have h_nat_t : ptrVal.tag.beq x.toAllocMapEntry.tag = true := by dsimp [ReborrowMapEntry.toAllocMapEntry]; rw [h_tag]; exact Nat.beq_refl _
-                    rw [h_nat_l, h_nat_t]
-                  · have hl : (x.localIdx == e.localIdx) = true := by rw [h_loc]; exact beq_self_eq_true _
-                    have ht : (x.tag == ptrVal.tag) = false := by
-                      cases h_eq : x.tag == ptrVal.tag
-                      · rfl
-                      · have h1 := (beq_iff_eq).mp h_eq
-                        exact False.elim (h_tag h1.symm)
-                    have ht_neq : (x.tag != ptrVal.tag) = true := by change (!(x.tag == ptrVal.tag)) = _; rw [ht]; rfl
-                    change (if _ then _ else x).toAllocMapEntry = _
-                    rw [hl, ht_neq]
-                    dsimp
-                    have h_nat_l : Nat.beq x.toAllocMapEntry.localIdx e.toAllocMapEntry.localIdx = true := by dsimp [ReborrowMapEntry.toAllocMapEntry]; rw [h_loc]; exact Nat.beq_refl _
-                    have h_nat_t : ptrVal.tag.beq x.toAllocMapEntry.tag = false := by
-                      dsimp [ReborrowMapEntry.toAllocMapEntry]
-                      cases h_eq : Nat.beq ptrVal.tag x.tag
-                      · rfl
-                      · have h1 := Nat.eq_of_beq_eq_true h_eq
-                        exact False.elim (h_tag h1)
-                    rw [h_nat_l, h_nat_t]
-                    dsimp [ReborrowMapEntry.toAllocMapEntry]
-                    cases h_perm : x.perm <;> rfl
-                · have hl : (x.localIdx == e.localIdx) = false := by
-                    cases h_eq : x.localIdx == e.localIdx
-                    · rfl
-                    · have h1 := (beq_iff_eq).mp h_eq
-                      exact False.elim (h_loc h1.symm)
-                  change (if _ then _ else x).toAllocMapEntry = _
-                  rw [hl]
-                  dsimp
-                  have h_nat_l : Nat.beq x.toAllocMapEntry.localIdx e.toAllocMapEntry.localIdx = false := by
-                    dsimp [ReborrowMapEntry.toAllocMapEntry]
-                    cases h_eq : Nat.beq x.localIdx e.localIdx
-                    · rfl
-                    · have h1 := Nat.eq_of_beq_eq_true h_eq
-                      exact False.elim (h_loc h1.symm)
-                  rw [h_nat_l]
-        · rename_i h_not
-          split
-          · rename_i ptrVal_1 heq
-            exact False.elim (h_not ptrVal_1 heq)
-          · rfl
-
-theorem h_s'_eq {s'_erase : MachineState} {s : MachineState} {treeMap : List ReborrowMapEntry} {refIdx : Local}
-  (heq : s'_erase.memory.borrows = (derefReadNextAllocMap s.frame.locals (treeMap.map ReborrowMapEntry.toAllocMapEntry) refIdx).map AllocMapEntry.toBorrowEntry) :
-  eraseBorrowParents { s'_erase with memory := { s'_erase.memory with borrows := s.memory.borrows } } (derefReadNextTreeMap s.frame.locals treeMap refIdx) = s'_erase := by
-  unfold eraseBorrowParents
-  dsimp
-  cases s'_erase with | mk frame memory =>
-  cases memory with | mk nextAllocId globals borrows nextTag callees callStack activeCallee activeProtectors nextProtector callerLocals =>
-  dsimp
-  congr
-  rw [derefReadNextTreeMap_map_toAllocMapEntry]
-  exact heq.symm
 theorem step_safeRef_deref_read_tree_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -8787,91 +9364,261 @@ theorem step_safeRef_deref_read_tree_simulation
     StepRelLM3_2Tree body m (derefReadNextTreeMap s.frame.locals treeMap refIdx)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  have hsim := step_safeRef_deref_read_simulation_explicit htree.erased_rel hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm (by
-    intro ptrVal hget e he htag hdead
-    obtain ⟨e', he', he_eq⟩ := List.exists_of_mem_map he
-    subst he_eq
-    have hlive := hlive_ref ptrVal hget e' he' htag hdead
-    obtain ⟨hoff, hperm, hkind⟩ := hlive
-    refine ⟨hoff, ?_, hkind⟩
-    intro hdis
-    have hdis' : e'.perm = .disabled := hdis
-    exact hperm hdis'
-  )
-  obtain ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, hbor, halloc, hd_tf⟩ := id htree.erased_rel
-  have hs_step_unfold := stepMirFn_eq_of_not_other body s hcal hphase
-  have hcal_erase : (eraseBorrowParents s treeMap).memory.activeCallee = none := hcal
-  have hs_erase_unfold := stepMirFn_eq_of_not_other body (eraseBorrowParents s treeMap) hcal_erase hphase
-  unfold eraseBorrowParents at hs_erase_unfold
-  dsimp only [] at hs_erase_unfold
-  simp only [hbb, hstmt] at hs_step_unfold hs_erase_unfold
-  generalize hstep_erase : stepMirFn body (eraseBorrowParents s treeMap) = step_erase at hsim
-  generalize hmiri : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = miri_res at hsim ⊢
-  cases hsim
-  case step s'_erase m' hrel_erase =>
-    have h_s' : stepMirFn body s = MirStepNode.step { s'_erase with memory := { s'_erase.memory with borrows := s.memory.borrows } } := by
-      rcases hopKind with rfl | rfl
-      · unfold eraseBorrowParents at hstep_erase
-        dsimp only [] at hstep_erase
-        rw [hs_erase_unfold] at hstep_erase
-        rw [hs_step_unfold]
-        unfold evalStmt
-        dsimp only []
-        unfold evalStmt at hstep_erase
-        dsimp only [] at hstep_erase
-        simp only [evalRvalue, evalOperand] at hstep_erase ⊢
-        cases h_get : Trusted.Sequence.get? s.frame.locals refIdx <;> simp only [h_get] at hstep_erase ⊢
-        · contradiction
-        · rename_i loc
-          cases h_loc : loc <;> simp only [h_loc] at hstep_erase ⊢
-          case dead => contradiction
-          case uninit => contradiction
-          case init val =>
-            cases h_val : val <;> simp only [h_val] at hstep_erase ⊢
-            case unit => contradiction
-            case scalar => contradiction
-            case aggregate => contradiction
-            case ptr ptrVal sz =>
-              cases h_look : lookupBorrow (List.map AllocMapEntry.toBorrowEntry (List.map ReborrowMapEntry.toAllocMapEntry treeMap)) ptrVal.tag <;> simp only [h_look] at hstep_erase ⊢
-              · cases h_glob : lookupGlobalAlloc s.memory.globals ptrVal.allocId <;> simp only [h_glob] at hstep_erase ⊢
-                · contradiction
-                · rename_i globAlloc
-                  sorry
-              · sorry
-      · unfold eraseBorrowParents at hstep_erase
-        dsimp only [] at hstep_erase
-        rw [hs_erase_unfold] at hstep_erase
-        rw [hs_step_unfold]
-        unfold evalStmt
-        dsimp only []
-        unfold evalStmt at hstep_erase
-        dsimp only [] at hstep_erase
-        simp only [evalRvalue, evalOperand] at hstep_erase ⊢
-        cases h_get : Trusted.Sequence.get? s.frame.locals refIdx <;> simp only [h_get] at hstep_erase ⊢
-        · contradiction
-        · rename_i loc
-          cases h_loc : loc <;> simp only [h_loc] at hstep_erase ⊢
-          case dead => contradiction
-          case uninit => contradiction
-          case init val =>
-            cases h_val : val <;> simp only [h_val] at hstep_erase ⊢
-            case unit => contradiction
-            case scalar => contradiction
-            case aggregate => contradiction
-            case ptr ptrVal sz =>
-              cases h_look : lookupBorrow (List.map AllocMapEntry.toBorrowEntry (List.map ReborrowMapEntry.toAllocMapEntry treeMap)) ptrVal.tag <;> simp only [h_look] at hstep_erase ⊢
-              · cases h_glob : lookupGlobalAlloc s.memory.globals ptrVal.allocId <;> simp only [h_glob] at hstep_erase ⊢
-                · contradiction
-                · rename_i globAlloc
-                  sorry
-              · sorry
-    rw [h_s']
-    sorry
-  case retRoot decl0 retVal imm0 mem' m' hdecl_0 hret himm_rel hm' =>
-    sorry
-  case ub m' msg =>
-    sorry
-
+  let s_e := eraseBorrowParents s treeMap
+  let am := treeMap.map ReborrowMapEntry.toAllocMapEntry
+  let treeMap' := derefReadNextTreeMap s.frame.locals treeMap refIdx
+  have hsim := step_safeRef_deref_read_simulation_explicit htree.erased_rel hphase hopKind
+    hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm (by
+      intro ptrVal hget e' he' htag' hdead
+      obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+      exact hlive_ref ptrVal hget e he htag' hdead)
+  obtain ⟨tf, hframes, _, _, hfr, hcal_e, _, hprot_e, hcaller_e, hbor_e, halloc_e, _⟩ :=
+    id htree.erased_rel
+  have hcal : s.memory.activeCallee = none := hcal_e
+  have hprot : s.memory.activeProtectors = .nil := hprot_e
+  have hbor_s : s.memory.borrows = treeMap.map ReborrowMapEntry.toBorrowEntry := htree.borrows_eq
+  have hnodup_tm : (treeMap.map ReborrowMapEntry.tag).Nodup := by
+    have htags : am.map AllocMapEntry.tag = treeMap.map ReborrowMapEntry.tag := by
+      dsimp only [am]; rw [List.map_map]; rfl
+    rw [← htags]; exact halloc_e.tags_nodup
+  have hskel : SameAllocSkeleton (derefReadNextAllocMap s.frame.locals am refIdx)
+      (treeMap'.map ReborrowMapEntry.toAllocMapEntry) := by
+    dsimp only [derefReadNextAllocMap, derefReadNextTreeMap, am, treeMap']
+    cases hgr : get? s.frame.locals refIdx with
+    | none => exact .refl _
+    | some slot =>
+      cases slot with
+      | dead => exact .refl _
+      | uninit => exact .refl _
+      | init val =>
+        cases val with
+        | unit => exact .refl _
+        | scalar _ => exact .refl _
+        | aggregate _ _ => exact .refl _
+        | ptr ptrVal sz =>
+          by_cases hsz : sz = 8
+          · subst hsz
+            simp only [lookupAllocMapByTag_map_toAllocMapEntry]
+            cases lookupTreeMapByTag treeMap ptrVal.tag with
+            | none => exact .refl _
+            | some e =>
+              dsimp only [Option.map, ReborrowMapEntry.toAllocMapEntry]
+              exact SameAllocSkeleton.of_tree_maps treeMap
+                (derefReadMapFn (treeMap.map ReborrowMapEntry.toAllocMapEntry) e.localIdx ptrVal.tag)
+                (fun x => derefReadMapFn_tag _ _ _ x)
+                (fun x => derefReadMapFn_localIdx _ _ _ x)
+                (fun x => derefReadMapFn_allocId _ _ _ x)
+                (derefReadMapFnTree treeMap e.localIdx ptrVal.tag)
+                (fun x => derefReadMapFnTree_tag _ _ _ x)
+                (fun x => derefReadMapFnTree_localIdx _ _ _ x)
+                (fun x => derefReadMapFnTree_allocId _ _ _ x)
+          · simp [hsz]; exact .refl _
+  obtain ⟨himm_d, himm_r⟩ := himm tf hframes
+  obtain ⟨slot_r, mls_r, _, _, hslot_r, hmls_r, _, hloc_r⟩ := hfr.lookup_local hdecl_ref
+  obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
+  have hslot_r_s : get? s.frame.locals refIdx = some slot_r := hslot_r
+  have hslot_d_s : get? s.frame.locals dstIdx = some slot_d := hslot_d
+  have hlt_af_d_s : dstIdx < s.frame.locals.length := hlt_af_d
+  have hcaller_s : s.memory.callerLocals = .nil := hcaller_e
+  have hfe : s_e.frame = s.frame := rfl
+  have hs_step := stepMirFn_eq_of_not_other body s hcal hphase
+  have he_step := stepMirFn_eq_of_not_other body s_e hcal_e hphase
+  simp only [hbb, hstmt] at hs_step
+  simp only [hfe, hbb, hstmt] at he_step
+  generalize hm_res :
+    Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mRes at hsim ⊢
+  change StepRelLM3_2 body m _ (stepMirFn body s_e) mRes at hsim
+  have hop_eq :
+      evalOperand s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
+        s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals =
+      evalOperand s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
+        s_e.memory.borrows s_e.memory.globals body.layouts s_e.memory.callerLocals := by
+    dsimp only [s_e, eraseBorrowParents]
+    rw [hbor_s]
+    exact evalOperand_treeMap_eq s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
+      treeMap s.memory.globals body.layouts s.memory.callerLocals
+  rcases hloc_r.ref_immediate_cases href_ty (himm_r mls_r hmls_r) with
+    ⟨hsr, _⟩ | ⟨hsr, _⟩ | ⟨_, _, hsr, _⟩ | ⟨ptrVal, _, hsr, hptrRel, _⟩
+  · have ha_s : stepMirFn body s = .fail .ub := by
+      rw [hs_step]; rcases hopKind with rfl | rfl <;>
+        (unfold evalStmt evalRvalue evalOperand; dsimp only [];
+         rw [hslot_r_s, hsr, hcaller_s])
+    have ha_e : stepMirFn body s_e = .fail .ub := by
+      rw [he_step]; rcases hopKind with rfl | rfl <;>
+        (unfold evalStmt; rw [hfe]; unfold evalRvalue evalOperand; dsimp only [];
+         rw [hslot_r_s, hsr, hcaller_e])
+    rw [ha_e] at hsim; rw [ha_s]
+    cases hsim with | ub m' msg => exact .ub _ m' msg
+  · have ha_s : stepMirFn body s = .fail .ub := by
+      rw [hs_step]; rcases hopKind with rfl | rfl <;>
+        (unfold evalStmt evalRvalue evalOperand; dsimp only [];
+         rw [hslot_r_s, hsr])
+    have ha_e : stepMirFn body s_e = .fail .ub := by
+      rw [he_step]; rcases hopKind with rfl | rfl <;>
+        (unfold evalStmt; rw [hfe]; unfold evalRvalue evalOperand; dsimp only [];
+         rw [hslot_r_s, hsr])
+    rw [ha_e] at hsim; rw [ha_s]
+    cases hsim with | ub m' msg => exact .ub _ m' msg
+  · have ha_s : stepMirFn body s = .fail .ub := by
+      rw [hs_step]; rcases hopKind with rfl | rfl <;>
+        (unfold evalStmt evalRvalue evalOperand; dsimp only [];
+         rw [hslot_r_s, hsr])
+    have ha_e : stepMirFn body s_e = .fail .ub := by
+      rw [he_step]; rcases hopKind with rfl | rfl <;>
+        (unfold evalStmt; rw [hfe]; unfold evalRvalue evalOperand; dsimp only [];
+         rw [hslot_r_s, hsr])
+    rw [ha_e] at hsim; rw [ha_s]
+    cases hsim with | ub m' msg => exact .ub _ m' msg
+  · have hsr_full : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) :=
+      hslot_r_s.trans (congrArg some hsr)
+    obtain ⟨_, _, _, _, _, _, ⟨e_am, he_am, htag_am, _⟩⟩ := hptrRel
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp he_am
+    cases hop_res : evalOperand s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
+        s_e.memory.borrows s_e.memory.globals body.layouts s_e.memory.callerLocals with
+    | ub =>
+      have hop_s : evalOperand s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
+          s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals = .ub :=
+        hop_eq.trans hop_res
+      have ha_s : stepMirFn body s = .fail .ub := by
+        rw [hs_step]; unfold evalStmt evalRvalue; dsimp only []; rw [hop_s]
+      have ha_e : stepMirFn body s_e = .fail .ub := by
+        rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hop_res]
+      rw [ha_e] at hsim; rw [ha_s]
+      cases hsim with | ub m' msg => exact .ub _ m' msg
+    | unsupported =>
+      have ha_e : stepMirFn body s_e = .unsupported := by
+        rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hop_res]
+      rw [ha_e] at hsim; cases hsim
+    | ok val locals₁ =>
+      have hop_s : evalOperand s.frame.locals (opKind ⟨refIdx, .cons .deref .nil⟩)
+          s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals =
+          .ok val locals₁ :=
+        hop_eq.trans hop_res
+      have hlb_e : lookupBorrow s_e.memory.borrows ptrVal.tag =
+          some e.toAllocMapEntry.toBorrowEntry := by
+        have h := (halloc_e.borrow_sync e.toAllocMapEntry he_am).2
+        dsimp only [AllocMapEntry.toBorrowEntry] at h ⊢
+        rw [htag_am] at h ⊢
+        exact h
+      have hloc₁_eq : locals₁ = s.frame.locals := by
+        rcases hopKind with rfl | rfl <;>
+        · unfold evalOperand at hop_res; dsimp only [] at hop_res
+          rw [hsr_full] at hop_res; dsimp only [] at hop_res
+          rw [hlb_e] at hop_res
+          dsimp only [ReborrowMapEntry.toAllocMapEntry, AllocMapEntry.toBorrowEntry] at hop_res
+          cases hbp : e.perm <;> (rw [hbp] at hop_res; try cases hop_res) <;>
+          · dsimp only [] at hop_res
+            cases hgt : get? s.frame.locals e.localIdx with
+            | none =>
+              rw [hgt, hcaller_e] at hop_res
+              simp [get?] at hop_res
+            | some tslot =>
+              rw [hgt] at hop_res
+              cases tslot with
+              | dead => cases hop_res
+              | uninit => cases hop_res
+              | init rootVal =>
+                dsimp only [appendProjections, readProjectedValue] at hop_res
+                injection hop_res with _ hl; exact hl.symm
+      subst hloc₁_eq
+      have hrv_s :
+          evalRvalue s.frame.locals (.use (opKind ⟨refIdx, .cons .deref .nil⟩))
+            s.memory body.localDecls body.layouts =
+          .ok val s.frame.locals
+            { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry } := by
+        have hfrz := freezeDerefRead_treeMap_eq s.frame.locals treeMap hnodup_tm
+          refIdx ptrVal he htag_am hsr_full
+        unfold evalRvalue; dsimp only []; rw [hop_s]
+        rcases hopKind with rfl | rfl <;>
+        · rw [hbor_s]
+          cases hbm : treeMap.map ReborrowMapEntry.toBorrowEntry with
+          | nil =>
+            exact False.elim (List.not_mem_nil (hbm ▸ List.mem_map_of_mem he))
+          | cons b₁ rest =>
+            cases rest with
+            | nil =>
+              rw [hbm] at hfrz; dsimp only [] at hfrz ⊢
+              rw [← hfrz, ← hbm, ← hbor_s]
+            | cons b₂ rest₂ =>
+              rw [hbm] at hfrz; dsimp only [] at hfrz ⊢; rw [hfrz]
+      by_cases hsd_dead : slot_d = .dead
+      · have ha_s : stepMirFn body s = .fail .ub := by
+          rw [hs_step]; unfold evalStmt; dsimp only []; rw [hrv_s]; dsimp only []
+          rw [hslot_d_s, hsd_dead]
+        have ha_e : stepMirFn body s_e = .fail .ub := by
+          rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hop_res]
+          rcases hopKind with rfl | rfl <;>
+          · cases s_e.memory.borrows with
+            | nil => dsimp only []; rw [hslot_d_s, hsd_dead]
+            | cons _ r =>
+              cases r <;> (dsimp only []; rw [hslot_d_s, hsd_dead])
+        rw [ha_e] at hsim; rw [ha_s]
+        cases hsim with | ub m' msg => exact .ub _ m' msg
+      · have hnot_dst_am : ∀ x ∈ am, x.localIdx ≠ dstIdx :=
+          htree.erased_rel.immediate_not_in_allocMap hframes hslot_d hsd_dead himm_d
+        have hnot_dst_tm' : ∀ x ∈ treeMap', x.localIdx ≠ dstIdx := by
+          intro x hx
+          have hx_am : x.toAllocMapEntry ∈ treeMap'.map ReborrowMapEntry.toAllocMapEntry :=
+            List.mem_map_of_mem hx
+          obtain ⟨a, ha, _, hl, _⟩ := hskel.symm.mem_left hx_am
+          have ha_orig : ∃ a₀ ∈ am, a.localIdx = a₀.localIdx := by
+            dsimp only [derefReadNextAllocMap] at ha
+            simp only [hsr_full] at ha
+            cases hlk : lookupAllocMapByTag am ptrVal.tag <;> simp only [hlk] at ha
+            · exact ⟨a, ha, rfl⟩
+            · obtain ⟨a₀, ha₀, rfl⟩ := List.mem_map.mp ha
+              exact ⟨a₀, ha₀, derefReadMapFn_localIdx ..⟩
+          obtain ⟨a₀, ha₀, hl₀⟩ := ha_orig
+          intro hd
+          exact hnot_dst_am a₀ ha₀ (hl₀.symm.trans (hl.symm.trans hd))
+        have hinv_s := invalidateConflictingBorrows_treeMap_eq_of_not_mem treeMap' dstIdx hnot_dst_tm'
+        have ha_s :
+            stepMirFn body s =
+              .step (advanceStmt s (s.frame.locals.set dstIdx (.init val))
+                { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry }) := by
+          rw [hs_step]; unfold evalStmt; dsimp only []; rw [hrv_s]; dsimp only []
+          rw [hslot_d_s]
+          cases slot_d with
+          | dead => exact absurd rfl hsd_dead
+          | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_s]
+          | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot, hinv_s]
+        have hprot_se : s_e.memory.activeProtectors = .nil := hprot_e
+        have hex_be : ∃ b_e,
+            stepMirFn body s_e =
+              .step (advanceStmt s_e (s.frame.locals.set dstIdx (.init val))
+                { s_e.memory with borrows := b_e }) := by
+          rw [he_step]; unfold evalStmt; rw [hfe]; unfold evalRvalue; dsimp only []; rw [hop_res]
+          rcases hopKind with rfl | rfl <;>
+          · cases s_e.memory.borrows with
+            | nil =>
+              dsimp only []; rw [hslot_d_s]
+              cases slot_d with
+              | dead => exact absurd rfl hsd_dead
+              | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
+              | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
+            | cons _ r =>
+              cases r <;>
+              · dsimp only []; rw [hslot_d_s]
+                cases slot_d with
+                | dead => exact absurd rfl hsd_dead
+                | uninit => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
+                | init _ => simp only [set?_eq_some_set hlt_af_d_s, hprot_se]; exact ⟨_, rfl⟩
+        obtain ⟨b_e, ha_e⟩ := hex_be
+        rw [ha_e] at hsim; rw [ha_s]
+        cases hsim with
+        | step s'_e m' hrel_e =>
+          have hs_eq :
+              advanceStmt s (s.frame.locals.set dstIdx (.init val))
+                { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry } =
+              { advanceStmt s_e (s.frame.locals.set dstIdx (.init val))
+                  { s_e.memory with borrows := b_e } with
+                memory :=
+                  { (advanceStmt s_e (s.frame.locals.set dstIdx (.init val))
+                      { s_e.memory with borrows := b_e }).memory with
+                    borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry } } := by
+            dsimp only [s_e, eraseBorrowParents, advanceStmt]
+          rw [hs_eq]
+          exact .step _ _ treeMap' (StateRelLM3_2Tree.of_erased_skeleton hrel_e hskel)
 
 theorem step_safeRef_deref_write_tree_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -8882,8 +9629,8 @@ theorem step_safeRef_deref_write_tree_simulation
     (hbb : Trusted.Sequence.get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : Trusted.Sequence.get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨refIdx, .cons .deref .nil⟩ (.use op), span⟩)
-    {refDecl : LocalDecl} {mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutability} {pointeeKind : RigidTy}
-    {valTy : Ty}
+    {refDecl : LocalDecl} {mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
+    {pointeeKind : RigidTy} {valTy : Ty}
     (hdecl_ref : Trusted.Sequence.get? body.localDecls refIdx = some refDecl)
     (href_ty : refDecl.ty.kind = .ref mutability pointeeKind)
     (hval_prim : IsPrimScalarTy valTy)
@@ -8901,7 +9648,184 @@ theorem step_safeRef_deref_write_tree_simulation
     StepRelLM3_2Tree body m (derefWriteNextTreeMap s.frame.locals treeMap refIdx)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  sorry
+  let s_e := eraseBorrowParents s treeMap
+  let am := treeMap.map ReborrowMapEntry.toAllocMapEntry
+  let treeMap' := derefWriteNextTreeMap s.frame.locals treeMap refIdx
+  have hsim := step_safeRef_deref_write_simulation_explicit htree.erased_rel hphase hbb hstmt
+    hdecl_ref href_ty hval_prim hval_kind hop himm_ref (by
+      intro ptrVal e' tgtDecl hget he' htag' hdecl_t hdead
+      obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+      exact hlive_ref ptrVal e tgtDecl hget he htag' hdecl_t hdead)
+  obtain ⟨tf, hframes, _, _, hfr, hcal_e, _, hprot_e, hcaller_e, _, halloc_e, _⟩ :=
+    id htree.erased_rel
+  have hcal : s.memory.activeCallee = none := hcal_e
+  have hprot : s.memory.activeProtectors = .nil := hprot_e
+  have hcaller : s.memory.callerLocals = .nil := hcaller_e
+  have hbor_s : s.memory.borrows = treeMap.map ReborrowMapEntry.toBorrowEntry := htree.borrows_eq
+  have hnodup_tm : (treeMap.map ReborrowMapEntry.tag).Nodup := by
+    have htags : am.map AllocMapEntry.tag = treeMap.map ReborrowMapEntry.tag := by
+      dsimp only [am]; rw [List.map_map]; rfl
+    rw [← htags]; exact halloc_e.tags_nodup
+  have hskel : SameAllocSkeleton (derefWriteNextAllocMap s.frame.locals am refIdx)
+      (treeMap'.map ReborrowMapEntry.toAllocMapEntry) := by
+    dsimp only [derefWriteNextAllocMap, derefWriteNextTreeMap, am, treeMap']
+    cases hgr : get? s.frame.locals refIdx with
+    | none => exact .refl _
+    | some slot =>
+      cases slot with
+      | dead => exact .refl _
+      | uninit => exact .refl _
+      | init val =>
+        cases val with
+        | unit => exact .refl _
+        | scalar _ => exact .refl _
+        | aggregate _ _ => exact .refl _
+        | ptr ptrVal sz =>
+          by_cases hsz : sz = 8
+          · subst hsz
+            simp only [lookupAllocMapByTag_map_toAllocMapEntry]
+            cases lookupTreeMapByTag treeMap ptrVal.tag with
+            | none => exact .refl _
+            | some e =>
+              dsimp only [Option.map, ReborrowMapEntry.toAllocMapEntry, updateAllocMapOnWrite]
+              exact SameAllocSkeleton.of_tree_maps treeMap
+                (fun x => x.updateOnWrite e.localIdx (some ptrVal.tag))
+                (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
+                (ReborrowMapEntry.updateOnWrite (treeMap.map ReborrowMapEntry.toBorrowEntry)
+                  e.localIdx ptrVal.tag)
+                (fun x => ReborrowMapEntry.updateOnWrite_tag _ _ _ x)
+                (fun x => ReborrowMapEntry.updateOnWrite_localIdx _ _ _ x)
+                (fun x => ReborrowMapEntry.updateOnWrite_allocId _ _ _ x)
+          · simp [hsz]; exact .refl _
+  have hop_tf := hop tf hframes
+  have hfe : s_e.frame = s.frame := rfl
+  have hs_step := stepMirFn_eq_of_not_other body s hcal hphase
+  have he_step := stepMirFn_eq_of_not_other body s_e hcal_e hphase
+  simp only [hbb, hstmt] at hs_step
+  simp only [hfe, hbb, hstmt] at he_step
+  generalize hm_res :
+    Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mRes at hsim ⊢
+  change StepRelLM3_2 body m _ (stepMirFn body s_e) mRes at hsim
+  have hop_eq :
+      evalOperand s.frame.locals op s.memory.borrows s.memory.globals body.layouts
+        s.memory.callerLocals =
+      evalOperand s.frame.locals op s_e.memory.borrows s_e.memory.globals body.layouts
+        s_e.memory.callerLocals := by
+    dsimp only [s_e, eraseBorrowParents]
+    rw [hbor_s]
+    exact evalOperand_treeMap_eq s.frame.locals op treeMap
+      s.memory.globals body.layouts s.memory.callerLocals
+  have hrv_s := evalRvalue_use_scalarOperand_eq hop_tf s.frame.locals s.memory
+  have hrv_e := evalRvalue_use_scalarOperand_eq hop_tf s.frame.locals s_e.memory
+  cases hop_res : evalOperand s.frame.locals op s_e.memory.borrows s_e.memory.globals
+      body.layouts s_e.memory.callerLocals with
+  | ub =>
+    have ha_s : stepMirFn body s = .fail .ub := by
+      rw [hs_step]; unfold evalStmt; dsimp only []; rw [hrv_s, hop_eq.trans hop_res]
+    have ha_e : stepMirFn body s_e = .fail .ub := by
+      rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []; rw [hrv_e, hop_res]
+    rw [ha_e] at hsim; rw [ha_s]
+    cases hsim with | ub m' msg => exact .ub _ m' msg
+  | unsupported =>
+    have ha_e : stepMirFn body s_e = .unsupported := by
+      rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []; rw [hrv_e, hop_res]
+    rw [ha_e] at hsim; cases hsim
+  | ok val locals₁ =>
+    have hloc₁_eq : locals₁ = s.frame.locals := by
+      cases hop_tf with
+      | constScalar c sc hcv _ _ _ _ _ _ =>
+        unfold evalOperand at hop_res; dsimp only [] at hop_res
+        rw [hcv] at hop_res; injection hop_res with _ hl; exact hl.symm
+      | copyLocal idx _ _ _ _ =>
+        unfold evalOperand at hop_res; dsimp only [] at hop_res
+        cases hgi : get? s.frame.locals idx with
+        | none => rw [hgi] at hop_res; cases hop_res
+        | some sl =>
+          rw [hgi] at hop_res
+          cases sl with
+          | dead => cases hop_res
+          | uninit => cases hop_res
+          | init _ =>
+            simp only [readProjectedValue] at hop_res
+            injection hop_res with _ hl; exact hl.symm
+    subst hloc₁_eq
+    have hwp_eq :
+        writePlaceValue s.frame.locals s.memory.borrows ⟨refIdx, .cons .deref .nil⟩ val =
+        writePlaceValue s.frame.locals s_e.memory.borrows ⟨refIdx, .cons .deref .nil⟩ val := by
+      dsimp only [s_e, eraseBorrowParents]; rw [hbor_s]
+      exact writePlaceValue_treeMap_eq s.frame.locals treeMap ⟨refIdx, .cons .deref .nil⟩ val
+    cases hwp_res : writePlaceValue s.frame.locals s_e.memory.borrows
+        ⟨refIdx, .cons .deref .nil⟩ val with
+    | ub =>
+      have ha_s : stepMirFn body s = .fail .ub := by
+        rw [hs_step]; unfold evalStmt; dsimp only []
+        rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
+        rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res, hcaller]
+      have ha_e : stepMirFn body s_e = .fail .ub := by
+        rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
+        rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
+        rw [hprot_e]; dsimp only []; rw [hwp_res, hcaller_e]
+      rw [ha_e] at hsim; rw [ha_s]
+      cases hsim with | ub m' msg => exact .ub _ m' msg
+    | unsupported =>
+      have ha_e : stepMirFn body s_e = .unsupported := by
+        rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
+        rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
+        rw [hprot_e]; dsimp only []; rw [hwp_res]
+      rw [ha_e] at hsim; cases hsim
+    | ok locals₂ =>
+      obtain ⟨slot_r, mls_r, _, _, hslot_r, hmls_r, _, hloc_r⟩ := hfr.lookup_local hdecl_ref
+      have hslot_r_s : get? s.frame.locals refIdx = some slot_r := hslot_r
+      rcases hloc_r.ref_immediate_cases href_ty ((himm_ref tf hframes) mls_r hmls_r) with
+        ⟨hsr, _⟩ | ⟨hsr, _⟩ | ⟨_, _, hsr, _⟩ | ⟨ptrVal, _, hsr, hptrRel, _⟩
+      · unfold writePlaceValue at hwp_res; dsimp only [] at hwp_res
+        rw [hslot_r_s, hsr] at hwp_res; cases hwp_res
+      · unfold writePlaceValue at hwp_res; dsimp only [] at hwp_res
+        rw [hslot_r_s, hsr] at hwp_res; cases hwp_res
+      · unfold writePlaceValue at hwp_res; dsimp only [] at hwp_res
+        rw [hslot_r_s, hsr] at hwp_res; cases hwp_res
+      · have hsr_full : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) :=
+          hslot_r_s.trans (congrArg some hsr)
+        obtain ⟨_, _, _, _, _, _, ⟨e_am, he_am, htag_am, _⟩⟩ := hptrRel
+        obtain ⟨e, he, rfl⟩ := List.mem_map.mp he_am
+        have hinv_s := invalidateDerefWriteBorrows_map_toBorrowEntry_tree
+          s.frame.locals treeMap hnodup_tm refIdx ptrVal he htag_am hsr_full
+        rw [← hbor_s] at hinv_s
+        have ha_s :
+            stepMirFn body s =
+              .step (advanceStmt s locals₂
+                { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry }) := by
+          rw [hs_step]; unfold evalStmt; dsimp only []
+          rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
+          rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res, hinv_s]
+        have ha_e :
+            stepMirFn body s_e =
+              .step (advanceStmt s_e locals₂
+                { s_e.memory with
+                  borrows := invalidateDerefWriteBorrows s.frame.locals s_e.memory.borrows
+                    ⟨refIdx, .cons .deref .nil⟩ .nil }) := by
+          rw [he_step]; unfold evalStmt; rw [hfe]; dsimp only []
+          rw [hrv_e, hop_res]; dsimp only [evalPlaceWrite]
+          rw [hprot_e]; dsimp only []; rw [hwp_res]
+        rw [ha_e] at hsim; rw [ha_s]
+        cases hsim with
+        | step s'_e m' hrel_e =>
+          have hs_eq :
+              advanceStmt s locals₂
+                { s.memory with borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry } =
+              { advanceStmt s_e locals₂
+                  { s_e.memory with
+                    borrows := invalidateDerefWriteBorrows s_e.frame.locals s_e.memory.borrows
+                      ⟨refIdx, .cons .deref .nil⟩ .nil } with
+                memory :=
+                  { (advanceStmt s_e locals₂
+                      { s_e.memory with
+                        borrows := invalidateDerefWriteBorrows s_e.frame.locals s_e.memory.borrows
+                          ⟨refIdx, .cons .deref .nil⟩ .nil }).memory with
+                    borrows := treeMap'.map ReborrowMapEntry.toBorrowEntry } } := by
+            dsimp only [s_e, eraseBorrowParents, advanceStmt]
+          rw [hs_eq]
+          exact .step _ _ treeMap' (StateRelLM3_2Tree.of_erased_skeleton hrel_e hskel)
 
 theorem step_terminator_goto_return_tree_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}

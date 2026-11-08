@@ -4648,50 +4648,367 @@ theorem StateRelLM3_2Tree.toFlatOfNoParents
     rw [hbor_eq, ← htree.borrows_eq]
   simpa [herase] using htree.erased_rel
 
-def lookupTreeMapByTag (treeMap : List ReborrowMapEntry) (tag : Nat) : Option ReborrowMapEntry :=
-  treeMap.find? (fun e => e.tag == tag)
+/-- Look up the first `ReborrowMapEntry` in `treeMap` with provenance tag `tag`. -/
+def lookupTreeMapByTag : List ReborrowMapEntry → Nat → Option ReborrowMapEntry
+  | .nil, _ => none
+  | e :: rest, tag => if Nat.beq e.tag tag then some e else lookupTreeMapByTag rest tag
 
-def reborrowTreeMapNext (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
-    (ptrIdx : Local) (newTag : Nat) (allocId : Miri.Memory.AllocId) : List ReborrowMapEntry :=
-  match Trusted.Sequence.get? locals ptrIdx with
+theorem lookupBorrow_map_toBorrowEntry_treeMap
+    (treeMap : List ReborrowMapEntry) (tag : Nat) :
+    lookupBorrow (treeMap.map ReborrowMapEntry.toBorrowEntry) tag =
+      (lookupTreeMapByTag treeMap tag).map ReborrowMapEntry.toBorrowEntry := by
+  induction treeMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, lookupBorrow, lookupTreeMapByTag,
+      ReborrowMapEntry.toBorrowEntry]
+    cases Nat.beq hd.tag tag
+    · exact ih
+    · rfl
+
+theorem lookupBorrow_erased_treeMap
+    (treeMap : List ReborrowMapEntry) (tag : Nat) :
+    lookupBorrow
+        ((treeMap.map ReborrowMapEntry.toAllocMapEntry).map AllocMapEntry.toBorrowEntry) tag =
+      (lookupTreeMapByTag treeMap tag).map (fun e => e.toAllocMapEntry.toBorrowEntry) := by
+  induction treeMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, lookupBorrow, lookupTreeMapByTag,
+      ReborrowMapEntry.toAllocMapEntry, AllocMapEntry.toBorrowEntry]
+    cases Nat.beq hd.tag tag
+    · exact ih
+    · rfl
+
+theorem lookupTreeMapByTag_of_mem_nodup
+    {treeMap : List ReborrowMapEntry}
+    (hnodup : (treeMap.map ReborrowMapEntry.tag).Nodup)
+    {e : ReborrowMapEntry} (he : e ∈ treeMap) {t : Nat} (ht : e.tag = t) :
+    lookupTreeMapByTag treeMap t = some e := by
+  induction treeMap with
+  | nil => cases he
+  | cons hd tl ih =>
+    simp only [List.map_cons, List.nodup_cons] at hnodup
+    unfold lookupTreeMapByTag
+    rcases List.mem_cons.mp he with rfl | hmem
+    · simp [← ht]
+    · have hne : Nat.beq hd.tag t = false := by
+        cases h : Nat.beq hd.tag t
+        · rfl
+        · have heq := (Nat.eq_of_beq_eq_true h).trans ht.symm
+          exact absurd (heq ▸ List.mem_map_of_mem hmem) hnodup.1
+      rw [hne]
+      exact ih hnodup.2 hmem
+
+/-- Tree-Borrows-aware read transition on a single `ReborrowMapEntry` within
+full hierarchy `allBorrows` when `targetLocal` is read through `rTag`:
+descendant/self reads (`isBorrowDescendantOrSelf allBorrows rTag x.tag = true`)
+preserve `x.perm`, while foreign reads freeze `.active -> .frozen`. -/
+def ReborrowMapEntry.updateOnRead (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) : ReborrowMapEntry :=
+  match Nat.beq x.localIdx targetLocal with
+  | false => x
+  | true =>
+    match isBorrowDescendantOrSelf allBorrows rTag x.tag with
+    | true => x
+    | false =>
+      match x.perm with
+      | .active => { x with perm := .frozen }
+      | _ => x
+
+@[simp]
+theorem ReborrowMapEntry.updateOnRead_tag (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) :
+    (x.updateOnRead allBorrows targetLocal rTag).tag = x.tag := by
+  unfold ReborrowMapEntry.updateOnRead
+  cases Nat.beq x.localIdx targetLocal <;> try rfl
+  cases isBorrowDescendantOrSelf allBorrows rTag x.tag <;> try rfl
+  cases x.perm <;> rfl
+
+@[simp]
+theorem ReborrowMapEntry.updateOnRead_localIdx (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) :
+    (x.updateOnRead allBorrows targetLocal rTag).localIdx = x.localIdx := by
+  unfold ReborrowMapEntry.updateOnRead
+  cases Nat.beq x.localIdx targetLocal <;> try rfl
+  cases isBorrowDescendantOrSelf allBorrows rTag x.tag <;> try rfl
+  cases x.perm <;> rfl
+
+@[simp]
+theorem ReborrowMapEntry.updateOnRead_allocId (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) :
+    (x.updateOnRead allBorrows targetLocal rTag).allocId = x.allocId := by
+  unfold ReborrowMapEntry.updateOnRead
+  cases Nat.beq x.localIdx targetLocal <;> try rfl
+  cases isBorrowDescendantOrSelf allBorrows rTag x.tag <;> try rfl
+  cases x.perm <;> rfl
+
+theorem ReborrowMapEntry.updateOnRead_toBorrowEntry (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) :
+    (x.updateOnRead allBorrows targetLocal rTag).toBorrowEntry =
+      updateBorrowPermOnReadAtProj allBorrows x.toBorrowEntry targetLocal
+        (some rTag) .nil 0 0 := by
+  rcases x with ⟨tag, loc, aid, perm, ptag⟩
+  unfold ReborrowMapEntry.updateOnRead updateBorrowPermOnReadAtProj
+    borrowEntryOverlapsWrite projectionsOverlap stripTransparentProjections
+    projectionsOverlapAux
+  dsimp only [ReborrowMapEntry.toBorrowEntry]
+  cases Nat.beq loc targetLocal
+  · rfl
+  · dsimp only
+    cases isBorrowDescendantOrSelf allBorrows rTag tag
+    · dsimp only
+      cases perm <;> rfl
+    · rfl
+
+theorem freezeTreeBorrowsOnReadAtProj_map_toBorrowEntry_tree
+    (allBorrows : List BorrowEntry) (treeMap : List ReborrowMapEntry)
+    (targetLocal : Local) (rTag : Nat) :
+    freezeTreeBorrowsOnReadAtProj allBorrows
+        (treeMap.map ReborrowMapEntry.toBorrowEntry) targetLocal (some rTag) .nil 0 0 =
+      (treeMap.map (ReborrowMapEntry.updateOnRead allBorrows targetLocal rTag)).map
+        ReborrowMapEntry.toBorrowEntry := by
+  induction treeMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, freezeTreeBorrowsOnReadAtProj,
+      ReborrowMapEntry.updateOnRead_toBorrowEntry, ih]
+
+/-- Per-entry deref-read transition on `treeMap` (mirroring Anneal's length-`< 2`
+skip in `evalRvalue` for `.use (opKind ⟨ptrIdx, [.deref]⟩)`). -/
+def derefReadMapFnTree (treeMap : List ReborrowMapEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) : ReborrowMapEntry :=
+  match treeMap with
+  | _ :: _ :: _ => x.updateOnRead (treeMap.map ReborrowMapEntry.toBorrowEntry) targetLocal rTag
+  | _ => x
+
+@[simp]
+theorem derefReadMapFnTree_tag (treeMap : List ReborrowMapEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) :
+    (derefReadMapFnTree treeMap targetLocal rTag x).tag = x.tag := by
+  unfold derefReadMapFnTree
+  cases treeMap with
+  | nil => rfl
+  | cons _ tl => cases tl <;> simp
+
+@[simp]
+theorem derefReadMapFnTree_localIdx (treeMap : List ReborrowMapEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) :
+    (derefReadMapFnTree treeMap targetLocal rTag x).localIdx = x.localIdx := by
+  unfold derefReadMapFnTree
+  cases treeMap with
+  | nil => rfl
+  | cons _ tl => cases tl <;> simp
+
+@[simp]
+theorem derefReadMapFnTree_allocId (treeMap : List ReborrowMapEntry)
+    (targetLocal : Local) (rTag : Nat) (x : ReborrowMapEntry) :
+    (derefReadMapFnTree treeMap targetLocal rTag x).allocId = x.allocId := by
+  unfold derefReadMapFnTree
+  cases treeMap with
+  | nil => rfl
+  | cons _ tl => cases tl <;> simp
+
+/-- Computable post-step `treeMap'` after a deref read `_d = (copy|move) *_r`:
+preserves ancestor/self borrows (`isBorrowDescendantOrSelf = true`) and freezes
+foreign `.active` borrows on `e.localIdx` when `treeMap` has `≥ 2` entries. -/
+def derefReadNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (ptrIdx : Local) : List ReborrowMapEntry :=
+  match get? locals ptrIdx with
+  | some (.init (.ptr ptrVal 8)) =>
+    match lookupTreeMapByTag treeMap ptrVal.tag with
+    | some e => treeMap.map (derefReadMapFnTree treeMap e.localIdx ptrVal.tag)
+    | none => treeMap
+  | _ => treeMap
+
+/-- Tree-Borrows-aware write transition on a single `ReborrowMapEntry` within
+full hierarchy `allBorrows` when `targetLocal` is written through `wTag`:
+descendant/self writes (`isBorrowDescendantOrSelf allBorrows wTag x.tag = true`)
+activate `.reserved -> .active` and preserve `.active` on ancestors, while
+foreign writes transition `x` to `.disabled`. -/
+def ReborrowMapEntry.updateOnWrite (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (wTag : Nat) (x : ReborrowMapEntry) : ReborrowMapEntry :=
+  match Nat.beq x.localIdx targetLocal with
+  | false => x
+  | true =>
+    match isBorrowDescendantOrSelf allBorrows wTag x.tag with
+    | true =>
+      match x.perm with
+      | .reserved => { x with perm := .active }
+      | _ => x
+    | false => { x with perm := .disabled }
+
+@[simp]
+theorem ReborrowMapEntry.updateOnWrite_tag (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (wTag : Nat) (x : ReborrowMapEntry) :
+    (x.updateOnWrite allBorrows targetLocal wTag).tag = x.tag := by
+  unfold ReborrowMapEntry.updateOnWrite
+  cases Nat.beq x.localIdx targetLocal <;> try rfl
+  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> try rfl
+  cases x.perm <;> rfl
+
+@[simp]
+theorem ReborrowMapEntry.updateOnWrite_localIdx (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (wTag : Nat) (x : ReborrowMapEntry) :
+    (x.updateOnWrite allBorrows targetLocal wTag).localIdx = x.localIdx := by
+  unfold ReborrowMapEntry.updateOnWrite
+  cases Nat.beq x.localIdx targetLocal <;> try rfl
+  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> try rfl
+  cases x.perm <;> rfl
+
+@[simp]
+theorem ReborrowMapEntry.updateOnWrite_allocId (allBorrows : List BorrowEntry)
+    (targetLocal : Local) (wTag : Nat) (x : ReborrowMapEntry) :
+    (x.updateOnWrite allBorrows targetLocal wTag).allocId = x.allocId := by
+  unfold ReborrowMapEntry.updateOnWrite
+  cases Nat.beq x.localIdx targetLocal <;> try rfl
+  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> try rfl
+  cases x.perm <;> rfl
+
+private theorem isBorrowDescendantOrSelf_self (borrows : List BorrowEntry) (t : Nat) :
+    isBorrowDescendantOrSelf borrows t t = true := by
+  unfold isBorrowDescendantOrSelf
+  cases length borrows with
+  | zero => exact Nat.beq_refl t
+  | succ _ => simp only [isBorrowDescendantOrSelfAux, Nat.beq_refl]
+
+theorem ReborrowMapEntry.updateOnWrite_toBorrowEntry_tree
+    (allBorrows : List BorrowEntry) (targetLocal : Local) (wTag : Nat)
+    (x : ReborrowMapEntry) :
+    (x.updateOnWrite allBorrows targetLocal wTag).toBorrowEntry =
+      updateBorrowPermTreeAtProj allBorrows x.toBorrowEntry targetLocal
+        (some wTag) .nil 0 0 := by
+  rcases x with ⟨tag, loc, aid, perm, ptag⟩
+  unfold ReborrowMapEntry.updateOnWrite updateBorrowPermTreeAtProj
+    resolveTreeBorrowWriterTag updateBorrowPermAtProj
+    borrowEntryOverlapsWrite projectionsOverlap stripTransparentProjections
+    projectionsOverlapAux
+  dsimp only [ReborrowMapEntry.toBorrowEntry]
+  cases Nat.beq loc targetLocal
+  · rfl
+  · dsimp only
+    cases hdesc : isBorrowDescendantOrSelf allBorrows wTag tag
+    · dsimp only
+      have hne : Nat.beq tag wTag = false := by
+        cases h : Nat.beq tag wTag
+        · rfl
+        · have heq := Nat.eq_of_beq_eq_true h
+          subst heq
+          rw [isBorrowDescendantOrSelf_self] at hdesc
+          cases hdesc
+      rw [hne]
+      rfl
+    · dsimp only
+      rw [Nat.beq_refl]
+      dsimp only
+      cases perm <;> rfl
+
+theorem invalidateTreeBorrowsAtProj_map_toBorrowEntry_tree
+    (allBorrows : List BorrowEntry) (treeMap : List ReborrowMapEntry)
+    (targetLocal : Local) (wTag : Nat) :
+    invalidateTreeBorrowsAtProj allBorrows
+        (treeMap.map ReborrowMapEntry.toBorrowEntry) targetLocal (some wTag) .nil 0 0 =
+      (treeMap.map (ReborrowMapEntry.updateOnWrite allBorrows targetLocal wTag)).map
+        ReborrowMapEntry.toBorrowEntry := by
+  induction treeMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, invalidateTreeBorrowsAtProj,
+      ReborrowMapEntry.updateOnWrite_toBorrowEntry_tree, ih]
+
+/-- Computable post-step `treeMap'` after a deref write `*_r = .use op`:
+activates `.reserved -> .active` and preserves `.active` on all `NodeRelation::Local`
+ancestors (`isBorrowDescendantOrSelf = true`), while disabling foreign borrows
+on `e.localIdx`. -/
+def derefWriteNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (ptrIdx : Local) : List ReborrowMapEntry :=
+  match get? locals ptrIdx with
   | some (.init (.ptr ptrVal 8)) =>
     match lookupTreeMapByTag treeMap ptrVal.tag with
     | some e =>
-        let newEntry : ReborrowMapEntry := {
-          allocId := allocId,
-          tag := newTag,
-          localIdx := e.localIdx,
-          perm := .active,
-          parentTag := some ptrVal.tag
-        }
-        treeMap ++ [newEntry]
+      treeMap.map
+        (ReborrowMapEntry.updateOnWrite (treeMap.map ReborrowMapEntry.toBorrowEntry)
+          e.localIdx ptrVal.tag)
     | none => treeMap
   | _ => treeMap
 
-def derefReadNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
-    (ptrIdx : Local) : List ReborrowMapEntry :=
-  match Trusted.Sequence.get? locals ptrIdx with
-  | some (.init (.ptr ptrVal 8)) =>
-    match lookupTreeMapByTag treeMap ptrVal.tag with
-    | some e => treeMap.map (fun x =>
-        if x.localIdx == e.localIdx && x.tag != ptrVal.tag then
-          { x with perm := match x.perm with | .active => .frozen | p => p }
-        else x)
-    | none => treeMap
-  | _ => treeMap
+theorem invalidateDerefWriteBorrows_map_toBorrowEntry_tree
+    (locals₁ : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (hnodup : (treeMap.map ReborrowMapEntry.tag).Nodup)
+    (ptrIdx : Local) (ptrVal : ProvenancePtr)
+    {e : ReborrowMapEntry} (he : e ∈ treeMap) (htag : e.tag = ptrVal.tag)
+    (hget : get? locals₁ ptrIdx = some (.init (.ptr ptrVal 8))) :
+    invalidateDerefWriteBorrows locals₁ (treeMap.map ReborrowMapEntry.toBorrowEntry)
+        ⟨ptrIdx, .cons .deref .nil⟩ .nil =
+      (derefWriteNextTreeMap locals₁ treeMap ptrIdx).map ReborrowMapEntry.toBorrowEntry := by
+  have hlook_tm := lookupTreeMapByTag_of_mem_nodup hnodup he htag
+  have hlook_bor :
+      lookupBorrow (treeMap.map ReborrowMapEntry.toBorrowEntry) ptrVal.tag =
+        some e.toBorrowEntry := by
+    rw [lookupBorrow_map_toBorrowEntry_treeMap, hlook_tm]; rfl
+  have hdw :
+      derefWriteNextTreeMap locals₁ treeMap ptrIdx =
+        treeMap.map
+          (ReborrowMapEntry.updateOnWrite (treeMap.map ReborrowMapEntry.toBorrowEntry)
+            e.localIdx ptrVal.tag) := by
+    simp [derefWriteNextTreeMap, hget, hlook_tm]
+  rw [hdw]
+  cases treeMap with
+  | nil => cases he
+  | cons b₁ rest =>
+    cases rest with
+    | nil =>
+      rcases List.mem_singleton.mp he with rfl
+      rcases e with ⟨tag, loc, aid, perm, ptag⟩
+      dsimp only at htag
+      subst htag
+      simp only [invalidateDerefWriteBorrows, hget, List.map_cons, List.map_nil] at hlook_bor ⊢
+      rw [hlook_bor]
+      dsimp only [ReborrowMapEntry.toBorrowEntry, appendProjections,
+        invalidateConflictingBorrows, updateBorrowPerm, ReborrowMapEntry.updateOnWrite]
+      rw [Nat.beq_refl, Nat.beq_refl, isBorrowDescendantOrSelf_self]
+      dsimp only []
+      cases perm <;> rfl
+    | cons b₂ rest₂ =>
+      simp only [invalidateDerefWriteBorrows, hget, List.map_cons] at hlook_bor ⊢
+      rw [hlook_bor]; dsimp only []
+      have hproj : appendProjections e.toBorrowEntry.targetProjection .nil = .nil := rfl
+      have hro : e.toBorrowEntry.rangeOffset = 0 := rfl
+      have hrl : e.toBorrowEntry.rangeLen = 0 := rfl
+      have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl
+      rw [hproj, hro, hrl, htl]
+      exact invalidateTreeBorrowsAtProj_map_toBorrowEntry_tree
+        ((b₁ :: b₂ :: rest₂).map ReborrowMapEntry.toBorrowEntry)
+        (b₁ :: b₂ :: rest₂) e.localIdx ptrVal.tag
 
-def derefWriteNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
-    (ptrIdx : Local) : List ReborrowMapEntry :=
-  match Trusted.Sequence.get? locals ptrIdx with
+/-- Initial `TreeBorrowPerm` assigned by `evalRvalue` to a reborrow `&bk (*ptrIdx)`. -/
+def reborrowPermOf (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (bk : BorrowKind) (ptrIdx : Local) : TreeBorrowPerm :=
+  match bk with
+  | .shared => sharedBorrowPerm localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩
+  | .mut _ => .reserved
+
+/-- Computable post-step `treeMap'` after reborrowing `_d = &bk (*ptrIdx)` with
+fresh provenance tag `newTag`: applies `ReborrowMapEntry.updateOnRead` across
+`treeMap` for the initial reborrow read and prepends the child borrow entry
+with `parentTag = some ptrVal.tag`. -/
+def reborrowTreeMapNext (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (bk : BorrowKind) (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
+    (ptrIdx : Local) (newTag : Nat) : List ReborrowMapEntry :=
+  match get? locals ptrIdx with
   | some (.init (.ptr ptrVal 8)) =>
     match lookupTreeMapByTag treeMap ptrVal.tag with
-    | some e => treeMap.map (fun x =>
-        if x.localIdx == e.localIdx then
-          if x.tag == ptrVal.tag then
-            { x with perm := .active }
-          else
-            { x with perm := .disabled }
-        else x)
+    | some e =>
+      let newEntry : ReborrowMapEntry :=
+        { tag := newTag
+          localIdx := e.localIdx
+          allocId := e.allocId
+          perm := reborrowPermOf localDecls layouts bk ptrIdx
+          parentTag := some ptrVal.tag }
+      newEntry ::
+        treeMap.map
+          (ReborrowMapEntry.updateOnRead (treeMap.map ReborrowMapEntry.toBorrowEntry)
+            e.localIdx ptrVal.tag)
     | none => treeMap
   | _ => treeMap
 

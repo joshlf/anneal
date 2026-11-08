@@ -8571,43 +8571,52 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps
   Witness.wit_lm3_2_placeMention_and_unified_return_ref_real_steps
 
-example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
     (hstate : StateRelLM3_2 body s m allocMap)
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : MirAst.BasicBlockData} {dstIdx refIdx : MirAst.Local}
-    {opKind : MirAst.Place → Operand} {span : String}
-    (hopKind : opKind = Operand.copy ∨ opKind = Operand.move)
+    {opKind : MirAst.Place → MirAst.Operand} {span : String}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
     (hbb : Trusted.Sequence.get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : Trusted.Sequence.get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨dstIdx, .nil⟩ (MirAst.Rvalue.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩)
-    {dstDecl refDecl allocDecl : MirAst.LocalDecl} {mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
+    {dstDecl refDecl allocDecl : MirAst.LocalDecl}
+    {mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
     (hdecl_dst : Trusted.Sequence.get? body.localDecls dstIdx = some dstDecl)
     (hdecl_ref : Trusted.Sequence.get? body.localDecls refIdx = some refDecl)
     (href_ty : refDecl.ty.kind = .ref mutability dstDecl.ty.kind)
     (hdst_prim : IsPrimScalarTy dstDecl.ty)
-    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
-      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
-    (hlive_ref : ∀ ptrVal, Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
-      ∀ e ∈ allocMap, e.tag = ptrVal.tag →
-        Trusted.Sequence.get? body.localDecls e.localIdx = some allocDecl ∧
-        allocDecl.ty.kind = dstDecl.ty.kind ∧
-        (translateTy dstDecl.ty body.layouts).layout.size = (translateTy allocDecl.ty body.layouts).layout.size ∧
-        (∃ sc, Trusted.Sequence.get? s.frame.locals e.localIdx = some (.init (.scalar sc)) ∧
-        ¬ AnnealScalarValid dstDecl.ty sc) ∧
-        ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
-        Trusted.Sequence.get? s.frame.locals dstIdx ≠ some .dead) ,
-    ∀ s', stepMirFn body s = MirStepNode.step s' →
-      ∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
-      (m', .error (.undefinedBehavior msg)) := @step_safeRef_deref_read_invalid_scalar_divergence
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {sc : MirAst.ScalarInt}
+    (hslot_r : Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hoff0 : ptrVal.offsetBytes = 0)
+    (hperm : e.perm ≠ .disabled)
+    (hdecl_a : Trusted.Sequence.get? body.localDecls e.localIdx = some allocDecl)
+    (htarget : Trusted.Sequence.get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
+    (hsize : (translateTy dstDecl.ty body.layouts).layout.size =
+      (translateTy allocDecl.ty body.layouts).layout.size)
+    (hinvalid : ¬ AnnealScalarValid dstDecl.ty sc)
+    (hdst_live : Trusted.Sequence.get? s.frame.locals dstIdx ≠ some .dead) :
+    (∃ s', stepMirFn body s = .step s' ∧
+      Trusted.Sequence.get? s'.frame.locals dstIdx = some (.init (.scalar sc))) ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "reading invalid value")) :=
+  step_safeRef_deref_read_invalid_scalar_divergence hstate hphase hopKind hbb hstmt
+    hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag hoff0 hperm
+    hdecl_a htarget hsize hinvalid hdst_live
 
-example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
     (htree : StateRelLM3_2Tree body s m treeMap)
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : MirAst.BasicBlockData} {dstIdx refIdx : MirAst.Local}
     {dstDecl refDecl : MirAst.LocalDecl}
-    {bk : MirAst.BorrowKind} {refMut dstMut : Trusted.Rustc.V2026_06_01.MirAst.Mutability} {pointeeKind dstPointee : MirAst.RigidTy}
+    {bk : MirAst.BorrowKind} {refMut dstMut : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
+    {pointeeKind dstPointee : MirAst.RigidTy}
     {span : String}
     (hbb : Trusted.Sequence.get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : Trusted.Sequence.get? bb.statements s.frame.stmtIdx =
@@ -8625,7 +8634,41 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead ∧
       ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
       (∀ tgtDecl, Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
-        tgtDecl.ty.kind = pointeeKind)) ,
+        tgtDecl.ty.kind = pointeeKind)) :
+    StepRelLM3_2Tree body m
+      (reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx
+        s.memory.nextTag)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_reborrow_safeRef_tree_simulation_explicit htree hphase hbb hstmt
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm
+
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : MirAst.BasicBlockData} {dstIdx refIdx : MirAst.Local}
+    {dstDecl refDecl : MirAst.LocalDecl}
+    {bk : MirAst.BorrowKind} {refMut dstMut : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
+    {pointeeKind dstPointee : MirAst.RigidTy}
+    {span : String}
+    (hbb : Trusted.Sequence.get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : Trusted.Sequence.get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (MirAst.Rvalue.ref bk ⟨refIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : Trusted.Sequence.get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : Trusted.Sequence.get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref refMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
+    (hlive_zero_perm : ∀ ptrVal e,
+      Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead ∧
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
+      (∀ tgtDecl, Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
+        tgtDecl.ty.kind = pointeeKind)) :
     ((stepMirFn body s = MirStepNode.fail .ub) ↔
       ∃ m' msg,
         Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
@@ -8634,9 +8677,12 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       stepMirFn body s = MirStepNode.step s' →
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .ok true) →
-      ∃ (treeMap' : List ReborrowMapEntry), StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) := @evalRvalue_reborrow_safeRef_tree_simulation
+      ∃ (treeMap' : List ReborrowMapEntry),
+        StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) :=
+  evalRvalue_reborrow_safeRef_tree_simulation htree hphase hbb hstmt
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm
 
-example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
     (htree : StateRelLM3_2Tree body s m treeMap)
     (hphase : ∀ p, body.phase ≠ .other p)
@@ -8658,12 +8704,14 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
         Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead →
           ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
           (∀ decl, Trusted.Sequence.get? body.localDecls e.localIdx = some decl →
-            decl.ty.kind = dstDecl.ty.kind)) ,
+            decl.ty.kind = dstDecl.ty.kind)) :
     StepRelLM3_2Tree body m (derefReadNextTreeMap s.frame.locals treeMap refIdx)
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := @step_safeRef_deref_read_tree_simulation
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_safeRef_deref_read_tree_simulation htree hphase hopKind hbb hstmt
+    hdecl_dst hdecl_ref href_ty hdst_prim himm hlive_ref
 
-example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
     (htree : StateRelLM3_2Tree body s m treeMap)
     (hphase : ∀ p, body.phase ≠ .other p)
@@ -8671,8 +8719,8 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hbb : Trusted.Sequence.get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : Trusted.Sequence.get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨refIdx, .cons .deref .nil⟩ (MirAst.Rvalue.use op), span⟩)
-    {refDecl : MirAst.LocalDecl} {mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutability} {pointeeKind : MirAst.RigidTy}
-    {valTy : MirAst.Ty}
+    {refDecl : MirAst.LocalDecl} {mutability : Trusted.Rustc.V2026_06_01.MirAst.Mutability}
+    {pointeeKind : MirAst.RigidTy} {valTy : MirAst.Ty}
     (hdecl_ref : Trusted.Sequence.get? body.localDecls refIdx = some refDecl)
     (href_ty : refDecl.ty.kind = .ref mutability pointeeKind)
     (hval_prim : IsPrimScalarTy valTy)
@@ -8686,12 +8734,14 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
       Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead →
       ptrVal.offsetBytes = 0 ∧ (e.perm = .active ∨ e.perm = .reserved) ∧
-        tgtDecl.ty.kind = pointeeKind) ,
+        tgtDecl.ty.kind = pointeeKind) :
     StepRelLM3_2Tree body m (derefWriteNextTreeMap s.frame.locals treeMap refIdx)
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := @step_safeRef_deref_write_tree_simulation
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_safeRef_deref_write_tree_simulation htree hphase hbb hstmt
+    hdecl_ref href_ty hval_prim hval_kind hop himm_ref hlive_ref
 
-example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
     (htree : StateRelLM3_2Tree body s m treeMap)
     (hphase : ∀ p, body.phase ≠ .other p)
@@ -8700,10 +8750,34 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstmt_none : Trusted.Sequence.get? bb.statements s.frame.stmtIdx = none)
     (hstmt_len : s.frame.stmtIdx = bb.statements.length)
     (hwt_term : WellTypedLM3_2StateTerminator body m bb)
-    (hgoto_ret : (∃ target, bb.terminator.kind = .goto target) ∨ bb.terminator.kind = .return_ ∨ bb.terminator.kind = .unreachable) ,
+    (hgoto_ret : (∃ target, bb.terminator.kind = .goto target) ∨
+      bb.terminator.kind = .return_ ∨ bb.terminator.kind = .unreachable) :
     StepRelLM3_2Tree body m treeMap
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := @step_terminator_goto_return_tree_simulation
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_terminator_goto_return_tree_simulation htree hphase hbb hstmt_none hstmt_len
+    hwt_term hgoto_ret
+
+open LeanMiriSpec.Correspondence in
+#assert_standard_axioms
+  annealDerefOperandToMemPlace_safeRef_ptr_same_size
+  step_safeRef_deref_read_invalid_scalar_divergence
+  lookupTreeMapByTag
+  ReborrowMapEntry.updateOnRead
+  derefReadMapFnTree
+  derefReadNextTreeMap
+  ReborrowMapEntry.updateOnWrite
+  derefWriteNextTreeMap
+  reborrowPermOf
+  reborrowTreeMapNext
+  SameAllocSkeleton
+  StateRelLM3_2Tree
+  StepRelLM3_2Tree
+  step_reborrow_safeRef_tree_simulation_explicit
+  evalRvalue_reborrow_safeRef_tree_simulation
+  step_safeRef_deref_read_tree_simulation
+  step_safeRef_deref_write_tree_simulation
+  step_terminator_goto_return_tree_simulation
 
 end StatementPins
 
