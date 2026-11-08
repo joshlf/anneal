@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsTier1.range_unchecked_length
 import Obligations.FxfsTier1.range_unchecked_length

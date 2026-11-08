@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsConcurrencyModels.lock_manager_is_allowed_and_acquire
 import Obligations.FxfsConcurrencyModels.lock_manager_is_allowed_and_acquire

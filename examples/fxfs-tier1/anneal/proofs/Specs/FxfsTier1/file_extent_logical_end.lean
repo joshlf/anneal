@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsTier1.file_extent_logical_end
 import Obligations.FxfsTier1.file_extent_logical_end

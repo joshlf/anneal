@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsTier1.fletcher64_step
 import Obligations.FxfsTier1.fletcher64_step

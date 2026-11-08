@@ -135,19 +135,96 @@ pub fn resolve_rustc_wrapper(config: &CaptureDriverConfig) -> PathBuf {
     PathBuf::from("anneal-rustc-capture")
 }
 
-/// Merge `ANODIZED_EMBED_SPECS_CFG` into an existing `RUSTFLAGS` value without
-/// duplicating the flag if it is already present.
-pub fn merge_rustflags(existing: Option<&str>) -> String {
-    match existing {
-        Some(flags) if !flags.trim().is_empty() => {
-            if flags.contains(ANODIZED_EMBED_SPECS_CFG) {
-                flags.to_string()
-            } else {
-                format!("{} {}", flags.trim_end(), ANODIZED_EMBED_SPECS_CFG)
+/// Parse `[package.metadata.anneal]` `capture_rustflags = [...]` from a
+/// `Cargo.toml` text string.
+///
+/// Unrecognized sections, comments, or missing keys return an empty vector.
+pub fn parse_manifest_capture_rustflags(cargo_toml: &str) -> Vec<String> {
+    let mut in_anneal_meta = false;
+    for raw_line in cargo_toml.lines() {
+        let line = strip_toml_comment_line(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_anneal_meta = line == "[package.metadata.anneal]"
+                || line == "[workspace.metadata.anneal]";
+            continue;
+        }
+        if !in_anneal_meta {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=')
+            && key.trim() == "capture_rustflags"
+        {
+            let arr = val.trim();
+            if let Some(inner) = arr.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                let mut flags = Vec::new();
+                for item in inner.split(',') {
+                    let item = item.trim();
+                    if let Some(unquoted) = item.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                        && !unquoted.trim().is_empty()
+                    {
+                        flags.push(unquoted.trim().to_string());
+                    }
+                }
+                return flags;
             }
         }
-        _ => ANODIZED_EMBED_SPECS_CFG.to_string(),
     }
+    Vec::new()
+}
+
+fn strip_toml_comment_line(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_quotes {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if ch == '#' && !in_quotes {
+            return &line[..idx];
+        }
+    }
+    line
+}
+
+/// Merge `ANODIZED_EMBED_SPECS_CFG` and optional manifest `capture_rustflags`
+/// into an existing `RUSTFLAGS` value without duplicating flags already present.
+pub fn merge_rustflags(existing: Option<&str>) -> String {
+    merge_rustflags_with_extra(existing, &[])
+}
+
+/// Merge `extra_flags` and `ANODIZED_EMBED_SPECS_CFG` into an existing
+/// `RUSTFLAGS` value without duplicating flags already present.
+pub fn merge_rustflags_with_extra(existing: Option<&str>, extra_flags: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(flags) = existing
+        && !flags.trim().is_empty()
+    {
+        parts.push(flags.trim().to_string());
+    }
+    let joined_existing = parts.join(" ");
+    for extra in extra_flags {
+        let extra = extra.trim();
+        if !extra.is_empty() && !joined_existing.contains(extra) && !parts.iter().any(|p| p == extra)
+        {
+            parts.push(extra.to_string());
+        }
+    }
+    if !parts.iter().any(|p| p.contains(ANODIZED_EMBED_SPECS_CFG)) {
+        parts.push(ANODIZED_EMBED_SPECS_CFG.to_string());
+    }
+    parts.join(" ")
 }
 
 /// Construct the `cargo check` command configured with
@@ -161,16 +238,22 @@ pub fn build_cargo_check_command(config: &CaptureDriverConfig) -> Command {
     let mut cmd = Command::new(cargo_bin);
     cmd.current_dir(&workspace_root);
     cmd.arg("check");
-    if let Some(ref manifest_path) = config.manifest_path {
+    let manifest_for_meta = if let Some(ref manifest_path) = config.manifest_path {
         let abs_manifest = crate::normalize_path_against(&base_dir, manifest_path);
-        cmd.arg("--manifest-path").arg(abs_manifest);
-    }
+        cmd.arg("--manifest-path").arg(&abs_manifest);
+        abs_manifest
+    } else {
+        workspace_root.join("Cargo.toml")
+    };
     for arg in &config.extra_cargo_args {
         cmd.arg(arg);
     }
+    let manifest_flags = fs::read_to_string(&manifest_for_meta)
+        .map(|raw| parse_manifest_capture_rustflags(&raw))
+        .unwrap_or_default();
     let wrapper = resolve_rustc_wrapper(config);
     let existing_rustflags = env::var("RUSTFLAGS").ok();
-    let rustflags = merge_rustflags(existing_rustflags.as_deref());
+    let rustflags = merge_rustflags_with_extra(existing_rustflags.as_deref(), &manifest_flags);
     cmd.env("RUSTC_WRAPPER", wrapper);
     cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
     cmd.env("ANNEAL_WHOLE_GRAPH_WRAPPER", "1");
@@ -3156,5 +3239,27 @@ end Proof.CrateA.caller_ffi_and_len
         compile_lean_file(&gen_dir.join("Verify/CrateA/caller_ffi_and_len.lean"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parses_manifest_capture_rustflags_and_merges_without_duplicates() {
+        let toml = r#"
+[package]
+name = "demo"
+version = "0.1.0"
+
+[package.metadata.anneal]
+capture_rustflags = ["-Zmir-enable-passes=-GVN", "-Cdebuginfo=0"] # comment
+
+[profile.dev]
+opt-level = 3
+"#;
+        let flags = parse_manifest_capture_rustflags(toml);
+        assert_eq!(flags, vec!["-Zmir-enable-passes=-GVN", "-Cdebuginfo=0"]);
+        let merged = merge_rustflags_with_extra(Some("-Zmir-enable-passes=-GVN"), &flags);
+        assert_eq!(
+            merged,
+            "-Zmir-enable-passes=-GVN -Cdebuginfo=0 --cfg anodized_embed_specs"
+        );
     }
 }

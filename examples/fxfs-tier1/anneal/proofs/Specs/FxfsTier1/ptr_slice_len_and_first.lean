@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsTier1.ptr_slice_len_and_first
 import Obligations.FxfsTier1.ptr_slice_len_and_first

@@ -15,3 +15,6 @@ debug = false
 debug-assertions = false
 overflow-checks = false
 incremental = false
+
+[package.metadata.anneal]
+capture_rustflags = ["-Zmir-enable-passes=-GVN"]

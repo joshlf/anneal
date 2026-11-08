@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsTier1.unicode_lookup_plane_bounds
 import Obligations.FxfsTier1.unicode_lookup_plane_bounds

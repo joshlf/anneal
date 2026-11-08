@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsTier1.ptr_slice_read_unaligned_u32
 import Obligations.FxfsTier1.ptr_slice_read_unaligned_u32

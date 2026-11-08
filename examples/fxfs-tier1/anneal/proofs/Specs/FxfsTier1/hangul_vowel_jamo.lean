@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsTier1.hangul_vowel_jamo
 import Obligations.FxfsTier1.hangul_vowel_jamo

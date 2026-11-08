@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsConcurrencyModels.skiplist_level_and_epoch_valid
 import Obligations.FxfsConcurrencyModels.skiplist_level_and_epoch_valid

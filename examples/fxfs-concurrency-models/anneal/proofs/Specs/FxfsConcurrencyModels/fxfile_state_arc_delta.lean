@@ -1,3 +1,4 @@
+-- @anneal-allow-replace-rust-spec
 import Trusted
 import Mir.FxfsConcurrencyModels.fxfile_state_arc_delta
 import Obligations.FxfsConcurrencyModels.fxfile_state_arc_delta
