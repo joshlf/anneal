@@ -125,11 +125,10 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     write_fileutil_stub(&fileutil, &fileutil_log, 0);
 
     // 1. Live smoke run with default seed `0x5eed0001` and no quarantine file:
-    // must run real Miri + Anneal, separate compared/agreed/diverged/not-compared,
-    // deduplicate the 2 raw divergences into 1 distinct fingerprint, and exit
-    // with status 4 (`EXIT_DIVERGENCE_DETECTED`). The UnsafeCell mutant
-    // (`pass_tb_unsafe_cell_shared_mutation__b1_c0`) agrees with Miri since
-    // I-11 fixed `&raw const` reborrows of `!Freeze` places.
+    // must run real Miri + Anneal and real ITree + Lean `TraceCheck`, separate
+    // compared/agreed/diverged/not-compared, materialize `coverage_ratchet.json`,
+    // and exit 0 (`PASS (0 divergences)`) now that all 4 previously open corpus
+    // bugs (`DIFF-AB`, `DIFF-C`, `DIFF-D`, `DIFF-E`) are fixed in `MirSemantics`.
     let out1 = run_campaign_driver(
         &fileutil,
         &[],
@@ -149,8 +148,8 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     let stderr1 = String::from_utf8_lossy(&out1.stderr);
     assert_eq!(
         out1.status.code(),
-        Some(4),
-        "live smoke campaign with unquarantined divergences must exit 4:\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
+        Some(0),
+        "live smoke campaign on 0x5eed0001 must exit 0:\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
     );
     assert!(
         !fileutil_log.exists(),
@@ -161,8 +160,8 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         fs::read_to_string(state_dir.join("reports/LATEST_REPORT.md")).expect("read LATEST_REPORT");
     assert_eq!(report1.trim(), stdout1.trim());
     assert!(
-        report1.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 1 raw)."),
-        "report must announce 1 unquarantined distinct / 1 raw divergence:\n{report1}"
+        report1.contains("Status: PASS (0 divergences)."),
+        "report must announce PASS (0 divergences):\n{report1}"
     );
     assert!(
         report1.contains("| Oracle comparison | **performed** | **performed** |"),
@@ -173,18 +172,18 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "report must show 16 compared candidates for both miri-difftest and itree-difftest:\n{report1}"
     );
     assert!(
-        report1.contains("| Agreed | 15 | 16 ("),
-        "report must show 15 agreed Miri candidates and 16 agreed ITree candidates:\n{report1}"
+        report1.contains("| Agreed | 16 | 16 ("),
+        "report must show 16 agreed Miri candidates and 16 agreed ITree candidates:\n{report1}"
     );
     assert!(
         report1.contains(
-            "| Diverged (raw / distinct) | 1 (1 distinct: 1 unquarantined, 0 quarantined) | 0 (0 distinct: 0 unquarantined, 0 quarantined) |"
+            "| Diverged (raw / distinct) | 0 (0 distinct: 0 unquarantined, 0 quarantined) | 0 (0 distinct: 0 unquarantined, 0 quarantined) |"
         ),
         "report must show raw and deduplicated divergence counts:\n{report1}"
     );
     assert!(
-        report1.contains("| Kernel-confirmed divergences (`by rfl`) | 1 | 0 ("),
-        "report must show 1 kernel-confirmed Miri divergence and 0 ITree divergences:\n{report1}"
+        report1.contains("| Kernel-confirmed divergences (`by rfl`) | 0 | 0 ("),
+        "report must show 0 kernel-confirmed Miri and ITree divergences:\n{report1}"
     );
     assert!(
         report1.contains("| Not compared | 0 | 0 |"),
@@ -214,13 +213,90 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
             "red-flag check `{check}` must PASS in live smoke report:\n{report1}"
         );
     }
+    let ratchet_json = fs::read_to_string(state_dir.join("state/coverage_ratchet.json"))
+        .expect("read coverage_ratchet.json");
     assert!(
-        report1.contains("| `RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub` | `ub_location_mismatch` | 1 |"),
-        "report must list deduplicated RawPtrOffsetMutator ub_location_mismatch fingerprint:\n{report1}"
+        ratchet_json.contains("\"cumulative_distinct_obs_paths\":")
+            && !ratchet_json.contains("\"cumulative_distinct_obs_paths\": 0"),
+        "coverage_ratchet.json must record non-zero cumulative_distinct_obs_paths:\n{ratchet_json}"
+    );
+
+    // 2. Live kernel-confirmed Miri vs. Anneal divergence bundle + `--reproduce` +
+    // unquarantined / partial-quarantine / full-quarantine verification:
+    // Evaluate a batch with 3 corpus candidates plus a negative-control
+    // candidate (`char` surrogate written through `*mut u32`) through live
+    // `evaluate_miri_batches` to produce a real `repro.rs` bundle on disk.
+    let root = repo_root();
+    let mut div_batch =
+        anneal_difftest::mutators_miri::generate_miri_corpus_batch(3, 0x5eed_0001, 0);
+    let neg_fn = "\
+pub fn neg_ctrl_char_surrogate_via_ptr__b0_c3() -> u32 {
+    let mut c: char = 'a';
+    let p: *mut u32 = (&raw mut c) as *mut u32;
+    unsafe {
+        *p = 0xD800u32;
+    }
+    c as u32
+}
+";
+    div_batch.push(anneal_difftest::mutators_miri::GeneratedMiriCandidate {
+        id: 3,
+        seed_index: 0,
+        seed_name: "ub_transmute_invalid_char_surrogate".to_string(),
+        fn_name: "neg_ctrl_char_surrogate_via_ptr__b0_c3".to_string(),
+        seed_u64: 0xDEAD_BEEF,
+        applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: neg_fn.to_string(),
+        source: anneal_difftest::mutators_miri::build_standalone_candidate_source(neg_fn),
+    });
+    let live_findings_dir = dir.join("live_findings");
+    let live_div_eval = anneal_difftest::miri_eval::evaluate_miri_batches(
+        "seeded",
+        0x5eed_0001,
+        &[div_batch],
+        4,
+        Some(&live_findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate live divergence batch");
+    let live_div_payload = anneal_difftest::miri_eval::render_eval_report_json(&live_div_eval);
+
+    let state_dir_div = dir.join("state_dir_div");
+    let out_div = run_campaign_driver(
+        &fileutil,
+        &[],
+        &[],
+        &[format!("miri_summary={live_div_payload}")],
+        &[
+            "--profile",
+            "smoke",
+            "--miri-only",
+            "--x20-uri",
+            "",
+            "--junit-xml",
+            &junit_arg,
+        ],
+        &state_dir_div,
+    );
+    let stdout_div = String::from_utf8_lossy(&out_div.stdout);
+    let stderr_div = String::from_utf8_lossy(&out_div.stderr);
+    assert_eq!(
+        out_div.status.code(),
+        Some(4),
+        "campaign with unquarantined divergence must exit 4:\nstdout:\n{stdout_div}\nstderr:\n{stderr_div}"
+    );
+    let report_div = fs::read_to_string(state_dir_div.join("reports/LATEST_REPORT.md"))
+        .expect("read LATEST_REPORT for div run");
+    assert!(
+        report_div.contains("Status: DIVERGENCE DETECTED (1 unquarantined distinct, 1 raw)."),
+        "report must announce 1 unquarantined distinct / 1 raw divergence:\n{report_div}"
     );
     assert!(
-        !report1.contains("pass_tb_unsafe_cell_shared_mutation"),
-        "fixed UnsafeCell false_positive_ub must no longer be reported:\n{report1}"
+        report_div.contains(
+            "| `BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar` | `missed_ub` | 1 |"
+        ),
+        "report must list deduplicated BitValidityTransmuteMutator missed_ub fingerprint:\n{report_div}"
     );
 
     let junit1 = fs::read_to_string(&junit).expect("read JUnit XML");
@@ -235,10 +311,12 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
 
     // Verify `LATEST_CAMPAIGN_SUMMARY.json` and reproduce each distinct finding's
     // `primary_repro_path` via `miri-difftest --reproduce`.
-    let summary_json = fs::read_to_string(state_dir.join("reports/LATEST_CAMPAIGN_SUMMARY.json"))
-        .expect("read LATEST_CAMPAIGN_SUMMARY.json");
-    assert!(summary_json.contains("\"fingerprint\": \"RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub\""));
-    assert!(!summary_json.contains("pass_tb_unsafe_cell_shared_mutation:false_positive_ub"));
+    let summary_json =
+        fs::read_to_string(state_dir_div.join("reports/LATEST_CAMPAIGN_SUMMARY.json"))
+            .expect("read LATEST_CAMPAIGN_SUMMARY.json");
+    assert!(summary_json.contains(
+        "\"fingerprint\": \"BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar\""
+    ));
 
     // Extract primary_repro_path values from the summary JSON and run `--reproduce` on each.
     let repro_paths: Vec<PathBuf> = summary_json
@@ -249,7 +327,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
             let path_str = rest.strip_suffix("\",")?;
             Some(PathBuf::from(path_str))
         })
-        .collect::< std::collections::BTreeSet<_> >()
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
     assert_eq!(
@@ -282,9 +360,9 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         );
     }
 
-    // 2. Partial quarantine (seeding a known divergence that is NOT quarantined):
-    // Quarantining only an unrelated fingerprint leaves `RawPtrOffsetMutator`
-    // unquarantined on `--miri-seed 0x5eed0001`, which must still fail with exit 4.
+    // 3. Partial quarantine (seeding a known divergence that is NOT quarantined):
+    // Quarantining only an unrelated fingerprint leaves `BitValidityTransmuteMutator`
+    // unquarantined, which must still fail with exit 4.
     let partial_quarantine = dir.join("partial_quarantine.json");
     fs::write(
         &partial_quarantine,
@@ -296,7 +374,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         &fileutil,
         &[],
         &[],
-        &[],
+        &[format!("miri_summary={live_div_payload}")],
         &[
             "--profile",
             "smoke",
@@ -322,7 +400,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "partial quarantine must leave 1 unquarantined distinct divergence:\n{report_partial}"
     );
 
-    // 3. Full quarantine of the known fingerprint: when all encountered
+    // 4. Full quarantine of the known fingerprint: when all encountered
     // divergences are quarantined, the campaign must exit 0 (`EXIT_SUCCESS`)
     // and emit 0 JUnit failures.
     let full_quarantine = dir.join("full_quarantine.json");
@@ -330,7 +408,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         &full_quarantine,
         r#"{
             "quarantined": [
-                "RawPtrOffsetMutator:ub_location_mismatch:MirDiffTag.ub"
+                "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar"
             ]
         }"#,
     )
@@ -340,10 +418,11 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         &fileutil,
         &[],
         &[],
-        &[],
+        &[format!("miri_summary={live_div_payload}")],
         &[
             "--profile",
             "smoke",
+            "--miri-only",
             "--miri-seed",
             "0x5eed0001",
             "--quarantine-file",

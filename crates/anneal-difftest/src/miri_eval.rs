@@ -156,6 +156,9 @@ pub struct MiriCampaignEvalReport {
     pub mutator_applications: BTreeMap<String, usize>,
     /// Detailed finding bundles for every `ComparisonVerdict::Diverge` item.
     pub findings: Vec<MiriFindingBundle>,
+    /// Deterministic, sorted observation-path signatures observed during live
+    /// oracle evaluation (`miri:<mutator_chain_or_template>:<verdict_or_outcome>:<diff_tag>`).
+    pub obs_path_signatures: Vec<String>,
     /// Per-item oracle reports from `run_difftest_oracle_pipeline`.
     pub item_reports: Vec<ItemOracleReport>,
     /// Total wall-clock duration in milliseconds.
@@ -581,8 +584,52 @@ pub fn evaluate_miri_batches(
 
     let mut findings = Vec::new();
     let mut kernel_confirmed_divergences = 0usize;
+    let mut obs_path_signatures_set = std::collections::BTreeSet::new();
 
     for item_rep in &oracle_report.items {
+        let miri_sig_tag = match &item_rep.miri {
+            MiriOutcome::PassUnit => "pass_unit".to_string(),
+            MiriOutcome::PassScalar { size_bytes, .. } => format!("pass_scalar_{size_bytes}"),
+            MiriOutcome::Panic { .. } => "panic".to_string(),
+            MiriOutcome::Ub { .. } => "ub".to_string(),
+            MiriOutcome::OracleError(_) => "error".to_string(),
+        };
+        let anneal_sig_tag = match &item_rep.anneal {
+            AnnealOutcome::PassUnit => "pass_unit".to_string(),
+            AnnealOutcome::PassScalar { size_bytes, .. } => format!("pass_scalar_{size_bytes}"),
+            AnnealOutcome::PassOther => "pass_other".to_string(),
+            AnnealOutcome::Panic { .. } => "panic".to_string(),
+            AnnealOutcome::Abort { .. } => "abort".to_string(),
+            AnnealOutcome::Ub { .. } => "ub".to_string(),
+            AnnealOutcome::ExternalCall { .. } => "external_call".to_string(),
+            AnnealOutcome::Unsupported { .. } => "unsupported".to_string(),
+            AnnealOutcome::OutOfFuel { .. } => "out_of_fuel".to_string(),
+            AnnealOutcome::CaptureOrLeanError(_) => "error".to_string(),
+        };
+        let diff_sig_tag = match &item_rep.verdict {
+            ComparisonVerdict::Agree => "agree".to_string(),
+            ComparisonVerdict::Diverge(div_kind) => divergence_class_slug(div_kind).to_string(),
+            ComparisonVerdict::NotCompared(reason) => match reason {
+                NotComparedReason::ExternalCall(_) => "not_compared_external_call".to_string(),
+                NotComparedReason::Unsupported(_) => "not_compared_unsupported".to_string(),
+                NotComparedReason::OutOfFuel(_) => "not_compared_out_of_fuel".to_string(),
+                NotComparedReason::MiriOracleError(_) => "not_compared_miri_oracle_error".to_string(),
+                NotComparedReason::CaptureFailed(_) => "not_compared_capture_failed".to_string(),
+            },
+        };
+        let template_and_chain = if let Some((cand, _)) = cand_by_name.get(&item_rep.name) {
+            if cand.applied_mutators.is_empty() {
+                format!("{}@identity", cand.seed_name)
+            } else {
+                format!("{}@{}", cand.seed_name, cand.applied_mutators.join("+"))
+            }
+        } else {
+            item_rep.name.clone()
+        };
+        obs_path_signatures_set.insert(format!(
+            "miri:{template_and_chain}:{miri_sig_tag}_vs_{anneal_sig_tag}:{diff_sig_tag}"
+        ));
+
         match &item_rep.miri {
             MiriOutcome::PassUnit | MiriOutcome::PassScalar { .. } => {
                 *miri_verdicts.entry("pass".to_string()).or_insert(0) += 1;
@@ -792,6 +839,7 @@ pub fn evaluate_miri_batches(
         unmodeled_external_calls,
         mutator_applications,
         findings,
+        obs_path_signatures: obs_path_signatures_set.into_iter().collect(),
         item_reports: oracle_report.items,
         elapsed_ms,
     })
@@ -881,6 +929,19 @@ fn render_usize_map_json(map: &BTreeMap<String, usize>, indent: usize) -> String
         .map(|(k, v)| format!("{inner_pad}{}: {v}", json_escape(k)))
         .collect();
     format!("{{\n{}\n{pad}}}", rows.join(",\n"))
+}
+
+fn render_string_list_json(items: &[String], indent: usize) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let pad = " ".repeat(indent);
+    let inner_pad = " ".repeat(indent + 2);
+    let rows: Vec<String> = items
+        .iter()
+        .map(|s| format!("{inner_pad}{}", json_escape(s)))
+        .collect();
+    format!("[\n{}\n{pad}]", rows.join(",\n"))
 }
 
 fn render_opt_str_json(opt: &Option<String>) -> String {
@@ -981,6 +1042,7 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
          \x20 \"not_compared_reasons\": {},\n\
          \x20 \"unmodeled_external_calls\": {},\n\
          \x20 \"mutator_applications\": {},\n\
+         \x20 \"obs_path_signatures\": {},\n\
          \x20 \"findings_count\": {},\n\
          \x20 \"findings\": {findings_json},\n\
          \x20 \"elapsed_ms\": {:.2}\n\
@@ -1004,6 +1066,7 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
         render_usize_map_json(&report.not_compared_reasons, 2),
         render_usize_map_json(&report.unmodeled_external_calls, 2),
         render_usize_map_json(&report.mutator_applications, 2),
+        render_string_list_json(&report.obs_path_signatures, 2),
         report.findings.len(),
         report.elapsed_ms,
     )

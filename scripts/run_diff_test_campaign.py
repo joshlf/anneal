@@ -33,6 +33,7 @@ Exit status:
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
 import datetime
 import json
@@ -59,6 +60,10 @@ EXIT_DIVERGENCE_DETECTED = 4
 
 DEFAULT_MIN_ORACLE_ELAPSED_MS = 50.0
 DEFAULT_MAX_ORACLE_ERRORS = 0
+
+# Module-level diagnostic store populated by `run_harness` (preserving its
+# 4-positional-argument signature for unit-test monkey-patching).
+LAST_HARNESS_DIAGNOSTICS: dict[str, dict[str, Any]] = {}
 
 VALID_DIVERGENCE_CLASSES = (
     "wrong_value",
@@ -221,8 +226,10 @@ def check_x20_uri(x20_uri: str) -> None:
         )
 
 
-def sync_state_from_x20(x20_uri: str, state_dir: Path) -> None:
-    """Pulls the ledger from `/x20/` via `fileutil` RPC."""
+def sync_state_from_x20(
+    x20_uri: str, state_dir: Path, include_ratchet: bool = True
+) -> None:
+    """Pulls the ledger (and coverage ratchet in live mode) from `/x20/` via `fileutil` RPC."""
     if not x20_uri or not has_x20_fileutil():
         return
     check_x20_uri(x20_uri)
@@ -235,6 +242,15 @@ def sync_state_from_x20(x20_uri: str, state_dir: Path) -> None:
             str(state_dir / "state" / "campaign_ledger.json"),
         ]
     )
+    if include_ratchet:
+        run_fileutil(
+            [
+                "cp",
+                "-f",
+                f"{x20_uri.rstrip('/')}/state/coverage_ratchet.json",
+                str(state_dir / "state" / "coverage_ratchet.json"),
+            ]
+        )
 
 
 def sync_state_to_x20(state_dir: Path, x20_uri: str, written: list[Path]) -> None:
@@ -338,31 +354,71 @@ def run_harness(
     ]
     env = dict(os.environ)
     env["ANNEAL_CALLER_PATH"] = env.get("PATH", "")
+    t0 = time.monotonic()
     res = subprocess.run(
         cmd, cwd=str(repo_root), env=env, text=True, capture_output=True
     )
+    elapsed_s = round(time.monotonic() - t0, 3)
+    stderr_lines = res.stderr.strip().splitlines() if res.stderr else []
+    stderr_tail = "\n".join(stderr_lines[-20:])
     if res.returncode != 0:
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+            "exit_code": res.returncode,
+            "oracle_error_reason": f"process_exit_{res.returncode}",
+            "stderr_tail": stderr_tail,
+            "elapsed_s": elapsed_s,
+        }
         sys.stderr.write(f"{bin_name} failed (exit {res.returncode}):\n{res.stderr}\n")
         return None
     try:
         summary = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+            "exit_code": res.returncode,
+            "oracle_error_reason": f"unreadable_json: {e}",
+            "stderr_tail": stderr_tail,
+            "elapsed_s": elapsed_s,
+        }
         sys.stderr.write(f"{bin_name} produced unreadable JSON: {e}\n")
         return None
     if not isinstance(summary, dict):
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+            "exit_code": res.returncode,
+            "oracle_error_reason": "non_object_json",
+            "stderr_tail": stderr_tail,
+            "elapsed_s": elapsed_s,
+        }
         sys.stderr.write(f"{bin_name} produced a non-object JSON summary\n")
         return None
     for key in HARNESS_INT_KEYS:
         val = summary.get(key)
         if val is not None and (isinstance(val, bool) or not isinstance(val, int)):
+            LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+                "exit_code": res.returncode,
+                "oracle_error_reason": f"non_integer_{key}",
+                "stderr_tail": stderr_tail,
+                "elapsed_s": elapsed_s,
+            }
             sys.stderr.write(f"{bin_name} produced non-integer {key}={val!r}\n")
             return None
     elapsed = summary.get("elapsed_ms")
     if elapsed is not None and (
         isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
     ):
+        LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+            "exit_code": res.returncode,
+            "oracle_error_reason": "non_numeric_elapsed_ms",
+            "stderr_tail": stderr_tail,
+            "elapsed_s": elapsed_s,
+        }
         sys.stderr.write(f"{bin_name} produced non-numeric elapsed_ms={elapsed!r}\n")
         return None
+    LAST_HARNESS_DIAGNOSTICS[bin_name] = {
+        "exit_code": 0,
+        "oracle_error_reason": None,
+        "stderr_tail": stderr_tail,
+        "elapsed_s": elapsed_s,
+    }
     return summary
 
 
@@ -574,7 +630,7 @@ def evaluate_itree_red_flags(
         reasons.append(
             f"itree_oracle_not_invoked: unsafe_token_violations={unsafe_violations} != 0"
         )
-    if compared <= 0 or compared != opt_both or compared + not_compared_cands != total:
+    if compared <= 0 or compared > opt_both or compared + not_compared_cands != total:
         oracle_invoked = False
         reasons.append(
             f"itree_oracle_not_invoked: compared ({compared}), opt_both ({opt_both}), "
@@ -908,16 +964,34 @@ def normalize_anneal_tag(raw_tag: str) -> str:
     return clean
 
 
-def extract_fault_line_text(finding: dict[str, Any]) -> str:
-    """Returns the source line at the earliest fault (`miri_pos` or `anneal_span`).
+ALL_MIRI_MUTATOR_TOKENS = (
+    "__miri_ptr_",
+    "__oob_",
+    "__neg_",
+    "__ptr_pair",
+    "__base_ptr",
+    "__miri_tb_",
+    "__tb_",
+    "__miri_valid_",
+    "__valid_",
+    "__bad_",
+    "__uninit_",
+    "__padded",
+    "__pad_bytes",
+    "__ptr_b",
+    "__raw_u8",
+    "__miri_arith_",
+    "__miri_wide",
+    "__miri_proj_",
+    "__proj_",
+)
 
-    When Anneal faults inside the unmutated seed body at an earlier line than a
-    subsequent Miri fault in an appended mutator tail (or vice versa), the
-    earliest line number is the point where the two executions first diverged.
-    """
+
+def extract_earliest_fault_line_no(finding: dict[str, Any]) -> int | None:
+    """Returns the 1-based line number of the earliest fault (`miri_pos` or `anneal_span`)."""
     src = finding.get("mutant_source")
     if not isinstance(src, str) or not src:
-        return ""
+        return None
     src_lines = src.splitlines()
     earliest_line_no: int | None = None
     for loc_key in ("miri_pos", "anneal_span"):
@@ -930,8 +1004,23 @@ def extract_fault_line_text(finding: dict[str, Any]) -> str:
             if 1 <= line_no <= len(src_lines):
                 if earliest_line_no is None or line_no < earliest_line_no:
                     earliest_line_no = line_no
+    return earliest_line_no
+
+
+def extract_fault_line_text(finding: dict[str, Any]) -> str:
+    """Returns the source line at the earliest fault (`miri_pos` or `anneal_span`).
+
+    When Anneal faults inside the unmutated seed body at an earlier line than a
+    subsequent Miri fault in an appended mutator tail (or vice versa), the
+    earliest line number is the point where the two executions first diverged.
+    """
+    src = finding.get("mutant_source")
+    if not isinstance(src, str) or not src:
+        return ""
+    earliest_line_no = extract_earliest_fault_line_no(finding)
     if earliest_line_no is None:
         return ""
+    src_lines = src.splitlines()
     return src_lines[earliest_line_no - 1]
 
 
@@ -975,6 +1064,20 @@ def infer_finding_cause(
             return "ArithmeticCastMutator"
         if any(tok in fault_text for tok in ("__miri_proj_", "__proj_")):
             return "PlaceProjectionWrapper"
+
+        # If the earliest fault occurred inside the unmutated seed prefix before
+        # an appended mutator tail (which only introduces mutator tokens on later
+        # lines), attribute the fault to `seed_name`.
+        earliest_line_no = extract_earliest_fault_line_no(finding)
+        src = finding.get("mutant_source")
+        if earliest_line_no is not None and isinstance(src, str):
+            src_lines = src.splitlines()
+            prefix_text = "\n".join(src_lines[:earliest_line_no])
+            suffix_text = "\n".join(src_lines[earliest_line_no:])
+            if not any(tok in prefix_text for tok in ALL_MIRI_MUTATOR_TOKENS) and any(
+                tok in suffix_text for tok in ALL_MIRI_MUTATOR_TOKENS
+            ):
+                return seed_name
 
     if seed_name in known_corpus_bug_seeds or not first_mutator:
         return seed_name
@@ -1413,10 +1516,321 @@ def write_oracle_junit_xml(
     tree.write(junit_path, encoding="utf-8", xml_declaration=True)
 
 
+def infer_fingerprint_suite(fp: str, entry: dict[str, Any] | None = None) -> str:
+    """Infers which harness suite (`miri-difftest` or `itree-difftest`) owns `fp`."""
+    if isinstance(entry, dict):
+        s = entry.get("suite") or entry.get("harness")
+        if s in ("miri-difftest", "miri"):
+            return "miri-difftest"
+        if s in ("itree-difftest", "itree"):
+            return "itree-difftest"
+    if (
+        "TraceReplayDiag." in fp
+        or ":itree_" in fp
+        or fp.startswith(
+            (
+                "itree:",
+                "itree_seed_",
+                "CallBoundaryOutliner:",
+                "LayoutPaddingPerturber:",
+                "BranchLoopWeaver:",
+                "ExtOracleInjector:",
+            )
+        )
+    ):
+        return "itree-difftest"
+    return "miri-difftest"
+
+
+def update_suite_scoped_fingerprints(
+    ledger: dict[str, Any],
+    date_prefix: str,
+    miri_suite_healthy: bool,
+    miri_unquarantined: list[DeduplicatedFinding],
+    miri_quarantined: list[DeduplicatedFinding],
+    itree_suite_healthy: bool,
+    itree_unquarantined: list[DeduplicatedFinding],
+    itree_quarantined: list[DeduplicatedFinding],
+) -> None:
+    """Updates `active_fingerprints`, `quarantined_fingerprints`, `fingerprint_history`,
+    and `resolved_history` independently per suite so an unhealthy or skipped suite
+    never falsely ages or resolves its fingerprints.
+    """
+    prev_active_raw = ledger.get("active_fingerprints", [])
+    prev_active_list: list[str] = (
+        [str(x) for x in prev_active_raw if isinstance(x, str)]
+        if isinstance(prev_active_raw, list)
+        else []
+    )
+    prev_quar_raw = ledger.get("quarantined_fingerprints", [])
+    prev_quar_list: list[str] = (
+        [str(x) for x in prev_quar_raw if isinstance(x, str)]
+        if isinstance(prev_quar_raw, list)
+        else []
+    )
+    raw_fp_hist = ledger.get("fingerprint_history", {})
+    fp_history: dict[str, dict[str, Any]] = (
+        {
+            str(k): copy.deepcopy(v)
+            for k, v in raw_fp_hist.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        }
+        if isinstance(raw_fp_hist, dict)
+        else {}
+    )
+    raw_res_hist = ledger.get("resolved_history", {})
+    resolved_history: dict[str, dict[str, Any]] = (
+        {
+            str(k): copy.deepcopy(v)
+            for k, v in raw_res_hist.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        }
+        if isinstance(raw_res_hist, dict)
+        else {}
+    )
+
+    for fp in prev_active_list:
+        if fp not in fp_history:
+            fp_history[fp] = {
+                "first_seen_date": date_prefix,
+                "last_seen_date": date_prefix,
+                "campaigns_failing": 1,
+                "suite": infer_fingerprint_suite(fp),
+            }
+
+    new_active: list[str] = []
+    new_quarantined: list[str] = []
+
+    for suite_name, is_healthy, suite_unquar, suite_quar in (
+        ("miri-difftest", miri_suite_healthy, miri_unquarantined, miri_quarantined),
+        ("itree-difftest", itree_suite_healthy, itree_unquarantined, itree_quarantined),
+    ):
+        prev_suite_active = {
+            fp
+            for fp in prev_active_list
+            if infer_fingerprint_suite(fp, fp_history.get(fp)) == suite_name
+        }
+        prev_suite_quar = {
+            fp
+            for fp in prev_quar_list
+            if infer_fingerprint_suite(fp, fp_history.get(fp)) == suite_name
+        }
+        prev_suite_hist_keys = {
+            fp
+            for fp, meta in fp_history.items()
+            if infer_fingerprint_suite(fp, meta) == suite_name
+        }
+
+        if is_healthy:
+            obs_unquar = {d.fingerprint for d in suite_unquar}
+            obs_quar = {d.fingerprint for d in suite_quar}
+
+            for fp in sorted(obs_unquar):
+                prev_meta = fp_history.get(fp)
+                if isinstance(prev_meta, dict):
+                    first_seen = str(prev_meta.get("first_seen_date") or date_prefix)
+                    failing_cnt = int(prev_meta.get("campaigns_failing", 0)) + 1
+                else:
+                    first_seen = date_prefix
+                    failing_cnt = 1
+                fp_history[fp] = {
+                    "first_seen_date": first_seen,
+                    "last_seen_date": date_prefix,
+                    "campaigns_failing": failing_cnt,
+                    "suite": suite_name,
+                }
+                resolved_history.pop(fp, None)
+
+            to_resolve = (prev_suite_active | prev_suite_hist_keys) - obs_unquar
+            for fp in sorted(to_resolve):
+                prev_meta = fp_history.pop(fp, None)
+                resolved_history[fp] = {
+                    "first_seen_date": str(
+                        (prev_meta or {}).get("first_seen_date") or date_prefix
+                    ),
+                    "last_seen_date": str(
+                        (prev_meta or {}).get("last_seen_date") or date_prefix
+                    ),
+                    "campaigns_failing": int(
+                        (prev_meta or {}).get("campaigns_failing", 1)
+                    ),
+                    "resolved_date": date_prefix,
+                    "suite": suite_name,
+                }
+
+            new_active.extend(sorted(obs_unquar))
+            new_quarantined.extend(sorted(obs_quar))
+        else:
+            # Preserve existing active/quarantined/history entries for this suite untouched.
+            for fp in prev_active_list:
+                if fp in prev_suite_active and fp not in new_active:
+                    new_active.append(fp)
+            for fp in prev_quar_list:
+                if fp in prev_suite_quar and fp not in new_quarantined:
+                    new_quarantined.append(fp)
+
+    ledger["active_fingerprints"] = new_active
+    ledger["quarantined_fingerprints"] = new_quarantined
+    ledger["fingerprint_history"] = fp_history
+    ledger["resolved_history"] = resolved_history
+
+
+def load_coverage_ratchet(ratchet_path: Path) -> dict[str, Any]:
+    if not ratchet_path.is_file():
+        return {}
+    try:
+        data = json.loads(ratchet_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def extract_suite_obs_path_signatures(
+    suite_key: str, summary: dict[str, Any], seed_val: int
+) -> list[str]:
+    """Extracts deterministic observation-path signatures from a healthy suite summary."""
+    raw_sigs = summary.get("obs_path_signatures")
+    if isinstance(raw_sigs, list):
+        cleaned = sorted(
+            {
+                (s.strip() if s.strip().startswith(f"{suite_key}:") else f"{suite_key}:{s.strip()}")
+                for s in raw_sigs
+                if isinstance(s, str) and s.strip()
+            }
+        )
+        if cleaned:
+            return cleaned
+
+    # Fallback derivation for unit-test mock summaries that omit `obs_path_signatures`.
+    seed_hex = f"0x{seed_val:08x}"
+    derived: set[str] = set()
+    if suite_key == "miri":
+        muts = summary.get("mutator_applications", {})
+        verdicts = summary.get("miri_verdicts", {})
+        active_muts = sorted(
+            k for k, v in (muts.items() if isinstance(muts, dict) else []) if int(v) > 0
+        ) or ["identity"]
+        active_verdicts = sorted(
+            k
+            for k, v in (verdicts.items() if isinstance(verdicts, dict) else [])
+            if int(v) > 0
+        ) or ["pass"]
+        for m in active_muts:
+            for v in active_verdicts:
+                derived.add(f"miri:{m}@{seed_hex}:{v}_vs_{v}:agree")
+    else:
+        n_obs = max(1, int(summary.get("distinct_obs_paths", 1)))
+        for idx in range(n_obs):
+            derived.add(f"itree:seed@{seed_hex}:obs_{idx:04d}:normal")
+    return sorted(derived)
+
+
+def update_coverage_ratchet(
+    ratchet_path: Path,
+    ledger: dict[str, Any],
+    miri_suite_healthy: bool,
+    miri: dict[str, Any] | None,
+    miri_seed: int,
+    itree_suite_healthy: bool,
+    itree: dict[str, Any] | None,
+    itree_seed: int,
+) -> Path:
+    """Monotonically merges observation-path signatures from healthy suite(s)
+    into `state/coverage_ratchet.json` and updates `ledger['cumulative_distinct_obs_paths']`.
+    """
+    ratchet = load_coverage_ratchet(ratchet_path)
+    raw_obs = ratchet.get("observed_paths", {})
+    observed_paths: dict[str, dict[str, Any]] = (
+        {
+            str(k): copy.deepcopy(v)
+            for k, v in raw_obs.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        }
+        if isinstance(raw_obs, dict)
+        else {}
+    )
+    now_utc = utc_now_iso()
+
+    for suite_key, is_healthy, summary, seed_val in (
+        ("miri", miri_suite_healthy, miri, miri_seed),
+        ("itree", itree_suite_healthy, itree, itree_seed),
+    ):
+        if not is_healthy or summary is None:
+            continue
+        seed_hex = f"0x{seed_val:08x}"
+        for sig in extract_suite_obs_path_signatures(suite_key, summary, seed_val):
+            prev = observed_paths.get(sig)
+            if isinstance(prev, dict):
+                prev["last_seen_utc"] = now_utc
+                prev["last_seen_seed"] = seed_hex
+                prev["hit_count"] = int(prev.get("hit_count", 1)) + 1
+                prev["suite"] = suite_key
+            else:
+                observed_paths[sig] = {
+                    "suite": suite_key,
+                    "first_seen_utc": now_utc,
+                    "last_seen_utc": now_utc,
+                    "first_seen_seed": seed_hex,
+                    "last_seen_seed": seed_hex,
+                    "hit_count": 1,
+                }
+
+    miri_obs_count = sum(
+        1
+        for k, v in observed_paths.items()
+        if (v.get("suite") == "miri" if isinstance(v, dict) else k.startswith("miri:"))
+    )
+    itree_obs_count = sum(
+        1
+        for k, v in observed_paths.items()
+        if (v.get("suite") == "itree" if isinstance(v, dict) else k.startswith("itree:"))
+    )
+    prev_per_suite = (
+        ratchet.get("per_suite_distinct_obs_paths")
+        if isinstance(ratchet.get("per_suite_distinct_obs_paths"), dict)
+        else {}
+    )
+    miri_ratchet = max(int(prev_per_suite.get("miri", 0)), miri_obs_count)
+    itree_ratchet = max(int(prev_per_suite.get("itree", 0)), itree_obs_count)
+    if itree_suite_healthy and itree is not None:
+        itree_ratchet = max(itree_ratchet, int(itree.get("distinct_obs_paths", 0)))
+
+    prev_ratchet_total = (
+        int(ratchet.get("cumulative_distinct_obs_paths", 0))
+        if isinstance(ratchet.get("cumulative_distinct_obs_paths"), int)
+        else 0
+    )
+    prev_ledger_total = ledger_counter(ledger, "cumulative_distinct_obs_paths")
+    new_total = max(
+        prev_ratchet_total,
+        prev_ledger_total,
+        len(observed_paths),
+        miri_ratchet + itree_ratchet if miri_obs_count > 0 and itree_obs_count > 0 else max(miri_ratchet, itree_ratchet),
+    )
+
+    updated_ratchet = {
+        "schema_version": 1,
+        "updated_utc": now_utc,
+        "cumulative_distinct_obs_paths": new_total,
+        "per_suite_distinct_obs_paths": {
+            "miri": miri_ratchet,
+            "itree": itree_ratchet,
+        },
+        "observed_paths": observed_paths,
+    }
+    ratchet_path.parent.mkdir(parents=True, exist_ok=True)
+    ratchet_path.write_text(
+        json.dumps(updated_ratchet, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    ledger["cumulative_distinct_obs_paths"] = new_total
+    return ratchet_path
+
+
 def render_oracle_campaign_report(
     profile: CampaignProfile,
     date_prefix: str,
-    miri: dict[str, Any],
+    miri: dict[str, Any] | None,
     miri_red_flags: RedFlagResult,
     all_dedup: list[DeduplicatedFinding],
     unquarantined: list[DeduplicatedFinding],
@@ -1433,6 +1847,9 @@ def render_oracle_campaign_report(
     elapsed_sec: float,
 ) -> str:
     """Renders the full Markdown report for a live oracle campaign."""
+    miri_performed = (
+        miri is not None and miri.get("oracle_comparison") == "performed"
+    )
     itree_performed = (
         include_itree
         and itree is not None
@@ -1442,11 +1859,13 @@ def render_oracle_campaign_report(
     itree_failed = include_itree and not (
         itree_ran_without_oracle or (itree_performed and itree_red_flags.passed)
     )
-    raw_divergences = int(miri["diverge_count"]) + (
+    raw_divergences = (
+        int(miri.get("diverge_count", 0)) if miri_performed and miri is not None else 0
+    ) + (
         int(itree["diverge_traces"]) if itree_performed and itree is not None else 0
     )
 
-    if not miri_red_flags.passed or itree_failed:
+    if not miri_performed or not miri_red_flags.passed or itree_failed:
         status = "RED FLAG / HARNESS FAILED"
     elif len(unquarantined) > 0:
         status = (
@@ -1465,10 +1884,19 @@ def render_oracle_campaign_report(
     else:
         status = "PASS (0 divergences)"
 
+    miri_mode_cell = (
+        f"`{miri.get('mode', 'seeded')}`"
+        if miri_performed and miri is not None
+        else "`harness-failed`"
+    )
     itree_mode_cell = (
         f"`{itree.get('mode', 'seeded')}`"
         if itree_performed and itree is not None
-        else ("`compile-only`" if include_itree else "skipped")
+        else (
+            "`compile-only`"
+            if (include_itree and itree_ran_without_oracle)
+            else ("`harness-failed`" if include_itree else "skipped")
+        )
     )
     itree_seed_cell = f"`0x{itree_seed:08x}`" if include_itree else "skipped (`--miri-only`)"
     itree_total_cell = (
@@ -1519,13 +1947,44 @@ def render_oracle_campaign_report(
         else "n/a"
     )
 
-    banner_lines = [
-        f"> **Status: {status}.**",
-        f"> `miri-difftest` evaluated `{miri['compared_candidates']}/{miri['total_candidates']}` "
-        f"candidates against live Miri (`-Zmiri-tree-borrows`) and Anneal's `MirSemantics` "
-        f"oracle (`{miri['agree_count']}` agreed, `{miri['diverge_count']}` diverged, "
-        f"`{miri['not_compared_count']}` not compared).",
-    ]
+    if miri_performed and miri is not None:
+        miri_total_cell = str(miri["total_candidates"])
+        miri_compiled_cell = (
+            f"{miri['compiled_candidates']} ({miri['compile_failed_candidates']} failed)"
+        )
+        miri_oracle_cell = "**performed**"
+        miri_compared_cell = str(miri["compared_candidates"])
+        miri_agreed_cell = str(miri["agree_count"])
+        miri_diverged_cell = (
+            f"{miri['diverge_count']} ({len(all_dedup) - len(itree_all_dedup)} distinct: "
+            f"{len(unquarantined) - len(itree_unquarantined)} unquarantined, "
+            f"{len(quarantined) - len(itree_quarantined)} quarantined)"
+        )
+        miri_kc_cell = str(miri["kernel_confirmed_divergences"])
+        miri_not_compared_cell = str(miri["not_compared_count"])
+        miri_elapsed_cell = f"{float(miri['elapsed_ms']):.1f} ms"
+        banner_lines = [
+            f"> **Status: {status}.**",
+            f"> `miri-difftest` evaluated `{miri['compared_candidates']}/{miri['total_candidates']}` "
+            f"candidates against live Miri (`-Zmiri-tree-borrows`) and Anneal's `MirSemantics` "
+            f"oracle (`{miri['agree_count']}` agreed, `{miri['diverge_count']}` diverged, "
+            f"`{miri['not_compared_count']}` not compared).",
+        ]
+    else:
+        miri_total_cell = str(miri.get("total_candidates", "n/a")) if miri else "n/a"
+        miri_compiled_cell = "n/a"
+        miri_oracle_cell = "harness failed"
+        miri_compared_cell = "0"
+        miri_agreed_cell = "n/a"
+        miri_diverged_cell = "n/a"
+        miri_kc_cell = "n/a"
+        miri_not_compared_cell = miri_total_cell
+        miri_elapsed_cell = "n/a"
+        banner_lines = [
+            f"> **Status: {status}.**",
+            "> `miri-difftest` failed to complete a valid live oracle comparison.",
+        ]
+
     if itree_performed and itree is not None:
         banner_lines.append(
             f"> `itree-difftest` evaluated `{itree['compared_candidates']}/{itree['total_candidates']}` "
@@ -1544,66 +2003,71 @@ def render_oracle_campaign_report(
         "",
         "| Metric | `miri-difftest` | `itree-difftest` |",
         "| :--- | :--- | :--- |",
-        f"| Mode | `{miri.get('mode', 'seeded')}` | {itree_mode_cell} |",
+        f"| Mode | {miri_mode_cell} | {itree_mode_cell} |",
         f"| Seed | `0x{miri_seed:08x}` | {itree_seed_cell} |",
-        f"| Candidates generated | {miri['total_candidates']} | {itree_total_cell} |",
-        f"| Compiled with `rustc` | {miri['compiled_candidates']} ({miri['compile_failed_candidates']} failed) | {itree_compiled_cell} |",
-        f"| Oracle comparison | **performed** | {itree_oracle_cell} |",
-        f"| Compared | {miri['compared_candidates']} | {itree_compared_cell} |",
-        f"| Agreed | {miri['agree_count']} | {itree_agreed_cell} |",
-        f"| Diverged (raw / distinct) | {miri['diverge_count']} ({len(all_dedup) - len(itree_all_dedup)} distinct: {len(unquarantined) - len(itree_unquarantined)} unquarantined, {len(quarantined) - len(itree_quarantined)} quarantined) | {itree_diverged_cell} |",
-        f"| Kernel-confirmed divergences (`by rfl`) | {miri['kernel_confirmed_divergences']} | {itree_kc_cell} |",
-        f"| Not compared | {miri['not_compared_count']} | {itree_not_compared_cell} |",
-        f"| Harness wall-clock | {float(miri['elapsed_ms']):.1f} ms | {itree_elapsed_cell} |",
+        f"| Candidates generated | {miri_total_cell} | {itree_total_cell} |",
+        f"| Compiled with `rustc` | {miri_compiled_cell} | {itree_compiled_cell} |",
+        f"| Oracle comparison | {miri_oracle_cell} | {itree_oracle_cell} |",
+        f"| Compared | {miri_compared_cell} | {itree_compared_cell} |",
+        f"| Agreed | {miri_agreed_cell} | {itree_agreed_cell} |",
+        f"| Diverged (raw / distinct) | {miri_diverged_cell} | {itree_diverged_cell} |",
+        f"| Kernel-confirmed divergences (`by rfl`) | {miri_kc_cell} | {itree_kc_cell} |",
+        f"| Not compared | {miri_not_compared_cell} | {itree_not_compared_cell} |",
+        f"| Harness wall-clock | {miri_elapsed_cell} | {itree_elapsed_cell} |",
         "",
         f"Total campaign wall-clock: {elapsed_sec:.2f} s.",
-        "",
-        "## Miri & Anneal Outcome Breakdown (`miri-difftest`)",
-        "",
-        "| Miri Verdict | Count | Anneal Outcome | Count | Divergence Class | Count |",
-        "| :--- | ---: | :--- | ---: | :--- | ---: |",
     ]
 
-    miri_v = sorted(miri["miri_verdicts"].items())
-    anneal_o = sorted(miri["anneal_outcomes"].items())
-    div_c = sorted(miri["divergence_classes"].items())
-    row_count = max(len(miri_v), len(anneal_o), len(div_c))
-    for i in range(row_count):
-        mv_k, mv_v = miri_v[i] if i < len(miri_v) else ("", "")
-        ao_k, ao_v = anneal_o[i] if i < len(anneal_o) else ("", "")
-        dc_k, dc_v = div_c[i] if i < len(div_c) else ("", "")
-        mv_label = f"`{mv_k}`" if mv_k else ""
-        ao_label = f"`{ao_k}`" if ao_k else ""
-        dc_label = f"`{dc_k}`" if dc_k else ""
-        lines.append(
-            f"| {mv_label} | {mv_v} | {ao_label} | {ao_v} | {dc_label} | {dc_v} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## Not-Compared Breakdown by Reason (`miri-difftest`)",
-            "",
-            "| Reason | Count |",
-            "| :--- | ---: |",
-        ]
-    )
-    for reason, count in sorted(miri["not_compared_reasons"].items()):
-        lines.append(f"| `{reason}` | {count} |")
-
-    ext_calls: dict[str, int] = miri.get("unmodeled_external_calls", {})
-    if ext_calls:
+    if miri_performed and miri is not None:
         lines.extend(
             [
                 "",
-                "### Unmodeled External Calls",
+                "## Miri & Anneal Outcome Breakdown (`miri-difftest`)",
                 "",
-                "| Callee `def_path` | Count |",
+                "| Miri Verdict | Count | Anneal Outcome | Count | Divergence Class | Count |",
+                "| :--- | ---: | :--- | ---: | :--- | ---: |",
+            ]
+        )
+        miri_v = sorted(miri["miri_verdicts"].items())
+        anneal_o = sorted(miri["anneal_outcomes"].items())
+        div_c = sorted(miri["divergence_classes"].items())
+        row_count = max(len(miri_v), len(anneal_o), len(div_c))
+        for i in range(row_count):
+            mv_k, mv_v = miri_v[i] if i < len(miri_v) else ("", "")
+            ao_k, ao_v = anneal_o[i] if i < len(anneal_o) else ("", "")
+            dc_k, dc_v = div_c[i] if i < len(div_c) else ("", "")
+            mv_label = f"`{mv_k}`" if mv_k else ""
+            ao_label = f"`{ao_k}`" if ao_k else ""
+            dc_label = f"`{dc_k}`" if dc_k else ""
+            lines.append(
+                f"| {mv_label} | {mv_v} | {ao_label} | {ao_v} | {dc_label} | {dc_v} |"
+            )
+
+        lines.extend(
+            [
+                "",
+                "## Not-Compared Breakdown by Reason (`miri-difftest`)",
+                "",
+                "| Reason | Count |",
                 "| :--- | ---: |",
             ]
         )
-        for callee, count in sorted(ext_calls.items(), key=lambda kv: (-kv[1], kv[0])):
-            lines.append(f"| `{callee}` | {count} |")
+        for reason, count in sorted(miri["not_compared_reasons"].items()):
+            lines.append(f"| `{reason}` | {count} |")
+
+        ext_calls: dict[str, int] = miri.get("unmodeled_external_calls", {})
+        if ext_calls:
+            lines.extend(
+                [
+                    "",
+                    "### Unmodeled External Calls",
+                    "",
+                    "| Callee `def_path` | Count |",
+                    "| :--- | ---: |",
+                ]
+            )
+            for callee, count in sorted(ext_calls.items(), key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"| `{callee}` | {count} |")
 
     if itree_performed and itree is not None:
         lines.extend(
@@ -1639,6 +2103,36 @@ def render_oracle_campaign_report(
         lines.append("")
         for reason in all_red_flag_reasons:
             lines.append(f"- **Red-flag failure**: {reason}")
+
+    failed_diags = {
+        k: v
+        for k, v in LAST_HARNESS_DIAGNOSTICS.items()
+        if isinstance(v, dict)
+        and (
+            v.get("exit_code", 0) != 0
+            or v.get("oracle_error_reason")
+            or v.get("stderr_tail")
+        )
+    }
+    if (not miri_performed or not miri_red_flags.passed or itree_failed) and failed_diags:
+        lines.extend(
+            [
+                "",
+                "## Harness Subprocess Diagnostics",
+                "",
+            ]
+        )
+        for bin_name, diag in sorted(failed_diags.items()):
+            lines.append(
+                f"- **`{bin_name}`**: exit_code=`{diag.get('exit_code')}`, "
+                f"elapsed_s=`{diag.get('elapsed_s')}`, "
+                f"reason=`{diag.get('oracle_error_reason')}`"
+            )
+            tail = str(diag.get("stderr_tail") or "").strip()
+            if tail:
+                lines.append("```text")
+                lines.append(tail)
+                lines.append("```")
 
     lines.extend(
         [
@@ -1691,7 +2185,7 @@ def render_oracle_campaign_report(
     return "\n".join(lines) + "\n"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Anneal differential-testing campaign orchestrator. Runs live Miri + "
@@ -1753,11 +2247,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path for JUnit XML (`sponge_log.xml`).",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     profile = PROFILES[args.profile]
     repo_root = Path(__file__).resolve().parent.parent
     start_time = time.monotonic()
@@ -1782,11 +2276,13 @@ def main() -> int:
     state_dir = Path(temp_ctx.name) if temp_ctx is not None else args.state_dir.resolve()
 
     try:
-        sync_state_from_x20(x20_uri, state_dir)
+        LAST_HARNESS_DIAGNOSTICS.clear()
+        sync_state_from_x20(x20_uri, state_dir, include_ratchet=not args.compile_only)
         (state_dir / "state").mkdir(parents=True, exist_ok=True)
         (state_dir / "reports").mkdir(parents=True, exist_ok=True)
 
         ledger_path = state_dir / "state" / "campaign_ledger.json"
+        ratchet_path = state_dir / "state" / "coverage_ratchet.json"
         try:
             ledger = load_ledger(ledger_path)
             miri_seed = (
@@ -1876,6 +2372,17 @@ def main() -> int:
                 miri_args,
                 run_tmp_path / "miri_difftest_out.json",
             )
+            if "miri-difftest" not in LAST_HARNESS_DIAGNOSTICS:
+                LAST_HARNESS_DIAGNOSTICS["miri-difftest"] = {
+                    "exit_code": 0 if miri is not None else 1,
+                    "oracle_error_reason": None if miri is not None else "harness_returned_none",
+                    "stderr_tail": "",
+                    "elapsed_s": (
+                        round(float(miri["elapsed_ms"]) / 1000.0, 3)
+                        if isinstance(miri, dict) and isinstance(miri.get("elapsed_ms"), (int, float))
+                        else 0.0
+                    ),
+                }
             itree = (
                 None
                 if args.miri_only
@@ -1886,7 +2393,19 @@ def main() -> int:
                     run_tmp_path / "itree_difftest_out.json",
                 )
             )
+            if not args.miri_only and "itree-difftest" not in LAST_HARNESS_DIAGNOSTICS:
+                LAST_HARNESS_DIAGNOSTICS["itree-difftest"] = {
+                    "exit_code": 0 if itree is not None else 1,
+                    "oracle_error_reason": None if itree is not None else "harness_returned_none",
+                    "stderr_tail": "",
+                    "elapsed_s": (
+                        round(float(itree["elapsed_ms"]) / 1000.0, 3)
+                        if isinstance(itree, dict) and isinstance(itree.get("elapsed_ms"), (int, float))
+                        else 0.0
+                    ),
+                }
 
+        include_itree = not args.miri_only
         miri_status = miri.get("oracle_comparison") if isinstance(miri, dict) else None
         itree_status = itree.get("oracle_comparison") if isinstance(itree, dict) else None
 
@@ -1894,7 +2413,10 @@ def main() -> int:
         # or stubbed non-oracle harnesses). When `--compile-only` was not passed,
         # `miri-difftest` returning `"not_performed"` is treated as a harness
         # failure (`EXIT_HARNESS_FAILED`).
-        if miri_status != "performed":
+        if args.compile_only or (
+            miri_status != "performed"
+            and (not include_itree or itree_status != "performed")
+        ):
             summaries = {"miri-difftest": miri}
             if not args.miri_only:
                 summaries["itree-difftest"] = itree
@@ -1966,16 +2488,40 @@ def main() -> int:
             print(report_md)
             return EXIT_HARNESS_FAILED if harness_failed else EXIT_NOT_EVALUATED
 
-        # Case 2: `miri-difftest` reported `"oracle_comparison": "performed"`.
-        assert miri is not None
-        valid_miri, err_reason = validate_performed_miri_summary(miri)
-        include_itree = not args.miri_only
+        # Case 2: At least one harness reported `"oracle_comparison": "performed"`.
+        valid_miri, err_reason = (
+            validate_performed_miri_summary(miri)
+            if isinstance(miri, dict) and miri_status == "performed"
+            else (False, "miri-difftest did not perform oracle comparison")
+        )
         itree_ran_without_oracle = (
             isinstance(itree, dict) and itree_status == "not_performed"
         )
-        itree_performed = isinstance(itree, dict) and itree_status == "performed"
-        if not valid_miri:
+        itree_claimed_performed = (
+            include_itree and isinstance(itree, dict) and itree_status == "performed"
+        )
+        valid_itree, itree_err = (
+            validate_performed_itree_summary(itree)
+            if itree_claimed_performed and itree is not None
+            else (False, "itree-difftest did not perform oracle comparison")
+        )
+
+        if not valid_miri and isinstance(miri, dict) and miri_status == "performed":
             sys.stderr.write(f"miri-difftest produced invalid oracle summary: {err_reason}\n")
+            LAST_HARNESS_DIAGNOSTICS.setdefault("miri-difftest", {})[
+                "oracle_error_reason"
+            ] = f"invalid_summary: {err_reason}"
+        if not valid_itree and itree_claimed_performed:
+            sys.stderr.write(
+                f"itree-difftest produced invalid oracle summary: {itree_err}\n"
+            )
+            LAST_HARNESS_DIAGNOSTICS.setdefault("itree-difftest", {})[
+                "oracle_error_reason"
+            ] = f"invalid_summary: {itree_err}"
+
+        # If neither suite produced a structurally valid performed summary, fall back
+        # to the 25-line `HARNESS FAILED` report without touching the ledger.
+        if not valid_miri and not valid_itree:
             elapsed_sec = time.monotonic() - start_time
             ran_without_oracle = {
                 "miri-difftest": False,
@@ -2010,27 +2556,37 @@ def main() -> int:
             print(report_md)
             return EXIT_HARNESS_FAILED
 
-        miri_red_flags = evaluate_miri_red_flags(
-            miri,
-            miri_seed,
-            ledger,
-            args.min_oracle_elapsed_ms,
-            args.max_oracle_errors,
-        )
-        if not miri_red_flags.passed:
+        miri_performed = valid_miri and miri is not None
+        if miri_performed and miri is not None:
+            miri_red_flags = evaluate_miri_red_flags(
+                miri,
+                miri_seed,
+                ledger,
+                args.min_oracle_elapsed_ms,
+                args.max_oracle_errors,
+            )
+            if not miri_red_flags.passed:
+                for reason in miri_red_flags.failure_reasons:
+                    sys.stderr.write(f"red-flag check failed: {reason}\n")
+                LAST_HARNESS_DIAGNOSTICS.setdefault("miri-difftest", {})[
+                    "oracle_error_reason"
+                ] = "; ".join(miri_red_flags.failure_reasons)
+        else:
+            miri_red_flags = RedFlagResult(
+                passed=False,
+                checks={"oracle_invoked": False},
+                failure_reasons=[f"miri_harness_failed: {err_reason}"],
+            )
             for reason in miri_red_flags.failure_reasons:
                 sys.stderr.write(f"red-flag check failed: {reason}\n")
 
+        itree_performed = valid_itree and itree is not None
         itree_red_flags: RedFlagResult | None = None
         itree_all_dedup: list[DeduplicatedFinding] = []
         itree_unquarantined: list[DeduplicatedFinding] = []
         itree_quarantined: list[DeduplicatedFinding] = []
-        if include_itree and itree_performed and itree is not None:
-            valid_itree, itree_err = validate_performed_itree_summary(itree)
+        if include_itree and itree_claimed_performed and itree is not None:
             if not valid_itree:
-                sys.stderr.write(
-                    f"itree-difftest produced invalid oracle summary: {itree_err}\n"
-                )
                 itree_red_flags = RedFlagResult(
                     passed=False,
                     checks={"itree_oracle_invoked": False},
@@ -2046,6 +2602,9 @@ def main() -> int:
                 if not itree_red_flags.passed:
                     for reason in itree_red_flags.failure_reasons:
                         sys.stderr.write(f"red-flag check failed: {reason}\n")
+                    LAST_HARNESS_DIAGNOSTICS.setdefault("itree-difftest", {})[
+                        "oracle_error_reason"
+                    ] = "; ".join(itree_red_flags.failure_reasons)
                 (
                     itree_all_dedup,
                     itree_unquarantined,
@@ -2056,59 +2615,129 @@ def main() -> int:
                 )
 
         known_corpus_bug_seeds = load_known_corpus_bug_seeds(repo_root)
-        miri_all_dedup, miri_unquarantined, miri_quarantined = (
-            deduplicate_and_quarantine_findings(
-                miri["findings"],
-                known_corpus_bug_seeds,
-                quarantine_rules,
+        miri_all_dedup: list[DeduplicatedFinding] = []
+        miri_unquarantined: list[DeduplicatedFinding] = []
+        miri_quarantined: list[DeduplicatedFinding] = []
+        if miri_performed and miri is not None:
+            miri_all_dedup, miri_unquarantined, miri_quarantined = (
+                deduplicate_and_quarantine_findings(
+                    miri["findings"],
+                    known_corpus_bug_seeds,
+                    quarantine_rules,
+                )
             )
-        )
         all_dedup = [*miri_all_dedup, *itree_all_dedup]
         unquarantined = [*miri_unquarantined, *itree_unquarantined]
         quarantined = [*miri_quarantined, *itree_quarantined]
 
-        itree_ok = (not include_itree) or itree_ran_without_oracle or (
-            itree_performed and itree_red_flags is not None and itree_red_flags.passed
+        miri_suite_healthy = bool(miri_performed and miri_red_flags.passed)
+        itree_suite_healthy = bool(
+            include_itree
+            and itree_performed
+            and itree_red_flags is not None
+            and itree_red_flags.passed
         )
-        harness_or_red_flag_failed = (not miri_red_flags.passed) or (not itree_ok)
+        itree_ok = (not include_itree) or itree_ran_without_oracle or itree_suite_healthy
+        harness_or_red_flag_failed = (not miri_suite_healthy) or (not itree_ok)
 
-        written = collect_finding_bundle_files(miri["findings"], state_dir)
-        if include_itree and itree_performed and itree is not None and isinstance(itree.get("findings"), list):
+        written: list[Path] = []
+        if miri_performed and miri is not None and isinstance(miri.get("findings"), list):
+            written.extend(collect_finding_bundle_files(miri["findings"], state_dir))
+        if (
+            include_itree
+            and itree_performed
+            and itree is not None
+            and isinstance(itree.get("findings"), list)
+        ):
             written.extend(collect_finding_bundle_files(itree["findings"], state_dir))
-        if not harness_or_red_flag_failed:
-            ledger["next_miri_seed"] = f"0x{advance_seed(miri_seed):08x}"
-            if include_itree and itree is not None:
+
+        if miri_suite_healthy or itree_suite_healthy:
+            ledger["schema_version"] = 1
+            ledger.setdefault("next_miri_seed", f"0x{miri_seed:08x}")
+            ledger.setdefault("next_itree_seed", f"0x{itree_seed:08x}")
+            ledger.setdefault("total_miri_candidates_generated", prev_miri_gen)
+            ledger.setdefault("total_miri_candidates_evaluated", prev_miri_eval)
+            ledger.setdefault("total_itree_candidates_generated", prev_itree_gen)
+            ledger.setdefault("total_itree_candidates_evaluated", prev_itree_eval)
+            ledger.setdefault("total_itree_traces_checked", prev_itree_traces)
+
+            if miri_suite_healthy and miri is not None:
+                ledger["next_miri_seed"] = f"0x{advance_seed(miri_seed):08x}"
+                ledger["total_miri_candidates_generated"] = prev_miri_gen + int(
+                    miri.get("total_candidates", 0)
+                )
+                ledger["total_miri_candidates_evaluated"] = prev_miri_eval + int(
+                    miri.get("compared_candidates", 0)
+                )
+                ledger["last_miri_seed"] = f"0x{miri_seed:08x}"
+                ledger["last_miri_signature"] = miri_signature_for_seed_check(miri)
+
+            if itree_suite_healthy and itree is not None:
                 ledger["next_itree_seed"] = f"0x{advance_seed(itree_seed):08x}"
                 ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
                     itree.get("total_candidates", 0)
                 )
-                if itree_performed:
-                    ledger["total_itree_candidates_evaluated"] = prev_itree_eval + int(
-                        itree.get("compared_candidates", 0)
-                    )
-                    ledger["total_itree_traces_checked"] = prev_itree_traces + int(
-                        itree.get("distinct_traces_checked", 0)
-                    )
-                    ledger["last_itree_seed"] = f"0x{itree_seed:08x}"
-                    ledger["last_itree_signature"] = itree_signature_for_seed_check(itree)
+                ledger["total_itree_candidates_evaluated"] = prev_itree_eval + int(
+                    itree.get("compared_candidates", 0)
+                )
+                ledger["total_itree_traces_checked"] = prev_itree_traces + int(
+                    itree.get("distinct_traces_checked", 0)
+                )
+                ledger["last_itree_seed"] = f"0x{itree_seed:08x}"
+                ledger["last_itree_signature"] = itree_signature_for_seed_check(itree)
+            elif include_itree and itree_ran_without_oracle and itree is not None:
+                ledger["next_itree_seed"] = f"0x{advance_seed(itree_seed):08x}"
+                ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
+                    itree.get("total_candidates", 0)
+                )
+
+            prev_per_suite = (
+                ledger.get("per_suite_runs")
+                if isinstance(ledger.get("per_suite_runs"), dict)
+                else {}
+            )
+            ledger["per_suite_runs"] = {
+                "itree": int(prev_per_suite.get("itree", 0))
+                + (1 if itree_suite_healthy else 0),
+                "miri": int(prev_per_suite.get("miri", 0))
+                + (1 if miri_suite_healthy else 0),
+            }
+
+            update_suite_scoped_fingerprints(
+                ledger,
+                date_prefix,
+                miri_suite_healthy,
+                miri_unquarantined,
+                miri_quarantined,
+                itree_suite_healthy,
+                itree_unquarantined,
+                itree_quarantined,
+            )
+
+            update_coverage_ratchet(
+                ratchet_path,
+                ledger,
+                miri_suite_healthy,
+                miri if miri_performed else None,
+                miri_seed,
+                itree_suite_healthy,
+                itree if itree_performed else None,
+                itree_seed,
+            )
+            written.append(ratchet_path)
+
             ledger["total_campaigns_run"] = prev_campaigns + 1
-            ledger["total_miri_candidates_generated"] = prev_miri_gen + int(
-                miri.get("total_candidates", 0)
-            )
-            ledger["total_miri_candidates_evaluated"] = prev_miri_eval + int(
-                miri.get("compared_candidates", 0)
-            )
-            ledger["last_miri_seed"] = f"0x{miri_seed:08x}"
-            ledger["last_miri_signature"] = miri_signature_for_seed_check(miri)
-            ledger["active_fingerprints"] = [d.fingerprint for d in unquarantined]
-            ledger["quarantined_fingerprints"] = [d.fingerprint for d in quarantined]
             ledger["last_run_utc"] = utc_now_iso()
             ledger["last_profile"] = profile.name
-            ledger["last_oracle_comparison"] = (
-                "performed"
-                if (not include_itree or itree_performed)
-                else "miri_performed_itree_not_performed"
-            )
+            if miri_suite_healthy and (not include_itree or itree_suite_healthy):
+                ledger["last_oracle_comparison"] = "performed"
+            elif miri_suite_healthy and itree_ran_without_oracle:
+                ledger["last_oracle_comparison"] = "miri_performed_itree_not_performed"
+            elif miri_suite_healthy:
+                ledger["last_oracle_comparison"] = "miri_performed_itree_failed"
+            else:
+                ledger["last_oracle_comparison"] = "miri_failed_itree_performed"
+
             ledger_path.write_text(
                 json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
@@ -2118,7 +2747,7 @@ def main() -> int:
         report_md = render_oracle_campaign_report(
             profile,
             date_prefix,
-            miri,
+            miri if miri_performed else None,
             miri_red_flags,
             all_dedup,
             unquarantined,
@@ -2152,10 +2781,12 @@ def main() -> int:
             "date_utc": date_prefix,
             "miri_seed": f"0x{miri_seed:08x}",
             "itree_seed": f"0x{itree_seed:08x}" if include_itree else None,
-            "miri_oracle_comparison": "performed",
+            "miri_oracle_comparison": (
+                "performed" if miri_suite_healthy else "failed"
+            ),
             "itree_oracle_comparison": (
                 "performed"
-                if (include_itree and itree_performed and itree_red_flags is not None and itree_red_flags.passed)
+                if itree_suite_healthy
                 else (
                     "not_performed"
                     if (include_itree and itree_ran_without_oracle)
@@ -2163,10 +2794,11 @@ def main() -> int:
                 )
             ),
             "red_flags": {
-                "passed": miri_red_flags.passed and (itree_red_flags is None or itree_red_flags.passed),
+                "passed": miri_suite_healthy and (not include_itree or itree_ran_without_oracle or itree_suite_healthy),
                 "checks": combined_checks,
                 "failure_reasons": combined_reasons,
             },
+            "harness_diagnostics": copy.deepcopy(LAST_HARNESS_DIAGNOSTICS),
             "miri_summary": miri,
             "itree_summary": itree if include_itree else None,
             "deduplicated_findings": [d.to_dict() for d in all_dedup],

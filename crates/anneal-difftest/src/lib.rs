@@ -42,12 +42,13 @@ pub use instrument::{
     observe_boundary_call, value_as_raw_bytes,
 };
 pub use itree_eval::{
-    CandidateCompile, DEFAULT_ITREE_TRIALS_PER_CANDIDATE, ITREE_DIAG_TAG_NAMES,
-    ITREE_MUTATOR_NAMES, ITREE_SAFE_SEEDS, ITREE_TRACE_CHECK_FUEL, ItreeCampaignEvalReport,
+    CandidateCompile, DEFAULT_ITREE_TRIALS_PER_CANDIDATE, ITREE_CONFIRM_CHUNK_SIZE,
+    ITREE_DIAG_TAG_NAMES, ITREE_MUTATOR_NAMES, ITREE_NOT_COMPARED_REASON_NAMES,
+    ITREE_PROBE_CHUNK_SIZE, ITREE_SAFE_SEEDS, ITREE_TRACE_CHECK_FUEL, ItreeCampaignEvalReport,
     ItreeEvalOptions, ItreeFindingBundle, ItreeReproReport, compile_itree_candidates,
     compile_rust_strict_opt, evaluate_itree_batches, evaluate_itree_batches_with_options,
     render_itree_eval_report_json, render_itree_eval_report_markdown,
-    render_itree_finding_bundle_json, reproduce_itree_finding,
+    render_itree_finding_bundle_json, reproduce_itree_finding, resolve_itree_lean_jobs,
 };
 pub use miri_eval::{
     DIVERGENCE_CLASS_NAMES, MIRI_MUTATOR_NAMES, MiriCampaignEvalReport, MiriFindingBundle,

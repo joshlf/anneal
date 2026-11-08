@@ -161,6 +161,21 @@ pub const ITREE_DIAG_TAG_NAMES: [&str; 11] = [
     "out_of_fuel",
 ];
 
+/// Canonical not-compared reason keys always included in `not_compared_reasons`.
+pub const ITREE_NOT_COMPARED_REASON_NAMES: [&str; 5] = [
+    "compile_failed",
+    "staging_failed",
+    "empty_trace",
+    "lean_probe_failed",
+    "lean_confirm_failed",
+];
+
+/// Maximum number of trace cases per Stage 1 `ItreeDiffBatchProbeChunk` Lean module.
+pub const ITREE_PROBE_CHUNK_SIZE: usize = 64;
+
+/// Maximum number of trace cases per Stage 2 `ItreeDiffBatchConfirmChunk` Lean module.
+pub const ITREE_CONFIRM_CHUNK_SIZE: usize = 16;
+
 /// Default number of input trials executed natively per compiled candidate.
 pub const DEFAULT_ITREE_TRIALS_PER_CANDIDATE: usize = 12;
 
@@ -168,6 +183,86 @@ pub const DEFAULT_ITREE_TRIALS_PER_CANDIDATE: usize = 12;
 /// `checkRawByteTraceFullBounded_sound`, and
 /// `checkRawByteTraceObsErasedBounded_sound`.
 pub const ITREE_TRACE_CHECK_FUEL: usize = 240;
+
+/// Resolve the maximum number of concurrent `lake env lean` chunk workers for
+/// `itree-difftest` based on `ANNEAL_ITREE_LEAN_JOBS` or `/proc/meminfo`.
+pub fn resolve_itree_lean_jobs() -> usize {
+    if let Ok(val) = env::var("ANNEAL_ITREE_LEAN_JOBS")
+        && let Ok(parsed) = val.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        return parsed.min(8);
+    }
+    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+        let mut mem_total_kib: Option<u64> = None;
+        let mut mem_avail_kib: Option<u64> = None;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                mem_total_kib = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok());
+            } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                mem_avail_kib = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok());
+            }
+        }
+        let gib = 1024 * 1024;
+        if let Some(avail) = mem_avail_kib {
+            if avail < 24 * gib {
+                return 1;
+            }
+            if avail < 48 * gib {
+                return 2;
+            }
+        }
+        if let Some(total) = mem_total_kib {
+            if total <= 36 * gib {
+                return 1;
+            }
+            if total <= 64 * gib {
+                return 2;
+            }
+            return 4;
+        }
+    }
+    1
+}
+
+fn fnv1a_64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+fn compute_itree_obs_shape_hash(
+    cand_source: &str,
+    prefix: &str,
+    branch_tags: &[u32],
+    call_seq: &[(String, usize)],
+) -> String {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    h = fnv1a_64_update(h, cand_source.trim().as_bytes());
+    h = fnv1a_64_update(h, &[0xFF]);
+    for &tag in branch_tags {
+        h = fnv1a_64_update(h, &tag.to_le_bytes());
+    }
+    h = fnv1a_64_update(h, &[0xFE]);
+    for (def_path, idx) in call_seq {
+        let norm_callee = def_path
+            .strip_prefix("itree_diff_staged::")
+            .unwrap_or(def_path)
+            .strip_prefix(prefix)
+            .unwrap_or(def_path);
+        h = fnv1a_64_update(h, norm_callee.as_bytes());
+        h = fnv1a_64_update(h, &(*idx as u64).to_le_bytes());
+    }
+    format!("b{}e{}h{:016x}", branch_tags.len(), call_seq.len(), h)
+}
 
 /// Per-candidate compilation results across `-C opt-level=0`, `-C opt-level=2`,
 /// and `anneal-mir-instrument` compilation at both `-O0` and `-O2`.
@@ -304,8 +399,15 @@ pub struct ItreeCampaignEvalReport {
     pub per_candidate_distinct_traces: BTreeMap<String, usize>,
     /// Trace counts by `TraceReplayDiag.tagName`.
     pub diag_tag_counts: BTreeMap<String, usize>,
+    /// Not-compared candidate counts by reason (`compile_failed`,
+    /// `staging_failed`, `empty_trace`, `lean_probe_failed`,
+    /// `lean_confirm_failed`).
+    pub not_compared_reasons: BTreeMap<String, usize>,
     /// Per-mutator application counts across all generated candidates.
     pub mutator_applications: BTreeMap<String, usize>,
+    /// Deterministic, sorted observation-path signatures observed during live
+    /// oracle evaluation (`itree:<mutator_chain_or_template>:<branch_and_ext_shape_hash>:<outcome_kind>`).
+    pub obs_path_signatures: Vec<String>,
     /// Self-contained finding bundles for every diverging trace.
     pub findings: Vec<ItreeFindingBundle>,
     /// Total wall-clock duration in milliseconds.
@@ -1265,6 +1367,10 @@ pub fn evaluate_itree_batches_with_options(
         .iter()
         .map(|k| (k.to_string(), 0))
         .collect();
+    let mut not_compared_reasons: BTreeMap<String, usize> = ITREE_NOT_COMPARED_REASON_NAMES
+        .iter()
+        .map(|k| (k.to_string(), 0))
+        .collect();
 
     if opt_level_0_and_2_compiled == 0 {
         return Err(format!(
@@ -1279,20 +1385,41 @@ pub fn evaluate_itree_batches_with_options(
             Vec::with_capacity(opt_level_0_and_2_compiled);
         let mut cand_meta: BTreeMap<String, (&GeneratedItreeCandidate, StagedItreeCandidate)> =
             BTreeMap::new();
+        let mut fn_prefix_map: BTreeMap<String, String> = BTreeMap::new();
 
         for (b_idx, batch) in batches.iter().enumerate() {
             for (c_idx, cand) in batch.iter().enumerate() {
                 let comp = compile_results[b_idx][c_idx];
-                if !(comp.opt0 && comp.opt2) || contains_unsafe_token(&cand.source) {
+                if !(comp.opt0 && comp.opt2 && comp.instrumented)
+                    || contains_unsafe_token(&cand.source)
+                {
+                    *not_compared_reasons
+                        .entry("compile_failed".to_string())
+                        .or_insert(0) += 1;
                     continue;
                 }
                 let prefix = format!("b{b_idx}_c{c_idx}__");
-                let staged = stage_itree_candidate_items(&cand.source, &prefix, "kernel_step")?;
+                let staged = match stage_itree_candidate_items(&cand.source, &prefix, "kernel_step")
+                {
+                    Ok(s) => s,
+                    Err(_) => {
+                        *not_compared_reasons
+                            .entry("staging_failed".to_string())
+                            .or_insert(0) += 1;
+                        continue;
+                    }
+                };
                 combined_candidates_rs.push_str(&staged.staged_source);
                 combined_candidates_rs.push('\n');
+                fn_prefix_map.insert(staged.root_fn_name.clone(), prefix);
                 cand_meta.insert(staged.root_fn_name.clone(), (cand, staged.clone()));
                 staged_candidates.push((cand, staged));
             }
+        }
+        if staged_candidates.is_empty() {
+            return Err(format!(
+                "cannot perform ITree oracle comparison: 0 of {total_candidates} candidates staged"
+            ));
         }
 
         fs::write(staging_dir.join("src/candidates.rs"), &combined_candidates_rs)
@@ -1366,7 +1493,13 @@ pub fn evaluate_itree_batches_with_options(
             collect_traces_natively(&repo_root, &staging_dir, &staged_with_trials)?;
 
         let mut total_traces_executed = 0usize;
-        let mut obs_path_set = MirObsPathSet::new();
+        let mut raw_trace_count_by_fn: BTreeMap<String, usize> = BTreeMap::new();
+        let mut obs_records_by_fn: BTreeMap<
+            String,
+            Vec<(crate::input_gen::MirObsPathKey, Vec<u8>)>,
+        > = BTreeMap::new();
+        let mut obs_sigs_by_fn: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut compared_fn_names: BTreeSet<String> = BTreeSet::new();
         let mut per_candidate_distinct_traces: BTreeMap<String, usize> = BTreeMap::new();
         let mut batch_cases: Vec<BatchTraceEvalCase> = Vec::new();
         let mut case_to_fn: BTreeMap<String, String> = BTreeMap::new();
@@ -1374,7 +1507,34 @@ pub fn evaluate_itree_batches_with_options(
         for (staged, _trials) in &staged_with_trials {
             let fn_name = &staged.root_fn_name;
             let raw_traces = traces_by_fn.get(fn_name).cloned().unwrap_or_default();
+            if raw_traces.is_empty() {
+                *not_compared_reasons
+                    .entry("empty_trace".to_string())
+                    .or_insert(0) += 1;
+                continue;
+            }
+            compared_fn_names.insert(fn_name.clone());
+            raw_trace_count_by_fn.insert(fn_name.clone(), raw_traces.len());
             total_traces_executed += raw_traces.len();
+
+            let prefix = fn_prefix_map
+                .get(fn_name)
+                .map(String::as_str)
+                .unwrap_or("");
+            let (cand_source, template_and_chain) = if let Some((cand, _)) = cand_meta.get(fn_name)
+            {
+                let tc = if cand.applied_mutators.is_empty() {
+                    format!("seed{}@identity", cand.seed_index)
+                } else {
+                    format!("seed{}@{}", cand.seed_index, cand.applied_mutators.join("+"))
+                };
+                (cand.source.as_str(), tc)
+            } else {
+                ("", fn_name.clone())
+            };
+
+            let mut fn_obs_records = Vec::with_capacity(raw_traces.len());
+            let mut fn_obs_sigs = BTreeSet::new();
 
             for tr in &raw_traces {
                 let mut call_seq = Vec::new();
@@ -1392,7 +1552,17 @@ pub fn evaluate_itree_batches_with_options(
                     }
                 }
                 let is_panic = matches!(tr.outcome, RecordedOutcome::Panic);
-                obs_path_set.record_execution(
+                let outcome_kind = match &tr.outcome {
+                    RecordedOutcome::Normal { .. } => "normal",
+                    RecordedOutcome::Panic => "panic",
+                    RecordedOutcome::Abort => "abort",
+                };
+                let shape_hash =
+                    compute_itree_obs_shape_hash(cand_source, prefix, &branch_tags, &call_seq);
+                fn_obs_sigs.insert(format!(
+                    "itree:{template_and_chain}:{shape_hash}:{outcome_kind}"
+                ));
+                fn_obs_records.push((
                     crate::input_gen::MirObsPathKey {
                         fn_name: fn_name.clone(),
                         branch_tags,
@@ -1400,8 +1570,10 @@ pub fn evaluate_itree_batches_with_options(
                         is_panic,
                     },
                     tr.raw_args.iter().flatten().copied().collect(),
-                );
+                ));
             }
+            obs_records_by_fn.insert(fn_name.clone(), fn_obs_records);
+            obs_sigs_by_fn.insert(fn_name.clone(), fn_obs_sigs);
 
             // Deduplicate distinct traces per candidate by observable (events, outcome).
             let mut seen_keys: BTreeSet<String> = BTreeSet::new();
@@ -1448,8 +1620,7 @@ pub fn evaluate_itree_batches_with_options(
             }
         }
 
-        let distinct_traces_checked = batch_cases.len();
-        if distinct_traces_checked == 0 {
+        if batch_cases.is_empty() {
             return Err("native trace collection produced 0 traces".to_string());
         }
 
@@ -1477,94 +1648,177 @@ pub fn evaluate_itree_batches_with_options(
         fs::create_dir_all(&verify_dir)
             .map_err(|e| format!("failed to create {}: {e}", verify_dir.display()))?;
 
-        // Stage 1: Probe `diagnoseRawByteTraceFullBounded` across all distinct traces.
-        // For large campaigns, shard into <=192-case probe modules and evaluate in parallel
-        // so individual `lean -M 8192` invocations stay well below memory limits.
-        let probe_src =
-            render_batch_trace_probe_lean_module("Proof.ItreeDiffBatchProbe", &batch_cases);
-        let probe_file = verify_dir.join("ItreeDiffBatchProbe.lean");
-        fs::write(&probe_file, &probe_src)
-            .map_err(|e| format!("failed to write {}: {e}", probe_file.display()))?;
+        let lean_jobs = resolve_itree_lean_jobs();
 
-        const PROBE_CHUNK_SIZE: usize = 192;
+        // Stage 1: Probe `diagnoseRawByteTraceFullBounded` across all distinct traces,
+        // chunked by `ITREE_PROBE_CHUNK_SIZE` (`<= 64` cases per chunk) and bounded by
+        // `resolve_itree_lean_jobs()`. If any chunk fails in `lake env lean`, fall back
+        // to probing each candidate's cases individually so any offending candidate is
+        // isolated into `not_compared_reasons["lean_probe_failed"]`.
         let mut probe_map: BTreeMap<String, (String, String)> = BTreeMap::new();
-        if batch_cases.len() <= PROBE_CHUNK_SIZE {
-            let probe_out = Command::new("lake")
-                .args(["env", "lean", "-M", "8192"])
-                .arg(&probe_file)
-                .current_dir(&anneal_dir)
-                .output()
-                .map_err(|e| format!("failed to run `lake env lean` on probe module: {e}"))?;
-            if !probe_out.status.success() {
-                return Err(format!(
-                    "`ItreeDiffBatchProbe.lean` failed ({}):\nstdout:\n{}\nstderr:\n{}",
-                    probe_out.status,
-                    String::from_utf8_lossy(&probe_out.stdout),
-                    String::from_utf8_lossy(&probe_out.stderr)
-                ));
-            }
-            probe_map =
-                parse_batch_trace_probe_output(&String::from_utf8_lossy(&probe_out.stdout));
-        } else {
-            let chunks: Vec<&[BatchTraceEvalCase]> =
-                batch_cases.chunks(PROBE_CHUNK_SIZE).collect();
-            for wave in chunks.chunks(4) {
-                let wave_res: Vec<Result<BTreeMap<String, (String, String)>, String>> =
-                    std::thread::scope(|s| {
-                        let handles: Vec<_> = wave
-                            .iter()
-                            .enumerate()
-                            .map(|(w_idx, chunk)| {
-                                let verify_dir = &verify_dir;
-                                let anneal_dir = &anneal_dir;
-                                s.spawn(move || {
-                                    let ns = format!("Proof.ItreeDiffBatchProbeChunk{w_idx}");
-                                    let src = render_batch_trace_probe_lean_module(&ns, chunk);
-                                    let chunk_file = verify_dir
-                                        .join(format!("ItreeDiffBatchProbeChunk{w_idx}.lean"));
-                                    fs::write(&chunk_file, &src).map_err(|e| {
-                                        format!("failed to write {}: {e}", chunk_file.display())
-                                    })?;
-                                    let out = Command::new("lake")
-                                        .args(["env", "lean", "-M", "8192"])
-                                        .arg(&chunk_file)
-                                        .current_dir(anneal_dir)
-                                        .output()
-                                        .map_err(|e| {
-                                            format!(
-                                                "failed to run `lake env lean` on {}: {e}",
-                                                chunk_file.display()
-                                            )
-                                        })?;
-                                    if !out.status.success() {
-                                        return Err(format!(
-                                            "`{}` failed ({}):\nstdout:\n{}\nstderr:\n{}",
-                                            chunk_file.display(),
-                                            out.status,
-                                            String::from_utf8_lossy(&out.stdout),
-                                            String::from_utf8_lossy(&out.stderr)
-                                        ));
-                                    }
+        let mut failed_probe_fns: BTreeSet<String> = BTreeSet::new();
+        let probe_chunks: Vec<(usize, &[BatchTraceEvalCase])> = batch_cases
+            .chunks(ITREE_PROBE_CHUNK_SIZE)
+            .enumerate()
+            .collect();
+
+        if let Some((_, first_chunk)) = probe_chunks.first() {
+            let probe_src =
+                render_batch_trace_probe_lean_module("Proof.ItreeDiffBatchProbe", first_chunk);
+            let probe_file = verify_dir.join("ItreeDiffBatchProbe.lean");
+            let _ = fs::write(&probe_file, &probe_src);
+        }
+
+        for wave in probe_chunks.chunks(lean_jobs) {
+            let wave_res: Vec<(
+                usize,
+                &[BatchTraceEvalCase],
+                Result<BTreeMap<String, (String, String)>, String>,
+            )> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|&(chunk_idx, chunk)| {
+                        let verify_dir = &verify_dir;
+                        let anneal_dir = &anneal_dir;
+                        s.spawn(move || {
+                            let ns = format!("Proof.ItreeDiffBatchProbeChunk{chunk_idx}");
+                            let src = render_batch_trace_probe_lean_module(&ns, chunk);
+                            let chunk_file = verify_dir
+                                .join(format!("ItreeDiffBatchProbeChunk{chunk_idx}.lean"));
+                            let write_res = fs::write(&chunk_file, &src).map_err(|e| {
+                                format!("failed to write {}: {e}", chunk_file.display())
+                            });
+                            if let Err(e) = write_res {
+                                return (chunk_idx, chunk, Err(e));
+                            }
+                            let out_res = Command::new("lake")
+                                .args(["env", "lean", "-M", "8192"])
+                                .arg(&chunk_file)
+                                .current_dir(anneal_dir)
+                                .output()
+                                .map_err(|e| {
+                                    format!(
+                                        "failed to run `lake env lean` on {}: {e}",
+                                        chunk_file.display()
+                                    )
+                                });
+                            match out_res {
+                                Ok(out) if out.status.success() => (
+                                    chunk_idx,
+                                    chunk,
                                     Ok(parse_batch_trace_probe_output(
                                         &String::from_utf8_lossy(&out.stdout),
-                                    ))
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| {
-                                h.join().unwrap_or_else(|_| {
-                                    Err("panic in probe chunk worker".to_string())
-                                })
-                            })
-                            .collect()
-                    });
-                for part in wave_res {
-                    probe_map.extend(part?);
+                                    )),
+                                ),
+                                Ok(out) => (
+                                    chunk_idx,
+                                    chunk,
+                                    Err(format!(
+                                        "`{}` failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                                        chunk_file.display(),
+                                        out.status,
+                                        String::from_utf8_lossy(&out.stdout),
+                                        String::from_utf8_lossy(&out.stderr)
+                                    )),
+                                ),
+                                Err(e) => (chunk_idx, chunk, Err(e)),
+                            }
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            (0, &[][..], Err("panic in probe chunk worker".to_string()))
+                        })
+                    })
+                    .collect()
+            });
+
+            for (_chunk_idx, chunk, res) in wave_res {
+                match res {
+                    Ok(part) => {
+                        probe_map.extend(part);
+                    }
+                    Err(_chunk_err) => {
+                        // Isolate per candidate within the failed chunk.
+                        let mut by_fn: BTreeMap<String, Vec<BatchTraceEvalCase>> = BTreeMap::new();
+                        for case in chunk {
+                            if let Some(fn_name) = case_to_fn.get(&case.case_ident) {
+                                by_fn.entry(fn_name.clone()).or_default().push(case.clone());
+                            }
+                        }
+                        for (fn_name, fn_cases) in by_fn {
+                            let ns = format!("Proof.ItreeDiffBatchProbeFallback_{fn_name}");
+                            let src = render_batch_trace_probe_lean_module(&ns, &fn_cases);
+                            let fb_file = verify_dir
+                                .join(format!("ItreeDiffBatchProbeFallback_{fn_name}.lean"));
+                            if fs::write(&fb_file, &src).is_err() {
+                                failed_probe_fns.insert(fn_name);
+                                continue;
+                            }
+                            let fb_out = Command::new("lake")
+                                .args(["env", "lean", "-M", "8192"])
+                                .arg(&fb_file)
+                                .current_dir(&anneal_dir)
+                                .output();
+                            match fb_out {
+                                Ok(out) if out.status.success() => {
+                                    let parsed = parse_batch_trace_probe_output(
+                                        &String::from_utf8_lossy(&out.stdout),
+                                    );
+                                    if fn_cases
+                                        .iter()
+                                        .all(|c| parsed.contains_key(&c.case_ident))
+                                    {
+                                        probe_map.extend(parsed);
+                                    } else {
+                                        failed_probe_fns.insert(fn_name);
+                                    }
+                                }
+                                _ => {
+                                    failed_probe_fns.insert(fn_name);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        for case in &batch_cases {
+            if !probe_map.contains_key(&case.case_ident)
+                && let Some(fn_name) = case_to_fn.get(&case.case_ident)
+            {
+                failed_probe_fns.insert(fn_name.clone());
+            }
+        }
+        for fn_name in &failed_probe_fns {
+            if compared_fn_names.remove(fn_name) {
+                if let Some(cnt) = raw_trace_count_by_fn.get(fn_name) {
+                    total_traces_executed = total_traces_executed.saturating_sub(*cnt);
+                }
+                per_candidate_distinct_traces.remove(fn_name);
+                obs_records_by_fn.remove(fn_name);
+                obs_sigs_by_fn.remove(fn_name);
+                *not_compared_reasons
+                    .entry("lean_probe_failed".to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        if !failed_probe_fns.is_empty() {
+            batch_cases.retain(|c| {
+                case_to_fn
+                    .get(&c.case_ident)
+                    .map(|f| !failed_probe_fns.contains(f))
+                    .unwrap_or(false)
+            });
+        }
+        if batch_cases.is_empty() {
+            return Err("all ITree candidates failed Stage 1 Lean probe evaluation".to_string());
+        }
+
         for case in &mut batch_cases {
             let (tag, _repr) = probe_map
                 .get(&case.case_ident)
@@ -1573,12 +1827,8 @@ pub fn evaluate_itree_batches_with_options(
         }
 
         // Stage 2: Kernel-confirm `TraceReplayDiag.tagName` (`by rfl`) and
-        // `checkRawByteTraceFullBounded_sound` + `checkRawByteTraceObsErasedBounded_sound`.
-        // For small batches (<= 32 distinct traces), confirm every trace in the Lean
-        // kernel. For larger campaign batches, confirm every divergence plus the first
-        // trace of each candidate (at least 16 traces) so `lake env lean` finishes well
-        // within campaign time budgets while every candidate and every divergence gets
-        // kernel-confirmed `by rfl` proofs.
+        // `checkRawByteTraceFullBounded_sound` + `checkRawByteTraceObsErasedBounded_sound`,
+        // chunked into modules of `<= ITREE_CONFIRM_CHUNK_SIZE` (`16`) cases per chunk.
         let confirm_cases: Vec<BatchTraceEvalCase> = if batch_cases.len() <= 32 {
             batch_cases.clone()
         } else {
@@ -1590,7 +1840,7 @@ pub fn evaluate_itree_batches_with_options(
                     .get(&case.case_ident)
                     .cloned()
                     .unwrap_or_default();
-                if is_div || (selected.len() < 16 && confirmed_fns.insert(fn_name)) {
+                if is_div || confirmed_fns.insert(fn_name) {
                     selected.push(case.clone());
                 }
             }
@@ -1601,29 +1851,175 @@ pub fn evaluate_itree_batches_with_options(
             }
             selected
         };
-        let confirm_src = render_batch_trace_eval_lean_module(
-            "Proof.ItreeDiffBatchConfirm",
-            &confirm_cases,
-            false,
-        );
-        let confirm_file = verify_dir.join("ItreeDiffBatchConfirm.lean");
-        fs::write(&confirm_file, &confirm_src)
-            .map_err(|e| format!("failed to write {}: {e}", confirm_file.display()))?;
 
-        let confirm_out = Command::new("lake")
-            .args(["env", "lean", "-M", "4096"])
-            .arg(&confirm_file)
-            .current_dir(&anneal_dir)
-            .output()
-            .map_err(|e| format!("failed to run `lake env lean` on confirm module: {e}"))?;
-        let kernel_confirmed_all = confirm_out.status.success();
-        if !kernel_confirmed_all {
-            return Err(format!(
-                "`ItreeDiffBatchConfirm.lean` failed kernel confirmation ({}):\nstdout:\n{}\nstderr:\n{}",
-                confirm_out.status,
-                String::from_utf8_lossy(&confirm_out.stdout),
-                String::from_utf8_lossy(&confirm_out.stderr)
-            ));
+        let confirm_chunks: Vec<(usize, &[BatchTraceEvalCase])> = confirm_cases
+            .chunks(ITREE_CONFIRM_CHUNK_SIZE)
+            .enumerate()
+            .collect();
+        let mut combined_confirm_src = String::new();
+        let mut failed_confirm_fns: BTreeSet<String> = BTreeSet::new();
+
+        for wave in confirm_chunks.chunks(lean_jobs) {
+            let wave_res: Vec<(usize, &[BatchTraceEvalCase], String, Result<(), String>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = wave
+                        .iter()
+                        .map(|&(chunk_idx, chunk)| {
+                            let verify_dir = &verify_dir;
+                            let anneal_dir = &anneal_dir;
+                            s.spawn(move || {
+                                let ns = format!("Proof.ItreeDiffBatchConfirmChunk{chunk_idx}");
+                                let src = render_batch_trace_eval_lean_module(&ns, chunk, false);
+                                let chunk_file = verify_dir.join(format!(
+                                    "ItreeDiffBatchConfirmChunk{chunk_idx}.lean"
+                                ));
+                                if let Err(e) = fs::write(&chunk_file, &src) {
+                                    return (
+                                        chunk_idx,
+                                        chunk,
+                                        src,
+                                        Err(format!(
+                                            "failed to write {}: {e}",
+                                            chunk_file.display()
+                                        )),
+                                    );
+                                }
+                                let out_res = Command::new("lake")
+                                    .args(["env", "lean", "-M", "8192"])
+                                    .arg(&chunk_file)
+                                    .current_dir(anneal_dir)
+                                    .output();
+                                match out_res {
+                                    Ok(out) if out.status.success() => {
+                                        (chunk_idx, chunk, src, Ok(()))
+                                    }
+                                    Ok(out) => (
+                                        chunk_idx,
+                                        chunk,
+                                        src,
+                                        Err(format!(
+                                            "`{}` failed kernel confirmation ({}):\nstdout:\n{}\nstderr:\n{}",
+                                            chunk_file.display(),
+                                            out.status,
+                                            String::from_utf8_lossy(&out.stdout),
+                                            String::from_utf8_lossy(&out.stderr)
+                                        )),
+                                    ),
+                                    Err(e) => (
+                                        chunk_idx,
+                                        chunk,
+                                        src,
+                                        Err(format!(
+                                            "failed to run `lake env lean` on {}: {e}",
+                                            chunk_file.display()
+                                        )),
+                                    ),
+                                }
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                (
+                                    0,
+                                    &[][..],
+                                    String::new(),
+                                    Err("panic in confirm chunk worker".to_string()),
+                                )
+                            })
+                        })
+                        .collect()
+                });
+
+            for (chunk_idx, chunk, src, res) in wave_res {
+                if chunk_idx == 0 {
+                    let confirm_file = verify_dir.join("ItreeDiffBatchConfirm.lean");
+                    let _ = fs::write(&confirm_file, &src);
+                }
+                match res {
+                    Ok(()) => {
+                        combined_confirm_src.push_str(&src);
+                        combined_confirm_src.push('\n');
+                    }
+                    Err(_chunk_err) => {
+                        let mut by_fn: BTreeMap<String, Vec<BatchTraceEvalCase>> = BTreeMap::new();
+                        for case in chunk {
+                            if let Some(fn_name) = case_to_fn.get(&case.case_ident) {
+                                by_fn.entry(fn_name.clone()).or_default().push(case.clone());
+                            }
+                        }
+                        for (fn_name, fn_cases) in by_fn {
+                            let ns = format!("Proof.ItreeDiffBatchConfirmFallback_{fn_name}");
+                            let fb_src =
+                                render_batch_trace_eval_lean_module(&ns, &fn_cases, false);
+                            let fb_file = verify_dir
+                                .join(format!("ItreeDiffBatchConfirmFallback_{fn_name}.lean"));
+                            if fs::write(&fb_file, &fb_src).is_err() {
+                                failed_confirm_fns.insert(fn_name);
+                                continue;
+                            }
+                            let fb_out = Command::new("lake")
+                                .args(["env", "lean", "-M", "8192"])
+                                .arg(&fb_file)
+                                .current_dir(&anneal_dir)
+                                .output();
+                            match fb_out {
+                                Ok(out) if out.status.success() => {
+                                    combined_confirm_src.push_str(&fb_src);
+                                    combined_confirm_src.push('\n');
+                                }
+                                _ => {
+                                    failed_confirm_fns.insert(fn_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for fn_name in &failed_confirm_fns {
+            if compared_fn_names.remove(fn_name) {
+                if let Some(cnt) = raw_trace_count_by_fn.get(fn_name) {
+                    total_traces_executed = total_traces_executed.saturating_sub(*cnt);
+                }
+                per_candidate_distinct_traces.remove(fn_name);
+                obs_records_by_fn.remove(fn_name);
+                obs_sigs_by_fn.remove(fn_name);
+                *not_compared_reasons
+                    .entry("lean_confirm_failed".to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        if !failed_confirm_fns.is_empty() {
+            batch_cases.retain(|c| {
+                case_to_fn
+                    .get(&c.case_ident)
+                    .map(|f| !failed_confirm_fns.contains(f))
+                    .unwrap_or(false)
+            });
+        }
+        if batch_cases.is_empty() {
+            return Err("all ITree candidates failed Stage 2 Lean kernel confirmation".to_string());
+        }
+
+        let distinct_traces_checked = batch_cases.len();
+        let kernel_confirmed_all = true;
+        let confirm_src = combined_confirm_src;
+
+        let mut obs_path_set = MirObsPathSet::new();
+        let mut obs_path_signatures_set = BTreeSet::new();
+        for fn_name in &compared_fn_names {
+            if let Some(records) = obs_records_by_fn.get(fn_name) {
+                for (key, args) in records {
+                    obs_path_set.record_execution(key.clone(), args.clone());
+                }
+            }
+            if let Some(sigs) = obs_sigs_by_fn.get(fn_name) {
+                obs_path_signatures_set.extend(sigs.iter().cloned());
+            }
         }
 
         let mut agree_traces = 0usize;
@@ -1687,7 +2083,7 @@ pub fn evaluate_itree_batches_with_options(
             }
         }
 
-        let compared_candidates = staged_with_trials.len();
+        let compared_candidates = compared_fn_names.len();
         let diverge_candidates = diverged_fn_names.len();
         let agree_candidates = compared_candidates.saturating_sub(diverge_candidates);
         let not_compared_candidates = total_candidates.saturating_sub(compared_candidates);
@@ -1719,7 +2115,9 @@ pub fn evaluate_itree_batches_with_options(
             distinct_obs_paths: obs_path_set.len(),
             per_candidate_distinct_traces,
             diag_tag_counts,
+            not_compared_reasons,
             mutator_applications,
+            obs_path_signatures: obs_path_signatures_set.into_iter().collect(),
             findings,
             elapsed_ms,
         })
@@ -1926,6 +2324,19 @@ fn render_usize_map_json(map: &BTreeMap<String, usize>, indent: usize) -> String
     format!("{{\n{}\n{pad}}}", rows.join(",\n"))
 }
 
+fn render_string_list_json(items: &[String], indent: usize) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let pad = " ".repeat(indent);
+    let inner_pad = " ".repeat(indent + 2);
+    let rows: Vec<String> = items
+        .iter()
+        .map(|s| format!("{inner_pad}{}", json_escape(s)))
+        .collect();
+    format!("[\n{}\n{pad}]", rows.join(",\n"))
+}
+
 /// Render an [`ItreeFindingBundle`] as a JSON object at indentation `indent`.
 pub fn render_itree_finding_bundle_json(finding: &ItreeFindingBundle, indent: usize) -> String {
     let pad = " ".repeat(indent);
@@ -2016,7 +2427,9 @@ pub fn render_itree_eval_report_json(report: &ItreeCampaignEvalReport) -> String
          \x20 \"distinct_obs_paths\": {},\n\
          \x20 \"per_candidate_distinct_traces\": {},\n\
          \x20 \"diag_tag_counts\": {},\n\
+         \x20 \"not_compared_reasons\": {},\n\
          \x20 \"mutator_applications\": {},\n\
+         \x20 \"obs_path_signatures\": {},\n\
          \x20 \"findings_count\": {},\n\
          \x20 \"findings\": {findings_json},\n\
          \x20 \"elapsed_ms\": {:.2}\n\
@@ -2046,7 +2459,9 @@ pub fn render_itree_eval_report_json(report: &ItreeCampaignEvalReport) -> String
         report.distinct_obs_paths,
         render_usize_map_json(&report.per_candidate_distinct_traces, 2),
         render_usize_map_json(&report.diag_tag_counts, 2),
+        render_usize_map_json(&report.not_compared_reasons, 2),
         render_usize_map_json(&report.mutator_applications, 2),
+        render_string_list_json(&report.obs_path_signatures, 2),
         report.findings.len(),
         report.elapsed_ms,
     )
