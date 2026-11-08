@@ -1517,7 +1517,24 @@ These are deliberate and are the first things to lift:
   `jumpToBlock`, and `ExposedTargetAtAddr` obligations directly from
   `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`
   with zero external MiniRust evaluation hypotheses, while preserving
-  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state. Threading
+  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state.
+  Pass B2 (MR-4.3) unifies `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+  into `translateStmtOrIntrinsic`, `statementOkWithIntrinsics` (via
+  `progStatementOk`), and `inFragmentWithIntrinsics`, proves the self-contained
+  1-step simulation lemma `FrameOkWithIntrinsics.assume_step` (deriving both
+  the normal-step continuation jump when `evalOperand = .ok (.scalar ⟨1, 1⟩, _)`
+  and the lockstep `StepRel` UB transition when `evalOperand = .ok (.scalar ⟨0, 1⟩, _)`
+  or `evalOperand = .error .ub`, while preserving `FrameOkWithIntrinsics`,
+  `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`), extends
+  `termPreservesAddrTaken` to check `TerminatorKind.call` return destinations
+  (`termPreservesAddrTaken_call_spec`), and verifies 3-way cross-feature
+  witnesses combining `Assume` + mutable/shared reborrowing + provenance casts
+  (`assumeReborrowExposeRoundTrip_three_way`, `assumeReborrowFalseUb_three_way`)
+  and multi-frame `Terminator::Call` + `&mut u32` (`Protected::Strong`) +
+  Tree Borrows `MachTB` + cross-frame `PointerExposeProvenance` /
+  `PointerWithExposedProvenance` (`callRefMutProtectedRoundTrip_mach_and_tb`,
+  `callRefMutProtectorViolation_mach_vs_tb`,
+  `callCrossFrameExposeWithExposed_mach_and_tb`). Threading
   `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across the
   continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
   from `step_correspondence_N`. A single exposure site in a loop
@@ -1547,10 +1564,11 @@ These are deliberate and are the first things to lift:
   (`run_ub_rel`, `run_ub_rel_from_start`, `mirCall_ub_rel`) relate `StateRel`
   and so take `step_correspondence`'s all-scalar `hall` hypothesis.
 * **Two block-splitting translations.** `translateFnWithIntrinsics` splits a
-  block after each `PointerExposeProvenance` / `PointerWithExposedProvenance`
-  cast (single-function, `FrameOkWithIntrinsics`), while `translateFnInProg`
-  splits it after each `Assume` (multi-function, `SegChain`, `SegPc`); neither
-  translation lowers the other's intrinsics.
+  block after each `PointerExposeProvenance`, `PointerWithExposedProvenance`, or
+  `Assume` statement (single-function, `FrameOkWithIntrinsics`), while
+  `translateFnInProg` splits it after each `Assume` and translates
+  `TerminatorKind.call` in a multi-function program (`SegChain`, `SegPc`);
+  `translateFnInProg` does not lower provenance casts.
 * **Compiler call intrinsics and pointer/target intrinsics (MR-4.2).**
   `progInFragment` admits `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
   directly in the multi-function simulation (`SegChain`, `SegPc`), and

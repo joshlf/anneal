@@ -1974,8 +1974,64 @@ inductive StmtTranslation : Type where
   | stmt (s : Gen.Statement)
   | intrinsic (op : Gen.IntrinsicOp) (dst : Gen.PlaceExpr) (args : List Gen.ValueExpr)
 
-/-- `minimize`'s statement translation including the integer-pointer provenance
-casts (`tooling/minimize/src/bb.rs`):
+/-- MiniRust's unit type `()`, used by `build::unit_place()` and `mk_start_fn`. -/
+def unitTy : Gen.Type :=
+  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
+
+/-- `build::unit_place()`, a dangling aligned raw-pointer dereference of unit
+type (`tooling/miniutil/src/build/expr.rs`, lines 55-65 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L55-L65>). -/
+def buildUnitPlace : Gen.PlaceExpr :=
+  .Deref (.Constant (.PointerWithoutProvenance 1) (.Ptr (.Raw .None))) unitTy
+
+/-- `build::abort()`, `Terminator::Intrinsic { intrinsic: IntrinsicOp::Abort, .. }`
+(`tooling/miniutil/src/build/bb.rs`, lines 28-35 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/bb.rs#L28-L35>). -/
+def buildAbort : Gen.Terminator :=
+  .Intrinsic .Abort [] buildUnitPlace none
+
+/-- `build::raw_void_ptr_ty()`, the thin raw pointer type with no metadata
+(`Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })`). -/
+def rawVoidPtrTy : Gen.Type := .Ptr (.Raw .None)
+
+/-- `build::unit_ptr()`, `minimize`'s aligned dangling raw pointer constant
+used as the dummy unwind payload and `unit_place` base (MiniRust's
+`tooling/miniutil/src/build/expr.rs` at the pinned commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs>):
+`Constant::PointerWithoutProvenance(Address::from_bytes(1))` at
+`raw_void_ptr_ty()`. -/
+def unitPtr : Gen.ValueExpr :=
+  .Constant (.PointerWithoutProvenance 1) rawVoidPtrTy
+
+/-- `build::unit_place()`, `*unit_ptr()` at the zero-sized `()` tuple type
+`Interp.unitType` (MiniRust's `tooling/miniutil/src/build/expr.rs` at the
+pinned commit). `minimize` uses it as the destination of every intrinsic
+that returns `()`, such as `Assume` (`StatementResult::Intrinsic`). -/
+def unitPlace : Gen.PlaceExpr :=
+  .Deref unitPtr Interp.unitType
+
+/-- `build::abort()`, `minimize`'s abort terminator
+(`tooling/minimize/src/bb.rs`):
+> "Terminator::Intrinsic {
+>      intrinsic: IntrinsicOp::Abort,
+>      arguments: list![],
+>      ret: unit_place(),
+>      next_block: None,
+>  }" -/
+def abortTerminator : Gen.Terminator :=
+  .Intrinsic .Abort [] unitPlace none
+
+/-- Whether a MIR statement is
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))`, which
+`minimize` lowers to a block-ending `StatementResult::Intrinsic` with
+`IntrinsicOp::Assume` and destination `unit_place()`. -/
+def isAssume (s : MirAst.Statement) : Bool :=
+  match s.kind with
+  | .intrinsic (.assume _) => true
+  | _ => false
+
+/-- `minimize`'s statement translation including `NonDivergingIntrinsic::Assume`
+and the integer-pointer provenance casts (`tooling/minimize/src/bb.rs`):
 > "match rval {
 >     rs::Rvalue::Cast(rs::CastKind::PointerExposeProvenance, operand, _) => {
 >         let operand = self.translate_operand(operand, span);
@@ -2000,6 +2056,9 @@ def translateStmtOrIntrinsic (decls : List MirAst.LocalDecl) (s : MirAst.Stateme
     (layouts : Layout.LayoutTable := ⟨64, true, []⟩) :
     Option StmtTranslation :=
   match s.kind with
+  | .intrinsic (.assume op) => do
+    let operand ← translateOperand decls op
+    pure (.intrinsic .Assume unitPlace [operand])
   | .assign dst (.cast .pointerExposeProvenance op _) => do
     let destination ← translatePlace decls dst
     let operand ← translateOperand decls op
@@ -2165,53 +2224,6 @@ Unlike statement rvalues (where `minimize` translates `Operand::Move` as
 def translateCallArg (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.ArgumentExpr
   | .move p => (translatePlace decls p).map .InPlace
   | op => (translateOperand decls op).map .ByValue
-
-/-- MiniRust's unit type `()`, used by `build::unit_place()` and `mk_start_fn`. -/
-def unitTy : Gen.Type :=
-  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
-
-/-- `build::unit_place()`, a dangling aligned raw-pointer dereference of unit
-type (`tooling/miniutil/src/build/expr.rs`, lines 55-65 at the pinned commit:
-<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L55-L65>). -/
-def buildUnitPlace : Gen.PlaceExpr :=
-  .Deref (.Constant (.PointerWithoutProvenance 1) (.Ptr (.Raw .None))) unitTy
-
-/-- `build::abort()`, `Terminator::Intrinsic { intrinsic: IntrinsicOp::Abort, .. }`
-(`tooling/miniutil/src/build/bb.rs`, lines 28-35 at the pinned commit:
-<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/bb.rs#L28-L35>). -/
-def buildAbort : Gen.Terminator :=
-  .Intrinsic .Abort [] buildUnitPlace none
-
-/-- `build::raw_void_ptr_ty()`, the thin raw pointer type with no metadata
-(`Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })`). -/
-def rawVoidPtrTy : Gen.Type := .Ptr (.Raw .None)
-
-/-- `build::unit_ptr()`, `minimize`'s aligned dangling raw pointer constant
-used as the dummy unwind payload and `unit_place` base (MiniRust's
-`tooling/miniutil/src/build/expr.rs` at the pinned commit,
-<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs>):
-`Constant::PointerWithoutProvenance(Address::from_bytes(1))` at
-`raw_void_ptr_ty()`. -/
-def unitPtr : Gen.ValueExpr :=
-  .Constant (.PointerWithoutProvenance 1) rawVoidPtrTy
-
-/-- `build::unit_place()`, `*unit_ptr()` at the zero-sized `()` tuple type
-`Interp.unitType` (MiniRust's `tooling/miniutil/src/build/expr.rs` at the
-pinned commit). `minimize` uses it as the destination of every intrinsic
-that returns `()`, such as `Assume` (`StatementResult::Intrinsic`). -/
-def unitPlace : Gen.PlaceExpr :=
-  .Deref unitPtr Interp.unitType
-
-/-- `build::abort()`, `minimize`'s abort terminator
-(`tooling/minimize/src/bb.rs`):
-> "Terminator::Intrinsic {
->      intrinsic: IntrinsicOp::Abort,
->      arguments: list![],
->      ret: unit_place(),
->      next_block: None,
->  }" -/
-def abortTerminator : Gen.Terminator :=
-  .Intrinsic .Abort [] unitPlace none
 
 /-- The `MR-4.1` spelling `buildUnitPlace` is `unitPlace`. -/
 theorem unitPlace_eq_buildUnitPlace : unitPlace = buildUnitPlace := rfl
@@ -2474,15 +2486,6 @@ def translateTerminatorInProg (fnMap : FnMap) (layouts : Layout.LayoutTable)
     let term ← translateTerminator layouts decls t
     pure (term, nextCleanup, [])
 
-
-/-- Whether a MIR statement is
-`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))`, the one
-statement that `minimize` turns into a block-ending
-`StatementResult::Intrinsic`. -/
-def isAssume (s : MirAst.Statement) : Bool :=
-  match s.kind with
-  | .intrinsic (.assume _) => true
-  | _ => false
 
 /-- `minimize`'s `translate_stmt` (`tooling/minimize/src/bb.rs`) on the
 fragment: `translateStatement` for the ordinary statements, and for
@@ -3595,14 +3598,33 @@ def stmtPreservesAddrTaken (addrLocals : List Nat) (s : MirAst.Statement) : Bool
   | .storageLive i | .storageDead i => !addrLocals.contains i
   | _ => true
 
-/-- Whether `t` moves out no local in `addrLocals`. -/
+/-- Whether `t` moves out no local in `addrLocals` and (when `t` is a `Call`)
+writes its return value to no local in `addrLocals`. -/
 def termPreservesAddrTaken (addrLocals : List Nat) (t : MirAst.Terminator) : Bool :=
   match t.kind with
   | .switchInt discr _ =>
     match opMoved discr with
     | some j => !addrLocals.contains j
     | none => true
+  | .call _ argOps dst _ _ =>
+    !addrLocals.contains dst.local_ &&
+    argOps.all fun op =>
+      match opMoved op with
+      | some j => !addrLocals.contains j
+      | none => true
   | _ => true
+
+theorem termPreservesAddrTaken_call_spec {addrLocals : List Nat}
+    {fn : MirAst.Operand} {argOps : List MirAst.Operand} {dst : MirAst.Place}
+    {target : Option Nat} {unwind : MirAst.UnwindAction} {span : String}
+    (h : termPreservesAddrTaken addrLocals ⟨.call fn argOps dst target unwind, span⟩ = true) :
+    addrLocals.contains dst.local_ = false ∧
+      ∀ op ∈ argOps, ∀ j, opMoved op = some j → addrLocals.contains j = false := by
+  simp only [termPreservesAddrTaken, Bool.and_eq_true, Bool.not_eq_true', List.all_eq_true] at h
+  refine ⟨h.1, fun op hop j hmov => ?_⟩
+  have hop' := h.2 op hop
+  rw [hmov] at hop'
+  simpa using hop'
 
 /-- Decidable static summary of a non-transparent `ProjectionElem` step, erasing
 type payloads so borrow targets have `DecidableEq` while matching
@@ -4030,11 +4052,35 @@ def provCastStmtOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
         | none => false
   | _ => false
 
-/-- Statement well-formedness extended with provenance-cast statements lowered
-to `Terminator::Intrinsic` blocks by `translateStmtOrIntrinsic`. -/
+/-- Statement check in a multi-function program (`progInFragment`) or
+intrinsic-extended body (`statementOkWithIntrinsics`): either a
+single-body fragment statement (`statementOk`) or
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on a well-typed
+`bool` fragment operand (`operandOkB decls (copyOp op)`), which `translate_bb`
+splits into `Terminator::Intrinsic { intrinsic: IntrinsicOp::Assume, .. }`
+jumping to a fresh continuation block (`splitStmts`, `splitBlockAtIntrinsics`). -/
+def progStatementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
+  match s.kind with
+  | .intrinsic (.assume op) => operandOkB layouts decls (copyOp op)
+  | _ => statementOk decls s layouts
+
+theorem progStatementOk_of_statementOk {decls : List MirAst.LocalDecl}
+    {s : MirAst.Statement} {layouts : Layout.LayoutTable}
+    (h : statementOk decls s layouts = true) :
+    progStatementOk decls s layouts = true := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | intrinsic intr =>
+    cases intr <;> simp [statementOk] at h
+  | _ => exact h
+
+/-- Statement well-formedness extended with `Assume` and provenance-cast
+statements lowered to `Terminator::Intrinsic` blocks by
+`translateStmtOrIntrinsic`. -/
 def statementOkWithIntrinsics (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
     (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
-  statementOk decls s layouts || provCastStmtOk decls s layouts
+  progStatementOk decls s layouts || provCastStmtOk decls s layouts
 
 /-! ### Provenance-cast data-flow and aliasing discipline
 
@@ -4193,6 +4239,14 @@ def countIntrinsics : List StmtTranslation → Nat
   | .stmt _ :: rest => countIntrinsics rest
   | .intrinsic _ _ _ :: rest => 1 + countIntrinsics rest
 
+theorem translateStmtOrIntrinsic_assume (decls : List MirAst.LocalDecl)
+    (op : MirAst.Operand) (span : String) (layouts : Layout.LayoutTable) :
+    translateStmtOrIntrinsic decls ⟨.intrinsic (.assume op), span⟩ layouts =
+      (do
+        let operand ← translateOperand decls op
+        pure (.intrinsic .Assume unitPlace [operand])) :=
+  rfl
+
 theorem translateStmtOrIntrinsic_expose (decls : List MirAst.LocalDecl)
     (dst : MirAst.Place) (op : MirAst.Operand) (ty : MirAst.Ty) (span : String)
     (layouts : Layout.LayoutTable) :
@@ -4215,7 +4269,7 @@ theorem translateStmtOrIntrinsic_withExposed (decls : List MirAst.LocalDecl)
 
 theorem translateStmtOrIntrinsic_of_not_provCast (decls : List MirAst.LocalDecl)
     (s : MirAst.Statement) (layouts : Layout.LayoutTable)
-    (hnp : isProvCastStmt s = false) :
+    (hnp : isProvCastStmt s = false) (hna : isAssume s = false) :
     translateStmtOrIntrinsic decls s layouts = (translateStatement decls s layouts).map .stmt := by
   obtain ⟨kind, span⟩ := s
   cases kind with
@@ -4223,6 +4277,10 @@ theorem translateStmtOrIntrinsic_of_not_provCast (decls : List MirAst.LocalDecl)
     cases rv with
     | cast ck op ty =>
       cases ck <;> first | rfl | simp [isProvCastStmt] at hnp
+    | _ => rfl
+  | intrinsic intr =>
+    cases intr with
+    | assume _ => simp [isAssume] at hna
     | _ => rfl
   | _ => rfl
 
@@ -4241,6 +4299,10 @@ theorem translateStmtOrIntrinsic_of_translateStatement (decls : List MirAst.Loca
       | pointerWithExposedProvenance =>
         simp [translateStatement, translateRvalue, copyRv] at h
       | _ => simp [translateStmtOrIntrinsic, h]
+    | _ => simp [translateStmtOrIntrinsic, h]
+  | intrinsic intr =>
+    cases intr with
+    | assume _ => simp [translateStatement] at h
     | _ => simp [translateStmtOrIntrinsic, h]
   | _ => simp [translateStmtOrIntrinsic, h]
 
@@ -4607,7 +4669,7 @@ theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
     by rw [provCastAliasView_of_not_hasProvCast hnp]; exact h13⟩, by simp [hfi]⟩
   intro bb hbb
   obtain ⟨⟨hc, hst⟩, htm⟩ := h9 bb hbb
-  exact ⟨⟨hc, fun s hs => by simp [statementOkWithIntrinsics, hst s hs]⟩, htm⟩
+  exact ⟨⟨hc, fun s hs => by simp [statementOkWithIntrinsics, progStatementOk_of_statementOk (hst s hs)]⟩, htm⟩
 /-! ### Multi-function fragment (`progInFragment`)
 
 In MiniRust's `Terminator::Call` (`spec/lang/step/terminators.md`), the caller
@@ -4921,18 +4983,6 @@ def terminatorInProgOk (callees : List MirAst.CapturedMir) (body : MirAst.Captur
     (blk : Nat) (t : MirAst.Terminator) : Bool :=
   terminatorOk body.layouts body.localDecls body.basicBlocks.length t ||
   callTerminatorOk callees body blk t
-
-/-- Statement check in a multi-function program (`progInFragment`): either a
-single-body fragment statement (`statementOk`) or
-`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on a well-typed
-`bool` fragment operand (`operandOkB decls (copyOp op)`), which `translate_bb`
-splits into `Terminator::Intrinsic { intrinsic: IntrinsicOp::Assume, .. }`
-jumping to a fresh continuation block (`splitStmts`, `SegChain`). -/
-def progStatementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
-    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
-  match s.kind with
-  | .intrinsic (.assume op) => operandOkB layouts decls (copyOp op)
-  | _ => statementOk decls s layouts
 
 /-- Per-function fragment check within a multi-function program
 `(fnMap, callees)`. Statements satisfy `progStatementOk` (admitting

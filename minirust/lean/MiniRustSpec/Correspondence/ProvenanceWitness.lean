@@ -979,4 +979,382 @@ theorem int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure :
       some true := by
   decide +kernel
 
+/-! ## 9. `Assume` across reborrowing and provenance casts (MR-4.3 Pass B2) -/
+
+/-- MIR of
+```rust
+fn assume_reborrow_expose_round_trip(mut x: u32) -> u32 {
+    let r1 = &mut x;                                         // _2 = &mut _1
+    let r2 = &mut *r1;                                       // _3 = &mut (*_2)
+    *r2 = 42;                                                // (*_3) = const 42_u32
+    let v = *r2;                                             // _4 = copy (*_3)
+    let ok = v == 42;                                        // _5 = Eq(copy _4, const 42_u32)
+    core::intrinsics::assume(ok);                            // Intrinsic(Assume(copy _5))
+    let addr = (r2 as *mut u32).expose_provenance();         // _6 = PointerExposeProvenance(copy _3)
+    let p = core::ptr::with_exposed_provenance_mut::<u32>(addr); // _7 = PointerWithExposedProvenance(copy _6)
+    unsafe { *p = 99; *p }                                   // (*_7) = const 99_u32; _0 = copy (*_7)
+}
+```
+Exercises `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume)` interleaved
+with two-level `&mut` reborrowing (`_2 = &mut _1; _3 = &mut (*_2)`) and
+`PointerExposeProvenance` / `PointerWithExposedProvenance` block splitting in a
+single `inFragmentWithIntrinsics` body: `translateStmtOrIntrinsic` splits the
+single MIR block into four MiniRust basic blocks (`bb0` ending in
+`IntrinsicOp::Assume -> bb1`, `bb1` ending in `PointerExposeProvenance -> bb2`,
+`bb2` ending in `PointerWithExposedProvenance -> bb3`, and `bb3` ending in
+`Return`). -/
+def assumeReborrowExposeRoundTrip : CapturedMir :=
+  ptrBody "witness::assume_reborrow_expose_round_trip"
+    [u32Decl, u32Decl, refMutU32Decl, refMutU32Decl, u32Decl, boolDecl, usizeDecl, ptrMutU32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .storageLive 6, .storageLive 7,
+     .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .assign (local_ 3) (.ref (.mut false) (derefPlace 2)),
+     .assign (derefPlace 3) (.use (constU32 42)),
+     .assign (local_ 4) (.use (.copy (derefPlace 3))),
+     .assign (local_ 5) (.binaryOp .eq (.copy (local_ 4)) (constU32 42)),
+     .intrinsic (.assume (.copy (local_ 5))),
+     .assign (local_ 6) (.cast .pointerExposeProvenance (.copy (local_ 3)) usizeTy),
+     .assign (local_ 7) (.cast .pointerWithExposedProvenance (.copy (local_ 6)) ptrMutU32Ty),
+     .assign (derefPlace 7) (.use (constU32 99)),
+     .assign (local_ 0) (.use (.copy (derefPlace 7)))]
+
+theorem assumeReborrowExposeRoundTrip_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics assumeReborrowExposeRoundTrip = true := by
+  decide +kernel
+
+theorem assumeReborrowExposeRoundTrip_singleExposeSiteOk :
+    singleExposeSiteOk assumeReborrowExposeRoundTrip = true := by
+  decide +kernel
+
+set_option maxRecDepth 200000 in
+theorem assumeReborrowExposeRoundTrip_anneal_ret :
+    ∃ mem, ReachesRet (mirTree assumeReborrowExposeRoundTrip
+      (initMachineState assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨99, 4⟩, mem)) :=
+  ⟨_, runA_sound assumeReborrowExposeRoundTrip 35 _ _ _ rfl⟩
+
+theorem assumeReborrowExposeRoundTrip_minirust_direct :
+    retAfterIntr assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩] 18 =
+      some (some { retAlloc with data := scalarBytes u32 99 }, [1]) := by
+  decide +kernel
+
+theorem assumeReborrowExposeRoundTrip_tb_direct :
+    retAfterIntrTB assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩] 18 = tbRetU32 99 := by
+  decide +kernel
+
+theorem assumeReborrowExposeRoundTrip_three_way :
+    inFragmentWithIntrinsics assumeReborrowExposeRoundTrip = true ∧
+      singleExposeSiteOk assumeReborrowExposeRoundTrip = true ∧
+      (∃ mem, ReachesRet (mirTree assumeReborrowExposeRoundTrip
+        (initMachineState assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩])) []
+        (.normal (.scalar ⟨99, 4⟩, mem))) ∧
+      retAfterIntr assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩] 18 =
+        some (some { retAlloc with data := scalarBytes u32 99 }, [1]) ∧
+      retAfterIntrTB assumeReborrowExposeRoundTrip [.scalar ⟨5, 4⟩] 18 = tbRetU32 99 :=
+  ⟨assumeReborrowExposeRoundTrip_inFragmentWithIntrinsics,
+    assumeReborrowExposeRoundTrip_singleExposeSiteOk,
+    assumeReborrowExposeRoundTrip_anneal_ret,
+    assumeReborrowExposeRoundTrip_minirust_direct,
+    assumeReborrowExposeRoundTrip_tb_direct⟩
+
+/-- Companion body in which the `Assume` condition after reborrowing is `false`
+(`*r2 == 0` when `*r2 == 42`), raising UB across Anneal, `Mach`, and `MachTB`. -/
+def assumeReborrowFalseUb : CapturedMir :=
+  ptrBody "witness::assume_reborrow_false_ub"
+    [u32Decl, u32Decl, refMutU32Decl, refMutU32Decl, u32Decl, boolDecl]
+    [.storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+     .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .assign (local_ 3) (.ref (.mut false) (derefPlace 2)),
+     .assign (derefPlace 3) (.use (constU32 42)),
+     .assign (local_ 4) (.use (.copy (derefPlace 3))),
+     .assign (local_ 5) (.binaryOp .eq (.copy (local_ 4)) (constU32 0)),
+     .intrinsic (.assume (.copy (local_ 5))),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem assumeReborrowFalseUb_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics assumeReborrowFalseUb = true := by
+  decide +kernel
+
+theorem assumeReborrowFalseUb_anneal_ub :
+    ∃ tr u, Reaches (mirTree assumeReborrowFalseUb
+      (initMachineState assumeReborrowFalseUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
+  faultsA_sound assumeReborrowFalseUb 25 _ (by decide)
+
+theorem assumeReborrowFalseUb_minirust_direct :
+    stopAfterIntr assumeReborrowFalseUb [.scalar ⟨5, 4⟩] 11 =
+      some (.ub "`Assume` intrinsic called on condition that is violated") := by
+  decide +kernel
+
+theorem assumeReborrowFalseUb_tb_direct :
+    stopAfterIntrTB assumeReborrowFalseUb [.scalar ⟨5, 4⟩] 11 =
+      some (.ub "`Assume` intrinsic called on condition that is violated") := by
+  decide +kernel
+
+theorem assumeReborrowFalseUb_three_way :
+    inFragmentWithIntrinsics assumeReborrowFalseUb = true ∧
+      (∃ tr u, Reaches (mirTree assumeReborrowFalseUb
+        (initMachineState assumeReborrowFalseUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+      stopAfterIntr assumeReborrowFalseUb [.scalar ⟨5, 4⟩] 11 =
+        some (.ub "`Assume` intrinsic called on condition that is violated") ∧
+      stopAfterIntrTB assumeReborrowFalseUb [.scalar ⟨5, 4⟩] 11 =
+        some (.ub "`Assume` intrinsic called on condition that is violated") :=
+  ⟨assumeReborrowFalseUb_inFragmentWithIntrinsics,
+    assumeReborrowFalseUb_anneal_ub,
+    assumeReborrowFalseUb_minirust_direct,
+    assumeReborrowFalseUb_tb_direct⟩
+
+/-! ## 10. Multi-frame `Terminator::Call` with `&mut` references, Tree Borrows function-entry protectors, and cross-frame provenance casts (MR-4.3 Pass B2) -/
+
+/-- Callee `fn add37_ref_mut(r: &mut u32) -> u32`: validates `r` with
+`fn_entry = true` (`Protected::Strong` under Tree Borrows), writes `*r = *r + 37`,
+and returns `*r`. -/
+def calleeAdd37RefMutFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, refTy .mut u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Validate (.Local (localName 1)) true,
+      .Assign (.Deref (.Load (.Local (localName 1))) (.Int u32))
+        (.BinOp (.Int .Add)
+          (.Load (.Deref (.Load (.Local (localName 1))) (.Int u32)))
+          (.Constant (.Int 37) (.Int u32))),
+      .Assign (.Local (localName 0))
+        (.Load (.Deref (.Load (.Local (localName 1))) (.Int u32)))],
+      .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+/-- Caller `fn call_ref_mut_protected(mut x: u32) -> u32`: borrows `_2 = &mut _1`,
+calls `add37_ref_mut(move _2) -> _3`, and returns `_3 + _1`. -/
+def callerRefMutProtectedFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 2))
+        (.AddrOf (.Local (localName 1)) (refPtrType .mut u32))],
+      .Call (fnPtrExpr (fnName 1)) .Rust
+        [.InPlace (.Local (localName 2))]
+        (.Local (localName 3)) (some (bbName 1)) none, .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 3))) (.Load (.Local (localName 1)))),
+      .StorageDead (localName 3),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def callRefMutProtectedProg : Gen.Program where
+  functions := ⟨[(fnName 0, callerRefMutProtectedFn),
+    (fnName 1, calleeAdd37RefMutFn),
+    (fnName 2, mkStartFn 0)]⟩
+  start := fnName 2
+  globals := ⟨[]⟩
+  vtables := ⟨[]⟩
+  traits := ⟨[]⟩
+
+def ctxCallRefMut1 : Ctx :=
+  ctxWithFns callerFrame retAlloc 2 [128, 256]
+
+def callRefMutProtectedMInit : Mach :=
+  multiMachineWithCtx ctxCallRefMut1 callRefMutProtectedProg 2 int2ptrRawRoundTripOk
+    callerRefMutProtectedFn [.uninit, .init (.scalar ⟨5, 4⟩)] (bbName 0)
+
+def callRefMutProtectedTBInit : MachTB :=
+  liftMachToTB callRefMutProtectedMInit
+
+/-- Multi-frame `Call` passing `&mut u32` with function-entry `Validate` (`fn_entry = true`)
+succeeds on both `Mach` (`BasicMemory`) and `MachTB` (`TreeBorrowsMemory`),
+updating caller local `_1` from `5` to `42`, releasing the callee's strong
+protector on `Return`, and returning `42 + 42 = 84`. -/
+theorem callRefMutProtectedRoundTrip_mach_and_tb :
+    (Interp.steps 12 callRefMutProtectedMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 84 }, [1]) ∧
+    (Interp.stepsTB 12 callRefMutProtectedTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 84 := by
+  decide +kernel
+
+/-- Callee `fn protector_conflict(r: &mut u32, raw: *mut u32) -> u32`:
+validates `r` at function entry (`Protected::Strong`), activates `r` via `*r = 10`,
+and then writes `*raw = 20` through the aliasing parent raw pointer `raw` while
+`r`'s strong function-entry protector is still active. -/
+def calleeProtectorConflictFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, refTy .mut u32),
+    (localName 2, thinRawPtrTy)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .Validate (.Local (localName 1)) true,
+      .Assign (.Deref (.Load (.Local (localName 1))) (.Int u32))
+        (.Constant (.Int 10) (.Int u32)),
+      .Assign (.Deref (.Load (.Local (localName 2))) (.Int u32))
+        (.Constant (.Int 20) (.Int u32)),
+      .Assign (.Local (localName 0))
+        (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32)))],
+      .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+/-- Caller `fn call_protector_conflict(mut x: u32) -> u32`: creates `raw = &raw mut _1`,
+reborrows `r = &mut *raw`, and calls `protector_conflict(move r, move raw)`. -/
+def callerProtectorConflictFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, thinRawPtrTy), (localName 3, refTy .mut u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 2))
+        (.AddrOf (.Local (localName 1)) (.Raw .None)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (refPtrType .mut u32))],
+      .Call (fnPtrExpr (fnName 1)) .Rust
+        [.InPlace (.Local (localName 3)), .InPlace (.Local (localName 2))]
+        (.Local (localName 0)) (some (bbName 1)) none, .Regular⟩),
+    (bbName 1, ⟨[
+      .StorageDead (localName 3),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def callProtectorConflictProg : Gen.Program where
+  functions := ⟨[(fnName 0, callerProtectorConflictFn),
+    (fnName 1, calleeProtectorConflictFn),
+    (fnName 2, mkStartFn 0)]⟩
+  start := fnName 2
+  globals := ⟨[]⟩
+  vtables := ⟨[]⟩
+  traits := ⟨[]⟩
+
+def callProtectorConflictMInit : Mach :=
+  multiMachineWithCtx ctxCallRefMut1 callProtectorConflictProg 2 int2ptrRawRoundTripOk
+    callerProtectorConflictFn [.uninit, .init (.scalar ⟨5, 4⟩)] (bbName 0)
+
+def callProtectorConflictTBInit : MachTB :=
+  liftMachToTB callProtectorConflictMInit
+
+def stopStepsTB (n : Nat) (m : MachTB) : Option Stop :=
+  match Interp.stepsTB n m with
+  | .error e => some e
+  | .ok _ => none
+
+/-- On `Mach` (`BasicMemory`), `callProtectorConflict` completes normally and returns
+`20`; on `MachTB` (`TreeBorrowsMemory`), the write through `raw` while `r`'s
+function-entry protector (`PermissionProt::Unique`) is active raises Tree Borrows UB
+(`"Tree Borrows: foreign read of protected Unique reference"` in
+`PermissionProt::foreign_write`). -/
+theorem callRefMutProtectorViolation_mach_vs_tb :
+    (Interp.steps 13 callProtectorConflictMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 20 }, [1]) ∧
+    stopStepsTB 8 callProtectorConflictTBInit =
+      some (.ub "Tree Borrows: foreign read of protected Unique reference") := by
+  decide +kernel
+
+/-- Callee `fn expose_ptr_callee(p: *mut u32) -> usize`: exposes `p` via
+`IntrinsicOp::PointerExposeProvenance` and returns the exposed `usize` address
+to its caller. -/
+def calleeExposePtrFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int usizeIt), (localName 1, thinRawPtrTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[],
+      .Intrinsic .PointerExposeProvenance [.Load (.Local (localName 1))]
+        (.Local (localName 0)) (some (bbName 1)), .Regular⟩),
+    (bbName 1, ⟨[], .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+/-- Caller `fn call_cross_frame_expose_with_exposed(mut x: u32) -> u32`:
+creates `_2 = &mut _1` and `_3 = &raw mut (*_2)`, passes `_3` to
+`expose_ptr_callee(move _3) -> _4`, reconstructs `_5 : *mut u32` in the caller
+frame via `IntrinsicOp::PointerWithExposedProvenance`, writes `(*_5) = 88`, and
+returns `_1` (`88`). -/
+def callerCrossFrameExposeFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, thinRawPtrTy),
+    (localName 4, .Int usizeIt), (localName 5, thinRawPtrTy)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2),
+      .StorageLive (localName 3),
+      .StorageLive (localName 4),
+      .StorageLive (localName 5),
+      .Assign (.Local (localName 2))
+        (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (.Raw .None))],
+      .Call (fnPtrExpr (fnName 1)) .Rust
+        [.InPlace (.Local (localName 3))]
+        (.Local (localName 4)) (some (bbName 1)) none, .Regular⟩),
+    (bbName 1, ⟨[],
+      .Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName 4))]
+        (.Local (localName 5)) (some (bbName 2)), .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Deref (.Load (.Local (localName 5))) (.Int u32))
+        (.Constant (.Int 88) (.Int u32)),
+      .Assign (.Local (localName 0)) (.Load (.Local (localName 1))),
+      .StorageDead (localName 5),
+      .StorageDead (localName 4),
+      .StorageDead (localName 3),
+      .StorageDead (localName 2)],
+      .Return, .Regular⟩)]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def callCrossFrameExposeProg : Gen.Program where
+  functions := ⟨[(fnName 0, callerCrossFrameExposeFn),
+    (fnName 1, calleeExposePtrFn),
+    (fnName 2, mkStartFn 0)]⟩
+  start := fnName 2
+  globals := ⟨[]⟩
+  vtables := ⟨[]⟩
+  traits := ⟨[]⟩
+
+def callCrossFrameExposeMInit : Mach :=
+  multiMachineWithCtx ctxCallRefMut1 callCrossFrameExposeProg 2 int2ptrRawRoundTripOk
+    callerCrossFrameExposeFn [.uninit, .init (.scalar ⟨5, 4⟩)] (bbName 0)
+
+def callCrossFrameExposeTBInit : MachTB :=
+  liftMachToTB callCrossFrameExposeMInit
+
+/-- Exposing a pointer in a callee frame (`PointerExposeProvenance`) and
+reconstructing it in the caller frame (`PointerWithExposedProvenance`) after
+`Return` succeeds and returns `88` on both `Mach` (`BasicMemory`) and `MachTB`
+(`TreeBorrowsMemory`). -/
+theorem callCrossFrameExposeWithExposed_mach_and_tb :
+    (Interp.steps 17 callCrossFrameExposeMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 88 }, [1]) ∧
+    (Interp.stepsTB 17 callCrossFrameExposeTBInit).toOption.map
+        (fun m =>
+          ({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+             stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome)) =
+      tbRetU32 88 := by
+  decide +kernel
+
 end MiniRustSpec.Correspondence.ProvenanceWitness

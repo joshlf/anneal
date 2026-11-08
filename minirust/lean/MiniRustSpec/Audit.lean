@@ -4415,6 +4415,25 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrAdjacentArgsAmbiguous_countExposeStmts_eq_two
   int2ptrAdjacentArgsAmbiguous_singleExposeSiteOk_false
   int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure
+  translateStmtOrIntrinsic_assume
+  termPreservesAddrTaken_call_spec
+  progStatementOk_of_statementOk
+  FrameOkWithIntrinsics.toFrameOk
+  FrameOkWithIntrinsics.assume_step
+  assumeReborrowExposeRoundTrip_inFragmentWithIntrinsics
+  assumeReborrowExposeRoundTrip_singleExposeSiteOk
+  assumeReborrowExposeRoundTrip_anneal_ret
+  assumeReborrowExposeRoundTrip_minirust_direct
+  assumeReborrowExposeRoundTrip_tb_direct
+  assumeReborrowExposeRoundTrip_three_way
+  assumeReborrowFalseUb_inFragmentWithIntrinsics
+  assumeReborrowFalseUb_anneal_ub
+  assumeReborrowFalseUb_minirust_direct
+  assumeReborrowFalseUb_tb_direct
+  assumeReborrowFalseUb_three_way
+  callRefMutProtectedRoundTrip_mach_and_tb
+  callRefMutProtectorViolation_mach_vs_tb
+  callCrossFrameExposeWithExposed_mach_and_tb
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -4699,6 +4718,25 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrAdjacentArgsAmbiguous_countExposeStmts_eq_two
   int2ptrAdjacentArgsAmbiguous_singleExposeSiteOk_false
   int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure
+  translateStmtOrIntrinsic_assume
+  termPreservesAddrTaken_call_spec
+  progStatementOk_of_statementOk
+  FrameOkWithIntrinsics.toFrameOk
+  FrameOkWithIntrinsics.assume_step
+  assumeReborrowExposeRoundTrip_inFragmentWithIntrinsics
+  assumeReborrowExposeRoundTrip_singleExposeSiteOk
+  assumeReborrowExposeRoundTrip_anneal_ret
+  assumeReborrowExposeRoundTrip_minirust_direct
+  assumeReborrowExposeRoundTrip_tb_direct
+  assumeReborrowExposeRoundTrip_three_way
+  assumeReborrowFalseUb_inFragmentWithIntrinsics
+  assumeReborrowFalseUb_anneal_ub
+  assumeReborrowFalseUb_minirust_direct
+  assumeReborrowFalseUb_tb_direct
+  assumeReborrowFalseUb_three_way
+  callRefMutProtectedRoundTrip_mach_and_tb
+  callRefMutProtectorViolation_mach_vs_tb
+  callCrossFrameExposeWithExposed_mach_and_tb
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"
