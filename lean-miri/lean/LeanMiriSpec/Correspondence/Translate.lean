@@ -959,7 +959,23 @@ def annealProjectionCx (layouts : LayoutTable)
   field := fun parent fieldIdx => annealFieldLayout layouts hintFieldTy parent fieldIdx
   variant := fun parent vIdx =>
     if vIdx == 0 then .ok parent
-    else .error (.invariant "multi-variant downcast not wired in LM-2.2")
+    else
+      match parent.layout.variants with
+      | .Empty => .error (.invariant "variant of empty layout")
+      | .Single act =>
+          if vIdx == act then .ok parent
+          else .error (.invariant "invalid variant index for single variant layout")
+      | .Multiple _ _ _ vars =>
+          if h : vIdx < vars.size then
+            let varLayout := vars[vIdx]
+            .ok { ty := parent.ty, layout := { parent.layout with
+              fields := .Arbitrary varLayout.fieldOffsets varLayout.fieldsInMemoryOrder
+              variants := .Single vIdx
+              backendRepr := varLayout.backendRepr
+              size := varLayout.size
+              uninhabited := varLayout.uninhabited } }
+          else
+            .error (.invariant "variant index out of bounds")
   dynamicAlign := fun _ lay => .ok (some lay.layout.align.abi)
   packedAlign := fun _ => .ok none
   immediateOffset := fun value source offset target =>
@@ -1427,8 +1443,24 @@ def annealProjectPlaceList (layouts : LayoutTable)
   | .Field fieldIdx fieldTy :: rest => do
       let next ← annealProjectFieldPlace layouts (some fieldTy) place fieldIdx
       annealProjectPlaceList layouts next rest
-  | .Downcast _ 0 :: rest =>
-      annealProjectPlaceList layouts place rest
+  | .Downcast _ variant :: rest => do
+      match place.layout.layout.variants with
+      | .Empty => .error (.invalidProgram "downcast variant of empty layout")
+      | .Single act =>
+          if variant == act then annealProjectPlaceList layouts place rest
+          else .error (.invalidProgram "invalid variant index for single variant layout")
+      | .Multiple _ _ _ vars =>
+          if h : variant < vars.size then
+            let varLayout := vars[variant]
+            let place' := { place with layout := { place.layout with layout := { place.layout.layout with
+              fields := .Arbitrary varLayout.fieldOffsets varLayout.fieldsInMemoryOrder
+              variants := .Single variant
+              backendRepr := varLayout.backendRepr
+              size := varLayout.size
+              uninhabited := varLayout.uninhabited } } }
+            annealProjectPlaceList layouts place' rest
+          else
+            .error (.invalidProgram "downcast variant index out of bounds")
   | _ :: _ => .error (.unsupported "non-field place projection in LM-2.2")
 
 /-- Resolve a projected `Miri.MIR.Place` to a `RuntimePlace AnnealProv` in the top frame. -/
@@ -1907,6 +1939,53 @@ def annealStructMemCopyOp (localDecls : List LocalDecl) (layouts : LayoutTable)
                         live := st.machine.memory.live.set! destIdx (k, ⟨kind, destAlloc'⟩) } } }
                 | EStateM.Result.error err _ => throw (annealStructMemCopyError err)
 
+mutual
+
+def annealDiscriminantHooks (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    Miri.Interpreter.DiscriminantHooks AnnealProv AnnealStepState Unit (Miri.Interpreter.RuntimePlace AnnealProv) where
+  runtimeTarget := annealRuntimeDataLayout
+  discriminantLayout := fun _ tyId => do
+    match layouts.lookup (tyId - 100) with
+    | some tl => pure { ty := tyId, layout := translateTypeLayout tl }
+    | none => pure { ty := tyId, layout := zstLayoutData }
+  tagLayout := fun _ tag => do
+    let lay : Miri.ABI.LayoutData := { fields := .Primitive, variants := .Empty, backendRepr := .Scalar tag, uninhabited := false, largestNiche := none, align := (match tag.primitive.defaultAlign annealRuntimeDataLayout with | .ok a => a | .error _ => ⟨Miri.ABI.Align.ONE⟩), size := (tag.size annealRuntimeDataLayout).toOption.get!, maxReprAlign := none, unadjustedAbiAlign := (match tag.primitive.defaultAlign annealRuntimeDataLayout with | .ok a => a | .error _ => ⟨Miri.ABI.Align.ONE⟩).abi, reprC := false, randomizationSeed := 0 }
+    return { ty := 0, layout := lay }
+  discriminantValue := fun _ ty variant => pure (some (ty, variant.toUInt64.toNat))
+  variantForDiscriminant := fun _ _ bits => pure (some bits.toNat)
+  adtVariantCount := fun _ tyId => do
+    match layouts.lookup (tyId - 100) with
+    | some tl =>
+        match tl.variants with
+        | .multiple _ _ vars => pure vars.length
+        | .single _ => pure 1
+        | .empty => pure 0
+    | none => pure 0
+  projectRead := fun _ op field => match Miri.Interpreter.projectField (annealProjectionCx layouts) op field with | .ok p => pure p | .error e => throw (.invalidProgram "projection error")
+  readImmediate := fun c op => annealReadImmediate op
+  destLayout := fun dest => dest.layout
+  projectWrite := fun _ dest field => match annealProjectFieldPlace layouts none dest field with | .ok p => pure p | .error e => throw e
+  writeScalar := fun c val dest => do
+    annealWriteImmediate (.scalar val) dest
+  toOp := fun _ dest => do
+    match dest.ref with
+    | .memory mp => pure ⟨.indirect mp, dest.layout⟩
+    | .local frameIdx localId offset _ => do
+        let st ← get
+        if h : frameIdx < st.stack.frames.size then
+          let frame := st.stack.frames[frameIdx]
+          match frame.getLocal localId with
+          | .ok (.mk (.live (.immediate imm)) _) =>
+              if offset.isSome then throw (.unsupported "toOp for local with offset")
+              pure ⟨.immediate imm, dest.layout⟩
+          | .ok (.mk (.live (.indirect mp)) _) =>
+              pure ⟨.indirect mp, dest.layout⟩
+          | .ok (.mk .dead _) => throw (.unsupported "toOp for dead local")
+          | .error _ => throw (.unsupported "toOp local error")
+        else
+          throw (.unsupported "toOp invalid frame")
+  scalarMayBeNull := fun _ _ => pure false
+
 /-- `AggregateHooks` instantiated for Anneal's single-threaded machine, wiring
 upstream `Miri.Interpreter.writeAggregate` to `annealProjectFieldPlace`,
 `annealEvalOperand`, `annealStructMemCopyOp` (for `.Memory` sub-structs), and
@@ -1937,7 +2016,20 @@ def annealAggregateHooks (localDecls : List LocalDecl := .nil)
     | .error _ => throw (.invalidProgram "expected scalar immediate")
   projectDowncast := fun _ dest variant =>
     if variant == 0 then pure dest
-    else throw (.unsupported "multi-variant aggregate downcast not wired in LM-2.2")
+    else
+      match dest.layout.layout.variants with
+      | .Multiple _ _ _ vars =>
+          if h : variant < vars.size then
+            let varLayout := vars[variant]
+            pure { dest with layout := { dest.layout with layout := { dest.layout.layout with
+              fields := .Arbitrary varLayout.fieldOffsets varLayout.fieldsInMemoryOrder
+              variants := .Single variant
+              backendRepr := varLayout.backendRepr
+              size := varLayout.size
+              uninhabited := varLayout.uninhabited } } }
+          else
+            throw (.invalidProgram "downcast variant index out of bounds")
+      | _ => throw (.invalidProgram "downcast on non-multiple variant layout")
   projectField := fun _ dest fieldIdx =>
     match dest.layout.layout.fields with
     | .Array stride _ => do
@@ -1962,9 +2054,9 @@ def annealAggregateHooks (localDecls : List LocalDecl := .nil)
     else do
       let imm ← annealReadImmediate src
       annealWriteImmediate imm.imm dest
-  writeDiscriminant := fun _ variant _ =>
+  writeDiscriminant := fun c variant dest =>
     if variant == 0 then pure ()
-    else throw (.unsupported "multi-variant aggregate writeDiscriminant not wired in LM-2.2")
+    else Miri.Interpreter.Discriminant.writeDiscriminant (annealDiscriminantHooks localDecls layouts) c variant dest
   enforceValidity := fun _ _ => pure true
   validate := fun _ _ => pure ()
   forceAllocation := fun c dest => do
@@ -2061,8 +2153,10 @@ def annealRvalueHooks (localDecls : List LocalDecl := .nil)
   normalize := fun _ tyId => pure tyId
   cast := fun c src kind ty dest =>
     Miri.Interpreter.Cast.cast (annealCastHooks layouts) c 16 src kind ty dest
-  readDiscriminant := fun _ _ => throw (.unsupported "readDiscriminant")
-  discriminantForVariant := fun _ _ _ => throw (.unsupported "discriminantForVariant")
+  readDiscriminant := fun c op => Miri.Interpreter.Discriminant.readDiscriminant (annealDiscriminantHooks localDecls layouts) c op
+  discriminantForVariant := fun c ty variant => Miri.Interpreter.Discriminant.discriminantForVariant (annealDiscriminantHooks localDecls layouts) c ty variant
+
+end
 
 theorem copyOp_eq_read_write_of_immediate
     (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -2175,11 +2269,12 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
       (Miri.Interpreter.Operand AnnealProv)
       (Miri.Interpreter.RvalueImmTy AnnealProv) where
   toControlHooks := annealControlHooks
-  evalDiscriminant := fun _ op state =>
+  evalDiscriminant := fun c op state =>
     Miri.Interpreter.runRvalue
       (do
         let opTy ← annealEvalOperand localDecls layouts op none
-        annealReadImmediate opTy)
+        let variant ← Miri.Interpreter.Discriminant.readDiscriminant (annealDiscriminantHooks localDecls layouts) c opTy
+        Miri.Interpreter.Discriminant.discriminantForVariant (annealDiscriminantHooks localDecls layouts) c opTy.layout.ty variant)
       state
   compareSwitchCase := fun choice value caseVal state =>
     Miri.Interpreter.runRvalue

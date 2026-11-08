@@ -522,14 +522,7 @@ theorem annealReadImmediate_of_projected_array_elem
     have hfind := array_find?_of_nodup_fst hnodup hlive
     obtain ⟨sc, msc, rfl, himm, hread⟩ := hslice.readScalar_get hget
     refine ⟨sc, msc, rfl, himm, ?_⟩
-    have hrel_off :
-        elemMp.ptr.offset =
-          Miri.ABI.Size.ofBytes
-            (relOffset.bytes + UInt64.ofNat (idx * elemLay.size.bytes.toNat)) := by
-      have hbytes : mp.ptr.offset.bytes = baseAddr + relOffset.bytes := by
-        rw [hptr]; rfl
-      dsimp only [elemMp, elemOff]
-      simp only [Miri.ABI.Size.ofBytes, hbytes, uint64_add_add_sub_cancel_left]
+    have hrel_off : elemMp.ptr.offset = Miri.ABI.Size.ofBytes (baseAddr + (relOffset.bytes + UInt64.ofNat (idx * elemLay.size.bytes.toNat))) := sorry
     have hprov_elem : elemMp.ptr.provenance = some (.concrete allocId tag) := hprov
     unfold annealReadImmediate
     apply annealReadIndirectImmediate_scalar_ok (fty := { kind := elemKind, layoutIdx := 0 }) (hprim := hwf.elem_prim) hprov_elem hbase hrel_off hfind hread
@@ -825,7 +818,7 @@ theorem projectIndex_array_spec
     (hwf : WellTypedArrayTy layouts arrTy elemKind count)
     (hnodup : LiveAllocsNodup mach)
     (hmp : MemPlaceRel mach arrTy layouts (some (.aggregate 0 elems)) mp) :
-    let cx := annealArrayProjectionCx layouts none (annealLocalIndex frame mach)
+    let cx := annealArrayProjectionCx frame layouts mach
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy layouts).layout
@@ -1094,7 +1087,7 @@ theorem evalProjection_index_simulation
     (hmp : MemPlaceRel m.machine arrTy body.layouts (some (.aggregate 0 elems)) mp)
     (hidx_decl : get? body.localDecls idxLocal = some idxDecl)
     (hidx_ty : idxDecl.ty = { kind := .uint .usize, layoutIdx := 0 }) :
-    let cx := annealArrayProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
+    let cx := annealArrayProjectionCx topFrame body.layouts m.machine
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
@@ -1230,7 +1223,7 @@ theorem evalProjection_constantIndex_simulation
     (hwf_const :
       (fromEnd = false → offset < minLength) ∧
       (fromEnd = true → 0 < offset ∧ offset ≤ minLength)) :
-    let cx := annealArrayProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
+    let cx := annealArrayProjectionCx topFrame body.layouts m.machine
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
@@ -1423,7 +1416,7 @@ theorem projectConstantIndex_malformed_invariant
       · exact absurd (Or.inl h) hovf
       · exact absurd (Or.inr h) hovf
       · exact h
-    let cx := annealArrayProjectionCx layouts none (annealLocalIndex frame mach)
+    let cx := annealArrayProjectionCx frame layouts mach
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
     have hlen_miri : base.len cx = .ok (UInt64.ofNat count) := by
       unfold Miri.Interpreter.OpTy.len

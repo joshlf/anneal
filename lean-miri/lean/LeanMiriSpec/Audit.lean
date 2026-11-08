@@ -28,6 +28,8 @@ import LeanMiriSpec.Correspondence.LayoutLM2_2
 import LeanMiriSpec.Correspondence.ProjLM2_2
 import LeanMiriSpec.Correspondence.SimLM2_2
 import LeanMiriSpec.Correspondence.WitLM2_2
+import LeanMiriSpec.Correspondence.SimLM2_3
+import LeanMiriSpec.Correspondence.WitLM2_3
 import LeanMiriSpec.Correspondence.UnionLM2_4
 import LeanMiriSpec.Correspondence.SimLM2_4
 import LeanMiriSpec.Correspondence.WitLM2_4

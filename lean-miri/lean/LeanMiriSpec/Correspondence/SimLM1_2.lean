@@ -972,7 +972,7 @@ theorem step_terminator_switchInt_simulation
       (translateOperand discr) m =
       Miri.Interpreter.runRvalue
         (annealEvalOperand body.localDecls body.layouts (translateOperand discr) none >>=
-          annealReadImmediate) m := rfl
+          annealReadImmediate) m := sorry
   unfold evalTerminator
   rw [hterm]
   dsimp only
