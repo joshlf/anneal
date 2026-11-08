@@ -8641,10 +8641,8 @@ theorem derefReadNextTreeMap_map_toAllocMapEntry (locals : List LocalSlot) (tree
     · rfl
     · rfl
     · rename_i val
-      cases val
-      · rfl
-      · rfl
-      · rename_i ptrVal size
+      cases val <;> try rfl
+      case ptr ptrVal size =>
         split
         · rename_i ptrVal' heq
           cases heq
@@ -8672,39 +8670,84 @@ theorem derefReadNextTreeMap_map_toAllocMapEntry (locals : List LocalSlot) (tree
                 have h_lookup' := h_lookup
                 unfold lookupTreeMapByTag at h_lookup'
                 cases h_tree : treeMap with
-                | nil => contradiction
+                | nil => rw [h_tree] at h_len; contradiction
                 | cons hd_tree tl_tree =>
                   cases tl_tree with
                   | nil =>
                     cases h_tag : hd_tree.tag == ptrVal.tag
-                    · rw [h_tag] at h_lookup'
-                      dsimp at h_lookup'
-                      unfold lookupTreeMapByTag at h_lookup'
+                    · have h_find : List.find? (fun e => e.tag == ptrVal.tag) treeMap = none := by rw [h_tree]; dsimp [List.find?]; rw [h_tag]
+                      rw [h_find] at h_lookup'
                       contradiction
-                    · rw [h_tag] at h_lookup'
-                      dsimp at h_lookup'
+                    · have h_find : List.find? (fun e => e.tag == ptrVal.tag) treeMap = some hd_tree := by rw [h_tree]; dsimp [List.find?]; rw [h_tag]
+                      rw [h_find] at h_lookup'
                       injection h_lookup' with h_eq
                       subst e
+                      rw [h_tree] at hx
                       cases hx
-                      · subst x
-                        have h_eq2 : hd_tree.tag = ptrVal.tag := beq_iff_eq.mp h_tag
+                      · have h_eq2 : x.tag = ptrVal.tag := beq_iff_eq.mp h_tag
+                        dsimp [ReborrowMapEntry.toAllocMapEntry]
                         simp [h_eq2]
                       · contradiction
                   | cons _ _ =>
-                    have : (treeMap.map ReborrowMapEntry.toAllocMapEntry).length = 1 := by rw [h_len]; rfl
-                    rw [h_tree] at this
-                    contradiction
+                    have h_len_contra : (treeMap.map ReborrowMapEntry.toAllocMapEntry).length = 1 := by rw [h_len]; rfl
+                    rw [h_tree] at h_len_contra
+                    revert h_len_contra
+                    simp
               | cons hd2 tl2 =>
                 unfold derefReadMapFn
                 dsimp
                 unfold AllocMapEntry.updateOnRead
-                cases h_if : (x.localIdx == e.localIdx && x.tag != ptrVal.tag)
-                · rw [h_if]; simp; cases x_perm : x.perm <;> rfl
-                · rw [h_if]; simp; cases x_perm : x.perm <;> rfl
+                by_cases h_loc : e.localIdx = x.localIdx
+                · by_cases h_tag : ptrVal.tag = x.tag
+                  · have hl : (x.localIdx == e.localIdx) = true := by rw [h_loc]; exact beq_self_eq_true _
+                    have ht : (x.tag == ptrVal.tag) = true := by rw [h_tag]; exact beq_self_eq_true _
+                    have ht_neq : (x.tag != ptrVal.tag) = false := by change (!(x.tag == ptrVal.tag)) = _; rw [ht]; rfl
+                    change (if _ then _ else x).toAllocMapEntry = _
+                    rw [hl, ht_neq]
+                    dsimp
+                    have h_nat_l : Nat.beq x.toAllocMapEntry.localIdx e.toAllocMapEntry.localIdx = true := by dsimp [ReborrowMapEntry.toAllocMapEntry]; rw [h_loc]; exact Nat.beq_refl _
+                    have h_nat_t : ptrVal.tag.beq x.toAllocMapEntry.tag = true := by dsimp [ReborrowMapEntry.toAllocMapEntry]; rw [h_tag]; exact Nat.beq_refl _
+                    rw [h_nat_l, h_nat_t]
+                  · have hl : (x.localIdx == e.localIdx) = true := by rw [h_loc]; exact beq_self_eq_true _
+                    have ht : (x.tag == ptrVal.tag) = false := by
+                      cases h_eq : x.tag == ptrVal.tag
+                      · rfl
+                      · have h1 := (beq_iff_eq).mp h_eq
+                        exact False.elim (h_tag h1.symm)
+                    have ht_neq : (x.tag != ptrVal.tag) = true := by change (!(x.tag == ptrVal.tag)) = _; rw [ht]; rfl
+                    change (if _ then _ else x).toAllocMapEntry = _
+                    rw [hl, ht_neq]
+                    dsimp
+                    have h_nat_l : Nat.beq x.toAllocMapEntry.localIdx e.toAllocMapEntry.localIdx = true := by dsimp [ReborrowMapEntry.toAllocMapEntry]; rw [h_loc]; exact Nat.beq_refl _
+                    have h_nat_t : ptrVal.tag.beq x.toAllocMapEntry.tag = false := by
+                      dsimp [ReborrowMapEntry.toAllocMapEntry]
+                      cases h_eq : Nat.beq ptrVal.tag x.tag
+                      · rfl
+                      · have h1 := Nat.eq_of_beq_eq_true h_eq
+                        exact False.elim (h_tag h1)
+                    rw [h_nat_l, h_nat_t]
+                    dsimp [ReborrowMapEntry.toAllocMapEntry]
+                    cases h_perm : x.perm <;> rfl
+                · have hl : (x.localIdx == e.localIdx) = false := by
+                    cases h_eq : x.localIdx == e.localIdx
+                    · rfl
+                    · have h1 := (beq_iff_eq).mp h_eq
+                      exact False.elim (h_loc h1.symm)
+                  change (if _ then _ else x).toAllocMapEntry = _
+                  rw [hl]
+                  dsimp
+                  have h_nat_l : Nat.beq x.toAllocMapEntry.localIdx e.toAllocMapEntry.localIdx = false := by
+                    dsimp [ReborrowMapEntry.toAllocMapEntry]
+                    cases h_eq : Nat.beq x.localIdx e.localIdx
+                    · rfl
+                    · have h1 := Nat.eq_of_beq_eq_true h_eq
+                      exact False.elim (h_loc h1.symm)
+                  rw [h_nat_l]
         · rename_i h_not
-          -- The negative case of split
-          sorry
-      · rfl
+          split
+          · rename_i ptrVal_1 heq
+            exact False.elim (h_not ptrVal_1 heq)
+          · rfl
 
 theorem h_s'_eq {s'_erase : MachineState} {s : MachineState} {treeMap : List ReborrowMapEntry} {refIdx : Local}
   (heq : s'_erase.memory.borrows = (derefReadNextAllocMap s.frame.locals (treeMap.map ReborrowMapEntry.toAllocMapEntry) refIdx).map AllocMapEntry.toBorrowEntry) :
