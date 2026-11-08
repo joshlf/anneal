@@ -2055,7 +2055,7 @@ def annealAggregateHooks (localDecls : List LocalDecl := .nil)
       let imm ← annealReadImmediate src
       annealWriteImmediate imm.imm dest
   writeDiscriminant := fun c variant dest =>
-    if variant == 0 then pure ()
+    if false then pure ()
     else Miri.Interpreter.Discriminant.writeDiscriminant (annealDiscriminantHooks localDecls layouts) c variant dest
   enforceValidity := fun _ _ => pure true
   validate := fun _ _ => pure ()
