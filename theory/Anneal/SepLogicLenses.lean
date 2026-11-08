@@ -2951,7 +2951,13 @@ theorem LiftLensRvalue.evalRvalue_eq
     rw [hEval₁]
     dsimp only
     rw [hEval₂]
-    exact hEvalOp m
+    dsimp only
+    split
+    · have hBad := hEvalOp m
+      unfold evalScalarBinOp at hBad
+      repeat' split at hBad
+      all_goals contradiction
+    · exact hEvalOp m
   | unaryOp_not hOp hNot =>
     rcases hOp.evalOperand_eq hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
@@ -8089,7 +8095,13 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     rw [hEval₁]
     dsimp only
     rw [hEval₂]
-    exact hEvalOp m
+    dsimp only
+    split
+    · have hBad := hEvalOp m
+      unfold evalScalarBinOp at hBad
+      repeat' split at hBad
+      all_goals contradiction
+    · exact hEvalOp m
   | unaryOp_not hOp hNot =>
     rcases hOp.evalOperand_eq_subplace hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩

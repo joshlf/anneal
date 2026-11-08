@@ -2773,7 +2773,17 @@ def resolveProjectedTyResolved
       let innerTy : Ty :=
         match findDeclOrContainerElemTyWithKind? localDecls layouts inner with
         | .some declTy => declTy
-        | .none => { kind := inner, layoutIdx := synthKindLayoutIdx layouts inner }
+        | .none =>
+          match LayoutTable.lookup layouts baseTy.layoutIdx with
+          | .some { size := pSz, fields := .primitive, fieldLayouts := flIdx :: .nil, .. } =>
+            match
+              Bool.and
+                (Nat.beq pSz.bytes (layoutPointerBytes layouts))
+                (Nat.ble (.succ flIdx) (length layouts.entries))
+            with
+            | true => { kind := inner, layoutIdx := flIdx }
+            | false => { kind := inner, layoutIdx := synthKindLayoutIdx layouts inner }
+          | _ => { kind := inner, layoutIdx := synthKindLayoutIdx layouts inner }
       resolveProjectedTyResolved localDecls layouts innerTy rest
     | .none => .none
   | .index _ :: rest =>
@@ -9945,23 +9955,49 @@ def evalReifyFnPointer
     | false =>
       match stringEq coercionKind "ArrayToPointer" with
       | true =>
-        match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+        let ptrBytes := layoutPointerBytes layouts
+        match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
         | .ok (.ptr ptrVal sz) locals' =>
-          match Bool.and (Nat.beq sz 8) (isThinRawPtrTy targetTy) with
+          match Bool.and (Nat.beq sz ptrBytes) (isThinRawPtrTy targetTy) with
           | false => .ub
           | true =>
             match lookupBorrow mem.borrows ptrVal.tag with
             | .some parentEntry =>
               deriveStackElemThinPtr locals' mem ptrVal parentEntry .none
             | .none => .ok (.ptr ptrVal sz) locals' mem
+        | .ok (.scalar sc) locals' =>
+          match Bool.and (Nat.beq sc.sizeBytes ptrBytes) (isThinRawPtrTy targetTy) with
+          | true =>
+            .ok (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+          | false => .ub
         | .ok _ _ => .ub
         | .ub => .ub
         | .unsupported => .unsupported
       | false =>
-        match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+        let ptrBytes := layoutPointerBytes layouts
+        match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
         | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
         | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
           .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+        | .ok (.scalar sc) locals' =>
+          match Bool.and (Nat.beq sc.sizeBytes ptrBytes) (isThinRawPtrTy targetTy) with
+          | true =>
+            .ok (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+          | false => .ub
+        | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
+          match
+            Bool.and
+              (Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes))
+              (isWideRawPtrTy targetTy)
+          with
+          | true =>
+            let modPtr := scalarModulus ptrBytes
+            .ok
+              (.aggregate 0
+                (.scalar ⟨wrapScalarBits addrSc.bits modPtr, ptrBytes⟩ ::
+                  .scalar ⟨wrapScalarBits metaSc.bits modPtr, ptrBytes⟩ :: .nil))
+              locals' mem
+          | false => .ub
         | .ok _ _ => .unsupported
         | .ub => .ub
         | .unsupported => .unsupported
@@ -10429,9 +10465,245 @@ def pointeeElemByteStride
         let resolvedPointeeTy : Ty :=
           match findDeclOrContainerElemTyWithKind? localDecls layouts inner with
           | .some declTy => declTy
-          | .none => { kind := inner, layoutIdx := unresolvedLayoutIdx layouts }
+          | .none =>
+            match LayoutTable.lookup layouts ptrTy.layoutIdx with
+            | .some { size := pSz, fields := .primitive, fieldLayouts := flIdx :: .nil, .. } =>
+              match
+                Bool.and
+                  (Nat.beq pSz.bytes (layoutPointerBytes layouts))
+                  (Nat.ble (.succ flIdx) (length layouts.entries))
+              with
+              | true => { kind := inner, layoutIdx := flIdx }
+              | false => { kind := inner, layoutIdx := unresolvedLayoutIdx layouts }
+            | _ => { kind := inner, layoutIdx := unresolvedLayoutIdx layouts }
         tyByteSize localDecls layouts resolvedPointeeTy
     | .none => .none
+
+/--
+Test whether `op` is a relational `BinOp` (`.eq`, `.ne`, `.lt`, `.le`, `.gt`,
+`.ge`, or three-way `.cmp`), which compares pointers by their machine address
+ignoring provenance (`MiniRust` `spec/lang/step/operators.md` `compare_ptr`).
+-/
+@[reducible]
+def isRelationalBinOp : BinOp → Bool
+  | .eq => true
+  | .ne => true
+  | .lt => true
+  | .le => true
+  | .gt => true
+  | .ge => true
+  | .cmp => true
+  | _ => false
+
+/--
+Test whether `op` has pointer/reference/fn-pointer type (`.rawPtr`, `.ref`,
+`.fnPtr`) or no declared type in `localDecls` (`.none`, e.g., untyped synthetic
+probes). Used to guard mixed `(.ptr, .scalar)` and `(.scalar, .ptr)` relational
+comparisons so ill-typed `Value.ptr` values in integer/boolean/char locals never
+masquerade as scalar integers.
+-/
+@[reducible]
+def isPtrOrUntypedOperand
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (op : Operand) :
+    Bool :=
+  match operandTy localDecls layouts op with
+  | .none => true
+  | .some ty =>
+    match ty.kind with
+    | .rawPtr _ _ => true
+    | .ref _ _ => true
+    | .fnPtr .. => true
+    | _ => false
+
+/--
+Test whether `op` is a relational `BinOp` whose operands have pointer (or
+untyped) `Operand` types in `localDecls`.
+-/
+@[reducible]
+def isPtrRelationalBinOp
+    (op : BinOp)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (lhsOp rhsOp : Operand) :
+    Bool :=
+  Bool.and
+    (isRelationalBinOp op)
+    (Bool.and
+      (isPtrOrUntypedOperand localDecls layouts lhsOp)
+      (isPtrOrUntypedOperand localDecls layouts rhsOp))
+
+/--
+Convert a tracked `ProvenancePtr` `p` of byte width `sz` to its canonical
+unsigned address `ScalarInt` `((p.allocId * 65536 + p.offsetBytes) mod 2^(8*sz))`
+for relational pointer comparisons.
+-/
+@[reducible]
+def ptrToAddrScalar (p : ProvenancePtr) (sz : Nat) : ScalarInt :=
+  { bits :=
+      wrapScalarBits
+        (Nat.add (Nat.mul p.allocId 65536) p.offsetBytes)
+        (scalarModulus sz)
+    sizeBytes := sz }
+
+/--
+Evaluate a relational `BinOp` (`isRelationalBinOp op = true`) on two 2-word
+wide pointers `(lhsThin, lhsMeta)` and `(rhsThin, rhsMeta)`, comparing first the
+thin data-pointer address and then the metadata word lexicographically
+(`MiniRust` `spec/lang/step/operators.md` `compare_ptr`).
+-/
+@[reducible]
+def evalWidePtrRelBinOp
+    (op : BinOp)
+    (lhsThin : Value)
+    (lhsMeta : ScalarInt)
+    (rhsThin : Value)
+    (rhsMeta : ScalarInt)
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (ptrBytes : Nat) :
+    RvalueEvalResult :=
+  let lhsAddrOpt : Option ScalarInt :=
+    match lhsThin with
+    | .ptr p sz =>
+      match Nat.beq sz ptrBytes with
+      | true => .some (ptrToAddrScalar p ptrBytes)
+      | false => .none
+    | .scalar sc =>
+      match Nat.beq sc.sizeBytes ptrBytes with
+      | true => .some { bits := wrapScalarBits sc.bits (scalarModulus ptrBytes), sizeBytes := ptrBytes }
+      | false => .none
+    | _ => .none
+  let rhsAddrOpt : Option ScalarInt :=
+    match rhsThin with
+    | .ptr p sz =>
+      match Nat.beq sz ptrBytes with
+      | true => .some (ptrToAddrScalar p ptrBytes)
+      | false => .none
+    | .scalar sc =>
+      match Nat.beq sc.sizeBytes ptrBytes with
+      | true => .some { bits := wrapScalarBits sc.bits (scalarModulus ptrBytes), sizeBytes := ptrBytes }
+      | false => .none
+    | _ => .none
+  match
+    lhsAddrOpt,
+    rhsAddrOpt,
+    Bool.and (Nat.beq lhsMeta.sizeBytes ptrBytes) (Nat.beq rhsMeta.sizeBytes ptrBytes)
+  with
+  | .some lhsAddr, .some rhsAddr, true =>
+    match Nat.beq lhsAddr.bits rhsAddr.bits with
+    | false => evalScalarBinOp op lhsAddr rhsAddr locals₂ mem false
+    | true =>
+      let modPtr := scalarModulus ptrBytes
+      let lhsMetaNorm : ScalarInt := { bits := wrapScalarBits lhsMeta.bits modPtr, sizeBytes := ptrBytes }
+      let rhsMetaNorm : ScalarInt := { bits := wrapScalarBits rhsMeta.bits modPtr, sizeBytes := ptrBytes }
+      evalScalarBinOp op lhsMetaNorm rhsMetaNorm locals₂ mem false
+  | _, _, _ => .unsupported
+
+/--
+Wrapper for wide raw-pointer / wide reference aggregate relational comparisons
+(`.aggregate 0 [thin, .scalar meta]`) that accepts flat `.aggregate` constructor
+fields so downstream equation-compiler proofs avoid nested pattern splitting.
+-/
+@[reducible]
+def evalWidePtrAggregateRelBinOp
+    (op : BinOp)
+    (lhsOp : Operand)
+    (lhsVar : Nat)
+    (lhsFields : List Value)
+    (rhsVar : Nat)
+    (rhsFields : List Value)
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  match Nat.beq lhsVar 0, Nat.beq rhsVar 0, lhsFields, rhsFields with
+  | true, true, lhsThin :: .scalar lhsMeta :: .nil, rhsThin :: .scalar rhsMeta :: .nil =>
+    let hasPtrOrWidePtrTy : Bool :=
+      match lhsThin, rhsThin with
+      | .ptr _ _, _ => true
+      | _, .ptr _ _ => true
+      | _, _ =>
+        match operandTy localDecls layouts lhsOp with
+        | .some ty =>
+          match ty.kind with
+          | .rawPtr _ (.slice _) => true
+          | .rawPtr _ .str => true
+          | .rawPtr _ (.dynamic _) => true
+          | .ref _ (.slice _) => true
+          | .ref _ .str => true
+          | .ref _ (.dynamic _) => true
+          | _ => false
+        | .none => false
+    match Bool.and (isRelationalBinOp op) hasPtrOrWidePtrTy with
+    | true =>
+      evalWidePtrRelBinOp
+        op
+        lhsThin
+        lhsMeta
+        rhsThin
+        rhsMeta
+        locals₂
+        mem
+        (layoutPointerBytes layouts)
+    | false => .unsupported
+  | _, _, _, _ => .unsupported
+
+/--
+Evaluate `BinOp.offset` when the pointer operand `lhsOp` evaluates to a
+provenance-less `Value.scalar lhs` (`null`, `ptr::without_provenance`, or an
+unexposed `usize as *const T` cast) and the count operand evaluates to
+`Value.scalar rhs`.
+
+Per Miri (`ptr_offset_inbounds`) and MiniRust (`spec/lang/step/operators.md`
+`ptr_offset_inbounds` + `spec/mem/basic.md` `check_ptr`), in-bounds pointer
+arithmetic on a pointer without provenance succeeds if and only if the total
+byte offset `count * size_of::<T>()` is `0` (either `count == 0` or ZST
+`size_of::<T>() == 0`), preserving `lhs`, and faults with `.ub` for any
+non-zero byte offset.
+-/
+@[reducible]
+def evalScalarPtrOffsetBinOp
+    (locals₂ : List LocalSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (lhsOp : Operand)
+    (lhs : ScalarInt)
+    (rhs : ScalarInt) :
+    RvalueEvalResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  let lhsKindClass : Nat :=
+    match operandTy localDecls layouts lhsOp with
+    | .none => 1
+    | .some ty =>
+      match isThinRawPtrTy ty with
+      | true => 1
+      | false =>
+        match isWideRawPtrTy ty with
+        | true => 2
+        | false =>
+          match ty.kind with
+          | .ref _ _ => 2
+          | _ => 0
+  match lhsKindClass with
+  | 0 => .unsupported
+  | 2 => .ub
+  | _ =>
+    match Bool.and (Nat.beq lhs.sizeBytes ptrBytes) (Nat.beq rhs.sizeBytes ptrBytes) with
+    | false => .ub
+    | true =>
+      match pointeeElemByteStride localDecls layouts lhsOp with
+      | .none => .ub
+      | .some elemStride =>
+        let modPtr := scalarModulus ptrBytes
+        let lhsBits := wrapScalarBits lhs.bits modPtr
+        let rhsBits := wrapScalarBits rhs.bits modPtr
+        match Bool.or (Nat.beq rhsBits 0) (Nat.beq elemStride 0) with
+        | true => .ok (.scalar ⟨lhsBits, ptrBytes⟩) locals₂ mem
+        | false => .ub
 
 /--
 Compute the default byte size of an untyped runtime `Value` when `localDecls`
@@ -10979,7 +11251,8 @@ def evalSliceFatPtrDerefBorrow
     (perm : TreeBorrowPerm)
     (isMut : Bool)
     (pointeeTyOpt : Option Ty := .none)
-    (layouts : LayoutTable := emptyLayoutTable) :
+    (layouts : LayoutTable := emptyLayoutTable)
+    (checkPerm : Bool := true) :
     RvalueEvalResult :=
   match
     Bool.and
@@ -10999,10 +11272,13 @@ def evalSliceFatPtrDerefBorrow
       match lookupBorrow mem.borrows parentPtr.tag with
       | .some parentEntry =>
         let permOk :=
-          match parentEntry.perm, isMut with
-          | .disabled, _ => false
-          | .frozen, true => false
-          | _, _ => true
+          match checkPerm with
+          | false => true
+          | true =>
+            match parentEntry.perm, isMut with
+            | .disabled, _ => false
+            | .frozen, true => false
+            | _, _ => true
         match permOk with
         | false => .ub
         | true =>
@@ -11331,7 +11607,9 @@ def evalGlobalThinPtrDerefBorrow
     (restProj : List ProjectionElem)
     (isMut : Bool)
     (pointeeTyOpt : Option Ty := .none)
-    (layouts : LayoutTable := emptyLayoutTable) :
+    (layouts : LayoutTable := emptyLayoutTable)
+    (localDecls : List LocalDecl := .nil)
+    (rawPtrMode : Bool := false) :
     RvalueEvalResult :=
   let mutOk :=
     match isMut, alloc.mutability with
@@ -11372,12 +11650,15 @@ def evalGlobalThinPtrDerefBorrow
       match resolvedRest with
       | .nil =>
         let reqBytes :=
-          match pointeeTyOpt with
-          | .some pointeeTy =>
-            match tyByteSize .nil layouts pointeeTy with
-            | .some n => n
+          match rawPtrMode with
+          | true => 0
+          | false =>
+            match pointeeTyOpt with
+            | .some pointeeTy =>
+              match tyByteSize .nil layouts pointeeTy with
+              | .some n => n
+              | .none => 0
             | .none => 0
-          | .none => 0
         match Nat.ble reqBytes remBytes with
         | true => .ok (.ptr parentPtr 8) locals mem
         | false => .ub
@@ -11393,7 +11674,10 @@ def evalGlobalThinPtrDerefBorrow
           match fromEnd with
           | true => Nat.sub maxElems offset
           | false => offset
-        let neededBytes := Nat.mul (.succ idx) elemSz
+        let neededBytes :=
+          match rawPtrMode with
+          | true => Nat.mul idx elemSz
+          | false => Nat.mul (.succ idx) elemSz
         match
           Bool.and
             (Nat.ble minLen maxElems)
@@ -11415,7 +11699,10 @@ def evalGlobalThinPtrDerefBorrow
             match fromEnd with
             | true => Nat.sub maxElems toIdx
             | false => toIdx
-          let neededBytes := Nat.mul endIdx elemSz
+          let neededBytes :=
+            match rawPtrMode with
+            | true => Nat.mul fromIdx elemSz
+            | false => Nat.mul endIdx elemSz
           match
             Bool.and
               (Nat.ble fromIdx endIdx)
@@ -11427,6 +11714,168 @@ def evalGlobalThinPtrDerefBorrow
             let newOff := Nat.add parentPtr.offsetBytes (Nat.mul fromIdx elemSz)
             .ok (.ptr { parentPtr with offsetBytes := newOff } 8) locals mem
           | false => .ub
+      | _ =>
+        match
+          projectionChainByteOffset?
+            layouts
+            pointeeTyOpt
+            .none
+            .none
+            0
+            localDecls
+            resolvedRest
+        with
+        | .none => .ub
+        | .some fieldOff =>
+          let reqTailBytesOpt : Option Nat :=
+            match rawPtrMode with
+            | true => .some 0
+            | false =>
+              match pointeeTyOpt with
+              | .none => .none
+              | .some pointeeTy =>
+                match resolveProjectedTyResolved localDecls layouts pointeeTy resolvedRest with
+                | .none => .none
+                | .some subTy => tyByteSize localDecls layouts subTy
+          match reqTailBytesOpt with
+          | .none => .ub
+          | .some reqTailBytes =>
+            match Nat.ble (Nat.add fieldOff reqTailBytes) remBytes with
+            | true =>
+              let newOff := Nat.add parentPtr.offsetBytes fieldOff
+              .ok (.ptr { parentPtr with offsetBytes := newOff } 8) locals mem
+            | false => .ub
+
+/--
+Evaluate `Rvalue.rawPtr` through a dereferenced provenance-less slice fat pointer
+`Value.aggregate 0 [Value.scalar addrSc, Value.scalar lenSc]` with non-empty
+post-deref projection `restProj`.
+
+Per Miri and MiniRust (`spec/lang/step/expressions.md` `PlaceExpr::Index` /
+`PlaceExpr::Field` + `spec/mem/basic.md` `check_ptr`), array/slice index bounds
+are checked against `lenSc.bits`, and the resulting `ptr_offset_inbounds` on the
+provenance-less data scalar succeeds if and only if the total byte offset is `0`.
+-/
+def evalScalarSliceFatPtrDerefRaw
+    (locals : List LocalSlot)
+    (mem : Memory)
+    (addrSc : ScalarInt)
+    (lenSc : ScalarInt)
+    (restProj : List ProjectionElem)
+    (pointeeTyOpt : Option Ty)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvalueEvalResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  match
+    Bool.and
+      (Nat.beq addrSc.sizeBytes ptrBytes)
+      (Nat.beq lenSc.sizeBytes ptrBytes)
+  with
+  | false => .ub
+  | true =>
+    let modPtr := scalarModulus ptrBytes
+    let baseBits := wrapScalarBits addrSc.bits modPtr
+    let lenBits := wrapScalarBits lenSc.bits modPtr
+    match
+      resolveBorrowProjectionElems
+        locals
+        (stripTransparentProjections restProj)
+    with
+    | .none => .ub
+    | .some rawResolvedRest =>
+      let resolvedRest := normalizeSubsliceProjections rawResolvedRest
+      let elemTyOpt : Option Ty :=
+        match pointeeTyOpt with
+        | .some { kind := .slice elemKind, layoutIdx := pIdx } =>
+          let elemIdx :=
+            match LayoutTable.lookup layouts pIdx with
+            | .some { fieldLayouts := flIdx :: _, .. } => flIdx
+            | _ => synthKindLayoutIdx layouts elemKind
+          .some (resolveTyWithLocalDecls localDecls layouts { kind := elemKind, layoutIdx := elemIdx })
+        | .some { kind := .str, .. } =>
+          .some { kind := .uint .u8, layoutIdx := synthKindLayoutIdx layouts (.uint .u8) }
+        | _ => .none
+      let elemSzOpt : Option Nat :=
+        match elemTyOpt with
+        | .some elemTy => tyByteSize localDecls layouts elemTy
+        | .none => .none
+      match resolvedRest with
+      | .nil =>
+        .ok
+          (.aggregate 0
+            (.scalar ⟨baseBits, ptrBytes⟩ :: .scalar ⟨lenBits, ptrBytes⟩ :: .nil))
+          locals
+          mem
+      | .subslice fromIdx toIdx fromEnd :: .nil =>
+        match Nat.ble toIdx lenBits with
+        | false => .ub
+        | true =>
+          let endIdx :=
+            match fromEnd with
+            | true => Nat.sub lenBits toIdx
+            | false => toIdx
+          match Nat.ble fromIdx endIdx with
+          | false => .ub
+          | true =>
+            let subLen := Nat.sub endIdx fromIdx
+            let offZero : Bool :=
+              match Nat.beq fromIdx 0 with
+              | true => true
+              | false =>
+                match elemSzOpt with
+                | .some 0 => true
+                | _ => false
+            match offZero with
+            | true =>
+              .ok
+                (.aggregate 0
+                  (.scalar ⟨baseBits, ptrBytes⟩ :: .scalar ⟨subLen, ptrBytes⟩ :: .nil))
+                locals
+                mem
+            | false => .ub
+      | .constantIndex offset minLen fromEnd :: tailProj =>
+        let fromEndBoundsOk :=
+          match fromEnd with
+          | false => true
+          | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset lenBits)
+        match Bool.and (Nat.ble minLen lenBits) fromEndBoundsOk with
+        | false => .ub
+        | true =>
+          let idx :=
+            match fromEnd with
+            | true => Nat.sub lenBits offset
+            | false => offset
+          match Nat.ble (.succ idx) lenBits with
+          | false => .ub
+          | true =>
+            let headZeroOpt : Option Bool :=
+              match Nat.beq idx 0 with
+              | true => .some true
+              | false =>
+                match elemSzOpt with
+                | .some sz => .some (Nat.beq sz 0)
+                | .none => .none
+            let tailZeroOpt : Option Bool :=
+              match tailProj with
+              | .nil => .some true
+              | _ :: _ =>
+                match
+                  projectionChainByteOffset?
+                    layouts
+                    elemTyOpt
+                    .none
+                    .none
+                    0
+                    localDecls
+                    tailProj
+                with
+                | .some tailOff => .some (Nat.beq tailOff 0)
+                | .none => .none
+            match headZeroOpt, tailZeroOpt with
+            | .some true, .some true =>
+              .ok (.scalar ⟨baseBits, ptrBytes⟩) locals mem
+            | _, _ => .ub
       | _ => .ub
 
 /--
@@ -12083,13 +12532,49 @@ def evalRvalue
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
-          let isSigned := operandIsSigned localDecls lhsOp layouts
-          evalScalarBinOp op lhs rhs locals₂ mem isSigned
+          match op with
+          | .offset =>
+            evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs
+          | _ =>
+            let isSigned := operandIsSigned localDecls lhsOp layouts
+            evalScalarBinOp op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
             evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc
-          | _ => .unsupported
+          | _ =>
+            match isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+            | true =>
+              evalScalarBinOp op (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+            | false => .unsupported
+        | .scalar lhsSc, .ptr ptrVal sz =>
+          match isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+          | true =>
+            evalScalarBinOp op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+          | false => .unsupported
+        | .ptr lhsPtr lhsSz, .ptr rhsPtr rhsSz =>
+          match isRelationalBinOp op with
+          | true =>
+            evalScalarBinOp
+              op
+              (ptrToAddrScalar lhsPtr lhsSz)
+              (ptrToAddrScalar rhsPtr rhsSz)
+              locals₂
+              mem
+              false
+          | false => .unsupported
+        | .aggregate lhsVar lhsFields, .aggregate rhsVar rhsFields =>
+          evalWidePtrAggregateRelBinOp
+            op
+            lhsOp
+            lhsVar
+            lhsFields
+            rhsVar
+            rhsFields
+            locals₂
+            mem
+            localDecls
+            layouts
         | _, _ => .unsupported
       | .ub => .ub
       | .unsupported => .unsupported
@@ -12352,150 +12837,379 @@ def evalRvalue
       match mutability with
       | .not => sharedBorrowPerm localDecls layouts place
       | .mut => TreeBorrowPerm.active
+    let ptrBytes := layoutPointerBytes layouts
     match place.projection with
     | .deref :: restProj =>
+      let cleanRest := stripTransparentProjections restProj
       let pointeeTyOpt :=
         placeTyResolved localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
       let accessedTyOpt := placeTyResolved localDecls layouts place
+      let isRefLocal : Bool :=
+        match get? localDecls place.local_ with
+        | .some { ty := { kind := .ref _ _, .. }, .. } => true
+        | _ => false
       match get? locals place.local_ with
       | .some (.init (.ptr parentPtr ptrSz)) =>
-        let isSyntheticFieldOnScalarPointee : Bool :=
-          match stripTransparentProjections restProj, pointeeTyOpt with
-          | .field _ _ :: _, .some { kind := .bool, .. } => true
-          | .field _ _ :: _, .some { kind := .char, .. } => true
-          | .field _ _ :: _, .some { kind := .int _, .. } => true
-          | .field _ _ :: _, .some { kind := .uint _, .. } => true
-          | .field _ _ :: _, .some { kind := .float _, .. } => true
-          | _, _ => false
-        let effPointeeTyOpt : Option Ty :=
-          match isSyntheticFieldOnScalarPointee with
-          | true => .none
-          | false => pointeeTyOpt
-        match lookupBorrow mem.borrows parentPtr.tag with
-        | .some parentEntry =>
-          match parentEntry.perm, mutability with
-          | .disabled, _ => .ub
-          | .frozen, .mut => .ub
-          | _, _ =>
+        match Nat.beq ptrSz ptrBytes with
+        | false => .ub
+        | true =>
+          match cleanRest with
+          | .nil =>
+            match isRefLocal with
+            | false => .ok (.ptr parentPtr ptrSz) locals mem
+            | true =>
+              -- If `place.local_` is a safe reference `&T` / `&mut T`, `*r` in
+              -- `&raw const *r` still dereferences `r` (`PlaceExpr::Deref` checks
+              -- `safe_pointee` dereferenceability in MiniRust `expressions.md:252`).
+              match lookupBorrow mem.borrows parentPtr.tag with
+              | .some parentEntry =>
+                let permOk :=
+                  match parentEntry.perm with
+                  | .disabled => false
+                  | _ => true
+                let liveOk :=
+                  match get? locals parentEntry.targetLocal with
+                  | .some (.init _) => true
+                  | .some .uninit => true
+                  | .some .dead => false
+                  | .none =>
+                    match get? mem.callerLocals parentEntry.targetLocal with
+                    | .some (.init _) => true
+                    | .some .uninit => true
+                    | _ => false
+                match Bool.and permOk liveOk with
+                | true => .ok (.ptr parentPtr ptrSz) locals mem
+                | false => .ub
+              | .none =>
+                match lookupGlobalAlloc mem.globals parentPtr.allocId with
+                | .some alloc =>
+                  match Nat.ble parentPtr.offsetBytes (length alloc.bytes) with
+                  | true => .ok (.ptr parentPtr ptrSz) locals mem
+                  | false => .ub
+                | .none =>
+                  let isZstPointee : Bool :=
+                    match pointeeTyOpt with
+                    | .some pTy =>
+                      match tyByteSize localDecls layouts pTy with
+                      | .some 0 => Bool.not (Nat.beq parentPtr.offsetBytes 0)
+                      | _ => false
+                    | .none => false
+                  match Bool.and (Nat.beq parentPtr.allocId 0) isZstPointee with
+                  | true => .ok (.ptr parentPtr ptrSz) locals mem
+                  | false => .ub
+          | _ :: _ =>
+            let isSyntheticFieldOnScalarPointee : Bool :=
+              match cleanRest, pointeeTyOpt with
+              | .field _ _ :: _, .some { kind := .bool, .. } => true
+              | .field _ _ :: _, .some { kind := .char, .. } => true
+              | .field _ _ :: _, .some { kind := .int _, .. } => true
+              | .field _ _ :: _, .some { kind := .uint _, .. } => true
+              | .field _ _ :: _, .some { kind := .float _, .. } => true
+              | _, _ => false
+            let effPointeeTyOpt : Option Ty :=
+              match isSyntheticFieldOnScalarPointee with
+              | true => .none
+              | false => pointeeTyOpt
             match resolveBorrowProjectionElems locals restProj with
             | .none => .ub
             | .some resolvedRest =>
-              let targetSlotAndDeclsOpt : Option (LocalSlot × List LocalDecl) :=
-                match get? locals parentEntry.targetLocal with
-                | .some .dead => .none
-                | .some slot => .some (slot, localDecls)
-                | .none =>
-                  match get? mem.callerLocals parentEntry.targetLocal with
-                  | .some .dead => .none
-                  | .some slot => .some (slot, .nil)
-                  | .none => .none
-              match targetSlotAndDeclsOpt with
-              | .none => .ub
-              | .some (.uninit, _) =>
-                match
-                  needsThinPtrElemResolution
-                    parentEntry.targetProjection
-                    parentPtr.offsetBytes,
-                  Nat.beq parentPtr.offsetBytes 0
-                with
-                | false, true =>
-                  let tag := mem.nextTag
-                  let fullProj :=
-                    match parentEntry.targetProjection with
-                    | .nil => resolvedRest
-                    | ph :: pt => ph :: appendProjections pt resolvedRest
-                  let rawPerm :=
-                    match mutability, parentEntry.perm with
-                    | .not, .reserved => TreeBorrowPerm.reserved
-                    | _, _ => perm
-                  let entry : BorrowEntry := {
-                    tag := tag
-                    targetLocal := parentEntry.targetLocal
-                    targetProjection := fullProj
-                    perm := rawPerm
-                    rangeOffset := parentEntry.rangeOffset
-                    rangeLen := parentEntry.rangeLen
-                    parentTag := .some parentPtr.tag
-                  }
-                  let mem' := {
-                    mem with
-                    borrows := entry :: mem.borrows
-                    nextTag := Nat.add tag 1
-                  }
-                  .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
-                | _, _ => .ub
-              | .some (.dead, _) => .ub
-              | .some (.init targetRootVal, targetDecls) =>
-                match
-                  resolveRawPtrDerefTarget?
+              let normRest := normalizeSubsliceProjections (stripTransparentProjections resolvedRest)
+              match lookupBorrow mem.borrows parentPtr.tag with
+              | .some parentEntry =>
+                let refPermOk : Bool :=
+                  match isRefLocal, parentEntry.perm with
+                  | true, .disabled => false
+                  | _, _ => true
+                match refPermOk with
+                | false => .ub
+                | true =>
+                  let rawPerm := parentEntry.perm
+                  let targetSlotAndDeclsOpt : Option (LocalSlot × List LocalDecl) :=
+                    match get? locals parentEntry.targetLocal with
+                    | .some slot => .some (slot, localDecls)
+                    | .none =>
+                      match get? mem.callerLocals parentEntry.targetLocal with
+                      | .some slot => .some (slot, .nil)
+                      | .none => .none
+                  let fallbackByByteOffset (checkDead : Bool) : RvalueEvalResult :=
+                    match isRefLocal, checkDead with
+                    | true, true => .ub
+                    | _, _ =>
+                      match
+                        projectionChainByteOffset?
+                          layouts
+                          effPointeeTyOpt
+                          .none
+                          .none
+                          0
+                          localDecls
+                          normRest
+                      with
+                      | .none => .ub
+                      | .some fieldOff =>
+                        match checkDead with
+                        | true =>
+                          match Nat.beq fieldOff 0 with
+                          | true => .ok (.ptr parentPtr ptrSz) locals mem
+                          | false => .ub
+                        | false =>
+                          let boundMem : Memory :=
+                            { emptyMemory with
+                              globals := mem.globals
+                              borrows := { parentEntry with perm := .active } :: .nil
+                              callerLocals := mem.callerLocals }
+                          let boundOpt :=
+                            ptrAllocByteBound? locals boundMem localDecls layouts parentPtr
+                          match evalBinOpOffset parentPtr ptrSz ⟨fieldOff, 8⟩ 1 boundOpt with
+                          | .none => .ub
+                          | .some newPtr =>
+                            match parentEntry.targetProjection with
+                            | .nil => .ok (.ptr { parentPtr with offsetBytes := newPtr.offsetBytes } ptrSz) locals mem
+                            | _ :: _ =>
+                              let tag := mem.nextTag
+                              let entry : BorrowEntry := {
+                                tag := tag
+                                targetLocal := parentEntry.targetLocal
+                                targetProjection := parentEntry.targetProjection
+                                perm := rawPerm
+                                rangeOffset := parentEntry.rangeOffset
+                                rangeLen := parentEntry.rangeLen
+                                parentTag := .some parentPtr.tag
+                              }
+                              let mem' := {
+                                mem with
+                                borrows := entry :: mem.borrows
+                                nextTag := Nat.add tag 1
+                              }
+                              .ok (.ptr { allocId := tag, offsetBytes := newPtr.offsetBytes } ptrSz) locals mem'
+                  match targetSlotAndDeclsOpt with
+                  | .none => fallbackByByteOffset true
+                  | .some (.dead, _) => fallbackByByteOffset true
+                  | .some (.uninit, targetDecls) =>
+                    match
+                      needsThinPtrElemResolution
+                        parentEntry.targetProjection
+                        parentPtr.offsetBytes,
+                      Nat.beq parentPtr.offsetBytes 0
+                    with
+                    | false, true =>
+                      let inBoundsUninit : Bool :=
+                        match
+                          projectionChainByteOffset?
+                            layouts
+                            effPointeeTyOpt
+                            .none
+                            .none
+                            0
+                            localDecls
+                            normRest
+                        with
+                        | .none =>
+                          match effPointeeTyOpt with
+                          | .none => Bool.not (startsWithArrayOrSliceProj normRest)
+                          | .some _ => false
+                        | .some fieldOff =>
+                          match get? targetDecls parentEntry.targetLocal with
+                          | .some decl =>
+                            match tyByteSize targetDecls layouts decl.ty with
+                            | .some allocSz => Nat.ble fieldOff allocSz
+                            | .none => true
+                          | .none => true
+                      match inBoundsUninit with
+                      | false => .ub
+                      | true =>
+                        let tag := mem.nextTag
+                        let fullProj :=
+                          match parentEntry.targetProjection with
+                          | .nil => resolvedRest
+                          | ph :: pt => ph :: appendProjections pt resolvedRest
+                        let entry : BorrowEntry := {
+                          tag := tag
+                          targetLocal := parentEntry.targetLocal
+                          targetProjection := fullProj
+                          perm := rawPerm
+                          rangeOffset := parentEntry.rangeOffset
+                          rangeLen := parentEntry.rangeLen
+                          parentTag := .some parentPtr.tag
+                        }
+                        let mem' := {
+                          mem with
+                          borrows := entry :: mem.borrows
+                          nextTag := Nat.add tag 1
+                        }
+                        .ok (.ptr { allocId := tag, offsetBytes := 0 } ptrSz) locals mem'
+                    | _, _ => fallbackByByteOffset false
+                  | .some (.init targetRootVal, targetDecls) =>
+                    match
+                      resolveRawPtrDerefTarget?
+                        locals
+                        targetRootVal
+                        parentEntry
+                        parentPtr
+                        resolvedRest
+                        targetDecls
+                        layouts
+                        effPointeeTyOpt
+                        accessedTyOpt
+                        isSyntheticFieldOnScalarPointee
+                        localDecls
+                    with
+                    | .some (fullProj, residualOffset) =>
+                      let tag := mem.nextTag
+                      let entry : BorrowEntry := {
+                        tag := tag
+                        targetLocal := parentEntry.targetLocal
+                        targetProjection := fullProj
+                        perm := rawPerm
+                        rangeOffset := parentEntry.rangeOffset
+                        rangeLen := parentEntry.rangeLen
+                        parentTag := .some parentPtr.tag
+                      }
+                      let mem' := {
+                        mem with
+                        borrows := entry :: mem.borrows
+                        nextTag := Nat.add tag 1
+                      }
+                      .ok (.ptr { allocId := tag, offsetBytes := residualOffset } ptrSz) locals mem'
+                    | .none => fallbackByByteOffset false
+              | .none =>
+                match lookupGlobalAlloc mem.globals parentPtr.allocId with
+                | .some alloc =>
+                  let isMut :=
+                    match isRefLocal, mutability with
+                    | true, .mut => true
+                    | _, _ => false
+                  evalGlobalThinPtrDerefBorrow
                     locals
-                    targetRootVal
-                    parentEntry
+                    mem
+                    alloc
                     parentPtr
-                    resolvedRest
-                    targetDecls
-                    layouts
+                    ptrSz
+                    restProj
+                    isMut
                     effPointeeTyOpt
-                    accessedTyOpt
-                    isSyntheticFieldOnScalarPointee
+                    layouts
                     localDecls
-                with
-                | .none => .ub
-                | .some (fullProj, residualOffset) =>
-                  let tag := mem.nextTag
-                  let rawPerm :=
-                    match mutability, parentEntry.perm with
-                    | .not, .reserved => TreeBorrowPerm.reserved
-                    | _, _ => perm
-                  let entry : BorrowEntry := {
-                    tag := tag
-                    targetLocal := parentEntry.targetLocal
-                    targetProjection := fullProj
-                    perm := rawPerm
-                    rangeOffset := parentEntry.rangeOffset
-                    rangeLen := parentEntry.rangeLen
-                    parentTag := .some parentPtr.tag
-                  }
-                  let mem' := {
-                    mem with
-                    borrows := entry :: mem.borrows
-                    nextTag := Nat.add tag 1
-                  }
-                  .ok (.ptr { allocId := tag, offsetBytes := residualOffset } 8) locals mem'
-        | .none =>
-          match lookupGlobalAlloc mem.globals parentPtr.allocId with
-          | .some alloc =>
-            let isMut :=
-              match mutability with
-              | .not => false
-              | .mut => true
-            evalGlobalThinPtrDerefBorrow
+                    (Bool.not isRefLocal)
+                | .none =>
+                  match isRefLocal with
+                  | true => .ub
+                  | false =>
+                    match
+                      projectionChainByteOffset?
+                        layouts
+                        effPointeeTyOpt
+                        .none
+                        .none
+                        0
+                        localDecls
+                        normRest
+                    with
+                    | .some 0 => .ok (.ptr parentPtr ptrSz) locals mem
+                    | _ => .ub
+      | .some (.init (.scalar sc)) =>
+        match Bool.and (Nat.beq sc.sizeBytes ptrBytes) (Bool.not isRefLocal) with
+        | false => .ub
+        | true =>
+          let baseBits := wrapScalarBits sc.bits (scalarModulus ptrBytes)
+          match cleanRest with
+          | .nil => .ok (.scalar ⟨baseBits, ptrBytes⟩) locals mem
+          | _ :: _ =>
+            let isSyntheticFieldOnScalarPointee : Bool :=
+              match cleanRest, pointeeTyOpt with
+              | .field _ _ :: _, .some { kind := .bool, .. } => true
+              | .field _ _ :: _, .some { kind := .char, .. } => true
+              | .field _ _ :: _, .some { kind := .int _, .. } => true
+              | .field _ _ :: _, .some { kind := .uint _, .. } => true
+              | .field _ _ :: _, .some { kind := .float _, .. } => true
+              | _, _ => false
+            let effPointeeTyOpt : Option Ty :=
+              match isSyntheticFieldOnScalarPointee with
+              | true => .none
+              | false => pointeeTyOpt
+            match resolveBorrowProjectionElems locals cleanRest with
+            | .none => .ub
+            | .some rawResolvedRest =>
+              let resolvedRest := normalizeSubsliceProjections rawResolvedRest
+              match
+                projectionChainByteOffset?
+                  layouts
+                  effPointeeTyOpt
+                  .none
+                  .none
+                  0
+                  localDecls
+                  resolvedRest
+              with
+              | .some 0 => .ok (.scalar ⟨baseBits, ptrBytes⟩) locals mem
+              | _ => .ub
+      | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
+        match
+          Bool.and
+            (Nat.beq ptrSz ptrBytes)
+            (Nat.beq lenSc.sizeBytes ptrBytes)
+        with
+        | false => .ub
+        | true =>
+          match cleanRest, isRefLocal with
+          | .nil, false =>
+            let lenBits := wrapScalarBits lenSc.bits (scalarModulus ptrBytes)
+            .ok
+              (.aggregate 0
+                (.ptr parentPtr ptrSz :: .scalar ⟨lenBits, ptrBytes⟩ :: .nil))
               locals
               mem
-              alloc
+          | _, _ =>
+            let rawPerm :=
+              match lookupBorrow mem.borrows parentPtr.tag with
+              | .some pe => pe.perm
+              | .none => perm
+            let isMut :=
+              match isRefLocal, mutability with
+              | true, .mut => true
+              | _, _ => false
+            evalSliceFatPtrDerefBorrow
+              locals
+              mem
               parentPtr
               ptrSz
+              lenSc
               restProj
+              rawPerm
               isMut
               pointeeTyOpt
               layouts
-          | .none => .ub
-      | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
-        let isMut :=
-          match mutability with
-          | .not => false
-          | .mut => true
-        evalSliceFatPtrDerefBorrow
-          locals
-          mem
-          parentPtr
-          ptrSz
-          lenSc
-          restProj
-          perm
-          isMut
-          pointeeTyOpt
-          layouts
+              isRefLocal
+      | .some (.init (.aggregate 0 (.scalar addrSc :: .scalar lenSc :: .nil))) =>
+        match isRefLocal with
+        | true => .ub
+        | false =>
+          match cleanRest with
+          | .nil =>
+            match
+              Bool.and
+                (Nat.beq addrSc.sizeBytes ptrBytes)
+                (Nat.beq lenSc.sizeBytes ptrBytes)
+            with
+            | true =>
+              let modPtr := scalarModulus ptrBytes
+              .ok
+                (.aggregate 0
+                  (.scalar ⟨wrapScalarBits addrSc.bits modPtr, ptrBytes⟩ ::
+                    .scalar ⟨wrapScalarBits lenSc.bits modPtr, ptrBytes⟩ :: .nil))
+                locals
+                mem
+            | false => .ub
+          | _ :: _ =>
+            evalScalarSliceFatPtrDerefRaw
+              locals
+              mem
+              addrSc
+              lenSc
+              restProj
+              pointeeTyOpt
+              localDecls
+              layouts
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
@@ -12587,6 +13301,36 @@ def evalRvalue
           | .rawPtr _ _ =>
             .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
           | _ => .ub
+    | .ok (.scalar sc) locals' =>
+      let ptrBytes := layoutPointerBytes layouts
+      match Nat.beq sc.sizeBytes ptrBytes with
+      | false => .ub
+      | true =>
+        match targetTy.kind with
+        | .rawPtr _ (.slice _) => .ub
+        | .rawPtr _ .str => .ub
+        | .rawPtr _ (.dynamic _) => .ub
+        | .rawPtr _ _ =>
+          .ok (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+        | _ => .ub
+    | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
+      match
+        Bool.and
+          (Nat.beq addrSc.sizeBytes 8)
+          (Nat.beq metaSc.sizeBytes 8)
+      with
+      | false => .ub
+      | true =>
+        let modPtr := scalarModulus 8
+        let addrBits := wrapScalarBits addrSc.bits modPtr
+        let metaBits := wrapScalarBits metaSc.bits modPtr
+        match isThinRawPtrTy targetTy with
+        | true => .ok (.scalar ⟨addrBits, 8⟩) locals' mem
+        | false =>
+          match targetTy.kind with
+          | .rawPtr _ _ =>
+            .ok (.aggregate 0 (.scalar ⟨addrBits, 8⟩ :: .scalar ⟨metaBits, 8⟩ :: .nil)) locals' mem
+          | _ => .ub
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
@@ -12594,27 +13338,80 @@ def evalRvalue
     evalReifyFnPointer locals op targetTy mem localDecls layouts coercionKind
   | .cast .fnPtrToPtr op targetTy =>
     evalFnPtrToPtr locals op targetTy mem localDecls layouts
-  | .cast .pointerExposeProvenance op _ =>
+  | .cast .pointerExposeProvenance op targetTy =>
+    let ptrBytes := layoutPointerBytes layouts
+    let outBytes :=
+      match intCastTargetBytes targetTy.kind with
+      | .some b => b
+      | .none => ptrBytes
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
-    | .ok (.ptr ptrVal _) locals' =>
-      let addr := Nat.add (Nat.mul ptrVal.allocId 65536) ptrVal.offsetBytes
-      .ok (.scalar ⟨addr, 8⟩) locals' mem
-    | .ok (.scalar sc) locals' => .ok (.scalar ⟨sc.bits, 8⟩) locals' mem
-    | .ok _ _ => .unsupported
-    | .ub => .ub
-    | .unsupported => .unsupported
-  | .cast .pointerWithExposedProvenance op _ =>
-    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+    | .ok (.ptr ptrVal ptrSz) locals' =>
+      match Nat.beq ptrSz ptrBytes with
+      | false => .ub
+      | true =>
+        let rawAddr :=
+          wrapScalarBits
+            (Nat.add (Nat.mul ptrVal.allocId 65536) ptrVal.offsetBytes)
+            (scalarModulus ptrBytes)
+        let addr := wrapScalarBits rawAddr (scalarModulus outBytes)
+        let mem' :=
+          { mem with exposedAllocIds := recordExposedAllocId mem.exposedAllocIds ptrVal.allocId }
+        .ok (.scalar ⟨addr, outBytes⟩) locals' mem'
     | .ok (.scalar sc) locals' =>
-      let p : ProvenancePtr := {
-        allocId := Nat.div sc.bits 65536
-        offsetBytes := Nat.mod sc.bits 65536
-      }
-      .ok (.ptr p 8) locals' mem
-    | .ok (.ptr ptrVal sz) locals' => .ok (.ptr ptrVal sz) locals' mem
+      match Nat.beq sc.sizeBytes ptrBytes with
+      | false => .ub
+      | true =>
+        let rawAddr := wrapScalarBits sc.bits (scalarModulus ptrBytes)
+        let addr := wrapScalarBits rawAddr (scalarModulus outBytes)
+        .ok (.scalar ⟨addr, outBytes⟩) locals' mem
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
+  | .cast .pointerWithExposedProvenance op targetTy =>
+    let ptrBytes := layoutPointerBytes layouts
+    let badTargetTy : Bool :=
+      match isWideRawPtrTy targetTy with
+      | true => true
+      | false =>
+        match targetTy.kind with
+        | .ref _ _ => true
+        | _ => false
+    match badTargetTy with
+    | true => .ub
+    | false =>
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
+      | .ok (.scalar sc) locals' =>
+        match Nat.beq sc.sizeBytes 0 with
+        | true => .unsupported
+        | false =>
+          let modPtr := scalarModulus ptrBytes
+          let addrBits :=
+            match operandIsSigned localDecls op layouts with
+            | false => wrapScalarBits sc.bits modPtr
+            | true =>
+              match Nat.ble ptrBytes sc.sizeBytes with
+              | true => wrapScalarBits sc.bits modPtr
+              | false => signExtendBits sc.bits sc.sizeBytes ptrBytes
+          let allocId := Nat.div addrBits 65536
+          let offsetBytes := Nat.mod addrBits 65536
+          let isExposed :=
+            Bool.or
+              (isExposedAllocId mem.exposedAllocIds allocId)
+              (match lookupGlobalAlloc mem.globals allocId with
+               | .some _ => Bool.not (Nat.beq allocId 0)
+               | .none => false)
+          match isExposed with
+          | true =>
+            .ok (.ptr { allocId := allocId, offsetBytes := offsetBytes } ptrBytes) locals' mem
+          | false =>
+            .ok (.scalar ⟨addrBits, ptrBytes⟩) locals' mem
+      | .ok (.ptr ptrVal sz) locals' =>
+        match Nat.beq sz ptrBytes with
+        | true => .ok (.ptr ptrVal sz) locals' mem
+        | false => .ub
+      | .ok _ _ => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported
   | .cast .transmute op targetTy =>
     evalByteCast locals op targetTy mem localDecls layouts
   | .cast .subtype op targetTy =>
@@ -12650,10 +13447,53 @@ def evalRvalue
       with
       | true => .ok (.scalar ⟨metaSc.bits, metaSc.sizeBytes⟩) locals' mem
       | false => .ub
+    | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
+      let isWidePtrOperand : Bool :=
+        match operandTy localDecls layouts op with
+        | .none => true
+        | .some ty =>
+          match ty.kind with
+          | .rawPtr _ (.slice _) => true
+          | .rawPtr _ .str => true
+          | .rawPtr _ (.dynamic _) => true
+          | .ref _ (.slice _) => true
+          | .ref _ .str => true
+          | .ref _ (.dynamic _) => true
+          | _ => false
+      match isWidePtrOperand with
+      | true =>
+        match
+          Bool.and
+            (Nat.beq addrSc.sizeBytes ptrBytes)
+            (Nat.beq metaSc.sizeBytes ptrBytes)
+        with
+        | true =>
+          .ok (.scalar ⟨wrapScalarBits metaSc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+        | false => .ub
+      | false =>
+        .ok (.scalar ⟨2, ptrBytes⟩) locals' mem
     | .ok (.aggregate 0 elems) locals' =>
       .ok (.scalar ⟨length elems, ptrBytes⟩) locals' mem
     | .ok (.ptr _ ptrSz) locals' =>
       match Nat.beq ptrSz ptrBytes with
+      | true => .ok .unit locals' mem
+      | false => .ub
+    | .ok (.scalar sc) locals' =>
+      let isThinPtrOperand : Bool :=
+        match operandTy localDecls layouts op with
+        | .none => true
+        | .some ty =>
+          match isThinRawPtrTy ty with
+          | true => true
+          | false =>
+            match ty.kind with
+            | .ref _ (.slice _) => false
+            | .ref _ .str => false
+            | .ref _ (.dynamic _) => false
+            | .ref _ _ => true
+            | .fnPtr .. => true
+            | _ => false
+      match Bool.and (Nat.beq sc.sizeBytes ptrBytes) isThinPtrOperand with
       | true => .ok .unit locals' mem
       | false => .ub
     | .ok _ _ => .unsupported
@@ -12687,27 +13527,26 @@ def evalRvalue
     | .ok (.ptr ptrVal _ :: .aggregate 0 .nil :: .nil) locals' =>
       .ok (.ptr ptrVal 8) locals' mem
     | .ok (.scalar addrSc :: .unit :: .nil) locals' =>
-      let p : ProvenancePtr := {
-        allocId := Nat.div addrSc.bits 65536
-        offsetBytes := Nat.mod addrSc.bits 65536
-      }
-      .ok (.ptr p 8) locals' mem
+      match Nat.beq addrSc.sizeBytes 8 with
+      | true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus 8), 8⟩) locals' mem
+      | false => .ub
     | .ok (.scalar addrSc :: .aggregate 0 .nil :: .nil) locals' =>
-      let p : ProvenancePtr := {
-        allocId := Nat.div addrSc.bits 65536
-        offsetBytes := Nat.mod addrSc.bits 65536
-      }
-      .ok (.ptr p 8) locals' mem
+      match Nat.beq addrSc.sizeBytes 8 with
+      | true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus 8), 8⟩) locals' mem
+      | false => .ub
     | .ok (.ptr ptrVal _ :: .scalar metaSc :: .nil) locals' =>
       .ok (.aggregate 0 (.ptr ptrVal 8 :: .scalar ⟨metaSc.bits, 8⟩ :: .nil))
         locals' mem
     | .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals' =>
-      let p : ProvenancePtr := {
-        allocId := Nat.div addrSc.bits 65536
-        offsetBytes := Nat.mod addrSc.bits 65536
-      }
-      .ok (.aggregate 0 (.ptr p 8 :: .scalar ⟨metaSc.bits, 8⟩ :: .nil))
-        locals' mem
+      match Bool.and (Nat.beq addrSc.sizeBytes 8) (Nat.beq metaSc.sizeBytes 8) with
+      | true =>
+        let modPtr := scalarModulus 8
+        .ok
+          (.aggregate 0
+            (.scalar ⟨wrapScalarBits addrSc.bits modPtr, 8⟩ ::
+              .scalar ⟨wrapScalarBits metaSc.bits modPtr, 8⟩ :: .nil))
+          locals' mem
+      | false => .ub
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported

@@ -2366,13 +2366,49 @@ def evalRvalueFast
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
-          let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
-          evalScalarBinOp op lhs rhs locals₂ mem isSigned
+          match op with
+          | .offset =>
+            evalScalarPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp lhs rhs
+          | _ =>
+            let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
+            evalScalarBinOp op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
             evalPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp ptrVal sz offsetSc
-          | _ => .unsupported
+          | _ =>
+            match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
+            | true =>
+              evalScalarBinOp op (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+            | false => .unsupported
+        | .scalar lhsSc, .ptr ptrVal sz =>
+          match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
+          | true =>
+            evalScalarBinOp op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+          | false => .unsupported
+        | .ptr lhsPtr lhsSz, .ptr rhsPtr rhsSz =>
+          match isRelationalBinOp op with
+          | true =>
+            evalScalarBinOp
+              op
+              (ptrToAddrScalar lhsPtr lhsSz)
+              (ptrToAddrScalar rhsPtr rhsSz)
+              locals₂
+              mem
+              false
+          | false => .unsupported
+        | .aggregate lhsVar lhsFields, .aggregate rhsVar rhsFields =>
+          evalWidePtrAggregateRelBinOp
+            op
+            lhsOp
+            lhsVar
+            lhsFields
+            rhsVar
+            rhsFields
+            locals₂
+            mem
+            body.localDecls
+            body.layouts
         | _, _ => .unsupported
       | .ub => .ub
       | .unsupported => .unsupported
@@ -2496,6 +2532,8 @@ def evalRvalueSymTreeFast
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
           match op with
+          | .offset =>
+            .leaf (evalScalarPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp lhs rhs)
           | .bitAnd =>
             .branch (Nat.beq lhs.sizeBytes 0) (.leaf .unsupported)
               (.branch (Nat.beq lhs.sizeBytes rhs.sizeBytes)
@@ -2516,7 +2554,40 @@ def evalRvalueSymTreeFast
           | .offset =>
             evalPtrOffsetBinOpSymTree locals₂ mem body.localDecls body.layouts
               lhsOp ptrVal sz offsetSc
-          | _ => .leaf .unsupported
+          | _ =>
+            match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
+            | true =>
+              evalScalarBinOpSymTree op (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+            | false => .leaf .unsupported
+        | .scalar lhsSc, .ptr ptrVal sz =>
+          match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
+          | true =>
+            evalScalarBinOpSymTree op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+          | false => .leaf .unsupported
+        | .ptr lhsPtr lhsSz, .ptr rhsPtr rhsSz =>
+          match isRelationalBinOp op with
+          | true =>
+            evalScalarBinOpSymTree
+              op
+              (ptrToAddrScalar lhsPtr lhsSz)
+              (ptrToAddrScalar rhsPtr rhsSz)
+              locals₂
+              mem
+              false
+          | false => .leaf .unsupported
+        | .aggregate lhsVar lhsFields, .aggregate rhsVar rhsFields =>
+          .leaf
+            (evalWidePtrAggregateRelBinOp
+              op
+              lhsOp
+              lhsVar
+              lhsFields
+              rhsVar
+              rhsFields
+              locals₂
+              mem
+              body.localDecls
+              body.layouts)
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub
       | .unsupported => .leaf .unsupported

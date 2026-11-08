@@ -1262,13 +1262,25 @@ private theorem evalRvalue_aggregate_rawPtr
       | .ok (.ptr ptrVal _ :: .aggregate 0 .nil :: .nil) locals' =>
         .ok (.ptr ptrVal 8) locals' mem
       | .ok (.scalar addrSc :: .unit :: .nil) locals' =>
-        .ok (.ptr { allocId := Nat.div addrSc.bits 65536, offsetBytes := Nat.mod addrSc.bits 65536 } 8) locals' mem
+        match Nat.beq addrSc.sizeBytes 8 with
+        | true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus 8), 8⟩) locals' mem
+        | false => .ub
       | .ok (.scalar addrSc :: .aggregate 0 .nil :: .nil) locals' =>
-        .ok (.ptr { allocId := Nat.div addrSc.bits 65536, offsetBytes := Nat.mod addrSc.bits 65536 } 8) locals' mem
+        match Nat.beq addrSc.sizeBytes 8 with
+        | true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus 8), 8⟩) locals' mem
+        | false => .ub
       | .ok (.ptr ptrVal _ :: .scalar metaSc :: .nil) locals' =>
         .ok (.aggregate 0 (.ptr ptrVal 8 :: .scalar ⟨metaSc.bits, 8⟩ :: .nil)) locals' mem
       | .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals' =>
-        .ok (.aggregate 0 (.ptr { allocId := Nat.div addrSc.bits 65536, offsetBytes := Nat.mod addrSc.bits 65536 } 8 :: .scalar ⟨metaSc.bits, 8⟩ :: .nil)) locals' mem
+        match Bool.and (Nat.beq addrSc.sizeBytes 8) (Nat.beq metaSc.sizeBytes 8) with
+        | true =>
+          let modPtr := scalarModulus 8
+          .ok
+            (.aggregate 0
+              (.scalar ⟨wrapScalarBits addrSc.bits modPtr, 8⟩ ::
+                .scalar ⟨wrapScalarBits metaSc.bits modPtr, 8⟩ :: .nil))
+            locals' mem
+        | false => .ub
       | .ok _ _ => .unsupported
       | .ub => .ub
       | .unsupported => .unsupported := rfl
@@ -1283,10 +1295,49 @@ private theorem evalRvalue_unaryOp_ptrMetadata
         match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
         | true => .ok (.scalar ⟨metaSc.bits, metaSc.sizeBytes⟩) locals' mem
         | false => .ub
+      | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
+        let isWidePtrOperand : Bool :=
+          match operandTy localDecls layouts op with
+          | .none => true
+          | .some ty =>
+            match ty.kind with
+            | .rawPtr _ (.slice _) => true
+            | .rawPtr _ .str => true
+            | .rawPtr _ (.dynamic _) => true
+            | .ref _ (.slice _) => true
+            | .ref _ .str => true
+            | .ref _ (.dynamic _) => true
+            | _ => false
+        match isWidePtrOperand with
+        | true =>
+          match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
+          | true =>
+            .ok (.scalar ⟨wrapScalarBits metaSc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+          | false => .ub
+        | false =>
+          .ok (.scalar ⟨2, ptrBytes⟩) locals' mem
       | .ok (.aggregate 0 elems) locals' =>
         .ok (.scalar ⟨Trusted.Sequence.length elems, ptrBytes⟩) locals' mem
       | .ok (.ptr _ ptrSz) locals' =>
         match Nat.beq ptrSz ptrBytes with
+        | true => .ok .unit locals' mem
+        | false => .ub
+      | .ok (.scalar sc) locals' =>
+        let isThinPtrOperand : Bool :=
+          match operandTy localDecls layouts op with
+          | .none => true
+          | .some ty =>
+            match isThinRawPtrTy ty with
+            | true => true
+            | false =>
+              match ty.kind with
+              | .ref _ (.slice _) => false
+              | .ref _ .str => false
+              | .ref _ (.dynamic _) => false
+              | .ref _ _ => true
+              | .fnPtr .. => true
+              | _ => false
+        match Bool.and (Nat.beq sc.sizeBytes ptrBytes) isThinPtrOperand with
         | true => .ok .unit locals' mem
         | false => .ub
       | .ok _ _ => .unsupported
@@ -1336,6 +1387,32 @@ private theorem evalRvalue_cast_ptrToPtr
             match targetTy.kind with
             | .rawPtr _ _ =>
               .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
+            | _ => .ub
+      | .ok (.scalar sc) locals' =>
+        let ptrBytes := layoutPointerBytes layouts
+        match Nat.beq sc.sizeBytes ptrBytes with
+        | false => .ub
+        | true =>
+          match targetTy.kind with
+          | .rawPtr _ (.slice _) => .ub
+          | .rawPtr _ .str => .ub
+          | .rawPtr _ (.dynamic _) => .ub
+          | .rawPtr _ _ =>
+            .ok (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+          | _ => .ub
+      | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
+        match Bool.and (Nat.beq addrSc.sizeBytes 8) (Nat.beq metaSc.sizeBytes 8) with
+        | false => .ub
+        | true =>
+          let modPtr := scalarModulus 8
+          let addrBits := wrapScalarBits addrSc.bits modPtr
+          let metaBits := wrapScalarBits metaSc.bits modPtr
+          match isThinRawPtrTy targetTy with
+          | true => .ok (.scalar ⟨addrBits, 8⟩) locals' mem
+          | false =>
+            match targetTy.kind with
+            | .rawPtr _ _ =>
+              .ok (.aggregate 0 (.scalar ⟨addrBits, 8⟩ :: .scalar ⟨metaBits, 8⟩ :: .nil)) locals' mem
             | _ => .ub
       | .ok _ _ => .unsupported
       | .ub => .ub

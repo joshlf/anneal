@@ -364,6 +364,8 @@ def isPureRvalue : Rvalue → Bool
     -- `ptrToPtr` reads `mem.borrows` and may push a fresh element borrow
     -- (`deriveStackElemThinPtr`), so it is not memory-independent.
     | .ptrToPtr => false
+    | .pointerExposeProvenance => false
+    | .pointerWithExposedProvenance => false
     | _ => isPureOperand op
   | .binaryOp op lhs rhs => isPureBinOp op && (isPureOperand lhs && isPureOperand rhs)
   | .nullaryOp _ _ => true
@@ -539,6 +541,16 @@ def RvalueEvalResult.withMem (mem : Memory) : RvalueEvalResult → RvalueEvalRes
   | .ub => .ub
   | .unsupported => .unsupported
 
+private theorem rval_withMem_ub {mem : Memory} :
+    RvalueEvalResult.ub = RvalueEvalResult.withMem mem RvalueEvalResult.ub := rfl
+
+private theorem rval_withMem_unsupported {mem : Memory} :
+    RvalueEvalResult.unsupported = RvalueEvalResult.withMem mem RvalueEvalResult.unsupported := rfl
+
+private theorem rval_withMem_ok {v : Value} {l : List LocalSlot} {m₀ mem : Memory} :
+    RvalueEvalResult.ok v l mem = RvalueEvalResult.withMem mem (RvalueEvalResult.ok v l m₀) := rfl
+
+
 @[simp]
 theorem evalSignedDiv_eq_withMem
     (a b sz : Nat) (locals : List LocalSlot) (mem : Memory) :
@@ -573,7 +585,7 @@ theorem evalScalarBinOp_eq_withMem
     cases op <;> dsimp only
     all_goals
       repeat' (first
-        | rfl
+        | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
         | exact evalSignedDiv_eq_withMem ..
         | exact evalSignedRem_eq_withMem ..
         | split)
@@ -585,7 +597,7 @@ theorem evalUnaryNot_eq_withMem
       RvalueEvalResult.withMem mem
         (evalUnaryNot sc optTy locals emptyMemory) := by
   unfold evalUnaryNot
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
 
 theorem evalByteCast_pure_eq_withMem
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
@@ -599,9 +611,9 @@ theorem evalByteCast_pure_eq_withMem
   rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
   dsimp only
   try cases evalOperand locals op [] [] layouts [] localDecls
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
   all_goals try dsimp (config := { zeta := true })
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
   all_goals try rfl
 
 /-- A pure projection path contains no `.deref`, so `splitLastDeref?` finds none. -/
@@ -646,7 +658,7 @@ theorem evalPlaceLen_pure_eq_withMem
       mem.callerLocals localDecls h_pure,
     evalPlaceRead_pure_eq locals p emptyMemory.borrows emptyMemory.globals
       layouts emptyMemory.callerLocals localDecls h_pure]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
 
 /-- `evalPlaceDiscriminant` only threads `mem` through to its result. -/
 theorem evalPlaceDiscriminant_eq_withMem
@@ -657,7 +669,7 @@ theorem evalPlaceDiscriminant_eq_withMem
         (evalPlaceDiscriminant val locals' emptyMemory p localDecls layouts) := by
   unfold evalPlaceDiscriminant
   dsimp only
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
 
 /--
 Evaluating a pure `Rvalue` at arbitrary `mem : Memory` produces the exact same
@@ -721,6 +733,8 @@ theorem evalRvalue_pure_eq_withMem
     | pointerCoercion _ => cases h_pure
     | fnPtrToPtr => cases h_pure
     | ptrToPtr => cases h_pure
+    | pointerExposeProvenance => cases h_pure
+    | pointerWithExposedProvenance => cases h_pure
     | transmute => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
     | subtype => exact evalByteCast_pure_eq_withMem locals op targetTy mem localDecls layouts h_pure
     | _ =>
@@ -733,9 +747,9 @@ theorem evalRvalue_pure_eq_withMem
       try rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       try cases evalOperand locals op [] [] layouts [] localDecls
       try cases evalOperand locals op [] [] layouts []
-      repeat' (first | rfl | split)
+      repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
       all_goals try dsimp (config := { zeta := true })
-      repeat' (first | rfl | split)
+      repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
       all_goals try rfl
   | binaryOp op lhs rhs =>
     simp only [isPureRvalue, Bool.and_eq_true] at h_pure
@@ -759,11 +773,36 @@ theorem evalRvalue_pure_eq_withMem
         | scalar lhsSc =>
           cases rhsVal with
           | scalar rhsSc =>
-            exact evalScalarBinOp_eq_withMem op lhsSc rhsSc locals₂ mem _
+            cases op with
+            | offset => exact absurd h_op (by decide)
+            | _ => exact evalScalarBinOp_eq_withMem _ lhsSc rhsSc locals₂ mem _
+          | ptr ptrVal sz =>
+            cases isPtrRelationalBinOp op localDecls layouts lhs rhs with
+            | false => rfl
+            | true => exact evalScalarBinOp_eq_withMem op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
-          | scalar _ => cases op <;> first | rfl | exact absurd h_op (by decide)
+          | scalar rhsSc =>
+            cases op with
+            | offset => exact absurd h_op (by decide)
+            | _ =>
+              cases isPtrRelationalBinOp _ localDecls layouts lhs rhs with
+              | false => rfl
+              | true => exact evalScalarBinOp_eq_withMem _ (ptrToAddrScalar ptrVal sz) rhsSc locals₂ mem false
+          | ptr rhsPtr rhsSz =>
+            cases op <;> first
+              | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
+              | exact evalScalarBinOp_eq_withMem _ (ptrToAddrScalar ptrVal sz) (ptrToAddrScalar rhsPtr rhsSz) locals₂ mem false
+          | _ => rfl
+        | aggregate lhsVar lhsFields =>
+          cases rhsVal with
+          | aggregate rhsVar rhsFields =>
+            dsimp only [evalWidePtrAggregateRelBinOp, evalWidePtrRelBinOp]
+            repeat' (first
+              | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
+              | exact evalScalarBinOp_eq_withMem ..
+              | split)
           | _ => rfl
         | _ => rfl
   | nullaryOp _ _ => rfl
@@ -785,18 +824,18 @@ theorem evalRvalue_pure_eq_withMem
       dsimp only [evalRvalue]
       rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
       rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-      repeat' (first | rfl | split)
+      repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
     | ptrMetadata =>
       dsimp only [evalRvalue]
       rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
       rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-      repeat' (first | rfl | split)
+      repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
   | discriminant p =>
     dsimp only [isPureRvalue] at h_pure
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals (.copy p) mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals (.copy p) emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    repeat' (first | rfl | exact evalPlaceDiscriminant_eq_withMem .. | split)
+    repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | exact evalPlaceDiscriminant_eq_withMem .. | split)
   | aggregate kind ops =>
     dsimp only [isPureRvalue] at h_pure
     cases kind
@@ -804,7 +843,7 @@ theorem evalRvalue_pure_eq_withMem
       dsimp only [evalRvalue]
       try rw [evalOperands_pure_eq locals ops mem.borrows mem.globals layouts mem.callerLocals h_pure]
       try rw [evalOperands_pure_eq locals ops emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-      repeat' (first | rfl | split)
+      repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
   | shallowInitBox _ _ => cases h_pure
   | copyForDeref _ => cases h_pure
 
@@ -2809,6 +2848,35 @@ theorem MirStepNode.pushBaseStack_unsupported
       MirStepNode.unsupported :=
   rfl
 
+private theorem rval_push_ub {c : CapturedMir} {b : List SavedCallerFrame} :
+    RvalueEvalResult.ub = RvalueEvalResult.pushBaseStack c b RvalueEvalResult.ub := rfl
+
+private theorem rval_push_unsupported {c : CapturedMir} {b : List SavedCallerFrame} :
+    RvalueEvalResult.unsupported =
+      RvalueEvalResult.pushBaseStack c b RvalueEvalResult.unsupported := rfl
+
+private theorem rval_push_ok
+    {c : CapturedMir} {b : List SavedCallerFrame}
+    {v : Value} {l : List LocalSlot} {m₁ m₂ : Memory}
+    (h : m₁ = Memory.pushBaseStack c b m₂) :
+    RvalueEvalResult.ok v l m₁ =
+      RvalueEvalResult.pushBaseStack c b (RvalueEvalResult.ok v l m₂) :=
+  h ▸ rfl
+
+
+private theorem step_push_fail {c : CapturedMir} {b : List SavedCallerFrame} {fk : FailureKind} :
+    MirStepNode.fail fk = MirStepNode.pushBaseStack c b (MirStepNode.fail fk) := rfl
+
+private theorem step_push_unsupported {c : CapturedMir} {b : List SavedCallerFrame} :
+    MirStepNode.unsupported = MirStepNode.pushBaseStack c b MirStepNode.unsupported := rfl
+
+private theorem step_push_step
+    {c : CapturedMir} {b : List SavedCallerFrame} {s₁ s₂ : MachineState}
+    (h : s₁ = MachineState.pushBaseStack c b s₂) :
+    MirStepNode.step s₁ = MirStepNode.pushBaseStack c b (MirStepNode.step s₂) :=
+  h ▸ rfl
+
+
 theorem internFnPtr_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (mem : Memory) (defPath : DefPath) (typeArgs : List RigidTy)
@@ -2831,7 +2899,7 @@ theorem evalUnsafeFnPointer_pushBaseStack
         (evalUnsafeFnPointer locals op targetTy mem localDecls layouts) := by
   unfold evalUnsafeFnPointer
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem deriveStackElemThinPtr_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -2843,7 +2911,7 @@ theorem deriveStackElemThinPtr_pushBaseStack
         (deriveStackElemThinPtr locals mem ptrVal parentEntry elemCountOpt) := by
   unfold deriveStackElemThinPtr
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalUnsizeCoercion_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -2855,38 +2923,67 @@ theorem evalUnsizeCoercion_pushBaseStack
         (evalUnsizeCoercion locals op targetTy mem localDecls layouts) := by
   unfold evalUnsizeCoercion
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalSliceFatPtrDerefBorrow_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (locals : List LocalSlot) (mem : Memory) (parentPtr : ProvenancePtr)
     (ptrSz : Nat) (lenSc : ScalarInt) (restProj : List ProjectionElem)
     (perm : TreeBorrowPerm) (isMut : Bool) (pointeeTyOpt : Option Ty)
-    (layouts : LayoutTable) :
+    (layouts : LayoutTable) (checkPerm : Bool) :
     evalSliceFatPtrDerefBorrow locals
         (Memory.pushBaseStack calleeBody baseStack mem)
-        parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts =
+        parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm =
       RvalueEvalResult.pushBaseStack calleeBody baseStack
         (evalSliceFatPtrDerefBorrow locals mem
-          parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts) := by
+          parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm) := by
   unfold evalSliceFatPtrDerefBorrow
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalGlobalThinPtrDerefBorrow_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (locals : List LocalSlot) (mem : Memory) (alloc : CapturedAllocation)
     (parentPtr : ProvenancePtr) (ptrSz : Nat) (restProj : List ProjectionElem)
-    (isMut : Bool) (pointeeTyOpt : Option Ty) (layouts : LayoutTable) :
+    (isMut : Bool) (pointeeTyOpt : Option Ty) (layouts : LayoutTable)
+    (localDecls : List LocalDecl) (rawPtrMode : Bool) :
     evalGlobalThinPtrDerefBorrow locals
         (Memory.pushBaseStack calleeBody baseStack mem)
-        alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts =
+        alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode =
       RvalueEvalResult.pushBaseStack calleeBody baseStack
         (evalGlobalThinPtrDerefBorrow locals mem
-          alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts) := by
+          alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode) := by
   unfold evalGlobalThinPtrDerefBorrow
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
+
+theorem evalScalarSliceFatPtrDerefRaw_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (locals : List LocalSlot) (mem : Memory) (addrSc lenSc : ScalarInt)
+    (restProj : List ProjectionElem) (pointeeTyOpt : Option Ty)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalScalarSliceFatPtrDerefRaw locals
+        (Memory.pushBaseStack calleeBody baseStack mem)
+        addrSc lenSc restProj pointeeTyOpt localDecls layouts =
+      RvalueEvalResult.pushBaseStack calleeBody baseStack
+        (evalScalarSliceFatPtrDerefRaw locals mem
+          addrSc lenSc restProj pointeeTyOpt localDecls layouts) := by
+  unfold evalScalarSliceFatPtrDerefRaw
+  dsimp only [Memory.pushBaseStack]
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
+
+theorem evalScalarPtrOffsetBinOp_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (locals₂ : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (lhsOp : Operand) (lhs rhs : ScalarInt) :
+    evalScalarPtrOffsetBinOp locals₂
+        (Memory.pushBaseStack calleeBody baseStack mem)
+        localDecls layouts lhsOp lhs rhs =
+      RvalueEvalResult.pushBaseStack calleeBody baseStack
+        (evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs) := by
+  unfold evalScalarPtrOffsetBinOp
+  dsimp only [Memory.pushBaseStack]
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalPtrOffsetBinOp_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -2900,7 +2997,7 @@ theorem evalPtrOffsetBinOp_pushBaseStack
           offsetSc) := by
   unfold evalPtrOffsetBinOp ptrAllocByteBound?
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalPlaceLen_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -2912,7 +3009,7 @@ theorem evalPlaceLen_pushBaseStack
         (evalPlaceLen locals place mem localDecls layouts) := by
   unfold evalPlaceLen
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalPlaceDiscriminant_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -2924,7 +3021,7 @@ theorem evalPlaceDiscriminant_pushBaseStack
         (evalPlaceDiscriminant val locals' mem place localDecls layouts) := by
   unfold evalPlaceDiscriminant
   dsimp only
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalReifyFnPointer_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -2942,7 +3039,7 @@ theorem evalReifyFnPointer_pushBaseStack
   | false =>
     dsimp only [Memory.pushBaseStack]
     repeat' (first
-      | rfl
+      | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
       | exact evalUnsizeCoercion_pushBaseStack ..
       | exact deriveStackElemThinPtr_pushBaseStack ..
       | split)
@@ -2961,7 +3058,7 @@ theorem evalReifyFnPointer_pushBaseStack
       | ok v locals' =>
         dsimp only [Memory.pushBaseStack]
         repeat' (first
-          | rfl
+          | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
           | (rw [internFnPtr_pushBaseStack]; rfl)
           | split)
 
@@ -2975,7 +3072,7 @@ theorem evalFnPtrToPtr_pushBaseStack
         (evalFnPtrToPtr locals op targetTy mem localDecls layouts) := by
   unfold evalFnPtrToPtr
   dsimp only [Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 theorem evalByteCast_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -2992,9 +3089,9 @@ theorem evalByteCast_pushBaseStack
   | unsupported => rfl
   | ok v locals' =>
     dsimp only
-    repeat' (first | rfl | split)
+    repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
     all_goals try dsimp (config := { zeta := true })
-    repeat' (first | rfl | split)
+    repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
     all_goals try rfl
 
 theorem evalSignedDiv_pushBaseStack
@@ -3041,7 +3138,7 @@ theorem evalScalarBinOp_pushBaseStack
     cases op <;> dsimp only
     all_goals
       repeat' (first
-        | rfl
+        | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
         | exact evalSignedDiv_pushBaseStack ..
         | exact evalSignedRem_pushBaseStack ..
         | split)
@@ -3055,7 +3152,7 @@ theorem evalUnaryNot_pushBaseStack
       RvalueEvalResult.pushBaseStack calleeBody baseStack
         (evalUnaryNot sc optTy locals mem) := by
   unfold evalUnaryNot
-  repeat' (first | rfl | split)
+  repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
 /--
 `evalRvalue` is completely independent of `Memory.callStack` and
@@ -3072,14 +3169,14 @@ theorem evalRvalue_pushBaseStack
   cases rv with
   | use op =>
     cases op
-    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | rfl | split))
+    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split))
   | «repeat» op count =>
     cases op
-    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | rfl | split))
+    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split))
   | ref bk place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
     repeat' (first
-      | rfl
+      | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
       | exact evalSliceFatPtrDerefBorrow_pushBaseStack ..
       | exact evalGlobalThinPtrDerefBorrow_pushBaseStack ..
       | split)
@@ -3087,9 +3184,10 @@ theorem evalRvalue_pushBaseStack
   | rawPtr mutab place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
     repeat' (first
-      | rfl
+      | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
       | exact evalSliceFatPtrDerefBorrow_pushBaseStack ..
       | exact evalGlobalThinPtrDerefBorrow_pushBaseStack ..
+      | exact evalScalarSliceFatPtrDerefRaw_pushBaseStack ..
       | split)
   | len place =>
     dsimp only [evalRvalue]
@@ -3112,7 +3210,7 @@ theorem evalRvalue_pushBaseStack
     | _ =>
       dsimp only [evalRvalue, Memory.pushBaseStack]
       repeat' (first
-        | rfl
+        | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
         | exact deriveStackElemThinPtr_pushBaseStack ..
         | split)
   | binaryOp op lhsOp rhsOp =>
@@ -3131,13 +3229,42 @@ theorem evalRvalue_pushBaseStack
         | scalar lhsSc =>
           cases rhsVal with
           | scalar rhsSc =>
-            exact evalScalarBinOp_pushBaseStack calleeBody baseStack
-              op lhsSc rhsSc locals₂ mem _
+            cases op with
+            | offset =>
+              exact evalScalarPtrOffsetBinOp_pushBaseStack calleeBody baseStack
+                locals₂ mem localDecls layouts lhsOp lhsSc rhsSc
+            | _ =>
+              exact evalScalarBinOp_pushBaseStack calleeBody baseStack
+                _ lhsSc rhsSc locals₂ mem _
+          | ptr ptrVal sz =>
+            cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+            | false => rfl
+            | true => exact evalScalarBinOp_pushBaseStack calleeBody baseStack op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
-          | scalar _ =>
-            cases op <;> first | rfl | exact evalPtrOffsetBinOp_pushBaseStack ..
+          | scalar rhsSc =>
+            cases op with
+            | offset =>
+              exact evalPtrOffsetBinOp_pushBaseStack calleeBody baseStack
+                locals₂ mem localDecls layouts lhsOp ptrVal sz rhsSc
+            | _ =>
+              cases isPtrRelationalBinOp _ localDecls layouts lhsOp rhsOp with
+              | false => rfl
+              | true => exact evalScalarBinOp_pushBaseStack calleeBody baseStack _ (ptrToAddrScalar ptrVal sz) rhsSc locals₂ mem false
+          | ptr rhsPtr rhsSz =>
+            cases op <;> first
+              | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
+              | exact evalScalarBinOp_pushBaseStack calleeBody baseStack _ (ptrToAddrScalar ptrVal sz) (ptrToAddrScalar rhsPtr rhsSz) locals₂ mem false
+          | _ => rfl
+        | aggregate lhsVar lhsFields =>
+          cases rhsVal with
+          | aggregate rhsVar rhsFields =>
+            dsimp only [evalWidePtrAggregateRelBinOp, evalWidePtrRelBinOp]
+            repeat' (first
+              | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
+              | exact evalScalarBinOp_pushBaseStack ..
+              | split)
           | _ => rfl
         | _ => rfl
   | nullaryOp _ _ => rfl
@@ -3155,27 +3282,27 @@ theorem evalRvalue_pushBaseStack
         | _ => rfl
     | neg =>
       dsimp only [evalRvalue, Memory.pushBaseStack]
-      repeat' (first | rfl | split)
+      repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
     | ptrMetadata =>
       dsimp only [evalRvalue, Memory.pushBaseStack]
-      repeat' (first | rfl | split)
+      repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
   | discriminant place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
     repeat' (first
-      | rfl
+      | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
       | exact evalPlaceDiscriminant_pushBaseStack ..
       | split)
   | aggregate kind ops =>
     cases kind <;>
       (dsimp only [evalRvalue, Memory.pushBaseStack];
-       repeat' (first | rfl | split))
+       repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split))
   | shallowInitBox _ _ => rfl
   | copyForDeref place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls <;> repeat' (first | rfl | split)
+    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls <;> repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
   | wrapUnsafeBinder op _ =>
     cases op
-    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | rfl | split))
+    all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split))
 
 theorem evalCopySingleDirect_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
@@ -3191,9 +3318,9 @@ theorem evalCopySingleDirect_pushBaseStack
           s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃) := by
   unfold evalCopySingleDirect
   dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   all_goals try dsimp (config := { zeta := true })
-  repeat' (first | rfl | split)
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   all_goals try rfl
 
 @[simp]
@@ -3239,6 +3366,14 @@ theorem Memory.pushBaseStack_activeProtectors
     (mem : Memory) :
     (Memory.pushBaseStack calleeBody baseStack mem).activeProtectors =
       mem.activeProtectors :=
+  rfl
+
+@[simp]
+theorem Memory.pushBaseStack_exposedAllocIds
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (mem : Memory) :
+    (Memory.pushBaseStack calleeBody baseStack mem).exposedAllocIds =
+      mem.exposedAllocIds :=
   rfl
 
 @[simp]
@@ -3584,7 +3719,7 @@ private theorem copyWriteDstVal_pushBaseStack
         (copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal) := by
   unfold copyWriteDstVal
   dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-  repeat' (first | rfl | split)
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
 
 private theorem copyWriteDstVal_isStmtNode
     (s : MachineState) (locals₃ : List LocalSlot) (dstPlace : Place)
@@ -3612,7 +3747,7 @@ private theorem copyViaBytesBody_pushBaseStack
           countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal) := by
   unfold copyViaBytesBody
   dsimp only
-  repeat' (first | rfl | exact copyWriteDstVal_pushBaseStack .. | split)
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | exact copyWriteDstVal_pushBaseStack .. | split)
 
 private theorem copyViaBytesBody_isStmtNode
     (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -3658,7 +3793,7 @@ private theorem evalCopyUnionBytes_pushBaseStack
           srcUnionOpt dstUnionOpt n locals₃) := by
   unfold evalCopyUnionBytes
   dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-  repeat' (first | rfl | exact copyWriteDstVal_pushBaseStack .. | split)
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | exact copyWriteDstVal_pushBaseStack .. | split)
 
 private theorem evalCopyUnionBytes_isStmtNode
     (s : MachineState) (src dst : Operand)
@@ -3694,7 +3829,7 @@ private theorem evalCopyNonOverlappingPermOk_pushBaseStack
   unfold evalCopyNonOverlappingPermOk
   dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
   repeat' (first
-    | rfl
+    | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl
     | exact evalCopyUnionBytes_pushBaseStack ..
     | exact evalCopySingleDirect_pushBaseStack ..
     | exact copyViaBytesBody_pushBaseStack ..
@@ -3863,36 +3998,36 @@ theorem evalStmt_pushBaseStack
   | placeMention p =>
     unfold evalStmt
     dsimp only [MachineState.pushBaseStack]
-    repeat' (first | rfl | split)
+    repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   | retag rk p =>
     unfold evalStmt
     dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-    repeat' (first | rfl | split)
+    repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   | storageLive loc =>
     unfold evalStmt
     dsimp only [MachineState.pushBaseStack]
-    repeat' (first | rfl | split)
+    repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   | storageDead loc =>
     unfold evalStmt
     dsimp only [MachineState.pushBaseStack]
-    repeat' (first | rfl | split)
+    repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   | deinit p =>
     unfold evalStmt
     dsimp only [MachineState.pushBaseStack]
-    repeat' (first | rfl | split)
+    repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   | intrinsic intr =>
     cases intr with
     | assume op =>
       unfold evalStmt
       dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-      repeat' (first | rfl | split)
+      repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
     | copyNonOverlapping src dst count =>
       exact evalCopyNonOverlapping_pushBaseStack calleeBody baseStack
         s src dst count localDecls layouts
   | setDiscriminant p variantIdx =>
     unfold evalStmt
     dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-    repeat' (first | rfl | split)
+    repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   | assign dst rv =>
     rw [evalStmt_assign_eq, evalStmt_assign_eq]
     dsimp only [MachineState.pushBaseStack]
@@ -3908,18 +4043,18 @@ theorem evalStmt_pushBaseStack
       | nil =>
         unfold evalAssignDst
         dsimp only [Memory.pushBaseStack]
-        repeat' (first | rfl | split)
+        repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
       | cons hd tl =>
         by_cases h_d : hd = .deref
         · subst h_d
           unfold evalAssignDst
           dsimp only [Memory.pushBaseStack]
-          repeat' (first | rfl | split)
+          repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
         · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d,
               evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d]
           unfold evalAssignNonDeref
           dsimp only [Memory.pushBaseStack]
-          repeat' (first | rfl | split)
+          repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
   | _ => rfl
 
 private theorem evalStmt_isStmtNode

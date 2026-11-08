@@ -3518,7 +3518,7 @@ def populateSinglePtrParamMemory
   | .ref mutbl pointee | .rawPtr mutbl pointee =>
     match mem with
     | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
       match isWidePointee pointee with
       | false =>
         match argVal with
@@ -3580,7 +3580,7 @@ def populateSinglePtrParamMemory
                         relocations := []
                         align := { bytes := 8 }
                         mutability := mutbl } :: globals
-                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs⟩
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs, exposedAllocIds⟩
           else
             mem
         | _ => mem
@@ -3650,7 +3650,7 @@ def populateSinglePtrParamMemory
                         relocations := []
                         align := { bytes := 8 }
                         mutability := mutbl } :: globals
-                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs⟩
+                  ⟨nextAllocId, nextGlobals, nextBorrows, nextTagVal, callees, traitImpls, callStack, activeCallee, activeProtectors, nextProtector, nextCallerLocals, fnPtrs, exposedAllocIds⟩
           else
             mem
         | _, _ => mem
@@ -3848,11 +3848,11 @@ def decodeRawByteTrace
         rawTrace.initMem
     with
     | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
+       activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
       some {
         args := args
         initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
+                    activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
         inlinedCallees := rawTrace.inlinedCallees
         events := events
         outcome := outcome
@@ -4347,11 +4347,11 @@ def diagnoseRawByteTraceBounded
             rawTrace.initMem
         with
         | ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩ =>
+           activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩ =>
           diagnoseObservedTraceBounded fuel checkBranches rootBody {
             args := args
             initMem := ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack,
-                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs⟩
+                        activeCallee, activeProtectors, nextProtector, callerLocals, fnPtrs, exposedAllocIds⟩
             inlinedCallees := rawTrace.inlinedCallees
             events := events
             outcome := outcome

@@ -1454,7 +1454,13 @@ theorem evalSymRvalueConcrete_sound
                       injection hRest1 with hS hRest2
                       injection hRest2 with hB hT
                       subst hV; subst hS; subst hB; subst hT
-                      exact evalSymScalarBinOp_sound op lhs rhs (concretizeSymSlots args slots2) mem (operandIsSigned localDecls lhsOp layouts) resVal hBin
+                      cases op with
+                      | offset =>
+                        unfold evalSymScalarBinOp at hBin
+                        repeat' split at hBin
+                        all_goals contradiction
+                      | _ =>
+                        exact evalSymScalarBinOp_sound _ lhs rhs (concretizeSymSlots args slots2) mem (operandIsSigned localDecls lhsOp layouts) resVal hBin
   | aggregate aggKind ops =>
     cases aggKind with
     | tuple =>
@@ -2408,23 +2414,28 @@ def symFinishPinEq
 `stmt` when `stmt` is `.assign ⟨dstLoc, .nil⟩ (.binaryOp .eq lhsOp rhsOp)` comparing
 `.symArg idx` against `.concrete (.scalar expectedSc)`. -/
 def symExtractPinEqStmt
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
     (st : SymState)
     (stmt : Statement) :
     Option (Nat × ScalarInt × SymState × SymState) :=
   match stmt.kind with
   | .assign ⟨dstLoc, .nil⟩ (.binaryOp .eq lhsOp rhsOp) =>
-    match evalSymOperand st.slots lhsOp st.borrows with
-    | .some (sv₁, slots₁) =>
-      match evalSymOperand slots₁ rhsOp st.borrows with
-      | .some (sv₂, slots₂) =>
-        match sv₁, sv₂ with
-        | .symArg idx, .concrete (.scalar sc) =>
-          symFinishPinEq st dstLoc slots₂ idx sc
-        | .concrete (.scalar sc), .symArg idx =>
-          symFinishPinEq st dstLoc slots₂ idx sc
-        | _, _ => .none
+    match isPtrOrUntypedOperand localDecls layouts lhsOp with
+    | true => .none
+    | false =>
+      match evalSymOperand st.slots lhsOp st.borrows with
+      | .some (sv₁, slots₁) =>
+        match evalSymOperand slots₁ rhsOp st.borrows with
+        | .some (sv₂, slots₂) =>
+          match sv₁, sv₂ with
+          | .symArg idx, .concrete (.scalar sc) =>
+            symFinishPinEq st dstLoc slots₂ idx sc
+          | .concrete (.scalar sc), .symArg idx =>
+            symFinishPinEq st dstLoc slots₂ idx sc
+          | _, _ => .none
+        | .none => .none
       | .none => .none
-    | .none => .none
   | _ => .none
 
 /-- Extract a symbolic equality pin from the current statement of `body` at `st`. -/
@@ -2439,7 +2450,7 @@ def symExtractPinEq
     | .none => .none
     | .some bb =>
       match get? bb.statements st.stmtIdx with
-      | .some stmt => symExtractPinEqStmt st stmt
+      | .some stmt => symExtractPinEqStmt body.localDecls body.layouts st stmt
       | .none => .none
 
 theorem scalarInt_eq_of_parts
@@ -2661,6 +2672,12 @@ theorem symExtractPinEq_branch_sound
                   cases op with
                   | eq =>
                     dsimp only [symExtractPinEqStmt] at hExt
+                    have hPtrTy : isPtrOrUntypedOperand body.localDecls body.layouts lhsOp = false := by
+                      cases h : isPtrOrUntypedOperand body.localDecls body.layouts lhsOp with
+                      | false => rfl
+                      | true => rw [h] at hExt; nomatch hExt
+                    rw [hPtrTy] at hExt
+                    dsimp only at hExt
                     rw [evalStmt_assign_nil_eq] at hHold
                     dsimp only [evalRvalue] at hHold
                     cases hLhs : evalSymOperand st.slots lhsOp st.borrows with
@@ -2707,7 +2724,11 @@ theorem symExtractPinEq_branch_sound
                                       (.concrete (.scalar sc0)) slots2 hRhs] at hHold
                                     dsimp only [concretizeSymReadResult] at hHold
                                     cases vArg0 with
-                                    | unit | ptr _ _ | aggregate _ _ =>
+                                    | unit | aggregate _ _ =>
+                                      exact False.elim hHold
+                                    | ptr _ _ =>
+                                      dsimp only [isPtrRelationalBinOp] at hHold
+                                      rw [hPtrTy] at hHold
                                       exact False.elim hHold
                                     | scalar actualSc =>
                                       dsimp only [evalScalarBinOp] at hHold
@@ -2762,7 +2783,11 @@ theorem symExtractPinEq_branch_sound
                                     rw [hArg0] at hHold
                                     dsimp only at hHold
                                     cases vArg0 with
-                                    | unit | ptr _ _ | aggregate _ _ =>
+                                    | unit | aggregate _ _ =>
+                                      exact False.elim hHold
+                                    | ptr _ _ =>
+                                      dsimp only [isPtrRelationalBinOp] at hHold
+                                      rw [hPtrTy] at hHold
                                       exact False.elim hHold
                                     | scalar actualSc =>
                                       dsimp only [evalScalarBinOp] at hHold
@@ -3887,8 +3912,12 @@ def symExtractUpperBound1Stmt
     Option (ScalarInt × SymState) :=
   match stmt.kind with
   | .assign ⟨dstLoc, .nil⟩ (.binaryOp op lhsOp rhsOp) =>
-    match isUnsignedUpperBoundOp op, operandIsSigned localDecls lhsOp layouts with
-    | true, false =>
+    match
+      isUnsignedUpperBoundOp op,
+      operandIsSigned localDecls lhsOp layouts,
+      isPtrOrUntypedOperand localDecls layouts lhsOp
+    with
+    | true, false, false =>
       match evalSymOperand st.slots lhsOp st.borrows with
       | .some (sv₁, slots₁) =>
         match sv₁ with
@@ -3908,7 +3937,7 @@ def symExtractUpperBound1Stmt
           | .none => .none
         | _ => .none
       | .none => .none
-    | _, _ => .none
+    | _, _, _ => .none
   | _ => .none
 
 /-- Extract a 1-argument unsigned upper bound from the current statement of `body` at `st`. -/
@@ -3988,6 +4017,11 @@ theorem symExtractUpperBound1_sound
                       nomatch hExt
                     | false =>
                       rw [hSig] at hExt
+                      have hPtrTy : isPtrOrUntypedOperand body.localDecls body.layouts lhsOp = false := by
+                        cases h : isPtrOrUntypedOperand body.localDecls body.layouts lhsOp with
+                        | false => rfl
+                        | true => rw [h] at hExt; nomatch hExt
+                      rw [hPtrTy] at hExt
                       dsimp only at hExt
                       rw [evalStmt_assign_nil_eq] at hHold
                       dsimp only [evalRvalue] at hHold
@@ -4061,65 +4095,68 @@ theorem symExtractUpperBound1_sound
                                                   exact False.elim hHold
                                                 | ptr _ _ =>
                                                   cases op with
-                                                  | eq | lt | le => exact False.elim hHold
+                                                  | eq | lt | le =>
+                                                    dsimp only [isPtrRelationalBinOp] at hHold
+                                                    rw [hPtrTy] at hHold
+                                                    exact False.elim hHold
                                                   | _ => nomatch hOp
                                                 | scalar actualSc =>
-                                                  dsimp only at hHold
-                                                  rw [hSig] at hHold
-                                                  cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
-                                                  | true =>
-                                                    dsimp only [evalScalarBinOp] at hHold
-                                                    rw [hActSz0] at hHold
-                                                    exact False.elim hHold
-                                                  | false =>
-                                                    cases hSzEq : Nat.beq actualSc.sizeBytes sc0.sizeBytes with
-                                                    | false =>
+                                                  have hNotOff : op = .le ∨ op = .lt ∨ op = .eq := by
+                                                    cases op <;> simp_all [isUnsignedUpperBoundOp]
+                                                  rcases hNotOff with rfl | rfl | rfl <;> (
+                                                    dsimp only at hHold
+                                                    rw [hSig] at hHold
+                                                    cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
+                                                    | true =>
                                                       dsimp only [evalScalarBinOp] at hHold
                                                       rw [hActSz0] at hHold
-                                                      dsimp only at hHold
-                                                      cases op with
-                                                      | eq | lt | le =>
+                                                      exact False.elim hHold
+                                                    | false =>
+                                                      cases hSzEq : Nat.beq actualSc.sizeBytes sc0.sizeBytes with
+                                                      | false =>
+                                                        dsimp only [evalScalarBinOp] at hHold
+                                                        rw [hActSz0] at hHold
+                                                        dsimp only at hHold
                                                         rw [hSzEq] at hHold
                                                         exact False.elim hHold
-                                                      | _ => nomatch hOp
-                                                    | true =>
-                                                      rw [evalScalarBinOp_unsignedUpperBound_eq
-                                                        op actualSc sc0
-                                                        (concretizeSymSlots args slots2)
-                                                        { nextAllocId := length body.allocations
-                                                          globals := body.allocations
-                                                          traitImpls := body.traitImpls
-                                                          borrows := st.borrows
-                                                          nextTag := st.nextTag
-                                                          callees := .nil
-                                                          callStack := .nil
-                                                          activeCallee := .none }
-                                                        hOp hActSz0 hSzEq] at hHold
-                                                      have ⟨_, hScEq, hBranch⟩ :=
-                                                        symFinishPinEq_branch_ok_sound
-                                                          fuel body args st dstLoc slots2 0 tightSc
-                                                          idxOut scOut stTrue stFalseOut
-                                                          (evalUnsignedUpperBoundCmp op actualSc.bits sc0.bits)
-                                                          hFin hHold
-                                                      cases hBranch with
-                                                      | inr hFalseHold =>
-                                                        exact False.elim
-                                                          (checkSymReturnsFalse_sound
-                                                            fuel body args stFalseOut hFalse hFalseHold)
-                                                      | inl hTruePair =>
-                                                        have hBle : actualSc.bits ≤ scOut.bits := by
-                                                          rw [hScEq]
-                                                          exact ble_of_evalUnsignedUpperBoundCmp
-                                                            op actualSc.bits sc0.bits hOp hTruePair.1
-                                                        have hSz : actualSc.sizeBytes = scOut.sizeBytes := by
-                                                          rw [hScEq]
-                                                          exact Nat.eq_of_beq_eq_true hSzEq
-                                                        refine ⟨actualSc.bits, hBle, ?_⟩
-                                                        cases actualSc with
-                                                        | mk bits sz =>
-                                                          dsimp only at hSz ⊢
-                                                          subst hSz
-                                                          rfl
+                                                      | true =>
+                                                        rw [evalScalarBinOp_unsignedUpperBound_eq
+                                                          _ actualSc sc0
+                                                          (concretizeSymSlots args slots2)
+                                                          { nextAllocId := length body.allocations
+                                                            globals := body.allocations
+                                                            traitImpls := body.traitImpls
+                                                            borrows := st.borrows
+                                                            nextTag := st.nextTag
+                                                            callees := .nil
+                                                            callStack := .nil
+                                                            activeCallee := .none }
+                                                          hOp hActSz0 hSzEq] at hHold
+                                                        have ⟨_, hScEq, hBranch⟩ :=
+                                                          symFinishPinEq_branch_ok_sound
+                                                            fuel body args st dstLoc slots2 0 tightSc
+                                                            idxOut scOut stTrue stFalseOut
+                                                            (evalUnsignedUpperBoundCmp _ actualSc.bits sc0.bits)
+                                                            hFin hHold
+                                                        cases hBranch with
+                                                        | inr hFalseHold =>
+                                                          exact False.elim
+                                                            (checkSymReturnsFalse_sound
+                                                              fuel body args stFalseOut hFalse hFalseHold)
+                                                        | inl hTruePair =>
+                                                          have hBle : actualSc.bits ≤ scOut.bits := by
+                                                            rw [hScEq]
+                                                            exact ble_of_evalUnsignedUpperBoundCmp
+                                                              _ actualSc.bits sc0.bits hOp hTruePair.1
+                                                          have hSz : actualSc.sizeBytes = scOut.sizeBytes := by
+                                                            rw [hScEq]
+                                                            exact Nat.eq_of_beq_eq_true hSzEq
+                                                          refine ⟨actualSc.bits, hBle, ?_⟩
+                                                          cases actualSc with
+                                                          | mk bits sz =>
+                                                            dsimp only at hSz ⊢
+                                                            subst hSz
+                                                            rfl)
                 | _ => nomatch hExt
           | _ => nomatch hExt
 
@@ -5597,27 +5634,31 @@ theorem symExtractEnsuresUpperBound1_sound
                                             args slots1 rhsOp st.borrows body.allocations body.layouts
                                             (.concrete (.scalar sc0)) slots2 hRhs]
                                           dsimp only [concretizeSymReadResult]
-                                          rw [hSig]
                                           have hUbOp : isUnsignedUpperBoundOp op = true :=
                                             isUnsignedUpperBoundOp_of_ensuresUpper hOp
                                           have hSzEq : Nat.beq sc0.sizeBytes sc0.sizeBytes = true :=
                                             Nat.beq_refl sc0.sizeBytes
-                                          rw [evalScalarBinOp_unsignedUpperBound_eq
-                                            op
-                                            { bits := r, sizeBytes := sc0.sizeBytes }
-                                            sc0
-                                            (concretizeSymSlots args slots2)
-                                            { nextAllocId := length body.allocations
-                                              globals := body.allocations
-                                              traitImpls := body.traitImpls
-                                              borrows := st.borrows
-                                              nextTag := st.nextTag
-                                              callees := .nil
-                                              callStack := .nil
-                                              activeCallee := .none }
-                                            hUbOp hSz0 hSzEq]
-                                          rw [evalUnsignedUpperBoundCmp_eq_true_of_ble op r sc0.bits hOp hBle]
-                                          exact hStepTrue
+                                          have hNotOff : op = .le ∨ op = .lt ∨ op = .eq := by
+                                            cases op <;> simp_all [isUnsignedUpperBoundOp]
+                                          rcases hNotOff with rfl | rfl | rfl <;> (
+                                            dsimp only
+                                            rw [hSig]
+                                            rw [evalScalarBinOp_unsignedUpperBound_eq
+                                              _
+                                              { bits := r, sizeBytes := sc0.sizeBytes }
+                                              sc0
+                                              (concretizeSymSlots args slots2)
+                                              { nextAllocId := length body.allocations
+                                                globals := body.allocations
+                                                traitImpls := body.traitImpls
+                                                borrows := st.borrows
+                                                nextTag := st.nextTag
+                                                callees := .nil
+                                                callStack := .nil
+                                                activeCallee := .none }
+                                              hUbOp hSz0 hSzEq]
+                                            rw [evalUnsignedUpperBoundCmp_eq_true_of_ble _ r sc0.bits hOp hBle]
+                                            exact hStepTrue)
                 | _ => nomatch hExt
           | _ => nomatch hExt
 

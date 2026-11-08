@@ -1443,13 +1443,50 @@ def evalRvalueSymTree
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
-          let isSigned := operandIsSigned localDecls lhsOp layouts
-          evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
+          match op with
+          | .offset =>
+            .leaf (evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs)
+          | _ =>
+            let isSigned := operandIsSigned localDecls lhsOp layouts
+            evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
             evalPtrOffsetBinOpSymTree locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc
-          | _ => .leaf .unsupported
+          | _ =>
+            match isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+            | true =>
+              evalScalarBinOpSymTree op (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+            | false => .leaf .unsupported
+        | .scalar lhsSc, .ptr ptrVal sz =>
+          match isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+          | true =>
+            evalScalarBinOpSymTree op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+          | false => .leaf .unsupported
+        | .ptr lhsPtr lhsSz, .ptr rhsPtr rhsSz =>
+          match isRelationalBinOp op with
+          | true =>
+            evalScalarBinOpSymTree
+              op
+              (ptrToAddrScalar lhsPtr lhsSz)
+              (ptrToAddrScalar rhsPtr rhsSz)
+              locals₂
+              mem
+              false
+          | false => .leaf .unsupported
+        | .aggregate lhsVar lhsFields, .aggregate rhsVar rhsFields =>
+          .leaf
+            (evalWidePtrAggregateRelBinOp
+              op
+              lhsOp
+              lhsVar
+              lhsFields
+              rhsVar
+              rhsFields
+              locals₂
+              mem
+              localDecls
+              layouts)
         | _, _ => .leaf .unsupported
       | .ub => .leaf .ub
       | .unsupported => .leaf .unsupported
@@ -1489,8 +1526,15 @@ theorem evalRvalueSymTree_eval
         | scalar lhs =>
           cases rhsVal with
           | scalar rhs =>
-            dsimp only
-            exact evalScalarBinOpSymTree_eval op lhs rhs locals₂ mem _
+            cases op with
+            | offset => rfl
+            | _ =>
+              dsimp only
+              exact evalScalarBinOpSymTree_eval _ lhs rhs locals₂ mem _
+          | ptr ptrVal sz =>
+            cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+            | false => rfl
+            | true => exact evalScalarBinOpSymTree_eval op lhs (ptrToAddrScalar ptrVal sz) locals₂ mem false
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
@@ -1499,8 +1543,17 @@ theorem evalRvalueSymTree_eval
             cases op with
             | offset =>
               exact evalPtrOffsetBinOpSymTree_eval locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc
-            | _ => rfl
+            | _ =>
+              cases isPtrRelationalBinOp _ localDecls layouts lhsOp rhsOp with
+              | false => rfl
+              | true => exact evalScalarBinOpSymTree_eval _ (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+          | ptr rhsPtr rhsSz =>
+            cases op <;> first
+              | rfl
+              | (dsimp only; exact evalScalarBinOpSymTree_eval _ (ptrToAddrScalar ptrVal sz) (ptrToAddrScalar rhsPtr rhsSz) locals₂ mem false)
           | _ => rfl
+        | aggregate lhsVar lhsFields =>
+          cases rhsVal <;> rfl
         | _ => rfl
   | unaryOp uop op =>
     cases uop with
