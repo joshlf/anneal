@@ -8633,7 +8633,7 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       stepMirFn body s = MirStepNode.step s' →
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .ok true) →
-      ∃ (treeMap' , List ReborrowMapEntry), StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) := @evalRvalue_reborrow_safeRef_tree_simulation
+      ∃ (treeMap' : List ReborrowMapEntry), StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) := @evalRvalue_reborrow_safeRef_tree_simulation
 
 example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
