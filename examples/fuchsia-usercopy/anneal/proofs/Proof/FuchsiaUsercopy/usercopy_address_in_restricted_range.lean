@@ -55,11 +55,11 @@ theorem verified : StatefulVerificationResult Obligations.FuchsiaUsercopy.userco
         rw [ite_eq_right (by omega)]
         rfl
   · -- `addr = 0`. bb1: `goto -> bb5`; bb5: `return false`
-    have h_z := Nat.eq_of_beq_eq_true h0
     apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
     apply LiftBlock.of_lookup rfl
     apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
     rintro _ _ _ ⟨⟩
+    have h_z := Nat.eq_of_beq_eq_true h0
     exact ⟨by rw [ite_eq_right (by omega)], fun _ => rfl⟩
 
 end Proof.FuchsiaUsercopy.usercopy_address_in_restricted_range

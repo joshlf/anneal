@@ -14,11 +14,10 @@ open Anneal.PureMirExec
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
 /-- A step from `s` that has no successor state (it returns or raises a waived
-UB) converges under the UB-waived semantics on its own: the one step consumes
-the only unit of the witness, since no leaf of the step tree consults the
-continuation. This is the UB-waived analogue of `MirExecWpConverges.halted`;
-`MirUbWaivedWpConverges.step` cannot express it because its call-free
-evaluator rejects UB nodes. -/
+UB) converges under the UB-waived semantics with a one-step witness, because
+no leaf of its step tree consults the continuation. This is the UB-waived
+analogue of `MirExecWpConverges.halted`; `MirUbWaivedWpConverges.step` cannot
+express it because its call-free evaluator rejects UB nodes. -/
 private theorem ubWaivedWpConverges_of_halt
     {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
     (h : evalSymNodeTreeUbWaived (fun _ => False) post (stepMirSymTree body s)) :

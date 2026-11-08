@@ -15,32 +15,19 @@ open Anneal.PureMirExec
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-/-- `evalSymNodeTreeModular` is monotone in its continuation. -/
-private theorem evalSymNodeTreeModular_mono {contract : MirCallContract}
-    {c₁ c₂ : MirExecState → Prop} {post : MirOutcome → Prop}
-    (h : ∀ st, c₁ st → c₂ st) :
-    ∀ t, evalSymNodeTreeModular contract c₁ post t →
-      evalSymNodeTreeModular contract c₂ post t
-  | .leaf (.ret _), hp => hp
-  | .leaf (.tau _), hp => h _ hp
-  | .leaf (.vis (.inl _) _), hp => hp
-  | .leaf (.vis (.inr (.inl _)) _), hp => h _ hp
-  | .leaf (.vis (.inr (.inr (.call _))) _), hp => ⟨hp.1, fun ans ha => h _ (hp.2 ans ha)⟩
-  | .branch true t _, hp => evalSymNodeTreeModular_mono h t hp
-  | .branch false _ t, hp => evalSymNodeTreeModular_mono h t hp
-
-/-- Fuel-free modular step that may cross an external call: when the step
-from `s` satisfies the call contract and every successor it admits (including
-every contract-admitted call answer) is `s'`, convergence from `s'` gives
-convergence from `s`. -/
+/-- Fuel-free modular step that may cross an external call. `h_step` says
+that the step from `s` satisfies every continuation that holds of `s'`: the
+step meets the call contract, and its only successor (for every call answer
+the contract admits) is `s'`. Convergence from `s'` then gives convergence from
+`s`. -/
 private theorem modularWpConverges_step_to {contract : MirCallContract}
     {body : CapturedMir} {s s' : MachineState} {post : MirOutcome → Prop}
-    (h_step : evalSymNodeTreeModular contract (fun st => st = .running s') post
-      (stepMirSymTree body s))
+    (h_step : ∀ {cont : MirExecState → Prop}, cont (.running s') →
+      evalSymNodeTreeModular contract cont post (stepMirSymTree body s))
     (h_next : MirModularWpConverges contract body s' post) :
-    MirModularWpConverges contract body s post := by
-  obtain ⟨n, hn⟩ := h_next
-  exact ⟨n + 1, evalSymNodeTreeModular_mono (fun _ h => h ▸ hn) _ h_step⟩
+    MirModularWpConverges contract body s post :=
+  let ⟨n, hn⟩ := h_next
+  ⟨n + 1, h_step hn⟩
 
 /-- Machine state on entry to block `bb` after bb0's `StorageLive`s, with `_5`
 in slot `s5`. -/
@@ -58,7 +45,7 @@ private def entryState (bb in_range dest_len fo v : Nat) (s5 : LocalSlot) :
 `dest_len - r` for overflow and bb4 returns `(r, dest_len - r)` with memory
 untouched; `h_Q` discharges the caller's postcondition for that outcome. -/
 private theorem bb3_converges {Q : Value → Memory → Prop}
-    (in_range dest_len fo v r : Nat)
+    {in_range dest_len fo v r : Nat}
     (h_r : r ≤ dest_len) (h_dl : dest_len < 18446744073709551616)
     (h_Q : Q (.aggregate 0 [.scalar ⟨r, 8⟩, .scalar ⟨dest_len - r, 8⟩]) emptyMemory) :
     MirModularWpConverges
@@ -90,8 +77,7 @@ theorem verified : ModularVerificationResult Obligations.FuchsiaUsercopy.usercop
       (mid := (· = entryState 3 0 dest_len fo v (.init (.scalar ⟨0, 8⟩))))
       (mirStepsConverges_of_runCfgToBlock _ _ _ rfl 3 _ ⟨rfl, rfl⟩) ?_
     rintro _ rfl
-    exact bb3_converges 0 dest_len fo v 0 (Nat.zero_le _) h_dl
-      ⟨rfl, by rintro _ _ _ _ ⟨⟩; rfl⟩
+    exact bb3_converges (Nat.zero_le _) h_dl ⟨rfl, by rintro _ _ _ _ ⟨⟩; rfl⟩
   · -- `source_in_restricted_range = true`: bb0 jumps to bb2.
     refine MirModularWpConverges.bind (mid := (· = entryState 2 1 dest_len fo v .uninit))
       (mirStepsConverges_of_runCfgToBlock _ _ _ rfl 2 _ ⟨rfl, rfl⟩) ?_
@@ -99,11 +85,13 @@ theorem verified : ModularVerificationResult Obligations.FuchsiaUsercopy.usercop
     -- bb2: `_5 = hermetic_copy_stub(copy _2, copy _3, copy _4) -> [return: bb3]`.
     -- The call meets the stub's contract, and every answer the contract admits
     -- returns `fault_offset` with memory untouched.
-    refine modularWpConverges_step_to ⟨⟨rfl, dest_len, fo, v, h_fo, h_dl, h_v, rfl, rfl⟩, ?_⟩
-      (bb3_converges 1 dest_len fo v fo h_fo h_dl ⟨rfl, by rintro _ _ _ _ ⟨⟩; rfl⟩)
+    refine modularWpConverges_step_to
+      (s' := entryState 3 1 dest_len fo v (.init (.scalar ⟨fo, 8⟩)))
+      (fun hc => ⟨⟨rfl, dest_len, fo, v, h_fo, h_dl, h_v, rfl, rfl⟩, ?_⟩)
+      (bb3_converges h_fo h_dl ⟨rfl, by rintro _ _ _ _ ⟨⟩; rfl⟩)
     rintro _ ⟨_, _, rfl, rfl, h_ret⟩
     obtain ⟨rfl, -⟩ := h_ret dest_len fo v rfl
-    rfl
+    exact hc
 
 /-- Model witness for `hermetic_copy_stub` returning `fault_offset`. -/
 def hermeticCopyStubModel (args : List Value) (mem : Memory) : Value × Memory :=
