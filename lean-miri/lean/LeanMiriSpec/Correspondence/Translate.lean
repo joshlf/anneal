@@ -1492,8 +1492,10 @@ def derefPointeeKindHasExactLayout : RigidTy → Bool
 `localId` (`*_p`), consulting `localDecls` when available and falling back to
 `rawPtrPointeeEncodedTyId? ptrLayout.ty`. Safe references (`&T` / `&mut T`) and
 pointees without an exact layout (`derefPointeeKindHasExactLayout`) resolve to
-`none`, so the dereference fails closed instead of reading with a guessed width
-or bypassing `PointerPlaceMachine.dereference`'s eager safe-reference checks. -/
+`none`, so the dereference never reads with a guessed width or bypasses
+`PointerPlaceMachine.dereference`'s eager safe-reference checks: safe references
+go through `annealDerefSafeRefToMemPlace`, which performs those checks, and
+every other pointee fails closed. -/
 def lookupDerefPointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTable)
     (localId : Miri.MIR.LocalId) (ptrLayout : Miri.Interpreter.LocalLayout) :
     Option Miri.Interpreter.LocalLayout :=
@@ -1508,6 +1510,25 @@ def lookupDerefPointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTabl
       | _ => none
   | none =>
       (rawPtrPointeeEncodedTyId? ptrLayout.ty).map (layoutOfEncodedTyId · layouts)
+
+/-- Resolve the pointee `LocalLayout` when dereferencing a safe-reference local
+`localId` (`*_r` with `_r : &T` or `&mut T`) from its declaration, for the
+pointees whose layout `translateTy` gives exactly
+(`derefPointeeKindHasExactLayout`). The encoded `TyId` of a reference (`41`)
+records neither its pointee nor its mutability, so undeclared locals resolve to
+`none`, as do raw pointers and every other pointee. -/
+def lookupRefDerefPointeeLayout (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (localId : Miri.MIR.LocalId) : Option Miri.Interpreter.LocalLayout :=
+  match get? localDecls localId with
+  | some decl =>
+      match decl.ty.kind with
+      | .ref _ pointeeKind =>
+          if derefPointeeKindHasExactLayout pointeeKind then
+            some (translateTy { kind := pointeeKind, layoutIdx := 0 } layouts)
+          else
+            none
+      | _ => none
+  | none => none
 
 /-- Address-based misalignment check for `AnnealProv` (`offsetIsAddr = true`),
 matching `Miri.Memory.Access.offsetMisalignment` (`Access.lean:183-188`). -/
@@ -1646,9 +1667,67 @@ def annealReadImmediate (op : Miri.Interpreter.OpTy AnnealProv) :
             throw (.unsupported "whole-array immediate read not supported")
       | _ => annealReadMemoryPlace mp op.layout
 
+/-- The eager checks that `Miri.Interpreter.PointerPlaceMachine.dereference`
+performs on a safe reference (`Kind.reference`) when validity is enforced, as a
+pure function of the machine, the reference immediate `ptrImm`, and the
+pointee layout. After converting the immediate to a pointer, it checks, in this
+order, that the pointer is non-null (`scalarMayBeNull`), dereferenceable for the
+pointee's size (`checkPointerAccess`, here `Miri.Memory.checkAndDerefPtr`
+against the cached base addresses with `annealResolvePtr`), and aligned to the
+pointee's ABI alignment (`checkPointerAlign`). Each failure is undefined
+behavior, so the resulting place never caches a misalignment. -/
+def annealSafeRefDerefCheck (mach : AnnealMachine)
+    (ptrImm : Miri.Interpreter.Immediate AnnealProv)
+    (pointeeLay : Miri.Interpreter.LocalLayout) :
+    Except Miri.Interpreter.StepError (Miri.Interpreter.MemPlace AnnealProv) :=
+  match ptrImm.toScalar with
+  | .error err => .error (Miri.Interpreter.ScalarOps.immediateError err)
+  | .ok sc =>
+    match sc.toPointer annealTargetDataLayout with
+    | .error err => .error (Miri.Interpreter.ScalarOps.scalarError err)
+    | .ok ptr =>
+      if ptr.offset.bytes == 0 then
+        .error (.undefinedBehavior "dereferencing a null reference")
+      else
+        match Miri.Memory.sizeAsI64 pointeeLay.layout.size with
+        | .error _ => .error (.invalidProgram "reference pointee size overflow")
+        | .ok signedSize =>
+          match Miri.Memory.checkAndDerefPtr annealPointerArithmetic ptr signedSize
+              (.dereferenceable "pointer") (annealResolvePtr mach)
+              (annealLookupAlloc mach) with
+          | .error _ => .error (.undefinedBehavior "dereferencing a dangling reference")
+          | .ok _ =>
+            match annealOffsetMisalignment ptr.offset pointeeLay.layout.align.abi with
+            | .error err => .error (.invalidProgram (toString err))
+            | .ok (some _) => .error (.undefinedBehavior "dereferencing an unaligned reference")
+            | .ok none => .ok ⟨ptr, .none, none⟩
+
+/-- Dereference a safe-reference local `localId` (`*_r` with `_r : &T` or
+`&mut T`) as `Miri.Interpreter.PointerPlaceMachine.dereference` does for
+`Kind.reference` when validity is enforced: read the reference, then run the
+eager non-null, dereferenceability, and alignment checks of
+`annealSafeRefDerefCheck` without changing the state. A raw pointer's
+dereference (`annealDerefOperandToMemPlace`) instead performs none of these
+checks (`PointerPlaceMachine.fromImmediate`) and leaves them to the access. -/
+@[irreducible]
+def annealDerefSafeRefToMemPlace (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (localId : Miri.MIR.LocalId) (operand : Miri.Interpreter.Operand AnnealProv)
+    (ptrLayout : Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState
+      (Miri.Interpreter.MemPlace AnnealProv × Miri.Interpreter.LocalLayout) := do
+  let some pointeeLay := lookupRefDerefPointeeLayout localDecls layouts localId
+    | throw (.unsupported "dereference of local without pointee layout")
+  let ptrImm ← annealReadImmediate ⟨operand, ptrLayout⟩
+  let st ← get
+  match annealSafeRefDerefCheck st.machine ptrImm.imm pointeeLay with
+  | .ok mplace => return (mplace, pointeeLay)
+  | .error err => throw err
+
 /-- Construct a dereferenced `MemPlace` (`*_p`) from pointer local `localId`'s
 current `Operand` and `LocalLayout`, caching numeric misalignment without
-eagerly requiring the pointee allocation to be live (`PointerPlaceMachine.lean`). -/
+eagerly requiring the pointee allocation to be live (`PointerPlaceMachine.lean`).
+Safe references, whose pointee layout `lookupDerefPointeeLayout` never resolves,
+are dereferenced by `annealDerefSafeRefToMemPlace` with eager checks. -/
 @[irreducible]
 def annealDerefOperandToMemPlace (localDecls : List LocalDecl) (layouts : LayoutTable)
     (localId : Miri.MIR.LocalId) (operand : Miri.Interpreter.Operand AnnealProv)
@@ -1656,7 +1735,7 @@ def annealDerefOperandToMemPlace (localDecls : List LocalDecl) (layouts : Layout
     Miri.Interpreter.RvalueM AnnealStepState
       (Miri.Interpreter.MemPlace AnnealProv × Miri.Interpreter.LocalLayout) := do
   let some pointeeLay := lookupDerefPointeeLayout localDecls layouts localId ptrLayout
-    | throw (.unsupported "dereference of local without pointee layout")
+    | annealDerefSafeRefToMemPlace localDecls layouts localId operand ptrLayout
   let ptrImm ← annealReadImmediate ⟨operand, ptrLayout⟩
   let sc ←
     match ptrImm.imm.toScalar with
@@ -1697,7 +1776,9 @@ in the top frame of `AnnealStepState`.
    `false`).
 4. A single `Deref` projection (`*_p`) constructs an `.indirect` memory operand
    with cached misalignment (`PointerPlaceMachine.lean`), deferring bounds,
-   liveness, alignment, and initialization checks to `annealReadImmediate`.
+   liveness, alignment, and initialization checks to `annealReadImmediate`. A
+   safe reference (`*_r`) checks non-nullness, bounds, liveness, and alignment
+   eagerly instead (`annealDerefSafeRefToMemPlace`).
 5. A single `Field` projection reads one scalar of a local that holds a scalar
    pair, such as a component of a checked-arithmetic result.
 6. On a memory-backed (`.indirect`) local whose whole allocation passes

@@ -25,6 +25,9 @@ import LeanMiriSpec.Correspondence.WitLM2_1
 import LeanMiriSpec.Correspondence.PtrLM3_1
 import LeanMiriSpec.Correspondence.SimLM3_1
 import LeanMiriSpec.Correspondence.WitLM3_1
+import LeanMiriSpec.Correspondence.RefLM3_2
+import LeanMiriSpec.Correspondence.SimLM3_2
+import LeanMiriSpec.Correspondence.WitLM3_2
 import LeanMiriSpec.Audit
 
 /-!
@@ -94,6 +97,18 @@ import LeanMiriSpec.Audit
   `Unreachable`, `SwitchInt`, and `Assert`).
 * `LeanMiriSpec.Correspondence.WitLM3_1`: standalone and end-to-end real-step
   (`Miri.Interpreter.Step.step`) witnesses for `LM-3.1`.
+* `LeanMiriSpec.Correspondence.RefLM3_2`: reference-aware relations
+  (`LocalRelLM3_2`, `StateRelLM3_2`), the vendored validity visitor instantiated
+  for Anneal (`annealValidityHooks`), the eager safe-reference dereference checks
+  (`annealSafeRefDerefCheck`), and the validity correspondence theorems
+  `validityVisitor_scalar_bool_simulation` and
+  `validityVisitor_ref_dereferenceable_simulation` (`LM-3.2`).
+* `LeanMiriSpec.Correspondence.SimLM3_2`: `LM-3.2` real-step correspondence for
+  `Rvalue.Ref` (`&_t`, `&mut _t`, with `forceAllocation`,
+  `evalRvalue_ref_simulation`), reborrowing through a raw pointer
+  (`evalRvalue_reborrow_simulation`), and the dangling-reborrow divergence.
+* `LeanMiriSpec.Correspondence.WitLM3_2`: `LM-3.2` witnesses, including end-to-end
+  runs of `ValidityVisitor.validatePlace`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
