@@ -6358,6 +6358,34 @@ theorem progInFragment_implies_progInFragmentWithIntrinsics
   exact ⟨⟨⟨hnodup, fun b hb => bodyInProgFragment_implies_withIntrinsics (hall b hb)⟩,
     hstack⟩, by rwa [htr_eq]⟩
 
+/-- Multi-function Tree Borrows single-expose-site discipline: every function
+body in `entry :: callees` satisfies `singleExposeSiteOk`, ensuring no single
+live stack frame executes `PointerExposeProvenance` more than once on the same
+local allocation (e.g. before and after a scalar `Call` in the same caller
+frame, after `ptrTermStep` forces a fresh borrow), while allowing both caller
+and callee frames to each execute `PointerExposeProvenance` on their own
+frame-local allocations (since a callee's stack allocation is deallocated on
+`Return`). -/
+def progSingleExposeSiteOk (entry : MirAst.CapturedMir)
+    (callees : List MirAst.CapturedMir) : Bool :=
+  (entry :: callees).all singleExposeSiteOk
+
+theorem progSingleExposeSiteOk_nil (body : MirAst.CapturedMir) :
+    progSingleExposeSiteOk body [] = singleExposeSiteOk body := by
+  simp [progSingleExposeSiteOk]
+
+theorem progInFragment_implies_progSingleExposeSiteOk
+    {entry : MirAst.CapturedMir} {callees : List MirAst.CapturedMir}
+    (h : progInFragment entry callees = true) :
+    progSingleExposeSiteOk entry callees = true := by
+  simp only [progInFragment, progSingleExposeSiteOk, Bool.and_eq_true, List.all_eq_true] at h ⊢
+  obtain ⟨⟨⟨_, hall⟩, _⟩, _⟩ := h
+  intro b hb
+  have hbf := hall b hb
+  simp only [bodyInProgFragment, Bool.and_eq_true] at hbf
+  obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp hbf.2
+  exact singleExposeSiteOk_of_not_hasProvCast (translateFnInProg_not_provCast hf).2
+
 /-- Per-statement syntactic well-formedness for cross-frame pointer/reference
 translation (`progCrossFrameTranslatable`): admits `statementOkWithIntrinsics`
 plus `Retag([fn entry], _i)` strictly on reference parameter locals (`isRefTy`,

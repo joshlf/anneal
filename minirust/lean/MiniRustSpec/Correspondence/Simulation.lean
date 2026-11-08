@@ -11119,4 +11119,239 @@ theorem inFragment_implies_progInFragmentWithIntrinsics
   inFragmentWithIntrinsics_implies_progInFragmentWithIntrinsics
     (inFragment_implies_inFragmentWithIntrinsics h)
 
+theorem exposeSourceCompatible_iff {dstMutbl srcMutbl : MirAst.Mutability}
+    {dstIt srcIt : Gen.IntType} :
+    exposeSourceCompatible dstMutbl dstIt (some (srcMutbl, srcIt)) = true ↔
+      srcIt = dstIt ∧ (srcMutbl = .mut ∨ dstMutbl = .not) := by
+  simp [exposeSourceCompatible, Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq]
+
+/-- Preservation of `BorrowsOk.ptr_slots` and reconstructed-pointer usability
+across a 2-step `PointerExposeProvenance` (`_i = _p as usize`) +
+`PointerWithExposedProvenance` (`_d = _i as *const/*mut T`) round-trip under
+`exposeSourceCompatible`: every pointer slot in `view2` (including the newly
+reconstructed pointer local `d`) resolves in `s.memory.borrows` to an
+address-taken target local with valid `ptrTargetSpec` and mutability-compatible
+permission, and when `_p` is non-`.disabled` in `ptrEnvBefore`, the reconstructed
+pointer `_d` is non-`.disabled` (and `.active ∨ .reserved` when `dstMutbl = .mut`). -/
+theorem BorrowsOk.ptr_slots_after_expose_withExposed {body : CapturedMir}
+    {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    {i p d addrBits : Nat} { dp dd : LocalDecl}
+    {srcMutbl dstMutbl : MirAst.Mutability} {srcIt dstIt : Gen.IntType}
+    {pv : ProvenancePtr}
+    (hb : BorrowsOk body ctx view s lm)
+    (hlen : view.length = body.localDecls.length)
+    (hdp : body.localDecls[p]? = some dp)
+    (hp_ty : ptrPointeeOf dp.ty = some (srcMutbl, srcIt))
+    (hview_p : view[p]? = some (.init (.ptr pv 8)))
+    (hdd : body.localDecls[d]? = some dd)
+    (hd_ty : rawPtrPointeeOf dd.ty = some (dstMutbl, dstIt))
+    (hcompat : exposeSourceCompatible dstMutbl dstIt (some (srcMutbl, srcIt)) = true) :
+    let view1 := view.set i (.init (.scalar ⟨addrBits, 8⟩))
+    let view2 := view1.set d (.init (.ptr pv 8))
+    view2[d]? = some (.init (.ptr pv 8)) ∧
+    srcIt = dstIt ∧
+    (∀ (q : Nat) (dq : LocalDecl) (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType)
+        (ptrVal : ProvenancePtr),
+      body.localDecls[q]? = some dq →
+      ptrPointeeOf dq.ty = some (mutbl, pointeeIt) →
+      view2[q]? = some (.init (.ptr ptrVal 8)) →
+      ∃ (entry : BorrowEntry) (relOff : Nat),
+        ptrVal.offsetBytes = 0 ∧
+        lookupBorrow s.memory.borrows ptrVal.tag = some entry ∧
+        (mutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved ∨ entry.perm = .disabled) ∧
+        entry.targetLocal ∈ bodyAddrTakenLocals body ∧
+        ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+          some (pointeeIt, relOff)) ∧
+    ((ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx).getD p .disabled ≠ .disabled →
+      ∀ (entry : BorrowEntry),
+        lookupBorrow s.memory.borrows pv.tag = some entry →
+        entry.perm ≠ .disabled ∧
+          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+  obtain ⟨hit_eq, hmut_compat⟩ := exposeSourceCompatible_iff.mp hcompat
+  have hd_decl : d < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdd).1
+  have hd_v1 : d < (view.set i (.init (.scalar ⟨addrBits, 8⟩))).length := by
+    simp [hlen, hd_decl]
+  have hview2_d : ((view.set i (.init (.scalar ⟨addrBits, 8⟩))).set d (.init (.ptr pv 8)))[d]? =
+      some (.init (.ptr pv 8)) :=
+    List.getElem?_set_self hd_v1
+  refine ⟨hview2_d, hit_eq, ?_, ?_⟩
+  · intro q dq mutbl pointeeIt ptrVal hdq hpt hv
+    by_cases hdq_eq : d = q
+    · subst hdq_eq
+      rw [hview2_d] at hv
+      injection hv with hinit
+      injection hinit with hval
+      injection hval with hpv_eq _
+      subst hpv_eq
+      rw [hdd] at hdq
+      injection hdq with hdd_eq
+      subst hdd_eq
+      have hpt_d : ptrPointeeOf dd.ty = some (dstMutbl, dstIt) :=
+        (ptrPointeeOf_of_rawPtrPointeeOf hd_ty).1
+      rw [hpt_d] at hpt
+      injection hpt with hpair
+      obtain ⟨rfl, rfl⟩ := Prod.mk.inj hpair
+      obtain ⟨entry, relOff, hoff0, hlk, hact, hspec⟩ :=
+        hb.ptr_slots p dp srcMutbl srcIt pv hdp hp_ty hview_p
+      obtain ⟨_, _, _, _, hk_addr, _⟩ := hb.entries_ok entry (lookupBorrow_mem_and_tag hlk).1
+      refine ⟨entry, relOff, hoff0, hlk, fun hdm => ?_, hk_addr, hit_eq ▸ hspec⟩
+      rcases hmut_compat with hsm | hdn
+      · exact hact hsm
+      · rw [hdn] at hdm; cases hdm
+    · rw [List.getElem?_set_ne hdq_eq] at hv
+      by_cases hiq : i = q
+      · subst hiq
+        by_cases hlt : i < view.length
+        · rw [List.getElem?_set_self hlt] at hv
+          cases hv
+        · rw [List.getElem?_eq_none (by simp; omega)] at hv
+          cases hv
+      · rw [List.getElem?_set_ne hiq] at hv
+        obtain ⟨entry, relOff, hoff0, hlk, hact, hspec⟩ :=
+          hb.ptr_slots q dq mutbl pointeeIt ptrVal hdq hpt hv
+        obtain ⟨_, _, _, _, hk_addr, _⟩ := hb.entries_ok entry (lookupBorrow_mem_and_tag hlk).1
+        exact ⟨entry, relOff, hoff0, hlk, hact, hk_addr, hspec⟩
+  · intro hndis entry hlk
+    obtain ⟨hperm_nd, hmut_act⟩ := hb.usable_of_not_disabled hndis hdp hp_ty hview_p hlk
+    refine ⟨hperm_nd, fun hdm => ?_⟩
+    rcases hmut_compat with hsm | hdn
+    · exact hmut_act hsm
+    · rw [hdn] at hdm; cases hdm
+
+/-- Strengthened 3-segment simulation (`Assume` -> `PointerExposeProvenance` ->
+`PointerWithExposedProvenance`) deriving `hbor_i` and `hbor_d` from `BorrowsOk`
+and `i, d ∉ bodyAddrTakenLocals body`, and establishing post-state `view2[d]?`,
+`s2.memory = s.memory`, `BorrowsOk.ptr_slots` across all pointer locals in
+`view2` (including the reconstructed pointer local `d`), and post-state
+dereference usability of `d` in `s2.memory.borrows`. -/
+theorem ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk
+    {body : CapturedMir} {f : Gen.Function}
+    {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    {m : Mach} {exposedTags : List Nat} {curSeg segStmt nb1 nb2 nb3 : Nat}
+    {bb : BasicBlockData} {stA : Statement} {opA : Operand} {opA' : Gen.ValueExpr}
+    {i p d : Nat} {di dp dd : LocalDecl}
+    {srcMutbl dstMutbl : MirAst.Mutability} {srcIt dstIt : Gen.IntType}
+    {op1 op2 : MirAst.Operand} {targetTy1 targetTy2 : MirAst.Ty}
+    {span1 span2 : String}
+    {pv : ProvenancePtr}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hframe : FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s.memory.borrows)
+      view lm m curSeg segStmt)
+    (hb : BorrowsOk body ctx view s lm)
+    (hat : AddrTakenTargetsOk body ctx view lm)
+    (hstale : StaleOk body s.frame.locals view s.frame.blockIdx s.frame.stmtIdx)
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hstA : bb.statements[s.frame.stmtIdx]? = some stA)
+    (hkA : stA.kind = .intrinsic (.assume opA))
+    (hreadsA : readsOk (movedBefore body s.frame.blockIdx s.frame.stmtIdx) [opA] = true)
+    (hokBA : operandOkB body.layouts body.localDecls (copyOp opA) = true)
+    (hopA : translateOperand body.localDecls opA = some opA')
+    (hbits1 : opBits view (copyOp opA) = some 1)
+    (hop1 : copyOp op1 = .copy ⟨p, []⟩)
+    (hop2 : copyOp op2 = .copy ⟨i, []⟩)
+    (hdi : body.localDecls[i]? = some di)
+    (hit_i : intTypeOf di.ty = some usizeIt)
+    (hi_addr : i ∉ bodyAddrTakenLocals body)
+    (hprot : s.memory.activeProtectors = [])
+    (hview_i : view[i]? ≠ some .dead)
+    (hdp : body.localDecls[p]? = some dp)
+    (hp_ty : ptrPointeeOf dp.ty = some (srcMutbl, srcIt))
+    (hp : (opPost s.frame.locals opA)[p]? = some (.init (.ptr pv 8)))
+    (hview_p : view[p]? = some (.init (.ptr pv 8)))
+    (hdd : body.localDecls[d]? = some dd)
+    (hd_ty : rawPtrPointeeOf dd.ty = some (dstMutbl, dstIt))
+    (hd_addr : d ∉ bodyAddrTakenLocals body)
+    (hcompat : exposeSourceCompatible dstMutbl dstIt (some (srcMutbl, srcIt)) = true)
+    (hnd_d : ((opPost (opPost s.frame.locals opA) op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))[d]? ≠ some .dead)
+    (hview_d : view[d]? ≠ some .dead)
+    (hnoadj : ∀ (entry : BorrowEntry) (relOff : Nat),
+      lookupBorrow s.memory.borrows pv.tag = some entry →
+      ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+        some (srcIt, relOff) →
+      ∀ q ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed
+          (ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)),
+        q = targetProv ctx entry.targetLocal) :
+    let s0 := advanceStmt s (opPost s.frame.locals opA)
+    let locals1 := (opPost s0.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+    ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 : Mach),
+      let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
+      let tProv : Prov := targetProv ctx entry.targetLocal
+      let view1 := view.set i (.init (.scalar ⟨tAddr.toNat, 8⟩))
+      let s1 := advanceStmt s0 locals1 s0.memory
+      let locals2 := (opPost locals1 op2).set d (.init (.ptr pv 8))
+      let view2 := view1.set d (.init (.ptr pv 8))
+      let s2 := advanceStmt s1 locals2 s1.memory
+      lookupBorrow s.memory.borrows pv.tag = some entry ∧
+      ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+        some (dstIt, relOff) ∧
+      srcIt = dstIt ∧
+      pv.offsetBytes = 0 ∧
+      entry.targetLocal ∈ bodyAddrTakenLocals body ∧
+      evalStmt s stA body.localDecls body.layouts = MirStepNode.step s0 ∧
+      Interp.evalTerminator m
+        (.Intrinsic .Assume [opA'] unitPlace (some (bbName nb1))) = .ok mA ∧
+      evalStmt s0 ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance op1 targetTy1), span1⟩
+        body.localDecls body.layouts = .tau (.running s1) ∧
+      Interp.evalTerminator mA
+        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))]
+          (.Local (localName i)) (some (bbName nb2))) = .ok m4 ∧
+      evalStmt s1 ⟨.assign ⟨d, []⟩ (.cast .pointerWithExposedProvenance op2 targetTy2), span2⟩
+        body.localDecls body.layouts = .tau (.running s2) ∧
+      s2.frame.locals[d]? = some (.init (.ptr pv 8)) ∧
+      view2[d]? = some (.init (.ptr pv 8)) ∧
+      s2.memory = s.memory ∧
+      evalValue m4 (.Load (.Local (localName i))) = .ok ((.Int tAddr, .Int usizeIt), m6) ∧
+      IntPtrCast.int2ptr m6 tAddr = .ok { addr := tAddr, provenance := some tProv } ∧
+      Interp.evalTerminator m4
+        (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName i))]
+          (.Local (localName d)) (some (bbName nb3))) = .ok m8 ∧
+      AllocShapeEq m.mem.memory.allocations m8.mem.memory.allocations ∧
+      ProvenanceRel body ctx s2 m8 (pv.tag :: exposedTags) ∧
+      FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm m8 nb3 0 ∧
+      AddrTakenTargetsOk body ctx view2 lm ∧
+      (∀ (q : Nat) (dq : LocalDecl) (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType)
+          (ptrVal : ProvenancePtr),
+        body.localDecls[q]? = some dq →
+        ptrPointeeOf dq.ty = some (mutbl, pointeeIt) →
+        view2[q]? = some (.init (.ptr ptrVal 8)) →
+        ∃ (entry' : BorrowEntry) (relOff' : Nat),
+          ptrVal.offsetBytes = 0 ∧
+          lookupBorrow s2.memory.borrows ptrVal.tag = some entry' ∧
+          (mutbl = .mut → entry'.perm = .active ∨ entry'.perm = .reserved ∨ entry'.perm = .disabled) ∧
+          entry'.targetLocal ∈ bodyAddrTakenLocals body ∧
+          ptrTargetSpec body.layouts body.localDecls ⟨entry'.targetLocal, entry'.targetProjection⟩ =
+            some (pointeeIt, relOff')) ∧
+      ((ptrEnvBefore body s.frame.blockIdx (s.frame.stmtIdx + 1)).getD p .disabled ≠ .disabled →
+        entry.perm ≠ .disabled ∧
+          (dstMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved)) := by
+  have hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i :=
+    hb.target_ne_of_not_addrTaken hi_addr
+  have hbor_d : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ d :=
+    hb.target_ne_of_not_addrTaken hd_addr
+  obtain ⟨entry, relOff, mA, m4, m6, m8, hlk, hsp, hA0, hmA, hA1, hM1, hA2, hsd,
+      harg2, hint, hM2, hshape, hprov2, hframe2, hat2⟩ :=
+    hprov.assume_then_expose_then_withExposed_from_frameOk
+      (nb1 := nb1) (nb2 := nb2) (nb3 := nb3) (targetTy1 := targetTy1) (targetTy2 := targetTy2)
+      (span1 := span1) (span2 := span2)
+      hframe hb hat hstale hbb hstA hkA hreadsA hokBA hopA hbits1
+      hop1 hop2 hdi hit_i hbor_i hprot hview_i hdp hp_ty hp hview_p
+      hdd hd_ty hbor_d hnd_d hview_d hnoadj
+  let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
+  have hb0 : BorrowsOk body ctx view (advanceStmt s (opPost s.frame.locals opA)) lm :=
+    hb.advance_keep hbb hstA (by simp [ptrStmtStep, hkA])
+  obtain ⟨hview2_d, hit_eq, hslots2, husable2⟩ :=
+    hb0.ptr_slots_after_expose_withExposed (i := i) (addrBits := tAddr.toNat)
+      hframe.locs.nlocals hdp hp_ty hview_p hdd hd_ty hcompat
+  obtain ⟨entry0, _, hoff0, hlk0, _, _⟩ :=
+    hb.ptr_slots p dp srcMutbl srcIt pv hdp hp_ty hview_p
+  rw [hlk] at hlk0
+  injection hlk0 with hent_eq
+  subst hent_eq
+  obtain ⟨_, _, _, _, hk_addr, _⟩ := hb.entries_ok entry (lookupBorrow_mem_and_tag hlk).1
+  exact ⟨entry, relOff, mA, m4, m6, m8, hlk, hit_eq ▸ hsp, hit_eq, hoff0, hk_addr,
+    hA0, hmA, hA1, hM1, hA2, hsd, hview2_d, rfl, harg2, hint, hM2, hshape, hprov2,
+    hframe2, hat2, hslots2, fun hndis => husable2 hndis entry hlk⟩
+
 end MiniRustSpec.Correspondence

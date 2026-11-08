@@ -4516,6 +4516,14 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   callerBorrowAcrossScalarCall_divergence
   callerBorrowExposeAndScalarCall_anneal_92
   callerBorrowExposeAndScalarCall_three_way
+  progSingleExposeSiteOk_nil
+  progInFragment_implies_progSingleExposeSiteOk
+  exposeSourceCompatible_iff
+  BorrowsOk.ptr_slots_after_expose_withExposed
+  ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk
+  callerBorrowExposeAndScalarCall_progSingleExposeSiteOk
+  callerPrePostCallExpose_anneal_42
+  callerPrePostCallExpose_three_way_divergence
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -4875,6 +4883,14 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   callerBorrowAcrossScalarCall_divergence
   callerBorrowExposeAndScalarCall_anneal_92
   callerBorrowExposeAndScalarCall_three_way
+  progSingleExposeSiteOk_nil
+  progInFragment_implies_progSingleExposeSiteOk
+  exposeSourceCompatible_iff
+  BorrowsOk.ptr_slots_after_expose_withExposed
+  ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk
+  callerBorrowExposeAndScalarCall_progSingleExposeSiteOk
+  callerPrePostCallExpose_anneal_42
+  callerPrePostCallExpose_three_way_divergence
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[WITNESS-AUDIT]"

@@ -1529,8 +1529,14 @@ These are deliberate and are the first things to lift:
   `m4.intptrcast = m.intptrcast`, and `ProvenanceRel`) and composes it in Pass A3
   into `ProvenanceRel.assume_then_expose_then_withExposed_from_frameOk` across
   three MiniRust segments (`Assume -> PointerExposeProvenance ->
-  PointerWithExposedProvenance`).
-  Passes B3 and A3 also unify multi-function translation (`translateFnInProgWithIntrinsics`
+  PointerWithExposedProvenance`). Pass B4 strengthens this composition to
+  `ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk` (via
+  `exposeSourceCompatible_iff` and `BorrowsOk.ptr_slots_after_expose_withExposed`),
+  deriving `hbor_i` and `hbor_d` directly from `BorrowsOk` and establishing that
+  the reconstructed pointer destination `_d` preserves `BorrowsOk.ptr_slots` on
+  `view2` together with non-`.disabled` (and `.active`/`.reserved` for `.mut`)
+  dereference usability in `s2.memory.borrows`.
+  Passes B3, A3, and B4 also unify multi-function translation (`translateFnInProgWithIntrinsics`
   and `translateProgWithIntrinsics`, agreeing with `translateProg` on
   provenance-cast-free programs via `translateProgWithIntrinsics_eq_of_no_provCast`
   and `translateProgWithIntrinsics_eq_of_progInFragment`) while separating two
@@ -1552,7 +1558,20 @@ These are deliberate and are the first things to lift:
      `invalidateConflictingBorrows` on the shared `s.memory.borrows` table for
      every callee root assignment (`callerBorrowAcrossScalarCall_divergence`,
      where both bodies individually satisfy `ptrAliasingOk = true` yet Anneal
-     faults after `Return` while `Mach` and `MachTB` return `42`).
+     faults after `Return` while `Mach` and `MachTB` return `42`). Moreover,
+     because `ptrTermStep` forces a caller that mutates `_1` through a borrow both
+     before and after a scalar `Call` to create a fresh borrow after `Return`,
+     exposing both the pre-call borrow and the post-call fresh borrow in the same
+     caller (`callerPrePostCallExpose_three_way_divergence`) satisfies
+     `progInFragmentWithIntrinsics = true` and returns `42` on Anneal and `Mach`
+     (`BasicMemory`), yet halts with `Stop.unsupported` on `MachTB`
+     (`TreeBorrowsMemory`) because the caller's live stack allocation accumulates
+     two distinct exposed Tree Borrows tags; `progSingleExposeSiteOk`
+     (`progSingleExposeSiteOk_nil`, `progInFragment_implies_progSingleExposeSiteOk`,
+     and `callerBorrowExposeAndScalarCall_progSingleExposeSiteOk`) rules out
+     multi-expose caller bodies while permitting one acyclic exposure per
+     function across calls (since callee stack allocations are deallocated on
+     `Return`).
   2. **`progCrossFrameTranslatable`** (`bodyCrossFrameTranslatable` and
      `progStmtOkWithIntrinsics`, restricting `.retag .fnEntry` to `isRefTy`
      reference parameters as witnessed by `callerRawPtrRetagFnEntry_B3_divergence`):

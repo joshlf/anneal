@@ -2242,4 +2242,151 @@ theorem callerBorrowExposeAndScalarCall_three_way :
    callerBorrowExposeAndScalarCall_anneal_92.2,
    by decide +kernel, by decide +kernel⟩
 
+/-! ## 12. Pass A3 critique & multi-function Tree Borrows exposure discipline (MR-4.3 Pass B4)
+
+Pass A3 unified `progInFragmentWithIntrinsics` by checking `provCastFlowOk` and
+`ptrAliasingProgOk (provCastAliasView body)` on every function, where
+`ptrTermStep` disables all pre-call caller borrows across a returning scalar
+`Call`. Because `ptrTermStep` forces a caller that wants to mutate a local `_1`
+through a borrow both before and after a scalar `Call` to create a **fresh**
+borrow (`&mut _1` + `Retag`) after `Return`, any caller that exposes its
+pre-call borrow via `PointerExposeProvenance` and then exposes its post-call
+fresh borrow via `PointerExposeProvenance` + `PointerWithExposedProvenance`
+satisfies `progInFragmentWithIntrinsics = true` (`provCastFlowOk = true` and
+`ptrAliasingProgOk = true`) and succeeds on both Anneal and MiniRust
+`BasicMemory` (`Mach`), yet halts with `Stop.unsupported` on MiniRust
+`TreeBorrowsMemory` (`MachTB`) because the caller's stack allocation `AllocId(1)`
+remains live across the call and accumulates two distinct exposed Tree Borrows
+tags `(AllocId(1), path₁)` and `(AllocId(1), path₂)`!
+
+By contrast, when each function in the program satisfies `singleExposeSiteOk`
+(`progSingleExposeSiteOk entry callees = true`, as in
+`callerBorrowExposeAndScalarCallMir` + `calleeBorrowAssumeAddMir` where the first
+exposure is inside the callee and the second is in the caller), the callee's
+stack allocation is deallocated on `Return` (`a.live = false`), so `MachTB`'s
+live-allocation candidate filter `tbmExposedInBounds` sees only the caller's own
+exposed tag and succeeds (`tbRetU32 92`). -/
+
+/-- `callerBorrowExposeAndScalarCallMir` and `calleeBorrowAssumeAddMir` satisfy
+the program-level single-expose-site discipline `progSingleExposeSiteOk = true`
+(one acyclic exposure site in the callee, whose stack allocation is deallocated
+on `Return`, and one acyclic exposure site in the caller). -/
+theorem callerBorrowExposeAndScalarCall_progSingleExposeSiteOk :
+    progSingleExposeSiteOk callerBorrowExposeAndScalarCallMir [calleeBorrowAssumeAddMir] = true := by
+  decide +kernel
+
+/-- Multi-function caller `fn caller_pre_post_call_expose(mut x: u32) -> u32`:
+before calling `scalar_assign_local1(1) -> _6`, borrows `_2 = &mut _1`, retags
+`_2`, takes `_3 = &raw mut (*_2)`, round-trips through `PointerExposeProvenance`
+(`_4`) and `PointerWithExposedProvenance` (`_5`), and writes `*_5 = 10`.
+Because `ptrTermStep` disables pre-call borrows across the returning `Call`, the
+continuation block `bb1` creates a fresh borrow `_7 = &mut _1`, retags `_7`,
+takes `_8 = &raw mut (*_7)`, round-trips through `PointerExposeProvenance`
+(`_9`) and `PointerWithExposedProvenance` (`_10`), writes `*_10 = _6 + 5` (`42`),
+and returns `_1`. -/
+def callerPrePostCallExposeMir : CapturedMir where
+  defPath := "witness::caller_pre_post_call_expose"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, refMutU32Decl, ptrMutU32Decl, usizeDecl, ptrMutU32Decl,
+    u32Decl, refMutU32Decl, ptrMutU32Decl, usizeDecl, ptrMutU32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.storageLive 4),
+        mkStmt (.storageLive 5),
+        mkStmt (.storageLive 6),
+        mkStmt (.assign (local_ 2) (.ref (.mut false) (local_ 1))),
+        mkStmt (.retag .default (local_ 2)),
+        mkStmt (.assign (local_ 3) (.rawPtr .mut (derefPlace 2))),
+        mkStmt (.assign (local_ 4) (.cast .pointerExposeProvenance (.copy (local_ 3)) usizeTy)),
+        mkStmt (.assign (local_ 5)
+          (.cast .pointerWithExposedProvenance (.copy (local_ 4)) ptrMutU32Ty)),
+        mkStmt (.assign (derefPlace 5) (.use (constU32 10)))],
+      terminator := mkTerm (.call (fnDefOp "witness::scalar_assign_local1")
+        [constU32 1] (local_ 6) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.storageLive 7),
+        mkStmt (.storageLive 8),
+        mkStmt (.storageLive 9),
+        mkStmt (.storageLive 10),
+        mkStmt (.assign (local_ 7) (.ref (.mut false) (local_ 1))),
+        mkStmt (.retag .default (local_ 7)),
+        mkStmt (.assign (local_ 8) (.rawPtr .mut (derefPlace 7))),
+        mkStmt (.assign (local_ 9) (.cast .pointerExposeProvenance (.copy (local_ 8)) usizeTy)),
+        mkStmt (.assign (local_ 10)
+          (.cast .pointerWithExposedProvenance (.copy (local_ 9)) ptrMutU32Ty)),
+        mkStmt (.assign (derefPlace 10) (.binaryOp .add (.copy (local_ 6)) (constU32 5))),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))),
+        mkStmt (.storageDead 10),
+        mkStmt (.storageDead 9),
+        mkStmt (.storageDead 8),
+        mkStmt (.storageDead 7),
+        mkStmt (.storageDead 6),
+        mkStmt (.storageDead 5),
+        mkStmt (.storageDead 4),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def callerPrePostCallExposeProg : Gen.Program :=
+  (translateProgWithIntrinsics callerPrePostCallExposeMir [calleeScalarAssignLocal1Mir]).getD
+    callRefMutProtectedProg
+
+def callerPrePostCallExposeMInit : Mach :=
+  match callerPrePostCallExposeProg.functions.entries[0]? with
+  | some (_, callerFn) =>
+    multiMachineWithCtx ctxCallRefMut1 callerPrePostCallExposeProg 2
+      callerPrePostCallExposeMir callerFn [.uninit, .init (.scalar ⟨5, 4⟩)] callerFn.start
+  | none => callRefMutProtectedMInit
+
+def callerPrePostCallExposeTBInit : MachTB :=
+  liftMachToTB callerPrePostCallExposeMInit
+
+theorem callerPrePostCallExpose_anneal_42 :
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees callerPrePostCallExposeMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir])
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerPrePostCallExposeMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir]) :=
+  runsToScalar_sound (fuel := 60) (by decide)
+
+/-- Pass B4 multi-function Tree Borrows exposure divergence:
+`callerPrePostCallExposeMir` + `calleeScalarAssignLocal1Mir` is accepted by
+`progInFragmentWithIntrinsics` (`true`) but rejected by
+`progSingleExposeSiteOk` (`false`); Anneal and MiniRust `Mach` (`BasicMemory`)
+both succeed and return `42` (`MirNoUBTree`), whereas MiniRust `MachTB`
+(`TreeBorrowsMemory`) halts at the post-call `PointerWithExposedProvenance`
+with `Stop.unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)"`
+because the pre-call and post-call `Retag`s expose two distinct tags on the
+same live caller stack allocation `AllocId(1)`. -/
+theorem callerPrePostCallExpose_three_way_divergence :
+    progInFragmentWithIntrinsics callerPrePostCallExposeMir [calleeScalarAssignLocal1Mir] = true ∧
+    progSingleExposeSiteOk callerPrePostCallExposeMir [calleeScalarAssignLocal1Mir] = false ∧
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees callerPrePostCallExposeMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir])
+      tr (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerPrePostCallExposeMir [.scalar ⟨5, 4⟩]
+        [calleeScalarAssignLocal1Mir]) ∧
+    (Interp.steps 38 callerPrePostCallExposeMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    stopStepsTB 38 callerPrePostCallExposeTBInit =
+      some (.unsupported
+        "int2ptr: several exposed allocations meet at the address (angelic choice)") :=
+  ⟨by decide +kernel, by decide +kernel,
+   callerPrePostCallExpose_anneal_42.1,
+   callerPrePostCallExpose_anneal_42.2,
+   by decide +kernel, by decide +kernel⟩
+
 end MiniRustSpec.Correspondence.ProvenanceWitness
