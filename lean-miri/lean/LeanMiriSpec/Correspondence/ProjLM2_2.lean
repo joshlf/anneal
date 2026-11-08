@@ -2401,7 +2401,7 @@ theorem toMemPlaceRel {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
     (by rw [ptr_addr_eq]; dsimp [Miri.ABI.Size.ZERO]; rw [UInt64.add_zero])
     mut_alloc aligned_ptr
     (by rw [byteSize_eq]; dsimp [Miri.ABI.Size.ZERO]; omega)
-    ?_ (fun v hv => by cases hv) (fun sc hsc => by cases hsc) (fun ek c elems hkind hopt => by cases hopt)
+    ?_ (fun _ hv => nomatch hv) (fun _ hsc => nomatch hsc) (fun _ _ _ _ hopt => nomatch hopt)
   intro _ _
   rw [mask_uninit]
   have hlt_u64 := (translateTy ty layouts).layout.size.bytes.toNat_lt
@@ -3077,8 +3077,7 @@ theorem of_updateAlloc_ne {env : StructTypeEnv} {mach : AnnealMachine}
             rw [List.getElem_set_ne (Ne.symm hju)]; exact hget_j
           rw [← hget_set]
           exact List.getElem_mem hj_set
-        exact .mk allocId tag baseAddr relOffset la hprov hmis hmeta hmem' hbase hovf hptr
-          hmut halign hbnd huninit hval hsc harr
+        exact .mk allocId tag baseAddr relOffset la hprov hmis hmeta hmem' hbase hovf hptr hmut halign hbnd huninit hval hsc harr
   | structDead f p c henv hc => exact .structDead f p c henv hc
   | structUninitImm f p c henv hc => exact .structUninitImm f p c henv hc
   | structUninitInd f p mp c henv hc hmp =>
