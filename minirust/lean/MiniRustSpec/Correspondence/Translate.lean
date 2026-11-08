@@ -6386,6 +6386,12 @@ theorem progInFragment_implies_progSingleExposeSiteOk
   obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp hbf.2
   exact singleExposeSiteOk_of_not_hasProvCast (translateFnInProg_not_provCast hf).2
 
+theorem inFragment_implies_progSingleExposeSiteOk {body : MirAst.CapturedMir}
+    (h : inFragment body = true) :
+    progSingleExposeSiteOk body [] = true := by
+  rw [progSingleExposeSiteOk_nil]
+  exact singleExposeSiteOk_of_not_hasProvCast (inFragment_not_hasProvCast h)
+
 /-- Per-statement syntactic well-formedness for cross-frame pointer/reference
 translation (`progCrossFrameTranslatable`): admits `statementOkWithIntrinsics`
 plus `Retag([fn entry], _i)` strictly on reference parameter locals (`isRefTy`,

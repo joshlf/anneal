@@ -2389,4 +2389,128 @@ theorem callerPrePostCallExpose_three_way_divergence :
    callerPrePostCallExpose_anneal_42.2,
    by decide +kernel, by decide +kernel⟩
 
+/-! ## 13. Cyclic loop multi-call callee stack-reuse 3-way witness (MR-4.3 Pass A4)
+
+Whereas §12 showed that exposing twice in the **same** live caller frame
+(`callerPrePostCallExposeMir`, rejected by `progSingleExposeSiteOk`) causes
+`MachTB` to halt with `Stop.unsupported` due to two live exposed tags on
+`AllocId(1)`, `progSingleExposeSiteOk` admits a cyclic `SwitchInt` loop caller
+(`isAcyclicCfg = false`, `hasProvCast = false`) that invokes an acyclic exposing
+callee (`calleeBorrowAssumeAddMir`, `singleExposeSiteOk = true`) multiple times!
+
+Across two loop iterations (`x = 5 -> 42 -> 79`), both `Mach` (`BM.pickAddr`)
+and `MachTB` (`TBM.pickAddr`) allocate the callee's borrowed parameter slot `_1`
+at the **exact same first-fit stack address `5 * 2 ^ 32` (`21474836480`)**,
+appending two distinct exposed provenances at `5 * 2 ^ 32` to
+`m.intptrcast.exposed`. Because the first call's stack allocation is deallocated
+on `Return` (`a.live = false`), `int2ptr` filters out the dead first-call
+allocation during the second call's `PointerWithExposedProvenance`, uniquely
+selecting the second call's live allocation and active Tree Borrows tag and
+achieving 3-way agreement (`79` + `MirNoUBTree`) across Anneal, `Mach`, and
+`MachTB`. -/
+
+/-- Looping caller `fn loop_call_expose_callee(x: u32) -> u32`:
+has a cyclic `SwitchInt` loop (`isAcyclicCfg = false`) calling
+`borrow_assume_add` twice (`5 -> 42 -> 79`) using distinct temporary `_4` for
+the `Call` destination. -/
+def callerLoopCallExposeCalleeMir : CapturedMir where
+  defPath := "witness::loop_call_expose_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 2) (.use (constU32 2))),
+        mkStmt (.assign (local_ 3) (.use (.copy (local_ 1))))],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 2)) { branches := [(0, 4)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 2) (.binaryOp .sub (.copy (local_ 2)) (constU32 1))),
+        mkStmt (.storageLive 4)],
+      terminator := mkTerm (.call (fnDefOp "witness::borrow_assume_add")
+        [.copy (local_ 3)] (local_ 4) (some 3) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 3) (.use (.copy (local_ 4)))),
+        mkStmt (.storageDead 4)],
+      terminator := mkTerm (.goto 1), isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def callerLoopCallExposeCalleeProg : Gen.Program :=
+  (translateProgWithIntrinsics callerLoopCallExposeCalleeMir [calleeBorrowAssumeAddMir]).getD
+    callRefMutProtectedProg
+
+def callerLoopCallExposeCalleeMInit : Mach :=
+  match callerLoopCallExposeCalleeProg.functions.entries[0]? with
+  | some (_, callerFn) =>
+    multiMachineWithCtx ctxCallRefMut1 callerLoopCallExposeCalleeProg 2
+      callerLoopCallExposeCalleeMir callerFn [.uninit, .init (.scalar ⟨5, 4⟩)] callerFn.start
+  | none => callRefMutProtectedMInit
+
+def callerLoopCallExposeCalleeTBInit : MachTB :=
+  liftMachToTB callerLoopCallExposeCalleeMInit
+
+theorem callerLoopCallExposeCallee_anneal_79 :
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees callerLoopCallExposeCalleeMir [.scalar ⟨5, 4⟩]
+        [calleeBorrowAssumeAddMir])
+      tr (.normal (.scalar ⟨79, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerLoopCallExposeCalleeMir [.scalar ⟨5, 4⟩]
+        [calleeBorrowAssumeAddMir]) :=
+  runsToScalar_sound (fuel := 120) (by decide)
+
+/-- Positive 3-way cyclic-loop multi-call stack-reuse witness (MR-4.3 Pass A4):
+`callerLoopCallExposeCalleeMir` (`isAcyclicCfg = false`) calling
+`calleeBorrowAssumeAddMir` satisfies both `progInFragmentWithIntrinsics = true`
+and `progSingleExposeSiteOk = true`, returns `79` (`MirNoUBTree`) on Anneal, and
+returns `79` in 73 steps on both MiniRust `Mach` (`BasicMemory`) and `MachTB`
+(`TreeBorrowsMemory`) while accumulating two distinct exposed provenances at the
+exact same reused first-fit callee stack address `5 * 2 ^ 32` (`21474836480`),
+both deallocated (`live = false`) on `Return`. -/
+theorem callerLoopCallExposeCallee_three_way :
+    isAcyclicCfg callerLoopCallExposeCalleeMir = false ∧
+    progInFragmentWithIntrinsics callerLoopCallExposeCalleeMir [calleeBorrowAssumeAddMir] = true ∧
+    progSingleExposeSiteOk callerLoopCallExposeCalleeMir [calleeBorrowAssumeAddMir] = true ∧
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees callerLoopCallExposeCalleeMir [.scalar ⟨5, 4⟩]
+        [calleeBorrowAssumeAddMir])
+      tr (.normal (.scalar ⟨79, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees callerLoopCallExposeCalleeMir [.scalar ⟨5, 4⟩]
+        [calleeBorrowAssumeAddMir]) ∧
+    (Interp.steps 73 callerLoopCallExposeCalleeMInit).toOption.map
+        (fun m =>
+          (m.mem.memory.allocations[0]?,
+           m.threads.map (·.stack.length),
+           m.intptrcast.exposed.elems.map (fun (aid, _) =>
+             m.mem.memory.allocations[aid.1.toNat]?.map
+               (fun a => (Gen.Allocation.addr a, Gen.Allocation.live a))))) =
+      some (some { retAlloc with data := scalarBytes u32 79 }, [1],
+        [some (21474836480, false), some (21474836480, false)]) ∧
+    (Interp.stepsTB 73 callerLoopCallExposeCalleeTBInit).toOption.map
+        (fun m =>
+          (({ retAlloc := m.mem.memory.mem.allocations[0]?.map (fun a => (a.live, a.data.map projByteTB))
+              stackDepths := m.threads.map (·.stack.length) } : TBRetOutcome),
+           m.intptrcast.exposed.elems.map (fun (aid, _) =>
+             m.mem.memory.mem.allocations[aid.1.toNat]?.map
+               (fun a => (Gen.Allocation.addr a, Gen.Allocation.live a))))) =
+      (tbRetU32 79).map (·, [some (21474836480, false), some (21474836480, false)]) :=
+  ⟨by decide +kernel, by decide +kernel, by decide +kernel,
+   callerLoopCallExposeCallee_anneal_79.1,
+   callerLoopCallExposeCallee_anneal_79.2,
+   by decide +kernel, by decide +kernel⟩
+
 end MiniRustSpec.Correspondence.ProvenanceWitness

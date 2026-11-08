@@ -1532,11 +1532,18 @@ These are deliberate and are the first things to lift:
   PointerWithExposedProvenance`). Pass B4 strengthens this composition to
   `ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk` (via
   `exposeSourceCompatible_iff` and `BorrowsOk.ptr_slots_after_expose_withExposed`),
-  deriving `hbor_i` and `hbor_d` directly from `BorrowsOk` and establishing that
-  the reconstructed pointer destination `_d` preserves `BorrowsOk.ptr_slots` on
-  `view2` together with non-`.disabled` (and `.active`/`.reserved` for `.mut`)
-  dereference usability in `s2.memory.borrows`.
-  Passes B3, A3, and B4 also unify multi-function translation (`translateFnInProgWithIntrinsics`
+  and Pass A4 closes the full inductive invariant tuple in
+  `BorrowsOk.after_expose_withExposed` and
+  `ProvenanceRel.assume_then_expose_then_withExposed_closed_from_frameOk`: at
+  `(s2, m8, view2, nb3, 0)`, all four correspondence invariants
+  (`ProvenanceRel`, `FrameOkWithIntrinsics`, bundled `BorrowsOk` including
+  `alias_ok` across `ptrStmtStep` for both provenance casts, and
+  `AddrTakenTargetsOk`) hold simultaneously, `evalValue m8 (.Load (.Local (localName d)))`
+  evaluates via `evalPtrLoad_withIntrinsics` to the exact target pointer
+  `offsetPtr (localPtr ctx entry.targetLocal) relOff` while preserving
+  `FrameOkWithIntrinsics`, and `_d` retains non-`.disabled` (and `.active`/`.reserved`
+  for `.mut`) dereference usability in `s2.memory.borrows`.
+  Passes B3, A3, B4, and A4 also unify multi-function translation (`translateFnInProgWithIntrinsics`
   and `translateProgWithIntrinsics`, agreeing with `translateProg` on
   provenance-cast-free programs via `translateProgWithIntrinsics_eq_of_no_provCast`
   and `translateProgWithIntrinsics_eq_of_progInFragment`) while separating two
@@ -1548,8 +1555,9 @@ These are deliberate and are the first things to lift:
      `ptrAliasingProgOk (provCastAliasView body)`) with scalar-boundary `Call`
      terminators. Both `progInFragment` and `inFragmentWithIntrinsics` embed
      into it (`progInFragment_implies_progInFragmentWithIntrinsics`,
-     `inFragmentWithIntrinsics_implies_progInFragmentWithIntrinsics`, and
-     `inFragment_implies_progInFragmentWithIntrinsics`), and
+     `inFragmentWithIntrinsics_implies_progInFragmentWithIntrinsics`,
+     `inFragment_implies_progInFragmentWithIntrinsics`, and
+     `inFragmentWithIntrinsics_and_singleExpose_implies_prog`), and
      `callerBorrowExposeAndScalarCall_three_way` witnesses a strict 2-function
      superset combining `Call`, `&mut`, `&raw mut`, `Retag`, `Assume`, and
      provenance casts with 3-way agreement (`92` + `MirNoUBTree`). Across
@@ -1568,10 +1576,15 @@ These are deliberate and are the first things to lift:
      (`TreeBorrowsMemory`) because the caller's live stack allocation accumulates
      two distinct exposed Tree Borrows tags; `progSingleExposeSiteOk`
      (`progSingleExposeSiteOk_nil`, `progInFragment_implies_progSingleExposeSiteOk`,
-     and `callerBorrowExposeAndScalarCall_progSingleExposeSiteOk`) rules out
-     multi-expose caller bodies while permitting one acyclic exposure per
-     function across calls (since callee stack allocations are deallocated on
-     `Return`).
+     `inFragment_implies_progSingleExposeSiteOk`,
+     `inFragmentWithIntrinsics_and_singleExpose_implies_prog`, and
+     `callerBorrowExposeAndScalarCall_progSingleExposeSiteOk`) rules out
+     multi-expose caller bodies while permitting cyclic loop callers that invoke
+     an acyclic exposing callee across iterations
+     (`callerLoopCallExposeCallee_three_way`, where two loop calls reuse the exact
+     same first-fit callee stack address `5 * 2 ^ 32`, deallocate the first call's
+     allocation on `Return`, and achieve 3-way agreement `79` + `MirNoUBTree`
+     across Anneal, `Mach`, and `MachTB`).
   2. **`progCrossFrameTranslatable`** (`bodyCrossFrameTranslatable` and
      `progStmtOkWithIntrinsics`, restricting `.retag .fnEntry` to `isRefTy`
      reference parameters as witnessed by `callerRawPtrRetagFnEntry_B3_divergence`):
