@@ -418,6 +418,13 @@ open LeanMiriSpec.Correspondence in
   step_terminator_assert_lm3_1_simulation
   Witness.wit_lm3_1_branch_offset_zero_and_return_rawPtr_real_steps
   Witness.wit_lm3_1_rawPtr_cmp_and_ptrMetadata_real_steps
+  step_rawPtr_cmp_ub_lm3_1_simulation
+  step_rawPtr_cmp_scalar_ptr_divergence
+  step_binOp_offset_move_scalar_nonzero_divergence
+  WellTypedLM3_1StateTerminator
+  step_terminator_lm3_1_state_simulation
+  step_mir_lm3_1_state_simulation
+  Witness.wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -3903,6 +3910,186 @@ example
       ImmediateRelLM3_1 allocMap decl0.ty body.layouts retVal imm0 ∧
       mRes = ({ m with stack := ⟨#[]⟩ }, .ok true) :=
   h.retNormal_rel
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind₁ opKind₂ : Place → MirAst.Operand}
+    (hopKind₁ : opKind₁ = MirAst.Operand.copy ∨ opKind₁ = MirAst.Operand.move)
+    (hopKind₂ : opKind₂ = MirAst.Operand.copy ∨ opKind₂ = MirAst.Operand.move)
+    {bop : MirAst.BinOp}
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩
+        (.binaryOp bop (opKind₁ ⟨lhsIdx, .nil⟩) (opKind₂ ⟨rhsIdx, .nil⟩)), span⟩)
+    {dstDecl lhsDecl rhsDecl : MirAst.LocalDecl}
+    {lhsMut rhsMut : Mutability} {lhsPointee rhsPointee : RigidTy}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
+    (hlhs_ty : lhsDecl.ty.kind = .rawPtr lhsMut lhsPointee)
+    (hrhs_ty : rhsDecl.ty.kind = .rawPtr rhsMut rhsPointee)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame lhsIdx ∧
+      IsImmediateFrameLocal topFrame rhsIdx)
+    (hub :
+      get? s.frame.locals lhsIdx = some .dead ∨
+      get? s.frame.locals lhsIdx = some .uninit ∨
+      get? s.frame.locals rhsIdx = some .dead ∨
+      get? s.frame.locals rhsIdx = some .uninit ∨
+      (opKind₁ = MirAst.Operand.move ∧ lhsIdx = rhsIdx)) :
+    StepRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_rawPtr_cmp_ub_lm3_1_simulation hstate hphase hopKind₁ hopKind₂ hbb hstmt
+    hdecl_dst hdecl_lhs hdecl_rhs hlhs_ty hrhs_ty himm hub
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {opKind₁ opKind₂ : Place → MirAst.Operand}
+    (hopKind₁ : opKind₁ = MirAst.Operand.copy ∨ opKind₁ = MirAst.Operand.move)
+    (hopKind₂ : opKind₂ = MirAst.Operand.copy ∨ opKind₂ = MirAst.Operand.move)
+    {bop : MirAst.BinOp} (hbop : IsCmpBinOp bop)
+    {bb : BasicBlockData} {dstIdx lhsIdx rhsIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩
+        (.binaryOp bop (opKind₁ ⟨lhsIdx, .nil⟩) (opKind₂ ⟨rhsIdx, .nil⟩)), span⟩)
+    {dstDecl lhsDecl rhsDecl : MirAst.LocalDecl}
+    {lhsMut rhsMut : Mutability} {lhsPointee rhsPointee : RigidTy}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_lhs : get? body.localDecls lhsIdx = some lhsDecl)
+    (hdecl_rhs : get? body.localDecls rhsIdx = some rhsDecl)
+    (hlhs_ty : lhsDecl.ty.kind = .rawPtr lhsMut lhsPointee)
+    (hrhs_ty : rhsDecl.ty.kind = .rawPtr rhsMut rhsPointee)
+    (hdst_ty : dstDecl.ty.kind = .bool)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧
+      IsImmediateFrameLocal topFrame lhsIdx ∧
+      IsImmediateFrameLocal topFrame rhsIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    {sc₁ : MirAst.ScalarInt} {ptrVal₂ : ProvenancePtr}
+    (hlhs_sc : get? s.frame.locals lhsIdx = some (.init (.scalar sc₁)))
+    (hrhs_ptr : get? s.frame.locals rhsIdx = some (.init (.ptr ptrVal₂ 8))) :
+    stepMirFn body s = MirStepNode.unsupported ∧
+    ∃ m' tf' b,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt (.ofBool b))))) :=
+  step_rawPtr_cmp_scalar_ptr_divergence hstate hphase hopKind₁ hopKind₂ hbop hbb hstmt
+    hdecl_dst hdecl_lhs hdecl_rhs hlhs_ty hrhs_ty hdst_ty himm hdst_live hlhs_sc hrhs_ptr
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local} {rhsOp : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp .offset (.move ⟨ptrIdx, .nil⟩) rhsOp), span⟩)
+    {dstDecl ptrDecl : MirAst.LocalDecl} {ptrMut : Mutability} {pointeeKind : RigidTy}
+    {rhsTy : Ty} {sc_p sc_r : MirAst.ScalarInt} {locals_r : List LocalSlot}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hpt : pointeeKind = .uint .u8 ∨ pointeeKind = .int .i8)
+    (hrhs_ty : rhsTy.kind = .uint .usize ∨ rhsTy.kind = .int .isize)
+    (hop_rhs : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame rhsOp rhsTy)
+    (himm_ptr : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame ptrIdx)
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.scalar sc_p)))
+    (ha_rhs : evalOperand (s.frame.locals.set ptrIdx .uninit) rhsOp
+      s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals =
+      .ok (.scalar sc_r) locals_r)
+    (hrhs_pos : 0 < sc_r.bits)
+    (hrhs_lt : sc_r.bits < 2 ^ 32) :
+    stepMirFn body s = MirStepNode.unsupported ∧
+    ∃ m',
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .error (.undefinedBehavior "pointer Offset out of bounds")) :=
+  step_binOp_offset_move_scalar_nonzero_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr
+    hptr_ty hpt hrhs_ty hop_rhs himm_ptr hslot_p ha_rhs hrhs_pos hrhs_lt
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hwt : WellTypedLM3_1StateTerminator body m bb) :
+    StepObsRelLM3_1 body m allocMap
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_terminator_lm3_1_state_simulation hstate hphase hbb hstmt_none hstmt_len hwt
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hloc :
+      (∃ stmt, get? bb.statements s.frame.stmtIdx = some stmt ∧
+        WellTypedLM3_1StateStmt body s m allocMap stmt) ∨
+      (get? bb.statements s.frame.stmtIdx = none ∧
+        s.frame.stmtIdx = length bb.statements ∧
+        WellTypedLM3_1StateTerminator body m bb))
+    (hsupply : AllocIdSupplyReady m.machine.memory) :
+    ∃ allocMap' : List AllocMapEntry,
+      StepObsRelLM3_1 body m allocMap'
+        (stepMirFn body s)
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_mir_lm3_1_state_simulation hstate hphase hbb hloc hsupply
+
+example :
+    (∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState)
+      (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (eqRes : Bool),
+      let b := Witness.lm31RawPtrCmpScalarPtrBody
+      let s₀ := Witness.mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+      let m₀ := Witness.mkFourLocalScalarMiriPre b Witness.boolTyLM31 Witness.rawPtrConstU64Ty
+        Witness.lm31Scalar0U64
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b s₀ = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () m₀ = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .unsupported ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      m₂.stack.frames = #[tf₂] ∧
+      (tf₂.locals[0]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt (.ofBool eqRes)))))) ∧
+    (∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState) (msg : String),
+      let b := Witness.lm31RawPtrCmpMoveUbBody
+      let s₀ := Witness.mkFourLocalScalarAnnealPre b ⟨42, 8⟩
+      let m₀ := Witness.mkFourLocalScalarMiriPre b Witness.u64Ty Witness.u64Ty
+        Witness.lm31Scalar42
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b s₀ = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () m₀ = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .error (.undefinedBehavior msg))) ∧
+    (∃ (m₁ : AnnealStepState),
+      let b := Witness.lm31MoveNullOffsetNonzeroBody
+      let s₀ := Witness.mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+      let m₀ := Witness.mkFourLocalScalarMiriPre b Witness.u64Ty Witness.rawPtrConstU8Ty
+        Witness.lm31Scalar0U64
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b s₀ = .unsupported ∧
+      Miri.Interpreter.Step.step hooks () m₀ =
+        (m₁, .error (.undefinedBehavior "pointer Offset out of bounds"))) :=
+  Witness.wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps
 
 end StatementPins
 

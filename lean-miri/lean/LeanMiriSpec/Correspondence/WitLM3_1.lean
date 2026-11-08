@@ -81,14 +81,19 @@ divergence theorems:
    (`42`); provenance-less `PtrToPtr` and `BinOp.Offset` (`0_usize` and
    `1_usize`) divergences; and RFC 2582 `&raw mut (*_2)` zero-offset
    correspondence vs. `&raw mut (*_2)` frozen-parent permission divergence.
-9. **`wit_lm3_1_branch_offset_zero_and_return_rawPtr_real_steps`** and
-   **`wit_lm3_1_rawPtr_cmp_and_ptrMetadata_real_steps`**: multi-block execution
-   from pointer-free `StateRel` through `&raw mut _1`, `*_2 = 99_u64`,
+9. **`wit_lm3_1_branch_offset_zero_and_return_rawPtr_real_steps`**,
+   **`wit_lm3_1_rawPtr_cmp_and_ptrMetadata_real_steps`**, and
+   **`wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps`**: multi-block
+   execution from pointer-free `StateRel` through `&raw mut _1`, `*_2 = 99_u64`,
    `_0 = Offset(move _2, 0_usize)` on `*mut u64` (`stride = 8`), `Assert`,
    `SwitchInt` (`MirObs.event 1`), and root-frame `Return` of `_0 : *mut u64`
-   (`PtrRel` return correspondence); plus provenance-less vs. tracked raw-pointer
-   `Eq` comparison, move-operand provenance-less `PtrToPtr` and `Offset(..., 0)`
-   divergences, and `UnOp.PtrMetadata` UB vs. thin-pointer divergence.
+   (`PtrRel` return correspondence); provenance-less vs. tracked raw-pointer
+   `Eq` comparison (`(.ptr, .ptr)` and symmetric `(.scalar, .ptr)`),
+   use-after-move pointer comparison UB (`Eq(move _2, copy _2)` via
+   `step_rawPtr_cmp_ub_lm3_1_simulation` and unified
+   `step_mir_lm3_1_state_simulation`), move-operand provenance-less `PtrToPtr`
+   and `Offset` (`0_usize` and non-zero `1_usize`) divergences, and
+   `UnOp.PtrMetadata` UB vs. thin-pointer divergence.
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness
@@ -6071,5 +6076,221 @@ theorem wit_lm3_1_rawPtr_cmp_and_ptrMetadata_real_steps :
            mkFourLocalScalar_all_immediate _ _ _ _ tf htf 1⟩)
         (by rintro ⟨⟩) ⟨by rintro ⟨⟩, by rintro ⟨⟩⟩
     exact ⟨m_ub, m_ok, msg, tf_ok, hsu, hm_ub, hst, hm_ok, htf_ok, hval_ok⟩
+
+/-- `Runtime(PostCleanup)` MIR body taking `_2 = &raw const _3` and comparing
+null `_1 : *const u64` (`0 as *const u64` on the LHS) with the tracked raw
+pointer `_2 : *const u64` (on the RHS) via `_0 = Eq(copy _1, copy _2)`. -/
+def lm31RawPtrCmpScalarPtrBody : CapturedMir where
+  defPath := "lm_3_1_witness::raw_ptr_cmp_scalar_ptr"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [boolDeclLM31, rawPtrConstU64Decl, rawPtrConstU64Decl, u64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.rawPtr .not (local_ 3))),
+        mkStmt (.assign (local_ 0)
+          (.binaryOp .eq (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- `Runtime(PostCleanup)` MIR body taking `_2 = &raw const _1` and executing a
+use-after-move relational comparison `_3 = Eq(move _2, copy _2)` on the tracked
+raw pointer `_2`. -/
+def lm31RawPtrCmpMoveUbBody : CapturedMir where
+  defPath := "lm_3_1_witness::raw_ptr_cmp_move_ub"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, u64Decl, rawPtrConstU64Decl, boolDeclLM31]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2) (.rawPtr .not (local_ 1))),
+        mkStmt (.assign (local_ 3)
+          (.binaryOp .eq (.move (local_ 2)) (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- `Runtime(PostCleanup)` MIR body executing
+`_2 = Offset(move _1, const 1_usize)` on null `_1 = 0 as *const u8` (non-zero
+offset on provenance-less pointer with destructive `move _1`). -/
+def lm31MoveNullOffsetNonzeroBody : CapturedMir where
+  defPath := "lm_3_1_witness::move_null_offset_nonzero"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u64Decl, rawPtrConstU8Decl, rawPtrConstU8Decl, u64Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 2)
+          (.binaryOp .offset (.move (local_ 1)) (.constant (constUsizeLM31 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- **`wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps`**:
+Concrete real-step witnesses exercising:
+1. **`step_rawPtr_cmp_scalar_ptr_divergence`**: on `lm31RawPtrCmpScalarPtrBody`,
+   after `_2 = &raw const _3`, comparing null `_1 = 0 as *const u64` on the LHS
+   with tracked `_2` on the RHS (`_0 = Eq(copy _1, copy _2)`) returns
+   `MirStepNode.unsupported` in Anneal while `lean-miri` steps storing
+   `.fromScalarInt (.ofBool eqRes)` in `_0`.
+2. **`step_rawPtr_cmp_ub_lm3_1_simulation` and `step_mir_lm3_1_state_simulation`
+   (`WellTypedLM3_1StateStmt.rawPtrCmpUb`)**: on `lm31RawPtrCmpMoveUbBody`, after
+   `_2 = &raw const _1`, the use-after-move comparison `_3 = Eq(move _2, copy _2)`
+   on the tracked pointer `_2` raises UB in lockstep (`StepObsRelLM3_1.ub`) in
+   both Anneal (`MirStepNode.fail .ub`) and `lean-miri`
+   (`StepError.undefinedBehavior`).
+3. **`step_binOp_offset_move_scalar_nonzero_divergence`**: on
+   `lm31MoveNullOffsetNonzeroBody`, `_2 = Offset(move _1, const 1_usize)` on
+   null `_1 = 0 as *const u8` returns `MirStepNode.unsupported` in Anneal while
+   `lean-miri` deinitializes `_1` and reports
+   `StepError.undefinedBehavior "pointer Offset out of bounds"`. -/
+theorem wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps :
+    -- (1) Symmetric `(.scalar, .ptr)` pointer comparison divergence (`null() == p`)
+    (∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState)
+      (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+      (eqRes : Bool),
+      let b := lm31RawPtrCmpScalarPtrBody
+      let s₀ := mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+      let m₀ := mkFourLocalScalarMiriPre b boolTyLM31 rawPtrConstU64Ty lm31Scalar0U64
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b s₀ = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () m₀ = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .unsupported ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      m₂.stack.frames = #[tf₂] ∧
+      (tf₂.locals[0]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar (.fromScalarInt (.ofBool eqRes)))))) ∧
+    -- (2) Tracked-pointer use-after-move `Eq(move _2, copy _2)` lockstep UB via
+    --     unified `step_mir_lm3_1_state_simulation`
+    (∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState) (msg : String),
+      let b := lm31RawPtrCmpMoveUbBody
+      let s₀ := mkFourLocalScalarAnnealPre b ⟨42, 8⟩
+      let m₀ := mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b s₀ = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () m₀ = (m₁, .ok true) ∧
+      stepMirFn b s₁ = .fail .ub ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .error (.undefinedBehavior msg))) ∧
+    -- (3) Move-operand non-zero `Offset(move _1, const 1_usize)` on null pointer
+    (∃ (m₁ : AnnealStepState),
+      let b := lm31MoveNullOffsetNonzeroBody
+      let s₀ := mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+      let m₀ := mkFourLocalScalarMiriPre b u64Ty rawPtrConstU8Ty lm31Scalar0U64
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b s₀ = .unsupported ∧
+      Miri.Interpreter.Step.step hooks () m₀ =
+        (m₁, .error (.undefinedBehavior "pointer Offset out of bounds"))) := by
+  let ptr0 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
+  refine ⟨?_, ?_, ?_⟩
+  · -- Part (1): `lm31RawPtrCmpScalarPtrBody`
+    let b := lm31RawPtrCmpScalarPtrBody
+    let s₀ := mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+    let m₀ := mkFourLocalScalarMiriPre b boolTyLM31 rawPtrConstU64Ty lm31Scalar0U64
+    have hrel₀ : StateRel b s₀ m₀ :=
+      mkFourLocalScalar_stateRel b boolTyLM31 boolDeclLM31 rawPtrConstU64Decl
+        rawPtrConstU64Decl u64Decl ⟨0, 8⟩ lm31Scalar0U64 rfl rfl lm31_scalarRel0U64 rfl
+        (by rintro ⟨⟩) (by rintro ⟨⟩)
+    have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+    have himm₀ : ∀ tf, m₀.stack.frames = #[tf] →
+        IsImmediateFrameLocal tf 2 ∧ IsImmediateFrameLocal tf 3 :=
+      fun tf htf =>
+        ⟨mkFourLocalScalar_all_immediate _ _ _ _ tf htf 2,
+         mkFourLocalScalar_all_immediate _ _ _ _ tf htf 3⟩
+    let bor := [rawPtrBorrowEntry b.localDecls b.layouts .not 3 1]
+    let s₁ := mkWitState b 1 [.uninit, .init (.scalar ⟨0, 8⟩), .init ptr0, .uninit] bor 2
+    have hs₁ : stepMirFn b s₀ = .step s₁ := rfl
+    obtain ⟨m₁, hm₁, hrel₁⟩ := stepRelLM3_1_of_anneal_step
+      (step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty) hs₁
+    have htag₀ : s₀.memory.nextTag = 1 := rfl
+    have hid₀ : (⟨m₀.machine.memory.nextAllocId,
+        AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = lm31AllocId1 := rfl
+    rw [htag₀, hid₀] at hrel₁
+    obtain ⟨_, himm₁_step⟩ := step_rawPtr_addrOf_preserves_ne hrel₀ rfl rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty hm₁
+    have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 3 → IsImmediateFrameLocal tf₁ k :=
+      fun tf₁ htf₁ k hne =>
+        himm₁_step _ tf₁ rfl htf₁ k hne (mkFourLocalScalar_all_immediate _ _ _ _ _ rfl k)
+    obtain ⟨hs₂, m₂, tf₂, eqRes, hm₂, htf₂, hval₂⟩ :=
+      step_rawPtr_cmp_scalar_ptr_divergence hrel₁ hphase (Or.inl rfl) (Or.inl rfl) (Or.inl rfl)
+        rfl rfl (dstDecl := boolDeclLM31) (lhsDecl := rawPtrConstU64Decl)
+        (rhsDecl := rawPtrConstU64Decl) rfl rfl rfl rfl rfl rfl
+        (fun tf₁ htf₁ =>
+          ⟨himm₁ tf₁ htf₁ 0 (by decide), himm₁ tf₁ htf₁ 1 (by decide),
+           himm₁ tf₁ htf₁ 2 (by decide)⟩)
+        (by rintro ⟨⟩) (sc₁ := ⟨0, 8⟩) (ptrVal₂ := { allocId := 1, offsetBytes := 0 }) rfl rfl
+    exact ⟨s₁, m₁, m₂, tf₂, eqRes, hs₁, hm₁, hs₂, hm₂, htf₂, hval₂⟩
+  · -- Part (2): `lm31RawPtrCmpMoveUbBody` via `step_mir_lm3_1_state_simulation`
+    let b := lm31RawPtrCmpMoveUbBody
+    let s₀ := mkFourLocalScalarAnnealPre b ⟨42, 8⟩
+    let m₀ := mkFourLocalScalarMiriPre b u64Ty u64Ty lm31Scalar42
+    have hrel₀ : StateRel b s₀ m₀ :=
+      mkFourLocalScalar_stateRel b u64Ty u64Decl u64Decl rawPtrConstU64Decl boolDeclLM31
+        ⟨42, 8⟩ lm31Scalar42 rfl rfl lm31_scalarRel42 rfl (by rintro ⟨⟩) (by rintro ⟨⟩)
+    have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+    have himm₀ : ∀ tf, m₀.stack.frames = #[tf] →
+        IsImmediateFrameLocal tf 2 ∧ IsImmediateFrameLocal tf 1 :=
+      fun tf htf =>
+        ⟨mkFourLocalScalar_all_immediate _ _ _ _ tf htf 2,
+         mkFourLocalScalar_all_immediate _ _ _ _ tf htf 1⟩
+    let bor := [rawPtrBorrowEntry b.localDecls b.layouts .not 1 1]
+    let s₁ := mkWitState b 1 [.uninit, .init (.scalar ⟨42, 8⟩), .init ptr0, .uninit] bor 2
+    have hs₁ : stepMirFn b s₀ = .step s₁ := rfl
+    obtain ⟨m₁, hm₁, hrel₁⟩ := stepRelLM3_1_of_anneal_step
+      (step_rawPtr_addrOf_simulation hrel₀ hphase rfl rfl rfl rfl rfl
+        (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀ AllocIdSupplyReady.empty) hs₁
+    have htag₀ : s₀.memory.nextTag = 1 := rfl
+    have hid₀ : (⟨m₀.machine.memory.nextAllocId,
+        AllocIdSupplyReady.empty.nonzero⟩ : Miri.Memory.AllocId) = lm31AllocId1 := rfl
+    rw [htag₀, hid₀] at hrel₁
+    obtain ⟨⟨hsupply₁, _, _⟩, himm₁_step⟩ :=
+      step_rawPtr_addrOf_preserves_supply hrel₀.toLM3_1
+        rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide) himm₀
+        AllocIdSupplyReady.empty (by decide) (fun h => nomatch h) hm₁
+    have himm₁ : ∀ tf₁, m₁.stack.frames = #[tf₁] → ∀ k, k ≠ 1 → IsImmediateFrameLocal tf₁ k :=
+      fun tf₁ htf₁ k hne =>
+        himm₁_step _ tf₁ rfl htf₁ k hne (mkFourLocalScalar_all_immediate _ _ _ _ _ rfl k)
+    have hwt₁ : WellTypedLM3_1StateStmt b s₁ m₁
+        [rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 lm31AllocId1]
+        (mkStmt (.assign (local_ 3) (.binaryOp .eq (.move (local_ 2)) (.copy (local_ 2))))) := by
+      exact .rawPtrCmpUb 3 2 2 MirAst.Operand.move MirAst.Operand.copy .eq
+        boolDeclLM31 rawPtrConstU64Decl rawPtrConstU64Decl .not .not (.uint .u64) (.uint .u64) _
+        (Or.inr rfl) (Or.inl rfl) (Or.inl rfl) rfl rfl rfl rfl rfl rfl
+        (fun tf₁ htf₁ =>
+          ⟨himm₁ tf₁ htf₁ 3 (by decide), himm₁ tf₁ htf₁ 2 (by decide),
+           himm₁ tf₁ htf₁ 2 (by decide)⟩)
+        (Or.inr (Or.inr ⟨rfl, rfl⟩))
+    obtain ⟨_, hsim₂⟩ := step_mir_lm3_1_state_simulation hrel₁ hphase rfl
+      (Or.inl ⟨_, rfl, hwt₁⟩) hsupply₁
+    have hs₂ : stepMirFn b s₁ = .fail .ub := rfl
+    obtain ⟨msg, hm₂_err⟩ := (StepObsRelLM3_1.ub_iff hsim₂).mp hs₂
+    exact ⟨s₁, m₁, (Miri.Interpreter.Step.step
+        (annealStepHooks b.localDecls b.layouts) () m₁).1,
+      msg, hs₁, hm₁, hs₂, Prod.ext rfl hm₂_err⟩
+  · -- Part (3): `lm31MoveNullOffsetNonzeroBody`
+    let b := lm31MoveNullOffsetNonzeroBody
+    let s₀ := mkFourLocalScalarAnnealPre b ⟨0, 8⟩
+    let m₀ := mkFourLocalScalarMiriPre b u64Ty rawPtrConstU8Ty lm31Scalar0U64
+    have hrel₀ : StateRelLM3_1 b s₀ m₀ [] :=
+      (mkFourLocalScalar_stateRel b u64Ty u64Decl rawPtrConstU8Decl rawPtrConstU8Decl u64Decl
+        ⟨0, 8⟩ lm31Scalar0U64 rfl rfl lm31_scalarRel0U64 rfl
+        (by rintro ⟨⟩) (by rintro ⟨⟩)).toLM3_1
+    obtain ⟨hs₁, m₁, hm₁⟩ :=
+      step_binOp_offset_move_scalar_nonzero_divergence hrel₀ (fun _ h => nomatch h) rfl rfl
+        (dstDecl := rawPtrConstU8Decl) (ptrDecl := rawPtrConstU8Decl) (rhsTy := usizeTyLM31)
+        (sc_p := ⟨0, 8⟩) (sc_r := ⟨1, 8⟩)
+        (locals_r := s₀.frame.locals.set 1 .uninit)
+        rfl rfl rfl (Or.inl rfl) (Or.inl rfl)
+        (fun tf _ => constUsize_wellTyped b tf 1 (by decide))
+        (fun tf htf => mkFourLocalScalar_all_immediate _ _ _ _ tf htf 1)
+        rfl rfl (by decide) (by decide)
+    exact ⟨m₁, hs₁, hm₁⟩
 
 end LeanMiriSpec.Correspondence.Witness
