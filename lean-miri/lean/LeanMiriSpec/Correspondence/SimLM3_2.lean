@@ -8752,8 +8752,14 @@ theorem derefReadNextTreeMap_map_toAllocMapEntry (locals : List LocalSlot) (tree
 theorem h_s'_eq {s'_erase : MachineState} {s : MachineState} {treeMap : List ReborrowMapEntry} {refIdx : Local}
   (heq : s'_erase.memory.borrows = (derefReadNextAllocMap s.frame.locals (treeMap.map ReborrowMapEntry.toAllocMapEntry) refIdx).map AllocMapEntry.toBorrowEntry) :
   eraseBorrowParents { s'_erase with memory := { s'_erase.memory with borrows := s.memory.borrows } } (derefReadNextTreeMap s.frame.locals treeMap refIdx) = s'_erase := by
-  sorry
-
+  unfold eraseBorrowParents
+  dsimp
+  cases s'_erase with | mk frame memory =>
+  cases memory with | mk nextAllocId globals borrows nextTag callees callStack activeCallee activeProtectors nextProtector callerLocals =>
+  dsimp
+  congr
+  rw [derefReadNextTreeMap_map_toAllocMapEntry]
+  exact heq.symm
 theorem step_safeRef_deref_read_tree_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -8804,7 +8810,61 @@ theorem step_safeRef_deref_read_tree_simulation
   cases hsim
   case step s'_erase m' hrel_erase =>
     have h_s' : stepMirFn body s = MirStepNode.step { s'_erase with memory := { s'_erase.memory with borrows := s.memory.borrows } } := by
-      sorry
+      rcases hopKind with rfl | rfl
+      · unfold eraseBorrowParents at hstep_erase
+        dsimp only [] at hstep_erase
+        rw [hs_erase_unfold] at hstep_erase
+        rw [hs_step_unfold]
+        unfold evalStmt
+        dsimp only []
+        unfold evalStmt at hstep_erase
+        dsimp only [] at hstep_erase
+        simp only [evalRvalue, evalOperand] at hstep_erase ⊢
+        cases h_get : Trusted.Sequence.get? s.frame.locals refIdx <;> simp only [h_get] at hstep_erase ⊢
+        · contradiction
+        · rename_i loc
+          cases h_loc : loc <;> simp only [h_loc] at hstep_erase ⊢
+          case dead => contradiction
+          case uninit => contradiction
+          case init val =>
+            cases h_val : val <;> simp only [h_val] at hstep_erase ⊢
+            case unit => contradiction
+            case scalar => contradiction
+            case aggregate => contradiction
+            case ptr ptrVal sz =>
+              cases h_look : lookupBorrow (List.map AllocMapEntry.toBorrowEntry (List.map ReborrowMapEntry.toAllocMapEntry treeMap)) ptrVal.tag <;> simp only [h_look] at hstep_erase ⊢
+              · cases h_glob : lookupGlobalAlloc s.memory.globals ptrVal.allocId <;> simp only [h_glob] at hstep_erase ⊢
+                · contradiction
+                · rename_i globAlloc
+                  sorry
+              · sorry
+      · unfold eraseBorrowParents at hstep_erase
+        dsimp only [] at hstep_erase
+        rw [hs_erase_unfold] at hstep_erase
+        rw [hs_step_unfold]
+        unfold evalStmt
+        dsimp only []
+        unfold evalStmt at hstep_erase
+        dsimp only [] at hstep_erase
+        simp only [evalRvalue, evalOperand] at hstep_erase ⊢
+        cases h_get : Trusted.Sequence.get? s.frame.locals refIdx <;> simp only [h_get] at hstep_erase ⊢
+        · contradiction
+        · rename_i loc
+          cases h_loc : loc <;> simp only [h_loc] at hstep_erase ⊢
+          case dead => contradiction
+          case uninit => contradiction
+          case init val =>
+            cases h_val : val <;> simp only [h_val] at hstep_erase ⊢
+            case unit => contradiction
+            case scalar => contradiction
+            case aggregate => contradiction
+            case ptr ptrVal sz =>
+              cases h_look : lookupBorrow (List.map AllocMapEntry.toBorrowEntry (List.map ReborrowMapEntry.toAllocMapEntry treeMap)) ptrVal.tag <;> simp only [h_look] at hstep_erase ⊢
+              · cases h_glob : lookupGlobalAlloc s.memory.globals ptrVal.allocId <;> simp only [h_glob] at hstep_erase ⊢
+                · contradiction
+                · rename_i globAlloc
+                  sorry
+              · sorry
     rw [h_s']
     sorry
   case retRoot decl0 retVal imm0 mem' m' hdecl_0 hret himm_rel hm' =>
