@@ -34,8 +34,8 @@ theorem verified :
       apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
     )
   )
-  have h1 : lvl < max_lvl := by simp at h_ge1; omega
-  have h2 : readers < 18446744073709551615 := by simp at h_ge2; omega
+  have h1 : lvl < max_lvl := by simpa using h_ge1
+  have h2 : readers < 18446744073709551615 := by simpa using h_ge2
   apply LiftBlock.of_lookup rfl
   apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
@@ -44,15 +44,14 @@ theorem verified :
   case h_rv_sub =>
     change evalScalarBinOp .subUnchecked ⟨max_lvl, 8⟩ ⟨lvl, 8⟩ _ _ false = _
     simp [evalScalarBinOp, scalarModulus, Nat.ble_eq_true_of_le (Nat.le_of_lt h1),
-      nat_ble_eq_false_of_lt (by omega : max_lvl - lvl < 18446744073709551616)]
+      nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le _ _) h_max)]
   repeat apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
     (evalPureStmtNorm_assign_local_of_evalRvalue (val := .scalar ⟨readers + 1, 8⟩)
       rfl ?h_rv_add rfl (by nofun) rfl)
   case h_rv_add =>
     change evalScalarBinOp .addUnchecked ⟨readers, 8⟩ ⟨1, 8⟩ _ _ false = _
-    simp [evalScalarBinOp, scalarModulus,
-      nat_ble_eq_false_of_lt (by omega : readers + 1 < 18446744073709551616)]
+    simp [evalScalarBinOp, scalarModulus, nat_ble_eq_false_of_lt (Nat.succ_lt_succ h2)]
   apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
   apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
   all_goals (

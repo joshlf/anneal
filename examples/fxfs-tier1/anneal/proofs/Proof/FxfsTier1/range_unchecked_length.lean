@@ -26,7 +26,7 @@ theorem verified : VerificationResult Obligations.FxfsTier1.range_unchecked_leng
   case h_rv =>
     change evalScalarBinOp .subUnchecked ⟨e, 8⟩ ⟨s, 8⟩ _ _ false = _
     simp [evalScalarBinOp, scalarModulus, Nat.ble_eq_true_of_le h_le,
-      nat_ble_eq_false_of_lt (by omega : e - s < 18446744073709551616)]
+      nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le _ _) h_e_max)]
   apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   rintro _ _ ⟨⟩
   rfl

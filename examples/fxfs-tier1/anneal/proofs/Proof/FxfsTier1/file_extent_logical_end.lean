@@ -27,7 +27,7 @@ theorem verified : VerificationResult Obligations.FxfsTier1.file_extent_logical_
   case h_rv_sub =>
     change evalScalarBinOp .subUnchecked ⟨de, 8⟩ ⟨ds, 8⟩ _ _ false = _
     simp [evalScalarBinOp, scalarModulus, Nat.ble_eq_true_of_le (Nat.le_of_lt h_lt),
-      nat_ble_eq_false_of_lt (by omega : de - ds < 18446744073709551616)]
+      nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt (Nat.le_add_left _ _) h_sum_max)]
   apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
     (evalPureStmtNorm_assign_local_of_evalRvalue (val := .scalar ⟨lo + (de - ds), 8⟩)
       rfl ?h_rv_add rfl (by nofun) rfl)
