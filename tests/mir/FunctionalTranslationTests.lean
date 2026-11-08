@@ -2,20 +2,12 @@ import Anneal.FunctionalTranslation
 
 namespace Anneal.FunctionalTranslationTests
 
-open Trusted.Refinement
 open Trusted.Effect
-open Trusted.ITree
-open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Refinement
-open Anneal.Effect
-open Anneal.ITree
-open Anneal.EffectWP
 open Anneal.ITreeWP
-open Anneal.Memory
 open Anneal.UnsafeObligations
 open Anneal.SepLogic
 open Anneal.Rustc.V2026_06_01.Lower
@@ -23,7 +15,8 @@ open Anneal.FunctionalTranslation
 
 /-!
 Kernel-checked verification test suites for `Anneal.FunctionalTranslation` over
-`V2026_06_01` `CapturedMir` bodies, exercising all four pillars:
+`V2026_06_01` `CapturedMir` bodies, exercising pillars 1–3 (the Pillar 4
+program-to-program refinement suite lives in `FunctionalTranslationEquivTests`):
 
 1. **Suite 1 (Pillar 1 + Pillar 2 Diamond Joining Without Path Splitting)**:
    - Spine-preserving symbolic aggregate merging (`SymVal`, `zipSymVal`,
@@ -48,18 +41,6 @@ Kernel-checked verification test suites for `Anneal.FunctionalTranslation` over
      + `(*_ptr).0` / `(*_ptr).1` dereference projections + conditional field
      mutation) via `MutRefLocalSpec`, `verifyMutRefLocalTotalByTransPlan`, and
      `statefulOfTotalMutRefLocal`.
-4. **Suite 4 (Pillar 4 Program-to-Program Layer 1A Refinement `≤` and `=`)**:
-   - Literal Layer 1A `ITree.toPartial` refinement (`≤`), behavioral equality
-     (`=`), and `MirTerminatesAndNoUB` between `fastSliceSumBody` (`unsafe`
-     unchecked indexing + `BinOp.addUnchecked`) and `safeSliceSumBody` (checked
-     `Rvalue.len` bounds `TerminatorKind.assert` + `BinOp.addWithOverflow`
-     overflow `TerminatorKind.assert`) over arbitrary symbolic `elems : List Nat`
-     and `n ≤ elems.length` via `dwp_mirTree_stateful_while_ranked` and
-     `verifyStatefulEquivViaPureModel`.
-   - Branch-observation-erased Layer 1A equivalence (`mirObsErasedStatefulTree`
-     and `eraseTracePartial`) between `branchlessMulDoubleBody` (`0` `switchInt`
-     events) and `branchingSelectDoubleBody` (`1` `switchInt` event) via
-     `verifyObsErasedStatefulEquivByTransPlan`.
 -/
 
 /-! ## Shared `V2026_06_01` `CapturedMir` AST Builders and Scalar Simplification Lemmas -/

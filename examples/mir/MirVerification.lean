@@ -3,21 +3,16 @@ import Anneal
 
 namespace AnnealExamples.MirVerification
 
-open Trusted.Refinement
 open Trusted.Effect
 open Trusted.ITree
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Refinement
-open Anneal.Effect
 open Anneal.ITree
-open Anneal.Pass
 open Anneal.EffectWP
 open Anneal.ITreeWP
 open Anneal.Scalars
-open Anneal.Memory
 open Anneal.BitValidity
 open Anneal.UnsafeObligations
 open Anneal.SepLogic

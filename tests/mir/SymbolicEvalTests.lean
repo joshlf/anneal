@@ -3,17 +3,10 @@ import Anneal.Rustc.V2026_06_01.SymReflect
 
 namespace Anneal.Rustc.V2026_06_01.SymbolicEvalTests
 
-open Trusted.Refinement
-open Trusted.Effect
-open Trusted.ITree
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Scalars
-open Anneal.Memory
-open Anneal.UnsafeObligations
-open Anneal.SepLogic
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
