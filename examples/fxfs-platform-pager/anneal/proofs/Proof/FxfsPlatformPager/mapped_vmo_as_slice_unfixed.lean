@@ -1,48 +1,43 @@
 import Trusted
-import Anneal
+import Anneal.MirLiftCore
 import Mir.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
 import Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
 import Specs.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
 
 namespace Proof.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
 
+open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.Lower
+open Anneal.MirFuelFree
+open Anneal.PureMirExec
+open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-set_option maxHeartbeats 10000000 in
+/-- Closes a step that halts immediately (such as a violated `assume` raising a
+waived UB): `MirUbWaivedWpConverges.step` requires `evalSymNodeTreeExec`, which
+rejects `.ub`, whereas `evalSymNodeTreeUbWaived` accepts `.halt .ub` at depth
+`1` without consulting the continuation. -/
+private theorem ubWaivedWpConverges_of_halt
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : evalSymNodeTreeUbWaived (fun _ => False) post (stepMirSymTree body s)) :
+    MirUbWaivedWpConverges body s post :=
+  ⟨1, h⟩
+
 theorem verified : UbExceptionVerificationResult Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim := by
-  refine verifyUbExceptionMirBounded
-    Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim 20 ?_ ?_
-  · intro args mem h_pre h_strict
-    rcases h_pre with ⟨mapped_len, pb, h_ml, _, rfl, rfl⟩
-    rcases h_strict with ⟨_, h_eq⟩
-    injection h_eq with _ ht1
-    injection ht1 with _ ht2
-    injection ht2 with h_pb_head _
-    injection h_pb_head with h_pb_sc
-    injection h_pb_sc with h_pb_bits _
-    subst h_pb_bits
-    conv => whnf
-    intro retVal mem' h_out
-    injection h_out with h_pair
-    injection h_pair with h_ret h_mem
-    subst h_ret h_mem
-    refine ⟨rfl, ?_⟩
-    intro ml' pb' h_args
-    injection h_args with h1 _
-  · intro args mem h_pre
-    rcases h_pre with ⟨mapped_len, pb, h_ml, h_pb, rfl, rfl⟩
-    rcases h_pb with rfl | rfl
-    · conv => whnf
-      intro retVal mem' h_out
-      injection h_out with h_pair
-      injection h_pair with h_ret h_mem
-      subst h_ret h_mem
-      refine ⟨rfl, ?_⟩
-      intro ml' pb' h_args
-      injection h_args with h1 _
-    · conv => whnf
-      trivial
+  refine (fun h => verifyUbExceptionMir_of_wpConverges _ h ?waived) ?strict
+  case strict =>
+    rintro _ _ ⟨_, _, -, -, rfl, rfl⟩ ⟨_, ⟨⟩⟩
+    exact mirWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, by rintro _ _ ⟨⟩; rfl⟩
+  case waived =>
+    intro _ _ h_pre
+    have h := h _ _ h_pre
+    rcases h_pre with ⟨_, _, -, rfl | rfl, rfl, rfl⟩
+    · exact .of_mirWpConverges (h ⟨_, rfl⟩)
+    · -- When `pager_backed = true`, the second `assume` (`copy _3 == false`)
+      -- fails and halts with a waived UB.
+      repeat
+        first
+        | exact ubWaivedWpConverges_of_halt trivial
+        | refine MirUbWaivedWpConverges.step ?_
 
 end Proof.FxfsPlatformPager.mapped_vmo_as_slice_unfixed

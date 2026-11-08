@@ -1,5 +1,5 @@
 import Trusted
-import Anneal
+import Anneal.MirLiftCore
 import Mir.FxfsStorageBoundary.ff1_block_tail_offset
 import Obligations.FxfsStorageBoundary.ff1_block_tail_offset
 import Specs.FxfsStorageBoundary.ff1_block_tail_offset
@@ -8,22 +8,28 @@ namespace Proof.FxfsStorageBoundary.ff1_block_tail_offset
 
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.SymbolicEval
+open Anneal.PureMirExec
+open Anneal.MirLiftCore
+open Anneal.FunctionalTranslation
 
-set_option maxHeartbeats 10000000 in
 theorem verified : StatefulVerificationResult Obligations.FxfsStorageBoundary.ff1_block_tail_offset.statefulClaim := by
-  refine verifyStatefulMirNoPanicSym Obligations.FxfsStorageBoundary.ff1_block_tail_offset.statefulClaim 100 ?_
-  intro args mem h_pre
-  rcases h_pre with ⟨⟨d, h_d, rfl⟩, rfl⟩
-  (repeat' ((conv => whnf); split))
-  all_goals (conv => whnf)
-  all_goals (dsimp at *; try simp_all; try omega)
-  all_goals (
-    intro d' h_eq
-    injection h_eq with h_head _
-    injection h_head with h_s1
-    cases h_s1
-    congr 1; congr 1; omega
-  )
+  refine verifyStatefulMirNoPanic_of_pureExec _ rfl
+    (fun _ _ h => h.2 ▸ rootActiveMemory_emptyMemory) ?_
+  rintro _ _ ⟨⟨d, h_d, rfl⟩, rfl⟩
+  apply lift_PureMirConverges rfl
+  apply LiftBlock.of_lookup rfl
+  repeat apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
+    (evalPureStmtNorm_assign_local_of_evalRvalue
+      (val := .scalar ⟨16 - d, 8⟩) rfl ?h_rv rfl (by nofun) rfl)
+  case h_rv =>
+    change evalScalarBinOp .subUnchecked ⟨16, 8⟩ ⟨d, 8⟩ _ _ false = _
+    simp [evalScalarBinOp, scalarModulus,
+      Nat.ble_eq_true_of_le (Nat.le_trans h_d (by decide : 12 ≤ 16)),
+      nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le 16 d) (by decide : 16 < 18446744073709551616))]
+  apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  rintro _ ⟨⟩
+  rfl
 
 end Proof.FxfsStorageBoundary.ff1_block_tail_offset

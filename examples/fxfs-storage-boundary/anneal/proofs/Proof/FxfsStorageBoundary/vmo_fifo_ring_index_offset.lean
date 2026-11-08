@@ -1,5 +1,5 @@
 import Trusted
-import Anneal
+import Anneal.MirLiftCore
 import Mir.FxfsStorageBoundary.vmo_fifo_ring_index_offset
 import Obligations.FxfsStorageBoundary.vmo_fifo_ring_index_offset
 import Specs.FxfsStorageBoundary.vmo_fifo_ring_index_offset
@@ -8,21 +8,41 @@ namespace Proof.FxfsStorageBoundary.vmo_fifo_ring_index_offset
 
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.SymbolicEval
+open Anneal.PureMirExec
+open Anneal.MirLiftCore
+open Anneal.FunctionalTranslation
 
-set_option maxHeartbeats 10000000 in
 theorem verified : StatefulVerificationResult Obligations.FxfsStorageBoundary.vmo_fifo_ring_index_offset.statefulClaim := by
-  refine verifyStatefulMirNoPanicSym Obligations.FxfsStorageBoundary.vmo_fifo_ring_index_offset.statefulClaim 100 ?_
-  intro args mem h_pre
-  rcases h_pre with ⟨⟨raw, cap, es, h_cap_pos, h_raw, h_cap, h_es, h_bound, rfl⟩, rfl⟩
-  have h_nat_mod : ∀ a b : Nat, a.mod b = a % b := fun _ _ => rfl
-  have h_rem_lt_cap : raw % cap < cap := Nat.mod_lt raw h_cap_pos
-  have h_rem_lt : raw % cap < 18446744073709551616 := Nat.lt_trans h_rem_lt_cap h_cap
-  have h_mul_le : (raw % cap) * es ≤ cap * es := Nat.mul_le_mul_right es (Nat.le_of_lt h_rem_lt_cap)
-  have h_mul_lt : (raw % cap) * es < 18446744073709551616 := Nat.lt_of_le_of_lt h_mul_le h_bound
-  (repeat' ((conv => whnf); split))
-  all_goals (conv => whnf)
-  all_goals (try dsimp at *; try simp_all; try omega)
-  all_goals (try rw [Nat.mod_eq_of_lt h_rem_lt] at *; try omega)
+  refine verifyStatefulMirNoPanic_of_pureExec _ rfl
+    (fun _ _ h => h.2 ▸ rootActiveMemory_emptyMemory) ?_
+  rintro _ _ ⟨⟨raw, cap, es, h_cap_pos, h_raw, -, -, h_bound, rfl⟩, rfl⟩
+  have h_cap0 : Nat.beq cap 0 = false :=
+    Bool.eq_false_iff.mpr fun h => Nat.ne_of_gt h_cap_pos (Nat.eq_of_beq_eq_true h)
+  have h_assert : (boolToScalar (Nat.beq cap 0)).bits = 0 := by rw [h_cap0]; rfl
+  apply lift_PureMirConverges rfl
+  apply LiftBlock.of_lookup rfl
+  apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+  apply LiftStmtsTerminator.term_assert (by rfl) (Or.inr rfl) (by rfl) (by rfl) h_assert
+  apply LiftBlock.of_lookup rfl
+  apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
+    (evalPureStmtNorm_assign_local_of_evalRvalue
+      (val := .scalar ⟨raw % cap, 8⟩) rfl ?h_rem rfl (by nofun) rfl)
+  case h_rem =>
+    change evalScalarBinOp .rem ⟨raw, 8⟩ ⟨cap, 8⟩ _ _ false = _
+    simp [evalScalarBinOp, scalarModulus, wrapScalarBits, h_cap0,
+      show raw.mod cap = raw % cap from rfl,
+      nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt (Nat.mod_le raw cap) h_raw)]
+  apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
+    (evalPureStmtNorm_assign_local_of_evalRvalue
+      (val := .scalar ⟨raw % cap * es, 8⟩) rfl ?h_mul rfl (by nofun) rfl)
+  case h_mul =>
+    change evalScalarBinOp .mulUnchecked ⟨raw % cap, 8⟩ ⟨es, 8⟩ _ _ false = _
+    simp [evalScalarBinOp, scalarModulus,
+      nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt
+        (Nat.mul_le_mul_right es (Nat.le_of_lt (Nat.mod_lt raw h_cap_pos))) h_bound)]
+  apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  rintro _ _ _ ⟨⟩
+  rfl
 
 end Proof.FxfsStorageBoundary.vmo_fifo_ring_index_offset

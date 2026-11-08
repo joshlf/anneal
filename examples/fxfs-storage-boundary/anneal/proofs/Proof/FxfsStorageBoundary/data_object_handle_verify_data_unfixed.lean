@@ -1,5 +1,5 @@
 import Trusted
-import Anneal
+import Anneal.MirLiftCore
 import Mir.FxfsStorageBoundary.data_object_handle_verify_data_unfixed
 import Obligations.FxfsStorageBoundary.data_object_handle_verify_data_unfixed
 import Specs.FxfsStorageBoundary.data_object_handle_verify_data_unfixed
@@ -7,112 +7,100 @@ import Proof.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked
 
 namespace Proof.FxfsStorageBoundary.data_object_handle_verify_data_unfixed
 
+open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
+open Anneal.MirFuelFree
+open Anneal.PureMirExec
+open Anneal.MirLiftCore
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-private theorem ble_eq_false_of_lt {a b : Nat} (h : b < a) : Nat.ble a b = false := by
-  cases h_b : Nat.ble a b
-  · rfl
-  · have := Nat.le_of_ble_eq_true h_b
-    omega
+/-- Fuel-free modular step that may cross an external call. `h_step` shows that
+the step meets the call contract and that every admitted call answer transitions
+to `s'`, so convergence from `s'` yields convergence from `s`. -/
+private theorem modularWpConverges_step_to {contract : MirCallContract}
+    {body : CapturedMir} {s s' : MachineState} {post : MirOutcome → Prop}
+    (h_step : ∀ {cont : MirExecState → Prop}, cont (.running s') →
+      evalSymNodeTreeModular contract cont post (stepMirSymTree body s))
+    (h_next : MirModularWpConverges contract body s' post) :
+    MirModularWpConverges contract body s post :=
+  let ⟨n, hn⟩ := h_next
+  ⟨n + 1, h_step hn⟩
 
-set_option maxHeartbeats 2000000 in
+private def forceNat? : Nat → Option Nat
+  | 0 => some 0
+  | n + 1 => match forceNat? n with | some k => some (k + 1) | none => none
+
+private theorem forceNat?_eq_some : ∀ n, forceNat? n = some n
+  | 0 => rfl
+  | n + 1 => by rw [forceNat?, forceNat?_eq_some n]
+
+/-- Call-free step that normalizes `blockIdx`, `stmtIdx`, and `locals` so nested
+`advanceStmt` and `List.set` terms do not accumulate across symbolic steps.
+Forcing `blockIdx` and `stmtIdx` via `forceNat?` prevents `switchInt` from
+unifying `?bb` with an unreduced `lookupSwitchTarget` term that retains the
+prior frame. -/
+private theorem modularStepNorm {contract : MirCallContract} {body : CapturedMir}
+    {s : MachineState} {bb stmt : Nat} {locals : List LocalSlot}
+    {post : MirOutcome → Prop}
+    (h_step : evalSymNodeTreeNoCall
+      (fun
+        | .running s' =>
+          s'.memory = emptyMemory ∧
+          forceNat? s'.frame.blockIdx = some bb ∧
+          forceNat? s'.frame.stmtIdx = some stmt ∧
+          forcePureEnv? s'.frame.locals = some locals
+        | _ => False) post (stepMirSymTree body s))
+    (h_next : MirModularWpConverges contract body
+      { frame := { blockIdx := bb, stmtIdx := stmt, locals := locals }
+        memory := emptyMemory } post) :
+    MirModularWpConverges contract body s post := by
+  refine MirModularWpConverges.step
+    (evalSymNodeTreeNoCall_mono ?_ (fun _ h => h) h_step)
+  rintro ⟨⟨_, _, _⟩, _⟩ ⟨rfl, hb, hst, hloc⟩
+  rw [forceNat?_eq_some] at hb hst
+  rw [forcePureEnv?_eq_some] at hloc
+  cases hb; cases hst; cases hloc
+  exact h_next
+
 theorem verified : ModularVerificationResult Obligations.FxfsStorageBoundary.data_object_handle_verify_data_unfixed.modularClaim := by
-  refine verifyModularContractMirSym
-    Obligations.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.ubExceptionClaim.callContract
-    Mir.FxfsStorageBoundary.data_object_handle_verify_data_unfixed.body
-    Specs.FxfsStorageBoundary.data_object_handle_verify_data_unfixed.pre
-    Specs.FxfsStorageBoundary.data_object_handle_verify_data_unfixed.post
-    30 ?_
-  intro args mem h_pre
-  rcases h_pre with ⟨vmo_size, offset, len, t, h_vmo, h_off, h_len, h_t, rfl, rfl⟩
-  conv => whnf
-  split
-  · next h_ble1 =>
-    have h_le1 : offset ≤ vmo_size := Nat.le_of_ble_eq_true h_ble1
-    conv => whnf
-    split
-    · next h_ble2 =>
-      conv => whnf
-      split
-      · next h_ble3 =>
-        have h_sub_lt : vmo_size - offset < 18446744073709551616 := by omega
-        have h_ble3' : Nat.ble len (vmo_size - offset) = true := by
-          dsimp [wrapScalarBits, scalarModulus, Nat.sub] at h_ble3
-          rw [ble_eq_false_of_lt h_sub_lt] at h_ble3
-          exact h_ble3
-        have h_le2 : len ≤ vmo_size - offset := Nat.le_of_ble_eq_true h_ble3'
-        conv => whnf
-        refine ⟨⟨rfl, vmo_size, offset, len, t, h_le1, h_le2, h_vmo, h_t, rfl, rfl⟩, ?_⟩
-        rintro _ ⟨retVal, mem', rfl, h_mem', h_ret_fn⟩
-        have h_rv := h_ret_fn vmo_size offset len t rfl
-        have h_mem_empty : mem' = emptyMemory := h_mem'
-        clear h_ret_fn h_mem'
-        subst h_rv h_mem_empty
-        conv => whnf
-        intro retVal' mem'' h_out
-        injection h_out with h_pair
-        injection h_pair with h_ret h_mem
-        subst h_ret h_mem
-        refine ⟨rfl, ?_⟩
-        intro vs' off' l' t' h_args
-        injection h_args with h1 ht1
-        injection ht1 with h2 ht2
-        injection ht2 with h3 _
-        injection h1 with hs1
-        injection h2 with hs2
-        injection h3 with hs3
-        cases hs1; cases hs2; cases hs3
-        have h_ok : offset ≤ vmo_size ∧ len ≤ vmo_size - offset := ⟨h_le1, h_le2⟩
-        simp [h_ok]
-      · next h_nble3 =>
-        have h_sub_lt : vmo_size - offset < 18446744073709551616 := by omega
-        have h_nble3' : Nat.ble len (vmo_size - offset) = false := by
-          dsimp [wrapScalarBits, scalarModulus, Nat.sub] at h_nble3
-          rw [ble_eq_false_of_lt h_sub_lt] at h_nble3
-          exact h_nble3
-        have h_gt2 : ¬ len ≤ vmo_size - offset :=
-          fun h_le => by rw [Nat.ble_eq_true_of_le h_le] at h_nble3'; contradiction
-        conv => whnf
-        intro retVal mem' h_out
-        injection h_out with h_pair
-        injection h_pair with h_ret h_mem
-        subst h_ret h_mem
-        refine ⟨rfl, ?_⟩
-        intro vs' off' l' t' h_args
-        injection h_args with h1 ht1
-        injection ht1 with h2 ht2
-        injection ht2 with h3 _
-        injection h1 with hs1
-        injection h2 with hs2
-        injection h3 with hs3
-        cases hs1; cases hs2; cases hs3
-        have h_not : ¬ (offset ≤ vmo_size ∧ len ≤ vmo_size - offset) := by omega
-        simp [h_not]
-    · intro _ _ h; nomatch h
-  · next h_nble1 =>
-    have h_gt1 : ¬ offset ≤ vmo_size :=
-      fun h_le => by
-        have h_tr : Nat.ble offset vmo_size = true := Nat.ble_eq_true_of_le h_le
-        rw [h_tr] at h_nble1; contradiction
-    conv => whnf
-    intro retVal mem' h_out
-    injection h_out with h_pair
-    injection h_pair with h_ret h_mem
-    subst h_ret h_mem
-    refine ⟨rfl, ?_⟩
-    intro vs' off' l' t' h_args
-    injection h_args with h1 ht1
-    injection ht1 with h2 ht2
-    injection ht2 with h3 _
-    injection h1 with hs1
-    injection h2 with hs2
-    injection h3 with hs3
-    cases hs1; cases hs2; cases hs3
-    have h_not : ¬ (offset ≤ vmo_size ∧ len ≤ vmo_size - offset) := by omega
-    simp [h_not]
+  refine verifyModularContractMir_of_wpConverges _ _ _ _ ?_
+  rintro _ _ ⟨vs, off, len, t, h_vs, -, -, h_t, rfl, rfl⟩
+  refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ (MirModularWpConverges.step ?_)
+  show (match Nat.ble off vs with | true => _ | false => _)
+  cases h_le1 : Nat.ble off vs
+  · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩
+      (.of_noCall (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩))
+    rintro _ _ _ _ ⟨⟩
+    simp [Nat.not_le.mpr (by simpa using h_le1)]
+  · have h1 := Nat.le_of_ble_eq_true h_le1
+    repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+    refine MirModularWpConverges.step ?_
+    show (match Nat.ble off vs with | true => _ | false => _)
+    rw [h_le1]
+    refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ (MirModularWpConverges.step ?_)
+    show (match Nat.ble len (wrapScalarBits (vs - off) 18446744073709551616) with
+      | true => _ | false => _)
+    rw [wrapScalarBits_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le _ _) h_vs)]
+    cases h_le2 : Nat.ble len (vs - off)
+    · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩
+        (.of_noCall (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩))
+      rintro _ _ _ _ ⟨⟩
+      simp [Nat.not_le.mpr (by simpa using h_le2)]
+    · have h2 := Nat.le_of_ble_eq_true h_le2
+      repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+      refine modularWpConverges_step_to (s' := ?s')
+        (fun hc => ⟨⟨rfl, vs, off, len, t, h1, h2, h_vs, h_t, rfl, rfl⟩, ?h_ans⟩) ?h_next
+      case h_ans =>
+        rintro _ ⟨_, _, rfl, rfl, h_ret⟩
+        obtain rfl := h_ret vs off len t rfl
+        exact hc
+      case h_next =>
+        refine .of_noCall
+          (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
+        rintro _ _ _ _ ⟨⟩
+        rw [ite_eq_left ⟨h1, h2⟩]
 
 /-- Model witness for `vmo_buffer_as_ref_unchecked` returning `offset + len`. -/
 def vmoSliceEndModel (args : List Value) (mem : Memory) : Value × Memory :=
@@ -122,8 +110,8 @@ def vmoSliceEndModel (args : List Value) (mem : Memory) : Value × Memory :=
   | _ => (.scalar { bits := 0, sizeBytes := 8 }, mem)
 
 /-- End-to-end horizontal linking theorem combining the modular proof of
-    `data_object_handle_verify_data_unfixed` with the scoped UB-exception proof of
-    `vmo_buffer_as_ref_unchecked`. -/
+    `data_object_handle_verify_data_unfixed` with the scoped UB-exception
+    proof of `vmo_buffer_as_ref_unchecked`. -/
 theorem linked_with_ub_exception (fallback : ExternalCallHandler) :
     ((fun args mem =>
       (mirHandledTree
@@ -150,16 +138,7 @@ theorem linked_with_ub_exception (fallback : ExternalCallHandler) :
     vmoSliceEndModel
     fallback
     ?_
-  intro args mem h_pre _
-  rcases h_pre with ⟨vmo_size, offset, len, t, _, _, _, _, rfl, rfl⟩
-  refine ⟨rfl, ?_⟩
-  intro vs' off' l' t' h_args
-  injection h_args with h1 ht1
-  injection ht1 with h2 ht2
-  injection ht2 with h3 _
-  injection h2 with hs2
-  injection h3 with hs3
-  cases hs2; cases hs3
-  rfl
+  rintro _ _ ⟨_, _, _, _, _, _, _, _, rfl, rfl⟩ -
+  exact ⟨rfl, by rintro _ _ _ _ ⟨⟩; rfl⟩
 
 end Proof.FxfsStorageBoundary.data_object_handle_verify_data_unfixed
