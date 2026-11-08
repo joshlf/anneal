@@ -6,36 +6,60 @@ import Specs.FuchsiaUsercopy.usercopy_address_in_restricted_range
 
 namespace Proof.FuchsiaUsercopy.usercopy_address_in_restricted_range
 
-open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.SymbolicEval
+open Anneal.PureMirExec
+open Anneal.MirLiftCore
 
-set_option maxHeartbeats 10000000 in
 theorem verified : StatefulVerificationResult Obligations.FuchsiaUsercopy.usercopy_address_in_restricted_range.statefulClaim := by
-  refine verifyStatefulMirNoPanicSym Obligations.FuchsiaUsercopy.usercopy_address_in_restricted_range.statefulClaim 30 ?_
-  intro args mem h_pre
-  rcases h_pre with ⟨⟨addr, rs, re, h_rs_re, h_addr_lt, h_re_lt, rfl⟩, rfl⟩
-  (repeat' ((conv => whnf); split))
-  all_goals (conv => whnf)
-  all_goals (dsimp at *; try simp_all; try omega)
-  all_goals (
-    intro addr' rs' re' h_eq
-    injection h_eq with h1 ht1
-    injection ht1 with h2 ht2
-    injection ht2 with h3 _
-    injection h1 with hs1
-    injection h2 with hs2
-    injection h3 with hs3
-    cases hs1; cases hs2; cases hs3
-    try (
-      have h_cond : addr ≠ 0 ∧ rs ≤ addr ∧ addr < re := by omega
-      simp [h_cond]
-      omega
-    )
-    try (
-      have h_ncond : ¬ (addr ≠ 0 ∧ rs ≤ addr ∧ addr < re) := by omega
-      simp [h_ncond]
-    )
-  )
+  refine verifyStatefulMirNoPanic_of_pureExec _ rfl
+    (fun _ _ h => h.2 ▸ rootActiveMemory_emptyMemory) ?_
+  rintro _ _ ⟨⟨addr, rs, re, -, -, -, rfl⟩, rfl⟩
+  -- The arms of bb0's switch reach `return` after different numbers of steps,
+  -- and the lifted step budget is a single metavariable, so split on
+  -- `addr == 0` before lifting. Rewriting it in the lifted environment then
+  -- resolves the switch.
+  cases h0 : Nat.beq addr 0 <;>
+    (apply lift_PureMirConverges rfl
+     -- bb0: `_4 = Eq(copy _1, const 0_usize); switchInt(move _4) -> [0: bb2, otherwise: bb1]`
+     apply LiftBlock.of_lookup rfl
+     apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+     rw [h0]
+     apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
+     -- bb2 (`_5 = Lt(copy _1, copy _2)`) or bb1 (`_0 = const false`)
+     apply LiftBlock.of_lookup rfl
+     apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl))
+  · -- bb2: `switchInt(move _5) -> [0: bb4, otherwise: bb3]`. Both arms assign
+    -- `_0` and `goto -> bb5`, so they share one step budget.
+    have h_ne := Nat.ne_of_beq_eq_false h0
+    cases hs : Nat.ble rs addr <;>
+      (apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
+       -- bb3 (`_0 = const false`) or bb4 (`_0 = Lt(copy _1, copy _3)`); `goto -> bb5`
+       apply LiftBlock.of_lookup rfl
+       apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+       apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
+       -- bb5: `return`
+       apply LiftBlock.of_lookup rfl
+       apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+       rintro _ _ _ ⟨⟩
+       refine ⟨?_, fun h => absurd h h_ne⟩)
+    · -- `addr < rs`: bb3 returned `false`.
+      have := Nat.not_le_of_not_ble_eq_true (Bool.ne_true_of_eq_false hs)
+      rw [ite_eq_right (by omega)]
+    · -- `rs ≤ addr`: bb4 returned `addr < re`.
+      have h_rs := Nat.le_of_ble_eq_true hs
+      cases hre : Nat.ble re addr
+      · have := Nat.not_le_of_not_ble_eq_true (Bool.ne_true_of_eq_false hre)
+        rw [ite_eq_left ⟨h_ne, h_rs, by omega⟩]
+        rfl
+      · have := Nat.le_of_ble_eq_true hre
+        rw [ite_eq_right (by omega)]
+        rfl
+  · -- `addr = 0`. bb1: `goto -> bb5`; bb5: `return false`
+    apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
+    apply LiftBlock.of_lookup rfl
+    apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    rintro _ _ _ ⟨⟩
+    have h_z := Nat.eq_of_beq_eq_true h0
+    exact ⟨by rw [ite_eq_right (by omega)], fun _ => rfl⟩
 
 end Proof.FuchsiaUsercopy.usercopy_address_in_restricted_range
