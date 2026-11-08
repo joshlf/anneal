@@ -613,6 +613,49 @@ def evalIntToPtrExposed
     | none =>
       .ok (.ptr { allocId := 0, offsetBytes := addr } none) exposed
 
+/-- Source-typed `CastKind.pointerExposeProvenance` (`PtrToInt`) evaluator, matching
+`anneal_mir::lower::rvalue::eval_lowered_cast` (`LoweredCast::PtrToInt`):
+- `src` must be a pointer or reference descriptor (`src.isPtr = true`: `rawPtr` or `refPtr`),
+  and `dst` must be an integral descriptor (`dst.isIntegral = true`), otherwise `.unsupported`;
+- `p.offsetBytes` must satisfy `src.isValidBits pw p.offsetBytes` (in particular, a null
+  reference `src = .refPtr` with `p.offsetBytes = 0` is rejected with `.ub` *before* any
+  provenance is exposed, matching `rvalue.rs:2155-2160`);
+- on valid inputs, returns `.ok (.scalar (p.offsetBytes % scalarModulus (dst.sizeBytes pw)))`
+  and exposes `prov` via `exposeProvOpt`. -/
+def evalPtrToIntExposeTyped
+    (pw : PtrWidth)
+    (src dst : ScalarTy)
+    (p : ProvenancePtr)
+    (exposed : ExposedProvenance)
+    (prov : Option Nat := some p.allocId) :
+    CastOutcome :=
+  match Bool.and src.isPtr dst.isIntegral with
+  | false => .unsupported
+  | true =>
+    match src.isValidBits pw p.offsetBytes with
+    | false => .ub
+    | true =>
+      .ok (.scalar (p.offsetBytes % scalarModulus (dst.sizeBytes pw))) (exposeProvOpt prov exposed)
+
+/-- Deterministic provenance selector used by `anneal_mir::lower::rvalue::eval_lowered_cast`
+(`LoweredCast::IntToPtr`, `rvalue.rs:2202-2206`): when `pick = true`, selects the first
+exposed provenance (`exposed.head?`), and `none` when `exposed = []` or `pick = false`. -/
+def pickExposedProv (pick : Bool) (exposed : ExposedProvenance) : Option Nat :=
+  match pick with
+  | false => none
+  | true => exposed.head?
+
+/-- Deterministic `CastKind.pointerWithExposedProvenance` (`IntToPtr`) evaluator matching
+`anneal_mir::lower::rvalue::eval_lowered_cast` (`LoweredCast::IntToPtr`): invokes
+`evalIntToPtrExposed` with `pickExposedProv pick exposed`. -/
+def evalIntToPtrDeterministic
+    (pw : PtrWidth)
+    (pick : Bool)
+    (addr : Nat)
+    (exposed : ExposedProvenance) :
+    CastOutcome :=
+  evalIntToPtrExposed pw addr (pickExposedProv pick exposed) exposed
+
 /-- Evaluate a same-size `CastKind.transmute` from `src` to `dst` under target pointer
 width `pw` and `TransmutePolicy` `policy`, threading `exposed : ExposedProvenance`
 unchanged (`exposes_provenance = false`). -/
@@ -1042,6 +1085,93 @@ theorem decodeCastVal_rawPtr_partial_overwrite_strips_provenance
   dsimp only
   rw [h_prov]
 
+/-- Concrete shuffled-fragment theorem: overwriting byte `i` (`i < numBytes`) of an encoded
+pointer with a fragment whose recorded byte position `pos' ≠ i` (even from the *same*
+allocation `allocId' = allocId`) strips the provenance of the reloaded pointer. -/
+theorem decodeCastPtrProv_encodeCastBytes_set_position_ne
+    (bits numBytes allocId allocId' i pos' : Nat) (d : UInt8)
+    (h_i : i < numBytes) (h_pos : pos' ≠ i) :
+    decodeCastPtrProv
+      ((encodeCastBytes bits numBytes (some allocId)).set i
+        { data := d, prov := some { allocId := allocId', position := pos' } }) = none :=
+  decodeCastPtrProv_eq_none_of_position_ne _ i (by simp [h_i])
+    { allocId := allocId', position := pos' } (by simp) h_pos
+
+/-- Transmute-level mixed-fragment overwrite: reloading the bytes of a stored thin pointer at a
+raw pointer type after overwriting any byte `i < pw.byteSize` with a fragment of a foreign
+allocation `allocId' ≠ p.allocId` yields a provenance-free pointer (`prov = none`). -/
+theorem decodeCastVal_rawPtr_foreign_overwrite_strips_provenance
+    (pw : PtrWidth) (p : ProvenancePtr) (allocId' i pos' : Nat) (d : UInt8)
+    (h_i : i < pw.byteSize) (h_ne : allocId' ≠ p.allocId) :
+    let bytes := (encodeCastBytes p.offsetBytes pw.byteSize (some p.allocId)).set i
+      { data := d, prov := some { allocId := allocId', position := pos' } }
+    decodeCastVal pw .rawPtr bytes =
+      some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none) := by
+  intro bytes
+  have h_len : bytes.length = pw.byteSize := by simp [bytes]
+  have h_lt : decodeCastIntBytes bytes < scalarModulus pw.byteSize := h_len ▸ decodeCastIntBytes_lt bytes
+  have h_valid : ScalarTy.rawPtr.isValidBits pw (decodeCastIntBytes bytes) = true :=
+    (ScalarTy.isValidBits_iff_validBits pw .rawPtr _).mpr ⟨h_lt, trivial⟩
+  have h_two : 2 ≤ pw.byteSize := by cases pw <;> decide
+  have h_prov : decodeCastPtrProv bytes = none :=
+    decodeCastPtrProv_encodeCastBytes_set_foreign p.offsetBytes pw.byteSize p.allocId allocId' i pos'
+      d h_i h_two h_ne
+  unfold decodeCastVal decodeCastPtrBytes
+  dsimp only [ScalarTy.isPtr]
+  rw [h_valid]
+  dsimp only
+  rw [h_prov]
+
+/-- Transmute-level shuffled-fragment overwrite: reloading the bytes of a stored thin pointer at a
+raw pointer type after overwriting any byte `i < pw.byteSize` with a fragment whose recorded
+position `pos' ≠ i` yields a provenance-free pointer (`prov = none`). -/
+theorem decodeCastVal_rawPtr_position_mismatch_strips_provenance
+    (pw : PtrWidth) (p : ProvenancePtr) (allocId' i pos' : Nat) (d : UInt8)
+    (h_i : i < pw.byteSize) (h_pos : pos' ≠ i) :
+    let bytes := (encodeCastBytes p.offsetBytes pw.byteSize (some p.allocId)).set i
+      { data := d, prov := some { allocId := allocId', position := pos' } }
+    decodeCastVal pw .rawPtr bytes =
+      some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes bytes } none) := by
+  intro bytes
+  have h_len : bytes.length = pw.byteSize := by simp [bytes]
+  have h_lt : decodeCastIntBytes bytes < scalarModulus pw.byteSize := h_len ▸ decodeCastIntBytes_lt bytes
+  have h_valid : ScalarTy.rawPtr.isValidBits pw (decodeCastIntBytes bytes) = true :=
+    (ScalarTy.isValidBits_iff_validBits pw .rawPtr _).mpr ⟨h_lt, trivial⟩
+  have h_prov : decodeCastPtrProv bytes = none :=
+    decodeCastPtrProv_encodeCastBytes_set_position_ne p.offsetBytes pw.byteSize p.allocId allocId'
+      i pos' d h_i h_pos
+  unfold decodeCastVal decodeCastPtrBytes
+  dsimp only [ScalarTy.isPtr]
+  rw [h_valid]
+  dsimp only
+  rw [h_prov]
+
+/-- Misaligned pointer slice theorem: if a pointer encoded via `encodeCastBytes` is sliced at a
+non-zero byte offset `k + 1 < numBytes` (plus any trailing `suffix` bytes, e.g. from an adjacent
+composite field), the resulting slice starts with a fragment of `position = k + 1 ≠ 0` and
+therefore decodes with `decodeCastPtrProv = none`. -/
+theorem decodeCastPtrProv_drop_succ_encodeCastBytes
+    (bits numBytes allocId k : Nat) (suffix : List CastByte)
+    (h_k : k + 1 < numBytes) :
+    decodeCastPtrProv
+      ((encodeCastBytes bits numBytes (some allocId)).drop (k + 1) ++ suffix) = none := by
+  have h_all := (checkProvenanceFrags_eq_true_iff allocId
+    (encodeCastBytes bits numBytes (some allocId)) 0).mp
+    (checkProvenanceFrags_encodeCastBytesAux allocId bits numBytes 0)
+  have h_len_drop : 0 < ((encodeCastBytes bits numBytes (some allocId)).drop (k + 1)).length := by
+    simp
+    omega
+  have h_len_app : 0 < ((encodeCastBytes bits numBytes (some allocId)).drop (k + 1) ++ suffix).length := by
+    rw [List.length_append]
+    omega
+  apply decodeCastPtrProv_eq_none_of_position_ne _ 0 h_len_app
+    { allocId := allocId, position := k + 1 }
+  · rw [List.getElem_append_left h_len_drop, List.getElem_drop]
+    have h_elem := h_all (k + 1 + 0) (by simp; omega)
+    simpa using h_elem
+  · dsimp only
+    omega
+
 /-- Exact refinement bridge: erasing per-byte fragment positions via
 `CastByte.toTrustedAbstractByte` maps `encodeCastBytesAux` to `Trusted.MirSemantics.encodeLittleEndianBytes`. -/
 theorem map_toTrustedAbstractByte_encodeCastBytesAux
@@ -1442,8 +1572,320 @@ theorem episode1_ptr_int_ptr_test_vectors :
     evalIntToPtrExposed .bits64 0x12345678 none [] =
       .ok (.ptr { allocId := 0, offsetBytes := 0x12345678 } none) [] ∧
     evalPtrToIntExpose .bits32 .usize { allocId := 0, offsetBytes := 0x41 } [] none =
-      .ok (.scalar 0x41) [] := by
-  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
+      .ok (.scalar 0x41) [] ∧
+    evalPtrToIntExpose .bits64 .u32 { allocId := 1, offsetBytes := 0x100000005 } [] =
+      .ok (.scalar 5) [1] := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `evalPtrToIntExposeTyped` specialized to `ScalarTy.rawPtr` is definitionally
+`evalPtrToIntExpose`. -/
+@[simp]
+theorem evalPtrToIntExposeTyped_rawPtr_eq
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (p : ProvenancePtr)
+    (exposed : ExposedProvenance)
+    (prov : Option Nat) :
+    evalPtrToIntExposeTyped pw .rawPtr dst p exposed prov =
+      evalPtrToIntExpose pw dst p exposed prov := rfl
+
+/-- Null-reference rejection in `PtrToInt` (`rvalue.rs:2155-2160`): when the source operand of
+`CastKind.pointerExposeProvenance` has reference type (`ScalarTy.refPtr`) and null address
+(`offsetBytes = 0`), `evalPtrToIntExposeTyped` faults with `.ub` *without* exposing provenance. -/
+theorem evalPtrToIntExposeTyped_refPtr_zero_ub
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (allocId : Nat)
+    (exposed : ExposedProvenance)
+    (prov : Option Nat)
+    (h_int : dst.isIntegral = true) :
+    evalPtrToIntExposeTyped pw .refPtr dst { allocId := allocId, offsetBytes := 0 } exposed prov =
+      .ub := by
+  have h_inv : ScalarTy.refPtr.isValidBits pw 0 = false := by
+    cases pw <;> rfl
+  unfold evalPtrToIntExposeTyped
+  rw [h_int, h_inv]
+  rfl
+
+/-- Reference-source `PtrToInt -> IntToPtr` round trip
+(`test_b2_ptr_to_int_evaluates_reference_sources_accepted_by_lowering` in `rvalue.rs`):
+for any non-null reference `p` (`0 < p.offsetBytes < scalarModulus pw.byteSize`) and integral
+target `dst` wide enough to hold `p.offsetBytes`, `evalPtrToIntExposeTyped pw .refPtr dst`
+evaluates to `.ok (.scalar p.offsetBytes) (exposeProv p.allocId exposed)` and
+`evalIntToPtrExposed` reconstructs `.ok (.ptr p (some p.allocId))`. -/
+theorem evalPtrToIntExposeTyped_refPtr_roundtrip
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (p : ProvenancePtr)
+    (exposed : ExposedProvenance)
+    (h_int : dst.isIntegral = true)
+    (h_nonnull : 0 < p.offsetBytes)
+    (h_off : p.offsetBytes < scalarModulus pw.byteSize)
+    (h_fit : p.offsetBytes < scalarModulus (dst.sizeBytes pw)) :
+    evalPtrToIntExposeTyped pw .refPtr dst p exposed =
+      .ok (.scalar p.offsetBytes) (exposeProv p.allocId exposed) ∧
+    evalIntToPtrExposed pw p.offsetBytes (some p.allocId) (exposeProv p.allocId exposed) =
+      .ok (.ptr p (some p.allocId)) (exposeProv p.allocId exposed) := by
+  have h_valid_ref : ScalarTy.refPtr.isValidBits pw p.offsetBytes = true :=
+    (ScalarTy.isValidBits_iff_validBits pw .refPtr p.offsetBytes).mpr ⟨h_off, h_nonnull⟩
+  refine ⟨?_, (ptrToInt_intToPtr_roundtrip pw dst p exposed h_int h_off h_fit).2⟩
+  unfold evalPtrToIntExposeTyped
+  rw [h_int, h_valid_ref, Nat.mod_eq_of_lt h_fit]
+  rfl
+
+/-- `scalarModulus n` is strictly positive for every `n : Nat`. -/
+theorem scalarModulus_pos (n : Nat) : 0 < scalarModulus n := by
+  induction n with
+  | zero => decide
+  | succ k ih =>
+    change 0 < 256 * scalarModulus k
+    omega
+
+/-- `scalarModulus` is monotone: `m ≤ n → scalarModulus m ≤ scalarModulus n`. -/
+theorem scalarModulus_mono {m n : Nat} (h : m ≤ n) :
+    scalarModulus m ≤ scalarModulus n := by
+  induction n with
+  | zero =>
+    have hm : m = 0 := by omega
+    subst hm
+    exact Nat.le_refl _
+  | succ k ih =>
+    by_cases hmk : m ≤ k
+    · have h_ih := ih hmk
+      change scalarModulus m ≤ 256 * scalarModulus k
+      omega
+    · have hm : m = k + 1 := by omega
+      subst hm
+      exact Nat.le_refl _
+
+/-- Truncating `PtrToInt -> IntToPtr` theorem (`test_eval_ptr_to_int_truncation` in `cast.rs`):
+when a pointer `p` is cast to a narrower integral type `dst` (`dst.sizeBytes pw ≤ pw.byteSize`,
+e.g. `u8`, `u16`, `u32` on 64-bit targets), `evalPtrToIntExpose` truncates the address to
+`p.offsetBytes % scalarModulus (dst.sizeBytes pw)` while *still* exposing `p.allocId`; casting
+that truncated integer back via `evalIntToPtrExposed` predicting `some p.allocId` succeeds and
+yields `{ allocId := p.allocId, offsetBytes := p.offsetBytes % scalarModulus (dst.sizeBytes pw) }`
+(same allocation provenance at the low-order truncated offset). -/
+theorem ptrToInt_truncating_exposes_and_reconstructs_low_bits
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (p : ProvenancePtr)
+    (exposed : ExposedProvenance)
+    (h_int : dst.isIntegral = true)
+    (h_narrow : dst.sizeBytes pw ≤ pw.byteSize)
+    (h_off : p.offsetBytes < scalarModulus pw.byteSize) :
+    let truncAddr := p.offsetBytes % scalarModulus (dst.sizeBytes pw)
+    let exposed' := exposeProv p.allocId exposed
+    evalPtrToIntExpose pw dst p exposed = .ok (.scalar truncAddr) exposed' ∧
+    evalIntToPtrExposed pw truncAddr (some p.allocId) exposed' =
+      .ok (.ptr { allocId := p.allocId, offsetBytes := truncAddr } (some p.allocId)) exposed' := by
+  dsimp only
+  have h_pos : 0 < scalarModulus (dst.sizeBytes pw) := scalarModulus_pos (dst.sizeBytes pw)
+  have h_mod_lt_dst :
+      p.offsetBytes % scalarModulus (dst.sizeBytes pw) < scalarModulus (dst.sizeBytes pw) :=
+    Nat.mod_lt p.offsetBytes h_pos
+  have h_mono : scalarModulus (dst.sizeBytes pw) ≤ scalarModulus pw.byteSize :=
+    scalarModulus_mono h_narrow
+  have h_mod_lt_pw :
+      p.offsetBytes % scalarModulus (dst.sizeBytes pw) < scalarModulus pw.byteSize :=
+    Nat.lt_of_lt_of_le h_mod_lt_dst h_mono
+  refine ⟨evalPtrToIntExpose_eq pw dst p exposed (some p.allocId) h_int h_off, ?_⟩
+  exact evalIntToPtrExposed_some_of_isExposed pw
+    (p.offsetBytes % scalarModulus (dst.sizeBytes pw)) p.allocId (exposeProv p.allocId exposed)
+    h_mod_lt_pw (isExposed_exposeProv p.allocId exposed)
+
+/-- Soundness of the deterministic provenance picker (`pickExposedProv`): any provenance returned
+by `pickExposedProv pick exposed` is guaranteed to be exposed in `exposed`. -/
+theorem isExposed_of_pickExposedProv_eq_some
+    (pick : Bool)
+    (exposed : ExposedProvenance)
+    (allocId : Nat)
+    (h_pick : pickExposedProv pick exposed = some allocId) :
+    isExposed allocId exposed := by
+  cases pick with
+  | false => contradiction
+  | true =>
+    cases exposed with
+    | nil => contradiction
+    | cons head tail =>
+      dsimp [pickExposedProv] at h_pick
+      injection h_pick with h_eq
+      subst h_eq
+      exact List.Mem.head tail
+
+/-- Deterministic `IntToPtr` (`evalIntToPtrDeterministic`, matching `rvalue.rs:2202-2210`)
+never fails with `UnexposedProvenance`: for any valid address `addr < scalarModulus pw.byteSize`,
+it always evaluates to `.ok`, picking the head exposed provenance when `pick = true` and
+`exposed` is non-empty, and `none` otherwise. -/
+theorem evalIntToPtrDeterministic_eq_ok
+    (pw : PtrWidth)
+    (pick : Bool)
+    (addr : Nat)
+    (exposed : ExposedProvenance)
+    (h_addr : addr < scalarModulus pw.byteSize) :
+    evalIntToPtrDeterministic pw pick addr exposed =
+      match pick, exposed with
+      | true, allocId :: _ =>
+        .ok (.ptr { allocId := allocId, offsetBytes := addr } (some allocId)) exposed
+      | _, _ =>
+        .ok (.ptr { allocId := 0, offsetBytes := addr } none) exposed := by
+  unfold evalIntToPtrDeterministic
+  cases pick with
+  | false =>
+    dsimp [pickExposedProv]
+    exact evalIntToPtrExposed_none pw addr exposed h_addr
+  | true =>
+    cases exposed with
+    | nil =>
+      dsimp [pickExposedProv]
+      exact evalIntToPtrExposed_none pw addr [] h_addr
+    | cons allocId rest =>
+      dsimp [pickExposedProv]
+      exact evalIntToPtrExposed_some_of_isExposed pw addr allocId (allocId :: rest) h_addr
+        (List.Mem.head rest)
+
+/-- Oracle-free deterministic `PtrToInt -> IntToPtr` round trip from an initially empty exposed
+set (`exposed = []`): `evalPtrToIntExpose` exposes `p.allocId` as the unique entry `[p.allocId]`,
+after which `evalIntToPtrDeterministic pw true` deterministically selects `some p.allocId` and
+reconstructs `.ok (.ptr p (some p.allocId)) [p.allocId]` with no external oracle prediction. -/
+theorem ptrToInt_intToPtrDeterministic_roundtrip_from_empty
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (p : ProvenancePtr)
+    (h_int : dst.isIntegral = true)
+    (h_off : p.offsetBytes < scalarModulus pw.byteSize)
+    (h_fit : p.offsetBytes < scalarModulus (dst.sizeBytes pw)) :
+    evalPtrToIntExpose pw dst p [] = .ok (.scalar p.offsetBytes) [p.allocId] ∧
+    evalIntToPtrDeterministic pw true p.offsetBytes [p.allocId] =
+      .ok (.ptr p (some p.allocId)) [p.allocId] := by
+  refine ⟨(ptrToInt_intToPtr_roundtrip pw dst p [] h_int h_off h_fit).1, ?_⟩
+  cases p
+  exact evalIntToPtrDeterministic_eq_ok pw true _ _ h_off
+
+/-- Type-safety of `decodeCastVal`: any value decoded by `decodeCastVal pw dst bytes` satisfies
+`CastVal.WellTyped pw dst`. -/
+theorem decodeCastVal_wellTyped
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (bytes : List CastByte)
+    (val : CastVal)
+    (h_dec : decodeCastVal pw dst bytes = some val) :
+    CastVal.WellTyped pw dst val := by
+  unfold decodeCastVal at h_dec
+  cases h_ptr : dst.isPtr with
+  | false =>
+    rw [h_ptr] at h_dec
+    dsimp only at h_dec
+    cases h_v : dst.isValidBits pw (decodeCastIntBytes bytes) with
+    | false =>
+      rw [h_v] at h_dec
+      contradiction
+    | true =>
+      rw [h_v] at h_dec
+      injection h_dec with h_val
+      subst h_val
+      exact ⟨h_ptr, (ScalarTy.isValidBits_iff_validBits pw dst _).mp h_v⟩
+  | true =>
+    rw [h_ptr] at h_dec
+    dsimp only at h_dec
+    cases h_v : dst.isValidBits pw (decodeCastIntBytes bytes) with
+    | false =>
+      rw [h_v] at h_dec
+      contradiction
+    | true =>
+      rw [h_v] at h_dec
+      injection h_dec with h_val
+      subst h_val
+      unfold decodeCastPtrBytes
+      have h_valid_prop := (ScalarTy.isValidBits_iff_validBits pw dst _).mp h_v
+      cases decodeCastPtrProv bytes with
+      | none =>
+        exact ⟨h_ptr, h_valid_prop, Or.inr ⟨rfl, rfl⟩⟩
+      | some allocId =>
+        exact ⟨h_ptr, h_valid_prop, Or.inl rfl⟩
+
+/-- Type-safety of `evalTransmuteSameSize`: whenever `evalTransmuteSameSize` returns
+`.ok val' exposed'`, the output value `val'` is well-typed for the target descriptor `dst`
+(`CastVal.WellTyped pw dst val'`). -/
+theorem evalTransmuteSameSize_wellTyped
+    (pw : PtrWidth)
+    (policy : TransmutePolicy)
+    (src dst : ScalarTy)
+    (val val' : CastVal)
+    (exposed exposed' : ExposedProvenance)
+    (h_eval : evalTransmuteSameSize pw policy src dst val exposed = .ok val' exposed') :
+    CastVal.WellTyped pw dst val' := by
+  unfold evalTransmuteSameSize at h_eval
+  repeat' split at h_eval
+  all_goals try contradiction
+  injection h_eval with h_v _
+  subst h_v
+  exact decodeCastVal_wellTyped pw dst _ _ ‹_›
+
+/-- Type-safety of `evalPtrToPtrCast`: any `.ok val' exposed'` result of `evalPtrToPtrCast`
+satisfies `CastVal.WellTyped pw .rawPtr val'`. -/
+theorem evalPtrToPtrCast_wellTyped
+    (pw : PtrWidth)
+    (p : ProvenancePtr)
+    (exposed exposed' : ExposedProvenance)
+    (prov : Option Nat)
+    (val' : CastVal)
+    (h_eval : evalPtrToPtrCast pw p exposed prov = .ok val' exposed') :
+    CastVal.WellTyped pw .rawPtr val' := by
+  unfold evalPtrToPtrCast at h_eval
+  cases h_v : ScalarTy.rawPtr.isValidBits pw p.offsetBytes with
+  | false =>
+    rw [h_v] at h_eval
+    contradiction
+  | true =>
+    rw [h_v] at h_eval
+    have h_vp := (ScalarTy.isValidBits_iff_validBits pw .rawPtr p.offsetBytes).mp h_v
+    cases prov with
+    | none =>
+      dsimp only at h_eval
+      injection h_eval with h_val _
+      subst h_val
+      exact ⟨rfl, h_vp, Or.inr ⟨rfl, rfl⟩⟩
+    | some allocId =>
+      dsimp only at h_eval
+      injection h_eval with h_val _
+      subst h_val
+      exact ⟨rfl, h_vp, Or.inl rfl⟩
+
+/-- Type-safety of `evalIntToPtrExposed`: any `.ok val' exposed'` result of `evalIntToPtrExposed`
+satisfies `CastVal.WellTyped pw .rawPtr val'`. -/
+theorem evalIntToPtrExposed_wellTyped
+    (pw : PtrWidth)
+    (addr : Nat)
+    (predicted : Option Nat)
+    (exposed exposed' : ExposedProvenance)
+    (val' : CastVal)
+    (h_eval : evalIntToPtrExposed pw addr predicted exposed = .ok val' exposed') :
+    CastVal.WellTyped pw .rawPtr val' := by
+  unfold evalIntToPtrExposed at h_eval
+  cases h_v : ScalarTy.rawPtr.isValidBits pw addr with
+  | false =>
+    rw [h_v] at h_eval
+    contradiction
+  | true =>
+    rw [h_v] at h_eval
+    have h_vp := (ScalarTy.isValidBits_iff_validBits pw .rawPtr addr).mp h_v
+    cases predicted with
+    | none =>
+      dsimp only at h_eval
+      injection h_eval with h_val _
+      subst h_val
+      exact ⟨rfl, h_vp, Or.inr ⟨rfl, rfl⟩⟩
+    | some allocId =>
+      dsimp only at h_eval
+      cases h_exp : isExposedBool allocId exposed with
+      | false =>
+        rw [h_exp] at h_eval
+        contradiction
+      | true =>
+        rw [h_exp] at h_eval
+        injection h_eval with h_val _
+        subst h_val
+        exact ⟨rfl, h_vp, Or.inl rfl⟩
 
 /-- Helper: any integral `ScalarTy` (`int` or `uint`) with `bits < scalarModulus (ty.sizeBytes pw)`
 satisfies `ty.isValidBits pw bits = true`. -/
@@ -1462,6 +1904,41 @@ theorem ScalarTy.isValidBits_of_isIntegral
   | uint w => exact ⟨h_bits, trivial⟩
   | rawPtr => contradiction
   | refPtr => contradiction
+
+/-- Type-safety of `evalPtrToIntExpose`: any `.ok val' exposed'` result of `evalPtrToIntExpose`
+satisfies `CastVal.WellTyped pw dst val'`. -/
+theorem evalPtrToIntExpose_wellTyped
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (p : ProvenancePtr)
+    (exposed exposed' : ExposedProvenance)
+    (prov : Option Nat)
+    (val' : CastVal)
+    (h_eval : evalPtrToIntExpose pw dst p exposed prov = .ok val' exposed') :
+    CastVal.WellTyped pw dst val' := by
+  unfold evalPtrToIntExpose at h_eval
+  cases h_int : dst.isIntegral with
+  | false =>
+    rw [h_int] at h_eval
+    contradiction
+  | true =>
+    rw [h_int] at h_eval
+    dsimp only at h_eval
+    cases h_v : ScalarTy.rawPtr.isValidBits pw p.offsetBytes with
+    | false =>
+      rw [h_v] at h_eval
+      contradiction
+    | true =>
+      rw [h_v] at h_eval
+      injection h_eval with h_val _
+      subst h_val
+      have h_nonptr : dst.isPtr = false := by
+        cases dst <;> simp [ScalarTy.isIntegral, ScalarTy.isPtr] at h_int ⊢
+      have h_mod_lt :
+          p.offsetBytes % scalarModulus (dst.sizeBytes pw) < scalarModulus (dst.sizeBytes pw) :=
+        Nat.mod_lt p.offsetBytes (scalarModulus_pos (dst.sizeBytes pw))
+      have h_valid_dst := ScalarTy.isValidBits_of_isIntegral pw dst _ h_int h_mod_lt
+      exact ⟨h_nonptr, (ScalarTy.isValidBits_iff_validBits pw dst _).mp h_valid_dst⟩
 
 /-- Transmuting an integer to `ScalarTy.rawPtr` yields a pointer with `Option.none` provenance
 (`allocId = 0`, `offsetBytes = bits`, `prov = none`) without modifying `exposed`. -/
@@ -1592,6 +2069,20 @@ theorem transmute_same_ty_id
         dsimp at h_zero
         subst h_zero
         cases policy <;> rfl
+
+/-- Target idempotence of `evalTransmuteSameSize`: if `evalTransmuteSameSize` from `src` to `dst`
+succeeds with `.ok val' exposed'`, then transmuting `val'` from `dst` to `dst` is the identity
+(`.ok val' exposed'`). -/
+theorem evalTransmuteSameSize_idempotent_target
+    (pw : PtrWidth)
+    (policy : TransmutePolicy)
+    (src dst : ScalarTy)
+    (val val' : CastVal)
+    (exposed exposed' : ExposedProvenance)
+    (h_eval : evalTransmuteSameSize pw policy src dst val exposed = .ok val' exposed') :
+    evalTransmuteSameSize pw policy dst dst val' exposed' = .ok val' exposed' :=
+  transmute_same_ty_id pw policy dst val' exposed'
+    (evalTransmuteSameSize_wellTyped pw policy src dst val val' exposed exposed' h_eval)
 
 /-- Same-width integer transmute round-trip theorem: for any two integer types `ty1`, `ty2`
 (`int` or `uint`) with `ty1.sizeBytes pw = ty2.sizeBytes pw` and valid `bits < scalarModulus (ty1.sizeBytes pw)`,
@@ -3820,5 +4311,161 @@ theorem trusted_pointerExposeProvenance_address_model_bridge
       exact (Nat.mul_eq_zero.mp h0).resolve_right (by decide)
     · intro h
       rw [h, Nat.zero_mul, Nat.zero_add]
+
+/-- `Trusted.MirSemantics.mergeByteProvenance` always retains `some pv` on the left, regardless
+of the right-hand provenance `restProv` (even when `restProv = none` or carries a different
+allocation!). -/
+@[simp]
+theorem trusted_mergeByteProvenance_some_left
+    (pv : Nat × Nat) (restProv : Option (Nat × Nat)) :
+    mergeByteProvenance (some pv) restProv = some pv := by
+  cases restProv <;> rfl
+
+/-- **Divergence (partial pointer overwrite provenance retention in `Trusted` vs. MiniRust
+fragment stripping in Anneal).** Because `Trusted.MirSemantics.mergeByteProvenance` retains the
+first non-`none` byte provenance (`trusted_mergeByteProvenance_some_left`), overwriting byte `1`
+(or any non-zero byte) of an 8-byte encoded pointer with a provenance-free byte `.init d none`
+*still* decodes in `Trusted.MirSemantics.decodeValueFromBytes` at `{ kind := .rawPtr m pt, .. }`
+to a pointer carrying `allocId = p.allocId`. By contrast, Anneal's `decodeCastVal` (mirroring
+MiniRust `decode_ptr` and Episode 1's `decode_ptr_bytes`) checks all `pw.byteSize` provenance
+fragments (`checkProvenanceFrags`) and strips provenance (`prov = none`, `allocId = 0`) whenever
+any byte `i < pw.byteSize` is overwritten. -/
+theorem trusted_vs_anneal_partial_overwrite_provenance_divergence
+    (fuel : Nat)
+    (layouts : LayoutTable)
+    (m : Mutability)
+    (pt : RigidTy)
+    (lIdx : Nat)
+    (p : ProvenancePtr)
+    (d : UInt8)
+    (h_thin : isThinPointee pt = true) :
+    let trustedOverwritten :=
+      (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))).set 1 (.init d none)
+    let annealOverwritten :=
+      (encodeCastBytes p.offsetBytes 8 (some p.allocId)).set 1 { data := d, prov := none }
+    (∃ newOffset,
+      decodeValueFromBytes (fuel + 1) layouts { kind := .rawPtr m pt, layoutIdx := lIdx }
+          trustedOverwritten =
+        .some (.ptr { allocId := p.allocId, offsetBytes := newOffset } 8)) ∧
+    decodeCastVal .bits64 .rawPtr annealOverwritten =
+      some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes annealOverwritten } none) := by
+  intro trustedOverwritten annealOverwritten
+  refine ⟨?_, decodeCastVal_rawPtr_partial_overwrite_strips_provenance .bits64 p 1 d (by decide)⟩
+  have h_len_tail :
+      Trusted.Sequence.length (encodeLittleEndianBytes ((p.offsetBytes / 256) / 256) 6
+        (some (p.allocId, p.tag))) = 6 :=
+    trusted_length_encodeLittleEndianBytes _ 6 _
+  have h_bound_tail : (p.offsetBytes / 256) / 256 % scalarModulus 6 < scalarModulus 6 :=
+    Nat.mod_lt _ (scalarModulus_pos 6)
+  have h_dec_tail :
+      ∃ highBits restProv,
+        decodeLittleEndianBytes (encodeLittleEndianBytes ((p.offsetBytes / 256) / 256) 6
+          (some (p.allocId, p.tag))) = .some (highBits, restProv) := by
+    generalize (p.offsetBytes / 256) / 256 = x
+    refine ⟨(x % 256) + 256 * ((x / 256 % 256) + 256 * ((x / 256 / 256 % 256) +
+      256 * ((x / 256 / 256 / 256 % 256) + 256 * ((x / 256 / 256 / 256 / 256 % 256) +
+        256 * ((x / 256 / 256 / 256 / 256 / 256 % 256) + 256 * 0))))),
+      some (p.allocId, p.tag), ?_⟩
+    rfl
+  rcases h_dec_tail with ⟨highBits, restProv, h_tail⟩
+  let b0 := UInt8.ofNat p.offsetBytes
+  let newOffset := b0.toBitVec.toNat + 256 * (d.toBitVec.toNat + 256 * highBits)
+  refine ⟨newOffset, ?_⟩
+  have h_over_eq :
+      trustedOverwritten =
+        .init b0 (some (p.allocId, p.tag)) ::
+        .init d none ::
+        encodeLittleEndianBytes ((p.offsetBytes / 256) / 256) 6 (some (p.allocId, p.tag)) := rfl
+  have h_len8 : Trusted.Sequence.length trustedOverwritten = 8 := by
+    rw [h_over_eq]
+    change Nat.succ (Nat.succ (Trusted.Sequence.length _)) = 8
+    rw [h_len_tail]
+  have h_dle :
+      decodeLittleEndianBytes trustedOverwritten =
+        .some (newOffset, some (p.allocId, p.tag)) := by
+    rw [h_over_eq, trusted_decodeLittleEndianBytes_init_cons,
+      trusted_decodeLittleEndianBytes_init_cons, h_tail]
+    dsimp only
+    rw [trusted_mergeByteProvenance_some_left]
+    rfl
+  have h_dsc :
+      decodeScalarBytes trustedOverwritten false =
+        .some (⟨newOffset, 8⟩, some (p.allocId, p.tag)) := by
+    unfold decodeScalarBytes
+    rw [h_len8, h_dle]
+  have h_beq8 : Nat.beq (Trusted.Sequence.length trustedOverwritten) 8 = true := by
+    rw [h_len8]
+    rfl
+  rw [trusted_decodeValueFromBytes_thin_rawPtr_eq fuel layouts m pt lIdx trustedOverwritten h_thin,
+    h_beq8]
+  dsimp only
+  rw [h_dsc]
+
+/-- Step-level correspondence in `Trusted.MirSemantics` between `Rvalue.cast .transmute` and
+`Rvalue.cast .ptrToPtr` on any thin pointer source (`rawPtr` or `refPtr`) and thin raw-pointer
+target (`*const U` / `*mut U`) when `lookupBorrow mem.borrows p.tag = none`: both evaluate to
+`ok (.ptr p 8) locals' mem`. -/
+theorem trusted_transmute_thin_rawPtr_eq_ptrToPtr_cast
+    (src : ScalarTy)
+    (m1 m2 : Mutability)
+    (pt1 pt2 : RigidTy)
+    (p : ProvenancePtr)
+    (locals locals' : List LocalSlot)
+    (op : Operand)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcLIdx dstLIdx : Nat)
+    (h_src : src.isPtr = true)
+    (h_thin1 : isThinPointee pt1 = true)
+    (h_thin2 : isThinPointee pt2 = true)
+    (h_src_valid : src.validBits .bits64 p.offsetBytes)
+    (h_lookup : lookupBorrow mem.borrows p.tag = none)
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok (.ptr p 8) locals')
+    (h_ty : operandTy localDecls layouts op =
+      .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
+    let dstTy : Ty := { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx }
+    evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
+      ok (.ptr p 8) locals' mem ∧
+    evalRvalue locals (.cast .ptrToPtr op dstTy) mem localDecls layouts =
+      ok (.ptr p 8) locals' mem ∧
+    evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
+      evalRvalue locals (.cast .ptrToPtr op dstTy) mem localDecls layouts := by
+  dsimp only
+  have h_off : p.offsetBytes < scalarModulus 8 := by
+    have hb := h_src_valid.1
+    rw [ScalarTy.sizeBytes_of_isPtr .bits64 src h_src] at hb
+    exact hb
+  have h_bc := (trusted_evalByteCast_thin_ptr_transmute_correspondence .rejectPtrToInt src .rawPtr
+    m1 m2 pt1 pt2 p [] locals locals' op mem localDecls layouts srcLIdx dstLIdx h_src rfl h_thin1
+    h_thin2 h_src_valid ⟨h_off, trivial⟩ h_op h_ty).2.1
+  have h_transmute :
+      evalRvalue locals (.cast .transmute op { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
+        mem localDecls layouts = ok (.ptr p 8) locals' mem := h_bc
+  have h_ptrToPtr :
+      evalRvalue locals (.cast .ptrToPtr op { kind := .rawPtr m2 pt2, layoutIdx := dstLIdx })
+        mem localDecls layouts = ok (.ptr p 8) locals' mem := by
+    dsimp only [evalRvalue]
+    rw [h_op]
+    dsimp only
+    rw [h_lookup]
+    cases pt2 <;> try (simp [isThinPointee] at h_thin2)
+    all_goals
+      dsimp only
+      split <;> first | contradiction | rfl
+  exact ⟨h_transmute, h_ptrToPtr, h_transmute.trans h_ptrToPtr.symm⟩
+
+/-- In `Trusted.MirSemantics`, `Rvalue.cast .transmute` and `Rvalue.cast .subtype` share the
+exact same `evalByteCast` evaluator and are definitionally equal for all arguments. -/
+theorem trusted_transmute_eq_subtype_cast
+    (locals : List LocalSlot)
+    (op : Operand)
+    (dstTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
+      evalRvalue locals (.cast .subtype op dstTy) mem localDecls layouts := rfl
 
 end Anneal.Mir.Cast
