@@ -5600,9 +5600,13 @@ theorem stmt_div_assign_uninit_union_nested_pair_ok :
       .some (.none, "none", .some (.scalar ⟨99, 4⟩)) := by
   rfl
 
-/-- `D13b` negative boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
+/-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
 writing an array element `_1[_2] = const 10_u64` into an uninitialized array
-local `_1` (where `_2 = const 0_usize`) faults with `FailureKind.ub`:
+local `_1` (where `_2 = const 0_usize`) still faults with `FailureKind.ub`.
+MiniRust (`eval_place` on `PlaceExpr::Index` only checks the index against the
+static element count) and Miri accept this write; Anneal keeps the fault because
+the `D13b` repair is scoped to field projections, so this witness guards that
+boundary rather than asserting Rust semantics:
 ```text
 StorageLive(_1); StorageLive(_2); _2 = const 0_usize;
 _1[_2] = const 10_u64; _0 = const 0_u64; return
@@ -5625,10 +5629,13 @@ theorem stmt_div_assign_uninit_array_index_is_ub :
       .some (.some .ub, "_1[_2] = 10", .none) := by
   rfl
 
-/-- `D13b` negative boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
+/-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
 writing an enum variant field `((_1 as Variant#0).0) = const 10_u64` into an
-uninitialized enum local `_1` (without `SetDiscriminant`) faults with
-`FailureKind.ub`:
+uninitialized enum local `_1` (without `SetDiscriminant`) still faults with
+`FailureKind.ub`. MiniRust (`eval_place` on `PlaceExpr::Downcast` returns the
+root place at the variant type without any check) and Miri accept this write;
+Anneal keeps the fault because the `D13b` repair is scoped to field projections,
+so this witness guards that boundary rather than asserting Rust semantics:
 ```text
 StorageLive(_1); ((_1 as A).0) = const 10_u64; _0 = const 0_u64; return
 ``` -/
@@ -5804,6 +5811,92 @@ theorem mir_uninit_aggregate_field_write_characterizations
       val locals₁ mem₁ locals₂,
     evalStmt_assign_uninit_non_aggregate_ub s dstLoc proj rest rv span localDecls layouts
       val locals₁ mem₁⟩
+
+/-- Whether every intermediate struct, union, or tuple field slot that
+`ensureNestedFieldShells val projs` visits along the `.field` chain of `projs`
+is already present and not `.unit` padding. Every value whose aggregates carry
+all of their fields along the chain satisfies it. -/
+def fieldShellChainPopulated : Value → List ProjectionElem → Bool
+  | .aggregate _ fields, .field fieldIdx fieldTy :: nextProj :: rest =>
+    let isInnerAggField :=
+      match fieldTy.kind, nextProj with
+      | .adt _ _, .field _ _ => true
+      | .tuple _, .field _ _ => true
+      | _, _ => false
+    match isInnerAggField with
+    | false => true
+    | true =>
+      match get? fields fieldIdx with
+      | .none => false
+      | .some .unit => false
+      | .some childVal => fieldShellChainPopulated childVal (nextProj :: rest)
+  | _, _ => true
+
+/-- Writing back the element already stored at `i` leaves the list unchanged. -/
+private theorem stmtDivSet?_self_of_get? {α : Type} (xs : List α) (i : Nat) (x : α)
+    (h : get? xs i = .some x) : set? xs i x = .some xs := by
+  unfold get? at h
+  unfold set?
+  have hlt : i < xs.length := (List.getElem?_eq_some_iff.mp h).1
+  have hx : xs[i] = x := (List.getElem?_eq_some_iff.mp h).2
+  simp [hlt, ← hx]
+
+/-- Non-regression for initialized roots (`D13b`): `ensureNestedFieldShells` is
+the identity on every value whose field chain along `projs` is populated
+(`fieldShellChainPopulated`). -/
+theorem ensureNestedFieldShells_eq_self_of_populated :
+    ∀ (projs : List ProjectionElem) (val : Value),
+      fieldShellChainPopulated val projs = true →
+      ensureNestedFieldShells val projs = val := by
+  intro projs
+  induction projs with
+  | nil => intro val _; cases val <;> rfl
+  | cons p tl ih =>
+    intro val hPop
+    cases tl with
+    | nil => cases p <;> cases val <;> rfl
+    | cons nextProj rest =>
+      cases p with
+      | field fieldIdx fieldTy =>
+        cases val with
+        | aggregate variantIdx fields =>
+          unfold fieldShellChainPopulated at hPop
+          unfold ensureNestedFieldShells
+          rcases fieldTy with ⟨kind, lidx⟩
+          have key : ∀ (childVal : Value),
+              get? fields fieldIdx = .some childVal →
+              fieldShellChainPopulated childVal (nextProj :: rest) = true →
+              (match set? fields fieldIdx (ensureNestedFieldShells childVal (nextProj :: rest)) with
+                | .some fields' => Value.aggregate variantIdx fields'
+                | .none => Value.aggregate variantIdx fields) = .aggregate variantIdx fields := by
+            intro childVal hGet hPop'
+            rw [ih childVal hPop', stmtDivSet?_self_of_get? fields fieldIdx _ hGet]
+          cases kind <;> cases nextProj <;> dsimp only at hPop ⊢ <;>
+            first
+            | rfl
+            | (cases hGet : get? fields fieldIdx with
+                | none => rw [hGet] at hPop; nomatch hPop
+                | some childVal =>
+                  rw [hGet] at hPop
+                  cases childVal with
+                  | unit => nomatch hPop
+                  | scalar sc => exact key _ hGet hPop
+                  | ptr pv sz => exact key _ hGet hPop
+                  | aggregate v fs => exact key _ hGet hPop)
+        | _ => rfl
+      | _ => cases val <;> rfl
+
+/-- Non-regression for initialized roots (`D13b`): on a root whose field chain
+along the written projection is populated, the projected write that `evalStmt`
+performs after `ensureNestedFieldShells` coincides with `writeProjectedValue` on
+the original root, i.e. with the behavior before nested shells were
+introduced. -/
+theorem writeProjectedValue_ensureNestedFieldShells_of_populated
+    (locals : List LocalSlot) (rootVal : Value) (projs : List ProjectionElem) (val : Value)
+    (hPop : fieldShellChainPopulated rootVal projs = true) :
+    writeProjectedValue locals (ensureNestedFieldShells rootVal projs) projs val =
+      writeProjectedValue locals rootVal projs val := by
+  rw [ensureNestedFieldShells_eq_self_of_populated projs rootVal hPop]
 
 end UninitAggregateFieldWrites
 

@@ -2190,6 +2190,13 @@ inner `.aggregate 0 ...` shell prevents `writeProjectedValue` from collapsing
 `.field 0` onto `.unit` (losing the inner aggregate wrapper) or faulting with
 `.ub` on `.field (k + 1)` against `.unit`.
 
+`evalStmt` applies this both to the default shell of an uninitialized
+destination (`uninitFieldWriteShell?`) and to the current value of an
+initialized destination before a projected write. Every slot it visits that is
+already present and not `.unit` is kept as is, so on a root whose intermediate
+field slots along the chain are all populated the result is the root itself and
+the write coincides with `writeProjectedValue` on the original root.
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
@@ -2306,7 +2313,10 @@ root pointer of a dereference and every `Index` local) to be initialized
 (`placeMentionOperandsInit`). A projected assignment into a live but
 uninitialized local writes into the default shell from `uninitFieldWriteShell?`
 when the projection starts with a field of a struct, union, or tuple local, and
-otherwise faults with `.ub`.
+otherwise faults with `.ub`. A projected assignment into an initialized local
+first materializes missing or `.unit`-padded intermediate struct, union, and
+tuple field shells along the written field chain (`ensureNestedFieldShells`),
+which leaves roots whose intermediate field slots are all populated unchanged.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
