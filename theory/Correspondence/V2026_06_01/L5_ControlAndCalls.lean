@@ -4807,6 +4807,91 @@ theorem stmt_div_storage_live_unprotected_disables :
                           perm := .disabled, protector := .some 1 }] }) := by
   rfl
 
+/-- `D2` retag-after-`StorageDead` regression (with global-allocation tag
+aliasing): retagging a reference `_2` after `StorageDead(_1)` faults with
+`FailureKind.ub` even when captured global allocation `stmtDivGlobal1` shares
+`allocId = 1` (removing `_1`'s borrow entry instead of disabling it would fall
+back to `lookupGlobalAlloc` and allow `Retag(_2)` to succeed):
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &_1;
+StorageDead(_1); Retag([default] _2); _0 = const 0_u64; return
+``` -/
+private def stmtDivDeadGlobalAliasRetagBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::retag_dead_reference_aliasing_global"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRefU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref .shared ⟨1, []⟩), span := "_2 = &_1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .retag .default ⟨2, []⟩, span := "Retag(_2)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_storage_dead_retag_is_ub :
+    diffCProbeBounded 16 stmtDivDeadGlobalAliasRetagBody
+      (.running (initMachineState stmtDivDeadGlobalAliasRetagBody [])) =
+      .some (.some .ub, "Retag(_2)", .none) := by
+  rfl
+
+/-- `D2` `copy_nonoverlapping` after `StorageDead` + `StorageLive` revival:
+copying 1 element from or to a pointer `_2` minted before `StorageDead(_1)` and
+`StorageLive(_1)` faults with `FailureKind.ub` even after `_1` is revived and
+re-initialized:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &raw mut _1; _0 = const 0_u64; _3 = &raw mut _0;
+StorageDead(_1); StorageLive(_1); _1 = const 20_u64;
+copy_nonoverlapping(src = copy _2, dst = copy _3, count = const 1_usize); return
+``` -/
+private def stmtDivReviveCopySrcBody : CapturedMir :=
+  stmtDivBody "stmt_div::copy_nonoverlapping_from_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" },
+      { kind := .assign ⟨3, []⟩ (.rawPtr .mut ⟨0, []⟩), span := "_3 = &raw mut _0" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .intrinsic (.copyNonOverlapping (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) (stmtDivConstUsize 1)),
+        span := "copy_nonoverlapping(src=_2, dst=_3, 1)" } ]
+
+theorem stmt_div_storage_revive_copy_nonoverlapping_is_ub :
+    diffCProbeBounded 16 stmtDivReviveCopySrcBody
+      (.running (initMachineState stmtDivReviveCopySrcBody [])) =
+      .some (.some .ub, "copy_nonoverlapping(src=_2, dst=_3, 1)", .none) := by
+  rfl
+
+/-- Positive control for `D9` + `D2` (`rustc_middle/src/mir/syntax.rs`:
+"`let _ = *ptr;` is fine even if the pointer is dangling"): mentioning `*_2` via
+`PlaceMention(*_2)` when `_2` is initialized succeeds even after its pointee
+`_1` has been deallocated by `StorageDead(_1)`:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &raw const _1;
+StorageDead(_1); PlaceMention(*_2); _0 = const 99_u64; return
+``` -/
+private def stmtDivPlaceMentionDanglingPtrOkBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_deref_dangling_pointer_ok"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .placeMention ⟨2, [.deref]⟩, span := "PlaceMention(*_2)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 99)), span := "_0 = 99" } ]
+
+theorem stmt_div_placeMention_deref_dangling_ok :
+    diffCProbeBounded 16 stmtDivPlaceMentionDanglingPtrOkBody
+      (.running (initMachineState stmtDivPlaceMentionDanglingPtrOkBody [])) =
+      .some (.none, "none", .some (.scalar ⟨99, 8⟩)) := by
+  rfl
+
 end StatementDivergenceRegressions
 
 end Correspondence.V2026_06_01.L5_ControlAndCalls
