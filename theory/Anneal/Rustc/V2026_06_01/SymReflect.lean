@@ -1851,7 +1851,7 @@ def symStepStmtConcrete
           st with
           stmtIdx := Nat.add st.stmtIdx 1
           slots := slots'
-          borrows := purgeLocalBorrows st.borrows loc
+          borrows := disableLocalBorrows st.borrows loc
         }
       | .none => .none
     | .none => .none
@@ -1864,7 +1864,7 @@ def symStepStmtConcrete
           st with
           stmtIdx := Nat.add st.stmtIdx 1
           slots := slots'
-          borrows := purgeLocalBorrows st.borrows loc
+          borrows := disableLocalBorrows st.borrows loc
         }
       | .none => .none
     | .none => .none

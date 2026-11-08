@@ -12198,7 +12198,7 @@ theorem PureMirModularConverges.step_stmt
           rcases m with ⟨_, _, bor, _, _, _, _, _, ap, _, _, _⟩
           dsimp only at h_ap
           subst h_ap
-          exact ⟨purgeLocalBorrows bor loc, rfl⟩
+          exact ⟨disableLocalBorrows bor loc, rfl⟩
     | storageDead loc =>
       unfold evalStmt at h_eval ⊢
       dsimp only [PureState.toMachineState] at h_eval ⊢
@@ -12215,7 +12215,7 @@ theorem PureMirModularConverges.step_stmt
           rcases m with ⟨_, _, bor, _, _, _, _, _, ap, _, _, _⟩
           dsimp only at h_ap
           subst h_ap
-          exact ⟨purgeLocalBorrows bor loc, rfl⟩
+          exact ⟨disableLocalBorrows bor loc, rfl⟩
     | deinit p =>
       unfold evalStmt at h_eval ⊢
       dsimp only [PureState.toMachineState] at h_eval ⊢

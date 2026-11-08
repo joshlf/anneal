@@ -1746,42 +1746,23 @@ def evalCopyNonOverlapping
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
-Test whether any `BorrowEntry` in `borrows` targets stack local `loc`
-(`entry.targetLocal == loc`), i.e. whether a reference or raw pointer minted
-from `loc`'s storage (directly by `Rvalue.ref` / `Rvalue.rawPtr`, or by a
-reborrow through such a pointer, whose entry inherits its parent's
-`targetLocal`) is still tracked in the Tree Borrows tag table.
-
-Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
-
-> "At any point during the execution of a function, each local is either
-> allocated or unallocated. Except as noted below, all locals except function
-> parameters are initially unallocated. `StorageLive` statements cause memory
-> to be allocated for the local while `StorageDead` statements cause the memory
-> to be freed. ... Using a local in any way (not only reading/writing from it)
-> while it is unallocated is UB."
--/
-def borrowsTargetLocal : List BorrowEntry → Local → Bool
-  | .nil, _ => false
-  | entry :: rest, loc =>
-    match Nat.beq entry.targetLocal loc with
-    | true => true
-    | false => borrowsTargetLocal rest loc
-
-/--
 Test whether any `BorrowEntry` in `borrows` targeting stack local `loc` carries a
 function-entry lifetime protector (`RetagKind.fnEntry`) that is still active in
 `activeProtectors` (`isBorrowProtected`).
 
-Freeing `loc`'s storage (`StorageDead(loc)`) acts as a write to every byte of
-the local that disables every tag minted from it, so the presence of such a
-protected tag makes the deallocation immediate undefined behavior. This check
-subsumes the whole-local foreign-write conflict check
+Freeing `loc`'s storage (`StorageDead(loc)`, or the implicit deallocation
+performed by `StorageLive(loc)`) acts as a write to every byte of the local that
+disables every tag minted from it (`disableLocalBorrows`), so the presence of
+such a protected tag makes the deallocation immediate undefined behavior. This
+check subsumes the whole-local foreign-write conflict check
 `hasProtectedWriteConflict borrows activeProtectors loc .none .nil`: unlike a
 foreign write, which tolerates `.reserved` (and already-`.disabled`) tags,
 deallocation rejects every protected tag regardless of its current permission.
+Function-entry protectors only cover memory owned by other frames (argument
+pointees), so with frame-relative `BorrowEntry.targetLocal` indices a protected
+entry can only match a local of the running frame through an index collision
+with a caller-frame local inside an inline callee frame, where the check errs
+on the side of `.ub`.
 
 Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
 `5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
@@ -1790,6 +1771,18 @@ Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
 > "When a reborrow occurs at function entry (i.e. the original reference is
 > passed as an argument), we add a *protector* to the reborrow. When a node is
 > protected, it is UB for this node to become `Disabled`."
+
+Reference (MiniRust `spec/mem/tree_borrows/memory.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/mem/tree_borrows/memory.md#L209-L215>
+
+> "// Check that ptr has the permission to write the entire allocation.
+> extra.root.access(Some(path), AccessKind::Write, Offset::ZERO, size)?;
+>
+> // Check that allocation is not strongly protected.
+> if extra.root.contains_strong_protector_preventing_deallocation() {
+>     throw_ub!("Tree Borrows: deallocating strongly protected allocation")
+> }"
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1815,18 +1808,35 @@ def hasProtectedLocalBorrow
     | false => hasProtectedLocalBorrow rest activeProtectors loc
 
 /--
-Remove every `BorrowEntry` targeting stack local `loc` from `borrows`.
+Disable every `BorrowEntry` in `borrows` targeting stack local `loc` (setting its
+Tree Borrows permission to `.disabled`), leaving every other entry unchanged.
 
 `StorageDead(loc)` frees `loc`'s storage and `StorageLive(loc)` allocates fresh
 storage for it (implicitly freeing any previous allocation), so every
-provenance tag minted from the previous allocation of `loc` (including
-reborrow descendants, which inherit `targetLocal` from their parent entry)
-becomes dangling. Purging those tags from the borrow table ensures that stale
-references and raw pointers created before `StorageDead(loc)` can never be
-resolved to (or revived into) the storage that a later `StorageLive(loc)`
-allocates: every subsequent access, reborrow, or retag through a purged tag
-finds no stack borrow entry and faults with `MirStepNode.fail .ub` unless it
-resolves to a captured global allocation.
+provenance tag minted from the previous allocation of `loc` (including reborrow
+descendants, which inherit `targetLocal` from their parent entry) becomes
+dangling. As in Tree Borrows, where deallocation is a write access to the whole
+allocation that leaves every tag of the dead allocation unusable, the entries
+stay in the borrow table but lose every permission: each place read, place
+write, reborrow (`Rvalue.ref` / `Rvalue.rawPtr`), retag, unsizing coercion, or
+pointer offset that resolves a disabled tag faults with `.ub`.
+
+The entries are disabled rather than removed because a provenance tag with no
+stack borrow entry falls back to `lookupGlobalAlloc` on `ptrVal.allocId`, and
+stack borrow tags (`Memory.nextTag`, starting at `1`) share their numbering with
+captured global allocation identifiers (also numbered from `1`): a removed
+stale tag would silently read or write an unrelated global allocation instead
+of faulting. Because tags are minted from the monotonically increasing
+`Memory.nextTag`, no reference or raw pointer created after `StorageLive(loc)`
+can share a disabled tag, so stale pointers are never revived into the new
+allocation.
+
+`BorrowEntry.targetLocal` indexes the locals of the frame that minted the tag,
+while the borrow table is shared by every inline call frame on
+`Memory.callStack`, so inside an inline callee frame this also disables
+caller-frame entries whose local index equals `loc`. The approximation is
+conservative: it can only make a later access through such a caller tag fault
+with `.ub` after the callee returns, never hide undefined behavior.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1835,49 +1845,30 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > "If the local is already allocated, calling `StorageLive` again will
 > implicitly free the local and then allocate fresh uninitialized memory. If a
 > local is already deallocated, calling `StorageDead` again is a NOP."
+
+Reference (MiniRust `spec/lang/step/statements.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/lang/step/statements.md#L166-L169>
+
+> "fn storage_live(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult {
+>     // First remove the old storage, if any.
+>     // This means the same address may be re-used for the new stoage.
+>     self.storage_dead(mem, local)?;"
 -/
-def purgeLocalBorrows : List BorrowEntry → Local → List BorrowEntry
+def disableLocalBorrows : List BorrowEntry → Local → List BorrowEntry
   | .nil, _ => .nil
   | entry :: rest, loc =>
     match Nat.beq entry.targetLocal loc with
-    | true => purgeLocalBorrows rest loc
-    | false => entry :: purgeLocalBorrows rest loc
+    | true => { entry with perm := .disabled } :: disableLocalBorrows rest loc
+    | false => entry :: disableLocalBorrows rest loc
 
 /--
-Definitional simplification equation for `borrowsTargetLocal` on the empty
+Definitional simplification equation for `disableLocalBorrows` on the empty
 borrow table.
 -/
 @[simp]
-theorem borrowsTargetLocal_nil (loc : Local) :
-    borrowsTargetLocal .nil loc = false := rfl
-
-/--
-Definitional simplification equation for `purgeLocalBorrows` on the empty
-borrow table.
--/
-@[simp]
-theorem purgeLocalBorrows_nil (loc : Local) :
-    purgeLocalBorrows .nil loc = .nil := rfl
-
-/--
-`borrowsTargetLocal borrows loc` is `false` whenever no entry of `borrows`
-targets `loc`.
--/
-theorem borrowsTargetLocal_eq_false_of_forall_ne
-    (borrows : List BorrowEntry)
-    (loc : Local)
-    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
-    borrowsTargetLocal borrows loc = false := by
-  induction borrows with
-  | nil => rfl
-  | cons entry rest ih =>
-    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
-    have hBeq : Nat.beq entry.targetLocal loc = false := by
-      cases hB : Nat.beq entry.targetLocal loc with
-      | false => rfl
-      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
-    simp only [borrowsTargetLocal, hBeq]
-    exact ih (fun e he => h e (List.Mem.tail entry he))
+theorem disableLocalBorrows_nil (loc : Local) :
+    disableLocalBorrows .nil loc = .nil := rfl
 
 /--
 No borrow entry is protected when no function-entry protector is active, so
@@ -1926,95 +1917,6 @@ theorem hasProtectedLocalBorrow_of_hasProtectedWriteConflict
       | true => rfl
 
 /--
-`purgeLocalBorrows borrows loc` retains no entry targeting `loc`.
--/
-theorem targetLocal_ne_of_mem_purgeLocalBorrows
-    (borrows : List BorrowEntry)
-    (loc : Local) :
-    ∀ entry ∈ purgeLocalBorrows borrows loc, entry.targetLocal ≠ loc := by
-  induction borrows with
-  | nil => intro entry hMem; nomatch hMem
-  | cons hd rest ih =>
-    intro entry hMem
-    cases hB : Nat.beq hd.targetLocal loc with
-    | true =>
-      simp only [purgeLocalBorrows, hB] at hMem
-      exact ih entry hMem
-    | false =>
-      simp only [purgeLocalBorrows, hB] at hMem
-      cases hMem with
-      | head => exact Nat.ne_of_beq_eq_false hB
-      | tail _ hMemRest => exact ih entry hMemRest
-
-/--
-After `purgeLocalBorrows borrows loc`, no borrow entry targets `loc`, so no
-stale provenance tag minted from a previous allocation of `loc` can resolve to
-its storage.
--/
-theorem borrowsTargetLocal_purgeLocalBorrows
-    (borrows : List BorrowEntry)
-    (loc : Local) :
-    borrowsTargetLocal (purgeLocalBorrows borrows loc) loc = false :=
-  borrowsTargetLocal_eq_false_of_forall_ne _ loc
-    (targetLocal_ne_of_mem_purgeLocalBorrows borrows loc)
-
-/--
-`purgeLocalBorrows borrows loc` leaves `borrows` unchanged when no entry
-targets `loc`.
--/
-theorem purgeLocalBorrows_eq_self_of_forall_ne
-    (borrows : List BorrowEntry)
-    (loc : Local)
-    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
-    purgeLocalBorrows borrows loc = borrows := by
-  induction borrows with
-  | nil => rfl
-  | cons entry rest ih =>
-    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
-    have hBeq : Nat.beq entry.targetLocal loc = false := by
-      cases hB : Nat.beq entry.targetLocal loc with
-      | false => rfl
-      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
-    simp only [purgeLocalBorrows, hBeq]
-    rw [ih (fun e he => h e (List.Mem.tail entry he))]
-
-/--
-`borrowsTargetLocal borrows loc` holds whenever some entry of `borrows` targets
-`loc`.
--/
-theorem borrowsTargetLocal_eq_true_of_mem
-    (borrows : List BorrowEntry)
-    (loc : Local)
-    (entry : BorrowEntry)
-    (hMem : entry ∈ borrows)
-    (hEq : entry.targetLocal = loc) :
-    borrowsTargetLocal borrows loc = true := by
-  induction borrows with
-  | nil => nomatch hMem
-  | cons hd tl ih =>
-    simp only [borrowsTargetLocal]
-    cases hB : Nat.beq hd.targetLocal loc with
-    | true => rfl
-    | false =>
-      cases hMem with
-      | head => exact absurd hEq (Nat.ne_of_beq_eq_false hB)
-      | tail _ hTl => exact ih hTl
-
-/--
-`purgeLocalBorrows borrows loc` leaves `borrows` unchanged when
-`borrowsTargetLocal borrows loc` is `false`.
--/
-theorem purgeLocalBorrows_eq_self_of_borrowsTargetLocal_eq_false
-    (borrows : List BorrowEntry)
-    (loc : Local)
-    (h : borrowsTargetLocal borrows loc = false) :
-    purgeLocalBorrows borrows loc = borrows :=
-  purgeLocalBorrows_eq_self_of_forall_ne borrows loc
-    (fun entry hMem hEq => by
-      rw [borrowsTargetLocal_eq_true_of_mem borrows loc entry hMem hEq] at h
-      nomatch h)
-
-/--
 `hasProtectedLocalBorrow borrows activeProtectors loc` is `false` when no entry
 targets `loc`.
 -/
@@ -2036,71 +1938,124 @@ theorem hasProtectedLocalBorrow_eq_false_of_forall_ne
     exact ih (fun e he => h e (List.Mem.tail entry he))
 
 /--
-Every entry returned by `lookupBorrow borrows tag` is a member of `borrows`
-with provenance tag `tag`.
+`disableLocalBorrows borrows loc` leaves `borrows` unchanged when no entry
+targets `loc`.
 -/
-theorem mem_of_lookupBorrow_eq_some
+theorem disableLocalBorrows_eq_self_of_forall_ne
     (borrows : List BorrowEntry)
-    (tag : Nat)
-    (entry : BorrowEntry)
-    (h : lookupBorrow borrows tag = .some entry) :
-    entry ∈ borrows ∧ entry.tag = tag := by
+    (loc : Local)
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
+    disableLocalBorrows borrows loc = borrows := by
   induction borrows with
-  | nil => nomatch h
+  | nil => rfl
+  | cons entry rest ih =>
+    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
+    have hBeq : Nat.beq entry.targetLocal loc = false := by
+      cases hB : Nat.beq entry.targetLocal loc with
+      | false => rfl
+      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
+    simp only [disableLocalBorrows, hBeq]
+    rw [ih (fun e he => h e (List.Mem.tail entry he))]
+
+/--
+Every entry of `disableLocalBorrows borrows loc` that targets `loc` is
+`.disabled`: no provenance tag minted from a previous allocation of `loc`
+retains any access permission.
+-/
+theorem perm_eq_disabled_of_mem_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    ∀ entry ∈ disableLocalBorrows borrows loc,
+      entry.targetLocal = loc → entry.perm = .disabled := by
+  induction borrows with
+  | nil => intro entry hMem; nomatch hMem
   | cons hd rest ih =>
-    unfold lookupBorrow at h
-    cases hEq : Nat.beq hd.tag tag with
-    | false =>
-      rw [hEq] at h
-      rcases ih h with ⟨hMem, hTag⟩
-      exact ⟨List.Mem.tail hd hMem, hTag⟩
+    intro entry hMem hT
+    cases hB : Nat.beq hd.targetLocal loc with
     | true =>
-      rw [hEq] at h
-      injection h with hHd
-      subst hHd
-      exact ⟨List.Mem.head rest, Nat.eq_of_beq_eq_true hEq⟩
+      simp only [disableLocalBorrows, hB] at hMem
+      cases hMem with
+      | head => rfl
+      | tail _ hMemRest => exact ih entry hMemRest hT
+    | false =>
+      simp only [disableLocalBorrows, hB] at hMem
+      cases hMem with
+      | head => exact absurd hT (Nat.ne_of_beq_eq_false hB)
+      | tail _ hMemRest => exact ih entry hMemRest hT
 
 /--
-No entry returned by `lookupBorrow (purgeLocalBorrows borrows loc) tag` can
-target `loc`.
+Resolving provenance tag `tag` in `disableLocalBorrows borrows loc` yields the
+entry that `tag` resolves to in `borrows`, disabled exactly when it targets
+`loc`; tags without a stack borrow entry remain unresolved.
 -/
-theorem lookupBorrow_purgeLocalBorrows_targetLocal_ne
+theorem lookupBorrow_disableLocalBorrows
     (borrows : List BorrowEntry)
     (loc : Local)
-    (tag : Nat)
-    (entry : BorrowEntry)
-    (h : lookupBorrow (purgeLocalBorrows borrows loc) tag = .some entry) :
-    entry.targetLocal ≠ loc :=
-  targetLocal_ne_of_mem_purgeLocalBorrows borrows loc entry
-    (mem_of_lookupBorrow_eq_some (purgeLocalBorrows borrows loc) tag entry h).1
-
-/--
-When every entry in `borrows` with provenance tag `tag` targets `loc`,
-`lookupBorrow (purgeLocalBorrows borrows loc) tag = .none`.
--/
-theorem lookupBorrow_purgeLocalBorrows_eq_none
-    (borrows : List BorrowEntry)
-    (loc : Local)
-    (tag : Nat)
-    (hTarget : ∀ entry ∈ borrows, entry.tag = tag → entry.targetLocal = loc) :
-    lookupBorrow (purgeLocalBorrows borrows loc) tag = .none := by
+    (tag : Nat) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag =
+      (match lookupBorrow borrows tag with
+       | .some entry =>
+         match Nat.beq entry.targetLocal loc with
+         | true => .some { entry with perm := .disabled }
+         | false => .some entry
+       | .none => .none) := by
   induction borrows with
   | nil => rfl
   | cons hd rest ih =>
-    have ihRest : lookupBorrow (purgeLocalBorrows rest loc) tag = .none :=
-      ih (fun e he hTag => hTarget e (List.Mem.tail hd he) hTag)
-    cases hLoc : Nat.beq hd.targetLocal loc with
-    | true =>
-      simp only [purgeLocalBorrows, hLoc, ihRest]
-    | false =>
-      simp only [purgeLocalBorrows, hLoc]
-      have hNeTag : Nat.beq hd.tag tag = false := by
-        cases hT : Nat.beq hd.tag tag with
-        | false => rfl
-        | true =>
-          have hEqLoc := hTarget hd (List.Mem.head rest) (Nat.eq_of_beq_eq_true hT)
-          exact False.elim (Nat.ne_of_beq_eq_false hLoc hEqLoc)
-      simp only [lookupBorrow, hNeTag, ihRest]
+    cases hB : Nat.beq hd.targetLocal loc <;>
+      cases hT : Nat.beq hd.tag tag <;>
+        simp only [disableLocalBorrows, lookupBorrow, hB, hT, ih]
+
+/--
+A provenance tag that resolved to a borrow entry targeting `loc` resolves to
+that entry disabled after `disableLocalBorrows borrows loc`.
+-/
+theorem lookupBorrow_disableLocalBorrows_of_targetLocal_eq
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (entry : BorrowEntry)
+    (hLookup : lookupBorrow borrows tag = .some entry)
+    (hTarget : entry.targetLocal = loc) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag =
+      .some { entry with perm := .disabled } := by
+  rw [lookupBorrow_disableLocalBorrows, hLookup]
+  have hB : Nat.beq entry.targetLocal loc = true := by
+    rw [hTarget]
+    exact Nat.beq_refl loc
+  simp only [hB]
+
+/--
+A provenance tag that resolved to a borrow entry targeting a local other than
+`loc` resolves to the same entry after `disableLocalBorrows borrows loc`.
+-/
+theorem lookupBorrow_disableLocalBorrows_of_targetLocal_ne
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (entry : BorrowEntry)
+    (hLookup : lookupBorrow borrows tag = .some entry)
+    (hTarget : entry.targetLocal ≠ loc) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag = .some entry := by
+  rw [lookupBorrow_disableLocalBorrows, hLookup]
+  have hB : Nat.beq entry.targetLocal loc = false := by
+    cases hB' : Nat.beq entry.targetLocal loc with
+    | false => rfl
+    | true => exact False.elim (hTarget (Nat.eq_of_beq_eq_true hB'))
+  simp only [hB]
+
+/--
+A provenance tag without a stack borrow entry in `borrows` (e.g. a pointer to a
+captured global allocation) remains unresolved after
+`disableLocalBorrows borrows loc`.
+-/
+theorem lookupBorrow_disableLocalBorrows_of_eq_none
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (hLookup : lookupBorrow borrows tag = .none) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag = .none := by
+  rw [lookupBorrow_disableLocalBorrows, hLookup]
 
 /--
 Test whether projection path `proj` contains a `.deref` projection, i.e.
@@ -2212,14 +2167,16 @@ theorem placeMentionOperandsInit_nil (locals : List LocalSlot) (rootSlot : Local
 Execute a single MIR `Statement` from state `s` using `localDecls` and `layouts`
 for type- and layout-aware rvalue and intrinsic evaluation.
 
-`StorageDead(loc)` and `StorageLive(loc)` fault with `MirStepNode.fail .ub` when
-a tag minted from `loc` is still protected by an active function-entry protector
+`StorageDead(loc)` and `StorageLive(loc)` (which implicitly frees any previous
+allocation of `loc`) fault with `MirStepNode.fail .ub` when a tag minted from
+`loc` is still protected by an active function-entry protector
 (`hasProtectedLocalBorrow`, only consulted when some protector is active), and
-otherwise purge every tag minted from `loc` (`purgeLocalBorrows`) before
-marking `loc` `.dead` or `.uninit`. Together these ensure that deallocating or
-implicitly reviving a local bearing an active protector is immediate UB, and
-that references and raw pointers created before `StorageDead(loc)` or a second
-`StorageLive(loc)` can never reach the storage allocated by `StorageLive(loc)`.
+otherwise disable every tag minted from `loc` (`disableLocalBorrows`) before
+marking `loc` `.dead` or `.uninit`. Together these ensure that deallocating a
+local bearing an active protector is immediate UB, and that references and raw
+pointers created before `StorageDead(loc)` or a second `StorageLive(loc)` fault
+with `.ub` on every later access or reborrow instead of reaching the storage
+allocated by `StorageLive(loc)` (or a global allocation sharing their tag).
 `PlaceMention(place)` requires every operand read while computing `place` (the
 root pointer of a dereference and every `Index` local) to be initialized
 (`placeMentionOperandsInit`).
@@ -2367,7 +2324,7 @@ def evalStmt
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
@@ -2379,7 +2336,7 @@ def evalStmt
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
@@ -2391,7 +2348,7 @@ def evalStmt
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
@@ -2403,7 +2360,7 @@ def evalStmt
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .deinit p =>
@@ -2603,13 +2560,14 @@ def evalStmt
     | .unsupported => MirStepNode.unsupported
 
 /--
-Universal characterization of `StatementKind.storageDead loc` in `evalStmt`:
+Universal characterization of `StatementKind.storageDead loc` in `evalStmt`
+(`D2` / `D14a-storage`):
 1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
    `set? s.frame.locals loc .dead = .some localsDead`) and no borrow entry
    targeting `loc` is protected by `s.memory.activeProtectors`
    (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
-   `evalStmt` steps to `advanceStmt s localsDead { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }`,
-   leaving no borrow entry targeting `loc` (`borrowsTargetLocal = false`).
+   `evalStmt` steps to `advanceStmt s localsDead { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }`,
+   in which every borrow entry targeting `loc` is `.disabled`.
 2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
    `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), `evalStmt`
    faults with `MirStepNode.fail .ub`.
@@ -2630,8 +2588,9 @@ theorem evalStmt_storageDead_purges_borrows
       evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts =
         MirStepNode.step
           (advanceStmt s localsDead
-            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }) ∧
-      borrowsTargetLocal (purgeLocalBorrows s.memory.borrows loc) loc = false) ∧
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
+        entry.targetLocal = loc → entry.perm = .disabled) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .dead = .some localsDead →
       hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
@@ -2640,7 +2599,7 @@ theorem evalStmt_storageDead_purges_borrows
       evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
   refine ⟨?_, ?_, ?_⟩
   · intro hGet hSet hProt
-    refine ⟨?_, borrowsTargetLocal_purgeLocalBorrows s.memory.borrows loc⟩
+    refine ⟨?_, perm_eq_disabled_of_mem_disableLocalBorrows s.memory.borrows loc⟩
     cases hAP : s.memory.activeProtectors with
     | nil => simp [evalStmt, hGet, hSet, hAP]
     | cons p ps =>
@@ -2658,16 +2617,18 @@ theorem evalStmt_storageDead_purges_borrows
     simp [evalStmt, hNone]
 
 /--
-Universal characterization of `StatementKind.storageLive loc` in `evalStmt`:
+Universal characterization of `StatementKind.storageLive loc` in `evalStmt`
+(`D2` / `D14a-storage`):
 1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
    `set? s.frame.locals loc .uninit = .some localsUninit`) and no borrow entry
    targeting `loc` is protected by `s.memory.activeProtectors`
    (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
-   `evalStmt` steps to `advanceStmt s localsUninit { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }`,
-   leaving no borrow entry targeting `loc` (`borrowsTargetLocal = false`).
+   `evalStmt` steps to `advanceStmt s localsUninit { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }`,
+   in which every borrow entry targeting `loc` is `.disabled`.
 2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
-   `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), `evalStmt`
-   faults with `MirStepNode.fail .ub`.
+   `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), the implicit
+   deallocation of `loc`'s previous storage makes `evalStmt` fault with
+   `MirStepNode.fail .ub`.
 3. When `loc` is out of bounds (`get? s.frame.locals loc = .none`), `evalStmt`
    faults with `MirStepNode.fail .ub`.
 -/
@@ -2685,8 +2646,9 @@ theorem evalStmt_storageLive_purges_borrows
       evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts =
         MirStepNode.step
           (advanceStmt s localsUninit
-            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }) ∧
-      borrowsTargetLocal (purgeLocalBorrows s.memory.borrows loc) loc = false) ∧
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
+        entry.targetLocal = loc → entry.perm = .disabled) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .uninit = .some localsUninit →
       hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
@@ -2695,7 +2657,7 @@ theorem evalStmt_storageLive_purges_borrows
       evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
   refine ⟨?_, ?_, ?_⟩
   · intro hGet hSet hProt
-    refine ⟨?_, borrowsTargetLocal_purgeLocalBorrows s.memory.borrows loc⟩
+    refine ⟨?_, perm_eq_disabled_of_mem_disableLocalBorrows s.memory.borrows loc⟩
     cases hAP : s.memory.activeProtectors with
     | nil => simp [evalStmt, hGet, hSet, hAP]
     | cons p ps =>
@@ -2713,13 +2675,18 @@ theorem evalStmt_storageLive_purges_borrows
     simp [evalStmt, hNone]
 
 /--
-Universal proof that after purging `loc`'s borrows (`purgeLocalBorrows borrows loc`
-on `StorageDead(loc)` or `StorageLive(loc)`), any pointer `ptrVal` whose
-provenance tag `ptrVal.tag` targeted `loc` resolves to `.none` in `lookupBorrow`
-and faults with `.ub` / `MirStepNode.fail .ub` on any subsequent dereference
-read (`evalOperand` / `evalPlaceRead`) or dereference write (`writePlaceValue` /
-`evalPlaceWrite`), even if `loc` has been revived by `StorageLive(loc)` and
-re-initialized in `localsAfter`.
+Universal proof (`D2` / `D14a-storage`) that once `StorageDead(loc)` or
+`StorageLive(loc)` has disabled `loc`'s borrows (`disableLocalBorrows borrows loc`),
+a pointer `ptrVal` whose provenance tag resolved to a borrow entry targeting
+`loc` (`lookupBorrow borrows ptrVal.tag = .some entry`,
+`entry.targetLocal = loc`) resolves to that entry disabled, and faults with
+`.ub` on every dereferencing read (`evalPlaceRead`, `evalOperand` copy/move),
+every dereferencing write (`writePlaceValue`, `evalPlaceWrite`), and every
+reborrow (`Rvalue.ref`, `Rvalue.rawPtr`) through it. This holds for arbitrary
+frame locals `localsAfter` (in particular after `loc` has been revived by
+`StorageLive(loc)` and re-initialized) and arbitrary captured global
+allocations `globals`: the disabled stack borrow entry keeps shadowing any
+global allocation that shares the pointer's allocation identifier.
 -/
 theorem evalStmt_storageRevive_old_ptr_deref_ub
     (borrows : List BorrowEntry)
@@ -2728,32 +2695,53 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
     (activeProtectors : List Nat)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
+    (mem : Memory)
     (loc ptrLoc : Local)
     (ptrVal : ProvenancePtr)
     (sz : Nat)
     (restProj : List ProjectionElem)
     (localsAfter : List LocalSlot)
     (writeVal : Value)
-    (hTarget : ∀ entry ∈ borrows, entry.tag = ptrVal.tag → entry.targetLocal = loc)
-    (hNoGlobal : lookupGlobalAlloc globals ptrVal.allocId = .none)
+    (borrowKind : BorrowKind)
+    (mutability : Mutability)
+    (entry : BorrowEntry)
+    (hLookup : lookupBorrow borrows ptrVal.tag = .some entry)
+    (hTarget : entry.targetLocal = loc)
     (hPtrSlot : get? localsAfter ptrLoc = .some (.init (.ptr ptrVal sz))) :
-    let borrowsAfter := purgeLocalBorrows borrows loc
+    let borrowsAfter := disableLocalBorrows borrows loc
     let derefPlace : Place := { local_ := ptrLoc, projection := .deref :: restProj }
-    lookupBorrow borrowsAfter ptrVal.tag = .none ∧
+    lookupBorrow borrowsAfter ptrVal.tag = .some { entry with perm := .disabled } ∧
     evalPlaceRead localsAfter derefPlace borrowsAfter globals layouts callerLocals localDecls = .ub ∧
     evalOperand localsAfter (.copy derefPlace) borrowsAfter globals layouts callerLocals = .ub ∧
     evalOperand localsAfter (.move derefPlace) borrowsAfter globals layouts callerLocals = .ub ∧
     writePlaceValue localsAfter borrowsAfter derefPlace writeVal = .ub ∧
-    evalPlaceWrite localsAfter borrowsAfter derefPlace writeVal activeProtectors = .ub := by
+    evalPlaceWrite localsAfter borrowsAfter derefPlace writeVal activeProtectors = .ub ∧
+    evalRvalue localsAfter (.ref borrowKind derefPlace)
+      { mem with borrows := borrowsAfter } localDecls layouts = .ub ∧
+    evalRvalue localsAfter (.rawPtr mutability derefPlace)
+      { mem with borrows := borrowsAfter } localDecls layouts = .ub := by
   dsimp only
-  have hLookupNone : lookupBorrow (purgeLocalBorrows borrows loc) ptrVal.tag = .none :=
-    lookupBorrow_purgeLocalBorrows_eq_none borrows loc ptrVal.tag hTarget
-  refine ⟨hLookupNone, ?_, ?_, ?_, ?_, ?_⟩
-  · simp [evalPlaceRead, hPtrSlot, hLookupNone, hNoGlobal]
-  · simp [evalOperand, hPtrSlot, hLookupNone, hNoGlobal]
-  · simp [evalOperand, hPtrSlot, hLookupNone, hNoGlobal]
-  · simp [writePlaceValue, hPtrSlot, hLookupNone]
-  · cases activeProtectors <;> simp [evalPlaceWrite, writePlaceValue, hPtrSlot, hLookupNone]
+  have hDis : lookupBorrow (disableLocalBorrows borrows loc) ptrVal.tag =
+      .some { entry with perm := .disabled } :=
+    lookupBorrow_disableLocalBorrows_of_targetLocal_eq borrows loc ptrVal.tag entry hLookup hTarget
+  have hWrite :
+      writePlaceValue localsAfter (disableLocalBorrows borrows loc)
+        { local_ := ptrLoc, projection := .deref :: restProj } writeVal = .ub := by
+    simp [writePlaceValue, hPtrSlot, hDis]
+  refine ⟨hDis, ?_, ?_, ?_, hWrite, ?_, ?_, ?_⟩
+  · simp [evalPlaceRead, hPtrSlot, hDis]
+  · simp [evalOperand, hPtrSlot, hDis]
+  · simp [evalOperand, hPtrSlot, hDis]
+  · unfold evalPlaceWrite
+    cases activeProtectors with
+    | nil => exact hWrite
+    | cons p ps =>
+      dsimp only
+      split
+      · rfl
+      · exact hWrite
+  · cases borrowKind <;> simp [evalRvalue, hPtrSlot, hDis]
+  · cases mutability <;> simp [evalRvalue, hPtrSlot, hDis]
 
 /--
 Universal proof that a bare `StatementKind.placeMention` (`place.projection = []`)

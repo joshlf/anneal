@@ -123,18 +123,18 @@ theorem mir_evalStmt_placeMention_dead_is_ub
 /-- Universal characterization of `StatementKind.storageLive`,
 `StatementKind.storageDead`, and protected-tag write conflict checking in
 `evalStmt` (`Statements.lean`):
-1. `.storageLive loc` transitions an in-bounds slot to `.uninit` and purges
-   every borrow-table entry minted from `loc` (`purgeLocalBorrows`) unless an
+1. `.storageLive loc` transitions an in-bounds slot to `.uninit` and disables
+   every borrow-table entry minted from `loc` (`disableLocalBorrows`) unless an
    entry targeting `loc` is still protected by an active function-entry
    protector (`hasProtectedLocalBorrow`), in which case it faults with `.ub`,
    or faults with `.ub` if `loc` is out of bounds;
-2. `.storageDead loc` transitions an in-bounds slot to `.dead` and purges every
-   borrow-table entry minted from `loc` unless an entry targeting `loc` is still
-   protected by an active function-entry protector
+2. `.storageDead loc` transitions an in-bounds slot to `.dead` and disables
+   every borrow-table entry minted from `loc` unless an entry targeting `loc` is
+   still protected by an active function-entry protector
    (`hasProtectedLocalBorrow`), in which case it faults with `.ub`, or faults
    with `.ub` if `loc` is out of bounds;
-3. Purging leaves no entry targeting `loc` behind (so no stale tag can reach a
-   revived `loc`) and is the identity when no entry targets `loc`; and
+3. Disabling leaves every entry targeting `loc` `.disabled` (so no stale tag can
+   reach a revived `loc`) and is the identity when no entry targets `loc`; and
 4. Writing to a root local when `hasProtectedWriteConflict` is `true` faults
    immediately with `MirStepNode.fail .ub`. -/
 theorem mir_evalStmt_storageLive_and_storageDead
@@ -146,7 +146,7 @@ theorem mir_evalStmt_storageLive_and_storageDead
       evalStmt s ⟨.storageLive loc, span⟩ =
         MirStepNode.step
           (advanceStmt s localsUninit
-            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })) ∧
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .uninit = .some localsUninit →
       hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
@@ -159,16 +159,17 @@ theorem mir_evalStmt_storageLive_and_storageDead
       evalStmt s ⟨.storageDead loc, span⟩ =
         MirStepNode.step
           (advanceStmt s localsDead
-            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })) ∧
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .dead = .some localsDead →
       hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
       evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .none →
       evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.fail .ub) ∧
-    borrowsTargetLocal (purgeLocalBorrows s.memory.borrows loc) loc = false ∧
-    (borrowsTargetLocal s.memory.borrows loc = false →
-      purgeLocalBorrows s.memory.borrows loc = s.memory.borrows) ∧
+    (∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
+      entry.targetLocal = loc → entry.perm = .disabled) ∧
+    ((∀ entry ∈ s.memory.borrows, entry.targetLocal ≠ loc) →
+      disableLocalBorrows s.memory.borrows loc = s.memory.borrows) ∧
     (∀ (rv : Rvalue) (val : Value) (locals₁ locals₂ : List LocalSlot) (mem₁ : Memory)
        (protHead : Nat) (protTail : List Nat),
       evalRvalue s.frame.locals rv s.memory = .ok val locals₁ mem₁ →
@@ -208,8 +209,8 @@ theorem mir_evalStmt_storageLive_and_storageDead
       rw [hAP] at hP
       simp [evalStmt, hGet, hSet, hAP, hP]
   · intro hGet; simp [evalStmt, hGet]
-  · exact borrowsTargetLocal_purgeLocalBorrows s.memory.borrows loc
-  · exact purgeLocalBorrows_eq_self_of_borrowsTargetLocal_eq_false s.memory.borrows loc
+  · exact perm_eq_disabled_of_mem_disableLocalBorrows s.memory.borrows loc
+  · exact disableLocalBorrows_eq_self_of_forall_ne s.memory.borrows loc
   · intro rv val locals₁ locals₂ mem₁ protHead protTail hEval hGet hSet hProt hConflict
     simp [evalStmt, hEval, hGet, hSet, hProt, hConflict]
 
@@ -4321,8 +4322,10 @@ end DiffCUnionCopyConfirmation
 /-! ## 6. Statement-Level Divergence Regressions (`D2`, `D14a-storage`, `D9`)
 
 Kernel-checked executions of `Runtime(PostCleanup)` MIR bodies exercising the
-`StorageDead`/`StorageLive` borrow purge, the `StorageDead` protector check,
-and the `PlaceMention` operand-initialization checks in `evalStmt`. -/
+`StorageDead`/`StorageLive` borrow invalidation (`disableLocalBorrows`), the
+`StorageDead`/`StorageLive` protector checks, and the `PlaceMention`
+operand-initialization checks in `evalStmt`. Unless noted otherwise, each
+`*_is_ub` witness below terminated without `.ub` before these checks existed. -/
 
 section StatementDivergenceRegressions
 
@@ -4342,6 +4345,9 @@ private def stmtDivRawMutU64Ty : Ty := { kind := .rawPtr .mut (.uint .u64), layo
 
 /-- `&u64` local type used by the dangling-reborrow regression body. -/
 private def stmtDivRefU64Ty : Ty := { kind := .ref .not (.uint .u64), layoutIdx := 0 }
+
+/-- `&mut u64` local type used by the two-phase-borrow revival regression bodies. -/
+private def stmtDivRefMutU64Ty : Ty := { kind := .ref .mut (.uint .u64), layoutIdx := 0 }
 
 /-- `u64` constant operand. -/
 private def stmtDivConstU64 (n : Nat) : Operand :=
@@ -4386,51 +4392,59 @@ private def stmtDivBody (name : String) (decls : List LocalDecl)
     layouts := emptyLayoutTable,
     allocations := [] }
 
-/-- `D2` (`wit_lm3_1_storage_revive_prog` from `StatementAndTerminatorDivergences.lean`):
-read through a raw pointer after its pointee's storage has ended, restarted,
-and been reinitialized to a fresh value:
+/-- `D2` (`wit_lm3_1_storage_revive_prog`): read through a raw pointer
+`&raw const _1` after `_1` is deallocated by `StorageDead(_1)`, revived by
+`StorageLive(_1)`, and re-initialized to `20`:
 ```text
 StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &raw const _1;
 StorageDead(_1); StorageLive(_1); _1 = const 20_u64; _0 = copy *_2; return
-``` -/
+```
+Noted exception: this program already faulted before `disableLocalBorrows`
+existed, because the direct write `_1 = 20` disables the `.frozen` tag of
+`&raw const _1` (a Tree Borrows foreign write), so it is kept only as a
+regression guard. The variant through a two-phase mutable borrow, whose
+`.reserved` tag survives that write, did return `20`
+(`stmt_div_storage_revive_two_phase_read_is_ub`). -/
 private def stmtDivReviveReadBody : CapturedMir :=
-  stmtDivBody "stmt_div::wit_lm3_1_storage_revive_prog"
-    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
-      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
-    [ { kind := .storageLive 1, span := "live _1" },
-      { kind := .storageLive 2, span := "live _2" },
-      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "stmt0: _1 = 10" },
-      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "stmt1: _2 = &raw const _1" },
-      { kind := .storageDead 1, span := "stmt2: StorageDead(_1)" },
-      { kind := .storageLive 1, span := "stmt3: StorageLive(_1)" },
-      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "stmt4: _1 = 20" },
-      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "stmt5: _0 = copy (*_2)" } ]
-
-/-- `D2` regression (`wit_lm3_1_storage_revive_prog`): reading through the stale
-pointer `_2` after `_1` is killed, revived, and reinitialized to `20` faults
-with `FailureKind.ub` (Anneal previously returned `20`). -/
-theorem stmt_div_storage_revive_dangling_read_is_ub :
-    diffCProbeBounded 16 stmtDivReviveReadBody
-      (.running (initMachineState stmtDivReviveReadBody [])) =
-      .some (.some .ub, "stmt5: _0 = copy (*_2)", .none) := by
-  rfl
-
-/-- `D2` (`StorageLive` on an already-live local without an intervening
-`StorageDead`, matching `lean-miri`'s `Miri.Interpreter.Frame.storageLiveDyn`):
-implicitly deallocates the old allocation of `_1` and purges its borrow tags,
-so reading through `_2` after `_1` is reinitialized faults with `FailureKind.ub`:
-```text
-StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &raw const _1;
-StorageLive(_1); _1 = const 20_u64; _0 = copy *_2; return
-``` -/
-private def stmtDivReviveWithoutDeadBody : CapturedMir :=
-  stmtDivBody "stmt_div::storage_live_implicit_dealloc_purges_borrows"
+  stmtDivBody "stmt_div::read_through_pointer_into_revived_and_reinit_local"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
       stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .storageLive 2, span := "live _2" },
       { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
       { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "stmt5: _0 = copy (*_2)" } ]
+
+/-- `D2` read-after-revive-and-reinit regression (`wit_lm3_1_storage_revive_prog`):
+even after `_1` is revived by `StorageLive(_1)` and re-initialized to `20`,
+reading `*_2` through the pointer minted before `StorageDead(_1)` faults with
+`FailureKind.ub`. -/
+theorem stmt_div_storage_revive_dangling_read_is_ub :
+    diffCProbeBounded 16 stmtDivReviveReadBody
+      (.running (initMachineState stmtDivReviveReadBody [])) =
+      .some (.some .ub, "stmt5: _0 = copy (*_2)", .none) := by
+  rfl
+
+/-- `D2` implicit-deallocation regression: calling `StorageLive(_1)` on an
+already-allocated local `_1` (without an intervening `StorageDead(_1)`)
+implicitly deallocates the old allocation of `_1` and disables its borrows, so
+a subsequent read through the two-phase mutable borrow `_2` after
+re-initializing `_1 = 20` faults with `FailureKind.ub` (Anneal previously
+returned `20`, since the `.reserved` tag of `_2` survives the direct write):
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &two-phase mut _1;
+StorageLive(_1); _1 = const 20_u64; _0 = copy *_2; return
+``` -/
+private def stmtDivReviveWithoutDeadBody : CapturedMir :=
+  stmtDivBody "stmt_div::storage_live_implicit_dealloc_disables_borrows"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRefMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
       { kind := .storageLive 1, span := "revive _1 directly" },
       { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
       { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy (*_2)" } ]
@@ -4439,6 +4453,127 @@ theorem stmt_div_storage_live_implicit_dealloc_dangling_read_is_ub :
     diffCProbeBounded 16 stmtDivReviveWithoutDeadBody
       (.running (initMachineState stmtDivReviveWithoutDeadBody [])) =
       .some (.some .ub, "_0 = copy (*_2)", .none) := by
+  rfl
+
+/-- `D2` read-after-revive regression through a two-phase mutable borrow, whose
+`.reserved` Tree Borrows tag survives the direct write `_1 = 20`:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &two-phase mut _1;
+StorageDead(_1); StorageLive(_1); _1 = const 20_u64; _0 = copy *_2; return
+```
+Anneal previously returned `20` from the revived allocation of `_1`. -/
+private def stmtDivReviveTwoPhaseReadBody : CapturedMir :=
+  stmtDivBody "stmt_div::read_through_two_phase_borrow_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRefMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- `D2` read-after-revive regression: reading `*_2` through the stale two-phase
+borrow faults with `FailureKind.ub`. -/
+theorem stmt_div_storage_revive_two_phase_read_is_ub :
+    diffCProbeBounded 16 stmtDivReviveTwoPhaseReadBody
+      (.running (initMachineState stmtDivReviveTwoPhaseReadBody [])) =
+      .some (.some .ub, "_0 = copy *_2", .none) := by
+  rfl
+
+/-- Captured global allocation with identifier `1` holding the `u64` value `42`.
+`anneal-rustc-capture` numbers captured global allocations from `1`, the same
+numbering that stack borrow tags use (`Memory.nextTag` starts at `1`). -/
+private def stmtDivGlobal1 : CapturedAllocation :=
+  { allocId := 1,
+    bytes := [.some 42, .some 0, .some 0, .some 0, .some 0, .some 0, .some 0, .some 0],
+    relocations := [], align := ⟨8⟩, mutability := .not }
+
+/-- `stmtDivBody` with the single captured global allocation `stmtDivGlobal1`. -/
+private def stmtDivBodyWithGlobal (name : String) (decls : List LocalDecl)
+    (stmts : List Statement) : CapturedMir :=
+  { stmtDivBody name decls stmts with allocations := [stmtDivGlobal1] }
+
+/-- `D2` tag/global aliasing body: the stack borrow tag `1` minted for `_2`
+equals the identifier of the captured global `stmtDivGlobal1`:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &raw const _1;
+StorageDead(_1); _0 = copy *_2; return
+``` -/
+private def stmtDivDeadGlobalAliasReadBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::read_through_dead_pointer_aliasing_global"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- `D2` tag/global aliasing regression: reading through the dangling pointer
+faults with `FailureKind.ub`. Removing (rather than disabling) `_1`'s borrow
+entries on `StorageDead(_1)` made `*_2` fall back to `lookupGlobalAlloc` and
+return the global's `42`. -/
+theorem stmt_div_storage_dead_global_alias_read_is_ub :
+    diffCProbeBounded 16 stmtDivDeadGlobalAliasReadBody
+      (.running (initMachineState stmtDivDeadGlobalAliasReadBody [])) =
+      .some (.some .ub, "_0 = copy *_2", .none) := by
+  rfl
+
+/-- `D14a-storage` tag/global aliasing body: reborrow through the dangling
+pointer, then read through the reborrow:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3); _1 = const 10_u64;
+_2 = &raw const _1; StorageDead(_1); _3 = &*_2; _0 = copy *_3; return
+``` -/
+private def stmtDivDeadGlobalAliasReborrowBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::reborrow_through_dead_pointer_aliasing_global"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 },
+      stmtDivDecl stmtDivRefU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .assign ⟨3, []⟩ (.ref .shared ⟨2, [.deref]⟩), span := "_3 = &*_2" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨3, [.deref]⟩)), span := "_0 = copy *_3" } ]
+
+/-- `D14a-storage` tag/global aliasing regression: the reborrow through the
+dangling pointer faults with `FailureKind.ub`. Removing (rather than disabling)
+`_1`'s borrow entries made the reborrow resolve to the global allocation and
+the body return the global's `42`. -/
+theorem stmt_div_storage_dead_global_alias_reborrow_is_ub :
+    diffCProbeBounded 16 stmtDivDeadGlobalAliasReborrowBody
+      (.running (initMachineState stmtDivDeadGlobalAliasReborrowBody [])) =
+      .some (.some .ub, "_3 = &*_2", .none) := by
+  rfl
+
+/-- Positive control for the aliasing regressions: a pointer to the captured
+global `stmtDivGlobal1` reads its `42` when no stack borrow shares its
+identifier:
+```text
+StorageLive(_1); _1 = const {alloc1: *const u64}; _0 = copy *_1; return
+``` -/
+private def stmtDivGlobalReadOkBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::read_through_global_pointer"
+    [stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, []⟩
+          (.use (.constant ⟨{ kind := .rawPtr .not (.uint .u64), layoutIdx := 0 },
+            .scalar (.ptr { allocId := 1, offsetBytes := 0 } 8)⟩)),
+        span := "_1 = &GLOBAL" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.deref]⟩)), span := "_0 = copy *_1" } ]
+
+/-- Positive control: the body returns the global's `42`. -/
+theorem stmt_div_global_read_ok :
+    diffCProbeBounded 16 stmtDivGlobalReadOkBody
+      (.running (initMachineState stmtDivGlobalReadOkBody [])) =
+      .some (.none, "none", .some (.scalar ⟨42, 8⟩)) := by
   rfl
 
 /-- `D2` (`wit_lm3_1_anneal_storage_revive_divergence`): write and read through a
@@ -4619,12 +4754,14 @@ theorem stmt_div_storage_dead_protected_is_ub :
   rfl
 
 /-- Once the protector is no longer active, `StorageDead(_1)` succeeds and
-purges every tag minted from `_1` from the borrow table. -/
-theorem stmt_div_storage_dead_unprotected_purges :
+disables every tag minted from `_1` in the borrow table. -/
+theorem stmt_div_storage_dead_unprotected_disables :
     evalStmt (stmtDivProtectedState []) ⟨.storageDead 1, "dead _1"⟩ =
       MirStepNode.step
         (advanceStmt (stmtDivProtectedState []) [.uninit, .dead]
-          { (stmtDivProtectedState []).memory with borrows := [] }) := by
+          { (stmtDivProtectedState []).memory with
+            borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                          perm := .disabled, protector := .some 1 }] }) := by
   rfl
 
 /-- `D2` protector regression on `StorageLive(_1)`: implicitly deallocating an
@@ -4636,12 +4773,14 @@ theorem stmt_div_storage_live_protected_is_ub :
   rfl
 
 /-- Once the protector is no longer active, `StorageLive(_1)` succeeds and
-purges every tag minted from `_1` from the borrow table. -/
-theorem stmt_div_storage_live_unprotected_purges :
+disables every tag minted from `_1` in the borrow table. -/
+theorem stmt_div_storage_live_unprotected_disables :
     evalStmt (stmtDivProtectedState []) ⟨.storageLive 1, "live _1"⟩ =
       MirStepNode.step
         (advanceStmt (stmtDivProtectedState []) [.uninit, .uninit]
-          { (stmtDivProtectedState []).memory with borrows := [] }) := by
+          { (stmtDivProtectedState []).memory with
+            borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                          perm := .disabled, protector := .some 1 }] }) := by
   rfl
 
 end StatementDivergenceRegressions

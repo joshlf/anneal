@@ -3578,25 +3578,25 @@ theorem LiftLensStmt.evalStmt_step
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hPurge := purgeLocalBorrows_eq_self_of_forall_ne _ _ hNe
+      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
       have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
-      | nil => simp [hEnv, hGet, hSet, hPurge]
-      | cons pHead pTail => simp [hEnv, hGet, hSet, hPurge, hProt, ← hAP]
+      | nil => simp [hEnv, hGet, hSet, hDisable]
+      | cons pHead pTail => simp [hEnv, hGet, hSet, hDisable, hProt, ← hAP]
   | storageDead hDead =>
     cases hDead with
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hPurge := purgeLocalBorrows_eq_self_of_forall_ne _ _ hNe
+      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
       have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
-      | nil => simp [hEnv, hGet, hSet, hPurge]
-      | cons pHead pTail => simp [hEnv, hGet, hSet, hPurge, hProt, ← hAP]
+      | nil => simp [hEnv, hGet, hSet, hDisable]
+      | cons pHead pTail => simp [hEnv, hGet, hSet, hDisable, hProt, ← hAP]
   | nop hNop =>
     cases hNop with
     | mk =>
@@ -9020,25 +9020,25 @@ theorem LiftLensStmt.evalStmt_step_subplace
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hPurge := purgeLocalBorrows_eq_self_of_forall_ne _ _ hNe
+      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
       have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
-      | nil => simp [hEnv, hGet, hSet, hPurge]
-      | cons pHead pTail => simp [hEnv, hGet, hSet, hPurge, hProt, ← hAP]
+      | nil => simp [hEnv, hGet, hSet, hDisable]
+      | cons pHead pTail => simp [hEnv, hGet, hSet, hDisable, hProt, ← hAP]
   | storageDead hDead =>
     cases hDead with
     | mk hGet hSet =>
       have hLen : env'.length = env.length := set?_length_eq hSet
       have hNe := targetLocal_ne_of_lt_frame hInv.borrows_above_frame hGet
-      have hPurge := purgeLocalBorrows_eq_self_of_forall_ne _ _ hNe
+      have hDisable := disableLocalBorrows_eq_self_of_forall_ne _ _ hNe
       have hProt := fun ap => hasProtectedLocalBorrow_eq_false_of_forall_ne _ ap _ hNe
       refine ⟨s.memory, ?_, hLen, (by rw [hLen]; exact hInv), hFrame, hKeys⟩
       unfold evalStmt
       cases hAP : s.memory.activeProtectors with
-      | nil => simp [hEnv, hGet, hSet, hPurge]
-      | cons pHead pTail => simp [hEnv, hGet, hSet, hPurge, hProt, ← hAP]
+      | nil => simp [hEnv, hGet, hSet, hDisable]
+      | cons pHead pTail => simp [hEnv, hGet, hSet, hDisable, hProt, ← hAP]
   | nop hNop =>
     cases hNop with
     | mk =>

@@ -2674,7 +2674,7 @@ def evalStmtFast
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
@@ -2686,7 +2686,7 @@ def evalStmtFast
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
@@ -2698,7 +2698,7 @@ def evalStmtFast
         | .nil =>
           MirStepNode.step
             (advanceStmt s locals'
-              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
         | protHead :: protTail =>
           match
             hasProtectedLocalBorrow
@@ -2710,7 +2710,7 @@ def evalStmtFast
           | false =>
             MirStepNode.step
               (advanceStmt s locals'
-                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .nop => MirStepNode.step (advanceStmt s s.frame.locals)
@@ -2760,7 +2760,7 @@ def evalStmtSymTreeFast
            | .nil =>
              MirStepNode.step
                (advanceStmt s locals'
-                 { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
            | protHead :: protTail =>
              match
                hasProtectedLocalBorrow
@@ -2772,7 +2772,7 @@ def evalStmtSymTreeFast
              | false =>
                MirStepNode.step
                  (advanceStmt s locals'
-                   { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .storageDead loc =>
@@ -2785,7 +2785,7 @@ def evalStmtSymTreeFast
            | .nil =>
              MirStepNode.step
                (advanceStmt s locals'
-                 { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                 { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
            | protHead :: protTail =>
              match
                hasProtectedLocalBorrow
@@ -2797,7 +2797,7 @@ def evalStmtSymTreeFast
              | false =>
                MirStepNode.step
                  (advanceStmt s locals'
-                   { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+                   { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .nop => .leaf (MirStepNode.step (advanceStmt s s.frame.locals))
