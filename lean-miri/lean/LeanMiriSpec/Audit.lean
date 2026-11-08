@@ -92,18 +92,24 @@ weakened theorem keeps its name:
   `step_two_stmts_lm2_2_simulation`, and `step_stmts_lm2_2_simulation`, together
   with the fourteen `WitLM2_2` concrete execution witnesses.
 * the `LM-2.3` theorems: genuine multi-variant direct-tagged enum layouts
-  (`ValidEnumLayout`), conservative hook extension (`step_LM2_3_eq_of_bodyFree`),
-  `StateRel.toLM2_3`, multi-variant enum construction and in-place overwrite
-  (`evalRvalue_aggregate_enum_simulation`), `SetDiscriminant`
-  (`step_setDiscriminant_simulation`, plus the `.uninit` divergence
-  `step_setDiscriminant_uninit_divergence`), `Rvalue.Discriminant`
+  (`ValidEnumLayout`), conservative hook extension
+  (`step_LM2_3_eq_of_bodyFree`), `StateRel.toLM2_3`, multi-variant enum
+  construction and in-place overwrite (`evalRvalue_aggregate_enum_simulation`),
+  `SetDiscriminant` (`step_setDiscriminant_simulation`, plus the `.uninit`
+  divergence `step_setDiscriminant_uninit_divergence`), `Rvalue.Discriminant`
   (`evalRvalue_discriminant_simulation`), `Downcast` + `Field` payload reads
   including inactive-variant uninitialized-byte UB
   (`evalProjection_downcast_field_simulation`) and inactive-variant initialized
-  overlapping-byte divergence (`evalProjection_downcast_field_initialized_divergence`),
-  `SwitchInt` match dispatch (`enum_match_switchInt_simulation`), `Goto`/`Return`
-  helpers, and the ten `WitLM2_3` concrete multi-variant execution, UB, and
-  divergence witnesses.
+  overlapping-byte divergence
+  (`evalProjection_downcast_field_initialized_divergence`), active-variant
+  `Downcast` + `Field` writes (`step_downcast_field_write_simulation`, plus
+  inactive-variant write divergence
+  `step_downcast_field_write_inactive_divergence`), whole-enum `Copy`/`Move`
+  (`step_enum_copy_move_simulation`), `StorageLive`/`StorageDead`
+  (`step_storageLive_LM2_3_simulation`, `step_storageDead_LM2_3_simulation`),
+  `SwitchInt` match dispatch (`enum_match_switchInt_simulation`),
+  `Goto`/`Return` helpers, and the thirteen `WitLM2_3` concrete multi-variant
+  execution, UB, and divergence witnesses.
 * the `LM-2.4` theorems: the union aggregate, field read, and whole-union copy/move
   fresh and in-place overwrite steps (`step_union_aggregate_simulation`,
   `step_union_aggregate_overwrite_simulation`, `step_union_field_read_simulation`,
@@ -989,6 +995,10 @@ open LeanMiriSpec.Correspondence in
   annealEvalEnumProjection
   annealDiscriminantHooksLM2_3
   annealAggregateHooksLM2_3
+  annealProjectEnumPlaceElem
+  annealProjectEnumPlaceList
+  annealEvalEnumProjectedPlace
+  annealEvalPlaceLM2_3
   annealRvalueHooksLM2_3
   annealStepHooksLM2_3
   BodyFreeOfLM2_3
@@ -997,10 +1007,14 @@ open LeanMiriSpec.Correspondence in
   ValidEnumLayout
   isVariantUninhabited_translateVariantsShape_multiple
   EnumMemRel
+  EnumMemRel.of_copy_fresh
+  EnumMemRel.of_copy_overwrite
   UninitEnumMemRel
   LocalRelLM2_3
   EnumLocalByteUninit
+  EnumLocalByteUninit.of_dealloc_other
   FrameRelLM2_3
+  FrameRelLM2_3.update_local_dealloc
   StateRelLM2_3
   StepRelLM2_3
   StepRelLM2_3.ub_iff
@@ -1022,6 +1036,13 @@ open LeanMiriSpec.Correspondence in
   enum_match_switchInt_simulation
   step_goto_lm2_3_simulation
   step_return_scalar_lm2_3_simulation
+  step_storageLive_LM2_3_simulation
+  step_storageDead_LM2_3_simulation
+  usesStructMemCopyDest_true_of_validEnum
+  step_enum_copy_move_simulation
+  annealEvalPlaceLM2_3_downcast_field_ok
+  step_downcast_field_write_simulation
+  step_downcast_field_write_inactive_divergence
   Witness.lm23EnumLayout
   Witness.lm23Layouts
   Witness.lm23Variants
@@ -1041,6 +1062,9 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm2_3_prefix_setDiscriminant_read
   Witness.wit_lm2_3_upcast_setDiscriminant_read_and_trailing_ub
   Witness.wit_lm2_3_bodyFree_divBody
+  Witness.wit_lm2_3_upcast_field_write_move_and_storage_lifecycle
+  Witness.wit_lm2_3_copy_move_and_downcast_write_ub
+  Witness.wit_lm2_3_downcast_write_inactive_divergence
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -7189,6 +7213,218 @@ example (divisor : Nat) :
         (annealStepHooks (Witness.divBody divisor).localDecls
           (Witness.divBody divisor).layouts) () (Witness.miriInit divisor) :=
   Witness.wit_lm2_3_bodyFree_divBody divisor
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env allocBudget s m →
+      (∀ p, body.phase ≠ .other p) →
+      ∀ {bb : BasicBlockData} {loc : Local} {decl : MirAst.LocalDecl} {span : String},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some ⟨.storageLive loc, span⟩ →
+        get? body.localDecls loc = some decl →
+        let mRes :=
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m
+        StepRelLM2_3 body env allocBudget m (stepMirFn body s) mRes ∧
+        IsImmediateStepLocal mRes.1 loc ∧
+        (∀ enumId b, enumId ≠ loc →
+          EnumLocalByteUninit m enumId b → EnumLocalByteUninit mRes.1 enumId b) ∧
+        (∀ j, IsImmediateStepLocal m j → IsImmediateStepLocal mRes.1 j) :=
+  @step_storageLive_LM2_3_simulation
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env allocBudget s m →
+      (∀ p, body.phase ≠ .other p) →
+      ∀ {bb : BasicBlockData} {loc : Local} {decl : MirAst.LocalDecl} {span : String},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some ⟨.storageDead loc, span⟩ →
+        get? body.localDecls loc = some decl →
+        loc ≠ 0 →
+        let mRes :=
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m
+        StepRelLM2_3 body env allocBudget m (stepMirFn body s) mRes ∧
+        (∀ enumId b, enumId ≠ loc →
+          EnumLocalByteUninit m enumId b → EnumLocalByteUninit mRes.1 enumId b) ∧
+        (∀ j, IsImmediateStepLocal m j → IsImmediateStepLocal mRes.1 j) :=
+  @step_storageDead_LM2_3_simulation
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env (allocBudget + 1) s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) →
+        ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {dstIdx srcIdx : Local} {dstDecl srcDecl : MirAst.LocalDecl}
+        {isMove : Bool} {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .assign ⟨dstIdx, .nil⟩
+          (.use (if isMove then .move ⟨srcIdx, .nil⟩ else .copy ⟨srcIdx, .nil⟩)) →
+        srcIdx ≠ dstIdx →
+        get? body.localDecls srcIdx = some srcDecl →
+        get? body.localDecls dstIdx = some dstDecl →
+        env srcDecl.ty = some (tagBytes, variants) →
+        dstDecl.ty = srcDecl.ty →
+        (get? s.frame.locals srcIdx = some .uninit →
+          IsImmediateStepLocal m srcIdx) →
+        let mRes :=
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m
+        StepRelLM2_3 body env allocBudget m (stepMirFn body s) mRes ∧
+        ((∀ msg, mRes.2 ≠ .error (.undefinedBehavior msg)) →
+          (isMove = true → IsImmediateStepLocal mRes.1 srcIdx) ∧
+          (∀ b, EnumLocalByteUninit m srcIdx b →
+            EnumLocalByteUninit mRes.1 dstIdx b) ∧
+          (∀ enumId b, enumId ≠ dstIdx → (isMove = true → enumId ≠ srcIdx) →
+            EnumLocalByteUninit m enumId b →
+            EnumLocalByteUninit mRes.1 enumId b) ∧
+          (∀ j, j ≠ dstIdx → IsImmediateStepLocal m j →
+            IsImmediateStepLocal mRes.1 j)) :=
+  @step_enum_copy_move_simulation
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env allocBudget s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) →
+        ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {dstIdx : Local} {dstDecl : MirAst.LocalDecl}
+        {vName : Option String} {variantIdx fieldIdx : Nat} {fieldTy : Ty}
+        {op : MirAst.Operand}
+        {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .assign
+          ⟨dstIdx, [.downcast vName variantIdx, .field fieldIdx fieldTy]⟩
+          (.use op) →
+        get? body.localDecls dstIdx = some dstDecl →
+        env dstDecl.ty = some (tagBytes, variants) →
+        (hv_lt : variantIdx < variants.length) →
+        (hf_lt : fieldIdx < (variants[variantIdx]'hv_lt).length) →
+        fieldTy = ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).ty →
+        (∀ tf, m.stack.frames = #[tf] →
+          WellTypedEnumScalarOp body tf op fieldTy) →
+        (get? s.frame.locals dstIdx = some .dead ∨
+          ∃ fieldVals,
+            get? s.frame.locals dstIdx =
+              some (.init (.aggregate variantIdx fieldVals)) ∧
+            fieldIdx ≤ fieldVals.length) →
+        let mRes :=
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m
+        StepRelLM2_3 body env allocBudget m (stepMirFn body s) mRes ∧
+        ((∀ msg, mRes.2 ≠ .error (.undefinedBehavior msg)) →
+          (∀ enumId b,
+            (enumId ≠ dstIdx ∨
+              ((b < ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes.toNat ∨
+                ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes.toNat +
+                  ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).fieldLayout.size.bytes.toNat ≤
+                  b) ∧
+                b < (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)) →
+            EnumLocalByteUninit m enumId b →
+            EnumLocalByteUninit mRes.1 enumId b) ∧
+          (∀ j, IsImmediateStepLocal m j → IsImmediateStepLocal mRes.1 j)) :=
+  @step_downcast_field_write_simulation
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env allocBudget s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) →
+        ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {dstIdx : Local} {dstDecl : MirAst.LocalDecl}
+        {vName : Option String} {variantIdx v_act fieldIdx : Nat} {fieldTy : Ty}
+        {fieldVals : List Value} {op : MirAst.Operand}
+        {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .assign
+          ⟨dstIdx, [.downcast vName variantIdx, .field fieldIdx fieldTy]⟩
+          (.use op) →
+        get? body.localDecls dstIdx = some dstDecl →
+        env dstDecl.ty = some (tagBytes, variants) →
+        (hv_lt : variantIdx < variants.length) →
+        (hf_lt : fieldIdx < (variants[variantIdx]'hv_lt).length) →
+        fieldTy = ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).ty →
+        (∀ tf, m.stack.frames = #[tf] →
+          WellTypedEnumScalarOp body tf op fieldTy) →
+        evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil ≠ .ub →
+        get? s.frame.locals dstIdx = some (.init (.aggregate v_act fieldVals)) →
+        variantIdx ≠ v_act →
+        stepMirFn body s = MirStepNode.fail .ub ∧
+        ∃ m',
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m =
+          (m', .ok true) :=
+  @step_downcast_field_write_inactive_divergence
+
+example :
+    ∃ (m₁ m₂ m₃ m₄ m₅ m₆ m₇ m₈ m₉ : AnnealStepState)
+      (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      Miri.Interpreter.Step.step Witness.lm23Hooks ()
+          (Witness.lm23InitMiri 15) = (m₁, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1 Witness.lm23Bb15S1 m₁ ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1 Witness.lm23Bb15S2 m₂ ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1 Witness.lm23Bb15S3 m₃ ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1 Witness.lm23Bb15S4 m₄ ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb15S5 m₅ ∧
+      IsImmediateStepLocal m₅ 1 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₅ = (m₆, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb15S6 m₆ ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₆ = (m₇, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb15S7 m₇ ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₇ = (m₈, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb15S8 m₈ ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₈ = (m₉, .ok true) ∧
+      annealControlHooks.returnOperand () m₈ = (m₈, .ok (.immediate imm0)) ∧
+      ImmediateRel Witness.lm23U64Ty Witness.lm23Layouts (.scalar ⟨99, 8⟩) imm0 ∧
+      m₉.stack.frames = #[] :=
+  Witness.wit_lm2_3_upcast_field_write_move_and_storage_lifecycle
+
+example :
+    (∃ m₁ msg₁,
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 16) = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () (Witness.lm23InitMiri 16) =
+        (m₁, .error (.undefinedBehavior msg₁))) ∧
+    (∃ m₂ msg₂,
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 17) = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () (Witness.lm23InitMiri 17) =
+        (m₂, .error (.undefinedBehavior msg₂))) ∧
+    (∃ m₃ m₄ msg₃,
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 18) =
+        .step Witness.lm23Bb18S1 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () (Witness.lm23InitMiri 18) =
+        (m₃, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1 Witness.lm23Bb18S1 m₃ ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb18S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₃ =
+        (m₄, .error (.undefinedBehavior msg₃))) :=
+  Witness.wit_lm2_3_copy_move_and_downcast_write_ub
+
+example :
+    ∃ (m₁ m₂ : AnnealStepState),
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 19) =
+        .step Witness.lm23Bb19S1 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () (Witness.lm23InitMiri 19) =
+        (m₁, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb19S1 m₁ ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb19S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₁ = (m₂, .ok true) :=
+  Witness.wit_lm2_3_downcast_write_inactive_divergence
 
 end LM2_3Pins
 

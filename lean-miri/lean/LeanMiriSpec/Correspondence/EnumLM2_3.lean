@@ -18,19 +18,20 @@ import LeanMiriSpec.Correspondence.ProjLM2_2
 # Multi-Variant Enum Hooks, `ValidEnumLayout`, and `StateRelLM2_3` (`LM-2.3`)
 
 In `Translate.lean`, `annealStepHooks.writeDiscriminant`,
-`annealRvalueHooks.readDiscriminant`, `annealRvalueHooks.discriminantForVariant`,
-`annealStructProjectionCx.variant`, and non-zero `annealAggregateHooks` variant
-downcasts/discriminants fail closed with `StepError.unsupported`.
+`annealRvalueHooks.readDiscriminant`,
+`annealRvalueHooks.discriminantForVariant`, `annealStructProjectionCx.variant`,
+and non-zero `annealAggregateHooks` variant downcasts/discriminants fail closed
+with `StepError.unsupported`.
 
 This module wires the vendored `lean-miri` multi-variant enum pipelines
 (`Miri.Interpreter.Discriminant.{writeDiscriminant, readDiscriminant,
 discriminantForVariant, tagForVariant}`, `Miri.Interpreter.writeAggregate`, and
 `Miri.Interpreter.{project, projectDowncast, projectField}`) as a conservative
-overlay `annealStepHooksLM2_3` over `annealStepHooks` (`step_LM2_3_eq_of_bodyFree`),
-and defines the modular enum state relation (`ValidEnumLayout`, `EnumMemRel`,
-`UninitEnumMemRel`, `LocalRelLM2_3`, `EnumLocalByteUninit`, `FrameRelLM2_3`,
-`StateRelLM2_3`, and `StepRelLM2_3`) consumed by `SimLM2_3.lean` and
-`WitLM2_3.lean`.
+overlay `annealStepHooksLM2_3` over `annealStepHooks`
+(`step_LM2_3_eq_of_bodyFree`), and defines the modular enum state relation
+(`ValidEnumLayout`, `EnumMemRel`, `UninitEnumMemRel`, `LocalRelLM2_3`,
+`EnumLocalByteUninit`, `FrameRelLM2_3`, `StateRelLM2_3`, and `StepRelLM2_3`)
+consumed by `SimLM2_3.lean` and `WitLM2_3.lean`.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -327,11 +328,106 @@ def annealEvalOperandLM2_3 (localDecls : List LocalDecl) (layouts : LayoutTable)
         annealEvalOperand localDecls layouts op known
   | _ => annealEvalOperand localDecls layouts op known
 
+/-- Project a `RuntimePlace AnnealProv` by one `Miri.MIR.ProjectionElem` under
+`annealEnumProjectionCx`, mirroring vendored
+`Miri.Interpreter.projectRuntimePlace` (`Miri/Interpreter/Place.lean`) so
+destination places carrying `ProjectionElem.Downcast` install the target
+variant's `VariantLayout` before subsequent `ProjectionElem.Field` offsets. -/
+def annealProjectEnumPlaceElem (layouts : LayoutTable)
+    (place : Miri.Interpreter.RuntimePlace AnnealProv)
+    (elem : Miri.MIR.ProjectionElem) :
+    Except Miri.Interpreter.StepError
+      (Miri.Interpreter.RuntimePlace AnnealProv) := do
+  let hintTy :=
+    match elem with
+    | .Field _ ft => some ft
+    | _ => none
+  let cx := annealEnumProjectionCx layouts hintTy
+  match place.ref with
+  | .memory mplace =>
+      match Miri.Interpreter.project cx
+          ⟨.indirect mplace, place.layout⟩ elem with
+      | .ok ⟨.indirect mplace', layout'⟩ => return ⟨.memory mplace', layout'⟩
+      | .ok ⟨.immediate _, _⟩ =>
+          throw (.invalidProgram "memory projection returned immediate")
+      | .error err => throw (annealLiftProjectionError err)
+  | .local frame localId offset identity =>
+      if !place.layout.layout.isSized then
+        throw (.invalidProgram "unsized local place")
+      let baseOffset := offset.getD Miri.ABI.Size.ZERO
+      let carrier : Miri.Interpreter.MemPlace AnnealProv :=
+        ⟨⟨baseOffset, none⟩, .none, none⟩
+      match Miri.Interpreter.project cx
+          ⟨.indirect carrier, place.layout⟩ elem with
+      | .ok ⟨.indirect result, layout'⟩ =>
+          if !layout'.layout.isSized || result.metadata.hasMeta then
+            throw (.invalidProgram "unsized projected local")
+          let bound ←
+            match result.ptr.offset.add layout'.layout.size with
+            | .ok b => pure b
+            | .error _ =>
+                throw (.invalidProgram "projected local size overflow")
+          let endOffset ←
+            match baseOffset.add place.layout.layout.size with
+            | .ok e => pure e
+            | .error _ => throw (.invalidProgram "local size overflow")
+          if result.ptr.offset.bytes < baseOffset.bytes ||
+              bound.bytes > endOffset.bytes then
+            throw (.invalidProgram "projected local is out of bounds")
+          else
+            return ⟨.local frame localId (some result.ptr.offset) identity,
+              layout'⟩
+      | .ok ⟨.immediate _, _⟩ =>
+          throw (.invalidProgram "local projection returned immediate")
+      | .error err => throw (annealLiftProjectionError err)
+
+/-- Project a `RuntimePlace AnnealProv` along a list of
+`Miri.MIR.ProjectionElem`s using `annealProjectEnumPlaceElem`. -/
+def annealProjectEnumPlaceList (layouts : LayoutTable)
+    (place : Miri.Interpreter.RuntimePlace AnnealProv) :
+    List Miri.MIR.ProjectionElem →
+    Except Miri.Interpreter.StepError
+      (Miri.Interpreter.RuntimePlace AnnealProv)
+  | [] => .ok place
+  | elem :: rest => do
+      let next ← annealProjectEnumPlaceElem layouts place elem
+      annealProjectEnumPlaceList layouts next rest
+
+/-- Resolve a `Downcast`-projected destination `Miri.MIR.Place` in the top
+frame via `annealProjectEnumPlaceList`. -/
+def annealEvalEnumProjectedPlace (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (place : Miri.MIR.Place) :
+    Miri.Interpreter.RvalueM AnnealStepState
+      (Miri.Interpreter.RuntimePlace AnnealProv) := do
+  let st ← get
+  if st.stack.currentFrame?.isNone then
+    throw (.stack .emptyStack)
+  let frameIdx := st.stack.frames.size - 1
+  let (frame', layout) ←
+    annealResolveAndCacheLocalLayout localDecls layouts place.localId none
+  let base : Miri.Interpreter.RuntimePlace AnnealProv :=
+    ⟨.local frameIdx place.localId none frame'.localsIdentity, layout⟩
+  match annealProjectEnumPlaceList layouts base place.projection.toList with
+  | .ok p => return p
+  | .error err => throw err
+
+/-- Enum-aware place evaluation: places carrying a `Downcast` projection use
+`annealEvalEnumProjectedPlace`; all other places delegate unchanged to
+`annealEvalPlace`. -/
+def annealEvalPlaceLM2_3 (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (place : Miri.MIR.Place) :
+    Miri.Interpreter.RvalueM AnnealStepState
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  if place.projection.toList.any isDowncastElem then
+    annealEvalEnumProjectedPlace localDecls layouts place
+  else
+    annealEvalPlace localDecls layouts place
+
 /-- `AggregateHooks` for multi-variant enum construction (`LM-2.3`), forcing the
-enum destination into memory on `projectDowncast`, projecting each active-variant
-payload field via `Miri.Interpreter.projectField`, copying each evaluated scalar
-operand into its variant offset, and writing the variant's tag scalar via
-vendored `Miri.Interpreter.Discriminant.writeDiscriminant`. -/
+enum destination into memory on `projectDowncast`, projecting each
+active-variant payload field via `Miri.Interpreter.projectField`, copying each
+evaluated scalar operand into its variant offset, and writing the variant's tag
+scalar via vendored `Miri.Interpreter.Discriminant.writeDiscriminant`. -/
 def annealAggregateHooksLM2_3 (localDecls : List LocalDecl)
     (layouts : LayoutTable) (operands : Array Miri.MIR.Operand) :
     Miri.Interpreter.AggregateHooks
@@ -381,7 +477,7 @@ def annealAggregateHooksLM2_3 (localDecls : List LocalDecl)
             (annealDiscriminantHooksLM2_3 localDecls layouts) c variant dest }
 
 /-- `RvalueHooks` extended with multi-variant enum `Aggregate`, `Discriminant`,
-and `Downcast` operand support. -/
+and `Downcast` place and operand support. -/
 def annealRvalueHooksLM2_3 (localDecls : List LocalDecl)
     (layouts : LayoutTable) :
     Miri.Interpreter.RvalueHooks
@@ -391,10 +487,14 @@ def annealRvalueHooksLM2_3 (localDecls : List LocalDecl)
       (Miri.Interpreter.RuntimePlace AnnealProv) :=
   let discrHooks := annealDiscriminantHooksLM2_3 localDecls layouts
   { annealRvalueHooks localDecls layouts with
+    evalPlace := fun _ p _ =>
+      annealEvalPlaceLM2_3 localDecls layouts p
     evalOperand := fun _ op known =>
       annealEvalOperandLM2_3 localDecls layouts op known
     evalOperandAt := fun _ _ op known =>
       annealEvalOperandLM2_3 localDecls layouts op known
+    evalPlaceToOp := fun _ p known =>
+      annealEvalOperandLM2_3 localDecls layouts (.Copy p) known
     writeAggregate := fun c k os d =>
       Miri.Interpreter.writeAggregate
         (annealAggregateHooksLM2_3 localDecls layouts os) c k os d
@@ -471,7 +571,8 @@ def stmtFreeOfLM2_3 (localDecls : List LocalDecl) (layouts : LayoutTable)
   | .SetDiscriminant _ _ => False
   | _ => True
 
-/-- Whether every basic block of `body` is free of `LM-2.3`-specific statements. -/
+/-- Whether every basic block of `body` is free of `LM-2.3`-specific
+statements. -/
 def BodyFreeOfLM2_3 (localDecls : List LocalDecl) (layouts : LayoutTable)
     (body : Miri.MIR.Body) : Prop :=
   ∀ bb ∈ body.basicBlocks.toList,
@@ -689,9 +790,10 @@ end ValidEnumLayout
 /-- Anneal's `LayoutTable` records no per-variant inhabitedness:
 `translateVariantFieldsShape` sets `uninhabited := false` for every variant of a
 `.multiple` layout. So lean-miri's `isVariantUninhabited` is `false` at every
-in-range variant of a translated enum layout, its `UninhabitedEnumVariantWritten`
-and `UninhabitedEnumVariantRead` UB checks never fire there, and the
-`vl_inhabited` field of `ValidEnumVariantFields` excludes no translated layout. -/
+in-range variant of a translated enum layout, its
+`UninhabitedEnumVariantWritten` and `UninhabitedEnumVariantRead` UB checks never
+fire there, and the `vl_inhabited` field of `ValidEnumVariantFields` excludes no
+translated layout. -/
 theorem isVariantUninhabited_translateVariantsShape_multiple
     (lay : Miri.ABI.LayoutData) (tag : ScalarLayout) (tagField : Nat)
     (shapes : List FieldsShape)
@@ -707,7 +809,8 @@ theorem isVariantUninhabited_translateVariantsShape_multiple
 abbrev EnumTypeEnv :=
   Ty → Option (Nat × List (List StructFieldDesc))
 
-/-- Empty `EnumTypeEnv` under which `StateRelLM2_3` coincides with `StateRel`. -/
+/-- Empty `EnumTypeEnv` under which `StateRelLM2_3` coincides with
+`StateRel`. -/
 def emptyEnumTypeEnv : EnumTypeEnv := fun _ => none
 
 /-- Memory-place correspondence for an **initialized** multi-variant enum value
@@ -937,6 +1040,128 @@ theorem of_dealloc {mach : AnnealMachine}
           base_lookup ptr_addr_eq addr_no_overflow mut_alloc aligned_ptr
           byteSize_eq alloc_len_eq prov_empty mask_rel tag_scalar_rel
           tag_bits_init tag_range_init tag_read payload_rel
+
+theorem of_copy_fresh {mach : AnnealMachine} {mem' : AnnealMemory}
+    {id : Miri.Memory.AllocId}
+    {ty : Ty} {layouts : LayoutTable} {tagBytes : Nat}
+    {variants : List (List StructFieldDesc)} {v_act : Nat}
+    {fieldVals : List Value} {srcMp : Miri.Interpreter.MemPlace AnnealProv}
+    {srcId : Miri.Memory.AllocId} {srcLocal : AnnealLocalAlloc}
+    (h : EnumMemRel mach ty layouts tagBytes variants v_act fieldVals srcMp)
+    {tag_s : Miri.Memory.BorTag}
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId tag_s))
+    (hlive_s : LiveAllocEntry mach.memory.live srcId srcLocal)
+    (hfresh : mem'.live.any (fun entry => entry.1 == id) = false)
+    (hovf : (annealStackBaseAddr id).toNat +
+      (translateTy ty layouts).layout.size.bytes.toNat < 2 ^ 64) :
+    EnumMemRel
+      (stackAllocMachine mach mem' id
+        (copyWholeStructAllocation srcLocal.allocation none))
+      ty layouts tagBytes variants v_act fieldVals (stackAllocPlace id) := by
+  rcases h with ⟨allocId, borTag, baseAddr, localAlloc, words, msc_tag,
+    valid_enum, active_lt, ptr_prov, _, _, live_entry, _, _, _, _, _,
+    byteSize_eq, alloc_len_eq, prov_empty, mask_rel, tag_scalar_rel,
+    tag_bits_init, tag_range_init, tag_read, payload_rel⟩
+  rw [ptr_prov] at hprov_s
+  injection hprov_s with hprov_eq
+  injection hprov_eq with hid_eq _
+  subst hid_eq
+  have hla_eq : srcLocal = localAlloc := by
+    have h1 := hlive_s.1
+    rw [live_entry.1] at h1
+    injection h1 with hp
+    exact (Prod.mk.inj hp).2.symm
+  subst hla_eq
+  let alloc' := copyWholeStructAllocation srcLocal.allocation none
+  obtain ⟨hmut', hbs', hlen', hpmap', hmask_eq, hread_eq⟩ :=
+    copyWholeStructAllocation_props srcLocal.allocation none
+  refine .mk id Miri.Memory.BorTag.one (annealStackBaseAddr id)
+    ⟨.stack, alloc'⟩ words msc_tag valid_enum active_lt rfl rfl rfl
+    (LiveAllocEntry.of_push_fresh_self _ hfresh)
+    (lookupBaseAddr_stackAllocMachine_self _ _ _ _)
+    rfl hovf hmut'
+    (annealStackBaseAddr_isAligned id _ valid_enum.align_pow2_le)
+    (hbs'.trans byteSize_eq) (by rw [hlen', hbs']; exact alloc_len_eq)
+    (hpmap'.trans prov_empty) (by rw [hmask_eq, hbs']; exact mask_rel)
+    tag_scalar_rel tag_bits_init
+    (by dsimp; rw [hmask_eq]; exact tag_range_init)
+    (by dsimp; rw [hread_eq]; exact tag_read) ?_
+  intro i hi
+  rcases payload_rel i hi with
+    ⟨sc, msc, hfv, hrel, hsz, hb, hc, hbits, hinit, hread⟩ | hnone
+  · exact Or.inl ⟨sc, msc, hfv, hrel, hsz, hb, hc, hbits,
+      by dsimp; rw [hmask_eq]; exact hinit,
+      by dsimp; rw [hread_eq]; exact hread⟩
+  · exact Or.inr hnone
+
+theorem of_copy_overwrite {mach : AnnealMachine} {u : Nat}
+    {destId : Miri.Memory.AllocId} {destBase : UInt64}
+    {destLocal : AnnealLocalAlloc}
+    {destMp : Miri.Interpreter.MemPlace AnnealProv}
+    {ty : Ty} {layouts : LayoutTable} {tagBytes : Nat}
+    {variants : List (List StructFieldDesc)} {v_act : Nat}
+    {fieldVals : List Value} {srcMp : Miri.Interpreter.MemPlace AnnealProv}
+    {srcId : Miri.Memory.AllocId} {srcLocal : AnnealLocalAlloc}
+    (h : EnumMemRel mach ty layouts tagBytes variants v_act fieldVals srcMp)
+    {tag_s : Miri.Memory.BorTag}
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId tag_s))
+    (hlive_s : LiveAllocEntry mach.memory.live srcId srcLocal)
+    {tag_d : Miri.Memory.BorTag}
+    (hprov_d : destMp.ptr.provenance = some (.concrete destId tag_d))
+    (hmis_d : destMp.misaligned = none)
+    (hmeta_d : destMp.metadata = .none)
+    (hlive_d : LiveAllocEntry mach.memory.live destId destLocal)
+    (hu_lt : u < mach.memory.live.size)
+    (hfidx_d : mach.memory.live.findIdx? (fun (k, _) => k == destId) = some u)
+    (hbase_d : mach.lookupBaseAddr destId = some destBase)
+    (hptr_d : destMp.ptr.offset = Miri.ABI.Size.ofBytes destBase)
+    (hovf_d : destBase.toNat +
+      (translateTy ty layouts).layout.size.bytes.toNat < 2 ^ 64)
+    (halign_d : destMp.ptr.offset.isAligned
+      (translateTy ty layouts).layout.align.abi = .ok true) :
+    EnumMemRel
+      (updateAllocMachine mach u destId destLocal.kind
+        (copyWholeStructAllocation srcLocal.allocation
+          destLocal.allocation.extra))
+      ty layouts tagBytes variants v_act fieldVals destMp := by
+  rcases h with ⟨allocId, borTag, baseAddr, localAlloc, words, msc_tag,
+    valid_enum, active_lt, ptr_prov, _, _, live_entry, _, _, _, _, _,
+    byteSize_eq, alloc_len_eq, prov_empty, mask_rel, tag_scalar_rel,
+    tag_bits_init, tag_range_init, tag_read, payload_rel⟩
+  rw [ptr_prov] at hprov_s
+  injection hprov_s with hprov_eq
+  injection hprov_eq with hid_eq _
+  subst hid_eq
+  have hla_eq : srcLocal = localAlloc := by
+    have h1 := hlive_s.1
+    rw [live_entry.1] at h1
+    injection h1 with hp
+    exact (Prod.mk.inj hp).2.symm
+  subst hla_eq
+  let alloc' := copyWholeStructAllocation srcLocal.allocation
+    destLocal.allocation.extra
+  obtain ⟨hmut', hbs', hlen', hpmap', hmask_eq, hread_eq⟩ :=
+    copyWholeStructAllocation_props srcLocal.allocation
+      destLocal.allocation.extra
+  have hlive_self : LiveAllocEntry
+      (mach.memory.live.set! u (destId, ⟨destLocal.kind, alloc'⟩))
+      destId ⟨destLocal.kind, alloc'⟩ :=
+    hlive_d.of_set!_self hu_lt hfidx_d ⟨destLocal.kind, alloc'⟩
+  refine .mk destId tag_d destBase ⟨destLocal.kind, alloc'⟩ words msc_tag
+    valid_enum active_lt hprov_d hmis_d hmeta_d hlive_self hbase_d hptr_d
+    hovf_d hmut' halign_d
+    (hbs'.trans byteSize_eq) (by rw [hlen', hbs']; exact alloc_len_eq)
+    (hpmap'.trans prov_empty) (by rw [hmask_eq, hbs']; exact mask_rel)
+    tag_scalar_rel tag_bits_init
+    (by dsimp; rw [hmask_eq]; exact tag_range_init)
+    (by dsimp; rw [hread_eq]; exact tag_read) ?_
+  intro i hi
+  rcases payload_rel i hi with
+    ⟨sc, msc, hfv, hrel, hsz, hb, hc, hbits, hinit, hread⟩ | hnone
+  · exact Or.inl ⟨sc, msc, hfv, hrel, hsz, hb, hc, hbits,
+      by dsimp; rw [hmask_eq]; exact hinit,
+      by dsimp; rw [hread_eq]; exact hread⟩
+  · exact Or.inr hnone
 
 end EnumMemRel
 
@@ -1313,6 +1538,77 @@ theorem EnumLocalByteUninit.of_replace_other {m : AnnealStepState}
   simp only [Array.getElem?_set, hne, ↓reduceIte] at hloc'
   exact h topFrame mp c allocId borTag localAlloc hframes hloc' hprov hfind
 
+theorem EnumLocalByteUninit.of_dealloc_other {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {localId otherIdx : Nat} {hlt : otherIdx < topFrame.locals.size}
+    {newLs : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    {b : Nat}
+    (hne : otherIdx ≠ localId)
+    (hframes : m.stack.frames = #[topFrame])
+    (h : EnumLocalByteUninit m localId b) :
+    EnumLocalByteUninit
+      { stack := ⟨#[{ topFrame with
+            locals := topFrame.locals.set otherIdx newLs hlt }]⟩
+        machine := { m.machine with
+          memory := deallocLocalMemory m.machine.memory
+            (topFrame.locals[otherIdx]'hlt).value } }
+      localId b := by
+  intro tf' mp c allocId borTag localAlloc hf' hloc' hprov hfind
+  injection hf' with hf_arr
+  injection hf_arr with htf_eq
+  subst htf_eq
+  dsimp at hloc' hfind
+  simp only [Array.getElem?_set, hne, ↓reduceIte] at hloc'
+  have hfind_orig :
+      m.machine.memory.live.find? (fun (k, _) => k == allocId) =
+        some (allocId, localAlloc) := by
+    cases hv : (topFrame.locals[otherIdx]'hlt).value with
+    | dead =>
+      rw [hv] at hfind; exact hfind
+    | live op =>
+      cases op with
+      | immediate _ =>
+        rw [hv] at hfind; exact hfind
+      | indirect mp0 =>
+        rw [hv] at hfind
+        cases hid : mp0.ptr.provenance.bind Miri.Memory.Provenance.getAllocId with
+        | none =>
+          have hmem : deallocLocalMemory m.machine.memory (.live (.indirect mp0)) =
+              m.machine.memory := by
+            simp [deallocLocalMemory, hid]
+          rw [hmem] at hfind; exact hfind
+        | some deadId =>
+          have hmem : deallocLocalMemory m.machine.memory (.live (.indirect mp0)) =
+              { m.machine.memory with
+                live := m.machine.memory.live.filter
+                  (fun entry => entry.1 != deadId) } := by
+            simp [deallocLocalMemory, hid]
+          rw [hmem] at hfind
+          dsimp at hfind
+          rw [← Array.find?_toList, Array.toList_filter,
+            List.find?_filter] at hfind
+          obtain ⟨hmem_f, _⟩ := List.find?_eq_some_iff_append.mp hfind
+          have hne_id : allocId ≠ deadId :=
+            bne_iff_ne.mp (of_decide_eq_true hmem_f).1
+          have hp_imp : ∀ x : Miri.Memory.AllocId × AnnealLocalAlloc,
+              decide ((x.1 != deadId) = true ∧
+                ((fun (k, _) => k == allocId) x) = true) =
+              (fun (k, _) => k == allocId) x := by
+            rintro ⟨k, la⟩
+            by_cases hk : k == allocId
+            · have hk_eq : k = allocId := beq_iff_eq.mp hk
+              subst hk_eq
+              simp [bne_iff_ne, hne_id]
+            · simp [hk]
+          have hfun_eq :
+              (fun x : Miri.Memory.AllocId × AnnealLocalAlloc =>
+                decide ((x.1 != deadId) = true ∧
+                  ((fun (k, _) => k == allocId) x) = true)) =
+              (fun (k, _) => k == allocId) := funext hp_imp
+          rw [hfun_eq, Array.find?_toList] at hfind
+          exact hfind
+  exact h topFrame mp c allocId borTag localAlloc hframes hloc' hprov hfind_orig
+
 /-- Frame correspondence for `LM-2.3`, parameterized by `EnumTypeEnv`. -/
 structure FrameRelLM2_3
     (body : CapturedMir)
@@ -1424,6 +1720,49 @@ theorem update_local {body : CapturedMir} {env : EnumTypeEnv}
         simp only [List.getElem?_set, hij, ↓reduceIte] at hs
         simp only [Array.getElem?_set, hij, ↓reduceIte] at hm
         exact h.locals_rel j d s mls hd hs hm
+
+theorem update_local_dealloc {body : CapturedMir} {env : EnumTypeEnv}
+    {mach : AnnealMachine} {af : StackFrame}
+    {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : FrameRelLM2_3 body env mach af mf)
+    (hdisj : MemoryAllocDisjoint mf)
+    {idx : Nat} {decl : LocalDecl}
+    {newSlot : LocalSlot} {newVal : Miri.Interpreter.LocalValue AnnealProv}
+    (hdecl : get? body.localDecls idx = some decl)
+    {hlt : idx < mf.locals.size}
+    (hnew : LocalRelLM2_3 env
+      { mach with memory := deallocLocalMemory mach.memory (mf.locals[idx]'hlt).value }
+      decl body.layouts newSlot { mf.locals[idx]'hlt with value := newVal }) :
+    FrameRelLM2_3 body env
+      { mach with memory := deallocLocalMemory mach.memory (mf.locals[idx]'hlt).value }
+      { af with locals := af.locals.set idx newSlot }
+      { mf with
+        locals := mf.locals.set idx
+          { mf.locals[idx]'hlt with value := newVal } hlt } := by
+  refine ⟨h.body_eq, h.location_eq, ?_, ?_, ?_⟩
+  · unfold length at *; rw [List.length_set]; exact h.af_locals_len
+  · rw [Array.size_set]; exact h.mf_locals_size
+  · intro j d s mls hd hs hm
+    have hidx_af : idx < af.locals.length := by
+      have hlen := h.af_locals_len
+      have hmsz := h.mf_locals_size
+      unfold length at hlen hmsz
+      omega
+    unfold get? at hs
+    rw [List.getElem?_set] at hs
+    rw [Array.getElem?_set] at hm
+    by_cases hij : idx = j
+    · subst hij
+      simp only [↓reduceIte, hidx_af, Option.some.injEq] at hs hm
+      rw [hdecl] at hd; injection hd with hd_eq
+      subst hd_eq hs hm
+      exact hnew
+    · simp only [hij, ↓reduceIte] at hs hm
+      apply (h.locals_rel j d s mls hd hs hm).of_dealloc
+      intro mp mp' hv hv'
+      apply hdisj idx j mp mp' (mf.locals[idx]'hlt).layout mls.layout hij
+      · rw [Array.getElem?_eq_getElem hlt, ← hv]
+      · rw [hm, ← hv']
 
 theorem step_pc {body : CapturedMir} {env : EnumTypeEnv}
     {mach : AnnealMachine} {af : StackFrame}
