@@ -2698,13 +2698,18 @@ a pointer `ptrVal` whose provenance tag resolved to a borrow entry targeting
 `.ub` on every dereferencing read (`evalPlaceRead`, `evalOperand` copy/move),
 every dereferencing write (`writePlaceValue`, `evalPlaceWrite`,
 `StatementKind.setDiscriminant`), every safe reborrow (`Rvalue.ref`), every
-reference retag (`StatementKind.retag`), every pointer-offset operation
-(`evalPtrOffsetBinOp`), and every non-zero-length `copy_nonoverlapping`
-(`evalCopyNonOverlappingWithCount`) through it. This holds for arbitrary frame
-locals `localsAfter` (in particular after `loc` has been revived by
-`StorageLive(loc)` and re-initialized) and arbitrary captured global allocations
-`globals`: the disabled stack borrow entry keeps shadowing any global allocation
-that shares the pointer's allocation identifier.
+reference retag (`StatementKind.retag`), and every non-zero-length
+`copy_nonoverlapping` (`evalCopyNonOverlappingWithCount`) through it. This holds
+for arbitrary frame locals `localsAfter` (in particular after `loc` has been
+revived by `StorageLive(loc)` and re-initialized) and arbitrary captured global
+allocations `globals`: the disabled stack borrow entry keeps shadowing any
+global allocation that shares the pointer's allocation identifier.
+
+Pointer arithmetic (`evalPtrOffsetBinOp`) and raw address-of (`Rvalue.rawPtr`)
+are deliberately not characterized: `Places.lean` currently faults on any
+disabled tag before inspecting the offset or the access, which is stricter than
+MiniRust and Miri for zero-byte offsets and raw address-of (both defined on
+dangling pointers), and those rules belong to `ws-lm-div-places-ptr`.
 -/
 theorem evalStmt_storageRevive_old_ptr_deref_ub
     (s : MachineState)
@@ -2749,8 +2754,6 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
       MirStepNode.fail .ub ∧
     evalStmt sAfter ⟨.setDiscriminant derefPlace n, span⟩ localDecls layouts =
       MirStepNode.fail .ub ∧
-    evalPtrOffsetBinOp localsAfter { mem with borrows := borrowsAfter }
-      localDecls layouts srcOp ptrVal sz ⟨n, 8⟩ = .ub ∧
     evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
       (.ptr ptrVal sz) otherVal (n + 1) localsAfter = MirStepNode.fail .ub ∧
     evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
@@ -2763,7 +2766,7 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
       writePlaceValue localsAfter (disableLocalBorrows borrows loc)
         { local_ := ptrLoc, projection := .deref :: restProj } writeVal = .ub := by
     simp [writePlaceValue, hPtrSlot, hDis]
-  refine ⟨hDis, ?_, ?_, ?_, hWrite, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨hDis, ?_, ?_, ?_, hWrite, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · simp [evalPlaceRead, hPtrSlot, hDis]
   · simp [evalOperand, hPtrSlot, hDis]
   · simp [evalOperand, hPtrSlot, hDis]
@@ -2778,7 +2781,6 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
   · cases borrowKind <;> simp [evalRvalue, hPtrSlot, hDis]
   · simp [evalStmt, evalOperand, readProjectedValue, hPtrSlot, hDis]
   · simp [evalStmt, evalOperand, hPtrSlot, hDis]
-  · simp [evalPtrOffsetBinOp, hDis]
   · unfold evalCopyNonOverlappingWithCount
     simp only [Nat.beq]
     cases otherVal with

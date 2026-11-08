@@ -5219,16 +5219,20 @@ theorem stmt_div_storage_revive_child_reborrow_read_is_ub :
   rfl
 
 /-- `D2` pointer-offset (`BinOp.offset`) after `StorageDead` + `StorageLive`
-revival: performing in-bounds pointer arithmetic `Offset(copy _2, const 0_isize)`
-on a raw pointer `_2 = &raw mut _1` minted before `StorageDead(_1)` faults with
-`FailureKind.ub` (Anneal previously allowed `Offset` on the stale tag and
-returned `0`):
+revival: offsetting the raw pointer `_2 = &raw mut _1` minted before
+`StorageDead(_1)` by one `u64` element (a non-zero byte offset, which MiniRust
+`ptr_offset_inbounds` and `ptr::offset` only allow inside a live allocation)
+faults with `FailureKind.ub` (Anneal previously allowed `Offset` on the stale
+tag and returned `0`):
 ```text
 StorageLive(_1); StorageLive(_2); StorageLive(_3);
 _1 = const 10_u64; _2 = &raw mut _1;
 StorageDead(_1); StorageLive(_1);
-_3 = Offset(copy _2, const 0_isize); _0 = const 0_u64; return
-``` -/
+_3 = Offset(copy _2, const 1_isize); _0 = const 0_u64; return
+```
+A zero offset is defined on dangling pointers in MiniRust and Miri; Anneal
+currently also faults on it because `evalPtrOffsetBinOp` (`Places.lean`)
+rejects disabled tags before inspecting the offset. -/
 private def stmtDivRevivePtrOffsetBody : CapturedMir :=
   stmtDivBody "stmt_div::ptr_offset_after_storage_revival"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
@@ -5242,14 +5246,14 @@ private def stmtDivRevivePtrOffsetBody : CapturedMir :=
       { kind := .storageLive 1, span := "revive _1" },
       { kind := .assign ⟨3, []⟩
           (.binaryOp .offset (.copy ⟨2, []⟩)
-            (.constant ⟨{ kind := .int .isize, layoutIdx := 0 }, .scalar (.int ⟨0, 8⟩)⟩)),
-        span := "_3 = Offset(_2, 0)" },
+            (.constant ⟨{ kind := .int .isize, layoutIdx := 0 }, .scalar (.int ⟨1, 8⟩)⟩)),
+        span := "_3 = Offset(_2, 1)" },
       { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
 
 theorem stmt_div_storage_revive_ptr_offset_is_ub :
     diffCProbeBounded 16 stmtDivRevivePtrOffsetBody
       (.running (initMachineState stmtDivRevivePtrOffsetBody [])) =
-      .some (.some .ub, "_3 = Offset(_2, 0)", .none) := by
+      .some (.some .ub, "_3 = Offset(_2, 1)", .none) := by
   rfl
 
 end StatementDivergenceRegressions
