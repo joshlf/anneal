@@ -9,6 +9,7 @@ those terms.
 -/
 
 import MiniRustSpec.Correspondence.PointerStep
+import MiniRustSpec.Correspondence.Provenance
 
 /-!
 # The correspondence theorem
@@ -4711,14 +4712,277 @@ theorem StateRelNProv.exposed_target_localPtr {body : CapturedMir} {f : Gen.Func
     hprov.sound prov hc
   exact ⟨tag, entry, pointeeIt, relOff, alloc, htag, hlk, hk, hspec, hpeq, halloc, hlive, haddr, hsz⟩
 
-/-- **Lockstep `PointerExposeProvenance` step correspondence (`MR-3.3` Pass A2).**
-When pointer local `_p` holds `.init (.ptr pv 8)` with `pv.offsetBytes = 0` and
-target provenance `tProv` (`ExposedTargetOk`), Anneal's `evalStmt` on
+/-! ### Provenance-cast steps: allocation shapes and the `ProvenanceRel` step lemmas (MR-3.3 B3)
+
+Pass A2 stated these step lemmas with the hypotheses
+`m4.mem.memory.allocations = m.mem.memory.allocations` and
+`m4.intptrcast = ...` on the MiniRust post-state. The first is unsatisfiable at
+every real `PointerExposeProvenance` / `PointerWithExposedProvenance` step,
+because the intrinsic stores its result into the destination local's
+allocation (`ProvenanceWitness.passA2_hm4_allocs_unsatisfiable_expose`,
+`..._withExposed`), so those lemmas applied to no execution. The lemmas below
+instead *derive* what the MiniRust step does: `placeStore`, `placeLoad`, local
+`evalPlace`, and `jumpToBlock` never touch `intptrcast` and change allocations
+only in their bytes (`AllocShapeEq`), which is all `ExposedTargetOk` and
+`ProvenanceRel` read. -/
+
+/-- Monadic inversion for `Interp`. -/
+theorem interpBind_ok {α β : Type} {m : Interp α} {f : α → Interp β} {y : β}
+    (h : (m >>= f) = .ok y) : ∃ x, m = .ok x ∧ f x = .ok y := by
+  cases m with
+  | error _ => cases h
+  | ok x => exact ⟨x, rfl, h⟩
+
+theorem listIndex_ok_get {T : Type} {xs : List T} {i : Int} {what : String} {x : T}
+    (h : listIndex xs i what = .ok x) : 0 ≤ i ∧ xs[i.toNat]? = some x := by
+  unfold listIndex at h
+  split at h
+  · next hge =>
+    cases hget : xs[i.toNat]? with
+    | none => simp [hget, specPanic] at h
+    | some y =>
+      simp only [hget, pure, Except.pure, Except.ok.injEq] at h
+      subst h
+      exact ⟨hge, rfl⟩
+  · simp [specPanic] at h
+
+theorem listSet_ok_eq {T : Type} {xs : List T} {i : Int} {x : T} {what : String} {ys : List T}
+    (h : listSet xs i x what = .ok ys) : ys = xs.set i.toNat x := by
+  unfold listSet at h
+  split at h
+  · simp only [pure, Except.pure, Except.ok.injEq] at h
+    exact h.symm
+  · simp [specPanic] at h
+
+theorem writeSubsliceAtIndex_length {T : Type} {xs : List T} {start : Int} {src ys : List T}
+    (h : writeSubsliceAtIndex xs start src = .ok ys) : ys.length = xs.length := by
+  unfold writeSubsliceAtIndex at h
+  split at h
+  · next hb =>
+    simp only [pure, Except.pure, Except.ok.injEq] at h
+    subst h
+    simp only [List.length_append, List.length_take, List.length_drop]
+    omega
+  · simp [specPanic] at h
+
+/-- Two allocation lists agree on length and, index by index, on address,
+liveness, and size: only the stored bytes may differ. This is everything
+`ExposedTargetOk` (and so `ProvenanceRel`) reads. -/
+def AllocShapeEq (as bs : List Gen.Allocation) : Prop :=
+  as.length = bs.length ∧
+    ∀ (i : Nat) (a : Gen.Allocation), as[i]? = some a →
+      ∃ b, bs[i]? = some b ∧ b.addr = a.addr ∧ b.live = a.live ∧ b.data.length = a.data.length
+
+theorem AllocShapeEq.refl (as : List Gen.Allocation) : AllocShapeEq as as :=
+  ⟨rfl, fun _ a h => ⟨a, h, rfl, rfl, rfl⟩⟩
+
+theorem AllocShapeEq.trans {as bs cs : List Gen.Allocation} (h1 : AllocShapeEq as bs)
+    (h2 : AllocShapeEq bs cs) : AllocShapeEq as cs := by
+  refine ⟨h1.1.trans h2.1, fun i a ha => ?_⟩
+  obtain ⟨b, hb, hb1, hb2, hb3⟩ := h1.2 i a ha
+  obtain ⟨c, hc, hc1, hc2, hc3⟩ := h2.2 i b hb
+  exact ⟨c, hc, hc1.trans hb1, hc2.trans hb2, hc3.trans hb3⟩
+
+theorem AllocShapeEq.set {as : List Gen.Allocation} {k : Nat} {a a' : Gen.Allocation}
+    (ha : as[k]? = some a) (haddr : a'.addr = a.addr) (hlive : a'.live = a.live)
+    (hlen : a'.data.length = a.data.length) :
+    AllocShapeEq as (as.set k a') := by
+  refine ⟨by simp, fun i b hb => ?_⟩
+  by_cases hik : k = i
+  · subst hik
+    rw [ha] at hb
+    cases hb
+    have hk : k < as.length := (List.getElem?_eq_some_iff.mp ha).1
+    exact ⟨a', by simp [hk], haddr, hlive, hlen⟩
+  · exact ⟨b, by rw [List.getElem?_set_ne hik]; exact hb, rfl, rfl, rfl⟩
+
+/-- `BasicMemory::store` only rewrites the bytes of one allocation. -/
+theorem BM.store_shape {mem mem' : BM} {ptr : Ptr} {bytes : List Byte} {align : Align}
+    (h : BM.store mem ptr bytes align = .ok mem') :
+    AllocShapeEq mem.allocations mem'.allocations := by
+  unfold BM.store at h
+  split at h
+  · simp [ub] at h
+  · obtain ⟨r, _, h⟩ := interpBind_ok h
+    cases r with
+    | none =>
+      simp only [pure, Except.pure, Except.ok.injEq] at h
+      subst h
+      exact AllocShapeEq.refl _
+    | some t =>
+      obtain ⟨id, pe, off⟩ := t
+      dsimp only at h
+      obtain ⟨alloc, hidx, h⟩ := interpBind_ok h
+      obtain ⟨data, hw, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hs, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq] at h
+      subst h
+      obtain ⟨_, hget⟩ := listIndex_ok_get hidx
+      rw [listSet_ok_eq hs]
+      exact AllocShapeEq.set hget rfl rfl (writeSubsliceAtIndex_length hw)
+
+/-- `BasicMemory::load` leaves the allocations unchanged up to shape. -/
+theorem BM.load_shape {mem mem' : BM} {ptr : Ptr} {len : Size} {align : Align}
+    {bytes : List Byte} (h : BM.load mem ptr len align = .ok (bytes, mem')) :
+    AllocShapeEq mem.allocations mem'.allocations := by
+  unfold BM.load at h
+  split at h
+  · simp [ub] at h
+  · obtain ⟨r, _, h⟩ := interpBind_ok h
+    cases r with
+    | none =>
+      simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨_, rfl⟩ := h
+      exact AllocShapeEq.refl _
+    | some t =>
+      obtain ⟨id, pe, off⟩ := t
+      dsimp only at h
+      obtain ⟨alloc, hidx, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hs, h⟩ := interpBind_ok h
+      obtain ⟨bs, _, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨_, rfl⟩ := h
+      obtain ⟨_, hget⟩ := listIndex_ok_get hidx
+      rw [listSet_ok_eq hs]
+      exact AllocShapeEq.set hget rfl rfl rfl
+
+/-- `Machine::place_store` changes only bytes of allocations, never
+`intptrcast`. -/
+theorem placeStore_shape {m m' : Mach} {pl : Gen.Place BM} {v : Val} {ty : Gen.Type}
+    (h : placeStore m pl v ty = .ok m') :
+    AllocShapeEq m.mem.memory.allocations m'.mem.memory.allocations ∧
+      m'.intptrcast = m.intptrcast := by
+  unfold placeStore at h
+  split at h
+  · simp [ub] at h
+  · unfold typedStore at h
+    cases hcv : checkValue v ty (some m) with
+    | error e => simp [hcv, specPanic, bind, Except.bind] at h
+    | ok u =>
+      simp only [hcv] at h
+      obtain ⟨bytes, _, h⟩ := interpBind_ok h
+      obtain ⟨cm, hcm, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq] at h
+      subst h
+      unfold CM.store at hcm
+      obtain ⟨mem', hbm, hcm⟩ := interpBind_ok hcm
+      simp only [pure, Except.pure, Except.ok.injEq] at hcm
+      subst hcm
+      exact ⟨BM.store_shape hbm, rfl⟩
+
+/-- `Machine::place_load` changes no allocation shape and never `intptrcast`. -/
+theorem placeLoad_shape {m m' : Mach} {pl : Gen.Place BM} {ty : Gen.Type} {v : Val}
+    (h : placeLoad m pl ty = .ok (v, m')) :
+    AllocShapeEq m.mem.memory.allocations m'.mem.memory.allocations ∧
+      m'.intptrcast = m.intptrcast := by
+  unfold placeLoad at h
+  split at h
+  · simp [ub] at h
+  · unfold typedLoad at h
+    obtain ⟨l, _, h⟩ := interpBind_ok h
+    obtain ⟨size, _, h⟩ := interpBind_ok h
+    obtain ⟨⟨bytes, cm⟩, hcm, h⟩ := interpBind_ok h
+    obtain ⟨dv, _, h⟩ := interpBind_ok h
+    unfold CM.load at hcm
+    obtain ⟨⟨bytes', mem'⟩, hbm, hcm⟩ := interpBind_ok hcm
+    simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hcm
+    obtain ⟨_, rfl⟩ := hcm
+    cases dv with
+    | none => simp [ub] at h
+    | some val =>
+      dsimp only at h
+      obtain ⟨u, _, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨_, rfl⟩ := h
+      exact ⟨BM.load_shape hbm, rfl⟩
+
+/-- Evaluating a local place leaves the machine unchanged. -/
+theorem evalPlace_local_eq {m m' : Mach} {name : Gen.LocalName} {out : Gen.Place BM × Gen.Type}
+    (h : evalPlace m (.Local name) = .ok (out, m')) : m' = m := by
+  unfold evalPlace at h
+  obtain ⟨fr, _, h⟩ := interpBind_ok h
+  obtain ⟨ty, _, h⟩ := interpBind_ok h
+  cases hmg : mapGet fr.locals name with
+  | none => simp [hmg, ub] at h
+  | some ptr =>
+    simp only [hmg, pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+    exact h.2.symm
+
+/-- Loading a local changes no allocation shape and never `intptrcast`. -/
+theorem evalValue_load_local_shape {m m' : Mach} {name : Gen.LocalName} {out : Val × Gen.Type}
+    (h : evalValue m (.Load (.Local name)) = .ok (out, m')) :
+    AllocShapeEq m.mem.memory.allocations m'.mem.memory.allocations ∧
+      m'.intptrcast = m.intptrcast := by
+  unfold evalValue at h
+  cases hpl : evalPlace m (.Local name) with
+  | error e => simp [hpl, bind, Except.bind] at h
+  | ok r =>
+    obtain ⟨⟨place, ty⟩, m1⟩ := r
+    have hm1 := evalPlace_local_eq hpl
+    simp only [hpl, bind, Except.bind] at h
+    cases hld : placeLoad m1 place ty with
+    | error e => simp [hld] at h
+    | ok r2 =>
+      obtain ⟨v, m2⟩ := r2
+      simp only [hld] at h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (Except.ok.inj h)
+      have := placeLoad_shape hld
+      rw [hm1] at this
+      exact this
+
+/-- `Machine::jump_to_block` changes only the current frame. -/
+theorem jumpToBlock_mem {m m' : Mach} {b : Gen.BbName} (h : jumpToBlock m b = .ok m') :
+    m'.mem = m.mem ∧ m'.intptrcast = m.intptrcast := by
+  unfold jumpToBlock mutateCurFrame at h
+  obtain ⟨t, _, h⟩ := interpBind_ok h
+  cases hl : t.stack.getLast? with
+  | none => simp [hl, specPanic] at h
+  | some fr =>
+    simp only [hl] at h
+    obtain ⟨threads, _, h⟩ := interpBind_ok h
+    simp only [pure, Except.pure, Except.ok.injEq] at h
+    subst h
+    exact ⟨rfl, rfl⟩
+
+theorem ExposedTargetOk.of_shape {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {as bs : List Gen.Allocation} {tag : Nat} {p : Prov}
+    (h : ExposedTargetOk body ctx s as tag p) (hs : AllocShapeEq as bs) :
+    ExposedTargetOk body ctx s bs tag p := by
+  obtain ⟨entry, pointeeIt, relOff, alloc, hlk, hk, hspec, hp, halloc, hlive, haddr, hsz⟩ := h
+  obtain ⟨b, hb, hb1, hb2, hb3⟩ := hs.2 _ alloc halloc
+  refine ⟨entry, pointeeIt, relOff, b, hlk, hk, hspec, hp, hb, hb2 ▸ hlive, hb1 ▸ haddr, ?_⟩
+  simpa [Allocation.size, hb3] using hsz
+
+theorem ProvenanceRel.of_shape {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {m m' : Mach} {tags : List Nat} (h : ProvenanceRel body ctx s m tags)
+    (hipc : m'.intptrcast = m.intptrcast)
+    (hs : AllocShapeEq m.mem.memory.allocations m'.mem.memory.allocations) :
+    ProvenanceRel body ctx s m' tags where
+  nodup := hipc ▸ h.nodup
+  sound p hp := by
+    rw [hipc] at hp
+    obtain ⟨t, ht, htgt⟩ := h.sound p hp
+    exact ⟨t, ht, htgt.of_shape hs⟩
+  complete t ht := by
+    obtain ⟨p, hp, htgt⟩ := h.complete t ht
+    exact ⟨p, hipc ▸ hp, htgt.of_shape hs⟩
+
+/-- `ProvenanceRel` reads the Anneal state only through its borrow table, which
+`advanceStmt` keeps. -/
+theorem ProvenanceRel.of_advanceStmt {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {m : Mach} {tags : List Nat} (locals' : List LocalSlot)
+    (h : ProvenanceRel body ctx s m tags) :
+    ProvenanceRel body ctx (advanceStmt s locals' s.memory) m tags :=
+  ⟨h.nodup, h.sound, h.complete⟩
+
+/-- **`PointerExposeProvenance` step (MR-3.3 B3).** Anneal's `evalStmt` on
 `_i = Cast(PointerExposeProvenance, copy _p, targetTy)` and MiniRust's
-`evalTerminator` on `Terminator::Intrinsic .PointerExposeProvenance` both succeed,
-extend `ProvenanceRel` with `pv.tag :: exposedTags` and `tProv`, and establish
-`ExposedLocalRel` on destination `usize` local `_i`. -/
-theorem StateRelN.expose_step_correspondence {body : CapturedMir} {ctx : Ctx}
+`evalTerminator` on the corresponding `Terminator::Intrinsic` both succeed;
+the MiniRust step changes `intptrcast` exactly by exposing the loaded pointer
+and allocations only in their bytes (`AllocShapeEq`), so `ProvenanceRel`
+extends to `pv.tag :: exposedTags` and `ExposedLocalRel` holds for `_i`. Unlike
+Pass A2's statement, nothing is assumed about the post-state `m4`. -/
+theorem ProvenanceRel.expose_step {body : CapturedMir} {ctx : Ctx}
     {s : MachineState} {m m1 m2 m3 m4 : Mach} {exposedTags : List Nat}
     {i p : Nat} {targetTy : MirAst.Ty} {span : String} {nb : Gen.BbName}
     {retPlace : Gen.Place BM} {argTy : Gen.Type}
@@ -4735,12 +4999,10 @@ theorem StateRelN.expose_step_correspondence {body : CapturedMir} {ctx : Ctx}
     (harg : evalValue m1 (.Load (.Local (localName p))) =
       .ok ((.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩, argTy), m2))
     (hstore : placeStore
-        { m2 with intptrcast := IntPtrCast.expose m2.intptrcast ({ addr := tAddr, provenance := some tProv }) }
+        { m2 with intptrcast :=
+            (IntPtrCast.expose m2.intptrcast { addr := tAddr, provenance := some tProv }) }
         retPlace (.Int tAddr) (.Int usizeIt) = .ok m3)
     (hjump : jumpToBlock m3 nb = .ok m4)
-    (hm4_ipc : m4.intptrcast =
-      IntPtrCast.expose m.intptrcast ({ addr := tAddr, provenance := some tProv }))
-    (hm4_allocs : m4.mem.memory.allocations = m.mem.memory.allocations)
     (hin_bounds : ∃ (idx : Nat) (a : Gen.Allocation),
       tProv = (⟨(idx : Int)⟩, ()) ∧
       m.mem.memory.allocations[idx]? = some a ∧
@@ -4752,46 +5014,52 @@ theorem StateRelN.expose_step_correspondence {body : CapturedMir} {ctx : Ctx}
     evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance (.copy ⟨p, []⟩) targetTy), span⟩
         body.localDecls body.layouts = .tau (.running s') ∧
     Interp.evalTerminator m
-        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))] (.Local (localName i)) (some nb)) =
-      .ok m4 ∧
+        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))]
+          (.Local (localName i)) (some nb)) = .ok m4 ∧
+    m4.intptrcast = IntPtrCast.expose m.intptrcast ({ addr := tAddr, provenance := some tProv }) ∧
+    AllocShapeEq m.mem.memory.allocations m4.mem.memory.allocations ∧
     ProvenanceRel body ctx s' m4 (pv.tag :: exposedTags) ∧
     ExposedLocalRel body ctx locals' s' m4 i pv tAddr tProv := by
-  have hA := (evalStmt_assign_expose s body.localDecls body.layouts i p targetTy span hi hbor_i hprot).1 pv hp hnd
+  have hA := (evalStmt_assign_expose s body.localDecls body.layouts i p targetTy span hi hbor_i
+    hprot).1 pv hp hnd
   have hM := evalTerminator_intrinsic_expose_ok hplace harg hstore hjump
-  have hprov_exp := hprov.expose_some tAddr htgt
+  have hm1 := evalPlace_local_eq hplace
+  subst hm1
+  obtain ⟨hs2, hipc2⟩ := evalValue_load_local_shape harg
+  obtain ⟨hs3, hipc3⟩ := placeStore_shape hstore
+  obtain ⟨hmem4, hipc4⟩ := jumpToBlock_mem hjump
+  have hipc : m4.intptrcast =
+      IntPtrCast.expose m1.intptrcast ({ addr := tAddr, provenance := some tProv }) := by
+    rw [hipc4, hipc3, hipc2]
+  have hshape : AllocShapeEq m1.mem.memory.allocations m4.mem.memory.allocations := by
+    rw [hmem4]
+    exact hs2.trans hs3
   have hprov4 : ProvenanceRel body ctx
-      (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))) s.memory)
-      m4 (pv.tag :: exposedTags) := by
-    refine ⟨?_, ?_, ?_⟩
-    · rw [hm4_ipc]; exact hprov_exp.nodup
-    · intro q hq
-      rw [hm4_ipc] at hq
-      rw [hm4_allocs]
-      exact hprov_exp.sound q hq
-    · intro t ht
-      rw [hm4_ipc, hm4_allocs]
-      exact hprov_exp.complete t ht
-  have hexp_loc : ExposedLocalRel body ctx
-      (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))
-      (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))) s.memory)
-      m4 i pv tAddr tProv := by
-    refine ⟨by simp [List.getElem?_set, hi], hoff0, ?_, ?_, ?_⟩
-    · rw [hm4_allocs]; exact htgt
-    · rw [hm4_ipc, setContains_expose_some_iff]
-      exact .inl rfl
-    · rw [hm4_allocs]; exact hin_bounds
-  exact ⟨hA, hM, hprov4, hexp_loc⟩
+      (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))
+        s.memory)
+      m4 (pv.tag :: exposedTags) :=
+    ((hprov.expose_some tAddr htgt).of_shape (m' := m4) hipc hshape).of_advanceStmt _
+  refine ⟨hA, hM, hipc, hshape, hprov4, ?_⟩
+  refine ⟨by simp [hi], hoff0, htgt.of_shape hshape, ?_, ?_⟩
+  · rw [hipc, setContains_expose_some_iff]
+    exact .inl rfl
+  · obtain ⟨idx, a, hpe, ha, hlive, hlo, hhi⟩ := hin_bounds
+    obtain ⟨b, hb, hb1, hb2, hb3⟩ := hshape.2 idx a ha
+    refine ⟨idx, b, hpe, hb, hb2 ▸ hlive, hb1 ▸ hlo, ?_⟩
+    have : (Allocation.size b).bytes = (Allocation.size a).bytes := by
+      simp [Allocation.size, hb3]
+    rw [hb1, this]
+    exact hhi
 
-/-- **Lockstep `PointerWithExposedProvenance` step correspondence (`MR-3.3` Pass A2).**
-Given `ExposedLocalRel` on `usize` local `_u` (holding encoded tag
-`pv.allocId * 65536 + pv.offsetBytes` in Anneal and `tAddr` in MiniRust with
-`tProv` exposed in `m.intptrcast.exposed`), Anneal's `evalStmt` on
-`_i = Cast(PointerWithExposedProvenance, copy _u, targetTy)` recovers the exact
-`ProvenancePtr` `pv` (`ExposedLocalRel.anneal_roundtrip`), and when `IntPtrCast.int2ptr`
-predicts `{ addr := tAddr, provenance := some tProv }`, MiniRust's `evalTerminator`
-on `Terminator::Intrinsic .PointerWithExposedProvenance` stores that reconstructed
-pointer into `_i` and preserves `ProvenanceRel`. -/
-theorem StateRelN.withExposed_step_correspondence {body : CapturedMir} {ctx : Ctx}
+/-- **`PointerWithExposedProvenance` step (MR-3.3 B3).** From `ExposedLocalRel`
+on `_u`, Anneal's `evalStmt` on `_i = Cast(PointerWithExposedProvenance, copy _u,
+targetTy)` recovers exactly `pv`; when MiniRust loads `tAddr` from `_u`, the
+uniqueness of the angelic resolution (`IntPtrCast.int2ptr_of_unique_candidate`)
+makes `int2ptr` return `tProv` as soon as no other live exposed allocation's
+range contains `tAddr`, and the step preserves `ProvenanceRel`. Unlike Pass A2's
+statement, neither the `int2ptr` result nor anything about the post-state `m4`
+is assumed. -/
+theorem ProvenanceRel.withExposed_step {body : CapturedMir} {ctx : Ctx}
     {s : MachineState} {m m1 m2 m3 m4 : Mach} {exposedTags : List Nat}
     {i u : Nat} {targetTy : MirAst.Ty} {span : String} {nb : Gen.BbName}
     {retPlace : Gen.Place BM} {retPtrTy : Gen.PtrType} {argTy : Gen.Type}
@@ -4805,36 +5073,69 @@ theorem StateRelN.withExposed_step_correspondence {body : CapturedMir} {ctx : Ct
     (hplace : evalPlace m (.Local (localName i)) = .ok ((retPlace, .Ptr retPtrTy), m1))
     (harg : evalValue m1 (.Load (.Local (localName u))) = .ok ((.Int tAddr, argTy), m2))
     (hmeta : PtrType.meta_kind retPtrTy = .None)
-    (hint : IntPtrCast.int2ptr m2 tAddr = .ok { addr := tAddr, provenance := some tProv })
+    (honly : ∀ q ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed tAddr,
+      q = tProv)
     (hstore : placeStore m2 retPlace
         (.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩)
         (.Ptr retPtrTy) = .ok m3)
-    (hjump : jumpToBlock m3 nb = .ok m4)
-    (hm4_ipc : m4.intptrcast = m.intptrcast)
-    (hm4_allocs : m4.mem.memory.allocations = m.mem.memory.allocations) :
+    (hjump : jumpToBlock m3 nb = .ok m4) :
     let s' := advanceStmt s (s.frame.locals.set i (.init (.ptr pv 8))) s.memory
     evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance (.copy ⟨u, []⟩) targetTy), span⟩
         body.localDecls body.layouts = .tau (.running s') ∧
+    IntPtrCast.int2ptr m2 tAddr = .ok { addr := tAddr, provenance := some tProv } ∧
     Interp.evalTerminator m
-        (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName u))] (.Local (localName i)) (some nb)) =
-      .ok m4 ∧
+        (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName u))]
+          (.Local (localName i)) (some nb)) = .ok m4 ∧
+    m4.intptrcast = m.intptrcast ∧
+    AllocShapeEq m.mem.memory.allocations m4.mem.memory.allocations ∧
     ProvenanceRel body ctx s' m4 exposedTags := by
-  have hA0 := (evalStmt_assign_withExposed s body.localDecls body.layouts i u targetTy span hi hbor_i hprot).1
-    ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩ hexp_loc.slot_eq hnd
+  have hA0 := (evalStmt_assign_withExposed s body.localDecls body.layouts i u targetTy span hi
+    hbor_i hprot).1 ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩ hexp_loc.slot_eq hnd
   rw [hexp_loc.anneal_roundtrip] at hA0
-  have hM := evalTerminator_intrinsic_withExposed_ok hplace harg hmeta hint hstore hjump
-  have hprov4 : ProvenanceRel body ctx
-      (advanceStmt s (s.frame.locals.set i (.init (.ptr pv 8))) s.memory)
-      m4 exposedTags := by
-    refine ⟨?_, ?_, ?_⟩
-    · rw [hm4_ipc]; exact hprov.nodup
+  have hm1 := evalPlace_local_eq hplace
+  subst hm1
+  obtain ⟨hs2, hipc2⟩ := evalValue_load_local_shape harg
+  obtain ⟨hs3, hipc3⟩ := placeStore_shape hstore
+  obtain ⟨hmem4, hipc4⟩ := jumpToBlock_mem hjump
+  -- `int2ptr` at `m2` sees `m1`'s exposed set and allocation shapes
+  have hcand1 := hexp_loc.candidate_mem
+  have hint : IntPtrCast.int2ptr m2 tAddr = .ok { addr := tAddr, provenance := some tProv } := by
+    apply IntPtrCast.int2ptr_of_unique_candidate
+    · rw [hipc2]; exact hexp_loc.exposed_mem
+    · rw [hipc2]
+      obtain ⟨i0, a, ha, hlive, hlo, hhi, hexp, hpe⟩ := mem_int2ptrCandidates hcand1
+      obtain ⟨b, hb, hb1, hb2, hb3⟩ := hs2.2 i0 a ha
+      rw [hpe]
+      refine int2ptrCandidates_mem_of hb (hb2 ▸ hlive) (hb1 ▸ hlo) ?_ hexp
+      have : (Allocation.size b).bytes = (Allocation.size a).bytes := by
+        simp [Allocation.size, hb3]
+      rw [hb1, this]
+      exact hhi
     · intro q hq
-      rw [hm4_ipc] at hq
-      rw [hm4_allocs]
-      exact hprov.sound q hq
-    · intro t ht
-      rw [hm4_ipc, hm4_allocs]
-      exact hprov.complete t ht
-  exact ⟨hA0, hM, hprov4⟩
+      rw [hipc2] at hq
+      obtain ⟨i0, b, hb, hlive, hlo, hhi, hexp, hpe⟩ := mem_int2ptrCandidates hq
+      -- transport back to `m1`'s allocations
+      have hlen := hs2.1
+      have hi0 : i0 < m1.mem.memory.allocations.length := by
+        rw [hlen]; exact (List.getElem?_eq_some_iff.mp hb).1
+      obtain ⟨a, ha⟩ : ∃ a, m1.mem.memory.allocations[i0]? = some a :=
+        ⟨_, List.getElem?_eq_getElem hi0⟩
+      obtain ⟨b', hb', hb1, hb2, hb3⟩ := hs2.2 i0 a ha
+      rw [hb] at hb'
+      cases hb'
+      apply honly
+      rw [hpe]
+      refine int2ptrCandidates_mem_of ha (hb2 ▸ hlive) (hb1 ▸ hlo) ?_ hexp
+      have : (Allocation.size b).bytes = (Allocation.size a).bytes := by
+        simp [Allocation.size, hb3]
+      rw [← hb1, ← this]
+      exact hhi
+  have hM := evalTerminator_intrinsic_withExposed_ok hplace harg hmeta hint hstore hjump
+  have hipc : m4.intptrcast = m1.intptrcast := by rw [hipc4, hipc3, hipc2]
+  have hshape : AllocShapeEq m1.mem.memory.allocations m4.mem.memory.allocations := by
+    rw [hmem4]
+    exact hs2.trans hs3
+  exact ⟨hA0, hint, hM, hipc, hshape, (hprov.of_shape hipc hshape).of_advanceStmt _⟩
+
 
 end MiniRustSpec.Correspondence

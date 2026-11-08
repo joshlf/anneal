@@ -639,4 +639,117 @@ theorem exposeTwoRefMutAngelicUnsupported_three_way :
    exposeTwoRefMutAngelicUnsupported_minirust_direct,
    exposeTwoRefMutAngelicUnsupported_tb_direct⟩
 
+/-! ## 6. Real provenance-cast steps rewrite allocation bytes (Pass B3)
+
+Pass A2's step lemmas assumed `m4.mem.memory.allocations = m.mem.memory.allocations`
+for the MiniRust post-state `m4` of the intrinsic terminator. At the actual
+`PointerExposeProvenance` (after 5 steps) and `PointerWithExposedProvenance`
+(after 6 steps) terminators of `int2ptrRawRoundTripOk`, evaluating exactly the
+terminator shapes those lemmas mention succeeds and *changes* the allocations
+(the destination local receives the address, resp. the reconstructed pointer),
+so that hypothesis held at no real step; `ProvenanceRel.expose_step` and
+`ProvenanceRel.withExposed_step` (`Simulation.lean`) derive the post-state facts
+instead. -/
+
+/-- The `Mach` state of `int2ptrRawRoundTripOk` after `k` steps. -/
+def rtState (k : Nat) : Option Mach :=
+  (startMachineIntr int2ptrRawRoundTripOk [.scalar ⟨5, 4⟩]).bind
+    (fun m => (Interp.steps k m).toOption)
+
+/-- Whether `m` is about to evaluate its block terminator, and that terminator
+is a provenance intrinsic of the given kind. -/
+def pendingIntrinsic (m : Mach) (op : Gen.IntrinsicOp) : Bool :=
+  match curFrame m with
+  | .ok fr =>
+    match mapIndex fr.func.blocks fr.next_block "" with
+    | .ok blk =>
+      decide (fr.next_stmt = (blk.statements.length : Int)) &&
+        match blk.terminator with
+        | .Intrinsic op' _ _ _ => decide (op' = op)
+        | _ => false
+    | .error _ => false
+  | .error _ => false
+
+/-- `int2ptrRawRoundTripOk`'s `PointerExposeProvenance` terminator. -/
+def rtExposeTerm : Gen.Terminator :=
+  .Intrinsic .PointerExposeProvenance [.Load (.Local (localName 2))] (.Local (localName 3))
+    (some (bbName 1))
+
+/-- `int2ptrRawRoundTripOk`'s `PointerWithExposedProvenance` terminator. -/
+def rtWithExposedTerm : Gen.Terminator :=
+  .Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName 3))] (.Local (localName 4))
+    (some (bbName 2))
+
+/-- Whether evaluating terminator `t` at `m` leaves the allocations literally
+unchanged (`none` if the evaluation stops). -/
+def termKeepsAllocs (t : Gen.Terminator) (m : Mach) : Option Bool :=
+  (Interp.evalTerminator m t).toOption.map
+    (fun m4 => decide (m4.mem.memory.allocations = m.mem.memory.allocations))
+
+theorem rtState_pending_expose :
+    (rtState 5).map (pendingIntrinsic · .PointerExposeProvenance) = some true := by
+  decide +kernel
+
+theorem rtState_pending_withExposed :
+    (rtState 6).map (pendingIntrinsic · .PointerWithExposedProvenance) = some true := by
+  decide +kernel
+
+theorem rtState_expose_changes_allocs :
+    (rtState 5).bind (termKeepsAllocs rtExposeTerm) = some false := by
+  decide +kernel
+
+theorem rtState_withExposed_changes_allocs :
+    (rtState 6).bind (termKeepsAllocs rtWithExposedTerm) = some false := by
+  decide +kernel
+
+/-- At the real `PointerExposeProvenance` step, every successful evaluation of
+the terminator changes the allocations: Pass A2's hypothesis
+`m4.mem.memory.allocations = m.mem.memory.allocations` is unsatisfiable. -/
+theorem passA2_hm4_allocs_unsatisfiable_expose :
+    ∀ m, rtState 5 = some m → ∀ m4, Interp.evalTerminator m rtExposeTerm = .ok m4 →
+      m4.mem.memory.allocations ≠ m.mem.memory.allocations := by
+  intro m hm m4 hev heq
+  have h := rtState_expose_changes_allocs
+  rw [hm] at h
+  simp only [Option.bind_some, termKeepsAllocs, hev, Except.toOption, Option.map_some,
+    Option.some.injEq, decide_eq_false_iff_not] at h
+  exact h heq
+
+/-- At the real `PointerWithExposedProvenance` step, likewise. -/
+theorem passA2_hm4_allocs_unsatisfiable_withExposed :
+    ∀ m, rtState 6 = some m → ∀ m4, Interp.evalTerminator m rtWithExposedTerm = .ok m4 →
+      m4.mem.memory.allocations ≠ m.mem.memory.allocations := by
+  intro m hm m4 hev heq
+  have h := rtState_withExposed_changes_allocs
+  rw [hm] at h
+  simp only [Option.bind_some, termKeepsAllocs, hev, Except.toOption, Option.map_some,
+    Option.some.injEq, decide_eq_false_iff_not] at h
+  exact h heq
+
+/-- The MiniRust sub-evaluations that `ProvenanceRel.expose_step` takes as
+hypotheses (`evalPlace` of `_3`, the load of `_2`, the `placeStore` after
+exposing, `jumpToBlock`) all succeed at the real `PointerExposeProvenance` step
+of `int2ptrRawRoundTripOk`, at `usize` type: unlike Pass A2's hypotheses they are
+jointly satisfiable. -/
+def exposeSubevalsOk (m : Mach) : Bool :=
+  match evalPlace m (.Local (localName 3)) with
+  | .ok ((pl, ty), m1) =>
+    (match ty with
+      | .Int it => decide (it = usizeIt)
+      | _ => false) &&
+      match evalValue m1 (.Load (.Local (localName 2))) with
+      | .ok ((.Ptr ⟨ptr, none⟩, _), m2) =>
+        match placeStore { m2 with intptrcast := IntPtrCast.expose m2.intptrcast ptr } pl
+            (.Int ptr.addr) (.Int usizeIt) with
+        | .ok m3 =>
+          match jumpToBlock m3 (bbName 1) with
+          | .ok _ => true
+          | .error _ => false
+        | .error _ => false
+      | _ => false
+  | .error _ => false
+
+theorem rtState_expose_subevals_ok : (rtState 5).map exposeSubevalsOk = some true := by
+  decide +kernel
+
 end MiniRustSpec.Correspondence.ProvenanceWitness

@@ -3568,8 +3568,32 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   evalTerminator_intrinsic_withExposed_err
   evalTerminatorM_intrinsic_withExposed_ok
   evalTerminatorM_intrinsic_withExposed_err
-  StateRelN.expose_step_correspondence
-  StateRelN.withExposed_step_correspondence
+  interpBind_ok
+  listIndex_ok_get
+  listSet_ok_eq
+  writeSubsliceAtIndex_length
+  AllocShapeEq.refl
+  AllocShapeEq.trans
+  AllocShapeEq.set
+  BM.store_shape
+  BM.load_shape
+  placeStore_shape
+  placeLoad_shape
+  evalPlace_local_eq
+  evalValue_load_local_shape
+  jumpToBlock_mem
+  ExposedTargetOk.of_shape
+  ProvenanceRel.of_shape
+  ProvenanceRel.of_advanceStmt
+  ProvenanceRel.expose_step
+  ProvenanceRel.withExposed_step
+  rtState_pending_expose
+  rtState_pending_withExposed
+  rtState_expose_changes_allocs
+  rtState_withExposed_changes_allocs
+  passA2_hm4_allocs_unsatisfiable_expose
+  passA2_hm4_allocs_unsatisfiable_withExposed
+  rtState_expose_subevals_ok
   int2ptr_singleton_offset_checkPtr_optimal
   int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok
   int2ptrRawRoundTripOk_singleExposeSiteOk
@@ -3758,8 +3782,32 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   evalTerminator_intrinsic_withExposed_err
   evalTerminatorM_intrinsic_withExposed_ok
   evalTerminatorM_intrinsic_withExposed_err
-  StateRelN.expose_step_correspondence
-  StateRelN.withExposed_step_correspondence
+  interpBind_ok
+  listIndex_ok_get
+  listSet_ok_eq
+  writeSubsliceAtIndex_length
+  AllocShapeEq.refl
+  AllocShapeEq.trans
+  AllocShapeEq.set
+  BM.store_shape
+  BM.load_shape
+  placeStore_shape
+  placeLoad_shape
+  evalPlace_local_eq
+  evalValue_load_local_shape
+  jumpToBlock_mem
+  ExposedTargetOk.of_shape
+  ProvenanceRel.of_shape
+  ProvenanceRel.of_advanceStmt
+  ProvenanceRel.expose_step
+  ProvenanceRel.withExposed_step
+  rtState_pending_expose
+  rtState_pending_withExposed
+  rtState_expose_changes_allocs
+  rtState_withExposed_changes_allocs
+  passA2_hm4_allocs_unsatisfiable_expose
+  passA2_hm4_allocs_unsatisfiable_withExposed
+  rtState_expose_subevals_ok
   int2ptr_singleton_offset_checkPtr_optimal
   int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok
   int2ptrRawRoundTripOk_singleExposeSiteOk

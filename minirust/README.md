@@ -1147,27 +1147,36 @@ These are deliberate and are the first things to lift:
     `TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
     `treeBorrowsWeakBoxDeallocAndDeadRelease` vs.
     `TreeBorrowsMemory.end_call_wfLive`).
-* **Provenance cast step correspondence (`ExposedLocalRel`, `StateRelN.expose_step_correspondence`, `StateRelN.withExposed_step_correspondence`) vs. multi-block CFGs.**
-  `Correspondence/Relation.lean` (`ExposedLocalRel`), `Correspondence/PointerStep.lean`
-  (`evalTerminator_intrinsic_expose_ok`, `evalTerminator_intrinsic_withExposed_ok`,
-  `evalTerminatorM_intrinsic_*`), and `Correspondence/Simulation.lean`
-  (`StateRelNProv.exposed_target_localPtr`, `StateRelN.expose_step_correspondence`,
-  `StateRelN.withExposed_step_correspondence`) relate Anneal's
-  `pv.allocId * 65536 + pv.offsetBytes` encoding in an exposed-address `usize`
-  local to MiniRust's `tAddr` and `m.intptrcast.exposed` without assuming
-  `inFragment` (`inFragment_not_hasProvCast`). Furthermore,
+* **Provenance casts have step lemmas, not yet a `StateRelN` simulation.**
+  `ProvenanceRel.expose_step` and `ProvenanceRel.withExposed_step`
+  (`Correspondence/Simulation.lean`, on top of `evalTerminator_intrinsic_*` in
+  `Correspondence/PointerStep.lean`) prove that Anneal's cast statement and
+  MiniRust's `Terminator::Intrinsic` both step, that the MiniRust step changes
+  `intptrcast` exactly by the exposure and the allocations only in their bytes
+  (`AllocShapeEq`, from `placeStore_shape`, `placeLoad_shape`,
+  `evalValue_load_local_shape`, and `jumpToBlock_mem`), that `ProvenanceRel` is
+  preserved and `ExposedLocalRel` (`Correspondence/Relation.lean`) established
+  for the exposed-address local, and that `int2ptr` resolves to the exposed
+  provenance whenever no other live exposed allocation contains the address.
+  They still take MiniRust's sub-evaluations (`evalPlace`, the loads,
+  `placeStore`, `jumpToBlock`) as hypotheses: deriving those needs `StateRelN`,
+  whose `LocalStorage` relates an exposed-address local by value (Anneal's
+  `tag * 65536 + offsetBytes` vs. MiniRust's address, `exposeTwice`), and
+  `ExposedLocalRel` does not yet record the address MiniRust stores. (Pass A2's
+  first versions also assumed `m4.mem.memory.allocations = m.mem.memory.allocations`
+  for the post-state, which no real step satisfies:
+  `passA2_hm4_allocs_unsatisfiable_expose`, `..._withExposed`.)
   `Correspondence/Provenance.lean` proves arbitrary-offset singleton optimality
   for `BasicMemory` (`int2ptr_singleton_offset_checkPtr_optimal`) alongside a
   `TreeBorrowsMemory` counterexample to singleton `Some(p)` dominance on
   negative-offset zero-sized reborrows
-  (`int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok`), and
-  `Correspondence/Translate.lean` / `Correspondence/ProvenanceWitness.lean`
-  characterize `singleExposeSiteOk` vs. `exposeTwoRefMutAngelicUnsupported_three_way`
-  (where `BasicMemory` deduplicates `(AllocId(1), ())` and returns `88` in
-  lockstep with Anneal while `TreeBorrowsMemory` records two distinct tags
-  `(AllocId(1), [0])` and `(AllocId(1), [1])` and stops with `Stop.unsupported`).
-  End-to-end whole-CFG induction over `splitBlockAtIntrinsics`'s block-numbered
-  continuations remains separate from single-block `step_correspondence_N`.
+  (`int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok`); `singleExposeSiteOk`
+  (at most one `PointerExposeProvenance` statement) is not part of the fragment
+  and does not rule out several exposed Tree Borrows tags in a loop, so
+  `MachTB` may still stop with `Stop.unsupported` on fragment bodies
+  (`exposeTwoRefMutAngelicUnsupported_three_way`). Whole-CFG induction over
+  `splitBlockAtIntrinsics`'s continuations remains separate from
+  `step_correspondence_N`.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.
