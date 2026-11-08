@@ -43,15 +43,21 @@ theorem evalRvalue_aggregate_enum_simulation
   simp only [hbb, hstmt]
   cases hwt with
   | mk decl fields paths decl_lookup env_lookup is_adt valid_layout =>
-    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.adt defPath variantIdx activeField) ops), span⟩) m = (sorry, .ok ()) := by sorry
-    have ha_ok : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.adt defPath variantIdx activeField) ops), span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
-    sorry
+
+    obtain ⟨s', ha_ok⟩ : ∃ s', evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.adt defPath variantIdx activeField) ops), span⟩ body.localDecls body.layouts = .step s' := by sorry
+    obtain ⟨m', hm_ok⟩ : ∃ m', Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.adt defPath variantIdx activeField) ops), span⟩) m = (m', .ok ()) := by sorry
+    rw [ha_ok]
+    have hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true) := by sorry
+    rw [hstep]
+    exact StepRelLM2_2.step s' m' sorry
+
 
 inductive WellTypedLM2_3SetDiscriminant
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (place : Place) (variantIdx : VariantIdx) : Prop where
   | mk (decl : LocalDecl)
        (decl_lookup : get? body.localDecls place.local_ = some decl)
+       (proj_nil : place.projection = [])
 
 theorem step_setDiscriminant_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -74,7 +80,10 @@ theorem step_setDiscriminant_simulation
   cases hwt with
   | mk decl decl_lookup =>
     have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.setDiscriminant place variantIdx, span⟩) m = (sorry, .ok ()) := by sorry
-    have ha_ok : evalStmt s ⟨.setDiscriminant place variantIdx, span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
+    have ha_ok : evalStmt s ⟨.setDiscriminant place variantIdx, span⟩ body.localDecls body.layouts = .step sorry := by sorry
+    rw [ha_ok]
+    have hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = (sorry, .ok true) := by sorry
+    rw [hstep]
     sorry
 
 inductive WellTypedLM2_3DiscriminantRead
@@ -105,30 +114,33 @@ theorem evalRvalue_discriminant_simulation
   simp only [hbb, hstmt]
   cases hwt with
   | mk decl placeDecl decl_lookup place_lookup =>
-    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.discriminant place), span⟩) m = (sorry, .ok ()) := by sorry
-    have ha_ok : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.discriminant place), span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
-    sorry
+
+    obtain ⟨s', ha_ok⟩ : ∃ s', evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.discriminant place), span⟩ body.localDecls body.layouts = .step s' := by sorry
+    obtain ⟨m', hm_ok⟩ : ∃ m', Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.discriminant place), span⟩) m = (m', .ok ()) := by sorry
+    rw [ha_ok]
+    have hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true) := by sorry
+    rw [hstep]
+    exact StepRelLM2_2.step s' m' sorry
+
+
 
 inductive WellTypedLM2_3Downcast
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
-    (dstIdx : Local) (place : Place) (variantIdx : VariantIdx) : Prop where
+    (dstIdx : Local) (base : Local) (projs : List ProjectionElem)
+    (variantName : String) (variantIdx : VariantIdx) (field : FieldIdx) (ty : Ty) : Prop where
   | mk (decl : LocalDecl)
-       (placeDecl : LocalDecl)
-       (decl_lookup : get? body.localDecls dstIdx = some decl)
-       (place_lookup : get? body.localDecls place.local_ = some placeDecl)
 
 theorem evalProjection_downcast_field_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
     {s : MachineState} {m : AnnealStepState}
-    (hstate : StateRelLM2_2 body env stEnv (k_bud + 1) s m)
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : BasicBlockData} {dstIdx : Local} {base : Local} {projs : List ProjectionElem}
-    {variantName : Option String} {variantIdx : VariantIdx} {field : FieldIdx} {ty : Ty}
-    {span : String}
+    {variantName : String} {variantIdx : VariantIdx} {field : FieldIdx} {ty : Ty} {span : String}
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨base, projs ++ [.downcast variantName variantIdx, .field field ty]⟩)), span⟩)
-    (hwt : WellTypedLM2_3Downcast body env stEnv dstIdx ⟨base, projs⟩ variantIdx) :
+    (hwt : WellTypedLM2_3Downcast body env stEnv dstIdx base projs variantName variantIdx field ty) :
     StepRelLM2_2 body env stEnv k_bud m
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
@@ -138,10 +150,15 @@ theorem evalProjection_downcast_field_simulation
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   simp only [hbb, hstmt]
   cases hwt with
-  | mk decl placeDecl decl_lookup place_lookup =>
-    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨base, projs ++ [.downcast variantName variantIdx, .field field ty]⟩)), span⟩) m = (sorry, .ok ()) := by sorry
-    have ha_ok : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨base, projs ++ [.downcast variantName variantIdx, .field field ty]⟩)), span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
-    sorry
+  | mk decl =>
+
+    obtain ⟨s', ha_ok⟩ : ∃ s', evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨base, projs ++ [.downcast variantName variantIdx, .field field ty]⟩)), span⟩ body.localDecls body.layouts = .step s' := by sorry
+    obtain ⟨m', hm_ok⟩ : ∃ m', Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨base, projs ++ [.downcast variantName variantIdx, .field field ty]⟩)), span⟩) m = (m', .ok ()) := by sorry
+    rw [ha_ok]
+    have hstep : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true) := by sorry
+    rw [hstep]
+    exact StepRelLM2_2.step s' m' sorry
+
 
 inductive WellTypedLM2_3SwitchInt
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
@@ -206,24 +223,17 @@ theorem enum_match_switchInt_simulation
       rw [hm_term']
       exact evalTerminator_switchInt_error _ () _ _ _ m m' _ hdisc
     simp only [hleft, hright]
-    sorry
+    exact StepRelLM2_2.ub m' msg
   | ok =>
     have hm_term' : translateTerminator { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span } =
         { sourceInfo := defaultSourceInfo,
           kind := .SwitchInt (translateOperand discr) (translateSwitchTargets targets) } := rfl
-    have hdisc : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
-        (translateOperand discr) m = (m, .ok sorry) := by
-      sorry
+    obtain ⟨m_disc, hdisc⟩ : ∃ d, (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant () (translateOperand discr) m = (m, .ok d) := by sorry
     have hcmp : ∀ val target_b, (val, target_b) ∈ targets.branches →
-      (annealTerminatorHooks body.localDecls body.layouts).compareSwitchCase () sorry val m = (m, .ok (Nat.beq sorry val)) := by
-      sorry
-    have hleft : evalTerminator s { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span } (some body) =
-        MirStepNode.step sorry := sorry
-    have hright : Miri.Interpreter.ControlFlow.evalTerminator (annealTerminatorHooks body.localDecls body.layouts) ()
-          (translateTerminator { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span }) m =
-        Miri.Interpreter.ControlFlow.goToBlock sorry m := by
-      sorry
+      (annealTerminatorHooks body.localDecls body.layouts).compareSwitchCase () m_disc val m = (m, .ok sorry) := by sorry
+    obtain ⟨s', hleft⟩ : ∃ s', evalTerminator s { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span } (some body) = MirStepNode.step s' := by sorry
+    obtain ⟨m_goto, hright⟩ : ∃ m_goto, Miri.Interpreter.ControlFlow.evalTerminator (annealTerminatorHooks body.localDecls body.layouts) () (translateTerminator { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span }) m = (m_goto, .ok ()) := by sorry
     simp only [hleft, hright]
-    sorry
+    exact StepRelLM2_2.step s' m_goto sorry
 
 end LeanMiriSpec.Correspondence
