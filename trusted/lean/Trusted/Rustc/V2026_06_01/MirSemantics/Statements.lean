@@ -2198,11 +2198,14 @@ produced by an earlier `setOrExtendFields` on a higher-index sibling field.
 
 `evalStmt` applies this both to the default shell of an uninitialized
 destination (`uninitFieldWriteShell?`) and to the current value of an
-initialized destination before a projected write. Every slot it visits that is
-already present and not `.unit` is kept as is, so on a root whose intermediate
-field slots along the chain are all populated (`fieldShellChainPopulated`) the
-result is the root itself and the write coincides with `writeProjectedValue` on
-the original root.
+initialized destination before a projected write. Transparent metadata
+projections (`.opaqueCast` and `.unwrapUnsafeBinder`) are traversed without
+altering the value, and `stripTransparentProjections` is used when checking
+whether the remaining projection chain continues with a `.field` projection.
+Every slot it visits that is already present and not `.unit` is kept as is, so
+on a root whose intermediate field slots along the chain are all populated
+(`fieldShellChainPopulated`) the result is the root itself and the write
+coincides with `writeProjectedValue` on the original root.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2213,13 +2216,17 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 -/
 def ensureNestedFieldShells (val : Value) (projs : List ProjectionElem) : Value :=
   match projs with
+  | .opaqueCast _ :: nextProj :: rest =>
+    ensureNestedFieldShells val (nextProj :: rest)
+  | .unwrapUnsafeBinder _ :: nextProj :: rest =>
+    ensureNestedFieldShells val (nextProj :: rest)
   | .field fieldIdx fieldTy :: nextProj :: rest =>
     match val with
     | .aggregate variantIdx fields =>
       let isInnerAggField :=
-        match fieldTy.kind, nextProj with
-        | .adt _ _, .field _ _ => true
-        | .tuple _, .field _ _ => true
+        match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+        | .field _ _ :: _, .adt _ _ => true
+        | .field _ _ :: _, .tuple _ => true
         | _, _ => false
       match isInnerAggField with
       | true =>
@@ -2231,9 +2238,7 @@ def ensureNestedFieldShells (val : Value) (projs : List ProjectionElem) : Value 
         | .some .unit =>
           let childShell :=
             ensureNestedFieldShells (.aggregate 0 .nil) (nextProj :: rest)
-          match set? fields fieldIdx childShell with
-          | .some fields' => .aggregate variantIdx fields'
-          | .none => .aggregate variantIdx fields
+          .aggregate variantIdx (setOrExtendFields fields fieldIdx childShell)
         | .some childVal =>
           let childVal' :=
             ensureNestedFieldShells childVal (nextProj :: rest)
@@ -2260,11 +2265,15 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 >   place and create a place referring to one of the fields of the type."
 -/
 def fieldShellChainPopulated : Value → List ProjectionElem → Bool
+  | val, .opaqueCast _ :: nextProj :: rest =>
+    fieldShellChainPopulated val (nextProj :: rest)
+  | val, .unwrapUnsafeBinder _ :: nextProj :: rest =>
+    fieldShellChainPopulated val (nextProj :: rest)
   | .aggregate _ fields, .field fieldIdx fieldTy :: nextProj :: rest =>
     let isInnerAggField :=
-      match fieldTy.kind, nextProj with
-      | .adt _ _, .field _ _ => true
-      | .tuple _, .field _ _ => true
+      match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+      | .field _ _ :: _, .adt _ _ => true
+      | .field _ _ :: _, .tuple _ => true
       | _, _ => false
     match isInnerAggField with
     | true =>
@@ -3548,7 +3557,8 @@ theorem evalStmt_assign_uninit_nested_field_ok
   have hShell :
       uninitFieldWriteShell? localDecls layouts dstLoc (.field outerIdx outerTy)
         [.field innerIdx innerTy] = .some shell := by
-    simp [uninitFieldWriteShell?, ensureNestedFieldShells, hTy, hGetNil outerIdx, outerTy, shell]
+    simp [uninitFieldWriteShell?, ensureNestedFieldShells, stripTransparentProjections,
+      hTy, hGetNil outerIdx, outerTy, shell]
   have hWrite :
       writeProjectedValue locals₁ shell
         [.field outerIdx outerTy, .field innerIdx innerTy] val = .ok rootVal' := by
@@ -3632,12 +3642,15 @@ theorem ensureNestedFieldShells_eq_self_of_populated :
     | nil => cases p <;> cases val <;> rfl
     | cons nextProj rest =>
       cases p with
+      | opaqueCast ty =>
+        cases val <;> exact ih _ hPop
+      | unwrapUnsafeBinder ty =>
+        cases val <;> exact ih _ hPop
       | field fieldIdx fieldTy =>
         cases val with
         | aggregate variantIdx fields =>
           unfold fieldShellChainPopulated at hPop
           unfold ensureNestedFieldShells
-          rcases fieldTy with ⟨kind, lidx⟩
           have key : ∀ (childVal : Value),
               get? fields fieldIdx = .some childVal →
               fieldShellChainPopulated childVal (nextProj :: rest) = true →
@@ -3646,18 +3659,32 @@ theorem ensureNestedFieldShells_eq_self_of_populated :
                 | .none => Value.aggregate variantIdx fields) = .aggregate variantIdx fields := by
             intro childVal hGet hPop'
             rw [ih childVal hPop', set?_self_of_get? fields fieldIdx _ hGet]
-          cases kind <;> cases nextProj <;> dsimp only at hPop ⊢ <;>
-            first
-            | rfl
-            | (cases hGet : get? fields fieldIdx with
-                | none => rw [hGet] at hPop; nomatch hPop
-                | some childVal =>
-                  rw [hGet] at hPop
-                  cases childVal with
-                  | unit => nomatch hPop
-                  | scalar sc => first | rfl | exact key _ hGet hPop
-                  | ptr pv sz => first | rfl | exact key _ hGet hPop
-                  | aggregate v fs => first | rfl | exact key _ hGet hPop)
+          have hInner :
+              (match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+               | .field _ _ :: _, .adt _ _ => true
+               | .field _ _ :: _, .tuple _ => true
+               | _, _ => false) = true ∨
+              (match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+               | .field _ _ :: _, .adt _ _ => true
+               | .field _ _ :: _, .tuple _ => true
+               | _, _ => false) = false := by
+            cases (match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+                   | .field _ _ :: _, .adt _ _ => true
+                   | .field _ _ :: _, .tuple _ => true
+                   | _, _ => false) <;> simp
+          rcases hInner with hTrue | hFalse
+          · rw [hTrue] at hPop ⊢
+            dsimp only at hPop ⊢
+            cases hGet : get? fields fieldIdx with
+            | none => rw [hGet] at hPop; nomatch hPop
+            | some childVal =>
+              rw [hGet] at hPop
+              cases childVal with
+              | unit => nomatch hPop
+              | scalar sc => exact key _ hGet hPop
+              | ptr pv sz => exact key _ hGet hPop
+              | aggregate v fs => exact key _ hGet hPop
+          · rw [hFalse]
         | _ => rfl
       | _ => cases val <;> rfl
 
@@ -3733,6 +3760,144 @@ theorem evalStmt_assign_init_projected_step
       simp [evalStmt, hRv, hInit, hWriteShell, hSet, hAP, hC]
 
 /--
+`D13b` nested field write into an unpopulated slot of an already-initialized
+aggregate (`evalStmt_assign_init_unpopulated_nested_field_ok`): when `dstLoc`
+holds `.init (.aggregate variantIdx fields)` (for instance, after an earlier
+field write initialized a sibling field of `dstLoc` or after `SetDiscriminant`
+initialized an enum variant) and the slot at `outerIdx` is still unpopulated
+(`get? fields outerIdx = .none ∨ get? fields outerIdx = .some .unit`), writing
+`val` into `[.field outerIdx outerTy, .field innerIdx innerTy]` materializes the
+inner `.aggregate 0 ...` shell at `outerIdx`, stores `val` at `innerIdx`, and
+steps.
+-/
+theorem evalStmt_assign_init_unpopulated_nested_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (variantIdx : VariantIdx)
+    (fields : List Value)
+    (outerIdx innerIdx : FieldIdx)
+    (innerTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (innerDefPath : DefPath)
+    (innerArgs : List RigidTy)
+    (innerLayoutIdx : Nat)
+    (val : Value)
+    (locals₁ locals₂ : List LocalSlot)
+    (mem₁ : Memory)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hInit : get? locals₁ dstLoc = .some (.init (.aggregate variantIdx fields)))
+    (hSlot : get? fields outerIdx = .none ∨ get? fields outerIdx = .some .unit)
+    (hSet :
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate variantIdx
+            (setOrExtendFields fields outerIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
+    let projs : List ProjectionElem := [.field outerIdx outerTy, .field innerIdx innerTy]
+    evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ projs with
+                 | .some rp => rp
+                 | .none => projs) }) := by
+  dsimp only
+  let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
+  have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
+    intro k; cases k <;> rfl
+  have hGetExt : ∀ (fs : List Value) (k : Nat) (v : Value),
+      get? (setOrExtendFields fs k v) k = .some v := by
+    intro fs
+    induction fs with
+    | nil =>
+      intro k v
+      induction k with
+      | zero => rfl
+      | succ n ih => exact ih
+    | cons hd tl ihFs =>
+      intro k v
+      cases k with
+      | zero => rfl
+      | succ n => exact ihFs n v
+  have hLenLtExt : ∀ (fs : List Value) (k : Nat) (v : Value),
+      k < (setOrExtendFields fs k v).length := by
+    intro fs
+    induction fs with
+    | nil =>
+      intro k v
+      induction k with
+      | zero => exact Nat.zero_lt_succ 0
+      | succ n ih =>
+        change n + 1 < (Value.unit :: setOrExtendFields .nil n v).length
+        simp only [List.length_cons]
+        exact Nat.succ_lt_succ ih
+    | cons hd tl ihFs =>
+      intro k v
+      cases k with
+      | zero => exact Nat.zero_lt_succ tl.length
+      | succ n =>
+        change n + 1 < (hd :: setOrExtendFields tl n v).length
+        simp only [List.length_cons]
+        exact Nat.succ_lt_succ (ihFs n v)
+  have hListSetExt : ∀ (fs : List Value) (k : Nat) (v w : Value),
+      (setOrExtendFields fs k v).set k w = setOrExtendFields fs k w := by
+    intro fs
+    induction fs with
+    | nil =>
+      intro k v w
+      induction k with
+      | zero => rfl
+      | succ n ih =>
+        change (Value.unit :: setOrExtendFields .nil n v).set (n + 1) w =
+          Value.unit :: setOrExtendFields .nil n w
+        simp [ih]
+    | cons hd tl ihFs =>
+      intro k v w
+      cases k with
+      | zero => rfl
+      | succ n =>
+        change (hd :: setOrExtendFields tl n v).set (n + 1) w =
+          hd :: setOrExtendFields tl n w
+        simp [ihFs n v w]
+  have hSetExt : ∀ (fs : List Value) (k : Nat) (v w : Value),
+      set? (setOrExtendFields fs k v) k w = .some (setOrExtendFields fs k w) := by
+    intro fs k v w
+    change (if k < (setOrExtendFields fs k v).length then
+        some ((setOrExtendFields fs k v).set k w) else none) =
+      .some (setOrExtendFields fs k w)
+    simp [hLenLtExt fs k v, hListSetExt fs k v w]
+  have hEns :
+      ensureNestedFieldShells (.aggregate variantIdx fields)
+        [.field outerIdx outerTy, .field innerIdx innerTy] =
+        .aggregate variantIdx (setOrExtendFields fields outerIdx (.aggregate 0 .nil)) := by
+    rcases hSlot with hS | hS <;>
+      simp [ensureNestedFieldShells, stripTransparentProjections, outerTy, hS]
+  have hWrite :
+      writeProjectedValue locals₁
+        (.aggregate variantIdx (setOrExtendFields fields outerIdx (.aggregate 0 .nil)))
+        [.field outerIdx outerTy, .field innerIdx innerTy] val =
+        .ok (.aggregate variantIdx
+          (setOrExtendFields fields outerIdx
+            (.aggregate 0 (setOrExtendFields .nil innerIdx val)))) := by
+    dsimp only [writeProjectedValue]
+    rw [hGetExt fields outerIdx (.aggregate 0 .nil)]
+    dsimp only [writeProjectedValue]
+    rw [hGetNil innerIdx]
+    dsimp only [writeProjectedValue]
+    rw [hSetExt fields outerIdx (.aggregate 0 .nil)
+      (.aggregate 0 (setOrExtendFields .nil innerIdx val))]
+  dsimp only [outerTy] at hEns hWrite
+  simp [evalStmt, hRv, hInit, hEns, hWrite, hSet, hProt]
+
+/--
 `D13b` array-field boundary (`evalStmt_assign_uninit_array_field_elem_ub`):
 writing an element of a never-written fixed-length array field
 (`.field fieldIdx { kind := .array elemKind count, .. } :: .index idxLocal :: rest`)
@@ -3786,6 +3951,72 @@ theorem evalStmt_assign_uninit_array_field_elem_ub
           (.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
             .index idxLocal :: rest) val = .ub := by
       cases fieldIdx <;> rfl
+    simp [evalStmt, hRv, hUninit, hSh, hW]
+
+/--
+`D13b` sub-projection boundary (`evalStmt_assign_uninit_field_non_field_subproj_ub`):
+writing through a never-written field of a live but uninitialized local `dstLoc`
+followed immediately by an array index (`.index`), constant index
+(`.constantIndex`), subslice (`.subslice`), or enum variant downcast
+(`.downcast`) faults with `MirStepNode.fail .ub` for every `fieldTy` and every
+declared root type.
+-/
+theorem evalStmt_assign_uninit_field_non_field_subproj_ub
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (nextProj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hSub :
+      (∃ idxLocal, nextProj = .index idxLocal) ∨
+      (∃ offset minLen fromEnd, nextProj = .constantIndex offset minLen fromEnd) ∨
+      (∃ fromIdx toIdx fromEnd, nextProj = .subslice fromIdx toIdx fromEnd) ∨
+      (∃ variantName variantIdx, nextProj = .downcast variantName variantIdx)) :
+    evalStmt s
+        ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: nextProj :: rest⟩ rv, span⟩
+        localDecls layouts =
+      MirStepNode.fail .ub := by
+  have hSubCases :
+      ensureNestedFieldShells (.aggregate 0 .nil)
+        (.field fieldIdx fieldTy :: nextProj :: rest) = .aggregate 0 .nil ∧
+      writeProjectedValue locals₁ (.aggregate 0 .nil)
+        (.field fieldIdx fieldTy :: nextProj :: rest) val = .ub := by
+    rcases fieldTy with ⟨kind, lIdx⟩
+    rcases hSub with ⟨idxLocal, rfl⟩ | ⟨offset, minLen, fromEnd, rfl⟩ |
+        ⟨fromIdx, toIdx, fromEnd, rfl⟩ | ⟨variantName, variantIdx, rfl⟩
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+  rcases hSubCases with ⟨hEns, hW⟩
+  cases hSh : uninitFieldWriteShell? localDecls layouts dstLoc
+      (.field fieldIdx fieldTy) (nextProj :: rest) with
+  | none => simp [evalStmt, hRv, hUninit, hSh]
+  | some shell =>
+    have hShell : shell = .aggregate 0 .nil := by
+      unfold uninitFieldWriteShell? at hSh
+      dsimp only at hSh
+      rw [hEns] at hSh
+      split at hSh <;> first | (injection hSh with h; exact h.symm) | nomatch hSh
+    subst hShell
     simp [evalStmt, hRv, hUninit, hSh, hW]
 
 end Trusted.Rustc.V2026_06_01.MirSemantics

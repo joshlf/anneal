@@ -5624,6 +5624,41 @@ theorem stmt_div_assign_uninit_union_nested_pair_ok :
       .some (.none, "none", .some (.scalar ⟨99, 4⟩)) := by
   rfl
 
+/-- `D13b` nested aggregate regression with transparent `.opaqueCast` and
+`.unwrapUnsafeBinder` wrappers: initialize `(_1.b as S).b = 40` on an
+uninitialized `Outer { a: S, b: S }` local and then initialize
+`(unwrap_unsafe_binder(_1.a)).b = 20` into the `.unit`-padded sibling slot at
+`_1.a`, reading `(_1.a).b` back:
+```text
+StorageLive(_1);
+((_1.b) as S).b = const 40_u64;
+(unwrap_unsafe_binder(_1.a)).b = const 20_u64;
+_0 = copy ((_1.a).b); return
+```
+Without stripping transparent projections in `ensureNestedFieldShells` and
+`fieldShellChainPopulated`, both writes faulted with `.ub` because the
+intermediate `.opaqueCast` / `.unwrapUnsafeBinder` hid the trailing `.field`
+projection. -/
+private def stmtDivNestedOpaqueCastInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::nested_struct_fields_with_transparent_projections"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .opaqueCast stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 40)),
+        span := "((_1.b) as S).b = 40" },
+      { kind := .assign ⟨1, [.field 0 stmtDivStructTy, .unwrapUnsafeBinder stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 20)),
+        span := "(unwrap(_1.a)).b = 20" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩)),
+        span := "_0 = copy (_1.a).b" } ]
+
+theorem stmt_div_assign_uninit_nested_opaque_cast_field_ok :
+    diffCProbeBounded 16 stmtDivNestedOpaqueCastInitBody
+      (.running (initMachineState stmtDivNestedOpaqueCastInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨20, 8⟩)) := by
+  rfl
+
 /-- `D13b` array-field scope-boundary witness
 (`evalStmt_assign_uninit_array_field_elem_ub`): writing element `_2` of the
 never-written array field `_1.arr` of an uninitialized union local
@@ -5718,7 +5753,10 @@ and `evalStmt` on projected writes into live uninitialized and initialized local
    field slots along the written chain are populated
    (`ensureNestedFieldShells_eq_self_of_populated`,
    `writeProjectedValue_ensureNestedFieldShells_of_populated`,
-   `evalStmt_assign_init_projected_step`).
+   `evalStmt_assign_init_projected_step`), while materializing inner aggregate
+   shells when writing into an unpopulated (`.none` or `.some .unit`) outer
+   field slot of an already-initialized aggregate
+   (`evalStmt_assign_init_unpopulated_nested_field_ok`).
 2. `uninitFieldWriteShell?` returns `.some (.aggregate 0 .nil)` for single-level
    field projections on `.adt` and `.tuple` locals (`uninitFieldWriteShell?_field_adt`,
    `uninitFieldWriteShell?_field_tuple`) and `.none` for non-field projection
@@ -5733,17 +5771,20 @@ and `evalStmt` on projected writes into live uninitialized and initialized local
    `evalStmt_assign_uninit_nested_field_ok`), and faults with
    `MirStepNode.fail .ub` when a protected borrow conflicts
    (`evalStmt_assign_uninit_aggregate_field_protected_conflict_ub`), when the
-   write goes through a never-written array field
-   (`evalStmt_assign_uninit_array_field_elem_ub`), or when no aggregate shell
-   applies (`evalStmt_assign_uninit_non_aggregate_ub`). -/
+   write goes through a never-written array field or non-field sub-projection
+   (`evalStmt_assign_uninit_array_field_elem_ub`,
+   `evalStmt_assign_uninit_field_non_field_subproj_ub`), or when no aggregate
+   shell applies (`evalStmt_assign_uninit_non_aggregate_ub`). -/
 theorem mir_uninit_aggregate_field_write_characterizations
     (s : MachineState)
     (dstLoc idxLocal : Local)
+    (variantIdx : VariantIdx)
+    (fields : List Value)
     (fieldIdx innerIdx : FieldIdx)
     (fieldTy : Ty)
     (elemKind : RigidTy)
     (count arrLayoutIdx : Nat)
-    (proj : ProjectionElem)
+    (proj nextProj : ProjectionElem)
     (rest : List ProjectionElem)
     (rv : Rvalue)
     (span : String)
@@ -5787,6 +5828,27 @@ theorem mir_uninit_aggregate_field_write_characterizations
                   (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
                    | .some rp => rp
                    | .none => proj :: rest) })) ∧
+    (let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
+      let projs : List ProjectionElem := [.field fieldIdx outerTy, .field innerIdx fieldTy]
+      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some (.init (.aggregate variantIdx fields)) →
+      (get? fields fieldIdx = .none ∨ get? fields fieldIdx = .some .unit) →
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate variantIdx
+            (setOrExtendFields fields fieldIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂ →
+      mem₁.activeProtectors = .nil →
+      evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals₂
+            { mem₁ with
+              borrows :=
+                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                  (match resolveBorrowProjectionElems locals₁ projs with
+                   | .some rp => rp
+                   | .none => projs) })) ∧
     (placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
         .some { kind := .adt defPath args, layoutIdx := layoutIdx } →
       uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
@@ -5886,6 +5948,16 @@ theorem mir_uninit_aggregate_field_write_characterizations
             span⟩
           localDecls layouts =
         MirStepNode.fail .ub) ∧
+    (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      ((∃ iLoc, nextProj = .index iLoc) ∨
+       (∃ offset minLen fromEnd, nextProj = .constantIndex offset minLen fromEnd) ∨
+       (∃ fromIdx toIdx fromEnd, nextProj = .subslice fromIdx toIdx fromEnd) ∨
+       (∃ variantName vIdx, nextProj = .downcast variantName vIdx)) →
+      evalStmt s
+          ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: nextProj :: rest⟩ rv, span⟩
+          localDecls layouts =
+        MirStepNode.fail .ub) ∧
     (proj ≠ .deref →
       evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some .uninit →
@@ -5897,6 +5969,9 @@ theorem mir_uninit_aggregate_field_write_characterizations
     writeProjectedValue_ensureNestedFieldShells_of_populated locals₁ rootVal (proj :: rest) val,
     evalStmt_assign_init_projected_step s dstLoc proj rest rv span localDecls layouts
       val rootVal rootVal' locals₁ locals₂ mem₁,
+    evalStmt_assign_init_unpopulated_nested_field_ok s dstLoc variantIdx fields
+      fieldIdx innerIdx fieldTy rv span localDecls layouts innerDefPath innerArgs
+      innerLayoutIdx val locals₁ locals₂ mem₁,
     uninitFieldWriteShell?_field_adt localDecls layouts dstLoc fieldIdx fieldTy
       defPath args layoutIdx,
     uninitFieldWriteShell?_field_tuple localDecls layouts dstLoc fieldIdx fieldTy
@@ -5915,6 +5990,8 @@ theorem mir_uninit_aggregate_field_write_characterizations
       val locals₁ mem₁ locals₂,
     evalStmt_assign_uninit_array_field_elem_ub s dstLoc idxLocal fieldIdx elemKind count
       arrLayoutIdx rest rv span localDecls layouts val locals₁ mem₁,
+    evalStmt_assign_uninit_field_non_field_subproj_ub s dstLoc fieldIdx fieldTy nextProj
+      rest rv span localDecls layouts val locals₁ mem₁,
     evalStmt_assign_uninit_non_aggregate_ub s dstLoc proj rest rv span localDecls layouts
       val locals₁ mem₁⟩
 
