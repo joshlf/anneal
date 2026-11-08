@@ -8779,6 +8779,119 @@ open LeanMiriSpec.Correspondence in
   step_safeRef_deref_write_tree_simulation
   step_terminator_goto_return_tree_simulation
 
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    (∃ (s₁ : MachineState) (m₁ : AnnealStepState)
+        (tf₁ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+        (msg₀ msg₁ : String),
+      let b := lm32RefNeverBody
+      let m₀ := mkPre4MiriLM32 b u64Ty lm32Mls42
+      Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
+          refNeverTyLM32 4
+          ⟨.local 0 2 none (.ofAllocationToken 0), translateTy refNeverTyLM32 b.layouts⟩
+          false false m₀ =
+        .error (.undefinedBehavior msg₀) m₀ ∧
+      stepMirFn b (mkPre4AnnealLM32 b (.init (.scalar ⟨42, 8⟩))) = .step s₁ ∧
+      Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m₀ =
+        (m₁, .ok true) ∧
+      StateRelLM3_2 b s₁ m₁ [refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1] ∧
+      get? s₁.frame.locals 2 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      m₁.stack.frames = #[tf₁] ∧
+      Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
+          refNeverTyLM32 4
+          ⟨.local 0 2 none tf₁.localsIdentity, translateTy refNeverTyLM32 b.layouts⟩
+          false false m₁ =
+        .error (.undefinedBehavior msg₁) m₁) ∧
+    (∀ (place : Miri.Interpreter.RuntimePlace AnnealProv) (m : AnnealStepState),
+      place.layout = translateTy voidTyLM32 lm32EnumLayouts →
+      Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks lm32EnumLayouts)
+          voidTyLM32 4 place false false m =
+        .error (.undefinedBehavior "validation: zero-variant enum value") m) ∧
+    (∀ bytes, decodeValueFromBytes 4 lm32EnumLayouts voidTyLM32 bytes = none) ∧
+    lm32ValidateTag2 (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 0))) =
+      .ok () (lm32ValidityState (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 0)))) ∧
+    decodeValueFromBytes 4 lm32EnumLayouts tag2TyLM32 [.init (UInt8.ofNat 0) none] =
+      some (.aggregate 0 .nil) ∧
+    lm32ValidateTag2 (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 2))) =
+      .error (.undefinedBehavior "InvalidTag(outside valid range)")
+        (lm32ValidityState (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 2)))) ∧
+    decodeValueFromBytes 4 lm32EnumLayouts tag2TyLM32 [.init (UInt8.ofNat 2) none] = none :=
+  Witness.wit_lm3_2_ref_never_and_enum_discriminant_validity
+
+open Witness in
+example :
+    ∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+      let b := lm32InvalidBoolReadBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      ¬ AnnealScalarValid boolTyLM32 ⟨2, 1⟩ ∧
+      stepMirFn b (mkPre4AnnealLM32 b (.init (.scalar ⟨2, 1⟩))) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkPre4MiriLM32 b boolTyLM32 lm32MlsU8Two) =
+        (m₁, .ok true) ∧
+      StateRelLM3_2 b s₁ m₁ [refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1] ∧
+      get? s₁.frame.locals 2 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      get? s₂.frame.locals 0 = some (.init (.scalar ⟨2, 1⟩)) ∧
+      stepMirFn b s₂ = .retNormal (.scalar ⟨2, 1⟩) s₂.memory ∧
+      Miri.Interpreter.Step.step hooks () m₁ =
+        (m₂, .error (.undefinedBehavior "reading invalid value")) :=
+  Witness.wit_lm3_2_invalid_bool_deref_read_divergence_real_steps
+
+open Witness in
+example :
+    ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState)
+        (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      let b := lm32ReborrowTreeBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      stepMirFn b (mkPre4AnnealLM32 b (.init (.scalar ⟨42, 8⟩))) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (mkPre4MiriLM32 b u64Ty lm32Mls42) =
+        (m₁, .ok true) ∧
+      StateRelLM3_2Tree b s₁ m₁ [lm32TreeRoot .active] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_2Tree b s₂ m₂ [lm32TreeChild .reserved, lm32TreeRoot .active] ∧
+      get? s₂.frame.locals 3 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_2Tree b s₃ m₃ [lm32TreeChild .active, lm32TreeRoot .active] ∧
+      get? s₃.frame.locals 1 = some (.init (.scalar ⟨99, 8⟩)) ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_2Tree b s₄ m₄ [lm32TreeChild .frozen, lm32TreeRoot .active] ∧
+      get? s₄.frame.locals 0 = some (.init (.scalar ⟨99, 8⟩)) ∧
+      stepMirFn b s₄ = .retNormal (.scalar ⟨99, 8⟩) s₄.memory ∧
+      Miri.Interpreter.Step.step hooks () m₄ = ({ m₄ with stack := ⟨#[]⟩ }, .ok true) ∧
+      get? b.localDecls 0 = some decl0 ∧
+      annealControlHooks.returnOperand () m₄ = (m₄, .ok (.immediate imm0)) ∧
+      ImmediateRelLM3_2
+        ([lm32TreeChild .frozen, lm32TreeRoot .active].map ReborrowMapEntry.toAllocMapEntry)
+        decl0.ty b.layouts (.scalar ⟨99, 8⟩) imm0 :=
+  Witness.wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps
+
+open LeanMiriSpec.Correspondence in
+#assert_standard_axioms
+  Witness.lm32Mls42
+  Witness.refNeverTyLM32
+  Witness.refNeverDeclLM32
+  Witness.lm32RefNeverBody
+  Witness.lm32VoidLayout
+  Witness.lm32Tag2Range
+  Witness.lm32Tag2Layout
+  Witness.lm32EnumLayouts
+  Witness.voidTyLM32
+  Witness.tag2TyLM32
+  Witness.lm32ValidateTag2
+  Witness.wit_lm3_2_ref_never_and_enum_discriminant_validity
+  Witness.boolDeclLM32
+  Witness.refBoolDeclLM32
+  Witness.lm32MlsU8Two
+  Witness.lm32InvalidBoolReadBody
+  Witness.wit_lm3_2_invalid_bool_deref_read_divergence_real_steps
+  Witness.lm32TreeRoot
+  Witness.lm32TreeChild
+  Witness.lm32ReborrowTreeBody
+  Witness.wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps
+
 end StatementPins
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
