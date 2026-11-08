@@ -2448,29 +2448,6 @@ def findDeclTyWithKind? : List LocalDecl → RigidTy → Option Ty
     | false => findDeclTyWithKind? rest kind
 
 /--
-Search `entries` starting at index `idx` for a single-variant
-`FieldsShape.arbitrary` `TypeLayout` with `length offsets == fieldCount` (and
-`l.size.bytes == reqSize` when `reqSize > 0`).
--/
-@[reducible]
-def findMatchingArbitraryLayoutIdxAux
-    (fieldCount reqSize idx : Nat) :
-    List TypeLayout → Option Nat
-  | .nil => .none
-  | l :: rest =>
-    let matchesEntry :=
-      match l.isUninhabited, l.variants, l.fields with
-      | false, .single 0, .arbitrary offsets _ =>
-        Bool.and
-          (Nat.beq (length offsets) fieldCount)
-          (Bool.or (Nat.beq reqSize 0) (Nat.beq l.size.bytes reqSize))
-      | _, _, _ => false
-    match matchesEntry with
-    | true => .some idx
-    | false =>
-      findMatchingArbitraryLayoutIdxAux fieldCount reqSize (.succ idx) rest
-
-/--
 Test whether `layout` is a valid aggregate `TypeLayout` for runtime variant
 `aggVar` and field count `fieldCount`.
 -/
@@ -2492,10 +2469,26 @@ def layoutMatchesAggregateVariant
   | _, _, _ => false
 
 /--
+Out-of-range `LayoutIdx` (`length layouts.entries`) used for synthesized `Ty`s
+whose compiler layout is unknown (array/slice element types rebuilt from a
+`RigidTy` kind without a container `fieldLayouts` entry or a structurally equal
+`LocalDecl`). Unlike `0`, which is also the index of the first real
+`TypeLayout`, it never adopts an unrelated entry: `LayoutTable.lookup` returns
+`.none`.
+-/
+@[reducible]
+def unresolvedLayoutIdx (layouts : LayoutTable) : Nat :=
+  length layouts.entries
+
+/--
 Resolve the `TypeLayout` of an aggregate `.aggregate aggVar fields` of static
-type `curTy` in `layouts`, falling back to `findMatchingArbitraryLayoutIdxAux`
-when `curTy` is an `.adt` with a synthesized `layoutIdx == 0` whose `entries[0]`
-does not match `(aggVar, length fields)`.
+type `curTy` in `layouts`: the entry at `curTy.layoutIdx` is used only when it
+is shaped like `(aggVar, length fields)` (`layoutMatchesAggregateVariant`), and
+`.none` is returned otherwise. In particular, a synthesized `layoutIdx == 0`
+whose `entries[0]` does not match is *not* replaced by some other entry of the
+same shape: two distinct types with equal field counts and sizes routinely have
+different field offsets (`repr(Rust)` reordering), so a shape-matched guess
+would resolve the wrong field.
 -/
 @[reducible]
 def lookupAggregateLayout?
@@ -2525,17 +2518,7 @@ def lookupAggregateLayout?
       | _ =>
         match layoutMatchesAggregateVariant l aggVar (length fields) with
         | true => .some l
-        | false =>
-          match Nat.beq curTy.layoutIdx 0, Nat.beq aggVar 0 with
-          | true, true =>
-            let reqSz :=
-              match inferValueCReprBytes (.aggregate 0 fields) with
-              | .some s => s
-              | .none => 0
-            match findMatchingArbitraryLayoutIdxAux (length fields) reqSz 0 layouts.entries with
-            | .some matchIdx => LayoutTable.lookup layouts matchIdx
-            | .none => .none
-          | _, _ => .none
+        | false => .none
     | .none => .none
   | _ => directOpt
 
@@ -3054,13 +3037,7 @@ def resolveAggregateAtByteOffsetStep
           let elemLayoutIdx : Nat :=
             match LayoutTable.lookup layouts curTy.layoutIdx with
             | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } => flIdx
-            | _ =>
-              match elemKind, fields with
-              | .adt _ _, .aggregate 0 eFields :: _ =>
-                match findMatchingArbitraryLayoutIdxAux (length eFields) elemSz 0 layouts.entries with
-                | .some matchIdx => matchIdx
-                | .none => 0
-              | _, _ => 0
+            | _ => unresolvedLayoutIdx layouts
           .some (.some { kind := elemKind, layoutIdx := elemLayoutIdx }, elemSz)
         | .adt _ _ | .tuple _ | .closure _ _ => .none
         | _ =>
@@ -3494,9 +3471,13 @@ def resolveSeqContainerElemByteStride
     | _ => inferElemListByteStride elems
 
 /--
-Resolve the element `Ty` (including a `LayoutTable` index when available) of a
-sequence container at `(targetLocal, containerProj)` whose runtime elements are
-`elems` of byte stride `elemSz`.
+Resolve the element `Ty` of a sequence container at `(targetLocal,
+containerProj)`: the element layout index recorded by the container's own
+`TypeLayout` (`fieldLayouts`), else a structurally equal `LocalDecl`
+(`findDeclTyWithKind?`), else the bare element kind with the out-of-range
+`unresolvedLayoutIdx`. Untyped containers yield `.none`. The runtime elements
+and stride are not consulted: no layout is ever guessed from the shape of the
+values.
 -/
 @[reducible]
 def resolveSeqContainerElemTyOpt
@@ -3504,8 +3485,8 @@ def resolveSeqContainerElemTyOpt
     (layouts : LayoutTable)
     (targetLocal : Local)
     (containerProj : List ProjectionElem)
-    (elems : List Value)
-    (elemSz : Nat) :
+    (_elems : List Value)
+    (_elemSz : Nat) :
     Option Ty :=
   let containerTyOpt :=
     placeTy localDecls layouts { local_ := targetLocal, projection := containerProj }
@@ -3535,20 +3516,8 @@ def resolveSeqContainerElemTyOpt
     | .none =>
       match findDeclTyWithKind? localDecls ek with
       | .some declTy => .some declTy
-      | .none =>
-        match ek, elems with
-        | .adt _ _, .aggregate 0 eFields :: _ =>
-          match findMatchingArbitraryLayoutIdxAux (length eFields) elemSz 0 layouts.entries with
-          | .some matchIdx => .some { kind := ek, layoutIdx := matchIdx }
-          | .none => .some { kind := ek, layoutIdx := 0 }
-        | _, _ => .some { kind := ek, layoutIdx := 0 }
-  | .none =>
-    match elems with
-    | .aggregate 0 eFields :: _ =>
-      match findMatchingArbitraryLayoutIdxAux (length eFields) elemSz 0 layouts.entries with
-      | .some matchIdx => .some { kind := .adt "" .nil, layoutIdx := matchIdx }
-      | .none => .none
-    | _ => .none
+      | .none => .some { kind := ek, layoutIdx := unresolvedLayoutIdx layouts }
+  | .none => .none
 
 /--
 Resolve the effective target projection path `(fullProj, residualBytes)` on
