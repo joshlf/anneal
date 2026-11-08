@@ -812,7 +812,6 @@ theorem translateTy_align_pow2_le_29 (ty : Ty) (layouts : LayoutTable) :
     (translateTy ty layouts).layout.align.abi.pow2 ≤ 29 := by
   unfold translateTy
   dsimp only
-  
   split
   · exact translateAlignBytes_pow2_le_29 _
   · exact translateAlignBytes_pow2_le_29 _
@@ -828,6 +827,14 @@ theorem translateTy_align_pow2_le_29 (ty : Ty) (layouts : LayoutTable) :
   · decide
   · decide
   · decide
+  · split
+    · exact translateTypeLayout_align_pow2_le_29 _
+    · dsimp only
+      cases h : scalarLayoutOfRigidTy _ with
+      | none => simp [Option.getD, zstLayoutData]; decide
+      | some l =>
+        simp only [Option.getD]
+        exact scalarLayoutOfRigidTy_align_pow2_le_29 h
   · split
     · exact translateTypeLayout_align_pow2_le_29 _
     · decide

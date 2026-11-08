@@ -28,7 +28,7 @@ upstream `lean-miri`:
    `_2.1 = 0x5566_u16` and keeping trailing alignment padding bytes `6, 7`
    `.uninit`), re-reads `_2.0` into `_0`, frees both stack allocations via
    `StorageDead`, and instantiates `step_two_stmts_lm2_2_simulation` and
-   `StateRelLM2_2.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PairEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide)`.
+   `StateRelLM2_2.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h)`.
 2. **Unpadded `AbiRepr.Memory` Struct (`lm22UnpaddedBody`)**: constructs 3-field
    `UnpaddedTriple { a: u32, b: u32, c: u32 }` (`size = 12`, `0` padding bytes),
    overwrites `_1.1 = const 77_u32`, reads `_1.1`, and proves base `StateRel`
@@ -745,7 +745,7 @@ theorem lm22Pair_full_trace_and_returns_agree :
     have hbase11 : StateRel lm22PairBody
         (lm22StepAnnealN lm22PairBody 11 (initMachineState lm22PairBody []))
         (lm22StepMiriN lm22PairBody 11 lm22PairMiriInit) := by
-      refine hs11.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PairEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+      refine hs11.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
       case hunpad =>
         intro i _ _ _ _ _ _ hdecl henv hslot _
         match i with
@@ -1036,7 +1036,7 @@ theorem lm22Unpadded_full_trace_and_returns_agree :
   have hbase3 : StateRel lm22UnpaddedBody
       (lm22StepAnnealN lm22UnpaddedBody 3 (initMachineState lm22UnpaddedBody []))
       (lm22StepMiriN lm22UnpaddedBody 3 lm22UnpaddedMiriInit) := by
-    refine hs3.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22UnpaddedEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide)
+    refine hs3.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h)
       (fun i decl v imm lay hdecl henv hslot ⟨tf, htf, hmls⟩ => ?_) ?hunpad
     case hunpad =>
       intro i decl _ _ _ fields paths hdecl henv _ _
@@ -1061,7 +1061,7 @@ theorem lm22Unpadded_full_trace_and_returns_agree :
   have hbase5 : StateRel lm22UnpaddedBody
       (lm22StepAnnealN lm22UnpaddedBody 5 (initMachineState lm22UnpaddedBody []))
       (lm22StepMiriN lm22UnpaddedBody 5 lm22UnpaddedMiriInit) := by
-    refine hs5.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22UnpaddedEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs5.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -1498,7 +1498,7 @@ theorem lm22Padded_full_trace_and_returns_agree :
   have hbase8 : StateRel lm22PaddedBody
       (lm22StepAnnealN lm22PaddedBody 8 (initMachineState lm22PaddedBody []))
       (lm22StepMiriN lm22PaddedBody 8 lm22PaddedMiriInit) := by
-    refine hs8.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PaddedEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs8.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -2054,7 +2054,7 @@ theorem lm22Nested_full_trace_and_returns_agree :
     have hbase14 : StateRel lm22NestedBody
         (lm22StepAnnealN lm22NestedBody 14 (initMachineState lm22NestedBody []))
         (lm22StepMiriN lm22NestedBody 14 lm22NestedMiriInit) := by
-      refine hs14.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22NestedEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+      refine hs14.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
       case hunpad =>
         intro i _ _ _ _ _ _ hdecl henv hslot _
         match i with
@@ -2364,7 +2364,7 @@ theorem lm22Reassign_full_trace_and_returns_agree :
   have hbase12 : StateRel lm22ReassignBody
       (lm22StepAnnealN lm22ReassignBody 12 (initMachineState lm22ReassignBody []))
       (lm22StepMiriN lm22ReassignBody 12 lm22ReassignMiriInit) := by
-    refine hs12.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PairEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs12.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -2804,7 +2804,7 @@ theorem lm22SubStruct_full_trace_and_returns_agree :
   have hbase14 : StateRel lm22SubStructBody
       (lm22StepAnnealN lm22SubStructBody 14 (initMachineState lm22SubStructBody []))
       (lm22StepMiriN lm22SubStructBody 14 lm22SubStructMiriInit) := by
-    refine hs14.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22NestedEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs14.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -3156,7 +3156,7 @@ theorem lm22Large_full_trace_and_returns_agree :
   have hbase5 : StateRel lm22LargeBody
       (lm22StepAnnealN lm22LargeBody 5 (initMachineState lm22LargeBody []))
       (lm22StepMiriN lm22LargeBody 5 lm22LargeMiriInit) := by
-    refine hs5.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22LargeEnv; intro h; cases ty; rename_i kind layoutIdx; cases kind <;> try dsimp only at h <;> try cases h <;> try decide) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs5.toStateRel_of_flat_imm (by rintro ⟨_, _⟩ _ _ h _ _ ⟨⟩; cases h) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with

@@ -531,7 +531,13 @@ def annealAggregateHooksLM2_4 (localDecls : List LocalDecl) (layouts : LayoutTab
       if isUnionLayout dest.layout then
         annealUnionAggregateField localDecls layouts dest idx
       else
-        base.projectField c dest idx }
+        base.projectField c dest idx
+    copyOpNoValidate := fun _ src dest _ => do
+      let imm ← annealReadImmediate src
+      annealWriteImmediate imm.imm dest
+    writeDiscriminant := fun _ _ dest => do
+      let _ ← annealEnsureAllocated dest
+      pure () }
 
 /-- `annealRvalueHooks` with union- and subslice-aware places, operands, copies
 (`annealMemCopyOp` for `usesMemCopy` sources), aggregates, and array repeats. -/
@@ -547,12 +553,16 @@ def annealRvalueHooksLM2_4 (localDecls : List LocalDecl) (layouts : LayoutTable)
     evalOperand := fun _ op known => annealEvalOperandLM2_4 localDecls layouts op known
     evalOperandAt := fun _ _ op known => annealEvalOperandLM2_4 localDecls layouts op known
     evalPlaceToOp := fun _ p known => annealEvalOperandLM2_4 localDecls layouts (.Copy p) known
-    copyOp := fun c src dest =>
+    copyOp := fun _ src dest =>
       if usesMemCopy src then annealMemCopyOp localDecls layouts src dest
-      else base.copyOp c src dest
-    copyOpAllowTransmute := fun c src dest =>
+      else do
+        let imm ← annealReadImmediate src
+        annealWriteImmediate imm.imm dest
+    copyOpAllowTransmute := fun _ src dest =>
       if usesMemCopy src then annealMemCopyOp localDecls layouts src dest
-      else base.copyOpAllowTransmute c src dest
+      else do
+        let imm ← annealReadImmediate src
+        annealWriteImmediate imm.imm dest
     writeAggregate := fun c k os d =>
       Miri.Interpreter.writeAggregate (annealAggregateHooksLM2_4 localDecls layouts) c k os d
     writeRepeat := fun c o d =>

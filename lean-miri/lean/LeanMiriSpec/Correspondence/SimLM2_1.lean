@@ -10,7 +10,6 @@ those terms.
 
 import LeanMiriSpec.Correspondence.SimLM1_4
 import LeanMiriSpec.Correspondence.AllocLM2_1
-import LeanMiriSpec.Correspondence.ProjLM2_2
 
 /-!
 # Lockstep Simulation for Homogeneous Arrays `[T; N]`, `Repeat`, `Len`, and `Index`/`ConstantIndex` Projections (`LM-2.1`)
@@ -151,6 +150,32 @@ theorem elem_fields_primitive
     (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.fields = .Primitive := by
   rcases h.elem_prim with rfl | rfl | ⟨it, rfl⟩ | ⟨ut, rfl⟩ <;> rfl
 
+/-- The element layout has nonzero byte size (`== ZERO` is `false`). -/
+theorem elem_size_beq_zero
+    {layouts : LayoutTable} {arrTy : Ty} {elemKind : RigidTy} {count : Nat}
+    (h : WellTypedArrayTy layouts arrTy elemKind count) :
+    ((translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size == Miri.ABI.Size.ZERO) = false :=
+  beq_false_of_ne (IsPrimScalarTy.size_ne_zero h.elem_prim)
+
+/-- The element layout uses `BackendRepr.Scalar`. -/
+theorem elem_backendRepr
+    {layouts : LayoutTable} {arrTy : Ty} {elemKind : RigidTy} {count : Nat}
+    (h : WellTypedArrayTy layouts arrTy elemKind count) :
+    ∃ s, (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.backendRepr = .Scalar s := by
+  rcases h.elem_prim with rfl | rfl | ⟨it, rfl⟩ | ⟨ut, rfl⟩ <;>
+    (try cases it) <;> (try cases ut) <;>
+    exact ⟨_, rfl⟩
+
+/-- Array element places never take the whole-struct memory-copy path (`usesStructMemCopyDest = false`). -/
+theorem elem_usesStructMemCopyDest_false
+    {layouts : LayoutTable} {arrTy : Ty} {elemKind : RigidTy} {count : Nat}
+    (h : WellTypedArrayTy layouts arrTy elemKind count)
+    (ref : Miri.Interpreter.RuntimePlaceRef AnnealProv) :
+    usesStructMemCopyDest ⟨ref, translateTy { kind := elemKind, layoutIdx := 0 } layouts⟩ = false := by
+  rcases h.elem_prim with rfl | rfl | ⟨it, rfl⟩ | ⟨ut, rfl⟩ <;>
+    (try cases it) <;> (try cases ut) <;>
+    rfl
+
 /-- Encoded array `TyId`s (`≥ 100`) never collide with `arraySliceMetaTyId` (`60`). -/
 theorem ty_ne_arraySliceMetaTyId
     {layouts : LayoutTable} {arrTy : Ty} {elemKind : RigidTy} {count : Nat}
@@ -161,7 +186,7 @@ theorem ty_ne_arraySliceMetaTyId
   unfold encodeTyId Miri.MIR.TyId at *
   rw [h.arr_kind]
   dsimp only
-  omega
+  cases encodeScalarRigidTy elemKind <;> dsimp only <;> omega
 
 end WellTypedArrayTy
 
@@ -523,7 +548,7 @@ theorem annealReadImmediate_of_projected_array_elem
     obtain ⟨sc, msc, rfl, himm, hread⟩ := hslice.readScalar_get hget
     refine ⟨sc, msc, rfl, himm, ?_⟩
     have hrel_off :
-        elemMp.ptr.offset =
+        Miri.ABI.Size.ofBytes (elemMp.ptr.offset.bytes - baseAddr) =
           Miri.ABI.Size.ofBytes
             (relOffset.bytes + UInt64.ofNat (idx * elemLay.size.bytes.toNat)) := by
       have hbytes : mp.ptr.offset.bytes = baseAddr + relOffset.bytes := by
@@ -531,8 +556,15 @@ theorem annealReadImmediate_of_projected_array_elem
       dsimp only [elemMp, elemOff]
       simp only [Miri.ABI.Size.ofBytes, hbytes, uint64_add_add_sub_cancel_left]
     have hprov_elem : elemMp.ptr.provenance = some (.concrete allocId tag) := hprov
-    unfold annealReadImmediate
-    apply annealReadIndirectImmediate_scalar_ok (fty := { kind := elemKind, layoutIdx := 0 }) (hprim := hwf.elem_prim) hprov_elem hbase hrel_off hfind hread
+    obtain ⟨s_repr, hrepr_elem⟩ := hwf.elem_backendRepr
+    have hsz_elem := hwf.elem_size_beq_zero
+    unfold annealReadImmediate annealReadIndirectImmediate
+    dsimp only [elemTy, elemLay] at hrel_off ⊢
+    rw [hprov_elem, hwf.elem_fields_primitive, hsz_elem, hrepr_elem]
+    simp only [Bool.false_eq_true, ↓reduceIte, get, getThe, MonadStateOf.get, EStateM.get, bind,
+      EStateM.bind, Option.bind_some, Miri.Memory.Provenance.getAllocId, hbase, hfind]
+    rw [hrel_off, hread]
+    rfl
 
 /-! ## 2. Pointer Arithmetic, `Index` and `ConstantIndex` Projection Simulation -/
 
@@ -814,7 +846,7 @@ theorem projectionMemoryOffset_inbounds_of_memPlaceRel
     hnot_ge63, hcheck, hwrap, Except.mapError, bind, Except.bind, pure, Except.pure]
 
 /-- Helper: `Miri.Interpreter.projectIndex` on an array `OpTy` with `WellTypedArrayTy`
-and `MemPlaceRel` (under `annealArrayProjectionCx frame layouts mach`):
+and `MemPlaceRel` (under `annealProjectionCx frame layouts mach`):
 - succeeds with offset `idx * elemSize` and layout `translateTy elemTy layouts` when `idx < count`,
 - fails with `.error (.bounds (UInt64.ofNat count) (UInt64.ofNat idx))` when `count ≤ idx` and `idx < 2 ^ 64`. -/
 theorem projectIndex_array_spec
@@ -825,7 +857,7 @@ theorem projectIndex_array_spec
     (hwf : WellTypedArrayTy layouts arrTy elemKind count)
     (hnodup : LiveAllocsNodup mach)
     (hmp : MemPlaceRel mach arrTy layouts (some (.aggregate 0 elems)) mp) :
-    let cx := annealArrayProjectionCx layouts none (annealLocalIndex frame mach)
+    let cx := annealProjectionCx frame layouts mach
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy layouts).layout
@@ -875,7 +907,7 @@ theorem projectIndex_array_spec
       rw [hidx_toNat, Nat.mul_comm]
       have hc1 : idx * elemLay.size.bytes.toNat < 2 ^ 64 := by omega
       have hc2 : idx * elemLay.size.bytes.toNat ≤ cx.maxSizeOfVal.bytes.toNat := by
-        have hmax : cx.maxSizeOfVal.bytes.toNat = 0x7fff_ffff_ffff_ffff := by dsimp [cx, annealArrayProjectionCx, Miri.ABI.Size.ofBytes]; rfl
+        have hmax : cx.maxSizeOfVal.bytes.toNat = 0x7fff_ffff_ffff_ffff := rfl
         rw [hmax]; omega
       simp [hc1, hc2]
     have hfield : cx.field base.layout 0 = .ok (translateTy elemTy layouts) := by
@@ -900,7 +932,7 @@ theorem projectIndex_array_spec
     simp only [bind, Except.bind, hnot_ge, ↓reduceIte, hcomp, hfield]
     unfold Miri.Interpreter.OpTy.offset Miri.Interpreter.OpTy.offsetWithMeta
     rw [hwf.elem_isSized]
-    dsimp only [base, cx, annealArrayProjectionCx, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    dsimp only [base, cx, annealProjectionCx, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
       bind, Except.bind, pure, Except.pure]
     rw [hmem_off]
     rfl
@@ -1094,7 +1126,7 @@ theorem evalProjection_index_simulation
     (hmp : MemPlaceRel m.machine arrTy body.layouts (some (.aggregate 0 elems)) mp)
     (hidx_decl : get? body.localDecls idxLocal = some idxDecl)
     (hidx_ty : idxDecl.ty = { kind := .uint .usize, layoutIdx := 0 }) :
-    let cx := annealArrayProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
+    let cx := annealProjectionCx topFrame body.layouts m.machine
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
@@ -1230,7 +1262,7 @@ theorem evalProjection_constantIndex_simulation
     (hwf_const :
       (fromEnd = false → offset < minLength) ∧
       (fromEnd = true → 0 < offset ∧ offset ≤ minLength)) :
-    let cx := annealArrayProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
+    let cx := annealProjectionCx topFrame body.layouts m.machine
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
@@ -1403,7 +1435,7 @@ theorem projectConstantIndex_malformed_invariant
         ((fromEnd = false ∧ minLength ≤ offset) ∨
          (fromEnd = true ∧ (offset = 0 ∨ minLength < offset))))) :
     ∃ msg,
-      annealProjectList (annealArrayProjectionCx frame layouts mach)
+      annealProjectList (annealProjectionCx frame layouts mach)
         ⟨.indirect mp, translateTy arrTy layouts⟩ [.ConstantIndex offset minLength fromEnd] =
         .error (.invariant msg) := by
   by_cases hovf : 2 ^ 64 ≤ offset ∨ 2 ^ 64 ≤ minLength
@@ -1423,7 +1455,7 @@ theorem projectConstantIndex_malformed_invariant
       · exact absurd (Or.inl h) hovf
       · exact absurd (Or.inr h) hovf
       · exact h
-    let cx := annealArrayProjectionCx layouts none (annealLocalIndex frame mach)
+    let cx := annealProjectionCx frame layouts mach
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
     have hlen_miri : base.len cx = .ok (UInt64.ofNat count) := by
       unfold Miri.Interpreter.OpTy.len
@@ -1482,7 +1514,7 @@ theorem annealReadImmediate_whole_array_unsupported
   | mk allocId tag baseAddr relOffset localAlloc
       hprov _ _ hlive hbase _ _ _ _ _ _ _ _ _ =>
     have hfind := array_find?_of_nodup_fst hnodup hlive
-    unfold annealReadImmediate
+    unfold annealReadImmediate annealReadIndirectImmediate
     dsimp only
     rw [hprov, hwf.arr_fields, hwf.ty_ne_arraySliceMetaTyId]
     simp [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
@@ -1501,7 +1533,7 @@ theorem encodeTyId_ne_arraySliceMetaTyId (ty : Ty) :
   | tuple elems => cases elems <;> (dsimp only; omega)
   | array elemKind _ =>
     dsimp only
-    omega
+    cases encodeScalarRigidTy elemKind <;> dsimp only <;> omega
   | _ =>
     dsimp only
     omega
@@ -1525,7 +1557,7 @@ theorem projectUnwrapArraySliceMeta_of_array_memPlaceRel
     {elems : List Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
     (hwf : WellTypedArrayTy layouts arrTy elemKind count)
     (hmp : MemPlaceRel mach arrTy layouts (some (.aggregate 0 elems)) mp) :
-    annealProjectList (annealArrayProjectionCx frame layouts mach)
+    annealProjectList (annealProjectionCx frame layouts mach)
       ⟨.indirect mp, translateTy arrTy layouts⟩ [.UnwrapUnsafeBinder arraySliceMetaTyId] =
       .ok ⟨.indirect mp, { ty := arraySliceMetaTyId, layout := (translateTy arrTy layouts).layout }⟩ := by
   have hfields := hwf.arr_fields
@@ -1542,7 +1574,7 @@ theorem projectUnwrapArraySliceMeta_of_array_memPlaceRel
   dsimp only [bind, Except.bind, Miri.Interpreter.OpTy.transmute]
   rw [hisSized]
   simp only [Bool.not_true, Bool.false_or, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
-    Miri.Interpreter.OpTy.offsetWithMeta, annealArrayProjectionCx,
+    Miri.Interpreter.OpTy.offsetWithMeta, annealProjectionCx,
     Miri.Interpreter.projectionMemoryOffset, Miri.Interpreter.MemPlace.offsetWithMeta,
     Miri.Interpreter.MemPlaceMeta.hasMeta, Bool.false_and, hwrap_zero, Except.mapError,
     pure, Except.pure]
@@ -1551,7 +1583,7 @@ theorem projectUnwrapArraySliceMeta_of_array_memPlaceRel
 
 /-- Every in-bounds array `Subslice` projection (`fromEnd = false` with `fromIdx ≤ toIdx ≤ count`,
 or `fromEnd = true` with `fromIdx + toIdx ≤ count` — covering both partial and whole-array
-subslices) fails closed with `.error (.obligation "array subslice in annealArrayProjectionCx")`,
+subslices) fails closed with `.error (.obligation "array subslice in annealProjectionCx")`,
 which `annealLiftProjectionError` maps to `StepError.unsupported`. -/
 theorem projectSubslice_array_unsupported
     {mach : AnnealMachine}
@@ -1563,10 +1595,10 @@ theorem projectSubslice_array_unsupported
     (hin :
       (fromEnd = false ∧ fromIdx ≤ toIdx ∧ toIdx ≤ count) ∨
       (fromEnd = true ∧ fromIdx + toIdx ≤ count)) :
-    annealProjectList (annealArrayProjectionCx frame layouts mach)
+    annealProjectList (annealProjectionCx frame layouts mach)
       ⟨.indirect mp, translateTy arrTy layouts⟩ [.Subslice fromIdx toIdx fromEnd] =
-      .error (.obligation "array subslice in annealArrayProjectionCx") := by
-  let cx := annealArrayProjectionCx layouts
+      .error (.obligation "array subslice in annealProjectionCx") := by
+  let cx := annealProjectionCx frame layouts mach
   let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
   let elemSize := (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size
   have hfields : base.layout.layout.fields = .Array elemSize (UInt64.ofNat count) := hwf.arr_fields
@@ -1621,10 +1653,10 @@ theorem projectSubslice_array_unsupported
     rfl
   have hsublay : ∀ subCount,
       cx.subsliceLayout base.layout subCount =
-        .error (.obligation "array subslice in annealArrayProjectionCx") := by
+        .error (.obligation "array subslice in annealProjectionCx") := by
     intro subCount
     change (match base.layout.layout.fields with
-      | .Array _ _ => Except.error (Miri.Interpreter.ProjectionError.obligation "array subslice in annealArrayProjectionCx")
+      | .Array _ _ => Except.error (Miri.Interpreter.ProjectionError.obligation "array subslice in annealProjectionCx")
       | _ => Except.error (Miri.Interpreter.ProjectionError.invariant "subslice on non-array")) = _
     rw [hfields]
   simp only [annealProjectList, Miri.Interpreter.project, hnot_ge64]
@@ -1725,7 +1757,7 @@ theorem annealReadImmediate_of_array_memPlaceRel
               (.fromScalarInt countSc),
               translateTy { kind := .ref .not (.slice .bool), layoutIdx := 0 }⟩
             m := by
-      unfold annealReadImmediate
+      unfold annealReadImmediate annealReadIndirectImmediate
       dsimp only [sliceOp]
       rw [hprov, hwf.arr_fields]
       simp only [beq_self_eq_true, ↓reduceIte, get, getThe, MonadStateOf.get, EStateM.get, bind,
@@ -2330,6 +2362,56 @@ theorem WellTypedLM2_1ScalarOperand.mono_immediate
   | ofScalar hs => exact .ofScalar (hs.mono_immediate hmono)
   | moveLocal idx decl hdecl hprim himm =>
     exact .moveLocal idx decl hdecl hprim (hmono idx himm)
+
+theorem WellTypedLM2_1ScalarOperand.evalOperand_immediate
+    {body : CapturedMir} {af : StackFrame}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {m : AnnealStepState} {op : MirAst.Operand} {ty : Ty}
+    (hframes : m.stack.frames = #[topFrame])
+    (hframe : FrameRel body m.machine af topFrame)
+    (hop : WellTypedLM2_1ScalarOperand body topFrame op ty)
+    (known : Option Miri.Interpreter.LocalLayout)
+    (src : Miri.Interpreter.OpTy AnnealProv) (m₁ : AnnealStepState)
+    (heval : annealEvalOperand body.localDecls body.layouts (translateOperand op) known m =
+      .ok src m₁) :
+    ∃ imm, src.op = .immediate imm := by
+  cases hop with
+  | ofScalar hs => exact hs.evalOperand_immediate hframes hframe known src m₁ heval
+  | moveLocal idx decl hdecl _ himm =>
+    obtain ⟨_, mls, _, hlt, _, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
+    have himm' := himm mls hmls
+    cases hloc with
+    | dead _ hcl =>
+      dsimp only [translateOperand, translatePlace, List.map, List.toArray] at heval
+      rw [annealEvalOperand_move_dead hframes hlt hdecl hmls_eq (fun l hl => hcl l hl)] at heval
+      cases heval
+    | indirect _ mp _ _ _ _ =>
+      exact False.elim (himm' mp rfl)
+    | immediate _ imm _ hcl _ =>
+      dsimp only [translateOperand, translatePlace, List.map, List.toArray] at heval
+      rw [annealEvalOperand_move_live hframes hlt hdecl hmls_eq (fun l hl => hcl l hl)] at heval
+      injection heval with hsrc _
+      subst hsrc
+      exact ⟨imm, rfl⟩
+
+theorem evalOperandAt_eq_of_immediate
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {path : Miri.Interpreter.OperandPath} {op : Miri.MIR.Operand}
+    {known : Option Miri.Interpreter.LocalLayout} {m₀ : AnnealStepState}
+    (h : ∀ src m₁, annealEvalOperand localDecls layouts op known m₀ = .ok src m₁ →
+      ∃ imm, src.op = .immediate imm) :
+    (annealAggregateHooks localDecls layouts).evalOperandAt () path op known m₀ =
+      ((annealEvalOperand localDecls layouts op known >>= annealReadImmediate) >>=
+        fun imm => pure ⟨.immediate imm.imm, imm.layout⟩) m₀ := by
+  dsimp only [annealAggregateHooks, bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure]
+  cases hf : annealEvalOperand localDecls layouts op known m₀ with
+  | error _ _ => rfl
+  | ok src m₁ =>
+    obtain ⟨imm, himm⟩ := h src m₁ hf
+    rcases src with ⟨sop, slay⟩
+    dsimp only at himm
+    subst himm
+    rfl
 
 theorem WellTypedLM2_1ScalarOperand.cache_layout
     {body : CapturedMir}
@@ -3066,12 +3148,14 @@ theorem annealWriteImmediate_stackAlloc_snoc
       UInt64.zero_add]
   dsimp only [elemSize] at hoff
   have hmsc_sz : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).size = msc.size := rfl
+  have hadd_zero_sz : ∀ x : UInt64, x + Miri.ABI.Size.ZERO.bytes = x := fun x => UInt64.add_zero x
   refine ⟨alloc', ?_, hbyteSize, halign, hmask, hslice'⟩
-  unfold annealWriteImmediate
+  unfold annealWriteImmediate annealWriteIndirectImmediate
   simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
     stack_currentFrame?_singleton ⟨#[tf]⟩ tf rfl, stackAllocPlace, Option.bind,
     Miri.Memory.Provenance.getAllocId, hbase, hlive, hidx, Array.getElem?_push_size,
-    hoff, hmsc_sz, hwrite, pure, set, MonadStateOf.set, EStateM.set, array_push_set!_size]
+    hadd_zero_sz, hoff, hmsc_sz, hwrite, pure, EStateM.pure, set, MonadStateOf.set,
+    EStateM.set, array_push_set!_size]
   rfl
 
 /-- Writing `.scalar (.fromScalarInt msc)` to element `k` of an existing indirect
@@ -3137,11 +3221,12 @@ theorem annealWriteImmediate_inplace_snoc
   dsimp only [elemSize] at hoff
   have hmsc_sz : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).size = msc.size := rfl
   refine ⟨alloc', ?_, hbyteSize, halign, hmask, hslice'⟩
-  unfold annealWriteImmediate
+  unfold annealWriteImmediate annealWriteIndirectImmediate
   simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
     stack_currentFrame?_singleton ⟨#[tf]⟩ tf rfl, hprov, Option.bind_some,
     Miri.Memory.Provenance.getAllocId, hbase_in, hfind_in, hget_in,
-    hoff, hmsc_sz, hwrite, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set]
+    Miri.ABI.Size.ZERO, UInt64.add_zero, hoff, hmsc_sz, hwrite, pure, EStateM.pure,
+    set, MonadStateOf.set, EStateM.set]
   dsimp only [inplaceMachine]
   simp only [array_set!_idem]
 
@@ -3557,7 +3642,10 @@ theorem writeRepeat_after_forceAlloc_spec
     let st₁ : AnnealStepState :=
       { stack := ⟨#[tf]⟩, machine := stackAllocMachine mach mem' allocId alloc₁ }
     have hcopy0 : h.copyOp () source firstPlace st₀ = .ok () st₁ := by
-      dsimp only [h, annealAggregateHooks, source]
+      dsimp only [h, annealAggregateHooks, source, firstPlace]
+      rw [hwf.elem_usesStructMemCopyDest_false]
+      simp only [Bool.and_false, Bool.false_eq_true, ↓reduceIte, annealReadImmediate,
+        pure, EStateM.pure, bind, EStateM.bind]
       exact hwrite₁
     rw [EStateM.bind_eq_ok hcopy0]
     dsimp only [h, annealAggregateHooks, firstPlace, aggregateLiftPub, pure, EStateM.pure,
@@ -3759,7 +3847,10 @@ theorem writeRepeat_inplace_spec
     let st₁ : AnnealStepState :=
       { stack := ⟨#[tf]⟩, machine := inplaceMachine mach allocIdx allocId kind alloc₁ }
     have hcopy0 : h.copyOp () source firstPlace st₀ = .ok () st₁ := by
-      dsimp only [h, annealAggregateHooks, source]
+      dsimp only [h, annealAggregateHooks, source, firstPlace]
+      rw [hwf.elem_usesStructMemCopyDest_false]
+      simp only [Bool.and_false, Bool.false_eq_true, ↓reduceIte, annealReadImmediate,
+        pure, EStateM.pure, bind, EStateM.bind]
       exact hwrite₁
     rw [EStateM.bind_eq_ok hcopy0]
     dsimp only [h, annealAggregateHooks, firstPlace, aggregateLiftPub, pure, EStateM.pure,
@@ -3946,8 +4037,10 @@ theorem evalRvalue_repeat_simulation
         (annealAggregateHooks body.localDecls body.layouts).evalOperandAt ()
           (Miri.Interpreter.OperandPath.rvalue "operand") (translateOperand op) none m₀ =
         .error (.undefinedBehavior msg) m' := by
-      dsimp only [annealAggregateHooks]
-      rw [hm₀_eq, EStateM.bind_assoc_apply, EStateM.bind_eq_error heval_m]
+      rw [hm₀_eq, evalOperandAt_eq_of_immediate
+        (hop₀.evalOperand_immediate (m := { stack := ⟨#[topFrame₀]⟩, machine := m.machine })
+          rfl hframe₀ none),
+        EStateM.bind_eq_error heval_m]
     have hm_err : Miri.Interpreter.Step.evalStatement
         (annealStepHooks body.localDecls body.layouts) ()
         (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.repeat op count), span⟩) m =
@@ -3968,8 +4061,10 @@ theorem evalRvalue_repeat_simulation
         .ok ⟨.immediate (.scalar (.fromScalarInt msc)),
              translateTy { kind := elemKind, layoutIdx := 0 } body.layouts⟩
           { m with stack := ⟨#[topFrame₁]⟩ } := by
-      dsimp only [annealAggregateHooks]
-      rw [hm₀_eq, EStateM.bind_assoc_apply, EStateM.bind_eq_ok heval_m]
+      rw [hm₀_eq, evalOperandAt_eq_of_immediate
+        (hop₀.evalOperand_immediate (m := { stack := ⟨#[topFrame₀]⟩, machine := m.machine })
+          rfl hframe₀ none),
+        EStateM.bind_eq_ok heval_m]
       rfl
     obtain ⟨slot_dst₁, mls_dst₁, hlt_af_dst₁, hlt_dst₁, hslot_dst₁, hmls_dst₁, hmls_dst₁_eq, hloc_dst₁⟩ :=
       hframe₁.lookup_local hdecl_dst
@@ -4714,7 +4809,9 @@ theorem evalLM2_1ScalarOperand_with_indirect_dst
           (fun _ hj => (hj.cache_layout hlt_idx _).set_immediate hlt_idx_c .uninit),
           rfl, hrel_sc, hsz_sc, hbool_sc, hchar_sc⟩
         · dsimp only [annealAggregateHooks, translateOperand, translatePlace, List.map, List.toArray]
-          rw [EStateM.bind_eq_ok hlive, EStateM.bind_eq_ok hread, hcomm, helem]
+          rw [EStateM.bind_eq_ok hlive]
+          dsimp only
+          rw [EStateM.bind_eq_ok hread, hcomm, helem]
           rfl
         · intro hdisj
           apply MemoryAllocDisjoint.mono_immediate (tf := tf_c) (hdisj.cache_layout hlt_idx _)
@@ -4845,7 +4942,9 @@ theorem evalLM2_1ScalarOperand_for_agg_inplace
           (fun _ hj => (hj.cache_layout hlt_idx _).set_immediate hlt_idx_c .uninit),
           rfl, hrel_sc, hsz_sc, hbool_sc, hchar_sc⟩
         · dsimp only [annealAggregateHooks, translateOperand, translatePlace, List.map, List.toArray]
-          rw [EStateM.bind_eq_ok hlive, EStateM.bind_eq_ok hread, helem]
+          rw [EStateM.bind_eq_ok hlive]
+          dsimp only
+          rw [EStateM.bind_eq_ok hread, helem]
           rfl
         · intro hdisj
           apply MemoryAllocDisjoint.mono_immediate (tf := tf_c) (hdisj.cache_layout hlt_idx _)
@@ -4961,6 +5060,8 @@ theorem writeAggregate_dead_err
   | zero =>
     simp only [List.range', List.forIn_nil, pure_bind]
     dsimp only [annealAggregateHooks]
+    rw [hwf.arr_fields]
+    dsimp only
     rw [← EStateM.bind_assoc_apply]
     exact EStateM.bind_eq_error hens_err
   | succ n =>
@@ -5043,6 +5144,8 @@ theorem writeAggregate_pre_eq_alloc0
   | zero =>
     simp only [List.range', List.forIn_nil, pure_bind]
     dsimp only [annealAggregateHooks]
+    rw [hwf.arr_fields]
+    dsimp only
     rw [← EStateM.bind_assoc_apply, ← EStateM.bind_assoc_apply,
       EStateM.bind_eq_ok hens_pre, EStateM.bind_eq_ok hens_id]
   | succ n =>
@@ -5142,6 +5245,8 @@ theorem writeAggregate_loop_spec
       fun _ hj => hj, rfl, hsize_k, by simpa using hslice_k⟩
     simp only [List.range', List.forIn_nil, pure_bind]
     dsimp only [annealAggregateHooks]
+    rw [hwf.arr_fields]
+    dsimp only
     rw [← EStateM.bind_assoc_apply, EStateM.bind_eq_ok hens_id]
     rfl
   | cons op rest ih =>
@@ -5223,8 +5328,10 @@ theorem writeAggregate_loop_spec
             { stack := ⟨#[setFrameLocalIndirect tf_k1 dstIdx hlt_k1 (stackAllocPlace allocId)]⟩,
               machine := stackAllocMachine mach mem' allocId alloc_k } =
           .ok () st_k1 := by
-        dsimp only [h, annealAggregateHooks, annealReadImmediate, pure, EStateM.pure, bind,
-          EStateM.bind]
+        dsimp only [h, annealAggregateHooks, fieldPlace, elemLay]
+        rw [hwf.elem_usesStructMemCopyDest_false]
+        dsimp only [Bool.false_and, Bool.false_eq_true, ↓reduceIte, annealReadImmediate, pure,
+          EStateM.pure, bind, EStateM.bind]
         exact hwrite_k1
       have hstep_ok :
           aggLoopBody h () operands dest k PUnit.unit st_k =
@@ -5359,6 +5466,8 @@ theorem writeAggregate_inplace_loop_spec
       fun _ hj => hj, rfl, rfl, by simpa using hslice_k⟩
     simp only [List.range', List.forIn_nil, pure_bind]
     dsimp only [annealAggregateHooks]
+    rw [hwf.arr_fields]
+    dsimp only
     rw [← EStateM.bind_assoc_apply, EStateM.bind_eq_ok hens_id]
     rfl
   | cons op rest ih =>
@@ -5436,8 +5545,10 @@ theorem writeAggregate_inplace_loop_spec
             { stack := ⟨#[tf_k1]⟩,
               machine := inplaceMachine mach allocIdx allocId kind alloc_k } =
           .ok () st_k1 := by
-        dsimp only [h, annealAggregateHooks, annealReadImmediate, pure, EStateM.pure, bind,
-          EStateM.bind]
+        dsimp only [h, annealAggregateHooks, fieldPlace, elemLay]
+        rw [hwf.elem_usesStructMemCopyDest_false]
+        dsimp only [Bool.false_and, Bool.false_eq_true, ↓reduceIte, annealReadImmediate, pure,
+          EStateM.pure, bind, EStateM.bind]
         exact hwrite_k1
       have hstep_ok :
           aggLoopBody h () operands dest k PUnit.unit st_k =
@@ -5926,10 +6037,10 @@ private theorem annealProjectList_zero_array_ub
     {proj : ProjectionElem}
     (hproj : WellTypedArrayElemProj body s tf proj) :
     ∃ msg,
-      (annealProjectList (annealArrayProjectionCx tf body.layouts mach)
+      (annealProjectList (annealProjectionCx tf body.layouts mach)
         ⟨.indirect mp, translateTy arrTy body.layouts⟩ [translateProjectionElem proj]).mapError
         annealLiftProjectionError = .error (.undefinedBehavior msg) := by
-  let cx := annealArrayProjectionCx tf body.layouts mach
+  let cx := annealProjectionCx tf body.layouts mach
   let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
   have hbase_fields :
       base.layout.layout.fields =
@@ -6225,7 +6336,7 @@ theorem annealEvalOperand_projected_array_simulation
         have hm_err : annealEvalOperand body.localDecls body.layouts
             (translateOperand (arrayElemReadOperand isMove arrIdx proj)) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m.machine)
+          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [translateProjectionElem proj] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6262,7 +6373,7 @@ theorem annealEvalOperand_projected_array_simulation
         have hm_err : annealEvalOperand body.localDecls body.layouts
             (translateOperand (arrayElemReadOperand isMove arrIdx (.index idxLocal))) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6283,7 +6394,7 @@ theorem annealEvalOperand_projected_array_simulation
         have hm_err : annealEvalOperand body.localDecls body.layouts
             (translateOperand (arrayElemReadOperand isMove arrIdx (.index idxLocal))) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6331,7 +6442,7 @@ theorem annealEvalOperand_projected_array_simulation
           have hm_err : annealEvalOperand body.localDecls body.layouts
               (translateOperand (arrayElemReadOperand isMove arrIdx (.index idxLocal))) known m =
               .error (.undefinedBehavior msg) m' := by
-            cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+            cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
                 ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
             | ok _ => simp [hpl, Except.mapError] at hpl_err
             | error pe =>
@@ -6384,7 +6495,7 @@ theorem annealEvalOperand_projected_array_simulation
             (translateOperand (arrayElemReadOperand isMove arrIdx
               (.constantIndex offset minLength fromEnd))) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩
               [.ConstantIndex offset minLength fromEnd] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
@@ -6500,6 +6611,9 @@ theorem annealEvalPlace_projected_array_simulation
     rw [hget_eq]
   have hnot_empty : m.stack.currentFrame?.isNone = false := by
     rw [stack_currentFrame?_singleton m.stack topFrame hframes]; rfl
+  have hproj_elem : (∃ l, translateProjectionElem proj = .Index l) ∨
+      (∃ o mn fe, translateProjectionElem proj = .ConstantIndex o mn fe) := by
+    cases hproj <;> simp [translateProjectionElem]
   rcases harr_slot with hdead | huninit | ⟨elems, hinit_elems⟩
   · left
     rw [hdead] at hslot_arr; injection hslot_arr with hslot_eq; subst hslot_eq
@@ -6512,8 +6626,9 @@ theorem annealEvalPlace_projected_array_simulation
       refine ⟨Or.inl hdead, m', "projected write to dead local", ?_⟩
       dsimp only [translatePlace, List.map]
       unfold annealEvalPlace
-      simp [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
-        hnot_empty, hres_arr, hgop, throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+      rcases hproj_elem with ⟨_, htp⟩ | ⟨_, _, _, htp⟩ <;>
+        simp [htp, get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
+          hnot_empty, hres_arr, hgop, throw, throwThe, MonadExceptOf.throw, EStateM.throw]
     | immediate _ _ _ _ himm =>
       rcases himm with ⟨h, _⟩ | ⟨_, h, _⟩ <;> cases h
     | indirect _ _ _ _ hnot_dead _ =>
@@ -6530,8 +6645,9 @@ theorem annealEvalPlace_projected_array_simulation
         refine ⟨Or.inr (Or.inl huninit), m', "projected write to uninitialized local", ?_⟩
         dsimp only [translatePlace, List.map]
         unfold annealEvalPlace
-        simp [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
-          hnot_empty, hres_arr, hgop, throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+        rcases hproj_elem with ⟨_, htp⟩ | ⟨_, _, _, htp⟩ <;>
+          simp [htp, get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
+            hnot_empty, hres_arr, hgop, throw, throwThe, MonadExceptOf.throw, EStateM.throw]
       · cases hv
     | indirect _ mp _ _ _ hmp =>
       have hgop : topFrame'.getLocalOperand arrIdx = .ok (.indirect mp) := by
@@ -6543,22 +6659,25 @@ theorem annealEvalPlace_projected_array_simulation
       · refine ⟨Or.inr (Or.inl huninit), m', "access to uninitialized indirect place", ?_⟩
         dsimp only [translatePlace, List.map]
         unfold annealEvalPlace
-        simp [m', get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
-          hnot_empty, hres_arr, hgop, hchk_err, throw, throwThe, MonadExceptOf.throw,
-          EStateM.throw]
+        rcases hproj_elem with ⟨_, htp⟩ | ⟨_, _, _, htp⟩ <;>
+          simp [htp, m', get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
+            hnot_empty, hres_arr, hgop, hchk_err, throw, throwThe, MonadExceptOf.throw,
+            EStateM.throw]
       · obtain ⟨msg, hpl_err⟩ :=
           annealProjectList_zero_array_ub hframe' hnodup hwf mp hproj'
         refine ⟨Or.inr (Or.inl huninit), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m.machine)
+        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [translateProjectionElem proj] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
         | error pe =>
           simp only [hpl, Except.mapError, Except.error.injEq] at hpl_err
           dsimp only [translatePlace, List.map]
           unfold annealEvalPlace
-          simp [m', get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
-            hnot_empty, hres_arr, hgop, hchk_ok, hpl, hpl_err, throw, throwThe,
-            MonadExceptOf.throw, EStateM.throw]
+          rcases hproj_elem with ⟨_, htp⟩ | ⟨_, _, _, htp⟩ <;>
+            (rw [htp] at hpl ⊢;
+             simp [m', get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
+               hnot_empty, hres_arr, hgop, hchk_ok, hpl, hpl_err, throw, throwThe,
+               MonadExceptOf.throw, EStateM.throw])
   · rw [hinit_elems] at hslot_arr; injection hslot_arr with hslot_eq; subst hslot_eq
     obtain ⟨mp, _, rfl, _, hmp⟩ := hloc_arr.array_init_is_indirect hwf.arr_kind
     have hlen_elems : elems.length = count := by
@@ -6582,7 +6701,7 @@ theorem annealEvalPlace_projected_array_simulation
       · left
         obtain ⟨_, hw_ub, msg, hpl_err⟩ := hdead_idx (Or.inl hdead_i)
         refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
         | error pe =>
@@ -6595,7 +6714,7 @@ theorem annealEvalPlace_projected_array_simulation
       · left
         obtain ⟨_, hw_ub, msg, hpl_err⟩ := hdead_idx (Or.inr huninit_i)
         refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
         | error pe =>
@@ -6620,7 +6739,7 @@ theorem annealEvalPlace_projected_array_simulation
         · left
           obtain ⟨_, hw_ub, msg, hpl_err⟩ := hoob_idx idxSc hslot_idx (Nat.le_of_not_lt hlt_c)
           refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6670,7 +6789,7 @@ theorem annealEvalPlace_projected_array_simulation
       · left
         obtain ⟨_, hw_ub, msg, hpl_err⟩ := hoob_c (Nat.lt_of_not_le hle_min)
         refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
+        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩
             [.ConstantIndex offset minLength fromEnd] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
@@ -6914,10 +7033,10 @@ theorem step_assign_malformed_constantIndex_invalidProgram
       dsimp only [translateStmtKind, translatePlace, List.map, List.toArray,
         translateRvalue, annealStepHooks]
       apply runRvalue_eq_of_eq
-      unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+      unfold Miri.Interpreter.evalRvalueIntoPlace
+      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
       rw [EStateM.bind_eq_ok hevalPlace_dst]
-      exact EStateM.bind_assoc_apply _ _ _ m₀
+      exact bind_copyOp_eq_of_immediate (fun _ _ hev => by rw [hop_err] at hev; cases hev)
     have hm_err_op :
         (annealEvalOperand body.localDecls body.layouts (translateOperand readOp)
           (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) m₀ =
@@ -7013,7 +7132,7 @@ theorem annealWriteImmediate_array_elem_set
     obtain ⟨hnodup', hlive', hother_live⟩ := hset_prop ⟨kind, alloc'⟩
     let mach' : AnnealMachine := inplaceMachine mach allocIdx allocId kind alloc'
     have hoff_eq :
-        elemMp.ptr.offset =
+        Miri.ABI.Size.ofBytes (elemMp.ptr.offset.bytes - baseAddr) =
         Miri.ABI.Size.ofBytes
           (relOffset.bytes + UInt64.ofNat (idx * elemLay.layout.size.bytes.toNat)) := by
       have hbytes : mp.ptr.offset.bytes = baseAddr + relOffset.bytes := by rw [hptr]; rfl
@@ -7025,10 +7144,11 @@ theorem annealWriteImmediate_array_elem_set
     have hw_ok : annealWriteImmediate (.scalar (.fromScalarInt msc)) ⟨.memory elemMp, elemLay⟩
         { stack := ⟨#[tf]⟩, machine := mach } =
         .ok () { stack := ⟨#[tf]⟩, machine := mach' } := by
-      unfold annealWriteImmediate
+      unfold annealWriteImmediate annealWriteIndirectImmediate
       simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
         stack_currentFrame?_singleton ⟨#[tf]⟩ tf rfl, hprov_e, Option.bind_some,
-        Miri.Memory.Provenance.getAllocId, hbase, hfindIdx, hgetIdx, hoff_eq,
+        Miri.Memory.Provenance.getAllocId, hbase, hfindIdx, hgetIdx,
+        Miri.ABI.Size.ZERO, UInt64.add_zero, hoff_eq,
         hmsc_sz, hwrite, pure, set, MonadStateOf.set, EStateM.set]
       rfl
     have hmp' : MemPlaceRel mach' arrDecl.ty body.layouts
@@ -7304,10 +7424,11 @@ theorem step_assign_array_element_simulation
       dsimp only [translateStmtKind, translatePlace, List.map, List.toArray,
         translateRvalue, annealStepHooks]
       apply runRvalue_eq_of_eq
-      unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+      unfold Miri.Interpreter.evalRvalueIntoPlace
+      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
       rw [EStateM.bind_eq_ok hevalPlace_dst]
-      exact EStateM.bind_assoc_apply _ _ _ m₀
+      exact bind_copyOp_eq_of_not_usesStructMemCopyDest
+        (by dsimp only [destPlace]; rw [hdst_ty]; exact hwf.elem_usesStructMemCopyDest_false _) m₀
     rcases annealEvalOperand_projected_array_simulation hstate₀ rfl hnodup isMove
         (some (translateTy dstDecl.ty body.layouts)) hdecl_arr hwf hproj₀ harr_slot with
       ⟨ha_ub_op, m', msg, hm_err_op⟩ |
@@ -7478,10 +7599,10 @@ theorem step_assign_array_element_simulation
         dsimp only [translateStmtKind, translateRvalue, annealStepHooks]
         rw [← hm₀_eq]
         apply runRvalue_eq_of_eq
-        unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+        unfold Miri.Interpreter.evalRvalueIntoPlace
+        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
         rw [EStateM.bind_eq_ok hevalPlace_ok]
-        exact EStateM.bind_assoc_apply _ _ _ _
+        exact bind_copyOp_eq_of_not_usesStructMemCopyDest (hwf.elem_usesStructMemCopyDest_false _) _
       have hop₀ : WellTypedLM2_1ScalarOperand body topFrame₀ srcOp elemTy :=
         hop.mono_immediate hmono₀
       rcases evalLM2_1ScalarOperand_preserves_array_local hframe₀ hdisj₀ hdecl_arr hwf hprim hop₀
@@ -7682,10 +7803,10 @@ theorem step_assign_array_element_simulation
         dsimp only [translateStmtKind, translateRvalue, annealStepHooks]
         rw [← hm₀_eq]
         apply runRvalue_eq_of_eq
-        unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+        unfold Miri.Interpreter.evalRvalueIntoPlace
+        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
         rw [EStateM.bind_eq_ok hevalPlace_ok]
-        exact EStateM.bind_assoc_apply _ _ _ _
+        exact bind_copyOp_eq_of_not_usesStructMemCopyDest (hwf_dst.elem_usesStructMemCopyDest_false _) _
       have hretCont₀ : topFrame₀.returnContinuation = .stop false := by
         rw [htf₀_eq]; exact hretCont
       have hretPlace₀ : ∃ rl, topFrame₀.returnPlace =
@@ -8108,10 +8229,10 @@ theorem step_scalar_preserves_nodup
         dsimp only [translateStmtKind, translatePlace, List.map, List.toArray,
           translateRvalue, annealStepHooks]
         apply runRvalue_eq_of_eq
-        unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+        unfold Miri.Interpreter.evalRvalueIntoPlace
+        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
         rw [EStateM.bind_eq_ok hevalPlace_dst]
-        exact EStateM.bind_assoc_apply _ _ _ m₀
+        exact bind_copyOp_eq_of_immediate (hop.evalOperand_immediate rfl hframe₀ _)
       generalize ha_op : evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil = aOp at hop_sim
       generalize hm_op : (annealEvalOperand body.localDecls body.layouts (translateOperand op)
         (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) m₀ = mOp at hop_sim
@@ -8462,6 +8583,8 @@ theorem step_lm1_4_preserves_nodup_and_immediate
       subst hbor hprot
       rfl
     dsimp only at hmem_same
+    obtain ⟨_, mls_src, hlt_af_src, hlt_src, hslot_src, hmls_src, hmls_src_eq, hloc_src⟩ :=
+      hframe₀.lookup_local hdecl_src
     have hm_eval : Miri.Interpreter.Step.evalStatement
         (annealStepHooks body.localDecls body.layouts) ()
         (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩) m =
@@ -8473,12 +8596,23 @@ theorem step_lm1_4_preserves_nodup_and_immediate
       dsimp only [translateStmtKind, translatePlace, translateOperand, List.map, List.toArray,
         translateRvalue, annealStepHooks]
       apply runRvalue_eq_of_eq
-      unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+      unfold Miri.Interpreter.evalRvalueIntoPlace
+      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
       rw [EStateM.bind_eq_ok hevalPlace_dst]
-      exact EStateM.bind_assoc_apply _ _ _ m₀
-    obtain ⟨_, mls_src, hlt_af_src, hlt_src, hslot_src, hmls_src, hmls_src_eq, hloc_src⟩ :=
-      hframe₀.lookup_local hdecl_src
+      refine bind_copyOp_eq_of_immediate (fun src m₁ heval => ?_)
+      cases hloc_src with
+      | dead cl hcl =>
+        rw [annealEvalOperand_move_dead (m := m₀) rfl hlt_src hdecl_src hmls_src_eq
+          (fun l hl => hcl l hl)] at heval
+        cases heval
+      | indirect _ mp _ _ _ _ =>
+        exact absurd rfl (hmono₀ srcIdx himm_src _ hmls_src mp)
+      | immediate _ imm cl hcl _ =>
+        rw [annealEvalOperand_move_live (m := m₀) rfl hlt_src hdecl_src hmls_src_eq
+          (fun l hl => hcl l hl)] at heval
+        injection heval with hsrc _
+        subst hsrc
+        exact ⟨imm, rfl⟩
     cases hloc_src with
     | dead cl hcl =>
       have hm_err : Miri.Interpreter.Step.evalStatement
