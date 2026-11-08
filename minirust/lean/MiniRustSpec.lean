@@ -27,6 +27,8 @@ import MiniRustSpec.Correspondence.RefWitness
 import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
+import MiniRustSpec.Correspondence.IntrinsicFallback
+import MiniRustSpec.Correspondence.IntrinsicBoundary
 import MiniRustSpec.Audit
 
 /-!
@@ -52,7 +54,14 @@ import MiniRustSpec.Audit
   `Correspondence.TbWitness` compare Anneal, `Machine<BasicMemory>`, and
   `Machine<TreeBorrowsMemory>` on concrete raw pointer, reference, reborrowing,
   safe-pointer validity, `CastKind.transmute`, `Box<T>`, `UnsafeCell<T>`,
-  `IntPtrCast`, and Tree Borrows programs.
+  `IntPtrCast`, and Tree Borrows programs; `Correspondence.Provenance` and
+  `Correspondence.ProvenanceWitness` cover the integer-pointer provenance casts;
+  the multi-function relation (`Terminator::Call`, call stacks, and the
+  `Assume` intrinsic) is proven in `Correspondence.Simulation` and
+  `Correspondence.Run`, with witnesses for intrinsic calls that resolve to MIR
+  fallback bodies (`Correspondence.IntrinsicFallback`) and boundary witnesses
+  for the intrinsic constructs outside the fragment
+  (`Correspondence.IntrinsicBoundary`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

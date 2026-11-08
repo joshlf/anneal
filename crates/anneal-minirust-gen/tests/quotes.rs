@@ -540,7 +540,7 @@ fn quotations_occur_upstream() {
     );
     // The interpretation and the translation quote dozens of upstream items;
     // a sudden drop means the extraction above broke.
-    assert!(total >= 140, "only {total} quotations found");
+    assert!(total >= 170, "only {total} quotations found");
 
     // Every spec-transcribing `def` in `Interp.lean` (after `/-! ## Target`,
     // except the Lean recursion/iteration helpers `countOnesLoop` and `steps`)
@@ -2326,6 +2326,627 @@ fn mr_3_2_reference_quotations_are_pinned_and_tamper_checked() {
         assert!(
             missing_piece_in(&corpus, Some(cited_file), tampered).is_some(),
             "tampered quotation unexpectedly found in `{cited_file}`: {tampered}"
+        );
+    }
+}
+
+#[test]
+fn call_return_and_multi_fn_quotations_are_pinned() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let ptr = "spec/mem/pointer.md";
+    let types = "spec/lang/types.md";
+    let exprs = "spec/lang/step/expressions.md";
+    let mach = "spec/lang/machine.md";
+    let terms = "spec/lang/step/terminators.md";
+    let bb = "tooling/minimize/src/bb.rs";
+    let prog = "tooling/minimize/src/program.rs";
+    let ty_rs = "tooling/minimize/src/ty.rs";
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            ptr,
+            "pub fn meta_kind(self) -> PointerMetaKind { \
+                 match self { \
+                     PtrType::Ref { pointee, .. } | PtrType::Box { pointee, .. } => pointee.layout.meta_kind(), \
+                     PtrType::Raw { meta_kind, .. } => meta_kind, \
+                     PtrType::FnPtr | PtrType::VTablePtr(_) => PointerMetaKind::None, \
+                 } \
+             }",
+            "PtrType::FnPtr | PtrType::VTablePtr(_) => PointerMetaKind::ElementCount,",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            types,
+            "Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(T::PTR_SIZE, T::PTR_ALIGN), \
+             Ptr(_) => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN), .. \
+             Array { elem, count } => Sized( \
+                 elem.layout::<T>().expect_size(\"WF ensures array element is sized\") * count, \
+                 elem.layout::<T>().expect_align(\"WF ensures array element is sized\"), \
+             ),",
+            "Ptr(p) if p.meta_kind() == PointerMetaKind::None => Sized(libspecr::Int::from(2) * T::PTR_SIZE, T::PTR_ALIGN),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "Constant::FnPointer(fn_name) => { let ptr = self.fn_ptrs[fn_name]; Value::Ptr(ptr.widen(None)) }",
+            "Constant::FnPointer(fn_name) => { let ptr = self.fn_ptrs[fn_name]; Value::Ptr(ptr.widen(Some(0))) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            mach,
+            "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> { \
+                 if let Value::Ptr(Pointer { thin_pointer: thin_ptr, metadata }) = ptr { \
+                     if metadata.is_some() { \
+                         throw_ub!(\"invalid pointer for function lookup\"); \
+                     }",
+            "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Method> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn check_abi_compatibility( caller_ty: Type, callee_ty: Type, ) -> bool {",
+            "fn check_abi_compatibility( caller_ty: Type, callee_ty: Type, ) -> Result<bool> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn prepare_for_inplace_passing( &mut self, place: Place<M>, ty: Type, ) -> NdResult {",
+            "fn prepare_for_in_place_passing( &mut self, place: Place<M>, ty: Type, ) -> NdResult {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn eval_argument( &mut self, val: ArgumentExpr, ) -> NdResult<(Value<M>, Type)> {",
+            "fn eval_argument( &mut self, val: ValueExpr, ) -> NdResult<(Value<M>, Type)> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn create_frame( \
+                 &mut self, \
+                 func: Function, \
+                 stack_pop_action: StackPopAction<M>, \
+                 caller_conv: CallingConvention, \
+                 caller_ret_ty: Type, \
+                 caller_args: List<(Value<M>, Type)>, \
+             ) -> NdResult<StackFrame<M>> {",
+            "fn create_frame( &mut self, func: Function, arg_vals: List<Place<M>>, ) -> NdResult<StackFrame<M>> {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "fn eval_call( \
+                 &mut self, \
+                 callee: Function, \
+                 caller_conv: CallingConvention, \
+                 arguments: List<(Value<M>, Type)>, \
+                 caller_ret: (Place<M>, Type), \
+                 next_block: Option<BbName>, \
+                 unwind_block: Option<BbName>, \
+             ) -> NdResult {",
+            "fn eval_call(&mut self, func: FnName, caller_conv: CallingConvention) -> NdResult {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Terminator",
+            "Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Statement",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "StackPopAction::BackToCaller { ret_val_ptr: caller_ret_ptr, next_block, .. } => {",
+            "StackPopAction::BackToCaller { ret_val_ptr: caller_ret_ptr, next_block } => {",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            prog,
+            "let entry_name = FnName(Name::from_internal(0)); \
+             self.fn_name_map.insert(entry_instance, entry_name);",
+            "let entry_name = FnName(Name::from_internal(1)); \
+             self.fn_name_map.insert(entry_instance, entry_name);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "match &x.node { \
+                 rs::Operand::Move(place) => \
+                     ArgumentExpr::InPlace(self.translate_place(&place, x.span)), \
+                 op => ArgumentExpr::ByValue(self.translate_operand(op, x.span)), \
+             }",
+            "rs::Operand::Move(place) => ArgumentExpr::ByValue(self.translate_place(&place, x.span)),",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::UnwindAction::Continue => { .. \
+                 let block_kind = BbKind::Cleanup; \
+                 let unwind_bb_name = self.fresh_bb_name(); \
+                 let unwind_bb = BasicBlock { \
+                     statements: list![], \
+                     terminator: Terminator::ResumeUnwind, \
+                     kind: block_kind, \
+                 };",
+            "rs::UnwindAction::Continue => { let block_kind = BbKind::Regular;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let unwind_block = Some(self.translate_unwind_action(unwind, bb)); .. \
+             build::fn_ptr(self.cx.get_fn_name(instance)) .. \
+             Terminator::Call { \
+                 callee, \
+                 calling_convention: conv, \
+                 arguments: args, \
+                 ret: self.translate_place(&destination, span), \
+                 next_block: target.as_ref().map(|t| self.bb_name_map[t]), \
+                 unwind_block, \
+             }",
+            "let unwind_block = None; Terminator::Call { callee,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            prog,
+            "fn mk_start_fn(entry: u32) -> Function { \
+                 let b0_name = BbName(Name::from_internal(0)); \
+                 let b1_name = BbName(Name::from_internal(1)); \
+                 let b2_name = BbName(Name::from_internal(2)); \
+                 let l0_name = LocalName(Name::from_internal(0));",
+            "fn mk_start_fn(entry: u64) -> Function {",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            prog,
+            "let number_of_fns = self.fn_name_map.len(); \
+             let start = FnName(Name::from_internal(number_of_fns as _)); \
+             self.functions.insert(start, mk_start_fn(0)); \
+             Program { \
+                 start, \
+                 functions: self.functions, \
+                 globals: self.globals, \
+                 vtables: self.vtables, \
+                 traits: self.traits, \
+             }",
+            "self.functions.insert(start, mk_start_fn(1));",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            ty_rs,
+            "pub fn translate_calling_convention(conv: rs::CanonAbi) -> CallingConvention { \
+                 match conv { \
+                     rs::CanonAbi::C => CallingConvention::C, \
+                     rs::CanonAbi::Rust => CallingConvention::Rust, \
+                     .. \
+                 } \
+             }",
+            "rs::CanonAbi::C => CallingConvention::Rust,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let abi = self \
+                 .cx \
+                 .tcx \
+                 .fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty()))) \
+                 .unwrap(); \
+             let conv = translate_calling_convention(abi.conv);",
+            ".fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty()))) \
+                 .unwrap(); \
+             let conv = CallingConvention::Rust;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            prog,
+            "pub fn get_fn_name(&mut self, key: rs::Instance<'tcx>) -> FnName { \
+                 let len = self.fn_name_map.len(); \
+                 *self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(len as _))) \
+             }",
+            "*self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(0)))",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 20, "expected 20 pinned MR-4.1 quotations");
+
+    let mr41_files = [ptr, types, exprs, mach, terms, bb, prog, ty_rs];
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        for other in mr41_files {
+            if other != *file {
+                assert!(
+                    missing_piece_in(&corpus, Some(other), genuine).is_some(),
+                    "quotation from `{file}` also matches `{other}`: {genuine}"
+                );
+            }
+        }
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let extracted = extract_quotes(&lean, &valid_paths)
+            .unwrap_or_else(|e| panic!("extract_quotes failed on `{lean_file}`: {e:?}"));
+        let pieces: Vec<String> = strip_line_comments(genuine)
+            .split("..")
+            .map(squash)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matched_in_lean = extracted.iter().any(|q| {
+            if q.cited_file != *file {
+                return false;
+            }
+            let q_squashed = squash(&strip_line_comments(&q.text));
+            let mut pos = 0usize;
+            for piece in &pieces {
+                let Some(j) = q_squashed[pos..].find(piece.as_str()) else {
+                    return false;
+                };
+                pos += j + piece.len();
+            }
+            true
+        });
+        assert!(
+            matched_in_lean,
+            "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
+        );
+    }
+}
+
+#[test]
+fn intrinsic_and_assume_quotations_are_pinned() {
+    let corpus = corpus();
+    let valid_paths: BTreeSet<String> = corpus.iter().map(|(p, _)| p.clone()).collect();
+    let intr = "spec/lang/step/intrinsics.md";
+    let terms = "spec/lang/step/terminators.md";
+    let exprs = "spec/lang/step/expressions.md";
+    let prelude = "spec/prelude/main.md";
+    let basic = "spec/mem/basic.md";
+    let intptr = "spec/mem/intptrcast.md";
+    let wf = "spec/lang/well-formed.md";
+    let bb = "tooling/minimize/src/bb.rs";
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            intr,
+            "fn unit_value<M: Memory>() -> Value<M> { Value::Tuple(list![]) }",
+            "fn unit_value<M: Memory>() -> Value<M> { Value::Tuple(list![Value::Bool(true)]) }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "fn unit_type() -> Type { \
+                 Type::Tuple { sized_fields: list![], sized_head_layout: TupleHeadLayout { \
+                     end: Size::ZERO, align: Align::ONE, packed_align: None, \
+                 }, unsized_field: None } \
+             }",
+            "end: Size::ZERO, align: Align::ONE, packed_align: Some(Align::ONE),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "if !b { \
+                 throw_ub!(\"`Assume` intrinsic called on condition that is violated\"); \
+             } \
+             ret(unit_value())",
+            "if b { throw_ub!(\"`Assume` intrinsic called on condition that is violated\"); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "IntrinsicOp::Abort: IntrinsicOp, \
+             arguments: List<(Value<M>, Type)>, \
+             ret_ty: Type, \
+             ) -> NdResult<Value<M>> { \
+                 throw_abort!(); \
+             }",
+            "IntrinsicOp::Abort: IntrinsicOp, \
+             arguments: List<(Value<M>, Type)>, \
+             ret_ty: Type, \
+             ) -> NdResult<Value<M>> { \
+                 throw_ub!(\"abort\"); \
+             }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "fn exit(&self) -> NdResult<!> { .. self.mem.leak_check()?; .. throw_machine_stop!(); }",
+            "fn exit(&self) -> NdResult<!> { throw_machine_stop!(); }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "Value::Int(i) => write!(stream, \"{}\\n\", i).unwrap(), \
+             Value::Bool(b) => write!(stream, \"{}\\n\", b).unwrap(), \
+             _ => throw_ub!(\"unsupported value for printing\"),",
+            "Value::Int(i) => write!(stream, \"{}\", i).unwrap(),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "self.intptrcast.expose(ptr); ret(Value::Int(ptr.addr))",
+            "self.intptrcast.expose(ptr); ret(Value::Int(ptr.addr + 1))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "Terminator::Intrinsic { intrinsic, arguments, ret: ret_expr, next_block }: Terminator \
+             ) -> NdResult { \
+                 let (ret_place, ret_ty) = self.eval_place(ret_expr)?; \
+                 let arguments = arguments.try_map(|arg| self.eval_value(arg))?; \
+                 let value = self.eval_intrinsic(intrinsic, arguments, ret_ty)?; \
+                 self.place_store(ret_place, value, ret_ty)?;",
+            "let value = self.eval_intrinsic(intrinsic, arguments, ret_ty)?; \
+             self.place_store(ret_place, value, unit_type())?;",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            terms,
+            "throw_ub!(\"return from an intrinsic where caller did not specify next block\");",
+            "throw_ub!(\"return from an intrinsic where callee did not specify next block\");",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            exprs,
+            "let aligned = self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr); \
+             ret((Place { ptr, aligned }, ty))",
+            "ret((Place { ptr, aligned: true }, ty))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            prelude,
+            "macro_rules! throw_abort { () => { do yeet TerminationInfo::Abort } }",
+            "macro_rules! throw_abort { () => { do yeet TerminationInfo::MachineStop } }",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            basic,
+            "match allocation.kind { .. Heap => throw_memory_leak!(), .. \
+                 Global | Function | Stack | VTable => {} \
+             }",
+            "Stack => throw_memory_leak!(),",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intptr,
+            "pub fn expose(&mut self, ptr: ThinPointer<Provenance>) { \
+                 if let Some(provenance) = ptr.provenance { .. \
+                     self.exposed.insert(provenance); \
+                 } \
+             }",
+            "if let Some(provenance) = ptr.provenance { self.exposed.remove(provenance);",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            bb,
+            "enum StatementResult { \
+                 Statement(Statement), \
+                 Intrinsic { intrinsic: IntrinsicOp, destination: PlaceExpr, arguments: List<ValueExpr> }, \
+             }",
+            "Intrinsic { intrinsic: IntrinsicOp, arguments: List<ValueExpr> },",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::NonDivergingIntrinsic::Assume(op) => { \
+                 let op = self.translate_operand(op, span); .. \
+                 let destination = build::unit_place(); \
+                 return StatementResult::Intrinsic { \
+                     intrinsic: IntrinsicOp::Assume, \
+                     destination, \
+                     arguments: list![op], \
+                 }; \
+             }",
+            "return StatementResult::Intrinsic { \
+                 intrinsic: IntrinsicOp::Abort, \
+                 destination, \
+                 arguments: list![op], \
+             };",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "StatementResult::Intrinsic { intrinsic, destination, arguments } => { .. \
+                 let next_bb = self.fresh_bb_name(); .. \
+                 let terminator = Terminator::Intrinsic { \
+                     intrinsic, \
+                     arguments, \
+                     ret: destination, \
+                     next_block: Some(next_bb), \
+                 };",
+            "let terminator = Terminator::Intrinsic { \
+                 intrinsic, \
+                 arguments, \
+                 ret: destination, \
+                 next_block: None, \
+             };",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb); \
+             for stmt in stmts.iter() { \
+                 cur_block_statements.push(stmt); \
+             }",
+            "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb); \
+             let cur_block =",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) => \
+                 rs::span_bug!(span, \"NonDivergingIntrinsic not supported: {intrinsic:?}\"),",
+            "rs::NonDivergingIntrinsic::CopyNonOverlapping(_) => StatementResult::Statement(",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            intr,
+            "fn load_raw_data(&mut self, ptr : Pointer<<M as Memory>::Provenance>, ptr_ty : PtrType) -> Result<List<u8>> { \
+                 let PtrType::Ref { pointee, .. } = ptr_ty else { \
+                     throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\"); \
+                 }; .. \
+                 let Some(data) = bytes.try_map(|byte| byte.data()) else { \
+                     throw_ub!(\"invalid argument to `RawEq` intrinsic: byte is uninitialized\"); \
+                 };",
+            "let PtrType::Raw { .. } = ptr_ty else { \
+                 throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\");",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            intr,
+            "IntrinsicOp::RawEq: IntrinsicOp, .. \
+             if l_ty != r_ty { \
+                 throw_ub!(\"invalid arguments to `RawEq` intrinsic: types of arguments are not identical\"); \
+             } .. \
+             let left_data = self.load_raw_data(left, l_ty)?; \
+             let right_data = self.load_raw_data(right, l_ty)?; \
+             ret(Value::Bool(left_data == right_data))",
+            "ret(Value::Bool(left_data != right_data))",
+            "MiniRustSpec/Interp.lean",
+        ),
+        (
+            bb,
+            "struct TerminatorResult { \
+                 stmts: List<Statement>, \
+                 terminator: Terminator, \
+             }",
+            "struct TerminatorResult { terminator: Terminator }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::raw_eq => \
+                 return TerminatorResult { \
+                     stmts: List::new(), \
+                     terminator: Terminator::Intrinsic { \
+                         intrinsic: IntrinsicOp::RawEq,",
+            "rs::sym::raw_eq => return TerminatorResult { stmts: List::new(), terminator: Terminator::Goto(",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::ctpop => { .. \
+                 let val = build::count_ones(v); \
+                 let stmt = Statement::Assign { destination, source: val }; \
+                 let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]); .. \
+             } \
+             rs::sym::exact_div => { .. \
+                 let val = build::div_exact(l, r); \
+                 let stmt = Statement::Assign { destination, source: val };",
+            "rs::sym::ctpop => { let val = build::div_exact(v, v);",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::cold_path => { .. \
+                 let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]); \
+                 return TerminatorResult { stmts: list![], terminator }; \
+             }",
+            "rs::sym::cold_path => { let terminator = build::abort();",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            bb,
+            "rs::sym::abort => { \
+                 let terminator = build::abort(); \
+                 TerminatorResult { stmts: list![], terminator } \
+             }",
+            "rs::sym::abort => { let terminator = Terminator::Unreachable;",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> { \
+                 let Some(next_block) = self.blocks.get(next_block_name) else { \
+                     throw_ill_formed!(\"Terminator: next block does not exist\"); \
+                 }; \
+                 ensure_wf( \
+                     next_block.kind == expected_block_kind, \
+                     \"Terminator: next block has the wrong block kind\", \
+                 )?; \
+                 ret(()) \
+             }",
+            "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> { ret(()) }",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "fn check_unwind_block(self, current_block_kind: BbKind, unwind_block_name: BbName) -> Result<()> { \
+                 let expected_block_kinds = match current_block_kind { \
+                     BbKind::Regular => list![BbKind::Cleanup, BbKind::Catch], \
+                     BbKind::Cleanup | BbKind::Terminate => list![BbKind::Terminate], \
+                     BbKind::Catch => throw_ill_formed!(\"Terminator: unwinding is not allowed in a catch block\"), \
+                 };",
+            "BbKind::Regular => list![BbKind::Regular],",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+        (
+            wf,
+            "let Some(start) = self.functions.get(self.start) else { \
+                 throw_ill_formed!(\"Program: start function does not exist\"); \
+             }; \
+             ensure_wf(start.calling_convention == CallingConvention::C, \"Program: start function has invalid calling convention\")?; \
+             let ret_layout = start.locals[start.ret].layout::<T>(); \
+             ensure_wf( \
+                 ret_layout == LayoutStrategy::Sized(Size::ZERO, Align::ONE), \
+                 \"Program: start function return local has invalid layout\" \
+             )?; \
+             ensure_wf(start.args.is_empty(), \"Program: start function has arguments\")?;",
+            "ensure_wf(start.calling_convention == CallingConvention::Rust,",
+            "MiniRustSpec/Correspondence/Translate.lean",
+        ),
+    ];
+    assert_eq!(cases.len(), 28, "expected 28 pinned MR-4.2 quotations");
+
+    let mr42_files = [intr, terms, exprs, prelude, basic, intptr, wf, bb];
+    let lean_root = minirust_dir().join("lean");
+    for (file, genuine, tampered, lean_file) in cases {
+        assert_eq!(
+            missing_piece_in(&corpus, Some(file), genuine),
+            None,
+            "genuine quotation not found in `{file}`: {genuine}"
+        );
+        assert!(
+            missing_piece_in(&corpus, Some(file), tampered).is_some(),
+            "tampered quotation unexpectedly found in `{file}`: {tampered}"
+        );
+        for other in mr42_files {
+            if other != *file {
+                assert!(
+                    missing_piece_in(&corpus, Some(other), genuine).is_some(),
+                    "quotation from `{file}` also matches `{other}`: {genuine}"
+                );
+            }
+        }
+        let lean = std::fs::read_to_string(lean_root.join(lean_file)).unwrap();
+        let extracted = extract_quotes(&lean, &valid_paths)
+            .unwrap_or_else(|e| panic!("extract_quotes failed on `{lean_file}`: {e:?}"));
+        let pieces: Vec<String> = strip_line_comments(genuine)
+            .split("..")
+            .map(squash)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let matched_in_lean = extracted.iter().any(|q| {
+            if q.cited_file != *file {
+                return false;
+            }
+            let q_squashed = squash(&strip_line_comments(&q.text));
+            let mut pos = 0usize;
+            for piece in &pieces {
+                let Some(j) = q_squashed[pos..].find(piece.as_str()) else {
+                    return false;
+                };
+                pos += j + piece.len();
+            }
+            true
+        });
+        assert!(
+            matched_in_lean,
+            "`{lean_file}` has no extracted block quote citing `{file}` that contains all pieces of `{genuine}`"
         );
     }
 }

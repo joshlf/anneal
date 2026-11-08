@@ -3685,7 +3685,6 @@ theorem evalStmt_placeMention_place (s : MachineState) (decls : List LocalDecl)
       .tau (.running (advanceStmt s s.frame.locals)) :=
   evalStmt_placeMention s decls layouts p.local_ p.projection span _hslots hn hi hlive0
 
-
 /-- Anneal's `StorageLive(_i)`: the slot becomes `.uninit`. -/
 theorem evalStmt_storageLive (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (i : Nat) (span : String) (hi : i < s.frame.locals.length) :
@@ -4694,5 +4693,357 @@ theorem stepMirFn_term (body : CapturedMir) (s : MachineState) (bb : BasicBlockD
     (hlen : s.frame.stmtIdx = bb.statements.length) :
     stepMirFn body s = evalTerminator s bb.terminator (some body) := by
   simp [stepMirFn, hcallee, hphase, get?, hbb, hlen, length]
+
+/-! ## Multi-frame `TerminatorKind.call` and `return_` evaluation -/
+
+theorem stepMirFn_active_stmt (entry curBody : CapturedMir) (s : MachineState)
+    (bb : BasicBlockData) (stmt : MirAst.Statement)
+    (hcur : s.memory.activeCallee.getD entry = curBody)
+    (hphase : curBody.phase = .runtimePostCleanup)
+    (hbb : curBody.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hst : bb.statements[s.frame.stmtIdx]? = some stmt) :
+    stepMirFn entry s = evalStmt s stmt curBody.localDecls curBody.layouts := by
+  simp [stepMirFn, hcur, hphase, get?, hbb, hst]
+
+theorem stepMirFn_active_term (entry curBody : CapturedMir) (s : MachineState)
+    (bb : BasicBlockData)
+    (hcur : s.memory.activeCallee.getD entry = curBody)
+    (hphase : curBody.phase = .runtimePostCleanup)
+    (hbb : curBody.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hlen : s.frame.stmtIdx = bb.statements.length) :
+    stepMirFn entry s = evalTerminator s bb.terminator (some curBody) := by
+  simp [stepMirFn, hcur, hphase, get?, hbb, hlen, length]
+
+theorem extractCalleeDefPath?_of_extractFnDefPath {func : Operand} {dp : String}
+    (h : extractFnDefPath func = some dp) :
+    MirSemantics.extractCalleeDefPath? func = some dp := by
+  cases func with
+  | constant c =>
+    simp only [extractFnDefPath] at h
+    cases hk : c.ty.kind <;> simp_all [MirSemantics.extractCalleeDefPath?]
+  | copy _ | move _ => simp [extractFnDefPath] at h
+
+theorem SlotsOk.set_uninit {decls : List LocalDecl} {locals : List LocalSlot}
+    (h : SlotsOk layouts decls locals) (j : Nat) :
+    SlotsOk layouts decls (locals.set j .uninit) := by
+  intro i d slot hd hs
+  by_cases hij : i = j
+  · subst hij
+    have hilt : i < locals.length := by
+      have hlen := (List.getElem?_eq_some_iff.mp hs).1
+      rwa [List.length_set] at hlen
+    rw [List.getElem?_set_self hilt, Option.some.injEq] at hs
+    subst hs
+    exact declSlotOk_uninit d layouts
+  · rw [List.getElem?_set_ne (Ne.symm hij)] at hs
+    exact h i d slot hd hs
+
+/-- Evaluating a single fragment call argument `op` in Anneal's `evalOperand`:
+agrees with `callArgVal`, updates `locals` by `opMoveLocal`, and preserves
+`SlotsOk` while producing a `SlotOk (tyOf pd)` argument value. -/
+theorem evalCallOperand_spec {decls : List LocalDecl} {locals : List LocalSlot}
+    (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
+    {pd : LocalDecl} {op : Operand} {argExpr : Gen.ArgumentExpr}
+    (hdecls : decls.all (fun d => (scalarTypeOf d.ty).isSome) = true)
+    (hok : callArgOk layouts decls pd op = true) (htr : translateCallArg decls op = some argExpr)
+    (borrows : List BorrowEntry) (globals : List MirAst.CapturedAllocation)
+    (evalLayouts : Layout.LayoutTable) (callerLocals : List LocalSlot) :
+    (∀ v, callArgVal locals op = some v →
+      evalOperand locals op borrows globals evalLayouts callerLocals =
+        .ok v (opMoveLocal locals op) ∧
+      SlotOk (tyOf pd) (.init v) ∧
+      (opMoveLocal locals op).length = decls.length ∧
+      SlotsOk layouts decls (opMoveLocal locals op)) ∧
+    (callArgVal locals op = none →
+      evalOperand locals op borrows globals evalLayouts callerLocals = .ub) := by
+  rcases callArgOk_cases hdecls hok htr with
+    ⟨j, hj, hsame⟩ | ⟨j, hj, hsame⟩ | ⟨j, fTy, it, hj, hpd, hfTy, htup⟩ |
+      ⟨j, fTy, hj, hpd, hfTy, htup⟩ | ⟨c, sc, e, hc, hscOk, _⟩
+  · have hjl : j < locals.length := by rw [hn]; exact hj
+    obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨_, List.getElem?_eq_getElem hj⟩
+    obtain ⟨_, _, ⟨T, hT1, hT2⟩, _⟩ := sameFragmentTy_spec (hsame d hd)
+    have hpdT : tyOf pd = T := tyOf_of_scalarTypeOf hT2
+    have hs : locals[j]? = some locals[j] := List.getElem?_eq_getElem hjl
+    have hslot : SlotOk T locals[j] := hslots.slotOk_scalar hd hs hT1
+    unfold evalOperand
+    simp only [callArgVal, opMoveLocal, opMoved, get?, hs]
+    cases hsl : locals[j] with
+    | dead => simp
+    | uninit => simp
+    | init v0 =>
+      rw [hsl] at hslot
+      refine ⟨fun v hv => ?_, fun hn' => by simp at hn'⟩
+      simp at hv; subst hv
+      exact ⟨by simp [readProjectedValue], hpdT ▸ hslot, hn, hslots⟩
+  · have hjl : j < locals.length := by rw [hn]; exact hj
+    obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨_, List.getElem?_eq_getElem hj⟩
+    obtain ⟨_, _, ⟨T, hT1, hT2⟩, _⟩ := sameFragmentTy_spec (hsame d hd)
+    have hpdT : tyOf pd = T := tyOf_of_scalarTypeOf hT2
+    have hs : locals[j]? = some locals[j] := List.getElem?_eq_getElem hjl
+    have hslot : SlotOk T locals[j] := hslots.slotOk_scalar hd hs hT1
+    unfold evalOperand
+    simp only [callArgVal, opMoveLocal, opMoved, get?, hs]
+    cases hsl : locals[j] with
+    | dead => simp
+    | uninit => simp
+    | init v0 =>
+      rw [hsl] at hslot
+      refine ⟨fun v hv => ?_, fun hn' => by simp at hn'⟩
+      simp at hv; subst hv
+      exact ⟨by simp [set?, hjl], hpdT ▸ hslot, by simp [hn], hslots.set_uninit j⟩
+  · have hjl : j < locals.length := by rw [hn]; exact hj
+    obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨_, List.getElem?_eq_getElem hj⟩
+    have hdTup := htup d hd
+    have hpdTy : tyOf pd = .Int it := (tyOf_int hpd).1
+    have hs : locals[j]? = some locals[j] := List.getElem?_eq_getElem hjl
+    have hslot : SlotOk (intBoolTupleTy it) locals[j] :=
+      hslots.slotOk_scalar hd hs (scalarTypeOf_tuple hdTup)
+    unfold evalOperand
+    simp only [callArgVal, opMoveLocal, opMoved, get?]
+    generalize locals[j] = slot at hs hslot
+    match slot, hslot with
+    | .dead, _ => simp [hs]
+    | .uninit, _ => simp [hs]
+    | .init (.scalar _), ⟨_, hvb⟩ => simp [intBoolTupleTy, ValidBits] at hvb
+    | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨it', htyT, hsz0, hb0, _, _⟩ =>
+      simp only [tupleIntOfTy_intBoolTupleTy, Option.some.injEq] at htyT
+      subst htyT
+      refine ⟨fun v hv => ?_, fun hn' => by simp [hs] at hn'⟩
+      simp [hs] at hv; subst hv
+      refine ⟨by simp [hs, readProjectedValue, get?], ?_, hn, hslots⟩
+      rw [hpdTy]; exact ⟨hsz0, hb0⟩
+  · have hjl : j < locals.length := by rw [hn]; exact hj
+    obtain ⟨d, hd⟩ : ∃ d, decls[j]? = some d := ⟨_, List.getElem?_eq_getElem hj⟩
+    obtain ⟨it, hdTup⟩ := htup d hd
+    have hpdTy : tyOf pd = .Bool := (tyOf_bool hpd).1
+    have hs : locals[j]? = some locals[j] := List.getElem?_eq_getElem hjl
+    have hslot : SlotOk (intBoolTupleTy it) locals[j] :=
+      hslots.slotOk_scalar hd hs (scalarTypeOf_tuple hdTup)
+    unfold evalOperand
+    simp only [callArgVal, opMoveLocal, opMoved, get?]
+    generalize locals[j] = slot at hs hslot
+    match slot, hslot with
+    | .dead, _ => simp [hs]
+    | .uninit, _ => simp [hs]
+    | .init (.scalar _), ⟨_, hvb⟩ => simp [intBoolTupleTy, ValidBits] at hvb
+    | .init (.aggregate 0 [.scalar sc0, .scalar sc1]), ⟨_, _, _, _, hsz1, hb1⟩ =>
+      refine ⟨fun v hv => ?_, fun hn' => by simp [hs] at hn'⟩
+      simp [hs] at hv; subst hv
+      refine ⟨by simp [hs, readProjectedValue, get?], ?_, hn, hslots⟩
+      rw [hpdTy]; exact ⟨hsz1, hb1⟩
+  · refine ⟨fun v hv => ?_, fun hn' => by simp [callArgVal, hc] at hn'⟩
+    simp [callArgVal, hc] at hv; subst hv
+    exact ⟨by simp [evalOperand, hc, evalConstValue, opMoveLocal, opMoved], hscOk, hn, hslots⟩
+
+/-- Sequential left-to-right evaluation of call arguments in Anneal's
+`evalOperands`: agrees with `callArgsEval` and preserves `SlotsOk`. -/
+theorem evalCallOperands_spec {decls : List LocalDecl} {locals : List LocalSlot}
+    (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
+    {paramDecls : List LocalDecl} {argOps : List Operand} {argExprs : List Gen.ArgumentExpr}
+    (hdecls : decls.all (fun d => (scalarTypeOf d.ty).isSome) = true)
+    (hargsOk : callArgsOk layouts decls paramDecls argOps = true)
+    (htrArgs : argOps.mapM (translateCallArg decls) = some argExprs)
+    (borrows : List BorrowEntry) (globals : List MirAst.CapturedAllocation)
+    (evalLayouts : Layout.LayoutTable) (callerLocals : List LocalSlot) :
+    (∀ vs locals', callArgsEval locals argOps = some (vs, locals') →
+      evalOperands locals argOps borrows globals evalLayouts callerLocals = .ok vs locals' ∧
+      vs.length = paramDecls.length ∧
+      (∀ (k : Nat) pd v, paramDecls[k]? = some pd → vs[k]? = some v → SlotOk (tyOf pd) (.init v)) ∧
+      locals'.length = decls.length ∧
+      SlotsOk layouts decls locals') ∧
+    (callArgsEval locals argOps = none →
+      evalOperands locals argOps borrows globals evalLayouts callerLocals = .ub) := by
+  induction paramDecls generalizing locals argOps argExprs with
+  | nil =>
+    cases argOps with
+    | nil =>
+      refine ⟨fun vs locals' h => ?_, fun h => by simp [callArgsEval] at h⟩
+      simp [callArgsEval] at h
+      obtain ⟨rfl, rfl⟩ := h
+      exact ⟨rfl, rfl, fun _ _ _ hk _ => by simp at hk, hn, hslots⟩
+    | cons _ _ => simp [callArgsOk] at hargsOk
+  | cons pd pds ih =>
+    cases argOps with
+    | nil => simp [callArgsOk] at hargsOk
+    | cons op ops =>
+      simp only [callArgsOk, Bool.and_eq_true] at hargsOk
+      simp only [List.mapM_cons, Option.bind_eq_bind] at htrArgs
+      cases htr1 : translateCallArg decls op with
+      | none => simp [htr1] at htrArgs
+      | some ae =>
+        cases htrRest : ops.mapM (translateCallArg decls) with
+        | none => simp [htr1, htrRest] at htrArgs
+        | some aes =>
+          obtain ⟨h1Ok, h1Ub⟩ := evalCallOperand_spec hslots hn hdecls hargsOk.1 htr1
+            borrows globals evalLayouts callerLocals
+          refine ⟨fun vs locals' hev => ?_, fun hnone => ?_⟩
+          · simp only [callArgsEval, Option.bind_eq_bind] at hev
+            cases hv1 : callArgVal locals op with
+            | none => simp [hv1] at hev
+            | some v1 =>
+              obtain ⟨heval1, hv1Ok, hn1, hslots1⟩ := h1Ok v1 hv1
+              obtain ⟨ihOk, _⟩ := ih hslots1 hn1 hargsOk.2 htrRest
+              cases hrest : callArgsEval (opMoveLocal locals op) ops with
+              | none => simp [hv1, hrest] at hev
+              | some p =>
+                obtain ⟨vsRest, locals2⟩ := p
+                simp [hv1, hrest] at hev
+                obtain ⟨rfl, rfl⟩ := hev
+                obtain ⟨hevalRest, hvslen, hvsOk, hn2, hslots2⟩ := ihOk vsRest locals2 hrest
+                refine ⟨by simp [evalOperands, heval1, hevalRest], by simp [hvslen], ?_, hn2, hslots2⟩
+                intro k pd' v' hpd' hv'
+                cases k with
+                | zero => simp at hpd' hv'; subst hpd' hv'; exact hv1Ok
+                | succ k => simp at hpd' hv'; exact hvsOk k pd' v' hpd' hv'
+          · simp only [callArgsEval, Option.bind_eq_bind] at hnone
+            cases hv1 : callArgVal locals op with
+            | none => simp [evalOperands, h1Ub hv1]
+            | some v1 =>
+              obtain ⟨heval1, _, hn1, hslots1⟩ := h1Ok v1 hv1
+              obtain ⟨_, ihUb⟩ := ih hslots1 hn1 hargsOk.2 htrRest
+              cases hrest : callArgsEval (opMoveLocal locals op) ops with
+              | none => simp [evalOperands, heval1, ihUb hrest]
+              | some p => cases p; simp [hv1, hrest] at hnone
+
+/-- Writing `retVal` to a fragment call destination under `CallerDestRel` in
+Anneal's `writePlaceValue` always succeeds with `writeCallDest`. -/
+theorem writePlaceValue_callDest {callerBody : CapturedMir} {callerCtx : Ctx}
+    {callerActual callerView : List LocalSlot} {callerLm : Map Gen.LocalName Ptr}
+    {calleeRetDecl : LocalDecl} {calleeBase : List Gen.Allocation} {calleeRetPtr : Ptr}
+    {destination : Place}
+    (hdest : CallerDestRel callerBody callerCtx callerActual callerView callerLm
+      calleeRetDecl calleeBase calleeRetPtr destination)
+    (borrows : List BorrowEntry) (retVal : Value) :
+    MirSemantics.writePlaceValue callerActual borrows destination retVal =
+      .ok (writeCallDest callerActual destination retVal) := by
+  cases hdest with
+  | root dst dDst callerSlot hActual hLive _ _ _ _ _ =>
+    have hlt : dst < callerActual.length := (List.getElem?_eq_some_iff.mp hActual).1
+    have hActElem : callerActual[dst]'hlt = callerSlot := by
+      simpa [List.getElem?_eq_getElem hlt] using hActual
+    cases callerSlot with
+    | dead => exact absurd rfl hLive
+    | uninit => simp [writePlaceValue, writeCallDest, get?, set?, hlt, hActElem]
+    | init v0 => simp [writePlaceValue, writeCallDest, get?, set?, hlt, hActElem]
+  | field0 dst fTy dDst it sc0 sc1 allocPre idDst hActual _ _ _ _ _ _ _ _ _ _ _ =>
+    have hlt : dst < callerActual.length := (List.getElem?_eq_some_iff.mp hActual).1
+    have hActElem : callerActual[dst]'hlt = .init (.aggregate 0 [.scalar sc0, .scalar sc1]) := by
+      simpa [List.getElem?_eq_getElem hlt] using hActual
+    simp [writePlaceValue, writeProjectedValue, writeCallDest, get?, set?, hlt, hActElem]
+  | field1 dst fTy dDst it sc0 sc1 allocPre pDst idDst hActual _ _ _ _ _ _ _ _ _ _ _ _ =>
+    have hlt : dst < callerActual.length := (List.getElem?_eq_some_iff.mp hActual).1
+    have hActElem : callerActual[dst]'hlt = .init (.aggregate 0 [.scalar sc0, .scalar sc1]) := by
+      simpa [List.getElem?_eq_getElem hlt] using hActual
+    simp [writePlaceValue, writeProjectedValue, writeCallDest, get?, set?, hlt, hActElem]
+
+/-- Anneal's `evalTerminator` on a direct intra-program `TerminatorKind.call`
+either raises UB when argument evaluation fails, or pushes a `SavedCallerFrame`
+and enters `calleeBody` at `(0, 0)` with `initLocals calleeBody argVals`. -/
+theorem evalTerminator_call_anneal {s : MachineState} {callerBody calleeBody : CapturedMir}
+    {func : Operand} {argOps : List Operand} {destination : Place}
+    {targetBb : Nat} {unwind : UnwindAction} {span : String} {dp : String}
+    {paramDecls : List LocalDecl} {argExprs : List Gen.ArgumentExpr}
+    (hextr : extractFnDefPath func = some dp)
+    (hfind : MirSemantics.findCallee? s.memory.callees dp = some calleeBody)
+    (hslots : SlotsOk callerBody.layouts callerBody.localDecls s.frame.locals)
+    (hn : s.frame.locals.length = callerBody.localDecls.length)
+    (hdecls : callerBody.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) = true)
+    (hargsOk : callArgsOk callerBody.layouts callerBody.localDecls paramDecls argOps = true)
+    (htrArgs : argOps.mapM (translateCallArg callerBody.localDecls) = some argExprs) :
+    (∀ argVals locals', callArgsEval s.frame.locals argOps = some (argVals, locals') →
+      MirSemantics.evalTerminator s ⟨.call func argOps destination (some targetBb) unwind, span⟩
+          (some callerBody) =
+        .tau (.running {
+          frame := { blockIdx := 0, stmtIdx := 0, locals := initLocals calleeBody argVals }
+          memory := {
+            s.memory with
+            callStack := {
+              callerBody := callerBody
+              frame := { s.frame with locals := locals' }
+              destination := destination
+              returnTarget := targetBb
+              calleeProtectors := s.memory.activeProtectors
+            } :: s.memory.callStack
+            activeCallee := some calleeBody
+          }
+        }) ∧
+      argVals.length = paramDecls.length ∧
+      (∀ (k : Nat) pd v, paramDecls[k]? = some pd → argVals[k]? = some v → SlotOk (tyOf pd) (.init v)) ∧
+      locals'.length = callerBody.localDecls.length ∧
+      SlotsOk callerBody.layouts callerBody.localDecls locals') ∧
+    (callArgsEval s.frame.locals argOps = none →
+      MirSemantics.evalTerminator s ⟨.call func argOps destination (some targetBb) unwind, span⟩
+        (some callerBody) = MirStepNode.fail .ub) := by
+  have hextr' := extractCalleeDefPath?_of_extractFnDefPath hextr
+  obtain ⟨hOk, hUb⟩ := evalCallOperands_spec hslots hn hdecls hargsOk htrArgs
+    s.memory.borrows s.memory.globals callerBody.layouts s.memory.callerLocals
+  refine ⟨fun argVals locals' hev => ?_, fun hnone => ?_⟩
+  · obtain ⟨heval, hvslen, hvsOk, hlen, hslots'⟩ := hOk argVals locals' hev
+    exact ⟨by simp [MirSemantics.evalTerminator, hextr', heval, hfind, MirStepNode.step],
+      hvslen, hvsOk, hlen, hslots'⟩
+  · simp [MirSemantics.evalTerminator, hextr', hUb hnone]
+
+/-- Anneal's `evalTerminator` on `TerminatorKind.return_` from a non-root callee
+frame (`s.memory.callStack = savedCaller :: restStack`) under `CallerDestRel`:
+either `_0` is uninitialized/dead/missing and `evalTerminator` raises UB, or
+`_0` holds `retVal` and execution resumes `savedCaller` at `returnTarget, 0`
+with `writeCallDest`. -/
+theorem evalTerminator_return_caller_anneal {s : MachineState} {curBody callerBody : CapturedMir}
+    {savedCaller : SavedCallerFrame} {restStack : List SavedCallerFrame} {span : String}
+    {callerCtx : Ctx} {callerView : List LocalSlot} {callerLm : Map Gen.LocalName Ptr}
+    {calleeRetDecl : LocalDecl} {calleeBase : List Gen.Allocation} {calleeRetPtr : Ptr}
+    (hstack : s.memory.callStack = savedCaller :: restStack)
+    (hprotNone : savedCaller.callerProtector = none)
+    (hcalleeProts : savedCaller.calleeProtectors = [])
+    (hdest : CallerDestRel callerBody callerCtx savedCaller.frame.locals callerView callerLm
+      calleeRetDecl calleeBase calleeRetPtr savedCaller.destination) :
+    (∀ retVal, s.frame.locals[0]? = some (.init retVal) →
+      MirSemantics.evalTerminator s ⟨.return_, span⟩ (some curBody) =
+        .tau (.running {
+          frame := {
+            savedCaller.frame with
+            blockIdx := savedCaller.returnTarget
+            stmtIdx := 0
+            locals := writeCallDest savedCaller.frame.locals savedCaller.destination retVal
+          }
+          memory := {
+            s.memory with
+            callStack := restStack
+            activeCallee := some savedCaller.callerBody
+            activeProtectors := []
+          }
+        })) ∧
+    ((s.frame.locals[0]? = some .uninit ∨ s.frame.locals[0]? = some .dead ∨
+        s.frame.locals[0]? = none) →
+      MirSemantics.evalTerminator s ⟨.return_, span⟩ (some curBody) = MirStepNode.fail .ub) := by
+  refine ⟨fun retVal h0 => ?_, fun hub => ?_⟩
+  · have hw := writePlaceValue_callDest hdest s.memory.borrows retVal
+    simp [MirSemantics.evalTerminator, get?, h0, hstack, hw, hprotNone, hcalleeProts, MirStepNode.step]
+  · rcases hub with h | h | h <;> simp [MirSemantics.evalTerminator, get?, h]
+
+/-- Anneal's `evalStmt` on `StatementKind.intrinsic (.assume op)`: evaluates `op`
+(moving out on `move _j`), raising UB if `op` is uninitialized or `false` (`0`)
+and advancing to `stmtIdx + 1` with `opPost s.frame.locals op` when `op` is
+`true` (`1`). -/
+theorem evalStmt_assume_anneal (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (op : Operand) (span : String)
+    (hslots : SlotsOk layouts decls s.frame.locals) (hn : s.frame.locals.length = decls.length)
+    (hsimple : simpleOp op = true) (hokB : operandOkB layouts decls (copyOp op) = true) :
+    (opBits s.frame.locals (copyOp op) = none →
+      evalStmt s ⟨.intrinsic (.assume op), span⟩ decls layouts = MirStepNode.fail .ub) ∧
+    (opBits s.frame.locals (copyOp op) = some 0 →
+      evalStmt s ⟨.intrinsic (.assume op), span⟩ decls layouts = MirStepNode.fail .ub) ∧
+    (opBits s.frame.locals (copyOp op) = some 1 →
+      evalStmt s ⟨.intrinsic (.assume op), span⟩ decls layouts =
+        MirStepNode.step (advanceStmt s (opPost s.frame.locals op))) := by
+  obtain ⟨hAok, hAnone⟩ := evalOperand_fragT decls s.frame.locals hslots hn
+    (.bool : FragTy .Bool u8Ty) (copyOp op) (operandOkB_T hokB)
+    s.memory.borrows s.memory.globals s.memory.callerLocals
+  have hmove := evalOperand_move s.frame.locals op hsimple
+    s.memory.borrows s.memory.globals layouts s.memory.callerLocals
+  refine ⟨fun hnone => ?_, fun h0 => ?_, fun h1 => ?_⟩
+  · simp [evalStmt, hmove, hAnone hnone, opWithLocals]
+  · simp [evalStmt, hmove, hAok 0 h0, opWithLocals, u8Ty]
+  · simp [evalStmt, hmove, hAok 1 h1, opWithLocals, u8Ty]
 
 end MiniRustSpec.Correspondence

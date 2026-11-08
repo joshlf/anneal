@@ -274,7 +274,7 @@ private def evalRvalueSymTreeFast
           tag := tag
           targetLocal := p.local_
           targetProjection := .nil
-          perm := .frozen
+          perm := sharedBorrowPerm ctx.localDecls ctx.layouts { local_ := p.local_, projection := [] }
         }
         let mem' := {
           mem with
@@ -337,7 +337,7 @@ private theorem evalRvalueSymTreeFast_eq
       evalRvalueSymTree locals rv mem ctx.localDecls ctx.layouts := by
   cases rv with
   | use op =>
-    dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
+    dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree, evalRvalue]
     rw [evalOperandFast_eq]
     cases evalOperand locals op mem.borrows mem.globals ctx.layouts mem.callerLocals <;> rfl
   | ref bk p =>
@@ -346,7 +346,7 @@ private theorem evalRvalueSymTreeFast_eq
       rcases p with ⟨loc, proj⟩
       cases proj with
       | nil =>
-        dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
+        dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree, evalRvalue]
         cases get? locals loc with
         | none => rfl
         | some slot => cases slot <;> rfl
@@ -356,12 +356,12 @@ private theorem evalRvalueSymTreeFast_eq
   | aggregate ak ops =>
     cases ak with
     | tuple =>
-      dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree, evalRvalue]
+      dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree, evalRvalue]
       rw [evalOperandsFast_eq]
       cases evalOperands locals ops mem.borrows mem.globals ctx.layouts mem.callerLocals <;> rfl
     | _ => rfl
   | binaryOp op lhsOp rhsOp =>
-    dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
+    dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree]
     rw [evalOperandFast_eq]
     cases evalOperand locals lhsOp mem.borrows mem.globals ctx.layouts mem.callerLocals with
     | ub => rfl
@@ -383,7 +383,7 @@ private theorem evalRvalueSymTreeFast_eq
   | unaryOp uop op =>
     cases uop with
     | not =>
-      dsimp only [evalRvalueSymTreeFast, evalRvalueSymTree]
+      dsimp only [evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze, evalRvalueSymTree]
       rw [evalOperandFast_eq]
       cases evalOperand locals op mem.borrows mem.globals ctx.layouts mem.callerLocals with
       | ok v _ => cases v <;> rfl
@@ -823,7 +823,7 @@ private theorem ensures_holds (b1 b2 : Nat) (hb1 : b1 ≤ 16) (hb2 : b2 ≤ 1024
     ensBB0, ensBB1,
     wpBlockLinear, wpBlockStep, wpExecGen, stepMirSymTreeFast, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
     evalOperandFast, evalOperandsFast, evalConstValue,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, evalUnaryNotSymTree,
     operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
@@ -952,7 +952,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
     reqBB0, reqBB1, reqBB2, reqBB3,
     wpBlockLinear, wpBlockStep, wpExecGen, stepMirSymTreeFast, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
     evalOperandFast, evalOperandsFast, evalConstValue,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
     operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
@@ -996,7 +996,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
             reqBB0, reqBB1, reqBB2, reqBB3,
             wpBlockLinear, wpBlockStep, wpExecGen, stepMirSymTreeFast, evalSymNodeTree,
             evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-            evalRvalueSymTreeFast,
+            evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
             evalOperandFast, evalOperandsFast, evalConstValue,
             evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
             operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
@@ -1033,7 +1033,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
             reqBB0, reqBB1, reqBB2, reqBB3,
             wpBlockLinear, wpBlockStep, wpExecGen, stepMirSymTreeFast, evalSymNodeTree,
             evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-            evalRvalueSymTreeFast,
+            evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
             evalOperandFast, evalOperandsFast, evalConstValue,
             evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
             operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
@@ -1077,7 +1077,7 @@ private theorem wpReq_inversion (v1 v2 : Value) :
                     reqBB0, reqBB1, reqBB2, reqBB3,
                     wpBlockLinear, wpBlockStep, wpExecGen, stepMirSymTreeFast, evalSymNodeTree,
                     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-                    evalRvalueSymTreeFast,
+                    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
                     evalOperandFast, evalOperandsFast, evalConstValue,
                     evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
                     operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
@@ -1175,7 +1175,7 @@ theorem verified : VerificationResult Obligations.WireframeDemo.frame_total_len.
       ftlBB0, ftlBB1,
       wpBlockLinear, wpBlockStep, wpExecGen, stepMirSymTreeFast, evalSymNodeTree,
       evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-      evalRvalueSymTreeFast,
+      evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
       evalOperandFast, evalOperandsFast, evalConstValue,
       evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
       operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,
@@ -1233,7 +1233,7 @@ theorem nonVacuousRequires :
     reqBB0, reqBB1, reqBB2, reqBB3,
     wpBlockLinear, wpBlockStep, wpExecGen, stepMirSymTreeFast, evalSymNodeTree,
     evalStmtSymTreeFast, finishAssignSymTree, finishAssignStmtNode, advanceStmt,
-    evalRvalueSymTreeFast,
+    evalRvalueSymTreeFast, sharedBorrowPerm, Option.bind, tyIsFreeze,
     evalOperandFast, evalOperandsFast, evalConstValue,
     evalScalarBinOpSymTree, bitwiseAndBitsFast, mod_1_2, bitwiseAndBits_8_1_0, evalUnaryNotSymTree,
     operandIsSigned, operandTy, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,

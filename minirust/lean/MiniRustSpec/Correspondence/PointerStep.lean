@@ -1652,7 +1652,7 @@ theorem evalStatement_assign_ptr_of {body : CapturedMir} {f : Gen.Function} {ctx
   have hgood : GoodSize pointeeIt.size.bytes := ptrPointeeOf_good hpt
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   obtain ⟨hTd, hitd⟩ := tyOf_isPtrTy (layouts := body.layouts) hp_ty
-  have hspec := (translateFn_spec body f h.hf).2.1 i d hd
+  have hspec := h.hf.2 i d hd
   obtain ⟨_, slot, _, hs⟩ := h.slot_exists i hi
   have hslive : slot ≠ .dead := fun hc => hlive (hc ▸ hs)
   obtain ⟨p, hp⟩ := h.locs.some_of_live hs hslive
@@ -2107,7 +2107,7 @@ theorem evalStatement_assign_reborrow_mr {body : CapturedMir} {f : Gen.Function}
   · right
     refine ⟨hnot, fun hlive => ?_⟩
     have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
-    have hspecF := (translateFn_spec body f h.hf).2.1 i d hd
+    have hspecF := h.hf.2 i d hd
     obtain ⟨_, slot, _, hs⟩ := h.slot_exists i hi
     obtain ⟨pi, hpi⟩ := h.locs.some_of_live hs (fun hc => hlive (hc ▸ hs))
     have hplace := evalPlace_local_some h.shape i _ hspecF.2 pi hpi
@@ -2304,7 +2304,7 @@ theorem evalStatement_assign_ptrRvalue_mr {body : CapturedMir} {f : Gen.Function
       ((view[p]? = some .uninit ∨ view[p]? = some .dead) → view[i]? ≠ some .dead →
         ∃ msg, evalStatement m (.Assign (.Local (localName i)) e) = .error (.ub msg)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
-  have hspecF := (translateFn_spec body f h.hf).2.1 i d hd
+  have hspecF := h.hf.2 i d hd
   obtain ⟨_, slot, _, hs⟩ := h.slot_exists i hi
   obtain ⟨p, _, hpmem, ⟨srcMutbl, hsrc, hmut⟩, _⟩ := evalRvalue_ptrRvalue hok hnraw hnref
   obtain ⟨dp, hdp, hp_pt⟩ : ∃ dp, body.localDecls[p]? = some dp ∧
@@ -3142,7 +3142,7 @@ theorem evalStatement_validate_local_mr {body : CapturedMir} {f : Gen.Function} 
   have hi_lt : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdi).1
   have hisPtr : isPtrTy di.ty = true := by simp [isPtrTy, hi_ty]
   obtain ⟨hTdi, hitdi⟩ := tyOf_isPtrTy (layouts := body.layouts) hisPtr
-  have hloc := ((translateFn_spec body f h.hf).2.1 i di hdi).2
+  have hloc := (h.hf.2 i di hdi).2
   rw [hTdi] at hloc
   obtain ⟨_, sloti, hdi', hsi⟩ := h.slot_exists i hi_lt
   rw [hdi] at hdi'; cases hdi'

@@ -82,6 +82,43 @@ The translation is defined only on the fragment checked by `inFragment`:
   every temporary the body mentions has explicit storage markers
   (`mentionsOk`); see below.
 
+The multi-function translation `translateProg` (`translateFnInProg`,
+`Terminator::Call`) is defined on the fragment checked by `progInFragment`:
+
+* the body declares the return place, the arguments, and any number of
+  temporaries (`argCount + 1 ≤ localDecls.length < 2^31`), all of integer,
+  `bool`, `core::cmp::Ordering`, or `(Int, bool)` 2-tuple type;
+* statements are the scalar-family statements of `inFragment` above together
+  with `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on a
+  `bool` fragment operand (`translateStmtResult`, `splitStmts`, `SegChain`,
+  `SegPc`);
+* terminators are `Goto`, `SwitchInt` on an integer or `bool` fragment operand
+  (`copy _j`, `move _j`, 2-tuple field projection, or constant), `Unreachable`,
+  `Return`, or direct monomorphic `Call`s to fragment callees, and every jump
+  or call return target is a block of the body;
+* no block in the source MIR body is a cleanup block (`translateUnwindAction`
+  synthesizes MiniRust cleanup blocks for call unwind edges);
+* no moved-from local is read before it is re-initialized (`movesOk`), call
+  return places are must-live and disjoint from call arguments (`livenessOk`,
+  `tupleInitOk`, `callTerminatorOk`), and every temporary the body mentions has
+  explicit storage markers (`mentionsOk`); see below.
+
+Both translations share `translateStatement`, `translatePlace`,
+`translateOperand`, and `translateTerminator`, so a statement or terminator
+lowers identically whichever function it appears in; the two fragment
+predicates differ only in which bodies their correspondence proofs cover.
+
+For `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`,
+`translateFnInProg` transcribes how `minimize` splits a MIR basic block: the
+statement ends the current MiniRust block segment in a `Terminator::Intrinsic`
+of `IntrinsicOp::Assume` on `op` with `ret = build::unit_place()` and a fresh
+continuation block (`translateStmtResult`, `splitStmts`, `SegChain`, `SegPc`).
+`translateFnWithIntrinsics` splits blocks in the same way at the provenance
+casts `PointerExposeProvenance` and `PointerWithExposedProvenance`
+(`translateStmtOrIntrinsic`, `splitBlockAtIntrinsics`).
+`translateRsIntrinsic` also transcribes `minimize`'s lowering of compiler
+intrinsic calls (`raw_eq`, `ctpop`, `exact_div`, `cold_path`, `abort`).
+
 `minimize` has no MiniRust Boolean operator to use: it writes `!b` as a
 transmute of `1 - b` back to `bool` (`boolNot`), `a & b` / `a | b` / `a ^ b` as
 integer `BitAnd` / `BitOr` / `BitXor` on the `u8` views transmuted back to
@@ -1864,6 +1901,21 @@ def initBlock (body : MirAst.CapturedMir) : Gen.BasicBlock :=
   ⟨(alwaysStorageLiveLocals body).map (fun loc => .StorageLive (localName loc)), .Goto (bbName 0),
     .Regular⟩
 
+/-- `minimize`'s calling-convention translation (`tooling/minimize/src/ty.rs`,
+lines 348-354 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/minimize/src/ty.rs#L348-L354>):
+> "pub fn translate_calling_convention(conv: rs::CanonAbi) -> CallingConvention {
+>      match conv {
+>          rs::CanonAbi::C => CallingConvention::C,
+>          rs::CanonAbi::Rust => CallingConvention::Rust,
+>          ..
+>      }
+>  }" -/
+def translateCallConv : Layout.CallConv → Option Gen.CallingConvention
+  | .c => some .C
+  | .rust => some .Rust
+  | _ => none
+
 /-- `minimize`'s function translation (`tooling/minimize/src/function.rs`),
 specialized to bodies without a spread argument (`spread_arg`, used only by
 closures and the `rust-call` ABI):
@@ -1894,11 +1946,13 @@ closures and the `rust-call` ABI):
 >      calling_convention: translate_calling_convention(self.abi.conv),
 >      implicit_writes: self.implicit_writes, };"
 
-Without a spread argument, `init_statements` holds exactly the `StorageLive`s
-of `alwaysStorageLiveLocals` (`initBlock`). We take the calling convention to
-be `Rust` and `implicit_writes` to be `true` (the `minimize` default absent
-`#[rustc_no_writable]`); neither is read by the interpreted fragment. -/
+Without a spread argument, `init_statements` holds exactly the
+`StorageLive`s of `alwaysStorageLiveLocals` (`initBlock`). We translate the
+calling convention from `body.fnAbi.conv` via `translateCallConv` and take
+`implicit_writes` to be `true` (the `minimize` default absent
+`#[rustc_no_writable]`). -/
 def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
   let locals ← translateLocals body.layouts 0 body.localDecls
   let blocks ← translateBlocks body.layouts body.localDecls 0 body.basicBlocks
   let n := body.basicBlocks.length
@@ -1906,7 +1960,7 @@ def translateFn (body : MirAst.CapturedMir) : Option Gen.Function := do
     locals := ⟨locals⟩
     args := (List.range body.argCount).map (fun k => localName (k + 1))
     ret := localName 0
-    calling_convention := .Rust
+    calling_convention := conv
     blocks := ⟨blocks ++ [(bbName n, initBlock body)]⟩
     start := bbName n
     implicit_writes := true
@@ -2004,6 +2058,7 @@ def translateBlocksWithIntrinsics (layouts : Layout.LayoutTable := ⟨64, true, 
 into `Terminator::Intrinsic` blocks (used by ground-truth and divergence
 witnesses outside `inFragment`). -/
 def translateFnWithIntrinsics (body : MirAst.CapturedMir) : Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
   let locals ← translateLocals body.layouts 0 body.localDecls
   let n := body.basicBlocks.length
   let (blocks, initIdx) ←
@@ -2012,10 +2067,686 @@ def translateFnWithIntrinsics (body : MirAst.CapturedMir) : Option Gen.Function 
     locals := ⟨locals⟩
     args := (List.range body.argCount).map (fun k => localName (k + 1))
     ret := localName 0
-    calling_convention := .Rust
+    calling_convention := conv
     blocks := ⟨blocks ++ [(bbName initIdx, initBlock body)]⟩
     start := bbName initIdx
     implicit_writes := true
+  }
+
+/-! ### Multi-function program translation (`Terminator::Call`) -/
+
+/-- Monomorphic function index `idx` as a MiniRust `FnName`
+(`tooling/minimize/src/program.rs`):
+> "pub fn get_fn_name(&mut self, key: rs::Instance<'tcx>) -> FnName {
+>      // Used as the fn name if it is not named yet.
+>      let len = self.fn_name_map.len();
+>
+>      *self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(len as _)))
+>  }" -/
+def fnName (idx : Nat) : Gen.FnName :=
+  ⟨⟨idx⟩⟩
+
+@[simp]
+theorem fnName_inj {i j : Nat} : fnName i = fnName j ↔ i = j := by
+  simp [fnName]
+
+/-- `build::fn_ptr(fn_name)`, which `minimize` emits for direct monomorphic
+calls (`tooling/minimize/src/bb.rs`, line 874; `tooling/miniutil/src/build/expr.rs`,
+lines 46-48 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L46-L48>):
+`ValueExpr::Constant(Constant::FnPointer(fn_name), Type::Ptr(PtrType::FnPtr))`. -/
+def fnPtrExpr (fn : Gen.FnName) : Gen.ValueExpr :=
+  .Constant (.FnPointer fn) (.Ptr .FnPtr)
+
+/-- Extract the canonical `DefPath` from a constant monomorphic function-item
+operand (`TyKind::FnDef`), matching `minimize`'s direct-call resolution
+(`tooling/minimize/src/bb.rs`):
+> "let fn_ty = func.ty(&self.body, self.tcx);
+>  let (f, substs_ref) = match *fn_ty.kind() {
+>      rs::TyKind::FnDef(id, substs) => (id, substs)," -/
+def extractFnDefPath : MirAst.Operand → Option String
+  | .constant c =>
+    match c.ty.kind with
+    | .fnDef defPath _ => some defPath
+    | _ => none
+  | _ => none
+
+/-- Program function-table mapping `defPath` to `(FnName, CallingConvention)`. -/
+abbrev FnMap : Type := List (String × (Gen.FnName × Gen.CallingConvention))
+
+/-- Look up the `FnName` assigned to `defPath` in `fnMap`. -/
+def lookupFnName : FnMap → String → Option Gen.FnName
+  | [], _ => none
+  | (dp, (fn, _)) :: rest, target =>
+    if dp == target then some fn else lookupFnName rest target
+
+/-- Look up the `(FnName, CallingConvention)` target assigned to `defPath` in `fnMap`. -/
+def lookupFnTarget : FnMap → String → Option (Gen.FnName × Gen.CallingConvention)
+  | [], _ => none
+  | (dp, entry) :: rest, target =>
+    if dp == target then some entry else lookupFnTarget rest target
+
+/-- Assign `FnName(0)` to `entry` and `FnName(1), FnName(2), ..` to `callees`
+in list order along with each body's translated calling convention (defaulting
+to `CallingConvention.Rust` if `translateCallConv` is `none`, so `fnNameMap`
+remains total while `translateFnInProg` requires `translateCallConv` to return
+`some`). `Ctxt::translate` names `entry` first
+(`tooling/minimize/src/program.rs`):
+> "let entry_name = FnName(Name::from_internal(0));
+>
+>  self.fn_name_map.insert(entry_instance, entry_name);"
+and `Ctxt::get_fn_name` names every other function in the order in which
+translation first references it:
+> "pub fn get_fn_name(&mut self, key: rs::Instance<'tcx>) -> FnName {
+>      // Used as the fn name if it is not named yet.
+>      let len = self.fn_name_map.len();
+>
+>      *self.fn_name_map.entry(key).or_insert_with(|| FnName(Name::from_internal(len as _)))
+>  }"
+The two numberings therefore coincide when `callees` lists the callees in that
+first-reference order, and otherwise differ only by a consistent renaming of
+`FnName`s, which the fragment cannot observe: function names only index
+`prog.functions` and `Machine::fn_ptrs`, and the fragment has no
+pointer-to-integer casts or pointer comparisons. -/
+def fnNameMap (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir) : FnMap :=
+  (entry :: callees).zipIdx.map fun (b, idx) =>
+    (b.defPath, (fnName idx, (translateCallConv b.fnAbi.conv).getD .Rust))
+
+/-- `minimize`'s call-argument translation (`tooling/minimize/src/bb.rs`):
+> "match &x.node {
+>      rs::Operand::Move(place) =>
+>          ArgumentExpr::InPlace(self.translate_place(&place, x.span)),
+>      op => ArgumentExpr::ByValue(self.translate_operand(op, x.span)),
+>  }"
+Unlike statement rvalues (where `minimize` translates `Operand::Move` as
+`ValueExpr::Load`), call arguments translate `Operand::Move(place)` as
+`ArgumentExpr::InPlace`, so MiniRust's `eval_argument` calls
+`prepare_for_inplace_passing` and writes `Uninit` bytes to the moved place. -/
+def translateCallArg (decls : List MirAst.LocalDecl) : MirAst.Operand → Option Gen.ArgumentExpr
+  | .move p => (translatePlace decls p).map .InPlace
+  | op => (translateOperand decls op).map .ByValue
+
+/-- MiniRust's unit type `()`, used by `build::unit_place()` and `mk_start_fn`. -/
+def unitTy : Gen.Type :=
+  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
+
+/-- `build::unit_place()`, a dangling aligned raw-pointer dereference of unit
+type (`tooling/miniutil/src/build/expr.rs`, lines 55-65 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs#L55-L65>). -/
+def buildUnitPlace : Gen.PlaceExpr :=
+  .Deref (.Constant (.PointerWithoutProvenance 1) (.Ptr (.Raw .None))) unitTy
+
+/-- `build::abort()`, `Terminator::Intrinsic { intrinsic: IntrinsicOp::Abort, .. }`
+(`tooling/miniutil/src/build/bb.rs`, lines 28-35 at the pinned commit:
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/bb.rs#L28-L35>). -/
+def buildAbort : Gen.Terminator :=
+  .Intrinsic .Abort [] buildUnitPlace none
+
+/-- `build::raw_void_ptr_ty()`, the thin raw pointer type with no metadata
+(`Type::Ptr(PtrType::Raw { meta_kind: PointerMetaKind::None })`). -/
+def rawVoidPtrTy : Gen.Type := .Ptr (.Raw .None)
+
+/-- `build::unit_ptr()`, `minimize`'s aligned dangling raw pointer constant
+used as the dummy unwind payload and `unit_place` base (MiniRust's
+`tooling/miniutil/src/build/expr.rs` at the pinned commit,
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/tooling/miniutil/src/build/expr.rs>):
+`Constant::PointerWithoutProvenance(Address::from_bytes(1))` at
+`raw_void_ptr_ty()`. -/
+def unitPtr : Gen.ValueExpr :=
+  .Constant (.PointerWithoutProvenance 1) rawVoidPtrTy
+
+/-- `build::unit_place()`, `*unit_ptr()` at the zero-sized `()` tuple type
+`Interp.unitType` (MiniRust's `tooling/miniutil/src/build/expr.rs` at the
+pinned commit). `minimize` uses it as the destination of every intrinsic
+that returns `()`, such as `Assume` (`StatementResult::Intrinsic`). -/
+def unitPlace : Gen.PlaceExpr :=
+  .Deref unitPtr Interp.unitType
+
+/-- `build::abort()`, `minimize`'s abort terminator
+(`tooling/minimize/src/bb.rs`):
+> "Terminator::Intrinsic {
+>      intrinsic: IntrinsicOp::Abort,
+>      arguments: list![],
+>      ret: unit_place(),
+>      next_block: None,
+>  }" -/
+def abortTerminator : Gen.Terminator :=
+  .Intrinsic .Abort [] unitPlace none
+
+/-- The `MR-4.1` spelling `buildUnitPlace` is `unitPlace`. -/
+theorem unitPlace_eq_buildUnitPlace : unitPlace = buildUnitPlace := rfl
+
+/-- The `MR-4.1` spelling `buildAbort` is `abortTerminator`. -/
+theorem abortTerminator_eq_buildAbort : abortTerminator = buildAbort := rfl
+
+/-- The `MR-4.1` spelling `unitTy` is the transcribed `unit_type()`. -/
+theorem unitType_eq_unitTy : Interp.unitType = unitTy := rfl
+
+/-- `minimize`'s translation of a call's `UnwindAction` in a non-cleanup basic
+block (`tooling/minimize/src/bb.rs`):
+> "rs::UnwindAction::Continue => {
+>      // UnwindAction::Continue must only be used by a call in a regular block,
+>      // therefore the unwind block should be a cleanup block.
+>      assert!(
+>          !bb.is_cleanup,
+>          \"A call in a cleanup block cannot use UnwindAction::Continue\"
+>      );
+>      let block_kind = BbKind::Cleanup;
+>      let unwind_bb_name = self.fresh_bb_name();
+>      let unwind_bb = BasicBlock {
+>          statements: list![],
+>          terminator: Terminator::ResumeUnwind,
+>          kind: block_kind,
+>      };
+>      self.blocks.insert(unwind_bb_name, unwind_bb);
+>      unwind_bb_name
+>  }
+>  rs::UnwindAction::Unreachable => {
+>      let block_kind = if bb.is_cleanup { BbKind::Terminate } else { BbKind::Cleanup };
+>      let unwind_bb_name = self.fresh_bb_name();
+>      let unwind_bb = BasicBlock {
+>          statements: list![],
+>          terminator: Terminator::Unreachable,
+>          kind: block_kind,
+>      };
+>      self.blocks.insert(unwind_bb_name, unwind_bb);
+>      unwind_bb_name
+>  }
+>  rs::UnwindAction::Terminate(_) => {
+>      // FIXME: do not ignore UnwindTerminateReason
+>      let block_kind = if bb.is_cleanup { BbKind::Terminate } else { BbKind::Cleanup };
+>      let unwind_bb_name = self.fresh_bb_name();
+>      let unwind_bb = BasicBlock {
+>          statements: list![],
+>          terminator: build::abort(),
+>          kind: block_kind,
+>      };
+>      self.blocks.insert(unwind_bb_name, unwind_bb);
+>      unwind_bb_name
+>  }
+>  rs::UnwindAction::Cleanup(cleanup_block) => self.bb_name_map[&cleanup_block],"
+Returns `(unwindBb, nextCleanup', extraBlocks)`. -/
+def translateUnwindAction (nextCleanup : Nat) :
+    MirAst.UnwindAction → Gen.BbName × Nat × List (Gen.BbName × Gen.BasicBlock)
+  | .continue_ =>
+    let b := bbName nextCleanup
+    (b, nextCleanup + 1, [(b, ⟨[], .ResumeUnwind, .Cleanup⟩)])
+  | .unreachable =>
+    let b := bbName nextCleanup
+    (b, nextCleanup + 1, [(b, ⟨[], .Unreachable, .Cleanup⟩)])
+  | .terminate =>
+    let b := bbName nextCleanup
+    (b, nextCleanup + 1, [(b, ⟨[], buildAbort, .Cleanup⟩)])
+  | .cleanup cb =>
+    (bbName cb, nextCleanup, [])
+
+/-- `minimize`'s per-statement translation result
+(`tooling/minimize/src/bb.rs`):
+> "/// A MIR statement becomes either a MiniRust statement or an intrinsic with some arguments, which
+>  /// then starts a new basic block.
+>  enum StatementResult {
+>      Statement(Statement),
+>      Intrinsic { intrinsic: IntrinsicOp, destination: PlaceExpr, arguments: List<ValueExpr> },
+>  }" -/
+inductive StatementResult : Type where
+  | statement (s : Gen.Statement)
+  | intrinsic (intrinsic : Gen.IntrinsicOp) (destination : Gen.PlaceExpr)
+      (arguments : List Gen.ValueExpr)
+
+/-- `minimize`'s per-terminator translation result
+(`tooling/minimize/src/bb.rs`):
+> "/// A MIR terminator becomes a MiniRust terminator, possibly preceded by a list
+>  /// of statements to execute at the end of the previous basic block.
+>  struct TerminatorResult {
+>      stmts: List<Statement>,
+>      terminator: Terminator,
+>  }" -/
+structure TerminatorResult where
+  stmts : List Gen.Statement
+  terminator : Gen.Terminator
+
+/-- `build::count_ones(v)`, `ValueExpr::UnOp` with `IntUnOp::CountOnes`. -/
+def buildCountOnes (v : Gen.ValueExpr) : Gen.ValueExpr :=
+  .UnOp (.Int .CountOnes) v
+
+/-- `build::div_exact(l, r)`, `ValueExpr::BinOp` with `IntBinOp::DivExact`. -/
+def buildDivExact (l r : Gen.ValueExpr) : Gen.ValueExpr :=
+  .BinOp (.Int .DivExact) l r
+
+/-- `minimize`'s `translate_rs_intrinsic` (`tooling/minimize/src/bb.rs`) on the
+intrinsic names whose arguments and destination require no `rustc` type-context
+queries (`raw_eq`, `ctpop`, `exact_div`, `cold_path`, `abort`):
+> "rs::sym::raw_eq =>
+>      return TerminatorResult {
+>          stmts: List::new(),
+>          terminator: Terminator::Intrinsic {
+>              intrinsic: IntrinsicOp::RawEq,
+>              arguments: args
+>                  .iter()
+>                  .map(|x| self.translate_operand(&x.node, x.span))
+>                  .collect(),
+>              ret: self.translate_place(&destination, span),
+>              next_block: target.as_ref().map(|t| self.bb_name_map[t]),
+>          },
+>      },"
+> "rs::sym::ctpop => {
+>      let v = self.translate_operand(&args[0].node, span);
+>      let destination = self.translate_place(&destination, span);
+>
+>      let val = build::count_ones(v);
+>      let stmt = Statement::Assign { destination, source: val };
+>
+>      let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]);
+>      return TerminatorResult { stmts: list![stmt], terminator };
+>  }
+>  rs::sym::exact_div => {
+>      let l = self.translate_operand(&args[0].node, span);
+>      let r = self.translate_operand(&args[1].node, span);
+>      let destination = self.translate_place(&destination, span);
+>
+>      let val = build::div_exact(l, r);
+>
+>      let stmt = Statement::Assign { destination, source: val };
+>      let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]);
+>
+>      return TerminatorResult { stmts: list![stmt], terminator };
+>  }"
+> "rs::sym::cold_path => {
+>      // Just a NOP for us.
+>      let terminator = Terminator::Goto(self.bb_name_map[&target.unwrap()]);
+>      return TerminatorResult { stmts: list![], terminator };
+>  }"
+> "rs::sym::abort => {
+>      let terminator = build::abort();
+>      TerminatorResult { stmts: list![], terminator }
+>  }"
+Other `translate_rs_intrinsic` arms (`assert_*_valid`, `arith_offset`,
+`ptr_offset_from*`, `size_of_val`, `align_of_val`, `catch_unwind`) query `tcx`
+layouts or synthesize catch blocks, and unsupported names hit `span_bug!`. -/
+inductive RsIntrinsic
+  | raw_eq
+  | ctpop
+  | exact_div
+  | cold_path
+  | abort
+  | ub_checks
+  deriving DecidableEq
+
+def translateRsIntrinsic (decls : List MirAst.LocalDecl) (name : RsIntrinsic)
+    (args : List MirAst.Operand) (destination : MirAst.Place) (target : Option Nat) :
+    Option TerminatorResult :=
+  match name with
+  | .raw_eq => do
+    let args' ← args.mapM (translateOperand decls)
+    let ret' ← translatePlace decls destination
+    pure ⟨[], .Intrinsic .RawEq args' ret' (target.map bbName)⟩
+  | .ctpop =>
+    match args, target with
+    | [vOp], some t => do
+      let v ← translateOperand decls vOp
+      let dest ← translatePlace decls destination
+      pure ⟨[.Assign dest (buildCountOnes v)], .Goto (bbName t)⟩
+    | _, _ => none
+  | .exact_div =>
+    match args, target with
+    | [lOp, rOp], some t => do
+      let l ← translateOperand decls lOp
+      let r ← translateOperand decls rOp
+      let dest ← translatePlace decls destination
+      pure ⟨[.Assign dest (buildDivExact l r)], .Goto (bbName t)⟩
+    | _, _ => none
+  | .cold_path =>
+    match target with
+    | some t => pure ⟨[], .Goto (bbName t)⟩
+    | none => none
+  | .abort => pure ⟨[], abortTerminator⟩
+  | _ => none
+
+/-- `minimize`'s terminator translation extended with direct monomorphic calls
+(`tooling/minimize/src/bb.rs`):
+> "let unwind_block = Some(self.translate_unwind_action(unwind, bb));
+>  ..
+>  let callee = if let rs::InstanceKind::Virtual(_trait, method) = instance.def {
+>      ..
+>  } else {
+>      build::fn_ptr(self.cx.get_fn_name(instance))
+>  };
+>
+>  Terminator::Call {
+>      callee,
+>      calling_convention: conv,
+>      arguments: args,
+>      ret: self.translate_place(&destination, span),
+>      next_block: target.as_ref().map(|t| self.bb_name_map[t]),
+>      unwind_block,
+>  }"
+where `minimize` computes the call edge's `conv` from the *callee instance's*
+own ABI:
+> "let abi = self
+>      .cx
+>      .tcx
+>      .fn_abi_of_instance(self.typing_env().as_query_input((instance, rs::List::empty())))
+>      .unwrap();
+>  let conv = translate_calling_convention(abi.conv);"
+so `lookupFnTarget` returns the callee's `translateCallConv callee.fnAbi.conv`,
+which is exactly the `calling_convention` that `translateFnInProg` gives the
+callee (and `create_frame`'s calling-convention check never fails on a
+translated direct call). Non-call terminators delegate directly to
+`translateTerminator` and synthesize no extra cleanup blocks. -/
+
+
+def translateIntrinsicOrNone (decls : List MirAst.LocalDecl) (defPath : String)
+    (argOps : List MirAst.Operand) (destination : MirAst.Place)
+    (target : Option MirAst.BasicBlockIdx) : Option TerminatorResult :=
+  match defPath.toList with
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','r','a','w','_','e','q'] =>
+      translateRsIntrinsic decls .raw_eq argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','t','p','o','p'] =>
+      translateRsIntrinsic decls .ctpop argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','e','x','a','c','t','_','d','i','v'] =>
+      translateRsIntrinsic decls .exact_div argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','c','o','l','d','_','p','a','t','h'] =>
+      translateRsIntrinsic decls .cold_path argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','a','b','o','r','t'] =>
+      translateRsIntrinsic decls .abort argOps destination target
+  | ['c','o','r','e',':',':','i','n','t','r','i','n','s','i','c','s',':',':','u','b','_','c','h','e','c','k','s'] =>
+      translateRsIntrinsic decls .ub_checks argOps destination target
+  | _ => none
+
+def translateTerminatorInProg (fnMap : FnMap) (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) (nextCleanup : Nat) (t : MirAst.Terminator) :
+    Option (Gen.Terminator × Nat × List (Gen.BbName × Gen.BasicBlock)) :=
+  match t.kind with
+  | .call func argOps destination target unwind => do
+    let defPath ← extractFnDefPath func
+    match translateIntrinsicOrNone decls defPath argOps destination target with
+    | some res =>
+      let b := bbName nextCleanup
+      pure (.Goto b, nextCleanup + 1, [(b, ⟨res.stmts, res.terminator, .Regular⟩)])
+    | none =>
+      let (fn, conv) ← lookupFnTarget fnMap defPath
+      let args ← argOps.mapM (translateCallArg decls)
+      let retPlace ← translatePlace decls destination
+      let (unwindBb, nextCleanup', extra) := translateUnwindAction nextCleanup unwind
+      pure (.Call (fnPtrExpr fn) conv args retPlace (target.map bbName) (some unwindBb),
+        nextCleanup', extra)
+  | _ => do
+    let term ← translateTerminator layouts decls t
+    pure (term, nextCleanup, [])
+
+
+/-- Whether a MIR statement is
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(_))`, the one
+statement that `minimize` turns into a block-ending
+`StatementResult::Intrinsic`. -/
+def isAssume (s : MirAst.Statement) : Bool :=
+  match s.kind with
+  | .intrinsic (.assume _) => true
+  | _ => false
+
+/-- `minimize`'s `translate_stmt` (`tooling/minimize/src/bb.rs`) on the
+fragment: `translateStatement` for the ordinary statements, and for
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+> "rs::StatementKind::Intrinsic(intrinsic) => {
+>      match &**intrinsic {
+>          rs::NonDivergingIntrinsic::Assume(op) => {
+>              let op = self.translate_operand(op, span);
+>              // Doesn't return anything, get us a dummy place.
+>              let destination = build::unit_place();
+>              return StatementResult::Intrinsic {
+>                  intrinsic: IntrinsicOp::Assume,
+>                  destination,
+>                  arguments: list![op],
+>              };
+>          }
+>          rs::NonDivergingIntrinsic::CopyNonOverlapping(_) =>
+>              rs::span_bug!(span, \"NonDivergingIntrinsic not supported: {intrinsic:?}\"),
+>      }
+>  }"
+`translate_operand` lowers `move p` like `copy p` (`translateOperand`).
+`CopyNonOverlapping` is a `span_bug!` in `minimize` and stays untranslated. -/
+def translateStmtResult (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Option StatementResult :=
+  match s.kind with
+  | .intrinsic (.assume op) =>
+    (translateOperand decls op).map (fun op' => .intrinsic .Assume unitPlace [op'])
+  | _ => (translateStatement decls s layouts).map .statement
+
+/-- The statement loop of `minimize`'s `translate_bb`
+(`tooling/minimize/src/bb.rs`):
+> "for stmt in bb.statements.iter() {
+>      match self.translate_stmt(stmt) {
+>          StatementResult::Statement(stmt) => {
+>              cur_block_statements.push(stmt);
+>          }
+>          StatementResult::Intrinsic { intrinsic, destination, arguments } => {
+>              // Generate a fresh bb name.
+>              let next_bb = self.fresh_bb_name();
+>              // End the current block by jumping to the next one.
+>              let terminator = Terminator::Intrinsic {
+>                  intrinsic,
+>                  arguments,
+>                  ret: destination,
+>                  next_block: Some(next_bb),
+>              };
+>              let cur_block = BasicBlock {
+>                  statements: cur_block_statements,
+>                  terminator,
+>                  kind: block_kind,
+>              };
+>              let old = self.blocks.insert(cur_block_name, cur_block);
+>              assert!(old.is_none()); // make sure we do not overwrite a bb
+>              // Go on building the next block.
+>              cur_block_name = next_bb;
+>              cur_block_statements = List::new();
+>          }
+>      }
+>  }"
+Given the open block's name `cur` and statements `acc` and the next fresh
+block index `nextBb`, returns the name and statements of the block that is
+still open after the loop, the blocks the loop finished (in insertion order),
+and the next fresh index. Fragment blocks are not cleanup blocks, so
+`block_kind` is `BbKind::Regular`. -/
+def splitStmts (cur : Gen.BbName) (acc : List Gen.Statement) (nextBb : Nat) :
+    List StatementResult →
+      Gen.BbName × List Gen.Statement × List (Gen.BbName × Gen.BasicBlock) × Nat
+  | [] => (cur, acc, [], nextBb)
+  | .statement s :: rest => splitStmts cur (acc ++ [s]) nextBb rest
+  | .intrinsic op dest args :: rest =>
+    let next := bbName nextBb
+    let r := splitStmts next [] (nextBb + 1) rest
+    (r.1, r.2.1, (cur, ⟨acc, .Intrinsic op args dest (some next), .Regular⟩) :: r.2.2.1, r.2.2.2)
+
+/-- Translate basic blocks in index order while threading the fresh block
+index `nextCleanup` (starting at `body.basicBlocks.length + 1`, after
+`init_bb = bbName n` in `FnCtxt::translate`). `minimize`'s `translate_bb`
+(`tooling/minimize/src/bb.rs`) first splits the block at every `Assume`
+statement (`splitStmts`, taking fresh names in statement order) and then
+translates the terminator into the block that is still open:
+> "let TerminatorResult { stmts, terminator } = self.translate_terminator(bb);
+>  for stmt in stmts.iter() {
+>      cur_block_statements.push(stmt);
+>  }
+>  let cur_block =
+>      BasicBlock { statements: cur_block_statements, terminator, kind: block_kind };
+>  let old = self.blocks.insert(cur_block_name, cur_block);
+>  assert!(old.is_none()); // make sure we do not overwrite a bb"
+so any unwind block of the terminator takes a fresh name after the split
+blocks. The first component lists every block that `translate_bb` inserts
+for MIR blocks (the segment named after the MIR block comes first), and the
+second component the synthesized cleanup blocks. -/
+def translateBlocksInProg (fnMap : FnMap) (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) :
+    Nat → Nat → List MirAst.BasicBlockData →
+      Option (List (Gen.BbName × Gen.BasicBlock) × List (Gen.BbName × Gen.BasicBlock))
+  | _, _, [] => some ([], [])
+  | i, nextCleanup, bb :: bbs => do
+    let results ← bb.statements.mapM (translateStmtResult decls · layouts)
+    let sp := splitStmts (bbName i) [] nextCleanup results
+    let (term, nextCleanup', extra1) ←
+      translateTerminatorInProg fnMap layouts decls sp.2.2.2 bb.terminator
+    let (rest, extraRest) ← translateBlocksInProg fnMap layouts decls (i + 1) nextCleanup' bbs
+    pure (sp.2.2.1 ++ [(sp.1, ⟨sp.2.1, term, .Regular⟩)] ++ rest, extra1 ++ extraRest)
+
+/-- How `translate_bb` lays out MIR statements `ss`, followed by a terminator
+that `translateTerminatorInProg` translated to `term`, from MiniRust block
+`name` on, as seen through a block lookup `look` (`mapGet f.blocks`):
+* `last`: no statement of `ss` is an `Assume`, and `name` holds the
+  translations of `ss` followed by `term`;
+* `split`: `ss = pre ++ s :: post` with `s` the first `Assume(op)`, `name`
+  holds the translations of `pre` followed by `Terminator::Intrinsic` of
+  `IntrinsicOp::Assume` on `op` with destination `unit_place()` and next block
+  `next`, and `post` is laid out from `next` on (`splitStmts`).
+
+A MIR program point `(blk, stmt)` therefore corresponds to a MiniRust program
+point inside one of these segments (`PcAt` in `Correspondence.Relation`). -/
+inductive SegChain (look : Gen.BbName → Option Gen.BasicBlock)
+    (decls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) (term : Gen.Terminator) :
+    Gen.BbName → List MirAst.Statement → Prop where
+  | last {name : Gen.BbName} {ss : List MirAst.Statement} {stmts : List Gen.Statement}
+      (hlook : look name = some ⟨stmts, term, .Regular⟩)
+      (htr : ss.mapM (translateStatement decls · layouts) = some stmts)
+      (hna : ∀ s ∈ ss, isAssume s = false) :
+      SegChain look decls layouts term name ss
+  | split {name : Gen.BbName} {nextIdx : Nat} {pre post : List MirAst.Statement}
+      {s : MirAst.Statement} {op : MirAst.Operand} {op' : Gen.ValueExpr}
+      {stmts : List Gen.Statement}
+      (hlook : look name =
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextIdx)), .Regular⟩)
+      (htr : pre.mapM (translateStatement decls · layouts) = some stmts)
+      (hna : ∀ s ∈ pre, isAssume s = false)
+      (hs : s.kind = .intrinsic (.assume op))
+      (hop : translateOperand decls op = some op')
+      (hrest : SegChain look decls layouts term (bbName nextIdx) post) :
+      SegChain look decls layouts term name (pre ++ s :: post)
+
+/-- Active program-counter relation along a `SegChain` rooted at
+`bbName entrySeg` for MIR statement list `ss` ending in `term`: MIR statement
+index `stmtIdx` corresponds to MiniRust block `bbName curSeg` at statement
+index `segStmt`. -/
+inductive SegPc (look : Gen.BbName → Option Gen.BasicBlock)
+    (decls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) (term : Gen.Terminator) :
+    Nat → List MirAst.Statement → Nat → Nat → Nat → Prop where
+  | hereLast {curSeg segStmt : Nat} {ss : List MirAst.Statement}
+      {stmts : List Gen.Statement}
+      (hlook : look (bbName curSeg) = some ⟨stmts, term, .Regular⟩)
+      (htr : ss.mapM (translateStatement decls · layouts) = some stmts)
+      (hna : ∀ s ∈ ss, isAssume s = false)
+      (hle : segStmt ≤ ss.length) :
+      SegPc look decls layouts term curSeg ss segStmt curSeg segStmt
+  | hereSplit {curSeg nextSeg segStmt : Nat} {pre post : List MirAst.Statement}
+      {s : MirAst.Statement} {op : MirAst.Operand} {op' : Gen.ValueExpr}
+      {stmts : List Gen.Statement}
+      (hlook : look (bbName curSeg) =
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg)), .Regular⟩)
+      (htr : pre.mapM (translateStatement decls · layouts) = some stmts)
+      (hna : ∀ s ∈ pre, isAssume s = false)
+      (hs : s.kind = .intrinsic (.assume op))
+      (hop : translateOperand decls op = some op')
+      (hrest : SegChain look decls layouts term (bbName nextSeg) post)
+      (hle : segStmt ≤ pre.length) :
+      SegPc look decls layouts term curSeg (pre ++ s :: post) segStmt curSeg segStmt
+  | stepSplit {entrySeg nextSeg curSeg segStmt restIdx : Nat}
+      {pre post : List MirAst.Statement}
+      {s : MirAst.Statement} {op : MirAst.Operand} {op' : Gen.ValueExpr}
+      {stmts : List Gen.Statement}
+      (hlook : look (bbName entrySeg) =
+        some ⟨stmts, .Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg)), .Regular⟩)
+      (htr : pre.mapM (translateStatement decls · layouts) = some stmts)
+      (hna : ∀ s ∈ pre, isAssume s = false)
+      (hs : s.kind = .intrinsic (.assume op))
+      (hop : translateOperand decls op = some op')
+      (hrest : SegPc look decls layouts term nextSeg post restIdx curSeg segStmt) :
+      SegPc look decls layouts term entrySeg (pre ++ s :: post) (pre.length + 1 + restIdx) curSeg segStmt
+
+/-- `FnCtxt::translate` for a function in a multi-function program: `init_bb`
+takes `bbName n` (`n = body.basicBlocks.length`), and the blocks that
+`translate_bb` creates with `fresh_bb_name()` (the continuations after each
+`Assume` statement, `splitStmts`, and the cleanup blocks synthesized by
+`translate_unwind_action`) take `bbName (n + 1), bbName (n + 2), ..` in
+allocation order (`tooling/minimize/src/function.rs`). When `body` contains no
+`Call` terminators and no `Assume` statements, `extra` is empty, every MIR
+block yields exactly one MiniRust block, and `translateFnInProg` produces the
+exact same `Gen.Function` as `translateFn`. -/
+def translateFnInProg (fnMap : FnMap)
+    (body : MirAst.CapturedMir) : Option Gen.Function := do
+  let conv ← translateCallConv body.fnAbi.conv
+  let locals ← translateLocals body.layouts 0 body.localDecls
+  let n := body.basicBlocks.length
+  let (blocks, extra) ←
+    translateBlocksInProg fnMap body.layouts body.localDecls 0 (n + 1) body.basicBlocks
+  pure {
+    locals := ⟨locals⟩
+    args := (List.range body.argCount).map (fun k => localName (k + 1))
+    ret := localName 0
+    calling_convention := conv
+    blocks := ⟨blocks ++ [(bbName n, initBlock body)] ++ extra⟩
+    start := bbName n
+    implicit_writes := true
+  }
+
+/-- `minimize`'s synthesized program-entry wrapper `mk_start_fn`
+(`tooling/minimize/src/program.rs`):
+> "fn mk_start_fn(entry: u32) -> Function {
+>      let b0_name = BbName(Name::from_internal(0));
+>      let b1_name = BbName(Name::from_internal(1));
+>      let b2_name = BbName(Name::from_internal(2));
+>      let l0_name = LocalName(Name::from_internal(0));" -/
+def mkStartFn (entryIdx : Nat) : Gen.Function :=
+  let b0Name := bbName 0
+  let b1Name := bbName 1
+  let b2Name := bbName 2
+  let l0Name := localName 0
+  let b0 : Gen.BasicBlock :=
+    ⟨[], .Call (fnPtrExpr (fnName entryIdx)) .Rust [] buildUnitPlace (some b1Name) (some b2Name),
+      .Regular⟩
+  let b1 : Gen.BasicBlock :=
+    ⟨[], .Intrinsic .Exit [] buildUnitPlace none, .Regular⟩
+  let b2 : Gen.BasicBlock :=
+    ⟨[], buildAbort, .Catch⟩
+  { locals := ⟨[(l0Name, unitTy)]⟩
+    args := []
+    ret := l0Name
+    blocks := ⟨[(b0Name, b0), (b1Name, b1), (b2Name, b2)]⟩
+    start := b0Name
+    calling_convention := .C
+    implicit_writes := true }
+
+/-- Translate `(entry :: callees)` in index order against `fnMap`. -/
+def translateProgFns (fnMap : FnMap) :
+    Nat → List MirAst.CapturedMir → Option (List (Gen.FnName × Gen.Function))
+  | _, [] => some []
+  | idx, b :: bs => do
+    let f ← translateFnInProg fnMap b
+    let rest ← translateProgFns fnMap (idx + 1) bs
+    pure ((fnName idx, f) :: rest)
+
+/-- `Ctxt::translate` for a multi-function MIR environment (`entry` + `callees`,
+`tooling/minimize/src/program.rs`):
+> "let number_of_fns = self.fn_name_map.len();
+>
+>  // add a `start` function, which calls `entry`.
+>  let start = FnName(Name::from_internal(number_of_fns as _));
+>  self.functions.insert(start, mk_start_fn(0));
+>
+>  Program {
+>      start,
+>      functions: self.functions,
+>      globals: self.globals,
+>      vtables: self.vtables,
+>      traits: self.traits,
+>  }" -/
+def translateProg (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir) :
+    Option Gen.Program := do
+  let fnMap := fnNameMap entry callees
+  let fns ← translateProgFns fnMap 0 (entry :: callees)
+  let startFn := fnName (1 + callees.length)
+  pure {
+    functions := ⟨fns ++ [(startFn, mkStartFn 0)]⟩
+    start := startFn
+    globals := ⟨[]⟩
+    vtables := ⟨[]⟩
+    traits := ⟨[]⟩
   }
 
 /-! ## The fragment -/
@@ -2653,8 +3384,10 @@ def readsOk : List Nat → List MirAst.Operand → Bool
     (simpleOp op && (opLocals op).all (fun j => !mo.contains j)) &&
     readsOk (moveOut mo op) ops
 
-/-- The moved-out locals after statement `s`: those its operands move out of,
-minus the root local it writes (a root assignment's destination, or the local of
+/-- The moved-out locals after statement `s`: those its operands move out of
+(including `Assume(move _j)`, which `evalOperand` moves out in Anneal while
+`translateOperand` lowers `move` via `ValueExpr::Load` in MiniRust), minus the
+root local it writes (a root assignment's destination, or the local of
 `StorageLive`, `StorageDead`, or root `Deinit`, after which both models agree
 that the local is unallocated or holds the same bytes; a projected assignment
 records its operand moves without clearing the destination root local). -/
@@ -2662,6 +3395,7 @@ def stmtMoved (mo : List Nat) (s : MirAst.Statement) : List Nat :=
   match s.kind with
   | .assign ⟨i, []⟩ rv => ((rvOperands rv).foldl moveOut mo).filter (· != i)
   | .assign ⟨_, _ :: _⟩ rv => (rvOperands rv).foldl moveOut mo
+  | .intrinsic (.assume op) => moveOut mo op
   | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => mo.filter (· != i)
   | _ => mo
 
@@ -2692,19 +3426,38 @@ def stmtReadsOk (mo : List Nat) (s : MirAst.Statement) : Bool :=
       let mo' := (rvOperands rv).foldl moveOut mo
       (placeLocals p).all (fun j => !mo'.contains j)
   | .retag _ ⟨p, []⟩ => !mo.contains p
+  | .intrinsic (.assume op) => readsOk mo [op]
   | _ => true
 
-/-- Whether terminator `t` reads no moved-out local (`Return` reads `_0`). -/
+/-- Whether terminator `t` reads no local in `mo`. For `Call`:
+* MiniRust's `Terminator::Call` runs `prepare_for_inplace_passing(ret_place)`
+  (writing `Uninit` to `ret_place`) *before* evaluating `arguments`, so
+  `readsOk (dst :: mo) argOps` forbids `argOps` from reading either a stale
+  local in `mo` or `dst`;
+* a root destination `⟨dst, []⟩` overwrites `_dst` completely without reading
+  its prior value (so `_dst = callee(..)` may re-initialize a moved-out local),
+  whereas a projected destination `⟨dst, _ :: _⟩` (`_dst.f = callee(..)`)
+  preserves the sibling field of `_dst` and requires `!mo.contains dst`. -/
 def termReadsOk (mo : List Nat) (t : MirAst.Terminator) : Bool :=
   match t.kind with
   | .switchInt discr _ => readsOk mo [discr]
   | .return_ => !mo.contains 0
+  | .call _ argOps ⟨dst, []⟩ _ _ => readsOk (dst :: mo) argOps
+  | .call _ argOps ⟨dst, _ :: _⟩ _ _ => !mo.contains dst && readsOk (dst :: mo) argOps
   | _ => true
 
-/-- The moved-out locals after terminator `t` reads its operand. -/
+/-- The stale moved-out locals after terminator `t`: `SwitchInt` marks a moved
+discriminant (lowered via `ValueExpr::Load`, which leaves initialized bytes in
+MiniRust), whereas `Call` clears a root destination `_dst` on its `some target`
+edge and does NOT add `Move` call arguments to `mo` (`callArgOk` restricts
+`Call` `Move` arguments to root locals `⟨j, []⟩`, which `translateCallArg`
+lowers to `ArgumentExpr::InPlace`, writing `Uninit` bytes in MiniRust too so
+`_j` is uninitialized in both semantics rather than stale; `termTupleInit`
+separately drops moved tuple locals via `dropMovedFrom`). -/
 def termMoved (mo : List Nat) (t : MirAst.Terminator) : List Nat :=
   match t.kind with
   | .switchInt discr _ => moveOut mo discr
+  | .call _ _ ⟨dst, []⟩ (some _) _ => mo.filter (· != dst)
   | _ => mo
 
 /-- The successor block indices of terminator `t`. -/
@@ -2712,6 +3465,7 @@ def termTargets (t : MirAst.Terminator) : List Nat :=
   match t.kind with
   | .goto target => [target]
   | .switchInt _ targets => targets.otherwise :: targets.branches.map Prod.snd
+  | .call _ _ _ (some target) _ => [target]
   | _ => []
 
 /-- Add elements of `xs` not already present in `acc`. -/
@@ -2782,15 +3536,18 @@ def stmtLocals (s : MirAst.Statement) : List Nat :=
   match s.kind with
   | .assign p (.rawPtr _ q) | .assign p (.ref _ q) => placeLocals p ++ placeLocals q
   | .assign p rv => placeLocals p ++ (rvOperands rv).flatMap opLocals
+  | .intrinsic (.assume op) => opLocals op
   | .placeMention p | .deinit p | .retag _ p => placeLocals p
   | .storageLive i | .storageDead i => [i]
   | _ => []
 
-/-- The locals a terminator mentions (`Return` reads `_0`). -/
+/-- The locals a terminator mentions (`Return` reads `_0`; `Call` mentions its
+destination local and all locals read by its arguments). -/
 def termLocals (t : MirAst.Terminator) : List Nat :=
   match t.kind with
   | .switchInt discr _ => opLocals discr
   | .return_ => [0]
+  | .call _ argOps dst _ _ => dst.local_ :: argOps.filterMap opRead
   | _ => []
 
 /-- No statement or terminator mentions a local that `initBlock` allocates. -/
@@ -2833,6 +3590,7 @@ def stmtPreservesAddrTaken (addrLocals : List Nat) (s : MirAst.Statement) : Bool
       | none => true
   match s.kind with
   | .assign dst rv => !addrLocals.contains dst.local_ && moveFree (rvOperands rv)
+  | .intrinsic (.assume op) => moveFree [op]
   | .deinit p => !addrLocals.contains p.local_
   | .storageLive i | .storageDead i => !addrLocals.contains i
   | _ => true
@@ -3192,7 +3950,14 @@ condition `argCount + 1 ≤ localDecls.length` ensures that `_0` (`f.ret`) and
 >          \"Function: return local is also used for an argument\");
 >  };"
 The bound `localDecls.length < 2^31` keeps the first-fit candidate addresses of
-`BM.pickAddr` that the callee's locals can occupy below `2^63`. -/
+`BM.pickAddr` that the callee's locals can occupy below `2^63`.
+
+Note: `inFragment` checks `statementOk`, which rejects
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`. The single-body
+MR-1.x and MR-4.1 theorems (like `run_ub`) do not model block splitting.
+`Assume` is only supported in multi-function proofs (`bodyInProgFragment`),
+where `translateFnInProg` explicitly translates `Assume` into a block-splitting
+`Terminator::Intrinsic` corresponding to `SegChain` and `SegPc`. -/
 def inFragment (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
   decide (body.argCount + 1 ≤ body.localDecls.length) &&
@@ -3682,11 +4447,15 @@ theorem translateFnWithIntrinsics_of_translateFn {body : MirAst.CapturedMir} {f 
     cases hblks : translateBlocks body.layouts body.localDecls 0 body.basicBlocks with
     | none => simp [hblks] at h
     | some blocks =>
-      simp only [hblks, Option.bind_some, Option.pure_def, Option.some.injEq] at h
-      subst h
-      have hbi := translateBlocksWithIntrinsics_of_translateBlocks body.layouts body.localDecls
-        0 body.basicBlocks.length body.basicBlocks blocks hclean hblks
-      simp [translateFnWithIntrinsics, hloc, hbi]
+      simp only [hblks, Option.bind_some] at h
+      cases hconv : translateCallConv body.fnAbi.conv with
+      | none => simp [hconv] at h
+      | some conv =>
+        simp only [hconv, Option.bind_some, Option.pure_def, Option.some.injEq] at h
+        subst h
+        have hbi := translateBlocksWithIntrinsics_of_translateBlocks body.layouts body.localDecls
+          0 body.basicBlocks.length body.basicBlocks blocks hclean hblks
+        simp [translateFnWithIntrinsics, hconv, hloc, hbi]
 
 /-- `translateStatement` rejects provenance casts. -/
 theorem translateStatement_not_provCast {decls : List MirAst.LocalDecl} {s : MirAst.Statement}
@@ -3839,5 +4608,529 @@ theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
   intro bb hbb
   obtain ⟨⟨hc, hst⟩, htm⟩ := h9 bb hbb
   exact ⟨⟨hc, fun s hs => by simp [statementOkWithIntrinsics, hst s hs]⟩, htm⟩
+/-! ### Multi-function fragment (`progInFragment`)
+
+In MiniRust's `Terminator::Call` (`spec/lang/step/terminators.md`), the caller
+evaluates `ret` and runs `prepare_for_inplace_passing(ret_place, ret_ty)`
+(which checks liveness/alignment and writes `Uninit` bytes to `ret_place`)
+*before* evaluating `arguments` and pushing the callee frame, whereas Anneal's
+`TerminatorKind.call` evaluates `argOps` first, pushes the callee frame, and
+writes `destination` via `writePlaceValue` when the callee returns:
+
+1. `livenessOk` computes the greatest fixed point `liveAtEntry` of must-live
+   locals across the CFG (`_0 .. _argCount` live at `bb0` entry, `StorageLive`
+   adds a local, `StorageDead` removes it, CFG joins intersect) so every call's
+   `destination.local_` is guaranteed live when `Terminator::Call` runs.
+2. `tupleInitOk` computes the greatest fixed point `tupleInitAtEntry` of
+   must-initialized `(Int, bool)` 2-tuple locals across the CFG so that when a
+   call writes into a projected tuple field (`_dst.0` or `_dst.1`), `_dst` is
+   already an initialized 2-tuple in Anneal (matching `writePlaceValue` on
+   `Return`) while MiniRust's `prepare_for_inplace_passing` deinitializes only
+   the target field's bytes and preserves the sibling field.
+3. `callTerminatorOk` checks callee resolution in `callees`, parameter count and
+   type compatibility across all four fragment types, root-only `Operand::Move`
+   on call arguments (projected `move (_j.f)` leaves `_j` initialized in Anneal
+   but writes `Uninit` via `ArgumentExpr::InPlace` in MiniRust), return-place
+   liveness/type compatibility, and disjointness of `destination.local_` from
+   all locals read by `argOps` (so `prepare_for_inplace_passing` on `ret`
+   cannot clobber any argument before `eval_argument` reads it). -/
+
+/-- Must-live transfer of statement `s` on a list of live local indices. -/
+def stmtMustLive (lv : List Nat) (s : MirAst.Statement) : List Nat :=
+  match s.kind with
+  | .storageLive i => if lv.contains i then lv else i :: lv
+  | .storageDead i => lv.filter (· != i)
+  | _ => lv
+
+/-- Initial per-block must-live sets before iteration: `_0 .. _argCount` at
+`bb0`, and all declared locals `0 .. L - 1` at `blk > 0` (top of the
+intersection lattice). -/
+def initLiveEntries (body : MirAst.CapturedMir) : List (List Nat) :=
+  (List.range body.basicBlocks.length).map fun blk =>
+    if blk == 0 then List.range (body.argCount + 1)
+    else List.range body.localDecls.length
+
+/-- One forward CFG intersection pass for must-live locals. -/
+def stepLiveEntries (body : MirAst.CapturedMir) (entries : List (List Nat)) :
+    List (List Nat) :=
+  let bbs := body.basicBlocks
+  (List.range bbs.length).map fun dst =>
+    let initAcc :=
+      if dst == 0 then List.range (body.argCount + 1)
+      else entries.getD dst (List.range body.localDecls.length)
+    (List.range bbs.length).foldl (fun acc src =>
+      match bbs[src]? with
+      | some bb =>
+        if (termTargets bb.terminator).contains dst then
+          let exitLv := bb.statements.foldl stmtMustLive (entries.getD src [])
+          acc.filter (fun i => exitLv.contains i)
+        else acc
+      | none => acc) initAcc
+
+/-- Iterate forward must-live intersection up to `fuel` passes. -/
+def iterLiveEntries : Nat → MirAst.CapturedMir → List (List Nat) → List (List Nat)
+  | 0, _, entries => entries
+  | n + 1, body, entries =>
+    let entries' := stepLiveEntries body entries
+    if entries' == entries then entries
+    else iterLiveEntries n body entries'
+
+/-- Locals guaranteed live on entry to block `blk`. -/
+def liveAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List Nat :=
+  let fuel := body.basicBlocks.length * (body.localDecls.length + 1)
+  (iterLiveEntries fuel body (initLiveEntries body)).getD blk []
+
+/-- Locals guaranteed live before statement `stmt` of block `blk`. -/
+def mustLiveBefore (body : MirAst.CapturedMir) (blk stmt : Nat) : List Nat :=
+  match body.basicBlocks[blk]? with
+  | some bb => (bb.statements.take stmt).foldl stmtMustLive (liveAtEntry body blk)
+  | none => liveAtEntry body blk
+
+/-- Inductive verification that `liveAtEntry` is a valid post-fixed point:
+every local in `liveAtEntry body 0` is in `0 .. argCount`, and every CFG edge
+`blk → t` preserves every local in `liveAtEntry body t`. -/
+def livenessOk (body : MirAst.CapturedMir) : Bool :=
+  (liveAtEntry body 0).all (fun i => decide (i ≤ body.argCount)) &&
+  (List.range body.basicBlocks.length).all fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb =>
+      let exitLv := bb.statements.foldl stmtMustLive (liveAtEntry body blk)
+      (termTargets bb.terminator).all (fun t =>
+        (liveAtEntry body t).all (fun i => exitLv.contains i))
+    | none => true
+
+/-- Whether local `i` is declared with an `(Int, bool)` 2-tuple type. -/
+def isTupleLocal (decls : List MirAst.LocalDecl) (i : Nat) : Bool :=
+  match decls[i]? with
+  | some d => (intBoolTupleOf d.ty).isSome
+  | none => false
+
+/-- Remove any root local moved out by `ops` from `ti`. -/
+def dropMovedFrom (ti : List Nat) (ops : List MirAst.Operand) : List Nat :=
+  ops.foldl (fun acc op =>
+    match opMoved op with
+    | some j => acc.filter (· != j)
+    | none => acc) ti
+
+/-- Must-initialized 2-tuple transfer of statement `s`. -/
+def stmtTupleInit (decls : List MirAst.LocalDecl) (ti : List Nat)
+    (s : MirAst.Statement) : List Nat :=
+  match s.kind with
+  | .assign ⟨i, []⟩ rv =>
+    let ti' := dropMovedFrom ti (rvOperands rv)
+    if isTupleLocal decls i then
+      if ti'.contains i then ti' else i :: ti'
+    else ti'.filter (· != i)
+  | .assign ⟨_, _ :: _⟩ rv => dropMovedFrom ti (rvOperands rv)
+  | .intrinsic (.assume op) => dropMovedFrom ti [op]
+  | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ => ti.filter (· != i)
+  | _ => ti
+
+/-- Must-initialized 2-tuple transfer across terminator `t` to its normal
+successor(s). -/
+def termTupleInit (decls : List MirAst.LocalDecl) (ti : List Nat)
+    (t : MirAst.Terminator) : List Nat :=
+  match t.kind with
+  | .switchInt discr _ => dropMovedFrom ti [discr]
+  | .call _ argOps ⟨dst, []⟩ (some _) _ =>
+    let ti' := dropMovedFrom ti argOps
+    if isTupleLocal decls dst then
+      if ti'.contains dst then ti' else dst :: ti'
+    else ti'.filter (· != dst)
+  | .call _ argOps ⟨_, _ :: _⟩ (some _) _ => dropMovedFrom ti argOps
+  | _ => ti
+
+/-- Initial per-block must-initialized 2-tuple sets: tuple parameters among
+`1 .. argCount` at `bb0`, and all tuple locals at `blk > 0`. -/
+def initTupleEntries (body : MirAst.CapturedMir) : List (List Nat) :=
+  let allTuples := (List.range body.localDecls.length).filter (isTupleLocal body.localDecls)
+  let paramTuples :=
+    ((List.range body.argCount).map (· + 1)).filter (isTupleLocal body.localDecls)
+  (List.range body.basicBlocks.length).map fun blk =>
+    if blk == 0 then paramTuples else allTuples
+
+/-- One forward CFG intersection pass for must-initialized 2-tuple locals. -/
+def stepTupleInitEntries (body : MirAst.CapturedMir) (entries : List (List Nat)) :
+    List (List Nat) :=
+  let bbs := body.basicBlocks
+  let allTuples := (List.range body.localDecls.length).filter (isTupleLocal body.localDecls)
+  let paramTuples :=
+    ((List.range body.argCount).map (· + 1)).filter (isTupleLocal body.localDecls)
+  (List.range bbs.length).map fun dst =>
+    let initAcc :=
+      if dst == 0 then paramTuples
+      else entries.getD dst allTuples
+    (List.range bbs.length).foldl (fun acc src =>
+      match bbs[src]? with
+      | some bb =>
+        if (termTargets bb.terminator).contains dst then
+          let midTi := bb.statements.foldl (stmtTupleInit body.localDecls) (entries.getD src [])
+          let exitTi := termTupleInit body.localDecls midTi bb.terminator
+          acc.filter (fun i => exitTi.contains i)
+        else acc
+      | none => acc) initAcc
+
+/-- Iterate forward must-initialized 2-tuple intersection up to `fuel` passes. -/
+def iterTupleInitEntries : Nat → MirAst.CapturedMir → List (List Nat) → List (List Nat)
+  | 0, _, entries => entries
+  | n + 1, body, entries =>
+    let entries' := stepTupleInitEntries body entries
+    if entries' == entries then entries
+    else iterTupleInitEntries n body entries'
+
+/-- 2-tuple locals guaranteed initialized on entry to block `blk`. -/
+def tupleInitAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List Nat :=
+  let fuel := body.basicBlocks.length * (body.localDecls.length + 1)
+  (iterTupleInitEntries fuel body (initTupleEntries body)).getD blk []
+
+/-- 2-tuple locals guaranteed initialized before statement `stmt` of block `blk`. -/
+def tupleInitBefore (body : MirAst.CapturedMir) (blk stmt : Nat) : List Nat :=
+  match body.basicBlocks[blk]? with
+  | some bb =>
+    (bb.statements.take stmt).foldl (stmtTupleInit body.localDecls) (tupleInitAtEntry body blk)
+  | none => tupleInitAtEntry body blk
+
+/-- Inductive verification that `tupleInitAtEntry` is a valid post-fixed point. -/
+def tupleInitOk (body : MirAst.CapturedMir) : Bool :=
+  (tupleInitAtEntry body 0).all (fun i =>
+    decide (1 ≤ i ∧ i ≤ body.argCount) && isTupleLocal body.localDecls i) &&
+  (List.range body.basicBlocks.length).all fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb =>
+      let midTi :=
+        bb.statements.foldl (stmtTupleInit body.localDecls) (tupleInitAtEntry body blk)
+      let exitTi := termTupleInit body.localDecls midTi bb.terminator
+      (termTargets bb.terminator).all (fun t =>
+        (tupleInitAtEntry body t).all (fun i => exitTi.contains i))
+    | none => true
+
+/-- Whether a call argument `op` in a caller with declarations `decls` is a
+well-typed fragment argument for callee parameter declaration `paramDecl`.
+`Operand::Move` is restricted to root locals (`move _j`), because projected
+`move (_j.f)` leaves `_j` initialized in Anneal (`evalOperand`) while MiniRust's
+`ArgumentExpr::InPlace` writes `Uninit` to field `f`. -/
+def callArgOk (layouts : Layout.LayoutTable) (decls : List MirAst.LocalDecl)
+    (paramDecl : MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+  let shapeOk :=
+    match op with
+    | .move ⟨_, []⟩ => true
+    | .move _ => false
+    | _ => true
+  shapeOk &&
+  if isBoolTy paramDecl.ty then operandOkB layouts decls (copyOp op)
+  else if isOrderingTy paramDecl.ty then operandOkO decls (copyOp op)
+  else
+    match intBoolTupleOf paramDecl.ty with
+    | some it => operandOkTuple decls it (copyOp op)
+    | none =>
+      match intTypeOf paramDecl.ty with
+      | some it => operandOk layouts decls it (copyOp op)
+      | none => false
+
+/-- Check every call argument against the callee's parameter declarations
+`_1 .. _argCount`. -/
+def callArgsOk (layouts : Layout.LayoutTable) (decls : List MirAst.LocalDecl) :
+    List MirAst.LocalDecl → List MirAst.Operand → Bool
+  | [], [] => true
+  | pd :: pds, op :: ops => callArgOk layouts decls pd op && callArgsOk layouts decls pds ops
+  | _, _ => false
+
+/-- Whether two MIR types translate to the same fragment MiniRust type. -/
+def sameFragmentTy (t1 t2 : MirAst.Ty) : Bool :=
+  (isBoolTy t1 && isBoolTy t2) ||
+  (isOrderingTy t1 && isOrderingTy t2) ||
+  (match intBoolTupleOf t1, intBoolTupleOf t2 with
+   | some it1, some it2 => decide (it1 = it2)
+   | _, _ => false) ||
+  (match intTypeOf t1, intTypeOf t2 with
+   | some it1, some it2 => decide (it1 = it2)
+   | _, _ => false)
+
+/-- Whether `destination` in the caller (with must-live set `lv` and
+must-initialized tuple set `ti` at the terminator) is a valid return place for a
+callee with return declaration `calleeRetDecl`:
+* root local `_dst`: `_dst` is must-live and has the same MiniRust type as
+  `calleeRetDecl`;
+* projected tuple field `_dst.0` or `_dst.1`: `_dst` is both must-live and
+  must-initialized as an `(it, bool)` 2-tuple, and the projected field has the
+  same MiniRust type as `calleeRetDecl`. -/
+def callDestOk (decls : List MirAst.LocalDecl) (lv ti : List Nat)
+    (calleeRetDecl : MirAst.LocalDecl) (destination : MirAst.Place) : Bool :=
+  match destination with
+  | ⟨dst, []⟩ =>
+    decide (dst < decls.length) && lv.contains dst &&
+    match decls[dst]? with
+    | some d => sameFragmentTy d.ty calleeRetDecl.ty
+    | none => false
+  | ⟨dst, [.field 0 fTy]⟩ =>
+    decide (dst < decls.length) && lv.contains dst && ti.contains dst &&
+    match decls[dst]? with
+    | some d =>
+      match intBoolTupleOf d.ty, intTypeOf fTy, intTypeOf calleeRetDecl.ty with
+      | some it, some fit, some rit => decide (fit = it) && decide (rit = it)
+      | _, _, _ => false
+    | none => false
+  | ⟨dst, [.field 1 fTy]⟩ =>
+    decide (dst < decls.length) && lv.contains dst && ti.contains dst &&
+    match decls[dst]? with
+    | some d =>
+      (intBoolTupleOf d.ty).isSome && isBoolTy fTy && isBoolTy calleeRetDecl.ty
+    | none => false
+  | _ => false
+
+/-- Whether `unwind` is one of the non-cleanup call `UnwindAction`s (`Continue`,
+`Unreachable`, or `Terminate`; fragment basic blocks have `!bb.isCleanup`). -/
+def callUnwindOk : MirAst.UnwindAction → Bool
+  | .continue_ | .unreachable | .terminate => true
+  | .cleanup _ => false
+
+/-- Whether a `TerminatorKind.call` at the end of block `blk` in `body` is in
+the multi-function fragment relative to `callees`. -/
+def callTerminatorOk (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir)
+    (blk : Nat) (t : MirAst.Terminator) : Bool :=
+  match t.kind, body.basicBlocks[blk]? with
+  | .call func argOps destination (some targetBb) unwind, some bb =>
+    match extractFnDefPath func with
+    | none => false
+    | some defPath =>
+      match translateIntrinsicOrNone body.localDecls defPath argOps destination (some targetBb) with
+      | some _ => false
+      | none =>
+        match MirSemantics.findCallee? callees defPath with
+      | none => false
+      | some callee =>
+        match callee.localDecls with
+        | [] => false
+        | retDecl :: restDecls =>
+          let lv := mustLiveBefore body blk bb.statements.length
+          let ti := tupleInitBefore body blk bb.statements.length
+          decide (targetBb < body.basicBlocks.length) &&
+          callUnwindOk unwind &&
+          (translateCallConv callee.fnAbi.conv).isSome &&
+          decide (argOps.length = callee.argCount) &&
+          decide (callee.argCount ≤ restDecls.length) &&
+          callArgsOk body.layouts body.localDecls (restDecls.take callee.argCount) argOps &&
+          callDestOk body.localDecls lv ti retDecl destination &&
+          argOps.all (fun op => opRead op != some destination.local_)
+  | _, _ => false
+
+/-- Block terminator check in a multi-function program: either a single-body
+fragment terminator (`terminatorOk`) or a fragment direct call
+(`callTerminatorOk`). -/
+def terminatorInProgOk (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir)
+    (blk : Nat) (t : MirAst.Terminator) : Bool :=
+  terminatorOk body.layouts body.localDecls body.basicBlocks.length t ||
+  callTerminatorOk callees body blk t
+
+/-- Statement check in a multi-function program (`progInFragment`): either a
+single-body fragment statement (`statementOk`) or
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on a well-typed
+`bool` fragment operand (`operandOkB decls (copyOp op)`), which `translate_bb`
+splits into `Terminator::Intrinsic { intrinsic: IntrinsicOp::Assume, .. }`
+jumping to a fresh continuation block (`splitStmts`, `SegChain`). -/
+def progStatementOk (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
+  match s.kind with
+  | .intrinsic (.assume op) => operandOkB layouts decls (copyOp op)
+  | _ => statementOk decls s layouts
+
+/-- Per-function fragment check within a multi-function program
+`(fnMap, callees)`. Statements satisfy `progStatementOk` (admitting
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` alongside
+`statementOk`), and `translateFnInProg` splits each MIR basic block at every
+`Assume` statement (`SegChain`, `SegPc`) exactly like `minimize`. -/
+def bodyInProgFragment (fnMap : FnMap)
+    (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir) : Bool :=
+  body.isRuntimePostCleanup &&
+  decide (body.argCount + 1 ≤ body.localDecls.length) &&
+  decide (body.localDecls.length < 2 ^ 31) &&
+  body.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) &&
+  decide (body.basicBlocks ≠ []) &&
+  (List.range body.basicBlocks.length).all (fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb =>
+      !bb.isCleanup &&
+      bb.statements.all (progStatementOk body.localDecls · body.layouts) &&
+      terminatorInProgOk callees body blk bb.terminator
+    | none => true) &&
+  storageDeadOk body && movesOk body && mentionsOk body &&
+  livenessOk body && tupleInitOk body &&
+  (translateFnInProg fnMap body).isSome
+
+/-- All callee `DefPath`s syntactically referenced by `Call` terminators in
+`body`. -/
+def callCalleesOf (body : MirAst.CapturedMir) : List String :=
+  body.basicBlocks.filterMap fun bb =>
+    match bb.terminator.kind with
+    | .call func _ _ _ _ => extractFnDefPath func
+    | _ => none
+
+/-- Fuel-bounded worst-case sum of `localDecls.length` along any static call
+chain rooted at `body`. Returns `none` if the call graph has a cycle or exceeds
+`fuel` frames. -/
+def maxStackLocalsAux : Nat → List MirAst.CapturedMir → MirAst.CapturedMir → Option Nat
+  | 0, _, _ => none
+  | fuel + 1, callees, body => do
+    let subBounds ← (callCalleesOf body).mapM fun dp => do
+      let callee ← MirSemantics.findCallee? callees dp
+      maxStackLocalsAux fuel callees callee
+    pure (body.localDecls.length + subBounds.foldl Nat.max 0)
+
+/-- Worst-case total `localDecls.length` across any call stack rooted at `entry`
+within `callees` (`fuel = callees.length + 1` suffices for every acyclic call
+graph over `callees`). -/
+def maxStackLocals (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir) :
+    Option Nat :=
+  maxStackLocalsAux (callees.length + 1) callees entry
+
+/-- Decidable multi-function fragment check for `entry` together with `callees`:
+1. `entry` and all `callees` have distinct `defPath`s;
+2. `entry` and every callee in `callees` satisfy `bodyInProgFragment`;
+3. the call graph rooted at `entry` is acyclic and its worst-case stack-local
+   budget `maxStackLocals entry callees` is strictly below `2^31` (keeping
+   `BM.pickAddr` first-fit stack candidate addresses below `2^63` across all
+   simultaneously live frames);
+4. `translateProg entry callees` succeeds. -/
+def progInFragment (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir) : Bool :=
+  let fnMap := fnNameMap entry callees
+  ((entry :: callees).map (·.defPath)).Nodup &&
+  (entry :: callees).all (bodyInProgFragment fnMap callees) &&
+  (match maxStackLocals entry callees with
+   | some bound => decide (bound < 2 ^ 31)
+   | none => false) &&
+  (translateProg entry callees).isSome
+
+
+
+/-- `Function::check_next_block` (`spec/lang/well-formed.md`):
+> "fn check_next_block(self, expected_block_kind: BbKind, next_block_name: BbName) -> Result<()> {
+>      let Some(next_block) = self.blocks.get(next_block_name) else {
+>          throw_ill_formed!(\"Terminator: next block does not exist\");
+>      };
+>      ensure_wf(
+>          next_block.kind == expected_block_kind,
+>          \"Terminator: next block has the wrong block kind\",
+>      )?;
+>      ret(())
+>  }" -/
+def checkNextBlock (f : Gen.Function) (expectedKind : Gen.BbKind) (nextBb : Gen.BbName) : Bool :=
+  match Interp.mapGet f.blocks nextBb with
+  | some bb => bb.kind == expectedKind
+  | none => false
+
+/-- `Function::check_unwind_block` (`spec/lang/well-formed.md`):
+> "fn check_unwind_block(self, current_block_kind: BbKind, unwind_block_name: BbName) -> Result<()> {
+>      let expected_block_kinds = match current_block_kind {
+>          BbKind::Regular => list![BbKind::Cleanup, BbKind::Catch],
+>          BbKind::Cleanup | BbKind::Terminate => list![BbKind::Terminate],
+>          BbKind::Catch => throw_ill_formed!(\"Terminator: unwinding is not allowed in a catch block\"),
+>      };
+>      let Some(unwind_block) = self.blocks.get(unwind_block_name) else {
+>          throw_ill_formed!(\"Terminator: unwind block does not exist\");
+>      };
+>      ensure_wf(
+>          expected_block_kinds.any(|kind| kind == unwind_block.kind),
+>          \"Terminator: unwind block has the wrong block kind\",
+>      )?;
+>      ret(())
+>  }" -/
+def checkUnwindBlock (f : Gen.Function) (curKind : Gen.BbKind) (unwindBb : Gen.BbName) : Bool :=
+  match curKind, Interp.mapGet f.blocks unwindBb with
+  | .Regular, some bb => bb.kind == .Cleanup || bb.kind == .Catch
+  | .Cleanup, some bb | .Terminate, some bb => bb.kind == .Terminate
+  | _, _ => false
+
+/-- Local-scoping clauses of `Statement::check_wf` (`spec/lang/well-formed.md`):
+`StorageLive` and `StorageDead` reference declared locals in `f.locals`, and
+`StorageDead` never targets `f.ret` or an argument in `f.args`. -/
+def stmtCfgWf (f : Gen.Function) : Gen.Statement → Bool
+  | .StorageLive l => (Interp.mapGet f.locals l).isSome
+  | .StorageDead l =>
+    (Interp.mapGet f.locals l).isSome && l != f.ret && !f.args.contains l
+  | _ => true
+
+/-- Block-kind and CFG-target clauses of `Terminator::check_wf` across all nine
+`Terminator` variants (`spec/lang/well-formed.md`):
+> "Return => {
+>      ensure_wf(block_kind == BbKind::Regular, \"Terminator::Return has to be called in a regular block\")?;
+>  }
+>  ..
+>  StopUnwind(next_block) => {
+>      ensure_wf(block_kind == BbKind::Catch, \"Terminator::StopUnwind has to be called in a catch block\")?;
+>      func.check_next_block(BbKind::Regular, next_block)?;
+>  }
+>  ResumeUnwind => {
+>      ensure_wf(block_kind == BbKind::Cleanup, \"Terminator::ResumeUnwind: has to be called in cleanup block\")?;
+>  }" -/
+def termCfgWf (f : Gen.Function) (blockKind : Gen.BbKind) : Gen.Terminator → Bool
+  | .Goto next => checkNextBlock f blockKind next
+  | .Switch _ cases fallback =>
+    cases.entries.all (fun p => checkNextBlock f blockKind p.2) &&
+    checkNextBlock f blockKind fallback
+  | .Unreachable => true
+  | .Intrinsic (.AtomicFetchAndOp op) _ _ next =>
+    (op == .Add || op == .Sub) &&
+    match next with
+    | some nb => checkNextBlock f blockKind nb
+    | none => true
+  | .Intrinsic _ _ _ next =>
+    match next with
+    | some nb => checkNextBlock f blockKind nb
+    | none => true
+  | .Call _ _ _ _ next unwind =>
+    (match next with | some nb => checkNextBlock f blockKind nb | none => true) &&
+    (match unwind with | some ub => checkUnwindBlock f blockKind ub | none => true)
+  | .Return => blockKind == .Regular
+  | .StartUnwind _ unwind => blockKind == .Regular && checkUnwindBlock f blockKind unwind
+  | .StopUnwind next => blockKind == .Catch && checkNextBlock f .Regular next
+  | .ResumeUnwind => blockKind == .Cleanup
+
+/-- Function local-map and CFG well-formedness check matching `Function::check_wf`
+(`spec/lang/well-formed.md`): distinct `locals` and `blocks` keys, declared and
+pairwise distinct `ret :: args`, a `Regular` `start` block in `f.blocks`, and
+`stmtCfgWf` + `termCfgWf` on every basic block. -/
+def funcCfgWf (f : Gen.Function) : Bool :=
+  decide (f.locals.entries.map Prod.fst).Nodup &&
+  decide (f.blocks.entries.map Prod.fst).Nodup &&
+  (Interp.mapGet f.locals f.ret).isSome &&
+  f.args.all (fun a => (Interp.mapGet f.locals a).isSome) &&
+  decide (f.ret :: f.args).Nodup &&
+  checkNextBlock f .Regular f.start &&
+  f.blocks.entries.all fun ⟨_, bb⟩ =>
+    bb.statements.all (stmtCfgWf f) &&
+    termCfgWf f bb.kind bb.terminator
+
+/-- Program function-table, CFG, and `start`-wrapper well-formedness check
+matching `Program::check_wf` (`spec/lang/well-formed.md`):
+> "// Check all the functions.
+>  for function in self.functions.values() {
+>      function.check_wf::<T>(self)?;
+>  }
+>
+>  // Ensure the start function exists, has the right ABI, takes no arguments, and returns a 1-ZST.
+>  let Some(start) = self.functions.get(self.start) else {
+>      throw_ill_formed!(\"Program: start function does not exist\");
+>  };
+>  ensure_wf(start.calling_convention == CallingConvention::C, \"Program: start function has invalid calling convention\")?;
+>  let ret_layout = start.locals[start.ret].layout::<T>();
+>  ensure_wf(
+>      ret_layout == LayoutStrategy::Sized(Size::ZERO, Align::ONE),
+>      \"Program: start function return local has invalid layout\"
+>  )?;
+>  ensure_wf(start.args.is_empty(), \"Program: start function has arguments\")?;" -/
+def progWf (p : Gen.Program) : Bool :=
+  decide (p.functions.entries.map Prod.fst).Nodup &&
+  p.functions.entries.all (fun ⟨_, f⟩ => funcCfgWf f) &&
+  match Interp.mapGet p.functions p.start with
+  | some start =>
+    start.calling_convention == .C &&
+    start.args.isEmpty &&
+    match Interp.mapGet start.locals start.ret with
+    | some retTy =>
+      match Interp.Type.layout retTy with
+      | .ok (.Sized sz align) => sz == ⟨0⟩ && align == ⟨1⟩
+      | _ => false
+    | none => false
+  | none => false
 
 end MiniRustSpec.Correspondence

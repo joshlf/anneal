@@ -2146,6 +2146,18 @@ theorem stmtMoved_not_addrTaken {addrLocals : List Nat} {st : MirAst.Statement} 
     cases projs <;> simp only [stmtMoved, List.mem_filter]
     · exact fun h => hk_mo h.1
     · exact hk_mo
+  | intrinsic intr =>
+    cases intr with
+    | assume op =>
+      simp only [stmtPreservesAddrTaken, List.all_cons, List.all_nil, Bool.and_true] at hst
+      simp only [stmtMoved, moveOut]
+      cases hm : opMoved op with
+      | none => exact hk_mo
+      | some j =>
+        rw [hm] at hst
+        have hjk : k ≠ j := fun h => by subst h; simp [hk_addr] at hst
+        simp [hk_mo, hjk]
+    | _ => simpa [stmtMoved] using hk_mo
   | _ => simpa [stmtMoved] using hk_mo
 
 theorem termMoved_not_addrTaken {addrLocals : List Nat} {t : MirAst.Terminator} {mo : List Nat}
@@ -2164,6 +2176,10 @@ theorem termMoved_not_addrTaken {addrLocals : List Nat} {t : MirAst.Terminator} 
       simp only [Bool.not_eq_true', Bool.eq_false_iff, ne_eq, List.contains_iff_mem] at ht
       have hjk : k ≠ j := fun h => ht (h ▸ hk_addr)
       simp [hk_mo, hjk]
+  | call func args dst target unwind =>
+    rcases dst with ⟨d, _ | ⟨_, _⟩⟩ <;> cases target <;>
+      simp only [termMoved, List.mem_filter] <;>
+      first | exact hk_mo | exact fun h => hk_mo h.1 | simpa using hk_mo
   | _ => simpa [termMoved] using hk_mo
 
 theorem iterMovedEntries_not_addrTaken {body : CapturedMir} (hpa : ptrAliasingOk body = true)
@@ -3541,6 +3557,7 @@ theorem terminatorOk_termTargets_lt {layouts : Layout.LayoutTable} {decls : List
       rcases hdst with rfl | ⟨p, hp, rfl⟩
       · exact ht.2
       · exact (ht.1.1.2 p hp).2
+  | call _ _ _ _ _ => simp [terminatorOk] at ht
   | _ => simp [termTargets] at hdst
 
 /-- On any CFG whose terminators satisfy `terminatorOk`, `iterPtrAliasEntries`
@@ -4425,7 +4442,7 @@ theorem evalTargetPlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         refine ⟨rfl, by simp, hgood, htlt, hptrEq, hal, fun targetPe hpe => ?_⟩
         simp only [translatePlace, Option.some.injEq] at hpe
         subst hpe
-        have hloc := ((translateFn_spec body f h.hf).2.1 k d hdk).2
+        have hloc := (h.hf.2 k d hdk).2
         rw [hTd] at hloc
         have hev := evalPlace_local_some h.shape k (.Int pointeeIt) hloc (localPtr ctx k) hlm_k
         simpa [offsetPtr] using hev
@@ -4564,7 +4581,7 @@ theorem evalTargetPlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
                 have hnoIdx : noIndexProj (.field idx fieldTy :: prest) = true :=
                   noIndexProj_of_resolveFieldPath hres
                 refine ⟨hnoIdx, by simp, hgood, htlt, hptrEq, hal, fun targetPe hpe => ?_⟩
-                have hloc := ((translateFn_spec body f h.hf).2.1 k d hdk).2
+                have hloc := (h.hf.2 k d hdk).2
                 rw [hTd] at hloc
                 obtain ⟨allocId, hpk, _, _, _, _, hAk⟩ :=
                   h.locs.storage_nonptr k d (.init rootVal) (localPtr ctx k) hdk hsk hlm_k hnotPtr
@@ -4616,7 +4633,7 @@ theorem evalPtrLoad {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   have hp_lt : p < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdp).1
   have hisPtr : isPtrTy dp.ty = true := by simp [isPtrTy, hp_ty]
   obtain ⟨hTdp, hitdp⟩ := tyOf_isPtrTy (layouts := body.layouts) hisPtr
-  have hloc := ((translateFn_spec body f h.hf).2.1 p dp hdp).2
+  have hloc := (h.hf.2 p dp hdp).2
   rw [hTdp] at hloc
   obtain ⟨_, slotp, hdp', hsp⟩ := h.slot_exists p hp_lt
   rw [hdp] at hdp'; cases hdp'
@@ -5803,8 +5820,8 @@ theorem mutateCurFrameOutM_retag_bm_eq (m : Mach) (ptr : Gen.Pointer Prov)
           pure, Except.pure, bind, Except.bind, hdrop, ht_self, hset]
   · simp only [hnonneg, ↓reduceIte, bind, Except.bind, specPanic]
 
-private theorem evalConstantM_bm_eq (c : Gen.Constant) :
-    evalConstantM (M := BM) c = evalConstant c := by
+private theorem evalConstantM_bm_eq (m : Mach) (c : Gen.Constant) :
+    evalConstantM (M := BM) m c = evalConstant m c := by
   cases c <;> rfl
 
 mutual
@@ -6272,6 +6289,231 @@ private theorem evalArgsM_bm_eq :
     · dsimp only [bind, Except.bind]
       rw [evalArgsM_bm_eq m1 es]
 
+private theorem mutateCurStackM_bm_eq {α : Type} (m : Mach)
+    (f : List Frame → Interp (α × List Frame)) :
+    mutateCurStackM (M := BM) m f = mutateCurStack m f := rfl
+
+private theorem fnFromPtrM_bm_eq (m : Mach) (v : Val) :
+    fnFromPtrM (M := BM) m v = fnFromPtr m v := by
+  cases v with
+  | Ptr p =>
+    rcases p with ⟨thinPtr, metadata⟩
+    simp only [fnFromPtrM, fnFromPtr]
+    split
+    · rfl
+    · split <;> split <;> simp_all
+  | _ => rfl
+
+private theorem prepareForInplacePassingM_bm_eq (m : Mach) (place : Gen.Place BM)
+    (ty : Gen.«Type») :
+    prepareForInplacePassingM (M := BM) m place ty = prepareForInplacePassing m place ty := by
+  unfold prepareForInplacePassingM prepareForInplacePassing
+  refine bind_congr_right _ (fun _ => ?_)
+  refine bind_congr_right _ (fun sz => ?_)
+  refine bind_congr_right _ (fun _ => ?_)
+  refine bind_congr_right _ (fun al => ?_)
+  exact bind_congr (cm_deinit_bm_eq m.mem place.ptr.thin_pointer sz al) (fun _ => rfl)
+
+private theorem evalArgumentM_bm_eq (m : Mach) (arg : Gen.ArgumentExpr) :
+    evalArgumentM (M := BM) m arg = evalArgument m arg := by
+  cases arg with
+  | ByValue v =>
+    unfold evalArgumentM evalArgument
+    exact evalValueM_bm_eq m v
+  | InPlace p =>
+    unfold evalArgumentM evalArgument
+    refine bind_congr (evalPlaceM_bm_eq m p) (fun ⟨⟨place, ty⟩, m1⟩ => ?_)
+    dsimp only
+    refine bind_congr (placeLoadM_bm_eq m1 place ty) (fun ⟨v, m2⟩ => ?_)
+    dsimp only
+    exact bind_congr (prepareForInplacePassingM_bm_eq m2 place ty) (fun _ => rfl)
+
+private theorem evalArgumentsM_bm_eq :
+    ∀ (m : Mach) (args : List Gen.ArgumentExpr),
+      evalArgumentsM (M := BM) m args = evalArguments m args
+  | m, [] => by unfold evalArgumentsM evalArguments; rfl
+  | m, a :: as => by
+    unfold evalArgumentsM evalArguments
+    refine bind_congr (evalArgumentM_bm_eq m a) (fun ⟨v, m1⟩ => ?_)
+    dsimp only
+    exact bind_congr (evalArgumentsM_bm_eq m1 as) (fun _ => rfl)
+
+private theorem allocFrameArgsM_bm_eq :
+    ∀ (fr : Frame) (cm : Gen.ConcurrentMemory BM) (ls : List Gen.LocalName),
+      allocFrameArgsM (M := BM) fr cm ls = allocFrameArgs fr cm ls
+  | fr, cm, [] => by unfold allocFrameArgsM allocFrameArgs; rfl
+  | fr, cm, l :: ls => by
+    unfold allocFrameArgsM allocFrameArgs
+    refine bind_congr (storageLiveM_bm_eq fr cm l) (fun ⟨fr1, cm1⟩ => ?_)
+    exact allocFrameArgsM_bm_eq fr1 cm1 ls
+
+private theorem initFrameArgsM_bm_eq :
+    ∀ (m : Mach) (frame : Frame) (ls : List Gen.LocalName) (args : List (Val × Gen.«Type»)),
+      initFrameArgsM (M := BM) m frame ls args = initFrameArgs m frame ls args
+  | m, frame, [], args => by unfold initFrameArgsM initFrameArgs; rfl
+  | m, frame, _ :: _, [] => by unfold initFrameArgsM initFrameArgs; rfl
+  | m, frame, l :: ls, (v, ty) :: args => by
+    have ih : ∀ m', initFrameArgsM (M := BM) m' frame ls args = initFrameArgs m' frame ls args :=
+      fun m' => initFrameArgsM_bm_eq m' frame ls args
+    unfold initFrameArgsM initFrameArgs
+    simp only [typedStoreM_bm_eq, ih]
+    refine bind_congr_right _ (fun calleeTy => ?_)
+    refine bind_congr_right _ (fun b => ?_)
+    split
+    · rfl
+    · refine bind_congr_right _ (fun l => ?_)
+      refine bind_congr_right _ (fun align => ?_)
+      refine bind_congr_right _ (fun calleePtr => ?_)
+      cases typedStore m calleePtr v ty align .None with
+      | ok m' => rfl
+      | error e => cases e <;> rfl
+
+private theorem createFrameM_bm_eq (m : Mach) (func : Gen.Function)
+    (spa : Gen.StackPopAction BM) (conv : Gen.CallingConvention) (retTy : Gen.«Type»)
+    (args : List (Val × Gen.«Type»)) :
+    createFrameM (M := BM) m func spa conv retTy args = createFrame m func spa conv retTy args := by
+  unfold createFrameM createFrame
+  refine bind_congr (storageLiveM_bm_eq _ m.mem func.ret) (fun ⟨fr1, cm1⟩ => ?_)
+  dsimp only
+  refine bind_congr (allocFrameArgsM_bm_eq fr1 cm1 func.args) (fun ⟨fr2, cm2⟩ => ?_)
+  dsimp only
+  split
+  · rfl
+  · refine bind_congr_right _ (fun _ => ?_)
+    refine bind_congr_right _ (fun _ => ?_)
+    split
+    · rfl
+    · split
+      · rfl
+      · exact bind_congr (initFrameArgsM_bm_eq _ fr2 func.args args) (fun _ => rfl)
+
+private theorem evalCallM_bm_eq (m : Mach) (callee : Gen.Function) (conv : Gen.CallingConvention)
+    (args : List (Val × Gen.«Type»)) (ret : Gen.Place BM × Gen.«Type»)
+    (nb ub : Option Gen.BbName) :
+    evalCallM (M := BM) m callee conv args ret nb ub = evalCall m callee conv args ret nb ub := by
+  unfold evalCallM evalCall
+  refine bind_congr (createFrameM_bm_eq _ _ _ _ _ _) (fun ⟨fr, m1⟩ => ?_)
+  dsimp only
+  exact bind_congr (mutateCurStackM_bm_eq m1 _) (fun _ => rfl)
+
+private theorem machineExitM_bm_eq {α : Type} (m : Mach) :
+    machineExitM (M := BM) (α := α) m = machineExit m := rfl
+
+private theorem cm_allocate_bm_fun :
+    @ConcurrentMemory.allocate BM _ _ = CM.allocate := by
+  funext cm kind size align
+  exact cm_allocate_bm_eq cm kind size align
+
+private theorem cm_deallocate_bm_fun :
+    @ConcurrentMemory.deallocate BM _ _ = CM.deallocate := by
+  funext cm ptr kind size align
+  exact cm_deallocate_bm_eq cm ptr kind size align
+
+private theorem evalPrintM_bm_eq :
+    ∀ (stream : DynWrite) (args : List (Val × Gen.«Type»)),
+      evalPrintM (M := BM) stream args = evalPrint stream args
+  | stream, [] => by unfold evalPrintM evalPrint; rfl
+  | stream, (v, _) :: rest => by
+    unfold evalPrintM evalPrint
+    cases v <;> simp only [evalPrintM_bm_eq]
+
+private theorem evalPrintM_bm_fun : @evalPrintM BM _ = evalPrint := by
+  funext stream args
+  exact evalPrintM_bm_eq stream args
+
+private theorem loadRawDataM_bm_eq (m : Mach) (ptr : Gen.Pointer Prov) (ptrTy : Gen.PtrType) :
+    loadRawDataM (M := BM) m ptr ptrTy = loadRawData m ptr ptrTy := by
+  unfold loadRawDataM loadRawData
+  rw [abstractByte_dataM_bm_eq]
+  rfl
+
+private theorem loadRawDataM_bm_fun : @loadRawDataM BM _ _ = loadRawData := by
+  funext m ptr ptrTy
+  exact loadRawDataM_bm_eq m ptr ptrTy
+
+private theorem activeThreadM_bm_eq (m : Mach) : activeThreadM (M := BM) m = activeThread m :=
+  rfl
+
+private theorem evalIntrinsicM_bm_eq_rawEq (m : Mach) (args : List (Val × Gen.«Type»))
+    (retTy : Gen.«Type») :
+    evalIntrinsicM (M := BM) m .RawEq args retTy = evalIntrinsic m .RawEq args retTy := by
+  simp only [evalIntrinsicM, evalIntrinsic, loadRawDataM_bm_fun]
+  rcases args with _ | ⟨⟨lV, lT⟩, _ | ⟨⟨rV, rT⟩, _ | ⟨_, _⟩⟩⟩ <;> try rfl
+  cases retTy with
+  | Bool =>
+    dsimp only
+    by_cases hte : typeEq lT rT = true
+    · simp only [hte, Bool.not_true]
+      rcases lV with _ | _ | lp | _ | _ <;> try rfl
+      rcases rV with _ | _ | rp | _ | _ <;> try rfl
+    · simp only [Bool.not_eq_true] at hte
+      simp only [hte, Bool.not_false]
+      rfl
+  | _ => rfl
+
+private theorem evalIntrinsicM_bm_eq_allocate (m : Mach) (args : List (Val × Gen.«Type»))
+    (retTy : Gen.«Type») :
+    evalIntrinsicM (M := BM) m .Allocate args retTy = evalIntrinsic m .Allocate args retTy := by
+  simp only [evalIntrinsicM, evalIntrinsic, cm_allocate_bm_fun]
+  rcases args with _ | ⟨⟨sizeV, sT⟩, _ | ⟨⟨alignV, aT⟩, _ | ⟨_, _⟩⟩⟩ <;> try rfl
+  cases sizeV with
+  | Int size =>
+    rcases hs : sizeFromBytes size with _ | sz <;> simp only [hs]
+    cases alignV with
+    | Int align =>
+      rcases ha : alignFromBytesInt align with _ | al <;> simp only [ha]
+      cases retTy with
+      | Ptr retPtrTy => by_cases hk : PtrType.meta_kind retPtrTy = .None <;> simp [hk] <;> rfl
+      | _ => rfl
+    | _ => rfl
+  | _ => rfl
+
+private theorem evalIntrinsicM_bm_eq_deallocate (m : Mach) (args : List (Val × Gen.«Type»))
+    (retTy : Gen.«Type») :
+    evalIntrinsicM (M := BM) m .Deallocate args retTy =
+      evalIntrinsic m .Deallocate args retTy := by
+  simp only [evalIntrinsicM, evalIntrinsic, cm_deallocate_bm_fun]
+  rcases args with _ | ⟨⟨ptrV, pT⟩, _ | ⟨⟨sizeV, sT⟩, _ | ⟨⟨alignV, aT⟩, _ | ⟨_, _⟩⟩⟩⟩ <;>
+    try rfl
+  rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ <;> try rfl
+  cases sizeV with
+  | Int size =>
+    rcases hs : sizeFromBytes size with _ | sz <;> simp only [hs]
+    cases alignV with
+    | Int align =>
+      rcases ha : alignFromBytesInt align with _ | al <;> simp only [ha]
+      split <;> rfl
+    | _ => rfl
+  | _ => rfl
+
+private theorem evalIntrinsicM_bm_eq_assume (m : Mach) (args : List (Val × Gen.«Type»))
+    (retTy : Gen.«Type») :
+    evalIntrinsicM (M := BM) m .Assume args retTy = evalIntrinsic m .Assume args retTy := by
+  simp only [evalIntrinsicM, evalIntrinsic]
+  rcases args with _ | ⟨⟨v, vT⟩, _ | ⟨_, _⟩⟩ <;> try rfl
+  cases v with
+  | Bool b =>
+    dsimp only
+    split <;> rfl
+  | _ => rfl
+
+private theorem evalIntrinsicM_bm_eq_getUnwindPayload (m : Mach)
+    (args : List (Val × Gen.«Type»)) (retTy : Gen.«Type») :
+    evalIntrinsicM (M := BM) m .GetUnwindPayload args retTy =
+      evalIntrinsic m .GetUnwindPayload args retTy := by
+  simp only [evalIntrinsicM, evalIntrinsic]
+  split
+  · rfl
+  · cases retTy with
+    | Ptr retPtrTy =>
+      by_cases hk : PtrType.meta_kind retPtrTy = .None
+      · simp only [hk, ite_true, activeThreadM_bm_eq]
+        congr 1
+        funext t
+        rcases h : t.unwind_payloads.getLast? with _ | tp <;> rfl
+      · simp [hk]
+    | _ => rfl
+
 private theorem exposeM_bm_eq (ipc : Gen.IntPtrCast Prov) (ptr : Ptr) :
     IntPtrCast.exposeM ipc ptr = IntPtrCast.expose ipc ptr := by
   unfold IntPtrCast.exposeM IntPtrCast.expose
@@ -6337,6 +6579,18 @@ private theorem evalIntrinsicM_bm_eq (m : Mach) (intrinsic : Gen.IntrinsicOp)
           | _ => rfl
         | _ => rfl
       · simp at hlen
+  | PrintStdout =>
+    simp only [evalPrintM_bm_fun]
+    split <;> rfl
+  | PrintStderr =>
+    simp only [evalPrintM_bm_fun]
+    split <;> rfl
+  | RawEq => exact evalIntrinsicM_bm_eq_rawEq m arguments retTy
+  | Allocate => exact evalIntrinsicM_bm_eq_allocate m arguments retTy
+  | Deallocate => exact evalIntrinsicM_bm_eq_deallocate m arguments retTy
+  | Exit => exact machineExitM_bm_eq m
+  | Assume => exact evalIntrinsicM_bm_eq_assume m arguments retTy
+  | GetUnwindPayload => exact evalIntrinsicM_bm_eq_getUnwindPayload m arguments retTy
   | _ => rfl
 
 private theorem terminateActiveThreadM_bm_eq (m : Mach) :
@@ -6444,6 +6698,16 @@ theorem evalTerminatorM_bm_eq (m : Mach) (term : Gen.Terminator) :
     | Int i => exact jumpToBlockM_bm_eq m1 ((mapGet cases i).getD fallback)
     | _ => rfl
   | Unreachable => rfl
+  | Call callee conv arguments retExpr nextBlock unwindBlock =>
+    unfold evalTerminatorM Interp.evalTerminator
+    refine bind_congr (evalPlaceM_bm_eq m retExpr) (fun ⟨⟨retPlace, retTy⟩, m1⟩ => ?_)
+    dsimp only
+    refine bind_congr (prepareForInplacePassingM_bm_eq m1 retPlace retTy) (fun m2 => ?_)
+    refine bind_congr (evalValueM_bm_eq m2 callee) (fun ⟨⟨calleeVal, _⟩, m3⟩ => ?_)
+    dsimp only
+    refine bind_congr (fnFromPtrM_bm_eq m3 calleeVal) (fun calleeFn => ?_)
+    refine bind_congr (evalArgumentsM_bm_eq m3 arguments) (fun ⟨args, m4⟩ => ?_)
+    exact evalCallM_bm_eq m4 calleeFn conv args (retPlace, retTy) nextBlock unwindBlock
   | Return => exact evalReturnM_bm_eq m
   | Intrinsic intrinsic arguments retExpr nextBlock =>
     unfold evalTerminatorM Interp.evalTerminator
@@ -8668,6 +8932,165 @@ theorem evalStatementM_tb_wfLive {m m' : MachTB} {stmt : Gen.Statement}
   | _ =>
     unfold evalStatementM at h; cases h
 
+/-- `machineExitM` never returns normally (`Machine::exit` ends in
+`throw_machine_stop!()` or a memory leak). -/
+private theorem machineExitM_tb_ne_ok {α : Type} {m : MachTB} {x : α} :
+    machineExitM (α := α) m ≠ .ok x := by
+  intro h
+  unfold machineExitM at h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  cases h
+
+/-- `loadRawDataM` on `MachTB` preserves `MachTB.wfLive`. -/
+private theorem loadRawDataM_tb_wfLive {m m' : MachTB}
+    {ptr : Gen.Pointer Gen.TreeBorrowsProvenance} {ptrTy : Gen.PtrType} {data : List UInt8}
+    (hwf : MachTB.wfLive m) (h : loadRawDataM m ptr ptrTy = .ok (data, m')) :
+    MachTB.wfLive m' := by
+  unfold loadRawDataM at h
+  split at h
+  · split at h
+    · obtain ⟨⟨bytes, cm⟩, hl, h⟩ := bind_ok h
+      dsimp only at h
+      split at h
+      · obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+        exact cm_tb_load_wfLive hwf hl
+      · cases h
+    · cases h
+  · cases h
+
+/-- `prepareForInplacePassingM` on `MachTB` preserves `MachTB.wfLive`. -/
+private theorem prepareForInplacePassingM_tb_wfLive {m m' : MachTB} {place : Gen.Place TBM}
+    {ty : Gen.Type} (hwf : MachTB.wfLive m) (h : prepareForInplacePassingM m place ty = .ok m') :
+    MachTB.wfLive m' := by
+  unfold prepareForInplacePassingM at h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨_, _, h⟩ := bind_ok h
+  obtain ⟨cm, hd, h⟩ := bind_ok h
+  obtain rfl := interp_pure_ok h
+  exact cm_tb_deinit_wfLive hwf hd
+
+/-- `evalArgumentM` on `MachTB` preserves `MachTB.wfLive`. -/
+private theorem evalArgumentM_tb_wfLive {m m' : MachTB} {arg : Gen.ArgumentExpr}
+    {v : Gen.Value TBM × Gen.Type} (hwf : MachTB.wfLive m)
+    (h : evalArgumentM m arg = .ok (v, m')) : MachTB.wfLive m' := by
+  cases arg with
+  | ByValue e =>
+    unfold evalArgumentM at h
+    exact evalValueM_tb_wfLive e hwf h
+  | InPlace p =>
+    unfold evalArgumentM at h
+    obtain ⟨⟨⟨place, ty⟩, m1⟩, hp, h⟩ := bind_ok h
+    obtain ⟨⟨val, m2⟩, hl, h⟩ := bind_ok h
+    obtain ⟨m3, hprep, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact prepareForInplacePassingM_tb_wfLive
+      (placeLoadM_tb_wfLive (evalPlaceM_tb_wfLive p hwf hp) hl) hprep
+
+/-- `evalArgumentsM` on `MachTB` preserves `MachTB.wfLive`. -/
+private theorem evalArgumentsM_tb_wfLive :
+    ∀ (args : List Gen.ArgumentExpr) {m m' : MachTB} {vs : List (Gen.Value TBM × Gen.Type)},
+      MachTB.wfLive m → evalArgumentsM m args = .ok (vs, m') → MachTB.wfLive m'
+  | [], _, _, _, hwf, h => by
+    unfold evalArgumentsM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  | a :: as, _, _, _, hwf, h => by
+    unfold evalArgumentsM at h
+    obtain ⟨⟨_, m1⟩, ha, h⟩ := bind_ok h
+    obtain ⟨⟨_, m2⟩, has, h⟩ := bind_ok h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact evalArgumentsM_tb_wfLive as (evalArgumentM_tb_wfLive hwf ha) has
+
+/-- `allocFrameArgsM` on `TBM` preserves `TreeBorrowsMemory.wfLive`. -/
+private theorem allocFrameArgsM_tb_wfLive :
+    ∀ (ls : List Gen.LocalName) {fr fr' : Gen.StackFrame TBM} {cm cm' : Gen.ConcurrentMemory TBM},
+      TreeBorrowsMemory.wfLive cm.memory →
+      allocFrameArgsM fr cm ls = .ok (fr', cm') → TreeBorrowsMemory.wfLive cm'.memory
+  | [], _, _, _, _, hwf, h => by
+    unfold allocFrameArgsM at h
+    obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+    exact hwf
+  | l :: ls, _, _, _, _, hwf, h => by
+    unfold allocFrameArgsM at h
+    obtain ⟨⟨fr1, cm1⟩, hsl, h⟩ := bind_ok h
+    exact allocFrameArgsM_tb_wfLive ls (storageLiveM_tb_wfLive hwf hsl) h
+
+/-- `initFrameArgsM` on `MachTB` preserves `MachTB.wfLive`. -/
+private theorem initFrameArgsM_tb_wfLive (frame : Gen.StackFrame TBM) :
+    ∀ (ls : List Gen.LocalName) (args : List (Gen.Value TBM × Gen.Type)) {m m' : MachTB},
+      MachTB.wfLive m → initFrameArgsM m frame ls args = .ok m' → MachTB.wfLive m'
+  | [], _, _, _, hwf, h => by
+    unfold initFrameArgsM at h
+    obtain rfl := interp_pure_ok h
+    exact hwf
+  | _ :: _, [], _, _, hwf, h => by
+    unfold initFrameArgsM at h
+    obtain rfl := interp_pure_ok h
+    exact hwf
+  | l :: ls, (v, ty) :: args, m, _, hwf, h => by
+    unfold initFrameArgsM at h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    obtain ⟨ok, _, h⟩ := bind_ok h
+    split at h
+    · cases h
+    · obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨ptr, _, h⟩ := bind_ok h
+      dsimp only at h
+      split at h
+      · rename_i m2 hst
+        obtain ⟨m3, hm3, h⟩ := bind_ok h
+        obtain rfl := interp_pure_ok hm3
+        exact initFrameArgsM_tb_wfLive frame ls args (typedStoreM_tb_wfLive hwf hst) h
+      all_goals
+        obtain ⟨_, hbad, _⟩ := bind_ok h
+        cases hbad
+
+/-- `createFrameM` on `MachTB` preserves `MachTB.wfLive`. -/
+private theorem createFrameM_tb_wfLive {m m' : MachTB} {func : Gen.Function}
+    {spa : Gen.StackPopAction TBM} {conv : Gen.CallingConvention} {retTy : Gen.Type}
+    {args : List (Gen.Value TBM × Gen.Type)} {fr : Gen.StackFrame TBM}
+    (hwf : MachTB.wfLive m) (h : createFrameM m func spa conv retTy args = .ok (fr, m')) :
+    MachTB.wfLive m' := by
+  unfold createFrameM at h
+  obtain ⟨⟨fr1, cm1⟩, hsl, h⟩ := bind_ok h
+  obtain ⟨⟨fr2, cm2⟩, hal, h⟩ := bind_ok h
+  dsimp only at h
+  have hcm2 : TreeBorrowsMemory.wfLive cm2.memory :=
+    allocFrameArgsM_tb_wfLive func.args (storageLiveM_tb_wfLive hwf hsl) hal
+  split at h
+  · cases h
+  · obtain ⟨_, _, h⟩ := bind_ok h
+    obtain ⟨_, _, h⟩ := bind_ok h
+    split at h
+    · cases h
+    · split at h
+      · cases h
+      · obtain ⟨m3, hinit, h⟩ := bind_ok h
+        obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+        exact initFrameArgsM_tb_wfLive fr2 func.args args (m := { m with mem := cm2 }) hcm2 hinit
+
+/-- `evalCallM` on `MachTB` preserves `MachTB.wfLive`. -/
+private theorem evalCallM_tb_wfLive {m m' : MachTB} {callee : Gen.Function}
+    {conv : Gen.CallingConvention} {args : List (Gen.Value TBM × Gen.Type)}
+    {ret : Gen.Place TBM × Gen.Type} {nb ub' : Option Gen.BbName}
+    (hwf : MachTB.wfLive m) (h : evalCallM m callee conv args ret nb ub' = .ok m') :
+    MachTB.wfLive m' := by
+  unfold evalCallM at h
+  obtain ⟨⟨fr, m1⟩, hc, h⟩ := bind_ok h
+  dsimp only at h
+  have hm1 := createFrameM_tb_wfLive hwf hc
+  unfold mutateCurStackM at h
+  obtain ⟨⟨_, m2⟩, hs, h⟩ := bind_ok h
+  obtain rfl := interp_pure_ok h
+  obtain ⟨_, _, hs⟩ := bind_ok hs
+  obtain ⟨_, hpure, hs⟩ := bind_ok hs
+  obtain ⟨_, _, hs⟩ := bind_ok hs
+  obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok hs)
+  exact hm1
+
 /-- `evalIntrinsicM` on `MachTB` preserves `MachTB.wfLive`. -/
 theorem evalIntrinsicM_tb_wfLive {m m' : MachTB} {intrinsic : Gen.IntrinsicOp}
     {arguments : List (Gen.Value TBM × Gen.Type)} {retTy : Gen.Type} {val : Gen.Value TBM}
@@ -8715,6 +9138,66 @@ theorem evalIntrinsicM_tb_wfLive {m m' : MachTB} {intrinsic : Gen.IntrinsicOp}
         all_goals (dsimp only [ub] at h; cases h)
       · simp at hlen
     · simp only [ne_eq, hlen, not_false_eq_true, ↓reduceIte, ub] at h; cases h
+  | Exit =>
+    dsimp only [evalIntrinsicM] at h
+    exact absurd h machineExitM_tb_ne_ok
+  | Abort =>
+    dsimp only [evalIntrinsicM, abort] at h; cases h
+  | Assume =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf)
+      | (dsimp only [ub] at h; cases h)
+  | PrintStdout =>
+    dsimp only [evalIntrinsicM] at h
+    split at h
+    · obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+      exact hwf
+    · dsimp only [ub] at h; cases h
+  | PrintStderr =>
+    dsimp only [evalIntrinsicM] at h
+    split at h
+    · obtain ⟨_, _, h⟩ := bind_ok h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+      exact hwf
+    · dsimp only [ub] at h; cases h
+  | Allocate =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨⟨_, cm⟩, ha, h⟩ := bind_ok h
+         obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+         exact cm_tb_allocate_wfLive hwf ha)
+  | Deallocate =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨cm, hd, h⟩ := bind_ok h
+         obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+         exact cm_tb_deallocate_wfLive hwf hd)
+  | RawEq =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨⟨_, m1⟩, hl1, h⟩ := bind_ok h
+         obtain ⟨⟨_, m2⟩, hl2, h⟩ := bind_ok h
+         obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+         exact loadRawDataM_tb_wfLive (loadRawDataM_tb_wfLive hwf hl1) hl2)
+  | GetUnwindPayload =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨_, _, h⟩ := bind_ok h
+         repeat' split at h
+         all_goals first
+           | (obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf)
+           | (dsimp only [ub] at h; cases h))
   | _ =>
     dsimp only [evalIntrinsicM, unsupported] at h; cases h
 
@@ -8808,6 +9291,18 @@ theorem evalTerminatorM_tb_wfLive {m m' : MachTB} {term : Gen.Terminator}
     | Int i => exact jumpToBlockM_tb_wfLive hm1 h
     | _ => cases h
   | Unreachable => unfold evalTerminatorM at h; cases h
+  | Call callee conv arguments retExpr nextBlock unwindBlock =>
+    unfold evalTerminatorM at h
+    obtain ⟨⟨⟨retPlace, retTy⟩, m1⟩, hp, h⟩ := bind_ok h
+    obtain ⟨m2, hprep, h⟩ := bind_ok h
+    obtain ⟨⟨⟨calleeVal, _⟩, m3⟩, hv, h⟩ := bind_ok h
+    obtain ⟨calleeFn, _, h⟩ := bind_ok h
+    obtain ⟨⟨args, m4⟩, hargs, h⟩ := bind_ok h
+    exact evalCallM_tb_wfLive
+      (evalArgumentsM_tb_wfLive arguments
+        (evalValueM_tb_wfLive callee
+          (prepareForInplacePassingM_tb_wfLive (evalPlaceM_tb_wfLive retExpr hwf hp) hprep) hv)
+        hargs) h
   | Return => exact evalReturnM_tb_wfLive hwf h
   | Intrinsic intrinsic arguments retExpr nextBlock =>
     unfold evalTerminatorM at h

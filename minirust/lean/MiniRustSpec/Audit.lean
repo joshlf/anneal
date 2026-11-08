@@ -16,6 +16,7 @@ import MiniRustSpec.Correspondence.RefWitness
 import MiniRustSpec.Correspondence.TbWitness
 import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
+import MiniRustSpec.Correspondence.IntrinsicBoundary
 
 /-!
 # Axiom audit
@@ -31,16 +32,18 @@ axioms of each declaration, so `lake build MiniRustSpec.Audit` doubles as the
 of declarations and logs one summary line per group, tagged `[ANCHOR-AUDIT]`
 (the anchors of the interpretation), `[SIMULATION-AUDIT]` (the
 correspondence theorems and the lemmas they rest on), `[WITNESS-AUDIT]`
-(the concrete witnesses), `[POINTER-AUDIT]` (the MR-3.1 raw pointer lemmas of
-`Correspondence.Pointers` and `Correspondence.PointerStep` and the witnesses of
+(the concrete witnesses; a second and a third `[WITNESS-AUDIT]` line cover
+`Correspondence.IntrinsicFallback` and `Correspondence.IntrinsicBoundary`),
+`[POINTER-AUDIT]` (the MR-3.1 raw pointer lemmas of `Correspondence.Pointers`
+and `Correspondence.PointerStep` and the witnesses of
 `Correspondence.PointerWitness`), `[REF-AUDIT]` (the MR-3.2 reference,
 reborrowing, safe-pointer validity, and Tree Borrows `ReborrowSettings`
-theorems and witnesses), or `[TB-AUDIT]` (the MR-3.2 Tree Borrows `wf` /
+theorems and witnesses), `[TB-AUDIT]` (the MR-3.2 Tree Borrows `wf` /
 `wfLive` / `no_specPanic` invariants, dereference-`move` and pointer-to-pointer
 dereference-copy correspondence lemmas, and `Correspondence.TbWitness` 3-way
-witnesses),
-ending in `sorry_free=true`. A group that depends on
-`sorryAx` or on any other non-standard axiom fails the build instead.
+witnesses), or `[PROV-AUDIT]` (the MR-3.3 provenance-cast theorems and
+witnesses), ending in `sorry_free=true`. A group that depends on `sorryAx` or
+on any other non-standard axiom fails the build instead.
 -/
 
 namespace MiniRustSpec.Audit
@@ -95,15 +98,111 @@ open MiniRustSpec.LibSpecr in
 
 open MiniRustSpec.Correspondence in
 #assert_standard_axioms
+  unitPlace_eq_buildUnitPlace
+  abortTerminator_eq_buildAbort
+  unitType_eq_unitTy
+  mapGet_eq_of_mem_nodup
+  isAssume_iff
+  translateStmtResult_some
+  splitStmts_names
+  translateTerminatorInProg_names
+  nodup_map_bbName
+  bbName_range'_nodup
+  range'_append_of_le
+  mem_bbName_range'
+  translateBlocksInProg_names
+  splitStmts_segChain
+  translateBlocksInProg_segChain
+  progStatementOk_notAssume
+  progStatementOk_assume
+  SegChain.pcZero
+  SegPc.atStmt_notAssume
+  SegPc.atStmt_assume
+  SegPc.atEnd
+  evalPlace_unitPlace
+  placeStore_unitValue
+  evalTerminator_assume_spec
+  evalStmt_assume_anneal
+  statementOk_isAssume
+  splitStmts_statements
+  mapM_translateStmtResult_of_noAssume
+  evalPlace_derefFree_mach
+  evalPlace_rethread_derefFree
+  translatePlace_derefFree
+  translateFnInProg_spec
+  translateProgFns_get
+  findCallee_idx
+  lookupFnName_of_lookupFnTarget
+  lookupFnTarget_zipIdx_aux
+  lookupFnName_zipIdx_aux
+  translateProg_spec
+  translateCallConv_eq_some_iff
+  translateUnwindAction_spec
+  mkStartFn_spec
+  translateTerminatorInProg_eq_of_not_call
+  translateBlocksInProg_eq_of_no_calls
+  translateFnInProg_eq_translateFn_of_no_calls
+  multi_step_correspondence
+  multi_step_start
+  multi_step_start_with_no_returnRel
+  multi_step_start_no_returnRel
+  initMachineStateWithCallees_startRel
+  bodyInProgFragment_allScalar
+  itOf_layouts_of_scalar
+  tyOf_layouts_of_scalar
+  declSlotData_layouts_of_scalar
+  localAllocsFrom_layouts_of_scalar
+  MultiStartRel.localsOk
+  steps_add_no_returnRel
+  multi_reaches_rel
+  multi_run_ret
+  multi_run_ret_from_start
+  multi_run_ub
+  multi_run_ub_from_start
+  CallStackRel.frames_ne_nil
+  MultiStateRel.not_returnRel
+  multi_run_ub_rel
+  multi_run_ub_rel_from_start
+  multi_steps_error
+  multi_steps_error_from_start
+  multi_mirNoUB_safe
+  multi_mirNoUB_safe_from_start
+  multi_steps_outcome
+  multi_steps_outcome_from_start
+  multi_steps_outcome_any_from_start
+  multi_mirNoUB_progress
+  multi_mirNoUB_progress_from_start
+  multi_mirNoUB_progress_any_from_start
+  multi_mirNoUB_diverges_steps_ok
+  multi_mirNoUB_diverges_from_start
+  multi_mirNoUB_diverges_rel_from_start
+  mirCallWithCallees_ret
+  mirCallWithCallees_ub
+  mirCallWithCallees_ub_rel
+  mirCallWithCallees_noUB
+  mirCallWithCallees_steps_error
+  mirCallWithCallees_progress
+  mirCallWithCallees_progress_any
+  mirCallWithCallees_outcome
+  mirCallWithCallees_outcome_any
+  mirCallWithCallees_diverges_steps_ok
+  mirCallWithCallees_diverges_rel
+  Shape.not_returnRel_of_ne_nil
+  StateRel.not_returnRel
   step_correspondence
   step_start
+  step_start_with_no_returnRel
+  step_start_no_returnRel
   initMachineState_startRel
   steps_ok_mono
   reaches_rel
+  reaches_rel_no_returnRel
   run_ret
   run_ret_from_start
   run_ub
   run_ub_from_start
+  run_ub_rel
+  run_ub_rel_from_start
   steps_error
   steps_error_from_start
   steps_outcome
@@ -117,12 +216,24 @@ open MiniRustSpec.Correspondence in
   mirNoUB_diverges_rel_from_start
   mirCall_ret
   mirCall_ub
+  mirCall_ub_rel
   mirCall_noUB
   mirCall_progress
   mirCall_diverges_steps_ok
   mirCall_diverges_rel
   mirCall_steps_error
   mirCall_outcome
+  stmtMustLive_mono
+  iterLiveEntries_stabilizes
+  livenessOk_eq_true
+  liveAtEntry_greatest
+  liveAtEntry_zero_mem
+  dropMovedFrom_mono
+  stmtTupleInit_mono
+  termTupleInit_mono
+  iterTupleInitEntries_stabilizes
+  tupleInitOk_eq_true
+  tupleInitAtEntry_greatest
   runA_sound
   runA_noUB
   faultsA_sound
@@ -329,7 +440,7 @@ open MiniRustSpec.Correspondence in
   overlaps_cand
   LocalsOkA.free_candidate
   LocalsOkA.alloc'
-  LocalsOk.alloc
+  LocalsOkA.alloc
   LocalsOk.killLocal
   LocalsOk.forget
   LocalsOkA.teardown
@@ -383,9 +494,216 @@ open MiniRustSpec.Correspondence in
   mirCall_progress_N
   mirCall_outcome_N
   mirCall_diverges_rel_N
+  nodup_map_localName
+  nodup_map_fnName
+  translateLocals_names
+  SegChain.head_regular
+  stmtCfgWf_of_translateStatement
+  splitStmts_cfgWf
+  termCfgWf_of_translateTerminator
+  translateBlocksInProg_cfgWf
+  translateFnInProg_funcCfgWf_core
+  translateFnInProg_funcCfgWf
+  translateFn_funcCfgWf
+  mkStartFn_funcCfgWf
+  translateProgFns_names_and_mem
+  translateProg_progWf
 
 open MiniRustSpec.Correspondence.Witness in
 #assert_standard_axioms
+  callerCallee_inFragment
+  calleePair_initLen
+  callerCallee_translate
+  callerMain_translateInProg
+  ctxCallerMain_ok
+  callerCallee20_anneal_ret
+  callerCallee20_noUB
+  callerCallee20_progress
+  callerCallee20_progress_any
+  callerCallee20_outcome_any
+  callerCallee20_minirust_ret
+  callerCallee20_midCall_step5
+  callerCallee20_minirust_direct
+  callerCalleeOv_anneal_ret
+  callerCalleeOv_noUB
+  callerCalleeOv_minirust_ret
+  callerCalleeOv_minirust_direct
+  projDestCaller_inFragment
+  ctxProjDest_ok
+  projDest_translate
+  projDestCaller_translateInProg
+  projDest127_anneal_ret
+  projDest127_noUB
+  projDest127_minirust_ret
+  projDest127_minirust_direct
+  chain3_inFragment
+  chain3_maxStackLocals
+  ctxChainEntry_ok
+  chain3_translate
+  chainEntry_translateInProg
+  chainNeg5_anneal_ret
+  chainNeg5_noUB
+  chainNeg5_minirust_ret
+  chainNeg5_depth4_step7
+  chainNeg5_minirust_direct
+  callArgUb_inFragment
+  ctxCallArgUb_ok
+  callArgUb_translate
+  callArgUbCaller_translateInProg
+  callArgUb_anneal_ub
+  callArgUb_minirust_ub
+  callArgUb_minirust_direct
+  callArgUb_converse_error
+  callArgUb_outcome
+  calleeDivZero_inFragment
+  ctxCalleeDivZero_ok
+  calleeDivZero_translate
+  calleeDivZeroCaller_translateInProg
+  calleeDivZero_anneal_ub
+  calleeDivZero_minirust_ub
+  calleeDivZero_minirust_direct
+  calleeDivZero_converse_error
+  callSpin_inFragment
+  ctxCallSpin_ok
+  callSpin_translate
+  callSpinCaller_translateInProg
+  callSpin_noUB
+  callSpin_noRet
+  callSpin_minirust_diverges
+  callSpin_minirust_diverges_rel
+  callDestArgAlias_movesOk
+  callDestArgAlias_rejected
+  callDestArgAlias_translate
+  callDestArgAlias_anneal_ret
+  callDestArgAlias_minirust_ub
+  callProjMoveReuse_rejected
+  callProjMoveReuse_translate
+  callProjMoveReuse_anneal_ret
+  callProjMoveReuse_minirust_ub
+  callMoveReuse_inFragment
+  callMoveReuse_anneal_ub
+  callMoveReuse_translate
+  callMoveReuse_translateInProg
+  ctxCallMoveReuse_ok
+  callMoveReuse_minirust_ub
+  callMoveReuse_minirust_direct
+  callMoveReuse_converse_error
+  moveReinitByCall_inFragment
+  moveReinitByCall_translate
+  moveReinitByCall_translateInProg
+  ctxMoveReinitByCall_ok
+  moveReinitByCall_anneal_ret
+  moveReinitByCall_minirust_ret
+  moveReinitByCall_minirust_direct
+  condCallMoveJoin_inFragment
+  condCallMoveJoin_translate
+  condCallMoveJoin_translateInProg
+  ctxCondCallMoveJoin_ok
+  condCallMoveJoin1_anneal_ret
+  condCallMoveJoin1_minirust_ret
+  condCallMoveJoin0_anneal_ret
+  condCallMoveJoin0_minirust_ret
+  condCallMoveJoin_minirust_direct
+  stmtMoveThenCallArg_movesOk
+  stmtMoveThenCallArg_rejected
+  recCycle_maxStackLocals
+  recCycle_rejected
+  layout_ptr_and_array_mr41
+  evalConstant_and_fnFromPtr_mr41
+  checkAbiCompatibility_all_variants_mr41
+  createFrame_ub_mr41
+  evalReturn_missingNextBlock_and_bottomOfStack_ub
+  cAbiCallee_conv
+  cAbi_inFragment
+  cAbi_translate
+  cAbiCaller_translateInProg
+  ctxCAbiCaller_ok
+  cAbi32_anneal_ret
+  cAbi32_noUB
+  cAbi32_minirust_ret
+  cAbi32_minirust_direct
+  badCallConv_rejected
+  deadCallDest_rejected
+  deadCallDest_translate
+  deadCallDest_anneal_ub
+  deadCallDest_minirust_ub_before_callee
+  uninitProjCallDest_rejected
+  uninitProjCallDest_translate
+  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_minirust_ret
+  diamondCall_inFragment
+  diamondCall_maxStackLocals
+  ctxDiamondCall_ok
+  diamondCall_translate
+  diamondCallEntry_translateInProg
+  diamondCall5_anneal_ret
+  diamondCall5_noUB
+  diamondCall5_minirust_ret
+  diamondCall5_minirust_direct
+  no_returnRel_before
+  never_ub_of_nonUb_stop
+  callDestArgAlias_noUB
+  callDestArgAlias_noUB_transfer_fails
+  callProjMoveReuse_noUB
+  callProjMoveReuse_noUB_transfer_fails
+  uninitProjCallDest_ub_transfer_fails
+  liveCallDestSpin_inFragment
+  liveCallDestSpin_translate
+  liveCallDestSpin_translateInProg
+  ctxLiveCallDestSpin_ok
+  liveCallDestSpin_noUB
+  liveCallDestSpin_noRet
+  liveCallDestSpin_minirust_diverges
+  liveCallDestSpin_minirust_diverges_rel
+  liveCallDestSpin_depth3_step20
+  deadCallDestSpin_rejected
+  ctxDeadCallDestSpin_ok
+  deadCallDestSpin_hyps
+  deadCallDestSpin_noUB
+  deadCallDestSpin_noRet
+  deadCallDestSpin_minirust_ub
+  deadCallDestSpin_noUB_transfer_fails
+  abiArgMismatch_rejected
+  abiArgMismatch_translate
+  abiArgMismatch_anneal_ret
+  abiArgMismatch_noUB
+  abiArgMismatch_minirust_ub
+  abiArgMismatch_noUB_transfer_fails
+  abiRetMismatch_rejected
+  abiRetMismatch_translate
+  abiRetMismatch_anneal_ret
+  abiRetMismatch_noUB
+  abiRetMismatch_minirust_ub
+  abiRetMismatch_noUB_transfer_fails
+  argCountMismatch_rejected
+  argCountMismatch_translate
+  argCountMismatch_anneal_ret
+  argCountMismatch_noUB
+  argCountMismatch_minirust_ub
+  argCountMismatch_noUB_transfer_fails
+  stmtMoveThenCallArg_translate
+  stmtMoveThenCallArg_anneal_ub
+  stmtMoveThenCallArg_minirust_ret
+  stmtMoveThenCallArg_ub_transfer_fails
+  calleeRetUninit_inFragment
+  calleeRetUninit_translate
+  calleeRetUninit_translateInProg
+  ctxCalleeRetUninit_ok
+  calleeRetUninit_anneal_ub
+  calleeRetUninit_minirust_ub
+  calleeRetUninit_minirust_ub_rel
+  calleeRetUninit_minirust_direct
+  calleeRetUninit_converse_error
+  retUninit_minirust_ub_rel_from_start
+  negMention0_minirust_ub_rel_from_start
+  calleeDivZero_minirust_ub_rel
+  callArgUb_minirust_ub_rel
+  callMoveReuse_minirust_ub_rel
+  projDestCaller_liveness_stabilizes
+  projDestCaller_tupleInit_stabilizes
+  projDestCaller_liveAtEntry_greatest
+  projDestCaller_tupleInitAtEntry_greatest
+  progStart_outside_fragment
   ctx0_ok1
   ctx0_ok2
   ctxI8_ok2
@@ -1038,6 +1356,62 @@ open MiniRustSpec.Correspondence.Witness in
   nestedTupleCopyUninitUb_minirust_direct
   nestedTupleCopyUninitUb_converse_error
   tuple_encode_decode_place_edge_cases
+  evalIntrinsic_abort_exit
+  evalIntrinsic_assume
+  evalIntrinsic_print
+  evalIntrinsic_rawEq_withExposed
+  evalIntrinsic_rawEq
+  evalIntrinsic_allocate_deallocate_leak
+  evalIntrinsic_exposeProvenance
+  evalIntrinsic_getUnwindPayload_empty
+  evalTerminator_abortTerminator
+  translateRsIntrinsic_witness
+  assumeSub_translate
+  assumeSub_translateInProg
+  assumeSub_inFragment
+  ctxAssumeSub_ok
+  runsToScalar_sound
+  assumeSub20_anneal_ret
+  assumeSub20_minirust_ret
+  assumeSub20_minirust_direct
+  assumeSub20_split_point
+  assumeSubFalse_anneal_ub
+  assumeSubFalse_minirust_ub_rel
+  assumeSubFalse_ub
+  assumeTupleCall_inFragment
+  assumeTupleCall_translate
+  assumeTupleCall_translateInProg
+  ctxAssumeTupleCall_ok
+  assumeTupleCall10_anneal_ret
+  assumeTupleCall10_minirust_ret
+  assumeTupleCallOv_anneal_ub
+  assumeTupleCallOv_minirust_ub_rel
+  assumeDeadLocal_inFragment
+  assumeDeadLocal_translate
+  assumeDeadLocal_translateInProg
+  ctxAssumeDeadLocal_ok
+  assumeDeadLocal_anneal_ub
+  assumeDeadLocal_minirust_ub_rel
+  assumeMultiFrame_inFragment
+  assumeMultiFrame_translate
+  assumeMultiFrame_translateInProg
+  assumeChainCallee_translateInProg
+  assumeMultiFrame_prog_wf
+  assumeMultiFrame_func_wf_caller
+  assumeMultiFrame_func_wf_callee
+  ctxAssumeMultiFrame_ok
+  assumeMultiFrame5_anneal_ret
+  assumeMultiFrame5_minirust_ret
+  assumeMultiFramePreUb_anneal_ub
+  assumeMultiFramePreUb_minirust_ub_rel
+  assumeMultiFrameCalleeSeg2Ub_anneal_ub
+  assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel
+  assumeMultiFramePostUb_anneal_ub
+  assumeMultiFramePostUb_minirust_ub_rel
+  assumeMoveReuse_rejected
+  assumeMoveReuse_diverges
+  assumeAfterMove_rejected
+  assumeAfterMove_diverges
 
 #assert_standard_axioms
   MiniRustSpec.Anchors.anchors_ok
@@ -1049,14 +1423,110 @@ open MiniRustSpec.Correspondence.Witness in
 
 open MiniRustSpec.Correspondence in
 #check_theorem_deps "[SIMULATION-AUDIT]"
+  unitPlace_eq_buildUnitPlace
+  abortTerminator_eq_buildAbort
+  unitType_eq_unitTy
+  mapGet_eq_of_mem_nodup
+  isAssume_iff
+  translateStmtResult_some
+  splitStmts_names
+  translateTerminatorInProg_names
+  nodup_map_bbName
+  bbName_range'_nodup
+  range'_append_of_le
+  mem_bbName_range'
+  translateBlocksInProg_names
+  splitStmts_segChain
+  translateBlocksInProg_segChain
+  progStatementOk_notAssume
+  progStatementOk_assume
+  SegChain.pcZero
+  SegPc.atStmt_notAssume
+  SegPc.atStmt_assume
+  SegPc.atEnd
+  evalPlace_unitPlace
+  placeStore_unitValue
+  evalTerminator_assume_spec
+  evalStmt_assume_anneal
+  statementOk_isAssume
+  splitStmts_statements
+  mapM_translateStmtResult_of_noAssume
+  evalPlace_derefFree_mach
+  evalPlace_rethread_derefFree
+  translatePlace_derefFree
+  translateFnInProg_spec
+  translateProgFns_get
+  findCallee_idx
+  lookupFnName_of_lookupFnTarget
+  lookupFnTarget_zipIdx_aux
+  lookupFnName_zipIdx_aux
+  translateProg_spec
+  translateCallConv_eq_some_iff
+  translateUnwindAction_spec
+  mkStartFn_spec
+  translateTerminatorInProg_eq_of_not_call
+  translateBlocksInProg_eq_of_no_calls
+  translateFnInProg_eq_translateFn_of_no_calls
+  multi_step_correspondence
+  multi_step_start
+  multi_step_start_with_no_returnRel
+  multi_step_start_no_returnRel
+  initMachineStateWithCallees_startRel
+  bodyInProgFragment_allScalar
+  itOf_layouts_of_scalar
+  tyOf_layouts_of_scalar
+  declSlotData_layouts_of_scalar
+  localAllocsFrom_layouts_of_scalar
+  MultiStartRel.localsOk
+  steps_add_no_returnRel
+  multi_reaches_rel
+  multi_run_ret
+  multi_run_ret_from_start
+  multi_run_ub
+  multi_run_ub_from_start
+  CallStackRel.frames_ne_nil
+  MultiStateRel.not_returnRel
+  multi_run_ub_rel
+  multi_run_ub_rel_from_start
+  multi_steps_error
+  multi_steps_error_from_start
+  multi_mirNoUB_safe
+  multi_mirNoUB_safe_from_start
+  multi_steps_outcome
+  multi_steps_outcome_from_start
+  multi_steps_outcome_any_from_start
+  multi_mirNoUB_progress
+  multi_mirNoUB_progress_from_start
+  multi_mirNoUB_progress_any_from_start
+  multi_mirNoUB_diverges_steps_ok
+  multi_mirNoUB_diverges_from_start
+  multi_mirNoUB_diverges_rel_from_start
+  mirCallWithCallees_ret
+  mirCallWithCallees_ub
+  mirCallWithCallees_ub_rel
+  mirCallWithCallees_noUB
+  mirCallWithCallees_steps_error
+  mirCallWithCallees_progress
+  mirCallWithCallees_progress_any
+  mirCallWithCallees_outcome
+  mirCallWithCallees_outcome_any
+  mirCallWithCallees_diverges_steps_ok
+  mirCallWithCallees_diverges_rel
+  Shape.not_returnRel_of_ne_nil
+  StateRel.not_returnRel
   step_correspondence
   evalReturn_frame
   step_start
+  step_start_with_no_returnRel
+  step_start_no_returnRel
   initMachineState_startRel
+  reaches_rel_no_returnRel
   run_ret
   run_ret_from_start
   run_ub
   run_ub_from_start
+  run_ub_rel
+  run_ub_rel_from_start
   steps_error
   steps_error_from_start
   steps_outcome
@@ -1065,12 +1535,24 @@ open MiniRustSpec.Correspondence in
   mirNoUB_safe_from_start
   mirCall_ret
   mirCall_ub
+  mirCall_ub_rel
   mirCall_noUB
   mirCall_progress
   mirCall_steps_error
   mirCall_outcome
   mirCall_diverges_steps_ok
   mirCall_diverges_rel
+  stmtMustLive_mono
+  iterLiveEntries_stabilizes
+  livenessOk_eq_true
+  liveAtEntry_greatest
+  liveAtEntry_zero_mem
+  dropMovedFrom_mono
+  stmtTupleInit_mono
+  termTupleInit_mono
+  iterTupleInitEntries_stabilizes
+  tupleInitOk_eq_true
+  tupleInitAtEntry_greatest
   evalValue_operandT
   evalValue_rvalueB
   evalStatement_assignB
@@ -1218,7 +1700,7 @@ open MiniRustSpec.Correspondence in
   overlaps_cand
   LocalsOkA.free_candidate
   LocalsOkA.alloc'
-  LocalsOk.alloc
+  LocalsOkA.alloc
   LocalsOk.killLocal
   LocalsOk.forget
   LocalsOkA.teardown
@@ -1270,9 +1752,216 @@ open MiniRustSpec.Correspondence in
   mirCall_progress_N
   mirCall_outcome_N
   mirCall_diverges_rel_N
+  nodup_map_localName
+  nodup_map_fnName
+  translateLocals_names
+  SegChain.head_regular
+  stmtCfgWf_of_translateStatement
+  splitStmts_cfgWf
+  termCfgWf_of_translateTerminator
+  translateBlocksInProg_cfgWf
+  translateFnInProg_funcCfgWf_core
+  translateFnInProg_funcCfgWf
+  translateFn_funcCfgWf
+  mkStartFn_funcCfgWf
+  translateProgFns_names_and_mem
+  translateProg_progWf
 
 open MiniRustSpec.Correspondence.Witness in
 #check_theorem_deps "[WITNESS-AUDIT]"
+  callerCallee_inFragment
+  calleePair_initLen
+  callerCallee_translate
+  callerMain_translateInProg
+  ctxCallerMain_ok
+  callerCallee20_anneal_ret
+  callerCallee20_noUB
+  callerCallee20_progress
+  callerCallee20_progress_any
+  callerCallee20_outcome_any
+  callerCallee20_minirust_ret
+  callerCallee20_midCall_step5
+  callerCallee20_minirust_direct
+  callerCalleeOv_anneal_ret
+  callerCalleeOv_noUB
+  callerCalleeOv_minirust_ret
+  callerCalleeOv_minirust_direct
+  projDestCaller_inFragment
+  ctxProjDest_ok
+  projDest_translate
+  projDestCaller_translateInProg
+  projDest127_anneal_ret
+  projDest127_noUB
+  projDest127_minirust_ret
+  projDest127_minirust_direct
+  chain3_inFragment
+  chain3_maxStackLocals
+  ctxChainEntry_ok
+  chain3_translate
+  chainEntry_translateInProg
+  chainNeg5_anneal_ret
+  chainNeg5_noUB
+  chainNeg5_minirust_ret
+  chainNeg5_depth4_step7
+  chainNeg5_minirust_direct
+  callArgUb_inFragment
+  ctxCallArgUb_ok
+  callArgUb_translate
+  callArgUbCaller_translateInProg
+  callArgUb_anneal_ub
+  callArgUb_minirust_ub
+  callArgUb_minirust_direct
+  callArgUb_converse_error
+  callArgUb_outcome
+  calleeDivZero_inFragment
+  ctxCalleeDivZero_ok
+  calleeDivZero_translate
+  calleeDivZeroCaller_translateInProg
+  calleeDivZero_anneal_ub
+  calleeDivZero_minirust_ub
+  calleeDivZero_minirust_direct
+  calleeDivZero_converse_error
+  callSpin_inFragment
+  ctxCallSpin_ok
+  callSpin_translate
+  callSpinCaller_translateInProg
+  callSpin_noUB
+  callSpin_noRet
+  callSpin_minirust_diverges
+  callSpin_minirust_diverges_rel
+  callDestArgAlias_movesOk
+  callDestArgAlias_rejected
+  callDestArgAlias_translate
+  callDestArgAlias_anneal_ret
+  callDestArgAlias_minirust_ub
+  callProjMoveReuse_rejected
+  callProjMoveReuse_translate
+  callProjMoveReuse_anneal_ret
+  callProjMoveReuse_minirust_ub
+  callMoveReuse_inFragment
+  callMoveReuse_anneal_ub
+  callMoveReuse_translate
+  callMoveReuse_translateInProg
+  ctxCallMoveReuse_ok
+  callMoveReuse_minirust_ub
+  callMoveReuse_minirust_direct
+  callMoveReuse_converse_error
+  moveReinitByCall_inFragment
+  moveReinitByCall_translate
+  moveReinitByCall_translateInProg
+  ctxMoveReinitByCall_ok
+  moveReinitByCall_anneal_ret
+  moveReinitByCall_minirust_ret
+  moveReinitByCall_minirust_direct
+  condCallMoveJoin_inFragment
+  condCallMoveJoin_translate
+  condCallMoveJoin_translateInProg
+  ctxCondCallMoveJoin_ok
+  condCallMoveJoin1_anneal_ret
+  condCallMoveJoin1_minirust_ret
+  condCallMoveJoin0_anneal_ret
+  condCallMoveJoin0_minirust_ret
+  condCallMoveJoin_minirust_direct
+  stmtMoveThenCallArg_movesOk
+  stmtMoveThenCallArg_rejected
+  recCycle_maxStackLocals
+  recCycle_rejected
+  layout_ptr_and_array_mr41
+  evalConstant_and_fnFromPtr_mr41
+  checkAbiCompatibility_all_variants_mr41
+  createFrame_ub_mr41
+  evalReturn_missingNextBlock_and_bottomOfStack_ub
+  cAbiCallee_conv
+  cAbi_inFragment
+  cAbi_translate
+  cAbiCaller_translateInProg
+  ctxCAbiCaller_ok
+  cAbi32_anneal_ret
+  cAbi32_noUB
+  cAbi32_minirust_ret
+  cAbi32_minirust_direct
+  badCallConv_rejected
+  deadCallDest_rejected
+  deadCallDest_translate
+  deadCallDest_anneal_ub
+  deadCallDest_minirust_ub_before_callee
+  uninitProjCallDest_rejected
+  uninitProjCallDest_translate
+  uninitProjCallDest_anneal_ub
+  uninitProjCallDest_minirust_ret
+  diamondCall_inFragment
+  diamondCall_maxStackLocals
+  ctxDiamondCall_ok
+  diamondCall_translate
+  diamondCallEntry_translateInProg
+  diamondCall5_anneal_ret
+  diamondCall5_noUB
+  diamondCall5_minirust_ret
+  diamondCall5_minirust_direct
+  no_returnRel_before
+  never_ub_of_nonUb_stop
+  callDestArgAlias_noUB
+  callDestArgAlias_noUB_transfer_fails
+  callProjMoveReuse_noUB
+  callProjMoveReuse_noUB_transfer_fails
+  uninitProjCallDest_ub_transfer_fails
+  liveCallDestSpin_inFragment
+  liveCallDestSpin_translate
+  liveCallDestSpin_translateInProg
+  ctxLiveCallDestSpin_ok
+  liveCallDestSpin_noUB
+  liveCallDestSpin_noRet
+  liveCallDestSpin_minirust_diverges
+  liveCallDestSpin_minirust_diverges_rel
+  liveCallDestSpin_depth3_step20
+  deadCallDestSpin_rejected
+  ctxDeadCallDestSpin_ok
+  deadCallDestSpin_hyps
+  deadCallDestSpin_noUB
+  deadCallDestSpin_noRet
+  deadCallDestSpin_minirust_ub
+  deadCallDestSpin_noUB_transfer_fails
+  abiArgMismatch_rejected
+  abiArgMismatch_translate
+  abiArgMismatch_anneal_ret
+  abiArgMismatch_noUB
+  abiArgMismatch_minirust_ub
+  abiArgMismatch_noUB_transfer_fails
+  abiRetMismatch_rejected
+  abiRetMismatch_translate
+  abiRetMismatch_anneal_ret
+  abiRetMismatch_noUB
+  abiRetMismatch_minirust_ub
+  abiRetMismatch_noUB_transfer_fails
+  argCountMismatch_rejected
+  argCountMismatch_translate
+  argCountMismatch_anneal_ret
+  argCountMismatch_noUB
+  argCountMismatch_minirust_ub
+  argCountMismatch_noUB_transfer_fails
+  stmtMoveThenCallArg_translate
+  stmtMoveThenCallArg_anneal_ub
+  stmtMoveThenCallArg_minirust_ret
+  stmtMoveThenCallArg_ub_transfer_fails
+  calleeRetUninit_inFragment
+  calleeRetUninit_translate
+  calleeRetUninit_translateInProg
+  ctxCalleeRetUninit_ok
+  calleeRetUninit_anneal_ub
+  calleeRetUninit_minirust_ub
+  calleeRetUninit_minirust_ub_rel
+  calleeRetUninit_minirust_direct
+  calleeRetUninit_converse_error
+  retUninit_minirust_ub_rel_from_start
+  negMention0_minirust_ub_rel_from_start
+  calleeDivZero_minirust_ub_rel
+  callArgUb_minirust_ub_rel
+  callMoveReuse_minirust_ub_rel
+  projDestCaller_liveness_stabilizes
+  projDestCaller_tupleInit_stabilizes
+  projDestCaller_liveAtEntry_greatest
+  projDestCaller_tupleInitAtEntry_greatest
+  progStart_outside_fragment
   cmpNotSwitch_inFragment
   cmpNotSwitch_translate
   cmpNotNeg1_anneal_ret
@@ -1758,6 +2447,62 @@ open MiniRustSpec.Correspondence.Witness in
   nestedTupleCopyUninitUb_minirust_direct
   nestedTupleCopyUninitUb_converse_error
   tuple_encode_decode_place_edge_cases
+  evalIntrinsic_abort_exit
+  evalIntrinsic_assume
+  evalIntrinsic_print
+  evalIntrinsic_rawEq_withExposed
+  evalIntrinsic_rawEq
+  evalIntrinsic_allocate_deallocate_leak
+  evalIntrinsic_exposeProvenance
+  evalIntrinsic_getUnwindPayload_empty
+  evalTerminator_abortTerminator
+  translateRsIntrinsic_witness
+  assumeSub_translate
+  assumeSub_translateInProg
+  assumeSub_inFragment
+  ctxAssumeSub_ok
+  runsToScalar_sound
+  assumeSub20_anneal_ret
+  assumeSub20_minirust_ret
+  assumeSub20_minirust_direct
+  assumeSub20_split_point
+  assumeSubFalse_anneal_ub
+  assumeSubFalse_minirust_ub_rel
+  assumeSubFalse_ub
+  assumeTupleCall_inFragment
+  assumeTupleCall_translate
+  assumeTupleCall_translateInProg
+  ctxAssumeTupleCall_ok
+  assumeTupleCall10_anneal_ret
+  assumeTupleCall10_minirust_ret
+  assumeTupleCallOv_anneal_ub
+  assumeTupleCallOv_minirust_ub_rel
+  assumeDeadLocal_inFragment
+  assumeDeadLocal_translate
+  assumeDeadLocal_translateInProg
+  ctxAssumeDeadLocal_ok
+  assumeDeadLocal_anneal_ub
+  assumeDeadLocal_minirust_ub_rel
+  assumeMultiFrame_inFragment
+  assumeMultiFrame_translate
+  assumeMultiFrame_translateInProg
+  assumeChainCallee_translateInProg
+  assumeMultiFrame_prog_wf
+  assumeMultiFrame_func_wf_caller
+  assumeMultiFrame_func_wf_callee
+  ctxAssumeMultiFrame_ok
+  assumeMultiFrame5_anneal_ret
+  assumeMultiFrame5_minirust_ret
+  assumeMultiFramePreUb_anneal_ub
+  assumeMultiFramePreUb_minirust_ub_rel
+  assumeMultiFrameCalleeSeg2Ub_anneal_ub
+  assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel
+  assumeMultiFramePostUb_anneal_ub
+  assumeMultiFramePostUb_minirust_ub_rel
+  assumeMoveReuse_rejected
+  assumeMoveReuse_diverges
+  assumeAfterMove_rejected
+  assumeAfterMove_diverges
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
 #assert_standard_axioms
@@ -3954,6 +4699,176 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrAdjacentArgsAmbiguous_countExposeStmts_eq_two
   int2ptrAdjacentArgsAmbiguous_singleExposeSiteOk_false
   int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure
+
+open MiniRustSpec.Correspondence in
+#check_theorem_deps "[WITNESS-AUDIT]"
+  CtxOk.of_scalar
+  fbCtxU32_ok_u8
+  fbCtxU32_ok_u32
+  fbCtxU32_ok_u32u32
+  fbCtxU8_ok_u8
+  fbCtxU8_ok_u8u8
+  fbCtxI8_ok_i8i8
+  fbRunsTo_sound
+  fb_forall_lt_of_all
+  fb_forall_mem_of_all
+  fb_returnRel_alloc
+  fb_minirust_ret
+  fb_minirust_of_runsTo
+  fbCtlz_inFragment
+  fbCtlz_translate
+  fbCtlzCaller_translateInProg
+  fbCtlz_check
+  fbCtlz_anneal_all
+  fbCtlz_minirust_all
+  fbCtlz128_anneal_ret
+  fbCtlz128_noUB
+  fbCtlz128_minirust_ret
+  fbCtlz128_minirust_direct
+  fbCttz_inFragment
+  fbCttz_translate
+  fbCttzCaller_translateInProg
+  fbCttz_check
+  fbCttz_anneal_all
+  fbCttz_minirust_all
+  fbCttz12_anneal_ret
+  fbCttz12_noUB
+  fbCttz12_minirust_ret
+  fbCttz12_minirust_direct
+  fbBswap_inFragment
+  fbBswap_translate
+  fbBswapCaller_translateInProg
+  fbBswap_check
+  fbBswap_anneal_samples
+  fbBswap_minirust_samples
+  fbBswapMid_anneal_ret
+  fbBswapMid_noUB
+  fbBswapMid_minirust_ret
+  fbBswapMid_minirust_direct
+  fbBitrev_inFragment
+  fbBitrev_translate
+  fbBitrevCaller_translateInProg
+  fbBitrev_check
+  fbBitrev_anneal_all
+  fbBitrev_minirust_all
+  fbBitrev35_anneal_ret
+  fbBitrev35_noUB
+  fbBitrev35_minirust_ret
+  fbBitrev35_minirust_direct
+  fbSatAdd_inFragment
+  fbSatAdd_translate
+  fbSatAddCaller_translateInProg
+  fbSatAdd_checkRow
+  fbSatAdd_checkGrid
+  fbSatAdd_anneal_row
+  fbSatAdd_anneal_grid
+  fbSatAdd_minirust_row
+  fbSatAdd_minirust_grid
+  fbSatAddOv_anneal_ret
+  fbSatAddOv_noUB
+  fbSatAddOv_minirust_ret
+  fbSatAddOv_minirust_direct
+  fbSatSub_inFragment
+  fbSatSub_translate
+  fbSatSubCaller_translateInProg
+  fbSatSub_checkRow
+  fbSatSub_checkCols
+  fbSatSub_checkGrid
+  fbSatSub_anneal_row
+  fbSatSub_anneal_cols
+  fbSatSub_anneal_grid
+  fbSatSub_minirust_row
+  fbSatSub_minirust_cols
+  fbSatSub_minirust_grid
+  fbSatSubMin_anneal_ret
+  fbSatSubMin_noUB
+  fbSatSubMin_minirust_ret
+  fbSatSubMin_minirust_direct
+  fbShl_inFragment
+  fbShr_inFragment
+  fbShl_translate
+  fbShr_translate
+  fbShlCaller_translateInProg
+  fbShrCaller_translateInProg
+  fbShl_checkRow
+  fbShl_checkSamples
+  fbShr_checkRow
+  fbShr_checkSamples
+  fbShl_anneal_row
+  fbShl_anneal_samples
+  fbShr_anneal_row
+  fbShr_anneal_samples
+  fbShl_minirust_row
+  fbShl_minirust_samples
+  fbShr_minirust_row
+  fbShr_minirust_samples
+  fbShl33_anneal_ret
+  fbShl33_noUB
+  fbShl33_minirust_ret
+  fbShl33_minirust_direct
+  fbShr63_anneal_ret
+  fbShr63_noUB
+  fbShr63_minirust_ret
+  fbShr63_minirust_direct
+  fbBlackBox_inFragment
+  fbBlackBox_translate
+  fbBlackBoxCaller_translateInProg
+  fbBlackBox_runA
+  fbBlackBox_argsOk
+  fbBlackBox_anneal_all
+  fbBlackBox_minirust_all
+  fbBlackBoxMid_anneal_ret
+  fbBlackBoxMid_noUB
+  fbBlackBoxMid_minirust_ret
+  fbBlackBoxMid_minirust_direct
+
+open MiniRustSpec.Correspondence in
+#check_theorem_deps "[WITNESS-AUDIT]"
+  bdNullaryOp_unsupported
+  bdUbChecks_step
+  bdUbChecks_not_noUB
+  bdNullaryOp_translateRvalue
+  bdUbChecks_rejected
+  bdCopy0_anneal_ret
+  bdCopy1_anneal_ret
+  bdCopy2_anneal_ret
+  bdCopy2_noUB
+  bdCopyZeroScalars_step
+  bdCopy_translateStatement
+  bdCopy_rejected
+  bdOffset1_anneal_ret
+  bdOffsetNeg1_anneal_ret
+  bdOffsetNeg1_noUB
+  bdOffset_rejected
+  bdArithOffset_extCall
+  bdMirCallReq_fields
+  bdWriteBytes_extCall
+  bdRawEq_extCall
+  bdColdPath_extCall
+  bdCtpop_extCall
+  bdExactDivI32_extCall
+  bdAbort_unsupported
+  bdExactDiv_param_types
+  bdExactDiv_same_request
+  bdExactDiv_decode
+  bdExactDiv_minirust_i32
+  bdExactDiv_minirust_u32
+  bdExtCallers_rejected
+  countOnesLoop_mod
+  evalCountOnes_intFromBits
+  evalCountOnes_signedness_indep
+  bdColdPath_handled
+  bdCtpop_handled
+  bdExactDiv_handled
+  exactDivHandler_iff_minirust
+  bdWriteBytes_unhandled_fault
+  bdUbChecksCall_extCall
+  bdUbChecksCall_handled
+  bdUnreach_anneal_ub
+  bdUnreach_anneal_fault
+  bd_minirust_unreachable_ub
+  bdUnreach_rejected
+  bdUnreachableTerminator_covered
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

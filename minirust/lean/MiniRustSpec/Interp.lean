@@ -46,14 +46,15 @@ here.
 * `PlaceExpr::Local`, `PlaceExpr::Field`, `PlaceExpr::Index`, and
   `PlaceExpr::Deref` (`spec/lang/step/expressions.md`),
   including `Machine::ptr_offset_inbounds` (`spec/lang/step/operators.md`),
-  `ThinPointer::wrapping_offset` and `ThinPointer::widen`
-  (`spec/mem/pointer.md`), `Memory::dereferenceable` and
-  `Memory::signed_dereferenceable` (`spec/mem/basic.md`,
+  `ThinPointer::wrapping_offset`, `ThinPointer::widen`, and
+  `PtrType::safe_pointee` (`spec/mem/pointer.md`), `Memory::dereferenceable`
+  and `Memory::signed_dereferenceable` (`spec/mem/basic.md`,
   `spec/mem/concurrent.md`, `spec/mem/interface.md`), and
   `Machine::vtable_lookup`, `Machine::compute_size`, and
   `Machine::compute_align` (`spec/lang/machine.md`).
-* `ValueExpr::Constant` for `Constant::Int`/`Constant::Bool`/
-  `Constant::PointerWithoutProvenance`, `ValueExpr::Tuple`, `ValueExpr::Load`,
+* `ValueExpr::Constant` (all `Constant` variants: `Int`, `Bool`,
+  `GlobalPointer`, `FnPointer`, `VTablePointer`, and
+  `PointerWithoutProvenance`), `ValueExpr::Tuple`, `ValueExpr::Load`,
   `ValueExpr::AddrOf` (with `check_value` at the pointer type and
   `BasicMemory`'s identity `retag_ptr`),
   `ValueExpr::UnOp` with `UnOp::Int` (all `IntUnOp` variants: `Neg`, `BitNot`,
@@ -75,11 +76,23 @@ here.
   and integer subtraction (see `MiniRustSpec.Correspondence.Translate`), so
   `UnOp::Int` on a `Value::Bool` stays a spec panic, exactly as upstream.
 * `Terminator::Goto`, `Terminator::Switch`, `Terminator::Unreachable`,
-  `Terminator::Return` (`spec/lang/step/terminators.md`), including frame
-  teardown, `storage_dead` of every local, and both stack-pop actions, and
-  `Terminator::Intrinsic` for the pointer provenance intrinsics
-  `PointerExposeProvenance` and `PointerWithExposedProvenance`
-  (`spec/lang/step/intrinsics.md`, `spec/mem/intptrcast.md`).
+  `Terminator::Call` (including `Machine::fn_from_ptr`,
+  `check_abi_compatibility`, `Machine::prepare_for_inplace_passing`,
+  `Machine::eval_argument` for both `ByValue` and `InPlace`,
+  `Machine::create_frame`, `Machine::eval_call`, and
+  `Machine::mutate_cur_stack`), `Terminator::Return`
+  (`spec/lang/step/terminators.md`, `spec/lang/machine.md`), including frame
+  teardown, `storage_dead` of every local, and both stack-pop actions
+  (`BottomOfStack` and `BackToCaller`), and `Terminator::Intrinsic`
+  (`spec/lang/step/terminators.md`) with `unit_value`, `unit_type`, and
+  `Machine::eval_intrinsic` for `IntrinsicOp::{Abort, Assume, Exit,
+  PrintStdout, PrintStderr, Allocate, Deallocate, RawEq,
+  PointerExposeProvenance, PointerWithExposedProvenance, GetUnwindPayload}`
+  (with `Machine::exit`, `Machine::eval_print`, `Machine::load_raw_data`,
+  `IntPtrCast::expose`, `IntPtrCast::int2ptr`, and `BasicMemory::leak_check`;
+  `spec/lang/step/intrinsics.md`, `spec/mem/intptrcast.md`,
+  `spec/mem/basic.md`). The thread, lock, and atomic intrinsics report
+  `unsupported`.
 * The representation relation (`Type::{decode, encode}`) for `Type::Int`,
   `Type::Bool`, `Type::Ptr` (thin pointers through `decode_ptr` and
   `encode_ptr`, which carry provenance in `AbstractByte::Init`, and wide
@@ -90,8 +103,10 @@ here.
   `Machine::check_value` (with `ensure_else_ub`, `checkUnionChunks`, and
   `check_ptr` / `check_ptr_metadata` for raw pointers and safe pointers
   `PtrType::Ref` / `PtrType::Box`) for
-  those types (`spec/lang/representation.md`); `Type::layout` for all of them
-  (`spec/lang/types.md`); `BasicMemory`'s `allocate`, `load`, `store`,
+  those types (`spec/lang/representation.md`); `Type::layout` across all nine
+  `Type` variants together with `LayoutStrategy::meta_kind` and
+  `PtrType::{safe_pointee, meta_kind}` (`spec/lang/types.md`,
+  `spec/mem/pointer.md`); `BasicMemory`'s `allocate`, `load`, `store`,
   `deallocate`, `dereferenceable`, `signed_dereferenceable`, `retag_ptr`,
   `leak_check`, and `check_ptr` (`spec/mem/basic.md`), wrapped by
   `ConcurrentMemory` (`spec/mem/concurrent.md`); and the full Tree Borrows
@@ -106,7 +121,8 @@ here.
   both `BasicMemory<x86_64>` (`Mach` / `step` / `steps`) and polymorphic
   `Machine<M>` (`MemoryOps`, `stepM` / `stepsM`) instantiated at
   `BasicMemory<x86_64>` and `TreeBorrowsMemory<x86_64>` (`MachTB` / `stepTB` /
-  `stepsTB`).
+  `stepsTB`). Both interpretations cover the same statements, places, values,
+  and terminators, including `Terminator::Call` and every intrinsic above.
 
 Everything else returns `Stop.unsupported`, so the interpretation is partial
 but never silently wrong. In particular, `check_ptr` for vtable pointers
@@ -118,12 +134,16 @@ supplied (`m = none` on non-ZST pointees) returns `Stop.unsupported`.
 specr-lang functions return `Result`/`NdResult`. We use `Except Stop`:
 
 * `Stop.ub` is `throw_ub!` (`TerminationInfo::Ub`),
+* `Stop.abort` is `throw_abort!` (`TerminationInfo::Abort`),
 * `Stop.deadlock` is `throw_deadlock!`,
 * `Stop.specPanic` is a specr-lang `panic!`, failed `assert!`, `unwrap` of
   `None`, or out-of-range indexing. Upstream says such a panic "is a bug in the
   specification" (vendored `README.md`), so it signals an ill-formed input
   rather than program behavior,
-* `Stop.unsupported` marks a construct outside the interpreted fragment.
+* `Stop.unsupported` marks a construct outside the interpreted fragment,
+* `Stop.machineStop` is `throw_machine_stop!` (`TerminationInfo::MachineStop`)
+  and `Stop.memoryLeak` is `throw_memory_leak!` (`TerminationInfo::MemoryLeak`),
+  the two outcomes of the `Exit` intrinsic.
 
 Three non-deterministic operations are reachable from this fragment. The
 thread choice in `Machine::step` has a unique solution here (see
@@ -183,10 +203,12 @@ abbrev MachTB : Type := Machine TBM
 /-- Why an interpreted computation stopped; see the module docs. -/
 inductive Stop : Type where
   | ub (msg : String)
+  | abort
   | deadlock
-  | memoryLeak
   | specPanic (msg : String)
   | unsupported (what : String)
+  | machineStop
+  | memoryLeak
   deriving DecidableEq
 
 /-- `Result<T>` of specr-lang, plus the two non-behavior stops. -/
@@ -195,7 +217,28 @@ abbrev Interp (α : Type) : Type := Except Stop α
 /-- `throw_ub!(msg)`. -/
 def ub {α : Type} (msg : String) : Interp α := .error (.ub msg)
 
-/-- `throw_memory_leak!()`. -/
+/-- `throw_abort!()` (`spec/prelude/main.md`):
+> "macro_rules! throw_abort {
+>      () => {
+>          do yeet TerminationInfo::Abort
+>      }
+>  }" -/
+def abort {α : Type} : Interp α := .error .abort
+
+/-- `throw_machine_stop!()` (`spec/prelude/main.md`):
+> "macro_rules! throw_machine_stop {
+>      () => {
+>          do yeet TerminationInfo::MachineStop
+>      };
+>  }" -/
+def machineStop {α : Type} : Interp α := .error .machineStop
+
+/-- `throw_memory_leak!()` (`spec/prelude/main.md`):
+> "macro_rules! throw_memory_leak {
+>      () => {
+>          do yeet TerminationInfo::MemoryLeak
+>      };
+>  }" -/
 def memoryLeak {α : Type} : Interp α := .error .memoryLeak
 
 /-- A specr-lang panic (`panic!`, failed `assert!`, `unwrap` of `None`). -/
@@ -261,6 +304,16 @@ def Size.add (a b : Size) : Size := ⟨a.bytes + b.bytes⟩
 /-- `Align::from_bytes(n)`: `Some` iff `n` is a power of two. -/
 def alignFromBytes (n : Nat) : Option Align :=
   if n ≠ 0 ∧ n &&& (n - 1) = 0 then some ⟨n⟩ else none
+
+/-- `Align::from_bytes(n)` on a mathematical integer `n : Int`: `Some` iff `n`
+is a (positive) power of two. -/
+def alignFromBytesInt (n : Int) : Option Align :=
+  if n < 0 then none else alignFromBytes n.toNat
+
+/-- `Size::from_bytes(n)` on a mathematical integer `n : Int`: `Some` iff `n`
+is non-negative. -/
+def sizeFromBytes (n : Int) : Option Size :=
+  if n < 0 then none else some ⟨n.toNat⟩
 
 /-- `Align::is_aligned(addr)`: `addr` is a multiple of the alignment. -/
 def Align.is_aligned (a : Align) (addr : Int) : Bool := addr % (a.bytes : Int) == 0
@@ -369,6 +422,19 @@ def mapInsert {K V : Type} [DecidableEq K] : List (K × V) → K → V → List 
 /-- `Map::insert(k, v)`. -/
 def mapInsertMap {K V : Type} [DecidableEq K] (m : Map K V) (k : K) (v : V) : Map K V :=
   ⟨mapInsert m.entries k v⟩
+
+/-- `PartialEq::eq` on `libspecr::Map`: extensional key-value equality
+(independent of association-list entry order or shadowed bindings). -/
+def mapEq {K V : Type} [DecidableEq K] (eqV : V → V → Bool) (m1 m2 : Map K V) : Bool :=
+  m1.entries.all (fun (k, _) =>
+    match mapGet m1 k, mapGet m2 k with
+    | some v1, some v2 => eqV v1 v2
+    | _, _ => false) &&
+  m2.entries.all (fun (k, _) => (mapGet m1 k).isSome)
+
+/-- Distinct key count `Map::len()` on `libspecr::Map`. -/
+def mapLen {K V : Type} [DecidableEq K] (m : Map K V) : Nat :=
+  (m.entries.map Prod.fst).eraseDups.length
 
 /-- `Set::insert(x)`. -/
 def setInsert {T : Type} [DecidableEq T] (s : Set T) (x : T) : Set T :=
@@ -2276,12 +2342,47 @@ def tryMutateCurFrame (m : Mach)
     let threads ← listSet m.threads m.active_thread t' "try_mutate_at"
     pure { m with mem := cm', threads := threads }
 
+/-- `Machine::mutate_cur_stack` (`spec/lang/machine.md`):
+> "fn mutate_cur_stack<O>(&mut self, f: impl FnOnce(&mut List<StackFrame<M>>) -> O) -> O {
+>     self.threads.mutate_at(self.active_thread, |thread| f(&mut thread.stack))
+> }" -/
+def mutateCurStack {α : Type} (m : Mach) (f : List Frame → Interp (α × List Frame)) :
+    Interp (α × Mach) := do
+  let t ← activeThread m
+  let (out, stack') ← f t.stack
+  let threads ← listSet m.threads m.active_thread { t with stack := stack' } "mutate_at"
+  pure (out, { m with threads := threads })
+
 /-- `StackFrame::jump_to_block` (`spec/lang/machine.md`):
 > "self.next_block = b; self.next_stmt = Int::ZERO;"
 and `Machine::jump_to_block` (`spec/lang/step/terminators.md`):
 > "self.try_mutate_cur_frame(|frame, _mem| { frame.jump_to_block(block); ret(()) })" -/
 def jumpToBlock (m : Mach) (b : BbName) : Interp Mach :=
   mutateCurFrame m (fun fr => { fr with next_block := b, next_stmt := 0 })
+
+/-- `Machine::fn_from_ptr` (`spec/lang/machine.md`):
+> "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> {
+>     if let Value::Ptr(Pointer { thin_pointer: thin_ptr, metadata }) = ptr {
+>         if metadata.is_some() {
+>             throw_ub!(\"invalid pointer for function lookup\");
+>         }
+>         let Some((func_name, _)) = self.fn_ptrs.iter().find(|(_, fn_ptr)| *fn_ptr == thin_ptr) else {
+>             throw_ub!(\"invalid pointer for function lookup\");
+>         };
+>         ret(self.prog.functions[func_name])
+>     } else {
+>         throw_ub!(\"trying to look up a function based on a non-pointer value\");
+>     }
+> }" -/
+def fnFromPtr (m : Mach) (ptr : Val) : Interp Function :=
+  match ptr with
+  | .Ptr ⟨thinPtr, metadata⟩ =>
+    if metadata.isSome then ub "invalid pointer for function lookup"
+    else
+      match m.fn_ptrs.entries.find? (fun (_, (fnPtr : Ptr)) => decide (fnPtr = thinPtr)) with
+      | some (funcName, _) => mapIndex m.prog.functions funcName "self.prog.functions[func_name]"
+      | none => ub "invalid pointer for function lookup"
+  | _ => ub "trying to look up a function based on a non-pointer value"
 
 /-- `Machine::vtable_lookup` (`spec/lang/machine.md`):
 > "fn vtable_lookup(&self) -> impl Fn(ThinPointer<M::Provenance>) -> VTable + 'static {
@@ -2597,22 +2698,46 @@ def placeStore (m : Mach) (place : Place BM) (val : Val) (ty : «Type») : Inter
   if !place.aligned then ub "storing to a place based on a misaligned pointer"
   else typedStore m place.ptr.thin_pointer val ty ⟨1⟩ .None
 
-/-- `Machine::eval_constant` for the constants that need no global, function,
-or vtable pointer of the machine:
-> "Constant::Int(i) => Value::Int(i),
->  Constant::Bool(b) => Value::Bool(b),"
-> "Constant::PointerWithoutProvenance(addr) => {
->     Value::Ptr(ThinPointer {
->         addr,
->         provenance: None,
->     }.widen(None))
+/-- `Machine::eval_constant` (`spec/lang/step/expressions.md`):
+> "fn eval_constant(&mut self, constant: Constant) -> Result<Value<M>> {
+>     ret(match constant {
+>         Constant::Int(i) => Value::Int(i),
+>         Constant::Bool(b) => Value::Bool(b),
+>         Constant::GlobalPointer(relocation) => {
+>             let ptr = self.global_ptrs[relocation.name].wrapping_offset::<M::T>(relocation.offset.bytes());
+>             Value::Ptr(ptr.widen(None))
+>         },
+>         Constant::FnPointer(fn_name) => {
+>             let ptr = self.fn_ptrs[fn_name];
+>             Value::Ptr(ptr.widen(None))
+>         },
+>         Constant::VTablePointer(vtable_name) => {
+>             let ptr = self.vtable_ptrs[vtable_name];
+>             Value::Ptr(ptr.widen(None))
+>         },
+>         Constant::PointerWithoutProvenance(addr) => {
+>             Value::Ptr(ThinPointer {
+>                 addr,
+>                 provenance: None,
+>             }.widen(None))
+>         }
+>     })
 > }" -/
-def evalConstant : Constant → Interp Val
+def evalConstant (m : Mach) : Constant → Interp Val
   | .Int i => pure (.Int i)
   | .Bool b => pure (.Bool b)
+  | .GlobalPointer relocation => do
+    let base ← mapIndex m.global_ptrs relocation.name "self.global_ptrs[relocation.name]"
+    let ptr := ThinPointer.wrapping_offset base relocation.offset.bytes
+    pure (.Ptr (ThinPointer.widen ptr none))
+  | .FnPointer fnName => do
+    let ptr ← mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+    pure (.Ptr (ThinPointer.widen ptr none))
+  | .VTablePointer vtableName => do
+    let ptr ← mapIndex m.vtable_ptrs vtableName "self.vtable_ptrs[vtable_name]"
+    pure (.Ptr (ThinPointer.widen ptr none))
   | .PointerWithoutProvenance addr =>
     pure (.Ptr (ThinPointer.widen { addr := addr, provenance := none } none))
-  | _ => unsupported "eval_constant for a global, function, or vtable pointer constant"
 
 /-! ## Operators (`spec/lang/step/operators.md`) -/
 
@@ -3171,6 +3296,88 @@ def retagPtrBM (m : Mach) (ptr : Pointer Prov) : Interp (Pointer Prov) := do
 
 /-! ## Place and value expressions (`spec/lang/step/expressions.md`) -/
 
+/-- The pointer checks and alignment computation of `Machine::eval_place` for
+`PlaceExpr::Deref` once its operand has evaluated to `Value::Ptr(ptr)` at
+`Type::Ptr(ptr_type)` (`spec/lang/step/expressions.md`):
+> "if let Some(pointee) = ptr_type.safe_pointee() {
+>      assert!(self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr));
+>      self.mem.dereferenceable(ptr.thin_pointer, self.compute_size(pointee.layout, ptr.metadata))?;
+>  }
+>  let aligned = self.compute_align(ty.layout::<M::T>(), ptr.metadata).is_aligned(ptr.thin_pointer.addr);
+>  ret((Place { ptr, aligned }, ty))"
+Neither step changes the machine (`dereferenceable` only reads memory). -/
+def derefPlace (m : Mach) (ptr : Pointer Prov) (ptrType : PtrType) (ty : «Type») :
+    Interp (Place BM × «Type») := do
+  match PtrType.safe_pointee ptrType with
+  | some pointee => do
+    let ptAlign ← computeAlign m pointee.layout ptr.metadata
+    if !Align.is_aligned ptAlign ptr.thin_pointer.addr then
+      specPanic "assertion failed: self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr)"
+    else do
+      let ptSize ← computeSize m pointee.layout ptr.metadata
+      CM.dereferenceable m.mem ptr.thin_pointer ptSize
+  | none => pure ()
+  let placeAlign ← computeAlign m (← Type.layout ty) ptr.metadata
+  let aligned := Align.is_aligned placeAlign ptr.thin_pointer.addr
+  pure ({ ptr := ptr, aligned := aligned }, ty)
+
+/-- The projection of `Machine::eval_place` for `PlaceExpr::Field` once the
+root place `root` of type `ty` is known (`spec/lang/step/expressions.md`):
+> "let (offset, field_ty) = match ty {
+>      Type::Tuple { sized_fields, unsized_field, sized_head_layout } => {
+>          if field >= 0 && field < sized_fields.len() {
+>              sized_fields[field]
+>          } else if field == sized_fields.len() {
+>              let tail_ty = unsized_field.expect(\"field projection to non-existing unsized tail\");
+>              let tail_align = self.compute_align(tail_ty.layout::<M::T>(), root.ptr.metadata);
+>              let offset = sized_head_layout.tail_offset(tail_align);
+>              (offset, tail_ty)
+>          } else {
+>              panic!(\"field projection to invalid field\");
+>          }
+>      }
+>      Type::Union { fields, .. } => fields[field],
+>      _ => panic!(\"field projection on non-projectable type\"),
+>  };
+>  assert!(offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata));
+>
+>  let ptr = self.ptr_offset_inbounds(root.ptr.thin_pointer, offset.bytes())?;
+>  let ptr = if !field_ty.layout::<M::T>().is_sized() {
+>      // Unsized fields should retain the metadata
+>      ptr.widen(root.ptr.metadata)
+>  } else {
+>      ptr.widen(None)
+>  };
+>  ret((Place { ptr, ..root }, field_ty))"
+None of these steps changes the machine. -/
+def fieldPlace (m : Mach) (root : Place BM) (ty : «Type») (field : Int) :
+    Interp (Place BM × «Type») := do
+  let (offset, fieldTy) ← match ty with
+    | .Tuple sizedFields sizedHeadLayout unsizedField =>
+      if 0 ≤ field ∧ field < (sizedFields.length : Int) then
+        listIndex sizedFields field "sized_fields[field]"
+      else if field = (sizedFields.length : Int) then
+        match unsizedField with
+        | none => specPanic "field projection to non-existing unsized tail"
+        | some tailTy => do
+          let tailAlign ← computeAlign m (← Type.layout tailTy) root.ptr.metadata
+          let offset := TupleHeadLayout.tail_offset sizedHeadLayout tailAlign
+          pure (offset, tailTy)
+      else
+        specPanic "field projection to invalid field"
+    | .Union fields _ _ _ => listIndex fields field "fields[field]"
+    | _ => specPanic "field projection on non-projectable type"
+  let rootSize ← computeSize m (← Type.layout ty) root.ptr.metadata
+  if !(offset.bytes ≤ rootSize.bytes) then
+    specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)"
+  else do
+    let ptr ← ptrOffsetInbounds m root.ptr.thin_pointer (offset.bytes : Int)
+    let ptr := if !LayoutStrategy.is_sized (← Type.layout fieldTy) then
+        ThinPointer.widen ptr root.ptr.metadata
+      else
+        ThinPointer.widen ptr none
+    pure ({ root with ptr := ptr }, fieldTy)
+
 mutual
 
 /-- `Machine::eval_place` for `PlaceExpr::Local`, `PlaceExpr::Field`,
@@ -3392,7 +3599,7 @@ machine's memory, so those operators are evaluated by `evalPtrOffset` and
 `evalPtrOffsetFrom` on the machine after both operands, and all others by the
 machine-free `evalBinOp`. -/
 def evalValue (m : Mach) : ValueExpr → Interp ((Val × «Type») × Mach)
-  | .Constant c ty => do pure ((← evalConstant c, ty), m)
+  | .Constant c ty => do pure ((← evalConstant m c, ty), m)
   | .Tuple exprs ty => do
     let (vals, m) ← evalValues m exprs
     pure ((.Tuple vals, ty), m)
@@ -4869,83 +5076,6 @@ def IntPtrCast.int2ptr (m : Mach) (addr : Int) : Interp Ptr := do
 
 /-! ## Intrinsics (`spec/lang/step/intrinsics.md`) -/
 
-/-- `Machine::eval_intrinsic` for the pointer provenance intrinsics
-`IntrinsicOp::PointerExposeProvenance` and
-`IntrinsicOp::PointerWithExposedProvenance` (`spec/lang/step/intrinsics.md`),
-to which `minimize` translates MIR's `PointerExposeProvenance` and
-`PointerWithExposedProvenance` casts:
-> "fn eval_intrinsic(&mut self,
->     IntrinsicOp::PointerExposeProvenance: IntrinsicOp,
->     arguments: List<(Value<M>, Type)>,
->     ret_ty: Type,
-> ) -> NdResult<Value<M>> {
->     if arguments.len() != 1 {
->         throw_ub!(\"invalid number of arguments for `PointerExposeProvenance` intrinsic\");
->     }
->     let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
->         throw_ub!(\"invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer\");
->     };
->     if ret_ty != Type::Int(IntType { signed: Unsigned, size: M::T::PTR_SIZE }) {
->         throw_ub!(\"invalid return type for `PointerExposeProvenance` intrinsic\")
->     }
->
->     self.intptrcast.expose(ptr);
->     ret(Value::Int(ptr.addr))
-> }
->
-> fn eval_intrinsic(&mut self,
->     IntrinsicOp::PointerWithExposedProvenance: IntrinsicOp,
->     arguments: List<(Value<M>, Type)>,
->     ret_ty: Type,
-> ) -> NdResult<Value<M>> {
->     if arguments.len() != 1 {
->         throw_ub!(\"invalid number of arguments for `PointerWithExposedProvenance` intrinsic\");
->     }
->     let Value::Int(addr) = arguments[0].0 else {
->         throw_ub!(\"invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer\");
->     };
->     let Type::Ptr(ret_ptr_ty) = ret_ty else {
->         throw_ub!(\"invalid return type for `PointerWithExposedProvenance` intrinsic\");
->     };
->     if ret_ptr_ty.meta_kind() != PointerMetaKind::None {
->         throw_ub!(\"unsized pointee requested for `PointerWithExposedProvenance` intrinsic\");
->     }
->
->     let ptr = self.intptrcast.int2ptr(addr)?;
->     ret(Value::Ptr(ptr.widen(None)))
-> }"
-Every other intrinsic is outside the fragment. -/
-def evalIntrinsic (m : Mach) (intrinsic : IntrinsicOp) (arguments : List (Val × «Type»))
-    (retTy : «Type») : Interp (Val × Mach) :=
-  match intrinsic with
-  | .PointerExposeProvenance =>
-    if arguments.length ≠ 1 then
-      ub "invalid number of arguments for `PointerExposeProvenance` intrinsic"
-    else
-      match arguments with
-      | [(.Ptr ⟨ptr, none⟩, _)] =>
-        match retTy with
-        | .Int ⟨.Unsigned, ⟨8⟩⟩ =>
-          pure (.Int ptr.addr, { m with intptrcast := IntPtrCast.expose m.intptrcast ptr })
-        | _ => ub "invalid return type for `PointerExposeProvenance` intrinsic"
-      | _ => ub "invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer"
-  | .PointerWithExposedProvenance =>
-    if arguments.length ≠ 1 then
-      ub "invalid number of arguments for `PointerWithExposedProvenance` intrinsic"
-    else
-      match arguments with
-      | [(.Int addr, _)] =>
-        match retTy with
-        | .Ptr retPtrTy =>
-          if PtrType.meta_kind retPtrTy ≠ .None then
-            ub "unsized pointee requested for `PointerWithExposedProvenance` intrinsic"
-          else do
-            let ptr ← IntPtrCast.int2ptr m addr
-            pure (.Ptr (ThinPointer.widen ptr none), m)
-        | _ => ub "invalid return type for `PointerWithExposedProvenance` intrinsic"
-      | _ => ub "invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer"
-  | _ => unsupported "eval_intrinsic for an intrinsic other than the pointer provenance intrinsics"
-
 /-- The argument loop of `Terminator::Intrinsic`
 (`spec/lang/step/terminators.md`), which keeps each argument's type:
 > "let arguments = arguments.try_map(|arg| self.eval_value(arg))?;" -/
@@ -4957,6 +5087,377 @@ def evalArgs (m : Mach) : List ValueExpr → Interp (List (Val × «Type») × M
     pure (arg :: args, m)
 
 /-! ## Terminators (`spec/lang/step/terminators.md`) -/
+
+mutual
+
+/-- Structural equality `caller_discriminator == callee_discriminator` on
+`Discriminator` decision trees in `check_abi_compatibility`
+(`spec/lang/step/terminators.md`), comparing `Branch` child maps extensionally:
+> "caller_discriminator == callee_discriminator &&" -/
+def discriminatorEq : Discriminator → Discriminator → Bool
+  | .Known v1, .Known v2 => v1 == v2
+  | .Invalid, .Invalid => true
+  | .Branch off1 ty1 fb1 ⟨ch1⟩, .Branch off2 ty2 fb2 ch2 =>
+    off1 == off2 && ty1 == ty2 && discriminatorEq fb1 fb2 &&
+    discriminatorChildrenEq [] ch1 ch2 &&
+    ch2.entries.all (fun (k, _) => (mapGet ⟨ch1⟩ k).isSome)
+  | _, _ => false
+
+/-- Child-map comparison of `discriminatorEq` (`spec/lang/step/terminators.md`),
+checking each active `(start, end)` binding of `ch1` against `ch2`:
+> "caller_discriminator == callee_discriminator &&" -/
+def discriminatorChildrenEq (seen : List (Int × Int)) :
+    List ((Int × Int) × Discriminator) → Map (Int × Int) Discriminator → Bool
+  | [], _ => true
+  | (k, d1) :: rest, ch2 =>
+    if seen.contains k then
+      discriminatorChildrenEq seen rest ch2
+    else
+      (match mapGet ch2 k with
+       | some d2 => discriminatorEq d1 d2
+       | none => false) &&
+      discriminatorChildrenEq (k :: seen) rest ch2
+
+end
+
+mutual
+
+/-- `check_abi_compatibility` (`spec/lang/step/terminators.md`):
+> "fn check_abi_compatibility(
+>     caller_ty: Type,
+>     callee_ty: Type,
+> ) -> bool {
+>     match (caller_ty, callee_ty) {
+>         (Type::Int(caller_ty), Type::Int(callee_ty)) =>
+>             caller_ty == callee_ty,
+>         (Type::Bool, Type::Bool) =>
+>             true,
+>         (Type::Ptr(caller_ty), Type::Ptr(callee_ty)) =>
+>             caller_ty.meta_kind() == callee_ty.meta_kind(),
+>         (Type::Tuple { sized_fields: caller_fields, sized_head_layout: caller_head_layout, unsized_field: caller_unsized_field },
+>          Type::Tuple { sized_fields: callee_fields, sized_head_layout: callee_head_layout, unsized_field: callee_unsized_field }) => {
+>             let (caller_size, caller_align) = caller_head_layout.head_size_and_align();
+>             let (callee_size, callee_align) = callee_head_layout.head_size_and_align();
+>             assert!(caller_unsized_field.is_none(), \"wf ensures all arugments are sized\");
+>             assert!(callee_unsized_field.is_none(), \"wf ensures all arugments are sized\");
+>             caller_fields.len() == callee_fields.len() &&
+>             caller_fields.zip(callee_fields).all(|(caller_field, callee_field)|
+>                 caller_field.0 == callee_field.0 && check_abi_compatibility(caller_field.1, callee_field.1)
+>             ) &&
+>             caller_size == callee_size &&
+>             caller_align == callee_align
+>         }
+>         (Type::Array { elem: caller_elem, count: caller_count },
+>          Type::Array { elem: callee_elem, count: callee_count }) =>
+>             check_abi_compatibility(caller_elem, callee_elem) && caller_count == callee_count,
+>         (Type::Union { fields: caller_fields, chunks: caller_chunks, size: caller_size, align: caller_align },
+>          Type::Union { fields: callee_fields, chunks: callee_chunks, size: callee_size, align: callee_align }) =>
+>             caller_fields.len() == callee_fields.len() &&
+>             caller_fields.zip(callee_fields).all(|(caller_field, callee_field)|
+>                 caller_field.0 == callee_field.0 && check_abi_compatibility(caller_field.1, callee_field.1)
+>             ) &&
+>             caller_chunks == callee_chunks &&
+>             caller_size == callee_size &&
+>             caller_align == callee_align,
+>         (Type::Enum { variants: caller_variants, discriminator: caller_discriminator, discriminant_ty: caller_discriminant_ty, size: caller_size, align: caller_align },
+>          Type::Enum { variants: callee_variants, discriminator: callee_discriminator, discriminant_ty: callee_discriminant_ty, size: callee_size, align: callee_align }) =>
+>             caller_variants.len() == callee_variants.len() &&
+>             caller_variants.iter().all(|(caller_discriminant, caller_variant)| {
+>                 let Some(callee_variant) = callee_variants.get(caller_discriminant) else {
+>                     return false;
+>                 };
+>                 check_abi_compatibility(caller_variant.ty, callee_variant.ty) &&
+>                 caller_variant.tagger == callee_variant.tagger
+>             }) &&
+>             caller_discriminator == callee_discriminator &&
+>             caller_discriminant_ty == callee_discriminant_ty &&
+>             caller_size == callee_size &&
+>             caller_align == callee_align,
+>         _ =>
+>             false
+>     }
+> }" -/
+def checkAbiCompatibility : «Type» → «Type» → Interp Bool
+  | .Int callerTy, .Int calleeTy => pure (callerTy == calleeTy)
+  | .Bool, .Bool => pure true
+  | .Ptr callerTy, .Ptr calleeTy =>
+    pure (PtrType.meta_kind callerTy == PtrType.meta_kind calleeTy)
+  | .Tuple callerFields callerHeadLayout callerUnsizedField,
+    .Tuple calleeFields calleeHeadLayout calleeUnsizedField =>
+    let (callerSize, callerAlign) := TupleHeadLayout.head_size_and_align callerHeadLayout
+    let (calleeSize, calleeAlign) := TupleHeadLayout.head_size_and_align calleeHeadLayout
+    if callerUnsizedField.isSome then
+      specPanic "wf ensures all arugments are sized"
+    else if calleeUnsizedField.isSome then
+      specPanic "wf ensures all arugments are sized"
+    else if callerFields.length ≠ calleeFields.length then
+      pure false
+    else do
+      if !(← checkAbiFields callerFields calleeFields) then
+        pure false
+      else
+        pure (callerSize == calleeSize && callerAlign == calleeAlign)
+  | .Array callerElem callerCount, .Array calleeElem calleeCount => do
+    if !(← checkAbiCompatibility callerElem calleeElem) then
+      pure false
+    else
+      pure (callerCount == calleeCount)
+  | .Union callerFields callerChunks callerSize callerAlign,
+    .Union calleeFields calleeChunks calleeSize calleeAlign =>
+    if callerFields.length ≠ calleeFields.length then
+      pure false
+    else do
+      if !(← checkAbiFields callerFields calleeFields) then
+        pure false
+      else
+        pure (callerChunks == calleeChunks && callerSize == calleeSize && callerAlign == calleeAlign)
+  | .Enum ⟨callerVariants⟩ callerDiscrTy callerDiscriminator callerSize callerAlign,
+    .Enum calleeVariants calleeDiscrTy calleeDiscriminator calleeSize calleeAlign =>
+    if mapLen ⟨callerVariants⟩ ≠ mapLen calleeVariants then
+      pure false
+    else do
+      if !(← checkAbiVariants [] callerVariants calleeVariants) then
+        pure false
+      else
+        pure (discriminatorEq callerDiscriminator calleeDiscriminator &&
+          callerDiscrTy == calleeDiscrTy &&
+          callerSize == calleeSize &&
+          callerAlign == calleeAlign)
+  | _, _ => pure false
+
+/-- The field-list comparison of `check_abi_compatibility` for `Tuple` and
+`Union` (`spec/lang/step/terminators.md`):
+> "caller_fields.zip(callee_fields).all(|(caller_field, callee_field)|
+>     caller_field.0 == callee_field.0 && check_abi_compatibility(caller_field.1, callee_field.1)
+> )" -/
+def checkAbiFields : List (Offset × «Type») → List (Offset × «Type») → Interp Bool
+  | (callerOff, callerTy) :: restCaller, (calleeOff, calleeTy) :: restCallee =>
+    if callerOff ≠ calleeOff then
+      pure false
+    else do
+      if !(← checkAbiCompatibility callerTy calleeTy) then
+        pure false
+      else
+        checkAbiFields restCaller restCallee
+  | _, _ => pure true
+
+/-- The variant-map comparison of `check_abi_compatibility` for `Enum`
+(`spec/lang/step/terminators.md`):
+> "caller_variants.iter().all(|(caller_discriminant, caller_variant)| {
+>     let Some(callee_variant) = callee_variants.get(caller_discriminant) else {
+>         return false;
+>     };
+>     check_abi_compatibility(caller_variant.ty, callee_variant.ty) &&
+>     caller_variant.tagger == callee_variant.tagger
+> })" -/
+def checkAbiVariants (seen : List Int) :
+    List (Int × Variant) → Map Int Variant → Interp Bool
+  | [], _ => pure true
+  | (callerDiscr, ⟨callerVarTy, callerTagger⟩) :: rest, calleeVariants =>
+    if seen.contains callerDiscr then
+      checkAbiVariants seen rest calleeVariants
+    else
+      match mapGet calleeVariants callerDiscr with
+      | none => pure false
+      | some calleeVariant => do
+        if !(← checkAbiCompatibility callerVarTy calleeVariant.ty) then
+          pure false
+        else if !mapEq (· == ·) callerTagger calleeVariant.tagger then
+          pure false
+        else
+          checkAbiVariants (callerDiscr :: seen) rest calleeVariants
+
+end
+
+/-- `Machine::prepare_for_inplace_passing` (`spec/lang/step/terminators.md`):
+> "fn prepare_for_inplace_passing(
+>     &mut self,
+>     place: Place<M>,
+>     ty: Type,
+> ) -> NdResult {
+>     self.mem.deinit(
+>         place.ptr.thin_pointer,
+>         ty.layout::<M::T>().expect_size(\"WF ensures arguments and return types are sized\"),
+>         ty.layout::<M::T>().expect_align(\"WF ensures arguments and return types are sized\")
+>     )?;
+>     ret(())
+> }" -/
+def prepareForInplacePassing (m : Mach) (place : Place BM) (ty : «Type») : Interp Mach := do
+  let size ← LayoutStrategy.expect_size (← Type.layout ty)
+    "WF ensures arguments and return types are sized"
+  let align ← LayoutStrategy.expect_align (← Type.layout ty)
+    "WF ensures arguments and return types are sized"
+  let cm ← CM.deinit m.mem place.ptr.thin_pointer size align
+  pure { m with mem := cm }
+
+/-- `Machine::eval_argument` (`spec/lang/step/terminators.md`):
+> "fn eval_argument(
+>     &mut self,
+>     val: ArgumentExpr,
+> ) -> NdResult<(Value<M>, Type)> {
+>     ret(match val {
+>         ArgumentExpr::ByValue(value) => {
+>             self.eval_value(value)?
+>         }
+>         ArgumentExpr::InPlace(place) => {
+>             let (place, ty) = self.eval_place(place)?;
+>             let value = self.place_load(place, ty)?;
+>             self.prepare_for_inplace_passing(place, ty)?;
+>             (value, ty)
+>         }
+>     })
+> }" -/
+def evalArgument (m : Mach) : ArgumentExpr → Interp ((Val × «Type») × Mach)
+  | .ByValue value => evalValue m value
+  | .InPlace place => do
+    let ((place, ty), m) ← evalPlace m place
+    let (value, m) ← placeLoad m place ty
+    let m ← prepareForInplacePassing m place ty
+    pure ((value, ty), m)
+
+/-- The argument evaluation loop of `Terminator::Call`
+(`spec/lang/step/terminators.md`):
+> "let arguments = arguments.try_map(|arg| self.eval_argument(arg))?;" -/
+def evalArguments (m : Mach) : List ArgumentExpr → Interp (List (Val × «Type») × Mach)
+  | [] => pure ([], m)
+  | arg :: args => do
+    let (v, m) ← evalArgument m arg
+    let (vs, m) ← evalArguments m args
+    pure (v :: vs, m)
+
+/-- The argument-local allocation loop of `Machine::create_frame`
+(`spec/lang/step/terminators.md`):
+> "for arg_local in func.args {
+>     frame.storage_live(&mut self.mem, arg_local)?;
+> }" -/
+def allocFrameArgs (fr : Frame) (cm : ConcurrentMemory BM) :
+    List LocalName → Interp (Frame × ConcurrentMemory BM)
+  | [] => pure (fr, cm)
+  | argLocal :: rest => do
+    let (fr, cm) ← storageLive fr cm argLocal
+    allocFrameArgs fr cm rest
+
+/-- The argument-passing and ABI-checking loop of `Machine::create_frame`
+(`spec/lang/step/terminators.md`):
+> "for (callee_local, (caller_val, caller_ty)) in func.args.zip(caller_args) {
+>     if !check_abi_compatibility(caller_ty, func.locals[callee_local]) {
+>         throw_ub!(\"call ABI violation: argument types are not compatible\");
+>     }
+>     let align = caller_ty.layout::<M::T>().expect_align(\"WF ensures function arguments are sized\");
+>     self.typed_store(frame.locals[callee_local], caller_val, caller_ty, align, Atomicity::None).unwrap();
+> }" -/
+def initFrameArgs (m : Mach) (frame : Frame) :
+    List LocalName → List (Val × «Type») → Interp Mach
+  | calleeLocal :: restLocals, (callerVal, callerTy) :: restArgs => do
+    let calleeTy ← mapIndex frame.func.locals calleeLocal "func.locals[callee_local]"
+    if !(← checkAbiCompatibility callerTy calleeTy) then
+      ub "call ABI violation: argument types are not compatible"
+    else do
+      let align ← LayoutStrategy.expect_align (← Type.layout callerTy)
+        "WF ensures function arguments are sized"
+      let calleePtr ← mapIndex frame.locals calleeLocal "frame.locals[callee_local]"
+      let m ← match typedStore m calleePtr callerVal callerTy align .None with
+        | .ok m => pure m
+        | .error (.unsupported w) => unsupported w
+        | .error (.specPanic msg) => specPanic msg
+        | .error _ => specPanic "self.typed_store(..).unwrap()"
+      initFrameArgs m frame restLocals restArgs
+  | _, _ => pure m
+
+/-- `Machine::create_frame` (`spec/lang/step/terminators.md`):
+> "fn create_frame(
+>     &mut self,
+>     func: Function,
+>     stack_pop_action: StackPopAction<M>,
+>     caller_conv: CallingConvention,
+>     caller_ret_ty: Type,
+>     caller_args: List<(Value<M>, Type)>,
+> ) -> NdResult<StackFrame<M>> {
+>     let mut frame = StackFrame {
+>         func,
+>         locals: Map::new(),
+>         stack_pop_action,
+>         next_block: func.start,
+>         next_stmt: Int::ZERO,
+>         extra: M::new_call(),
+>     };
+>     frame.storage_live(&mut self.mem, func.ret)?;
+>     for arg_local in func.args {
+>         frame.storage_live(&mut self.mem, arg_local)?;
+>     }
+>     if caller_conv != func.calling_convention {
+>         throw_ub!(\"call ABI violation: calling conventions are not the same\");
+>     }
+>     if !check_abi_compatibility(caller_ret_ty, func.locals[func.ret]) {
+>         throw_ub!(\"call ABI violation: return types are not compatible\");
+>     }
+>     if func.args.len() != caller_args.len() {
+>         throw_ub!(\"call ABI violation: number of arguments does not agree\");
+>     }
+>     ..
+>     ret(frame)
+> }" -/
+def createFrame (m : Mach) (func : Function) (stackPopAction : StackPopAction BM)
+    (callerConv : CallingConvention) (callerRetTy : «Type»)
+    (callerArgs : List (Val × «Type»)) : Interp (Frame × Mach) := do
+  let frame : Frame := {
+    func := func
+    locals := ⟨[]⟩
+    stack_pop_action := stackPopAction
+    next_block := func.start
+    next_stmt := 0
+    extra := ()
+  }
+  let (frame, cm) ← storageLive frame m.mem func.ret
+  let (frame, cm) ← allocFrameArgs frame cm func.args
+  let m := { m with mem := cm }
+  if callerConv ≠ func.calling_convention then
+    ub "call ABI violation: calling conventions are not the same"
+  else do
+    let calleeRetTy ← mapIndex frame.func.locals frame.func.ret "func.locals[func.ret]"
+    if !(← checkAbiCompatibility callerRetTy calleeRetTy) then
+      ub "call ABI violation: return types are not compatible"
+    else if func.args.length ≠ callerArgs.length then
+      ub "call ABI violation: number of arguments does not agree"
+    else do
+      let m ← initFrameArgs m frame func.args callerArgs
+      pure (frame, m)
+
+/-- `Machine::eval_call` (`spec/lang/step/terminators.md`):
+> "fn eval_call(
+>     &mut self,
+>     callee: Function,
+>     caller_conv: CallingConvention,
+>     arguments: List<(Value<M>, Type)>,
+>     caller_ret: (Place<M>, Type),
+>     next_block: Option<BbName>,
+>     unwind_block: Option<BbName>,
+> ) -> NdResult {
+>     let (caller_ret_place, caller_ret_ty) = caller_ret;
+>     let stack_pop_action = StackPopAction::BackToCaller {
+>         next_block,
+>         unwind_block,
+>         ret_val_ptr: caller_ret_place.ptr.thin_pointer,
+>     };
+>     let frame = self.create_frame(
+>         callee,
+>         stack_pop_action,
+>         caller_conv,
+>         caller_ret_ty,
+>         arguments,
+>     )?;
+>     self.mutate_cur_stack(|stack| stack.push(frame));
+>     ret(())
+> }" -/
+def evalCall (m : Mach) (callee : Function) (callerConv : CallingConvention)
+    (arguments : List (Val × «Type»)) (callerRet : Place BM × «Type»)
+    (nextBlock : Option BbName) (unwindBlock : Option BbName) : Interp Mach := do
+  let (callerRetPlace, callerRetTy) := callerRet
+  let stackPopAction : StackPopAction BM :=
+    .BackToCaller nextBlock unwindBlock callerRetPlace.ptr.thin_pointer
+  let (frame, m) ← createFrame m callee stackPopAction callerConv callerRetTy arguments
+  let (_, m) ← mutateCurStack m (fun stack => pure ((), stack ++ [frame]))
+  pure m
 
 /-- The teardown loop of `Terminator::Return`:
 > "while let Some(local) = frame.locals.keys().next() {
@@ -5053,8 +5554,622 @@ def evalReturn (m : Mach) : Interp Mach := do
       | some nb => jumpToBlock m nb
       | none => ub "return from a function where caller did not specify next block"
 
-/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, `Return`,
-and `Intrinsic`:
+/-! ## Intrinsics (`spec/lang/step/intrinsics.md`) -/
+
+/-- `unit_value` (`spec/lang/step/intrinsics.md`):
+> "fn unit_value<M: Memory>() -> Value<M> {
+>      Value::Tuple(list![])
+>  }" -/
+def unitValue : Val :=
+  .Tuple []
+
+/-- `unit_type` (`spec/lang/step/intrinsics.md`):
+> "fn unit_type() -> Type {
+>      Type::Tuple { sized_fields: list![], sized_head_layout: TupleHeadLayout {
+>          end: Size::ZERO, align: Align::ONE, packed_align: None,
+>      }, unsized_field: None }
+>  }" -/
+def unitType : «Type» :=
+  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
+
+/-- `BasicMemory::leak_check` (`spec/mem/basic.md`):
+> "fn leak_check(&self) -> Result {
+>      use AllocationKind::*;
+>      for allocation in self.allocations {
+>          if allocation.live {
+>              match allocation.kind {
+>                  // These should all be gone.
+>                  Heap => throw_memory_leak!(),
+>                  // These we can still have at the end.
+>                  Global | Function | Stack | VTable => {}
+>              }
+>          }
+>      }
+>      ret(())
+>  }"
+which `ConcurrentMemory::leak_check` forwards to (`spec/mem/concurrent.md`):
+> "pub fn leak_check(&self) -> Result {
+>      self.memory.leak_check()
+>  }"
+The loop stops at the first live `Heap` allocation; its order is irrelevant
+because every iteration either continues or throws the same
+`TerminationInfo::MemoryLeak`. -/
+def CM.leak_check (cm : ConcurrentMemory BM) : Interp Unit :=
+  if cm.memory.allocations.any (fun a => a.live && decide (a.kind = .Heap)) then memoryLeak
+  else pure ()
+
+/-- `Machine::exit` (`spec/lang/step/intrinsics.md`):
+> "fn exit(&self) -> NdResult<!> {
+>      // Check for memory leaks.
+>      self.mem.leak_check()?;
+>      // No leak found -- good, stop the machine.
+>      throw_machine_stop!();
+>  }"
+`NdResult<!>` never returns normally, so the result type is arbitrary. -/
+def machineExit {α : Type} (m : Mach) : Interp α := do
+  CM.leak_check m.mem
+  machineStop
+
+/-- `Machine::eval_print` (`spec/lang/step/intrinsics.md`):
+> "fn eval_print(
+>      &mut self,
+>      stream: DynWrite,
+>      arguments: List<(Value<M>, Type)>,
+>  ) -> Result {
+>      for (arg, _) in arguments {
+>          match arg {
+>              Value::Int(i) => write!(stream, \"{}\\n\", i).unwrap(),
+>              Value::Bool(b) => write!(stream, \"{}\\n\", b).unwrap(),
+>              _ => throw_ub!(\"unsupported value for printing\"),
+>          }
+>      }
+>
+>      ret(())
+>  }"
+`DynWrite` records the written strings (`MiniRustSpec.LibSpecr.DynWrite`), so
+the interpretation returns the extended sink; `Display` of a `libspecr::Int`
+is its decimal expansion with a leading `-` when negative, which is Lean's
+`toString` on `Int`. -/
+def evalPrint (stream : DynWrite) : List (Val × «Type») → Interp DynWrite
+  | [] => pure stream
+  | (arg, _) :: rest =>
+    match arg with
+    | .Int i => evalPrint ⟨stream.written ++ [toString i ++ "\n"]⟩ rest
+    | .Bool b => evalPrint ⟨stream.written ++ [toString b ++ "\n"]⟩ rest
+    | _ => ub "unsupported value for printing"
+
+/-- Structural equality on `LayoutStrategy` for `Type` comparison (`l_ty != r_ty`
+in `IntrinsicOp::RawEq`, `spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def layoutStrategyEq : LayoutStrategy → LayoutStrategy → Bool
+  | .Sized s1 a1, .Sized s2 a2 => s1 == s2 && a1 == a2
+  | .Slice s1 a1, .Slice s2 a2 => s1 == s2 && a1 == a2
+  | .TraitObject t1, .TraitObject t2 => t1 == t2
+  | .Tuple h1 t1, .Tuple h2 t2 => h1 == h2 && layoutStrategyEq t1 t2
+  | _, _ => false
+
+/-- Structural equality on `UnsafeCellStrategy` for `Type` comparison
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def unsafeCellStrategyEq : UnsafeCellStrategy → UnsafeCellStrategy → Bool
+  | .Sized c1, .Sized c2 => c1 == c2
+  | .Slice c1, .Slice c2 => c1 == c2
+  | .TraitObject, .TraitObject => true
+  | .Tuple h1 t1, .Tuple h2 t2 => h1 == h2 && unsafeCellStrategyEq t1 t2
+  | _, _ => false
+
+/-- Structural equality on `PointeeInfo` for `Type` comparison
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def pointeeInfoEq (p1 p2 : PointeeInfo) : Bool :=
+  layoutStrategyEq p1.layout p2.layout &&
+  p1.inhabited == p2.inhabited &&
+  unsafeCellStrategyEq p1.unsafe_cells p2.unsafe_cells &&
+  p1.freeze == p2.freeze &&
+  p1.unpin == p2.unpin
+
+/-- Structural equality on `PtrType` for `Type` comparison
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def ptrTypeEq : PtrType → PtrType → Bool
+  | .Ref m1 p1, .Ref m2 p2 => m1 == m2 && pointeeInfoEq p1 p2
+  | .Box p1, .Box p2 => pointeeInfoEq p1 p2
+  | .Raw k1, .Raw k2 => k1 == k2
+  | .FnPtr, .FnPtr => true
+  | .VTablePtr t1, .VTablePtr t2 => t1 == t2
+  | _, _ => false
+
+mutual
+
+/-- Structural equality `l_ty == r_ty` on MiniRust `Type` values (with
+extensional comparison of `Enum` `variants`, `Variant.tagger`, and
+`Discriminator` maps), used by `l_ty != r_ty` in `IntrinsicOp::RawEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {
+>      throw_ub!(\"invalid arguments to `RawEq` intrinsic: types of arguments are not identical\");
+>  }" -/
+def typeEq : «Type» → «Type» → Bool
+  | .Int t1, .Int t2 => t1 == t2
+  | .Bool, .Bool => true
+  | .Ptr p1, .Ptr p2 => ptrTypeEq p1 p2
+  | .Tuple f1 h1 u1, .Tuple f2 h2 u2 =>
+    typeFieldsEq f1 f2 && h1 == h2 && typeOptEq u1 u2
+  | .Array e1 c1, .Array e2 c2 => typeEq e1 e2 && c1 == c2
+  | .Slice e1, .Slice e2 => typeEq e1 e2
+  | .Union f1 ch1 s1 a1, .Union f2 ch2 s2 a2 =>
+    typeFieldsEq f1 f2 && ch1 == ch2 && s1 == s2 && a1 == a2
+  | .Enum ⟨v1⟩ dt1 disc1 s1 a1, .Enum v2 dt2 disc2 s2 a2 =>
+    mapLen ⟨v1⟩ == mapLen v2 &&
+    typeVariantsEq [] v1 v2 &&
+    dt1 == dt2 &&
+    discriminatorEq disc1 disc2 &&
+    s1 == s2 &&
+    a1 == a2
+  | .TraitObject t1, .TraitObject t2 => t1 == t2
+  | _, _ => false
+
+/-- Optional unsized-tail comparison for `Type::Tuple` in `typeEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def typeOptEq : Option «Type» → Option «Type» → Bool
+  | none, none => true
+  | some t1, some t2 => typeEq t1 t2
+  | _, _ => false
+
+/-- Field-list comparison for `Type::Tuple` and `Type::Union` in `typeEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def typeFieldsEq : List (Offset × «Type») → List (Offset × «Type») → Bool
+  | [], [] => true
+  | (o1, t1) :: r1, (o2, t2) :: r2 => o1 == o2 && typeEq t1 t2 && typeFieldsEq r1 r2
+  | _, _ => false
+
+/-- Extensional `Enum` variant-map comparison for `typeEq`
+(`spec/lang/step/intrinsics.md`):
+> "if l_ty != r_ty {" -/
+def typeVariantsEq (seen : List Int) : List (Int × Variant) → Map Int Variant → Bool
+  | [], _ => true
+  | (d, ⟨vt1, tag1⟩) :: rest, v2 =>
+    if seen.contains d then
+      typeVariantsEq seen rest v2
+    else
+      (match mapGet v2 d with
+       | some vt2 => typeEq vt1 vt2.ty && mapEq (· == ·) tag1 vt2.tagger
+       | none => false) &&
+      typeVariantsEq (d :: seen) rest v2
+
+end
+
+/-- `Machine::load_raw_data` (`spec/lang/step/intrinsics.md`):
+> "fn load_raw_data(&mut self, ptr : Pointer<<M as Memory>::Provenance>, ptr_ty : PtrType) -> Result<List<u8>> {
+>      let PtrType::Ref { pointee, .. } = ptr_ty else {
+>          throw_ub!(\"invalid argument to `RawEq` intrinsic: not a reference\");
+>      };
+>      let PointeeInfo { layout: LayoutStrategy::Sized(size, align), .. } = pointee else {
+>          throw_ub!(\"invalid argument to `RawEq` intrinsic: unsized pointee\");
+>      };
+>      let bytes = self.mem.load(ptr.thin_pointer, size, align, Atomicity::None)?;
+>
+>      let Some(data) = bytes.try_map(|byte| byte.data()) else {
+>          throw_ub!(\"invalid argument to `RawEq` intrinsic: byte is uninitialized\");
+>      };
+>
+>      Ok(data)
+>  }" -/
+def loadRawData (m : Mach) (ptr : Pointer Prov) (ptrTy : PtrType) :
+    Interp (List UInt8 × Mach) :=
+  match ptrTy with
+  | .Ref _ pointee =>
+    match pointee.layout with
+    | .Sized size align => do
+      let (bytes, cm) ← CM.load m.mem ptr.thin_pointer size align .None
+      match bytes.mapM AbstractByte.data with
+      | some data => pure (data, { m with mem := cm })
+      | none => ub "invalid argument to `RawEq` intrinsic: byte is uninitialized"
+    | _ => ub "invalid argument to `RawEq` intrinsic: unsized pointee"
+  | _ => ub "invalid argument to `RawEq` intrinsic: not a reference"
+
+/-- `Machine::eval_intrinsic` (`spec/lang/step/intrinsics.md`) for
+`PointerExposeProvenance`, `PointerWithExposedProvenance`, `Exit`, `Abort`,
+`Assume`, `PrintStdout`, `PrintStderr`, `Allocate`, `Deallocate`, `RawEq`,
+and `GetUnwindPayload`:
+> "fn eval_intrinsic(&mut self,
+>      IntrinsicOp::PointerExposeProvenance: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 1 {
+>          throw_ub!(\"invalid number of arguments for `PointerExposeProvenance` intrinsic\");
+>      }
+>      let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+>          throw_ub!(\"invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer\");
+>      };
+>      if ret_ty != Type::Int(IntType { signed: Unsigned, size: M::T::PTR_SIZE }) {
+>          throw_ub!(\"invalid return type for `PointerExposeProvenance` intrinsic\")
+>      }
+>
+>      self.intptrcast.expose(ptr);
+>      ret(Value::Int(ptr.addr))
+>  }
+>
+>  fn eval_intrinsic(&mut self,
+>      IntrinsicOp::PointerWithExposedProvenance: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 1 {
+>          throw_ub!(\"invalid number of arguments for `PointerWithExposedProvenance` intrinsic\");
+>      }
+>      let Value::Int(addr) = arguments[0].0 else {
+>          throw_ub!(\"invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer\");
+>      };
+>      let Type::Ptr(ret_ptr_ty) = ret_ty else {
+>          throw_ub!(\"invalid return type for `PointerWithExposedProvenance` intrinsic\");
+>      };
+>      if ret_ptr_ty.meta_kind() != PointerMetaKind::None {
+>          throw_ub!(\"unsized pointee requested for `PointerWithExposedProvenance` intrinsic\");
+>      }
+>
+>      let ptr = self.intptrcast.int2ptr(addr)?;
+>      ret(Value::Ptr(ptr.widen(None)))
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::Exit: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      self.exit()?
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::Abort: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      throw_abort!();
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::Assume: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 1 {
+>          throw_ub!(\"invalid number of arguments for `Assume` intrinsic\");
+>      }
+>      let Value::Bool(b) = arguments[0].0 else {
+>          throw_ub!(\"invalid argument for `Assume` intrinsic: not a Boolean\");
+>      };
+>      if ret_ty != unit_type() {
+>          throw_ub!(\"invalid return type for `Assume` intrinsic\")
+>      }
+>
+>      if !b {
+>          throw_ub!(\"`Assume` intrinsic called on condition that is violated\");
+>      }
+>
+>      ret(unit_value())
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::PrintStdout: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if ret_ty != unit_type() {
+>          throw_ub!(\"invalid return type for `PrintStdout` intrinsic\")
+>      }
+>
+>      self.eval_print(self.stdout, arguments)?;
+>
+>      ret(unit_value())
+>  }
+>
+>  fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::PrintStderr: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if ret_ty != unit_type() {
+>          throw_ub!(\"invalid return type for `PrintStderr` intrinsic\")
+>      }
+>
+>      self.eval_print(self.stderr, arguments)?;
+>
+>      ret(unit_value())
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::Allocate: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 2 {
+>          throw_ub!(\"invalid number of arguments for `Allocate` intrinsic\");
+>      }
+>
+>      let Value::Int(size) = arguments[0].0 else {
+>          throw_ub!(\"invalid first argument to `Allocate` intrinsic: not an integer\");
+>      };
+>      let Some(size) = Size::from_bytes(size) else {
+>          throw_ub!(\"invalid size for `Allocate` intrinsic: negative size\");
+>      };
+>
+>      let Value::Int(align) = arguments[1].0 else {
+>          throw_ub!(\"invalid second argument to `Allocate` intrinsic: not an integer\");
+>      };
+>      let Some(align) = Align::from_bytes(align) else {
+>          throw_ub!(\"invalid alignment for `Allocate` intrinsic: not a power of 2\");
+>      };
+>
+>      let Type::Ptr(ret_ptr_ty) = ret_ty else {
+>          throw_ub!(\"invalid return type for `Allocate` intrinsic\");
+>      };
+>      if ret_ptr_ty.meta_kind() != PointerMetaKind::None {
+>          throw_ub!(\"unsized pointee requested for `Allocate` intrinsic\");
+>      }
+>
+>      let alloc = self.mem.allocate(AllocationKind::Heap, size, align)?;
+>
+>      ret(Value::Ptr(alloc.widen(None)))
+>  }
+>
+>  fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::Deallocate: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 3 {
+>          throw_ub!(\"invalid number of arguments for `Deallocate` intrinsic\");
+>      }
+>
+>      let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+>          throw_ub!(\"invalid first argument to `Deallocate` intrinsic: not a thin pointer\");
+>      };
+>
+>      let Value::Int(size) = arguments[1].0 else {
+>          throw_ub!(\"invalid second argument to `Deallocate` intrinsic: not an integer\");
+>      };
+>      let Some(size) = Size::from_bytes(size) else {
+>          throw_ub!(\"invalid size for `Deallocate` intrinsic: negative size\");
+>      };
+>
+>      let Value::Int(align) = arguments[2].0 else {
+>          throw_ub!(\"invalid third argument to `Deallocate` intrinsic: not an integer\");
+>      };
+>      let Some(align) = Align::from_bytes(align) else {
+>          throw_ub!(\"invalid alignment for `Deallocate` intrinsic: not a power of 2\");
+>      };
+>
+>      if ret_ty != unit_type() {
+>          throw_ub!(\"invalid return type for `Deallocate` intrinsic\")
+>      }
+>
+>      self.mem.deallocate(ptr, AllocationKind::Heap, size, align)?;
+>
+>      ret(unit_value())
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::RawEq: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 2 {
+>          throw_ub!(\"invalid number of arguments for `RawEq` intrinsic\");
+>      }
+>      if ret_ty != Type::Bool {
+>          throw_ub!(\"invalid return type for `RawEq` intrinsic\")
+>      }
+>
+>      let (left, l_ty) = (arguments).index_at(0);
+>      let (right, r_ty) = (arguments).index_at(1);
+>
+>      if l_ty != r_ty {
+>          throw_ub!(\"invalid arguments to `RawEq` intrinsic: types of arguments are not identical\");
+>      }
+>
+>      let Value::Ptr(left) = left else {
+>          throw_ub!(\"invalid first argument to `RawEq` intrinsic: not a pointer\");
+>      };
+>
+>      let Value::Ptr(right) = right else {
+>          throw_ub!(\"invalid second argument to `RawEq` intrinsic: not a pointer\");
+>      };
+>
+>      let Type::Ptr(l_ty) = l_ty else {
+>          throw_ub!(\"invalid argument type to `RawEq` intrinsic: not a pointer\");
+>      };
+>
+>      let left_data = self.load_raw_data(left, l_ty)?;
+>      let right_data = self.load_raw_data(right, l_ty)?;
+>
+>      ret(Value::Bool(left_data == right_data))
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::GetUnwindPayload: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 0 {
+>          throw_ub!(\"invalid number of arguments for `GetUnwindPayload` intrinsic\");
+>      }
+>
+>      let Type::Ptr(ret_ptr_ty) = ret_ty else {
+>          throw_ub!(\"invalid return type for `GetUnwindPayload` intrinsic\");
+>      };
+>      if ret_ptr_ty.meta_kind() != PointerMetaKind::None {
+>          throw_ub!(\"invalid return type for `GetUnwindPayload` intrinsic\");
+>      }
+>
+>      let Some(thin_pointer) = self.active_thread().unwind_payloads.last() else {
+>          throw_ub!(\"GetUnwindPayload: the payload stack is empty\");
+>      };
+>
+>      let payload_pointer = Value::Ptr(Pointer { thin_pointer, metadata: None });
+>
+>      ret(payload_pointer)
+>  }"
+`Type` has no derived decidable equality in the generated model, so `ret_ty !=
+unit_type()` and `ret_ty != Type::Bool` match on the exact `unitType` and
+`Type::Bool` terms while `l_ty != r_ty` in `RawEq` uses `typeEq`; `ret_ty !=
+Type::Int(IntType { signed: Unsigned, size: M::T::PTR_SIZE })` in
+`PointerExposeProvenance` matches on `usize` (`⟨.Unsigned, ⟨8⟩⟩`).
+`PointerWithExposedProvenance` resolves the angelic `predict` choice of
+`IntPtrCast::int2ptr` through `IntPtrCast.int2ptr` (see `int2ptrProvenance`),
+and the thread (`Spawn`, `Join`), lock, and atomic intrinsics report
+`unsupported`. -/
+def evalIntrinsic (m : Mach) (op : IntrinsicOp) (arguments : List (Val × «Type»))
+    (retTy : «Type») : Interp (Val × Mach) :=
+  match op with
+  | .PointerExposeProvenance =>
+    if arguments.length ≠ 1 then
+      ub "invalid number of arguments for `PointerExposeProvenance` intrinsic"
+    else
+      match arguments with
+      | [(.Ptr ⟨ptr, none⟩, _)] =>
+        match retTy with
+        | .Int ⟨.Unsigned, ⟨8⟩⟩ =>
+          pure (.Int ptr.addr, { m with intptrcast := IntPtrCast.expose m.intptrcast ptr })
+        | _ => ub "invalid return type for `PointerExposeProvenance` intrinsic"
+      | _ => ub "invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer"
+  | .PointerWithExposedProvenance =>
+    if arguments.length ≠ 1 then
+      ub "invalid number of arguments for `PointerWithExposedProvenance` intrinsic"
+    else
+      match arguments with
+      | [(.Int addr, _)] =>
+        match retTy with
+        | .Ptr retPtrTy =>
+          if PtrType.meta_kind retPtrTy ≠ .None then
+            ub "unsized pointee requested for `PointerWithExposedProvenance` intrinsic"
+          else do
+            let ptr ← IntPtrCast.int2ptr m addr
+            pure (.Ptr (ThinPointer.widen ptr none), m)
+        | _ => ub "invalid return type for `PointerWithExposedProvenance` intrinsic"
+      | _ => ub "invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer"
+  | .Exit => machineExit m
+  | .Abort => abort
+  | .Assume =>
+    match arguments with
+    | [(val, _)] =>
+      match val with
+      | .Bool b =>
+        match retTy with
+        | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none =>
+          if !b then
+            ub "`Assume` intrinsic called on condition that is violated"
+          else
+            pure (unitValue, m)
+        | _ => ub "invalid return type for `Assume` intrinsic"
+      | _ => ub "invalid argument for `Assume` intrinsic: not a Boolean"
+    | _ => ub "invalid number of arguments for `Assume` intrinsic"
+  | .PrintStdout =>
+    match retTy with
+    | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+      let stdout ← evalPrint m.stdout arguments
+      pure (unitValue, { m with stdout := stdout })
+    | _ => ub "invalid return type for `PrintStdout` intrinsic"
+  | .PrintStderr =>
+    match retTy with
+    | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+      let stderr ← evalPrint m.stderr arguments
+      pure (unitValue, { m with stderr := stderr })
+    | _ => ub "invalid return type for `PrintStderr` intrinsic"
+  | .Allocate =>
+    match arguments with
+    | [(sizeV, _), (alignV, _)] =>
+      match sizeV with
+      | .Int size =>
+        match sizeFromBytes size with
+        | some size =>
+          match alignV with
+          | .Int align =>
+            match alignFromBytesInt align with
+            | some align =>
+              match retTy with
+              | .Ptr retPtrTy =>
+                if PtrType.meta_kind retPtrTy = .None then do
+                  let (alloc, cm) ← CM.allocate m.mem .Heap size align
+                  pure (.Ptr (ThinPointer.widen alloc none), { m with mem := cm })
+                else
+                  ub "unsized pointee requested for `Allocate` intrinsic"
+              | _ => ub "invalid return type for `Allocate` intrinsic"
+            | none => ub "invalid alignment for `Allocate` intrinsic: not a power of 2"
+          | _ => ub "invalid second argument to `Allocate` intrinsic: not an integer"
+        | none => ub "invalid size for `Allocate` intrinsic: negative size"
+      | _ => ub "invalid first argument to `Allocate` intrinsic: not an integer"
+    | _ => ub "invalid number of arguments for `Allocate` intrinsic"
+  | .Deallocate =>
+    match arguments with
+    | [(ptrV, _), (sizeV, _), (alignV, _)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ =>
+        match sizeV with
+        | .Int size =>
+          match sizeFromBytes size with
+          | some size =>
+            match alignV with
+            | .Int align =>
+              match alignFromBytesInt align with
+              | some align =>
+                match retTy with
+                | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+                  let cm ← CM.deallocate m.mem ptr .Heap size align
+                  pure (unitValue, { m with mem := cm })
+                | _ => ub "invalid return type for `Deallocate` intrinsic"
+              | none => ub "invalid alignment for `Deallocate` intrinsic: not a power of 2"
+            | _ => ub "invalid third argument to `Deallocate` intrinsic: not an integer"
+          | none => ub "invalid size for `Deallocate` intrinsic: negative size"
+        | _ => ub "invalid second argument to `Deallocate` intrinsic: not an integer"
+      | _ => ub "invalid first argument to `Deallocate` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `Deallocate` intrinsic"
+  | .RawEq =>
+    match arguments with
+    | [(leftV, lTy), (rightV, rTy)] =>
+      match retTy with
+      | .Bool =>
+        if !typeEq lTy rTy then
+          ub "invalid arguments to `RawEq` intrinsic: types of arguments are not identical"
+        else
+          match leftV with
+          | .Ptr leftPtr =>
+            match rightV with
+            | .Ptr rightPtr =>
+              match lTy with
+              | .Ptr lPtrTy => do
+                let (leftData, m) ← loadRawData m leftPtr lPtrTy
+                let (rightData, m) ← loadRawData m rightPtr lPtrTy
+                pure (.Bool (leftData == rightData), m)
+              | _ => ub "invalid argument type to `RawEq` intrinsic: not a pointer"
+            | _ => ub "invalid second argument to `RawEq` intrinsic: not a pointer"
+          | _ => ub "invalid first argument to `RawEq` intrinsic: not a pointer"
+      | _ => ub "invalid return type for `RawEq` intrinsic"
+    | _ => ub "invalid number of arguments for `RawEq` intrinsic"
+  | .GetUnwindPayload =>
+    if !arguments.isEmpty then
+      ub "invalid number of arguments for `GetUnwindPayload` intrinsic"
+    else
+      match retTy with
+      | .Ptr retPtrTy =>
+        if PtrType.meta_kind retPtrTy = .None then do
+          let t ← activeThread m
+          match t.unwind_payloads.getLast? with
+          | some thinPointer =>
+            pure (.Ptr { thin_pointer := thinPointer, metadata := none }, m)
+          | none => ub "GetUnwindPayload: the payload stack is empty"
+        else
+          ub "invalid return type for `GetUnwindPayload` intrinsic"
+      | _ => ub "invalid return type for `GetUnwindPayload` intrinsic"
+  | _ =>
+    unsupported "eval_intrinsic for a thread, lock, or atomic intrinsic"
+
+/-- `Machine::eval_terminator` for `Goto`, `Switch`, `Unreachable`, `Call`,
+`Return`, and `Intrinsic` (`spec/lang/step/terminators.md`):
 > "fn eval_terminator(&mut self, Terminator::Goto(block_name): Terminator) -> NdResult {
 >     self.jump_to_block(block_name)?;
 >     ret(())
@@ -5069,6 +6184,25 @@ and `Intrinsic`:
 > ..
 > fn eval_terminator(&mut self, Terminator::Unreachable: Terminator) -> NdResult {
 >     throw_ub!(\"reached unreachable code\");
+> }
+> ..
+> fn eval_terminator(
+>     &mut self,
+>     Terminator::Call { callee, calling_convention: caller_conv, arguments, ret: ret_expr, next_block, unwind_block }: Terminator
+> ) -> NdResult {
+>     let (ret_place, ret_ty) = self.eval_place(ret_expr)?;
+>     self.prepare_for_inplace_passing(ret_place, ret_ty)?;
+>     let (callee_val, _) = self.eval_value(callee)?;
+>     let callee = self.fn_from_ptr(callee_val)?;
+>     let arguments = arguments.try_map(|arg| self.eval_argument(arg))?;
+>     self.eval_call(
+>         callee,
+>         caller_conv,
+>         arguments,
+>         (ret_place, ret_ty),
+>         next_block,
+>         unwind_block,
+>     )
 > }"
 and for `Intrinsic` (with `evalIntrinsic`):
 > "fn eval_terminator(
@@ -5105,6 +6239,13 @@ def evalTerminator (m : Mach) : Terminator → Interp Mach
     | .Int i => jumpToBlock m ((mapGet cases i).getD fallback)
     | _ => specPanic "switch on a non-integer"
   | .Unreachable => ub "reached unreachable code"
+  | .Call callee callerConv arguments retExpr nextBlock unwindBlock => do
+    let ((retPlace, retTy), m) ← evalPlace m retExpr
+    let m ← prepareForInplacePassing m retPlace retTy
+    let ((calleeVal, _), m) ← evalValue m callee
+    let callee ← fnFromPtr m calleeVal
+    let (arguments, m) ← evalArguments m arguments
+    evalCall m callee callerConv arguments (retPlace, retTy) nextBlock unwindBlock
   | .Return => evalReturn m
   | .Intrinsic intrinsic arguments retExpr nextBlock => do
     let ((retPlace, retTy), m) ← evalPlace m retExpr
@@ -5114,7 +6255,7 @@ def evalTerminator (m : Mach) : Terminator → Interp Mach
     match nextBlock with
     | some nb => jumpToBlock m nb
     | none => ub "return from an intrinsic where caller did not specify next block"
-  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Return/Intrinsic"
+  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Call/Return/Intrinsic"
 
 /-! ## The step function (`spec/lang/machine.md`) -/
 
@@ -6336,15 +7477,24 @@ def placeStoreM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (place : Pla
   if !place.aligned then ub "storing to a place based on a misaligned pointer"
   else typedStoreM m place.ptr.thin_pointer val ty ⟨1⟩ .None
 
-/-- Polymorphic `Machine::eval_constant` (`spec/lang/step/expressions.md`); see `evalConstant`:
-> "Constant::Int(i) => Value::Int(i),
->  Constant::Bool(b) => Value::Bool(b)," -/
-def evalConstantM {M : Type} [Memory M] : Constant → Interp (Value M)
+/-- Polymorphic `Machine::eval_constant` (`spec/lang/step/expressions.md`); see
+`evalConstant`, whose quotation covers all `Constant` variants:
+> "fn eval_constant(&mut self, constant: Constant) -> Result<Value<M>> {" -/
+def evalConstantM {M : Type} [Memory M] (m : Machine M) : Constant → Interp (Value M)
   | .Int i => pure (.Int i)
   | .Bool b => pure (.Bool b)
+  | .GlobalPointer relocation => do
+    let base ← mapIndex m.global_ptrs relocation.name "self.global_ptrs[relocation.name]"
+    let ptr := ThinPointer.wrapping_offsetM base relocation.offset.bytes
+    pure (.Ptr (ThinPointer.widen ptr none))
+  | .FnPointer fnName => do
+    let ptr ← mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+    pure (.Ptr (ThinPointer.widen ptr none))
+  | .VTablePointer vtableName => do
+    let ptr ← mapIndex m.vtable_ptrs vtableName "self.vtable_ptrs[vtable_name]"
+    pure (.Ptr (ThinPointer.widen ptr none))
   | .PointerWithoutProvenance addr =>
     pure (.Ptr (ThinPointer.widen { addr := addr, provenance := none } none))
-  | _ => unsupported "eval_constant for a global, function, or vtable pointer constant"
 
 /-- Polymorphic `Machine::eval_cast_op` (`spec/lang/step/operators.md`); see `evalCastOp`:
 > "fn eval_cast_op(&self, cast_op: CastOp, (operand, old_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
@@ -6688,7 +7838,7 @@ def evalPlaceM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
 > })?;" -/
 def evalValueM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     ValueExpr → Interp ((Value M × «Type») × Machine M)
-  | .Constant c ty => do pure ((← evalConstantM c, ty), m)
+  | .Constant c ty => do pure ((← evalConstantM m c, ty), m)
   | .Tuple exprs ty => do
     let (vals, m) ← evalValuesM m exprs
     pure ((.Tuple vals, ty), m)
@@ -6972,48 +8122,51 @@ def IntPtrCast.int2ptrM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (add
   let provenance ← int2ptrProvenanceM m addr
   pure { addr := addr, provenance := provenance }
 
-/-- Polymorphic `Machine::eval_intrinsic` (`spec/lang/step/intrinsics.md`);
-see `evalIntrinsic`:
-> "fn eval_intrinsic(&mut self,
->     IntrinsicOp::PointerExposeProvenance: IntrinsicOp,
->     arguments: List<(Value<M>, Type)>,
->     ret_ty: Type,
-> ) -> NdResult<Value<M>> {
->     if arguments.len() != 1 {
->         throw_ub!(\"invalid number of arguments for `PointerExposeProvenance` intrinsic\");
->     }
->     let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
->         throw_ub!(\"invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer\");
->     };
->     if ret_ty != Type::Int(IntType { signed: Unsigned, size: M::T::PTR_SIZE }) {
->         throw_ub!(\"invalid return type for `PointerExposeProvenance` intrinsic\")
->     }
->
->     self.intptrcast.expose(ptr);
->     ret(Value::Int(ptr.addr))
-> }
->
-> fn eval_intrinsic(&mut self,
->     IntrinsicOp::PointerWithExposedProvenance: IntrinsicOp,
->     arguments: List<(Value<M>, Type)>,
->     ret_ty: Type,
-> ) -> NdResult<Value<M>> {
->     if arguments.len() != 1 {
->         throw_ub!(\"invalid number of arguments for `PointerWithExposedProvenance` intrinsic\");
->     }
->     let Value::Int(addr) = arguments[0].0 else {
->         throw_ub!(\"invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer\");
->     };
->     let Type::Ptr(ret_ptr_ty) = ret_ty else {
->         throw_ub!(\"invalid return type for `PointerWithExposedProvenance` intrinsic\");
->     };
->     if ret_ptr_ty.meta_kind() != PointerMetaKind::None {
->         throw_ub!(\"unsized pointee requested for `PointerWithExposedProvenance` intrinsic\");
->     }
->
->     let ptr = self.intptrcast.int2ptr(addr)?;
->     ret(Value::Ptr(ptr.widen(None)))
-> }" -/
+/-- Polymorphic `unit_value` (`spec/lang/step/intrinsics.md`); see `unitValue`:
+> "fn unit_value<M: Memory>() -> Value<M> {" -/
+def unitValueM {M : Type} [Memory M] : Value M :=
+  .Tuple []
+
+/-- Polymorphic `Machine::exit` (`spec/lang/step/intrinsics.md`); see
+`machineExit`:
+> "fn exit(&self) -> NdResult<!> {" -/
+def machineExitM {M : Type} [Memory M] [MemoryOps M] {α : Type} (m : Machine M) :
+    Interp α := do
+  ConcurrentMemory.leak_check m.mem
+  machineStop
+
+/-- Polymorphic `Machine::eval_print` (`spec/lang/step/intrinsics.md`); see
+`evalPrint`:
+> "fn eval_print(" -/
+def evalPrintM {M : Type} [Memory M] (stream : DynWrite) :
+    List (Value M × «Type») → Interp DynWrite
+  | [] => pure stream
+  | (arg, _) :: rest =>
+    match arg with
+    | .Int i => evalPrintM ⟨stream.written ++ [toString i ++ "\n"]⟩ rest
+    | .Bool b => evalPrintM ⟨stream.written ++ [toString b ++ "\n"]⟩ rest
+    | _ => ub "unsupported value for printing"
+
+/-- Polymorphic `Machine::load_raw_data` (`spec/lang/step/intrinsics.md`); see
+`loadRawData`:
+> "fn load_raw_data(&mut self, ptr : Pointer<<M as Memory>::Provenance>, ptr_ty : PtrType) -> Result<List<u8>> {" -/
+def loadRawDataM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : Pointer (Memory.Provenance M)) (ptrTy : PtrType) :
+    Interp (List UInt8 × Machine M) :=
+  match ptrTy with
+  | .Ref _ pointee =>
+    match pointee.layout with
+    | .Sized size align => do
+      let (bytes, cm) ← ConcurrentMemory.load m.mem ptr.thin_pointer size align .None
+      match bytes.mapM AbstractByte.dataM with
+      | some data => pure (data, { m with mem := cm })
+      | none => ub "invalid argument to `RawEq` intrinsic: byte is uninitialized"
+    | _ => ub "invalid argument to `RawEq` intrinsic: unsized pointee"
+  | _ => ub "invalid argument to `RawEq` intrinsic: not a reference"
+
+/-- Polymorphic `Machine::eval_intrinsic` (`spec/lang/step/intrinsics.md`); see
+`evalIntrinsic`, whose quotations cover every intrinsic interpreted here:
+> "fn eval_intrinsic(&mut self," -/
 def evalIntrinsicM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
     (intrinsic : IntrinsicOp) (arguments : List (Value M × «Type»))
     (retTy : «Type») : Interp (Value M × Machine M) :=
@@ -7044,7 +8197,121 @@ def evalIntrinsicM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
             pure (.Ptr (ThinPointer.widen ptr none), m)
         | _ => ub "invalid return type for `PointerWithExposedProvenance` intrinsic"
       | _ => ub "invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer"
-  | _ => unsupported "eval_intrinsic for an intrinsic other than the pointer provenance intrinsics"
+  | .Exit => machineExitM m
+  | .Abort => abort
+  | .Assume =>
+    match arguments with
+    | [(val, _)] =>
+      match val with
+      | .Bool b =>
+        match retTy with
+        | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none =>
+          if !b then
+            ub "`Assume` intrinsic called on condition that is violated"
+          else
+            pure (unitValueM, m)
+        | _ => ub "invalid return type for `Assume` intrinsic"
+      | _ => ub "invalid argument for `Assume` intrinsic: not a Boolean"
+    | _ => ub "invalid number of arguments for `Assume` intrinsic"
+  | .PrintStdout =>
+    match retTy with
+    | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+      let stdout ← evalPrintM m.stdout arguments
+      pure (unitValueM, { m with stdout := stdout })
+    | _ => ub "invalid return type for `PrintStdout` intrinsic"
+  | .PrintStderr =>
+    match retTy with
+    | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+      let stderr ← evalPrintM m.stderr arguments
+      pure (unitValueM, { m with stderr := stderr })
+    | _ => ub "invalid return type for `PrintStderr` intrinsic"
+  | .Allocate =>
+    match arguments with
+    | [(sizeV, _), (alignV, _)] =>
+      match sizeV with
+      | .Int size =>
+        match sizeFromBytes size with
+        | some size =>
+          match alignV with
+          | .Int align =>
+            match alignFromBytesInt align with
+            | some align =>
+              match retTy with
+              | .Ptr retPtrTy =>
+                if PtrType.meta_kind retPtrTy = .None then do
+                  let (alloc, cm) ← ConcurrentMemory.allocate m.mem .Heap size align
+                  pure (.Ptr (ThinPointer.widen alloc none), { m with mem := cm })
+                else
+                  ub "unsized pointee requested for `Allocate` intrinsic"
+              | _ => ub "invalid return type for `Allocate` intrinsic"
+            | none => ub "invalid alignment for `Allocate` intrinsic: not a power of 2"
+          | _ => ub "invalid second argument to `Allocate` intrinsic: not an integer"
+        | none => ub "invalid size for `Allocate` intrinsic: negative size"
+      | _ => ub "invalid first argument to `Allocate` intrinsic: not an integer"
+    | _ => ub "invalid number of arguments for `Allocate` intrinsic"
+  | .Deallocate =>
+    match arguments with
+    | [(ptrV, _), (sizeV, _), (alignV, _)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ =>
+        match sizeV with
+        | .Int size =>
+          match sizeFromBytes size with
+          | some size =>
+            match alignV with
+            | .Int align =>
+              match alignFromBytesInt align with
+              | some align =>
+                match retTy with
+                | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+                  let cm ← ConcurrentMemory.deallocate m.mem ptr .Heap size align
+                  pure (unitValueM, { m with mem := cm })
+                | _ => ub "invalid return type for `Deallocate` intrinsic"
+              | none => ub "invalid alignment for `Deallocate` intrinsic: not a power of 2"
+            | _ => ub "invalid third argument to `Deallocate` intrinsic: not an integer"
+          | none => ub "invalid size for `Deallocate` intrinsic: negative size"
+        | _ => ub "invalid second argument to `Deallocate` intrinsic: not an integer"
+      | _ => ub "invalid first argument to `Deallocate` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `Deallocate` intrinsic"
+  | .RawEq =>
+    match arguments with
+    | [(leftV, lTy), (rightV, rTy)] =>
+      match retTy with
+      | .Bool =>
+        if !typeEq lTy rTy then
+          ub "invalid arguments to `RawEq` intrinsic: types of arguments are not identical"
+        else
+          match leftV with
+          | .Ptr leftPtr =>
+            match rightV with
+            | .Ptr rightPtr =>
+              match lTy with
+              | .Ptr lPtrTy => do
+                let (leftData, m) ← loadRawDataM m leftPtr lPtrTy
+                let (rightData, m) ← loadRawDataM m rightPtr lPtrTy
+                pure (.Bool (leftData == rightData), m)
+              | _ => ub "invalid argument type to `RawEq` intrinsic: not a pointer"
+            | _ => ub "invalid second argument to `RawEq` intrinsic: not a pointer"
+          | _ => ub "invalid first argument to `RawEq` intrinsic: not a pointer"
+      | _ => ub "invalid return type for `RawEq` intrinsic"
+    | _ => ub "invalid number of arguments for `RawEq` intrinsic"
+  | .GetUnwindPayload =>
+    if !arguments.isEmpty then
+      ub "invalid number of arguments for `GetUnwindPayload` intrinsic"
+    else
+      match retTy with
+      | .Ptr retPtrTy =>
+        if PtrType.meta_kind retPtrTy = .None then do
+          let t ← activeThreadM m
+          match t.unwind_payloads.getLast? with
+          | some thinPointer =>
+            pure (.Ptr { thin_pointer := thinPointer, metadata := none }, m)
+          | none => ub "GetUnwindPayload: the payload stack is empty"
+        else
+          ub "invalid return type for `GetUnwindPayload` intrinsic"
+      | _ => ub "invalid return type for `GetUnwindPayload` intrinsic"
+  | _ =>
+    unsupported "eval_intrinsic for a thread, lock, or atomic intrinsic"
 
 /-- Polymorphic argument loop of `Terminator::Intrinsic` (`spec/lang/step/terminators.md`);
 see `evalArgs`:
@@ -7056,6 +8323,144 @@ def evalArgsM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     let (arg, m) ← evalValueM m e
     let (args, m) ← evalArgsM m es
     pure (arg :: args, m)
+
+/-- Polymorphic `Machine::mutate_cur_stack` (`spec/lang/machine.md`); see
+`mutateCurStack`:
+> "fn mutate_cur_stack<O>(&mut self, f: impl FnOnce(&mut List<StackFrame<M>>) -> O) -> O {" -/
+def mutateCurStackM {M : Type} [Memory M] {α : Type} (m : Machine M)
+    (f : List (StackFrame M) → Interp (α × List (StackFrame M))) :
+    Interp (α × Machine M) := do
+  let t ← activeThreadM m
+  let (out, stack') ← f t.stack
+  let threads ← listSet m.threads m.active_thread { t with stack := stack' } "mutate_at"
+  pure (out, { m with threads := threads })
+
+/-- Polymorphic `Machine::fn_from_ptr` (`spec/lang/machine.md`); see
+`fnFromPtr`:
+> "fn fn_from_ptr(&self, ptr: Value<M>) -> Result<Function> {" -/
+def fnFromPtrM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (ptr : Value M) :
+    Interp Function :=
+  match ptr with
+  | .Ptr ⟨thinPtr, metadata⟩ =>
+    if metadata.isSome then ub "invalid pointer for function lookup"
+    else
+      match m.fn_ptrs.entries.find?
+          (fun (_, (fnPtr : ThinPointer (Memory.Provenance M))) => decide (fnPtr = thinPtr)) with
+      | some (funcName, _) => mapIndex m.prog.functions funcName "self.prog.functions[func_name]"
+      | none => ub "invalid pointer for function lookup"
+  | _ => ub "trying to look up a function based on a non-pointer value"
+
+/-- Polymorphic `Machine::prepare_for_inplace_passing`
+(`spec/lang/step/terminators.md`); see `prepareForInplacePassing`:
+> "fn prepare_for_inplace_passing(" -/
+def prepareForInplacePassingM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (place : Place M) (ty : «Type») : Interp (Machine M) := do
+  let size ← LayoutStrategy.expect_size (← Type.layout ty)
+    "WF ensures arguments and return types are sized"
+  let align ← LayoutStrategy.expect_align (← Type.layout ty)
+    "WF ensures arguments and return types are sized"
+  let cm ← ConcurrentMemory.deinit m.mem place.ptr.thin_pointer size align
+  pure { m with mem := cm }
+
+/-- Polymorphic `Machine::eval_argument` (`spec/lang/step/terminators.md`); see
+`evalArgument`:
+> "fn eval_argument(" -/
+def evalArgumentM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
+    ArgumentExpr → Interp ((Value M × «Type») × Machine M)
+  | .ByValue value => evalValueM m value
+  | .InPlace place => do
+    let ((place, ty), m) ← evalPlaceM m place
+    let (value, m) ← placeLoadM m place ty
+    let m ← prepareForInplacePassingM m place ty
+    pure ((value, ty), m)
+
+/-- Polymorphic argument evaluation loop of `Terminator::Call`
+(`spec/lang/step/terminators.md`); see `evalArguments`:
+> "let arguments = arguments.try_map(|arg| self.eval_argument(arg))?;" -/
+def evalArgumentsM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
+    List ArgumentExpr → Interp (List (Value M × «Type») × Machine M)
+  | [] => pure ([], m)
+  | arg :: args => do
+    let (v, m) ← evalArgumentM m arg
+    let (vs, m) ← evalArgumentsM m args
+    pure (v :: vs, m)
+
+/-- Polymorphic argument-local allocation loop of `Machine::create_frame`
+(`spec/lang/step/terminators.md`); see `allocFrameArgs`:
+> "for arg_local in func.args {" -/
+def allocFrameArgsM {M : Type} [Memory M] [MemoryOps M] (fr : StackFrame M)
+    (cm : ConcurrentMemory M) :
+    List LocalName → Interp (StackFrame M × ConcurrentMemory M)
+  | [] => pure (fr, cm)
+  | argLocal :: rest => do
+    let (fr, cm) ← storageLiveM fr cm argLocal
+    allocFrameArgsM fr cm rest
+
+/-- Polymorphic argument-passing and ABI-checking loop of `Machine::create_frame`
+(`spec/lang/step/terminators.md`); see `initFrameArgs`:
+> "for (callee_local, (caller_val, caller_ty)) in func.args.zip(caller_args) {" -/
+def initFrameArgsM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (frame : StackFrame M) :
+    List LocalName → List (Value M × «Type») → Interp (Machine M)
+  | calleeLocal :: restLocals, (callerVal, callerTy) :: restArgs => do
+    let calleeTy ← mapIndex frame.func.locals calleeLocal "func.locals[callee_local]"
+    if !(← checkAbiCompatibility callerTy calleeTy) then
+      ub "call ABI violation: argument types are not compatible"
+    else do
+      let align ← LayoutStrategy.expect_align (← Type.layout callerTy)
+        "WF ensures function arguments are sized"
+      let calleePtr ← mapIndex frame.locals calleeLocal "frame.locals[callee_local]"
+      let m ← match typedStoreM m calleePtr callerVal callerTy align .None with
+        | .ok m => pure m
+        | .error (.unsupported w) => unsupported w
+        | .error (.specPanic msg) => specPanic msg
+        | .error _ => specPanic "self.typed_store(..).unwrap()"
+      initFrameArgsM m frame restLocals restArgs
+  | _, _ => pure m
+
+/-- Polymorphic `Machine::create_frame` (`spec/lang/step/terminators.md`); see
+`createFrame`. The new frame's `extra` is `M::new_call()`
+(`MemoryOps.new_call`):
+> "fn create_frame(" -/
+def createFrameM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (func : Function)
+    (stackPopAction : StackPopAction M) (callerConv : CallingConvention)
+    (callerRetTy : «Type») (callerArgs : List (Value M × «Type»)) :
+    Interp (StackFrame M × Machine M) := do
+  let frame : StackFrame M := {
+    func := func
+    locals := ⟨[]⟩
+    stack_pop_action := stackPopAction
+    next_block := func.start
+    next_stmt := 0
+    extra := MemoryOps.new_call
+  }
+  let (frame, cm) ← storageLiveM frame m.mem func.ret
+  let (frame, cm) ← allocFrameArgsM frame cm func.args
+  let m := { m with mem := cm }
+  if callerConv ≠ func.calling_convention then
+    ub "call ABI violation: calling conventions are not the same"
+  else do
+    let calleeRetTy ← mapIndex frame.func.locals frame.func.ret "func.locals[func.ret]"
+    if !(← checkAbiCompatibility callerRetTy calleeRetTy) then
+      ub "call ABI violation: return types are not compatible"
+    else if func.args.length ≠ callerArgs.length then
+      ub "call ABI violation: number of arguments does not agree"
+    else do
+      let m ← initFrameArgsM m frame func.args callerArgs
+      pure (frame, m)
+
+/-- Polymorphic `Machine::eval_call` (`spec/lang/step/terminators.md`); see
+`evalCall`:
+> "fn eval_call(" -/
+def evalCallM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) (callee : Function)
+    (callerConv : CallingConvention) (arguments : List (Value M × «Type»))
+    (callerRet : Place M × «Type») (nextBlock : Option BbName)
+    (unwindBlock : Option BbName) : Interp (Machine M) := do
+  let (callerRetPlace, callerRetTy) := callerRet
+  let stackPopAction : StackPopAction M :=
+    .BackToCaller nextBlock unwindBlock callerRetPlace.ptr.thin_pointer
+  let (frame, m) ← createFrameM m callee stackPopAction callerConv callerRetTy arguments
+  let (_, m) ← mutateCurStackM m (fun stack => pure ((), stack ++ [frame]))
+  pure m
 
 /-- Polymorphic teardown loop of `Terminator::Return` (`spec/lang/step/terminators.md`);
 see `deallocAll`:
@@ -7162,6 +8567,13 @@ def evalTerminatorM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     | .Int i => jumpToBlockM m ((mapGet cases i).getD fallback)
     | _ => specPanic "switch on a non-integer"
   | .Unreachable => ub "reached unreachable code"
+  | .Call callee callerConv arguments retExpr nextBlock unwindBlock => do
+    let ((retPlace, retTy), m) ← evalPlaceM m retExpr
+    let m ← prepareForInplacePassingM m retPlace retTy
+    let ((calleeVal, _), m) ← evalValueM m callee
+    let callee ← fnFromPtrM m calleeVal
+    let (arguments, m) ← evalArgumentsM m arguments
+    evalCallM m callee callerConv arguments (retPlace, retTy) nextBlock unwindBlock
   | .Return => evalReturnM m
   | .Intrinsic intrinsic arguments retExpr nextBlock => do
     let ((retPlace, retTy), m) ← evalPlaceM m retExpr
@@ -7171,7 +8583,7 @@ def evalTerminatorM {M : Type} [Memory M] [MemoryOps M] (m : Machine M) :
     match nextBlock with
     | some nb => jumpToBlockM m nb
     | none => ub "return from an intrinsic where caller did not specify next block"
-  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Return/Intrinsic"
+  | _ => unsupported "eval_terminator for a terminator other than Goto/Switch/Unreachable/Call/Return/Intrinsic"
 
 /-- Polymorphic `Machine::step` (`spec/lang/machine.md`); see `step`:
 > "if !self.threads.any(|thread| thread.state == ThreadState::Enabled) { throw_deadlock!(); }

@@ -152,6 +152,52 @@ interpretation, all by kernel computation (`decide`/`rfl`, no
   (`nestedTupleOk_minirust_padding_bytes`), and UB paths for faulting tuple
   aggregate operands, faulting nested field write RHS, and reading an
   uninitialized tuple local.
+* `callerMain`/`calleePair`, `projDestCaller`/`negI8Callee`/`flipBoolCallee`,
+  `chainEntry`/`chainMid`/`chainLeaf`, `callArgUbCaller`,
+  `calleeDivZeroCaller`/`divTenI8Callee`, `callSpinCaller`/`idU32Callee`,
+  `callMoveReuse`, `moveReinitByCall`, `condCallMoveJoin`,
+  `cAbiCaller`/`cAbiCallee`, `diamondCallEntry`/`diamondMidA`/`diamondMidB`,
+  `liveCallDestSpinCaller`/`spinU32Callee`,
+  `calleeRetUninitCaller`/`retUninitCallee`, `callDestArgAlias`,
+  `callProjMoveReuse`, `stmtMoveThenCallArg`, `recCycleA`/`recCycleB`,
+  `badCallConvCaller`, `deadCallDestCaller`, `deadCallDestSpinCaller`,
+  `uninitProjCallDestCaller`, `abiArgMismatchCaller`, `abiRetMismatchCaller`,
+  and `argCountMismatchCaller`/`const5Callee` (MR-4.1): multi-function
+  `translateProg` and `progInFragment` programs exercising `Terminator::Call`
+  (`ByValue` and `InPlace` argument passing, `Constant::FnPointer`,
+  `fn_from_ptr`, `check_abi_compatibility`, `create_frame` with both
+  `CallingConvention::Rust` and `CallingConvention::C`, multi-step
+  `Call + initBlock` entry, and `UnwindAction::{Continue, Unreachable,
+  Terminate}`), multi-frame `Terminator::Return` (`StackPopAction::BackToCaller`
+  into root locals and projected `.0` / `.1` tuple fields, and UB on a callee's
+  uninitialized `_0`), 3-deep nested and diamond-shaped call graphs,
+  call-argument, post-call `move` reuse, and callee-body UB propagation,
+  diverging multi-function executions (`mirCallWithCallees_diverges_rel`,
+  including a callee that never returns), soundness counterexamples for
+  return-place aliasing, dead and uninitialized return places, argument-type,
+  return-type, and argument-count mismatches, projected `move` call arguments,
+  pre-call `move` reuse, unsupported calling conventions, and cyclic call graphs
+  (where the necessity witnesses also refute the conclusion of
+  `mirCallWithCallees_noUB` or `mirCallWithCallees_ub` outright), plus
+  ground-truth unit checks of the `MR-4.1` `Interp` definitions and
+  `progStart_outside_fragment`, which shows why the theorems start at
+  `fEntry.start` under an external caller rather than at `prog.start`.
+* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, `translateRsIntrinsic_witness`,
+  `assumeSub`, `assumeTupleCallCaller`, `assumeDeadLocal`, `assumeMoveReuse`, and
+  `assumeAfterMove` (`MR-4.2`): every transcribed `IntrinsicOp` arm of
+  `eval_intrinsic` (`Abort`, `Exit`, `Assume` with each of its UB checks,
+  `PrintStdout` and `PrintStderr`, `Allocate` and `Deallocate` with `Heap` leak
+  checking, `RawEq` with `load_raw_data` and structural `typeEq`,
+  `PointerExposeProvenance`, `PointerWithExposedProvenance`, and
+  `GetUnwindPayload`), `build::abort()`, `translateRsIntrinsic`, and full
+  multi-function `progInFragment` block-splitting correspondence (`SegPc`,
+  `SegChain`) for `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+  via `mirCallWithCallees_ret` and `mirCallWithCallees_ub_rel` — across multiple
+  `Assume`s in one block (`assumeSub`), `Assume(move _)` + tuple-field
+  projection + `Terminator::Call` across split blocks (`assumeTupleCallCaller`),
+  dead-local `Assume` UB (`assumeDeadLocal`), and necessity witnesses proving
+  that neither `stmtMoved` (`assumeMoveReuse`) nor `stmtReadsOk`
+  (`assumeAfterMove`) on `Assume` can be dropped.
 -/
 
 namespace MiniRustSpec.Correspondence.Witness
@@ -179,7 +225,6 @@ def constU32 (n : Nat) : Operand := .constant { ty := u32Ty, val := .scalar (.in
 def u32Layout : TypeLayout :=
   { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
     variants := .single 0, isUninhabited := false }
-
 
 @[simp] theorem arrayTypeOf_int (it : IntTy) (l : Nat) :
     arrayTypeOf { kind := .int it, layoutIdx := l } = none := rfl
@@ -4557,7 +4602,6 @@ theorem evalPlace_field_union_and_offset_panic :
       .error (.specPanic "assertion failed: offset <= self.compute_size(ty.layout::<M::T>(), root.ptr.metadata)") :=
   ⟨rfl, rfl, rfl⟩
 
-
 /-! ## Temporaries, storage markers, `move`, `Deinit`, and the init block
 
 MR-1.3 bodies with temporaries beyond the arguments. `tempMove` exercises
@@ -7101,6 +7145,4086 @@ theorem ordBoolCastTempMoveFalse_minirust_direct :
         [1]) := by
   decide +kernel
 
+/-! ## Multi-function `Terminator::Call` & `Return` stack witnesses (`MR-4.1`) -/
+
+/-- Extract `some msg` when an `Interp` computation stops with `.error (.ub msg)`. -/
+def ubMsg? {α : Type} : Interp α → Option String
+  | .error (.ub msg) => some msg
+  | _ => none
+
+private theorem eq_error_ub_of_ubMsg? {α : Type} {x : Interp α} {msg : String}
+    (h : ubMsg? x = some msg) : x = .error (.ub msg) := by
+  cases x with
+  | ok _ => simp [ubMsg?] at h
+  | error e =>
+    cases e <;> simp [ubMsg?] at h ⊢
+    exact h
+
+/-- Direct-call function-item constant operand (`TyKind.fnDef dp []` with
+`MirConstVal.zeroSized`), recognized by both `Translate.extractFnDefPath` and
+`MirSemantics.extractCalleeDefPath?`. -/
+def fnDefOp (dp : String) : Operand :=
+  .constant { ty := { kind := .fnDef dp [], layoutIdx := 0 }, val := .zeroSized }
+
+/-- Root caller context with `retA` at allocation index `0` (address `64`) and
+`fnAllocs nFns` (`AllocationKind::Function` allocations at addresses `16 + k`
+for `0 ≤ k < nFns`) at indices `1 .. nFns`, plus root locals at `addrs`. -/
+def ctxWithFns (caller : Frame) (retA : Gen.Allocation) (nFns : Nat)
+    (addrs : List Int) : Ctx :=
+  { caller := caller, payloads := [], base := retA :: fnAllocs nFns,
+    addrs := addrs, nextBlock := bbName 7, unwindBlock := none, retPtr := retPtr }
+
+/-- Multi-function MiniRust machine running `fEntry` from `prog` under caller
+context `rootCtx` with `fnPtrMap 1 nFns` and initial Anneal locals `locals` at
+`blk`. -/
+def multiMachineWithCtx (rootCtx : Ctx) (prog : Gen.Program) (nFns : Nat)
+    (entry : CapturedMir) (fEntry : Gen.Function) (locals : List LocalSlot)
+    (blk : Gen.BbName) : Mach :=
+  { prog := prog,
+    mem := { memory := { allocations := rootCtx.base ++
+                           localAllocs rootCtx
+                             (entry.localDecls.take (entry.argCount + 1)) locals,
+                         _phantom := {} },
+             accesses := [] },
+    intptrcast := ⟨⟨[]⟩⟩,
+    threads := [thread1 rootCtx [rootCtx.caller,
+      { calleeFrame fEntry rootCtx (entry.argCount + 1) 0 0 with next_block := blk }]],
+    active_thread := 0, synchronized_threads := ⟨[]⟩, locks := [], global_ptrs := ⟨[]⟩,
+    fn_ptrs := fnPtrMap 1 nFns, vtable_ptrs := ⟨[]⟩, stdout := ⟨[]⟩, stderr := ⟨[]⟩ }
+
+/-! ### `callerMain` invoking `calleePair` (`ByValue` + `InPlace` args & `Call + initBlock`) -/
+
+def tupleU32Layout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory, fields := .primitive,
+    variants := .single 0, isUninhabited := false }
+
+def fnAbiCalleePair : FnAbi :=
+  { args := [{ layout := u32Layout, mode := .direct },
+      { layout := tupleU32Layout, mode := .direct }],
+    ret := { layout := u32Layout, mode := .direct }, conv := .rust, canUnwind := false }
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn callee_pair(a: u32, pair: (u32, bool)) -> u32 {
+    // unmarked _4: i8 allocated by callee initBlock (initLen = 2)
+    let mut k: u32;             // bb0: StorageLive(_3); _3 = const 7_u32
+    if pair.1 {                 //      switchInt(copy (_2.1)) -> [0: bb1, otherwise: bb2]
+        a.wrapping_sub(k)       // bb2: _0 = Sub(copy _1, move _3); Deinit(_3); StorageDead(_3); return
+    } else {
+        pair.0.wrapping_add(k)  // bb1: _0 = Add(copy (_2.0), move _3); Deinit(_3); StorageDead(_3); return
+    }
+}
+```
+Having both an unmentioned unmarked local (`_4 : i8`, allocated in `calleePair`'s
+`initBlock`, so `initLen calleePair = 2`) and a `StorageLive` local (`_3 : u32`)
+makes entering `calleePair` take `3` MiniRust steps (`Terminator::Call` plus
+`StorageLive(_4)` plus `Goto(bb0)`) for one Anneal `.tau` call step. -/
+def calleePair : CapturedMir where
+  defPath := "witness::callee_pair"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, u32BoolTupleDecl, u32Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.use (constU32 7)))],
+      terminator := mkTerm (.switchInt (.copy (field1 2)) { branches := [(0, 1)], otherwise := 2 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (field0U32 2)) (.move (local_ 3)))),
+        mkStmt (.deinit (local_ 3)),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .sub (.copy (local_ 1)) (.move (local_ 3)))),
+        mkStmt (.deinit (local_ 3)),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiCalleePair
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn caller_main(x: u32, y: u32) -> u32 {
+    let pair = AddWithOverflow(x, y);   // bb0: StorageLive(_3); StorageLive(_4); _3 = AddWithOverflow(copy _1, copy _2)
+    let r = callee_pair(x, move pair);  //      _4 = Call(callee_pair, [copy _1, move _3]) -> [return: bb1, unwind: continue]
+    r.wrapping_add(x)                   // bb1: _0 = Add(move _4, copy _1); StorageDead(_4); StorageDead(_3); return
+}
+```
+Passes `_1` by value (`ArgumentExpr::ByValue`, leaving `_1` live for `bb1`) and
+`_3 : (u32, bool)` in place (`ArgumentExpr::InPlace`, deinitializing `_3` to
+`Uninit` bytes in MiniRust memory before entering `calleePair`). -/
+def callerMain : CapturedMir where
+  defPath := "witness::caller_main"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, u32Decl, u32BoolTupleDecl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.storageLive 4),
+        mkStmt (.assign (local_ 3) (.binaryOp .addWithOverflow (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm (.call (fnDefOp "witness::callee_pair")
+        [.copy (local_ 1), .move (local_ 3)] (local_ 4) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.move (local_ 4)) (.copy (local_ 1)))),
+        mkStmt (.storageDead 4),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem callerCallee_inFragment : progInFragment callerMain [calleePair] = true := by decide
+
+theorem calleePair_initLen : initLen calleePair = 2 := rfl
+
+def callerMainFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Int u32),
+    (localName 3, intBoolTupleTy u32), (localName 4, .Int u32)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 3),
+      .StorageLive (localName 4),
+      .Assign (.Local (localName 3))
+        (.BinOp (.IntWithOverflow .Add) (.Load (.Local (localName 1)))
+          (.Load (.Local (localName 2))))],
+      .Call (fnPtrExpr (fnName 1)) .Rust
+        [.ByValue (.Load (.Local (localName 1))), .InPlace (.Local (localName 3))]
+        (.Local (localName 4)) (some (bbName 1)) (some (bbName 3)), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 4))) (.Load (.Local (localName 1)))),
+      .StorageDead (localName 4),
+      .StorageDead (localName 3)],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[], .Goto (bbName 0), .Regular⟩),
+    (bbName 3, ⟨[], .ResumeUnwind, .Cleanup⟩)]⟩
+  start := bbName 2
+  implicit_writes := true
+
+def calleePairFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, intBoolTupleTy u32), (localName 3, .Int u32), (localName 4, .Int i8)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 3),
+      .Assign (.Local (localName 3)) (.Constant (.Int 7) (.Int u32))],
+      .Switch (.UnOp (.Cast (.Transmute (.Int u8))) (.Load (.Field (.Local (localName 2)) 1)))
+        ⟨[(0, bbName 1)]⟩ (bbName 2), .Regular⟩),
+    (bbName 1, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Add) (.Load (.Field (.Local (localName 2)) 0))
+          (.Load (.Local (localName 3)))),
+      .Deinit (.Local (localName 3)),
+      .StorageDead (localName 3)],
+      .Return, .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Sub) (.Load (.Local (localName 1))) (.Load (.Local (localName 3)))),
+      .Deinit (.Local (localName 3)),
+      .StorageDead (localName 3)],
+      .Return, .Regular⟩),
+    (bbName 3, ⟨[.StorageLive (localName 4)], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 3
+  implicit_writes := true
+
+def callerCalleeProg : Gen.Program where
+  functions := ⟨[(fnName 0, callerMainFn), (fnName 1, calleePairFn), (fnName 2, mkStartFn 0)]⟩
+  start := fnName 2
+  globals := ⟨[]⟩
+  vtables := ⟨[]⟩
+  traits := ⟨[]⟩
+
+theorem callerCallee_translate :
+    translateProg callerMain [calleePair] = some callerCalleeProg := rfl
+
+theorem callerMain_translateInProg :
+    translateFnInProg (fnNameMap callerMain [calleePair]) callerMain = some callerMainFn := rfl
+
+def ctxCallerMain : Ctx :=
+  ctxWithFns callerFrame retAlloc 2 [128, 256, 384]
+
+theorem ctxCallerMain_ok : CtxOk callerMain ctxCallerMain where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [callerMain] at hd; subst hd; decide
+    | 1, _, hd => simp [callerMain] at hd; subst hd; decide
+    | 2, _, hd => simp [callerMain] at hd; subst hd; decide
+    | _ + 3, hi, _ => simp [callerMain] at hi
+  ret := by
+    intro d hd; simp [callerMain] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- Non-overflow call `(20u32, 5u32)`: `AddWithOverflow(20, 5) = (25, false)`,
+`calleePair(20, (25, false)) = 25 + 7 = 32`, and `callerMain` returns
+`32 + 20 = 52u32`. -/
+def callerCallee20Args : List Value := [.scalar ⟨20, 4⟩, .scalar ⟨5, 4⟩]
+
+def callerCallee20S0 : MachineState :=
+  initMachineStateWithCallees callerMain callerCallee20Args [calleePair]
+
+def callerCallee20MInit : Mach :=
+  multiMachineWithCtx ctxCallerMain callerCalleeProg 2 callerMain callerMainFn
+    callerCallee20S0.frame.locals callerMainFn.start
+
+theorem callerCallee20_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair])
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨52, 4⟩,
+        { callerCallee20S0.memory with activeCallee := some callerMain })) :=
+  runA_sound callerMain 25 _ _ _ rfl
+
+theorem callerCallee20_noUB :
+    MirNoUBTree (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) :=
+  runA_noUB callerMain 25 _ _ _ rfl
+
+theorem callerCallee20_progress (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps (initLen callerMain + n) callerCallee20MInit = .ok m0 ∧
+      Interp.steps (initLen callerMain + n + d) callerCallee20MInit = .ok m' ∧
+      MultiStateRel callerMain [calleePair] callerCalleeProg ctxCallerMain s' m' ∧
+      Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (mirTree callerMain s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen callerMain + n ∧
+      Interp.steps k callerCallee20MInit = .ok mRet ∧
+      ReturnRel callerMain ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (.normal (v, mem))) :=
+  mirCallWithCallees_progress callerCallee_inFragment callerCallee_translate
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callerCallee20_noUB n
+
+theorem callerCallee20_progress_any (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps n callerCallee20MInit = .ok m0 ∧
+      Interp.steps (n + d) callerCallee20MInit = .ok m' ∧
+      MultiStateRel callerMain [calleePair] callerCalleeProg ctxCallerMain s' m' ∧
+      Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (mirTree callerMain s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧
+      Interp.steps k callerCallee20MInit = .ok mRet ∧
+      ReturnRel callerMain ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (.normal (v, mem))) :=
+  mirCallWithCallees_progress_any callerCallee_inFragment callerCallee_translate
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callerCallee20_noUB n
+
+theorem callerCallee20_outcome_any (n : Nat) :
+    (∃ d s' m0 m' tr, Interp.steps n callerCallee20MInit = .ok m0 ∧
+      Interp.steps (n + d) callerCallee20MInit = .ok m' ∧
+      MultiStateRel callerMain [calleePair] callerCalleeProg ctxCallerMain s' m' ∧
+      Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (mirTree callerMain s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ n ∧
+      Interp.steps k callerCallee20MInit = .ok mRet ∧
+      ReturnRel callerMain ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr
+        (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps n callerCallee20MInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTreeWithCallees callerMain callerCallee20Args [calleePair]) tr u ∧
+        FaultNow u) :=
+  mirCallWithCallees_outcome_any callerCallee_inFragment callerCallee_translate
+    callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
+    callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl n
+
+theorem callerCallee20_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n callerCallee20MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 52 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret callerCallee_inFragment callerCallee_translate
+      callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCallee20Args (by decide)
+      callerCallee20MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      callerCallee20_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [callerMain] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- Mid-call snapshot right after `Terminator::Call` (step `5`, before
+`calleePair`'s 2-step `initBlock` completes): the thread stack has depth `3`
+(`[callerFrame, callerMainFn, calleePairFn]`), and `callerMain`'s moved tuple
+local `_3` (allocation `6`) has been deinitialized to 8 `Uninit` bytes by
+`ArgumentExpr::InPlace`. -/
+theorem callerCallee20_midCall_step5 :
+    (Interp.steps 5 callerCallee20MInit).toOption.map
+        (fun m => (m.threads.map (·.stack.length),
+          (m.mem.memory.allocations[6]?).map (·.data))) =
+      some ([3], some (List.replicate 8 .Uninit)) := by
+  decide +kernel
+
+theorem callerCallee20_minirust_direct :
+    (Interp.steps 18 callerCallee20MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 52 }, [1]) := by
+  decide +kernel
+
+/-- Overflow call `(u32::MAX, 5u32)`: `AddWithOverflow(4294967295, 5) = (4, true)`,
+`calleePair` takes `bb2` (`4294967295 - 7 = 4294967288`), and `callerMain`
+returns `4294967288.wrapping_add(4294967295) = 4294967287u32`. -/
+def callerCalleeOvArgs : List Value := [.scalar ⟨4294967295, 4⟩, .scalar ⟨5, 4⟩]
+
+def callerCalleeOvS0 : MachineState :=
+  initMachineStateWithCallees callerMain callerCalleeOvArgs [calleePair]
+
+def callerCalleeOvMInit : Mach :=
+  multiMachineWithCtx ctxCallerMain callerCalleeProg 2 callerMain callerMainFn
+    callerCalleeOvS0.frame.locals callerMainFn.start
+
+theorem callerCalleeOv_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees callerMain callerCalleeOvArgs [calleePair])
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨4294967287, 4⟩,
+        { callerCalleeOvS0.memory with activeCallee := some callerMain })) :=
+  runA_sound callerMain 25 _ _ _ rfl
+
+theorem callerCalleeOv_noUB :
+    MirNoUBTree (mirCallTreeWithCallees callerMain callerCalleeOvArgs [calleePair]) :=
+  runA_noUB callerMain 25 _ _ _ rfl
+
+theorem callerCalleeOv_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n callerCalleeOvMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? =
+        some { retAlloc with data := scalarBytes u32 4294967287 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret callerCallee_inFragment callerCallee_translate
+      callerMain_translateInProg ctxCallerMain ctxCallerMain_ok callerCalleeOvArgs (by decide)
+      callerCalleeOvMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      callerCalleeOv_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [callerMain] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem callerCalleeOv_minirust_direct :
+    (Interp.steps 18 callerCalleeOvMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 4294967287 }, [1]) := by
+  decide +kernel
+
+/-! ### Projected tuple-field call destinations & sequential multi-call reuse -/
+
+def fnAbiBool1 : FnAbi :=
+  { args := [{ layout := boolLayout, mode := .direct }],
+    ret := { layout := boolLayout, mode := .direct }, conv := .rust, canUnwind := false }
+
+def negI8Callee : CapturedMir where
+  defPath := "witness::neg_i8_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.unaryOp .neg (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def flipBoolCallee : CapturedMir where
+  defPath := "witness::flip_bool_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.unaryOp .not (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiBool1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Caller writing sequential call results into projected fields `_0.0`
+(`CallerDestRel.field0`, `UnwindAction.unreachable`, preserving `_0.1`) and
+`_0.1` (`CallerDestRel.field1`, `UnwindAction.terminate`, preserving `_0.0`) of
+an initialized `(i8, bool)` return local `_0`. -/
+def projDestCaller : CapturedMir where
+  defPath := "witness::proj_dest_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8BoolTupleDecl, i8Decl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .addWithOverflow (.copy (local_ 1)) (constI8 1)))],
+      terminator := mkTerm (.call (fnDefOp "witness::neg_i8_callee")
+        [.copy (local_ 1)] (field0I8 0) (some 1) .unreachable),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.use (.copy (field1 0))))],
+      terminator := mkTerm (.call (fnDefOp "witness::flip_bool_callee")
+        [.copy (local_ 2)] (field1 0) (some 2) .terminate),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem projDestCaller_inFragment :
+    progInFragment projDestCaller [negI8Callee, flipBoolCallee] = true := by decide
+
+def retAllocTupleI8 : Gen.Allocation :=
+  { data := List.replicate 2 .Uninit, addr := 64, align := ⟨1⟩, kind := .Stack, live := true,
+    extra := () }
+
+def callerFnTupleI8 : Gen.Function where
+  locals := ⟨[(localName 0, intBoolTupleTy i8)]⟩
+  args := []
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[]⟩
+  start := bbName 0
+  implicit_writes := true
+
+def callerFrameTupleI8 : Frame :=
+  { func := callerFnTupleI8, locals := ⟨[(localName 0, retPtr)]⟩,
+    stack_pop_action := .BottomOfStack, next_block := bbName 0, next_stmt := 0, extra := () }
+
+def ctxProjDest : Ctx :=
+  ctxWithFns callerFrameTupleI8 retAllocTupleI8 3 [128, 256]
+
+theorem ctxProjDest_ok : CtxOk projDestCaller ctxProjDest where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [projDestCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [projDestCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [projDestCaller] at hi
+  ret := by
+    intro d hd; simp [projDestCaller] at hd; subst hd
+    exact ⟨0, retAllocTupleI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def projDestProg : Gen.Program :=
+  (translateProg projDestCaller [negI8Callee, flipBoolCallee]).getD emptyProg
+
+def projDestCallerFn : Gen.Function :=
+  (translateFnInProg (fnNameMap projDestCaller [negI8Callee, flipBoolCallee])
+    projDestCaller).getD callerFnTupleI8
+
+theorem projDest_translate :
+    translateProg projDestCaller [negI8Callee, flipBoolCallee] = some projDestProg := rfl
+
+theorem projDestCaller_translateInProg :
+    translateFnInProg (fnNameMap projDestCaller [negI8Callee, flipBoolCallee]) projDestCaller =
+      some projDestCallerFn := rfl
+
+/-- Input `127i8`: `AddWithOverflow(127i8, 1i8) = (-128i8, true)`,
+`negI8Callee(127i8)` overwrites `_0.0` with `-127i8` (bits `129`) while leaving
+`_0.1 = true`, and `flipBoolCallee(true)` overwrites `_0.1` with `false` while
+leaving `_0.0 = -127i8`. -/
+def projDest127Args : List Value := [.scalar ⟨127, 1⟩]
+
+def projDest127S0 : MachineState :=
+  initMachineStateWithCallees projDestCaller projDest127Args [negI8Callee, flipBoolCallee]
+
+def projDest127MInit : Mach :=
+  multiMachineWithCtx ctxProjDest projDestProg 3 projDestCaller projDestCallerFn
+    projDest127S0.frame.locals projDestCallerFn.start
+
+theorem projDest127_anneal_ret :
+    ReachesRet
+      (mirCallTreeWithCallees projDestCaller projDest127Args [negI8Callee, flipBoolCallee]) []
+      (.normal (.aggregate 0 [.scalar ⟨129, 1⟩, .scalar ⟨0, 1⟩],
+        { projDest127S0.memory with activeCallee := some projDestCaller })) :=
+  runA_sound projDestCaller 25 _ _ _ rfl
+
+theorem projDest127_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees projDestCaller projDest127Args [negI8Callee, flipBoolCallee]) :=
+  runA_noUB projDestCaller 25 _ _ _ rfl
+
+theorem projDest127_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n projDest127MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? =
+        some { retAllocTupleI8 with data := scalarBytes i8 129 ++ scalarBytes u8 0 } ∧
+      m'.threads = [thread1 ctxProjDest
+        [{ callerFrameTupleI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret projDestCaller_inFragment projDest_translate
+      projDestCaller_translateInProg ctxProjDest ctxProjDest_ok projDest127Args (by decide)
+      projDest127MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      projDest127_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [projDestCaller] at hd; subst hd
+  simp [retPtr, ctxProjDest, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxProjDest, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem projDest127_minirust_direct :
+    (Interp.steps 13 projDest127MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocTupleI8 with data := scalarBytes i8 129 ++ scalarBytes u8 0 },
+        [1]) := by
+  decide +kernel
+
+/-! ### 3-deep nested call stack & `Ordering` enum ABI (`chainEntry -> chainMid -> chainLeaf`) -/
+
+def chainLeaf : CapturedMir where
+  defPath := "witness::chain_leaf"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [orderingDecl, i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .cmp (.copy (local_ 1)) (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+def chainMid : CapturedMir where
+  defPath := "witness::chain_mid"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [orderingDecl, i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.unaryOp .neg (.copy (local_ 1))))],
+      terminator := mkTerm (.call (fnDefOp "witness::chain_leaf")
+        [.copy (local_ 1), .move (local_ 2)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def chainEntry : CapturedMir where
+  defPath := "witness::chain_entry"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [orderingDecl, i8Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::chain_mid")
+        [.move (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem chain3_inFragment :
+    progInFragment chainEntry [chainMid, chainLeaf] = true := by decide
+
+theorem chain3_maxStackLocals :
+    maxStackLocals chainEntry [chainMid, chainLeaf] = some 8 := rfl
+
+def ctxChainEntry : Ctx :=
+  ctxWithFns callerFrameI8 retAllocI8 3 [128, 256]
+
+theorem ctxChainEntry_ok : CtxOk chainEntry ctxChainEntry where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [chainEntry] at hd; subst hd; decide
+    | 1, _, hd => simp [chainEntry] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [chainEntry] at hi
+  ret := by
+    intro d hd; simp [chainEntry] at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def chain3Prog : Gen.Program :=
+  (translateProg chainEntry [chainMid, chainLeaf]).getD emptyProg
+
+def chainEntryFn : Gen.Function :=
+  (translateFnInProg (fnNameMap chainEntry [chainMid, chainLeaf]) chainEntry).getD callerFn
+
+theorem chain3_translate :
+    translateProg chainEntry [chainMid, chainLeaf] = some chain3Prog := rfl
+
+theorem chainEntry_translateInProg :
+    translateFnInProg (fnNameMap chainEntry [chainMid, chainLeaf]) chainEntry =
+      some chainEntryFn := rfl
+
+/-- Input `-5i8` (bits `251`): `chainEntry(-5)` calls `chainMid(-5)`, which
+computes `-(-5) = 5` and calls `chainLeaf(-5, 5)`, returning `Ordering::Less`
+(`-1i8`, byte `255`) back through all three frames. -/
+def chainNeg5Args : List Value := [.scalar ⟨251, 1⟩]
+
+def chainNeg5S0 : MachineState :=
+  initMachineStateWithCallees chainEntry chainNeg5Args [chainMid, chainLeaf]
+
+def chainNeg5MInit : Mach :=
+  multiMachineWithCtx ctxChainEntry chain3Prog 3 chainEntry chainEntryFn
+    chainNeg5S0.frame.locals chainEntryFn.start
+
+theorem chainNeg5_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees chainEntry chainNeg5Args [chainMid, chainLeaf]) []
+      (.normal (.scalar ⟨255, 1⟩,
+        { chainNeg5S0.memory with activeCallee := some chainEntry })) :=
+  runA_sound chainEntry 25 _ _ _ rfl
+
+theorem chainNeg5_noUB :
+    MirNoUBTree (mirCallTreeWithCallees chainEntry chainNeg5Args [chainMid, chainLeaf]) :=
+  runA_noUB chainEntry 25 _ _ _ rfl
+
+theorem chainNeg5_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n chainNeg5MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAllocI8 with data := scalarBytes u8 255 } ∧
+      m'.threads = [thread1 ctxChainEntry
+        [{ callerFrameI8 with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret chain3_inFragment chain3_translate
+      chainEntry_translateInProg ctxChainEntry ctxChainEntry_ok chainNeg5Args (by decide)
+      chainNeg5MInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      chainNeg5_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [chainEntry] at hd; subst hd
+  simp [retPtr, ctxChainEntry, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxChainEntry, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- At step `7`, all three translated functions (`chainEntryFn`, `chainMidFn`,
+and `chainLeafFn`) are live on the MiniRust call stack above `callerFrameI8`
+(stack depth `4`). -/
+theorem chainNeg5_depth4_step7 :
+    (Interp.steps 7 chainNeg5MInit).toOption.map (fun m => m.threads.map (·.stack.length)) =
+      some [4] := by
+  decide +kernel
+
+theorem chainNeg5_minirust_direct :
+    (Interp.steps 11 chainNeg5MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes u8 255 }, [1]) := by
+  decide +kernel
+
+/-! ### Multi-frame UB propagation (call-argument UB and callee-body UB) -/
+
+def idU32Callee : CapturedMir where
+  defPath := "witness::id_u32_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Caller passing an uninitialized local `copy _1` as a call argument to
+`idU32Callee`: both semantics raise UB during argument evaluation before
+entering `idU32Callee`. -/
+def callArgUbCaller : CapturedMir where
+  defPath := "witness::call_arg_ub_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 1)],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem callArgUb_inFragment :
+    progInFragment callArgUbCaller [idU32Callee] = true := by decide
+
+def ctxCallArgUb : Ctx :=
+  ctxWithFns callerFrame retAlloc 2 [128]
+
+theorem ctxCallArgUb_ok : CtxOk callArgUbCaller ctxCallArgUb where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [callArgUbCaller] at hd; subst hd; decide
+    | _ + 1, hi, _ => simp [callArgUbCaller] at hi
+  ret := by
+    intro d hd; simp [callArgUbCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def callArgUbProg : Gen.Program :=
+  (translateProg callArgUbCaller [idU32Callee]).getD emptyProg
+
+def callArgUbCallerFn : Gen.Function :=
+  (translateFnInProg (fnNameMap callArgUbCaller [idU32Callee]) callArgUbCaller).getD callerFn
+
+theorem callArgUb_translate :
+    translateProg callArgUbCaller [idU32Callee] = some callArgUbProg := rfl
+
+theorem callArgUbCaller_translateInProg :
+    translateFnInProg (fnNameMap callArgUbCaller [idU32Callee]) callArgUbCaller =
+      some callArgUbCallerFn := rfl
+
+def callArgUbS0 : MachineState :=
+  initMachineStateWithCallees callArgUbCaller [] [idU32Callee]
+
+def callArgUbMInit : Mach :=
+  multiMachineWithCtx ctxCallArgUb callArgUbProg 2 callArgUbCaller callArgUbCallerFn
+    callArgUbS0.frame.locals callArgUbCallerFn.start
+
+theorem callArgUb_anneal_ub :
+    ∃ tr u, Reaches (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr u ∧ FaultNow u :=
+  faultsA_sound callArgUbCaller 5 _ (by decide)
+
+theorem callArgUb_minirust_ub :
+    ∃ (n : Nat) (msg : String), Interp.steps n callArgUbMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := callArgUb_anneal_ub
+  exact mirCallWithCallees_ub callArgUb_inFragment callArgUb_translate
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+theorem callArgUb_minirust_direct :
+    Interp.steps 3 callArgUbMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+theorem callArgUb_converse_error :
+    (∃ msg,
+      Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u, Reaches (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr u ∧
+        FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 3 ∧ Interp.steps k callArgUbMInit = .ok mRet ∧
+      ReturnRel callArgUbCaller ctxCallArgUb s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr
+        (.normal (v, mem))) :=
+  mirCallWithCallees_steps_error callArgUb_inFragment callArgUb_translate
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callArgUb_minirust_direct
+
+theorem callArgUb_outcome :
+    (∃ d s' m0 m' tr, Interp.steps (initLen callArgUbCaller + 1) callArgUbMInit = .ok m0 ∧
+      Interp.steps (initLen callArgUbCaller + 1 + d) callArgUbMInit = .ok m' ∧
+      MultiStateRel callArgUbCaller [idU32Callee] callArgUbProg ctxCallArgUb s' m' ∧
+      Reaches (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr
+        (mirTree callArgUbCaller s')) ∨
+    (∃ k s' mRet tr v mem, k ≤ initLen callArgUbCaller + 1 ∧
+      Interp.steps k callArgUbMInit = .ok mRet ∧
+      ReturnRel callArgUbCaller ctxCallArgUb s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr
+        (.normal (v, mem))) ∨
+    (∃ msg, Interp.steps (initLen callArgUbCaller + 1) callArgUbMInit = .error (.ub msg) ∧
+      ∃ tr u, Reaches (mirCallTreeWithCallees callArgUbCaller [] [idU32Callee]) tr u ∧
+        FaultNow u) :=
+  mirCallWithCallees_outcome callArgUb_inFragment callArgUb_translate
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl 1
+
+/-- Callee faulting with division-by-zero inside a pushed stack frame. -/
+def divTenI8Callee : CapturedMir where
+  defPath := "witness::div_ten_i8_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .div (constI8 10) (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def calleeDivZeroCaller : CapturedMir where
+  defPath := "witness::callee_div_zero_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::div_ten_i8_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem calleeDivZero_inFragment :
+    progInFragment calleeDivZeroCaller [divTenI8Callee] = true := by decide
+
+def ctxCalleeDivZero : Ctx :=
+  ctxWithFns callerFrameI8 retAllocI8 2 [128, 256]
+
+theorem ctxCalleeDivZero_ok : CtxOk calleeDivZeroCaller ctxCalleeDivZero where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [calleeDivZeroCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [calleeDivZeroCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [calleeDivZeroCaller] at hi
+  ret := by
+    intro d hd; simp [calleeDivZeroCaller] at hd; subst hd
+    exact ⟨0, retAllocI8, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def calleeDivZeroProg : Gen.Program :=
+  (translateProg calleeDivZeroCaller [divTenI8Callee]).getD emptyProg
+
+def calleeDivZeroCallerFn : Gen.Function :=
+  (translateFnInProg (fnNameMap calleeDivZeroCaller [divTenI8Callee])
+    calleeDivZeroCaller).getD callerFn
+
+theorem calleeDivZero_translate :
+    translateProg calleeDivZeroCaller [divTenI8Callee] = some calleeDivZeroProg := rfl
+
+theorem calleeDivZeroCaller_translateInProg :
+    translateFnInProg (fnNameMap calleeDivZeroCaller [divTenI8Callee]) calleeDivZeroCaller =
+      some calleeDivZeroCallerFn := rfl
+
+def calleeDivZeroArgs : List Value := [.scalar ⟨0, 1⟩]
+
+def calleeDivZeroS0 : MachineState :=
+  initMachineStateWithCallees calleeDivZeroCaller calleeDivZeroArgs [divTenI8Callee]
+
+def calleeDivZeroMInit : Mach :=
+  multiMachineWithCtx ctxCalleeDivZero calleeDivZeroProg 2 calleeDivZeroCaller
+    calleeDivZeroCallerFn calleeDivZeroS0.frame.locals calleeDivZeroCallerFn.start
+
+theorem calleeDivZero_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees calleeDivZeroCaller calleeDivZeroArgs [divTenI8Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound calleeDivZeroCaller 10 _ (by decide)
+
+theorem calleeDivZero_minirust_ub :
+    ∃ (n : Nat) (msg : String), Interp.steps n calleeDivZeroMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := calleeDivZero_anneal_ub
+  exact mirCallWithCallees_ub calleeDivZero_inFragment calleeDivZero_translate
+    calleeDivZeroCaller_translateInProg ctxCalleeDivZero ctxCalleeDivZero_ok calleeDivZeroArgs
+    (by decide) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+theorem calleeDivZero_minirust_direct :
+    Interp.steps 4 calleeDivZeroMInit = .error (.ub "division by zero") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+theorem calleeDivZero_converse_error :
+    (∃ msg, Stop.ub "division by zero" = .ub msg ∧
+      ∃ tr u, Reaches
+        (mirCallTreeWithCallees calleeDivZeroCaller calleeDivZeroArgs [divTenI8Callee]) tr u ∧
+        FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k calleeDivZeroMInit = .ok mRet ∧
+      ReturnRel calleeDivZeroCaller ctxCalleeDivZero s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees calleeDivZeroCaller calleeDivZeroArgs [divTenI8Callee])
+        tr (.normal (v, mem))) :=
+  mirCallWithCallees_steps_error calleeDivZero_inFragment calleeDivZero_translate
+    calleeDivZeroCaller_translateInProg ctxCalleeDivZero ctxCalleeDivZero_ok calleeDivZeroArgs
+    (by decide) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    calleeDivZero_minirust_direct
+
+/-! ### Diverging multi-function call loop (`callSpinCaller` calling `idU32Callee`) -/
+
+/-- Diverging caller `StorageLive(_2); loop { _2 = copy _1; _1 = id_u32_callee(move _2); }`:
+the static call graph `callSpinCaller -> idU32Callee` is acyclic, and each
+iteration pushes and pops `idU32Callee` cleanly without unbounded stack growth. -/
+def callSpinCaller : CapturedMir where
+  defPath := "witness::call_spin_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2)],
+      terminator := mkTerm (.goto 1),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 2) (.use (.copy (local_ 1))))],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.move (local_ 2)] (local_ 1) (some 1) .continue_),
+      isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem callSpin_inFragment :
+    progInFragment callSpinCaller [idU32Callee] = true := by decide
+
+def ctxCallSpin : Ctx :=
+  ctxWithFns callerFrame retAlloc 2 [128, 256]
+
+theorem ctxCallSpin_ok : CtxOk callSpinCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [callSpinCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [callSpinCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [callSpinCaller] at hi
+  ret := by
+    intro d hd; simp [callSpinCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def callSpinProg : Gen.Program :=
+  (translateProg callSpinCaller [idU32Callee]).getD emptyProg
+
+def callSpinCallerFn : Gen.Function :=
+  (translateFnInProg (fnNameMap callSpinCaller [idU32Callee]) callSpinCaller).getD callerFn
+
+theorem callSpin_translate :
+    translateProg callSpinCaller [idU32Callee] = some callSpinProg := rfl
+
+theorem callSpinCaller_translateInProg :
+    translateFnInProg (fnNameMap callSpinCaller [idU32Callee]) callSpinCaller =
+      some callSpinCallerFn := rfl
+
+def callSpinArgs : List Value := [.scalar ⟨0, 4⟩]
+
+def callSpinS0 : MachineState :=
+  initMachineStateWithCallees callSpinCaller callSpinArgs [idU32Callee]
+
+private def nextSpinState (s : MachineState) : MachineState :=
+  match stepMirFn callSpinCaller s with
+  | .tau (.running s') => s'
+  | _ => s
+
+private def callSpinS1 : MachineState := nextSpinState callSpinS0
+
+private def callSpinS2 : MachineState := nextSpinState callSpinS1
+
+private def callSpinS3 : MachineState := nextSpinState callSpinS2
+
+private def callSpinS4 : MachineState := nextSpinState callSpinS3
+
+private def callSpinS5 : MachineState := nextSpinState callSpinS4
+
+private def callSpinS6 : MachineState := nextSpinState callSpinS5
+
+private def callSpinS7 : MachineState := nextSpinState callSpinS6
+
+/-- Eight-state silent-step invariant for `callSpinCaller`:
+`S0 -> S1 -> S2 -> S3` on entry (`activeCallee = none`), entering the 4-state
+call/return cycle `S4 -> S5 -> S6 -> S7 -> S4`. -/
+def CallSpinInv (s : MachineState) : Prop :=
+  s = callSpinS0 ∨ s = callSpinS1 ∨ s = callSpinS2 ∨ s = callSpinS3 ∨
+  s = callSpinS4 ∨ s = callSpinS5 ∨ s = callSpinS6 ∨ s = callSpinS7
+
+private theorem callSpin_step (s : MachineState) (h : CallSpinInv s) :
+    ∃ s', stepMirFn callSpinCaller s = .tau (.running s') ∧ CallSpinInv s' := by
+  rcases h with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · exact ⟨callSpinS1, rfl, Or.inr (Or.inl rfl)⟩
+  · exact ⟨callSpinS2, rfl, Or.inr (Or.inr (Or.inl rfl))⟩
+  · exact ⟨callSpinS3, rfl, Or.inr (Or.inr (Or.inr (Or.inl rfl)))⟩
+  · exact ⟨callSpinS4, rfl, Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))⟩
+  · exact ⟨callSpinS5, rfl, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl)))))⟩
+  · exact ⟨callSpinS6, rfl, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))))⟩
+  · exact ⟨callSpinS7, rfl, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr rfl))))))⟩
+  · exact ⟨callSpinS4, rfl, Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))⟩
+
+def callSpinMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin callSpinProg 2 callSpinCaller callSpinCallerFn
+    callSpinS0.frame.locals callSpinCallerFn.start
+
+theorem callSpin_noUB :
+    MirNoUBTree (mirCallTreeWithCallees callSpinCaller callSpinArgs [idU32Callee]) :=
+  treeSafe_of_tau_inv callSpin_step (Or.inl rfl)
+
+theorem callSpin_noRet (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet (mirCallTreeWithCallees callSpinCaller callSpinArgs [idU32Callee]) tr o :=
+  noRet_of_tau_inv callSpin_step (Or.inl rfl) tr o
+
+theorem callSpin_minirust_diverges (n : Nat) :
+    ∃ m', Interp.steps n callSpinMInit = .ok m' :=
+  mirCallWithCallees_diverges_steps_ok callSpin_inFragment callSpin_translate
+    callSpinCaller_translateInProg ctxCallSpin ctxCallSpin_ok callSpinArgs (by decide)
+    callSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callSpin_noUB callSpin_noRet n
+
+theorem callSpin_minirust_diverges_rel (n : Nat) :
+    ∃ d s' m0 m' tr, Interp.steps (initLen callSpinCaller + n) callSpinMInit = .ok m0 ∧
+      Interp.steps (initLen callSpinCaller + n + d) callSpinMInit = .ok m' ∧
+      MultiStateRel callSpinCaller [idU32Callee] callSpinProg ctxCallSpin s' m' ∧
+      Reaches (mirCallTreeWithCallees callSpinCaller callSpinArgs [idU32Callee]) tr
+        (mirTree callSpinCaller s') :=
+  mirCallWithCallees_diverges_rel callSpin_inFragment callSpin_translate
+    callSpinCaller_translateInProg ctxCallSpin ctxCallSpin_ok callSpinArgs (by decide)
+    callSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callSpin_noUB callSpin_noRet n
+
+/-! ### Soundness-boundary counterexamples (`progInFragment = false`) -/
+
+/-- Counterexample 1 (`_1 = idU32Callee(copy _1)`): return place `_1` aliases
+argument `copy _1`. Anneal evaluates `copy _1` before writing `_1` on return and
+succeeds, whereas MiniRust's `Terminator::Call` runs
+`prepare_for_inplace_passing(_1)` (writing `Uninit`) BEFORE `eval_argument`
+loads `_1`, faulting with UB! `callTerminatorOk` rightly rejects this. -/
+def callDestArgAlias : CapturedMir where
+  defPath := "witness::call_dest_arg_alias"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (local_ 1)] (local_ 1) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem callDestArgAlias_movesOk : movesOk callDestArgAlias = false := by decide
+
+theorem callDestArgAlias_rejected :
+    progInFragment callDestArgAlias [idU32Callee] = false := by decide
+
+def callDestArgAliasProg : Gen.Program :=
+  (translateProg callDestArgAlias [idU32Callee]).getD emptyProg
+
+def callDestArgAliasFn : Gen.Function :=
+  (translateFnInProg (fnNameMap callDestArgAlias [idU32Callee]) callDestArgAlias).getD callerFn
+
+theorem callDestArgAlias_translate :
+    translateProg callDestArgAlias [idU32Callee] = some callDestArgAliasProg := rfl
+
+def callDestArgAliasS0 : MachineState :=
+  initMachineStateWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]
+
+def callDestArgAliasMInit : Mach :=
+  multiMachineWithCtx ctxCallerMain callDestArgAliasProg 2 callDestArgAlias callDestArgAliasFn
+    callDestArgAliasS0.frame.locals callDestArgAliasFn.start
+
+theorem callDestArgAlias_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) []
+      (.normal (.scalar ⟨7, 4⟩,
+        { callDestArgAliasS0.memory with activeCallee := some callDestArgAlias })) :=
+  runA_sound callDestArgAlias 10 _ _ _ rfl
+
+theorem callDestArgAlias_minirust_ub :
+    Interp.steps 2 callDestArgAliasMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- Counterexample 2 (`_2 = idU32Callee(move (_1.0)); _0 = copy (_1.0)`):
+projected `move (_1.0)` in a call argument leaves `_1` intact in Anneal's
+`evalOperand` (which only deinitializes root moves), whereas MiniRust translates
+`Operand::Move(_1.0)` to `ArgumentExpr::InPlace (.Field (.Local _1) 0)` and
+deinitializes `_1.0`, faulting when `bb1` reads `copy (_1.0)`! `callArgOk`
+rightly restricts `Operand::Move` call arguments to root locals. -/
+def callProjMoveReuse : CapturedMir where
+  defPath := "witness::call_proj_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32BoolTupleDecl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.move (field0U32 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (field0U32 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem callProjMoveReuse_rejected :
+    progInFragment callProjMoveReuse [idU32Callee] = false := by decide
+
+def callProjMoveReuseProg : Gen.Program :=
+  (translateProg callProjMoveReuse [idU32Callee]).getD emptyProg
+
+def callProjMoveReuseFn : Gen.Function :=
+  (translateFnInProg (fnNameMap callProjMoveReuse [idU32Callee]) callProjMoveReuse).getD callerFn
+
+theorem callProjMoveReuse_translate :
+    translateProg callProjMoveReuse [idU32Callee] = some callProjMoveReuseProg := rfl
+
+def callProjMoveReuseArgs : List Value := [.aggregate 0 [.scalar ⟨9, 4⟩, .scalar ⟨1, 1⟩]]
+
+def callProjMoveReuseS0 : MachineState :=
+  initMachineStateWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]
+
+def callProjMoveReuseMInit : Mach :=
+  multiMachineWithCtx ctxCallerMain callProjMoveReuseProg 2 callProjMoveReuse
+    callProjMoveReuseFn callProjMoveReuseS0.frame.locals callProjMoveReuseFn.start
+
+theorem callProjMoveReuse_anneal_ret :
+    ReachesRet
+      (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]) []
+      (.normal (.scalar ⟨9, 4⟩,
+        { callProjMoveReuseS0.memory with activeCallee := some callProjMoveReuse })) :=
+  runA_sound callProjMoveReuse 10 _ _ _ rfl
+
+theorem callProjMoveReuse_minirust_ub :
+    Interp.steps 7 callProjMoveReuseMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- Post-call root-`move` reuse (`StorageLive(_2); _2 = idU32Callee(move _1);
+_0 = copy _1`): because `ArgumentExpr::InPlace` writes `Uninit` to `_1` in
+MiniRust just as `evalOperand` sets `_1` to `.uninit` in Anneal (`_1` is not
+stale!), `callMoveReuse` is IN `progInFragment`, and BOTH forward UB transfer
+(`mirCallWithCallees_ub`) and converse error soundness
+(`mirCallWithCallees_steps_error`) apply on `bb1`'s `copy _1`. -/
+def callMoveReuse : CapturedMir where
+  defPath := "witness::call_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.move (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem callMoveReuse_inFragment :
+    progInFragment callMoveReuse [idU32Callee] = true := by decide
+
+theorem callMoveReuse_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]) tr u ∧ FaultNow u :=
+  faultsA_sound callMoveReuse 10 _ (by decide)
+
+def callMoveReuseProg : Gen.Program :=
+  (translateProg callMoveReuse [idU32Callee]).getD emptyProg
+
+def callMoveReuseFn : Gen.Function :=
+  (translateFnInProg (fnNameMap callMoveReuse [idU32Callee]) callMoveReuse).getD callerFn
+
+theorem callMoveReuse_translate :
+    translateProg callMoveReuse [idU32Callee] = some callMoveReuseProg := rfl
+
+theorem callMoveReuse_translateInProg :
+    translateFnInProg (fnNameMap callMoveReuse [idU32Callee]) callMoveReuse =
+      some callMoveReuseFn := rfl
+
+def callMoveReuseMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin callMoveReuseProg 2 callMoveReuse callMoveReuseFn
+    (initMachineStateWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]).frame.locals
+    callMoveReuseFn.start
+
+theorem ctxCallMoveReuse_ok : CtxOk callMoveReuse ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [callMoveReuse] at hd; subst hd; decide
+    | 1, _, hd => simp [callMoveReuse] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [callMoveReuse] at hi
+  ret := by
+    intro d hd; simp [callMoveReuse] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem callMoveReuse_minirust_ub :
+    ∃ (n : Nat) (msg : String), Interp.steps n callMoveReuseMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := callMoveReuse_anneal_ub
+  exact mirCallWithCallees_ub callMoveReuse_inFragment callMoveReuse_translate
+    callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
+    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+theorem callMoveReuse_minirust_direct :
+    Interp.steps 7 callMoveReuseMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+theorem callMoveReuse_converse_error :
+    (∃ msg,
+      Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u,
+        Reaches (mirCallTreeWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]) tr u ∧
+          FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 7 ∧ Interp.steps k callMoveReuseMInit = .ok mRet ∧
+      ReturnRel callMoveReuse ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callMoveReuse [.scalar ⟨7, 4⟩] [idU32Callee]) tr
+        (.normal (v, mem))) :=
+  mirCallWithCallees_steps_error callMoveReuse_inFragment callMoveReuse_translate
+    callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
+    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    callMoveReuse_minirust_direct
+
+/-- Root-destination call re-initialization (`StorageLive(_2); _2 = move _1;
+_1 = idU32Callee(copy _2); _0 = copy _1; StorageDead(_2); Return`): `_1` is
+moved out by `_2 = move _1` (entering `mo`), then completely overwritten by the
+root destination of `_1 = idU32Callee(copy _2)` (`termMoved` clears `_1` from
+`mo`, and `termReadsOk` allows `_1 ∈ mo` on root destinations `⟨dst, []⟩`). -/
+def moveReinitByCall : CapturedMir where
+  defPath := "witness::move_reinit_by_call"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.use (.move (local_ 1))))],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (local_ 2)] (local_ 1) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem moveReinitByCall_inFragment :
+    progInFragment moveReinitByCall [idU32Callee] = true := by decide
+
+def moveReinitByCallProg : Gen.Program :=
+  (translateProg moveReinitByCall [idU32Callee]).getD emptyProg
+
+def moveReinitByCallFn : Gen.Function :=
+  (translateFnInProg (fnNameMap moveReinitByCall [idU32Callee]) moveReinitByCall).getD callerFn
+
+theorem moveReinitByCall_translate :
+    translateProg moveReinitByCall [idU32Callee] = some moveReinitByCallProg := rfl
+
+theorem moveReinitByCall_translateInProg :
+    translateFnInProg (fnNameMap moveReinitByCall [idU32Callee]) moveReinitByCall =
+      some moveReinitByCallFn := rfl
+
+def moveReinitByCallS0 : MachineState :=
+  initMachineStateWithCallees moveReinitByCall [.scalar ⟨55, 4⟩] [idU32Callee]
+
+def moveReinitByCallMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin moveReinitByCallProg 2 moveReinitByCall moveReinitByCallFn
+    moveReinitByCallS0.frame.locals moveReinitByCallFn.start
+
+theorem ctxMoveReinitByCall_ok : CtxOk moveReinitByCall ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [moveReinitByCall] at hd; subst hd; decide
+    | 1, _, hd => simp [moveReinitByCall] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [moveReinitByCall] at hi
+  ret := by
+    intro d hd; simp [moveReinitByCall] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem moveReinitByCall_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees moveReinitByCall [.scalar ⟨55, 4⟩] [idU32Callee]) []
+      (.normal (.scalar ⟨55, 4⟩,
+        { moveReinitByCallS0.memory with activeCallee := some moveReinitByCall })) :=
+  runA_sound moveReinitByCall 20 _ _ _ rfl
+
+theorem moveReinitByCall_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n moveReinitByCallMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 55 } ∧
+      m'.threads = [thread1 ctxCallSpin
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret moveReinitByCall_inFragment moveReinitByCall_translate
+      moveReinitByCall_translateInProg ctxCallSpin ctxMoveReinitByCall_ok
+      [.scalar ⟨55, 4⟩] (by decide) moveReinitByCallMInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      moveReinitByCall_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [moveReinitByCall] at hd; subst hd
+  simp [retPtr, ctxCallSpin, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallSpin, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem moveReinitByCall_minirust_direct :
+    (Interp.steps 10 moveReinitByCallMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 55 }, [1]) := by
+  decide +kernel
+
+/-- Branch-correlated `Call` `move` across a CFG join:
+```rust
+fn cond_call_move_join(flag: u32, x: u32) -> u32 {
+    let y = if flag != 0 { id_u32_callee(move x) } else { 0 };
+    if flag != 0 { y } else { x }
+}
+```
+On `bb1` (`flag != 0`), `move _2` is lowered via `ArgumentExpr::InPlace` (writing
+`Uninit` in MiniRust too, so `_2` is not stale!), allowing `bb5` (`flag == 0`)
+after the join block `bb3` to read `copy _2` cleanly in `progInFragment`. -/
+def condCallMoveJoin : CapturedMir where
+  defPath := "witness::cond_call_move_join"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 3)],
+      terminator := mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 2)], otherwise := 1 }),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.move (local_ 2)] (local_ 3) (some 3) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 3) (.use (constU32 0)))],
+      terminator := mkTerm (.goto 3), isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 5)], otherwise := 4 }),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 3)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_, isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 2)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem condCallMoveJoin_inFragment :
+    progInFragment condCallMoveJoin [idU32Callee] = true := by decide
+
+def condCallMoveJoinProg : Gen.Program :=
+  (translateProg condCallMoveJoin [idU32Callee]).getD emptyProg
+
+def condCallMoveJoinFn : Gen.Function :=
+  (translateFnInProg (fnNameMap condCallMoveJoin [idU32Callee]) condCallMoveJoin).getD callerFn
+
+theorem condCallMoveJoin_translate :
+    translateProg condCallMoveJoin [idU32Callee] = some condCallMoveJoinProg := rfl
+
+theorem condCallMoveJoin_translateInProg :
+    translateFnInProg (fnNameMap condCallMoveJoin [idU32Callee]) condCallMoveJoin =
+      some condCallMoveJoinFn := rfl
+
+theorem ctxCondCallMoveJoin_ok : CtxOk condCallMoveJoin ctxCallerMain where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [condCallMoveJoin] at hd; subst hd; decide
+    | 1, _, hd => simp [condCallMoveJoin] at hd; subst hd; decide
+    | 2, _, hd => simp [condCallMoveJoin] at hd; subst hd; decide
+    | _ + 3, hi, _ => simp [condCallMoveJoin] at hi
+  ret := by
+    intro d hd; simp [condCallMoveJoin] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def condCallMoveJoin1Args : List Value := [.scalar ⟨1, 4⟩, .scalar ⟨42, 4⟩]
+
+def condCallMoveJoin1S0 : MachineState :=
+  initMachineStateWithCallees condCallMoveJoin condCallMoveJoin1Args [idU32Callee]
+
+def condCallMoveJoin1MInit : Mach :=
+  multiMachineWithCtx ctxCallerMain condCallMoveJoinProg 2 condCallMoveJoin condCallMoveJoinFn
+    condCallMoveJoin1S0.frame.locals condCallMoveJoinFn.start
+
+theorem condCallMoveJoin1_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees condCallMoveJoin condCallMoveJoin1Args [idU32Callee])
+      [⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩,
+        ⟨.inr (.inl (.emit (.event 1))), PUnit.unit⟩]
+      (.normal (.scalar ⟨42, 4⟩,
+        { condCallMoveJoin1S0.memory with activeCallee := some condCallMoveJoin })) :=
+  runA_sound condCallMoveJoin 25 _ _ _ rfl
+
+theorem condCallMoveJoin1_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n condCallMoveJoin1MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret condCallMoveJoin_inFragment condCallMoveJoin_translate
+      condCallMoveJoin_translateInProg ctxCallerMain ctxCondCallMoveJoin_ok
+      condCallMoveJoin1Args (by decide) condCallMoveJoin1MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      condCallMoveJoin1_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [condCallMoveJoin] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+def condCallMoveJoin0Args : List Value := [.scalar ⟨0, 4⟩, .scalar ⟨99, 4⟩]
+
+def condCallMoveJoin0S0 : MachineState :=
+  initMachineStateWithCallees condCallMoveJoin condCallMoveJoin0Args [idU32Callee]
+
+def condCallMoveJoin0MInit : Mach :=
+  multiMachineWithCtx ctxCallerMain condCallMoveJoinProg 2 condCallMoveJoin condCallMoveJoinFn
+    condCallMoveJoin0S0.frame.locals condCallMoveJoinFn.start
+
+theorem condCallMoveJoin0_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees condCallMoveJoin condCallMoveJoin0Args [idU32Callee])
+      [⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩,
+        ⟨.inr (.inl (.emit (.event 0))), PUnit.unit⟩]
+      (.normal (.scalar ⟨99, 4⟩, condCallMoveJoin0S0.memory)) :=
+  runA_sound condCallMoveJoin 25 _ _ _ rfl
+
+theorem condCallMoveJoin0_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n condCallMoveJoin0MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 99 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret condCallMoveJoin_inFragment condCallMoveJoin_translate
+      condCallMoveJoin_translateInProg ctxCallerMain ctxCondCallMoveJoin_ok
+      condCallMoveJoin0Args (by decide) condCallMoveJoin0MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      condCallMoveJoin0_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [condCallMoveJoin] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem condCallMoveJoin_minirust_direct :
+    (Interp.steps 11 condCallMoveJoin1MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    (Interp.steps 9 condCallMoveJoin0MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 99 }, [1]) :=
+  ⟨by decide +kernel, by decide +kernel⟩
+
+/-- Counterexample 3 (`StorageLive(_2); _2 = move _1; _0 = idU32Callee(copy _1)`):
+passing a local that was moved out in an earlier statement (leaving stale bytes
+in MiniRust!) as a call argument is rejected by `termReadsOk` / `movesOk` (and
+`progInFragment`). -/
+def stmtMoveThenCallArg : CapturedMir where
+  defPath := "witness::stmt_move_then_call_arg"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.use (.move (local_ 1))))],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem stmtMoveThenCallArg_movesOk : movesOk stmtMoveThenCallArg = false := by decide
+
+theorem stmtMoveThenCallArg_rejected :
+    progInFragment stmtMoveThenCallArg [idU32Callee] = false := by decide
+
+/-- Counterexample 4: mutual recursion `recCycleA -> recCycleB -> recCycleA` is
+rejected by `maxStackLocals = none` (`progInFragment = false`). -/
+def recCycleA : CapturedMir where
+  defPath := "witness::rec_cycle_a"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::rec_cycle_b")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def recCycleB : CapturedMir where
+  defPath := "witness::rec_cycle_b"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::rec_cycle_a")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem recCycle_maxStackLocals :
+    maxStackLocals recCycleA [recCycleB, recCycleA] = none := rfl
+
+theorem recCycle_rejected :
+    progInFragment recCycleA [recCycleB, recCycleA] = false := by decide
+
+/-! ### Ground-truth `Interp` unit checks for `MR-4.1` spec items -/
+
+/-- `Type.layout` on `Ptr` (thin `FnPtr`, thin sized `Ref`, wide `Slice` `Ref`,
+and `Raw (.VTablePointer _)`) and `Array` (`[u32; 3]`, `3 * 4 = 12` bytes, align `4`). -/
+def sizedU32Pointee : Gen.PointeeInfo :=
+  { layout := .Sized ⟨4⟩ ⟨4⟩, inhabited := true, unsafe_cells := .Sized [],
+    freeze := true, unpin := true }
+
+def sliceU32Pointee : Gen.PointeeInfo :=
+  { layout := .Slice ⟨4⟩ ⟨4⟩, inhabited := true, unsafe_cells := .Slice [],
+    freeze := true, unpin := true }
+
+theorem layout_ptr_and_array_mr41 :
+    Type.layout (.Ptr .FnPtr) = .ok (.Sized ⟨8⟩ ⟨8⟩) ∧
+    Type.layout (.Ptr (.Ref .Immutable sizedU32Pointee)) = .ok (.Sized ⟨8⟩ ⟨8⟩) ∧
+    Type.layout (.Ptr (.Ref .Immutable sliceU32Pointee)) = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    Type.layout (.Ptr (.Raw (.VTablePointer ⟨⟨0⟩⟩))) = .ok (.Sized ⟨16⟩ ⟨8⟩) ∧
+    Type.layout (.Array (.Int u32) 3) = .ok (.Sized ⟨12⟩ ⟨4⟩) :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `evalConstant` on `FnPointer`, `GlobalPointer` (with offset),
+`VTablePointer`, and `PointerWithoutProvenance`, plus `fnFromPtr` on valid thin
+function pointers, wide pointers (UB), unmapped thin pointers (UB), and
+non-pointer values (UB). -/
+def constTestMach : Mach :=
+  { callerCallee20MInit with
+    prog := { callerCalleeProg with
+              globals := ⟨[(⟨⟨0⟩⟩, { bytes := [some 1, some 2], relocations := [], align := ⟨2⟩ })]⟩ },
+    global_ptrs := ⟨[(⟨⟨0⟩⟩, { addr := 32, provenance := some (⟨99⟩, ()) })]⟩,
+    vtable_ptrs := ⟨[(⟨⟨0⟩⟩, { addr := 48, provenance := some (⟨98⟩, ()) })]⟩ }
+
+theorem evalConstant_and_fnFromPtr_mr41 :
+    evalConstant constTestMach (.FnPointer (fnName 1)) =
+      .ok (.Ptr ⟨fnPtrAt 1 1, none⟩) ∧
+    evalConstant constTestMach (.GlobalPointer ⟨⟨⟨0⟩⟩, ⟨1⟩⟩) =
+      .ok (.Ptr ⟨{ addr := 33, provenance := some (⟨99⟩, ()) }, none⟩) ∧
+    evalConstant constTestMach (.VTablePointer ⟨⟨0⟩⟩) =
+      .ok (.Ptr ⟨{ addr := 48, provenance := some (⟨98⟩, ()) }, none⟩) ∧
+    evalConstant constTestMach (.PointerWithoutProvenance 4096) =
+      .ok (.Ptr ⟨{ addr := 4096, provenance := none }, none⟩) ∧
+    fnFromPtr constTestMach (.Ptr ⟨fnPtrAt 1 1, none⟩) = .ok calleePairFn ∧
+    fnFromPtr constTestMach (.Ptr ⟨fnPtrAt 1 1, some (.ElementCount 2)⟩) =
+      .error (.ub "invalid pointer for function lookup") ∧
+    fnFromPtr constTestMach (.Ptr ⟨{ addr := 999, provenance := none }, none⟩) =
+      .error (.ub "invalid pointer for function lookup") ∧
+    fnFromPtr constTestMach (.Int 0) =
+      .error (.ub "trying to look up a function based on a non-pointer value") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `checkAbiCompatibility` across `Int`, `Bool`, `Ptr`, `Tuple` (including
+unsized tuple `specPanic`), `Array`, `Union`, and `Enum` (`orderingTy`
+`Branch` `Discriminator`, variant mismatch, and tagger mismatch). -/
+def sampleUnionA : Gen.Type :=
+  .Union [(⟨0⟩, .Int u32), (⟨0⟩, .Bool)] [(⟨0⟩, ⟨4⟩)] ⟨4⟩ ⟨4⟩
+
+def sampleUnionBadChunks : Gen.Type :=
+  .Union [(⟨0⟩, .Int u32), (⟨0⟩, .Bool)] [(⟨0⟩, ⟨2⟩)] ⟨4⟩ ⟨4⟩
+
+def orderingBadTagger : Gen.Type :=
+  match orderingTy with
+  | .Enum ⟨(-1, v) :: rest⟩ dTy discr sz al =>
+    .Enum ⟨(-1, { v with tagger := ⟨[(⟨0⟩, (u8, 42))]⟩ }) :: rest⟩ dTy discr sz al
+  | t => t
+
+theorem checkAbiCompatibility_all_variants_mr41 :
+    checkAbiCompatibility (.Int u32) (.Int u32) = .ok true ∧
+    checkAbiCompatibility (.Int u32) (.Int i8) = .ok false ∧
+    checkAbiCompatibility .Bool .Bool = .ok true ∧
+    checkAbiCompatibility (.Ptr .FnPtr) (.Ptr (.Raw .None)) = .ok true ∧
+    checkAbiCompatibility (.Ptr .FnPtr) (.Ptr (.Raw .ElementCount)) = .ok false ∧
+    checkAbiCompatibility (intBoolTupleTy u32) (intBoolTupleTy u32) = .ok true ∧
+    checkAbiCompatibility (intBoolTupleTy u32) (intBoolTupleTy i8) = .ok false ∧
+    checkAbiCompatibility (.Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ (some (.Array (.Int u8) 0))) unitTy =
+      .error (.specPanic "wf ensures all arugments are sized") ∧
+    checkAbiCompatibility (.Array (.Int u32) 4) (.Array (.Int u32) 4) = .ok true ∧
+    checkAbiCompatibility (.Array (.Int u32) 4) (.Array (.Int u32) 5) = .ok false ∧
+    checkAbiCompatibility sampleUnionA sampleUnionA = .ok true ∧
+    checkAbiCompatibility sampleUnionA sampleUnionBadChunks = .ok false ∧
+    checkAbiCompatibility orderingTy orderingTy = .ok true ∧
+    checkAbiCompatibility orderingTy orderingBadTagger = .ok false ∧
+    checkAbiCompatibility orderingTy .Bool = .ok false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `createFrame` ABI-violation UB paths (calling convention mismatch, return
+type mismatch, argument count mismatch, and argument type mismatch). -/
+theorem createFrame_ub_mr41 :
+    createFrame callerCallee20MInit calleePairFn
+      (.BackToCaller (some (bbName 1)) none retPtr) .C (.Int u32) [] =
+      .error (.ub "call ABI violation: calling conventions are not the same") ∧
+    createFrame callerCallee20MInit calleePairFn
+      (.BackToCaller (some (bbName 1)) none retPtr) .Rust .Bool [] =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    createFrame callerCallee20MInit calleePairFn
+      (.BackToCaller (some (bbName 1)) none retPtr) .Rust (.Int u32) [] =
+      .error (.ub "call ABI violation: number of arguments does not agree") ∧
+    createFrame callerCallee20MInit calleePairFn
+      (.BackToCaller (some (bbName 1)) none retPtr) .Rust (.Int u32)
+      [(.Bool true, .Bool), (.Bool false, .Bool)] =
+      .error (.ub "call ABI violation: argument types are not compatible") :=
+  ⟨eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+def retNoNextBlockMach : Mach :=
+  let m := multiMachineWithCtx
+    { ctxWithFns callerFrame retAlloc 1 [128, 256] with nextBlock := bbName 7 }
+    emptyProg 1 idU32Callee
+    ((translateFn idU32Callee).getD callerFn)
+    [.init (.scalar ⟨11, 4⟩), .init (.scalar ⟨11, 4⟩)]
+    (bbName 0)
+  let t0 := m.threads[0]?.getD (thread1 ctx0 [])
+  let fTop := (t0.stack.getLast?.getD callerFrame)
+  { m with threads := [{ t0 with stack := [callerFrame,
+      { fTop with next_stmt := 1, stack_pop_action := .BackToCaller none none retPtr }] }] }
+
+def retBottomOfStackMach : Mach :=
+  let m := multiMachineWithCtx
+    (ctxWithFns callerFrame retAlloc 1 [128, 256])
+    emptyProg 1 idU32Callee
+    ((translateFn idU32Callee).getD callerFn)
+    [.init (.scalar ⟨11, 4⟩), .init (.scalar ⟨11, 4⟩)]
+    (bbName 0)
+  let t0 := m.threads[0]?.getD (thread1 ctx0 [])
+  let fTop := (t0.stack.getLast?.getD callerFrame)
+  { m with threads := [{ t0 with stack := [
+      { fTop with next_stmt := 1, stack_pop_action := .BottomOfStack }] }] }
+
+/-- `evalReturn` UB paths (`next_block = none` and `BottomOfStack` on thread `0`). -/
+theorem evalReturn_missingNextBlock_and_bottomOfStack_ub :
+    evalReturn retNoNextBlockMach =
+      .error (.ub "return from a function where caller did not specify next block") ∧
+    evalReturn retBottomOfStackMach =
+      .error (.ub "the start function must not return") :=
+  ⟨eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-! ### Pass `B3` hardening witnesses: `CallConv.c` (`extern "C"`), unsupported-ABI rejection,
+dead / uninitialized-tuple return-place counterexamples, and diamond call DAG -/
+
+/-- `extern "C"` single-parameter `u32 -> u32` ABI (`Layout.CallConv.c`). -/
+def fnAbiC1 : FnAbi :=
+  { (fnAbi 1) with conv := .c }
+
+/-- `extern "C"` callee `cAbiCallee(x: u32) -> u32 { x + 10 }`: exercises
+`translateCallConv .c = some .C` in both `translateFn` and `translateFnInProg`. -/
+def cAbiCallee : CapturedMir where
+  defPath := "witness::c_abi_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 1)) (constU32 10)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiC1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Rust-ABI caller invoking `extern "C"` `cAbiCallee` (`CallingConvention.C` on
+the `Terminator::Call` edge while the caller itself has `CallingConvention.Rust`). -/
+def cAbiCaller : CapturedMir where
+  defPath := "witness::c_abi_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::c_abi_callee")
+        [.move (local_ 1)] (local_ 0) (some 1) .unreachable),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem cAbiCallee_conv :
+    (translateFn cAbiCallee).map (·.calling_convention) = some .C ∧
+    (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCallee).map
+      (·.calling_convention) = some .C ∧
+    (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCaller).map
+      (·.calling_convention) = some .Rust :=
+  ⟨rfl, rfl, rfl⟩
+
+theorem cAbi_inFragment :
+    progInFragment cAbiCaller [cAbiCallee] = true := by decide
+
+def cAbiProg : Gen.Program :=
+  (translateProg cAbiCaller [cAbiCallee]).getD emptyProg
+
+def cAbiCallerFn : Gen.Function :=
+  (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCaller).getD callerFn
+
+theorem cAbi_translate :
+    translateProg cAbiCaller [cAbiCallee] = some cAbiProg := rfl
+
+theorem cAbiCaller_translateInProg :
+    translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCaller = some cAbiCallerFn := rfl
+
+theorem ctxCAbiCaller_ok : CtxOk cAbiCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [cAbiCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [cAbiCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [cAbiCaller] at hi
+  ret := by
+    intro d hd; simp [cAbiCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def cAbi32Args : List Value := [.scalar ⟨32, 4⟩]
+
+def cAbi32S0 : MachineState :=
+  initMachineStateWithCallees cAbiCaller cAbi32Args [cAbiCallee]
+
+def cAbi32MInit : Mach :=
+  multiMachineWithCtx ctxCallSpin cAbiProg 2 cAbiCaller cAbiCallerFn
+    cAbi32S0.frame.locals cAbiCallerFn.start
+
+theorem cAbi32_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees cAbiCaller cAbi32Args [cAbiCallee]) []
+      (.normal (.scalar ⟨42, 4⟩,
+        { cAbi32S0.memory with activeCallee := some cAbiCaller })) :=
+  runA_sound cAbiCaller 20 _ _ _ rfl
+
+theorem cAbi32_noUB :
+    MirNoUBTree (mirCallTreeWithCallees cAbiCaller cAbi32Args [cAbiCallee]) :=
+  runA_noUB cAbiCaller 20 _ _ _ rfl
+
+theorem cAbi32_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n cAbi32MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads = [thread1 ctxCallSpin
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret cAbi_inFragment cAbi_translate
+      cAbiCaller_translateInProg ctxCallSpin ctxCAbiCaller_ok
+      cAbi32Args (by decide) cAbi32MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      cAbi32_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [cAbiCaller] at hd; subst hd
+  simp [retPtr, ctxCallSpin, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallSpin, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem cAbi32_minirust_direct :
+    (Interp.steps 6 cAbi32MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) := by
+  decide +kernel
+
+/-- Rejection of unsupported calling conventions (`Layout.CallConv.rustIntrinsic`
+and `Layout.CallConv.other "sysv64"`): `translateCallConv = none`, so both
+single-function (`translateFn`, `inFragment`) and multi-function
+(`callTerminatorOk`, `translateProg`, `progInFragment`) checks reject them. -/
+def badCallConvCallee : CapturedMir :=
+  { idU32Callee with
+    defPath := "witness::bad_call_conv_callee",
+    fnAbi := { (fnAbi 1) with conv := .rustIntrinsic } }
+
+def badCallConvSysvBody : CapturedMir :=
+  { idU32Callee with
+    defPath := "witness::bad_sysv_body",
+    fnAbi := { (fnAbi 1) with conv := .other "sysv64" } }
+
+def badCallConvCaller : CapturedMir where
+  defPath := "witness::bad_call_conv_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::bad_call_conv_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem badCallConv_rejected :
+    translateCallConv .rustIntrinsic = none ∧
+    translateCallConv (.other "sysv64") = none ∧
+    translateFn badCallConvCallee = none ∧
+    inFragment badCallConvCallee = false ∧
+    translateFn badCallConvSysvBody = none ∧
+    inFragment badCallConvSysvBody = false ∧
+    callTerminatorOk [badCallConvCallee] badCallConvCaller 0
+      (mkTerm (.call (fnDefOp "witness::bad_call_conv_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_)) = false ∧
+    progInFragment badCallConvCaller [badCallConvCallee] = false ∧
+    translateProg badCallConvCaller [badCallConvCallee] = none :=
+  ⟨rfl, rfl, rfl, by decide, rfl, by decide, by decide, by decide, rfl⟩
+
+/-- Dead return place
+(`StorageLive(_2); StorageDead(_2); _2 = idU32Callee(copy _1)`):
+in MiniRust, `Terminator::Call` evaluates the return place `_2` and runs
+`prepare_for_inplace_passing` BEFORE argument evaluation or callee entry,
+faulting on step 4 (after `initBlock` `Goto(bb0)`, `StorageLive(_2)`, and
+`StorageDead(_2)`) with `"access to a dead local"` before `idU32Callee` is ever
+entered, whereas Anneal enters `idU32Callee` and faults only when `Return`
+writes the dead `_2`. Both semantics fault here, so this caller alone does not
+show that the check is necessary; `deadCallDestSpinCaller` replaces
+`idU32Callee` with a diverging callee, for which Anneal never faults.
+`callDestOk` requires `lv.contains dst` and rejects this caller. -/
+def deadCallDestCaller : CapturedMir where
+  defPath := "witness::dead_call_dest_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2), mkStmt (.storageDead 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 0)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem deadCallDest_rejected :
+    callDestOk deadCallDestCaller.localDecls (mustLiveBefore deadCallDestCaller 0 2)
+      (tupleInitBefore deadCallDestCaller 0 2) u32Decl (local_ 2) = false ∧
+    progInFragment deadCallDestCaller [idU32Callee] = false := by
+  decide
+
+def deadCallDestProg : Gen.Program :=
+  (translateProg deadCallDestCaller [idU32Callee]).getD emptyProg
+
+def deadCallDestFn : Gen.Function :=
+  (translateFnInProg (fnNameMap deadCallDestCaller [idU32Callee]) deadCallDestCaller).getD callerFn
+
+theorem deadCallDest_translate :
+    translateProg deadCallDestCaller [idU32Callee] = some deadCallDestProg := rfl
+
+def deadCallDestS0 : MachineState :=
+  initMachineStateWithCallees deadCallDestCaller [.scalar ⟨7, 4⟩] [idU32Callee]
+
+def deadCallDestMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin deadCallDestProg 2 deadCallDestCaller deadCallDestFn
+    deadCallDestS0.frame.locals deadCallDestFn.start
+
+theorem deadCallDest_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees deadCallDestCaller [.scalar ⟨7, 4⟩] [idU32Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound deadCallDestCaller 10 _ (by decide)
+
+theorem deadCallDest_minirust_ub_before_callee :
+    Interp.steps 4 deadCallDestMInit =
+      .error (.ub "access to a dead local") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- Counterexample 6 (`StorageLive(_2); _2.0 = negI8Callee(copy _1); _0 = copy (_2.0);
+StorageDead(_2); Return` where `_2 : (i8, bool)` is live but uninitialized):
+when `negI8Callee(5i8)` returns `-5i8`, Anneal's `writePlaceValue` faults with UB
+because projected field assignment into `.uninit` local `_2` is forbidden in
+Anneal's value-slot model (`uninitProjCallDest_anneal_ub`), whereas MiniRust's
+byte-level stack allocation writes `[-5i8]` to byte `0` of `_2` and returns
+`-5i8` (`251`) cleanly (`uninitProjCallDest_minirust_ret`)! Thus `ti.contains dst`
+(`tupleInitOk`) in `callDestOk` is strictly required for forward UB soundness. -/
+def uninitProjCallDestCaller : CapturedMir where
+  defPath := "witness::uninit_proj_call_dest_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl, i8BoolTupleDecl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::neg_i8_callee")
+        [.copy (local_ 1)] (field0I8 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (field0I8 2)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem uninitProjCallDest_rejected :
+    (mustLiveBefore uninitProjCallDestCaller 0 1).contains 2 = true ∧
+    (tupleInitBefore uninitProjCallDestCaller 0 1).contains 2 = false ∧
+    callDestOk uninitProjCallDestCaller.localDecls (mustLiveBefore uninitProjCallDestCaller 0 1)
+      (tupleInitBefore uninitProjCallDestCaller 0 1) i8Decl (field0I8 2) = false ∧
+    progInFragment uninitProjCallDestCaller [negI8Callee] = false := by
+  decide
+
+def uninitProjCallDestProg : Gen.Program :=
+  (translateProg uninitProjCallDestCaller [negI8Callee]).getD emptyProg
+
+def uninitProjCallDestFn : Gen.Function :=
+  (translateFnInProg (fnNameMap uninitProjCallDestCaller [negI8Callee])
+    uninitProjCallDestCaller).getD callerFnI8
+
+theorem uninitProjCallDest_translate :
+    translateProg uninitProjCallDestCaller [negI8Callee] = some uninitProjCallDestProg := rfl
+
+def uninitProjCallDestS0 : MachineState :=
+  initMachineStateWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]
+
+def uninitProjCallDestMInit : Mach :=
+  multiMachineWithCtx ctxCalleeDivZero uninitProjCallDestProg 2 uninitProjCallDestCaller
+    uninitProjCallDestFn uninitProjCallDestS0.frame.locals uninitProjCallDestFn.start
+
+theorem uninitProjCallDest_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound uninitProjCallDestCaller 15 _ (by decide)
+
+theorem uninitProjCallDest_minirust_ret :
+    (Interp.steps 9 uninitProjCallDestMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAllocI8 with data := scalarBytes i8 251 }, [1]) := by
+  decide +kernel
+
+/-- Diamond call-graph DAG (`diamondCallEntry -> diamondMidA -> cAbiCallee` and
+`diamondCallEntry -> diamondMidB -> cAbiCallee`) mixing `.Rust` (`diamondCallEntry`,
+`diamondMidA`) and `.C` (`diamondMidB`, `cAbiCallee`) calling conventions across
+shared leaf `cAbiCallee`. -/
+def diamondMidA : CapturedMir where
+  defPath := "witness::diamond_mid_a"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::c_abi_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def diamondMidB : CapturedMir where
+  defPath := "witness::diamond_mid_b"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.binaryOp .add (.copy (local_ 1)) (constU32 1)))],
+      terminator := mkTerm (.call (fnDefOp "witness::c_abi_callee")
+        [.move (local_ 2)] (local_ 0) (some 1) .terminate),
+      isCleanup := false },
+    { statements := [mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiC1
+  layouts := emptyLayoutTable
+  allocations := []
+
+def diamondCallEntry : CapturedMir where
+  defPath := "witness::diamond_call_entry"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2), mkStmt (.storageLive 3)],
+      terminator := mkTerm (.call (fnDefOp "witness::diamond_mid_a")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::diamond_mid_b")
+        [.move (local_ 1)] (local_ 3) (some 2) .unreachable),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.move (local_ 2)) (.move (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem diamondCall_inFragment :
+    progInFragment diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] = true := by
+  decide
+
+theorem diamondCall_maxStackLocals :
+    maxStackLocals diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] = some 9 := rfl
+
+def ctxDiamondCall : Ctx :=
+  ctxWithFns callerFrame retAlloc 4 [128, 256]
+
+theorem ctxDiamondCall_ok : CtxOk diamondCallEntry ctxDiamondCall where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [diamondCallEntry] at hd; subst hd; decide
+    | 1, _, hd => simp [diamondCallEntry] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [diamondCallEntry] at hi
+  ret := by
+    intro d hd; simp [diamondCallEntry] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def diamondCallProg : Gen.Program :=
+  (translateProg diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee]).getD emptyProg
+
+def diamondCallEntryFn : Gen.Function :=
+  (translateFnInProg (fnNameMap diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee])
+    diamondCallEntry).getD callerFn
+
+theorem diamondCall_translate :
+    translateProg diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee] =
+      some diamondCallProg := rfl
+
+theorem diamondCallEntry_translateInProg :
+    translateFnInProg (fnNameMap diamondCallEntry [diamondMidA, diamondMidB, cAbiCallee])
+      diamondCallEntry = some diamondCallEntryFn := rfl
+
+def diamondCall5Args : List Value := [.scalar ⟨5, 4⟩]
+
+def diamondCall5S0 : MachineState :=
+  initMachineStateWithCallees diamondCallEntry diamondCall5Args
+    [diamondMidA, diamondMidB, cAbiCallee]
+
+def diamondCall5MInit : Mach :=
+  multiMachineWithCtx ctxDiamondCall diamondCallProg 4 diamondCallEntry diamondCallEntryFn
+    diamondCall5S0.frame.locals diamondCallEntryFn.start
+
+theorem diamondCall5_anneal_ret :
+    ReachesRet
+      (mirCallTreeWithCallees diamondCallEntry diamondCall5Args
+        [diamondMidA, diamondMidB, cAbiCallee]) []
+      (.normal (.scalar ⟨31, 4⟩,
+        { diamondCall5S0.memory with activeCallee := some diamondCallEntry })) :=
+  runA_sound diamondCallEntry 35 _ _ _ rfl
+
+theorem diamondCall5_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees diamondCallEntry diamondCall5Args
+        [diamondMidA, diamondMidB, cAbiCallee]) :=
+  runA_noUB diamondCallEntry 35 _ _ _ rfl
+
+theorem diamondCall5_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n diamondCall5MInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 31 } ∧
+      m'.threads = [thread1 ctxDiamondCall
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret diamondCall_inFragment diamondCall_translate
+      diamondCallEntry_translateInProg ctxDiamondCall ctxDiamondCall_ok
+      diamondCall5Args (by decide) diamondCall5MInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+      diamondCall5_anneal_ret
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [diamondCallEntry] at hd; subst hd
+  simp [retPtr, ctxDiamondCall, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxDiamondCall, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem diamondCall5_minirust_direct :
+    (Interp.steps 24 diamondCall5MInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 31 }, [1]) := by
+  decide +kernel
+
+/-! ### Pass `A3` necessity witnesses for `progInFragment`'s call checks
+
+Each rejected caller below refutes the conclusion of a transfer theorem: either
+of `mirCallWithCallees_noUB` (Anneal's tree is `MirNoUBTree`, yet MiniRust stops
+with UB before any root return) or of `mirCallWithCallees_ub` (Anneal reaches
+UB, yet MiniRust never raises UB). So each conjunct of `progInFragment` that
+rejects it (`callDestOk`'s liveness, tuple-initialization, and return-type
+checks, `callArgsOk`'s parameter types, `callTerminatorOk`'s argument count and
+return-place and argument disjointness, root-only `move` call arguments, and
+`termReadsOk`) is necessary. `deadCallDestSpin_hyps` checks that every other
+hypothesis of `mirCallWithCallees_noUB` holds for `deadCallDestSpinCaller`. -/
+
+/-- `ReturnRel` pops MiniRust's active thread back to the single external caller
+frame, so it holds at none of the first `n` steps when every one of them leaves
+a stack whose length is not `1`. -/
+theorem no_returnRel_before {entry : CapturedMir} {ctx : Ctx} {mInit : Mach} {n : Nat}
+    (hdepth : (List.range n).all (fun k =>
+      (Interp.steps k mInit).toOption.map (fun m => m.threads.map (·.stack.length)) !=
+        some [1]) = true)
+    {k : Nat} {s' : MachineState} {v : Value} {mRet : Mach}
+    (hk : k < n) (hsteps : Interp.steps k mInit = .ok mRet) :
+    ¬ ReturnRel entry ctx s' v mRet := by
+  rintro ⟨_, _, _, _, _, _, _, _, hthr, _, _⟩
+  have hk' := List.all_eq_true.mp hdepth k (List.mem_range.mpr hk)
+  simp [hsteps, Except.toOption, hthr, thread1] at hk'
+
+/-- Whether an `Interp` result is a `Stop.ub`. -/
+def isUbStop {α : Type} : Interp α → Bool
+  | .error (.ub _) => true
+  | _ => false
+
+/-- Whether an `Interp` result is a stop other than `Stop.ub`. -/
+def isNonUbStop {α : Type} : Interp α → Bool
+  | .error (.ub _) => false
+  | .error _ => true
+  | .ok _ => false
+
+/-- If MiniRust raises no UB in its first `N` steps and stops with a non-UB
+error at step `N` (for instance a `specPanic` in the witnesses' external caller
+frame, whose `callerFn` has no blocks, right after the root return), it never
+raises UB: `Interp.steps` propagates an error unchanged. -/
+theorem never_ub_of_nonUb_stop {m : Mach} {N : Nat}
+    (hpre : (List.range N).all (fun k => !isUbStop (Interp.steps k m)) = true)
+    (hstop : isNonUbStop (Interp.steps N m) = true) :
+    ¬ ∃ (n : Nat) (msg : String), Interp.steps n m = .error (.ub msg) := by
+  rintro ⟨n, msg, h⟩
+  by_cases hn : n < N
+  · have hk := List.all_eq_true.mp hpre n (List.mem_range.mpr hn)
+    rw [h] at hk
+    simp [isUbStop] at hk
+  · obtain ⟨j, rfl⟩ : ∃ j, n = N + j := ⟨n - N, by omega⟩
+    cases hN : Interp.steps N m with
+    | ok mN => rw [hN] at hstop; simp [isNonUbStop] at hstop
+    | error e =>
+      rw [steps_add, hN, error_bind] at h
+      injection h with he
+      subst he
+      simp [hN, isNonUbStop] at hstop
+
+/-- `callDestArgAlias` (`_1 = idU32Callee(copy _1)`) refutes the conclusion of
+`mirCallWithCallees_noUB` (at `n = 2`): Anneal returns without UB, while
+MiniRust's `prepare_for_inplace_passing` uninitializes `_1` before the argument
+load. -/
+theorem callDestArgAlias_noUB :
+    MirNoUBTree (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) :=
+  runA_noUB callDestArgAlias 10 _ _ _ rfl
+
+theorem callDestArgAlias_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee]) ∧
+    Interp.steps 2 callDestArgAliasMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k callDestArgAliasMInit = .ok mRet ∧
+      ReturnRel callDestArgAlias ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callDestArgAlias [.scalar ⟨7, 4⟩] [idU32Callee])
+        tr (.normal (v, mem)) :=
+  ⟨callDestArgAlias_noUB, callDestArgAlias_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := callDestArgAliasMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- `callProjMoveReuse` (`_2 = idU32Callee(move (_1.0)); _0 = copy (_1.0)`)
+refutes the conclusion of `mirCallWithCallees_noUB` (at `n = 7`). -/
+theorem callProjMoveReuse_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]) :=
+  runA_noUB callProjMoveReuse 10 _ _ _ rfl
+
+theorem callProjMoveReuse_noUB_transfer_fails :
+    MirNoUBTree
+      (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee]) ∧
+    Interp.steps 7 callProjMoveReuseMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 7 ∧ Interp.steps k callProjMoveReuseMInit = .ok mRet ∧
+      ReturnRel callProjMoveReuse ctxCallerMain s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees callProjMoveReuse callProjMoveReuseArgs [idU32Callee])
+        tr (.normal (v, mem)) :=
+  ⟨callProjMoveReuse_noUB, callProjMoveReuse_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := callProjMoveReuseMInit) (n := 7) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- `uninitProjCallDestCaller` refutes the conclusion of
+`mirCallWithCallees_ub`: Anneal faults when `Return` writes `_2.0` into the
+uninitialized tuple `_2`, while MiniRust returns `-5i8` at step `9` and then
+stops with a `specPanic` in the external caller frame, never raising UB. -/
+theorem uninitProjCallDest_ub_transfer_fails :
+    (∃ tr u, Reaches
+      (mirCallTreeWithCallees uninitProjCallDestCaller [.scalar ⟨5, 1⟩] [negI8Callee]) tr u ∧
+      FaultNow u) ∧
+    ¬ ∃ (n : Nat) (msg : String), Interp.steps n uninitProjCallDestMInit = .error (.ub msg) :=
+  ⟨uninitProjCallDest_anneal_ub,
+    never_ub_of_nonUb_stop (N := 10) (by decide +kernel) (by decide +kernel)⟩
+
+/-- Diverging callee `fn spin_u32_callee(x: u32) -> u32 { loop {} }`. -/
+def spinU32Callee : CapturedMir where
+  defPath := "witness::spin_u32_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [{ statements := [], terminator := mkTerm (.goto 0), isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Live return place, diverging callee
+(`StorageLive(_2); _2 = spinU32Callee(copy _1); _0 = copy _2; StorageDead(_2)`):
+in `progInFragment`, and both semantics run forever without UB, MiniRust in
+lockstep with a 3-frame stack (`liveCallDestSpin_depth3_step20`). -/
+def liveCallDestSpinCaller : CapturedMir where
+  defPath := "witness::live_call_dest_spin_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::spin_u32_callee")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 2)))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem liveCallDestSpin_inFragment :
+    progInFragment liveCallDestSpinCaller [spinU32Callee] = true := by decide
+
+def liveCallDestSpinProg : Gen.Program :=
+  (translateProg liveCallDestSpinCaller [spinU32Callee]).getD emptyProg
+
+def liveCallDestSpinFn : Gen.Function :=
+  (translateFnInProg (fnNameMap liveCallDestSpinCaller [spinU32Callee])
+    liveCallDestSpinCaller).getD callerFn
+
+theorem liveCallDestSpin_translate :
+    translateProg liveCallDestSpinCaller [spinU32Callee] = some liveCallDestSpinProg := rfl
+
+theorem liveCallDestSpin_translateInProg :
+    translateFnInProg (fnNameMap liveCallDestSpinCaller [spinU32Callee]) liveCallDestSpinCaller =
+      some liveCallDestSpinFn := rfl
+
+def callDestSpinArgs : List Value := [.scalar ⟨7, 4⟩]
+
+def liveCallDestSpinS0 : MachineState :=
+  initMachineStateWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee]
+
+def liveCallDestSpinMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin liveCallDestSpinProg 2 liveCallDestSpinCaller
+    liveCallDestSpinFn liveCallDestSpinS0.frame.locals liveCallDestSpinFn.start
+
+theorem ctxLiveCallDestSpin_ok : CtxOk liveCallDestSpinCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [liveCallDestSpinCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [liveCallDestSpinCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [liveCallDestSpinCaller] at hi
+  ret := by
+    intro d hd; simp [liveCallDestSpinCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+private def nextLiveSpinState (s : MachineState) : MachineState :=
+  match stepMirFn liveCallDestSpinCaller s with
+  | .tau (.running s') => s'
+  | _ => s
+
+private def liveCallDestSpinS1 : MachineState := nextLiveSpinState liveCallDestSpinS0
+
+private def liveCallDestSpinS2 : MachineState := nextLiveSpinState liveCallDestSpinS1
+
+/-- Three-state silent-step invariant: `StorageLive(_2)`, the call, and the
+callee's `Goto(bb0)` self-loop. -/
+def LiveCallDestSpinInv (s : MachineState) : Prop :=
+  s = liveCallDestSpinS0 ∨ s = liveCallDestSpinS1 ∨ s = liveCallDestSpinS2
+
+private theorem liveCallDestSpin_step (s : MachineState) (h : LiveCallDestSpinInv s) :
+    ∃ s', stepMirFn liveCallDestSpinCaller s = .tau (.running s') ∧
+      LiveCallDestSpinInv s' := by
+  rcases h with rfl | rfl | rfl
+  · exact ⟨liveCallDestSpinS1, rfl, Or.inr (Or.inl rfl)⟩
+  · exact ⟨liveCallDestSpinS2, rfl, Or.inr (Or.inr rfl)⟩
+  · exact ⟨liveCallDestSpinS2, rfl, Or.inr (Or.inr rfl)⟩
+
+theorem liveCallDestSpin_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee]) :=
+  treeSafe_of_tau_inv liveCallDestSpin_step (Or.inl rfl)
+
+theorem liveCallDestSpin_noRet (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet
+      (mirCallTreeWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee]) tr o :=
+  noRet_of_tau_inv liveCallDestSpin_step (Or.inl rfl) tr o
+
+theorem liveCallDestSpin_minirust_diverges (n : Nat) :
+    ∃ m', Interp.steps n liveCallDestSpinMInit = .ok m' :=
+  mirCallWithCallees_diverges_steps_ok liveCallDestSpin_inFragment liveCallDestSpin_translate
+    liveCallDestSpin_translateInProg ctxCallSpin ctxLiveCallDestSpin_ok callDestSpinArgs
+    (by decide) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    liveCallDestSpin_noUB liveCallDestSpin_noRet n
+
+theorem liveCallDestSpin_minirust_diverges_rel (n : Nat) :
+    ∃ d s' m0 m' tr,
+      Interp.steps (initLen liveCallDestSpinCaller + n) liveCallDestSpinMInit = .ok m0 ∧
+      Interp.steps (initLen liveCallDestSpinCaller + n + d) liveCallDestSpinMInit = .ok m' ∧
+      MultiStateRel liveCallDestSpinCaller [spinU32Callee] liveCallDestSpinProg ctxCallSpin s' m' ∧
+      Reaches (mirCallTreeWithCallees liveCallDestSpinCaller callDestSpinArgs [spinU32Callee])
+        tr (mirTree liveCallDestSpinCaller s') :=
+  mirCallWithCallees_diverges_rel liveCallDestSpin_inFragment liveCallDestSpin_translate
+    liveCallDestSpin_translateInProg ctxCallSpin ctxLiveCallDestSpin_ok callDestSpinArgs
+    (by decide) liveCallDestSpinMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    liveCallDestSpin_noUB liveCallDestSpin_noRet n
+
+theorem liveCallDestSpin_depth3_step20 :
+    (Interp.steps 20 liveCallDestSpinMInit).toOption.map
+        (fun m => m.threads.map (·.stack.length)) = some [3] := by
+  decide +kernel
+
+/-- Necessity of `callDestOk`'s liveness check (`lv.contains dst`): the same
+caller as `liveCallDestSpinCaller` with one extra `StorageDead(_2)` before the
+call. Every other per-body check passes (`deadCallDestSpin_rejected`), and
+`livenessOk` itself holds (`liveAtEntry` is a valid post-fixed point that simply
+does not contain `_2` at the call), so only `callDestOk` rejects it. Anneal
+pushes `spinU32Callee` without inspecting `_2` and runs forever without UB,
+whereas MiniRust's `prepare_for_inplace_passing` faults on the dead `_2` at
+step 4 (`deadCallDestSpin_noUB_transfer_fails`). -/
+def deadCallDestSpinCaller : CapturedMir where
+  defPath := "witness::dead_call_dest_spin_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.storageLive 2), mkStmt (.storageDead 2)],
+      terminator := mkTerm (.call (fnDefOp "witness::spin_u32_callee")
+        [.copy (local_ 1)] (local_ 2) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 0)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem deadCallDestSpin_rejected :
+    (mustLiveBefore deadCallDestSpinCaller 0 2).contains 2 = false ∧
+    callDestOk deadCallDestSpinCaller.localDecls (mustLiveBefore deadCallDestSpinCaller 0 2)
+      (tupleInitBefore deadCallDestSpinCaller 0 2) u32Decl (local_ 2) = false ∧
+    movesOk deadCallDestSpinCaller = true ∧ mentionsOk deadCallDestSpinCaller = true ∧
+    storageDeadOk deadCallDestSpinCaller = true ∧ livenessOk deadCallDestSpinCaller = true ∧
+    tupleInitOk deadCallDestSpinCaller = true ∧
+    progInFragment deadCallDestSpinCaller [spinU32Callee] = false := by
+  decide
+
+def deadCallDestSpinProg : Gen.Program :=
+  (translateProg deadCallDestSpinCaller [spinU32Callee]).getD emptyProg
+
+def deadCallDestSpinFn : Gen.Function :=
+  (translateFnInProg (fnNameMap deadCallDestSpinCaller [spinU32Callee])
+    deadCallDestSpinCaller).getD callerFn
+
+def deadCallDestSpinS0 : MachineState :=
+  initMachineStateWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]
+
+def deadCallDestSpinMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin deadCallDestSpinProg 2 deadCallDestSpinCaller
+    deadCallDestSpinFn deadCallDestSpinS0.frame.locals deadCallDestSpinFn.start
+
+theorem ctxDeadCallDestSpin_ok : CtxOk deadCallDestSpinCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [deadCallDestSpinCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [deadCallDestSpinCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [deadCallDestSpinCaller] at hi
+  ret := by
+    intro d hd; simp [deadCallDestSpinCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+/-- Every hypothesis of `mirCallWithCallees_noUB` other than `hfrag` holds for
+`deadCallDestSpinCaller` (the remaining `hthreads`, `hactive`, and `hallocs`
+hold by `rfl` for `multiMachineWithCtx`). -/
+theorem deadCallDestSpin_hyps :
+    translateProg deadCallDestSpinCaller [spinU32Callee] = some deadCallDestSpinProg ∧
+    translateFnInProg (fnNameMap deadCallDestSpinCaller [spinU32Callee])
+      deadCallDestSpinCaller = some deadCallDestSpinFn ∧
+    CtxOk deadCallDestSpinCaller ctxCallSpin ∧
+    argsOk deadCallDestSpinCaller callDestSpinArgs = true ∧
+    ProgEnvOk deadCallDestSpinProg (fnNameMap deadCallDestSpinCaller [spinU32Callee])
+      deadCallDestSpinMInit :=
+  ⟨rfl, rfl, ctxDeadCallDestSpin_ok, by decide, progEnvOk_fnPtrMap rfl rfl (by decide)⟩
+
+private def nextDeadSpinState (s : MachineState) : MachineState :=
+  match stepMirFn deadCallDestSpinCaller s with
+  | .tau (.running s') => s'
+  | _ => s
+
+private def deadCallDestSpinS1 : MachineState := nextDeadSpinState deadCallDestSpinS0
+
+private def deadCallDestSpinS2 : MachineState := nextDeadSpinState deadCallDestSpinS1
+
+private def deadCallDestSpinS3 : MachineState := nextDeadSpinState deadCallDestSpinS2
+
+/-- Four-state silent-step invariant: `StorageLive(_2)`, `StorageDead(_2)`, the
+call (which Anneal performs without reading the dead `_2`), and the callee's
+`Goto(bb0)` self-loop. -/
+def DeadCallDestSpinInv (s : MachineState) : Prop :=
+  s = deadCallDestSpinS0 ∨ s = deadCallDestSpinS1 ∨ s = deadCallDestSpinS2 ∨
+    s = deadCallDestSpinS3
+
+private theorem deadCallDestSpin_step (s : MachineState) (h : DeadCallDestSpinInv s) :
+    ∃ s', stepMirFn deadCallDestSpinCaller s = .tau (.running s') ∧
+      DeadCallDestSpinInv s' := by
+  rcases h with rfl | rfl | rfl | rfl
+  · exact ⟨deadCallDestSpinS1, rfl, Or.inr (Or.inl rfl)⟩
+  · exact ⟨deadCallDestSpinS2, rfl, Or.inr (Or.inr (Or.inl rfl))⟩
+  · exact ⟨deadCallDestSpinS3, rfl, Or.inr (Or.inr (Or.inr rfl))⟩
+  · exact ⟨deadCallDestSpinS3, rfl, Or.inr (Or.inr (Or.inr rfl))⟩
+
+theorem deadCallDestSpin_noUB :
+    MirNoUBTree
+      (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]) :=
+  treeSafe_of_tau_inv deadCallDestSpin_step (Or.inl rfl)
+
+theorem deadCallDestSpin_noRet (tr : List (Event MirEffect)) (o : MirOutcome) :
+    ¬ ReachesRet
+      (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]) tr o :=
+  noRet_of_tau_inv deadCallDestSpin_step (Or.inl rfl) tr o
+
+theorem deadCallDestSpin_minirust_ub :
+    Interp.steps 4 deadCallDestSpinMInit = .error (.ub "access to a dead local") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (instantiated at `n = 4`) fails
+for `deadCallDestSpinCaller`, although its tree is `MirNoUBTree`. -/
+theorem deadCallDestSpin_noUB_transfer_fails :
+    MirNoUBTree
+      (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee]) ∧
+    Interp.steps 4 deadCallDestSpinMInit = .error (.ub "access to a dead local") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k deadCallDestSpinMInit = .ok mRet ∧
+      ReturnRel deadCallDestSpinCaller ctxCallSpin s' v mRet ∧
+      ReachesRet
+        (mirCallTreeWithCallees deadCallDestSpinCaller callDestSpinArgs [spinU32Callee])
+        tr (.normal (v, mem)) :=
+  ⟨deadCallDestSpin_noUB, deadCallDestSpin_minirust_ub,
+    fun ⟨_, _, _, tr, _, _, _, _, _, hret⟩ => deadCallDestSpin_noRet tr _ hret⟩
+
+/-- Identity callee `fn id_i8_callee(x: i8) -> i8 { x }`. -/
+def idI8Callee : CapturedMir where
+  defPath := "witness::id_i8_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, i8Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Necessity of `callArgsOk`'s parameter-type check: passing the `u32` local
+`_1` to `idI8Callee`'s `i8` parameter. Anneal's `initLocals` stores the argument
+value without consulting the parameter type, so the call returns `7` without
+UB, whereas MiniRust's `create_frame` finds
+`check_abi_compatibility(u32, i8) = false` and faults at step 2. -/
+def abiArgMismatchCaller : CapturedMir where
+  defPath := "witness::abi_arg_mismatch_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [i8Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::id_i8_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbiI8 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem abiArgMismatch_rejected :
+    callArgsOk abiArgMismatchCaller.layouts abiArgMismatchCaller.localDecls [i8Decl] [.copy (local_ 1)] = false ∧
+    progInFragment abiArgMismatchCaller [idI8Callee] = false := by
+  decide
+
+def abiArgMismatchProg : Gen.Program :=
+  (translateProg abiArgMismatchCaller [idI8Callee]).getD emptyProg
+
+def abiArgMismatchFn : Gen.Function :=
+  (translateFnInProg (fnNameMap abiArgMismatchCaller [idI8Callee])
+    abiArgMismatchCaller).getD callerFnI8
+
+theorem abiArgMismatch_translate :
+    translateProg abiArgMismatchCaller [idI8Callee] = some abiArgMismatchProg := rfl
+
+def abiArgMismatchArgs : List Value := [.scalar ⟨7, 4⟩]
+
+def abiArgMismatchS0 : MachineState :=
+  initMachineStateWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]
+
+def abiArgMismatchMInit : Mach :=
+  multiMachineWithCtx ctxCalleeDivZero abiArgMismatchProg 2 abiArgMismatchCaller
+    abiArgMismatchFn abiArgMismatchS0.frame.locals abiArgMismatchFn.start
+
+theorem abiArgMismatch_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) []
+      (.normal (.scalar ⟨7, 4⟩,
+        { abiArgMismatchS0.memory with activeCallee := some abiArgMismatchCaller })) :=
+  runA_sound abiArgMismatchCaller 10 _ _ _ rfl
+
+theorem abiArgMismatch_noUB :
+    MirNoUBTree (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) :=
+  runA_noUB abiArgMismatchCaller 10 _ _ _ rfl
+
+theorem abiArgMismatch_minirust_ub :
+    Interp.steps 2 abiArgMismatchMInit =
+      .error (.ub "call ABI violation: argument types are not compatible") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (at `n = 2`) fails for
+`abiArgMismatchCaller`: MiniRust's stack still has the entry frame at steps `0`
+and `1`, so no `ReturnRel` precedes the UB. -/
+theorem abiArgMismatch_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee]) ∧
+    Interp.steps 2 abiArgMismatchMInit =
+      .error (.ub "call ABI violation: argument types are not compatible") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k abiArgMismatchMInit = .ok mRet ∧
+      ReturnRel abiArgMismatchCaller ctxCalleeDivZero s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees abiArgMismatchCaller abiArgMismatchArgs [idI8Callee])
+        tr (.normal (v, mem)) :=
+  ⟨abiArgMismatch_noUB, abiArgMismatch_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := abiArgMismatchMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- Necessity of `callDestOk`'s return-type check: writing `idI8Callee`'s `i8`
+result into the `u32` return place `_0`. Anneal's `writePlaceValue` replaces the
+root slot without consulting its type, so the call returns `5` without UB,
+whereas MiniRust's `create_frame` finds `check_abi_compatibility(u32, i8) =
+false` for the return types and faults at step 2. -/
+def abiRetMismatchCaller : CapturedMir where
+  defPath := "witness::abi_ret_mismatch_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, i8Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::id_i8_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem abiRetMismatch_rejected :
+    callDestOk abiRetMismatchCaller.localDecls (mustLiveBefore abiRetMismatchCaller 0 0)
+      (tupleInitBefore abiRetMismatchCaller 0 0) i8Decl (local_ 0) = false ∧
+    progInFragment abiRetMismatchCaller [idI8Callee] = false := by
+  decide
+
+def abiRetMismatchProg : Gen.Program :=
+  (translateProg abiRetMismatchCaller [idI8Callee]).getD emptyProg
+
+def abiRetMismatchFn : Gen.Function :=
+  (translateFnInProg (fnNameMap abiRetMismatchCaller [idI8Callee])
+    abiRetMismatchCaller).getD callerFn
+
+theorem abiRetMismatch_translate :
+    translateProg abiRetMismatchCaller [idI8Callee] = some abiRetMismatchProg := rfl
+
+def abiRetMismatchArgs : List Value := [.scalar ⟨5, 1⟩]
+
+def abiRetMismatchS0 : MachineState :=
+  initMachineStateWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]
+
+def abiRetMismatchMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin abiRetMismatchProg 2 abiRetMismatchCaller
+    abiRetMismatchFn abiRetMismatchS0.frame.locals abiRetMismatchFn.start
+
+theorem abiRetMismatch_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) []
+      (.normal (.scalar ⟨5, 1⟩,
+        { abiRetMismatchS0.memory with activeCallee := some abiRetMismatchCaller })) :=
+  runA_sound abiRetMismatchCaller 10 _ _ _ rfl
+
+theorem abiRetMismatch_noUB :
+    MirNoUBTree (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) :=
+  runA_noUB abiRetMismatchCaller 10 _ _ _ rfl
+
+theorem abiRetMismatch_minirust_ub :
+    Interp.steps 2 abiRetMismatchMInit =
+      .error (.ub "call ABI violation: return types are not compatible") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (at `n = 2`) fails for
+`abiRetMismatchCaller`. -/
+theorem abiRetMismatch_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee]) ∧
+    Interp.steps 2 abiRetMismatchMInit =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k abiRetMismatchMInit = .ok mRet ∧
+      ReturnRel abiRetMismatchCaller ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees abiRetMismatchCaller abiRetMismatchArgs [idI8Callee])
+        tr (.normal (v, mem)) :=
+  ⟨abiRetMismatch_noUB, abiRetMismatch_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := abiRetMismatchMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-- Callee ignoring its parameter (`fn const5_callee(_x: u32) -> u32 { 5 }`). -/
+def const5Callee : CapturedMir where
+  defPath := "witness::const5_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [mkStmt (.assign (local_ 0) (.use (constU32 5)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Necessity of `callTerminatorOk`'s argument-count check: calling the unary
+`const5Callee` with no arguments. Anneal's `initLocals` leaves the missing
+parameter `_1` dead, which `const5Callee` never reads, so the call returns `5`
+without UB, whereas MiniRust's `create_frame` faults at step 2 because
+`func.args.len() != caller_args.len()`. -/
+def argCountMismatchCaller : CapturedMir where
+  defPath := "witness::arg_count_mismatch_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::const5_callee") [] (local_ 0) (some 1)
+        .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 0
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem argCountMismatch_rejected :
+    callTerminatorOk [const5Callee] argCountMismatchCaller 0
+      (mkTerm (.call (fnDefOp "witness::const5_callee") [] (local_ 0) (some 1) .continue_)) =
+      false ∧
+    progInFragment argCountMismatchCaller [const5Callee] = false := by
+  decide
+
+def argCountMismatchProg : Gen.Program :=
+  (translateProg argCountMismatchCaller [const5Callee]).getD emptyProg
+
+def argCountMismatchFn : Gen.Function :=
+  (translateFnInProg (fnNameMap argCountMismatchCaller [const5Callee])
+    argCountMismatchCaller).getD callerFn
+
+theorem argCountMismatch_translate :
+    translateProg argCountMismatchCaller [const5Callee] = some argCountMismatchProg := rfl
+
+def argCountMismatchS0 : MachineState :=
+  initMachineStateWithCallees argCountMismatchCaller [] [const5Callee]
+
+def argCountMismatchMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin argCountMismatchProg 2 argCountMismatchCaller
+    argCountMismatchFn argCountMismatchS0.frame.locals argCountMismatchFn.start
+
+theorem argCountMismatch_anneal_ret :
+    ReachesRet (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) []
+      (.normal (.scalar ⟨5, 4⟩,
+        { argCountMismatchS0.memory with activeCallee := some argCountMismatchCaller })) :=
+  runA_sound argCountMismatchCaller 10 _ _ _ rfl
+
+theorem argCountMismatch_noUB :
+    MirNoUBTree (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) :=
+  runA_noUB argCountMismatchCaller 10 _ _ _ rfl
+
+theorem argCountMismatch_minirust_ub :
+    Interp.steps 2 argCountMismatchMInit =
+      .error (.ub "call ABI violation: number of arguments does not agree") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+/-- The conclusion of `mirCallWithCallees_noUB` (at `n = 2`) fails for
+`argCountMismatchCaller`. -/
+theorem argCountMismatch_noUB_transfer_fails :
+    MirNoUBTree (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee]) ∧
+    Interp.steps 2 argCountMismatchMInit =
+      .error (.ub "call ABI violation: number of arguments does not agree") ∧
+    ¬ ∃ k s' mRet tr v mem, k < 2 ∧ Interp.steps k argCountMismatchMInit = .ok mRet ∧
+      ReturnRel argCountMismatchCaller ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees argCountMismatchCaller [] [const5Callee])
+        tr (.normal (v, mem)) :=
+  ⟨argCountMismatch_noUB, argCountMismatch_minirust_ub,
+    fun ⟨_, _, _, _, _, _, hk, hsteps, hret, _⟩ =>
+      no_returnRel_before (mInit := argCountMismatchMInit) (n := 2) (by decide +kernel)
+        hk hsteps hret⟩
+
+/-! ### Pre-call statement `move` passed as a call argument
+
+`stmtMoveThenCallArg`
+(`StorageLive(_2); _2 = move _1; _0 = idU32Callee(copy _1)`)
+disagrees in the forward direction: Anneal faults reading the moved-out `_1`,
+while MiniRust (whose statement `move` is a plain `Load`) passes the stale `7`
+and returns it, so `termReadsOk`'s `readsOk (dst :: mo) argOps` is necessary
+for `mirCallWithCallees_ub`. -/
+
+def stmtMoveThenCallArgProg : Gen.Program :=
+  (translateProg stmtMoveThenCallArg [idU32Callee]).getD emptyProg
+
+def stmtMoveThenCallArgFn : Gen.Function :=
+  (translateFnInProg (fnNameMap stmtMoveThenCallArg [idU32Callee])
+    stmtMoveThenCallArg).getD callerFn
+
+theorem stmtMoveThenCallArg_translate :
+    translateProg stmtMoveThenCallArg [idU32Callee] = some stmtMoveThenCallArgProg := rfl
+
+def stmtMoveThenCallArgArgs : List Value := [.scalar ⟨7, 4⟩]
+
+def stmtMoveThenCallArgS0 : MachineState :=
+  initMachineStateWithCallees stmtMoveThenCallArg stmtMoveThenCallArgArgs [idU32Callee]
+
+def stmtMoveThenCallArgMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin stmtMoveThenCallArgProg 2 stmtMoveThenCallArg
+    stmtMoveThenCallArgFn stmtMoveThenCallArgS0.frame.locals stmtMoveThenCallArgFn.start
+
+theorem stmtMoveThenCallArg_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees stmtMoveThenCallArg stmtMoveThenCallArgArgs [idU32Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound stmtMoveThenCallArg 10 _ (by decide)
+
+theorem stmtMoveThenCallArg_minirust_ret :
+    (Interp.steps 8 stmtMoveThenCallArgMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 7 }, [1]) := by
+  decide +kernel
+
+/-- The conclusion of `mirCallWithCallees_ub` fails for `stmtMoveThenCallArg`:
+Anneal reaches UB, but MiniRust returns `7` at step `8` and then stops with a
+`specPanic` in the external caller frame, never raising UB. -/
+theorem stmtMoveThenCallArg_ub_transfer_fails :
+    (∃ tr u, Reaches
+      (mirCallTreeWithCallees stmtMoveThenCallArg stmtMoveThenCallArgArgs [idU32Callee]) tr u ∧
+      FaultNow u) ∧
+    ¬ ∃ (n : Nat) (msg : String), Interp.steps n stmtMoveThenCallArgMInit = .error (.ub msg) :=
+  ⟨stmtMoveThenCallArg_anneal_ub,
+    never_ub_of_nonUb_stop (N := 9) (by decide +kernel) (by decide +kernel)⟩
+
+/-! ### Callee `Return` UB in a pushed frame (`StackPopAction::BackToCaller`) -/
+
+/-- Callee returning its uninitialized `_0`
+(`fn ret_uninit_callee(x: u32) -> u32` whose only block is `return`). -/
+def retUninitCallee : CapturedMir where
+  defPath := "witness::ret_uninit_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [{ statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Caller `_0 = retUninitCallee(copy _1)`: in `progInFragment`, and both
+semantics fault on the callee's `Return` (Anneal reads the `.uninit` `_0`;
+MiniRust's `typed_load` of the callee's `_0` decodes `Uninit` bytes) before
+`StackPopAction::BackToCaller` writes the caller's return place. -/
+def calleeRetUninitCaller : CapturedMir where
+  defPath := "witness::callee_ret_uninit_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl]
+  basicBlocks := [
+    { statements := [],
+      terminator := mkTerm (.call (fnDefOp "witness::ret_uninit_callee")
+        [.copy (local_ 1)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [], terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem calleeRetUninit_inFragment :
+    progInFragment calleeRetUninitCaller [retUninitCallee] = true := by decide
+
+def calleeRetUninitProg : Gen.Program :=
+  (translateProg calleeRetUninitCaller [retUninitCallee]).getD emptyProg
+
+def calleeRetUninitFn : Gen.Function :=
+  (translateFnInProg (fnNameMap calleeRetUninitCaller [retUninitCallee])
+    calleeRetUninitCaller).getD callerFn
+
+theorem calleeRetUninit_translate :
+    translateProg calleeRetUninitCaller [retUninitCallee] = some calleeRetUninitProg := rfl
+
+theorem calleeRetUninit_translateInProg :
+    translateFnInProg (fnNameMap calleeRetUninitCaller [retUninitCallee]) calleeRetUninitCaller =
+      some calleeRetUninitFn := rfl
+
+def calleeRetUninitArgs : List Value := [.scalar ⟨3, 4⟩]
+
+def calleeRetUninitMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin calleeRetUninitProg 2 calleeRetUninitCaller calleeRetUninitFn
+    (initMachineStateWithCallees calleeRetUninitCaller calleeRetUninitArgs
+      [retUninitCallee]).frame.locals
+    calleeRetUninitFn.start
+
+theorem ctxCalleeRetUninit_ok : CtxOk calleeRetUninitCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [calleeRetUninitCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [calleeRetUninitCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [calleeRetUninitCaller] at hi
+  ret := by
+    intro d hd; simp [calleeRetUninitCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem calleeRetUninit_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees calleeRetUninitCaller calleeRetUninitArgs [retUninitCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound calleeRetUninitCaller 10 _ (by decide)
+
+theorem calleeRetUninit_minirust_ub :
+    ∃ (n : Nat) (msg : String), Interp.steps n calleeRetUninitMInit = .error (.ub msg) := by
+  obtain ⟨tr, u, hr, hf⟩ := calleeRetUninit_anneal_ub
+  exact mirCallWithCallees_ub calleeRetUninit_inFragment calleeRetUninit_translate
+    calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
+    (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- The callee-`Return` fault is localized (`mirCallWithCallees_ub_rel`):
+MiniRust reaches in `n` steps a machine still `MultiStateRel`-related to Anneal,
+no intermediate step `k ≤ n` satisfies `ReturnRel`, and the very next step
+(`n + 1`) raises UB. -/
+theorem calleeRetUninit_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n calleeRetUninitMInit = .ok mLast ∧
+      MultiStateRel calleeRetUninitCaller [retUninitCallee] calleeRetUninitProg ctxCallSpin
+        sLast mLast ∧
+      (∀ s' v, ¬ ReturnRel calleeRetUninitCaller ctxCallSpin s' v mLast) ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) calleeRetUninitMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k calleeRetUninitMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := calleeRetUninit_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel calleeRetUninit_inFragment calleeRetUninit_translate
+      calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
+      (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, fun _ _ => hrel.not_returnRel, hstep, hsteps1, hno⟩
+
+theorem calleeRetUninit_minirust_direct :
+    Interp.steps 4 calleeRetUninitMInit =
+      .error (.ub "load at type but the data in memory violates the language invariant") :=
+  eq_error_ub_of_ubMsg? (by decide +kernel)
+
+theorem calleeRetUninit_converse_error :
+    (∃ msg,
+      Stop.ub "load at type but the data in memory violates the language invariant" = .ub msg ∧
+      ∃ tr u,
+        Reaches (mirCallTreeWithCallees calleeRetUninitCaller calleeRetUninitArgs
+          [retUninitCallee]) tr u ∧ FaultNow u) ∨
+    (∃ k s' mRet tr v mem, k < 4 ∧ Interp.steps k calleeRetUninitMInit = .ok mRet ∧
+      ReturnRel calleeRetUninitCaller ctxCallSpin s' v mRet ∧
+      ReachesRet (mirCallTreeWithCallees calleeRetUninitCaller calleeRetUninitArgs
+        [retUninitCallee]) tr (.normal (v, mem))) :=
+  mirCallWithCallees_steps_error calleeRetUninit_inFragment calleeRetUninit_translate
+    calleeRetUninit_translateInProg ctxCallSpin ctxCalleeRetUninit_ok calleeRetUninitArgs
+    (by decide) calleeRetUninitMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl
+    calleeRetUninit_minirust_direct
+
+/-! ### Pass `B4`: localized single-body and multi-function UB witnesses, and
+fixed-point convergence witnesses -/
+
+/-- Single-body localized UB from `f.start` (`mirCall_ub_rel`) on `retUninit`:
+MiniRust steps to a `StateRel`-related state `mLast` with `¬ ReturnRel` at every
+prefix step `k ≤ n`, and the next step (`n + 1`) raises UB. -/
+theorem retUninit_minirust_ub_rel_from_start :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n retUninitMInit = .ok mLast ∧
+      StateRel retUninit retUninitFn ctx0 sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) retUninitMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k retUninitMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := retUninit_anneal_ub
+  exact mirCall_ub_rel retUninit_inFragment retUninit_translate ctx0 (ctx0_ok1 rfl) []
+    (by decide) retUninitMInit rfl rfl rfl hr hf
+
+/-- Single-body localized UB from `f.start` (`run_ub_rel_from_start`) on
+`negMention` with input `0` (branching into `Terminator::Unreachable`). -/
+theorem negMention0_minirust_ub_rel_from_start :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n negMention0MInit = .ok mLast ∧
+      StateRel negMention negMentionFn ctx0 sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) negMention0MInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k negMention0MInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := negMention0_anneal_ub
+  exact run_ub_rel_from_start negMention_inFragment negMention_translate ctx0 negMention0S0
+    negMention0MInit negMention0_startRel hr hf
+
+/-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
+`calleeDivZeroCaller` faulting inside `divTenI8Callee`, with prefix-wide
+`¬ ReturnRel` across every intermediate step `k ≤ n`. -/
+theorem calleeDivZero_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n calleeDivZeroMInit = .ok mLast ∧
+      MultiStateRel calleeDivZeroCaller [divTenI8Callee] calleeDivZeroProg ctxCalleeDivZero
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) calleeDivZeroMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k calleeDivZeroMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := calleeDivZero_anneal_ub
+  exact mirCallWithCallees_ub_rel calleeDivZero_inFragment calleeDivZero_translate
+    calleeDivZeroCaller_translateInProg ctxCalleeDivZero ctxCalleeDivZero_ok calleeDivZeroArgs
+    (by decide) calleeDivZeroMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
+`callArgUbCaller` faulting during call-argument evaluation. -/
+theorem callArgUb_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n callArgUbMInit = .ok mLast ∧
+      MultiStateRel callArgUbCaller [idU32Callee] callArgUbProg ctxCallArgUb sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) callArgUbMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k callArgUbMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := callArgUb_anneal_ub
+  exact mirCallWithCallees_ub_rel callArgUb_inFragment callArgUb_translate
+    callArgUbCaller_translateInProg ctxCallArgUb ctxCallArgUb_ok [] (by decide)
+    callArgUbMInit (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- Multi-function localized UB (`mirCallWithCallees_ub_rel`) on
+`callMoveReuse` faulting in caller `bb1` after a completed callee return. -/
+theorem callMoveReuse_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n callMoveReuseMInit = .ok mLast ∧
+      MultiStateRel callMoveReuse [idU32Callee] callMoveReuseProg ctxCallSpin sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) callMoveReuseMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k callMoveReuseMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := callMoveReuse_anneal_ub
+  exact mirCallWithCallees_ub_rel callMoveReuse_inFragment callMoveReuse_translate
+    callMoveReuse_translateInProg ctxCallSpin ctxCallMoveReuse_ok
+    [.scalar ⟨7, 4⟩] (by decide) callMoveReuseMInit
+    (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+
+/-- Unconditional fixed-point stabilization of `iterLiveEntries` and
+`livenessOk_eq_true` on `projDestCaller` and `deadCallDestSpinCaller`. -/
+theorem projDestCaller_liveness_stabilizes :
+    (let fuel := projDestCaller.basicBlocks.length * (projDestCaller.localDecls.length + 1)
+     stepLiveEntries projDestCaller
+       (iterLiveEntries fuel projDestCaller (initLiveEntries projDestCaller)) =
+     iterLiveEntries fuel projDestCaller (initLiveEntries projDestCaller)) ∧
+    livenessOk projDestCaller = true ∧
+    (let fuel :=
+       deadCallDestSpinCaller.basicBlocks.length *
+         (deadCallDestSpinCaller.localDecls.length + 1)
+     stepLiveEntries deadCallDestSpinCaller
+       (iterLiveEntries fuel deadCallDestSpinCaller (initLiveEntries deadCallDestSpinCaller)) =
+     iterLiveEntries fuel deadCallDestSpinCaller (initLiveEntries deadCallDestSpinCaller)) ∧
+    livenessOk deadCallDestSpinCaller = true :=
+  ⟨iterLiveEntries_stabilizes (body := projDestCaller) (by decide),
+   livenessOk_eq_true (body := projDestCaller) (by decide),
+   iterLiveEntries_stabilizes (body := deadCallDestSpinCaller) (by decide),
+   livenessOk_eq_true (body := deadCallDestSpinCaller) (by decide)⟩
+
+/-- Unconditional fixed-point stabilization of `iterTupleInitEntries` and
+`tupleInitOk_eq_true` on `projDestCaller` and `uninitProjCallDestCaller`. -/
+theorem projDestCaller_tupleInit_stabilizes :
+    (let fuel := projDestCaller.basicBlocks.length * (projDestCaller.localDecls.length + 1)
+     stepTupleInitEntries projDestCaller
+       (iterTupleInitEntries fuel projDestCaller (initTupleEntries projDestCaller)) =
+     iterTupleInitEntries fuel projDestCaller (initTupleEntries projDestCaller)) ∧
+    tupleInitOk projDestCaller = true ∧
+    (let fuel :=
+       uninitProjCallDestCaller.basicBlocks.length *
+         (uninitProjCallDestCaller.localDecls.length + 1)
+     stepTupleInitEntries uninitProjCallDestCaller
+       (iterTupleInitEntries fuel uninitProjCallDestCaller
+         (initTupleEntries uninitProjCallDestCaller)) =
+     iterTupleInitEntries fuel uninitProjCallDestCaller
+       (initTupleEntries uninitProjCallDestCaller)) ∧
+    tupleInitOk uninitProjCallDestCaller = true :=
+  ⟨iterTupleInitEntries_stabilizes projDestCaller,
+   tupleInitOk_eq_true projDestCaller,
+   iterTupleInitEntries_stabilizes uninitProjCallDestCaller,
+   tupleInitOk_eq_true uninitProjCallDestCaller⟩
+
+/-- Greatest post-fixed-point optimality of `liveAtEntry` instantiated on
+`projDestCaller` (`[[0, 1], [0, 1], [0, 1, 2]]` is a post-fixed point). -/
+theorem projDestCaller_liveAtEntry_greatest {dst : Nat}
+    (hdst : dst < projDestCaller.basicBlocks.length) :
+    ∀ i ∈ ([[0, 1], [0, 1], [0, 1, 2]] : List (List Nat)).getD dst [],
+      i ∈ liveAtEntry projDestCaller dst :=
+  liveAtEntry_greatest
+    (by decide)
+    (fun d hd hne i hi => by
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert i hi
+      rcases (by omega : d = 1 ∨ d = 2) with rfl | rfl <;> decide)
+    (fun s d bb hbb hd ht i hi => by
+      have hs : s < 3 := by
+        have := (List.getElem?_eq_some_iff.mp hbb).1
+        simpa [projDestCaller] using this
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert bb hbb ht i hi
+      rcases (by omega : s = 0 ∨ s = 1 ∨ s = 2) with rfl | rfl | rfl <;>
+      rcases (by omega : d = 0 ∨ d = 1 ∨ d = 2) with rfl | rfl | rfl <;>
+      (intro bb hbb; simp [projDestCaller] at hbb; subst hbb; decide))
+    hdst
+
+/-- Greatest post-fixed-point optimality of `tupleInitAtEntry` instantiated on
+`projDestCaller` (`[[], [0], [0]]` is a post-fixed point). -/
+theorem projDestCaller_tupleInitAtEntry_greatest {dst : Nat}
+    (hdst : dst < projDestCaller.basicBlocks.length) :
+    ∀ i ∈ ([[], [0], [0]] : List (List Nat)).getD dst [],
+      i ∈ tupleInitAtEntry projDestCaller dst :=
+  tupleInitAtEntry_greatest
+    (by decide)
+    (fun d hd hne i hi => by
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert i hi
+      rcases (by omega : d = 1 ∨ d = 2) with rfl | rfl <;> decide)
+    (fun s d bb hbb hd ht i hi => by
+      have hs : s < 3 := by
+        have := (List.getElem?_eq_some_iff.mp hbb).1
+        simpa [projDestCaller] using this
+      have hd' : d < 3 := by simpa [projDestCaller] using hd
+      revert bb hbb ht i hi
+      rcases (by omega : s = 0 ∨ s = 1 ∨ s = 2) with rfl | rfl | rfl <;>
+      rcases (by omega : d = 0 ∨ d = 1 ∨ d = 2) with rfl | rfl | rfl <;>
+      (intro bb hbb; simp [projDestCaller] at hbb; subst hbb; decide))
+    hdst
+
+/-! ### `prog.start` versus the external caller -/
+
+/-- Whether an `Interp` result is a `Stop.unsupported`. -/
+def isUnsupportedStop {α : Type} : Interp α → Bool
+  | .error (.unsupported _) => true
+  | _ => false
+
+/-- The translation of the `extern "C"` callee `cAbiCallee`. -/
+def cAbiCalleeFn : Gen.Function :=
+  (translateFnInProg (fnNameMap cAbiCaller [cAbiCallee]) cAbiCallee).getD callerFn
+
+/-- The dangling, aligned pointer behind `build::unit_place()`. -/
+def unitPlacePtr : Ptr := { addr := 1, provenance := none }
+
+/-- Why the correspondence starts at `fEntry.start` under an external `rootCtx`
+rather than at `prog.start`. `mkStartFn`'s first block evaluates
+`build::unit_place()`, a `PlaceExpr::Deref` of the dangling raw pointer at
+address `1`; since `MR-4.2` transcribes `PlaceExpr::Deref`, this yields the
+aligned zero-sized place of type `unit_type()` without touching memory. But the
+`Terminator::Call` that block performs (Rust calling convention, no arguments, a
+`()` return place, as in `minimize`'s `mk_start_fn`) fails `create_frame` for
+an entry such as `callerMain`, which returns `u32`, and for any `extern "C"`
+entry such as `cAbiCallee`. `rootCtx` instead supplies the entry's arguments
+and a return place of its own type (`CtxOk`). -/
+theorem progStart_outside_fragment :
+    evalPlace callerCallee20MInit buildUnitPlace =
+      .ok (({ ptr := { thin_pointer := unitPlacePtr, metadata := none }, aligned := true },
+        unitTy), callerCallee20MInit) ∧
+    createFrame callerCallee20MInit callerMainFn
+      (.BackToCaller (some (bbName 1)) (some (bbName 2)) unitPlacePtr) .Rust unitTy [] =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    createFrame callerCallee20MInit cAbiCalleeFn
+      (.BackToCaller (some (bbName 1)) (some (bbName 2)) unitPlacePtr) .Rust unitTy [] =
+      .error (.ub "call ABI violation: calling conventions are not the same") :=
+  ⟨rfl, eq_error_ub_of_ubMsg? (by decide +kernel), eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-! ## `MR-4.2`: intrinsics
+
+Ground-truth checks of the transcribed `Machine::eval_intrinsic`
+(`evalIntrinsic`), `Terminator::Intrinsic` (`evalTerminator`), and
+`translateRsIntrinsic` (`tooling/minimize/src/bb.rs`) on concrete machines, plus
+end-to-end correspondence and dataflow necessity witnesses for `Assume`
+statements (`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`):
+`minimize` ends the current MiniRust block at every `Assume` in a
+`Terminator::Intrinsic` of `IntrinsicOp::Assume` whose next block is fresh
+(`translateStmtResult`, `splitStmts`), and `progInFragment` (`progStatementOk`)
+connects arbitrary multi-`Assume` block chains (`SegPc`, `SegChain`) to
+`mirCallWithCallees_ret` and `mirCallWithCallees_ub_rel`. -/
+
+/-! ### `Machine::eval_intrinsic` on a concrete machine -/
+
+/-- The integer of a `Value::Int`. -/
+def intOfVal? : Val → Option Int
+  | .Int i => some i
+  | _ => none
+
+/-- The Boolean of a `Value::Bool`. -/
+def boolOfVal? : Val → Option Bool
+  | .Bool b => some b
+  | _ => none
+
+/-- Whether an `Interp` result is `Stop.memoryLeak`. -/
+def isMemoryLeakStop {α : Type} : Interp α → Bool
+  | .error .memoryLeak => true
+  | _ => false
+
+/-- Whether an `Interp` result is `Stop.machineStop`. -/
+def isMachineStop {α : Type} : Interp α → Bool
+  | .error .machineStop => true
+  | _ => false
+
+/-- Whether a MiniRust value is `unit_value()` (`Value::Tuple(list![])`). -/
+def isUnitValue : Val → Bool
+  | .Tuple [] => true
+  | _ => false
+
+/-- `IntrinsicOp::Abort` throws `TerminationInfo::Abort`; `IntrinsicOp::Exit`
+runs the leak check, which passes on a machine without live `Heap`
+allocations, and then throws `TerminationInfo::MachineStop`. -/
+theorem evalIntrinsic_abort_exit :
+    evalIntrinsic callerCallee20MInit .Abort [] Interp.unitType = .error .abort ∧
+    evalIntrinsic callerCallee20MInit .Exit [] Interp.unitType = .error .machineStop :=
+  ⟨rfl, rfl⟩
+
+/-- `IntrinsicOp::Assume` returns `unit_value()` on `true` and raises each of
+its four UB checks: a violated condition, a non-Boolean argument, a wrong
+argument count, and a return type other than `unit_type()`. -/
+theorem evalIntrinsic_assume :
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool true, .Bool)] Interp.unitType =
+      .ok (Interp.unitValue, callerCallee20MInit) ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool false, .Bool)] Interp.unitType =
+      .error (.ub "`Assume` intrinsic called on condition that is violated") ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Int 1, .Int u8Ty)] Interp.unitType =
+      .error (.ub "invalid argument for `Assume` intrinsic: not a Boolean") ∧
+    evalIntrinsic callerCallee20MInit .Assume [] Interp.unitType =
+      .error (.ub "invalid number of arguments for `Assume` intrinsic") ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool true, .Bool), (.Bool true, .Bool)]
+        Interp.unitType =
+      .error (.ub "invalid number of arguments for `Assume` intrinsic") ∧
+    evalIntrinsic callerCallee20MInit .Assume [(.Bool true, .Bool)] .Bool =
+      .error (.ub "invalid return type for `Assume` intrinsic") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `IntrinsicOp::PrintStdout` and `IntrinsicOp::PrintStderr` append one line
+per integer or Boolean argument to their stream, reject any other value with
+UB, and check the `unit_type()` return type first. -/
+theorem evalIntrinsic_print :
+    (evalIntrinsic callerCallee20MInit .PrintStdout
+        [(.Int (-7), .Int i32W), (.Bool true, .Bool)] Interp.unitType).toOption.map
+        (fun r => (isUnitValue r.1, r.2.stdout.written, r.2.stderr.written)) =
+      some (true, ["-7\n", "true\n"], []) ∧
+    (evalIntrinsic callerCallee20MInit .PrintStderr [(.Int 42, .Int u32)]
+        Interp.unitType).toOption.map
+        (fun r => (r.2.stdout.written, r.2.stderr.written)) =
+      some ([], ["42\n"]) ∧
+    evalIntrinsic callerCallee20MInit .PrintStdout [(Interp.unitValue, Interp.unitType)]
+        Interp.unitType =
+      .error (.ub "unsupported value for printing") ∧
+    evalIntrinsic callerCallee20MInit .PrintStdout [] .Bool =
+      .error (.ub "invalid return type for `PrintStdout` intrinsic") := by
+  refine ⟨by decide +kernel, by decide +kernel, rfl, rfl⟩
+
+/-- `IntrinsicOp::RawEq` rejects non-pointer arguments, wrong argument counts,
+and non-`bool` return types with UB; `IntrinsicOp::PointerWithExposedProvenance`
+turns an integer into a thin raw pointer at that address (with no provenance,
+since nothing is exposed yet; `IntPtrCast::int2ptr`), while a non-integer
+argument is UB. -/
+theorem evalIntrinsic_rawEq_withExposed :
+    evalIntrinsic callerCallee20MInit .RawEq
+      [(.Int 1, .Int u8Ty), (.Int 1, .Int u8Ty)] .Bool =
+      .error (.ub "invalid first argument to `RawEq` intrinsic: not a pointer") ∧
+    evalIntrinsic callerCallee20MInit .RawEq [(.Int 1, .Int u8Ty)] .Bool =
+      .error (.ub "invalid number of arguments for `RawEq` intrinsic") ∧
+    evalIntrinsic callerCallee20MInit .RawEq [(.Int 1, .Int u8Ty), (.Int 1, .Int u8Ty)]
+        (.Int u8Ty) =
+      .error (.ub "invalid return type for `RawEq` intrinsic") ∧
+    (evalIntrinsic callerCallee20MInit .PointerWithExposedProvenance
+      [(.Int 64, .Int u64W)] (.Ptr (.Raw .None))).toOption.map (·.1) =
+      some (.Ptr ⟨⟨64, none⟩, none⟩) ∧
+    evalIntrinsic callerCallee20MInit .PointerWithExposedProvenance
+        [(.Bool true, .Bool)] (.Ptr (.Raw .None)) =
+      .error (.ub "invalid argument for `PointerWithExposedProvenance` intrinsic: not an integer") :=
+  ⟨eq_error_ub_of_ubMsg? (by decide +kernel), rfl, rfl, rfl, rfl⟩
+
+/-- Concrete machine with four 4-byte `Stack` allocations (`42u32`, `42u32`,
+`99u32`, and 4 `Uninit` bytes) for testing `IntrinsicOp::RawEq` and
+`Machine::load_raw_data`. -/
+def rawEqMach : Mach :=
+  { callerCallee20MInit with
+    mem := { memory := {
+      allocations := [
+        { data := scalarBytes u32 42, addr := 128, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+        { data := scalarBytes u32 42, addr := 256, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+        { data := scalarBytes u32 99, addr := 384, align := ⟨4⟩, kind := .Stack, live := true, extra := () },
+        { data := List.replicate 4 .Uninit, addr := 512, align := ⟨4⟩, kind := .Stack, live := true, extra := () }],
+      _phantom := {} }, accesses := [] } }
+
+def rawEqPtr (id : Nat) (addr : Int) : Val :=
+  .Ptr ⟨⟨addr, some (⟨id⟩, ())⟩, none⟩
+
+def sizedU32RefTy : Gen.Type := .Ptr (.Ref .Immutable sizedU32Pointee)
+
+/-- Full `IntrinsicOp::RawEq` semantics (`spec/lang/step/intrinsics.md`):
+compares initialized byte sequences of two sized references (`42u32 == 42u32` is
+`true`, `42u32 == 99u32` is `false`), raises UB when any byte is `Uninit`,
+raises UB when the two argument types differ (`typeEq`), and raises UB when the
+pointer type is `.Raw` rather than `.Ref`. -/
+theorem evalIntrinsic_rawEq :
+    (evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 1 256, sizedU32RefTy)] .Bool).toOption.bind
+        (fun r => boolOfVal? r.1) = some true ∧
+    (evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 2 384, sizedU32RefTy)] .Bool).toOption.bind
+        (fun r => boolOfVal? r.1) = some false ∧
+    evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 3 512, sizedU32RefTy)] .Bool =
+      .error (.ub "invalid argument to `RawEq` intrinsic: byte is uninitialized") ∧
+    evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, sizedU32RefTy), (rawEqPtr 1 256, .Ptr (.Raw .None))] .Bool =
+      .error (.ub "invalid arguments to `RawEq` intrinsic: types of arguments are not identical") ∧
+    evalIntrinsic rawEqMach .RawEq
+      [(rawEqPtr 0 128, .Ptr (.Raw .None)), (rawEqPtr 1 256, .Ptr (.Raw .None))] .Bool =
+      .error (.ub "invalid argument to `RawEq` intrinsic: not a reference") :=
+  ⟨by decide +kernel, by decide +kernel,
+   eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel),
+   eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-- `IntrinsicOp::Allocate`, `IntrinsicOp::Deallocate`, and `IntrinsicOp::Exit`
+(`ConcurrentMemory::leak_check`): allocating 4 `Heap` bytes and exiting without
+deallocating throws `Stop.memoryLeak`, whereas deallocating with matching size
+and alignment and then exiting throws `Stop.machineStop`; negative size,
+non-power-of-two alignment, and size mismatch on `Deallocate` raise UB. -/
+theorem evalIntrinsic_allocate_deallocate_leak :
+    isMemoryLeakStop (do
+      let (_, m1) ← evalIntrinsic callerCallee20MInit .Allocate
+        [(.Int 4, .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None))
+      evalIntrinsic m1 .Exit [] Interp.unitType) = true ∧
+    isMachineStop (do
+      let (p, m1) ← evalIntrinsic callerCallee20MInit .Allocate
+        [(.Int 4, .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None))
+      let (_, m2) ← evalIntrinsic m1 .Deallocate
+        [(p, .Ptr (.Raw .None)), (.Int 4, .Int u64W), (.Int 4, .Int u64W)] Interp.unitType
+      evalIntrinsic m2 .Exit [] Interp.unitType) = true ∧
+    evalIntrinsic callerCallee20MInit .Allocate
+      [(.Int (-1), .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None)) =
+      .error (.ub "invalid size for `Allocate` intrinsic: negative size") ∧
+    evalIntrinsic callerCallee20MInit .Allocate
+      [(.Int 4, .Int u64W), (.Int 3, .Int u64W)] (.Ptr (.Raw .None)) =
+      .error (.ub "invalid alignment for `Allocate` intrinsic: not a power of 2") ∧
+    (do
+      let (p, m1) ← evalIntrinsic callerCallee20MInit .Allocate
+        [(.Int 4, .Int u64W), (.Int 4, .Int u64W)] (.Ptr (.Raw .None))
+      evalIntrinsic m1 .Deallocate
+        [(p, .Ptr (.Raw .None)), (.Int 8, .Int u64W), (.Int 4, .Int u64W)] Interp.unitType) =
+      .error (.ub "deallocating with incorrect size information") :=
+  ⟨by decide +kernel, by decide +kernel, rfl, rfl, eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-- `IntrinsicOp::PointerExposeProvenance` returns the address of a thin
+pointer at `usize` and records its provenance as exposed. -/
+theorem evalIntrinsic_exposeProvenance :
+    (evalIntrinsic callerCallee20MInit .PointerExposeProvenance
+        [(.Ptr ⟨⟨128, some (⟨3⟩, ())⟩, none⟩, .Ptr (.Raw .None))] (.Int u64W)).toOption.map
+        (fun r => (intOfVal? r.1, r.2.intptrcast.exposed.elems.map (·.1._0))) =
+      some (some 128, [3]) ∧
+    evalIntrinsic callerCallee20MInit .PointerExposeProvenance
+        [(.Ptr ⟨⟨128, some (⟨3⟩, ())⟩, none⟩, .Ptr (.Raw .None))] (.Int u32) =
+      .error (.ub "invalid return type for `PointerExposeProvenance` intrinsic") :=
+  ⟨by decide +kernel, rfl⟩
+
+/-- `IntrinsicOp::GetUnwindPayload` on a thread with an empty payload stack is
+UB. -/
+theorem evalIntrinsic_getUnwindPayload_empty :
+    evalIntrinsic callerCallee20MInit .GetUnwindPayload [] (.Ptr (.Raw .None)) =
+      .error (.ub "GetUnwindPayload: the payload stack is empty") := rfl
+
+/-- The `Terminator::Intrinsic` that `build::abort()` produces stores nothing
+and throws `TerminationInfo::Abort`: `unit_place()` evaluates without touching
+memory, and `IntrinsicOp::Abort` never returns. -/
+theorem evalTerminator_abortTerminator :
+    evalTerminator callerCallee20MInit abortTerminator = .error .abort := rfl
+
+/-- `translateRsIntrinsic` (`tooling/minimize/src/bb.rs`) lowers `"raw_eq"` to
+`Terminator::Intrinsic(.RawEq, ...)`, `"ctpop"` to `UnOp::Int(.CountOnes)` +
+`Goto`, `"exact_div"` to `BinOp::Int(.DivExact)` + `Goto`, `"cold_path"` to a
+no-op `Goto`, `"abort"` to `build::abort()`, and rejects unmodeled fallback
+intrinsics (`"ctlz"`). -/
+theorem translateRsIntrinsic_witness :
+    translateRsIntrinsic decls .raw_eq [.copy (local_ 1), .copy (local_ 2)]
+        (local_ 0) (some 1) =
+      some ⟨[], .Intrinsic .RawEq
+        [.Load (.Local (localName 1)), .Load (.Local (localName 2))]
+        (.Local (localName 0)) (some (bbName 1))⟩ ∧
+    translateRsIntrinsic decls .ctpop [.copy (local_ 1)] (local_ 0) (some 1) =
+      some ⟨[.Assign (.Local (localName 0)) (buildCountOnes (.Load (.Local (localName 1))))],
+        .Goto (bbName 1)⟩ ∧
+    translateRsIntrinsic decls .exact_div [.copy (local_ 1), .copy (local_ 2)]
+        (local_ 0) (some 1) =
+      some ⟨[.Assign (.Local (localName 0))
+        (buildDivExact (.Load (.Local (localName 1))) (.Load (.Local (localName 2))))],
+        .Goto (bbName 1)⟩ ∧
+    translateRsIntrinsic decls .cold_path [] (local_ 0) (some 1) =
+      some ⟨[], .Goto (bbName 1)⟩ ∧
+    translateRsIntrinsic decls .abort [] (local_ 0) none =
+      some ⟨[], abortTerminator⟩ :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### `Assume` statements and `minimize`'s block splitting -/
+
+/-- MIR (`Runtime(PostCleanup)`) of
+```rust
+fn assume_sub(x: u32, b: bool) -> u32 {
+    unsafe { core::intrinsics::assume(b) }; // bb0: assume(copy _2)
+    let r = x.wrapping_sub(1);               //      _0 = Sub(copy _1, const 1_u32)
+    unsafe { core::intrinsics::assume(b) }; //      assume(copy _2)
+    r                                        //      return
+}
+```
+with `r` living in the return place. rustc's `LowerIntrinsics` MIR pass turns
+each `assume(b)` call into the statement
+`StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(copy _2))`. -/
+def assumeSub : CapturedMir where
+  defPath := "witness::assume_sub"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .sub (.copy (local_ 1)) (constU32 1))),
+        mkStmt (.intrinsic (.assume (.copy (local_ 2))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- The MiniRust function `minimize` produces for `assumeSub`: `translate_bb`
+ends `bb0` at each `Assume` in a `Terminator::Intrinsic` whose next block is a
+fresh name (`bbName 2`, then `bbName 3`, after `init_bb = bbName 1`), and the
+`return` lands in the block that is still open. -/
+def assumeSubFn : Gen.Function where
+  locals := ⟨[(localName 0, .Int u32), (localName 1, .Int u32), (localName 2, .Bool)]⟩
+  args := [localName 1, localName 2]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[], .Intrinsic .Assume [.Load (.Local (localName 2))] unitPlace
+      (some (bbName 2)), .Regular⟩),
+    (bbName 2, ⟨[
+      .Assign (.Local (localName 0))
+        (.BinOp (.Int .Sub) (.Load (.Local (localName 1))) (.Constant (.Int 1) (.Int u32)))],
+      .Intrinsic .Assume [.Load (.Local (localName 2))] unitPlace (some (bbName 3)), .Regular⟩),
+    (bbName 3, ⟨[], .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+def assumeSubProg : Gen.Program where
+  functions := ⟨[(fnName 0, assumeSubFn), (fnName 1, mkStartFn 0)]⟩
+  start := fnName 1
+  globals := ⟨[]⟩
+  vtables := ⟨[]⟩
+  traits := ⟨[]⟩
+
+theorem assumeSub_translate : translateProg assumeSub [] = some assumeSubProg := rfl
+
+theorem assumeSub_translateInProg :
+    translateFnInProg (fnNameMap assumeSub []) assumeSub = some assumeSubFn := rfl
+
+/-- `progInFragment` (`progStatementOk`) admits `Assume` statements and connects
+their split-block translation (`SegPc`, `SegChain`) to the multi-function
+correspondence theorems. -/
+theorem assumeSub_inFragment : progInFragment assumeSub [] = true := by decide
+
+def ctxAssumeSub : Ctx := ctxWithFns callerFrame retAlloc 1 [128, 256, 384]
+
+theorem ctxAssumeSub_ok : CtxOk assumeSub ctxAssumeSub where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeSub] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeSub] at hd; subst hd; decide
+    | 2, _, hd => simp [assumeSub] at hd; subst hd; decide
+    | _ + 3, hi, _ => simp [assumeSub] at hi
+  ret := by
+    intro d hd; simp [assumeSub] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def assumeSubArgs (x : Nat) (b : Bool) : List Value :=
+  [.scalar ⟨x, 4⟩, .scalar ⟨if b then 1 else 0, 1⟩]
+
+def assumeSubS0 (x : Nat) (b : Bool) : MachineState :=
+  initMachineStateWithCallees assumeSub (assumeSubArgs x b) []
+
+def assumeSubMInit (x : Nat) (b : Bool) : Mach :=
+  multiMachineWithCtx ctxAssumeSub assumeSubProg 1 assumeSub assumeSubFn
+    (assumeSubS0 x b).frame.locals assumeSubFn.start
+
+/-- `runA` returns the scalar `⟨bits, size⟩`. -/
+def runsToScalar (body : CapturedMir) (fuel : Nat) (s : MachineState) (bits size : Nat) : Bool :=
+  match runA body fuel s with
+  | some (_, .normal (.scalar sc, _)) => sc.bits == bits && sc.sizeBytes == size
+  | _ => false
+
+/-- A passing `runsToScalar` check is a UB-free return of `⟨bits, size⟩`
+(`runA_sound`, `runA_noUB`). -/
+theorem runsToScalar_sound {body : CapturedMir} {fuel : Nat} {s : MachineState}
+    {bits size : Nat} (h : runsToScalar body fuel s bits size = true) :
+    (∃ tr mem, ReachesRet (mirTree body s) tr (.normal (.scalar ⟨bits, size⟩, mem))) ∧
+      MirNoUBTree (mirTree body s) := by
+  unfold runsToScalar at h
+  split at h
+  · rename_i tr sc mem hrun
+    rw [Bool.and_eq_true, beq_iff_eq, beq_iff_eq] at h
+    obtain ⟨hb, hs⟩ := h
+    have hsc : sc = ⟨bits, size⟩ := by cases sc; simp_all
+    subst hsc
+    exact ⟨⟨tr, mem, runA_sound body fuel _ _ _ hrun⟩, runA_noUB body fuel _ _ _ hrun⟩
+  · exact absurd h Bool.false_ne_true
+
+/-- With `b = true`, Anneal's `assume_sub(20, true)` steps over both `Assume`
+statements and returns `19u32` without UB. -/
+theorem assumeSub20_anneal_ret :
+    (∃ tr mem, ReachesRet (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 true) []) tr
+      (.normal (.scalar ⟨19, 4⟩, mem))) ∧
+    MirNoUBTree (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 true) []) :=
+  runsToScalar_sound (fuel := 10) (by decide)
+
+/-- End-to-end correspondence transfer (`mirCallWithCallees_ret`) for
+`assume_sub(20, true)` across two `Assume` block splits in one MIR basic block. -/
+theorem assumeSub20_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeSubMInit 20 true) = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 19 } ∧
+      m'.threads = [thread1 ctxAssumeSub
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨⟨tr, mem, hanneal⟩, _⟩ := assumeSub20_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret assumeSub_inFragment assumeSub_translate
+      assumeSub_translateInProg ctxAssumeSub ctxAssumeSub_ok
+      (assumeSubArgs 20 true) (by decide) (assumeSubMInit 20 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assumeSub] at hd; subst hd
+  simp [retPtr, ctxAssumeSub, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxAssumeSub, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- MiniRust runs the translation of `assume_sub(20, true)` from `start` in
+`5` steps (the init block's `Goto`, the first `Terminator::Intrinsic`, the
+`Sub` assignment in `bbName 2`, the second `Terminator::Intrinsic`, and
+`Return`), writing the bytes of `19u32` into the caller's return place. -/
+theorem assumeSub20_minirust_direct :
+    (Interp.steps 5 (assumeSubMInit 20 true)).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 19 }, [1]) := by
+  decide +kernel
+
+/-- One Anneal step over the first `Assume` moves from MIR program point
+`(bb0, 1)`; the matching MiniRust step (after the init block) lands at the
+start of the fresh block `bbName 2`. -/
+theorem assumeSub20_split_point :
+    (match stepMirFn assumeSub (assumeSubS0 20 true) with
+      | .tau (.running s') => some (s'.frame.blockIdx, s'.frame.stmtIdx)
+      | _ => none) = some (0, 1) ∧
+    (Interp.steps 2 (assumeSubMInit 20 true)).toOption.map
+        (fun m => m.threads.map (fun t => t.stack.getLast?.map
+          (fun fr => (fr.next_block, fr.next_stmt)))) =
+      some [some (bbName 2, 0)] := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
+
+/-- With `b = false`, Anneal's `assume_sub(20, false)` faults (`FaultNow`), and
+`mirCallWithCallees_ub_rel` transfers that fault to MiniRust strictly before any
+root return. -/
+theorem assumeSubFalse_anneal_ub :
+    ∃ tr u, Reaches (mirCallTreeWithCallees assumeSub (assumeSubArgs 20 false) []) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeSub 5 _ (by decide)
+
+theorem assumeSubFalse_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeSubMInit 20 false) = .ok mLast ∧
+      MultiStateRel assumeSub [] assumeSubProg ctxAssumeSub sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeSubMInit 20 false) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeSubMInit 20 false) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeSubFalse_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeSub_inFragment assumeSub_translate
+      assumeSub_translateInProg ctxAssumeSub ctxAssumeSub_ok
+      (assumeSubArgs 20 false) (by decide) (assumeSubMInit 20 false)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- Direct confirmation on `b = false`: Anneal's first step is `MirStepNode.fail .ub`,
+and MiniRust's second step (the first `Terminator::Intrinsic`) throws the
+`Assume` UB of `eval_intrinsic`. -/
+theorem assumeSubFalse_ub :
+    stepMirFn assumeSub (assumeSubS0 20 false) = MirStepNode.fail .ub ∧
+    Interp.steps 2 (assumeSubMInit 20 false) =
+      .error (.ub "`Assume` intrinsic called on condition that is violated") :=
+  ⟨rfl, eq_error_ub_of_ubMsg? (by decide +kernel)⟩
+
+/-! ### Multi-frame `Assume` + tuple projection + `Call` (`assumeTupleCallCaller`)
+and `Assume` dataflow soundness / necessity witnesses -/
+
+/-- Multi-function caller exercising `Assume(move _3)` inside a split block
+before a `TerminatorKind.call` to `idU32Callee`, followed by a second split
+block on return (`bb1` containing `Assume(const true)`):
+```rust
+fn assume_tuple_call(x: u32) -> u32 {
+    let pair = AddWithOverflow(x, 5);   // bb0: StorageLive(_2); StorageLive(_3); _2 = AddWithOverflow(_1, 5)
+    let ok = !pair.1;                   //      _3 = Not(copy (_2.1))
+    unsafe { assume(move ok) };         //      assume(move _3)          [splits bb0 -> bbName 3]
+    StorageDead(_3);                    //      StorageDead(_3)
+    let r = id_u32_callee(pair.0);      //      _0 = Call(id_u32_callee, [copy (_2.0)]) -> bb1
+    unsafe { assume(true) };            // bb1: assume(const true)       [splits bb1 -> bbName 4]
+    StorageDead(_2);                    //      StorageDead(_2)
+    r                                   //      return
+}
+```
+-/
+def assumeTupleCallCaller : CapturedMir where
+  defPath := "witness::assume_tuple_call"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, u32BoolTupleDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 2) (.binaryOp .addWithOverflow (.copy (local_ 1)) (constU32 5))),
+        mkStmt (.assign (local_ 3) (.unaryOp .not (.copy (field1 2)))),
+        mkStmt (.intrinsic (.assume (.move (local_ 3)))),
+        mkStmt (.storageDead 3)],
+      terminator := mkTerm (.call (fnDefOp "witness::id_u32_callee")
+        [.copy (field0U32 2)] (local_ 0) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.intrinsic (.assume (.constant { ty := boolDecl.ty, val := .scalar (.int ⟨1, 1⟩) }))),
+        mkStmt (.storageDead 2)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeTupleCall_inFragment :
+    progInFragment assumeTupleCallCaller [idU32Callee] = true := by decide
+
+def assumeTupleCallProg : Gen.Program :=
+  (translateProg assumeTupleCallCaller [idU32Callee]).getD emptyProg
+
+def assumeTupleCallFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeTupleCallCaller [idU32Callee])
+    assumeTupleCallCaller).getD callerFn
+
+theorem assumeTupleCall_translate :
+    translateProg assumeTupleCallCaller [idU32Callee] = some assumeTupleCallProg := rfl
+
+theorem assumeTupleCall_translateInProg :
+    translateFnInProg (fnNameMap assumeTupleCallCaller [idU32Callee]) assumeTupleCallCaller =
+      some assumeTupleCallFn := rfl
+
+theorem ctxAssumeTupleCall_ok : CtxOk assumeTupleCallCaller ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeTupleCallCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeTupleCallCaller] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [assumeTupleCallCaller] at hi
+  ret := by
+    intro d hd; simp [assumeTupleCallCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def assumeTupleCallMInit (x : Nat) : Mach :=
+  multiMachineWithCtx ctxCallSpin assumeTupleCallProg 2 assumeTupleCallCaller assumeTupleCallFn
+    (initMachineStateWithCallees assumeTupleCallCaller [.scalar ⟨x, 4⟩] [idU32Callee]).frame.locals
+    assumeTupleCallFn.start
+
+theorem assumeTupleCall10_anneal_ret :
+    (∃ tr mem, ReachesRet (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨10, 4⟩] [idU32Callee]) tr
+      (.normal (.scalar ⟨15, 4⟩, mem))) ∧
+    MirNoUBTree (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨10, 4⟩] [idU32Callee]) :=
+  runsToScalar_sound (fuel := 15) (by decide)
+
+theorem assumeTupleCall10_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeTupleCallMInit 10) = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 15 } ∧
+      m'.threads = [thread1 ctxCallSpin
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨⟨tr, mem, hanneal⟩, _⟩ := assumeTupleCall10_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret assumeTupleCall_inFragment assumeTupleCall_translate
+      assumeTupleCall_translateInProg ctxCallSpin ctxAssumeTupleCall_ok
+      [.scalar ⟨10, 4⟩] (by decide) (assumeTupleCallMInit 10)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assumeTupleCallCaller] at hd; subst hd
+  simp [retPtr, ctxCallSpin, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallSpin, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem assumeTupleCallOv_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeTupleCallCaller [.scalar ⟨4294967295, 4⟩] [idU32Callee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeTupleCallCaller 10 _ (by decide)
+
+theorem assumeTupleCallOv_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeTupleCallMInit 4294967295) = .ok mLast ∧
+      MultiStateRel assumeTupleCallCaller [idU32Callee] assumeTupleCallProg ctxCallSpin sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeTupleCallMInit 4294967295) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeTupleCallMInit 4294967295) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeTupleCallOv_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeTupleCall_inFragment assumeTupleCall_translate
+      assumeTupleCall_translateInProg ctxCallSpin ctxAssumeTupleCall_ok
+      [.scalar ⟨4294967295, 4⟩] (by decide) (assumeTupleCallMInit 4294967295)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+ 
+
+/-! ## Multi-frame `Assume` chains & `funcCfgWf`/`progWf` (`assumeMultiFrameCaller`) -/
+
+/-- Callee with two distinct `Assume` statements (`x > 0` and `x < 10`) whose
+`StorageLive`/`StorageDead` scopes straddle both `Assume` basic-block splits,
+splitting `bb0` into three MiniRust basic blocks before returning `x + 1`. -/
+def assumeChainCallee : CapturedMir where
+  defPath := "witness::assume_chain_callee"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.assign (local_ 2) (.binaryOp .gt (.copy (local_ 1)) (constU32 0))),
+        mkStmt (.intrinsic (.assume (.move (local_ 2)))),
+        mkStmt (.storageDead 2),
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.binaryOp .lt (.copy (local_ 1)) (constU32 10))),
+        mkStmt (.intrinsic (.assume (.move (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.assign (local_ 0) (.binaryOp .add (.copy (local_ 1)) (constU32 1)))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Caller exercising `Assume` before `TerminatorKind.call`, a multi-split
+callee frame (`assumeChainCallee`), and `Assume` in the post-call continuation
+block `bb1` before returning `(x + 1) * 2`. -/
+def assumeMultiFrameCaller : CapturedMir where
+  defPath := "witness::assume_multi_frame_caller"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl, u32Decl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.binaryOp .lt (.copy (local_ 1)) (constU32 100))),
+        mkStmt (.intrinsic (.assume (.move (local_ 3)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.storageLive 4)],
+      terminator := mkTerm (.call (fnDefOp "witness::assume_chain_callee")
+        [.copy (local_ 1)] (local_ 4) (some 1) .continue_),
+      isCleanup := false },
+    { statements := [
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.binaryOp .mul (.move (local_ 4)) (constU32 2))),
+        mkStmt (.storageDead 4)],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeMultiFrame_inFragment :
+    progInFragment assumeMultiFrameCaller [assumeChainCallee] = true := by decide
+
+def assumeMultiFrameProg : Gen.Program :=
+  (translateProg assumeMultiFrameCaller [assumeChainCallee]).getD emptyProg
+
+def assumeMultiFrameFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+    assumeMultiFrameCaller).getD callerFn
+
+def assumeChainCalleeFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+    assumeChainCallee).getD callerFn
+
+theorem assumeMultiFrame_translate :
+    translateProg assumeMultiFrameCaller [assumeChainCallee] = some assumeMultiFrameProg := rfl
+
+theorem assumeMultiFrame_translateInProg :
+    translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+      assumeMultiFrameCaller = some assumeMultiFrameFn := rfl
+
+theorem assumeChainCallee_translateInProg :
+    translateFnInProg (fnNameMap assumeMultiFrameCaller [assumeChainCallee])
+      assumeChainCallee = some assumeChainCalleeFn := rfl
+
+theorem assumeMultiFrame_prog_wf :
+    progWf assumeMultiFrameProg = true :=
+  translateProg_progWf assumeMultiFrame_inFragment assumeMultiFrame_translate
+
+theorem assumeMultiFrame_func_wf_caller :
+    funcCfgWf assumeMultiFrameFn = true :=
+  translateFnInProg_funcCfgWf (callees := [assumeChainCallee])
+    (by decide) assumeMultiFrame_translateInProg
+
+theorem assumeMultiFrame_func_wf_callee :
+    funcCfgWf assumeChainCalleeFn = true :=
+  translateFnInProg_funcCfgWf (callees := [assumeChainCallee])
+    (by decide) assumeChainCallee_translateInProg
+
+theorem ctxAssumeMultiFrame_ok : CtxOk assumeMultiFrameCaller ctxCallerMain where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeMultiFrameCaller] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeMultiFrameCaller] at hd; subst hd; decide
+    | 2, _, hd => simp [assumeMultiFrameCaller] at hd; subst hd; decide
+    | _ + 3, hi, _ => simp [assumeMultiFrameCaller] at hi
+  ret := by
+    intro d hd; simp [assumeMultiFrameCaller] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def assumeMultiFrameArgs (x : Nat) (postOk : Bool) : List Value :=
+  [.scalar ⟨x, 4⟩, .scalar ⟨if postOk then 1 else 0, 1⟩]
+
+def assumeMultiFrameMInit (x : Nat) (postOk : Bool) : Mach :=
+  multiMachineWithCtx ctxCallerMain assumeMultiFrameProg 2 assumeMultiFrameCaller assumeMultiFrameFn
+    (initMachineStateWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs x postOk)
+      [assumeChainCallee]).frame.locals
+    assumeMultiFrameFn.start
+
+/-- `(5, true)` passes pre-call `Assume(5 < 100)`, both split-block `Assume`s in
+`assumeChainCallee` (`5 > 0`, `5 < 10`), and post-call `Assume(true)`, returning
+`(5 + 1) * 2 = 12u32`. -/
+theorem assumeMultiFrame5_anneal_ret :
+    (∃ tr mem, ReachesRet
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 true)
+        [assumeChainCallee]) tr (.normal (.scalar ⟨12, 4⟩, mem))) ∧
+    MirNoUBTree
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 true)
+        [assumeChainCallee]) :=
+  runsToScalar_sound (fuel := 25) (by decide)
+
+theorem assumeMultiFrame5_minirust_ret :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n (assumeMultiFrameMInit 5 true) = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 12 } ∧
+      m'.threads = [thread1 ctxCallerMain
+        [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨⟨tr, mem, hanneal⟩, _⟩ := assumeMultiFrame5_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCallWithCallees_ret assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 5 true) (by decide) (assumeMultiFrameMInit 5 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hanneal
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [assumeMultiFrameCaller] at hd; subst hd
+  simp [retPtr, ctxCallerMain, ctxWithFns] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctxCallerMain, ctxWithFns] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+/-- `(100, true)` raises UB in the caller's pre-call `Assume(100 < 100)` before
+entering `assumeChainCallee`. -/
+theorem assumeMultiFramePreUb_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 100 true)
+        [assumeChainCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeMultiFrameCaller 10 _ (by decide)
+
+theorem assumeMultiFramePreUb_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeMultiFrameMInit 100 true) = .ok mLast ∧
+      MultiStateRel assumeMultiFrameCaller [assumeChainCallee] assumeMultiFrameProg ctxCallerMain
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeMultiFrameMInit 100 true) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeMultiFrameMInit 100 true) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeMultiFramePreUb_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 100 true) (by decide) (assumeMultiFrameMInit 100 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- `(10, true)` passes the caller's pre-call `Assume` and the callee's first
+`Assume(10 > 0)`, then raises UB at the callee's second `Assume(10 < 10)` in the
+split continuation block while the caller's frame is suspended on the stack. -/
+theorem assumeMultiFrameCalleeSeg2Ub_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 10 true)
+        [assumeChainCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeMultiFrameCaller 20 _ (by decide)
+
+theorem assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeMultiFrameMInit 10 true) = .ok mLast ∧
+      MultiStateRel assumeMultiFrameCaller [assumeChainCallee] assumeMultiFrameProg ctxCallerMain
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeMultiFrameMInit 10 true) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeMultiFrameMInit 10 true) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeMultiFrameCalleeSeg2Ub_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 10 true) (by decide) (assumeMultiFrameMInit 10 true)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- `(5, false)` completes `assumeChainCallee(5) == 6` across all three callee
+segments and raises UB at the caller's post-call `Assume(false)` in `bb1`. -/
+theorem assumeMultiFramePostUb_anneal_ub :
+    ∃ tr u, Reaches
+      (mirCallTreeWithCallees assumeMultiFrameCaller (assumeMultiFrameArgs 5 false)
+        [assumeChainCallee]) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeMultiFrameCaller 25 _ (by decide)
+
+theorem assumeMultiFramePostUb_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n (assumeMultiFrameMInit 5 false) = .ok mLast ∧
+      MultiStateRel assumeMultiFrameCaller [assumeChainCallee] assumeMultiFrameProg ctxCallerMain
+        sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) (assumeMultiFrameMInit 5 false) = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k (assumeMultiFrameMInit 5 false) = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeMultiFramePostUb_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeMultiFrame_inFragment assumeMultiFrame_translate
+      assumeMultiFrame_translateInProg ctxCallerMain ctxAssumeMultiFrame_ok
+      (assumeMultiFrameArgs 5 false) (by decide) (assumeMultiFrameMInit 5 false)
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- Necessity witness for `livenessOk` on `StatementKind.intrinsic (.assume op)`:
+reading a local after `StorageDead(_2)` raises UB in both Anneal (`evalOperand`
+sees `.dead`) and MiniRust (`evalPlace` dereferences a deallocated local). Note
+that `livenessOk` permits reading a `StorageDead` local so long as its allocation
+is still dead on all incoming paths, and both semantics step in lockstep to UB. -/
+def assumeDeadLocal : CapturedMir where
+  defPath := "witness::assume_dead_local"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 1
+  localDecls := [u32Decl, u32Decl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 2),
+        mkStmt (.storageDead 2),
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 1
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeDeadLocal_inFragment : progInFragment assumeDeadLocal [] = true := by decide
+
+def assumeDeadLocalProg : Gen.Program := (translateProg assumeDeadLocal []).getD emptyProg
+
+def assumeDeadLocalFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeDeadLocal []) assumeDeadLocal).getD callerFn
+
+theorem assumeDeadLocal_translate : translateProg assumeDeadLocal [] = some assumeDeadLocalProg := rfl
+
+theorem assumeDeadLocal_translateInProg :
+    translateFnInProg (fnNameMap assumeDeadLocal []) assumeDeadLocal = some assumeDeadLocalFn := rfl
+
+theorem ctxAssumeDeadLocal_ok : CtxOk assumeDeadLocal ctxCallSpin where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    match i, hi, hd with
+    | 0, _, hd => simp [assumeDeadLocal] at hd; subst hd; decide
+    | 1, _, hd => simp [assumeDeadLocal] at hd; subst hd; decide
+    | _ + 2, hi, _ => simp [assumeDeadLocal] at hi
+  ret := by
+    intro d hd; simp [assumeDeadLocal] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+def assumeDeadLocalMInit : Mach :=
+  multiMachineWithCtx ctxCallSpin assumeDeadLocalProg 1 assumeDeadLocal assumeDeadLocalFn
+    (initMachineStateWithCallees assumeDeadLocal [.scalar ⟨7, 4⟩] []).frame.locals
+    assumeDeadLocalFn.start
+
+theorem assumeDeadLocal_anneal_ub :
+    ∃ tr u, Reaches (mirCallTreeWithCallees assumeDeadLocal [.scalar ⟨7, 4⟩] []) tr u ∧
+      FaultNow u :=
+  faultsA_sound assumeDeadLocal 6 _ (by decide)
+
+theorem assumeDeadLocal_minirust_ub_rel :
+    ∃ (n : Nat) (sLast : MachineState) (mLast : Mach) (msg : String),
+      Interp.steps n assumeDeadLocalMInit = .ok mLast ∧
+      MultiStateRel assumeDeadLocal [] assumeDeadLocalProg ctxCallSpin sLast mLast ∧
+      Interp.step mLast = .error (.ub msg) ∧
+      Interp.steps (n + 1) assumeDeadLocalMInit = .error (.ub msg) ∧
+      (∀ k ≤ n, ∀ mk, Interp.steps k assumeDeadLocalMInit = .ok mk →
+        ∀ b' c' s' v, ¬ ReturnRel b' c' s' v mk) := by
+  obtain ⟨tr, u, hr, hf⟩ := assumeDeadLocal_anneal_ub
+  obtain ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩ :=
+    mirCallWithCallees_ub_rel assumeDeadLocal_inFragment assumeDeadLocal_translate
+      assumeDeadLocal_translateInProg ctxCallSpin ctxAssumeDeadLocal_ok
+      [.scalar ⟨7, 4⟩] (by decide) assumeDeadLocalMInit
+      (progEnvOk_fnPtrMap rfl rfl (by decide)) rfl rfl rfl hr hf
+  exact ⟨n, sLast, mLast, msg, hsteps, hrel, hstep, hsteps1, hno⟩
+
+/-- Necessity of `stmtMoved` on `Assume` (`Assume(move _2); _0 = copy _1; _3 = copy _2`):
+Anneal's `evalOperand` moves out of `_2` on `Assume(move _2)`, so reading `_2`
+afterwards faults with UB, whereas MiniRust's `ValueExpr::Load` in
+`Terminator::Intrinsic` leaves `_2`'s bytes initialized and returns `7u32`.
+`movesOk` (and `progInFragment`) must therefore record `moveOut mo op` on
+`StatementKind.intrinsic (.assume op)`. -/
+def assumeMoveReuse : CapturedMir where
+  defPath := "witness::assume_move_reuse"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.intrinsic (.assume (.move (local_ 2)))),
+        mkStmt (.assign (local_ 3) (.use (.copy (local_ 2)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeMoveReuse_rejected :
+    movesOk assumeMoveReuse = false ∧ progInFragment assumeMoveReuse [] = false :=
+  ⟨by decide, by decide⟩
+
+def assumeMoveReuseProg : Gen.Program := (translateProg assumeMoveReuse []).getD emptyProg
+
+def assumeMoveReuseFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeMoveReuse []) assumeMoveReuse).getD callerFn
+
+def assumeMoveReuseMInit : Mach :=
+  multiMachineWithCtx ctxAssumeSub assumeMoveReuseProg 1 assumeMoveReuse assumeMoveReuseFn
+    (initMachineStateWithCallees assumeMoveReuse (assumeSubArgs 7 true) []).frame.locals
+    assumeMoveReuseFn.start
+
+theorem assumeMoveReuse_diverges :
+    (∃ tr u, Reaches (mirCallTreeWithCallees assumeMoveReuse (assumeSubArgs 7 true) []) tr u ∧
+      FaultNow u) ∧
+    (Interp.steps 7 assumeMoveReuseMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
+  ⟨faultsA_sound assumeMoveReuse 6 _ (by decide), by decide +kernel⟩
+
+/-- Necessity of `stmtReadsOk` on `Assume` (`_3 = move _2; Assume(copy _2)`):
+moving `_2` in a prior statement leaves stale `true` bytes in MiniRust's local
+allocation, so MiniRust passes `Terminator::Intrinsic(.Assume)` and returns
+`7u32` while Anneal faults with UB on `Assume(copy _2)`. `movesOk` (and
+`progInFragment`) must therefore check `!mo.contains b` on `Assume`'s operand. -/
+def assumeAfterMove : CapturedMir where
+  defPath := "witness::assume_after_move"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 2
+  localDecls := [u32Decl, u32Decl, boolDecl, boolDecl]
+  basicBlocks := [
+    { statements := [
+        mkStmt (.storageLive 3),
+        mkStmt (.assign (local_ 3) (.use (.move (local_ 2)))),
+        mkStmt (.intrinsic (.assume (.copy (local_ 2)))),
+        mkStmt (.storageDead 3),
+        mkStmt (.assign (local_ 0) (.use (.copy (local_ 1))))],
+      terminator := mkTerm .return_, isCleanup := false }]
+  fnAbi := fnAbi 2
+  layouts := emptyLayoutTable
+  allocations := []
+
+theorem assumeAfterMove_rejected :
+    movesOk assumeAfterMove = false ∧ progInFragment assumeAfterMove [] = false :=
+  ⟨by decide, by decide⟩
+
+def assumeAfterMoveProg : Gen.Program := (translateProg assumeAfterMove []).getD emptyProg
+
+def assumeAfterMoveFn : Gen.Function :=
+  (translateFnInProg (fnNameMap assumeAfterMove []) assumeAfterMove).getD callerFn
+
+def assumeAfterMoveMInit : Mach :=
+  multiMachineWithCtx ctxAssumeSub assumeAfterMoveProg 1 assumeAfterMove assumeAfterMoveFn
+    (initMachineStateWithCallees assumeAfterMove (assumeSubArgs 7 true) []).frame.locals
+    assumeAfterMoveFn.start
+
+theorem assumeAfterMove_diverges :
+    (∃ tr u, Reaches (mirCallTreeWithCallees assumeAfterMove (assumeSubArgs 7 true) []) tr u ∧
+      FaultNow u) ∧
+    (Interp.steps 7 assumeAfterMoveMInit).toOption.map
+        (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
+      some (some { retAlloc with data := scalarBytes u32 7 }, [1]) :=
+  ⟨faultsA_sound assumeAfterMove 6 _ (by decide), by decide +kernel⟩
+
 /-! ## Homogeneous arrays (`Type::Array`), `Repeat`, `Len`, and `Index`/`ConstantIndex` projections -/
 
 def usizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
@@ -8318,7 +12442,6 @@ theorem arrayComposeSwitchOobUb_minirust_direct :
       .error (.ub "access to out-of-bounds index") := rfl
 
 /-! ## Padded single-variant struct `Padded(u8, u32, u16)` (`TupleFields`, `.Uninit` padding preservation, and scalar `Field` reads/writes) -/
-
 
 def u16Ty : Ty := { kind := .uint .u16, layoutIdx := 0 }
 def u16Decl : LocalDecl := { mutability := .mut, ty := u16Ty, debugName := none }
