@@ -1,5 +1,5 @@
 import Trusted
-import Anneal
+import Anneal.MirLiftCore
 import Mir.FxfsPlatformPager.layer_pager_read_unfixed
 import Obligations.FxfsPlatformPager.layer_pager_read_unfixed
 import Specs.FxfsPlatformPager.layer_pager_read_unfixed
@@ -11,14 +11,15 @@ open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.MirFuelFree
+open Anneal.PureMirExec
+open Anneal.MirLiftCore
+open Anneal.FunctionalTranslation
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-/-- Fuel-free modular step that may cross an external call. `h_step` says
-that the step from `s` satisfies every continuation that holds of `s'`: the
-step meets the call contract, and its only successor (for every call answer
-the contract admits) is `s'`. Convergence from `s'` then gives convergence from
-`s`. -/
+/-- Fuel-free modular step that may cross an external call. `h_step` shows that
+the step meets the call contract and that every admitted call answer transitions
+to `s'`, so convergence from `s'` yields convergence from `s`. -/
 private theorem modularWpConverges_step_to {contract : MirCallContract}
     {body : CapturedMir} {s s' : MachineState} {post : MirOutcome → Prop}
     (h_step : ∀ {cont : MirExecState → Prop}, cont (.running s') →
@@ -28,108 +29,93 @@ private theorem modularWpConverges_step_to {contract : MirCallContract}
   let ⟨n, hn⟩ := h_next
   ⟨n + 1, h_step hn⟩
 
-/-- Machine state at statement `stmt` of block `bb` with memory untouched.
-Stepping symbolically from one of these explicit states keeps each proof term
-small. -/
-private def stateAt (bb stmt : Nat) (locals : List LocalSlot) : MachineState :=
-  { frame := { blockIdx := bb, stmtIdx := stmt, locals := locals }
-    memory := emptyMemory }
+private def forceNat? : Nat → Option Nat
+  | 0 => some 0
+  | n + 1 => (forceNat? n).map (· + 1)
 
-/-- Arguments `(mapped_len, ptr_non_null, pager_backed, read_offset,
-read_len)`. -/
-private abbrev argVals (ml pnn pb ro rl : Nat) : List Value :=
-  [.scalar ⟨ml, 8⟩, .scalar ⟨pnn, 1⟩, .scalar ⟨pb, 1⟩, .scalar ⟨ro, 8⟩, .scalar ⟨rl, 8⟩]
+private theorem forceNat?_eq_some : ∀ n, forceNat? n = some n
+  | 0 => rfl
+  | n + 1 => by simp [forceNat?, forceNat?_eq_some n]
 
-/-- From bb5's `_8 = Sub(copy _6, copy _4)` with
-`read_offset ≤ mapped_len`: the function returns
-`Some(read_offset + read_len)` exactly when
-`read_len ≤ mapped_len - read_offset`. -/
-private theorem bb5_converges (ml pb ro rl : Nat) (h_ml : ml < 18446744073709551616)
-    (h1 : ro ≤ ml) :
-    MirModularWpConverges
-      Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim.callContract
-      Mir.FxfsPlatformPager.layer_pager_read_unfixed.body
-      (stateAt 5 2
-        [.uninit, .uninit, .uninit, .uninit, .init (.scalar ⟨ro, 8⟩),
-         .init (.scalar ⟨rl, 8⟩), .init (.scalar ⟨ml, 8⟩), .dead, .uninit, .dead, .dead])
-      (mirSafePost (Specs.FxfsPlatformPager.layer_pager_read_unfixed.post
-        (argVals ml 1 pb ro rl) emptyMemory)) := by
-  -- `read_offset ≤ mapped_len` selects the non-wrapping arm of the
-  -- subtraction.
-  refine MirModularWpConverges.step ?_
-  show (match Nat.ble ro ml with | true => _ | false => _)
-  rw [Nat.ble_eq_true_of_le h1]
-  -- `StorageLive(_9); _9 = Gt(copy _5, copy _8)` branches on
-  -- `read_len ≤ mapped_len - read_offset`.
-  repeat refine MirModularWpConverges.step ?_
-  show (match Nat.ble rl (wrapScalarBits (ml - ro) 18446744073709551616) with
-    | true => _ | false => _)
-  rw [wrapScalarBits_eq_of_lt (by omega)]
-  cases h_le2 : Nat.ble rl (ml - ro)
-  · -- `read_len > mapped_len - read_offset`: bb6 returns `None` through bb8.
-    repeat refine MirModularWpConverges.step ?_
-    refine ⟨rfl, ?_⟩
-    rintro _ _ _ _ _ ⟨⟩
-    have h_gt := Nat.not_le_of_not_ble_eq_true (Bool.ne_true_of_eq_false h_le2)
-    rw [ite_eq_right (by omega)]
-  · -- bb7: `_10 = Add(copy _4, copy _5); _0 = Option::<usize>::Some(copy _10)`;
-    -- bb9: `return`.
-    have h2 := Nat.le_of_ble_eq_true h_le2
-    repeat refine MirModularWpConverges.step ?_
-    refine ⟨rfl, ?_⟩
-    rintro _ _ _ _ _ ⟨⟩
-    rw [ite_eq_left ⟨rfl, h1, h2⟩]
-    -- `read_offset + read_len ≤ mapped_len < 2^64`, so `Add` does not wrap.
-    show Value.aggregate 1 [.scalar ⟨wrapScalarBits (ro + rl) 18446744073709551616, 8⟩] = _
-    rw [wrapScalarBits_eq_of_lt (by omega)]
-
-/-- From bb3's entry, after the call returned `mapped_len` in `_6`. -/
-private theorem bb3_converges (ml pb ro rl : Nat) (h_ml : ml < 18446744073709551616) :
-    MirModularWpConverges
-      Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim.callContract
-      Mir.FxfsPlatformPager.layer_pager_read_unfixed.body
-      (stateAt 3 0
-        [.uninit, .uninit, .uninit, .uninit, .init (.scalar ⟨ro, 8⟩),
-         .init (.scalar ⟨rl, 8⟩), .init (.scalar ⟨ml, 8⟩), .dead, .dead, .dead, .dead])
-      (mirSafePost (Specs.FxfsPlatformPager.layer_pager_read_unfixed.post
-        (argVals ml 1 pb ro rl) emptyMemory)) := by
-  -- bb3: `StorageLive(_7); _7 = Gt(copy _4, copy _6)` branches on
-  -- `read_offset ≤ mapped_len`.
-  repeat refine MirModularWpConverges.step ?_
-  show (match Nat.ble ro ml with | true => _ | false => _)
-  cases h_le1 : Nat.ble ro ml
-  · -- `read_offset > mapped_len`: bb4 returns `None` through bb8.
-    repeat refine MirModularWpConverges.step ?_
-    refine ⟨rfl, ?_⟩
-    rintro _ _ _ _ _ ⟨⟩
-    have h_gt := Nat.not_le_of_not_ble_eq_true (Bool.ne_true_of_eq_false h_le1)
-    rw [ite_eq_right (by omega)]
-  · -- `switchInt(move _7)` jumps to bb5: `StorageDead(_7); StorageLive(_8)`.
-    repeat (refine MirModularWpConverges.step ?_; change MirModularWpConverges _ _ _ _)
-    exact bb5_converges ml pb ro rl h_ml (Nat.le_of_ble_eq_true h_le1)
+/-- Call-free step that normalizes `blockIdx`, `stmtIdx`, and `locals` so nested
+`advanceStmt` and `List.set` terms do not accumulate across symbolic steps. -/
+private theorem modularStepNorm {contract : MirCallContract} {body : CapturedMir}
+    {s : MachineState} {bb stmt : Nat} {locals : List LocalSlot}
+    {post : MirOutcome → Prop}
+    (h_step : evalSymNodeTreeNoCall
+      (fun
+        | .running s' =>
+          s'.memory = emptyMemory ∧
+          forceNat? s'.frame.blockIdx = some bb ∧
+          forceNat? s'.frame.stmtIdx = some stmt ∧
+          forcePureEnv? s'.frame.locals = some locals
+        | _ => False) post (stepMirSymTree body s))
+    (h_next : MirModularWpConverges contract body
+      { frame := { blockIdx := bb, stmtIdx := stmt, locals := locals }
+        memory := emptyMemory } post) :
+    MirModularWpConverges contract body s post := by
+  refine MirModularWpConverges.step
+    (evalSymNodeTreeNoCall_mono ?_ (fun _ h => h) h_step)
+  rintro (⟨⟨b, st, loc⟩, mem⟩ | _ | _)
+  · rintro ⟨rfl, hb, hst, hloc⟩
+    rw [forceNat?_eq_some] at hb hst
+    rw [forcePureEnv?_eq_some] at hloc
+    cases hb; cases hst; cases hloc
+    exact h_next
+  · exact False.elim
+  · exact False.elim
 
 theorem verified : ModularVerificationResult Obligations.FxfsPlatformPager.layer_pager_read_unfixed.modularClaim := by
   refine verifyModularContractMir_of_wpConverges _ _ _ _ ?_
-  rintro _ _ ⟨ml, pnn, pb, ro, rl, h_ml, -, -, h_pnn, h_pb, rfl, rfl⟩
-  rcases h_pnn with rfl | rfl
-  · -- `ptr_non_null = false`: bb0 jumps to bb1, which returns `None`.
-    repeat refine MirModularWpConverges.step ?_
-    refine ⟨rfl, ?_⟩
+  rintro _ _ ⟨ml, _, pb, ro, rl, h_ml, -, -, rfl | rfl, h_pb, rfl, rfl⟩
+  · refine MirModularWpConverges.of_noCall
+      (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
     rintro _ _ _ _ _ ⟨⟩
-    rw [ite_eq_right (by omega)]
-  · -- bb0 jumps to bb2: `StorageLive(_6)`, then the call
-    -- `_6 = mapped_vmo_as_slice_unfixed(move _1, move _2, move _3)`. Step only
-    -- while the next state is running, which stops at the call.
-    repeat (refine MirModularWpConverges.step ?_; change MirModularWpConverges _ _ _ _)
-    -- The call meets the callee's contract, and every answer the contract
-    -- admits returns `mapped_len` with memory untouched.
+    simp
+  · repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
     refine modularWpConverges_step_to (s' := ?s')
       (fun hc => ⟨⟨rfl, ml, pb, h_ml, h_pb, rfl, rfl⟩, ?h_ans⟩) ?h_next
     case h_ans =>
       rintro _ ⟨_, _, rfl, rfl, h_ret⟩
       obtain rfl := h_ret ml pb rfl
       exact hc
-    case h_next => exact bb3_converges ml pb ro rl h_ml
+    case h_next =>
+      repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+      refine MirModularWpConverges.step ?_
+      show (match Nat.ble ro ml with | true => _ | false => _)
+      cases h_le1 : Nat.ble ro ml
+      · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+        refine MirModularWpConverges.of_noCall
+          (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
+        rintro _ _ _ _ _ ⟨⟩
+        rw [ite_eq_right fun h => by simp [Nat.ble_eq_true_of_le h.2.1] at h_le1]
+      · have h1 := Nat.le_of_ble_eq_true h_le1
+        repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+        refine MirModularWpConverges.step ?_
+        show (match Nat.ble ro ml with | true => _ | false => _)
+        rw [h_le1]
+        repeat refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+        refine MirModularWpConverges.step ?_
+        show (match Nat.ble rl (wrapScalarBits (ml - ro) 18446744073709551616) with
+          | true => _ | false => _)
+        rw [show wrapScalarBits (ml - ro) 18446744073709551616 = ml - ro by
+          simp [wrapScalarBits,
+            nat_ble_eq_false_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le _ _) h_ml)]]
+        cases h_le2 : Nat.ble rl (ml - ro)
+        · refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+          refine MirModularWpConverges.of_noCall
+            (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
+          rintro _ _ _ _ _ ⟨⟩
+          rw [ite_eq_right fun h => by simp [Nat.ble_eq_true_of_le h.2.2] at h_le2]
+        · have h2 := Nat.le_of_ble_eq_true h_le2
+          refine modularStepNorm ⟨rfl, rfl, rfl, rfl⟩ ?_
+          refine MirModularWpConverges.of_noCall
+            (mirNoCallWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, ?_⟩)
+          rintro _ _ _ _ _ ⟨⟩
+          rw [ite_eq_left ⟨rfl, h1, h2⟩]
+          change Value.aggregate 1 [.scalar ⟨wrapScalarBits (ro + rl) 18446744073709551616, 8⟩] = _
+          simp [wrapScalarBits, nat_ble_eq_false_of_lt
+            (Nat.lt_of_le_of_lt (Nat.add_comm rl ro ▸ Nat.add_le_of_le_sub h1 h2) h_ml)]
 
 /-- Model witness for `mapped_vmo_as_slice_unfixed` returning `mapped_len`. -/
 def mappedVmoLenModel (args : List Value) (mem : Memory) : Value × Memory :=
@@ -167,10 +153,7 @@ theorem linked_with_ub_exception (fallback : ExternalCallHandler) :
     mappedVmoLenModel
     fallback
     ?_
-  intro args mem h_pre _
-  rcases h_pre with ⟨mapped_len, pb, _, _, rfl, rfl⟩
-  refine ⟨rfl, ?_⟩
-  intro ml' pb' h_args
-  injection h_args with h1 _
+  rintro _ _ ⟨_, _, _, _, rfl, rfl⟩ -
+  exact ⟨rfl, by rintro _ _ ⟨⟩; rfl⟩
 
 end Proof.FxfsPlatformPager.layer_pager_read_unfixed

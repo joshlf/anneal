@@ -1,5 +1,5 @@
 import Trusted
-import Anneal
+import Anneal.MirLiftCore
 import Mir.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
 import Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
 import Specs.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
@@ -10,39 +10,35 @@ open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.MirFuelFree
+open Anneal.PureMirExec
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-/-- A step from `s` that has no successor state (it returns or raises a waived
-UB) converges under the UB-waived semantics with a one-step witness, because
-no leaf of its step tree consults the continuation. -/
+/-- Closes a step that halts immediately (such as a violated `assume` raising a
+waived UB): `MirUbWaivedWpConverges.step` requires `evalSymNodeTreeExec`, which
+rejects `.ub`, whereas `evalSymNodeTreeUbWaived` accepts `.halt .ub` at depth
+`1` without consulting the continuation. -/
 private theorem ubWaivedWpConverges_of_halt
     {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
     (h : evalSymNodeTreeUbWaived (fun _ => False) post (stepMirSymTree body s)) :
     MirUbWaivedWpConverges body s post :=
   ⟨1, h⟩
 
-/-- With `pager_backed = false`, both `assume`s in bb0 hold, and bb0 returns
-`mapped_len` with memory untouched. -/
 private theorem not_pager_backed_converges (ml : Nat) :
     MirWpConverges Mir.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.body
       (initMachineStateWithMemory Mir.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.body
         [.scalar ⟨ml, 8⟩, .scalar ⟨1, 1⟩, .scalar ⟨0, 1⟩] emptyMemory)
       (mirSafePost (Specs.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.post
-        [.scalar ⟨ml, 8⟩, .scalar ⟨1, 1⟩, .scalar ⟨0, 1⟩] emptyMemory)) := by
-  refine MirWpConverges.step ?_
-  repeat refine MirExecWpConverges.step ?_
-  exact ⟨rfl, by rintro _ _ ⟨⟩; rfl⟩
+        [.scalar ⟨ml, 8⟩, .scalar ⟨1, 1⟩, .scalar ⟨0, 1⟩] emptyMemory)) :=
+  mirWpConverges_of_runCfgToBlock _ _ rfl 0 _ ⟨rfl, rfl, by rintro _ _ ⟨⟩; rfl⟩
 
 theorem verified : UbExceptionVerificationResult Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim := by
   refine verifyUbExceptionMir_of_wpConverges _ ?_ ?_
-  · -- Strict-safety domain: `pager_backed = false`.
-    rintro _ _ ⟨ml, pb, -, -, rfl, rfl⟩ ⟨_, ⟨⟩⟩
+  · rintro _ _ ⟨ml, _, -, -, rfl, rfl⟩ ⟨_, ⟨⟩⟩
     exact not_pager_backed_converges ml
-  · rintro _ _ ⟨ml, pb, -, h_pb, rfl, rfl⟩
-    rcases h_pb with rfl | rfl
+  · rintro _ _ ⟨ml, _, -, rfl | rfl, rfl, rfl⟩
     · exact .of_mirWpConverges (not_pager_backed_converges ml)
-    · -- `pager_backed = true`: bb0's second `assume` (`copy _3 == false`)
-      -- fails, which raises a waived UB.
+    · -- When `pager_backed = true`, the second `assume` (`copy _3 == false`)
+      -- fails and halts with a waived UB.
       repeat
         first
         | exact ubWaivedWpConverges_of_halt trivial
