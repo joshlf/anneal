@@ -5872,15 +5872,15 @@ open Trusted.Rustc.V2026_06_01.Layout in
 example (layouts : LayoutTable) (c : Ty) {ty : Ty}
     (st : AnnealStepState) :
     (ty.kind = .bool →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .boolean st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .boolean st) ∧
     (ty.kind = .char →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .character st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .character st) ∧
     (∀ it, ty.kind = .int it →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .integer st) ∧
     (∀ ut, ty.kind = .uint ut →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .integer st) ∧
     (ty.kind = .never →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .never st) :=
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .never st) :=
   annealValidityClassify_prim layouts c st
 
 open Trusted.Rustc.V2026_06_01.Layout in
@@ -5915,16 +5915,16 @@ example (layouts : LayoutTable) (c : Ty) {ty : Ty}
         ⟨.local 0 idx none tf.localsIdentity, translateTy ty layouts⟩ ev m =
       .ok ⟨.scalar (.fromScalarInt msc), translateTy ty layouts⟩ m ∧
     (ty.kind = .bool →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .boolean m ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .boolean m ∧
       ((∃ b, (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toBool = .ok b) ↔
         AnnealScalarValid ty sc)) ∧
     (ty.kind = .char →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .character m) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .character m) ∧
     ((∃ it, ty.kind = .int it) ∨ (∃ ut, ty.kind = .uint ut) →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .integer m ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .integer m ∧
       AnnealScalarValid ty sc) ∧
     (ty.kind = .never →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .never m) :=
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .never m) :=
   validityVisitor_scalar_bool_simulation layouts c hrel hsz hframes hlt hval ev
 
 open Trusted.Rustc.V2026_06_01.Layout in

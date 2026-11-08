@@ -912,31 +912,6 @@ def annealValidityProjectionHooks :
   layoutOf := fun _ _ => throw (.unsupported "validity projection: layoutOf")
   localIndex := fun _ _ => throw (.unsupported "validity projection: localIndex")
 
-/-- Classify an encoded `TyId` for the validity visitor. The context `c` is
-the Anneal type of the validated place: `encodeTyId` maps every reference to
-`TyId 41`, so only `c` records whether a reference is mutable. Aggregates and
-every other type outside the scalar and reference fragment fail closed with
-`StepError.unsupported`, never with a verdict. -/
-def annealValidityClassify (c : Ty) (tyId : Miri.MIR.TyId) :
-    EStateM Miri.Interpreter.StepError AnnealStepState
-      Miri.Interpreter.ValidityVisitor.TypeKind :=
-  match tyId with
-  | 1 => pure .boolean
-  | 2 => pure .character
-  | 10 | 11 | 12 | 13 | 14 | 15 | 20 | 21 | 22 | 23 | 24 | 25 => pure .integer
-  | 30 | 31 | 32 | 33 => pure .float
-  | 41 =>
-    match c.kind with
-    | .ref .mut _ => pure (.reference true)
-    | .ref .not _ => pure (.reference false)
-    | _ => throw (.invalidProgram "reference TyId at a non-reference type")
-  | 42 => pure .functionPointer
-  | 50 => pure .never
-  | 60 | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 68 | 69
-  | 70 | 71 | 72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 =>
-    pure (.rawPointer tyId true)
-  | _ => throw (.unsupported "validity of a type outside the scalar and reference fragment")
-
 /-- Encoded integer `TyId` (`10..14` signed, `20..24` unsigned) for an enum tag
 primitive of `widthBytes` bytes (`1, 2, 4, 8, 16`) and signedness `signed`. -/
 def annealTagIntTyId (widthBytes : Nat) (signed : Bool) : Option Miri.MIR.TyId :=
@@ -990,6 +965,31 @@ def annealValidityClassifyAdt (layouts : LayoutTable) (tyId : Miri.MIR.TyId) :
     | none => throw (.unsupported "validity of an aggregate without layout")
   else
     throw (.unsupported "validity of a type outside the scalar, reference, and enum fragment")
+
+/-- Classify an encoded `TyId` for the validity visitor. The context `c` is
+the Anneal type of the validated place: `encodeTyId` maps every reference to
+`TyId 41`, so only `c` records whether a reference is mutable. Aggregates and
+every other type outside the scalar and reference fragment fail closed with
+`StepError.unsupported`, never with a verdict. -/
+def annealValidityClassify (layouts : LayoutTable) (c : Ty) (tyId : Miri.MIR.TyId) :
+    EStateM Miri.Interpreter.StepError AnnealStepState
+      Miri.Interpreter.ValidityVisitor.TypeKind :=
+  match tyId with
+  | 1 => pure .boolean
+  | 2 => pure .character
+  | 10 | 11 | 12 | 13 | 14 | 15 | 20 | 21 | 22 | 23 | 24 | 25 => pure .integer
+  | 30 | 31 | 32 | 33 => pure .float
+  | 41 =>
+    match c.kind with
+    | .ref .mut _ => pure (.reference true)
+    | .ref .not _ => pure (.reference false)
+    | _ => throw (.invalidProgram "reference TyId at a non-reference type")
+  | 42 => pure .functionPointer
+  | 50 => pure .never
+  | 60 | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 68 | 69
+  | 70 | 71 | 72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 | 80 | 81 | 82 =>
+    pure (.rawPointer tyId true)
+  | id => if 100 ≤ id then annealValidityClassifyAdt layouts id else throw (.unsupported "validity of a type outside the scalar and reference fragment")
 
 /-- Operational inhabitedness of an encoded `TyId` (`100 ≤ tyId < 900`) against
 `layouts`: `false` when `tl.isUninhabited` or `tl.variants = .empty`, and `true`
@@ -1223,7 +1223,7 @@ def annealValidityHooks (layouts : LayoutTable) :
   debugAssertions := false
   classify := fun c tyId =>
     if tyId < 100 then
-      if tyId == 51 then pure (.aggregate false false false) else annealValidityClassify c tyId
+      if tyId == 51 then pure (.aggregate false false false) else annealValidityClassify layouts c tyId
     else
       annealValidityClassifyAdt layouts tyId
   unitLayout := fun _ => pure (translateTy { kind := .tuple .nil, layoutIdx := 0 })
@@ -1332,15 +1332,15 @@ types as `.integer`; the uninhabited `!` is `.never`. -/
 theorem annealValidityClassify_prim (layouts : LayoutTable) (c : Ty) {ty : Ty}
     (st : AnnealStepState) :
     (ty.kind = .bool →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .boolean st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .boolean st) ∧
     (ty.kind = .char →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .character st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .character st) ∧
     (∀ it, ty.kind = .int it →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .integer st) ∧
     (∀ ut, ty.kind = .uint ut →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .integer st) ∧
     (ty.kind = .never →
-      annealValidityClassify c (translateTy ty layouts).ty st = .ok .never st) := by
+      annealValidityClassify layouts c (translateTy ty layouts).ty st = .ok .never st) := by
   refine ⟨fun hk => ?_, fun hk => ?_, fun it hk => ?_, fun ut hk => ?_, fun hk => ?_⟩
   · simp only [translateTy, encodeTyId, hk]; rfl
   · simp only [translateTy, encodeTyId, hk]; rfl
@@ -1536,16 +1536,16 @@ theorem validityVisitor_scalar_bool_simulation
         ⟨.local 0 idx none tf.localsIdentity, translateTy ty layouts⟩ ev m =
       .ok ⟨.scalar (.fromScalarInt msc), translateTy ty layouts⟩ m ∧
     (ty.kind = .bool →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .boolean m ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .boolean m ∧
       ((∃ b, (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toBool = .ok b) ↔
         AnnealScalarValid ty sc)) ∧
     (ty.kind = .char →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .character m) ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .character m) ∧
     ((∃ it, ty.kind = .int it) ∨ (∃ ut, ty.kind = .uint ut) →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .integer m ∧
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .integer m ∧
       AnnealScalarValid ty sc) ∧
     (ty.kind = .never →
-      annealValidityClassify c (translateTy ty layouts).ty m = .ok .never m) := by
+      annealValidityClassify layouts c (translateTy ty layouts).ty m = .ok .never m) := by
   obtain ⟨hcb, hcc, hci, hcu, hcn⟩ := annealValidityClassify_prim layouts c (ty := ty) m
   refine ⟨annealValidityHooks_readImmediate_local layouts c hframes hlt hval _ ev,
     fun hk => ⟨hcb hk, ?_⟩, hcc, fun hint => ?_, hcn⟩
