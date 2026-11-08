@@ -421,5 +421,5 @@ fn anchors_match_generated_items_and_cover_interp() {
     let prov_sec = &audit_text[audit_text.find("#check_theorem_deps \"[PROV-AUDIT]\"").unwrap()..];
     let prov_sec = &prov_sec[..prov_sec.find("\n\n").unwrap()];
     let prov_count = prov_sec.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
-    assert!(prov_count >= 299, "expected at least 299 [PROV-AUDIT] theorems, found {prov_count}");
+    assert!(prov_count >= 355, "expected at least 355 [PROV-AUDIT] theorems, found {prov_count}");
 }

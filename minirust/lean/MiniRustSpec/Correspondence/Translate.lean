@@ -5340,24 +5340,1050 @@ theorem terminatorInProgOkWithIntrinsics_of_terminatorInProgOk
   · simp [terminatorInProgOkWithIntrinsics,
       callTerminatorOkWithIntrinsics_of_callTerminatorOk h2]
 
-/-- Per-statement well-formedness in a multi-function program with
-pointer/reference parameters, `Assume`, and provenance-cast intrinsics:
-admits `statementOkWithIntrinsics` plus `Retag([fn entry], _i)` on parameter
-pointer/reference locals (`1 ≤ i ≤ argCount`). -/
+/-- Whether `t` is a non-diverging `Call` terminator (`target = some _`). -/
+def isNonDivergingCall (t : MirAst.Terminator) : Bool :=
+  match t.kind with
+  | .call _ _ _ (some _) _ => true
+  | _ => false
+
+/-- Pointer/borrow local state transfer across a block terminator `t` in a
+multi-function program. In Anneal's `MirSemantics`, all frames share a single
+global `s.memory.borrows` table keyed by un-namespaced `BorrowEntry.targetLocal : Nat`,
+so any root assignment `_k = rv` inside a callee runs
+`invalidateConflictingBorrows mem₁.borrows k .none` across active caller borrows
+whose `targetLocal` happens to equal `k`. Consequently, across a returning `Call`
+terminator, every caller pointer/reference local transitions to `.disabled`
+(forcing fresh borrows after `Return`), while terminators without a returning
+`Call` preserve `env` identically. -/
+def ptrTermStep (decls : List MirAst.LocalDecl) (env : List PtrLocalState)
+    (t : MirAst.Terminator) : List PtrLocalState :=
+  let n := decls.length
+  match t.kind with
+  | .call _ _ ⟨dst, []⟩ (some _) _ =>
+    (List.range n).map fun q =>
+      if q == dst && isDeclPtrLocal decls dst then .disabled
+      else
+        match env.getD q .disabled with
+        | .empty => .empty
+        | .live _ _ | .disabled => .disabled
+  | .call _ _ _ (some _) _ =>
+    (List.range n).map fun q =>
+      match env.getD q .disabled with
+      | .empty => .empty
+      | .live _ _ | .disabled => .disabled
+  | _ => env
+
+/-- One forward dataflow pass for `ptrAliasingProgOk`, composing `ptrStmtStep`
+across block statements with `ptrTermStep` across block terminators. -/
+def stepPtrAliasProgEntries (decls : List MirAst.LocalDecl)
+    (bbs : List MirAst.BasicBlockData)
+    (entries : List (List PtrLocalState)) : List (List PtrLocalState) :=
+  let n := decls.length
+  (List.range bbs.length).map fun dst =>
+    (List.range bbs.length).foldl (fun acc src =>
+      match bbs[src]? with
+      | some bb =>
+        if (termTargets bb.terminator).contains dst then
+          let inEnv := entries.getD src (initPtrEnv n)
+          let midEnv := bb.statements.foldl (ptrStmtStep decls) inEnv
+          let outEnv := ptrTermStep decls midEnv bb.terminator
+          joinPtrEnv n acc outEnv
+        else acc
+      | none => acc) (entries.getD dst (initPtrEnv n))
+
+/-- Iterate `stepPtrAliasProgEntries` up to `fuel` passes. -/
+def iterPtrAliasProgEntries :
+    Nat → List MirAst.LocalDecl → List MirAst.BasicBlockData →
+      List (List PtrLocalState) → List (List PtrLocalState)
+  | 0, _, _, entries => entries
+  | k + 1, decls, bbs, entries =>
+    let entries' := stepPtrAliasProgEntries decls bbs entries
+    if entries' == entries then entries
+    else iterPtrAliasProgEntries k decls bbs entries'
+
+/-- Abstract `PtrLocalState` environment at entry to block `blk` in a
+multi-function body (`ptrAliasingProgOk`). -/
+def ptrProgEnvAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List PtrLocalState :=
+  let n := body.localDecls.length
+  let b := body.basicBlocks.length
+  let fuel := b * n * (n + 3) + 1
+  let init := initPtrEntries b n
+  (iterPtrAliasProgEntries fuel body.localDecls body.basicBlocks init).getD blk (initPtrEnv n)
+
+/-- Multi-function pointer/borrow aliasing discipline extending `ptrAliasingOk`
+with `ptrTermStep` across returning `Call` terminators. Coincides identically
+with `ptrAliasingOk` when `body` contains no returning `Call` terminators
+(`ptrAliasingProgOk_eq_of_no_calls`), and holds automatically on scalar-only
+`progInFragment` bodies (`ptrAliasingProgOk_of_scalar`). -/
+def ptrAliasingProgOk (body : MirAst.CapturedMir) : Bool :=
+  let addrLocals := bodyAddrTakenLocals body
+  let n := body.localDecls.length
+  addrLocals.all (fun k => decide (1 ≤ k ∧ k ≤ body.argCount)) &&
+  body.basicBlocks.all (fun bb =>
+    bb.statements.all (stmtPreservesAddrTaken addrLocals) &&
+    termPreservesAddrTaken addrLocals bb.terminator) &&
+  subsumesPtrEnv n (initPtrEnv n) (ptrProgEnvAtEntry body 0) &&
+  (List.range body.basicBlocks.length).all fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb =>
+      let inEnv := ptrProgEnvAtEntry body blk
+      let midEnv := bb.statements.foldl (ptrStmtStep body.localDecls) inEnv
+      let exitEnv := ptrTermStep body.localDecls midEnv bb.terminator
+      blockPtrAliasOk body.localDecls inEnv bb.statements &&
+      (termTargets bb.terminator).all (fun t =>
+        subsumesPtrEnv n exitEnv (ptrProgEnvAtEntry body t))
+    | none => true
+
+theorem ptrTermStep_eq_of_not_call (decls : List MirAst.LocalDecl)
+    (env : List PtrLocalState) (t : MirAst.Terminator)
+    (h : isNonDivergingCall t = false) :
+    ptrTermStep decls env t = env := by
+  obtain ⟨kind, span⟩ := t
+  cases kind with
+  | call fn args dst tgt unw =>
+    cases tgt with
+    | none => cases dst with | mk d projs => cases projs <;> rfl
+    | some _ => simp [isNonDivergingCall] at h
+  | _ => rfl
+
+private theorem foldl_congr_prog {α β : Type} (f g : α → β → α) (init : α) (l : List β)
+    (h : ∀ a, ∀ b ∈ l, f a b = g a b) : l.foldl f init = l.foldl g init := by
+  induction l generalizing init with
+  | nil => rfl
+  | cons x xs ih =>
+    simp only [List.foldl_cons, h init x (List.mem_cons_self ..)]
+    exact ih _ (fun a b hb => h a b (List.mem_cons_of_mem x hb))
+
+private theorem list_all_congr_prog {α : Type} {l : List α} {p q : α → Bool}
+    (h : ∀ x ∈ l, p x = q x) : l.all p = l.all q := by
+  induction l with
+  | nil => rfl
+  | cons a as ih =>
+    simp [h a (List.mem_cons_self ..), ih (fun x hx => h x (List.mem_cons_of_mem a hx))]
+
+theorem stepPtrAliasProgEntries_eq_of_no_calls (decls : List MirAst.LocalDecl)
+    (bbs : List MirAst.BasicBlockData) (entries : List (List PtrLocalState))
+    (hno : ∀ bb ∈ bbs, isNonDivergingCall bb.terminator = false) :
+    stepPtrAliasProgEntries decls bbs entries = stepPtrAliasEntries decls bbs entries := by
+  dsimp only [stepPtrAliasProgEntries, stepPtrAliasEntries]
+  apply List.map_congr_left
+  intro dst _
+  apply foldl_congr_prog
+  intro acc src _
+  cases hbb : bbs[src]? with
+  | none => rfl
+  | some bb =>
+    have hmem : bb ∈ bbs := List.mem_of_getElem? hbb
+    simp [ptrTermStep_eq_of_not_call decls _ bb.terminator (hno bb hmem)]
+
+theorem iterPtrAliasProgEntries_eq_of_no_calls :
+    ∀ (fuel : Nat) (decls : List MirAst.LocalDecl) (bbs : List MirAst.BasicBlockData)
+      (entries : List (List PtrLocalState)),
+      (∀ bb ∈ bbs, isNonDivergingCall bb.terminator = false) →
+      iterPtrAliasProgEntries fuel decls bbs entries = iterPtrAliasEntries fuel decls bbs entries
+  | 0, _, _, _, _ => rfl
+  | k + 1, decls, bbs, entries, hno => by
+    simp only [iterPtrAliasProgEntries, iterPtrAliasEntries,
+      stepPtrAliasProgEntries_eq_of_no_calls decls bbs entries hno]
+    split
+    · rfl
+    · exact iterPtrAliasProgEntries_eq_of_no_calls k decls bbs _ hno
+
+theorem ptrProgEnvAtEntry_eq_of_no_calls (body : MirAst.CapturedMir) (blk : Nat)
+    (hno : ∀ bb ∈ body.basicBlocks, isNonDivergingCall bb.terminator = false) :
+    ptrProgEnvAtEntry body blk = ptrEnvAtEntry body blk := by
+  simp only [ptrProgEnvAtEntry, ptrEnvAtEntry,
+    iterPtrAliasProgEntries_eq_of_no_calls _ body.localDecls body.basicBlocks _ hno]
+
+theorem ptrAliasingProgOk_eq_of_no_calls (body : MirAst.CapturedMir)
+    (hno : ∀ bb ∈ body.basicBlocks, isNonDivergingCall bb.terminator = false) :
+    ptrAliasingProgOk body = ptrAliasingOk body := by
+  dsimp only [ptrAliasingProgOk, ptrAliasingOk]
+  rw [ptrProgEnvAtEntry_eq_of_no_calls body 0 hno]
+  congr 1
+  apply list_all_congr_prog
+  intro blk _
+  cases hbb : body.basicBlocks[blk]? with
+  | none => rfl
+  | some bb =>
+    have hmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
+    dsimp only
+    rw [ptrProgEnvAtEntry_eq_of_no_calls body blk hno,
+      ptrTermStep_eq_of_not_call body.localDecls _ bb.terminator (hno bb hmem)]
+    congr 1
+    apply list_all_congr_prog
+    intro t _
+    rw [ptrProgEnvAtEntry_eq_of_no_calls body t hno]
+
+private theorem isPtrTy_false_of_scalarTypeOf {ty : MirAst.Ty}
+    (h : (scalarTypeOf ty).isSome = true) : isPtrTy ty = false := by
+  obtain ⟨kind, lidx⟩ := ty
+  cases kind <;> simp [isPtrTy, ptrPointeeOf] at *
+  all_goals simp [scalarTypeOf, isBoolTy, isOrderingTy, intBoolTupleOf, intTypeOf, intTyBytes] at h
+
+private theorem isDeclPtrLocal_false_of_scalar {decls : List MirAst.LocalDecl}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true) (i : Nat) :
+    isDeclPtrLocal decls i = false := by
+  unfold isDeclPtrLocal
+  cases hd : decls[i]? with
+  | none => rfl
+  | some d => exact isPtrTy_false_of_scalarTypeOf (hsc d (List.mem_of_getElem? hd))
+
+private theorem initPtrEnv_getD_lt_prog {n q : Nat} (hq : q < n) :
+    (initPtrEnv n).getD q .disabled = .empty := by
+  unfold initPtrEnv
+  rw [List.getD_eq_getElem?_getD, List.getElem?_map, List.getElem?_range hq]
+  rfl
+
+private theorem map_getD_initPtrEnv_prog (n : Nat) :
+    (List.range n).map (fun q => (initPtrEnv n).getD q .disabled) = initPtrEnv n := by
+  unfold initPtrEnv
+  apply List.map_congr_left
+  intro q hq
+  rw [List.getD_eq_getElem?_getD, List.getElem?_map, List.getElem?_range (List.mem_range.mp hq)]
+  rfl
+
+private theorem statementOk_not_deref_assign_of_scalar {decls : List MirAst.LocalDecl}
+    {w : Nat} {rv : MirAst.Rvalue} {span : String} {layouts : Layout.LayoutTable}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true)
+    (hok : statementOk decls ⟨.assign ⟨w, [.deref]⟩ rv, span⟩ layouts = true) : False := by
+  simp only [statementOk, Bool.and_eq_true] at hok
+  cases hd : decls[w]? with
+  | none => simp [hd] at hok
+  | some d =>
+    have hfalse := isPtrTy_false_of_scalarTypeOf (hsc d (List.mem_of_getElem? hd))
+    simp only [isPtrTy] at hfalse
+    cases hpt : ptrPointeeOf d.ty with
+    | none => simp [hd, hpt] at hok
+    | some pr => simp [hpt] at hfalse
+
+private theorem progStatementOk_ptrStmtStep_initPtrEnv {decls : List MirAst.LocalDecl}
+    {s : MirAst.Statement} {layouts : Layout.LayoutTable}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true)
+    (hok : progStatementOk decls s layouts = true) :
+    ptrStmtStep decls (initPtrEnv decls.length) s = initPtrEnv decls.length := by
+  obtain ⟨kind, span⟩ := s
+  have hnoPtr := isDeclPtrLocal_false_of_scalar hsc
+  cases kind with
+  | assign place rv =>
+    rcases place with ⟨i, projs⟩
+    cases projs with
+    | nil =>
+      simp only [ptrStmtStep, hnoPtr i, Bool.false_eq_true, ↓reduceIte]
+      exact map_getD_initPtrEnv_prog _
+    | cons p rest =>
+      cases p with
+      | deref =>
+        cases rest with
+        | nil =>
+          simp only [progStatementOk] at hok
+          exact False.elim (statementOk_not_deref_assign_of_scalar hsc hok)
+        | cons _ _ => exact map_getD_initPtrEnv_prog _
+      | _ => exact map_getD_initPtrEnv_prog _
+  | storageLive i | storageDead i =>
+    simp only [ptrStmtStep, hnoPtr i, Bool.false_eq_true, ↓reduceIte]
+    exact map_getD_initPtrEnv_prog _
+  | deinit place =>
+    rcases place with ⟨i, projs⟩
+    cases projs <;>
+      (simp only [ptrStmtStep, hnoPtr i, Bool.false_eq_true, ↓reduceIte];
+       exact map_getD_initPtrEnv_prog _)
+  | _ => exact map_getD_initPtrEnv_prog _
+
+private theorem foldl_ptrStmtStep_initPtrEnv {decls : List MirAst.LocalDecl}
+    {layouts : Layout.LayoutTable}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true) :
+    ∀ (ss : List MirAst.Statement),
+      (∀ s ∈ ss, progStatementOk decls s layouts = true) →
+      ss.foldl (ptrStmtStep decls) (initPtrEnv decls.length) = initPtrEnv decls.length
+  | [], _ => rfl
+  | s :: ss, hok => by
+    simp only [List.foldl_cons,
+      progStatementOk_ptrStmtStep_initPtrEnv hsc (hok s (List.mem_cons_self ..))]
+    exact foldl_ptrStmtStep_initPtrEnv hsc ss (fun s' hs' => hok s' (List.mem_cons_of_mem s hs'))
+
+private theorem ptrTermStep_initPtrEnv_of_scalar {decls : List MirAst.LocalDecl}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true) (t : MirAst.Terminator) :
+    ptrTermStep decls (initPtrEnv decls.length) t = initPtrEnv decls.length := by
+  have hnoPtr := isDeclPtrLocal_false_of_scalar hsc
+  obtain ⟨kind, span⟩ := t
+  cases kind with
+  | call fn args dst tgt unw =>
+    cases tgt with
+    | none => cases dst with | mk d projs => cases projs <;> rfl
+    | some targetBb =>
+      rcases dst with ⟨d, projs⟩
+      cases projs with
+      | nil =>
+        dsimp only [ptrTermStep]
+        apply List.map_congr_left
+        intro q hq
+        rw [hnoPtr d, Bool.and_false, initPtrEnv_getD_lt_prog (List.mem_range.mp hq)]
+        rfl
+      | cons _ _ =>
+        dsimp only [ptrTermStep]
+        apply List.map_congr_left
+        intro q hq
+        rw [initPtrEnv_getD_lt_prog (List.mem_range.mp hq)]
+  | _ => rfl
+
+private theorem joinPtrEnv_initPtrEnv_self (n : Nat) :
+    joinPtrEnv n (initPtrEnv n) (initPtrEnv n) = initPtrEnv n := by
+  unfold joinPtrEnv
+  apply List.map_congr_left
+  intro q hq
+  rw [initPtrEnv_getD_lt_prog (List.mem_range.mp hq)]
+  rfl
+
+private theorem initPtrEntries_getD_prog {b n k : Nat} :
+    (initPtrEntries b n).getD k (initPtrEnv n) = initPtrEnv n := by
+  unfold initPtrEntries
+  by_cases hk : k < b
+  · rw [List.getD_eq_getElem?_getD, List.getElem?_map, List.getElem?_range hk]
+    rfl
+  · have hge : ((List.range b).map (fun _ => initPtrEnv n)).length ≤ k := by simp; omega
+    rw [List.getD_eq_getElem?_getD, List.getElem?_eq_none hge]
+    rfl
+
+private theorem stepPtrAliasProgEntries_init_of_scalar {decls : List MirAst.LocalDecl}
+    {bbs : List MirAst.BasicBlockData} {layouts : Layout.LayoutTable}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ bbs, ∀ s ∈ bb.statements, progStatementOk decls s layouts = true) :
+    stepPtrAliasProgEntries decls bbs (initPtrEntries bbs.length decls.length) =
+      initPtrEntries bbs.length decls.length := by
+  dsimp only [stepPtrAliasProgEntries]
+  unfold initPtrEntries
+  apply List.map_congr_left
+  intro dst _
+  have hinit : ((List.range bbs.length).map (fun _ => initPtrEnv decls.length)).getD dst
+      (initPtrEnv decls.length) = initPtrEnv decls.length := initPtrEntries_getD_prog
+  rw [hinit]
+  have hfold : ∀ (l : List Nat),
+      l.foldl (fun acc src =>
+        match bbs[src]? with
+        | some bb =>
+          if (termTargets bb.terminator).contains dst then
+            let inEnv := (initPtrEntries bbs.length decls.length).getD src (initPtrEnv decls.length)
+            let midEnv := bb.statements.foldl (ptrStmtStep decls) inEnv
+            let outEnv := ptrTermStep decls midEnv bb.terminator
+            joinPtrEnv decls.length acc outEnv
+          else acc
+        | none => acc) (initPtrEnv decls.length) = initPtrEnv decls.length := by
+    intro l
+    induction l with
+    | nil => rfl
+    | cons src rest ih =>
+      simp only [List.foldl_cons]
+      have hstep :
+          (match bbs[src]? with
+          | some bb =>
+            if (termTargets bb.terminator).contains dst then
+              let inEnv := (initPtrEntries bbs.length decls.length).getD src (initPtrEnv decls.length)
+              let midEnv := bb.statements.foldl (ptrStmtStep decls) inEnv
+              let outEnv := ptrTermStep decls midEnv bb.terminator
+              joinPtrEnv decls.length (initPtrEnv decls.length) outEnv
+            else initPtrEnv decls.length
+          | none => initPtrEnv decls.length) = initPtrEnv decls.length := by
+        cases hbb : bbs[src]? with
+        | none => rfl
+        | some bb =>
+          dsimp only
+          split
+          · rw [initPtrEntries_getD_prog,
+              foldl_ptrStmtStep_initPtrEnv hsc bb.statements (hbbs bb (List.mem_of_getElem? hbb)),
+              ptrTermStep_initPtrEnv_of_scalar hsc bb.terminator,
+              joinPtrEnv_initPtrEnv_self]
+          · rfl
+      rw [hstep]
+      exact ih
+  exact hfold (List.range bbs.length)
+
+private theorem ptrProgEnvAtEntry_of_scalar {body : MirAst.CapturedMir} (blk : Nat)
+    (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true) :
+    ptrProgEnvAtEntry body blk = initPtrEnv body.localDecls.length := by
+  dsimp only [ptrProgEnvAtEntry]
+  have hfix := stepPtrAliasProgEntries_init_of_scalar hsc hbbs
+  have hiter : ∀ fuel,
+      iterPtrAliasProgEntries fuel body.localDecls body.basicBlocks
+        (initPtrEntries body.basicBlocks.length body.localDecls.length) =
+      initPtrEntries body.basicBlocks.length body.localDecls.length
+    | 0 => rfl
+    | k + 1 => by simp [iterPtrAliasProgEntries, hfix]
+  rw [hiter]
+  exact initPtrEntries_getD_prog
+
+private theorem rvalueOk_not_borrow {layouts : Layout.LayoutTable}
+    {decls : List MirAst.LocalDecl} (it : Gen.IntType) {rv : MirAst.Rvalue}
+    (h : directBorrowOf rv ≠ none) : rvalueOk layouts decls it rv = false ∧
+      rvalueOk layouts decls it (copyRv rv) = false := by
+  cases rv <;> simp [directBorrowOf, copyRv, rvalueOk] at h ⊢
+
+private theorem tupleRvalueOk_not_borrow {layouts : Layout.LayoutTable}
+    {decls : List MirAst.LocalDecl} {dstTy : MirAst.Ty} {fields : List (Nat × TupleSpec)}
+    {size align : Nat} {rv : MirAst.Rvalue}
+    (h : directBorrowOf rv ≠ none) :
+    tupleRvalueOk layouts decls dstTy fields size align rv = false := by
+  cases rv <;> simp [directBorrowOf, tupleRvalueOk] at h ⊢
+
+private theorem progStatementOk_not_directBorrow_of_scalar {decls : List MirAst.LocalDecl}
+    {s : MirAst.Statement} {layouts : Layout.LayoutTable}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true)
+    (hok : progStatementOk decls s layouts = true) :
+    (match s.kind with
+     | .assign _ rv => (directBorrowOf rv).map (·.2.local_)
+     | _ => none) = none := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    dsimp only
+    cases hdb : directBorrowOf rv with
+    | none => rfl
+    | some mp =>
+      exfalso
+      have hne : directBorrowOf rv ≠ none := by simp [hdb]
+      simp only [progStatementOk] at hok
+      rcases dst with ⟨i, projs⟩
+      cases projs with
+      | nil =>
+        simp only [statementOk] at hok
+        cases hd : decls[i]? with
+        | none => simp [hd] at hok
+        | some d =>
+          have hsc_d := hsc d (List.mem_of_getElem? hd)
+          simp only [hd] at hok
+          by_cases hb : isBoolTy d.ty
+          · cases rv <;> simp [directBorrowOf] at hdb <;> simp [hb, copyRv, rvalueOkB] at hok
+          · by_cases ho : isOrderingTy d.ty
+            · cases rv <;> simp [directBorrowOf] at hdb <;> simp [hb, ho, copyRv, rvalueOkO] at hok
+            · simp only [hb, ho, Bool.false_eq_true, ↓reduceIte] at hok
+              cases h1 : intBoolTupleOf d.ty with
+              | some it =>
+                cases rv <;> simp [directBorrowOf] at hdb <;> simp [h1, copyRv, rvalueOkTuple] at hok
+              | none =>
+                simp only [h1] at hok
+                cases h2 : intTypeOf d.ty with
+                | some it =>
+                  cases rv <;> simp [directBorrowOf] at hdb <;>
+                    simp [h2, copyRv, rvalueOk, ptrDerefReadOk] at hok
+                | none => simp [scalarTypeOf, hb, ho, h1, h2] at hsc_d
+      | cons pr rest =>
+        cases pr with
+        | deref =>
+          cases rest with
+          | nil => exact statementOk_not_deref_assign_of_scalar hsc hok
+          | cons _ _ => simp [statementOk] at hok
+        | field idx fTy =>
+          simp only [statementOk, Bool.and_eq_true] at hok
+          obtain ⟨_, hbr⟩ := hok
+          cases hpi : placeIntType layouts decls ⟨i, .field idx fTy :: rest⟩ with
+          | some it => simp [hpi, (rvalueOk_not_borrow it hne).1] at hbr
+          | none =>
+            simp only [hpi] at hbr
+            cases htp : tuplePlaceSpec layouts decls ⟨i, .field idx fTy :: rest⟩ with
+            | none => simp [htp] at hbr
+            | some fsa =>
+              rcases fsa with ⟨fields, size, align⟩
+              cases hpm : placeMirTy decls ⟨i, .field idx fTy :: rest⟩ with
+              | none => simp [htp, hpm] at hbr
+              | some dstTy => simp [htp, hpm, tupleRvalueOk_not_borrow hne] at hbr
+        | index idxLoc =>
+          cases rest with
+          | nil =>
+            simp only [statementOk] at hok
+            cases ha : (decls[i]?.bind fun x => arrayTypeOf x.ty) with
+            | none => simp [Option.bind_eq_bind, ha] at hok
+            | some ec => simp [Option.bind_eq_bind, ha, (rvalueOk_not_borrow ec.1 hne).1] at hok
+          | cons _ _ => simp [statementOk] at hok
+        | constantIndex o ml fe =>
+          cases rest with
+          | nil =>
+            simp only [statementOk] at hok
+            cases ha : (decls[i]?.bind fun x => arrayTypeOf x.ty) with
+            | none => simp [Option.bind_eq_bind, ha] at hok
+            | some ec => simp [Option.bind_eq_bind, ha, (rvalueOk_not_borrow ec.1 hne).1] at hok
+          | cons _ _ => simp [statementOk] at hok
+        | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+          cases rest with
+          | nil =>
+            simp only [statementOk] at hok
+            cases ha : (decls[i]?.bind fun x => arrayTypeOf x.ty) with
+            | none => simp [Option.bind_eq_bind, ha] at hok
+            | some ec => simp [Option.bind_eq_bind, ha, projOk] at hok
+          | cons _ _ => simp [statementOk] at hok
+  | _ => rfl
+
+private theorem bodyAddrTakenLocals_eq_nil_of_scalar {body : MirAst.CapturedMir}
+    (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true) :
+    bodyAddrTakenLocals body = [] := by
+  unfold bodyAddrTakenLocals
+  rw [List.flatMap_eq_nil_iff]
+  intro bb hbb
+  rw [List.filterMap_eq_nil_iff]
+  intro s hs
+  exact progStatementOk_not_directBorrow_of_scalar hsc (hbbs bb hbb s hs)
+
+private theorem progStatementOk_ptrStmtOk_initPtrEnv {decls : List MirAst.LocalDecl}
+    {s : MirAst.Statement} {layouts : Layout.LayoutTable}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true)
+    (hok : progStatementOk decls s layouts = true) :
+    ptrStmtOk (initPtrEnv decls.length) s = true := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    rcases dst with ⟨i, projs⟩
+    cases projs with
+    | nil =>
+      dsimp only [ptrStmtOk]
+      cases hpr : ptrDerefReadSrc rv with
+      | some p =>
+        have hlt : p < decls.length := by
+          have hderef : ∃ rest, copyRv rv = .use (.copy ⟨p, .deref :: rest⟩) := by
+            unfold ptrDerefReadSrc at hpr
+            cases hcr : copyRv rv with
+            | use op =>
+              cases op with
+              | copy pl =>
+                rcases pl with ⟨p', prs⟩
+                cases prs with
+                | nil => simp [hcr] at hpr
+                | cons pr0 rest =>
+                  cases pr0 <;> simp [hcr] at hpr
+                  subst hpr; exact ⟨rest, rfl⟩
+              | _ => simp [hcr] at hpr
+            | _ => simp [hcr] at hpr
+          obtain ⟨rest, hcr⟩ := hderef
+          simp only [progStatementOk, statementOk] at hok
+          cases hd : decls[i]? with
+          | none => simp [hd] at hok
+          | some d =>
+            have hsc_d := hsc d (List.mem_of_getElem? hd)
+            simp only [hd, hcr] at hok
+            by_cases hb : isBoolTy d.ty
+            · simp [hb, rvalueOkB, operandOkB] at hok
+            · by_cases ho : isOrderingTy d.ty
+              · simp [hb, ho, rvalueOkO, operandOkO] at hok
+              · simp only [hb, ho, Bool.false_eq_true, ↓reduceIte] at hok
+                cases h1 : intBoolTupleOf d.ty with
+                | some it => simp [h1, rvalueOkTuple, operandOkTuple] at hok
+                | none =>
+                  simp only [h1] at hok
+                  cases h2 : intTypeOf d.ty with
+                  | some it =>
+                    simp only [h2, Bool.or_eq_true] at hok
+                    rcases hok with hr | hp
+                    · cases rest with
+                      | cons _ _ => simp [rvalueOk, operandOk, placeOk] at hr
+                      | nil =>
+                        simp only [rvalueOk, operandOk, placeOk, Bool.and_eq_true,
+                          decide_eq_true_eq] at hr
+                        exact hr.1.1
+                    · cases rest with
+                      | cons _ _ => simp [ptrDerefReadOk] at hp
+                      | nil =>
+                        simp only [ptrDerefReadOk, Bool.and_eq_true, decide_eq_true_eq] at hp
+                        exact hp.1
+                  | none => simp [scalarTypeOf, hb, ho, h1, h2] at hsc_d
+        dsimp only
+        rw [initPtrEnv_getD_lt_prog hlt]
+        rfl
+      | none =>
+        cases hrb : reborrowParentOf rv with
+        | none => rfl
+        | some p =>
+          exfalso
+          simp only [progStatementOk, statementOk] at hok
+          cases hd : decls[i]? with
+          | none => simp [hd] at hok
+          | some d =>
+            have hsc_d := hsc d (List.mem_of_getElem? hd)
+            simp only [hd] at hok
+            by_cases hb : isBoolTy d.ty
+            · cases rv <;> simp [reborrowParentOf] at hrb <;> simp [hb, copyRv, rvalueOkB] at hok
+            · by_cases ho : isOrderingTy d.ty
+              · cases rv <;> simp [reborrowParentOf] at hrb <;> simp [hb, ho, copyRv, rvalueOkO] at hok
+              · simp only [hb, ho, Bool.false_eq_true, ↓reduceIte] at hok
+                cases h1 : intBoolTupleOf d.ty with
+                | some it =>
+                  cases rv <;> simp [reborrowParentOf] at hrb <;> simp [h1, copyRv, rvalueOkTuple] at hok
+                | none =>
+                  simp only [h1] at hok
+                  cases h2 : intTypeOf d.ty with
+                  | some it =>
+                    cases rv <;> simp [reborrowParentOf] at hrb <;>
+                      simp [h2, copyRv, rvalueOk, ptrDerefReadOk] at hok
+                  | none => simp [scalarTypeOf, hb, ho, h1, h2] at hsc_d
+    | cons pr rest =>
+      cases pr with
+      | deref =>
+        cases rest with
+        | nil =>
+          simp only [progStatementOk] at hok
+          exact False.elim (statementOk_not_deref_assign_of_scalar hsc hok)
+        | cons _ _ => rfl
+      | _ => rfl
+  | retag rk pl =>
+    rcases pl with ⟨p, projs⟩
+    cases projs with
+    | cons _ _ => rfl
+    | nil =>
+      simp only [progStatementOk, statementOk, isDeclPtrLocal_false_of_scalar hsc p,
+        Bool.and_false] at hok
+      cases hok
+  | _ => rfl
+
+private theorem blockPtrAliasOk_initPtrEnv_of_scalar {decls : List MirAst.LocalDecl}
+    {layouts : Layout.LayoutTable}
+    (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true) :
+    ∀ (ss : List MirAst.Statement),
+      (∀ s ∈ ss, progStatementOk decls s layouts = true) →
+      blockPtrAliasOk decls (initPtrEnv decls.length) ss = true
+  | [], _ => rfl
+  | s :: ss, hok => by
+    have hs := hok s (List.mem_cons_self ..)
+    simp only [blockPtrAliasOk, progStatementOk_ptrStmtOk_initPtrEnv hsc hs,
+      progStatementOk_ptrStmtStep_initPtrEnv hsc hs, Bool.true_and]
+    exact blockPtrAliasOk_initPtrEnv_of_scalar hsc ss (fun s' hs' => hok s' (List.mem_cons_of_mem s hs'))
+
+private theorem stmtPreservesAddrTaken_nil (s : MirAst.Statement) :
+    stmtPreservesAddrTaken [] s = true := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    simp only [stmtPreservesAddrTaken, List.contains_nil, Bool.not_false, Bool.true_and]
+    rw [List.all_eq_true]
+    intro op _
+    cases opMoved op <;> rfl
+  | intrinsic intr =>
+    cases intr with
+    | assume op =>
+      simp only [stmtPreservesAddrTaken, List.all_cons, List.all_nil, Bool.and_true]
+      cases opMoved op <;> rfl
+    | _ => rfl
+  | deinit _ | storageLive _ | storageDead _ => simp [stmtPreservesAddrTaken]
+  | _ => rfl
+
+private theorem termPreservesAddrTaken_nil (t : MirAst.Terminator) :
+    termPreservesAddrTaken [] t = true := by
+  obtain ⟨kind, span⟩ := t
+  cases kind with
+  | switchInt discr _ =>
+    dsimp only [termPreservesAddrTaken]
+    cases opMoved discr <;> rfl
+  | call _ argOps dst _ _ =>
+    simp only [termPreservesAddrTaken, List.contains_nil, Bool.not_false, Bool.true_and]
+    rw [List.all_eq_true]
+    intro op _
+    cases opMoved op <;> rfl
+  | _ => rfl
+
+theorem ptrAliasingProgOk_of_scalar (body : MirAst.CapturedMir)
+    (hsc : ∀ d ∈ body.localDecls, (scalarTypeOf d.ty).isSome = true)
+    (hbbs : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true) :
+    ptrAliasingProgOk body = true := by
+  dsimp only [ptrAliasingProgOk]
+  rw [bodyAddrTakenLocals_eq_nil_of_scalar hsc hbbs]
+  rw [ptrProgEnvAtEntry_of_scalar 0 hsc hbbs]
+  have hsub_self : subsumesPtrEnv body.localDecls.length
+      (initPtrEnv body.localDecls.length) (initPtrEnv body.localDecls.length) = true := by
+    simp only [subsumesPtrEnv, List.all_eq_true, List.mem_range]
+    intro q hq
+    rw [initPtrEnv_getD_lt_prog hq]
+    rfl
+  have hpres : (body.basicBlocks.all fun bb =>
+      bb.statements.all (stmtPreservesAddrTaken []) &&
+      termPreservesAddrTaken [] bb.terminator) = true := by
+    rw [List.all_eq_true]
+    intro bb _
+    rw [Bool.and_eq_true]
+    exact ⟨List.all_eq_true.mpr (fun s _ => stmtPreservesAddrTaken_nil s),
+      termPreservesAddrTaken_nil bb.terminator⟩
+  rw [List.all_nil, hpres, hsub_self]
+  simp only [Bool.true_and, List.all_eq_true]
+  intro blk _
+  cases hbb : body.basicBlocks[blk]? with
+  | none => rfl
+  | some bb =>
+    have hmem : bb ∈ body.basicBlocks := List.mem_of_getElem? hbb
+    dsimp only
+    rw [ptrProgEnvAtEntry_of_scalar blk hsc hbbs,
+      foldl_ptrStmtStep_initPtrEnv hsc bb.statements (hbbs bb hmem),
+      ptrTermStep_initPtrEnv_of_scalar hsc bb.terminator,
+      blockPtrAliasOk_initPtrEnv_of_scalar hsc bb.statements (hbbs bb hmem),
+      Bool.true_and, List.all_eq_true]
+    intro t _
+    rw [ptrProgEnvAtEntry_of_scalar t hsc hbbs]
+    exact hsub_self
+
+theorem translateProgFnsWithIntrinsics_eq_of_no_provCast (fnMap : FnMap) :
+    ∀ (idx : Nat) (bs : List MirAst.CapturedMir),
+      (∀ b ∈ bs, ∀ bb ∈ b.basicBlocks, ∀ s ∈ bb.statements, isProvCastStmt s = false) →
+      translateProgFnsWithIntrinsics fnMap idx bs = translateProgFns fnMap idx bs
+  | _, [], _ => rfl
+  | idx, b :: bs, hnp => by
+    have hb := translateFnInProgWithIntrinsics_eq_of_no_provCast fnMap b
+      (hnp b (List.mem_cons_self ..))
+    have hbs := translateProgFnsWithIntrinsics_eq_of_no_provCast fnMap (idx + 1) bs
+      (fun b' hb' => hnp b' (List.mem_cons_of_mem b hb'))
+    simp [translateProgFnsWithIntrinsics, translateProgFns, hb, hbs]
+
+theorem translateProgWithIntrinsics_eq_of_no_provCast
+    (entry : MirAst.CapturedMir) (callees : List MirAst.CapturedMir)
+    (hnp : ∀ b ∈ entry :: callees, ∀ bb ∈ b.basicBlocks, ∀ s ∈ bb.statements,
+      isProvCastStmt s = false) :
+    translateProgWithIntrinsics entry callees = translateProg entry callees := by
+  simp only [translateProgWithIntrinsics, translateProg,
+    translateProgFnsWithIntrinsics_eq_of_no_provCast _ 0 (entry :: callees) hnp]
+
+private theorem mapM_translateStmtResult_not_provCast {decls : List MirAst.LocalDecl}
+    {layouts : Layout.LayoutTable} :
+    ∀ (ss : List MirAst.Statement) (res : List StatementResult),
+      ss.mapM (translateStmtResult decls · layouts) = some res →
+      ∀ s ∈ ss, isProvCastStmt s = false
+  | [], _, _, s, hs => by cases hs
+  | s0 :: ss, _, h, s, hs => by
+    simp only [List.mapM_cons, Option.bind_eq_bind] at h
+    cases h0 : translateStmtResult decls s0 layouts with
+    | none => simp [h0] at h
+    | some r0 =>
+      simp only [h0, Option.bind_some] at h
+      cases hss : ss.mapM (translateStmtResult decls · layouts) with
+      | none => simp [hss] at h
+      | some rs =>
+        rcases List.mem_cons.mp hs with rfl | hs'
+        · exact translateStmtResult_not_provCast h0
+        · exact mapM_translateStmtResult_not_provCast ss rs hss s hs'
+
+private theorem translateBlocksInProg_not_provCast {fnMap : FnMap}
+    {layouts : Layout.LayoutTable} {decls : List MirAst.LocalDecl} :
+    ∀ (i nextCleanup : Nat) (bbs : List MirAst.BasicBlockData)
+      (out : List (Gen.BbName × Gen.BasicBlock) × List (Gen.BbName × Gen.BasicBlock)),
+      translateBlocksInProg fnMap layouts decls i nextCleanup bbs = some out →
+      ∀ bb ∈ bbs, ∀ s ∈ bb.statements, isProvCastStmt s = false
+  | _, _, [], _, _, bb, hbb => by cases hbb
+  | i, nextCleanup, bb0 :: bbs, _, h, bb, hbb => by
+    simp only [translateBlocksInProg, Option.bind_eq_bind] at h
+    cases hss : bb0.statements.mapM (translateStmtResult decls · layouts) with
+    | none => simp [hss] at h
+    | some results =>
+      simp only [hss, Option.bind_some] at h
+      cases hterm : translateTerminatorInProg fnMap layouts decls
+          (splitStmts (bbName i) [] nextCleanup results).2.2.2 bb0.terminator with
+      | none => simp [hterm] at h
+      | some tre =>
+        rcases tre with ⟨term, nextCleanup', extra1⟩
+        simp only [hterm, Option.bind_some] at h
+        cases hrest : translateBlocksInProg fnMap layouts decls (i + 1) nextCleanup' bbs with
+        | none => simp [hrest] at h
+        | some restOut =>
+          rcases List.mem_cons.mp hbb with rfl | hbb'
+          · exact mapM_translateStmtResult_not_provCast _ results hss
+          · exact translateBlocksInProg_not_provCast (i + 1) nextCleanup' bbs restOut hrest bb hbb'
+
+theorem translateFnInProg_not_provCast {fnMap : FnMap} {body : MirAst.CapturedMir}
+    {f : Gen.Function} (h : translateFnInProg fnMap body = some f) :
+    (∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements, isProvCastStmt s = false) ∧
+      hasProvCast body = false := by
+  simp only [translateFnInProg, Option.bind_eq_bind] at h
+  cases hconv : translateCallConv body.fnAbi.conv with
+  | none => simp [hconv] at h
+  | some conv =>
+    simp only [hconv, Option.bind_some] at h
+    cases hloc : translateLocals body.layouts 0 body.localDecls with
+    | none => simp [hloc] at h
+    | some locals =>
+      simp only [hloc, Option.bind_some] at h
+      cases hblks : translateBlocksInProg fnMap body.layouts body.localDecls
+          0 (body.basicBlocks.length + 1) body.basicBlocks with
+      | none => simp [hblks] at h
+      | some out =>
+        have hno := translateBlocksInProg_not_provCast 0 (body.basicBlocks.length + 1)
+          body.basicBlocks out hblks
+        refine ⟨hno, ?_⟩
+        unfold hasProvCast
+        rw [List.any_eq_false]
+        intro bb hbb hany
+        rw [List.any_eq_true] at hany
+        obtain ⟨s, hs, hp⟩ := hany
+        rw [hno bb hbb s hs] at hp
+        cases hp
+
+theorem terminatorOk_not_call {layouts : Layout.LayoutTable}
+    {decls : List MirAst.LocalDecl} {nblocks : Nat} {t : MirAst.Terminator}
+    (h : terminatorOk layouts decls nblocks t = true) :
+    isNonDivergingCall t = false ∧
+    (∀ fn args dst tgt unw, t.kind ≠ .call fn args dst tgt unw) := by
+  obtain ⟨kind, span⟩ := t
+  cases kind <;> simp [terminatorOk, isNonDivergingCall] at h ⊢
+
+theorem callCalleesOf_eq_nil_of_terminatorOk {body : MirAst.CapturedMir}
+    (hterm : ∀ bb ∈ body.basicBlocks,
+      terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator = true) :
+    callCalleesOf body = [] := by
+  unfold callCalleesOf
+  rw [List.filterMap_eq_nil_iff]
+  intro bb hbb
+  have hnc := (terminatorOk_not_call (hterm bb hbb)).2
+  cases hk : bb.terminator.kind with
+  | call fn args dst tgt unw => exact False.elim (hnc fn args dst tgt unw hk)
+  | _ => rfl
+
+private theorem mapM_translateStmtResultWithIntrinsics_isSome_of_orIntrinsic
+    {decls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable} :
+    ∀ (ss : List MirAst.Statement) (trs : List StmtTranslation),
+      ss.mapM (translateStmtOrIntrinsic decls · layouts) = some trs →
+      ss.mapM (translateStmtResultWithIntrinsics decls · layouts) =
+        some (trs.map StmtTranslation.toStatementResult)
+  | [], _, h => by
+    simp only [List.mapM_nil, Option.pure_def, Option.some.injEq] at h
+    subst h; rfl
+  | s :: ss, _, h => by
+    simp only [List.mapM_cons, Option.bind_eq_bind] at h
+    cases hs : translateStmtOrIntrinsic decls s layouts with
+    | none => simp [hs] at h
+    | some tr0 =>
+      simp only [hs, Option.bind_some] at h
+      cases hss : ss.mapM (translateStmtOrIntrinsic decls · layouts) with
+      | none => simp [hss] at h
+      | some rest =>
+        simp only [hss, Option.bind_some, Option.pure_def, Option.some.injEq] at h
+        subst h
+        have ih := mapM_translateStmtResultWithIntrinsics_isSome_of_orIntrinsic ss rest hss
+        simp only [List.mapM_cons, Option.bind_eq_bind, ih, Option.bind_some]
+        simp [translateStmtResultWithIntrinsics, hs]
+
+private theorem translateBlocksInProgWithIntrinsics_isSome_of_blocksWithIntrinsics
+    (fnMap : FnMap) {layouts : Layout.LayoutTable} {decls : List MirAst.LocalDecl}
+    {nblocks : Nat} :
+    ∀ (i nf nc : Nat) (bbs : List MirAst.BasicBlockData)
+      (out : List (Gen.BbName × Gen.BasicBlock) × Nat),
+      (∀ bb ∈ bbs, terminatorOk layouts decls nblocks bb.terminator = true) →
+      translateBlocksWithIntrinsics layouts decls i nf bbs = some out →
+      (translateBlocksInProgWithIntrinsics fnMap layouts decls i nc bbs).isSome = true
+  | _, _, _, [], _, _, _ => rfl
+  | i, nf, nc, bb :: bbs, _, hterm, h => by
+    simp only [translateBlocksWithIntrinsics, Option.bind_eq_bind] at h
+    cases hss : bb.statements.mapM (translateStmtOrIntrinsic decls · layouts) with
+    | none => simp [hss] at h
+    | some trs =>
+      simp only [hss, Option.bind_some] at h
+      cases htm : translateTerminator layouts decls bb.terminator with
+      | none => simp [htm] at h
+      | some term =>
+        simp only [htm, Option.bind_some] at h
+        cases hrest : translateBlocksWithIntrinsics layouts decls (i + 1)
+            (splitBlockAtIntrinsics (bbName i) [] term
+              (if bb.isCleanup then Gen.BbKind.Cleanup else .Regular) nf trs).2 bbs with
+        | none => simp [hrest] at h
+        | some restOut =>
+          have hss' := mapM_translateStmtResultWithIntrinsics_isSome_of_orIntrinsic
+            bb.statements trs hss
+          have hnc := (terminatorOk_not_call (hterm bb (List.mem_cons_self ..))).2
+          have htmInProg : translateTerminatorInProg fnMap layouts decls
+              (splitStmts (bbName i) [] nc (trs.map StmtTranslation.toStatementResult)).2.2.2
+              bb.terminator =
+              (some (term,
+                (splitStmts (bbName i) [] nc (trs.map StmtTranslation.toStatementResult)).2.2.2,
+                [])) := by
+            rcases hbt : bb.terminator with ⟨tk, tspan⟩
+            rw [hbt] at hnc htm
+            cases tk with
+            | call fn args dst tgt unw => exact False.elim (hnc fn args dst tgt unw rfl)
+            | _ => simp [translateTerminatorInProg, htm]
+          have ih := translateBlocksInProgWithIntrinsics_isSome_of_blocksWithIntrinsics fnMap
+            (i + 1) _ (splitStmts (bbName i) [] nc (trs.map StmtTranslation.toStatementResult)).2.2.2
+            bbs restOut
+            (fun b hb => hterm b (List.mem_cons_of_mem bb hb)) hrest
+          obtain ⟨restRes, hrestRes⟩ := Option.isSome_iff_exists.mp ih
+          rcases restRes with ⟨restBlks, extraRest⟩
+          simp [translateBlocksInProgWithIntrinsics, hss', htmInProg, hrestRes]
+
+theorem translateFnInProgWithIntrinsics_isSome_of_translateFnWithIntrinsics
+    (fnMap : FnMap) {body : MirAst.CapturedMir} {f : Gen.Function}
+    (hterm : ∀ bb ∈ body.basicBlocks,
+      terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator = true)
+    (h : translateFnWithIntrinsics body = some f) :
+    (translateFnInProgWithIntrinsics fnMap body).isSome = true := by
+  simp only [translateFnWithIntrinsics, Option.bind_eq_bind] at h
+  cases hconv : translateCallConv body.fnAbi.conv with
+  | none => simp [hconv] at h
+  | some conv =>
+    simp only [hconv, Option.bind_some] at h
+    cases hloc : translateLocals body.layouts 0 body.localDecls with
+    | none => simp [hloc] at h
+    | some locals =>
+      simp only [hloc, Option.bind_some] at h
+      cases hblks : translateBlocksWithIntrinsics body.layouts body.localDecls 0
+          body.basicBlocks.length body.basicBlocks with
+      | none => simp [hblks] at h
+      | some out =>
+        have his := translateBlocksInProgWithIntrinsics_isSome_of_blocksWithIntrinsics
+          fnMap 0 body.basicBlocks.length (body.basicBlocks.length + 1)
+          body.basicBlocks out hterm hblks
+        obtain ⟨⟨blks, extra⟩, hbe⟩ := Option.isSome_iff_exists.mp his
+        simp [translateFnInProgWithIntrinsics, hconv, hloc, hbe]
+
+/-- Per-function sound correspondence fragment within a multi-function program
+with intra-frame pointers, references, reborrows, `Transmute`, `Assume`,
+`PointerExposeProvenance`, and `PointerWithExposedProvenance` intrinsics, plus
+scalar-interface `Call` terminators (`terminatorInProgOk`):
+* return local `_0` is scalar (`scalarTypeOf`) and parameters `_1 .. _argCount`
+  are non-pointer (`!isPtrTy`), preventing Anneal's un-namespaced
+  `BorrowEntry.targetLocal : Nat` from resolving against a callee's own local
+  slots across frames;
+* temporaries are scalar or pointer/reference (`scalarTypeOf` or `isPtrTy`);
+* provenance casts satisfy `provCastFlowOk body`;
+* intra-frame and cross-call borrows satisfy
+  `ptrAliasingProgOk (provCastAliasView body)` (disabling caller borrows across
+  returning `Call`s because any callee root assignment `_k = rv` runs
+  `invalidateConflictingBorrows` on the shared `s.memory.borrows` table). -/
+def bodyInProgFragmentWithIntrinsics (fnMap : FnMap)
+    (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir) : Bool :=
+  body.isRuntimePostCleanup &&
+  decide (body.argCount + 1 ≤ body.localDecls.length) &&
+  decide (body.localDecls.length < 2 ^ 31) &&
+  (body.localDecls[0]? >>= (scalarTypeOf ·.ty)).isSome &&
+  body.localDecls.all (localDeclOk body.layouts) &&
+  ((body.localDecls.drop 1).take body.argCount).all (fun d => !isPtrTy d.ty) &&
+  (body.localDecls.drop (body.argCount + 1)).all
+    (fun d => (scalarTypeOf d.ty).isSome || isPtrTy d.ty) &&
+  decide (body.basicBlocks ≠ []) &&
+  (List.range body.basicBlocks.length).all (fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb =>
+      !bb.isCleanup &&
+      bb.statements.all (statementOkWithIntrinsics body.localDecls · body.layouts) &&
+      terminatorInProgOk callees body blk bb.terminator
+    | none => true) &&
+  storageDeadOk body && movesOk body && mentionsOk body &&
+  livenessOk body && tupleInitOk body &&
+  provCastFlowOk body && ptrAliasingProgOk (provCastAliasView body) &&
+  (translateFnInProgWithIntrinsics fnMap body).isSome
+
+/-- Decidable sound multi-function correspondence fragment unifying
+`progInFragment` (multi-function `Call` + `Assume`) and
+`inFragmentWithIntrinsics` (intra-frame pointers, references, reborrows,
+`Transmute`, `Assume`, `PointerExposeProvenance`, and
+`PointerWithExposedProvenance`). -/
+def progInFragmentWithIntrinsics (entry : MirAst.CapturedMir)
+    (callees : List MirAst.CapturedMir) : Bool :=
+  let fnMap := fnNameMap entry callees
+  ((entry :: callees).map (·.defPath)).Nodup &&
+  (entry :: callees).all (bodyInProgFragmentWithIntrinsics fnMap callees) &&
+  (match maxStackLocals entry callees with
+   | some bound => decide (bound < 2 ^ 31)
+   | none => false) &&
+  (translateProgWithIntrinsics entry callees).isSome
+
+theorem bodyInProgFragment_implies_withIntrinsics {fnMap : FnMap}
+    {callees : List MirAst.CapturedMir} {body : MirAst.CapturedMir}
+    (h : bodyInProgFragment fnMap callees body = true) :
+    bodyInProgFragmentWithIntrinsics fnMap callees body = true := by
+  simp only [bodyInProgFragment, bodyInProgFragmentWithIntrinsics,
+    Bool.and_eq_true, List.all_eq_true] at h ⊢
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, hsc⟩, h5⟩, hbbs⟩, h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, htr⟩ := h
+  obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp htr
+  obtain ⟨hnp_stmt, hnp⟩ := translateFnInProg_not_provCast hf
+  have hlen_pos : 0 < body.localDecls.length := by
+    simp only [decide_eq_true_eq] at h2; omega
+  have hd0 : (body.localDecls[0]? >>= (scalarTypeOf ·.ty)).isSome = true := by
+    have hd0_eq : body.localDecls[0]? = some body.localDecls[0] := List.getElem?_eq_getElem hlen_pos
+    simp only [hd0_eq, Option.bind_eq_bind, Option.bind_some]
+    exact hsc body.localDecls[0] (List.mem_of_getElem? hd0_eq)
+  have hdeclOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true := by
+    intro d hd
+    simp [localDeclOk, hsc d hd]
+  have hargs : ∀ d ∈ (body.localDecls.drop 1).take body.argCount, (!isPtrTy d.ty) = true := by
+    intro d hd
+    have hmem : d ∈ body.localDecls := List.mem_of_mem_drop (List.mem_of_mem_take hd)
+    simp [isPtrTy_false_of_scalarTypeOf (hsc d hmem)]
+  have htemps : ∀ d ∈ body.localDecls.drop (body.argCount + 1),
+      ((scalarTypeOf d.ty).isSome || isPtrTy d.ty) = true := by
+    intro d hd
+    simp [hsc d (List.mem_of_mem_drop hd)]
+  have hbbs_stmt : ∀ bb ∈ body.basicBlocks, ∀ s ∈ bb.statements,
+      progStatementOk body.localDecls s body.layouts = true := by
+    intro bb hbb s hs
+    obtain ⟨blk, hblk, rfl⟩ := List.getElem_of_mem hbb
+    have hb := hbbs blk (List.mem_range.mpr hblk)
+    simp only [List.getElem?_eq_getElem hblk, Bool.and_eq_true, List.all_eq_true] at hb
+    exact hb.1.2 s hs
+  have hbbs' : ∀ blk ∈ List.range body.basicBlocks.length,
+      (match body.basicBlocks[blk]? with
+       | some bb =>
+         !bb.isCleanup &&
+         bb.statements.all (statementOkWithIntrinsics body.localDecls · body.layouts) &&
+         terminatorInProgOk callees body blk bb.terminator
+       | none => true) = true := by
+    intro blk hblk
+    have hb := hbbs blk hblk
+    cases hget : body.basicBlocks[blk]? with
+    | none => rfl
+    | some bb =>
+      simp only [hget, Bool.and_eq_true, List.all_eq_true] at hb ⊢
+      exact ⟨⟨hb.1.1, fun s hs => by simp [statementOkWithIntrinsics, hb.1.2 s hs]⟩, hb.2⟩
+  have htr' : (translateFnInProgWithIntrinsics fnMap body).isSome = true := by
+    rw [translateFnInProgWithIntrinsics_eq_of_no_provCast fnMap body hnp_stmt, hf]
+    rfl
+  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, hd0⟩, hdeclOk⟩, hargs⟩, htemps⟩, h5⟩, hbbs'⟩,
+    h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, provCastFlowOk_of_not_hasProvCast hnp⟩, ?_⟩, htr'⟩
+  rw [provCastAliasView_of_not_hasProvCast hnp]
+  exact ptrAliasingProgOk_of_scalar body hsc hbbs_stmt
+
+theorem translateProgWithIntrinsics_eq_of_progInFragment
+    {entry : MirAst.CapturedMir} {callees : List MirAst.CapturedMir}
+    (h : progInFragment entry callees = true) :
+    translateProgWithIntrinsics entry callees = translateProg entry callees := by
+  simp only [progInFragment, Bool.and_eq_true, List.all_eq_true] at h
+  obtain ⟨⟨⟨_, hall⟩, _⟩, _⟩ := h
+  apply translateProgWithIntrinsics_eq_of_no_provCast
+  intro b hb
+  have hbf := hall b hb
+  simp only [bodyInProgFragment, Bool.and_eq_true] at hbf
+  obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp hbf.2
+  exact (translateFnInProg_not_provCast hf).1
+
+theorem progInFragment_implies_progInFragmentWithIntrinsics
+    {entry : MirAst.CapturedMir} {callees : List MirAst.CapturedMir}
+    (h : progInFragment entry callees = true) :
+    progInFragmentWithIntrinsics entry callees = true := by
+  have htr_eq := translateProgWithIntrinsics_eq_of_progInFragment h
+  simp only [progInFragment, progInFragmentWithIntrinsics,
+    Bool.and_eq_true, List.all_eq_true] at h ⊢
+  obtain ⟨⟨⟨hnodup, hall⟩, hstack⟩, htr⟩ := h
+  exact ⟨⟨⟨hnodup, fun b hb => bodyInProgFragment_implies_withIntrinsics (hall b hb)⟩,
+    hstack⟩, by rwa [htr_eq]⟩
+
+/-- Per-statement syntactic well-formedness for cross-frame pointer/reference
+translation (`progCrossFrameTranslatable`): admits `statementOkWithIntrinsics`
+plus `Retag([fn entry], _i)` strictly on reference parameter locals (`isRefTy`,
+`1 ≤ i ≤ argCount`). Raw pointer parameters (`*const T` / `*mut T`) are excluded
+because Anneal's `.retag .fnEntry` attaches a strong borrow protector to any
+`.ptr` slot (`Statements.lean`), whereas MiniRust's `Validate` on `PtrType::Raw`
+is a no-op. -/
 def progStmtOkWithIntrinsics (argCount : Nat) (decls : List MirAst.LocalDecl)
     (s : MirAst.Statement) (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
   statementOkWithIntrinsics decls s layouts ||
   match s.kind with
   | .retag .fnEntry ⟨i, []⟩ =>
-    decide (1 ≤ i ∧ i ≤ argCount) && decide (i < decls.length) && isDeclPtrLocal decls i
+    decide (1 ≤ i ∧ i ≤ argCount) && decide (i < decls.length) &&
+    match decls[i]? with
+    | some d => isRefTy d.ty
+    | none => false
   | _ => false
 
-/-- Per-function fragment check within a multi-function program with
-pointer/reference parameters, `Assume`, `PointerExposeProvenance`, and
-`PointerWithExposedProvenance` intrinsics, enforcing address-taken target
-preservation (`stmtPreservesAddrTaken` and `termPreservesAddrTaken`) across
-statements and `Call` terminators. -/
-def bodyInProgFragmentWithIntrinsics (fnMap : FnMap)
+/-- Syntactic per-body translatability check for multi-function programs that
+also pass pointer or reference arguments/returns across `Call` boundaries
+(`callTerminatorOkWithIntrinsics`, `progStmtOkWithIntrinsics`). Such cross-frame
+pointer/reference programs translate cleanly to MiniRust (`Mach` and `MachTB`)
+via `translateProgWithIntrinsics`, but lie outside the sound Anneal–MiniRust
+correspondence fragment `progInFragmentWithIntrinsics` because Anneal's
+`BorrowEntry.targetLocal : Nat` is un-namespaced across frames. -/
+def bodyCrossFrameTranslatable (fnMap : FnMap)
     (callees : List MirAst.CapturedMir) (body : MirAst.CapturedMir) : Bool :=
   let addrLocals := bodyAddrTakenLocals body
   body.isRuntimePostCleanup &&
@@ -5379,17 +6405,117 @@ def bodyInProgFragmentWithIntrinsics (fnMap : FnMap)
   livenessOk body && tupleInitOk body &&
   (translateFnInProgWithIntrinsics fnMap body).isSome
 
-/-- Decidable multi-function fragment check with pointer/reference parameters,
-`Assume`, and provenance-cast intrinsics. -/
-def progInFragmentWithIntrinsics (entry : MirAst.CapturedMir)
+/-- Decidable syntactic translatability check for multi-function programs
+including cross-frame pointer/reference arguments, `Retag(FnEntry)` on reference
+parameters, `Assume`, and provenance-cast intrinsics. Strictly contains
+`progInFragmentWithIntrinsics`
+(`progInFragmentWithIntrinsics_implies_progCrossFrameTranslatable`). -/
+def progCrossFrameTranslatable (entry : MirAst.CapturedMir)
     (callees : List MirAst.CapturedMir) : Bool :=
   let fnMap := fnNameMap entry callees
   ((entry :: callees).map (·.defPath)).Nodup &&
-  (entry :: callees).all (bodyInProgFragmentWithIntrinsics fnMap callees) &&
+  (entry :: callees).all (bodyCrossFrameTranslatable fnMap callees) &&
   (match maxStackLocals entry callees with
    | some bound => decide (bound < 2 ^ 31)
    | none => false) &&
   (translateProgWithIntrinsics entry callees).isSome
+
+private theorem directBorrowOf_provCastAliasStmt (s : MirAst.Statement) :
+    (match (provCastAliasStmt s).kind with
+     | .assign _ rv => Option.map (fun x : MirAst.Mutability × MirAst.Place => x.snd.local_) (directBorrowOf rv)
+     | _ => none) =
+    (match s.kind with
+     | .assign _ rv => Option.map (fun x : MirAst.Mutability × MirAst.Place => x.snd.local_) (directBorrowOf rv)
+     | _ => none) := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    cases rv with
+    | cast ck op ty =>
+      cases ck <;> rfl
+    | _ => rfl
+  | _ => rfl
+
+private theorem bodyAddrTakenLocals_provCastAliasView (body : MirAst.CapturedMir) :
+    bodyAddrTakenLocals (provCastAliasView body) = bodyAddrTakenLocals body := by
+  unfold provCastAliasView
+  split
+  · unfold bodyAddrTakenLocals
+    simp only [List.flatMap_map, List.filterMap_map, Function.comp_def]
+    congr 1; funext a; congr 1; funext x
+    exact directBorrowOf_provCastAliasStmt x
+  · rfl
+
+private theorem stmtPreservesAddrTaken_provCastAliasStmt (addrLocals : List Nat)
+    (s : MirAst.Statement) :
+    stmtPreservesAddrTaken addrLocals (provCastAliasStmt s) =
+      stmtPreservesAddrTaken addrLocals s := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    cases rv with
+    | cast ck op ty =>
+      cases ck <;> rfl
+    | _ => rfl
+  | _ => rfl
+
+theorem bodyInProgFragmentWithIntrinsics_implies_crossFrameTranslatable
+    {fnMap : FnMap} {callees : List MirAst.CapturedMir} {body : MirAst.CapturedMir}
+    (h : bodyInProgFragmentWithIntrinsics fnMap callees body = true) :
+    bodyCrossFrameTranslatable fnMap callees body = true := by
+  simp only [bodyInProgFragmentWithIntrinsics, bodyCrossFrameTranslatable,
+    Bool.and_eq_true, List.all_eq_true] at h ⊢
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, _⟩, h5⟩, _⟩, _⟩, h8⟩, hbbs⟩,
+    h10⟩, h11⟩, h12⟩, h13⟩, h14⟩, _⟩, hptr⟩, htr⟩ := h
+  simp only [ptrAliasingProgOk, bodyAddrTakenLocals_provCastAliasView, Bool.and_eq_true,
+    List.all_eq_true] at hptr
+  obtain ⟨⟨⟨hat_arg, hpres⟩, _⟩, _⟩ := hptr
+  have hat_arg' : ∀ k ∈ bodyAddrTakenLocals body, decide (1 ≤ k ∧ k ≤ body.argCount) = true := by
+    intro k hk
+    have hk' := hat_arg k hk
+    unfold provCastAliasView at hk'
+    split at hk' <;> exact hk'
+  have hpres_body : ∀ bb ∈ body.basicBlocks,
+      (∀ s ∈ bb.statements, stmtPreservesAddrTaken (bodyAddrTakenLocals body) s = true) ∧
+      termPreservesAddrTaken (bodyAddrTakenLocals body) bb.terminator = true := by
+    intro bb hbb
+    unfold provCastAliasView at hpres
+    split at hpres
+    · have hp := hpres { bb with statements := bb.statements.map provCastAliasStmt }
+        (List.mem_map_of_mem hbb)
+      refine ⟨fun s hs => ?_, hp.2⟩
+      rw [← stmtPreservesAddrTaken_provCastAliasStmt]
+      exact hp.1 _ (List.mem_map_of_mem hs)
+    · exact hpres bb hbb
+  have hbbs' : ∀ blk ∈ List.range body.basicBlocks.length,
+      (match body.basicBlocks[blk]? with
+       | some bb =>
+         !bb.isCleanup &&
+         bb.statements.all (progStmtOkWithIntrinsics body.argCount body.localDecls · body.layouts) &&
+         bb.statements.all (stmtPreservesAddrTaken (bodyAddrTakenLocals body)) &&
+         termPreservesAddrTaken (bodyAddrTakenLocals body) bb.terminator &&
+         terminatorInProgOkWithIntrinsics callees body blk bb.terminator
+       | none => true) = true := by
+    intro blk hblk
+    have hb := hbbs blk hblk
+    cases hget : body.basicBlocks[blk]? with
+    | none => rfl
+    | some bb =>
+      obtain ⟨hsp, htp⟩ := hpres_body bb (List.mem_of_getElem? hget)
+      simp only [hget, Bool.and_eq_true, List.all_eq_true] at hb ⊢
+      exact ⟨⟨⟨⟨hb.1.1, fun s hs => by simp [progStmtOkWithIntrinsics, hb.1.2 s hs]⟩,
+        hsp⟩, htp⟩, terminatorInProgOkWithIntrinsics_of_terminatorInProgOk hb.2⟩
+  exact ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h5⟩, h8⟩, hbbs'⟩, hat_arg'⟩, h10⟩, h11⟩, h12⟩, h13⟩, h14⟩, htr⟩
+
+theorem progInFragmentWithIntrinsics_implies_progCrossFrameTranslatable
+    {entry : MirAst.CapturedMir} {callees : List MirAst.CapturedMir}
+    (h : progInFragmentWithIntrinsics entry callees = true) :
+    progCrossFrameTranslatable entry callees = true := by
+  simp only [progInFragmentWithIntrinsics, progCrossFrameTranslatable,
+    Bool.and_eq_true, List.all_eq_true] at h ⊢
+  obtain ⟨⟨⟨hnodup, hall⟩, hstack⟩, htr⟩ := h
+  exact ⟨⟨⟨hnodup, fun b hb => bodyInProgFragmentWithIntrinsics_implies_crossFrameTranslatable (hall b hb)⟩,
+    hstack⟩, htr⟩
 
 
 

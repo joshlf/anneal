@@ -1523,41 +1523,57 @@ These are deliberate and are the first things to lift:
   Pass B2 (MR-4.3) unifies `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
   into `translateStmtOrIntrinsic`, `statementOkWithIntrinsics` (via
   `progStatementOk`), and `inFragmentWithIntrinsics`, and proves the one-step
-  lemma `FrameOkWithIntrinsics.assume_step`; Pass B3 strengthens it to
-  `ProvenanceRel.assume_step_from_frameOk`, proving that when `opBits view (copyOp op) = some 1`,
-  Anneal advances and MiniRust jumps to the continuation block while preserving
-  `FrameOkWithIntrinsics`, `StaleOk` (`StaleOk.assume`), `BorrowsOk`
-  (`BorrowsOk.advance_keep`), `AddrTakenTargetsOk` (`AddrTakenTargetsOk.opPost`),
-  and `ProvenanceRel` (`m4.mem.memory = m.mem.memory` and `m4.intptrcast = m.intptrcast`).
-  Pass B3 also unifies multi-function translation and fragment checking with
-  intrinsics and pointer/reference parameters in `translateFnInProgWithIntrinsics`,
-  `translateProgWithIntrinsics`, `bodyInProgFragmentWithIntrinsics`, and
-  `progInFragmentWithIntrinsics` (agreeing with `translateFnInProg` on
-  provenance-cast-free bodies via `translateFnInProgWithIntrinsics_eq_of_no_provCast`,
-  admitting `Retag([fn entry], _i)` on reference parameters `1 ≤ i ≤ argCount`
-  via `progStmtOkWithIntrinsics`, and enforcing `termPreservesAddrTaken` on
-  `TerminatorKind.call`, witnessed by `callerRefMutProtectedBadCallDstMir` in
-  `callerRefMutProtectedBadCallDst_notInFragmentWithIntrinsics`). The witnesses
-  `assumeReborrowExposeRoundTrip_three_way` and `assumeReborrowFalseUb_three_way`
-  run Anneal, `Mach`, and `MachTB` on `Assume` combined with `&mut` reborrowing
-  and provenance casts, while `callRefMutProtectedRoundTrip_three_way`,
-  `callRefMutProtectorViolation_three_way`, and
-  `callCrossFrameExposeWithExposed_three_way` check `progInFragmentWithIntrinsics = true`,
-  translate concrete multi-function `CapturedMir` pairs via
-  `translateProgWithIntrinsics`, and run them 3-way across Anneal
-  (`mirCallTreeWithCallees`), `Mach` (`BasicMemory`), and `MachTB`
-  (`TreeBorrowsMemory`) on `Terminator::Call` with `&mut u32` function-entry
-  protectors and cross-frame provenance casts (`callCrossFrameExposeWithExposed_three_way`
-  returns `88` on all three semantics; `callRefMutProtectorViolation_three_way`
-  faults on Anneal and `MachTB` while returning `20` on `Mach`; and
-  `callRefMutProtectedRoundTrip_three_way` witnesses why `progInFragment`
-  requires scalar parameters for `multi_step_correspondence`: Anneal's
-  `Terminators.evalTerminator` saves caller locals on `s.memory.callStack`
-  without rebinding `BorrowEntry.targetLocal` across frames, so dereferencing a
-  caller-local reference inside a pushed callee frame faults in Anneal while
-  `Mach` and `MachTB` return `84`). Threading
-  `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across the
-  continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
+  lemma `FrameOkWithIntrinsics.assume_step`; Pass B3/A3 strengthens it to
+  `ProvenanceRel.assume_step_from_frameOk` (preserving `FrameOkWithIntrinsics`,
+  `StaleOk`, `BorrowsOk`, `AddrTakenTargetsOk`, `m4.mem.memory = m.mem.memory`,
+  `m4.intptrcast = m.intptrcast`, and `ProvenanceRel`) and composes it in Pass A3
+  into `ProvenanceRel.assume_then_expose_then_withExposed_from_frameOk` across
+  three MiniRust segments (`Assume -> PointerExposeProvenance ->
+  PointerWithExposedProvenance`).
+  Passes B3 and A3 also unify multi-function translation (`translateFnInProgWithIntrinsics`
+  and `translateProgWithIntrinsics`, agreeing with `translateProg` on
+  provenance-cast-free programs via `translateProgWithIntrinsics_eq_of_no_provCast`
+  and `translateProgWithIntrinsics_eq_of_progInFragment`) while separating two
+  decidable predicates:
+  1. **`progInFragmentWithIntrinsics`** (`bodyInProgFragmentWithIntrinsics`): the
+     sound unified correspondence fragment combining intra-frame pointers,
+     references, reborrows, `Transmute`, `Assume`, `PointerExposeProvenance`, and
+     `PointerWithExposedProvenance` (`provCastFlowOk` and
+     `ptrAliasingProgOk (provCastAliasView body)`) with scalar-boundary `Call`
+     terminators. Both `progInFragment` and `inFragmentWithIntrinsics` embed
+     into it (`progInFragment_implies_progInFragmentWithIntrinsics`,
+     `inFragmentWithIntrinsics_implies_progInFragmentWithIntrinsics`, and
+     `inFragment_implies_progInFragmentWithIntrinsics`), and
+     `callerBorrowExposeAndScalarCall_three_way` witnesses a strict 2-function
+     superset combining `Call`, `&mut`, `&raw mut`, `Retag`, `Assume`, and
+     provenance casts with 3-way agreement (`92` + `MirNoUBTree`). Across
+     returning `Call`s, `ptrAliasingProgOk` (`ptrTermStep`) disables active caller
+     borrows because Anneal's `Statements.evalStmt` runs
+     `invalidateConflictingBorrows` on the shared `s.memory.borrows` table for
+     every callee root assignment (`callerBorrowAcrossScalarCall_divergence`,
+     where both bodies individually satisfy `ptrAliasingOk = true` yet Anneal
+     faults after `Return` while `Mach` and `MachTB` return `42`).
+  2. **`progCrossFrameTranslatable`** (`bodyCrossFrameTranslatable` and
+     `progStmtOkWithIntrinsics`, restricting `.retag .fnEntry` to `isRefTy`
+     reference parameters as witnessed by `callerRawPtrRetagFnEntry_B3_divergence`):
+     the syntactic translatability check for multi-function programs that pass
+     pointers or references across `Call` boundaries
+     (`progInFragmentWithIntrinsics_implies_progCrossFrameTranslatable`). Such
+     programs lie outside sound Anneal–MiniRust correspondence because Anneal's
+     `Terminators.evalTerminator` saves caller locals on `s.memory.callStack`
+     without rebinding `BorrowEntry.targetLocal : Nat` across frames — which not
+     only faults on `callRefMutProtectedRoundTrip_three_way` (and overwrites
+     `callee.frame.locals[1]` on `callRefMutProtectorViolation_three_way`), but
+     can **silently return a wrong scalar with `MirNoUBTree`** when the callee's
+     colliding local slot holds a same-typed scalar
+     (`callerRefMutSilentWrongLocal_divergence`: Anneal returns `137` with no UB
+     while `Mach` and `MachTB` return `42`). Single-body divergences admitted by
+     Pass B3's unguarded predicate (`progInFragmentWithIntrinsicsB3`) are also
+     recorded in `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`,
+     `childReborrowWriteDisablesParent_B3_divergence`, and
+     `exposeSharedRefWriteUb_B3_divergence`.
+  Threading `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across
+  the continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
   from `step_correspondence_N`. A single exposure site in a loop
   does accumulate Tree Borrows tags when the loop retags (`exposeLoopReborrow`,
   in the fragment: `MachTB` stops with `Stop.unsupported` on the second
@@ -1569,16 +1585,15 @@ These are deliberate and are the first things to lift:
   call cycles, indirect function-pointer or virtual calls, and unwinding across
   stack frames (`UnwindResume` / cleanup blocks) remain outside the fragment.
 * **Multi-function correspondence (`multi_step_correspondence`) vs. unified
-  multi-function translation (`translateProgWithIntrinsics`).** `progInFragment`
+  multi-function fragment (`progInFragmentWithIntrinsics`).** `progInFragment`
   (`bodyInProgFragment`) admits integer, `bool`, `Ordering`, and `(Int, bool)`
   locals for the symbolic `multi_step_correspondence` induction, while
   `progInFragmentWithIntrinsics` (`bodyInProgFragmentWithIntrinsics` and
-  `translateProgWithIntrinsics`) extends multi-function translation and fragment
-  checking to pointer/reference parameters, `Retag(FnEntry)` on parameter
-  locals, `Assume`, `PointerExposeProvenance`, and
-  `PointerWithExposedProvenance` (`translateFnInProgWithIntrinsics_eq_of_no_provCast`
-  proves that `translateFnInProgWithIntrinsics` coincides with `translateFnInProg`
-  whenever a body has no provenance casts). The
+  `translateProgWithIntrinsics`) unifies `progInFragment` and
+  `inFragmentWithIntrinsics` under `provCastFlowOk` and
+  `ptrAliasingProgOk (provCastAliasView body)` (and `progCrossFrameTranslatable`
+  checks syntactic `translateProgWithIntrinsics` lowering for cross-frame
+  pointer/reference witnesses). The
   multi-frame relations (`MultiStartRel`, `CallStackRel`) state per-local facts
   at the default layout table, and `itOf_scalar_layouts`,
   `tyOf_scalar_layouts`, `declSlotData_scalar_layouts`, and

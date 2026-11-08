@@ -10854,10 +10854,25 @@ theorem FrameOkWithIntrinsics.assume_step {body : CapturedMir} {f : Gen.Function
       hm4, by dsimp [rethread]; rw [hwm, hmem3], by dsimp [rethread, mSt, withMem]; exact hipc3,
       ⟨hframe.hf, ⟨rfl, h3.shape.active, rfl⟩, h3.locs, hframe.declsOk, hframe.nonScalar⟩⟩
 
+/-- `AddrTakenTargetsOk` transfers from `view` to `actual` along `StaleOk`
+because `StaleOk` never turns a non-`.dead` view slot into `.dead`. -/
+theorem AddrTakenTargetsOk.of_stale {body : CapturedMir} {ctx : Ctx}
+    {actual view : List LocalSlot} {lm : Map Gen.LocalName Ptr} {blk stmt : Nat}
+    (hat : AddrTakenTargetsOk body ctx view lm)
+    (hstale : StaleOk body actual view blk stmt) :
+    AddrTakenTargetsOk body ctx actual lm := by
+  intro k hk
+  obtain ⟨hview_nd, hlm, hd⟩ := hat k hk
+  refine ⟨?_, hlm, hd⟩
+  by_cases heq : actual[k]? = view[k]?
+  · rwa [heq]
+  · rw [(hstale.2 k heq).2.1]; simp
+
 /-- Full cross-feature simulation step for `Intrinsic(Assume(op))` preserving
 `FrameOkWithIntrinsics`, `StaleOk`, `BorrowsOk` (active borrow tags and
-reborrowing permissions), `AddrTakenTargetsOk`, and `ProvenanceRel` (exposed
-provenances in `IntPtrCast`). -/
+reborrowing permissions), `AddrTakenTargetsOk`, `m4.mem.memory = m.mem.memory`,
+`m4.intptrcast = m.intptrcast`, and `ProvenanceRel` (exposed provenances in
+`IntPtrCast`). -/
 theorem ProvenanceRel.assume_step_from_frameOk {body : CapturedMir} {f : Gen.Function}
     {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
     {m : Mach} {exposedTags : List Nat} {curSeg segStmt nextSeg : Nat}
@@ -10892,6 +10907,8 @@ theorem ProvenanceRel.assume_step_from_frameOk {body : CapturedMir} {f : Gen.Fun
       ∃ m4,
         Interp.evalTerminator m
           (.Intrinsic .Assume [op'] unitPlace (some (bbName nextSeg))) = .ok m4 ∧
+        m4.mem.memory = m.mem.memory ∧
+        m4.intptrcast = m.intptrcast ∧
         ProvenanceRel body ctx s' m4 exposedTags ∧
         FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s'.memory.borrows)
           view lm m4 nextSeg 0) := by
@@ -10909,6 +10926,197 @@ theorem ProvenanceRel.assume_step_from_frameOk {body : CapturedMir} {f : Gen.Fun
     hb.advance_keep hbb hst (by simp [ptrStmtStep])
   have hprov1 : ProvenanceRel body ctx (advanceStmt s (opPost s.frame.locals op)) m4 exposedTags :=
     (hprov.of_shape hipc4 (by rw [← hmem4]; exact AllocShapeEq.refl _)).of_advanceStmt _
-  exact ⟨hA1, hstale1, hb1, hat1, m4, hm4, hprov1, hframe4⟩
+  exact ⟨hA1, hstale1, hb1, hat1, m4, hm4, hmem4, hipc4, hprov1, hframe4⟩
+
+/-- Complete 3-segment simulation (`Assume` -> `PointerExposeProvenance` ->
+`PointerWithExposedProvenance`) composing `ProvenanceRel.assume_step_from_frameOk`
+with `ProvenanceRel.expose_then_withExposed_from_frameOk` across three MiniRust
+segments (`curSeg -> nb1 -> nb2 -> nb3`) while preserving `FrameOkWithIntrinsics`,
+`ProvenanceRel`, and `AddrTakenTargetsOk`. -/
+theorem ProvenanceRel.assume_then_expose_then_withExposed_from_frameOk
+    {body : CapturedMir} {f : Gen.Function}
+    {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    {m : Mach} {exposedTags : List Nat} {curSeg segStmt nb1 nb2 nb3 : Nat}
+    {bb : BasicBlockData} {stA : Statement} {opA : Operand} {opA' : Gen.ValueExpr}
+    {i p d : Nat} {di dp dd : LocalDecl}
+    {srcMutbl dstMutbl : MirAst.Mutability} {srcIt dstIt : Gen.IntType}
+    {op1 op2 : MirAst.Operand} {targetTy1 targetTy2 : MirAst.Ty}
+    {span1 span2 : String}
+    {pv : ProvenancePtr}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hframe : FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s.memory.borrows)
+      view lm m curSeg segStmt)
+    (hb : BorrowsOk body ctx view s lm)
+    (hat : AddrTakenTargetsOk body ctx view lm)
+    (hstale : StaleOk body s.frame.locals view s.frame.blockIdx s.frame.stmtIdx)
+    (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    (hstA : bb.statements[s.frame.stmtIdx]? = some stA)
+    (hkA : stA.kind = .intrinsic (.assume opA))
+    (hreadsA : readsOk (movedBefore body s.frame.blockIdx s.frame.stmtIdx) [opA] = true)
+    (hokBA : operandOkB body.layouts body.localDecls (copyOp opA) = true)
+    (hopA : translateOperand body.localDecls opA = some opA')
+    (hbits1 : opBits view (copyOp opA) = some 1)
+    (hop1 : copyOp op1 = .copy ⟨p, []⟩)
+    (hop2 : copyOp op2 = .copy ⟨i, []⟩)
+    (hdi : body.localDecls[i]? = some di)
+    (hit_i : intTypeOf di.ty = some usizeIt)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = [])
+    (hview_i : view[i]? ≠ some .dead)
+    (hdp : body.localDecls[p]? = some dp)
+    (hp_ty : ptrPointeeOf dp.ty = some (srcMutbl, srcIt))
+    (hp : (opPost s.frame.locals opA)[p]? = some (.init (.ptr pv 8)))
+    (hview_p : view[p]? = some (.init (.ptr pv 8)))
+    (hdd : body.localDecls[d]? = some dd)
+    (hd_ty : rawPtrPointeeOf dd.ty = some (dstMutbl, dstIt))
+    (hbor_d : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ d)
+    (hnd_d : ((opPost (opPost s.frame.locals opA) op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))[d]? ≠ some .dead)
+    (hview_d : view[d]? ≠ some .dead)
+    (hnoadj : ∀ (entry : BorrowEntry) (relOff : Nat),
+      lookupBorrow s.memory.borrows pv.tag = some entry →
+      ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+        some (srcIt, relOff) →
+      ∀ q ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed
+          (ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)),
+        q = targetProv ctx entry.targetLocal) :
+    let s0 := advanceStmt s (opPost s.frame.locals opA)
+    let locals1 := (opPost s0.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+    ∃ (entry : BorrowEntry) (relOff : Nat) (mA m4 m6 m8 : Mach),
+      let tAddr : Int := ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)
+      let tProv : Prov := targetProv ctx entry.targetLocal
+      let view1 := view.set i (.init (.scalar ⟨tAddr.toNat, 8⟩))
+      let s1 := advanceStmt s0 locals1 s0.memory
+      let locals2 := (opPost locals1 op2).set d (.init (.ptr pv 8))
+      let view2 := view1.set d (.init (.ptr pv 8))
+      let s2 := advanceStmt s1 locals2 s1.memory
+      lookupBorrow s.memory.borrows pv.tag = some entry ∧
+      ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+        some (srcIt, relOff) ∧
+      evalStmt s stA body.localDecls body.layouts = MirStepNode.step s0 ∧
+      Interp.evalTerminator m
+        (.Intrinsic .Assume [opA'] unitPlace (some (bbName nb1))) = .ok mA ∧
+      evalStmt s0 ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance op1 targetTy1), span1⟩
+        body.localDecls body.layouts = .tau (.running s1) ∧
+      Interp.evalTerminator mA
+        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))]
+          (.Local (localName i)) (some (bbName nb2))) = .ok m4 ∧
+      evalStmt s1 ⟨.assign ⟨d, []⟩ (.cast .pointerWithExposedProvenance op2 targetTy2), span2⟩
+        body.localDecls body.layouts = .tau (.running s2) ∧
+      s2.frame.locals[d]? = some (.init (.ptr pv 8)) ∧
+      evalValue m4 (.Load (.Local (localName i))) = .ok ((.Int tAddr, .Int usizeIt), m6) ∧
+      IntPtrCast.int2ptr m6 tAddr = .ok { addr := tAddr, provenance := some tProv } ∧
+      Interp.evalTerminator m4
+        (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName i))]
+          (.Local (localName d)) (some (bbName nb3))) = .ok m8 ∧
+      AllocShapeEq m.mem.memory.allocations m8.mem.memory.allocations ∧
+      ProvenanceRel body ctx s2 m8 (pv.tag :: exposedTags) ∧
+      FrameOkWithIntrinsics body f (ctxWithBorrows body ctx s2.memory.borrows) view2 lm m8 nb3 0 ∧
+      AddrTakenTargetsOk body ctx view2 lm := by
+  have hat_s : AddrTakenTargetsOk body ctx s.frame.locals lm := hat.of_stale hstale
+  obtain ⟨_, _, h1⟩ :=
+    hprov.assume_step_from_frameOk (nextSeg := nb1)
+      hframe hb hat_s hstale hbb hstA hkA hreadsA hokBA hopA
+  obtain ⟨hA0, hstale0, hb0, _, mA, hmA, hmemA, hipcA, hprov0, hframe0⟩ := h1 hbits1
+  let s0 := advanceStmt s (opPost s.frame.locals opA)
+  have hs0_len : s0.frame.locals.length = body.localDecls.length :=
+    hstale0.1.trans hframe.locs.nlocals
+  have hnd0_i : s0.frame.locals[i]? ≠ some .dead := by
+    by_cases heq : s0.frame.locals[i]? = view[i]?
+    · rwa [heq]
+    · rw [(hstale0.2 i heq).2.1]; simp
+  have hnoadj0 : ∀ (entry : BorrowEntry) (relOff : Nat),
+      lookupBorrow s0.memory.borrows pv.tag = some entry →
+      ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+        some (srcIt, relOff) →
+      ∀ q ∈ int2ptrCandidates mA.mem.memory.allocations mA.intptrcast.exposed
+          (ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)),
+        q = targetProv ctx entry.targetLocal := by
+    intro entry relOff hlk hsp q hq
+    rw [hmemA, hipcA] at hq
+    exact hnoadj entry relOff hlk hsp q hq
+  obtain ⟨entry, relOff, m4, m6, m8, hlk, hsp, hA1, hM1, hA2, hsd, harg2, hint, hM2,
+      hshape08, hprov2, hframe2, hat2⟩ :=
+    hprov0.expose_then_withExposed_from_frameOk (targetTy1 := targetTy1) (targetTy2 := targetTy2)
+      (span1 := span1) (span2 := span2) (nb1 := nb2) (nb2 := nb3)
+      hframe0 hb0 hat hop1 hop2 hs0_len hdi hit_i hbor_i hprot hnd0_i hview_i
+      hdp hp_ty hp hview_p hdd hd_ty hbor_d hnd_d hview_d hnoadj0
+  have hshape_mA : AllocShapeEq m.mem.memory.allocations mA.mem.memory.allocations := by
+    rw [hmemA]; exact AllocShapeEq.refl _
+  exact ⟨entry, relOff, mA, m4, m6, m8, hlk, hsp, hA0, hmA, hA1, hM1, hA2, hsd,
+    harg2, hint, hM2, hshape_mA.trans hshape08, hprov2, hframe2, hat2⟩
+
+/-- Every single-body `inFragmentWithIntrinsics` program (intra-frame pointers,
+references, reborrows, `Transmute`, `Assume`, `PointerExposeProvenance`, and
+`PointerWithExposedProvenance`) embeds unconditionally into the unified
+multi-function fragment `progInFragmentWithIntrinsics body []`. -/
+theorem inFragmentWithIntrinsics_implies_progInFragmentWithIntrinsics
+    {body : CapturedMir} (h : inFragmentWithIntrinsics body = true) :
+    progInFragmentWithIntrinsics body [] = true := by
+  simp only [inFragmentWithIntrinsics, Bool.and_eq_true, List.all_eq_true] at h
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, h12⟩,
+    hflow⟩, hptr⟩, htr⟩ := h
+  obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp htr
+  have hterm : ∀ bb ∈ body.basicBlocks,
+      terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator = true :=
+    fun bb hbb => (h9 bb hbb).2
+  have hnoCalls_view : ∀ bb ∈ (provCastAliasView body).basicBlocks,
+      isNonDivergingCall bb.terminator = false := by
+    intro bb hbb
+    unfold provCastAliasView at hbb
+    split at hbb
+    · simp only [List.mem_map] at hbb
+      obtain ⟨bb0, hbb0, rfl⟩ := hbb
+      exact (terminatorOk_not_call (hterm bb0 hbb0)).1
+    · exact (terminatorOk_not_call (hterm bb hbb)).1
+  have hptrProg : ptrAliasingProgOk (provCastAliasView body) = true := by
+    rw [ptrAliasingProgOk_eq_of_no_calls _ hnoCalls_view]
+    exact hptr
+  have hargLe : body.argCount ≤ body.localDecls.length := by
+    simp only [decide_eq_true_eq] at h2; omega
+  have hlv := livenessOk_eq_true (body := body) hargLe
+  have hti := tupleInitOk_eq_true body
+  have hfnSome := translateFnInProgWithIntrinsics_isSome_of_translateFnWithIntrinsics
+    (fnNameMap body []) hterm hf
+  obtain ⟨fProg, hfProg⟩ := Option.isSome_iff_exists.mp hfnSome
+  have hbbs' : ∀ blk ∈ List.range body.basicBlocks.length,
+      (match body.basicBlocks[blk]? with
+       | some bb =>
+         !bb.isCleanup &&
+         bb.statements.all (statementOkWithIntrinsics body.localDecls · body.layouts) &&
+         terminatorInProgOk [] body blk bb.terminator
+       | none => true) = true := by
+    intro blk _
+    cases hget : body.basicBlocks[blk]? with
+    | none => rfl
+    | some bb =>
+      obtain ⟨⟨hc, hss⟩, htm⟩ := h9 bb (List.mem_of_getElem? hget)
+      simp only [Bool.and_eq_true, List.all_eq_true]
+      exact ⟨⟨hc, hss⟩, by simp [terminatorInProgOk, htm]⟩
+  have hbodyOk : bodyInProgFragmentWithIntrinsics (fnNameMap body []) [] body = true := by
+    simp only [bodyInProgFragmentWithIntrinsics, Bool.and_eq_true, List.all_eq_true]
+    exact ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, hbbs'⟩,
+      h10⟩, h11⟩, h12⟩, hlv⟩, hti⟩, hflow⟩, hptrProg⟩, hfnSome⟩
+  have hstack : maxStackLocals body [] = some body.localDecls.length := by
+    simp [maxStackLocals, maxStackLocalsAux, callCalleesOf_eq_nil_of_terminatorOk hterm]
+  have hprogSome : (translateProgWithIntrinsics body []).isSome = true := by
+    simp [translateProgWithIntrinsics, translateProgFnsWithIntrinsics, hfProg]
+  have hnodup : ((body :: ([] : List CapturedMir)).map (·.defPath)).Nodup := by simp
+  simp only [progInFragmentWithIntrinsics, Bool.and_eq_true, List.all_eq_true,
+    decide_eq_true_eq, hstack, hprogSome, Bool.and_true]
+  refine ⟨⟨hnodup, ?_⟩, ?_⟩
+  · intro b hb
+    rcases List.mem_singleton.mp hb with rfl
+    exact hbodyOk
+  · simpa [decide_eq_true_eq] using h3
+
+/-- Every single-body `inFragment` program embeds into
+`progInFragmentWithIntrinsics body []`. -/
+theorem inFragment_implies_progInFragmentWithIntrinsics
+    {body : CapturedMir} (h : inFragment body = true) :
+    progInFragmentWithIntrinsics body [] = true :=
+  inFragmentWithIntrinsics_implies_progInFragmentWithIntrinsics
+    (inFragment_implies_inFragmentWithIntrinsics h)
 
 end MiniRustSpec.Correspondence
