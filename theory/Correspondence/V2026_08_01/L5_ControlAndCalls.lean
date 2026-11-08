@@ -214,6 +214,256 @@ theorem mir_evalStmt_storageLive_and_storageDead
   · intro rv val locals₁ locals₂ mem₁ protHead protTail hEval hGet hSet hProt hConflict
     simp [evalStmt, hEval, hGet, hSet, hProt, hConflict]
 
+/--
+`disableLocalBorrows` preserves the length of the borrow table (`Trusted.Sequence.length`),
+ensuring that fuel bounds parameterized by `Trusted.Sequence.length borrows` (such as
+`isBorrowDescendantOrSelf`) are unchanged.
+-/
+@[simp]
+theorem length_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    Trusted.Sequence.length (disableLocalBorrows borrows loc) =
+      Trusted.Sequence.length borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases hB : Nat.beq hd.targetLocal loc <;>
+      simp [disableLocalBorrows, Trusted.Sequence.length, hB] at ih ⊢ <;>
+        exact ih
+
+/--
+`disableLocalBorrows` is idempotent on the same local: disabling `loc`'s
+borrows a second time (e.g. when `StorageLive(loc)` follows `StorageDead(loc)`)
+produces the identical borrow table.
+-/
+@[simp]
+theorem disableLocalBorrows_idem
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    disableLocalBorrows (disableLocalBorrows borrows loc) loc =
+      disableLocalBorrows borrows loc := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases hB : Nat.beq hd.targetLocal loc <;>
+      simp only [disableLocalBorrows, hB, ih]
+
+/--
+`disableLocalBorrows` commutes across arbitrary locals `loc₁` and `loc₂`.
+-/
+theorem disableLocalBorrows_comm
+    (borrows : List BorrowEntry)
+    (loc₁ loc₂ : Local) :
+    disableLocalBorrows (disableLocalBorrows borrows loc₁) loc₂ =
+      disableLocalBorrows (disableLocalBorrows borrows loc₂) loc₁ := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases h₁ : Nat.beq hd.targetLocal loc₁ <;>
+      cases h₂ : Nat.beq hd.targetLocal loc₂ <;>
+        simp only [disableLocalBorrows, h₁, h₂, ih]
+
+/--
+Disabling borrows targeting `loc₁` preserves `hasProtectedLocalBorrow` for
+every local `loc₂`, because `disableLocalBorrows` modifies only `perm` while
+preserving `targetLocal` and `protector`.
+-/
+@[simp]
+theorem hasProtectedLocalBorrow_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc₁ loc₂ : Local) :
+    hasProtectedLocalBorrow (disableLocalBorrows borrows loc₁) activeProtectors loc₂ =
+      hasProtectedLocalBorrow borrows activeProtectors loc₂ := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases h₁ : Nat.beq hd.targetLocal loc₁ with
+    | false =>
+      cases hC : Bool.and (Nat.beq hd.targetLocal loc₂) (isBorrowProtected activeProtectors hd) <;>
+        simp only [disableLocalBorrows, h₁, hasProtectedLocalBorrow, hC, ih]
+    | true =>
+      have hProt :
+          isBorrowProtected activeProtectors { hd with perm := .disabled } =
+            isBorrowProtected activeProtectors hd := rfl
+      cases hC : Bool.and (Nat.beq hd.targetLocal loc₂) (isBorrowProtected activeProtectors hd) <;>
+        simp only [disableLocalBorrows, h₁, hasProtectedLocalBorrow, hProt, hC, ih]
+
+/--
+`disableLocalBorrows` preserves the parent-tag chain (`tag` and `parentTag`) of
+every entry in `borrows`, so Tree Borrows ancestor-descendant reachability
+(`isBorrowDescendantOrSelfAux`) is invariant under `disableLocalBorrows`.
+-/
+theorem isBorrowDescendantOrSelfAux_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (fuel candidateTag ancestorTag : Nat) :
+    isBorrowDescendantOrSelfAux fuel (disableLocalBorrows borrows loc) candidateTag ancestorTag =
+      isBorrowDescendantOrSelfAux fuel borrows candidateTag ancestorTag := by
+  induction fuel generalizing candidateTag with
+  | zero => rfl
+  | succ fuel' ih =>
+    unfold isBorrowDescendantOrSelfAux
+    cases hEq : Nat.beq candidateTag ancestorTag with
+    | true => rfl
+    | false =>
+      dsimp only
+      rw [lookupBorrow_disableLocalBorrows]
+      cases hLook : lookupBorrow borrows candidateTag with
+      | none => rfl
+      | some entry =>
+        dsimp only
+        cases hB : Nat.beq entry.targetLocal loc <;>
+          cases hP : entry.parentTag <;>
+            simp only [hP] <;>
+              exact ih _
+
+/--
+Tree Borrows ancestor-descendant reachability (`isBorrowDescendantOrSelf`) is
+invariant under `disableLocalBorrows`.
+-/
+@[simp]
+theorem isBorrowDescendantOrSelf_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (candidateTag ancestorTag : Nat) :
+    isBorrowDescendantOrSelf (disableLocalBorrows borrows loc) candidateTag ancestorTag =
+      isBorrowDescendantOrSelf borrows candidateTag ancestorTag := by
+  unfold isBorrowDescendantOrSelf
+  rw [length_disableLocalBorrows, isBorrowDescendantOrSelfAux_disableLocalBorrows]
+
+/--
+Two-step `StorageDead(loc)` followed by `StorageLive(loc)` revival theorem
+(`D2` / `D14a-storage`): when `loc` is in bounds and unprotected
+(`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
+executing `StorageDead(loc)` and then `StorageLive(loc)` steps cleanly in both
+transitions without faulting, advances `stmtIdx` twice, sets `loc` to `.uninit`
+(`localsRevived`), and leaves the borrow table equal to the single pass
+`disableLocalBorrows s.memory.borrows loc` (by `disableLocalBorrows_idem`),
+preserving `hasProtectedLocalBorrow` and `isBorrowDescendantOrSelf`.
+-/
+theorem evalStmt_storageDead_then_storageLive_revive
+    (s : MachineState)
+    (loc loc₂ : Local)
+    (slot : LocalSlot)
+    (localsDead localsRevived : List LocalSlot)
+    (spanDead spanLive : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (candidateTag ancestorTag : Nat)
+    (hGet : get? s.frame.locals loc = .some slot)
+    (hSetDead : set? s.frame.locals loc .dead = .some localsDead)
+    (hGetDead : get? localsDead loc = .some .dead)
+    (hSetRevived : set? localsDead loc .uninit = .some localsRevived)
+    (hNoProt : hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false) :
+    let borrowsDis := disableLocalBorrows s.memory.borrows loc
+    let memDis : Memory := { s.memory with borrows := borrowsDis }
+    let sDead : MachineState := advanceStmt s localsDead memDis
+    let sRevived : MachineState := advanceStmt sDead localsRevived memDis
+    evalStmt s ⟨.storageDead loc, spanDead⟩ localDecls layouts =
+      MirStepNode.step sDead ∧
+    disableLocalBorrows borrowsDis loc = borrowsDis ∧
+    evalStmt sDead ⟨.storageLive loc, spanLive⟩ localDecls layouts =
+      MirStepNode.step sRevived ∧
+    hasProtectedLocalBorrow borrowsDis s.memory.activeProtectors loc₂ =
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc₂ ∧
+    isBorrowDescendantOrSelf borrowsDis candidateTag ancestorTag =
+      isBorrowDescendantOrSelf s.memory.borrows candidateTag ancestorTag := by
+  dsimp only
+  have hDeadStep :
+      evalStmt s ⟨.storageDead loc, spanDead⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s localsDead
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) :=
+    ((evalStmt_storageDead_purges_borrows
+        s loc slot localsDead spanDead localDecls layouts).1
+      hGet hSetDead hNoProt).1
+  have hIdem :
+      disableLocalBorrows (disableLocalBorrows s.memory.borrows loc) loc =
+        disableLocalBorrows s.memory.borrows loc :=
+    disableLocalBorrows_idem s.memory.borrows loc
+  have hNoProtDis :
+      hasProtectedLocalBorrow
+        (disableLocalBorrows s.memory.borrows loc)
+        s.memory.activeProtectors
+        loc = false := by
+    rw [hasProtectedLocalBorrow_disableLocalBorrows]
+    exact hNoProt
+  have hLiveStep :
+      evalStmt
+        (advanceStmt s localsDead
+          { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+        ⟨.storageLive loc, spanLive⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt
+            (advanceStmt s localsDead
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+            localsRevived
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) := by
+    have hRaw :=
+      ((evalStmt_storageLive_purges_borrows
+          (advanceStmt s localsDead
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+          loc .dead localsRevived spanLive localDecls layouts).1
+        hGetDead hSetRevived hNoProtDis).1
+    dsimp [advanceStmt] at hRaw ⊢
+    rw [hIdem] at hRaw
+    exact hRaw
+  refine ⟨hDeadStep, hIdem, hLiveStep,
+    hasProtectedLocalBorrow_disableLocalBorrows s.memory.borrows s.memory.activeProtectors loc loc₂,
+    isBorrowDescendantOrSelf_disableLocalBorrows s.memory.borrows loc candidateTag ancestorTag⟩
+
+/-- Algebraic and structural invariants of `disableLocalBorrows` and two-step
+`StorageDead(loc)` + `StorageLive(loc)` revival (`Statements.lean`):
+1. `disableLocalBorrows` is idempotent on the same local (`disableLocalBorrows_idem`),
+2. `disableLocalBorrows` commutes across locals (`disableLocalBorrows_comm`),
+3. `disableLocalBorrows` preserves borrow-table length (`length_disableLocalBorrows`),
+   active-protector conflict status (`hasProtectedLocalBorrow_disableLocalBorrows`),
+   and Tree Borrows ancestor-descendant reachability
+   (`isBorrowDescendantOrSelf_disableLocalBorrows`), and
+4. Executing `StorageDead(loc)` followed by `StorageLive(loc)` steps cleanly in
+   two steps to the idempotently disabled borrow table
+   (`evalStmt_storageDead_then_storageLive_revive`). -/
+theorem mir_disableLocalBorrows_algebraic_properties
+    (s : MachineState) (loc loc₂ : Local) (slot : LocalSlot)
+    (localsDead localsRevived : List LocalSlot)
+    (spanDead spanLive : String) (candidateTag ancestorTag : Nat) :
+    disableLocalBorrows (disableLocalBorrows s.memory.borrows loc) loc =
+      disableLocalBorrows s.memory.borrows loc ∧
+    disableLocalBorrows (disableLocalBorrows s.memory.borrows loc) loc₂ =
+      disableLocalBorrows (disableLocalBorrows s.memory.borrows loc₂) loc ∧
+    Trusted.Sequence.length (disableLocalBorrows s.memory.borrows loc) =
+      Trusted.Sequence.length s.memory.borrows ∧
+    hasProtectedLocalBorrow (disableLocalBorrows s.memory.borrows loc)
+      s.memory.activeProtectors loc₂ =
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc₂ ∧
+    isBorrowDescendantOrSelf (disableLocalBorrows s.memory.borrows loc)
+      candidateTag ancestorTag =
+      isBorrowDescendantOrSelf s.memory.borrows candidateTag ancestorTag ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      get? localsDead loc = .some .dead →
+      set? localsDead loc .uninit = .some localsRevived →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      let memDis : Memory := { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }
+      let sDead : MachineState := advanceStmt s localsDead memDis
+      let sRevived : MachineState := advanceStmt sDead localsRevived memDis
+      evalStmt s ⟨.storageDead loc, spanDead⟩ = MirStepNode.step sDead ∧
+      evalStmt sDead ⟨.storageLive loc, spanLive⟩ = MirStepNode.step sRevived) := by
+  refine ⟨disableLocalBorrows_idem s.memory.borrows loc,
+    disableLocalBorrows_comm s.memory.borrows loc loc₂,
+    length_disableLocalBorrows s.memory.borrows loc,
+    hasProtectedLocalBorrow_disableLocalBorrows s.memory.borrows s.memory.activeProtectors loc loc₂,
+    isBorrowDescendantOrSelf_disableLocalBorrows s.memory.borrows loc candidateTag ancestorTag,
+    ?_⟩
+  intro hGet hSetDead hGetDead hSetRevived hNoProt
+  have hRev :=
+    evalStmt_storageDead_then_storageLive_revive
+      s loc loc₂ slot localsDead localsRevived spanDead spanLive .nil emptyLayoutTable
+      candidateTag ancestorTag hGet hSetDead hGetDead hSetRevived hNoProt
+  exact ⟨hRev.1, hRev.2.2.1⟩
+
 /-! ## 2. Terminator Dispatch, Unwinding, Call-Stack, and `exact_div` Intrinsic Correspondence -/
 
 /-- Universal proof by structural induction on `branches : List (Nat × BasicBlockIdx)`
@@ -4905,6 +5155,77 @@ theorem stmt_div_placeMention_deref_dangling_ok :
     diffCProbeBounded 16 stmtDivPlaceMentionDanglingPtrOkBody
       (.running (initMachineState stmtDivPlaceMentionDanglingPtrOkBody [])) =
       .some (.none, "none", .some (.scalar ⟨99, 8⟩)) := by
+  rfl
+
+/-- `D2` transitive child-reborrow revival regression: reborrowing a mutable
+reference `_3 = &mut *_2` (`parentTag = .some 1`, `targetLocal = 1`, initialized
+in `.reserved` permission) from raw pointer `_2 = &raw mut _1` before
+`StorageDead(_1)`, reviving and re-initializing `_1 = 20` (which only disables
+`.active` tags at base `12c9ecb8`, leaving `.reserved` child tag `2` alive),
+and reading `_0 = copy *_3`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &raw mut _1; _3 = &mut *_2;
+StorageDead(_1); StorageLive(_1); _1 = const 20_u64;
+_0 = copy *_3; return
+``` -/
+private def stmtDivReviveChildReborrowReadBody : CapturedMir :=
+  stmtDivBody "stmt_div::read_through_child_reborrow_after_revival"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRefMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .assign ⟨3, []⟩ (.ref (.mut false) ⟨2, [.deref]⟩), span := "_3 = &mut *_2" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨3, [.deref]⟩)), span := "_0 = copy *_3" } ]
+
+/-- `D2` child-reborrow revival regression: `disableLocalBorrows` disables every
+borrow entry with `targetLocal = 1` (both parent tag `1` and child reborrow tag
+`2`), so reading `*_3` after revival faults with `FailureKind.ub` (Anneal
+previously returned the revived `20`). -/
+theorem stmt_div_storage_revive_child_reborrow_read_is_ub :
+    diffCProbeBounded 20 stmtDivReviveChildReborrowReadBody
+      (.running (initMachineState stmtDivReviveChildReborrowReadBody [])) =
+      .some (.some .ub, "_0 = copy *_3", .none) := by
+  rfl
+
+/-- `D2` pointer-offset (`BinOp.offset`) after `StorageDead` + `StorageLive`
+revival: performing in-bounds pointer arithmetic `Offset(copy _2, const 0_isize)`
+on a raw pointer `_2 = &raw mut _1` minted before `StorageDead(_1)` faults with
+`FailureKind.ub` (Anneal previously allowed `Offset` on the stale tag and
+returned `0`):
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &raw mut _1;
+StorageDead(_1); StorageLive(_1);
+_3 = Offset(copy _2, const 0_isize); _0 = const 0_u64; return
+``` -/
+private def stmtDivRevivePtrOffsetBody : CapturedMir :=
+  stmtDivBody "stmt_div::ptr_offset_after_storage_revival"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨3, []⟩
+          (.binaryOp .offset (.copy ⟨2, []⟩)
+            (.constant ⟨{ kind := .int .isize, layoutIdx := 0 }, .scalar (.int ⟨0, 8⟩)⟩)),
+        span := "_3 = Offset(_2, 0)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_storage_revive_ptr_offset_is_ub :
+    diffCProbeBounded 16 stmtDivRevivePtrOffsetBody
+      (.running (initMachineState stmtDivRevivePtrOffsetBody [])) =
+      .some (.some .ub, "_3 = Offset(_2, 0)", .none) := by
   rfl
 
 end StatementDivergenceRegressions

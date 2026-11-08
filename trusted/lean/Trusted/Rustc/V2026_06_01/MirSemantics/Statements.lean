@@ -2058,110 +2058,6 @@ theorem lookupBorrow_disableLocalBorrows_of_eq_none
   rw [lookupBorrow_disableLocalBorrows, hLookup]
 
 /--
-`disableLocalBorrows` preserves the length of the borrow table.
--/
-@[simp]
-theorem length_disableLocalBorrows
-    (borrows : List BorrowEntry)
-    (loc : Local) :
-    length (disableLocalBorrows borrows loc) = length borrows := by
-  induction borrows with
-  | nil => rfl
-  | cons hd rest ih =>
-    unfold disableLocalBorrows
-    cases Nat.beq hd.targetLocal loc <;>
-      exact congrArg Nat.succ ih
-
-/--
-`disableLocalBorrows` is idempotent on the same local `loc` (e.g. when
-`StorageDead(loc)` is followed by `StorageLive(loc)`).
--/
-@[simp]
-theorem disableLocalBorrows_idem
-    (borrows : List BorrowEntry)
-    (loc : Local) :
-    disableLocalBorrows (disableLocalBorrows borrows loc) loc =
-      disableLocalBorrows borrows loc := by
-  induction borrows with
-  | nil => rfl
-  | cons hd rest ih =>
-    cases hB : Nat.beq hd.targetLocal loc <;>
-      simp only [disableLocalBorrows, hB, ih]
-
-/--
-`disableLocalBorrows` on two locals commutes.
--/
-theorem disableLocalBorrows_comm
-    (borrows : List BorrowEntry)
-    (loc₁ loc₂ : Local) :
-    disableLocalBorrows (disableLocalBorrows borrows loc₁) loc₂ =
-      disableLocalBorrows (disableLocalBorrows borrows loc₂) loc₁ := by
-  induction borrows with
-  | nil => rfl
-  | cons hd rest ih =>
-    cases hB1 : Nat.beq hd.targetLocal loc₁ <;>
-      cases hB2 : Nat.beq hd.targetLocal loc₂ <;>
-        simp only [disableLocalBorrows, hB1, hB2, ih]
-
-/--
-`disableLocalBorrows` preserves `hasProtectedLocalBorrow`, which depends only on
-`targetLocal` and `protector`.
--/
-@[simp]
-theorem hasProtectedLocalBorrow_disableLocalBorrows
-    (borrows : List BorrowEntry)
-    (activeProtectors : List Nat)
-    (loc₁ loc₂ : Local) :
-    hasProtectedLocalBorrow (disableLocalBorrows borrows loc₁) activeProtectors loc₂ =
-      hasProtectedLocalBorrow borrows activeProtectors loc₂ := by
-  induction borrows with
-  | nil => rfl
-  | cons hd rest ih =>
-    cases hB1 : Nat.beq hd.targetLocal loc₁ <;>
-      simp only [disableLocalBorrows, hasProtectedLocalBorrow, isBorrowProtected, hB1, ih]
-
-/--
-`disableLocalBorrows` preserves fuel-bounded Tree Borrows ancestor reachability
-(`isBorrowDescendantOrSelfAux`), since `tag` and `parentTag` are unchanged.
--/
-theorem isBorrowDescendantOrSelfAux_disableLocalBorrows
-    (fuel : Nat)
-    (borrows : List BorrowEntry)
-    (loc : Local)
-    (candidateTag ancestorTag : Nat) :
-    isBorrowDescendantOrSelfAux fuel (disableLocalBorrows borrows loc) candidateTag ancestorTag =
-      isBorrowDescendantOrSelfAux fuel borrows candidateTag ancestorTag := by
-  induction fuel generalizing candidateTag with
-  | zero => rfl
-  | succ f ih =>
-    unfold isBorrowDescendantOrSelfAux
-    cases Nat.beq candidateTag ancestorTag with
-    | true => rfl
-    | false =>
-      rw [lookupBorrow_disableLocalBorrows]
-      cases hL : lookupBorrow borrows candidateTag with
-      | none => rfl
-      | some entry =>
-        cases hB : Nat.beq entry.targetLocal loc <;>
-          cases hP : entry.parentTag <;>
-            simp only [hB, hP, ih]
-
-/--
-`disableLocalBorrows` preserves the Tree Borrows subtree relation
-`isBorrowDescendantOrSelf`.
--/
-@[simp]
-theorem isBorrowDescendantOrSelf_disableLocalBorrows
-    (borrows : List BorrowEntry)
-    (loc : Local)
-    (candidateTag ancestorTag : Nat) :
-    isBorrowDescendantOrSelf (disableLocalBorrows borrows loc) candidateTag ancestorTag =
-      isBorrowDescendantOrSelf borrows candidateTag ancestorTag := by
-  unfold isBorrowDescendantOrSelf
-  rw [length_disableLocalBorrows]
-  exact isBorrowDescendantOrSelfAux_disableLocalBorrows (length borrows) borrows loc candidateTag ancestorTag
-
-/--
 Test whether projection path `proj` contains a `.deref` projection, i.e.
 whether computing the place loads a pointer value out of (a sub-place of) its
 root local. In `Runtime(PostCleanup)` MIR a `Deref` may only appear as the
@@ -2800,14 +2696,15 @@ a pointer `ptrVal` whose provenance tag resolved to a borrow entry targeting
 `loc` (`lookupBorrow borrows ptrVal.tag = .some entry`,
 `entry.targetLocal = loc`) resolves to that entry disabled, and faults with
 `.ub` on every dereferencing read (`evalPlaceRead`, `evalOperand` copy/move),
-every dereferencing write (`writePlaceValue`, `evalPlaceWrite`), every safe
-reborrow (`Rvalue.ref`), every reference retag (`StatementKind.retag`), and
-every non-zero-length `copy_nonoverlapping` (`evalCopyNonOverlappingWithCount`)
-through it. This holds for arbitrary frame locals `localsAfter` (in particular
-after `loc` has been revived by `StorageLive(loc)` and re-initialized) and
-arbitrary captured global allocations `globals`: the disabled stack borrow entry
-keeps shadowing any global allocation that shares the pointer's allocation
-identifier.
+every dereferencing write (`writePlaceValue`, `evalPlaceWrite`,
+`StatementKind.setDiscriminant`), every safe reborrow (`Rvalue.ref`), every
+reference retag (`StatementKind.retag`), every pointer-offset operation
+(`evalPtrOffsetBinOp`), and every non-zero-length `copy_nonoverlapping`
+(`evalCopyNonOverlappingWithCount`) through it. This holds for arbitrary frame
+locals `localsAfter` (in particular after `loc` has been revived by
+`StorageLive(loc)` and re-initialized) and arbitrary captured global allocations
+`globals`: the disabled stack borrow entry keeps shadowing any global allocation
+that shares the pointer's allocation identifier.
 -/
 theorem evalStmt_storageRevive_old_ptr_deref_ub
     (s : MachineState)
@@ -2850,6 +2747,10 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
       { mem with borrows := borrowsAfter } localDecls layouts = .ub ∧
     evalStmt sAfter ⟨.retag retagKind ⟨ptrLoc, .nil⟩, span⟩ localDecls layouts =
       MirStepNode.fail .ub ∧
+    evalStmt sAfter ⟨.setDiscriminant derefPlace n, span⟩ localDecls layouts =
+      MirStepNode.fail .ub ∧
+    evalPtrOffsetBinOp localsAfter { mem with borrows := borrowsAfter }
+      localDecls layouts srcOp ptrVal sz ⟨n, 8⟩ = .ub ∧
     evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
       (.ptr ptrVal sz) otherVal (n + 1) localsAfter = MirStepNode.fail .ub ∧
     evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
@@ -2862,7 +2763,7 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
       writePlaceValue localsAfter (disableLocalBorrows borrows loc)
         { local_ := ptrLoc, projection := .deref :: restProj } writeVal = .ub := by
     simp [writePlaceValue, hPtrSlot, hDis]
-  refine ⟨hDis, ?_, ?_, ?_, hWrite, ?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨hDis, ?_, ?_, ?_, hWrite, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · simp [evalPlaceRead, hPtrSlot, hDis]
   · simp [evalOperand, hPtrSlot, hDis]
   · simp [evalOperand, hPtrSlot, hDis]
@@ -2876,6 +2777,8 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
       · exact hWrite
   · cases borrowKind <;> simp [evalRvalue, hPtrSlot, hDis]
   · simp [evalStmt, evalOperand, readProjectedValue, hPtrSlot, hDis]
+  · simp [evalStmt, evalOperand, hPtrSlot, hDis]
+  · simp [evalPtrOffsetBinOp, hDis]
   · unfold evalCopyNonOverlappingWithCount
     simp only [Nat.beq]
     cases otherVal with
@@ -2988,46 +2891,42 @@ theorem evalStmt_placeMention_deref_uninit_ub
       simp [evalStmt, placeMentionOperandsInit, projectionHasDeref, placeIndexLocalsInit, hSlot, hIdxFalse]
 
 /--
-Universal characterization of `StatementKind.placeMention` along a
-non-dereferencing projection path (`projectionHasDeref proj = false`):
-1. When any `.index idxLocal` along `proj` is not an initialized scalar
-   (`placeIndexLocalsInit s.frame.locals proj = false`), `evalStmt` faults with
-   `MirStepNode.fail .ub`.
-2. When `loc` is live (`.some .uninit` or `.some (.init v)`) and every
-   `.index idxLocal` along `proj` is an initialized scalar
-   (`placeIndexLocalsInit s.frame.locals proj = true`), `evalStmt` steps cleanly
-   to `advanceStmt s s.frame.locals`.
+Biconditional (`↔`) characterization of `StatementKind.placeMention` along a
+non-dereferencing projection path (`projectionHasDeref proj = false`) on a live
+local (`get? s.frame.locals loc = .some slot`, `slot ≠ .dead`):
+1. `evalStmt` steps cleanly to `advanceStmt s s.frame.locals` if and only if
+   every `.index idxLocal` along `proj` is an initialized scalar
+   (`placeIndexLocalsInit s.frame.locals proj = true`).
+2. `evalStmt` faults with `MirStepNode.fail .ub` if and only if some
+   `.index idxLocal` along `proj` is not an initialized scalar
+   (`placeIndexLocalsInit s.frame.locals proj = false`).
 -/
 theorem evalStmt_placeMention_nonDeref_index_iff
     (s : MachineState)
     (loc : Local)
+    (slot : LocalSlot)
     (proj : List ProjectionElem)
     (span : String)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (hNoDeref : projectionHasDeref proj = false) :
-    (placeIndexLocalsInit s.frame.locals proj = false →
-      evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
-        MirStepNode.fail .ub) ∧
-    (get? s.frame.locals loc = .some .uninit →
-      placeIndexLocalsInit s.frame.locals proj = true →
-      evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
-        MirStepNode.step (advanceStmt s s.frame.locals)) ∧
-    (∀ v : Value,
-      get? s.frame.locals loc = .some (.init v) →
-      placeIndexLocalsInit s.frame.locals proj = true →
-      evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
-        MirStepNode.step (advanceStmt s s.frame.locals)) := by
-  refine ⟨?_, ?_, ?_⟩
-  · intro hIdxFalse
-    cases hGet : get? s.frame.locals loc with
-    | none => simp [evalStmt, hGet]
-    | some slot =>
-      cases slot <;>
-        simp [evalStmt, placeMentionOperandsInit, hNoDeref, hIdxFalse, hGet]
-  · intro hUninit hIdxTrue
-    simp [evalStmt, placeMentionOperandsInit, hNoDeref, hUninit, hIdxTrue]
-  · intro v hInit hIdxTrue
-    simp [evalStmt, placeMentionOperandsInit, hNoDeref, hInit, hIdxTrue]
+    (hNoDeref : projectionHasDeref proj = false)
+    (hSlot : get? s.frame.locals loc = .some slot)
+    (hLive : slot ≠ .dead) :
+    (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s s.frame.locals) ↔
+      placeIndexLocalsInit s.frame.locals proj = true) ∧
+    (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub ↔
+      placeIndexLocalsInit s.frame.locals proj = false) := by
+  cases slot with
+  | dead => exact False.elim (hLive rfl)
+  | uninit =>
+    cases hIdx : placeIndexLocalsInit s.frame.locals proj <;>
+      simp [evalStmt, placeMentionOperandsInit, hNoDeref, hSlot, hIdx] <;>
+        intro h <;> nomatch h
+  | init v =>
+    cases hIdx : placeIndexLocalsInit s.frame.locals proj <;>
+      simp [evalStmt, placeMentionOperandsInit, hNoDeref, hSlot, hIdx] <;>
+        intro h <;> nomatch h
 
 end Trusted.Rustc.V2026_06_01.MirSemantics
