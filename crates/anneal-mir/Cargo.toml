@@ -1,0 +1,10 @@
+[package]
+name = "anneal-mir"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "MIR intermediate representation, lowering, and pointer-to-int cast support for Anneal."
+license = "BSD-2-Clause OR Apache-2.0 OR MIT"
+repository = "https://github.com/joshlf/anneal"
+publish = false
+
+[dependencies]

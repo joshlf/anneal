@@ -8,5 +8,6 @@ members = [
     "crates/anneal-spec-macros",
     "crates/anneal-specr-lean",
     "crates/anneal-minirust-gen",
+    "crates/anneal-mir",
     "crates/anneal-trace",
 ]

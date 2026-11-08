@@ -12,6 +12,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "anneal-mir"
+version = "0.1.0-alpha.1"
+
+[[package]]
 name = "anneal-mir-instrument"
 version = "0.1.0"
 
