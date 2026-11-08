@@ -2670,9 +2670,23 @@ def evalStmtFast
     | .some _ =>
       match set? s.frame.locals loc .uninit with
       | .some locals' =>
-        MirStepNode.step
-          (advanceStmt s locals'
-            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+        match s.memory.activeProtectors with
+        | .nil =>
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+        | protHead :: protTail =>
+          match
+            hasProtectedLocalBorrow
+              s.memory.borrows
+              (protHead :: protTail)
+              loc
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.step
+              (advanceStmt s locals'
+                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
@@ -2742,9 +2756,23 @@ def evalStmtSymTreeFast
        | .some _ =>
          match set? s.frame.locals loc .uninit with
          | .some locals' =>
-           MirStepNode.step
-             (advanceStmt s locals'
-               { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+           match s.memory.activeProtectors with
+           | .nil =>
+             MirStepNode.step
+               (advanceStmt s locals'
+                 { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+           | protHead :: protTail =>
+             match
+               hasProtectedLocalBorrow
+                 s.memory.borrows
+                 (protHead :: protTail)
+                 loc
+             with
+             | true => MirStepNode.fail .ub
+             | false =>
+               MirStepNode.step
+                 (advanceStmt s locals'
+                   { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .storageDead loc =>

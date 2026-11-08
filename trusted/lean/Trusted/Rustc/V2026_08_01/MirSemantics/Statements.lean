@@ -2036,6 +2036,73 @@ theorem hasProtectedLocalBorrow_eq_false_of_forall_ne
     exact ih (fun e he => h e (List.Mem.tail entry he))
 
 /--
+Every entry returned by `lookupBorrow borrows tag` is a member of `borrows`
+with provenance tag `tag`.
+-/
+theorem mem_of_lookupBorrow_eq_some
+    (borrows : List BorrowEntry)
+    (tag : Nat)
+    (entry : BorrowEntry)
+    (h : lookupBorrow borrows tag = .some entry) :
+    entry ∈ borrows ∧ entry.tag = tag := by
+  induction borrows with
+  | nil => nomatch h
+  | cons hd rest ih =>
+    unfold lookupBorrow at h
+    cases hEq : Nat.beq hd.tag tag with
+    | false =>
+      rw [hEq] at h
+      rcases ih h with ⟨hMem, hTag⟩
+      exact ⟨List.Mem.tail hd hMem, hTag⟩
+    | true =>
+      rw [hEq] at h
+      injection h with hHd
+      subst hHd
+      exact ⟨List.Mem.head rest, Nat.eq_of_beq_eq_true hEq⟩
+
+/--
+No entry returned by `lookupBorrow (purgeLocalBorrows borrows loc) tag` can
+target `loc`.
+-/
+theorem lookupBorrow_purgeLocalBorrows_targetLocal_ne
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (entry : BorrowEntry)
+    (h : lookupBorrow (purgeLocalBorrows borrows loc) tag = .some entry) :
+    entry.targetLocal ≠ loc :=
+  targetLocal_ne_of_mem_purgeLocalBorrows borrows loc entry
+    (mem_of_lookupBorrow_eq_some (purgeLocalBorrows borrows loc) tag entry h).1
+
+/--
+When every entry in `borrows` with provenance tag `tag` targets `loc`,
+`lookupBorrow (purgeLocalBorrows borrows loc) tag = .none`.
+-/
+theorem lookupBorrow_purgeLocalBorrows_eq_none
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (hTarget : ∀ entry ∈ borrows, entry.tag = tag → entry.targetLocal = loc) :
+    lookupBorrow (purgeLocalBorrows borrows loc) tag = .none := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    have ihRest : lookupBorrow (purgeLocalBorrows rest loc) tag = .none :=
+      ih (fun e he hTag => hTarget e (List.Mem.tail hd he) hTag)
+    cases hLoc : Nat.beq hd.targetLocal loc with
+    | true =>
+      simp only [purgeLocalBorrows, hLoc, ihRest]
+    | false =>
+      simp only [purgeLocalBorrows, hLoc]
+      have hNeTag : Nat.beq hd.tag tag = false := by
+        cases hT : Nat.beq hd.tag tag with
+        | false => rfl
+        | true =>
+          have hEqLoc := hTarget hd (List.Mem.head rest) (Nat.eq_of_beq_eq_true hT)
+          exact False.elim (Nat.ne_of_beq_eq_false hLoc hEqLoc)
+      simp only [lookupBorrow, hNeTag, ihRest]
+
+/--
 Test whether projection path `proj` contains a `.deref` projection, i.e.
 whether computing the place loads a pointer value out of (a sub-place of) its
 root local. In `Runtime(PostCleanup)` MIR a `Deref` may only appear as the
@@ -2145,14 +2212,14 @@ theorem placeMentionOperandsInit_nil (locals : List LocalSlot) (rootSlot : Local
 Execute a single MIR `Statement` from state `s` using `localDecls` and `layouts`
 for type- and layout-aware rvalue and intrinsic evaluation.
 
-`StorageDead(loc)` faults with `MirStepNode.fail .ub` when a tag minted from
-`loc` is still protected by an active function-entry protector
+`StorageDead(loc)` and `StorageLive(loc)` fault with `MirStepNode.fail .ub` when
+a tag minted from `loc` is still protected by an active function-entry protector
 (`hasProtectedLocalBorrow`, only consulted when some protector is active), and
-otherwise purges every tag minted from `loc` (`purgeLocalBorrows`) before
-marking `loc` `.dead`. `StorageLive(loc)` purges any stale tags minted from
-`loc` before marking it `.uninit`. Together these ensure that references and
-raw pointers created before `StorageDead(loc)` can never reach the storage
-allocated by a later `StorageLive(loc)`.
+otherwise purge every tag minted from `loc` (`purgeLocalBorrows`) before
+marking `loc` `.dead` or `.uninit`. Together these ensure that deallocating or
+implicitly reviving a local bearing an active protector is immediate UB, and
+that references and raw pointers created before `StorageDead(loc)` or a second
+`StorageLive(loc)` can never reach the storage allocated by `StorageLive(loc)`.
 `PlaceMention(place)` requires every operand read while computing `place` (the
 root pointer of a dereference and every `Index` local) to be initialized
 (`placeMentionOperandsInit`).
@@ -2296,9 +2363,23 @@ def evalStmt
     | .some _ =>
       match set? s.frame.locals loc .uninit with
       | .some locals' =>
-        MirStepNode.step
-          (advanceStmt s locals'
-            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+        match s.memory.activeProtectors with
+        | .nil =>
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+        | protHead :: protTail =>
+          match
+            hasProtectedLocalBorrow
+              s.memory.borrows
+              (protHead :: protTail)
+              loc
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.step
+              (advanceStmt s locals'
+                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
@@ -2520,5 +2601,222 @@ def evalStmt
         | .none => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
+
+/--
+Universal characterization of `StatementKind.storageDead loc` in `evalStmt`:
+1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
+   `set? s.frame.locals loc .dead = .some localsDead`) and no borrow entry
+   targeting `loc` is protected by `s.memory.activeProtectors`
+   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
+   `evalStmt` steps to `advanceStmt s localsDead { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }`,
+   leaving no borrow entry targeting `loc` (`borrowsTargetLocal = false`).
+2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
+   `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), `evalStmt`
+   faults with `MirStepNode.fail .ub`.
+3. When `loc` is out of bounds (`get? s.frame.locals loc = .none`), `evalStmt`
+   faults with `MirStepNode.fail .ub`.
+-/
+theorem evalStmt_storageDead_purges_borrows
+    (s : MachineState)
+    (loc : Local)
+    (slot : LocalSlot)
+    (localsDead : List LocalSlot)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s localsDead
+            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }) ∧
+      borrowsTargetLocal (purgeLocalBorrows s.memory.borrows loc) loc = false) ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .none →
+      evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro hGet hSet hProt
+    refine ⟨?_, borrowsTargetLocal_purgeLocalBorrows s.memory.borrows loc⟩
+    cases hAP : s.memory.activeProtectors with
+    | nil => simp [evalStmt, hGet, hSet, hAP]
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hGet hSet hProt
+    cases hAP : s.memory.activeProtectors with
+    | nil =>
+      rw [hAP, hasProtectedLocalBorrow_nil_protectors] at hProt
+      nomatch hProt
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hNone
+    simp [evalStmt, hNone]
+
+/--
+Universal characterization of `StatementKind.storageLive loc` in `evalStmt`:
+1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
+   `set? s.frame.locals loc .uninit = .some localsUninit`) and no borrow entry
+   targeting `loc` is protected by `s.memory.activeProtectors`
+   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
+   `evalStmt` steps to `advanceStmt s localsUninit { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }`,
+   leaving no borrow entry targeting `loc` (`borrowsTargetLocal = false`).
+2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
+   `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), `evalStmt`
+   faults with `MirStepNode.fail .ub`.
+3. When `loc` is out of bounds (`get? s.frame.locals loc = .none`), `evalStmt`
+   faults with `MirStepNode.fail .ub`.
+-/
+theorem evalStmt_storageLive_purges_borrows
+    (s : MachineState)
+    (loc : Local)
+    (slot : LocalSlot)
+    (localsUninit : List LocalSlot)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .uninit = .some localsUninit →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s localsUninit
+            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc }) ∧
+      borrowsTargetLocal (purgeLocalBorrows s.memory.borrows loc) loc = false) ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .uninit = .some localsUninit →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .none →
+      evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro hGet hSet hProt
+    refine ⟨?_, borrowsTargetLocal_purgeLocalBorrows s.memory.borrows loc⟩
+    cases hAP : s.memory.activeProtectors with
+    | nil => simp [evalStmt, hGet, hSet, hAP]
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hGet hSet hProt
+    cases hAP : s.memory.activeProtectors with
+    | nil =>
+      rw [hAP, hasProtectedLocalBorrow_nil_protectors] at hProt
+      nomatch hProt
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hNone
+    simp [evalStmt, hNone]
+
+/--
+Universal proof that after purging `loc`'s borrows (`purgeLocalBorrows borrows loc`
+on `StorageDead(loc)` or `StorageLive(loc)`), any pointer `ptrVal` whose
+provenance tag `ptrVal.tag` targeted `loc` resolves to `.none` in `lookupBorrow`
+and faults with `.ub` / `MirStepNode.fail .ub` on any subsequent dereference
+read (`evalOperand` / `evalPlaceRead`) or dereference write (`writePlaceValue` /
+`evalPlaceWrite`), even if `loc` has been revived by `StorageLive(loc)` and
+re-initialized in `localsAfter`.
+-/
+theorem evalStmt_storageRevive_old_ptr_deref_ub
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (callerLocals : List LocalSlot)
+    (activeProtectors : List Nat)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc ptrLoc : Local)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (restProj : List ProjectionElem)
+    (localsAfter : List LocalSlot)
+    (writeVal : Value)
+    (hTarget : ∀ entry ∈ borrows, entry.tag = ptrVal.tag → entry.targetLocal = loc)
+    (hNoGlobal : lookupGlobalAlloc globals ptrVal.allocId = .none)
+    (hPtrSlot : get? localsAfter ptrLoc = .some (.init (.ptr ptrVal sz))) :
+    let borrowsAfter := purgeLocalBorrows borrows loc
+    let derefPlace : Place := { local_ := ptrLoc, projection := .deref :: restProj }
+    lookupBorrow borrowsAfter ptrVal.tag = .none ∧
+    evalPlaceRead localsAfter derefPlace borrowsAfter globals layouts callerLocals localDecls = .ub ∧
+    evalOperand localsAfter (.copy derefPlace) borrowsAfter globals layouts callerLocals = .ub ∧
+    evalOperand localsAfter (.move derefPlace) borrowsAfter globals layouts callerLocals = .ub ∧
+    writePlaceValue localsAfter borrowsAfter derefPlace writeVal = .ub ∧
+    evalPlaceWrite localsAfter borrowsAfter derefPlace writeVal activeProtectors = .ub := by
+  dsimp only
+  have hLookupNone : lookupBorrow (purgeLocalBorrows borrows loc) ptrVal.tag = .none :=
+    lookupBorrow_purgeLocalBorrows_eq_none borrows loc ptrVal.tag hTarget
+  refine ⟨hLookupNone, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [evalPlaceRead, hPtrSlot, hLookupNone, hNoGlobal]
+  · simp [evalOperand, hPtrSlot, hLookupNone, hNoGlobal]
+  · simp [evalOperand, hPtrSlot, hLookupNone, hNoGlobal]
+  · simp [writePlaceValue, hPtrSlot, hLookupNone]
+  · cases activeProtectors <;> simp [evalPlaceWrite, writePlaceValue, hPtrSlot, hLookupNone]
+
+/--
+Universal proof that a bare `StatementKind.placeMention` (`place.projection = []`)
+on a live local (`get? s.frame.locals loc = .some .uninit` or `.some (.init v)`)
+steps cleanly to `advanceStmt s s.frame.locals` without loading or mutating the
+local.
+-/
+theorem evalStmt_placeMention_local_uninit_ok
+    (s : MachineState)
+    (loc : Local)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some .uninit →
+      evalStmt s ⟨.placeMention ⟨loc, .nil⟩, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+    (∀ v : Value,
+      get? s.frame.locals loc = .some (.init v) →
+      evalStmt s ⟨.placeMention ⟨loc, .nil⟩, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s s.frame.locals)) := by
+  refine ⟨?_, ?_⟩
+  · intro hUninit
+    simp [evalStmt, hUninit]
+  · intro v hInit
+    simp [evalStmt, hInit]
+
+/--
+Universal proof that a dereferencing `StatementKind.placeMention`
+(`place.projection = .deref :: restProj`) faults with `MirStepNode.fail .ub`
+whenever the root local is uninitialized (`.some .uninit`), dead (`.some .dead`),
+or out of bounds (`.none`), or whenever any `.index idxLocal` along `restProj`
+is not an initialized scalar (`placeIndexLocalsInit s.frame.locals restProj = false`).
+-/
+theorem evalStmt_placeMention_deref_uninit_ub
+    (s : MachineState)
+    (loc : Local)
+    (restProj : List ProjectionElem)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some .uninit →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .some .dead →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .none →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (∀ slot : LocalSlot,
+      get? s.frame.locals loc = .some slot →
+      placeIndexLocalsInit s.frame.locals restProj = false →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro hUninit
+    simp [evalStmt, placeMentionOperandsInit, projectionHasDeref, hUninit]
+  · intro hDead
+    simp [evalStmt, hDead]
+  · intro hNone
+    simp [evalStmt, hNone]
+  · intro slot hSlot hIdxFalse
+    cases slot <;>
+      simp [evalStmt, placeMentionOperandsInit, projectionHasDeref, placeIndexLocalsInit, hSlot, hIdxFalse]
 
 end Trusted.Rustc.V2026_08_01.MirSemantics

@@ -12194,7 +12194,11 @@ theorem PureMirModularConverges.step_stmt
         | some l' =>
           rw [h_s] at h_eval
           injection h_eval with h_se; injection h_se with h_eq
-          subst h_eq; exact ⟨purgeLocalBorrows m.borrows loc, by cases m; rfl⟩
+          subst h_eq
+          rcases m with ⟨_, _, bor, _, _, _, _, _, ap, _, _, _⟩
+          dsimp only at h_ap
+          subst h_ap
+          exact ⟨purgeLocalBorrows bor loc, rfl⟩
     | storageDead loc =>
       unfold evalStmt at h_eval ⊢
       dsimp only [PureState.toMachineState] at h_eval ⊢
@@ -13815,7 +13819,12 @@ private theorem sameExceptBorrows_step_noCall
                   | none => rw [h_set] at h_wp; exact False.elim h_wp
                   | some _ =>
                     rw [h_set] at h_wp h_inv_next
-                    exact ih_run ⟨h_inv_next, h_dst_stk⟩ ⟨h_adv_m _ _ _, h_meq⟩ h_wp
+                    rw [h_ap] at h_wp h_inv_next
+                    have h_ap2 : s₂.memory.activeProtectors = [] := by
+                      rw [mf_ap, h_ap]
+                    rw [h_ap2]
+                    exact ih_run ⟨h_inv_next, h_dst_stk⟩
+                      ⟨h_adv_m _ _ _, ⟨mf_cal, mf_tr, mf_cs, mf_ac, rfl⟩⟩ h_wp
               | storageDead loc =>
                 dsimp only [evalStmt] at h_wp h_inv_next ⊢
                 rw [h_fr]

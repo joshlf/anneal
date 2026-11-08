@@ -1770,8 +1770,9 @@ def symPlaceIndexLocalsInit (slots : List SymSlot) : List ProjectionElem → Boo
   | _ :: rest => symPlaceIndexLocalsInit slots rest
 
 /-- Symbolic counterpart of `placeMentionOperandsInit`: a dereferenced root slot
-must be a concrete initialized slot, and every `Index` local must be a concrete
-initialized scalar slot (`symPlaceIndexLocalsInit`). -/
+must be an initialized slot (`.concrete (.init _)`, `.symArg _`, or
+`.symPair0 _ _`), and every `Index` local must be a concrete initialized scalar
+slot (`symPlaceIndexLocalsInit`). -/
 def symPlaceMentionOk
     (slots : List SymSlot)
     (rootSlot : SymSlot)
@@ -1780,6 +1781,8 @@ def symPlaceMentionOk
   Bool.and
     (match projectionHasDeref proj, rootSlot with
      | true, .concrete (.init _) => true
+     | true, .symArg _ => true
+     | true, .symPair0 _ _ => true
      | true, _ => false
      | false, _ => true)
     (symPlaceIndexLocalsInit slots proj)
@@ -1819,30 +1822,6 @@ theorem symPlaceIndexLocalsInit_concretize
     | downcast _ _ => exact ih h
     | opaqueCast _ => exact ih h
     | unwrapUnsafeBinder _ => exact ih h
-
-theorem placeMentionOperandsInit_concretize_of_symPlaceMentionOk
-    (args : List Value) (slots : List SymSlot) (rootSlot : SymSlot)
-    (proj : List ProjectionElem)
-    (hOk : symPlaceMentionOk slots rootSlot proj = true) :
-    placeMentionOperandsInit (concretizeSymSlots args slots)
-      (concretizeSymSlot args rootSlot) proj = true := by
-  unfold symPlaceMentionOk at hOk
-  rw [Bool.and_eq_true] at hOk
-  obtain ⟨hRootOk, hIdxOk⟩ := hOk
-  have hIdx := symPlaceIndexLocalsInit_concretize args slots proj hIdxOk
-  unfold placeMentionOperandsInit
-  cases hD : projectionHasDeref proj with
-  | false => exact hIdx
-  | true =>
-    rw [hD] at hRootOk
-    cases rootSlot with
-    | concrete c =>
-      cases c with
-      | init v => exact hIdx
-      | uninit => nomatch hRootOk
-      | dead => nomatch hRootOk
-    | symArg _ => nomatch hRootOk
-    | symPair0 _ _ => nomatch hRootOk
 
 /-- Concrete symbolic step for a single `Statement`. -/
 def symStepStmtConcrete
@@ -5155,7 +5134,52 @@ theorem get?_some_of_blt_length :
   | v :: _, .zero, _ => ⟨v, rfl⟩
   | _ :: rest, .succ idx, h => get?_some_of_blt_length rest idx h
 
-/-- Check that any symbolic argument index written by `symStepStmtConcrete` is `< argCount`. -/
+/-- Check that any symbolic argument index dereferenced by a `PlaceMention` is `< argCount`. -/
+def symPlaceMentionInBounds
+    (argCount : Nat)
+    (rootSlot : SymSlot)
+    (proj : List ProjectionElem) :
+    Bool :=
+  match projectionHasDeref proj, rootSlot with
+  | true, .symArg idx => Nat.blt idx argCount
+  | true, .symPair0 _ idx => Nat.blt idx argCount
+  | _, _ => true
+
+theorem placeMentionOperandsInit_concretize_of_symPlaceMentionOk
+    (args : List Value) (slots : List SymSlot) (rootSlot : SymSlot)
+    (proj : List ProjectionElem)
+    (hOk : symPlaceMentionOk slots rootSlot proj = true)
+    (hRootInB : symPlaceMentionInBounds (length args) rootSlot proj = true) :
+    placeMentionOperandsInit (concretizeSymSlots args slots)
+      (concretizeSymSlot args rootSlot) proj = true := by
+  unfold symPlaceMentionOk at hOk
+  unfold symPlaceMentionInBounds at hRootInB
+  rw [Bool.and_eq_true] at hOk
+  obtain ⟨hRootOk, hIdxOk⟩ := hOk
+  have hIdx := symPlaceIndexLocalsInit_concretize args slots proj hIdxOk
+  unfold placeMentionOperandsInit
+  cases hD : projectionHasDeref proj with
+  | false => exact hIdx
+  | true =>
+    rw [hD] at hRootOk hRootInB
+    cases rootSlot with
+    | concrete c =>
+      cases c with
+      | init v => exact hIdx
+      | uninit => nomatch hRootOk
+      | dead => nomatch hRootOk
+    | symArg idx =>
+      rcases get?_some_of_blt_length args idx hRootInB with ⟨v, hv⟩
+      dsimp only [concretizeSymSlot]
+      rw [hv]
+      exact hIdx
+    | symPair0 v0 idx =>
+      rcases get?_some_of_blt_length args idx hRootInB with ⟨v, hv⟩
+      dsimp only [concretizeSymSlot]
+      rw [hv]
+      exact hIdx
+
+/-- Check that any symbolic argument index read or written by `symStepStmtConcrete` is `< argCount`. -/
 def symStepStmtInBounds
     (argCount : Nat)
     (localDecls : List LocalDecl)
@@ -5164,6 +5188,10 @@ def symStepStmtInBounds
     (stmt : Statement) :
     Bool :=
   match stmt.kind with
+  | .placeMention place =>
+    match get? st.slots place.local_ with
+    | .some sSlot => symPlaceMentionInBounds argCount sSlot place.projection
+    | .none => true
   | .assign ⟨_, .nil⟩ rv =>
     match evalSymRvalueConcrete st.slots st.borrows st.nextTag localDecls layouts rv with
     | .some (sv, _, _, _) =>
@@ -5194,6 +5222,7 @@ theorem symStepStmtConcrete_step_of_inBounds
       rfl
     | placeMention place =>
       dsimp only [symStepStmtConcrete] at h
+      dsimp only [symStepStmtInBounds] at hInB
       dsimp only [evalStmt, concretizeSymState]
       rw [get?_concretizeSymSlots args st.slots place.local_]
       cases hGet : get? st.slots place.local_ with
@@ -5201,7 +5230,8 @@ theorem symStepStmtConcrete_step_of_inBounds
         rw [hGet] at h
         nomatch h
       | some sSlot =>
-        rw [hGet] at h
+        rw [hGet] at h hInB
+        dsimp only at hInB
         have hRes : symSlotIsDead sSlot = false ∧
             (match symPlaceMentionOk st.slots sSlot place.projection with
               | true => some { st with stmtIdx := Nat.add st.stmtIdx 1 }
@@ -5223,9 +5253,12 @@ theorem symStepStmtConcrete_step_of_inBounds
           rw [hM] at hOk
           injection hOk with hEq
           subst hEq
+          have hRootInB : symPlaceMentionInBounds (length args) sSlot place.projection = true := by
+            rw [hLen]
+            exact hInB
           have hInit :=
             placeMentionOperandsInit_concretize_of_symPlaceMentionOk
-              args st.slots sSlot place.projection hM
+              args st.slots sSlot place.projection hM hRootInB
           dsimp only
           rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
             (rw [hSlot] at hInit ⊢
