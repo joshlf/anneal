@@ -5684,11 +5684,13 @@ private def stmtDivPairOfUnionsTy : Ty :=
 
 /-- `D13b` Tree Borrows invalidation regression on an uninitialized union field
 write: taking a shared reference `_2 = &_1` to an uninitialized `Freeze` union
-local `_1 : U` (valid in Rust/Miri/MiniRust since unions permit uninitialized
-bytes) mints a `.frozen` borrow on `_1`; initializing `_1.f0 = const 42_u32` via
-the `D13b` `.uninit` branch disables that conflicting `.frozen` borrow, so a
-subsequent read `_0 = copy ((*_2).f0)` faults with `FailureKind.ub` at the read
-(whereas Anneal previously faulted earlier at `_1.f0 = 42`):
+local `_1 : U` (accepted at the MIR level by Miri and MiniRust, whose reference
+validity does not require an initialized pointee; surface Rust rejects the
+borrow statically) mints a `.frozen` borrow on `_1`; initializing
+`_1.f0 = const 42_u32` via the `D13b` `.uninit` branch disables that conflicting
+`.frozen` borrow, so a subsequent read `_0 = copy ((*_2).f0)` faults with
+`FailureKind.ub` at the read (whereas Anneal previously faulted earlier at
+`_1.f0 = 42`):
 ```text
 StorageLive(_1); StorageLive(_2); _2 = &_1; _1.f0 = const 42_u32;
 _0 = copy ((*_2).f0); return
@@ -5749,6 +5751,49 @@ theorem stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok :
     diffCProbeBounded 16 stmtDivUninitSiblingPreservesMutRefBody
       (.running (initMachineState stmtDivUninitSiblingPreservesMutRefBody [])) =
       .some (.none, "none", .some (.scalar ⟨10, 4⟩)) := by
+  rfl
+
+/-- `D13b` overlapping-field complement of
+`stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok`: the same body
+with the nested `D13b` write moved from the disjoint sibling `(_1.b).f0` onto the
+borrowed field `(_1.a).f0` disables the `.active` borrow `_2 = &mut (_1.a)`
+(`invalidateConflictingBorrowsAtProj` on the overlapping two-level path
+`[.field 0 U, .field 0 u32]`), so the later write through `_2` faults with
+`FailureKind.ub`. Miri reports UB at the same statement (the direct write to
+`_1.a` is a foreign write that disables `_2` under Tree Borrows, and pops it
+under Stacked Borrows). Together with the sibling witness, this pins
+projection-aware invalidation on the nested `.uninit` path: dropping the
+invalidation would return `10` here, and whole-local invalidation would fault
+in the sibling witness. Anneal previously faulted at `_3.f0 = 10`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_3.f0 = const 10_u32; _2 = &mut (_1.a); (_1.a).f0 = const 20_u32;
+(*_2) = move _3; _0 = copy ((_1.a).f0); return
+``` -/
+private def stmtDivUninitOverlapDisablesMutRefBody : CapturedMir :=
+  stmtDivBody "stmt_div::uninit_overlapping_union_field_write_disables_mut_ref"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivPairOfUnionsTy,
+      stmtDivDecl stmtDivRefMutUnionTy, stmtDivDecl stmtDivUnionTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨3, [.field 0 stmtDivU32Ty]⟩ (.use (stmtDivConstU32 10)),
+        span := "_3.f0 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut false) ⟨1, [.field 0 stmtDivUnionTy]⟩),
+        span := "_2 = &mut (_1.a)" },
+      { kind := .assign ⟨1, [.field 0 stmtDivUnionTy, .field 0 stmtDivU32Ty]⟩
+          (.use (stmtDivConstU32 20)),
+        span := "(_1.a).f0 = 20" },
+      { kind := .assign ⟨2, [.deref]⟩ (.use (.move ⟨3, []⟩)),
+        span := "(*_2) = move _3" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivUnionTy, .field 0 stmtDivU32Ty]⟩)),
+        span := "_0 = copy (_1.a).f0" } ]
+
+theorem stmt_div_assign_uninit_overlapping_nested_field_write_disables_mut_ref_ub :
+    diffCProbeBounded 16 stmtDivUninitOverlapDisablesMutRefBody
+      (.running (initMachineState stmtDivUninitOverlapDisablesMutRefBody [])) =
+      .some (.some .ub, "(*_2) = move _3", .none) := by
   rfl
 
 /-- Known `D13b` limitation, pinned so that a future fix is noticed: after an
