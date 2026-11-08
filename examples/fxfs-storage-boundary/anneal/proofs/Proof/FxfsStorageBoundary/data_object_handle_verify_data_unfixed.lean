@@ -30,10 +30,7 @@ private theorem modularWpConverges_step_to {contract : MirCallContract}
 
 private def forceNat? : Nat → Option Nat
   | 0 => some 0
-  | n + 1 =>
-    match forceNat? n with
-    | some k => some (k + 1)
-    | none => none
+  | n + 1 => match forceNat? n with | some k => some (k + 1) | none => none
 
 private theorem forceNat?_eq_some : ∀ n, forceNat? n = some n
   | 0 => rfl
@@ -61,14 +58,11 @@ private theorem modularStepNorm {contract : MirCallContract} {body : CapturedMir
     MirModularWpConverges contract body s post := by
   refine MirModularWpConverges.step
     (evalSymNodeTreeNoCall_mono ?_ (fun _ h => h) h_step)
-  rintro (⟨⟨_, _, loc⟩, _⟩ | _ | _)
-  · rintro ⟨rfl, hb, hst, hloc⟩
-    rw [forceNat?_eq_some] at hb hst
-    rw [forcePureEnv?_eq_some] at hloc
-    cases hb; cases hst; cases hloc
-    exact h_next
-  · exact False.elim
-  · exact False.elim
+  rintro ⟨⟨_, _, _⟩, _⟩ ⟨rfl, hb, hst, hloc⟩
+  rw [forceNat?_eq_some] at hb hst
+  rw [forcePureEnv?_eq_some] at hloc
+  cases hb; cases hst; cases hloc
+  exact h_next
 
 theorem verified : ModularVerificationResult Obligations.FxfsStorageBoundary.data_object_handle_verify_data_unfixed.modularClaim := by
   refine verifyModularContractMir_of_wpConverges _ _ _ _ ?_
