@@ -1,13 +1,3 @@
-/-
-Copyright 2026 The Fuchsia Authors
-
-Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
-<LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
-license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
-This file may not be copied, modified, or distributed except according to
-those terms.
--/
-
 import LeanMiriSpec.Correspondence.Simulation
 import LeanMiriSpec.Correspondence.SimLM2_2
 import LeanMiriSpec.Correspondence.Translate
@@ -132,6 +122,68 @@ theorem enum_match_switchInt_simulation
     (hwt : WellTypedLM2_3SwitchInt body env stEnv discr targets) :
     StepRelLM2_2 body env stEnv k_bud m
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by sorry
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hinit_env, himm_env, hsupply, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by
+    simp [hstmt_len]
+  simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+  rw [miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb hstmt_none]
+  rcases hwt with ⟨ty, hwt_discr⟩
+  have hbbt : bb.terminator = ⟨.switchInt discr targets, bb.terminator.span⟩ := by
+    cases hb : bb.terminator with | mk kind span =>
+      rw [hb] at hterm
+      change kind = _ at hterm
+      subst hterm
+      rfl
+  rw [hbbt]
+  have hfr_exc : FrameRelLM2_2Except body env none m.machine s.frame topFrame :=
+      FrameRelLM2_2Except.of_frameRel none hframe
+  have hop_sim := evalLM2_2Operand_except hframes hfr_exc
+    (fun j hj _ => hinit_env j hj)
+    (fun j hj _ => himm_env j hj)
+    (by nofun) hwt_discr s.memory.globals none
+  generalize ha_op : evalOperand s.frame.locals discr [] s.memory.globals body.layouts = aOp at hop_sim
+  generalize hm_op : (annealEvalOperand body.localDecls body.layouts (translateOperand discr) none >>=
+    annealReadImmediate) m = mOp at hop_sim
+  cases hop_sim with
+  | ub m' msg =>
+    have hm_term' : translateTerminator { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span } =
+        { sourceInfo := defaultSourceInfo,
+          kind := .SwitchInt (translateOperand discr) (translateSwitchTargets targets) } := rfl
+    have hdisc : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
+        (translateOperand discr) m = (m', .error (.undefinedBehavior msg)) := by
+      sorry
+    have hleft : evalTerminator s { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span } (some body) = MirStepNode.fail .ub := by
+      unfold evalTerminator
+      dsimp only
+      rw [hbor, hcaller, ha_op]
+    have hright : Miri.Interpreter.ControlFlow.evalTerminator (annealTerminatorHooks body.localDecls body.layouts) ()
+          (translateTerminator { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span }) m =
+        (m', Except.error (Miri.Interpreter.StepError.undefinedBehavior msg)) := by
+      rw [hm_term']
+      exact evalTerminator_switchInt_error _ () _ _ _ m m' _ hdisc
+    simp only [hleft, hright]
+    sorry
+  | ok =>
+    have hm_term' : translateTerminator { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span } =
+        { sourceInfo := defaultSourceInfo,
+          kind := .SwitchInt (translateOperand discr) (translateSwitchTargets targets) } := rfl
+    have hdisc : (annealTerminatorHooks body.localDecls body.layouts).evalDiscriminant ()
+        (translateOperand discr) m = (m, .ok sorry) := by
+      sorry
+    have hcmp : ∀ val target_b, (val, target_b) ∈ targets.branches →
+      (annealTerminatorHooks body.localDecls body.layouts).compareSwitchCase () sorry val m = (m, .ok (Nat.beq sorry val)) := by
+      sorry
+    have hleft : evalTerminator s { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span } (some body) =
+        MirStepNode.step sorry := sorry
+    have hright : Miri.Interpreter.ControlFlow.evalTerminator (annealTerminatorHooks body.localDecls body.layouts) ()
+          (translateTerminator { kind := TerminatorKind.switchInt discr targets, span := bb.terminator.span }) m =
+        Miri.Interpreter.ControlFlow.goToBlock sorry m := by
+      sorry
+    simp only [hleft, hright]
+    sorry
 
 end LeanMiriSpec.Correspondence
