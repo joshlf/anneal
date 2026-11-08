@@ -24,6 +24,10 @@ import LeanMiriSpec.Correspondence.WitLM1_4
 import LeanMiriSpec.Correspondence.AllocLM2_1
 import LeanMiriSpec.Correspondence.SimLM2_1
 import LeanMiriSpec.Correspondence.WitLM2_1
+import LeanMiriSpec.Correspondence.LayoutLM2_2
+import LeanMiriSpec.Correspondence.ProjLM2_2
+import LeanMiriSpec.Correspondence.SimLM2_2
+import LeanMiriSpec.Correspondence.WitLM2_2
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -63,7 +67,24 @@ weakened theorem keeps its name:
   `forceAllocation_preserves_StateRel`, together with the `WitLM1_4` witnesses
   showing that these premises can be met, that `forceAllocation` really
   promotes an immediate local to memory, and that storage statements then free
-  that memory in lockstep.
+  that memory in lockstep;
+* the `LM-2.2` theorems: `ValidStructLayout`, `writeField_preserves_other_fields_and_padding`,
+  `writeScalarPairField_preserves_other_fields_and_padding`, `StructMemPlaceRel`
+  (unpadded aggregates project to the unchanged base `MemPlaceRel` via
+  `toMemPlaceRel`; padded ones are related only by `StateRelLM2_2`),
+  `evalProjection_nested_field_read_simulation`,
+  `evalOperand_nested_substruct_read_simulation`,
+  `evalOperand_nested_scalar_wrap_read_simulation`,
+  `evalRvalue_aggregate_tuple_struct_simulation`,
+  `step_assign_nested_field_write_simulation`,
+  `step_assign_nested_substruct_write_simulation`,
+  `step_assign_nested_scalar_wrap_write_simulation`,
+  `step_assign_use_struct_lm2_2_simulation`,
+  `step_assign_use_memory_struct_lm2_2_simulation`,
+  `step_stmt_lm2_2_simulation`, `step_terminator_goto_lm2_2_simulation`,
+  `step_terminator_return_lm2_2_simulation`,
+  `step_two_stmts_lm2_2_simulation`, and `step_stmts_lm2_2_simulation`, together
+  with the fourteen `WitLM2_2` concrete execution witnesses.
 -/
 
 namespace LeanMiriSpec.Audit
@@ -374,6 +395,231 @@ open LeanMiriSpec.Correspondence in
   Witness.lm21FullFnBody
   Witness.lm21_fullFn_init_stateRel
   Witness.lm21_signed_bool_char_runBounded_return
+  valueLeafBytes
+  annealFieldLayout
+  annealMutablePlaceHooks
+  annealWriteProjectedLocalImmediate
+  annealAggregateHooks
+  InitMaskWordRel
+  initMaskWordRel_new_false
+  initMaskWordRel_get
+  initMaskWordRel_not_isRangeInitialized_of_get_false
+  initMaskWordRel_isRangeInitialized
+  initMaskWordRel_setRange_true
+  alloc_readScalar_at_offset
+  alloc_readScalar_congr
+  alloc_writeScalar_at_offset
+  StructFieldDesc
+  isStructPaddingByte
+  ValidStructLayout
+  ValidStructLayout.arbitrary_flat
+  ValidStructLayout.sumFieldBytes_lt_iff_exists_padding
+  ValidStructLayout.byte_mem_field_of_size_le_sumFieldBytes
+  writeField_preserves_other_fields_and_padding
+  writeScalarPairField_preserves_other_fields_and_padding
+  IsRoundtripTy
+  ValidFieldProjChain
+  ValidAggregateFieldPath
+  DisjointFieldPaths
+  StructMemPlaceRel
+  StructMemPlaceRel.toMemPlaceRel
+  UninitStructMemPlaceRel.toMemPlaceRel
+  StructMemPlaceRel.has_uninit_of_padding_byte
+  UninitStructMemPlaceRel
+  StructTypeEnv
+  ImmediateStructRel
+  AllocIdWatermark
+  AllocIdSupplyValid
+  LocalRelLM2_2
+  FrameRelLM2_2
+  LM2_2StaticEnv
+  StateRelLM2_2
+  StateRel.toLM2_2
+  StateRelLM2_2.toStateRel_of_flat_imm
+  StepRelLM2_2
+  ProjectedReadSimRelLM2_2
+  WellTypedLM2_2ProjectedRead
+  evalProjection_nested_field_read_simulation
+  IsImmediateStructTy
+  WellTypedLM2_2Operand
+  IsTupleOrSingleAdtKind
+  WellTypedLM2_2AggFieldSpec
+  WellTypedLM2_2AggFields
+  WellTypedLM2_2Aggregate
+  evalRvalue_aggregate_tuple_struct_simulation
+  WellTypedLM2_2FieldWrite
+  step_assign_nested_field_write_simulation
+  step_assign_nested_field_write_post_structMemPlaceRel
+  WellTypedLM2_2UseAssign
+  step_assign_use_lm2_2_simulation
+  StructMemPlaceRel.of_overwrite_immediate
+  StructMemPlaceRel.overwrite_immediate
+  UninitStructMemPlaceRel.overwrite_immediate
+  annealWriteImmediate_unprojected_indirect_eq
+  useStructPostStaticEnv
+  WellTypedLM2_2UseAssignStruct
+  step_assign_use_struct_lm2_2_simulation
+  step_nop_lm2_2_simulation
+  step_storageLive_lm2_2_simulation
+  step_storageDead_lm2_2_simulation
+  WellTypedLM2_2Stmt
+  step_stmt_lm2_2_simulation
+  step_two_stmts_lm2_2_simulation
+  WellTypedLM2_2Stmts
+  step_stmts_lm2_2_simulation
+  Witness.lm22PairBody
+  Witness.lm22PairMiriInit
+  Witness.lm22Pair_validStructLayout
+  Witness.lm22Pair_isImmediateStructTy
+  Witness.lm22Pair_trailing_padding_bytes
+  Witness.lm22Pair_stateRelLM2_2_init
+  Witness.lm22Pair_full_trace_and_returns_agree
+  Witness.lm22UnpaddedBody
+  Witness.lm22UnpaddedMiriInit
+  Witness.lm22Unpadded_validStructLayout
+  Witness.lm22Unpadded_no_padding_bytes
+  Witness.lm22Unpadded_stateRelLM2_2_init
+  Witness.lm22Unpadded_full_trace_and_returns_agree
+  Witness.lm22InnerU32_validStructLayout
+  Witness.lm22InnerU32_isImmediateStructTy
+  Witness.lm22Padded_validStructLayout
+  Witness.lm22Padded_interfield_padding_bytes
+  Witness.lm22Padded_writeField_preserves_witness
+  Witness.lm22PaddedBody
+  Witness.lm22PaddedMiriInit
+  Witness.lm22Padded_stateRelLM2_2_init
+  Witness.lm22Padded_full_trace_and_returns_agree
+  Witness.lm22InnerPair_validStructLayout
+  Witness.lm22InnerPair_isImmediateStructTy
+  Witness.lm22Nested_validStructLayout
+  Witness.lm22Nested_all_five_padding_bytes
+  Witness.lm22NestedBody
+  Witness.lm22NestedMiriInit
+  Witness.lm22Nested_stateRelLM2_2_init
+  Witness.lm22Nested_full_trace_and_returns_agree
+  Witness.lm22ReassignBody
+  Witness.lm22ReassignMiriInit
+  Witness.lm22Reassign_stateRelLM2_2_init
+  Witness.lm22Reassign_useStruct_wt
+  Witness.lm22Reassign_full_trace_and_returns_agree
+  Witness.lm22Reassign_block_wt
+  Witness.lm22Reassign_block_stmts_simulation
+  maskBlocksGetBit
+  initWordsFalse
+  initWordsTrue
+  ValidAggregateFieldPath.prefix_of_append
+  ValidAggregateFieldPath.read_substruct_scalarPair
+  StructMemPlaceRel.write_substruct_scalarPair
+  WellTypedLM2_2ProjectedSubStructRead
+  ProjectedSubStructReadSimRelLM2_2
+  evalProjection_nested_substruct_read_at_local
+  evalOperand_nested_substruct_read_simulation
+  WellTypedLM2_2SubStructWrite
+  step_assign_nested_substruct_write_simulation
+  Witness.lm22Nested_projChain_inner_substruct
+  Witness.lm22SubStructBody
+  Witness.lm22SubStructMiriInit
+  Witness.lm22SubStruct_stateRelLM2_2_init
+  Witness.lm22SubStruct_read_wt
+  Witness.lm22SubStruct_write_wt
+  Witness.lm22SubStruct_full_trace_and_returns_agree
+  Witness.lm22LargeTy
+  Witness.lm22LargeLayoutTable
+  Witness.lm22LargeFields
+  Witness.lm22LargePaths
+  Witness.lm22LargeEnv
+  Witness.lm22Large_validStructLayout
+  Witness.lm22Large_multi_block_padding_bytes
+  Witness.lm22LargeBody
+  Witness.lm22LargeMiriInit
+  Witness.lm22Large_stateRelLM2_2_init
+  Witness.lm22Large_full_trace_and_returns_agree
+  step_terminator_goto_lm2_2_simulation
+  step_terminator_return_lm2_2_simulation
+  Witness.lm22_return_agree_of_stateRelLM2_2
+  Witness.lm22LiveRetBody
+  Witness.lm22LiveRetMiriInit
+  Witness.lm22LiveRet_stateRelLM2_2_init
+  Witness.lm22LiveRet_full_trace_and_returns_agree
+  usesStructMemCopyDest
+  annealStructMemCopyOp
+  StructMemPlaceRel.of_copy_fresh
+  StructMemPlaceRel.of_copy_overwrite
+  annealStructMemCopyOp_dead_ub
+  annealStructMemCopyOp_uninitImm_ok
+  annealStructMemCopyOp_indirect_ok
+  ValidAggregateFieldPath.read_substruct_scalarWrap
+  StructMemPlaceRel.write_substruct_scalarWrap
+  WellTypedLM2_2ProjectedScalarWrapRead
+  ProjectedScalarWrapReadSimRelLM2_2
+  evalProjection_nested_scalar_wrap_read_at_local
+  evalOperand_nested_scalar_wrap_read_simulation
+  evalStatement_assign_use_mem_eq
+  WellTypedLM2_2ScalarWrapWrite
+  step_assign_nested_scalar_wrap_write_simulation
+  StateRelLM2_2.extract_structMemPlaceRel
+  WellTypedLM2_2UseAssignMemStruct
+  step_assign_use_memory_struct_lm2_2_simulation
+  Witness.lm22MemMoveBody
+  Witness.lm22MemMoveMiriInit
+  Witness.lm22MemMove_stateRelLM2_2_init
+  Witness.lm22MemMove_move2to3_wt
+  Witness.lm22MemMove_copy3to4_wt
+  Witness.lm22MemMove_full_trace_and_returns_agree
+  Witness.lm22Padded_projChain_inner_wrap
+  Witness.lm22ScalarWrapSubBody
+  Witness.lm22ScalarWrapSubMiriInit
+  Witness.lm22ScalarWrapSub_stateRelLM2_2_init
+  Witness.lm22ScalarWrapSub_read_wt
+  Witness.lm22ScalarWrapSub_write_wt
+  Witness.lm22ScalarWrapSub_full_trace_and_returns_agree
+  Witness.lm22Realistic80Ty
+  Witness.lm22Realistic80LayoutTable
+  Witness.lm22Realistic80Fields
+  Witness.lm22Realistic80Paths
+  Witness.lm22Realistic80Env
+  Witness.lm22Realistic80_validStructLayout
+  Witness.lm22Realistic80_all_padding_bytes
+  Witness.lm22Realistic80Body
+  Witness.lm22Realistic80MiriInit
+  Witness.lm22Realistic80_stateRelLM2_2_init
+  Witness.lm22Realistic80_full_trace_and_returns_agree
+  copyWholeStructAllocation
+  copyWholeStructAllocation_props
+  annealStructMemCopyOp_readOnly_ub
+  Witness.lm22PairWrap_read_wt
+  Witness.lm22PairWrap_full_trace_and_returns_agree
+  Witness.lm22MemMoveUb_faults_with_ub_on_both
+  Witness.lm22ReadOnlyCopy_ub
+  Witness.lm22SuperOuter_agg_hooks_ok
+  Witness.lm22SuperOuter_step1_stateRel
+  Witness.lm22SuperOuter_full_trace_and_returns_agree
+  annealStructMemCopyOp_dangling_src_ub
+  annealStructMemCopyOp_dangling_dest_ub
+  annealStructMemCopyOp_overlap_ub
+  WellTypedLM2_2SelfMoveMemStruct
+  step_assign_self_move_memory_struct_lm2_2_simulation
+  step_assign_self_copy_memory_struct_divergence
+  annealControlHooks_returnOperand_indirect
+  StepRelStructReturnLM2_2
+  step_terminator_return_struct_lm2_2_simulation
+  Witness.lm22DanglingSrcCopy_ub
+  Witness.lm22DanglingDestCopy_ub
+  Witness.lm22StructRetBody
+  Witness.lm22StructRetMiriInit
+  Witness.lm22StructRet_stateRelLM2_2_init
+  Witness.lm22StructRet_full_trace_and_struct_return
+  Witness.lm22SelfMoveBody
+  Witness.lm22SelfMoveMiriInit
+  Witness.lm22SelfMove_stateRelLM2_2_init
+  Witness.lm22SelfMove_full_trace_and_returns_agree
+  Witness.lm22SelfCopyBody
+  Witness.lm22SelfCopyAnnealInit
+  Witness.lm22SelfCopyMiriInit
+  Witness.lm22SuperTripleInitAlloc_selfCopy_err
+  Witness.lm22SelfCopyOverlap_ub
+  Witness.lm22SelfCopy_stateRel
+  Witness.lm22SelfCopy_divergence
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -2446,6 +2692,1323 @@ example :
       ImmediateRel Witness.lm21I32Ty emptyLayoutTable (.scalar ⟨22, 4⟩)
         (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22))) :=
   Witness.lm21_signed_bool_char_runBounded_return
+/-! ### LM-2.2 statement & witness pins -/
+
+section LM2_2Pins
+
+open Trusted.Rustc.V2026_06_01.Layout
+
+-- `LocalRel.indirect` keeps its upstream whole-value view: an initialized
+-- memory-backed slot `.init v` carries `MemPlaceRel … (some v)`, an uninitialized
+-- one `MemPlaceRel … none`. `LM-2.2` leaves `Relation.lean` unchanged.
+example {mach : AnnealMachine} {decl : MirAst.LocalDecl} {layouts : LayoutTable}
+    {v : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {c : Option Miri.Interpreter.LocalLayout}
+    (hc : ∀ l ∈ c, l = translateTy decl.ty layouts)
+    (hmp : MemPlaceRel mach decl.ty layouts (some v) mp) :
+    LocalRel mach decl layouts (.init v) ⟨.live (.indirect mp), c⟩ :=
+  .indirect (.init v) mp c hc (by nofun) hmp
+
+example
+    {layout : Miri.ABI.LayoutData}
+    {fields : List StructFieldDesc}
+    (hvalid : ValidStructLayout layout fields)
+    {i : Nat} (hi : i < fields.length)
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc)
+    (hfield_sz : (fields[i]'hi).fieldLayout.size = translateSizeBytes sc.sizeBytes)
+    {E : Type} {A : Miri.Memory.Allocation AnnealProv E} {words : Array UInt64}
+    (hbsize : A.byteSize = layout.size)
+    (hlen : A.len = A.byteSize.bytes.toNat)
+    (hmut : A.mutability = .Mut)
+    (hprov : A.provenanceMap = Miri.Memory.ProvenanceMap.new)
+    (hmask : InitMaskWordRel A.initializationMask A.byteSize words) :
+    ∃ (A' : Miri.Memory.Allocation AnnealProv E) (words' : Array UInt64),
+      Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+          (Miri.Memory.allocRange (fields[i]'hi).offset msc.size)
+          (Miri.Memory.Scalar.fromScalarInt msc) A = .ok () A' ∧
+      A'.byteSize = layout.size ∧
+      A'.len = A'.byteSize.bytes.toNat ∧
+      A'.mutability = .Mut ∧
+      A'.provenanceMap = Miri.Memory.ProvenanceMap.new ∧
+      InitMaskWordRel A'.initializationMask A'.byteSize words' ∧
+      (∀ b, b < layout.size.bytes.toNat →
+        maskBlocksGetBit words' b =
+          (maskBlocksGetBit words b ||
+            decide ((fields[i]'hi).offset.bytes.toNat ≤ b ∧
+              b < (fields[i]'hi).offset.bytes.toNat +
+                (fields[i]'hi).fieldLayout.size.bytes.toNat))) ∧
+      A'.initializationMask.isRangeInitialized
+          (Miri.Memory.allocRange (fields[i]'hi).offset (fields[i]'hi).fieldLayout.size) =
+        .ok (.ok ()) ∧
+      A'.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange (fields[i]'hi).offset (fields[i]'hi).fieldLayout.size) false =
+        .ok (Miri.Memory.Scalar.fromScalarInt msc) ∧
+      (∀ j (hj : j < fields.length), j ≠ i →
+        0 < (fields[j]'hj).fieldLayout.size.bytes.toNat →
+        (∀ b, (fields[j]'hj).offset.bytes.toNat ≤ b →
+          b < (fields[j]'hj).offset.bytes.toNat +
+            (fields[j]'hj).fieldLayout.size.bytes.toNat →
+          maskBlocksGetBit words b = true) →
+        A'.initializationMask.isRangeInitialized
+            (Miri.Memory.allocRange (fields[j]'hj).offset (fields[j]'hj).fieldLayout.size) =
+          .ok (.ok ()) ∧
+        A'.readScalar annealTargetDataLayout
+            (Miri.Memory.allocRange (fields[j]'hj).offset (fields[j]'hj).fieldLayout.size) false =
+          A.readScalar annealTargetDataLayout
+            (Miri.Memory.allocRange (fields[j]'hj).offset (fields[j]'hj).fieldLayout.size) false) ∧
+      (∀ p, isStructPaddingByte fields layout.size p →
+        A'.initializationMask.get (Miri.ABI.Size.ofBytes (UInt64.ofNat p)) =
+          A.initializationMask.get (Miri.ABI.Size.ofBytes (UInt64.ofNat p))) :=
+  writeField_preserves_other_fields_and_padding hvalid hi hrel hfield_sz hbsize hlen hmut hprov hmask
+
+example
+    {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp)
+    {p : Nat} (hp : isStructPaddingByte fields (translateTy ty layouts).layout.size p) :
+    ∃ allocId localAlloc,
+      mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+      mach.memory.live.find? (fun (k, _) => k == allocId) = some (allocId, localAlloc) ∧
+      (∀ q, isStructPaddingByte fields (translateTy ty layouts).layout.size q →
+        localAlloc.allocation.initializationMask.get
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat q)) = .ok false) ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateTy ty layouts).layout.size) ≠
+        .ok (.ok ()) :=
+  StructMemPlaceRel.has_uninit_of_padding_byte h hp
+
+example
+    {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp)
+    (hunpad : (translateTy ty layouts).layout.size.bytes.toNat ≤ structSumFieldBytes fields) :
+    MemPlaceRel mach ty layouts (some rootVal) mp :=
+  StructMemPlaceRel.toMemPlaceRel h hunpad
+
+example
+    {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : UninitStructMemPlaceRel mach ty layouts fields mp) :
+    MemPlaceRel mach ty layouts none mp :=
+  UninitStructMemPlaceRel.toMemPlaceRel h
+
+example
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (h : StateRel body s m) :
+    StateRelLM2_2 body emptyStructTypeEnv {} 0 s m :=
+  StateRel.toLM2_2 h
+
+example
+    {body : CapturedMir} {env : StructTypeEnv}
+    {stEnv : LM2_2StaticEnv} {allocBudget : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (h : StateRelLM2_2 body env stEnv allocBudget s m)
+    (hflat : ∀ (i : Nat) (decl : MirAst.LocalDecl) (v : Value)
+      (imm : Miri.Interpreter.Immediate AnnealProv)
+      (lay : Option Miri.Interpreter.LocalLayout),
+      get? body.localDecls i = some decl →
+      env decl.ty ≠ none →
+      get? s.frame.locals i = some (.init v) →
+      (∃ tf, m.stack.frames = #[tf] ∧ tf.locals[i]? = some ⟨.live (.immediate imm), lay⟩) →
+      ImmediateRel decl.ty body.layouts v imm)
+    (hunpad : ∀ (i : Nat) (decl : MirAst.LocalDecl) (v : Value)
+      (mp : Miri.Interpreter.MemPlace AnnealProv)
+      (lay : Option Miri.Interpreter.LocalLayout)
+      (fields : List StructFieldDesc) (paths : List (List ProjectionElem)),
+      get? body.localDecls i = some decl →
+      env decl.ty = some (fields, paths) →
+      get? s.frame.locals i = some (.init v) →
+      (∃ tf, m.stack.frames = #[tf] ∧ tf.locals[i]? = some ⟨.live (.indirect mp), lay⟩) →
+      (translateTy decl.ty body.layouts).layout.size.bytes.toNat ≤ structSumFieldBytes fields) :
+    StateRel body s m :=
+  StateRelLM2_2.toStateRel_of_flat_imm h (by intro ty fs ps henv ek c; dsimp [StructTypeEnv, emptyStructTypeEnv] at henv; contradiction) hflat hunpad
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {af : StackFrame}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {m : AnnealStepState} {isMove : Bool} {idx : Local}
+    {projs : List ProjectionElem} {leafTy : Ty}
+    (hframes : m.stack.frames = #[topFrame])
+    (hframe : FrameRelLM2_2 body env m.machine af topFrame)
+    (hwt : WellTypedLM2_2ProjectedRead body env idx projs leafTy)
+    (globals : List CapturedAllocation)
+    (known : Option Miri.Interpreter.LocalLayout) :
+    ProjectedReadSimRelLM2_2 body env af topFrame m leafTy
+      (evalOperand af.locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals body.layouts .nil)
+      ((annealEvalOperand body.localDecls body.layouts
+          (translateOperand (mkPlaceOperand isMove ⟨idx, projs⟩)) known >>=
+        annealReadImmediate) m) :=
+  evalProjection_nested_field_read_simulation hframes hframe hwt globals known
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv (k_bud + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local}
+    {kind : MirAst.AggregateKind} {ops : List MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate kind ops), span⟩)
+    (hwt : WellTypedLM2_2Aggregate body env stEnv dstIdx kind ops) :
+    StepRelLM2_2 body env (aggPostStaticEnv stEnv dstIdx ops) k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  evalRvalue_aggregate_tuple_struct_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv (k_bud + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {projs : List ProjectionElem}
+    {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, projs⟩ (.use op), span⟩)
+    (hwt : WellTypedLM2_2FieldWrite body env stEnv dstIdx projs op) :
+    StepRelLM2_2 body env (fieldWritePostStaticEnv stEnv dstIdx op) k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_nested_field_write_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s s' : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv (k_bud + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {projs : List ProjectionElem}
+    {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, projs⟩ (.use op), span⟩)
+    (hwt : WellTypedLM2_2FieldWrite body env stEnv dstIdx projs op)
+    (hstep : stepMirFn body s = .step s') :
+    ∃ decl fields paths rootVal mp,
+      get? body.localDecls dstIdx = some decl ∧
+      env decl.ty = some (fields, paths) ∧
+      get? s'.frame.locals dstIdx = some (.init rootVal) ∧
+      StructMemPlaceRel
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.machine
+        decl.ty body.layouts fields paths rootVal mp ∧
+      ∃ tf lay,
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.stack.frames =
+          #[tf] ∧
+        tf.locals[dstIdx]? = some ⟨.live (.indirect mp), lay⟩ :=
+  step_assign_nested_field_write_post_structMemPlaceRel hstate hphase hbb hstmt hwt hstep
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use op), span⟩)
+    (hwt : WellTypedLM2_2UseAssign body env stEnv dstIdx op) :
+    StepRelLM2_2 body env (usePostStaticEnv stEnv dstIdx op) k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_use_lm2_2_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir} {env : StructTypeEnv}
+    {stEnv stEnv' : LM2_2StaticEnv} {k_bud k_bud' : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {stmt : Statement}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx = some stmt)
+    (hwt : WellTypedLM2_2Stmt body env stEnv k_bud stmt stEnv' k_bud') :
+    StepRelLM2_2 body env stEnv' k_bud' m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_stmt_lm2_2_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir} {env : StructTypeEnv}
+    {stEnv₀ stEnv₁ stEnv₂ : LM2_2StaticEnv} {k₀ k₁ k₂ : Nat}
+    {s₀ : MachineState} {m₀ : AnnealStepState}
+    (hstate₀ : StateRelLM2_2 body env stEnv₀ k₀ s₀ m₀)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {stmt₁ stmt₂ : Statement}
+    (hbb : get? body.basicBlocks s₀.frame.blockIdx = some bb)
+    (hstmt₁ : get? bb.statements s₀.frame.stmtIdx = some stmt₁)
+    (hstmt₂ : get? bb.statements (s₀.frame.stmtIdx + 1) = some stmt₂)
+    (hwt₁ : WellTypedLM2_2Stmt body env stEnv₀ k₀ stmt₁ stEnv₁ k₁)
+    (hwt₂ : WellTypedLM2_2Stmt body env stEnv₁ k₁ stmt₂ stEnv₂ k₂) :
+    (stepMirFn body s₀ = .fail .ub ∧
+      ∃ m_err msg,
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m₀ =
+          (m_err, .error (.undefinedBehavior msg))) ∨
+    (∃ s₁ m₁,
+      stepMirFn body s₀ = .step s₁ ∧
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m₀ =
+        (m₁, .ok true) ∧
+      StateRelLM2_2 body env stEnv₁ k₁ s₁ m₁ ∧
+      StepRelLM2_2 body env stEnv₂ k₂ m₁
+        (stepMirFn body s₁)
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m₁)) :=
+  step_two_stmts_lm2_2_simulation hstate₀ hphase hbb hstmt₁ hstmt₂ hwt₁ hwt₂
+
+example :
+    StateRelLM2_2 Witness.lm22PairBody Witness.lm22PairEnv
+      { initLocals := [2, 1], immLocals := [2, 3, 2, 0] } 1
+      (Witness.lm22StepAnnealN Witness.lm22PairBody 5
+        (initMachineState Witness.lm22PairBody []))
+      (Witness.lm22StepMiriN Witness.lm22PairBody 5 Witness.lm22PairMiriInit) ∧
+    (∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22PairBody 7 Witness.lm22PairMiriInit).machine
+        Witness.lm22PairTy Witness.lm22PairLayoutTable
+        Witness.lm22PairFields Witness.lm22PairPaths
+        (.aggregate 0 [.scalar ⟨0x99AABBCC, 4⟩, .scalar ⟨0x5566, 2⟩]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22PairBody 7 Witness.lm22PairMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 6) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 7) = .ok false ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)) ≠ .ok (.ok ())) ∧
+    StateRel Witness.lm22PairBody
+      (Witness.lm22StepAnnealN Witness.lm22PairBody 11
+        (initMachineState Witness.lm22PairBody []))
+      (Witness.lm22StepMiriN Witness.lm22PairBody 11 Witness.lm22PairMiriInit) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22PairBody 12
+        (initMachineState Witness.lm22PairBody [])) = some 0x99AABBCC ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22PairBody 12 Witness.lm22PairMiriInit) = some 0x99AABBCC :=
+  Witness.lm22Pair_full_trace_and_returns_agree
+
+example :
+    (∃ mp,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22UnpaddedBody 3 Witness.lm22UnpaddedMiriInit).machine
+        Witness.lm22UnpaddedTy Witness.lm22UnpaddedLayoutTable
+        Witness.lm22UnpaddedFields Witness.lm22UnpaddedPaths
+        (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨77, 4⟩, .scalar ⟨30, 4⟩]) mp) ∧
+    StateRel Witness.lm22UnpaddedBody
+      (Witness.lm22StepAnnealN Witness.lm22UnpaddedBody 3
+        (initMachineState Witness.lm22UnpaddedBody []))
+      (Witness.lm22StepMiriN Witness.lm22UnpaddedBody 3 Witness.lm22UnpaddedMiriInit) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22UnpaddedBody 6
+        (initMachineState Witness.lm22UnpaddedBody [])) = some 77 ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22UnpaddedBody 6 Witness.lm22UnpaddedMiriInit) = some 77 :=
+  Witness.lm22Unpadded_full_trace_and_returns_agree
+
+example :
+    ValidStructLayout
+      (translateTy Witness.lm22InnerU32Ty Witness.lm22PaddedLayoutTable).layout
+      [Witness.lm22InnerU32Field0] ∧
+    ValidStructLayout
+      (translateTy Witness.lm22PaddedTy Witness.lm22PaddedLayoutTable).layout
+      Witness.lm22PaddedFields ∧
+    (∃ (A' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
+      (∃ raw,
+        Miri.Memory.Allocation.tryNew (Miri.ABI.Size.ofBytes 8)
+          (translateAlignBytes 4) .Uninit annealZeroedStorage = .ok raw ∧
+        Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+          (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4))
+          (Miri.Memory.Scalar.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 99))
+          (raw.withExtra (none : Option Miri.TreeBorrows.BorrowTree)) = .ok () A') ∧
+      A'.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4)) = .ok (.ok ()) ∧
+      A'.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      A'.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      A'.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false) :=
+  ⟨Witness.lm22InnerU32_validStructLayout,
+    Witness.lm22Padded_validStructLayout,
+    Witness.lm22Padded_writeField_preserves_witness⟩
+
+example :
+    (∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22PaddedBody 5 Witness.lm22PaddedMiriInit).machine
+        Witness.lm22PaddedTy Witness.lm22PaddedLayoutTable
+        Witness.lm22PaddedFields Witness.lm22PaddedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22PaddedBody 5 Witness.lm22PaddedMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)) ≠ .ok (.ok ())) ∧
+    StateRelLM2_2 Witness.lm22PaddedBody Witness.lm22PaddedEnv
+      { initLocals := [2, 0, 1], immLocals := [2, 0, 2, 0] } 0
+      (Witness.lm22StepAnnealN Witness.lm22PaddedBody 7
+        (initMachineState Witness.lm22PaddedBody []))
+      (Witness.lm22StepMiriN Witness.lm22PaddedBody 7 Witness.lm22PaddedMiriInit) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22PaddedBody 9
+        (initMachineState Witness.lm22PaddedBody [])) = some 99 ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22PaddedBody 9 Witness.lm22PaddedMiriInit) = some 99 :=
+  Witness.lm22Padded_full_trace_and_returns_agree
+
+example :
+    ValidStructLayout
+      (translateTy Witness.lm22InnerPairTy Witness.lm22NestedLayoutTable).layout
+      Witness.lm22InnerPairFields ∧
+    ValidStructLayout
+      (translateTy Witness.lm22NestedTy Witness.lm22NestedLayoutTable).layout
+      Witness.lm22NestedFields ∧
+    ((∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22NestedBody 7 Witness.lm22NestedMiriInit).machine
+        Witness.lm22NestedTy Witness.lm22NestedLayoutTable
+        Witness.lm22NestedFields Witness.lm22NestedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0xBEEF, 2⟩]]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22NestedBody 7 Witness.lm22NestedMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 10) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 11) = .ok false ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 12)) ≠ .ok (.ok ())) ∧
+    StateRelLM2_2 Witness.lm22NestedBody Witness.lm22NestedEnv
+      { initLocals := [0, 4, 3, 2], immLocals := [0, 4, 3, 1, 4, 3, 0] } 0
+      (Witness.lm22StepAnnealN Witness.lm22NestedBody 10
+        (initMachineState Witness.lm22NestedBody []))
+      (Witness.lm22StepMiriN Witness.lm22NestedBody 10 Witness.lm22NestedMiriInit) ∧
+    get? (Witness.lm22StepAnnealN Witness.lm22NestedBody 10
+      (initMachineState Witness.lm22NestedBody [])).frame.locals 3 =
+      some (.init (.scalar ⟨7, 1⟩)) ∧
+    get? (Witness.lm22StepAnnealN Witness.lm22NestedBody 10
+      (initMachineState Witness.lm22NestedBody [])).frame.locals 4 =
+      some (.init (.scalar ⟨0x11112222, 4⟩)) ∧
+    Witness.annealOutcomeScalarBits 2
+      (runAnnealBounded Witness.lm22NestedBody 15
+        (initMachineState Witness.lm22NestedBody [])) = some 0xBEEF ∧
+    Witness.miriOutcomeScalarBits 2
+      (runMiriBounded Witness.lm22NestedBody 15 Witness.lm22NestedMiriInit) = some 0xBEEF) :=
+  ⟨Witness.lm22InnerPair_validStructLayout,
+    Witness.lm22Nested_validStructLayout,
+    Witness.lm22Nested_full_trace_and_returns_agree⟩
+
+/-! Whole-value reassignment of memory-backed immediate-ABI structs (`[adv B2]`). -/
+
+example
+    {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {dstIdx : Nat} {val : Miri.Interpreter.Immediate AnnealProv}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {lay : Option Miri.Interpreter.LocalLayout}
+    {dstLay : Miri.Interpreter.LocalLayout}
+    {id0 : Miri.Interpreter.LocalsIdentity}
+    (hframes : m.stack.frames = #[topFrame])
+    (hget : topFrame.getLocal dstIdx = .ok ⟨.live (.indirect mp), lay⟩) :
+    annealWriteImmediate val ⟨.local 0 dstIdx none id0, dstLay⟩ m =
+      annealWriteIndirectImmediate val mp Miri.ABI.Size.ZERO dstLay m :=
+  annealWriteImmediate_unprojected_indirect_eq hframes hget
+
+example
+    {m : AnnealStepState} {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {newVal : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {allocId : Miri.Memory.AllocId} {baseAddr : UInt64}
+    {localAlloc : AnnealLocalAlloc} {words0 : Array UInt64}
+    (himm : ImmediateStructRel ty layouts fields paths newVal imm)
+    (hprov : mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one))
+    (hmis : mp.misaligned = none)
+    (hmeta : mp.metadata = .none)
+    (hlive : LiveAllocEntry m.machine.memory.live allocId localAlloc)
+    (hbase : m.machine.lookupBaseAddr allocId = some baseAddr)
+    (hptr : mp.ptr.offset = Miri.ABI.Size.ofBytes baseAddr)
+    (hovf : baseAddr.toNat + (translateTy ty layouts).layout.size.bytes.toNat < 2 ^ 64)
+    (hmut : localAlloc.allocation.mutability = .Mut)
+    (halign : mp.ptr.offset.isAligned (translateTy ty layouts).layout.align.abi = .ok true)
+    (hbs : localAlloc.allocation.byteSize = (translateTy ty layouts).layout.size)
+    (hlen : localAlloc.allocation.len = localAlloc.allocation.byteSize.bytes.toNat)
+    (hpmap : localAlloc.allocation.provenanceMap = Miri.Memory.ProvenanceMap.new)
+    (hmask : InitMaskWordRel localAlloc.allocation.initializationMask
+      localAlloc.allocation.byteSize words0)
+    (hpad : ∀ p, isStructPaddingByte fields (translateTy ty layouts).layout.size p →
+      localAlloc.allocation.initializationMask.get
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat p)) = .ok false) :
+    ∃ (u : Nat) (hu_lt : u < m.machine.memory.live.size)
+      (alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
+      m.machine.memory.live[u]'hu_lt = (allocId, localAlloc) ∧
+      annealWriteIndirectImmediate imm mp Miri.ABI.Size.ZERO (translateTy ty layouts) m =
+        .ok () { m with machine := updateAllocMachine m.machine u allocId localAlloc.kind alloc' } ∧
+      StructMemPlaceRel (updateAllocMachine m.machine u allocId localAlloc.kind alloc')
+        ty layouts fields paths newVal mp :=
+  StructMemPlaceRel.of_overwrite_immediate himm hprov hmis hmeta hlive hbase hptr hovf
+    hmut halign hbs hlen hpmap hmask hpad
+
+example
+    {m : AnnealStepState} {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {oldVal newVal : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (hmp : StructMemPlaceRel m.machine ty layouts fields paths oldVal mp)
+    (himm : ImmediateStructRel ty layouts fields paths newVal imm) :
+    ∃ (allocId : Miri.Memory.AllocId) (localAlloc : AnnealLocalAlloc)
+      (u : Nat) (hu_lt : u < m.machine.memory.live.size)
+      (alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
+      mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+      m.machine.memory.live[u]'hu_lt = (allocId, localAlloc) ∧
+      annealWriteIndirectImmediate imm mp Miri.ABI.Size.ZERO (translateTy ty layouts) m =
+        .ok () { m with machine := updateAllocMachine m.machine u allocId localAlloc.kind alloc' } ∧
+      StructMemPlaceRel (updateAllocMachine m.machine u allocId localAlloc.kind alloc')
+        ty layouts fields paths newVal mp :=
+  StructMemPlaceRel.overwrite_immediate hmp himm
+
+example
+    {m : AnnealStepState} {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {newVal : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (hmp : UninitStructMemPlaceRel m.machine ty layouts fields mp)
+    (himm : ImmediateStructRel ty layouts fields paths newVal imm) :
+    ∃ (allocId : Miri.Memory.AllocId) (localAlloc : AnnealLocalAlloc)
+      (u : Nat) (hu_lt : u < m.machine.memory.live.size)
+      (alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
+      mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+      m.machine.memory.live[u]'hu_lt = (allocId, localAlloc) ∧
+      annealWriteIndirectImmediate imm mp Miri.ABI.Size.ZERO (translateTy ty layouts) m =
+        .ok () { m with machine := updateAllocMachine m.machine u allocId localAlloc.kind alloc' } ∧
+      StructMemPlaceRel (updateAllocMachine m.machine u allocId localAlloc.kind alloc')
+        ty layouts fields paths newVal mp :=
+  UninitStructMemPlaceRel.overwrite_immediate hmp himm
+
+example (stEnv : LM2_2StaticEnv) (dstIdx : Local) (op : MirAst.Operand) :
+    useStructPostStaticEnv stEnv dstIdx op =
+      { initLocals := dstIdx :: (operandPostStaticEnv stEnv op).initLocals
+        immLocals := (operandPostStaticEnv stEnv op).immLocals.filter (· != dstIdx) } := rfl
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
+    {dstIdx : Local} {op : MirAst.Operand}
+    (decl : MirAst.LocalDecl) (fields : List StructFieldDesc) (paths : List (List ProjectionElem))
+    (hdecl : get? body.localDecls dstIdx = some decl)
+    (hstruct : IsImmediateStructTy env body.layouts decl.ty fields paths)
+    (hop : WellTypedLM2_2Operand body env stEnv op decl.ty) :
+    WellTypedLM2_2UseAssignStruct body env stEnv dstIdx op :=
+  .mk decl fields paths hdecl hstruct hop
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use op), span⟩)
+    (hwt : WellTypedLM2_2UseAssignStruct body env stEnv dstIdx op) :
+    StepRelLM2_2 body env (useStructPostStaticEnv stEnv dstIdx op) k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_use_struct_lm2_2_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir} {env : StructTypeEnv}
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    {stEnv stEnv' : LM2_2StaticEnv} {k_bud k_bud' : Nat} {stmts : List Statement}
+    (hwt : WellTypedLM2_2Stmts body env stEnv k_bud stmts stEnv' k_bud')
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmts : ∀ i (hi : i < stmts.length),
+      get? bb.statements (s.frame.stmtIdx + i) = some (stmts[i]'hi)) :
+    (runAnnealBounded body stmts.length s = .faulted .ub ∧
+      ∃ m_err msg,
+        runMiriBounded body stmts.length m = .error m_err (.undefinedBehavior msg)) ∨
+    (∃ s' m',
+      runAnnealBounded body stmts.length s = .running s' ∧
+      runMiriBounded body stmts.length m = .running m' ∧
+      StateRelLM2_2 body env stEnv' k_bud' s' m' ∧
+      s'.frame.blockIdx = s.frame.blockIdx ∧
+      s'.frame.stmtIdx = s.frame.stmtIdx + stmts.length) :=
+  step_stmts_lm2_2_simulation hphase hwt hstate hbb hstmts
+
+example :
+    (∃ tf mp lay,
+      (Witness.lm22StepMiriN Witness.lm22ReassignBody 6 Witness.lm22ReassignMiriInit).stack.frames =
+        #[tf] ∧
+      tf.locals[1]? = some ⟨.live (.indirect mp), lay⟩ ∧
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22ReassignBody 6 Witness.lm22ReassignMiriInit).machine
+        Witness.lm22PairTy Witness.lm22PairLayoutTable Witness.lm22PairFields Witness.lm22PairPaths
+        (.aggregate 0 [.scalar ⟨0x01020304, 4⟩, .scalar ⟨0x5566, 2⟩]) mp) ∧
+    get? (Witness.lm22StepAnnealN Witness.lm22ReassignBody 7
+      (initMachineState Witness.lm22ReassignBody [])).frame.locals 1 =
+      some (.init (.aggregate 0 [.scalar ⟨0xAABBCCDD, 4⟩, .scalar ⟨0x7788, 2⟩])) ∧
+    StateRelLM2_2 Witness.lm22ReassignBody Witness.lm22PairEnv
+      { initLocals := [1, 2, 1], immLocals := [3, 0] } 0
+      (Witness.lm22StepAnnealN Witness.lm22ReassignBody 7
+        (initMachineState Witness.lm22ReassignBody []))
+      (Witness.lm22StepMiriN Witness.lm22ReassignBody 7 Witness.lm22ReassignMiriInit) ∧
+    get? (Witness.lm22StepAnnealN Witness.lm22ReassignBody 9
+      (initMachineState Witness.lm22ReassignBody [])).frame.locals 3 =
+      some (.init (.scalar ⟨0x7788, 2⟩)) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22ReassignBody 13
+        (initMachineState Witness.lm22ReassignBody [])) = some 0xAABBCCDD ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22ReassignBody 13 Witness.lm22ReassignMiriInit) =
+        some 0xAABBCCDD :=
+  Witness.lm22Reassign_full_trace_and_returns_agree
+
+example :
+    ∃ s' m',
+      runAnnealBounded Witness.lm22ReassignBody 12
+        (initMachineState Witness.lm22ReassignBody []) = .running s' ∧
+      runMiriBounded Witness.lm22ReassignBody 12 Witness.lm22ReassignMiriInit = .running m' ∧
+      StateRelLM2_2 Witness.lm22ReassignBody Witness.lm22PairEnv
+        { initLocals := [1, 2, 3, 0, 3, 1, 2, 1], immLocals := [1, 2, 3, 0, 3, 3, 0] } 0 s' m' ∧
+      s'.frame.blockIdx = 0 ∧ s'.frame.stmtIdx = 12 :=
+  Witness.lm22Reassign_block_stmts_simulation
+
+/-! Non-leaf `ScalarPair` sub-struct read/write & multi-block `InitMask` (`[adv A2]`). -/
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {af : StackFrame}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {m : AnnealStepState} {isMove : Bool} {idx : Local}
+    {projs : List ProjectionElem} {subTy : Ty}
+    {sf₀ sf₁ : StructFieldDesc} {mid₀ mid₁ : Ty}
+    (hframes : m.stack.frames = #[topFrame])
+    (hframe : FrameRelLM2_2 body env m.machine af topFrame)
+    (hwt : WellTypedLM2_2ProjectedSubStructRead body env idx projs subTy sf₀ sf₁ mid₀ mid₁)
+    (globals : List CapturedAllocation)
+    (known : Option Miri.Interpreter.LocalLayout) :
+    ProjectedSubStructReadSimRelLM2_2 body env af topFrame m subTy sf₀ sf₁ mid₀ mid₁
+      (evalOperand af.locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals body.layouts .nil)
+      ((annealEvalOperand body.localDecls body.layouts
+          (translateOperand (mkPlaceOperand isMove ⟨idx, projs⟩)) known >>=
+        annealReadImmediate) m) :=
+  evalOperand_nested_substruct_read_simulation hframes hframe hwt globals known
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {projs : List ProjectionElem}
+    {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, projs⟩ (.use op), span⟩)
+    (hwt : WellTypedLM2_2SubStructWrite body env stEnv dstIdx projs op) :
+    StepRelLM2_2 body env (fieldWritePostStaticEnv stEnv dstIdx op) k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_nested_substruct_write_simulation hstate hphase hbb hstmt hwt
+
+example :
+    (get? (Witness.lm22StepAnnealN Witness.lm22SubStructBody 7
+      (initMachineState Witness.lm22SubStructBody [])).frame.locals 3 =
+      some (.init (.aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩])) ∧
+     ∃ imm,
+      ImmediateStructRel Witness.lm22InnerPairTy Witness.lm22NestedLayoutTable
+        Witness.lm22InnerPairFields Witness.lm22InnerPairPaths
+        (.aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]) imm) ∧
+    (∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22SubStructBody 9 Witness.lm22SubStructMiriInit).machine
+        Witness.lm22NestedTy Witness.lm22NestedLayoutTable
+        Witness.lm22NestedFields Witness.lm22NestedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x55556666, 4⟩, .scalar ⟨0x7788, 2⟩]]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22SubStructBody 9 Witness.lm22SubStructMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 10) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 11) = .ok false ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 12)) ≠ .ok (.ok ())) ∧
+    Witness.annealOutcomeScalarBits 2
+      (runAnnealBounded Witness.lm22SubStructBody 15
+        (initMachineState Witness.lm22SubStructBody [])) = some 0x7788 ∧
+    Witness.miriOutcomeScalarBits 2
+      (runMiriBounded Witness.lm22SubStructBody 15 Witness.lm22SubStructMiriInit) = some 0x7788 :=
+  Witness.lm22SubStruct_full_trace_and_returns_agree
+
+example :
+    ValidStructLayout
+      (translateTy Witness.lm22LargeTy Witness.lm22LargeLayoutTable).layout
+      Witness.lm22LargeFields ∧
+    ((∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22LargeBody 3 Witness.lm22LargeMiriInit).machine
+        Witness.lm22LargeTy Witness.lm22LargeLayoutTable
+        Witness.lm22LargeFields Witness.lm22LargePaths
+        (.aggregate 0 [.scalar ⟨5, 1⟩, .scalar ⟨100, 4⟩, .scalar ⟨999, 4⟩]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22LargeBody 3 Witness.lm22LargeMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 64) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 72) = .ok false ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 80)) ≠ .ok (.ok ())) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22LargeBody 6
+        (initMachineState Witness.lm22LargeBody [])) = some 999 ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22LargeBody 6 Witness.lm22LargeMiriInit) = some 999) :=
+  ⟨Witness.lm22Large_validStructLayout, Witness.lm22Large_full_trace_and_returns_agree⟩
+
+/-! Terminators under `StateRelLM2_2` and return with a live padded struct (`[adv B3]`). -/
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : (∃ target, bb.terminator.kind = .goto target) ∨
+      bb.terminator.kind = .unreachable) :
+    StepRelLM2_2 body env stEnv k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_terminator_goto_lm2_2_simulation hstate hphase hbb hstmt_none hstmt_len hterm
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_)
+    {decl0 : MirAst.LocalDecl}
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (henv0 : env decl0.ty = none)
+    (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (himm0 : 0 ∈ stEnv.immLocals) :
+    StepRel body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_terminator_return_lm2_2_simulation hstate hphase hbb hstmt_none hstmt_len hcleanup
+    hret hdecl0 henv0 hsz0 himm0
+
+example :
+    (∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22LiveRetBody 7 Witness.lm22LiveRetMiriInit).machine
+        Witness.lm22PaddedTy Witness.lm22PaddedLayoutTable
+        Witness.lm22PaddedFields Witness.lm22PaddedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22LiveRetBody 7
+          Witness.lm22LiveRetMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false) ∧
+    StateRelLM2_2 Witness.lm22LiveRetBody Witness.lm22PaddedEnv
+      { initLocals := [2, 0, 1], immLocals := [2, 0, 2, 0] } 0
+      (Witness.lm22StepAnnealN Witness.lm22LiveRetBody 7
+        (initMachineState Witness.lm22LiveRetBody []))
+      (Witness.lm22StepMiriN Witness.lm22LiveRetBody 7 Witness.lm22LiveRetMiriInit) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22LiveRetBody 8
+        (initMachineState Witness.lm22LiveRetBody [])) = some 99 ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22LiveRetBody 8 Witness.lm22LiveRetMiriInit) = some 99 :=
+  Witness.lm22LiveRet_full_trace_and_returns_agree
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    {idx : Local} {decl : MirAst.LocalDecl}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {rootVal : Value}
+    (hdecl : get? body.localDecls idx = some decl)
+    (henv : env decl.ty = some (fields, paths))
+    (hmem : (translateTy decl.ty body.layouts).layout.backendRepr = .Memory (sized := true))
+    (hslot : get? s.frame.locals idx = some (.init rootVal)) :
+    ∃ mp tf lay,
+      m.stack.frames = #[tf] ∧
+      tf.locals[idx]? = some ⟨.live (.indirect mp), lay⟩ ∧
+      StructMemPlaceRel m.machine decl.ty body.layouts fields paths rootVal mp :=
+  StateRelLM2_2.extract_structMemPlaceRel hstate hdecl henv hmem hslot
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv (k_bud + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {isMove : Bool} {srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (mkPlaceOperand isMove ⟨srcIdx, .nil⟩)), span⟩)
+    (hwt : WellTypedLM2_2UseAssignMemStruct body env stEnv dstIdx isMove srcIdx) :
+    StepRelLM2_2 body env
+      (useStructPostStaticEnv stEnv dstIdx (mkPlaceOperand isMove ⟨srcIdx, .nil⟩))
+      k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_use_memory_struct_lm2_2_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {af : StackFrame}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {m : AnnealStepState} {isMove : Bool} {idx : Local}
+    {projs : List ProjectionElem} {subTy : Ty}
+    {sf₀ : StructFieldDesc} {mid₀ : Ty}
+    (hframes : m.stack.frames = #[topFrame])
+    (hframe : FrameRelLM2_2 body env m.machine af topFrame)
+    (hwt : WellTypedLM2_2ProjectedScalarWrapRead body env idx projs subTy sf₀ mid₀)
+    (globals : List CapturedAllocation)
+    (known : Option Miri.Interpreter.LocalLayout) :
+    ProjectedScalarWrapReadSimRelLM2_2 body env af topFrame m subTy sf₀ mid₀
+      (evalOperand af.locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals body.layouts .nil)
+      ((annealEvalOperand body.localDecls body.layouts
+          (translateOperand (mkPlaceOperand isMove ⟨idx, projs⟩)) known >>=
+        annealReadImmediate) m) :=
+  evalOperand_nested_scalar_wrap_read_simulation hframes hframe hwt globals known
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv (k_bud + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx : Local} {projs : List ProjectionElem}
+    {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, projs⟩ (.use op), span⟩)
+    (hwt : WellTypedLM2_2ScalarWrapWrite body env stEnv dstIdx projs op) :
+    StepRelLM2_2 body env (fieldWritePostStaticEnv stEnv dstIdx op) k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_nested_scalar_wrap_write_simulation hstate hphase hbb hstmt hwt
+
+example :
+    (get? (Witness.lm22StepAnnealN Witness.lm22MemMoveBody 7
+        (initMachineState Witness.lm22MemMoveBody [])).frame.locals 2 =
+      some .uninit ∧
+     ∃ mp3 alloc3,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22MemMoveBody 7 Witness.lm22MemMoveMiriInit).machine
+        Witness.lm22NestedTy Witness.lm22NestedLayoutTable
+        Witness.lm22NestedFields Witness.lm22NestedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp3 ∧
+      (∃ allocId3,
+        mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22MemMoveBody 7
+          Witness.lm22MemMoveMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 10) = .ok false ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 11) = .ok false) ∧
+    (∃ mp4 alloc4,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22MemMoveBody 10 Witness.lm22MemMoveMiriInit).machine
+        Witness.lm22NestedTy Witness.lm22NestedLayoutTable
+        Witness.lm22NestedFields Witness.lm22NestedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp4 ∧
+      (∃ allocId4,
+        mp4.ptr.provenance = some (.concrete allocId4 Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22MemMoveBody 10
+          Witness.lm22MemMoveMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId4) = some (allocId4, alloc4)) ∧
+      alloc4.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      alloc4.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      alloc4.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false ∧
+      alloc4.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 10) = .ok false ∧
+      alloc4.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 11) = .ok false) ∧
+    Witness.annealOutcomeScalarBits 2
+      (runAnnealBounded Witness.lm22MemMoveBody 16
+        (initMachineState Witness.lm22MemMoveBody [])) = some 0x3344 ∧
+    Witness.miriOutcomeScalarBits 2
+      (runMiriBounded Witness.lm22MemMoveBody 16 Witness.lm22MemMoveMiriInit) = some 0x3344 :=
+  Witness.lm22MemMove_full_trace_and_returns_agree
+
+example :
+    (get? (Witness.lm22StepAnnealN Witness.lm22ScalarWrapSubBody 7
+        (initMachineState Witness.lm22ScalarWrapSubBody [])).frame.locals 3 =
+      some (.init (.aggregate 0 [.scalar ⟨42, 4⟩])) ∧
+     ∃ imm,
+      ImmediateStructRel Witness.lm22InnerU32Ty Witness.lm22PaddedLayoutTable
+        [Witness.lm22InnerU32Field0] [[.field 0 Witness.lm22U32Ty]]
+        (.aggregate 0 [.scalar ⟨42, 4⟩]) imm) ∧
+    (∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22ScalarWrapSubBody 9
+          Witness.lm22ScalarWrapSubMiriInit).machine
+        Witness.lm22PaddedTy Witness.lm22PaddedLayoutTable
+        Witness.lm22PaddedFields Witness.lm22PaddedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFEBABE, 4⟩]]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22ScalarWrapSubBody 9
+          Witness.lm22ScalarWrapSubMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)) ≠ .ok (.ok ())) ∧
+    get? (Witness.lm22StepAnnealN Witness.lm22ScalarWrapSubBody 10
+        (initMachineState Witness.lm22ScalarWrapSubBody [])).frame.locals 4 =
+      some (.init (.scalar ⟨42, 4⟩)) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22ScalarWrapSubBody 16
+        (initMachineState Witness.lm22ScalarWrapSubBody [])) = some 0xCAFEBABE ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22ScalarWrapSubBody 16 Witness.lm22ScalarWrapSubMiriInit) =
+        some 0xCAFEBABE :=
+  Witness.lm22ScalarWrapSub_full_trace_and_returns_agree
+
+example :
+    ValidStructLayout
+      (translateTy Witness.lm22Realistic80Ty Witness.lm22Realistic80LayoutTable).layout
+      Witness.lm22Realistic80Fields ∧
+    ((∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22Realistic80Body 5
+          Witness.lm22Realistic80MiriInit).machine
+        Witness.lm22Realistic80Ty Witness.lm22Realistic80LayoutTable
+        Witness.lm22Realistic80Fields Witness.lm22Realistic80Paths
+        (.aggregate 0
+          [.scalar ⟨1, 1⟩, .scalar ⟨10, 8⟩, .scalar ⟨20, 8⟩, .scalar ⟨30, 8⟩,
+           .scalar ⟨40, 8⟩, .scalar ⟨50, 8⟩, .scalar ⟨60, 8⟩, .scalar ⟨70, 8⟩,
+           .scalar ⟨0x1122334455667788, 8⟩, .scalar ⟨0xAB, 1⟩]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22Realistic80Body 5
+          Witness.lm22Realistic80MiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 ∧
+      (∀ p, ((1 ≤ p ∧ p ≤ 7) ∨ (73 ≤ p ∧ p ≤ 79)) →
+        localAlloc.allocation.initializationMask.get
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat p)) = .ok false) ∧
+      localAlloc.allocation.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 80)) ≠ .ok (.ok ())) ∧
+    get? (Witness.lm22StepAnnealN Witness.lm22Realistic80Body 6
+        (initMachineState Witness.lm22Realistic80Body [])).frame.locals 2 =
+      some (.init (.scalar ⟨0x1122334455667788, 8⟩)) ∧
+    Witness.annealOutcomeScalarBits 1
+      (runAnnealBounded Witness.lm22Realistic80Body 10
+        (initMachineState Witness.lm22Realistic80Body [])) = some 0xAB ∧
+    Witness.miriOutcomeScalarBits 1
+      (runMiriBounded Witness.lm22Realistic80Body 10 Witness.lm22Realistic80MiriInit) =
+        some 0xAB) :=
+  ⟨Witness.lm22Realistic80_validStructLayout,
+    Witness.lm22Realistic80_full_trace_and_returns_agree⟩
+
+/-! Mutability-normalized whole-struct copy, read-only destination UB,
+    immediate `ScalarPair` scalar-wrapper read, `.Memory` move-then-use UB,
+    and `.Memory` sub-struct (`sf.length = 3`) aggregate/projection pins. -/
+
+example
+    (alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree))
+    (extra : Option Miri.TreeBorrows.BorrowTree) :
+    let alloc' := copyWholeStructAllocation alloc extra
+    alloc'.mutability = .Mut ∧
+    alloc'.byteSize = alloc.byteSize ∧
+    alloc'.len = alloc.len ∧
+    alloc'.provenanceMap = alloc.provenanceMap ∧
+    alloc'.initializationMask = alloc.initializationMask ∧
+    (∀ dl r rp, alloc'.readScalar dl r rp = alloc.readScalar dl r rp) :=
+  copyWholeStructAllocation_props alloc extra
+
+example
+    {ld : List MirAst.LocalDecl} {ly : LayoutTable}
+    {srcMp destMp : Miri.Interpreter.MemPlace AnnealProv}
+    {srcLay wholeLay : Miri.Interpreter.LocalLayout}
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {dstIdx : Miri.MIR.LocalId}
+    {iden : Miri.Interpreter.LocalsIdentity}
+    {c : Option Miri.Interpreter.LocalLayout}
+    {srcId destId : Miri.Memory.AllocId}
+    {srcBase destBase : UInt64}
+    {srcLocal destLocal : AnnealLocalAlloc}
+    {destAlloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    {u : Nat}
+    (hframes : m.stack.frames = #[tf])
+    (hlt : dstIdx < tf.locals.size)
+    (hind : tf.locals[dstIdx]'hlt = ⟨.live (.indirect destMp), c⟩)
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId Miri.Memory.BorTag.one))
+    (hbase_s : m.machine.lookupBaseAddr srcId = some srcBase)
+    (hptr_s : srcMp.ptr.offset = Miri.ABI.Size.ofBytes srcBase)
+    (hlive_s : LiveAllocEntry m.machine.memory.live srcId srcLocal)
+    (hprov_d : destMp.ptr.provenance = some (.concrete destId Miri.Memory.BorTag.one))
+    (hbase_d : m.machine.lookupBaseAddr destId = some destBase)
+    (hptr_d : destMp.ptr.offset = Miri.ABI.Size.ofBytes destBase)
+    (hu_lt : u < m.machine.memory.live.size)
+    (hfidx_d : m.machine.memory.live.findIdx? (fun (k, _) => k == destId) = some u)
+    (hget_d : m.machine.memory.live[u]'hu_lt = (destId, destLocal))
+    (hmut_d : destLocal.allocation.mutability = .Not)
+    (hcopy_err : Miri.Memory.Allocation.copy srcLocal.allocation
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO wholeLay.layout.size)
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) (srcId == destId) true
+        destLocal.allocation = .error .readOnlyAllocation destAlloc') :
+    annealStructMemCopyOp ld ly ⟨.indirect srcMp, srcLay⟩
+        ⟨.local 0 dstIdx none iden, wholeLay⟩ m =
+      .error (.undefinedBehavior "write to read-only allocation") m :=
+  annealStructMemCopyOp_readOnly_ub hframes hlt hind hprov_s hbase_s hptr_s
+    hlive_s hprov_d hbase_d hptr_d hu_lt hfidx_d hget_d hmut_d hcopy_err
+
+example :
+    (∃ imm3,
+      ImmediateStructRel Witness.lm22PairWrapTy Witness.lm22PairWrapLayoutTable
+        Witness.lm22PairWrapFields Witness.lm22PairWrapPaths
+        (.aggregate 0 [.scalar ⟨0x11223344, 4⟩, .aggregate 0 [.scalar ⟨0x13579BDF, 4⟩]]) imm3) ∧
+    (∃ imm4,
+      ImmediateStructRel Witness.lm22InnerU32Ty Witness.lm22PairWrapLayoutTable
+        [Witness.lm22InnerU32Field0] [[.field 0 Witness.lm22U32Ty]]
+        (.aggregate 0 [.scalar ⟨0x13579BDF, 4⟩]) imm4) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22PairWrapBody 14
+        (initMachineState Witness.lm22PairWrapBody [])) = some 0x13579BDF ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22PairWrapBody 14 Witness.lm22PairWrapMiriInit) =
+        some 0x13579BDF :=
+  Witness.lm22PairWrap_full_trace_and_returns_agree
+
+example :
+    runAnnealBounded Witness.lm22MemMoveUbBody 8
+        (initMachineState Witness.lm22MemMoveUbBody []) = .faulted .ub ∧
+    ∃ m_err msg,
+      runMiriBounded Witness.lm22MemMoveUbBody 8 Witness.lm22MemMoveUbMiriInit =
+        .error m_err (.undefinedBehavior msg) :=
+  Witness.lm22MemMoveUb_faults_with_ub_on_both
+
+example :
+    annealStructMemCopyOp Witness.lm22MemMoveUbBody.localDecls
+      Witness.lm22NestedLayoutTable
+      ⟨.indirect (stackAllocPlace Witness.lm22AllocId1),
+        translateTy Witness.lm22NestedTy Witness.lm22NestedLayoutTable⟩
+      ⟨.local 0 2 none (.ofAllocationToken 0),
+        translateTy Witness.lm22NestedTy Witness.lm22NestedLayoutTable⟩
+      Witness.lm22ReadOnlyCopyState =
+    .error (.undefinedBehavior "write to read-only allocation")
+      Witness.lm22ReadOnlyCopyState :=
+  Witness.lm22ReadOnlyCopy_ub
+
+example :
+    let m1 := Witness.lm22StepMiriN Witness.lm22SuperOuterBody 1
+      Witness.lm22SuperOuterMiriInit
+    (Miri.Interpreter.Step.step
+      (annealStepHooks Witness.lm22SuperOuterBody.localDecls
+        Witness.lm22SuperOuterBody.layouts) ()
+      Witness.lm22SuperOuterMiriInit).2 = .ok true ∧
+    (∃ la1,
+      m1.machine.memory.live[0]? = some (Witness.lm22AllocId1, la1) ∧
+      la1.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 0) = .ok true ∧
+      la1.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      la1.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      la1.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false ∧
+      la1.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 4) = .ok true) :=
+  Witness.lm22SuperOuter_agg_hooks_ok
+
+example :
+    (∃ mp3 alloc3,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22SuperOuterBody 4
+          Witness.lm22SuperOuterMiriInit).machine
+        Witness.lm22SuperOuterTy Witness.lm22SuperLayoutTable
+        Witness.lm22SuperOuterFields Witness.lm22SuperOuterPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩,
+          .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨0x778899AA, 4⟩]]) mp3 ∧
+      (∃ allocId3,
+        mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22SuperOuterBody 4
+          Witness.lm22SuperOuterMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22SuperOuterBody 9
+        Witness.lm22SuperOuterAnnealInit) = some 0x778899AA ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22SuperOuterBody 9
+        Witness.lm22SuperOuterMiriInit) = some 0x778899AA :=
+  Witness.lm22SuperOuter_full_trace_and_returns_agree
+
+/-! Dangling-allocation copy UB, self-move vs. self-copy (`copyRangesOverlap` UB),
+    and tuple/struct-returning root `Return` simulation pins. -/
+
+example
+    {ld : List MirAst.LocalDecl} {ly : LayoutTable}
+    {srcMp destMp : Miri.Interpreter.MemPlace AnnealProv}
+    {srcLay wholeLay : Miri.Interpreter.LocalLayout}
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {dstIdx : Miri.MIR.LocalId}
+    {iden : Miri.Interpreter.LocalsIdentity}
+    {c : Option Miri.Interpreter.LocalLayout}
+    {srcId : Miri.Memory.AllocId}
+    {srcBase : UInt64}
+    (hframes : m.stack.frames = #[tf])
+    (hlt : dstIdx < tf.locals.size)
+    (hind : tf.locals[dstIdx]'hlt = ⟨.live (.indirect destMp), c⟩)
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId Miri.Memory.BorTag.one))
+    (hbase_s : m.machine.lookupBaseAddr srcId = some srcBase)
+    (hdead_s : m.machine.memory.live.find? (fun (k, _) => k == srcId) = none) :
+    annealStructMemCopyOp ld ly ⟨.indirect srcMp, srcLay⟩
+        ⟨.local 0 dstIdx none iden, wholeLay⟩ m =
+      .error (.undefinedBehavior "dangling allocation in memory copy") m :=
+  annealStructMemCopyOp_dangling_src_ub hframes hlt hind hprov_s hbase_s hdead_s
+
+example
+    {ld : List MirAst.LocalDecl} {ly : LayoutTable}
+    {srcMp destMp : Miri.Interpreter.MemPlace AnnealProv}
+    {srcLay wholeLay : Miri.Interpreter.LocalLayout}
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {dstIdx : Miri.MIR.LocalId}
+    {iden : Miri.Interpreter.LocalsIdentity}
+    {c : Option Miri.Interpreter.LocalLayout}
+    {srcId destId : Miri.Memory.AllocId}
+    {srcBase destBase : UInt64}
+    {srcLocal : AnnealLocalAlloc}
+    (hframes : m.stack.frames = #[tf])
+    (hlt : dstIdx < tf.locals.size)
+    (hind : tf.locals[dstIdx]'hlt = ⟨.live (.indirect destMp), c⟩)
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId Miri.Memory.BorTag.one))
+    (hbase_s : m.machine.lookupBaseAddr srcId = some srcBase)
+    (hlive_s : LiveAllocEntry m.machine.memory.live srcId srcLocal)
+    (hprov_d : destMp.ptr.provenance = some (.concrete destId Miri.Memory.BorTag.one))
+    (hbase_d : m.machine.lookupBaseAddr destId = some destBase)
+    (hdead_d : m.machine.memory.live.findIdx? (fun (k, _) => k == destId) = none) :
+    annealStructMemCopyOp ld ly ⟨.indirect srcMp, srcLay⟩
+        ⟨.local 0 dstIdx none iden, wholeLay⟩ m =
+      .error (.undefinedBehavior "dangling allocation in memory copy") m :=
+  annealStructMemCopyOp_dangling_dest_ub hframes hlt hind hprov_s hbase_s hlive_s
+    hprov_d hbase_d hdead_d
+
+example
+    {ld : List MirAst.LocalDecl} {ly : LayoutTable}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {srcLay wholeLay : Miri.Interpreter.LocalLayout}
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {idx : Miri.MIR.LocalId}
+    {iden : Miri.Interpreter.LocalsIdentity}
+    {c : Option Miri.Interpreter.LocalLayout}
+    {allocId : Miri.Memory.AllocId}
+    {baseAddr : UInt64}
+    {localAlloc : AnnealLocalAlloc}
+    {alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
+    {u : Nat}
+    (hframes : m.stack.frames = #[tf])
+    (hlt : idx < tf.locals.size)
+    (hind : tf.locals[idx]'hlt = ⟨.live (.indirect mp), c⟩)
+    (hprov : mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one))
+    (hbase : m.machine.lookupBaseAddr allocId = some baseAddr)
+    (hptr : mp.ptr.offset = Miri.ABI.Size.ofBytes baseAddr)
+    (hlive : LiveAllocEntry m.machine.memory.live allocId localAlloc)
+    (hu_lt : u < m.machine.memory.live.size)
+    (hfidx : m.machine.memory.live.findIdx? (fun (k, _) => k == allocId) = some u)
+    (hget : m.machine.memory.live[u]'hu_lt = (allocId, localAlloc))
+    (hcopy_err : Miri.Memory.Allocation.copy localAlloc.allocation
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO wholeLay.layout.size)
+        Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) true true
+        localAlloc.allocation = .error .copyRangesOverlap alloc') :
+    annealStructMemCopyOp ld ly ⟨.indirect mp, srcLay⟩
+        ⟨.local 0 idx none iden, wholeLay⟩ m =
+      .error (.undefinedBehavior "whole-value copy between overlapping ranges") m :=
+  annealStructMemCopyOp_overlap_ub hframes hlt hind hprov hbase hptr hlive hu_lt hfidx hget hcopy_err
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv (k_bud + 1) s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {idx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨idx, .nil⟩ (.use (.move ⟨idx, .nil⟩)), span⟩)
+    (hwt : WellTypedLM2_2SelfMoveMemStruct body env stEnv idx) :
+    StepRelLM2_2 body env
+      (useStructPostStaticEnv stEnv idx (.move ⟨idx, .nil⟩))
+      k_bud m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_assign_self_move_memory_struct_lm2_2_simulation hstate hphase hbb hstmt hwt
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {idx : Local} {decl : MirAst.LocalDecl}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {topOffsets : Array Miri.ABI.Size} {memoryIndex : Array Nat}
+    {rootVal : Value} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨idx, .nil⟩ (.use (.copy ⟨idx, .nil⟩)), span⟩)
+    (hdecl : get? body.localDecls idx = some decl)
+    (henv : env decl.ty = some (fields, paths))
+    (hmem_repr : (translateTy decl.ty body.layouts).layout.backendRepr = .Memory (sized := true))
+    (harb : (translateTy decl.ty body.layouts).layout.fields =
+      .Arbitrary topOffsets memoryIndex)
+    (hnz_sz : (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (hslot : get? s.frame.locals idx = some (.init rootVal))
+    (hcopy_err : ∀ (allocId : Miri.Memory.AllocId) (localAlloc : AnnealLocalAlloc),
+      LiveAllocEntry m.machine.memory.live allocId localAlloc →
+      localAlloc.allocation.byteSize = (translateTy decl.ty body.layouts).layout.size →
+      ∃ alloc',
+        Miri.Memory.Allocation.copy localAlloc.allocation
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+            (translateTy decl.ty body.layouts).layout.size)
+          Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) true true
+          localAlloc.allocation = .error .copyRangesOverlap alloc') :
+    stepMirFn body s =
+      MirStepNode.step (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) ∧
+    ∃ m_err,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m_err, .error (.undefinedBehavior "whole-value copy between overlapping ranges")) :=
+  step_assign_self_copy_memory_struct_divergence hstate hphase hbb hstmt hdecl henv
+    hmem_repr harb hnz_sz hslot hcopy_err
+
+example
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_2 body env stEnv k_bud s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_)
+    {decl0 : MirAst.LocalDecl}
+    {fields : List StructFieldDesc}
+    {paths : List (List ProjectionElem)}
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (henv0 : env decl0.ty = some (fields, paths))
+    (h0_state : 0 ∈ stEnv.initLocals ∨ 0 ∈ stEnv.immLocals) :
+    StepRelStructReturnLM2_2 body fields paths m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  step_terminator_return_struct_lm2_2_simulation hstate hphase hbb hstmt_none hstmt_len
+    hcleanup hret hdecl0 henv0 h0_state
+
+example :
+    annealStructMemCopyOp Witness.lm22MemMoveUbBody.localDecls
+      Witness.lm22NestedLayoutTable
+      ⟨.indirect (stackAllocPlace Witness.lm22AllocId1),
+        translateTy Witness.lm22NestedTy Witness.lm22NestedLayoutTable⟩
+      ⟨.local 0 2 none (.ofAllocationToken 0),
+        translateTy Witness.lm22NestedTy Witness.lm22NestedLayoutTable⟩
+      Witness.lm22DanglingSrcCopyState =
+    .error (.undefinedBehavior "dangling allocation in memory copy")
+      Witness.lm22DanglingSrcCopyState :=
+  Witness.lm22DanglingSrcCopy_ub
+
+example :
+    annealStructMemCopyOp Witness.lm22MemMoveUbBody.localDecls
+      Witness.lm22NestedLayoutTable
+      ⟨.indirect (stackAllocPlace Witness.lm22AllocId1),
+        translateTy Witness.lm22NestedTy Witness.lm22NestedLayoutTable⟩
+      ⟨.local 0 2 none (.ofAllocationToken 0),
+        translateTy Witness.lm22NestedTy Witness.lm22NestedLayoutTable⟩
+      Witness.lm22DanglingDestCopyState =
+    .error (.undefinedBehavior "dangling allocation in memory copy")
+      Witness.lm22DanglingDestCopyState :=
+  Witness.lm22DanglingDestCopy_ub
+
+example :
+    runAnnealBounded Witness.lm22StructRetBody 6
+        (initMachineState Witness.lm22StructRetBody []) =
+      .returned (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xDEADBEEF, 4⟩]])
+        (initMachineState Witness.lm22StructRetBody []).memory ∧
+    ∃ m_ret mp0 alloc0,
+      runMiriBounded Witness.lm22StructRetBody 6 Witness.lm22StructRetMiriInit =
+        .returned m_ret (.ok (.indirect mp0)) ∧
+      StructMemPlaceRel m_ret.machine Witness.lm22PaddedTy Witness.lm22PaddedLayoutTable
+        Witness.lm22PaddedFields Witness.lm22PaddedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xDEADBEEF, 4⟩]]) mp0 ∧
+      (∃ allocId0,
+        mp0.ptr.provenance = some (.concrete allocId0 Miri.Memory.BorTag.one) ∧
+        m_ret.machine.memory.live.find? (fun (k, _) => k == allocId0) = some (allocId0, alloc0)) ∧
+      alloc0.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      alloc0.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      alloc0.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false :=
+  Witness.lm22StructRet_full_trace_and_struct_return
+
+example :
+    (∃ mp localAlloc,
+      StructMemPlaceRel
+        (Witness.lm22StepMiriN Witness.lm22SelfMoveBody 5
+          Witness.lm22SelfMoveMiriInit).machine
+        Witness.lm22PaddedTy Witness.lm22PaddedLayoutTable
+        Witness.lm22PaddedFields Witness.lm22PaddedPaths
+        (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFE1234, 4⟩]]) mp ∧
+      (∃ allocId,
+        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (Witness.lm22StepMiriN Witness.lm22SelfMoveBody 5
+          Witness.lm22SelfMoveMiriInit).machine.memory.live.find?
+          (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
+      localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 3) = .ok false) ∧
+    Witness.annealOutcomeScalarBits 4
+      (runAnnealBounded Witness.lm22SelfMoveBody 9
+        (initMachineState Witness.lm22SelfMoveBody [])) = some 0xCAFE1234 ∧
+    Witness.miriOutcomeScalarBits 4
+      (runMiriBounded Witness.lm22SelfMoveBody 9 Witness.lm22SelfMoveMiriInit) =
+        some 0xCAFE1234 :=
+  Witness.lm22SelfMove_full_trace_and_returns_agree
+
+example :
+    annealStructMemCopyOp Witness.lm22SelfCopyBody.localDecls
+      Witness.lm22UnpaddedLayoutTable
+      ⟨.indirect (stackAllocPlace Witness.lm22AllocId1),
+        translateTy Witness.lm22UnpaddedTy Witness.lm22UnpaddedLayoutTable⟩
+      ⟨.local 0 1 none (.ofAllocationToken 0),
+        translateTy Witness.lm22UnpaddedTy Witness.lm22UnpaddedLayoutTable⟩
+      Witness.lm22SelfCopyMiriInit =
+    .error (.undefinedBehavior "whole-value copy between overlapping ranges")
+      Witness.lm22SelfCopyMiriInit :=
+  Witness.lm22SelfCopyOverlap_ub
+
+example :
+    stepMirFn Witness.lm22SelfCopyBody Witness.lm22SelfCopyAnnealInit =
+      MirStepNode.step (advanceStmt Witness.lm22SelfCopyAnnealInit
+        (Witness.lm22SelfCopyAnnealInit.frame.locals.set 1
+          (.init (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩])))
+        Witness.lm22SelfCopyAnnealInit.memory) ∧
+    ∃ m_err,
+      Miri.Interpreter.Step.step
+          (annealStepHooks Witness.lm22SelfCopyBody.localDecls
+            Witness.lm22SelfCopyBody.layouts) ()
+          Witness.lm22SelfCopyMiriInit =
+        (m_err, .error (.undefinedBehavior "whole-value copy between overlapping ranges")) :=
+  Witness.lm22SelfCopy_divergence
+
+end LM2_2Pins
 
 end StatementPins
 

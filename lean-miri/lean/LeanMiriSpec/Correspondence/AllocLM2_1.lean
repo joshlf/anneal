@@ -812,6 +812,7 @@ theorem translateTy_align_pow2_le_29 (ty : Ty) (layouts : LayoutTable) :
     (translateTy ty layouts).layout.align.abi.pow2 ≤ 29 := by
   unfold translateTy
   dsimp only
+  
   split
   · exact translateAlignBytes_pow2_le_29 _
   · exact translateAlignBytes_pow2_le_29 _
@@ -827,14 +828,6 @@ theorem translateTy_align_pow2_le_29 (ty : Ty) (layouts : LayoutTable) :
   · decide
   · decide
   · decide
-  · split
-    · exact translateTypeLayout_align_pow2_le_29 _
-    · dsimp only
-      cases h : scalarLayoutOfRigidTy _ with
-      | none => simp [Option.getD, zstLayoutData]; decide
-      | some l =>
-        simp only [Option.getD]
-        exact scalarLayoutOfRigidTy_align_pow2_le_29 h
   · split
     · exact translateTypeLayout_align_pow2_le_29 _
     · decide
@@ -939,7 +932,7 @@ theorem ArraySliceRel.writeScalar_snoc
     by rw [hbyteSize]; exact hmask', by rw [hbyteSize]; exact hin, ?_⟩
   · rw [List.length_append, List.length_singleton, hslice.elems_len]
   · intro idx elemVal hget
-    dsimp only
+    
     change (elems ++ [.scalar sc])[idx]? = some elemVal at hget
     by_cases hlt_idx : idx < elems.length
     · rw [List.getElem?_append_left hlt_idx] at hget
@@ -974,9 +967,9 @@ theorem ArraySliceRel.writeScalar_snoc
       subst heq_idx
       simp only [Nat.sub_self, List.getElem?_cons_zero, Option.some.injEq] at hget
       subst hget
+      intro elemTy elemLay elemOff
       refine ⟨sc, msc, rfl, hsz, hbool, hchar, hrel, ?_⟩
-      dsimp only [elemOff, elemSize] at hread_at
-      simpa only [hslice.elems_len, ← hsz] using hread_at
+      dsimp [elemOff, elemLay, elemTy]; simpa only [hslice.elems_len, ← hsz] using hread_at
 
 /-- Overwriting element `idx < count` in `ArraySliceRel elemKind count layouts elems`
 updates the relation to `ArraySliceRel elemKind count layouts (elems.set idx (.scalar sc))`. -/
@@ -1039,7 +1032,7 @@ theorem ArraySliceRel.writeScalar_set
     hmut', hprov', by rw [hbyteSize]; exact hmask',
     by rw [hbyteSize]; exact hin, ?_⟩
   intro j elemVal hget
-  dsimp only
+  
   change (elems.set idx (.scalar sc))[j]? = some elemVal at hget
   rw [List.getElem?_set] at hget
   by_cases heq : idx = j
@@ -1047,9 +1040,9 @@ theorem ArraySliceRel.writeScalar_set
     have hlt_elems : idx < elems.length := by rw [hslice.elems_len]; exact hlt
     simp only [↓reduceIte, hlt_elems, Option.some.injEq] at hget
     subst hget
+    intro elemTy elemLay elemOff
     refine ⟨sc, msc, rfl, hsz, hbool, hchar, hrel, ?_⟩
-    dsimp only [elemOff, elemSize] at hread_at
-    simpa only [← hsz] using hread_at
+    dsimp [elemOff, elemLay, elemTy]; simpa only [← hsz] using hread_at
   · simp only [heq, ↓reduceIte] at hget
     have hj_lt_elems : j < elems.length := (List.getElem?_eq_some_iff.mp hget).1
     have hj_lt : j < count := by rw [← hslice.elems_len]; exact hj_lt_elems
@@ -1143,7 +1136,7 @@ theorem writeScalarRepeatedly_spec
     obtain ⟨alloc₁, hwrite₁, hsz₁, halign₁, hmask₁, hslice₁⟩ :=
       hslice.writeScalar_snoc hrel hsz hbool hchar hmask_full hin1
     have hsc_size : msc.size = elemSize := by
-      dsimp only [elemSize]
+      dsimp [elemSize]
       rw [hsz, ← hrel.size_eq]
     rw [hsc_size] at hwrite₁
     have hin_k :
@@ -1170,8 +1163,10 @@ theorem writeScalarRepeatedly_spec
       simp only [UInt64.toNat_toBitVec, UInt64.toNat_add, UInt64.toNat_ofNat']
       omega
     unfold writeScalarRepeatedly
+    dsimp only [elemSize] at hwrite₁
     rw [hwrite₁]
     dsimp only
+    
     rw [hoff_step, hwrite₂]
     refine ⟨alloc₂, rfl, hsz₂.trans hsz₁, halign₂.trans halign₁, by rw [← hsz₁]; exact hmask₂, ?_⟩
     have hrep : (elems ++ [.scalar sc]) ++ List.replicate k (.scalar sc) =

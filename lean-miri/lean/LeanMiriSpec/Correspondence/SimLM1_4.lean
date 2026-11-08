@@ -693,6 +693,9 @@ theorem evalOperand_move_simulation
       subst hbor hprot
       rfl
     dsimp only at hmem_same
+    -- Case on the source local.
+    obtain ⟨slot_src, mls_src, hlt_af_src, hlt_src, hslot_src, hmls_src, hmls_src_eq, hloc_src⟩ :=
+      hframe₀.lookup_local hdecl_src
     -- The statement runs the moved operand, reads it, and writes it to `_d`.
     have hm_eval : Miri.Interpreter.Step.evalStatement
         (annealStepHooks body.localDecls body.layouts) ()
@@ -705,13 +708,22 @@ theorem evalOperand_move_simulation
       dsimp only [translateStmtKind, translatePlace, translateOperand, List.map, List.toArray,
         translateRvalue, annealStepHooks]
       apply runRvalue_eq_of_eq
-      unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+      unfold Miri.Interpreter.evalRvalueIntoPlace
+      dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
       rw [EStateM.bind_eq_ok hevalPlace_dst]
-      exact EStateM.bind_assoc_apply _ _ _ m₀
-    -- Case on the source local.
-    obtain ⟨slot_src, mls_src, hlt_af_src, hlt_src, hslot_src, hmls_src, hmls_src_eq, hloc_src⟩ :=
-      hframe₀.lookup_local hdecl_src
+      refine bind_copyOp_eq_of_immediate (fun src m₁ heval => ?_)
+      cases hloc_src with
+      | dead cl hcl =>
+        rw [annealEvalOperand_move_dead (m := m₀) rfl hlt_src hdecl_src hmls_src_eq (fun l hl => hcl l hl)] at heval
+        cases heval
+      | indirect _ mp _ _ _ _ =>
+        exact absurd rfl (hmono₀ srcIdx himm_src _ hmls_src mp)
+      | immediate _ imm cl hcl _ =>
+        rw [annealEvalOperand_move_live (m := m₀) rfl hlt_src hdecl_src hmls_src_eq
+          (fun l hl => hcl l hl)] at heval
+        injection heval with hsrc _
+        subst hsrc
+        exact ⟨imm, rfl⟩
     cases hloc_src with
     | dead cl hcl =>
       have ha_ub : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩

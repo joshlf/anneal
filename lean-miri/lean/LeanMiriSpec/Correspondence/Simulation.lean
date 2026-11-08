@@ -2759,6 +2759,13 @@ def IsPrimScalarTy (ty : Ty) : Prop :=
   ty.kind = .bool ∨ ty.kind = .char ∨
     (∃ it, ty.kind = .int it) ∨ (∃ ut, ty.kind = .uint ut)
 
+theorem IsPrimScalarTy.fields_eq_primitive {ty : Ty} {layouts : LayoutTable}
+    (h : IsPrimScalarTy ty) :
+    (translateTy ty layouts).layout.fields = Miri.ABI.FieldsShape.Primitive := by
+  rcases h with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩ <;>
+    (try cases it) <;> (try cases ut) <;>
+    (simp only [translateTy, hk]; rfl)
+
 theorem IsPrimScalarTy.layoutOfEncoded {ty : Ty} {layouts : LayoutTable}
     (h : IsPrimScalarTy ty) :
     layoutOfEncodedTyId (encodeTyId ty) layouts = translateTy ty layouts := by
@@ -3367,6 +3374,52 @@ theorem evalOperand_scalar_simulation
               rw [Array.getElem?_set_ne _ (Ne.symm hk)]
               simp [Option.map_eq_bind]
               cases topFrame.locals[k]? <;> rfl)
+
+theorem WellTypedScalarOperand.evalOperand_immediate
+    {body : CapturedMir} {af : StackFrame}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {m : AnnealStepState} {op : MirAst.Operand} {ty : Ty}
+    (hframes : m.stack.frames = #[topFrame])
+    (hframe : FrameRel body m.machine af topFrame)
+    (hop : WellTypedScalarOperand body topFrame op ty)
+    (known : Option Miri.Interpreter.LocalLayout)
+    (src : Miri.Interpreter.OpTy AnnealProv) (m₁ : AnnealStepState)
+    (heval : annealEvalOperand body.localDecls body.layouts (translateOperand op) known m =
+      .ok src m₁) :
+    ∃ imm, src.op = .immediate imm := by
+  cases hop with
+  | constScalar c sc hval hprim hsz hcan _ _ _ =>
+    obtain ⟨msc, htry, _⟩ := tryFromUInt_of_valid_canonical hsz hcan
+    have heval_m : annealEvalOperand body.localDecls body.layouts
+        (translateOperand (.constant c)) known m =
+        .ok ⟨.immediate (.scalar (.fromScalarInt msc)), translateTy c.ty body.layouts⟩ m := by
+      with_unfolding_all
+        unfold translateOperand translateConstOperand annealEvalOperand evalMirConstImmediate
+        dsimp only; rw [hval]
+        simp only [translateConstValue, translateConstScalar, get, getThe, MonadStateOf.get,
+          EStateM.get, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+          stack_currentFrame?_singleton m.stack topFrame hframes, Option.isNone_some,
+          Bool.false_eq_true, ↓reduceIte, htry, hprim.layoutOfEncoded]
+    rw [heval_m] at heval
+    injection heval with hsrc _
+    subst hsrc
+    exact ⟨_, rfl⟩
+  | copyLocal idx decl hdecl _ himm =>
+    obtain ⟨_, mls, _, hlt_mf, _, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
+    have hcache := hloc.layout_eq
+    have himm' := himm mls hmls
+    have htr : translateOperand (.copy ⟨idx, .nil⟩) = .Copy ⟨idx, #[]⟩ := rfl
+    rw [htr] at heval
+    cases hloc with
+    | dead _ _ =>
+      rw [annealEvalOperand_copy_dead hframes hlt_mf hdecl hmls_eq hcache] at heval
+      cases heval
+    | indirect _ mp _ _ _ _ => exact False.elim (himm' mp rfl)
+    | immediate _ imm _ _ _ =>
+      rw [annealEvalOperand_copy_live hframes hlt_mf hdecl hmls_eq hcache] at heval
+      injection heval with hsrc _
+      subst hsrc
+      exact ⟨imm, rfl⟩
 
 /-! ### 5.3 Public Mirrors & Operator-Result Shape Lemmas for `ScalarOps` / `Rvalue` -/
 
@@ -4900,10 +4953,10 @@ theorem step_assign_scalar_simulation_ext
         dsimp only [translateStmtKind, translatePlace, List.map, List.toArray,
           translateRvalue, annealStepHooks]
         apply runRvalue_eq_of_eq
-        unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
-        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt]
+        unfold Miri.Interpreter.evalRvalueIntoPlace
+        dsimp only [Miri.Interpreter.RvalueHooks.evalOperandAt, annealRvalueHooks]
         rw [EStateM.bind_eq_ok hevalPlace_dst]
-        exact EStateM.bind_assoc_apply _ _ _ m₀
+        exact bind_copyOp_eq_of_immediate (hop.evalOperand_immediate rfl hframe₀ _)
       generalize ha_op : evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil = aOp at hop_sim
       generalize hm_op : (annealEvalOperand body.localDecls body.layouts (translateOperand op)
         (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) m₀ = mOp at hop_sim

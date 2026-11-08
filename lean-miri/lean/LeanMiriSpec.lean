@@ -22,6 +22,10 @@ import LeanMiriSpec.Correspondence.WitLM1_4
 import LeanMiriSpec.Correspondence.AllocLM2_1
 import LeanMiriSpec.Correspondence.SimLM2_1
 import LeanMiriSpec.Correspondence.WitLM2_1
+import LeanMiriSpec.Correspondence.LayoutLM2_2
+import LeanMiriSpec.Correspondence.ProjLM2_2
+import LeanMiriSpec.Correspondence.SimLM2_2
+import LeanMiriSpec.Correspondence.WitLM2_2
 import LeanMiriSpec.Audit
 
 /-!
@@ -78,6 +82,39 @@ import LeanMiriSpec.Audit
   re-establishing `LiveAllocsNodup` and local immediacy so that array statements
   chain.
 * `LeanMiriSpec.Correspondence.WitLM2_1`: non-vacuity witnesses for `LM-2.1`.
+* `LeanMiriSpec.Correspondence.LayoutLM2_2`: byte-level `InitMaskWordRel`,
+  arbitrary-offset `Allocation.readScalar`/`writeScalar` round-trip,
+  `ValidStructLayout`, field-write preservation across disjoint scalar fields
+  and uninitialized padding bytes, and unpadded vs. padded byte-counting
+  dichotomy (`LM-2.2`).
+* `LeanMiriSpec.Correspondence.ProjLM2_2`: nested `Field` projection chains,
+  `StructMemPlaceRel` / `ImmediateStructRel`, `StateRelLM2_2`, base `StateRel`
+  bridge theorems (`StateRel.toLM2_2`, `StateRelLM2_2.toStateRel_of_flat_imm`),
+  and nested `Field` read simulation (`LM-2.2`).
+* `LeanMiriSpec.Correspondence.SimLM2_2`: state-independent `LM-2.2` typing
+  judgments and lockstep simulation for `Rvalue.Aggregate` (`Tuple` / single-variant
+  `Adt`), nested `Field` scalar and immediate sub-struct reads/writes (`.Scalar`
+  wrappers and `.ScalarPair` sub-structs), whole-value `Use` copies/moves across
+  both immediate-ABI and `.Memory`-ABI aggregates (`annealStructMemCopyOp`,
+  including self-move `_idx = move _idx` lockstep simulation and self-copy
+  `_idx = copy _idx` `copyRangesOverlap` UB characterization),
+  `StorageLive`/`StorageDead`, block-level composition (`step_stmts_lm2_2_simulation`),
+  and `Goto`/`Unreachable`/`Return` terminators (including tuple- and
+  struct-returning root functions via `step_terminator_return_struct_lm2_2_simulation`)
+  under `StateRelLM2_2`.
+* `LeanMiriSpec.Correspondence.WitLM2_2`: seventeen kernel-checked `LM-2.2`
+  execution witnesses covering `AbiRepr.ScalarPair` (`forceAllocation` +
+  `StorageDead` + memory-backed reassignment), unpadded and padded
+  `AbiRepr.Memory`, nested `AbiRepr.Scalar` wrapper (`_3 = copy _1.1`,
+  `_1.1 = move _2`, plus immediate `ScalarPair` + `Scalar` wrapper
+  `_4 = copy _3.1`) and `ScalarPair` (`_3 = copy _2.1`, `_2.1 = move _4`)
+  sub-struct reads/writes, whole-value `.Memory` struct move/copy
+  (`_3 = move _2`, `_4 = copy _3`), self-move (`_1 = move _1`) vs. self-copy
+  (`_1 = copy _1` `copyRangesOverlap` UB), dangling/read-only/move-then-use UB,
+  2-level 3-field `.Memory` sub-struct construction/mutation/read,
+  tuple/struct-returning root functions (`fn() -> PaddedOuter`), root `return`
+  with live padded memory, and `> 64`-byte multi-block `InitMask` `#[repr(C)]`
+  structs (`80` bytes across two 64-bit `InitMask` words).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
