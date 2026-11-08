@@ -12720,21 +12720,14 @@ def recoverExposedPtrValue?
     | false =>
       let pageAllocId := Nat.div addrBits 65536
       let pageOff := Nat.mod addrBits 65536
-      let notStackBorrowTag : Bool :=
-        match lookupBorrow borrows pageAllocId with
-        | .none => true
-        | .some _ => false
       let pageExposedOrGlobal : Bool :=
-        match notStackBorrowTag with
-        | false => false
-        | true =>
-          match lookupGlobalAlloc globals pageAllocId with
-          | .some alloc =>
-            Bool.and
-              (Bool.not (Nat.beq pageAllocId 0))
-              (Nat.ble pageOff (length alloc.bytes))
-          | .none =>
-            isExposedAllocId exposedAllocIds pageAllocId
+        match lookupGlobalAlloc globals pageAllocId with
+        | .some alloc =>
+          Bool.and
+            (Bool.not (Nat.beq pageAllocId 0))
+            (Nat.ble pageOff (length alloc.bytes))
+        | .none =>
+          isExposedAllocId exposedAllocIds pageAllocId
       match pageExposedOrGlobal with
       | true =>
         .some (.ptr { allocId := pageAllocId, offsetBytes := pageOff } ptrBytes)
