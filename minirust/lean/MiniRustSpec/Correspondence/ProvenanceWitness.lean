@@ -815,10 +815,12 @@ theorem rtState_expose_then_withExposed_synced :
     (rtState 5).map exposeThenWithExposedSyncedOk = some true := by
   decide +kernel
 
-/-- Counterexample MIR body with a single syntactic `PointerExposeProvenance`
-statement (`countExposeStmts = 1`) inside a loop (`bb0 -> bb0`), demonstrating
-why `singleExposeSiteOk` requires `isAcyclicCfg body = true` in addition to
-`countExposeStmts body ≤ 1`. -/
+/-- MIR body with a single syntactic `PointerExposeProvenance` statement
+(`countExposeStmts = 1`) inside a loop (`bb0 -> bb0`), which `isAcyclicCfg`
+rejects. Its loop re-exposes `&raw mut _1`, and creating a raw pointer does not
+retag, so on `MachTB` its exposed set stays a singleton however many iterations
+run (`exposeLoopSingleSite_tb_exposed_singleton`); the loop that actually
+accumulates distinct Tree Borrows tags at one site is `exposeLoopReborrow`. -/
 def exposeLoopSingleSite : CapturedMir :=
   { int2ptrRawRoundTripOk with
     defPath := "witness::expose_loop_single_site"
@@ -846,6 +848,73 @@ theorem exposeLoopSingleSite_isAcyclicCfg_false :
 
 theorem exposeLoopSingleSite_singleExposeSiteOk_false :
     singleExposeSiteOk exposeLoopSingleSite = false := by
+  decide +kernel
+
+/-! ## 7. A single exposure site in a loop: Tree Borrows tag accumulation (Pass B4) -/
+
+/-- After 29 `MachTB` steps (several loop iterations) `exposeLoopSingleSite` has
+exposed exactly one Tree Borrows provenance. -/
+theorem exposeLoopSingleSite_tb_exposed_singleton :
+    (startMachineIntrTB exposeLoopSingleSite [.scalar ⟨5, 4⟩]).bind
+        (fun m => (Interp.stepsTB 29 m).toOption.map (·.intptrcast.exposed.elems.length)) =
+      some 1 := by
+  decide +kernel
+
+/-- MIR of
+```text
+bb0: StorageLive(_2..=_5); goto bb1
+bb1: _2 = &mut _1; _3 = &raw mut (*_2); _4 = _3 as usize (PointerExposeProvenance);
+     _5 = _4 as *mut u32 (PointerWithExposedProvenance); (*_5) = const 7_u32; goto bb1
+```
+One exposure site, in a loop: every iteration retags `&mut _1`, so on `MachTB`
+the second iteration exposes a second tag of `_1`'s allocation and
+`PointerWithExposedProvenance` stops with `Stop.unsupported`, while `Mach`
+(`()` provenance, deduplicated) keeps running. The body is in
+`inFragmentWithIntrinsics`, and `singleExposeSiteOk` (which demands an acyclic
+CFG) rejects it. -/
+def exposeLoopReborrow : CapturedMir :=
+  { int2ptrRawRoundTripOk with
+    defPath := "witness::expose_loop_reborrow"
+    localDecls := [u32Decl, u32Decl, refMutU32Decl, ptrMutU32Decl, usizeDecl, ptrMutU32Decl]
+    basicBlocks := [
+      { statements := [⟨.storageLive 2, ""⟩, ⟨.storageLive 3, ""⟩, ⟨.storageLive 4, ""⟩,
+          ⟨.storageLive 5, ""⟩]
+        terminator := ⟨.goto 1, ""⟩
+        isCleanup := false },
+      { statements := [
+          ⟨.assign (local_ 2) (.ref (.mut false) (local_ 1)), ""⟩,
+          ⟨.assign (local_ 3) (.rawPtr .mut (derefPlace 2)), ""⟩,
+          ⟨.assign (local_ 4) (.cast .pointerExposeProvenance (.copy (local_ 3)) usizeTy), ""⟩,
+          ⟨.assign (local_ 5)
+            (.cast .pointerWithExposedProvenance (.copy (local_ 4)) ptrMutU32Ty), ""⟩,
+          ⟨.assign (derefPlace 5) (.use (constU32 7)), ""⟩]
+        terminator := ⟨.goto 1, ""⟩
+        isCleanup := false }] }
+
+theorem exposeLoopReborrow_inFragmentWithIntrinsics :
+    inFragmentWithIntrinsics exposeLoopReborrow = true := by decide +kernel
+
+theorem exposeLoopReborrow_singleExposeSiteOk_false :
+    singleExposeSiteOk exposeLoopReborrow = false := by decide +kernel
+
+theorem exposeLoopReborrow_tb_two_tags :
+    (startMachineIntrTB exposeLoopReborrow [.scalar ⟨5, 4⟩]).bind
+        (fun m => (Interp.stepsTB 15 m).toOption.map (·.intptrcast.exposed.elems.length)) =
+      some 2 := by
+  decide +kernel
+
+theorem exposeLoopReborrow_tb_unsupported :
+    stopAfterIntrTB exposeLoopReborrow [.scalar ⟨5, 4⟩] 16 =
+      some (.unsupported "int2ptr: several exposed allocations meet at the address (angelic choice)") := by
+  decide +kernel
+
+theorem exposeLoopReborrow_bm_runs :
+    stopAfterIntr exposeLoopReborrow [.scalar ⟨5, 4⟩] 40 = none := by
+  decide +kernel
+
+/-- Anneal runs 60 steps of the loop without faulting. -/
+theorem exposeLoopReborrow_anneal_no_fault_60 :
+    faultsA exposeLoopReborrow 60 (initMachineState exposeLoopReborrow [.scalar ⟨5, 4⟩]) = false := by
   decide +kernel
 
 end MiniRustSpec.Correspondence.ProvenanceWitness

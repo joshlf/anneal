@@ -1184,6 +1184,22 @@ These are deliberate and are the first things to lift:
   sites such as `exposeLoopSingleSite_singleExposeSiteOk_false`). Whole-CFG
   induction over `splitBlockAtIntrinsics`'s continuation blocks remains separate
   from `step_correspondence_N`.
+  `ProvenanceRel.expose_then_withExposed_reconstructs` generalizes the 2-step
+  round trip to states with prior exposures (no other live exposed allocation
+  containing the address) and states that `IntPtrCast.int2ptr` reconstructs
+  exactly the pointer loaded from `_p` before the exposure while Anneal's
+  destination receives exactly `_p`'s `pv`. The lemmas still take MiniRust's
+  `evalPlace` results, the load of the exposed pointer, and the stores and jumps
+  as hypotheses: every `StateRelN`-level lemma that would supply them
+  (`FrameOk`, whose `hf : translateFn body = some f` fails on any body with a
+  provenance cast, and `evalPtrLoad`, which assumes `inFragment`) excludes these
+  bodies, so a `translateFnWithIntrinsics` analogue of `FrameOk` is the next step
+  (`AddrTakenTargetsOk` states the `BorrowsOk.target_ptrs` facts such an
+  analogue needs, not yet proved invariant). A single exposure site in a loop
+  does accumulate Tree Borrows tags when the loop retags (`exposeLoopReborrow`,
+  in the fragment: `MachTB` stops with `Stop.unsupported` on the second
+  iteration while `Mach` runs on), whereas `exposeLoopSingleSite`'s raw-pointer
+  loop keeps a singleton exposed set (`exposeLoopSingleSite_tb_exposed_singleton`).
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

@@ -3632,6 +3632,15 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeLoopSingleSite_countExposeStmts_eq_one
   exposeLoopSingleSite_isAcyclicCfg_false
   exposeLoopSingleSite_singleExposeSiteOk_false
+  int2ptrCandidates_shape_back
+  ProvenanceRel.expose_then_withExposed_reconstructs
+  exposeLoopSingleSite_tb_exposed_singleton
+  exposeLoopReborrow_inFragmentWithIntrinsics
+  exposeLoopReborrow_singleExposeSiteOk_false
+  exposeLoopReborrow_tb_two_tags
+  exposeLoopReborrow_tb_unsupported
+  exposeLoopReborrow_bm_runs
+  exposeLoopReborrow_anneal_no_fault_60
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -3878,6 +3887,15 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeLoopSingleSite_countExposeStmts_eq_one
   exposeLoopSingleSite_isAcyclicCfg_false
   exposeLoopSingleSite_singleExposeSiteOk_false
+  int2ptrCandidates_shape_back
+  ProvenanceRel.expose_then_withExposed_reconstructs
+  exposeLoopSingleSite_tb_exposed_singleton
+  exposeLoopReborrow_inFragmentWithIntrinsics
+  exposeLoopReborrow_singleExposeSiteOk_false
+  exposeLoopReborrow_tb_two_tags
+  exposeLoopReborrow_tb_unsupported
+  exposeLoopReborrow_bm_runs
+  exposeLoopReborrow_anneal_no_fault_60
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

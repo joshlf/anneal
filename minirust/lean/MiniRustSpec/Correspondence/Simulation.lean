@@ -5698,6 +5698,123 @@ theorem ProvenanceRel.expose_then_withExposed_step {body : CapturedMir} {ctx : C
       hplace2 harg2 hmeta2 honly hstore2 hjump2
   exact ⟨hA1, hM1, hA2, m8, hM2, hshape1.trans hshape2, hprov2⟩
 
+/-- `int2ptrCandidates` transports backwards along `AllocShapeEq`. -/
+theorem int2ptrCandidates_shape_back {as bs : List Gen.Allocation} {exposed : Set Prov}
+    {addr : Int} {q : Prov} (hs : AllocShapeEq as bs)
+    (hq : q ∈ int2ptrCandidates bs exposed addr) :
+    q ∈ int2ptrCandidates as exposed addr := by
+  obtain ⟨i0, b, hb, hlive, hlo, hhi, hexp, hpe⟩ := mem_int2ptrCandidates hq
+  have hi0 : i0 < as.length := by
+    rw [hs.1]; exact (List.getElem?_eq_some_iff.mp hb).1
+  obtain ⟨a, ha⟩ : ∃ a, as[i0]? = some a := ⟨_, List.getElem?_eq_getElem hi0⟩
+  obtain ⟨b', hb', hb1, hb2, hb3⟩ := hs.2 i0 a ha
+  rw [hb] at hb'
+  cases hb'
+  rw [hpe]
+  refine int2ptrCandidates_mem_of ha (hb2 ▸ hlive) (hb1 ▸ hlo) ?_ hexp
+  have : (Allocation.size b).bytes = (Allocation.size a).bytes := by
+    simp [Allocation.size, hb3]
+  rw [← hb1, ← this]
+  exact hhi
+
+/-- **Round trip with prior exposures (MR-3.3 B4).** Generalizes
+`ProvenanceRel.expose_then_withExposed_step` from an empty exposed set to any
+`ProvenanceRel` state in which no *other* live exposed allocation contains the
+exposed address (`hnoadj`, e.g. non-adjacent allocations), and exposes the
+angelic resolution: the MiniRust `PointerWithExposedProvenance` reloads exactly
+`tAddr` from the exposed-address local and `IntPtrCast.int2ptr` reconstructs
+exactly the pointer `{ addr := tAddr, provenance := some tProv }` that was loaded
+from `_p` before the exposure, while Anneal's destination receives exactly the
+`pv` that `_p` held. -/
+theorem ProvenanceRel.expose_then_withExposed_reconstructs {body : CapturedMir} {ctx : Ctx}
+    {s : MachineState} {m m1 m2 m3 m4 : Mach} {exposedTags : List Nat}
+    {i p d : Nat} {op1 op2 : MirAst.Operand} {targetTy1 targetTy2 : MirAst.Ty}
+    {span1 span2 : String} {nb1 nb2 : Gen.BbName}
+    {retPlace1 retPlace2 : Gen.Place BM} {argTy1 : Gen.Type} {retPtrTy2 : Gen.PtrType}
+    {pv : ProvenancePtr} {tAddr : Int} {tProv : Prov}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hnoadj : ∀ q ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed tAddr,
+      q = tProv)
+    (hop1 : copyOp op1 = .copy ⟨p, []⟩)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = [])
+    (hnd_i : s.frame.locals[i]? ≠ some .dead)
+    (hp : s.frame.locals[p]? = some (.init (.ptr pv 8)))
+    (hoff0 : pv.offsetBytes = 0)
+    (htgt : ExposedTargetAtAddr body ctx s m.mem.memory.allocations pv.tag tAddr tProv)
+    (hplace1 : evalPlace m (.Local (localName i)) = .ok ((retPlace1, .Int usizeIt), m1))
+    (harg1 : evalValue m1 (.Load (.Local (localName p))) =
+      .ok ((.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩, argTy1), m2))
+    (hstore1 : placeStore
+        { m2 with intptrcast :=
+            (IntPtrCast.expose m2.intptrcast { addr := tAddr, provenance := some tProv }) }
+        retPlace1 (.Int tAddr) (.Int usizeIt) = .ok m3)
+    (hjump1 : jumpToBlock m3 nb1 = .ok m4)
+    (hop2 : copyOp op2 = .copy ⟨i, []⟩)
+    (hd : d < s.frame.locals.length)
+    (hbor_d : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ d)
+    (hnd_d : ((opPost s.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))[d]? ≠ some .dead)
+    (hplace2 : evalPlace m4 (.Local (localName d)) = .ok ((retPlace2, .Ptr retPtrTy2), m4))
+    (hmeta2 : PtrType.meta_kind retPtrTy2 = .None)
+    (hstore_jump2 : ∀ m6,
+      evalValue m4 (.Load (.Local (localName i))) = .ok ((.Int tAddr, .Int usizeIt), m6) →
+      ∃ m7 m8,
+        placeStore m6 retPlace2
+          (.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩)
+          (.Ptr retPtrTy2) = .ok m7 ∧
+        jumpToBlock m7 nb2 = .ok m8) :
+    let locals1 := (opPost s.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+    let s1 := advanceStmt s locals1 s.memory
+    let locals2 := (opPost locals1 op2).set d (.init (.ptr pv 8))
+    let s2 := advanceStmt s1 locals2 s1.memory
+    evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance op1 targetTy1), span1⟩
+        body.localDecls body.layouts = .tau (.running s1) ∧
+    Interp.evalTerminator m
+        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))]
+          (.Local (localName i)) (some nb1)) = .ok m4 ∧
+    evalStmt s1 ⟨.assign ⟨d, []⟩ (.cast .pointerWithExposedProvenance op2 targetTy2), span2⟩
+        body.localDecls body.layouts = .tau (.running s2) ∧
+    s2.frame.locals[d]? = some (.init (.ptr pv 8)) ∧
+    ∃ m6 m8,
+      evalValue m4 (.Load (.Local (localName i))) = .ok ((.Int tAddr, .Int usizeIt), m6) ∧
+      IntPtrCast.int2ptr m6 tAddr = .ok { addr := tAddr, provenance := some tProv } ∧
+      Interp.evalTerminator m4
+          (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName i))]
+            (.Local (localName d)) (some nb2)) = .ok m8 ∧
+      AllocShapeEq m.mem.memory.allocations m8.mem.memory.allocations ∧
+      ProvenanceRel body ctx s2 m8 (pv.tag :: exposedTags) := by
+  obtain ⟨hA1, hM1, hipc1, hshape1, hprov1, hsync1⟩ :=
+    hprov.expose_step_synced hop1 hi hbor_i hprot hnd_i hp hoff0 htgt
+      hplace1 harg1 hstore1 hjump1
+  rcases hsync1.load_ok with ⟨m6, harg2⟩
+  obtain ⟨m7, m8, hstore2, hjump2⟩ := hstore_jump2 m6 harg2
+  have honly : ∀ q ∈ int2ptrCandidates m4.mem.memory.allocations m4.intptrcast.exposed tAddr,
+      q = tProv := by
+    intro q hq
+    have hexp : setContains m4.intptrcast.exposed q = true := int2ptrCandidates_exposed hq
+    rw [hipc1, setContains_expose_some_iff] at hexp
+    rcases hexp with rfl | hold
+    · rfl
+    · apply hnoadj
+      have hq' := int2ptrCandidates_shape_back hshape1 hq
+      obtain ⟨i0, a, ha, hlive, hlo, hhi, _, hpe⟩ := mem_int2ptrCandidates hq'
+      rw [hpe] at hold ⊢
+      exact int2ptrCandidates_mem_of ha hlive hlo hhi hold
+  have hd1 : d < ((opPost s.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))).length := by
+    simp [opPost_length, hd]
+  obtain ⟨hA2, hint, hM2, _, hshape2, hprov2⟩ :=
+    hprov1.withExposed_step_synced hop2 hsync1 hd1 hbor_d hprot hnd_d
+      hplace2 harg2 hmeta2 honly hstore2 hjump2
+  refine ⟨hA1, hM1, hA2, ?_, m6, m8, harg2, hint, hM2, hshape1.trans hshape2, hprov2⟩
+  have hd2 : d < (opPost ((opPost s.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))) op2).length := by
+    simp [opPost_length, hd]
+  exact List.getElem?_set_self hd2
+
 /-- Explicit proof that `BorrowsOk.target_ptrs` is vacuously satisfied whenever
 `hasProvCast body = true`, because its definition in `Pointers.lean` is guarded
 by `inFragment body = true → ...` and `inFragment_not_hasProvCast` proves
@@ -5711,10 +5828,14 @@ theorem BorrowsOk.target_ptrs_vacuous_of_hasProvCast {body : CapturedMir}
     rw [hhas] at this
     contradiction
 
-/-- Non-vacuous counterpart to `BorrowsOk.target_ptrs` (`AddrTakenTargetsOk`)
-that holds on `inFragmentWithIntrinsics` bodies (where `inFragment body = false`):
-every address-taken local `k ∈ bodyAddrTakenLocals body` is live in `view` and
-mapped in `lm` to `localPtr ctx k` with well-aligned in-bounds address. -/
+/-- The facts `BorrowsOk.target_ptrs` provides on `inFragment` bodies, stated
+without its `inFragment body = true` guard (which makes it vacuous on every
+`inFragmentWithIntrinsics` body with a provenance cast): every address-taken
+local `k ∈ bodyAddrTakenLocals body` is live in `view` and mapped in `lm` to
+`localPtr ctx k` with a well-aligned in-bounds address. Nothing yet proves that
+it holds along executions of `inFragmentWithIntrinsics` bodies (that requires a
+`translateFnWithIntrinsics` analogue of `FrameOk` / `StateRelN`), so it is a
+target invariant, not an established one. -/
 def AddrTakenTargetsOk (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
     (lm : Map Gen.LocalName Ptr) : Prop :=
   ∀ k ∈ bodyAddrTakenLocals body,
