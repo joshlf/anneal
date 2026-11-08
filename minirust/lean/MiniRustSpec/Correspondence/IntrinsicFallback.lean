@@ -199,7 +199,7 @@ def fbCtxI8 : Ctx := ctxWithFns callerFrameI8 retAllocI8 2 fbAddrs
 
 /-- `CtxOk` for an all-scalar body from its obligations at the default layout
 table: scalar-family locals have the same storage type at every layout table
-(`itOf_layouts_of_scalar`, `tyOf_layouts_of_scalar`). -/
+(`itOf_scalar_layouts`, `tyOf_scalar_layouts`). -/
 theorem CtxOk.of_scalar {body : CapturedMir} {ctx : Ctx}
     (hall : body.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) = true)
     (hbase : BaseLow ctx)
@@ -208,16 +208,14 @@ theorem CtxOk.of_scalar {body : CapturedMir} {ctx : Ctx}
     (hret : ∀ d, body.localDecls[0]? = some d → RetPlaceOk ctx (tyOf d) (itOf d)) :
     CtxOk body ctx where
   addrs := fun i d hi hd => by
-    obtain ⟨T, hT⟩ :=
-      Option.isSome_iff_exists.mp (List.all_eq_true.mp hall d (List.mem_of_getElem? hd))
-    rw [itOf_layouts_of_scalar (L1 := body.layouts) (L2 := ⟨64, true, []⟩) hT,
-      tyOf_layouts_of_scalar (L1 := body.layouts) (L2 := ⟨64, true, []⟩) hT]
+    have hsc := List.all_eq_true.mp hall d (List.mem_of_getElem? hd)
+    rw [itOf_scalar_layouts hsc body.layouts ⟨64, true, []⟩,
+      tyOf_scalar_layouts hsc body.layouts ⟨64, true, []⟩]
     exact haddrs i d hi hd
   ret := fun d hd => by
-    obtain ⟨T, hT⟩ :=
-      Option.isSome_iff_exists.mp (List.all_eq_true.mp hall d (List.mem_of_getElem? hd))
-    rw [itOf_layouts_of_scalar (L1 := body.layouts) (L2 := ⟨64, true, []⟩) hT,
-      tyOf_layouts_of_scalar (L1 := body.layouts) (L2 := ⟨64, true, []⟩) hT]
+    have hsc := List.all_eq_true.mp hall d (List.mem_of_getElem? hd)
+    rw [itOf_scalar_layouts hsc body.layouts ⟨64, true, []⟩,
+      tyOf_scalar_layouts hsc body.layouts ⟨64, true, []⟩]
     exact hret d hd
   baseLow := hbase
 
@@ -382,7 +380,6 @@ theorem fb_returnRel_alloc {entry : CapturedMir} {d : LocalDecl} {caller : Frame
     m.mem.memory.allocations[0]? = some { retA with data := declSlotData d (.init v) } ∧
     m.threads = [thread1 (ctxWithFns caller retA nFns addrs)
       [{ caller with next_block := bbName 7, next_stmt := 0 }]] := by
-  obtain ⟨T, hT⟩ := Option.isSome_iff_exists.mp hsc
   obtain ⟨r, a, d', R, hd', _hv, hp, hr, hthr, hallocs, _hR⟩ := h
   rw [hd] at hd'
   cases hd'
@@ -392,7 +389,7 @@ theorem fb_returnRel_alloc {entry : CapturedMir} {d : LocalDecl} {caller : Frame
   simp [ctxWithFns] at hr
   subst hr
   refine ⟨?_, hthr⟩
-  rw [hallocs, declSlotData_layouts_of_scalar (L1 := ⟨64, true, []⟩) (L2 := entry.layouts) hT]
+  rw [hallocs, declSlotData_scalar_layouts hsc _ ⟨64, true, []⟩ entry.layouts]
   rfl
 
 /-- The `callerCallee20_minirust_ret` pattern for an entry with one callee: an

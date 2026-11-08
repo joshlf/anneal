@@ -1104,7 +1104,13 @@ theorem assumeReborrowFalseUb_three_way :
     assumeReborrowFalseUb_minirust_direct,
     assumeReborrowFalseUb_tb_direct⟩
 
-/-! ## 10. Multi-frame `Terminator::Call` with `&mut` references, Tree Borrows function-entry protectors, and cross-frame provenance casts (MR-4.3 Pass B2) -/
+/-! ## 10. Multi-frame calls with `&mut` protectors and provenance casts (MR-4.3 Pass B2)
+
+The programs of this section are hand-written MiniRust `Gen.Function`s, not
+`translateProg` output, and have no Anneal counterpart: they check that the
+merged interpreter runs `Terminator::Call` together with Tree Borrows
+function-entry protectors and cross-frame provenance casts on both `Mach` and
+`MachTB`. -/
 
 /-- Callee `fn add37_ref_mut(r: &mut u32) -> u32`: validates `r` with
 `fn_entry = true` (`Protected::Strong` under Tree Borrows), writes `*r = *r + 37`,

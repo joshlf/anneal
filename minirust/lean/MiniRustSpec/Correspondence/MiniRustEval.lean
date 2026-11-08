@@ -3312,24 +3312,16 @@ theorem LocalsOkA.storage_any {body : CapturedMir} {ctx : Ctx} {al : List Nat}
 theorem LocalsOk.dead_of_none {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} {allocs : List Gen.Allocation}
     (hlo : LocalsOk body ctx locals lm allocs) {i : Nat} {slot : LocalSlot}
-    (hs : locals[i]? = some slot) (hp : mapGet lm (localName i) = none) : slot = .dead := by
-  cases slot with
-  | dead => rfl
-  | uninit =>
-    have h := (hlo.live i _ hs).mpr (.inl (by simp))
-    simp [hp] at h
-  | init v =>
-    have h := (hlo.live i _ hs).mpr (.inl (by simp))
-    simp [hp] at h
+    (hs : locals[i]? = some slot) (hp : mapGet lm (localName i) = none) : slot = .dead :=
+  LocalsOkA.dead_of_none hlo hs hp
 
 /-- A live local is in the locals map. -/
 theorem LocalsOk.some_of_live {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
     {lm : Map Gen.LocalName Ptr} {allocs : List Gen.Allocation}
     (hlo : LocalsOk body ctx locals lm allocs) {i : Nat} {slot : LocalSlot}
     (hs : locals[i]? = some slot) (hlive : slot ≠ .dead) :
-    ∃ p, mapGet lm (localName i) = some p := by
-  have h := (hlo.live i slot hs).mpr (.inl hlive)
-  exact Option.isSome_iff_exists.mp h
+    ∃ p, mapGet lm (localName i) = some p :=
+  LocalsOkA.some_of_live hlo hs hlive
 
 /-- A dead local that `minimize`'s init block does not allocate is not in the
 locals map. -/
@@ -3337,12 +3329,8 @@ theorem LocalsOk.none_of_dead {body : CapturedMir} {ctx : Ctx} {locals : List Lo
     {lm : Map Gen.LocalName Ptr} {allocs : List Gen.Allocation}
     (hlo : LocalsOk body ctx locals lm allocs) {i : Nat}
     (hs : locals[i]? = some .dead) (hal : i ∉ alwaysStorageLiveLocals body) :
-    mapGet lm (localName i) = none := by
-  cases hp : mapGet lm (localName i) with
-  | none => rfl
-  | some p =>
-    have h := (hlo.live i .dead hs).mp (by simp [hp])
-    simp [hal] at h
+    mapGet lm (localName i) = none :=
+  LocalsOkA.none_of_dead hlo hs hal
 
 theorem fragTy_of_scalarTypeOf {d : LocalDecl} {layouts : Layout.LayoutTable}
     {T : Gen.Type} {it : Gen.IntType}
@@ -7538,8 +7526,7 @@ theorem LocalsOk.alloc {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot
     LocalsOk body ctx (locals.set i .uninit)
       ⟨lm.entries ++ [(localName i, { addr := addr, provenance := some (⟨(A.length : Int)⟩, ()) })]⟩
       (A ++ [stackAlloc addr (itOf d body.layouts) (declSlotData d .uninit body.layouts)]) :=
-  LocalsOkA.alloc' hlo i d hd hs hp addr haddr haddrMax hcls .uninit
-    (declSlotOk_uninit d body.layouts) (.inr (by simp)) (.inl (by simp)) (fun _ _ => Iff.rfl)
+  LocalsOkA.alloc hlo i d hd hs hp addr haddr haddrMax hcls
 
 /-! ### The first-fit address of `StorageLive` -/
 
@@ -7685,182 +7672,22 @@ theorem LocalsOkA.baseCandBounded_of_scalar {body : CapturedMir} {ctx : Ctx} {al
           by simp only [stackAlloc]; rw [hlen]; exact hle⟩
         exact List.mem_map.mpr ⟨(localName i, q), hmemq, by simp [hj, candIdx_cand]⟩
 
-/-- Under `LocalsOkA` and `BaseCandBounded ctx.base bound`, when
-`bound + body.localDecls.length < 2^31`, some first-fit candidate below `2^31`
-is free of every live allocation in `A`. -/
-theorem LocalsOkA.free_candidate_cand {body : CapturedMir} {ctx : Ctx} {al : List Nat}
-    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
-    {bound : Nat} (hlo : LocalsOkA body ctx al locals lm A)
-    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31)
-    (size : Size) (hsize : size.bytes ≤ 32)
+/-- Every declaration of a body whose locals are all scalars is `localDeclOk`. -/
+theorem localDeclOk_of_scalar {body : CapturedMir}
     (hdecls : ∀ (i : Nat) d, body.localDecls[i]? = some d → scalarTypeOf d.ty = some (tyOf d)) :
-    ∃ k, k < 2 ^ 31 ∧
-      ∀ a ∈ A, a.live = true → Allocation.overlaps a (allocCandidate k) size = false := by
-  obtain ⟨cands, hcands, hbaseA⟩ := hlo.baseCandBounded_of_scalar hbase hdecls
-  obtain ⟨k, hkL, hknot⟩ := exists_not_mem_le cands
-  refine ⟨k, by omega, ?_⟩
-  intro a ha hlive
-  rcases hbaseA a ha hlive with hlow | ⟨j, hjc, hjaddr, hjlen⟩
-  · exact overlaps_low a k size hlow
-  · have hjk : j ≠ k := by
-      intro hjk; subst hjk
-      exact hknot hjc
-    exact overlaps_cand a j k size hjaddr hjk (by omega) (by omega)
+    ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true := by
+  intro d hd
+  obtain ⟨i, hi⟩ := List.mem_iff_getElem?.mp hd
+  simp [localDeclOk, hdecls i d hi]
 
-/-- Under `LocalsOk` and `BaseLow`, some first-fit candidate below `2^31` is
-free: the caller's allocations lie below `2^32`, and each candidate that a
-live callee allocation occupies belongs to one entry of the locals map, which
-has at most `localDecls.length < 2^31` entries. -/
-theorem LocalsOkA.free_candidate {body : CapturedMir} {ctx : Ctx} {al : List Nat}
-    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
-    (hlo : LocalsOkA body ctx al locals lm A)
-    (hns : NonScalarLive body locals lm)
-    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) (size : Size)
-    (hsize : size.bytes ≤ 32)
-    (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true) :
-    ∃ k, k < 2 ^ 31 ∧
-      ∀ a ∈ A, a.live = true → Allocation.overlaps a (allocCandidate k) size = false := by
-  let L := lm.entries.map (fun e => candIdx e.2.addr)
-  obtain ⟨k, hkL, hknot⟩ := exists_not_mem_le L
-  have hLlen : L.length ≤ body.localDecls.length := by
-    simp only [L, List.length_map]; exact hlo.entries_length
-  refine ⟨k, by omega, ?_⟩
-  intro a ha hlive
-  obtain ⟨id, hid⟩ := List.getElem_of_mem ha
-  have hAid : A[id]? = some a := by rw [List.getElem?_eq_getElem hid.1]; simp [hid.2]
-  obtain ⟨R, hR⟩ := hlo.base
-  by_cases hidb : id < ctx.base.length
-  · have hab : a ∈ ctx.base := by
-      have : (ctx.base ++ R)[id]? = some a := hR ▸ hAid
-      rw [List.getElem?_append_left hidb] at this
-      exact List.mem_of_getElem? this
-    exact overlaps_low a k size (hbaseLow a hab hlive)
-  · obtain ⟨i, q, hq, hqid⟩ := hlo.owned id a hAid hlive (by omega)
-    have hmemq := mapGet_mem hq
-    obtain ⟨i', hi', hei⟩ := hlo.keysLocal _ hmemq
-    simp only [localName_inj] at hei; subst hei
-    obtain ⟨d, hd⟩ : ∃ d, body.localDecls[i]? = some d := ⟨_, List.getElem?_eq_getElem hi'⟩
-    obtain ⟨sl, hsl⟩ : ∃ sl, locals[i]? = some sl :=
-      ⟨_, List.getElem?_eq_getElem (by rw [hlo.nlocals]; exact hi')⟩
-    obtain ⟨data, _, _, _, hcls, hlen, hAq⟩ :=
-      hlo.storage_any_id hd hsl hq hqid (hdeclsOk d (List.mem_of_getElem? hd))
-    rw [hAid] at hAq
-    injection hAq with hAq'
-    subst a
-    cases hsc : scalarTypeOf d.ty with
-    | none =>
-      cases hp_ty : isPtrTy d.ty with
-      | false =>
-        have hlow := (hns i d sl hd hsl hsc hp_ty).2 q hq
-        exact overlaps_low _ k size (by simp only [stackAlloc]; rw [hlen]; exact hlow)
-      | true =>
-        have hle : tyBytes (tyOf d body.layouts) ≤ 32 := scalar_tyBytes_le (.inr hp_ty)
-        rcases hcls with hlow | ⟨_, j, hj⟩
-        · exact overlaps_low _ k size (by simp only [stackAlloc]; rw [hlen]; exact hlow)
-        · have hjk : j ≠ k := by
-            intro hjk; subst hjk
-            apply hknot
-            simp only [L, List.mem_map]
-            exact ⟨(localName i, q), hmemq, by simp [hj, candIdx_cand]⟩
-          exact overlaps_cand _ j k size (by simp [stackAlloc, hj]) hjk
-            (by simp only [stackAlloc]; rw [hlen]; omega) (by omega)
-    | some T =>
-      have hle : tyBytes (tyOf d body.layouts) ≤ 32 := scalar_tyBytes_le (.inl (by simp [hsc]))
-      rcases hcls with hlow | ⟨_, j, hj⟩
-      · exact overlaps_low _ k size (by simp only [stackAlloc]; rw [hlen]; exact hlow)
-      · have hjk : j ≠ k := by
-          intro hjk; subst hjk
-          apply hknot
-          simp only [L, List.mem_map]
-          exact ⟨(localName i, q), hmemq, by simp [hj, candIdx_cand]⟩
-        exact overlaps_cand _ j k size (by simp [stackAlloc, hj]) hjk
-          (by simp only [stackAlloc]; rw [hlen]; omega) (by omega)
-
-/-- `BasicMemory::allocate` of a callee local under `LocalsOkA` and
-`BaseCandBounded`. -/
-theorem BM_allocate_local_cand {body : CapturedMir} {ctx : Ctx} {al : List Nat}
-    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {mem : BM} {bound : Nat}
-    (hlo : LocalsOkA body ctx al locals lm mem.allocations)
-    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31)
-    (hdecls : ∀ (i : Nat) d, body.localDecls[i]? = some d → scalarTypeOf d.ty = some (tyOf d))
-    {T : Gen.Type} {it : Gen.IntType} (hT : LocalTy T it) (hle : tyBytes T ≤ 32) :
-    ∃ k, k < 2 ^ 31 ∧
-      BM.allocate mem .Stack ⟨tyBytes T⟩ ⟨it.size.bytes⟩ =
-        .ok ({ addr := allocCandidate k, provenance := some (⟨(mem.allocations.length : Int)⟩, ()) },
-             { mem with allocations := mem.allocations ++
-                [{ addr := allocCandidate k, align := ⟨it.size.bytes⟩, kind := .Stack, live := true,
-                   data := List.replicate (tyBytes T) .Uninit, extra := () }] }) ∧
-      AddrOk (allocCandidate k) it ∧ allocCandidate k + (tyBytes T : Int) < 2 ^ 64 := by
-  obtain ⟨k0, hk0, hfree⟩ := hlo.free_candidate_cand hbase hn ⟨tyBytes T⟩ hle hdecls
-  have hok0 := allocAddrOk_cand mem ⟨tyBytes T⟩ ⟨it.size.bytes⟩ k0 hk0 hle hT.good hfree
-  obtain ⟨k, _, hkk0, hff, hok⟩ := firstFitAddr_spec mem ⟨tyBytes T⟩ ⟨it.size.bytes⟩
-    (2 ^ 32 - 1) 0 k0 (Nat.zero_le _) (by omega) hok0
-  have hvalid : x86_64.valid_size ⟨tyBytes T⟩ = true := by
-    have hb : (2 : Int) ^ (Size.bits x86_64.PTR_SIZE - 1) = 2 ^ 63 := rfl
-    simp only [x86_64.valid_size, inBounds, hb, decide_eq_true_eq, Bool.and_eq_true]
-    constructor <;> omega
-  have hpick : BM.pickAddr mem ⟨tyBytes T⟩ ⟨it.size.bytes⟩ = some (allocCandidate k) := hff
-  have hgs : it.size.bytes ≤ 16 := by rcases hT.good with h | h | h | h | h <;> omega
-  refine ⟨k, by omega, by simp [BM.allocate, hvalid, hpick], ?_, ?_⟩
-  · simp only [BM.allocAddrOk] at hok
-    split at hok
-    · simp at hok
-    · next hpos =>
-      split at hok
-      · simp at hok
-      · next hal =>
-        simp only [Bool.not_eq_true', Bool.not_eq_false] at hal
-        simp only [Align.is_aligned, beq_iff_eq] at hal
-        refine ⟨hal, ?_, ?_⟩
-        · simp only [allocCandidate]; omega
-        · simp only [allocCandidate]; omega
-  · simp only [allocCandidate]
-    omega
-
-/-- `BasicMemory::allocate` of a callee local under `LocalsOk` and `BaseLow`
-succeeds at a free first-fit candidate. -/
-theorem BM_allocate_local {body : CapturedMir} {ctx : Ctx} {al : List Nat}
-    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {mem : BM}
-    (hlo : LocalsOkA body ctx al locals lm mem.allocations)
-    (hns : NonScalarLive body locals lm)
-    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31)
-    (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
-    {T : Gen.Type} {it : Gen.IntType} (hT : LocalTy T it)
-    (hle : tyBytes T ≤ 32) (hsz : it.size.bytes ≤ tyBytes T) :
-    ∃ k, k < 2 ^ 31 ∧
-      BM.allocate mem .Stack ⟨tyBytes T⟩ ⟨it.size.bytes⟩ =
-        .ok ({ addr := allocCandidate k, provenance := some (⟨(mem.allocations.length : Int)⟩, ()) },
-             { mem with allocations := mem.allocations ++
-                [{ addr := allocCandidate k, align := ⟨it.size.bytes⟩, kind := .Stack, live := true,
-                   data := List.replicate (tyBytes T) .Uninit, extra := () }] }) ∧
-      AddrOk (allocCandidate k) it ∧ allocCandidate k + (tyBytes T : Int) < 2 ^ 64 := by
-  obtain ⟨k0, hk0, hfree⟩ := hlo.free_candidate hns hbaseLow hn ⟨tyBytes T⟩ hle hdeclsOk
-  have hok0 := allocAddrOk_cand mem ⟨tyBytes T⟩ ⟨it.size.bytes⟩ k0 hk0 hle hT.good hfree
-  obtain ⟨k, _, hkk0, hff, hok⟩ := firstFitAddr_spec mem ⟨tyBytes T⟩ ⟨it.size.bytes⟩
-    (2 ^ 32 - 1) 0 k0 (Nat.zero_le _) (by omega) hok0
-  have hvalid : x86_64.valid_size ⟨tyBytes T⟩ = true := by
-    have hb : (2 : Int) ^ (Size.bits x86_64.PTR_SIZE - 1) = 2 ^ 63 := rfl
-    simp only [x86_64.valid_size, inBounds, hb, decide_eq_true_eq, Bool.and_eq_true]
-    constructor <;> omega
-  have hpick : BM.pickAddr mem ⟨tyBytes T⟩ ⟨it.size.bytes⟩ = some (allocCandidate k) := hff
-  refine ⟨k, by omega, by simp [BM.allocate, hvalid, hpick], ?_, ?_⟩
-  · simp only [BM.allocAddrOk] at hok
-    split at hok
-    · simp at hok
-    · next hpos =>
-      split at hok
-      · simp at hok
-      · next hal =>
-        split at hok
-        · simp at hok
-        · next hin =>
-          simp only [Bool.not_eq_true', Bool.not_eq_false] at hal hin
-          simp only [Align.is_aligned, beq_iff_eq] at hal
-          rw [inBounds_unsigned_ptrSize_iff] at hin
-          refine ⟨hal, by omega, ?_⟩
-          omega
-  · simp only [allocCandidate]
-    omega
+/-- `NonScalarLive` holds vacuously in a body whose locals are all scalars. -/
+theorem NonScalarLive.of_scalar {body : CapturedMir} {locals : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr}
+    (hdecls : ∀ (i : Nat) d, body.localDecls[i]? = some d → scalarTypeOf d.ty = some (tyOf d)) :
+    NonScalarLive body locals lm := by
+  intro i d _ hd _ hnone _
+  rw [hdecls i d hd] at hnone
+  cases hnone
 
 /-- Under `LocalsOkA`, `NonScalarLive`, and `BaseCandBounded ctx.base bound`,
 when `bound + body.localDecls.length < 2^31`, some first-fit candidate below
@@ -7934,6 +7761,37 @@ theorem LocalsOkA.free_candidate_cand_ns {body : CapturedMir} {ctx : Ctx} {al : 
       · exact overlaps_cand _ j k size (by simp [stackAlloc, hj]) (hcand j hj)
           (by simp only [stackAlloc]; rw [hlen]; omega) (by omega)
 
+/-- Under `LocalsOkA` and `BaseCandBounded ctx.base bound`, when
+`bound + body.localDecls.length < 2^31`, some first-fit candidate below `2^31`
+is free of every live allocation in `A`
+(`free_candidate_cand_ns` for a body whose locals are all scalars). -/
+theorem LocalsOkA.free_candidate_cand {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
+    {bound : Nat} (hlo : LocalsOkA body ctx al locals lm A)
+    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31)
+    (size : Size) (hsize : size.bytes ≤ 32)
+    (hdecls : ∀ (i : Nat) d, body.localDecls[i]? = some d → scalarTypeOf d.ty = some (tyOf d)) :
+    ∃ k, k < 2 ^ 31 ∧
+      ∀ a ∈ A, a.live = true → Allocation.overlaps a (allocCandidate k) size = false :=
+  hlo.free_candidate_cand_ns (NonScalarLive.of_scalar hdecls) hbase hn size hsize
+    (localDeclOk_of_scalar hdecls)
+
+/-- Under `LocalsOk` and `BaseLow`, some first-fit candidate below `2^31` is
+free: the caller's allocations lie below `2^32`, and each candidate that a
+live callee allocation occupies belongs to one entry of the locals map, which
+has at most `localDecls.length < 2^31` entries
+(`free_candidate_cand_ns` at `bound = 0`). -/
+theorem LocalsOkA.free_candidate {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
+    (hlo : LocalsOkA body ctx al locals lm A)
+    (hns : NonScalarLive body locals lm)
+    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) (size : Size)
+    (hsize : size.bytes ≤ 32)
+    (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true) :
+    ∃ k, k < 2 ^ 31 ∧
+      ∀ a ∈ A, a.live = true → Allocation.overlaps a (allocCandidate k) size = false :=
+  hlo.free_candidate_cand_ns hns hbaseLow.toBaseCandBounded (by omega) size hsize hdeclsOk
+
 /-- `BasicMemory::allocate` of a callee local of at most `32` bytes under
 `LocalsOkA`, `NonScalarLive`, and `BaseCandBounded`. -/
 theorem BM_allocate_local_cand_ns {body : CapturedMir} {ctx : Ctx} {al : List Nat}
@@ -7976,6 +7834,46 @@ theorem BM_allocate_local_cand_ns {body : CapturedMir} {ctx : Ctx} {al : List Na
   · simp only [allocCandidate]
     omega
 
+/-- `BasicMemory::allocate` of a callee local under `LocalsOkA` and
+`BaseCandBounded`
+(`BM_allocate_local_cand_ns` for a body whose locals are all scalars). -/
+theorem BM_allocate_local_cand {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {mem : BM} {bound : Nat}
+    (hlo : LocalsOkA body ctx al locals lm mem.allocations)
+    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31)
+    (hdecls : ∀ (i : Nat) d, body.localDecls[i]? = some d → scalarTypeOf d.ty = some (tyOf d))
+    {T : Gen.Type} {it : Gen.IntType} (hT : LocalTy T it) (hle : tyBytes T ≤ 32) :
+    ∃ k, k < 2 ^ 31 ∧
+      BM.allocate mem .Stack ⟨tyBytes T⟩ ⟨it.size.bytes⟩ =
+        .ok ({ addr := allocCandidate k, provenance := some (⟨(mem.allocations.length : Int)⟩, ()) },
+             { mem with allocations := mem.allocations ++
+                [{ addr := allocCandidate k, align := ⟨it.size.bytes⟩, kind := .Stack, live := true,
+                   data := List.replicate (tyBytes T) .Uninit, extra := () }] }) ∧
+      AddrOk (allocCandidate k) it ∧ allocCandidate k + (tyBytes T : Int) < 2 ^ 64 :=
+  BM_allocate_local_cand_ns hlo (NonScalarLive.of_scalar hdecls) hbase hn
+    (localDeclOk_of_scalar hdecls) hT hle
+
+/-- `BasicMemory::allocate` of a callee local under `LocalsOk` and `BaseLow`
+succeeds at a free first-fit candidate
+(`BM_allocate_local_cand_ns` at `bound = 0`; `hT` already bounds the alignment,
+so the size bound `_hsz` is not needed). -/
+theorem BM_allocate_local {body : CapturedMir} {ctx : Ctx} {al : List Nat}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {mem : BM}
+    (hlo : LocalsOkA body ctx al locals lm mem.allocations)
+    (hns : NonScalarLive body locals lm)
+    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31)
+    (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
+    {T : Gen.Type} {it : Gen.IntType} (hT : LocalTy T it)
+    (hle : tyBytes T ≤ 32) :
+    ∃ k, k < 2 ^ 31 ∧
+      BM.allocate mem .Stack ⟨tyBytes T⟩ ⟨it.size.bytes⟩ =
+        .ok ({ addr := allocCandidate k, provenance := some (⟨(mem.allocations.length : Int)⟩, ()) },
+             { mem with allocations := mem.allocations ++
+                [{ addr := allocCandidate k, align := ⟨it.size.bytes⟩, kind := .Stack, live := true,
+                   data := List.replicate (tyBytes T) .Uninit, extra := () }] }) ∧
+      AddrOk (allocCandidate k) it ∧ allocCandidate k + (tyBytes T : Int) < 2 ^ 64 :=
+  BM_allocate_local_cand_ns hlo hns hbaseLow.toBaseCandBounded (by omega) hdeclsOk hT hle
+
 /-- `Machine::eval_statement` on `StorageDead(_i)` for a local that
 `minimize`'s init block does not allocate: the local leaves the locals map
 and its allocation (if any) is deallocated. -/
@@ -8017,15 +7915,18 @@ theorem evalStatement_storageDead {body : CapturedMir} {f : Gen.Function} {ctx :
 /-- `Machine::eval_statement` on `StorageLive(_i)` under `BaseCandBounded` for
 a local that `minimize`'s init block does not allocate: `storage_dead` of the
 old storage (if any), then a fresh `Stack` allocation at the first free
-candidate address of `BM.pickAddr`. -/
-theorem evalStatement_storageLive_cand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+candidate address of `BM.pickAddr`, which exists because the caller's live
+allocations occupy at most `bound` candidates and `bound` plus the number of
+locals stays below `2^31`. The locals map changes only at `_i`. -/
+theorem evalStatement_storageLive_cand_ns {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt bound : Nat}
     (h : FrameOk body f ctx locals lm m blk stmt) (i : Nat) (d : LocalDecl)
     (hd : body.localDecls[i]? = some d) (hal : i ∉ alwaysStorageLiveLocals body)
     (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
     (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31) :
     ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
-      FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt := by
+      FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt ∧
+      (∀ j, j ≠ i → mapGet lm' (localName j) = mapGet lm (localName j)) := by
   have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
   have hspec := h.hf.2 i d hd
   have hlt := h.decl_localTy i d hd
@@ -8079,84 +7980,6 @@ theorem evalStatement_storageLive_cand {body : CapturedMir} {f : Gen.Function} {
     rfl
   have htm := tryMutateCurFrame_callee h.shape
     (fun fr cm => storageLive fr cm (localName i)) _ _ hsl
-  refine ⟨_, ⟨lm2.entries ++ [(localName i, newPtr)]⟩, by simp only [evalStatement]; exact htm, ?_⟩
-  have hns3 : NonScalarLive body (locals.set i .uninit) ⟨lm2.entries ++ [(localName i, newPtr)]⟩ :=
-    (h.nonScalar.filter_scalar hd hscalar .uninit).append_scalar hd hscalar
-      (filter_key_not_mem _ _) newPtr
-  refine FrameOk.mk' h.hf ⟨rfl, h.shape.active, rfl⟩ ?_ h.declsOk hns3
-  have hlo3 := hlo2.alloc i d hd hs2 hp2 (allocCandidate k) haddr haddrMax
-    (Or.inr ⟨by omega, k, rfl⟩)
-  rw [List.set_set] at hlo3
-  exact hlo3
-
-/-- `Machine::eval_statement` on `StorageLive(_i)` for a local that
-`minimize`'s init block does not allocate: `storage_dead` of the old storage
-(if any), then a fresh `Stack` allocation at the first free candidate address
-of `BM.pickAddr`, which exists because the caller's allocations lie below
-`2^32` (`BaseLow`) and the body has fewer than `2^31` locals. -/
-theorem evalStatement_storageLive {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
-    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
-    (h : FrameOk body f ctx locals lm m blk stmt) (i : Nat) (d : LocalDecl)
-    (hd : body.localDecls[i]? = some d) (hal : i ∉ alwaysStorageLiveLocals body)
-    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
-    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) :
-    ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
-      FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt ∧
-      (∀ j, j ≠ i → mapGet lm' (localName j) = mapGet lm (localName j)) := by
-  have hi : i < body.localDecls.length := (List.getElem?_eq_some_iff.mp hd).1
-  have hspec := h.hf.2 i d hd
-  have hlt := h.decl_localTy i d hd
-  obtain ⟨_, slot, _, hs⟩ := h.slot_exists i hi
-  have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hs).1
-  let lm2 : Map Gen.LocalName Ptr := ⟨lm.entries.filter (fun e => !decide (e.1 = localName i))⟩
-  obtain ⟨cm2, hsd, hlo2⟩ : ∃ cm2 : Gen.ConcurrentMemory BM,
-      storageDead (calleeFrameL f ctx lm blk stmt) m.mem (localName i) =
-        .ok ({ calleeFrameL f ctx lm blk stmt with locals := lm2 }, cm2) ∧
-      LocalsOk body ctx (locals.set i .dead) lm2 cm2.memory.allocations := by
-    cases hp : mapGet lm (localName i) with
-    | none =>
-      have hdead := h.locs.dead_of_none hs hp
-      subst hdead
-      exact ⟨m.mem, storageDead_none hlt hspec.2 (by simpa [calleeFrameL] using hp),
-        h.locs.forget i hs hp⟩
-    | some p =>
-      obtain ⟨k, data, hpk, _, _, _, _, hlen, hA⟩ :=
-        h.locs.storage_any hd hs hp (h.declsOk d (List.mem_of_getElem? hd))
-      exact ⟨_, storageDead_some hlt hspec.2 (by simpa [calleeFrameL] using hp) hpk hA rfl rfl rfl
-        hlen rfl,
-        h.locs.killLocal i d hd slot hs hal p hp k hpk _ hA⟩
-  have hp2 : mapGet lm2 (localName i) = none := by simp [lm2, mapGet_filter_key]
-  have hs2 : (locals.set i .dead)[i]? = some .dead := List.getElem?_set_self hil
-  have hns2 : NonScalarLive body (locals.set i .dead) lm2 :=
-    h.nonScalar.filter_scalar hd hscalar .dead
-  have hle_sc := scalar_tyBytes_le (layouts := body.layouts) hscalar
-  have hsz_sc := scalar_size_le_tyBytes (layouts := body.layouts) hscalar
-  obtain ⟨k, _, halloc, haddr, haddrMax⟩ :=
-    BM_allocate_local (mem := cm2.memory) hlo2 hns2 hbaseLow hn h.declsOk hlt hle_sc hsz_sc
-  let newPtr : Ptr :=
-    { addr := allocCandidate k, provenance := some (⟨(cm2.memory.allocations.length : Int)⟩, ()) }
-  have hins : mapInsertMap lm2 (localName i) newPtr = ⟨lm2.entries ++ [(localName i, newPtr)]⟩ := by
-    simp only [mapInsertMap]
-    rw [mapInsert_absent _ _ _ (filter_key_not_mem _ _)]
-  have hsl : storageLive (calleeFrameL f ctx lm blk stmt) m.mem (localName i) =
-      .ok ({ calleeFrameL f ctx lm blk stmt with locals := ⟨lm2.entries ++ [(localName i, newPtr)]⟩ },
-        { cm2 with memory := { cm2.memory with allocations := cm2.memory.allocations ++
-          [stackAlloc (allocCandidate k) (itOf d body.layouts) (declSlotData d .uninit body.layouts)] } }) := by
-    have hmi : mapIndex (calleeFrameL f ctx lm blk stmt).func.locals (localName i)
-        "self.func.locals[local]" = .ok (tyOf d body.layouts) := by
-      simp [mapIndex, calleeFrameL, hspec.2]
-    have hca : CM.allocate cm2 .Stack ⟨tyBytes (tyOf d body.layouts)⟩ ⟨(itOf d body.layouts).size.bytes⟩ =
-        .ok (newPtr, { cm2 with memory := { cm2.memory with allocations := cm2.memory.allocations ++
-          [stackAlloc (allocCandidate k) (itOf d body.layouts) (declSlotData d .uninit body.layouts)] } }) := by
-      rw [declSlotData_uninit_of_declOk (h.declsOk d (List.mem_of_getElem? hd))]
-      simp only [CM.allocate, halloc, ok_bind, pure_ok]
-      rfl
-    simp only [storageLive, hsd, ok_bind]
-    rw [hmi, ok_bind, hlt.layout, ok_bind, expect_size_sized, ok_bind, expect_align_sized, ok_bind]
-    rw [hca, ok_bind, hins]
-    rfl
-  have htm := tryMutateCurFrame_callee h.shape
-    (fun fr cm => storageLive fr cm (localName i)) _ _ hsl
   refine ⟨_, ⟨lm2.entries ++ [(localName i, newPtr)]⟩, by simp only [evalStatement]; exact htm, ?_, ?_⟩
   · have hns3 : NonScalarLive body (locals.set i .uninit) ⟨lm2.entries ++ [(localName i, newPtr)]⟩ :=
       (h.nonScalar.filter_scalar hd hscalar .uninit).append_scalar hd hscalar
@@ -8173,83 +7996,46 @@ theorem evalStatement_storageLive {body : CapturedMir} {f : Gen.Function} {ctx :
     rw [mapGet_filter_key]
     simp [hne]
 
-/-- `StorageLive(_i)` of `minimize`'s init block under `FnLocalsSpec` and
-`BaseCandBounded`. -/
-theorem evalStatement_storageLive_init_cand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+/-- `Machine::eval_statement` on `StorageLive(_i)` under `BaseCandBounded` for
+a local that `minimize`'s init block does not allocate: `storage_dead` of the
+old storage (if any), then a fresh `Stack` allocation at the first free
+candidate address of `BM.pickAddr`
+(`evalStatement_storageLive_cand_ns` without its frame condition). -/
+theorem evalStatement_storageLive_cand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt bound : Nat}
+    (h : FrameOk body f ctx locals lm m blk stmt) (i : Nat) (d : LocalDecl)
+    (hd : body.localDecls[i]? = some d) (hal : i ∉ alwaysStorageLiveLocals body)
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
+    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31) :
+    ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
+      FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt := by
+  obtain ⟨m', lm', hm', h', -⟩ := evalStatement_storageLive_cand_ns h i d hd hal hscalar hbase hn
+  exact ⟨m', lm', hm', h'⟩
+
+/-- `Machine::eval_statement` on `StorageLive(_i)` for a local that
+`minimize`'s init block does not allocate: `storage_dead` of the old storage
+(if any), then a fresh `Stack` allocation at the first free candidate address
+of `BM.pickAddr`, which exists because the caller's allocations lie below
+`2^32` (`BaseLow`) and the body has fewer than `2^31` locals
+(`evalStatement_storageLive_cand_ns` at `bound = 0`). -/
+theorem evalStatement_storageLive {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach} {blk stmt : Nat}
+    (h : FrameOk body f ctx locals lm m blk stmt) (i : Nat) (d : LocalDecl)
+    (hd : body.localDecls[i]? = some d) (hal : i ∉ alwaysStorageLiveLocals body)
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
+    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) :
+    ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
+      FrameOk body f ctx (locals.set i .uninit) lm' m' blk stmt ∧
+      (∀ j, j ≠ i → mapGet lm' (localName j) = mapGet lm (localName j)) :=
+  evalStatement_storageLive_cand_ns h i d hd hal hscalar hbaseLow.toBaseCandBounded (by omega)
+
+/-- `StorageLive(_i)` of `minimize`'s init block under `BaseCandBounded` for a
+temporary `_i` of `alwaysStorageLiveLocals`, which Anneal keeps dead and which
+is not yet in the locals map: a fresh allocation at the first free candidate
+address, keeping `NonScalarLive` and changing the locals map only at `_i`. -/
+theorem evalStatement_storageLive_init_cand_ns {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     {al : List Nat} {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach}
     {blk stmt bound : Nat} (hf : FnLocalsSpec body f)
-    (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] m.mem.memory.allocations)
-    (hlo : LocalsOkA body ctx al locals lm m.mem.memory.allocations)
-    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
-    (hsi : locals[i]? = some .dead) (hp : mapGet lm (localName i) = none)
-    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31)
-    (hdecls : ∀ (i : Nat) d, body.localDecls[i]? = some d → scalarTypeOf d.ty = some (tyOf d)) :
-    ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
-      Shape m' ctx [ctx.caller, calleeFrameL f ctx lm' blk stmt] m'.mem.memory.allocations ∧
-      LocalsOkA body ctx (al ++ [i]) locals lm' m'.mem.memory.allocations := by
-  have hspec := hf.2 i d hd
-  have hsc := scalarTypeOf_tyOf_layouts body.layouts (hdecls i d hd)
-  have hlt := localTy_of_decl hsc
-  have hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true := .inl (by simp [hsc])
-  have hil : i < locals.length := (List.getElem?_eq_some_iff.mp hsi).1
-  have hnot : ∀ e ∈ lm.entries, e.1 ≠ localName i := by
-    intro e he hei
-    obtain ⟨k', v'⟩ := e
-    simp only at hei
-    subst hei
-    have := mapGet_isSome_of_mem (es := lm.entries) he
-    rw [hp] at this
-    simp at this
-  have hsd : storageDead (calleeFrameL f ctx lm blk stmt) m.mem (localName i) =
-      .ok ({ calleeFrameL f ctx lm blk stmt with locals := lm }, m.mem) :=
-    storageDead_none' hlt hspec.2 (by simpa [calleeFrameL] using hp)
-  have hle_sc := scalar_tyBytes_le (layouts := body.layouts) hscalar
-  obtain ⟨k, _, halloc, haddr, haddrMax⟩ :=
-    BM_allocate_local_cand (mem := m.mem.memory) hlo hbase hn hdecls hlt hle_sc
-  let newPtr : Ptr :=
-    { addr := allocCandidate k, provenance := some (⟨(m.mem.memory.allocations.length : Int)⟩, ()) }
-  have hins : mapInsertMap lm (localName i) newPtr = ⟨lm.entries ++ [(localName i, newPtr)]⟩ := by
-    simp only [mapInsertMap]
-    rw [mapInsert_absent _ _ _ hnot]
-  have hsl : storageLive (calleeFrameL f ctx lm blk stmt) m.mem (localName i) =
-      .ok ({ calleeFrameL f ctx lm blk stmt with locals := ⟨lm.entries ++ [(localName i, newPtr)]⟩ },
-        { m.mem with memory := { m.mem.memory with allocations := m.mem.memory.allocations ++
-          [stackAlloc (allocCandidate k) (itOf d body.layouts) (declSlotData d .dead body.layouts)] } }) := by
-    have hmi : mapIndex (calleeFrameL f ctx lm blk stmt).func.locals (localName i)
-        "self.func.locals[local]" = .ok (tyOf d body.layouts) := by
-      simp [mapIndex, calleeFrameL, hspec.2]
-    have hca : CM.allocate m.mem .Stack ⟨tyBytes (tyOf d body.layouts)⟩ ⟨(itOf d body.layouts).size.bytes⟩ =
-        .ok (newPtr, { m.mem with memory := { m.mem.memory with
-          allocations := m.mem.memory.allocations ++
-            [stackAlloc (allocCandidate k) (itOf d body.layouts) (declSlotData d .dead body.layouts)] } }) := by
-      rw [declSlotData_dead d body.layouts, declSlotData_uninit hsc]
-      simp only [CM.allocate, halloc, ok_bind, pure_ok]
-      rfl
-    simp only [storageLive, hsd, ok_bind]
-    rw [hmi, ok_bind, hlt.layout, ok_bind, expect_size_sized, ok_bind, expect_align_sized, ok_bind]
-    rw [hca, ok_bind, hins]
-    rfl
-  have htm := tryMutateCurFrame_callee hsh
-    (fun fr cm => storageLive fr cm (localName i)) _ _ hsl
-  refine ⟨_, ⟨lm.entries ++ [(localName i, newPtr)]⟩, by simp only [evalStatement]; exact htm,
-    ?_, ?_⟩
-  · exact ⟨rfl, hsh.active, rfl⟩
-  have hlo3 := hlo.alloc' (al' := al ++ [i]) i d hd hsi hp (allocCandidate k) haddr haddrMax
-    (Or.inr ⟨by omega, k, rfl⟩) .dead (declSlotOk_dead d body.layouts) (.inr (by simp))
-    (.inr (by simp)) (fun j hj => by simp [hj])
-  have hset : locals.set i .dead = locals := by
-    have h1 := List.set_getElem_self (as := locals) hil
-    rwa [show locals[i] = .dead from
-      Option.some.inj ((List.getElem?_eq_getElem hil).symm.trans hsi)] at h1
-  rw [hset] at hlo3
-  exact hlo3
-
-/-- `StorageLive(_i)` of `minimize`'s init block for a temporary `_i` of
-`alwaysStorageLiveLocals`, which Anneal keeps dead and which is not yet in the
-locals map: a fresh allocation at the first free candidate address. -/
-theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
-    {al : List Nat} {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach}
-    {blk stmt : Nat} (hf : FnLocalsSpec body f)
     (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] m.mem.memory.allocations)
     (hlo : LocalsOkA body ctx al locals lm m.mem.memory.allocations)
     (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
@@ -8257,7 +8043,7 @@ theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {
     (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
     (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
     (hsi : locals[i]? = some .dead) (hp : mapGet lm (localName i) = none)
-    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) :
+    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31) :
     ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
       Shape m' ctx [ctx.caller, calleeFrameL f ctx lm' blk stmt] m'.mem.memory.allocations ∧
       LocalsOkA body ctx (al ++ [i]) locals lm' m'.mem.memory.allocations ∧
@@ -8278,9 +8064,8 @@ theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {
       .ok ({ calleeFrameL f ctx lm blk stmt with locals := lm }, m.mem) :=
     storageDead_none' hlt hspec.2 (by simpa [calleeFrameL] using hp)
   have hle_sc := scalar_tyBytes_le (layouts := body.layouts) hscalar
-  have hsz_sc := scalar_size_le_tyBytes (layouts := body.layouts) hscalar
   obtain ⟨k, _, halloc, haddr, haddrMax⟩ :=
-    BM_allocate_local (mem := m.mem.memory) hlo hns hbaseLow hn hdeclsOk hlt hle_sc hsz_sc
+    BM_allocate_local_cand_ns (mem := m.mem.memory) hlo hns hbase hn hdeclsOk hlt hle_sc
   let newPtr : Ptr :=
     { addr := allocCandidate k, provenance := some (⟨(m.mem.memory.allocations.length : Int)⟩, ()) }
   have hins : mapInsertMap lm (localName i) newPtr = ⟨lm.entries ++ [(localName i, newPtr)]⟩ := by
@@ -8320,6 +8105,49 @@ theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {
   · have hne : localName j ≠ localName i := by simp [localName_inj, hji]
     rw [mapGet_append_single _ _ _ _ hnot]
     simp [hne]
+
+/-- `StorageLive(_i)` of `minimize`'s init block under `FnLocalsSpec` and
+`BaseCandBounded`
+(`evalStatement_storageLive_init_cand_ns` for a body whose locals are all scalars). -/
+theorem evalStatement_storageLive_init_cand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {al : List Nat} {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach}
+    {blk stmt bound : Nat} (hf : FnLocalsSpec body f)
+    (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] m.mem.memory.allocations)
+    (hlo : LocalsOkA body ctx al locals lm m.mem.memory.allocations)
+    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
+    (hsi : locals[i]? = some .dead) (hp : mapGet lm (localName i) = none)
+    (hbase : BaseCandBounded ctx.base bound) (hn : bound + body.localDecls.length < 2 ^ 31)
+    (hdecls : ∀ (i : Nat) d, body.localDecls[i]? = some d → scalarTypeOf d.ty = some (tyOf d)) :
+    ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
+      Shape m' ctx [ctx.caller, calleeFrameL f ctx lm' blk stmt] m'.mem.memory.allocations ∧
+      LocalsOkA body ctx (al ++ [i]) locals lm' m'.mem.memory.allocations := by
+  obtain ⟨m', lm', hm', hsh', hlo', -⟩ := evalStatement_storageLive_init_cand_ns hf hsh hlo
+    (localDeclOk_of_scalar hdecls) (NonScalarLive.of_scalar hdecls) i d hd
+    (.inl (by simp [hdecls i d hd])) hsi hp hbase hn
+  exact ⟨m', lm', hm', hsh', hlo'⟩
+
+/-- `StorageLive(_i)` of `minimize`'s init block for a temporary `_i` of
+`alwaysStorageLiveLocals`, which Anneal keeps dead and which is not yet in the
+locals map: a fresh allocation at the first free candidate address
+(`evalStatement_storageLive_init_cand_ns` at `bound = 0`). -/
+theorem evalStatement_storageLive_init {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
+    {al : List Nat} {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {m : Mach}
+    {blk stmt : Nat} (hf : FnLocalsSpec body f)
+    (hsh : Shape m ctx [ctx.caller, calleeFrameL f ctx lm blk stmt] m.mem.memory.allocations)
+    (hlo : LocalsOkA body ctx al locals lm m.mem.memory.allocations)
+    (hdeclsOk : ∀ d ∈ body.localDecls, localDeclOk body.layouts d = true)
+    (hns : NonScalarLive body locals lm)
+    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
+    (hscalar : (scalarTypeOf d.ty).isSome = true ∨ isPtrTy d.ty = true)
+    (hsi : locals[i]? = some .dead) (hp : mapGet lm (localName i) = none)
+    (hbaseLow : BaseLow ctx) (hn : body.localDecls.length < 2 ^ 31) :
+    ∃ m' lm', evalStatement m (.StorageLive (localName i)) = .ok m' ∧
+      Shape m' ctx [ctx.caller, calleeFrameL f ctx lm' blk stmt] m'.mem.memory.allocations ∧
+      LocalsOkA body ctx (al ++ [i]) locals lm' m'.mem.memory.allocations ∧
+      NonScalarLive body locals lm' ∧
+      (∀ j, j ≠ i → mapGet lm' (localName j) = mapGet lm (localName j)) :=
+  evalStatement_storageLive_init_cand_ns hf hsh hlo hdeclsOk hns i d hd hscalar hsi hp
+    hbaseLow.toBaseCandBounded (by omega)
 
 /-! ## `Return` -/
 
@@ -10007,26 +9835,6 @@ theorem LocalsOkA.storage_scalar {body : CapturedMir} {ctx : Ctx} {al : List Nat
     declSlotData_scalar_layouts hsc slot body.layouts ⟨64, true, []⟩] at hA
   exact ⟨id, hpid, hb, ha, hc, hA⟩
 
-/-- `LocalsOk.store` specialized to a scalar-family local, in MR-4's default-layout form. -/
-theorem LocalsOk.store_scalar {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
-    {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation} (hlo : LocalsOk body ctx locals lm A)
-    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
-    (hsc : (scalarTypeOf d.ty).isSome = true) (slot slot' : LocalSlot)
-    (hs : locals[i]? = some slot) (hlive' : slot' ≠ .dead) (hslot' : SlotOk (tyOf d) slot')
-    (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
-    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) :
-    LocalsOk body ctx (locals.set i slot') lm
-      (A.set k (stackAlloc p.addr (itOf d) (declSlotData d slot'))) := by
-  obtain ⟨T, hT⟩ := Option.isSome_iff_exists.mp hsc
-  have hdok : DeclSlotOk d slot' body.layouts := by
-    rw [DeclSlotOk_of_scalarTypeOf hT, tyOf_scalar_layouts hsc body.layouts ⟨64, true, []⟩]
-    exact hslot'
-  have h := hlo.store i d hd slot slot' hs hlive' hdok p hp k hpk
-    (.inl (isPtrTy_false_of_scalarTypeOf hT))
-  rw [itOf_scalar_layouts hsc body.layouts ⟨64, true, []⟩,
-    declSlotData_scalar_layouts hsc slot' body.layouts ⟨64, true, []⟩] at h
-  exact h
-
 /-- `LocalsOkA.store` specialized to a scalar-family local, in MR-4's default-layout form. -/
 theorem LocalsOkA.store_scalar {body : CapturedMir} {ctx : Ctx} {al : List Nat}
     {locals : List LocalSlot} {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation}
@@ -10043,6 +9851,18 @@ theorem LocalsOkA.store_scalar {body : CapturedMir} {ctx : Ctx} {al : List Nat}
   rw [itOf_scalar_layouts hsc body.layouts ⟨64, true, []⟩,
     declSlotData_scalar_layouts hsc slot' body.layouts ⟨64, true, []⟩] at h
   exact h
+
+/-- `LocalsOk.store` specialized to a scalar-family local, in MR-4's default-layout form. -/
+theorem LocalsOk.store_scalar {body : CapturedMir} {ctx : Ctx} {locals : List LocalSlot}
+    {lm : Map Gen.LocalName Ptr} {A : List Gen.Allocation} (hlo : LocalsOk body ctx locals lm A)
+    (i : Nat) (d : LocalDecl) (hd : body.localDecls[i]? = some d)
+    (hsc : (scalarTypeOf d.ty).isSome = true) (slot slot' : LocalSlot)
+    (hs : locals[i]? = some slot) (hlive' : slot' ≠ .dead) (hslot' : SlotOk (tyOf d) slot')
+    (p : Ptr) (hp : mapGet lm (localName i) = some p) (k : Nat)
+    (hpk : p.provenance = some (⟨(k : Int)⟩, ())) :
+    LocalsOk body ctx (locals.set i slot') lm
+      (A.set k (stackAlloc p.addr (itOf d) (declSlotData d slot'))) :=
+  LocalsOkA.store_scalar hlo i d hd hsc slot slot' hs hlive' hslot' p hp k hpk
 
 /-- `LocalsOkA.alloc'` for `StorageLive` of a dead scalar-family local, in MR-4's
 default-layout form. -/

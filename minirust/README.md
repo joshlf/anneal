@@ -592,15 +592,17 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   of `alwaysStorageLiveLocals`, then `Goto(bb0)`) runs in `initLen body` steps
   to `StateRelN` (and `StateRel`).
 * `reaches_rel_N`, `reaches_rel`, `run_ret_N`, `run_ret`, `run_ub_N`, `run_ub`,
-  `run_ub_rel`, `run_ret_from_start`, `run_ub_from_start`,
-  `run_ub_rel_from_start`, `mirCall_ret`, `mirCall_ub`, `mirCall_ub_rel`
-  (`Run.lean`): lifted to Anneal's interaction trees `mirTree body s` and
-  `mirCallTree body args`: if Anneal returns `v` (or can reach UB), then
-  MiniRust started either at `bb0` or at `f.start` performs the corresponding
-  return (or raises UB, localized by the `_rel` variants to step `n + 1` from a
-  `StateRel`-related machine `mLast` with `¬ ReturnRel` at every prefix step
-  `k ≤ n` via `reaches_rel_no_returnRel`, `StateRel.not_returnRel`, and
-  `step_start_no_returnRel`) within finitely many steps.
+  `run_ub_rel_N`, `run_ub_rel`, `run_ret_from_start`, `run_ub_from_start`,
+  `run_ub_rel_from_start_N`, `run_ub_rel_from_start`, `mirCall_ret`,
+  `mirCall_ub`, `mirCall_ub_rel` (`Run.lean`): lifted to Anneal's interaction
+  trees `mirTree body s` and `mirCallTree body args`: if Anneal returns `v` (or
+  can reach UB), then MiniRust started either at `bb0` or at `f.start` performs
+  the corresponding return (or raises UB, localized by the `_rel` variants to
+  step `n + 1` from a `StateRelN`- or `StateRel`-related machine `mLast` with
+  `¬ ReturnRel` at every prefix step `k ≤ n` via `reaches_rel_no_returnRel_N`,
+  `StateRel.not_returnRel`, and `step_start_no_returnRel`) within finitely many
+  steps. Only `run_ub_rel` and `reaches_rel_no_returnRel`, which start from an
+  arbitrary `StateRel` machine, need the all-scalar `hall` hypothesis.
 * `steps_error_N`, `steps_error`, `steps_error_from_start`,
   `mirCall_steps_error` (`Run.lean`): conversely, if MiniRust stops with *any*
   error within `n` steps from `StateRelN`, `StateRel`, `StartRel`, or
@@ -1520,21 +1522,24 @@ These are deliberate and are the first things to lift:
   `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state.
   Pass B2 (MR-4.3) unifies `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
   into `translateStmtOrIntrinsic`, `statementOkWithIntrinsics` (via
-  `progStatementOk`), and `inFragmentWithIntrinsics`, proves the self-contained
-  1-step simulation lemma `FrameOkWithIntrinsics.assume_step` (deriving both
-  the normal-step continuation jump when `evalOperand = .ok (.scalar ⟨1, 1⟩, _)`
-  and the lockstep `StepRel` UB transition when `evalOperand = .ok (.scalar ⟨0, 1⟩, _)`
-  or `evalOperand = .error .ub`, while preserving `FrameOkWithIntrinsics`,
-  `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`), extends
-  `termPreservesAddrTaken` to check `TerminatorKind.call` return destinations
-  (`termPreservesAddrTaken_call_spec`), and verifies 3-way cross-feature
-  witnesses combining `Assume` + mutable/shared reborrowing + provenance casts
-  (`assumeReborrowExposeRoundTrip_three_way`, `assumeReborrowFalseUb_three_way`)
-  and multi-frame `Terminator::Call` + `&mut u32` (`Protected::Strong`) +
-  Tree Borrows `MachTB` + cross-frame `PointerExposeProvenance` /
-  `PointerWithExposedProvenance` (`callRefMutProtectedRoundTrip_mach_and_tb`,
-  `callRefMutProtectorViolation_mach_vs_tb`,
-  `callCrossFrameExposeWithExposed_mach_and_tb`). Threading
+  `progStatementOk`), and `inFragmentWithIntrinsics`, and proves the one-step
+  lemma `FrameOkWithIntrinsics.assume_step`: when the condition is
+  uninitialized or `false` (`opBits view (copyOp op)` is `none` or `some 0`),
+  both Anneal and MiniRust raise UB, and when it is `true`, Anneal advances
+  while MiniRust jumps to the continuation block, preserving
+  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` (the lemma states nothing
+  about `BorrowsOk` or `ProvenanceRel`). `termPreservesAddrTaken` rejects a
+  `TerminatorKind.call` whose destination or moved argument is address-taken
+  (`termPreservesAddrTaken_call_spec`), although no fragment yet admits both
+  calls and `ptrAliasingOk`. The witnesses `assumeReborrowExposeRoundTrip_three_way`
+  and `assumeReborrowFalseUb_three_way` run Anneal, `Mach`, and `MachTB` on
+  `Assume` combined with `&mut` reborrowing and provenance casts, while
+  `callRefMutProtectedRoundTrip_mach_and_tb`,
+  `callRefMutProtectorViolation_mach_vs_tb`, and
+  `callCrossFrameExposeWithExposed_mach_and_tb` run hand-written multi-function
+  MiniRust programs (with no Anneal side and no `translateProg`) that combine
+  `Terminator::Call` with `&mut u32` function-entry protectors and cross-frame
+  provenance casts on `Mach` and `MachTB`. Threading
   `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across the
   continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
   from `step_correspondence_N`. A single exposure site in a loop
@@ -1555,14 +1560,12 @@ These are deliberate and are the first things to lift:
   single-function correspondence (`step_correspondence_N`) covers; both
   translations share `translateStatement` and `translateTerminator`. The
   multi-frame relations (`MultiStartRel`, `CallStackRel`) state per-local facts
-  at the default layout table, and `itOf_layouts_of_scalar`,
-  `tyOf_layouts_of_scalar`, `declSlotData_layouts_of_scalar`, and
-  `localAllocsFrom_layouts_of_scalar` bridge them to the single-frame relations
+  at the default layout table, and `itOf_scalar_layouts`,
+  `tyOf_scalar_layouts`, `declSlotData_scalar_layouts`, and
+  `localAllocsFrom_scalar_layouts` bridge them to the single-frame relations
   at `body.layouts`; the call and return lemmas (`callArgOk_cases`,
   `evalArguments_spec`, `evalCall_spec`, `evalReturn_caller_spec`) take the
-  scalar-only hypothesis explicitly. The localized single-body UB theorems
-  (`run_ub_rel`, `run_ub_rel_from_start`, `mirCall_ub_rel`) relate `StateRel`
-  and so take `step_correspondence`'s all-scalar `hall` hypothesis.
+  scalar-only hypothesis explicitly.
 * **Two block-splitting translations.** `translateFnWithIntrinsics` splits a
   block after each `PointerExposeProvenance`, `PointerWithExposedProvenance`, or
   `Assume` statement (single-function, `FrameOkWithIntrinsics`), while

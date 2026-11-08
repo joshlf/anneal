@@ -8228,41 +8228,17 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
 scalar-family locals, which are the only locals of the multi-function fragment
 (`bodyInProgFragment_allScalar`). -/
 
-theorem itOf_layouts_of_scalar {d : LocalDecl} {L1 L2 : Layout.LayoutTable} {T : Gen.Type}
-    (h : scalarTypeOf d.ty = some T) : itOf d L1 = itOf d L2 := by
-  rcases scalarTypeOf_cases h with ⟨hb, _⟩ | ⟨it, hit, _⟩ | ⟨ho, _⟩ | ⟨it, htup, _⟩
-  · exact (tyOf_bool (layouts := L1) hb).2.trans (tyOf_bool (layouts := L2) hb).2.symm
-  · exact (tyOf_int (layouts := L1) hit).2.trans (tyOf_int (layouts := L2) hit).2.symm
-  · exact (tyOf_ordering (layouts := L1) ho).2.trans (tyOf_ordering (layouts := L2) ho).2.symm
-  · exact (tyOf_tuple (layouts := L1) htup).2.trans (tyOf_tuple (layouts := L2) htup).2.symm
-
-theorem tyOf_layouts_of_scalar {d : LocalDecl} {L1 L2 : Layout.LayoutTable} {T : Gen.Type}
-    (h : scalarTypeOf d.ty = some T) : tyOf d L1 = tyOf d L2 :=
-  (tyOf_of_scalarTypeOf h).trans (tyOf_of_scalarTypeOf h).symm
-
-theorem declSlotData_layouts_of_scalar {d : LocalDecl} {L1 L2 : Layout.LayoutTable}
-    {T : Gen.Type} (h : scalarTypeOf d.ty = some T) (slot : LocalSlot) :
-    declSlotData d slot L1 = declSlotData d slot L2 := by
-  cases htup : intBoolTupleOf d.ty with
-  | some it => rw [declSlotData_of_some htup, declSlotData_of_some htup]
-  | none =>
-    have ha : arrayTypeOf d.ty = none := arrayTypeOf_none_of_scalarTypeOf h
-    rw [declSlotData_of_none htup ha (tupleTypeOf_none_of_scalarTypeOf h),
-      declSlotData_of_none htup ha (tupleTypeOf_none_of_scalarTypeOf h),
-      itOf_layouts_of_scalar (L1 := L1) (L2 := L2) h]
-
-theorem localAllocsFrom_layouts_of_scalar (ctx : Ctx) :
-    ∀ (i : Nat) (decls : List LocalDecl) (locals : List LocalSlot) (L1 L2 : Layout.LayoutTable),
+theorem localAllocsFrom_scalar_layouts (ctx : Ctx) :
+    ∀ (i : Nat) (decls : List LocalDecl) (locals : List LocalSlot) (L L' : Layout.LayoutTable),
       (∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true) →
-      localAllocsFrom ctx i decls locals L1 = localAllocsFrom ctx i decls locals L2
+      localAllocsFrom ctx i decls locals L = localAllocsFrom ctx i decls locals L'
   | _, [], locals, _, _, _ => by cases locals <;> rfl
   | _, _ :: _, [], _, _, _ => rfl
-  | i, d :: ds, slot :: slots, L1, L2, h => by
-    obtain ⟨T, hT⟩ := Option.isSome_iff_exists.mp (h d List.mem_cons_self)
+  | i, d :: ds, slot :: slots, L, L', h => by
+    have hd := h d List.mem_cons_self
     simp only [localAllocsFrom]
-    rw [itOf_layouts_of_scalar (L1 := L1) (L2 := L2) hT,
-      declSlotData_layouts_of_scalar (L1 := L1) (L2 := L2) hT,
-      localAllocsFrom_layouts_of_scalar ctx (i + 1) ds slots L1 L2
+    rw [itOf_scalar_layouts hd L L', declSlotData_scalar_layouts hd slot L L',
+      localAllocsFrom_scalar_layouts ctx (i + 1) ds slots L L'
         (fun d' hd' => h d' (List.mem_cons_of_mem _ hd'))]
 
 /-- Initial locals map at `fEntry.start` under `MultiStartRel`. -/
@@ -8274,15 +8250,14 @@ theorem MultiStartRel.localsOk {entry : CapturedMir} {callees : List CapturedMir
     (hall : entry.localDecls.all (fun d => (scalarTypeOf d.ty).isSome) = true) :
     LocalsOkA entry rootCtx [] s.frame.locals (localsMap rootCtx (entry.argCount + 1))
       mInit.mem.memory.allocations := by
-  have hsc : ∀ (i : Nat) d, entry.localDecls[i]? = some d → ∃ T, scalarTypeOf d.ty = some T :=
-    fun i d hd =>
-      Option.isSome_iff_exists.mp (List.all_eq_true.mp hall d (List.mem_of_getElem? hd))
+  have hsc : ∀ (i : Nat) d, entry.localDecls[i]? = some d → (scalarTypeOf d.ty).isSome = true :=
+    fun _ d hd => List.all_eq_true.mp hall d (List.mem_of_getElem? hd)
   have hs1 : StartRel entry fEntry rootCtx s mInit := {
     threads := hstart.threads
     active := hstart.active
     allocs := by
       rw [hstart.allocs, localAllocs, localAllocs,
-        localAllocsFrom_layouts_of_scalar rootCtx 0 _ s.frame.locals ⟨64, true, []⟩
+        localAllocsFrom_scalar_layouts rootCtx 0 _ s.frame.locals ⟨64, true, []⟩
           entry.layouts
           (fun d hd => List.all_eq_true.mp hall d (List.mem_of_mem_take hd))]
     blk0 := hstart.blk0
@@ -8290,21 +8265,19 @@ theorem MultiStartRel.localsOk {entry : CapturedMir} {callees : List CapturedMir
     hasBlocks := hstart.hasBlocks
     nlocals := hstart.nlocals
     slots := fun i d slot hd hs => by
-      obtain ⟨T, hT⟩ := hsc i d hd
+      obtain ⟨T, hT⟩ := Option.isSome_iff_exists.mp (hsc i d hd)
       rw [DeclSlotOk_of_scalarTypeOf hT,
-        tyOf_layouts_of_scalar (L1 := entry.layouts) (L2 := ⟨64, true, []⟩) hT]
+        tyOf_scalar_layouts (hsc i d hd) entry.layouts ⟨64, true, []⟩]
       exact hstart.slots i d slot hd hs
     argsLive := hstart.argsLive
     tempsDead := hstart.tempsDead
     addrs := fun i d hi hd => by
-      obtain ⟨T, hT⟩ := hsc i d hd
-      rw [itOf_layouts_of_scalar (L1 := entry.layouts) (L2 := ⟨64, true, []⟩) hT,
-        tyOf_layouts_of_scalar (L1 := entry.layouts) (L2 := ⟨64, true, []⟩) hT]
+      rw [itOf_scalar_layouts (hsc i d hd) entry.layouts ⟨64, true, []⟩,
+        tyOf_scalar_layouts (hsc i d hd) entry.layouts ⟨64, true, []⟩]
       exact hstart.addrs i d hi hd
     ret := fun d hd => by
-      obtain ⟨T, hT⟩ := hsc 0 d hd
-      rw [itOf_layouts_of_scalar (L1 := entry.layouts) (L2 := ⟨64, true, []⟩) hT,
-        tyOf_layouts_of_scalar (L1 := entry.layouts) (L2 := ⟨64, true, []⟩) hT]
+      rw [itOf_scalar_layouts (hsc 0 d hd) entry.layouts ⟨64, true, []⟩,
+        tyOf_scalar_layouts (hsc 0 d hd) entry.layouts ⟨64, true, []⟩]
       exact hstart.ret d hd
     baseLow := hstart.baseLow
     borrows := hstart.borrows
@@ -8314,7 +8287,7 @@ theorem MultiStartRel.localsOk {entry : CapturedMir} {callees : List CapturedMir
     callerLocals := hstart.callerLocals
   }
   exact hs1.localsOk hargs (fun i d _ hd =>
-    let ⟨_, hT⟩ := hsc i d hd
+    let ⟨_, hT⟩ := Option.isSome_iff_exists.mp (hsc i d hd)
     isPtrTy_false_of_scalarTypeOf hT)
 
 /-- **Multi-function init block (`fEntry.start`, with intermediate non-return
@@ -8423,7 +8396,7 @@ private theorem initLocalsAux_argsInit (layouts : Layout.LayoutTable) (ds : List
       have hvslot : SlotOk (tyOf d0) (.init v) := by
         obtain ⟨T, hT⟩ := Option.isSome_iff_exists.mp (hsc d0 List.mem_cons_self)
         have h1 := (DeclSlotOk_of_scalarTypeOf hT (.init v)).mp (declArgOk_declSlotOk hv)
-        rwa [tyOf_layouts_of_scalar (L1 := layouts) (L2 := ⟨64, true, []⟩) hT] at h1
+        rwa [tyOf_scalar_layouts (hsc d0 List.mem_cons_self) layouts ⟨64, true, []⟩] at h1
       intro j d hj hd
       cases j with
       | zero =>
@@ -8461,9 +8434,8 @@ theorem initMachineStateWithCallees_startRel {entry : CapturedMir}
   have hentryFrag := hallFrag entry List.mem_cons_self
   obtain ⟨_, hdeclLen, _, hbne, _⟩ := bodyInProgFragment_spec hentryFrag
   have hall := bodyInProgFragment_allScalar hentryFrag
-  have hscd : ∀ (i : Nat) d, entry.localDecls[i]? = some d → ∃ T, scalarTypeOf d.ty = some T :=
-    fun i d hd =>
-      Option.isSome_iff_exists.mp (List.all_eq_true.mp hall d (List.mem_of_getElem? hd))
+  have hscd : ∀ (i : Nat) d, entry.localDecls[i]? = some d → (scalarTypeOf d.ty).isSome = true :=
+    fun _ d hd => List.all_eq_true.mp hall d (List.mem_of_getElem? hd)
   cases hdecls : entry.localDecls with
   | nil => simp [hdecls] at hdeclLen
   | cons d0 ds =>
@@ -8499,14 +8471,12 @@ theorem initMachineStateWithCallees_startRel {entry : CapturedMir}
       argsLive := ?_
       tempsDead := ?_
       addrs := fun i d hi hd => by
-        obtain ⟨T, hT⟩ := hscd i d hd
-        rw [itOf_layouts_of_scalar (L1 := ⟨64, true, []⟩) (L2 := entry.layouts) hT,
-          tyOf_layouts_of_scalar (L1 := ⟨64, true, []⟩) (L2 := entry.layouts) hT]
+        rw [itOf_scalar_layouts (hscd i d hd) ⟨64, true, []⟩ entry.layouts,
+          tyOf_scalar_layouts (hscd i d hd) ⟨64, true, []⟩ entry.layouts]
         exact hctx.addrs i d hi hd
       ret := fun d hd => by
-        obtain ⟨T, hT⟩ := hscd 0 d hd
-        rw [itOf_layouts_of_scalar (L1 := ⟨64, true, []⟩) (L2 := entry.layouts) hT,
-          tyOf_layouts_of_scalar (L1 := ⟨64, true, []⟩) (L2 := entry.layouts) hT]
+        rw [itOf_scalar_layouts (hscd 0 d hd) ⟨64, true, []⟩ entry.layouts,
+          tyOf_scalar_layouts (hscd 0 d hd) ⟨64, true, []⟩ entry.layouts]
         exact hctx.ret d hd
       baseLow := hctx.baseLow
       calleesEq := rfl
@@ -8516,14 +8486,15 @@ theorem initMachineStateWithCallees_startRel {entry : CapturedMir}
       protectors := rfl
       callerLocals := rfl }
     · intro i d slot hd hs
-      obtain ⟨T, hT⟩ := hscd i d hd
+      have hsc := hscd i d hd
+      obtain ⟨T, hT⟩ := Option.isSome_iff_exists.mp hsc
       rw [hdecls] at hd; rw [hinit] at hs
       cases i with
       | zero => simp at hd hs; subst hs; trivial
       | succ k =>
         simp at hd hs
         have h1 := (DeclSlotOk_of_scalarTypeOf hT slot).mp (hslots k d slot hd hs)
-        rwa [tyOf_layouts_of_scalar (L1 := entry.layouts) (L2 := ⟨64, true, []⟩) hT] at h1
+        rwa [tyOf_scalar_layouts hsc entry.layouts ⟨64, true, []⟩] at h1
     · intro i d hi1 hi2 hd
       rw [hdecls] at hd; rw [hinit]
       cases i with

@@ -148,10 +148,11 @@ open MiniRustSpec.Correspondence in
   multi_step_start_no_returnRel
   initMachineStateWithCallees_startRel
   bodyInProgFragment_allScalar
-  itOf_layouts_of_scalar
-  tyOf_layouts_of_scalar
-  declSlotData_layouts_of_scalar
-  localAllocsFrom_layouts_of_scalar
+  itOf_scalar_layouts
+  tyOf_scalar_layouts
+  declSlotData_scalar_layouts
+  scalarTypeOf_tyOf_of_isSome
+  localAllocsFrom_scalar_layouts
   MultiStartRel.localsOk
   steps_add_no_returnRel
   multi_reaches_rel
@@ -196,12 +197,15 @@ open MiniRustSpec.Correspondence in
   initMachineState_startRel
   steps_ok_mono
   reaches_rel
+  reaches_rel_no_returnRel_N
   reaches_rel_no_returnRel
   run_ret
   run_ret_from_start
   run_ub
   run_ub_from_start
+  run_ub_rel_N
   run_ub_rel
+  run_ub_rel_from_start_N
   run_ub_rel_from_start
   steps_error
   steps_error_from_start
@@ -434,6 +438,15 @@ open MiniRustSpec.Correspondence in
   storageDead_none
   storageDead_none'
   BM_allocate_local
+  BM_allocate_local_cand
+  BM_allocate_local_cand_ns
+  LocalsOkA.free_candidate_cand_ns
+  localDeclOk_of_scalar
+  NonScalarLive.of_scalar
+  evalStatement_storageLive_cand
+  evalStatement_storageLive_cand_ns
+  evalStatement_storageLive_init_cand
+  evalStatement_storageLive_init_cand_ns
   firstFitAddr_spec
   allocAddrOk_cand
   overlaps_low
@@ -1473,10 +1486,11 @@ open MiniRustSpec.Correspondence in
   multi_step_start_no_returnRel
   initMachineStateWithCallees_startRel
   bodyInProgFragment_allScalar
-  itOf_layouts_of_scalar
-  tyOf_layouts_of_scalar
-  declSlotData_layouts_of_scalar
-  localAllocsFrom_layouts_of_scalar
+  itOf_scalar_layouts
+  tyOf_scalar_layouts
+  declSlotData_scalar_layouts
+  scalarTypeOf_tyOf_of_isSome
+  localAllocsFrom_scalar_layouts
   MultiStartRel.localsOk
   steps_add_no_returnRel
   multi_reaches_rel
@@ -1520,12 +1534,15 @@ open MiniRustSpec.Correspondence in
   step_start_with_no_returnRel
   step_start_no_returnRel
   initMachineState_startRel
+  reaches_rel_no_returnRel_N
   reaches_rel_no_returnRel
   run_ret
   run_ret_from_start
   run_ub
   run_ub_from_start
+  run_ub_rel_N
   run_ub_rel
+  run_ub_rel_from_start_N
   run_ub_rel_from_start
   steps_error
   steps_error_from_start
@@ -1694,6 +1711,15 @@ open MiniRustSpec.Correspondence in
   storageDead_none
   storageDead_none'
   BM_allocate_local
+  BM_allocate_local_cand
+  BM_allocate_local_cand_ns
+  LocalsOkA.free_candidate_cand_ns
+  localDeclOk_of_scalar
+  NonScalarLive.of_scalar
+  evalStatement_storageLive_cand
+  evalStatement_storageLive_cand_ns
+  evalStatement_storageLive_init_cand
+  evalStatement_storageLive_init_cand_ns
   firstFitAddr_spec
   allocAddrOk_cand
   overlaps_low
