@@ -102,7 +102,7 @@ weakened theorem keeps its name:
   (`evalProjection_downcast_field_simulation`) and inactive-variant initialized
   overlapping-byte divergence (`evalProjection_downcast_field_initialized_divergence`),
   `SwitchInt` match dispatch (`enum_match_switchInt_simulation`), `Goto`/`Return`
-  helpers, and the nine `WitLM2_3` concrete multi-variant execution, UB, and
+  helpers, and the ten `WitLM2_3` concrete multi-variant execution, UB, and
   divergence witnesses.
 * the `LM-2.4` theorems: the union aggregate, field read, and whole-union copy/move
   fresh and in-place overwrite steps (`step_union_aggregate_simulation`,
@@ -1039,6 +1039,7 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm2_3_setDiscriminant_uninit_divergence
   Witness.wit_lm2_3_inactive_variant_initialized_divergence
   Witness.wit_lm2_3_prefix_setDiscriminant_read
+  Witness.wit_lm2_3_upcast_setDiscriminant_read_and_trailing_ub
   Witness.wit_lm2_3_bodyFree_divBody
 
 /-- Exhaustively verify that every declaration across every imported
@@ -6820,7 +6821,15 @@ example :
         get? s.frame.locals dstIdx ≠ some .uninit →
         (∀ v_act (hv_act : v_act < variants.length) fieldVals,
           get? s.frame.locals dstIdx = some (.init (.aggregate v_act fieldVals)) →
-          (variants[variantIdx]'hv_lt) <+: (variants[v_act]'hv_act)) →
+          ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
+            (∃ (hi_act : i < (variants[v_act]'hv_act).length),
+              (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
+            (get? fieldVals i = none ∧
+              ∃ b,
+                ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
+                b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
+                  ((variants[variantIdx]'hv_lt)[i]'hi).fieldLayout.size.bytes.toNat ∧
+                EnumLocalByteUninit m dstIdx b)) →
         StepRelLM2_3 body env allocBudget m
           (stepMirFn body s)
           (Miri.Interpreter.Step.step
@@ -6980,6 +6989,7 @@ example :
         variantIdx ≠ v_act →
         (hv_act : v_act < variants.length) →
         (hj : j < (variants[v_act]'hv_act).length) →
+        j < fieldVals.length →
         ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt) = ((variants[v_act]'hv_act)[j]'hj) →
         stepMirFn body s = .fail .ub ∧
         ∃ (sc : MirAst.ScalarInt) (m' : AnnealStepState),
@@ -7146,6 +7156,27 @@ example :
       Miri.Interpreter.Step.step Witness.lm23Hooks () m₂ = (m₃, .ok true) ∧
       StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb13S3 m₃ :=
   Witness.wit_lm2_3_prefix_setDiscriminant_read
+
+example :
+    ∃ (m₁ m₂ m₃ m₄ : AnnealStepState) (msg : String),
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 14) =
+        .step Witness.lm23Bb14S1 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks ()
+        (Witness.lm23InitMiri 14) = (m₁, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb14S1 m₁ ∧
+      EnumLocalByteUninit m₁ 1 8 ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb14S1 =
+        .step Witness.lm23Bb14S2 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb14S2 m₂ ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb14S2 =
+        .step Witness.lm23Bb14S3 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb14S3 m₃ ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb14S3 = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₃ =
+        (m₄, .error (.undefinedBehavior msg)) :=
+  Witness.wit_lm2_3_upcast_setDiscriminant_read_and_trailing_ub
 
 example (divisor : Nat) :
     BodyFreeOfLM2_3 (Witness.divBody divisor).localDecls

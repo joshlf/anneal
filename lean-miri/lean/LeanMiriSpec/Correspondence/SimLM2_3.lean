@@ -2108,9 +2108,13 @@ state simulates vendored `Miri.Interpreter.project` (`projectDowncast` +
 `projectField`) + `annealReadImmediate` + `annealWriteImmediate` in lockstep:
 * `.dead` `_src` → `StepRelLM2_3.ub` (`"read of dead local"`);
 * `.uninit` `_src` (immediate or indirect) → `StepRelLM2_3.ub`;
-* `.init (.aggregate v_act fieldVals)` with `variantIdx = v_act`: reads active
-  payload scalar `fieldVals[fieldIdx]` and steps `.step` (or `.ub` if `_dst` is
-  `.dead`), preserving `EnumLocalByteUninit` on all `enumId ≠ dstIdx`;
+* `.init (.aggregate v_act fieldVals)` with `variantIdx = v_act`: if
+  `get? fieldVals fieldIdx = some (.scalar sc)`, reads active payload scalar
+  `sc` and steps `.step` (or `.ub` if `_dst` is `.dead`); if
+  `get? fieldVals fieldIdx = none` (e.g. reading an uninitialized trailing field
+  after `SetDiscriminant` switched from a narrower variant to a wider variant),
+  both Anneal and `lean-miri` step to `StepRelLM2_3.ub`, preserving
+  `EnumLocalByteUninit` on all `enumId ≠ dstIdx`;
 * `.init (.aggregate v_act fieldVals)` with `variantIdx ≠ v_act` (inactive
   variant whose target field slice contains an uninitialized byte
   `EnumLocalByteUninit m srcIdx b`): both Anneal and `lean-miri` step to
@@ -2426,82 +2430,132 @@ theorem evalProjection_downcast_field_simulation
     -- Subcase A (`variantIdx = v_act`: active variant read) vs Subcase B (`variantIdx ≠ v_act`: inactive UB)
     by_cases hv_eq : variantIdx = v_act
     · subst hv_eq
-      obtain ⟨sc, msc, hget_fv, hrel_sc, hsz_sc, hbool_sc, hchar_sc, _, _, hread_sc⟩ :=
-        hpayload fieldIdx hf_lt
-      have hfl_eq : (translateTy fieldTy body.layouts).layout =
-          ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).fieldLayout := by
-        rw [hfty_eq]; exact hfl_f.symm
-      have hread_sc' :
-          localAlloc.allocation.readScalar annealTargetDataLayout
-            (Miri.Memory.allocRange ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset
-              (translateTy fieldTy body.layouts).layout.size) false =
-          .ok (.fromScalarInt msc) := by
-        rw [hfl_eq]; exact hread_sc
-      have hptr_f :
-          Miri.ABI.Size.ofBytes
-            (mp.ptr.offset.bytes + ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes) =
-          Miri.ABI.Size.ofBytes
-            (baseAddr + ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes) := by
-        rw [hptr]; rfl
-      have hread_ok := annealReadIndirectImmediate_scalar_ok
-        (mp := ⟨⟨Miri.ABI.Size.ofBytes
-          (mp.ptr.offset.bytes + ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes),
-          mp.ptr.provenance⟩, .none, mp.misaligned⟩)
-        (m := m₁) hprim_fty hprov hbase hptr_f hlive.1 hread_sc'
-      have ha_ok : evalStmt s stmt body.localDecls body.layouts =
-          match get? s.frame.locals dstIdx with
-          | .some .dead => MirStepNode.fail .ub
-          | .some _ =>
-            match set? s.frame.locals dstIdx (.init (.scalar sc)) with
-            | .some locals₂ => MirStepNode.step (advanceStmt s locals₂ s.memory)
-            | .none => MirStepNode.fail .ub
-          | .none => MirStepNode.fail .ub := by
+      rcases hpayload fieldIdx hf_lt with
+        ⟨sc, msc, hget_fv, hrel_sc, hsz_sc, hbool_sc, hchar_sc, _, _, hread_sc⟩ |
+        ⟨hget_none, b_u, hb_ge, hb_lt, hbit_false⟩
+      · have hfl_eq : (translateTy fieldTy body.layouts).layout =
+            ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).fieldLayout := by
+          rw [hfty_eq]; exact hfl_f.symm
+        have hread_sc' :
+            localAlloc.allocation.readScalar annealTargetDataLayout
+              (Miri.Memory.allocRange ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset
+                (translateTy fieldTy body.layouts).layout.size) false =
+            .ok (.fromScalarInt msc) := by
+          rw [hfl_eq]; exact hread_sc
+        have hptr_f :
+            Miri.ABI.Size.ofBytes
+              (mp.ptr.offset.bytes + ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes) =
+            Miri.ABI.Size.ofBytes
+              (baseAddr + ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes) := by
+          rw [hptr]; rfl
+        have hread_ok := annealReadIndirectImmediate_scalar_ok
+          (mp := ⟨⟨Miri.ABI.Size.ofBytes
+            (mp.ptr.offset.bytes + ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).offset.bytes),
+            mp.ptr.provenance⟩, .none, mp.misaligned⟩)
+          (m := m₁) hprim_fty hprov hbase hptr_f hlive.1 hread_sc'
+        have ha_ok : evalStmt s stmt body.localDecls body.layouts =
+            match get? s.frame.locals dstIdx with
+            | .some .dead => MirStepNode.fail .ub
+            | .some _ =>
+              match set? s.frame.locals dstIdx (.init (.scalar sc)) with
+              | .some locals₂ => MirStepNode.step (advanceStmt s locals₂ s.memory)
+              | .none => MirStepNode.fail .ub
+            | .none => MirStepNode.fail .ub := by
+          have hbeq_v : Nat.beq variantIdx variantIdx = true := by simp
+          unfold evalStmt; rw [hkind]
+          cases isMove <;> {
+            simp only [Bool.false_eq_true, ↓reduceIte, evalRvalue, evalOperand, hbor, hcaller,
+              hslot_s, readProjectedValue, hbeq_v, hget_fv, hprot,
+              invalidateConflictingBorrows]
+            cases get? s.frame.locals dstIdx with
+            | none => rfl
+            | some sl =>
+              cases sl with
+              | dead => rfl
+              | uninit | init _ =>
+                cases set? s.frame.locals dstIdx _ with
+                | none => rfl
+                | some locals₂ =>
+                  apply congrArg MirStepNode.step
+                  apply congrArg (fun mem' => advanceStmt s locals₂ mem')
+                  cases hm : s.memory; simp_all
+          }
+        have hm_write :
+            Miri.Interpreter.Step.evalStatement
+              (annealStepHooksLM2_3 body.localDecls body.layouts) () (translateStmt stmt) m =
+            Miri.Interpreter.runRvalue
+              (annealWriteImmediate (.scalar (.fromScalarInt msc)) destPlace) m₁ := by
+          rw [hm_base]
+          apply runRvalue_eq_of_eq
+          rw [EStateM.bind_eq_ok (by
+            rw [EStateM.bind_eq_ok hdown_ok]; dsimp [annealReadImmediate]; exact hread_ok)]
+        have hlaysz_dst :
+            (translateTy dstDecl.ty body.layouts).layout.size = translateSizeBytes sc.sizeBytes := by
+          rw [hdst_ty, hfl_eq]; exact hsz_sc
+        have hbool_dst : dstDecl.ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1) := by
+          rw [hdst_ty, hfty_eq]; exact hbool_sc
+        have hchar_dst : dstDecl.ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true := by
+          rw [hdst_ty, hfty_eq]; exact hchar_sc
+        obtain ⟨hstep_rel, hpres_u, hpres_i⟩ :=
+          write_after_rvalue_simulation_LM2_3
+            (annealStepHooksLM2_3 body.localDecls body.layouts)
+            (topFrame₁ := tf₁) (id0 := topFrame.localsIdentity)
+            hretCont ⟨retLay, hretPlace⟩ halloc hcal hstack hbor hprot hcaller
+            hframes hframe.body_eq hframe.location_eq hbb hstmt
+            hframe₁ hdisj₁ hdst_decl henv_dst himm_dst₁
+            (.scalar sc msc hrel_sc hlaysz_dst hbool_dst hchar_dst)
+            ha_ok hm_write
+        exact ⟨hstep_rel, (fun enumId b hne hu => hpres_u enumId b hne (huninit_m₁ enumId b hu)),
+          (fun j hj => hpres_i j (himm_m₁ j hj))⟩
+      · -- Active variant (`variantIdx = v_act`), missing trailing field (`get? fieldVals fieldIdx = none`):
+        -- BOTH Anneal and `lean-miri` step to `.ub`!
+        let fDesc := (variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt
+        have hfl_eq : (translateTy fieldTy body.layouts).layout = fDesc.fieldLayout := by
+          rw [hfty_eq]; exact hfl_f.symm
+        have hf_inb :
+            fDesc.offset.bytes.toNat + (translateTy fieldTy body.layouts).layout.size.bytes.toNat ≤
+              localAlloc.allocation.byteSize.bytes.toNat := by
+          rw [hfl_eq, hbs_eq]
+          exact hvf.fields_in_bounds fieldIdx hf_lt
+        have hb_lt_ty :
+            b_u < fDesc.offset.bytes.toNat +
+              (translateTy fieldTy body.layouts).layout.size.bytes.toNat := by
+          rw [hfl_eq]; exact hb_lt
+        have hb_sz : b_u < localAlloc.allocation.byteSize.bytes.toNat :=
+          Nat.lt_of_lt_of_le hb_lt_ty hf_inb
+        have hget_false :
+            localAlloc.allocation.initializationMask.get
+              (Miri.ABI.Size.ofBytes (UInt64.ofNat b_u)) = .ok false := by
+          rw [initMaskWordRel_get hmask_rel hb_sz, hbit_false]
+        have hlen_lt_4g : localAlloc.allocation.byteSize.bytes.toNat < 2 ^ 32 := by
+          rw [hbs_eq]; exact hvalid_enum.size_lt_4gib
+        obtain ⟨badRng, huninit_q⟩ :=
+          initMaskWordRel_isRangeInitialized_error_of_get_false
+            hmask_rel hlen_lt_4g hf_inb hb_ge hb_lt_ty hget_false
+        have hptr_f :
+            Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes + fDesc.offset.bytes) =
+            Miri.ABI.Size.ofBytes (baseAddr + fDesc.offset.bytes) := by
+          rw [hptr]; rfl
+        have hread_err := annealReadIndirectImmediate_scalar_uninit_ub
+          (mp := ⟨⟨Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes + fDesc.offset.bytes),
+            mp.ptr.provenance⟩, .none, mp.misaligned⟩)
+          (m := m₁) hprim_fty hprov hbase hptr_f hlive.1 huninit_q
         have hbeq_v : Nat.beq variantIdx variantIdx = true := by simp
-        unfold evalStmt; rw [hkind]
-        cases isMove <;> {
-          simp only [Bool.false_eq_true, ↓reduceIte, evalRvalue, evalOperand, hbor, hcaller,
-            hslot_s, readProjectedValue, hbeq_v, hget_fv, hprot,
-            invalidateConflictingBorrows]
-          cases get? s.frame.locals dstIdx with
-          | none => rfl
-          | some sl =>
-            cases sl with
-            | dead => rfl
-            | uninit | init _ =>
-              cases set? s.frame.locals dstIdx _ with
-              | none => rfl
-              | some locals₂ =>
-                apply congrArg MirStepNode.step
-                apply congrArg (fun mem' => advanceStmt s locals₂ mem')
-                cases hm : s.memory; simp_all
-        }
-      have hm_write :
-          Miri.Interpreter.Step.evalStatement
-            (annealStepHooksLM2_3 body.localDecls body.layouts) () (translateStmt stmt) m =
-          Miri.Interpreter.runRvalue
-            (annealWriteImmediate (.scalar (.fromScalarInt msc)) destPlace) m₁ := by
-        rw [hm_base]
-        apply runRvalue_eq_of_eq
-        rw [EStateM.bind_eq_ok (by
-          rw [EStateM.bind_eq_ok hdown_ok]; dsimp [annealReadImmediate]; exact hread_ok)]
-      have hlaysz_dst :
-          (translateTy dstDecl.ty body.layouts).layout.size = translateSizeBytes sc.sizeBytes := by
-        rw [hdst_ty, hfl_eq]; exact hsz_sc
-      have hbool_dst : dstDecl.ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1) := by
-        rw [hdst_ty, hfty_eq]; exact hbool_sc
-      have hchar_dst : dstDecl.ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true := by
-        rw [hdst_ty, hfty_eq]; exact hchar_sc
-      obtain ⟨hstep_rel, hpres_u, hpres_i⟩ :=
-        write_after_rvalue_simulation_LM2_3
-          (annealStepHooksLM2_3 body.localDecls body.layouts)
-          (topFrame₁ := tf₁) (id0 := topFrame.localsIdentity)
-          hretCont ⟨retLay, hretPlace⟩ halloc hcal hstack hbor hprot hcaller
-          hframes hframe.body_eq hframe.location_eq hbb hstmt
-          hframe₁ hdisj₁ hdst_decl henv_dst himm_dst₁
-          (.scalar sc msc hrel_sc hlaysz_dst hbool_dst hchar_dst)
-          ha_ok hm_write
-      exact ⟨hstep_rel, (fun enumId b hne hu => hpres_u enumId b hne (huninit_m₁ enumId b hu)),
-        (fun j hj => hpres_i j (himm_m₁ j hj))⟩
+        have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
+          unfold evalStmt; rw [hkind]
+          cases isMove <;> {
+            simp only [Bool.false_eq_true, ↓reduceIte, evalRvalue, evalOperand,
+              hslot_s, readProjectedValue, hbeq_v, hget_none]
+          }
+        have hm_err :
+            Miri.Interpreter.Step.evalStatement
+              (annealStepHooksLM2_3 body.localDecls body.layouts) () (translateStmt stmt) m =
+            (m₁, .error (.undefinedBehavior "read of uninitialized memory field")) := by
+          rw [hm_base]; unfold Miri.Interpreter.runRvalue
+          rw [EStateM.bind_eq_error (by
+            rw [EStateM.bind_eq_ok hdown_ok]; dsimp [annealReadImmediate]; exact hread_err)]
+        rw [ha_ub, miri_step_at_statement_error _ hframes hframe.body_eq hframe.location_eq hbb hstmt hm_err]
+        exact ⟨.ub _ _, (fun _ _ _ hu => huninit_m₁ _ _ hu), (fun _ hj => himm_m₁ _ hj)⟩
     · -- Inactive variant (`variantIdx ≠ v_act`): BOTH Anneal and `lean-miri` step to `.ub`!
       obtain ⟨b_u, hb_ge, hb_lt, huninit_src⟩ := hinactive_uninit v_act fieldVals hslot_s hv_eq
       have huninit_src₁ := huninit_m₁ srcIdx b_u huninit_src
@@ -2602,6 +2656,7 @@ theorem evalProjection_downcast_field_initialized_divergence
     (hv_ne : variantIdx ≠ v_act)
     (hv_act : v_act < variants.length)
     (hj : j < (variants[v_act]'hv_act).length)
+    (hj_val : j < fieldVals.length)
     (hf_overlap : ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt) = ((variants[v_act]'hv_act)[j]'hj)) :
     stepMirFn body s = .fail .ub ∧
     ∃ (sc : MirAst.ScalarInt) (m' : AnnealStepState),
@@ -2761,8 +2816,26 @@ theorem evalProjection_downcast_field_initialized_divergence
         hres_src, hop_s1]
       exact hproj_i
     have hprim_fty : IsPrimScalarTy fieldTy := by rw [hfty_eq]; exact hprim_f
-    obtain ⟨sc, msc, hget_fv, hrel_sc, hsz_sc, hbool_sc, hchar_sc, _, _, hread_sc⟩ :=
-      hpayload j hj
+    obtain ⟨sc, msc, hget_fv, hrel_sc, hsz_sc, hbool_sc, hchar_sc, _, _, hread_sc⟩ :
+        let f := (variants[v_act]'hv_act)[j]'hj
+        ∃ sc msc,
+          get? fieldVals j = some (.scalar sc) ∧
+          ScalarRel sc msc ∧
+          f.fieldLayout.size = translateSizeBytes sc.sizeBytes ∧
+          (f.ty.kind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) ∧
+          (f.ty.kind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true) ∧
+          (∀ b, f.offset.bytes.toNat ≤ b →
+            b < f.offset.bytes.toNat + f.fieldLayout.size.bytes.toNat →
+            maskBlocksGetBit words b = true) ∧
+          localAlloc.allocation.initializationMask.isRangeInitialized
+            (Miri.Memory.allocRange f.offset f.fieldLayout.size) = .ok (.ok ()) ∧
+          localAlloc.allocation.readScalar annealTargetDataLayout
+            (Miri.Memory.allocRange f.offset f.fieldLayout.size) false =
+            .ok (.fromScalarInt msc) := by
+      rcases hpayload j hj with hinit | ⟨hget_none, _⟩
+      · exact hinit
+      · unfold get? at hget_none
+        exact absurd (List.getElem?_eq_none_iff.mp hget_none) (by omega)
     have hfl_eq : (translateTy fieldTy body.layouts).layout =
         ((variants[variantIdx]'hv_lt)[fieldIdx]'hf_lt).fieldLayout := by
       rw [hfty_eq]; exact hfl_f.symm
@@ -3111,12 +3184,17 @@ lockstep whenever `_dst` is not `.uninit`:
   index. The step preserves `EnumLocalByteUninit` on every `enumId ≠ dstIdx`
   and on `dstIdx` at every non-tag byte `b ≥ tagBytes`.
 
-`hpayload_compat` requires the target variant's payload descriptors to be a
-prefix of the active variant's (a fieldless target always qualifies). That is
-exactly when Anneal's retained `fieldVals` still describe the bytes at the
-target variant's field offsets. For any other target, the post-step states are
-not `StateRelLM2_3`-related: lean-miri's payload bytes stay where the old
-variant put them, so they need not encode `fieldVals` at the new offsets.
+`hpayload_compat` requires that for each field `i` of the target variant
+`variants[variantIdx]`:
+* either field `i` has the same `StructFieldDesc` as field `i` of the active
+  variant `variants[v_act]` (e.g. a fieldless target variant, a prefix payload
+  `V2 -> V1`, or a shared prefix field of `V1 -> V2`), or
+* `get? fieldVals i = none` and at least one byte in field `i`'s slice is
+  uninitialized (`EnumLocalByteUninit m dstIdx b`), as when `SetDiscriminant`
+  switches from a narrower variant to a wider variant (`V1 -> V2`). In that
+  case, shared prefix fields remain readable via
+  `evalProjection_downcast_field_simulation` while reading the uninitialized
+  trailing field `i` raises UB in lockstep in both Anneal and `lean-miri`.
 
 `hnot_uninit` excludes an `.uninit` `_dst`, where the machines disagree:
 Anneal reports UB, but `writeDiscriminant` forces the local into memory and
@@ -3140,7 +3218,15 @@ theorem step_setDiscriminant_simulation
     (hpayload_compat :
       ∀ v_act (hv_act : v_act < variants.length) fieldVals,
         get? s.frame.locals dstIdx = some (.init (.aggregate v_act fieldVals)) →
-        (variants[variantIdx]'hv_lt) <+: (variants[v_act]'hv_act)) :
+        ∀ i (hi : i < (variants[variantIdx]'hv_lt).length),
+          (∃ (hi_act : i < (variants[v_act]'hv_act).length),
+            (variants[variantIdx]'hv_lt)[i]'hi = (variants[v_act]'hv_act)[i]'hi_act) ∨
+          (get? fieldVals i = none ∧
+            ∃ b,
+              ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat ≤ b ∧
+              b < ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
+                ((variants[variantIdx]'hv_lt)[i]'hi).fieldLayout.size.bytes.toNat ∧
+              EnumLocalByteUninit m dstIdx b)) :
     StepRelLM2_3 body env allocBudget m
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooksLM2_3 body.localDecls body.layouts) () m) ∧
@@ -3266,7 +3352,7 @@ theorem step_setDiscriminant_simulation
       have hpayload' :
           ∀ (i : Nat) (hi : i < (variants[variantIdx]'hv_lt).length),
             let f := (variants[variantIdx]'hv_lt)[i]'hi
-            ∃ sc msc,
+            (∃ sc msc,
               get? fieldVals i = some (.scalar sc) ∧
               ScalarRel sc msc ∧
               f.fieldLayout.size = translateSizeBytes sc.sizeBytes ∧
@@ -3279,69 +3365,99 @@ theorem step_setDiscriminant_simulation
                 (Miri.Memory.allocRange f.offset f.fieldLayout.size) = .ok (.ok ()) ∧
               alloc'.readScalar annealTargetDataLayout
                 (Miri.Memory.allocRange f.offset f.fieldLayout.size) false =
-                .ok (.fromScalarInt msc) := by
+                .ok (.fromScalarInt msc)) ∨
+            (get? fieldVals i = none ∧
+              ∃ b,
+                f.offset.bytes.toNat ≤ b ∧
+                b < f.offset.bytes.toNat + f.fieldLayout.size.bytes.toNat ∧
+                maskBlocksGetBit words' b = false) := by
         have hpre := hpayload_compat v_act hv_act_lt fieldVals hslot_d
-        · intro i hi
-          have hi_act : i < (variants[v_act]'hv_act_lt).length :=
-            Nat.lt_of_lt_of_le hi hpre.length_le
-          have hf_eq : (variants[variantIdx]'hv_lt)[i]'hi =
-              (variants[v_act]'hv_act_lt)[i]'hi_act :=
-            hpre.getElem hi
-          obtain ⟨sc, msc, hfv_i, hrel_i, hsz_i, hbool_i, hchar_i, hbits_i, hinit_i, hread_i⟩ :=
-            hpayload i hi_act
-          obtain ⟨_, _, _, _, _, _, _, _, _, vars, _, _, hvf_all⟩ := hvalid_enum.table_entry
-          have hvf_act := hvf_all v_act hv_act_lt
+        obtain ⟨_, _, _, _, _, _, _, _, _, vars, _, _, hvf_all⟩ := hvalid_enum.table_entry
+        intro i hi
+        rcases hpre i hi with ⟨hi_act, hf_eq⟩ | ⟨hget_none, b_u, hb_ge, hb_lt, huninit_b⟩
+        · have hvf_act := hvf_all v_act hv_act_lt
           have hbnd_i :
               ((variants[v_act]'hv_act_lt)[i]'hi_act).offset.bytes.toNat +
                 ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size.bytes.toNat ≤
                 localAlloc.allocation.byteSize.bytes.toNat := by
             rw [hbs]; exact hvf_act.fields_in_bounds i hi_act
           have hafter_i := hvf_act.fields_after_tag i hi_act
-          have hpos_i :
-              0 < ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size.bytes.toNat := by
-            rw [hsz_i, translateSizeBytes_toNat_eq hrel_i.validBytes]
-            rcases hrel_i.validBytes with h | h | h | h | h <;> omega
-          have hbits_i' :
-              ∀ b, ((variants[v_act]'hv_act_lt)[i]'hi_act).offset.bytes.toNat ≤ b →
-                b < ((variants[v_act]'hv_act_lt)[i]'hi_act).offset.bytes.toNat +
-                  ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size.bytes.toNat →
-                maskBlocksGetBit words' b = true := by
-            intro b hb1 hb2
-            rw [hbits' b (by omega), hbits_i b hb1 hb2, Bool.true_or]
-          have hinit_i' :
-              alloc'.initializationMask.isRangeInitialized
-                (Miri.Memory.allocRange ((variants[v_act]'hv_act_lt)[i]'hi_act).offset
-                  ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size) = .ok (.ok ()) :=
-            initMaskWordRel_isRangeInitialized hmask' hpos_i hbnd_i hbits_i'
-          have hrawA_len :
-              (lm22AllocRaw localAlloc.allocation).size =
+          rcases hpayload i hi_act with
+            ⟨sc, msc, hfv_i, hrel_i, hsz_i, hbool_i, hchar_i, hbits_i, hinit_i, hread_i⟩ |
+            ⟨hget_none, b_u, hb_ge, hb_lt, hbit_false⟩
+          · have hpos_i :
+                0 < ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size.bytes.toNat := by
+              rw [hsz_i, translateSizeBytes_toNat_eq hrel_i.validBytes]
+              rcases hrel_i.validBytes with h | h | h | h | h <;> omega
+            have hbits_i' :
+                ∀ b, ((variants[v_act]'hv_act_lt)[i]'hi_act).offset.bytes.toNat ≤ b →
+                  b < ((variants[v_act]'hv_act_lt)[i]'hi_act).offset.bytes.toNat +
+                    ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size.bytes.toNat →
+                  maskBlocksGetBit words' b = true := by
+              intro b hb1 hb2
+              rw [hbits' b (by omega), hbits_i b hb1 hb2, Bool.true_or]
+            have hinit_i' :
+                alloc'.initializationMask.isRangeInitialized
+                  (Miri.Memory.allocRange ((variants[v_act]'hv_act_lt)[i]'hi_act).offset
+                    ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size) = .ok (.ok ()) :=
+              initMaskWordRel_isRangeInitialized hmask' hpos_i hbnd_i hbits_i'
+            have hrawA_len :
+                (lm22AllocRaw localAlloc.allocation).size =
+                  localAlloc.allocation.byteSize.bytes.toNat := by
+              have : (lm22AllocRaw localAlloc.allocation).size = localAlloc.allocation.len := by
+                cases localAlloc.allocation; rfl
+              rw [this, hlen]
+            have hrawA'_len :
+                (lm22AllocRaw alloc').size = alloc'.byteSize.bytes.toNat := by
+              have : (lm22AllocRaw alloc').size = alloc'.len := by cases alloc'; rfl
+              rw [this, hlen', hbs', hlen]
+            have hread_i' :
+                alloc'.readScalar annealTargetDataLayout
+                  (Miri.Memory.allocRange ((variants[v_act]'hv_act_lt)[i]'hi_act).offset
+                    ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size) false =
+                .ok (.fromScalarInt msc) := by
+              rw [← hread_i]
+              apply alloc_readScalar_congr hrawA_len hrawA'_len hbs' hinit_i hinit_i' hbnd_i
+              have hex := extract_writeBytes_disjoint (lm22AllocRaw localAlloc.allocation)
+                (lm22LeBytes variantIdx (translateSizeBytes tagBytes).bytes.toNat)
+                (lm22LeBytes_size _ _)
+                (by rw [Nat.zero_add, hrawA_len, hbs, htb_nat]; exact hvalid_enum.size_ge_tag)
+                (by rw [hrawA_len]; exact hbnd_i)
+                (Or.inr (by rw [Nat.zero_add, htb_nat]; exact hafter_i))
+              rw [Nat.zero_add] at hex
+              rw [hraw']
+              exact hex
+            dsimp only
+            rw [hf_eq]
+            exact Or.inl ⟨sc, msc, hfv_i, hrel_i, hsz_i, hbool_i, hchar_i, hbits_i', hinit_i', hread_i'⟩
+          · have hb_sz : b_u < localAlloc.allocation.byteSize.bytes.toNat := by omega
+            have hnot_lt_tb : decide (b_u < tagBytes) = false := decide_eq_false (by omega)
+            have hbit_false' : maskBlocksGetBit words' b_u = false := by
+              rw [hbits' b_u hb_sz, hbit_false, hnot_lt_tb]; rfl
+            dsimp only
+            rw [hf_eq]
+            exact Or.inr ⟨hget_none, b_u, hb_ge, hb_lt, hbit_false'⟩
+        · have hvf_tgt := hvf_all variantIdx hv_lt
+          have hbnd_tgt :
+              ((variants[variantIdx]'hv_lt)[i]'hi).offset.bytes.toNat +
+                ((variants[variantIdx]'hv_lt)[i]'hi).fieldLayout.size.bytes.toNat ≤
                 localAlloc.allocation.byteSize.bytes.toNat := by
-            have : (lm22AllocRaw localAlloc.allocation).size = localAlloc.allocation.len := by
-              cases localAlloc.allocation; rfl
-            rw [this, hlen]
-          have hrawA'_len :
-              (lm22AllocRaw alloc').size = alloc'.byteSize.bytes.toNat := by
-            have : (lm22AllocRaw alloc').size = alloc'.len := by cases alloc'; rfl
-            rw [this, hlen', hbs', hlen]
-          have hread_i' :
-              alloc'.readScalar annealTargetDataLayout
-                (Miri.Memory.allocRange ((variants[v_act]'hv_act_lt)[i]'hi_act).offset
-                  ((variants[v_act]'hv_act_lt)[i]'hi_act).fieldLayout.size) false =
-              .ok (.fromScalarInt msc) := by
-            rw [← hread_i]
-            apply alloc_readScalar_congr hrawA_len hrawA'_len hbs' hinit_i hinit_i' hbnd_i
-            have hex := extract_writeBytes_disjoint (lm22AllocRaw localAlloc.allocation)
-              (lm22LeBytes variantIdx (translateSizeBytes tagBytes).bytes.toNat)
-              (lm22LeBytes_size _ _)
-              (by rw [Nat.zero_add, hrawA_len, hbs, htb_nat]; exact hvalid_enum.size_ge_tag)
-              (by rw [hrawA_len]; exact hbnd_i)
-              (Or.inr (by rw [Nat.zero_add, htb_nat]; exact hafter_i))
-            rw [Nat.zero_add] at hex
-            rw [hraw']
-            exact hex
-          dsimp only
-          rw [hf_eq]
-          exact ⟨sc, msc, hfv_i, hrel_i, hsz_i, hbool_i, hchar_i, hbits_i', hinit_i', hread_i'⟩
+            rw [hbs]; exact hvf_tgt.fields_in_bounds i hi
+          have hafter_tgt := hvf_tgt.fields_after_tag i hi
+          have hu₀ : EnumLocalByteUninit m₀ dstIdx b_u :=
+            EnumLocalByteUninit.of_cache_layout hframes huninit_b
+          have hmls_d0 :
+              tf₀.locals[dstIdx]? =
+                some ⟨.live (.indirect mp), some (translateTy dstDecl.ty body.layouts)⟩ := by
+            rw [Array.getElem?_eq_getElem hlt_d0, hind₀]
+          have hold_false := hu₀ tf₀ mp _ allocId borTag localAlloc rfl hmls_d0 hprov hlive.1
+          have hb_sz : b_u < localAlloc.allocation.byteSize.bytes.toNat := by omega
+          rw [initMaskWordRel_get hmask hb_sz] at hold_false
+          injection hold_false with hbit_old
+          have hnot_lt_tb : decide (b_u < tagBytes) = false := decide_eq_false (by omega)
+          have hbit_false' : maskBlocksGetBit words' b_u = false := by
+            rw [hbits' b_u hb_sz, hbit_old, hnot_lt_tb]; rfl
+          exact Or.inr ⟨hget_none, b_u, hb_ge, hb_lt, hbit_false'⟩
       have hmem_new :
           EnumMemRel mach' dstDecl.ty body.layouts tagBytes variants variantIdx fieldVals mp :=
         .mk allocId borTag baseAddr ⟨localAlloc.kind, alloc'⟩ words' mscTag'
@@ -4900,7 +5016,7 @@ private theorem finish_aggregate_enum_from_indirect
               (Or.inr (by rw [Nat.zero_add, htb_nat]; exact hafter_i))
             rw [Nat.zero_add] at hex
             exact hex
-        exact ⟨sc_i, msc_i, hget_i, hrel_i, hsz_i, hbool_i, hchar_i,
+        exact Or.inl ⟨sc_i, msc_i, hget_i, hrel_i, hsz_i, hbool_i, hchar_i,
           hbits_i, hinit'_i, hread'_i⟩
     have hfr_final_ex : FrameRelLM2_3Except body env dstIdx m_final.machine s.frame tf_end :=
       hfr_end.of_updateAlloc_excl hdisj_end hdst_end hprov hu_lt hu_eq

@@ -716,9 +716,14 @@ offset `0`:
 * Tag slice `[0, tagBytes)` is initialized (`maskBlocksGetBit words b = true`
   and `isRangeInitialized = .ok (.ok ())`) and `readScalar` returns the tag
   scalar `msc_tag` (`ScalarRel ⟨v_act, tagBytes⟩ msc_tag`).
-* For each payload field `i < (variants[v_act]).length`, `get? fieldVals i =
-  some (.scalar sc_i)` and the field slice `[f_i.offset, f_i.offset + f_i.size)`
-  is initialized and reads back `msc_i` (`ScalarRel sc_i msc_i`). -/
+* For each payload field `i < (variants[v_act]).length`, either:
+  - `get? fieldVals i = some (.scalar sc_i)` and the field slice
+    `[f_i.offset, f_i.offset + f_i.size)` is initialized and reads back
+    `msc_i` (`ScalarRel sc_i msc_i`), or
+  - `get? fieldVals i = none` (e.g. a trailing field after `SetDiscriminant`
+    switches from a narrower variant to a wider variant) and at least one byte
+    in `[f_i.offset, f_i.offset + f_i.size)` is uninitialized in `words`, so
+    reading field `i` of `v_act` raises UB in both Anneal and `lean-miri`. -/
 inductive EnumMemRel
     (mach : AnnealMachine)
     (ty : Ty)
@@ -772,7 +777,7 @@ inductive EnumMemRel
       (payload_rel :
         ∀ (i : Nat) (hi : i < (variants[v_act]'active_lt).length),
           let f := (variants[v_act]'active_lt)[i]'hi
-          ∃ sc msc,
+          (∃ sc msc,
             get? fieldVals i = some (.scalar sc) ∧
             ScalarRel sc msc ∧
             f.fieldLayout.size = translateSizeBytes sc.sizeBytes ∧
@@ -785,7 +790,12 @@ inductive EnumMemRel
               (Miri.Memory.allocRange f.offset f.fieldLayout.size) = .ok (.ok ()) ∧
             localAlloc.allocation.readScalar annealTargetDataLayout
               (Miri.Memory.allocRange f.offset f.fieldLayout.size) false =
-              .ok (.fromScalarInt msc)) :
+              .ok (.fromScalarInt msc)) ∨
+          (get? fieldVals i = none ∧
+            ∃ b,
+              f.offset.bytes.toNat ≤ b ∧
+              b < f.offset.bytes.toNat + f.fieldLayout.size.bytes.toNat ∧
+              maskBlocksGetBit words b = false)) :
       EnumMemRel mach ty layouts tagBytes variants v_act fieldVals mp
 
 /-- Memory-place correspondence for an **uninitialized** indirect enum local
