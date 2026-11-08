@@ -635,10 +635,10 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
       evalOperand, evalConstValue]
   · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
       isThinRawPtrTy, emptyMemory, lookupBorrow, lookupFnPtr, hNotIntrinsic]
-  · simp [evalRvalue, evalOperand, get?, readProjectedValue]
-  · simp [evalRvalue, evalOperand, get?, readProjectedValue,
+  · simp [evalRvalue, evalCastPtrToPtr, layoutPointerBytes, evalOperand, get?, readProjectedValue]
+  · simp [evalRvalue, evalPointerExposeProvenance, layoutPointerBytes, evalOperand, get?, readProjectedValue,
       ptrAddress?, emptyMemory, lookupBorrow, recordExposedAllocId,
-      isExposedAllocId, fnPtrAllocBase, intCastTargetBytes] <;> decide
+      isExposedAllocId, fnPtrAllocBase] <;> decide
   · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
       isThinRawPtrTy, emptyMemory, lookupBorrow, isFnPtrAllocId, fnPtrAllocBase]
 

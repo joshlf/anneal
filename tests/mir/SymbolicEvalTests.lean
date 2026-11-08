@@ -1256,31 +1256,48 @@ private theorem evalRvalue_aggregate_rawPtr
     (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.aggregate (.rawPtr elemTy mutability) ops) mem localDecls layouts =
+      let ptrBytes := layoutPointerBytes layouts
       match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
-      | .ok (.ptr ptrVal _ :: .unit :: .nil) locals' =>
-        .ok (.ptr ptrVal 8) locals' mem
-      | .ok (.ptr ptrVal _ :: .aggregate 0 .nil :: .nil) locals' =>
-        .ok (.ptr ptrVal 8) locals' mem
+      | .ok (.ptr ptrVal ptrSz :: .unit :: .nil) locals' =>
+        match isUnsizedRawPtrPointee elemTy, Nat.beq ptrSz ptrBytes with
+        | false, true => .ok (.ptr ptrVal ptrBytes) locals' mem
+        | _, _ => .ub
+      | .ok (.ptr ptrVal ptrSz :: .aggregate 0 .nil :: .nil) locals' =>
+        match isUnsizedRawPtrPointee elemTy, Nat.beq ptrSz ptrBytes with
+        | false, true => .ok (.ptr ptrVal ptrBytes) locals' mem
+        | _, _ => .ub
       | .ok (.scalar addrSc :: .unit :: .nil) locals' =>
-        match Nat.beq addrSc.sizeBytes 8 with
-        | true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus 8), 8⟩) locals' mem
-        | false => .ub
+        match isUnsizedRawPtrPointee elemTy, Nat.beq addrSc.sizeBytes ptrBytes with
+        | false, true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+        | _, _ => .ub
       | .ok (.scalar addrSc :: .aggregate 0 .nil :: .nil) locals' =>
-        match Nat.beq addrSc.sizeBytes 8 with
-        | true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus 8), 8⟩) locals' mem
-        | false => .ub
-      | .ok (.ptr ptrVal _ :: .scalar metaSc :: .nil) locals' =>
-        .ok (.aggregate 0 (.ptr ptrVal 8 :: .scalar ⟨metaSc.bits, 8⟩ :: .nil)) locals' mem
+        match isUnsizedRawPtrPointee elemTy, Nat.beq addrSc.sizeBytes ptrBytes with
+        | false, true => .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
+        | _, _ => .ub
+      | .ok (.ptr ptrVal ptrSz :: .scalar metaSc :: .nil) locals' =>
+        match wideAggregatePointeeIsDyn? elemTy with
+        | .some true => .unsupported
+        | .none => .ub
+        | .some false =>
+          match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
+          | true =>
+            .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .scalar ⟨metaSc.bits, ptrBytes⟩ :: .nil))
+              locals' mem
+          | false => .ub
       | .ok (.scalar addrSc :: .scalar metaSc :: .nil) locals' =>
-        match Bool.and (Nat.beq addrSc.sizeBytes 8) (Nat.beq metaSc.sizeBytes 8) with
-        | true =>
-          let modPtr := scalarModulus 8
-          .ok
-            (.aggregate 0
-              (.scalar ⟨wrapScalarBits addrSc.bits modPtr, 8⟩ ::
-                .scalar ⟨wrapScalarBits metaSc.bits modPtr, 8⟩ :: .nil))
-            locals' mem
-        | false => .ub
+        match wideAggregatePointeeIsDyn? elemTy with
+        | .some true => .unsupported
+        | .none => .ub
+        | .some false =>
+          match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
+          | true =>
+            let modPtr := scalarModulus ptrBytes
+            .ok
+              (.aggregate 0
+                (.scalar ⟨wrapScalarBits addrSc.bits modPtr, ptrBytes⟩ ::
+                  .scalar ⟨wrapScalarBits metaSc.bits modPtr, ptrBytes⟩ :: .nil))
+              locals' mem
+          | false => .ub
       | .ok _ _ => .unsupported
       | .ub => .ub
       | .unsupported => .unsupported := rfl
@@ -1348,72 +1365,65 @@ private theorem evalRvalue_cast_ptrToPtr
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
+      let ptrBytes := layoutPointerBytes layouts
       match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | .ok (.ptr ptrVal sz) locals' =>
-        match targetTy.kind with
-        | .rawPtr _ (.slice _) => .ub
-        | .rawPtr _ .str => .ub
-        | .rawPtr _ (.dynamic _) => .ub
-        | .rawPtr _ dstElem =>
-          let arrayCastLenOpt : Option Nat :=
-            match operandTy localDecls layouts op with
-            | .some { kind := .rawPtr _ (.array srcElem arrLen), .. } =>
-              match rigidTyEq srcElem dstElem with
-              | true => .some arrLen
-              | false => .none
-            | .some { kind := .ref _ (.array srcElem arrLen), .. } =>
-              match rigidTyEq srcElem dstElem with
-              | true => .some arrLen
-              | false => .none
-            | _ => .none
-          match arrayCastLenOpt, lookupBorrow mem.borrows ptrVal.tag with
-          | .some arrLen, .some parentEntry =>
-            match Nat.beq sz 8 with
-            | true => deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some arrLen)
-            | false => .ub
-          | _, _ => .ok (.ptr ptrVal sz) locals' mem
-        | _ => .ok (.ptr ptrVal sz) locals' mem
+        match Nat.beq sz ptrBytes with
+        | false => .ub
+        | true =>
+          match thinRawPtrPointee? targetTy with
+          | .none => .ub
+          | .some dstElem =>
+            match arrayPtrOrRefElemLen? (operandTy localDecls layouts op) dstElem, lookupBorrow mem.borrows ptrVal.tag with
+            | .some arrLen, .some parentEntry =>
+              deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some arrLen) ptrBytes
+            | _, _ => .ok (.ptr ptrVal ptrBytes) locals' mem
       | .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' =>
-        match Bool.and (Nat.beq sz 8) (Nat.beq metaSc.sizeBytes 8) with
+        match Bool.and (Nat.beq sz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
         | false => .ub
         | true =>
           match isThinRawPtrTy targetTy with
           | true =>
             match lookupBorrow mem.borrows ptrVal.tag with
             | .some parentEntry =>
-              deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some metaSc.bits)
-            | .none => .ok (.ptr ptrVal sz) locals' mem
+              deriveStackElemThinPtr locals' mem ptrVal parentEntry (.some metaSc.bits) ptrBytes
+            | .none => .ok (.ptr ptrVal ptrBytes) locals' mem
           | false =>
-            match targetTy.kind with
-            | .rawPtr _ _ =>
-              .ok (.aggregate 0 (.ptr ptrVal sz :: .scalar metaSc :: .nil)) locals' mem
-            | _ => .ub
+            match wideRawPtrIsDyn? targetTy with
+            | .some false =>
+              .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .scalar metaSc :: .nil)) locals' mem
+            | .some true =>
+              match isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) with
+              | true => .ub
+              | false => .ok (.aggregate 0 (.ptr ptrVal ptrBytes :: .scalar metaSc :: .nil)) locals' mem
+            | .none => .ub
       | .ok (.scalar sc) locals' =>
-        let ptrBytes := layoutPointerBytes layouts
         match Nat.beq sc.sizeBytes ptrBytes with
         | false => .ub
         | true =>
-          match targetTy.kind with
-          | .rawPtr _ (.slice _) => .ub
-          | .rawPtr _ .str => .ub
-          | .rawPtr _ (.dynamic _) => .ub
-          | .rawPtr _ _ =>
+          match isThinRawPtrTy targetTy with
+          | true =>
             .ok (.scalar ⟨wrapScalarBits sc.bits (scalarModulus ptrBytes), ptrBytes⟩) locals' mem
-          | _ => .ub
+          | false => .ub
       | .ok (.aggregate 0 (.scalar addrSc :: .scalar metaSc :: .nil)) locals' =>
-        match Bool.and (Nat.beq addrSc.sizeBytes 8) (Nat.beq metaSc.sizeBytes 8) with
+        match Bool.and (Nat.beq addrSc.sizeBytes ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
         | false => .ub
         | true =>
-          let modPtr := scalarModulus 8
+          let modPtr := scalarModulus ptrBytes
           let addrBits := wrapScalarBits addrSc.bits modPtr
           let metaBits := wrapScalarBits metaSc.bits modPtr
           match isThinRawPtrTy targetTy with
-          | true => .ok (.scalar ⟨addrBits, 8⟩) locals' mem
+          | true => .ok (.scalar ⟨addrBits, ptrBytes⟩) locals' mem
           | false =>
-            match targetTy.kind with
-            | .rawPtr _ _ =>
-              .ok (.aggregate 0 (.scalar ⟨addrBits, 8⟩ :: .scalar ⟨metaBits, 8⟩ :: .nil)) locals' mem
-            | _ => .ub
+            match wideRawPtrIsDyn? targetTy with
+            | .some false =>
+              .ok (.aggregate 0 (.scalar ⟨addrBits, ptrBytes⟩ :: .scalar ⟨metaBits, ptrBytes⟩ :: .nil)) locals' mem
+            | .some true =>
+              match isSliceOrStrPtrOrRefTy (operandTy localDecls layouts op) with
+              | true => .ub
+              | false =>
+                .ok (.aggregate 0 (.scalar ⟨addrBits, ptrBytes⟩ :: .scalar ⟨metaBits, ptrBytes⟩ :: .nil)) locals' mem
+            | .none => .ub
       | .ok _ _ => .unsupported
       | .ub => .ub
       | .unsupported => .unsupported := rfl
@@ -1466,6 +1476,8 @@ theorem sliceLenAsPtrFromRawParts_verified :
     evalRvalueSymTree, evalRvalueWithMemory,
     evalRvalue_aggregate_tuple, evalRvalue_aggregate_rawPtr,
     evalRvalue_unaryOp_ptrMetadata, evalRvalue_cast_ptrToPtr, isThinRawPtrTy,
+    isUnsizedRawPtrPointee, wideAggregatePointeeIsDyn?,
+    thinRawPtrPointee?, wideRawPtrIsDyn?, isSliceOrStrPtrOrRefTy, arrayPtrOrRefElemLen?,
     evalOperand, evalOperands_nil, evalOperands_cons, evalConstValue, layoutPointerBytes, LayoutTable.lookup,
     lookup_len_1, lookup_as_ptr_1, lookup_from_raw_1,
     evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf,
@@ -1620,6 +1632,8 @@ theorem sliceHelperPipeline_verified :
       evalRvalueSymTree, evalRvalueWithMemory,
       evalRvalue_aggregate_tuple, evalRvalue_aggregate_rawPtr,
       evalRvalue_unaryOp_ptrMetadata, evalRvalue_cast_ptrToPtr, isThinRawPtrTy,
+    isUnsizedRawPtrPointee, wideAggregatePointeeIsDyn?,
+    thinRawPtrPointee?, wideRawPtrIsDyn?, isSliceOrStrPtrOrRefTy, arrayPtrOrRefElemLen?,
       evalPtrOffsetBinOpSymTree, evalBinOpOffsetSymTree, finishBinOpOffsetSymTree,
       pointeeElemByteStride, ptrAllocByteBound?, pointeeTyOf, elemTyOf, rigidTyKindByteSize, intCastTargetBytes,
       rigidTyByteSize, UintTy.byteWidth, IntTy.byteWidth, FloatTy.byteWidth, lookupGlobalAlloc,
