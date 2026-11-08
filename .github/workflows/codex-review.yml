@@ -1,0 +1,105 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+name: Codex review gate
+
+'on':
+  # workflow_run executes on the default branch even when the notification
+  # originated from a PR or merge-group ref. The notification is only a wakeup;
+  # no artifacts or commands from that run are consumed here.
+  workflow_run:
+    workflows: [Codex review events]
+    types: [requested, completed]
+  issue_comment:
+    types: [created, edited, deleted]
+  # Reconcile existing PRs when the adapter itself lands or changes on main.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  record-deletion:
+    # Do not put workflow-level concurrency above these jobs. Every deletion
+    # must reach durable storage before GitHub can coalesce evaluator jobs.
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.action == 'deleted' &&
+      github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Configure this environment to admit only the main branch, before storing
+    # the App key. PR workflows cannot retrieve it by naming the environment.
+    environment: codex-review-publisher
+    env:
+      ACTIONS_CACHE_URL: ''
+      ACTIONS_RESULTS_URL: ''
+      ACTIONS_RUNTIME_TOKEN: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: app-token
+        with:
+          client-id: ${{ vars.CODEX_REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CODEX_REVIEW_APP_PRIVATE_KEY }}
+          permission-statuses: write
+      - name: Preserve a deleted summary's identity
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CODEX_REVIEW_PUBLISHER_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: python3 -I -B ci/codex_review.py --record-deletion
+
+  reconcile:
+    needs: [record-deletion]
+    if: >-
+      always() && !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      (needs.record-deletion.result == 'success' ||
+       needs.record-deletion.result == 'skipped') &&
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request)
+    # The output is shared by commits, including commits used in several PRs.
+    # Serialize all evaluations. Each retained run reads every open PR and live
+    # queue entry, so coalescing a pending evaluator does not lose its work.
+    concurrency:
+      group: codex-review-gate
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: codex-review-publisher
+    env:
+      ACTIONS_CACHE_URL: ''
+      ACTIONS_RESULTS_URL: ''
+      ACTIONS_RUNTIME_TOKEN: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This branch is the policy owner. Event refs and dispatch refs must
+          # not select the executable code that receives the status token.
+          ref: refs/heads/main
+          persist-credentials: false
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: app-token
+        with:
+          client-id: ${{ vars.CODEX_REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CODEX_REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-statuses: write
+      - name: Publish the current Code Review verdicts
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CODEX_REVIEW_PUBLISHER_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
+        # Isolated Python ignores user site packages and PYTHONPATH. PR text is
+        # read through the API as data; it never becomes a command or a path.
+        run: python3 -I -B ci/codex_review.py --publish

@@ -1,0 +1,27 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Licensed under a BSD-style license <LICENSE-BSD>, Apache License, Version 2.0
+# <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, or the MIT
+# license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your option.
+# This file may not be copied, modified, or distributed except according to
+# those terms.
+
+name: Codex review events
+
+'on':
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, closed, ready_for_review,
+            converted_to_draft]
+  merge_group:
+    types: [checks_requested]
+
+# This workflow only creates a workflow_run notification on the default branch.
+# It has no checkout, environment, secrets, or write permissions. The publisher
+# independently reads live GitHub state; this run supplies no approval evidence.
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'true'
