@@ -602,4 +602,41 @@ theorem int2ptrAfterStorageDeadTwoExposed_three_way :
   ⟨by decide +kernel, faultsA_sound int2ptrAfterStorageDeadTwoExposed 40 _ (by decide),
     by decide +kernel, by decide +kernel⟩
 
+/-! ## 5. `inFragmentWithIntrinsics` vs. `singleExposeSiteOk` on `Mach` vs. `MachTB` (Pass A2) -/
+
+theorem int2ptrRawRoundTripOk_singleExposeSiteOk :
+    singleExposeSiteOk int2ptrRawRoundTripOk = true := by decide +kernel
+
+theorem exposeSingleRefMutRoundTrip_singleExposeSiteOk :
+    singleExposeSiteOk exposeSingleRefMutRoundTrip = true := by decide +kernel
+
+theorem exposeTwoRefMutAngelicUnsupported_singleExposeSiteOk_false :
+    singleExposeSiteOk exposeTwoRefMutAngelicUnsupported = false := by decide +kernel
+
+/-- **Three-way `Mach` vs. `MachTB` multi-tag theorem inside `inFragmentWithIntrinsics`.**
+`exposeTwoRefMutAngelicUnsupported` satisfies `inFragmentWithIntrinsics = true`
+(because creating the second `&mut _1` disables the first, and only the second
+exposed address `_7` is passed to `with_exposed_provenance`), and both Anneal
+and `Mach` (`BasicMemory`, which deduplicates `(AllocId(1), ())` into a singleton
+`exposed` set) return `88`, whereas `MachTB` (`TreeBorrowsMemory`) records two
+distinct exposed `TreeBorrowsProvenance` tags `(AllocId(1), [0])` and
+`(AllocId(1), [1])` at the same address and stops with `Stop.unsupported`
+(`singleExposeSiteOk = false`). -/
+theorem exposeTwoRefMutAngelicUnsupported_three_way :
+    inFragmentWithIntrinsics exposeTwoRefMutAngelicUnsupported = true ∧
+    singleExposeSiteOk exposeTwoRefMutAngelicUnsupported = false ∧
+    (∃ mem, ReachesRet (mirTree exposeTwoRefMutAngelicUnsupported
+      (initMachineState exposeTwoRefMutAngelicUnsupported [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨88, 4⟩, mem))) ∧
+    retAfterIntr exposeTwoRefMutAngelicUnsupported [.scalar ⟨5, 4⟩] 18 =
+      some (some { retAlloc with data := scalarBytes u32 88 }, [1]) ∧
+    stopAfterIntrTB exposeTwoRefMutAngelicUnsupported [.scalar ⟨5, 4⟩] 15 =
+      some (.unsupported
+        "int2ptr: several exposed allocations meet at the address (angelic choice)") :=
+  ⟨exposeTwoRefMutAngelicUnsupported_inFragmentWithIntrinsics,
+   exposeTwoRefMutAngelicUnsupported_singleExposeSiteOk_false,
+   exposeTwoRefMutAngelicUnsupported_anneal_ret,
+   exposeTwoRefMutAngelicUnsupported_minirust_direct,
+   exposeTwoRefMutAngelicUnsupported_tb_direct⟩
+
 end MiniRustSpec.Correspondence.ProvenanceWitness

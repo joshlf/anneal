@@ -3785,6 +3785,22 @@ theorem provCastAliasView_of_not_hasProvCast {body : MirAst.CapturedMir}
     (h : hasProvCast body = false) : provCastAliasView body = body := by
   simp [provCastAliasView, h]
 
+/-- Number of `PointerExposeProvenance` statements across all blocks of `body`. -/
+def countExposeStmts (body : MirAst.CapturedMir) : Nat :=
+  (exposedIntLocals body).length
+
+/-- Sufficient syntactic condition guaranteeing at most one `PointerExposeProvenance`
+site in `body` (so loop-free bodies in `TreeBorrowsMemory` cannot accumulate two
+distinct exposed `TreeBorrowsProvenance` tags `(AllocId, path)` on the same
+allocation, avoiding `MachTB`'s `Stop.unsupported` multi-tag angelic ambiguity
+on `exposeTwoRefMutAngelicUnsupported`). -/
+def singleExposeSiteOk (body : MirAst.CapturedMir) : Bool :=
+  !hasProvCast body || decide (countExposeStmts body ≤ 1)
+
+theorem singleExposeSiteOk_of_not_hasProvCast {body : MirAst.CapturedMir}
+    (h : hasProvCast body = false) : singleExposeSiteOk body = true := by
+  simp [singleExposeSiteOk, h]
+
 /-- `inFragment` embeds into `inFragmentWithIntrinsics`. -/
 theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
     (h : inFragment body = true) :

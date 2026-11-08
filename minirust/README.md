@@ -1147,14 +1147,27 @@ These are deliberate and are the first things to lift:
     `TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
     `treeBorrowsWeakBoxDeallocAndDeadRelease` vs.
     `TreeBorrowsMemory.end_call_wfLive`).
-* **Provenance casts have no simulation theorem yet.** `inFragmentWithIntrinsics`
-  bodies are not covered by `step_correspondence_N`: Anneal stores
-  `tag * 65536 + offsetBytes` in an exposed-address local where MiniRust stores
-  the address, so `LocalStorage` needs a pointer-like relation for those locals
-  (`ctxWithBorrows`' `ptrTargets` already maps each tag to its MiniRust address),
-  and `BorrowsOk.target_ptrs`, `StateRelNProv.exposed_target_localPtr` (which
-  assume `inFragment`, and so bodies without any provenance cast,
-  `inFragment_not_hasProvCast`) must be restated for the extended fragment.
+* **Provenance cast step correspondence (`ExposedLocalRel`, `StateRelN.expose_step_correspondence`, `StateRelN.withExposed_step_correspondence`) vs. multi-block CFGs.**
+  `Correspondence/Relation.lean` (`ExposedLocalRel`), `Correspondence/PointerStep.lean`
+  (`evalTerminator_intrinsic_expose_ok`, `evalTerminator_intrinsic_withExposed_ok`,
+  `evalTerminatorM_intrinsic_*`), and `Correspondence/Simulation.lean`
+  (`StateRelNProv.exposed_target_localPtr`, `StateRelN.expose_step_correspondence`,
+  `StateRelN.withExposed_step_correspondence`) relate Anneal's
+  `pv.allocId * 65536 + pv.offsetBytes` encoding in an exposed-address `usize`
+  local to MiniRust's `tAddr` and `m.intptrcast.exposed` without assuming
+  `inFragment` (`inFragment_not_hasProvCast`). Furthermore,
+  `Correspondence/Provenance.lean` proves arbitrary-offset singleton optimality
+  for `BasicMemory` (`int2ptr_singleton_offset_checkPtr_optimal`) alongside a
+  `TreeBorrowsMemory` counterexample to singleton `Some(p)` dominance on
+  negative-offset zero-sized reborrows
+  (`int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok`), and
+  `Correspondence/Translate.lean` / `Correspondence/ProvenanceWitness.lean`
+  characterize `singleExposeSiteOk` vs. `exposeTwoRefMutAngelicUnsupported_three_way`
+  (where `BasicMemory` deduplicates `(AllocId(1), ())` and returns `88` in
+  lockstep with Anneal while `TreeBorrowsMemory` records two distinct tags
+  `(AllocId(1), [0])` and `(AllocId(1), [1])` and stops with `Stop.unsupported`).
+  End-to-end whole-CFG induction over `splitBlockAtIntrinsics`'s block-numbered
+  continuations remains separate from single-block `step_correspondence_N`.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

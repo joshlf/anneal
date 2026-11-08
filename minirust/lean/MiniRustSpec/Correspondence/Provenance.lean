@@ -622,4 +622,69 @@ theorem int2ptrProvenanceM_tb_two_tags_unsupported {m : MachTB} {addr : Int}
       have h2 := int2ptrProvenanceM_unique (M := TBM) exposedInBoundsSound_TBM h hq
       exact hne (h1.trans h2.symm)
 
+/-- **Singleton arbitrary-offset angelic optimality.** When `m.intptrcast.exposed`
+is a singleton `[p0]`, `IntPtrCast.int2ptr` is optimal not only at the cast
+address `addr` (`offset = 0`), but across **every** arbitrary byte offset
+`off : Int` (e.g., struct field projection `(*ptr).field` or `wrapping_offset`
+bringing an out-of-bounds integer address back into allocation `p0`): if *some*
+admissible provenance `q` makes `BasicMemory::check_ptr` succeed at `addr + off`
+for `len` bytes, then the pointer `ptr` predicted by `IntPtrCast.int2ptr m addr`
+succeeds at `ptr.addr + off` as well. -/
+theorem int2ptr_singleton_offset_checkPtr_optimal {m : Mach} {addr off : Int}
+    {p0 : Prov} {ptr : Ptr} {len : Size}
+    (hsing : m.intptrcast.exposed.elems = [p0])
+    (hint : IntPtrCast.int2ptr m addr = .ok ptr) {q : Option Prov}
+    (hq : Int2ptrAdmissible m.intptrcast.exposed q)
+    {r : Option (AllocId × Unit × Size)}
+    (hok : BM.check_ptr m.mem.memory { addr := addr + off, provenance := q } len = .ok r) :
+    ∃ r', BM.check_ptr m.mem.memory { addr := ptr.addr + off, provenance := ptr.provenance } len = .ok r' := by
+  have hptr : ptr = { addr := addr, provenance := some p0 } := by
+    simp [IntPtrCast.int2ptr, int2ptrProvenance, hsing, bind, Except.bind, pure, Except.pure] at hint
+    exact hint.symm
+  subst hptr
+  by_cases hlen : len.bytes = 0
+  · exact ⟨none, by simp [BM.check_ptr, hlen, pure, Except.pure]⟩
+  · cases q with
+    | none =>
+      obtain ⟨e, he⟩ := checkPtr_none_error (mem := m.mem.memory) (addr := addr + off) hlen
+      rw [he] at hok
+      cases hok
+    | some qp =>
+      have hexp : setContains m.intptrcast.exposed qp = true := hq
+      have hqp : qp = p0 := setContains_of_elems_eq_singleton hsing hexp
+      subst hqp
+      exact ⟨r, hok⟩
+
+/-- **Tree Borrows singleton counterexample at negative offset on ZST reborrow.**
+Unlike `BasicMemory` (where `int2ptr_singleton_offset_checkPtr_optimal` holds for
+every continuation), in `TreeBorrowsMemory` (`MachTB`) when `exposed` is a
+singleton `[p0]` (`p0 = (AllocId(0), parentPath)`) and `addr < a.addr` (strictly
+before allocation `0`'s start address), `IntPtrCast.int2ptrM` commits to
+`some p0`, which causes a zero-sized `TreeBorrowsMemory.reborrow` (`settings.inside = []`)
+at `addr` to fail with `Stop.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()"`,
+whereas the admissible `predict` choice `provenance = none` (`Int2ptrAdmissible`)
+takes the `ptr.provenance = none` branch and succeeds! -/
+theorem int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok {m : MachTB} {addr : Int}
+    {parentPath : Gen.Path} {a}
+    {settings : Gen.ReborrowSettings} {fe : Gen.TreeBorrowsFrameExtra}
+    (hsing : m.intptrcast.exposed.elems = [(⟨0⟩, parentPath)])
+    (ha0 : m.mem.memory.mem.allocations[0]? = some a)
+    (hneg : addr < a.addr)
+    (hzst : settings.inside = []) :
+    IntPtrCast.int2ptrM m addr = .ok { addr := addr, provenance := some (⟨0⟩, parentPath) } ∧
+    Int2ptrAdmissible m.intptrcast.exposed (none : Option TreeBorrowsProvenance) ∧
+    TreeBorrowsMemory.reborrow m.mem.memory
+        { addr := addr, provenance := some (⟨0⟩, parentPath) } settings fe =
+      .error (.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()") ∧
+    TreeBorrowsMemory.reborrow m.mem.memory
+        { addr := addr, provenance := none } settings fe =
+      .ok ({ addr := addr, provenance := none }, m.mem.memory, fe) := by
+  refine ⟨by simp [IntPtrCast.int2ptrM, int2ptrProvenanceM, hsing, bind, Except.bind, pure, Except.pure],
+    trivial, ?_, ?_⟩
+  · have hnot_le : ¬ (a.addr ≤ addr) := by dsimp only [Address] at hneg ⊢; omega
+    simp [TreeBorrowsMemory.reborrow, BasicMemory.check_ptr, hzst,
+      listMutateAt, listIndex, ha0, Size.from_bytes, hnot_le, specPanic,
+      bind, Except.bind, pure, Except.pure]
+  · simp [TreeBorrowsMemory.reborrow, BasicMemory.check_ptr, hzst, bind, Except.bind, pure, Except.pure]
+
 end MiniRustSpec.Correspondence

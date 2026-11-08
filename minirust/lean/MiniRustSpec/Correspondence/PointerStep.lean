@@ -3530,4 +3530,119 @@ theorem expose_withExposed_roundtrip (pv : ProvenancePtr) (hoff : pv.offsetBytes
     (allocId * 65536 + offsetBytes) % 65536 = offsetBytes
   exact ⟨by omega, by omega⟩
 
+/-! ## `evalTerminator` / `evalTerminatorM` step lemmas for `Terminator::Intrinsic` (MR-3.3 Pass A2) -/
+
+@[simp] theorem evalArgs_singleton (m : Mach) (e : Gen.ValueExpr) :
+    evalArgs m [e] =
+      (do
+        let (arg, m1) ← evalValue m e
+        pure ([arg], m1)) := by
+  simp [evalArgs, bind, Except.bind, pure, Except.pure]
+
+@[simp] theorem evalArgsM_singleton {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (e : Gen.ValueExpr) :
+    evalArgsM m [e] =
+      (do
+        let (arg, m1) ← evalValueM m e
+        pure ([arg], m1)) := by
+  simp [evalArgsM, bind, Except.bind, pure, Except.pure]
+
+/-- Full `evalTerminator` step for `Terminator::Intrinsic .PointerExposeProvenance`:
+evaluates `retExpr` to `(retPlace, .Int usizeIt)`, evaluates `argExpr` to a thin
+pointer `(.Ptr ⟨ptr, none⟩, argTy)`, exposes `ptr` in `m2.intptrcast`, stores
+`.Int ptr.addr` into `retPlace`, and jumps to `nb`. -/
+theorem evalTerminator_intrinsic_expose_ok {m m1 m2 m3 m4 : Mach}
+    {argExpr : Gen.ValueExpr} {retExpr : Gen.PlaceExpr} {nb : Gen.BbName}
+    {retPlace : Gen.Place BM} {ptr : Ptr} {argTy : Gen.Type}
+    (hplace : evalPlace m retExpr = .ok ((retPlace, .Int usizeIt), m1))
+    (harg : evalValue m1 argExpr = .ok ((.Ptr ⟨ptr, none⟩, argTy), m2))
+    (hstore : placeStore { m2 with intptrcast := IntPtrCast.expose m2.intptrcast ptr }
+        retPlace (.Int ptr.addr) (.Int usizeIt) = .ok m3)
+    (hjump : jumpToBlock m3 nb = .ok m4) :
+    Interp.evalTerminator m (.Intrinsic .PointerExposeProvenance [argExpr] retExpr (some nb)) =
+      .ok m4 := by
+  simp [Interp.evalTerminator, hplace, harg, hstore, hjump, bind, Except.bind, pure, Except.pure]
+
+/-- Polymorphic `evalTerminatorM` step for `Terminator::Intrinsic .PointerExposeProvenance`. -/
+theorem evalTerminatorM_intrinsic_expose_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m m1 m2 m3 m4 : Gen.Machine M}
+    {argExpr : Gen.ValueExpr} {retExpr : Gen.PlaceExpr} {nb : Gen.BbName}
+    {retPlace : Gen.Place M} {ptr : Gen.ThinPointer (Gen.Memory.Provenance M)} {argTy : Gen.Type}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, .Int usizeIt), m1))
+    (harg : evalValueM m1 argExpr = .ok ((.Ptr ⟨ptr, none⟩, argTy), m2))
+    (hstore : placeStoreM { m2 with intptrcast := IntPtrCast.exposeM m2.intptrcast ptr }
+        retPlace (.Int ptr.addr) (.Int usizeIt) = .ok m3)
+    (hjump : jumpToBlockM m3 nb = .ok m4) :
+    Interp.evalTerminatorM m (.Intrinsic .PointerExposeProvenance [argExpr] retExpr (some nb)) =
+      .ok m4 := by
+  simp [Interp.evalTerminatorM, hplace, harg, hstore, hjump, bind, Except.bind, pure, Except.pure]
+
+/-- Full `evalTerminator` step for `Terminator::Intrinsic .PointerWithExposedProvenance`
+when `IntPtrCast.int2ptr` succeeds: evaluates `retExpr` to `(retPlace, .Ptr retPtrTy)`,
+evaluates `argExpr` to `(.Int addr, argTy)`, predicts `ptr` via `IntPtrCast.int2ptr m2 addr`,
+stores `.Ptr ⟨ptr, none⟩` into `retPlace`, and jumps to `nb`. -/
+theorem evalTerminator_intrinsic_withExposed_ok {m m1 m2 m3 m4 : Mach}
+    {argExpr : Gen.ValueExpr} {retExpr : Gen.PlaceExpr} {nb : Gen.BbName}
+    {retPlace : Gen.Place BM} {retPtrTy : Gen.PtrType}
+    {addr : Int} {argTy : Gen.Type} {ptr : Ptr}
+    (hplace : evalPlace m retExpr = .ok ((retPlace, .Ptr retPtrTy), m1))
+    (harg : evalValue m1 argExpr = .ok ((.Int addr, argTy), m2))
+    (hmeta : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptr m2 addr = .ok ptr)
+    (hstore : placeStore m2 retPlace (.Ptr ⟨ptr, none⟩) (.Ptr retPtrTy) = .ok m3)
+    (hjump : jumpToBlock m3 nb = .ok m4) :
+    Interp.evalTerminator m (.Intrinsic .PointerWithExposedProvenance [argExpr] retExpr (some nb)) =
+      .ok m4 := by
+  simp [Interp.evalTerminator, hplace, harg,
+    evalIntrinsic_withExposed_ok hmeta hint, hstore, hjump, bind, Except.bind]
+
+/-- Full `evalTerminator` error propagation for `Terminator::Intrinsic .PointerWithExposedProvenance`
+when `IntPtrCast.int2ptr` stops with `.error err` (e.g., `Stop.unsupported`). -/
+theorem evalTerminator_intrinsic_withExposed_err {m m1 m2 : Mach}
+    {argExpr : Gen.ValueExpr} {retExpr : Gen.PlaceExpr} {nb : Option Gen.BbName}
+    {retPlace : Gen.Place BM} {retPtrTy : Gen.PtrType}
+    {addr : Int} {argTy : Gen.Type} {err : Stop}
+    (hplace : evalPlace m retExpr = .ok ((retPlace, .Ptr retPtrTy), m1))
+    (harg : evalValue m1 argExpr = .ok ((.Int addr, argTy), m2))
+    (hmeta : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptr m2 addr = .error err) :
+    Interp.evalTerminator m (.Intrinsic .PointerWithExposedProvenance [argExpr] retExpr nb) =
+      .error err := by
+  simp [Interp.evalTerminator, hplace, harg,
+    evalIntrinsic_withExposed_err hmeta hint, bind, Except.bind]
+
+/-- Polymorphic `evalTerminatorM` step for `Terminator::Intrinsic .PointerWithExposedProvenance`
+when `IntPtrCast.int2ptrM` succeeds. -/
+theorem evalTerminatorM_intrinsic_withExposed_ok {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m m1 m2 m3 m4 : Gen.Machine M}
+    {argExpr : Gen.ValueExpr} {retExpr : Gen.PlaceExpr} {nb : Gen.BbName}
+    {retPlace : Gen.Place M} {retPtrTy : Gen.PtrType}
+    {addr : Int} {argTy : Gen.Type} {ptr : Gen.ThinPointer (Gen.Memory.Provenance M)}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, .Ptr retPtrTy), m1))
+    (harg : evalValueM m1 argExpr = .ok ((.Int addr, argTy), m2))
+    (hmeta : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptrM m2 addr = .ok ptr)
+    (hstore : placeStoreM m2 retPlace (.Ptr ⟨ptr, none⟩) (.Ptr retPtrTy) = .ok m3)
+    (hjump : jumpToBlockM m3 nb = .ok m4) :
+    Interp.evalTerminatorM m (.Intrinsic .PointerWithExposedProvenance [argExpr] retExpr (some nb)) =
+      .ok m4 := by
+  simp [Interp.evalTerminatorM, hplace, harg,
+    evalIntrinsicM_withExposed_ok hmeta hint, hstore, hjump, bind, Except.bind]
+
+/-- Polymorphic `evalTerminatorM` error propagation for `Terminator::Intrinsic .PointerWithExposedProvenance`
+when `IntPtrCast.int2ptrM` stops with `.error err`. -/
+theorem evalTerminatorM_intrinsic_withExposed_err {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m m1 m2 : Gen.Machine M}
+    {argExpr : Gen.ValueExpr} {retExpr : Gen.PlaceExpr} {nb : Option Gen.BbName}
+    {retPlace : Gen.Place M} {retPtrTy : Gen.PtrType}
+    {addr : Int} {argTy : Gen.Type} {err : Stop}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, .Ptr retPtrTy), m1))
+    (harg : evalValueM m1 argExpr = .ok ((.Int addr, argTy), m2))
+    (hmeta : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptrM m2 addr = .error err) :
+    Interp.evalTerminatorM m (.Intrinsic .PointerWithExposedProvenance [argExpr] retExpr nb) =
+      .error err := by
+  simp [Interp.evalTerminatorM, hplace, harg,
+    evalIntrinsicM_withExposed_err hmeta hint, bind, Except.bind]
+
 end MiniRustSpec.Correspondence

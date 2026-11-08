@@ -3557,6 +3557,25 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrDeadAllocDerefUb_exposed_dead
   int2ptrDeadAllocDerefUb_provenanceRel_fails
   int2ptrAfterStorageDeadTwoExposed_three_way
+  singleExposeSiteOk_of_not_hasProvCast
+  ExposedLocalRel.anneal_roundtrip
+  ExposedLocalRel.candidate_mem
+  evalArgs_singleton
+  evalArgsM_singleton
+  evalTerminator_intrinsic_expose_ok
+  evalTerminatorM_intrinsic_expose_ok
+  evalTerminator_intrinsic_withExposed_ok
+  evalTerminator_intrinsic_withExposed_err
+  evalTerminatorM_intrinsic_withExposed_ok
+  evalTerminatorM_intrinsic_withExposed_err
+  StateRelN.expose_step_correspondence
+  StateRelN.withExposed_step_correspondence
+  int2ptr_singleton_offset_checkPtr_optimal
+  int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok
+  int2ptrRawRoundTripOk_singleExposeSiteOk
+  exposeSingleRefMutRoundTrip_singleExposeSiteOk
+  exposeTwoRefMutAngelicUnsupported_singleExposeSiteOk_false
+  exposeTwoRefMutAngelicUnsupported_three_way
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -3728,6 +3747,25 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrDeadAllocDerefUb_exposed_dead
   int2ptrDeadAllocDerefUb_provenanceRel_fails
   int2ptrAfterStorageDeadTwoExposed_three_way
+  singleExposeSiteOk_of_not_hasProvCast
+  ExposedLocalRel.anneal_roundtrip
+  ExposedLocalRel.candidate_mem
+  evalArgs_singleton
+  evalArgsM_singleton
+  evalTerminator_intrinsic_expose_ok
+  evalTerminatorM_intrinsic_expose_ok
+  evalTerminator_intrinsic_withExposed_ok
+  evalTerminator_intrinsic_withExposed_err
+  evalTerminatorM_intrinsic_withExposed_ok
+  evalTerminatorM_intrinsic_withExposed_err
+  StateRelN.expose_step_correspondence
+  StateRelN.withExposed_step_correspondence
+  int2ptr_singleton_offset_checkPtr_optimal
+  int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok
+  int2ptrRawRoundTripOk_singleExposeSiteOk
+  exposeSingleRefMutRoundTrip_singleExposeSiteOk
+  exposeTwoRefMutAngelicUnsupported_singleExposeSiteOk_false
+  exposeTwoRefMutAngelicUnsupported_three_way
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

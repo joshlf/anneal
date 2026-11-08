@@ -832,4 +832,49 @@ theorem ProvenanceRel.exposed_alloc_live {body : CapturedMir} {ctx : Ctx} {s : M
   obtain ⟨tag, _, htgt⟩ := hrel.sound p hp
   exact htgt.toExposedAllocOk
 
+/-- Coupling invariant for an exposed-address `usize` local `e` written by
+`PointerExposeProvenance`: in Anneal, slot `e` holds the encoded tag
+`.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)` with `pv.offsetBytes = 0`;
+in MiniRust, `pv.tag` satisfies `ExposedTargetOk` for `p` with
+`setContains m.intptrcast.exposed p = true`, and the MiniRust address `tAddr`
+lies within `p`'s live allocation `[a.addr, a.addr + a.size]`. -/
+structure ExposedLocalRel (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
+    (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov) : Prop where
+  slot_eq : view[e]? = some (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+  off_zero : pv.offsetBytes = 0
+  target_ok : ExposedTargetOk body ctx s m.mem.memory.allocations pv.tag p
+  exposed_mem : setContains m.intptrcast.exposed p = true
+  in_bounds : ∃ (idx : Nat) (a : Gen.Allocation),
+    p = (⟨(idx : Int)⟩, ()) ∧
+    m.mem.memory.allocations[idx]? = some a ∧
+    a.live = true ∧
+    (a.addr : Int) ≤ tAddr ∧
+    tAddr ≤ (a.addr : Int) + (Allocation.size a).bytes
+
+theorem ExposedLocalRel.anneal_roundtrip {body : CapturedMir} {ctx : Ctx}
+    {view : List LocalSlot} {s : MachineState} {m : Mach} {e : Nat}
+    {pv : ProvenancePtr} {tAddr : Int} {p : Prov}
+    (h : ExposedLocalRel body ctx view s m e pv tAddr p) :
+    ({ allocId := (pv.allocId * 65536 + pv.offsetBytes) / 65536,
+       offsetBytes := (pv.allocId * 65536 + pv.offsetBytes) % 65536 } : ProvenancePtr) = pv := by
+  have hoff := h.off_zero
+  rcases pv with ⟨allocId, offsetBytes⟩
+  change Nat at allocId
+  dsimp only at hoff ⊢
+  subst hoff
+  simp only [ProvenancePtr.mk.injEq]
+  change (allocId * 65536 + 0) / 65536 = (allocId : Nat) ∧
+    (allocId * 65536 + 0) % 65536 = 0
+  exact ⟨by omega, by omega⟩
+
+theorem ExposedLocalRel.candidate_mem {body : CapturedMir} {ctx : Ctx}
+    {view : List LocalSlot} {s : MachineState} {m : Mach} {e : Nat}
+    {pv : ProvenancePtr} {tAddr : Int} {p : Prov}
+    (h : ExposedLocalRel body ctx view s m e pv tAddr p) :
+    p ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed tAddr := by
+  obtain ⟨idx, a, rfl, ha, hlive, hlo, hhi⟩ := h.in_bounds
+  simp only [int2ptrCandidates, List.mem_map, List.mem_filter, Prod.exists, Bool.and_eq_true,
+    decide_eq_true_eq]
+  exact ⟨a, idx, ⟨List.mem_zipIdx_iff_getElem?.mpr ha, ⟨⟨hlive, hlo⟩, hhi⟩, h.exposed_mem⟩, rfl⟩
+
 end MiniRustSpec.Correspondence

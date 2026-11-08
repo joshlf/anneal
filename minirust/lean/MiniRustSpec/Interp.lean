@@ -4827,10 +4827,14 @@ integer byte decoding ignores provenance fragments, so `Some(p)` succeeds in
 every continuation where `None` succeeds):
 
 * if `exposed` is empty, `None` is the unique admissible provenance;
-* if `exposed` is a singleton `[p]`, `Some(p)` dominates `None` by provenance
-  monotonicity, so `Some(p)` is exact for every continuation — even when `addr`
+* if `exposed` is a singleton `[p]`, `Some(p)` dominates `None` in `BasicMemory`
+  by provenance monotonicity (`int2ptr_singleton_offset_checkPtr_optimal`), so
+  `Some(p)` is exact for every `BasicMemory` continuation — even when `addr`
   lies temporarily outside allocation `p` before a wrapping offset brings it
-  back in bounds;
+  back in bounds (note: in `TreeBorrowsMemory`, if `addr < alloc.addr`, a
+  zero-sized reborrow `&*(ptr as *const ())` under `Some(p)` hits
+  `Stop.specPanic "Offset::from_bytes(ptr.addr - allocation.addr).unwrap()"`
+  whereas `None` succeeds; see `int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok`);
 * if `exposed` contains two or more provenances, `int2ptrCandidates` selects the
   live exposed allocations whose range `[addr_a, addr_a + size_a]` contains
   `addr`: a unique candidate `[p]` resolves to `Some(p)`, while zero or multiple

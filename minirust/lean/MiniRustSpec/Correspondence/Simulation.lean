@@ -4685,23 +4685,156 @@ theorem StateRelN.expose_provenance_rel {body : CapturedMir} {f : Gen.Function}
   obtain ⟨entry, _, _, _, hlk, hk, _⟩ := htgt'
   exact ⟨entry, hlk, hk, hprov.expose_some addr htgt⟩
 
-/-- Under `StateRelNProv` on an `inFragment` body, every provenance `prov` in
+/-- Under `StateRelNProv` (without requiring `inFragment`, which excludes
+provenance casts by `inFragment_not_hasProvCast`), every provenance `prov` in
 `m.intptrcast.exposed` is `targetProv ctx k` for an address-taken local
-`k ∈ bodyAddrTakenLocals body` mapped to `localPtr ctx k` in the callee frame. -/
+`k ∈ bodyAddrTakenLocals body` backed by a live stack allocation at index
+`ctx.base.length + k` and address `ctx.addrs.getD k 0`. -/
 theorem StateRelNProv.exposed_target_localPtr {body : CapturedMir} {f : Gen.Function}
     {ctx : Ctx} {s : MachineState} {m : Mach} {exposedTags : List Nat}
     (h : StateRelNProv body f ctx s m exposedTags)
-    (hfrag : inFragment body = true)
     {prov : Prov} (hc : setContains m.intptrcast.exposed prov = true) :
-    ∃ k ∈ bodyAddrTakenLocals body,
-      prov = targetProv ctx k ∧
-      ∃ (view : List LocalSlot) (lm : Map Gen.LocalName Ptr),
-        m.threads = [thread1 ctx [ctx.caller, calleeFrameL f ctx lm s.frame.blockIdx s.frame.stmtIdx]] ∧
-        view[k]? ≠ some LocalSlot.dead ∧
-        mapGet lm (localName k) = some (localPtr ctx k) := by
-  obtain ⟨⟨view, lm, _, hthr, _, _, hbo⟩, hprov⟩ := h
-  obtain ⟨_, _, entry, _, _, _, _, hk, _, rfl, _⟩ := hprov.sound prov hc
-  obtain ⟨hnd, hlmk, _⟩ := hbo.target_ptrs hfrag entry.targetLocal hk
-  exact ⟨entry.targetLocal, hk, rfl, view, lm, hthr, hnd, hlmk⟩
+    ∃ (tag : Nat) (entry : BorrowEntry) (pointeeIt : Gen.IntType) (relOff : Nat)
+      (alloc : Gen.Allocation),
+      tag ∈ exposedTags ∧
+      lookupBorrow s.memory.borrows tag = some entry ∧
+      entry.targetLocal ∈ bodyAddrTakenLocals body ∧
+      ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+        some (pointeeIt, relOff) ∧
+      prov = targetProv ctx entry.targetLocal ∧
+      m.mem.memory.allocations[ctx.base.length + entry.targetLocal]? = some alloc ∧
+      alloc.live = true ∧
+      alloc.addr = ctx.addrs.getD entry.targetLocal 0 ∧
+      relOff + pointeeIt.size.bytes ≤ (Allocation.size alloc).bytes := by
+  obtain ⟨_, hprov⟩ := h
+  obtain ⟨tag, htag, entry, pointeeIt, relOff, alloc, hlk, hk, hspec, hpeq, halloc, hlive, haddr, hsz⟩ :=
+    hprov.sound prov hc
+  exact ⟨tag, entry, pointeeIt, relOff, alloc, htag, hlk, hk, hspec, hpeq, halloc, hlive, haddr, hsz⟩
+
+/-- **Lockstep `PointerExposeProvenance` step correspondence (`MR-3.3` Pass A2).**
+When pointer local `_p` holds `.init (.ptr pv 8)` with `pv.offsetBytes = 0` and
+target provenance `tProv` (`ExposedTargetOk`), Anneal's `evalStmt` on
+`_i = Cast(PointerExposeProvenance, copy _p, targetTy)` and MiniRust's
+`evalTerminator` on `Terminator::Intrinsic .PointerExposeProvenance` both succeed,
+extend `ProvenanceRel` with `pv.tag :: exposedTags` and `tProv`, and establish
+`ExposedLocalRel` on destination `usize` local `_i`. -/
+theorem StateRelN.expose_step_correspondence {body : CapturedMir} {ctx : Ctx}
+    {s : MachineState} {m m1 m2 m3 m4 : Mach} {exposedTags : List Nat}
+    {i p : Nat} {targetTy : MirAst.Ty} {span : String} {nb : Gen.BbName}
+    {retPlace : Gen.Place BM} {argTy : Gen.Type}
+    {pv : ProvenancePtr} {tAddr : Int} {tProv : Prov}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = [])
+    (hnd : s.frame.locals[i]? ≠ some .dead)
+    (hp : s.frame.locals[p]? = some (.init (.ptr pv 8)))
+    (hoff0 : pv.offsetBytes = 0)
+    (htgt : ExposedTargetOk body ctx s m.mem.memory.allocations pv.tag tProv)
+    (hplace : evalPlace m (.Local (localName i)) = .ok ((retPlace, .Int usizeIt), m1))
+    (harg : evalValue m1 (.Load (.Local (localName p))) =
+      .ok ((.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩, argTy), m2))
+    (hstore : placeStore
+        { m2 with intptrcast := IntPtrCast.expose m2.intptrcast ({ addr := tAddr, provenance := some tProv }) }
+        retPlace (.Int tAddr) (.Int usizeIt) = .ok m3)
+    (hjump : jumpToBlock m3 nb = .ok m4)
+    (hm4_ipc : m4.intptrcast =
+      IntPtrCast.expose m.intptrcast ({ addr := tAddr, provenance := some tProv }))
+    (hm4_allocs : m4.mem.memory.allocations = m.mem.memory.allocations)
+    (hin_bounds : ∃ (idx : Nat) (a : Gen.Allocation),
+      tProv = (⟨(idx : Int)⟩, ()) ∧
+      m.mem.memory.allocations[idx]? = some a ∧
+      a.live = true ∧
+      (a.addr : Int) ≤ tAddr ∧
+      tAddr ≤ (a.addr : Int) + (Allocation.size a).bytes) :
+    let locals' := s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+    let s' := advanceStmt s locals' s.memory
+    evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance (.copy ⟨p, []⟩) targetTy), span⟩
+        body.localDecls body.layouts = .tau (.running s') ∧
+    Interp.evalTerminator m
+        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))] (.Local (localName i)) (some nb)) =
+      .ok m4 ∧
+    ProvenanceRel body ctx s' m4 (pv.tag :: exposedTags) ∧
+    ExposedLocalRel body ctx locals' s' m4 i pv tAddr tProv := by
+  have hA := (evalStmt_assign_expose s body.localDecls body.layouts i p targetTy span hi hbor_i hprot).1 pv hp hnd
+  have hM := evalTerminator_intrinsic_expose_ok hplace harg hstore hjump
+  have hprov_exp := hprov.expose_some tAddr htgt
+  have hprov4 : ProvenanceRel body ctx
+      (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))) s.memory)
+      m4 (pv.tag :: exposedTags) := by
+    refine ⟨?_, ?_, ?_⟩
+    · rw [hm4_ipc]; exact hprov_exp.nodup
+    · intro q hq
+      rw [hm4_ipc] at hq
+      rw [hm4_allocs]
+      exact hprov_exp.sound q hq
+    · intro t ht
+      rw [hm4_ipc, hm4_allocs]
+      exact hprov_exp.complete t ht
+  have hexp_loc : ExposedLocalRel body ctx
+      (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))
+      (advanceStmt s (s.frame.locals.set i (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))) s.memory)
+      m4 i pv tAddr tProv := by
+    refine ⟨by simp [List.getElem?_set, hi], hoff0, ?_, ?_, ?_⟩
+    · rw [hm4_allocs]; exact htgt
+    · rw [hm4_ipc, setContains_expose_some_iff]
+      exact .inl rfl
+    · rw [hm4_allocs]; exact hin_bounds
+  exact ⟨hA, hM, hprov4, hexp_loc⟩
+
+/-- **Lockstep `PointerWithExposedProvenance` step correspondence (`MR-3.3` Pass A2).**
+Given `ExposedLocalRel` on `usize` local `_u` (holding encoded tag
+`pv.allocId * 65536 + pv.offsetBytes` in Anneal and `tAddr` in MiniRust with
+`tProv` exposed in `m.intptrcast.exposed`), Anneal's `evalStmt` on
+`_i = Cast(PointerWithExposedProvenance, copy _u, targetTy)` recovers the exact
+`ProvenancePtr` `pv` (`ExposedLocalRel.anneal_roundtrip`), and when `IntPtrCast.int2ptr`
+predicts `{ addr := tAddr, provenance := some tProv }`, MiniRust's `evalTerminator`
+on `Terminator::Intrinsic .PointerWithExposedProvenance` stores that reconstructed
+pointer into `_i` and preserves `ProvenanceRel`. -/
+theorem StateRelN.withExposed_step_correspondence {body : CapturedMir} {ctx : Ctx}
+    {s : MachineState} {m m1 m2 m3 m4 : Mach} {exposedTags : List Nat}
+    {i u : Nat} {targetTy : MirAst.Ty} {span : String} {nb : Gen.BbName}
+    {retPlace : Gen.Place BM} {retPtrTy : Gen.PtrType} {argTy : Gen.Type}
+    {pv : ProvenancePtr} {tAddr : Int} {tProv : Prov}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hexp_loc : ExposedLocalRel body ctx s.frame.locals s m u pv tAddr tProv)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = [])
+    (hnd : s.frame.locals[i]? ≠ some .dead)
+    (hplace : evalPlace m (.Local (localName i)) = .ok ((retPlace, .Ptr retPtrTy), m1))
+    (harg : evalValue m1 (.Load (.Local (localName u))) = .ok ((.Int tAddr, argTy), m2))
+    (hmeta : PtrType.meta_kind retPtrTy = .None)
+    (hint : IntPtrCast.int2ptr m2 tAddr = .ok { addr := tAddr, provenance := some tProv })
+    (hstore : placeStore m2 retPlace
+        (.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩)
+        (.Ptr retPtrTy) = .ok m3)
+    (hjump : jumpToBlock m3 nb = .ok m4)
+    (hm4_ipc : m4.intptrcast = m.intptrcast)
+    (hm4_allocs : m4.mem.memory.allocations = m.mem.memory.allocations) :
+    let s' := advanceStmt s (s.frame.locals.set i (.init (.ptr pv 8))) s.memory
+    evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance (.copy ⟨u, []⟩) targetTy), span⟩
+        body.localDecls body.layouts = .tau (.running s') ∧
+    Interp.evalTerminator m
+        (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName u))] (.Local (localName i)) (some nb)) =
+      .ok m4 ∧
+    ProvenanceRel body ctx s' m4 exposedTags := by
+  have hA0 := (evalStmt_assign_withExposed s body.localDecls body.layouts i u targetTy span hi hbor_i hprot).1
+    ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩ hexp_loc.slot_eq hnd
+  rw [hexp_loc.anneal_roundtrip] at hA0
+  have hM := evalTerminator_intrinsic_withExposed_ok hplace harg hmeta hint hstore hjump
+  have hprov4 : ProvenanceRel body ctx
+      (advanceStmt s (s.frame.locals.set i (.init (.ptr pv 8))) s.memory)
+      m4 exposedTags := by
+    refine ⟨?_, ?_, ?_⟩
+    · rw [hm4_ipc]; exact hprov.nodup
+    · intro q hq
+      rw [hm4_ipc] at hq
+      rw [hm4_allocs]
+      exact hprov.sound q hq
+    · intro t ht
+      rw [hm4_ipc, hm4_allocs]
+      exact hprov.complete t ht
+  exact ⟨hA0, hM, hprov4⟩
 
 end MiniRustSpec.Correspondence
