@@ -142,9 +142,9 @@ Reference (Miri Tree Borrows implementation,
 `src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
 `spec/mem/tree_borrows/state_machine_unprotected.md` at commit
-`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/perms.rs>
-<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/state_machine_unprotected.md#L5-L19>
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/mem/tree_borrows/state_machine_unprotected.md#L5-L19>
 
 > "enum PermissionUnprot {
 >     /// Represents a shared reference to interior mutable data.
@@ -174,6 +174,71 @@ inductive TreeBorrowPerm : Type where
   | frozen : TreeBorrowPerm
   /-- Invalidated borrow tag; any access is undefined behavior (`Disabled`). -/
   | disabled : TreeBorrowPerm
+
+/--
+Compute the initial `TreeBorrowPerm` for a function-entry protected reborrow
+(`RetagKind.fnEntry`).
+
+When `isMutable == true`, the protected reborrow starts in `.active` permission
+when implicit function-entry writes are enabled (`implicitWrites == true`,
+activating the mutable reference at function entry and performing an initial
+child write against foreign aliases) and in `.reserved` permission when
+`implicitWrites == false` (two-phase or deferred-write mode). When
+`isMutable == false`, a shared borrow of a `Freeze` type (`isFreeze == true`)
+starts `.frozen`, whereas a shared borrow of a non-`Freeze` (`UnsafeCell`-bearing)
+type (`isFreeze == false`) starts `.reserved` so interior-mutable accesses remain
+permitted.
+
+Reference (The Rust Reference, "Mutable references (`&mut T`)"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html#mutable-references-mut>
+
+> "Mutable references point to memory which is owned by some other value. A
+> mutable reference type is written &mut type or &'a mut type."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+>
+> "- Mutating immutable bytes."
+-/
+def initProtectedReborrowPerm
+    (isMutable : Bool)
+    (isFreeze : Bool)
+    (implicitWrites : Bool := true) :
+    TreeBorrowPerm :=
+  match isMutable with
+  | true =>
+    match implicitWrites with
+    | true => .active
+    | false => .reserved
+  | false =>
+    match isFreeze with
+    | true => .frozen
+    | false => .reserved
+
+/--
+Return `true` when an initial `TreeBorrowPerm` assigned to a function-entry
+protected reborrow performs an immediate implicit child write upon creation
+(`.active` permission), and `false` otherwise (`.reserved`, `.frozen`, or
+`.disabled`).
+
+Reference (The Rust Reference, "Mutable references (`&mut T`)"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html#mutable-references-mut>
+
+> "Mutable references point to memory which is owned by some other value. A
+> mutable reference type is written &mut type or &'a mut type."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "- Breaking the pointer aliasing rules."
+>
+> "- Mutating immutable bytes."
+-/
+def protectedReborrowHasInitWrite : TreeBorrowPerm → Bool
+  | .active => true
+  | _ => false
 
 /--
 0-based local variable index alias for borrow-table target references.
@@ -221,9 +286,9 @@ Reference (Miri Tree Borrows implementation,
 `src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, and MiniRust
 `spec/mem/tree_borrows/tree.md` at commit
-`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/src/tools/miri/src/borrow_tracker/tree_borrows/tree.rs>
-<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L3-L55>
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/mem/tree_borrows/tree.md#L3-L55>
 
 > "The core data structure of Tree Borrows is a *tree*, with a state machine in
 > each node. We use a tree to track reborrows in each allocation; each reborrow
