@@ -495,14 +495,24 @@ impl CalleeGraph<'_> {
     }
 }
 
+fn is_builtin_unreachable_call_target(def_id: &str) -> bool {
+    matches!(
+        def_id,
+        "core::hint::unreachable_unchecked"
+            | "std::hint::unreachable_unchecked"
+            | "core::intrinsics::unreachable"
+    )
+}
+
 /// Populate `bundle.transitive_callees`, `bundle.external_spec_callees`,
 /// `bundle.called_callees`, `bundle.spec_callees`, and
 /// `bundle.spec_companions_with_calls` for each subject bundle by computing the
 /// cycle-safe transitive closure of reachable `.fnDef "<callee_def_id>"` and
 /// trait-impl references across all captured MIR bodies (`Subject`,
-/// `UnsafeTraitImpl`, `Callee`, `Model`, `TypeInvariant`), excluding any target
-/// with an explicit `#[external_spec(for = <target>)]` override or
-/// `#[spec(trusted)]` attribute.
+/// `UnsafeTraitImpl`, `Callee`, `Model`, `TypeInvariant`), excluding built-in
+/// unreachable intrinsics (`Terminators.isUnreachableCallTarget`), any target
+/// with an explicit `#[external_spec(for = <target>)]` override,
+/// `#[spec(trusted)]` attribute, or authored `UbExceptionItemSpec` contract.
 ///
 /// The subject body's closure becomes `defaultCallees`; the closure of its
 /// `requires` / `ensures` companions (including those of reachable
@@ -518,6 +528,19 @@ pub(crate) fn populate_called_callees(
         .filter(|b| b.has_rust_trusted_attr())
         .map(|b| b.subject.target.def_id.clone())
         .collect();
+    let proofs_root = mir_root
+        .parent()
+        .and_then(|g| g.parent())
+        .and_then(|d| d.parent())
+        .map(|ws| ws.join("anneal").join("proofs"));
+    let ub_exception_subject_def_ids: BTreeSet<String> = match proofs_root.as_deref() {
+        Some(pr) if pr.is_dir() => bundles
+            .iter()
+            .filter(|b| detect_authored_item_modules(pr, &b.item_rel_path).is_ub_exception)
+            .map(|b| b.subject.target.def_id.clone())
+            .collect(),
+        _ => BTreeSet::new(),
+    };
 
     let trusted_callees_by_def_id: BTreeMap<String, CalleeContractRef> = bundles
         .iter()
@@ -566,8 +589,10 @@ pub(crate) fn populate_called_callees(
         if record.target.mir_module_path.is_empty() {
             continue;
         }
-        if external_spec_contracts.contains_key(&record.target.def_id)
+        if is_builtin_unreachable_call_target(&record.target.def_id)
+            || external_spec_contracts.contains_key(&record.target.def_id)
             || trusted_subject_def_ids.contains(&record.target.def_id)
+            || ub_exception_subject_def_ids.contains(&record.target.def_id)
         {
             continue;
         }
