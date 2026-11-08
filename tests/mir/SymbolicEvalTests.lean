@@ -575,7 +575,7 @@ theorem writeAndReadMutSymClaim_verified :
     StatefulVerificationResult writeAndReadMutSymClaim := by
   refine verifyStatefulMirFuelFree writeAndReadMutSymClaim ?_
   rintro _ _ ⟨v, hv, rfl, rfl⟩ _ _ ⟨⟩
-  exact ⟨fun v' h_eq => by simp at h_eq; subst h_eq; rfl, rfl⟩
+  exact ⟨by rintro _ ⟨⟩; rfl, rfl⟩
 
 def writeAndReadMutPinnedClaim : StatefulClaim where
   body := writeAndReadMutMir
@@ -1111,22 +1111,18 @@ private theorem SymConv.step {body : CapturedMir} {post : MirOutcome → Prop}
     rw [wpMirExecSym, evalSymNodeTree_eq, stepMirExecSymTree_eval]
   rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval] at h
   cases h_st : stepMirState body st with
-  | ret out =>
-    rw [h_st] at h
-    exact ⟨1, by rw [h_unfold, h_st]; exact h⟩
+  | ret out => rw [h_st] at h; exact ⟨1, by rw [h_unfold, h_st]; exact h⟩
   | tau st' =>
     rw [h_st] at h
     obtain ⟨fuel, h_wp⟩ := h
     exact ⟨fuel + 1, by rw [h_unfold, h_st]; exact h_wp⟩
   | vis i k =>
+    rw [h_st] at h
     rcases i with f | (e | c)
-    · rw [h_st] at h
-      exact h.elim
-    · rw [h_st] at h
-      obtain ⟨fuel, h_wp⟩ := h
+    · exact h.elim
+    · obtain ⟨fuel, h_wp⟩ := h
       exact ⟨fuel + 1, by rw [h_unfold, h_st]; exact h_wp⟩
-    · rw [h_st] at h
-      exact h.elim
+    · exact h.elim
 
 /-- Discharge `VerificationResult c` from per-input fuel-free convergence. -/
 private theorem verifyMirNoPanic_of_symConv (c : Claim)
@@ -1416,7 +1412,7 @@ theorem reifyAndCallFnPtr_verified :
     VerificationResult reifyAndCallFnPtrClaim := by
   refine verifyByWPFuelFree reifyAndCallFnPtrClaim ?_
   rintro _ ⟨x, _, rfl⟩ _ ⟨⟩
-  simp <;> omega
+  simp <;> omega -- `simp` leaves the `u8` range side condition `x % 2 < 256`.
 
 /--
 Caller `indirectFnPtrTailCallMir` taking an incoming function pointer parameter

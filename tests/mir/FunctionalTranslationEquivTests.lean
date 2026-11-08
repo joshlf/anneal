@@ -418,14 +418,13 @@ private theorem fastSliceSum_h_body
     repeat' first
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, fastSliceSumMkState, fastSliceSumBody,
           encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
-          stepMirState, advanceStmt, evalRvalue, evalOperand, evalConstValue,
-          readProjectedValue, readProjectedValue_index, evalPlaceWrite, operandIsSigned,
-          operandTy, placeTy, tyIsSigned, evalTerminator, applyUnwindAction, Option.getD,
-          GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite,
-          decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq,
-          Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq,
-          instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows,
-          prefixSum_succ]
+          advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
+          readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
+          List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
+          instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and,
+          List.length, List.set, BEq.beq, get?, set?, length, emptyMemory,
+          invalidateConflictingBorrows, prefixSum_succ]
       | rw [get?_map_u32 h_i_lt_len]
       | rw [evalScalarBinOp_addUnchecked_u32 h_add_u32]
       | rw [evalScalarBinOp_addUnchecked_usize h_add_usize]
@@ -459,8 +458,8 @@ theorem dwp_fastSliceSumBody_trace
     exact dwp_of_runMirTauToRet 3
       (out := .normal (.scalar ⟨prefixSum elems i, 4⟩, emptyMemory)) rfl ⟨rfl, rfl⟩
   · rintro r s tr ⟨i, temps, h_ir, rfl, rfl⟩
-    have h_ps_le := prefixSum_mono elems (show i + 1 ≤ n by omega)
-    rw [prefixSum_succ] at h_ps_le
+    have h_ps_le : prefixSum elems i + elems.getD i 0 ≤ prefixSum elems n :=
+      prefixSum_mono elems (show i + 1 ≤ n by omega)
     refine ⟨1, _, _, _, by
       rw [fastSliceSum_header_switch_raw, nat_ble_eq_false_of_lt (show i < n by omega)]; rfl,
       fastSliceSum_h_body elems n i temps (by omega) (by omega) (by omega), ?_⟩
@@ -535,14 +534,13 @@ private theorem safeSliceSum_h_body
     repeat' first
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, safeSliceSumMkState, safeSliceSumBody,
           encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
-          stepMirState, advanceStmt, evalRvalue, evalOperand, evalConstValue,
-          readProjectedValue, readProjectedValue_index, evalPlaceWrite, operandIsSigned,
-          operandTy, placeTy, tyIsSigned, evalTerminator, applyUnwindAction, Option.getD,
-          GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite,
-          decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq,
-          Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq,
-          instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows,
-          prefixSum_succ]
+          advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
+          readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
+          tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
+          List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
+          instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and,
+          List.length, List.set, BEq.beq, get?, set?, length, emptyMemory,
+          invalidateConflictingBorrows, prefixSum_succ]
       | rw [evalScalarBinOp_lt_usize_of_lt h_i_lt_len]
       | rw [get?_map_u32 h_i_lt_len]
       | rw [evalScalarBinOp_addWithOverflow_u32 h_add_u32]
@@ -578,8 +576,8 @@ theorem dwp_safeSliceSumBody_trace
     exact dwp_of_runMirTauToRet 3
       (out := .normal (.scalar ⟨prefixSum elems i, 4⟩, emptyMemory)) rfl ⟨rfl, rfl⟩
   · rintro r s tr ⟨i, o5, rest, h_ir, rfl, rfl⟩
-    have h_ps_le := prefixSum_mono elems (show i + 1 ≤ n by omega)
-    rw [prefixSum_succ] at h_ps_le
+    have h_ps_le : prefixSum elems i + elems.getD i 0 ≤ prefixSum elems n :=
+      prefixSum_mono elems (show i + 1 ≤ n by omega)
     refine ⟨1, _, _, _, by
       rw [safeSliceSum_header_switch_raw, nat_ble_eq_false_of_lt (show i < n by omega)]; rfl,
       safeSliceSum_h_body elems n i rest (by omega) (by omega) (by omega), ?_⟩

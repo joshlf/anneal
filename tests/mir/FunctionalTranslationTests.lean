@@ -483,13 +483,14 @@ private theorem sumToN_header_switch_lt
   rw [sumToN_header_switch_raw, nat_ble_eq_false_of_lt h_lt]
   rfl
 
-private theorem sumToN_body_step
-    {n i : Nat}
-    (h_acc_lt : arithSum i + i < 4294967296)
-    (h_inc_lt : i + 1 < 4294967296) :
+/-- One loop-body pass `bb2 → bb1` at iteration `i < n ≤ 1000` (both `u32` adds in range). -/
+private theorem sumToN_body_step {n i : Nat} (hn : n ≤ 1000) (h_lt : i < n) :
     evalPlanToJoin sumToNLoopBody (.jump 1) (sumToNBranchState 2 n i ⟨1, 1⟩) =
       some (sumToNState 1 n (i + 1) (arithSum i + i) (.init (.scalar ⟨1, 1⟩))) := by
-  rw [← wrapU32_add h_acc_lt, ← wrapU32_add h_inc_lt]; rfl
+  have := arithSum_le_sq i
+  have : i * i ≤ 1000 * 1000 := Nat.mul_le_mul (by omega) (by omega)
+  rw [← wrapU32_add (show arithSum i + i < 4294967296 by omega),
+    ← wrapU32_add (show i + 1 < 4294967296 by omega)]; rfl
 
 /--
 Inductive `wpTransPlan` proof for the `TransPlan.loop` sub-plan rooted at header
@@ -511,14 +512,10 @@ private theorem wpTransPlan_sumToN_header
     rfl
   | rem + 1, i, cmpOpt, h_sum => by
     have h_lt : i < n := by omega
-    have h_ai_le : arithSum i ≤ i * i := arithSum_le_sq i
-    have h_i_le : i * i ≤ 1000 * 1000 := Nat.mul_le_mul (by omega) (by omega)
-    have h_acc_lt : arithSum i + i < 4294967296 := by omega
-    have h_inc_lt : i + 1 < 4294967296 := by omega
     rw [wpTransPlan, sumToN_header_switch_lt cmpOpt h_lt]
     dsimp only
     refine ⟨rfl, rfl, (fun h => by cases h), fun _ => ?_⟩
-    rw [sumToN_body_step h_acc_lt h_inc_lt]
+    rw [sumToN_body_step hn h_lt]
     dsimp only
     exact ⟨trivial,
       wpTransPlan_sumToN_header n hn rem (i + 1) (some (.scalar ⟨1, 1⟩)) (by omega)⟩
@@ -570,11 +567,9 @@ theorem sumToNLoop_partial_by_coinductive_invariant (n : Nat) (hn : n ≤ 1000) 
     ⟨0, none, Nat.zero_le n, rfl⟩
   rintro s ⟨i, cmpOpt, h_le, rfl⟩
   rcases Nat.lt_or_eq_of_le h_le with h_lt | rfl
-  · have h_ai_le : arithSum i ≤ i * i := arithSum_le_sq i
-    have h_i_le : i * i ≤ 1000 * 1000 := Nat.mul_le_mul (by omega) (by omega)
-    refine ⟨true, 1, _, _, sumToN_header_switch_lt cmpOpt h_lt,
+  · refine ⟨true, 1, _, _, sumToN_header_switch_lt cmpOpt h_lt,
             (fun h => by cases h), fun _ => ?_⟩
-    exact ⟨_, sumToN_body_step (by omega) (by omega), trivial,
+    exact ⟨_, sumToN_body_step hn h_lt, trivial,
            ⟨i + 1, some (.scalar ⟨1, 1⟩), by omega, rfl⟩⟩
   · refine ⟨false, 0, _, _, sumToN_header_switch_ge i cmpOpt,
             fun _ => ?_, (fun h => by cases h)⟩
@@ -829,12 +824,8 @@ theorem advanceCursorMutSpec_total_and_stateful_verified :
       advanceCursorMutSpec (fun _ _ _ => advanceCursorMutPlan) ?_
     rintro c extraArgs mem ⟨h_pos, h_len, rfl, delta, h_delta, rfl⟩
     have h_add_lt : c.pos + delta < 4294967296 := by omega
-    exact wpTransPlan_mono
-      (fun out h_eq => by
-        subst h_eq
-        exact ⟨_, rfl, rfl⟩)
+    exact wpTransPlan_mono (fun _ h_eq => h_eq ▸ ⟨_, rfl, rfl⟩)
       (advanceCursorMut_wpTransPlan c h_add_lt)
   exact ⟨h_tot, statefulOfTotalMutRefLocal h_tot⟩
-
 
 end Anneal.FunctionalTranslationTests
