@@ -4398,17 +4398,7 @@ theorem multiBlockPipeline_stage1_converges
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  refine ⟨3, ?_⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
-    multiBlockPipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirStepsSym, wpMirExecStepsSym]
-  simp [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval,
-    evalNodeNoCallWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?,
-    evalStmt, evalRvalue, evalOperand, evalTerminator, readProjectedValue,
-    writePlaceValue, invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    evalNodeNoCallWP, MirStepNode.step]
+  exact ⟨3, rfl⟩
 
 /--
 Stage 2 (`bb1 -> bb2 -> return`): from `multiBlockMidState b mem`,
@@ -4426,17 +4416,7 @@ theorem multiBlockPipeline_stage2_converges
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  refine ⟨3, ?_⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
-    multiBlockPipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirSym, wpMirExecSym]
-  simp [evalSymNodeTree_eq, stepMirExecSymTree_eval,
-    evalNodeWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?, evalStmt,
-    evalRvalue, evalOperand, evalTerminator, writePlaceValue,
-    invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    evalNodeWP, MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+  exact ⟨3, rfl, rfl⟩
 
 /--
 Fuel-free sequential composition of Stage 1 and Stage 2 via
@@ -4645,17 +4625,7 @@ theorem multiBlockPipeline_stage2_noCallWpConverges
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  refine ⟨3, ?_⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
-    multiBlockPipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirNoCallSym, wpMirExecNoCallSym]
-  simp [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval,
-    evalNodeNoCallWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?, evalStmt,
-    evalRvalue, evalOperand, evalTerminator, writePlaceValue,
-    invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    evalNodeNoCallWP, MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+  exact ⟨3, rfl, rfl⟩
 
 /--
 Fuel-free call-forbidding sequential composition (`MirNoCallWpConverges.bind`)
@@ -4739,17 +4709,7 @@ theorem multiBlockPipeline_stage2_ubWaivedWpConverges
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  refine ⟨3, ?_⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
-    multiBlockPipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirUbWaivedSym, wpMirExecUbWaivedSym]
-  simp [evalSymNodeTreeUbWaived_eq, stepMirExecSymTree_eval,
-    evalNodeUbWaivedWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?,
-    evalStmt, evalRvalue, evalOperand, evalTerminator, writePlaceValue,
-    invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    evalNodeUbWaivedWP, MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+  exact ⟨3, rfl, rfl⟩
 
 /--
 Fuel-free UB-waived sequential composition (`MirUbWaivedWpConverges.bind`) of
@@ -4857,22 +4817,9 @@ theorem multiBlockPipeline_stage2_modularWpConverges
       (multiBlockMidState b mem)
       (mirNormalPost
         (fun retVal mem' =>
-          retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)) := by
-  rcases mem with
-    ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
-     activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  refine ⟨3, ?_⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
-    multiBlockPipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirModularSym, wpMirExecModularSym]
-  simp [evalSymNodeTreeModular_eq, stepMirExecSymTree_eval,
-    evalNodeModularWP_eq, stepMirState, stepMirFn, Trusted.Sequence.get?,
-    evalStmt, evalRvalue, evalOperand, evalTerminator, writePlaceValue,
-    invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    evalNodeModularWP, MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+          retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)) :=
+  MirModularWpConverges.of_noCall
+    (multiBlockPipeline_stage2_noCallWpConverges b mem h_root)
 
 /--
 Fuel-free modular sequential composition (`MirModularWpConverges.bind`) of
@@ -4967,17 +4914,7 @@ theorem multiBlockPipeline_stage1_traceStepsConverges
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  refine ⟨3, ?_⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
-    multiBlockPipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirTraceStepsSym, wpMirExecTraceStepsSym]
-  simp [evalSymNodeTreeTraceNoCall_eq, stepMirExecSymTree_eval,
-    evalNodeTraceNoCallWP, stepMirState, stepMirFn, Trusted.Sequence.get?,
-    evalStmt, evalRvalue, evalOperand, evalTerminator, readProjectedValue,
-    writePlaceValue, invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    MirStepNode.step]
+  exact ⟨3, rfl, rfl⟩
 
 /--
 Stage 2 (`bb1 -> bb2 -> return`) trace-aware convergence (`MirTraceWpConverges`)
@@ -4994,21 +4931,11 @@ theorem multiBlockPipeline_stage2_traceWpConverges
           (fun retVal mem' =>
             retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)
           out) := by
-  refine MirTraceWpConverges.of_wpMirTraceSym (fuel := 3) ?_
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, multiBlockMidState, advanceStmt, Trusted.Sequence.set?,
-    multiBlockPipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirTraceSym, wpMirExecTraceSym]
-  simp [evalSymNodeTreeTrace_eq, stepMirExecSymTree_eval,
-    evalNodeTraceWP, stepMirState, stepMirFn, Trusted.Sequence.get?,
-    evalStmt, evalRvalue, evalOperand, evalTerminator, writePlaceValue,
-    invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+  exact ⟨3, rfl, rfl, rfl⟩
 
 /--
 Fuel-free trace-aware sequential composition (`MirTraceWpConverges.bind_silent`)
@@ -5147,16 +5074,7 @@ theorem branchingTracePipeline_stage1_traceStepsConverges
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  refine ⟨1, ?_⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, branchingTraceMidState, advanceStmt, Trusted.Sequence.set?,
-    branchingTracePipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirTraceStepsSym, wpMirExecTraceStepsSym]
-  simp [evalSymNodeTreeTraceNoCall_eq, stepMirExecSymTree_eval,
-    evalNodeTraceNoCallWP, stepMirState, stepMirFn, Trusted.Sequence.get?,
-    evalOperand, evalTerminator, readProjectedValue,
-    lookupSwitchTarget, get?, List.length, Trusted.Sequence.length, BEq.beq,
-    MirStepNode.emitStep]
+  exact ⟨1, rfl, rfl⟩
 
 /--
 Stage 2 (`bb1 -> bb2 -> return`) of `branchingTracePipelineBody` from
@@ -5172,21 +5090,11 @@ theorem branchingTracePipeline_stage2_traceWpConverges
           (fun retVal mem' =>
             retVal = .scalar { bits := b, sizeBytes := 4 } ∧ mem' = mem)
           out) := by
-  refine MirTraceWpConverges.of_wpMirTraceSym (fuel := 3) ?_
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
   rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
-  dsimp [initMachineState, initMachineStateWithMemory, initLocals, initLocalsAux,
-    List.length, branchingTraceMidState, advanceStmt, Trusted.Sequence.set?,
-    branchingTracePipelineBody, Trusted.Sequence.get?]
-  dsimp [wpMirTraceSym, wpMirExecTraceSym]
-  simp [evalSymNodeTreeTrace_eq, stepMirExecSymTree_eval,
-    evalNodeTraceWP, stepMirState, stepMirFn, Trusted.Sequence.get?,
-    evalStmt, evalRvalue, evalOperand, evalTerminator, writePlaceValue,
-    invalidateConflictingBorrows, get?, List.length,
-    Trusted.Sequence.length, BEq.beq, advanceStmt, Trusted.Sequence.set?,
-    MirStepNode.step, MirStepNode.retNormal, mirNormalPost]
+  exact ⟨3, rfl, rfl, rfl⟩
 
 /--
 Fuel-free non-empty trace composition (`MirTraceWpConverges.bind`) chaining
