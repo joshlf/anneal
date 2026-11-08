@@ -540,6 +540,8 @@ pub struct CandidateCompile {
 pub struct ItreeEvalOptions {
     /// Number of native execution trials per compiled candidate.
     pub trials_per_candidate: usize,
+    /// Maximum number of trace cases per Stage 2 `ItreeDiffBatchConfirmChunk` Lean module.
+    pub confirm_chunk_size: usize,
     /// Optional path to the Anneal repository root (`trusted/lean` and `theory`).
     pub anneal_repo_root: Option<PathBuf>,
     /// Optional directory where self-contained finding bundles are written.
@@ -560,6 +562,7 @@ impl Default for ItreeEvalOptions {
     fn default() -> Self {
         Self {
             trials_per_candidate: DEFAULT_ITREE_TRIALS_PER_CANDIDATE,
+            confirm_chunk_size: ITREE_CONFIRM_CHUNK_SIZE,
             anneal_repo_root: None,
             findings_dir: None,
             mir_mutations: Vec::new(),
@@ -1290,10 +1293,11 @@ fn render_trace_collector_source(
         "#[path = {:?}]\npub mod trace_observer;",
         trace_observer_path.display()
     );
-    let _ = writeln!(
-        out,
-        "pub mod itree_diff_staged {{\n    include!(\"src/candidates.rs\");\n}}\n"
-    );
+    let _ = writeln!(out, "pub mod itree_diff_staged {{");
+    for (staged, _trials) in staged_candidates {
+        let _ = writeln!(out, "{}", staged.staged_source);
+    }
+    let _ = writeln!(out, "}}\n");
     let _ = writeln!(
         out,
         "use trace_observer::{{EnvSchedule, TraceCapture, TraceRecorder, encode_recorded_raw_trace_hex, value_as_raw_bytes}};\n"
@@ -1351,63 +1355,10 @@ fn collect_traces_natively(
     repo_root: &Path,
     staging_dir: &Path,
     staged_candidates: &[(StagedItreeCandidate, Vec<CandidateTrialInput>)],
-) -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
+) -> Result<(BTreeMap<String, Vec<RecordedRawTrace>>, Vec<String>), String> {
     let proc_macro_dylib = build_anneal_trace_proc_macro_dylib(repo_root, staging_dir)?;
     let mir_instrument_bin = ensure_mir_instrument_bin(repo_root)?;
-    let collector_src = render_trace_collector_source(repo_root, staged_candidates);
-    let collector_rs = staging_dir.join("collect_traces.rs");
-    let collector_bin_o0 = staging_dir.join("collect_traces_bin_o0");
-    let collector_bin_o2 = staging_dir.join("collect_traces_bin_o2");
-    fs::write(&collector_rs, &collector_src)
-        .map_err(|e| format!("failed to write {}: {e}", collector_rs.display()))?;
-
     let extern_arg = format!("anneal_trace={}", proc_macro_dylib.display());
-    let compile_one = |opt_level: &str, bin_path: &Path| -> Result<(), String> {
-        let opt_flag = format!("opt-level={opt_level}");
-        let compile_out = Command::new(&mir_instrument_bin)
-            .args([
-                "--edition=2024",
-                "--cfg",
-                "anneal_trace_ext",
-                "-A",
-                "warnings",
-                "-C",
-                &opt_flag,
-                "-C",
-                "codegen-units=16",
-                "--extern",
-                &extern_arg,
-            ])
-            .arg(&collector_rs)
-            .arg("-o")
-            .arg(bin_path)
-            .current_dir(staging_dir)
-            .output()
-            .map_err(|e| {
-                format!(
-                    "failed to invoke anneal-mir-instrument (-O{opt_level}) for trace collector: {e}"
-                )
-            })?;
-        if !compile_out.status.success() {
-            return Err(format!(
-                "compiling collect_traces.rs with anneal-mir-instrument (-O{opt_level}) failed:\n{}",
-                String::from_utf8_lossy(&compile_out.stderr)
-            ));
-        }
-        Ok(())
-    };
-    let (res_o0, res_o2) = std::thread::scope(|s| {
-        let h0 = s.spawn(|| compile_one("0", &collector_bin_o0));
-        let h2 = s.spawn(|| compile_one("2", &collector_bin_o2));
-        (
-            h0.join()
-                .unwrap_or_else(|_| Err("panic compiling -O0 trace collector".to_string())),
-            h2.join()
-                .unwrap_or_else(|_| Err("panic compiling -O2 trace collector".to_string())),
-        )
-    });
-    res_o0?;
-    res_o2?;
 
     let parse_collector_stdout =
         |stdout: &[u8]| -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
@@ -1427,38 +1378,138 @@ fn collect_traces_natively(
             Ok(by_fn)
         };
 
-    let run_o0 = Command::new(&collector_bin_o0)
-        .current_dir(staging_dir)
-        .output()
-        .map_err(|e| format!("failed to execute -O0 trace collector binary: {e}"))?;
-    if !run_o0.status.success() {
-        return Err(format!(
-            "running collect_traces_bin_o0 failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run_o0.stdout),
-            String::from_utf8_lossy(&run_o0.stderr)
-        ));
-    }
-    let run_o2 = Command::new(&collector_bin_o2)
-        .current_dir(staging_dir)
-        .output()
-        .map_err(|e| format!("failed to execute -O2 trace collector binary: {e}"))?;
-    if !run_o2.status.success() {
-        return Err(format!(
-            "running collect_traces_bin_o2 failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run_o2.stdout),
-            String::from_utf8_lossy(&run_o2.stderr)
-        ));
-    }
+    let fn_to_fn: BTreeMap<String, String> = staged_candidates
+        .iter()
+        .map(|(s, _)| (s.root_fn_name.clone(), s.root_fn_name.clone()))
+        .collect();
 
-    let by_fn_o0 = parse_collector_stdout(&run_o0.stdout)?;
-    let by_fn_o2 = parse_collector_stdout(&run_o2.stdout)?;
-    if by_fn_o0 != by_fn_o2 {
-        return Err(
-            "binary-instrumented traces differed between `-C opt-level=0` and `-C opt-level=2`"
-                .to_string(),
-        );
+    let trace_stage = run_isolated_lean_stage(
+        "ItreeDiffTraceCollect",
+        staged_candidates,
+        ITREE_PROBE_CHUNK_SIZE,
+        1,
+        |(s, _): &(StagedItreeCandidate, Vec<CandidateTrialInput>)| s.root_fn_name.as_str(),
+        &fn_to_fn,
+        |label: &str, chunk: &[(StagedItreeCandidate, Vec<CandidateTrialInput>)]| {
+            let collector_src = render_trace_collector_source(repo_root, chunk);
+            let collector_rs = staging_dir.join(format!("collect_traces_{label}.rs"));
+            let collector_bin_o0 = staging_dir.join(format!("collect_traces_bin_o0_{label}"));
+            let collector_bin_o2 = staging_dir.join(format!("collect_traces_bin_o2_{label}"));
+            let cleanup = || {
+                let _ = fs::remove_file(&collector_rs);
+                let _ = fs::remove_file(&collector_bin_o0);
+                let _ = fs::remove_file(&collector_bin_o2);
+            };
+            if let Err(e) = fs::write(&collector_rs, &collector_src) {
+                cleanup();
+                return Err(format!("failed to write {}: {e}", collector_rs.display()));
+            }
+
+            let compile_one = |opt_level: &str, bin_path: &Path| -> Result<(), String> {
+                let opt_flag = format!("opt-level={opt_level}");
+                let compile_out = Command::new(&mir_instrument_bin)
+                    .args([
+                        "--edition=2024",
+                        "--cfg",
+                        "anneal_trace_ext",
+                        "-A",
+                        "warnings",
+                        "-C",
+                        &opt_flag,
+                        "-C",
+                        "codegen-units=16",
+                        "--extern",
+                        &extern_arg,
+                    ])
+                    .arg(&collector_rs)
+                    .arg("-o")
+                    .arg(bin_path)
+                    .current_dir(staging_dir)
+                    .output()
+                    .map_err(|e| {
+                        format!(
+                            "failed to invoke anneal-mir-instrument (-O{opt_level}) for trace collector: {e}"
+                        )
+                    })?;
+                if !compile_out.status.success() {
+                    return Err(format!(
+                        "compiling {} with anneal-mir-instrument (-O{opt_level}) failed:\n{}",
+                        collector_rs.display(),
+                        String::from_utf8_lossy(&compile_out.stderr)
+                    ));
+                }
+                Ok(())
+            };
+            let (res_o0, res_o2) = std::thread::scope(|s| {
+                let h0 = s.spawn(|| compile_one("0", &collector_bin_o0));
+                let h2 = s.spawn(|| compile_one("2", &collector_bin_o2));
+                (
+                    h0.join().unwrap_or_else(|_| {
+                        Err("panic compiling -O0 trace collector".to_string())
+                    }),
+                    h2.join().unwrap_or_else(|_| {
+                        Err("panic compiling -O2 trace collector".to_string())
+                    }),
+                )
+            });
+            if let Err(e) = res_o0.and(res_o2) {
+                cleanup();
+                return Err(e);
+            }
+
+            let run_res = (|| -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
+                let run_o0 = Command::new(&collector_bin_o0)
+                    .current_dir(staging_dir)
+                    .output()
+                    .map_err(|e| format!("failed to execute -O0 trace collector binary: {e}"))?;
+                if !run_o0.status.success() {
+                    return Err(format!(
+                        "running {} failed:\nstdout:\n{}\nstderr:\n{}",
+                        collector_bin_o0.display(),
+                        String::from_utf8_lossy(&run_o0.stdout),
+                        String::from_utf8_lossy(&run_o0.stderr)
+                    ));
+                }
+                let run_o2 = Command::new(&collector_bin_o2)
+                    .current_dir(staging_dir)
+                    .output()
+                    .map_err(|e| format!("failed to execute -O2 trace collector binary: {e}"))?;
+                if !run_o2.status.success() {
+                    return Err(format!(
+                        "running {} failed:\nstdout:\n{}\nstderr:\n{}",
+                        collector_bin_o2.display(),
+                        String::from_utf8_lossy(&run_o2.stdout),
+                        String::from_utf8_lossy(&run_o2.stderr)
+                    ));
+                }
+
+                let mut by_fn_o0 = parse_collector_stdout(&run_o0.stdout)?;
+                let mut by_fn_o2 = parse_collector_stdout(&run_o2.stdout)?;
+                let mut chunk_out: BTreeMap<String, Vec<RecordedRawTrace>> = BTreeMap::new();
+                for (staged, _trials) in chunk {
+                    let fn_name = &staged.root_fn_name;
+                    let t0 = by_fn_o0.remove(fn_name).unwrap_or_default();
+                    let t2 = by_fn_o2.remove(fn_name).unwrap_or_default();
+                    if t0 != t2 {
+                        eprintln!(
+                            "itree-difftest: `{fn_name}` binary-instrumented traces differed \
+                             between `-C opt-level=0` and `-C opt-level=2`"
+                        );
+                        chunk_out.insert(fn_name.clone(), Vec::new());
+                    } else {
+                        chunk_out.insert(fn_name.clone(), t0);
+                    }
+                }
+                Ok(chunk_out)
+            })();
+            cleanup();
+            run_res
+        },
+    );
+    for err in &trace_stage.errors {
+        eprintln!("itree-difftest: native trace collector failure: {err}");
     }
-    Ok(by_fn_o0)
+    Ok((trace_stage.results, trace_stage.errors))
 }
 
 fn extract_mir_neighborhood(staging_dir: &Path, mir_module: &str) -> (String, String) {
@@ -1575,6 +1626,7 @@ pub fn evaluate_itree_batches(
 ) -> Result<ItreeCampaignEvalReport, String> {
     let options = ItreeEvalOptions {
         trials_per_candidate: DEFAULT_ITREE_TRIALS_PER_CANDIDATE,
+        confirm_chunk_size: ITREE_CONFIRM_CHUNK_SIZE,
         anneal_repo_root: anneal_repo_root.map(Path::to_path_buf),
         findings_dir: findings_dir.map(Path::to_path_buf),
         mir_mutations: Vec::new(),
@@ -1753,7 +1805,7 @@ pub fn evaluate_itree_batches_with_options(
             options.root_mir_swaps.iter().cloned().collect();
 
         // Execute all compiled candidates natively with boundary interposition.
-        let traces_by_fn =
+        let (traces_by_fn, trace_stage_errors) =
             collect_traces_natively(&repo_root, &staging_dir, &staged_with_trials)?;
 
         let mut raw_trace_count_by_fn: BTreeMap<String, usize> = BTreeMap::new();
@@ -1884,28 +1936,82 @@ pub fn evaluate_itree_batches_with_options(
         }
 
         if batch_cases.is_empty() {
-            return Err("native trace collection produced 0 traces".to_string());
+            return Err(match trace_stage_errors.first() {
+                Some(err) => format!("native trace collection produced 0 traces: {err}"),
+                None => "native trace collection produced 0 traces".to_string(),
+            });
         }
 
-        // Build Anneal + all referenced Mir modules once via `lake build`.
+        // Build Anneal + referenced Mir modules via `lake build` in isolated chunks,
+        // skipping unused `__AnnealSafePadded_*` derived-trait Mir modules and
+        // isolating any candidate whose `Mir.ItreeDiffStaged.*` module fails to build.
         let anneal_dir = staging_dir.join(".anneal");
-        let lake_targets: Vec<String> = if staged_with_trials.len() > 64 {
-            vec!["Anneal".to_string(), "Mir".to_string()]
-        } else {
-            let mut targets = vec!["Anneal".to_string()];
-            for case in &batch_cases {
-                if !targets.contains(&case.config.root_mir_module) {
-                    targets.push(case.config.root_mir_module.clone());
-                }
-                for m in &case.config.callee_sig_modules {
-                    if !targets.contains(m) {
-                        targets.push(m.clone());
-                    }
+        let mut mir_modules_by_fn: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for case in &batch_cases {
+            let Some(fn_name) = case_to_fn.get(&case.case_ident) else {
+                continue;
+            };
+            let entry = mir_modules_by_fn.entry(fn_name.clone()).or_default();
+            if !entry.contains(&case.config.root_mir_module) {
+                entry.push(case.config.root_mir_module.clone());
+            }
+            for m in &case.config.callee_sig_modules {
+                if !entry.contains(m) {
+                    entry.push(m.clone());
                 }
             }
-            targets
-        };
-        run_lake_verify_targets(&anneal_dir, &lake_targets)?;
+        }
+        let mir_fn_cases: Vec<(String, Vec<String>)> = mir_modules_by_fn.into_iter().collect();
+        let mir_fn_to_fn: BTreeMap<String, String> = mir_fn_cases
+            .iter()
+            .map(|(f, _)| (f.clone(), f.clone()))
+            .collect();
+        let mir_stage = run_isolated_lean_stage(
+            "ItreeDiffMirBuild",
+            &mir_fn_cases,
+            ITREE_PROBE_CHUNK_SIZE,
+            1,
+            |(f, _): &(String, Vec<String>)| f.as_str(),
+            &mir_fn_to_fn,
+            |_label: &str, chunk: &[(String, Vec<String>)]| {
+                let mut targets = vec!["Anneal".to_string()];
+                for (_f, mods) in chunk {
+                    for m in mods {
+                        if !targets.contains(m) {
+                            targets.push(m.clone());
+                        }
+                    }
+                }
+                run_lake_verify_targets(&anneal_dir, &targets)?;
+                Ok(chunk.iter().map(|(f, _)| (f.clone(), ())).collect())
+            },
+        );
+        for err in &mir_stage.errors {
+            eprintln!("itree-difftest: Lean Mir module build failure: {err}");
+        }
+        for fn_name in &mir_stage.failed_fns {
+            if compared_fn_names.remove(fn_name) {
+                eprintln!("itree-difftest: `{fn_name}` not compared: lean_probe_failed");
+                *not_compared_reasons
+                    .entry("lean_probe_failed".to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        batch_cases.retain(|c| {
+            case_to_fn
+                .get(&c.case_ident)
+                .is_some_and(|f| compared_fn_names.contains(f))
+        });
+        if batch_cases.is_empty() {
+            return Err(format!(
+                "all ITree candidates failed Lean Mir module build: {}",
+                mir_stage
+                    .errors
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("no Mir build output")
+            ));
+        }
 
         let verify_dir = anneal_dir.join("generated/Verify/ItreeDiffStaged");
         fs::create_dir_all(&verify_dir)
@@ -1975,13 +2081,15 @@ pub fn evaluate_itree_batches_with_options(
         // Stage 2: Kernel-confirm `TraceReplayDiag.tagName` (`by rfl`) and
         // `checkRawByteTraceFullBounded_sound` + `checkRawByteTraceObsErasedBounded_sound`
         // in chunks of `<= ITREE_CONFIRM_CHUNK_SIZE` cases, each chunk importing only
-        // its own `Mir.ItreeDiffStaged.*` modules. Small batches (<= 32 distinct
-        // traces) confirm every trace; larger batches confirm every divergence plus
-        // the first trace of every candidate. `kernel_confirmed_traces` counts only
-        // traces whose theorems were actually checked by the Lean kernel.
-        let confirm_cases: Vec<BatchTraceEvalCase> = if batch_cases.len() <= 32 {
-            batch_cases.clone()
-        } else {
+        // its own `Mir.ItreeDiffStaged.*` modules. Identity-mode runs and single-chunk
+        // batches (`<= ITREE_CONFIRM_CHUNK_SIZE` distinct traces) confirm every trace;
+        // larger batches confirm every divergence plus the first trace of every
+        // candidate. `kernel_confirmed_traces` counts only traces whose theorems were
+        // actually checked by the Lean kernel.
+        let confirm_cases: Vec<BatchTraceEvalCase> =
+            if mode == "identity" || batch_cases.len() <= ITREE_CONFIRM_CHUNK_SIZE {
+                batch_cases.clone()
+            } else {
             let mut selected = Vec::new();
             let mut confirmed_fns: BTreeSet<String> = BTreeSet::new();
             for case in &batch_cases {
@@ -1997,10 +2105,11 @@ pub fn evaluate_itree_batches_with_options(
             selected
         };
 
+        let confirm_chunk_size = options.confirm_chunk_size.max(1);
         let confirm_stage = run_isolated_lean_stage(
             "ItreeDiffBatchConfirm",
             &confirm_cases,
-            ITREE_CONFIRM_CHUNK_SIZE,
+            confirm_chunk_size,
             lean_jobs,
             batch_case_ident,
             &case_to_fn,

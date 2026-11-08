@@ -264,6 +264,7 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
                 ".sub".to_string(),
             )],
             root_mir_swaps: Vec::new(),
+            ..ItreeEvalOptions::default()
         },
     )
     .expect("evaluate negative control A");
@@ -328,6 +329,7 @@ fn negative_control_mir_mutation_and_root_swap_produce_reproducible_divergences(
                     "Mir.ItreeDiffStaged.b0_c0__kernel_step".to_string(),
                 ),
             ],
+            ..ItreeEvalOptions::default()
         },
     )
     .expect("evaluate negative control B");

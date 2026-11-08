@@ -863,8 +863,9 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
                     "total_candidates": 4,
                 }
 
+            junit_xml = state_dir / "reports" / "junit_results.xml"
             with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
-                rc = run_main(state_dir)
+                rc = run_main(state_dir, "--junit-xml", str(junit_xml))
 
             self.assertEqual(rc, campaign.EXIT_HARNESS_FAILED)
             report_md = (state_dir / "reports" / "LATEST_REPORT.md").read_text(
@@ -888,6 +889,9 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
                 ledger["next_miri_seed"], f"0x{campaign.advance_seed(0x10010001):08x}"
             )
             self.assertEqual(ledger["next_itree_seed"], "0x20020002")
+            junit_text = junit_xml.read_text(encoding="utf-8")
+            self.assertIn('<failure message="harness failed">', junit_text)
+            self.assertNotIn("red-flag vacuity check failed", junit_text)
 
     def test_legacy_x20_ledger_upgrade_on_partial_failure(self) -> None:
         """The real pre-2026-11-08 x20 ledger upgrades cleanly when itree crashes."""
@@ -1140,6 +1144,182 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
             # The ledger floor (50) dominates the 4 observed paths.
             self.assertEqual(ratchet["cumulative_distinct_obs_paths"], 50)
             self.assertEqual(read_ledger(state_dir)["cumulative_distinct_obs_paths"], 50)
+
+    def test_quarantined_fingerprint_full_lifecycle(self) -> None:
+        """Quarantined fingerprints track history, pop from resolved on regression, and resolve when fixed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            fp = "BitValidityTransmuteMutator:false_positive_ub:MirDiffTag.ub:invalid_value_load"
+            write_initial_ledger(
+                state_dir,
+                active_fingerprints=[],
+                fingerprint_history={},
+                resolved_history={
+                    fp: {
+                        "first_seen_date": "2026-01-10",
+                        "last_seen_date": "2026-01-12",
+                        "campaigns_failing": 2,
+                        "resolved_date": "2026-01-13",
+                        "suite": "miri-difftest",
+                    }
+                },
+            )
+            quarantine = state_dir / "quarantine.json"
+            quarantine.write_text(json.dumps({"quarantined": [fp]}), encoding="utf-8")
+
+            observed_miri_fps = [fp]
+            call_round = [0]
+
+            def fake_run_harness(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                bonus = call_round[0]
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(
+                        state_dir,
+                        seed=harness_args[harness_args.index("--seed") + 1],
+                        fingerprints=list(observed_miri_fps),
+                        mutator_bonus=bonus,
+                    )
+                return make_healthy_itree_report(
+                    state_dir,
+                    seed=harness_args[harness_args.index("--seed") + 1],
+                    mutator_bonus=bonus,
+                )
+
+            # Campaign 1: `fp` reappears while quarantined -> popped from `resolved_history`,
+            # recorded in `fingerprint_history` with preserved `first_seen_date` and `campaigns_failing = 2`.
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
+                rc1 = run_main(state_dir, "--quarantine-file", str(quarantine))
+            self.assertEqual(rc1, campaign.EXIT_SUCCESS)
+            ledger1 = read_ledger(state_dir)
+            self.assertEqual(ledger1["active_fingerprints"], [])
+            self.assertEqual(ledger1["quarantined_fingerprints"], [fp])
+            self.assertNotIn(fp, ledger1["resolved_history"])
+            self.assertEqual(ledger1["fingerprint_history"][fp]["first_seen_date"], "2026-01-10")
+            self.assertEqual(ledger1["fingerprint_history"][fp]["campaigns_failing"], 2)
+
+            # Campaign 2: `fp` is fixed (0 findings) while still listed in quarantine file ->
+            # removed from `quarantined_fingerprints` and moved to `resolved_history`.
+            observed_miri_fps.clear()
+            call_round[0] = 1
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
+                rc2 = run_main(state_dir, "--quarantine-file", str(quarantine))
+            self.assertEqual(rc2, campaign.EXIT_SUCCESS)
+            ledger2 = read_ledger(state_dir)
+            self.assertEqual(ledger2["active_fingerprints"], [])
+            self.assertEqual(ledger2["quarantined_fingerprints"], [])
+            self.assertNotIn(fp, ledger2["fingerprint_history"])
+            self.assertIn(fp, ledger2["resolved_history"])
+            self.assertEqual(ledger2["resolved_history"][fp]["first_seen_date"], "2026-01-10")
+            self.assertEqual(ledger2["resolved_history"][fp]["campaigns_failing"], 2)
+
+    def test_itree_red_flags_enforce_candidate_trace_divergence_consistency_and_kc_floor(self) -> None:
+        """`diverge_candidates` vs `diverge_traces` and `agree_candidates + diverge_traces` floor are enforced."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            repro_file = state_dir / "repro.rs"
+            repro_file.write_text("fn main() {}\n", encoding="utf-8")
+            # 1. diverge_candidates == 0 with diverge_traces > 0 is dishonest.
+            inconsistent = make_healthy_itree_report(state_dir)
+            inconsistent["agree_traces"] = 15
+            inconsistent["diverge_traces"] = 1
+            inconsistent["kernel_confirmed_divergences"] = 1
+            inconsistent["diag_tag_counts"]["ok"] = 15
+            inconsistent["diag_tag_counts"]["outcome_mismatch"] = 1
+            inconsistent["findings"] = [
+                {
+                    "finding_id": "f0",
+                    "diag_tag": "outcome_mismatch",
+                    "kernel_confirmed": True,
+                    "repro_path": str(repro_file),
+                }
+            ]
+            red1 = campaign.evaluate_itree_red_flags(inconsistent, 0x20020002, {}, 50.0)
+            self.assertFalse(red1.checks["itree_oracle_invoked"])
+
+            # 2. With 1 diverging candidate (3 diverging traces) + 7 agreeing candidates,
+            # Stage 2 must kernel-confirm at least 7 + 3 = 10 traces.
+            div_report = make_healthy_itree_report(state_dir)
+            div_report["agree_candidates"] = 7
+            div_report["diverge_candidates"] = 1
+            div_report["agree_traces"] = 13
+            div_report["diverge_traces"] = 3
+            div_report["kernel_confirmed_divergences"] = 3
+            div_report["diag_tag_counts"]["ok"] = 13
+            div_report["diag_tag_counts"]["outcome_mismatch"] = 3
+            div_report["findings_count"] = 3
+            div_report["findings"] = [
+                {
+                    "finding_id": f"f{i}",
+                    "diag_tag": "outcome_mismatch",
+                    "kernel_confirmed": True,
+                    "repro_path": str(repro_file),
+                }
+                for i in range(3)
+            ]
+
+            div_report["kernel_confirmed_traces"] = 9
+            red_low = campaign.evaluate_itree_red_flags(div_report, 0x20020002, {}, 50.0)
+            self.assertFalse(red_low.checks["itree_oracle_invoked"])
+
+            div_report["kernel_confirmed_traces"] = 10
+            red_ok = campaign.evaluate_itree_red_flags(div_report, 0x20020002, {}, 50.0)
+            self.assertTrue(red_ok.passed, red_ok.failure_reasons)
+
+    def test_compile_only_strips_v1_live_ledger_keys(self) -> None:
+        """`--compile-only` on an existing v1 ledger strips all live-oracle keys to match `LEDGER_KEYS`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            write_initial_ledger(state_dir)
+
+            def fake_run_harness(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return {
+                        "harness": "miri-difftest",
+                        "oracle_comparison": "not_performed",
+                        "mode": "seeded",
+                        "seed": "0x10010001",
+                        "batches": 2,
+                        "batch_size": 4,
+                        "total_candidates": 8,
+                        "opt_level_0_compiled": 8,
+                        "opt_level_2_compiled": 8,
+                        "opt_level_0_and_2_compiled": 8,
+                        "compile_pass_rate_pct": 100.0,
+                        "mutator_applications": {"AddToSubMutator": 4},
+                    }
+                return {
+                    "harness": "itree-difftest",
+                    "oracle_comparison": "not_performed",
+                    "mode": "seeded",
+                    "seed": "0x20020002",
+                    "batches": 2,
+                    "batch_size": 4,
+                    "total_candidates": 8,
+                    "unsafe_token_violations": 0,
+                    "opt_level_0_compiled": 8,
+                    "opt_level_2_compiled": 8,
+                    "opt_level_0_and_2_compiled": 8,
+                    "compile_pass_rate_pct": 100.0,
+                    "mutator_applications": {"BranchLoopWeaver": 4},
+                }
+
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
+                rc = run_main(state_dir, "--compile-only")
+            self.assertEqual(rc, campaign.EXIT_NOT_EVALUATED)
+            ledger = read_ledger(state_dir)
+            expected_keys = {
+                "total_campaigns_run",
+                "last_run_utc",
+                "last_profile",
+                "last_oracle_comparison",
+                "next_miri_seed",
+                "next_itree_seed",
+                "total_miri_candidates_generated",
+                "total_itree_candidates_generated",
+            }
+            self.assertEqual(set(ledger.keys()), expected_keys)
 
 
 if __name__ == "__main__":
