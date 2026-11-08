@@ -586,10 +586,11 @@ structure ValidEnumVariantFields (layouts : LayoutTable) (tagBytes : Nat)
   scalar of width `tagBytes` whose `validRange` contains every variant index
   `v < variants.length`, `tagBytes ≤ size < 2 ^ 32`, and `align.abi.pow2 ≤ 29`.
 * Each variant `v < variants.length` satisfies `ValidEnumVariantFields`, which
-  in particular makes every variant inhabited. Anneal's `evalStmt` never
-  checks inhabitedness, while lean-miri reports `UninhabitedEnumVariantWritten`
-  for a write of an uninhabited variant, so such variants are outside this
-  correspondence. -/
+  in particular makes every variant inhabited. That excludes no translated
+  layout: Anneal's `LayoutTable` cannot express an uninhabited variant
+  (`isVariantUninhabited_translateVariantsShape_multiple`), so lean-miri's
+  `UninhabitedEnumVariantWritten` UB never fires on a translated enum, and
+  Anneal's `evalStmt` has no inhabitedness check to compare it with. -/
 structure ValidEnumLayout (ty : Ty) (layouts : LayoutTable) (tagBytes : Nat)
     (variants : List (List StructFieldDesc)) : Prop where
   is_adt : ∃ defPath adtArgs, ty.kind = .adt defPath adtArgs
@@ -684,6 +685,22 @@ theorem isEnumLayout_true {ty : Ty} {layouts : LayoutTable} {tagBytes : Nat}
   rw [hvars]
 
 end ValidEnumLayout
+
+/-- Anneal's `LayoutTable` records no per-variant inhabitedness:
+`translateVariantFieldsShape` sets `uninhabited := false` for every variant of a
+`.multiple` layout. So lean-miri's `isVariantUninhabited` is `false` at every
+in-range variant of a translated enum layout, its `UninhabitedEnumVariantWritten`
+and `UninhabitedEnumVariantRead` UB checks never fire there, and the
+`vl_inhabited` field of `ValidEnumVariantFields` excludes no translated layout. -/
+theorem isVariantUninhabited_translateVariantsShape_multiple
+    (lay : Miri.ABI.LayoutData) (tag : ScalarLayout) (tagField : Nat)
+    (shapes : List FieldsShape)
+    (hvars : lay.variants = translateVariantsShape (.multiple tag tagField shapes))
+    {v : Nat} (hv : v < shapes.length) :
+    lay.isVariantUninhabited v = false := by
+  unfold Miri.ABI.LayoutData.isVariantUninhabited
+  rw [hvars]
+  simp [translateVariantsShape, translateVariantFieldsShape, hv]
 
 /-- Static environment mapping each multi-variant enum `Ty` in `LM-2.3` to its
 `(tagBytes, variants)` layout descriptor (`none` for scalar/non-enum types). -/

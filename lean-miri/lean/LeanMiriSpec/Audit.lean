@@ -995,6 +995,7 @@ open LeanMiriSpec.Correspondence in
   step_LM2_3_eq_of_bodyFree
   ValidEnumVariantFields
   ValidEnumLayout
+  isVariantUninhabited_translateVariantsShape_multiple
   EnumMemRel
   UninitEnumMemRel
   LocalRelLM2_3
@@ -7017,6 +7018,13 @@ example :
               EnumLocalByteUninit mRes.1 localId b) ∧
             (∀ j, IsImmediateStepLocal m j → IsImmediateStepLocal mRes.1 j)) :=
   @enum_match_switchInt_simulation
+
+example :
+    ∀ (lay : Miri.ABI.LayoutData) (tag : Layout.ScalarLayout) (tagField : Nat)
+      (shapes : List Layout.FieldsShape),
+      lay.variants = translateVariantsShape (.multiple tag tagField shapes) →
+      ∀ {v : Nat}, v < shapes.length → lay.isVariantUninhabited v = false :=
+  @isVariantUninhabited_translateVariantsShape_multiple
 
 example :
     ValidEnumLayout Witness.lm23EnumTy Witness.lm23Layouts 4 Witness.lm23Variants :=
