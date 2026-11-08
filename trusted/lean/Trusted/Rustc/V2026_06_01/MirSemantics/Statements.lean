@@ -3470,8 +3470,8 @@ theorem evalStmt_assign_uninit_tuple_field_ok
 `D13b` nested aggregate field initialization (`evalStmt_assign_uninit_nested_field_ok`):
 writing `val` into a 2-level nested field path
 `[.field outerIdx outerTy, .field innerIdx innerTy]` on a live but uninitialized
-struct or union local `dstLoc` whose outer field `outerTy` is itself a
-struct/union (`.adt innerDefPath innerArgs`), with no active protector,
+struct, union, or tuple local `dstLoc` whose outer field `outerTy` is itself a
+struct/union (`.adt _ _`) or tuple (`.tuple _`), with no active protector,
 materializes both the outer and inner `.aggregate 0 ...` shells, stores `val`
 at `innerIdx` inside `outerIdx`, and steps.
 -/
@@ -3479,22 +3479,27 @@ theorem evalStmt_assign_uninit_nested_field_ok
     (s : MachineState)
     (dstLoc : Local)
     (outerIdx innerIdx : FieldIdx)
-    (innerTy : Ty)
+    (outerTy innerTy : Ty)
     (rv : Rvalue)
     (span : String)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (defPath innerDefPath : DefPath)
-    (args innerArgs : List RigidTy)
-    (layoutIdx innerLayoutIdx : Nat)
     (val : Value)
     (locals₁ : List LocalSlot)
     (mem₁ : Memory)
     (locals₂ : List LocalSlot)
     (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
     (hUninit : get? locals₁ dstLoc = .some .uninit)
-    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-      .some { kind := .adt defPath args, layoutIdx := layoutIdx })
+    (hRootAgg :
+      (∃ defPath args layoutIdx,
+        placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+          .some { kind := .adt defPath args, layoutIdx := layoutIdx }) ∨
+      (∃ tupleFields layoutIdx,
+        placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+          .some { kind := .tuple tupleFields, layoutIdx := layoutIdx }))
+    (hOuterAgg :
+      (∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
+      (∃ innerFields, outerTy.kind = .tuple innerFields))
     (hSet :
       set? locals₁ dstLoc
         (.init
@@ -3503,7 +3508,6 @@ theorem evalStmt_assign_uninit_nested_field_ok
               (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
         .some locals₂)
     (hProt : mem₁.activeProtectors = .nil) :
-    let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
     let projs : List ProjectionElem := [.field outerIdx outerTy, .field innerIdx innerTy]
     evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
       MirStepNode.step
@@ -3515,7 +3519,6 @@ theorem evalStmt_assign_uninit_nested_field_ok
                  | .some rp => rp
                  | .none => projs) }) := by
   dsimp only
-  let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
   let shell : Value :=
     .aggregate 0 (setOrExtendFields .nil outerIdx (.aggregate 0 .nil))
   let rootVal' : Value :=
@@ -3557,8 +3560,12 @@ theorem evalStmt_assign_uninit_nested_field_ok
   have hShell :
       uninitFieldWriteShell? localDecls layouts dstLoc (.field outerIdx outerTy)
         [.field innerIdx innerTy] = .some shell := by
-    simp [uninitFieldWriteShell?, ensureNestedFieldShells, stripTransparentProjections,
-      hTy, hGetNil outerIdx, outerTy, shell]
+    rcases outerTy with ⟨outerKind, outerLayoutIdx⟩
+    rcases hRootAgg with ⟨defPath, args, layoutIdx, hTy⟩ | ⟨tupleFields, layoutIdx, hTy⟩ <;>
+      rcases hOuterAgg with ⟨innerDefPath, innerArgs, hKind⟩ | ⟨innerFields, hKind⟩ <;>
+      dsimp only at hKind <;> subst hKind <;>
+      simp [uninitFieldWriteShell?, ensureNestedFieldShells, stripTransparentProjections,
+        hTy, hGetNil outerIdx, shell]
   have hWrite :
       writeProjectedValue locals₁ shell
         [.field outerIdx outerTy, .field innerIdx innerTy] val = .ok rootVal' := by
@@ -3764,7 +3771,8 @@ theorem evalStmt_assign_init_projected_step
 aggregate (`evalStmt_assign_init_unpopulated_nested_field_ok`): when `dstLoc`
 holds `.init (.aggregate variantIdx fields)` (for instance, after an earlier
 field write initialized a sibling field of `dstLoc` or after `SetDiscriminant`
-initialized an enum variant) and the slot at `outerIdx` is still unpopulated
+initialized an enum variant), `outerTy` is a struct/union (`.adt _ _`) or tuple
+(`.tuple _`), and the slot at `outerIdx` is still unpopulated
 (`get? fields outerIdx = .none ∨ get? fields outerIdx = .some .unit`), writing
 `val` into `[.field outerIdx outerTy, .field innerIdx innerTy]` materializes the
 inner `.aggregate 0 ...` shell at `outerIdx`, stores `val` at `innerIdx`, and
@@ -3776,19 +3784,19 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
     (variantIdx : VariantIdx)
     (fields : List Value)
     (outerIdx innerIdx : FieldIdx)
-    (innerTy : Ty)
+    (outerTy innerTy : Ty)
     (rv : Rvalue)
     (span : String)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (innerDefPath : DefPath)
-    (innerArgs : List RigidTy)
-    (innerLayoutIdx : Nat)
     (val : Value)
     (locals₁ locals₂ : List LocalSlot)
     (mem₁ : Memory)
     (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
     (hInit : get? locals₁ dstLoc = .some (.init (.aggregate variantIdx fields)))
+    (hOuterAgg :
+      (∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
+      (∃ innerFields, outerTy.kind = .tuple innerFields))
     (hSlot : get? fields outerIdx = .none ∨ get? fields outerIdx = .some .unit)
     (hSet :
       set? locals₁ dstLoc
@@ -3798,7 +3806,6 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
               (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
         .some locals₂)
     (hProt : mem₁.activeProtectors = .nil) :
-    let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
     let projs : List ProjectionElem := [.field outerIdx outerTy, .field innerIdx innerTy]
     evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
       MirStepNode.step
@@ -3810,7 +3817,6 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
                  | .some rp => rp
                  | .none => projs) }) := by
   dsimp only
-  let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
   have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
     intro k; cases k <;> rfl
   have hGetExt : ∀ (fs : List Value) (k : Nat) (v : Value),
@@ -3878,8 +3884,11 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
       ensureNestedFieldShells (.aggregate variantIdx fields)
         [.field outerIdx outerTy, .field innerIdx innerTy] =
         .aggregate variantIdx (setOrExtendFields fields outerIdx (.aggregate 0 .nil)) := by
-    rcases hSlot with hS | hS <;>
-      simp [ensureNestedFieldShells, stripTransparentProjections, outerTy, hS]
+    rcases outerTy with ⟨outerKind, outerLayoutIdx⟩
+    rcases hOuterAgg with ⟨innerDefPath, innerArgs, hKind⟩ | ⟨innerFields, hKind⟩ <;>
+      dsimp only at hKind <;> subst hKind <;>
+      (rcases hSlot with hS | hS <;>
+        simp [ensureNestedFieldShells, stripTransparentProjections, hS])
   have hWrite :
       writeProjectedValue locals₁
         (.aggregate variantIdx (setOrExtendFields fields outerIdx (.aggregate 0 .nil)))
@@ -3894,7 +3903,6 @@ theorem evalStmt_assign_init_unpopulated_nested_field_ok
     dsimp only [writeProjectedValue]
     rw [hSetExt fields outerIdx (.aggregate 0 .nil)
       (.aggregate 0 (setOrExtendFields .nil innerIdx val))]
-  dsimp only [outerTy] at hEns hWrite
   simp [evalStmt, hRv, hInit, hEns, hWrite, hSet, hProt]
 
 /--
