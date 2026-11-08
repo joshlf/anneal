@@ -3437,145 +3437,100 @@ private def evalCopyNonOverlappingPermOk
   let n := countBits
   let srcStart := srcPtr.offsetBytes
   let dstStart := dstPtr.offsetBytes
-  let isSingleDirect :=
-    Bool.and (Nat.beq n 1) (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
-  match isSingleDirect with
+  let srcUnionOpt :=
+    resolveUnionEndpoint? localDecls layouts locals₃ srcEntry
+  let dstUnionOpt :=
+    resolveUnionEndpoint? localDecls layouts locals₃ dstEntry
+  let hasUnionEndpoint :=
+    match srcUnionOpt, dstUnionOpt with
+    | .none, .none => false
+    | _, _ => true
+  match hasUnionEndpoint with
   | true =>
-    evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
+    evalCopyUnionBytes
+      s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+      srcUnionOpt dstUnionOpt n locals₃
   | false =>
-    let srcRootSlot : Option LocalSlot :=
-      match get? locals₃ srcEntry.targetLocal with
-      | .some slot => .some slot
-      | .none =>
-        match get? s.memory.callerLocals srcEntry.targetLocal with
+    let isSingleDirect :=
+      Bool.and (Nat.beq n 1) (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+    match isSingleDirect with
+    | true =>
+      evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
+    | false =>
+      let srcRootSlot : Option LocalSlot :=
+        match get? locals₃ srcEntry.targetLocal with
         | .some slot => .some slot
-        | .none => get? s.memory.callerLocals (Nat.sub srcEntry.targetLocal (length locals₃))
-    let dstRootSlot : Option LocalSlot :=
-      match get? locals₃ dstEntry.targetLocal with
-      | .some slot => .some slot
-      | .none =>
-        match get? s.memory.callerLocals dstEntry.targetLocal with
+        | .none =>
+          match get? s.memory.callerLocals srcEntry.targetLocal with
+          | .some slot => .some slot
+          | .none => get? s.memory.callerLocals (Nat.sub srcEntry.targetLocal (length locals₃))
+      let dstRootSlot : Option LocalSlot :=
+        match get? locals₃ dstEntry.targetLocal with
         | .some slot => .some slot
-        | .none => get? s.memory.callerLocals (Nat.sub dstEntry.targetLocal (length locals₃))
-    match srcRootSlot, dstRootSlot with
-    | .some (.init srcRootVal), .some (.init dstRootVal) =>
-      let dstPlace : Place := {
-        local_ := dstEntry.targetLocal
-        projection := dstEntry.targetProjection
-      }
-      let dstLocalPlaceTy : Option Ty :=
-        match get? locals₃ dstPlace.local_ with
-        | .some _ => placeTy localDecls layouts dstPlace
-        | .none => .none
-      let dstIsAdt : Bool :=
-        match dstLocalPlaceTy with
-        | .some { kind := .adt _ _, .. } => true
-        | _ => false
-      match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
-            readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
-      | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
-        let inBounds :=
-          Bool.and (Bool.not dstIsAdt)
-            (Bool.and (Nat.ble (Nat.add srcStart n) (length srcElems))
-              (Nat.ble (Nat.add dstStart n) (length dstElems)))
-        match inBounds with
-        | false =>
-          match Bool.and (Nat.beq dstStart 0) (Nat.ble (Nat.add srcStart n) (length srcElems)) with
+        | .none =>
+          match get? s.memory.callerLocals dstEntry.targetLocal with
+          | .some slot => .some slot
+          | .none => get? s.memory.callerLocals (Nat.sub dstEntry.targetLocal (length locals₃))
+      match srcRootSlot, dstRootSlot with
+      | .some (.init srcRootVal), .some (.init dstRootVal) =>
+        let dstPlace : Place := {
+          local_ := dstEntry.targetLocal
+          projection := dstEntry.targetProjection
+        }
+        let dstLocalPlaceTy : Option Ty :=
+          match get? locals₃ dstPlace.local_ with
+          | .some _ => placeTy localDecls layouts dstPlace
+          | .none => .none
+        let dstIsAdt : Bool :=
+          match dstLocalPlaceTy with
+          | .some { kind := .adt _ _, .. } => true
+          | _ => false
+        match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
+              readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
+        | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
+          let inBounds :=
+            Bool.and (Bool.not dstIsAdt)
+              (Bool.and (Nat.ble (Nat.add srcStart n) (length srcElems))
+                (Nat.ble (Nat.add dstStart n) (length dstElems)))
+          match inBounds with
+          | false =>
+            match Bool.and (Nat.beq dstStart 0) (Nat.ble (Nat.add srcStart n) (length srcElems)) with
+            | true =>
+              copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+                countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt
+                (.aggregate 0 srcElems) (.aggregate 0 dstElems)
+            | false => MirStepNode.fail .ub
+          | true =>
+            let sameContainer :=
+              Bool.and (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+                (projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection)
+            let disjoint :=
+              match Nat.beq srcPtr.tag dstPtr.tag with
+              | true => false
+              | false =>
+                match sameContainer with
+                | false => true
+                | true =>
+                  Bool.or (Nat.ble (Nat.add srcStart n) dstStart)
+                    (Nat.ble (Nat.add dstStart n) srcStart)
+            match disjoint with
+            | false => MirStepNode.fail .ub
+            | true =>
+              let copiedSlice := takeValues n (dropValues srcStart srcElems)
+              let dstElems' := spliceValues copiedSlice dstStart dstElems
+              copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag
+                (.aggregate 0 dstElems')
+        | .ok srcSubVal, .ok dstSubVal =>
+          copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+            countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal
+        | .ok srcSubVal, .ub =>
+          match Nat.beq dstStart 0 with
           | true =>
             copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-              countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt
-              (.aggregate 0 srcElems) (.aggregate 0 dstElems)
+              countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal .unit
           | false => MirStepNode.fail .ub
-        | true =>
-          let sameContainer :=
-            Bool.and (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-              (projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection)
-          let disjoint :=
-            match Nat.beq srcPtr.tag dstPtr.tag with
-            | true => false
-            | false =>
-              match sameContainer with
-              | false => true
-              | true =>
-                Bool.or (Nat.ble (Nat.add srcStart n) dstStart)
-                  (Nat.ble (Nat.add dstStart n) srcStart)
-          match disjoint with
-          | false => MirStepNode.fail .ub
-          | true =>
-            let copiedSlice := takeValues n (dropValues srcStart srcElems)
-            let dstElems' := spliceValues copiedSlice dstStart dstElems
-            copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag
-              (.aggregate 0 dstElems')
-      | .ok srcSubVal, .ok dstSubVal =>
-        copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-          countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal
-      | .ok srcSubVal, .ub =>
-        match Nat.beq dstStart 0 with
-        | true =>
-          copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-            countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal .unit
-        | false => MirStepNode.fail .ub
-      | .ub, _ =>
-        match srcRootVal, dstRootVal, srcEntry.targetProjection, dstEntry.targetProjection with
-        | .aggregate _ srcFields,
-          .aggregate dstVar dstFields,
-          .field _ srcFieldTy :: .nil,
-          .field _ dstFieldTy :: .nil =>
-          let overlaps :=
-            match Nat.beq srcPtr.tag dstPtr.tag with
-            | true => true
-            | false => Nat.beq srcEntry.targetLocal dstEntry.targetLocal
-          match overlaps with
-          | true => MirStepNode.fail .ub
-          | false =>
-            let elemBytesOpt : Option Nat :=
-              match operandPointeeTy localDecls layouts src with
-              | .some pt => rigidTyByteSize layouts pt
-              | .none => .some 1
-            match elemBytesOpt, rigidTyByteSize layouts srcFieldTy, rigidTyByteSize layouts dstFieldTy with
-            | .some elemSz, .some srcPlaceBytes, .some dstPlaceBytes =>
-              let copyByteLen := Nat.mul n elemSz
-              let inBounds :=
-                Bool.and (Nat.ble (Nat.add srcStart copyByteLen) srcPlaceBytes)
-                  (Nat.ble (Nat.add dstStart copyByteLen) dstPlaceBytes)
-              match inBounds with
-              | false => MirStepNode.fail .ub
-              | true =>
-                match encodeUnionFieldsWith (encodeUntypedValueToBytes defaultCodecFuel) srcPlaceBytes srcFields with
-                | .none => MirStepNode.fail .ub
-                | .some srcUnionBytes =>
-                  match sliceAbstractBytes srcUnionBytes srcStart copyByteLen with
-                  | .none => MirStepNode.fail .ub
-                  | .some copiedBytes =>
-                    match Bool.and (Nat.beq dstStart 0) (Nat.beq copyByteLen dstPlaceBytes),
-                          decodeValueFromBytes defaultCodecFuel layouts dstFieldTy copiedBytes with
-                    | true, .some decodedVal =>
-                      copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag decodedVal
-                    | _, _ =>
-                      let dstIsUnion : Bool :=
-                        match get? localDecls dstEntry.targetLocal with
-                        | .some decl =>
-                          match LayoutTable.lookup layouts decl.ty.layoutIdx with
-                          | .some l =>
-                            match l.fields with
-                            | .union _ => true
-                            | _ => false
-                          | .none => false
-                        | .none => false
-                      match dstIsUnion with
-                      | false => MirStepNode.fail .ub
-                      | true =>
-                        let resetUnion := Value.aggregate dstVar (takeValues 1 dstFields)
-                        match set? locals₃ dstEntry.targetLocal (.init resetUnion) with
-                        | .some locals₄ =>
-                          let borrows' :=
-                            invalidateConflictingBorrows s.memory.borrows dstEntry.targetLocal (.some dstPtr.tag)
-                          MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
-                        | .none => MirStepNode.fail .ub
-            | _, _, _ => MirStepNode.fail .ub
-        | _, _, _, _ => MirStepNode.fail .ub
+        | _, _ => MirStepNode.fail .ub
       | _, _ => MirStepNode.fail .ub
-    | _, _ => MirStepNode.fail .ub
 
 private theorem evalCopyNonOverlappingWithCount_eq
     (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -3682,6 +3637,44 @@ private theorem evalCopySingleDirect_isStmtNode
     | exact Or.inr (Or.inr rfl)
     | split)
 
+private theorem evalCopyUnionBytes_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (srcUnionOpt dstUnionOpt : Option UnionPlaceInfo)
+    (n : Nat) (locals₃ : List LocalSlot) :
+    evalCopyUnionBytes
+        (MachineState.pushBaseStack calleeBody baseStack s)
+        src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        srcUnionOpt dstUnionOpt n locals₃ =
+      MirStepNode.pushBaseStack calleeBody baseStack
+        (evalCopyUnionBytes
+          s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+          srcUnionOpt dstUnionOpt n locals₃) := by
+  unfold evalCopyUnionBytes
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  repeat' (first | rfl | exact copyWriteDstVal_pushBaseStack .. | split)
+
+private theorem evalCopyUnionBytes_isStmtNode
+    (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (srcUnionOpt dstUnionOpt : Option UnionPlaceInfo)
+    (n : Nat) (locals₃ : List LocalSlot) :
+    IsStmtNode
+      (evalCopyUnionBytes
+        s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        srcUnionOpt dstUnionOpt n locals₃) := by
+  unfold evalCopyUnionBytes
+  dsimp only
+  repeat' (first
+    | exact copyWriteDstVal_isStmtNode ..
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
+
 private theorem evalCopyNonOverlappingPermOk_pushBaseStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (s : MachineState) (src dst : Operand)
@@ -3698,6 +3691,7 @@ private theorem evalCopyNonOverlappingPermOk_pushBaseStack
   dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
   repeat' (first
     | rfl
+    | exact evalCopyUnionBytes_pushBaseStack ..
     | exact evalCopySingleDirect_pushBaseStack ..
     | exact copyViaBytesBody_pushBaseStack ..
     | exact copyWriteDstVal_pushBaseStack ..
@@ -3714,6 +3708,7 @@ private theorem evalCopyNonOverlappingPermOk_isStmtNode
   unfold evalCopyNonOverlappingPermOk
   dsimp only
   repeat' (first
+    | exact evalCopyUnionBytes_isStmtNode ..
     | exact evalCopySingleDirect_isStmtNode ..
     | exact copyViaBytesBody_isStmtNode ..
     | exact copyWriteDstVal_isStmtNode ..
