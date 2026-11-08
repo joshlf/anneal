@@ -1,0 +1,22 @@
+name = "Anneal"
+defaultTargets = ["Anneal"]
+
+[[lean_lib]]
+name = "Trusted"
+srcDir = "trusted/lean"
+
+[[lean_lib]]
+name = "Anneal"
+srcDir = "theory"
+
+[[lean_lib]]
+name = "MiniRust"
+srcDir = "theory"
+
+[[lean_lib]]
+name = "Correspondence"
+srcDir = "theory"
+
+[[lean_lib]]
+name = "MiniRustSpec"
+srcDir = "minirust/lean"
