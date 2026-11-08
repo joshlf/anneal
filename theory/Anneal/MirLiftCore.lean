@@ -651,7 +651,13 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
   | proj :: rest =>
     match get? locals dst.local_ with
     | some (.init rootVal) =>
-      match writeProjectedValue locals rootVal (proj :: rest) val with
+      match
+        writeProjectedValue
+          locals
+          (ensureNestedFieldShells rootVal (proj :: rest))
+          (proj :: rest)
+          val
+      with
       | .ok rootVal' =>
         match set? locals dst.local_ (.init rootVal') with
         | some locals' =>
@@ -1342,7 +1348,12 @@ theorem evalStmt_assign_of_evalRvalue {bbIdx : BasicBlockIdx} {stmtIdx : Nat}
            | uninit => cases h_write
            | init rootVal =>
              dsimp only [] at h_write ⊢
-             cases h_wp : writeProjectedValue env₁ rootVal (_ :: rest) val with
+             cases h_wp :
+                 writeProjectedValue
+                   env₁
+                   (ensureNestedFieldShells rootVal (_ :: rest))
+                   (_ :: rest)
+                   val with
              | ub => rw [h_wp] at h_write; cases h_write
              | unsupported => rw [h_wp] at h_write; cases h_write
              | ok rootVal' =>

@@ -2179,25 +2179,75 @@ theorem placeMentionOperandsInit_nil (locals : List LocalSlot) (rootSlot : Local
   cases rootSlot <;> rfl
 
 /--
+Materialize default `.aggregate 0 .nil` shells along a chain of intermediate
+aggregate `.field` projections inside `val` whenever the current slot at
+`fieldIdx` is either absent (`fieldIdx ≥ length fields`) or `.unit` padding
+produced by an earlier `setOrExtendFields` on a higher-index sibling field.
+
+When `fieldTy.kind` is a struct/union (`.adt _ _`) or tuple (`.tuple _`) and
+the remaining projection path continues with `.field _ _`, materializing an
+inner `.aggregate 0 ...` shell prevents `writeProjectedValue` from collapsing
+`.field 0` onto `.unit` (losing the inner aggregate wrapper) or faulting with
+`.ub` on `.field (k + 1)` against `.unit`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
+-/
+def ensureNestedFieldShells (val : Value) (projs : List ProjectionElem) : Value :=
+  match projs with
+  | .field fieldIdx fieldTy :: nextProj :: rest =>
+    match val with
+    | .aggregate variantIdx fields =>
+      let isInnerAggField :=
+        match fieldTy.kind, nextProj with
+        | .adt _ _, .field _ _ => true
+        | .tuple _, .field _ _ => true
+        | _, _ => false
+      match isInnerAggField with
+      | false => .aggregate variantIdx fields
+      | true =>
+        match get? fields fieldIdx with
+        | .none =>
+          let childShell :=
+            ensureNestedFieldShells (.aggregate 0 .nil) (nextProj :: rest)
+          .aggregate variantIdx (setOrExtendFields fields fieldIdx childShell)
+        | .some .unit =>
+          let childShell :=
+            ensureNestedFieldShells (.aggregate 0 .nil) (nextProj :: rest)
+          match set? fields fieldIdx childShell with
+          | .some fields' => .aggregate variantIdx fields'
+          | .none => .aggregate variantIdx fields
+        | .some childVal =>
+          let childVal' :=
+            ensureNestedFieldShells childVal (nextProj :: rest)
+          match set? fields fieldIdx childVal' with
+          | .some fields' => .aggregate variantIdx fields'
+          | .none => .aggregate variantIdx fields
+    | _ => val
+  | _ => val
+
+/--
 Default root value for a projected assignment `dst = rv` into a live but
 uninitialized destination local `loc` (`.uninit`) whose first projection
 `proj` is a field projection (`.field _ _`) and whose declared type
 (`placeTy localDecls layouts { local_ := loc, projection := .nil }`) is a
 struct, union, or tuple (`.adt _ _` or `.tuple _`).
 
-The shell is the empty aggregate `.aggregate 0 .nil`. `writeProjectedValue`
-extends an aggregate's field list on demand (`setOrExtendFields`), so the
-projected write materializes the written field. A field with a higher index
-that was never written still faults with `.ub` when read, while a lower-index
-field that was never written reads as the `.unit` padding that
-`setOrExtendFields` also uses for union fields, and a nested write such as
-`_1.0.1 = v` into an inner aggregate that was never written still faults,
-because `writeProjectedValue` pads missing fields with `.unit` rather than with
-a nested shell. Every other projection head
-(`.index`, `.constantIndex`, `.subslice`, `.downcast`, `.opaqueCast`,
-`.unwrapUnsafeBinder`; `.deref` writes never reach this helper) and every
-non-aggregate declared type yields `.none`, preserving the fault on projected
-writes into uninitialized locals.
+The shell starts as `.aggregate 0 .nil` and uses `ensureNestedFieldShells` along
+`.field fieldIdx fieldTy :: rest` so both single-level field writes (`_1.f = v`)
+and nested aggregate field writes (`_1.a.b = v` or `_1.0.1 = v`) materialize
+`.aggregate 0 ...` shells at every intermediate `.adt` or `.tuple` field.
+A field with a higher index that was never written still faults with `.ub` when
+read, while a lower-index field that was never written reads as the `.unit`
+padding that `setOrExtendFields` also uses for union fields. Every other
+projection head (`.index`, `.constantIndex`, `.subslice`, `.downcast`,
+`.opaqueCast`, `.unwrapUnsafeBinder`; `.deref` writes never reach this helper)
+and every non-aggregate declared type yields `.none`, preserving the fault on
+projected writes into uninitialized locals.
 
 Reference (MiniRust `spec/lang/step/statements.md` at commit
 `d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
@@ -2218,13 +2268,22 @@ def uninitFieldWriteShell?
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (loc : Local)
-    (proj : ProjectionElem) :
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem := .nil) :
     Option Value :=
   match proj with
-  | .field _ _ =>
+  | .field fieldIdx fieldTy =>
     match placeTy localDecls layouts { local_ := loc, projection := .nil } with
-    | .some { kind := .adt _ _, .. } => .some (.aggregate 0 .nil)
-    | .some { kind := .tuple _, .. } => .some (.aggregate 0 .nil)
+    | .some { kind := .adt _ _, .. } =>
+      .some
+        (ensureNestedFieldShells
+          (.aggregate 0 .nil)
+          (.field fieldIdx fieldTy :: rest))
+    | .some { kind := .tuple _, .. } =>
+      .some
+        (ensureNestedFieldShells
+          (.aggregate 0 .nil)
+          (.field fieldIdx fieldTy :: rest))
     | _ => .none
   | _ => .none
 
@@ -2581,7 +2640,13 @@ def evalStmt
       | proj :: rest =>
         match get? locals₁ dst.local_ with
         | .some (.init rootVal) =>
-          match writeProjectedValue locals₁ rootVal (proj :: rest) val with
+          match
+            writeProjectedValue
+              locals₁
+              (ensureNestedFieldShells rootVal (proj :: rest))
+              (proj :: rest)
+              val
+          with
           | .ok rootVal' =>
             match set? locals₁ dst.local_ (.init rootVal') with
             | .some locals₂ =>
@@ -2622,7 +2687,7 @@ def evalStmt
           | .ub => MirStepNode.fail .ub
           | .unsupported => MirStepNode.unsupported
         | .some .uninit =>
-          match uninitFieldWriteShell? localDecls layouts dst.local_ proj with
+          match uninitFieldWriteShell? localDecls layouts dst.local_ proj rest with
           | .some rootVal =>
             match writeProjectedValue locals₁ rootVal (proj :: rest) val with
             | .ok rootVal' =>
@@ -3028,8 +3093,19 @@ theorem evalStmt_placeMention_nonDeref_index_iff
         intro h <;> nomatch h
 
 /--
-`uninitFieldWriteShell?` returns the empty aggregate shell exactly for a field
-projection head on a local whose declared type is a struct, union, or tuple.
+`ensureNestedFieldShells` on a single-element projection list `[proj]` is the
+identity on `val`.
+-/
+@[simp]
+theorem ensureNestedFieldShells_singleton
+    (val : Value)
+    (proj : ProjectionElem) :
+    ensureNestedFieldShells val [proj] = val := by
+  cases proj <;> rfl
+
+/--
+`uninitFieldWriteShell?` returns the empty aggregate shell for a single-level
+field projection on a local whose declared type is a struct or union.
 -/
 theorem uninitFieldWriteShell?_field_adt
     (localDecls : List LocalDecl)
@@ -3047,8 +3123,8 @@ theorem uninitFieldWriteShell?_field_adt
   simp [uninitFieldWriteShell?, hTy]
 
 /--
-`uninitFieldWriteShell?` returns the empty aggregate shell for a field
-projection head on a tuple-typed local.
+`uninitFieldWriteShell?` returns the empty aggregate shell for a single-level
+field projection on a tuple-typed local.
 -/
 theorem uninitFieldWriteShell?_field_tuple
     (localDecls : List LocalDecl)
@@ -3066,29 +3142,88 @@ theorem uninitFieldWriteShell?_field_tuple
 
 /--
 `uninitFieldWriteShell?` yields `.none` for every projection head other than a
-field projection.
+field projection, regardless of any trailing projections `rest`.
 -/
 theorem uninitFieldWriteShell?_eq_none_of_not_field
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (loc : Local)
     (proj : ProjectionElem)
+    (rest : List ProjectionElem := .nil)
     (hNotField : ∀ (fieldIdx : FieldIdx) (fieldTy : Ty), proj ≠ .field fieldIdx fieldTy) :
-    uninitFieldWriteShell? localDecls layouts loc proj = .none := by
+    uninitFieldWriteShell? localDecls layouts loc proj rest = .none := by
   cases proj with
   | field fieldIdx fieldTy => exact False.elim (hNotField fieldIdx fieldTy rfl)
   | _ => rfl
 
 /--
+`uninitFieldWriteShell?` yields `.none` whenever the destination local's
+declared root type is neither a struct/union (`.adt _ _`) nor a tuple
+(`.tuple _`).
+-/
+theorem uninitFieldWriteShell?_eq_none_of_non_aggregate_ty
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem := .nil)
+    (hNotAdt : ∀ (defPath : DefPath) (args : List RigidTy) (layoutIdx : Nat),
+      placeTy localDecls layouts { local_ := loc, projection := .nil } ≠
+        .some { kind := .adt defPath args, layoutIdx := layoutIdx })
+    (hNotTuple : ∀ (fields : List RigidTy) (layoutIdx : Nat),
+      placeTy localDecls layouts { local_ := loc, projection := .nil } ≠
+        .some { kind := .tuple fields, layoutIdx := layoutIdx }) :
+    uninitFieldWriteShell? localDecls layouts loc proj rest = .none := by
+  cases proj with
+  | field fieldIdx fieldTy =>
+    unfold uninitFieldWriteShell?
+    cases hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } with
+    | none => rfl
+    | some ty =>
+      rcases ty with ⟨kind, layoutIdx⟩
+      cases kind with
+      | adt defPath args => exact False.elim (hNotAdt defPath args layoutIdx hTy)
+      | tuple fields => exact False.elim (hNotTuple fields layoutIdx hTy)
+      | _ => rfl
+  | _ => rfl
+
+/--
+Whether `uninitFieldWriteShell?` returns `.none` depends only on the root local
+and the head projection `proj`, not on the trailing projection path `rest`.
+-/
+@[simp]
+theorem uninitFieldWriteShell?_eq_none_iff
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem) :
+    uninitFieldWriteShell? localDecls layouts loc proj rest = .none ↔
+      uninitFieldWriteShell? localDecls layouts loc proj .nil = .none := by
+  cases proj with
+  | field fieldIdx fieldTy =>
+    unfold uninitFieldWriteShell?
+    cases hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } with
+    | none => simp
+    | some ty =>
+      rcases ty with ⟨kind, layoutIdx⟩
+      cases kind <;> simp
+  | _ => simp [uninitFieldWriteShell?]
+
+/--
 Universal characterization (`D13b`) of a projected assignment
 `dst = rv` with `dst.projection = .field fieldIdx fieldTy :: rest` into a live
 but uninitialized local `dstLoc` with a struct, union, or tuple shell
-(`uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
-.some shell`): when the projected write into the shell succeeds
-(`writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
-.ok rootVal'`) and no active protector conflicts with the write, `evalStmt`
-initializes `dstLoc` to `rootVal'`, invalidates the borrows conflicting with
-the written projection, and steps.
+(`uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
+.some shell`):
+1. When the projected write into the shell succeeds
+   (`writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
+   .ok rootVal'`) and no active protector conflicts with the write, `evalStmt`
+   initializes `dstLoc` to `rootVal'`, invalidates the borrows conflicting with
+   the written projection, and steps.
+2. When an active function-entry protector conflicts with the write
+   (`hasProtectedWriteConflict = true`), `evalStmt` faults with
+   `MirStepNode.fail .ub`.
 -/
 theorem evalStmt_assign_uninit_aggregate_field_step
     (s : MachineState)
@@ -3107,7 +3242,7 @@ theorem evalStmt_assign_uninit_aggregate_field_step
     (locals₂ : List LocalSlot)
     (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
     (hUninit : get? locals₁ dstLoc = .some .uninit)
-    (hShell : uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
+    (hShell : uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
       .some shell)
     (hWrite : writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
       .ok rootVal')
@@ -3132,6 +3267,46 @@ theorem evalStmt_assign_uninit_aggregate_field_step
   | cons protHead protTail =>
     have hC := hNoConflict protHead protTail hAP
     simp [evalStmt, hRv, hUninit, hShell, hWrite, hSet, hAP, hC]
+
+/--
+`D13b` protected-write conflict boundary: when an uninitialized aggregate field
+write would disable a borrow protected by an active function-entry protector
+(`hasProtectedWriteConflict = true`), `evalStmt` faults with
+`MirStepNode.fail .ub`.
+-/
+theorem evalStmt_assign_uninit_aggregate_field_protected_conflict_ub
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (shell rootVal' : Value)
+    (locals₂ : List LocalSlot)
+    (protHead : Nat)
+    (protTail : List Nat)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hShell : uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
+      .some shell)
+    (hWrite : writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
+      .ok rootVal')
+    (hSet : set? locals₁ dstLoc (.init rootVal') = .some locals₂)
+    (hAP : mem₁.activeProtectors = protHead :: protTail)
+    (hConflict :
+      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
+        (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
+         | .some rp => rp
+         | .none => .field fieldIdx fieldTy :: rest) = true) :
+    evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.fail .ub := by
+  simp [evalStmt, hRv, hUninit, hShell, hWrite, hSet, hAP, hConflict]
 
 /--
 `D13b` union / struct field initialization (`evalStmt_assign_uninit_union_field_ok`):
@@ -3185,6 +3360,163 @@ theorem evalStmt_assign_uninit_union_field_ok
     (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
 
 /--
+`D13b` tuple field initialization (`evalStmt_assign_uninit_tuple_field_ok`):
+writing `val` into field `fieldIdx` of a live but uninitialized local `dstLoc`
+whose declared type is a tuple (`.tuple fields`), with no active protector,
+initializes `dstLoc` to `.aggregate 0 (setOrExtendFields .nil fieldIdx val)`
+and steps.
+-/
+theorem evalStmt_assign_uninit_tuple_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (fields : List RigidTy)
+    (layoutIdx : Nat)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (locals₂ : List LocalSlot)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+      .some { kind := .tuple fields, layoutIdx := layoutIdx })
+    (hSet : set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+      .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: .nil⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
+                 | .some rp => rp
+                 | .none => .field fieldIdx fieldTy :: .nil) }) := by
+  have hShell :=
+    uninitFieldWriteShell?_field_tuple localDecls layouts dstLoc fieldIdx fieldTy
+      fields layoutIdx hTy
+  have hWrite :
+      writeProjectedValue locals₁ (.aggregate 0 .nil) (.field fieldIdx fieldTy :: .nil) val =
+        .ok (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) := by
+    cases fieldIdx <;> rfl
+  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx fieldTy .nil rv span
+    localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil)
+    (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) locals₂ hRv hUninit hShell hWrite hSet
+    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+
+/--
+`D13b` nested aggregate field initialization (`evalStmt_assign_uninit_nested_field_ok`):
+writing `val` into a 2-level nested field path
+`[.field outerIdx outerTy, .field innerIdx innerTy]` on a live but uninitialized
+struct or union local `dstLoc` whose outer field `outerTy` is itself a
+struct/union (`.adt innerDefPath innerArgs`), with no active protector,
+materializes both the outer and inner `.aggregate 0 ...` shells, stores `val`
+at `innerIdx` inside `outerIdx`, and steps.
+-/
+theorem evalStmt_assign_uninit_nested_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (outerIdx innerIdx : FieldIdx)
+    (innerTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (defPath innerDefPath : DefPath)
+    (args innerArgs : List RigidTy)
+    (layoutIdx innerLayoutIdx : Nat)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (locals₂ : List LocalSlot)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+      .some { kind := .adt defPath args, layoutIdx := layoutIdx })
+    (hSet :
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate 0
+            (setOrExtendFields .nil outerIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
+    let projs : List ProjectionElem := [.field outerIdx outerTy, .field innerIdx innerTy]
+    evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ projs with
+                 | .some rp => rp
+                 | .none => projs) }) := by
+  dsimp only
+  let outerTy : Ty := { kind := .adt innerDefPath innerArgs, layoutIdx := innerLayoutIdx }
+  let shell : Value :=
+    .aggregate 0 (setOrExtendFields .nil outerIdx (.aggregate 0 .nil))
+  let rootVal' : Value :=
+    .aggregate 0
+      (setOrExtendFields .nil outerIdx
+        (.aggregate 0 (setOrExtendFields .nil innerIdx val)))
+  have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
+    intro k; cases k <;> rfl
+  have hGetExt : ∀ (k : Nat) (v : Value),
+      get? (setOrExtendFields .nil k v) k = .some v := by
+    intro k v
+    induction k with
+    | zero => rfl
+    | succ n ih => exact ih
+  have hLenExt : ∀ (k : Nat) (v : Value),
+      (setOrExtendFields .nil k v).length = k + 1 := by
+    intro k v
+    induction k with
+    | zero => rfl
+    | succ n ih =>
+      change (Value.unit :: setOrExtendFields .nil n v).length = n + 1 + 1
+      simp [ih]
+  have hListSetExt : ∀ (k : Nat) (v w : Value),
+      (setOrExtendFields .nil k v).set k w = setOrExtendFields .nil k w := by
+    intro k v w
+    induction k with
+    | zero => rfl
+    | succ n ih =>
+      change (Value.unit :: setOrExtendFields .nil n v).set (n + 1) w =
+        Value.unit :: setOrExtendFields .nil n w
+      simp [ih]
+  have hSetExt : ∀ (k : Nat) (v w : Value),
+      set? (setOrExtendFields .nil k v) k w = .some (setOrExtendFields .nil k w) := by
+    intro k v w
+    change (if k < (setOrExtendFields .nil k v).length then
+        some ((setOrExtendFields .nil k v).set k w) else none) =
+      .some (setOrExtendFields .nil k w)
+    simp [hLenExt k v, hListSetExt k v w]
+  have hShell :
+      uninitFieldWriteShell? localDecls layouts dstLoc (.field outerIdx outerTy)
+        [.field innerIdx innerTy] = .some shell := by
+    simp [uninitFieldWriteShell?, ensureNestedFieldShells, hTy, hGetNil outerIdx, outerTy, shell]
+  have hWrite :
+      writeProjectedValue locals₁ shell
+        [.field outerIdx outerTy, .field innerIdx innerTy] val = .ok rootVal' := by
+    dsimp only [shell, rootVal', writeProjectedValue]
+    rw [hGetExt outerIdx (.aggregate 0 .nil)]
+    dsimp only [writeProjectedValue]
+    rw [hGetNil innerIdx]
+    dsimp only [writeProjectedValue]
+    rw [hSetExt outerIdx (.aggregate 0 .nil)
+      (.aggregate 0 (setOrExtendFields .nil innerIdx val))]
+  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc outerIdx outerTy
+    [.field innerIdx innerTy] rv span localDecls layouts val locals₁ mem₁ shell rootVal'
+    locals₂ hRv hUninit hShell hWrite hSet
+    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+
+/--
 `D13b` boundary (`evalStmt_assign_uninit_non_aggregate_ub`): a projected
 assignment into a live but uninitialized local still faults with
 `MirStepNode.fail .ub` whenever no default shell applies
@@ -3211,8 +3543,11 @@ theorem evalStmt_assign_uninit_non_aggregate_ub
     (hNoShell : uninitFieldWriteShell? localDecls layouts dstLoc proj = .none) :
     evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.fail .ub := by
+  have hNoShellRest :
+      uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none :=
+    (uninitFieldWriteShell?_eq_none_iff localDecls layouts dstLoc proj rest).mpr hNoShell
   cases proj with
   | deref => exact False.elim (hNotDeref rfl)
-  | _ => simp [evalStmt, hRv, hUninit, hNoShell]
+  | _ => simp [evalStmt, hRv, hUninit, hNoShellRest]
 
 end Trusted.Rustc.V2026_06_01.MirSemantics

@@ -850,7 +850,13 @@ private def evalAssignNonDeref
     (localDecls : List LocalDecl) (layouts : LayoutTable) : MirStepNode :=
   match get? locals₁ dstLoc with
   | .some (.init rootVal) =>
-    match writeProjectedValue locals₁ rootVal proj val with
+    match
+      writeProjectedValue
+        locals₁
+        (ensureNestedFieldShells rootVal proj)
+        proj
+        val
+    with
     | .ok rootVal' =>
       match set? locals₁ dstLoc (.init rootVal') with
       | .some locals₂ =>
@@ -882,7 +888,7 @@ private def evalAssignNonDeref
     | .unsupported => MirStepNode.unsupported
   | .some .uninit =>
     match (match proj with
-       | hd :: _ => uninitFieldWriteShell? localDecls layouts dstLoc hd
+       | hd :: tl => uninitFieldWriteShell? localDecls layouts dstLoc hd tl
        | .nil => .none) with
     | .some rootVal =>
       match writeProjectedValue locals₁ rootVal proj val with
@@ -1207,7 +1213,7 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
           cases slot with
           | uninit =>
             dsimp only
-            cases uninitFieldWriteShell? localDecls layouts dstLoc hd with
+            cases uninitFieldWriteShell? localDecls layouts dstLoc hd tl with
             | none => rfl
             | some rootVal =>
               dsimp only
@@ -1231,7 +1237,7 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
           | dead => rfl
           | init rootVal =>
             dsimp only
-            cases writeProjectedValue locals₁ rootVal _ val with
+            cases writeProjectedValue locals₁ (ensureNestedFieldShells rootVal (hd :: tl)) _ val with
             | ub => rfl
             | unsupported => rfl
             | ok rootVal' =>
@@ -12460,7 +12466,7 @@ theorem PureMirModularConverges.step_stmt
             cases sl with
             | uninit =>
               dsimp only at h_eval ⊢
-              cases h_sh : uninitFieldWriteShell? body.localDecls body.layouts dstLoc hd with
+              cases h_sh : uninitFieldWriteShell? body.localDecls body.layouts dstLoc hd tl with
               | none => rw [h_sh] at h_eval; nomatch h_eval
               | some rootVal =>
                 rw [h_sh] at h_eval
@@ -12483,7 +12489,9 @@ theorem PureMirModularConverges.step_stmt
             | dead => nomatch h_eval
             | init rootVal =>
               dsimp only at h_eval ⊢
-              generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_eval ⊢
+              generalize
+                writeProjectedValue l1 (ensureNestedFieldShells rootVal (hd :: tl)) _ val =
+                  wpvRes at h_eval ⊢
               cases wpvRes with
               | ub => nomatch h_eval
               | unsupported => nomatch h_eval
@@ -14127,7 +14135,7 @@ private theorem sameExceptBorrows_step_noCall
                         dsimp only at h_wp h_inv_next ⊢
                         cases h_sh : uninitFieldWriteShell?
                             (s₁.memory.activeCallee.getD body).localDecls
-                            (s₁.memory.activeCallee.getD body).layouts dstLoc hd with
+                            (s₁.memory.activeCallee.getD body).layouts dstLoc hd tl with
                         | none => rw [h_sh] at h_wp; exact False.elim h_wp
                         | some rootVal =>
                           rw [h_sh] at h_wp h_inv_next
@@ -14151,7 +14159,9 @@ private theorem sameExceptBorrows_step_noCall
                       | dead => exact False.elim h_wp
                       | init rootVal =>
                         dsimp only at h_wp h_inv_next ⊢
-                        generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_wp h_inv_next ⊢
+                        generalize
+                          writeProjectedValue l1 (ensureNestedFieldShells rootVal (hd :: tl)) _ val =
+                            wpvRes at h_wp h_inv_next ⊢
                         cases wpvRes with
                         | ub => exact False.elim h_wp
                         | unsupported => exact False.elim h_wp

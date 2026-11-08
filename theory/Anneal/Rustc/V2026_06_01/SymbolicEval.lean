@@ -1621,7 +1621,13 @@ def finishAssignStmtNode
     | proj :: rest =>
       match get? locals₁ dst.local_ with
       | .some (.init rootVal) =>
-        match writeProjectedValue locals₁ rootVal (proj :: rest) val with
+        match
+          writeProjectedValue
+            locals₁
+            (ensureNestedFieldShells rootVal (proj :: rest))
+            (proj :: rest)
+            val
+        with
         | .ok rootVal' =>
           match set? locals₁ dst.local_ (.init rootVal') with
           | .some locals₂ =>
@@ -1662,7 +1668,7 @@ def finishAssignStmtNode
         | .ub => MirStepNode.fail .ub
         | .unsupported => MirStepNode.unsupported
       | .some .uninit =>
-        match uninitFieldWriteShell? localDecls layouts dst.local_ proj with
+        match uninitFieldWriteShell? localDecls layouts dst.local_ proj rest with
         | .some rootVal =>
           match writeProjectedValue locals₁ rootVal (proj :: rest) val with
           | .ok rootVal' =>
