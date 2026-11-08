@@ -1541,7 +1541,9 @@ theorem evalRvalueSymCont_eq
 /-- Direct `MirStepNode` completion of `StatementKind.assign dst rv`. -/
 def finishAssignStmtNode
     (s : MachineState)
-    (dst : Place) :
+    (dst : Place)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
     RvalueEvalResult → MirStepNode
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
@@ -1619,7 +1621,13 @@ def finishAssignStmtNode
     | proj :: rest =>
       match get? locals₁ dst.local_ with
       | .some (.init rootVal) =>
-        match writeProjectedValue locals₁ rootVal (proj :: rest) val with
+        match
+          writeProjectedValue
+            locals₁
+            (ensureNestedFieldShells rootVal (proj :: rest))
+            (proj :: rest)
+            val
+        with
         | .ok rootVal' =>
           match set? locals₁ dst.local_ (.init rootVal') with
           | .some locals₂ =>
@@ -1659,7 +1667,50 @@ def finishAssignStmtNode
           | .none => MirStepNode.fail .ub
         | .ub => MirStepNode.fail .ub
         | .unsupported => MirStepNode.unsupported
-      | .some .uninit => MirStepNode.fail .ub
+      | .some .uninit =>
+        match uninitFieldWriteShell? localDecls layouts dst.local_ proj rest with
+        | .some rootVal =>
+          match writeProjectedValue locals₁ rootVal (proj :: rest) val with
+          | .ok rootVal' =>
+            match set? locals₁ dst.local_ (.init rootVal') with
+            | .some locals₂ =>
+              let resolvedLocalProj :=
+                match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+                | .some rp => rp
+                | .none => proj :: rest
+              match mem₁.activeProtectors with
+              | .nil =>
+                let borrows' :=
+                  invalidateConflictingBorrowsAtProj
+                    mem₁.borrows
+                    dst.local_
+                    .none
+                    resolvedLocalProj
+                MirStepNode.step
+                  (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+              | protHead :: protTail =>
+                match
+                  hasProtectedWriteConflict
+                    mem₁.borrows
+                    (protHead :: protTail)
+                    dst.local_
+                    .none
+                    resolvedLocalProj
+                with
+                | true => MirStepNode.fail .ub
+                | false =>
+                  let borrows' :=
+                    invalidateConflictingBorrowsAtProj
+                      mem₁.borrows
+                      dst.local_
+                      .none
+                      resolvedLocalProj
+                  MirStepNode.step
+                    (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+            | .none => MirStepNode.fail .ub
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
+        | .none => MirStepNode.fail .ub
       | .some .dead => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
 
@@ -1672,7 +1723,7 @@ def evalStmtSymTree
   match stmt.kind with
   | .assign dst rv =>
     (evalRvalueSymTree s.frame.locals rv s.memory localDecls layouts).bind
-      (fun res => .leaf (finishAssignStmtNode s dst res))
+      (fun res => .leaf (finishAssignStmtNode s dst localDecls layouts res))
   | _ => .leaf (evalStmt s stmt localDecls layouts)
 
 theorem evalStmtSymTree_eval
