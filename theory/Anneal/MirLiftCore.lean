@@ -2596,7 +2596,8 @@ theorem evalRvalueSymTreeFast_eq
   | _ => rfl
 
 def finishAssignStmtNodeFast
-    (s : MachineState) (dst : Place) : RvalueEvalResult → MirStepNode
+    (s : MachineState) (dst : Place) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvalueEvalResult → MirStepNode
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
   | .ok val locals₁ mem₁ =>
@@ -2615,11 +2616,13 @@ def finishAssignStmtNodeFast
             MirStepNode.step (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .none => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
-    | _ => finishAssignStmtNode s dst (.ok val locals₁ mem₁)
+    | _ => finishAssignStmtNode s dst localDecls layouts (.ok val locals₁ mem₁)
 
 theorem finishAssignStmtNodeFast_eq
-    (s : MachineState) (dst : Place) (res : RvalueEvalResult) :
-    finishAssignStmtNodeFast s dst res = finishAssignStmtNode s dst res := by
+    (s : MachineState) (dst : Place) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (res : RvalueEvalResult) :
+    finishAssignStmtNodeFast s dst localDecls layouts res =
+      finishAssignStmtNode s dst localDecls layouts res := by
   cases res with
   | ub => rfl
   | unsupported => rfl
@@ -2663,7 +2666,7 @@ def evalStmtFast
     (body : CapturedMir) (s : MachineState) (stmt : Statement) : MirStepNode :=
   match stmt.kind with
   | .assign dst rv =>
-    finishAssignStmtNodeFast s dst
+    finishAssignStmtNodeFast s dst body.localDecls body.layouts
       (evalRvalueFast body s.frame.locals rv s.memory)
   | .storageLive loc =>
     match get? s.frame.locals loc with
@@ -2723,21 +2726,26 @@ theorem evalStmtFast_eq
   rcases stmt with ⟨kind, span⟩
   cases kind with
   | assign dst rv =>
-    show finishAssignStmtNodeFast s dst (evalRvalueFast body s.frame.locals rv s.memory) = _
+    show finishAssignStmtNodeFast s dst body.localDecls body.layouts
+      (evalRvalueFast body s.frame.locals rv s.memory) = _
     rw [finishAssignStmtNodeFast_eq, evalRvalueFast_eq]
     dsimp only [finishAssignStmtNode, evalStmt]
     cases evalRvalue s.frame.locals rv s.memory body.localDecls body.layouts <;> rfl
   | _ => rfl
 
-def finishAssignSymTree (s : MachineState) (dst : Place) :
+def finishAssignSymTree (s : MachineState) (dst : Place)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
     SymTree RvalueEvalResult → SymTree MirStepNode
-  | .leaf res => .leaf (finishAssignStmtNode s dst res)
-  | .branch c t1 t2 => .branch c (finishAssignSymTree s dst t1) (finishAssignSymTree s dst t2)
+  | .leaf res => .leaf (finishAssignStmtNode s dst localDecls layouts res)
+  | .branch c t1 t2 =>
+    .branch c (finishAssignSymTree s dst localDecls layouts t1)
+      (finishAssignSymTree s dst localDecls layouts t2)
 
 theorem finishAssignSymTree_eq (s : MachineState) (dst : Place)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
     (t : SymTree RvalueEvalResult) :
-    finishAssignSymTree s dst t =
-      t.bind (fun res => .leaf (finishAssignStmtNode s dst res)) := by
+    finishAssignSymTree s dst localDecls layouts t =
+      t.bind (fun res => .leaf (finishAssignStmtNode s dst localDecls layouts res)) := by
   induction t with
   | leaf _ => rfl
   | branch _ _ _ ih1 ih2 =>
@@ -2748,7 +2756,7 @@ def evalStmtSymTreeFast
     (body : CapturedMir) (s : MachineState) (stmt : Statement) : SymTree MirStepNode :=
   match stmt.kind with
   | .assign dst rv =>
-    finishAssignSymTree s dst
+    finishAssignSymTree s dst body.localDecls body.layouts
       (evalRvalueSymTreeFast body s.frame.locals rv s.memory)
   | .storageLive loc =>
     .leaf
@@ -2810,7 +2818,8 @@ theorem evalStmtSymTreeFast_eq
   rcases stmt with ⟨kind, span⟩
   cases kind with
   | assign dst rv =>
-    show finishAssignSymTree s dst (evalRvalueSymTreeFast body s.frame.locals rv s.memory) =
+    show finishAssignSymTree s dst body.localDecls body.layouts
+        (evalRvalueSymTreeFast body s.frame.locals rv s.memory) =
       (evalRvalueSymTree s.frame.locals rv s.memory body.localDecls body.layouts).bind _
     rw [finishAssignSymTree_eq, evalRvalueSymTreeFast_eq]
   | _ => rfl

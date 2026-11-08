@@ -5416,4 +5416,103 @@ theorem stmt_div_placeMention_deref_index_uninit_is_ub :
 
 end StatementDivergenceRegressions
 
+/-! ## 7. Uninitialized Aggregate Field Writes (`D13b`)
+
+Kernel-checked executions of projected assignments into a field of a live but
+uninitialized struct, union, or tuple local (`uninitFieldWriteShell?` in
+`evalStmt`). Each body faulted with `.ub` at its first field write before the
+default aggregate shell was introduced. -/
+
+section UninitAggregateFieldWrites
+
+open Trusted.Effect
+
+/-- `u32` local type used by the union field regression body. -/
+private def stmtDivU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+
+/-- `u32` constant operand. -/
+private def stmtDivConstU32 (n : Nat) : Operand :=
+  .constant ⟨stmtDivU32Ty, .scalar (.int ⟨n, 4⟩)⟩
+
+/-- `union U { f0: u32, f1: u32 }`. -/
+private def stmtDivUnionTy : Ty := { kind := .adt "stmt_div::U" [], layoutIdx := 0 }
+
+/-- `struct S { a: u64, b: u64 }`. -/
+private def stmtDivStructTy : Ty := { kind := .adt "stmt_div::S" [], layoutIdx := 0 }
+
+/-- `(u64, u64)`. -/
+private def stmtDivPairTy : Ty := { kind := .tuple [.uint .u64, .uint .u64], layoutIdx := 0 }
+
+/-- `D13b` (`step_union_field_write_uninit_divergence`): initialize field `f0`
+of an uninitialized union local and read it back:
+```text
+StorageLive(_1); _1.f0 = const 42_u32; _0 = copy (_1.f0); return
+``` -/
+private def stmtDivUnionFieldInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::union_field_write_into_uninit"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU32Ty]⟩ (.use (stmtDivConstU32 42)),
+        span := "_1.f0 = 42" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 0 stmtDivU32Ty]⟩)),
+        span := "_0 = copy _1.f0" } ]
+
+/-- `D13b` regression: the union field write initializes `_1.f0` and the body
+returns `42` (Anneal previously faulted with `.ub` at `_1.f0 = 42`). -/
+theorem stmt_div_assign_uninit_union_field_ok :
+    diffCProbeBounded 16 stmtDivUnionFieldInitBody
+      (.running (initMachineState stmtDivUnionFieldInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨42, 4⟩)) := by
+  rfl
+
+/-- `D13b` struct variant: initialize both fields of an uninitialized struct
+local out of declaration order and read the first one back:
+```text
+StorageLive(_1); _1.b = const 7_u64; _1.a = const 5_u64; _0 = copy (_1.a); return
+``` -/
+private def stmtDivStructFieldInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::struct_fields_written_out_of_order_into_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivStructTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 7)),
+        span := "_1.b = 7" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 5)),
+        span := "_1.a = 5" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 0 stmtDivU64Ty]⟩)),
+        span := "_0 = copy _1.a" } ]
+
+/-- `D13b` struct regression: the body returns `5` (Anneal previously faulted
+with `.ub` at `_1.b = 7`). -/
+theorem stmt_div_assign_uninit_struct_fields_ok :
+    diffCProbeBounded 16 stmtDivStructFieldInitBody
+      (.running (initMachineState stmtDivStructFieldInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
+  rfl
+
+/-- `D13b` tuple variant: initialize both fields of an uninitialized pair local
+and read the second one back:
+```text
+StorageLive(_1); _1.0 = const 3_u64; _1.1 = const 4_u64; _0 = copy (_1.1); return
+``` -/
+private def stmtDivPairFieldInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::tuple_fields_written_into_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivPairTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 3)),
+        span := "_1.0 = 3" },
+      { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 4)),
+        span := "_1.1 = 4" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 1 stmtDivU64Ty]⟩)),
+        span := "_0 = copy _1.1" } ]
+
+/-- `D13b` tuple regression: the body returns `4` (Anneal previously faulted
+with `.ub` at `_1.0 = 3`). -/
+theorem stmt_div_assign_uninit_tuple_fields_ok :
+    diffCProbeBounded 16 stmtDivPairFieldInitBody
+      (.running (initMachineState stmtDivPairFieldInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨4, 8⟩)) := by
+  rfl
+
+end UninitAggregateFieldWrites
+
 end Correspondence.V2026_06_01.L5_ControlAndCalls

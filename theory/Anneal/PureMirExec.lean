@@ -846,7 +846,8 @@ theorem memory_with_borrows_nil_eq {mem : Memory} (h : mem.borrows = []) :
 
 private def evalAssignNonDeref
     (s : MachineState) (dstLoc : Local) (proj : List ProjectionElem)
-    (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory) : MirStepNode :=
+    (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) : MirStepNode :=
   match get? locals₁ dstLoc with
   | .some (.init rootVal) =>
     match writeProjectedValue locals₁ rootVal proj val with
@@ -879,13 +880,49 @@ private def evalAssignNonDeref
       | .none => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
-  | .some .uninit => MirStepNode.fail .ub
+  | .some .uninit =>
+    match (match proj with
+       | hd :: _ => uninitFieldWriteShell? localDecls layouts dstLoc hd
+       | .nil => .none) with
+    | .some rootVal =>
+      match writeProjectedValue locals₁ rootVal proj val with
+      | .ok rootVal' =>
+        match set? locals₁ dstLoc (.init rootVal') with
+        | .some locals₂ =>
+          let resolvedLocalProj :=
+            match resolveBorrowProjectionElems locals₁ proj with
+            | .some rp => rp
+            | .none => proj
+          match mem₁.activeProtectors with
+          | .nil =>
+            let borrows' :=
+              invalidateConflictingBorrowsAtProj
+                mem₁.borrows dstLoc .none resolvedLocalProj
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+          | protHead :: protTail =>
+            match
+              hasProtectedWriteConflict
+                mem₁.borrows (protHead :: protTail) dstLoc .none resolvedLocalProj
+            with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let borrows' :=
+                invalidateConflictingBorrowsAtProj
+                  mem₁.borrows dstLoc .none resolvedLocalProj
+              MirStepNode.step
+                (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        | .none => MirStepNode.fail .ub
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+    | .none => MirStepNode.fail .ub
   | .some .dead => MirStepNode.fail .ub
   | .none => MirStepNode.fail .ub
 
 private def evalAssignDst
     (s : MachineState) (dst : Place) (val : Value)
-    (locals₁ : List LocalSlot) (mem₁ : Memory) : MirStepNode :=
+    (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) : MirStepNode :=
   match dst.projection with
   | .nil =>
     match get? locals₁ dst.local_ with
@@ -936,14 +973,14 @@ private def evalAssignDst
         | .unsupported => MirStepNode.unsupported
     | .unsupported => MirStepNode.unsupported
   | hd :: tl =>
-    evalAssignNonDeref s dst.local_ (hd :: tl) val locals₁ mem₁
+    evalAssignNonDeref s dst.local_ (hd :: tl) val locals₁ mem₁ localDecls layouts
 
 private theorem evalStmt_assign_eq
     (s : MachineState) (dst : Place) (rv : Rvalue) (span : String)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalStmt s ⟨.assign dst rv, span⟩ localDecls layouts =
       match evalRvalue s.frame.locals rv s.memory localDecls layouts with
-      | .ok val locals₁ mem₁ => evalAssignDst s dst val locals₁ mem₁
+      | .ok val locals₁ mem₁ => evalAssignDst s dst val locals₁ mem₁ localDecls layouts
       | .ub => MirStepNode.fail .ub
       | .unsupported => MirStepNode.unsupported := by
   unfold evalStmt
@@ -961,9 +998,10 @@ private theorem evalAssignDst_nonDeref
     (s : MachineState) (dstLoc : Local) (hd : ProjectionElem)
     (tl : List ProjectionElem) (val : Value)
     (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
     (h_nd : hd ≠ .deref) :
-    evalAssignDst s ⟨dstLoc, hd :: tl⟩ val locals₁ mem₁ =
-      evalAssignNonDeref s dstLoc (hd :: tl) val locals₁ mem₁ := by
+    evalAssignDst s ⟨dstLoc, hd :: tl⟩ val locals₁ mem₁ localDecls layouts =
+      evalAssignNonDeref s dstLoc (hd :: tl) val locals₁ mem₁ localDecls layouts := by
   cases hd with
   | deref => exact False.elim (h_nd rfl)
   | _ => rfl
@@ -1159,15 +1197,37 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
       | cons hd tl =>
         simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
         have h_nd := ne_deref_of_isPureProjElem h_dst.1
-        rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd,
-            evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd]
+        rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd,
+            evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd]
         unfold evalAssignNonDeref
         dsimp only
         cases get? locals₁ dstLoc with
         | none => rw [MirStepNode.withMem_fail]
         | some slot =>
           cases slot with
-          | uninit => rfl
+          | uninit =>
+            dsimp only
+            cases uninitFieldWriteShell? localDecls layouts dstLoc hd with
+            | none => rfl
+            | some rootVal =>
+              dsimp only
+              cases writeProjectedValue locals₁ rootVal _ val with
+              | ub => rfl
+              | unsupported => rfl
+              | ok rootVal' =>
+                dsimp only
+                cases set? locals₁ dstLoc (.init rootVal') with
+                | none => rw [MirStepNode.withMem_fail]
+                | some locals₂ =>
+                  try rw [h_prot, h_borrows]
+                  try rfl
+                  dsimp only [emptyMemory, invalidateConflictingBorrowsAtProj,
+                    MirStepNode.step, advanceStmt, MirStepNode.withMem,
+                    MirExecState.withMem]
+                  cases mem₀
+                  subst h_borrows
+                  subst h_prot
+                  rfl
           | dead => rfl
           | init rootVal =>
             dsimp only
@@ -3914,8 +3974,8 @@ theorem evalStmt_pushBaseStack
           unfold evalAssignDst
           dsimp only [Memory.pushBaseStack]
           repeat' (first | rfl | split)
-        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d,
-              evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d]
+        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d,
+              evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
           unfold evalAssignNonDeref
           dsimp only [Memory.pushBaseStack]
           repeat' (first | rfl | split)
@@ -3963,7 +4023,7 @@ private theorem evalStmt_isStmtNode
             | exact Or.inr (Or.inl ⟨_, rfl⟩)
             | exact Or.inr (Or.inr rfl)
             | split)
-        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_d]
+        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
           unfold evalAssignNonDeref; dsimp only
           repeat' (first
             | exact Or.inl ⟨_, rfl⟩
@@ -12389,8 +12449,8 @@ theorem PureMirModularConverges.step_stmt
         | cons hd tl =>
           simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
           have h_nd := ne_deref_of_isPureProjElem h_dst.1
-          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd] at h_eval
-          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd]
+          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd] at h_eval
+          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd]
           unfold evalAssignNonDeref at h_eval ⊢
           dsimp only at h_eval ⊢
           cases h_g : get? l1 dstLoc with
@@ -12398,7 +12458,28 @@ theorem PureMirModularConverges.step_stmt
           | some sl =>
             rw [h_g] at h_eval
             cases sl with
-            | uninit => nomatch h_eval
+            | uninit =>
+              dsimp only at h_eval ⊢
+              cases h_sh : uninitFieldWriteShell? body.localDecls body.layouts dstLoc hd with
+              | none => rw [h_sh] at h_eval; nomatch h_eval
+              | some rootVal =>
+                rw [h_sh] at h_eval
+                dsimp only at h_eval ⊢
+                generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_eval ⊢
+                cases wpvRes with
+                | ub => nomatch h_eval
+                | unsupported => nomatch h_eval
+                | ok rootVal' =>
+                  dsimp only at h_eval ⊢
+                  cases h_s : set? l1 dstLoc (.init rootVal') with
+                  | none => rw [h_s] at h_eval; nomatch h_eval
+                  | some l2 =>
+                    rw [h_s] at h_eval
+                    dsimp only [emptyMemory] at h_eval
+                    rw [h_ap]
+                    injection h_eval with h_se; injection h_se with h_eq
+                    subst h_eq
+                    exact ⟨invalidateConflictingBorrowsAtProj m.borrows dstLoc .none _, rfl⟩
             | dead => nomatch h_eval
             | init rootVal =>
               dsimp only at h_eval ⊢
@@ -14033,8 +14114,8 @@ private theorem sameExceptBorrows_step_noCall
                   | cons hd tl =>
                     simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
                     have h_nd := ne_deref_of_isPureProjElem h_dst.1
-                    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd] at h_wp h_inv_next
-                    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ h_nd]
+                    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd] at h_wp h_inv_next
+                    rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd]
                     unfold evalAssignNonDeref at h_wp h_inv_next ⊢
                     dsimp only at h_wp h_inv_next ⊢
                     cases h_g : get? l1 dstLoc with
@@ -14042,7 +14123,31 @@ private theorem sameExceptBorrows_step_noCall
                     | some sl =>
                       rw [h_g] at h_wp h_inv_next
                       cases sl with
-                      | uninit => exact False.elim h_wp
+                      | uninit =>
+                        dsimp only at h_wp h_inv_next ⊢
+                        cases h_sh : uninitFieldWriteShell?
+                            (s₁.memory.activeCallee.getD body).localDecls
+                            (s₁.memory.activeCallee.getD body).layouts dstLoc hd with
+                        | none => rw [h_sh] at h_wp; exact False.elim h_wp
+                        | some rootVal =>
+                          rw [h_sh] at h_wp h_inv_next
+                          dsimp only at h_wp h_inv_next ⊢
+                          generalize writeProjectedValue l1 rootVal _ val = wpvRes at h_wp h_inv_next ⊢
+                          cases wpvRes with
+                          | ub => exact False.elim h_wp
+                          | unsupported => exact False.elim h_wp
+                          | ok rootVal' =>
+                            dsimp only at h_wp h_inv_next ⊢
+                            cases h_set : set? l1 dstLoc (.init rootVal') with
+                            | none => rw [h_set] at h_wp; exact False.elim h_wp
+                            | some l2 =>
+                              rw [h_set] at h_wp h_inv_next
+                              dsimp only at h_wp h_inv_next ⊢
+                              rw [h_ap] at h_wp h_inv_next
+                              rw [mf_ap, h_ap]
+                              exact ih_run ⟨h_inv_next, by
+                                rw [h_bor]; exact h_dst_stk⟩
+                                ⟨h_adv_m _ _ _, ⟨mf_cal, mf_tr, mf_cs, mf_ac, rfl⟩⟩ h_wp
                       | dead => exact False.elim h_wp
                       | init rootVal =>
                         dsimp only at h_wp h_inv_next ⊢
