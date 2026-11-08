@@ -20,6 +20,7 @@ inductive WellTypedLM2_3EnumAggregate
        (env_lookup : env decl.ty = some (fields, paths))
        (is_adt : ∃ args, decl.ty.kind = .adt defPath args)
        (valid_layout : ValidStructLayout (translateTy decl.ty body.layouts).layout fields)
+       (ops_ok : WellTypedLM2_2AggFields body env dstIdx (translateTy decl.ty body.layouts) fields paths stEnv 0 0 ops)
 
 theorem evalRvalue_aggregate_enum_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -203,6 +204,15 @@ inductive WellTypedLM2_3Downcast
     (dstIdx : Local) (base : Local) (projs : List ProjectionElem)
     (variantName : String) (variantIdx : VariantIdx) (field : FieldIdx) (ty : Ty) : Prop where
   | mk (decl : LocalDecl)
+       (baseDecl : LocalDecl)
+       (defPath : DefPath)
+       (fields : List StructFieldDesc)
+       (paths : List (List ProjectionElem))
+       (decl_lookup : get? body.localDecls dstIdx = some decl)
+       (base_lookup : get? body.localDecls base = some baseDecl)
+       (env_lookup : env baseDecl.ty = some (fields, paths))
+       (is_adt : ∃ args, baseDecl.ty.kind = .adt defPath args)
+       (valid_layout : ValidStructLayout (translateTy baseDecl.ty body.layouts).layout fields)
 
 theorem evalProjection_downcast_field_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
