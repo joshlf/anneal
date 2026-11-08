@@ -19,6 +19,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -930,6 +931,61 @@ class TestCliAndLimits(unittest.TestCase):
         self.assertIsNotNone(events[0][1])
         self.assertEqual(events[0][1], events[1][1])
 
+    def test_snapshot_probes_child_pid_cgroup_first(self) -> None:
+        if not Path("/proc/self/cgroup").is_file():
+            self.skipTest("requires Linux /proc/<pid>/cgroup")
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            probed: list[Path] = []
+
+            def spy(
+                cgroup_root: Path = Path("/sys/fs/cgroup"),
+                proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+            ) -> dict[str, Any]:
+                probed.append(proc_cgroup_path)
+                return dict(FAKE_CGROUP_INFO)
+
+            with mock.patch.object(alr, "probe_cgroup_v2_memory", side_effect=spy):
+                snap = alr.format_cgroup_diagnostic_snapshot(pid=child.pid)
+            self.assertEqual(probed, [Path(f"/proc/{child.pid}/cgroup")])
+            self.assertIn("anon+shmem=1234M", snap)
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_timeout_snapshot_samples_live_child_scope(self) -> None:
+        """End to end: the 124 snapshot reports the child's own systemd scope
+        (its `MemoryMax` and resident `anon` heap), sampled before the kill."""
+        if not sys.platform.startswith("linux") or not alr.systemd_user_scope_available():
+            self.skipTest("systemd-run --user --scope unavailable")
+        err_buf = io.StringIO()
+        with mock.patch("sys.stderr", err_buf):
+            rc = alr.main(
+                [
+                    "--mode",
+                    "file",
+                    "--timeout",
+                    "3",
+                    "--memory-max-mb",
+                    "1536",
+                    "--no-slot-lock",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; b = bytearray(128 * 1024 * 1024); time.sleep(30)",
+                ]
+            )
+        self.assertEqual(rc, 124)
+        err = err_buf.getvalue()
+        self.assertIn("memory.max=1536M (avail=", err)
+        match = re.search(r"Cgroup v2 Snapshot : anon\+shmem=(\d+)M", err)
+        self.assertIsNotNone(match, err)
+        assert match is not None
+        self.assertGreaterEqual(int(match.group(1)), 120)
+
     def test_oom_exit_137_diagnostic_includes_cgroup_snapshot(self) -> None:
         err_buf = io.StringIO()
         with mock.patch("sys.stderr", err_buf), mock.patch.object(
@@ -1510,6 +1566,161 @@ class TestVerifyBundleFF(unittest.TestCase):
             self.assertTrue(ok_rel, err_rel)
             self.assertEqual(heads_rel.get("refs/heads/unstable"), c1)
 
+    def test_bundle_with_conflicting_duplicate_ref_tips_fails_closed(self) -> None:
+        """`git bundle list-heads` accepts a header naming <ref> twice; refuse it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            repo = tmp_p / "repo"
+            _init_repo(repo)
+            c1 = _commit_file(repo, "a.txt", "1\n", "c1")
+            c2 = _commit_file(repo, "a.txt", "2\n", "c2")
+            _git(repo, "branch", "unstable", c2)
+            good = _make_bundle(repo, tmp_p / "good.bundle", "refs/heads/unstable")
+            data = good.read_bytes()
+            hdr_end = data.index(b"\n\n")
+
+            def with_extra_head(sha: str) -> Path:
+                out = tmp_p / f"dup-{sha[:7]}.bundle"
+                out.write_bytes(
+                    data[:hdr_end] + f"\n{sha} refs/heads/unstable".encode() + data[hdr_end:]
+                )
+                return out
+
+            conflicting = with_extra_head(c1)
+            listed = _git(repo, "bundle", "list-heads", str(conflicting))
+            self.assertEqual(len(listed.splitlines()), 2)  # git itself accepts it
+            _git(repo, "branch", "-f", "unstable", c1)
+            for sync in (False, True):
+                v = alr.verify_bundle_ff(conflicting, repo_dir=repo, sync_if_behind=sync)
+                self.assertFalse(v["ok"])
+                self.assertEqual(v["status"], "bundle_error")
+                self.assertIn("conflicting tips", v["message"])
+                self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
+
+            # An identical duplicate is unambiguous and still verified normally.
+            identical = with_extra_head(c2)
+            v_same = alr.verify_bundle_ff(identical, repo_dir=repo)
+            self.assertEqual(v_same["status"], "stale_behind")
+
+    def test_sync_missing_ref_on_unborn_checked_out_branch(self) -> None:
+        """`git init -b unstable` checks out an unborn <ref>: create it via
+        `reset --hard` only when that worktree is clean."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            src = tmp_p / "src"
+            _init_repo(src)
+            c1 = _commit_file(src, "a.txt", "1\n", "c1")
+            _git(src, "branch", "unstable", c1)
+            bundle = _make_bundle(src, tmp_p / "b.bundle", "refs/heads/unstable")
+
+            fresh = tmp_p / "fresh"
+            fresh.mkdir()
+            _git(fresh, "init", "-q", "-b", "unstable")
+            (fresh / "notes.txt").write_text("wip\n", encoding="utf-8")
+            v_dirty = alr.verify_bundle_ff(bundle, repo_dir=fresh, sync_if_behind=True)
+            self.assertFalse(v_dirty["ok"])
+            self.assertFalse(v_dirty["synced"])
+            self.assertEqual(v_dirty["status"], "missing_local_ref")
+            self.assertIn("dirty worktree", v_dirty["message"])
+            self.assertIsNone(_rev(fresh, "refs/heads/unstable"))
+            self.assertEqual(
+                (fresh / "notes.txt").read_text(encoding="utf-8"), "wip\n"
+            )
+
+            (fresh / "notes.txt").unlink()
+            v = alr.verify_bundle_ff(bundle, repo_dir=fresh, sync_if_behind=True)
+            self.assertTrue(v["ok"], v["message"])
+            self.assertTrue(v["synced"])
+            self.assertEqual(v["status"], "synced_missing_local_ref")
+            self.assertEqual(_rev(fresh, "refs/heads/unstable"), c1)
+            self.assertEqual(_git(fresh, "symbolic-ref", "HEAD"), "refs/heads/unstable")
+            self.assertEqual((fresh / "a.txt").read_text(encoding="utf-8"), "1\n")
+            self.assertEqual(_git(fresh, "status", "--porcelain"), "")
+
+    def test_sync_refuses_during_real_interactive_rebase_of_ref(self) -> None:
+        """A real `git rebase -i` stop detaches HEAD (so `worktree list` shows no
+        branch); <ref> must still not be moved underneath the rebase."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            repo = tmp_p / "repo"
+            _init_repo(repo)
+            c0 = _commit_file(repo, "a.txt", "0\n", "c0")
+            c1 = _commit_file(repo, "a.txt", "1\n", "c1")
+            c2 = _commit_file(repo, "a.txt", "2\n", "c2")
+            _git(repo, "branch", "unstable", c2)
+            bundle = _make_bundle(repo, tmp_p / "b.bundle", "refs/heads/unstable")
+            _git(repo, "checkout", "-q", "-B", "unstable", c1)
+
+            env = dict(alr._git_env(), GIT_SEQUENCE_EDITOR="sed -i -e 's/^pick/edit/'")
+            stop = subprocess.run(
+                ["git", "rebase", "-i", c0],
+                cwd=str(repo),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(stop.returncode, 0, stop.stderr)
+            wt_list = _git(repo, "worktree", "list", "--porcelain")
+            self.assertIn("detached", wt_list)
+            self.assertNotIn("branch refs/heads/unstable", wt_list)
+
+            v = alr.verify_bundle_ff(bundle, repo_dir=repo, sync_if_behind=True)
+            self.assertFalse(v["ok"])
+            self.assertFalse(v["synced"])
+            self.assertEqual(v["status"], "stale_behind")
+            self.assertIn("active rebase or bisect", v["message"])
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
+
+            subprocess.run(
+                ["git", "rebase", "--abort"],
+                cwd=str(repo),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=True,
+            )
+            v_after = alr.verify_bundle_ff(bundle, repo_dir=repo, sync_if_behind=True)
+            self.assertTrue(v_after["ok"], v_after["message"])
+            self.assertEqual(v_after["status"], "synced_fast_forward")
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c2)
+            self.assertEqual((repo / "a.txt").read_text(encoding="utf-8"), "2\n")
+
+    def test_unfetched_diverged_remote_with_sync_fetches_then_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            remote = tmp_p / "remote"
+            local = tmp_p / "local"
+            _init_repo(remote)
+            c1 = _commit_file(remote, "f.txt", "v1\n", "c1")
+            _git(remote, "branch", "unstable", c1)
+            subprocess.run(
+                ["git", "clone", "-q", str(remote), str(local)],
+                env=alr._git_env(),
+                check=True,
+                capture_output=True,
+            )
+            _git(local, "checkout", "-q", "-b", "unstable", "origin/unstable")
+            c_local = _commit_file(local, "local.txt", "mine\n", "c_local")
+            _git(local, "checkout", "-q", "main")
+            _git(remote, "checkout", "-q", "unstable")
+            c2 = _commit_file(remote, "f.txt", "v2\n", "c2")
+            bundle = _make_bundle(remote, tmp_p / "b.bundle", "refs/heads/unstable")
+
+            v_no_sync = alr.verify_bundle_ff(bundle, repo_dir=local)
+            self.assertEqual(v_no_sync["status"], "unfetched_remote_tip")
+            self.assertFalse(_has_object(local, c2))
+
+            v_sync = alr.verify_bundle_ff(bundle, repo_dir=local, sync_if_behind=True)
+            self.assertFalse(v_sync["ok"])
+            self.assertFalse(v_sync["synced"])
+            self.assertEqual(v_sync["status"], "diverged")
+            self.assertEqual(v_sync["remote_tip"], c2)
+            self.assertEqual(v_sync["local_tip"], c_local)
+            self.assertTrue(_has_object(local, c2))  # fetched to decide, never applied
+            self.assertEqual(_rev(local, "refs/heads/unstable"), c_local)
+
 
 # ---------------------------------------------------------------------------
 # x20 staging via `fileutil` (never through the `x20fsd` FUSE mount)
@@ -1669,6 +1880,17 @@ class TestX20Staging(unittest.TestCase):
         self.assertFalse(alr._is_x20_remote_not_found("No such file or directory", _URI))
         self.assertFalse(alr._is_x20_remote_not_found("", _URI))
 
+        # Veto markers that only occur inside the echoed path do not count...
+        odd_uri = "/x20/teams/unavailable-internal error/anneal.bundle"
+        odd_msg = REAL_CP_REMOTE_NOT_FOUND.replace(_URI, odd_uri).replace(
+            "/teams/anneal-agent/u/anneal.bundle", odd_uri[len("/x20") :]
+        )
+        self.assertTrue(alr._is_x20_remote_not_found(odd_msg, odd_uri))
+        # ...but a real veto outside the path still fails closed.
+        self.assertFalse(
+            alr._is_x20_remote_not_found(f"DEADLINE_EXCEEDED: rpc\n{odd_msg}", odd_uri)
+        )
+
     def _setup(self, tmp_p: Path) -> tuple[Path, Path, Path, str]:
         repo = tmp_p / "repo"
         _init_repo(repo)
@@ -1688,6 +1910,7 @@ class TestX20Staging(unittest.TestCase):
         mock_fileutil: Path,
         mode: str,
         bundle_path: str,
+        sync_if_behind: bool = False,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         log_file = tmp_p / f"log-{mode}.jsonl"
         log_file.unlink(missing_ok=True)
@@ -1715,7 +1938,10 @@ class TestX20Staging(unittest.TestCase):
             alr, "FILEUTIL_CP_TIMEOUT_SEC", 1.0
         ), _stdin_as_pipe():
             verdict = alr.verify_bundle_ff(
-                bundle_path, repo_dir=repo, fileutil_bin=str(mock_fileutil)
+                bundle_path,
+                repo_dir=repo,
+                fileutil_bin=str(mock_fileutil),
+                sync_if_behind=sync_if_behind,
             )
         calls = [
             json.loads(line)
@@ -1802,6 +2028,35 @@ class TestX20Staging(unittest.TestCase):
             )
             self.assertEqual(verdict_slashed["status"], "no_remote_bundle")
             self.assertEqual(calls_slashed[0]["argv"][1:4], ["cp", "-f", self.X20_URI])
+
+    def test_x20_staged_bundle_supports_sync_end_to_end(self) -> None:
+        """`--sync-if-behind` fetches the unfetched tip from the fileutil-staged
+        temp copy (still alive inside the `with` body), then cleans it up."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            repo, _, mock_fileutil, c1 = self._setup(tmp_p)
+            other = tmp_p / "other"
+            subprocess.run(
+                ["git", "clone", "-q", str(repo), str(other)],
+                env=alr._git_env(),
+                check=True,
+                capture_output=True,
+            )
+            _git(other, "checkout", "-q", "-b", "unstable", "origin/unstable")
+            c2 = _commit_file(other, "a.txt", "2\n", "c2")
+            ahead = _make_bundle(other, tmp_p / "ahead.bundle", "refs/heads/unstable")
+            self.assertFalse(_has_object(repo, c2))
+
+            verdict, calls, _ = self._run_case(
+                tmp_p, repo, ahead, mock_fileutil, "ok", self.FUSE_PATH, sync_if_behind=True
+            )
+            self.assertTrue(verdict["ok"], verdict["message"])
+            self.assertTrue(verdict["synced"])
+            self.assertEqual(verdict["status"], "synced_fast_forward")
+            self.assertEqual(verdict["remote_tip"], c2)
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c2)
+            self.assertEqual([c["argv"][1] for c in calls], ["cp"])
+            self.assertNotEqual(c1, c2)
 
     def test_unrunnable_fileutil_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

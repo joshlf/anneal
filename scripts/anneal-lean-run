@@ -974,10 +974,16 @@ def _is_x20_remote_not_found(output: str, x20_uri: str) -> bool:
     bundle, because `no_remote_bundle` is a fail-open (`ok = True`) verdict.
     """
     lower = output.lower()
-    if any(marker in lower for marker in _X20_FATAL_ERROR_MARKERS):
-        return False
     uri = x20_uri.strip().rstrip("/").lower()
     if not uri:
+        return False
+    # `fileutil` echoes the URI (and its `/x20`-relative form) back in its
+    # messages; drop those echoes before looking for veto markers so that a
+    # path merely *named* e.g. `.../unavailable/anneal.bundle` cannot turn a
+    # genuine NOT_FOUND into an (overly) fatal error.
+    rel = uri[len("/x20") :] if uri.startswith("/x20/") else uri
+    scrubbed = lower.replace(uri, " ").replace(rel, " ")
+    if any(marker in scrubbed for marker in _X20_FATAL_ERROR_MARKERS):
         return False
     if f"not_found: {uri}:" in lower:
         return True
@@ -1235,6 +1241,18 @@ def parse_bundle_heads(
                 False,
                 {},
                 f"Invalid commit SHA in git bundle list-heads output: {sha!r}",
+            )
+        # `git bundle list-heads` happily prints a header that names the same
+        # ref twice with different tips (`git bundle create` never writes one).
+        # Which tip a later `git fetch` / `git x20-pull` honors is ambiguous,
+        # so treat such a bundle as corrupt instead of silently keeping one.
+        prior = heads.get(ref_name)
+        if prior is not None and prior != sha:
+            return (
+                False,
+                {},
+                f"Bundle header lists conflicting tips for {ref_name}: "
+                f"{prior} vs {sha}",
             )
         heads[ref_name] = sha
 
