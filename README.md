@@ -53,3 +53,8 @@ that as well.)
   strategy.
 - [`docs/trust-model.md`](docs/trust-model.md): The `trusted/` vs. `theory/`
   boundary, Statement-Origin Separation, and repository CI boundary auditing.
+
+## Repository checks
+
+See [the Codex review gate guide](docs/codex-review.md) for enabling the required
+review status, diagnosing blocked PRs, and testing the evaluator locally.
