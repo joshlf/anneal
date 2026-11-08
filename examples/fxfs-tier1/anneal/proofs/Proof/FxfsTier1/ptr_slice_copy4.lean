@@ -1,26 +1,23 @@
 import Trusted
-import Anneal.Rustc.V2026_06_01.Lower
+import Anneal.MirLiftCore
 import Mir.FxfsTier1.ptr_slice_copy4
 import Obligations.FxfsTier1.ptr_slice_copy4
 import Specs.FxfsTier1.ptr_slice_copy4
 
 namespace Proof.FxfsTier1.ptr_slice_copy4
 
-open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.Lower
-open Specs.FxfsTier1.ptr_slice_copy4
+open Anneal.MirFuelFree
+open Anneal.PureMirExec
 
 theorem verified :
     StatefulVerificationResult
       Obligations.FxfsTier1.ptr_slice_copy4.statefulClaim := by
-  refine verifyStatefulMirBounded Obligations.FxfsTier1.ptr_slice_copy4.statefulClaim 24 ?_
-  intro args mem h_pre
-  rcases h_pre with ⟨rfl, rfl⟩
-  intro retVal mem' h_out
-  injection h_out with h_pair
-  injection h_pair with h_ret h_mem
-  subst h_ret h_mem
-  exact ⟨rfl, rfl⟩
+  refine verifyStatefulMirNoPanic_of_wpConverges _ ?_
+  rintro _ _ ⟨rfl, rfl⟩
+  exact MirWpConverges.of_runMirBounded
+    (fuel := defaultCfgSteps Mir.FxfsTier1.ptr_slice_copy4.body)
+    rfl
+    ⟨rfl, rfl⟩
 
 end Proof.FxfsTier1.ptr_slice_copy4
