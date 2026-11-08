@@ -56,10 +56,12 @@ and proves concrete `rfl`-verified execution witnesses exercising all five
    dispatching via `SwitchInt`'s `otherwise` fallback arm, stepping across
    `Goto`, projecting `V2.1 = 88_u64`, and returning `88_u64` in lockstep.
 5. `wit_lm2_3_uninit_and_dead_ub`: lockstep undefined-behavior witnesses for
-   `discriminant(_1)` on `.uninit`, `SetDiscriminant(_1, 0)` on `.uninit`,
-   `Lm23Enum::V0` aggregate assignment to `.dead` `_4`, and `Downcast` + `Field`
-   projection from `.dead` `_4`.
-6. `wit_lm2_3_bodyFree_divBody`: `BodyFreeOfLM2_3` and
+   `discriminant(_1)` on `.uninit`, `Lm23Enum::V0` aggregate assignment to
+   `.dead` `_4`, `Downcast` + `Field` projection from `.dead` `_4`, and
+   `SetDiscriminant(_4, 1)` on `.dead` `_4`.
+6. `wit_lm2_3_setDiscriminant_uninit_divergence`: `SetDiscriminant(_1, 0)` on
+   `.uninit` `_1` is UB in Anneal, but lean-miri writes the tag and steps.
+7. `wit_lm2_3_bodyFree_divBody`: `BodyFreeOfLM2_3` and
    `step_LM2_3_eq_of_bodyFree` on `LM-1.1`'s `divBody`.
 -/
 
@@ -375,8 +377,10 @@ def lm23FnAbi : FnAbi :=
   inactive-variant UB after `SetDiscriminant`;
 - `bb4`..`bb6`: `V2(7, 88) -> discriminant -> SwitchInt(otherwise => bb5) ->
   Goto(bb6) -> copy ((_1 as 2).1) -> Return`;
-- `bb7`..`bb10`: `.uninit` `discriminant`, `.uninit` `SetDiscriminant`, `.dead`
-  `Aggregate`, and `.dead` `Downcast` + `Field` UB blocks. -/
+- `bb7`, `bb9`..`bb11`: `.uninit` `discriminant`, `.dead` `Aggregate`, `.dead`
+  `Downcast` + `Field`, and `.dead` `SetDiscriminant` lockstep UB blocks;
+- `bb8`: `SetDiscriminant` on `.uninit` `_1`, where Anneal reports UB but
+  lean-miri writes the tag. -/
 def lm23Body : CapturedMir where
   defPath := "lm_2_3_witness::enums"
   phase := .runtimePostCleanup
@@ -433,7 +437,7 @@ def lm23Body : CapturedMir where
       { statements := [lm23DiscrStmt 2 1]
         terminator := lm23Term .return_
         isCleanup := false }
-    , -- bb8: SetDiscriminant(_1, 0) on uninit _1 -> UB
+    , -- bb8: SetDiscriminant(_1, 0) on uninit _1: Anneal UB, lean-miri steps
       { statements := [lm23SetDiscrStmt 1 0]
         terminator := lm23Term .return_
         isCleanup := false }
@@ -444,6 +448,10 @@ def lm23Body : CapturedMir where
     , -- bb10: _3 = copy ((_4 as 1).0) on dead _4 -> UB
       { statements :=
           [ lm23DowncastReadStmt false 3 4 (some "V1") 1 0 lm23U32Ty ]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb11: SetDiscriminant(_4, 1) on dead _4 -> UB
+      { statements := [lm23SetDiscrStmt 4 1]
         terminator := lm23Term .return_
         isCleanup := false } ]
   fnAbi := lm23FnAbi
@@ -753,7 +761,7 @@ theorem wit_lm2_3_full_pipeline_trace :
   obtain ⟨hrel₅, hu₅_fn, himm₅_fn⟩ := step_setDiscriminant_simulation
     hst₄ lm23_phase lm23_env_valid rfl rfl rfl
     (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide)
-    (fun _ _ _ _ => Or.inl rfl)
+    (by intro h; cases h) (fun _ _ _ _ => List.nil_prefix)
   rw [lm23_pipe_a5] at hrel₅
   obtain ⟨m₅, hm₅, hst₅⟩ := stepRelLM2_3_inv_step hrel₅
   have hu₅ : EnumLocalByteUninit m₅ 1 8 := by
@@ -881,7 +889,7 @@ theorem wit_lm2_3_setDiscriminant_then_inactive_ub :
   obtain ⟨hrel₂, hu₂_fn, himm₂_fn⟩ := step_setDiscriminant_simulation
     hst₁ lm23_phase lm23_env_valid rfl rfl rfl
     (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide)
-    (fun _ _ _ _ => Or.inl rfl)
+    (by intro h; cases h) (fun _ _ _ _ => List.nil_prefix)
   rw [lm23_bb3_a2] at hrel₂
   obtain ⟨m₂, hm₂, hst₂⟩ := stepRelLM2_3_inv_step hrel₂
   have hu₂ : EnumLocalByteUninit m₂ 1 8 := by
@@ -1034,24 +1042,24 @@ theorem wit_lm2_3_switch_otherwise_and_goto_trace :
   exact ⟨m₁, m₂, m₃, m₄, m₅, m₆, imm0,
     hm₁, hm₂, hm₃, hst₃, hm₄, hst₄, hm₅, hm₆, hret_op, himm_rel⟩
 
-/-! ## 6. Witness 5: Lockstep `.uninit` and `.dead` Enum UB Paths (`bb7..bb10`) -/
+/-! ## 6. Witness 5: Lockstep `.uninit` and `.dead` Enum UB Paths (`bb7`, `bb9..bb11`) -/
 
 /-- **Witness 5 (`wit_lm2_3_uninit_and_dead_ub`)**:
-Lockstep undefined behavior across all four uninitialized / dead enum error
-paths (`discriminant` on `.uninit`, `SetDiscriminant` on `.uninit`, `Aggregate`
-write to `.dead`, and `Downcast` + `Field` read from `.dead`). -/
+Lockstep undefined behavior on four uninitialized or dead enum error paths:
+`discriminant` on `.uninit`, `Aggregate` write to `.dead`, `Downcast` + `Field`
+read from `.dead`, and `SetDiscriminant` on `.dead`. -/
 theorem wit_lm2_3_uninit_and_dead_ub :
     (stepMirFn lm23Body (lm23InitAnneal 7) = .fail .ub ∧
       ∃ msg, (Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 7)).2 =
-        .error (.undefinedBehavior msg)) ∧
-    (stepMirFn lm23Body (lm23InitAnneal 8) = .fail .ub ∧
-      ∃ msg, (Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 8)).2 =
         .error (.undefinedBehavior msg)) ∧
     (stepMirFn lm23Body (lm23InitAnneal 9) = .fail .ub ∧
       ∃ msg, (Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 9)).2 =
         .error (.undefinedBehavior msg)) ∧
     (stepMirFn lm23Body (lm23InitAnneal 10) = .fail .ub ∧
       ∃ msg, (Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 10)).2 =
+        .error (.undefinedBehavior msg)) ∧
+    (stepMirFn lm23Body (lm23InitAnneal 11) = .fail .ub ∧
+      ∃ msg, (Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 11)).2 =
         .error (.undefinedBehavior msg)) := by
   refine ⟨?_, ?_, ?_, ?_⟩
   · have ha : stepMirFn lm23Body (lm23InitAnneal 7) = .fail .ub := rfl
@@ -1059,12 +1067,6 @@ theorem wit_lm2_3_uninit_and_dead_ub :
       (lm23_init_stateRelLM2_3 7 0 (by decide)) lm23_phase lm23_env_valid
       rfl rfl rfl (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23IsizeTy)
       rfl rfl rfl lm23_isDiscrDest_isize (lm23_init_imm 7 2)
-    exact ⟨ha, hrel.ub_iff.mp ha⟩
-  · have ha : stepMirFn lm23Body (lm23InitAnneal 8) = .fail .ub := rfl
-    obtain ⟨hrel, _, _⟩ := step_setDiscriminant_simulation
-      (lm23_init_stateRelLM2_3 8 0 (by decide)) lm23_phase lm23_env_valid
-      rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide)
-      (fun _ _ _ _ => Or.inl rfl)
     exact ⟨ha, hrel.ub_iff.mp ha⟩
   · have ha : stepMirFn lm23Body (lm23InitAnneal 9) = .fail .ub := rfl
     have hsim := evalRvalue_aggregate_enum_simulation
@@ -1081,10 +1083,30 @@ theorem wit_lm2_3_uninit_and_dead_ub :
       rfl rfl rfl (by decide) (by decide) rfl rfl (lm23_init_imm 10 3)
       (fun _ _ hsl _ => by simp [lm23InitAnneal, get?] at hsl)
     exact ⟨ha, hrel.ub_iff.mp ha⟩
+  · have ha : stepMirFn lm23Body (lm23InitAnneal 11) = .fail .ub := rfl
+    obtain ⟨hrel, _, _⟩ := step_setDiscriminant_simulation
+      (lm23_init_stateRelLM2_3 11 0 (by decide)) lm23_phase lm23_env_valid
+      rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide)
+      (by intro h; cases h)
+      (fun _ _ _ hsl => by simp [lm23InitAnneal, get?] at hsl)
+    exact ⟨ha, hrel.ub_iff.mp ha⟩
 
-/-! ## 7. Witness 6: Conservative Extension (`BodyFreeOfLM2_3`) -/
+/-! ## 7. Witness 6: `SetDiscriminant` on `.uninit` Diverges (`bb8`) -/
 
-/-- **Witness 6 (`wit_lm2_3_bodyFree_divBody`)**:
+/-- **Witness 6 (`wit_lm2_3_setDiscriminant_uninit_divergence`)**:
+`SetDiscriminant(_1, 0)` on the fresh `.uninit` local `_1` is UB in Anneal,
+but lean-miri forces `_1` into memory, writes tag `0`, and completes the step
+(`step_setDiscriminant_uninit_divergence`). -/
+theorem wit_lm2_3_setDiscriminant_uninit_divergence :
+    stepMirFn lm23Body (lm23InitAnneal 8) = .fail .ub ∧
+    ∃ m', Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 8) = (m', .ok true) :=
+  step_setDiscriminant_uninit_divergence
+    (lm23_init_stateRelLM2_3 8 1 (by decide)) lm23_phase lm23_env_valid
+    rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide) rfl
+
+/-! ## 8. Witness 7: Conservative Extension (`BodyFreeOfLM2_3`) -/
+
+/-- **Witness 7 (`wit_lm2_3_bodyFree_divBody`)**:
 `LM-1.1`'s scalar `divBody` satisfies `BodyFreeOfLM2_3`, so
 `annealStepHooksLM2_3` steps identically to `annealStepHooks` on `miriInit`. -/
 theorem wit_lm2_3_bodyFree_divBody (divisor : Nat) :

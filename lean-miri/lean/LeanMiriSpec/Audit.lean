@@ -95,12 +95,13 @@ weakened theorem keeps its name:
   (`ValidEnumLayout`), conservative hook extension (`step_LM2_3_eq_of_bodyFree`),
   `StateRel.toLM2_3`, multi-variant enum construction and in-place overwrite
   (`evalRvalue_aggregate_enum_simulation`), `SetDiscriminant`
-  (`step_setDiscriminant_simulation`), `Rvalue.Discriminant`
+  (`step_setDiscriminant_simulation`, plus the `.uninit` divergence
+  `step_setDiscriminant_uninit_divergence`), `Rvalue.Discriminant`
   (`evalRvalue_discriminant_simulation`), `Downcast` + `Field` payload reads
   including inactive-variant uninitialized-byte UB
   (`evalProjection_downcast_field_simulation`), `SwitchInt` match dispatch
-  (`enum_match_switchInt_simulation`), `Goto`/`Return` helpers, and the six
-  `WitLM2_3` concrete multi-variant execution and UB witnesses.
+  (`enum_match_switchInt_simulation`), `Goto`/`Return` helpers, and the seven
+  `WitLM2_3` concrete multi-variant execution, UB, and divergence witnesses.
 * the `LM-2.4` theorems: the union aggregate, field read, and whole-union copy/move
   fresh and in-place overwrite steps (`step_union_aggregate_simulation`,
   `step_union_aggregate_overwrite_simulation`, `step_union_field_read_simulation`,
@@ -987,7 +988,6 @@ open LeanMiriSpec.Correspondence in
   annealDiscriminantHooksLM2_3
   annealAggregateHooksLM2_3
   annealRvalueHooksLM2_3
-  annealWriteEnumDiscriminantStmt
   annealStepHooksLM2_3
   BodyFreeOfLM2_3
   step_LM2_3_eq_of_bodyFree
@@ -1007,7 +1007,12 @@ open LeanMiriSpec.Correspondence in
   IsEnumDiscrDestTy
   WellTypedEnumScalarOp
   evalRvalue_aggregate_enum_simulation
+  writeDiscriminant_local_of_forced_ok
+  writeDiscriminant_indirect_local_ok
+  writeDiscriminant_dead_local_err
+  writeDiscriminant_uninit_imm_local_ok
   step_setDiscriminant_simulation
+  step_setDiscriminant_uninit_divergence
   evalRvalue_discriminant_simulation
   evalProjection_downcast_field_simulation
   enum_match_switchInt_simulation
@@ -1027,6 +1032,7 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm2_3_setDiscriminant_then_inactive_ub
   Witness.wit_lm2_3_switch_otherwise_and_goto_trace
   Witness.wit_lm2_3_uninit_and_dead_ub
+  Witness.wit_lm2_3_setDiscriminant_uninit_divergence
   Witness.wit_lm2_3_bodyFree_divBody
 
 /-- Exhaustively verify that every declaration across every imported
@@ -6805,10 +6811,10 @@ example :
         get? body.localDecls dstIdx = some dstDecl →
         env dstDecl.ty = some (tagBytes, variants) →
         (hv_lt : variantIdx < variants.length) →
+        get? s.frame.locals dstIdx ≠ some .uninit →
         (∀ v_act (hv_act : v_act < variants.length) fieldVals,
           get? s.frame.locals dstIdx = some (.init (.aggregate v_act fieldVals)) →
-          variants[variantIdx]'hv_lt = [] ∨
-            variants[variantIdx]'hv_lt = variants[v_act]'hv_act) →
+          (variants[variantIdx]'hv_lt) <+: (variants[v_act]'hv_act)) →
         StepRelLM2_3 body env allocBudget m
           (stepMirFn body s)
           (Miri.Interpreter.Step.step
@@ -6829,6 +6835,27 @@ example :
               (annealStepHooksLM2_3 body.localDecls body.layouts) () m).1
             j) :=
   @step_setDiscriminant_simulation
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env (allocBudget + 1) s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {dstIdx : Local} {dstDecl : MirAst.LocalDecl} {variantIdx : Nat}
+        {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .setDiscriminant ⟨dstIdx, .nil⟩ variantIdx →
+        get? body.localDecls dstIdx = some dstDecl →
+        env dstDecl.ty = some (tagBytes, variants) →
+        variantIdx < variants.length →
+        get? s.frame.locals dstIdx = some .uninit →
+        stepMirFn body s = .fail .ub ∧
+        ∃ m', Miri.Interpreter.Step.step
+          (annealStepHooksLM2_3 body.localDecls body.layouts) () m = (m', .ok true) :=
+  @step_setDiscriminant_uninit_divergence
 
 example :
     ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
@@ -7017,16 +7044,22 @@ example :
     (stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 7) = .fail .ub ∧
       ∃ msg, (Miri.Interpreter.Step.step Witness.lm23Hooks ()
         (Witness.lm23InitMiri 7)).2 = .error (.undefinedBehavior msg)) ∧
-    (stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 8) = .fail .ub ∧
-      ∃ msg, (Miri.Interpreter.Step.step Witness.lm23Hooks ()
-        (Witness.lm23InitMiri 8)).2 = .error (.undefinedBehavior msg)) ∧
     (stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 9) = .fail .ub ∧
       ∃ msg, (Miri.Interpreter.Step.step Witness.lm23Hooks ()
         (Witness.lm23InitMiri 9)).2 = .error (.undefinedBehavior msg)) ∧
     (stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 10) = .fail .ub ∧
       ∃ msg, (Miri.Interpreter.Step.step Witness.lm23Hooks ()
-        (Witness.lm23InitMiri 10)).2 = .error (.undefinedBehavior msg)) :=
+        (Witness.lm23InitMiri 10)).2 = .error (.undefinedBehavior msg)) ∧
+    (stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 11) = .fail .ub ∧
+      ∃ msg, (Miri.Interpreter.Step.step Witness.lm23Hooks ()
+        (Witness.lm23InitMiri 11)).2 = .error (.undefinedBehavior msg)) :=
   Witness.wit_lm2_3_uninit_and_dead_ub
+
+example :
+    stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 8) = .fail .ub ∧
+    ∃ m', Miri.Interpreter.Step.step Witness.lm23Hooks ()
+      (Witness.lm23InitMiri 8) = (m', .ok true) :=
+  Witness.wit_lm2_3_setDiscriminant_uninit_divergence
 
 example (divisor : Nat) :
     BodyFreeOfLM2_3 (Witness.divBody divisor).localDecls

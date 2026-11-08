@@ -129,7 +129,8 @@ import LeanMiriSpec.Audit
   (`StateRel.toLM2_3_empty`, `StateRel.toLM2_3`).
 * `LeanMiriSpec.Correspondence.SimLM2_3`: `LM-2.3` lockstep simulation for
   multi-variant enum `Rvalue.Aggregate` (`evalRvalue_aggregate_enum_simulation`),
-  `StatementKind.SetDiscriminant` (`step_setDiscriminant_simulation`),
+  `StatementKind.SetDiscriminant` (`step_setDiscriminant_simulation`, with the
+  `.uninit` divergence `step_setDiscriminant_uninit_divergence`),
   `Rvalue.Discriminant` (`evalRvalue_discriminant_simulation`), `Downcast` +
   `Field` payload reads including inactive-variant uninitialized-byte UB
   (`evalProjection_downcast_field_simulation`), `Terminator.SwitchInt` match
@@ -137,8 +138,8 @@ import LeanMiriSpec.Audit
 * `LeanMiriSpec.Correspondence.WitLM2_3`: kernel-checked `LM-2.3` multi-variant
   execution witnesses covering an 8-step end-to-end `Lm23Enum` pipeline,
   inactive-variant `Downcast` + `Field` UB before and after `SetDiscriminant`,
-  `SwitchInt` `otherwise` fallback + `Goto`, `.uninit`/`.dead` UB traps, and
-  `BodyFreeOfLM2_3`.
+  `SwitchInt` `otherwise` fallback + `Goto`, `.uninit`/`.dead` UB traps, the
+  `SetDiscriminant`-on-`.uninit` divergence, and `BodyFreeOfLM2_3`.
 * `LeanMiriSpec.Correspondence.UnionLM2_4`: the `LM-2.4` union and `Subslice`
   hooks (`annealStepHooksLM2_4`, a conservative extension of `annealStepHooks`),
   the union initialization masks of `I-11` (`unionPrefixMask`, certified against

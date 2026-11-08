@@ -19,7 +19,7 @@ import LeanMiriSpec.Correspondence.ProjLM2_2
 
 In `Translate.lean`, `annealStepHooks.writeDiscriminant`,
 `annealRvalueHooks.readDiscriminant`, `annealRvalueHooks.discriminantForVariant`,
-`annealProjectionCx.variant`, and non-zero `annealAggregateHooks` variant
+`annealStructProjectionCx.variant`, and non-zero `annealAggregateHooks` variant
 downcasts/discriminants fail closed with `StepError.unsupported`.
 
 This module wires the vendored `lean-miri` multi-variant enum pipelines
@@ -78,13 +78,13 @@ def downcastEnumLayout (parent : Miri.Interpreter.LocalLayout) (variant : Nat) :
       else .error (.invariant "single-variant downcast mismatch")
   | .Empty => .error (.invariant "downcast on empty variants")
 
-/-- `annealProjectionCx` extended with `downcastEnumLayout` so vendored
+/-- `annealStructProjectionCx` extended with `downcastEnumLayout` so vendored
 `Miri.Interpreter.project` (`projectDowncast` + `projectField`) handles
 `PlaceElem.Downcast` followed by `PlaceElem.Field`. -/
 def annealEnumProjectionCx (layouts : LayoutTable)
     (hintFieldTy : Option Miri.MIR.TyId) :
     Miri.Interpreter.ProjectionCx AnnealProv :=
-  { annealProjectionCx layouts hintFieldTy with
+  { annealStructProjectionCx layouts hintFieldTy with
     variant := downcastEnumLayout }
 
 /-- Project an `OpTy AnnealProv` along a list of `Miri.MIR.ProjectionElem`s
@@ -185,14 +185,20 @@ def annealForceEnumAllocation (localDecls : List LocalDecl)
 def fixedFieldProjectionCx (layouts : LayoutTable)
     (fixedLay : Miri.Interpreter.LocalLayout) :
     Miri.Interpreter.ProjectionCx AnnealProv :=
-  { annealProjectionCx layouts none with
+  { annealStructProjectionCx layouts none with
     field := fun _ _ => .ok fixedLay }
 
 /-- `DiscriminantHooks` instantiated for Anneal's single-threaded machine,
 wiring vendored `Miri.Interpreter.Discriminant.{writeDiscriminant,
 readDiscriminant, discriminantForVariant, tagForVariant}` to `LayoutTable`
 variant counts, `Miri.Interpreter.projectField` tag projection, and
-`annealReadImmediate` / `annealWriteImmediate`. -/
+`annealReadImmediate` / `annealWriteImmediate`.
+
+`discriminantValue` and `variantForDiscriminant` identify each variant's
+discriminant with its index, as a `usize`. This matches Anneal's `evalRvalue`,
+which evaluates `.discriminant` to `⟨variantIdx, 8⟩`. `LayoutTable` records no
+explicit discriminant values, so enums declared with explicit discriminants
+(`A = 5`) are outside this model. -/
 def annealDiscriminantHooksLM2_3 (localDecls : List LocalDecl)
     (layouts : LayoutTable) :
     Miri.Interpreter.DiscriminantHooks
@@ -397,40 +403,6 @@ def annealRvalueHooksLM2_3 (localDecls : List LocalDecl)
     discriminantForVariant := fun c tyId variant =>
       Miri.Interpreter.Discriminant.discriminantForVariant discrHooks c tyId variant }
 
-/-- Execute `StatementKind.SetDiscriminant` on `dest`, diagnosing dead or
-uninitialized enum destinations as `StepError.undefinedBehavior` (matching
-Anneal's `MirSemantics.evalStmt` on `.setDiscriminant`) before writing the new
-variant tag via vendored `Miri.Interpreter.Discriminant.writeDiscriminant`. -/
-def annealWriteEnumDiscriminantStmt (localDecls : List LocalDecl)
-    (layouts : LayoutTable) (variant : Nat)
-    (dest : Miri.Interpreter.RuntimePlace AnnealProv) :
-    Miri.Interpreter.RvalueM AnnealStepState Unit := do
-  let st ← get
-  let some frame := st.stack.currentFrame?
-    | throw (.stack .emptyStack)
-  match dest.ref with
-  | .local frameIdx localId none _ =>
-      if frameIdx != st.stack.frames.size - 1 then
-        throw (.invalidProgram "place refers to another frame")
-      match frame.getLocalOperand localId with
-      | .error (.localExpectedLive _) =>
-          throw (.undefinedBehavior "write to dead local")
-      | .error e =>
-          throw (.stack e)
-      | .ok (.immediate .uninit) =>
-          throw (.undefinedBehavior "setDiscriminant on uninitialized local")
-      | .ok (.immediate _) =>
-          throw (.unsupported "setDiscriminant on non-aggregate immediate local")
-      | .ok (.indirect mp) =>
-          let some tagLay := enumTagLayoutOf dest.layout
-            | throw (.unsupported "setDiscriminant on non-Multiple layout")
-          match annealCheckIndirectInitialized st.machine mp tagLay.layout.size with
-          | .error err => throw err
-          | .ok () =>
-              Miri.Interpreter.Discriminant.writeDiscriminant
-                (annealDiscriminantHooksLM2_3 localDecls layouts) () variant dest
-  | _ => throw (.unsupported "projected setDiscriminant in LM-2.3")
-
 /-- Whether a `Miri.MIR.Operand` contains a `Downcast` projection. -/
 def lm23Operand : Miri.MIR.Operand → Bool
   | .Copy p | .Move p => p.projection.toList.any isDowncastElem
@@ -454,7 +426,17 @@ def lm23Assign (localDecls : List LocalDecl) (layouts : LayoutTable)
 
 /-- Conservative `StepHooks` overlay for `LM-2.3`: intercepts only `lm23Assign`
 assignments and `StatementKind.SetDiscriminant`, delegating every other
-statement and terminator unchanged to `annealStepHooks`. -/
+statement and terminator unchanged to `annealStepHooks`.
+
+`writeDiscriminant` runs vendored `Discriminant.writeDiscriminant` with no
+extra checks, exactly as lean-miri's reference `ExecutionMachine.stepHooks`
+does (and as rustc's `write_discriminant` does for direct tags). It does not
+read the destination first, so `SetDiscriminant` on an uninitialized enum local
+forces the local into memory and writes the tag. A dead destination fails in
+`projectWrite`'s `annealForceEnumAllocation` with `"write to dead local"`
+(rustc's `DeadLocal`). Anneal's `evalStmt` is stricter on uninitialized
+destinations; `step_setDiscriminant_uninit_divergence` in `SimLM2_3.lean`
+states that difference. -/
 def annealStepHooksLM2_3 (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable) :
     Miri.Interpreter.StepHooks
@@ -474,9 +456,10 @@ def annealStepHooksLM2_3 (localDecls : List LocalDecl := .nil)
           state
       else
         base.assign choice place rvalue state
-    writeDiscriminant := fun _ variant dest state =>
+    writeDiscriminant := fun choice variant dest state =>
       Miri.Interpreter.runRvalue
-        (annealWriteEnumDiscriminantStmt localDecls layouts variant dest)
+        (Miri.Interpreter.Discriminant.writeDiscriminant
+          (annealDiscriminantHooksLM2_3 localDecls layouts) choice variant dest)
         state }
 
 /-- Whether a `Miri.MIR.Statement` is outside the `LM-2.3` overlay (`lm23Assign`
@@ -602,7 +585,11 @@ structure ValidEnumVariantFields (layouts : LayoutTable) (tagBytes : Nat)
   `variants = .Multiple tag .Direct 0 vars` where `tag` is an unsigned integer
   scalar of width `tagBytes` whose `validRange` contains every variant index
   `v < variants.length`, `tagBytes ≤ size < 2 ^ 32`, and `align.abi.pow2 ≤ 29`.
-* Each variant `v < variants.length` satisfies `ValidEnumVariantFields`. -/
+* Each variant `v < variants.length` satisfies `ValidEnumVariantFields`, which
+  in particular makes every variant inhabited. Anneal's `evalStmt` never
+  checks inhabitedness, while lean-miri reports `UninhabitedEnumVariantWritten`
+  for a write of an uninhabited variant, so such variants are outside this
+  correspondence. -/
 structure ValidEnumLayout (ty : Ty) (layouts : LayoutTable) (tagBytes : Nat)
     (variants : List (List StructFieldDesc)) : Prop where
   is_adt : ∃ defPath adtArgs, ty.kind = .adt defPath adtArgs
