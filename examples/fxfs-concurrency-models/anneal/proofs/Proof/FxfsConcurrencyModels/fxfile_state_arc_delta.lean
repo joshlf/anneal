@@ -23,7 +23,7 @@ theorem verified :
     apply lift_PureMirConverges rfl
     repeat (
       apply LiftBlock.of_lookup rfl
-      try apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+      apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
       first
       | apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
       | apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)

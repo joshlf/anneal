@@ -15,7 +15,7 @@ theorem verified :
     StatefulVerificationResult
       Obligations.FxfsConcurrencyModels.lock_manager_is_allowed_and_acquire.statefulClaim := by
   refine verifyStatefulMirNoPanic_of_pureExec _ rfl (fun _ _ h => h.2 ▸ rootActiveMemory_emptyMemory) ?_
-  rintro _ _ ⟨⟨cur, cnt, head_b, tgt, h_cur, rfl, h_head, h_tgt, _, rfl⟩, rfl⟩
+  rintro _ _ ⟨⟨cur, _, head_b, tgt, h_cur, rfl, h_head, h_tgt, _, rfl⟩, rfl⟩
   rcases h_cur with rfl | rfl <;>
     rcases (by omega : head_b = 0 ∨ head_b = 1) with rfl | rfl <;>
     rcases h_tgt with rfl | rfl
@@ -23,7 +23,7 @@ theorem verified :
     apply lift_PureMirConverges rfl
     repeat (
       apply LiftBlock.of_lookup rfl
-      try apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+      apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
       first
       | apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
       | apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)

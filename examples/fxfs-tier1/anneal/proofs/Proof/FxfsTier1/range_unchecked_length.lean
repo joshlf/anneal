@@ -8,6 +8,7 @@ namespace Proof.FxfsTier1.range_unchecked_length
 
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
+open Anneal.FunctionalTranslation
 open Anneal.PureMirExec
 open Anneal.MirLiftCore
 
@@ -19,15 +20,13 @@ theorem verified : VerificationResult Obligations.FxfsTier1.range_unchecked_leng
   rintro _ ⟨s, e, h_le, h_e_max, rfl⟩
   apply lift_PureMirConverges rfl
   apply LiftBlock.of_lookup rfl
-  repeat apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
     (evalPureStmtNorm_assign_local_of_evalRvalue (val := .scalar ⟨e - s, 8⟩)
       rfl ?h_rv rfl (by nofun) rfl)
   case h_rv =>
     change evalScalarBinOp .subUnchecked ⟨e, 8⟩ ⟨s, 8⟩ _ _ false = _
     simp [evalScalarBinOp, scalarModulus, Nat.ble_eq_true_of_le h_le,
-      Anneal.FunctionalTranslation.nat_ble_eq_false_of_lt (by omega : e - s < 18446744073709551616)]
-  apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+      nat_ble_eq_false_of_lt (by omega : e - s < 18446744073709551616)]
   apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   rintro _ _ ⟨⟩
   rfl
