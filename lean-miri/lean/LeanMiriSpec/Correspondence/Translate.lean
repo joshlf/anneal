@@ -2269,12 +2269,11 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
       (Miri.Interpreter.Operand AnnealProv)
       (Miri.Interpreter.RvalueImmTy AnnealProv) where
   toControlHooks := annealControlHooks
-  evalDiscriminant := fun c op state =>
+  evalDiscriminant := fun _ op state =>
     Miri.Interpreter.runRvalue
       (do
         let opTy ← annealEvalOperand localDecls layouts op none
-        let variant ← Miri.Interpreter.Discriminant.readDiscriminant (annealDiscriminantHooks localDecls layouts) c opTy
-        Miri.Interpreter.Discriminant.discriminantForVariant (annealDiscriminantHooks localDecls layouts) c opTy.layout.ty variant)
+        annealReadImmediate opTy)
       state
   compareSwitchCase := fun choice value caseVal state =>
     Miri.Interpreter.runRvalue
