@@ -6,33 +6,33 @@ import Specs.FuchsiaUsercopy.usercopy_address_in_restricted_range
 
 namespace Proof.FuchsiaUsercopy.usercopy_address_in_restricted_range
 
-open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.PureMirExec
 open Anneal.MirLiftCore
-open Anneal.Rustc.V2026_06_01.SymbolicEval
 
 theorem verified : StatefulVerificationResult Obligations.FuchsiaUsercopy.usercopy_address_in_restricted_range.statefulClaim := by
   refine verifyStatefulMirNoPanic_of_pureExec _ rfl
     (fun _ _ h => h.2 ▸ rootActiveMemory_emptyMemory) ?_
   rintro _ _ ⟨⟨addr, rs, re, -, -, -, rfl⟩, rfl⟩
-  -- Split on both switch conditions before lifting so that each path gets its
-  -- own step budget; rewriting them in the lifted environment resolves the
-  -- switches.
-  cases h0 : Nat.beq addr 0
-  · have h_ne := Nat.ne_of_beq_eq_false h0
+  -- The arms of bb0's switch reach `return` after different numbers of steps,
+  -- and the lifted step budget is a single metavariable, so split on
+  -- `addr == 0` before lifting. Rewriting it in the lifted environment then
+  -- resolves the switch.
+  cases h0 : Nat.beq addr 0 <;>
+    (apply lift_PureMirConverges rfl
+     -- bb0: `_4 = Eq(copy _1, const 0_usize); switchInt(move _4) -> [0: bb2, otherwise: bb1]`
+     apply LiftBlock.of_lookup rfl
+     apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+     rw [h0]
+     apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
+     -- bb2 (`_5 = Lt(copy _1, copy _2)`) or bb1 (`_0 = const false`)
+     apply LiftBlock.of_lookup rfl
+     apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl))
+  · -- bb2: `switchInt(move _5) -> [0: bb4, otherwise: bb3]`. Both arms assign
+    -- `_0` and `goto -> bb5`, so they share one step budget.
+    have h_ne := Nat.ne_of_beq_eq_false h0
     cases hs : Nat.ble rs addr <;>
-      (apply lift_PureMirConverges rfl
-       -- bb0: `_4 = Eq(copy _1, const 0_usize); switchInt(move _4) -> [0: bb2, otherwise: bb1]`
-       apply LiftBlock.of_lookup rfl
-       apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-       rw [h0]
-       apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-       -- bb2: `_5 = Lt(copy _1, copy _2); switchInt(move _5) -> [0: bb4, otherwise: bb3]`
-       apply LiftBlock.of_lookup rfl
-       apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-       rw [hs]
-       apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
+      (apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
        -- bb3 (`_0 = const false`) or bb4 (`_0 = Lt(copy _1, copy _3)`); `goto -> bb5`
        apply LiftBlock.of_lookup rfl
        apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
@@ -54,19 +54,9 @@ theorem verified : StatefulVerificationResult Obligations.FuchsiaUsercopy.userco
       · have := Nat.le_of_ble_eq_true hre
         rw [ite_eq_right (by omega)]
         rfl
-  · -- `addr = 0`: bb1 returns `false`.
+  · -- `addr = 0`. bb1: `goto -> bb5`; bb5: `return false`
     have h_z := Nat.eq_of_beq_eq_true h0
-    apply lift_PureMirConverges rfl
-    -- bb0, as above
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
-    rw [h0]
-    apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
-    -- bb1: `_0 = const false; goto -> bb5`
-    apply LiftBlock.of_lookup rfl
-    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
     apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
-    -- bb5: `return`
     apply LiftBlock.of_lookup rfl
     apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
     rintro _ _ _ ⟨⟩

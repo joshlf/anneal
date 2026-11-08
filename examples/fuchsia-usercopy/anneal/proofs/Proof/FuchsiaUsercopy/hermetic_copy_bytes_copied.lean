@@ -19,11 +19,11 @@ theorem verified : StatefulVerificationResult Obligations.FuchsiaUsercopy.hermet
   apply lift_PureMirConverges rfl
   -- bb0: `StorageLive(_4); _4 = SubWithOverflow(copy _3, copy _1); assert(!_4.1) -> bb1`
   apply LiftBlock.of_lookup rfl
-  apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+  repeat apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl) (by rfl)
   apply LiftStmtsTerminator.cons_eval_norm (by rfl) (Or.inr rfl) (by rfl)
     (evalPureStmtNorm_assign_local_of_evalRvalue
       (val := .aggregate 0 [.scalar ⟨unread - base, 8⟩, .scalar ⟨0, 1⟩])
-      (oldSlot := .uninit) rfl ?h_rv rfl (fun h => nomatch h) rfl)
+      rfl ?h_rv rfl (by nofun) rfl)
   case h_rv =>
     -- `base ≤ unread`, so the checked subtraction takes its non-overflow arm.
     change (match Nat.ble base unread with | true => _ | false => _) = _

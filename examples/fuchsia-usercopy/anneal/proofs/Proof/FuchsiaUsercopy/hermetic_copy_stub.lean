@@ -11,7 +11,6 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
 open Anneal.MirFuelFree
 open Anneal.PureMirExec
-open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
 /-- A step from `s` that has no successor state (it returns or raises a waived
