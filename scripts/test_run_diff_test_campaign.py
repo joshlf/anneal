@@ -191,7 +191,10 @@ def make_healthy_itree_report(
         "not_compared_reasons": {
             "compile_failed": 0,
             "staging_failed": 0,
+            "trace_collect_failed": 0,
+            "opt_level_trace_mismatch": 0,
             "empty_trace": 0,
+            "lean_build_failed": 0,
             "lean_probe_failed": not_compared_candidates,
             "lean_confirm_failed": 0,
         },
@@ -1266,61 +1269,153 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
             red_ok = campaign.evaluate_itree_red_flags(div_report, 0x20020002, {}, 50.0)
             self.assertTrue(red_ok.passed, red_ok.failure_reasons)
 
-    def test_compile_only_strips_v1_live_ledger_keys(self) -> None:
-        """`--compile-only` on an existing v1 ledger strips all live-oracle keys to match `LEDGER_KEYS`."""
+    def test_compile_only_preserves_live_history_and_strips_only_legacy_keys(self) -> None:
+        """`--compile-only` strips only the legacy prototype keys, never live-oracle history.
+
+        The capsule launcher uploads `state/` after every run, so stripping
+        `fingerprint_history` / `resolved_history` / `last_*_signature` /
+        `per_suite_runs` on a pass-through `--compile-only` run would erase the
+        shared x20 ledger's aging history and seed-sensitivity baselines.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp)
-            write_initial_ledger(state_dir)
+            ledger_path = write_initial_ledger(
+                state_dir,
+                total_miri_candidates_evaluated=99,
+                cumulative_distinct_obs_paths=7,
+                last_miri_signature={"miri_verdicts": {"pass": 3}},
+                quarantined_fingerprints=["PlaceProjectionWrapper:missed_ub:MirDiffTag.normalScalar"],
+            )
+            before = json.loads(ledger_path.read_text(encoding="utf-8"))
 
             def fake_run_harness(repo_root, bin_name, harness_args, json_path):
                 healthy_diag(bin_name)
-                if bin_name == "miri-difftest":
-                    return {
-                        "harness": "miri-difftest",
-                        "oracle_comparison": "not_performed",
-                        "mode": "seeded",
-                        "seed": "0x10010001",
-                        "batches": 2,
-                        "batch_size": 4,
-                        "total_candidates": 8,
-                        "opt_level_0_compiled": 8,
-                        "opt_level_2_compiled": 8,
-                        "opt_level_0_and_2_compiled": 8,
-                        "compile_pass_rate_pct": 100.0,
-                        "mutator_applications": {"AddToSubMutator": 4},
-                    }
                 return {
-                    "harness": "itree-difftest",
+                    "harness": bin_name,
                     "oracle_comparison": "not_performed",
                     "mode": "seeded",
-                    "seed": "0x20020002",
                     "batches": 2,
                     "batch_size": 4,
                     "total_candidates": 8,
-                    "unsafe_token_violations": 0,
-                    "opt_level_0_compiled": 8,
-                    "opt_level_2_compiled": 8,
+                    "compiled_candidates": 8,
                     "opt_level_0_and_2_compiled": 8,
-                    "compile_pass_rate_pct": 100.0,
-                    "mutator_applications": {"BranchLoopWeaver": 4},
+                    "elapsed_ms": 4.0,
                 }
 
             with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
                 rc = run_main(state_dir, "--compile-only")
             self.assertEqual(rc, campaign.EXIT_NOT_EVALUATED)
             ledger = read_ledger(state_dir)
-            expected_keys = {
-                "total_campaigns_run",
-                "last_run_utc",
-                "last_profile",
-                "last_oracle_comparison",
-                "next_miri_seed",
-                "next_itree_seed",
-                "total_miri_candidates_generated",
-                "total_itree_candidates_generated",
-            }
-            self.assertEqual(set(ledger.keys()), expected_keys)
+            for key in campaign.OBSOLETE_LEDGER_KEYS:
+                self.assertNotIn(key, ledger, key)
+            for key in (
+                "schema_version",
+                "per_suite_runs",
+                "fingerprint_history",
+                "resolved_history",
+                "quarantined_fingerprints",
+                "last_miri_seed",
+                "last_miri_signature",
+                "last_itree_seed",
+            ):
+                self.assertEqual(ledger[key], before[key], key)
+            self.assertEqual(ledger["total_campaigns_run"], before["total_campaigns_run"] + 1)
+            self.assertEqual(ledger["last_oracle_comparison"], "not_performed")
+            self.assertFalse((state_dir / "state" / "coverage_ratchet.json").exists())
 
+    def test_missing_ratchet_baseline_is_flagged_not_hidden(self) -> None:
+        """A ledger floor without the prior ratchet set is surfaced, never passed off as cumulative."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            # The capsule launcher copies only `campaign_ledger.json` into a fresh
+            # state directory, so the prior `coverage_ratchet.json` is absent.
+            write_initial_ledger(
+                state_dir, active_fingerprints=[], cumulative_distinct_obs_paths=120
+            )
+
+            def fake_run_harness(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(state_dir)
+                return make_healthy_itree_report(state_dir)
+
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
+                rc = run_main(state_dir)
+
+            self.assertEqual(rc, campaign.EXIT_SUCCESS)
+            ratchet = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertIs(ratchet.get("baseline_missing"), True)
+            self.assertEqual(len(ratchet["observed_paths"]), 4)
+            self.assertEqual(ratchet["cumulative_distinct_obs_paths"], 120)
+            self.assertEqual(read_ledger(state_dir)["cumulative_distinct_obs_paths"], 120)
+            summary = json.loads(
+                (state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertIs(summary["coverage_ratchet_baseline_missing"], True)
+            report_md = (state_dir / "reports" / "LATEST_REPORT.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Coverage ratchet warning", report_md)
+
+            # A later run that does see the (partial) ratchet accumulates into it, but
+            # keeps flagging the gap until the union catches up with the floor.
+            def fake_run_harness_2(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(
+                        state_dir,
+                        obs_path_signatures=[
+                            "miri:s01_checked_add@AddToSubMutator:pass_vs_pass:agree",
+                            "miri:s03_new_path@M9:panic_vs_panic:agree",
+                        ],
+                        mutator_bonus=1,
+                    )
+                return make_healthy_itree_report(state_dir, mutator_bonus=1)
+
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness_2):
+                rc2 = run_main(state_dir)
+            self.assertEqual(rc2, campaign.EXIT_SUCCESS)
+            ratchet2 = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(ratchet2["observed_paths"]), 5)
+            self.assertIs(ratchet2.get("baseline_missing"), True)
+            self.assertEqual(ratchet2["cumulative_distinct_obs_paths"], 120)
+
+    def test_new_itree_reasons_count_as_oracle_errors(self) -> None:
+        """Trace-collector, `-O0`/`-O2` mismatch, and Lean build drops are oracle errors."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            self.assertEqual(
+                set(campaign.ITREE_ORACLE_ERROR_REASONS),
+                set(campaign.VALID_ITREE_NOT_COMPARED_REASONS) - {"compile_failed"},
+            )
+            for reason in (
+                "trace_collect_failed",
+                "opt_level_trace_mismatch",
+                "lean_build_failed",
+            ):
+                with self.subTest(reason=reason):
+                    report = make_healthy_itree_report(state_dir, not_compared_candidates=1)
+                    report["not_compared_reasons"]["lean_probe_failed"] = 0
+                    report["not_compared_reasons"][reason] = 1
+                    self.assertEqual(
+                        campaign.validate_performed_itree_summary(report), (True, "ok")
+                    )
+                    red = campaign.evaluate_itree_red_flags(report, 0x20020002, {}, 50.0)
+                    self.assertFalse(red.checks["itree_oracle_error_threshold"])
+                    self.assertTrue(red.checks["itree_oracle_invoked"], red.failure_reasons)
+                    self.assertTrue(
+                        any(f"{reason}=1" in r for r in red.failure_reasons), red.failure_reasons
+                    )
+            # Summaries from older harness builds with an unknown reason key set are invalid.
+            stale = make_healthy_itree_report(state_dir)
+            del stale["not_compared_reasons"]["lean_build_failed"]
+            self.assertFalse(campaign.validate_performed_itree_summary(stale)[0])
 
 if __name__ == "__main__":
     unittest.main()

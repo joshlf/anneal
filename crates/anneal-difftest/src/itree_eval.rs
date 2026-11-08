@@ -162,10 +162,23 @@ pub const ITREE_DIAG_TAG_NAMES: [&str; 11] = [
 ];
 
 /// Canonical not-compared reason keys always included in `not_compared_reasons`.
-pub const ITREE_NOT_COMPARED_REASON_NAMES: [&str; 5] = [
+///
+/// Every reason except `compile_failed` means the oracle pipeline itself failed
+/// on a candidate that compiled: `staging_failed` (item staging/annotation),
+/// `trace_collect_failed` (native trace collector failed to compile/run/parse
+/// even in isolation), `opt_level_trace_mismatch` (`-C opt-level=0` and
+/// `-C opt-level=2` executions recorded different traces), `empty_trace`
+/// (the candidate ran but recorded no traces), `lean_build_failed` (its
+/// `Mir.ItreeDiffStaged.*` modules failed `lake build`), `lean_probe_failed`
+/// (Stage 1 `diagnoseRawByteTraceFullBounded`), and `lean_confirm_failed`
+/// (Stage 2 kernel confirmation).
+pub const ITREE_NOT_COMPARED_REASON_NAMES: [&str; 8] = [
     "compile_failed",
     "staging_failed",
+    "trace_collect_failed",
+    "opt_level_trace_mismatch",
     "empty_trace",
+    "lean_build_failed",
     "lean_probe_failed",
     "lean_confirm_failed",
 ];
@@ -175,6 +188,15 @@ pub const ITREE_PROBE_CHUNK_SIZE: usize = 64;
 
 /// Maximum number of trace cases per Stage 2 `ItreeDiffBatchConfirmChunk` Lean module.
 pub const ITREE_CONFIRM_CHUNK_SIZE: usize = 16;
+
+/// Upper bound on any configured Stage 2 chunk size
+/// ([`ItreeEvalOptions::confirm_chunk_size`]).
+pub const ITREE_MAX_CONFIRM_CHUNK_SIZE: usize = 64;
+
+/// Batches with at most this many distinct traces kernel-confirm every trace in
+/// Stage 2; larger batches confirm every divergence plus the first trace of
+/// every compared candidate.
+pub const ITREE_FULL_CONFIRM_MAX_TRACES: usize = 32;
 
 /// Default number of input trials executed natively per compiled candidate.
 pub const DEFAULT_ITREE_TRIALS_PER_CANDIDATE: usize = 12;
@@ -540,7 +562,9 @@ pub struct CandidateCompile {
 pub struct ItreeEvalOptions {
     /// Number of native execution trials per compiled candidate.
     pub trials_per_candidate: usize,
-    /// Maximum number of trace cases per Stage 2 `ItreeDiffBatchConfirmChunk` Lean module.
+    /// Maximum number of trace cases per Stage 2 `ItreeDiffBatchConfirmChunk` Lean
+    /// module (default [`ITREE_CONFIRM_CHUNK_SIZE`]; clamped to
+    /// `1..=`[`ITREE_MAX_CONFIRM_CHUNK_SIZE`]).
     pub confirm_chunk_size: usize,
     /// Optional path to the Anneal repository root (`trusted/lean` and `theory`).
     pub anneal_repo_root: Option<PathBuf>,
@@ -652,9 +676,10 @@ pub struct ItreeCampaignEvalReport {
     pub diverge_traces: usize,
     /// Count of distinct traces whose `TraceReplayDiag` tag and soundness
     /// theorems the Lean kernel actually checked (`by rfl`) in Stage 2
-    /// `ItreeDiffBatchConfirmChunk*` modules: every trace when at most 32
-    /// distinct traces were probed, otherwise every divergence plus the first
-    /// trace of each compared candidate (so `compared_candidates <=
+    /// `ItreeDiffBatchConfirmChunk*` modules: every trace in identity mode or
+    /// when at most [`ITREE_FULL_CONFIRM_MAX_TRACES`] distinct traces were
+    /// probed, otherwise every divergence plus the first non-diverging trace of
+    /// each compared candidate (so `agree_candidates + diverge_traces <=
     /// kernel_confirmed_traces <= distinct_traces_checked`).
     pub kernel_confirmed_traces: usize,
     /// Count of diverging traces kernel-confirmed via `by rfl`.
@@ -1355,7 +1380,7 @@ fn collect_traces_natively(
     repo_root: &Path,
     staging_dir: &Path,
     staged_candidates: &[(StagedItreeCandidate, Vec<CandidateTrialInput>)],
-) -> Result<(BTreeMap<String, Vec<RecordedRawTrace>>, Vec<String>), String> {
+) -> Result<NativeTraceCollection, String> {
     let proc_macro_dylib = build_anneal_trace_proc_macro_dylib(repo_root, staging_dir)?;
     let mir_instrument_bin = ensure_mir_instrument_bin(repo_root)?;
     let extern_arg = format!("anneal_trace={}", proc_macro_dylib.display());
@@ -1457,7 +1482,7 @@ fn collect_traces_natively(
                 return Err(e);
             }
 
-            let run_res = (|| -> Result<BTreeMap<String, Vec<RecordedRawTrace>>, String> {
+            let run_res = (|| -> Result<CollectedChunkTraces, String> {
                 let run_o0 = Command::new(&collector_bin_o0)
                     .current_dir(staging_dir)
                     .output()
@@ -1485,7 +1510,7 @@ fn collect_traces_natively(
 
                 let mut by_fn_o0 = parse_collector_stdout(&run_o0.stdout)?;
                 let mut by_fn_o2 = parse_collector_stdout(&run_o2.stdout)?;
-                let mut chunk_out: BTreeMap<String, Vec<RecordedRawTrace>> = BTreeMap::new();
+                let mut chunk_out = CollectedChunkTraces::new();
                 for (staged, _trials) in chunk {
                     let fn_name = &staged.root_fn_name;
                     let t0 = by_fn_o0.remove(fn_name).unwrap_or_default();
@@ -1495,9 +1520,9 @@ fn collect_traces_natively(
                             "itree-difftest: `{fn_name}` binary-instrumented traces differed \
                              between `-C opt-level=0` and `-C opt-level=2`"
                         );
-                        chunk_out.insert(fn_name.clone(), Vec::new());
+                        chunk_out.insert(fn_name.clone(), None);
                     } else {
-                        chunk_out.insert(fn_name.clone(), t0);
+                        chunk_out.insert(fn_name.clone(), Some(t0));
                     }
                 }
                 Ok(chunk_out)
@@ -1509,7 +1534,53 @@ fn collect_traces_natively(
     for err in &trace_stage.errors {
         eprintln!("itree-difftest: native trace collector failure: {err}");
     }
-    Ok((trace_stage.results, trace_stage.errors))
+    let mut collection = NativeTraceCollection {
+        collect_failed: trace_stage.failed_fns,
+        errors: trace_stage.errors,
+        ..NativeTraceCollection::default()
+    };
+    for (fn_name, traces) in trace_stage.results {
+        match traces {
+            Some(traces) => {
+                collection.traces_by_fn.insert(fn_name, traces);
+            }
+            None => {
+                collection.opt_level_mismatch.insert(fn_name);
+            }
+        }
+    }
+    Ok(collection)
+}
+
+/// Per-candidate traces from one collector chunk: `None` marks a candidate whose
+/// `-C opt-level=0` and `-C opt-level=2` traces differed.
+type CollectedChunkTraces = BTreeMap<String, Option<Vec<RecordedRawTrace>>>;
+
+/// Per-candidate outcome of [`collect_traces_natively`].
+#[derive(Debug, Default)]
+struct NativeTraceCollection {
+    /// Raw traces of every candidate whose `-O0` and `-O2` executions agreed.
+    traces_by_fn: BTreeMap<String, Vec<RecordedRawTrace>>,
+    /// Candidates whose trace collector failed to compile, run, or parse,
+    /// even after per-candidate fallback.
+    collect_failed: BTreeSet<String>,
+    /// Candidates whose `-C opt-level=0` and `-C opt-level=2` traces differed.
+    opt_level_mismatch: BTreeSet<String>,
+    /// Truncated diagnostics for failed collector chunks / fallbacks.
+    errors: Vec<String>,
+}
+
+impl NativeTraceCollection {
+    /// `not_compared_reasons` key for a candidate that has no usable traces.
+    fn missing_trace_reason(&self, fn_name: &str) -> &'static str {
+        if self.opt_level_mismatch.contains(fn_name) {
+            "opt_level_trace_mismatch"
+        } else if self.collect_failed.contains(fn_name) {
+            "trace_collect_failed"
+        } else {
+            "empty_trace"
+        }
+    }
 }
 
 fn extract_mir_neighborhood(staging_dir: &Path, mir_module: &str) -> (String, String) {
@@ -1805,8 +1876,7 @@ pub fn evaluate_itree_batches_with_options(
             options.root_mir_swaps.iter().cloned().collect();
 
         // Execute all compiled candidates natively with boundary interposition.
-        let (traces_by_fn, trace_stage_errors) =
-            collect_traces_natively(&repo_root, &staging_dir, &staged_with_trials)?;
+        let native = collect_traces_natively(&repo_root, &staging_dir, &staged_with_trials)?;
 
         let mut raw_trace_count_by_fn: BTreeMap<String, usize> = BTreeMap::new();
         let mut obs_records_by_fn: BTreeMap<
@@ -1821,14 +1891,15 @@ pub fn evaluate_itree_batches_with_options(
 
         for (staged, _trials) in &staged_with_trials {
             let fn_name = &staged.root_fn_name;
-            let raw_traces = traces_by_fn.get(fn_name).cloned().unwrap_or_default();
+            let raw_traces = native
+                .traces_by_fn
+                .get(fn_name)
+                .cloned()
+                .unwrap_or_default();
             if raw_traces.is_empty() {
-                eprintln!(
-                    "itree-difftest: `{fn_name}` produced no native traces (not compared: empty_trace)"
-                );
-                *not_compared_reasons
-                    .entry("empty_trace".to_string())
-                    .or_insert(0) += 1;
+                let reason = native.missing_trace_reason(fn_name);
+                eprintln!("itree-difftest: `{fn_name}` not compared: {reason}");
+                *not_compared_reasons.entry(reason.to_string()).or_insert(0) += 1;
                 continue;
             }
             compared_fn_names.insert(fn_name.clone());
@@ -1936,7 +2007,7 @@ pub fn evaluate_itree_batches_with_options(
         }
 
         if batch_cases.is_empty() {
-            return Err(match trace_stage_errors.first() {
+            return Err(match native.errors.first() {
                 Some(err) => format!("native trace collection produced 0 traces: {err}"),
                 None => "native trace collection produced 0 traces".to_string(),
             });
@@ -1991,9 +2062,9 @@ pub fn evaluate_itree_batches_with_options(
         }
         for fn_name in &mir_stage.failed_fns {
             if compared_fn_names.remove(fn_name) {
-                eprintln!("itree-difftest: `{fn_name}` not compared: lean_probe_failed");
+                eprintln!("itree-difftest: `{fn_name}` not compared: lean_build_failed");
                 *not_compared_reasons
-                    .entry("lean_probe_failed".to_string())
+                    .entry("lean_build_failed".to_string())
                     .or_insert(0) += 1;
             }
         }
@@ -2080,14 +2151,14 @@ pub fn evaluate_itree_batches_with_options(
 
         // Stage 2: Kernel-confirm `TraceReplayDiag.tagName` (`by rfl`) and
         // `checkRawByteTraceFullBounded_sound` + `checkRawByteTraceObsErasedBounded_sound`
-        // in chunks of `<= ITREE_CONFIRM_CHUNK_SIZE` cases, each chunk importing only
-        // its own `Mir.ItreeDiffStaged.*` modules. Identity-mode runs and single-chunk
-        // batches (`<= ITREE_CONFIRM_CHUNK_SIZE` distinct traces) confirm every trace;
+        // in chunks of `<= confirm_chunk_size` cases, each chunk importing only
+        // its own `Mir.ItreeDiffStaged.*` modules. Identity-mode runs and batches of
+        // `<= ITREE_FULL_CONFIRM_MAX_TRACES` distinct traces confirm every trace;
         // larger batches confirm every divergence plus the first trace of every
         // candidate. `kernel_confirmed_traces` counts only traces whose theorems were
         // actually checked by the Lean kernel.
         let confirm_cases: Vec<BatchTraceEvalCase> =
-            if mode == "identity" || batch_cases.len() <= ITREE_CONFIRM_CHUNK_SIZE {
+            if mode == "identity" || batch_cases.len() <= ITREE_FULL_CONFIRM_MAX_TRACES {
                 batch_cases.clone()
             } else {
             let mut selected = Vec::new();
@@ -2105,7 +2176,9 @@ pub fn evaluate_itree_batches_with_options(
             selected
         };
 
-        let confirm_chunk_size = options.confirm_chunk_size.max(1);
+        let confirm_chunk_size = options
+            .confirm_chunk_size
+            .clamp(1, ITREE_MAX_CONFIRM_CHUNK_SIZE);
         let confirm_stage = run_isolated_lean_stage(
             "ItreeDiffBatchConfirm",
             &confirm_cases,
@@ -2866,6 +2939,36 @@ mod tests {
         assert_ne!(a, other_branch);
         assert_ne!(a, other_call_pos);
         assert!(a.starts_with("b2e1h"), "unexpected shape hash format: {a}");
+    }
+
+    #[test]
+    fn missing_trace_reasons_distinguish_collector_failure_and_opt_level_mismatch() {
+        let native = NativeTraceCollection {
+            traces_by_fn: BTreeMap::from([("ok_fn".to_string(), Vec::new())]),
+            collect_failed: BTreeSet::from(["crashed_fn".to_string()]),
+            opt_level_mismatch: BTreeSet::from(["flaky_fn".to_string()]),
+            errors: Vec::new(),
+        };
+        assert_eq!(
+            native.missing_trace_reason("flaky_fn"),
+            "opt_level_trace_mismatch"
+        );
+        assert_eq!(
+            native.missing_trace_reason("crashed_fn"),
+            "trace_collect_failed"
+        );
+        assert_eq!(native.missing_trace_reason("ok_fn"), "empty_trace");
+        for reason in [
+            "opt_level_trace_mismatch",
+            "trace_collect_failed",
+            "empty_trace",
+            "lean_build_failed",
+        ] {
+            assert!(
+                ITREE_NOT_COMPARED_REASON_NAMES.contains(&reason),
+                "`{reason}` must be a canonical not-compared reason"
+            );
+        }
     }
 
     #[test]

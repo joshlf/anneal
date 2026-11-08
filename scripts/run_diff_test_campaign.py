@@ -104,21 +104,22 @@ VALID_ITREE_DIAG_TAGS = (
 VALID_ITREE_NOT_COMPARED_REASONS = (
     "compile_failed",
     "staging_failed",
+    "trace_collect_failed",
+    "opt_level_trace_mismatch",
     "empty_trace",
+    "lean_build_failed",
     "lean_probe_failed",
     "lean_confirm_failed",
 )
 
 # Not-compared reasons that mean the ITree oracle pipeline (staging, native trace
-# capture, or Lean `TraceCheck` probe / kernel confirmation) failed on a candidate
-# that compiled. Like Miri oracle/capture errors, these count against
+# capture, `-O0`/`-O2` trace agreement, or Lean `Mir` build / `TraceCheck` probe /
+# kernel confirmation) failed on a candidate that compiled: every reason except
+# `compile_failed`. Like Miri oracle/capture errors, these count against
 # `--max-oracle-errors` so isolated per-candidate failures can never silently
 # shrink the compared set of a run that still reports itself as healthy.
-ITREE_ORACLE_ERROR_REASONS = (
-    "staging_failed",
-    "empty_trace",
-    "lean_probe_failed",
-    "lean_confirm_failed",
+ITREE_ORACLE_ERROR_REASONS = tuple(
+    r for r in VALID_ITREE_NOT_COMPARED_REASONS if r != "compile_failed"
 )
 
 # Integer count keys that a harness JSON summary may carry.
@@ -151,24 +152,18 @@ HARNESS_INT_KEYS = (
 )
 
 # Ledger keys that earlier compile-only versions of this runner dropped when
-# running without an oracle, plus v1 live-oracle ledger keys that must not
-# remain when a state directory is reused in `--compile-only` mode.
+# running without an oracle. Live-oracle history (`fingerprint_history`,
+# `resolved_history`, `quarantined_fingerprints`, `last_*_signature`,
+# `per_suite_runs`, `schema_version`, ...) is deliberately NOT listed: the
+# capsule launcher uploads `state/` after every run, so stripping it on a
+# pass-through `--compile-only` run would erase the shared x20 ledger's aging
+# history and seed-sensitivity baselines.
 OBSOLETE_LEDGER_KEYS = (
-    "schema_version",
-    "per_suite_runs",
     "total_miri_candidates_evaluated",
     "total_itree_candidates_evaluated",
     "total_itree_inputs_evaluated",
-    "total_itree_traces_checked",
     "cumulative_distinct_obs_paths",
     "active_fingerprints",
-    "quarantined_fingerprints",
-    "fingerprint_history",
-    "resolved_history",
-    "last_miri_seed",
-    "last_miri_signature",
-    "last_itree_seed",
-    "last_itree_signature",
 )
 
 
@@ -1918,7 +1913,7 @@ def update_coverage_ratchet(
     itree_suite_healthy: bool,
     itree: dict[str, Any] | None,
     itree_seed: int,
-) -> Path:
+) -> tuple[Path, bool]:
     """Monotonically merges observation-path signatures from healthy suite(s)
     into `state/coverage_ratchet.json` and updates `ledger['cumulative_distinct_obs_paths']`.
 
@@ -1926,6 +1921,13 @@ def update_coverage_ratchet(
     and `cumulative_distinct_obs_paths` count distinct semantic observation paths
     ever observed by a healthy suite. Previous ratchet / ledger totals act as a
     floor if the ratchet file was lost or truncated.
+
+    Returns `(ratchet_path, baseline_missing)`, where `baseline_missing` means the
+    prior `observed_paths` set held fewer paths than the recorded cumulative
+    floor (e.g. the capsule launcher copied only `campaign_ledger.json` into a
+    fresh state directory), so this run's union could not extend the history.
+    The flag is also persisted in the ratchet so consumers never mistake a
+    single-run union for the cumulative set.
     """
     ratchet = load_coverage_ratchet(ratchet_path)
     raw_obs = ratchet.get("observed_paths", {})
@@ -1938,6 +1940,18 @@ def update_coverage_ratchet(
         if isinstance(raw_obs, dict)
         else {}
     )
+    prior_floor = max(
+        _safe_nonneg_int(ratchet.get("cumulative_distinct_obs_paths")),
+        _safe_nonneg_int(ledger.get("cumulative_distinct_obs_paths")),
+    )
+    baseline_missing = len(observed_paths) < prior_floor
+    if baseline_missing:
+        sys.stderr.write(
+            f"warning: {ratchet_path} holds {len(observed_paths)} observation paths but the "
+            f"recorded cumulative floor is {prior_floor}; this run cannot extend the "
+            "cumulative set (provide state/coverage_ratchet.json alongside "
+            "state/campaign_ledger.json to accumulate)\n"
+        )
     now_utc = utc_now_iso()
 
     for suite_key, is_healthy, summary, seed_val in (
@@ -1997,13 +2011,15 @@ def update_coverage_ratchet(
         "per_suite_distinct_obs_paths": per_suite,
         "observed_paths": observed_paths,
     }
+    if baseline_missing:
+        updated_ratchet["baseline_missing"] = True
     ratchet_path.parent.mkdir(parents=True, exist_ok=True)
     ratchet_path.write_text(
         json.dumps(updated_ratchet, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     ledger["cumulative_distinct_obs_paths"] = new_total
-    return ratchet_path
+    return ratchet_path, baseline_missing
 
 
 def markdown_code_fence_for(text: str) -> str:
@@ -2037,6 +2053,7 @@ def render_oracle_campaign_report(
     miri_seed: int,
     itree_seed: int,
     elapsed_sec: float,
+    coverage_ratchet_baseline_missing: bool = False,
 ) -> str:
     """Renders the full Markdown report for a live oracle campaign."""
     miri_performed = (
@@ -2209,6 +2226,16 @@ def render_oracle_campaign_report(
         "",
         f"Total campaign wall-clock: {elapsed_sec:.2f} s.",
     ]
+    if coverage_ratchet_baseline_missing:
+        lines.extend(
+            [
+                "",
+                "> **Coverage ratchet warning**: the prior `state/coverage_ratchet.json` "
+                "observation-path set was missing or incomplete, so this run's paths could "
+                "not extend the cumulative set (`cumulative_distinct_obs_paths` kept its "
+                "recorded floor).",
+            ]
+        )
 
     if miri_performed and miri is not None:
         lines.extend(
@@ -2883,6 +2910,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             written.extend(collect_finding_bundle_files(itree["findings"], state_dir))
 
+        ratchet_baseline_missing = False
         if miri_suite_healthy or itree_suite_healthy:
             ledger["schema_version"] = 1
             ledger.setdefault("next_miri_seed", f"0x{miri_seed:08x}")
@@ -2946,7 +2974,7 @@ def main(argv: list[str] | None = None) -> int:
                 itree_quarantined,
             )
 
-            update_coverage_ratchet(
+            _, ratchet_baseline_missing = update_coverage_ratchet(
                 ratchet_path,
                 ledger,
                 miri_suite_healthy,
@@ -2998,6 +3026,7 @@ def main(argv: list[str] | None = None) -> int:
             miri_seed,
             itree_seed,
             elapsed_sec,
+            coverage_ratchet_baseline_missing=ratchet_baseline_missing,
         )
         for report_path in [
             state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_report.md",
@@ -3035,6 +3064,7 @@ def main(argv: list[str] | None = None) -> int:
                 "failure_reasons": combined_reasons,
             },
             "harness_diagnostics": copy.deepcopy(LAST_HARNESS_DIAGNOSTICS),
+            "coverage_ratchet_baseline_missing": ratchet_baseline_missing,
             "miri_summary": miri,
             "itree_summary": itree if include_itree else None,
             "deduplicated_findings": [d.to_dict() for d in all_dedup],
