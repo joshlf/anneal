@@ -26,6 +26,9 @@ import LeanMiriSpec.Correspondence.LayoutLM2_2
 import LeanMiriSpec.Correspondence.ProjLM2_2
 import LeanMiriSpec.Correspondence.SimLM2_2
 import LeanMiriSpec.Correspondence.WitLM2_2
+import LeanMiriSpec.Correspondence.UnionLM2_4
+import LeanMiriSpec.Correspondence.SimLM2_4
+import LeanMiriSpec.Correspondence.WitLM2_4
 import LeanMiriSpec.Audit
 
 /-!
@@ -115,6 +118,16 @@ import LeanMiriSpec.Audit
   tuple/struct-returning root functions (`fn() -> PaddedOuter`), root `return`
   with live padded memory, and `> 64`-byte multi-block `InitMask` `#[repr(C)]`
   structs (`80` bytes across two 64-bit `InitMask` words).
+* `LeanMiriSpec.Correspondence.UnionLM2_4`: the `LM-2.4` union and `Subslice`
+  hooks (`annealStepHooksLM2_4`, a conservative extension of `annealStepHooks`),
+  the union initialization masks of `I-11` (`unionPrefixMask`, certified against
+  the vendored chunk copy by `unionPrefixMask_vendoredCopy`), and the union state
+  relation `StateRelLM2_4`.
+* `LeanMiriSpec.Correspondence.SimLM2_4`: `LM-2.4` correspondence for union
+  aggregates, union field reads (including reads of uninitialized bytes),
+  whole-union copies that preserve the initialization mask, and `Subslice`
+  projections, with the boundaries of the agreeing fragment.
+* `LeanMiriSpec.Correspondence.WitLM2_4`: non-vacuity witnesses for `LM-2.4`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

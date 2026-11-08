@@ -2334,7 +2334,20 @@ theorem of_dealloc {mach : AnnealMachine}
           base_lookup ptr_addr_eq addr_no_overflow mut_alloc aligned_ptr byteSize_eq alloc_len_eq
           prov_empty mask_rel word_bits_init fields_rel padding_uninit
 
+
+
+theorem byteSize_eq {mach ty layouts fields paths rootVal mp}
+    (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp) :
+    ∃ (allocId : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag)
+      (baseAddr : UInt64) (localAlloc : AnnealLocalAlloc),
+      mp.ptr.provenance = some (.concrete allocId tag) ∧
+      mach.memory.live.find? (fun (k, _) => k == allocId) = some (allocId, localAlloc) ∧
+      localAlloc.allocation.byteSize = (translateTy ty layouts).layout.size := by
+  rcases h with ⟨allocId, tag, baseAddr, localAlloc, _, _, _, _, _, ptr_prov, _, _, live_entry, _, _, _, _, _, byteSize_eq, _⟩
+  exact ⟨allocId, tag, baseAddr, localAlloc, ptr_prov, live_entry.left, byteSize_eq⟩
+
 end StructMemPlaceRel
+
 
 /-- Memory-place correspondence for an **uninitialized** indirect aggregate local
 (`.uninit` in Anneal, `.indirect mp` backed by a freshly allocated uninitialized

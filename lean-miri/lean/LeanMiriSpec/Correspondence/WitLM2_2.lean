@@ -28,7 +28,7 @@ upstream `lean-miri`:
    `_2.1 = 0x5566_u16` and keeping trailing alignment padding bytes `6, 7`
    `.uninit`), re-reads `_2.0` into `_0`, frees both stack allocations via
    `StorageDead`, and instantiates `step_two_stmts_lm2_2_simulation` and
-   `StateRelLM2_2.toStateRel_of_flat_imm`.
+   `StateRelLM2_2.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PairEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide))`.
 2. **Unpadded `AbiRepr.Memory` Struct (`lm22UnpaddedBody`)**: constructs 3-field
    `UnpaddedTriple { a: u32, b: u32, c: u32 }` (`size = 12`, `0` padding bytes),
    overwrites `_1.1 = const 77_u32`, reads `_1.1`, and proves base `StateRel`
@@ -667,7 +667,7 @@ theorem lm22Pair_full_trace_and_returns_agree :
         lm22PairTy lm22PairLayoutTable lm22PairFields lm22PairPaths
         (.aggregate 0 [.scalar ⟨0x99AABBCC, 4⟩, .scalar ⟨0x5566, 2⟩]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22PairBody 7 lm22PairMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 6) = .ok false ∧
@@ -717,7 +717,7 @@ theorem lm22Pair_full_trace_and_returns_agree :
             lm22PairTy lm22PairLayoutTable lm22PairFields lm22PairPaths
             (.aggregate 0 [.scalar ⟨0x99AABBCC, 4⟩, .scalar ⟨0x5566, 2⟩]) mp ∧
           (∃ allocId,
-            mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+            (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
             (lm22StepMiriN lm22PairBody 7 lm22PairMiriInit).machine.memory.live.find?
               (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
           localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 6) = .ok false ∧
@@ -745,7 +745,7 @@ theorem lm22Pair_full_trace_and_returns_agree :
     have hbase11 : StateRel lm22PairBody
         (lm22StepAnnealN lm22PairBody 11 (initMachineState lm22PairBody []))
         (lm22StepMiriN lm22PairBody 11 lm22PairMiriInit) := by
-      refine hs11.toStateRel_of_flat_imm (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+      refine hs11.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PairEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide)) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
       case hunpad =>
         intro i _ _ _ _ _ _ hdecl henv hslot _
         match i with
@@ -1036,7 +1036,7 @@ theorem lm22Unpadded_full_trace_and_returns_agree :
   have hbase3 : StateRel lm22UnpaddedBody
       (lm22StepAnnealN lm22UnpaddedBody 3 (initMachineState lm22UnpaddedBody []))
       (lm22StepMiriN lm22UnpaddedBody 3 lm22UnpaddedMiriInit) := by
-    refine hs3.toStateRel_of_flat_imm
+    refine hs3.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22UnpaddedEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide))
       (fun i decl v imm lay hdecl henv hslot ⟨tf, htf, hmls⟩ => ?_) ?hunpad
     case hunpad =>
       intro i decl _ _ _ fields paths hdecl henv _ _
@@ -1061,7 +1061,7 @@ theorem lm22Unpadded_full_trace_and_returns_agree :
   have hbase5 : StateRel lm22UnpaddedBody
       (lm22StepAnnealN lm22UnpaddedBody 5 (initMachineState lm22UnpaddedBody []))
       (lm22StepMiriN lm22UnpaddedBody 5 lm22UnpaddedMiriInit) := by
-    refine hs5.toStateRel_of_flat_imm (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs5.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22UnpaddedEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide)) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -1378,7 +1378,7 @@ theorem lm22Padded_full_trace_and_returns_agree :
         lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22PaddedBody 5 lm22PaddedMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -1478,7 +1478,7 @@ theorem lm22Padded_full_trace_and_returns_agree :
           lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
           (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
         (∃ allocId,
-          mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
           (lm22StepMiriN lm22PaddedBody 5 lm22PaddedMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
         localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -1498,7 +1498,7 @@ theorem lm22Padded_full_trace_and_returns_agree :
   have hbase8 : StateRel lm22PaddedBody
       (lm22StepAnnealN lm22PaddedBody 8 (initMachineState lm22PaddedBody []))
       (lm22StepMiriN lm22PaddedBody 8 lm22PaddedMiriInit) := by
-    refine hs8.toStateRel_of_flat_imm (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs8.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PaddedEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide)) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -1882,7 +1882,7 @@ theorem lm22Nested_full_trace_and_returns_agree :
         lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0xBEEF, 2⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22NestedBody 7 lm22NestedMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -2034,7 +2034,7 @@ theorem lm22Nested_full_trace_and_returns_agree :
             lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
             (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0xBEEF, 2⟩]]) mp ∧
           (∃ allocId,
-            mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+            (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
             (lm22StepMiriN lm22NestedBody 7 lm22NestedMiriInit).machine.memory.live.find?
               (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
           localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -2054,7 +2054,7 @@ theorem lm22Nested_full_trace_and_returns_agree :
     have hbase14 : StateRel lm22NestedBody
         (lm22StepAnnealN lm22NestedBody 14 (initMachineState lm22NestedBody []))
         (lm22StepMiriN lm22NestedBody 14 lm22NestedMiriInit) := by
-      refine hs14.toStateRel_of_flat_imm (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+      refine hs14.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22NestedEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide)) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
       case hunpad =>
         intro i _ _ _ _ _ _ hdecl henv hslot _
         match i with
@@ -2364,7 +2364,7 @@ theorem lm22Reassign_full_trace_and_returns_agree :
   have hbase12 : StateRel lm22ReassignBody
       (lm22StepAnnealN lm22ReassignBody 12 (initMachineState lm22ReassignBody []))
       (lm22StepMiriN lm22ReassignBody 12 lm22ReassignMiriInit) := by
-    refine hs12.toStateRel_of_flat_imm (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs12.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22PairEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide)) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -2630,7 +2630,7 @@ theorem lm22SubStruct_full_trace_and_returns_agree :
         lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x55556666, 4⟩, .scalar ⟨0x7788, 2⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22SubStructBody 9 lm22SubStructMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -2784,7 +2784,7 @@ theorem lm22SubStruct_full_trace_and_returns_agree :
           lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
           (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x55556666, 4⟩, .scalar ⟨0x7788, 2⟩]]) mp ∧
         (∃ allocId,
-          mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
           (lm22StepMiriN lm22SubStructBody 9 lm22SubStructMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
         localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -2804,7 +2804,7 @@ theorem lm22SubStruct_full_trace_and_returns_agree :
   have hbase14 : StateRel lm22SubStructBody
       (lm22StepAnnealN lm22SubStructBody 14 (initMachineState lm22SubStructBody []))
       (lm22StepMiriN lm22SubStructBody 14 lm22SubStructMiriInit) := by
-    refine hs14.toStateRel_of_flat_imm (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs14.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22NestedEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide)) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -3051,7 +3051,7 @@ theorem lm22Large_full_trace_and_returns_agree :
         lm22LargeTy lm22LargeLayoutTable lm22LargeFields lm22LargePaths
         (.aggregate 0 [.scalar ⟨5, 1⟩, .scalar ⟨100, 4⟩, .scalar ⟨999, 4⟩]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22LargeBody 3 lm22LargeMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 ∧
@@ -3132,7 +3132,7 @@ theorem lm22Large_full_trace_and_returns_agree :
           lm22LargeTy lm22LargeLayoutTable lm22LargeFields lm22LargePaths
           (.aggregate 0 [.scalar ⟨5, 1⟩, .scalar ⟨100, 4⟩, .scalar ⟨999, 4⟩]) mp ∧
         (∃ allocId,
-          mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
           (lm22StepMiriN lm22LargeBody 3 lm22LargeMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
         localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 ∧
@@ -3147,8 +3147,8 @@ theorem lm22Large_full_trace_and_returns_agree :
       obtain ⟨allocId, localAlloc, hprov, hfind, hpad_fn, hhas_uninit⟩ :=
         hsmpr.has_uninit_of_padding_byte p1
       have hbs : localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 := by
-        rcases hsmpr with ⟨aid, _, la, _, _, _, _, _, hprov', _, _, ⟨hfind', _⟩, _, _, _, _, _, hbs, _⟩
-        cases Option.some.inj (hprov.symm.trans hprov')
+        obtain ⟨aid, tag, b, la, hprov', hfind', hbs⟩ := StructMemPlaceRel.byteSize_eq hsmpr
+        obtain ⟨tag, hprov_eq⟩ := hprov; cases Option.some.inj (hprov_eq.symm.trans hprov')
         cases Option.some.inj (hfind.symm.trans hfind')
         exact hbs
       exact ⟨mp, localAlloc, hsmpr, ⟨allocId, hprov, hfind⟩, hbs,
@@ -3156,7 +3156,7 @@ theorem lm22Large_full_trace_and_returns_agree :
   have hbase5 : StateRel lm22LargeBody
       (lm22StepAnnealN lm22LargeBody 5 (initMachineState lm22LargeBody []))
       (lm22StepMiriN lm22LargeBody 5 lm22LargeMiriInit) := by
-    refine hs5.toStateRel_of_flat_imm (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
+    refine hs5.toStateRel_of_flat_imm (by intro ty fs ps h _ _; revert h; unfold lm22LargeEnv; intro h; try dsimp only at h; cases ty; rename_i kind layoutIdx; cases kind <;> (try cases h) <;> (try decide)) (fun i _ _ _ _ hdecl henv hslot _ => ?_) ?hunpad
     case hunpad =>
       intro i _ _ _ _ _ _ hdecl henv hslot _
       match i with
@@ -3350,7 +3350,7 @@ theorem lm22LiveRet_full_trace_and_returns_agree :
         lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22LiveRetBody 7 lm22LiveRetMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false) ∧
@@ -3444,7 +3444,7 @@ theorem lm22LiveRet_full_trace_and_returns_agree :
           lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
           (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
         (∃ allocId,
-          mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
           (lm22StepMiriN lm22LiveRetBody 7 lm22LiveRetMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
         localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false := by
@@ -3644,7 +3644,7 @@ theorem lm22MemMove_full_trace_and_returns_agree :
         lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp3 ∧
       (∃ allocId3,
-        mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp3.ptr.provenance = some (.concrete allocId3 tag)) ∧
         (lm22StepMiriN lm22MemMoveBody 7 lm22MemMoveMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
       alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -3658,7 +3658,7 @@ theorem lm22MemMove_full_trace_and_returns_agree :
         lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp4 ∧
       (∃ allocId4,
-        mp4.ptr.provenance = some (.concrete allocId4 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp4.ptr.provenance = some (.concrete allocId4 tag)) ∧
         (lm22StepMiriN lm22MemMoveBody 10 lm22MemMoveMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId4) = some (allocId4, alloc4)) ∧
       alloc4.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -3729,7 +3729,7 @@ theorem lm22MemMove_full_trace_and_returns_agree :
           lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
           (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp3 ∧
         (∃ allocId3,
-          mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp3.ptr.provenance = some (.concrete allocId3 tag)) ∧
           (lm22StepMiriN lm22MemMoveBody 7 lm22MemMoveMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
         alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -3751,7 +3751,7 @@ theorem lm22MemMove_full_trace_and_returns_agree :
           lm22NestedTy lm22NestedLayoutTable lm22NestedFields lm22NestedPaths
           (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp4 ∧
         (∃ allocId4,
-          mp4.ptr.provenance = some (.concrete allocId4 Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp4.ptr.provenance = some (.concrete allocId4 tag)) ∧
           (lm22StepMiriN lm22MemMoveBody 10 lm22MemMoveMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId4) = some (allocId4, alloc4)) ∧
         alloc4.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -3943,7 +3943,7 @@ theorem lm22ScalarWrapSub_full_trace_and_returns_agree :
         lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFEBABE, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22ScalarWrapSubBody 9 lm22ScalarWrapSubMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -4091,7 +4091,7 @@ theorem lm22ScalarWrapSub_full_trace_and_returns_agree :
           lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
           (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFEBABE, 4⟩]]) mp ∧
         (∃ allocId,
-          mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
           (lm22StepMiriN lm22ScalarWrapSubBody 9 lm22ScalarWrapSubMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
         localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -4431,7 +4431,7 @@ theorem lm22Realistic80_full_trace_and_returns_agree :
            .scalar ⟨40, 8⟩, .scalar ⟨50, 8⟩, .scalar ⟨60, 8⟩, .scalar ⟨70, 8⟩,
            .scalar ⟨0x1122334455667788, 8⟩, .scalar ⟨0xAB, 1⟩]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22Realistic80Body 5 lm22Realistic80MiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 ∧
@@ -4535,7 +4535,7 @@ theorem lm22Realistic80_full_trace_and_returns_agree :
              .scalar ⟨40, 8⟩, .scalar ⟨50, 8⟩, .scalar ⟨60, 8⟩, .scalar ⟨70, 8⟩,
              .scalar ⟨0x1122334455667788, 8⟩, .scalar ⟨0xAB, 1⟩]) mp ∧
         (∃ allocId,
-          mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
           (lm22StepMiriN lm22Realistic80Body 5 lm22Realistic80MiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
         localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 ∧
@@ -4550,8 +4550,8 @@ theorem lm22Realistic80_full_trace_and_returns_agree :
     obtain ⟨allocId, localAlloc, hprov, hfind, hpad_fn, hhas_uninit⟩ :=
       hsmpr.has_uninit_of_padding_byte hp1
     have hbs : localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 := by
-      rcases hsmpr with ⟨aid, _, la, _, _, _, _, _, hprov', _, _, ⟨hfind', _⟩, _, _, _, _, _, hbs, _⟩
-      cases Option.some.inj (hprov.symm.trans hprov')
+      obtain ⟨aid, tag, b, la, hprov', hfind', hbs⟩ := StructMemPlaceRel.byteSize_eq hsmpr
+      obtain ⟨tag, hprov_eq⟩ := hprov; cases Option.some.inj (hprov_eq.symm.trans hprov')
       cases Option.some.inj (hfind.symm.trans hfind')
       exact hbs
     exact ⟨mp, localAlloc, hsmpr, ⟨allocId, hprov, hfind⟩, hbs,
@@ -5621,7 +5621,7 @@ private theorem lm22SuperOuter_step0_spec :
   have hsr7 : ScalarRel ⟨7, 1⟩ (Miri.Memory.ScalarInt.ofUInt8 7) :=
     ⟨Or.inl rfl, by rw [scalarModulus_eq_two_pow]; decide, rfl, rfl⟩
   obtain ⟨after0, _, hw0, _, _, _, _, _, _, _, _, _⟩ :=
-    alloc_writeScalar_at_offset hsr7 (A := lm22SuperOuterUninitAlloc)
+    alloc_writeScalar_at_offset_mask hsr7 (A := lm22SuperOuterUninitAlloc)
       (start := Miri.ABI.Size.ZERO)
       (by rw [hlen_u, hbs_u]; rfl) hmut_u hprov_u hmask_rel_u
       (by rw [hbs_u]; decide)
@@ -6033,7 +6033,7 @@ private theorem lm22SuperOuter_hsmpr1
         .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩]]) := by
     change 0 < 1 ∧ ((0 < 4 ∧ (0 < 4 ∧ (0 < 4 ∧ True))) ∧ True)
     decide
-  refine .mk lm22AllocId1 (annealStackBaseAddr lm22AllocId1)
+  refine .mk lm22AllocId1 Miri.Memory.BorTag.one (annealStackBaseAddr lm22AllocId1)
     ⟨.stack, step1Alloc⟩ words1
     lm22SuperOuter_validStructLayout rfl
     ⟨⟨_, _, rfl⟩, hnz1⟩
@@ -6142,7 +6142,7 @@ theorem lm22SuperOuter_full_trace_and_returns_agree :
         (.aggregate 0 [.scalar ⟨7, 1⟩,
           .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨0x778899AA, 4⟩]]) mp3 ∧
       (∃ allocId3,
-        mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp3.ptr.provenance = some (.concrete allocId3 tag)) ∧
         (lm22StepMiriN lm22SuperOuterBody 4 lm22SuperOuterMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
       alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -6228,7 +6228,7 @@ theorem lm22SuperOuter_full_trace_and_returns_agree :
           (.aggregate 0 [.scalar ⟨7, 1⟩,
             .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨0x778899AA, 4⟩]]) mp3 ∧
         (∃ allocId3,
-          mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp3.ptr.provenance = some (.concrete allocId3 tag)) ∧
           (lm22StepMiriN lm22SuperOuterBody 4 lm22SuperOuterMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
         alloc3.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -6384,7 +6384,7 @@ theorem lm22StructRet_full_trace_and_struct_return :
         lm22PaddedFields lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xDEADBEEF, 4⟩]]) mp0 ∧
       (∃ allocId0,
-        mp0.ptr.provenance = some (.concrete allocId0 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp0.ptr.provenance = some (.concrete allocId0 tag)) ∧
         m_ret.machine.memory.live.find? (fun (k, _) => k == allocId0) = some (allocId0, alloc0)) ∧
       alloc0.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
       alloc0.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
@@ -6570,7 +6570,7 @@ theorem lm22SelfMove_full_trace_and_returns_agree :
         lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFE1234, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (lm22StepMiriN lm22SelfMoveBody 5 lm22SelfMoveMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -6655,7 +6655,7 @@ theorem lm22SelfMove_full_trace_and_returns_agree :
           lm22PaddedTy lm22PaddedLayoutTable lm22PaddedFields lm22PaddedPaths
           (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFE1234, 4⟩]]) mp ∧
         (∃ allocId,
-          mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+          (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
           (lm22StepMiriN lm22SelfMoveBody 5 lm22SelfMoveMiriInit).machine.memory.live.find?
             (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
         localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -6792,7 +6792,7 @@ private theorem lm22SelfCopy_hsmpr :
       NoZeroByteLeaves (.aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩]) := by
     change 0 < 4 ∧ (0 < 4 ∧ (0 < 4 ∧ True))
     decide
-  refine .mk lm22AllocId1 (annealStackBaseAddr lm22AllocId1)
+  refine .mk lm22AllocId1 Miri.Memory.BorTag.one (annealStackBaseAddr lm22AllocId1)
     ⟨.stack, lm22SuperTripleInitAlloc⟩ (initWordsTrue (Miri.ABI.Size.ofBytes 12))
     lm22Unpadded_validStructLayout rfl ⟨⟨_, _, rfl⟩, hnz⟩
     rfl rfl rfl rfl

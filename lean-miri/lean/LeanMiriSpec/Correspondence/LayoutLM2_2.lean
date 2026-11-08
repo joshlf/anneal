@@ -21,7 +21,7 @@ This module proves the byte-level memory and `InitMask` foundations for `LM-2.2`
    `words : Array UInt64` (`64` bytes per block, `words.size = len.bytes.toNat / 64 + 1`),
    proving exact bit-level transitions (`maskBlocksGetBit`) for `InitMask.setRange`,
    `InitMask.get`, and `InitMask.isRangeInitialized` without any 64-byte size cap.
-2. `alloc_writeScalar_at_offset`: proves that writing a `ScalarRel`-related
+2. `alloc_writeScalar_at_offset_mask`: proves that writing a `ScalarRel`-related
    scalar at any in-bounds byte range `[start, start + sz)` of a mutable
    allocation succeeds, reads back the written scalar at `[start, start + sz)`,
    preserves `Allocation.readScalar` and `isRangeInitialized` on every disjoint
@@ -1578,7 +1578,7 @@ theorem alloc_readScalar_congr {E : Type}
   simp only [Except.mapError, bind, Except.bind, lm22_getBytesUnchecked_eq, hslice_eq,
     Bool.false_eq_true, ↓reduceIte, hoff]
 
-theorem alloc_writeScalar_at_offset {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+theorem alloc_writeScalar_at_offset_mask {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
     (hrel : ScalarRel sc msc) {E : Type} {A : Miri.Memory.Allocation AnnealProv E}
     {start : Miri.ABI.Size} {words : Array UInt64}
     (hlen : A.len = A.byteSize.bytes.toNat)
@@ -1834,7 +1834,7 @@ theorem writeField_preserves_other_fields_and_padding
     rw [← hfield_sz, hbsize]
     exact hvalid.fields_in_bounds i hi
   obtain ⟨A', words', hwrite, hbsize', hlen', hmut', hprov', hmask', hword_bits, hraw', hinit_i, hread_i⟩ :=
-    alloc_writeScalar_at_offset hrel hlen hmut hprov hmask hbnd_i
+    alloc_writeScalar_at_offset_mask hrel hlen hmut hprov hmask hbnd_i
   rw [← hfield_sz] at hinit_i hread_i hword_bits hraw'
   have hrawA_len : (lm22AllocRaw A).size = A.byteSize.bytes.toNat := by
     have : (lm22AllocRaw A).size = A.len := by cases A; rfl

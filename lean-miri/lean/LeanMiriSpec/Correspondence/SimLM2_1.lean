@@ -532,7 +532,7 @@ theorem annealReadImmediate_of_projected_array_elem
       simp only [Miri.ABI.Size.ofBytes, hbytes, uint64_add_add_sub_cancel_left]
     have hprov_elem : elemMp.ptr.provenance = some (.concrete allocId tag) := hprov
     unfold annealReadImmediate
-    apply annealReadIndirectImmediate_scalar_ok hwf.elem_prim hprov_elem hbase hrel_off hfind hread
+    apply annealReadIndirectImmediate_scalar_ok (fty := { kind := elemKind, layoutIdx := 0 }) (hprim := hwf.elem_prim) hprov_elem hbase hrel_off hfind hread
 
 /-! ## 2. Pointer Arithmetic, `Index` and `ConstantIndex` Projection Simulation -/
 
@@ -814,7 +814,7 @@ theorem projectionMemoryOffset_inbounds_of_memPlaceRel
     hnot_ge63, hcheck, hwrap, Except.mapError, bind, Except.bind, pure, Except.pure]
 
 /-- Helper: `Miri.Interpreter.projectIndex` on an array `OpTy` with `WellTypedArrayTy`
-and `MemPlaceRel` (under `annealProjectionCx frame layouts mach`):
+and `MemPlaceRel` (under `annealArrayProjectionCx frame layouts mach`):
 - succeeds with offset `idx * elemSize` and layout `translateTy elemTy layouts` when `idx < count`,
 - fails with `.error (.bounds (UInt64.ofNat count) (UInt64.ofNat idx))` when `count ≤ idx` and `idx < 2 ^ 64`. -/
 theorem projectIndex_array_spec
@@ -825,7 +825,7 @@ theorem projectIndex_array_spec
     (hwf : WellTypedArrayTy layouts arrTy elemKind count)
     (hnodup : LiveAllocsNodup mach)
     (hmp : MemPlaceRel mach arrTy layouts (some (.aggregate 0 elems)) mp) :
-    let cx := annealProjectionCx layouts none (annealLocalIndex frame mach)
+    let cx := annealArrayProjectionCx layouts none (annealLocalIndex frame mach)
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy layouts).layout
@@ -875,7 +875,7 @@ theorem projectIndex_array_spec
       rw [hidx_toNat, Nat.mul_comm]
       have hc1 : idx * elemLay.size.bytes.toNat < 2 ^ 64 := by omega
       have hc2 : idx * elemLay.size.bytes.toNat ≤ cx.maxSizeOfVal.bytes.toNat := by
-        have hmax : cx.maxSizeOfVal.bytes.toNat = 0x7fff_ffff_ffff_ffff := by dsimp [cx, annealProjectionCx, Miri.ABI.Size.ofBytes]; rfl
+        have hmax : cx.maxSizeOfVal.bytes.toNat = 0x7fff_ffff_ffff_ffff := by dsimp [cx, annealArrayProjectionCx, Miri.ABI.Size.ofBytes]; rfl
         rw [hmax]; omega
       simp [hc1, hc2]
     have hfield : cx.field base.layout 0 = .ok (translateTy elemTy layouts) := by
@@ -900,7 +900,7 @@ theorem projectIndex_array_spec
     simp only [bind, Except.bind, hnot_ge, ↓reduceIte, hcomp, hfield]
     unfold Miri.Interpreter.OpTy.offset Miri.Interpreter.OpTy.offsetWithMeta
     rw [hwf.elem_isSized]
-    dsimp only [base, cx, annealProjectionCx, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    dsimp only [base, cx, annealArrayProjectionCx, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
       bind, Except.bind, pure, Except.pure]
     rw [hmem_off]
     rfl
@@ -1094,7 +1094,7 @@ theorem evalProjection_index_simulation
     (hmp : MemPlaceRel m.machine arrTy body.layouts (some (.aggregate 0 elems)) mp)
     (hidx_decl : get? body.localDecls idxLocal = some idxDecl)
     (hidx_ty : idxDecl.ty = { kind := .uint .usize, layoutIdx := 0 }) :
-    let cx := annealProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
+    let cx := annealArrayProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
@@ -1230,7 +1230,7 @@ theorem evalProjection_constantIndex_simulation
     (hwf_const :
       (fromEnd = false → offset < minLength) ∧
       (fromEnd = true → 0 < offset ∧ offset ≤ minLength)) :
-    let cx := annealProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
+    let cx := annealArrayProjectionCx body.layouts none (annealLocalIndex topFrame m.machine)
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
     let elemTy : Ty := { kind := elemKind, layoutIdx := 0 }
     let elemLay := (translateTy elemTy body.layouts).layout
@@ -1403,7 +1403,7 @@ theorem projectConstantIndex_malformed_invariant
         ((fromEnd = false ∧ minLength ≤ offset) ∨
          (fromEnd = true ∧ (offset = 0 ∨ minLength < offset))))) :
     ∃ msg,
-      annealProjectList (annealProjectionCx frame layouts mach)
+      annealProjectList (annealArrayProjectionCx frame layouts mach)
         ⟨.indirect mp, translateTy arrTy layouts⟩ [.ConstantIndex offset minLength fromEnd] =
         .error (.invariant msg) := by
   by_cases hovf : 2 ^ 64 ≤ offset ∨ 2 ^ 64 ≤ minLength
@@ -1423,7 +1423,7 @@ theorem projectConstantIndex_malformed_invariant
       · exact absurd (Or.inl h) hovf
       · exact absurd (Or.inr h) hovf
       · exact h
-    let cx := annealProjectionCx layouts none (annealLocalIndex frame mach)
+    let cx := annealArrayProjectionCx layouts none (annealLocalIndex frame mach)
     let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
     have hlen_miri : base.len cx = .ok (UInt64.ofNat count) := by
       unfold Miri.Interpreter.OpTy.len
@@ -1525,7 +1525,7 @@ theorem projectUnwrapArraySliceMeta_of_array_memPlaceRel
     {elems : List Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
     (hwf : WellTypedArrayTy layouts arrTy elemKind count)
     (hmp : MemPlaceRel mach arrTy layouts (some (.aggregate 0 elems)) mp) :
-    annealProjectList (annealProjectionCx frame layouts mach)
+    annealProjectList (annealArrayProjectionCx frame layouts mach)
       ⟨.indirect mp, translateTy arrTy layouts⟩ [.UnwrapUnsafeBinder arraySliceMetaTyId] =
       .ok ⟨.indirect mp, { ty := arraySliceMetaTyId, layout := (translateTy arrTy layouts).layout }⟩ := by
   have hfields := hwf.arr_fields
@@ -1542,7 +1542,7 @@ theorem projectUnwrapArraySliceMeta_of_array_memPlaceRel
   dsimp only [bind, Except.bind, Miri.Interpreter.OpTy.transmute]
   rw [hisSized]
   simp only [Bool.not_true, Bool.false_or, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
-    Miri.Interpreter.OpTy.offsetWithMeta, annealProjectionCx,
+    Miri.Interpreter.OpTy.offsetWithMeta, annealArrayProjectionCx,
     Miri.Interpreter.projectionMemoryOffset, Miri.Interpreter.MemPlace.offsetWithMeta,
     Miri.Interpreter.MemPlaceMeta.hasMeta, Bool.false_and, hwrap_zero, Except.mapError,
     pure, Except.pure]
@@ -1551,7 +1551,7 @@ theorem projectUnwrapArraySliceMeta_of_array_memPlaceRel
 
 /-- Every in-bounds array `Subslice` projection (`fromEnd = false` with `fromIdx ≤ toIdx ≤ count`,
 or `fromEnd = true` with `fromIdx + toIdx ≤ count` — covering both partial and whole-array
-subslices) fails closed with `.error (.obligation "array subslice in annealProjectionCx")`,
+subslices) fails closed with `.error (.obligation "array subslice in annealArrayProjectionCx")`,
 which `annealLiftProjectionError` maps to `StepError.unsupported`. -/
 theorem projectSubslice_array_unsupported
     {mach : AnnealMachine}
@@ -1563,10 +1563,10 @@ theorem projectSubslice_array_unsupported
     (hin :
       (fromEnd = false ∧ fromIdx ≤ toIdx ∧ toIdx ≤ count) ∨
       (fromEnd = true ∧ fromIdx + toIdx ≤ count)) :
-    annealProjectList (annealProjectionCx frame layouts mach)
+    annealProjectList (annealArrayProjectionCx frame layouts mach)
       ⟨.indirect mp, translateTy arrTy layouts⟩ [.Subslice fromIdx toIdx fromEnd] =
-      .error (.obligation "array subslice in annealProjectionCx") := by
-  let cx := annealProjectionCx layouts
+      .error (.obligation "array subslice in annealArrayProjectionCx") := by
+  let cx := annealArrayProjectionCx layouts
   let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy layouts⟩
   let elemSize := (translateTy { kind := elemKind, layoutIdx := 0 } layouts).layout.size
   have hfields : base.layout.layout.fields = .Array elemSize (UInt64.ofNat count) := hwf.arr_fields
@@ -1621,10 +1621,10 @@ theorem projectSubslice_array_unsupported
     rfl
   have hsublay : ∀ subCount,
       cx.subsliceLayout base.layout subCount =
-        .error (.obligation "array subslice in annealProjectionCx") := by
+        .error (.obligation "array subslice in annealArrayProjectionCx") := by
     intro subCount
     change (match base.layout.layout.fields with
-      | .Array _ _ => Except.error (Miri.Interpreter.ProjectionError.obligation "array subslice in annealProjectionCx")
+      | .Array _ _ => Except.error (Miri.Interpreter.ProjectionError.obligation "array subslice in annealArrayProjectionCx")
       | _ => Except.error (Miri.Interpreter.ProjectionError.invariant "subslice on non-array")) = _
     rw [hfields]
   simp only [annealProjectList, Miri.Interpreter.project, hnot_ge64]
@@ -5926,10 +5926,10 @@ private theorem annealProjectList_zero_array_ub
     {proj : ProjectionElem}
     (hproj : WellTypedArrayElemProj body s tf proj) :
     ∃ msg,
-      (annealProjectList (annealProjectionCx tf body.layouts mach)
+      (annealProjectList (annealArrayProjectionCx tf body.layouts mach)
         ⟨.indirect mp, translateTy arrTy body.layouts⟩ [translateProjectionElem proj]).mapError
         annealLiftProjectionError = .error (.undefinedBehavior msg) := by
-  let cx := annealProjectionCx tf body.layouts mach
+  let cx := annealArrayProjectionCx tf body.layouts mach
   let base : Miri.Interpreter.OpTy AnnealProv := ⟨.indirect mp, translateTy arrTy body.layouts⟩
   have hbase_fields :
       base.layout.layout.fields =
@@ -6225,7 +6225,7 @@ theorem annealEvalOperand_projected_array_simulation
         have hm_err : annealEvalOperand body.localDecls body.layouts
             (translateOperand (arrayElemReadOperand isMove arrIdx proj)) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m.machine)
+          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [translateProjectionElem proj] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6262,7 +6262,7 @@ theorem annealEvalOperand_projected_array_simulation
         have hm_err : annealEvalOperand body.localDecls body.layouts
             (translateOperand (arrayElemReadOperand isMove arrIdx (.index idxLocal))) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6283,7 +6283,7 @@ theorem annealEvalOperand_projected_array_simulation
         have hm_err : annealEvalOperand body.localDecls body.layouts
             (translateOperand (arrayElemReadOperand isMove arrIdx (.index idxLocal))) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6331,7 +6331,7 @@ theorem annealEvalOperand_projected_array_simulation
           have hm_err : annealEvalOperand body.localDecls body.layouts
               (translateOperand (arrayElemReadOperand isMove arrIdx (.index idxLocal))) known m =
               .error (.undefinedBehavior msg) m' := by
-            cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+            cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
                 ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
             | ok _ => simp [hpl, Except.mapError] at hpl_err
             | error pe =>
@@ -6384,7 +6384,7 @@ theorem annealEvalOperand_projected_array_simulation
             (translateOperand (arrayElemReadOperand isMove arrIdx
               (.constantIndex offset minLength fromEnd))) known m =
             .error (.undefinedBehavior msg) m' := by
-          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩
               [.ConstantIndex offset minLength fromEnd] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
@@ -6549,7 +6549,7 @@ theorem annealEvalPlace_projected_array_simulation
       · obtain ⟨msg, hpl_err⟩ :=
           annealProjectList_zero_array_ub hframe' hnodup hwf mp hproj'
         refine ⟨Or.inr (Or.inl huninit), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m.machine)
+        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [translateProjectionElem proj] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
         | error pe =>
@@ -6582,7 +6582,7 @@ theorem annealEvalPlace_projected_array_simulation
       · left
         obtain ⟨_, hw_ub, msg, hpl_err⟩ := hdead_idx (Or.inl hdead_i)
         refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
         | error pe =>
@@ -6595,7 +6595,7 @@ theorem annealEvalPlace_projected_array_simulation
       · left
         obtain ⟨_, hw_ub, msg, hpl_err⟩ := hdead_idx (Or.inr huninit_i)
         refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
         | error pe =>
@@ -6620,7 +6620,7 @@ theorem annealEvalPlace_projected_array_simulation
         · left
           obtain ⟨_, hw_ub, msg, hpl_err⟩ := hoob_idx idxSc hslot_idx (Nat.le_of_not_lt hlt_c)
           refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-          cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+          cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
               ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩ [.Index idxLocal] with
           | ok _ => simp [hpl, Except.mapError] at hpl_err
           | error pe =>
@@ -6670,7 +6670,7 @@ theorem annealEvalPlace_projected_array_simulation
       · left
         obtain ⟨_, hw_ub, msg, hpl_err⟩ := hoob_c (Nat.lt_of_not_le hle_min)
         refine ⟨Or.inr (Or.inr ⟨elems, hinit_elems, hw_ub⟩), m', msg, ?_⟩
-        cases hpl : annealProjectList (annealProjectionCx topFrame' body.layouts m'.machine)
+        cases hpl : annealProjectList (annealArrayProjectionCx topFrame' body.layouts m'.machine)
             ⟨.indirect mp, translateTy arrDecl.ty body.layouts⟩
             [.ConstantIndex offset minLength fromEnd] with
         | ok _ => simp [hpl, Except.mapError] at hpl_err
