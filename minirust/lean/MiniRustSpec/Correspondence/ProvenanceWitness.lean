@@ -752,4 +752,100 @@ def exposeSubevalsOk (m : Mach) : Bool :=
 theorem rtState_expose_subevals_ok : (rtState 5).map exposeSubevalsOk = some true := by
   decide +kernel
 
+/-- Executable check that the individual sub-evaluations of
+`ProvenanceRel.withExposed_step_synced` (`evalPlace` of `_4`, `evalValue` of
+`.Load (.Local (localName 3))` returning `(.Int 256, .Int usizeIt)`, `placeStore` of
+the reconstructed pointer `{ addr := 256, provenance := some (⟨2⟩, ()) }`, and
+`jumpToBlock`) all succeed at `rtState 6` of `int2ptrRawRoundTripOk`. -/
+def withExposedSubevalsOk (m : Mach) : Bool :=
+  match evalPlace m (.Local (localName 4)) with
+  | .ok ((pl, ty), m1) =>
+    (match ty with
+      | .Ptr ptrTy => decide (PtrType.meta_kind ptrTy = .None)
+      | _ => false) &&
+      match evalValue m1 (.Load (.Local (localName 3))) with
+      | .ok ((.Int addr, .Int it), m2) =>
+        decide (addr = 256 ∧ it = usizeIt) &&
+          match IntPtrCast.int2ptr m2 addr with
+          | .ok ptr =>
+            decide (ptr = { addr := 256, provenance := some (⟨2⟩, ()) }) &&
+              match placeStore m2 pl (.Ptr ⟨ptr, none⟩) ty with
+              | .ok m3 =>
+                match jumpToBlock m3 (bbName 2) with
+                | .ok _ => true
+                | .error _ => false
+              | .error _ => false
+          | .error _ => false
+      | _ => false
+  | .error _ => false
+
+theorem rtState_withExposed_subevals_ok : (rtState 6).map withExposedSubevalsOk = some true := by
+  decide +kernel
+
+/-- Concrete 2-step execution witness for `expose_then_withExposed` on
+`int2ptrRawRoundTripOk`:
+1. At `rtState 5` (immediately before `ExposeProvenance`), `m5.intptrcast.exposed.elems = []`.
+2. Executing `rtExposeTerm` (`m5 -> m6`) exposes `targetProv ctx0 1 = (⟨2⟩, ())` and stores
+   the target address `256` into `_3` so
+   `evalValue m6 (.Load (.Local (localName 3))) = .ok ((.Int 256, .Int usizeIt), m6')`
+   with `m6'.mem.memory.allocations = m6.mem.memory.allocations`.
+3. Immediately executing `rtWithExposedTerm` (`m6 -> m7`) loads `256` from `_3`, resolves
+   `IntPtrCast.int2ptr m6 256 = .ok { addr := 256, provenance := some (⟨2⟩, ()) }`, and stores
+   the reconstructed pointer into `_4`. -/
+def exposeThenWithExposedSyncedOk (m5 : Mach) : Bool :=
+  decide (m5.intptrcast.exposed.elems = []) &&
+    match Interp.evalTerminator m5 rtExposeTerm with
+    | .ok m6 =>
+      decide (m6.intptrcast.exposed.elems = [(⟨2⟩, ())]) &&
+        match evalValue m6 (.Load (.Local (localName 3))) with
+        | .ok ((.Int addr, .Int it), m6') =>
+          decide (addr = 256 ∧ it = usizeIt ∧
+            m6'.mem.memory.allocations = m6.mem.memory.allocations) &&
+            match Interp.evalTerminator m6 rtWithExposedTerm with
+            | .ok m7 =>
+              match evalValue m7 (.Load (.Local (localName 4))) with
+              | .ok ((.Ptr ⟨ptr, none⟩, _), _) =>
+                decide (ptr = { addr := 256, provenance := some (⟨2⟩, ()) })
+              | _ => false
+            | .error _ => false
+        | _ => false
+    | .error _ => false
+
+theorem rtState_expose_then_withExposed_synced :
+    (rtState 5).map exposeThenWithExposedSyncedOk = some true := by
+  decide +kernel
+
+/-- Counterexample MIR body with a single syntactic `PointerExposeProvenance`
+statement (`countExposeStmts = 1`) inside a loop (`bb0 -> bb0`), demonstrating
+why `singleExposeSiteOk` requires `isAcyclicCfg body = true` in addition to
+`countExposeStmts body ≤ 1`. -/
+def exposeLoopSingleSite : CapturedMir :=
+  { int2ptrRawRoundTripOk with
+    defPath := "witness::expose_loop_single_site"
+    basicBlocks := [
+      { statements := [
+          ⟨.storageLive 2, ""⟩,
+          ⟨.storageLive 3, ""⟩,
+          ⟨.assign (local_ 2) (.rawPtr .mut (local_ 1)), ""⟩,
+          ⟨.assign (local_ 3) (.cast .pointerExposeProvenance (.copy (local_ 2)) usizeTy), ""⟩
+        ]
+        terminator := ⟨.goto 0, ""⟩
+        isCleanup := false }
+    ] }
+
+/-- `exposeLoopSingleSite` has only 1 syntactic `PointerExposeProvenance` statement,
+yet its CFG has a back-edge (`bb0 -> bb0`), so `isAcyclicCfg` and `singleExposeSiteOk`
+both reject it (`false`). -/
+theorem exposeLoopSingleSite_countExposeStmts_eq_one :
+    countExposeStmts exposeLoopSingleSite = 1 := by
+  decide +kernel
+
+theorem exposeLoopSingleSite_isAcyclicCfg_false :
+    isAcyclicCfg exposeLoopSingleSite = false := by
+  decide +kernel
+
+theorem exposeLoopSingleSite_singleExposeSiteOk_false :
+    singleExposeSiteOk exposeLoopSingleSite = false := by
+  decide +kernel
+
 end MiniRustSpec.Correspondence.ProvenanceWitness

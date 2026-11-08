@@ -3600,6 +3600,38 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSingleRefMutRoundTrip_singleExposeSiteOk
   exposeTwoRefMutAngelicUnsupported_singleExposeSiteOk_false
   exposeTwoRefMutAngelicUnsupported_three_way
+  singleExposeSiteOk_imp_acyclic
+  ExposedTargetAtAddr.toExposedTargetOk
+  ExposedTargetAtAddr.in_bounds
+  ExposedTargetAtAddr.of_target_offset
+  ExposedTargetAtAddr.of_shape
+  copyOp_eq_copy_local_iff
+  evalStmt_assign_expose_op
+  evalStmt_assign_withExposed_op
+  subsliceWithLength_of_writeSubsliceAtIndex
+  BM.load_eq
+  placeLoad_mem_eq
+  evalValue_load_local_eq
+  listIndex_set_self
+  listSet_set_self
+  BM.check_ptr_set_data
+  BM.load_of_store
+  placeLoad_of_placeStore_int
+  placeLoad_of_placeStore_usize
+  placeStore_curFrame
+  evalValue_load_local_curFrame
+  jumpToBlock_curFrame
+  evalPlace_local_of_curFrame
+  ProvenanceRel.expose_step_synced
+  ProvenanceRel.withExposed_step_synced
+  ProvenanceRel.expose_then_withExposed_step
+  BorrowsOk.target_ptrs_vacuous_of_hasProvCast
+  BorrowsOk.exposedTargetAtAddr_of_ptr_slot
+  rtState_withExposed_subevals_ok
+  rtState_expose_then_withExposed_synced
+  exposeLoopSingleSite_countExposeStmts_eq_one
+  exposeLoopSingleSite_isAcyclicCfg_false
+  exposeLoopSingleSite_singleExposeSiteOk_false
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -3814,6 +3846,38 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeSingleRefMutRoundTrip_singleExposeSiteOk
   exposeTwoRefMutAngelicUnsupported_singleExposeSiteOk_false
   exposeTwoRefMutAngelicUnsupported_three_way
+  singleExposeSiteOk_imp_acyclic
+  ExposedTargetAtAddr.toExposedTargetOk
+  ExposedTargetAtAddr.in_bounds
+  ExposedTargetAtAddr.of_target_offset
+  ExposedTargetAtAddr.of_shape
+  copyOp_eq_copy_local_iff
+  evalStmt_assign_expose_op
+  evalStmt_assign_withExposed_op
+  subsliceWithLength_of_writeSubsliceAtIndex
+  BM.load_eq
+  placeLoad_mem_eq
+  evalValue_load_local_eq
+  listIndex_set_self
+  listSet_set_self
+  BM.check_ptr_set_data
+  BM.load_of_store
+  placeLoad_of_placeStore_int
+  placeLoad_of_placeStore_usize
+  placeStore_curFrame
+  evalValue_load_local_curFrame
+  jumpToBlock_curFrame
+  evalPlace_local_of_curFrame
+  ProvenanceRel.expose_step_synced
+  ProvenanceRel.withExposed_step_synced
+  ProvenanceRel.expose_then_withExposed_step
+  BorrowsOk.target_ptrs_vacuous_of_hasProvCast
+  BorrowsOk.exposedTargetAtAddr_of_ptr_slot
+  rtState_withExposed_subevals_ok
+  rtState_expose_then_withExposed_synced
+  exposeLoopSingleSite_countExposeStmts_eq_one
+  exposeLoopSingleSite_isAcyclicCfg_false
+  exposeLoopSingleSite_singleExposeSiteOk_false
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

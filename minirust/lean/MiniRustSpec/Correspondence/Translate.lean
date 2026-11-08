@@ -3789,17 +3789,37 @@ theorem provCastAliasView_of_not_hasProvCast {body : MirAst.CapturedMir}
 def countExposeStmts (body : MirAst.CapturedMir) : Nat :=
   (exposedIntLocals body).length
 
-/-- Sufficient syntactic condition guaranteeing at most one `PointerExposeProvenance`
-site in `body` (so loop-free bodies in `TreeBorrowsMemory` cannot accumulate two
-distinct exposed `TreeBorrowsProvenance` tags `(AllocId, path)` on the same
-allocation, avoiding `MachTB`'s `Stop.unsupported` multi-tag angelic ambiguity
-on `exposeTwoRefMutAngelicUnsupported`). -/
+/-- Whether every control-flow edge in `body` goes strictly forward
+(`blk < t`), ruling out CFG cycles/loops. In a cyclic CFG, even a single
+syntactic `PointerExposeProvenance` statement (`countExposeStmts body = 1`)
+inside a loop body can execute across multiple iterations on fresh reborrows
+`&mut _x` and accumulate multiple distinct `TreeBorrowsProvenance` tags
+`(AllocId, path)` on the same allocation in `MachTB`. -/
+def isAcyclicCfg (body : MirAst.CapturedMir) : Bool :=
+  (List.range body.basicBlocks.length).all fun blk =>
+    match body.basicBlocks[blk]? with
+    | some bb => (termTargets bb.terminator).all (fun t => decide (blk < t))
+    | none => true
+
+/-- Sufficient syntactic condition guaranteeing at most one dynamic
+`PointerExposeProvenance` execution in `body`: at most one syntactic
+`PointerExposeProvenance` statement (`countExposeStmts body ≤ 1`) and an
+acyclic CFG (`isAcyclicCfg body`), so executions in `TreeBorrowsMemory` cannot
+accumulate two distinct exposed `TreeBorrowsProvenance` tags `(AllocId, path)`
+on the same allocation (neither via multiple statements as in
+`exposeTwoRefMutAngelicUnsupported` nor via a loop around a single statement). -/
 def singleExposeSiteOk (body : MirAst.CapturedMir) : Bool :=
-  !hasProvCast body || decide (countExposeStmts body ≤ 1)
+  !hasProvCast body || (decide (countExposeStmts body ≤ 1) && isAcyclicCfg body)
 
 theorem singleExposeSiteOk_of_not_hasProvCast {body : MirAst.CapturedMir}
     (h : hasProvCast body = false) : singleExposeSiteOk body = true := by
   simp [singleExposeSiteOk, h]
+
+theorem singleExposeSiteOk_imp_acyclic {body : MirAst.CapturedMir}
+    (hs : singleExposeSiteOk body = true) (hp : hasProvCast body = true) :
+    countExposeStmts body ≤ 1 ∧ isAcyclicCfg body = true := by
+  simp [singleExposeSiteOk, hp] at hs
+  exact hs
 
 /-- `inFragment` embeds into `inFragmentWithIntrinsics`. -/
 theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}

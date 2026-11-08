@@ -1147,36 +1147,43 @@ These are deliberate and are the first things to lift:
     `TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
     `treeBorrowsWeakBoxDeallocAndDeadRelease` vs.
     `TreeBorrowsMemory.end_call_wfLive`).
-* **Provenance casts have step lemmas, not yet a `StateRelN` simulation.**
-  `ProvenanceRel.expose_step` and `ProvenanceRel.withExposed_step`
-  (`Correspondence/Simulation.lean`, on top of `evalTerminator_intrinsic_*` in
-  `Correspondence/PointerStep.lean`) prove that Anneal's cast statement and
-  MiniRust's `Terminator::Intrinsic` both step, that the MiniRust step changes
-  `intptrcast` exactly by the exposure and the allocations only in their bytes
-  (`AllocShapeEq`, from `placeStore_shape`, `placeLoad_shape`,
-  `evalValue_load_local_shape`, and `jumpToBlock_mem`), that `ProvenanceRel` is
-  preserved and `ExposedLocalRel` (`Correspondence/Relation.lean`) established
-  for the exposed-address local, and that `int2ptr` resolves to the exposed
-  provenance whenever no other live exposed allocation contains the address.
-  They still take MiniRust's sub-evaluations (`evalPlace`, the loads,
-  `placeStore`, `jumpToBlock`) as hypotheses: deriving those needs `StateRelN`,
-  whose `LocalStorage` relates an exposed-address local by value (Anneal's
-  `tag * 65536 + offsetBytes` vs. MiniRust's address, `exposeTwice`), and
-  `ExposedLocalRel` does not yet record the address MiniRust stores. (Pass A2's
-  first versions also assumed `m4.mem.memory.allocations = m.mem.memory.allocations`
-  for the post-state, which no real step satisfies:
+* **Provenance casts have synchronized 1-step and 2-step round-trip simulation
+  lemmas, not yet a whole-CFG `StateRelN` induction.**
+  `ProvenanceRel.expose_step`, `ProvenanceRel.withExposed_step`, and their
+  Pass A3 strengthenings `ProvenanceRel.expose_step_synced`,
+  `ProvenanceRel.withExposed_step_synced`, and
+  `ProvenanceRel.expose_then_withExposed_step` (`Correspondence/Simulation.lean`,
+  on top of `evalStmt_assign_expose_op`, `evalStmt_assign_withExposed_op`, and
+  `evalTerminator_intrinsic_*` in `Correspondence/PointerStep.lean`) prove across
+  both `.copy` and `.move` operands (`copyOp op = .copy ⟨p, []⟩`) that Anneal's
+  cast statement and MiniRust's `Terminator::Intrinsic` both step, that the
+  MiniRust step changes `intptrcast` exactly by the exposure and the allocations
+  only in their bytes (`AllocShapeEq`), that `ProvenanceRel` is preserved, and
+  that `ExposedLocalSynced` (`Correspondence/Relation.lean`, via
+  `BM.load_of_store`, `placeLoad_of_placeStore_usize`, `jumpToBlock_curFrame`,
+  and `evalPlace_local_of_curFrame`) records *both* the Anneal scalar tag slot
+  and the MiniRust `usize` load result (`evalValue m4 (.Load (.Local (localName i)))
+  = .ok ((.Int tAddr, .Int usizeIt), m_load)`). Consequently,
+  `ProvenanceRel.expose_then_withExposed_step` chains `PointerExposeProvenance`
+  into `PointerWithExposedProvenance` (`rtState_withExposed_subevals_ok`,
+  `rtState_expose_then_withExposed_synced`) without assuming an external load
+  hypothesis for the exposed-address local, and `ExposedTargetAtAddr` (connected
+  to `BorrowsOk` via `BorrowsOk.exposedTargetAtAddr_of_ptr_slot`, alongside
+  `BorrowsOk.target_ptrs_vacuous_of_hasProvCast` and `AddrTakenTargetsOk`)
+  unifies `ExposedTargetOk` with the in-bounds address witness. (Pass A2's first
+  versions assumed `m4.mem.memory.allocations = m.mem.memory.allocations` for the
+  post-state, which no real step satisfies:
   `passA2_hm4_allocs_unsatisfiable_expose`, `..._withExposed`.)
   `Correspondence/Provenance.lean` proves arbitrary-offset singleton optimality
   for `BasicMemory` (`int2ptr_singleton_offset_checkPtr_optimal`) alongside a
   `TreeBorrowsMemory` counterexample to singleton `Some(p)` dominance on
   negative-offset zero-sized reborrows
   (`int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok`); `singleExposeSiteOk`
-  (at most one `PointerExposeProvenance` statement) is not part of the fragment
-  and does not rule out several exposed Tree Borrows tags in a loop, so
-  `MachTB` may still stop with `Stop.unsupported` on fragment bodies
-  (`exposeTwoRefMutAngelicUnsupported_three_way`). Whole-CFG induction over
-  `splitBlockAtIntrinsics`'s continuations remains separate from
-  `step_correspondence_N`.
+  requires both `countExposeStmts body ≤ 1` and `isAcyclicCfg body = true`
+  (`singleExposeSiteOk_imp_acyclic`, rejecting loop-borne single syntactic expose
+  sites such as `exposeLoopSingleSite_singleExposeSiteOk_false`). Whole-CFG
+  induction over `splitBlockAtIntrinsics`'s continuation blocks remains separate
+  from `step_correspondence_N`.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

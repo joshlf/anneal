@@ -777,6 +777,65 @@ theorem ExposedTargetOk.toExposedAllocOk {body : CapturedMir} {ctx : Ctx} {s : M
   obtain ⟨entry, _, _, alloc, _, _, _, rfl, halloc, hlive, _, _⟩ := h
   exact ⟨ctx.base.length + entry.targetLocal, alloc, rfl, halloc, hlive⟩
 
+/-- Refined target coupling that ties an Anneal borrow tag `tag` to both its
+MiniRust target provenance `p` and its in-bounds MiniRust address `tAddr`
+inside `p`'s live allocation `[alloc.addr, alloc.addr + alloc.size]`. -/
+def ExposedTargetAtAddr (body : CapturedMir) (ctx : Ctx) (s : MachineState)
+    (allocs : List Gen.Allocation) (tag : Nat) (tAddr : Int) (p : Prov) : Prop :=
+  ∃ (entry : BorrowEntry) (pointeeIt : Gen.IntType) (relOff : Nat) (alloc : Gen.Allocation),
+    lookupBorrow s.memory.borrows tag = some entry ∧
+    entry.targetLocal ∈ bodyAddrTakenLocals body ∧
+    ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+      some (pointeeIt, relOff) ∧
+    p = targetProv ctx entry.targetLocal ∧
+    allocs[ctx.base.length + entry.targetLocal]? = some alloc ∧
+    alloc.live = true ∧
+    alloc.addr = ctx.addrs.getD entry.targetLocal 0 ∧
+    relOff + pointeeIt.size.bytes ≤ (Allocation.size alloc).bytes ∧
+    (alloc.addr : Int) ≤ tAddr ∧
+    tAddr ≤ (alloc.addr : Int) + (Allocation.size alloc).bytes
+
+theorem ExposedTargetAtAddr.toExposedTargetOk {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {allocs : List Gen.Allocation} {tag : Nat} {tAddr : Int} {p : Prov}
+    (h : ExposedTargetAtAddr body ctx s allocs tag tAddr p) :
+    ExposedTargetOk body ctx s allocs tag p := by
+  obtain ⟨entry, pointeeIt, relOff, alloc, h1, h2, h3, h4, h5, h6, h7, h8, _, _⟩ := h
+  exact ⟨entry, pointeeIt, relOff, alloc, h1, h2, h3, h4, h5, h6, h7, h8⟩
+
+theorem ExposedTargetAtAddr.in_bounds {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {allocs : List Gen.Allocation} {tag : Nat} {tAddr : Int} {p : Prov}
+    (h : ExposedTargetAtAddr body ctx s allocs tag tAddr p) :
+    ∃ (idx : Nat) (a : Gen.Allocation),
+      p = (⟨(idx : Int)⟩, ()) ∧
+      allocs[idx]? = some a ∧
+      a.live = true ∧
+      (a.addr : Int) ≤ tAddr ∧
+      tAddr ≤ (a.addr : Int) + (Allocation.size a).bytes := by
+  obtain ⟨entry, _, _, alloc, _, _, _, rfl, halloc, hlive, _, _, hlo, hhi⟩ := h
+  exact ⟨ctx.base.length + entry.targetLocal, alloc, rfl, halloc, hlive, hlo, hhi⟩
+
+/-- When `tAddr` is the target local's base address plus `relOff`
+(`ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)`), `ExposedTargetAtAddr`
+holds directly from the witnesses of `ExposedTargetOk` without a separate
+existential `hin_bounds` hypothesis. -/
+theorem ExposedTargetAtAddr.of_target_offset {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {allocs : List Gen.Allocation} {tag : Nat} {entry : BorrowEntry}
+    {pointeeIt : Gen.IntType} {relOff : Nat} {alloc : Gen.Allocation}
+    (hlk : lookupBorrow s.memory.borrows tag = some entry)
+    (hk : entry.targetLocal ∈ bodyAddrTakenLocals body)
+    (hspec : ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+      some (pointeeIt, relOff))
+    (halloc : allocs[ctx.base.length + entry.targetLocal]? = some alloc)
+    (hlive : alloc.live = true)
+    (haddr : alloc.addr = ctx.addrs.getD entry.targetLocal 0)
+    (hsz : relOff + pointeeIt.size.bytes ≤ (Allocation.size alloc).bytes) :
+    ExposedTargetAtAddr body ctx s allocs tag
+      (ctx.addrs.getD entry.targetLocal 0 + (relOff : Int))
+      (targetProv ctx entry.targetLocal) :=
+  ⟨entry, pointeeIt, relOff, alloc, hlk, hk, hspec, rfl, halloc, hlive, haddr, hsz,
+    by rw [haddr]; exact Int.le_add_of_nonneg_right (Int.natCast_nonneg relOff),
+    by rw [haddr]; omega⟩
+
 /-- Synchronized provenance and exposed-set invariant relating Anneal's exposed
 borrow tags `exposedTags` and MiniRust's `m.intptrcast.exposed`. -/
 structure ProvenanceRel (body : CapturedMir) (ctx : Ctx) (s : MachineState)
@@ -876,5 +935,19 @@ theorem ExposedLocalRel.candidate_mem {body : CapturedMir} {ctx : Ctx}
   simp only [int2ptrCandidates, List.mem_map, List.mem_filter, Prod.exists, Bool.and_eq_true,
     decide_eq_true_eq]
   exact ⟨a, idx, ⟨List.mem_zipIdx_iff_getElem?.mpr ha, ⟨⟨hlive, hlo⟩, hhi⟩, h.exposed_mem⟩, rfl⟩
+
+/-- Synchronized exposed-address local invariant (Pass A3): extends
+`ExposedLocalRel` with the MiniRust local-storage side, guaranteeing that
+loading `localName e` in `m` succeeds and returns `(.Int tAddr, .Int usizeIt)`.
+This closes the gap where `ExposedLocalRel` recorded only the Anneal slot
+`view[e]?` and not what MiniRust stored in `localName e`, allowing
+`PointerExposeProvenance` to be chained directly into
+`PointerWithExposedProvenance`. -/
+structure ExposedLocalSynced (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
+    (s : MachineState) (m : Mach) (e : Nat) (pv : ProvenancePtr) (tAddr : Int) (p : Prov) :
+    Prop extends ExposedLocalRel body ctx view s m e pv tAddr p where
+  load_ok : ∃ m_load,
+    evalValue m (.Load (.Local (localName e))) =
+      .ok ((.Int tAddr, .Int usizeIt), m_load)
 
 end MiniRustSpec.Correspondence

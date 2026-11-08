@@ -3530,6 +3530,118 @@ theorem expose_withExposed_roundtrip (pv : ProvenancePtr) (hoff : pv.offsetBytes
     (allocId * 65536 + offsetBytes) % 65536 = offsetBytes
   exact ⟨by omega, by omega⟩
 
+theorem copyOp_eq_copy_local_iff (op : MirAst.Operand) (p : Nat) :
+    copyOp op = .copy ⟨p, []⟩ ↔ op = .copy ⟨p, []⟩ ∨ op = .move ⟨p, []⟩ := by
+  cases op with
+  | copy pl => simp [copyOp]
+  | move pl => simp [copyOp]
+  | constant c => simp [copyOp]
+
+/-- Operand-generic Anneal execution of `_i = Cast(PointerExposeProvenance, op, targetTy)`
+for any root-local operand `op` with `copyOp op = .copy ⟨p, []⟩` (covering both
+`.copy ⟨p, []⟩` and `.move ⟨p, []⟩` permitted by `statementOkWithIntrinsics`):
+when `_p` holds `.init (.ptr pv 8)`, updates the operand's moved-out local via
+`opPost` and stores `.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩` into `_i`;
+when `_p` is `.uninit` or `.dead`, raises UB. -/
+theorem evalStmt_assign_expose_op (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (i p : Nat) (op : MirAst.Operand)
+    (targetTy : MirAst.Ty) (span : String)
+    (hop_copy : copyOp op = .copy ⟨p, []⟩)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = []) :
+    (∀ (pv : ProvenancePtr),
+      s.frame.locals[p]? = some (.init (.ptr pv 8)) →
+      s.frame.locals[i]? ≠ some .dead →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance op targetTy), span⟩
+          decls layouts =
+        .tau (.running (advanceStmt s
+          ((opPost s.frame.locals op).set i
+            (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))
+          s.memory))) ∧
+    ((s.frame.locals[p]? = some .uninit ∨ s.frame.locals[p]? = some .dead) →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance op targetTy), span⟩
+          decls layouts = MirStepNode.fail .ub) := by
+  rcases (copyOp_eq_copy_local_iff op p).mp hop_copy with rfl | rfl
+  · have hpost : opPost s.frame.locals (.copy ⟨p, []⟩) = s.frame.locals := rfl
+    rw [hpost]
+    exact evalStmt_assign_expose s decls layouts i p targetTy span hi hbor_i hprot
+  · have hil : i < (opPost s.frame.locals (.move ⟨p, []⟩)).length := by
+      rw [opPost_length]; exact hi
+    have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor_i
+    refine ⟨fun pv hp hnd => ?_, fun hu => ?_⟩
+    · have hp_lt : p < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hp).1
+      have hop : evalOperand s.frame.locals (.move ⟨p, []⟩) s.memory.borrows s.memory.globals
+          layouts s.memory.callerLocals =
+          .ok (.ptr pv 8) (opPost s.frame.locals (.move ⟨p, []⟩)) := by
+        simp only [evalOperand, get?, hp, opPost, opMoved]
+        simp [set?, hp_lt]
+      have hrv := evalRvalue_expose s.frame.locals (.move ⟨p, []⟩) targetTy s.memory decls layouts
+        pv 8 (opPost s.frame.locals (.move ⟨p, []⟩)) hop
+      simp only [evalStmt, hrv, get?]
+      cases hsl : (opPost s.frame.locals (.move ⟨p, []⟩))[i]? with
+      | none => simp [hil] at hsl
+      | some slot =>
+        cases slot with
+        | dead => exact absurd ((opPost_dead _ _ _).mp hsl) hnd
+        | uninit => simp [set?, hil, hprot, hinv, MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+        | init w => simp [set?, hil, hprot, hinv, MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+    · rcases hu with hu | hu <;>
+        simp [evalStmt, evalRvalue, evalOperand, get?, hu]
+
+/-- Operand-generic Anneal execution of `_i = Cast(PointerWithExposedProvenance, op, targetTy)`
+for any root-local operand `op` with `copyOp op = .copy ⟨u, []⟩` (covering both
+`.copy ⟨u, []⟩` and `.move ⟨u, []⟩` permitted by `statementOkWithIntrinsics`):
+when `_u` holds `.init (.scalar sc)`, updates the operand's moved-out local via
+`opPost` and stores
+`.ptr { allocId := sc.bits / 65536, offsetBytes := sc.bits % 65536 } 8` into `_i`;
+when `_u` is `.uninit` or `.dead`, raises UB. -/
+theorem evalStmt_assign_withExposed_op (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (i u : Nat) (op : MirAst.Operand)
+    (targetTy : MirAst.Ty) (span : String)
+    (hop_copy : copyOp op = .copy ⟨u, []⟩)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = []) :
+    (∀ (sc : ScalarInt),
+      s.frame.locals[u]? = some (.init (.scalar sc)) →
+      s.frame.locals[i]? ≠ some .dead →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance op targetTy), span⟩
+          decls layouts =
+        .tau (.running (advanceStmt s
+          ((opPost s.frame.locals op).set i
+            (.init (.ptr { allocId := sc.bits / 65536, offsetBytes := sc.bits % 65536 } 8)))
+          s.memory))) ∧
+    ((s.frame.locals[u]? = some .uninit ∨ s.frame.locals[u]? = some .dead) →
+      evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance op targetTy), span⟩
+          decls layouts = MirStepNode.fail .ub) := by
+  rcases (copyOp_eq_copy_local_iff op u).mp hop_copy with rfl | rfl
+  · have hpost : opPost s.frame.locals (.copy ⟨u, []⟩) = s.frame.locals := rfl
+    rw [hpost]
+    exact evalStmt_assign_withExposed s decls layouts i u targetTy span hi hbor_i hprot
+  · have hil : i < (opPost s.frame.locals (.move ⟨u, []⟩)).length := by
+      rw [opPost_length]; exact hi
+    have hinv := invalidateConflictingBorrows_of_ne s.memory.borrows i .none hbor_i
+    refine ⟨fun sc hu hnd => ?_, fun hu => ?_⟩
+    · have hu_lt : u < s.frame.locals.length := (List.getElem?_eq_some_iff.mp hu).1
+      have hop : evalOperand s.frame.locals (.move ⟨u, []⟩) s.memory.borrows s.memory.globals
+          layouts s.memory.callerLocals =
+          .ok (.scalar sc) (opPost s.frame.locals (.move ⟨u, []⟩)) := by
+        simp only [evalOperand, get?, hu, opPost, opMoved]
+        simp [set?, hu_lt]
+      have hrv := evalRvalue_withExposed s.frame.locals (.move ⟨u, []⟩) targetTy s.memory decls layouts
+        sc (opPost s.frame.locals (.move ⟨u, []⟩)) hop
+      simp only [evalStmt, hrv, get?]
+      cases hsl : (opPost s.frame.locals (.move ⟨u, []⟩))[i]? with
+      | none => simp [hil] at hsl
+      | some slot =>
+        cases slot with
+        | dead => exact absurd ((opPost_dead _ _ _).mp hsl) hnd
+        | uninit => simp [set?, hil, hprot, hinv, MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+        | init w => simp [set?, hil, hprot, hinv, MirStepNode.step, memory_mk_nil_prot s.memory hprot]
+    · rcases hu with hu | hu <;>
+        simp [evalStmt, evalRvalue, evalOperand, get?, hu]
+
 /-! ## `evalTerminator` / `evalTerminatorM` step lemmas for `Terminator::Intrinsic` (MR-3.3 Pass A2) -/
 
 @[simp] theorem evalArgs_singleton (m : Mach) (e : Gen.ValueExpr) :

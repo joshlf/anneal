@@ -5137,5 +5137,632 @@ theorem ProvenanceRel.withExposed_step {body : CapturedMir} {ctx : Ctx}
     exact hs2.trans hs3
   exact ⟨hA0, hint, hM, hipc, hshape, (hprov.of_shape hipc hshape).of_advanceStmt _⟩
 
+/-- `ExposedTargetAtAddr` is preserved when replacing `as` with `bs` whose
+allocation table is `AllocShapeEq`-related. -/
+theorem ExposedTargetAtAddr.of_shape {body : CapturedMir} {ctx : Ctx} {s : MachineState}
+    {as bs : List Gen.Allocation} {tag : Nat} {tAddr : Int} {p : Prov}
+    (h : ExposedTargetAtAddr body ctx s as tag tAddr p) (hs : AllocShapeEq as bs) :
+    ExposedTargetAtAddr body ctx s bs tag tAddr p := by
+  obtain ⟨entry, pointeeIt, relOff, alloc, hlk, hk, hspec, hp, halloc, hlive, haddr, hsz, hlo, hhi⟩ := h
+  obtain ⟨b, hb, hb1, hb2, hb3⟩ := hs.2 _ alloc halloc
+  refine ⟨entry, pointeeIt, relOff, b, hlk, hk, hspec, hp, hb, hb2 ▸ hlive, hb1 ▸ haddr, ?_,
+    hb1 ▸ hlo, ?_⟩
+  · simpa [Allocation.size, hb3] using hsz
+  · simpa [Allocation.size, hb1, hb3] using hhi
+
+/-- Reading back the exact subslice written by `writeSubsliceAtIndex` returns
+the written bytes `src`. -/
+theorem subsliceWithLength_of_writeSubsliceAtIndex {T : Type} {xs : List T} {start : Int}
+    {src ys : List T} (h : writeSubsliceAtIndex xs start src = .ok ys) :
+    subsliceWithLength ys start (src.length : Int) = .ok src := by
+  have hlen : ys.length = xs.length := writeSubsliceAtIndex_length h
+  unfold writeSubsliceAtIndex at h
+  split at h
+  · next hb =>
+    simp only [pure, Except.pure, Except.ok.injEq] at h
+    have hstart : (start.toNat : Int) = start := Int.toNat_of_nonneg hb.1
+    have hle : start.toNat + src.length ≤ xs.length := by omega
+    have hys : ys = spliceAt xs start.toNat src := h.symm
+    have hle' : start.toNat + src.length ≤ ys.length := by omega
+    rw [← hstart, subsliceWithLength_eq_drop_take ys start.toNat src.length hle', hys]
+    rw [drop_take_spliceAt_self xs start.toNat src hle]
+  · simp [specPanic] at h
+
+/-- `BasicMemory::load` preserves the entire `BasicMemory` unchanged (`mem' = mem`),
+because `listSet mem.allocations id._0 allocation` writes back the identical
+`allocation` read by `listIndex mem.allocations id._0`. -/
+theorem BM.load_eq {mem mem' : BM} {ptr : Ptr} {len : Size} {align : Align}
+    {bytes : List Byte} (h : BM.load mem ptr len align = .ok (bytes, mem')) :
+    mem' = mem := by
+  unfold BM.load at h
+  split at h
+  · simp [ub] at h
+  · obtain ⟨r, _, h⟩ := interpBind_ok h
+    cases r with
+    | none =>
+      simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+      exact h.2.symm
+    | some t =>
+      obtain ⟨id, pe, off⟩ := t
+      dsimp only at h
+      obtain ⟨alloc, hidx, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hs, h⟩ := interpBind_ok h
+      obtain ⟨bs, _, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨_, rfl⟩ := h
+      obtain ⟨_, hget⟩ := listIndex_ok_get hidx
+      rw [listSet_ok_eq hs]
+      cases mem
+      simp only [Gen.BasicMemory.mk.injEq]
+      exact ⟨set_self_of_getElem? _ _ _ hget, trivial⟩
+
+/-- `Machine::place_load` preserves `mem.memory`, `intptrcast`, and `threads`
+literally (`m'.mem.memory = m.mem.memory ∧ m'.intptrcast = m.intptrcast ∧ m'.threads = m.threads`),
+changing only the concurrent access log `m'.mem.accesses`. -/
+theorem placeLoad_mem_eq {m m' : Mach} {pl : Gen.Place BM} {ty : Gen.Type} {v : Val}
+    (h : placeLoad m pl ty = .ok (v, m')) :
+    m'.mem.memory = m.mem.memory ∧ m'.intptrcast = m.intptrcast ∧ m'.threads = m.threads := by
+  unfold placeLoad at h
+  split at h
+  · simp [ub] at h
+  · unfold typedLoad at h
+    obtain ⟨l, _, h⟩ := interpBind_ok h
+    obtain ⟨size, _, h⟩ := interpBind_ok h
+    obtain ⟨⟨bytes, cm⟩, hcm, h⟩ := interpBind_ok h
+    obtain ⟨dv, _, h⟩ := interpBind_ok h
+    unfold CM.load at hcm
+    obtain ⟨⟨bytes', mem'⟩, hbm, hcm⟩ := interpBind_ok hcm
+    simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hcm
+    obtain ⟨_, rfl⟩ := hcm
+    cases dv with
+    | none => simp [ub] at h
+    | some val =>
+      dsimp only at h
+      obtain ⟨u, _, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+      obtain ⟨_, rfl⟩ := h
+      exact ⟨BM.load_eq hbm, rfl, rfl⟩
+
+/-- `evalValue m (.Load (.Local name))` preserves `mem.memory`, `intptrcast`,
+and `threads` literally. -/
+theorem evalValue_load_local_eq {m m' : Mach} {name : Gen.LocalName} {out : Val × Gen.Type}
+    (h : evalValue m (.Load (.Local name)) = .ok (out, m')) :
+    m'.mem.memory = m.mem.memory ∧ m'.intptrcast = m.intptrcast ∧ m'.threads = m.threads := by
+  unfold evalValue at h
+  cases hpl : evalPlace m (.Local name) with
+  | error e => simp [hpl, bind, Except.bind] at h
+  | ok r =>
+    obtain ⟨⟨place, ty⟩, m1⟩ := r
+    have hm1 := evalPlace_local_eq hpl
+    simp only [hpl, bind, Except.bind] at h
+    cases hld : placeLoad m1 place ty with
+    | error e => simp [hld] at h
+    | ok r2 =>
+      obtain ⟨v, m2⟩ := r2
+      simp only [hld] at h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (Except.ok.inj h)
+      have := placeLoad_mem_eq hld
+      rw [hm1] at this
+      exact this
+
+theorem listIndex_set_self {T : Type} {xs : List T} {i : Int} {x : T} (x' : T)
+    (hge : 0 ≤ i) (hget : xs[i.toNat]? = some x) (what : String) :
+    listIndex (xs.set i.toNat x') i what = .ok x' := by
+  have hlt : i.toNat < xs.length := (List.getElem?_eq_some_iff.mp hget).1
+  unfold listIndex
+  simp [hge, List.getElem?_set_self hlt, pure, Except.pure]
+
+theorem listSet_set_self {T : Type} {xs : List T} {i : Int} {x : T} (x' : T)
+    (hge : 0 ≤ i) (hget : xs[i.toNat]? = some x) (what : String) :
+    listSet (xs.set i.toNat x') i x' what = .ok (xs.set i.toNat x') := by
+  have hlt : i.toNat < xs.length := (List.getElem?_eq_some_iff.mp hget).1
+  unfold listSet
+  simp [hge, hlt, List.set_set, pure, Except.pure]
+
+theorem BM.check_ptr_set_data {mem : BM} {ptr : Ptr} {len : Size}
+    {id : Gen.AllocId} {pe : Unit} {off : Size} {alloc : Gen.Allocation} {data : List Byte}
+    (hchk : BM.check_ptr mem ptr len = .ok (some (id, pe, off)))
+    (hidx : listIndex mem.allocations id._0 "self.allocations[id.0]" = .ok alloc)
+    (hlen : data.length = alloc.data.length) :
+    BM.check_ptr { mem with allocations := mem.allocations.set id._0.toNat { alloc with data := data } }
+      ptr len = .ok (some (id, pe, off)) := by
+  obtain ⟨hge, hget⟩ := listIndex_ok_get hidx
+  unfold BM.check_ptr at hchk ⊢
+  split at hchk
+  · simp [pure, Except.pure] at hchk
+  · next hne0 =>
+    simp only [hne0, ↓reduceIte]
+    cases hp : ptr.provenance with
+    | none => simp [hp, ub] at hchk
+    | some p =>
+      rcases p with ⟨id', pe'⟩
+      simp only [hp] at hchk ⊢
+      obtain ⟨alloc', hidx', hrest⟩ := interpBind_ok hchk
+      split at hrest
+      · simp [ub] at hrest
+      · next hlive =>
+        split at hrest
+        · simp [ub] at hrest
+        · next hinb =>
+          simp only [pure, Except.pure, Except.ok.injEq, Option.some.injEq, Prod.mk.injEq] at hrest
+          rcases hrest with ⟨rfl, _, rfl⟩
+          rw [hidx] at hidx'
+          cases hidx'
+          rw [listIndex_set_self _ hge hget]
+          simp only [bind, Except.bind, hlive, Allocation.size, hlen] at hinb ⊢
+          simp [hinb, pure, Except.pure]
+
+/-- After `BM.store mem ptr bytes align = .ok mem'`, loading `⟨bytes.length⟩`
+bytes back from `ptr` with the same `align` succeeds and returns `(bytes, mem')`. -/
+theorem BM.load_of_store {mem mem' : BM} {ptr : Ptr} {bytes : List Byte} {align : Align}
+    (h : BM.store mem ptr bytes align = .ok mem') :
+    BM.load mem' ptr ⟨bytes.length⟩ align = .ok (bytes, mem') := by
+  unfold BM.store at h
+  split at h
+  · simp [ub] at h
+  · next hal =>
+    obtain ⟨r, hchk, h⟩ := interpBind_ok h
+    cases r with
+    | none =>
+      simp only [pure, Except.pure, Except.ok.injEq] at h
+      subst h
+      unfold BM.check_ptr at hchk
+      split at hchk
+      · next hzero =>
+        have hnil : bytes = [] := List.eq_nil_of_length_eq_zero hzero
+        subst hnil
+        unfold BM.load
+        simp [hal, BM.check_ptr, pure, Except.pure]
+      · cases hp : ptr.provenance with
+        | none => simp [hp, ub] at hchk
+        | some p =>
+          rcases p with ⟨id, pe⟩
+          simp only [hp] at hchk
+          obtain ⟨alloc, _, hrest⟩ := interpBind_ok hchk
+          split at hrest
+          · simp [ub] at hrest
+          · split at hrest <;> simp [ub, pure, Except.pure] at hrest
+    | some t =>
+      rcases t with ⟨id, pe, off⟩
+      dsimp only at h
+      obtain ⟨alloc, hidx, h⟩ := interpBind_ok h
+      obtain ⟨data, hw, h⟩ := interpBind_ok h
+      obtain ⟨allocs', hs, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq] at h
+      subst h
+      obtain ⟨hge, hget⟩ := listIndex_ok_get hidx
+      have hs_eq := listSet_ok_eq hs
+      subst hs_eq
+      have hchk' := BM.check_ptr_set_data hchk hidx (writeSubsliceAtIndex_length hw)
+      have hidx' := listIndex_set_self { alloc with data := data } hge hget "self.allocations[id.0]"
+      have hs' := listSet_set_self { alloc with data := data } hge hget "set"
+      have hsub := subsliceWithLength_of_writeSubsliceAtIndex hw
+      unfold BM.load
+      simp [hal, hchk', bind, Except.bind, hidx', hs', hsub, pure, Except.pure]
+
+/-- After `placeStore m pl (.Int tAddr) (.Int it) = .ok m'` at any valid integer
+type `it`, loading `(pl, .Int it)` from any machine `m''` with
+`m''.mem.memory = m'.mem.memory` succeeds and returns `.Int tAddr`. -/
+theorem placeLoad_of_placeStore_int {m m' m'' : Mach} {pl : Gen.Place BM}
+    {it : Gen.IntType} (hgood : GoodSize it.size.bytes) {tAddr : Int}
+    (hstore : placeStore m pl (.Int tAddr) (.Int it) = .ok m')
+    (hmem : m''.mem.memory = m'.mem.memory) :
+    ∃ m_load,
+      placeLoad m'' pl (.Int it) = .ok (.Int tAddr, m_load) ∧
+      m_load.mem.memory = m''.mem.memory := by
+  unfold placeStore at hstore
+  split at hstore
+  · simp [ub] at hstore
+  · next hal =>
+    unfold typedStore at hstore
+    have hcv_eq : checkValue (.Int tAddr) (.Int it) (some m) =
+        ensureElseUb (IntType.can_represent it tAddr) "Value::Int: invalid integer value" := rfl
+    cases hrep : IntType.can_represent it tAddr with
+    | false =>
+      simp [hcv_eq, hrep, ensureElseUb, ub, specPanic, bind, Except.bind] at hstore
+    | true =>
+      have hcv : checkValue (.Int tAddr) (.Int it) (some m) = .ok () :=
+        checkValue_int hrep
+      have henc := encode_int it tAddr hgood hrep
+      simp only [hcv, henc, bind, Except.bind] at hstore
+      obtain ⟨cm, hcm, hstore⟩ := interpBind_ok hstore
+      simp only [pure, Except.pure, Except.ok.injEq] at hstore
+      subst hstore
+      unfold CM.store at hcm
+      obtain ⟨mem', hbm, hcm⟩ := interpBind_ok hcm
+      simp only [pure, Except.pure, Except.ok.injEq] at hcm
+      subst hcm
+      dsimp only at hmem
+      have hload := BM.load_of_store hbm
+      have hblen : (⟨(scalarBytes it (tAddr % 2 ^ (8 * it.size.bytes)).toNat).length⟩ : Size) = it.size := by
+        rw [scalarBytes_length]
+      rw [hblen, ← hmem] at hload
+      have hpos := two_pow_pos (8 * it.size.bytes)
+      have h0 := Int.emod_nonneg tAddr (Int.ne_of_gt hpos)
+      have h1 := Int.emod_lt_of_pos tAddr hpos
+      have hbits_lt : (tAddr % 2 ^ (8 * it.size.bytes)).toNat < 2 ^ (8 * it.size.bytes) := by
+        have : ((tAddr % 2 ^ (8 * it.size.bytes)).toNat : Int) < 2 ^ (8 * it.size.bytes) := by
+          rw [Int.toNat_of_nonneg h0]; exact h1
+        exact_mod_cast this
+      have hdec := decode_int_scalarBytes it (tAddr % 2 ^ (8 * it.size.bytes)).toNat hbits_lt
+      have hn : 0 < 8 * it.size.bytes := by have := hgood.pos; omega
+      have hw := (inBounds_iff tAddr it.signed it.size (by simpa [Size.bits] using hn)).mp hrep
+      rw [← eq_intFromBits tAddr it hn (by simpa [Size.bits] using hw.1) (by simpa [Size.bits] using hw.2)] at hdec
+      refine ⟨{ m'' with mem := ({ memory := m''.mem.memory, accesses := m''.mem.accesses ++ [⟨.Load, .None, pl.ptr.thin_pointer.addr, it.size⟩] }) }, ?_, rfl⟩
+      unfold placeLoad
+      simp [hal]
+      simp only [typedLoad, layout_eq it hgood, LayoutStrategy.expect_size, bind, Except.bind, CM.load, hload, hdec, checkValue_int hrep, pure, Except.pure]
+
+/-- After `placeStore m pl (.Int tAddr) (.Int usizeIt) = .ok m'`, loading
+`(pl, .Int usizeIt)` from any machine `m''` with `m''.mem.memory = m'.mem.memory`
+succeeds and returns `.Int tAddr`. -/
+theorem placeLoad_of_placeStore_usize {m m' m'' : Mach} {pl : Gen.Place BM} {tAddr : Int}
+    (hstore : placeStore m pl (.Int tAddr) (.Int usizeIt) = .ok m')
+    (hmem : m''.mem.memory = m'.mem.memory) :
+    ∃ m_load,
+      placeLoad m'' pl (.Int usizeIt) = .ok (.Int tAddr, m_load) ∧
+      m_load.mem.memory = m''.mem.memory :=
+  placeLoad_of_placeStore_int (Or.inr (Or.inr (Or.inr (Or.inl rfl)))) hstore hmem
+
+theorem placeStore_curFrame {m m' : Mach} {pl : Gen.Place BM} {v : Val} {ty : Gen.Type}
+    (h : placeStore m pl v ty = .ok m') :
+    curFrame m' = curFrame m := by
+  unfold placeStore at h
+  split at h
+  · simp [ub] at h
+  · unfold typedStore at h
+    cases hcv : checkValue v ty (some m) with
+    | error e => simp [hcv, specPanic, bind, Except.bind] at h
+    | ok u =>
+      simp only [hcv] at h
+      obtain ⟨bytes, _, h⟩ := interpBind_ok h
+      obtain ⟨cm, _, h⟩ := interpBind_ok h
+      simp only [pure, Except.pure, Except.ok.injEq] at h
+      subst h
+      rfl
+
+theorem evalValue_load_local_curFrame {m m' : Mach} {name : Gen.LocalName} {out : Val × Gen.Type}
+    (h : evalValue m (.Load (.Local name)) = .ok (out, m')) :
+    curFrame m' = curFrame m := by
+  unfold evalValue at h
+  obtain ⟨⟨⟨place, ty⟩, m1⟩, hpl, h⟩ := interpBind_ok h
+  obtain ⟨⟨v, m2⟩, hld, h⟩ := interpBind_ok h
+  simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at h
+  obtain ⟨_, rfl⟩ := h
+  have hm1 := evalPlace_local_eq hpl
+  subst hm1
+  unfold placeLoad at hld
+  split at hld
+  · simp [ub] at hld
+  · unfold typedLoad at hld
+    obtain ⟨_, _, hld⟩ := interpBind_ok hld
+    obtain ⟨_, _, hld⟩ := interpBind_ok hld
+    obtain ⟨_, _, hld⟩ := interpBind_ok hld
+    obtain ⟨dv, _, hld⟩ := interpBind_ok hld
+    cases dv with
+    | none => simp [ub] at hld
+    | some val =>
+      dsimp only at hld
+      obtain ⟨_, _, hld⟩ := interpBind_ok hld
+      simp only [pure, Except.pure, Except.ok.injEq, Prod.mk.injEq] at hld
+      obtain ⟨_, rfl⟩ := hld
+      rfl
+
+theorem jumpToBlock_curFrame {m m' : Mach} {b : Gen.BbName}
+    (h : jumpToBlock m b = .ok m') :
+    ∃ fr, curFrame m = .ok fr ∧
+      curFrame m' = .ok { fr with next_block := b, next_stmt := 0 } := by
+  unfold jumpToBlock mutateCurFrame at h
+  obtain ⟨t, ht, h⟩ := interpBind_ok h
+  cases hl : t.stack.getLast? with
+  | none => simp [hl, specPanic] at h
+  | some fr =>
+    simp only [hl] at h
+    obtain ⟨threads, hs, h⟩ := interpBind_ok h
+    simp only [pure, Except.pure, Except.ok.injEq] at h
+    subst h
+    obtain ⟨hge, hget⟩ := listIndex_ok_get ht
+    have hs_eq := listSet_ok_eq hs
+    subst hs_eq
+    refine ⟨fr, ?_, ?_⟩
+    · unfold curFrame
+      simp [ht, hl, bind, Except.bind, pure, Except.pure]
+    · unfold curFrame activeThread
+      rw [listIndex_set_self _ hge hget]
+      simp [bind, Except.bind, pure, Except.pure]
+
+theorem evalPlace_local_of_curFrame {m m' : Mach} {name : Gen.LocalName}
+    {out : Gen.Place BM × Gen.Type} {fr fr' : Frame}
+    (h : evalPlace m (.Local name) = .ok (out, m))
+    (hfr : curFrame m = .ok fr) (hfr' : curFrame m' = .ok fr')
+    (hfunc : fr'.func = fr.func) (hlocals : fr'.locals = fr.locals) :
+    evalPlace m' (.Local name) = .ok (out, m') := by
+  unfold evalPlace at h ⊢
+  rw [hfr] at h
+  rw [hfr']
+  simp only [bind, Except.bind, hfunc, hlocals] at h ⊢
+  obtain ⟨ty, hty, h⟩ := interpBind_ok h
+  rw [hty]
+  cases hmg : mapGet fr.locals name with
+  | none => simp [hmg, ub] at h
+  | some ptr =>
+    simpa [hmg, pure, Except.pure] using h
+
+/-- Strengthened `ProvenanceRel.expose_step` (`ProvenanceRel.expose_step_synced`):
+from `ExposedTargetAtAddr` (which unifies `ExposedTargetOk` and `hin_bounds`
+without a redundant existential) and any root-local operand `op` with
+`copyOp op = .copy ⟨p, []⟩` (covering both `.copy ⟨p, []⟩` and `.move ⟨p, []⟩`),
+we ALSO establish `ExposedLocalSynced body ctx locals' s' m4 i pv tAddr tProv`,
+proving that loading `localName i` at `m4` succeeds and returns `(.Int tAddr, .Int usizeIt)`. -/
+theorem ProvenanceRel.expose_step_synced {body : CapturedMir} {ctx : Ctx}
+    {s : MachineState} {m m1 m2 m3 m4 : Mach} {exposedTags : List Nat}
+    {i p : Nat} {op : MirAst.Operand} {targetTy : MirAst.Ty} {span : String} {nb : Gen.BbName}
+    {retPlace : Gen.Place BM} {argTy : Gen.Type}
+    {pv : ProvenancePtr} {tAddr : Int} {tProv : Prov}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hop : copyOp op = .copy ⟨p, []⟩)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = [])
+    (hnd : s.frame.locals[i]? ≠ some .dead)
+    (hp : s.frame.locals[p]? = some (.init (.ptr pv 8)))
+    (hoff0 : pv.offsetBytes = 0)
+    (htgt : ExposedTargetAtAddr body ctx s m.mem.memory.allocations pv.tag tAddr tProv)
+    (hplace : evalPlace m (.Local (localName i)) = .ok ((retPlace, .Int usizeIt), m1))
+    (harg : evalValue m1 (.Load (.Local (localName p))) =
+      .ok ((.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩, argTy), m2))
+    (hstore : placeStore
+        { m2 with intptrcast :=
+            (IntPtrCast.expose m2.intptrcast { addr := tAddr, provenance := some tProv }) }
+        retPlace (.Int tAddr) (.Int usizeIt) = .ok m3)
+    (hjump : jumpToBlock m3 nb = .ok m4) :
+    let locals' := (opPost s.frame.locals op).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+    let s' := advanceStmt s locals' s.memory
+    evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance op targetTy), span⟩
+        body.localDecls body.layouts = .tau (.running s') ∧
+    Interp.evalTerminator m
+        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))]
+          (.Local (localName i)) (some nb)) = .ok m4 ∧
+    m4.intptrcast = IntPtrCast.expose m.intptrcast ({ addr := tAddr, provenance := some tProv }) ∧
+    AllocShapeEq m.mem.memory.allocations m4.mem.memory.allocations ∧
+    ProvenanceRel body ctx s' m4 (pv.tag :: exposedTags) ∧
+    ExposedLocalSynced body ctx locals' s' m4 i pv tAddr tProv := by
+  have hA := (evalStmt_assign_expose_op s body.localDecls body.layouts i p op targetTy span
+    hop hi hbor_i hprot).1 pv hp hnd
+  have hstep := hprov.expose_step (targetTy := targetTy) (span := span) hi hbor_i hprot hnd
+    hp hoff0 htgt.toExposedTargetOk hplace harg hstore hjump htgt.in_bounds
+  rcases hstep with ⟨_, hM, hipc, hshape, hprov_copy, hrel_copy⟩
+  have hprov' : ProvenanceRel body ctx
+      (advanceStmt s ((opPost s.frame.locals op).set i
+        (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))) s.memory)
+      m4 (pv.tag :: exposedTags) :=
+    ⟨hprov_copy.nodup, hprov_copy.sound, hprov_copy.complete⟩
+  have hslot_i : ((opPost s.frame.locals op).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))[i]? =
+      some (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)) := by
+    have hil : i < (opPost s.frame.locals op).length := by rw [opPost_length]; exact hi
+    exact List.getElem?_set_self hil
+  have hrel' : ExposedLocalRel body ctx
+      ((opPost s.frame.locals op).set i
+        (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))
+      (advanceStmt s ((opPost s.frame.locals op).set i
+        (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))) s.memory)
+      m4 i pv tAddr tProv :=
+    ⟨hslot_i, hoff0, hrel_copy.target_ok, hrel_copy.exposed_mem, hrel_copy.in_bounds⟩
+  refine ⟨hA, hM, hipc, hshape, hprov', ⟨hrel', ?_⟩⟩
+  have hm1 := evalPlace_local_eq hplace
+  subst hm1
+  have hfr_arg := evalValue_load_local_curFrame harg
+  have hfr_store := placeStore_curFrame hstore
+  obtain ⟨fr3, hfr3, hfr4⟩ := jumpToBlock_curFrame hjump
+  have hfr1 : curFrame m1 = .ok fr3 := by
+    rw [← hfr_arg]
+    exact hfr_store.symm.trans hfr3
+  have hpl4 : evalPlace m4 (.Local (localName i)) = .ok ((retPlace, .Int usizeIt), m4) :=
+    evalPlace_local_of_curFrame hplace hfr1 hfr4 rfl rfl
+  obtain ⟨hmem4, _⟩ := jumpToBlock_mem hjump
+  obtain ⟨m_load, hld4, _⟩ := placeLoad_of_placeStore_usize hstore (by rw [hmem4])
+  refine ⟨m_load, ?_⟩
+  unfold evalValue
+  simp [hpl4, hld4, bind, Except.bind, pure, Except.pure]
+
+/-- `ProvenanceRel.withExposed_step_synced`: uses `ExposedLocalSynced` and any
+root-local operand `op` with `copyOp op = .copy ⟨u, []⟩` (covering both `.copy`
+and `.move`) to step `PointerWithExposedProvenance` on both Anneal and MiniRust. -/
+theorem ProvenanceRel.withExposed_step_synced {body : CapturedMir} {ctx : Ctx}
+    {s : MachineState} {m m1 m2 m3 m4 : Mach} {exposedTags : List Nat}
+    {i u : Nat} {op : MirAst.Operand} {targetTy : MirAst.Ty} {span : String} {nb : Gen.BbName}
+    {retPlace : Gen.Place BM} {retPtrTy : Gen.PtrType} {argTy : Gen.Type}
+    {pv : ProvenancePtr} {tAddr : Int} {tProv : Prov}
+    (hprov : ProvenanceRel body ctx s m exposedTags)
+    (hop : copyOp op = .copy ⟨u, []⟩)
+    (hsync : ExposedLocalSynced body ctx s.frame.locals s m u pv tAddr tProv)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = [])
+    (hnd : s.frame.locals[i]? ≠ some .dead)
+    (hplace : evalPlace m (.Local (localName i)) = .ok ((retPlace, .Ptr retPtrTy), m1))
+    (harg : evalValue m1 (.Load (.Local (localName u))) = .ok ((.Int tAddr, argTy), m2))
+    (hmeta : PtrType.meta_kind retPtrTy = .None)
+    (honly : ∀ q ∈ int2ptrCandidates m.mem.memory.allocations m.intptrcast.exposed tAddr,
+      q = tProv)
+    (hstore : placeStore m2 retPlace
+        (.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩)
+        (.Ptr retPtrTy) = .ok m3)
+    (hjump : jumpToBlock m3 nb = .ok m4) :
+    let locals' := (opPost s.frame.locals op).set i (.init (.ptr pv 8))
+    let s' := advanceStmt s locals' s.memory
+    evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerWithExposedProvenance op targetTy), span⟩
+        body.localDecls body.layouts = .tau (.running s') ∧
+    IntPtrCast.int2ptr m2 tAddr = .ok { addr := tAddr, provenance := some tProv } ∧
+    Interp.evalTerminator m
+        (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName u))]
+          (.Local (localName i)) (some nb)) = .ok m4 ∧
+    m4.intptrcast = m.intptrcast ∧
+    AllocShapeEq m.mem.memory.allocations m4.mem.memory.allocations ∧
+    ProvenanceRel body ctx s' m4 exposedTags := by
+  have hA0 := (evalStmt_assign_withExposed_op s body.localDecls body.layouts i u op targetTy span
+    hop hi hbor_i hprot).1 ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩
+    hsync.toExposedLocalRel.slot_eq hnd
+  rw [hsync.toExposedLocalRel.anneal_roundtrip] at hA0
+  have hstep := hprov.withExposed_step (targetTy := targetTy) (span := span)
+    hsync.toExposedLocalRel hi hbor_i hprot hnd hplace harg hmeta honly hstore hjump
+  rcases hstep with ⟨_, hint, hM, hipc, hshape, hprov_copy⟩
+  exact ⟨hA0, hint, hM, hipc, hshape, ⟨hprov_copy.nodup, hprov_copy.sound, hprov_copy.complete⟩⟩
+
+/-- Composed 2-step round-trip simulation (`ProvenanceRel.expose_then_withExposed_step`):
+starting from a single-expose state (`m.intptrcast.exposed.elems = []`), executing
+`PointerExposeProvenance` (`s -> s1`, `m -> m4`) followed by
+`PointerWithExposedProvenance` (`s1 -> s2`, `m4 -> m8`) succeeds on both Anneal
+and MiniRust, automatically discharging:
+1. the intermediate Anneal slot invariant (`ExposedLocalSynced`),
+2. the existence of a valid MiniRust `.Load (.Local (localName i))` evaluation at `m4`
+   (`∃ m6, evalValue m4 (.Load (.Local (localName i))) = .ok ((.Int tAddr, .Int usizeIt), m6)`), and
+3. the uniqueness of the angelic candidate (`honly`) at `m4`. -/
+theorem ProvenanceRel.expose_then_withExposed_step {body : CapturedMir} {ctx : Ctx}
+    {s : MachineState} {m m1 m2 m3 m4 : Mach}
+    {i p d : Nat} {op1 op2 : MirAst.Operand} {targetTy1 targetTy2 : MirAst.Ty}
+    {span1 span2 : String} {nb1 nb2 : Gen.BbName}
+    {retPlace1 retPlace2 : Gen.Place BM} {argTy1 : Gen.Type} {retPtrTy2 : Gen.PtrType}
+    {pv : ProvenancePtr} {tAddr : Int} {tProv : Prov}
+    (hprov : ProvenanceRel body ctx s m [])
+    (hempty : m.intptrcast.exposed.elems = [])
+    (hop1 : copyOp op1 = .copy ⟨p, []⟩)
+    (hi : i < s.frame.locals.length)
+    (hbor_i : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ i)
+    (hprot : s.memory.activeProtectors = [])
+    (hnd_i : s.frame.locals[i]? ≠ some .dead)
+    (hp : s.frame.locals[p]? = some (.init (.ptr pv 8)))
+    (hoff0 : pv.offsetBytes = 0)
+    (htgt : ExposedTargetAtAddr body ctx s m.mem.memory.allocations pv.tag tAddr tProv)
+    (hplace1 : evalPlace m (.Local (localName i)) = .ok ((retPlace1, .Int usizeIt), m1))
+    (harg1 : evalValue m1 (.Load (.Local (localName p))) =
+      .ok ((.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩, argTy1), m2))
+    (hstore1 : placeStore
+        { m2 with intptrcast :=
+            (IntPtrCast.expose m2.intptrcast { addr := tAddr, provenance := some tProv }) }
+        retPlace1 (.Int tAddr) (.Int usizeIt) = .ok m3)
+    (hjump1 : jumpToBlock m3 nb1 = .ok m4)
+    (hop2 : copyOp op2 = .copy ⟨i, []⟩)
+    (hd : d < s.frame.locals.length)
+    (hbor_d : ∀ e ∈ s.memory.borrows, e.targetLocal ≠ d)
+    (hnd_d : ((opPost s.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩)))[d]? ≠ some .dead)
+    (hplace2 : evalPlace m4 (.Local (localName d)) = .ok ((retPlace2, .Ptr retPtrTy2), m4))
+    (hmeta2 : PtrType.meta_kind retPtrTy2 = .None)
+    (hstore_jump2 : ∀ m6,
+      evalValue m4 (.Load (.Local (localName i))) = .ok ((.Int tAddr, .Int usizeIt), m6) →
+      ∃ m7 m8,
+        placeStore m6 retPlace2
+          (.Ptr ⟨{ addr := tAddr, provenance := some tProv }, none⟩)
+          (.Ptr retPtrTy2) = .ok m7 ∧
+        jumpToBlock m7 nb2 = .ok m8) :
+    let locals1 := (opPost s.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))
+    let s1 := advanceStmt s locals1 s.memory
+    let locals2 := (opPost locals1 op2).set d (.init (.ptr pv 8))
+    let s2 := advanceStmt s1 locals2 s1.memory
+    evalStmt s ⟨.assign ⟨i, []⟩ (.cast .pointerExposeProvenance op1 targetTy1), span1⟩
+        body.localDecls body.layouts = .tau (.running s1) ∧
+    Interp.evalTerminator m
+        (.Intrinsic .PointerExposeProvenance [.Load (.Local (localName p))]
+          (.Local (localName i)) (some nb1)) = .ok m4 ∧
+    evalStmt s1 ⟨.assign ⟨d, []⟩ (.cast .pointerWithExposedProvenance op2 targetTy2), span2⟩
+        body.localDecls body.layouts = .tau (.running s2) ∧
+    ∃ m8,
+      Interp.evalTerminator m4
+          (.Intrinsic .PointerWithExposedProvenance [.Load (.Local (localName i))]
+            (.Local (localName d)) (some nb2)) = .ok m8 ∧
+      AllocShapeEq m.mem.memory.allocations m8.mem.memory.allocations ∧
+      ProvenanceRel body ctx s2 m8 [pv.tag] := by
+  obtain ⟨hA1, hM1, hipc1, hshape1, hprov1, hsync1⟩ :=
+    hprov.expose_step_synced hop1 hi hbor_i hprot hnd_i hp hoff0 htgt
+      hplace1 harg1 hstore1 hjump1
+  rcases hsync1.load_ok with ⟨m6, harg2⟩
+  obtain ⟨m7, m8, hstore2, hjump2⟩ := hstore_jump2 m6 harg2
+  have honly : ∀ q ∈ int2ptrCandidates m4.mem.memory.allocations m4.intptrcast.exposed tAddr,
+      q = tProv := by
+    intro q hq
+    have hexp : setContains m4.intptrcast.exposed q = true := int2ptrCandidates_exposed hq
+    rw [hipc1, setContains_expose_some_iff] at hexp
+    rcases hexp with rfl | hold
+    · rfl
+    · rw [setContains_iff_mem, hempty] at hold
+      cases hold
+  have hd1 : d < ((opPost s.frame.locals op1).set i
+      (.init (.scalar ⟨pv.allocId * 65536 + pv.offsetBytes, 8⟩))).length := by
+    simp [opPost_length, hd]
+  obtain ⟨hA2, _, hM2, _, hshape2, hprov2⟩ :=
+    hprov1.withExposed_step_synced hop2 hsync1 hd1 hbor_d hprot hnd_d
+      hplace2 harg2 hmeta2 honly hstore2 hjump2
+  exact ⟨hA1, hM1, hA2, m8, hM2, hshape1.trans hshape2, hprov2⟩
+
+/-- Explicit proof that `BorrowsOk.target_ptrs` is vacuously satisfied whenever
+`hasProvCast body = true`, because its definition in `Pointers.lean` is guarded
+by `inFragment body = true → ...` and `inFragment_not_hasProvCast` proves
+`inFragment body = true → hasProvCast body = false`. -/
+theorem BorrowsOk.target_ptrs_vacuous_of_hasProvCast {body : CapturedMir}
+    (hhas : hasProvCast body = true) :
+    inFragment body = false := by
+  cases hin : inFragment body
+  · rfl
+  · have := inFragment_not_hasProvCast hin
+    rw [hhas] at this
+    contradiction
+
+/-- Non-vacuous counterpart to `BorrowsOk.target_ptrs` (`AddrTakenTargetsOk`)
+that holds on `inFragmentWithIntrinsics` bodies (where `inFragment body = false`):
+every address-taken local `k ∈ bodyAddrTakenLocals body` is live in `view` and
+mapped in `lm` to `localPtr ctx k` with well-aligned in-bounds address. -/
+def AddrTakenTargetsOk (body : CapturedMir) (ctx : Ctx) (view : List LocalSlot)
+    (lm : Map Gen.LocalName Ptr) : Prop :=
+  ∀ k ∈ bodyAddrTakenLocals body,
+    view[k]? ≠ some .dead ∧
+    mapGet lm (localName k) = some (localPtr ctx k) ∧
+    (∀ d, body.localDecls[k]? = some d →
+      isPtrTy d.ty = false ∧
+      AddrOk (ctx.addrs.getD k 0) (itOf d body.layouts) ∧
+      ctx.addrs.getD k 0 + (tyBytes (tyOf d body.layouts) : Int) < 2 ^ 64)
+
+/-- Connecting `BorrowsOk` directly to `ExposedTargetAtAddr`: for any valid
+pointer slot `view[p]? = some (.init (.ptr ptrVal 8))` in `BorrowsOk`, its borrow
+tag `ptrVal.tag` resolves to an `entry` targeting an address-taken local
+`entry.targetLocal ∈ bodyAddrTakenLocals body` with `ptrVal.offsetBytes = 0`,
+and any live allocation `alloc` at `ctx.base.length + entry.targetLocal` with
+`alloc.addr = ctx.addrs.getD entry.targetLocal 0` and sufficient size yields
+`ExposedTargetAtAddr` at `ctx.addrs.getD entry.targetLocal 0 + (relOff : Int)`. -/
+theorem BorrowsOk.exposedTargetAtAddr_of_ptr_slot {body : CapturedMir}
+    {ctx : Ctx} {view : List LocalSlot} {s : MachineState} {lm : Map Gen.LocalName Ptr}
+    {allocs : List Gen.Allocation}
+    {p : Nat} {dp : LocalDecl} {mutbl : MirAst.Mutability} {pointeeIt : Gen.IntType}
+    {ptrVal : ProvenancePtr}
+    (hb : BorrowsOk body ctx view s lm)
+    (hdp : body.localDecls[p]? = some dp)
+    (hp_ty : ptrPointeeOf dp.ty = some (mutbl, pointeeIt))
+    (hvp : view[p]? = some (.init (.ptr ptrVal 8)))
+    (halloc_ok : ∀ (entry : BorrowEntry) (relOff : Nat),
+      lookupBorrow s.memory.borrows ptrVal.tag = some entry →
+      entry.targetLocal ∈ bodyAddrTakenLocals body →
+      ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+        some (pointeeIt, relOff) →
+      ∃ alloc,
+        allocs[ctx.base.length + entry.targetLocal]? = some alloc ∧
+        alloc.live = true ∧
+        alloc.addr = ctx.addrs.getD entry.targetLocal 0 ∧
+        relOff + pointeeIt.size.bytes ≤ (Allocation.size alloc).bytes) :
+    ptrVal.offsetBytes = 0 ∧
+    ∃ (entry : BorrowEntry) (relOff : Nat),
+      lookupBorrow s.memory.borrows ptrVal.tag = some entry ∧
+      ExposedTargetAtAddr body ctx s allocs ptrVal.tag
+        (ctx.addrs.getD entry.targetLocal 0 + (relOff : Int))
+        (targetProv ctx entry.targetLocal) := by
+  obtain ⟨entry, relOff, hoff0, hlk, _, hspec⟩ :=
+    hb.ptr_slots p dp mutbl pointeeIt ptrVal hdp hp_ty hvp
+  have hmem : entry ∈ s.memory.borrows := (lookupBorrow_mem_and_tag hlk).1
+  obtain ⟨_, _, _, _, hk, _⟩ := hb.entries_ok entry hmem
+  obtain ⟨alloc, halloc, hlive, haddr, hsz⟩ := halloc_ok entry relOff hlk hk hspec
+  exact ⟨hoff0, entry, relOff, hlk,
+    ExposedTargetAtAddr.of_target_offset hlk hk hspec halloc hlive haddr hsz⟩
 
 end MiniRustSpec.Correspondence
