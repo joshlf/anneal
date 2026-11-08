@@ -390,9 +390,9 @@ private theorem get?_map_u32 {elems : List Nat} {i : Nat} (h_lt : i < elems.leng
     }
     memory := emptyMemory }
 
-private theorem fastSliceSum_header_switch_raw
+private theorem fastSliceSum_header_switch_raw {fuel : Nat}
     (elems : List Nat) (n i : Nat) (o5 o6 : Option Value) :
-    runMirToBinarySwitch 2 fastSliceSumBody (fastSliceSumMkState elems n 1 i o5 o6) =
+    runMirToBinarySwitch (fuel + 2) fastSliceSumBody (fastSliceSumMkState elems n 1 i o5 o6) =
       let sc := boolToScalar (!Nat.ble n i)
       some (!sc.bits.beq 0, sc.bits,
             fastSliceSumMkState elems n 2 i (some (.scalar sc)) o6,
@@ -406,18 +406,18 @@ module, which `trusted/audit/check_trusted.py` then rejects as foreign dependenc
 theory modules that realize the same lemmas.
 -/
 private theorem fastSliceSum_h_body
-    (elems : List Nat) (n i : Nat) (temps : Option (Value × Value))
+    (elems : List Nat) (n i : Nat) (o6 : Option Value)
     (h_i_lt_len : i < elems.length)
     (h_add_u32 : prefixSum elems i + elems.getD i 0 < 4294967296)
     (h_add_usize : i + 1 < 18446744073709551616) :
     runMirTauToBlock 5 fastSliceSumBody 1
-      (fastSliceSumMkState elems n 2 i (some (.scalar ⟨1, 1⟩)) (temps.map Prod.snd)) =
+      (fastSliceSumMkState elems n 2 i (some (.scalar ⟨1, 1⟩)) o6) =
       some (fastSliceSumMkState elems n 1 (i + 1) (some (.scalar ⟨1, 1⟩))
               (some (.scalar ⟨elems.getD i 0, 4⟩))) := by
-  rcases temps with _ | ⟨_, _⟩ <;>
+  cases o6 <;>
     repeat' first
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, fastSliceSumMkState, fastSliceSumBody,
-          encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
+          encodeU32Slice, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
           readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
@@ -446,25 +446,24 @@ theorem dwp_fastSliceSumBody_trace
     (s' := fastSliceSumMkState elems n 1 0 none none) rfl ?_
   refine dwp_mirTree_stateful_while_ranked fastSliceSumBody 1 2 5
     (fun r s tr =>
-      ∃ (i : Nat) (temps : Option (Value × Value)),
+      ∃ (i : Nat) (o5 o6 : Option Value),
         i + r = n ∧
         tr = List.replicate i (mirSwitchEvent 1) ∧
-        s = fastSliceSumMkState elems n 1 i (temps.map Prod.fst) (temps.map Prod.snd))
-    (h_zero := ?_) (h_succ := ?_) n ⟨0, none, Nat.zero_add n, rfl, rfl⟩
-  · rintro s tr ⟨i, temps, h_ir, rfl, rfl⟩
+        s = fastSliceSumMkState elems n 1 i o5 o6)
+    (h_zero := ?_) (h_succ := ?_) n ⟨0, none, none, Nat.zero_add n, rfl, rfl⟩
+  · rintro s tr ⟨i, o5, o6, h_ir, rfl, rfl⟩
     obtain rfl : i = n := by omega
     refine ⟨0, _, _, by
-      rw [fastSliceSum_header_switch_raw, nat_ble_eq_true_of_le (Nat.le_refl i)]; rfl, ?_⟩
+      rw [fastSliceSum_header_switch_raw (fuel := 0), nat_ble_eq_true_of_le (Nat.le_refl i)]; rfl, ?_⟩
     exact dwp_of_runMirTauToRet 3
       (out := .normal (.scalar ⟨prefixSum elems i, 4⟩, emptyMemory)) rfl ⟨rfl, rfl⟩
-  · rintro r s tr ⟨i, temps, h_ir, rfl, rfl⟩
+  · rintro r s tr ⟨i, o5, o6, h_ir, rfl, rfl⟩
     have h_ps_le : prefixSum elems i + elems.getD i 0 ≤ prefixSum elems n :=
       prefixSum_mono elems (show i + 1 ≤ n by omega)
     refine ⟨1, _, _, _, by
-      rw [fastSliceSum_header_switch_raw, nat_ble_eq_false_of_lt (show i < n by omega)]; rfl,
-      fastSliceSum_h_body elems n i temps (by omega) (by omega) (by omega), ?_⟩
-    exact ⟨i + 1, some (.scalar ⟨1, 1⟩, .scalar ⟨elems.getD i 0, 4⟩),
-      by omega, List.replicate_succ'.symm, rfl⟩
+      rw [fastSliceSum_header_switch_raw (fuel := 0), nat_ble_eq_false_of_lt (show i < n by omega)]; rfl,
+      fastSliceSum_h_body elems n i o6 (by omega) (by omega) (by omega), ?_⟩
+    exact ⟨i + 1, _, _, by omega, List.replicate_succ'.symm, rfl⟩
 
 @[reducible] private def safeSliceSumMkState
     (elems : List Nat) (n : Nat) (bb : Nat) (i : Nat)
@@ -504,10 +503,10 @@ private theorem safeSliceSum_bb2_len_step (elems : List Nat) (n i : Nat)
           memory := emptyMemory }) := by
   rcases rest with _ | ⟨_, _, _, _, _⟩ <;> rfl
 
-private theorem safeSliceSum_header_switch_raw
+private theorem safeSliceSum_header_switch_raw {fuel : Nat}
     (elems : List Nat) (n i : Nat) (o5 : Option Value)
     (rest : Option (Value × Value × Value × Value × Value)) :
-    runMirToBinarySwitch 2 safeSliceSumBody (safeSliceSumMkState elems n 1 i o5 rest) =
+    runMirToBinarySwitch (fuel + 2) safeSliceSumBody (safeSliceSumMkState elems n 1 i o5 rest) =
       let sc := boolToScalar (!Nat.ble n i)
       some (!sc.bits.beq 0, sc.bits,
             safeSliceSumMkState elems n 2 i (some (.scalar sc)) rest,
@@ -572,14 +571,14 @@ theorem dwp_safeSliceSumBody_trace
   · rintro s tr ⟨i, o5, rest, h_ir, rfl, rfl⟩
     obtain rfl : i = n := by omega
     refine ⟨0, _, _, by
-      rw [safeSliceSum_header_switch_raw, nat_ble_eq_true_of_le (Nat.le_refl i)]; rfl, ?_⟩
+      rw [safeSliceSum_header_switch_raw (fuel := 0), nat_ble_eq_true_of_le (Nat.le_refl i)]; rfl, ?_⟩
     exact dwp_of_runMirTauToRet 3
       (out := .normal (.scalar ⟨prefixSum elems i, 4⟩, emptyMemory)) rfl ⟨rfl, rfl⟩
   · rintro r s tr ⟨i, o5, rest, h_ir, rfl, rfl⟩
     have h_ps_le : prefixSum elems i + elems.getD i 0 ≤ prefixSum elems n :=
       prefixSum_mono elems (show i + 1 ≤ n by omega)
     refine ⟨1, _, _, _, by
-      rw [safeSliceSum_header_switch_raw, nat_ble_eq_false_of_lt (show i < n by omega)]; rfl,
+      rw [safeSliceSum_header_switch_raw (fuel := 0), nat_ble_eq_false_of_lt (show i < n by omega)]; rfl,
       safeSliceSum_h_body elems n i rest (by omega) (by omega) (by omega), ?_⟩
     exact ⟨i + 1, _, _, by omega, List.replicate_succ'.symm, rfl⟩
 

@@ -1314,35 +1314,18 @@ theorem example_signature_predicates_and_polymorphic_obligations :
       polySwapPairU32MirBody
       [.scalar ⟨10, 1⟩, .scalar ⟨20, 4⟩]
       emptyMemory := by
-  simp [
-    emptyMemory,
-    TypeLayout.isParamPlaceholder,
-    alignUp,
-    maxNat,
-    pow2Nat,
-    Trusted.Sequence.get?,
-    Trusted.Sequence.length,
-    UintTy.byteWidth,
-    UintTy.bitWidth,
-    appendTypeLayouts,
-    setTypeLayoutAt,
-    computeAggregateBackendRepr,
+  simp [emptyMemory, TypeLayout.isParamPlaceholder, alignUp, maxNat, pow2Nat,
+    Trusted.Sequence.get?, Trusted.Sequence.length, UintTy.byteWidth, UintTy.bitWidth,
+    appendTypeLayouts, setTypeLayoutAt, computeAggregateBackendRepr,
     TypeLayout.recomputeFromFieldLayouts,
     Trusted.Rustc.V2026_06_01.Layout.substitutePlaceholderEntries,
-    Trusted.Rustc.V2026_06_01.Layout.recomputeEntriesWith,
-    TypeSubst.layouts,
-    RigidTy.instantiate,
-    RigidTy.instantiateList,
-    RigidTy.hasSubstParam,
-    RigidTy.hasSubstParamList,
-    RigidTy.isCompoundSubstParam,
-    RigidTy.isTrivialZst,
-    RigidTy.computeLayout,
-    Trusted.Rustc.V2026_06_01.MirAst.hasNonParamTyAtIdx,
+    Trusted.Rustc.V2026_06_01.Layout.recomputeEntriesWith, TypeSubst.layouts,
+    RigidTy.instantiate, RigidTy.instantiateList, RigidTy.hasSubstParam,
+    RigidTy.hasSubstParamList, RigidTy.isCompoundSubstParam, RigidTy.isTrivialZst,
+    RigidTy.computeLayout, Trusted.Rustc.V2026_06_01.MirAst.hasNonParamTyAtIdx,
     Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamTyAtIdx,
     Trusted.Rustc.V2026_06_01.MirAst.substituteTyParamLayoutsAux,
-    Trusted.Rustc.V2026_06_01.MirAst.recomputeTyCompoundLayoutsAux
-  ] <;> decide
+    Trusted.Rustc.V2026_06_01.MirAst.recomputeTyCompoundLayoutsAux] <;> decide
 
 /-! ## 12. Signature Predicates over Capture-Shaped Layout Tables: Pointer Fields, Captured Field Layouts, Unrecorded Pointee Layouts & the Monomorphic Signature Guard -/
 
@@ -1652,22 +1635,7 @@ theorem example_capture_shaped_signature_predicates :
       (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨23, 0⟩ 8] rcMem ∧
     ¬ argsMatchSignature
       (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨20, 8⟩ 8] rcMem := by
-  simp [
-    emptyMemory,
-    rcMem,
-    rcLayoutTable,
-    mkRcBody,
-    rcUsizeTy,
-    rcRefUsercopyTy,
-    rcUsercopyTy,
-    rcCursorTypeLayout,
-    rcNonNullU8TypeLayout,
-    rcUsercopyTypeLayout,
-    sigUsizeTypeLayout,
-    sigThinPtrTypeLayout,
-    sigWideSliceTypeLayout,
-    sigRawPtrTypeLayout
-  ] <;> decide
+  simp <;> decide
 
 @[reducible]
 def rcRefDynTy (m : Mutability) : Ty :=
@@ -1703,23 +1671,7 @@ theorem example_dyn_and_extern_reference_signatures :
       [.aggregate 0 [.ptr ⟨20, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
     argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨10, 0⟩ 8] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨99, 0⟩ 8] rcMem := by
-  simp [
-    emptyMemory,
-    rcMem,
-    rcLayoutTable,
-    mkRcBody,
-    rcUsizeTy,
-    rcRefDynTy,
-    rcRefExternTy,
-    rcCursorTypeLayout,
-    rcNonNullU8TypeLayout,
-    rcUsercopyTypeLayout,
-    rcWideDynTypeLayout,
-    sigUsizeTypeLayout,
-    sigThinPtrTypeLayout,
-    sigWideSliceTypeLayout,
-    sigRawPtrTypeLayout
-  ] <;> decide
+  simp <;> decide
 
 @[reducible]
 def rcOptionBoolTy : Ty :=
@@ -1772,28 +1724,7 @@ theorem example_generic_enum_payload_signatures :
       [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨1, 1⟩]] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcTaggedStructBoolTy] rcUsizeTy)
       [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨2, 1⟩]] rcMem := by
-  simp [
-    emptyMemory,
-    rcMem,
-    rcLayoutTable,
-    mkRcBody,
-    rcUsizeTy,
-    rcTaggedBoolTy,
-    rcControlFlowU8BoolTy,
-    rcTaggedStructBoolTy,
-    rcCursorTypeLayout,
-    rcNonNullU8TypeLayout,
-    rcUsercopyTypeLayout,
-    rcWideDynTypeLayout,
-    rcOptionBoolTypeLayout,
-    rcTaggedBoolTypeLayout,
-    rcControlFlowU8BoolTypeLayout,
-    rcTaggedStructBoolTypeLayout,
-    sigUsizeTypeLayout,
-    sigThinPtrTypeLayout,
-    sigWideSliceTypeLayout,
-    sigRawPtrTypeLayout
-  ] <;> decide
+  simp <;> decide
 
 @[reducible]
 def rcCellU32Ty : Ty := { kind := .adt "core::cell::Cell" [.uint .u32], layoutIdx := 12 }
@@ -1849,31 +1780,8 @@ theorem example_layoutless_fields_and_subplace_borrows :
       [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨1, 8⟩]] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcRefSliceUsizeTy] rcUsizeTy)
       [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨2, 8⟩]] rcMem := by
-  simp [
-    emptyMemory,
-    rcMem,
-    rcLayoutTable,
-    mkRcBody,
-    rcUsizeTy,
-    rcCellU32Ty,
-    rcUnsafeCellBoolTy,
-    rcReorderedTy,
-    rcRefUsizeTy,
-    rcRefOpaqueTy,
-    rcRefSliceUsizeTy,
-    rcCellU32TypeLayout,
-    rcUnsafeCellBoolTypeLayout,
-    rcReorderedTypeLayout,
-    readProjectedValue,
-    extractSubslice,
-    takeValues,
-    dropValues,
-    Trusted.Sequence.get?,
-    Trusted.Sequence.length,
-    sigUsizeTypeLayout,
-    sigThinPtrTypeLayout,
-    sigWideSliceTypeLayout
-  ] <;> decide
+  simp [readProjectedValue, extractSubslice, takeValues, dropValues,
+    Trusted.Sequence.get?, Trusted.Sequence.length] <;> decide
 
 /--
 The monomorphic signature guard emitted beside `statefulClaim`, `totalClaim`,

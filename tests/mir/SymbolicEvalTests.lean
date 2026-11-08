@@ -1211,12 +1211,11 @@ theorem sliceHelperPipeline_verified :
   have h_half : signedHalfModulus 8 = 9223372036854775808 := rfl
   have h_wrap : wrapScalarBits mid 18446744073709551616 = mid :=
     wrapScalarBits_eq_of_lt (by omega)
+  have h_d : Nat.ble 9223372036854775808 mid = false := (nat_ble_eq_false_iff _ _).2 (by omega)
   have h_neg : isSignedNegative mid 8 = false := by
     show Nat.ble (Nat.div (scalarModulus 8) 2) (wrapScalarBits mid (scalarModulus 8)) = false
-    rw [h_mod, h_wrap]
-    exact (nat_ble_eq_false_iff _ _).2 (by show mid < 9223372036854775808; omega)
+    rw [h_mod, h_wrap]; exact h_d
   have h_mul : Nat.mul mid 1 = mid := Nat.mul_one mid
-  have h_d : Nat.ble 9223372036854775808 mid = false := (nat_ble_eq_false_iff _ _).2 (by omega)
   have h_c : Nat.ble 9223372036854775808 (Nat.add offsetBytes mid) = false :=
     (nat_ble_eq_false_iff _ _).2 (by change offsetBytes + mid < _; omega)
   have h_o : Nat.ble 9223372036854775808 offsetBytes = false :=

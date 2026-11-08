@@ -305,19 +305,21 @@ private theorem twoDiamond_bb0_switch (c1 c2 : Bool) (x : Nat) :
             twoDiamondPreSwitchState c1 c2 x 2) :=
   rfl
 
-private theorem twoDiamond_bb1_join (c1 c2 : Bool) (x : Nat)
-    (hx10 : x + 10 < 4294967296) (hx20 : x + 20 < 4294967296) :
+private theorem twoDiamond_bb1_join (c1 c2 : Bool) (x : Nat) (hx : x < 1000) :
     evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
       (twoDiamondPreSwitchState c1 c2 x 1) =
       some (twoDiamondBb3BranchState c1 c2 x (x + 10) (x + 20)) := by
-  rw [← wrapU32_add hx10, ← wrapU32_add hx20]; rfl
+  rw [← wrapU32_add (by omega : x + 10 < 4294967296),
+      ← wrapU32_add (by omega : x + 20 < 4294967296)]
+  rfl
 
-private theorem twoDiamond_bb2_join (c1 c2 : Bool) (x : Nat)
-    (hx1 : x + 1 < 4294967296) (hx2 : x + 2 < 4294967296) :
+private theorem twoDiamond_bb2_join (c1 c2 : Bool) (x : Nat) (hx : x < 1000) :
     evalPlanToJoin twoDiamondTupleBody (.jump 3 5)
       (twoDiamondPreSwitchState c1 c2 x 2) =
       some (twoDiamondBb3BranchState c1 c2 x (x + 1) (x + 2)) := by
-  rw [← wrapU32_add hx1, ← wrapU32_add hx2]; rfl
+  rw [← wrapU32_add (by omega : x + 1 < 4294967296),
+      ← wrapU32_add (by omega : x + 2 < 4294967296)]
+  rfl
 
 /--
 Core `wpTransPlan` proof for `twoDiamondTupleBody` over symbolic `(c1, c2, x)`.
@@ -335,8 +337,7 @@ theorem wpTransPlan_twoDiamondTuple
   rw [boolToScalar_eq c1, boolToScalar_eq c2, twoDiamondPlan, wpTransPlan,
     twoDiamond_bb0_switch c1 c2 x, not_beq_toNat_zero c1]
   dsimp only
-  rw [twoDiamond_bb1_join c1 c2 x (by omega) (by omega),
-    twoDiamond_bb2_join c1 c2 x (by omega) (by omega)]
+  rw [twoDiamond_bb1_join c1 c2 x hx, twoDiamond_bb2_join c1 c2 x hx]
   dsimp only [twoDiamondBb3BranchState, joinPlanMemConsistent]
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
   rw [wpTransPlan]
@@ -463,22 +464,22 @@ private abbrev sumToNBranchState (bb n i : Nat) (sc : ScalarInt) : MachineState 
   sumToNState bb n i (arithSum i) (.init (.scalar sc))
 
 private theorem sumToN_header_switch_raw
-    (n i : Nat) (cmpOpt : Option Value) :
-    runMirToBinarySwitch 32 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
+    {fuel : Nat} (n i : Nat) (cmpOpt : Option Value) :
+    runMirToBinarySwitch (fuel + 2) sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
       let sc := boolToScalar (!Nat.ble n i)
       some (!sc.bits.beq 0, sc.bits, sumToNBranchState 2 n i sc, sumToNBranchState 3 n i sc) := by
   cases cmpOpt <;> rfl
 
 private theorem sumToN_header_switch_ge
-    (i : Nat) (cmpOpt : Option Value) :
-    runMirToBinarySwitch 32 sumToNLoopBody (sumToNHeaderState i i cmpOpt) =
+    {fuel : Nat} (i : Nat) (cmpOpt : Option Value) :
+    runMirToBinarySwitch (fuel + 2) sumToNLoopBody (sumToNHeaderState i i cmpOpt) =
       some (false, 0, sumToNBranchState 2 i i ⟨0, 1⟩, sumToNBranchState 3 i i ⟨0, 1⟩) := by
   rw [sumToN_header_switch_raw, nat_ble_eq_true_of_le (Nat.le_refl i)]
   rfl
 
 private theorem sumToN_header_switch_lt
-    {n i : Nat} (cmpOpt : Option Value) (h_lt : i < n) :
-    runMirToBinarySwitch 32 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
+    {fuel n i : Nat} (cmpOpt : Option Value) (h_lt : i < n) :
+    runMirToBinarySwitch (fuel + 2) sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
       some (true, 1, sumToNBranchState 2 n i ⟨1, 1⟩, sumToNBranchState 3 n i ⟨1, 1⟩) := by
   rw [sumToN_header_switch_raw, nat_ble_eq_false_of_lt h_lt]
   rfl
@@ -563,7 +564,7 @@ theorem sumToNLoop_partial_by_coinductive_invariant (n : Nat) (hn : n ≤ 1000) 
   refine dwlp_of_runMirTauToBlock (targetBlock := 1) 7
     (s' := sumToNHeaderState n 0 none) rfl ?_
   refine dwlp_mirTree_while_invariant (ewp := mirDefaultWP) sumToNLoopBody
-    (fun s => ∃ i cmpOpt, i ≤ n ∧ s = sumToNHeaderState n i cmpOpt) 32 (.jump 1) .ret ?_
+    (fun s => ∃ i cmpOpt, i ≤ n ∧ s = sumToNHeaderState n i cmpOpt) 2 (.jump 1) .ret ?_
     ⟨0, none, Nat.zero_le n, rfl⟩
   rintro s ⟨i, cmpOpt, h_le, rfl⟩
   rcases Nat.lt_or_eq_of_le h_le with h_lt | rfl
@@ -775,18 +776,6 @@ private theorem advanceCursorMut_bb0_switch
             advanceCursorMutState 2 c.pos c.len delta (c.pos + delta) cmp) := by
   rw [← wrapU32_add h_add_lt]; rfl
 
-private theorem advanceCursorMut_bb1_join (pos len delta sum : Nat) (cmp : ScalarInt) :
-    evalPlanToJoin advanceCursorMutMirBody (.jump 3 3)
-      (advanceCursorMutState 1 pos len delta sum cmp) =
-      some (advanceCursorMutState 3 sum len delta sum cmp) :=
-  rfl
-
-private theorem advanceCursorMut_bb2_join (pos len delta sum : Nat) (cmp : ScalarInt) :
-    evalPlanToJoin advanceCursorMutMirBody (.jump 3 2)
-      (advanceCursorMutState 2 pos len delta sum cmp) =
-      some (advanceCursorMutState 3 pos len delta sum cmp) :=
-  rfl
-
 private theorem advanceCursorMut_wpTransPlan
     (c : FrameCursor) {delta : Nat} (h_add_lt : c.pos + delta < 4294967296) :
     wpTransPlan mirNoCallWP advanceCursorMutMirBody advanceCursorMutPlan
@@ -802,9 +791,6 @@ private theorem advanceCursorMut_wpTransPlan
       (initMachineStateWithMemory advanceCursorMutMirBody
         [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) := by
   rw [advanceCursorMutPlan, wpTransPlan, advanceCursorMut_bb0_switch c h_add_lt]
-  dsimp only
-  rw [advanceCursorMut_bb1_join, advanceCursorMut_bb2_join]
-  dsimp only [advanceCursorMutState, joinPlanMemConsistent]
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
   rw [wpTransPlan, zipLocalSlots_eq_ite _ (by rfl), not_beq_boolToScalar_zero]
   dsimp only [FrameCursor.advancePure]
