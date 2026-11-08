@@ -1511,10 +1511,18 @@ fn collect_traces_natively(
                 let mut by_fn_o0 = parse_collector_stdout(&run_o0.stdout)?;
                 let mut by_fn_o2 = parse_collector_stdout(&run_o2.stdout)?;
                 let mut chunk_out = CollectedChunkTraces::new();
-                for (staged, _trials) in chunk {
+                for (staged, trials) in chunk {
                     let fn_name = &staged.root_fn_name;
                     let t0 = by_fn_o0.remove(fn_name).unwrap_or_default();
                     let t2 = by_fn_o2.remove(fn_name).unwrap_or_default();
+                    if t0.len() != trials.len() || t2.len() != trials.len() {
+                        return Err(format!(
+                            "trace count mismatch for `{fn_name}`: expected {} trial(s), got -O0={} and -O2={}",
+                            trials.len(),
+                            t0.len(),
+                            t2.len()
+                        ));
+                    }
                     if t0 != t2 {
                         eprintln!(
                             "itree-difftest: `{fn_name}` binary-instrumented traces differed \
@@ -2111,7 +2119,16 @@ pub fn evaluate_itree_batches_with_options(
             |label: &str, chunk: &[BatchTraceEvalCase]| {
                 let src = render_batch_trace_probe_lean_module(&format!("Proof.{label}"), chunk);
                 let stdout = run_itree_lean_module(&verify_dir, &anneal_dir, label, &src)?;
-                Ok(parse_batch_trace_probe_output(&stdout))
+                let parsed = parse_batch_trace_probe_output(&stdout);
+                for c in chunk {
+                    if !parsed.contains_key(&c.case_ident) {
+                        return Err(format!(
+                            "Stage 1 Lean probe module `{label}` omitted output for `{}`",
+                            c.case_ident
+                        ));
+                    }
+                }
+                Ok(parsed)
             },
         );
         for err in &probe_stage.errors {
@@ -2161,20 +2178,20 @@ pub fn evaluate_itree_batches_with_options(
             if mode == "identity" || batch_cases.len() <= ITREE_FULL_CONFIRM_MAX_TRACES {
                 batch_cases.clone()
             } else {
-            let mut selected = Vec::new();
-            let mut confirmed_fns: BTreeSet<String> = BTreeSet::new();
-            for case in &batch_cases {
-                let is_div = case.expected_diag_tag.as_deref() != Some("ok");
-                let fn_name = case_to_fn
-                    .get(&case.case_ident)
-                    .cloned()
-                    .unwrap_or_default();
-                if is_div || confirmed_fns.insert(fn_name) {
-                    selected.push(case.clone());
+                let mut selected = Vec::new();
+                let mut confirmed_fns: BTreeSet<String> = BTreeSet::new();
+                for case in &batch_cases {
+                    let is_div = case.expected_diag_tag.as_deref() != Some("ok");
+                    let fn_name = case_to_fn
+                        .get(&case.case_ident)
+                        .cloned()
+                        .unwrap_or_default();
+                    if is_div || confirmed_fns.insert(fn_name) {
+                        selected.push(case.clone());
+                    }
                 }
-            }
-            selected
-        };
+                selected
+            };
 
         let confirm_chunk_size = options
             .confirm_chunk_size

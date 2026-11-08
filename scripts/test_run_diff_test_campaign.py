@@ -1386,6 +1386,81 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
             self.assertIs(ratchet2.get("baseline_missing"), True)
             self.assertEqual(ratchet2["cumulative_distinct_obs_paths"], 120)
 
+            # Once a subsequent run's union catches up with the recorded floor
+            # (here floor = 6 and the run adds a 6th distinct path), `baseline_missing`
+            # clears immediately on that catch-up run.
+            ratchet2["cumulative_distinct_obs_paths"] = 6
+            (state_dir / "state" / "coverage_ratchet.json").write_text(
+                json.dumps(ratchet2), encoding="utf-8"
+            )
+            ledger2 = read_ledger(state_dir)
+            ledger2["cumulative_distinct_obs_paths"] = 6
+            (state_dir / "state" / "campaign_ledger.json").write_text(
+                json.dumps(ledger2), encoding="utf-8"
+            )
+
+            def fake_run_harness_3(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(
+                        state_dir,
+                        obs_path_signatures=[
+                            "miri:s01_checked_add@AddToSubMutator:pass_vs_pass:agree",
+                            "miri:s04_catchup_path@M10:pass_vs_pass:agree",
+                        ],
+                        mutator_bonus=2,
+                    )
+                return make_healthy_itree_report(state_dir, mutator_bonus=2)
+
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness_3):
+                rc3 = run_main(state_dir)
+            self.assertEqual(rc3, campaign.EXIT_SUCCESS)
+            ratchet3 = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(ratchet3["observed_paths"]), 6)
+            self.assertEqual(ratchet3["cumulative_distinct_obs_paths"], 6)
+            self.assertNotIn("baseline_missing", ratchet3)
+            summary3 = json.loads(
+                (state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertIs(summary3["coverage_ratchet_baseline_missing"], False)
+            report3 = (state_dir / "reports" / "LATEST_REPORT.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("Coverage ratchet warning", report3)
+
+            # Conversely, if `cumulative_distinct_obs_paths` is 0 in both files
+            # while `per_suite_distinct_obs_paths` records a higher per-suite floor
+            # than `observed_paths` contains, `baseline_missing` is still detected.
+            ratchet3["cumulative_distinct_obs_paths"] = 0
+            ratchet3["per_suite_distinct_obs_paths"] = {"miri": 4, "itree": 10}
+            (state_dir / "state" / "coverage_ratchet.json").write_text(
+                json.dumps(ratchet3), encoding="utf-8"
+            )
+            ledger3 = read_ledger(state_dir)
+            ledger3["cumulative_distinct_obs_paths"] = 0
+            (state_dir / "state" / "campaign_ledger.json").write_text(
+                json.dumps(ledger3), encoding="utf-8"
+            )
+
+            def fake_run_harness_4(repo_root, bin_name, harness_args, json_path):
+                healthy_diag(bin_name)
+                if bin_name == "miri-difftest":
+                    return make_healthy_miri_report(state_dir, mutator_bonus=3)
+                return make_healthy_itree_report(state_dir, mutator_bonus=3)
+
+            with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness_4):
+                rc4 = run_main(state_dir)
+            self.assertEqual(rc4, campaign.EXIT_SUCCESS)
+            ratchet4 = json.loads(
+                (state_dir / "state" / "coverage_ratchet.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(ratchet4["cumulative_distinct_obs_paths"], 14)
+            self.assertIs(ratchet4.get("baseline_missing"), True)
+
     def test_new_itree_reasons_count_as_oracle_errors(self) -> None:
         """Trace-collector, `-O0`/`-O2` mismatch, and Lean build drops are oracle errors."""
         with tempfile.TemporaryDirectory() as tmp:

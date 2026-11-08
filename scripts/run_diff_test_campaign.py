@@ -1923,11 +1923,12 @@ def update_coverage_ratchet(
     floor if the ratchet file was lost or truncated.
 
     Returns `(ratchet_path, baseline_missing)`, where `baseline_missing` means the
-    prior `observed_paths` set held fewer paths than the recorded cumulative
-    floor (e.g. the capsule launcher copied only `campaign_ledger.json` into a
-    fresh state directory), so this run's union could not extend the history.
-    The flag is also persisted in the ratchet so consumers never mistake a
-    single-run union for the cumulative set.
+    updated `observed_paths` union still holds fewer paths than the recorded
+    cumulative or per-suite floor (e.g. the capsule launcher copied only
+    `campaign_ledger.json` into a fresh state directory), so this run's union
+    could not extend the history. The flag is also persisted in the ratchet until
+    `observed_paths` catches up with the floor so consumers never mistake a
+    partial union for the full cumulative set.
     """
     ratchet = load_coverage_ratchet(ratchet_path)
     raw_obs = ratchet.get("observed_paths", {})
@@ -1940,18 +1941,6 @@ def update_coverage_ratchet(
         if isinstance(raw_obs, dict)
         else {}
     )
-    prior_floor = max(
-        _safe_nonneg_int(ratchet.get("cumulative_distinct_obs_paths")),
-        _safe_nonneg_int(ledger.get("cumulative_distinct_obs_paths")),
-    )
-    baseline_missing = len(observed_paths) < prior_floor
-    if baseline_missing:
-        sys.stderr.write(
-            f"warning: {ratchet_path} holds {len(observed_paths)} observation paths but the "
-            f"recorded cumulative floor is {prior_floor}; this run cannot extend the "
-            "cumulative set (provide state/coverage_ratchet.json alongside "
-            "state/campaign_ledger.json to accumulate)\n"
-        )
     now_utc = utc_now_iso()
 
     for suite_key, is_healthy, summary, seed_val in (
@@ -2003,6 +1992,17 @@ def update_coverage_ratchet(
         sum(per_suite.values()),
         len(observed_paths),
     )
+
+    baseline_missing = len(observed_paths) < new_total or any(
+        suite_count(k) < per_suite[k] for k in ("miri", "itree")
+    )
+    if baseline_missing:
+        sys.stderr.write(
+            f"warning: {ratchet_path} holds {len(observed_paths)} observation paths but the "
+            f"recorded cumulative floor is {new_total}; this run cannot extend the "
+            "cumulative set (provide state/coverage_ratchet.json alongside "
+            "state/campaign_ledger.json to accumulate)\n"
+        )
 
     updated_ratchet = {
         "schema_version": 1,
