@@ -23,6 +23,7 @@ open Anneal.UnsafeObligations
 open Anneal.SepLogic
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.TraceCheck
+open Anneal.Rustc.V2026_06_01.SymbolicEval (refuteClaimByStrictUB)
 
 /-!
 Worked vertical slices of Rust `Runtime(PostCleanup)` MIR verification over
@@ -107,18 +108,33 @@ private def mkMirBody
   allocations := []
 }
 
-private theorem observe_cofix_tau
-    {step : MirExecState → MirStepNode} {st₁ st₂ : MirExecState}
-    (h : step st₁ = .tau st₂) :
-    (ITree.cofix step st₁).observe = .tau (ITree.cofix step st₂) := by
-  rw [ITree.observe_cofix, h]; rfl
-
-private theorem observe_cofix_vis
-    {step : MirExecState → MirStepNode} {st : MirExecState}
-    {i : MirEffect.I} {k : MirEffect.O i → MirExecState}
-    (h : step st = .vis i k) :
-    (ITree.cofix step st).observe = .vis i (fun o => ITree.cofix step (k o)) := by
-  rw [ITree.observe_cofix, h]; rfl
+/--
+Fuel-free `PureMirConverges` for a call-free, alias-free body whose entry block
+runs its statements and returns. The alias-erased evaluator runs the whole
+block at once (`LiftStmtsTerminator.eval_n`) and `return` hands local `_0` to
+`post`, so callers state neither the statement count nor a step budget; every
+premise is a closed evaluation fact discharged by `rfl`.
+-/
+private theorem pureMirConverges_of_straightLine
+    {body : CapturedMir} {args : List Value} {post : Value → Prop}
+    {stmts : List Statement} {span : String}
+    {env' : Anneal.MirLiftCore.PureEnv} {val : Value}
+    (h_pure : Anneal.PureMirExec.checkPureMir body = true := by rfl)
+    (h_phase : body.phase = .runtimePostCleanup := by rfl)
+    (h_bb : Trusted.Sequence.get? body.basicBlocks 0 =
+      some { statements := stmts, terminator := { kind := .return_, span },
+             isCleanup := false } := by rfl)
+    (h_eval : Anneal.MirLiftCore.evalPureStmtsN body 0 stmts stmts.length 0
+      (Anneal.MirLiftCore.initPureEnv body args) = some env' := by rfl)
+    (h_ret : Trusted.Sequence.get? env' 0 = some (.init val) := by rfl)
+    (h_post : post val := by rfl) :
+    Anneal.PureMirExec.PureMirConverges body (Anneal.PureMirExec.initPureState body args)
+      post :=
+  Anneal.MirLiftCore.lift_PureMirConverges h_pure <|
+    Anneal.MirLiftCore.LiftBlock.of_lookup h_bb <|
+      Anneal.MirLiftCore.LiftStmtsTerminator.eval_n h_bb (.inl h_phase) h_eval <|
+        Anneal.MirLiftCore.LiftStmtsTerminator.term_return h_bb (.inl h_phase)
+          (Nat.zero_add _) h_ret h_post
 
 /-! ## 1. Checked `u32` Addition vs. Unchecked Overflow UB & 2. Boolean Specs -/
 
@@ -146,51 +162,22 @@ def addU32TotalClaim : TotalClaim where
 theorem addU32SafeClaim_verified : VerificationResult addU32SafeClaim := by
   refine Anneal.PureMirExec.verifyMirNoPanic_of_pureExec addU32SafeClaim rfl ?_
   rintro _ rfl
-  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
-  repeat (first
-    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl))
-  rfl
+  exact pureMirConverges_of_straightLine
 
 theorem addU32TotalClaim_verified : TotalVerificationResult addU32TotalClaim := by
   refine Anneal.PureMirExec.verifyTotalMir_of_pureExec addU32TotalClaim rfl
     (fun _ _ h => h.2 ▸ Anneal.PureMirExec.rootActiveMemory_emptyMemory) ?_
   rintro _ _ ⟨rfl, rfl⟩
-  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
-  repeat (first
-    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl))
-  rfl
+  exact pureMirConverges_of_straightLine
 
 def overflowAddU32Claim : Claim where
   body := addU32UncheckedMirBody
   pre args := args = [.scalar ⟨4294967295, 4⟩, .scalar ⟨1, 4⟩]
   post _ _ := True
 
-theorem not_overflowAddU32Claim_holds : ¬ overflowAddU32Claim.holds := by
-  intro h_holds
-  let overflowArgs : List Value := [.scalar ⟨4294967295, 4⟩, .scalar ⟨1, 4⟩]
-  have h_safe := (h_holds overflowArgs rfl).1
-  let step := stepMirState addU32UncheckedMirBody
-  let t := mirCallTree addU32UncheckedMirBody overflowArgs
-  have h_obs : t.observe =
-      ITreeF.vis (E := MirEffect) (.inl (.fail FailureKind.ub))
-        (fun o => ITree.cofix step (PEmpty.elim o)) :=
-    observe_cofix_vis (step := step)
-      (st := .running (initMachineState addU32UncheckedMirBody overflowArgs))
-      (i := .inl (.fail FailureKind.ub)) (k := PEmpty.elim) rfl
-  exact h_safe [] t (.refl t)
-    ⟨t, .inl (.fail FailureKind.ub), _, .refl t, h_obs, trivial⟩
+/-- `u32::MAX + 1` under `AddUnchecked` is UB on the very first step. -/
+theorem not_overflowAddU32Claim_holds : ¬ overflowAddU32Claim.holds :=
+  refuteClaimByStrictUB overflowAddU32Claim 1 _ rfl
 
 theorem example_add_u32_safe_and_total :
     VerificationResult addU32SafeClaim ∧
@@ -210,19 +197,10 @@ def eq42BoolSpecMirBody : CapturedMir :=
        isCleanup := false }]
 
 theorem example_companion_bool_spec_holds :
-    MirBoolPredicateHolds eq42BoolSpecMirBody [.scalar ⟨42, 4⟩] := by
+    MirBoolPredicateHolds eq42BoolSpecMirBody [.scalar ⟨42, 4⟩] :=
   -- `#mir_lift_spec` introduction for a call-free, alias-free companion body.
-  refine Anneal.PureMirExec.mirBoolPredicateHolds_of_pureExec _ _ rfl ?_
-  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
-  repeat (first
-    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl))
-  rfl
+  Anneal.PureMirExec.mirBoolPredicateHolds_of_pureExec _ _ rfl
+    pureMirConverges_of_straightLine
 
 /-! ## 3. Trace-Aware `switchInt` Verification (`TraceVerificationResult`) -/
 
@@ -294,9 +272,7 @@ def reborrowWriteStatefulClaim : StatefulClaim where
 theorem reborrowWriteStatefulClaim_verified :
     StatefulVerificationResult reborrowWriteStatefulClaim := by
   refine verifyStatefulMirFuelFree reborrowWriteStatefulClaim ?_
-  rintro _ _ ⟨rfl, rfl⟩ retVal mem' h_out
-  injection h_out with h_pair; injection h_pair with h_ret h_m
-  subst h_ret h_m
+  rintro _ _ ⟨rfl, rfl⟩ _ _ ⟨⟩
   exact ⟨rfl, rfl⟩
 
 def aliasingViolationMirBody : CapturedMir :=
@@ -323,35 +299,11 @@ def aliasingViolationClaim : Claim where
   pre args := args = []
   post _ _ := True
 
-theorem not_aliasingViolationClaim_holds : ¬ aliasingViolationClaim.holds := by
-  intro h_holds
-  have h_safe := (h_holds [] rfl).1
-  let s₀ := initMachineState aliasingViolationMirBody []
-  let step := stepMirState aliasingViolationMirBody
-  let t₀ := ITree.cofix step (.running s₀)
-  let st₁ := match step (.running s₀) with | .tau x => x | _ => .running s₀
-  let st₂ := match step st₁ with | .tau x => x | _ => .running s₀
-  let st₃ := match step st₂ with | .tau x => x | _ => .running s₀
-  let st₄ := match step st₃ with | .tau x => x | _ => .running s₀
-  let st₅ := match step st₄ with | .tau x => x | _ => .running s₀
-  let st₆ := match step st₅ with | .tau x => x | _ => .running s₀
-  let st₇ := match step st₆ with | .tau x => x | _ => .running s₀
-  have h₁ : t₀.observe = .tau (ITree.cofix step st₁) := observe_cofix_tau rfl
-  have h₂ : (ITree.cofix step st₁).observe = .tau (ITree.cofix step st₂) := observe_cofix_tau rfl
-  have h₃ : (ITree.cofix step st₂).observe = .tau (ITree.cofix step st₃) := observe_cofix_tau rfl
-  have h₄ : (ITree.cofix step st₃).observe = .tau (ITree.cofix step st₄) := observe_cofix_tau rfl
-  have h₅ : (ITree.cofix step st₄).observe = .tau (ITree.cofix step st₅) := observe_cofix_tau rfl
-  have h₆ : (ITree.cofix step st₅).observe = .tau (ITree.cofix step st₆) := observe_cofix_tau rfl
-  have h₇ : (ITree.cofix step st₆).observe = .tau (ITree.cofix step st₇) := observe_cofix_tau rfl
-  have h_tau : TauStar t₀ (ITree.cofix step st₇) :=
-    .step h₁ (.step h₂ (.step h₃ (.step h₄ (.step h₅ (.step h₆ (.step h₇ (.refl _)))))))
-  have h_ub : (ITree.cofix step st₇).observe =
-      ITreeF.vis (E := MirEffect) (.inl (.fail FailureKind.ub))
-        (fun o => ITree.cofix step (PEmpty.elim o)) :=
-    observe_cofix_vis (step := step) (st := st₇)
-      (i := .inl (.fail FailureKind.ub)) (k := PEmpty.elim) rfl
-  exact h_safe [] t₀ (.refl t₀)
-    ⟨ITree.cofix step st₇, .inl (.fail FailureKind.ub), _, h_tau, h_ub, trivial⟩
+/-- The first seven statements step silently; the write through `_2` disables
+its child reborrow `_3`, so the eighth step, reading through `_3`, is Tree
+Borrows UB. -/
+theorem not_aliasingViolationClaim_holds : ¬ aliasingViolationClaim.holds :=
+  refuteClaimByStrictUB aliasingViolationClaim 8 [] rfl
 
 theorem example_tree_borrows_reborrow_and_aliasing_refutation :
     StatefulVerificationResult reborrowWriteStatefulClaim ∧
@@ -422,15 +374,13 @@ theorem infiniteLoopPartialClaim_verified :
   let t₀ := mirCallTree infiniteLoopMirBody []
   refine DWLP.coinduct (fun t _ => t = t₀) ?_ rfl
   rintro t _ rfl
-  have h_obs : t₀.observe = .tau t₀ := by
-    unfold t₀ mirCallTree mirTree; rw [ITree.observe_cofix]; rfl
+  have h_obs : t₀.observe = .tau t₀ := ITree.observe_cofix _ _
   simp only [h_obs]
 
 theorem not_infiniteLoopTotalClaim_holds : ¬ infiniteLoopTotalClaim.holds := by
   intro h_total
   let t₀ := mirStatefulTree infiniteLoopMirBody [] emptyMemory
-  have h_obs : t₀.observe = .tau t₀ := by
-    unfold t₀ mirStatefulTree mirTree; rw [ITree.observe_cofix]; rfl
+  have h_obs : t₀.observe = .tau t₀ := ITree.observe_cofix _ _
   have h_div : Diverges t₀ :=
     Diverges.coinduct (fun x => x = t₀)
       (fun x hx => by subst hx; simp only [h_obs])
@@ -478,58 +428,62 @@ def impureFfiDoubleCallClaim : Claim where
   pre args := args = []
   post _ _ := True
 
-theorem not_impureFfiDoubleCallClaim_holds : ¬ impureFfiDoubleCallClaim.holds := by
-  intro h_holds
-  have h_safe := (h_holds [] rfl).1
-  let s₀ := initMachineState ffiDoubleCallMirBody []
-  let step := stepMirState ffiDoubleCallMirBody
-  let t₀ := ITree.cofix step (.running s₀)
-  let st_a := match step (.running s₀) with | .tau x => x | _ => .running s₀
-  let st_b := match step st_a with | .tau x => x | _ => .running s₀
-  let st_c := match step st_b with | .tau x => x | _ => .running s₀
-  let s_c := match st_c with | .running x => x | _ => s₀
-  have h_ta : t₀.observe = .tau (ITree.cofix step st_a) := observe_cofix_tau rfl
-  have h_tb : (ITree.cofix step st_a).observe = .tau (ITree.cofix step st_b) := observe_cofix_tau rfl
-  have h_tc : (ITree.cofix step st_b).observe = .tau (ITree.cofix step st_c) := observe_cofix_tau rfl
-  let req₁ : MirCallReq := { defPath := "ffi::rand_u32", args := [], memory := s_c.memory }
-  let k₁ : MirCallAns → MirExecState :=
-    resumeExternalCall s_c s_c.frame.locals { local_ := 1, projection := [] } 1 .unreachable
-  have h_vis₁ : (ITree.cofix step st_c).observe =
-      ITreeF.vis (E := MirEffect) (.inr (.inr (.call req₁)))
-        (fun ans => ITree.cofix step (k₁ ans)) :=
-    observe_cofix_vis (step := step) (st := st_c)
-      (i := .inr (.inr (.call req₁))) (k := k₁) rfl
-  let ans₁ : MirCallAns := .returned (.scalar ⟨0, 4⟩) s_c.memory
-  let t₁ := ITree.cofix step (k₁ ans₁)
-  let s₁ := match k₁ ans₁ with | .running x => x | _ => s₀
-  let req₂ : MirCallReq := { defPath := "ffi::rand_u32", args := [], memory := s₁.memory }
-  let k₂ : MirCallAns → MirExecState :=
-    resumeExternalCall s₁ s₁.frame.locals { local_ := 2, projection := [] } 2 .unreachable
-  have h_vis₂ : t₁.observe =
-      ITreeF.vis (E := MirEffect) (.inr (.inr (.call req₂)))
-        (fun ans => ITree.cofix step (k₂ ans)) :=
-    observe_cofix_vis (step := step) (st := k₁ ans₁)
-      (i := .inr (.inr (.call req₂))) (k := k₂) rfl
-  let ans₂ : MirCallAns := .returned (.scalar ⟨1, 4⟩) s₁.memory
-  let t₂ := ITree.cofix step (k₂ ans₂)
-  let st₃ := match step (k₂ ans₂) with | .tau x => x | _ => .running s₀
-  let t₃ := ITree.cofix step st₃
-  have h_tau₂ : t₂.observe = .tau t₃ := observe_cofix_tau rfl
-  have h_ub₃ : t₃.observe =
-      ITreeF.vis (E := MirEffect) (.inl (.fail FailureKind.ub))
-        (fun o => ITree.cofix step (PEmpty.elim o)) :=
-    observe_cofix_vis (step := step) (st := st₃)
-      (i := .inl (.fail FailureKind.ub)) (k := PEmpty.elim) rfl
-  have h_reach :
-      Reaches t₀
-        [Event.mk (E := MirEffect) (.inr (.inr (.call req₁))) ans₁,
-         Event.mk (E := MirEffect) (.inr (.inr (.call req₂))) ans₂]
-        t₂ :=
-    .tau h_ta (.tau h_tb (.tau h_tc
-      (.vis h_vis₁ (fun hf => hf) ans₁
-        (.vis h_vis₂ (fun hf => hf) ans₂ (.refl t₂)))))
-  exact h_safe _ t₂ h_reach
-    ⟨t₃, .inl (.fail FailureKind.ub), _, .step h_tau₂ (.refl t₃), h_ub₃, trivial⟩
+/--
+Bounded strict-UB detector like `reachesStrictUBExecBounded`, except that
+instead of giving up at an external call it answers the `n`-th one by
+returning `answers[n]` with memory unchanged: one schedule of an impure
+environment.
+-/
+private def reachesUBAnswering (body : CapturedMir) :
+    Nat → List Value → MirExecState → Bool
+  | 0, _, _ => false
+  | fuel + 1, answers, st =>
+    match stepMirState body st with
+    | .ret _ => false
+    | .tau st' => reachesUBAnswering body fuel answers st'
+    | .vis (.inl (.fail .ub)) _ => true
+    | .vis (.inl _) _ => false
+    | .vis (.inr (.inl _)) k => reachesUBAnswering body fuel answers (k PUnit.unit)
+    | .vis (.inr (.inr (.call req))) k =>
+      match answers with
+      | [] => false
+      | v :: rest => reachesUBAnswering body fuel rest (k (.returned v req.memory))
+
+/-- UB found by `reachesUBAnswering` is reachable, so the tree is not
+`TreeSafe`. -/
+private theorem reachesUBAnswering_not_treeSafe (body : CapturedMir) (fuel : Nat) :
+    ∀ answers st, reachesUBAnswering body fuel answers st = true →
+      ¬ TreeSafe (ITree.cofix (stepMirState body) st) := by
+  induction fuel with
+  | zero => intro _ _ h; nomatch h
+  | succ fuel ih =>
+    intro answers st h_ub h_safe
+    have h_obs := ITree.observe_cofix (stepMirState body) st
+    unfold reachesUBAnswering at h_ub
+    cases h_step : stepMirState body st with
+    | ret _ => simp only [h_step] at h_ub; nomatch h_ub
+    | tau st' =>
+      simp only [h_step] at h_ub
+      rw [h_step] at h_obs
+      exact ih _ _ h_ub (treeSafe_residual h_safe (.tau h_obs (.refl _)))
+    | vis i k =>
+      rw [h_step] at h_obs
+      rcases i with f | e | ⟨req⟩
+      · exact h_safe [] _ (.refl _) ⟨_, _, _, .refl _, h_obs, trivial⟩
+      · simp only [h_step] at h_ub
+        exact ih _ _ h_ub (treeSafe_residual h_safe (.vis h_obs id PUnit.unit (.refl _)))
+      · cases answers with
+        | nil => simp only [h_step] at h_ub; nomatch h_ub
+        | cons v rest =>
+          simp only [h_step] at h_ub
+          exact ih _ _ h_ub (treeSafe_residual h_safe (.vis h_obs id _ (.refl _)))
+
+/-- After the three `StorageLive`s, the two `ffi::rand_u32` calls may return
+`0` and then `1`, so the `assert` panics with unwind action `unreachable`: UB. -/
+theorem not_impureFfiDoubleCallClaim_holds : ¬ impureFfiDoubleCallClaim.holds :=
+  fun h_holds =>
+    reachesUBAnswering_not_treeSafe ffiDoubleCallMirBody 7
+      [.scalar ⟨0, 4⟩, .scalar ⟨1, 4⟩] _ (by rfl) (h_holds [] rfl).1
 
 def pureConstSevenContract : CallContract MirCallReq (fun _ => MirCallAns) where
   pre req := req.defPath = "ffi::rand_u32" ∧ req.args = []
@@ -545,13 +499,11 @@ theorem pureConstFfiModularClaim_verified :
     (fun args mem => args = [] ∧ mem = emptyMemory)
     (fun _ _ ret _ => ret = .scalar ⟨1, 4⟩) ?_
   rintro _ _ ⟨rfl, rfl⟩
-  refine ⟨⟨rfl, rfl⟩, fun ans₁ h_ans₁ => ?_⟩
-  subst h_ans₁
-  refine ⟨⟨rfl, rfl⟩, fun ans₂ h_ans₂ => ?_⟩
-  subst h_ans₂
-  intro retVal _ h_out
-  injection h_out with h_pair; injection h_pair with h_ret _
-  exact h_ret.symm
+  refine ⟨⟨rfl, rfl⟩, ?_⟩
+  rintro _ rfl
+  refine ⟨⟨rfl, rfl⟩, ?_⟩
+  rintro _ rfl _ _ ⟨⟩
+  rfl
 
 theorem example_impure_ffi_refutation_and_modular_contract :
     ¬ impureFfiDoubleCallClaim.holds ∧
@@ -602,11 +554,9 @@ theorem callerAddTwoModular_verified :
     (fun args mem => args = [.scalar ⟨40, 4⟩] ∧ mem = emptyMemory)
     (fun _ _ ret _ => ret = .scalar ⟨42, 4⟩) ?_
   rintro _ _ ⟨rfl, rfl⟩
-  refine ⟨⟨rfl, rfl, rfl⟩, fun ans h_ans => ?_⟩
-  subst h_ans
-  intro retVal _ h_out
-  injection h_out with h_pair; injection h_pair with h_ret _
-  exact h_ret.symm
+  refine ⟨⟨rfl, rfl, rfl⟩, ?_⟩
+  rintro _ rfl _ _ ⟨⟩
+  rfl
 
 theorem calleeAddOne_satisfies_contract :
     ∀ req : MirCallReq,
@@ -619,17 +569,12 @@ theorem calleeAddOne_satisfies_contract :
   rintro req _ ⟨_, h_args, h_mem⟩
   rw [h_args, h_mem]
   apply (Anneal.MirFuelFree.dwp_of_mirNoCallWpConverges ?_).toDWLP
-  refine Anneal.MirFuelFree.MirNoCallWpConverges.mono ?_ (Anneal.PureMirExec.mirNoCallWpConverges_of_pureExec (post := fun retVal => retVal = .scalar ⟨41, 4⟩) (by rfl) ?_)
-  · intro out h_out
-    cases out with
-    | normal rv => rcases rv with ⟨retVal, mem'⟩; rcases h_out with ⟨rfl, rfl⟩; rfl
-    | panic => exact h_out.elim
-    | abort => exact h_out.elim
-  · apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
-    apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
-    apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-    exact Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
-      (by rfl) rfl
+  refine Anneal.MirFuelFree.MirNoCallWpConverges.mono ?_
+    (Anneal.PureMirExec.mirNoCallWpConverges_of_pureExec
+      (post := fun retVal => retVal = .scalar ⟨41, 4⟩) rfl pureMirConverges_of_straightLine)
+  -- `panic`/`abort` have postcondition `False`; `normal` fixes `mem'` and `ret = 41`.
+  rintro (⟨_, _⟩ | _ | _) ⟨rfl, rfl⟩
+  rfl
 
 def rejectOtherCallsHandler : ExternalCallHandler :=
   fun _ => ITree.fail (E := MirClosedEffect) FailureKind.unsupported
@@ -709,9 +654,7 @@ def unalignSetStatefulClaim : StatefulClaim where
 theorem unalign_set_mir_verified :
     StatefulVerificationResult unalignSetStatefulClaim := by
   refine verifyStatefulMirFuelFree unalignSetStatefulClaim ?_
-  rintro _ _ ⟨oldVal, rfl, rfl⟩ retVal mem' h_out
-  injection h_out with h_pair; injection h_pair with h_ret h_m
-  subst h_ret h_m
+  rintro _ _ ⟨oldVal, rfl, rfl⟩ _ _ ⟨⟩
   refine ⟨rfl,
     ⟨⟨{ tag := 1, targetLocal := 3, targetProjection := [], perm := .active },
       rfl, rfl, rfl⟩, rfl⟩,
@@ -997,16 +940,7 @@ def polySwapPairU32Claim : Claim where
 theorem polySwapPairU32Claim_verified : VerificationResult polySwapPairU32Claim := by
   refine Anneal.PureMirExec.verifyMirNoPanic_of_pureExec polySwapPairU32Claim rfl ?_
   rintro _ rfl
-  apply Anneal.MirLiftCore.lift_PureMirConverges (by rfl)
-  repeat (first
-    | apply Anneal.MirLiftCore.LiftBlock.of_lookup (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.cons_eval (by rfl) (Or.inl rfl) (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_goto (by rfl) (Or.inl rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_switchInt (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl) (by rfl)
-    | apply Anneal.MirLiftCore.LiftStmtsTerminator.term_return (by rfl) (Or.inl rfl) (by rfl)
-        (by rfl))
-  rfl
+  exact pureMirConverges_of_straightLine
 
 @[reducible]
 def defaultBoolTypeLayout : TypeLayout := {
@@ -1384,13 +1318,9 @@ theorem example_signature_predicates_and_polymorphic_obligations :
       polySwapPairU32MirBody
       [.scalar ⟨10, 1⟩, .scalar ⟨20, 4⟩]
       emptyMemory := by
-  set_option linter.unusedSimpArgs false in
   simp [
     emptyMemory,
     TypeLayout.isParamPlaceholder,
-    wrappingRangeContains,
-    primitiveKindByteWidth,
-    scalarLayoutByteWidth,
     alignUp,
     maxNat,
     pow2Nat,
@@ -1398,25 +1328,13 @@ theorem example_signature_predicates_and_polymorphic_obligations :
     Trusted.Sequence.length,
     UintTy.byteWidth,
     UintTy.bitWidth,
-    IntTy.byteWidth,
-    IntTy.bitWidth,
-    FloatTy.byteWidth,
     appendTypeLayouts,
     setTypeLayoutAt,
-    lookupFieldLayouts,
-    computeArbitraryFieldsAux,
-    computeUnionSizeAndAlign,
     computeAggregateBackendRepr,
-    tagScalarByteWidth,
-    recomputeVariantShapesAux,
     TypeLayout.recomputeFromFieldLayouts,
     Trusted.Rustc.V2026_06_01.Layout.substitutePlaceholderEntries,
     Trusted.Rustc.V2026_06_01.Layout.recomputeEntriesWith,
-    LayoutTable.appendParamLayouts,
-    LayoutTable.lookup,
-    TypeSubst.lookup,
     TypeSubst.layouts,
-    TypeSubst.length,
     RigidTy.instantiate,
     RigidTy.instantiateList,
     RigidTy.hasSubstParam,
@@ -1424,65 +1342,10 @@ theorem example_signature_predicates_and_polymorphic_obligations :
     RigidTy.isCompoundSubstParam,
     RigidTy.isTrivialZst,
     RigidTy.computeLayout,
-    RigidTy.computeLayoutList,
-    Trusted.Rustc.V2026_06_01.Layout.LayoutTable.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.LayoutTable.instantiate,
-    Ty.instantiate,
-    ConstOperand.instantiate,
-    TraitRef.instantiate,
-    TraitImplEntry.instantiate,
-    TraitImplEntry.instantiateList,
-    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.instantiateList,
-    Trusted.Rustc.V2026_06_01.MirAst.Place.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.Operand.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.Operand.instantiateList,
-    Trusted.Rustc.V2026_06_01.MirAst.AggregateKind.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.Rvalue.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.StatementKind.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.Statement.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.Statement.instantiateList,
-    Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.Terminator.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.instantiateList,
-    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.instantiate,
-    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.instantiateList,
-    Trusted.Rustc.V2026_06_01.MirAst.appendTys,
-    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.ProjectionElem.collectTysList,
-    Trusted.Rustc.V2026_06_01.MirAst.Place.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.Operand.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.Operand.collectTysList,
-    Trusted.Rustc.V2026_06_01.MirAst.AggregateKind.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.Rvalue.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.NonDivergingIntrinsic.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.StatementKind.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.Statement.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.Statement.collectTysList,
-    Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.Terminator.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.collectTys,
-    Trusted.Rustc.V2026_06_01.MirAst.BasicBlockData.collectTysList,
-    Trusted.Rustc.V2026_06_01.MirAst.LocalDecl.collectTysList,
-    Trusted.Rustc.V2026_06_01.MirAst.collectBodyTys,
     Trusted.Rustc.V2026_06_01.MirAst.hasNonParamTyAtIdx,
     Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamTyAtIdx,
     Trusted.Rustc.V2026_06_01.MirAst.substituteTyParamLayoutsAux,
-    Trusted.Rustc.V2026_06_01.MirAst.recomputeTyCompoundLayoutsAux,
-    Trusted.Rustc.V2026_06_01.MirAst.hasNonParamDeclAtIdx,
-    Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamDeclAtIdx,
-    Trusted.Rustc.V2026_06_01.MirAst.substituteDeclParamLayoutsAux,
-    Trusted.Rustc.V2026_06_01.MirAst.recomputeDeclCompoundLayoutsAux,
-    LayoutTable.instantiateForBody,
-    LayoutTable.instantiateForDecls,
-    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.recomputeMode,
-    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.instantiateForDecl,
-    Trusted.Rustc.V2026_06_01.MirAst.ArgAbi.instantiateListForDecls,
-    Trusted.Rustc.V2026_06_01.MirAst.FnAbi.instantiate,
-    dropGenericParams,
-    CapturedMir.instantiate
+    Trusted.Rustc.V2026_06_01.MirAst.recomputeTyCompoundLayoutsAux
   ] <;> decide
 
 /-! ## 12. Signature Predicates over Capture-Shaped Layout Tables: Pointer Fields, Captured Field Layouts, Unrecorded Pointee Layouts & the Monomorphic Signature Guard -/
@@ -1793,7 +1656,6 @@ theorem example_capture_shaped_signature_predicates :
       (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨23, 0⟩ 8] rcMem ∧
     ¬ argsMatchSignature
       (mkRcBody [rcRefUsercopyTy] rcUsizeTy [rcUsercopyTy]) [.ptr ⟨20, 8⟩ 8] rcMem := by
-  set_option linter.unusedSimpArgs false in
   simp [
     emptyMemory,
     rcMem,
@@ -1845,7 +1707,6 @@ theorem example_dyn_and_extern_reference_signatures :
       [.aggregate 0 [.ptr ⟨20, 0⟩ 8, .scalar ⟨0x5000, 8⟩]] rcMem ∧
     argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨10, 0⟩ 8] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcRefExternTy] rcUsizeTy) [.ptr ⟨99, 0⟩ 8] rcMem := by
-  set_option linter.unusedSimpArgs false in
   simp [
     emptyMemory,
     rcMem,
@@ -1915,14 +1776,12 @@ theorem example_generic_enum_payload_signatures :
       [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨1, 1⟩]] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcTaggedStructBoolTy] rcUsizeTy)
       [.aggregate 0 [.scalar ⟨200, 1⟩, .scalar ⟨2, 1⟩]] rcMem := by
-  set_option linter.unusedSimpArgs false in
   simp [
     emptyMemory,
     rcMem,
     rcLayoutTable,
     mkRcBody,
     rcUsizeTy,
-    rcOptionBoolTy,
     rcTaggedBoolTy,
     rcControlFlowU8BoolTy,
     rcTaggedStructBoolTy,
@@ -1994,7 +1853,6 @@ theorem example_layoutless_fields_and_subplace_borrows :
       [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨1, 8⟩]] rcMem ∧
     ¬ argsMatchSignature (mkRcBody [rcRefSliceUsizeTy] rcUsizeTy)
       [.aggregate 0 [.ptr ⟨27, 0⟩ 8, .scalar ⟨2, 8⟩]] rcMem := by
-  set_option linter.unusedSimpArgs false in
   simp [
     emptyMemory,
     rcMem,
