@@ -7,167 +7,129 @@ import Proof.FxfsPlatformPager.mapped_vmo_as_slice_unfixed
 
 namespace Proof.FxfsPlatformPager.layer_pager_read_unfixed
 
+open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
+open Anneal.MirFuelFree
 open Anneal.Rustc.V2026_06_01.Lower
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-private theorem ble_eq_false_of_lt {a b : Nat} (h : b < a) : Nat.ble a b = false := by
-  cases h_b : Nat.ble a b
-  · rfl
-  · have := Nat.le_of_ble_eq_true h_b
-    omega
+/-- Fuel-free modular step that may cross an external call. `h_step` says
+that the step from `s` satisfies every continuation that holds of `s'`: the
+step meets the call contract, and its only successor (for every call answer
+the contract admits) is `s'`. Convergence from `s'` then gives convergence from
+`s`. -/
+private theorem modularWpConverges_step_to {contract : MirCallContract}
+    {body : CapturedMir} {s s' : MachineState} {post : MirOutcome → Prop}
+    (h_step : ∀ {cont : MirExecState → Prop}, cont (.running s') →
+      evalSymNodeTreeModular contract cont post (stepMirSymTree body s))
+    (h_next : MirModularWpConverges contract body s' post) :
+    MirModularWpConverges contract body s post :=
+  let ⟨n, hn⟩ := h_next
+  ⟨n + 1, h_step hn⟩
 
-set_option maxHeartbeats 2000000 in
-theorem verified : ModularVerificationResult Obligations.FxfsPlatformPager.layer_pager_read_unfixed.modularClaim := by
-  refine verifyModularContractMirSym
-    Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim.callContract
-    Mir.FxfsPlatformPager.layer_pager_read_unfixed.body
-    Specs.FxfsPlatformPager.layer_pager_read_unfixed.pre
-    Specs.FxfsPlatformPager.layer_pager_read_unfixed.post
-    30 ?_
-  intro args mem h_pre
-  rcases h_pre with ⟨mapped_len, pnn, pb, read_offset, read_len, h_ml, h_ro, h_rl, h_pnn, h_pb, rfl, rfl⟩
-  rcases h_pnn with rfl | rfl
-  · conv => whnf
-    intro retVal mem' h_out
-    injection h_out with h_pair
-    injection h_pair with h_ret h_mem
-    subst h_ret h_mem
-    refine ⟨rfl, ?_⟩
-    intro ml' pnn' pb' ro' rl' h_args
-    injection h_args with h1 ht1
-    injection ht1 with h2 ht2
-    injection h2 with hs2
-    cases hs2
-    simp
-  · conv => whnf
-    refine ⟨⟨rfl, mapped_len, pb, h_ml, h_pb, rfl, rfl⟩, ?_⟩
-    rintro _ ⟨retVal, mem', rfl, h_mem', h_ret_fn⟩
-    have h_rv := h_ret_fn mapped_len pb rfl
-    have h_mem_empty : mem' = emptyMemory := h_mem'
-    clear h_ret_fn h_mem'
-    subst h_rv h_mem_empty
-    change wpMirExecModularSym
+/-- Machine state at statement `stmt` of block `bb` with memory untouched.
+Stepping symbolically from one of these explicit states keeps each proof term
+small. -/
+private def stateAt (bb stmt : Nat) (locals : List LocalSlot) : MachineState :=
+  { frame := { blockIdx := bb, stmtIdx := stmt, locals := locals }
+    memory := emptyMemory }
+
+/-- Arguments `(mapped_len, ptr_non_null, pager_backed, read_offset,
+read_len)`. -/
+private abbrev argVals (ml pnn pb ro rl : Nat) : List Value :=
+  [.scalar ⟨ml, 8⟩, .scalar ⟨pnn, 1⟩, .scalar ⟨pb, 1⟩, .scalar ⟨ro, 8⟩, .scalar ⟨rl, 8⟩]
+
+/-- From bb5's `_8 = Sub(copy _6, copy _4)` with
+`read_offset ≤ mapped_len`: the function returns
+`Some(read_offset + read_len)` exactly when
+`read_len ≤ mapped_len - read_offset`. -/
+private theorem bb5_converges (ml pb ro rl : Nat) (h_ml : ml < 18446744073709551616)
+    (h1 : ro ≤ ml) :
+    MirModularWpConverges
       Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim.callContract
-      21
       Mir.FxfsPlatformPager.layer_pager_read_unfixed.body
-      (.running {
-        frame := {
-          blockIdx := 3,
-          stmtIdx := 0,
-          locals := [
-            .uninit,
-            .init (.scalar { bits := mapped_len, sizeBytes := 8 }),
-            .init (.scalar { bits := 1, sizeBytes := 1 }),
-            .init (.scalar { bits := pb, sizeBytes := 1 }),
-            .init (.scalar { bits := read_offset, sizeBytes := 8 }),
-            .init (.scalar { bits := read_len, sizeBytes := 8 }),
-            .init (.scalar { bits := mapped_len, sizeBytes := 8 }),
-            .uninit, .uninit, .uninit, .uninit, .uninit, .uninit
-          ]
-        },
-        memory := emptyMemory
-      })
-      _
-    conv => whnf
-    split
-    · next h_ble1 =>
-      have h_le1 : read_offset ≤ mapped_len := Nat.le_of_ble_eq_true h_ble1
-      conv => whnf
-      split
-      · next h_ble2 =>
-        conv => whnf
-        split
-        · next h_ble3 =>
-          have h_sub_lt : mapped_len - read_offset < 18446744073709551616 := by omega
-          have h_ble3' : Nat.ble read_len (mapped_len - read_offset) = true := by
-            dsimp [wrapScalarBits, scalarModulus, Nat.sub] at h_ble3
-            rw [ble_eq_false_of_lt h_sub_lt] at h_ble3
-            exact h_ble3
-          have h_le2 : read_len ≤ mapped_len - read_offset := Nat.le_of_ble_eq_true h_ble3'
-          conv => whnf
-          split
-          · next h_ble4 =>
-            have h_sum_lt : read_offset + read_len < 18446744073709551616 := by omega
-            have h_nble4 : Nat.ble 18446744073709551616 (read_offset + read_len) = false :=
-              ble_eq_false_of_lt h_sum_lt
-            dsimp [scalarModulus, Nat.add] at h_ble4
-            rw [h_nble4] at h_ble4
-            contradiction
-          · next h_nble4 =>
-            conv => whnf
-            intro retVal' mem'' h_out
-            injection h_out with h_pair
-            injection h_pair with h_ret h_mem
-            subst h_ret h_mem
-            refine ⟨rfl, ?_⟩
-            intro ml' pnn' pb' ro' rl' h_args
-            injection h_args with h1 ht1
-            injection ht1 with h2 ht2
-            injection ht2 with h3 ht3
-            injection ht3 with h4 ht4
-            injection ht4 with h5 _
-            injection h1 with hs1
-            injection h2 with hs2
-            injection h4 with hs4
-            injection h5 with hs5
-            cases hs1; cases hs2; cases hs4; cases hs5
-            have h_ok : read_offset ≤ mapped_len ∧ read_len ≤ mapped_len - read_offset := ⟨h_le1, h_le2⟩
-            simp [h_ok]
-            omega
-        · next h_nble3 =>
-          have h_sub_lt : mapped_len - read_offset < 18446744073709551616 := by omega
-          have h_nble3' : Nat.ble read_len (mapped_len - read_offset) = false := by
-            dsimp [wrapScalarBits, scalarModulus, Nat.sub] at h_nble3
-            rw [ble_eq_false_of_lt h_sub_lt] at h_nble3
-            exact h_nble3
-          have h_gt2 : ¬ read_len ≤ mapped_len - read_offset :=
-            fun h_le => by rw [Nat.ble_eq_true_of_le h_le] at h_nble3'; contradiction
-          conv => whnf
-          intro retVal' mem'' h_out
-          injection h_out with h_pair
-          injection h_pair with h_ret h_mem
-          subst h_ret h_mem
-          refine ⟨rfl, ?_⟩
-          intro ml' pnn' pb' ro' rl' h_args
-          injection h_args with h1 ht1
-          injection ht1 with h2 ht2
-          injection ht2 with h3 ht3
-          injection ht3 with h4 ht4
-          injection ht4 with h5 _
-          injection h1 with hs1
-          injection h2 with hs2
-          injection h4 with hs4
-          injection h5 with hs5
-          cases hs1; cases hs2; cases hs4; cases hs5
-          have h_not : ¬ (read_offset ≤ mapped_len ∧ read_len ≤ mapped_len - read_offset) := by omega
-          simp [h_not]
-      · intro _ _ h; nomatch h
-    · next h_nble1 =>
-      have h_gt1 : ¬ read_offset ≤ mapped_len :=
-        fun h_le => by
-          have h_tr : Nat.ble read_offset mapped_len = true := Nat.ble_eq_true_of_le h_le
-          rw [h_tr] at h_nble1; contradiction
-      conv => whnf
-      intro retVal' mem'' h_out
-      injection h_out with h_pair
-      injection h_pair with h_ret h_mem
-      subst h_ret h_mem
-      refine ⟨rfl, ?_⟩
-      intro ml' pnn' pb' ro' rl' h_args
-      injection h_args with h1 ht1
-      injection ht1 with h2 ht2
-      injection ht2 with h3 ht3
-      injection ht3 with h4 ht4
-      injection ht4 with h5 _
-      injection h1 with hs1
-      injection h2 with hs2
-      injection h4 with hs4
-      injection h5 with hs5
-      cases hs1; cases hs2; cases hs4; cases hs5
-      have h_not : ¬ (read_offset ≤ mapped_len ∧ read_len ≤ mapped_len - read_offset) := by omega
-      simp [h_not]
+      (stateAt 5 2
+        [.uninit, .uninit, .uninit, .uninit, .init (.scalar ⟨ro, 8⟩),
+         .init (.scalar ⟨rl, 8⟩), .init (.scalar ⟨ml, 8⟩), .dead, .uninit, .dead, .dead])
+      (mirSafePost (Specs.FxfsPlatformPager.layer_pager_read_unfixed.post
+        (argVals ml 1 pb ro rl) emptyMemory)) := by
+  -- `read_offset ≤ mapped_len` selects the non-wrapping arm of the
+  -- subtraction.
+  refine MirModularWpConverges.step ?_
+  show (match Nat.ble ro ml with | true => _ | false => _)
+  rw [Nat.ble_eq_true_of_le h1]
+  -- `StorageLive(_9); _9 = Gt(copy _5, copy _8)` branches on
+  -- `read_len ≤ mapped_len - read_offset`.
+  repeat refine MirModularWpConverges.step ?_
+  show (match Nat.ble rl (wrapScalarBits (ml - ro) 18446744073709551616) with
+    | true => _ | false => _)
+  rw [wrapScalarBits_eq_of_lt (by omega)]
+  cases h_le2 : Nat.ble rl (ml - ro)
+  · -- `read_len > mapped_len - read_offset`: bb6 returns `None` through bb8.
+    repeat refine MirModularWpConverges.step ?_
+    refine ⟨rfl, ?_⟩
+    rintro _ _ _ _ _ ⟨⟩
+    have h_gt := Nat.not_le_of_not_ble_eq_true (Bool.ne_true_of_eq_false h_le2)
+    rw [ite_eq_right (by omega)]
+  · -- bb7: `_10 = Add(copy _4, copy _5); _0 = Option::<usize>::Some(copy _10)`;
+    -- bb9: `return`.
+    have h2 := Nat.le_of_ble_eq_true h_le2
+    repeat refine MirModularWpConverges.step ?_
+    refine ⟨rfl, ?_⟩
+    rintro _ _ _ _ _ ⟨⟩
+    rw [ite_eq_left ⟨rfl, h1, h2⟩]
+    -- `read_offset + read_len ≤ mapped_len < 2^64`, so `Add` does not wrap.
+    show Value.aggregate 1 [.scalar ⟨wrapScalarBits (ro + rl) 18446744073709551616, 8⟩] = _
+    rw [wrapScalarBits_eq_of_lt (by omega)]
+
+/-- From bb3's entry, after the call returned `mapped_len` in `_6`. -/
+private theorem bb3_converges (ml pb ro rl : Nat) (h_ml : ml < 18446744073709551616) :
+    MirModularWpConverges
+      Obligations.FxfsPlatformPager.mapped_vmo_as_slice_unfixed.ubExceptionClaim.callContract
+      Mir.FxfsPlatformPager.layer_pager_read_unfixed.body
+      (stateAt 3 0
+        [.uninit, .uninit, .uninit, .uninit, .init (.scalar ⟨ro, 8⟩),
+         .init (.scalar ⟨rl, 8⟩), .init (.scalar ⟨ml, 8⟩), .dead, .dead, .dead, .dead])
+      (mirSafePost (Specs.FxfsPlatformPager.layer_pager_read_unfixed.post
+        (argVals ml 1 pb ro rl) emptyMemory)) := by
+  -- bb3: `StorageLive(_7); _7 = Gt(copy _4, copy _6)` branches on
+  -- `read_offset ≤ mapped_len`.
+  repeat refine MirModularWpConverges.step ?_
+  show (match Nat.ble ro ml with | true => _ | false => _)
+  cases h_le1 : Nat.ble ro ml
+  · -- `read_offset > mapped_len`: bb4 returns `None` through bb8.
+    repeat refine MirModularWpConverges.step ?_
+    refine ⟨rfl, ?_⟩
+    rintro _ _ _ _ _ ⟨⟩
+    have h_gt := Nat.not_le_of_not_ble_eq_true (Bool.ne_true_of_eq_false h_le1)
+    rw [ite_eq_right (by omega)]
+  · -- `switchInt(move _7)` jumps to bb5: `StorageDead(_7); StorageLive(_8)`.
+    repeat (refine MirModularWpConverges.step ?_; change MirModularWpConverges _ _ _ _)
+    exact bb5_converges ml pb ro rl h_ml (Nat.le_of_ble_eq_true h_le1)
+
+theorem verified : ModularVerificationResult Obligations.FxfsPlatformPager.layer_pager_read_unfixed.modularClaim := by
+  refine verifyModularContractMir_of_wpConverges _ _ _ _ ?_
+  rintro _ _ ⟨ml, pnn, pb, ro, rl, h_ml, -, -, h_pnn, h_pb, rfl, rfl⟩
+  rcases h_pnn with rfl | rfl
+  · -- `ptr_non_null = false`: bb0 jumps to bb1, which returns `None`.
+    repeat refine MirModularWpConverges.step ?_
+    refine ⟨rfl, ?_⟩
+    rintro _ _ _ _ _ ⟨⟩
+    rw [ite_eq_right (by omega)]
+  · -- bb0 jumps to bb2: `StorageLive(_6)`, then the call
+    -- `_6 = mapped_vmo_as_slice_unfixed(move _1, move _2, move _3)`. Step only
+    -- while the next state is running, which stops at the call.
+    repeat (refine MirModularWpConverges.step ?_; change MirModularWpConverges _ _ _ _)
+    -- The call meets the callee's contract, and every answer the contract
+    -- admits returns `mapped_len` with memory untouched.
+    refine modularWpConverges_step_to (s' := ?s')
+      (fun hc => ⟨⟨rfl, ml, pb, h_ml, h_pb, rfl, rfl⟩, ?h_ans⟩) ?h_next
+    case h_ans =>
+      rintro _ ⟨_, _, rfl, rfl, h_ret⟩
+      obtain rfl := h_ret ml pb rfl
+      exact hc
+    case h_next => exact bb3_converges ml pb ro rl h_ml
 
 /-- Model witness for `mapped_vmo_as_slice_unfixed` returning `mapped_len`. -/
 def mappedVmoLenModel (args : List Value) (mem : Memory) : Value × Memory :=

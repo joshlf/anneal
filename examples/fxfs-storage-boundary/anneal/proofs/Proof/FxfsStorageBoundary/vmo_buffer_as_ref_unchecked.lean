@@ -6,58 +6,52 @@ import Specs.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked
 
 namespace Proof.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked
 
+open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.Lower
+open Anneal.MirFuelFree
 open Anneal.Rustc.V2026_06_01.SymbolicEval
 
-set_option maxHeartbeats 10000000 in
+/-- A step from `s` that has no successor state (it returns or raises a waived
+UB) converges under the UB-waived semantics with a one-step witness, because
+no leaf of its step tree consults the continuation. -/
+private theorem ubWaivedWpConverges_of_halt
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop}
+    (h : evalSymNodeTreeUbWaived (fun _ => False) post (stepMirSymTree body s)) :
+    MirUbWaivedWpConverges body s post :=
+  ⟨1, h⟩
+
+/-- With `trusted = true`, bb0's `assume` holds, and bb0 returns
+`offset + len` with memory untouched. -/
+private theorem trusted_converges (vs off len : Nat)
+    (h_off : off ≤ vs) (h_len : len ≤ vs - off) (h_vs : vs < 18446744073709551616) :
+    MirWpConverges Mir.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.body
+      (initMachineStateWithMemory Mir.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.body
+        [.scalar ⟨vs, 8⟩, .scalar ⟨off, 8⟩, .scalar ⟨len, 8⟩, .scalar ⟨1, 1⟩] emptyMemory)
+      (mirSafePost (Specs.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.post
+        [.scalar ⟨vs, 8⟩, .scalar ⟨off, 8⟩, .scalar ⟨len, 8⟩, .scalar ⟨1, 1⟩]
+        emptyMemory)) := by
+  refine MirWpConverges.step ?_
+  repeat refine MirExecWpConverges.step ?_
+  refine ⟨rfl, ?_⟩
+  rintro _ _ _ _ ⟨⟩
+  -- `offset + len ≤ vmo_size < 2^64`, so the wrapping `Add` does not wrap.
+  show Value.scalar ⟨wrapScalarBits (off + len) 18446744073709551616, 8⟩ = _
+  rw [wrapScalarBits_eq_of_lt (by omega)]
+
 theorem verified : UbExceptionVerificationResult Obligations.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.ubExceptionClaim := by
-  refine verifyUbExceptionMirSym
-    Obligations.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked.ubExceptionClaim 20 ?_ ?_
-  · intro args mem h_pre h_strict
-    rcases h_pre with ⟨vmo_size, offset, len, t, h_off, h_len, h_vmo, _, rfl, rfl⟩
-    rcases h_strict with ⟨_, _, _, h_eq⟩
-    have ht_bits : t = 1 := by
-      injection h_eq with _ ht1
-      injection ht1 with _ ht2
-      injection ht2 with _ ht3
-      injection ht3 with ht_head _
-      injection ht_head with ht_sc
-      injection ht_sc with ht_b _
-    subst ht_bits
-    (repeat' ((conv => whnf); split))
-    all_goals (conv => whnf)
-    all_goals (dsimp at *; try simp_all; try omega)
-    all_goals (
-      refine ⟨rfl, ?_⟩
-      intro vs' off' l' t' h_args
-      injection h_args with _ ht1
-      injection ht1 with h2 ht2
-      injection ht2 with h3 _
-      injection h2 with hs2
-      injection h3 with hs3
-      cases hs2; cases hs3
-      congr 1; congr 1; omega
-    )
-  · intro args mem h_pre
-    rcases h_pre with ⟨vmo_size, offset, len, t, h_off, h_len, h_vmo, h_t, rfl, rfl⟩
+  refine verifyUbExceptionMir_of_wpConverges _ ?_ ?_
+  · -- Strict-safety domain: `trusted = true`.
+    rintro _ _ ⟨vs, off, len, t, h_off, h_len, h_vs, -, rfl, rfl⟩ ⟨_, _, _, ⟨⟩⟩
+    exact trusted_converges vs off len h_off h_len h_vs
+  · rintro _ _ ⟨vs, off, len, t, h_off, h_len, h_vs, h_t, rfl, rfl⟩
     rcases h_t with rfl | rfl
-    · conv => whnf
-      trivial
-    · (repeat' ((conv => whnf); split))
-      all_goals (conv => whnf)
-      all_goals (dsimp at *; try simp_all; try omega)
-      all_goals (
-        refine ⟨rfl, ?_⟩
-        intro vs' off' l' t' h_args
-        injection h_args with _ ht1
-        injection ht1 with h2 ht2
-        injection ht2 with h3 _
-        injection h2 with hs2
-        injection h3 with hs3
-        cases hs2; cases hs3
-        congr 1; congr 1; omega
-      )
+    · -- `trusted = false`: bb0's `assume` (`copy _4 != false`) fails, which
+      -- raises a waived UB.
+      repeat
+        first
+        | exact ubWaivedWpConverges_of_halt trivial
+        | refine MirUbWaivedWpConverges.step ?_
+    · exact .of_mirWpConverges (trusted_converges vs off len h_off h_len h_vs)
 
 end Proof.FxfsStorageBoundary.vmo_buffer_as_ref_unchecked

@@ -6,29 +6,31 @@ import Specs.FxfsPlatformPager.pager_dirty_batch_split_lengths
 
 namespace Proof.FxfsPlatformPager.pager_dirty_batch_split_lengths
 
-open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
-open Anneal.Rustc.V2026_06_01.SymbolicEval
+open Anneal.PureMirExec
+open Anneal.MirLiftCore
 
-set_option maxHeartbeats 1000000 in
 theorem verified : StatefulVerificationResult Obligations.FxfsPlatformPager.pager_dirty_batch_split_lengths.statefulClaim := by
-  refine verifyStatefulMirNoPanicSym Obligations.FxfsPlatformPager.pager_dirty_batch_split_lengths.statefulClaim 30 ?_
-  intro args mem h_pre
-  rcases h_pre with ⟨⟨rs, re, cs, _, _, h_rs, h_re, h_cs, rfl⟩, rfl⟩
-  rcases h_rs with rfl | rfl <;>
-    rcases h_re with rfl | rfl <;>
-    rcases h_cs with rfl | rfl
-  all_goals (
-    conv => whnf
-    intro rs' re' cs' h_eq
-    injection h_eq with h1 h_t1
-    injection h_t1 with h2 h_t2
-    injection h_t2 with h3 _
-    injection h1 with hs1
-    injection h2 with hs2
-    injection h3 with hs3
-    cases hs1; cases hs2; cases hs3
+  refine verifyStatefulMirNoPanic_of_pureExec _ rfl
+    (fun _ _ h => h.2 ▸ rootActiveMemory_emptyMemory) ?_
+  rintro _ _ ⟨⟨rs, re, cs, -, -, h_rs, h_re, h_cs, rfl⟩, rfl⟩
+  -- `pre` admits eight concrete `(rs, re, cs)` triples. Each run follows the
+  -- branches its inputs select through `goto`s and `switchInt`s until bb9
+  -- returns.
+  rcases h_rs with rfl | rfl <;> rcases h_re with rfl | rfl <;>
+    rcases h_cs with rfl | rfl <;>
+  · apply lift_PureMirConverges rfl
+    repeat
+      apply LiftBlock.of_lookup rfl
+      apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+      first
+      | apply LiftStmtsTerminator.term_goto (by rfl) (Or.inr rfl) (by rfl)
+      | apply LiftStmtsTerminator.term_switchInt (by rfl) (Or.inr rfl) (by rfl) (by rfl) (by rfl)
+    -- bb9: `StorageDead(_8); _0 = (copy _6, move _7); StorageDead(_6); return`
+    apply LiftBlock.of_lookup rfl
+    apply LiftStmtsTerminator.eval_rest (by rfl) (Or.inr rfl) (by rfl)
+    apply LiftStmtsTerminator.term_return (by rfl) (Or.inr rfl) (by rfl) (by rfl)
+    rintro _ _ _ ⟨⟩
     rfl
-  )
 
 end Proof.FxfsPlatformPager.pager_dirty_batch_split_lengths
