@@ -3271,9 +3271,139 @@ def statementOkWithIntrinsics (decls : List MirAst.LocalDecl) (s : MirAst.Statem
     (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
   statementOk decls s layouts || provCastStmtOk decls s layouts
 
+/-! ### Provenance-cast data-flow and aliasing discipline
+
+Anneal's MIR semantics (`trusted/lean/.../MirSemantics/Places.lean`) does not
+model exposure: `PointerExposeProvenance` returns the *encoding*
+`tag * 65536 + offsetBytes` of the pointer's borrow tag, and
+`PointerWithExposedProvenance` decodes any integer back into a pointer with tag
+`n / 65536`. MiniRust instead returns the pointer's address and resolves the
+provenance of `int2ptr` angelically among the exposed provenances. The two
+agree only when an exposed integer is used for nothing but casting it back:
+
+* observing it (`exposeTwice`: `(e2 - e1) as u32` is `65536` in Anneal and `0`
+  in MiniRust) makes the results differ;
+* forging one (`int2ptrForgedTag`: `65536 as *const u32` reads a borrowed
+  local in Anneal but is UB in MiniRust) makes Anneal *more* defined than
+  MiniRust;
+* laundering mutability or pointee type through the integer (`*const u32` →
+  `usize` → `*mut u32`) escapes `ptrRvalueOk`'s `PtrToPtr` rule;
+* and a round-tripped pointer is a tag-sharing copy of the exposed pointer in
+  Anneal, so it must obey the same `ptrAliasingOk` borrow discipline.
+
+`provCastFlowOk` and `ptrAliasingOk (provCastAliasView body)` enforce exactly
+this. -/
+
+/-- Whether some statement of `body` is a provenance cast. -/
+def hasProvCast (body : MirAst.CapturedMir) : Bool :=
+  body.basicBlocks.any fun bb => bb.statements.any isProvCastStmt
+
+/-- The *exposed-address locals*: the root destinations of
+`PointerExposeProvenance` casts. -/
+def exposedIntLocals (body : MirAst.CapturedMir) : List Nat :=
+  body.basicBlocks.flatMap fun bb => bb.statements.filterMap fun s =>
+    match s.kind with
+    | .assign ⟨e, []⟩ (.cast .pointerExposeProvenance _ _) => some e
+    | _ => none
+
+/-- `(mutability, pointee)` of the pointer local read by each
+`PointerExposeProvenance` cast into local `e` (`none` for an operand that is
+not a whole declared pointer local). -/
+def exposeSourcesOf (body : MirAst.CapturedMir) (e : Nat) :
+    List (Option (MirAst.Mutability × Gen.IntType)) :=
+  body.basicBlocks.flatMap fun bb => bb.statements.filterMap fun s =>
+    match s.kind with
+    | .assign ⟨e', []⟩ (.cast .pointerExposeProvenance op _) =>
+      if e' = e then
+        some (match copyOp op with
+          | .copy ⟨p, []⟩ => body.localDecls[p]? >>= (ptrPointeeOf ·.ty)
+          | _ => none)
+      else none
+    | _ => none
+
+/-- The exposed-address local read as a whole (`copy _e` / `move _e`) by a
+`PointerWithExposedProvenance` operand. -/
+def exposedIntOperand (E : List Nat) : MirAst.Operand → Option Nat
+  | .copy ⟨e, []⟩ => if E.contains e then some e else none
+  | .move ⟨e, []⟩ => if E.contains e then some e else none
+  | _ => none
+
+/-- An exposed source pointer may be reconstructed at `(mutbl, pointeeIt)`:
+same pointee, and no `*const`/`&` to `*mut` upgrade (`ptrRvalueOk`'s
+`PtrToPtr` rule). -/
+def exposeSourceCompatible (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType) :
+    Option (MirAst.Mutability × Gen.IntType) → Bool
+  | some (srcMutbl, srcIt) =>
+    decide (srcIt = pointeeIt) && (decide (srcMutbl = .mut) || decide (mutbl = .not))
+  | none => false
+
+/-- Per-statement data flow of exposed-address locals `E`: they are written
+only by `PointerExposeProvenance`, read only (whole) by
+`PointerWithExposedProvenance` at a compatible pointer type, and otherwise only
+storage-cycled; no other statement mentions them. -/
+def provCastStmtFlowOk (body : MirAst.CapturedMir) (E : List Nat) (s : MirAst.Statement) :
+    Bool :=
+  if isProvCastStmt s then
+    match s.kind with
+    | .assign ⟨_, []⟩ (.cast .pointerExposeProvenance op _) =>
+      (opLocals op).all (fun j => !E.contains j)
+    | .assign ⟨q, []⟩ (.cast .pointerWithExposedProvenance op targetTy) =>
+      !E.contains q &&
+      match exposedIntOperand E op, rawPtrPointeeOf targetTy with
+      | some e, some (mutbl, pointeeIt) =>
+        (exposeSourcesOf body e).all (exposeSourceCompatible mutbl pointeeIt)
+      | _, _ => false
+    | _ => false
+  else
+    match s.kind with
+    | .storageLive _ | .storageDead _ => true
+    | _ => (stmtLocals s).all (fun j => !E.contains j)
+
+/-- Data-flow discipline for provenance casts: exposed-address locals are
+temporaries (never `_0` or an argument, so they are neither returned nor
+supplied by the caller), never observed (no arithmetic, comparison, cast,
+branch, or borrow), and every `PointerWithExposedProvenance` operand is one of
+them (no forged integers). Vacuous for bodies without provenance casts. -/
+def provCastFlowOk (body : MirAst.CapturedMir) : Bool :=
+  !hasProvCast body ||
+  (let E := exposedIntLocals body
+   E.all (fun e => decide (body.argCount < e)) &&
+   body.basicBlocks.all (fun bb =>
+     bb.statements.all (provCastStmtFlowOk body E) &&
+     (termLocals bb.terminator).all (fun j => !E.contains j)))
+
+/-- Thin raw pointer type standing in for exposed-address locals in
+`provCastAliasView`. -/
+def provCastAliasTy : MirAst.Ty := { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
+
+/-- A provenance cast seen by the alias analysis as the tag-preserving pointer
+copy it is in Anneal (`_e = copy _p`, `_q = copy _e`). -/
+def provCastAliasStmt (s : MirAst.Statement) : MirAst.Statement :=
+  match s.kind with
+  | .assign dst (.cast .pointerExposeProvenance op _) => { s with kind := .assign dst (.use op) }
+  | .assign dst (.cast .pointerWithExposedProvenance op _) => { s with kind := .assign dst (.use op) }
+  | _ => s
+
+/-- The body as `ptrAliasingOk` must see it: exposed-address locals become
+pointer locals and provenance casts become pointer copies, so a reconstructed
+pointer shares the borrow tag (and `PtrLocalState`) of the exposed one, exactly
+as Anneal's `tag * 65536 + offsetBytes` encoding round-trips the tag. The
+identity on bodies without provenance casts. -/
+def provCastAliasView (body : MirAst.CapturedMir) : MirAst.CapturedMir :=
+  if hasProvCast body then
+    let E := exposedIntLocals body
+    { body with
+      localDecls := body.localDecls.zipIdx.map (fun (d, i) =>
+        if E.contains i then { d with ty := provCastAliasTy } else d)
+      basicBlocks := body.basicBlocks.map (fun bb =>
+        { bb with statements := bb.statements.map provCastAliasStmt }) }
+  else body
+
 /-- Decidable fragment extended with `CastKind::PointerExposeProvenance` and
 `CastKind::PointerWithExposedProvenance` statements lowered via
-`translateFnWithIntrinsics`. -/
+`translateFnWithIntrinsics`, under the provenance-cast data-flow discipline
+`provCastFlowOk` and the borrow discipline `ptrAliasingOk` of
+`provCastAliasView` (which `inFragment` imposes through `ptrAliasingOk`). -/
 def inFragmentWithIntrinsics (body : MirAst.CapturedMir) : Bool :=
   body.isRuntimePostCleanup &&
   decide (body.argCount + 1 ≤ body.localDecls.length) &&
@@ -3289,6 +3419,7 @@ def inFragmentWithIntrinsics (body : MirAst.CapturedMir) : Bool :=
     bb.statements.all (statementOkWithIntrinsics body.localDecls · body.layouts) &&
     terminatorOk body.layouts body.localDecls body.basicBlocks.length bb.terminator) &&
   storageDeadOk body && movesOk body && mentionsOk body &&
+  provCastFlowOk body && ptrAliasingOk (provCastAliasView body) &&
   (translateFnWithIntrinsics body).isSome
 
 /-- Number of `.intrinsic` entries in a `StmtTranslation` list. -/
@@ -3557,18 +3688,118 @@ theorem translateFnWithIntrinsics_of_translateFn {body : MirAst.CapturedMir} {f 
         0 body.basicBlocks.length body.basicBlocks blocks hclean hblks
       simp [translateFnWithIntrinsics, hloc, hbi]
 
+/-- `translateStatement` rejects provenance casts. -/
+theorem translateStatement_not_provCast {decls : List MirAst.LocalDecl} {s : MirAst.Statement}
+    {layouts : Layout.LayoutTable} {st : Gen.Statement}
+    (h : translateStatement decls s layouts = some st) : isProvCastStmt s = false := by
+  obtain ⟨kind, span⟩ := s
+  cases kind with
+  | assign dst rv =>
+    cases rv with
+    | cast ck op ty =>
+      cases ck with
+      | pointerExposeProvenance => simp [translateStatement, translateRvalue, copyRv] at h
+      | pointerWithExposedProvenance => simp [translateStatement, translateRvalue, copyRv] at h
+      | _ => simp [isProvCastStmt]
+    | _ => simp [isProvCastStmt]
+  | _ => simp [isProvCastStmt]
+
+theorem mapM_translateStatement_not_provCast {decls : List MirAst.LocalDecl}
+    {layouts : Layout.LayoutTable} :
+    ∀ (ss : List MirAst.Statement) (stmts : List Gen.Statement),
+      ss.mapM (translateStatement decls · layouts) = some stmts →
+      ∀ s ∈ ss, isProvCastStmt s = false
+  | [], _, _, s, hs => by cases hs
+  | s0 :: ss, _, h, s, hs => by
+    simp only [List.mapM_cons, Option.bind_eq_bind] at h
+    cases h0 : translateStatement decls s0 layouts with
+    | none => simp [h0] at h
+    | some st0 =>
+      simp only [h0, Option.bind_some] at h
+      cases hss : ss.mapM (translateStatement decls · layouts) with
+      | none => simp [hss] at h
+      | some rest =>
+        rcases List.mem_cons.mp hs with rfl | hs'
+        · exact translateStatement_not_provCast h0
+        · exact mapM_translateStatement_not_provCast ss rest hss s hs'
+
+theorem translateBlocks_not_provCast {layouts : Layout.LayoutTable}
+    {decls : List MirAst.LocalDecl} :
+    ∀ (i : Nat) (bbs : List MirAst.BasicBlockData) (blks : List (Gen.BbName × Gen.BasicBlock)),
+      translateBlocks layouts decls i bbs = some blks →
+      ∀ bb ∈ bbs, ∀ s ∈ bb.statements, isProvCastStmt s = false
+  | _, [], _, _, bb, hbb => by cases hbb
+  | i, bb0 :: bbs, _, h, bb, hbb => by
+    simp only [translateBlocks, translateBlock, Option.bind_eq_bind] at h
+    cases hss : bb0.statements.mapM (translateStatement decls · layouts) with
+    | none => simp [hss] at h
+    | some stmts =>
+      simp only [hss, Option.bind_some] at h
+      cases hterm : translateTerminator layouts decls bb0.terminator with
+      | none => simp [hterm] at h
+      | some term =>
+        simp only [hterm, Option.bind_some, Option.pure_def] at h
+        cases hrest : translateBlocks layouts decls (i + 1) bbs with
+        | none => simp [hrest] at h
+        | some restBlks =>
+          rcases List.mem_cons.mp hbb with rfl | hbb'
+          · exact mapM_translateStatement_not_provCast _ stmts hss
+          · exact translateBlocks_not_provCast (i + 1) bbs restBlks hrest bb hbb'
+
+/-- Every body that `translateFn` translates is free of provenance casts. -/
+theorem translateFn_not_hasProvCast {body : MirAst.CapturedMir} {f : Gen.Function}
+    (h : translateFn body = some f) : hasProvCast body = false := by
+  simp only [translateFn, Option.bind_eq_bind] at h
+  cases hloc : translateLocals body.layouts 0 body.localDecls with
+  | none => simp [hloc] at h
+  | some locals =>
+    simp only [hloc, Option.bind_some] at h
+    cases hblks : translateBlocks body.layouts body.localDecls 0 body.basicBlocks with
+    | none => simp [hblks] at h
+    | some blocks =>
+      have hno := translateBlocks_not_provCast 0 body.basicBlocks blocks hblks
+      unfold hasProvCast
+      rw [List.any_eq_false]
+      intro bb hbb hany
+      rw [List.any_eq_true] at hany
+      obtain ⟨s, hs, hp⟩ := hany
+      rw [hno bb hbb s hs] at hp
+      cases hp
+
+/-- `inFragment` bodies contain no provenance cast. In particular every lemma
+whose hypotheses include `inFragment body = true` (such as
+`StateRelNProv.exposed_target_localPtr`) is about bodies that never expose a
+provenance. -/
+theorem inFragment_not_hasProvCast {body : MirAst.CapturedMir} (h : inFragment body = true) :
+    hasProvCast body = false := by
+  simp only [inFragment, Bool.and_eq_true] at h
+  obtain ⟨_, h14⟩ := h
+  obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp h14
+  exact translateFn_not_hasProvCast hf
+
+theorem provCastFlowOk_of_not_hasProvCast {body : MirAst.CapturedMir}
+    (h : hasProvCast body = false) : provCastFlowOk body = true := by
+  simp [provCastFlowOk, h]
+
+theorem provCastAliasView_of_not_hasProvCast {body : MirAst.CapturedMir}
+    (h : hasProvCast body = false) : provCastAliasView body = body := by
+  simp [provCastAliasView, h]
+
 /-- `inFragment` embeds into `inFragmentWithIntrinsics`. -/
 theorem inFragment_implies_inFragmentWithIntrinsics {body : MirAst.CapturedMir}
     (h : inFragment body = true) :
     inFragmentWithIntrinsics body = true := by
+  have hnp := inFragment_not_hasProvCast h
   simp only [inFragment, inFragmentWithIntrinsics, Bool.and_eq_true, List.all_eq_true] at h ⊢
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, h12⟩, _⟩, h14⟩ := h
+  obtain ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, h12⟩, h13⟩, h14⟩ := h
   obtain ⟨f, hf⟩ := Option.isSome_iff_exists.mp h14
   have hclean : ∀ bb ∈ body.basicBlocks, bb.isCleanup = false := by
     intro bb hbb
     simpa using (h9 bb hbb).1.1
   have hfi := translateFnWithIntrinsics_of_translateFn hclean hf
-  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, ?_⟩, h10⟩, h11⟩, h12⟩, by simp [hfi]⟩
+  refine ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, ?_⟩, h10⟩, h11⟩, h12⟩,
+    provCastFlowOk_of_not_hasProvCast hnp⟩,
+    by rw [provCastAliasView_of_not_hasProvCast hnp]; exact h13⟩, by simp [hfi]⟩
   intro bb hbb
   obtain ⟨⟨hc, hst⟩, htm⟩ := h9 bb hbb
   exact ⟨⟨hc, fun s hs => by simp [statementOkWithIntrinsics, hst s hs]⟩, htm⟩

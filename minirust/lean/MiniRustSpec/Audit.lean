@@ -14,6 +14,8 @@ import MiniRustSpec.Correspondence.Witness
 import MiniRustSpec.Correspondence.PointerWitness
 import MiniRustSpec.Correspondence.RefWitness
 import MiniRustSpec.Correspondence.TbWitness
+import MiniRustSpec.Correspondence.Provenance
+import MiniRustSpec.Correspondence.ProvenanceWitness
 
 /-!
 # Axiom audit
@@ -3385,7 +3387,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   unitTupleMutRefRoundTrip_translate
   unitTupleMutRefRoundTrip_three_way
 
-open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
+open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
+  MiniRustSpec.Correspondence.ProvenanceWitness in
 #assert_standard_axioms
   translateStmtOrIntrinsic_expose
   translateStmtOrIntrinsic_withExposed
@@ -3453,13 +3456,13 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   StateRelNProv.exposed_target_localPtr
   exposeTwice_translateIntr
   exposeSingleRefMutRoundTrip_inFragmentWithIntrinsics
-  exposeSharedRefWriteUb_inFragmentWithIntrinsics
+  exposeSharedRefWriteUb_notInFragmentWithIntrinsics
   exposeTwoRefMutAngelicUnsupported_inFragmentWithIntrinsics
   int2ptrRawRoundTripOk_inFragmentWithIntrinsics
   int2ptrRawRoundTripOk_translateIntr
   int2ptrRawRoundTripOk_minirust_direct
   int2ptrRawRoundTripOk_tb_direct
-  int2ptrUnexposedDerefUb_inFragmentWithIntrinsics
+  int2ptrUnexposedDerefUb_notInFragmentWithIntrinsics
   int2ptrUnexposedDerefUb_translateIntr
   int2ptrUnexposedDerefUb_minirust_direct
   int2ptrUnexposedDerefUb_tb_direct
@@ -3469,8 +3472,94 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrDeadAllocDerefUb_translateIntr
   int2ptrDeadAllocDerefUb_minirust_direct
   int2ptrDeadAllocDerefUb_tb_direct
+  translateStatement_not_provCast
+  mapM_translateStatement_not_provCast
+  translateBlocks_not_provCast
+  translateFn_not_hasProvCast
+  inFragment_not_hasProvCast
+  provCastFlowOk_of_not_hasProvCast
+  provCastAliasView_of_not_hasProvCast
+  mem_int2ptrCandidates
+  int2ptrCandidates_mem_of
+  int2ptrCandidates_exposed
+  setContains_of_elems_eq_singleton
+  setContains_of_elems_eq_singleton_self
+  int2ptrProvenance_admissible
+  IntPtrCast.int2ptr_admissible
+  int2ptrProvenance_eq_none_iff
+  int2ptrProvenance_error_unsupported
+  IntPtrCast.int2ptr_error_unsupported
+  exposedInBoundsSound_BM
+  mem_tbmExposedInBounds
+  exposedInBoundsSound_TBM
+  int2ptrProvenanceM_admissible
+  int2ptrProvenanceM_admissible_BM
+  int2ptrProvenanceM_admissible_TBM
+  int2ptrProvenanceM_error_unsupported
+  int2ptrProvenanceM_unique
+  int2ptrProvenance_unique_cand
+  int2ptrProvenance_unique
+  checkPtr_ok_some_inv
+  checkPtr_none_error
+  int2ptr_checkPtr_angelic_optimal
+  int2ptr_checkPtr_ub_forced
+  int2ptrCandidates_two_boundary
+  int2ptrProvenance_boundary_unsupported
+  setContains_expose_self_some
+  IntPtrCast.int2ptr_expose_empty_roundtrip
+  int2ptrCandidates_nodup
+  IntPtrCast.int2ptr_of_unique_candidate
+  IntPtrCast.int2ptr_expose_unique_roundtrip
+  int2ptrProvenanceM_tb_two_tags_unsupported
+  inFragmentWithIntrinsics_imp_A1
+  exposeTwice_inFragmentWithIntrinsicsA1
+  exposeTwice_provCastFlowOk_false
+  exposeTwice_notInFragmentWithIntrinsics
+  exposeTwice_intr_minirust_direct
+  exposeTwice_intr_tb_direct
+  exposeTwice_three_way_divergence
+  int2ptrForgedTag_inFragmentWithIntrinsicsA1
+  int2ptrForgedTag_notInFragmentWithIntrinsics
+  int2ptrForgedTag_anneal_ret
+  int2ptrForgedTag_minirust_direct
+  int2ptrForgedTag_tb_direct
+  int2ptrForgedTag_three_way_divergence
+  directWrite_inFragmentWithIntrinsicsA1
+  directWrite_notInFragmentWithIntrinsics
+  directWrite_A1_divergence
+  exposeSharedRefWriteUb_inFragmentWithIntrinsicsA1
+  exposeSharedRefWriteUb_A1_divergence
+  int2ptrRawRoundTripOk_anneal_ret
+  int2ptrRoundTripOk_three_way
+  int2ptrUnexposedDerefUb_anneal_ub
+  int2ptrUnexposedUb_three_way
+  int2ptrAdjacentArgsAmbiguous_inFragmentWithIntrinsics
+  int2ptrAdjacentArgsAmbiguous_anneal_ret
+  int2ptrAdjacentArgsAmbiguous_minirust_direct
+  int2ptrAdjacentArgsAmbiguous_tb_direct
+  int2ptrAdjacentArgsAmbiguous_spaced_minirust_direct
+  int2ptrAdjacentArgsAmbiguous_spaced_tb_direct
+  int2ptrAmbiguityUnsupported_three_way
+  int2ptrAfterStorageDeadUb_translateIntr
+  int2ptrAfterStorageDeadUb_notInFragmentWithIntrinsics
+  int2ptrAfterStorageDeadUb_anneal_ub
+  int2ptrAfterStorageDeadUb_minirust_direct
+  int2ptrAfterStorageDeadUb_tb_direct
+  int2ptrDeadAllocUb_three_way
+  int2ptrDeadAllocDerefUb_notInFragmentWithIntrinsics
+  int2ptrDeadAllocDerefUb_inFragmentWithIntrinsicsA1
+  int2ptrDeadAllocDerefUb_anneal_ub
+  int2ptrDeadAllocDerefUb_three_way
+  int2ptrMultiAllocBoundaryUnsupported_notInFragmentWithIntrinsics
+  int2ptrMultiAllocBoundaryUnsupported_anneal_ub
+  int2ptrMultiAllocBoundaryUnsupported_three_way
+  exposedAllLive_of_provenanceRel
+  int2ptrDeadAllocDerefUb_exposed_dead
+  int2ptrDeadAllocDerefUb_provenanceRel_fails
+  int2ptrAfterStorageDeadTwoExposed_three_way
 
-open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
+open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
+  MiniRustSpec.Correspondence.ProvenanceWitness in
 #check_theorem_deps "[PROV-AUDIT]"
   translateStmtOrIntrinsic_expose
   translateStmtOrIntrinsic_withExposed
@@ -3538,13 +3627,13 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   StateRelNProv.exposed_target_localPtr
   exposeTwice_translateIntr
   exposeSingleRefMutRoundTrip_inFragmentWithIntrinsics
-  exposeSharedRefWriteUb_inFragmentWithIntrinsics
+  exposeSharedRefWriteUb_notInFragmentWithIntrinsics
   exposeTwoRefMutAngelicUnsupported_inFragmentWithIntrinsics
   int2ptrRawRoundTripOk_inFragmentWithIntrinsics
   int2ptrRawRoundTripOk_translateIntr
   int2ptrRawRoundTripOk_minirust_direct
   int2ptrRawRoundTripOk_tb_direct
-  int2ptrUnexposedDerefUb_inFragmentWithIntrinsics
+  int2ptrUnexposedDerefUb_notInFragmentWithIntrinsics
   int2ptrUnexposedDerefUb_translateIntr
   int2ptrUnexposedDerefUb_minirust_direct
   int2ptrUnexposedDerefUb_tb_direct
@@ -3554,6 +3643,91 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   int2ptrDeadAllocDerefUb_translateIntr
   int2ptrDeadAllocDerefUb_minirust_direct
   int2ptrDeadAllocDerefUb_tb_direct
+  translateStatement_not_provCast
+  mapM_translateStatement_not_provCast
+  translateBlocks_not_provCast
+  translateFn_not_hasProvCast
+  inFragment_not_hasProvCast
+  provCastFlowOk_of_not_hasProvCast
+  provCastAliasView_of_not_hasProvCast
+  mem_int2ptrCandidates
+  int2ptrCandidates_mem_of
+  int2ptrCandidates_exposed
+  setContains_of_elems_eq_singleton
+  setContains_of_elems_eq_singleton_self
+  int2ptrProvenance_admissible
+  IntPtrCast.int2ptr_admissible
+  int2ptrProvenance_eq_none_iff
+  int2ptrProvenance_error_unsupported
+  IntPtrCast.int2ptr_error_unsupported
+  exposedInBoundsSound_BM
+  mem_tbmExposedInBounds
+  exposedInBoundsSound_TBM
+  int2ptrProvenanceM_admissible
+  int2ptrProvenanceM_admissible_BM
+  int2ptrProvenanceM_admissible_TBM
+  int2ptrProvenanceM_error_unsupported
+  int2ptrProvenanceM_unique
+  int2ptrProvenance_unique_cand
+  int2ptrProvenance_unique
+  checkPtr_ok_some_inv
+  checkPtr_none_error
+  int2ptr_checkPtr_angelic_optimal
+  int2ptr_checkPtr_ub_forced
+  int2ptrCandidates_two_boundary
+  int2ptrProvenance_boundary_unsupported
+  setContains_expose_self_some
+  IntPtrCast.int2ptr_expose_empty_roundtrip
+  int2ptrCandidates_nodup
+  IntPtrCast.int2ptr_of_unique_candidate
+  IntPtrCast.int2ptr_expose_unique_roundtrip
+  int2ptrProvenanceM_tb_two_tags_unsupported
+  inFragmentWithIntrinsics_imp_A1
+  exposeTwice_inFragmentWithIntrinsicsA1
+  exposeTwice_provCastFlowOk_false
+  exposeTwice_notInFragmentWithIntrinsics
+  exposeTwice_intr_minirust_direct
+  exposeTwice_intr_tb_direct
+  exposeTwice_three_way_divergence
+  int2ptrForgedTag_inFragmentWithIntrinsicsA1
+  int2ptrForgedTag_notInFragmentWithIntrinsics
+  int2ptrForgedTag_anneal_ret
+  int2ptrForgedTag_minirust_direct
+  int2ptrForgedTag_tb_direct
+  int2ptrForgedTag_three_way_divergence
+  directWrite_inFragmentWithIntrinsicsA1
+  directWrite_notInFragmentWithIntrinsics
+  directWrite_A1_divergence
+  exposeSharedRefWriteUb_inFragmentWithIntrinsicsA1
+  exposeSharedRefWriteUb_A1_divergence
+  int2ptrRawRoundTripOk_anneal_ret
+  int2ptrRoundTripOk_three_way
+  int2ptrUnexposedDerefUb_anneal_ub
+  int2ptrUnexposedUb_three_way
+  int2ptrAdjacentArgsAmbiguous_inFragmentWithIntrinsics
+  int2ptrAdjacentArgsAmbiguous_anneal_ret
+  int2ptrAdjacentArgsAmbiguous_minirust_direct
+  int2ptrAdjacentArgsAmbiguous_tb_direct
+  int2ptrAdjacentArgsAmbiguous_spaced_minirust_direct
+  int2ptrAdjacentArgsAmbiguous_spaced_tb_direct
+  int2ptrAmbiguityUnsupported_three_way
+  int2ptrAfterStorageDeadUb_translateIntr
+  int2ptrAfterStorageDeadUb_notInFragmentWithIntrinsics
+  int2ptrAfterStorageDeadUb_anneal_ub
+  int2ptrAfterStorageDeadUb_minirust_direct
+  int2ptrAfterStorageDeadUb_tb_direct
+  int2ptrDeadAllocUb_three_way
+  int2ptrDeadAllocDerefUb_notInFragmentWithIntrinsics
+  int2ptrDeadAllocDerefUb_inFragmentWithIntrinsicsA1
+  int2ptrDeadAllocDerefUb_anneal_ub
+  int2ptrDeadAllocDerefUb_three_way
+  int2ptrMultiAllocBoundaryUnsupported_notInFragmentWithIntrinsics
+  int2ptrMultiAllocBoundaryUnsupported_anneal_ub
+  int2ptrMultiAllocBoundaryUnsupported_three_way
+  exposedAllLive_of_provenanceRel
+  int2ptrDeadAllocDerefUb_exposed_dead
+  int2ptrDeadAllocDerefUb_provenanceRel_fails
+  int2ptrAfterStorageDeadTwoExposed_three_way
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

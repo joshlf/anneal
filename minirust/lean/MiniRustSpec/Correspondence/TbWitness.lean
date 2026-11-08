@@ -1598,8 +1598,11 @@ theorem exposeTwice_translateIntr :
 theorem exposeSingleRefMutRoundTrip_inFragmentWithIntrinsics :
     inFragmentWithIntrinsics exposeSingleRefMutRoundTrip = true := by decide +kernel
 
-theorem exposeSharedRefWriteUb_inFragmentWithIntrinsics :
-    inFragmentWithIntrinsics exposeSharedRefWriteUb = true := by decide +kernel
+/-- Reconstructing `*mut u32` from the exposed address of a `*const u32` launders
+mutability through the integer, which `provCastFlowOk` rejects
+(`exposeSourceCompatible`, mirroring `ptrRvalueOk`'s `PtrToPtr` rule). -/
+theorem exposeSharedRefWriteUb_notInFragmentWithIntrinsics :
+    inFragmentWithIntrinsics exposeSharedRefWriteUb = false := by decide +kernel
 
 theorem exposeTwoRefMutAngelicUnsupported_inFragmentWithIntrinsics :
     inFragmentWithIntrinsics exposeTwoRefMutAngelicUnsupported = true := by decide +kernel
@@ -1646,8 +1649,10 @@ def int2ptrUnexposedDerefUb : CapturedMir :=
      .assign (local_ 3) (.cast .pointerWithExposedProvenance (.copy (local_ 2)) ptrConstU32Ty),
      .assign (local_ 0) (.use (.copy (derefPlace 3)))]
 
-theorem int2ptrUnexposedDerefUb_inFragmentWithIntrinsics :
-    inFragmentWithIntrinsics int2ptrUnexposedDerefUb = true := by decide +kernel
+/-- The forged address `256` is not an exposed-address local, so `provCastFlowOk`
+rejects the body (Anneal decodes any integer into a tag, see `int2ptrForgedTag`). -/
+theorem int2ptrUnexposedDerefUb_notInFragmentWithIntrinsics :
+    inFragmentWithIntrinsics int2ptrUnexposedDerefUb = false := by decide +kernel
 
 theorem int2ptrUnexposedDerefUb_translateIntr :
     (translateFnWithIntrinsics int2ptrUnexposedDerefUb).isSome = true := by decide +kernel

@@ -181,11 +181,15 @@ misaligned pointer UB), `UnOp::GetThinPointer`, `BinOp::PtrOffset` with both
 `Constant::PointerWithoutProvenance`, and `Terminator::Intrinsic` for
 `IntrinsicOp::{PointerExposeProvenance, PointerWithExposedProvenance}` with
 `IntPtrCast::{expose, int2ptr}` (`spec/mem/intptrcast.md`). `int2ptr` predicts
-a provenance with the angelic choice `predict`; the interpretation picks the
-exposed live allocation whose address range (one-past-the-end included)
-contains the address, returns no provenance when there is none, and reports
-`Stop.unsupported` when several allocations qualify (`int2ptrProvenance`), so
-its successful runs are runs of the spec.
+a provenance with the angelic choice `predict`; the interpretation
+(`int2ptrProvenance`) returns no provenance when nothing is exposed, the exposed
+provenance when exactly one is exposed, and otherwise the unique exposed live
+allocation whose address range (one-past-the-end included) contains the
+address, reporting `Stop.unsupported` when none or several qualify. Its
+successful runs are runs of the spec (`int2ptrProvenance_admissible`), it never
+fabricates UB (`int2ptrProvenance_error_unsupported`), and UB on the
+reconstructed pointer's first access is UB for every admissible choice
+(`int2ptr_checkPtr_ub_forced`; see `Correspondence/Provenance.lean`).
 `BasicMemory::allocate` picks the address with the daemonic choice `pick`,
 which never has a unique solution; the interpretation commits to one valid
 resolution (`BM.pickAddr`): the first multiple of `2^32` in `[2^32, 2^64)`
@@ -912,8 +916,48 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   `Unprot` permissions on the dead allocation after `release_protector`'s early
   `!allocation.live` return).
 
+`Correspondence/Provenance.lean` proves the angelic `IntPtrCast::int2ptr`
+resolution sound and characterizes where it stops: every predicted provenance is
+admissible for `predict` (`int2ptrProvenance_admissible`,
+`int2ptrProvenanceM_admissible` for both `BM` and `TBM`), `None` is predicted
+exactly when nothing is exposed (`int2ptrProvenance_eq_none_iff`), the
+prediction fails only with `Stop.unsupported`
+(`int2ptrProvenance_error_unsupported`), any exposed live allocation containing
+the address is the predicted one (`int2ptrProvenanceM_unique`), if any
+admissible provenance passes `BasicMemory::check_ptr` the predicted pointer does
+too (`int2ptr_checkPtr_angelic_optimal`, `int2ptr_checkPtr_ub_forced`), two
+distinct candidates arise exactly where one live exposed allocation ends and
+another begins (`int2ptrCandidates_two_boundary`,
+`int2ptrProvenance_boundary_unsupported`), exposing and casting back round-trips
+(`IntPtrCast.int2ptr_expose_empty_roundtrip`,
+`IntPtrCast.int2ptr_expose_unique_roundtrip`), and two exposed Tree Borrows tags
+of one allocation always stop (`int2ptrProvenanceM_tb_two_tags_unsupported`).
+
+`inFragmentWithIntrinsics` (`Translate.lean`) admits `PointerExposeProvenance`
+and `PointerWithExposedProvenance` casts lowered by `translateFnWithIntrinsics`
+under `provCastFlowOk` (exposed-address locals are non-argument temporaries,
+written only by `PointerExposeProvenance`, read only by
+`PointerWithExposedProvenance` at the exposed pointer's pointee and without
+adding mutability, and never otherwise observed; no forged addresses) and
+`ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
+pointer copy, as in Anneal's `tag * 65536 + offsetBytes` encoding).
+`Correspondence/ProvenanceWitness.lean` records why: the extended fragment
+without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`
+(Anneal `65536` vs. `0` on `Mach` and `MachTB`), `int2ptrForgedTag` (Anneal
+returns `5` from the forged address `65536` while both MiniRust machines raise
+UB), `directWrite`, and `exposeSharedRefWriteUb`, all rejected now; and it runs
+the brief's suite across all three semantics: `int2ptrRoundTripOk_three_way`
+(`77`), `int2ptrUnexposedUb_three_way`, `int2ptrAmbiguityUnsupported_three_way`
+(two adjacent exposed arguments under `ctxAdj`: Anneal `9`, `Stop.unsupported`
+on `Mach` and `MachTB`; `9` everywhere when the arguments are apart), and
+`int2ptrDeadAllocUb_three_way` (the cast after `StorageDead`), plus
+`int2ptrDeadAllocDerefUb_provenanceRel_fails` (Pass A1's `ProvenanceRel` fails
+after `StorageDead` of an exposed temporary) and
+`int2ptrAfterStorageDeadTwoExposed_three_way` (`Stop.unsupported` although every
+admissible provenance faults).
+
 `Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, `[WITNESS-AUDIT]`,
-`[POINTER-AUDIT]`, `[REF-AUDIT]`, and `[TB-AUDIT]` lines ending in
+`[POINTER-AUDIT]`, `[REF-AUDIT]`, `[TB-AUDIT]`, and `[PROV-AUDIT]` lines ending in
 `sorry_free=true` (via `#check_theorem_deps`, which also rejects duplicate
 declaration names and non-`theorem` constants) and fails the build if any listed
 declaration (or any declaration in any `MiniRustSpec.*` module via
@@ -1103,6 +1147,14 @@ These are deliberate and are the first things to lift:
     `TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
     `treeBorrowsWeakBoxDeallocAndDeadRelease` vs.
     `TreeBorrowsMemory.end_call_wfLive`).
+* **Provenance casts have no simulation theorem yet.** `inFragmentWithIntrinsics`
+  bodies are not covered by `step_correspondence_N`: Anneal stores
+  `tag * 65536 + offsetBytes` in an exposed-address local where MiniRust stores
+  the address, so `LocalStorage` needs a pointer-like relation for those locals
+  (`ctxWithBorrows`' `ptrTargets` already maps each tag to its MiniRust address),
+  and `BorrowsOk.target_ptrs`, `StateRelNProv.exposed_target_localPtr` (which
+  assume `inFragment`, and so bodies without any provenance cast,
+  `inFragment_not_hasProvCast`) must be restated for the extended fragment.
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

@@ -25,6 +25,8 @@ import MiniRustSpec.Correspondence.PointerStep
 import MiniRustSpec.Correspondence.PointerWitness
 import MiniRustSpec.Correspondence.RefWitness
 import MiniRustSpec.Correspondence.TbWitness
+import MiniRustSpec.Correspondence.Provenance
+import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Audit
 
 /-!
