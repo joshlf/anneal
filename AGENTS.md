@@ -30,6 +30,8 @@ Apply these rules to all work in this repository:
   follow-up work. Any temporary or exempted `TODO` must cite an issue using
   `TODO(#123):`.
 <!-- TODO-check-enable -->
+- **Prose and explanations:** Use simple, plain-spoken prose without sacrificing
+  precision or accuracy. Apply the writing skills required below.
 - **Prose and comment wrapping:** Wrap prose in code comments and Markdown
   files at 80 columns from the left margin when practical, including any
   comment prefix (`//`, `///`, `//!`, `--`, `/--`, `/-!`). Do not wrap Markdown
