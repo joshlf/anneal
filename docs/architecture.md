@@ -166,9 +166,13 @@ Stage 1 translates each `rustc_middle::mir` construct directly into its
 corresponding constructor in `Trusted/MirAst.lean`:
 
 - **Places and projections (`Place`, `PlaceElem`):** A MIR `Place` is emitted
-  directly as `(LocalId, List PlaceElem)` with `.deref` and `.field idx`
-  projection elements. Stage 1 never pattern-matches projection chains in Rust
-  to synthesize special-case rvalues.
+  directly as `(LocalId, List PlaceElem)` for the supported projection subset
+  (`.deref` and `.field idx`), while `extract_place` fails closed with an
+  explicit compiler diagnostic on not-yet-modeled `ProjectionElem` variants
+  (`Index`, `ConstantIndex`, `Subslice`, `Downcast`, `OpaqueCast`,
+  `UnwrapUnsafeBinder`, and `Subtype`). Stage 1 never pattern-matches projection
+  chains in Rust to synthesize special-case rvalues or silently drop
+  projections.
 - **Operands and rvalues (`Operand`, `Rvalue`):** `Operand::Copy(p)`,
   `Operand::Move(p)`, and `Operand::Constant(...)` map 1-to-1 to
   `Operand.copy`, `Operand.move`, and `Operand.constVal` / `Operand.constParam`.
@@ -389,14 +393,20 @@ and `Trusted/MirSemantics.lean` models the two distinctly:
   arithmetic overflow (`+`, `-`, `*`), division or remainder by zero, and slice
   bounds checks to `TerminatorKind::Assert` (`Terminator.assert`), and lowers
   explicit `panic!` or `assert!` failures to `core::panicking::panic*`
-  (`Terminator.panic`). When `Terminator.assert` evaluates a boolean operand
-  that does not match `expected` (or when `Terminator.panic` executes),
-  `evalMirTerminator` steps to `.terminated .unwind` (only a non-boolean or
-  uninitialized `cond` operand or an out-of-bounds target block is `.failed`).
-  Under Anneal's baseline safety semantics (`PrefixOutcome.isSafe`), clean
-  unwinding is safe, while total-correctness execution lemmas (`ExecNormal`) and
-  compile-time constant admission (`ConstSucceeds` in `MonoAdmitted`) require
-  normal return (`.terminated (.normal ...)`).
+  (`Terminator.panic`). Both constructors record `hasCleanup : Bool` (`true`
+  when `rustc`'s `UnwindAction` is `UnwindAction::Cleanup(_)`). When
+  `Terminator.assert` evaluates a boolean operand that does not match `expected`
+  (or when `Terminator.panic` executes), `evalMirTerminator` steps to
+  `.terminated .unwind` only for a top-level frame without an unwind cleanup
+  edge (`hasCleanup = false` and `s.stack = []`); if an unwind cleanup block
+  (`hasCleanup = true`) or caller frame (`!s.stack.isEmpty`) is present (or if
+  `cond` is non-boolean/uninitialized or `target` is out of bounds),
+  `evalMirTerminator` steps fail-closed to `.failed` so destructor cleanup is
+  never skipped. Under Anneal's baseline safety semantics
+  (`PrefixOutcome.isSafe`), clean top-level unwinding is safe, while
+  total-correctness execution lemmas (`ExecNormal`) and compile-time constant
+  admission (`ConstSucceeds` in `MonoAdmitted`) require normal return
+  (`.terminated (.normal ...)`).
 
 ### Stage 3: In-place lowering and compositional verification (`theory/Anneal/`)
 
@@ -546,11 +556,11 @@ inside `after_analysis`.
 Code that is only safe when `debug_assert!` is active is unsound in release
 builds. Conversely, ordinary Rust arithmetic (`+`, `-`, `*`) emits overflow
 `TerminatorKind::Assert` checks when overflow checks are enabled. To verify
-that functions do not rely on `debug_assert!` while modeling overflow checks
-consistently, `rustc-capture` runs the compiler pipeline across two
-configurations (`-C debug-assertions=on -C overflow-checks=on` vs.
-`-C debug-assertions=off -C overflow-checks=off`) and checks that every
-captured function's rendered `Mir.lean` is identical across both passes.
+that functions do not rely on `debug_assert!` without rejecting ordinary checked
+integer arithmetic, `rustc-capture` holds `-C overflow-checks=on` constant
+across both compiler passes (`-C debug-assertions=on -C overflow-checks=on` vs.
+`-C debug-assertions=off -C overflow-checks=on`) and checks that every captured
+function's rendered `Mir.lean` is identical across both passes.
 
 ### Guarding against post-monomorphization errors (PMEs)
 
@@ -560,8 +570,13 @@ checking can still fail during monomorphization if it evaluates a failing
 `const { ... }` block, triggers an associated-constant panic, or instantiates a
 type whose concrete size exceeds `isize::MAX`.
 
-Anneal closes this post-monomorphization gap with a two-part defense across
-Stage 1 and Stage 2:
+Because Stage 1 fails closed on alignment- and offset-dependent generic
+operations (`NullOp::AlignOf`, `NullOp::OffsetOf`, and raw-pointer alignment
+checks) and admits only `size_of::<T>()` layout queries (`NullOp::SizeOf`) over
+generic type parameters, a monomorphization's layout environment in the current
+`candidate:mir_semantics` fragment is fully determined by its type-parameter
+size assignment `s.tySizes`. Anneal closes the post-monomorphization gap over
+this fragment with a two-part defense across Stage 1 and Stage 2:
 
 1. **Pre-pruning `required_consts` capture and `MonoAdmitted` (`ConstSucceeds`):**
    Even a dead branch such as `if false { const { panic!() } }` can trigger a
