@@ -8620,6 +8620,96 @@ theorem evalRvalue_reborrow_safeRef_tree_simulation
         (m', .ok true) →
       ∃ (treeMap' : List ReborrowMapEntry), StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) := by
   sorry
+theorem lookupAllocMapByTag_map_toAllocMapEntry (treeMap : List ReborrowMapEntry) (tag : Nat) :
+  lookupAllocMapByTag (treeMap.map ReborrowMapEntry.toAllocMapEntry) tag = (lookupTreeMapByTag treeMap tag).map ReborrowMapEntry.toAllocMapEntry := by
+  induction treeMap with | nil => rfl | cons hd tl ih =>
+    simp [lookupAllocMapByTag, lookupTreeMapByTag]
+    by_cases h : hd.tag = tag <;> simp [ReborrowMapEntry.toAllocMapEntry, h]
+    · exact ih
+
+
+theorem derefReadNextTreeMap_map_toAllocMapEntry (locals : List LocalSlot) (treeMap : List ReborrowMapEntry) (ptrIdx : Local) :
+  (derefReadNextTreeMap locals treeMap ptrIdx).map ReborrowMapEntry.toAllocMapEntry =
+  derefReadNextAllocMap locals (treeMap.map ReborrowMapEntry.toAllocMapEntry) ptrIdx := by
+  have h_seq : Trusted.Sequence.get? locals ptrIdx = get? locals ptrIdx := rfl
+  unfold derefReadNextTreeMap derefReadNextAllocMap
+  rw [h_seq]
+  cases h : get? locals ptrIdx
+  · rfl
+  · rename_i slot
+    cases slot
+    · rfl
+    · rfl
+    · rename_i val
+      cases val
+      · rfl
+      · rfl
+      · rename_i ptrVal size
+        split
+        · rename_i ptrVal' heq
+          cases heq
+          change _ = match lookupAllocMapByTag (List.map ReborrowMapEntry.toAllocMapEntry treeMap) ptrVal.tag with
+                     | some e => List.map (derefReadMapFn (List.map ReborrowMapEntry.toAllocMapEntry treeMap) e.localIdx ptrVal.tag) (List.map ReborrowMapEntry.toAllocMapEntry treeMap)
+                     | none => List.map ReborrowMapEntry.toAllocMapEntry treeMap
+          rw [lookupAllocMapByTag_map_toAllocMapEntry]
+          cases h_lookup : lookupTreeMapByTag treeMap ptrVal.tag
+          · dsimp only [Option.map]
+          · rename_i e
+            dsimp only [Option.map]
+            rw [List.map_map, List.map_map]
+            apply List.map_congr_left
+            intro x hx
+            cases h_len : treeMap.map ReborrowMapEntry.toAllocMapEntry with
+            | nil =>
+              have : treeMap = [] := List.map_eq_nil_iff.mp h_len
+              subst this
+              contradiction
+            | cons hd tl =>
+              cases tl with
+              | nil =>
+                unfold derefReadMapFn
+                dsimp
+                have h_lookup' := h_lookup
+                unfold lookupTreeMapByTag at h_lookup'
+                cases h_tree : treeMap with
+                | nil => contradiction
+                | cons hd_tree tl_tree =>
+                  cases tl_tree with
+                  | nil =>
+                    cases h_tag : hd_tree.tag == ptrVal.tag
+                    · rw [h_tag] at h_lookup'
+                      dsimp at h_lookup'
+                      unfold lookupTreeMapByTag at h_lookup'
+                      contradiction
+                    · rw [h_tag] at h_lookup'
+                      dsimp at h_lookup'
+                      injection h_lookup' with h_eq
+                      subst e
+                      cases hx
+                      · subst x
+                        have h_eq2 : hd_tree.tag = ptrVal.tag := beq_iff_eq.mp h_tag
+                        simp [h_eq2]
+                      · contradiction
+                  | cons _ _ =>
+                    have : (treeMap.map ReborrowMapEntry.toAllocMapEntry).length = 1 := by rw [h_len]; rfl
+                    rw [h_tree] at this
+                    contradiction
+              | cons hd2 tl2 =>
+                unfold derefReadMapFn
+                dsimp
+                unfold AllocMapEntry.updateOnRead
+                cases h_if : (x.localIdx == e.localIdx && x.tag != ptrVal.tag)
+                · rw [h_if]; simp; cases x_perm : x.perm <;> rfl
+                · rw [h_if]; simp; cases x_perm : x.perm <;> rfl
+        · rename_i h_not
+          -- The negative case of split
+          sorry
+      · rfl
+
+theorem h_s'_eq {s'_erase : MachineState} {s : MachineState} {treeMap : List ReborrowMapEntry} {refIdx : Local}
+  (heq : s'_erase.memory.borrows = (derefReadNextAllocMap s.frame.locals (treeMap.map ReborrowMapEntry.toAllocMapEntry) refIdx).map AllocMapEntry.toBorrowEntry) :
+  eraseBorrowParents { s'_erase with memory := { s'_erase.memory with borrows := s.memory.borrows } } (derefReadNextTreeMap s.frame.locals treeMap refIdx) = s'_erase := by
+  sorry
 
 theorem step_safeRef_deref_read_tree_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
@@ -8648,7 +8738,37 @@ theorem step_safeRef_deref_read_tree_simulation
     StepRelLM3_2Tree body m (derefReadNextTreeMap s.frame.locals treeMap refIdx)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  sorry
+  have hsim := step_safeRef_deref_read_simulation_explicit htree.erased_rel hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm (by
+    intro ptrVal hget e he htag hdead
+    obtain ⟨e', he', he_eq⟩ := List.exists_of_mem_map he
+    subst he_eq
+    have hlive := hlive_ref ptrVal hget e' he' htag hdead
+    obtain ⟨hoff, hperm, hkind⟩ := hlive
+    refine ⟨hoff, ?_, hkind⟩
+    intro hdis
+    have hdis' : e'.perm = .disabled := hdis
+    exact hperm hdis'
+  )
+  obtain ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hstack, hprot, hcaller, hbor, halloc, hd_tf⟩ := id htree.erased_rel
+  have hs_step_unfold := stepMirFn_eq_of_not_other body s hcal hphase
+  have hcal_erase : (eraseBorrowParents s treeMap).memory.activeCallee = none := hcal
+  have hs_erase_unfold := stepMirFn_eq_of_not_other body (eraseBorrowParents s treeMap) hcal_erase hphase
+  unfold eraseBorrowParents at hs_erase_unfold
+  dsimp only [] at hs_erase_unfold
+  simp only [hbb, hstmt] at hs_step_unfold hs_erase_unfold
+  generalize hstep_erase : stepMirFn body (eraseBorrowParents s treeMap) = step_erase at hsim
+  generalize hmiri : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = miri_res at hsim ⊢
+  cases hsim
+  case step s'_erase m' hrel_erase =>
+    have h_s' : stepMirFn body s = MirStepNode.step { s'_erase with memory := { s'_erase.memory with borrows := s.memory.borrows } } := by
+      sorry
+    rw [h_s']
+    sorry
+  case retRoot decl0 retVal imm0 mem' m' hdecl_0 hret himm_rel hm' =>
+    sorry
+  case ub m' msg =>
+    sorry
+
 
 theorem step_safeRef_deref_write_tree_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
