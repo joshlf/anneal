@@ -8,13 +8,16 @@
 # This file may not be copied, modified, or distributed except according to
 # those terms.
 
-"""Hardware-matched resource wrapper for `lake`, `lean`, and `cargo` commands.
+"""Hardware-matched resource wrapper for `lake`, `lean`, and `cargo` commands,
+plus pre-export fast-forward bundle verification (`--verify-bundle-ff`).
 
-Probes the host's logical CPU count and physical RAM (`MemTotal` and
-`MemAvailable`) at invocation time, partitions threads and memory across the
-active worktree concurrency factor `W`, and executes the target command inside a
-fail-fast OS memory boundary (`MemoryMax` with `MemorySwapMax=0` when `systemd`
-user scopes are available) and a wall-clock timeout.
+Probes the host's logical CPU count, physical RAM (`MemTotal` and
+`MemAvailable`), and cgroup v2 non-reclaimable working set (`anon + shmem` vs
+reclaimable `file` page cache in `memory.stat`) at invocation time, partitions
+threads and memory across the active worktree concurrency factor `W`, and
+executes the target command inside a fail-fast OS memory boundary (`MemoryMax`
+with `MemorySwapMax=0` when `systemd` user scopes are available) and a
+wall-clock timeout.
 
 Why this wrapper exists:
 - Lean 4's `-M <MB>` flag bounds only the internal small-object allocator and
@@ -26,6 +29,14 @@ Why this wrapper exists:
 - Setting `MemorySwapMax=0` alongside `MemoryMax` derived from physical RAM
   forces the kernel cgroup controller to terminate only the runaway `lean`
   scope immediately (`exit 137`) with zero swap thrashing.
+- On Linux cgroup v2 hosts, `memory.current` conflates reclaimable `.olean`
+  `file` page cache with true non-reclaimable heap (`anon + shmem`). Budgeting
+  cgroup headroom via `memory.max - (anon + shmem)` prevents `.olean` file cache
+  from falsely throttling concurrent builds while still throttling when genuine
+  anonymous working-set pressure rises.
+- Pre-export bundle verification (`--verify-bundle-ff` / `--check-unstable-ff`)
+  guards shared integration refs (`refs/heads/unstable`) in x20 Git bundles
+  against accidental non-fast-forward rollbacks.
 """
 
 from __future__ import annotations
@@ -40,22 +51,311 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
-from typing import Iterator
+from typing import Any, Iterator
 
 sys.dont_write_bytecode = True
 
+MIB = 1024 * 1024
+X20_FUSE_PREFIXES: tuple[str, ...] = ("/google/data/rw/", "/google/data/ro/")
+X20_URI_PREFIX = "/x20/"
 
-def probe_host_hardware() -> dict[str, int]:
-    """Returns host logical CPU count and physical memory in MiB."""
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def parse_proc_cgroup_v2(
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> str | None:
+    """Parses `/proc/self/cgroup` for the unified hierarchy `0::<rel_path>` line."""
+    try:
+        if not proc_cgroup_path.is_file():
+            return None
+        raw = proc_cgroup_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("0::"):
+            continue
+        rel = line.split("::", 1)[1].strip()
+        if rel.endswith(" (deleted)"):
+            rel = rel[: -len(" (deleted)")].strip()
+        if not rel or rel == "/":
+            return "/"
+        return "/" + rel.lstrip("/")
+    return None
+
+
+def parse_memory_stat(source: str | Path) -> dict[str, int]:
+    """Parses cgroup v2 `memory.stat` key-value integer pairs (in bytes)."""
+    raw: str
+    if isinstance(source, Path):
+        try:
+            raw = source.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {}
+    elif isinstance(source, str):
+        if "\n" not in source and " " not in source and source.strip():
+            p = Path(source)
+            try:
+                if p.is_file():
+                    raw = p.read_text(encoding="utf-8", errors="replace")
+                else:
+                    raw = source
+            except OSError:
+                raw = source
+        else:
+            raw = source
+    else:
+        return {}
+
+    stats: dict[str, int] = {}
+    for line in raw.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        key, val_str = parts
+        try:
+            val = int(val_str)
+        except ValueError:
+            continue
+        if val >= 0:
+            stats[key] = val
+    return stats
+
+
+def _read_cgroup_int(path: Path) -> int | None:
+    """Reads a finite non-negative integer from a cgroup file, or None for 'max'/missing."""
+    try:
+        if not path.is_file():
+            return None
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    first = raw.split()[0]
+    try:
+        val = int(first)
+    except ValueError:
+        return None
+    return val if val >= 0 else None
+
+
+def _empty_cgroup_info() -> dict[str, Any]:
+    return {
+        "cgroup_v2": False,
+        "cgroup_path": None,
+        "cgroup_anon_mib": None,
+        "cgroup_shmem_mib": None,
+        "cgroup_anon_shmem_mib": None,
+        "cgroup_file_cache_mib": None,
+        "cgroup_current_mib": None,
+        "cgroup_memory_max_mib": None,
+        "cgroup_avail_mib": None,
+    }
+
+
+def _has_cgroup_memory_files(directory: Path) -> bool:
+    try:
+        if not directory.is_dir():
+            return False
+        return any(
+            (directory / name).is_file()
+            for name in ("memory.stat", "memory.current", "memory.max")
+        )
+    except OSError:
+        return False
+
+
+def probe_cgroup_v2_memory(
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> dict[str, Any]:
+    """Probes cgroup v2 `memory.stat` (`anon + shmem` vs `file`) and ancestor `memory.max`."""
+    try:
+        if not cgroup_root.is_dir():
+            return _empty_cgroup_info()
+    except OSError:
+        return _empty_cgroup_info()
+
+    rel_path: str | None = None
+    try:
+        proc_exists = proc_cgroup_path.is_file()
+    except OSError:
+        proc_exists = False
+
+    if proc_exists:
+        rel_path = parse_proc_cgroup_v2(proc_cgroup_path)
+        if rel_path is None:
+            return _empty_cgroup_info()
+    else:
+        # Allow unit tests that pass a custom `cgroup_root` without overriding
+        # `proc_cgroup_path` on non-Linux hosts to probe `cgroup_root` directly.
+        if (
+            proc_cgroup_path == Path("/proc/self/cgroup")
+            and cgroup_root != Path("/sys/fs/cgroup")
+            and _has_cgroup_memory_files(cgroup_root)
+        ):
+            rel_path = "/"
+        else:
+            return _empty_cgroup_info()
+
+    rel_clean = rel_path.lstrip("/")
+    rel_parts = [p for p in Path(rel_clean).parts if p not in ("", ".")]
+    if ".." in rel_parts:
+        return _empty_cgroup_info()
+
+    candidate = cgroup_root.joinpath(*rel_parts) if rel_parts else cgroup_root
+    try:
+        candidate_is_dir = candidate.is_dir()
+    except OSError:
+        candidate_is_dir = False
+
+    if candidate_is_dir and (
+        _has_cgroup_memory_files(candidate)
+        or (candidate / "cgroup.controllers").is_file()
+        or (candidate / "cgroup.procs").is_file()
+    ):
+        leaf_dir = candidate
+        resolved_cgroup_path = "/" + "/".join(rel_parts) if rel_parts else "/"
+    elif rel_parts and _has_cgroup_memory_files(cgroup_root):
+        # Container namespace where `/proc/self/cgroup` reports a host-relative
+        # path while `/sys/fs/cgroup` is already mounted at the container leaf
+        # (or a unit test populating `cgroup_root` directly).
+        leaf_dir = cgroup_root
+        resolved_cgroup_path = "/"
+    else:
+        return _empty_cgroup_info()
+
+    try:
+        root_res = cgroup_root.resolve()
+        curr_res = leaf_dir.resolve()
+    except OSError:
+        return _empty_cgroup_info()
+
+    if curr_res != root_res and root_res not in curr_res.parents:
+        return _empty_cgroup_info()
+
+    levels: list[Path] = []
+    curr = curr_res
+    while True:
+        levels.append(curr)
+        if curr == root_res or curr.parent == curr:
+            break
+        curr = curr.parent
+
+    if not any(_has_cgroup_memory_files(lvl) for lvl in levels):
+        return _empty_cgroup_info()
+
+    leaf_stat: dict[str, int] = {}
+    for lvl in levels:
+        stat_file = lvl / "memory.stat"
+        if stat_file.is_file():
+            parsed = parse_memory_stat(stat_file)
+            if parsed:
+                leaf_stat = parsed
+                break
+
+    leaf_anon_shmem_bytes: int | None = None
+    cgroup_anon_mib: int | None = None
+    cgroup_shmem_mib: int | None = None
+    cgroup_anon_shmem_mib: int | None = None
+    cgroup_file_cache_mib: int | None = None
+
+    if leaf_stat:
+        anon_bytes = leaf_stat.get("anon", 0)
+        shmem_bytes = leaf_stat.get("shmem", 0)
+        file_bytes = leaf_stat.get(
+            "file",
+            leaf_stat.get("inactive_file", 0) + leaf_stat.get("active_file", 0),
+        )
+        leaf_anon_shmem_bytes = anon_bytes + shmem_bytes
+        cgroup_anon_mib = anon_bytes // MIB
+        cgroup_shmem_mib = shmem_bytes // MIB
+        cgroup_anon_shmem_mib = leaf_anon_shmem_bytes // MIB
+        cgroup_file_cache_mib = file_bytes // MIB
+
+    leaf_current_bytes: int | None = None
+    for lvl in levels:
+        cur_val = _read_cgroup_int(lvl / "memory.current")
+        if cur_val is not None:
+            leaf_current_bytes = cur_val
+            break
+    cgroup_current_mib = (
+        (leaf_current_bytes // MIB) if leaf_current_bytes is not None else None
+    )
+
+    min_max_mib: int | None = None
+    min_avail_mib: int | None = None
+
+    for lvl in levels:
+        lvl_max_bytes = _read_cgroup_int(lvl / "memory.max")
+        if lvl_max_bytes is None or lvl_max_bytes <= 0:
+            continue
+        lvl_cur_bytes = _read_cgroup_int(lvl / "memory.current")
+        lvl_stat_path = lvl / "memory.stat"
+        lvl_stat = parse_memory_stat(lvl_stat_path) if lvl_stat_path.is_file() else {}
+
+        if "anon" in lvl_stat or "shmem" in lvl_stat:
+            lvl_used_bytes = lvl_stat.get("anon", 0) + lvl_stat.get("shmem", 0)
+        elif "inactive_file" in lvl_stat and lvl_cur_bytes is not None:
+            lvl_used_bytes = max(0, lvl_cur_bytes - lvl_stat["inactive_file"])
+        elif lvl_cur_bytes is not None:
+            lvl_used_bytes = lvl_cur_bytes
+        elif leaf_anon_shmem_bytes is not None:
+            lvl_used_bytes = leaf_anon_shmem_bytes
+        else:
+            lvl_used_bytes = 0
+
+        lvl_avail_bytes = max(0, lvl_max_bytes - lvl_used_bytes)
+        lvl_max_mib = lvl_max_bytes // MIB
+        lvl_avail_mib = lvl_avail_bytes // MIB
+
+        if min_max_mib is None or lvl_max_mib < min_max_mib:
+            min_max_mib = lvl_max_mib
+        if min_avail_mib is None or lvl_avail_mib < min_avail_mib:
+            min_avail_mib = lvl_avail_mib
+
+    return {
+        "cgroup_v2": True,
+        "cgroup_path": resolved_cgroup_path,
+        "cgroup_anon_mib": cgroup_anon_mib,
+        "cgroup_shmem_mib": cgroup_shmem_mib,
+        "cgroup_anon_shmem_mib": cgroup_anon_shmem_mib,
+        "cgroup_file_cache_mib": cgroup_file_cache_mib,
+        "cgroup_current_mib": cgroup_current_mib,
+        "cgroup_memory_max_mib": min_max_mib,
+        "cgroup_avail_mib": min_avail_mib,
+    }
+
+
+probe_cgroup_v2 = probe_cgroup_v2_memory
+
+
+def probe_host_hardware(
+    meminfo_path: Path = Path("/proc/meminfo"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> dict[str, Any]:
+    """Returns host logical CPU count, physical memory in MiB, and cgroup v2 stats."""
     cpu_cores = os.cpu_count() or 4
     mem_total_mb = 16384
     mem_avail_mb = 12288
 
-    meminfo = Path("/proc/meminfo")
-    if meminfo.is_file():
+    if meminfo_path.is_file():
         try:
-            raw = meminfo.read_text(encoding="utf-8", errors="replace")
+            raw = meminfo_path.read_text(encoding="utf-8", errors="replace")
             kv: dict[str, int] = {}
             for line in raw.splitlines():
                 parts = line.split(":")
@@ -73,7 +373,7 @@ def probe_host_hardware() -> dict[str, int]:
                 mem_avail_mb = kv["MemFree"] + kv.get("Cached", 0)
         except OSError:
             pass
-    elif sys.platform == "darwin":
+    elif sys.platform == "darwin" and meminfo_path == Path("/proc/meminfo"):
         try:
             res = subprocess.run(
                 ["sysctl", "-n", "hw.memsize"],
@@ -83,15 +383,28 @@ def probe_host_hardware() -> dict[str, int]:
                 timeout=2.0,
             )
             if res.returncode == 0 and res.stdout.strip().isdigit():
-                mem_total_mb = int(res.stdout.strip()) // (1024 * 1024)
+                mem_total_mb = int(res.stdout.strip()) // MIB
                 mem_avail_mb = int(mem_total_mb * 0.75)
         except Exception:
             pass
+
+    cg = probe_cgroup_v2_memory(
+        cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path
+    )
+    cg_max_mib = cg.get("cgroup_memory_max_mib")
+    if isinstance(cg_max_mib, int) and cg_max_mib > 0:
+        mem_total_mb = max(1024, min(mem_total_mb, cg_max_mib))
+
+    mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb))
+    cg_avail_mib = cg.get("cgroup_avail_mib")
+    if isinstance(cg_avail_mib, int) and cg_avail_mib >= 0:
+        mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb, cg_avail_mib))
 
     return {
         "cpu_cores": max(1, cpu_cores),
         "mem_total_mb": max(1024, mem_total_mb),
         "mem_avail_mb": max(512, min(mem_total_mb, mem_avail_mb)),
+        **cg,
     }
 
 
@@ -117,17 +430,26 @@ def detect_mode(cmd: list[str], requested_mode: str) -> str:
 
 
 def compute_limits(
-    hw: dict[str, int],
+    hw: dict[str, Any],
     mode: str,
     concurrency: int,
-    override_mem_mb: int | None,
-    override_timeout_sec: int | None,
-) -> dict[str, int | str]:
+    override_mem_mb: int | None = None,
+    override_timeout_sec: int | None = None,
+) -> dict[str, Any]:
     """Computes hardware-matched thread, RAM, and wall-clock limits."""
     w = max(1, concurrency)
-    cpu_cores = hw["cpu_cores"]
-    mem_total_mb = hw["mem_total_mb"]
-    mem_avail_mb = hw["mem_avail_mb"]
+    cpu_cores = max(1, int(hw["cpu_cores"]))
+    mem_total_mb = max(1024, int(hw["mem_total_mb"]))
+    mem_avail_mb = max(512, int(hw["mem_avail_mb"]))
+
+    cg_max_mib = hw.get("cgroup_memory_max_mib")
+    if isinstance(cg_max_mib, int) and cg_max_mib > 0:
+        mem_total_mb = max(1024, min(mem_total_mb, cg_max_mib))
+
+    mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb))
+    cg_avail_mib = hw.get("cgroup_avail_mib")
+    if isinstance(cg_avail_mib, int) and cg_avail_mib >= 0:
+        mem_avail_mb = max(512, min(mem_total_mb, mem_avail_mb, cg_avail_mib))
 
     threads = max(1, cpu_cores // w)
 
@@ -176,7 +498,69 @@ def compute_limits(
         "lean_m_mb": lean_m_mb,
         "timeout_sec": timeout_sec,
         "build_slots": build_slots,
+        "cgroup_v2": bool(hw.get("cgroup_v2", False)),
+        "cgroup_path": hw.get("cgroup_path"),
+        "cgroup_anon_mib": hw.get("cgroup_anon_mib"),
+        "cgroup_shmem_mib": hw.get("cgroup_shmem_mib"),
+        "cgroup_anon_shmem_mib": hw.get("cgroup_anon_shmem_mib"),
+        "cgroup_file_cache_mib": hw.get("cgroup_file_cache_mib"),
+        "cgroup_current_mib": hw.get("cgroup_current_mib"),
+        "cgroup_memory_max_mib": cg_max_mib if isinstance(cg_max_mib, int) else None,
+        "cgroup_avail_mib": cg_avail_mib if isinstance(cg_avail_mib, int) else None,
     }
+
+
+def format_cgroup_probe_line(limits: dict[str, Any]) -> str:
+    """Formats the human-readable `Cgroup v2 Memory` line for `--probe`."""
+    if not limits.get("cgroup_v2"):
+        return "  Cgroup v2 Memory   : unavailable (using /proc/meminfo)"
+    anon_shmem = limits.get("cgroup_anon_shmem_mib")
+    anon = limits.get("cgroup_anon_mib")
+    shmem = limits.get("cgroup_shmem_mib")
+    file_cache = limits.get("cgroup_file_cache_mib")
+    current = limits.get("cgroup_current_mib")
+    cg_max = limits.get("cgroup_memory_max_mib")
+    cg_avail = limits.get("cgroup_avail_mib")
+
+    ws_str = (
+        f"{anon_shmem} MiB (anon={anon} MiB, shmem={shmem} MiB)"
+        if anon_shmem is not None
+        else "n/a"
+    )
+    file_str = f"{file_cache} MiB" if file_cache is not None else "n/a"
+    cur_str = f"{current} MiB" if current is not None else "n/a"
+    if cg_max is not None:
+        max_str = (
+            f"{cg_max} MiB (avail={cg_avail} MiB)"
+            if cg_avail is not None
+            else f"{cg_max} MiB"
+        )
+    else:
+        max_str = "unbounded"
+
+    return (
+        f"  Cgroup v2 Memory   : anon+shmem={ws_str}, "
+        f"file={file_str}, current={cur_str}, memory.max={max_str}"
+    )
+
+
+def format_cgroup_diagnostic_snapshot(
+    cg: dict[str, Any] | None = None,
+) -> str:
+    """Formats a post-mortem cgroup v2 memory snapshot for timeout/OOM stderr diagnostics."""
+    info = cg if cg is not None else probe_cgroup_v2_memory()
+    if not info.get("cgroup_v2"):
+        return ""
+    anon_shmem = info.get("cgroup_anon_shmem_mib")
+    file_cache = info.get("cgroup_file_cache_mib")
+    current = info.get("cgroup_current_mib")
+    cg_max = info.get("cgroup_memory_max_mib")
+    cg_avail = info.get("cgroup_avail_mib")
+    max_str = f"{cg_max}M (avail={cg_avail}M)" if cg_max is not None else "unbounded"
+    return (
+        f"  Cgroup v2 Snapshot : anon+shmem={anon_shmem}M, "
+        f"file={file_cache}M, current={current}M, memory.max={max_str}\n"
+    )
 
 
 def systemd_user_scope_available() -> bool:
@@ -315,7 +699,7 @@ def terminate_process_group(pgid: int, grace_sec: float = 2.0) -> None:
 
 
 def run_bounded_command(
-    cmd: list[str], limits: dict[str, int | str], use_slot_lock: bool
+    cmd: list[str], limits: dict[str, Any], use_slot_lock: bool
 ) -> int:
     """Executes `cmd` inside the computed memory, swap, thread, and time bounds."""
     threads = int(limits["threads"])
@@ -383,10 +767,12 @@ def run_bounded_command(
         except subprocess.TimeoutExpired:
             terminate_process_group(proc.pid)
             proc.wait()
+            cg_snap = format_cgroup_diagnostic_snapshot()
             sys.stderr.write(
                 f"\n[anneal-lean-run] ERROR: Command timed out after "
                 f"{timeout_sec}s (mode={mode}, MemoryMax={memory_max_mb}M, "
                 f"threads={threads}).\n"
+                f"{cg_snap}"
                 "  Remediation: Inspect proof goals interactively with "
                 "`lean_goal` / wildcard `change ... _` "
                 "(`skills/anneal-lsp/SKILL.md`) and apply the kernel "
@@ -401,10 +787,12 @@ def run_bounded_command(
                 terminate_process_group(proc.pid)
 
     if rc in (137, -9):
+        cg_snap = format_cgroup_diagnostic_snapshot()
         sys.stderr.write(
             f"\n[anneal-lean-run] ERROR: Command was terminated by the OS "
             f"memory guard (exit 137, MemoryMax={memory_max_mb}M, "
             f"MemorySwapMax=0, mode={mode}).\n"
+            f"{cg_snap}"
             "  Why: The process exceeded its hardware-matched physical RAM "
             "ceiling and was killed before it could thrash host swap.\n"
             "  Remediation: Avoid unfolding multi-block "
@@ -417,26 +805,729 @@ def run_bounded_command(
     return rc
 
 
+def is_x20_path(bundle_path: str | Path) -> bool:
+    """Returns True if `bundle_path` is an `/x20/` URI or `/google/data/r{w,o}/` path."""
+    s = str(bundle_path).strip()
+    return s.startswith(X20_URI_PREFIX) or any(
+        s.startswith(p) for p in X20_FUSE_PREFIXES
+    )
+
+
+def to_x20_uri(bundle_path: str | Path) -> str:
+    """Translates `/google/data/r{w,o}/...` FUSE paths to `/x20/...` URIs."""
+    s = str(bundle_path).strip()
+    for prefix in X20_FUSE_PREFIXES:
+        if s.startswith(prefix):
+            return X20_URI_PREFIX + s[len(prefix) :]
+    return s
+
+
+def normalize_git_ref(ref: str) -> str:
+    """Normalizes a branch shorthand (e.g. `unstable`) to `refs/heads/<branch>`."""
+    r = ref.strip()
+    if not r:
+        return "refs/heads/unstable"
+    if r == "HEAD" or r.startswith("refs/"):
+        return r
+    if r.startswith(("heads/", "tags/", "remotes/")):
+        return f"refs/{r}"
+    return f"refs/heads/{r}"
+
+
+def _run_git(
+    args: list[str], cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd is not None else None,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _is_x20_not_found_error(output: str) -> bool:
+    lower = output.lower()
+    fatal_markers = (
+        "permission_denied",
+        "permission denied",
+        "deadline_exceeded",
+        "deadline exceeded",
+        "unauthenticated",
+        "unavailable",
+        "internal error",
+    )
+    if any(m in lower for m in fatal_markers):
+        return False
+    not_found_markers = (
+        "no_such_file_or_directory",
+        "no such file or directory",
+        "file not found",
+        "generic::not_found",
+        "not_found:",
+        "code: not_found",
+        "does not exist",
+    )
+    return any(m in lower for m in not_found_markers)
+
+
+@contextmanager
+def stage_bundle_for_verification(
+    bundle_path: str | Path,
+    fileutil_bin: str | None = None,
+) -> Iterator[tuple[str, Path | None, str | None]]:
+    """Safely stages a local or x20 bundle for inspection, cleaning up temporary files."""
+    raw_str = str(bundle_path).strip()
+    if not raw_str:
+        yield ("bundle_error", None, "Empty bundle path")
+        return
+
+    if is_x20_path(raw_str):
+        x20_uri = to_x20_uri(raw_str)
+        eff_fileutil = fileutil_bin
+        if eff_fileutil is None:
+            eff_fileutil = (
+                "/usr/bin/fileutil"
+                if Path("/usr/bin/fileutil").is_file()
+                else shutil.which("fileutil")
+            )
+        if not eff_fileutil:
+            yield (
+                "bundle_error",
+                None,
+                f"fileutil is required to stage x20 bundle {x20_uri} safely without FUSE",
+            )
+            return
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="anneal-bundle-ff-"))
+        try:
+            staged_file = tmpdir / "remote.bundle"
+            try:
+                res = subprocess.run(
+                    [
+                        eff_fileutil,
+                        "--x20_force_client_creation_at_head",
+                        "cp",
+                        "-f",
+                        x20_uri,
+                        str(staged_file),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=120.0,
+                )
+            except Exception as exc:
+                yield (
+                    "bundle_error",
+                    None,
+                    f"Failed executing fileutil for {x20_uri}: {exc}",
+                )
+                return
+
+            if res.returncode != 0:
+                combined = f"{res.stderr}\n{res.stdout}"
+                if _is_x20_not_found_error(combined):
+                    yield ("no_remote_bundle", None, None)
+                else:
+                    detail = (
+                        res.stderr.strip()
+                        or res.stdout.strip()
+                        or f"exit code {res.returncode}"
+                    )
+                    yield (
+                        "bundle_error",
+                        None,
+                        f"fileutil cp failed for {x20_uri}: {detail}",
+                    )
+                return
+
+            try:
+                if not staged_file.is_file() or staged_file.stat().st_size == 0:
+                    yield (
+                        "bundle_error",
+                        None,
+                        f"Staged bundle from {x20_uri} is missing or empty",
+                    )
+                    return
+            except OSError as exc:
+                yield (
+                    "bundle_error",
+                    None,
+                    f"Cannot stat staged bundle from {x20_uri}: {exc}",
+                )
+                return
+
+            yield ("staged", staged_file, None)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    local_p = Path(raw_str)
+    try:
+        if local_p.is_symlink() and not local_p.exists():
+            yield (
+                "bundle_error",
+                None,
+                f"Bundle path {raw_str} is a broken symlink",
+            )
+            return
+        if not local_p.exists():
+            yield ("no_remote_bundle", None, None)
+            return
+        if not local_p.is_file():
+            yield (
+                "bundle_error",
+                None,
+                f"Bundle path {raw_str} is not a regular file",
+            )
+            return
+        if local_p.stat().st_size == 0:
+            yield (
+                "bundle_error",
+                None,
+                f"Bundle file {raw_str} is empty (0 bytes)",
+            )
+            return
+        yield ("staged", local_p.resolve(), None)
+    except OSError as exc:
+        yield ("bundle_error", None, f"Cannot access bundle {raw_str}: {exc}")
+
+
+def parse_bundle_heads(
+    bundle_file: Path,
+) -> tuple[bool, dict[str, str], str | None]:
+    """Runs `git bundle list-heads` on `bundle_file` and returns `(ok, ref_map, error)`."""
+    res = _run_git(["bundle", "list-heads", str(bundle_file)])
+    if res.returncode != 0:
+        detail = (
+            res.stderr.strip()
+            or res.stdout.strip()
+            or f"git bundle list-heads exited with {res.returncode}"
+        )
+        return (False, {}, detail)
+
+    heads: dict[str, str] = {}
+    for raw_line in res.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return (
+                False,
+                {},
+                f"Malformed line in git bundle list-heads output: {line!r}",
+            )
+        sha, ref_name = parts[0].lower(), parts[1]
+        if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+            return (
+                False,
+                {},
+                f"Invalid commit SHA in git bundle list-heads output: {sha!r}",
+            )
+        heads[ref_name] = sha
+
+    if not heads:
+        return (False, {}, "Bundle lists zero heads")
+    return (True, heads, None)
+
+
+def _sync_local_ref_to_remote(
+    repo_path: Path,
+    normalized_ref: str,
+    old_tip: str | None,
+    new_tip: str,
+) -> tuple[bool, str | None]:
+    """Safely advances `normalized_ref` to `new_tip`, checking all linked worktrees."""
+    top_res = _run_git(["rev-parse", "--show-toplevel"], cwd=repo_path)
+    current_toplevel = (
+        Path(top_res.stdout.strip()).resolve()
+        if (top_res.returncode == 0 and top_res.stdout.strip())
+        else None
+    )
+
+    wt_res = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
+    if wt_res.returncode != 0:
+        return (
+            False,
+            wt_res.stderr.strip() or "Failed to inspect git worktree list",
+        )
+
+    stanzas: list[dict[str, str]] = []
+    cur_stanza: dict[str, str] = {}
+    for raw_line in wt_res.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if cur_stanza:
+                stanzas.append(cur_stanza)
+                cur_stanza = {}
+            continue
+        if line.startswith("worktree "):
+            if cur_stanza:
+                stanzas.append(cur_stanza)
+            cur_stanza = {"worktree": line[len("worktree ") :].strip()}
+        elif line.startswith("branch "):
+            cur_stanza["branch"] = line[len("branch ") :].strip()
+    if cur_stanza:
+        stanzas.append(cur_stanza)
+
+    for entry in stanzas:
+        if entry.get("branch") != normalized_ref:
+            continue
+        wt_str = entry.get("worktree", "")
+        if not wt_str:
+            continue
+        try:
+            wt_path = Path(wt_str).resolve()
+        except OSError:
+            return (False, f"Cannot resolve worktree path {wt_str}")
+
+        if current_toplevel is None or wt_path != current_toplevel:
+            return (
+                False,
+                f"{normalized_ref} is checked out in linked worktree {wt_path}",
+            )
+
+        st_res = _run_git(["status", "--porcelain"], cwd=current_toplevel)
+        if st_res.returncode != 0 or st_res.stdout.strip():
+            return (
+                False,
+                f"{normalized_ref} is checked out in dirty worktree {current_toplevel}",
+            )
+
+        if old_tip is not None:
+            ff_res = _run_git(
+                ["merge", "--ff-only", new_tip], cwd=current_toplevel
+            )
+        else:
+            ff_res = _run_git(
+                ["reset", "--hard", new_tip], cwd=current_toplevel
+            )
+        if ff_res.returncode != 0:
+            return (
+                False,
+                ff_res.stderr.strip() or "git merge --ff-only failed",
+            )
+        return (True, None)
+
+    cmd = (
+        ["update-ref", normalized_ref, new_tip, old_tip]
+        if old_tip is not None
+        else ["update-ref", normalized_ref, new_tip]
+    )
+    up_res = _run_git(cmd, cwd=repo_path)
+    if up_res.returncode != 0:
+        return (False, up_res.stderr.strip() or "git update-ref failed")
+    return (True, None)
+
+
+def verify_bundle_ff(
+    bundle_path: str | Path,
+    ref: str = "refs/heads/unstable",
+    repo_dir: str | Path = ".",
+    local_rev: str | None = None,
+    sync_if_behind: bool = False,
+    fileutil_bin: str | None = None,
+) -> dict[str, Any]:
+    """Verifies that local `ref` (or `local_rev`) is a fast-forward descendant of `bundle_path`."""
+    bundle_str = str(bundle_path)
+    normalized_ref = normalize_git_ref(ref)
+    repo_path = Path(repo_dir)
+    target_local_rev = (
+        local_rev.strip()
+        if (local_rev is not None and local_rev.strip())
+        else normalized_ref
+    )
+    local_rev_is_override = bool(
+        local_rev is not None
+        and local_rev.strip()
+        and normalize_git_ref(local_rev.strip()) != normalized_ref
+    )
+
+    def _verdict(
+        ok: bool,
+        status: str,
+        remote_tip: str | None,
+        local_tip: str | None,
+        synced: bool,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "status": status,
+            "bundle_path": bundle_str,
+            "ref": normalized_ref,
+            "remote_tip": remote_tip,
+            "local_tip": local_tip,
+            "synced": synced,
+            "message": message,
+        }
+
+    is_git_repo = False
+    local_tip: str | None = None
+    try:
+        if repo_path.is_dir():
+            git_chk = _run_git(["rev-parse", "--git-dir"], cwd=repo_path)
+            if git_chk.returncode == 0:
+                is_git_repo = True
+                rev_res = _run_git(
+                    [
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        f"{target_local_rev}^{{commit}}",
+                    ],
+                    cwd=repo_path,
+                )
+                if rev_res.returncode == 0 and rev_res.stdout.strip():
+                    local_tip = rev_res.stdout.strip().lower()
+    except OSError:
+        is_git_repo = False
+        local_tip = None
+
+    with stage_bundle_for_verification(
+        bundle_path, fileutil_bin=fileutil_bin
+    ) as (stage_status, staged_path, stage_err):
+        if stage_status == "no_remote_bundle":
+            return _verdict(
+                ok=True,
+                status="no_remote_bundle",
+                remote_tip=None,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Remote bundle {bundle_str} does not exist yet; "
+                    "first-time bundle export is allowed."
+                ),
+            )
+
+        if stage_status != "staged" or staged_path is None:
+            return _verdict(
+                ok=False,
+                status="bundle_error",
+                remote_tip=None,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Failed to stage or read remote bundle {bundle_str}: "
+                    f"{stage_err or 'unknown error'} (failing closed)."
+                ),
+            )
+
+        ok_heads, heads, heads_err = parse_bundle_heads(staged_path)
+        if not ok_heads:
+            return _verdict(
+                ok=False,
+                status="bundle_error",
+                remote_tip=None,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Corrupt or unreadable remote bundle {bundle_str}: "
+                    f"{heads_err or 'git bundle list-heads failed'} (failing closed)."
+                ),
+            )
+
+        remote_tip = heads.get(normalized_ref)
+        if remote_tip is None:
+            return _verdict(
+                ok=True,
+                status="no_remote_ref",
+                remote_tip=None,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Ref {normalized_ref} is not present in remote bundle "
+                    f"{bundle_str}; export is allowed."
+                ),
+            )
+
+        if not is_git_repo or local_tip is None:
+            if not is_git_repo or not sync_if_behind or local_rev_is_override:
+                reason = (
+                    f"Directory {repo_path} is not a valid Git repository"
+                    if not is_git_repo
+                    else f"Local ref/revision {target_local_rev} does not exist in {repo_path}"
+                )
+                return _verdict(
+                    ok=False,
+                    status="missing_local_ref",
+                    remote_tip=remote_tip,
+                    local_tip=None,
+                    synced=False,
+                    message=(
+                        f"{reason} while remote bundle {bundle_str} has "
+                        f"{normalized_ref} at {remote_tip}. Remediation: run "
+                        "`git x20-pull` or pass `--sync-if-behind` before exporting."
+                    ),
+                )
+
+            fetch_res = _run_git(
+                ["fetch", "--no-tags", "--quiet", str(staged_path), normalized_ref],
+                cwd=repo_path,
+            )
+            has_obj = (
+                _run_git(
+                    ["cat-file", "-e", f"{remote_tip}^{{commit}}"],
+                    cwd=repo_path,
+                ).returncode
+                == 0
+            )
+            if fetch_res.returncode != 0 or not has_obj:
+                detail = (
+                    fetch_res.stderr.strip()
+                    or "failed to fetch remote_tip commit from bundle"
+                )
+                return _verdict(
+                    ok=False,
+                    status="bundle_error",
+                    remote_tip=remote_tip,
+                    local_tip=None,
+                    synced=False,
+                    message=(
+                        f"Failed fetching {normalized_ref} ({remote_tip}) from "
+                        f"bundle {bundle_str}: {detail} (failing closed)."
+                    ),
+                )
+
+            sync_ok, sync_err = _sync_local_ref_to_remote(
+                repo_path, normalized_ref, None, remote_tip
+            )
+            if not sync_ok:
+                return _verdict(
+                    ok=False,
+                    status="missing_local_ref",
+                    remote_tip=remote_tip,
+                    local_tip=None,
+                    synced=False,
+                    message=(
+                        f"Local {normalized_ref} is missing and `--sync-if-behind` "
+                        f"could not create it at {remote_tip}: {sync_err}."
+                    ),
+                )
+            return _verdict(
+                ok=True,
+                status="synced_missing_local_ref",
+                remote_tip=remote_tip,
+                local_tip=remote_tip,
+                synced=True,
+                message=(
+                    f"Fetched and created missing local {normalized_ref} at "
+                    f"{remote_tip} from {bundle_str}."
+                ),
+            )
+
+        if local_tip == remote_tip:
+            return _verdict(
+                ok=True,
+                status="up_to_date",
+                remote_tip=remote_tip,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Local {normalized_ref} ({local_tip}) matches remote "
+                    f"bundle {bundle_str} ({remote_tip})."
+                ),
+            )
+
+        has_remote_obj = (
+            _run_git(
+                ["cat-file", "-e", f"{remote_tip}^{{commit}}"], cwd=repo_path
+            ).returncode
+            == 0
+        )
+        if has_remote_obj:
+            is_ff = (
+                _run_git(
+                    ["merge-base", "--is-ancestor", remote_tip, local_tip],
+                    cwd=repo_path,
+                ).returncode
+                == 0
+            )
+            if is_ff:
+                return _verdict(
+                    ok=True,
+                    status="fast_forward",
+                    remote_tip=remote_tip,
+                    local_tip=local_tip,
+                    synced=False,
+                    message=(
+                        f"Local {normalized_ref} ({local_tip}) is a fast-forward "
+                        f"descendant of remote bundle {bundle_str} ({remote_tip})."
+                    ),
+                )
+        else:
+            if not sync_if_behind:
+                return _verdict(
+                    ok=False,
+                    status="unfetched_remote_tip",
+                    remote_tip=remote_tip,
+                    local_tip=local_tip,
+                    synced=False,
+                    message=(
+                        f"Remote bundle {bundle_str} has {normalized_ref} at "
+                        f"{remote_tip}, which is not present in local repository "
+                        f"{repo_path} (local tip: {local_tip}). Remediation: run "
+                        "`git x20-pull` or pass `--sync-if-behind` before exporting."
+                    ),
+                )
+
+            fetch_res = _run_git(
+                ["fetch", "--no-tags", "--quiet", str(staged_path), normalized_ref],
+                cwd=repo_path,
+            )
+            has_remote_obj = (
+                _run_git(
+                    ["cat-file", "-e", f"{remote_tip}^{{commit}}"],
+                    cwd=repo_path,
+                ).returncode
+                == 0
+            )
+            if fetch_res.returncode != 0 or not has_remote_obj:
+                detail = (
+                    fetch_res.stderr.strip()
+                    or "failed to fetch remote_tip commit from bundle"
+                )
+                return _verdict(
+                    ok=False,
+                    status="bundle_error",
+                    remote_tip=remote_tip,
+                    local_tip=local_tip,
+                    synced=False,
+                    message=(
+                        f"Failed fetching {normalized_ref} ({remote_tip}) from "
+                        f"bundle {bundle_str}: {detail} (failing closed)."
+                    ),
+                )
+
+            if (
+                _run_git(
+                    ["merge-base", "--is-ancestor", remote_tip, local_tip],
+                    cwd=repo_path,
+                ).returncode
+                == 0
+            ):
+                return _verdict(
+                    ok=True,
+                    status="fast_forward",
+                    remote_tip=remote_tip,
+                    local_tip=local_tip,
+                    synced=False,
+                    message=(
+                        f"Local {normalized_ref} ({local_tip}) is a fast-forward "
+                        f"descendant of remote bundle {bundle_str} ({remote_tip})."
+                    ),
+                )
+
+        is_behind = (
+            _run_git(
+                ["merge-base", "--is-ancestor", local_tip, remote_tip],
+                cwd=repo_path,
+            ).returncode
+            == 0
+        )
+        if not is_behind:
+            return _verdict(
+                ok=False,
+                status="diverged",
+                remote_tip=remote_tip,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Local {normalized_ref} ({local_tip}) has diverged from "
+                    f"remote bundle {bundle_str} tip ({remote_tip}); neither is "
+                    "an ancestor of the other. Remediation: run `git x20-pull` "
+                    f"and rebase or merge {normalized_ref} before exporting."
+                ),
+            )
+
+        cnt_res = _run_git(
+            ["rev-list", "--count", f"{local_tip}..{remote_tip}"],
+            cwd=repo_path,
+        )
+        behind_count = (
+            int(cnt_res.stdout.strip())
+            if (cnt_res.returncode == 0 and cnt_res.stdout.strip().isdigit())
+            else 1
+        )
+
+        if not sync_if_behind or local_rev_is_override:
+            return _verdict(
+                ok=False,
+                status="stale_behind",
+                remote_tip=remote_tip,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Local {normalized_ref} ({local_tip}) is stale "
+                    f"({behind_count} commit(s) behind remote bundle {bundle_str} "
+                    f"tip {remote_tip}). Remediation: run `git x20-pull` or "
+                    "pass `--sync-if-behind` to fast-forward before exporting."
+                ),
+            )
+
+        sync_ok, sync_err = _sync_local_ref_to_remote(
+            repo_path, normalized_ref, local_tip, remote_tip
+        )
+        if not sync_ok:
+            return _verdict(
+                ok=False,
+                status="stale_behind",
+                remote_tip=remote_tip,
+                local_tip=local_tip,
+                synced=False,
+                message=(
+                    f"Local {normalized_ref} ({local_tip}) is stale "
+                    f"({behind_count} commit(s) behind remote bundle {bundle_str} "
+                    f"tip {remote_tip}), and `--sync-if-behind` refused to "
+                    f"update: {sync_err}. Remediation: clean the worktree or "
+                    "run `git x20-pull` before exporting."
+                ),
+            )
+
+        return _verdict(
+            ok=True,
+            status="synced_fast_forward",
+            remote_tip=remote_tip,
+            local_tip=remote_tip,
+            synced=True,
+            message=(
+                f"Fast-forwarded local {normalized_ref} from {local_tip} to "
+                f"remote bundle {bundle_str} tip {remote_tip} "
+                f"({behind_count} commit(s))."
+            ),
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Run `lake`, `lean`, or `cargo` commands with hardware-matched "
             "CPU thread, physical RAM (`MemoryMax`), zero-swap "
-            "(`MemorySwapMax=0`), and wall-clock timeout limits."
+            "(`MemorySwapMax=0`), and wall-clock timeout limits, or verify "
+            "fast-forward bundle ancestry (`--verify-bundle-ff`)."
         )
     )
     p.add_argument(
         "--probe",
+        "--print-limits",
+        dest="probe",
         action="store_true",
         help=(
-            "Print detected host hardware and computed resource limits "
-            "without running a command."
+            "Print detected host hardware, cgroup v2 working-set stats, and "
+            "computed resource limits without running a command."
         ),
     )
     p.add_argument(
         "--json",
         action="store_true",
-        help="Format `--probe` output as JSON.",
+        help=(
+            "Format `--probe` / `--print-limits` or `--verify-bundle-ff` "
+            "output as JSON."
+        ),
     )
     p.add_argument(
         "--mode",
@@ -451,7 +1542,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--concurrency",
         "-W",
         type=int,
-        default=int(os.environ.get("ANNEAL_WORKTREE_CONCURRENCY", "1")),
+        default=_env_int("ANNEAL_WORKTREE_CONCURRENCY", 1),
         help=(
             "Number of concurrent active build worktrees sharing this host "
             "(default: $ANNEAL_WORKTREE_CONCURRENCY or 1)."
@@ -460,13 +1551,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--memory-max-mb",
         type=int,
-        default=int(os.environ.get("ANNEAL_LEAN_MEMORY_MAX_MB", "0")) or None,
+        default=_env_int("ANNEAL_LEAN_MEMORY_MAX_MB", 0) or None,
         help="Override the computed hard physical RAM ceiling in MiB.",
     )
     p.add_argument(
         "--timeout",
         type=int,
-        default=int(os.environ.get("ANNEAL_LEAN_TIMEOUT_SEC", "0")) or None,
+        default=_env_int("ANNEAL_LEAN_TIMEOUT_SEC", 0) or None,
         help=(
             "Override the wall-clock timeout in seconds (default: 180s for "
             "file, 900s for build)."
@@ -476,6 +1567,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-slot-lock",
         action="store_true",
         help="Disable the host-wide concurrent build slot lock for `build` mode.",
+    )
+    p.add_argument(
+        "--verify-bundle-ff",
+        "--check-unstable-ff",
+        dest="verify_bundle_ff",
+        metavar="BUNDLE_PATH",
+        default=None,
+        help=(
+            "Verify that local `--ref` (default: refs/heads/unstable) is a "
+            "fast-forward descendant of `--ref` in BUNDLE_PATH before exporting."
+        ),
+    )
+    p.add_argument(
+        "--ref",
+        default="refs/heads/unstable",
+        help=(
+            "Git ref to check with `--verify-bundle-ff` "
+            "(default: refs/heads/unstable)."
+        ),
+    )
+    p.add_argument(
+        "--repo-dir",
+        default=".",
+        help="Local Git repository directory for `--verify-bundle-ff` (default: .).",
+    )
+    p.add_argument(
+        "--local-rev",
+        default=None,
+        help=(
+            "Optional local commit/ref override for `--verify-bundle-ff` "
+            "(default: same as `--ref`)."
+        ),
+    )
+    p.add_argument(
+        "--sync-if-behind",
+        action="store_true",
+        help=(
+            "When `--verify-bundle-ff` detects that local `--ref` is missing "
+            "or strictly behind the remote bundle tip, safely fetch and "
+            "fast-forward local `--ref`."
+        ),
     )
     p.add_argument(
         "cmd",
@@ -488,13 +1620,38 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cmd = list(args.cmd)
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
+
+    if args.verify_bundle_ff is not None:
+        if args.probe or cmd:
+            sys.stderr.write(
+                "[anneal-lean-run] ERROR: `--verify-bundle-ff` cannot be "
+                "combined with `--probe` or a command execution.\n"
+            )
+            return 2
+        verdict = verify_bundle_ff(
+            bundle_path=args.verify_bundle_ff,
+            ref=args.ref,
+            repo_dir=args.repo_dir,
+            local_rev=args.local_rev,
+            sync_if_behind=args.sync_if_behind,
+        )
+        if not verdict["ok"]:
+            sys.stderr.write(f"[anneal-lean-run] ERROR: {verdict['message']}\n")
+        if args.json:
+            print(json.dumps(verdict, indent=2))
+        elif verdict["ok"]:
+            print(
+                f"[anneal-lean-run] OK ({verdict['status']}): "
+                f"{verdict['message']}"
+            )
+        return 0 if verdict["ok"] else 1
 
     hw = probe_host_hardware()
     eff_mode = detect_mode(cmd, args.mode)
@@ -520,6 +1677,7 @@ def main() -> int:
                 f"  Host CPUs          : {limits['cpu_cores']} logical cores\n"
                 f"  Host Physical RAM  : {limits['mem_total_mb']} MiB total, "
                 f"{limits['mem_avail_mb']} MiB available\n"
+                f"{format_cgroup_probe_line(limits)}\n"
                 f"  Thread Budget (-j) : {limits['threads']} threads "
                 f"(LEAN_NUM_THREADS={limits['threads']})\n"
                 f"  Hard RAM Cap       : {limits['memory_max_mb']} MiB "
