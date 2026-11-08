@@ -154,7 +154,7 @@ functions** in `Trusted.Rustc.V2026_06_01.MirSemantics`:
 3. `.canonicalSafeLocalWriteRead`: executes `writePlaceValue` followed by `readProjectedValue`
 4. `.canonicalSafeTreeBorrowMut`: executes `evalRvalue (.ref (.mut false) ...)` followed by deref `writePlaceValue`
 5. `.sharedUnsafeCellWrite` (`GAP-MR-0001`): executes `evalRvalue (.ref .shared ...)` on local 0
-   with `localDecls` typing local 0 as `core::cell::UnsafeCell<u32>` (`!Freeze` → `TreeBorrowPerm.reserved`),
+   with `localDecls` typing local 0 as `core::cell::UnsafeCell<u32>` (`!Freeze` → `TreeBorrowPerm.cell`),
    followed by `evalRvalue (.rawPtr .not { local_ := 1, projection := [.deref] })` (the real MIR shape
    produced by `(shared_ref as *const UnsafeCell<u32>) as *mut u32` → `&raw const (*_1)`), and then
    executes `writePlaceValue` through the resulting raw pointer (`[.deref]`), returning `.normalUnit`.

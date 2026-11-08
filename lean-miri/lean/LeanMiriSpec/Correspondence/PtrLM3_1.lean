@@ -89,18 +89,13 @@ theorem toBorrowEntry_updateOnWrite (e : AllocMapEntry) (targetLocal : Local)
     (e.updateOnWrite targetLocal writerTag).toBorrowEntry =
       updateBorrowPerm e.toBorrowEntry targetLocal writerTag := by
   unfold updateOnWrite toBorrowEntry updateBorrowPerm
-  dsimp only
-  cases Nat.beq e.localIdx targetLocal with
-  | false => rfl
-  | true =>
-    dsimp only
-    cases writerTag with
-    | none => cases e.perm <;> rfl
-    | some wTag =>
-      dsimp only
-      cases Nat.beq e.tag wTag with
-      | false => rfl
-      | true => cases e.perm <;> rfl
+  split
+  · rfl
+  · cases treeBorrowNodeAccess .write
+        (treeBorrowWriterRelatedness
+          { tag := e.tag, targetLocal := e.localIdx, targetProjection := .nil,
+            perm := e.perm } writerTag)
+        e.perm false <;> rfl
 
 end AllocMapEntry
 

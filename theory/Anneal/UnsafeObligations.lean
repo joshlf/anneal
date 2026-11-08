@@ -128,13 +128,13 @@ def stepTreeBorrowAccess?
     match isWrite, entry.perm with
     | false, .disabled => none
     | false, _ => some mem
-    | true, .active | true, .reserved =>
+    | true, .frozen | true, .disabled => none
+    | true, _ =>
       some
         { mem with
           borrows :=
             invalidateConflictingBorrows
               mem.borrows entry.targetLocal (some rp.tag) }
-    | true, .frozen | true, .disabled => none
 
 /-- 5. Tree Borrows access obligation for read or write through `rp`. -/
 def HasTreeBorrowAccess

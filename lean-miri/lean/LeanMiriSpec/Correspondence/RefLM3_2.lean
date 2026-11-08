@@ -4822,10 +4822,13 @@ def derefReadNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEn
   | _ => treeMap
 
 /-- Tree-Borrows-aware write transition on a single `ReborrowMapEntry` within
-full hierarchy `allBorrows` when `targetLocal` is written through `wTag`:
-descendant/self writes (`isBorrowDescendantOrSelf allBorrows wTag x.tag = true`)
-activate `.reserved -> .active` and preserve `.active` on ancestors, while
-foreign writes transition `x` to `.disabled`. -/
+full hierarchy `allBorrows` when `targetLocal` is written through `wTag`,
+mirroring the unprotected per-node write transition (`treeBorrowNodeAccess
+.write`) that `updateBorrowPermTreeAtProj` applies: descendant/self writes
+(`isBorrowDescendantOrSelf allBorrows wTag x.tag = true`) activate the
+reservations `.reservedFrz _` and `.reservedIM` to `.active` and preserve every
+other permission, while foreign writes disable `x` unless it is `.cell` or
+`.reservedIM`, which tolerate foreign writes. -/
 def ReborrowMapEntry.updateOnWrite (allBorrows : List BorrowEntry)
     (targetLocal : Local) (wTag : Nat) (x : ReborrowMapEntry) : ReborrowMapEntry :=
   match Nat.beq x.localIdx targetLocal with
@@ -4834,9 +4837,14 @@ def ReborrowMapEntry.updateOnWrite (allBorrows : List BorrowEntry)
     match isBorrowDescendantOrSelf allBorrows wTag x.tag with
     | true =>
       match x.perm with
-      | .reserved => { x with perm := .active }
+      | .reservedFrz _ => { x with perm := .active }
+      | .reservedIM => { x with perm := .active }
       | _ => x
-    | false => { x with perm := .disabled }
+    | false =>
+      match x.perm with
+      | .cell => x
+      | .reservedIM => x
+      | _ => { x with perm := .disabled }
 
 @[simp]
 theorem ReborrowMapEntry.updateOnWrite_tag (allBorrows : List BorrowEntry)
@@ -4844,8 +4852,7 @@ theorem ReborrowMapEntry.updateOnWrite_tag (allBorrows : List BorrowEntry)
     (x.updateOnWrite allBorrows targetLocal wTag).tag = x.tag := by
   unfold ReborrowMapEntry.updateOnWrite
   cases Nat.beq x.localIdx targetLocal <;> try rfl
-  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> try rfl
-  cases x.perm <;> rfl
+  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> cases x.perm <;> rfl
 
 @[simp]
 theorem ReborrowMapEntry.updateOnWrite_localIdx (allBorrows : List BorrowEntry)
@@ -4853,8 +4860,7 @@ theorem ReborrowMapEntry.updateOnWrite_localIdx (allBorrows : List BorrowEntry)
     (x.updateOnWrite allBorrows targetLocal wTag).localIdx = x.localIdx := by
   unfold ReborrowMapEntry.updateOnWrite
   cases Nat.beq x.localIdx targetLocal <;> try rfl
-  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> try rfl
-  cases x.perm <;> rfl
+  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> cases x.perm <;> rfl
 
 @[simp]
 theorem ReborrowMapEntry.updateOnWrite_allocId (allBorrows : List BorrowEntry)
@@ -4862,8 +4868,7 @@ theorem ReborrowMapEntry.updateOnWrite_allocId (allBorrows : List BorrowEntry)
     (x.updateOnWrite allBorrows targetLocal wTag).allocId = x.allocId := by
   unfold ReborrowMapEntry.updateOnWrite
   cases Nat.beq x.localIdx targetLocal <;> try rfl
-  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> try rfl
-  cases x.perm <;> rfl
+  cases isBorrowDescendantOrSelf allBorrows wTag x.tag <;> cases x.perm <;> rfl
 
 private theorem isBorrowDescendantOrSelf_self (borrows : List BorrowEntry) (t : Nat) :
     isBorrowDescendantOrSelf borrows t t = true := by
@@ -4888,20 +4893,25 @@ theorem ReborrowMapEntry.updateOnWrite_toBorrowEntry_tree
   · rfl
   · dsimp only
     cases hdesc : isBorrowDescendantOrSelf allBorrows wTag tag
-    · dsimp only
-      have hne : Nat.beq tag wTag = false := by
+    · have hne : Nat.beq tag wTag = false := by
         cases h : Nat.beq tag wTag
         · rfl
         · have heq := Nat.eq_of_beq_eq_true h
           subst heq
           rw [isBorrowDescendantOrSelf_self] at hdesc
           cases hdesc
-      rw [hne]
-      rfl
-    · dsimp only
-      rw [Nat.beq_refl]
-      dsimp only
-      cases perm <;> rfl
+      have hrel : treeBorrowWriterRelatedness
+          { tag := tag, targetLocal := loc, targetProjection := .nil, perm := perm,
+            parentTag := ptag } (some wTag) = .foreignAccess := by
+        simp only [treeBorrowWriterRelatedness, hne]
+      rw [hrel]
+      rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;> rfl
+    · have hrel : treeBorrowWriterRelatedness
+          { tag := tag, targetLocal := loc, targetProjection := .nil, perm := perm,
+            parentTag := ptag } (some tag) = .localAccess := by
+        simp only [treeBorrowWriterRelatedness, Nat.beq_refl]
+      rw [hrel]
+      rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;> rfl
 
 theorem invalidateTreeBorrowsAtProj_map_toBorrowEntry_tree
     (allBorrows : List BorrowEntry) (treeMap : List ReborrowMapEntry)
@@ -4917,9 +4927,10 @@ theorem invalidateTreeBorrowsAtProj_map_toBorrowEntry_tree
       ReborrowMapEntry.updateOnWrite_toBorrowEntry_tree, ih]
 
 /-- Computable post-step `treeMap'` after a deref write `*_r = .use op`:
-activates `.reserved -> .active` and preserves `.active` on all `NodeRelation::Local`
-ancestors (`isBorrowDescendantOrSelf = true`), while disabling foreign borrows
-on `e.localIdx`. -/
+applies `ReborrowMapEntry.updateOnWrite`, activating reservations to `.active`
+on all `NodeRelation::Local` ancestors (`isBorrowDescendantOrSelf = true`),
+while disabling foreign borrows on `e.localIdx` other than `.cell` and
+`.reservedIM`. -/
 def derefWriteNextTreeMap (locals : List LocalSlot) (treeMap : List ReborrowMapEntry)
     (ptrIdx : Local) : List ReborrowMapEntry :=
   match get? locals ptrIdx with
@@ -4964,11 +4975,14 @@ theorem invalidateDerefWriteBorrows_map_toBorrowEntry_tree
       subst htag
       simp only [invalidateDerefWriteBorrows, hget, List.map_cons, List.map_nil] at hlook_bor ⊢
       rw [hlook_bor]
+      have hrel : treeBorrowWriterRelatedness
+          { tag := ptrVal.tag, targetLocal := loc, targetProjection := .nil, perm := perm,
+            parentTag := ptag } (some ptrVal.tag) = .localAccess := by
+        simp only [treeBorrowWriterRelatedness, Nat.beq_refl]
       dsimp only [ReborrowMapEntry.toBorrowEntry, appendProjections,
         invalidateConflictingBorrows, updateBorrowPerm, ReborrowMapEntry.updateOnWrite]
-      rw [Nat.beq_refl, Nat.beq_refl, isBorrowDescendantOrSelf_self]
-      dsimp only []
-      cases perm <;> rfl
+      simp only [Nat.beq_refl, isBorrowDescendantOrSelf_self, hrel]
+      rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _ <;> rfl
     | cons b₂ rest₂ =>
       simp only [invalidateDerefWriteBorrows, hget, List.map_cons] at hlook_bor ⊢
       rw [hlook_bor]; dsimp only []
@@ -4981,12 +4995,14 @@ theorem invalidateDerefWriteBorrows_map_toBorrowEntry_tree
         ((b₁ :: b₂ :: rest₂).map ReborrowMapEntry.toBorrowEntry)
         (b₁ :: b₂ :: rest₂) e.localIdx ptrVal.tag
 
-/-- Initial `TreeBorrowPerm` assigned by `evalRvalue` to a reborrow `&bk (*ptrIdx)`. -/
+/-- Initial `TreeBorrowPerm` assigned by `evalRvalue` to a reborrow `&bk (*ptrIdx)`:
+`sharedBorrowPerm` for shared reborrows and `mutableBorrowPerm` for mutable and
+two-phase reborrows. -/
 def reborrowPermOf (localDecls : List LocalDecl) (layouts : LayoutTable)
     (bk : BorrowKind) (ptrIdx : Local) : TreeBorrowPerm :=
   match bk with
   | .shared => sharedBorrowPerm localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩
-  | .mut _ => .reserved
+  | .mut _ => mutableBorrowPerm localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩
 
 /-- Computable post-step `treeMap'` after reborrowing `_d = &bk (*ptrIdx)` with
 fresh provenance tag `newTag`: applies `ReborrowMapEntry.updateOnRead` across
