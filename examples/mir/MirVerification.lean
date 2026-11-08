@@ -1312,18 +1312,9 @@ theorem example_signature_predicates_and_polymorphic_obligations :
       polySwapPairU32MirBody
       [.scalar ⟨10, 1⟩, .scalar ⟨20, 4⟩]
       emptyMemory := by
-  simp [emptyMemory, TypeLayout.isParamPlaceholder, alignUp, maxNat, pow2Nat,
-    Trusted.Sequence.get?, Trusted.Sequence.length, UintTy.byteWidth, UintTy.bitWidth,
-    appendTypeLayouts, setTypeLayoutAt, computeAggregateBackendRepr,
-    TypeLayout.recomputeFromFieldLayouts,
-    Trusted.Rustc.V2026_06_01.Layout.substitutePlaceholderEntries,
-    Trusted.Rustc.V2026_06_01.Layout.recomputeEntriesWith, TypeSubst.layouts,
-    RigidTy.instantiate, RigidTy.instantiateList, RigidTy.hasSubstParam,
-    RigidTy.hasSubstParamList, RigidTy.isCompoundSubstParam, RigidTy.isTrivialZst,
-    RigidTy.computeLayout, Trusted.Rustc.V2026_06_01.MirAst.hasNonParamTyAtIdx,
-    Trusted.Rustc.V2026_06_01.MirAst.hasCompoundParamTyAtIdx,
-    Trusted.Rustc.V2026_06_01.MirAst.substituteTyParamLayoutsAux,
-    Trusted.Rustc.V2026_06_01.MirAst.recomputeTyCompoundLayoutsAux] <;> decide
+  simp [Trusted.Sequence.get?, Trusted.Sequence.length, TypeLayout.isParamPlaceholder,
+    substitutePlaceholderEntries, hasNonParamTyAtIdx, hasCompoundParamTyAtIdx,
+    substituteTyParamLayoutsAux, recomputeTyCompoundLayoutsAux] <;> decide
 
 /-! ## 12. Signature Predicates over Capture-Shaped Layout Tables: Pointer Fields, Captured Field Layouts, Unrecorded Pointee Layouts & the Monomorphic Signature Guard -/
 

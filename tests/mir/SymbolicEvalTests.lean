@@ -374,23 +374,11 @@ multi-block short-circuit `clampReqMir` predicate over all canonical `u8` inputs
 theorem clampReqMir_iff_arith (x : Nat) :
     MirBoolPredicateHolds clampReqMir [.scalar { bits := x, sizeBytes := 1 }] ↔
       (x < 20 ∧ x ≠ 15) := by
-  have h_iff :=
-    mirBoolPredicateHolds_iff_wpMirBoolSym 12 clampReqMir
-      [.scalar { bits := x, sizeBytes := 1 }] (by
-        ((repeat' ((conv => whnf); split)); all_goals (conv => whnf)) <;> trivial)
-  rw [h_iff]
-  constructor
-  · intro h
-    (repeat' ((conv at h => whnf); split at h))
-    all_goals (conv at h => whnf)
-    all_goals (try exact False.elim h)
-    all_goals simp_all
-    all_goals omega
-  · rintro ⟨hx20, hx15⟩
-    (repeat' ((conv => whnf); split))
-    all_goals (conv => whnf)
-    all_goals simp_all
-    all_goals omega
+  rw [mirBoolPredicateHolds_iff_wpMirBoolSym 12 clampReqMir _ (by
+    ((repeat' ((conv => whnf); split)); all_goals (conv => whnf)) <;> trivial)]
+  (repeat' ((conv => lhs; whnf); split)) <;>
+    (conv => lhs; whnf) <;>
+    simp_all <;> omega
 
 /--
 Single-pass symbolic verification of branching `clampOrStepMir` with `#[spec]`
@@ -403,18 +391,13 @@ theorem clampOrStepClaim_verified : VerificationResult clampOrStepClaim := by
   have hx20 : x < 20 := ((clampReqMir_iff_arith x).1 h_req).1
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · refine ⟨mirBoolPredicateHolds_of_wp_fuelFree clampEnsMir _, ?_⟩
-    rintro _ ⟨⟩
-    have h_not_lt : ¬ (x < 10) := by simp_all
-    simp [h_not_lt]
+    rintro _ ⟨⟩; simp_all; omega
   · simp_all; omega
-  · have h_lt10 : x < 10 := by simp_all
-    have h_wrap : (x + 1) % 256 = x + 1 := Nat.mod_eq_of_lt (by omega)
-    refine ⟨mirBoolPredicateHolds_of_fuelFree clampEnsMir _ (by
+  · refine ⟨mirBoolPredicateHolds_of_fuelFree clampEnsMir _ (by
       rw [← wpMirSym_eq_wpMirBounded]
       (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
       all_goals first | (rintro _ _ ⟨⟩; rfl) | (simp_all; omega)), ?_⟩
-    rintro _ ⟨⟩
-    simp [h_lt10, h_wrap]
+    rintro _ ⟨⟩; simp_all
 
 /-- Pinned 1-argument `u32` `#[spec(requires: magic == 7, ensures: ret == 7)]` test. -/
 def pinMagicMir : CapturedMir :=
@@ -1574,10 +1557,9 @@ theorem guardedSliceLenSub_verified :
   refine verifyByWPFuelFree guardedSliceLenSubClaim ?_
   rintro _ ⟨p, len, mid, h_le, h_len, rfl⟩
   have h_ble : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
-  have h_sub : len - mid < 18446744073709551616 := by omega
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · rintro _ _ _ ⟨⟩
-    simp; exact h_sub
+    simp; omega
   · simp_all
   · simp_all
 
@@ -1663,8 +1645,7 @@ theorem guardedPanicCall_verified :
   rintro _ ⟨p, len, mid, h_len, h_mid, rfl⟩
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · rintro _ _ _ h_le ⟨⟩
-    have h_sub : len - mid < 18446744073709551616 := by omega
-    simp; exact h_sub
+    simp; omega
   · simp_all
   · trivial
 
