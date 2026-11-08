@@ -5152,4 +5152,73 @@ theorem step_storageLive_lm3_2_simulation
     · left
       simp only [hk, Array.getElem?_set, ↓reduceIte]
 
+/-! ## Typed Copy of a Dangling Reference -/
+
+/-- **`step_safeRef_copy_dangling_validity_divergence` (`LM-3.2`, genuine
+divergence)**: a typed copy `_d = copy _r` of a safe reference `_r : &T`
+whose pointee local has been killed by `StorageDead`:
+
+1. Anneal's `evalOperand` reads the dangling reference `.ptr p 8` without any
+   check (Anneal validates a reference only when it is dereferenced), and the
+   real step is the lockstep `StepRelLM3_2` of `step_safeRef_use_simulation`:
+   `annealRvalueHooks.copyOp` writes the pointer without validating it;
+2. the vendored validity visitor rejects the copied value
+   (`ValidityVisitor.validatePlace` on `_r`: "encountered a dangling reference
+   (use-after-free)"). Miri's `copy_op` validates its destination when
+   validity is enforced (`writePlaceImmediate` → `validate`), and that
+   destination holds exactly this value, so in Miri the typed copy itself is
+   undefined behavior.
+
+Both semantics are fixed (`trusted/lean`, `lean-miri/vendor`): Anneal defers
+the undefined behavior of a dangling reference to its first dereference, while
+Miri reports it at the first typed copy. -/
+theorem step_safeRef_copy_dangling_validity_divergence
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨srcIdx, .nil⟩)), span⟩)
+    {dstDecl srcDecl : LocalDecl} {srcMut dstMut : Mutability}
+    {dstPointee : RigidTy} {targetDecl : LocalDecl}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
+    (hsrc_ty : srcDecl.ty.kind = .ref srcMut targetDecl.ty.kind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame srcIdx)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv} {e : AllocMapEntry}
+    (hslot_src : get? s.frame.locals srcIdx = some (.init (.ptr p 8)))
+    (hptr : PtrRel allocMap p mptr) (he : e ∈ allocMap) (htag : e.tag = p.tag)
+    (hdecl_t : get? body.localDecls e.localIdx = some targetDecl)
+    (hdead_t : get? s.frame.locals e.localIdx = some .dead)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) (hlt : srcIdx < tf.locals.size)
+    (hval_src : (tf.locals[srcIdx]'hlt).value =
+      .live (.immediate (.scalar (.fromPointer annealTargetDataLayout mptr))))
+    (fuel : Nat) :
+    evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals = .ok (.ptr p 8) s.frame.locals ∧
+    StepRelLM3_2 body m allocMap (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks body.layouts) srcDecl.ty
+        (fuel + 1) ⟨.local 0 srcIdx none tf.localsIdentity, translateTy srcDecl.ty body.layouts⟩
+        false false m =
+      .error (.undefinedBehavior
+        "validation: encountered a dangling reference (use-after-free)") m := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨d, hd, hprim⟩ := halloc.target_decl e he
+  rw [hdecl_t] at hd
+  cases hd
+  refine ⟨?_, step_safeRef_use_simulation hstate hphase (Or.inl rfl) hbb hstmt hdecl_dst
+    hdecl_src hsrc_ty hdst_ty himm, ?_⟩
+  · unfold evalOperand
+    dsimp only []
+    rw [hslot_src]
+    rfl
+  · exact ((validatePlace_ref_nonrecursive_simulation hstate hframes hlt hprim hsrc_ty fuel).2.2.2
+      hptr he htag ⟨targetDecl, hdecl_t, rfl⟩ hval_src).2.2 hdead_t
+
 end LeanMiriSpec.Correspondence

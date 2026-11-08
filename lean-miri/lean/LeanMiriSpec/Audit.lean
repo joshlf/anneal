@@ -7513,6 +7513,50 @@ open LeanMiriSpec.Correspondence in
   Witness.lm32RunVisitRefBoolRecursive
   Witness.wit_lm3_2_recursive_ref_pointee_validity
 
+/-! ### `LM-3.2` A1 statement pins -/
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx srcIdx : Local} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨srcIdx, .nil⟩)), span⟩)
+    {dstDecl srcDecl : MirAst.LocalDecl} {srcMut dstMut : Mutability}
+    {dstPointee : RigidTy} {targetDecl : MirAst.LocalDecl}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_src : get? body.localDecls srcIdx = some srcDecl)
+    (hsrc_ty : srcDecl.ty.kind = .ref srcMut targetDecl.ty.kind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame srcIdx)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv} {e : AllocMapEntry}
+    (hslot_src : get? s.frame.locals srcIdx = some (.init (.ptr p 8)))
+    (hptr : PtrRel allocMap p mptr) (he : e ∈ allocMap) (htag : e.tag = p.tag)
+    (hdecl_t : get? body.localDecls e.localIdx = some targetDecl)
+    (hdead_t : get? s.frame.locals e.localIdx = some .dead)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) (hlt : srcIdx < tf.locals.size)
+    (hval_src : (tf.locals[srcIdx]'hlt).value =
+      .live (.immediate (.scalar (.fromPointer annealTargetDataLayout mptr))))
+    (fuel : Nat) :
+    evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
+        body.layouts s.memory.callerLocals = .ok (.ptr p 8) s.frame.locals ∧
+    StepRelLM3_2 body m allocMap (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks body.layouts) srcDecl.ty
+        (fuel + 1) ⟨.local 0 srcIdx none tf.localsIdentity, translateTy srcDecl.ty body.layouts⟩
+        false false m =
+      .error (.undefinedBehavior
+        "validation: encountered a dangling reference (use-after-free)") m :=
+  step_safeRef_copy_dangling_validity_divergence hstate hphase hbb hstmt hdecl_dst hdecl_src hsrc_ty hdst_ty himm hslot_src hptr he htag hdecl_t hdead_t hframes hlt hval_src fuel
+
+open LeanMiriSpec.Correspondence in
+#assert_standard_axioms
+  step_safeRef_copy_dangling_validity_divergence
+
 end StatementPins
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
