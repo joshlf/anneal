@@ -958,6 +958,7 @@ _X20_FATAL_ERROR_MARKERS: tuple[str, ...] = (
     "unavailable",
     "resource_exhausted",
     "internal error",
+    "open failed for",
 )
 
 
@@ -975,21 +976,21 @@ def _is_x20_remote_not_found(output: str, x20_uri: str) -> bool:
     """
     lower = output.lower()
     uri = x20_uri.strip().rstrip("/").lower()
-    if not uri:
+    if not uri.startswith("/x20/") or len(uri) <= len("/x20/"):
         return False
     # `fileutil` echoes the URI (and its `/x20`-relative form) back in its
-    # messages; drop those echoes before looking for veto markers so that a
-    # path merely *named* e.g. `.../unavailable/anneal.bundle` cannot turn a
-    # genuine NOT_FOUND into an (overly) fatal error.
-    rel = uri[len("/x20") :] if uri.startswith("/x20/") else uri
+    # messages; drop those echoes before looking for veto markers or protocol
+    # tokens so that a path merely *named* e.g. `.../unavailable/...` or
+    # `.../storage_x20/no_such_file_or_directory/...` cannot misclassify errors.
+    rel = uri[len("/x20") :]
     scrubbed = lower.replace(uri, " ").replace(rel, " ")
     if any(marker in scrubbed for marker in _X20_FATAL_ERROR_MARKERS):
         return False
     if f"not_found: {uri}:" in lower:
         return True
     return (
-        "storage_x20" in lower
-        and "no_such_file_or_directory" in lower
+        "storage_x20" in scrubbed
+        and "no_such_file_or_directory" in scrubbed
         and uri in lower
     )
 
@@ -1226,7 +1227,7 @@ def parse_bundle_heads(
         if not line:
             continue
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) != 2:
             return (
                 False,
                 {},
@@ -1299,18 +1300,44 @@ def _worktree_git_dir(wt_path: Path) -> Path | None:
         return gd_path
 
 
-def _worktree_detached_target_ref(git_dir: Path) -> str | None:
-    """Returns the normalized branch ref being rebased/bisected in `git_dir`, if any."""
+def _worktree_detached_target_refs(git_dir: Path) -> set[str]:
+    """Returns normalized branch refs being rebased/bisected/update-reffed in `git_dir`."""
+    refs: set[str] = set()
     for rel in ("rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"):
         p = git_dir / rel
         try:
             if p.is_file():
                 val = p.read_text(encoding="utf-8", errors="replace").strip()
                 if val:
-                    return normalize_git_ref(val)
+                    refs.add(normalize_git_ref(val))
         except OSError:
             continue
-    return None
+    update_refs_file = git_dir / "rebase-merge" / "update-refs"
+    try:
+        if update_refs_file.is_file():
+            for raw_line in (
+                update_refs_file.read_text(encoding="utf-8", errors="replace")
+                .splitlines()
+            ):
+                line = raw_line.strip()
+                if line.startswith("refs/"):
+                    refs.add(normalize_git_ref(line))
+    except OSError:
+        pass
+    for todo_name in ("git-rebase-todo", "done"):
+        todo_file = git_dir / "rebase-merge" / todo_name
+        try:
+            if todo_file.is_file():
+                for raw_line in (
+                    todo_file.read_text(encoding="utf-8", errors="replace")
+                    .splitlines()
+                ):
+                    parts = raw_line.strip().split()
+                    if len(parts) >= 2 and parts[0] in ("update-ref", "u"):
+                        refs.add(normalize_git_ref(parts[1]))
+        except OSError:
+            continue
+    return refs
 
 
 def _worktree_in_progress_operation(git_dir: Path) -> str | None:
@@ -1401,13 +1428,14 @@ def _sync_local_ref_to_remote(
             return (False, f"Cannot resolve worktree path {wt_str}")
 
         wt_git_dir = _worktree_git_dir(wt_path)
-        if wt_git_dir is not None:
-            detached_ref = _worktree_detached_target_ref(wt_git_dir)
-            if detached_ref == normalized_ref:
-                return (
-                    False,
-                    f"{normalized_ref} has an active rebase or bisect in worktree {wt_path}",
-                )
+        if (
+            wt_git_dir is not None
+            and normalized_ref in _worktree_detached_target_refs(wt_git_dir)
+        ):
+            return (
+                False,
+                f"{normalized_ref} has an active rebase or bisect in worktree {wt_path}",
+            )
 
         if entry.get("branch") != normalized_ref:
             continue

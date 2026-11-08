@@ -1602,6 +1602,64 @@ class TestVerifyBundleFF(unittest.TestCase):
             v_same = alr.verify_bundle_ff(identical, repo_dir=repo)
             self.assertEqual(v_same["status"], "stale_behind")
 
+            # A head line with extra trailing tokens is rejected by `parse_bundle_heads`.
+            with mock.patch.object(
+                alr,
+                "_run_git",
+                return_value=subprocess.CompletedProcess(
+                    ["git"], 0, f"{c2} refs/heads/unstable extra_token\n", ""
+                ),
+            ):
+                ok_extra, heads_extra, err_extra = alr.parse_bundle_heads(good)
+            self.assertFalse(ok_extra)
+            self.assertEqual(heads_extra, {})
+            self.assertIn("Malformed line", err_extra or "")
+
+    def test_rebase_update_refs_blocks_sync_if_behind(self) -> None:
+        """When a stacked branch rebase (`git rebase --update-refs`) is active on a
+        top branch while `refs/heads/unstable` is queued in `rebase-merge/update-refs`
+        or `rebase-merge/git-rebase-todo`, `--sync-if-behind` must refuse to move
+        `refs/heads/unstable` underneath the rebase."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            repo = tmp_p / "repo"
+            _init_repo(repo)
+            c1 = _commit_file(repo, "a.txt", "1\n", "c1")
+            c2 = _commit_file(repo, "a.txt", "2\n", "c2")
+            _git(repo, "branch", "unstable", c2)
+            bundle = _make_bundle(repo, tmp_p / "b.bundle", "refs/heads/unstable")
+            _git(repo, "branch", "-f", "unstable", c1)
+
+            wt = tmp_p / "wt-stack"
+            _git(repo, "worktree", "add", "-q", "--detach", str(wt), c1)
+            wt_git_dir = alr._worktree_git_dir(wt)
+            assert wt_git_dir is not None
+            rb_dir = wt_git_dir / "rebase-merge"
+            rb_dir.mkdir(parents=True)
+            (rb_dir / "head-name").write_text("refs/heads/feature-top\n", encoding="utf-8")
+            (rb_dir / "update-refs").write_text(
+                f"refs/heads/unstable\n{c1}\n", encoding="utf-8"
+            )
+            v_ur = alr.verify_bundle_ff(bundle, repo_dir=repo, sync_if_behind=True)
+            self.assertFalse(v_ur["ok"])
+            self.assertEqual(v_ur["status"], "stale_behind")
+            self.assertIn("active rebase or bisect", v_ur["message"])
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
+
+            (rb_dir / "update-refs").unlink()
+            (rb_dir / "git-rebase-todo").write_text(
+                f"pick {c1} c1\nupdate-ref refs/heads/unstable\n", encoding="utf-8"
+            )
+            v_todo = alr.verify_bundle_ff(bundle, repo_dir=repo, sync_if_behind=True)
+            self.assertFalse(v_todo["ok"])
+            self.assertEqual(v_todo["status"], "stale_behind")
+            self.assertIn("active rebase or bisect", v_todo["message"])
+            self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
+            (rb_dir / "git-rebase-todo").unlink()
+            (rb_dir / "head-name").unlink()
+            rb_dir.rmdir()
+            _git(repo, "worktree", "remove", "--force", str(wt))
+
     def test_sync_missing_ref_on_unborn_checked_out_branch(self) -> None:
         """`git init -b unstable` checks out an unborn <ref>: create it via
         `reset --hard` only when that worktree is clean."""
@@ -1890,6 +1948,20 @@ class TestX20Staging(unittest.TestCase):
         self.assertFalse(
             alr._is_x20_remote_not_found(f"DEADLINE_EXCEEDED: rpc\n{odd_msg}", odd_uri)
         )
+        # Conversely, a path containing `storage_x20` and `no_such_file_or_directory`
+        # must not spoof a missing-remote classification on a non-missing error.
+        spoof_uri = (
+            "/x20/teams/storage_x20/no_such_file_or_directory/anneal.bundle"
+        )
+        self.assertFalse(
+            alr._is_x20_remote_not_found(
+                f"E0000 couldn't copy `{spoof_uri}': generic::invalid_argument: bad request",
+                spoof_uri,
+            )
+        )
+        # Bare `/x20/` root is never a remote bundle file.
+        self.assertFalse(alr._is_x20_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, "/x20/"))
+        self.assertFalse(alr._is_x20_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, "/x20"))
 
     def _setup(self, tmp_p: Path) -> tuple[Path, Path, Path, str]:
         repo = tmp_p / "repo"
