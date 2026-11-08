@@ -22,6 +22,9 @@ import LeanMiriSpec.Correspondence.WitLM1_4
 import LeanMiriSpec.Correspondence.AllocLM2_1
 import LeanMiriSpec.Correspondence.SimLM2_1
 import LeanMiriSpec.Correspondence.WitLM2_1
+import LeanMiriSpec.Correspondence.PtrLM3_1
+import LeanMiriSpec.Correspondence.SimLM3_1
+import LeanMiriSpec.Correspondence.WitLM3_1
 import LeanMiriSpec.Audit
 
 /-!
@@ -78,6 +81,19 @@ import LeanMiriSpec.Audit
   re-establishing `LiveAllocsNodup` and local immediacy so that array statements
   chain.
 * `LeanMiriSpec.Correspondence.WitLM2_1`: non-vacuity witnesses for `LM-2.1`.
+* `LeanMiriSpec.Correspondence.PtrLM3_1`: raw pointer and allocation-map invariants
+  (`AllocMapRel`, `PtrRel`), pointer resolution (`annealResolvePtr`), bounds/alignment
+  validation (`checkAndDerefPtr`), and `Miri.Interpreter.ptrOffsetInbounds` (`LM-3.1`).
+* `LeanMiriSpec.Correspondence.SimLM3_1`: `LM-3.1` correspondence for `Rvalue.RawPtr`
+  (`&raw const`/`&raw mut`) with `forceAllocation`, `PlaceElem.Deref` (`*ptr`) reads,
+  writes, and UB, `StorageLive`/`StorageDead` on address-taken locals,
+  `BinOp.Offset` (`inbounds` vs. `wrapping`, including zero-count offsets across
+  all exact-layout pointee strides), relational raw-pointer comparisons (`Eq`..`Ge`),
+  `UnOp.PtrMetadata`, `CastKind.PtrToPtr`, pointer/integer exposure casts, and
+  `StateRelLM3_1` root-frame terminators (`Goto`, scalar and raw-pointer `Return`,
+  `Unreachable`, `SwitchInt`, and `Assert`).
+* `LeanMiriSpec.Correspondence.WitLM3_1`: standalone and end-to-end real-step
+  (`Miri.Interpreter.Step.step`) witnesses for `LM-3.1`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
