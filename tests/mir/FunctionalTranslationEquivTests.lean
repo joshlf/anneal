@@ -118,11 +118,6 @@ Kernel-checked verification test suites for `Anneal.FunctionalTranslation` over
 @[reducible] private def locPlace (idx : Local) : Place :=
   { local_ := idx, projection := [] }
 
-private theorem nat_add_eq (a b : Nat) : a.add b = a + b := rfl
-
-private theorem scalarModulus_four : scalarModulus 4 = 4294967296 := by decide
-private theorem scalarModulus_eight : scalarModulus 8 = 18446744073709551616 := by decide
-
 /-- Non-dead local slot helper (`none ↦ .uninit`, `some v ↦ .init v`). -/
 @[reducible] private def optSlot : Option Value → LocalSlot
   | none => .uninit
@@ -166,47 +161,43 @@ private theorem evalScalarBinOp_add_usize
     (h_lt : a + b < 18446744073709551616) :
     evalScalarBinOp .add ⟨a, 8⟩ ⟨b, 8⟩ locals mem false =
       .ok (.scalar ⟨a + b, 8⟩) locals mem := by
-  unfold evalScalarBinOp
-  dsimp only
-  rw [nat_add_eq, scalarModulus_eight, wrapScalarBits_of_lt h_lt]
+  unfold evalScalarBinOp; dsimp only
+  rw [show wrapScalarBits (a.add b) (scalarModulus 8) = a + b from wrapScalarBits_of_lt h_lt]
 
 private theorem evalScalarBinOp_addUnchecked_u32
     {a b : Nat} {locals : List LocalSlot} {mem : Memory}
     (h_lt : a + b < 4294967296) :
     evalScalarBinOp .addUnchecked ⟨a, 4⟩ ⟨b, 4⟩ locals mem false =
       .ok (.scalar ⟨a + b, 4⟩) locals mem := by
-  unfold evalScalarBinOp
-  dsimp only
-  rw [nat_add_eq, scalarModulus_four, nat_ble_eq_false_of_lt h_lt]
+  unfold evalScalarBinOp; dsimp only
+  rw [show Nat.ble (scalarModulus 4) (a.add b) = false from nat_ble_eq_false_of_lt h_lt]
+  rfl
 
 private theorem evalScalarBinOp_addUnchecked_usize
     {a b : Nat} {locals : List LocalSlot} {mem : Memory}
     (h_lt : a + b < 18446744073709551616) :
     evalScalarBinOp .addUnchecked ⟨a, 8⟩ ⟨b, 8⟩ locals mem false =
       .ok (.scalar ⟨a + b, 8⟩) locals mem := by
-  unfold evalScalarBinOp
-  dsimp only
-  rw [nat_add_eq, scalarModulus_eight, nat_ble_eq_false_of_lt h_lt]
+  unfold evalScalarBinOp; dsimp only
+  rw [show Nat.ble (scalarModulus 8) (a.add b) = false from nat_ble_eq_false_of_lt h_lt]
+  rfl
 
 private theorem evalScalarBinOp_addWithOverflow_u32
     {a b : Nat} {locals : List LocalSlot} {mem : Memory}
     (h_lt : a + b < 4294967296) :
     evalScalarBinOp .addWithOverflow ⟨a, 4⟩ ⟨b, 4⟩ locals mem false =
       .ok (.aggregate 0 [.scalar ⟨a + b, 4⟩, .scalar ⟨0, 1⟩]) locals mem := by
-  unfold evalScalarBinOp
-  dsimp only
-  rw [nat_add_eq, scalarModulus_four, wrapScalarBits_of_lt h_lt,
-      nat_ble_eq_false_of_lt h_lt]
+  unfold evalScalarBinOp; dsimp only
+  rw [show wrapScalarBits (a.add b) (scalarModulus 4) = a + b from wrapScalarBits_of_lt h_lt,
+      show Nat.ble (scalarModulus 4) (a.add b) = false from nat_ble_eq_false_of_lt h_lt]
 
 private theorem evalScalarBinOp_lt_usize_of_lt
     {a b : Nat} {locals : List LocalSlot} {mem : Memory}
     (h_lt : a < b) :
     evalScalarBinOp .lt ⟨a, 8⟩ ⟨b, 8⟩ locals mem false =
       .ok (.scalar ⟨1, 1⟩) locals mem := by
-  unfold evalScalarBinOp
-  dsimp only
-  rw [nat_ble_eq_false_of_lt h_lt]
-  rfl
+  unfold evalScalarBinOp; dsimp only
+  rw [nat_ble_eq_false_of_lt h_lt]; rfl
 
 /-! ## Suite 4: Pillar 4 Program-to-Program Layer 1A Refinement (`≤` and `=`) -/
 
@@ -690,8 +681,8 @@ theorem branchlessMulDouble_obsErased_equiv_branchingSelectDouble
   have h_2x : wrapScalarBits (x + x) (scalarModulus 4) = x + x :=
     wrapScalarBits_of_lt (show x + x < 4294967296 by omega)
   refine verifyObsErasedStatefulEquivByTransPlan
-    (implPlan := .ret 6)
-    (specPlan := .splitBranch (.ret 2) (.ret 2) 1)
+    (implPlan := .ret)
+    (specPlan := .splitBranch .ret .ret)
     (expectedRet := .scalar ⟨if flag then x + x else 0, 4⟩)
     (expectedMem := emptyMemory)
     ?_ ?_ <;> cases flag <;> rw [wpTransPlan]

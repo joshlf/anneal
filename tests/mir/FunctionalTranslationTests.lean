@@ -265,7 +265,7 @@ private theorem twoDiamond_args_inj {c1 c2 c1' c2' : Bool} {x x' : Nat}
     (h : [Value.scalar (boolToScalar c1), .scalar (boolToScalar c2), .scalar ⟨x, 4⟩] =
       [.scalar (boolToScalar c1'), .scalar (boolToScalar c2'), .scalar ⟨x', 4⟩]) :
     c1 = c1' ∧ c2 = c2' ∧ x = x' := by
-  cases c1 <;> cases c1' <;> cases c2 <;> cases c2' <;> simp_all [boolToScalar]
+  cases c1 <;> cases c1' <;> cases c2 <;> cases c2' <;> cases h <;> exact ⟨rfl, rfl, rfl⟩
 
 private def twoDiamondPreSwitchState (c1 c2 : Bool) (x : Nat) (bb : BasicBlockIdx) : MachineState :=
   { frame := {
@@ -464,21 +464,21 @@ private abbrev sumToNBranchState (bb n i : Nat) (sc : ScalarInt) : MachineState 
 
 private theorem sumToN_header_switch_raw
     (n i : Nat) (cmpOpt : Option Value) :
-    runMirToBinarySwitch 2 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
+    runMirToBinarySwitch 32 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
       let sc := boolToScalar (!Nat.ble n i)
       some (!sc.bits.beq 0, sc.bits, sumToNBranchState 2 n i sc, sumToNBranchState 3 n i sc) := by
   cases cmpOpt <;> rfl
 
 private theorem sumToN_header_switch_ge
     (i : Nat) (cmpOpt : Option Value) :
-    runMirToBinarySwitch 2 sumToNLoopBody (sumToNHeaderState i i cmpOpt) =
+    runMirToBinarySwitch 32 sumToNLoopBody (sumToNHeaderState i i cmpOpt) =
       some (false, 0, sumToNBranchState 2 i i ⟨0, 1⟩, sumToNBranchState 3 i i ⟨0, 1⟩) := by
   rw [sumToN_header_switch_raw, nat_ble_eq_true_of_le (Nat.le_refl i)]
   rfl
 
 private theorem sumToN_header_switch_lt
     {n i : Nat} (cmpOpt : Option Value) (h_lt : i < n) :
-    runMirToBinarySwitch 2 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
+    runMirToBinarySwitch 32 sumToNLoopBody (sumToNHeaderState n i cmpOpt) =
       some (true, 1, sumToNBranchState 2 n i ⟨1, 1⟩, sumToNBranchState 3 n i ⟨1, 1⟩) := by
   rw [sumToN_header_switch_raw, nat_ble_eq_false_of_lt h_lt]
   rfl
@@ -487,7 +487,7 @@ private theorem sumToN_body_step
     {n i : Nat}
     (h_acc_lt : arithSum i + i < 4294967296)
     (h_inc_lt : i + 1 < 4294967296) :
-    evalPlanToJoin sumToNLoopBody (.jump 1 4) (sumToNBranchState 2 n i ⟨1, 1⟩) =
+    evalPlanToJoin sumToNLoopBody (.jump 1) (sumToNBranchState 2 n i ⟨1, 1⟩) =
       some (sumToNState 1 n (i + 1) (arithSum i + i) (.init (.scalar ⟨1, 1⟩))) := by
   rw [← wrapU32_add h_acc_lt, ← wrapU32_add h_inc_lt]; rfl
 
@@ -500,7 +500,7 @@ private theorem wpTransPlan_sumToN_header
     ∀ (rem i : Nat) (cmpOpt : Option Value),
       i + rem = n →
       wpTransPlan mirNoCallWP sumToNLoopBody
-        (.loop 1 rem (.jump 1 4) (.ret 2) 2)
+        (.loop 1 rem (.jump 1) .ret)
         (· = .normal (.scalar ⟨arithSum n, 4⟩, emptyMemory))
         (sumToNHeaderState n i cmpOpt)
   | 0, i, cmpOpt, h_sum => by
@@ -537,13 +537,13 @@ theorem sumToNLoop_total_and_terminates (n : Nat) (hn : n ≤ 1000) :
     TotalVerificationResult (sumToNTotalClaim n) ∧
     MirTerminatesAndNoUB sumToNLoopBody [.scalar ⟨n, 4⟩] emptyMemory := by
   have h_plan :
-      wpTransPlan mirNoCallWP sumToNLoopBody (.seq 1 (.loop 1 n (.jump 1 4) (.ret 2) 2))
+      wpTransPlan mirNoCallWP sumToNLoopBody (.seq 1 (.loop 1 n (.jump 1) .ret))
         (· = .normal (.scalar ⟨arithSum n, 4⟩, emptyMemory))
         (initMachineStateWithMemory sumToNLoopBody [.scalar ⟨n, 4⟩] emptyMemory) := by
     rw [wpTransPlan]
     exact wpTransPlan_sumToN_header n hn n 0 none (Nat.zero_add n)
   refine ⟨verifyTotalByTransPlan (ewp := mirNoCallWP) (sumToNTotalClaim n)
-      (fun _ _ => .seq 1 (.loop 1 n (.jump 1 4) (.ret 2) 2)) ?_,
+      (fun _ _ => .seq 1 (.loop 1 n (.jump 1) .ret)) ?_,
     mirTerminatesAndNoUB_of_dwp (ewp := mirNoCallWP) (P := fun _ _ => True)
       (DWP.mono (fun _ _ h_eq => ⟨_, _, h_eq, trivial⟩)
         (dwp_mirStatefulTree_of_transPlan h_plan))⟩
@@ -566,7 +566,7 @@ theorem sumToNLoop_partial_by_coinductive_invariant (n : Nat) (hn : n ≤ 1000) 
   refine dwlp_of_runMirTauToBlock (targetBlock := 1) 7
     (s' := sumToNHeaderState n 0 none) rfl ?_
   refine dwlp_mirTree_while_invariant (ewp := mirDefaultWP) sumToNLoopBody
-    (fun s => ∃ i cmpOpt, i ≤ n ∧ s = sumToNHeaderState n i cmpOpt) 2 (.jump 1 4) (.ret 2) ?_
+    (fun s => ∃ i cmpOpt, i ≤ n ∧ s = sumToNHeaderState n i cmpOpt) 32 (.jump 1) .ret ?_
     ⟨0, none, Nat.zero_le n, rfl⟩
   rintro s ⟨i, cmpOpt, h_le, rfl⟩
   rcases Nat.lt_or_eq_of_le h_le with h_lt | rfl

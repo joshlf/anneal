@@ -151,9 +151,7 @@ theorem addBoundedClaim_verified : VerificationResult addBoundedClaim := by
   rintro _ ⟨a, b, ha, hb, rfl⟩
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · simp_all; omega
-  · intro a' b' h_args
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-    rcases h_args with ⟨rfl, rfl⟩
+  · rintro _ _ ⟨⟩
     simp; omega
 
 def addBoundedTotalClaim : TotalClaim where
@@ -228,9 +226,7 @@ theorem advanceOffsetSymClaim_verified :
   dsimp [scalarModulus, scalarPow2] at hb
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · trivial
-  · rintro ⟨b', hb', h_pre⟩ b'' h_args
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_pre h_args
-    subst h_pre; subst h_args
+  · rintro ⟨_, hb', ⟨⟩⟩ _ ⟨⟩
     simp; omega
 
 theorem advanceOffsetSym_holdsWithSafety :
@@ -407,9 +403,7 @@ theorem clampOrStepClaim_verified : VerificationResult clampOrStepClaim := by
   have hx20 : x < 20 := ((clampReqMir_iff_arith x).1 h_req).1
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
   · refine ⟨mirBoolPredicateHolds_of_wp_fuelFree clampEnsMir _, ?_⟩
-    intro x' h_args
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-    subst h_args
+    rintro _ ⟨⟩
     have h_not_lt : ¬ (x < 10) := by simp_all
     simp [h_not_lt]
   · simp_all; omega
@@ -419,9 +413,7 @@ theorem clampOrStepClaim_verified : VerificationResult clampOrStepClaim := by
       rw [← wpMirSym_eq_wpMirBounded]
       (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
       all_goals first | (rintro _ _ ⟨⟩; rfl) | (simp_all; omega)), ?_⟩
-    intro x' h_args
-    simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-    subst h_args
+    rintro _ ⟨⟩
     simp [h_lt10, h_wrap]
 
 /-- Pinned 1-argument `u32` `#[spec(requires: magic == 7, ensures: ret == 7)]` test. -/
@@ -1238,10 +1230,7 @@ theorem sliceHelperPipeline_verified :
     | ((conv => arg 3; reduce); apply SymConv.step; conv => whnf)
     | (simp only [h_mod, h_half, h_wrap, h_neg, h_mul, h_d, h_c, h_o, h_sub, Bool.not_false];
        conv => whnf))
-  intro p' len' mid' h_args
-  simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
-    Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
-  rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
+  rintro _ _ _ ⟨⟩
   have h_ble_sub : Nat.ble 18446744073709551616 (len - mid) = false :=
     (nat_ble_eq_false_iff _ _).2 (by omega)
   simp [h_ble_sub]
@@ -1426,11 +1415,7 @@ indirect `TerminatorKind.call` across all 256 `u8` inputs.
 theorem reifyAndCallFnPtr_verified :
     VerificationResult reifyAndCallFnPtrClaim := by
   refine verifyByWPFuelFree reifyAndCallFnPtrClaim ?_
-  rintro _ ⟨x, _, rfl⟩
-  intro x' h_args
-  simp only [List.cons.injEq, Value.scalar.injEq, ScalarInt.mk.injEq, and_true] at h_args
-  subst h_args
-  -- `simp` leaves the `u8` range side condition `x % 2 < 256`.
+  rintro _ ⟨x, _, rfl⟩ _ ⟨⟩
   simp <;> omega
 
 /--
@@ -1596,10 +1581,7 @@ theorem guardedSliceLenSub_verified :
   have h_ble : Nat.ble mid len = true := Nat.ble_eq_true_of_le h_le
   have h_sub : len - mid < 18446744073709551616 := by omega
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-  · intro p' len' mid' h_args
-    simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
-      Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
-    rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
+  · rintro _ _ _ ⟨⟩
     simp; exact h_sub
   · simp_all
   · simp_all
@@ -1685,10 +1667,7 @@ theorem guardedPanicCall_verified :
   refine verifyByWPSafeFuelFree guardedPanicCallClaim ?_
   rintro _ ⟨p, len, mid, h_len, h_mid, rfl⟩
   (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-  · intro p' len' mid' h_le h_args
-    simp only [List.cons.injEq, Value.aggregate.injEq, Value.ptr.injEq,
-      Value.scalar.injEq, ScalarInt.mk.injEq, and_true, true_and] at h_args
-    rcases h_args with ⟨⟨rfl, rfl⟩, rfl⟩
+  · rintro _ _ _ h_le ⟨⟩
     have h_sub : len - mid < 18446744073709551616 := by omega
     simp; exact h_sub
   · simp_all
@@ -1849,14 +1828,8 @@ theorem externalSpecSliceCaller_verified :
     "core::slice::from_raw_parts_mut"
     [.uint .u8]
     extFromRawPartsMutSidecarMir
-    (fun args =>
-      ∃ p len,
-        len < 18446744073709551616 ∧
-        args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
-    (fun args ret =>
-      ∀ p len,
-        args = [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }] →
-        ret = .aggregate 0 [.ptr p 8, .scalar { bits := len, sizeBytes := 8 }])
+    _
+    _
     externalSpecSliceCallerMir
     [coreSliceLenMir]
     externalSpecSliceCallerClaim.pre
@@ -1866,26 +1839,14 @@ theorem externalSpecSliceCaller_verified :
   rintro _ _ ⟨p, len, hp, hlen, rfl, rfl⟩
   (conv => whnf)
   refine ⟨⟨rfl, rfl, rfl, ⟨Or.inl ⟨p, 8, rfl⟩, ⟨len, hlen, rfl⟩, trivial⟩, ⟨p, len, hlen, rfl⟩⟩, ?_⟩
-  rintro ans h_post
-  cases ans with
-  | returned retVal memAfter =>
-    rcases h_post with ⟨_, _, h_ens⟩
-    have h_ret := h_ens p len rfl
-    subst h_ret
+  rintro (⟨retVal, memAfter⟩ | _ | _) h_post
+  · rcases h_post with ⟨_, _, h_ens⟩
+    obtain rfl := h_ens p len rfl
     (conv => whnf)
-    rintro retVal' mem' h_out p' len' h_args
-    injection h_out with h_pair
-    injection h_pair with h_rv _
-    subst h_rv
-    simp only [List.cons.injEq, Value.ptr.injEq, Value.scalar.injEq,
-      ScalarInt.mk.injEq, and_true] at h_args
-    rcases h_args with ⟨rfl, rfl⟩
+    rintro _ _ ⟨⟩ _ _ ⟨⟩
     rfl
-  | panicked memAfter =>
-    exact False.elim h_post
-  | aborted =>
-    intro _ _ h_eq
-    cases h_eq
+  · exact h_post.elim
+  · rintro _ _ ⟨⟩
 
 /--
 Kernel-checked compositional caller–callee linking via
@@ -1917,19 +1878,12 @@ theorem externalSpecSliceCaller_linked_verified :
     abortExternalCalls
     ?_
     ?_
-  · rintro req h_path ⟨_, h_typeArgs, _, _, ⟨p, len, h_len_lt, h_args⟩⟩
-    cases req with
-    | mk defPath typeArgs args memory =>
-      dsimp only at h_path h_typeArgs h_args ⊢
-      subst h_path h_typeArgs h_args
-      refine ⟨callFrameAndTraitsPreserved_restoreCallerMemoryFrame_same_fnPtrs memory _ rfl, ?_, ?_⟩
-      · exact ⟨p, 8, len, h_len_lt, rfl⟩
-      · intro p' len' h_eq
-        simp only [List.cons.injEq, Value.ptr.injEq, Value.scalar.injEq,
-          ScalarInt.mk.injEq, and_true] at h_eq
-        rcases h_eq with ⟨rfl, rfl⟩
-        rfl
-  · rintro req h_ne ⟨h_eq, _⟩
+  · rintro ⟨defPath, typeArgs, args, memory⟩ rfl ⟨_, rfl, _, _, ⟨p, len, h_len_lt, rfl⟩⟩
+    refine ⟨callFrameAndTraitsPreserved_restoreCallerMemoryFrame_same_fnPtrs memory _ rfl,
+      ⟨p, 8, len, h_len_lt, rfl⟩, ?_⟩
+    rintro _ _ ⟨⟩
+    rfl
+  · rintro _ h_ne ⟨h_eq, _⟩
     exact False.elim (h_ne h_eq)
 
 /--

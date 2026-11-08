@@ -237,12 +237,8 @@ theorem example_branch_obs_trace_verified :
     TraceVerificationResult branchObsTraceClaim := by
   refine verifyTraceMirFuelFree branchObsTraceClaim ?_
   rintro _ _ ⟨(rfl | rfl), rfl⟩
-  · refine ⟨fun hf => hf, fun o => ?_⟩
-    cases o
-    exact ⟨fun _ => ⟨rfl, _, rfl⟩, fun h_abs => by simp at h_abs⟩
-  · refine ⟨fun hf => hf, fun o => ?_⟩
-    cases o
-    exact ⟨fun h_abs => by simp at h_abs, fun _ => ⟨rfl, _, rfl⟩⟩
+  · exact ⟨fun hf => hf, fun | .unit => ⟨fun _ => ⟨rfl, _, rfl⟩, fun h_abs => by simp at h_abs⟩⟩
+  · exact ⟨fun hf => hf, fun | .unit => ⟨fun h_abs => by simp at h_abs, fun _ => ⟨rfl, _, rfl⟩⟩⟩
 
 /-! ## 4. Tree Borrows Mutable Reborrowing vs. Disabled-Child Aliasing UB -/
 
@@ -660,8 +656,8 @@ theorem unalign_set_mir_verified :
       rfl, rfl, rfl⟩, rfl⟩,
     ⟨⟨{ tag := 2, targetLocal := 4, targetProjection := [], perm := .frozen },
       rfl, (fun h => nomatch h)⟩, rfl⟩,
-    ⟨(fun _ _ ha => nomatch ha), fun tag ht => ?_⟩⟩
-  simp at ht; subst ht; rfl
+    ⟨(fun _ _ ha => nomatch ha), ?_⟩⟩
+  rintro _ (_ | ⟨_, ⟨⟩⟩); rfl
 
 theorem unalign_set_mir_framed_verified :
     StatefulVerificationResult
