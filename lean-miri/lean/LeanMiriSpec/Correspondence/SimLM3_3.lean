@@ -266,4 +266,58 @@ theorem sim_lm3_3_foreign_read_step (perm : TreeBorrowPerm) (isProtected : Bool)
     | exact Or.inl ⟨by decide, _, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
     | exact Or.inr ⟨by decide, rfl⟩
 
+/-! ## Parent-child reborrow hierarchy accesses (`I-10` & `I-11`) -/
+
+/-- State with `_1 = 7`, `_2` holding parent root tag `1` (permission
+`parentPerm`, unprotected), and `_3` holding child reborrow tag `2`
+(`parentTag = some 1`, permission `childPerm`, protected iff `isProtected`). -/
+def reborrowHierarchyState (parentPerm childPerm : TreeBorrowPerm)
+    (isProtected : Bool) : MachineState :=
+  simState [.uninit, .init (.scalar ⟨7, 8⟩), .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)]
+    [entry 2 childPerm (some 1) (protOf isProtected), entry 1 parentPerm none none]
+    isProtected
+
+/-- **`sim_lm3_3_reborrow_child_write_step`**: across all 6 parent permissions,
+all 6 child permissions, and both child protector settings (`6 × 6 × 2 = 72`
+combinations), Anneal's real step of `(*_3) = const 99` through the child
+reborrow tag `2` (`parentTag = some 1`) corresponds via `StepTreeRel` to Miri's
+normal-tree write from node `0` (tag `2`), which visits both the child node `0`
+and its parent node `1` as `LocalAccess` writes. -/
+theorem sim_lm3_3_reborrow_child_write_step
+    (parentPerm childPerm : TreeBorrowPerm) (isProtected : Bool) :
+    TreeBorrowsRel (reborrowHierarchyState parentPerm childPerm isProtected).memory.borrows
+      (activeOf isProtected)
+      (basedNormalTree (reborrowHierarchyState parentPerm childPerm isProtected).memory.borrows
+        (activeOf isProtected)) ∧
+    StepTreeRel
+      (stepMirFn foreignWriteBody (reborrowHierarchyState parentPerm childPerm isProtected))
+      ((basedNormalTree (reborrowHierarchyState parentPerm childPerm isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 0 .Write .VisitChildrenOfAccessed) := by
+  rcases parentPerm with _ | (_ | _) | _ | _ | _ | _ <;>
+    rcases childPerm with _ | (_ | _) | _ | _ | _ | _ <;>
+    cases isProtected <;>
+    refine ⟨⟨rfl, by decide, rfl, rfl, rfl⟩, ?_⟩ <;>
+    first
+    | exact Or.inl ⟨by decide, _, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
+    | exact Or.inr ⟨by decide, rfl⟩
+
+/-- **`sim_lm3_3_reborrow_parent_write_invalidates_child_step`**: across all 6
+child permissions and both child protector settings, Anneal's real step of
+`(*_2) = const 99` through the parent tag `1` (`parentPerm = .unique`) in the
+parent-child hierarchy corresponds via `StepTreeRel` to Miri's normal-tree write
+from node `1` (tag `1`), which visits the parent node `1` as a `LocalAccess`
+write and visits the child reborrow node `0` (tag `2`, `parentTag = some 1`) as
+a `ForeignAccess` write. -/
+theorem sim_lm3_3_reborrow_parent_write_invalidates_child_step
+    (childPerm : TreeBorrowPerm) (isProtected : Bool) :
+    StepTreeRel
+      (stepMirFn childWriteBody (reborrowHierarchyState .unique childPerm isProtected))
+      ((basedNormalTree (reborrowHierarchyState .unique childPerm isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 1 .Write .VisitChildrenOfAccessed) := by
+  rcases childPerm with _ | (_ | _) | _ | _ | _ | _ <;>
+    cases isProtected <;>
+    first
+    | exact Or.inl ⟨by decide, _, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
+    | exact Or.inr ⟨by decide, rfl⟩
+
 end LeanMiriSpec.Correspondence.SimLM3_3

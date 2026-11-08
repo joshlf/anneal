@@ -296,4 +296,110 @@ theorem wit_lm3_3_unsafe_cell_vs_freeze_real_steps :
     ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, by decide,
       ⟨by decide, by decide, rfl, rfl, rfl⟩, by decide⟩⟩
 
+/-! ## (e) `&mut UnsafeCell<u32>` (`ReservedIM`) lifecycle vs. `Cell` -/
+
+/-- ```text
+bb0: _2 = &mut _1;               // tag 1: ReservedIM for UnsafeCell<u32>
+     _3 = &raw mut _1;           // tag 2: unrelated raw tag (Unique)
+     (*_3) = const 10_u32;       // foreign write: ReservedIM survives!
+     (*_2) = const 20_u32;       // child write: ReservedIM activates to Unique!
+     _1 = const 30_u32;          // foreign write: Unique is now disabled!
+     _0 = copy (*_2);            // child read through disabled tag 1 -> UB!
+     return
+``` -/
+def bodyE : CapturedMir :=
+  witBody "lm_3_3_witness::reserved_im_lifecycle" 4
+    [declOf u32T, declOf unsafeCellU32T, refMutDecl unsafeCellU32T.kind,
+      rawMutDecl unsafeCellU32T.kind]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.assign (loc 3) (.rawPtr .mut (loc 1))),
+     stmt (.assign (deref 3) (.use (cU32 10))),
+     stmt (.assign (deref 2) (.use (cU32 20))),
+     stmt (.assign (loc 1) (.use (cU32 30))),
+     stmt (.assign (loc 0) (.use (.copy (deref 2))))]
+
+/-- **(e) `wit_lm3_3_reservedIM_lifecycle_real_steps`** (certifying the
+separation between `ReservedIM` and `Cell`):
+1. `_2 = &mut _1` on `_1 : UnsafeCell<u32>` creates tag `1` in `ReservedIM`
+   (`.reservedIM`);
+2. `_3 = &raw mut _1` creates tag `2` in `Unique`;
+3. the foreign write `(*_3) = 10` leaves tag `1` in `ReservedIM` (surviving
+   foreign writes before activation);
+4. the child write `(*_2) = 20` activates tag `1` from `ReservedIM` to `Unique`
+   (unlike `Cell`, which stays `Cell`);
+5. once activated to `Unique`, a subsequent foreign write `_1 = 30` disables
+   tag `1` to `Disabled`, and the later child read `copy (*_2)` is undefined
+   behavior in Anneal (`.fail .ub`) and a `ChildAccessForbidden Disabled`
+   transition error in Miri. -/
+theorem wit_lm3_3_reservedIM_lifecycle_real_steps :
+    ∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyE initD = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reservedIM] ∧
+      stepMirFn bodyE s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .unique, entry 1 .reservedIM] ∧
+      stepMirFn bodyE s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique, entry 1 .reservedIM] ∧
+      get? s₃.frame.locals 1 = some (.init (.scalar ⟨10, 4⟩)) ∧
+      stepMirFn bodyE s₃ = .step s₄ ∧
+      s₄.memory.borrows = [entry 2 .disabled, entry 1 .unique] ∧
+      get? s₄.frame.locals 1 = some (.init (.scalar ⟨20, 4⟩)) ∧
+      stepMirFn bodyE s₄ = .step s₅ ∧
+      s₅.memory.borrows = [entry 2 .disabled, entry 1 .disabled] ∧
+      stepMirFn bodyE s₅ = .fail .ub ∧
+      ((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₄.memory.borrows []
+        ((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden .Disabled) := by
+  refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl, rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩, by decide⟩
+
+/-! ## (f) Shared deref reborrow `&(*_2)` of `UnsafeCell<u32>` (`Cell`) skips initial read -/
+
+/-- ```text
+bb0: _2 = &_1;                   // tag 1: Cell
+     _3 = &mut _1;               // tag 2: ReservedIM
+     (*_3) = const 42_u32;       // child write: tag 2 activates to Unique, tag 1 stays Cell
+     _4 = &(*_2);                // tag 3: Cell reborrow (parent 1) — NO initial read!
+     (*_3) = const 99_u32;       // child write through tag 2 still succeeds (stayed Unique)!
+     return
+``` -/
+def bodyF : CapturedMir :=
+  witBody "lm_3_3_witness::cell_reborrow_preserves_unique" 4
+    [declOf u32T, declOf unsafeCellU32T, refDecl unsafeCellU32T.kind,
+      refMutDecl unsafeCellU32T.kind, refDecl unsafeCellU32T.kind]
+    [stmt (.assign (loc 2) (.ref .shared (loc 1))),
+     stmt (.assign (loc 3) (.ref (.mut false) (loc 1))),
+     stmt (.assign (deref 3) (.use (cU32 42))),
+     stmt (.assign (loc 4) (.ref .shared (deref 2))),
+     stmt (.assign (deref 3) (.use (cU32 99)))]
+
+/-- Initial state of `bodyF`: `_1 = 5_u32`. -/
+def initF : MachineState :=
+  witInit [.uninit, .init (.scalar ⟨5, 4⟩), .uninit, .uninit, .uninit]
+
+/-- **(f) `wit_lm3_3_cell_reborrow_preserves_unique_real_steps`**:
+shared deref reborrow `_4 = &(*_2)` on `_2 : &UnsafeCell<u32>` assigns
+permission `.cell` to the new child tag `3` (`parentTag = some 1`) and performs
+no initial child read (`Permission.Cell.associatedAccess = none`), so the
+sibling `Unique` tag `2` is not frozen to `Frozen` and still permits subsequent
+writes `(*_3) = 99_u32`. -/
+theorem wit_lm3_3_cell_reborrow_preserves_unique_real_steps :
+    ∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyF initF = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .cell] ∧
+      stepMirFn bodyF s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .reservedIM, entry 1 .cell] ∧
+      stepMirFn bodyF s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique, entry 1 .cell] ∧
+      stepMirFn bodyF s₃ = .step s₄ ∧
+      s₄.memory.borrows = [entry 3 .cell (some 1), entry 2 .unique, entry 1 .cell] ∧
+      stepMirFn bodyF s₄ = .step s₅ ∧
+      s₅.memory.borrows = [entry 3 .cell (some 1), entry 2 .unique, entry 1 .cell] ∧
+      get? s₅.frame.locals 1 = some (.init (.scalar ⟨99, 4⟩)) := by
+  exact ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end LeanMiriSpec.Correspondence.WitnessLM3_3

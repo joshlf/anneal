@@ -3255,9 +3255,11 @@ Tree Borrows modeling in `Rvalue.use`, `Rvalue.copyForDeref`, `Rvalue.ref`, and
   are checked only against the reader's own permission by `evalOperand`.
 - Dereference reborrows (`.ref borrowKind (.deref :: restProj)`) link the new
   tag to `parentTag := .some parentPtr.tag`, perform the initial child read
-  through the parent (rejecting it with `hasTreeReadUB` when two or more
-  entries exist, then applying `freezeTreeBorrowsOnReadAtProj` with protector
-  status, matching Miri's reborrow access), and initialize the new tag with
+  through the parent when `perm` is not `.cell` (rejecting it with
+  `hasTreeReadUB` when two or more entries exist, then applying
+  `freezeTreeBorrowsOnReadAtProj` with protector status, matching Miri's
+  `Permission::associated_access` and MiniRust's
+  `PermissionUnprot::init_access`), and initialize the new tag with
   Miri's unprotected `NewPermission::new` choice: `sharedBorrowPerm`
   (`.frozen` or `.cell`) for shared reborrows and `mutableBorrowPerm`
   (`.reservedFrz false` or `.reservedIM`) for mutable and two-phase reborrows.
@@ -3458,29 +3460,35 @@ def evalRvalue
               let readUB :=
                 match mem.borrows with
                 | _ :: _ :: _ =>
-                  hasTreeReadUB
-                    mem.borrows
-                    mem.borrows
-                    mem.activeProtectors
-                    parentEntry.targetLocal
-                    (.some parentPtr.tag)
-                    fullProj
-                    parentEntry.rangeOffset
-                    parentEntry.rangeLen
+                  match perm with
+                  | .cell => false
+                  | _ =>
+                    hasTreeReadUB
+                      mem.borrows
+                      mem.borrows
+                      mem.activeProtectors
+                      parentEntry.targetLocal
+                      (.some parentPtr.tag)
+                      fullProj
+                      parentEntry.rangeOffset
+                      parentEntry.rangeLen
                 | _ => false
               match readUB with
               | true => .ub
               | false =>
                 let borrowsAfterRead :=
-                  freezeTreeBorrowsOnReadAtProj
-                    mem.borrows
-                    mem.borrows
-                    parentEntry.targetLocal
-                    (.some parentPtr.tag)
-                    fullProj
-                    parentEntry.rangeOffset
-                    parentEntry.rangeLen
-                    mem.activeProtectors
+                  match perm with
+                  | .cell => mem.borrows
+                  | _ =>
+                    freezeTreeBorrowsOnReadAtProj
+                      mem.borrows
+                      mem.borrows
+                      parentEntry.targetLocal
+                      (.some parentPtr.tag)
+                      fullProj
+                      parentEntry.rangeOffset
+                      parentEntry.rangeLen
+                      mem.activeProtectors
                 let entry : BorrowEntry := {
                   tag := tag
                   targetLocal := parentEntry.targetLocal

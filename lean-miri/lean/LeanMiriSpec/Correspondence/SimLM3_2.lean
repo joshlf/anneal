@@ -886,7 +886,9 @@ theorem evalRvalue_reborrow_root_ok
     | cons b₂ rest' =>
       rw [hb] at hrd
       rw [hrd]
-      cases hp : e.perm <;> rcases hm : bk with _ | ⟨_ | _⟩
+      cases sharedBorrowPerm localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩ <;>
+        cases mutableBorrowPerm localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩ <;>
+        cases hp : e.perm <;> rcases hm : bk with _ | ⟨_ | _⟩
       all_goals first
         | exact absurd hp hne_dis
         | exact BorrowKind.noConfusion (hm.symm.trans (hnf hp))
@@ -9201,12 +9203,25 @@ theorem step_reborrow_safeRef_tree_simulation_explicit
           (by rw [← hbor_s]; exact hanc_read ptrVal e hsr_full he htag)
         rw [htag] at hgood
         exact hasTreeReadUB_treeMap_eq_false treeMap treeMap e.localIdx ptrVal.tag hgood
+      have hsh_perm :
+          sharedBorrowPerm body.localDecls body.layouts ⟨refIdx, .cons .deref .nil⟩ = .frozen := by
+        rcases hpk_prim with hpk | hpk | ⟨_, hpk⟩ | ⟨_, hpk⟩ <;>
+          (dsimp only at hpk;
+           unfold sharedBorrowPerm placeTy resolveProjectedTy pointeeTyOf tyIsFreeze rigidTyIsFreeze;
+           dsimp only []; rw [hdecl_ref]; dsimp only []; rw [href_ty]; dsimp only []; rw [hpk])
+      have hmut_perm :
+          mutableBorrowPerm body.localDecls body.layouts ⟨refIdx, .cons .deref .nil⟩ =
+            .reservedFrz false := by
+        rcases hpk_prim with hpk | hpk | ⟨_, hpk⟩ | ⟨_, hpk⟩ <;>
+          (dsimp only at hpk;
+           unfold mutableBorrowPerm placeTy resolveProjectedTy pointeeTyOf tyIsFreeze rigidTyIsFreeze;
+           dsimp only []; rw [hdecl_ref]; dsimp only []; rw [href_ty]; dsimp only []; rw [hpk])
       unfold evalRvalue; dsimp only []
       rw [hsr_full]; dsimp only []
       rw [hlook_s]; dsimp only [ReborrowMapEntry.toBorrowEntry]
       rw [hbor_s, hprot, htm'_eq]
       dsimp only [List.map_cons, ReborrowMapEntry.toBorrowEntry, reborrowPermOf]
-      rw [hfrz]
+      rw [hsh_perm, hmut_perm, hfrz]
       generalize treeMap.map ReborrowMapEntry.toBorrowEntry = B at hrd ⊢
       cases B with
       | nil =>
@@ -9224,12 +9239,11 @@ theorem step_reborrow_safeRef_tree_simulation_explicit
             | exact BorrowKind.noConfusion (hm.symm.trans (hnf hp))
             | rfl
         | cons b₂ rest₂ =>
-          rw [hrd]
           cases hp : e.perm <;> rcases hm : bk with _ | ⟨_ | _⟩
           all_goals first
             | exact absurd hp hne_dis
             | exact BorrowKind.noConfusion (hm.symm.trans (hnf hp))
-            | rfl
+            | (dsimp only []; rw [hrd]; rfl)
     by_cases hsd_dead : slot_d = .dead
     · have ha_s : stepMirFn body s = MirStepNode.fail .ub := by
         rw [stepMirFn_eq_of_not_other body s hcal hphase]
