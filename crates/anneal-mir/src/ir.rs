@@ -55,6 +55,15 @@ impl PtrWidth {
             PtrWidth::Bits64 => i64::MAX as i128,
         }
     }
+
+    /// Maximum size in bytes of any Rust object on this target (`isize::MAX`).
+    ///
+    /// `rustc` rejects types whose size exceeds `isize::MAX` ("values of the type are too
+    /// big for the target architecture"), and pointer offsets in bytes must also fit in
+    /// `isize`.
+    pub const fn max_object_size(self) -> u128 {
+        self.max_isize() as u128
+    }
 }
 
 /// Integer scalar width and signedness.
@@ -411,7 +420,36 @@ impl Ty {
         self.byte_size_for(PtrWidth::Bits64)
     }
 
-    /// Size in bytes for the given target pointer width.
+    /// ABI alignment in bytes under `ptr_width`.
+    ///
+    /// Anneal's layout model assumes *natural* alignment for primitive scalars
+    /// (`align_of::<T>() == size_of::<T>()` for `bool`, `char`, every integer type, and thin
+    /// pointers), as on `x86_64`, `aarch64`, `riscv`, and `wasm32`. Targets that under-align
+    /// 64/128-bit integers (e.g. `i686`, where `align_of::<u64>() == 4`) are not modeled.
+    /// Arrays have their element's alignment; tuples have the maximum field alignment
+    /// (`1` for `()`); `!` has alignment `1`.
+    pub fn align_for(&self, ptr_width: PtrWidth) -> usize {
+        match self {
+            Ty::Bool | Ty::Never => 1,
+            Ty::Char => 4,
+            Ty::Int(it) => it.byte_size_for(ptr_width),
+            Ty::Uint(ut) => ut.byte_size_for(ptr_width),
+            Ty::RawPtr(_, _) | Ty::Ref(_, _) => ptr_width.byte_size(),
+            Ty::Array(elem, _) => elem.align_for(ptr_width),
+            Ty::Tuple(fields) => fields.iter().map(|f| f.align_for(ptr_width)).max().unwrap_or(1),
+        }
+    }
+
+    /// Size in bytes for the given target pointer width (saturating on overflow).
+    ///
+    /// Matches `rustc`'s `repr(Rust)` layout under the natural-alignment model of
+    /// [`Ty::align_for`]: arrays are `count * size_of(elem)`, and tuples are the sum of their
+    /// field sizes rounded up to the tuple's alignment, which is the minimal size `rustc`'s
+    /// field reordering always achieves (e.g. `(u8, u32)` and `(u8, u32, u8)` are both `8`
+    /// bytes, `(u16, u8)` is `4`, `(u64, u32)` is `16`). Uninhabited types still have a
+    /// layout size (`!` is `0`, `(!, u32)` is `4`).
+    ///
+    /// Use [`Ty::layout_size_for`] to detect types that are too large for the target.
     pub fn byte_size_for(&self, ptr_width: PtrWidth) -> usize {
         match self {
             Ty::Bool => 1,
@@ -420,40 +458,134 @@ impl Ty {
             Ty::Uint(ut) => ut.byte_size_for(ptr_width),
             Ty::RawPtr(_, _) | Ty::Ref(_, _) => ptr_width.byte_size(),
             Ty::Array(elem, count) => elem.byte_size_for(ptr_width).saturating_mul(*count),
-            Ty::Tuple(fields) => fields.iter().map(|f| f.byte_size_for(ptr_width)).sum(),
+            Ty::Tuple(fields) => {
+                let unpadded = fields
+                    .iter()
+                    .fold(0usize, |acc, f| acc.saturating_add(f.byte_size_for(ptr_width)));
+                let align = self.align_for(ptr_width);
+                unpadded.checked_next_multiple_of(align).unwrap_or(usize::MAX)
+            }
             Ty::Never => 0,
         }
     }
 
+    /// Size in bytes of this type's layout under `ptr_width`, or `None` if the type is not
+    /// representable on that target: an array length exceeding the target's `usize::MAX`,
+    /// or a total size exceeding the target's `isize::MAX` ([`PtrWidth::max_object_size`]).
+    ///
+    /// Unlike [`Ty::checked_byte_size`], uninhabited types still report their layout size
+    /// (`!` is `Some(0)`, `(!, u32)` is `Some(4)`), because pointer arithmetic and transmute
+    /// size checks operate on layout sizes.
+    pub fn layout_size_for(&self, ptr_width: PtrWidth) -> Option<usize> {
+        let size = match self {
+            Ty::Bool
+            | Ty::Char
+            | Ty::Int(_)
+            | Ty::Uint(_)
+            | Ty::RawPtr(_, _)
+            | Ty::Ref(_, _)
+            | Ty::Never => self.byte_size_for(ptr_width),
+            Ty::Array(elem, count) => {
+                if (*count as u128) > ptr_width.max_usize() {
+                    return None;
+                }
+                elem.layout_size_for(ptr_width)?.checked_mul(*count)?
+            }
+            Ty::Tuple(fields) => {
+                let mut unpadded = 0usize;
+                for field in fields {
+                    unpadded = unpadded.checked_add(field.layout_size_for(ptr_width)?)?;
+                }
+                unpadded.checked_next_multiple_of(self.align_for(ptr_width))?
+            }
+        };
+        if (size as u128) > ptr_width.max_object_size() {
+            return None;
+        }
+        Some(size)
+    }
+
     /// Computes the byte size of an inhabited type under `ptr_width`, returning `None`
-    /// if the type is uninhabited (e.g., `!`, `(!, u32)`, `[!; 1]`) or if size arithmetic overflows.
+    /// if the type is uninhabited (e.g., `!`, `(!, u32)`, `[!; 1]`) or if its layout is not
+    /// representable on the target (see [`Ty::layout_size_for`]).
     ///
     /// Note that `[!; 0]` is inhabited and returns `Some(0)`.
     pub fn checked_byte_size(&self, ptr_width: PtrWidth) -> Option<usize> {
         if !self.is_inhabited() {
             return None;
         }
+        self.layout_size_for(ptr_width)
+    }
+
+    /// Returns true if this type contains a niche-bearing scalar (`bool`, `char`, or `&T`),
+    /// whose placement `rustc` may optimize when laying out tuples.
+    fn contains_niche(&self) -> bool {
         match self {
-            Ty::Bool => Some(1),
-            Ty::Char => Some(4),
-            Ty::Int(it) => Some(it.byte_size_for(ptr_width)),
-            Ty::Uint(ut) => Some(ut.byte_size_for(ptr_width)),
-            Ty::RawPtr(_, _) | Ty::Ref(_, _) => Some(ptr_width.byte_size()),
-            Ty::Array(elem, count) => {
-                if *count == 0 {
-                    Some(0)
-                } else {
-                    elem.checked_byte_size(ptr_width)?.checked_mul(*count)
-                }
-            }
+            Ty::Bool | Ty::Char | Ty::Ref(_, _) => true,
+            Ty::Array(elem, count) => *count > 0 && elem.contains_niche(),
+            Ty::Tuple(fields) => fields.iter().any(Ty::contains_niche),
+            Ty::Int(_) | Ty::Uint(_) | Ty::RawPtr(_, _) | Ty::Never => false,
+        }
+    }
+
+    /// `rustc`'s field-ordering key `log2(max(align, size))` for niche-free fields.
+    fn alignment_group_key(&self, ptr_width: PtrWidth) -> u32 {
+        let align = self.align_for(ptr_width);
+        let size = self.byte_size_for(ptr_width);
+        align.max(size).trailing_zeros()
+    }
+
+    /// Returns true if this type has a *canonical byte layout* under `ptr_width`: its
+    /// in-memory representation under `rustc`'s `repr(Rust)` layout is the padding-free
+    /// concatenation of its fields in declaration order (arrays: elements in index order),
+    /// with scalars encoded little-endian.
+    ///
+    /// - Scalars, `!`, and arrays of canonical element types are canonical.
+    /// - A tuple is canonical when all fields are canonical and either
+    ///   (a) it has at most one field,
+    ///   (b) all of its fields have the same type, or
+    ///   (c) no field contains a niche-bearing scalar (`bool`, `char`, `&T`), the fields'
+    ///   alignment-group keys `log2(max(align, size))` are non-increasing in declaration order,
+    ///   and the unpadded size is a multiple of the tuple's alignment (no padding at all).
+    ///
+    /// These conditions are conservative: declaration order is then already size-optimal and
+    /// sorted by alignment group, so `rustc`'s field-reordering heuristics (which may otherwise
+    /// move fields, or place niches, differently across compiler versions) keep it. Byte-level
+    /// (`CastKind::Transmute`) reinterpretation is only defined for canonical layouts: e.g.
+    /// `(u16, u16)`, `(u32, u16, u16)`, and `(*const u8, u64)` are canonical, whereas
+    /// `(u8, u32)` (padding), `(u32, u64)` (fields not sorted by alignment), and `(u8, bool)`
+    /// (niche placement is compiler-dependent) are not.
+    pub fn has_canonical_byte_layout(&self, ptr_width: PtrWidth) -> bool {
+        match self {
+            Ty::Bool
+            | Ty::Char
+            | Ty::Int(_)
+            | Ty::Uint(_)
+            | Ty::RawPtr(_, _)
+            | Ty::Ref(_, _)
+            | Ty::Never => true,
+            Ty::Array(elem, _) => elem.has_canonical_byte_layout(ptr_width),
             Ty::Tuple(fields) => {
-                let mut total = 0usize;
-                for field in fields {
-                    total = total.checked_add(field.checked_byte_size(ptr_width)?)?;
+                if !fields.iter().all(|f| f.has_canonical_byte_layout(ptr_width)) {
+                    return false;
                 }
-                Some(total)
+                if fields.len() <= 1 || fields.windows(2).all(|w| w[0] == w[1]) {
+                    return true;
+                }
+                if fields.iter().any(Ty::contains_niche) {
+                    return false;
+                }
+                let keys_non_increasing = fields.windows(2).all(|w| {
+                    w[0].alignment_group_key(ptr_width) >= w[1].alignment_group_key(ptr_width)
+                });
+                if !keys_non_increasing {
+                    return false;
+                }
+                let unpadded = fields
+                    .iter()
+                    .fold(0usize, |acc, f| acc.saturating_add(f.byte_size_for(ptr_width)));
+                unpadded % self.align_for(ptr_width) == 0
             }
-            Ty::Never => None,
         }
     }
 }

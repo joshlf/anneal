@@ -5,9 +5,10 @@ use anneal_mir::ir::{
     Operand, Place, PointerValue, ProjectionElem, PtrWidth, Rvalue, Statement, Ty, UintTy, UnOp,
 };
 use anneal_mir::lower::{
-    ExposedProvenanceTracker, LoweredRvalue, LoweredStatement, MirValue, RvalueEvalError,
-    RvalueLowerError, TransmutePolicy, eval_aggregate, eval_binop, eval_checked_binop,
-    eval_lowered_rvalue, eval_unop, lower_body, lower_rvalue, lower_statement, resolve_place_ty,
+    CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredRvalue, LoweredStatement,
+    MirValue, RvalueEvalError, RvalueLowerError, TransmutePolicy, eval_aggregate, eval_binop,
+    eval_checked_binop, eval_constant, eval_lowered_rvalue, eval_unop, lower_body, lower_rvalue,
+    lower_rvalue_with_policy, lower_statement, resolve_place_ty,
 };
 
 #[test]
@@ -514,4 +515,666 @@ fn test_place_projections_statement_and_body_lowering() {
     )
     .unwrap();
     assert_eq!(char_val, MirValue::Char('A'));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] regression tests
+// ---------------------------------------------------------------------------------------------
+
+fn eval_rv(
+    rvalue: &Rvalue,
+    local_decls: &[Ty],
+    locals: &[MirValue],
+    ptr_width: PtrWidth,
+    policy: TransmutePolicy,
+    tracker: &mut ExposedProvenanceTracker,
+) -> Result<MirValue, RvalueEvalError> {
+    let lowered = lower_rvalue_with_policy(rvalue, local_decls, ptr_width, policy)
+        .expect("rvalue must lower");
+    eval_lowered_rvalue(&lowered, locals, ptr_width, policy, tracker)
+}
+
+#[test]
+fn test_b1_aggregate_transmutes_evaluate_to_typed_values() {
+    let pw = PtrWidth::Bits64;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let mut tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let arr_u8_4 = Ty::Array(Box::new(u8_ty.clone()), 4);
+    let local_decls = vec![arr_u8_4.clone(), u32_ty.clone()];
+    let locals = vec![
+        MirValue::Array {
+            elements: [0x11, 0x22, 0x33, 0x44]
+                .into_iter()
+                .map(|b| MirValue::unsigned(b, UintTy::U8, pw))
+                .collect(),
+            elem_ty: u8_ty.clone(),
+        },
+        MirValue::unsigned(0x0100_0001, UintTy::U32, pw),
+    ];
+    let transmute = |operand: Operand, target: Ty| Rvalue::Cast(CastKind::Transmute, operand, target);
+
+    // [u8; 4] -> u32 (A0: TypeMismatch, aggregate operands were unsupported).
+    assert_eq!(
+        eval_rv(
+            &transmute(Operand::Copy(Place::from_local(0)), u32_ty.clone()),
+            &local_decls,
+            &locals,
+            pw,
+            policy,
+            &mut tracker
+        ),
+        Ok(MirValue::unsigned(0x4433_2211, UintTy::U32, pw))
+    );
+
+    // u32 -> (u16, u16) yields a typed tuple (A0: a tuple of four u8 bytes).
+    let pair = Ty::Tuple(vec![u16_ty.clone(), u16_ty.clone()]);
+    let pair_val = eval_rv(
+        &transmute(Operand::Copy(Place::from_local(1)), pair.clone()),
+        &local_decls,
+        &locals,
+        pw,
+        policy,
+        &mut tracker,
+    )
+    .unwrap();
+    assert_eq!(
+        pair_val,
+        MirValue::Tuple(vec![
+            MirValue::unsigned(0x0001, UintTy::U16, pw),
+            MirValue::unsigned(0x0100, UintTy::U16, pw),
+        ])
+    );
+    assert_eq!(pair_val.ty(), pair);
+
+    // u32 -> [bool; 4] yields an array of bools (A0: a tuple of u8 bytes).
+    let arr_bool_4 = Ty::Array(Box::new(Ty::Bool), 4);
+    let bools = eval_rv(
+        &transmute(Operand::Copy(Place::from_local(1)), arr_bool_4.clone()),
+        &local_decls,
+        &locals,
+        pw,
+        policy,
+        &mut tracker,
+    )
+    .unwrap();
+    assert_eq!(
+        bools,
+        MirValue::Array {
+            elements: vec![
+                MirValue::Bool(true),
+                MirValue::Bool(false),
+                MirValue::Bool(false),
+                MirValue::Bool(true),
+            ],
+            elem_ty: Ty::Bool,
+        }
+    );
+    assert_eq!(bools.ty(), arr_bool_4);
+
+    // [u8; 4] -> [bool; 4] with byte 0x11 is an invalid bool.
+    assert_eq!(
+        eval_rv(
+            &transmute(Operand::Copy(Place::from_local(0)), arr_bool_4),
+            &local_decls,
+            &locals,
+            pw,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Bool,
+            bits: 0x11,
+        }))
+    );
+
+    // () -> [!; 0] yields an empty array of `!` (A0: an empty tuple).
+    let never_arr = Ty::Array(Box::new(Ty::Never), 0);
+    assert_eq!(
+        eval_rv(
+            &transmute(Operand::Constant(Constant::Unit), never_arr),
+            &local_decls,
+            &locals,
+            pw,
+            policy,
+            &mut tracker
+        ),
+        Ok(MirValue::Array {
+            elements: vec![],
+            elem_ty: Ty::Never,
+        })
+    );
+
+    // A value whose runtime type disagrees with the operand's declared type is rejected.
+    let wrong_locals = vec![locals[0].clone(), MirValue::unsigned(1, UintTy::U16, pw)];
+    assert!(matches!(
+        eval_rv(
+            &transmute(Operand::Copy(Place::from_local(1)), pair),
+            &local_decls,
+            &wrong_locals,
+            pw,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn test_b1_pointer_aggregate_transmutes_preserve_or_strip_provenance() {
+    let pw = PtrWidth::Bits64;
+    let mut tracker = ExposedProvenanceTracker::new();
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let raw_u8 = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let pair = Ty::Tuple(vec![raw_u8.clone(), usize_ty.clone()]);
+    let local_decls = vec![raw_u8.clone(), pair.clone()];
+    let p0 = PointerValue::with_provenance(0x1000, 5, 6);
+    let p1 = PointerValue::with_provenance(0x2000, 7, 8);
+    let locals = vec![
+        MirValue::ptr(p0, raw_u8.clone()),
+        MirValue::Tuple(vec![
+            MirValue::ptr(p1, raw_u8.clone()),
+            MirValue::unsigned(0x3000, UintTy::Usize, pw),
+        ]),
+    ];
+
+    // *const u8 -> [*const u8; 1] keeps the provenance under the default policy.
+    let arr_raw = Ty::Array(Box::new(raw_u8.clone()), 1);
+    let wrapped = eval_rv(
+        &Rvalue::Cast(CastKind::Transmute, Operand::Copy(Place::from_local(0)), arr_raw),
+        &local_decls,
+        &locals,
+        pw,
+        TransmutePolicy::RejectPtrToInt,
+        &mut tracker,
+    )
+    .unwrap();
+    assert_eq!(
+        wrapped,
+        MirValue::Array {
+            elements: vec![MirValue::ptr(p0, raw_u8.clone())],
+            elem_ty: raw_u8.clone(),
+        }
+    );
+
+    // (*const u8, usize) -> [usize; 2] is Ptr -> Int: rejected by default ...
+    let arr_usize_2 = Ty::Array(Box::new(usize_ty), 2);
+    let to_words = Rvalue::Cast(
+        CastKind::Transmute,
+        Operand::Copy(Place::from_local(1)),
+        arr_usize_2.clone(),
+    );
+    assert_eq!(
+        lower_rvalue(&to_words, &local_decls, pw),
+        Err(RvalueLowerError::CastError(
+            CastLowerError::PtrToIntTransmuteDisallowed {
+                src_ty: pair,
+                target_ty: arr_usize_2,
+            }
+        ))
+    );
+    // ... and strips provenance without exposing it under AllowPtrToIntStripProvenance.
+    assert_eq!(
+        eval_rv(
+            &to_words,
+            &local_decls,
+            &locals,
+            pw,
+            TransmutePolicy::AllowPtrToIntStripProvenance,
+            &mut tracker
+        ),
+        Ok(MirValue::Array {
+            elements: vec![
+                MirValue::unsigned(0x2000, UintTy::Usize, pw),
+                MirValue::unsigned(0x3000, UintTy::Usize, pw),
+            ],
+            elem_ty: Ty::Uint(UintTy::Usize),
+        })
+    );
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn test_b1_offset_byte_offset_bounds_provenance_and_strides() {
+    let raw_u8 = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let base = MirValue::ptr(PointerValue::with_provenance(0x1000, 1, 1), raw_u8.clone());
+
+    // usize counts: byte offset must fit in isize even when the address would not wrap.
+    // (A0 accepted both of these.)
+    let over32 = MirValue::unsigned(0x8000_0000, UintTy::Usize, PtrWidth::Bits32);
+    assert!(matches!(
+        eval_binop(BinOp::Offset, &base, &over32, PtrWidth::Bits32),
+        Err(RvalueEvalError::PointerOffsetOverflow { .. })
+    ));
+    let over64 = MirValue::unsigned(1 << 63, UintTy::Usize, PtrWidth::Bits64);
+    assert!(matches!(
+        eval_binop(BinOp::Offset, &base, &over64, PtrWidth::Bits64),
+        Err(RvalueEvalError::PointerOffsetOverflow { .. })
+    ));
+    let max_ok = MirValue::unsigned(0x7FFF_E000, UintTy::Usize, PtrWidth::Bits32);
+    assert_eq!(
+        eval_binop(BinOp::Offset, &base, &max_ok, PtrWidth::Bits32)
+            .unwrap()
+            .as_ptr(),
+        Some(PointerValue::with_provenance(0x7FFF_F000, 1, 1))
+    );
+
+    // Non-zero offsets require provenance; offsetting by 0 bytes is always allowed.
+    let bare = MirValue::ptr(PointerValue::without_provenance(0x1000), raw_u8.clone());
+    assert_eq!(
+        eval_binop(
+            BinOp::Offset,
+            &bare,
+            &MirValue::unsigned(1, UintTy::Usize, PtrWidth::Bits64),
+            PtrWidth::Bits64
+        ),
+        Err(RvalueEvalError::PointerArithmeticWithoutProvenance {
+            addr: 0x1000,
+            byte_offset: 1,
+        })
+    );
+    assert_eq!(
+        eval_binop(
+            BinOp::Offset,
+            &bare,
+            &MirValue::signed(0, IntTy::Isize, PtrWidth::Bits64),
+            PtrWidth::Bits64
+        )
+        .unwrap()
+        .as_ptr(),
+        Some(PointerValue::without_provenance(0x1000))
+    );
+
+    // `*const (u8, u32)` advances by rustc's 8-byte size (A0: 5 bytes).
+    let padded = Ty::Tuple(vec![Ty::Uint(UintTy::U8), Ty::Uint(UintTy::U32)]);
+    let raw_padded = Ty::RawPtr(Box::new(padded), Mutability::Not);
+    let one = Operand::Constant(Constant::Int(1, Ty::Uint(UintTy::Usize)));
+    let offset_rv = Rvalue::BinaryOp(BinOp::Offset, Operand::Copy(Place::from_local(0)), one);
+    let lowered =
+        lower_rvalue(&offset_rv, std::slice::from_ref(&raw_padded), PtrWidth::Bits64).unwrap();
+    assert!(matches!(
+        lowered,
+        LoweredRvalue::BinaryOp {
+            pointee_size: Some(8),
+            ..
+        }
+    ));
+    let mut tracker = ExposedProvenanceTracker::new();
+    let padded_ptr = MirValue::ptr(PointerValue::with_provenance(0x1000, 2, 2), raw_padded);
+    assert_eq!(
+        eval_lowered_rvalue(
+            &lowered,
+            &[padded_ptr],
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &mut tracker
+        )
+        .unwrap()
+        .as_ptr(),
+        Some(PointerValue::with_provenance(0x1008, 2, 2))
+    );
+
+    // Uninhabited pointees still have a layout-size stride (rustc accepts `<*const !>::add`).
+    for (pointee, stride) in [
+        (Ty::Never, 0),
+        (Ty::Tuple(vec![Ty::Never, Ty::Uint(UintTy::U32)]), 4),
+    ] {
+        let raw = Ty::RawPtr(Box::new(pointee), Mutability::Not);
+        let lowered = lower_rvalue(&offset_rv, &[raw], PtrWidth::Bits64).unwrap();
+        assert!(matches!(
+            lowered,
+            LoweredRvalue::BinaryOp { pointee_size: Some(s), .. } if s == stride
+        ));
+    }
+}
+
+#[test]
+fn test_b1_place_projection_type_checks_survive_downcast() {
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let u128_ty = Ty::Uint(UintTy::U128);
+    let local_decls = vec![
+        Ty::Tuple(vec![u8_ty, u16_ty.clone()]),
+        Ty::Array(Box::new(u32_ty.clone()), 4),
+    ];
+
+    let downcast_field = |idx: usize, ty: Ty| {
+        Place::with_projection(0, vec![ProjectionElem::Downcast(0), ProjectionElem::Field(idx, ty)])
+    };
+    assert_eq!(resolve_place_ty(&downcast_field(1, u16_ty), &local_decls), Ok(Ty::Uint(UintTy::U16)));
+    // A0 accepted any type / index for a field projection after `Downcast`.
+    assert!(matches!(
+        resolve_place_ty(&downcast_field(1, u128_ty.clone()), &local_decls),
+        Err(RvalueLowerError::InvalidProjection { .. })
+    ));
+    assert!(matches!(
+        resolve_place_ty(&downcast_field(5, u128_ty), &local_decls),
+        Err(RvalueLowerError::InvalidProjection { .. })
+    ));
+    // Arrays have no fields in MIR (A0 accepted `_1.0: u32`).
+    let array_field = Place::with_projection(1, vec![ProjectionElem::Field(0, u32_ty)]);
+    assert!(matches!(
+        resolve_place_ty(&array_field, &local_decls),
+        Err(RvalueLowerError::InvalidProjection { .. })
+    ));
+    // Downcast of a non-ADT (array) place is invalid.
+    let array_downcast = Place::with_projection(1, vec![ProjectionElem::Downcast(0)]);
+    assert!(matches!(
+        resolve_place_ty(&array_downcast, &local_decls),
+        Err(RvalueLowerError::InvalidProjection { .. })
+    ));
+}
+
+#[test]
+fn test_b1_union_aggregates_check_variant_and_destination_field() {
+    let pw = PtrWidth::Bits64;
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    // `union U { a: u32, b: u16 }`, modeled as the tuple of its declared field types.
+    let union_ty = Ty::Tuple(vec![u32_ty, u16_ty.clone()]);
+    let local_decls = vec![union_ty, u16_ty];
+    let union_init = |variant_idx: usize, field: usize| {
+        Rvalue::Aggregate(
+            AggregateKind::Adt {
+                def_path: "U".into(),
+                variant_idx,
+                active_field: Some(field),
+            },
+            vec![Operand::Copy(Place::from_local(1))],
+        )
+    };
+    let assign = |place: usize, rv: Rvalue| Statement::Assign(Place::from_local(place), rv);
+
+    assert!(lower_statement(&assign(0, union_init(0, 1)), &local_decls, pw).is_ok());
+    // Unions are single-variant ADTs: rustc requires FIRST_VARIANT.
+    assert!(matches!(
+        lower_rvalue(&union_init(1, 1), &local_decls, pw),
+        Err(RvalueLowerError::InvalidAggregateOperands { count: 1, .. })
+    ));
+    assert!(matches!(
+        eval_aggregate(
+            &AggregateKind::Adt {
+                def_path: "U".into(),
+                variant_idx: 1,
+                active_field: Some(1),
+            },
+            vec![MirValue::unsigned(7, UintTy::U16, pw)],
+            pw,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    // The active field's declared type must match the operand (field 0 is u32, operand u16).
+    assert!(matches!(
+        lower_statement(&assign(0, union_init(0, 0)), &local_decls, pw),
+        Err(RvalueLowerError::AssignmentTypeMismatch { .. })
+    ));
+    // Out-of-range active field.
+    assert!(matches!(
+        lower_statement(&assign(0, union_init(0, 5)), &local_decls, pw),
+        Err(RvalueLowerError::AssignmentTypeMismatch { .. })
+    ));
+    // A0 accepted assigning a union initializer with an arbitrary (unchecked) active field
+    // index to a place of the operand's own type.
+    assert!(matches!(
+        lower_statement(&assign(1, union_init(0, 7)), &local_decls, pw),
+        Err(RvalueLowerError::AssignmentTypeMismatch { .. })
+    ));
+}
+
+#[test]
+fn test_b1_raw_ptr_aggregate_operand_checks() {
+    let pw = PtrWidth::Bits64;
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let raw_mut = Ty::RawPtr(Box::new(u32_ty.clone()), Mutability::Mut);
+    let local_decls = vec![
+        raw_mut.clone(),
+        Ty::RawPtr(Box::new(u32_ty.clone()), Mutability::Not),
+        Ty::Ref(Box::new(u32_ty.clone()), Mutability::Mut),
+        Ty::Uint(UintTy::Usize),
+        u32_ty.clone(),
+        Ty::unit(),
+    ];
+    let kind = AggregateKind::RawPtr {
+        pointee: u32_ty.clone(),
+        mutability: Mutability::Mut,
+    };
+    let build = |data: usize| {
+        Rvalue::Aggregate(
+            kind.clone(),
+            vec![Operand::Copy(Place::from_local(data)), Operand::Copy(Place::from_local(5))],
+        )
+    };
+
+    assert_eq!(lower_rvalue(&build(0), &local_decls, pw).unwrap().ty(), &raw_mut);
+    assert_eq!(lower_rvalue(&build(3), &local_decls, pw).unwrap().ty(), &raw_mut);
+    // Mutability mismatch, references, and non-usize integers are rejected (rustc validator).
+    for bad in [1, 2, 4] {
+        assert!(
+            matches!(
+                lower_rvalue(&build(bad), &local_decls, pw),
+                Err(RvalueLowerError::InvalidAggregateOperands { count: 2, .. })
+            ),
+            "data operand _{bad} must be rejected"
+        );
+    }
+    // Evaluation mirrors lowering: a usize address yields a pointer without provenance ...
+    assert_eq!(
+        eval_aggregate(
+            &kind,
+            vec![MirValue::unsigned(0x40, UintTy::Usize, pw), MirValue::Unit],
+            pw
+        ),
+        Ok(MirValue::ptr(PointerValue::without_provenance(0x40), raw_mut))
+    );
+    // ... while mismatched mutability and non-usize addresses are rejected.
+    let const_ptr = MirValue::ptr(
+        PointerValue::with_provenance(0x40, 1, 1),
+        Ty::RawPtr(Box::new(u32_ty), Mutability::Not),
+    );
+    assert!(eval_aggregate(&kind, vec![const_ptr, MirValue::Unit], pw).is_err());
+    assert!(
+        eval_aggregate(
+            &kind,
+            vec![MirValue::unsigned(0x40, UintTy::U32, pw), MirValue::Unit],
+            pw
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn test_b1_place_evaluation_respects_projections() {
+    let pw = PtrWidth::Bits64;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let mut tracker = ExposedProvenanceTracker::new();
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty.clone()), Mutability::Mut);
+    let inner = Ty::Tuple(vec![]);
+    let outer = Ty::Tuple(vec![inner.clone()]);
+    let local_decls = vec![
+        Ty::Tuple(vec![u32_ty.clone(), u32_ty.clone()]),
+        raw_u32.clone(),
+        raw_u32.clone(),
+        outer.clone(),
+    ];
+    let p = PointerValue::with_provenance(0x4000, 9, 9);
+    let locals = vec![
+        MirValue::Tuple(vec![
+            MirValue::unsigned(1, UintTy::U32, pw),
+            MirValue::unsigned(2, UintTy::U32, pw),
+        ]),
+        MirValue::ptr(p, raw_u32.clone()),
+        MirValue::ptr(PointerValue::without_provenance(0), raw_u32.clone()),
+        MirValue::Adt {
+            def_path: "Outer".into(),
+            variant_idx: 3,
+            active_field: None,
+            fields: vec![MirValue::Adt {
+                def_path: "Inner".into(),
+                variant_idx: 1,
+                active_field: None,
+                fields: vec![],
+            }],
+        },
+    ];
+    let deref = |local: usize| Place::with_projection(local, vec![ProjectionElem::Deref]);
+
+    // `&raw mut (*_1)` and `&(*_1)` reborrow `_1`: same address and provenance.
+    assert_eq!(
+        eval_rv(&Rvalue::RawPtr(Mutability::Mut, deref(1)), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(p, raw_u32.clone()))
+    );
+    let ref_u32 = Ty::Ref(Box::new(u32_ty.clone()), Mutability::Not);
+    assert_eq!(
+        eval_rv(&Rvalue::Ref(Mutability::Not, deref(1)), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(p, ref_u32.clone()))
+    );
+    // `&(*null)` is a null reference (UB); `&raw const (*null)` is fine.
+    assert_eq!(
+        eval_rv(&Rvalue::Ref(Mutability::Not, deref(2)), &local_decls, &locals, pw, policy, &mut tracker),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_u32,
+            bits: 0,
+        }))
+    );
+    assert!(
+        eval_rv(&Rvalue::RawPtr(Mutability::Not, deref(2)), &local_decls, &locals, pw, policy, &mut tracker)
+            .is_ok()
+    );
+    // A0 returned `&_0`'s synthetic address for `&_0.1` (and for every other projection).
+    let field1 = Place::with_projection(0, vec![ProjectionElem::Field(1, u32_ty)]);
+    assert_eq!(
+        eval_rv(&Rvalue::Ref(Mutability::Not, field1.clone()), &local_decls, &locals, pw, policy, &mut tracker),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(field1))
+    );
+    // A0 returned the *base local's* discriminant (3) for `discriminant(_3.0)` (truly 1).
+    let inner_place = Place::with_projection(3, vec![ProjectionElem::Field(0, inner)]);
+    assert_eq!(
+        eval_rv(&Rvalue::Discriminant(inner_place.clone()), &local_decls, &locals, pw, policy, &mut tracker),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(inner_place))
+    );
+    assert_eq!(
+        eval_rv(&Rvalue::Discriminant(Place::from_local(3)), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::signed(3, IntTy::Isize, pw))
+    );
+    // CopyForDeref copies a dereferenceable place; non-pointer places are rejected when lowering.
+    assert_eq!(
+        eval_rv(&Rvalue::CopyForDeref(Place::from_local(1)), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(p, raw_u32))
+    );
+    assert_eq!(
+        lower_rvalue(&Rvalue::CopyForDeref(Place::from_local(3)), &local_decls, pw),
+        Err(RvalueLowerError::InvalidCopyForDeref(outer))
+    );
+    assert!(tracker.is_empty());
+}
+
+#[test]
+fn test_b1_constants_are_validated_in_lowering_and_evaluation() {
+    let local_decls: Vec<Ty> = vec![];
+    let use_const = |c: Constant| Rvalue::Use(Operand::Constant(c));
+
+    for (constant, ptr_width) in [
+        (Constant::Int(5, Ty::Bool), PtrWidth::Bits64),
+        (Constant::Int(256, Ty::Uint(UintTy::U8)), PtrWidth::Bits64),
+        (Constant::Int(0x1FF, Ty::Int(IntTy::I8)), PtrWidth::Bits64),
+        (Constant::Int(1 << 32, Ty::Uint(UintTy::Usize)), PtrWidth::Bits32),
+        (
+            Constant::Ptr(
+                PointerValue::without_provenance(0),
+                Ty::Ref(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+            ),
+            PtrWidth::Bits64,
+        ),
+        (
+            Constant::Ptr(
+                PointerValue::without_provenance(1 << 32),
+                Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+            ),
+            PtrWidth::Bits32,
+        ),
+        (
+            Constant::Ptr(PointerValue::without_provenance(8), Ty::Uint(UintTy::Usize)),
+            PtrWidth::Bits64,
+        ),
+    ] {
+        assert!(
+            matches!(
+                lower_rvalue(&use_const(constant.clone()), &local_decls, ptr_width),
+                Err(RvalueLowerError::InvalidConstant { .. })
+            ),
+            "{constant:?} must be rejected when lowering"
+        );
+        assert!(
+            matches!(
+                eval_constant(&constant, ptr_width),
+                Err(RvalueEvalError::InvalidConstant(_))
+            ),
+            "{constant:?} must be rejected when evaluating"
+        );
+    }
+
+    // Signed constants may be given in sign-extended form.
+    let neg_one = Constant::Int(u128::MAX, Ty::Int(IntTy::I8));
+    assert!(lower_rvalue(&use_const(neg_one.clone()), &local_decls, PtrWidth::Bits64).is_ok());
+    assert_eq!(
+        eval_constant(&neg_one, PtrWidth::Bits64).unwrap().as_signed(PtrWidth::Bits64),
+        Some(-1)
+    );
+    // The same 64-bit address is fine on a 64-bit target.
+    let wide_ptr = Constant::Ptr(
+        PointerValue::without_provenance(1 << 32),
+        Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+    );
+    assert!(lower_rvalue(&use_const(wide_ptr), &local_decls, PtrWidth::Bits64).is_ok());
+}
+
+#[test]
+fn test_b1_layout_limits_for_bodies_len_and_repeat() {
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let big = Ty::Array(Box::new(u8_ty.clone()), 1 << 31);
+    let body = Body {
+        local_decls: vec![big.clone()],
+        basic_blocks: vec![],
+    };
+    assert_eq!(lower_body(&body, PtrWidth::Bits32), Err(RvalueLowerError::LayoutTooLarge(big)));
+    assert!(lower_body(&body, PtrWidth::Bits64).is_ok());
+
+    // `[(); 1 << 33]` has size 0 but its length does not fit a 32-bit usize.
+    let zst_arr = Ty::Array(Box::new(Ty::unit()), 1 << 33);
+    let len_rv = Rvalue::Len(Place::from_local(0));
+    assert_eq!(
+        lower_rvalue(&len_rv, std::slice::from_ref(&zst_arr), PtrWidth::Bits32),
+        Err(RvalueLowerError::LayoutTooLarge(zst_arr.clone()))
+    );
+    assert!(matches!(
+        lower_rvalue(&len_rv, &[zst_arr], PtrWidth::Bits64),
+        Ok(LoweredRvalue::Len {
+            static_len: 0x2_0000_0000,
+            ..
+        })
+    ));
+
+    let zero_u8 = Operand::Constant(Constant::Int(0, u8_ty));
+    assert!(matches!(
+        lower_rvalue(&Rvalue::Repeat(zero_u8.clone(), 1 << 31), &[], PtrWidth::Bits32),
+        Err(RvalueLowerError::LayoutTooLarge(_))
+    ));
+    // Representable, but beyond what the evaluator materializes.
+    let lowered = lower_rvalue(&Rvalue::Repeat(zero_u8, 1 << 21), &[], PtrWidth::Bits64).unwrap();
+    let mut tracker = ExposedProvenanceTracker::new();
+    assert_eq!(
+        eval_lowered_rvalue(
+            &lowered,
+            &[],
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::EvaluationLimit { len: 1 << 21 })
+    );
 }

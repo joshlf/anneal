@@ -17,10 +17,14 @@ use crate::ir::{
     PointerValue, ProjectionElem, PtrWidth, Rvalue, Statement, Ty, UintTy, UnOp,
 };
 use crate::lower::cast::{
-    CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast, TransmutePolicy,
-    TransmuteValue, eval_int_to_int, eval_int_to_ptr_with_ptr_width,
+    AbstractByte, CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast,
+    TransmutePolicy, TransmuteValue, decode_int_bytes, decode_ptr_bytes, encode_int_bytes,
+    encode_ptr_bytes, eval_int_to_int, eval_int_to_ptr_with_ptr_width,
     eval_ptr_to_int_with_ptr_width, eval_transmute, lower_cast_rvalue_with_ptr_width,
 };
+
+/// Maximum number of array elements the evaluator materializes in a single `MirValue::Array`.
+const MAX_EVAL_ARRAY_LEN: usize = 1 << 20;
 
 /// Errors encountered during MIR rvalue, statement, or body lowering.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +72,17 @@ pub enum RvalueLowerError {
     },
     /// Uninhabited type in a context requiring an inhabited type.
     UninhabitedType(Ty),
+    /// Ill-formed `Operand::Constant` (wrong type, out-of-range bits, or null `&T`).
+    InvalidConstant {
+        constant: Constant,
+        reason: &'static str,
+    },
+    /// `Rvalue::CopyForDeref` applied to a place whose type is not dereferenceable
+    /// (`RawPtr` or `Ref`).
+    InvalidCopyForDeref(Ty),
+    /// Type's layout is not representable on the target pointer width (see
+    /// [`Ty::layout_size_for`]).
+    LayoutTooLarge(Ty),
 }
 
 impl std::fmt::Display for RvalueLowerError {
@@ -129,6 +144,15 @@ impl std::fmt::Display for RvalueLowerError {
             }
             RvalueLowerError::UninhabitedType(ty) => {
                 write!(f, "uninhabited type {ty:?}")
+            }
+            RvalueLowerError::InvalidConstant { constant, reason } => {
+                write!(f, "invalid constant {constant:?}: {reason}")
+            }
+            RvalueLowerError::InvalidCopyForDeref(ty) => {
+                write!(f, "CopyForDeref requires a RawPtr or Ref place, got {ty:?}")
+            }
+            RvalueLowerError::LayoutTooLarge(ty) => {
+                write!(f, "type {ty:?} is too large for the target architecture")
             }
         }
     }
@@ -263,176 +287,79 @@ pub struct LoweredBody {
 }
 
 /// Resolves the static `Ty` of a `Place` against `local_decls`, validating all projections.
+///
+/// Mirrors `rustc`'s MIR validator: `Deref` requires a `RawPtr`/`Ref`; `Field(i, ty)`
+/// requires a tuple whose field `i` has exactly type `ty` (arrays have no fields);
+/// `Index`/`ConstantIndex`/`Subslice` require an array (and a `usize` index local / in-bounds
+/// constant offsets); `Downcast(_)` selects an ADT variant, which Anneal models as the tuple of
+/// that variant's fields, so it leaves the tuple type unchanged and subsequent `Field`
+/// projections are still fully type-checked.
 pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueLowerError> {
     let Some(base_ty) = local_decls.get(place.local.0) else {
         return Err(RvalueLowerError::UnknownLocal(place.local));
     };
     let mut cur_ty = base_ty.clone();
-    let mut downcast_active = false;
 
     for elem in &place.projection {
-        match elem {
-            ProjectionElem::Deref => {
-                downcast_active = false;
-                match cur_ty {
-                    Ty::RawPtr(inner, _) | Ty::Ref(inner, _) => {
-                        cur_ty = *inner;
-                    }
-                    other => {
-                        return Err(RvalueLowerError::InvalidProjection {
-                            place: place.clone(),
-                            current_ty: other,
-                            elem: elem.clone(),
-                        });
-                    }
+        let invalid = |current_ty: Ty| RvalueLowerError::InvalidProjection {
+            place: place.clone(),
+            current_ty,
+            elem: elem.clone(),
+        };
+        cur_ty = match (elem, cur_ty) {
+            (ProjectionElem::Deref, Ty::RawPtr(inner, _) | Ty::Ref(inner, _)) => *inner,
+            (ProjectionElem::Field(idx, field_ty), Ty::Tuple(fields)) => {
+                if fields.get(*idx) != Some(field_ty) {
+                    return Err(invalid(Ty::Tuple(fields)));
                 }
+                field_ty.clone()
             }
-            ProjectionElem::Field(idx, field_ty) => match &cur_ty {
-                Ty::Tuple(fields) => {
-                    if let Some(actual) = fields.get(*idx) {
-                        if actual != field_ty && !downcast_active {
-                            return Err(RvalueLowerError::InvalidProjection {
-                                place: place.clone(),
-                                current_ty: cur_ty,
-                                elem: elem.clone(),
-                            });
-                        }
-                        downcast_active = false;
-                        cur_ty = field_ty.clone();
-                    } else if downcast_active {
-                        downcast_active = false;
-                        cur_ty = field_ty.clone();
-                    } else {
-                        return Err(RvalueLowerError::InvalidProjection {
-                            place: place.clone(),
-                            current_ty: cur_ty,
-                            elem: elem.clone(),
-                        });
-                    }
-                }
-                Ty::Array(elem_ty, len) => {
-                    downcast_active = false;
-                    if *idx < *len && **elem_ty == *field_ty {
-                        cur_ty = field_ty.clone();
-                    } else {
-                        return Err(RvalueLowerError::InvalidProjection {
-                            place: place.clone(),
-                            current_ty: cur_ty,
-                            elem: elem.clone(),
-                        });
-                    }
-                }
-                _ => {
-                    return Err(RvalueLowerError::InvalidProjection {
-                        place: place.clone(),
-                        current_ty: cur_ty,
-                        elem: elem.clone(),
-                    });
-                }
-            },
-            ProjectionElem::Index(idx_local) => {
-                downcast_active = false;
+            (ProjectionElem::Index(idx_local), Ty::Array(elem_ty, _)) => {
                 let Some(idx_ty) = local_decls.get(idx_local.0) else {
                     return Err(RvalueLowerError::UnknownLocal(*idx_local));
                 };
                 if *idx_ty != Ty::Uint(UintTy::Usize) {
                     return Err(RvalueLowerError::InvalidIndexType(idx_ty.clone()));
                 }
-                match cur_ty {
-                    Ty::Array(elem_ty, _) => {
-                        cur_ty = *elem_ty;
-                    }
-                    other => {
-                        return Err(RvalueLowerError::InvalidProjection {
-                            place: place.clone(),
-                            current_ty: other,
-                            elem: elem.clone(),
-                        });
-                    }
-                }
+                *elem_ty
             }
-            ProjectionElem::ConstantIndex {
-                offset,
-                min_length,
-                from_end,
-            } => {
-                downcast_active = false;
-                match cur_ty {
-                    Ty::Array(elem_ty, len) => {
-                        let len_u64 = len as u64;
-                        let valid_bounds = len_u64 >= *min_length
-                            && if *from_end {
-                                *offset >= 1 && *offset <= len_u64
-                            } else {
-                                *offset < len_u64
-                            };
-                        if !valid_bounds {
-                            return Err(RvalueLowerError::InvalidProjection {
-                                place: place.clone(),
-                                current_ty: Ty::Array(elem_ty, len),
-                                elem: elem.clone(),
-                            });
-                        }
-                        cur_ty = *elem_ty;
-                    }
-                    other => {
-                        return Err(RvalueLowerError::InvalidProjection {
-                            place: place.clone(),
-                            current_ty: other,
-                            elem: elem.clone(),
-                        });
-                    }
+            (
+                ProjectionElem::ConstantIndex {
+                    offset,
+                    min_length,
+                    from_end,
+                },
+                Ty::Array(elem_ty, len),
+            ) => {
+                let len_u64 = len as u64;
+                let valid_bounds = len_u64 >= *min_length
+                    && if *from_end {
+                        *offset >= 1 && *offset <= len_u64
+                    } else {
+                        *offset < len_u64
+                    };
+                if !valid_bounds {
+                    return Err(invalid(Ty::Array(elem_ty, len)));
                 }
+                *elem_ty
             }
-            ProjectionElem::Subslice { from, to, from_end } => {
-                downcast_active = false;
-                match cur_ty {
-                    Ty::Array(elem_ty, len) => {
-                        let len_u64 = len as u64;
-                        let new_len = if *from_end {
-                            match from.checked_add(*to) {
-                                Some(total) if total <= len_u64 => (len_u64 - total) as usize,
-                                _ => {
-                                    return Err(RvalueLowerError::InvalidProjection {
-                                        place: place.clone(),
-                                        current_ty: Ty::Array(elem_ty, len),
-                                        elem: elem.clone(),
-                                    });
-                                }
-                            }
-                        } else if *from <= *to && *to <= len_u64 {
-                            (*to - *from) as usize
-                        } else {
-                            return Err(RvalueLowerError::InvalidProjection {
-                                place: place.clone(),
-                                current_ty: Ty::Array(elem_ty, len),
-                                elem: elem.clone(),
-                            });
-                        };
-                        cur_ty = Ty::Array(elem_ty, new_len);
+            (ProjectionElem::Subslice { from, to, from_end }, Ty::Array(elem_ty, len)) => {
+                let len_u64 = len as u64;
+                let new_len = if *from_end {
+                    match from.checked_add(*to) {
+                        Some(total) if total <= len_u64 => len_u64 - total,
+                        _ => return Err(invalid(Ty::Array(elem_ty, len))),
                     }
-                    other => {
-                        return Err(RvalueLowerError::InvalidProjection {
-                            place: place.clone(),
-                            current_ty: other,
-                            elem: elem.clone(),
-                        });
-                    }
-                }
+                } else if *from <= *to && *to <= len_u64 {
+                    *to - *from
+                } else {
+                    return Err(invalid(Ty::Array(elem_ty, len)));
+                };
+                Ty::Array(elem_ty, new_len as usize)
             }
-            ProjectionElem::Downcast(_) => match &cur_ty {
-                Ty::Tuple(_) => {
-                    downcast_active = true;
-                }
-                _ => {
-                    return Err(RvalueLowerError::InvalidProjection {
-                        place: place.clone(),
-                        current_ty: cur_ty,
-                        elem: elem.clone(),
-                    });
-                }
-            },
-        }
+            (ProjectionElem::Downcast(_), Ty::Tuple(fields)) => Ty::Tuple(fields),
+            (_, other) => return Err(invalid(other)),
+        };
     }
 
     Ok(cur_ty)
@@ -444,6 +371,69 @@ pub fn resolve_operand_ty(operand: &Operand, local_decls: &[Ty]) -> Result<Ty, R
         Operand::Copy(place) | Operand::Move(place) => resolve_place_ty(place, local_decls),
         Operand::Constant(constant) => Ok(constant.ty()),
     }
+}
+
+/// Checks that a MIR constant is well-formed under `ptr_width`:
+/// - `Constant::Int(bits, ty)` requires an `Int`/`Uint` type and `bits` within the type's
+///   width (signed constants may also be given in sign-extended `i128` form, e.g.
+///   `u128::MAX` for `-1i8`);
+/// - `Constant::Ptr(ptr, ty)` requires a `RawPtr`/`Ref` type, an address within the target
+///   pointer width, and a non-null address for references.
+fn check_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<(), &'static str> {
+    match constant {
+        Constant::Int(bits, ty) => {
+            let in_range = match ty {
+                Ty::Uint(ut) => *bits <= ut.mask(ptr_width),
+                Ty::Int(it) => {
+                    let sign_extended = *bits as i128;
+                    *bits <= it.mask(ptr_width)
+                        || (sign_extended < 0 && sign_extended >= it.min_value(ptr_width))
+                }
+                _ => return Err("Constant::Int must carry an Int or Uint type"),
+            };
+            if in_range {
+                Ok(())
+            } else {
+                Err("Constant::Int bits exceed the width of its type")
+            }
+        }
+        Constant::Ptr(ptr, ty) => {
+            if !ty.is_any_ptr() {
+                return Err("Constant::Ptr must carry a RawPtr or Ref type");
+            }
+            if u128::from(ptr.addr) > ptr_width.mask() {
+                return Err("Constant::Ptr address exceeds the target pointer width");
+            }
+            if ty.is_ref() && ptr.addr == 0 {
+                return Err("Constant::Ptr of reference type must be non-null");
+            }
+            Ok(())
+        }
+        Constant::Bool(_) | Constant::Char(_) | Constant::Unit => Ok(()),
+    }
+}
+
+/// Resolves an operand's type during lowering, additionally validating constants.
+fn lower_operand_ty(
+    operand: &Operand,
+    local_decls: &[Ty],
+    ptr_width: PtrWidth,
+) -> Result<Ty, RvalueLowerError> {
+    if let Operand::Constant(constant) = operand {
+        check_constant(constant, ptr_width).map_err(|reason| RvalueLowerError::InvalidConstant {
+            constant: constant.clone(),
+            reason,
+        })?;
+    }
+    resolve_operand_ty(operand, local_decls)
+}
+
+/// Returns `ty` if its layout is representable under `ptr_width`, else `LayoutTooLarge`.
+fn check_layout(ty: Ty, ptr_width: PtrWidth) -> Result<Ty, RvalueLowerError> {
+    if ty.layout_size_for(ptr_width).is_none() {
+        return Err(RvalueLowerError::LayoutTooLarge(ty));
+    }
+    Ok(ty)
 }
 
 /// Validates operand types for `BinOp` and returns `(result_ty, pointee_size)`.
@@ -542,10 +532,11 @@ fn validate_binop_types(
                     rhs_ty: rhs_ty.clone(),
                 });
             }
-            if !pointee.is_inhabited() {
-                return Err(RvalueLowerError::UninhabitedType(pointee.clone()));
-            }
-            let stride = pointee.byte_size_for(ptr_width);
+            // The stride is the pointee's layout size, which is well-defined even for
+            // uninhabited pointees (`*const !` has stride 0, `*const (!, u32)` stride 4).
+            let stride = pointee
+                .layout_size_for(ptr_width)
+                .ok_or_else(|| RvalueLowerError::LayoutTooLarge(pointee.clone()))?;
             Ok((lhs_ty.clone(), Some(stride)))
         }
     }
@@ -560,15 +551,15 @@ pub fn lower_rvalue_with_policy(
 ) -> Result<LoweredRvalue, RvalueLowerError> {
     match rvalue {
         Rvalue::Use(operand) => {
-            let ty = resolve_operand_ty(operand, local_decls)?;
+            let ty = lower_operand_ty(operand, local_decls, ptr_width)?;
             Ok(LoweredRvalue::Use {
                 operand: operand.clone(),
                 ty,
             })
         }
         Rvalue::Repeat(operand, count) => {
-            let elem_ty = resolve_operand_ty(operand, local_decls)?;
-            let ty = Ty::Array(Box::new(elem_ty.clone()), *count);
+            let elem_ty = lower_operand_ty(operand, local_decls, ptr_width)?;
+            let ty = check_layout(Ty::Array(Box::new(elem_ty.clone()), *count), ptr_width)?;
             Ok(LoweredRvalue::Repeat {
                 operand: operand.clone(),
                 count: *count,
@@ -597,16 +588,19 @@ pub fn lower_rvalue_with_policy(
         Rvalue::Len(place) => {
             let place_ty = resolve_place_ty(place, local_decls)?;
             match place_ty {
-                Ty::Array(_, len) => Ok(LoweredRvalue::Len {
-                    place: place.clone(),
-                    static_len: len,
-                    ty: Ty::Uint(UintTy::Usize),
-                }),
+                Ty::Array(_, len) if (len as u128) <= ptr_width.max_usize() => {
+                    Ok(LoweredRvalue::Len {
+                        place: place.clone(),
+                        static_len: len,
+                        ty: Ty::Uint(UintTy::Usize),
+                    })
+                }
+                Ty::Array(_, _) => Err(RvalueLowerError::LayoutTooLarge(place_ty)),
                 other => Err(RvalueLowerError::InvalidLenTarget(other)),
             }
         }
         Rvalue::Cast(kind, operand, target_ty) => {
-            let src_ty = resolve_operand_ty(operand, local_decls)?;
+            let src_ty = lower_operand_ty(operand, local_decls, ptr_width)?;
             let cast = lower_cast_rvalue_with_ptr_width(
                 *kind,
                 operand,
@@ -621,8 +615,8 @@ pub fn lower_rvalue_with_policy(
             })
         }
         Rvalue::BinaryOp(op, lhs, rhs) => {
-            let lhs_ty = resolve_operand_ty(lhs, local_decls)?;
-            let rhs_ty = resolve_operand_ty(rhs, local_decls)?;
+            let lhs_ty = lower_operand_ty(lhs, local_decls, ptr_width)?;
+            let rhs_ty = lower_operand_ty(rhs, local_decls, ptr_width)?;
             let (ty, pointee_size) = validate_binop_types(*op, &lhs_ty, &rhs_ty, ptr_width)?;
             Ok(LoweredRvalue::BinaryOp {
                 op: *op,
@@ -635,8 +629,8 @@ pub fn lower_rvalue_with_policy(
             })
         }
         Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
-            let lhs_ty = resolve_operand_ty(lhs, local_decls)?;
-            let rhs_ty = resolve_operand_ty(rhs, local_decls)?;
+            let lhs_ty = lower_operand_ty(lhs, local_decls, ptr_width)?;
+            let rhs_ty = lower_operand_ty(rhs, local_decls, ptr_width)?;
             match op {
                 BinOp::Add
                 | BinOp::Sub
@@ -680,7 +674,7 @@ pub fn lower_rvalue_with_policy(
             })
         }
         Rvalue::UnaryOp(op, operand) => {
-            let operand_ty = resolve_operand_ty(operand, local_decls)?;
+            let operand_ty = lower_operand_ty(operand, local_decls, ptr_width)?;
             let ty = match op {
                 UnOp::Not => {
                     if operand_ty == Ty::Bool || operand_ty.is_integral() {
@@ -735,8 +729,13 @@ pub fn lower_rvalue_with_policy(
         Rvalue::Aggregate(kind, operands) => {
             let mut operand_tys = Vec::with_capacity(operands.len());
             for op in operands {
-                operand_tys.push(resolve_operand_ty(op, local_decls)?);
+                operand_tys.push(lower_operand_ty(op, local_decls, ptr_width)?);
             }
+            let invalid = |reason: &'static str| RvalueLowerError::InvalidAggregateOperands {
+                kind: kind.clone(),
+                count: operands.len(),
+                reason,
+            };
             let ty = match kind {
                 AggregateKind::Array(elem_ty) => {
                     for op_ty in &operand_tys {
@@ -747,16 +746,25 @@ pub fn lower_rvalue_with_policy(
                             });
                         }
                     }
-                    Ty::Array(Box::new(elem_ty.clone()), operands.len())
+                    check_layout(Ty::Array(Box::new(elem_ty.clone()), operands.len()), ptr_width)?
                 }
                 AggregateKind::Tuple => Ty::Tuple(operand_tys.clone()),
-                AggregateKind::Adt { active_field, .. } => {
-                    if active_field.is_some() && operands.len() != 1 {
-                        return Err(RvalueLowerError::InvalidAggregateOperands {
-                            kind: kind.clone(),
-                            count: operands.len(),
-                            reason: "union aggregate initialization requires exactly 1 operand",
-                        });
+                AggregateKind::Adt {
+                    variant_idx,
+                    active_field,
+                    ..
+                } => {
+                    if active_field.is_some() {
+                        // `rustc` MIR validation: union initializers have exactly one operand and
+                        // always use `FIRST_VARIANT` (unions are single-variant ADTs).
+                        if operands.len() != 1 {
+                            return Err(invalid(
+                                "union aggregate initialization requires exactly 1 operand",
+                            ));
+                        }
+                        if *variant_idx != 0 {
+                            return Err(invalid("union aggregate initialization must use variant 0"));
+                        }
                     }
                     Ty::Tuple(operand_tys.clone())
                 }
@@ -766,27 +774,27 @@ pub fn lower_rvalue_with_policy(
                     mutability,
                 } => {
                     if operands.len() != 2 {
-                        return Err(RvalueLowerError::InvalidAggregateOperands {
-                            kind: kind.clone(),
-                            count: operands.len(),
-                            reason: "RawPtr aggregate requires 2 operands (data_ptr_or_addr, unit_metadata)",
-                        });
+                        return Err(invalid(
+                            "RawPtr aggregate requires 2 operands (data_ptr_or_addr, unit_metadata)",
+                        ));
                     }
-                    let data_ty = &operand_tys[0];
-                    let meta_ty = &operand_tys[1];
-                    if !(data_ty.is_any_ptr() || data_ty.is_integral()) {
-                        return Err(RvalueLowerError::InvalidAggregateOperands {
-                            kind: kind.clone(),
-                            count: operands.len(),
-                            reason: "RawPtr aggregate first operand must be a pointer or integer address",
-                        });
+                    // `rustc` MIR validation: the data pointer is a thin raw pointer whose
+                    // mutability matches the constructed pointer's; Anneal additionally accepts a
+                    // `usize` address (yielding a pointer without provenance).
+                    let data_ok = match &operand_tys[0] {
+                        Ty::RawPtr(_, data_mutability) => data_mutability == mutability,
+                        Ty::Uint(UintTy::Usize) => true,
+                        _ => false,
+                    };
+                    if !data_ok {
+                        return Err(invalid(
+                            "RawPtr aggregate first operand must be a raw pointer of matching mutability or a usize address",
+                        ));
                     }
-                    if !meta_ty.is_unit() {
-                        return Err(RvalueLowerError::InvalidAggregateOperands {
-                            kind: kind.clone(),
-                            count: operands.len(),
-                            reason: "thin RawPtr aggregate second operand must be unit metadata ()",
-                        });
+                    if !operand_tys[1].is_unit() {
+                        return Err(invalid(
+                            "thin RawPtr aggregate second operand must be unit metadata ()",
+                        ));
                     }
                     Ty::RawPtr(Box::new(pointee.clone()), *mutability)
                 }
@@ -800,6 +808,10 @@ pub fn lower_rvalue_with_policy(
         }
         Rvalue::CopyForDeref(place) => {
             let ty = resolve_place_ty(place, local_decls)?;
+            // `rustc` only emits `CopyForDeref` for places of dereferenceable type.
+            if !ty.is_any_ptr() {
+                return Err(RvalueLowerError::InvalidCopyForDeref(ty));
+            }
             Ok(LoweredRvalue::CopyForDeref {
                 place: place.clone(),
                 ty,
@@ -842,11 +854,15 @@ pub fn lower_statement_with_policy(
                 ..
             } = &lowered
             {
-                // Allow union aggregate initialization to assign to either a single-field tuple,
-                // the active field's type directly, or a multi-field tuple representing the union layout.
-                operand_tys.len() == 1
-                    && (place_ty == operand_tys[0]
-                        || matches!(&place_ty, Ty::Tuple(fields) if fields.get(*field_idx) == Some(&operand_tys[0])))
+                // Union initialization: Anneal models a union-typed place as the tuple of the
+                // union's declared field types, so the destination must declare field
+                // `field_idx` with exactly the initializing operand's type (`rustc`: "union
+                // field has the wrong type" otherwise).
+                matches!(
+                    &place_ty,
+                    Ty::Tuple(fields)
+                        if operand_tys.len() == 1 && fields.get(*field_idx) == Some(&operand_tys[0])
+                )
             } else {
                 false
             };
@@ -890,11 +906,17 @@ pub fn lower_statement(
 }
 
 /// Lowers a complete MIR `Body` under `ptr_width` and `policy`.
+///
+/// Every local's declared type must be representable on the target
+/// ([`Ty::layout_size_for`]), otherwise `RvalueLowerError::LayoutTooLarge` is returned.
 pub fn lower_body_with_policy(
     body: &Body,
     ptr_width: PtrWidth,
     policy: TransmutePolicy,
 ) -> Result<LoweredBody, RvalueLowerError> {
+    for local_ty in &body.local_decls {
+        check_layout(local_ty.clone(), ptr_width)?;
+    }
     let mut basic_blocks = Vec::with_capacity(body.basic_blocks.len());
     for BasicBlockData {
         statements,
@@ -1080,6 +1102,21 @@ pub enum RvalueEvalError {
     CastEval(CastEvalError),
     /// Dynamic type mismatch.
     TypeMismatch(&'static str),
+    /// Non-zero pointer `Offset` on a pointer without provenance: `ptr::offset`/`ptr::add`
+    /// require the pointer to be derived from an allocation unless the byte offset is `0`.
+    PointerArithmeticWithoutProvenance {
+        addr: u64,
+        byte_offset: i128,
+    },
+    /// Place projection that cannot be evaluated without a memory model (only bare locals,
+    /// and `&(*p)` / `&raw (*p)` reborrows, are supported).
+    UnsupportedPlaceProjection(Place),
+    /// Ill-formed `Constant` (wrong type, out-of-range bits, or null `&T`).
+    InvalidConstant(&'static str),
+    /// Array value too large for the evaluator to materialize.
+    EvaluationLimit {
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for RvalueEvalError {
@@ -1117,6 +1154,19 @@ impl std::fmt::Display for RvalueEvalError {
             }
             RvalueEvalError::CastEval(err) => write!(f, "cast evaluation error: {err}"),
             RvalueEvalError::TypeMismatch(msg) => write!(f, "rvalue type mismatch: {msg}"),
+            RvalueEvalError::PointerArithmeticWithoutProvenance { addr, byte_offset } => {
+                write!(
+                    f,
+                    "pointer offset by {byte_offset} bytes on pointer {addr:#x} without provenance (UB)"
+                )
+            }
+            RvalueEvalError::UnsupportedPlaceProjection(place) => {
+                write!(f, "place {place:?} requires a memory model to evaluate")
+            }
+            RvalueEvalError::InvalidConstant(reason) => write!(f, "invalid constant: {reason}"),
+            RvalueEvalError::EvaluationLimit { len } => {
+                write!(f, "array of {len} elements exceeds the evaluator's materialization limit")
+            }
         }
     }
 }
@@ -1130,7 +1180,11 @@ impl From<CastEvalError> for RvalueEvalError {
 }
 
 /// Evaluates a `Constant` into a `MirValue` under `ptr_width`.
+///
+/// Rejects ill-formed constants (see `check_constant`) instead of silently truncating them:
+/// e.g. a `Constant::Int` whose bits exceed its type's width, or a null `&T` constant.
 pub fn eval_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<MirValue, RvalueEvalError> {
+    check_constant(constant, ptr_width).map_err(RvalueEvalError::InvalidConstant)?;
     match constant {
         Constant::Int(bits, ty) => match ty {
             Ty::Int(it) => Ok(MirValue::Int {
@@ -1141,26 +1195,16 @@ pub fn eval_constant(constant: &Constant, ptr_width: PtrWidth) -> Result<MirValu
                 bits: *bits & ut.mask(ptr_width),
                 ty: ty.clone(),
             }),
-            _ => Err(RvalueEvalError::TypeMismatch(
-                "Constant::Int must carry Int or Uint type",
+            _ => Err(RvalueEvalError::InvalidConstant(
+                "Constant::Int must carry an Int or Uint type",
             )),
         },
         Constant::Bool(b) => Ok(MirValue::Bool(*b)),
         Constant::Char(c) => Ok(MirValue::Char(*c)),
-        Constant::Ptr(ptr, ty) => {
-            if !ty.is_any_ptr() {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Constant::Ptr must carry RawPtr or Ref type",
-                ));
-            }
-            Ok(MirValue::Ptr {
-                ptr: PointerValue {
-                    addr: (ptr.addr as u128 & ptr_width.mask()) as u64,
-                    provenance: ptr.provenance,
-                },
-                ty: ty.clone(),
-            })
-        }
+        Constant::Ptr(ptr, ty) => Ok(MirValue::Ptr {
+            ptr: *ptr,
+            ty: ty.clone(),
+        }),
         Constant::Unit => Ok(MirValue::Unit),
     }
 }
@@ -1603,11 +1647,6 @@ pub fn eval_binop(
                     "Offset LHS type must be RawPtr or Ref",
                 ));
             };
-            if !pointee.is_inhabited() {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Offset pointee type must be inhabited",
-                ));
-            }
             let MirValue::Int {
                 bits: count_bits,
                 ty: rhs_ty,
@@ -1617,67 +1656,37 @@ pub fn eval_binop(
                     "Offset RHS must be MirValue::Int",
                 ));
             };
+            // The stride is the pointee's layout size (well-defined even when uninhabited).
+            let Some(pointee_size) = pointee.layout_size_for(ptr_width) else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Offset pointee layout is too large for the target",
+                ));
+            };
+            let base_addr = u128::from(ptr.addr) & ptr_width.mask();
+            let overflow = |offset: i128| RvalueEvalError::PointerOffsetOverflow {
+                base_addr: ptr.addr,
+                offset,
+                pointee_size,
+            };
 
-            let pointee_size = pointee.byte_size_for(ptr_width);
-            let base_addr = (ptr.addr as u128) & ptr_width.mask();
-
-            let new_addr = match rhs_ty {
+            // `ptr::offset` (signed count) / `ptr::add` (unsigned count): the byte offset
+            // `count * size_of::<T>()`, computed on mathematical integers, must fit in `isize`.
+            let (count, byte_delta) = match rhs_ty {
                 Ty::Int(it) => {
-                    let count_signed = it.sign_extend(*count_bits, ptr_width);
-                    let Some(byte_delta) = count_signed.checked_mul(pointee_size as i128) else {
-                        return Err(RvalueEvalError::PointerOffsetOverflow {
-                            base_addr: ptr.addr,
-                            offset: count_signed,
-                            pointee_size,
-                        });
-                    };
-                    if byte_delta < ptr_width.min_isize() || byte_delta > ptr_width.max_isize() {
-                        return Err(RvalueEvalError::PointerOffsetOverflow {
-                            base_addr: ptr.addr,
-                            offset: count_signed,
-                            pointee_size,
-                        });
-                    }
-                    let Some(res) = (base_addr as i128).checked_add(byte_delta) else {
-                        return Err(RvalueEvalError::PointerOffsetOverflow {
-                            base_addr: ptr.addr,
-                            offset: count_signed,
-                            pointee_size,
-                        });
-                    };
-                    if res < 0 || (res as u128) > ptr_width.mask() {
-                        return Err(RvalueEvalError::PointerOffsetOverflow {
-                            base_addr: ptr.addr,
-                            offset: count_signed,
-                            pointee_size,
-                        });
-                    }
-                    res as u64
+                    let count = it.sign_extend(*count_bits, ptr_width);
+                    let delta = count
+                        .checked_mul(pointee_size as i128)
+                        .ok_or_else(|| overflow(count))?;
+                    (count, delta)
                 }
                 Ty::Uint(ut) => {
                     let count_unsigned = *count_bits & ut.mask(ptr_width);
-                    let Some(byte_delta) = count_unsigned.checked_mul(pointee_size as u128) else {
-                        return Err(RvalueEvalError::PointerOffsetOverflow {
-                            base_addr: ptr.addr,
-                            offset: count_unsigned as i128,
-                            pointee_size,
-                        });
-                    };
-                    let Some(res) = base_addr.checked_add(byte_delta) else {
-                        return Err(RvalueEvalError::PointerOffsetOverflow {
-                            base_addr: ptr.addr,
-                            offset: count_unsigned as i128,
-                            pointee_size,
-                        });
-                    };
-                    if res > ptr_width.mask() {
-                        return Err(RvalueEvalError::PointerOffsetOverflow {
-                            base_addr: ptr.addr,
-                            offset: count_unsigned as i128,
-                            pointee_size,
-                        });
-                    }
-                    res as u64
+                    let count = i128::try_from(count_unsigned).unwrap_or(i128::MAX);
+                    let delta = count_unsigned
+                        .checked_mul(pointee_size as u128)
+                        .filter(|delta| *delta <= ptr_width.max_object_size())
+                        .ok_or_else(|| overflow(count))?;
+                    (count, delta as i128)
                 }
                 _ => {
                     return Err(RvalueEvalError::TypeMismatch(
@@ -1685,10 +1694,26 @@ pub fn eval_binop(
                     ));
                 }
             };
+            if byte_delta < ptr_width.min_isize() || byte_delta > ptr_width.max_isize() {
+                return Err(overflow(count));
+            }
+            // The resulting address must not wrap around the target address space.
+            let new_addr = base_addr as i128 + byte_delta;
+            if new_addr < 0 || (new_addr as u128) > ptr_width.mask() {
+                return Err(overflow(count));
+            }
+            // A non-zero offset requires a pointer derived from an allocation, i.e. one that
+            // carries provenance (offsetting by 0 bytes is always allowed).
+            if byte_delta != 0 && ptr.provenance.is_none() {
+                return Err(RvalueEvalError::PointerArithmeticWithoutProvenance {
+                    addr: ptr.addr,
+                    byte_offset: byte_delta,
+                });
+            }
 
             Ok(MirValue::Ptr {
                 ptr: PointerValue {
-                    addr: new_addr,
+                    addr: new_addr as u64,
                     provenance: ptr.provenance,
                 },
                 ty: ptr_ty.clone(),
@@ -1768,10 +1793,17 @@ pub fn eval_aggregate(
             variant_idx,
             active_field,
         } => {
-            if active_field.is_some() && operands.len() != 1 {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "union Adt aggregate with active_field requires exactly 1 operand",
-                ));
+            if active_field.is_some() {
+                if operands.len() != 1 {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "union Adt aggregate with active_field requires exactly 1 operand",
+                    ));
+                }
+                if *variant_idx != 0 {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "union Adt aggregate with active_field must use variant 0",
+                    ));
+                }
             }
             Ok(MirValue::Adt {
                 def_path: def_path.clone(),
@@ -1795,17 +1827,23 @@ pub fn eval_aggregate(
                 ));
             }
             let ptr = match &operands[0] {
-                MirValue::Ptr { ptr, .. } => PointerValue {
-                    addr: (ptr.addr as u128 & ptr_width.mask()) as u64,
+                MirValue::Ptr {
+                    ptr,
+                    ty: Ty::RawPtr(_, data_mutability),
+                } if data_mutability == mutability => PointerValue {
+                    addr: (u128::from(ptr.addr) & ptr_width.mask()) as u64,
                     provenance: ptr.provenance,
                 },
-                MirValue::Int { bits, .. } => PointerValue {
+                MirValue::Int {
+                    bits,
+                    ty: Ty::Uint(UintTy::Usize),
+                } => PointerValue {
                     addr: (*bits & ptr_width.mask()) as u64,
                     provenance: None,
                 },
                 _ => {
                     return Err(RvalueEvalError::TypeMismatch(
-                        "RawPtr aggregate first operand must be pointer or integer address",
+                        "RawPtr aggregate data operand must be a raw pointer of matching mutability or a usize address",
                     ));
                 }
             };
@@ -1814,6 +1852,134 @@ pub fn eval_aggregate(
                 ty: Ty::RawPtr(Box::new(pointee.clone()), *mutability),
             })
         }
+    }
+}
+
+/// Encodes `val` as the canonical byte image of type `ty` (see
+/// [`Ty::has_canonical_byte_layout`]), validating that the value's shape and scalar types
+/// match `ty`. Pointer bytes carry provenance fragments (MiniRust `encode_ptr`).
+fn encode_mir_value(
+    val: &MirValue,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+    out: &mut Vec<AbstractByte>,
+) -> Result<(), RvalueEvalError> {
+    match (ty, val) {
+        (Ty::Bool, MirValue::Bool(b)) => out.push(AbstractByte::new(u8::from(*b))),
+        (Ty::Char, MirValue::Char(c)) => out.extend(encode_int_bytes(u128::from(u32::from(*c)), 4)),
+        (Ty::Int(_) | Ty::Uint(_), MirValue::Int { bits, ty: val_ty }) if val_ty == ty => {
+            if !ty.is_valid_scalar_bits(*bits, ptr_width) {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: *bits,
+                }));
+            }
+            out.extend(encode_int_bytes(*bits, ty.byte_size_for(ptr_width)));
+        }
+        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::Ptr { ptr, ty: val_ty }) if val_ty == ty => {
+            let addr_bits = u128::from(ptr.addr) & ptr_width.mask();
+            if !ty.is_valid_scalar_bits(addr_bits, ptr_width) {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: addr_bits,
+                }));
+            }
+            out.extend(encode_ptr_bytes(*ptr, ptr_width));
+        }
+        (
+            Ty::Array(elem, count),
+            MirValue::Array {
+                elements,
+                elem_ty,
+            },
+        ) if **elem == *elem_ty && elements.len() == *count => {
+            for element in elements {
+                encode_mir_value(element, elem, ptr_width, out)?;
+            }
+        }
+        (Ty::Tuple(fields), MirValue::Unit) if fields.is_empty() => {}
+        (Ty::Tuple(fields), MirValue::Tuple(values)) if values.len() == fields.len() => {
+            for (value, field) in values.iter().zip(fields) {
+                encode_mir_value(value, field, ptr_width, out)?;
+            }
+        }
+        _ => {
+            return Err(RvalueEvalError::TypeMismatch(
+                "transmute operand value does not match its source type (ADT values have no modeled byte layout)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decodes the canonical byte image `bytes` (exactly `ty`'s size, already validated by
+/// `eval_transmute`) into a structured `MirValue` of type `ty`.
+fn decode_mir_value(
+    bytes: &[AbstractByte],
+    ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<MirValue, RvalueEvalError> {
+    let invalid = |bits: u128| {
+        RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ty.clone(),
+            bits,
+        })
+    };
+    match ty {
+        Ty::Bool => match decode_int_bytes(bytes) {
+            0 => Ok(MirValue::Bool(false)),
+            1 => Ok(MirValue::Bool(true)),
+            bits => Err(invalid(bits)),
+        },
+        Ty::Char => {
+            let bits = decode_int_bytes(bytes);
+            u32::try_from(bits)
+                .ok()
+                .and_then(char::from_u32)
+                .map(MirValue::Char)
+                .ok_or_else(|| invalid(bits))
+        }
+        Ty::Int(_) | Ty::Uint(_) => Ok(MirValue::Int {
+            bits: decode_int_bytes(bytes),
+            ty: ty.clone(),
+        }),
+        Ty::RawPtr(_, _) | Ty::Ref(_, _) => {
+            let ptr = decode_ptr_bytes(bytes);
+            if !ty.is_valid_scalar_bits(u128::from(ptr.addr), ptr_width) {
+                return Err(invalid(u128::from(ptr.addr)));
+            }
+            Ok(MirValue::Ptr {
+                ptr,
+                ty: ty.clone(),
+            })
+        }
+        Ty::Array(elem, count) => {
+            if *count > MAX_EVAL_ARRAY_LEN {
+                return Err(RvalueEvalError::EvaluationLimit { len: *count });
+            }
+            let elem_size = elem.byte_size_for(ptr_width);
+            let elements = (0..*count)
+                .map(|i| decode_mir_value(&bytes[i * elem_size..(i + 1) * elem_size], elem, ptr_width))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MirValue::Array {
+                elements,
+                elem_ty: (**elem).clone(),
+            })
+        }
+        Ty::Tuple(fields) if fields.is_empty() => Ok(MirValue::Unit),
+        Ty::Tuple(fields) => {
+            let mut offset = 0usize;
+            let mut values = Vec::with_capacity(fields.len());
+            for field in fields {
+                let size = field.byte_size_for(ptr_width);
+                values.push(decode_mir_value(&bytes[offset..offset + size], field, ptr_width)?);
+                offset += size;
+            }
+            Ok(MirValue::Tuple(values))
+        }
+        Ty::Never => Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
+            target_ty: Ty::Never,
+        })),
     }
 }
 
@@ -1839,12 +2005,17 @@ pub fn eval_lowered_cast(
             })
         }
         LoweredCast::IntToPtr { target_ty, .. } => {
-            let Some(addr) = val.as_bits() else {
+            let MirValue::Int { bits: addr, ty } = val else {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "IntToPtr requires scalar integer value",
+                    "IntToPtr requires integer value",
                 ));
             };
-            let ptr = eval_int_to_ptr_with_ptr_width(addr, target_ty, ptr_width, tracker, None)?;
+            if !ty.is_integral() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "IntToPtr requires integer value",
+                ));
+            }
+            let ptr = eval_int_to_ptr_with_ptr_width(*addr, target_ty, ptr_width, tracker, None)?;
             Ok(MirValue::Ptr {
                 ptr,
                 ty: target_ty.clone(),
@@ -1890,69 +2061,50 @@ pub fn eval_lowered_cast(
             src_ty, target_ty, ..
         } => {
             let tv_in = match val {
-                MirValue::Ptr { ptr, .. } => TransmuteValue::Ptr(*ptr),
-                MirValue::Int { bits, .. } => TransmuteValue::Scalar(*bits),
-                MirValue::Bool(b) => TransmuteValue::Scalar(u128::from(*b)),
-                MirValue::Char(c) => TransmuteValue::Scalar(u32::from(*c) as u128),
-                MirValue::Unit => TransmuteValue::Bytes(Vec::new()),
-                _ => {
+                MirValue::Ptr { ptr, ty } if ty == src_ty => TransmuteValue::Ptr(*ptr),
+                MirValue::Int { bits, ty } if ty == src_ty => TransmuteValue::Scalar(*bits),
+                MirValue::Bool(b) if *src_ty == Ty::Bool => TransmuteValue::Scalar(u128::from(*b)),
+                MirValue::Char(c) if *src_ty == Ty::Char => {
+                    TransmuteValue::Scalar(u128::from(u32::from(*c)))
+                }
+                MirValue::Ptr { .. } | MirValue::Int { .. } | MirValue::Bool(_) | MirValue::Char(_) => {
                     return Err(RvalueEvalError::TypeMismatch(
-                        "unsupported value for eval_lowered_cast Transmute",
+                        "transmute operand value does not match its source type",
                     ));
+                }
+                MirValue::Unit | MirValue::Array { .. } | MirValue::Tuple(_) | MirValue::Adt { .. } => {
+                    let mut bytes = Vec::with_capacity(src_ty.byte_size_for(ptr_width));
+                    encode_mir_value(val, src_ty, ptr_width, &mut bytes)?;
+                    TransmuteValue::AbstractBytes(bytes)
                 }
             };
             let tv_out = eval_transmute(tv_in, src_ty, target_ty, ptr_width, policy, tracker)?;
-            match (tv_out, target_ty) {
-                (TransmuteValue::Ptr(ptr), _) => Ok(MirValue::Ptr {
+            match tv_out {
+                TransmuteValue::Ptr(ptr) => Ok(MirValue::Ptr {
                     ptr,
                     ty: target_ty.clone(),
                 }),
-                (TransmuteValue::Scalar(bits), Ty::Bool) => Ok(MirValue::Bool(bits != 0)),
-                (TransmuteValue::Scalar(bits), Ty::Char) => {
-                    let c = char::from_u32(bits as u32).ok_or(CastEvalError::InvalidBitPattern {
-                        target_ty: Ty::Char,
-                        bits,
-                    })?;
-                    Ok(MirValue::Char(c))
+                TransmuteValue::Scalar(bits) => {
+                    let size = target_ty.byte_size_for(ptr_width);
+                    let bytes: Vec<AbstractByte> = encode_int_bytes(bits, size).collect();
+                    decode_mir_value(&bytes, target_ty, ptr_width)
                 }
-                (TransmuteValue::Scalar(bits), _) => Ok(MirValue::Int {
-                    bits,
-                    ty: target_ty.clone(),
-                }),
-                (TransmuteValue::Bytes(_), Ty::Tuple(fields)) if fields.is_empty() => {
-                    Ok(MirValue::Unit)
+                TransmuteValue::Bytes(raw) => {
+                    let bytes: Vec<AbstractByte> = raw.into_iter().map(AbstractByte::new).collect();
+                    decode_mir_value(&bytes, target_ty, ptr_width)
                 }
-                (TransmuteValue::Bytes(bytes), Ty::Array(elem_ty, count))
-                    if **elem_ty == Ty::Uint(UintTy::U8) && bytes.len() == *count =>
-                {
-                    let elements = bytes
-                        .into_iter()
-                        .map(|b| MirValue::Int {
-                            bits: b as u128,
-                            ty: Ty::Uint(UintTy::U8),
-                        })
-                        .collect();
-                    Ok(MirValue::Array {
-                        elements,
-                        elem_ty: Ty::Uint(UintTy::U8),
-                    })
-                }
-                (TransmuteValue::Bytes(bytes), _) => {
-                    let elements = bytes
-                        .into_iter()
-                        .map(|b| MirValue::Int {
-                            bits: b as u128,
-                            ty: Ty::Uint(UintTy::U8),
-                        })
-                        .collect();
-                    Ok(MirValue::Tuple(elements))
-                }
+                TransmuteValue::AbstractBytes(bytes) => decode_mir_value(&bytes, target_ty, ptr_width),
             }
         }
     }
 }
 
-/// Evaluates a `LoweredRvalue` given a closure/slice mapping `Local`s to `MirValue`s.
+/// Evaluates a `LoweredRvalue` given a slice mapping `Local`s to `MirValue`s.
+///
+/// There is no memory model: operands, `Discriminant`, and `CopyForDeref` may only read bare
+/// locals; `Ref`/`RawPtr` of a bare local yield a synthetic per-local address with a fresh
+/// provenance, and `Ref`/`RawPtr` of `(*p)` reborrow `p`'s address and provenance. Any other
+/// projection returns `RvalueEvalError::UnsupportedPlaceProjection`.
 pub fn eval_lowered_rvalue(
     rvalue: &LoweredRvalue,
     locals: &[MirValue],
@@ -1960,19 +2112,21 @@ pub fn eval_lowered_rvalue(
     policy: TransmutePolicy,
     tracker: &mut ExposedProvenanceTracker,
 ) -> Result<MirValue, RvalueEvalError> {
+    let read_local = |local: Local| -> Result<MirValue, RvalueEvalError> {
+        locals
+            .get(local.0)
+            .cloned()
+            .ok_or(RvalueEvalError::TypeMismatch("local index out of bounds"))
+    };
+    let read_place = |place: &Place| -> Result<MirValue, RvalueEvalError> {
+        if !place.projection.is_empty() {
+            return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+        }
+        read_local(place.local)
+    };
     let eval_op = |op: &Operand| -> Result<MirValue, RvalueEvalError> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => {
-                if !place.projection.is_empty() {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "projected place evaluation requires memory environment",
-                    ));
-                }
-                locals
-                    .get(place.local.0)
-                    .cloned()
-                    .ok_or(RvalueEvalError::TypeMismatch("local index out of bounds"))
-            }
+            Operand::Copy(place) | Operand::Move(place) => read_place(place),
             Operand::Constant(c) => eval_constant(c, ptr_width),
         }
     };
@@ -1985,6 +2139,9 @@ pub fn eval_lowered_rvalue(
             elem_ty,
             ..
         } => {
+            if *count > MAX_EVAL_ARRAY_LEN {
+                return Err(RvalueEvalError::EvaluationLimit { len: *count });
+            }
             let v = eval_op(operand)?;
             Ok(MirValue::Array {
                 elements: vec![v; *count],
@@ -1997,9 +2154,31 @@ pub fn eval_lowered_rvalue(
         | LoweredRvalue::RawPtr {
             place, ty: ref_ty, ..
         } => {
-            let addr = ((place.local.0 as u128 + 1) * 0x1000) & ptr_width.mask();
+            let ptr = match place.projection.as_slice() {
+                [] => {
+                    // Synthetic, page-aligned per-local allocation with a fresh provenance.
+                    let addr = ((place.local.0 as u128 + 1) * 0x1000) & ptr_width.mask();
+                    PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, 1)
+                }
+                [ProjectionElem::Deref] => match read_local(place.local)? {
+                    // `&(*p)` / `&raw const (*p)`: reborrow keeps p's address and provenance.
+                    MirValue::Ptr { ptr, .. } => ptr,
+                    _ => {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Deref projection requires a pointer value",
+                        ));
+                    }
+                },
+                _ => return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone())),
+            };
+            if ref_ty.is_ref() && ptr.addr == 0 {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ref_ty.clone(),
+                    bits: 0,
+                }));
+            }
             Ok(MirValue::Ptr {
-                ptr: PointerValue::with_provenance(addr as u64, place.local.0 as u64 + 1, 1),
+                ptr,
                 ty: ref_ty.clone(),
             })
         }
@@ -2045,11 +2224,8 @@ pub fn eval_lowered_rvalue(
             eval_unop(*op, &v, ptr_width)
         }
         LoweredRvalue::Discriminant { place, .. } => {
-            let v = locals
-                .get(place.local.0)
-                .ok_or(RvalueEvalError::TypeMismatch("local index out of bounds"))?;
-            let discr = match v {
-                MirValue::Adt { variant_idx, .. } => *variant_idx as i128,
+            let discr = match read_place(place)? {
+                MirValue::Adt { variant_idx, .. } => variant_idx as i128,
                 _ => 0,
             };
             Ok(MirValue::signed(discr, IntTy::Isize, ptr_width))
@@ -2061,10 +2237,7 @@ pub fn eval_lowered_rvalue(
             }
             eval_aggregate(kind, vals, ptr_width)
         }
-        LoweredRvalue::CopyForDeref { place, .. } => locals
-            .get(place.local.0)
-            .cloned()
-            .ok_or(RvalueEvalError::TypeMismatch("local index out of bounds")),
+        LoweredRvalue::CopyForDeref { place, .. } => read_place(place),
     }
 }
 
@@ -2214,5 +2387,69 @@ mod tests {
         let out_ptr = offset_res.as_ptr().unwrap();
         assert_eq!(out_ptr.addr, 0x1000 - 2 * 4);
         assert_eq!(out_ptr.provenance, ptr_val.as_ptr().unwrap().provenance);
+    }
+
+    #[test]
+    fn test_b1_mir_value_byte_codec_roundtrips_nested_canonical_values() {
+        let pw = PtrWidth::Bits64;
+        let raw = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+        // Structural codec over ((u32, u16, u16), [*const u8; 1], [char; 2]). (Canonicality is
+        // enforced by `eval_transmute`; this mixed-niche tuple is deliberately not canonical.)
+        let ty = Ty::Tuple(vec![
+            Ty::Tuple(vec![Ty::Uint(UintTy::U32), Ty::Uint(UintTy::U16), Ty::Uint(UintTy::U16)]),
+            Ty::Array(Box::new(raw.clone()), 1),
+            Ty::Array(Box::new(Ty::Char), 2),
+        ]);
+        assert!(!ty.has_canonical_byte_layout(pw));
+        let ptr = PointerValue::with_provenance(0xABCD, 1, 2);
+        let val = MirValue::Tuple(vec![
+            MirValue::Tuple(vec![
+                MirValue::unsigned(0x1122_3344, UintTy::U32, pw),
+                MirValue::unsigned(0x5566, UintTy::U16, pw),
+                MirValue::unsigned(0x7788, UintTy::U16, pw),
+            ]),
+            MirValue::Array {
+                elements: vec![MirValue::ptr(ptr, raw.clone())],
+                elem_ty: raw.clone(),
+            },
+            MirValue::Array {
+                elements: vec![MirValue::Char('é'), MirValue::Char('\u{10FFFF}')],
+                elem_ty: Ty::Char,
+            },
+        ]);
+        let mut bytes = Vec::new();
+        encode_mir_value(&val, &ty, pw, &mut bytes).unwrap();
+        assert_eq!(bytes.len(), ty.byte_size_for(pw));
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[..4].iter().map(|b| b.data).collect::<Vec<_>>(), &[0x44, 0x33, 0x22, 0x11]);
+        assert!(bytes[8..16].iter().all(|b| b.provenance.is_some()));
+        assert_eq!(decode_mir_value(&bytes, &ty, pw), Ok(val));
+
+        // Shape mismatches are rejected rather than silently re-typed.
+        let wrong = MirValue::Tuple(vec![MirValue::Unit]);
+        assert!(matches!(
+            encode_mir_value(&wrong, &ty, pw, &mut Vec::new()),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        // ADT values have no modeled byte layout.
+        let adt = MirValue::Adt {
+            def_path: "S".into(),
+            variant_idx: 0,
+            active_field: None,
+            fields: vec![],
+        };
+        assert!(matches!(
+            encode_mir_value(&adt, &Ty::unit(), pw, &mut Vec::new()),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        // Decoding validates niches: a surrogate is not a char.
+        let surrogate: Vec<AbstractByte> = encode_int_bytes(0xD800, 4).collect();
+        assert_eq!(
+            decode_mir_value(&surrogate, &Ty::Char, pw),
+            Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                target_ty: Ty::Char,
+                bits: 0xD800,
+            }))
+        );
     }
 }

@@ -12,11 +12,16 @@ use std::collections::BTreeSet;
 use crate::ir::{CastKind, Operand, PointerValue, Provenance, PtrWidth, ScalarTy, Ty};
 
 /// Policy governing pointer-to-integer reinterpretation in `CastKind::Transmute`.
+///
+/// A transmute is `Ptr -> Int` iff some pointer (`RawPtr`/`Ref`) in the source's byte layout
+/// does not land exactly on a pointer at the same byte offset of the target's layout (e.g.
+/// `*const T -> usize`, `&T -> [u8; 8]`, or `(*const T, u64) -> (u64, *const T)`). Transmutes
+/// that keep every pointer on a pointer (e.g. `*const T -> &U`, `*const T -> [*mut U; 1]`, or
+/// `(*const T, u64) -> (*mut U, u64)`) are `Ptr -> Ptr` and preserve provenance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TransmutePolicy {
-    /// Rejects `Ptr -> Int` transmutes (`RawPtr`/`Ref` to non-pointer scalars or aggregates),
-    /// requiring callers to use `CastKind::PointerExposeProvenance` or explicitly opt into
-    /// provenance stripping.
+    /// Rejects `Ptr -> Int` transmutes, requiring callers to use
+    /// `CastKind::PointerExposeProvenance` or explicitly opt into provenance stripping.
     #[default]
     RejectPtrToInt,
     /// Permits same-size `Ptr -> Int` transmutes while stripping pointer provenance
@@ -69,6 +74,16 @@ pub enum CastLowerError {
         src_ty: Ty,
         target_ty: Ty,
     },
+    /// Type's layout is not representable on the target (array length above `usize::MAX`
+    /// or size above `isize::MAX`; see [`Ty::layout_size_for`]).
+    LayoutTooLarge {
+        ty: Ty,
+    },
+    /// Byte-level transmute through a type without a canonical byte layout (see
+    /// [`Ty::has_canonical_byte_layout`]), e.g. a tuple with padding or reordered fields.
+    UnsupportedLayout {
+        ty: Ty,
+    },
 }
 
 impl std::fmt::Display for CastLowerError {
@@ -102,6 +117,12 @@ impl std::fmt::Display for CastLowerError {
                     f,
                     "pointer-to-integer transmute from {src_ty:?} to {target_ty:?} disallowed by policy"
                 )
+            }
+            CastLowerError::LayoutTooLarge { ty } => {
+                write!(f, "type {ty:?} is too large for the target architecture")
+            }
+            CastLowerError::UnsupportedLayout { ty } => {
+                write!(f, "type {ty:?} has no canonical byte layout for transmute")
             }
         }
     }
@@ -219,7 +240,99 @@ pub fn lower_int_to_ptr(
     })
 }
 
+/// Maximum number of pointer leaves analyzed when checking a transmute's provenance policy.
+const MAX_POINTER_LEAVES: usize = 1 << 16;
+
+/// Collects the byte offsets (in increasing order) of every thin pointer (`RawPtr`/`Ref`)
+/// inside the canonical byte layout of `ty`, starting at `base`. Returns `false` if more
+/// than `budget` pointers would be collected.
+fn collect_pointer_offsets(
+    ty: &Ty,
+    ptr_width: PtrWidth,
+    base: usize,
+    out: &mut Vec<usize>,
+    budget: &mut usize,
+) -> bool {
+    if !ty.contains_ptr() {
+        return true;
+    }
+    match ty {
+        Ty::RawPtr(_, _) | Ty::Ref(_, _) => {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            out.push(base);
+            true
+        }
+        Ty::Array(elem, count) => {
+            let elem_size = elem.byte_size_for(ptr_width);
+            (0..*count).all(|i| {
+                collect_pointer_offsets(elem, ptr_width, base + i * elem_size, out, budget)
+            })
+        }
+        Ty::Tuple(fields) => {
+            let mut offset = base;
+            for field in fields {
+                if !collect_pointer_offsets(field, ptr_width, offset, out, budget) {
+                    return false;
+                }
+                offset += field.byte_size_for(ptr_width);
+            }
+            true
+        }
+        Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::Never => true,
+    }
+}
+
+/// Failure of the static layout/provenance checks shared by `lower_transmute` and
+/// `eval_transmute`.
+enum TransmuteLayoutError {
+    /// The given type has no canonical byte layout (or too many pointers to analyze).
+    Unsupported(Ty),
+    /// Some source pointer's bytes would be reinterpreted as non-pointer data.
+    PtrToInt,
+}
+
+/// Checks that both sides of a same-size transmute have canonical byte layouts and applies
+/// `policy` to source pointers: a transmute is `Ptr -> Int` iff some source pointer does not
+/// land exactly on a target pointer at the same byte offset (e.g. `*const u8 -> usize`,
+/// `(*const u8, u64) -> (u64, *const u8)`), whereas `*const u8 -> [&u8; 1]` or
+/// `(*const u8, u64) -> (*mut u16, u64)` preserve every pointer.
+fn check_transmute_layouts(
+    src_ty: &Ty,
+    target_ty: &Ty,
+    ptr_width: PtrWidth,
+    policy: TransmutePolicy,
+) -> Result<(), TransmuteLayoutError> {
+    for ty in [src_ty, target_ty] {
+        if !ty.has_canonical_byte_layout(ptr_width) {
+            return Err(TransmuteLayoutError::Unsupported(ty.clone()));
+        }
+    }
+    let mut src_ptrs = Vec::new();
+    let mut src_budget = MAX_POINTER_LEAVES;
+    if !collect_pointer_offsets(src_ty, ptr_width, 0, &mut src_ptrs, &mut src_budget) {
+        return Err(TransmuteLayoutError::Unsupported(src_ty.clone()));
+    }
+    let mut target_ptrs = Vec::new();
+    let mut target_budget = MAX_POINTER_LEAVES;
+    if !collect_pointer_offsets(target_ty, ptr_width, 0, &mut target_ptrs, &mut target_budget) {
+        return Err(TransmuteLayoutError::Unsupported(target_ty.clone()));
+    }
+    let ptr_to_int = src_ptrs.iter().any(|off| target_ptrs.binary_search(off).is_err());
+    if ptr_to_int && policy == TransmutePolicy::RejectPtrToInt {
+        return Err(TransmuteLayoutError::PtrToInt);
+    }
+    Ok(())
+}
+
 /// Lowers a `CastKind::Transmute` under an explicit `PtrWidth` and `TransmutePolicy`.
+///
+/// Checks, in order: the target (then source) is inhabited; both layouts are representable
+/// on the target ([`Ty::layout_size_for`]); the sizes match; non-scalar sides have canonical
+/// byte layouts ([`Ty::has_canonical_byte_layout`]); and `policy` permits every source
+/// pointer that does not land exactly on a target pointer.
 pub fn lower_transmute(
     operand: &Operand,
     src_ty: &Ty,
@@ -239,8 +352,14 @@ pub fn lower_transmute(
         });
     }
 
-    let src_bytes = src_ty.byte_size_for(ptr_width);
-    let target_bytes = target_ty.byte_size_for(ptr_width);
+    let src_bytes = src_ty
+        .layout_size_for(ptr_width)
+        .ok_or_else(|| CastLowerError::LayoutTooLarge { ty: src_ty.clone() })?;
+    let target_bytes = target_ty
+        .layout_size_for(ptr_width)
+        .ok_or_else(|| CastLowerError::LayoutTooLarge {
+            ty: target_ty.clone(),
+        })?;
     if src_bytes != target_bytes {
         return Err(CastLowerError::SizeMismatchTransmute {
             src_ty: src_ty.clone(),
@@ -250,15 +369,13 @@ pub fn lower_transmute(
         });
     }
 
-    // Check Ptr -> Int policy: if source contains a pointer and target does not preserve it as a pointer,
-    // RejectPtrToInt forbids the transmute.
-    if src_ty.contains_ptr() && !target_ty.is_any_ptr() && policy == TransmutePolicy::RejectPtrToInt
-    {
-        return Err(CastLowerError::PtrToIntTransmuteDisallowed {
+    check_transmute_layouts(src_ty, target_ty, ptr_width, policy).map_err(|err| match err {
+        TransmuteLayoutError::Unsupported(ty) => CastLowerError::UnsupportedLayout { ty },
+        TransmuteLayoutError::PtrToInt => CastLowerError::PtrToIntTransmuteDisallowed {
             src_ty: src_ty.clone(),
             target_ty: target_ty.clone(),
-        });
-    }
+        },
+    })?;
 
     let op = match (src_ty.to_scalar_ty(), target_ty.to_scalar_ty()) {
         (Some(src), Some(dst)) => CastOp::Transmute { src, dst },
@@ -424,6 +541,15 @@ pub enum CastEvalError {
         src_ty: Ty,
         target_ty: Ty,
     },
+    /// Type's layout is not representable on the target (see [`Ty::layout_size_for`]).
+    LayoutTooLarge {
+        ty: Ty,
+    },
+    /// Byte-level transmute through a type without a canonical byte layout (see
+    /// [`Ty::has_canonical_byte_layout`]).
+    UnsupportedLayout {
+        ty: Ty,
+    },
 }
 
 impl std::fmt::Display for CastEvalError {
@@ -454,6 +580,12 @@ impl std::fmt::Display for CastEvalError {
                     "pointer-to-integer transmute from {src_ty:?} to {target_ty:?} disallowed by policy"
                 )
             }
+            CastEvalError::LayoutTooLarge { ty } => {
+                write!(f, "type {ty:?} is too large for the target architecture")
+            }
+            CastEvalError::UnsupportedLayout { ty } => {
+                write!(f, "type {ty:?} has no canonical byte layout for transmute")
+            }
         }
     }
 }
@@ -467,8 +599,152 @@ pub enum TransmuteValue {
     Scalar(u128),
     /// Machine pointer with address and optional provenance (`RawPtr` or `Ref`).
     Ptr(PointerValue),
-    /// Little-endian byte representation for aggregate values (`Array`, `Tuple`).
+    /// Provenance-free little-endian byte representation of an aggregate value
+    /// (`Array`, `Tuple`) laid out canonically (see [`Ty::has_canonical_byte_layout`]).
     Bytes(Vec<u8>),
+    /// Byte representation of an aggregate value whose pointer bytes carry provenance
+    /// fragments (MiniRust `AbstractByte`), e.g. `[*const u8; 2]` or `(*const u8, u64)`.
+    AbstractBytes(Vec<AbstractByte>),
+}
+
+/// Provenance fragment carried by one byte of an encoded pointer (MiniRust
+/// `ProvenanceFrag`): the pointer's provenance plus the byte's position within the
+/// pointer's encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProvenanceFrag {
+    pub provenance: Provenance,
+    pub position: usize,
+}
+
+/// Initialized abstract byte (MiniRust `AbstractByte::Init`): a data byte plus an optional
+/// pointer-provenance fragment. Canonical layouts have no padding, so MiniRust's
+/// `AbstractByte::Uninit` never arises in Anneal's transmute model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AbstractByte {
+    pub data: u8,
+    pub provenance: Option<ProvenanceFrag>,
+}
+
+impl AbstractByte {
+    /// A data byte without provenance.
+    pub const fn new(data: u8) -> Self {
+        AbstractByte {
+            data,
+            provenance: None,
+        }
+    }
+}
+
+/// Encodes the low `size` (`<= 16`) bytes of `bits` little-endian, without provenance.
+pub(crate) fn encode_int_bytes(bits: u128, size: usize) -> impl Iterator<Item = AbstractByte> {
+    (0..size.min(16)).map(move |i| AbstractByte::new((bits >> (i * 8)) as u8))
+}
+
+/// Decodes up to 16 little-endian bytes into an unsigned bit pattern, ignoring provenance
+/// (MiniRust integer/`bool`/`char` decoding strips provenance without exposing it).
+pub(crate) fn decode_int_bytes(bytes: &[AbstractByte]) -> u128 {
+    bytes
+        .iter()
+        .take(16)
+        .enumerate()
+        .fold(0u128, |acc, (i, b)| acc | (u128::from(b.data) << (i * 8)))
+}
+
+/// Encodes a thin pointer as little-endian address bytes (masked to `ptr_width`), each
+/// tagged with a provenance fragment recording its position (MiniRust `encode_ptr`).
+pub(crate) fn encode_ptr_bytes(ptr: PointerValue, ptr_width: PtrWidth) -> Vec<AbstractByte> {
+    let addr = u128::from(ptr.addr) & ptr_width.mask();
+    (0..ptr_width.byte_size())
+        .map(|position| AbstractByte {
+            data: (addr >> (position * 8)) as u8,
+            provenance: ptr
+                .provenance
+                .map(|provenance| ProvenanceFrag { provenance, position }),
+        })
+        .collect()
+}
+
+/// Decodes a thin pointer (MiniRust `decode_ptr`): the result keeps a provenance only if
+/// every byte carries a fragment of that same provenance at its matching position;
+/// otherwise (mixed, missing, or shuffled fragments) the pointer has no provenance.
+pub(crate) fn decode_ptr_bytes(bytes: &[AbstractByte]) -> PointerValue {
+    let addr = decode_int_bytes(bytes) as u64;
+    let provenance = bytes
+        .first()
+        .and_then(|b| b.provenance)
+        .map(|frag| frag.provenance)
+        .filter(|prov| {
+            bytes.iter().enumerate().all(|(idx, b)| {
+                matches!(b.provenance, Some(frag) if frag.position == idx && frag.provenance == *prov)
+            })
+        });
+    PointerValue { addr, provenance }
+}
+
+/// Decodes `bytes` at `ty` (a canonical layout of exactly `bytes.len()` bytes), validating
+/// every scalar leaf, and appends the re-encoded value to `out`: non-pointer leaves drop any
+/// provenance (stripping without exposing), and pointer leaves keep a provenance only if
+/// all of their bytes agree on it (MiniRust `decode_ptr`).
+fn normalize_bytes(
+    bytes: &[AbstractByte],
+    ty: &Ty,
+    ptr_width: PtrWidth,
+    out: &mut Vec<AbstractByte>,
+) -> Result<(), CastEvalError> {
+    match ty {
+        Ty::RawPtr(_, _) | Ty::Ref(_, _) => {
+            let ptr = decode_ptr_bytes(bytes);
+            let bits = u128::from(ptr.addr);
+            if !ty.is_valid_scalar_bits(bits, ptr_width) {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits,
+                });
+            }
+            out.extend(encode_ptr_bytes(ptr, ptr_width));
+            Ok(())
+        }
+        Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) => {
+            let bits = decode_int_bytes(bytes);
+            if !ty.is_valid_scalar_bits(bits, ptr_width) {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits,
+                });
+            }
+            out.extend(encode_int_bytes(bits, bytes.len()));
+            Ok(())
+        }
+        Ty::Array(elem, count) => {
+            let elem_size = elem.byte_size_for(ptr_width);
+            if elem_size == 0 {
+                // Zero-sized elements occupy no bytes; inhabited ZST elements are always valid.
+                return if *count == 0 || elem.is_inhabited() {
+                    Ok(())
+                } else {
+                    Err(CastEvalError::UninhabitedTarget {
+                        target_ty: ty.clone(),
+                    })
+                };
+            }
+            for chunk in bytes.chunks_exact(elem_size) {
+                normalize_bytes(chunk, elem, ptr_width, out)?;
+            }
+            Ok(())
+        }
+        Ty::Tuple(fields) => {
+            let mut offset = 0usize;
+            for field in fields {
+                let size = field.byte_size_for(ptr_width);
+                normalize_bytes(&bytes[offset..offset + size], field, ptr_width, out)?;
+                offset += size;
+            }
+            Ok(())
+        }
+        Ty::Never => Err(CastEvalError::UninhabitedTarget {
+            target_ty: Ty::Never,
+        }),
+    }
 }
 
 /// Evaluates a lowered `PtrToInt` cast on a concrete pointer value under `ptr_width`.
@@ -549,6 +825,10 @@ pub fn eval_int_to_ptr(
 }
 
 /// Evaluates a numeric `CastKind::IntToInt` conversion (including `bool`/`char` as integer).
+///
+/// Signed sources sign-extend, unsigned/`bool`/`char` sources zero-extend, and the result is
+/// truncated to the target width. A `char` target (`u8 as char`) must yield a Unicode
+/// scalar value, otherwise `CastEvalError::InvalidBitPattern` is returned.
 pub fn eval_int_to_int(
     src_bits: u128,
     src_ty: &Ty,
@@ -562,14 +842,14 @@ pub fn eval_int_to_int(
         _ => return Err(CastEvalError::TypeMismatch("IntToInt target must be Int, Uint, or Char")),
     };
 
-    match src_ty {
+    let result = match src_ty {
         Ty::Int(src_it) => {
             let signed = src_it.sign_extend(src_bits, ptr_width);
-            Ok((signed as u128) & dst_mask)
+            (signed as u128) & dst_mask
         }
         Ty::Uint(src_ut) => {
             let unsigned = src_bits & src_ut.mask(ptr_width);
-            Ok(unsigned & dst_mask)
+            unsigned & dst_mask
         }
         Ty::Bool => {
             if src_bits > 1 {
@@ -578,7 +858,7 @@ pub fn eval_int_to_int(
                     bits: src_bits,
                 });
             }
-            Ok(src_bits & dst_mask)
+            src_bits & dst_mask
         }
         Ty::Char => {
             if !ScalarTy::Char.is_valid_bits(src_bits, ptr_width) {
@@ -587,84 +867,48 @@ pub fn eval_int_to_int(
                     bits: src_bits,
                 });
             }
-            Ok(src_bits & dst_mask)
+            src_bits & dst_mask
         }
-        _ => Err(CastEvalError::TypeMismatch(
-            "IntToInt source must be Int, Uint, Bool, or Char",
-        )),
-    }
-}
+        _ => {
+            return Err(CastEvalError::TypeMismatch(
+                "IntToInt source must be Int, Uint, Bool, or Char",
+            ));
+        }
+    };
 
-/// Validates that `bytes` (of length `ty.byte_size_for(ptr_width)`) form a bit-valid value for `ty`.
-fn validate_aggregate_bytes(
-    bytes: &[u8],
-    ty: &Ty,
-    ptr_width: PtrWidth,
-) -> Result<(), CastEvalError> {
-    if !ty.is_inhabited() {
-        return Err(CastEvalError::UninhabitedTarget {
-            target_ty: ty.clone(),
+    if *target_ty == Ty::Char && !ScalarTy::Char.is_valid_bits(result, ptr_width) {
+        return Err(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Char,
+            bits: result,
         });
     }
-    let expected_len = ty.byte_size_for(ptr_width);
-    if bytes.len() != expected_len {
-        return Err(CastEvalError::SizeMismatch {
-            src_bytes: bytes.len(),
-            target_bytes: expected_len,
-        });
-    }
-    match ty {
-        Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Uint(_) | Ty::RawPtr(_, _) | Ty::Ref(_, _) => {
-            let mut bits = 0u128;
-            for (i, &b) in bytes.iter().enumerate().take(16) {
-                bits |= (b as u128) << (i * 8);
-            }
-            if !ty.is_valid_scalar_bits(bits, ptr_width) {
-                return Err(CastEvalError::InvalidBitPattern {
-                    target_ty: ty.clone(),
-                    bits,
-                });
-            }
-            Ok(())
-        }
-        Ty::Array(elem, count) => {
-            let elem_sz = elem.byte_size_for(ptr_width);
-            for i in 0..*count {
-                let start = i * elem_sz;
-                let end = start + elem_sz;
-                validate_aggregate_bytes(&bytes[start..end], elem, ptr_width)?;
-            }
-            Ok(())
-        }
-        Ty::Tuple(fields) => {
-            let mut offset = 0usize;
-            for field in fields {
-                let f_sz = field.byte_size_for(ptr_width);
-                validate_aggregate_bytes(&bytes[offset..offset + f_sz], field, ptr_width)?;
-                offset += f_sz;
-            }
-            Ok(())
-        }
-        Ty::Never => Err(CastEvalError::UninhabitedTarget {
-            target_ty: Ty::Never,
-        }),
-    }
+    Ok(result)
 }
 
 /// Evaluates a same-size `CastKind::Transmute` on `val` under `ptr_width` and `policy`.
 ///
+/// Semantics follow MiniRust's `transmute(v, src, dst) = dst.decode(src.encode(v))` over
+/// [`AbstractByte`]s, restricted to canonical byte layouts
+/// ([`Ty::has_canonical_byte_layout`]), with scalars encoded little-endian.
+///
 /// Key invariants (UCG `#286` / MiniRust):
 /// 1. **Never** exposes provenance in `tracker` (`tracker` is borrowed only to prove/assert
 ///    that `eval_transmute` leaves the exposed provenance set untouched).
-/// 2. `Ptr -> Ptr`: preserves `PointerValue { addr, provenance }` (masked to `ptr_width`),
-///    and rejects `addr == 0` when `target_ty` is `Ty::Ref`.
-/// 3. `Ptr -> Int` (under `TransmutePolicy::AllowPtrToIntStripProvenance`): strips `provenance`
-///    without exposing it and validates `addr` against `target_ty`'s bit-validity niche
-///    (e.g. `Ptr -> Char` on 32-bit checks Unicode scalar validity!).
+/// 2. `Ptr -> Ptr` (including pointers nested at matching offsets inside arrays/tuples, e.g.
+///    `*const u8 -> [&u8; 1]`): preserves `PointerValue { addr, provenance }` (masked to
+///    `ptr_width`), and rejects `addr == 0` when the target pointer is a `Ty::Ref`.
+/// 3. `Ptr -> Int` (only under `TransmutePolicy::AllowPtrToIntStripProvenance`): strips
+///    provenance without exposing it and validates the target's bit-validity niche
+///    (e.g. `Ptr -> Char` on 32-bit checks Unicode scalar validity!). Pointer bytes that
+///    are split across, or shuffled into, a different pointer yield a pointer without
+///    provenance (MiniRust `decode_ptr`).
 /// 4. `Int -> Ptr`: produces `PointerValue { addr, provenance: None }`, rejecting `addr == 0`
-///    when `target_ty` is `Ty::Ref`.
+///    when the target is `Ty::Ref`.
 /// 5. `Scalar -> Scalar`: validates `target_ty` niche (`bool` `0..=1`, `char` scalar value),
 ///    returning `CastEvalError::InvalidBitPattern` on invalid bit patterns.
+///
+/// Aggregate results are returned as `TransmuteValue::Bytes` when no byte carries
+/// provenance, and as `TransmuteValue::AbstractBytes` otherwise.
 pub fn eval_transmute(
     val: TransmuteValue,
     src_ty: &Ty,
@@ -682,8 +926,14 @@ pub fn eval_transmute(
         return Err(CastEvalError::TypeMismatch("source type is uninhabited"));
     }
 
-    let src_bytes = src_ty.byte_size_for(ptr_width);
-    let target_bytes = target_ty.byte_size_for(ptr_width);
+    let src_bytes = src_ty
+        .layout_size_for(ptr_width)
+        .ok_or_else(|| CastEvalError::LayoutTooLarge { ty: src_ty.clone() })?;
+    let target_bytes = target_ty
+        .layout_size_for(ptr_width)
+        .ok_or_else(|| CastEvalError::LayoutTooLarge {
+            ty: target_ty.clone(),
+        })?;
     if src_bytes != target_bytes {
         return Err(CastEvalError::SizeMismatch {
             src_bytes,
@@ -691,61 +941,16 @@ pub fn eval_transmute(
         });
     }
 
-    if src_ty.contains_ptr() && !target_ty.is_any_ptr() && policy == TransmutePolicy::RejectPtrToInt
-    {
-        return Err(CastEvalError::PtrToIntDisallowed {
+    check_transmute_layouts(src_ty, target_ty, ptr_width, policy).map_err(|err| match err {
+        TransmuteLayoutError::Unsupported(ty) => CastEvalError::UnsupportedLayout { ty },
+        TransmuteLayoutError::PtrToInt => CastEvalError::PtrToIntDisallowed {
             src_ty: src_ty.clone(),
             target_ty: target_ty.clone(),
-        });
-    }
+        },
+    })?;
 
-    match val {
-        TransmuteValue::Ptr(ptr) => {
-            if !src_ty.is_any_ptr() {
-                return Err(CastEvalError::TypeMismatch(
-                    "TransmuteValue::Ptr requires pointer or reference source type",
-                ));
-            }
-            let addr_bits = (ptr.addr as u128) & ptr_width.mask();
-            let addr = addr_bits as u64;
-            if src_ty.is_ref() && addr == 0 {
-                return Err(CastEvalError::InvalidBitPattern {
-                    target_ty: src_ty.clone(),
-                    bits: 0,
-                });
-            }
-
-            if target_ty.is_any_ptr() {
-                if target_ty.is_ref() && addr == 0 {
-                    return Err(CastEvalError::InvalidBitPattern {
-                        target_ty: target_ty.clone(),
-                        bits: 0,
-                    });
-                }
-                Ok(TransmuteValue::Ptr(PointerValue {
-                    addr,
-                    provenance: ptr.provenance,
-                }))
-            } else if target_ty.is_scalar() {
-                // Ptr -> Scalar (under AllowPtrToIntStripProvenance): strip provenance without exposing it,
-                // and validate target scalar bit-validity (e.g., Ptr -> Char on 32-bit!).
-                if !target_ty.is_valid_scalar_bits(addr_bits, ptr_width) {
-                    return Err(CastEvalError::InvalidBitPattern {
-                        target_ty: target_ty.clone(),
-                        bits: addr_bits,
-                    });
-                }
-                Ok(TransmuteValue::Scalar(addr_bits))
-            } else {
-                // Ptr -> Aggregate (under AllowPtrToIntStripProvenance): serialize address bytes
-                // and validate aggregate niches.
-                let bytes: Vec<u8> = (0..target_bytes)
-                    .map(|i| ((addr_bits >> (i * 8)) & 0xFF) as u8)
-                    .collect();
-                validate_aggregate_bytes(&bytes, target_ty, ptr_width)?;
-                Ok(TransmuteValue::Bytes(bytes))
-            }
-        }
+    // 1. Encode the (validated) source value at `src_ty`.
+    let bytes: Vec<AbstractByte> = match val {
         TransmuteValue::Scalar(src_bits) => {
             if src_ty.is_any_ptr() || !src_ty.is_scalar() {
                 return Err(CastEvalError::TypeMismatch(
@@ -758,65 +963,83 @@ pub fn eval_transmute(
                     bits: src_bits,
                 });
             }
-
-            if target_ty.is_any_ptr() {
-                // Scalar -> Ptr: never fabricates or picks exposed provenance (`provenance: None`).
-                if !target_ty.is_valid_scalar_bits(src_bits, ptr_width) {
-                    return Err(CastEvalError::InvalidBitPattern {
-                        target_ty: target_ty.clone(),
-                        bits: src_bits,
-                    });
-                }
-                let addr = (src_bits & ptr_width.mask()) as u64;
-                Ok(TransmuteValue::Ptr(PointerValue {
-                    addr,
-                    provenance: None,
-                }))
-            } else if target_ty.is_scalar() {
-                if !target_ty.is_valid_scalar_bits(src_bits, ptr_width) {
-                    return Err(CastEvalError::InvalidBitPattern {
-                        target_ty: target_ty.clone(),
-                        bits: src_bits,
-                    });
-                }
-                let masked = src_bits & target_ty.scalar_mask(ptr_width);
-                Ok(TransmuteValue::Scalar(masked))
-            } else {
-                // Scalar -> Aggregate (e.g. u32 -> [u8; 4] or u32 -> (u16, u16)):
-                let bytes: Vec<u8> = (0..target_bytes)
-                    .map(|i| ((src_bits >> (i * 8)) & 0xFF) as u8)
-                    .collect();
-                validate_aggregate_bytes(&bytes, target_ty, ptr_width)?;
-                Ok(TransmuteValue::Bytes(bytes))
-            }
+            encode_int_bytes(src_bits, src_bytes).collect()
         }
-        TransmuteValue::Bytes(bytes) => {
-            if bytes.len() != src_bytes {
+        TransmuteValue::Ptr(ptr) => {
+            if !src_ty.is_any_ptr() {
+                return Err(CastEvalError::TypeMismatch(
+                    "TransmuteValue::Ptr requires pointer or reference source type",
+                ));
+            }
+            let addr_bits = u128::from(ptr.addr) & ptr_width.mask();
+            if !src_ty.is_valid_scalar_bits(addr_bits, ptr_width) {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: src_ty.clone(),
+                    bits: addr_bits,
+                });
+            }
+            encode_ptr_bytes(ptr, ptr_width)
+        }
+        TransmuteValue::Bytes(raw) => {
+            if raw.len() != src_bytes {
                 return Err(CastEvalError::SizeMismatch {
-                    src_bytes: bytes.len(),
+                    src_bytes: raw.len(),
                     target_bytes,
                 });
             }
-            validate_aggregate_bytes(&bytes, src_ty, ptr_width)?;
-            validate_aggregate_bytes(&bytes, target_ty, ptr_width)?;
+            let raw: Vec<AbstractByte> = raw.into_iter().map(AbstractByte::new).collect();
+            let mut normalized = Vec::with_capacity(src_bytes);
+            normalize_bytes(&raw, src_ty, ptr_width, &mut normalized)?;
+            normalized
+        }
+        TransmuteValue::AbstractBytes(raw) => {
+            if raw.len() != src_bytes {
+                return Err(CastEvalError::SizeMismatch {
+                    src_bytes: raw.len(),
+                    target_bytes,
+                });
+            }
+            let mut normalized = Vec::with_capacity(src_bytes);
+            normalize_bytes(&raw, src_ty, ptr_width, &mut normalized)?;
+            normalized
+        }
+    };
 
-            if target_ty.is_any_ptr() {
-                let mut bits = 0u128;
-                for (i, &b) in bytes.iter().enumerate().take(16) {
-                    bits |= (b as u128) << (i * 8);
-                }
-                Ok(TransmuteValue::Ptr(PointerValue {
-                    addr: (bits & ptr_width.mask()) as u64,
-                    provenance: None,
-                }))
-            } else if target_ty.is_scalar() {
-                let mut bits = 0u128;
-                for (i, &b) in bytes.iter().enumerate().take(16) {
-                    bits |= (b as u128) << (i * 8);
-                }
-                Ok(TransmuteValue::Scalar(bits))
+    // 2. Decode the bytes at `target_ty`, validating every scalar leaf.
+    match target_ty.to_scalar_ty() {
+        Some(ScalarTy::Ptr(_)) => {
+            // Int -> Ptr never fabricates provenance; Ptr -> Ptr keeps it only if every
+            // pointer byte still carries the same provenance fragment in order.
+            let ptr = decode_ptr_bytes(&bytes);
+            let bits = u128::from(ptr.addr);
+            if !target_ty.is_valid_scalar_bits(bits, ptr_width) {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: target_ty.clone(),
+                    bits,
+                });
+            }
+            Ok(TransmuteValue::Ptr(ptr))
+        }
+        Some(_) => {
+            // Ptr -> Int strips provenance without exposing it.
+            let bits = decode_int_bytes(&bytes);
+            if !target_ty.is_valid_scalar_bits(bits, ptr_width) {
+                return Err(CastEvalError::InvalidBitPattern {
+                    target_ty: target_ty.clone(),
+                    bits,
+                });
+            }
+            Ok(TransmuteValue::Scalar(bits))
+        }
+        None => {
+            let mut normalized = Vec::with_capacity(target_bytes);
+            normalize_bytes(&bytes, target_ty, ptr_width, &mut normalized)?;
+            if normalized.iter().all(|b| b.provenance.is_none()) {
+                Ok(TransmuteValue::Bytes(
+                    normalized.into_iter().map(|b| b.data).collect(),
+                ))
             } else {
-                Ok(TransmuteValue::Bytes(bytes))
+                Ok(TransmuteValue::AbstractBytes(normalized))
             }
         }
     }
@@ -1138,5 +1361,63 @@ mod tests {
                 bits: 0xD800,
             }
         );
+    }
+
+    #[test]
+    fn test_b1_collect_pointer_offsets_in_layout_order() {
+        let raw = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+        let raw_mut = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U16)), Mutability::Mut);
+        // ([*const u8; 2], (u64, *mut u16)) on 64-bit: pointers at 0, 8, and 24.
+        let ty = Ty::Tuple(vec![
+            Ty::Array(Box::new(raw.clone()), 2),
+            Ty::Tuple(vec![Ty::Uint(UintTy::U64), raw_mut]),
+        ]);
+        assert!(ty.has_canonical_byte_layout(PtrWidth::Bits64));
+        let mut offsets = Vec::new();
+        let mut budget = MAX_POINTER_LEAVES;
+        assert!(collect_pointer_offsets(&ty, PtrWidth::Bits64, 0, &mut offsets, &mut budget));
+        assert_eq!(offsets, vec![0, 8, 24]);
+        assert_eq!(budget, MAX_POINTER_LEAVES - 3);
+
+        // On 32-bit the same pointers sit at 0 and 4 (u64 still takes 8 bytes), then 16; the
+        // inner tuple then has tail padding, so the whole type is not canonical there.
+        let mut offsets32 = Vec::new();
+        let mut budget32 = MAX_POINTER_LEAVES;
+        assert!(collect_pointer_offsets(&ty, PtrWidth::Bits32, 0, &mut offsets32, &mut budget32));
+        assert_eq!(offsets32, vec![0, 4, 16]);
+        assert!(!ty.has_canonical_byte_layout(PtrWidth::Bits32));
+
+        // Budget exhaustion is reported instead of enumerating unboundedly.
+        let mut tiny_budget = 2;
+        assert!(!collect_pointer_offsets(&ty, PtrWidth::Bits64, 0, &mut Vec::new(), &mut tiny_budget));
+        // Pointer-free subtrees are skipped without consuming budget.
+        let mut zero_budget = 0;
+        let ints = Ty::Array(Box::new(Ty::Uint(UintTy::U64)), usize::MAX / 8);
+        assert!(collect_pointer_offsets(&ints, PtrWidth::Bits64, 0, &mut Vec::new(), &mut zero_budget));
+    }
+
+    #[test]
+    fn test_b1_pointer_byte_codec_masks_and_tracks_fragment_positions() {
+        let prov = Provenance { alloc_id: 4, tag: 2 };
+        // Addresses are masked to the target pointer width when encoded.
+        let ptr = PointerValue::with_provenance(0x1_2345_6789, prov.alloc_id, prov.tag);
+        let bytes32 = encode_ptr_bytes(ptr, PtrWidth::Bits32);
+        assert_eq!(bytes32.len(), 4);
+        assert_eq!(
+            bytes32.iter().map(|b| b.data).collect::<Vec<_>>(),
+            vec![0x89, 0x67, 0x45, 0x23]
+        );
+        for (position, byte) in bytes32.iter().enumerate() {
+            assert_eq!(byte.provenance, Some(ProvenanceFrag { provenance: prov, position }));
+        }
+        assert_eq!(
+            decode_ptr_bytes(&bytes32),
+            PointerValue::with_provenance(0x2345_6789, prov.alloc_id, prov.tag)
+        );
+        // Integer decoding ignores (strips) provenance fragments.
+        assert_eq!(decode_int_bytes(&bytes32), 0x2345_6789);
+        // A byte image without fragments decodes to a pointer without provenance.
+        let plain: Vec<AbstractByte> = encode_int_bytes(0x2345_6789, 4).collect();
+        assert_eq!(decode_ptr_bytes(&plain), PointerValue::without_provenance(0x2345_6789));
     }
 }
