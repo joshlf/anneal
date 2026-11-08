@@ -3641,6 +3641,35 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeLoopReborrow_tb_unsupported
   exposeLoopReborrow_bm_runs
   exposeLoopReborrow_anneal_no_fault_60
+  provCastAliasStmt_directBorrow
+  bodyAddrTakenLocals_provCastAliasView
+  stmtPreservesAddrTaken_provCastAliasStmt
+  inFragmentWithIntrinsics_addrTaken_spec
+  AddrTakenTargetsOk.of_start
+  AddrTakenTargetsOk.set
+  AddrTakenTargetsOk.set_init
+  AddrTakenTargetsOk.opPost
+  stmtPreservesAddrTaken_assign_dst_not_mem
+  BorrowsOk.target_ne_of_stmtPreserves
+  translateFnWithIntrinsics_locals
+  FrameOkWithIntrinsics.mk'
+  FrameOkWithIntrinsics.of_FrameOk
+  FrameOkWithIntrinsics.nlocals
+  FrameOkWithIntrinsics.slots
+  FrameOkWithIntrinsics.decl_localTy
+  FrameOkWithIntrinsics.slot_exists
+  FrameOkWithIntrinsics.local_ty
+  ptrTargetSpec_aligned_and_good
+  ptrTargetSpec_valid_withIntrinsics
+  evalPtrLoad_withIntrinsics
+  placeLoad_active_thread
+  evalValue_load_local_preserves_shape
+  ProvenanceRel.expose_step_from_frameOk
+  ProvenanceRel.withExposed_step_from_frameOk
+  ProvenanceRel.expose_then_withExposed_from_frameOk
+  int2ptrAdjacentArgsAmbiguous_countExposeStmts_eq_two
+  int2ptrAdjacentArgsAmbiguous_singleExposeSiteOk_false
+  int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
@@ -3896,6 +3925,35 @@ open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence
   exposeLoopReborrow_tb_unsupported
   exposeLoopReborrow_bm_runs
   exposeLoopReborrow_anneal_no_fault_60
+  provCastAliasStmt_directBorrow
+  bodyAddrTakenLocals_provCastAliasView
+  stmtPreservesAddrTaken_provCastAliasStmt
+  inFragmentWithIntrinsics_addrTaken_spec
+  AddrTakenTargetsOk.of_start
+  AddrTakenTargetsOk.set
+  AddrTakenTargetsOk.set_init
+  AddrTakenTargetsOk.opPost
+  stmtPreservesAddrTaken_assign_dst_not_mem
+  BorrowsOk.target_ne_of_stmtPreserves
+  translateFnWithIntrinsics_locals
+  FrameOkWithIntrinsics.mk'
+  FrameOkWithIntrinsics.of_FrameOk
+  FrameOkWithIntrinsics.nlocals
+  FrameOkWithIntrinsics.slots
+  FrameOkWithIntrinsics.decl_localTy
+  FrameOkWithIntrinsics.slot_exists
+  FrameOkWithIntrinsics.local_ty
+  ptrTargetSpec_aligned_and_good
+  ptrTargetSpec_valid_withIntrinsics
+  evalPtrLoad_withIntrinsics
+  placeLoad_active_thread
+  evalValue_load_local_preserves_shape
+  ProvenanceRel.expose_step_from_frameOk
+  ProvenanceRel.withExposed_step_from_frameOk
+  ProvenanceRel.expose_then_withExposed_from_frameOk
+  int2ptrAdjacentArgsAmbiguous_countExposeStmts_eq_two
+  int2ptrAdjacentArgsAmbiguous_singleExposeSiteOk_false
+  int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

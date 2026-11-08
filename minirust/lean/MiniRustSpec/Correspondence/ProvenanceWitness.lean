@@ -917,4 +917,66 @@ theorem exposeLoopReborrow_anneal_no_fault_60 :
     faultsA exposeLoopReborrow 60 (initMachineState exposeLoopReborrow [.scalar ⟨5, 4⟩]) = false := by
   decide +kernel
 
+/-! ## 8. Concrete round-trip reconstruction with a non-empty prior exposed set (Pass A4) -/
+
+/-- `int2ptrAdjacentArgsAmbiguous` has two syntactic `PointerExposeProvenance`
+statements (`_5 = _3 as usize` and `_6 = _4 as usize`), so `singleExposeSiteOk`
+is `false`. -/
+theorem int2ptrAdjacentArgsAmbiguous_countExposeStmts_eq_two :
+    countExposeStmts int2ptrAdjacentArgsAmbiguous = 2 := by
+  decide +kernel
+
+theorem int2ptrAdjacentArgsAmbiguous_singleExposeSiteOk_false :
+    singleExposeSiteOk int2ptrAdjacentArgsAmbiguous = false := by
+  decide +kernel
+
+/-- Concrete execution check for the 2-step round trip in the presence of a
+prior exposure (`ProvenanceRel.expose_then_withExposed_reconstructs` /
+`ProvenanceRel.expose_then_withExposed_from_frameOk`) on
+`int2ptrAdjacentArgsAmbiguous` under `ctx0_2` (`_1` at `256`, `_2` at `384`):
+1. After 9 `Mach` steps (`m9`, immediately after exposing `_3 = &raw const _1`),
+   `m9.intptrcast.exposed.elems = [(⟨2⟩, ())]` is already non-empty, and no
+   currently exposed live allocation contains `_2`'s address `384`
+   (`int2ptrCandidates m9.mem.memory.allocations m9.intptrcast.exposed 384 = []`).
+2. Step 10 (`m9 -> m10`, exposing `_4 = &raw const _2` into `_6`) extends
+   `m10.intptrcast.exposed.elems` to `[(⟨2⟩, ()), (⟨3⟩, ())]` and stores `384`
+   into `_6` (`evalValue m10 (.Load (.Local (localName 6))) = .ok ((.Int 384, .Int usizeIt), _)`),
+   with `int2ptrCandidates m10.mem.memory.allocations m10.intptrcast.exposed 384 = [(⟨3⟩, ())]`
+   and `IntPtrCast.int2ptr m10 384 = .ok { addr := 384, provenance := some (⟨3⟩, ()) }`.
+3. Step 11 (`m10 -> m11`, `_7 = _6 as *const u32`) reconstructs and stores
+   `{ addr := 384, provenance := some (⟨3⟩, ()) }` into `_7`. -/
+def spacedSecondExposeReconstructsOk (m0 : Mach) : Bool :=
+  match Interp.steps 9 m0 with
+  | .ok m9 =>
+    decide (m9.intptrcast.exposed.elems = [(⟨2⟩, ())]) &&
+    decide (int2ptrCandidates m9.mem.memory.allocations m9.intptrcast.exposed 384 = []) &&
+    match Interp.step m9 with
+    | .ok m10 =>
+      decide (m10.intptrcast.exposed.elems = [(⟨2⟩, ()), (⟨3⟩, ())]) &&
+      decide (int2ptrCandidates m10.mem.memory.allocations m10.intptrcast.exposed 384 =
+        [(⟨3⟩, ())]) &&
+      match IntPtrCast.int2ptr m10 384 with
+      | .ok ptr0 =>
+        decide (ptr0 = { addr := 384, provenance := some (⟨3⟩, ()) }) &&
+        match evalValue m10 (.Load (.Local (localName 6))) with
+        | .ok ((.Int addr, .Int it), _) =>
+          decide (addr = 384 ∧ it = usizeIt) &&
+          match Interp.step m10 with
+          | .ok m11 =>
+            match evalValue m11 (.Load (.Local (localName 7))) with
+            | .ok ((.Ptr ⟨ptr, none⟩, _), _) =>
+              decide (ptr = { addr := 384, provenance := some (⟨3⟩, ()) })
+            | _ => false
+          | .error _ => false
+        | _ => false
+      | .error _ => false
+    | .error _ => false
+  | .error _ => false
+
+theorem int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure :
+    (startMachineIntrCtx ctx0_2 int2ptrAdjacentArgsAmbiguous [.scalar ⟨7, 4⟩, .scalar ⟨9, 4⟩]).map
+        spacedSecondExposeReconstructsOk =
+      some true := by
+  decide +kernel
+
 end MiniRustSpec.Correspondence.ProvenanceWitness

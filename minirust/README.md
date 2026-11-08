@@ -1186,16 +1186,27 @@ These are deliberate and are the first things to lift:
   from `step_correspondence_N`.
   `ProvenanceRel.expose_then_withExposed_reconstructs` generalizes the 2-step
   round trip to states with prior exposures (no other live exposed allocation
-  containing the address) and states that `IntPtrCast.int2ptr` reconstructs
+  containing the address, witnessed concretely on `int2ptrAdjacentArgsAmbiguous`
+  under `ctx0_2` by `int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure`)
+  and states that `IntPtrCast.int2ptr` reconstructs
   exactly the pointer loaded from `_p` before the exposure while Anneal's
-  destination receives exactly `_p`'s `pv`. The lemmas still take MiniRust's
-  `evalPlace` results, the load of the exposed pointer, and the stores and jumps
-  as hypotheses: every `StateRelN`-level lemma that would supply them
-  (`FrameOk`, whose `hf : translateFn body = some f` fails on any body with a
-  provenance cast, and `evalPtrLoad`, which assumes `inFragment`) excludes these
-  bodies, so a `translateFnWithIntrinsics` analogue of `FrameOk` is the next step
-  (`AddrTakenTargetsOk` states the `BorrowsOk.target_ptrs` facts such an
-  analogue needs, not yet proved invariant). A single exposure site in a loop
+  destination receives exactly `_p`'s `pv`. Pass A4 further introduces
+  `FrameOkWithIntrinsics` (the `translateFnWithIntrinsics` analogue of `FrameOk`,
+  via `translateFnWithIntrinsics_locals`), `inFragmentWithIntrinsics_addrTaken_spec`
+  and `AddrTakenTargetsOk.{of_start,set,set_init,opPost}`, and the
+  `inFragment`-free `evalPtrLoad_withIntrinsics` (on top of
+  `ptrTargetSpec_aligned_and_good` and `ptrTargetSpec_valid_withIntrinsics`),
+  culminating in `ProvenanceRel.expose_step_from_frameOk`,
+  `ProvenanceRel.withExposed_step_from_frameOk`, and
+  `ProvenanceRel.expose_then_withExposed_from_frameOk`: these derive all
+  MiniRust `evalPlace`, pointer/integer `evalValue` load, `placeStore`,
+  `jumpToBlock`, and `ExposedTargetAtAddr` obligations directly from
+  `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`
+  with zero external MiniRust evaluation hypotheses, while preserving
+  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state. Threading
+  `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across the
+  continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
+  from `step_correspondence_N`. A single exposure site in a loop
   does accumulate Tree Borrows tags when the loop retags (`exposeLoopReborrow`,
   in the fragment: `MachTB` stops with `Stop.unsupported` on the second
   iteration while `Mach` runs on), whereas `exposeLoopSingleSite`'s raw-pointer
