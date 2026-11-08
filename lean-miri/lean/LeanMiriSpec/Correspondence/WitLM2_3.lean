@@ -61,7 +61,18 @@ and proves concrete `rfl`-verified execution witnesses exercising all five
    `SetDiscriminant(_4, 1)` on `.dead` `_4`.
 6. `wit_lm2_3_setDiscriminant_uninit_divergence`: `SetDiscriminant(_1, 0)` on
    `.uninit` `_1` is UB in Anneal, but lean-miri writes the tag and steps.
-7. `wit_lm2_3_bodyFree_divBody`: `BodyFreeOfLM2_3` and
+7. `wit_lm2_3_inactive_variant_initialized_divergence`: after
+   `_1 = Lm23Enum::V1(42_u32)`, projecting inactive variant `V2`'s first field
+   `((_1 as 2).0 : u32)` at `[4, 8)` (which overlaps active `V1.0` at `[4, 8)`)
+   is UB in Anneal (`stepMirFn = .fail .ub`), whereas `lean-miri` reads the
+   initialized bytes `[4, 8)` without checking the discriminant tag and writes
+   `42_u32` into `_3` (`evalProjection_downcast_field_initialized_divergence`).
+8. `wit_lm2_3_prefix_setDiscriminant_read`: after
+   `_1 = Lm23Enum::V2(42_u32, 99_u64)`, `SetDiscriminant(_1, 1)` mutates the
+   tag in place to `1` (`V1`'s payload `[u32 @ 4]` is a non-empty strict prefix
+   of `V2`'s payload `[u32 @ 4, u64 @ 8]`), and `_3 = copy ((_1 as 1).0 : u32)`
+   reads `42_u32` in lockstep in both Anneal and `lean-miri`.
+9. `wit_lm2_3_bodyFree_divBody`: `BodyFreeOfLM2_3` and
    `step_LM2_3_eq_of_bodyFree` on `LM-1.1`'s `divBody`.
 -/
 
@@ -452,6 +463,19 @@ def lm23Body : CapturedMir where
         isCleanup := false }
     , -- bb11: SetDiscriminant(_4, 1) on dead _4 -> UB
       { statements := [lm23SetDiscrStmt 4 1]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb12: _1 = V1(42), then _3 = copy ((_1 as 2).0): Anneal UB, lean-miri reads 42_u32
+      { statements :=
+          [ lm23AggV1Stmt 1 42
+          , lm23DowncastReadStmt false 3 1 (some "V2") 2 0 lm23U32Ty ]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb13: _1 = V2(42, 99), SetDiscriminant(_1, 1) (non-empty prefix!), _3 = copy ((_1 as 1).0)
+      { statements :=
+          [ lm23AggV2ConstStmt 1 42 99
+          , lm23SetDiscrStmt 1 1
+          , lm23DowncastReadStmt false 3 1 (some "V1") 1 0 lm23U32Ty ]
         terminator := lm23Term .return_
         isCleanup := false } ]
   fnAbi := lm23FnAbi
@@ -1104,9 +1128,144 @@ theorem wit_lm2_3_setDiscriminant_uninit_divergence :
     (lm23_init_stateRelLM2_3 8 1 (by decide)) lm23_phase lm23_env_valid
     rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide) rfl
 
-/-! ## 8. Witness 7: Conservative Extension (`BodyFreeOfLM2_3`) -/
+/-! ## 8. Witness 7: Inactive-Variant Read on Initialized Bytes Diverges (`bb12`) -/
 
-/-- **Witness 7 (`wit_lm2_3_bodyFree_divBody`)**:
+def lm23Bb12S1 : MachineState :=
+  { frame := { blockIdx := 12, stmtIdx := 1,
+               locals := [.uninit, .init (.aggregate 1 [.scalar ⟨42, 4⟩]),
+                          .uninit, .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+def lm23Bb12S2 : MachineState :=
+  { frame := { blockIdx := 12, stmtIdx := 2,
+               locals := [.uninit, .init (.aggregate 1 [.scalar ⟨42, 4⟩]),
+                          .uninit, .init (.scalar ⟨42, 4⟩), .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+theorem lm23_bb12_a1 : stepMirFn lm23Body (lm23InitAnneal 12) = .step lm23Bb12S1 := rfl
+theorem lm23_bb12_a2 : stepMirFn lm23Body lm23Bb12S1 = .fail .ub := rfl
+
+/-- **Witness 7 (`wit_lm2_3_inactive_variant_initialized_divergence`)**:
+After `_1 = Lm23Enum::V1(42_u32)`, projecting inactive variant `V2`'s first
+field `((_1 as 2).0 : u32)` at offset `4` (which overlaps active variant `V1`'s
+field `0` at `[4, 8)`) is rejected by Anneal (`stepMirFn = .fail .ub`), whereas
+`lean-miri` reads the initialized `u32` scalar `42` from `[4, 8)` without
+checking the discriminant tag and writes `42_u32` into `_3`
+(`evalProjection_downcast_field_initialized_divergence`). -/
+theorem wit_lm2_3_inactive_variant_initialized_divergence :
+    ∃ (m₁ m₂ : AnnealStepState),
+      stepMirFn lm23Body (lm23InitAnneal 12) = .step lm23Bb12S1 ∧
+      Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 12) = (m₁, .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 lm23Bb12S1 m₁ ∧
+      stepMirFn lm23Body lm23Bb12S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23Hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 lm23Bb12S2 m₂ := by
+  obtain ⟨m₁, hm₁, hst₁, _, himm₁⟩ :=
+    lm23_step_agg_v1_at (b := 12) (budget := 0) (by decide) rfl rfl lm23_bb12_a1
+  obtain ⟨ha₂, sc, m₂, hsc, hm₂, hst₂, _, _⟩ :=
+    evalProjection_downcast_field_initialized_divergence
+      hst₁ lm23_phase lm23_env_valid rfl rfl (isMove := false) rfl
+      (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23U32Ty)
+      (v_act := 1) (j := 0) (fieldVals := [.scalar ⟨42, 4⟩])
+      rfl rfl rfl (by decide) (by decide) rfl rfl (himm₁ 3 (by decide))
+      (by intro h; cases h) rfl (by decide) (by decide) (by decide) rfl
+  have hsc_eq : sc = ⟨42, 4⟩ := by
+    simpa [get?] using hsc.symm
+  subst hsc_eq
+  exact ⟨m₁, m₂, lm23_bb12_a1, hm₁, hst₁, ha₂, hm₂, hst₂⟩
+
+/-! ## 9. Witness 8: Non-Empty Strict Prefix `SetDiscriminant` + Read (`bb13`) -/
+
+def lm23Bb13S1 : MachineState :=
+  { frame := { blockIdx := 13, stmtIdx := 1,
+               locals := [.uninit,
+                          .init (.aggregate 2 [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩]),
+                          .uninit, .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+def lm23Bb13S2 : MachineState :=
+  { frame := { blockIdx := 13, stmtIdx := 2,
+               locals := [.uninit,
+                          .init (.aggregate 1 [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩]),
+                          .uninit, .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+def lm23Bb13S3 : MachineState :=
+  { frame := { blockIdx := 13, stmtIdx := 3,
+               locals := [.uninit,
+                          .init (.aggregate 1 [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩]),
+                          .uninit, .init (.scalar ⟨42, 4⟩), .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+theorem lm23_bb13_a1 : stepMirFn lm23Body (lm23InitAnneal 13) = .step lm23Bb13S1 := rfl
+theorem lm23_bb13_a2 : stepMirFn lm23Body lm23Bb13S1 = .step lm23Bb13S2 := rfl
+theorem lm23_bb13_a3 : stepMirFn lm23Body lm23Bb13S2 = .step lm23Bb13S3 := rfl
+
+/-- **Witness 8 (`wit_lm2_3_prefix_setDiscriminant_read`)**:
+After `_1 = Lm23Enum::V2(42_u32, 99_u64)`, `SetDiscriminant(_1, 1)` mutates the
+discriminant tag in place from `2` (`V2`) to `1` (`V1`) whose payload layout
+`[u32 @ 4]` is a non-empty strict prefix of `V2`'s `[u32 @ 4, u64 @ 8]`
+(`lm23Variants[1] <+: lm23Variants[2]`), and `_3 = copy ((_1 as 1).0 : u32)`
+then reads `42_u32` in lockstep in both Anneal and `lean-miri`. -/
+theorem wit_lm2_3_prefix_setDiscriminant_read :
+    ∃ (m₁ m₂ m₃ : AnnealStepState),
+      stepMirFn lm23Body (lm23InitAnneal 13) = .step lm23Bb13S1 ∧
+      Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 13) = (m₁, .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 lm23Bb13S1 m₁ ∧
+      stepMirFn lm23Body lm23Bb13S1 = .step lm23Bb13S2 ∧
+      Miri.Interpreter.Step.step lm23Hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 lm23Bb13S2 m₂ ∧
+      stepMirFn lm23Body lm23Bb13S2 = .step lm23Bb13S3 ∧
+      Miri.Interpreter.Step.step lm23Hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 lm23Bb13S3 m₃ := by
+  have hsim₁ := evalRvalue_aggregate_enum_simulation
+    (lm23_init_stateRelLM2_3 13 1 (by decide)) lm23_env_valid lm23_phase
+    rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl
+    (tagBytes := 4) (variants := lm23Variants) rfl (by decide) rfl
+    (fun tf i hi _ => by
+      have hi' : i < 2 := hi
+      match i with
+      | 0 => exact lm23_constU32_wt 42 (by decide) tf
+      | 1 => exact lm23_constU64_wt 99 (by decide) tf
+      | _ + 2 => omega)
+  dsimp only at hsim₁
+  rcases hsim₁ with ⟨hrel₁, hpost₁⟩
+  rw [lm23_bb13_a1] at hrel₁
+  obtain ⟨m₁, hm₁, hst₁⟩ := stepRelLM2_3_inv_step hrel₁
+  have hno₁ : ∀ msg, (Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 13)).2 ≠
+      .error (.undefinedBehavior msg) := by
+    rw [hm₁]; intro _ h; cases h
+  have himm₁_3 : IsImmediateStepLocal m₁ 3 := by
+    simpa [hm₁] using (hpost₁ hno₁).2.2 3 (by decide) (lm23_init_imm 13 3)
+  obtain ⟨hrel₂, _, himm₂_fn⟩ := step_setDiscriminant_simulation
+    hst₁ lm23_phase lm23_env_valid rfl rfl rfl
+    (dstDecl := lm23Decl lm23EnumTy) rfl rfl (by decide)
+    (by intro h; cases h)
+    (fun v_act hv_act _ hsl => by
+      injection hsl with hs; injection hs with hv; injection hv with hv_eq _
+      subst hv_eq
+      exact ⟨[{ offset := Miri.ABI.Size.ofBytes 8
+                ty := lm23U64Ty
+                fieldLayout := (translateTy lm23U64Ty lm23Layouts).layout }], rfl⟩)
+  rw [lm23_bb13_a2] at hrel₂
+  obtain ⟨m₂, hm₂, hst₂⟩ := stepRelLM2_3_inv_step hrel₂
+  have himm₂_3 : IsImmediateStepLocal m₂ 3 := by
+    simpa [hm₂] using himm₂_fn 3 himm₁_3
+  obtain ⟨hrel₃, _, _⟩ := evalProjection_downcast_field_simulation
+    hst₂ lm23_phase lm23_env_valid rfl rfl (isMove := false) rfl
+    (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23U32Ty)
+    rfl rfl rfl (by decide) (by decide) rfl rfl himm₂_3
+    (fun v_act _ hsl hne => by
+      injection hsl with hs; injection hs with hv; injection hv with hv_eq _
+      exact absurd hv_eq hne)
+  rw [lm23_bb13_a3] at hrel₃
+  obtain ⟨m₃, hm₃, hst₃⟩ := stepRelLM2_3_inv_step hrel₃
+  exact ⟨m₁, m₂, m₃, lm23_bb13_a1, hm₁, hst₁, lm23_bb13_a2, hm₂, hst₂,
+    lm23_bb13_a3, hm₃, hst₃⟩
+
+/-! ## 10. Witness 9: Conservative Extension (`BodyFreeOfLM2_3`) -/
+
+/-- **Witness 9 (`wit_lm2_3_bodyFree_divBody`)**:
 `LM-1.1`'s scalar `divBody` satisfies `BodyFreeOfLM2_3`, so
 `annealStepHooksLM2_3` steps identically to `annealStepHooks` on `miriInit`. -/
 theorem wit_lm2_3_bodyFree_divBody (divisor : Nat) :

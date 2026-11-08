@@ -195,10 +195,10 @@ variant counts, `Miri.Interpreter.projectField` tag projection, and
 `annealReadImmediate` / `annealWriteImmediate`.
 
 `discriminantValue` and `variantForDiscriminant` identify each variant's
-discriminant with its index, as a `usize`. This matches Anneal's `evalRvalue`,
-which evaluates `.discriminant` to `⟨variantIdx, 8⟩`. `LayoutTable` records no
-explicit discriminant values, so enums declared with explicit discriminants
-(`A = 5`) are outside this model. -/
+discriminant with its index, as an `isize` (Rust's default enum discriminant
+type). This matches Anneal's `evalRvalue`, which evaluates `.discriminant` to
+`⟨variantIdx, 8⟩`. `LayoutTable` records no explicit discriminant values, so
+enums declared with explicit discriminants (`A = 5`) are outside this model. -/
 def annealDiscriminantHooksLM2_3 (localDecls : List LocalDecl)
     (layouts : LayoutTable) :
     Miri.Interpreter.DiscriminantHooks
@@ -208,7 +208,7 @@ def annealDiscriminantHooksLM2_3 (localDecls : List LocalDecl)
       (Miri.Interpreter.RuntimePlace AnnealProv) where
   runtimeTarget := annealRuntimeDataLayout
   discriminantLayout := fun _ _ =>
-    pure (translateTy { kind := .uint .usize, layoutIdx := 0 } layouts)
+    pure (translateTy { kind := .int .isize, layoutIdx := 0 } layouts)
   tagLayout := fun _ tag =>
     match tagLayoutOfAbiScalar tag with
     | some l => pure l
@@ -220,7 +220,7 @@ def annealDiscriminantHooksLM2_3 (localDecls : List LocalDecl)
           match tl.variants with
           | .multiple _ _ vs =>
               if variant < vs.length then
-                pure (some (25, BitVec.ofNat 128 variant))
+                pure (some (15, BitVec.ofNat 128 variant))
               else
                 pure none
           | _ => pure none
