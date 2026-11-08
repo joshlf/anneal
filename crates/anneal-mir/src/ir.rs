@@ -576,15 +576,22 @@ impl Ty {
                     return false;
                 }
                 let keys_non_increasing = fields.windows(2).all(|w| {
-                    w[0].alignment_group_key(ptr_width) >= w[1].alignment_group_key(ptr_width)
+                    w[0].align_for(ptr_width) >= w[1].align_for(ptr_width)
+                        && w[0].alignment_group_key(ptr_width)
+                            >= w[1].alignment_group_key(ptr_width)
                 });
                 if !keys_non_increasing {
                     return false;
                 }
-                let unpadded = fields
-                    .iter()
-                    .fold(0usize, |acc, f| acc.saturating_add(f.byte_size_for(ptr_width)));
-                unpadded % self.align_for(ptr_width) == 0
+                let mut offset = 0usize;
+                for f in fields {
+                    let f_align = f.align_for(ptr_width);
+                    if offset % f_align != 0 {
+                        return false;
+                    }
+                    offset = offset.saturating_add(f.byte_size_for(ptr_width));
+                }
+                offset % self.align_for(ptr_width) == 0
             }
         }
     }

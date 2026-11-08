@@ -859,3 +859,72 @@ fn test_b1_eval_int_to_int_validates_char_targets() {
         })
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv A1] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a1_tuple_canonical_layout_rejects_increasing_field_alignment_with_same_size() {
+    let tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let u64_ty = Ty::Uint(UintTy::U64);
+    let op = Operand::Constant(Constant::Unit);
+
+    // `([u8; 4], u32)` has field sizes (4, 4) so `max(align, size)` is 4 for both,
+    // but `[u8; 4]` has align 1 < `u32` align 4, so `rustc` reorders `u32` before `[u8; 4]`.
+    // Similarly `([u8; 6], u16)` has `max(align, size)` trailing_zeros (1, 1) and unpadded size 8,
+    // but `[u8; 6]` has align 1 < `u16` align 2 (which would also place `u16` at offset 6 or reorder).
+    // And `((u32, u32), u64)` has field sizes (8, 8), but `(u32, u32)` has align 4 < `u64` align 8.
+    let non_canonical = [
+        Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 4), u32_ty.clone()]),
+        Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 6), u16_ty.clone()]),
+        Ty::Tuple(vec![
+            Ty::Tuple(vec![u32_ty.clone(), u32_ty.clone()]),
+            u64_ty.clone(),
+        ]),
+    ];
+
+    for bad_tuple in &non_canonical {
+        assert!(
+            !bad_tuple.has_canonical_byte_layout(PtrWidth::Bits64),
+            "{bad_tuple:?} must not be treated as canonical declaration-order layout"
+        );
+        let size = bad_tuple.byte_size_for(PtrWidth::Bits64);
+        let byte_arr = Ty::Array(Box::new(u8_ty.clone()), size);
+        assert_eq!(
+            lower_transmute(
+                &op,
+                bad_tuple,
+                &byte_arr,
+                PtrWidth::Bits64,
+                TransmutePolicy::RejectPtrToInt,
+            ),
+            Err(CastLowerError::UnsupportedLayout {
+                ty: bad_tuple.clone(),
+            })
+        );
+        assert_eq!(
+            eval_transmute(
+                TransmuteValue::Bytes(vec![0; size]),
+                bad_tuple,
+                &byte_arr,
+                PtrWidth::Bits64,
+                TransmutePolicy::RejectPtrToInt,
+                &tracker,
+            ),
+            Err(CastEvalError::UnsupportedLayout {
+                ty: bad_tuple.clone(),
+            })
+        );
+    }
+
+    // Conversely, `(u32, [u8; 4])` and `(u64, (u32, u32))` have non-increasing alignments
+    // and zero padding, so they ARE canonical.
+    let canon_u32_arr = Ty::Tuple(vec![u32_ty.clone(), Ty::Array(Box::new(u8_ty), 4)]);
+    let canon_u64_pair = Ty::Tuple(vec![u64_ty, Ty::Tuple(vec![u32_ty.clone(), u32_ty])]);
+    assert!(canon_u32_arr.has_canonical_byte_layout(PtrWidth::Bits64));
+    assert!(canon_u64_pair.has_canonical_byte_layout(PtrWidth::Bits64));
+}

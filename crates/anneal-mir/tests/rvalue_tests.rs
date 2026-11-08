@@ -5,10 +5,11 @@ use anneal_mir::ir::{
     Operand, Place, PointerValue, ProjectionElem, PtrWidth, Rvalue, Statement, Ty, UintTy, UnOp,
 };
 use anneal_mir::lower::{
-    CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredRvalue, LoweredStatement,
-    MirValue, RvalueEvalError, RvalueLowerError, TransmutePolicy, eval_aggregate, eval_binop,
-    eval_checked_binop, eval_constant, eval_lowered_rvalue, eval_unop, lower_body, lower_rvalue,
-    lower_rvalue_with_policy, lower_statement, resolve_place_ty,
+    CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast, LoweredRvalue,
+    LoweredStatement, MirValue, RvalueEvalError, RvalueLowerError, TransmutePolicy, eval_aggregate,
+    eval_binop, eval_checked_binop, eval_constant, eval_lowered_cast, eval_lowered_rvalue,
+    eval_unop, lower_body, lower_rvalue, lower_rvalue_with_policy, lower_statement,
+    resolve_place_ty,
 };
 
 #[test]
@@ -1177,4 +1178,175 @@ fn test_b1_layout_limits_for_bodies_len_and_repeat() {
         ),
         Err(RvalueEvalError::EvaluationLimit { len: 1 << 21 })
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A1] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a1_single_field_union_rejects_out_of_bounds_active_field_and_aggregate_layout_overflow() {
+    let pw32 = PtrWidth::Bits32;
+    let pw64 = PtrWidth::Bits64;
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let one_field_union = Ty::Tuple(vec![u32_ty.clone()]);
+    let local_decls = vec![one_field_union];
+    let op_u32 = Operand::Constant(Constant::Int(7, u32_ty));
+
+    // Field 0 is valid on a 1-field union.
+    let valid_union_stmt = Statement::Assign(
+        Place::from_local(0),
+        Rvalue::Aggregate(
+            AggregateKind::Adt {
+                def_path: "SingleFieldUnion".into(),
+                variant_idx: 0,
+                active_field: Some(0),
+            },
+            vec![op_u32.clone()],
+        ),
+    );
+    assert!(lower_statement(&valid_union_stmt, &local_decls, pw64).is_ok());
+
+    // Field 99 is out of bounds on a 1-field union even though `rvalue_ty` is also `(u32,)`.
+    let oob_union_stmt = Statement::Assign(
+        Place::from_local(0),
+        Rvalue::Aggregate(
+            AggregateKind::Adt {
+                def_path: "SingleFieldUnion".into(),
+                variant_idx: 0,
+                active_field: Some(99),
+            },
+            vec![op_u32],
+        ),
+    );
+    assert!(matches!(
+        lower_statement(&oob_union_stmt, &local_decls, pw64),
+        Err(RvalueLowerError::AssignmentTypeMismatch { .. })
+    ));
+
+    // Two 1 GiB arrays each fit in 32-bit `isize::MAX`, but a Tuple/Adt/Closure combining them
+    // is 2 GiB > `i32::MAX` and must fail with `LayoutTooLarge` on 32-bit targets.
+    let one_gib = Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 1 << 30);
+    let half_decls = vec![one_gib.clone(), one_gib];
+    let ops = vec![
+        Operand::Copy(Place::from_local(0)),
+        Operand::Copy(Place::from_local(1)),
+    ];
+    for kind in [
+        AggregateKind::Tuple,
+        AggregateKind::Adt {
+            def_path: "BigPair".into(),
+            variant_idx: 0,
+            active_field: None,
+        },
+        AggregateKind::Closure,
+    ] {
+        let rv = Rvalue::Aggregate(kind, ops.clone());
+        assert!(matches!(
+            lower_rvalue(&rv, &half_decls, pw32),
+            Err(RvalueLowerError::LayoutTooLarge(_))
+        ));
+        assert!(lower_rvalue(&rv, &half_decls, pw64).is_ok());
+    }
+}
+
+#[test]
+fn test_a1_eval_lowered_cast_and_null_ref_guards() {
+    let pw = PtrWidth::Bits64;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let mut tracker = ExposedProvenanceTracker::new();
+
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let i8_ty = Ty::Int(IntTy::I8);
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let raw_u8 = Ty::RawPtr(Box::new(u8_ty.clone()), Mutability::Not);
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty.clone()), Mutability::Not);
+    let ref_u8 = Ty::Ref(Box::new(u8_ty.clone()), Mutability::Not);
+    let dummy_op = Operand::Constant(Constant::Unit);
+
+    // 1. IntToInt must reject a pointer runtime value even though `MirValue::as_bits` returns Some.
+    let int_to_int = LoweredCast::IntToInt {
+        src_ty: usize_ty.clone(),
+        target_ty: u32_ty.clone(),
+        operand: dummy_op.clone(),
+    };
+    let ptr_val = MirValue::ptr(PointerValue::with_provenance(0x1000, 1, 1), raw_u8.clone());
+    assert!(eval_lowered_cast(&int_to_int, &ptr_val, pw, policy, &mut tracker).is_err());
+
+    // 2. Signed IntToPtr (`-1i8 as *const u8`) sign-extends to pointer width.
+    let i8_to_ptr = LoweredCast::IntToPtr {
+        src_ty: i8_ty,
+        target_ty: raw_u8.clone(),
+        operand: dummy_op.clone(),
+        pick_exposed_provenance: true,
+    };
+    let neg_one_i8 = MirValue::signed(-1, IntTy::I8, pw);
+    assert_eq!(
+        eval_lowered_cast(&i8_to_ptr, &neg_one_i8, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(
+            PointerValue::without_provenance(u64::MAX),
+            raw_u8.clone()
+        ))
+    );
+    assert_eq!(
+        eval_lowered_cast(&i8_to_ptr, &neg_one_i8, PtrWidth::Bits32, policy, &mut tracker),
+        Ok(MirValue::ptr(
+            PointerValue::without_provenance(0xFFFF_FFFF),
+            raw_u8.clone()
+        ))
+    );
+
+    // 3. PtrToInt and PtrToPtr must reject mismatched runtime pointer types and `Ty::Ref`.
+    let ptr_to_int = LoweredCast::PtrToInt {
+        src_ty: raw_u8.clone(),
+        target_ty: usize_ty,
+        operand: dummy_op.clone(),
+        expose_provenance: true,
+    };
+    let wrong_ptr = MirValue::ptr(PointerValue::with_provenance(0x1000, 2, 2), raw_u32.clone());
+    assert!(eval_lowered_cast(&ptr_to_int, &wrong_ptr, pw, policy, &mut tracker).is_err());
+    assert!(tracker.is_empty());
+
+    let ptr_to_ptr = LoweredCast::PtrToPtr {
+        src_ty: raw_u8,
+        target_ty: raw_u32,
+        operand: dummy_op,
+    };
+    assert!(eval_lowered_cast(&ptr_to_ptr, &wrong_ptr, pw, policy, &mut tracker).is_err());
+
+    // 4. Null `Ty::Ref` values are rejected in pointer comparisons, `PtrMetadata`, `Offset`,
+    // and `&raw const (*null_ref)` reborrows.
+    let null_ref = MirValue::ptr(PointerValue::without_provenance(0), ref_u8.clone());
+    let valid_ref = MirValue::ptr(PointerValue::with_provenance(0x1000, 3, 3), ref_u8.clone());
+    assert!(matches!(
+        eval_binop(BinOp::Eq, &null_ref, &valid_ref, pw),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { .. }))
+    ));
+    assert!(matches!(
+        eval_unop(UnOp::PtrMetadata, &null_ref, pw),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { .. }))
+    ));
+    assert!(matches!(
+        eval_binop(
+            BinOp::Offset,
+            &null_ref,
+            &MirValue::signed(0, IntTy::Isize, pw),
+            pw
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { .. }))
+    ));
+
+    let deref0 = Place::with_projection(0, vec![ProjectionElem::Deref]);
+    assert!(matches!(
+        eval_rv(
+            &Rvalue::RawPtr(Mutability::Not, deref0),
+            &[ref_u8],
+            &[null_ref],
+            pw,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { .. }))
+    ));
 }

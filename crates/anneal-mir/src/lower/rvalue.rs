@@ -748,7 +748,7 @@ pub fn lower_rvalue_with_policy(
                     }
                     check_layout(Ty::Array(Box::new(elem_ty.clone()), operands.len()), ptr_width)?
                 }
-                AggregateKind::Tuple => Ty::Tuple(operand_tys.clone()),
+                AggregateKind::Tuple => check_layout(Ty::Tuple(operand_tys.clone()), ptr_width)?,
                 AggregateKind::Adt {
                     variant_idx,
                     active_field,
@@ -766,9 +766,9 @@ pub fn lower_rvalue_with_policy(
                             return Err(invalid("union aggregate initialization must use variant 0"));
                         }
                     }
-                    Ty::Tuple(operand_tys.clone())
+                    check_layout(Ty::Tuple(operand_tys.clone()), ptr_width)?
                 }
-                AggregateKind::Closure => Ty::Tuple(operand_tys.clone()),
+                AggregateKind::Closure => check_layout(Ty::Tuple(operand_tys.clone()), ptr_width)?,
                 AggregateKind::RawPtr {
                     pointee,
                     mutability,
@@ -842,9 +842,7 @@ pub fn lower_statement_with_policy(
             let lowered = lower_rvalue_with_policy(rvalue, local_decls, ptr_width, policy)?;
             let rvalue_ty = lowered.ty();
 
-            let compatible = if &place_ty == rvalue_ty {
-                true
-            } else if let LoweredRvalue::Aggregate {
+            let compatible = if let LoweredRvalue::Aggregate {
                 kind:
                     AggregateKind::Adt {
                         active_field: Some(field_idx),
@@ -857,14 +855,15 @@ pub fn lower_statement_with_policy(
                 // Union initialization: Anneal models a union-typed place as the tuple of the
                 // union's declared field types, so the destination must declare field
                 // `field_idx` with exactly the initializing operand's type (`rustc`: "union
-                // field has the wrong type" otherwise).
+                // field has the wrong type" otherwise). Checking this before `&place_ty == rvalue_ty`
+                // ensures out-of-bounds `field_idx` on a 1-field union is rejected.
                 matches!(
                     &place_ty,
                     Ty::Tuple(fields)
                         if operand_tys.len() == 1 && fields.get(*field_idx) == Some(&operand_tys[0])
                 )
             } else {
-                false
+                &place_ty == rvalue_ty
             };
 
             if !compatible {
@@ -1367,10 +1366,16 @@ fn compare_mir_values(
                 ptr: pb,
                 ty: rhs_ty,
             },
-        ) if allow_pointers && lhs_ty == rhs_ty => {
+        ) if allow_pointers && lhs_ty == rhs_ty && lhs_ty.is_any_ptr() => {
             let mask = ptr_width.mask();
             let aa = (pa.addr as u128) & mask;
             let ab = (pb.addr as u128) & mask;
+            if lhs_ty.is_ref() && (aa == 0 || ab == 0) {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: lhs_ty.clone(),
+                    bits: 0,
+                }));
+            }
             Ok(aa.cmp(&ab))
         }
         _ => Err(RvalueEvalError::TypeMismatch(
@@ -1663,6 +1668,12 @@ pub fn eval_binop(
                 ));
             };
             let base_addr = u128::from(ptr.addr) & ptr_width.mask();
+            if ptr_ty.is_ref() && base_addr == 0 {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ptr_ty.clone(),
+                    bits: 0,
+                }));
+            }
             let overflow = |offset: i128| RvalueEvalError::PointerOffsetOverflow {
                 base_addr: ptr.addr,
                 offset,
@@ -1701,6 +1712,12 @@ pub fn eval_binop(
             let new_addr = base_addr as i128 + byte_delta;
             if new_addr < 0 || (new_addr as u128) > ptr_width.mask() {
                 return Err(overflow(count));
+            }
+            if ptr_ty.is_ref() && new_addr == 0 {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ptr_ty.clone(),
+                    bits: 0,
+                }));
             }
             // A non-zero offset requires a pointer derived from an allocation, i.e. one that
             // carries provenance (offsetting by 0 bytes is always allowed).
@@ -1759,7 +1776,15 @@ pub fn eval_unop(
             )),
         },
         UnOp::PtrMetadata => match val {
-            MirValue::Ptr { .. } => Ok(MirValue::Unit),
+            MirValue::Ptr { ptr, ty } if ty.is_any_ptr() => {
+                if ty.is_ref() && (u128::from(ptr.addr) & ptr_width.mask()) == 0 {
+                    return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                        target_ty: ty.clone(),
+                        bits: 0,
+                    }));
+                }
+                Ok(MirValue::Unit)
+            }
             _ => Err(RvalueEvalError::TypeMismatch(
                 "UnOp::PtrMetadata requires pointer or reference operand",
             )),
@@ -1992,30 +2017,45 @@ pub fn eval_lowered_cast(
     tracker: &mut ExposedProvenanceTracker,
 ) -> Result<MirValue, RvalueEvalError> {
     match cast {
-        LoweredCast::PtrToInt { target_ty, .. } => {
-            let Some(ptr) = val.as_ptr() else {
+        LoweredCast::PtrToInt {
+            src_ty, target_ty, ..
+        } => {
+            let MirValue::Ptr { ptr, ty } = val else {
                 return Err(RvalueEvalError::TypeMismatch(
                     "PtrToInt requires pointer value",
                 ));
             };
-            let bits = eval_ptr_to_int_with_ptr_width(ptr, target_ty, ptr_width, tracker)?;
+            if ty != src_ty || !src_ty.is_raw_ptr() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "PtrToInt operand type must match raw pointer source type",
+                ));
+            }
+            let bits = eval_ptr_to_int_with_ptr_width(*ptr, target_ty, ptr_width, tracker)?;
             Ok(MirValue::Int {
                 bits,
                 ty: target_ty.clone(),
             })
         }
-        LoweredCast::IntToPtr { target_ty, .. } => {
+        LoweredCast::IntToPtr {
+            src_ty, target_ty, ..
+        } => {
             let MirValue::Int { bits: addr, ty } = val else {
                 return Err(RvalueEvalError::TypeMismatch(
                     "IntToPtr requires integer value",
                 ));
             };
-            if !ty.is_integral() {
+            if ty != src_ty || !ty.is_integral() {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "IntToPtr requires integer value",
+                    "IntToPtr operand type must match integral source type",
                 ));
             }
-            let ptr = eval_int_to_ptr_with_ptr_width(*addr, target_ty, ptr_width, tracker, None)?;
+            let addr_bits = match ty {
+                Ty::Int(it) => (it.sign_extend(*addr, ptr_width) as u128) & ptr_width.mask(),
+                Ty::Uint(ut) => (*addr & ut.mask(ptr_width)) & ptr_width.mask(),
+                _ => unreachable!(),
+            };
+            let ptr =
+                eval_int_to_ptr_with_ptr_width(addr_bits, target_ty, ptr_width, tracker, None)?;
             Ok(MirValue::Ptr {
                 ptr,
                 ty: target_ty.clone(),
@@ -2024,6 +2064,11 @@ pub fn eval_lowered_cast(
         LoweredCast::IntToInt {
             src_ty, target_ty, ..
         } => {
+            if val.ty() != *src_ty || src_ty.is_any_ptr() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "IntToInt operand type must match non-pointer scalar source type",
+                ));
+            }
             let Some(src_bits) = val.as_bits() else {
                 return Err(RvalueEvalError::TypeMismatch(
                     "IntToInt requires scalar value",
@@ -2043,12 +2088,19 @@ pub fn eval_lowered_cast(
                 })
             }
         }
-        LoweredCast::PtrToPtr { target_ty, .. } => {
-            let Some(ptr) = val.as_ptr() else {
+        LoweredCast::PtrToPtr {
+            src_ty, target_ty, ..
+        } => {
+            let MirValue::Ptr { ptr, ty } = val else {
                 return Err(RvalueEvalError::TypeMismatch(
                     "PtrToPtr requires pointer value",
                 ));
             };
+            if ty != src_ty || !src_ty.is_raw_ptr() || !target_ty.is_raw_ptr() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "PtrToPtr requires raw pointer source and target types matching operand",
+                ));
+            }
             Ok(MirValue::Ptr {
                 ptr: PointerValue {
                     addr: (ptr.addr as u128 & ptr_width.mask()) as u64,
@@ -2162,7 +2214,26 @@ pub fn eval_lowered_rvalue(
                 }
                 [ProjectionElem::Deref] => match read_local(place.local)? {
                     // `&(*p)` / `&raw const (*p)`: reborrow keeps p's address and provenance.
-                    MirValue::Ptr { ptr, .. } => ptr,
+                    MirValue::Ptr { ptr, ty } => {
+                        if !ty.is_any_ptr() || ty.pointee_ty() != ref_ty.pointee_ty() {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "Deref projection requires a pointer value with matching pointee type",
+                            ));
+                        }
+                        let masked_addr = (u128::from(ptr.addr) & ptr_width.mask()) as u64;
+                        if ty.is_ref() && masked_addr == 0 {
+                            return Err(RvalueEvalError::CastEval(
+                                CastEvalError::InvalidBitPattern {
+                                    target_ty: ty,
+                                    bits: 0,
+                                },
+                            ));
+                        }
+                        PointerValue {
+                            addr: masked_addr,
+                            provenance: ptr.provenance,
+                        }
+                    }
                     _ => {
                         return Err(RvalueEvalError::TypeMismatch(
                             "Deref projection requires a pointer value",
