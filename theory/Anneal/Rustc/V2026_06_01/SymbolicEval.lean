@@ -1456,23 +1456,66 @@ def evalRvalueSymTree
           | _ =>
             match isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | true =>
-              evalScalarBinOpSymTree op (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+              match
+                ptrAddressScalar?
+                  locals₂
+                  mem.borrows
+                  mem.callerLocals
+                  localDecls
+                  layouts
+                  (layoutPointerBytes layouts)
+                  ptrVal
+                  sz
+              with
+              | .some lhsAddrSc =>
+                evalScalarBinOpSymTree op lhsAddrSc offsetSc locals₂ mem false
+              | .none => .leaf .unsupported
             | false => .leaf .unsupported
         | .scalar lhsSc, .ptr ptrVal sz =>
           match isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
           | true =>
-            evalScalarBinOpSymTree op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+            match
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                localDecls
+                layouts
+                (layoutPointerBytes layouts)
+                ptrVal
+                sz
+            with
+            | .some rhsAddrSc =>
+              evalScalarBinOpSymTree op lhsSc rhsAddrSc locals₂ mem false
+            | .none => .leaf .unsupported
           | false => .leaf .unsupported
         | .ptr lhsPtr lhsSz, .ptr rhsPtr rhsSz =>
-          match isRelationalBinOp op with
+          match isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
           | true =>
-            evalScalarBinOpSymTree
-              op
-              (ptrToAddrScalar lhsPtr lhsSz)
-              (ptrToAddrScalar rhsPtr rhsSz)
-              locals₂
-              mem
-              false
+            let ptrBytes := layoutPointerBytes layouts
+            match
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                localDecls
+                layouts
+                ptrBytes
+                lhsPtr
+                lhsSz,
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                localDecls
+                layouts
+                ptrBytes
+                rhsPtr
+                rhsSz
+            with
+            | .some lhsAddrSc, .some rhsAddrSc =>
+              evalScalarBinOpSymTree op lhsAddrSc rhsAddrSc locals₂ mem false
+            | _, _ => .leaf .unsupported
           | false => .leaf .unsupported
         | .aggregate lhsVar lhsFields, .aggregate rhsVar rhsFields =>
           .leaf
@@ -1534,7 +1577,12 @@ theorem evalRvalueSymTree_eval
           | ptr ptrVal sz =>
             cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | false => rfl
-            | true => exact evalScalarBinOpSymTree_eval op lhs (ptrToAddrScalar ptrVal sz) locals₂ mem false
+            | true =>
+              dsimp only
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              | none => rfl
+              | some rhsAddrSc =>
+                exact evalScalarBinOpSymTree_eval op lhs rhsAddrSc locals₂ mem false
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
@@ -1546,11 +1594,26 @@ theorem evalRvalueSymTree_eval
             | _ =>
               cases isPtrRelationalBinOp _ localDecls layouts lhsOp rhsOp with
               | false => rfl
-              | true => exact evalScalarBinOpSymTree_eval _ (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+              | true =>
+                dsimp only
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+                | none => rfl
+                | some lhsAddrSc =>
+                  exact evalScalarBinOpSymTree_eval _ lhsAddrSc offsetSc locals₂ mem false
           | ptr rhsPtr rhsSz =>
-            cases op <;> first
-              | rfl
-              | (dsimp only; exact evalScalarBinOpSymTree_eval _ (ptrToAddrScalar ptrVal sz) (ptrToAddrScalar rhsPtr rhsSz) locals₂ mem false)
+            dsimp only
+            cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+            | false => rfl
+            | true =>
+              dsimp only
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              | none =>
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz <;> rfl
+              | some lhsAddrSc =>
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz with
+                | none => rfl
+                | some rhsAddrSc =>
+                  exact evalScalarBinOpSymTree_eval op lhsAddrSc rhsAddrSc locals₂ mem false
           | _ => rfl
         | aggregate lhsVar lhsFields =>
           cases rhsVal <;> rfl

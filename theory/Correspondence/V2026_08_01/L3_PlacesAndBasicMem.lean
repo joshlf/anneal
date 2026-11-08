@@ -1777,6 +1777,7 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     let outerTy : Ty := { kind := .adt "Outer" .nil, layoutIdx := 5 }
     let isizeTy : Ty := { kind := .int .isize, layoutIdx := 6 }
     let arr3PairTy : Ty := { kind := .array (.adt "PairU32" .nil) 3, layoutIdx := 7 }
+    let mixedTy : Ty := { kind := .adt "Mixed" .nil, layoutIdx := 8 }
     let testLayouts : LayoutTable := {
       pointerBits := 64
       isLittleEndian := true
@@ -1821,7 +1822,13 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
           backendRepr := .memory,
           fields := .array ⟨8⟩ 3,
           variants := .single 0, isUninhabited := false,
-          fieldLayouts := [1] }
+          fieldLayouts := [1] },
+        -- 8: Mixed { a: u32 @ 0, b: u8 @ 4 } (size 8, align 4)
+        { size := ⟨8⟩, align := ⟨4⟩,
+          backendRepr := .memory,
+          fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1],
+          variants := .single 0, isUninhabited := false,
+          fieldLayouts := [0, 3] }
       ]
     }
     let pairVal : Value := .aggregate 0 [.scalar ⟨aVal, 4⟩, .scalar ⟨bVal, 4⟩]
@@ -1894,9 +1901,13 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
       { mutability := .not, ty := arr3PairTy, debugName := .none },
       { mutability := .not, ty := rawConstU32Ty, debugName := .none }
     ]
+    let mixedDecls : List LocalDecl := [
+      { mutability := .not, ty := mixedTy, debugName := .none },
+      { mutability := .not, ty := rawConstU32Ty, debugName := .none }
+    ]
     let constIsize (n : Nat) : Operand :=
       .constant { ty := isizeTy, val := .scalar (.int ⟨n, 8⟩) }
-    -- 1. `ptrAllocByteBound?` on `PairU32` (typed and untyped), `PaddedS`, `Outer`, and subslice
+    -- 1. `ptrAllocByteBound?` on `PairU32` (typed and untyped), `PaddedS` (typed vs unlaid-out field-only), `Outer`, and subslice
     ptrAllocByteBound? [.init pairVal] memPair pairDecls testLayouts ⟨1, 0⟩ = .some 8 ∧
     ptrAllocByteBound? [.init pairVal] memPair pairDecls testLayouts ⟨2, 0⟩ = .some 4 ∧
     ptrAllocByteBound? [.init pairVal] memPair .nil emptyLayoutTable ⟨1, 0⟩ = .some 8 ∧
@@ -1904,8 +1915,8 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     ptrAllocByteBound? [.init paddedVal] memPadded paddedDecls testLayouts ⟨1, 0⟩ = .some 12 ∧
     ptrAllocByteBound? [.init paddedVal] memPadded paddedDecls testLayouts ⟨2, 0⟩ = .some 8 ∧
     ptrAllocByteBound? [.init paddedVal] memPadded paddedDecls testLayouts ⟨3, 0⟩ = .some 4 ∧
-    ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨1, 0⟩ = .some 12 ∧
-    ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨2, 0⟩ = .some 8 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨1, 0⟩ = .some 4 ∧
+    ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨2, 0⟩ = .some 1 ∧
     ptrAllocByteBound? [.init paddedVal] memPadded .nil emptyLayoutTable ⟨3, 0⟩ = .some 4 ∧
     ptrAllocByteBound? [.init outerVal] memOuter outerDecls testLayouts ⟨1, 0⟩ = .some 16 ∧
     ptrAllocByteBound? [.init outerVal] memOuter outerDecls testLayouts ⟨2, 0⟩ = .some 12 ∧
@@ -1934,7 +1945,7 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     evalOperand
       [.init paddedVal, .init (.ptr ⟨1, 8⟩ 8)]
       (.copy { local_ := 1, projection := [.deref] })
-      memPadded.borrows .nil testLayouts =
+      memPadded.borrows .nil testLayouts .nil paddedDecls =
       .ok (.scalar ⟨bVal, 4⟩) [.init paddedVal, .init (.ptr ⟨1, 8⟩ 8)] ∧
     evalPlaceRead
       [.init paddedVal, .init (.ptr ⟨1, 8⟩ 8)]
@@ -1944,7 +1955,7 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     evalOperand
       [.init paddedVal, .init (.ptr ⟨1, 4⟩ 8)]
       (.copy { local_ := 1, projection := [.deref] })
-      memPadded.borrows .nil testLayouts = .ub ∧
+      memPadded.borrows .nil testLayouts .nil paddedDecls = .ub ∧
     -- 5. Nested `Outer`: `+3` (`offsetBytes = 12`) reads `outer.second.b` (`bVal`)
     evalPlaceRead
       [.init outerVal, .init (.ptr ⟨1, 12⟩ 8)]
@@ -1955,7 +1966,7 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     evalOperand
       [.init arr3Val, .init (.ptr ⟨1, 4⟩ 8)]
       (.copy { local_ := 1, projection := [.deref] })
-      memSub.borrows .nil testLayouts =
+      memSub.borrows .nil testLayouts .nil subDecls =
       .ok (.scalar ⟨bVal, 4⟩) [.init arr3Val, .init (.ptr ⟨1, 4⟩ 8)] ∧
     evalRvalue
       [.init arr3Val, .init (.ptr ⟨1, 0⟩ 8)]
@@ -1965,7 +1976,7 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     evalOperand
       [.init arr3Val, .init (.ptr ⟨1, 8⟩ 8)]
       (.copy { local_ := 1, projection := [.deref] })
-      memSub.borrows .nil testLayouts = .ub ∧
+      memSub.borrows .nil testLayouts .nil subDecls = .ub ∧
     evalRvalue
       [.init arr3Val, .init (.ptr ⟨1, 0⟩ 8)]
       (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 3))
@@ -1987,16 +1998,8 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
       [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
       (.rawPtr .not { local_ := 1, projection := [.deref] })
       memPair pairConstDecls testLayouts =
-      .ok (.ptr ⟨4, 0⟩ 8) [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)]
-        { memPair with
-          borrows :=
-            { tag := 4,
-              targetLocal := 0,
-              targetProjection := [.field 1 u32Ty],
-              perm := .frozen,
-              parentTag := .some 1 } :: memPair.borrows,
-          nextTag := 5 } ∧
-    -- 8. One-past-the-end (`offset(base, 2isize)` -> `offsetBytes = 8`) succeeds at `BinOp.offset`; deref read/write/reborrow -> `.ub`
+      .ok (.ptr ⟨1, 4⟩ 8) [.init pairVal, .init (.ptr ⟨1, 4⟩ 8)] memPair ∧
+    -- 8. One-past-the-end (`offset(base, 2isize)` -> `offsetBytes = 8`) succeeds at `BinOp.offset` and RFC 2582 `&raw mut *p`; deref read/write/safe-reborrow -> `.ub`
     evalRvalue
       [.init pairVal, .init (.ptr ⟨1, 0⟩ 8)]
       (.binaryOp .offset (.copy { local_ := 1, projection := .nil }) (constIsize 2))
@@ -2022,7 +2025,8 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     evalRvalue
       [.init pairVal, .init (.ptr ⟨1, 8⟩ 8)]
       (.rawPtr .mut { local_ := 1, projection := [.deref] })
-      memPair pairDecls testLayouts = .ub ∧
+      memPair pairDecls testLayouts =
+      .ok (.ptr ⟨1, 8⟩ 8) [.init pairVal, .init (.ptr ⟨1, 8⟩ 8)] memPair ∧
     -- 9. Beyond one-past-the-end (`+3` on `pair.a`, `+2` on `pair.b`) faults immediately at `BinOp.offset` with `.ub`
     evalRvalue
       [.init pairVal, .init (.ptr ⟨1, 0⟩ 8)]
@@ -2040,7 +2044,7 @@ theorem mir_cross_field_ptr_offset_and_one_past_end_corresponds
     evalOperand
       [.init mixedVal, .init (.ptr ⟨1, 4⟩ 8)]
       (.copy { local_ := 1, projection := [.deref] })
-      [borrowPairA] .nil emptyLayoutTable = .ub := by
+      [borrowPairA] .nil testLayouts .nil mixedDecls = .ub := by
   exact ⟨
     rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
     rfl,

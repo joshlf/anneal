@@ -597,7 +597,7 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
       .ok
         (.scalar { bits := fnPtrAllocBase * 65536, sizeBytes := 8 })
         [.init (.ptr expectedPtr 8)]
-        memAfterReify) ∧
+        { memAfterReify with exposedAllocIds := [fnPtrAllocBase] }) ∧
     (evalRvalue
         [.init (.ptr { allocId := 0, offsetBytes := 0 } 8)]
         (.cast .fnPtrToPtr (.copy ⟨0, .nil⟩) rawConstUnitTy)
@@ -636,7 +636,9 @@ theorem mir_evalRvalue_reifyFnPointer_and_fnPtrToPtr_chain
   · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
       isThinRawPtrTy, emptyMemory, lookupBorrow, lookupFnPtr, hNotIntrinsic]
   · simp [evalRvalue, evalOperand, get?, readProjectedValue]
-  · simp [evalRvalue, evalOperand, get?, readProjectedValue]
+  · simp [evalRvalue, evalOperand, get?, readProjectedValue,
+      ptrAddress?, emptyMemory, lookupBorrow, recordExposedAllocId,
+      isExposedAllocId, fnPtrAllocBase, intCastTargetBytes] <;> decide
   · simp [evalRvalue, evalFnPtrToPtr, evalOperand, get?, readProjectedValue,
       isThinRawPtrTy, emptyMemory, lookupBorrow, isFnPtrAllocId, fnPtrAllocBase]
 

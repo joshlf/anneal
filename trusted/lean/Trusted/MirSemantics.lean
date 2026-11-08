@@ -76,6 +76,8 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   splitLastDeref? evalPlaceLen
   findDeclTyWithKind? pointeeElemByteStride valueDefaultByteSize
   projectedValueDefaultByteSize ptrAllocByteBound?
+  ptrToAddrScalar stackLocalAddrPageBase borrowPlaceByteOffset?
+  borrowBaseAddress? ptrAddress? ptrAddressScalar? recoverExposedPtrValue?
   evalBinOpOffset evalPtrOffsetBinOp evalSliceFatPtrDerefBorrow
   evalGlobalThinPtrDerefBorrow evalPlaceDiscriminant
   evalRvalue evalRvalueWithMemory advanceStmt

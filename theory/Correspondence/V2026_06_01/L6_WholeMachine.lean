@@ -56,7 +56,7 @@ theorem mir_initMachineState_pc_zero
     (initMachineStateWithCallees body args callees).memory.activeCallee = none ∧
     (initMachineStateWithCallees body args callees).memory.nextTag = 1 ∧
     (initMachineStateWithCallees body args callees).memory.callees = callees ∧
-    (initMachineStateWithCallees body args []).memory.traitImpls = [] ∧
+    (initMachineStateWithCallees body args []).memory.traitImpls = body.traitImpls ∧
     (∀ c cs, (initMachineStateWithCallees body args (c :: cs)).memory.traitImpls = body.traitImpls) := by
   cases callees <;>
     exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩

@@ -2379,23 +2379,66 @@ def evalRvalueFast
           | _ =>
             match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
             | true =>
-              evalScalarBinOp op (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+              match
+                ptrAddressScalar?
+                  locals₂
+                  mem.borrows
+                  mem.callerLocals
+                  body.localDecls
+                  body.layouts
+                  (layoutPointerBytes body.layouts)
+                  ptrVal
+                  sz
+              with
+              | .some lhsAddrSc =>
+                evalScalarBinOp op lhsAddrSc offsetSc locals₂ mem false
+              | .none => .unsupported
             | false => .unsupported
         | .scalar lhsSc, .ptr ptrVal sz =>
           match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
           | true =>
-            evalScalarBinOp op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+            match
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                body.localDecls
+                body.layouts
+                (layoutPointerBytes body.layouts)
+                ptrVal
+                sz
+            with
+            | .some rhsAddrSc =>
+              evalScalarBinOp op lhsSc rhsAddrSc locals₂ mem false
+            | .none => .unsupported
           | false => .unsupported
         | .ptr lhsPtr lhsSz, .ptr rhsPtr rhsSz =>
-          match isRelationalBinOp op with
+          match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
           | true =>
-            evalScalarBinOp
-              op
-              (ptrToAddrScalar lhsPtr lhsSz)
-              (ptrToAddrScalar rhsPtr rhsSz)
-              locals₂
-              mem
-              false
+            let ptrBytes := layoutPointerBytes body.layouts
+            match
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                body.localDecls
+                body.layouts
+                ptrBytes
+                lhsPtr
+                lhsSz,
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                body.localDecls
+                body.layouts
+                ptrBytes
+                rhsPtr
+                rhsSz
+            with
+            | .some lhsAddrSc, .some rhsAddrSc =>
+              evalScalarBinOp op lhsAddrSc rhsAddrSc locals₂ mem false
+            | _, _ => .unsupported
           | false => .unsupported
         | .aggregate lhsVar lhsFields, .aggregate rhsVar rhsFields =>
           evalWidePtrAggregateRelBinOp
@@ -2557,23 +2600,66 @@ def evalRvalueSymTreeFast
           | _ =>
             match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
             | true =>
-              evalScalarBinOpSymTree op (ptrToAddrScalar ptrVal sz) offsetSc locals₂ mem false
+              match
+                ptrAddressScalar?
+                  locals₂
+                  mem.borrows
+                  mem.callerLocals
+                  body.localDecls
+                  body.layouts
+                  (layoutPointerBytes body.layouts)
+                  ptrVal
+                  sz
+              with
+              | .some lhsAddrSc =>
+                evalScalarBinOpSymTree op lhsAddrSc offsetSc locals₂ mem false
+              | .none => .leaf .unsupported
             | false => .leaf .unsupported
         | .scalar lhsSc, .ptr ptrVal sz =>
           match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
           | true =>
-            evalScalarBinOpSymTree op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+            match
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                body.localDecls
+                body.layouts
+                (layoutPointerBytes body.layouts)
+                ptrVal
+                sz
+            with
+            | .some rhsAddrSc =>
+              evalScalarBinOpSymTree op lhsSc rhsAddrSc locals₂ mem false
+            | .none => .leaf .unsupported
           | false => .leaf .unsupported
         | .ptr lhsPtr lhsSz, .ptr rhsPtr rhsSz =>
-          match isRelationalBinOp op with
+          match isPtrRelationalBinOp op body.localDecls body.layouts lhsOp rhsOp with
           | true =>
-            evalScalarBinOpSymTree
-              op
-              (ptrToAddrScalar lhsPtr lhsSz)
-              (ptrToAddrScalar rhsPtr rhsSz)
-              locals₂
-              mem
-              false
+            let ptrBytes := layoutPointerBytes body.layouts
+            match
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                body.localDecls
+                body.layouts
+                ptrBytes
+                lhsPtr
+                lhsSz,
+              ptrAddressScalar?
+                locals₂
+                mem.borrows
+                mem.callerLocals
+                body.localDecls
+                body.layouts
+                ptrBytes
+                rhsPtr
+                rhsSz
+            with
+            | .some lhsAddrSc, .some rhsAddrSc =>
+              evalScalarBinOpSymTree op lhsAddrSc rhsAddrSc locals₂ mem false
+            | _, _ => .leaf .unsupported
           | false => .leaf .unsupported
         | .aggregate lhsVar lhsFields, .aggregate rhsVar rhsFields =>
           .leaf

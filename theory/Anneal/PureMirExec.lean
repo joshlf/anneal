@@ -413,12 +413,53 @@ def isPureTerminator : TerminatorKind → Bool
   | _ => false
 
 /--
+Strengthened syntactic purity check on an `Rvalue` in the presence of active
+borrows (`mem.borrows ≠ []`): in addition to `isPureRvalue rv`, rejects
+relational `BinOp`s whose LHS operand is pointer-typed or untyped in
+`localDecls`, because pointer relational comparisons consult `mem.borrows` via
+`ptrAddressScalar?`.
+-/
+def isBorrowFreePureRvalue
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (rv : Rvalue) : Bool :=
+  isPureRvalue rv &&
+  match rv with
+  | .binaryOp op lhs _ =>
+    Bool.not (Bool.and (isRelationalBinOp op) (isPtrOrUntypedOperand localDecls layouts lhs))
+  | _ => true
+
+/--
+Strengthened syntactic purity check on a `StatementKind` in the presence of
+active borrows (`mem.borrows ≠ []`).
+-/
+def isBorrowFreePureStatement
+    (localDecls : List LocalDecl) (layouts : LayoutTable) : StatementKind → Bool
+  | .assign p r => isPurePlace p && isBorrowFreePureRvalue localDecls layouts r
+  | sk => isPureStatement sk
+
+theorem isPureRvalue_of_isBorrowFreePureRvalue
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {rv : Rvalue}
+    (h : isBorrowFreePureRvalue localDecls layouts rv = true) :
+    isPureRvalue rv = true :=
+  (Bool.and_eq_true_iff.mp h).1
+
+theorem isPureStatement_of_isBorrowFreePureStatement
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {sk : StatementKind}
+    (h : isBorrowFreePureStatement localDecls layouts sk = true) :
+    isPureStatement sk = true := by
+  cases sk with
+  | assign p r =>
+    simp only [isBorrowFreePureStatement, isPureStatement, Bool.and_eq_true] at h ⊢
+    exact ⟨h.1, isPureRvalue_of_isBorrowFreePureRvalue h.2⟩
+  | _ => exact h
+
+/--
 Computable $O(|\text{MIR}|)$ syntactic purity checker on a `CapturedMir` body,
 discharged by `decide` or `rfl`.
 -/
 def checkPureMir (body : CapturedMir) : Bool :=
   body.basicBlocks.all (fun block =>
-    block.statements.all (fun stmt => isPureStatement stmt.kind) &&
+    block.statements.all (fun stmt =>
+      isBorrowFreePureStatement body.localDecls body.layouts stmt.kind) &&
     isPureTerminator block.terminator.kind)
 
 /-! ## 3. Pure Memory-Independence & Step Simulation Lemmas -/
@@ -440,6 +481,16 @@ theorem list_all_of_get?
     | succ idx' =>
       exact ih h_all.2 h_get
 
+private theorem list_all_mono {α : Type} {p q : α → Bool} {xs : List α}
+    (h_imp : ∀ x, p x = true → q x = true)
+    (h : xs.all p = true) :
+    xs.all q = true := by
+  induction xs with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.all_cons, Bool.and_eq_true] at h ⊢
+    exact ⟨h_imp hd h.1, ih h.2⟩
+
 /--
 If `checkPureMir body = true`, every basic block in `body.basicBlocks` has pure
 statements and a pure terminator.
@@ -450,8 +501,13 @@ theorem checkPureMir_block
     (h_bb : get? body.basicBlocks bbIdx = some bb) :
     bb.statements.all (fun stmt => isPureStatement stmt.kind) = true ∧
     isPureTerminator bb.terminator.kind = true := by
-  have h := list_all_of_get? h_pure h_bb
-  exact Bool.and_eq_true_iff.mp h
+  have h_raw :
+      (bb.statements.all (fun stmt =>
+        isBorrowFreePureStatement body.localDecls body.layouts stmt.kind) &&
+       isPureTerminator bb.terminator.kind) = true :=
+    list_all_of_get? (xs := body.basicBlocks) (idx := (bbIdx : Nat)) h_pure h_bb
+  have h := Bool.and_eq_true_iff.mp h_raw
+  exact ⟨list_all_mono (fun _ hs => isPureStatement_of_isBorrowFreePureStatement hs) h.1, h.2⟩
 
 /--
 Evaluating a pure `Operand` is completely independent of `borrows`, `globals`,
@@ -671,15 +727,34 @@ theorem evalPlaceDiscriminant_eq_withMem
   dsimp only
   repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
 
-/--
-Evaluating a pure `Rvalue` at arbitrary `mem : Memory` produces the exact same
-value and local-slot updates as evaluating at `emptyMemory`, leaving `mem`
-completely unchanged.
--/
-theorem evalRvalue_pure_eq_withMem
+private theorem ptrAddressScalar?_nil_borrows
+    (locals : List LocalSlot) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (ptrBytes : Nat) (p : ProvenancePtr) (sz : Nat) :
+    ptrAddressScalar? locals [] callerLocals localDecls layouts ptrBytes p sz =
+      .some (ptrToAddrScalar p sz) :=
+  rfl
+
+private theorem isPtrRelationalBinOp_eq_false_of_nonptr
+    {op : BinOp} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {lhs rhs : Operand}
+    (h : Bool.not (Bool.and (isRelationalBinOp op) (isPtrOrUntypedOperand localDecls layouts lhs)) = true) :
+    isPtrRelationalBinOp op localDecls layouts lhs rhs = false := by
+  unfold isPtrRelationalBinOp
+  cases h1 : isRelationalBinOp op <;> cases h2 : isPtrOrUntypedOperand localDecls layouts lhs
+  · rfl
+  · rfl
+  · rfl
+  · rw [h1, h2] at h; cases h
+
+private theorem evalRvalue_pure_eq_withMem_core
     (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (h_pure : isPureRvalue rv = true) :
+    (h_pure : isPureRvalue rv = true)
+    (h_bor_or_nonptr :
+      mem.borrows = [] ∨
+      ∀ op lhs rhs, rv = .binaryOp op lhs rhs →
+        Bool.not (Bool.and (isRelationalBinOp op) (isPtrOrUntypedOperand localDecls layouts lhs)) = true) :
     evalRvalue locals rv mem localDecls layouts =
       RvalueEvalResult.withMem mem
         (evalRvalue locals rv emptyMemory localDecls layouts) := by
@@ -752,6 +827,7 @@ theorem evalRvalue_pure_eq_withMem
       repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
       all_goals try rfl
   | binaryOp op lhs rhs =>
+    have h_bor_or_np := h_bor_or_nonptr.imp id (fun f => f op lhs rhs rfl)
     simp only [isPureRvalue, Bool.and_eq_true] at h_pure
     obtain ⟨h_op, h_pure⟩ := h_pure
     dsimp only [evalRvalue]
@@ -777,9 +853,14 @@ theorem evalRvalue_pure_eq_withMem
             | offset => exact absurd h_op (by decide)
             | _ => exact evalScalarBinOp_eq_withMem _ lhsSc rhsSc locals₂ mem _
           | ptr ptrVal sz =>
-            cases isPtrRelationalBinOp op localDecls layouts lhs rhs with
-            | false => rfl
-            | true => exact evalScalarBinOp_eq_withMem op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+            rcases h_bor_or_np with h_borrows | h_np
+            · cases isPtrRelationalBinOp op localDecls layouts lhs rhs with
+              | false => rfl
+              | true =>
+                dsimp only [emptyMemory]
+                rw [h_borrows, ptrAddressScalar?_nil_borrows, ptrAddressScalar?_nil_borrows]
+                exact evalScalarBinOp_eq_withMem op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+            · rw [isPtrRelationalBinOp_eq_false_of_nonptr h_np]; rfl
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
@@ -787,22 +868,43 @@ theorem evalRvalue_pure_eq_withMem
             cases op with
             | offset => exact absurd h_op (by decide)
             | _ =>
-              cases isPtrRelationalBinOp _ localDecls layouts lhs rhs with
-              | false => rfl
-              | true => exact evalScalarBinOp_eq_withMem _ (ptrToAddrScalar ptrVal sz) rhsSc locals₂ mem false
+              rcases h_bor_or_np with h_borrows | h_np
+              · cases isPtrRelationalBinOp _ localDecls layouts lhs rhs with
+                | false => rfl
+                | true =>
+                  dsimp only [emptyMemory]
+                  rw [h_borrows, ptrAddressScalar?_nil_borrows, ptrAddressScalar?_nil_borrows]
+                  exact evalScalarBinOp_eq_withMem _ (ptrToAddrScalar ptrVal sz) rhsSc locals₂ mem false
+              · rw [isPtrRelationalBinOp_eq_false_of_nonptr h_np]; rfl
           | ptr rhsPtr rhsSz =>
-            cases op <;> first
-              | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
-              | exact evalScalarBinOp_eq_withMem _ (ptrToAddrScalar ptrVal sz) (ptrToAddrScalar rhsPtr rhsSz) locals₂ mem false
+            rcases h_bor_or_np with h_borrows | h_np
+            · cases isPtrRelationalBinOp op localDecls layouts lhs rhs with
+              | false => rfl
+              | true =>
+                dsimp only [emptyMemory]
+                rw [h_borrows,
+                    ptrAddressScalar?_nil_borrows, ptrAddressScalar?_nil_borrows,
+                    ptrAddressScalar?_nil_borrows, ptrAddressScalar?_nil_borrows]
+                exact evalScalarBinOp_eq_withMem op (ptrToAddrScalar ptrVal sz) (ptrToAddrScalar rhsPtr rhsSz) locals₂ mem false
+            · rw [isPtrRelationalBinOp_eq_false_of_nonptr h_np]; rfl
           | _ => rfl
         | aggregate lhsVar lhsFields =>
           cases rhsVal with
           | aggregate rhsVar rhsFields =>
-            dsimp only [evalWidePtrAggregateRelBinOp, evalWidePtrRelBinOp]
-            repeat' (first
-              | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
-              | exact evalScalarBinOp_eq_withMem ..
-              | split)
+            rcases h_bor_or_np with h_borrows | h_np
+            · dsimp only [evalWidePtrAggregateRelBinOp, evalWidePtrRelBinOp, emptyMemory]
+              rw [h_borrows]
+              simp only [ptrAddressScalar?_nil_borrows]
+              repeat' (first
+                | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
+                | exact evalScalarBinOp_eq_withMem ..
+                | split)
+            · dsimp only [evalWidePtrAggregateRelBinOp]
+              cases h1 : isRelationalBinOp op <;> cases h2 : isPtrOrUntypedOperand localDecls layouts lhs
+              · repeat' (first | rfl | split)
+              · repeat' (first | rfl | split)
+              · repeat' (first | rfl | split)
+              · rw [h1, h2] at h_np; cases h_np
           | _ => rfl
         | _ => rfl
   | nullaryOp _ _ => rfl
@@ -846,6 +948,39 @@ theorem evalRvalue_pure_eq_withMem
       repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
   | shallowInitBox _ _ => cases h_pure
   | copyForDeref _ => cases h_pure
+
+/--
+Evaluating a pure `Rvalue` at `mem : Memory` with `mem.borrows = []` produces
+the exact same value and local-slot updates as evaluating at `emptyMemory`,
+leaving `mem` completely unchanged.
+-/
+theorem evalRvalue_pure_eq_withMem
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_pure : isPureRvalue rv = true)
+    (h_borrows : mem.borrows = []) :
+    evalRvalue locals rv mem localDecls layouts =
+      RvalueEvalResult.withMem mem
+        (evalRvalue locals rv emptyMemory localDecls layouts) :=
+  evalRvalue_pure_eq_withMem_core locals rv mem localDecls layouts h_pure (Or.inl h_borrows)
+
+/--
+Evaluating a borrow-free pure `Rvalue` (`isBorrowFreePureRvalue`) at ANY
+`mem : Memory` (even when `mem.borrows ≠ []`) produces the exact same value and
+local-slot updates as evaluating at `emptyMemory`, leaving `mem` unchanged.
+-/
+theorem evalRvalue_borrowFree_pure_eq_withMem
+    (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_pure : isBorrowFreePureRvalue localDecls layouts rv = true) :
+    evalRvalue locals rv mem localDecls layouts =
+      RvalueEvalResult.withMem mem
+        (evalRvalue locals rv emptyMemory localDecls layouts) := by
+  have ⟨h_p, h_np⟩ := Bool.and_eq_true_iff.mp h_pure
+  refine evalRvalue_pure_eq_withMem_core locals rv mem localDecls layouts h_p (Or.inr ?_)
+  intro op lhs rhs h_eq
+  subst h_eq
+  exact h_np
 
 /-- Replace the `Memory` in a normal `MirOutcome` with `mem`. -/
 def MirOutcome.withMem (mem : Memory) : MirOutcome → MirOutcome
@@ -1143,8 +1278,8 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
     rcases h_pure with ⟨h_dst, h_rv⟩
     rw [evalStmt_assign_eq, evalStmt_assign_eq]
     dsimp only [PureState.toMachineState]
-    rw [evalRvalue_pure_eq_withMem ps.env rv mem₀ localDecls layouts h_rv]
-    have h_emp := evalRvalue_pure_eq_withMem ps.env rv emptyMemory localDecls layouts h_rv
+    rw [evalRvalue_pure_eq_withMem ps.env rv mem₀ localDecls layouts h_rv h_borrows]
+    have h_emp := evalRvalue_pure_eq_withMem ps.env rv emptyMemory localDecls layouts h_rv rfl
     cases h_res : evalRvalue ps.env rv emptyMemory localDecls layouts with
     | ub => rfl
     | unsupported => rfl
@@ -3239,7 +3374,12 @@ theorem evalRvalue_pushBaseStack
           | ptr ptrVal sz =>
             cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
             | false => rfl
-            | true => exact evalScalarBinOp_pushBaseStack calleeBody baseStack op lhsSc (ptrToAddrScalar ptrVal sz) locals₂ mem false
+            | true =>
+              dsimp only
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              | none => rfl
+              | some rhsAddrSc =>
+                exact evalScalarBinOp_pushBaseStack calleeBody baseStack op lhsSc rhsAddrSc locals₂ mem false
           | _ => rfl
         | ptr ptrVal sz =>
           cases rhsVal with
@@ -3251,11 +3391,25 @@ theorem evalRvalue_pushBaseStack
             | _ =>
               cases isPtrRelationalBinOp _ localDecls layouts lhsOp rhsOp with
               | false => rfl
-              | true => exact evalScalarBinOp_pushBaseStack calleeBody baseStack _ (ptrToAddrScalar ptrVal sz) rhsSc locals₂ mem false
+              | true =>
+                dsimp only
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+                | none => rfl
+                | some lhsAddrSc =>
+                  exact evalScalarBinOp_pushBaseStack calleeBody baseStack _ lhsAddrSc rhsSc locals₂ mem false
           | ptr rhsPtr rhsSz =>
-            cases op <;> first
-              | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl
-              | exact evalScalarBinOp_pushBaseStack calleeBody baseStack _ (ptrToAddrScalar ptrVal sz) (ptrToAddrScalar rhsPtr rhsSz) locals₂ mem false
+            cases isPtrRelationalBinOp op localDecls layouts lhsOp rhsOp with
+            | false => rfl
+            | true =>
+              dsimp only
+              cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) ptrVal sz with
+              | none =>
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz <;> rfl
+              | some lhsAddrSc =>
+                cases ptrAddressScalar? locals₂ mem.borrows mem.callerLocals localDecls layouts (layoutPointerBytes layouts) rhsPtr rhsSz with
+                | none => rfl
+                | some rhsAddrSc =>
+                  exact evalScalarBinOp_pushBaseStack calleeBody baseStack op lhsAddrSc rhsAddrSc locals₂ mem false
           | _ => rfl
         | aggregate lhsVar lhsFields =>
           cases rhsVal with
@@ -9146,12 +9300,14 @@ def checkPureMirWithCallees
   match maxCallDepth with
   | 0 =>
     body.basicBlocks.all (fun block =>
-      block.statements.all (fun stmt => isPureStatement stmt.kind) &&
+      block.statements.all (fun stmt =>
+        isBorrowFreePureStatement body.localDecls body.layouts stmt.kind) &&
       checkPureTerminatorWith callees body.layouts traitImpls (fun _ => false)
         block.terminator.kind body.localDecls)
   | depth' + 1 =>
     body.basicBlocks.all (fun block =>
-      block.statements.all (fun stmt => isPureStatement stmt.kind) &&
+      block.statements.all (fun stmt =>
+        isBorrowFreePureStatement body.localDecls body.layouts stmt.kind) &&
       checkPureTerminatorWith callees body.layouts traitImpls
         (fun calleeBody =>
           checkPureMirWithCallees callees calleeBody depth' traitImpls)
@@ -9209,16 +9365,6 @@ theorem checkPureTerminatorWith_mono
         | some cb =>
           rw [h_lk] at h_ext
           exact h_imp cb h_ext
-
-private theorem list_all_mono {α : Type} {p q : α → Bool} {xs : List α}
-    (h_imp : ∀ x, p x = true → q x = true)
-    (h : xs.all p = true) :
-    xs.all q = true := by
-  induction xs with
-  | nil => rfl
-  | cons hd tl ih =>
-    simp only [List.all_cons, Bool.and_eq_true] at h ⊢
-    exact ⟨h_imp hd h.1, ih h.2⟩
 
 /--
 Every call-free `checkPureMir body = true` witness is also accepted by
@@ -9281,7 +9427,8 @@ theorem IsPureWithCalleesAtSomeDepth.block
     {body : CapturedMir} {bbIdx : BasicBlockIdx} {bb : BasicBlockData}
     (h_pure : IsPureWithCalleesAtSomeDepth callees traitImpls body)
     (h_bb : get? body.basicBlocks bbIdx = some bb) :
-    bb.statements.all (fun stmt => isPureStatement stmt.kind) = true ∧
+    bb.statements.all (fun stmt =>
+      isBorrowFreePureStatement body.localDecls body.layouts stmt.kind) = true ∧
     checkPureTerminatorWith callees body.layouts traitImpls
       (fun cb =>
         match Classical.propDecidable (IsPureWithCalleesAtSomeDepth callees traitImpls cb) with
@@ -9767,7 +9914,8 @@ private theorem stepMirFn_pureCallee_step_and_replaceRoot
       cases h_stmt : get? bb.statements s.frame.stmtIdx with
       | some stmt =>
         dsimp only
-        have h_s := list_all_of_get? h_stmts h_stmt
+        have h_s_bf := list_all_of_get? h_stmts h_stmt
+        have h_s := isPureStatement_of_isBorrowFreePureStatement h_s_bf
         refine ⟨evalStmt_preserves_pureCalleeMachineInv h_s h_inv_full, ?_⟩
         have h_eq1 :=
           evalStmt_toMachineState_eq_withMem_of_frameFree
@@ -12266,7 +12414,7 @@ theorem PureMirModularConverges.step_stmt
     (h_phase : ∀ tag, body.phase ≠ .other tag)
     (h_bb : get? body.basicBlocks ps.bb = some bb)
     (h_stmt : get? bb.statements ps.stmtIdx = some stmt)
-    (h_pure : isPureStatement stmt.kind = true)
+    (h_pure : isBorrowFreePureStatement body.localDecls body.layouts stmt.kind = true)
     (h_eval :
       evalStmt (ps.toMachineState emptyMemory) stmt body.localDecls body.layouts =
         MirStepNode.step s_emp)
@@ -12275,6 +12423,7 @@ theorem PureMirModularConverges.step_stmt
         (PureState.ofMachineState s_emp) post traitImpls) :
     PureMirModularConverges contract body callees ps post traitImpls := by
   intro m hm
+  have h_pure_s := isPureStatement_of_isBorrowFreePureStatement h_pure
   have h_ap : m.activeProtectors = [] := hm.2.2.2.2
   have h_step_m :
       ∃ bs : List BorrowEntry,
@@ -12381,13 +12530,13 @@ theorem PureMirModularConverges.step_stmt
               subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
     | intrinsic intr =>
       cases intr with
-      | copyNonOverlapping _ _ _ => cases h_pure
+      | copyNonOverlapping _ _ _ => cases h_pure_s
       | assume op =>
-        dsimp only [isPureStatement] at h_pure
+        dsimp only [isPureStatement] at h_pure_s
         unfold evalStmt at h_eval ⊢
         dsimp only [PureState.toMachineState] at h_eval ⊢
-        rw [evalOperand_pure_eq ps.env op m.borrows m.globals body.layouts m.callerLocals h_pure]
-        rw [evalOperand_pure_eq ps.env op emptyMemory.borrows emptyMemory.globals body.layouts emptyMemory.callerLocals h_pure] at h_eval
+        rw [evalOperand_pure_eq ps.env op m.borrows m.globals body.layouts m.callerLocals h_pure_s]
+        rw [evalOperand_pure_eq ps.env op emptyMemory.borrows emptyMemory.globals body.layouts emptyMemory.callerLocals h_pure_s] at h_eval
         cases h_ev : evalOperand ps.env op [] [] body.layouts [] with
         | ub => rw [h_ev] at h_eval; nomatch h_eval
         | unsupported => rw [h_ev] at h_eval; nomatch h_eval
@@ -12403,11 +12552,11 @@ theorem PureMirModularConverges.step_stmt
               injection h_eval with h_se; injection h_se with h_eq
               subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
           | _ => nomatch h_eval
-    | retag _ _ => cases h_pure
-    | backwardIncompatibleDropHint _ => cases h_pure
+    | retag _ _ => cases h_pure_s
+    | backwardIncompatibleDropHint _ => cases h_pure_s
     | setDiscriminant p varIdx =>
-      dsimp only [isPureStatement] at h_pure
-      have h_op : isPureOperand (.copy p) = true := h_pure
+      dsimp only [isPureStatement] at h_pure_s
+      have h_op : isPureOperand (.copy p) = true := h_pure_s
       unfold evalStmt at h_eval ⊢
       dsimp only [PureState.toMachineState] at h_eval ⊢
       rcases p with ⟨loc, proj⟩
@@ -12446,8 +12595,8 @@ theorem PureMirModularConverges.step_stmt
           cases v with
           | aggregate _ flds =>
             dsimp only at h_eval ⊢
-            rw [writePlaceValue_pure_eq l1 m.borrows { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) h_pure]
-            rw [writePlaceValue_pure_eq l1 emptyMemory.borrows { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) h_pure] at h_eval
+            rw [writePlaceValue_pure_eq l1 m.borrows { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) h_pure_s]
+            rw [writePlaceValue_pure_eq l1 emptyMemory.borrows { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) h_pure_s] at h_eval
             cases h_w : writePlaceValue l1 [] { local_ := loc, projection := hd :: tl } (.aggregate varIdx flds) with
             | ub => rw [h_w] at h_eval; nomatch h_eval
             | unsupported => rw [h_w] at h_eval; nomatch h_eval
@@ -12457,13 +12606,13 @@ theorem PureMirModularConverges.step_stmt
               subst h_eq; exact ⟨m.borrows, by cases m; rfl⟩
           | _ => nomatch h_eval
     | assign dst rv =>
-      simp only [isPureStatement, Bool.and_eq_true] at h_pure
+      simp only [isBorrowFreePureStatement, Bool.and_eq_true] at h_pure
       rcases h_pure with ⟨h_dst, h_rv⟩
       rw [evalStmt_assign_eq] at h_eval
       rw [evalStmt_assign_eq]
       dsimp only [PureState.toMachineState] at h_eval ⊢
-      rw [evalRvalue_pure_eq_withMem ps.env rv m body.localDecls body.layouts h_rv]
-      have h_emp := evalRvalue_pure_eq_withMem ps.env rv emptyMemory body.localDecls body.layouts h_rv
+      rw [evalRvalue_borrowFree_pure_eq_withMem ps.env rv m body.localDecls body.layouts h_rv]
+      have h_emp := evalRvalue_borrowFree_pure_eq_withMem ps.env rv emptyMemory body.localDecls body.layouts h_rv
       cases h_res : evalRvalue ps.env rv emptyMemory body.localDecls body.layouts with
       | ub => rw [h_res] at h_eval; nomatch h_eval
       | unsupported => rw [h_res] at h_eval; nomatch h_eval
@@ -13877,7 +14026,8 @@ private theorem sameExceptBorrows_step_noCall
             | some stmt =>
               rw [h_stmt] at h_wp
               dsimp only at h_wp ⊢
-              have h_s := list_all_of_get? h_stmts h_stmt
+              have h_s_bf := list_all_of_get? h_stmts h_stmt
+              have h_s := isPureStatement_of_isBorrowFreePureStatement h_s_bf
               have h_inv_next :=
                 evalStmt_preserves_pureCalleeMachineInv
                   (localDecls := (s₁.memory.activeCallee.getD body).localDecls)
@@ -14074,15 +14224,15 @@ private theorem sameExceptBorrows_step_noCall
                         exact ih_run ⟨h_inv_next, h_dst_stk⟩ ⟨h_adv _, h_meq⟩ h_wp
                     | _ => exact False.elim h_wp
               | assign dst rv =>
-                simp only [isPureStatement, Bool.and_eq_true] at h_s
-                rcases h_s with ⟨h_dst, h_rv⟩
+                simp only [isBorrowFreePureStatement, Bool.and_eq_true] at h_s_bf
+                rcases h_s_bf with ⟨h_dst, h_rv⟩
                 rw [evalStmt_assign_eq] at h_wp h_inv_next
                 rw [evalStmt_assign_eq]
                 rw [h_fr]
-                rw [evalRvalue_pure_eq_withMem s₁.frame.locals rv s₂.memory
+                rw [evalRvalue_borrowFree_pure_eq_withMem s₁.frame.locals rv s₂.memory
                   (s₁.memory.activeCallee.getD body).localDecls
                   (s₁.memory.activeCallee.getD body).layouts h_rv]
-                rw [evalRvalue_pure_eq_withMem s₁.frame.locals rv s₁.memory
+                rw [evalRvalue_borrowFree_pure_eq_withMem s₁.frame.locals rv s₁.memory
                   (s₁.memory.activeCallee.getD body).localDecls
                   (s₁.memory.activeCallee.getD body).layouts h_rv] at h_wp h_inv_next
                 cases h_ev : evalRvalue s₁.frame.locals rv emptyMemory
