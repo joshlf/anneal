@@ -5342,33 +5342,37 @@ theorem stmt_div_storage_revive_ptr_offset_is_ub :
       .some (.some .ub, "_3 = Offset(_2, 1)", .none) := by
   rfl
 
+/-- Two-variant enum `enum E { A(u64), B(u64) }` used by the `SetDiscriminant`
+regression body (`SetDiscriminant` is only well-formed on enums). -/
+private def stmtDivEnumTy : Ty := { kind := .adt "stmt_div::E" [], layoutIdx := 0 }
+
 /-- `D2` `SetDiscriminant` after `StorageDead` + `StorageLive` revival:
 writing a discriminant through the two-phase mutable borrow `_2 = &two-phase mut _1`
-(whose `.reserved` tag survives the direct write `_1 = [3, 4]` at base `12c9ecb8`)
-after `_1` has been deallocated by `StorageDead(_1)`, revived by
+(whose `.reserved` tag survives the direct write `_1 = E::A(20)` at base
+`12c9ecb8`) after `_1` has been deallocated by `StorageDead(_1)`, revived by
 `StorageLive(_1)`, and re-initialized faults with `FailureKind.ub` (Anneal
 previously updated the revived `_1`'s discriminant and returned `0`):
 ```text
 StorageLive(_1); StorageLive(_2);
-_1 = [const 1_u64, const 2_u64]; _2 = &two-phase mut _1;
-StorageDead(_1); StorageLive(_1); _1 = [const 3_u64, const 4_u64];
+_1 = E::A(const 10_u64); _2 = &two-phase mut _1;
+StorageDead(_1); StorageLive(_1); _1 = E::A(const 20_u64);
 SetDiscriminant(*_2, 1); _0 = const 0_u64; return
 ``` -/
 private def stmtDivReviveSetDiscrBody : CapturedMir :=
   stmtDivBody "stmt_div::set_discriminant_through_revived_local_borrow"
-    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy,
-      stmtDivDecl { kind := .ref .mut (.array (.uint .u64) 2), layoutIdx := 0 }]
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivEnumTy,
+      stmtDivDecl { kind := .ref .mut (.adt "stmt_div::E" []), layoutIdx := 0 }]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .storageLive 2, span := "live _2" },
       { kind := .assign ⟨1, []⟩
-          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
-        span := "_1 = [1, 2]" },
+          (.aggregate (.adt "stmt_div::E" 0 .none) [stmtDivConstU64 10]),
+        span := "_1 = E::A(10)" },
       { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
       { kind := .storageDead 1, span := "dead _1" },
       { kind := .storageLive 1, span := "revive _1" },
       { kind := .assign ⟨1, []⟩
-          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 3, stmtDivConstU64 4]),
-        span := "_1 = [3, 4]" },
+          (.aggregate (.adt "stmt_div::E" 0 .none) [stmtDivConstU64 20]),
+        span := "_1 = E::A(20)" },
       { kind := .setDiscriminant ⟨2, [.deref]⟩ 1, span := "SetDiscriminant(*_2, 1)" },
       { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
 
