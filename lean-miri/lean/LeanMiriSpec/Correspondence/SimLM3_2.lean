@@ -3461,7 +3461,7 @@ theorem step_safeRef_use_simulation
       exact finish_write_immediate_lm3_2_from_mid hframes hfr.body_eq hfr.location_eq hstate_mid rfl
         hbb hstmt hdecl_dst (himm_d_tfb.deinit_local hlt_sb) hrv_a hm_w hnew_ptr
 
-private theorem annealReadImmediate_indirect_prim_eq₂
+theorem annealReadImmediate_indirect_prim_eq₂
     {ty : Ty} {ly : LayoutTable} (hprim : IsPrimScalarTy ty)
     (mp : Miri.Interpreter.MemPlace AnnealProv) :
     annealReadImmediate ⟨.indirect mp, translateTy ty ly⟩ =
@@ -8694,6 +8694,125 @@ theorem step_terminator_goto_return_tree_simulation
     StepRelLM3_2Tree body m treeMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  sorry
+  have ⟨hcleanup, hret_decl0⟩ : bb.isCleanup = false ∧ (bb.terminator.kind = .return_ → ∃ d, get? body.localDecls 0 = some d ∧
+          (translateTy d.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO ∧
+          ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame 0) := by
+    rcases hgoto_ret with ⟨target, hgoto⟩ | hret | hunreach
+    · cases hwt_term
+      · exact ⟨by assumption, fun h => by rw [hgoto] at h; contradiction⟩
+      · rw [hgoto] at *; contradiction
+      · rw [hgoto] at *; contradiction
+      · rw [hgoto] at *; contradiction
+      · rw [hgoto] at *; contradiction
+    · cases hwt_term
+      · rw [hret] at *; contradiction
+      · refine ⟨by assumption, fun _ => ⟨_, by assumption, by assumption, by assumption⟩⟩
+      · rw [hret] at *; contradiction
+      · rw [hret] at *; contradiction
+      · rw [hret] at *; contradiction
+    · cases hwt_term
+      · rw [hunreach] at *; contradiction
+      · rw [hunreach] at *; contradiction
+      · exact ⟨by assumption, fun h => by rw [hunreach] at h; contradiction⟩
+      · rw [hunreach] at *; contradiction
+      · rw [hunreach] at *; contradiction
+  rcases htree.erased_rel with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hcal, hstack, hprot, hcaller, hbor, halloc, hd_tf⟩
+  have hcal' : s.memory.activeCallee = none := hcal
+  have hstack' : s.memory.callStack = [] := hstack
+  rw [stepMirFn_eq_of_not_other body s hcal' hphase]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by
+    simp [hstmt_len]
+  simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+  rw [miri_step_at_terminator hframes hframe.body_eq hframe.location_eq hbb hstmt_none]
+  rcases hgoto_ret with ⟨target, hgoto⟩ | hret | hunreach
+  · unfold evalTerminator translateTerminator
+      Miri.Interpreter.ControlFlow.evalTerminator
+      Miri.Interpreter.ControlFlow.goToBlock
+      Miri.Interpreter.ControlFlow.setLocation
+    rw [hgoto, stack_currentFrame?_singleton m.stack topFrame hframes, hframes]
+    dsimp only [translateTerminatorKind, Except.map, Id.run]
+    apply StepRelLM3_2Tree.step
+    refine StateRelLM3_2Tree.mk (StateRelLM3_2.mk
+      { topFrame with location := .mir ⟨target, 0⟩ }
+      rfl hretCont ⟨retLay, hretPlace⟩
+      ⟨hframe.body_eq, rfl, hframe.af_locals_len, hframe.mf_locals_size, hframe.locals_rel⟩
+      hcal hstack hprot hcaller hbor ?_ hd_tf) htree.borrows_eq
+    refine ⟨halloc.tags_nodup, halloc.local_to_alloc_unique, halloc.alloc_to_local_injective,
+      halloc.target_decl, halloc.base_addr_valid, halloc.borrow_sync, halloc.live_key_unique, ?_⟩
+    intro tf' htf' e he
+    injection htf' with h1; injection h1 with h2; subst tf'
+    exact halloc.local_alloc_sync topFrame hframes e he
+  · unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
+    rw [hret, hstack', annealTerminatorHooks_toControlHooks]
+    dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+    obtain ⟨decl0, hdecl0, hsz0, himm0⟩ := hret_decl0 hret
+    obtain ⟨slot0, mls0, _, _, hslot0, hmls0, _, hloc0⟩ := hframe.lookup_local hdecl0
+    have hslot0' : get? s.frame.locals 0 = some slot0 := hslot0
+    rw [hslot0']
+    have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
+    have himm0' := himm0 topFrame hframes mls0 hmls0
+    cases hloc0 with
+    | ref ptrVal mptr _ mutability pk _ hty0 hptrRel =>
+      have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
+      rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+        hframe.location_eq hbb hcleanup hretCont hop0
+        (annealControlHooks_popFrame_singleton hframes)
+        (annealControlHooks_copyReturn_empty _ hretPlace)
+        (annealControlHooks_cleanupFrame_eq false topFrame _)]
+      exact StepRelLM3_2Tree.retRoot treeMap decl0 (.ptr ptrVal 8)
+        (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
+        s.memory _ hdecl0 hop0 (.ref mutability pk ptrVal mptr hty0 hptrRel) rfl
+    | lm3_1 hloc0_1 =>
+      cases hloc0_1 with
+      | rawPtr ptrVal mptr _ mutability pk _ hty0 hptrRel =>
+        have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
+        rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+          hframe.location_eq hbb hcleanup hretCont hop0
+          (annealControlHooks_popFrame_singleton hframes)
+          (annealControlHooks_copyReturn_empty _ hretPlace)
+          (annealControlHooks_cleanupFrame_eq false topFrame _)]
+        exact StepRelLM3_2Tree.retRoot treeMap decl0 (.ptr ptrVal 8)
+          (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
+          s.memory _ hdecl0 hop0 (.lm3_1 (.rawPtr mutability pk ptrVal mptr hty0 hptrRel)) rfl
+      | base hbase0 =>
+        cases hbase0 with
+        | dead _ _ =>
+          rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
+            hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_dead hframes hget0)]
+          exact StepRelLM3_2Tree.ub _ _ _
+        | indirect _ mp _ _ _ _ =>
+          exact False.elim (himm0' mp rfl)
+        | immediate _ imm _ _ hval =>
+          rcases hval with ⟨rfl, rfl⟩ | ⟨retVal, rfl, himmRel⟩
+          · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
+              hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
+            exact StepRelLM3_2Tree.ub _ _ _
+          · cases himmRel with
+            | unit hzero =>
+              exact False.elim (hsz0 hzero)
+            | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
+              have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
+              rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+                hframe.location_eq hbb hcleanup hretCont hop0
+                (annealControlHooks_popFrame_singleton hframes)
+                (annealControlHooks_copyReturn_empty _ hretPlace)
+                (annealControlHooks_cleanupFrame_eq false topFrame _)]
+              exact StepRelLM3_2Tree.retRoot treeMap decl0 _ _ s.memory _ hdecl0 hop0
+                (.lm3_1 (.of_immediateRel (.scalar sc msc hsc hsz_sc hbool_sc hchar_sc))) rfl
+            | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair =>
+              have hop0 := annealControlHooks_returnOperand_scalarPair hframes hget0
+              rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+                hframe.location_eq hbb hcleanup hretCont hop0
+                (annealControlHooks_popFrame_singleton hframes)
+                (annealControlHooks_copyReturn_empty _ hretPlace)
+                (annealControlHooks_cleanupFrame_eq false topFrame _)]
+              exact StepRelLM3_2Tree.retRoot treeMap decl0 _ _ s.memory _ hdecl0 hop0
+                (.lm3_1 (.of_immediateRel (.scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair))) rfl
+  · unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
+    rw [hunreach]
+    dsimp only [translateTerminatorKind, Except.map, Id.run]
+    exact StepRelLM3_2Tree.ub _ _ _
 
 end LeanMiriSpec.Correspondence

@@ -8591,14 +8591,15 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hlive_ref : ∀ ptrVal, Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
       ∀ e ∈ allocMap, e.tag = ptrVal.tag →
         Trusted.Sequence.get? body.localDecls e.localIdx = some allocDecl ∧
+        allocDecl.ty.kind = dstDecl.ty.kind ∧
         (translateTy dstDecl.ty body.layouts).layout.size = (translateTy allocDecl.ty body.layouts).layout.size ∧
         (∃ sc, Trusted.Sequence.get? s.frame.locals e.localIdx = some (.init (.scalar sc)) ∧
         ¬ AnnealScalarValid dstDecl.ty sc) ∧
         ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
         Trusted.Sequence.get? s.frame.locals dstIdx ≠ some .dead) ,
-    ∃ s', stepMirFn body s = MirStepNode.step s' ∧
-    ∃ msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
-      (m, .error (.undefinedBehavior msg)) := @step_safeRef_deref_read_invalid_scalar_divergence
+    ∀ s', stepMirFn body s = MirStepNode.step s' →
+      ∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+      (m', .error (.undefinedBehavior msg)) := @step_safeRef_deref_read_invalid_scalar_divergence
 
 example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -8624,7 +8625,7 @@ example : ∀ {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead ∧
       ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
       (∀ tgtDecl, Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
-        tgtDecl.ty.kind = pointeeKind)) :
+        tgtDecl.ty.kind = pointeeKind)) ,
     ((stepMirFn body s = MirStepNode.fail .ub) ↔
       ∃ m' msg,
         Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
