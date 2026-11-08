@@ -310,6 +310,9 @@ fn check_transmute_layouts(
             return Err(TransmuteLayoutError::Unsupported(ty.clone()));
         }
     }
+    if src_ty == target_ty {
+        return Ok(());
+    }
     let mut src_ptrs = Vec::new();
     let mut src_budget = MAX_POINTER_LEAVES;
     if !collect_pointer_offsets(src_ty, ptr_width, 0, &mut src_ptrs, &mut src_budget) {

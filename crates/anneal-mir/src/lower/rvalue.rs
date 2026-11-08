@@ -1937,30 +1937,46 @@ fn encode_mir_value(
     Ok(())
 }
 
-/// Validates `val` against `ty` for an identity transmute: like `encode_mir_value` (shape,
-/// scalar types, and leaf validity such as non-null `&T`), but also accepts struct/enum
-/// `MirValue::Adt` values, which Anneal types as the tuple of their fields.
-fn encode_or_validate_identity(
+/// Validates and normalizes `val` against `ty` for an identity transmute (`src_ty == target_ty`):
+/// checks shape, scalar types, and leaf bit-validity (such as non-null `&T`), masks pointer
+/// addresses and integer bits to `ptr_width`, and preserves struct/enum/union `MirValue::Adt`
+/// values (which Anneal types as the tuple of their declared fields) across both canonical and
+/// non-canonical field layouts.
+fn eval_identity_transmute_value(
     val: &MirValue,
     ty: &Ty,
     ptr_width: PtrWidth,
-) -> Result<(), RvalueEvalError> {
+) -> Result<MirValue, RvalueEvalError> {
     match (ty, val) {
-        (
-            Ty::Tuple(fields),
-            MirValue::Adt {
-                active_field: None,
-                fields: values,
-                ..
-            },
-        )
-        | (Ty::Tuple(fields), MirValue::Tuple(values))
-            if values.len() == fields.len() =>
-        {
-            values
-                .iter()
-                .zip(fields)
-                .try_for_each(|(value, field)| encode_or_validate_identity(value, field, ptr_width))
+        (Ty::Bool, MirValue::Bool(b)) => Ok(MirValue::Bool(*b)),
+        (Ty::Char, MirValue::Char(c)) => Ok(MirValue::Char(*c)),
+        (Ty::Int(_) | Ty::Uint(_), MirValue::Int { bits, ty: val_ty }) if val_ty == ty => {
+            if !ty.is_valid_scalar_bits(*bits, ptr_width) {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: *bits,
+                }));
+            }
+            Ok(MirValue::Int {
+                bits: *bits & ty.scalar_mask(ptr_width),
+                ty: ty.clone(),
+            })
+        }
+        (Ty::RawPtr(_, _) | Ty::Ref(_, _), MirValue::Ptr { ptr, ty: val_ty }) if val_ty == ty => {
+            let addr_bits = u128::from(ptr.addr) & ptr_width.mask();
+            if !ty.is_valid_scalar_bits(addr_bits, ptr_width) {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: ty.clone(),
+                    bits: addr_bits,
+                }));
+            }
+            Ok(MirValue::Ptr {
+                ptr: PointerValue {
+                    addr: addr_bits as u64,
+                    provenance: ptr.provenance,
+                },
+                ty: ty.clone(),
+            })
         }
         (
             Ty::Array(elem, count),
@@ -1968,10 +1984,74 @@ fn encode_or_validate_identity(
                 elements,
                 elem_ty,
             },
-        ) if **elem == *elem_ty && elements.len() == *count => elements
-            .iter()
-            .try_for_each(|element| encode_or_validate_identity(element, elem, ptr_width)),
-        _ => encode_mir_value(val, ty, ptr_width, &mut Vec::new()),
+        ) if **elem == *elem_ty && elements.len() == *count => {
+            if *count > MAX_EVAL_ARRAY_LEN {
+                return Err(RvalueEvalError::EvaluationLimit { len: *count });
+            }
+            let norm = elements
+                .iter()
+                .map(|element| eval_identity_transmute_value(element, elem, ptr_width))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MirValue::Array {
+                elements: norm,
+                elem_ty: elem_ty.clone(),
+            })
+        }
+        (Ty::Tuple(fields), MirValue::Unit) if fields.is_empty() => Ok(MirValue::Unit),
+        (Ty::Tuple(fields), MirValue::Tuple(values)) if values.len() == fields.len() => {
+            let norm = values
+                .iter()
+                .zip(fields)
+                .map(|(value, field)| eval_identity_transmute_value(value, field, ptr_width))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MirValue::Tuple(norm))
+        }
+        (
+            Ty::Tuple(fields),
+            MirValue::Adt {
+                def_path,
+                variant_idx,
+                active_field: None,
+                fields: values,
+            },
+        ) if values.len() == fields.len() => {
+            let norm = values
+                .iter()
+                .zip(fields)
+                .map(|(value, field)| eval_identity_transmute_value(value, field, ptr_width))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MirValue::Adt {
+                def_path: def_path.clone(),
+                variant_idx: *variant_idx,
+                active_field: None,
+                fields: norm,
+            })
+        }
+        (
+            Ty::Tuple(fields),
+            MirValue::Adt {
+                def_path,
+                variant_idx: 0,
+                active_field: Some(field_idx),
+                fields: values,
+            },
+        ) if values.len() == 1 => {
+            let Some(field_ty) = fields.get(*field_idx) else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "union Adt active_field index out of bounds for union type",
+                ));
+            };
+            let norm = eval_identity_transmute_value(&values[0], field_ty, ptr_width)?;
+            Ok(MirValue::Adt {
+                def_path: def_path.clone(),
+                variant_idx: 0,
+                active_field: Some(*field_idx),
+                fields: vec![norm],
+            })
+        }
+        _ => Err(RvalueEvalError::TypeMismatch(
+            "transmute operand value does not match its source type",
+        )),
     }
 }
 
@@ -2056,7 +2136,10 @@ pub fn eval_lowered_cast(
 ) -> Result<MirValue, RvalueEvalError> {
     match cast {
         LoweredCast::PtrToInt {
-            src_ty, target_ty, ..
+            src_ty,
+            target_ty,
+            expose_provenance,
+            ..
         } => {
             let MirValue::Ptr { ptr, ty } = val else {
                 return Err(RvalueEvalError::TypeMismatch(
@@ -2075,7 +2158,14 @@ pub fn eval_lowered_cast(
                     bits: 0,
                 }));
             }
-            let bits = eval_ptr_to_int_with_ptr_width(*ptr, target_ty, ptr_width, tracker)?;
+            let mut suppressed = ExposedProvenanceTracker::new();
+            let active_tracker = if *expose_provenance {
+                tracker
+            } else {
+                &mut suppressed
+            };
+            let bits =
+                eval_ptr_to_int_with_ptr_width(*ptr, target_ty, ptr_width, active_tracker)?;
             Ok(MirValue::Int {
                 bits,
                 ty: target_ty.clone(),
@@ -2173,10 +2263,10 @@ pub fn eval_lowered_cast(
         LoweredCast::Transmute {
             src_ty, target_ty, ..
         } => {
-            if src_ty == target_ty && !src_ty.has_canonical_byte_layout(ptr_width) {
-                // Identity transmute through a layout without a canonical byte image (e.g. a
-                // padded tuple): `T.decode(T.encode(v)) == v` for every valid `v`, so validate
-                // the operand against `T` and return it unchanged.
+            if src_ty == target_ty {
+                // Identity transmute (`T.decode(T.encode(v)) == v` for every valid `v`),
+                // covering both canonical and non-canonical layouts as well as `MirValue::Adt`
+                // struct/enum/union values.
                 if !src_ty.is_inhabited() {
                     return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
                         target_ty: target_ty.clone(),
@@ -2187,8 +2277,7 @@ pub fn eval_lowered_cast(
                         ty: src_ty.clone(),
                     }));
                 }
-                encode_or_validate_identity(val, src_ty, ptr_width)?;
-                return Ok(val.clone());
+                return eval_identity_transmute_value(val, src_ty, ptr_width);
             }
             let tv_in = match val {
                 MirValue::Ptr { ptr, ty } if ty == src_ty => TransmuteValue::Ptr(*ptr),
@@ -2273,6 +2362,11 @@ pub fn eval_lowered_rvalue(
                 return Err(RvalueEvalError::EvaluationLimit { len: *count });
             }
             let v = eval_op(operand)?;
+            if v.ty() != *elem_ty {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Repeat operand runtime type does not match element type",
+                ));
+            }
             Ok(MirValue::Array {
                 elements: vec![v; *count],
                 elem_ty: elem_ty.clone(),
@@ -2355,10 +2449,16 @@ pub fn eval_lowered_rvalue(
             lhs,
             rhs,
             lhs_ty,
+            rhs_ty,
             ..
         } => {
             let lv = eval_op(lhs)?;
             let rv = eval_op(rhs)?;
+            if lv.ty() != *lhs_ty || rv.ty() != *rhs_ty {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "CheckedBinaryOp operand runtime types do not match lowered types",
+                ));
+            }
             let (wrapped, overflowed) = eval_checked_binop(*op, &lv, &rv, ptr_width)?;
             Ok(MirValue::Tuple(vec![
                 MirValue::Int {
@@ -2386,7 +2486,27 @@ pub fn eval_lowered_rvalue(
             }
             eval_aggregate(kind, vals, ptr_width)
         }
-        LoweredRvalue::CopyForDeref { place, .. } => read_place(place),
+        LoweredRvalue::CopyForDeref { place, ty } => match read_place(place)? {
+            MirValue::Ptr { ptr, ty: val_ty } if val_ty == *ty && ty.is_any_ptr() => {
+                let masked_addr = (u128::from(ptr.addr) & ptr_width.mask()) as u64;
+                if ty.is_ref() && masked_addr == 0 {
+                    return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                        target_ty: ty.clone(),
+                        bits: 0,
+                    }));
+                }
+                Ok(MirValue::Ptr {
+                    ptr: PointerValue {
+                        addr: masked_addr,
+                        provenance: ptr.provenance,
+                    },
+                    ty: ty.clone(),
+                })
+            }
+            _ => Err(RvalueEvalError::TypeMismatch(
+                "CopyForDeref requires a pointer value matching the place type",
+            )),
+        },
     }
 }
 

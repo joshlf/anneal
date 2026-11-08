@@ -1539,3 +1539,171 @@ fn test_b2_identity_transmute_of_non_canonical_types_returns_validated_value() {
         Err(RvalueEvalError::TypeMismatch(_))
     ));
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv A2] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a2_identity_transmute_handles_canonical_structs_unions_and_32bit_ptr_masking() {
+    let pw64 = PtrWidth::Bits64;
+    let pw32 = PtrWidth::Bits32;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let mut tracker = ExposedProvenanceTracker::new();
+
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let u64_ty = Ty::Uint(UintTy::U64);
+    let raw_u8 = Ty::RawPtr(Box::new(u8_ty.clone()), Mutability::Not);
+    let ref_u8 = Ty::Ref(Box::new(u8_ty.clone()), Mutability::Not);
+
+    // 1. Canonical struct (`struct Pair(u32, u32)` or `struct Wrapper(u32)`): B2 only took the
+    // `MirValue::Adt` identity branch when `!src_ty.has_canonical_byte_layout(ptr_width)`, so
+    // canonical structs fell through to `encode_mir_value` and failed with `TypeMismatch`!
+    let canon_pair_ty = Ty::Tuple(vec![u32_ty.clone(), u32_ty.clone()]);
+    assert!(canon_pair_ty.has_canonical_byte_layout(pw64));
+    let canon_struct_val = MirValue::Adt {
+        def_path: "AlignedPair".into(),
+        variant_idx: 0,
+        active_field: None,
+        fields: vec![
+            MirValue::unsigned(10, UintTy::U32, pw64),
+            MirValue::unsigned(20, UintTy::U32, pw64),
+        ],
+    };
+    let identity_pair = Rvalue::Cast(
+        CastKind::Transmute,
+        Operand::Copy(Place::from_local(0)),
+        canon_pair_ty.clone(),
+    );
+    assert_eq!(
+        eval_rv(
+            &identity_pair,
+            std::slice::from_ref(&canon_pair_ty),
+            std::slice::from_ref(&canon_struct_val),
+            pw64,
+            policy,
+            &mut tracker
+        ),
+        Ok(canon_struct_val)
+    );
+
+    // 2. Union `MirValue::Adt` (`active_field: Some(field_idx)`) identity transmute: validates
+    // the active field against `fields[field_idx]` and rejects out-of-bounds `active_field`.
+    let union_ty = Ty::Tuple(vec![u32_ty.clone(), u64_ty]);
+    let union_val = MirValue::Adt {
+        def_path: "MyUnion".into(),
+        variant_idx: 0,
+        active_field: Some(1),
+        fields: vec![MirValue::unsigned(0xCAFE_BABE, UintTy::U64, pw64)],
+    };
+    let identity_union = Rvalue::Cast(
+        CastKind::Transmute,
+        Operand::Copy(Place::from_local(0)),
+        union_ty.clone(),
+    );
+    assert_eq!(
+        eval_rv(
+            &identity_union,
+            std::slice::from_ref(&union_ty),
+            std::slice::from_ref(&union_val),
+            pw64,
+            policy,
+            &mut tracker
+        ),
+        Ok(union_val)
+    );
+    let bad_union_val = MirValue::Adt {
+        def_path: "MyUnion".into(),
+        variant_idx: 0,
+        active_field: Some(5),
+        fields: vec![MirValue::unsigned(1, UintTy::U32, pw64)],
+    };
+    assert!(matches!(
+        eval_rv(
+            &identity_union,
+            std::slice::from_ref(&union_ty),
+            &[bad_union_val],
+            pw64,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // 3. On 32-bit targets, identity transmute of a non-canonical tuple containing a pointer
+    // masks the pointer's address to 32 bits (B2 cloned the unmasked 64-bit address).
+    let non_canon_ptr_tuple = Ty::Tuple(vec![raw_u8.clone(), u8_ty.clone()]);
+    assert!(!non_canon_ptr_tuple.has_canonical_byte_layout(pw32));
+    let unmasked_ptr = PointerValue::with_provenance(0x1_0000_2000, 41, 42);
+    let masked_ptr = PointerValue::with_provenance(0x0000_2000, 41, 42);
+    let in_tuple = MirValue::Tuple(vec![
+        MirValue::ptr(unmasked_ptr, raw_u8.clone()),
+        MirValue::unsigned(9, UintTy::U8, pw32),
+    ]);
+    let expected_tuple = MirValue::Tuple(vec![
+        MirValue::ptr(masked_ptr, raw_u8),
+        MirValue::unsigned(9, UintTy::U8, pw32),
+    ]);
+    let identity_ptr_tuple = Rvalue::Cast(
+        CastKind::Transmute,
+        Operand::Copy(Place::from_local(0)),
+        non_canon_ptr_tuple.clone(),
+    );
+    assert_eq!(
+        eval_rv(
+            &identity_ptr_tuple,
+            std::slice::from_ref(&non_canon_ptr_tuple),
+            &[in_tuple],
+            pw32,
+            policy,
+            &mut tracker
+        ),
+        Ok(expected_tuple)
+    );
+    assert!(tracker.is_empty());
+
+    // 4. `LoweredCast::PtrToInt` honors `expose_provenance: false`, and `Repeat`,
+    // `CheckedBinaryOp`, and `CopyForDeref` validate runtime operand types and null `&T`.
+    let no_expose = LoweredCast::PtrToInt {
+        src_ty: ref_u8.clone(),
+        target_ty: Ty::Uint(UintTy::Usize),
+        operand: Operand::Copy(Place::from_local(0)),
+        expose_provenance: false,
+    };
+    let valid_ref = MirValue::ptr(PointerValue::with_provenance(0x8000, 51, 52), ref_u8.clone());
+    assert_eq!(
+        eval_lowered_cast(&no_expose, &valid_ref, pw64, policy, &mut tracker),
+        Ok(MirValue::unsigned(0x8000, UintTy::Usize, pw64))
+    );
+    assert!(tracker.is_empty());
+
+    let repeat_u32 = lower_rvalue(
+        &Rvalue::Repeat(Operand::Copy(Place::from_local(0)), 2),
+        std::slice::from_ref(&u32_ty),
+        pw64,
+    )
+    .unwrap();
+    assert!(matches!(
+        eval_lowered_rvalue(
+            &repeat_u32,
+            &[MirValue::unsigned(1, UintTy::U8, pw64)],
+            pw64,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    let copy_deref_ref = lower_rvalue(
+        &Rvalue::CopyForDeref(Place::from_local(0)),
+        std::slice::from_ref(&ref_u8),
+        pw64,
+    )
+    .unwrap();
+    let null_ref = MirValue::ptr(PointerValue::without_provenance(0), ref_u8);
+    assert!(matches!(
+        eval_lowered_rvalue(&copy_deref_ref, &[null_ref], pw64, policy, &mut tracker),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { .. }))
+    ));
+}

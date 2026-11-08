@@ -984,3 +984,43 @@ fn test_b2_identity_transmute_lowers_for_non_canonical_layouts() {
         Err(CastLowerError::UnsupportedLayout { ty: padded })
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv A2] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a2_eval_transmute_identity_bypasses_pointer_leaf_budget_for_canonical_arrays() {
+    let tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let raw_u8 = Ty::RawPtr(Box::new(u8_ty), Mutability::Not);
+    let many_ptrs = Ty::Array(Box::new(raw_u8), 1 << 17);
+    let op = Operand::Constant(Constant::Unit);
+
+    // `lower_transmute` accepts `many_ptrs -> many_ptrs` because `src_ty == target_ty`.
+    // `eval_transmute` must also skip `collect_pointer_offsets` when `src_ty == target_ty`
+    // rather than failing with `UnsupportedLayout` on the 65,536-pointer leaf budget.
+    assert!(
+        lower_transmute(
+            &op,
+            &many_ptrs,
+            &many_ptrs,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+        )
+        .is_ok()
+    );
+    let zero_bytes = vec![0u8; (1 << 17) * 8];
+    assert_eq!(
+        eval_transmute(
+            TransmuteValue::Bytes(zero_bytes.clone()),
+            &many_ptrs,
+            &many_ptrs,
+            PtrWidth::Bits64,
+            TransmutePolicy::RejectPtrToInt,
+            &tracker,
+        ),
+        Ok(TransmuteValue::Bytes(zero_bytes))
+    );
+    assert!(tracker.is_empty());
+}
