@@ -637,13 +637,27 @@ def evalPtrToIntExposeTyped
     | true =>
       .ok (.scalar (p.offsetBytes % scalarModulus (dst.sizeBytes pw))) (exposeProvOpt prov exposed)
 
+/-- Least exposed allocation identifier, or `none` if nothing has been exposed. This is
+`BTreeSet::first` on Episode 1's `ExposedProvenanceTracker.exposed : BTreeSet<Provenance>`
+(an *ordered set*): it depends only on the set of exposed allocations, not on exposure order
+(`leastExposed_congr`). -/
+def leastExposed : ExposedProvenance → Option Nat
+  | [] => none
+  | a :: rest =>
+    match leastExposed rest with
+    | none => some a
+    | some b => some (min a b)
+
 /-- Deterministic provenance selector used by `anneal_mir::lower::rvalue::eval_lowered_cast`
-(`LoweredCast::IntToPtr`, `rvalue.rs:2202-2206`): when `pick = true`, selects the first
-exposed provenance (`exposed.head?`), and `none` when `exposed = []` or `pick = false`. -/
+(`LoweredCast::IntToPtr`, `rvalue.rs:2196-2206`): when `pick = true`, predicts the **least**
+exposed provenance (`tracker.exposed.first().copied()` on a `BTreeSet`, i.e. `leastExposed`),
+and `none` when `exposed = []` or `pick = false`. Note that `exposed.head?` would instead pick
+the most recently exposed allocation (`exposeProv` prepends), which diverges from Episode 1
+whenever allocations are exposed in non-increasing order. -/
 def pickExposedProv (pick : Bool) (exposed : ExposedProvenance) : Option Nat :=
   match pick with
   | false => none
-  | true => exposed.head?
+  | true => leastExposed exposed
 
 /-- Deterministic `CastKind.pointerWithExposedProvenance` (`IntToPtr`) evaluator matching
 `anneal_mir::lower::rvalue::eval_lowered_cast` (`LoweredCast::IntToPtr`): invokes
@@ -655,6 +669,38 @@ def evalIntToPtrDeterministic
     (exposed : ExposedProvenance) :
     CastOutcome :=
   evalIntToPtrExposed pw addr (pickExposedProv pick exposed) exposed
+
+/-- Integer-to-address conversion of Episode 1's `LoweredCast::IntToPtr` evaluation
+(`rvalue.rs:2190-2194`): an unsigned source is truncated to its own width
+(`addr & ut.mask(ptr_width)`), a signed source is **sign-extended** from its own width
+(`it.sign_extend(addr, ptr_width) as u128`), and the result is reduced modulo the target pointer
+width (`& ptr_width.mask()`). For a signed source with `2 * b ≥ m` (a negative value), the
+two's-complement wrap `b - m (mod pw.modulus)` is computed as `(b + pw.modulus * m - m) % pw.modulus`. -/
+def intToPtrAddress (pw : PtrWidth) (src : ScalarTy) (bits : Nat) : Nat :=
+  match src with
+  | .uint w => (bits % scalarModulus (w.byteSize pw)) % pw.modulus
+  | .int w =>
+    match Nat.blt (2 * (bits % scalarModulus (w.byteSize pw))) (scalarModulus (w.byteSize pw)) with
+    | true => (bits % scalarModulus (w.byteSize pw)) % pw.modulus
+    | false =>
+      (bits % scalarModulus (w.byteSize pw) + pw.modulus * scalarModulus (w.byteSize pw) -
+        scalarModulus (w.byteSize pw)) % pw.modulus
+  | _ => bits % pw.modulus
+
+/-- Source-typed deterministic `CastKind.pointerWithExposedProvenance` evaluator matching
+Episode 1's `eval_lowered_cast` (`LoweredCast::IntToPtr`): requires an integral source
+(otherwise `.unsupported`), converts the integer with `intToPtrAddress` (sign- or zero-extension
+plus pointer-width masking), and predicts provenance with `pickExposedProv`. -/
+def evalIntToPtrTyped
+    (pw : PtrWidth)
+    (src : ScalarTy)
+    (bits : Nat)
+    (pick : Bool)
+    (exposed : ExposedProvenance) :
+    CastOutcome :=
+  match src.isIntegral with
+  | false => .unsupported
+  | true => evalIntToPtrDeterministic pw pick (intToPtrAddress pw src bits) exposed
 
 /-- Evaluate a same-size `CastKind.transmute` from `src` to `dst` under target pointer
 width `pw` and `TransmutePolicy` `policy`, threading `exposed : ExposedProvenance`
@@ -1693,6 +1739,128 @@ theorem ptrToInt_truncating_exposes_and_reconstructs_low_bits
     (p.offsetBytes % scalarModulus (dst.sizeBytes pw)) p.allocId (exposeProv p.allocId exposed)
     h_mod_lt_pw (isExposed_exposeProv p.allocId exposed)
 
+/-- `leastExposed e = none` exactly when nothing has been exposed. -/
+theorem leastExposed_eq_none_iff (e : ExposedProvenance) : leastExposed e = none ↔ e = [] := by
+  cases e with
+  | nil => exact ⟨fun _ => rfl, fun _ => rfl⟩
+  | cons a rest =>
+    constructor
+    · intro h
+      unfold leastExposed at h
+      cases h_r : leastExposed rest with
+      | none =>
+        rw [h_r] at h
+        contradiction
+      | some b =>
+        rw [h_r] at h
+        contradiction
+    · intro h
+      contradiction
+
+/-- The least exposed allocation is exposed. -/
+theorem leastExposed_mem :
+    ∀ (e : ExposedProvenance) (a : Nat), leastExposed e = some a → a ∈ e
+  | [], a, h => by
+    unfold leastExposed at h
+    contradiction
+  | x :: rest, a, h => by
+    unfold leastExposed at h
+    cases h_r : leastExposed rest with
+    | none =>
+      rw [h_r] at h
+      injection h with h_eq
+      subst h_eq
+      exact List.Mem.head _
+    | some b =>
+      rw [h_r] at h
+      injection h with h_eq
+      have hb := leastExposed_mem rest b h_r
+      rcases Nat.le_total x b with hxb | hbx
+      · rw [Nat.min_eq_left hxb] at h_eq
+        subst h_eq
+        exact List.Mem.head _
+      · rw [Nat.min_eq_right hbx] at h_eq
+        subst h_eq
+        exact List.Mem.tail _ hb
+
+/-- The least exposed allocation is below every exposed allocation. -/
+theorem leastExposed_le :
+    ∀ (e : ExposedProvenance) (a : Nat), leastExposed e = some a → ∀ b ∈ e, a ≤ b
+  | [], a, h => by
+    unfold leastExposed at h
+    contradiction
+  | x :: rest, a, h => by
+    intro b hb
+    unfold leastExposed at h
+    cases h_r : leastExposed rest with
+    | none =>
+      rw [h_r] at h
+      injection h with h_eq
+      subst h_eq
+      have h_nil : rest = [] := (leastExposed_eq_none_iff rest).mp h_r
+      subst h_nil
+      cases hb with
+      | head => exact Nat.le_refl _
+      | tail _ h' => cases h'
+    | some c =>
+      rw [h_r] at h
+      injection h with h_eq
+      subst h_eq
+      cases hb with
+      | head => exact Nat.min_le_left _ _
+      | tail _ h' => exact Nat.le_trans (Nat.min_le_right _ _) (leastExposed_le rest c h_r b h')
+
+/-- Set semantics: `leastExposed` depends only on *which* allocations are exposed. -/
+theorem leastExposed_congr (e₁ e₂ : ExposedProvenance) (h : ∀ x, x ∈ e₁ ↔ x ∈ e₂) :
+    leastExposed e₁ = leastExposed e₂ := by
+  cases h1 : leastExposed e₁ with
+  | none =>
+    have h_nil : e₁ = [] := (leastExposed_eq_none_iff e₁).mp h1
+    subst h_nil
+    cases e₂ with
+    | nil => rfl
+    | cons y ys => exact absurd ((h y).mpr (List.Mem.head ys)) (by simp)
+  | some a =>
+    have ha := leastExposed_mem e₁ a h1
+    cases h2 : leastExposed e₂ with
+    | none =>
+      have h_nil : e₂ = [] := (leastExposed_eq_none_iff e₂).mp h2
+      rw [h_nil] at h
+      exact absurd ((h a).mp ha) (by simp)
+    | some b =>
+      have hb := leastExposed_mem e₂ b h2
+      have hab := leastExposed_le e₁ a h1 b ((h b).mpr hb)
+      have hba := leastExposed_le e₂ b h2 a ((h a).mp ha)
+      rw [Nat.le_antisymm hab hba]
+
+/-- Membership in `exposeProv a e`. -/
+theorem mem_exposeProv_iff (a x : Nat) (e : ExposedProvenance) :
+    x ∈ exposeProv a e ↔ x = a ∨ x ∈ e := by
+  unfold exposeProv
+  split
+  · next h_mem =>
+    constructor
+    · intro hx
+      exact Or.inr hx
+    · rintro (rfl | hx)
+      · exact h_mem
+      · exact hx
+  · exact List.mem_cons
+
+/-- Exposure-order independence of Episode 1's deterministic `IntToPtr` prediction: exposing
+`a` then `b` or `b` then `a` yields the same predicted provenance (`BTreeSet` semantics). -/
+theorem pickExposedProv_exposeProv_comm (pick : Bool) (a b : Nat) (e : ExposedProvenance) :
+    pickExposedProv pick (exposeProv a (exposeProv b e)) =
+      pickExposedProv pick (exposeProv b (exposeProv a e)) := by
+  cases pick with
+  | false => rfl
+  | true =>
+    show leastExposed _ = leastExposed _
+    apply leastExposed_congr
+    intro x
+    rw [mem_exposeProv_iff, mem_exposeProv_iff, mem_exposeProv_iff, mem_exposeProv_iff]
+    exact or_left_comm
+
 /-- Soundness of the deterministic provenance picker (`pickExposedProv`): any provenance returned
 by `pickExposedProv pick exposed` is guaranteed to be exposed in `exposed`. -/
 theorem isExposed_of_pickExposedProv_eq_some
@@ -1703,14 +1871,7 @@ theorem isExposed_of_pickExposedProv_eq_some
     isExposed allocId exposed := by
   cases pick with
   | false => contradiction
-  | true =>
-    cases exposed with
-    | nil => contradiction
-    | cons head tail =>
-      dsimp [pickExposedProv] at h_pick
-      injection h_pick with h_eq
-      subst h_eq
-      exact List.Mem.head tail
+  | true => exact leastExposed_mem exposed allocId h_pick
 
 /-- Deterministic `IntToPtr` (`evalIntToPtrDeterministic`, matching `rvalue.rs:2202-2210`)
 never fails with `UnexposedProvenance`: for any valid address `addr < scalarModulus pw.byteSize`,
@@ -1723,25 +1884,17 @@ theorem evalIntToPtrDeterministic_eq_ok
     (exposed : ExposedProvenance)
     (h_addr : addr < scalarModulus pw.byteSize) :
     evalIntToPtrDeterministic pw pick addr exposed =
-      match pick, exposed with
-      | true, allocId :: _ =>
+      match pickExposedProv pick exposed with
+      | some allocId =>
         .ok (.ptr { allocId := allocId, offsetBytes := addr } (some allocId)) exposed
-      | _, _ =>
+      | none =>
         .ok (.ptr { allocId := 0, offsetBytes := addr } none) exposed := by
   unfold evalIntToPtrDeterministic
-  cases pick with
-  | false =>
-    dsimp [pickExposedProv]
-    exact evalIntToPtrExposed_none pw addr exposed h_addr
-  | true =>
-    cases exposed with
-    | nil =>
-      dsimp [pickExposedProv]
-      exact evalIntToPtrExposed_none pw addr [] h_addr
-    | cons allocId rest =>
-      dsimp [pickExposedProv]
-      exact evalIntToPtrExposed_some_of_isExposed pw addr allocId (allocId :: rest) h_addr
-        (List.Mem.head rest)
+  cases h_pick : pickExposedProv pick exposed with
+  | none => exact evalIntToPtrExposed_none pw addr exposed h_addr
+  | some allocId =>
+    exact evalIntToPtrExposed_some_of_isExposed pw addr allocId exposed h_addr
+      (isExposed_of_pickExposedProv_eq_some pick exposed allocId h_pick)
 
 /-- Oracle-free deterministic `PtrToInt -> IntToPtr` round trip from an initially empty exposed
 set (`exposed = []`): `evalPtrToIntExpose` exposes `p.allocId` as the unique entry `[p.allocId]`,
@@ -1758,8 +1911,204 @@ theorem ptrToInt_intToPtrDeterministic_roundtrip_from_empty
     evalIntToPtrDeterministic pw true p.offsetBytes [p.allocId] =
       .ok (.ptr p (some p.allocId)) [p.allocId] := by
   refine ⟨(ptrToInt_intToPtr_roundtrip pw dst p [] h_int h_off h_fit).1, ?_⟩
-  cases p
-  exact evalIntToPtrDeterministic_eq_ok pw true _ _ h_off
+  rw [evalIntToPtrDeterministic_eq_ok pw true _ _ h_off]
+  rfl
+
+/-- Episode 1's deterministic `PtrToInt -> IntToPtr` pipeline from an arbitrary exposed set:
+the reconstructed pointer keeps the address `p.offsetBytes` but carries the **least** exposed
+provenance of `exposeProv p.allocId exposed`, which is `p.allocId` exactly when no smaller
+allocation was exposed before. -/
+theorem ptrToInt_intToPtrDeterministic_picks_least_exposed
+    (pw : PtrWidth)
+    (dst : ScalarTy)
+    (p : ProvenancePtr)
+    (exposed : ExposedProvenance)
+    (h_int : dst.isIntegral = true)
+    (h_off : p.offsetBytes < scalarModulus pw.byteSize)
+    (h_fit : p.offsetBytes < scalarModulus (dst.sizeBytes pw)) :
+    ∃ least,
+      leastExposed (exposeProv p.allocId exposed) = some least ∧
+      least ≤ p.allocId ∧
+      evalPtrToIntExpose pw dst p exposed =
+        .ok (.scalar p.offsetBytes) (exposeProv p.allocId exposed) ∧
+      evalIntToPtrDeterministic pw true p.offsetBytes (exposeProv p.allocId exposed) =
+        .ok (.ptr { allocId := least, offsetBytes := p.offsetBytes } (some least))
+          (exposeProv p.allocId exposed) ∧
+      (least = p.allocId ↔ ∀ b ∈ exposed, p.allocId ≤ b) := by
+  have h_mem : p.allocId ∈ exposeProv p.allocId exposed := isExposed_exposeProv p.allocId exposed
+  cases h_least : leastExposed (exposeProv p.allocId exposed) with
+  | none =>
+    have h_nil := (leastExposed_eq_none_iff _).mp h_least
+    rw [h_nil] at h_mem
+    exact absurd h_mem (by simp)
+  | some least =>
+    have h_le := leastExposed_le _ least h_least
+    have h_lmem := leastExposed_mem _ least h_least
+    refine ⟨least, rfl, h_le p.allocId h_mem,
+      (ptrToInt_intToPtr_roundtrip pw dst p exposed h_int h_off h_fit).1, ?_, ?_⟩
+    · rw [evalIntToPtrDeterministic_eq_ok pw true _ _ h_off]
+      show (match leastExposed (exposeProv p.allocId exposed) with
+            | some allocId =>
+              CastOutcome.ok (.ptr { allocId := allocId, offsetBytes := p.offsetBytes } (some allocId))
+                (exposeProv p.allocId exposed)
+            | none =>
+              CastOutcome.ok (.ptr { allocId := 0, offsetBytes := p.offsetBytes } none)
+                (exposeProv p.allocId exposed)) = _
+      rw [h_least]
+    · constructor
+      · intro h_eq b hb
+        rw [← h_eq]
+        exact h_le b (isExposed_of_isExposed p.allocId b exposed hb)
+      · intro h_min
+        rcases (mem_exposeProv_iff p.allocId least exposed).mp h_lmem with h_l | h_l
+        · exact h_l
+        · exact Nat.le_antisymm (h_le p.allocId h_mem) (h_min least h_l)
+
+/-- Regression vectors for Episode 1's `BTreeSet::first` prediction (`rvalue.rs:2196-2206`):
+after exposing allocation `3` and then `5`, `IntToPtr` predicts the least provenance `3` (a
+`head?`-based selector would wrongly pick the most recent `5`); and after exposing `1`, a
+`PtrToInt -> IntToPtr` round trip of a pointer into allocation `7` reconstructs the address with
+provenance `1`, not `7`, exactly as Episode 1's evaluator does. -/
+theorem episode1_intToPtr_least_exposed_vectors :
+    exposeProv 5 (exposeProv 3 []) = [5, 3] ∧
+    evalIntToPtrDeterministic .bits64 true 0x40 (exposeProv 5 (exposeProv 3 [])) =
+      .ok (.ptr { allocId := 3, offsetBytes := 0x40 } (some 3)) [5, 3] ∧
+    evalPtrToIntExpose .bits64 .usize { allocId := 7, offsetBytes := 0x40 } [1] =
+      .ok (.scalar 0x40) [7, 1] ∧
+    evalIntToPtrDeterministic .bits64 true 0x40 [7, 1] =
+      .ok (.ptr { allocId := 1, offsetBytes := 0x40 } (some 1)) [7, 1] := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `intToPtrAddress` always yields an in-range pointer address. -/
+theorem intToPtrAddress_lt (pw : PtrWidth) (src : ScalarTy) (bits : Nat) :
+    intToPtrAddress pw src bits < scalarModulus pw.byteSize := by
+  have h_pos : 0 < scalarModulus pw.byteSize := scalarModulus_pos pw.byteSize
+  unfold intToPtrAddress
+  cases src with
+  | uint w => exact Nat.mod_lt _ h_pos
+  | int w =>
+    dsimp only
+    split
+    · exact Nat.mod_lt _ h_pos
+    · exact Nat.mod_lt _ h_pos
+  | bool => exact Nat.mod_lt _ h_pos
+  | char => exact Nat.mod_lt _ h_pos
+  | rawPtr => exact Nat.mod_lt _ h_pos
+  | refPtr => exact Nat.mod_lt _ h_pos
+
+/-- Zero-extension: an in-range unsigned source no wider than a pointer keeps its value. -/
+theorem intToPtrAddress_uint_of_lt (pw : PtrWidth) (w : IntWidth) (bits : Nat)
+    (h_narrow : w.byteSize pw ≤ pw.byteSize)
+    (h_bits : bits < scalarModulus (w.byteSize pw)) :
+    intToPtrAddress pw (.uint w) bits = bits := by
+  have h_bits_pw : bits < scalarModulus pw.byteSize :=
+    Nat.lt_of_lt_of_le h_bits (scalarModulus_mono h_narrow)
+  show (bits % scalarModulus (w.byteSize pw)) % scalarModulus pw.byteSize = bits
+  rw [Nat.mod_eq_of_lt h_bits, Nat.mod_eq_of_lt h_bits_pw]
+
+/-- A non-negative in-range signed source no wider than a pointer keeps its value. -/
+theorem intToPtrAddress_int_of_nonneg (pw : PtrWidth) (w : IntWidth) (bits : Nat)
+    (h_narrow : w.byteSize pw ≤ pw.byteSize)
+    (h_bits : bits < scalarModulus (w.byteSize pw))
+    (h_nonneg : 2 * bits < scalarModulus (w.byteSize pw)) :
+    intToPtrAddress pw (.int w) bits = bits := by
+  have h_bits_pw : bits < scalarModulus pw.byteSize :=
+    Nat.lt_of_lt_of_le h_bits (scalarModulus_mono h_narrow)
+  have h_blt : Nat.blt (2 * bits) (scalarModulus (w.byteSize pw)) = true := Nat.blt_eq.mpr h_nonneg
+  show (match Nat.blt (2 * (bits % scalarModulus (w.byteSize pw))) (scalarModulus (w.byteSize pw)) with
+        | true => (bits % scalarModulus (w.byteSize pw)) % scalarModulus pw.byteSize
+        | false =>
+          (bits % scalarModulus (w.byteSize pw) +
+              scalarModulus pw.byteSize * scalarModulus (w.byteSize pw) -
+            scalarModulus (w.byteSize pw)) % scalarModulus pw.byteSize) = bits
+  rw [Nat.mod_eq_of_lt h_bits, h_blt]
+  exact Nat.mod_eq_of_lt h_bits_pw
+
+/-- **Sign extension**: a negative in-range signed source (`2 * bits ≥ m`) no wider than a
+pointer is sign-extended to the pointer width, i.e. its address is `bits + pw.modulus - m`
+(e.g. `(-1i32) as *const T` is `usize::MAX`, not `0xFFFF_FFFF`). -/
+theorem intToPtrAddress_int_of_neg (pw : PtrWidth) (w : IntWidth) (bits : Nat)
+    (h_narrow : w.byteSize pw ≤ pw.byteSize)
+    (h_bits : bits < scalarModulus (w.byteSize pw))
+    (h_neg : scalarModulus (w.byteSize pw) ≤ 2 * bits) :
+    intToPtrAddress pw (.int w) bits =
+      bits + scalarModulus pw.byteSize - scalarModulus (w.byteSize pw) := by
+  have h_mono : scalarModulus (w.byteSize pw) ≤ scalarModulus pw.byteSize := scalarModulus_mono h_narrow
+  have h_blt : Nat.blt (2 * bits) (scalarModulus (w.byteSize pw)) = false := by
+    cases h : Nat.blt (2 * bits) (scalarModulus (w.byteSize pw)) with
+    | false => rfl
+    | true => exact absurd (Nat.blt_eq.mp h) (by omega)
+  show (match Nat.blt (2 * (bits % scalarModulus (w.byteSize pw))) (scalarModulus (w.byteSize pw)) with
+        | true => (bits % scalarModulus (w.byteSize pw)) % scalarModulus pw.byteSize
+        | false =>
+          (bits % scalarModulus (w.byteSize pw) +
+              scalarModulus pw.byteSize * scalarModulus (w.byteSize pw) -
+            scalarModulus (w.byteSize pw)) % scalarModulus pw.byteSize) = _
+  rw [Nat.mod_eq_of_lt h_bits, h_blt]
+  dsimp only
+  have h_m_pos : 0 < scalarModulus (w.byteSize pw) := scalarModulus_pos _
+  obtain ⟨k, hk⟩ : ∃ k, scalarModulus (w.byteSize pw) = k + 1 :=
+    ⟨scalarModulus (w.byteSize pw) - 1, by omega⟩
+  rw [hk] at h_bits h_mono h_neg ⊢
+  generalize scalarModulus pw.byteSize = M at h_mono ⊢
+  have h_split : bits + M * (k + 1) - (k + 1) = (bits + M - (k + 1)) + M * k := by
+    rw [Nat.mul_succ]
+    generalize M * k = MK
+    omega
+  rw [h_split, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt (by omega)]
+
+/-- For pointer-sized integral sources (`usize`/`isize`, or `u64`/`i64` on 64-bit targets) every
+in-range bit pattern is its own address, including the upper half for signed sources. -/
+theorem intToPtrAddress_ptr_sized (pw : PtrWidth) (src : ScalarTy) (bits : Nat)
+    (h_int : src.isIntegral = true)
+    (h_sz : src.sizeBytes pw = pw.byteSize)
+    (h_bits : bits < scalarModulus pw.byteSize) :
+    intToPtrAddress pw src bits = bits := by
+  cases src with
+  | uint w =>
+    have h_w : w.byteSize pw = pw.byteSize := h_sz
+    exact intToPtrAddress_uint_of_lt pw w bits (Nat.le_of_eq h_w) (h_w ▸ h_bits)
+  | int w =>
+    have h_w : w.byteSize pw = pw.byteSize := h_sz
+    by_cases h_nn : 2 * bits < scalarModulus (w.byteSize pw)
+    · exact intToPtrAddress_int_of_nonneg pw w bits (Nat.le_of_eq h_w) (h_w ▸ h_bits) h_nn
+    · rw [intToPtrAddress_int_of_neg pw w bits (Nat.le_of_eq h_w) (h_w ▸ h_bits) (by omega), h_w]
+      omega
+  | bool => contradiction
+  | char => contradiction
+  | rawPtr => contradiction
+  | refPtr => contradiction
+
+/-- Source-typed `IntToPtr` never faults on integral sources: it yields a pointer at
+`intToPtrAddress pw src bits` with the predicted provenance. -/
+theorem evalIntToPtrTyped_eq_ok
+    (pw : PtrWidth) (src : ScalarTy) (bits : Nat) (pick : Bool) (exposed : ExposedProvenance)
+    (h_int : src.isIntegral = true) :
+    evalIntToPtrTyped pw src bits pick exposed =
+      match pickExposedProv pick exposed with
+      | some allocId =>
+        .ok (.ptr { allocId := allocId, offsetBytes := intToPtrAddress pw src bits }
+          (some allocId)) exposed
+      | none =>
+        .ok (.ptr { allocId := 0, offsetBytes := intToPtrAddress pw src bits } none) exposed := by
+  unfold evalIntToPtrTyped
+  rw [h_int]
+  exact evalIntToPtrDeterministic_eq_ok pw pick _ exposed (intToPtrAddress_lt pw src bits)
+
+/-- Regression vectors for Episode 1's `IntToPtr` address conversion (`rvalue.rs:2190-2194`):
+sign extension of signed sources versus zero extension of unsigned sources, and truncation to
+the target pointer width. -/
+theorem episode1_intToPtr_address_vectors :
+    intToPtrAddress .bits64 .i32 0xFFFFFFFF = 0xFFFFFFFFFFFFFFFF ∧
+    intToPtrAddress .bits64 .u32 0xFFFFFFFF = 0xFFFFFFFF ∧
+    intToPtrAddress .bits64 .i8 0x80 = 0xFFFFFFFFFFFFFF80 ∧
+    intToPtrAddress .bits64 .isize 0xFFFFFFFFFFFFFFFF = 0xFFFFFFFFFFFFFFFF ∧
+    intToPtrAddress .bits32 .i64 0x100000005 = 5 ∧
+    intToPtrAddress .bits32 .i16 0xFFFE = 0xFFFFFFFE ∧
+    evalIntToPtrTyped .bits64 .i32 0xFFFFFFFF false [] =
+      .ok (.ptr { allocId := 0, offsetBytes := 0xFFFFFFFFFFFFFFFF } none) [] ∧
+    evalIntToPtrTyped .bits64 .bool 1 true [] = .unsupported := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Type-safety of `decodeCastVal`: any value decoded by `decodeCastVal pw dst bytes` satisfies
 `CastVal.WellTyped pw dst`. -/
@@ -1939,6 +2288,25 @@ theorem evalPtrToIntExpose_wellTyped
         Nat.mod_lt p.offsetBytes (scalarModulus_pos (dst.sizeBytes pw))
       have h_valid_dst := ScalarTy.isValidBits_of_isIntegral pw dst _ h_int h_mod_lt
       exact ⟨h_nonptr, (ScalarTy.isValidBits_iff_validBits pw dst _).mp h_valid_dst⟩
+
+/-- Type-safety of the source-typed deterministic `IntToPtr` evaluator `evalIntToPtrTyped`. -/
+theorem evalIntToPtrTyped_wellTyped
+    (pw : PtrWidth)
+    (src : ScalarTy)
+    (bits : Nat)
+    (pick : Bool)
+    (exposed exposed' : ExposedProvenance)
+    (val' : CastVal)
+    (h_eval : evalIntToPtrTyped pw src bits pick exposed = .ok val' exposed') :
+    CastVal.WellTyped pw .rawPtr val' := by
+  unfold evalIntToPtrTyped at h_eval
+  cases h_int : src.isIntegral with
+  | false =>
+    rw [h_int] at h_eval
+    contradiction
+  | true =>
+    rw [h_int] at h_eval
+    exact evalIntToPtrExposed_wellTyped pw _ _ exposed exposed' val' h_eval
 
 /-- Transmuting an integer to `ScalarTy.rawPtr` yields a pointer with `Option.none` provenance
 (`allocId = 0`, `offsetBytes = bits`, `prov = none`) without modifying `exposed`. -/
@@ -2305,6 +2673,50 @@ theorem evalTransmuteSameSize_ptr_to_nonPtr_allow_eq
   dsimp only
   rw [decodeCastIntBytes_encodeCastBytes (src.sizeBytes pw) p.offsetBytes prov h_bound]
   cases dst.isValidBits pw p.offsetBytes <;> rfl
+
+/-- **Episode 1 evaluator pipeline** (`eval_lowered_cast`: `LoweredCast::PtrToInt` followed by
+`LoweredCast::IntToPtr` with `pick_exposed_provenance = true`) for any pointer or reference source
+and any pointer-sized integral intermediate (`usize`/`isize`, `u64`/`i64` on 64-bit targets):
+`PtrToInt` returns the address and exposes `p.allocId`; `IntToPtr` (sign-extension included)
+recovers the address exactly and predicts the **least** exposed provenance, which is `p.allocId`
+iff no smaller allocation had been exposed. -/
+theorem ptrToIntTyped_intToPtrTyped_pipeline
+    (pw : PtrWidth)
+    (src dst : ScalarTy)
+    (p : ProvenancePtr)
+    (exposed : ExposedProvenance)
+    (h_src : src.isPtr = true)
+    (h_int : dst.isIntegral = true)
+    (h_sz : dst.sizeBytes pw = pw.byteSize)
+    (h_valid : src.validBits pw p.offsetBytes) :
+    ∃ least,
+      leastExposed (exposeProv p.allocId exposed) = some least ∧
+      evalPtrToIntExposeTyped pw src dst p exposed =
+        .ok (.scalar p.offsetBytes) (exposeProv p.allocId exposed) ∧
+      evalIntToPtrTyped pw dst p.offsetBytes true (exposeProv p.allocId exposed) =
+        .ok (.ptr { allocId := least, offsetBytes := p.offsetBytes } (some least))
+          (exposeProv p.allocId exposed) ∧
+      (least = p.allocId ↔ ∀ b ∈ exposed, p.allocId ≤ b) := by
+  have h_off : p.offsetBytes < scalarModulus pw.byteSize := by
+    have hb := h_valid.1
+    rw [ScalarTy.sizeBytes_of_isPtr pw src h_src] at hb
+    exact hb
+  have h_fit : p.offsetBytes < scalarModulus (dst.sizeBytes pw) := by
+    rw [h_sz]
+    exact h_off
+  obtain ⟨least, h_least, _, _, h_det, h_iff⟩ :=
+    ptrToInt_intToPtrDeterministic_picks_least_exposed pw dst p exposed h_int h_off h_fit
+  have h_sv : src.isValidBits pw p.offsetBytes = true :=
+    (ScalarTy.isValidBits_iff_validBits pw src p.offsetBytes).mpr h_valid
+  refine ⟨least, h_least, ?_, ?_, h_iff⟩
+  · unfold evalPtrToIntExposeTyped
+    rw [h_src, h_int, h_sv, Nat.mod_eq_of_lt h_fit]
+    rfl
+  · unfold evalIntToPtrTyped
+    rw [h_int]
+    dsimp only
+    rw [intToPtrAddress_ptr_sized pw dst p.offsetBytes h_int h_sz h_off]
+    exact h_det
 
 /-- Transmute round trip through an integer loses provenance (UCG `#286`): the default policy
 rejects `rawPtr -> uint w`; under the opt-in policy, `rawPtr -> uint w -> rawPtr` (pointer-sized
@@ -4467,5 +4879,110 @@ theorem trusted_transmute_eq_subtype_cast
     (layouts : LayoutTable) :
     evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts =
       evalRvalue locals (.cast .subtype op dstTy) mem localDecls layouts := rfl
+
+
+/-- **Size-mismatch refinement theorem.** For every pair of scalar descriptors (pointers with
+thin pointees included) whose 64-bit sizes differ — e.g. `bool`/`char`/`u32` vs. any thin
+pointer, or `u8` vs. `u16` — both Anneal's `evalTransmuteSameSize` and
+`Trusted.MirSemantics.evalByteCast` reject the transmute with `.unsupported`, for *every*
+operand value and policy. Together with the scalar, thin-pointer, `Int -> Ptr`, and `Ptr -> Int`
+refinement theorems this covers every descriptor pair, leaving only provenance-free pointer
+*sources* (which `Trusted.Value` cannot represent) and the documented divergences. -/
+theorem trusted_evalByteCast_size_mismatch_transmute_correspondence
+    (policy : TransmutePolicy)
+    (src dst : ScalarTy)
+    (m1 m2 : Mutability)
+    (pt1 pt2 : RigidTy)
+    (val : CastVal)
+    (v : Value)
+    (exposed : ExposedProvenance)
+    (locals locals' : List LocalSlot)
+    (op : Operand)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcLIdx dstLIdx : Nat)
+    (h_thin1 : isThinPointee pt1 = true)
+    (h_thin2 : isThinPointee pt2 = true)
+    (h_ne : src.sizeBytes .bits64 ≠ dst.sizeBytes .bits64)
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok v locals')
+    (h_ty : operandTy localDecls layouts op =
+      .some { kind := src.toTrustedRigidTy m1 pt1, layoutIdx := srcLIdx }) :
+    evalByteCast locals op { kind := dst.toTrustedRigidTy m2 pt2, layoutIdx := dstLIdx }
+        mem localDecls layouts = .unsupported ∧
+    evalTransmuteSameSize .bits64 policy src dst val exposed = .unsupported ∧
+    evalByteCast locals op { kind := dst.toTrustedRigidTy m2 pt2, layoutIdx := dstLIdx }
+        mem localDecls layouts =
+      CastOutcome.toTrustedResult .bits64 dst locals' mem
+        (evalTransmuteSameSize .bits64 policy src dst val exposed) := by
+  have h_trusted := trusted_evalByteCast_size_mismatch locals locals' op mem localDecls layouts v
+    _ _ _ _ h_op (ScalarTy.rigidTyByteSize_toTrustedRigidTy layouts m2 pt2 dst dstLIdx h_thin2) h_ty
+    (ScalarTy.rigidTyByteSize_toTrustedRigidTy layouts m1 pt1 src srcLIdx h_thin1) h_ne
+  have h_anneal := transmute_size_mismatch_unsupported .bits64 policy src dst val exposed h_ne
+  refine ⟨h_trusted, h_anneal, ?_⟩
+  rw [h_trusted, h_anneal]
+  rfl
+
+/-- **Divergence (provenance forging by a foreign first byte).** `Trusted`'s byte-provenance
+merge (`mergeByteProvenance`) keeps the provenance of the *first* byte that carries one, so
+overwriting byte `0` of a stored pointer to `p.allocId` with a byte carrying another pointer's
+provenance `(q.allocId, q.tag)` makes `Trusted.decodeValueFromBytes` produce a pointer **into
+`q.allocId`** whose address is built mostly from `p`'s bytes. Anneal's MiniRust-faithful
+`decodeCastVal` (`decodeCastPtrProv_eq_some_iff`) instead strips provenance entirely. -/
+theorem trusted_vs_anneal_foreign_first_byte_provenance_forging
+    (fuel : Nat)
+    (layouts : LayoutTable)
+    (m : Mutability)
+    (pt : RigidTy)
+    (lIdx : Nat)
+    (p q : ProvenancePtr)
+    (d : UInt8)
+    (h_thin : isThinPointee pt = true)
+    (h_off : p.offsetBytes < scalarModulus 8)
+    (h_ne : q.allocId ≠ p.allocId) :
+    let trustedForged :=
+      (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))).set 0
+        (.init d (some (q.allocId, q.tag)))
+    let annealForged :=
+      (encodeCastBytes p.offsetBytes 8 (some p.allocId)).set 0
+        { data := d, prov := some { allocId := q.allocId, position := 0 } }
+    decodeValueFromBytes (fuel + 1) layouts { kind := .rawPtr m pt, layoutIdx := lIdx }
+        trustedForged =
+      .some (.ptr { allocId := q.allocId,
+                    offsetBytes := d.toBitVec.toNat + 256 * (p.offsetBytes / 256) } 8) ∧
+    decodeCastVal .bits64 .rawPtr annealForged =
+      some (.ptr { allocId := 0, offsetBytes := decodeCastIntBytes annealForged } none) := by
+  intro trustedForged annealForged
+  refine ⟨?_, decodeCastVal_rawPtr_foreign_overwrite_strips_provenance .bits64 p q.allocId 0 0 d
+    (by decide) h_ne⟩
+  have h_eq : trustedForged =
+      .init d (some (q.allocId, q.tag)) ::
+        encodeLittleEndianBytes (Nat.div p.offsetBytes 256) 7 (some (p.allocId, p.tag)) := rfl
+  have h_tail_bound : Nat.div p.offsetBytes 256 < scalarModulus (6 + 1) := by
+    change p.offsetBytes < 256 * scalarModulus 7 at h_off
+    show p.offsetBytes / 256 < scalarModulus 7
+    omega
+  have h_tail := trusted_decodeLittleEndianBytes_encodeLittleEndianBytes 6 (Nat.div p.offsetBytes 256)
+    (some (p.allocId, p.tag)) h_tail_bound
+  have h_len : Trusted.Sequence.length trustedForged = 8 := by
+    rw [h_eq]
+    change Nat.succ (Trusted.Sequence.length
+      (encodeLittleEndianBytes (Nat.div p.offsetBytes 256) 7 (some (p.allocId, p.tag)))) = 8
+    rw [trusted_length_encodeLittleEndianBytes]
+  have h_dle : decodeLittleEndianBytes trustedForged =
+      .some (d.toBitVec.toNat + 256 * (p.offsetBytes / 256), some (q.allocId, q.tag)) := by
+    rw [h_eq, trusted_decodeLittleEndianBytes_init_cons, h_tail]
+    rfl
+  have h_dsc : decodeScalarBytes trustedForged false =
+      .some (⟨d.toBitVec.toNat + 256 * (p.offsetBytes / 256), 8⟩, some (q.allocId, q.tag)) := by
+    unfold decodeScalarBytes
+    rw [h_len, h_dle]
+  have h_beq8 : Nat.beq (Trusted.Sequence.length trustedForged) 8 = true := by
+    rw [h_len]
+    rfl
+  rw [trusted_decodeValueFromBytes_thin_rawPtr_eq fuel layouts m pt lIdx trustedForged h_thin, h_beq8]
+  dsimp only
+  rw [h_dsc]
 
 end Anneal.Mir.Cast
