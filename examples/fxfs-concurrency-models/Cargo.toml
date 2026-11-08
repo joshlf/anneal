@@ -8,3 +8,10 @@ publish = false
 
 [dependencies]
 anneal-spec = { path = "../../crates/anneal-spec" }
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
