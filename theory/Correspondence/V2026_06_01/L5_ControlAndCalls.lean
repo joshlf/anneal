@@ -78,10 +78,15 @@ theorem mir_evalStmt_nop_coverage_constEvalCounter
   exact ⟨rfl, rfl, rfl, rfl⟩
 
 /-- Universal characterization of `StatementKind.placeMention`
-(`Statements.lean:783-787` vs. `spec/lang/step/statements.md`): mentioning an
-out-of-bounds or `.dead` local faults with `MirStepNode.fail .ub`, whereas
-mentioning a live (`.uninit` or `.init`) local advances the statement program
-counter without mutating locals or memory. -/
+(`Statements.lean` vs. `spec/lang/step/statements.md`): mentioning an
+out-of-bounds or `.dead` local faults with `MirStepNode.fail .ub`; mentioning a
+live (`.uninit` or `.init`) local advances the statement program counter without
+mutating locals or memory exactly when every operand read while computing the
+place is initialized, i.e. a dereferenced root local holds a value and every
+`Index` local holds an initialized scalar (`placeMentionOperandsInit`), and
+faults with `MirStepNode.fail .ub` otherwise. In particular, a bare mention of
+an uninitialized local (`place.projection = []`) steps, whereas dereferencing an
+uninitialized root local or indexing by an uninitialized local faults. -/
 theorem mir_evalStmt_placeMention_dead_is_ub
     (s : MachineState) (place : Place) (span : String) :
     (get? s.frame.locals place.local_ = .none →
@@ -89,37 +94,79 @@ theorem mir_evalStmt_placeMention_dead_is_ub
     (get? s.frame.locals place.local_ = .some .dead →
       evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals place.local_ = .some .uninit →
+      projectionHasDeref place.projection = false →
+      placeIndexLocalsInit s.frame.locals place.projection = true →
       evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) ∧
     (∀ v : Value, get? s.frame.locals place.local_ = .some (.init v) →
-      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) := by
-  refine ⟨?_, ?_, ?_, ?_⟩
+      placeIndexLocalsInit s.frame.locals place.projection = true →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+    (get? s.frame.locals place.local_ = .some .uninit →
+      place.projection = .nil →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+    (get? s.frame.locals place.local_ = .some .uninit →
+      projectionHasDeref place.projection = true →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.fail .ub) ∧
+    (∀ slot : LocalSlot, get? s.frame.locals place.local_ = .some slot →
+      placeIndexLocalsInit s.frame.locals place.projection = false →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro h; simp [evalStmt, h]
   · intro h; simp [evalStmt, h]
-  · intro h; simp [evalStmt, h]
-  · intro v h; simp [evalStmt, h]
+  · intro h hDeref hIdx
+    simp [evalStmt, placeMentionOperandsInit, h, hDeref, hIdx]
+  · intro v h hIdx
+    cases hDeref : projectionHasDeref place.projection <;>
+      simp [evalStmt, placeMentionOperandsInit, h, hDeref, hIdx]
+  · intro h hNil
+    simp [evalStmt, h, hNil]
+  · intro h hDeref
+    simp [evalStmt, placeMentionOperandsInit, h, hDeref]
+  · intro slot h hIdx
+    cases slot <;> cases hDeref : projectionHasDeref place.projection <;>
+      simp [evalStmt, placeMentionOperandsInit, h, hDeref, hIdx]
 
 /-- Universal characterization of `StatementKind.storageLive`,
 `StatementKind.storageDead`, and protected-tag write conflict checking in
-`evalStmt` (`Statements.lean:821-941`):
-1. `.storageLive loc` transitions an in-bounds slot to `.uninit` (or faults with
-   `.ub` if `loc` is out of bounds);
-2. `.storageDead loc` transitions an in-bounds slot to `.dead` (or faults with
-   `.ub` if `loc` is out of bounds); and
-3. Writing to a root local when `hasProtectedWriteConflict` is `true` faults
+`evalStmt` (`Statements.lean`):
+1. `.storageLive loc` transitions an in-bounds slot to `.uninit` and purges
+   every borrow-table entry minted from `loc` (`purgeLocalBorrows`), or faults
+   with `.ub` if `loc` is out of bounds;
+2. `.storageDead loc` transitions an in-bounds slot to `.dead` and purges every
+   borrow-table entry minted from `loc` unless an entry targeting `loc` is still
+   protected by an active function-entry protector
+   (`hasProtectedLocalBorrow`), in which case it faults with `.ub`, or faults
+   with `.ub` if `loc` is out of bounds;
+3. Purging leaves no entry targeting `loc` behind (so no stale tag can reach a
+   revived `loc`) and is the identity when no entry targets `loc`; and
+4. Writing to a root local when `hasProtectedWriteConflict` is `true` faults
    immediately with `MirStepNode.fail .ub`. -/
 theorem mir_evalStmt_storageLive_and_storageDead
     (s : MachineState) (loc : Local) (slot : LocalSlot)
     (localsUninit localsDead : List LocalSlot) (span : String) :
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .uninit = .some localsUninit →
-      evalStmt s ⟨.storageLive loc, span⟩ = MirStepNode.step (advanceStmt s localsUninit)) ∧
+      evalStmt s ⟨.storageLive loc, span⟩ =
+        MirStepNode.step
+          (advanceStmt s localsUninit
+            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })) ∧
     (get? s.frame.locals loc = .none →
       evalStmt s ⟨.storageLive loc, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .dead = .some localsDead →
-      evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.step (advanceStmt s localsDead)) ∧
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      evalStmt s ⟨.storageDead loc, span⟩ =
+        MirStepNode.step
+          (advanceStmt s localsDead
+            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })) ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .none →
       evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.fail .ub) ∧
+    borrowsTargetLocal (purgeLocalBorrows s.memory.borrows loc) loc = false ∧
+    (borrowsTargetLocal s.memory.borrows loc = false →
+      purgeLocalBorrows s.memory.borrows loc = s.memory.borrows) ∧
     (∀ (rv : Rvalue) (val : Value) (locals₁ locals₂ : List LocalSlot) (mem₁ : Memory)
        (protHead : Nat) (protTail : List Nat),
       evalRvalue s.frame.locals rv s.memory = .ok val locals₁ mem₁ →
@@ -128,11 +175,26 @@ theorem mir_evalStmt_storageLive_and_storageDead
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none .nil = true →
       evalStmt s ⟨.assign ⟨loc, .nil⟩ rv, span⟩ = MirStepNode.fail .ub) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro hGet hSet; simp [evalStmt, hGet, hSet]
   · intro hGet; simp [evalStmt, hGet]
-  · intro hGet hSet; simp [evalStmt, hGet, hSet]
+  · intro hGet hSet hP
+    cases hAP : s.memory.activeProtectors with
+    | nil => simp [evalStmt, hGet, hSet, hAP]
+    | cons p ps =>
+      rw [hAP] at hP
+      simp [evalStmt, hGet, hSet, hAP, hP]
+  · intro hGet hSet hP
+    cases hAP : s.memory.activeProtectors with
+    | nil =>
+      rw [hAP, hasProtectedLocalBorrow_nil_protectors] at hP
+      nomatch hP
+    | cons p ps =>
+      rw [hAP] at hP
+      simp [evalStmt, hGet, hSet, hAP, hP]
   · intro hGet; simp [evalStmt, hGet]
+  · exact borrowsTargetLocal_purgeLocalBorrows s.memory.borrows loc
+  · exact purgeLocalBorrows_eq_self_of_borrowsTargetLocal_eq_false s.memory.borrows loc
   · intro rv val locals₁ locals₂ mem₁ protHead protTail hEval hGet hSet hProt hConflict
     simp [evalStmt, hEval, hGet, hSet, hProt, hConflict]
 
@@ -4259,5 +4321,261 @@ theorem confirm_copy_nonoverlapping_union_ub_and_edge_cases :
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end DiffCUnionCopyConfirmation
+
+/-! ## 6. Statement-Level Divergence Regressions (`D2`, `D14a-storage`, `D9`)
+
+Kernel-checked executions of `Runtime(PostCleanup)` MIR bodies exercising the
+`StorageDead`/`StorageLive` borrow purge, the `StorageDead` protector check,
+and the `PlaceMention` operand-initialization checks in `evalStmt`. -/
+
+section StatementDivergenceRegressions
+
+open Trusted.Effect
+
+/-- `u64` local type used by the statement divergence regression bodies. -/
+private def stmtDivU64Ty : Ty := { kind := .uint .u64, layoutIdx := 0 }
+
+/-- `usize` local type used by the statement divergence regression bodies. -/
+private def stmtDivUsizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+
+/-- `[u64; 2]` local type used by the `Index` regression body. -/
+private def stmtDivArrTy : Ty := { kind := .array (.uint .u64) 2, layoutIdx := 0 }
+
+/-- `*mut u64` local type used by the statement divergence regression bodies. -/
+private def stmtDivRawMutU64Ty : Ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }
+
+/-- `&u64` local type used by the dangling-reborrow regression body. -/
+private def stmtDivRefU64Ty : Ty := { kind := .ref .not (.uint .u64), layoutIdx := 0 }
+
+/-- `u64` constant operand. -/
+private def stmtDivConstU64 (n : Nat) : Operand :=
+  .constant ⟨stmtDivU64Ty, .scalar (.int ⟨n, 8⟩)⟩
+
+/-- `usize` constant operand. -/
+private def stmtDivConstUsize (n : Nat) : Operand :=
+  .constant ⟨stmtDivUsizeTy, .scalar (.int ⟨n, 8⟩)⟩
+
+/-- Mutable local declaration of type `ty`. -/
+private def stmtDivDecl (ty : Ty) : LocalDecl :=
+  { mutability := .mut, ty := ty, debugName := .none }
+
+/-- `extern "Rust"` ABI returning a `u64` directly. -/
+private def stmtDivFnAbiU64 : FnAbi :=
+  { args := [],
+    ret := {
+      layout := {
+        size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr :=
+          .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false
+      },
+      mode := .direct
+    },
+    conv := .rust, canUnwind := true }
+
+/-- Single-block `Runtime(PostCleanup)` body with locals `decls` and
+statements `stmts` that returns `_0`. -/
+private def stmtDivBody (name : String) (decls : List LocalDecl)
+    (stmts : List Statement) : CapturedMir :=
+  { defPath := name,
+    phase := .runtimePostCleanup,
+    role := .subject,
+    argCount := 0,
+    localDecls := decls,
+    basicBlocks := [
+      { statements := stmts,
+        terminator := { kind := .return_, span := "return" },
+        isCleanup := false }],
+    fnAbi := stmtDivFnAbiU64,
+    layouts := emptyLayoutTable,
+    allocations := [] }
+
+/-- `D2` (`wit_lm3_1_anneal_storage_revive_divergence`): write and read through a
+raw pointer after its pointee's storage has ended and restarted:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 42_u64; _2 = &raw mut _1;
+StorageDead(_1); StorageLive(_1); *_2 = const 7_u64; _0 = copy *_2; return
+``` -/
+private def stmtDivReviveBody : CapturedMir :=
+  stmtDivBody "stmt_div::write_through_pointer_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 42)), span := "_1 = 42" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨2, [.deref]⟩ (.use (stmtDivConstU64 7)), span := "*_2 = 7" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- `D2` regression: the write through the stale pointer `_2` into the revived
+local `_1` faults with `FailureKind.ub` (Anneal previously returned `7`). -/
+theorem stmt_div_storage_revive_write_is_ub :
+    diffCProbeBounded 16 stmtDivReviveBody
+      (.running (initMachineState stmtDivReviveBody [])) =
+      .some (.some .ub, "*_2 = 7", .none) := by
+  rfl
+
+/-- Positive control for `D2`: a pointer freshly minted after `StorageLive(_1)`
+revives `_1` still reads and writes the new storage:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 42_u64; _2 = &raw mut _1;
+StorageDead(_1); StorageLive(_1); _1 = const 9_u64; _2 = &raw mut _1;
+*_2 = const 7_u64; _0 = copy *_2; return
+``` -/
+private def stmtDivReviveFreshBody : CapturedMir :=
+  stmtDivBody "stmt_div::write_through_fresh_pointer_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 42)), span := "_1 = 42" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 9)), span := "_1 = 9" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1 (fresh)" },
+      { kind := .assign ⟨2, [.deref]⟩ (.use (stmtDivConstU64 7)), span := "*_2 = 7" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- Positive control for `D2`: the fresh pointer returns `7`. -/
+theorem stmt_div_storage_revive_fresh_pointer_ok :
+    diffCProbeBounded 16 stmtDivReviveFreshBody
+      (.running (initMachineState stmtDivReviveFreshBody [])) =
+      .some (.none, "none", .some (.scalar ⟨7, 8⟩)) := by
+  rfl
+
+/-- `D14a-storage` (`evalRvalue_reborrow_dangling_divergence`): reborrow a shared
+reference through a raw pointer whose pointee was killed by `StorageDead`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3); _1 = const 42_u64;
+_2 = &raw mut _1; StorageDead(_1); _3 = &*_2; _0 = const 0_u64; return
+``` -/
+private def stmtDivDanglingReborrowBody : CapturedMir :=
+  stmtDivBody "stmt_div::reborrow_through_dangling_pointer"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty,
+      stmtDivDecl stmtDivRefU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 42)), span := "_1 = 42" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .assign ⟨3, []⟩ (.ref .shared ⟨2, [.deref]⟩), span := "_3 = &*_2" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+/-- `D14a-storage` regression: reborrowing through the dangling pointer faults
+with `FailureKind.ub` instead of minting a dangling reference. -/
+theorem stmt_div_storage_dead_reborrow_is_ub :
+    diffCProbeBounded 16 stmtDivDanglingReborrowBody
+      (.running (initMachineState stmtDivDanglingReborrowBody [])) =
+      .some (.some .ub, "_3 = &*_2", .none) := by
+  rfl
+
+/-- `D9` (`step_placeMention_deref_uninit_divergence`): mention a dereference of
+an uninitialized raw-pointer local:
+```text
+StorageLive(_1); PlaceMention(*_1); _0 = const 0_u64; return
+``` -/
+private def stmtDivPlaceMentionDerefUninitBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_deref_uninit_pointer"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .placeMention ⟨1, [.deref]⟩, span := "PlaceMention(*_1)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+/-- `D9` regression: computing `*_1` loads the uninitialized pointer `_1` and
+faults with `FailureKind.ub`. -/
+theorem stmt_div_placeMention_deref_uninit_is_ub :
+    diffCProbeBounded 8 stmtDivPlaceMentionDerefUninitBody
+      (.running (initMachineState stmtDivPlaceMentionDerefUninitBody [])) =
+      .some (.some .ub, "PlaceMention(*_1)", .none) := by
+  rfl
+
+/-- `D9` index regression body: mention `_1[_2]` with an uninitialized index:
+```text
+StorageLive(_1); StorageLive(_2); _1 = [const 1_u64, const 2_u64];
+PlaceMention(_1[_2]); _0 = const 0_u64; return
+``` -/
+private def stmtDivPlaceMentionIndexUninitBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_index_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy, stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
+        span := "_1 = [1, 2]" },
+      { kind := .placeMention ⟨1, [.index 2]⟩, span := "PlaceMention(_1[_2])" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+/-- `D9` regression: computing `_1[_2]` reads the uninitialized index local `_2`
+and faults with `FailureKind.ub`. -/
+theorem stmt_div_placeMention_index_uninit_is_ub :
+    diffCProbeBounded 8 stmtDivPlaceMentionIndexUninitBody
+      (.running (initMachineState stmtDivPlaceMentionIndexUninitBody [])) =
+      .some (.some .ub, "PlaceMention(_1[_2])", .none) := by
+  rfl
+
+/-- Positive control for `D9`: mentioning an uninitialized local without
+projections (`let _ = x;` on a live local) and mentioning an initialized index
+both remain defined:
+```text
+StorageLive(_1); StorageLive(_2); PlaceMention(_2); _2 = const 1_usize;
+_1 = [const 1_u64, const 2_u64]; PlaceMention(_1[_2]); _0 = const 5_u64; return
+``` -/
+private def stmtDivPlaceMentionOkBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_defined"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy, stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .placeMention ⟨2, []⟩, span := "PlaceMention(_2)" },
+      { kind := .assign ⟨2, []⟩ (.use (stmtDivConstUsize 1)), span := "_2 = 1" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
+        span := "_1 = [1, 2]" },
+      { kind := .placeMention ⟨1, [.index 2]⟩, span := "PlaceMention(_1[_2])" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 5)), span := "_0 = 5" } ]
+
+/-- Positive control for `D9`: the body returns `5`. -/
+theorem stmt_div_placeMention_defined_ok :
+    diffCProbeBounded 16 stmtDivPlaceMentionOkBody
+      (.running (initMachineState stmtDivPlaceMentionOkBody [])) =
+      .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
+  rfl
+
+/-- Machine state at `StorageDead(_1)` in which `_1` is borrowed by a tag
+carrying function-entry protector `protId`, with active protectors `prots`. -/
+private def stmtDivProtectedState (prots : List Nat) : MachineState :=
+  { frame := {
+      blockIdx := 0
+      stmtIdx := 0
+      locals := [.uninit, .init (.scalar ⟨42, 8⟩)]
+    }
+    memory := {
+      emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                    perm := .active, protector := .some 1 }]
+      nextTag := 2
+      activeProtectors := prots
+      nextProtector := 2
+    } }
+
+/-- `D2` protector regression: `StorageDead(_1)` faults with `FailureKind.ub`
+while a tag minted from `_1` is protected by an active function-entry
+protector. -/
+theorem stmt_div_storage_dead_protected_is_ub :
+    evalStmt (stmtDivProtectedState [1]) ⟨.storageDead 1, "dead _1"⟩ =
+      MirStepNode.fail .ub := by
+  rfl
+
+/-- Once the protector is no longer active, `StorageDead(_1)` succeeds and
+purges every tag minted from `_1` from the borrow table. -/
+theorem stmt_div_storage_dead_unprotected_purges :
+    evalStmt (stmtDivProtectedState []) ⟨.storageDead 1, "dead _1"⟩ =
+      MirStepNode.step
+        (advanceStmt (stmtDivProtectedState []) [.uninit, .dead]
+          { (stmtDivProtectedState []).memory with borrows := [] }) := by
+  rfl
+
+end StatementDivergenceRegressions
 
 end Correspondence.V2026_06_01.L5_ControlAndCalls

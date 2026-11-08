@@ -1746,8 +1746,416 @@ def evalCopyNonOverlapping
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
+Test whether any `BorrowEntry` in `borrows` targets stack local `loc`
+(`entry.targetLocal == loc`), i.e. whether a reference or raw pointer minted
+from `loc`'s storage (directly by `Rvalue.ref` / `Rvalue.rawPtr`, or by a
+reborrow through such a pointer, whose entry inherits its parent's
+`targetLocal`) is still tracked in the Tree Borrows tag table.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+> "At any point during the execution of a function, each local is either
+> allocated or unallocated. Except as noted below, all locals except function
+> parameters are initially unallocated. `StorageLive` statements cause memory
+> to be allocated for the local while `StorageDead` statements cause the memory
+> to be freed. ... Using a local in any way (not only reading/writing from it)
+> while it is unallocated is UB."
+-/
+def borrowsTargetLocal : List BorrowEntry → Local → Bool
+  | .nil, _ => false
+  | entry :: rest, loc =>
+    match Nat.beq entry.targetLocal loc with
+    | true => true
+    | false => borrowsTargetLocal rest loc
+
+/--
+Test whether any `BorrowEntry` in `borrows` targeting stack local `loc` carries a
+function-entry lifetime protector (`RetagKind.fnEntry`) that is still active in
+`activeProtectors` (`isBorrowProtected`).
+
+Freeing `loc`'s storage (`StorageDead(loc)`) acts as a write to every byte of
+the local that disables every tag minted from it, so the presence of such a
+protected tag makes the deallocation immediate undefined behavior. This check
+subsumes the whole-local foreign-write conflict check
+`hasProtectedWriteConflict borrows activeProtectors loc .none .nil`: unlike a
+foreign write, which tolerates `.reserved` (and already-`.disabled`) tags,
+deallocation rejects every protected tag regardless of its current permission.
+
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L7-L8>
+
+> "When a reborrow occurs at function entry (i.e. the original reference is
+> passed as an argument), we add a *protector* to the reborrow. When a node is
+> protected, it is UB for this node to become `Disabled`."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+> "`StorageLive`/`StorageDead` act like the heap operations
+> `allocate`/`deallocate`, but for stack-allocated local variables."
+-/
+def hasProtectedLocalBorrow
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc : Local) :
+    Bool :=
+  match borrows with
+  | .nil => false
+  | entry :: rest =>
+    match
+      Bool.and
+        (Nat.beq entry.targetLocal loc)
+        (isBorrowProtected activeProtectors entry)
+    with
+    | true => true
+    | false => hasProtectedLocalBorrow rest activeProtectors loc
+
+/--
+Remove every `BorrowEntry` targeting stack local `loc` from `borrows`.
+
+`StorageDead(loc)` frees `loc`'s storage and `StorageLive(loc)` allocates fresh
+storage for it (implicitly freeing any previous allocation), so every
+provenance tag minted from the previous allocation of `loc` (including
+reborrow descendants, which inherit `targetLocal` from their parent entry)
+becomes dangling. Purging those tags from the borrow table ensures that stale
+references and raw pointers created before `StorageDead(loc)` can never be
+resolved to (or revived into) the storage that a later `StorageLive(loc)`
+allocates: every subsequent access, reborrow, or retag through a purged tag
+finds no stack borrow entry and faults with `MirStepNode.fail .ub` unless it
+resolves to a captured global allocation.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs>
+
+> "If the local is already allocated, calling `StorageLive` again will
+> implicitly free the local and then allocate fresh uninitialized memory. If a
+> local is already deallocated, calling `StorageDead` again is a NOP."
+-/
+def purgeLocalBorrows : List BorrowEntry → Local → List BorrowEntry
+  | .nil, _ => .nil
+  | entry :: rest, loc =>
+    match Nat.beq entry.targetLocal loc with
+    | true => purgeLocalBorrows rest loc
+    | false => entry :: purgeLocalBorrows rest loc
+
+/--
+Definitional simplification equation for `borrowsTargetLocal` on the empty
+borrow table.
+-/
+@[simp]
+theorem borrowsTargetLocal_nil (loc : Local) :
+    borrowsTargetLocal .nil loc = false := rfl
+
+/--
+Definitional simplification equation for `purgeLocalBorrows` on the empty
+borrow table.
+-/
+@[simp]
+theorem purgeLocalBorrows_nil (loc : Local) :
+    purgeLocalBorrows .nil loc = .nil := rfl
+
+/--
+`borrowsTargetLocal borrows loc` is `false` whenever no entry of `borrows`
+targets `loc`.
+-/
+theorem borrowsTargetLocal_eq_false_of_forall_ne
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
+    borrowsTargetLocal borrows loc = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
+    have hBeq : Nat.beq entry.targetLocal loc = false := by
+      cases hB : Nat.beq entry.targetLocal loc with
+      | false => rfl
+      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
+    simp only [borrowsTargetLocal, hBeq]
+    exact ih (fun e he => h e (List.Mem.tail entry he))
+
+/--
+No borrow entry is protected when no function-entry protector is active, so
+`hasProtectedLocalBorrow borrows .nil loc` is always `false`.
+-/
+@[simp]
+theorem hasProtectedLocalBorrow_nil_protectors
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    hasProtectedLocalBorrow borrows .nil loc = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hProt : isBorrowProtected .nil entry = false := by
+      unfold isBorrowProtected
+      cases entry.protector <;> rfl
+    simp only [hasProtectedLocalBorrow, hProt, Bool.and_false]
+    exact ih
+
+/--
+`hasProtectedLocalBorrow` subsumes the whole-local foreign-write protector
+check: whenever a direct write to the whole of `loc` would disable a protected
+tag (`hasProtectedWriteConflict borrows activeProtectors loc .none .nil`), so
+does deallocating `loc`.
+-/
+theorem hasProtectedLocalBorrow_of_hasProtectedWriteConflict
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc : Local)
+    (h : hasProtectedWriteConflict borrows activeProtectors loc .none .nil = true) :
+    hasProtectedLocalBorrow borrows activeProtectors loc = true := by
+  induction borrows with
+  | nil => exact h
+  | cons entry rest ih =>
+    unfold hasProtectedWriteConflict at h
+    unfold hasProtectedLocalBorrow
+    cases hT : Nat.beq entry.targetLocal loc with
+    | false =>
+      simp only [hT, Bool.false_and] at h ⊢
+      exact ih h
+    | true =>
+      cases hP : isBorrowProtected activeProtectors entry with
+      | false =>
+        simp only [hT, hP, Bool.false_and, Bool.and_false] at h ⊢
+        exact ih h
+      | true => rfl
+
+/--
+`purgeLocalBorrows borrows loc` retains no entry targeting `loc`.
+-/
+theorem targetLocal_ne_of_mem_purgeLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    ∀ entry ∈ purgeLocalBorrows borrows loc, entry.targetLocal ≠ loc := by
+  induction borrows with
+  | nil => intro entry hMem; nomatch hMem
+  | cons hd rest ih =>
+    intro entry hMem
+    cases hB : Nat.beq hd.targetLocal loc with
+    | true =>
+      simp only [purgeLocalBorrows, hB] at hMem
+      exact ih entry hMem
+    | false =>
+      simp only [purgeLocalBorrows, hB] at hMem
+      cases hMem with
+      | head => exact Nat.ne_of_beq_eq_false hB
+      | tail _ hMemRest => exact ih entry hMemRest
+
+/--
+After `purgeLocalBorrows borrows loc`, no borrow entry targets `loc`, so no
+stale provenance tag minted from a previous allocation of `loc` can resolve to
+its storage.
+-/
+theorem borrowsTargetLocal_purgeLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    borrowsTargetLocal (purgeLocalBorrows borrows loc) loc = false :=
+  borrowsTargetLocal_eq_false_of_forall_ne _ loc
+    (targetLocal_ne_of_mem_purgeLocalBorrows borrows loc)
+
+/--
+`purgeLocalBorrows borrows loc` leaves `borrows` unchanged when no entry
+targets `loc`.
+-/
+theorem purgeLocalBorrows_eq_self_of_forall_ne
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
+    purgeLocalBorrows borrows loc = borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
+    have hBeq : Nat.beq entry.targetLocal loc = false := by
+      cases hB : Nat.beq entry.targetLocal loc with
+      | false => rfl
+      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
+    simp only [purgeLocalBorrows, hBeq]
+    rw [ih (fun e he => h e (List.Mem.tail entry he))]
+
+/--
+`borrowsTargetLocal borrows loc` holds whenever some entry of `borrows` targets
+`loc`.
+-/
+theorem borrowsTargetLocal_eq_true_of_mem
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (entry : BorrowEntry)
+    (hMem : entry ∈ borrows)
+    (hEq : entry.targetLocal = loc) :
+    borrowsTargetLocal borrows loc = true := by
+  induction borrows with
+  | nil => nomatch hMem
+  | cons hd tl ih =>
+    simp only [borrowsTargetLocal]
+    cases hB : Nat.beq hd.targetLocal loc with
+    | true => rfl
+    | false =>
+      cases hMem with
+      | head => exact absurd hEq (Nat.ne_of_beq_eq_false hB)
+      | tail _ hTl => exact ih hTl
+
+/--
+`purgeLocalBorrows borrows loc` leaves `borrows` unchanged when
+`borrowsTargetLocal borrows loc` is `false`.
+-/
+theorem purgeLocalBorrows_eq_self_of_borrowsTargetLocal_eq_false
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (h : borrowsTargetLocal borrows loc = false) :
+    purgeLocalBorrows borrows loc = borrows :=
+  purgeLocalBorrows_eq_self_of_forall_ne borrows loc
+    (fun entry hMem hEq => by
+      rw [borrowsTargetLocal_eq_true_of_mem borrows loc entry hMem hEq] at h
+      nomatch h)
+
+/--
+`hasProtectedLocalBorrow borrows activeProtectors loc` is `false` when no entry
+targets `loc`.
+-/
+theorem hasProtectedLocalBorrow_eq_false_of_forall_ne
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc : Local)
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
+    hasProtectedLocalBorrow borrows activeProtectors loc = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
+    have hBeq : Nat.beq entry.targetLocal loc = false := by
+      cases hB : Nat.beq entry.targetLocal loc with
+      | false => rfl
+      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
+    simp only [hasProtectedLocalBorrow, hBeq, Bool.false_and]
+    exact ih (fun e he => h e (List.Mem.tail entry he))
+
+/--
+Test whether projection path `proj` contains a `.deref` projection, i.e.
+whether computing the place loads a pointer value out of (a sub-place of) its
+root local. In `Runtime(PostCleanup)` MIR a `Deref` may only appear as the
+first projection of a place, so this coincides with `proj` starting with
+`.deref` on well-formed bodies.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L114-L115>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1166-L1171>
+
+> "Furthermore, `Deref` projections must be the first projection within any
+> place (if they appear at all)"
+>
+> "A `Deref` projection begins by loading a value from the parent place, as if
+> by [`Operand::Copy`]. It then dereferences the resulting pointer, creating a
+> place of the pointee's type. The resulting address is the address that was
+> stored in the pointer."
+-/
+def projectionHasDeref : List ProjectionElem → Bool
+  | .nil => false
+  | .deref :: _ => true
+  | _ :: rest => projectionHasDeref rest
+
+/--
+Test whether every `.index idxLocal` projection in `proj` names a local of
+`locals` holding an initialized scalar (`.init (.scalar _)`), i.e. whether
+every index operand read while computing the place is initialized.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1192-L1279>
+
+> "/// Index into a slice/array.
+> ...
+> Index(V),"
+-/
+def placeIndexLocalsInit (locals : List LocalSlot) : List ProjectionElem → Bool
+  | .nil => true
+  | .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar _)) => placeIndexLocalsInit locals rest
+    | _ => false
+  | _ :: rest => placeIndexLocalsInit locals rest
+
+/--
+Test whether every operand that `StatementKind.placeMention` reads while
+computing a place with live root slot `rootSlot` and projection path `proj` in
+`locals` is initialized:
+
+1. when `proj` dereferences its root (`projectionHasDeref proj`), the root local
+   must hold an initialized value (`.init _`) from which the pointer is loaded;
+2. every `.index idxLocal` projection must name an initialized scalar local
+   (`placeIndexLocalsInit locals proj`).
+
+A bare mention of a live but uninitialized local (`proj = []`, `rootSlot =
+.uninit`) reads nothing and remains defined. The place itself is never loaded,
+so the pointee of a dereferenced pointer may be dangling.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs>
+
+> "This statement exists to preserve a trace of a scrutinee matched against a
+> wildcard binding. This is especially useful for `let _ = PLACE;` bindings that
+> desugar to a single `PlaceMention(PLACE)`.
+>
+> When executed at runtime, this computes the given place, but then discards
+> it without doing a load. `let _ = *ptr;` is fine even if the pointer is
+> dangling."
+-/
+def placeMentionOperandsInit
+    (locals : List LocalSlot)
+    (rootSlot : LocalSlot)
+    (proj : List ProjectionElem) :
+    Bool :=
+  match projectionHasDeref proj, rootSlot with
+  | true, .init _ => placeIndexLocalsInit locals proj
+  | true, _ => false
+  | false, _ => placeIndexLocalsInit locals proj
+
+/--
+Definitional simplification equation for `projectionHasDeref` on the empty
+projection.
+-/
+@[simp]
+theorem projectionHasDeref_nil : projectionHasDeref .nil = false := rfl
+
+/--
+Definitional simplification equation for `placeIndexLocalsInit` on the empty
+projection.
+-/
+@[simp]
+theorem placeIndexLocalsInit_nil (locals : List LocalSlot) :
+    placeIndexLocalsInit locals .nil = true := rfl
+
+/--
+A bare `PlaceMention` of a local (empty projection) reads no operand, so
+`placeMentionOperandsInit` holds for every root slot.
+-/
+@[simp]
+theorem placeMentionOperandsInit_nil (locals : List LocalSlot) (rootSlot : LocalSlot) :
+    placeMentionOperandsInit locals rootSlot .nil = true := by
+  cases rootSlot <;> rfl
+
+/--
 Execute a single MIR `Statement` from state `s` using `localDecls` and `layouts`
 for type- and layout-aware rvalue and intrinsic evaluation.
+
+`StorageDead(loc)` faults with `MirStepNode.fail .ub` when a tag minted from
+`loc` is still protected by an active function-entry protector
+(`hasProtectedLocalBorrow`, only consulted when some protector is active), and
+otherwise purges every tag minted from `loc` (`purgeLocalBorrows`) before
+marking `loc` `.dead`. `StorageLive(loc)` purges any stale tags minted from
+`loc` before marking it `.uninit`. Together these ensure that references and
+raw pointers created before `StorageDead(loc)` can never reach the storage
+allocated by a later `StorageLive(loc)`.
+`PlaceMention(place)` requires every operand read while computing `place` (the
+root pointer of a dereference and every `Index` local) to be initialized
+(`placeMentionOperandsInit`).
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1782,7 +2190,10 @@ def evalStmt
     match get? s.frame.locals place.local_ with
     | .none => MirStepNode.fail .ub
     | .some .dead => MirStepNode.fail .ub
-    | .some _ => MirStepNode.step (advanceStmt s s.frame.locals)
+    | .some rootSlot =>
+      match placeMentionOperandsInit s.frame.locals rootSlot place.projection with
+      | true => MirStepNode.step (advanceStmt s s.frame.locals)
+      | false => MirStepNode.fail .ub
   | .retag retagKind place =>
     match
       evalOperand
@@ -1884,14 +2295,34 @@ def evalStmt
     match get? s.frame.locals loc with
     | .some _ =>
       match set? s.frame.locals loc .uninit with
-      | .some locals' => MirStepNode.step (advanceStmt s locals')
+      | .some locals' =>
+        MirStepNode.step
+          (advanceStmt s locals'
+            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
     match get? s.frame.locals loc with
     | .some _ =>
       match set? s.frame.locals loc .dead with
-      | .some locals' => MirStepNode.step (advanceStmt s locals')
+      | .some locals' =>
+        match s.memory.activeProtectors with
+        | .nil =>
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+        | protHead :: protTail =>
+          match
+            hasProtectedLocalBorrow
+              s.memory.borrows
+              (protHead :: protTail)
+              loc
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.step
+              (advanceStmt s locals'
+                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .deinit p =>

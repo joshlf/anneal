@@ -1759,6 +1759,91 @@ theorem concretizeSymState_initSymState
   dsimp only [concretizeSymState, initSymState, initMachineState, concretizeSymMemory]
   rw [concretizeSymSlots_initSymSlots args body.localDecls body.argCount h_len]
 
+/-- Symbolic counterpart of `placeIndexLocalsInit`: every `.index idxLocal`
+projection in `proj` names a concrete initialized scalar slot of `slots`. -/
+def symPlaceIndexLocalsInit (slots : List SymSlot) : List ProjectionElem → Bool
+  | .nil => true
+  | .index idxLocal :: rest =>
+    match get? slots idxLocal with
+    | .some (.concrete (.init (.scalar _))) => symPlaceIndexLocalsInit slots rest
+    | _ => false
+  | _ :: rest => symPlaceIndexLocalsInit slots rest
+
+/-- Symbolic counterpart of `placeMentionOperandsInit`: a dereferenced root slot
+must be a concrete initialized slot, and every `Index` local must be a concrete
+initialized scalar slot (`symPlaceIndexLocalsInit`). -/
+def symPlaceMentionOk
+    (slots : List SymSlot)
+    (rootSlot : SymSlot)
+    (proj : List ProjectionElem) :
+    Bool :=
+  Bool.and
+    (match projectionHasDeref proj, rootSlot with
+     | true, .concrete (.init _) => true
+     | true, _ => false
+     | false, _ => true)
+    (symPlaceIndexLocalsInit slots proj)
+
+theorem symPlaceIndexLocalsInit_concretize
+    (args : List Value) (slots : List SymSlot) (proj : List ProjectionElem)
+    (h : symPlaceIndexLocalsInit slots proj = true) :
+    placeIndexLocalsInit (concretizeSymSlots args slots) proj = true := by
+  induction proj with
+  | nil => rfl
+  | cons e rest ih =>
+    cases e with
+    | index idxLocal =>
+      simp only [symPlaceIndexLocalsInit] at h
+      simp only [placeIndexLocalsInit, get?_concretizeSymSlots args slots idxLocal]
+      revert h
+      cases get? slots idxLocal with
+      | none => intro h; nomatch h
+      | some sl =>
+        cases sl with
+        | concrete c =>
+          cases c with
+          | init v =>
+            cases v with
+            | scalar sc => intro h; exact ih h
+            | unit => intro h; nomatch h
+            | ptr _ _ => intro h; nomatch h
+            | aggregate _ _ => intro h; nomatch h
+          | uninit => intro h; nomatch h
+          | dead => intro h; nomatch h
+        | symArg _ => intro h; nomatch h
+        | symPair0 _ _ => intro h; nomatch h
+    | deref => exact ih h
+    | field _ _ => exact ih h
+    | constantIndex _ _ _ => exact ih h
+    | subslice _ _ _ => exact ih h
+    | downcast _ _ => exact ih h
+    | opaqueCast _ => exact ih h
+    | unwrapUnsafeBinder _ => exact ih h
+
+theorem placeMentionOperandsInit_concretize_of_symPlaceMentionOk
+    (args : List Value) (slots : List SymSlot) (rootSlot : SymSlot)
+    (proj : List ProjectionElem)
+    (hOk : symPlaceMentionOk slots rootSlot proj = true) :
+    placeMentionOperandsInit (concretizeSymSlots args slots)
+      (concretizeSymSlot args rootSlot) proj = true := by
+  unfold symPlaceMentionOk at hOk
+  rw [Bool.and_eq_true] at hOk
+  obtain ⟨hRootOk, hIdxOk⟩ := hOk
+  have hIdx := symPlaceIndexLocalsInit_concretize args slots proj hIdxOk
+  unfold placeMentionOperandsInit
+  cases hD : projectionHasDeref proj with
+  | false => exact hIdx
+  | true =>
+    rw [hD] at hRootOk
+    cases rootSlot with
+    | concrete c =>
+      cases c with
+      | init v => exact hIdx
+      | uninit => nomatch hRootOk
+      | dead => nomatch hRootOk
+    | symArg _ => nomatch hRootOk
+    | symPair0 _ _ => nomatch hRootOk
+
 /-- Concrete symbolic step for a single `Statement`. -/
 def symStepStmtConcrete
     (localDecls : List LocalDecl)
@@ -1774,19 +1859,34 @@ def symStepStmtConcrete
     match get? st.slots place.local_ with
     | .none => .none
     | .some (.concrete .dead) => .none
-    | .some _ => .some { st with stmtIdx := Nat.add st.stmtIdx 1 }
+    | .some sSlot =>
+      match symPlaceMentionOk st.slots sSlot place.projection with
+      | true => .some { st with stmtIdx := Nat.add st.stmtIdx 1 }
+      | false => .none
   | .storageLive loc =>
     match get? st.slots loc with
     | .some _ =>
       match set? st.slots loc (.concrete .uninit) with
-      | .some slots' => .some { st with stmtIdx := Nat.add st.stmtIdx 1, slots := slots' }
+      | .some slots' =>
+        .some {
+          st with
+          stmtIdx := Nat.add st.stmtIdx 1
+          slots := slots'
+          borrows := purgeLocalBorrows st.borrows loc
+        }
       | .none => .none
     | .none => .none
   | .storageDead loc =>
     match get? st.slots loc with
     | .some _ =>
       match set? st.slots loc (.concrete .dead) with
-      | .some slots' => .some { st with stmtIdx := Nat.add st.stmtIdx 1, slots := slots' }
+      | .some slots' =>
+        .some {
+          st with
+          stmtIdx := Nat.add st.stmtIdx 1
+          slots := slots'
+          borrows := purgeLocalBorrows st.borrows loc
+        }
       | .none => .none
     | .none => .none
   | .assign dst rv =>
@@ -1907,12 +2007,34 @@ theorem symStepStmtConcrete_sound
         nomatch h
       | some sSlot =>
         rw [hGet] at h
-        have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
-        injection hOk with hEq
-        subst hEq
-        dsimp only
-        rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-          (rw [hSlot]; exact Or.inl rfl)
+        have hRes : symSlotIsDead sSlot = false ∧
+            (match symPlaceMentionOk st.slots sSlot place.projection with
+              | true => some { st with stmtIdx := Nat.add st.stmtIdx 1 }
+              | false => none) = some st' := by
+          cases sSlot with
+          | concrete c =>
+            cases c with
+            | dead => nomatch h
+            | uninit => exact ⟨rfl, h⟩
+            | init _ => exact ⟨rfl, h⟩
+          | symArg _ => exact ⟨rfl, h⟩
+          | symPair0 _ _ => exact ⟨rfl, h⟩
+        obtain ⟨hNotDead, hOk⟩ := hRes
+        cases hM : symPlaceMentionOk st.slots sSlot place.projection with
+        | false =>
+          rw [hM] at hOk
+          nomatch hOk
+        | true =>
+          rw [hM] at hOk
+          injection hOk with hEq
+          subst hEq
+          dsimp only
+          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+            (rw [hSlot]
+             dsimp only
+             split
+             · exact Or.inl rfl
+             · exact Or.inr rfl)
     | storageLive loc =>
       dsimp only [symStepStmtConcrete] at h
       dsimp only [evalStmt, concretizeSymState]
@@ -5080,12 +5202,36 @@ theorem symStepStmtConcrete_step_of_inBounds
         nomatch h
       | some sSlot =>
         rw [hGet] at h
-        have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
-        injection hOk with hEq
-        subst hEq
-        dsimp only
-        rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-          (rw [hSlot]; rfl)
+        have hRes : symSlotIsDead sSlot = false ∧
+            (match symPlaceMentionOk st.slots sSlot place.projection with
+              | true => some { st with stmtIdx := Nat.add st.stmtIdx 1 }
+              | false => none) = some st' := by
+          cases sSlot with
+          | concrete c =>
+            cases c with
+            | dead => nomatch h
+            | uninit => exact ⟨rfl, h⟩
+            | init _ => exact ⟨rfl, h⟩
+          | symArg _ => exact ⟨rfl, h⟩
+          | symPair0 _ _ => exact ⟨rfl, h⟩
+        obtain ⟨hNotDead, hOk⟩ := hRes
+        cases hM : symPlaceMentionOk st.slots sSlot place.projection with
+        | false =>
+          rw [hM] at hOk
+          nomatch hOk
+        | true =>
+          rw [hM] at hOk
+          injection hOk with hEq
+          subst hEq
+          have hInit :=
+            placeMentionOperandsInit_concretize_of_symPlaceMentionOk
+              args st.slots sSlot place.projection hM
+          dsimp only
+          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+            (rw [hSlot] at hInit ⊢
+             dsimp only
+             rw [hInit]
+             try rfl)
     | storageLive loc =>
       dsimp only [symStepStmtConcrete] at h
       dsimp only [evalStmt, concretizeSymState]

@@ -2669,14 +2669,34 @@ def evalStmtFast
     match get? s.frame.locals loc with
     | .some _ =>
       match set? s.frame.locals loc .uninit with
-      | .some locals' => MirStepNode.step (advanceStmt s locals')
+      | .some locals' =>
+        MirStepNode.step
+          (advanceStmt s locals'
+            { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
     match get? s.frame.locals loc with
     | .some _ =>
       match set? s.frame.locals loc .dead with
-      | .some locals' => MirStepNode.step (advanceStmt s locals')
+      | .some locals' =>
+        match s.memory.activeProtectors with
+        | .nil =>
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+        | protHead :: protTail =>
+          match
+            hasProtectedLocalBorrow
+              s.memory.borrows
+              (protHead :: protTail)
+              loc
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.step
+              (advanceStmt s locals'
+                { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .nop => MirStepNode.step (advanceStmt s s.frame.locals)
@@ -2721,7 +2741,10 @@ def evalStmtSymTreeFast
       (match get? s.frame.locals loc with
        | .some _ =>
          match set? s.frame.locals loc .uninit with
-         | .some locals' => MirStepNode.step (advanceStmt s locals')
+         | .some locals' =>
+           MirStepNode.step
+             (advanceStmt s locals'
+               { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .storageDead loc =>
@@ -2729,7 +2752,24 @@ def evalStmtSymTreeFast
       (match get? s.frame.locals loc with
        | .some _ =>
          match set? s.frame.locals loc .dead with
-         | .some locals' => MirStepNode.step (advanceStmt s locals')
+         | .some locals' =>
+           match s.memory.activeProtectors with
+           | .nil =>
+             MirStepNode.step
+               (advanceStmt s locals'
+                 { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
+           | protHead :: protTail =>
+             match
+               hasProtectedLocalBorrow
+                 s.memory.borrows
+                 (protHead :: protTail)
+                 loc
+             with
+             | true => MirStepNode.fail .ub
+             | false =>
+               MirStepNode.step
+                 (advanceStmt s locals'
+                   { s.memory with borrows := purgeLocalBorrows s.memory.borrows loc })
          | .none => MirStepNode.fail .ub
        | .none => MirStepNode.fail .ub)
   | .nop => .leaf (MirStepNode.step (advanceStmt s s.frame.locals))
