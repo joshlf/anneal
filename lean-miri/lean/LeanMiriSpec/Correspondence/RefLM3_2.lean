@@ -2694,4 +2694,312 @@ theorem visit_ref_recursive_pointee_simulation
     · exact hv_child.2.2.1 (hci it hk) _ ((hrd_child .integer).trans hrm)
     · exact hv_child.2.2.1 (hcu ut hk) _ ((hrd_child .integer).trans hrm)
 
+/-- **In-bounds misaligned safe-reference `ValidityVisitor.validatePlace`
+simulation (`LM-3.2`)**: in any `StateRelLM3_2` state (`m.stack.frames = #[tf]`),
+when `refIdx` holds a safe reference `_r : &(mut) P` (`IsPrimScalarTy P`)
+pointing at `p.offsetBytes` inside a live stack allocation `e.localIdx`
+(`p.offsetBytes + sizeof(P) ≤ sizeof(allocDecl.ty)`) whose address fails
+`P`'s ABI alignment (`annealOffsetMisalignment ... = .ok (some mis)`),
+`ValidityVisitor.validatePlace` passes `checkPointerAccess` (in bounds),
+`scalarMayBeNull` (non-null), and `opsemInhabited`, and rejects the reference at
+`checkPointerAlignResult` with `classifyPointerAlignmentError`. -/
+theorem validatePlace_ref_misaligned_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {refIdx : Nat} (hlt : refIdx < tf.locals.size)
+    {pointeeTy : Ty} (hprim : IsPrimScalarTy pointeeTy)
+    {refTy : Ty} {refMut : Mutability}
+    (hrefTy : refTy.kind = .ref refMut pointeeTy.kind)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv} {e : AllocMapEntry}
+    (hptr : PtrRel allocMap p mptr) (he : e ∈ allocMap) (htag : e.tag = p.tag)
+    {allocDecl : LocalDecl} (hdecl_a : get? body.localDecls e.localIdx = some allocDecl)
+    {slot : LocalSlot} (hslot : get? s.frame.locals e.localIdx = some slot)
+    (hlive_slot : slot ≠ .dead)
+    (hinbounds : p.offsetBytes + (translateTy pointeeTy body.layouts).layout.size.bytes.toNat ≤
+      (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat)
+    {mis : Miri.Memory.Misalignment}
+    (hmis_err : annealOffsetMisalignment
+      (Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat p.offsetBytes))
+      (translateTy pointeeTy body.layouts).layout.align.abi = .ok (some mis))
+    (hval : (tf.locals[refIdx]'hlt).value =
+      .live (.immediate (.scalar (.fromPointer annealTargetDataLayout mptr))))
+    (fuel : Nat) :
+    let mutBool : Bool := match refMut with | .mut => true | .not => false
+    Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks body.layouts) refTy
+      (fuel + 1) ⟨.local 0 refIdx none tf.localsIdentity, translateTy refTy body.layouts⟩
+      false false m =
+      .error (Miri.Interpreter.ValidityVisitor.classifyPointerAlignmentError
+        ⟨"", #[]⟩ (.reference mutBool) mis) m := by
+  intro mutBool
+  let place : Miri.Interpreter.RuntimePlace AnnealProv :=
+    ⟨.local 0 refIdx none tf.localsIdentity, translateTy refTy body.layouts⟩
+  let initSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+    { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+      refTracking := none, dataBytes := none }
+  have hcl : (annealValidityHooks body.layouts).classify refTy
+      (translateTy refTy body.layouts).ty m = .ok (.reference mutBool) m := by
+    cases refMut <;> (simp only [annealValidityHooks, annealValidityClassify, translateTy,
+      encodeTyId, hrefTy, mutBool]; rfl)
+  have hvr := visit_reference_cases (annealValidityHooks body.layouts) refTy fuel initSession
+    place m mutBool hcl rfl rfl rfl
+  have hvp := validatePlace_annealValidityHooks_nonrecursive_eq body.layouts refTy (fuel + 1) place m
+  have hptLay : annealValidityPointeeLayout body.layouts refTy =
+      some (translateTy pointeeTy body.layouts) := by
+    have hexact : derefPointeeKindHasExactLayout pointeeTy.kind = true := by
+      rcases hprim with h | h | ⟨_, h⟩ | ⟨_, h⟩ <;> rw [h] <;> rfl
+    unfold annealValidityPointeeLayout
+    rw [hrefTy]
+    dsimp only []
+    rw [hexact]
+    simp only [↓reduceIte, Option.some.injEq]
+    exact hprim.translateTy_layoutIdx body.layouts
+  obtain ⟨hsized, _, _⟩ := hprim.layout_ok (layouts := body.layouts)
+  obtain ⟨hsize, hpos, hfit, _, _, _⟩ := hprim.size_align_ok body.layouts
+  have hpos_nat : 0 < (translateTy pointeeTy body.layouts).layout.size.bytes.toNat := by
+    exact_mod_cast hpos
+  obtain ⟨tf₀, hframes₀, _, _, _, _, _, _, _, _, halloc, _⟩ := id hstate
+  rw [hframes] at hframes₀; injection hframes₀ with h0; injection h0 with htf; subst htf
+  obtain ⟨borTag, hmptr, hoff_lt⟩ := PtrRel.allocId_of_entry halloc hptr he htag
+  obtain ⟨hid, _, hbase⟩ := halloc.base_addr_valid e he
+  have hrd := annealValidityHooks_readImmediate_local body.layouts refTy hframes hlt hval
+    (translateTy refTy body.layouts) .reference
+  have hm : mptr.withOptionalProvenance =
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat p.offsetBytes),
+        some (.concrete e.allocId borTag)⟩ := by
+    rw [hmptr]; rfl
+  have hmis_ptr : annealOffsetMisalignment mptr.withOptionalProvenance.offset
+      (translateTy pointeeTy body.layouts).layout.align.abi = .ok (some mis) := by
+    rw [hm]; exact hmis_err
+  let ptPlace : Miri.Interpreter.MPlaceTy AnnealProv :=
+    ⟨⟨mptr.withOptionalProvenance, .none, some mis⟩, translateTy pointeeTy body.layouts⟩
+  have hptr_p : (annealValidityHooks body.layouts).ptrToPlace refTy
+      ⟨.scalar (.fromPointer annealTargetDataLayout mptr), translateTy refTy body.layouts⟩ m =
+      .ok ptPlace m := by
+    show (do _ : EStateM _ _ _) m = .ok ptPlace m
+    simp only [annealValidityHooks, hptLay, Miri.Interpreter.Immediate.toScalar,
+      scalar_fromPointer_toPointer_eq, hmis_ptr, bind, EStateM.bind, pure, EStateM.pure]
+    rfl
+  have hdyn : (annealValidityHooks body.layouts).sizeAndAlign refTy ptPlace m =
+      .ok (some (ptPlace.layout.layout.size, ptPlace.layout.layout.align.abi)) m := by
+    simp only [annealValidityHooks, ptPlace, hsized, ↓reduceIte]; rfl
+  obtain ⟨hlive_e, _⟩ := halloc.local_alloc_sync tf hframes e he
+  obtain ⟨_, _, hshape⟩ := hlive_e slot hslot hlive_slot
+  obtain ⟨la, hfind, _, _, hsh⟩ := hshape allocDecl hdecl_a
+  have hin : p.offsetBytes + (translateTy pointeeTy body.layouts).layout.size.bytes.toNat ≤
+      la.allocation.byteSize.bytes.toNat := by
+    rw [hsh.byteSize_eq]; exact hinbounds
+  have hacc_ok := (annealValidityAccessCheck_stack m.machine e.allocId borTag p.offsetBytes
+    (translateTy pointeeTy body.layouts).layout.size hid hoff_lt hbase hsize hpos_nat hfit).1
+    la hfind hin
+  have hacc : (annealValidityHooks body.layouts).checkPointerAccess refTy ptPlace.mplace.ptr
+      ptPlace.layout.layout.size m = .ok (.ok ()) m := by
+    simp only [ptPlace]; rw [hm, annealValidityHooks_checkPointerAccess_eq, hacc_ok]
+  have hsc_m : Miri.Memory.Scalar.fromMaybePointer (annealValidityHooks body.layouts).target.base
+      ptPlace.mplace.ptr = .ok (.fromPointer annealTargetDataLayout mptr) := by
+    simp only [ptPlace, hmptr, Miri.Memory.Pointer.withOptionalProvenance,
+      Miri.Memory.Scalar.fromMaybePointer, annealValidityHooks, annealRuntimeDataLayout]
+    rfl
+  have hnn := annealStackBaseAddr_add_ne_zero e.allocId p.offsetBytes hid hoff_lt
+  have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+      (.fromPointer annealTargetDataLayout mptr) m = .ok false m := by
+    rw [hmptr]
+    exact fromPointer_scalarMayBeNull_eq body.layouts refTy _ _ m hnn
+  have hinh := prim_opsemInhabited_true body.layouts refTy hprim m
+  have hal : (annealValidityHooks body.layouts).checkPointerAlignResult refTy ptPlace.mplace.ptr
+      ptPlace.layout.layout.align.abi m = .ok (.error mis) m := by
+    simp only [ptPlace, hm, annealValidityHooks, hmis_err]; rfl
+  have hv_ok := (((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).2 hnull).2 hinh
+  exact hvp.2 _ _ (hv_ok.1 mis hal)
+
+private theorem annealOffsetMisalignment_align_one (off : Miri.ABI.Size) :
+    annealOffsetMisalignment off Miri.ABI.Align.ONE = .ok none := by
+  have his : off.isAligned Miri.ABI.Align.ONE = .ok true := by
+    unfold Miri.ABI.Size.isAligned Miri.ABI.Align.bytes Miri.ABI.Align.ONE
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    change Except.ok ((off.bytes &&& 0) == 0) = Except.ok true
+    simp
+  unfold annealOffsetMisalignment
+  rw [his]
+
+private theorem annealValidityAccessCheck_zero (mach : AnnealMachine)
+    (ptr : Miri.Memory.Pointer (Option AnnealProv)) :
+    annealValidityAccessCheck mach ptr Miri.ABI.Size.ZERO = .ok () := by
+  have hsz : Miri.Memory.sizeAsI64 Miri.ABI.Size.ZERO = .ok 0 := rfl
+  unfold annealValidityAccessCheck
+  rw [hsz]
+  dsimp only []
+  rw [Miri.Memory.zero_sized_check_skips_resolution]
+
+/-- **Zero-sized `&()` / `&mut ()` `ValidityVisitor.validatePlace` simulation
+(`LM-3.2`)**: for a safe reference to unit `()` (`refTy.kind = .ref refMut (.tuple .nil)`):
+1. **Null integer scalar (`sc.bits = 0`)**: `checkPointerAccess` skips resolution on
+   `sizeof(()) = 0`, and `scalarMayBeNull` rejects the null ZST reference with
+   `"validation: null or maybe-null safe pointer"`.
+2. **Non-null integer scalar (`sc.bits ≠ 0`, `sc.bits < 2 ^ 64`, e.g. `NonNull::<()>::dangling().as_ref()`)**:
+   accepted (`.ok () m`) without provenance or a backing allocation, because a
+   zero-sized access requires `0` dereferenceable bytes and `align(()) = 1`.
+3. **Any stack pointer `p` (`PtrRel allocMap p mptr`, `e ∈ allocMap`, even after `StorageDead(e.localIdx)`)**:
+   accepted (`.ok () m`), because `annealStackBaseAddr e.allocId + p.offsetBytes ≠ 0`
+   and `sizeof(()) = 0`. -/
+theorem validatePlace_ref_unit_zst_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {refIdx : Nat} (hlt : refIdx < tf.locals.size)
+    {refTy : Ty} {refMut : Mutability}
+    (hrefTy : refTy.kind = .ref refMut (.tuple .nil))
+    (fuel : Nat) :
+    let place : Miri.Interpreter.RuntimePlace AnnealProv :=
+      ⟨.local 0 refIdx none tf.localsIdentity, translateTy refTy body.layouts⟩
+    (∀ {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt},
+      ScalarRel sc msc → sc.sizeBytes = 8 → sc.bits < 2 ^ 64 →
+      (tf.locals[refIdx]'hlt).value = .live (.immediate (.scalar (.fromScalarInt msc))) →
+      (sc.bits = 0 →
+        Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks body.layouts) refTy
+          (fuel + 1) place false false m =
+          .error (.undefinedBehavior "validation: null or maybe-null safe pointer") m) ∧
+      (sc.bits ≠ 0 →
+        Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks body.layouts) refTy
+          (fuel + 1) place false false m = .ok () m)) ∧
+    (∀ {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv} {e : AllocMapEntry},
+      PtrRel allocMap p mptr → e ∈ allocMap → e.tag = p.tag →
+      (tf.locals[refIdx]'hlt).value =
+        .live (.immediate (.scalar (.fromPointer annealTargetDataLayout mptr))) →
+      Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks body.layouts) refTy
+        (fuel + 1) place false false m = .ok () m) := by
+  intro place
+  let initSession : Miri.Interpreter.ValidityVisitor.Session AnnealProv :=
+    { path := ⟨"", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+      refTracking := none, dataBytes := none }
+  let mutBool : Bool := match refMut with | .mut => true | .not => false
+  let unitLay : Miri.Interpreter.LocalLayout :=
+    translateTy { kind := .tuple .nil, layoutIdx := 0 } body.layouts
+  have hcl : (annealValidityHooks body.layouts).classify refTy
+      (translateTy refTy body.layouts).ty m = .ok (.reference mutBool) m := by
+    cases refMut <;> (simp only [annealValidityHooks, annealValidityClassify, translateTy,
+      encodeTyId, hrefTy, mutBool]; rfl)
+  have hvr := visit_reference_cases (annealValidityHooks body.layouts) refTy fuel initSession
+    place m mutBool hcl rfl rfl rfl
+  have hvp := validatePlace_annealValidityHooks_nonrecursive_eq body.layouts refTy (fuel + 1) place m
+  have hptLay : annealValidityPointeeLayout body.layouts refTy = some unitLay := by
+    unfold annealValidityPointeeLayout
+    rw [hrefTy]; rfl
+  have hsized : unitLay.layout.isSized = true := rfl
+  have hinh : (annealValidityHooks body.layouts).opsemInhabited refTy unitLay.ty m = .ok true m :=
+    rfl
+  have hunitAlign : unitLay.layout.align.abi = Miri.ABI.Align.ONE := rfl
+  have hunitSize : unitLay.layout.size = Miri.ABI.Size.ZERO := rfl
+  refine ⟨fun {sc msc} hrel hsz8 hlt64 hval => ?_, fun {p mptr e} hptr he htag hval => ?_⟩
+  · have hrd := annealValidityHooks_readImmediate_local body.layouts refTy hframes hlt hval
+      (translateTy refTy body.layouts) .reference
+    have hmis : annealOffsetMisalignment
+        (Miri.Memory.Pointer.withoutProvenance (Prov := AnnealProv) (UInt64.ofNat sc.bits)).offset
+        unitLay.layout.align.abi = .ok none := by
+      rw [hunitAlign]
+      exact annealOffsetMisalignment_align_one _
+    let ptPlace : Miri.Interpreter.MPlaceTy AnnealProv :=
+      ⟨⟨Miri.Memory.Pointer.withoutProvenance (UInt64.ofNat sc.bits), .none, none⟩, unitLay⟩
+    have hptr_p : (annealValidityHooks body.layouts).ptrToPlace refTy
+        ⟨.scalar (.fromScalarInt msc), translateTy refTy body.layouts⟩ m = .ok ptPlace m := by
+      show (do _ : EStateM _ _ _) m = .ok ptPlace m
+      simp only [annealValidityHooks, hptLay, Miri.Interpreter.Immediate.toScalar,
+        scalar_fromScalarInt_toPointer_eq hrel hsz8, hmis, bind, EStateM.bind, pure, EStateM.pure]
+      rfl
+    have hdyn : (annealValidityHooks body.layouts).sizeAndAlign refTy ptPlace m =
+        .ok (some (ptPlace.layout.layout.size, ptPlace.layout.layout.align.abi)) m := rfl
+    have hacc : (annealValidityHooks body.layouts).checkPointerAccess refTy ptPlace.mplace.ptr
+        ptPlace.layout.layout.size m = .ok (.ok ()) m := by
+      simp only [ptPlace]
+      rw [annealValidityHooks_checkPointerAccess_eq, hunitSize, annealValidityAccessCheck_zero]
+    have hsc_m : Miri.Memory.Scalar.fromMaybePointer (annealValidityHooks body.layouts).target.base
+        ptPlace.mplace.ptr = .ok (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits))) := by
+      with_unfolding_all
+        change ((do
+            let scalar ← (Miri.Memory.ScalarInt.tryFromUInt
+              (BitVec.ofNat 128 (UInt64.ofNat sc.bits).toNat)
+              (Miri.ABI.Size.ofBytes 8)).mapError (fun e => Miri.Memory.ScalarError.scalarInt e)
+            match scalar with
+            | some scalar => pure (.fromScalarInt scalar)
+            | none => throw (.pointerOffsetDoesNotFit
+                (Miri.ABI.Size.ofBytes (UInt64.ofNat sc.bits))
+                (Miri.ABI.Size.ofBytes 8))) :
+            Except Miri.Memory.ScalarError (Miri.Memory.Scalar AnnealProv)) =
+          .ok (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits)))
+        rw [tryFromUInt_8_of_u64]
+        rfl
+    have hal : (annealValidityHooks body.layouts).checkPointerAlignResult refTy ptPlace.mplace.ptr
+        ptPlace.layout.layout.align.abi m = .ok (.ok ()) m := by
+      simp only [ptPlace, annealValidityHooks, hmis]; rfl
+    refine ⟨fun h0 => ?_, fun hne => ?_⟩
+    · have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+          (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits))) m = .ok true m := by
+        rw [h0]
+        with_unfolding_all rfl
+      have herr := ((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).1 hnull
+      rw [hvp.2 _ _ herr]
+      cases mutBool <;> rfl
+    · have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+          (.fromScalarInt (.ofUInt64 (UInt64.ofNat sc.bits))) m = .ok false m := by
+        have hne_bv : (BitVec.ofNat 128 sc.bits == 0) = false := by
+          cases h : (BitVec.ofNat 128 sc.bits == 0) with
+          | false => rfl
+          | true =>
+            have heq := congrArg BitVec.toNat (beq_iff_eq.mp h)
+            have hlt128 : sc.bits < 2 ^ 128 := by omega
+            simp only [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hlt128] at heq
+            exact absurd heq hne
+        have hu64 : (UInt64.ofNat sc.bits).toNat = sc.bits := Nat.mod_eq_of_lt hlt64
+        show EStateM.Result.ok ((Miri.Memory.ScalarInt.ofUInt64 (UInt64.ofNat sc.bits)).isNull) m =
+          .ok false m
+        with_unfolding_all
+          show EStateM.Result.ok (BitVec.ofNat 128 (UInt64.ofNat sc.bits).toNat == 0) m = .ok false m
+          rw [hu64, hne_bv]
+      have hv_ok := (((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).2 hnull).2 hinh
+      exact hvp.1 initSession m (hv_ok.2 hal) rfl
+  · obtain ⟨tf₀, hframes₀, _, _, _, _, _, _, _, _, halloc, _⟩ := id hstate
+    rw [hframes] at hframes₀; injection hframes₀ with h0; injection h0 with htf; subst htf
+    obtain ⟨borTag, hmptr, hoff_lt⟩ := PtrRel.allocId_of_entry halloc hptr he htag
+    obtain ⟨hid, _, _⟩ := halloc.base_addr_valid e he
+    have hrd := annealValidityHooks_readImmediate_local body.layouts refTy hframes hlt hval
+      (translateTy refTy body.layouts) .reference
+    have hmis : annealOffsetMisalignment mptr.withOptionalProvenance.offset
+        unitLay.layout.align.abi = .ok none := by
+      rw [hunitAlign]
+      exact annealOffsetMisalignment_align_one _
+    let ptPlace : Miri.Interpreter.MPlaceTy AnnealProv :=
+      ⟨⟨mptr.withOptionalProvenance, .none, none⟩, unitLay⟩
+    have hptr_p : (annealValidityHooks body.layouts).ptrToPlace refTy
+        ⟨.scalar (.fromPointer annealTargetDataLayout mptr), translateTy refTy body.layouts⟩ m =
+        .ok ptPlace m := by
+      show (do _ : EStateM _ _ _) m = .ok ptPlace m
+      simp only [annealValidityHooks, hptLay, Miri.Interpreter.Immediate.toScalar,
+        scalar_fromPointer_toPointer_eq, hmis, bind, EStateM.bind, pure, EStateM.pure]
+      rfl
+    have hdyn : (annealValidityHooks body.layouts).sizeAndAlign refTy ptPlace m =
+        .ok (some (ptPlace.layout.layout.size, ptPlace.layout.layout.align.abi)) m := rfl
+    have hacc : (annealValidityHooks body.layouts).checkPointerAccess refTy ptPlace.mplace.ptr
+        ptPlace.layout.layout.size m = .ok (.ok ()) m := by
+      simp only [ptPlace]
+      rw [annealValidityHooks_checkPointerAccess_eq, hunitSize, annealValidityAccessCheck_zero]
+    have hsc_m : Miri.Memory.Scalar.fromMaybePointer (annealValidityHooks body.layouts).target.base
+        ptPlace.mplace.ptr = .ok (.fromPointer annealTargetDataLayout mptr) := by
+      simp only [ptPlace, hmptr, Miri.Memory.Pointer.withOptionalProvenance,
+        Miri.Memory.Scalar.fromMaybePointer, annealValidityHooks, annealRuntimeDataLayout]
+      rfl
+    have hnn := annealStackBaseAddr_add_ne_zero e.allocId p.offsetBytes hid hoff_lt
+    have hnull : (annealValidityHooks body.layouts).scalarMayBeNull refTy
+        (.fromPointer annealTargetDataLayout mptr) m = .ok false m := by
+      rw [hmptr]
+      exact fromPointer_scalarMayBeNull_eq body.layouts refTy _ _ m hnn
+    have hal : (annealValidityHooks body.layouts).checkPointerAlignResult refTy ptPlace.mplace.ptr
+        ptPlace.layout.layout.align.abi m = .ok (.ok ()) m := by
+      simp only [ptPlace, annealValidityHooks, hmis]; rfl
+    have hv_ok := (((hvr.2 _ ptPlace hrd hptr_p hsized hdyn).2 _ hacc hsc_m).2 hnull).2 hinh
+    exact hvp.1 initSession m (hv_ok.2 hal) rfl
+
 end LeanMiriSpec.Correspondence
