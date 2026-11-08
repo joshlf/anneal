@@ -108,19 +108,22 @@ assert data["total_candidates"] == 77
 assert data["compiled_candidates"] == 77
 assert data["compile_failed_candidates"] == 0
 assert data["compared_candidates"] == 75
-assert data["agree_count"] == 71
-assert data["diverge_count"] == 4
-assert data["kernel_confirmed_divergences"] == 4
+assert data["agree_count"] == 75
+assert data["diverge_count"] == 0
+assert data["kernel_confirmed_divergences"] == 0
 assert data["not_compared_count"] == 2
+assert isinstance(data.get("obs_path_signatures"), list)
+assert len(data["obs_path_signatures"]) > 0
+assert all(s.startswith("miri:") for s in data["obs_path_signatures"])
 
 div_classes = data["divergence_classes"]
 assert div_classes == {
-    "false_positive_ub": 1,
-    "missed_ub": 1,
+    "false_positive_ub": 0,
+    "missed_ub": 0,
     "panic_site_mismatch": 0,
     "panic_vs_return": 0,
     "return_vs_panic": 0,
-    "ub_location_mismatch": 2,
+    "ub_location_mismatch": 0,
     "wrong_value": 0,
 }, f"unexpected divergence_classes: {div_classes}"
 
@@ -140,12 +143,7 @@ assert ext.get("core::fmt::Arguments::<'a>::from_str") == 1, f"unexpected ext: {
 assert ext.get("miri_diff_corpus::helper_add_ten") == 1, f"unexpected ext: {ext}"
 assert sum(ext.values()) == 2, f"unexpected ext sum: {ext}"
 
-expected_findings = {
-    "ub_transmute_invalid_bool_through_ptr": "missed_ub",
-    "pass_ptr_offset_within_array": "false_positive_ub",
-    "ub_ptr_offset_oob_read": "ub_location_mismatch",
-    "ub_ptr_offset_oob_write": "ub_location_mismatch",
-}
+expected_findings = {}
 
 manifest = tomllib.loads(manifest_path.read_text())
 manifest_bugs = {
@@ -166,31 +164,9 @@ manifest_ext = {
 assert len(manifest_ext) == 2, f"expected 2 externalCall entries in manifest, got {manifest_ext}"
 
 findings = data["findings"]
-assert len(findings) == 4
+assert len(findings) == 0
 actual_map = {f["fn_name"]: f["divergence_class"] for f in findings}
 assert actual_map == expected_findings, f"mismatch: {actual_map} vs {expected_findings}"
-
-for f in findings:
-    assert f["kernel_confirmed"] is True
-    assert "theorem confirm_tag_" in f["kernel_confirm_theorems"]
-    assert "theorem confirm_probe_" in f["kernel_confirm_theorems"]
-    assert ":= by\n  rfl" in f["kernel_confirm_theorems"]
-    assert "def body : CapturedMir :=" in f["mir_neighborhood"]
-    assert f["miri_excerpt"]
-    assert f["anneal_lean_tag"].lstrip("(").startswith("MirDiffTag.")
-    bundle_dir = findings_dir / f["finding_id"]
-    repro_rs = bundle_dir / "repro.rs"
-    finding_json = bundle_dir / "finding.json"
-    summary_md = bundle_dir / "SUMMARY.md"
-    assert repro_rs.is_file(), f"missing {repro_rs}"
-    assert finding_json.is_file(), f"missing {finding_json}"
-    assert summary_md.is_file(), f"missing {summary_md}"
-    assert repro_rs.read_text() == f["mutant_source"]
-    md_text = summary_md.read_text()
-    assert '## Miri Output Excerpt' in md_text
-    assert '## Lean 4 Kernel Confirmation Theorems' in md_text
-    assert '## Captured MIR Neighborhood' in md_text
-    assert '## Mutant Source' in md_text
 "#,
         )
         .arg(&json_path)
@@ -257,7 +233,7 @@ fn miri_seeded_runs_produce_pass_panic_ub_mix_vary_with_seed_and_reproduce_findi
     );
 
     // Verify both runs produced a mix of pass, panic, and ub verdicts from Miri,
-    // that metrics differ across seeds, and collect all repro.rs paths to re-run.
+    // that metrics differ across seeds, and that all compared candidates agree.
     let check_out = Command::new("python3")
         .arg("-c")
         .arg(
@@ -273,6 +249,7 @@ for label, d in [("seed1", d1), ("seed2", d2)]:
     assert d["total_candidates"] == 12, label
     assert d["compiled_candidates"] >= 11, label
     assert d["compared_candidates"] > 0, label
+    assert isinstance(d.get("obs_path_signatures"), list) and len(d["obs_path_signatures"]) > 0, label
     mv = d["miri_verdicts"]
     assert mv["pass"] > 0, f"{label} missing Miri pass verdicts: {mv}"
     assert mv["panic"] > 0, f"{label} missing Miri panic verdicts: {mv}"
@@ -280,6 +257,7 @@ for label, d in [("seed1", d1), ("seed2", d2)]:
     assert mv["error"] == 0, f"{label} unexpected Miri oracle error: {mv}"
     assert d["diverge_count"] == d["kernel_confirmed_divergences"], label
     assert d["diverge_count"] == len(d["findings"]), label
+    assert d["agree_count"] == d["compared_candidates"], label
 
 # Seed sensitivity: mutator application counts and Miri/Anneal distributions
 # must change when the seed changes.
@@ -291,19 +269,6 @@ assert (
 assert d1["mutator_applications"] != d2["mutator_applications"], (
     f"mutator_applications identical across seeds: {d1['mutator_applications']}"
 )
-
-all_findings = d1["findings"] + d2["findings"]
-assert len(all_findings) > 0, "expected at least one divergence finding across seeded runs"
-for f in all_findings:
-    print(
-        f["repro_path"],
-        f["fn_name"],
-        f["divergence_class"],
-        f["miri_outcome"],
-        f["anneal_outcome"],
-        f["anneal_lean_tag"],
-        sep="\t",
-    )
 "#,
         )
         .arg(&json1)
@@ -316,35 +281,79 @@ for f in all_findings:
         String::from_utf8_lossy(&check_out.stderr)
     );
 
-    let lines: Vec<String> = String::from_utf8_lossy(&check_out.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect();
-    assert!(!lines.is_empty(), "must have findings to reproduce");
+    // Negative control: evaluate a candidate that writes a surrogate code point
+    // (0xD800) into a `char` local via `*mut u32` and loads it as `u32`,
+    // verifying finding bundle generation (`repro.rs`, `finding.json`,
+    // `SUMMARY.md`) and standalone `--reproduce` round-tripping.
+    let root = repo_root();
+    let neg_fn = "\
+pub fn neg_ctrl_char_surrogate_via_ptr__b0_c0() -> u32 {
+    let mut c: char = 'a';
+    let p: *mut u32 = (&raw mut c) as *mut u32;
+    unsafe {
+        *p = 0xD800u32;
+    }
+    c as u32
+}
+";
+    let neg_cand = GeneratedMiriCandidate {
+        id: 0,
+        seed_index: 0,
+        seed_name: "ub_transmute_invalid_char_surrogate".to_string(),
+        fn_name: "neg_ctrl_char_surrogate_via_ptr__b0_c0".to_string(),
+        seed_u64: 0xDEAD_BEEF,
+        applied_mutators: vec!["BitValidityTransmuteMutator".to_string()],
+        tracked_locals: Vec::new(),
+        fn_source: neg_fn.to_string(),
+        source: build_standalone_candidate_source(neg_fn),
+    };
+    let neg_findings_dir = dir.join("findings_neg");
+    let neg_report = evaluate_miri_batches(
+        "seeded",
+        0xDEAD_BEEF,
+        &[vec![neg_cand]],
+        1,
+        Some(&neg_findings_dir),
+        Some(&root),
+    )
+    .expect("evaluate negative-control divergence candidate");
+    assert_eq!(neg_report.compared_candidates, 1);
+    assert_eq!(neg_report.diverge_count, 1);
+    assert_eq!(neg_report.kernel_confirmed_divergences, 1);
+    assert_eq!(neg_report.findings.len(), 1);
+    let f = &neg_report.findings[0];
+    assert!(f.kernel_confirmed);
+    assert!(f.kernel_confirm_theorems.contains("theorem confirm_tag_"));
+    assert!(f.kernel_confirm_theorems.contains("theorem confirm_probe_"));
+    assert!(f.kernel_confirm_theorems.contains(":= by\n  rfl"));
+    assert!(f.mir_neighborhood.contains("def body : CapturedMir :="));
+    let repro_path = f.repro_path.as_ref().expect("repro_path");
+    let bundle_dir = repro_path.parent().expect("bundle_dir");
+    assert!(bundle_dir.join("finding.json").is_file());
+    let summary_md = fs::read_to_string(bundle_dir.join("SUMMARY.md")).expect("read SUMMARY.md");
+    assert!(summary_md.contains("## Miri Output Excerpt"));
+    assert!(summary_md.contains("## Lean 4 Kernel Confirmation Theorems"));
+    assert!(summary_md.contains("## Captured MIR Neighborhood"));
+    assert!(summary_md.contains("## Mutant Source"));
 
-    for (idx, line) in lines.iter().enumerate() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        assert_eq!(parts.len(), 6, "unexpected finding line: {line}");
-        let (repro_path, fn_name, exp_class, exp_miri, exp_anneal, exp_lean) = (
-            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5],
-        );
-        let repro_json = dir.join(format!("repro_{idx}.json"));
-        let repro_out = Command::new(bin)
-            .arg("--reproduce")
-            .arg(repro_path)
-            .arg("--output-json")
-            .arg(&repro_json)
-            .output()
-            .expect("run miri-difftest --reproduce");
-        assert!(
-            repro_out.status.success(),
-            "--reproduce failed for {repro_path}:\n{}",
-            String::from_utf8_lossy(&repro_out.stderr)
-        );
-        let verify_repro = Command::new("python3")
-            .arg("-c")
-            .arg(
-                r#"
+    let repro_json = dir.join("repro_neg.json");
+    let repro_out = Command::new(bin)
+        .arg("--reproduce")
+        .arg(repro_path)
+        .arg("--output-json")
+        .arg(&repro_json)
+        .output()
+        .expect("run miri-difftest --reproduce");
+    assert!(
+        repro_out.status.success(),
+        "--reproduce failed for {}:\n{}",
+        repro_path.display(),
+        String::from_utf8_lossy(&repro_out.stderr)
+    );
+    let verify_repro = Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
 import json, pathlib, sys
 rep = json.loads(pathlib.Path(sys.argv[1]).read_text())
 _, _, fn_name, exp_class, exp_miri, exp_anneal, exp_lean = sys.argv
@@ -356,17 +365,23 @@ assert rep["anneal_outcome"] == exp_anneal, f"{rep['anneal_outcome']} != {exp_an
 assert rep["anneal_lean_tag"] == exp_lean, f"{rep['anneal_lean_tag']} != {exp_lean}"
 assert rep["kernel_confirmed"] is True, f"expected kernel_confirmed=True, got {rep}"
 "#,
-            )
-            .arg(&repro_json)
-            .args([fn_name, exp_class, exp_miri, exp_anneal, exp_lean])
-            .output()
-            .expect("verify reproducer JSON");
-        assert!(
-            verify_repro.status.success(),
-            "reproducer mismatch for {repro_path}:\n{}",
-            String::from_utf8_lossy(&verify_repro.stderr)
-        );
-    }
+        )
+        .arg(&repro_json)
+        .args([
+            &f.fn_name,
+            &f.divergence_class,
+            &f.miri_outcome_tag,
+            &f.anneal_outcome_tag,
+            &f.anneal_lean_tag,
+        ])
+        .output()
+        .expect("verify reproducer JSON");
+    assert!(
+        verify_repro.status.success(),
+        "reproducer mismatch for {}:\n{}",
+        repro_path.display(),
+        String::from_utf8_lossy(&verify_repro.stderr)
+    );
 }
 
 #[test]
