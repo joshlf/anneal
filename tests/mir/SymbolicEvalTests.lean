@@ -2879,6 +2879,10 @@ Namespace-shadowing regression check verifying that generated modules (such as
 -/
 namespace MiriOracleShadowCompatCheck
 
+-- Keep in sync with the `open` header that `crates/cargo-anneal/src/miri_oracle.rs` emits
+-- for `MiriOracleProbe` / `MiriOracleConfirm` (including the otherwise-unused
+-- `Trusted.Sequence`), so this check sees the same name environment.
+open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 open Trusted.VerificationResult
