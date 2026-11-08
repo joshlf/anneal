@@ -459,9 +459,10 @@ theorem evalOperand_pure_eq
     (locals : List LocalSlot) (op : Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    {localDecls : List LocalDecl}
     (h_pure : isPureOperand op = true) :
-    evalOperand locals op borrows globals layouts callerLocals =
-      evalOperand locals op [] [] layouts [] := by
+    evalOperand locals op borrows globals layouts callerLocals localDecls =
+      evalOperand locals op [] [] layouts [] localDecls := by
   cases op with
   | constant c =>
     rcases c with ⟨ty, val⟩
@@ -497,16 +498,17 @@ theorem evalOperands_pure_eq
     (locals : List LocalSlot) (ops : List Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
     (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    {localDecls : List LocalDecl}
     (h_pure : ops.all isPureOperand = true) :
-    evalOperands locals ops borrows globals layouts callerLocals =
-      evalOperands locals ops [] [] layouts [] := by
+    evalOperands locals ops borrows globals layouts callerLocals localDecls =
+      evalOperands locals ops [] [] layouts [] localDecls := by
   induction ops generalizing locals with
   | nil => rfl
   | cons op rest ih =>
     simp only [List.all_cons, Bool.and_eq_true] at h_pure
     unfold evalOperands
     rw [evalOperand_pure_eq locals op borrows globals layouts callerLocals h_pure.1]
-    cases evalOperand locals op [] [] layouts [] with
+    cases evalOperand locals op [] [] layouts [] localDecls with
     | ub => rfl
     | unsupported => rfl
     | ok v locals₁ =>
@@ -520,9 +522,10 @@ Writing to a pure `Place` via `writePlaceValue` is completely independent of
 theorem writePlaceValue_pure_eq
     (locals : List LocalSlot) (borrows : List BorrowEntry)
     (dst : Place) (val : Value)
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
     (h_pure : isPurePlace dst = true) :
-    writePlaceValue locals borrows dst val =
-      writePlaceValue locals [] dst val := by
+    writePlaceValue locals borrows dst val localDecls layouts =
+      writePlaceValue locals [] dst val localDecls layouts := by
   rcases dst with ⟨loc, proj⟩
   cases proj with
   | nil => rfl
@@ -595,7 +598,7 @@ theorem evalByteCast_pure_eq_withMem
   rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
   rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
   dsimp only
-  try cases evalOperand locals op [] [] layouts []
+  try cases evalOperand locals op [] [] layouts [] localDecls
   repeat' (first | rfl | split)
   all_goals try dsimp (config := { zeta := true })
   repeat' (first | rfl | split)
@@ -674,7 +677,7 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    cases evalOperand locals op [] [] layouts [] with
+    cases evalOperand locals op [] [] layouts [] localDecls with
     | ub => rfl
     | unsupported => rfl
     | ok v locals' =>
@@ -692,7 +695,7 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
     rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-    cases evalOperand locals op [] [] layouts [] with
+    cases evalOperand locals op [] [] layouts [] localDecls with
     | ub => rfl
     | unsupported => rfl
     | ok v locals' =>
@@ -728,6 +731,7 @@ theorem evalRvalue_pure_eq_withMem
       try unfold evalReifyFnPointer
       try unfold evalFnPtrToPtr
       try rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
+      try cases evalOperand locals op [] [] layouts [] localDecls
       try cases evalOperand locals op [] [] layouts []
       repeat' (first | rfl | split)
       all_goals try dsimp (config := { zeta := true })
@@ -739,14 +743,14 @@ theorem evalRvalue_pure_eq_withMem
     dsimp only [evalRvalue]
     rw [evalOperand_pure_eq locals lhs mem.borrows mem.globals layouts mem.callerLocals h_pure.1]
     rw [evalOperand_pure_eq locals lhs emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure.1]
-    cases evalOperand locals lhs [] [] layouts [] with
+    cases evalOperand locals lhs [] [] layouts [] localDecls with
     | ub => rfl
     | unsupported => rfl
     | ok lhsVal locals₁ =>
       dsimp only
       rw [evalOperand_pure_eq locals₁ rhs mem.borrows mem.globals layouts mem.callerLocals h_pure.2]
       rw [evalOperand_pure_eq locals₁ rhs emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure.2]
-      cases evalOperand locals₁ rhs [] [] layouts [] with
+      cases evalOperand locals₁ rhs [] [] layouts [] localDecls with
       | ub => rfl
       | unsupported => rfl
       | ok rhsVal locals₂ =>
@@ -770,7 +774,7 @@ theorem evalRvalue_pure_eq_withMem
       dsimp only [evalRvalue]
       rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
       rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
-      cases evalOperand locals op [] [] layouts [] with
+      cases evalOperand locals op [] [] layouts [] localDecls with
       | ub => rfl
       | unsupported => rfl
       | ok v locals' =>
@@ -2983,7 +2987,7 @@ theorem evalByteCast_pushBaseStack
         (evalByteCast locals op targetTy mem localDecls layouts) := by
   unfold evalByteCast
   dsimp only [Memory.pushBaseStack]
-  cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+  cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
   | ub => rfl
   | unsupported => rfl
   | ok v locals' =>
@@ -3113,12 +3117,12 @@ theorem evalRvalue_pushBaseStack
         | split)
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
+    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
     | ub => rfl
     | unsupported => rfl
     | ok lhsVal locals₁ =>
       dsimp only
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals with
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | ub => rfl
       | unsupported => rfl
       | ok rhsVal locals₂ =>
@@ -3141,7 +3145,7 @@ theorem evalRvalue_pushBaseStack
     cases uop with
     | not =>
       dsimp only [evalRvalue, Memory.pushBaseStack]
-      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | ub => rfl
       | unsupported => rfl
       | ok v locals' =>
@@ -3168,7 +3172,7 @@ theorem evalRvalue_pushBaseStack
   | shallowInitBox _ _ => rfl
   | copyForDeref place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
-    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals <;> repeat' (first | rfl | split)
+    cases evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls <;> repeat' (first | rfl | split)
   | wrapUnsafeBinder op _ =>
     cases op
     all_goals (dsimp only [evalRvalue, Memory.pushBaseStack]; repeat' (first | rfl | split))

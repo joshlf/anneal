@@ -2584,8 +2584,9 @@ theorem LiftLensOperand.evalOperand_eq
     (borrows : List BorrowEntry)
     (globals : List CapturedAllocation)
     (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) :
-    evalOperand env op borrows globals layouts callerLocals = .ok v env' ∧
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperand env op borrows globals layouts callerLocals localDecls = .ok v env' ∧
     env'.length = env.length := by
   cases h with
   | copy_local hGet =>
@@ -2640,8 +2641,9 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
     {op : Operand} {v : Value} {m : Memory}
     (h : LiftDerefRead env entries op v env')
     (hInv : SepLensStateInv env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperand env op m.borrows m.globals layouts m.callerLocals = .ok v env' ∧
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperand env op m.borrows m.globals layouts m.callerLocals localDecls = .ok v env' ∧
     env' = env ∧
     (∀ ptrLoc restProj,
       (op = .copy { local_ := ptrLoc, projection := .deref :: restProj } ∨
@@ -2657,12 +2659,13 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
       rw [hT]
       exact get?_eq_none_of_le hAbove
     refine ⟨?_, rfl, ?_⟩
-    · unfold evalOperand
-      simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-      rw [hGetPtr]
-      simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-      rw [hEnvNone, hT, hCaller]
-      rfl
+    · cases localDecls <;>
+      · unfold evalOperand
+        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+        rw [hGetPtr]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        rw [hEnvNone, hT, hCaller]
+        rfl
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · injection hCopy with hPlace
@@ -2688,12 +2691,13 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq
       rw [hT]
       exact get?_eq_none_of_le hAbove
     refine ⟨?_, rfl, ?_⟩
-    · unfold evalOperand
-      simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-      rw [hGetPtr]
-      simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-      rw [hEnvNone, hT, hCaller]
-      rfl
+    · cases localDecls <;>
+      · unfold evalOperand
+        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue, _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+        rw [hGetPtr]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        rw [hEnvNone, hT, hCaller]
+        rfl
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · nomatch hCopy
@@ -2716,8 +2720,9 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq
     {op : Operand} {v : Value} {m : Memory}
     (h : LiftDerefFieldRead env entries op v env')
     (hInv : SepLensStateInv env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperand env op m.borrows m.globals layouts m.callerLocals = .ok v env' ∧
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperand env op m.borrows m.globals layouts m.callerLocals localDecls = .ok v env' ∧
     env' = env ∧
     (∀ ptrLoc restProj,
       (op = .copy { local_ := ptrLoc, projection := .deref :: restProj } ∨
@@ -2733,14 +2738,15 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq
       rw [hT]
       exact get?_eq_none_of_le hAbove
     refine ⟨?_, rfl, ?_⟩
-    · unfold evalOperand
-      simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-        _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-      rw [hGetPtr]
-      simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-      rw [hEnvNone, hT, hCaller]
-      dsimp only
-      rw [hRead]
+    · cases localDecls <;>
+      · unfold evalOperand
+        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+        rw [hGetPtr]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        rw [hEnvNone, hT, hCaller]
+        dsimp only
+        rw [hRead]
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · injection hCopy with hPlace
@@ -2767,14 +2773,15 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq
       rw [hT]
       exact get?_eq_none_of_le hAbove
     refine ⟨?_, rfl, ?_⟩
-    · unfold evalOperand
-      simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-        _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-      rw [hGetPtr]
-      simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-      rw [hEnvNone, hT, hCaller]
-      dsimp only
-      rw [hRead]
+    · cases localDecls <;>
+      · unfold evalOperand
+        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+        rw [hGetPtr]
+        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+        rw [hEnvNone, hT, hCaller]
+        dsimp only
+        rw [hRead]
     · intro pLoc rProj hOpEq
       rcases hOpEq with hCopy | hMove
       · nomatch hCopy
@@ -2803,17 +2810,18 @@ theorem LiftLensOperandAny.evalOperand_eq
     {op : Operand} {v : Value} {m : Memory}
     (h : LiftLensOperandAny env entries op v env')
     (hInv : SepLensStateInv env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperand env op m.borrows m.globals layouts m.callerLocals = .ok v env' ∧
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperand env op m.borrows m.globals layouts m.callerLocals localDecls = .ok v env' ∧
     env'.length = env.length := by
   cases h with
-  | pure hOp => exact hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals
+  | pure hOp => exact hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals localDecls
   | deref hDeref =>
-    rcases hDeref.evalOperand_and_freeze_eq hInv layouts with ⟨hEval, hEnvEq, _⟩
+    rcases hDeref.evalOperand_and_freeze_eq hInv layouts localDecls with ⟨hEval, hEnvEq, _⟩
     subst hEnvEq
     exact ⟨hEval, rfl⟩
   | deref_field hField =>
-    rcases hField.evalOperand_and_freeze_eq hInv layouts with ⟨hEval, hEnvEq, _⟩
+    rcases hField.evalOperand_and_freeze_eq hInv layouts localDecls with ⟨hEval, hEnvEq, _⟩
     subst hEnvEq
     exact ⟨hEval, rfl⟩
 
@@ -2822,13 +2830,14 @@ theorem LiftLensOperands.evalOperands_eq
     {ops : List Operand} {vs : List Value} {m : Memory}
     (h : LiftLensOperands env entries ops vs env')
     (hInv : SepLensStateInv env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperands env ops m.borrows m.globals layouts m.callerLocals = .ok vs env' ∧
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperands env ops m.borrows m.globals layouts m.callerLocals localDecls = .ok vs env' ∧
     env'.length = env.length := by
   induction h with
   | nil => exact ⟨rfl, rfl⟩
   | cons hOp _ ih =>
-    rcases hOp.evalOperand_eq hInv layouts with ⟨hEval₁, hLen₁⟩
+    rcases hOp.evalOperand_eq hInv layouts localDecls with ⟨hEval₁, hLen₁⟩
     rcases ih (by rw [hLen₁]; exact hInv) with ⟨hEval₂, hLen₂⟩
     refine ⟨?_, hLen₂.trans hLen₁⟩
     unfold evalOperands
@@ -2846,14 +2855,14 @@ theorem LiftLensRvalue.evalRvalue_eq
     env'.length = env.length := by
   cases h with
   | use_pure hOp =>
-    rcases hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals with
+    rcases hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals localDecls with
       ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     simp [hEval]
     exact hOp.not_deref m.borrows m
   | use_deref hDeref =>
-    rcases hDeref.evalOperand_and_freeze_eq hInv layouts with
+    rcases hDeref.evalOperand_and_freeze_eq hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
@@ -2883,7 +2892,7 @@ theorem LiftLensRvalue.evalRvalue_eq
           dsimp only
           rw [hFr, ← hB]
   | use_deref_field hField =>
-    rcases hField.evalOperand_and_freeze_eq hInv layouts with
+    rcases hField.evalOperand_and_freeze_eq hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
@@ -2917,7 +2926,7 @@ theorem LiftLensRvalue.evalRvalue_eq
         LiftDerefRead env entries
           (.copy { local_ := _, projection := [.deref] }) v env :=
       .copy_deref hGetPtr hLookVal
-    rcases hDeref.evalOperand_and_freeze_eq hInv layouts with
+    rcases hDeref.evalOperand_and_freeze_eq hInv layouts localDecls with
       ⟨hEval, _, hFreeze⟩
     refine ⟨?_, rfl⟩
     unfold evalRvalue
@@ -2933,8 +2942,8 @@ theorem LiftLensRvalue.evalRvalue_eq
         dsimp only
         rw [hFr, ← hB]
   | binaryOp hLhs hRhs hEvalOp =>
-    rcases hLhs.evalOperand_eq hInv layouts with ⟨hEval₁, hLen₁⟩
-    rcases hRhs.evalOperand_eq (by rw [hLen₁]; exact hInv) layouts with
+    rcases hLhs.evalOperand_eq hInv layouts localDecls with ⟨hEval₁, hLen₁⟩
+    rcases hRhs.evalOperand_eq (by rw [hLen₁]; exact hInv) layouts localDecls with
       ⟨hEval₂, hLen₂⟩
     refine ⟨?_, hLen₂.trans hLen₁⟩
     unfold evalRvalue
@@ -2944,14 +2953,14 @@ theorem LiftLensRvalue.evalRvalue_eq
     rw [hEval₂]
     exact hEvalOp m
   | unaryOp_not hOp hNot =>
-    rcases hOp.evalOperand_eq hInv layouts with ⟨hEval, hLen⟩
+    rcases hOp.evalOperand_eq hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
     rw [hEval]
     exact hNot m
   | unaryOp_neg hOp hSz =>
-    rcases hOp.evalOperand_eq hInv layouts with ⟨hEval, hLen⟩
+    rcases hOp.evalOperand_eq hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
@@ -2959,7 +2968,7 @@ theorem LiftLensRvalue.evalRvalue_eq
     dsimp only
     rw [hSz]
   | cast_intToInt hOp hSz hTarget =>
-    rcases hOp.evalOperand_eq hInv layouts with ⟨hEval, hLen⟩
+    rcases hOp.evalOperand_eq hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
@@ -2970,13 +2979,13 @@ theorem LiftLensRvalue.evalRvalue_eq
   | tuple_nil =>
     exact ⟨rfl, rfl⟩
   | aggregate_tuple hOps =>
-    rcases hOps.evalOperands_eq hInv layouts with ⟨hEval, hLen⟩
+    rcases hOps.evalOperands_eq hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
     rw [hEval]
   | aggregate_adt hOps =>
-    rcases hOps.evalOperands_eq hInv layouts with ⟨hEval, hLen⟩
+    rcases hOps.evalOperands_eq hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
@@ -7604,8 +7613,9 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
     {op : Operand} {v : Value} {m : Memory}
     (h : LiftDerefRead env entries op v env')
     (hInv : SepSubplaceLensStateInv subplaceOf env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperand env op m.borrows m.globals layouts m.callerLocals =
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperand env op m.borrows m.globals layouts m.callerLocals localDecls =
       .ok v env' ∧
     env' = env ∧
     (∀ ptrLoc restProj,
@@ -7626,13 +7636,14 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-        rw [hEnvNone, hT, hCaller]
-        rfl
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+          rw [hEnvNone, hT, hCaller]
+          rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -7658,14 +7669,15 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
-        rw [hEnvNone, hT, hCaller]
-        dsimp only [appendProjections, readProjectedValue]
-        rw [hEl]
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
+          rw [hEnvNone, hT, hCaller]
+          dsimp only [appendProjections, readProjectedValue]
+          rw [hEl]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -7696,13 +7708,14 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-        rw [hEnvNone, hT, hCaller]
-        rfl
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+          rw [hEnvNone, hT, hCaller]
+          rfl
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -7728,14 +7741,15 @@ theorem LiftDerefRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
-        rw [hEnvNone, hT, hCaller]
-        dsimp only [appendProjections, readProjectedValue]
-        rw [hEl]
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
+          rw [hEnvNone, hT, hCaller]
+          dsimp only [appendProjections, readProjectedValue]
+          rw [hEl]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -7760,8 +7774,9 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
     {op : Operand} {v : Value} {m : Memory}
     (h : LiftDerefFieldRead env entries op v env')
     (hInv : SepSubplaceLensStateInv subplaceOf env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperand env op m.borrows m.globals layouts m.callerLocals =
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperand env op m.borrows m.globals layouts m.callerLocals localDecls =
       .ok v env' ∧
     env' = env ∧
     (∀ ptrLoc restProj,
@@ -7782,14 +7797,15 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-        rw [hEnvNone, hT, hCaller]
-        dsimp only
-        rw [hRead]
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+          rw [hEnvNone, hT, hCaller]
+          dsimp only
+          rw [hRead]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -7815,16 +7831,17 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
-        rw [hEnvNone, hT, hCaller]
-        dsimp only [appendProjections, readProjectedValue]
-        rw [hEl]
-        dsimp only [readProjectedValue]
-        rw [hRead]
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
+          rw [hEnvNone, hT, hCaller]
+          dsimp only [appendProjections, readProjectedValue]
+          rw [hEl]
+          dsimp only [readProjectedValue]
+          rw [hRead]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · injection hCopy with hPlace
@@ -7855,14 +7872,15 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP]
-        rw [hEnvNone, hT, hCaller]
-        dsimp only
-        rw [hRead]
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP]
+          rw [hEnvNone, hT, hCaller]
+          dsimp only
+          rw [hRead]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -7888,16 +7906,17 @@ theorem LiftDerefFieldRead.evalOperand_and_freeze_eq_subplace
       have hEnvNone : get? env entry.targetLocal = .none := by
         rw [hT]; exact get?_eq_none_of_le hAbove
       refine ⟨?_, rfl, ?_⟩
-      · unfold evalOperand
-        simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
-          _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
-        rw [hGetPtr]
-        simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
-        rw [hEnvNone, hT, hCaller]
-        dsimp only [appendProjections, readProjectedValue]
-        rw [hEl]
-        dsimp only [readProjectedValue]
-        rw [hRead]
+      · cases localDecls <;>
+        · unfold evalOperand
+          simp only [_root_.Anneal.UnsafeObligations.RawPtrVal.toMirValue,
+            _root_.Anneal.UnsafeObligations.RawPtrVal.toMirPtr] at hGetPtr ⊢
+          rw [hGetPtr]
+          simp [ProvenancePtr.tag, hLookB, hPerm, hP, hOff]
+          rw [hEnvNone, hT, hCaller]
+          dsimp only [appendProjections, readProjectedValue]
+          rw [hEl]
+          dsimp only [readProjectedValue]
+          rw [hRead]
       · intro pLoc rProj hOpEq
         rcases hOpEq with hCopy | hMove
         · nomatch hCopy
@@ -7922,20 +7941,21 @@ theorem LiftLensOperandAny.evalOperand_eq_subplace
     {op : Operand} {v : Value} {m : Memory}
     (h : LiftLensOperandAny env entries op v env')
     (hInv : SepSubplaceLensStateInv subplaceOf env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperand env op m.borrows m.globals layouts m.callerLocals =
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperand env op m.borrows m.globals layouts m.callerLocals localDecls =
       .ok v env' ∧
     env'.length = env.length := by
   cases h with
   | pure hOp =>
-    exact hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals
+    exact hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals localDecls
   | deref hDeref =>
-    rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts with
+    rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, hEnvEq, _⟩
     subst hEnvEq
     exact ⟨hEval, rfl⟩
   | deref_field hField =>
-    rcases hField.evalOperand_and_freeze_eq_subplace hInv layouts with
+    rcases hField.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, hEnvEq, _⟩
     subst hEnvEq
     exact ⟨hEval, rfl⟩
@@ -7946,14 +7966,15 @@ theorem LiftLensOperands.evalOperands_eq_subplace
     {ops : List Operand} {vs : List Value} {m : Memory}
     (h : LiftLensOperands env entries ops vs env')
     (hInv : SepSubplaceLensStateInv subplaceOf env.length entries m)
-    (layouts : LayoutTable) :
-    evalOperands env ops m.borrows m.globals layouts m.callerLocals =
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperands env ops m.borrows m.globals layouts m.callerLocals localDecls =
       .ok vs env' ∧
     env'.length = env.length := by
   induction h with
   | nil => exact ⟨rfl, rfl⟩
   | cons hOp _ ih =>
-    rcases hOp.evalOperand_eq_subplace hInv layouts with ⟨hEval₁, hLen₁⟩
+    rcases hOp.evalOperand_eq_subplace hInv layouts localDecls with ⟨hEval₁, hLen₁⟩
     rcases ih (by rw [hLen₁]; exact hInv) with ⟨hEval₂, hLen₂⟩
     refine ⟨?_, hLen₂.trans hLen₁⟩
     unfold evalOperands
@@ -7972,14 +7993,14 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     env'.length = env.length := by
   cases h with
   | use_pure hOp =>
-    rcases hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals with
+    rcases hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals localDecls with
       ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     simp [hEval]
     exact hOp.not_deref m.borrows m
   | use_deref hDeref =>
-    rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts with
+    rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
@@ -8009,7 +8030,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           dsimp only
           rw [hFr, ← hB]
   | use_deref_field hField =>
-    rcases hField.evalOperand_and_freeze_eq_subplace hInv layouts with
+    rcases hField.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
@@ -8043,7 +8064,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
         LiftDerefRead env entries
           (.copy { local_ := _, projection := [.deref] }) v env :=
       .copy_deref hGetPtr hLookVal
-    rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts with
+    rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts localDecls with
       ⟨hEval, _, hFreeze⟩
     refine ⟨?_, rfl⟩
     unfold evalRvalue
@@ -8059,8 +8080,8 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
         dsimp only
         rw [hFr, ← hB]
   | binaryOp hLhs hRhs hEvalOp =>
-    rcases hLhs.evalOperand_eq_subplace hInv layouts with ⟨hEval₁, hLen₁⟩
-    rcases hRhs.evalOperand_eq_subplace (by rw [hLen₁]; exact hInv) layouts
+    rcases hLhs.evalOperand_eq_subplace hInv layouts localDecls with ⟨hEval₁, hLen₁⟩
+    rcases hRhs.evalOperand_eq_subplace (by rw [hLen₁]; exact hInv) layouts localDecls
       with ⟨hEval₂, hLen₂⟩
     refine ⟨?_, hLen₂.trans hLen₁⟩
     unfold evalRvalue
@@ -8070,14 +8091,14 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     rw [hEval₂]
     exact hEvalOp m
   | unaryOp_not hOp hNot =>
-    rcases hOp.evalOperand_eq_subplace hInv layouts with ⟨hEval, hLen⟩
+    rcases hOp.evalOperand_eq_subplace hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
     rw [hEval]
     exact hNot m
   | unaryOp_neg hOp hSz =>
-    rcases hOp.evalOperand_eq_subplace hInv layouts with ⟨hEval, hLen⟩
+    rcases hOp.evalOperand_eq_subplace hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
@@ -8085,7 +8106,7 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     dsimp only
     rw [hSz]
   | cast_intToInt hOp hSz hTarget =>
-    rcases hOp.evalOperand_eq_subplace hInv layouts with ⟨hEval, hLen⟩
+    rcases hOp.evalOperand_eq_subplace hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
@@ -8095,13 +8116,13 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     rfl
   | tuple_nil => exact ⟨rfl, rfl⟩
   | aggregate_tuple hOps =>
-    rcases hOps.evalOperands_eq_subplace hInv layouts with ⟨hEval, hLen⟩
+    rcases hOps.evalOperands_eq_subplace hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only
     rw [hEval]
   | aggregate_adt hOps =>
-    rcases hOps.evalOperands_eq_subplace hInv layouts with ⟨hEval, hLen⟩
+    rcases hOps.evalOperands_eq_subplace hInv layouts localDecls with ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
     dsimp only

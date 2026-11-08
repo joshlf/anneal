@@ -1437,9 +1437,9 @@ def evalRvalueSymTree
     (layouts : LayoutTable) : SymTree RvalueEvalResult :=
   match rv with
   | .binaryOp op lhsOp rhsOp =>
-    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
+    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
     | .ok lhsVal locals₁ =>
-      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals with
+      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | .ok rhsVal locals₂ =>
         match lhsVal, rhsVal with
         | .scalar lhs, .scalar rhs =>
@@ -1456,7 +1456,7 @@ def evalRvalueSymTree
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
   | .unaryOp .not op =>
-    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
     | .ok (.scalar sc) locals' =>
       evalUnaryNotSymTree sc (operandTy localDecls layouts op) locals' mem
     | .ok _ _ => .leaf .unsupported
@@ -1475,12 +1475,12 @@ theorem evalRvalueSymTree_eval
   cases rv with
   | binaryOp op lhsOp rhsOp =>
     dsimp only [evalRvalueSymTree, evalRvalue]
-    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals with
+    cases evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
     | ub => rfl
     | unsupported => rfl
     | ok lhsVal locals₁ =>
       dsimp only
-      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals with
+      cases evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | ub => rfl
       | unsupported => rfl
       | ok rhsVal locals₂ =>
@@ -1506,7 +1506,7 @@ theorem evalRvalueSymTree_eval
     cases uop with
     | not =>
       dsimp only [evalRvalueSymTree, evalRvalue]
-      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      cases evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | ub => rfl
       | unsupported => rfl
       | ok v locals' =>

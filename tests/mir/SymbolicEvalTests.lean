@@ -1223,17 +1223,19 @@ private theorem lookup_from_raw_1 :
 private theorem evalOperands_nil
     (locals : List LocalSlot) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) :
-    evalOperands locals [] borrows globals layouts callerLocals = .ok [] locals := rfl
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperands locals [] borrows globals layouts callerLocals localDecls = .ok [] locals := rfl
 
 private theorem evalOperands_cons
     (locals : List LocalSlot) (op : Operand) (rest : List Operand)
     (borrows : List BorrowEntry) (globals : List CapturedAllocation)
-    (layouts : LayoutTable) (callerLocals : List LocalSlot) :
-    evalOperands locals (op :: rest) borrows globals layouts callerLocals =
-      match evalOperand locals op borrows globals layouts callerLocals with
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl := .nil) :
+    evalOperands locals (op :: rest) borrows globals layouts callerLocals localDecls =
+      match evalOperand locals op borrows globals layouts callerLocals localDecls with
       | .ok v locals₁ =>
-        match evalOperands locals₁ rest borrows globals layouts callerLocals with
+        match evalOperands locals₁ rest borrows globals layouts callerLocals localDecls with
         | .ok vs locals₂ => .ok (v :: vs) locals₂
         | .ub => .ub
         | .unsupported => .unsupported
@@ -1244,7 +1246,7 @@ private theorem evalRvalue_aggregate_tuple
     (locals : List LocalSlot) (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.aggregate .tuple ops) mem localDecls layouts =
-      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
+      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
       | .ub => .ub
       | .unsupported => .unsupported := rfl
@@ -1254,7 +1256,7 @@ private theorem evalRvalue_aggregate_rawPtr
     (ops : List Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.aggregate (.rawPtr elemTy mutability) ops) mem localDecls layouts =
-      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals with
+      match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | .ok (.ptr ptrVal _ :: .unit :: .nil) locals' =>
         .ok (.ptr ptrVal 8) locals' mem
       | .ok (.ptr ptrVal _ :: .aggregate 0 .nil :: .nil) locals' =>
@@ -1276,7 +1278,7 @@ private theorem evalRvalue_unaryOp_ptrMetadata
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.unaryOp .ptrMetadata op) mem localDecls layouts =
       let ptrBytes := layoutPointerBytes layouts
-      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | .ok (.aggregate 0 (.ptr _ ptrSz :: .scalar metaSc :: .nil)) locals' =>
         match Bool.and (Nat.beq ptrSz ptrBytes) (Nat.beq metaSc.sizeBytes ptrBytes) with
         | true => .ok (.scalar ⟨metaSc.bits, metaSc.sizeBytes⟩) locals' mem
@@ -1295,7 +1297,7 @@ private theorem evalRvalue_cast_ptrToPtr
     (locals : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     evalRvalue locals (.cast .ptrToPtr op targetTy) mem localDecls layouts =
-      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
+      match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls with
       | .ok (.ptr ptrVal sz) locals' =>
         match targetTy.kind with
         | .rawPtr _ (.slice _) => .ub
@@ -1394,7 +1396,8 @@ theorem sliceLenAsPtrFromRawParts_verified :
     checkCalleeTargetCompatible, pushCalleeFrame, restoreCallerProtectors,
     SymTree.bind, SymTree.run, evalNodeWP,
     MirStepNode.step, MirStepNode.retNormal, mirNormalPost,
-    readProjectedValue, writePlaceValue, invalidateConflictingBorrows, lookupBorrow, ProvenancePtr.tag,
+    readProjectedValue, writePlaceValue, validateValueForTy?, isValidCharCode,
+    invalidateConflictingBorrows, lookupBorrow, ProvenancePtr.tag,
     operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned,
     GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
     HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
@@ -1551,7 +1554,8 @@ theorem sliceHelperPipeline_verified :
       checkCalleeTargetCompatible, pushCalleeFrame, restoreCallerProtectors,
       SymTree.bind, SymTree.run, evalNodeWP,
       MirStepNode.step, MirStepNode.retNormal, mirNormalPost,
-      readProjectedValue, writePlaceValue, invalidateConflictingBorrows, lookupBorrow, ProvenancePtr.tag,
+      readProjectedValue, writePlaceValue, validateValueForTy?, isValidCharCode,
+    invalidateConflictingBorrows, lookupBorrow, ProvenancePtr.tag,
       operandIsSigned, operandTy, placeTy, resolveProjectedTy, tyIsSigned,
       GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal,
       HAppend.hAppend, instHAppendOfAppend, Append.append, List.instAppend,
