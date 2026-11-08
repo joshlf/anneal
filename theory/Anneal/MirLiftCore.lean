@@ -2312,14 +2312,17 @@ def evalRvalueFast
   | .use op =>
     match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals with
     | .ok v locals' =>
-      match op, mem.borrows with
-      | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-        .ok v locals'
-          { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
-      | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-        .ok v locals'
-          { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
-      | _, _ => .ok v locals' mem
+      match validateLoadedValue body.layouts body.localDecls op v with
+      | false => .ub
+      | true =>
+        match op, mem.borrows with
+        | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+          .ok v locals'
+            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+        | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+          .ok v locals'
+            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+        | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .cast ck op targetTy =>
@@ -2434,14 +2437,17 @@ def evalRvalueSymTreeFast
   | .use op =>
     match evalOperandFast body locals op mem.borrows mem.globals mem.callerLocals with
     | .ok v locals' =>
-      .leaf (match op, mem.borrows with
-      | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-        .ok v locals'
-          { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
-      | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
-        .ok v locals'
-          { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
-      | _, _ => .ok v locals' mem)
+      .leaf (match validateLoadedValue body.layouts body.localDecls op v with
+      | false => .ub
+      | true =>
+        match op, mem.borrows with
+        | .copy { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+          .ok v locals'
+            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+        | .move { local_ := ptrLoc, projection := .deref :: restProj }, b₁ :: b₂ :: restBorrows =>
+          .ok v locals'
+            { mem with borrows := freezeDerefReadBorrowsAt locals ptrLoc restProj (b₁ :: b₂ :: restBorrows) }
+        | _, _ => .ok v locals' mem)
     | .ub => .leaf .ub
     | .unsupported => .leaf .unsupported
   | .ref bk p =>

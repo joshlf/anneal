@@ -352,7 +352,7 @@ theorem evalCopyNonOverlapping_one_of_obligations
   have hSrcZero : src.toProvenancePtr.offsetBytes = 0 := hSrcOff
   have hDstZero : dst.toProvenancePtr.offsetBytes = 0 := hDstOff
   unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
-    evalCopySingleDirect writePlaceValue
+    evalCopyNonOverlappingPermOk evalCopySingleDirect writePlaceValue
   simp [hSrc, hDst, hCnt, hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
         hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,
         hDstProj, hDstVal, hWrite, readProjectedValue]

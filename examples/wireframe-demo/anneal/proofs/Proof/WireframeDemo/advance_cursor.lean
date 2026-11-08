@@ -74,9 +74,9 @@ private theorem advance_cursor_lift
   · rfl
   · repeat (apply LiftLensStmts.cons; · exact .storageLive (.mk rfl (set?_of_forcePureEnv? rfl)))
     apply LiftLensStmts.cons
-    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
+    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl) rfl) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
     apply LiftLensStmts.cons
-    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
+    · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl) rfl) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
     apply LiftLensStmts.cons
     · exact .pureAssign (.mk (.binaryOp (v := .aggregate 0 [.scalar ⟨limit - offset, 2⟩, .scalar ⟨0, 1⟩])
         (.pure (.copy_local rfl)) (.pure (.copy_local rfl))
@@ -107,7 +107,7 @@ private theorem advance_cursor_lift
       · rfl
       · rfl
       · apply LiftLensStmts.cons
-        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
+        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl) rfl) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         apply LiftLensStmts.cons
         · exact .pureAssign (.mk (.binaryOp (.pure (.copy_local rfl)) (.pure (.copy_local rfl)) (fun _ => rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         exact .nil
@@ -121,7 +121,7 @@ private theorem advance_cursor_lift
         · rfl
         · rfl
         · apply LiftLensStmts.cons
-          · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
+          · exact .pureAssign (.mk (.use_deref_field (.copy_deref_field (rp := cursorRp) rfl rfl rfl) rfl) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
           apply LiftLensStmts.cons
           · exact .pureAssign (.mk (.binaryOp (v := .aggregate 0 [.scalar ⟨offset + step, 2⟩, .scalar ⟨0, 1⟩])
               (.pure (.copy_local rfl)) (.pure (.copy_local rfl))
@@ -143,10 +143,10 @@ private theorem advance_cursor_lift
           · rfl
           · apply LiftLensStmts.cons
             · exact .derefWrite (.field
-                (.use_pure (.move_field rfl rfl))
+                (.use_pure (.move_field rfl rfl) rfl)
                 (rp := cursorRp) rfl rfl rfl)
             apply LiftLensStmts.cons
-            · exact .pureAssign (.mk (.use_pure .const_scalar) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
+            · exact .pureAssign (.mk (.use_pure .const_scalar rfl) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
             exact .nil
           · -- bb5: `return`
             exact LiftLensBlock.return_ rfl rfl rfl .nil rfl
@@ -160,7 +160,7 @@ private theorem advance_cursor_lift
       · rfl
       · rfl
       · apply LiftLensStmts.cons
-        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
+        · exact .pureAssign (.mk (.use_pure (.move_field rfl rfl) rfl) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         apply LiftLensStmts.cons
         · exact .pureAssign (.mk (.binaryOp (.pure (.copy_local rfl)) (.pure (.copy_local rfl)) (fun _ => rfl)) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
         exact .nil
@@ -173,7 +173,7 @@ private theorem advance_cursor_lift
         · rfl
         · rfl
         · apply LiftLensStmts.cons
-          · exact .pureAssign (.mk (.use_pure .const_scalar) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
+          · exact .pureAssign (.mk (.use_pure .const_scalar rfl) rfl (fun h => nomatch h) (set?_of_forcePureEnv? rfl))
           exact .nil
         · -- bb5: `return`
           exact LiftLensBlock.return_ rfl rfl rfl .nil rfl

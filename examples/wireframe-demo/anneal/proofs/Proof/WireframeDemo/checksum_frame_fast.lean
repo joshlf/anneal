@@ -120,7 +120,7 @@ private theorem impl_verified
       Mir.WireframeDemo.checksum_frame_fast.body,
       lookupBlock, stepCfgState, dispatchBlockCfg, stepNodeToCfg, evalTerminatorCfg,
       evalStmtFast, finishAssignStmtNodeFast, advanceStmt,
-      evalRvalueFast, evalByteCastAfterOperand_frame8, frame4WordsLE,
+      evalRvalueFast, validateLoadedValue, evalByteCastAfterOperand_frame8, frame4WordsLE,
       evalOperandFast, evalConstValue, evalScalarBinOp, evalUnaryNot,
       operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq,
       tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,

@@ -128,7 +128,7 @@ fn miri_diff_manifest_validation_rejects_stale_bugs_and_bad_paths() {
         .iter()
         .filter(|t| t.known_anneal_bug.is_some())
         .count();
-    assert_eq!(bug_count, 3);
+    assert_eq!(bug_count, 2);
 
     // Every `ub` test must have `miri_ub_span` recorded, and no non-`ub` test
     // may have `miri_ub_span`.
@@ -417,8 +417,8 @@ fn end_to_end_miri_differential_suite_and_ratchet() {
     assert_eq!(report.total_tests, 77);
     assert_eq!(report.verified_pass_count, 33);
     assert_eq!(report.verified_panic_count, 9);
-    assert_eq!(report.verified_strict_ub_count, 32);
-    assert_eq!(report.ratcheted_known_bug_count, 3);
+    assert_eq!(report.verified_strict_ub_count, 33);
+    assert_eq!(report.ratcheted_known_bug_count, 2);
     // 33 pass + 9 panic + 1 helper (`helper_add_ten`) = 43 certificate modules
     assert_eq!(report.audited_certificate_modules.len(), 43);
 

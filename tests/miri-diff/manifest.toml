@@ -300,12 +300,6 @@ upstream_path = "tests/fail/validity/transmute_through_ptr.rs"
 miri_verdict = "ub"
 miri_ub_span = "src/lib.rs:323:5"
 fuel = 128
-[tests.known_anneal_bug]
-status = "open_bug"
-bug_class = "soundness_false_negative"
-observed_anneal_tag = "pass:scalar:3:1"
-suspected_component = "Trusted.Rustc.V2026_06_01.MirSemantics.Places"
-summary = "Writing 3u8 through a *mut u8 pointer cast from &mut bool stores an out-of-range scalar (3) into the bool local without re-validating bool scalar range [0, 1] on write or subsequent typed read."
 
 [[tests]]
 name = "pass_uninit_union_write_then_read"

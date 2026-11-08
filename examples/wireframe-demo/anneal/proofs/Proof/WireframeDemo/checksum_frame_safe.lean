@@ -221,7 +221,7 @@ theorem safe_noCallWpConverges
       Mir.WireframeDemo.checksum_frame_safe.body,
       lookupBlock, stepCfgState, dispatchBlockCfg, stepNodeToCfg,
       evalTerminatorCfg, evalStmtFast, finishAssignStmtNodeFast, advanceStmt,
-      evalRvalueFast, evalOperandFast, evalConstValue,
+      evalRvalueFast, validateLoadedValue, evalOperandFast, evalConstValue,
       evalScalarBinOp, evalUnaryNot,
       operandIsSigned, operandTy, sharedBorrowPerm, rigidTyIsFreeze, stringEq,
       tyIsFreeze, placeTy, resolveProjectedTy, pointeeTyOf, elemTyOf, tyIsSigned,

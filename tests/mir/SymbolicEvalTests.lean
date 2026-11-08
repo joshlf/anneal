@@ -2049,7 +2049,11 @@ def polyIdMir : CapturedMir := {
 
 def polyIdClaimFor (typeArgs : TypeSubst) : Claim where
   body := polyIdMir.instantiate typeArgs
-  pre args := ∃ v : Value, args = [v]
+  pre args :=
+    ∃ v : Value, args = [v] ∧
+      (match typeArgs with
+      | [(.bool, _)] => v = .scalar { bits := 0, sizeBytes := 1 } ∨ v = .scalar { bits := 1, sizeBytes := 1 }
+      | _ => True)
   post args ret := args = [ret]
 
 /--
@@ -2061,8 +2065,20 @@ theorem polyId_all_typeArgs_verified :
       typeArgs.length = 1 →
       VerificationResult (polyIdClaimFor typeArgs) := by
   refine verifyPolyMirNoPanicSym polyIdMir polyIdClaimFor 8 ?_
-  rintro typeArgs _ args s rfl ⟨v, rfl⟩ h_ctx
-  rfl
+  intro typeArgs
+  cases typeArgs with
+  | nil => intro h_len; contradiction
+  | cons head tail =>
+    cases tail with
+    | cons head2 tail2 => intro h_len; dsimp [TypeSubst.length] at h_len; have : polyIdMir.typeParamCount = 1 := rfl; omega
+    | nil =>
+      rcases head with ⟨t, l⟩
+      intro h_len args s rfl ⟨v, h_args, hv⟩ h_ctx
+      subst h_args
+      cases t
+      case bool =>
+        rcases hv with rfl | rfl <;> rfl
+      all_goals rfl
 
 /--
 `#[external_spec]` sidecar for `core::slice::from_raw_parts_mut` and a modular

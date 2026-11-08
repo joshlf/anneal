@@ -2179,16 +2179,19 @@ inductive LiftLensRvalue
       {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
       {op : Operand} {v : Value} :
       LiftLensOperand env op v env' →
+      validateLoadedValue layouts localDecls op v = true →
       LiftLensRvalue localDecls layouts env entries (.use op) v env'
   | use_deref
       {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
       {op : Operand} {v : Value} :
       LiftDerefRead env entries op v env' →
+      validateLoadedValue layouts localDecls op v = true →
       LiftLensRvalue localDecls layouts env entries (.use op) v env'
   | use_deref_field
       {env env' : PureEnv} {entries : List (RawPtrVal × Value)}
       {op : Operand} {v : Value} :
       LiftDerefFieldRead env entries op v env' →
+      validateLoadedValue layouts localDecls op v = true →
       LiftLensRvalue localDecls layouts env entries (.use op) v env'
   | copyForDeref_deref
       {env : PureEnv} {entries : List (RawPtrVal × Value)}
@@ -2845,20 +2848,24 @@ theorem LiftLensRvalue.evalRvalue_eq
     evalRvalue env rv m localDecls layouts = .ok v env' m ∧
     env'.length = env.length := by
   cases h with
-  | use_pure hOp =>
+  | use_pure hOp hVal =>
     rcases hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals with
       ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
-    simp [hEval]
+    simp only [hEval]
+    rw [hVal]
+    dsimp only
     exact hOp.not_deref m.borrows m
-  | use_deref hDeref =>
+  | use_deref hDeref hVal =>
     rcases hDeref.evalOperand_and_freeze_eq hInv layouts with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
     unfold evalRvalue
-    simp [hEval]
+    simp only [hEval]
+    rw [hVal]
+    dsimp only
     cases hDeref with
     | copy_deref _ _ =>
       cases hB : m.borrows with
@@ -2882,13 +2889,15 @@ theorem LiftLensRvalue.evalRvalue_eq
           rw [hB] at hFr
           dsimp only
           rw [hFr, ← hB]
-  | use_deref_field hField =>
+  | use_deref_field hField hVal =>
     rcases hField.evalOperand_and_freeze_eq hInv layouts with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
     unfold evalRvalue
-    simp [hEval]
+    simp only [hEval]
+    rw [hVal]
+    dsimp only
     cases hField with
     | copy_deref_field _ _ _ =>
       cases hB : m.borrows with
@@ -3914,9 +3923,9 @@ theorem LiftLensRvalue.length_eq
     (h : LiftLensRvalue localDecls layouts env entries rv v env') :
     env'.length = env.length := by
   cases h with
-  | use_pure hOp => exact hOp.length_eq
-  | use_deref hDeref => cases hDeref <;> rfl
-  | use_deref_field hField => cases hField <;> rfl
+  | use_pure hOp _ => exact hOp.length_eq
+  | use_deref hDeref _ => cases hDeref <;> rfl
+  | use_deref_field hField _ => cases hField <;> rfl
   | copyForDeref_deref _ _ => rfl
   | binaryOp hLhs hRhs _ => exact hRhs.length_eq.trans hLhs.length_eq
   | unaryOp_not hOp _ => exact hOp.length_eq
@@ -7971,20 +7980,24 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
     evalRvalue env rv m localDecls layouts = .ok v env' m ∧
     env'.length = env.length := by
   cases h with
-  | use_pure hOp =>
+  | use_pure hOp hVal =>
     rcases hOp.evalOperand_eq m.borrows m.globals layouts m.callerLocals with
       ⟨hEval, hLen⟩
     refine ⟨?_, hLen⟩
     unfold evalRvalue
-    simp [hEval]
+    simp only [hEval]
+    rw [hVal]
+    dsimp only
     exact hOp.not_deref m.borrows m
-  | use_deref hDeref =>
+  | use_deref hDeref hVal =>
     rcases hDeref.evalOperand_and_freeze_eq_subplace hInv layouts with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
     unfold evalRvalue
-    simp [hEval]
+    simp only [hEval]
+    rw [hVal]
+    dsimp only
     cases hDeref with
     | copy_deref _ _ =>
       cases hB : m.borrows with
@@ -8008,13 +8021,15 @@ theorem LiftLensRvalue.evalRvalue_eq_subplace
           rw [hB] at hFr
           dsimp only
           rw [hFr, ← hB]
-  | use_deref_field hField =>
+  | use_deref_field hField hVal =>
     rcases hField.evalOperand_and_freeze_eq_subplace hInv layouts with
       ⟨hEval, hEnvEq, hFreeze⟩
     subst hEnvEq
     refine ⟨?_, rfl⟩
     unfold evalRvalue
-    simp [hEval]
+    simp only [hEval]
+    rw [hVal]
+    dsimp only
     cases hField with
     | copy_deref_field _ _ _ =>
       cases hB : m.borrows with
@@ -10994,7 +11009,7 @@ theorem add_assign_lift (x_ptr : RawPtrVal) (x_old d_val : Nat) :
   refine .cons (.derefWrite (.mk (.binaryOp_add (by decide)
       (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
       (.pure (.copy_local rfl))) rfl (lookupLensVal?_singleton_self _ _))) ?_
-  refine .cons (.pureAssign (.mk (.use_pure .const_zeroSized) rfl
+  refine .cons (.pureAssign (.mk (.use_pure .const_zeroSized rfl) rfl
       (fun h => nomatch h) rfl)) ?_
   exact .nil
 
@@ -11086,7 +11101,7 @@ theorem add_assign_retag_lift (x_ptr : RawPtrVal) (x_old d_val : Nat) :
   refine .cons (.derefWrite (.mk (.binaryOp_add (by decide)
       (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
       (.pure (.copy_local rfl))) rfl (lookupLensVal?_singleton_self _ _))) ?_
-  refine .cons (.pureAssign (.mk (oldSlot := .uninit) (.use_pure .const_zeroSized)
+  refine .cons (.pureAssign (.mk (oldSlot := .uninit) (.use_pure .const_zeroSized rfl)
       rfl (fun h => nomatch h) rfl)) ?_
   exact .nil
 
@@ -11250,17 +11265,17 @@ theorem swap_u32_lift (a_ptr b_ptr : RawPtrVal) (a_old b_old : Nat)
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
       (env₂ := [.uninit, .init (.ptr a_ptr.toMirPtr 8),
         .init (.ptr b_ptr.toMirPtr 8), .init (.scalar ⟨a_old, 4⟩)])
-      (.use_deref (.copy_deref rfl (by simp [lookupLensVal?]; rfl)))
+      (.use_deref (.copy_deref rfl (by simp [lookupLensVal?]; rfl)) rfl)
       rfl (fun h => nomatch h) rfl)) ?_
   refine .cons (.derefWrite (.mk
-      (.use_deref (.copy_deref rfl (by simp [lookupLensVal?, hNe]; rfl)))
+      (.use_deref (.copy_deref rfl (by simp [lookupLensVal?, hNe]; rfl)) rfl)
       rfl (by simp [lookupLensVal?]; rfl))) ?_
-  refine .cons (.derefWrite (.mk (.use_pure (.copy_local rfl)) rfl
+  refine .cons (.derefWrite (.mk (.use_pure (.copy_local rfl) rfl) rfl
       (by simp [lookupLensVal?, updateLensVal, hNe]; rfl))) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
       (env₂ := [.init .unit, .init (.ptr a_ptr.toMirPtr 8),
         .init (.ptr b_ptr.toMirPtr 8), .init (.scalar ⟨a_old, 4⟩)])
-      (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+      (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
   refine .cons (.storageDead (.mk (oldSlot := .init (.scalar ⟨a_old, 4⟩))
       (env' := [.init .unit, .init (.ptr a_ptr.toMirPtr 8),
         .init (.ptr b_ptr.toMirPtr 8), .dead]) rfl rfl)) ?_
@@ -11494,11 +11509,11 @@ theorem add_assign_checked_lift (x_ptr : RawPtrVal) (x_old d_val : Nat)
   · refine LiftLensBlock.return_
       (env' := [.init .unit, .init (.ptr x_ptr.toMirPtr 8),
         .init (.scalar ⟨d_val, 4⟩), .dead]) rfl rfl rfl ?_ rfl
-    refine .cons (.derefWrite (.mk (.use_pure (.move_field rfl rfl)) rfl
+    refine .cons (.derefWrite (.mk (.use_pure (.move_field rfl rfl) rfl) rfl
       (lookupLensVal?_singleton_self _ _))) ?_
     refine .cons (.storageDead (.mk rfl rfl)) ?_
     refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-      (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+      (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
     exact .nil
 
 /--
@@ -11704,7 +11719,7 @@ theorem max_assign_u32_lift (x_ptr : RawPtrVal) (x_old y_val : Nat) :
       · rfl
       · rfl
       · rfl
-      · refine .cons (.derefWrite (.mk (.use_pure (.copy_local rfl)) rfl
+      · refine .cons (.derefWrite (.mk (.use_pure (.copy_local rfl) rfl) rfl
           (lookupLensVal?_singleton_self _ _))) ?_
         rw [updateLensVal_singleton_self]
         exact .nil
@@ -11713,7 +11728,7 @@ theorem max_assign_u32_lift (x_ptr : RawPtrVal) (x_old y_val : Nat) :
             .init (.scalar ⟨y_val, 4⟩), .dead]) rfl rfl rfl ?_ rfl
         refine .cons (.storageDead (.mk rfl rfl)) ?_
         refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-          (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+          (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
         exact .nil
   · have hLe : y_val ≤ x_old := Nat.le_of_not_lt hLt
     have hBle : Nat.ble y_val x_old = true := Nat.ble_eq_true_of_le hLe
@@ -11744,7 +11759,7 @@ theorem max_assign_u32_lift (x_ptr : RawPtrVal) (x_old y_val : Nat) :
           .init (.scalar ⟨y_val, 4⟩), .dead]) rfl rfl rfl ?_ rfl
       refine .cons (.storageDead (.mk rfl rfl)) ?_
       refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-        (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+        (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
       exact .nil
 
 /--
@@ -11871,7 +11886,7 @@ theorem not_assign_lift (x_ptr : RawPtrVal) (x_old : Nat) :
       (fun _ => rfl))
     rfl (lookupLensVal?_singleton_self _ _))) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-    (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+    (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
   exact .nil
 
 theorem not_assign_mirWpConverges
@@ -12004,7 +12019,7 @@ theorem widen_assign_lift (x_ptr : RawPtrVal) (x_old y_val : Nat) :
     (.cast_intToInt (targetBytes := 8) (.pure (.copy_local rfl)) rfl rfl)
     rfl (lookupLensVal?_singleton_self _ _))) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-    (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+    (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
   exact .nil
 
 theorem widen_assign_mirWpConverges
@@ -12142,7 +12157,7 @@ theorem neg_assign_i32_lift (x_ptr : RawPtrVal) (x_old : Nat) :
       rfl)
     rfl (lookupLensVal?_singleton_self _ _))) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-    (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+    (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
   exact .nil
 
 theorem neg_assign_i32_mirWpConverges
@@ -12287,7 +12302,7 @@ theorem drop_temp_assign_lift (x_ptr : RawPtrVal) (x_old d_val : Nat) :
       (env' := [.uninit, .init (.ptr x_ptr.toMirPtr 8),
         .init (.scalar ⟨d_val, 4⟩), .uninit]) rfl rfl)) ?_
     refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-      (.use_pure (.copy_local rfl)) rfl (fun h => nomatch h) rfl)) ?_
+      (.use_pure (.copy_local rfl) rfl) rfl (fun h => nomatch h) rfl)) ?_
     refine .cons (.derefWrite (.mk
       (.binaryOp_add (by decide)
         (.deref (.copy_deref rfl (lookupLensVal?_singleton_self _ _)))
@@ -12302,7 +12317,7 @@ theorem drop_temp_assign_lift (x_ptr : RawPtrVal) (x_old d_val : Nat) :
         .init (.scalar ⟨d_val, 4⟩), .dead]) rfl rfl rfl ?_ rfl
     refine .cons (.storageDead (.mk rfl rfl)) ?_
     refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-      (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+      (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
     exact .nil
 
 theorem drop_temp_assign_mirWpConverges
@@ -12696,7 +12711,7 @@ theorem swap_pair_u32_lift (p_ptr : RawPtrVal) (a_old b_old : Nat) :
     rfl rfl)) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
     (.use_deref_field (.copy_deref_field rfl
-      (lookupLensVal?_singleton_self _ _) rfl))
+      (lookupLensVal?_singleton_self _ _) rfl) rfl)
     rfl (fun h => nomatch h) rfl)) ?_
   refine .cons (.storageLive (.mk (oldSlot := .dead)
     (env' := [.uninit, .init (.ptr p_ptr.toMirPtr 8),
@@ -12704,20 +12719,20 @@ theorem swap_pair_u32_lift (p_ptr : RawPtrVal) (a_old b_old : Nat) :
     rfl rfl)) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
     (.use_deref_field (.copy_deref_field rfl
-      (lookupLensVal?_singleton_self _ _) rfl))
+      (lookupLensVal?_singleton_self _ _) rfl) rfl)
     rfl (fun h => nomatch h) rfl)) ?_
   refine .cons (.derefWrite (.field
-    (.use_pure (.move_local rfl rfl))
+    (.use_pure (.move_local rfl rfl) rfl)
     rfl (lookupLensVal?_singleton_self _ _) rfl)) ?_
   rw [updateLensVal_singleton_self]
   refine .cons (.storageDead (.mk rfl rfl)) ?_
   refine .cons (.derefWrite (.field
-    (.use_pure (.move_local rfl rfl))
+    (.use_pure (.move_local rfl rfl) rfl)
     rfl (lookupLensVal?_singleton_self _ _) rfl)) ?_
   rw [updateLensVal_singleton_self]
   refine .cons (.storageDead (.mk rfl rfl)) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-    (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+    (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
   exact .nil
 
 theorem swap_pair_u32_mirWpConverges
@@ -13503,7 +13518,7 @@ theorem swap_pair_tuple_rvalue_lift (p_ptr : RawPtrVal) (a_old b_old : Nat) :
     rfl (lookupLensVal?_singleton_self _ _))) ?_
   rw [updateLensVal_singleton_self]
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-    (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+    (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
   exact .nil
 
 theorem swap_pair_tuple_rvalue_mirWpConverges
@@ -13671,7 +13686,7 @@ theorem step_fib_pair_adt_lift (p_ptr : RawPtrVal) (a_old b_old : Nat) :
   rw [updateLensVal_singleton_self]
   refine .cons (.storageDead (.mk rfl rfl)) ?_
   refine .cons (.pureAssign (.mk (oldSlot := .uninit)
-    (.use_pure .const_zeroSized) rfl (fun h => nomatch h) rfl)) ?_
+    (.use_pure .const_zeroSized rfl) rfl (fun h => nomatch h) rfl)) ?_
   exact .nil
 
 theorem step_fib_pair_adt_mirWpConverges

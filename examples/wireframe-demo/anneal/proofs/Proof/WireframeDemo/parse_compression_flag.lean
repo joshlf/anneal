@@ -37,7 +37,7 @@ private theorem rustRequires_imp_zero_or_one (b : Nat)
     defaultSpecSteps, entryBB, dummyBB, lookupBlock,
     wpBlockLinear, wpCfgStep, dispatchBlock, wpExecFallback, wpExecGen,
     stepMirSymTreeFast, evalSymNodeTree, evalStmtSymTreeFast, finishAssignSymTree,
-    finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, evalOperandFast,
+    finishAssignStmtNode, advanceStmt, evalRvalueSymTreeFast, validateLoadedValue, evalOperandFast,
     evalOperandsFast, evalConstValue, evalScalarBinOpSymTree, bitwiseAndBitsFast,
     evalUnaryNotSymTree, operandIsSigned, operandTy, sharedBorrowPerm,
     rigidTyIsFreeze, stringEq, tyIsFreeze, placeTy, resolveProjectedTy,

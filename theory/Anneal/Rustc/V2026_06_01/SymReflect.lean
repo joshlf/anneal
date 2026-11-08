@@ -1222,6 +1222,23 @@ def freezeSymPlaceReadBorrows
     freezeSymDerefReadBorrowsAt slots place.local_ restProj (b₁ :: b₂ :: restBorrows)
   | _, _ => borrows
 
+/-- Validate that a loaded symbolic value complies with `validateLoadedValue`. -/
+def symValidateLoadedValue
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl)
+    (op : Operand)
+    (sv : SymVal) : Bool :=
+  match op with
+  | .copy _ | .move _ =>
+    match operandTy localDecls layouts op with
+    | .some { kind := .bool, .. } =>
+      match sv with
+      | .concrete (.scalar sc) => Nat.beq sc.bits 0 || Nat.beq sc.bits 1
+      | .symGuarded (.scalar sc) _ => Nat.beq sc.bits 0 || Nat.beq sc.bits 1
+      | _ => false
+    | _ => true
+  | _ => true
+
 /-- Evaluate an `Rvalue` that produces a `SymVal`. -/
 def evalSymRvalueConcrete
     (slots : List SymSlot)
@@ -1235,7 +1252,9 @@ def evalSymRvalueConcrete
   | .use op =>
     match evalSymOperand slots op borrows with
     | .some (sv, slots') =>
-      .some (sv, slots', freezeSymOperandReadBorrows slots op borrows, nextTag)
+      match symValidateLoadedValue layouts localDecls op sv with
+      | true => .some (sv, slots', freezeSymOperandReadBorrows slots op borrows, nextTag)
+      | false => .none
     | .none => .none
   | .copyForDeref place =>
     match evalSymPlaceCopy slots place borrows with
@@ -1347,6 +1366,155 @@ theorem concretizeSymReadResult_to_rvalue
     dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
     cases get? args idx <;> rfl
 
+theorem concretizeSymReadResult_to_rvalue_valid
+    (args : List Value)
+    (sv0 : SymVal)
+    (s1 : List SymSlot)
+    (mem' : Memory)
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl)
+    (op : Operand)
+    (hValid : symValidateLoadedValue layouts localDecls op sv0 = true) :
+    (match concretizeSymReadResult args sv0 s1 with
+     | .ok v locals' =>
+       match validateLoadedValue layouts localDecls op v with
+       | false => RvalueEvalResult.ub
+       | true => RvalueEvalResult.ok v locals' mem'
+     | .ub => RvalueEvalResult.ub
+     | .unsupported => RvalueEvalResult.unsupported) =
+      concretizeSymRvalueResult args sv0 s1 mem' := by
+  cases sv0 with
+  | concrete v =>
+    dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+    have hVal : validateLoadedValue layouts localDecls op v = true := by
+      cases op with
+      | constant _ => rfl
+      | copy p =>
+        dsimp only [validateLoadedValue]
+        dsimp only [symValidateLoadedValue] at hValid
+        cases hTy : operandTy localDecls layouts (.copy p) with
+        | none => rfl
+        | some ty =>
+          cases ty with | mk kind layoutIdx =>
+          cases kind with
+          | bool =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
+          | _ => rfl
+      | move p =>
+        dsimp only [validateLoadedValue]
+        dsimp only [symValidateLoadedValue] at hValid
+        cases hTy : operandTy localDecls layouts (.move p) with
+        | none => rfl
+        | some ty =>
+          cases ty with | mk kind layoutIdx =>
+          cases kind with
+          | bool =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
+          | _ => rfl
+    rw [hVal]
+  | symArg idx =>
+    dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+    cases op with
+    | constant _ => cases get? args idx <;> rfl
+    | copy p =>
+      dsimp only [validateLoadedValue]
+      dsimp only [symValidateLoadedValue] at hValid
+      cases hTy : operandTy localDecls layouts (.copy p) with
+      | none => cases get? args idx <;> rfl
+      | some ty =>
+        cases ty with | mk kind layoutIdx =>
+        cases kind with
+        | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | _ => cases get? args idx <;> rfl
+    | move p =>
+      dsimp only [validateLoadedValue]
+      dsimp only [symValidateLoadedValue] at hValid
+      cases hTy : operandTy localDecls layouts (.move p) with
+      | none => cases get? args idx <;> rfl
+      | some ty =>
+        cases ty with | mk kind layoutIdx =>
+        cases kind with
+        | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | _ => cases get? args idx <;> rfl
+  | symPair0 v0 idx =>
+    dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+    cases op with
+    | constant _ => cases get? args idx <;> rfl
+    | copy p =>
+      dsimp only [validateLoadedValue]
+      dsimp only [symValidateLoadedValue] at hValid
+      cases hTy : operandTy localDecls layouts (.copy p) with
+      | none => cases get? args idx <;> rfl
+      | some ty =>
+        cases ty with | mk kind layoutIdx =>
+        cases kind with
+        | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | _ => cases get? args idx <;> rfl
+    | move p =>
+      dsimp only [validateLoadedValue]
+      dsimp only [symValidateLoadedValue] at hValid
+      cases hTy : operandTy localDecls layouts (.move p) with
+      | none => cases get? args idx <;> rfl
+      | some ty =>
+        cases ty with | mk kind layoutIdx =>
+        cases kind with
+        | bool => rw [hTy] at hValid; dsimp only at hValid; nomatch hValid
+        | _ => cases get? args idx <;> rfl
+  | symGuarded v0 idx =>
+    dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+    have hVal : validateLoadedValue layouts localDecls op v0 = true := by
+      cases op with
+      | constant _ => rfl
+      | copy p =>
+        dsimp only [validateLoadedValue]
+        dsimp only [symValidateLoadedValue] at hValid
+        cases hTy : operandTy localDecls layouts (.copy p) with
+        | none => rfl
+        | some ty =>
+          cases ty with | mk kind layoutIdx =>
+          cases kind with
+          | bool =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v0 with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
+          | _ => rfl
+      | move p =>
+        dsimp only [validateLoadedValue]
+        dsimp only [symValidateLoadedValue] at hValid
+        cases hTy : operandTy localDecls layouts (.move p) with
+        | none => rfl
+        | some ty =>
+          cases ty with | mk kind layoutIdx =>
+          cases kind with
+          | bool =>
+            rw [hTy] at hValid; dsimp only at hValid
+            cases v0 with
+            | scalar sc =>
+              dsimp only
+              exact hValid
+            | unit | ptr _ _ | aggregate _ _ =>
+              nomatch hValid
+          | _ => rfl
+    cases get? args idx with
+    | none => rfl
+    | some _ => dsimp only; rw [hVal]
+
 theorem evalSymRvalueConcrete_sound
     (args : List Value)
     (slots : List SymSlot)
@@ -1378,97 +1546,106 @@ theorem evalSymRvalueConcrete_sound
       rw [hOp] at h
       cases pair with
       | mk sv0 s1 =>
-        injection h with hTup
-        injection hTup with hV hRest1
-        injection hRest1 with hS hRest2
-        injection hRest2 with hB hT
-        subst hV; subst hS; subst hB; subst hT
-        rw [evalSymOperand_sound args slots op mem.borrows mem.globals layouts sv0 s1 hOp]
-        rw [memory_borrows_eta mem]
-        cases op with
-        | constant _ =>
-          dsimp only [freezeSymOperandReadBorrows]
-          exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
-        | copy p =>
-          cases p with
-          | mk loc proj =>
-            cases proj with
-            | nil =>
-              dsimp only [freezeSymOperandReadBorrows]
-              exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
-            | cons pHead pTail =>
-              cases pHead with
-              | deref =>
-                dsimp only [evalSymOperand] at hOp
-                cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows with
-                | none =>
-                  rw [hCopy] at hOp
-                  nomatch hOp
-                | some sv1 =>
-                  rw [hCopy] at hOp
-                  injection hOp with hPair
-                  injection hPair with hSv hSlots
-                  subst hSv
-                  cases hBs : mem.borrows with
-                  | nil =>
-                    dsimp only [freezeSymOperandReadBorrows]
-                    rw [← hBs]
-                    exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
-                  | cons b1 rest1 =>
-                    cases rest1 with
+        dsimp only at h
+        cases hValid : symValidateLoadedValue layouts localDecls op sv0 with
+        | false =>
+          rw [hValid] at h
+          nomatch h
+        | true =>
+          rw [hValid] at h
+          injection h with hTup
+          injection hTup with hV hRest1
+          injection hRest1 with hS hRest2
+          injection hRest2 with hB hT
+          subst hV; subst hS; subst hB; subst hT
+          rw [evalSymOperand_sound args slots op mem.borrows mem.globals layouts sv0 s1 hOp]
+          rw [memory_borrows_eta mem]
+          cases op with
+          | constant _ =>
+            dsimp only [freezeSymOperandReadBorrows]
+            exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.constant _) hValid
+          | copy p =>
+            cases p with
+            | mk loc proj =>
+              cases proj with
+              | nil =>
+                dsimp only [freezeSymOperandReadBorrows]
+                exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.copy { local_ := loc, projection := .nil }) hValid
+              | cons pHead pTail =>
+                cases pHead with
+                | deref =>
+                  dsimp only [evalSymOperand] at hOp
+                  cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows with
+                  | none =>
+                    rw [hCopy] at hOp
+                    nomatch hOp
+                  | some sv1 =>
+                    rw [hCopy] at hOp
+                    injection hOp with hPair
+                    injection hPair with hSv hSlots
+                    subst hSv
+                    cases hBs : mem.borrows with
                     | nil =>
                       dsimp only [freezeSymOperandReadBorrows]
                       rw [← hBs]
-                      exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
-                    | cons b2 restBorrows =>
-                      rw [hBs] at hCopy
-                      dsimp only [freezeSymOperandReadBorrows]
-                      rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail (b1 :: b2 :: restBorrows) sv1 hCopy]
-                      exact concretizeSymReadResult_to_rvalue args sv1 s1
-                        { mem with borrows := freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail (b1 :: b2 :: restBorrows) }
-              | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                      exact concretizeSymReadResult_to_rvalue_valid args sv1 s1 mem layouts localDecls (Operand.copy { local_ := loc, projection := .deref :: pTail }) hValid
+                    | cons b1 rest1 =>
+                      cases rest1 with
+                      | nil =>
+                        dsimp only [freezeSymOperandReadBorrows]
+                        rw [← hBs]
+                        exact concretizeSymReadResult_to_rvalue_valid args sv1 s1 mem layouts localDecls (Operand.copy { local_ := loc, projection := .deref :: pTail }) hValid
+                      | cons b2 restBorrows =>
+                        rw [hBs] at hCopy
+                        dsimp only [freezeSymOperandReadBorrows]
+                        rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail (b1 :: b2 :: restBorrows) sv1 hCopy]
+                        exact concretizeSymReadResult_to_rvalue_valid args sv1 s1
+                          { mem with borrows := freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail (b1 :: b2 :: restBorrows) }
+                          layouts localDecls (Operand.copy { local_ := loc, projection := .deref :: pTail }) hValid
+                | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                  dsimp only [freezeSymOperandReadBorrows]
+                  exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
+          | move p =>
+            cases p with
+            | mk loc proj =>
+              cases proj with
+              | nil =>
                 dsimp only [freezeSymOperandReadBorrows]
-                exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
-        | move p =>
-          cases p with
-          | mk loc proj =>
-            cases proj with
-            | nil =>
-              dsimp only [freezeSymOperandReadBorrows]
-              exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
-            | cons pHead pTail =>
-              cases pHead with
-              | deref =>
-                dsimp only [evalSymOperand] at hOp
-                cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows with
-                | none =>
-                  rw [hCopy] at hOp
-                  nomatch hOp
-                | some sv1 =>
-                  rw [hCopy] at hOp
-                  injection hOp with hPair
-                  injection hPair with hSv hSlots
-                  subst hSv
-                  cases hBs : mem.borrows with
-                  | nil =>
-                    dsimp only [freezeSymOperandReadBorrows]
-                    rw [← hBs]
-                    exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
-                  | cons b1 rest1 =>
-                    cases rest1 with
+                exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.move { local_ := loc, projection := .nil }) hValid
+              | cons pHead pTail =>
+                cases pHead with
+                | deref =>
+                  dsimp only [evalSymOperand] at hOp
+                  cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows with
+                  | none =>
+                    rw [hCopy] at hOp
+                    nomatch hOp
+                  | some sv1 =>
+                    rw [hCopy] at hOp
+                    injection hOp with hPair
+                    injection hPair with hSv hSlots
+                    subst hSv
+                    cases hBs : mem.borrows with
                     | nil =>
                       dsimp only [freezeSymOperandReadBorrows]
                       rw [← hBs]
-                      exact concretizeSymReadResult_to_rvalue args sv1 s1 mem
-                    | cons b2 restBorrows =>
-                      rw [hBs] at hCopy
-                      dsimp only [freezeSymOperandReadBorrows]
-                      rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail (b1 :: b2 :: restBorrows) sv1 hCopy]
-                      exact concretizeSymReadResult_to_rvalue args sv1 s1
-                        { mem with borrows := freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail (b1 :: b2 :: restBorrows) }
-              | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
-                dsimp only [freezeSymOperandReadBorrows]
-                exact concretizeSymReadResult_to_rvalue args sv0 s1 mem
+                      exact concretizeSymReadResult_to_rvalue_valid args sv1 s1 mem layouts localDecls (Operand.move { local_ := loc, projection := .deref :: pTail }) hValid
+                    | cons b1 rest1 =>
+                      cases rest1 with
+                      | nil =>
+                        dsimp only [freezeSymOperandReadBorrows]
+                        rw [← hBs]
+                        exact concretizeSymReadResult_to_rvalue_valid args sv1 s1 mem layouts localDecls (Operand.move { local_ := loc, projection := .deref :: pTail }) hValid
+                      | cons b2 restBorrows =>
+                        rw [hBs] at hCopy
+                        dsimp only [freezeSymOperandReadBorrows]
+                        rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail (b1 :: b2 :: restBorrows) sv1 hCopy]
+                        exact concretizeSymReadResult_to_rvalue_valid args sv1 s1
+                          { mem with borrows := freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail (b1 :: b2 :: restBorrows) }
+                          layouts localDecls (Operand.move { local_ := loc, projection := .deref :: pTail }) hValid
+                | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                  dsimp only [freezeSymOperandReadBorrows]
+                  exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
   | copyForDeref place =>
     dsimp only [evalSymRvalueConcrete] at h
     dsimp only [evalRvalue]

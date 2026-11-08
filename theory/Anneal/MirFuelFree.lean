@@ -4319,6 +4319,7 @@ def u32Layout : TypeLayout :=
     isUninhabited := false }
 
 /-- Standard 4-byte `u32` `Ty` referencing index `0` of `[u32Layout]`. -/
+@[reducible, simp]
 def u32Ty : Ty :=
   { kind := .uint .u32, layoutIdx := 0 }
 

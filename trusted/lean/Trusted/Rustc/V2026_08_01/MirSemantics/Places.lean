@@ -8134,6 +8134,30 @@ def evalPlaceDiscriminant
   | .ptr _ _ => .ok (.scalar ⟨0, 8⟩) locals' mem
 
 /--
+Validate that a loaded operand value complies with the type's `ScalarLayout.validRange`.
+Typed loads (`Operand.copy` and `Operand.move`) of scalar types with a restricted range
+(e.g., `bool` [0, 1]) must evaluate to UB if the underlying value is outside the valid range.
+-/
+@[simp, reducible]
+def validateLoadedValue
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl)
+    (op : Operand)
+    (v : Value) : Bool :=
+  match op with
+  | .constant _ => true
+  | .copy _ | .move _ =>
+    match operandTy localDecls layouts op with
+    | .some ty =>
+      match ty.kind with
+      | .bool =>
+        match v with
+        | .scalar sc => Bool.or (Nat.beq sc.bits 0) (Nat.beq sc.bits 1)
+        | _ => false
+      | _ => true
+    | .none => true
+
+/--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
 resolve operand types, signedness, and byte layouts for `Rvalue.binaryOp`,
 `Rvalue.unaryOp`, `Rvalue.cast`, and `Rvalue.aggregate`.
@@ -8227,32 +8251,35 @@ def evalRvalue
   | .use op | .wrapUnsafeBinder op _ =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals with
     | .ok v locals' =>
-      match op, mem.borrows with
-      | .copy { local_ := ptrLoc, projection := .deref :: restProj },
-        b₁ :: b₂ :: restBorrows =>
-        .ok
-          v
-          locals'
-          { mem with
-            borrows :=
-              freezeDerefReadBorrowsAt
-                locals
-                ptrLoc
-                restProj
-                (b₁ :: b₂ :: restBorrows) }
-      | .move { local_ := ptrLoc, projection := .deref :: restProj },
-        b₁ :: b₂ :: restBorrows =>
-        .ok
-          v
-          locals'
-          { mem with
-            borrows :=
-              freezeDerefReadBorrowsAt
-                locals
-                ptrLoc
-                restProj
-                (b₁ :: b₂ :: restBorrows) }
-      | _, _ => .ok v locals' mem
+      match validateLoadedValue layouts localDecls op v with
+      | false => .ub
+      | true =>
+        match op, mem.borrows with
+        | .copy { local_ := ptrLoc, projection := .deref :: restProj },
+          b₁ :: b₂ :: restBorrows =>
+          .ok
+            v
+            locals'
+            { mem with
+              borrows :=
+                freezeDerefReadBorrowsAt
+                  locals
+                  ptrLoc
+                  restProj
+                  (b₁ :: b₂ :: restBorrows) }
+        | .move { local_ := ptrLoc, projection := .deref :: restProj },
+          b₁ :: b₂ :: restBorrows =>
+          .ok
+            v
+            locals'
+            { mem with
+              borrows :=
+                freezeDerefReadBorrowsAt
+                  locals
+                  ptrLoc
+                  restProj
+                  (b₁ :: b₂ :: restBorrows) }
+        | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
   | .binaryOp op lhsOp rhsOp =>
