@@ -2034,6 +2034,27 @@ def inferElemListByteStride : List Value → Nat
   | _ => 1
 
 /--
+Check that every element in `elems` has byte size `elemSz` according to
+`inferValueByteSizeAux 8` (returning `false` when `elemSz == 0` or any element
+differs from `elemSz`). Used to distinguish homogeneous array/slice element
+lists from heterogeneous variant-0 aggregates (such as `(u8, u32)` tuples) when
+no static array/slice `placeTy` is in scope.
+-/
+@[reducible]
+def elemsHaveUniformByteStride : List Value → Nat → Bool
+  | .nil, elemSz => Bool.not (Nat.beq elemSz 0)
+  | e :: rest, elemSz =>
+    match Nat.beq elemSz 0 with
+    | true => false
+    | false =>
+      match inferValueByteSizeAux 8 e with
+      | .some eSz =>
+        match Nat.beq eSz elemSz with
+        | true => elemsHaveUniformByteStride rest elemSz
+        | false => false
+      | .none => false
+
+/--
 Divide `rem` by positive `stride` using structural recursion on `fuel`,
 returning `.some acc` when `stride` divides `rem` evenly and `.none` otherwise.
 -/
@@ -2630,12 +2651,12 @@ def projectionChainByteOffset?
 /--
 Check whether candidate aggregate field `idx` at byte span
 `[fOff .. fOff + fSize)` matches a cross-field pointer access of
-`expectedElemBytes` bytes at `relOff` (either directly at leaf `idx` or by
+`expectedElemBytes` bytes at `relOff` (either directly at leaf `idx`, at an
+intra-scalar byte offset `relOff - fOff` within a scalar leaf `idx`, or by
 descending into a nested aggregate via `recurse`).
 -/
-@[reducible]
 def matchAggregateCandidateField?
-    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem))
+    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem × Nat))
     (idx : FieldIdx)
     (fVal : Value)
     (fOff fSize relOff expectedElemBytes : Nat)
@@ -2643,7 +2664,7 @@ def matchAggregateCandidateField?
     (leafProjTy : Ty)
     (nestedProjTy : Ty)
     (nestedTyOpt : Option Ty) :
-    Option (List ProjectionElem) :=
+    Option (List ProjectionElem × Nat) :=
   match
     Bool.and
       (Nat.beq relOff fOff)
@@ -2655,12 +2676,12 @@ def matchAggregateCandidateField?
       | .aggregate _ _ => true
       | _ => false
     match Bool.or (Bool.not fIsAgg) leafIsAggregate with
-    | true => .some (.field idx leafProjTy :: .nil)
+    | true => .some (.field idx leafProjTy :: .nil, 0)
     | false =>
       match fVal with
       | .aggregate _ _ =>
         match recurse fVal nestedTyOpt 0 with
-        | .some innerProj => .some (.field idx nestedProjTy :: innerProj)
+        | .some (innerProj, resOff) => .some (.field idx nestedProjTy :: innerProj, resOff)
         | .none => .none
       | _ => .none
   | false =>
@@ -2674,23 +2695,30 @@ def matchAggregateCandidateField?
       match fVal with
       | .aggregate _ _ =>
         match recurse fVal nestedTyOpt (Nat.sub relOff fOff) with
-        | .some innerProj => .some (.field idx nestedProjTy :: innerProj)
+        | .some (innerProj, resOff) => .some (.field idx nestedProjTy :: innerProj, resOff)
         | .none => .none
+      | .scalar sc =>
+        match leafIsAggregate with
+        | true => .none
+        | false =>
+          let resOff := Nat.sub relOff fOff
+          match Nat.ble (Nat.add resOff expectedElemBytes) sc.sizeBytes with
+          | true => .some (.field idx nestedProjTy :: .nil, resOff)
+          | false => .none
       | _ => .none
 
 /--
 Scan fields of a `FieldsShape.arbitrary` aggregate in source field order to
 resolve a cross-field byte offset `relOff` of size `expectedElemBytes`.
 -/
-@[reducible]
 def scanArbitraryLayoutFields?
-    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem))
+    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem × Nat))
     (layouts : LayoutTable)
     (relOff expectedElemBytes : Nat)
     (leafIsAggregate : Bool)
     (defaultLeafTy : Ty) :
     Nat → List Size → List Nat → List RigidTy → List Value →
-      Option (List ProjectionElem)
+      Option (List ProjectionElem × Nat)
   | _, .nil, _, _, _ => .none
   | _, _, _, _, .nil => .none
   | idx, off :: offRest, fieldLayouts, tupleKinds, fVal :: fRest =>
@@ -2782,14 +2810,13 @@ byte offsets (`#[repr(C)]`-aligned when `useCAlign == true`, or unaligned tuple
 structural widths when `useCAlign == false`) when no `FieldsShape.arbitrary`
 layout table entry is available.
 -/
-@[reducible]
 def scanSequentialFields?
-    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem))
+    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem × Nat))
     (useCAlign : Bool)
     (relOff expectedElemBytes : Nat)
     (leafIsAggregate : Bool)
     (defaultLeafTy : Ty) :
-    Nat → Nat → List RigidTy → List Value → Option (List ProjectionElem)
+    Nat → Nat → List RigidTy → List Value → Option (List ProjectionElem × Nat)
   | _, _, _, .nil => .none
   | idx, runningOff, tupleKinds, fVal :: fRest =>
     let fkOpt : Option RigidTy :=
@@ -2854,9 +2881,8 @@ def scanSequentialFields?
 Single fuel step of `resolveAggregateAtByteOffset?`, parameterized by nested
 aggregate resolver `recurse`.
 -/
-@[reducible]
 def resolveAggregateAtByteOffsetStep
-    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem))
+    (recurse : Value → Option Ty → Nat → Option (List ProjectionElem × Nat))
     (layouts : LayoutTable)
     (curVal : Value)
     (curTyOpt : Option Ty)
@@ -2864,7 +2890,7 @@ def resolveAggregateAtByteOffsetStep
     (leafIsAggregate : Bool)
     (defaultLeafTy : Ty)
     (forceSeqRoot : Bool) :
-    Option (List ProjectionElem) :=
+    Option (List ProjectionElem × Nat) :=
   match curVal with
   | .aggregate aggVar fields =>
     let (tupleKinds, useCAlign) : (List RigidTy × Bool) :=
@@ -2931,11 +2957,11 @@ def resolveAggregateAtByteOffsetStep
               | .aggregate _ _ => true
               | _ => false
             match Bool.or (Bool.not elemIsAgg) leafIsAggregate with
-            | true => .some (.constantIndex elemIdx 0 false :: .nil)
+            | true => .some (.constantIndex elemIdx 0 false :: .nil, 0)
             | false =>
               match recurse elemVal elemTyOpt 0 with
-              | .some innerProj =>
-                .some (.constantIndex elemIdx 0 false :: innerProj)
+              | .some (innerProj, resOff) =>
+                .some (.constantIndex elemIdx 0 false :: innerProj, resOff)
               | .none => .none
           | false =>
             match Nat.ble (Nat.add innerOff expectedElemBytes) elemSz with
@@ -2944,9 +2970,16 @@ def resolveAggregateAtByteOffsetStep
               match elemVal with
               | .aggregate _ _ =>
                 match recurse elemVal elemTyOpt innerOff with
-                | .some innerProj =>
-                  .some (.constantIndex elemIdx 0 false :: innerProj)
+                | .some (innerProj, resOff) =>
+                  .some (.constantIndex elemIdx 0 false :: innerProj, resOff)
                 | .none => .none
+              | .scalar sc =>
+                match leafIsAggregate with
+                | true => .none
+                | false =>
+                  match Nat.ble (Nat.add innerOff expectedElemBytes) sc.sizeBytes with
+                  | true => .some (.constantIndex elemIdx 0 false :: .nil, innerOff)
+                  | false => .none
               | _ => .none
     | .none =>
       match curTyOpt with
@@ -2974,7 +3007,7 @@ def resolveAggregateAtByteOffsetStep
                     .nil
                     fields
                 with
-                | .some innerProj => .some (.downcast "" aggVar :: innerProj)
+                | .some (innerProj, resOff) => .some (.downcast "" aggVar :: innerProj, resOff)
                 | .none => .none
             | _ => .none
           | .single singleVar, .arbitrary offsets _ =>
@@ -3059,9 +3092,10 @@ def resolveAggregateAtByteOffsetStep
 /--
 Resolve byte offset `relOff` of access size `expectedElemBytes` within aggregate
 `curVal`, descending into nested struct, tuple, enum-variant, or array fields up
-to `fuel` levels using structural recursion on `fuel`.
+to `fuel` levels using structural recursion on `fuel`, and returning the
+resolved relative projection path together with any intra-scalar residual byte
+offset `residualBytes`.
 -/
-@[reducible]
 def resolveAggregateAtByteOffset?
     (fuel : Nat)
     (layouts : LayoutTable)
@@ -3071,12 +3105,12 @@ def resolveAggregateAtByteOffset?
     (leafIsAggregate : Bool)
     (defaultLeafTy : Ty)
     (forceSeqRoot : Bool := false) :
-    Option (List ProjectionElem) :=
+    Option (List ProjectionElem × Nat) :=
   match fuel with
   | .zero => .none
   | .succ fuel' =>
     let recurse (v : Value) (tyOpt : Option Ty) (innerOff : Nat) :
-        Option (List ProjectionElem) :=
+        Option (List ProjectionElem × Nat) :=
       resolveAggregateAtByteOffset?
         fuel'
         layouts
@@ -3101,8 +3135,9 @@ def resolveAggregateAtByteOffset?
 /--
 Resolve a non-zero intra-allocation byte offset `offsetBytes` from a field-based
 `BorrowEntry` projection `normTargetProj` ending in `.field _ leafFieldTy` onto
-the sibling or nested field at `startByteOff + offsetBytes`, returning `.none`
-when `targetByteOff` is one-past-the-end, out-of-bounds, misaligned, or
+the sibling or nested field at `startByteOff + offsetBytes` (plus any
+intra-scalar residual byte offset `residualBytes`), returning `.none` when
+`targetByteOff` is one-past-the-end, out-of-bounds, misaligned, or
 size-mismatched.
 
 Reference (`library/core/src/ptr/const_ptr.rs` at commit
@@ -3120,7 +3155,6 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 >   dangling or unaligned, even in place expression context (e.g.
 >   `addr_of!(*expr)`)."
 -/
-@[reducible]
 def resolveStackThinPtrFieldOffsetProj?
     (indexLocals : List LocalSlot)
     (targetRootVal : Value)
@@ -3131,8 +3165,9 @@ def resolveStackThinPtrFieldOffsetProj?
     (restProj : List ProjectionElem)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (pointeeTyOpt : Option Ty) :
-    Option (List ProjectionElem) :=
+    (pointeeTyOpt : Option Ty)
+    (reqBytesOpt : Option Nat := .none) :
+    Option (List ProjectionElem × Nat) :=
   let (encProj, relProj) := splitAfterLastSeqProj normTargetProj
   match readProjectedValue indexLocals targetRootVal encProj with
   | .ok (.aggregate encVar encFields) =>
@@ -3152,10 +3187,20 @@ def resolveStackThinPtrFieldOffsetProj?
         | .ok lv => .some lv
         | _ => .none
       let expectedElemBytesOpt : Option Nat :=
-        match pointeeTyOpt with
-        | .some pt =>
-          match rigidTyByteSize layouts pt with
-          | .some sz => .some sz
+        match restProj, reqBytesOpt with
+        | .nil, .some reqB => .some reqB
+        | _, _ =>
+          match pointeeTyOpt with
+          | .some pt =>
+            match rigidTyByteSize layouts pt with
+            | .some sz => .some sz
+            | .none =>
+              match rigidTyByteSize layouts leafFieldTy with
+              | .some sz => .some sz
+              | .none =>
+                match leafValOpt with
+                | .some lv => inferValueCReprBytes lv
+                | .none => .none
           | .none =>
             match rigidTyByteSize layouts leafFieldTy with
             | .some sz => .some sz
@@ -3163,13 +3208,6 @@ def resolveStackThinPtrFieldOffsetProj?
               match leafValOpt with
               | .some lv => inferValueCReprBytes lv
               | .none => .none
-        | .none =>
-          match rigidTyByteSize layouts leafFieldTy with
-          | .some sz => .some sz
-          | .none =>
-            match leafValOpt with
-            | .some lv => inferValueCReprBytes lv
-            | .none => .none
       match expectedElemBytesOpt with
       | .none => .none
       | .some expectedElemBytes =>
@@ -3240,37 +3278,35 @@ def resolveStackThinPtrFieldOffsetProj?
                 (endsWithSubslice encProj)
             with
             | .none => .none
-            | .some resolvedRelProj =>
-              let combined :=
-                appendProjections
-                  encProj
-                  (appendProjections resolvedRelProj restProj)
-              .some (normalizeSubsliceProjections combined)
+            | .some (resolvedRelProj, resOff) =>
+              let validRes : Bool :=
+                match restProj with
+                | .nil => true
+                | _ :: _ => Nat.beq resOff 0
+              match validRes with
+              | false => .none
+              | true =>
+                let combined :=
+                  appendProjections
+                    encProj
+                    (appendProjections resolvedRelProj restProj)
+                .some (normalizeSubsliceProjections combined, resOff)
   | _ => .none
 
 /--
-Resolve the effective target projection path on `entry.targetLocal` when
-dereferencing, writing through, or reborrowing a stack-backed thin pointer
-`Value.ptr ptrVal sz` (`BorrowEntry` `entry`) with post-deref projection suffix
-`restProj`.
+Resolve the effective target projection path `(fullProj, residualBytes)` on
+`entry.targetLocal` when dereferencing, writing through, or reborrowing a
+stack-backed thin pointer `Value.ptr ptrVal sz` (`BorrowEntry` `entry`) with
+post-deref projection suffix `restProj`.
 
-- When `ptrVal.offsetBytes == 0` and the pointer is not an element pointer into
-  a subslice or array (`isElemPtrAtZero == false`), returns the direct
-  concatenation `entry.targetProjection ++ restProj`.
-- When `ptrVal.offsetBytes > 0` on a pointer derived from a struct/tuple field
-  projection (`.field fieldIdx fieldTy`), resolves `startByteOff +
-  ptrVal.offsetBytes` within the enclosing aggregate via
-  `resolveStackThinPtrFieldOffsetProj?` (returning `.none` on one-past-the-end,
-  out-of-bounds, misaligned, or size-mismatched offsets).
-- When `ptrVal.offsetBytes > 0` on an array or subslice element pointer (or when
-  `ptrVal.offsetBytes == 0` with `isElemPtrAtZero == true`), translates
-  `ptrVal.offsetBytes` into an element index via `byteOffsetToElemIdx?`,
-  verifies in-bounds access against the backing array/subslice aggregate
-  (`elemIdx < length elems`), and returns the normalized projection path (or
-  `.none` on misaligned or out-of-bounds offset).
+- `residualBytes` is `0` when the pointer lands on an exact element or field
+  boundary, and `> 0` when `restProj = .nil` and the access lands at an
+  intra-element or intra-field byte offset within a wider scalar leaf.
+- Heterogeneous variant-0 aggregates (such as `(u8, u32)` tuples without an
+  in-scope `LocalDecl`) are guarded by `elemsHaveUniformByteStride` so they are
+  never misclassified as homogeneous `[T; N]` arrays.
 -/
-@[reducible]
-def resolveStackThinPtrTargetProj?
+def resolveStackThinPtrTargetProjWithResidual?
     (indexLocals : List LocalSlot)
     (targetRootVal : Value)
     (entry : BorrowEntry)
@@ -3278,8 +3314,16 @@ def resolveStackThinPtrTargetProj?
     (restProj : List ProjectionElem)
     (localDecls : List LocalDecl := .nil)
     (layouts : LayoutTable := emptyLayoutTable)
-    (pointeeTyOpt : Option Ty := .none) :
-    Option (List ProjectionElem) :=
+    (pointeeTyOpt : Option Ty := .none)
+    (reqBytesOpt : Option Nat := .none) :
+    Option (List ProjectionElem × Nat) :=
+  let effReqBytesOpt : Option Nat :=
+    match reqBytesOpt with
+    | .some n => .some n
+    | .none =>
+      match pointeeTyOpt with
+      | .some pt => rigidTyByteSize layouts pt
+      | .none => .none
   let rawFullProj :=
     match entry.targetProjection with
     | .nil => restProj
@@ -3315,9 +3359,15 @@ def resolveStackThinPtrTargetProj?
               with
               | .some { kind := .array _ _, .. } => true
               | .some { kind := .slice _, .. } => true
-              | _ => false
+              | _ =>
+                match restProj, tyScalarBytes pointeeTy with
+                | .nil, .some _ =>
+                  match readProjectedValue indexLocals targetRootVal normTargetProj with
+                  | .ok (.aggregate _ _) => true
+                  | _ => false
+                | _, _ => false
   match Nat.beq ptrVal.offsetBytes 0, isElemPtrAtZero with
-  | true, false => .some rawFullProj
+  | true, false => .some (rawFullProj, 0)
   | _, _ =>
     match splitLastConstantIndex? normTargetProj with
     | .some (initProj, baseIdx, minLen) =>
@@ -3325,7 +3375,6 @@ def resolveStackThinPtrTargetProj?
       | .ok (.aggregate 0 elems) =>
         let elemSz := inferElemListByteStride elems
         match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
-        | .none => .none
         | .some elemDelta =>
           let idx := Nat.add baseIdx elemDelta
           match
@@ -3340,43 +3389,180 @@ def resolveStackThinPtrTargetProj?
               match initProj with
               | .nil => elemProj
               | ph :: pt => ph :: appendProjections pt elemProj
-            .some (normalizeSubsliceProjections combined)
-      | _ => .none
-    | .none =>
-      let resolveSeqAtNormTarget : Option (List ProjectionElem) :=
-        match readProjectedValue indexLocals targetRootVal normTargetProj with
-        | .ok (.aggregate 0 elems) =>
-          let elemSz := inferElemListByteStride elems
-          match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
-          | .none => .none
-          | .some elemOffset =>
-            match endsWithSubslice normTargetProj, stripTransparentProjections restProj with
-            | false, .constantIndex relIdx minLen false :: tailProj =>
-              let idx := Nat.add elemOffset relIdx
-              let remLen := Nat.sub (length elems) elemOffset
+            .some (normalizeSubsliceProjections combined, 0)
+        | .none =>
+          match restProj, Nat.ble 1 elemSz with
+          | .nil, true =>
+            let (elemDelta, remBytes) :=
+              divModBytesAux ptrVal.offsetBytes ptrVal.offsetBytes elemSz 0
+            let idx := Nat.add baseIdx elemDelta
+            match
+              Bool.and
+                (Nat.ble minLen (length elems))
+                (Nat.ble (.succ idx) (length elems))
+            with
+            | false => .none
+            | true =>
+              let reqB :=
+                match effReqBytesOpt with
+                | .some n => n
+                | .none => 1
               match
                 Bool.and
-                  (Nat.ble minLen remLen)
-                  (Nat.ble (.succ idx) (length elems))
+                  (Nat.ble 1 reqB)
+                  (Nat.ble (Nat.add remBytes reqB) elemSz)
               with
               | false => .none
               | true =>
-                let elemProj := ProjectionElem.constantIndex idx 0 false :: tailProj
-                let combined :=
-                  match normTargetProj with
-                  | .nil => elemProj
-                  | ph :: pt => ph :: appendProjections pt elemProj
-                .some (normalizeSubsliceProjections combined)
-            | _, _ =>
-              match Nat.ble (.succ elemOffset) (length elems) with
-              | false => .none
-              | true =>
-                let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: restProj
-                let combined :=
-                  match normTargetProj with
-                  | .nil => elemProj
-                  | ph :: pt => ph :: appendProjections pt elemProj
-                .some (normalizeSubsliceProjections combined)
+                match get? elems idx with
+                | .some (.scalar sc) =>
+                  match Nat.ble (Nat.add remBytes reqB) sc.sizeBytes with
+                  | false => .none
+                  | true =>
+                    let elemProj := ProjectionElem.constantIndex idx 0 false :: .nil
+                    let combined :=
+                      match initProj with
+                      | .nil => elemProj
+                      | ph :: pt => ph :: appendProjections pt elemProj
+                    .some (normalizeSubsliceProjections combined, remBytes)
+                | .some (.aggregate eVar eFields) =>
+                  let defaultLeafTy : Ty :=
+                    match pointeeTyOpt with
+                    | .some pt => pt
+                    | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+                  match
+                    resolveAggregateAtByteOffset?
+                      8
+                      layouts
+                      (.aggregate eVar eFields)
+                      .none
+                      remBytes
+                      reqB
+                      false
+                      defaultLeafTy
+                      false
+                  with
+                  | .some (innerProj, innerRes) =>
+                    let elemProj := ProjectionElem.constantIndex idx 0 false :: innerProj
+                    let combined :=
+                      match initProj with
+                      | .nil => elemProj
+                      | ph :: pt => ph :: appendProjections pt elemProj
+                    .some (normalizeSubsliceProjections combined, innerRes)
+                  | .none => .none
+                | _ => .none
+          | _, _ => .none
+      | _ => .none
+    | .none =>
+      let resolveSeqAtNormTarget : Option (List ProjectionElem × Nat) :=
+        match readProjectedValue indexLocals targetRootVal normTargetProj with
+        | .ok (.aggregate 0 elems) =>
+          let elemSz := inferElemListByteStride elems
+          let isSeqCandidate : Bool :=
+            match endsWithSubslice normTargetProj with
+            | true => true
+            | false =>
+              match
+                placeTy
+                  localDecls
+                  layouts
+                  { local_ := entry.targetLocal, projection := normTargetProj }
+              with
+              | .some { kind := .array _ _, .. } => true
+              | .some { kind := .slice _, .. } => true
+              | .some { kind := .adt _ _, .. } => false
+              | .some { kind := .tuple _, .. } => false
+              | .some { kind := .closure _ _, .. } => false
+              | _ => elemsHaveUniformByteStride elems elemSz
+          match isSeqCandidate with
+          | false => .none
+          | true =>
+            match byteOffsetToElemIdx? ptrVal.offsetBytes elemSz with
+            | .some elemOffset =>
+              match endsWithSubslice normTargetProj, stripTransparentProjections restProj with
+              | false, .constantIndex relIdx minLen false :: tailProj =>
+                let idx := Nat.add elemOffset relIdx
+                let remLen := Nat.sub (length elems) elemOffset
+                match
+                  Bool.and
+                    (Nat.ble minLen remLen)
+                    (Nat.ble (.succ idx) (length elems))
+                with
+                | false => .none
+                | true =>
+                  let elemProj := ProjectionElem.constantIndex idx 0 false :: tailProj
+                  let combined :=
+                    match normTargetProj with
+                    | .nil => elemProj
+                    | ph :: pt => ph :: appendProjections pt elemProj
+                  .some (normalizeSubsliceProjections combined, 0)
+              | _, _ =>
+                match Nat.ble (.succ elemOffset) (length elems) with
+                | false => .none
+                | true =>
+                  let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: restProj
+                  let combined :=
+                    match normTargetProj with
+                    | .nil => elemProj
+                    | ph :: pt => ph :: appendProjections pt elemProj
+                  .some (normalizeSubsliceProjections combined, 0)
+            | .none =>
+              match restProj, Nat.ble 1 elemSz with
+              | .nil, true =>
+                let (elemOffset, remBytes) :=
+                  divModBytesAux ptrVal.offsetBytes ptrVal.offsetBytes elemSz 0
+                match Nat.ble (.succ elemOffset) (length elems) with
+                | false => .none
+                | true =>
+                  let reqB :=
+                    match effReqBytesOpt with
+                    | .some n => n
+                    | .none => 1
+                  match
+                    Bool.and
+                      (Nat.ble 1 reqB)
+                      (Nat.ble (Nat.add remBytes reqB) elemSz)
+                  with
+                  | false => .none
+                  | true =>
+                    match get? elems elemOffset with
+                    | .some (.scalar sc) =>
+                      match Nat.ble (Nat.add remBytes reqB) sc.sizeBytes with
+                      | false => .none
+                      | true =>
+                        let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: .nil
+                        let combined :=
+                          match normTargetProj with
+                          | .nil => elemProj
+                          | ph :: pt => ph :: appendProjections pt elemProj
+                        .some (normalizeSubsliceProjections combined, remBytes)
+                    | .some (.aggregate eVar eFields) =>
+                      let defaultLeafTy : Ty :=
+                        match pointeeTyOpt with
+                        | .some pt => pt
+                        | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+                      match
+                        resolveAggregateAtByteOffset?
+                          8
+                          layouts
+                          (.aggregate eVar eFields)
+                          .none
+                          remBytes
+                          reqB
+                          false
+                          defaultLeafTy
+                          false
+                      with
+                      | .some (innerProj, innerRes) =>
+                        let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: innerProj
+                        let combined :=
+                          match normTargetProj with
+                          | .nil => elemProj
+                          | ph :: pt => ph :: appendProjections pt elemProj
+                        .some (normalizeSubsliceProjections combined, innerRes)
+                      | .none => .none
+                    | _ => .none
+              | _, _ => .none
         | _ => .none
       match Nat.beq ptrVal.offsetBytes 0, splitLastField? normTargetProj with
       | false, .some (_, _, leafFieldTy) =>
@@ -3409,6 +3595,7 @@ def resolveStackThinPtrTargetProj?
               localDecls
               layouts
               pointeeTyOpt
+              reqBytesOpt
           | false =>
             match resolveSeqAtNormTarget with
             | .some resolved => .some resolved
@@ -3424,6 +3611,7 @@ def resolveStackThinPtrTargetProj?
                 localDecls
                 layouts
                 pointeeTyOpt
+                reqBytesOpt
         | false =>
           resolveStackThinPtrFieldOffsetProj?
             indexLocals
@@ -3436,8 +3624,16 @@ def resolveStackThinPtrTargetProj?
             localDecls
             layouts
             pointeeTyOpt
+            reqBytesOpt
       | false, .none =>
-        match endsWithSubslice normTargetProj, pointeeTyOpt with
+        let fallbackLeafTyOpt : Option Ty :=
+          match pointeeTyOpt with
+          | .some pt => .some pt
+          | .none =>
+            match reqBytesOpt with
+            | .some reqB => .some { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+            | .none => .none
+        match endsWithSubslice normTargetProj, fallbackLeafTyOpt with
         | false, .some pt =>
           let targetIsStructLike : Bool :=
             match
@@ -3463,6 +3659,7 @@ def resolveStackThinPtrTargetProj?
               localDecls
               layouts
               pointeeTyOpt
+              reqBytesOpt
           | false =>
             match resolveSeqAtNormTarget with
             | .some resolved => .some resolved
@@ -3478,8 +3675,59 @@ def resolveStackThinPtrTargetProj?
                 localDecls
                 layouts
                 pointeeTyOpt
+                reqBytesOpt
         | _, _ => resolveSeqAtNormTarget
-      | true, _ => resolveSeqAtNormTarget
+      | true, _ =>
+        match resolveSeqAtNormTarget with
+        | .some resolved => .some resolved
+        | .none =>
+          match pointeeTyOpt with
+          | .some pt =>
+            resolveStackThinPtrFieldOffsetProj?
+              indexLocals
+              targetRootVal
+              entry.targetLocal
+              normTargetProj
+              pt
+              ptrVal.offsetBytes
+              restProj
+              localDecls
+              layouts
+              pointeeTyOpt
+              reqBytesOpt
+          | .none => .none
+
+/--
+Resolve the effective target projection path on `entry.targetLocal` when
+dereferencing, writing through, or reborrowing a stack-backed thin pointer
+`Value.ptr ptrVal sz` (`BorrowEntry` `entry`) with post-deref projection suffix
+`restProj` and zero intra-scalar residual offset (`residualBytes == 0`).
+-/
+@[reducible]
+def resolveStackThinPtrTargetProj?
+    (indexLocals : List LocalSlot)
+    (targetRootVal : Value)
+    (entry : BorrowEntry)
+    (ptrVal : ProvenancePtr)
+    (restProj : List ProjectionElem)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (pointeeTyOpt : Option Ty := .none) :
+    Option (List ProjectionElem) :=
+  match
+    resolveStackThinPtrTargetProjWithResidual?
+      indexLocals
+      targetRootVal
+      entry
+      ptrVal
+      restProj
+      localDecls
+      layouts
+      pointeeTyOpt
+      .none
+  with
+  | .some (fullProj, .zero) => .some fullProj
+  | _ => .none
 
 /--
 Look up the first `LocalDecl` in `localDecls` whose `decl.ty.kind` structurally
@@ -3829,7 +4077,8 @@ def evalStackThinPtrTypedDerefRead
     (layouts : LayoutTable)
     (pointeeTyOpt : Option Ty)
     (accessedTyOpt : Option Ty)
-    (targetTyOpt : Option Ty := .none) :
+    (targetTyOpt : Option Ty := .none)
+    (targetDecls : List LocalDecl := localDecls) :
     PlaceReadResult :=
   let isSyntheticFieldOnScalarPointee : Bool :=
     match stripTransparentProjections restProj, pointeeTyOpt with
@@ -3885,16 +4134,21 @@ def evalStackThinPtrTypedDerefRead
       match scalarSliceFastOpt with
       | .some res => res
       | .none =>
+        let reqBytesOpt : Option Nat :=
+          match restProj, accessedTyOpt with
+          | .nil, .some accTy => rigidTyByteSize layouts accTy
+          | _, _ => .none
         match
-          resolveStackThinPtrTargetProj?
+          resolveStackThinPtrTargetProjWithResidual?
             locals
             targetRootVal
             entry
             ptrVal
             restProj
-            localDecls
+            targetDecls
             layouts
             effPointeeTyOpt
+            reqBytesOpt
         with
         | .none =>
           match
@@ -3913,7 +4167,7 @@ def evalStackThinPtrTypedDerefRead
             | true => .ok decodedVal locals
             | false => .ub
           | .none => .ub
-        | .some fullProj =>
+        | .some (fullProj, residualBytes) =>
           match readProjectedValue locals targetRootVal fullProj with
           | .ok fieldVal =>
             let finalValOpt : Option Value :=
@@ -3921,10 +4175,14 @@ def evalStackThinPtrTypedDerefRead
               | .some accTy, .scalar fSc =>
                 match tyScalarBytes accTy with
                 | .some reqBytes =>
-                  match Nat.beq reqBytes fSc.sizeBytes with
+                  match
+                    Bool.and
+                      (Nat.beq residualBytes 0)
+                      (Nat.beq reqBytes fSc.sizeBytes)
+                  with
                   | true => .some (.scalar fSc)
                   | false =>
-                    match extractScalarSlice? fSc 0 reqBytes with
+                    match extractScalarSlice? fSc residualBytes reqBytes with
                     | .some slicedSc => .some (.scalar slicedSc)
                     | .none =>
                       decodeAtBorrowTargetOffset?
@@ -3936,8 +4194,14 @@ def evalStackThinPtrTypedDerefRead
                         layouts
                         accessedTyOpt
                         targetTyOpt
-                | .none => .some fieldVal
-              | _, _ => .some fieldVal
+                | .none =>
+                  match Nat.beq residualBytes 0 with
+                  | true => .some fieldVal
+                  | false => .none
+              | _, _ =>
+                match Nat.beq residualBytes 0 with
+                | true => .some fieldVal
+                | false => .none
             match finalValOpt with
             | .none => .ub
             | .some finalVal =>
@@ -4165,6 +4429,7 @@ def evalPlaceRead
                 pointeeTyOpt
                 accessedTyOpt
                 .none
+                .nil
             | _ => .ub
       | .none =>
         match
@@ -4990,21 +5255,28 @@ def writeSliceFatPtrTargetValue
       | _ => .ub
 
 /--
-Fit a scalar store `val` into the existing scalar sub-value `oldRead` at the
-start of the resolved destination: a store of the same width replaces the
-scalar, a narrower store is spliced into its low-addressed bytes
-(`spliceScalarSlice?` at byte offset `0`), and a wider store is `.none` (it
-would overrun the resolved sub-value). Non-scalar stores, and stores over
-non-scalar or unreadable sub-values, are returned unchanged.
+Fit a scalar store `val` into the existing scalar sub-value `oldRead` at byte
+offset `residualBytes` of the resolved destination: a store of the same width
+at offset `0` replaces the scalar, a narrower store (or intra-scalar store) is
+spliced into `oldSc` via `spliceScalarSlice? oldSc residualBytes wSc`, and a
+wider or out-of-bounds store returns `.none`. Non-scalar stores require
+`residualBytes == 0`.
 -/
 @[reducible]
-def fitScalarStoreAtResolved? (oldRead : ProjReadResult) (val : Value) : Option Value :=
+def fitScalarStoreAtResolved?
+    (oldRead : ProjReadResult)
+    (residualBytes : Nat)
+    (val : Value) :
+    Option Value :=
   match val, oldRead with
   | .scalar wSc, .ok (.scalar oldSc) =>
-    match spliceScalarSlice? oldSc 0 wSc with
+    match spliceScalarSlice? oldSc residualBytes wSc with
     | .some mergedSc => .some (.scalar mergedSc)
     | .none => .none
-  | _, _ => .some val
+  | _, _ =>
+    match Nat.beq residualBytes 0 with
+    | true => .some val
+    | false => .none
 
 /--
 Write `val` through a stack-backed thin pointer `ptrVal` (`BorrowEntry` `entry`,
@@ -5022,12 +5294,14 @@ scalar splicing, out-of-bounds offset detection, and bit-validity checks.
   (`ptrVal.offsetBytes + W ≤ oldSc.sizeBytes`) splices its `W` little-endian
   bytes into the referent at `ptrVal.offsetBytes`.
 - Any other store resolves its destination with
-  `resolveStackThinPtrTargetProj?` (element or field pointer arithmetic such as
-  `*p.add(1) = v` derived from `&mut arr[0]`, and element-zero resolution of a
-  `*mut T` cast from `&mut [T; N]`), using `targetDecls` (the `LocalDecl`s that
-  describe `entry.targetLocal`: `localDecls` for active-frame targets, `.nil`
-  for caller-frame targets). A scalar store into a narrower resolved scalar
-  sub-value is `.ub` (`fitScalarStoreAtResolved?`).
+  `resolveStackThinPtrTargetProjWithResidual?` (element, intra-element, field, or
+  intra-field pointer arithmetic such as `*p.add(1) = v` derived from
+  `&mut arr[0]`, and element-zero resolution of a `*mut T` cast from
+  `&mut [T; N]`), using `targetDecls` (the `LocalDecl`s that describe
+  `entry.targetLocal`: `localDecls` for active-frame targets, `.nil` for
+  caller-frame targets). A scalar store into aresolved scalar sub-value is
+  spliced at `residualBytes` (or `.ub` if wider/out-of-bounds) via
+  `fitScalarStoreAtResolved?`.
 - A field projection through a pointer whose static pointee type is a scalar
   (`isSyntheticFieldOnScalarPointee`) on a borrow of a whole local writes
   `restProj` directly, mirroring `evalStackThinPtrTypedDerefRead`.
@@ -5107,11 +5381,15 @@ def writeStackThinPtrTypedDeref
     | .none =>
       match get? targetLocals entry.targetLocal with
       | .some (.init targetRootVal) =>
-        let resolvedProjOpt : Option (List ProjectionElem) :=
+        let reqBytesOpt : Option Nat :=
+          match restProj, val with
+          | .nil, .scalar wSc => .some wSc.sizeBytes
+          | _, _ => .none
+        let resolvedProjOpt : Option (List ProjectionElem × Nat) :=
           match isSyntheticFieldOnScalarPointee, entry.targetProjection with
-          | true, .nil => .some rawFullProj
+          | true, .nil => .some (rawFullProj, 0)
           | _, _ =>
-            resolveStackThinPtrTargetProj?
+            resolveStackThinPtrTargetProjWithResidual?
               indexLocals
               targetRootVal
               entry
@@ -5120,19 +5398,21 @@ def writeStackThinPtrTypedDeref
               targetDecls
               layouts
               effPointeeTyOpt
+              reqBytesOpt
         match resolvedProjOpt with
         | .none => .ub
-        | .some .nil =>
-          match fitScalarStoreAtResolved? (.ok targetRootVal) val with
+        | .some (.nil, residualBytes) =>
+          match fitScalarStoreAtResolved? (.ok targetRootVal) residualBytes val with
           | .none => .ub
           | .some storeVal =>
             match set? targetLocals entry.targetLocal (.init storeVal) with
             | .some targetLocals' => .ok targetLocals'
             | .none => .ub
-        | .some (pHead :: pTail) =>
+        | .some (pHead :: pTail, residualBytes) =>
           match
             fitScalarStoreAtResolved?
               (readProjectedValue indexLocals targetRootVal (pHead :: pTail))
+              residualBytes
               val
           with
           | .none => .ub
@@ -9090,6 +9370,141 @@ def evalPlaceDiscriminant
   | .ptr _ _ => .ok (.scalar ⟨0, 8⟩) locals' mem
 
 /--
+Resolve the effective target projection path `(fullProj, residualOffset)` for a
+reference reborrow (`Rvalue.ref _ (*ptr ...)`), returning `.none` on out-of-bounds
+offset/width (`ub`), `.some .none` on `.unsupported` projection read, and
+`.some (.some (fullProj, residualOffset))` when the reborrow target is live and
+in bounds.
+-/
+def resolveRefDerefTarget?
+    (locals : List LocalSlot)
+    (targetRootVal : Value)
+    (parentEntry : BorrowEntry)
+    (parentPtr : ProvenancePtr)
+    (resolvedRest : List ProjectionElem)
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (pointeeTyOpt : Option Ty)
+    (accessedTyOpt : Option Ty) :
+    Option (Option (List ProjectionElem × Nat)) :=
+  let reqBytesOpt : Option Nat :=
+    match resolvedRest, accessedTyOpt with
+    | .nil, .some accTy => rigidTyByteSize layouts accTy
+    | _, _ => .none
+  let rawFull :=
+    match parentEntry.targetProjection with
+    | .nil => resolvedRest
+    | ph :: pt => ph :: appendProjections pt resolvedRest
+  let resolvedFullProjOpt : Option (List ProjectionElem × Nat) :=
+    match
+      resolveStackThinPtrTargetProjWithResidual?
+        locals
+        targetRootVal
+        parentEntry
+        parentPtr
+        resolvedRest
+        targetDecls
+        layouts
+        pointeeTyOpt
+        reqBytesOpt
+    with
+    | .some (fp, resOff) => .some (fp, resOff)
+    | .none =>
+      match accessedTyOpt, readProjectedValue locals targetRootVal rawFull with
+      | .some accTy, .ok (.scalar sc) =>
+        match tyScalarBytes accTy with
+        | .some reqBytes =>
+          match
+            Bool.and
+              (Nat.ble 1 reqBytes)
+              (Nat.ble (Nat.add parentPtr.offsetBytes reqBytes) sc.sizeBytes)
+          with
+          | true => .some (rawFull, parentPtr.offsetBytes)
+          | false => .none
+        | .none => .none
+      | _, _ => .none
+  match resolvedFullProjOpt with
+  | .none => .none
+  | .some (fullProj, residualOffset) =>
+    match readProjectedValue locals targetRootVal fullProj with
+    | .ub => .none
+    | .unsupported => .some .none
+    | .ok targetSubVal =>
+      let widthOk : Bool :=
+        match accessedTyOpt, targetSubVal with
+        | .some accTy, .scalar sc =>
+          match tyScalarBytes accTy with
+          | .some reqBytes =>
+            Nat.ble (Nat.add residualOffset reqBytes) sc.sizeBytes
+          | .none => true
+        | _, _ => true
+      match widthOk with
+      | false => .none
+      | true => .some (.some (fullProj, residualOffset))
+
+/--
+Resolve the effective target projection path `(fullProj, residualOffset)` for a
+raw-pointer reborrow (`Rvalue.rawPtr _ (*ptr ...)`).
+-/
+def resolveRawPtrDerefTarget?
+    (locals : List LocalSlot)
+    (targetRootVal : Value)
+    (parentEntry : BorrowEntry)
+    (parentPtr : ProvenancePtr)
+    (resolvedRest : List ProjectionElem)
+    (targetDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (effPointeeTyOpt : Option Ty)
+    (accessedTyOpt : Option Ty)
+    (isSyntheticFieldOnScalarPointee : Bool) :
+    Option (List ProjectionElem × Nat) :=
+  let rawFull :=
+    match parentEntry.targetProjection with
+    | .nil => resolvedRest
+    | ph :: pt => ph :: appendProjections pt resolvedRest
+  let reqBytesOpt : Option Nat :=
+    match resolvedRest, accessedTyOpt with
+    | .nil, .some accTy => rigidTyByteSize layouts accTy
+    | _, _ => .none
+  match isSyntheticFieldOnScalarPointee, parentEntry.targetProjection with
+  | true, .nil => .some (rawFull, 0)
+  | _, _ =>
+    match
+      resolveStackThinPtrTargetProjWithResidual?
+        locals
+        targetRootVal
+        parentEntry
+        parentPtr
+        resolvedRest
+        targetDecls
+        layouts
+        effPointeeTyOpt
+        reqBytesOpt
+    with
+    | .some (fp, resOff) => .some (fp, resOff)
+    | .none =>
+      match accessedTyOpt, readProjectedValue locals targetRootVal rawFull with
+      | .some accTy, .ok (.scalar sc) =>
+        match tyScalarBytes accTy with
+        | .some reqBytes =>
+          match
+            Bool.and
+              (Nat.ble 1 reqBytes)
+              (Nat.ble (Nat.add parentPtr.offsetBytes reqBytes) sc.sizeBytes)
+          with
+          | true => .some (rawFull, parentPtr.offsetBytes)
+          | false => .none
+        | .none => .none
+      | _, _ =>
+        match
+          needsThinPtrElemResolution
+            parentEntry.targetProjection
+            parentPtr.offsetBytes
+        with
+        | false => .some (rawFull, parentPtr.offsetBytes)
+        | true => .none
+
+/--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
 resolve operand types, signedness, and byte layouts for `Rvalue.binaryOp`,
 `Rvalue.unaryOp`, `Rvalue.cast`, and `Rvalue.aggregate`.
@@ -9287,95 +9702,61 @@ def evalRvalue
               match resolveBorrowProjectionElems locals restProj with
               | .none => .ub
               | .some resolvedRest =>
-                let targetRootOpt : Option Value :=
+                let targetRootAndDeclsOpt : Option (Value × List LocalDecl) :=
                   match get? locals parentEntry.targetLocal with
-                  | .some (.init v) => .some v
+                  | .some (.init v) => .some (v, localDecls)
                   | .some _ => .none
                   | .none =>
                     match get? mem.callerLocals parentEntry.targetLocal with
-                    | .some (.init v) => .some v
+                    | .some (.init v) => .some (v, .nil)
                     | _ => .none
-                match targetRootOpt with
+                match targetRootAndDeclsOpt with
                 | .none => .ub
-                | .some targetRootVal =>
-                  let resolvedFullProjOpt : Option (List ProjectionElem × Nat) :=
-                    let rawFull :=
-                      match parentEntry.targetProjection with
-                      | .nil => resolvedRest
-                      | ph :: pt => ph :: appendProjections pt resolvedRest
-                    match
-                      resolveStackThinPtrTargetProj?
-                        locals
-                        targetRootVal
-                        parentEntry
-                        parentPtr
-                        resolvedRest
-                        localDecls
-                        layouts
-                        pointeeTyOpt
-                    with
-                    | .some fp => .some (fp, 0)
-                    | .none =>
-                      match accessedTyOpt, readProjectedValue locals targetRootVal rawFull with
-                      | .some accTy, .ok (.scalar sc) =>
-                        match tyScalarBytes accTy with
-                        | .some reqBytes =>
-                          match
-                            Bool.and
-                              (Nat.ble 1 reqBytes)
-                              (Nat.ble (Nat.add parentPtr.offsetBytes reqBytes) sc.sizeBytes)
-                          with
-                          | true => .some (rawFull, parentPtr.offsetBytes)
-                          | false => .none
-                        | .none => .none
-                      | _, _ => .none
-                  match resolvedFullProjOpt with
+                | .some (targetRootVal, targetDecls) =>
+                  match
+                    resolveRefDerefTarget?
+                      locals
+                      targetRootVal
+                      parentEntry
+                      parentPtr
+                      resolvedRest
+                      targetDecls
+                      layouts
+                      pointeeTyOpt
+                      accessedTyOpt
+                  with
                   | .none => .ub
-                  | .some (fullProj, residualOffset) =>
-                    match readProjectedValue locals targetRootVal fullProj with
-                    | .ub => .ub
-                    | .unsupported => .unsupported
-                    | .ok targetSubVal =>
-                      let widthOk : Bool :=
-                        match accessedTyOpt, targetSubVal with
-                        | .some accTy, .scalar sc =>
-                          match tyScalarBytes accTy with
-                          | .some reqBytes =>
-                            Nat.ble (Nat.add residualOffset reqBytes) sc.sizeBytes
-                          | .none => true
-                        | _, _ => true
-                      match widthOk with
-                      | false => .ub
-                      | true =>
-                        let tag := mem.nextTag
-                        let reborrowPerm :=
-                          match borrowKind with
-                          | .shared => perm
-                          | .mut _ => TreeBorrowPerm.reserved
-                        let borrowsAfterRead :=
-                          freezeTreeBorrowsOnReadAtProj
-                            mem.borrows
-                            mem.borrows
-                            parentEntry.targetLocal
-                            (.some parentPtr.tag)
-                            fullProj
-                            parentEntry.rangeOffset
-                            parentEntry.rangeLen
-                        let entry : BorrowEntry := {
-                          tag := tag
-                          targetLocal := parentEntry.targetLocal
-                          targetProjection := fullProj
-                          perm := reborrowPerm
-                          rangeOffset := parentEntry.rangeOffset
-                          rangeLen := parentEntry.rangeLen
-                          parentTag := .some parentPtr.tag
-                        }
-                        let mem' := {
-                          mem with
-                          borrows := entry :: borrowsAfterRead
-                          nextTag := Nat.add tag 1
-                        }
-                        .ok (.ptr { allocId := tag, offsetBytes := residualOffset } 8) locals mem'
+                  | .some .none => .unsupported
+                  | .some (.some (fullProj, residualOffset)) =>
+                    let tag := mem.nextTag
+                    let reborrowPerm :=
+                      match borrowKind with
+                      | .shared => perm
+                      | .mut _ => TreeBorrowPerm.reserved
+                    let borrowsAfterRead :=
+                      freezeTreeBorrowsOnReadAtProj
+                        mem.borrows
+                        mem.borrows
+                        parentEntry.targetLocal
+                        (.some parentPtr.tag)
+                        fullProj
+                        parentEntry.rangeOffset
+                        parentEntry.rangeLen
+                    let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := fullProj
+                      perm := reborrowPerm
+                      rangeOffset := parentEntry.rangeOffset
+                      rangeLen := parentEntry.rangeLen
+                      parentTag := .some parentPtr.tag
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: borrowsAfterRead
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok (.ptr { allocId := tag, offsetBytes := residualOffset } 8) locals mem'
           | .none =>
             match lookupGlobalAlloc mem.globals parentPtr.allocId with
             | .some alloc =>
@@ -9446,75 +9827,64 @@ def evalRvalue
       | .mut => TreeBorrowPerm.active
     match place.projection with
     | .deref :: restProj =>
+      let pointeeTyOpt :=
+        placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+      let accessedTyOpt := placeTy localDecls layouts place
       match get? locals place.local_ with
       | .some (.init (.ptr parentPtr ptrSz)) =>
-        match lookupBorrow mem.borrows parentPtr.tag with
-        | .some parentEntry =>
-          match parentEntry.perm, mutability with
-          | .disabled, _ => .ub
-          | .frozen, .mut => .ub
-          | _, _ =>
-            match resolveBorrowProjectionElems locals restProj with
-            | .none => .ub
-            | .some resolvedRest =>
-              match
-                needsThinPtrElemResolution
-                  parentEntry.targetProjection
-                  parentPtr.offsetBytes
-              with
-              | false =>
-                let tag := mem.nextTag
-                let fullProj :=
-                  match parentEntry.targetProjection with
-                  | .nil => resolvedRest
-                  | ph :: pt => ph :: appendProjections pt resolvedRest
-                let rawPerm :=
-                  match mutability, parentEntry.perm with
-                  | .not, .reserved => TreeBorrowPerm.reserved
-                  | _, _ => perm
-                let entry : BorrowEntry := {
-                  tag := tag
-                  targetLocal := parentEntry.targetLocal
-                  targetProjection := fullProj
-                  perm := rawPerm
-                  rangeOffset := parentEntry.rangeOffset
-                  rangeLen := parentEntry.rangeLen
-                  parentTag := .some parentPtr.tag
-                }
-                let mem' := {
-                  mem with
-                  borrows := entry :: mem.borrows
-                  nextTag := Nat.add tag 1
-                }
-                .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
-              | true =>
-                let targetRootOpt : Option Value :=
+        let isSyntheticFieldOnScalarPointee : Bool :=
+          match stripTransparentProjections restProj, pointeeTyOpt with
+          | .field _ _ :: _, .some { kind := .bool, .. } => true
+          | .field _ _ :: _, .some { kind := .char, .. } => true
+          | .field _ _ :: _, .some { kind := .int _, .. } => true
+          | .field _ _ :: _, .some { kind := .uint _, .. } => true
+          | .field _ _ :: _, .some { kind := .float _, .. } => true
+          | _, _ => false
+        let effPointeeTyOpt : Option Ty :=
+          match isSyntheticFieldOnScalarPointee with
+          | true => .none
+          | false => pointeeTyOpt
+        let alignTyOpt : Option Ty :=
+          match effPointeeTyOpt, restProj with
+          | .some pt, _ => .some pt
+          | .none, .nil => accessedTyOpt
+          | .none, _ :: _ => .none
+        match checkDerefAlign localDecls layouts alignTyOpt parentPtr.offsetBytes with
+        | false => .ub
+        | true =>
+          match lookupBorrow mem.borrows parentPtr.tag with
+          | .some parentEntry =>
+            match parentEntry.perm, mutability with
+            | .disabled, _ => .ub
+            | .frozen, .mut => .ub
+            | _, _ =>
+              match resolveBorrowProjectionElems locals restProj with
+              | .none => .ub
+              | .some resolvedRest =>
+                let targetSlotAndDeclsOpt : Option (LocalSlot × List LocalDecl) :=
                   match get? locals parentEntry.targetLocal with
-                  | .some (.init v) => .some v
-                  | .some _ => .none
+                  | .some .dead => .none
+                  | .some slot => .some (slot, localDecls)
                   | .none =>
                     match get? mem.callerLocals parentEntry.targetLocal with
-                    | .some (.init v) => .some v
-                    | _ => .none
-                match targetRootOpt with
+                    | .some .dead => .none
+                    | .some slot => .some (slot, .nil)
+                    | .none => .none
+                match targetSlotAndDeclsOpt with
                 | .none => .ub
-                | .some targetRootVal =>
-                  let pointeeTyOpt :=
-                    placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+                | .some (.uninit, _) =>
                   match
-                    resolveStackThinPtrTargetProj?
-                      locals
-                      targetRootVal
-                      parentEntry
-                      parentPtr
-                      resolvedRest
-                      localDecls
-                      layouts
-                      pointeeTyOpt
+                    needsThinPtrElemResolution
+                      parentEntry.targetProjection
+                      parentPtr.offsetBytes,
+                    Nat.beq parentPtr.offsetBytes 0
                   with
-                  | .none => .ub
-                  | .some fullProj =>
+                  | false, true =>
                     let tag := mem.nextTag
+                    let fullProj :=
+                      match parentEntry.targetProjection with
+                      | .nil => resolvedRest
+                      | ph :: pt => ph :: appendProjections pt resolvedRest
                     let rawPerm :=
                       match mutability, parentEntry.perm with
                       | .not, .reserved => TreeBorrowPerm.reserved
@@ -9534,44 +9904,85 @@ def evalRvalue
                       nextTag := Nat.add tag 1
                     }
                     .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
-        | .none =>
-          match lookupGlobalAlloc mem.globals parentPtr.allocId with
-          | .some alloc =>
-            let isMut :=
-              match mutability with
-              | .not => false
-              | .mut => true
-            let pointeeTyOpt :=
-              placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
-            evalGlobalThinPtrDerefBorrow
-              locals
-              mem
-              alloc
-              parentPtr
-              ptrSz
-              restProj
-              isMut
-              pointeeTyOpt
-              layouts
-          | .none => .ub
+                  | _, _ => .ub
+                | .some (.dead, _) => .ub
+                | .some (.init targetRootVal, targetDecls) =>
+                  match
+                    resolveRawPtrDerefTarget?
+                      locals
+                      targetRootVal
+                      parentEntry
+                      parentPtr
+                      resolvedRest
+                      targetDecls
+                      layouts
+                      effPointeeTyOpt
+                      accessedTyOpt
+                      isSyntheticFieldOnScalarPointee
+                  with
+                  | .none => .ub
+                  | .some (fullProj, residualOffset) =>
+                    let tag := mem.nextTag
+                    let rawPerm :=
+                      match mutability, parentEntry.perm with
+                      | .not, .reserved => TreeBorrowPerm.reserved
+                      | _, _ => perm
+                    let entry : BorrowEntry := {
+                      tag := tag
+                      targetLocal := parentEntry.targetLocal
+                      targetProjection := fullProj
+                      perm := rawPerm
+                      rangeOffset := parentEntry.rangeOffset
+                      rangeLen := parentEntry.rangeLen
+                      parentTag := .some parentPtr.tag
+                    }
+                    let mem' := {
+                      mem with
+                      borrows := entry :: mem.borrows
+                      nextTag := Nat.add tag 1
+                    }
+                    .ok (.ptr { allocId := tag, offsetBytes := residualOffset } 8) locals mem'
+          | .none =>
+            match lookupGlobalAlloc mem.globals parentPtr.allocId with
+            | .some alloc =>
+              let isMut :=
+                match mutability with
+                | .not => false
+                | .mut => true
+              evalGlobalThinPtrDerefBorrow
+                locals
+                mem
+                alloc
+                parentPtr
+                ptrSz
+                restProj
+                isMut
+                pointeeTyOpt
+                layouts
+            | .none => .ub
       | .some (.init (.aggregate 0 (.ptr parentPtr ptrSz :: .scalar lenSc :: .nil))) =>
-        let isMut :=
-          match mutability with
-          | .not => false
-          | .mut => true
-        let pointeeTyOpt :=
-          placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
-        evalSliceFatPtrDerefBorrow
-          locals
-          mem
-          parentPtr
-          ptrSz
-          lenSc
-          restProj
-          perm
-          isMut
-          pointeeTyOpt
-          layouts
+        match
+          Bool.and
+            (checkDerefAlign localDecls layouts pointeeTyOpt parentPtr.offsetBytes)
+            (checkDerefAlign localDecls layouts accessedTyOpt parentPtr.offsetBytes)
+        with
+        | false => .ub
+        | true =>
+          let isMut :=
+            match mutability with
+            | .not => false
+            | .mut => true
+          evalSliceFatPtrDerefBorrow
+            locals
+            mem
+            parentPtr
+            ptrSz
+            lenSc
+            restProj
+            perm
+            isMut
+            pointeeTyOpt
+            layouts
       | _ => .ub
     | _ =>
       match get? locals place.local_ with
