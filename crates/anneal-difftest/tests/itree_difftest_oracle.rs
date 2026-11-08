@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anneal_difftest::itree_eval::{
-    ITREE_SAFE_SEEDS, ItreeEvalOptions, evaluate_itree_batches_with_options,
-    reproduce_itree_finding,
+    ITREE_CONFIRM_CHUNK_SIZE, ITREE_SAFE_SEEDS, ItreeEvalOptions,
+    evaluate_itree_batches_with_options, reproduce_itree_finding,
 };
 use anneal_difftest::mutators_itree::{generate_itree_batch, generate_itree_identity_batch};
 
@@ -180,7 +180,10 @@ fn itree_difftest_live_identity_and_mutated_batches_confirm_traces_in_lean() {
     );
 
     // 3. Multi-chunk Stage 2 confirmation (> 32 distinct traces and > 16 candidates
-    //    across multiple `ITREE_CONFIRM_CHUNK_SIZE = 16` chunks).
+    //    across multiple `ITREE_CONFIRM_CHUNK_SIZE = 16` chunks). Above 32 traces
+    //    Stage 2 kernel-confirms every divergence plus the first trace of every
+    //    candidate, and `kernel_confirmed_traces` must report exactly the traces
+    //    the kernel checked (never the full distinct-trace count).
     let multi_chunk_batches = vec![generate_itree_batch(ITREE_SAFE_SEEDS, 20, 0x3333_4444)];
     let multi_summary = evaluate_itree_batches_with_options(
         "seeded",
@@ -195,16 +198,39 @@ fn itree_difftest_live_identity_and_mutated_batches_confirm_traces_in_lean() {
     )
     .expect("evaluate multi-chunk batch");
     assert_eq!(multi_summary.compared_candidates, 20);
+    assert_eq!(multi_summary.not_compared_candidates, 0);
+    assert_eq!(
+        multi_summary.not_compared_reasons.values().sum::<usize>(),
+        0,
+        "unexpected not-compared reasons: {:?}",
+        multi_summary.not_compared_reasons
+    );
     assert!(
         multi_summary.distinct_traces_checked > 32,
         "expected > 32 distinct traces across multiple Stage 2 chunks, got {}",
         multi_summary.distinct_traces_checked
     );
+    assert_eq!(multi_summary.diverge_candidates, 0);
     assert_eq!(
+        multi_summary.kernel_confirmed_traces, multi_summary.compared_candidates,
+        "with 0 divergences, Stage 2 confirms exactly one trace per candidate"
+    );
+    assert!(
+        multi_summary.kernel_confirmed_traces > ITREE_CONFIRM_CHUNK_SIZE
+            && multi_summary.kernel_confirmed_traces < multi_summary.distinct_traces_checked,
+        "Stage 2 must span multiple {ITREE_CONFIRM_CHUNK_SIZE}-case chunks without \
+         over-claiming: kernel_confirmed_traces={}, distinct_traces_checked={}",
         multi_summary.kernel_confirmed_traces,
         multi_summary.distinct_traces_checked
     );
-    assert_eq!(multi_summary.diverge_candidates, 0);
+    assert!(
+        multi_summary
+            .obs_path_signatures
+            .iter()
+            .all(|s| !s.contains("b0_c")),
+        "obs_path_signatures must not depend on candidate positions: {:?}",
+        multi_summary.obs_path_signatures
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

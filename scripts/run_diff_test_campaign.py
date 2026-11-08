@@ -24,7 +24,9 @@ Exit status:
   2  invalid command line, harness crash, missing Miri/Lean toolchain,
      malformed harness JSON, red-flag vacuity failure (`zero_compared_items`,
      `impossible_wall_clock`, `identical_metrics_across_seeds`,
-     `oracle_not_invoked`), or oracle errors above `--max-oracle-errors`;
+     `oracle_not_invoked`), or oracle errors above `--max-oracle-errors`
+     (in either suite). Ledger state of a suite that completed a healthy live
+     oracle run is still committed when the other suite fails;
   3  compile-only mode (`--compile-only`): neither harness crashed, and both
      harnesses reported `"oracle_comparison": "not_performed"`;
   4  one or more unquarantined divergences were detected by a live oracle run.
@@ -96,6 +98,27 @@ VALID_ITREE_DIAG_TAGS = (
     "decode_event_failed",
     "decode_outcome_failed",
     "out_of_fuel",
+)
+
+# `itree-difftest` per-candidate not-compared reasons (`ITREE_NOT_COMPARED_REASON_NAMES`).
+VALID_ITREE_NOT_COMPARED_REASONS = (
+    "compile_failed",
+    "staging_failed",
+    "empty_trace",
+    "lean_probe_failed",
+    "lean_confirm_failed",
+)
+
+# Not-compared reasons that mean the ITree oracle pipeline (staging, native trace
+# capture, or Lean `TraceCheck` probe / kernel confirmation) failed on a candidate
+# that compiled. Like Miri oracle/capture errors, these count against
+# `--max-oracle-errors` so isolated per-candidate failures can never silently
+# shrink the compared set of a run that still reports itself as healthy.
+ITREE_ORACLE_ERROR_REASONS = (
+    "staging_failed",
+    "empty_trace",
+    "lean_probe_failed",
+    "lean_confirm_failed",
 )
 
 # Integer count keys that a harness JSON summary may carry.
@@ -467,6 +490,12 @@ def validate_performed_miri_summary(summary: dict[str, Any]) -> tuple[bool, str]
         return False, "missing or invalid 'unmodeled_external_calls' map"
     if not is_int_map(summary.get("mutator_applications")):
         return False, "missing or invalid 'mutator_applications' map"
+    if "obs_path_signatures" in summary:
+        sigs = summary.get("obs_path_signatures")
+        if not isinstance(sigs, list) or not all(
+            isinstance(s, str) and s.strip() for s in sigs
+        ):
+            return False, "invalid 'obs_path_signatures' list"
 
     findings = summary.get("findings")
     if not isinstance(findings, list):
@@ -558,6 +587,16 @@ def validate_performed_itree_summary(summary: dict[str, Any]) -> tuple[bool, str
         return False, "missing or invalid 'per_candidate_distinct_traces' map"
     if not is_int_map(summary.get("mutator_applications")):
         return False, "missing or invalid 'mutator_applications' map"
+    if "not_compared_reasons" in summary and not is_int_map(
+        summary.get("not_compared_reasons"), VALID_ITREE_NOT_COMPARED_REASONS
+    ):
+        return False, "invalid 'not_compared_reasons' map"
+    if "obs_path_signatures" in summary:
+        sigs = summary.get("obs_path_signatures")
+        if not isinstance(sigs, list) or not all(
+            isinstance(s, str) and s.strip() for s in sigs
+        ):
+            return False, "invalid 'obs_path_signatures' list"
 
     findings = summary.get("findings")
     if not isinstance(findings, list):
@@ -602,6 +641,7 @@ def evaluate_itree_red_flags(
     itree_seed: int,
     ledger: dict[str, Any],
     min_oracle_elapsed_ms: float,
+    max_oracle_errors: int = DEFAULT_MAX_ORACLE_ERRORS,
 ) -> RedFlagResult:
     """Runs red-flag vacuity checks on an `itree-difftest` oracle summary."""
     reasons: list[str] = []
@@ -609,6 +649,7 @@ def evaluate_itree_red_flags(
     total = int(summary["total_candidates"])
     unsafe_violations = int(summary["unsafe_token_violations"])
     opt_both = int(summary["opt_level_0_and_2_compiled"])
+    instrumented = int(summary["instrumented_compiled"])
     compared = int(summary["compared_candidates"])
     agree_cands = int(summary["agree_candidates"])
     diverge_cands = int(summary["diverge_candidates"])
@@ -623,6 +664,10 @@ def evaluate_itree_red_flags(
     elapsed_ms = float(summary["elapsed_ms"])
     diag_counts: dict[str, int] = summary["diag_tag_counts"]
     findings: list[dict[str, Any]] = summary["findings"]
+    nc_reasons_raw = summary.get("not_compared_reasons")
+    nc_reasons: dict[str, int] | None = (
+        nc_reasons_raw if isinstance(nc_reasons_raw, dict) else None
+    )
 
     oracle_invoked = True
     if unsafe_violations != 0:
@@ -630,12 +675,35 @@ def evaluate_itree_red_flags(
         reasons.append(
             f"itree_oracle_not_invoked: unsafe_token_violations={unsafe_violations} != 0"
         )
-    if compared <= 0 or compared > opt_both or compared + not_compared_cands != total:
-        oracle_invoked = False
-        reasons.append(
-            f"itree_oracle_not_invoked: compared ({compared}), opt_both ({opt_both}), "
-            f"not_compared ({not_compared_cands}), total ({total}) inconsistent"
-        )
+    if nc_reasons is None:
+        # Legacy summaries without per-reason accounting: every candidate that
+        # compiled at `-O0` and `-O2` must have been compared.
+        if compared <= 0 or compared != opt_both or compared + not_compared_cands != total:
+            oracle_invoked = False
+            reasons.append(
+                f"itree_oracle_not_invoked: compared ({compared}), opt_both ({opt_both}), "
+                f"not_compared ({not_compared_cands}), total ({total}) inconsistent"
+            )
+    else:
+        # Per-candidate isolation may legitimately leave compiled candidates
+        # uncompared, but only with a reason for every one of them.
+        eligible_cap = min(opt_both, instrumented)
+        nc_sum = sum(int(v) for v in nc_reasons.values())
+        compile_failed = int(nc_reasons.get("compile_failed", 0))
+        if (
+            compared <= 0
+            or compared > eligible_cap
+            or compared + not_compared_cands != total
+            or nc_sum != not_compared_cands
+            or compile_failed < total - eligible_cap
+        ):
+            oracle_invoked = False
+            reasons.append(
+                f"itree_oracle_not_invoked: compared ({compared}), opt_both ({opt_both}), "
+                f"instrumented ({instrumented}), not_compared ({not_compared_cands}), "
+                f"sum(not_compared_reasons) ({nc_sum}), compile_failed ({compile_failed}), "
+                f"total ({total}) inconsistent"
+            )
     if agree_cands + diverge_cands != compared:
         oracle_invoked = False
         reasons.append(
@@ -663,8 +731,13 @@ def evaluate_itree_red_flags(
             f"itree_oracle_not_invoked: agree_traces ({agree_traces}) + "
             f"diverge_traces ({diverge_traces}) != distinct_traces ({distinct_traces})"
         )
+    # Every divergence must be kernel-confirmed. Beyond small batches (where every
+    # trace is confirmed), `itree-difftest` kernel-confirms every divergence plus
+    # at least one trace per compared candidate, so the honest count of
+    # kernel-confirmed traces lies in [max(compared, diverge_traces), distinct].
     if (
-        kc_traces != distinct_traces
+        kc_traces > distinct_traces
+        or kc_traces < max(compared, diverge_traces)
         or kc_divergences != diverge_traces
         or len(findings) != diverge_traces
     ):
@@ -672,7 +745,8 @@ def evaluate_itree_red_flags(
         reasons.append(
             f"itree_oracle_not_invoked: kernel_confirmed_traces ({kc_traces}), "
             f"kernel_confirmed_divergences ({kc_divergences}), findings ({len(findings)}) "
-            f"do not match distinct_traces ({distinct_traces}) / diverge_traces ({diverge_traces})"
+            f"do not match distinct_traces ({distinct_traces}) / diverge_traces ({diverge_traces}) "
+            f"/ compared_candidates ({compared})"
         )
     for f in findings:
         repro_p = Path(f["repro_path"])
@@ -711,11 +785,26 @@ def evaluate_itree_red_flags(
             f"itree_identical_metrics_across_seeds: seed {seed_hex} produced identical trace metrics/mutators to prior seed {prev_seed}"
         )
 
+    oracle_error_counts = {
+        k: int(nc_reasons.get(k, 0)) if nc_reasons is not None else 0
+        for k in ITREE_ORACLE_ERROR_REASONS
+    }
+    itree_oracle_errors = sum(oracle_error_counts.values())
+    within_error_threshold = itree_oracle_errors <= max_oracle_errors
+    if not within_error_threshold:
+        breakdown = ", ".join(f"{k}={v}" for k, v in oracle_error_counts.items() if v)
+        reasons.append(
+            f"itree_oracle_errors_exceeded: {itree_oracle_errors} candidate(s) dropped by "
+            f"ITree staging/trace/Lean oracle errors ({breakdown}) > max_oracle_errors "
+            f"({max_oracle_errors})"
+        )
+
     checks = {
         "itree_oracle_invoked": oracle_invoked,
         "itree_non_zero_compared": non_zero_compared,
         "itree_plausible_wall_clock": plausible_wall_clock,
         "itree_seed_sensitivity": seed_sensitive,
+        "itree_oracle_error_threshold": within_error_threshold,
     }
     return RedFlagResult(
         passed=all(checks.values()),
@@ -1542,6 +1631,17 @@ def infer_fingerprint_suite(fp: str, entry: dict[str, Any] | None = None) -> str
     return "miri-difftest"
 
 
+def _safe_nonneg_int(raw: Any, default: int = 0) -> int:
+    """Returns `raw` as a non-negative int, or `default` for corrupt values."""
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        return raw if raw >= 0 else default
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return default
+
+
 def update_suite_scoped_fingerprints(
     ledger: dict[str, Any],
     date_prefix: str,
@@ -1555,6 +1655,16 @@ def update_suite_scoped_fingerprints(
     """Updates `active_fingerprints`, `quarantined_fingerprints`, `fingerprint_history`,
     and `resolved_history` independently per suite so an unhealthy or skipped suite
     never falsely ages or resolves its fingerprints.
+
+    - A healthy suite increments `campaigns_failing` and refreshes `last_seen_date`
+      for each fingerprint it observed unquarantined, and moves its previously
+      tracked fingerprints that it no longer observed at all (neither unquarantined
+      nor quarantined) to `resolved_history`. A fingerprint that reappears after
+      being resolved keeps its original `first_seen_date`.
+    - An unhealthy or skipped suite leaves its entries byte-for-byte untouched.
+    - Legacy ledgers without `fingerprint_history` get entries for their active
+      fingerprints dated by the ledger's `last_run_utc` (when they were last
+      observed), never by today's date.
     """
     prev_active_raw = ledger.get("active_fingerprints", [])
     prev_active_list: list[str] = (
@@ -1589,14 +1699,15 @@ def update_suite_scoped_fingerprints(
         else {}
     )
 
-    for fp in prev_active_list:
-        if fp not in fp_history:
-            fp_history[fp] = {
-                "first_seen_date": date_prefix,
-                "last_seen_date": date_prefix,
-                "campaigns_failing": 1,
-                "suite": infer_fingerprint_suite(fp),
-            }
+    last_run = ledger.get("last_run_utc")
+    legacy_seen_date = (
+        last_run[:10]
+        if isinstance(last_run, str) and len(last_run) >= 10
+        else date_prefix
+    )
+
+    def suite_of(fp: str) -> str:
+        return infer_fingerprint_suite(fp, fp_history.get(fp))
 
     new_active: list[str] = []
     new_quarantined: list[str] = []
@@ -1605,69 +1716,76 @@ def update_suite_scoped_fingerprints(
         ("miri-difftest", miri_suite_healthy, miri_unquarantined, miri_quarantined),
         ("itree-difftest", itree_suite_healthy, itree_unquarantined, itree_quarantined),
     ):
-        prev_suite_active = {
-            fp
-            for fp in prev_active_list
-            if infer_fingerprint_suite(fp, fp_history.get(fp)) == suite_name
-        }
-        prev_suite_quar = {
-            fp
-            for fp in prev_quar_list
-            if infer_fingerprint_suite(fp, fp_history.get(fp)) == suite_name
-        }
-        prev_suite_hist_keys = {
-            fp
-            for fp, meta in fp_history.items()
-            if infer_fingerprint_suite(fp, meta) == suite_name
-        }
+        prev_suite_active = [fp for fp in prev_active_list if suite_of(fp) == suite_name]
+        prev_suite_quar = [fp for fp in prev_quar_list if suite_of(fp) == suite_name]
 
-        if is_healthy:
-            obs_unquar = {d.fingerprint for d in suite_unquar}
-            obs_quar = {d.fingerprint for d in suite_quar}
-
-            for fp in sorted(obs_unquar):
-                prev_meta = fp_history.get(fp)
-                if isinstance(prev_meta, dict):
-                    first_seen = str(prev_meta.get("first_seen_date") or date_prefix)
-                    failing_cnt = int(prev_meta.get("campaigns_failing", 0)) + 1
-                else:
-                    first_seen = date_prefix
-                    failing_cnt = 1
-                fp_history[fp] = {
-                    "first_seen_date": first_seen,
-                    "last_seen_date": date_prefix,
-                    "campaigns_failing": failing_cnt,
-                    "suite": suite_name,
-                }
-                resolved_history.pop(fp, None)
-
-            to_resolve = (prev_suite_active | prev_suite_hist_keys) - obs_unquar
-            for fp in sorted(to_resolve):
-                prev_meta = fp_history.pop(fp, None)
-                resolved_history[fp] = {
-                    "first_seen_date": str(
-                        (prev_meta or {}).get("first_seen_date") or date_prefix
-                    ),
-                    "last_seen_date": str(
-                        (prev_meta or {}).get("last_seen_date") or date_prefix
-                    ),
-                    "campaigns_failing": int(
-                        (prev_meta or {}).get("campaigns_failing", 1)
-                    ),
-                    "resolved_date": date_prefix,
-                    "suite": suite_name,
-                }
-
-            new_active.extend(sorted(obs_unquar))
-            new_quarantined.extend(sorted(obs_quar))
-        else:
-            # Preserve existing active/quarantined/history entries for this suite untouched.
-            for fp in prev_active_list:
-                if fp in prev_suite_active and fp not in new_active:
+        if not is_healthy:
+            # Preserve this suite's active/quarantined/history entries untouched.
+            for fp in prev_suite_active:
+                if fp not in new_active:
                     new_active.append(fp)
-            for fp in prev_quar_list:
-                if fp in prev_suite_quar and fp not in new_quarantined:
+            for fp in prev_suite_quar:
+                if fp not in new_quarantined:
                     new_quarantined.append(fp)
+            continue
+
+        # Healthy suite: materialize legacy history entries before aging them.
+        for fp in prev_suite_active:
+            if fp not in fp_history:
+                fp_history[fp] = {
+                    "first_seen_date": legacy_seen_date,
+                    "last_seen_date": legacy_seen_date,
+                    "campaigns_failing": 1,
+                    "suite": suite_name,
+                }
+
+        obs_unquar = {d.fingerprint for d in suite_unquar}
+        obs_quar = {d.fingerprint for d in suite_quar} - obs_unquar
+        prev_suite_hist_keys = {
+            fp for fp, meta in fp_history.items() if infer_fingerprint_suite(fp, meta) == suite_name
+        }
+
+        for fp in sorted(obs_unquar):
+            prev_meta = fp_history.get(fp)
+            if not isinstance(prev_meta, dict):
+                # A regression of a previously resolved fingerprint continues its
+                # original history instead of restarting it.
+                prev_meta = resolved_history.get(fp)
+            if isinstance(prev_meta, dict):
+                first_seen = str(prev_meta.get("first_seen_date") or date_prefix)
+                failing_cnt = _safe_nonneg_int(prev_meta.get("campaigns_failing"), 0) + 1
+            else:
+                first_seen = date_prefix
+                failing_cnt = 1
+            fp_history[fp] = {
+                "first_seen_date": first_seen,
+                "last_seen_date": date_prefix,
+                "campaigns_failing": failing_cnt,
+                "suite": suite_name,
+            }
+            resolved_history.pop(fp, None)
+
+        # Still observed, but quarantined: not resolved; refresh `last_seen_date`
+        # without counting a failing campaign.
+        for fp in sorted(obs_quar):
+            meta = fp_history.get(fp)
+            if isinstance(meta, dict):
+                meta["last_seen_date"] = date_prefix
+                meta["suite"] = suite_name
+
+        to_resolve = (set(prev_suite_active) | prev_suite_hist_keys) - obs_unquar - obs_quar
+        for fp in sorted(to_resolve):
+            prev_meta = fp_history.pop(fp, None) or {}
+            resolved_history[fp] = {
+                "first_seen_date": str(prev_meta.get("first_seen_date") or legacy_seen_date),
+                "last_seen_date": str(prev_meta.get("last_seen_date") or legacy_seen_date),
+                "campaigns_failing": _safe_nonneg_int(prev_meta.get("campaigns_failing"), 1),
+                "resolved_date": date_prefix,
+                "suite": suite_name,
+            }
+
+        new_active.extend(sorted(obs_unquar))
+        new_quarantined.extend(sorted(obs_quar))
 
     ledger["active_fingerprints"] = new_active
     ledger["quarantined_fingerprints"] = new_quarantined
@@ -1687,42 +1805,53 @@ def load_coverage_ratchet(ratchet_path: Path) -> dict[str, Any]:
 
 def extract_suite_obs_path_signatures(
     suite_key: str, summary: dict[str, Any], seed_val: int
-) -> list[str]:
-    """Extracts deterministic observation-path signatures from a healthy suite summary."""
+) -> tuple[list[str], bool]:
+    """Returns `(signatures, derived)` for a healthy suite summary.
+
+    Live harness summaries carry `obs_path_signatures`, which are used verbatim
+    (prefixed with `<suite_key>:` when needed), even when empty. Only summaries
+    that omit the key entirely (unit-test mocks, pre-ratchet harness builds) fall
+    back to coarse signatures derived from `mutator_applications` /
+    `miri_verdicts` or `distinct_obs_paths`; those are flagged `derived=True`.
+    """
     raw_sigs = summary.get("obs_path_signatures")
     if isinstance(raw_sigs, list):
         cleaned = sorted(
             {
-                (s.strip() if s.strip().startswith(f"{suite_key}:") else f"{suite_key}:{s.strip()}")
+                (
+                    s.strip()
+                    if s.strip().startswith(f"{suite_key}:")
+                    else f"{suite_key}:{s.strip()}"
+                )
                 for s in raw_sigs
                 if isinstance(s, str) and s.strip()
             }
         )
-        if cleaned:
-            return cleaned
+        return cleaned, False
 
-    # Fallback derivation for unit-test mock summaries that omit `obs_path_signatures`.
     seed_hex = f"0x{seed_val:08x}"
     derived: set[str] = set()
     if suite_key == "miri":
         muts = summary.get("mutator_applications", {})
         verdicts = summary.get("miri_verdicts", {})
         active_muts = sorted(
-            k for k, v in (muts.items() if isinstance(muts, dict) else []) if int(v) > 0
+            k
+            for k, v in (muts.items() if isinstance(muts, dict) else [])
+            if _safe_nonneg_int(v) > 0
         ) or ["identity"]
         active_verdicts = sorted(
             k
             for k, v in (verdicts.items() if isinstance(verdicts, dict) else [])
-            if int(v) > 0
+            if _safe_nonneg_int(v) > 0
         ) or ["pass"]
         for m in active_muts:
             for v in active_verdicts:
-                derived.add(f"miri:{m}@{seed_hex}:{v}_vs_{v}:agree")
+                derived.add(f"miri:derived:{m}@{seed_hex}:{v}")
     else:
-        n_obs = max(1, int(summary.get("distinct_obs_paths", 1)))
+        n_obs = max(1, _safe_nonneg_int(summary.get("distinct_obs_paths"), 1))
         for idx in range(n_obs):
-            derived.add(f"itree:seed@{seed_hex}:obs_{idx:04d}:normal")
-    return sorted(derived)
+            derived.add(f"itree:derived:seed@{seed_hex}:obs_{idx:04d}")
+    return sorted(derived), True
 
 
 def update_coverage_ratchet(
@@ -1737,6 +1866,11 @@ def update_coverage_ratchet(
 ) -> Path:
     """Monotonically merges observation-path signatures from healthy suite(s)
     into `state/coverage_ratchet.json` and updates `ledger['cumulative_distinct_obs_paths']`.
+
+    `observed_paths` only ever grows (set union), so `per_suite_distinct_obs_paths`
+    and `cumulative_distinct_obs_paths` count distinct semantic observation paths
+    ever observed by a healthy suite. Previous ratchet / ledger totals act as a
+    floor if the ratchet file was lost or truncated.
     """
     ratchet = load_coverage_ratchet(ratchet_path)
     raw_obs = ratchet.get("observed_paths", {})
@@ -1758,15 +1892,16 @@ def update_coverage_ratchet(
         if not is_healthy or summary is None:
             continue
         seed_hex = f"0x{seed_val:08x}"
-        for sig in extract_suite_obs_path_signatures(suite_key, summary, seed_val):
+        sigs, derived = extract_suite_obs_path_signatures(suite_key, summary, seed_val)
+        for sig in sigs:
             prev = observed_paths.get(sig)
             if isinstance(prev, dict):
                 prev["last_seen_utc"] = now_utc
                 prev["last_seen_seed"] = seed_hex
-                prev["hit_count"] = int(prev.get("hit_count", 1)) + 1
+                prev["hit_count"] = _safe_nonneg_int(prev.get("hit_count"), 1) + 1
                 prev["suite"] = suite_key
             else:
-                observed_paths[sig] = {
+                entry: dict[str, Any] = {
                     "suite": suite_key,
                     "first_seen_utc": now_utc,
                     "last_seen_utc": now_utc,
@@ -1774,48 +1909,36 @@ def update_coverage_ratchet(
                     "last_seen_seed": seed_hex,
                     "hit_count": 1,
                 }
+                if derived:
+                    entry["derived"] = True
+                observed_paths[sig] = entry
 
-    miri_obs_count = sum(
-        1
-        for k, v in observed_paths.items()
-        if (v.get("suite") == "miri" if isinstance(v, dict) else k.startswith("miri:"))
-    )
-    itree_obs_count = sum(
-        1
-        for k, v in observed_paths.items()
-        if (v.get("suite") == "itree" if isinstance(v, dict) else k.startswith("itree:"))
-    )
-    prev_per_suite = (
-        ratchet.get("per_suite_distinct_obs_paths")
-        if isinstance(ratchet.get("per_suite_distinct_obs_paths"), dict)
-        else {}
-    )
-    miri_ratchet = max(int(prev_per_suite.get("miri", 0)), miri_obs_count)
-    itree_ratchet = max(int(prev_per_suite.get("itree", 0)), itree_obs_count)
-    if itree_suite_healthy and itree is not None:
-        itree_ratchet = max(itree_ratchet, int(itree.get("distinct_obs_paths", 0)))
+    def suite_count(suite_key: str) -> int:
+        return sum(
+            1
+            for k, v in observed_paths.items()
+            if (v.get("suite") == suite_key)
+            or (v.get("suite") is None and k.startswith(f"{suite_key}:"))
+        )
 
-    prev_ratchet_total = (
-        int(ratchet.get("cumulative_distinct_obs_paths", 0))
-        if isinstance(ratchet.get("cumulative_distinct_obs_paths"), int)
-        else 0
-    )
-    prev_ledger_total = ledger_counter(ledger, "cumulative_distinct_obs_paths")
+    prev_per_suite_raw = ratchet.get("per_suite_distinct_obs_paths")
+    prev_per_suite = prev_per_suite_raw if isinstance(prev_per_suite_raw, dict) else {}
+    per_suite = {
+        key: max(_safe_nonneg_int(prev_per_suite.get(key)), suite_count(key))
+        for key in ("miri", "itree")
+    }
+
     new_total = max(
-        prev_ratchet_total,
-        prev_ledger_total,
+        _safe_nonneg_int(ratchet.get("cumulative_distinct_obs_paths")),
+        _safe_nonneg_int(ledger.get("cumulative_distinct_obs_paths")),
         len(observed_paths),
-        miri_ratchet + itree_ratchet if miri_obs_count > 0 and itree_obs_count > 0 else max(miri_ratchet, itree_ratchet),
     )
 
     updated_ratchet = {
         "schema_version": 1,
         "updated_utc": now_utc,
         "cumulative_distinct_obs_paths": new_total,
-        "per_suite_distinct_obs_paths": {
-            "miri": miri_ratchet,
-            "itree": itree_ratchet,
-        },
+        "per_suite_distinct_obs_paths": per_suite,
         "observed_paths": observed_paths,
     }
     ratchet_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1825,6 +1948,19 @@ def update_coverage_ratchet(
     )
     ledger["cumulative_distinct_obs_paths"] = new_total
     return ratchet_path
+
+
+def markdown_code_fence_for(text: str) -> str:
+    """Returns a backtick fence longer than any backtick run inside `text`."""
+    longest = 0
+    run = 0
+    for ch in text:
+        if ch == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return "`" * max(3, longest + 1)
 
 
 def render_oracle_campaign_report(
@@ -2082,6 +2218,20 @@ def render_oracle_campaign_report(
         for tag, count in sorted(itree["diag_tag_counts"].items()):
             lines.append(f"| `{tag}` | {count} |")
 
+        itree_nc_reasons = itree.get("not_compared_reasons")
+        if isinstance(itree_nc_reasons, dict):
+            lines.extend(
+                [
+                    "",
+                    "## Not-Compared Breakdown by Reason (`itree-difftest`)",
+                    "",
+                    "| Reason | Count |",
+                    "| :--- | ---: |",
+                ]
+            )
+            for reason, count in sorted(itree_nc_reasons.items()):
+                lines.append(f"| `{reason}` | {count} |")
+
     lines.extend(
         [
             "",
@@ -2104,17 +2254,17 @@ def render_oracle_campaign_report(
         for reason in all_red_flag_reasons:
             lines.append(f"- **Red-flag failure**: {reason}")
 
+    failed_suites = set()
+    if not miri_performed or not miri_red_flags.passed:
+        failed_suites.add("miri-difftest")
+    if itree_failed:
+        failed_suites.add("itree-difftest")
     failed_diags = {
         k: v
         for k, v in LAST_HARNESS_DIAGNOSTICS.items()
-        if isinstance(v, dict)
-        and (
-            v.get("exit_code", 0) != 0
-            or v.get("oracle_error_reason")
-            or v.get("stderr_tail")
-        )
+        if k in failed_suites and isinstance(v, dict)
     }
-    if (not miri_performed or not miri_red_flags.passed or itree_failed) and failed_diags:
+    if failed_diags:
         lines.extend(
             [
                 "",
@@ -2130,9 +2280,10 @@ def render_oracle_campaign_report(
             )
             tail = str(diag.get("stderr_tail") or "").strip()
             if tail:
-                lines.append("```text")
+                fence = markdown_code_fence_for(tail)
+                lines.append(f"{fence}text")
                 lines.append(tail)
-                lines.append("```")
+                lines.append(fence)
 
     lines.extend(
         [
@@ -2233,7 +2384,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-oracle-errors",
         type=int,
         default=DEFAULT_MAX_ORACLE_ERRORS,
-        help="Maximum allowed Miri/capture oracle errors before failing (default: 0).",
+        help=(
+            "Maximum allowed oracle errors per suite before failing (default: 0): "
+            "Miri/capture errors for miri-difftest, and candidates dropped by "
+            "staging, native trace capture, or Lean probe/kernel-confirmation "
+            "failures for itree-difftest."
+        ),
     )
     parser.add_argument(
         "--min-oracle-elapsed-ms",
@@ -2511,6 +2667,14 @@ def main(argv: list[str] | None = None) -> int:
             LAST_HARNESS_DIAGNOSTICS.setdefault("miri-difftest", {})[
                 "oracle_error_reason"
             ] = f"invalid_summary: {err_reason}"
+        elif isinstance(miri, dict) and miri_status != "performed":
+            sys.stderr.write(
+                f"miri-difftest reported unsupported oracle_comparison={miri_status!r} "
+                "in a live oracle campaign\n"
+            )
+            diag = LAST_HARNESS_DIAGNOSTICS.setdefault("miri-difftest", {})
+            if not diag.get("oracle_error_reason"):
+                diag["oracle_error_reason"] = f"oracle_comparison={miri_status!r}"
         if not valid_itree and itree_claimed_performed:
             sys.stderr.write(
                 f"itree-difftest produced invalid oracle summary: {itree_err}\n"
@@ -2518,6 +2682,17 @@ def main(argv: list[str] | None = None) -> int:
             LAST_HARNESS_DIAGNOSTICS.setdefault("itree-difftest", {})[
                 "oracle_error_reason"
             ] = f"invalid_summary: {itree_err}"
+        elif (
+            include_itree
+            and isinstance(itree, dict)
+            and itree_status not in ("performed", "not_performed")
+        ):
+            sys.stderr.write(
+                f"itree-difftest reported unsupported oracle_comparison={itree_status!r}\n"
+            )
+            diag = LAST_HARNESS_DIAGNOSTICS.setdefault("itree-difftest", {})
+            if not diag.get("oracle_error_reason"):
+                diag["oracle_error_reason"] = f"oracle_comparison={itree_status!r}"
 
         # If neither suite produced a structurally valid performed summary, fall back
         # to the 25-line `HARNESS FAILED` report without touching the ledger.
@@ -2598,6 +2773,7 @@ def main(argv: list[str] | None = None) -> int:
                     itree_seed,
                     ledger,
                     args.min_oracle_elapsed_ms,
+                    args.max_oracle_errors,
                 )
                 if not itree_red_flags.passed:
                     for reason in itree_red_flags.failure_reasons:
@@ -2744,6 +2920,10 @@ def main(argv: list[str] | None = None) -> int:
             written.append(ledger_path)
 
         elapsed_sec = time.monotonic() - start_time
+        # Only structurally valid performed summaries (or honest `not_performed`
+        # summaries) are rendered cell-by-cell; an invalid `performed` claim is
+        # rendered as `harness-failed` alongside its synthetic red-flag failure.
+        itree_for_report = itree if (itree_performed or itree_ran_without_oracle) else None
         report_md = render_oracle_campaign_report(
             profile,
             date_prefix,
@@ -2753,7 +2933,7 @@ def main(argv: list[str] | None = None) -> int:
             unquarantined,
             quarantined,
             include_itree,
-            itree,
+            itree_for_report,
             itree_red_flags,
             itree_all_dedup,
             itree_unquarantined,
@@ -2782,7 +2962,7 @@ def main(argv: list[str] | None = None) -> int:
             "miri_seed": f"0x{miri_seed:08x}",
             "itree_seed": f"0x{itree_seed:08x}" if include_itree else None,
             "miri_oracle_comparison": (
-                "performed" if miri_suite_healthy else "failed"
+                "performed" if miri_performed else "failed"
             ),
             "itree_oracle_comparison": (
                 "performed"
@@ -2818,7 +2998,7 @@ def main(argv: list[str] | None = None) -> int:
             write_oracle_junit_xml(
                 args.junit_xml.resolve(),
                 profile.name,
-                miri,
+                miri if miri_performed else None,
                 miri_red_flags,
                 miri_unquarantined,
                 include_itree,

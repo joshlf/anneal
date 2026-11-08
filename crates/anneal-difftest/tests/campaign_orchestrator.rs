@@ -207,6 +207,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "itree_non_zero_compared",
         "itree_plausible_wall_clock",
         "itree_seed_sensitivity",
+        "itree_oracle_error_threshold",
     ] {
         assert!(
             report1.contains(&format!("| `{check}` | PASS |")),
