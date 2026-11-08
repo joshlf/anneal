@@ -523,7 +523,7 @@ theorem annealReadImmediate_of_projected_array_elem
     obtain ⟨sc, msc, rfl, himm, hread⟩ := hslice.readScalar_get hget
     refine ⟨sc, msc, rfl, himm, ?_⟩
     have hrel_off :
-        Miri.ABI.Size.ofBytes (elemMp.ptr.offset.bytes - baseAddr) =
+        elemMp.ptr.offset =
           Miri.ABI.Size.ofBytes
             (relOffset.bytes + UInt64.ofNat (idx * elemLay.size.bytes.toNat)) := by
       have hbytes : mp.ptr.offset.bytes = baseAddr + relOffset.bytes := by
@@ -7013,7 +7013,7 @@ theorem annealWriteImmediate_array_elem_set
     obtain ⟨hnodup', hlive', hother_live⟩ := hset_prop ⟨kind, alloc'⟩
     let mach' : AnnealMachine := inplaceMachine mach allocIdx allocId kind alloc'
     have hoff_eq :
-        Miri.ABI.Size.ofBytes (elemMp.ptr.offset.bytes - baseAddr) =
+        elemMp.ptr.offset =
         Miri.ABI.Size.ofBytes
           (relOffset.bytes + UInt64.ofNat (idx * elemLay.layout.size.bytes.toNat)) := by
       have hbytes : mp.ptr.offset.bytes = baseAddr + relOffset.bytes := by rw [hptr]; rfl
