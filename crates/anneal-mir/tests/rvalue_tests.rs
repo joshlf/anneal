@@ -1350,3 +1350,192 @@ fn test_a1_eval_lowered_cast_and_null_ref_guards() {
         Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { .. }))
     ));
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv B2] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b2_ptr_to_int_evaluates_reference_sources_accepted_by_lowering() {
+    let pw = PtrWidth::Bits64;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let mut tracker = ExposedProvenanceTracker::new();
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let ref_u8 = Ty::Ref(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let p = PointerValue::with_provenance(0x5000, 11, 12);
+    let expose = Rvalue::Cast(
+        CastKind::PointerExposeProvenance,
+        Operand::Copy(Place::from_local(0)),
+        usize_ty.clone(),
+    );
+
+    // `lower_ptr_to_int` (base API) accepts `&T` sources; A1's evaluator then rejected the
+    // very cast it had lowered with `TypeMismatch`.
+    let lowered = lower_rvalue(&expose, std::slice::from_ref(&ref_u8), pw).unwrap();
+    assert!(matches!(
+        lowered,
+        LoweredRvalue::Cast {
+            cast: LoweredCast::PtrToInt { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        eval_lowered_rvalue(&lowered, &[MirValue::ptr(p, ref_u8.clone())], pw, policy, &mut tracker),
+        Ok(MirValue::unsigned(0x5000, UintTy::Usize, pw))
+    );
+    assert!(tracker.is_exposed(&p.provenance.unwrap()));
+
+    // A null `&T` value is invalid and is not exposed.
+    let mut fresh = ExposedProvenanceTracker::new();
+    assert_eq!(
+        eval_lowered_rvalue(
+            &lowered,
+            &[MirValue::ptr(PointerValue::without_provenance(0), ref_u8.clone())],
+            pw,
+            policy,
+            &mut fresh
+        ),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_u8,
+            bits: 0,
+        }))
+    );
+    assert!(fresh.is_empty());
+}
+
+#[test]
+fn test_b2_int_to_ptr_predicts_exposed_provenance_so_offset_stays_defined() {
+    let pw = PtrWidth::Bits64;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let raw_u8 = Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not);
+    let local_decls = vec![raw_u8.clone(), usize_ty.clone(), raw_u8.clone()];
+    let p = PointerValue::with_provenance(0x6000, 21, 22);
+
+    let expose = Rvalue::Cast(
+        CastKind::PointerExposeProvenance,
+        Operand::Copy(Place::from_local(0)),
+        usize_ty.clone(),
+    );
+    let with_exposed = Rvalue::Cast(
+        CastKind::PointerWithExposedProvenance,
+        Operand::Copy(Place::from_local(1)),
+        raw_u8.clone(),
+    );
+    let add_one = Rvalue::BinaryOp(
+        BinOp::Offset,
+        Operand::Copy(Place::from_local(2)),
+        Operand::Constant(Constant::Int(1, usize_ty.clone())),
+    );
+
+    // `let a = p as usize; let q = a as *const u8; q.add(1)` (`ptr::with_exposed_provenance`)
+    // is defined. A0/B1/A1 always predicted `None` provenance for `q`, so the non-zero
+    // `Offset` reported `PointerArithmeticWithoutProvenance` (a false UB report).
+    let mut tracker = ExposedProvenanceTracker::new();
+    let addr = eval_rv(&expose, &local_decls, &[MirValue::ptr(p, raw_u8.clone())], pw, policy, &mut tracker)
+        .unwrap();
+    let locals = vec![MirValue::ptr(p, raw_u8.clone()), addr.clone(), MirValue::Unit];
+    let q = eval_rv(&with_exposed, &local_decls, &locals, pw, policy, &mut tracker).unwrap();
+    assert_eq!(q, MirValue::ptr(p, raw_u8.clone()));
+    let locals = vec![MirValue::Unit, addr.clone(), q];
+    assert_eq!(
+        eval_rv(&add_one, &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(PointerValue::with_provenance(0x6001, 21, 22), raw_u8.clone()))
+    );
+
+    // With nothing exposed, `int2ptr` can only predict `None`, so the offset is UB.
+    let mut empty = ExposedProvenanceTracker::new();
+    let locals = vec![MirValue::Unit, addr.clone(), MirValue::Unit];
+    let bare = eval_rv(&with_exposed, &local_decls, &locals, pw, policy, &mut empty).unwrap();
+    assert_eq!(bare, MirValue::ptr(PointerValue::without_provenance(0x6000), raw_u8.clone()));
+    let locals = vec![MirValue::Unit, addr.clone(), bare];
+    assert_eq!(
+        eval_rv(&add_one, &local_decls, &locals, pw, policy, &mut empty),
+        Err(RvalueEvalError::PointerArithmeticWithoutProvenance {
+            addr: 0x6000,
+            byte_offset: 1,
+        })
+    );
+
+    // A lowered cast with `pick_exposed_provenance: false` never picks provenance.
+    let no_pick = LoweredCast::IntToPtr {
+        src_ty: usize_ty,
+        target_ty: raw_u8.clone(),
+        operand: Operand::Copy(Place::from_local(1)),
+        pick_exposed_provenance: false,
+    };
+    assert_eq!(
+        eval_lowered_cast(&no_pick, &addr, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(PointerValue::without_provenance(0x6000), raw_u8))
+    );
+}
+
+#[test]
+fn test_b2_identity_transmute_of_non_canonical_types_returns_validated_value() {
+    let pw = PtrWidth::Bits64;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let mut tracker = ExposedProvenanceTracker::new();
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let ref_u8 = Ty::Ref(Box::new(u8_ty.clone()), Mutability::Not);
+    let padded = Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone()]);
+    let with_ref = Ty::Tuple(vec![ref_u8.clone(), u8_ty.clone()]);
+    let local_decls = vec![padded.clone(), with_ref.clone()];
+    let identity = |local: usize, ty: Ty| {
+        Rvalue::Cast(CastKind::Transmute, Operand::Copy(Place::from_local(local)), ty)
+    };
+
+    let padded_val = MirValue::Tuple(vec![
+        MirValue::unsigned(7, UintTy::U8, pw),
+        MirValue::unsigned(0xDEAD_BEEF, UintTy::U32, pw),
+    ]);
+    let r = PointerValue::with_provenance(0x7000, 31, 32);
+    let ref_val = MirValue::Tuple(vec![MirValue::ptr(r, ref_u8.clone()), MirValue::unsigned(1, UintTy::U8, pw)]);
+    let locals = vec![padded_val.clone(), ref_val.clone()];
+    assert_eq!(
+        eval_rv(&identity(0, padded.clone()), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(padded_val.clone())
+    );
+    // Provenance is preserved and never exposed.
+    assert_eq!(
+        eval_rv(&identity(1, with_ref.clone()), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(ref_val)
+    );
+    assert!(tracker.is_empty());
+
+    // Struct values (typed as the tuple of their fields) are returned unchanged too.
+    let adt_val = MirValue::Adt {
+        def_path: "S".into(),
+        variant_idx: 0,
+        active_field: None,
+        fields: vec![
+            MirValue::unsigned(1, UintTy::U8, pw),
+            MirValue::unsigned(2, UintTy::U32, pw),
+        ],
+    };
+    let locals = vec![adt_val.clone(), MirValue::Unit];
+    assert_eq!(
+        eval_rv(&identity(0, padded.clone()), &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(adt_val)
+    );
+
+    // Invalid operands are still rejected: a null reference field ...
+    let null_ref_val = MirValue::Tuple(vec![
+        MirValue::ptr(PointerValue::without_provenance(0), ref_u8.clone()),
+        MirValue::unsigned(1, UintTy::U8, pw),
+    ]);
+    let locals = vec![padded_val, null_ref_val];
+    assert_eq!(
+        eval_rv(&identity(1, with_ref), &local_decls, &locals, pw, policy, &mut tracker),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: ref_u8,
+            bits: 0,
+        }))
+    );
+    // ... and values whose shape does not match the type.
+    let locals = vec![MirValue::unsigned(7, UintTy::U8, pw), MirValue::Unit];
+    assert!(matches!(
+        eval_rv(&identity(0, padded), &local_decls, &locals, pw, policy, &mut tracker),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}

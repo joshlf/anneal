@@ -369,13 +369,18 @@ pub fn lower_transmute(
         });
     }
 
-    check_transmute_layouts(src_ty, target_ty, ptr_width, policy).map_err(|err| match err {
-        TransmuteLayoutError::Unsupported(ty) => CastLowerError::UnsupportedLayout { ty },
-        TransmuteLayoutError::PtrToInt => CastLowerError::PtrToIntTransmuteDisallowed {
-            src_ty: src_ty.clone(),
-            target_ty: target_ty.clone(),
-        },
-    })?;
+    // Transmuting a type to itself is the identity on its values (MiniRust:
+    // `T.decode(T.encode(v)) == v`) whatever its layout, and keeps every pointer on itself, so
+    // neither a canonical byte layout nor the `Ptr -> Int` policy applies.
+    if src_ty != target_ty {
+        check_transmute_layouts(src_ty, target_ty, ptr_width, policy).map_err(|err| match err {
+            TransmuteLayoutError::Unsupported(ty) => CastLowerError::UnsupportedLayout { ty },
+            TransmuteLayoutError::PtrToInt => CastLowerError::PtrToIntTransmuteDisallowed {
+                src_ty: src_ty.clone(),
+                target_ty: target_ty.clone(),
+            },
+        })?;
+    }
 
     let op = match (src_ty.to_scalar_ty(), target_ty.to_scalar_ty()) {
         (Some(src), Some(dst)) => CastOp::Transmute { src, dst },

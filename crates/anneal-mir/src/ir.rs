@@ -544,13 +544,18 @@ impl Ty {
     /// - A tuple is canonical when all fields are canonical and either
     ///   (a) it has at most one field,
     ///   (b) all of its fields have the same type, or
-    ///   (c) no field contains a niche-bearing scalar (`bool`, `char`, `&T`), the fields'
-    ///   alignment-group keys `log2(max(align, size))` are non-increasing in declaration order,
-    ///   and the unpadded size is a multiple of the tuple's alignment (no padding at all).
+    ///   (c) no field contains a niche-bearing scalar (`bool`, `char`, `&T`), both the fields'
+    ///   ABI alignments and their alignment-group keys `log2(max(align, size))` are
+    ///   non-increasing in declaration order, and declaration order has no padding at all
+    ///   (every field offset is aligned and the unpadded size is a multiple of the tuple's
+    ///   alignment).
     ///
-    /// These conditions are conservative: declaration order is then already size-optimal and
-    /// sorted by alignment group, so `rustc`'s field-reordering heuristics (which may otherwise
-    /// move fields, or place niches, differently across compiler versions) keep it. Byte-level
+    /// These conditions are deliberately conservative: declaration order is then already
+    /// size-optimal *and* sorted under every field-sorting key `rustc` has used (plain ABI
+    /// alignment in older compilers, `log2(max(align, size))` in current ones), so its
+    /// field-reordering heuristics keep it across compiler versions. (`rustc` 1.98 in fact also
+    /// keeps declaration order for some tuples rejected here, e.g. `([u8; 4], u32)` has field
+    /// offsets `[0, 4]`, but older `rustc` sorted the `u32` first.) Byte-level
     /// (`CastKind::Transmute`) reinterpretation is only defined for canonical layouts: e.g.
     /// `(u16, u16)`, `(u32, u16, u16)`, and `(*const u8, u64)` are canonical, whereas
     /// `(u8, u32)` (padding), `(u32, u64)` (fields not sorted by alignment), and `(u8, bool)`
@@ -585,13 +590,12 @@ impl Ty {
                 }
                 let mut offset = 0usize;
                 for f in fields {
-                    let f_align = f.align_for(ptr_width);
-                    if offset % f_align != 0 {
+                    if !offset.is_multiple_of(f.align_for(ptr_width)) {
                         return false;
                     }
                     offset = offset.saturating_add(f.byte_size_for(ptr_width));
                 }
-                offset % self.align_for(ptr_width) == 0
+                offset.is_multiple_of(self.align_for(ptr_width))
             }
         }
     }

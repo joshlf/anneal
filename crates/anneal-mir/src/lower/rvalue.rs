@@ -1937,6 +1937,44 @@ fn encode_mir_value(
     Ok(())
 }
 
+/// Validates `val` against `ty` for an identity transmute: like `encode_mir_value` (shape,
+/// scalar types, and leaf validity such as non-null `&T`), but also accepts struct/enum
+/// `MirValue::Adt` values, which Anneal types as the tuple of their fields.
+fn encode_or_validate_identity(
+    val: &MirValue,
+    ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<(), RvalueEvalError> {
+    match (ty, val) {
+        (
+            Ty::Tuple(fields),
+            MirValue::Adt {
+                active_field: None,
+                fields: values,
+                ..
+            },
+        )
+        | (Ty::Tuple(fields), MirValue::Tuple(values))
+            if values.len() == fields.len() =>
+        {
+            values
+                .iter()
+                .zip(fields)
+                .try_for_each(|(value, field)| encode_or_validate_identity(value, field, ptr_width))
+        }
+        (
+            Ty::Array(elem, count),
+            MirValue::Array {
+                elements,
+                elem_ty,
+            },
+        ) if **elem == *elem_ty && elements.len() == *count => elements
+            .iter()
+            .try_for_each(|element| encode_or_validate_identity(element, elem, ptr_width)),
+        _ => encode_mir_value(val, ty, ptr_width, &mut Vec::new()),
+    }
+}
+
 /// Decodes the canonical byte image `bytes` (exactly `ty`'s size, already validated by
 /// `eval_transmute`) into a structured `MirValue` of type `ty`.
 fn decode_mir_value(
@@ -2025,10 +2063,17 @@ pub fn eval_lowered_cast(
                     "PtrToInt requires pointer value",
                 ));
             };
-            if ty != src_ty || !src_ty.is_raw_ptr() {
+            // `lower_ptr_to_int` accepts raw pointers *and* references as sources.
+            if ty != src_ty || !src_ty.is_any_ptr() {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "PtrToInt operand type must match raw pointer source type",
+                    "PtrToInt operand type must match pointer or reference source type",
                 ));
+            }
+            if src_ty.is_ref() && (u128::from(ptr.addr) & ptr_width.mask()) == 0 {
+                return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+                    target_ty: src_ty.clone(),
+                    bits: 0,
+                }));
             }
             let bits = eval_ptr_to_int_with_ptr_width(*ptr, target_ty, ptr_width, tracker)?;
             Ok(MirValue::Int {
@@ -2037,7 +2082,10 @@ pub fn eval_lowered_cast(
             })
         }
         LoweredCast::IntToPtr {
-            src_ty, target_ty, ..
+            src_ty,
+            target_ty,
+            pick_exposed_provenance,
+            ..
         } => {
             let MirValue::Int { bits: addr, ty } = val else {
                 return Err(RvalueEvalError::TypeMismatch(
@@ -2054,8 +2102,21 @@ pub fn eval_lowered_cast(
                 Ty::Uint(ut) => (*addr & ut.mask(ptr_width)) & ptr_width.mask(),
                 _ => unreachable!(),
             };
-            let ptr =
-                eval_int_to_ptr_with_ptr_width(addr_bits, target_ty, ptr_width, tracker, None)?;
+            // MiniRust `int2ptr` angelically predicts either no provenance or a previously
+            // exposed one. Anneal's evaluator has no allocation bounds, so every exposed
+            // provenance satisfies every later provenance-dependent check (e.g. non-zero
+            // `Offset`) equally well; we deterministically predict the least exposed
+            // provenance, and `None` only when nothing has been exposed (or picking is
+            // disabled). Predicting `None` despite exposed provenance would make valid
+            // `ptr::with_exposed_provenance(addr).add(n)` programs report UB.
+            let predicted = if *pick_exposed_provenance {
+                tracker.exposed.first().copied()
+            } else {
+                None
+            };
+            let ptr = eval_int_to_ptr_with_ptr_width(
+                addr_bits, target_ty, ptr_width, tracker, predicted,
+            )?;
             Ok(MirValue::Ptr {
                 ptr,
                 ty: target_ty.clone(),
@@ -2112,6 +2173,23 @@ pub fn eval_lowered_cast(
         LoweredCast::Transmute {
             src_ty, target_ty, ..
         } => {
+            if src_ty == target_ty && !src_ty.has_canonical_byte_layout(ptr_width) {
+                // Identity transmute through a layout without a canonical byte image (e.g. a
+                // padded tuple): `T.decode(T.encode(v)) == v` for every valid `v`, so validate
+                // the operand against `T` and return it unchanged.
+                if !src_ty.is_inhabited() {
+                    return Err(RvalueEvalError::CastEval(CastEvalError::UninhabitedTarget {
+                        target_ty: target_ty.clone(),
+                    }));
+                }
+                if src_ty.layout_size_for(ptr_width).is_none() {
+                    return Err(RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge {
+                        ty: src_ty.clone(),
+                    }));
+                }
+                encode_or_validate_identity(val, src_ty, ptr_width)?;
+                return Ok(val.clone());
+            }
             let tv_in = match val {
                 MirValue::Ptr { ptr, ty } if ty == src_ty => TransmuteValue::Ptr(*ptr),
                 MirValue::Int { bits, ty } if ty == src_ty => TransmuteValue::Scalar(*bits),

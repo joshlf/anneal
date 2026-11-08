@@ -873,11 +873,12 @@ fn test_a1_tuple_canonical_layout_rejects_increasing_field_alignment_with_same_s
     let u64_ty = Ty::Uint(UintTy::U64);
     let op = Operand::Constant(Constant::Unit);
 
-    // `([u8; 4], u32)` has field sizes (4, 4) so `max(align, size)` is 4 for both,
-    // but `[u8; 4]` has align 1 < `u32` align 4, so `rustc` reorders `u32` before `[u8; 4]`.
-    // Similarly `([u8; 6], u16)` has `max(align, size)` trailing_zeros (1, 1) and unpadded size 8,
-    // but `[u8; 6]` has align 1 < `u16` align 2 (which would also place `u16` at offset 6 or reorder).
-    // And `((u32, u32), u64)` has field sizes (8, 8), but `(u32, u32)` has align 4 < `u64` align 8.
+    // `([u8; 4], u32)` has field sizes (4, 4) so `max(align, size)` is 4 for both, but
+    // `[u8; 4]` has align 1 < `u32` align 4: older `rustc` versions sorted fields by plain ABI
+    // alignment (moving the `u32` first), so this layout is not *guaranteed* to stay in
+    // declaration order across compilers. (`rustc` 1.98 happens to keep it: offsets `[0, 4]`.)
+    // Similarly `([u8; 6], u16)` (alignment-group keys (1, 1), align 1 < 2; 1.98 offsets
+    // `[0, 6]`) and `((u32, u32), u64)` (sizes (8, 8), align 4 < 8; 1.98 offsets `[0, 8]`).
     let non_canonical = [
         Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 4), u32_ty.clone()]),
         Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 6), u16_ty.clone()]),
@@ -927,4 +928,59 @@ fn test_a1_tuple_canonical_layout_rejects_increasing_field_alignment_with_same_s
     let canon_u64_pair = Ty::Tuple(vec![u64_ty, Ty::Tuple(vec![u32_ty.clone(), u32_ty])]);
     assert!(canon_u32_arr.has_canonical_byte_layout(PtrWidth::Bits64));
     assert!(canon_u64_pair.has_canonical_byte_layout(PtrWidth::Bits64));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B2] regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b2_identity_transmute_lowers_for_non_canonical_layouts() {
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let op = Operand::Constant(Constant::Unit);
+
+    // `transmute::<T, T>` (e.g. after monomorphizing generic code) is the identity whatever
+    // T's layout; A0/B1/A1 rejected these with `UnsupportedLayout` because the padded /
+    // possibly-reordered layouts have no canonical byte image.
+    let padded = Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone()]);
+    let unsorted = Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 4), u32_ty.clone()]);
+    for ty in [&padded, &unsorted] {
+        assert!(!ty.has_canonical_byte_layout(PtrWidth::Bits64));
+        let lowered = lower_transmute(&op, ty, ty, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt)
+            .expect("identity transmute must lower");
+        assert!(matches!(
+            lowered,
+            LoweredCast::Transmute {
+                op: CastOp::AggregateTransmute { size_bytes: 8 },
+                exposes_provenance: false,
+                ..
+            }
+        ));
+    }
+    // Pointers stay on themselves, so the default policy is satisfied even for a mixed-niche
+    // tuple holding a reference.
+    let with_ref = Ty::Tuple(vec![Ty::Ref(Box::new(u8_ty.clone()), Mutability::Not), u8_ty.clone()]);
+    assert!(
+        lower_transmute(&op, &with_ref, &with_ref, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt)
+            .is_ok()
+    );
+    // Identity still requires an inhabited, representable type.
+    let uninhabited = Ty::Tuple(vec![Ty::Never, u32_ty.clone()]);
+    assert_eq!(
+        lower_transmute(&op, &uninhabited, &uninhabited, PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::UninhabitedTarget {
+            target_ty: uninhabited.clone(),
+        })
+    );
+    let too_big = Ty::Array(Box::new(u8_ty), 1 << 31);
+    assert_eq!(
+        lower_transmute(&op, &too_big, &too_big, PtrWidth::Bits32, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::LayoutTooLarge { ty: too_big })
+    );
+    // Non-identity transmutes through non-canonical layouts remain unsupported.
+    assert_eq!(
+        lower_transmute(&op, &padded, &Ty::Uint(UintTy::U64), PtrWidth::Bits64, TransmutePolicy::RejectPtrToInt),
+        Err(CastLowerError::UnsupportedLayout { ty: padded })
+    );
 }
