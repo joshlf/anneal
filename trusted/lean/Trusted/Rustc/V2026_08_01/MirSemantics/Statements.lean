@@ -2219,7 +2219,11 @@ computing a place with live root slot `rootSlot` and projection path `proj` in
 
 A bare mention of a live but uninitialized local (`proj = []`, `rootSlot =
 .uninit`) reads nothing and remains defined. The place itself is never loaded,
-so the pointee of a dereferenced pointer may be dangling.
+so the pointee of a dereferenced raw pointer may be dangling. MiniRust
+additionally requires the pointee of a dereferenced safe pointer (`&T`,
+`&mut T`, `Box<T>`) to be dereferenceable when the place is computed; that
+check is not modeled here, so `PlaceMention(*r)` through a dangling reference
+`r` steps where MiniRust faults.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2232,6 +2236,17 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > When executed at runtime, this computes the given place, but then discards
 > it without doing a load. `let _ = *ptr;` is fine even if the pointer is
 > dangling."
+
+Reference (MiniRust `spec/lang/step/expressions.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/lang/step/expressions.md#L250-L256>
+
+> "// We know the pointer is valid for its type, but make sure safe pointers are also dereferenceable.
+> // (We don't do a full retag here, this is not considered creating a new pointer.)
+> if let Some(pointee) = ptr_type.safe_pointee() {
+> ...
+>     self.mem.dereferenceable(ptr.thin_pointer, self.compute_size(pointee.layout, ptr.metadata))?;
+> }"
 -/
 def placeMentionOperandsInit
     (locals : List LocalSlot)
@@ -2913,8 +2928,10 @@ Universal proof that a dereferencing `StatementKind.placeMention`
 `advanceStmt s s.frame.locals` whenever the root pointer local is initialized
 (`get? s.frame.locals loc = .some (.init v)`) and every `.index idxLocal` along
 `restProj` is an initialized scalar
-(`placeIndexLocalsInit s.frame.locals restProj = true`), even if the pointer
-itself is dangling (`let _ = *ptr;`).
+(`placeIndexLocalsInit s.frame.locals restProj = true`), even if the pointee
+is dangling (`let _ = *ptr;`). For safe pointers this is more permissive than
+MiniRust, which also requires the pointee to be dereferenceable (see
+`placeMentionOperandsInit`).
 -/
 theorem evalStmt_placeMention_deref_init_ok
     (s : MachineState)

@@ -4809,25 +4809,25 @@ theorem stmt_div_storage_dead_retag_is_ub :
       .some (.some .ub, "Retag(_2)", .none) := by
   rfl
 
-/-- `D2` `copy_nonoverlapping` after `StorageDead` + `StorageLive` revival:
-copying 1 element from or to a pointer `_2` minted before `StorageDead(_1)` and
-`StorageLive(_1)` faults with `FailureKind.ub` even after `_1` is revived and
-re-initialized:
+/-- `D2` `copy_nonoverlapping` source after `StorageDead` + `StorageLive`
+revival: copying 1 element out of the revived and re-initialized `_1` through
+the two-phase mutable borrow `_2` minted before `StorageDead(_1)` (whose
+`.reserved` tag survives the direct write `_1 = 20`):
 ```text
 StorageLive(_1); StorageLive(_2); StorageLive(_3);
-_1 = const 10_u64; _2 = &raw mut _1; _0 = const 0_u64; _3 = &raw mut _0;
+_1 = const 10_u64; _2 = &two-phase mut _1; _0 = const 0_u64; _3 = &raw mut _0;
 StorageDead(_1); StorageLive(_1); _1 = const 20_u64;
 copy_nonoverlapping(src = copy _2, dst = copy _3, count = const 1_usize); return
 ``` -/
 private def stmtDivReviveCopySrcBody : CapturedMir :=
   stmtDivBody "stmt_div::copy_nonoverlapping_from_revived_local"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
-      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+      stmtDivDecl stmtDivRefMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .storageLive 2, span := "live _2" },
       { kind := .storageLive 3, span := "live _3" },
       { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
-      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
       { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" },
       { kind := .assign ⟨3, []⟩ (.rawPtr .mut ⟨0, []⟩), span := "_3 = &raw mut _0" },
       { kind := .storageDead 1, span := "dead _1" },
@@ -4836,10 +4836,49 @@ private def stmtDivReviveCopySrcBody : CapturedMir :=
       { kind := .intrinsic (.copyNonOverlapping (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) (stmtDivConstUsize 1)),
         span := "copy_nonoverlapping(src=_2, dst=_3, 1)" } ]
 
+/-- `D2` `copy_nonoverlapping` source regression: the copy faults with
+`FailureKind.ub` (Anneal previously copied the revived `20` into `_0` and
+returned it). -/
 theorem stmt_div_storage_revive_copy_nonoverlapping_is_ub :
-    diffCProbeBounded 16 stmtDivReviveCopySrcBody
+    diffCProbeBounded 20 stmtDivReviveCopySrcBody
       (.running (initMachineState stmtDivReviveCopySrcBody [])) =
       .some (.some .ub, "copy_nonoverlapping(src=_2, dst=_3, 1)", .none) := by
+  rfl
+
+/-- `D2` `copy_nonoverlapping` destination after `StorageDead` + `StorageLive`
+revival: copying 1 element into the revived `_1` through the raw pointer `_2`
+minted before `StorageDead(_1)`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &raw mut _1; _0 = const 5_u64; _3 = &raw mut _0;
+StorageDead(_1); StorageLive(_1);
+copy_nonoverlapping(src = copy _3, dst = copy _2, count = const 1_usize);
+_0 = copy _1; return
+``` -/
+private def stmtDivReviveCopyDstBody : CapturedMir :=
+  stmtDivBody "stmt_div::copy_nonoverlapping_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 5)), span := "_0 = 5" },
+      { kind := .assign ⟨3, []⟩ (.rawPtr .mut ⟨0, []⟩), span := "_3 = &raw mut _0" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .intrinsic (.copyNonOverlapping (.copy ⟨3, []⟩) (.copy ⟨2, []⟩) (stmtDivConstUsize 1)),
+        span := "copy_nonoverlapping(src=_3, dst=_2, 1)" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩)), span := "_0 = copy _1" } ]
+
+/-- `D2` `copy_nonoverlapping` destination regression: the copy faults with
+`FailureKind.ub` (Anneal previously wrote `5` into the revived `_1` through the
+stale pointer and returned it). -/
+theorem stmt_div_storage_revive_copy_nonoverlapping_dst_is_ub :
+    diffCProbeBounded 20 stmtDivReviveCopyDstBody
+      (.running (initMachineState stmtDivReviveCopyDstBody [])) =
+      .some (.some .ub, "copy_nonoverlapping(src=_3, dst=_2, 1)", .none) := by
   rfl
 
 /-- Positive control for `D9` + `D2` (`rustc_middle/src/mir/syntax.rs`:
