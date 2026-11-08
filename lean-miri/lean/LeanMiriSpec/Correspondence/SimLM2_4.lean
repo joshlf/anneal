@@ -291,6 +291,22 @@ theorem IsPrimScalarTy.fields_primitive {ty : Ty} {layouts : LayoutTable}
   rcases h with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩ <;>
     (try cases it) <;> (try cases ut) <;> simp [translateTy, hk] <;> rfl
 
+/-- A primitive scalar layout has nonzero byte size (`== ZERO` is `false`). -/
+theorem IsPrimScalarTy.size_beq_zero {ty : Ty} {layouts : LayoutTable}
+    (h : IsPrimScalarTy ty) :
+    ((translateTy ty layouts).layout.size == Miri.ABI.Size.ZERO) = false :=
+  beq_false_of_ne (IsPrimScalarTy.size_ne_zero h)
+
+/-- A primitive scalar layout uses `BackendRepr.Scalar`. -/
+theorem IsPrimScalarTy.backendRepr_scalar {ty : Ty} {layouts : LayoutTable}
+    (h : IsPrimScalarTy ty) :
+    ∃ s, (translateTy ty layouts).layout.backendRepr = .Scalar s := by
+  rcases h with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩ <;>
+    (try cases it) <;> (try cases ut) <;> simp [translateTy, hk] <;> exact ⟨_, rfl⟩
+
+private theorem add_size_zero_bytes (x : UInt64) : x + Miri.ABI.Size.ZERO.bytes = x :=
+  UInt64.add_zero x
+
 /-- `annealReadImmediate` of a field of a memory-backed union (`UnionMemRel`)
 reads the field's bytes `[0, w)` (`w` the field's size): when the field is the
 one the union holds (`w = k`), it returns the held scalar; when the field is
@@ -311,7 +327,7 @@ theorem annealReadImmediate_unionMem
           .ok ⟨.scalar (.fromScalarInt msc), translateTy fty layouts⟩ m) ∧
     (sc.sizeBytes < w → w ≤ S →
       annealReadImmediate ⟨.indirect mp, translateTy fty layouts⟩ m =
-        .error (.undefinedBehavior "read of uninitialized indirect scalar") m) := by
+        .error (.undefinedBehavior "read of uninitialized memory field") m) := by
   cases hmem with
   | mk allocId tag baseAddr localAlloc msc hprov _ _ hlive hbase hptr _ hsize hlen _ _ _ _ _
       hk_le hmask hrel _ himm hraw =>
@@ -320,6 +336,8 @@ theorem annealReadImmediate_unionMem
       have hb : mp.ptr.offset.bytes = baseAddr := by rw [hptr]; rfl
       rw [hb, UInt64.sub_self]; rfl
     have hfields := hprim.fields_primitive (layouts := layouts)
+    have hsz0 := hprim.size_beq_zero (layouts := layouts)
+    obtain ⟨s_repr, hrepr⟩ := hprim.backendRepr_scalar (layouts := layouts)
     have hS16 : S ≤ 16 := by rcases hS with h | h | h | h | h <;> omega
     have hkv := hrel.validBytes
     have hunfold :
@@ -328,11 +346,16 @@ theorem annealReadImmediate_unionMem
               (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes w)) false with
           | .ok sc => EStateM.Result.ok ⟨.scalar sc, translateTy fty layouts⟩ m
           | .error (.invalidUninitBytes _) =>
-              EStateM.Result.error (.undefinedBehavior "read of uninitialized indirect scalar") m
-          | .error _ => EStateM.Result.error (.unsupported "indirect scalar read failed") m) := by
-      unfold annealReadImmediate
-      simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, hprov,
-        Option.bind_some, Miri.Memory.Provenance.getAllocId, hbase, hfind, hrel_off, hfields, hsz]
+              EStateM.Result.error (.undefinedBehavior "read of uninitialized memory field") m
+          | .error (.outOfBounds ..) =>
+              EStateM.Result.error (.undefinedBehavior "out-of-bounds memory field read") m
+          | .error _ => EStateM.Result.error (.unsupported "readScalar failed") m) := by
+      unfold annealReadImmediate annealReadIndirectImmediate
+      dsimp only
+      rw [hprov, hfields, hsz0, hrepr, hsz]
+      simp only [Bool.false_eq_true, ↓reduceIte, get, getThe, MonadStateOf.get, EStateM.get,
+        bind, EStateM.bind, Option.bind_some, Miri.Memory.Provenance.getAllocId, hbase, hfind,
+        hrel_off]
       cases localAlloc.allocation.readScalar annealTargetDataLayout
           (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes w)) false with
       | ok v => rfl
@@ -756,7 +779,7 @@ theorem step_union_field_read_simulation
     have hm_err : Miri.Interpreter.Step.evalStatement
         (annealStepHooksLM2_4 body.localDecls body.layouts) ()
         (translateStmt ⟨.assign ⟨r, .nil⟩ (.use (unionFieldReadOperand isMove u j fty)), span⟩) m =
-        (m₁, .error (.undefinedBehavior "read of uninitialized indirect scalar")) := by
+        (m₁, .error (.undefinedBehavior "read of uninitialized memory field")) := by
       rw [hm_eval]
       unfold Miri.Interpreter.runRvalue
       rw [EStateM.bind_eq_error (hbig hlt hwS)]
@@ -1139,11 +1162,12 @@ theorem annealWriteImmediate_unionFresh
   have hmsc_sz : (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).size = msc.size :=
     rfl
   refine ⟨A', ?_, h1, h2, h3, h4, h5, h6, h7, h8, h9⟩
-  unfold annealWriteImmediate
+  unfold annealWriteImmediate annealWriteIndirectImmediate
   simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
     stack_currentFrame?_singleton ⟨#[tf]⟩ tf rfl, stackAllocPlace, Option.bind,
     Miri.Memory.Provenance.getAllocId, hbase, hlive, hidx, Array.getElem?_push_size,
-    hoff, hmsc_sz, hw, pure, set, MonadStateOf.set, EStateM.set, array_push_set!_size]
+    add_size_zero_bytes, hoff, hmsc_sz, hw, pure, EStateM.pure, set, MonadStateOf.set,
+    EStateM.set, array_push_set!_size]
   rfl
 
 /-- `annealUnionAggregateField` on an uninitialized immediate union local whose
@@ -3676,11 +3700,11 @@ theorem annealWriteImmediate_unionInplace
   obtain ⟨hnodup', hmem', hother⟩ := hset ⟨kind, A'⟩
   refine ⟨allocIdx, allocId, kind, A', ⟨kind, A⟩, by rw [hprov]; rfl, hlive, ?_, ?_, hnodup',
     fun a la hne hmem_a => hother a la hne hmem_a⟩
-  · unfold annealWriteImmediate
+  · unfold annealWriteImmediate annealWriteIndirectImmediate
     simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
       stack_currentFrame?_singleton ⟨#[tf]⟩ tf rfl, hprov, Option.bind,
-      Miri.Memory.Provenance.getAllocId, hbase, hoff, hfindIdx, hget, hmsc_sz, hw, pure,
-      set, MonadStateOf.set, EStateM.set]
+      Miri.Memory.Provenance.getAllocId, hbase, add_size_zero_bytes, hoff, hfindIdx, hget,
+      hmsc_sz, hw, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set]
     rfl
   · exact .mk allocId tag baseAddr ⟨kind, A'⟩ msc' hprov hmis hmeta hmem' hbase hptr hovf
       (hA'_sz.trans hsz) hA'_len hA'_mut hA'_prov (hA'_align.trans hal) (hA'_extra.trans hex)
@@ -4707,14 +4731,18 @@ theorem step_union_type_punning_read_divergence
         have hb : mp.ptr.offset.bytes = baseAddr := by rw [hptr]; rfl
         rw [hb, UInt64.sub_self]; rfl
       have hfields_f := hprim.fields_primitive (layouts := body.layouts)
+      have hsz0_f := hprim.size_beq_zero (layouts := body.layouts)
+      obtain ⟨s_repr, hrepr_f⟩ := hprim.backendRepr_scalar (layouts := body.layouts)
       have hinit := hmask.init hS hrel.validBytes hw hk_le hw_le
       obtain ⟨msc_w, hrel_w, hread_sc⟩ :=
         union_readScalar_prefix_le hw hlen hsize hS16 hw_le hk_le hinit hraw
       refine ⟨msc_w, hrel_w, ?_⟩
-      unfold annealReadImmediate
-      simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, hprov,
-        Option.bind_some, Miri.Memory.Provenance.getAllocId, hbase, hfind, hrel_off, hfields_f,
-        hsz, hread_sc, pure, EStateM.pure, m₁]
+      unfold annealReadImmediate annealReadIndirectImmediate
+      dsimp only
+      rw [hprov, hfields_f, hsz0_f, hrepr_f, hsz]
+      simp only [Bool.false_eq_true, ↓reduceIte, get, getThe, MonadStateOf.get, EStateM.get,
+        bind, EStateM.bind, Option.bind_some, Miri.Memory.Provenance.getAllocId, hbase, hfind,
+        hrel_off, hread_sc, pure, EStateM.pure, m₁]
   -- Write `msc_w` into the live immediate local `r`.
   have hframe₁ : FrameRelLM2_4 body m.machine s.frame topFrame₁ :=
     (hframe.cache_local_layout hdecl_r hlt_r0).cache_local_layout hdecl_u hlt_u₀
@@ -4928,11 +4956,11 @@ theorem step_union_nonzero_field_write_divergence
         ⟨.memory mp, translateTy fty body.layouts⟩ m₀ =
         .ok () { stack := ⟨#[topFrame₀]⟩,
                  machine := inplaceMachine m.machine allocIdx allocId kind A' } := by
-      unfold annealWriteImmediate
+      unfold annealWriteImmediate annealWriteIndirectImmediate
       simp only [m₀, get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
         stack_currentFrame?_singleton ⟨#[topFrame₀]⟩ topFrame₀ rfl, hprov, Option.bind,
-        Miri.Memory.Provenance.getAllocId, hbase, hoff, hfindIdx, hget_idx, hmsc_sz, hw, pure,
-        set, MonadStateOf.set, EStateM.set]
+        Miri.Memory.Provenance.getAllocId, hbase, add_size_zero_bytes, hoff, hfindIdx, hget_idx,
+        hmsc_sz, hw, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set]
       rfl
     have hcopy_imm :
         (annealRvalueHooksLM2_4 body.localDecls body.layouts).copyOp ()
@@ -6136,8 +6164,9 @@ theorem step_union_whole_copy_or_move_overwrite_simulation
             (annealStepHooksLM2_4 body.localDecls body.layouts) ()
             (translateStmt ⟨.assign ⟨w, .nil⟩ (.use (unionWholeOperand isMove u)), span⟩) m =
             Miri.Interpreter.runRvalue
-              ((annealRvalueHooks body.localDecls body.layouts).copyOp ()
-                ⟨.immediate .uninit, layU⟩ destPlace) { m with stack := ⟨#[tf_op]⟩ } := by
+              (do
+                let imm ← annealReadImmediate ⟨.immediate .uninit, layU⟩
+                annealWriteImmediate imm.imm destPlace) { m with stack := ⟨#[tf_op]⟩ } := by
           unfold Miri.Interpreter.Step.evalStatement translateStmt
           dsimp only [translateStmtKind, translatePlace, List.map, List.toArray]
           simp only [annealStepHooksLM2_4, hlm24, ↓reduceIte]
@@ -6831,11 +6860,11 @@ theorem annealWriteImmediate_unionInplace_ge
   obtain ⟨hnodup', hmem', hother⟩ := hset ⟨kind, A'⟩
   refine ⟨allocIdx, allocId, kind, A', ⟨kind, A⟩, by rw [hprov]; rfl, hlive, ?_, ?_, hnodup',
     fun a la hne hmem_a => hother a la hne hmem_a⟩
-  · unfold annealWriteImmediate
+  · unfold annealWriteImmediate annealWriteIndirectImmediate
     simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
       stack_currentFrame?_singleton ⟨#[tf]⟩ tf rfl, hprov, Option.bind,
-      Miri.Memory.Provenance.getAllocId, hbase, hoff, hfindIdx, hget, hmsc_sz, hw, pure,
-      set, MonadStateOf.set, EStateM.set]
+      Miri.Memory.Provenance.getAllocId, hbase, add_size_zero_bytes, hoff, hfindIdx, hget,
+      hmsc_sz, hw, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set]
     rfl
   · exact .mk allocId tag baseAddr ⟨kind, A'⟩ msc' hprov hmis hmeta hmem' hbase hptr hovf
       (hA'_sz.trans hsz) hA'_len hA'_mut hA'_prov (hA'_align.trans hal) (hA'_extra.trans hex)
@@ -7354,12 +7383,12 @@ theorem step_union_aggregate_smaller_overwrite_divergence
   have hw_imm : annealWriteImmediate (.scalar (.fromScalarInt msc)) ⟨.memory mp, fl⟩
       { stack := ⟨#[tf₁]⟩, machine := m.machine } = .ok () st₃ := by
     rcases la_old with ⟨kind_old, alloc_old⟩
-    unfold annealWriteImmediate
+    unfold annealWriteImmediate annealWriteIndirectImmediate
     simp only [get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
       stack_currentFrame?_singleton ⟨#[tf₁]⟩ tf₁ rfl, hprov, Option.bind,
-      Miri.Memory.Provenance.getAllocId, hbase, hoff, hfindIdx, hget_live,
+      Miri.Memory.Provenance.getAllocId, hbase, add_size_zero_bytes, hoff, hfindIdx, hget_live,
       show (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).size = msc.size from rfl,
-      hw_alloc, pure, set, MonadStateOf.set, EStateM.set]
+      hw_alloc, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set]
     rfl
   have hev_ok : (annealAggregateHooksLM2_4 body.localDecls body.layouts).evalOperandAt ()
       (Miri.Interpreter.OperandPath.aggregate 0) (translateOperand op) (some fl) m₀ =
@@ -8868,11 +8897,11 @@ theorem step_subslice_elem_write_characterization
       have hprov_e : elemMp.ptr.provenance = some (.concrete allocId tag) := hprov
       have hw_ok : annealWriteImmediate (.scalar (.fromScalarInt msc)) ⟨.memory elemMp, elemLay⟩ m₀ =
           .ok () { stack := ⟨#[topFrame']⟩, machine := mach' } := by
-        unfold annealWriteImmediate
+        unfold annealWriteImmediate annealWriteIndirectImmediate
         simp only [m₀, get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind,
           stack_currentFrame?_singleton ⟨#[topFrame']⟩ topFrame' rfl, hprov_e, Option.bind_some,
-          Miri.Memory.Provenance.getAllocId, hbase, hfindIdx, hgetIdx, hoff_eq,
-          hmsc_sz, hwrite, pure, set, MonadStateOf.set, EStateM.set]
+          Miri.Memory.Provenance.getAllocId, hbase, hfindIdx, hgetIdx, add_size_zero_bytes,
+          hoff_eq, hmsc_sz, hwrite, pure, EStateM.pure, set, MonadStateOf.set, EStateM.set]
         rfl
       have hm_stmt : Miri.Interpreter.Step.evalStatement
           (annealStepHooksLM2_4 body.localDecls body.layouts) ()
@@ -9099,14 +9128,14 @@ theorem step_repeat_union_field_simulation
     have hop_agg_err : (annealAggregateHooksLM2_4 body.localDecls body.layouts).evalOperandAt ()
         (Miri.Interpreter.OperandPath.rvalue "operand")
         (translateOperand (unionFieldReadOperand isMove u j fty)) none m₀ =
-        .error (.undefinedBehavior "read of uninitialized indirect scalar") m₁ := by
+        .error (.undefinedBehavior "read of uninitialized memory field") m₁ := by
       dsimp only [annealAggregateHooksLM2_4]
       rw [EStateM.bind_eq_ok hop_u, EStateM.bind_eq_error hread_err]
     have hm_err : Miri.Interpreter.Step.evalStatement
         (annealStepHooksLM2_4 body.localDecls body.layouts) ()
         (translateStmt ⟨.assign ⟨arrIdx, .nil⟩
           (.repeat (unionFieldReadOperand isMove u j fty) count), span⟩) m =
-        (m₁, .error (.undefinedBehavior "read of uninitialized indirect scalar")) := by
+        (m₁, .error (.undefinedBehavior "read of uninitialized memory field")) := by
       rw [hm_eval, writeRepeat_def]
       unfold Miri.Interpreter.runRvalue
       rw [EStateM.bind_eq_error hop_agg_err]

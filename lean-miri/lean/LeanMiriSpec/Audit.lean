@@ -3177,7 +3177,7 @@ example
     (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp)
     {p : Nat} (hp : isStructPaddingByte fields (translateTy ty layouts).layout.size p) :
     ∃ allocId localAlloc,
-      mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+      (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
       mach.memory.live.find? (fun (k, _) => k == allocId) = some (allocId, localAlloc) ∧
       (∀ q, isStructPaddingByte fields (translateTy ty layouts).layout.size q →
         localAlloc.allocation.initializationMask.get
@@ -3191,10 +3191,11 @@ example
     {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
     {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
     {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (not_array : ∀ ek c, ty.kind ≠ RigidTy.array ek c)
     (h : StructMemPlaceRel mach ty layouts fields paths rootVal mp)
     (hunpad : (translateTy ty layouts).layout.size.bytes.toNat ≤ structSumFieldBytes fields) :
     MemPlaceRel mach ty layouts (some rootVal) mp :=
-  StructMemPlaceRel.toMemPlaceRel h hunpad
+  StructMemPlaceRel.toMemPlaceRel not_array h hunpad
 
 example
     {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
@@ -3214,6 +3215,7 @@ example
     {stEnv : LM2_2StaticEnv} {allocBudget : Nat}
     {s : MachineState} {m : AnnealStepState}
     (h : StateRelLM2_2 body env stEnv allocBudget s m)
+    (henv_valid : ∀ ty fs ps, env ty = some (fs, ps) → ∀ ek c, ty.kind ≠ RigidTy.array ek c)
     (hflat : ∀ (i : Nat) (decl : MirAst.LocalDecl) (v : Value)
       (imm : Miri.Interpreter.Immediate AnnealProv)
       (lay : Option Miri.Interpreter.LocalLayout),
@@ -3232,7 +3234,7 @@ example
       (∃ tf, m.stack.frames = #[tf] ∧ tf.locals[i]? = some ⟨.live (.indirect mp), lay⟩) →
       (translateTy decl.ty body.layouts).layout.size.bytes.toNat ≤ structSumFieldBytes fields) :
     StateRel body s m :=
-  StateRelLM2_2.toStateRel_of_flat_imm h (by intro ty fs ps henv ek c; dsimp [StructTypeEnv, emptyStructTypeEnv] at henv; contradiction) hflat hunpad
+  StateRelLM2_2.toStateRel_of_flat_imm h henv_valid hflat hunpad
 
 example
     {body : CapturedMir} {env : StructTypeEnv} {af : StackFrame}
@@ -3377,7 +3379,7 @@ example :
         Witness.lm22PairFields Witness.lm22PairPaths
         (.aggregate 0 [.scalar ⟨0x99AABBCC, 4⟩, .scalar ⟨0x5566, 2⟩]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22PairBody 7 Witness.lm22PairMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 6) = .ok false ∧
@@ -3445,7 +3447,7 @@ example :
         Witness.lm22PaddedFields Witness.lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22PaddedBody 5 Witness.lm22PaddedMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -3479,7 +3481,7 @@ example :
         Witness.lm22NestedFields Witness.lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0xBEEF, 2⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22NestedBody 7 Witness.lm22NestedMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -3530,10 +3532,10 @@ example
     {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
     {newVal : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
     {mp : Miri.Interpreter.MemPlace AnnealProv}
-    {allocId : Miri.Memory.AllocId} {baseAddr : UInt64}
+    {allocId : Miri.Memory.AllocId} {tag : Miri.Memory.BorTag} {baseAddr : UInt64}
     {localAlloc : AnnealLocalAlloc} {words0 : Array UInt64}
     (himm : ImmediateStructRel ty layouts fields paths newVal imm)
-    (hprov : mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one))
+    (hprov : mp.ptr.provenance = some (.concrete allocId tag))
     (hmis : mp.misaligned = none)
     (hmeta : mp.metadata = .none)
     (hlive : LiveAllocEntry m.machine.memory.live allocId localAlloc)
@@ -3567,10 +3569,10 @@ example
     {mp : Miri.Interpreter.MemPlace AnnealProv}
     (hmp : StructMemPlaceRel m.machine ty layouts fields paths oldVal mp)
     (himm : ImmediateStructRel ty layouts fields paths newVal imm) :
-    ∃ (allocId : Miri.Memory.AllocId) (localAlloc : AnnealLocalAlloc)
+    ∃ (allocId : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag) (localAlloc : AnnealLocalAlloc)
       (u : Nat) (hu_lt : u < m.machine.memory.live.size)
       (alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
-      mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+      mp.ptr.provenance = some (.concrete allocId tag) ∧
       m.machine.memory.live[u]'hu_lt = (allocId, localAlloc) ∧
       annealWriteIndirectImmediate imm mp Miri.ABI.Size.ZERO (translateTy ty layouts) m =
         .ok () { m with machine := updateAllocMachine m.machine u allocId localAlloc.kind alloc' } ∧
@@ -3585,10 +3587,10 @@ example
     {mp : Miri.Interpreter.MemPlace AnnealProv}
     (hmp : UninitStructMemPlaceRel m.machine ty layouts fields mp)
     (himm : ImmediateStructRel ty layouts fields paths newVal imm) :
-    ∃ (allocId : Miri.Memory.AllocId) (localAlloc : AnnealLocalAlloc)
+    ∃ (allocId : Miri.Memory.AllocId) (tag : Miri.Memory.BorTag) (localAlloc : AnnealLocalAlloc)
       (u : Nat) (hu_lt : u < m.machine.memory.live.size)
       (alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)),
-      mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+      mp.ptr.provenance = some (.concrete allocId tag) ∧
       m.machine.memory.live[u]'hu_lt = (allocId, localAlloc) ∧
       annealWriteIndirectImmediate imm mp Miri.ABI.Size.ZERO (translateTy ty layouts) m =
         .ok () { m with machine := updateAllocMachine m.machine u allocId localAlloc.kind alloc' } ∧
@@ -3737,7 +3739,7 @@ example :
         Witness.lm22NestedFields Witness.lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x55556666, 4⟩, .scalar ⟨0x7788, 2⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22SubStructBody 9 Witness.lm22SubStructMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
@@ -3765,7 +3767,7 @@ example :
         Witness.lm22LargeFields Witness.lm22LargePaths
         (.aggregate 0 [.scalar ⟨5, 1⟩, .scalar ⟨100, 4⟩, .scalar ⟨999, 4⟩]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22LargeBody 3 Witness.lm22LargeMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
       localAlloc.allocation.byteSize = Miri.ABI.Size.ofBytes 80 ∧
@@ -3829,7 +3831,7 @@ example :
         Witness.lm22PaddedFields Witness.lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨99, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22LiveRetBody 7
           Witness.lm22LiveRetMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
@@ -3925,7 +3927,7 @@ example :
         Witness.lm22NestedFields Witness.lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp3 ∧
       (∃ allocId3,
-        mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp3.ptr.provenance = some (.concrete allocId3 tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22MemMoveBody 7
           Witness.lm22MemMoveMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
@@ -3941,7 +3943,7 @@ example :
         Witness.lm22NestedFields Witness.lm22NestedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0x11112222, 4⟩, .scalar ⟨0x3344, 2⟩]]) mp4 ∧
       (∃ allocId4,
-        mp4.ptr.provenance = some (.concrete allocId4 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp4.ptr.provenance = some (.concrete allocId4 tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22MemMoveBody 10
           Witness.lm22MemMoveMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId4) = some (allocId4, alloc4)) ∧
@@ -3973,7 +3975,7 @@ example :
         Witness.lm22PaddedFields Witness.lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFEBABE, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22ScalarWrapSubBody 9
           Witness.lm22ScalarWrapSubMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
@@ -4008,7 +4010,7 @@ example :
            .scalar ⟨40, 8⟩, .scalar ⟨50, 8⟩, .scalar ⟨60, 8⟩, .scalar ⟨70, 8⟩,
            .scalar ⟨0x1122334455667788, 8⟩, .scalar ⟨0xAB, 1⟩]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22Realistic80Body 5
           Witness.lm22Realistic80MiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧
@@ -4063,11 +4065,13 @@ example
     (hframes : m.stack.frames = #[tf])
     (hlt : dstIdx < tf.locals.size)
     (hind : tf.locals[dstIdx]'hlt = ⟨.live (.indirect destMp), c⟩)
-    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId Miri.Memory.BorTag.one))
+    {tag_s : Miri.Memory.BorTag}
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId tag_s))
     (hbase_s : m.machine.lookupBaseAddr srcId = some srcBase)
     (hptr_s : srcMp.ptr.offset = Miri.ABI.Size.ofBytes srcBase)
     (hlive_s : LiveAllocEntry m.machine.memory.live srcId srcLocal)
-    (hprov_d : destMp.ptr.provenance = some (.concrete destId Miri.Memory.BorTag.one))
+    {tag_d : Miri.Memory.BorTag}
+    (hprov_d : destMp.ptr.provenance = some (.concrete destId tag_d))
     (hbase_d : m.machine.lookupBaseAddr destId = some destBase)
     (hptr_d : destMp.ptr.offset = Miri.ABI.Size.ofBytes destBase)
     (hu_lt : u < m.machine.memory.live.size)
@@ -4147,7 +4151,7 @@ example :
         (.aggregate 0 [.scalar ⟨7, 1⟩,
           .aggregate 0 [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨0x778899AA, 4⟩]]) mp3 ∧
       (∃ allocId3,
-        mp3.ptr.provenance = some (.concrete allocId3 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp3.ptr.provenance = some (.concrete allocId3 tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22SuperOuterBody 4
           Witness.lm22SuperOuterMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId3) = some (allocId3, alloc3)) ∧
@@ -4179,7 +4183,8 @@ example
     (hframes : m.stack.frames = #[tf])
     (hlt : dstIdx < tf.locals.size)
     (hind : tf.locals[dstIdx]'hlt = ⟨.live (.indirect destMp), c⟩)
-    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId Miri.Memory.BorTag.one))
+    {tag_s : Miri.Memory.BorTag}
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId tag_s))
     (hbase_s : m.machine.lookupBaseAddr srcId = some srcBase)
     (hdead_s : m.machine.memory.live.find? (fun (k, _) => k == srcId) = none) :
     annealStructMemCopyOp ld ly ⟨.indirect srcMp, srcLay⟩
@@ -4202,10 +4207,12 @@ example
     (hframes : m.stack.frames = #[tf])
     (hlt : dstIdx < tf.locals.size)
     (hind : tf.locals[dstIdx]'hlt = ⟨.live (.indirect destMp), c⟩)
-    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId Miri.Memory.BorTag.one))
+    {tag_s : Miri.Memory.BorTag}
+    (hprov_s : srcMp.ptr.provenance = some (.concrete srcId tag_s))
     (hbase_s : m.machine.lookupBaseAddr srcId = some srcBase)
     (hlive_s : LiveAllocEntry m.machine.memory.live srcId srcLocal)
-    (hprov_d : destMp.ptr.provenance = some (.concrete destId Miri.Memory.BorTag.one))
+    {tag_d : Miri.Memory.BorTag}
+    (hprov_d : destMp.ptr.provenance = some (.concrete destId tag_d))
     (hbase_d : m.machine.lookupBaseAddr destId = some destBase)
     (hdead_d : m.machine.memory.live.findIdx? (fun (k, _) => k == destId) = none) :
     annealStructMemCopyOp ld ly ⟨.indirect srcMp, srcLay⟩
@@ -4223,7 +4230,7 @@ example
     {idx : Miri.MIR.LocalId}
     {iden : Miri.Interpreter.LocalsIdentity}
     {c : Option Miri.Interpreter.LocalLayout}
-    {allocId : Miri.Memory.AllocId}
+    {allocId : Miri.Memory.AllocId} {tag : Miri.Memory.BorTag}
     {baseAddr : UInt64}
     {localAlloc : AnnealLocalAlloc}
     {alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)}
@@ -4231,7 +4238,7 @@ example
     (hframes : m.stack.frames = #[tf])
     (hlt : idx < tf.locals.size)
     (hind : tf.locals[idx]'hlt = ⟨.live (.indirect mp), c⟩)
-    (hprov : mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one))
+    (hprov : mp.ptr.provenance = some (.concrete allocId tag))
     (hbase : m.machine.lookupBaseAddr allocId = some baseAddr)
     (hptr : mp.ptr.offset = Miri.ABI.Size.ofBytes baseAddr)
     (hlive : LiveAllocEntry m.machine.memory.live allocId localAlloc)
@@ -4359,7 +4366,7 @@ example :
         Witness.lm22PaddedFields Witness.lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xDEADBEEF, 4⟩]]) mp0 ∧
       (∃ allocId0,
-        mp0.ptr.provenance = some (.concrete allocId0 Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp0.ptr.provenance = some (.concrete allocId0 tag)) ∧
         m_ret.machine.memory.live.find? (fun (k, _) => k == allocId0) = some (allocId0, alloc0)) ∧
       alloc0.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 1) = .ok false ∧
       alloc0.allocation.initializationMask.get (Miri.ABI.Size.ofBytes 2) = .ok false ∧
@@ -4375,7 +4382,7 @@ example :
         Witness.lm22PaddedFields Witness.lm22PaddedPaths
         (.aggregate 0 [.scalar ⟨7, 1⟩, .aggregate 0 [.scalar ⟨0xCAFE1234, 4⟩]]) mp ∧
       (∃ allocId,
-        mp.ptr.provenance = some (.concrete allocId Miri.Memory.BorTag.one) ∧
+        (∃ tag, mp.ptr.provenance = some (.concrete allocId tag)) ∧
         (Witness.lm22StepMiriN Witness.lm22SelfMoveBody 5
           Witness.lm22SelfMoveMiriInit).machine.memory.live.find?
           (fun (k, _) => k == allocId) = some (allocId, localAlloc)) ∧

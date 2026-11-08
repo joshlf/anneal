@@ -139,6 +139,23 @@ theorem ValidFieldProjChain.not_deref_head
     p0 ≠ .deref := by
   cases h <;> nofun
 
+theorem ValidFieldProjChain.head_field
+    {layouts : LayoutTable} {baseLay : Miri.Interpreter.LocalLayout}
+    {p0 : ProjectionElem} {ps : List ProjectionElem}
+    {leafTy : Ty} {totalOff : Miri.ABI.Size}
+    (h : ValidFieldProjChain layouts baseLay (p0 :: ps) leafTy totalOff) :
+    ∃ idx fty, p0 = .field idx fty := by
+  cases h <;> exact ⟨_, _, rfl⟩
+
+theorem ValidFieldProjChain.translate_head_field
+    {layouts : LayoutTable} {baseLay : Miri.Interpreter.LocalLayout}
+    {p0 : ProjectionElem} {ps : List ProjectionElem}
+    {leafTy : Ty} {totalOff : Miri.ABI.Size}
+    (h : ValidFieldProjChain layouts baseLay (p0 :: ps) leafTy totalOff) :
+    ∃ fidx fty, translateProjectionElem p0 = .Field fidx fty := by
+  obtain ⟨idx, fty, rfl⟩ := h.head_field
+  exact ⟨idx, encodeTyId fty, rfl⟩
+
 theorem ValidFieldProjChain.last_eq
     {layouts : LayoutTable} {baseLay : Miri.Interpreter.LocalLayout}
     {projs : List ProjectionElem} {leafTy : Ty} {totalOff : Miri.ABI.Size}
@@ -183,7 +200,7 @@ theorem projectField_indirect_of_fieldLayout
     (hsized : fl.layout.isSized = true)
     (hno_ovf : mp.ptr.offset.bytes.toNat + off.bytes.toNat < 2 ^ 64) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts hintFieldTy)
+        (annealStructProjectionCx layouts hintFieldTy)
         ⟨.indirect mp, baseLay⟩ idx =
       .ok ⟨.indirect
             ⟨⟨Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes + off.bytes), mp.ptr.provenance⟩,
@@ -191,7 +208,7 @@ theorem projectField_indirect_of_fieldLayout
             fl⟩ := by
   obtain ⟨hadd, _⟩ := size_add_of_no_overflow hno_ovf
   unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-    annealProjectionCx
+    annealStructProjectionCx
   simp [hoff, hfl, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
     hadd, Except.mapError, bind, Except.bind, pure, Except.pure]
 
@@ -206,7 +223,7 @@ theorem projectField_indirect_eq
     (hsized : (translateTy fty layouts).layout.isSized = true)
     (hno_ovf : mp.ptr.offset.bytes.toNat + off.bytes.toNat < 2 ^ 64) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.indirect mp, baseLay⟩ idx =
       .ok ⟨.indirect
             ⟨⟨Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes + off.bytes), mp.ptr.provenance⟩,
@@ -451,7 +468,7 @@ theorem projectField_immediate_uninit_eq
     (hbnd : off.bytes.toNat + (translateTy fty layouts).layout.size.bytes.toNat ≤
       baseLay.layout.size.bytes.toNat) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.immediate .uninit, baseLay⟩ idx =
       .ok ⟨.immediate .uninit, translateTy fty layouts⟩ := by
   have hlt_u64 := baseLay.layout.size.bytes.toNat_lt
@@ -467,7 +484,7 @@ theorem projectField_immediate_uninit_eq
     rw [hadd_toNat]
     omega
   unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-    annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+    annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
   simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
     hadd, hnot_gt, Except.mapError, bind, Except.bind, pure, Except.pure]
 
@@ -509,7 +526,7 @@ theorem projectField_immediate_scalar_eq
     (hoff : baseLay.layout.fields.offset idx = .ok Miri.ABI.Size.ZERO)
     (hsz_eq : (translateTy fty layouts).layout.size = baseLay.layout.size) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.immediate (.scalar s), baseLay⟩ idx =
       .ok ⟨.immediate (.scalar s), translateTy fty layouts⟩ := by
   have hlt_u64 := baseLay.layout.size.bytes.toNat_lt
@@ -530,7 +547,7 @@ theorem projectField_immediate_scalar_eq
   have hbeq_sz : ((translateTy fty layouts).layout.size == baseLay.layout.size) = true :=
     beq_iff_eq.mpr hsz_eq
   unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-    annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+    annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
   simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
     hadd, hnot_gt, huninhab, hzst, hrepr_f, hbeq_sz,
     Except.mapError, bind, Except.bind, pure, Except.pure]
@@ -546,7 +563,7 @@ theorem projectField_immediate_scalarPair_zero_eq
     (hsz_ne : (translateTy fty layouts).layout.size ≠ baseLay.layout.size)
     (hbnd : (translateTy fty layouts).layout.size.bytes.toNat ≤ baseLay.layout.size.bytes.toNat) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.immediate (.scalarPair s0 s1), baseLay⟩ 0 =
       .ok ⟨.immediate (.scalar s0), translateTy fty layouts⟩ := by
   have hlt_u64 := baseLay.layout.size.bytes.toNat_lt
@@ -567,7 +584,7 @@ theorem projectField_immediate_scalarPair_zero_eq
   have hbeq_sz : ((translateTy fty layouts).layout.size == baseLay.layout.size) = false :=
     beq_false_of_ne hsz_ne
   unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-    annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+    annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
   simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
     hadd, hnot_gt, huninhab, hzst, hrepr_f, hbeq_sz, hrepr,
     Except.mapError, bind, Except.bind, pure, Except.pure]
@@ -585,7 +602,7 @@ theorem projectField_immediate_scalarPair_one_eq
     (hbnd : bOff.bytes.toNat + (translateTy fty layouts).layout.size.bytes.toNat ≤
       baseLay.layout.size.bytes.toNat) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.immediate (.scalarPair s0 s1), baseLay⟩ 1 =
       .ok ⟨.immediate (.scalar s1), translateTy fty layouts⟩ := by
   have hlt_u64 := baseLay.layout.size.bytes.toNat_lt
@@ -607,7 +624,7 @@ theorem projectField_immediate_scalarPair_one_eq
   have hbeq_zero : (bOff == Miri.ABI.Size.ZERO) = false :=
     beq_false_of_ne hbOff_ne
   unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-    annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+    annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
   simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
     hadd, hnot_gt, huninhab, hzst, hrepr_f, hbeq_sz, hrepr, hbeq_zero,
     Except.mapError, bind, Except.bind, pure, Except.pure]
@@ -639,7 +656,7 @@ theorem projectField_immediate_same_size_eq
     (hoff : baseLay.layout.fields.offset idx = .ok Miri.ABI.Size.ZERO)
     (hsz_eq : (translateTy fty layouts).layout.size = baseLay.layout.size) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.immediate imm, baseLay⟩ idx =
       .ok ⟨.immediate imm, translateTy fty layouts⟩ := by
   have hlt_u64 := baseLay.layout.size.bytes.toNat_lt
@@ -663,14 +680,14 @@ theorem projectField_immediate_same_size_eq
   | uninit => exact False.elim (himm_init rfl)
   | scalar s =>
     unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-      annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+      annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
     simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
       hadd, hnot_gt, huninhab, hzst, hbeq_sz,
       Except.mapError, bind, Except.bind, pure, Except.pure]
     split <;> split at * <;> split at * <;> simp_all
   | scalarPair s0 s1 =>
     unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-      annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+      annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
     simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
       hadd, hnot_gt, huninhab, hzst, hbeq_sz,
       Except.mapError, bind, Except.bind, pure, Except.pure]
@@ -688,7 +705,7 @@ theorem projectField_immediate_scalarPair_zero_nonForget_eq
     (hsz_ne : (translateTy fty layouts).layout.size ≠ baseLay.layout.size)
     (hbnd : (translateTy fty layouts).layout.size.bytes.toNat ≤ baseLay.layout.size.bytes.toNat) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.immediate (.scalarPair s0 s1), baseLay⟩ 0 =
       .ok ⟨.immediate (.scalar s0), translateTy fty layouts⟩ := by
   have hlt_u64 := baseLay.layout.size.bytes.toNat_lt
@@ -709,7 +726,7 @@ theorem projectField_immediate_scalarPair_zero_nonForget_eq
   have hbeq_sz : ((translateTy fty layouts).layout.size == baseLay.layout.size) = false :=
     beq_false_of_ne hsz_ne
   unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-    annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+    annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
   simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
     hadd, hnot_gt, huninhab, hzst, hbeq_sz, hrepr,
     Except.mapError, bind, Except.bind, pure, Except.pure]
@@ -729,7 +746,7 @@ theorem projectField_immediate_scalarPair_one_nonForget_eq
     (hbnd : bOff.bytes.toNat + (translateTy fty layouts).layout.size.bytes.toNat ≤
       baseLay.layout.size.bytes.toNat) :
     Miri.Interpreter.projectField
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         ⟨.immediate (.scalarPair s0 s1), baseLay⟩ 1 =
       .ok ⟨.immediate (.scalar s1), translateTy fty layouts⟩ := by
   have hlt_u64 := baseLay.layout.size.bytes.toNat_lt
@@ -751,7 +768,7 @@ theorem projectField_immediate_scalarPair_one_nonForget_eq
   have hbeq_zero : (bOff == Miri.ABI.Size.ZERO) = false :=
     beq_false_of_ne hbOff_ne
   unfold Miri.Interpreter.projectField Miri.Interpreter.OpTy.offsetWithMeta
-    annealProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
+    annealStructProjectionCx annealFieldLayout Miri.Interpreter.projectionImmediateOffset
   simp [hoff, hrt.layoutOfEncoded, hsized, Miri.Interpreter.MemPlaceMeta.hasMeta,
     hadd, hnot_gt, huninhab, hzst, hbeq_sz, hrepr, hbeq_zero,
     Except.mapError, bind, Except.bind, pure, Except.pure]
@@ -1272,7 +1289,8 @@ theorem annealEvalOperand_projected_live
     (hmls : topFrame.locals[idx]'hlt = ⟨.live opVal, lay⟩)
     (hcache : ∀ l, lay = some l → l = translateTy decl.ty body.layouts)
     (hnot_single_pair :
-      ps ≠ [] ∨ ∀ s0 s1, opVal ≠ .immediate (.scalarPair s0 s1)) :
+      ps ≠ [] ∨ ∀ s0 s1, opVal ≠ .immediate (.scalarPair s0 s1))
+    (hp : ∃ fidx fty, p = .Field fidx fty) :
     annealEvalOperand body.localDecls body.layouts
         (if isMove then .Move ⟨idx, (p :: ps).toArray⟩ else .Copy ⟨idx, (p :: ps).toArray⟩)
         known m =
@@ -1280,6 +1298,7 @@ theorem annealEvalOperand_projected_live
         { m with
           stack := ⟨#[cacheFrameLocalLayout topFrame idx hlt
             (translateTy decl.ty body.layouts)]⟩ } := by
+  obtain ⟨fidx, fty, rfl⟩ := hp
   have hcache' : ∀ l, (topFrame.locals[idx]'hlt).layout = some l →
       l = translateTy decl.ty body.layouts := by
     rw [hmls]; exact hcache
@@ -1294,21 +1313,17 @@ theorem annealEvalOperand_projected_live
         get, getThe, MonadStateOf.get, EStateM.get, Bind.bind, EStateM.bind,
         Pure.pure, EStateM.pure, stack_currentFrame?_singleton m.stack topFrame hframes,
         Option.isNone_some, hres, hgop]
-      cases p with
-      | Field fidx fty =>
-        cases ps with
-        | nil =>
-          rcases hnot_single_pair with hne_nil | hnot_pair
-          · exact False.elim (hne_nil rfl)
-          · cases opVal with
-            | indirect _ => rfl
-            | immediate imm =>
-              cases imm with
-              | uninit | scalar _ => rfl
-              | scalarPair s0 s1 => exact False.elim (hnot_pair s0 s1 rfl)
-        | cons _ _ => rfl
-      | Deref | PhantomDeref | Index _ | ConstantIndex _ _ _ | Subslice _ _ _ | Downcast _ _
-      | OpaqueCast _ | UnwrapUnsafeBinder _ => rfl
+      cases ps with
+      | nil =>
+        rcases hnot_single_pair with hne_nil | hnot_pair
+        · exact False.elim (hne_nil rfl)
+        · cases opVal with
+          | indirect _ => rfl
+          | immediate imm =>
+            cases imm with
+            | uninit | scalar _ => rfl
+            | scalarPair s0 s1 => exact False.elim (hnot_pair s0 s1 rfl)
+      | cons _ _ => rfl
 
 theorem annealEvalOperand_projected_scalarPair_single
     {body : CapturedMir} {m : AnnealStepState}
@@ -3587,7 +3602,7 @@ theorem evalProjection_nested_field_read_at_local
         dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p),
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p),
             annealReadImmediate_uninit]
       refine Or.inr ⟨_, _, ?_, hm_err⟩
       rw [ha_proj, hslot]
@@ -3640,7 +3655,7 @@ theorem evalProjection_nested_field_read_at_local
         dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p)]
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
         dsimp [annealReadImmediate]
         exact hread_ub
       refine Or.inr ⟨_, _, ?_, hm_err⟩
@@ -3666,7 +3681,7 @@ theorem evalProjection_nested_field_read_at_local
         · rw [htr_op]; dsimp only [Bind.bind]
           rw [EStateM.bind_apply_ok
                 ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                  (Or.inr (by nofun))).trans heval_p)]
+                  (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
           rfl
       | scalarPair f₀ f₁ mid₀ mid₁ z₀ z₁ a b bOff sc₀ sc₁ msc₀ msc₁ v₀ v₁
           hvalid _ _ _ hrepr _ _ hoff₀ hoff₁ hf₀_off hf₁_off hfl₀ hfl₁
@@ -3744,10 +3759,10 @@ theorem evalProjection_nested_field_read_at_local
             refine Or.inl ⟨sc₀, msc₀, translateTy f₀.ty body.layouts,
               ?_, ?_, .scalar sc₀ msc₀ hrel₀ hlaysz hbool₀ hchar₀⟩
             · rw [ha_proj, hslot]; dsimp only; rw [ha_read]
-            · rw [htr_op]; dsimp only [Bind.bind]
+            · rw [htr_op]; dsimp only [Bind.bind, translateProjectionElem]
               rw [EStateM.bind_apply_ok
                     ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                      (Or.inl (by nofun))).trans heval_p)]
+                      (Or.inl (by nofun)) ⟨0, encodeTyId mid₀, rfl⟩).trans heval_p)]
               rfl
         · dsimp at hpath_k hty_k; subst hty_k
           injection hpath_k with hp0_eq hps_eq; subst hp0_eq hps_eq
@@ -3809,10 +3824,10 @@ theorem evalProjection_nested_field_read_at_local
             refine Or.inl ⟨sc₁, msc₁, translateTy f₁.ty body.layouts,
               ?_, ?_, .scalar sc₁ msc₁ hrel₁ hlaysz hbool₁ hchar₁⟩
             · rw [ha_proj, hslot]; dsimp only; rw [ha_read]
-            · rw [htr_op]; dsimp only [Bind.bind]
+            · rw [htr_op]; dsimp only [Bind.bind, translateProjectionElem]
               rw [EStateM.bind_apply_ok
                     ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                      (Or.inl (by nofun))).trans heval_p)]
+                      (Or.inl (by nofun)) ⟨1, encodeTyId mid₁, rfl⟩).trans heval_p)]
               rfl
     | structInd f' p' v mp c henv' _ hmp =>
       rw [henv] at henv'
@@ -3849,7 +3864,7 @@ theorem evalProjection_nested_field_read_at_local
       · rw [htr_op]; dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p)]
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
         dsimp [annealReadImmediate]
         exact hread_ok
 
@@ -5663,7 +5678,7 @@ theorem evalProjection_nested_substruct_read_at_local
         dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p),
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p),
             annealReadImmediate_uninit]
       refine Or.inr ⟨_, _, ?_, hm_err⟩
       rw [ha_proj, hslot]
@@ -5715,7 +5730,7 @@ theorem evalProjection_nested_substruct_read_at_local
         dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p)]
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
         dsimp [annealReadImmediate]
         exact hread_ub
       refine Or.inr ⟨_, _, ?_, hm_err⟩
@@ -5810,7 +5825,7 @@ theorem evalProjection_nested_substruct_read_at_local
       · rw [htr_op]; dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p)]
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
         dsimp [annealReadImmediate]
         exact hread_ok
 
@@ -6690,7 +6705,7 @@ theorem evalProjection_nested_scalar_wrap_read_at_local
         dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p),
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p),
             annealReadImmediate_uninit]
       refine Or.inr ⟨_, _, ?_, hm_err⟩
       rw [ha_proj, hslot]
@@ -6744,7 +6759,7 @@ theorem evalProjection_nested_scalar_wrap_read_at_local
         dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p)]
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
         dsimp [annealReadImmediate]
         exact hread_ub
       refine Or.inr ⟨_, _, ?_, hm_err⟩
@@ -6779,7 +6794,7 @@ theorem evalProjection_nested_scalar_wrap_read_at_local
         · rw [htr_op]; dsimp only [Bind.bind]
           rw [EStateM.bind_apply_ok
                 ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                  (Or.inr (by nofun))).trans heval_p)]
+                  (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
           rfl
       | scalarPair f₀ f₁ mid₀' mid₁' z₀ z₁ _ _ bOff sc₀ sc₁ msc₀ msc₁ v₀ v₁
           hvalid_out _ _ _ hrepr_out _ _ hoff₀ hoff₁ hf₀_off hf₁_off hfl₀ hfl₁
@@ -6881,10 +6896,10 @@ theorem evalProjection_nested_scalar_wrap_read_at_local
               refine Or.inl ⟨sc₀, msc₀, translateTy subTy body.layouts, ?_, ?_, himm_sub0⟩
               · rw [ha_proj, hslot]
                 simp only [readProjectedValue, get?, List.getElem?_cons_zero, ha_sub]
-              · rw [htr_op]; dsimp only [Bind.bind]
+              · rw [htr_op]; dsimp only [Bind.bind, translateProjectionElem]
                 rw [EStateM.bind_apply_ok
                       ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                        (Or.inl (by nofun))).trans heval_p)]
+                        (Or.inl (by nofun)) ⟨0, encodeTyId mid₀', rfl⟩).trans heval_p)]
                 rfl
         · dsimp [List.append] at hpath₀ hty₀ hfl_k₀
           injection hpath₀ with hp0_eq hz1_eq; subst hp0_eq
@@ -6971,10 +6986,10 @@ theorem evalProjection_nested_scalar_wrap_read_at_local
               · rw [ha_proj, hslot]
                 simp only [readProjectedValue, get?, List.getElem?_cons_succ,
                   List.getElem?_cons_zero, ha_sub]
-              · rw [htr_op]; dsimp only [Bind.bind]
+              · rw [htr_op]; dsimp only [Bind.bind, translateProjectionElem]
                 rw [EStateM.bind_apply_ok
                       ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                        (Or.inl (by nofun))).trans heval_p)]
+                        (Or.inl (by nofun)) ⟨1, encodeTyId mid₁', rfl⟩).trans heval_p)]
                 rfl
     | structInd f' p' v mp c henv' _ hmp =>
       rw [henv] at henv'
@@ -7025,7 +7040,7 @@ theorem evalProjection_nested_scalar_wrap_read_at_local
       · rw [htr_op]; dsimp only [Bind.bind]
         rw [EStateM.bind_apply_ok
               ((annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache
-                (Or.inr (by nofun))).trans heval_p)]
+                (Or.inr (by nofun)) hchain.translate_head_field).trans heval_p)]
         dsimp [annealReadImmediate]
         exact hread_ok
 

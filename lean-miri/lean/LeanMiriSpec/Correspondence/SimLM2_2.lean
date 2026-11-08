@@ -437,13 +437,14 @@ theorem annealEvalPlace_projected
   cases projs with
   | nil => exact False.elim (hchain.ne_nil rfl)
   | cons p ps =>
+    obtain ⟨fidx0, fty0, rfl⟩ := hchain.head_field
     have hcur : m.stack.currentFrame?.isNone = false := by
       rw [stack_currentFrame?_singleton m.stack topFrame hframes]; rfl
     have hsz_frames : m.stack.frames.size - 1 = 0 := by rw [hframes]; rfl
     have hid_c : (cacheFrameLocalLayout topFrame idx hlt
         (translateTy decl.ty body.layouts)).localsIdentity = topFrame.localsIdentity := rfl
     change annealEvalProjectedPlace body.localDecls body.layouts
-      ⟨idx, (List.map translateProjectionElem (p :: ps)).toArray⟩ m = _
+      ⟨idx, (List.map translateProjectionElem (.field fidx0 fty0 :: ps)).toArray⟩ m = _
     with_unfolding_all
       unfold annealEvalProjectedPlace
       simp only [get, getThe, MonadStateOf.get, Bind.bind, Pure.pure,
@@ -2662,14 +2663,14 @@ private theorem projectField_hint_ok_layout_eq
     {layouts : LayoutTable} {base out : Miri.Interpreter.OpTy AnnealProv}
     {idx : Nat} {fty : Ty} (hrt : IsRoundtripTy fty)
     (hok : Miri.Interpreter.project
-      (annealProjectionCx layouts (some (encodeTyId fty)))
+      (annealStructProjectionCx layouts (some (encodeTyId fty)))
       base (.Field idx (encodeTyId fty)) = .ok out) :
     out.layout = translateTy fty layouts := by
   unfold Miri.Interpreter.project Miri.Interpreter.projectField at hok
   obtain ⟨off0, _, hok1⟩ := except_bind_ok hok
   obtain ⟨lay, hlay, hok2⟩ := except_bind_ok hok1
   have hlay_eq : lay = translateTy fty layouts := by
-    unfold annealProjectionCx annealFieldLayout at hlay
+    unfold annealStructProjectionCx annealFieldLayout at hlay
     dsimp only at hlay
     rw [hrt.layoutOfEncoded] at hlay
     injection hlay with hlay'
@@ -2680,7 +2681,7 @@ private theorem projectField_hint_ok_layout_eq
     by_cases hbs : base.layout.layout.isSized = true
     · simp [hbs, bind, Except.bind, throw, throwThe, MonadExceptOf.throw] at hok2
     · simp only [hbs, Bool.false_eq_true, ↓reduceIte] at hok2
-      unfold annealProjectionCx at hok2
+      unfold annealStructProjectionCx at hok2
       dsimp only [bind, Except.bind, pure, Except.pure, Except.mapError] at hok2
       cases hal : off0.alignTo (translateTy fty layouts).layout.align.abi with
       | error _ => rw [hal] at hok2; cases hok2
@@ -2704,7 +2705,7 @@ private theorem annealEvalProjection_ok_layout_eq
       Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
       throw, throwThe, MonadExceptOf.throw, EStateM.throw] at hok
     cases hp : Miri.Interpreter.project
-        (annealProjectionCx layouts (some (encodeTyId fty)))
+        (annealStructProjectionCx layouts (some (encodeTyId fty)))
         base (.Field idx (encodeTyId fty)) with
     | error _ => rw [hp] at hok; cases hok
     | ok next =>
@@ -2720,7 +2721,7 @@ private theorem annealEvalProjection_ok_layout_eq
       Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
       throw, throwThe, MonadExceptOf.throw, EStateM.throw] at hok
     cases hp : Miri.Interpreter.project
-        (annealProjectionCx layouts (some (encodeTyId midTy)))
+        (annealStructProjectionCx layouts (some (encodeTyId midTy)))
         base (.Field idx (encodeTyId midTy)) with
     | error _ => rw [hp] at hok; cases hok
     | ok next =>
@@ -2810,7 +2811,8 @@ private theorem annealEvalOperand_projected_indirect_layout_eq
         by_cases hps : ps = []
         · right; intro s0 s1 heq; exact hsp ⟨hps, s0, s1, heq⟩
         · left; cases ps with | nil => exact absurd rfl hps | cons _ _ => nofun
-      rw [annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache hnot_sp] at hok
+      dsimp only [translateProjectionElem] at hok
+      rw [annealEvalOperand_projected_live hframes hlt_mf hdecl hmls_eq hcache hnot_sp ⟨idx0, encodeTyId fty0, rfl⟩] at hok
       exact annealEvalProjection_ok_layout_eq hchain hok
 
 private theorem WellTypedLM2_2Operand.annealEvalOperand_indirect_usesStructMemCopyDest_false
@@ -2932,7 +2934,7 @@ private theorem writeAggregateFieldsAux_step_eq
   dsimp only [writeAggregateFieldsAux, Miri.Interpreter.AggregateHooks.evalOperandAt,
     bind, Bind.bind, EStateM.bind]
   rw [hproj]
-  dsimp only [annealAggregateHooks]
+  dsimp only [annealAggregateHooks, bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure]
   cases hev : annealEvalOperand localDecls layouts op (some fl) m with
   | error _ _ => rfl
   | ok v s1 =>
@@ -2940,9 +2942,18 @@ private theorem writeAggregateFieldsAux_step_eq
     dsimp only
     cases vop with
     | immediate imm =>
-      cases usesStructMemCopyDest ⟨fieldRef, vlay⟩ && usesStructMemCopyDest ⟨fieldRef, fl⟩ <;>
-        cases imm <;> rfl
+      cases imm with
+      | uninit =>
+        dsimp only [annealReadImmediate, pure, EStateM.pure, bind, EStateM.bind,
+          throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+      | scalar _ =>
+        dsimp only [annealReadImmediate, pure, EStateM.pure, bind, EStateM.bind]
+        cases usesStructMemCopyDest ⟨fieldRef, vlay⟩ && usesStructMemCopyDest ⟨fieldRef, fl⟩ <;> rfl
+      | scalarPair _ _ =>
+        dsimp only [annealReadImmediate, pure, EStateM.pure, bind, EStateM.bind]
+        cases usesStructMemCopyDest ⟨fieldRef, vlay⟩ && usesStructMemCopyDest ⟨fieldRef, fl⟩ <;> rfl
     | indirect mp =>
+      dsimp only [EStateM.pure]
       rw [hind_false mp vlay s1 hev]
       rfl
 
@@ -3552,10 +3563,16 @@ theorem evalRvalue_aggregate_tuple_struct_simulation
         apply runRvalue_eq_of_eq
         unfold Miri.Interpreter.evalRvalueIntoPlace annealRvalueHooks
         rw [EStateM.bind_eq_ok hevalPlace_dst]
+        have hdisc_eq :
+            (annealAggregateHooks body.localDecls body.layouts).writeDiscriminant () 0
+              ⟨.local 0 dstIdx none topFrame.localsIdentity, translateTy decl.ty body.layouts⟩ =
+            pure () := by
+          unfold annealAggregateHooks
+          rcases hvalid.fields_shape_valid with ⟨_, hf, _⟩ | ⟨_, _, hf, _⟩ <;> simp [hf]
         exact congrFun (writeAggregate_list_eq (annealAggregateHooks body.localDecls body.layouts)
           hmkind ((op₀ :: rest).map translateOperand)
           ⟨.local 0 dstIdx none topFrame.localsIdentity, translateTy decl.ty body.layouts⟩
-          rfl rfl rfl rfl) _
+          rfl hdisc_eq rfl rfl) _
       obtain ⟨opTy₀, fl₀, relOff₀, hop₀, hfl₀_sized, hrel₀_le, hproj₀_ok, hwrite₀_spec⟩ :=
         hspec₀.step_spec hvalid hplen
       have hstep₀_eq := writeAggregateFieldsAux_step_eq body.localDecls body.layouts
