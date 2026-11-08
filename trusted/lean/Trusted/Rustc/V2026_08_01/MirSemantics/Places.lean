@@ -289,6 +289,59 @@ def normalizeSubsliceProjections (proj : List ProjectionElem) : List ProjectionE
   normalizeSubsliceProjectionsAux .none proj
 
 /--
+Normalize adjacent `.subslice` projections without collapsing a trailing
+`.constantIndex` into an enclosing `.subslice`, preserving the narrowest
+enclosing subslice window for spatial provenance bounds in
+`ptrAllocByteBound?`, `resolveStackThinPtrFieldOffsetProj?`, and
+`resolveStackThinPtrTargetProjWithResidual?`.
+-/
+@[reducible]
+def normalizeAdjacentSubslicesAux :
+    Option (Nat × Nat) → List ProjectionElem → List ProjectionElem
+  | .none, .nil => .nil
+  | .some (fromA, toA), .nil => .subslice fromA toA false :: .nil
+  | .none, .subslice fromA toA false :: rest =>
+    match Nat.ble fromA toA with
+    | true => normalizeAdjacentSubslicesAux (.some (fromA, toA)) rest
+    | false =>
+      .subslice fromA toA false :: normalizeAdjacentSubslicesAux .none rest
+  | .none, elem :: rest =>
+    elem :: normalizeAdjacentSubslicesAux .none rest
+  | .some (fromA, toA), .subslice relFrom relTo false :: rest =>
+    let subLen := Nat.sub toA fromA
+    match Bool.and (Nat.ble relFrom relTo) (Nat.ble relTo subLen) with
+    | true =>
+      normalizeAdjacentSubslicesAux
+        (.some (Nat.add fromA relFrom, Nat.add fromA relTo))
+        rest
+    | false =>
+      .subslice fromA toA false ::
+        .subslice relFrom relTo false ::
+        normalizeAdjacentSubslicesAux .none rest
+  | .some (fromA, toA), .subslice relFrom relTo true :: rest =>
+    let subLen := Nat.sub toA fromA
+    let endIdx := Nat.sub subLen relTo
+    match Bool.and (Nat.ble relTo subLen) (Nat.ble relFrom endIdx) with
+    | true =>
+      normalizeAdjacentSubslicesAux
+        (.some (Nat.add fromA relFrom, Nat.add fromA endIdx))
+        rest
+    | false =>
+      .subslice fromA toA false ::
+        .subslice relFrom relTo true ::
+        normalizeAdjacentSubslicesAux .none rest
+  | .some (fromA, toA), elem :: rest =>
+    .subslice fromA toA false :: elem :: normalizeAdjacentSubslicesAux .none rest
+
+/--
+Normalize adjacent `.subslice` projections while retaining `.subslice` window
+boundaries ahead of `.constantIndex` / `.field` projections.
+-/
+@[reducible]
+def normalizeAdjacentSubslices (proj : List ProjectionElem) : List ProjectionElem :=
+  normalizeAdjacentSubslicesAux .none proj
+
+/--
 Test whether two transparent-stripped, subslice-normalized projection paths
 within the same root local overlap.
 
@@ -2481,6 +2534,508 @@ def unresolvedLayoutIdx (layouts : LayoutTable) : Nat :=
   length layouts.entries
 
 /--
+`true` for the primitive scalar kinds (`bool`, `char`, integers, floats), whose
+`encodeValueToBytes` image never consults a `LayoutTable` entry.
+-/
+@[reducible]
+def isPrimitiveScalarKind : RigidTy → Bool
+  | .bool => true
+  | .char => true
+  | .int _ => true
+  | .uint _ => true
+  | .float _ => true
+  | _ => false
+
+/--
+Layout index for a synthesized `Ty` of `kind` when no compiler layout index is
+in scope: `0` for primitive scalar kinds (matching standard MIR scalar `Ty`s
+such as `{ kind := .uint .u32, layoutIdx := 0 }`), and `unresolvedLayoutIdx
+layouts` for aggregate/sequence kinds so they never adopt `layouts.entries[0]`.
+-/
+@[reducible]
+def synthKindLayoutIdx (layouts : LayoutTable) (kind : RigidTy) : Nat :=
+  match isPrimitiveScalarKind kind with
+  | true => 0
+  | false => unresolvedLayoutIdx layouts
+
+/--
+`true` when every `RigidTy` in `ks` is structurally equal to `k0`.
+-/
+@[reducible]
+def allSameRigidTy (k0 : RigidTy) : List RigidTy → Bool
+  | .nil => true
+  | k :: rest =>
+    match rigidTyEq k0 k with
+    | true => allSameRigidTy k0 rest
+    | false => false
+
+/--
+`true` when tuple element kinds `ks` have compiler-independent field layout even
+without a captured `TypeLayout` entry: empty `()`, single-field `(T,)` (cannot
+be reordered), or homogeneous primitive scalar tuples `(T, T, ...)` (identical
+size, alignment, and niche across all fields, with zero padding). Heterogeneous
+multi-field tuples such as `(u8, u32)` or `(u8, u16, u8)` are reordered by
+`rustc` (`repr(Rust)`), so their field offsets and padded size require a
+captured `TypeLayout`.
+-/
+@[reducible]
+def isLayoutFreeTupleKinds : List RigidTy → Bool
+  | .nil => true
+  | _ :: .nil => true
+  | k0 :: k1 :: rest =>
+    Bool.and (isPrimitiveScalarKind k0) (allSameRigidTy k0 (k1 :: rest))
+
+/--
+Exact byte width of a flat runtime scalar or thin pointer value (`.none` for
+aggregates or unit).
+-/
+@[reducible]
+def flatValueByteSize? : Value → Option Nat
+  | .scalar sc => .some sc.sizeBytes
+  | .ptr _ sz => .some sz
+  | _ => .none
+
+/--
+`true` when every runtime value in `vs` is a flat scalar or thin pointer of byte
+width `sz`.
+-/
+@[reducible]
+def allFlatValuesOfSize : Nat → List Value → Bool
+  | _, .nil => true
+  | sz, v :: rest =>
+    match flatValueByteSize? v with
+    | .some vSz =>
+      match Nat.beq sz vSz with
+      | true => allFlatValuesOfSize sz rest
+      | false => false
+    | .none => false
+
+/--
+`true` when an untyped runtime field/element list consists exclusively of flat
+scalars or thin pointers of a single uniform positive byte width (or at most one
+flat field), refusing heterogeneous or nested-aggregate runtime lists whose
+`repr(Rust)` layout cannot be inferred without static `TypeLayout` metadata.
+-/
+@[reducible]
+def isHomogeneousUntypedFields : List Value → Bool
+  | .nil => true
+  | v :: .nil =>
+    match flatValueByteSize? v with
+    | .some _ => true
+    | .none => false
+  | v0 :: v1 :: rest =>
+    match flatValueByteSize? v0 with
+    | .some sz =>
+      match Nat.ble 1 sz with
+      | true => allFlatValuesOfSize sz (v1 :: rest)
+      | false => false
+    | .none => false
+
+/--
+`true` when `l` is structurally plausible as the `TypeLayout` of an `.adt` or
+`.closure` (rejecting `.array` layouts and non-ZST single-variant `.primitive`
+entries such as `u8` at `layouts.entries[0]`).
+-/
+@[reducible]
+def layoutValidForAdt (l : TypeLayout) : Bool :=
+  match l.fields, l.variants with
+  | .array _ _, _ => false
+  | .primitive, .single _ => Nat.beq l.size.bytes 0
+  | _, _ => true
+
+/--
+`true` when `idx` is either `0` (the default index assigned to `Ty`s synthesized
+by `pointeeTyOf` / `elemTyOf`) or an out-of-range index in `layouts` (such as
+`unresolvedLayoutIdx layouts`).
+-/
+@[reducible]
+def isUnresolvedLayoutIdx (layouts : LayoutTable) (idx : Nat) : Bool :=
+  match Nat.beq idx 0 with
+  | true => true
+  | false =>
+    match LayoutTable.lookup layouts idx with
+    | .some _ => false
+    | .none => true
+
+/--
+Search `localDecls` for an array or slice declaration whose element kind
+structurally matches `kind` and whose `TypeLayout` in `layouts` records an
+element layout index `flIdx :: _`, returning `{ kind := kind, layoutIdx := flIdx }`.
+-/
+@[reducible]
+def findContainerElemTyWithKind?
+    (layouts : LayoutTable) :
+    List LocalDecl → RigidTy → Option Ty
+  | .nil, _ => .none
+  | decl :: rest, kind =>
+    let elemKindOpt : Option RigidTy :=
+      match decl.ty.kind with
+      | .array ek _ => .some ek
+      | .slice ek => .some ek
+      | _ => .none
+    match elemKindOpt with
+    | .some ek =>
+      match rigidTyEq ek kind with
+      | false => findContainerElemTyWithKind? layouts rest kind
+      | true =>
+        match LayoutTable.lookup layouts decl.ty.layoutIdx with
+        | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+          .some { kind := kind, layoutIdx := flIdx }
+        | _ => findContainerElemTyWithKind? layouts rest kind
+    | .none => findContainerElemTyWithKind? layouts rest kind
+
+/--
+Look up `kind` in `localDecls` first by exact `LocalDecl` match
+(`findDeclTyWithKind?`), then by array/slice container `fieldLayouts`
+(`findContainerElemTyWithKind?`).
+-/
+@[reducible]
+def findDeclOrContainerElemTyWithKind?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (kind : RigidTy) :
+    Option Ty :=
+  match findDeclTyWithKind? localDecls kind with
+  | .some declTy => .some declTy
+  | .none => findContainerElemTyWithKind? layouts localDecls kind
+
+/--
+Resolve a `Ty` whose `layoutIdx` may be unresolved (`isUnresolvedLayoutIdx
+layouts ty.layoutIdx`) against `localDecls` and `layouts`:
+- If `ty.layoutIdx` is a valid non-zero index in `layouts`, returns `ty`.
+- Otherwise, looks up `ty.kind` via `findDeclOrContainerElemTyWithKind? localDecls layouts`.
+- If `ty.layoutIdx == 0` and no declaration in a non-empty `localDecls` matches a
+  non-primitive aggregate/sequence `ty.kind`, replaces the synthetic `0` with
+  `unresolvedLayoutIdx layouts` so `ty` never accidentally adopts `layouts.entries[0]`.
+-/
+@[reducible]
+def resolveTyWithLocalDecls
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Ty :=
+  match isUnresolvedLayoutIdx layouts ty.layoutIdx with
+  | false => ty
+  | true =>
+    match findDeclOrContainerElemTyWithKind? localDecls layouts ty.kind with
+    | .some declTy => declTy
+    | .none =>
+      match Nat.beq ty.layoutIdx 0, localDecls with
+      | true, _ :: _ =>
+        match isPrimitiveScalarKind ty.kind with
+        | true => ty
+        | false => { ty with layoutIdx := unresolvedLayoutIdx layouts }
+      | _, _ => ty
+
+/--
+Walk `proj` from `baseTy` like `resolveProjectedTy`, but resolve `.deref` and
+`.index`/`.constantIndex` inner types through container `fieldLayouts` and
+`findDeclOrContainerElemTyWithKind?`, assigning `unresolvedLayoutIdx layouts`
+instead of `0` when no compiler layout is in scope.
+-/
+@[reducible]
+def resolveProjectedTyResolved
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (baseTy : Ty) :
+    List ProjectionElem → Option Ty
+  | .nil => .some baseTy
+  | .field fieldIdx fieldTy :: rest =>
+    let nextTy : Ty :=
+      match isUnresolvedLayoutIdx layouts fieldTy.layoutIdx with
+      | false => fieldTy
+      | true =>
+        match LayoutTable.lookup layouts baseTy.layoutIdx with
+        | .some l =>
+          match l.variants with
+          | .single _ =>
+            match get? l.fieldLayouts fieldIdx with
+            | .some flIdx => { fieldTy with layoutIdx := flIdx }
+            | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+          | _ => resolveTyWithLocalDecls localDecls layouts fieldTy
+        | .none => resolveTyWithLocalDecls localDecls layouts fieldTy
+    resolveProjectedTyResolved localDecls layouts nextTy rest
+  | .opaqueCast castTy :: rest =>
+    resolveProjectedTyResolved
+      localDecls
+      layouts
+      (resolveTyWithLocalDecls localDecls layouts castTy)
+      rest
+  | .unwrapUnsafeBinder innerTy :: rest =>
+    resolveProjectedTyResolved
+      localDecls
+      layouts
+      (resolveTyWithLocalDecls localDecls layouts innerTy)
+      rest
+  | .deref :: rest =>
+    match pointeeTyOf baseTy with
+    | .some { kind := inner, .. } =>
+      let innerTy : Ty :=
+        match findDeclOrContainerElemTyWithKind? localDecls layouts inner with
+        | .some declTy => declTy
+        | .none => { kind := inner, layoutIdx := synthKindLayoutIdx layouts inner }
+      resolveProjectedTyResolved localDecls layouts innerTy rest
+    | .none => .none
+  | .index _ :: rest =>
+    match elemTyOf baseTy with
+    | .some { kind := ek, .. } =>
+      let elemTy : Ty :=
+        match LayoutTable.lookup layouts baseTy.layoutIdx with
+        | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+          { kind := ek, layoutIdx := flIdx }
+        | _ =>
+          match findDeclOrContainerElemTyWithKind? localDecls layouts ek with
+          | .some declTy => declTy
+          | .none => { kind := ek, layoutIdx := synthKindLayoutIdx layouts ek }
+      resolveProjectedTyResolved localDecls layouts elemTy rest
+    | .none => .none
+  | .constantIndex _ _ _ :: rest =>
+    match elemTyOf baseTy with
+    | .some { kind := ek, .. } =>
+      let elemTy : Ty :=
+        match LayoutTable.lookup layouts baseTy.layoutIdx with
+        | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+          { kind := ek, layoutIdx := flIdx }
+        | _ =>
+          match findDeclOrContainerElemTyWithKind? localDecls layouts ek with
+          | .some declTy => declTy
+          | .none => { kind := ek, layoutIdx := synthKindLayoutIdx layouts ek }
+      resolveProjectedTyResolved localDecls layouts elemTy rest
+    | .none => .none
+  | .subslice _ _ _ :: rest =>
+    resolveProjectedTyResolved localDecls layouts baseTy rest
+  | .downcast _ _ :: rest =>
+    resolveProjectedTyResolved localDecls layouts baseTy rest
+
+/--
+Resolve the `Ty` of `p` from `localDecls` and `layouts` without conflating
+synthesized pointee/element `layoutIdx` values with `layouts.entries[0]`.
+-/
+@[reducible]
+def placeTyResolved
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (p : Place) :
+    Option Ty :=
+  match get? localDecls p.local_ with
+  | .some decl => resolveProjectedTyResolved localDecls layouts decl.ty p.projection
+  | .none => .none
+
+/--
+Resolve the `Ty` of `op` using `placeTyResolved` for place operands and `c.ty`
+for constants.
+-/
+@[reducible]
+def operandTyResolved
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (op : Operand) :
+    Option Ty :=
+  match op with
+  | .copy p => placeTyResolved localDecls layouts p
+  | .move p => placeTyResolved localDecls layouts p
+  | .constant c => .some c.ty
+
+/--
+Search `localDecls` for an array or slice declaration whose element kind
+structurally matches `kind` and whose `TypeLayout` in `layouts` has
+`fields = .array stride _`, returning `(stride.bytes, layout.align.bytes)`.
+-/
+@[reducible]
+def findArrayElemStrideAndAlign?
+    (layouts : LayoutTable) :
+    List LocalDecl → RigidTy → Option (Nat × Nat)
+  | .nil, _ => .none
+  | decl :: rest, kind =>
+    let elemKindOpt : Option RigidTy :=
+      match decl.ty.kind with
+      | .array ek _ => .some ek
+      | .slice ek => .some ek
+      | _ => .none
+    match elemKindOpt with
+    | .some ek =>
+      match rigidTyEq ek kind with
+      | false => findArrayElemStrideAndAlign? layouts rest kind
+      | true =>
+        match LayoutTable.lookup layouts decl.ty.layoutIdx with
+        | .some l =>
+          match l.fields with
+          | .array stride _ =>
+            match Nat.ble 1 stride.bytes with
+            | true =>
+              let a :=
+                match Nat.ble 1 l.align.bytes with
+                | true => l.align.bytes
+                | false => 1
+              .some (stride.bytes, a)
+            | false => findArrayElemStrideAndAlign? layouts rest kind
+          | _ => findArrayElemStrideAndAlign? layouts rest kind
+        | .none => findArrayElemStrideAndAlign? layouts rest kind
+    | .none => findArrayElemStrideAndAlign? layouts rest kind
+
+/--
+Accumulate the `#[repr(C)]` `(sizeBytes, alignBytes)` across tuple element
+kinds `ks` using recursive element analyzer `recKind`.
+-/
+@[reducible]
+def foldTupleKindsCReprAux
+    (recKind : RigidTy → Option (Nat × Nat))
+    (runningOff maxAlign : Nat) :
+    List RigidTy → Option (Nat × Nat)
+  | .nil => .some (alignUpBytes runningOff maxAlign, maxAlign)
+  | k :: rest =>
+    match recKind k with
+    | .none => .none
+    | .some (fSz, fAlign) =>
+      let alignedOff := alignUpBytes runningOff fAlign
+      let nextMax :=
+        match Nat.ble maxAlign fAlign with
+        | true => fAlign
+        | false => maxAlign
+      foldTupleKindsCReprAux
+        recKind
+        (Nat.add alignedOff fSz)
+        nextMax
+        rest
+
+/--
+Compute `(sizeBytes, alignBytes)` of `ty` using `localDecls` and `layouts` with
+structural recursion on `fuel`:
+- Resolves `ty` via `resolveTyWithLocalDecls localDecls layouts ty`.
+- Checks structural compatibility of `LayoutTable.lookup layouts rTy.layoutIdx`
+  with `rTy.kind`.
+- Falls back to structural tuple layout only for `isLayoutFreeTupleKinds`
+  (`()`, `(T,)`, or homogeneous primitive `(T, T, ...)`), refusing unlaid-out
+  heterogeneous tuples whose `repr(Rust)` layout depends on compiler reordering.
+-/
+@[reducible]
+def tyByteSizeAndAlignAux
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Nat → Ty → Option (Nat × Nat)
+  | .zero, _ => .none
+  | .succ fuel, ty =>
+    let rTy := resolveTyWithLocalDecls localDecls layouts ty
+    match rTy.kind with
+    | .tuple .nil | .fnDef _ _ | .never => .some (0, 1)
+    | .array elemKind n =>
+      let layoutSizeAlignOpt : Option (Nat × Nat) :=
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some l =>
+          match l.fields with
+          | .array stride count =>
+            match Nat.beq count n with
+            | false => .none
+            | true =>
+              let a :=
+                match Nat.ble 1 l.align.bytes with
+                | true => l.align.bytes
+                | false => 1
+              let sz :=
+                match Nat.beq l.size.bytes 0, Nat.ble 1 stride.bytes with
+                | true, true => Nat.mul n stride.bytes
+                | _, _ => l.size.bytes
+              .some (sz, a)
+          | _ => .none
+        | .none => .none
+      match layoutSizeAlignOpt with
+      | .some sa => .some sa
+      | .none =>
+        let elemTy : Ty :=
+          match LayoutTable.lookup layouts rTy.layoutIdx with
+          | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } =>
+            { kind := elemKind, layoutIdx := flIdx }
+          | _ =>
+            resolveTyWithLocalDecls
+              localDecls
+              layouts
+              { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+        match tyByteSizeAndAlignAux localDecls layouts fuel elemTy with
+        | .some (elemSz, elemAlign) => .some (Nat.mul n elemSz, elemAlign)
+        | .none => .none
+    | .tuple (k :: ks) =>
+      let layoutSizeAlignOpt : Option (Nat × Nat) :=
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some l =>
+          match layoutMatchesAggregateVariant l 0 (length (k :: ks)) with
+          | false => .none
+          | true =>
+            let a :=
+              match Nat.ble 1 l.align.bytes with
+              | true => l.align.bytes
+              | false => 1
+            .some (l.size.bytes, a)
+        | .none => .none
+      match layoutSizeAlignOpt with
+      | .some sa => .some sa
+      | .none =>
+        match isLayoutFreeTupleKinds (k :: ks) with
+        | false => .none
+        | true =>
+          foldTupleKindsCReprAux
+            (fun fk =>
+              tyByteSizeAndAlignAux
+                localDecls
+                layouts
+                fuel
+                (resolveTyWithLocalDecls
+                  localDecls
+                  layouts
+                  { kind := fk, layoutIdx := unresolvedLayoutIdx layouts }))
+            0
+            1
+            (k :: ks)
+    | .adt _ _ | .closure _ _ =>
+      match LayoutTable.lookup layouts rTy.layoutIdx with
+      | .some l =>
+        match layoutValidForAdt l with
+        | false => findArrayElemStrideAndAlign? layouts localDecls rTy.kind
+        | true =>
+          let a :=
+            match Nat.ble 1 l.align.bytes with
+            | true => l.align.bytes
+            | false => 1
+          .some (l.size.bytes, a)
+      | .none => findArrayElemStrideAndAlign? layouts localDecls rTy.kind
+    | _ =>
+      match rigidTyByteSize layouts rTy with
+      | .none => .none
+      | .some sz =>
+        let a :=
+          match LayoutTable.lookup layouts rTy.layoutIdx with
+          | .some l =>
+            match l.fields, Nat.beq l.size.bytes sz with
+            | .primitive, true =>
+              match Nat.ble 1 l.align.bytes with
+              | true => l.align.bytes
+              | false => 1
+            | _, _ =>
+              let ptrBytes := layoutPointerBytes layouts
+              match rTy.kind with
+              | .int .isize | .uint .usize | .rawPtr _ _ | .ref _ _ | .fnPtr _ _ _ _ => ptrBytes
+              | _ => scalarNaturalAlignBytes sz
+          | .none =>
+            let ptrBytes := layoutPointerBytes layouts
+            match rTy.kind with
+            | .int .isize | .uint .usize | .rawPtr _ _ | .ref _ _ | .fnPtr _ _ _ _ => ptrBytes
+            | _ => scalarNaturalAlignBytes sz
+        .some (sz, a)
+
+/--
+Determine the byte size of `ty` using `localDecls` and `layouts`
+(`tyByteSizeAndAlignAux`).
+-/
+@[reducible]
+def tyByteSize
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Option Nat :=
+  match tyByteSizeAndAlignAux localDecls layouts 8 ty with
+  | .some (sz, _) => .some sz
+  | .none => .none
+
+/--
 Resolve the `TypeLayout` of an aggregate `.aggregate aggVar fields` of static
 type `curTy` in `layouts`: the entry at `curTy.layoutIdx` is used only when it
 is shaped like `(aggVar, length fields)` (`layoutMatchesAggregateVariant`), and
@@ -2510,7 +3065,7 @@ def lookupAggregateLayout?
       | true => .some l
       | false => .none
     | .none => .none
-  | .adt _ _ =>
+  | .adt _ _ | .closure _ _ =>
     match directOpt with
     | .some l =>
       match l.fields with
@@ -2585,26 +3140,33 @@ def aggregateFieldByteOffset?
   match layoutOffOpt with
   | .some off => .some off
   | .none =>
-    let tupleOffOpt : Option Nat :=
-      match activeVariant, encTyOpt with
-      | .none, .some { kind := .tuple ks, .. } =>
+    match encTyOpt with
+    | .some { kind := .tuple ks, .. } =>
+      match activeVariant, isLayoutFreeTupleKinds ks with
+      | .none, true =>
         match Nat.ble (.succ fieldIdx) (length ks) with
         | true => sumPrefixTupleKindBytes fieldIdx ks
         | false => .none
       | _, _ => .none
-    match tupleOffOpt with
-    | .some off => .some off
+    | .some { kind := .adt _ _, .. } | .some { kind := .closure _ _, .. } =>
+      match activeVariant, encValOpt with
+      | .none, .some (.aggregate 0 (_ :: .nil)) =>
+        match Nat.beq fieldIdx 0 with
+        | true => .some 0
+        | false => .none
+      | _, _ => .none
+    | .some _ => .none
     | .none =>
-      match encValOpt with
-      | .some (.aggregate aggVar fields) =>
-        let varOk :=
-          match activeVariant with
-          | .some expVar => Nat.beq aggVar expVar
-          | .none => Nat.beq aggVar 0
-        match Bool.and varOk (Nat.ble (.succ fieldIdx) (length fields)) with
+      match activeVariant, encValOpt with
+      | .none, .some (.aggregate 0 fields) =>
+        match
+          Bool.and
+            (isHomogeneousUntypedFields fields)
+            (Nat.ble (.succ fieldIdx) (length fields))
+        with
         | true => sumPrefixFieldValueBytes fieldIdx fields
         | false => .none
-      | _ => .none
+      | _, _ => .none
 
 /--
 Accumulate the byte offset of projection chain `proj` relative to an enclosing
@@ -2624,13 +3186,28 @@ def projectionChainByteOffset?
     (curTyOpt : Option Ty)
     (curValOpt : Option Value)
     (activeVariant : Option VariantIdx)
-    (accOff : Nat) :
+    (accOff : Nat)
+    (localDecls : List LocalDecl := .nil) :
     List ProjectionElem → Option Nat
   | .nil => .some accOff
   | .opaqueCast castTy :: rest =>
-    projectionChainByteOffset? layouts (.some castTy) curValOpt .none accOff rest
+    projectionChainByteOffset?
+      layouts
+      (.some (resolveTyWithLocalDecls localDecls layouts castTy))
+      curValOpt
+      .none
+      accOff
+      localDecls
+      rest
   | .unwrapUnsafeBinder innerTy :: rest =>
-    projectionChainByteOffset? layouts (.some innerTy) curValOpt .none accOff rest
+    projectionChainByteOffset?
+      layouts
+      (.some (resolveTyWithLocalDecls localDecls layouts innerTy))
+      curValOpt
+      .none
+      accOff
+      localDecls
+      rest
   | .downcast _ variantIdx :: rest =>
     projectionChainByteOffset?
       layouts
@@ -2638,12 +3215,17 @@ def projectionChainByteOffset?
       curValOpt
       (.some variantIdx)
       accOff
+      localDecls
       rest
   | .field fieldIdx fieldTy :: rest =>
+    let resolvedCurTyOpt : Option Ty :=
+      match curTyOpt with
+      | .some rawCurTy => .some (resolveTyWithLocalDecls localDecls layouts rawCurTy)
+      | .none => .none
     match
       aggregateFieldByteOffset?
         layouts
-        curTyOpt
+        resolvedCurTyOpt
         activeVariant
         curValOpt
         fieldIdx
@@ -2661,8 +3243,8 @@ def projectionChainByteOffset?
           | true => get? fields fieldIdx
           | false => .none
         | _ => .none
-      let nextFieldTy : Ty :=
-        match Nat.beq fieldTy.layoutIdx 0, activeVariant, curTyOpt with
+      let rawNextFieldTy : Ty :=
+        match isUnresolvedLayoutIdx layouts fieldTy.layoutIdx, activeVariant, resolvedCurTyOpt with
         | true, .none, .some curTy =>
           match LayoutTable.lookup layouts curTy.layoutIdx with
           | .some layout =>
@@ -2671,17 +3253,53 @@ def projectionChainByteOffset?
             | .none => fieldTy
           | .none => fieldTy
         | _, _, _ => fieldTy
+      let nextFieldTy := resolveTyWithLocalDecls localDecls layouts rawNextFieldTy
       projectionChainByteOffset?
         layouts
         (.some nextFieldTy)
         nextValOpt
         .none
         (Nat.add accOff stepOff)
+        localDecls
         rest
   | .constantIndex elemIdx minLen false :: rest =>
-    let nextElemTyOpt : Option Ty :=
+    let resolvedCurTyOpt : Option Ty :=
       match curTyOpt with
-      | .some curTy => elemTyOf curTy
+      | .some rawCurTy => .some (resolveTyWithLocalDecls localDecls layouts rawCurTy)
+      | .none => .none
+    let nextElemTyOpt : Option Ty :=
+      match resolvedCurTyOpt with
+      | .some curTy =>
+        let elemKindOpt : Option RigidTy :=
+          match curTy.kind with
+          | .array ek _ => .some ek
+          | .slice ek => .some ek
+          | _ => .none
+        match elemKindOpt with
+        | .none => .none
+        | .some ek =>
+          let flIdxOpt : Option Nat :=
+            match LayoutTable.lookup layouts curTy.layoutIdx with
+            | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } => .some flIdx
+            | _ => .none
+          match flIdxOpt with
+          | .some flIdx => .some { kind := ek, layoutIdx := flIdx }
+          | .none =>
+            .some
+              (resolveTyWithLocalDecls
+                localDecls
+                layouts
+                { kind := ek, layoutIdx := unresolvedLayoutIdx layouts })
+      | .none => .none
+    let layoutStrideOpt : Option Nat :=
+      match resolvedCurTyOpt with
+      | .some curTy =>
+        match LayoutTable.lookup layouts curTy.layoutIdx with
+        | .some { fields := .array stride _, .. } =>
+          match Nat.ble 1 stride.bytes with
+          | true => .some stride.bytes
+          | false => .none
+        | _ => .none
       | .none => .none
     match curValOpt with
     | .some (.aggregate 0 elems) =>
@@ -2693,23 +3311,27 @@ def projectionChainByteOffset?
       | false => .none
       | true =>
         let elemSz :=
-          match nextElemTyOpt with
-          | .some elemTy =>
-            match rigidTyByteSize layouts elemTy with
-            | .some sz => sz
+          match layoutStrideOpt with
+          | .some s => s
+          | .none =>
+            match nextElemTyOpt with
+            | .some elemTy =>
+              match tyByteSize localDecls layouts elemTy with
+              | .some sz => sz
+              | .none => inferElemListByteStride elems
             | .none => inferElemListByteStride elems
-          | .none => inferElemListByteStride elems
         projectionChainByteOffset?
           layouts
           nextElemTyOpt
           (get? elems elemIdx)
           .none
           (Nat.add accOff (Nat.mul elemIdx elemSz))
+          localDecls
           rest
     | .some _ => .none
     | .none =>
       let layoutElemStrideOpt : Option (Nat × Nat) :=
-        match curTyOpt with
+        match resolvedCurTyOpt with
         | .some curTy =>
           match LayoutTable.lookup layouts curTy.layoutIdx with
           | .some layout =>
@@ -2733,9 +3355,10 @@ def projectionChainByteOffset?
             .none
             .none
             (Nat.add accOff (Nat.mul elemIdx elemSz))
+            localDecls
             rest
       | .none =>
-        match curTyOpt with
+        match resolvedCurTyOpt with
         | .some { kind := .array elemKind arrLen, .. } =>
           match
             Bool.and
@@ -2744,7 +3367,11 @@ def projectionChainByteOffset?
           with
           | false => .none
           | true =>
-            match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+            let fallbackElemTy :=
+              match nextElemTyOpt with
+              | .some et => et
+              | .none => { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+            match tyByteSize localDecls layouts fallbackElemTy with
             | .some elemSz =>
               projectionChainByteOffset?
                 layouts
@@ -2752,6 +3379,7 @@ def projectionChainByteOffset?
                 .none
                 .none
                 (Nat.add accOff (Nat.mul elemIdx elemSz))
+                localDecls
                 rest
             | .none => .none
         | _ => .none
@@ -2857,29 +3485,35 @@ def scanArbitraryLayoutFields?
           | .some fk =>
             match rigidTyKindByteSize fk with
             | .some sz => .some sz
-            | .none => inferValueCReprBytes fVal
-          | .none => inferValueCReprBytes fVal
+            | .none => flatValueByteSize? fVal
+          | .none =>
+            match fVal with
+            | .unit => .some 0
+            | _ => flatValueByteSize? fVal
       | .none =>
         match fkOpt with
         | .some fk =>
           match rigidTyKindByteSize fk with
           | .some sz => .some sz
-          | .none => inferValueCReprBytes fVal
-        | .none => inferValueCReprBytes fVal
-    let nestedLayoutIdx : Nat :=
-      match flIdxOpt with
-      | .some flIdx => flIdx
-      | .none => 0
+          | .none => flatValueByteSize? fVal
+        | .none =>
+          match fVal with
+          | .unit => .some 0
+          | _ => flatValueByteSize? fVal
     let nestedProjTy : Ty :=
-      match fkOpt with
-      | .some fk => { kind := fk, layoutIdx := nestedLayoutIdx }
-      | .none => { kind := defaultLeafTy.kind, layoutIdx := nestedLayoutIdx }
+      match flIdxOpt, fkOpt with
+      | .some flIdx, .some fk => { kind := fk, layoutIdx := flIdx }
+      | .some flIdx, .none => { kind := defaultLeafTy.kind, layoutIdx := flIdx }
+      | .none, .some fk => { kind := fk, layoutIdx := synthKindLayoutIdx layouts fk }
+      | .none, .none =>
+        { kind := defaultLeafTy.kind, layoutIdx := synthKindLayoutIdx layouts defaultLeafTy.kind }
     let nestedTyOpt : Option Ty :=
       match flIdxOpt, fkOpt with
       | .some flIdx, .some fk => .some { kind := fk, layoutIdx := flIdx }
       | .some flIdx, .none =>
         .some { kind := defaultLeafTy.kind, layoutIdx := flIdx }
-      | .none, .some fk => .some { kind := fk, layoutIdx := 0 }
+      | .none, .some fk =>
+        .some { kind := fk, layoutIdx := synthKindLayoutIdx layouts fk }
       | .none, .none => .none
     match fSizeOpt with
     | .none => .none
@@ -2921,6 +3555,8 @@ layout table entry is available.
 -/
 def scanSequentialFields?
     (recurse : Value → Option Ty → Nat → Option (List ProjectionElem × Nat))
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
     (useCAlign : Bool)
     (relOff expectedElemBytes : Nat)
     (leafIsAggregate : Bool)
@@ -2936,20 +3572,38 @@ def scanSequentialFields?
       match tupleKinds with
       | _ :: tkRest => tkRest
       | .nil => .nil
+    let unresIdx := unresolvedLayoutIdx layouts
     let fSizeAndAlignOpt : Option (Nat × Nat) :=
-      match useCAlign, fkOpt with
-      | false, .some fk =>
-        match rigidTyKindByteSize fk with
-        | .some sz => .some (sz, 1)
-        | .none => inferValueCReprSizeAndAlignAux 8 fVal
-      | _, _ => inferValueCReprSizeAndAlignAux 8 fVal
+      match fkOpt with
+      | .some fk =>
+        match
+          tyByteSizeAndAlignAux
+            localDecls
+            layouts
+            4
+            { kind := fk, layoutIdx := unresIdx }
+        with
+        | .some (sz, a) =>
+          match useCAlign with
+          | true => .some (sz, a)
+          | false => .some (sz, 1)
+        | .none => .none
+      | .none =>
+        match fVal with
+        | .unit => .some (0, 1)
+        | _ =>
+          match flatValueByteSize? fVal with
+          | .some sz => .some (sz, scalarNaturalAlignBytes sz)
+          | .none => .none
     let nestedProjTy : Ty :=
       match fkOpt with
-      | .some fk => { kind := fk, layoutIdx := 0 }
+      | .some fk =>
+        resolveTyWithLocalDecls localDecls layouts { kind := fk, layoutIdx := synthKindLayoutIdx layouts fk }
       | .none => defaultLeafTy
     let nestedTyOpt : Option Ty :=
       match fkOpt with
-      | .some fk => .some { kind := fk, layoutIdx := 0 }
+      | .some fk =>
+        .some (resolveTyWithLocalDecls localDecls layouts { kind := fk, layoutIdx := synthKindLayoutIdx layouts fk })
       | .none => .none
     match fSizeAndAlignOpt with
     | .none => .none
@@ -2976,6 +3630,8 @@ def scanSequentialFields?
       | .none =>
         scanSequentialFields?
           recurse
+          localDecls
+          layouts
           useCAlign
           relOff
           expectedElemBytes
@@ -2998,64 +3654,64 @@ def resolveAggregateAtByteOffsetStep
     (relOff expectedElemBytes : Nat)
     (leafIsAggregate : Bool)
     (defaultLeafTy : Ty)
-    (forceSeqRoot : Bool) :
+    (forceSeqRoot : Bool)
+    (localDecls : List LocalDecl := .nil) :
     Option (List ProjectionElem × Nat) :=
   match curVal with
   | .aggregate aggVar fields =>
-    let (tupleKinds, useCAlign) : (List RigidTy × Bool) :=
+    let resolvedCurTyOpt : Option Ty :=
       match curTyOpt with
+      | .some rawCurTy => .some (resolveTyWithLocalDecls localDecls layouts rawCurTy)
+      | .none => .none
+    let (tupleKinds, useCAlign) : (List RigidTy × Bool) :=
+      match resolvedCurTyOpt with
       | .some { kind := .tuple ks, .. } => (ks, true)
       | _ => (.nil, true)
     let isArrayContainer : Option (Option Ty × Nat) :=
-      match Nat.beq aggVar 0, curTyOpt with
+      match Nat.beq aggVar 0, resolvedCurTyOpt with
       | false, _ => .none
       | true, .some curTy =>
         match curTy.kind with
         | .array elemKind _ | .slice elemKind =>
+          let elemLayoutIdx : Nat :=
+            match LayoutTable.lookup layouts curTy.layoutIdx with
+            | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } => flIdx
+            | _ =>
+              match findDeclOrContainerElemTyWithKind? localDecls layouts elemKind with
+              | .some declTy => declTy.layoutIdx
+              | .none => unresolvedLayoutIdx layouts
+          let elemTy : Ty := { kind := elemKind, layoutIdx := elemLayoutIdx }
           let elemSz :=
             match LayoutTable.lookup layouts curTy.layoutIdx with
             | .some { fields := .array stride _, .. } =>
               match Nat.ble 1 stride.bytes with
               | true => stride.bytes
               | false =>
-                match fields with
-                | f0 :: _ =>
-                  match inferValueCReprBytes f0 with
-                  | .some sz => sz
-                  | .none => inferElemListByteStride fields
-                | .nil => 0
+                match tyByteSize localDecls layouts elemTy with
+                | .some sz => sz
+                | .none => 0
             | _ =>
-              match rigidTyKindByteSize elemKind with
+              match tyByteSize localDecls layouts elemTy with
               | .some sz => sz
-              | .none =>
-                match fields with
-                | f0 :: _ =>
-                  match inferValueCReprBytes f0 with
-                  | .some sz => sz
-                  | .none => inferElemListByteStride fields
-                | .nil => 0
-          let elemLayoutIdx : Nat :=
-            match LayoutTable.lookup layouts curTy.layoutIdx with
-            | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } => flIdx
-            | _ => unresolvedLayoutIdx layouts
-          .some (.some { kind := elemKind, layoutIdx := elemLayoutIdx }, elemSz)
+              | .none => 0
+          .some (.some elemTy, elemSz)
         | .adt _ _ | .tuple _ | .closure _ _ => .none
         | _ =>
-          match Nat.beq curTy.layoutIdx 0, LayoutTable.lookup layouts curTy.layoutIdx with
+          match isUnresolvedLayoutIdx layouts curTy.layoutIdx, LayoutTable.lookup layouts curTy.layoutIdx with
           | false, .some { fields := .array stride _, .. } => .some (.none, stride.bytes)
           | _, _ => .none
       | true, .none =>
-        match forceSeqRoot with
-        | false => .none
-        | true =>
+        match forceSeqRoot, isHomogeneousUntypedFields fields with
+        | true, true =>
           let elemSz :=
             match fields with
             | f0 :: _ =>
-              match inferValueCReprBytes f0 with
+              match flatValueByteSize? f0 with
               | .some sz => sz
-              | .none => inferElemListByteStride fields
+              | .none => 0
             | .nil => 0
           .some (.none, elemSz)
+        | _, _ => .none
     match isArrayContainer with
     | .some (elemTyOpt, elemSz) =>
       match Nat.beq elemSz 0 with
@@ -3101,7 +3757,7 @@ def resolveAggregateAtByteOffsetStep
                   | false => .none
               | _ => .none
     | .none =>
-      match curTyOpt with
+      match resolvedCurTyOpt with
       | .some curTy =>
         match lookupAggregateLayout? layouts curTy aggVar fields with
         | .some layout =>
@@ -3147,9 +3803,17 @@ def resolveAggregateAtByteOffsetStep
                   layout.fieldLayouts
                   tupleKinds
                   fields
-              | false =>
+              | false => .none
+          | _, .union _ => .none
+          | .single singleVar, _ =>
+            match Nat.beq aggVar singleVar, isLayoutFreeTupleKinds tupleKinds with
+            | true, true =>
+              match curTy.kind with
+              | .tuple _ =>
                 scanSequentialFields?
                   recurse
+                  localDecls
+                  layouts
                   useCAlign
                   relOff
                   expectedElemBytes
@@ -3159,48 +3823,42 @@ def resolveAggregateAtByteOffsetStep
                   0
                   tupleKinds
                   fields
-          | _, .union _ => .none
-          | .single singleVar, _ =>
-            match Nat.beq aggVar singleVar with
-            | false => .none
-            | true =>
-              scanSequentialFields?
-                recurse
-                useCAlign
-                relOff
-                expectedElemBytes
-                leafIsAggregate
-                defaultLeafTy
-                0
-                0
-                tupleKinds
-                fields
+              | _ => .none
+            | _, _ => .none
           | .empty, _ => .none
         | .none =>
-          match curTy.kind, Nat.beq (length fields) 1, Nat.beq relOff 0 with
-          | .adt _ _, false, _ => .none
-          | .adt _ _, true, false => .none
-          | _, _, _ =>
+          let allowSeqWithoutLayout : Bool :=
             match Nat.beq aggVar 0 with
-            | false => .none
+            | false => false
             | true =>
-              scanSequentialFields?
-                recurse
-                useCAlign
-                relOff
-                expectedElemBytes
-                leafIsAggregate
-                defaultLeafTy
-                0
-                0
-                tupleKinds
-                fields
+              match curTy.kind with
+              | .tuple ks => isLayoutFreeTupleKinds ks
+              | .adt _ _ | .closure _ _ => Nat.beq (length fields) 1
+              | _ => false
+          match allowSeqWithoutLayout with
+          | false => .none
+          | true =>
+            scanSequentialFields?
+              recurse
+              localDecls
+              layouts
+              useCAlign
+              relOff
+              expectedElemBytes
+              leafIsAggregate
+              defaultLeafTy
+              0
+              0
+              tupleKinds
+              fields
       | .none =>
-        match Nat.beq aggVar 0 with
+        match Bool.and (Nat.beq aggVar 0) (isHomogeneousUntypedFields fields) with
         | false => .none
         | true =>
           scanSequentialFields?
             recurse
+            localDecls
+            layouts
             true
             relOff
             expectedElemBytes
@@ -3227,7 +3885,8 @@ def resolveAggregateAtByteOffset?
     (relOff expectedElemBytes : Nat)
     (leafIsAggregate : Bool)
     (defaultLeafTy : Ty)
-    (forceSeqRoot : Bool := false) :
+    (forceSeqRoot : Bool := false)
+    (localDecls : List LocalDecl := .nil) :
     Option (List ProjectionElem × Nat) :=
   match fuel with
   | .zero => .none
@@ -3244,6 +3903,7 @@ def resolveAggregateAtByteOffset?
         leafIsAggregate
         defaultLeafTy
         false
+        localDecls
     resolveAggregateAtByteOffsetStep
       recurse
       layouts
@@ -3254,6 +3914,92 @@ def resolveAggregateAtByteOffset?
       leafIsAggregate
       defaultLeafTy
       forceSeqRoot
+      localDecls
+
+/--
+Resolve the element byte stride of a sequence container at
+`(targetLocal, containerProj)` whose runtime elements are `elems`.
+-/
+@[reducible]
+def resolveSeqContainerElemByteStride
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (targetLocal : Local)
+    (containerProj : List ProjectionElem)
+    (elems : List Value) :
+    Nat :=
+  let containerTyOpt :=
+    placeTyResolved localDecls layouts { local_ := targetLocal, projection := containerProj }
+  match containerTyOpt with
+  | .some cTy =>
+    let resolvedCTy := resolveTyWithLocalDecls localDecls layouts cTy
+    match LayoutTable.lookup layouts resolvedCTy.layoutIdx with
+    | .some { fields := .array stride _, .. } =>
+      match Nat.ble 1 stride.bytes with
+      | true => stride.bytes
+      | false => 0
+    | _ =>
+      match resolvedCTy.kind with
+      | .array ek _ | .slice ek =>
+        match
+          tyByteSize
+            localDecls
+            layouts
+            { kind := ek, layoutIdx := unresolvedLayoutIdx layouts }
+        with
+        | .some s => s
+        | .none => 0
+      | _ => 0
+  | .none =>
+    match isHomogeneousUntypedFields elems, elems with
+    | true, e0 :: _ =>
+      match flatValueByteSize? e0 with
+      | .some sz => sz
+      | .none => 0
+    | _, _ => 0
+
+/--
+Resolve the element `Ty` of a sequence container at `(targetLocal,
+containerProj)`: the element layout index recorded by the container's own
+`TypeLayout` (`fieldLayouts`), else a structurally equal `LocalDecl` or array
+container layout (`findDeclOrContainerElemTyWithKind?`), else the bare element
+kind with the out-of-range `unresolvedLayoutIdx`. Untyped containers yield
+`.none`. The runtime elements and stride are not consulted: no layout is ever
+guessed from the shape of the values.
+-/
+@[reducible]
+def resolveSeqContainerElemTyOpt
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (targetLocal : Local)
+    (containerProj : List ProjectionElem)
+    (_elems : List Value)
+    (_elemSz : Nat) :
+    Option Ty :=
+  let containerTyOpt :=
+    placeTyResolved localDecls layouts { local_ := targetLocal, projection := containerProj }
+  let elemKindOpt : Option RigidTy :=
+    match containerTyOpt with
+    | .some { kind := .array ek _, .. } => .some ek
+    | .some { kind := .slice ek, .. } => .some ek
+    | _ => .none
+  let fromFieldLayoutsOpt : Option Nat :=
+    match containerTyOpt with
+    | .some cTy =>
+      let resolvedCTy := resolveTyWithLocalDecls localDecls layouts cTy
+      match LayoutTable.lookup layouts resolvedCTy.layoutIdx with
+      | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } => .some flIdx
+      | _ => .none
+    | .none => .none
+  match elemKindOpt with
+  | .some ek =>
+    match fromFieldLayoutsOpt with
+    | .some flIdx => .some { kind := ek, layoutIdx := flIdx }
+    | .none =>
+      match findDeclOrContainerElemTyWithKind? localDecls layouts ek with
+      | .some declTy => .some declTy
+      | .none => .some { kind := ek, layoutIdx := synthKindLayoutIdx layouts ek }
+  | .none => .none
 
 /--
 Resolve a non-zero intra-allocation byte offset `offsetBytes` from a field-based
@@ -3282,7 +4028,7 @@ def resolveStackThinPtrFieldOffsetProj?
     (indexLocals : List LocalSlot)
     (targetRootVal : Value)
     (targetLocal : Local)
-    (normTargetProj : List ProjectionElem)
+    (windowTargetProj : List ProjectionElem)
     (leafFieldTy : Ty)
     (offsetBytes : Nat)
     (restProj : List ProjectionElem)
@@ -3291,32 +4037,27 @@ def resolveStackThinPtrFieldOffsetProj?
     (pointeeTyOpt : Option Ty)
     (reqBytesOpt : Option Nat := .none) :
     Option (List ProjectionElem × Nat) :=
-  let (encProj, relProj) := splitAfterLastSeqProj normTargetProj
+  let (encProj, rawRelProj) := splitAfterLastSeqProj windowTargetProj
+  let relProj := normalizeSubsliceProjections rawRelProj
   match readProjectedValue indexLocals targetRootVal encProj with
   | .ok (.aggregate encVar encFields) =>
     let encVal := Value.aggregate encVar encFields
     let encTyOpt : Option Ty :=
       match
-        placeTy
+        placeTyResolved
           localDecls
           layouts
           { local_ := targetLocal, projection := encProj }
       with
-      | .some rawEncTy =>
-        match Nat.beq rawEncTy.layoutIdx 0 with
-        | false => .some rawEncTy
-        | true =>
-          match findDeclTyWithKind? localDecls rawEncTy.kind with
-          | .some declTy => .some declTy
-          | .none => .some rawEncTy
+      | .some rawEncTy => .some (resolveTyWithLocalDecls localDecls layouts rawEncTy)
       | .none => .none
     match
-      projectionChainByteOffset? layouts encTyOpt (.some encVal) .none 0 relProj
+      projectionChainByteOffset? layouts encTyOpt (.some encVal) .none 0 localDecls relProj
     with
     | .none => .none
     | .some startByteOff =>
       let leafValOpt : Option Value :=
-        match readProjectedValue indexLocals targetRootVal normTargetProj with
+        match readProjectedValue indexLocals targetRootVal windowTargetProj with
         | .ok lv => .some lv
         | _ => .none
       let expectedElemBytesOpt : Option Nat :=
@@ -3325,21 +4066,21 @@ def resolveStackThinPtrFieldOffsetProj?
         | _, _ =>
           match pointeeTyOpt with
           | .some pt =>
-            match rigidTyByteSize layouts pt with
+            match tyByteSize localDecls layouts pt with
             | .some sz => .some sz
             | .none =>
-              match rigidTyByteSize layouts leafFieldTy with
+              match tyByteSize localDecls layouts leafFieldTy with
               | .some sz => .some sz
               | .none =>
                 match leafValOpt with
-                | .some lv => inferValueCReprBytes lv
+                | .some lv => flatValueByteSize? lv
                 | .none => .none
           | .none =>
-            match rigidTyByteSize layouts leafFieldTy with
+            match tyByteSize localDecls layouts leafFieldTy with
             | .some sz => .some sz
             | .none =>
               match leafValOpt with
-              | .some lv => inferValueCReprBytes lv
+              | .some lv => flatValueByteSize? lv
               | .none => .none
       match expectedElemBytesOpt with
       | .none => .none
@@ -3354,20 +4095,13 @@ def resolveStackThinPtrFieldOffsetProj?
               match Nat.beq encVar 0 with
               | false => .some 0
               | true =>
-                let subInitPlace : Place := {
-                  local_ := targetLocal
-                  projection := subInitProj
-                }
                 let elemSz :=
-                  match placeTy localDecls layouts subInitPlace with
-                  | .some parentTy =>
-                    match elemTyOf parentTy with
-                    | .some elemTy =>
-                      match rigidTyByteSize layouts elemTy with
-                      | .some n => n
-                      | .none => inferElemListByteStride encFields
-                    | .none => inferElemListByteStride encFields
-                  | .none => inferElemListByteStride encFields
+                  resolveSeqContainerElemByteStride
+                    localDecls
+                    layouts
+                    targetLocal
+                    subInitProj
+                    encFields
                 .some (Nat.mul (length encFields) elemSz)
             | .none =>
               match encTyOpt with
@@ -3375,22 +4109,28 @@ def resolveStackThinPtrFieldOffsetProj?
                 match lookupAggregateLayout? layouts encTy encVar encFields with
                 | .some l => .some l.size.bytes
                 | .none =>
-                  match inferValueCReprBytes encVal with
+                  match tyByteSize localDecls layouts encTy with
                   | .some sz => .some sz
-                  | .none => rigidTyByteSize layouts encTy
-              | .none => inferValueCReprBytes encVal
+                  | .none =>
+                    match encVar, encFields with
+                    | 0, onlyField :: .nil => flatValueByteSize? onlyField
+                    | _, _ => .some 0
+              | .none =>
+                match Bool.and (Nat.beq encVar 0) (isHomogeneousUntypedFields encFields) with
+                | true => inferValueCReprBytes encVal
+                | false => .some 0
           let inBounds : Bool :=
             match enclosingBytesOpt with
             | .some encBytes =>
               Nat.ble (Nat.add targetByteOff expectedElemBytes) encBytes
-            | .none => true
+            | .none => false
           match inBounds with
           | false => .none
           | true =>
             let defaultLeafTy : Ty :=
               match pointeeTyOpt with
-              | .some pt => pt
-              | .none => leafFieldTy
+              | .some pt => resolveTyWithLocalDecls localDecls layouts pt
+              | .none => resolveTyWithLocalDecls localDecls layouts leafFieldTy
             let leafIsAggregate : Bool :=
               match defaultLeafTy.kind with
               | .adt _ _ => true
@@ -3412,6 +4152,7 @@ def resolveStackThinPtrFieldOffsetProj?
                 leafIsAggregate
                 defaultLeafTy
                 (endsWithSubslice encProj)
+                localDecls
             with
             | .none => .none
             | .some (resolvedRelProj, resOff) =>
@@ -3430,96 +4171,6 @@ def resolveStackThinPtrFieldOffsetProj?
   | _ => .none
 
 /--
-Resolve the element byte stride of a sequence container at
-`(targetLocal, containerProj)` whose runtime elements are `elems`.
--/
-@[reducible]
-def resolveSeqContainerElemByteStride
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (targetLocal : Local)
-    (containerProj : List ProjectionElem)
-    (elems : List Value) :
-    Nat :=
-  let containerTyOpt :=
-    placeTy localDecls layouts { local_ := targetLocal, projection := containerProj }
-  let layoutStrideOpt : Option Nat :=
-    match containerTyOpt with
-    | .some cTy =>
-      let resolvedCTy :=
-        match Nat.beq cTy.layoutIdx 0 with
-        | false => cTy
-        | true =>
-          match findDeclTyWithKind? localDecls cTy.kind with
-          | .some dt => dt
-          | .none => cTy
-      match LayoutTable.lookup layouts resolvedCTy.layoutIdx with
-      | .some { fields := .array stride _, .. } =>
-        match Nat.ble 1 stride.bytes with
-        | true => .some stride.bytes
-        | false => .none
-      | _ => .none
-    | .none => .none
-  match layoutStrideOpt with
-  | .some s => s
-  | .none =>
-    match elems with
-    | .aggregate 0 eFields :: _ =>
-      match inferValueCReprBytes (.aggregate 0 eFields) with
-      | .some sz => sz
-      | .none => inferElemListByteStride elems
-    | _ => inferElemListByteStride elems
-
-/--
-Resolve the element `Ty` of a sequence container at `(targetLocal,
-containerProj)`: the element layout index recorded by the container's own
-`TypeLayout` (`fieldLayouts`), else a structurally equal `LocalDecl`
-(`findDeclTyWithKind?`), else the bare element kind with the out-of-range
-`unresolvedLayoutIdx`. Untyped containers yield `.none`. The runtime elements
-and stride are not consulted: no layout is ever guessed from the shape of the
-values.
--/
-@[reducible]
-def resolveSeqContainerElemTyOpt
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (targetLocal : Local)
-    (containerProj : List ProjectionElem)
-    (_elems : List Value)
-    (_elemSz : Nat) :
-    Option Ty :=
-  let containerTyOpt :=
-    placeTy localDecls layouts { local_ := targetLocal, projection := containerProj }
-  let elemKindOpt : Option RigidTy :=
-    match containerTyOpt with
-    | .some { kind := .array ek _, .. } => .some ek
-    | .some { kind := .slice ek, .. } => .some ek
-    | _ => .none
-  let fromFieldLayoutsOpt : Option Nat :=
-    match containerTyOpt with
-    | .some cTy =>
-      let resolvedCTy :=
-        match Nat.beq cTy.layoutIdx 0 with
-        | false => cTy
-        | true =>
-          match findDeclTyWithKind? localDecls cTy.kind with
-          | .some dt => dt
-          | .none => cTy
-      match LayoutTable.lookup layouts resolvedCTy.layoutIdx with
-      | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } => .some flIdx
-      | _ => .none
-    | .none => .none
-  match elemKindOpt with
-  | .some ek =>
-    match fromFieldLayoutsOpt with
-    | .some flIdx => .some { kind := ek, layoutIdx := flIdx }
-    | .none =>
-      match findDeclTyWithKind? localDecls ek with
-      | .some declTy => .some declTy
-      | .none => .some { kind := ek, layoutIdx := unresolvedLayoutIdx layouts }
-  | .none => .none
-
-/--
 Resolve the effective target projection path `(fullProj, residualBytes)` on
 `entry.targetLocal` when dereferencing, writing through, or reborrowing a
 stack-backed thin pointer `Value.ptr ptrVal sz` (`BorrowEntry` `entry`) with
@@ -3529,7 +4180,7 @@ post-deref projection suffix `restProj`.
   boundary, and `> 0` when `restProj = .nil` and the access lands at an
   intra-element or intra-field byte offset within a wider scalar leaf.
 - Heterogeneous variant-0 aggregates (such as `(u8, u32)` tuples without an
-  in-scope `LocalDecl`) are guarded by `elemsHaveUniformByteStride` so they are
+  in-scope `LocalDecl`) are guarded by `isHomogeneousUntypedFields` so they are
   never misclassified as homogeneous `[T; N]` arrays.
 -/
 def resolveStackThinPtrTargetProjWithResidual?
@@ -3548,7 +4199,7 @@ def resolveStackThinPtrTargetProjWithResidual?
     | .some n => .some n
     | .none =>
       match pointeeTyOpt with
-      | .some pt => rigidTyByteSize layouts pt
+      | .some pt => tyByteSize localDecls layouts pt
       | .none => .none
   let leafIsAgg : Bool :=
     match pointeeTyOpt with
@@ -3563,6 +4214,8 @@ def resolveStackThinPtrTargetProjWithResidual?
     | ph :: pt => ph :: appendProjections pt restProj
   let normTargetProj :=
     normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
+  let windowTargetProj :=
+    normalizeAdjacentSubslices (stripTransparentProjections entry.targetProjection)
   let isElemPtrAtZero : Bool :=
     match endsWithSubslice normTargetProj, pointeeTyOpt with
     | false, .none => false
@@ -3585,7 +4238,7 @@ def resolveStackThinPtrTargetProjWithResidual?
             | false => false
             | true =>
               match
-                placeTy
+                placeTyResolved
                   localDecls
                   layouts
                   { local_ := entry.targetLocal, projection := normTargetProj }
@@ -3602,7 +4255,7 @@ def resolveStackThinPtrTargetProjWithResidual?
   match Nat.beq ptrVal.offsetBytes 0, isElemPtrAtZero with
   | true, false => .some (rawFullProj, 0)
   | _, _ =>
-    match splitLastConstantIndex? normTargetProj with
+    match splitLastConstantIndex? windowTargetProj with
     | .some (initProj, baseIdx, minLen) =>
       match readProjectedValue indexLocals targetRootVal initProj with
       | .ok (.aggregate 0 elems) =>
@@ -3644,8 +4297,8 @@ def resolveStackThinPtrTargetProjWithResidual?
               | true =>
                 let defaultLeafTy : Ty :=
                   match pointeeTyOpt with
-                  | .some pt => pt
-                  | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+                  | .some pt => resolveTyWithLocalDecls localDecls layouts pt
+                  | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                 match
                   resolveAggregateAtByteOffset?
                     8
@@ -3657,6 +4310,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                     leafIsAgg
                     defaultLeafTy
                     false
+                    localDecls
                 with
                 | .some (innerProj, innerRes) =>
                   let elemProj := ProjectionElem.constantIndex idx 0 false :: innerProj
@@ -3711,8 +4365,8 @@ def resolveStackThinPtrTargetProjWithResidual?
                 | .some (.aggregate eVar eFields) =>
                   let defaultLeafTy : Ty :=
                     match pointeeTyOpt with
-                    | .some pt => pt
-                    | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+                    | .some pt => resolveTyWithLocalDecls localDecls layouts pt
+                    | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                   match
                     resolveAggregateAtByteOffset?
                       8
@@ -3724,6 +4378,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                       leafIsAgg
                       defaultLeafTy
                       false
+                      localDecls
                   with
                   | .some (innerProj, innerRes) =>
                     let elemProj := ProjectionElem.constantIndex idx 0 false :: innerProj
@@ -3740,13 +4395,12 @@ def resolveStackThinPtrTargetProjWithResidual?
       let resolveSeqAtNormTarget : Option (List ProjectionElem × Nat) :=
         match readProjectedValue indexLocals targetRootVal normTargetProj with
         | .ok (.aggregate 0 elems) =>
-          let rawStride := inferElemListByteStride elems
           let isSeqCandidate : Bool :=
             match endsWithSubslice normTargetProj with
             | true => true
             | false =>
               match
-                placeTy
+                placeTyResolved
                   localDecls
                   layouts
                   { local_ := entry.targetLocal, projection := normTargetProj }
@@ -3756,7 +4410,7 @@ def resolveStackThinPtrTargetProjWithResidual?
               | .some { kind := .adt _ _, .. } => false
               | .some { kind := .tuple _, .. } => false
               | .some { kind := .closure _ _, .. } => false
-              | _ => elemsHaveUniformByteStride elems rawStride
+              | _ => Bool.and (Nat.ble 1 (length elems)) (isHomogeneousUntypedFields elems)
           match isSeqCandidate with
           | false => .none
           | true =>
@@ -3811,8 +4465,8 @@ def resolveStackThinPtrTargetProjWithResidual?
                     | true =>
                       let defaultLeafTy : Ty :=
                         match pointeeTyOpt with
-                        | .some pt => pt
-                        | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+                        | .some pt => resolveTyWithLocalDecls localDecls layouts pt
+                        | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                       match
                         resolveAggregateAtByteOffset?
                           8
@@ -3824,6 +4478,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                           leafIsAgg
                           defaultLeafTy
                           false
+                          localDecls
                       with
                       | .some (innerProj, innerRes) =>
                         let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: innerProj
@@ -3873,8 +4528,8 @@ def resolveStackThinPtrTargetProjWithResidual?
                     | .some (.aggregate eVar eFields) =>
                       let defaultLeafTy : Ty :=
                         match pointeeTyOpt with
-                        | .some pt => pt
-                        | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+                        | .some pt => resolveTyWithLocalDecls localDecls layouts pt
+                        | .none => { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
                       match
                         resolveAggregateAtByteOffset?
                           8
@@ -3886,6 +4541,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                           leafIsAgg
                           defaultLeafTy
                           false
+                          localDecls
                       with
                       | .some (innerProj, innerRes) =>
                         let elemProj := ProjectionElem.constantIndex elemOffset 0 false :: innerProj
@@ -3922,7 +4578,7 @@ def resolveStackThinPtrTargetProjWithResidual?
               indexLocals
               targetRootVal
               entry.targetLocal
-              normTargetProj
+              windowTargetProj
               leafFieldTy
               ptrVal.offsetBytes
               restProj
@@ -3938,7 +4594,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                 indexLocals
                 targetRootVal
                 entry.targetLocal
-                normTargetProj
+                windowTargetProj
                 leafFieldTy
                 ptrVal.offsetBytes
                 restProj
@@ -3951,7 +4607,7 @@ def resolveStackThinPtrTargetProjWithResidual?
             indexLocals
             targetRootVal
             entry.targetLocal
-            normTargetProj
+            windowTargetProj
             leafFieldTy
             ptrVal.offsetBytes
             restProj
@@ -3965,13 +4621,14 @@ def resolveStackThinPtrTargetProjWithResidual?
           | .some pt => .some pt
           | .none =>
             match reqBytesOpt with
-            | .some reqB => .some { kind := uintRigidTyOfStride reqB, layoutIdx := 0 }
+            | .some reqB =>
+              .some { kind := uintRigidTyOfStride reqB, layoutIdx := unresolvedLayoutIdx layouts }
             | .none => .none
         match endsWithSubslice normTargetProj, fallbackLeafTyOpt with
         | false, .some pt =>
           let targetIsStructLike : Bool :=
             match
-              placeTy
+              placeTyResolved
                 localDecls
                 layouts
                 { local_ := entry.targetLocal, projection := normTargetProj }
@@ -3986,7 +4643,7 @@ def resolveStackThinPtrTargetProjWithResidual?
               indexLocals
               targetRootVal
               entry.targetLocal
-              normTargetProj
+              windowTargetProj
               pt
               ptrVal.offsetBytes
               restProj
@@ -4002,7 +4659,7 @@ def resolveStackThinPtrTargetProjWithResidual?
                 indexLocals
                 targetRootVal
                 entry.targetLocal
-                normTargetProj
+                windowTargetProj
                 pt
                 ptrVal.offsetBytes
                 restProj
@@ -4021,7 +4678,7 @@ def resolveStackThinPtrTargetProjWithResidual?
               indexLocals
               targetRootVal
               entry.targetLocal
-              normTargetProj
+              windowTargetProj
               pt
               ptrVal.offsetBytes
               restProj
@@ -4125,56 +4782,88 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 > place expression context."
 -/
 @[reducible]
+def foldTupleMaxAlignAux
+    (recKind : RigidTy → Nat)
+    (acc : Nat) :
+    List RigidTy → Nat
+  | .nil => acc
+  | fk :: rest =>
+    let fa := recKind fk
+    let next :=
+      match Nat.ble acc fa with
+      | true => fa
+      | false => acc
+    foldTupleMaxAlignAux recKind next rest
+
+@[reducible]
+def tyByteAlignAux
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Nat → Ty → Nat
+  | .zero, _ => 1
+  | .succ fuel, ty =>
+    let rTy := resolveTyWithLocalDecls localDecls layouts ty
+    let directLayoutAlignOpt : Option Nat :=
+      match LayoutTable.lookup layouts rTy.layoutIdx with
+      | .none => .none
+      | .some l =>
+        let ok : Bool :=
+          match rTy.kind with
+          | .adt _ _ | .closure _ _ => layoutValidForAdt l
+          | .tuple ks => layoutMatchesAggregateVariant l 0 (length ks)
+          | .array _ n =>
+            match l.fields with
+            | .array _ count => Nat.beq count n
+            | _ => false
+          | _ =>
+            match l.fields, rigidTyByteSize layouts rTy with
+            | .primitive, .some sz =>
+              Bool.and (Bool.not (isUnresolvedLayoutIdx layouts rTy.layoutIdx)) (Nat.beq l.size.bytes sz)
+            | _, _ => false
+        match ok with
+        | false => .none
+        | true =>
+          match Nat.ble 1 l.align.bytes with
+          | true => .some l.align.bytes
+          | false => .some 1
+    match directLayoutAlignOpt with
+    | .some a => a
+    | .none =>
+      match tyKindByteAlign layouts rTy.kind with
+      | .some a =>
+        match Nat.ble 1 a with
+        | true => a
+        | false => 1
+      | .none =>
+        match findArrayElemStrideAndAlign? layouts localDecls rTy.kind with
+        | .some (_, a) => a
+        | .none =>
+          match rTy.kind with
+          | .array elem _ | .slice elem =>
+            tyByteAlignAux
+              localDecls
+              layouts
+              fuel
+              { kind := elem, layoutIdx := unresolvedLayoutIdx layouts }
+          | .tuple (k :: ks) =>
+            foldTupleMaxAlignAux
+              (fun fk =>
+                tyByteAlignAux
+                  localDecls
+                  layouts
+                  fuel
+                  { kind := fk, layoutIdx := unresolvedLayoutIdx layouts })
+              1
+              (k :: ks)
+          | _ => 1
+
+@[reducible]
 def tyByteAlign
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (ty : Ty) :
     Nat :=
-  let capturedAlignOpt : Option Nat :=
-    match Nat.beq ty.layoutIdx 0 with
-    | true => .none
-    | false =>
-      match LayoutTable.lookup layouts ty.layoutIdx with
-      | .some l => .some l.align.bytes
-      | .none => .none
-  let structuralAlignOpt : Option Nat :=
-    match capturedAlignOpt with
-    | .some a => .some a
-    | .none => tyKindByteAlign layouts ty.kind
-  match structuralAlignOpt with
-  | .some a =>
-    match Nat.ble 1 a with
-    | true => a
-    | false => 1
-  | .none =>
-    let resolvedLayoutOpt : Option TypeLayout :=
-      match Nat.beq ty.layoutIdx 0 with
-      | false => LayoutTable.lookup layouts ty.layoutIdx
-      | true =>
-        match findDeclTyWithKind? localDecls ty.kind with
-        | .some declTy => LayoutTable.lookup layouts declTy.layoutIdx
-        | .none =>
-          match localDecls with
-          | .nil => LayoutTable.lookup layouts 0
-          | _ :: _ => .none
-    match resolvedLayoutOpt with
-    | .some l =>
-      match Nat.ble 1 l.align.bytes with
-      | true => l.align.bytes
-      | false => 1
-    | .none =>
-      match ty.kind with
-      | .array elem _ | .slice elem =>
-        match findDeclTyWithKind? localDecls elem with
-        | .some elemDeclTy =>
-          match LayoutTable.lookup layouts elemDeclTy.layoutIdx with
-          | .some l =>
-            match Nat.ble 1 l.align.bytes with
-            | true => l.align.bytes
-            | false => 1
-          | .none => 1
-        | .none => 1
-      | _ => 1
+  tyByteAlignAux localDecls layouts 8 ty
 
 /--
 Check whether byte offset `offsetBytes` satisfies the required alignment of
@@ -4303,26 +4992,13 @@ def allFlatScalarValues : List Value → Bool
   | _ :: _ => false
 
 /--
-`true` for the primitive scalar kinds (`bool`, `char`, integers, floats), whose
-`encodeValueToBytes` image never consults a `LayoutTable` entry.
--/
-@[reducible]
-def isPrimitiveScalarKind : RigidTy → Bool
-  | .bool => true
-  | .char => true
-  | .int _ => true
-  | .uint _ => true
-  | .float _ => true
-  | _ => false
-
-/--
 Resolve a layout-faithful `Ty` for an aggregate `baseTy` with runtime variant
 `varIdx` and field list `fields`:
 - For arrays/slices of a primitive scalar kind, `baseTy` is layout-faithful directly.
-- Otherwise, resolves `baseTy.layoutIdx == 0` via `findDeclTyWithKind? localDecls`
-  when `localDecls` is non-empty, requires a captured `TypeLayout` entry at the
-  resolved `layoutIdx` that matches `(varIdx, length fields)` (`layoutMatchesAggregateVariant`),
-  and requires all field values to be flat scalars (`allFlatScalarValues fields`).
+- Otherwise, resolves `baseTy` via `resolveTyWithLocalDecls localDecls layouts`,
+  requires a captured `TypeLayout` entry at the resolved `layoutIdx` that matches
+  `(varIdx, length fields)` (`layoutMatchesAggregateVariant`), and requires all
+  field values to be flat scalars (`allFlatScalarValues fields`).
 -/
 @[reducible]
 def resolveFaithfulAggregateTy?
@@ -4345,22 +5021,13 @@ def resolveFaithfulAggregateTy?
     match allFlatScalarValues fields with
     | false => .none
     | true =>
-      let resolvedTyOpt : Option Ty :=
-        match Nat.beq baseTy.layoutIdx 0 with
-        | false => .some baseTy
-        | true =>
-          match localDecls with
-          | .nil => .some baseTy
-          | _ :: _ => findDeclTyWithKind? localDecls baseTy.kind
-      match resolvedTyOpt with
+      let resolvedTy := resolveTyWithLocalDecls localDecls layouts baseTy
+      match LayoutTable.lookup layouts resolvedTy.layoutIdx with
+      | .some l =>
+        match layoutMatchesAggregateVariant l varIdx (length fields) with
+        | true => .some resolvedTy
+        | false => .none
       | .none => .none
-      | .some resolvedTy =>
-        match LayoutTable.lookup layouts resolvedTy.layoutIdx with
-        | .some l =>
-          match layoutMatchesAggregateVariant l varIdx (length fields) with
-          | true => .some resolvedTy
-          | false => .none
-        | .none => .none
 
 /--
 `true` when `encodeValueToBytes layouts baseTy` of an aggregate with field
@@ -4404,7 +5071,8 @@ def decodeSubValueAtByteOffset?
     (accTy : Ty)
     (localDecls : List LocalDecl := .nil) :
     Option Value :=
-  match rigidTyByteSize layouts accTy with
+  let rAccTy := resolveTyWithLocalDecls localDecls layouts accTy
+  match tyByteSize localDecls layouts rAccTy with
   | .none => .none
   | .some reqBytes =>
     let encodedOpt : Option (List AbstractByte) :=
@@ -4422,7 +5090,7 @@ def decodeSubValueAtByteOffset?
       match sliceAbstractBytes encodedBytes offsetBytes reqBytes with
       | .none => .none
       | .some sliceBytes =>
-        decodeValueFromBytes defaultCodecFuel layouts accTy sliceBytes
+        decodeValueFromBytes defaultCodecFuel layouts rAccTy sliceBytes
 
 /--
 Byte-offset decoding fallback for a typed thin-pointer dereference read `*ptr`
@@ -4506,13 +5174,18 @@ def evalStackThinPtrTypedDerefRead
     | .field _ _ :: _, .some { kind := .float _, .. } => true
     | _, _ => false
   let effPointeeTyOpt : Option Ty :=
-    match isSyntheticFieldOnScalarPointee with
-    | true => .none
-    | false => pointeeTyOpt
+    match isSyntheticFieldOnScalarPointee, pointeeTyOpt with
+    | true, _ => .none
+    | false, .some pt => .some (resolveTyWithLocalDecls localDecls layouts pt)
+    | false, .none => .none
+  let resolvedAccTyOpt : Option Ty :=
+    match accessedTyOpt with
+    | .some accTy => .some (resolveTyWithLocalDecls localDecls layouts accTy)
+    | .none => .none
   let alignTyOpt : Option Ty :=
     match effPointeeTyOpt, restProj with
     | .some pt, _ => .some pt
-    | .none, .nil => accessedTyOpt
+    | .none, .nil => resolvedAccTyOpt
     | .none, _ :: _ => .none
   match checkDerefAlign localDecls layouts alignTyOpt ptrVal.offsetBytes with
   | false => .ub
@@ -4525,14 +5198,14 @@ def evalStackThinPtrTypedDerefRead
     | true, .nil =>
       match readProjectedValue locals targetRootVal rawFullProj with
       | .ok fieldVal =>
-        match validateValueForTy? layouts accessedTyOpt fieldVal with
+        match validateValueForTy? layouts resolvedAccTyOpt fieldVal with
         | true => .ok fieldVal locals
         | false => .ub
       | .ub => .ub
       | .unsupported => .unsupported
     | _, _ =>
       let scalarSliceFastOpt : Option PlaceReadResult :=
-        match restProj, accessedTyOpt with
+        match restProj, resolvedAccTyOpt with
         | .nil, .some accTy =>
           match tyScalarBytes accTy with
           | .some reqBytes =>
@@ -4541,7 +5214,7 @@ def evalStackThinPtrTypedDerefRead
               match extractScalarSlice? sc ptrVal.offsetBytes reqBytes with
               | .some slicedSc =>
                 let v := Value.scalar slicedSc
-                match validateValueForTy? layouts accessedTyOpt v with
+                match validateValueForTy? layouts resolvedAccTyOpt v with
                 | true => .some (.ok v locals)
                 | false => .some .ub
               | .none => .none
@@ -4552,8 +5225,8 @@ def evalStackThinPtrTypedDerefRead
       | .some res => res
       | .none =>
         let reqBytesOpt : Option Nat :=
-          match restProj, accessedTyOpt with
-          | .nil, .some accTy => rigidTyByteSize layouts accTy
+          match restProj, resolvedAccTyOpt with
+          | .nil, .some accTy => tyByteSize localDecls layouts accTy
           | _, _ => .none
         match
           resolveStackThinPtrTargetProjWithResidual?
@@ -4576,12 +5249,12 @@ def evalStackThinPtrTypedDerefRead
               ptrVal
               restProj
               layouts
-              accessedTyOpt
+              resolvedAccTyOpt
               targetTyOpt
               targetDecls
           with
           | .some decodedVal =>
-            match validateValueForTy? layouts accessedTyOpt decodedVal with
+            match validateValueForTy? layouts resolvedAccTyOpt decodedVal with
             | true => .ok decodedVal locals
             | false => .ub
           | .none => .ub
@@ -4589,7 +5262,7 @@ def evalStackThinPtrTypedDerefRead
           match readProjectedValue locals targetRootVal fullProj with
           | .ok fieldVal =>
             let finalValOpt : Option Value :=
-              match accessedTyOpt, fieldVal with
+              match resolvedAccTyOpt, fieldVal with
               | .some accTy, .scalar fSc =>
                 match tyScalarBytes accTy with
                 | .some reqBytes =>
@@ -4610,7 +5283,7 @@ def evalStackThinPtrTypedDerefRead
                         ptrVal
                         restProj
                         layouts
-                        accessedTyOpt
+                        resolvedAccTyOpt
                         targetTyOpt
                         targetDecls
                 | .none =>
@@ -4627,7 +5300,7 @@ def evalStackThinPtrTypedDerefRead
                     ptrVal
                     restProj
                     layouts
-                    accessedTyOpt
+                    resolvedAccTyOpt
                     targetTyOpt
                     targetDecls
                 | .none =>
@@ -4641,7 +5314,7 @@ def evalStackThinPtrTypedDerefRead
             match finalValOpt with
             | .none => .ub
             | .some finalVal =>
-              match validateValueForTy? layouts accessedTyOpt finalVal with
+              match validateValueForTy? layouts resolvedAccTyOpt finalVal with
               | true => .ok finalVal locals
               | false => .ub
           | .ub => .ub
@@ -4765,13 +5438,19 @@ def evalSliceFatPtrDerefRead
       match lookupGlobalAlloc globals ptrVal.allocId with
       | .some alloc =>
         let elemSz :=
-          match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+          match
+            tyByteSize
+              localDecls
+              layouts
+              { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+          with
           | .some n => n
           | .none => 1
         let totalBytes := Nat.mul lenSc.bits elemSz
         match globalAllocSliceToAbstractBytes alloc ptrVal.offsetBytes totalBytes with
         | .some absBytes =>
-          let sliceArrTy : Ty := { kind := .array elemKind lenSc.bits, layoutIdx := 0 }
+          let sliceArrTy : Ty :=
+            { kind := .array elemKind lenSc.bits, layoutIdx := unresolvedLayoutIdx layouts }
           match decodeValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes with
           | .some decodedVal =>
             match readProjectedValue locals decodedVal restProj with
@@ -4822,11 +5501,11 @@ def evalPlaceRead
     (callerLocals : List LocalSlot := .nil)
     (localDecls : List LocalDecl := .nil) :
     PlaceReadResult :=
-  let accessedTyOpt := placeTy localDecls layouts p
   match p.projection with
   | .deref :: restProj =>
+    let accessedTyOpt := placeTyResolved localDecls layouts p
     let pointeeTyOpt :=
-      placeTy localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
+      placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
     match get? locals p.local_ with
     | .some (.init (.ptr ptrVal sz)) =>
       match lookupBorrow borrows ptrVal.tag with
@@ -4846,7 +5525,7 @@ def evalPlaceRead
               layouts
               pointeeTyOpt
               accessedTyOpt
-              (placeTy
+              (placeTyResolved
                 localDecls
                 layouts
                 { local_ := entry.targetLocal, projection := entry.targetProjection })
@@ -4914,7 +5593,7 @@ def evalPlaceRead
     | .some (.init rootVal) =>
       match readProjectedValue locals rootVal p.projection with
       | .ok fieldVal =>
-        match validateValueForTy? layouts accessedTyOpt fieldVal with
+        match validateValueForTy? layouts (placeTy localDecls layouts p) fieldVal with
         | true => .ok fieldVal locals
         | false => .ub
       | .ub => .ub
@@ -5079,8 +5758,8 @@ def evalOperand
         | _ => .ub
       | _ :: _ =>
         let pointeeTyOpt :=
-          placeTy localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
-        let accessedTyOpt := placeTy localDecls layouts p
+          placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
+        let accessedTyOpt := placeTyResolved localDecls layouts p
         match get? locals p.local_ with
         | .some (.init (.ptr ptrVal sz)) =>
           match lookupBorrow borrows ptrVal.tag with
@@ -5100,7 +5779,7 @@ def evalOperand
                   layouts
                   pointeeTyOpt
                   accessedTyOpt
-                  (placeTy
+                  (placeTyResolved
                     localDecls
                     layouts
                     { local_ := entry.targetLocal, projection := entry.targetProjection })
@@ -5297,8 +5976,8 @@ def evalOperand
         | _ => .ub
       | _ :: _ =>
         let pointeeTyOpt :=
-          placeTy localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
-        let accessedTyOpt := placeTy localDecls layouts p
+          placeTyResolved localDecls layouts { local_ := p.local_, projection := .deref :: .nil }
+        let accessedTyOpt := placeTyResolved localDecls layouts p
         match get? locals p.local_ with
         | .some (.init (.ptr ptrVal sz)) =>
           match lookupBorrow borrows ptrVal.tag with
@@ -5318,7 +5997,7 @@ def evalOperand
                   layouts
                   pointeeTyOpt
                   accessedTyOpt
-                  (placeTy
+                  (placeTyResolved
                     localDecls
                     layouts
                     { local_ := entry.targetLocal, projection := entry.targetProjection })
@@ -5765,18 +6444,23 @@ def writeStackThinPtrTypedDeref
     | .field _ _ :: _, .some { kind := .float _, .. } => true
     | _, _ => false
   let effPointeeTyOpt : Option Ty :=
-    match isSyntheticFieldOnScalarPointee with
-    | true => .none
-    | false => pointeeTyOpt
+    match isSyntheticFieldOnScalarPointee, pointeeTyOpt with
+    | true, _ => .none
+    | false, .some pt => .some (resolveTyWithLocalDecls localDecls layouts pt)
+    | false, .none => .none
+  let resolvedAccTyOpt : Option Ty :=
+    match accessedTyOpt with
+    | .some accTy => .some (resolveTyWithLocalDecls localDecls layouts accTy)
+    | .none => .none
   let alignTyOpt : Option Ty :=
     match effPointeeTyOpt, restProj with
     | .some pt, _ => .some pt
-    | .none, .nil => accessedTyOpt
+    | .none, .nil => resolvedAccTyOpt
     | .none, _ :: _ => .none
   match
     Bool.and
       (checkDerefAlign localDecls layouts alignTyOpt ptrVal.offsetBytes)
-      (validateValueForTy? layouts accessedTyOpt val)
+      (validateValueForTy? layouts resolvedAccTyOpt val)
   with
   | false => .ub
   | true =>
@@ -5821,7 +6505,11 @@ def writeStackThinPtrTypedDeref
         let reqBytesOpt : Option Nat :=
           match restProj, val with
           | .nil, .scalar wSc => .some wSc.sizeBytes
-          | _, _ => .none
+          | .nil, _ =>
+            match resolvedAccTyOpt with
+            | .some accTy => tyByteSize localDecls layouts accTy
+            | .none => .none
+          | _ :: _, _ => .none
         let resolvedProjOpt : Option (List ProjectionElem × Nat) :=
           match isSyntheticFieldOnScalarPointee, entry.targetProjection with
           | true, .nil => .some (rawFullProj, 0)
@@ -5914,8 +6602,8 @@ def writePlaceValue
       | .none => .ub
   | .deref :: restProj =>
     let pointeeTyOpt :=
-      placeTy localDecls layouts { local_ := dst.local_, projection := .deref :: .nil }
-    let accessedTyOpt := placeTy localDecls layouts dst
+      placeTyResolved localDecls layouts { local_ := dst.local_, projection := .deref :: .nil }
+    let accessedTyOpt := placeTyResolved localDecls layouts dst
     match get? locals dst.local_ with
     | .some (.init (.ptr ptrVal _)) =>
       match lookupBorrow borrows ptrVal.tag with
@@ -6175,8 +6863,8 @@ def writeCallerPlaceValue
   match dst.projection with
   | .deref :: restProj =>
     let pointeeTyOpt :=
-      placeTy localDecls layouts { local_ := dst.local_, projection := .deref :: .nil }
-    let accessedTyOpt := placeTy localDecls layouts dst
+      placeTyResolved localDecls layouts { local_ := dst.local_, projection := .deref :: .nil }
+    let accessedTyOpt := placeTyResolved localDecls layouts dst
     match get? frameLocals dst.local_ with
     | .some (.init (.ptr ptrVal _)) =>
       match lookupBorrow borrows ptrVal.tag with
@@ -7886,11 +8574,11 @@ def evalUnsizeCoercion
                   let elemSz :=
                     match targetTy.kind with
                     | .ref _ (.slice dstElem) =>
-                      match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                      match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
                       | .some sz => sz
                       | .none => 1
                     | .rawPtr _ (.slice dstElem) =>
-                      match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                      match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
                       | .some sz => sz
                       | .none => 1
                     | _ => 1
@@ -7926,9 +8614,9 @@ def evalUnsizeCoercion
                   let dstElemSzOpt : Option Nat :=
                     match targetTy.kind with
                     | .ref _ (.slice dstElem) =>
-                      rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                      tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
                     | .rawPtr _ (.slice dstElem) =>
-                      rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                      tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
                     | _ => .none
                   match
                     readSliceBackingAggregate?
@@ -7986,9 +8674,9 @@ def evalUnsizeCoercion
                 let dstElemSzOpt : Option Nat :=
                   match targetTy.kind with
                   | .ref _ (.slice dstElem) =>
-                    rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                    tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
                   | .rawPtr _ (.slice dstElem) =>
-                    rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 }
+                    tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts }
                   | _ => .none
                 match
                   readSliceBackingAggregate?
@@ -8044,7 +8732,7 @@ def evalUnsizeCoercion
               match Bool.and mutOk (Nat.ble ptrVal.offsetBytes (length alloc.bytes)), dstElemOpt with
               | true, .some dstElem =>
                 let elemSz :=
-                  match rigidTyByteSize layouts { kind := dstElem, layoutIdx := 0 } with
+                  match tyByteSize localDecls layouts { kind := dstElem, layoutIdx := unresolvedLayoutIdx layouts } with
                   | .some n => n
                   | .none => 1
                 let remBytes := Nat.sub (length alloc.bytes) ptrVal.offsetBytes
@@ -8576,7 +9264,7 @@ def evalPlaceLen
                 let expSzOpt : Option Nat :=
                   match pTy with
                   | .some { kind := .slice elemKind, .. } =>
-                    rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+                    tyByteSize localDecls layouts { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
                   | _ => .none
                 match
                   readSliceBackingAggregate?
@@ -8607,7 +9295,7 @@ def evalPlaceLen
               let elemSz :=
                 match pTy with
                 | .some { kind := .slice elemKind, .. } =>
-                  match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                  match tyByteSize localDecls layouts { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } with
                   | .some n => n
                   | .none => 1
                 | _ => 1
@@ -8708,15 +9396,15 @@ def pointeeElemByteStride
   | .none => .some 1
   | .some ptrTy =>
     match pointeeTyOf ptrTy with
-    | .some pointeeTy =>
-      match rigidTyKindByteSize pointeeTy.kind with
+    | .some { kind := inner, .. } =>
+      match rigidTyKindByteSize inner with
       | .some sz => .some sz
       | .none =>
-        let resolvedPointeeTy :=
-          match findDeclTyWithKind? localDecls pointeeTy.kind with
+        let resolvedPointeeTy : Ty :=
+          match findDeclOrContainerElemTyWithKind? localDecls layouts inner with
           | .some declTy => declTy
-          | .none => pointeeTy
-        rigidTyByteSize layouts resolvedPointeeTy
+          | .none => { kind := inner, layoutIdx := unresolvedLayoutIdx layouts }
+        tyByteSize localDecls layouts resolvedPointeeTy
     | .none => .none
 
 /--
@@ -8789,7 +9477,9 @@ def ptrAllocByteBound?
             | _ => .none
         let normTargetProj :=
           normalizeSubsliceProjections (stripTransparentProjections entry.targetProjection)
-        match splitLastConstantIndex? normTargetProj with
+        let windowTargetProj :=
+          normalizeAdjacentSubslices (stripTransparentProjections entry.targetProjection)
+        match splitLastConstantIndex? windowTargetProj with
         | .some (initProj, baseIdx, minLen) =>
           match rootValOpt with
           | .some rootVal =>
@@ -8803,17 +9493,13 @@ def ptrAllocByteBound?
               | false => .some 0
               | true =>
                 let remElems := Nat.sub (length elems) baseIdx
-                let elemPlace : Place := {
-                  local_ := entry.targetLocal
-                  projection := normTargetProj
-                }
                 let elemSz :=
-                  match placeTy localDecls layouts elemPlace with
-                  | .some elemTy =>
-                    match rigidTyByteSize layouts elemTy with
-                    | .some n => n
-                    | .none => inferElemListByteStride elems
-                  | .none => inferElemListByteStride elems
+                  resolveSeqContainerElemByteStride
+                    localDecls
+                    layouts
+                    entry.targetLocal
+                    initProj
+                    elems
                 .some (Nat.mul remElems elemSz)
             | _ => .some 0
           | .none =>
@@ -8821,30 +9507,56 @@ def ptrAllocByteBound?
               local_ := entry.targetLocal
               projection := initProj
             }
-            match placeTy localDecls layouts initPlace with
+            match placeTyResolved localDecls layouts initPlace with
             | .some arrTy =>
               match arrTy.kind with
               | .array elemKind arrLen =>
-                match
-                  Bool.and
-                    (Nat.ble minLen arrLen)
-                    (Nat.ble baseIdx arrLen)
-                with
-                | false => .some 0
-                | true =>
-                  let remElems := Nat.sub arrLen baseIdx
-                  match LayoutTable.lookup layouts arrTy.layoutIdx with
-                  | .some layout =>
-                    match layout.fields with
-                    | .array stride _ => .some (Nat.mul remElems stride.bytes)
-                    | _ =>
-                      match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                let containerLenOpt : Option Nat :=
+                  match splitLastSubslice? initProj with
+                  | .none => .some arrLen
+                  | .some (_, fromIdx, toIdx, fromEnd) =>
+                    match fromEnd with
+                    | false =>
+                      match Bool.and (Nat.ble fromIdx toIdx) (Nat.ble toIdx arrLen) with
+                      | true => .some (Nat.sub toIdx fromIdx)
+                      | false => .none
+                    | true =>
+                      match Nat.ble (Nat.add fromIdx toIdx) arrLen with
+                      | true => .some (Nat.sub (Nat.sub arrLen toIdx) fromIdx)
+                      | false => .none
+                match containerLenOpt with
+                | .none => .some 0
+                | .some cLen =>
+                  match
+                    Bool.and
+                      (Nat.ble minLen cLen)
+                      (Nat.ble baseIdx cLen)
+                  with
+                  | false => .some 0
+                  | true =>
+                    let remElems := Nat.sub cLen baseIdx
+                    match LayoutTable.lookup layouts arrTy.layoutIdx with
+                    | .some layout =>
+                      match layout.fields with
+                      | .array stride _ => .some (Nat.mul remElems stride.bytes)
+                      | _ =>
+                        match
+                          tyByteSize
+                            localDecls
+                            layouts
+                            { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                        with
+                        | .some elemSz => .some (Nat.mul remElems elemSz)
+                        | .none => .some 0
+                    | .none =>
+                      match
+                        tyByteSize
+                          localDecls
+                          layouts
+                          { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                      with
                       | .some elemSz => .some (Nat.mul remElems elemSz)
                       | .none => .some 0
-                  | .none =>
-                    match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
-                    | .some elemSz => .some (Nat.mul remElems elemSz)
-                    | .none => .some 0
               | _ => .some 0
             | _ => .some 0
         | .none =>
@@ -8854,32 +9566,13 @@ def ptrAllocByteBound?
             | .some rootVal =>
               match readProjectedValue locals rootVal normTargetProj with
               | .ok (.aggregate 0 subElems) =>
-                let initPlace : Place := {
-                  local_ := entry.targetLocal
-                  projection := initProj
-                }
                 let elemSz :=
-                  match placeTy localDecls layouts initPlace with
-                  | .some parentTy =>
-                    match LayoutTable.lookup layouts parentTy.layoutIdx with
-                    | .some layout =>
-                      match layout.fields with
-                      | .array stride _ => stride.bytes
-                      | _ =>
-                        match elemTyOf parentTy with
-                        | .some elemTy =>
-                          match rigidTyByteSize layouts elemTy with
-                          | .some n => n
-                          | .none => inferElemListByteStride subElems
-                        | .none => inferElemListByteStride subElems
-                    | .none =>
-                      match elemTyOf parentTy with
-                      | .some elemTy =>
-                        match rigidTyByteSize layouts elemTy with
-                        | .some n => n
-                        | .none => inferElemListByteStride subElems
-                      | .none => inferElemListByteStride subElems
-                  | .none => inferElemListByteStride subElems
+                  resolveSeqContainerElemByteStride
+                    localDecls
+                    layouts
+                    entry.targetLocal
+                    initProj
+                    subElems
                 .some (Nat.mul (length subElems) elemSz)
               | _ => .some 0
             | .none =>
@@ -8887,7 +9580,7 @@ def ptrAllocByteBound?
                 local_ := entry.targetLocal
                 projection := initProj
               }
-              match placeTy localDecls layouts initPlace with
+              match placeTyResolved localDecls layouts initPlace with
               | .some arrTy =>
                 match arrTy.kind with
                 | .array elemKind arrLen =>
@@ -8908,11 +9601,21 @@ def ptrAllocByteBound?
                       match layout.fields with
                       | .array stride _ => .some (Nat.mul subLen stride.bytes)
                       | _ =>
-                        match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                        match
+                          tyByteSize
+                            localDecls
+                            layouts
+                            { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                        with
                         | .some elemSz => .some (Nat.mul subLen elemSz)
                         | .none => .some 0
                     | .none =>
-                      match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+                      match
+                        tyByteSize
+                          localDecls
+                          layouts
+                          { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
+                      with
                       | .some elemSz => .some (Nat.mul subLen elemSz)
                       | .none => .some 0
                   | .none => .some 0
@@ -8924,26 +9627,29 @@ def ptrAllocByteBound?
                 local_ := entry.targetLocal
                 projection := entry.targetProjection
               }
-              match placeTy localDecls layouts targetPlace with
+              match placeTyResolved localDecls layouts targetPlace with
               | .some projTy =>
-                match rigidTyByteSize layouts projTy with
+                match tyByteSize localDecls layouts projTy with
                 | .some n => .some n
-                | .none =>
-                  match rootValOpt with
-                  | .some rootVal =>
-                    projectedValueDefaultByteSize locals rootVal entry.targetProjection
-                  | .none => .some 0
+                | .none => .some 0
               | .none =>
                 match rootValOpt with
                 | .some rootVal =>
-                  projectedValueDefaultByteSize locals rootVal entry.targetProjection
+                  match readProjectedValue locals rootVal entry.targetProjection with
+                  | .ok (.aggregate 0 fs) =>
+                    match isHomogeneousUntypedFields fs with
+                    | true => inferValueCReprBytes (.aggregate 0 fs)
+                    | false => .some 0
+                  | .ok pv => valueDefaultByteSize pv
+                  | _ => .some 0
                 | .none => .some 0
-            match splitLastField? normTargetProj with
+            match splitLastField? windowTargetProj with
             | .none => fallbackTargetPlaceBytes
             | .some _ =>
-              let (encProj, relProj) := splitAfterLastSeqProj normTargetProj
+              let (encProj, rawRelProj) := splitAfterLastSeqProj windowTargetProj
+              let relProj := normalizeSubsliceProjections rawRelProj
               let encTyOpt :=
-                placeTy
+                placeTyResolved
                   localDecls
                   layouts
                   { local_ := entry.targetLocal, projection := encProj }
@@ -8971,27 +9677,12 @@ def ptrAllocByteBound?
                   match subInitValOpt with
                   | .some (.aggregate 0 subElems) =>
                     let elemSz :=
-                      match placeTy localDecls layouts subInitPlace with
-                      | .some parentTy =>
-                        match LayoutTable.lookup layouts parentTy.layoutIdx with
-                        | .some layout =>
-                          match layout.fields with
-                          | .array stride _ => stride.bytes
-                          | _ =>
-                            match elemTyOf parentTy with
-                            | .some elemTy =>
-                              match rigidTyByteSize layouts elemTy with
-                              | .some n => n
-                              | .none => inferElemListByteStride subElems
-                            | .none => inferElemListByteStride subElems
-                        | .none =>
-                          match elemTyOf parentTy with
-                          | .some elemTy =>
-                            match rigidTyByteSize layouts elemTy with
-                            | .some n => n
-                            | .none => inferElemListByteStride subElems
-                          | .none => inferElemListByteStride subElems
-                      | .none => inferElemListByteStride subElems
+                      resolveSeqContainerElemByteStride
+                        localDecls
+                        layouts
+                        entry.targetLocal
+                        subInitProj
+                        subElems
                     let subLenOpt : Option Nat :=
                       match fromEnd with
                       | false =>
@@ -9007,7 +9698,7 @@ def ptrAllocByteBound?
                     | .none => .some 0
                   | .some _ => .some 0
                   | .none =>
-                    match placeTy localDecls layouts subInitPlace with
+                    match placeTyResolved localDecls layouts subInitPlace with
                     | .some parentTy =>
                       match parentTy.kind with
                       | .array elemKind arrLen =>
@@ -9027,9 +9718,15 @@ def ptrAllocByteBound?
                             match layout.fields with
                             | .array stride _ => .some stride.bytes
                             | _ =>
-                              rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+                              tyByteSize
+                                localDecls
+                                layouts
+                                { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
                           | .none =>
-                            rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+                            tyByteSize
+                              localDecls
+                              layouts
+                              { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
                         match subLenOpt, elemSzOpt with
                         | .some subLen, .some elemSz => .some (Nat.mul subLen elemSz)
                         | _, _ => .some 0
@@ -9039,7 +9736,7 @@ def ptrAllocByteBound?
                   let encSzOpt_fromArray : Option Nat :=
                     match splitLastConstantIndex? encProj with
                     | .some (arrProj, _, _) =>
-                      match placeTy localDecls layouts { local_ := entry.targetLocal, projection := arrProj } with
+                      match placeTyResolved localDecls layouts { local_ := entry.targetLocal, projection := arrProj } with
                       | .some arrTy =>
                         match LayoutTable.lookup layouts arrTy.layoutIdx with
                         | .some layout =>
@@ -9053,16 +9750,14 @@ def ptrAllocByteBound?
                   | .some sz => .some sz
                   | .none =>
                     match encTyOpt with
-                    | .some encTy =>
-                      match rigidTyByteSize layouts encTy with
-                      | .some sz => .some sz
-                      | .none =>
-                        match encValOpt with
-                        | .some ev => inferValueCReprBytes ev
-                        | .none => .none
+                    | .some encTy => tyByteSize localDecls layouts encTy
                     | .none =>
                       match encValOpt with
-                      | .some ev => inferValueCReprBytes ev
+                      | .some (.aggregate 0 fs) =>
+                        match isHomogeneousUntypedFields fs with
+                        | true => inferValueCReprBytes (.aggregate 0 fs)
+                        | false => .none
+                      | .some ev => valueDefaultByteSize ev
                       | .none => .none
               match enclosingBytesOpt with
               | .none => fallbackTargetPlaceBytes
@@ -9074,6 +9769,7 @@ def ptrAllocByteBound?
                     encValOpt
                     .none
                     0
+                    localDecls
                     relProj
                 with
                 | .none => .some 0
@@ -9297,8 +9993,12 @@ def evalSliceFatPtrDerefBorrow
           | .some targetRootVal =>
             let expSzOpt : Option Nat :=
               match pointeeTyOpt with
-              | .some { kind := .slice elemKind, .. } =>
-                rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 }
+              | .some { kind := .slice elemKind, layoutIdx := pIdx } =>
+                let elemIdx :=
+                  match LayoutTable.lookup layouts pIdx with
+                  | .some { fieldLayouts := flIdx :: _, .. } => flIdx
+                  | _ => unresolvedLayoutIdx layouts
+                tyByteSize .nil layouts { kind := elemKind, layoutIdx := elemIdx }
               | _ => .none
             match
               readSliceBackingAggregate?
@@ -9492,8 +10192,15 @@ def evalSliceFatPtrDerefBorrow
                 | .array stride _ => uintRigidTyOfStride stride.bytes
                 | _ => .uint .u8
               | .none => .uint .u8
+          let elemIdx :=
+            match pointeeTyOpt with
+            | .some { layoutIdx := pIdx, .. } =>
+              match LayoutTable.lookup layouts pIdx with
+              | .some { fieldLayouts := flIdx :: _, .. } => flIdx
+              | _ => unresolvedLayoutIdx layouts
+            | .none => unresolvedLayoutIdx layouts
           let elemSz :=
-            match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+            match tyByteSize .nil layouts { kind := elemKind, layoutIdx := elemIdx } with
             | .some n => n
             | .none => 1
           let mutOk :=
@@ -9619,9 +10326,13 @@ def evalGlobalThinPtrDerefBorrow
       let remBytes := Nat.sub (length alloc.bytes) parentPtr.offsetBytes
       let (elemSz, maxElems) :=
         match pointeeTyOpt with
-        | .some { kind := .array elemKind arrLen, .. } =>
+        | .some { kind := .array elemKind arrLen, layoutIdx := pIdx } =>
+          let elemIdx :=
+            match LayoutTable.lookup layouts pIdx with
+            | .some { fieldLayouts := flIdx :: _, .. } => flIdx
+            | _ => unresolvedLayoutIdx layouts
           let sz :=
-            match rigidTyByteSize layouts { kind := elemKind, layoutIdx := 0 } with
+            match tyByteSize .nil layouts { kind := elemKind, layoutIdx := elemIdx } with
             | .some n => n
             | .none => 1
           (sz, arrLen)
@@ -9637,7 +10348,7 @@ def evalGlobalThinPtrDerefBorrow
         let reqBytes :=
           match pointeeTyOpt with
           | .some pointeeTy =>
-            match rigidTyByteSize layouts pointeeTy with
+            match tyByteSize .nil layouts pointeeTy with
             | .some n => n
             | .none => 0
           | .none => 0
@@ -9723,7 +10434,7 @@ def evalPlaceDiscriminant
     RvalueEvalResult :=
   match val with
   | .aggregate variantIdx fields =>
-    match placeTy localDecls layouts place with
+    match placeTyResolved localDecls layouts place with
     | .some pTy =>
       match pTy.kind with
       | .never => .ub
@@ -9772,7 +10483,7 @@ def evalPlaceDiscriminant
       | _ => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
     | .none => .ok (.scalar ⟨variantIdx, 8⟩) locals' mem
   | .scalar sc =>
-    match placeTy localDecls layouts place with
+    match placeTyResolved localDecls layouts place with
     | .some pTy =>
       match pTy.kind with
       | .never => .ub
@@ -9824,7 +10535,10 @@ def resolveRefDerefTarget?
     Option (Option (List ProjectionElem × Nat)) :=
   let reqBytesOpt : Option Nat :=
     match resolvedRest, accessedTyOpt with
-    | .nil, .some accTy => rigidTyByteSize layouts accTy
+    | .nil, .some accTy =>
+      match tyByteSize targetDecls layouts accTy with
+      | .some sz => .some sz
+      | .none => tyByteSize .nil layouts accTy
     | _, _ => .none
   let rawFull :=
     match parentEntry.targetProjection with
@@ -9906,7 +10620,10 @@ def resolveRawPtrDerefTarget?
     | ph :: pt => ph :: appendProjections pt resolvedRest
   let reqBytesOpt : Option Nat :=
     match resolvedRest, accessedTyOpt with
-    | .nil, .some accTy => rigidTyByteSize layouts accTy
+    | .nil, .some accTy =>
+      match tyByteSize targetDecls layouts accTy with
+      | .some sz => .some sz
+      | .none => tyByteSize .nil layouts accTy
     | _, _ => .none
   match isSyntheticFieldOnScalarPointee, parentEntry.targetProjection with
   | true, .nil => .some (rawFull, 0)
@@ -10127,8 +10844,8 @@ def evalRvalue
     match place.projection with
     | .deref :: restProj =>
       let pointeeTyOpt :=
-        placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
-      let accessedTyOpt := placeTy localDecls layouts place
+        placeTyResolved localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+      let accessedTyOpt := placeTyResolved localDecls layouts place
       let isSyntheticFieldOnScalarPointee : Bool :=
         match stripTransparentProjections restProj, pointeeTyOpt with
         | .field _ _ :: _, .some { kind := .bool, .. } => true
@@ -10291,8 +11008,8 @@ def evalRvalue
     match place.projection with
     | .deref :: restProj =>
       let pointeeTyOpt :=
-        placeTy localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
-      let accessedTyOpt := placeTy localDecls layouts place
+        placeTyResolved localDecls layouts { local_ := place.local_, projection := .deref :: .nil }
+      let accessedTyOpt := placeTyResolved localDecls layouts place
       match get? locals place.local_ with
       | .some (.init (.ptr parentPtr ptrSz)) =>
         let isSyntheticFieldOnScalarPointee : Bool :=
