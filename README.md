@@ -70,6 +70,11 @@ that as well.)
   vs. `theory/` boundary and `trusted/audit/` implement and enforce
   [`PRINCIPLES.md`](PRINCIPLES.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
+## Repository checks
+
+See [the Codex review gate guide](docs/codex-review.md) for enabling the required
+review status, diagnosing blocked PRs, and testing the evaluator locally.
+
 ## Repository layout and trust boundary
 
 | Path | Trust status | Role |

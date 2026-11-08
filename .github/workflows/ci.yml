@@ -45,6 +45,9 @@ jobs:
           persist-credentials: false
       - name: Run todo check
         run: ./ci/check_todo.sh
+      - name: Test the Codex review gate
+        # These tests use fake GitHub responses and make no status writes.
+        run: python3 -B -m unittest discover -s ci -p 'test_codex_review.py' -v
 
   # FIXME(#87): We must address all blockers listed in #87 before permitting
   # stable releases.
