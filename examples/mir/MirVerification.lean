@@ -562,8 +562,7 @@ theorem calleeAddOne_satisfies_contract :
         (mirStatefulTree calleeAddOneMirBody req.args req.memory)
         (fun out _ => addOneAt40Contract.post req (outcomeToCallAns req.memory out))
         PUnit.unit := by
-  rintro req _ ⟨_, h_args, h_mem⟩
-  rw [h_args, h_mem]
+  rintro ⟨_, _, _, _⟩ _ ⟨_, rfl, rfl⟩
   apply (Anneal.MirFuelFree.dwp_of_mirNoCallWpConverges ?_).toDWLP
   refine Anneal.MirFuelFree.MirNoCallWpConverges.mono ?_
     (Anneal.PureMirExec.mirNoCallWpConverges_of_pureExec
@@ -585,8 +584,7 @@ theorem example_horizontal_caller_callee_linking :
         (fun _ _ ret _ => ret = .scalar ⟨42, 4⟩) := by
   refine linkVerifiedMirCallee callerAddTwoModular_verified
     calleeAddOneMirBody rejectOtherCallsHandler calleeAddOne_satisfies_contract ?_
-  intro req _ h_ne h_pre _
-  exact False.elim (h_ne h_pre.1)
+  exact fun _ _ h_ne h_pre _ => (h_ne h_pre.1).elim
 
 /-! ## 7. Disjoint-Footprint Separation-Logic Framing & Exclusivity -/
 

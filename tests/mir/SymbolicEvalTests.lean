@@ -145,7 +145,7 @@ def addBoundedClaim : Claim where
               .scalar { bits := b, sizeBytes := 1 }] →
       ret = .scalar { bits := a + b, sizeBytes := 1 }
 
-/-- Single-pass fuel-free symbolic verification of `add_bounded` over all `10,000` `(a, b)` pairs. -/
+/-- Single-pass fuel-free symbolic verification of `add_bounded` over all `10,000` `(a, b)`. -/
 theorem addBoundedClaim_verified : VerificationResult addBoundedClaim := by
   refine verifyByWPFuelFree addBoundedClaim ?_
   rintro _ ⟨a, b, ha, hb, rfl⟩
@@ -460,7 +460,7 @@ def pinMagicClaim : Claim where
 theorem pinMagicClaim_verified : VerificationResult pinMagicClaim :=
   dischargeRustEqU32FuelFree pinMagicClaim pinMagicReqMir pinMagicEnsMir 7
 
-/-- Pinned 2-argument `(u8, u8)` short-circuit `&&` `#[spec]` test for `dischargeRustEq2U8FuelFree`. -/
+/-- Pinned `(u8, u8)` short-circuit `&&` `#[spec]` test (`dischargeRustEq2U8FuelFree`). -/
 def totalFrameLenReqMir : CapturedMir :=
   mkMirBody "sym_test::req_total_frame_len" 2
     [ mkDecl .mut boolMirTy
@@ -1878,8 +1878,7 @@ theorem externalSpecSliceCaller_linked_verified :
       ⟨p, 8, len, h_len_lt, rfl⟩, ?_⟩
     rintro _ _ ⟨⟩
     rfl
-  · rintro _ h_ne ⟨h_eq, _⟩
-    exact False.elim (h_ne h_eq)
+  · exact fun _ h_ne ⟨h_eq, _⟩ => (h_ne h_eq).elim
 
 /--
 `O(1)` lookup context witness for `coreSliceLenMir` basic block `0` and
