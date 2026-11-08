@@ -35,7 +35,17 @@ theorem evalRvalue_aggregate_enum_simulation
     (hwt : WellTypedLM2_3EnumAggregate body env stEnv dstIdx defPath variantIdx ops) :
     StepRelLM2_2 body env (aggPostStaticEnv stEnv dstIdx ops) k_bud m
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by sorry
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hinit_env, himm_env, hsupply, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  simp only [hbb, hstmt]
+  cases hwt with
+  | mk decl fields paths decl_lookup env_lookup is_adt valid_layout =>
+    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.adt defPath variantIdx activeField) ops), span⟩) m = (sorry, .ok ()) := by sorry
+    have ha_ok : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate (.adt defPath variantIdx activeField) ops), span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
+    sorry
 
 inductive WellTypedLM2_3SetDiscriminant
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
@@ -55,7 +65,17 @@ theorem step_setDiscriminant_simulation
     (hwt : WellTypedLM2_3SetDiscriminant body env stEnv place variantIdx) :
     StepRelLM2_2 body env stEnv k_bud m
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by sorry
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hinit_env, himm_env, hsupply, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  simp only [hbb, hstmt]
+  cases hwt with
+  | mk decl decl_lookup =>
+    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.setDiscriminant place variantIdx, span⟩) m = (sorry, .ok ()) := by sorry
+    have ha_ok : evalStmt s ⟨.setDiscriminant place variantIdx, span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
+    sorry
 
 inductive WellTypedLM2_3DiscriminantRead
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
@@ -77,7 +97,17 @@ theorem evalRvalue_discriminant_simulation
     (hwt : WellTypedLM2_3DiscriminantRead body env stEnv dstIdx place) :
     StepRelLM2_2 body env stEnv k_bud m
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by sorry
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hinit_env, himm_env, hsupply, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  simp only [hbb, hstmt]
+  cases hwt with
+  | mk decl placeDecl decl_lookup place_lookup =>
+    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.discriminant place), span⟩) m = (sorry, .ok ()) := by sorry
+    have ha_ok : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.discriminant place), span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
+    sorry
 
 inductive WellTypedLM2_3Downcast
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
@@ -101,7 +131,17 @@ theorem evalProjection_downcast_field_simulation
     (hwt : WellTypedLM2_3Downcast body env stEnv dstIdx ⟨base, projs⟩ variantIdx) :
     StepRelLM2_2 body env stEnv k_bud m
       (stepMirFn body s)
-      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by sorry
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hinit_env, himm_env, hsupply, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  simp only [hbb, hstmt]
+  cases hwt with
+  | mk decl placeDecl decl_lookup place_lookup =>
+    have hm_ok : Miri.Interpreter.Step.evalStatement (annealStepHooks body.localDecls body.layouts) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨base, projs ++ [.downcast variantName variantIdx, .field field ty]⟩)), span⟩) m = (sorry, .ok ()) := by sorry
+    have ha_ok : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.use (.copy ⟨base, projs ++ [.downcast variantName variantIdx, .field field ty]⟩)), span⟩ body.localDecls body.layouts = MirStepNode.step sorry := by sorry
+    sorry
 
 inductive WellTypedLM2_3SwitchInt
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
