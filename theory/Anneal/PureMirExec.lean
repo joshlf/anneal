@@ -735,6 +735,14 @@ private theorem ptrAddressScalar?_nil_borrows
       .some (ptrToAddrScalar p sz) :=
   rfl
 
+private theorem resolveWideWordScalar?_nil_borrows
+    (word : Value) (locals : List LocalSlot) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrBytes : Nat) :
+    resolveWideWordScalar? word locals [] callerLocals localDecls layouts ptrBytes =
+      resolveWideWordScalar? word locals [] [] localDecls layouts ptrBytes := by
+  unfold resolveWideWordScalar?
+  simp only [ptrAddressScalar?_nil_borrows]
+
 private theorem isPtrRelationalBinOp_eq_false_of_nonptr
     {op : BinOp} {localDecls : List LocalDecl} {layouts : LayoutTable}
     {lhs rhs : Operand}
@@ -894,7 +902,7 @@ private theorem evalRvalue_pure_eq_withMem_core
             rcases h_bor_or_np with h_borrows | h_np
             · dsimp only [evalWidePtrAggregateRelBinOp, evalWidePtrRelBinOp, emptyMemory]
               rw [h_borrows]
-              simp only [ptrAddressScalar?_nil_borrows]
+              simp only [resolveWideWordScalar?_nil_borrows]
               repeat' (first
                 | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok
                 | exact evalScalarBinOp_eq_withMem ..
@@ -928,7 +936,7 @@ private theorem evalRvalue_pure_eq_withMem_core
       rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
     | ptrMetadata =>
-      dsimp only [evalRvalue]
+      dsimp only [evalRvalue, evalUnaryPtrMetadata]
       rw [evalOperand_pure_eq locals op mem.borrows mem.globals layouts mem.callerLocals h_pure]
       rw [evalOperand_pure_eq locals op emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
@@ -3519,7 +3527,7 @@ theorem evalRvalue_pushBaseStack
       dsimp only [evalRvalue, Memory.pushBaseStack]
       repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
     | ptrMetadata =>
-      dsimp only [evalRvalue, Memory.pushBaseStack]
+      dsimp only [evalRvalue, evalUnaryPtrMetadata, Memory.pushBaseStack]
       repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
   | discriminant place =>
     dsimp only [evalRvalue, Memory.pushBaseStack]
