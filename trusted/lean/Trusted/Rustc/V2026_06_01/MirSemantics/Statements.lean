@@ -2179,23 +2179,22 @@ theorem placeMentionOperandsInit_nil (locals : List LocalSlot) (rootSlot : Local
   cases rootSlot <;> rfl
 
 /--
-Materialize default `.aggregate 0 .nil` (or `.aggregate 0 (replicateValue count elemShell)`
-for fixed-length array fields) shells along a chain of intermediate aggregate
-`.field` projections inside `val` whenever the current slot at `fieldIdx` is
-either absent (`fieldIdx ≥ length fields`) or `.unit` padding produced by an
-earlier `setOrExtendFields` on a higher-index sibling field.
+Materialize default `.aggregate 0 .nil` shells along a chain of intermediate
+aggregate `.field` projections inside `val` whenever the current slot at
+`fieldIdx` is either absent (`fieldIdx ≥ length fields`) or `.unit` padding
+produced by an earlier `setOrExtendFields` on a higher-index sibling field.
 
 1. When `fieldTy.kind` is a struct/union (`.adt _ _`) or tuple (`.tuple _`) and
    the remaining projection path continues with `.field _ _`, materializing an
    inner `.aggregate 0 ...` shell prevents `writeProjectedValue` from collapsing
    `.field 0` onto `.unit` (losing the inner aggregate wrapper) or faulting with
    `.ub` on `.field (k + 1)` against `.unit`.
-2. When `fieldTy.kind` is a fixed-length array (`.array elemKind count`) and the
-   next projection is `.index _`, `.constantIndex _ _ _`, or `.subslice _ _ _`,
-   materializing `.aggregate 0 (replicateValue count elemShell)` when the array
-   field slot is absent or `.unit` allows element-by-element array-field writes
-   (`_u.arr[i] = val` or `_s.pts[i].f = val`) to succeed in bounds (`i < count`)
-   and fault with `.ub` out of bounds (`i ≥ count`).
+2. Fixed-length array fields (`.array _ _`) are never materialized, so an
+   element write through a never-written array field (`_u.arr[i] = val`) still
+   faults with `.ub`. An array shell would have to fill every unwritten element
+   with a `.unit` placeholder, and a later read of such an element
+   (`copy _u.arr[j]`) would return that placeholder instead of faulting on the
+   uninitialized element as MiniRust and Miri do.
 
 `evalStmt` applies this both to the default shell of an uninitialized
 destination (`uninitFieldWriteShell?`) and to the current value of an
@@ -2241,38 +2240,12 @@ def ensureNestedFieldShells (val : Value) (projs : List ProjectionElem) : Value 
           match set? fields fieldIdx childVal' with
           | .some fields' => .aggregate variantIdx fields'
           | .none => .aggregate variantIdx fields
-      | false =>
-        let arrayCount? : Option Nat :=
-          match fieldTy.kind, nextProj with
-          | .array _ count, .index _ => .some count
-          | .array _ count, .constantIndex _ _ _ => .some count
-          | .array _ count, .subslice _ _ _ => .some count
-          | _, _ => .none
-        match arrayCount? with
-        | .none => .aggregate variantIdx fields
-        | .some count =>
-          let elemShell : Value :=
-            match fieldTy.kind with
-            | .array (.adt _ _) _ =>
-              ensureNestedFieldShells (.aggregate 0 .nil) rest
-            | .array (.tuple _) _ =>
-              ensureNestedFieldShells (.aggregate 0 .nil) rest
-            | _ => .unit
-          let arrShell : Value := .aggregate 0 (replicateValue count elemShell)
-          match get? fields fieldIdx with
-          | .none =>
-            .aggregate variantIdx (setOrExtendFields fields fieldIdx arrShell)
-          | .some .unit =>
-            match set? fields fieldIdx arrShell with
-            | .some fields' => .aggregate variantIdx fields'
-            | .none => .aggregate variantIdx fields
-          | .some _ =>
-            .aggregate variantIdx fields
+      | false => .aggregate variantIdx fields
     | _ => val
   | _ => val
 
 /--
-Whether every intermediate struct, union, tuple, or array field slot that
+Whether every intermediate struct, union, or tuple field slot that
 `ensureNestedFieldShells val projs` inspects along `projs` is already present
 and not `.unit` padding.
 
@@ -2299,20 +2272,7 @@ def fieldShellChainPopulated : Value → List ProjectionElem → Bool
       | .none => false
       | .some .unit => false
       | .some childVal => fieldShellChainPopulated childVal (nextProj :: rest)
-    | false =>
-      let isArrayElemProj :=
-        match fieldTy.kind, nextProj with
-        | .array _ _, .index _ => true
-        | .array _ _, .constantIndex _ _ _ => true
-        | .array _ _, .subslice _ _ _ => true
-        | _, _ => false
-      match isArrayElemProj with
-      | false => true
-      | true =>
-        match get? fields fieldIdx with
-        | .none => false
-        | .some .unit => false
-        | .some _ => true
+    | false => true
   | _, _ => true
 
 /--
@@ -3773,239 +3733,59 @@ theorem evalStmt_assign_init_projected_step
       simp [evalStmt, hRv, hInit, hWriteShell, hSet, hAP, hC]
 
 /--
-Every in-bounds index `i < count` in `replicateValue count v` reads as `.some v`.
+`D13b` array-field boundary (`evalStmt_assign_uninit_array_field_elem_ub`):
+writing an element of a never-written fixed-length array field
+(`.field fieldIdx { kind := .array elemKind count, .. } :: .index idxLocal :: rest`)
+of a live but uninitialized local still faults with `MirStepNode.fail .ub`,
+whatever the local's declared type. `ensureNestedFieldShells` materializes no
+array shell, because filling the unwritten elements with `.unit` placeholders
+would let later reads of those elements succeed where MiniRust and Miri report
+a read of uninitialized memory.
 -/
-theorem get?_replicateValue_lt :
-    ∀ (count i : Nat) (v : Value),
-      i < count →
-      get? (replicateValue count v) i = .some v
-  | .zero, _, _, hLt => nomatch hLt
-  | .succ _, .zero, _, _ => rfl
-  | .succ k, .succ n, v, hLt =>
-    get?_replicateValue_lt k n v (Nat.lt_of_succ_lt_succ hLt)
-
-/--
-Every out-of-bounds index `count ≤ i` in `replicateValue count v` reads as `.none`.
--/
-theorem get?_replicateValue_ge :
-    ∀ (count i : Nat) (v : Value),
-      count ≤ i →
-      get? (replicateValue count v) i = .none
-  | .zero, .zero, _, _ => rfl
-  | .zero, .succ _, _, _ => rfl
-  | .succ _, .zero, _, hGe => nomatch hGe
-  | .succ k, .succ n, v, hGe =>
-    get?_replicateValue_ge k n v (Nat.le_of_succ_le_succ hGe)
-
-/--
-The length of `replicateValue count v` equals `count`.
--/
-private theorem replicateValue_length :
-    ∀ (count : Nat) (v : Value),
-      (replicateValue count v).length = count
-  | .zero, _ => rfl
-  | .succ k, v => congrArg Nat.succ (replicateValue_length k v)
-
-/--
-Default element shell placed in each slot of a materialized fixed-length array
-field when the trailing projection after `.index` is empty: `.aggregate 0 .nil`
-for struct/union (`.adt _ _`) and tuple (`.tuple _`) elements, and `.unit` for
-all other element kinds.
--/
-def defaultArrayElemShell (elemKind : RigidTy) : Value :=
-  match elemKind with
-  | .adt _ _ => .aggregate 0 .nil
-  | .tuple _ => .aggregate 0 .nil
-  | _ => .unit
-
-/--
-`D13b` array-field element initialization (`evalStmt_assign_uninit_array_field_index_ok`):
-writing `val` into an in-bounds runtime index `sc.bits < count` of an array-typed
-field `.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx }`
-on a live but uninitialized struct or union local `dstLoc` materializes the
-`count`-element array shell, writes `val` at `sc.bits`, and steps.
--/
-theorem evalStmt_assign_uninit_array_field_index_ok
+theorem evalStmt_assign_uninit_array_field_elem_ub
     (s : MachineState)
     (dstLoc idxLocal : Local)
     (fieldIdx : FieldIdx)
     (elemKind : RigidTy)
     (count arrLayoutIdx : Nat)
+    (rest : List ProjectionElem)
     (rv : Rvalue)
     (span : String)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
-    (defPath : DefPath)
-    (args : List RigidTy)
-    (layoutIdx : Nat)
-    (sc : ScalarInt)
-    (val : Value)
-    (locals₁ locals₂ : List LocalSlot)
-    (mem₁ : Memory)
-    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
-    (hUninit : get? locals₁ dstLoc = .some .uninit)
-    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-      .some { kind := .adt defPath args, layoutIdx := layoutIdx })
-    (hIdx : get? locals₁ idxLocal = .some (.init (.scalar sc)))
-    (hLt : sc.bits < count)
-    (hSet :
-      set? locals₁ dstLoc
-        (.init
-          (.aggregate 0
-            (setOrExtendFields .nil fieldIdx
-              (.aggregate 0
-                ((replicateValue count (defaultArrayElemShell elemKind)).set sc.bits val))))) =
-        .some locals₂)
-    (hProt : mem₁.activeProtectors = .nil) :
-    let arrTy : Ty := { kind := .array elemKind count, layoutIdx := arrLayoutIdx }
-    let projs : List ProjectionElem := [.field fieldIdx arrTy, .index idxLocal]
-    evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
-      MirStepNode.step
-        (advanceStmt s locals₂
-          { mem₁ with
-            borrows :=
-              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                (match resolveBorrowProjectionElems locals₁ projs with
-                 | .some rp => rp
-                 | .none => projs) }) := by
-  let arrTy : Ty := { kind := .array elemKind count, layoutIdx := arrLayoutIdx }
-  let elemShell : Value := defaultArrayElemShell elemKind
-  let arrShell : Value := .aggregate 0 (replicateValue count elemShell)
-  let shell : Value := .aggregate 0 (setOrExtendFields .nil fieldIdx arrShell)
-  let rootVal' : Value :=
-    .aggregate 0
-      (setOrExtendFields .nil fieldIdx
-        (.aggregate 0 ((replicateValue count elemShell).set sc.bits val)))
-  have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
-    intro k; cases k <;> rfl
-  have hGetExt : ∀ (k : Nat) (v : Value),
-      get? (setOrExtendFields .nil k v) k = .some v := by
-    intro k v
-    induction k with
-    | zero => rfl
-    | succ n ih => exact ih
-  have hLenExt : ∀ (k : Nat) (v : Value),
-      (setOrExtendFields .nil k v).length = k + 1 := by
-    intro k v
-    induction k with
-    | zero => rfl
-    | succ n ih =>
-      change (Value.unit :: setOrExtendFields .nil n v).length = n + 1 + 1
-      simp [ih]
-  have hListSetExt : ∀ (k : Nat) (v w : Value),
-      (setOrExtendFields .nil k v).set k w = setOrExtendFields .nil k w := by
-    intro k v w
-    induction k with
-    | zero => rfl
-    | succ n ih =>
-      change (Value.unit :: setOrExtendFields .nil n v).set (n + 1) w =
-        Value.unit :: setOrExtendFields .nil n w
-      simp [ih]
-  have hSetExt : ∀ (k : Nat) (v w : Value),
-      set? (setOrExtendFields .nil k v) k w = .some (setOrExtendFields .nil k w) := by
-    intro k v w
-    change (if k < (setOrExtendFields .nil k v).length then
-        some ((setOrExtendFields .nil k v).set k w) else none) =
-      .some (setOrExtendFields .nil k w)
-    simp [hLenExt k v, hListSetExt k v w]
-  have hSetElem :
-      set? (replicateValue count elemShell) sc.bits val =
-        .some ((replicateValue count elemShell).set sc.bits val) := by
-    change (if sc.bits < (replicateValue count elemShell).length then
-        some ((replicateValue count elemShell).set sc.bits val) else none) =
-      .some ((replicateValue count elemShell).set sc.bits val)
-    rw [replicateValue_length count elemShell]
-    simp [hLt]
-  have hShell :
-      uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx arrTy)
-        [.index idxLocal] = .some shell := by
-    cases elemKind <;>
-      simp [uninitFieldWriteShell?, ensureNestedFieldShells, defaultArrayElemShell,
-        hTy, hGetNil fieldIdx, arrTy, shell, arrShell, elemShell]
-  have hWriteInner :
-      writeProjectedValue locals₁ arrShell [.index idxLocal] val =
-        .ok (.aggregate 0 ((replicateValue count elemShell).set sc.bits val)) := by
-    simp [arrShell, writeProjectedValue, hIdx,
-      get?_replicateValue_lt count sc.bits elemShell hLt, hSetElem]
-  have hWrite :
-      writeProjectedValue locals₁ shell
-        [.field fieldIdx arrTy, .index idxLocal] val = .ok rootVal' := by
-    dsimp only [shell, rootVal', writeProjectedValue]
-    rw [hGetExt fieldIdx arrShell]
-    dsimp only []
-    rw [hWriteInner]
-    dsimp only []
-    rw [hSetExt fieldIdx arrShell
-      (.aggregate 0 ((replicateValue count elemShell).set sc.bits val))]
-  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx arrTy
-    [.index idxLocal] rv span localDecls layouts val locals₁ mem₁ shell rootVal'
-    locals₂ hRv hUninit hShell hWrite hSet
-    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
-
-/--
-`D13b` array-field out-of-bounds index boundary (`evalStmt_assign_uninit_array_field_index_oob_ub`):
-writing into an out-of-bounds runtime index `count ≤ sc.bits` of an array-typed
-field `.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx }`
-on a live but uninitialized struct or union local `dstLoc` faults with
-`MirStepNode.fail .ub`.
--/
-theorem evalStmt_assign_uninit_array_field_index_oob_ub
-    (s : MachineState)
-    (dstLoc idxLocal : Local)
-    (fieldIdx : FieldIdx)
-    (elemKind : RigidTy)
-    (count arrLayoutIdx : Nat)
-    (rv : Rvalue)
-    (span : String)
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (defPath : DefPath)
-    (args : List RigidTy)
-    (layoutIdx : Nat)
-    (sc : ScalarInt)
     (val : Value)
     (locals₁ : List LocalSlot)
     (mem₁ : Memory)
     (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
-    (hUninit : get? locals₁ dstLoc = .some .uninit)
-    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-      .some { kind := .adt defPath args, layoutIdx := layoutIdx })
-    (hIdx : get? locals₁ idxLocal = .some (.init (.scalar sc)))
-    (hGe : count ≤ sc.bits) :
-    let arrTy : Ty := { kind := .array elemKind count, layoutIdx := arrLayoutIdx }
-    evalStmt s ⟨.assign ⟨dstLoc, [.field fieldIdx arrTy, .index idxLocal]⟩ rv, span⟩
-      localDecls layouts = MirStepNode.fail .ub := by
-  let arrTy : Ty := { kind := .array elemKind count, layoutIdx := arrLayoutIdx }
-  let elemShell : Value := defaultArrayElemShell elemKind
-  let arrShell : Value := .aggregate 0 (replicateValue count elemShell)
-  let shell : Value := .aggregate 0 (setOrExtendFields .nil fieldIdx arrShell)
-  have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
-    intro k; cases k <;> rfl
-  have hGetExt : ∀ (k : Nat) (v : Value),
-      get? (setOrExtendFields .nil k v) k = .some v := by
-    intro k v
-    induction k with
-    | zero => rfl
-    | succ n ih => exact ih
-  have hShell :
-      uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx arrTy)
-        [.index idxLocal] = .some shell := by
-    cases elemKind <;>
-      simp [uninitFieldWriteShell?, ensureNestedFieldShells, defaultArrayElemShell,
-        hTy, hGetNil fieldIdx, arrTy, shell, arrShell, elemShell]
-  have hWriteInner :
-      writeProjectedValue locals₁ arrShell [.index idxLocal] val = .ub := by
-    simp [arrShell, writeProjectedValue, hIdx,
-      get?_replicateValue_ge count sc.bits elemShell hGe]
-  have hWrite :
-      writeProjectedValue locals₁ shell
-        [.field fieldIdx arrTy, .index idxLocal] val = .ub := by
-    dsimp only [shell, writeProjectedValue]
-    rw [hGetExt fieldIdx arrShell]
-    dsimp only []
-    rw [hWriteInner]
-  change evalStmt s ⟨.assign ⟨dstLoc, [.field fieldIdx arrTy, .index idxLocal]⟩ rv, span⟩
-    localDecls layouts = MirStepNode.fail .ub
-  simp [evalStmt, hRv, hUninit, hShell, hWrite]
+    (hUninit : get? locals₁ dstLoc = .some .uninit) :
+    evalStmt s
+        ⟨.assign
+          ⟨dstLoc,
+            .field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+              .index idxLocal :: rest⟩ rv,
+          span⟩
+        localDecls layouts =
+      MirStepNode.fail .ub := by
+  cases hSh : uninitFieldWriteShell? localDecls layouts dstLoc
+      (.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx })
+      (.index idxLocal :: rest) with
+  | none => simp [evalStmt, hRv, hUninit, hSh]
+  | some shell =>
+    have hShell : shell = .aggregate 0 .nil := by
+      have hEns :
+          ensureNestedFieldShells (.aggregate 0 .nil)
+            (.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+              .index idxLocal :: rest) = .aggregate 0 .nil := rfl
+      unfold uninitFieldWriteShell? at hSh
+      dsimp only at hSh
+      rw [hEns] at hSh
+      split at hSh <;> first | (injection hSh with h; exact h.symm) | nomatch hSh
+    subst hShell
+    have hW :
+        writeProjectedValue locals₁ (.aggregate 0 .nil)
+          (.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+            .index idxLocal :: rest) val = .ub := by
+      cases fieldIdx <;> rfl
+    simp [evalStmt, hRv, hUninit, hSh, hW]
 
 end Trusted.Rustc.V2026_06_01.MirSemantics

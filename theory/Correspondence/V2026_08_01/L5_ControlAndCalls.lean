@@ -5600,105 +5600,35 @@ theorem stmt_div_assign_uninit_union_nested_pair_ok :
       .some (.none, "none", .some (.scalar ⟨99, 4⟩)) := by
   rfl
 
-/-- `D13b` union with fixed-length array field (`union U { arr: [u64; 2], wide: u64 }`,
-`evalStmt_assign_uninit_array_field_index_ok`):
-initialize elements `0` and `1` of `_1.arr` via runtime `.index` projections on
-an uninitialized union local and read `_1.arr[1]` back:
+/-- `D13b` array-field scope-boundary witness
+(`evalStmt_assign_uninit_array_field_elem_ub`): writing element `_2` of the
+never-written array field `_1.arr` of an uninitialized union local
+(`union U { arr: [u64; 2], wide: u64 }`) still faults with `FailureKind.ub`:
 ```text
-StorageLive(_1); StorageLive(_2); StorageLive(_3);
-_2 = const 0_usize; _3 = const 1_usize;
-(_1.arr)[_2] = const 11_u64; (_1.arr)[_3] = const 22_u64;
-_0 = copy ((_1.arr)[_3]); return
-``` -/
-private def stmtDivUnionArrayFieldInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::union_array_field_index_write_into_uninit"
-    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivUnionTy,
-      stmtDivDecl stmtDivUsizeTy, stmtDivDecl stmtDivUsizeTy]
-    [ { kind := .storageLive 1, span := "live _1" },
-      { kind := .storageLive 2, span := "live _2" },
-      { kind := .storageLive 3, span := "live _3" },
-      { kind := .assign ⟨2, []⟩
-          (.use (.constant ⟨stmtDivUsizeTy, .scalar (.int ⟨0, 8⟩)⟩)),
-        span := "_2 = 0" },
-      { kind := .assign ⟨3, []⟩
-          (.use (.constant ⟨stmtDivUsizeTy, .scalar (.int ⟨1, 8⟩)⟩)),
-        span := "_3 = 1" },
-      { kind := .assign ⟨1, [.field 0 stmtDivArrTy, .index 2]⟩
-          (.use (stmtDivConstU64 11)),
-        span := "(_1.arr)[_2] = 11" },
-      { kind := .assign ⟨1, [.field 0 stmtDivArrTy, .index 3]⟩
-          (.use (stmtDivConstU64 22)),
-        span := "(_1.arr)[_3] = 22" },
-      { kind := .assign ⟨0, []⟩
-          (.use (.copy ⟨1, [.field 0 stmtDivArrTy, .index 3]⟩)),
-        span := "_0 = copy (_1.arr)[_3]" } ]
-
-theorem stmt_div_assign_uninit_union_array_field_ok :
-    diffCProbeBounded 16 stmtDivUnionArrayFieldInitBody
-      (.running (initMachineState stmtDivUnionArrayFieldInitBody [])) =
-      .some (.none, "none", .some (.scalar ⟨22, 8⟩)) := by
-  rfl
-
-/-- `D13b` out-of-bounds array-field index write on an uninitialized union local
-(`evalStmt_assign_uninit_array_field_index_oob_ub`): writing `(_1.arr)[_2] = 99`
-where `_2 = 2_usize` and `arr: [u64; 2]` faults with `FailureKind.ub`:
-```text
-StorageLive(_1); StorageLive(_2); _2 = const 2_usize;
-(_1.arr)[_2] = const 99_u64; _0 = const 0_u64; return
-``` -/
-private def stmtDivUnionArrayFieldOobBody : CapturedMir :=
-  stmtDivBody "stmt_div::union_array_field_oob_index_write_into_uninit_is_ub"
+StorageLive(_1); StorageLive(_2); _2 = const 0_usize;
+(_1.arr)[_2] = const 11_u64; _0 = const 0_u64; return
+```
+MiniRust and Miri accept this write. Anneal keeps the fault: materializing the
+array would fill the unwritten element `(_1.arr)[1]` with a `.unit` placeholder
+that a later `copy (_1.arr)[1]` would return instead of faulting on the
+uninitialized element. -/
+private def stmtDivUnionArrayFieldElemBody : CapturedMir :=
+  stmtDivBody "stmt_div::union_array_field_elem_write_into_uninit_is_ub"
     [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivUnionTy, stmtDivDecl stmtDivUsizeTy]
     [ { kind := .storageLive 1, span := "live _1" },
       { kind := .storageLive 2, span := "live _2" },
       { kind := .assign ⟨2, []⟩
-          (.use (.constant ⟨stmtDivUsizeTy, .scalar (.int ⟨2, 8⟩)⟩)),
-        span := "_2 = 2" },
+          (.use (.constant ⟨stmtDivUsizeTy, .scalar (.int ⟨0, 8⟩)⟩)),
+        span := "_2 = 0" },
       { kind := .assign ⟨1, [.field 0 stmtDivArrTy, .index 2]⟩
-          (.use (stmtDivConstU64 99)),
-        span := "(_1.arr)[_2] = 99" },
+          (.use (stmtDivConstU64 11)),
+        span := "(_1.arr)[_2] = 11" },
       { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
 
-theorem stmt_div_assign_uninit_union_array_field_oob_is_ub :
-    diffCProbeBounded 16 stmtDivUnionArrayFieldOobBody
-      (.running (initMachineState stmtDivUnionArrayFieldOobBody [])) =
-      .some (.some .ub, "(_1.arr)[_2] = 99", .none) := by
-  rfl
-
-/-- `[S; 2]` array-of-structs field type where `S = { a: u64, b: u64 }`. -/
-private def stmtDivStructArrTy : Ty :=
-  { kind := .array (.adt "stmt_div::S" []) 2, layoutIdx := 0 }
-
-/-- `D13b` struct holding an array of structs (`struct Path { pts: [S; 2] }`):
-initialize `(_1.pts[_2]).b = 77` and `(_1.pts[_2]).a = 66` at index `_2 = 1` on
-an uninitialized `Path` local and read `(_1.pts[_2]).b` back:
-```text
-StorageLive(_1); StorageLive(_2); _2 = const 1_usize;
-(_1.pts[_2]).b = const 77_u64; (_1.pts[_2]).a = const 66_u64;
-_0 = copy ((_1.pts[_2]).b); return
-``` -/
-private def stmtDivArrayOfStructsFieldInitBody : CapturedMir :=
-  stmtDivBody "stmt_div::array_of_structs_field_write_into_uninit"
-    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy, stmtDivDecl stmtDivUsizeTy]
-    [ { kind := .storageLive 1, span := "live _1" },
-      { kind := .storageLive 2, span := "live _2" },
-      { kind := .assign ⟨2, []⟩
-          (.use (.constant ⟨stmtDivUsizeTy, .scalar (.int ⟨1, 8⟩)⟩)),
-        span := "_2 = 1" },
-      { kind := .assign ⟨1, [.field 0 stmtDivStructArrTy, .index 2, .field 1 stmtDivU64Ty]⟩
-          (.use (stmtDivConstU64 77)),
-        span := "(_1.pts[_2]).b = 77" },
-      { kind := .assign ⟨1, [.field 0 stmtDivStructArrTy, .index 2, .field 0 stmtDivU64Ty]⟩
-          (.use (stmtDivConstU64 66)),
-        span := "(_1.pts[_2]).a = 66" },
-      { kind := .assign ⟨0, []⟩
-          (.use (.copy ⟨1, [.field 0 stmtDivStructArrTy, .index 2, .field 1 stmtDivU64Ty]⟩)),
-        span := "_0 = copy (_1.pts[_2]).b" } ]
-
-theorem stmt_div_assign_uninit_array_of_structs_field_ok :
-    diffCProbeBounded 16 stmtDivArrayOfStructsFieldInitBody
-      (.running (initMachineState stmtDivArrayOfStructsFieldInitBody [])) =
-      .some (.none, "none", .some (.scalar ⟨77, 8⟩)) := by
+theorem stmt_div_assign_uninit_array_field_elem_is_ub :
+    diffCProbeBounded 16 stmtDivUnionArrayFieldElemBody
+      (.running (initMachineState stmtDivUnionArrayFieldElemBody [])) =
+      .some (.some .ub, "(_1.arr)[_2] = 11", .none) := by
   rfl
 
 /-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
@@ -5771,18 +5701,17 @@ and `evalStmt` on projected writes into live uninitialized and initialized local
    heads or non-aggregate root types (`uninitFieldWriteShell?_eq_none_of_not_field`,
    `uninitFieldWriteShell?_eq_none_of_non_aggregate_ty`,
    `uninitFieldWriteShell?_eq_none_iff`).
-3. `evalStmt` initializes `.uninit` struct, union, tuple, nested aggregate, and
-   fixed-length array-field locals when `writeProjectedValue` succeeds and no
-   active protector conflicts (`evalStmt_assign_uninit_aggregate_field_step`,
+3. `evalStmt` initializes `.uninit` struct, union, tuple, and nested aggregate
+   locals when `writeProjectedValue` succeeds and no active protector conflicts
+   (`evalStmt_assign_uninit_aggregate_field_step`,
    `evalStmt_assign_uninit_union_field_ok`,
    `evalStmt_assign_uninit_tuple_field_ok`,
-   `evalStmt_assign_uninit_nested_field_ok`,
-   `evalStmt_assign_uninit_array_field_index_ok`), and faults with
+   `evalStmt_assign_uninit_nested_field_ok`), and faults with
    `MirStepNode.fail .ub` when a protected borrow conflicts
-   (`evalStmt_assign_uninit_aggregate_field_protected_conflict_ub`), when an
-   array-field runtime index is out of bounds
-   (`evalStmt_assign_uninit_array_field_index_oob_ub`), or when no aggregate
-   shell applies (`evalStmt_assign_uninit_non_aggregate_ub`). -/
+   (`evalStmt_assign_uninit_aggregate_field_protected_conflict_ub`), when the
+   write goes through a never-written array field
+   (`evalStmt_assign_uninit_array_field_elem_ub`), or when no aggregate shell
+   applies (`evalStmt_assign_uninit_non_aggregate_ub`). -/
 theorem mir_uninit_aggregate_field_write_characterizations
     (s : MachineState)
     (dstLoc idxLocal : Local)
@@ -5799,7 +5728,6 @@ theorem mir_uninit_aggregate_field_write_characterizations
     (defPath innerDefPath : DefPath)
     (args innerArgs tupleFields : List RigidTy)
     (layoutIdx innerLayoutIdx : Nat)
-    (sc : ScalarInt)
     (val rootVal : Value)
     (locals₁ : List LocalSlot)
     (mem₁ : Memory)
@@ -5924,42 +5852,16 @@ theorem mir_uninit_aggregate_field_write_characterizations
                   (match resolveBorrowProjectionElems locals₁ projs with
                    | .some rp => rp
                    | .none => projs) })) ∧
-    (
-      let arrTy : Ty := { kind := .array elemKind count, layoutIdx := arrLayoutIdx }
-      let projs : List ProjectionElem := [.field fieldIdx arrTy, .index idxLocal]
-      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+    (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some .uninit →
-      placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-        .some { kind := .adt defPath args, layoutIdx := layoutIdx } →
-      get? locals₁ idxLocal = .some (.init (.scalar sc)) →
-      sc.bits < count →
-      set? locals₁ dstLoc
-        (.init
-          (.aggregate 0
-            (setOrExtendFields .nil fieldIdx
-              (.aggregate 0
-                ((replicateValue count (defaultArrayElemShell elemKind)).set sc.bits val))))) =
-        .some locals₂ →
-      mem₁.activeProtectors = .nil →
-      evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
-        MirStepNode.step
-          (advanceStmt s locals₂
-            { mem₁ with
-              borrows :=
-                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
-                  (match resolveBorrowProjectionElems locals₁ projs with
-                   | .some rp => rp
-                   | .none => projs) })) ∧
-    (
-      let arrTy : Ty := { kind := .array elemKind count, layoutIdx := arrLayoutIdx }
-      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
-      get? locals₁ dstLoc = .some .uninit →
-      placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
-        .some { kind := .adt defPath args, layoutIdx := layoutIdx } →
-      get? locals₁ idxLocal = .some (.init (.scalar sc)) →
-      count ≤ sc.bits →
-      evalStmt s ⟨.assign ⟨dstLoc, [.field fieldIdx arrTy, .index idxLocal]⟩ rv, span⟩
-        localDecls layouts = MirStepNode.fail .ub) ∧
+      evalStmt s
+          ⟨.assign
+            ⟨dstLoc,
+              .field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+                .index idxLocal :: rest⟩ rv,
+            span⟩
+          localDecls layouts =
+        MirStepNode.fail .ub) ∧
     (proj ≠ .deref →
       evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
       get? locals₁ dstLoc = .some .uninit →
@@ -5987,10 +5889,8 @@ theorem mir_uninit_aggregate_field_write_characterizations
     evalStmt_assign_uninit_nested_field_ok s dstLoc fieldIdx innerIdx fieldTy rv span
       localDecls layouts defPath innerDefPath args innerArgs layoutIdx innerLayoutIdx
       val locals₁ mem₁ locals₂,
-    evalStmt_assign_uninit_array_field_index_ok s dstLoc idxLocal fieldIdx elemKind count
-      arrLayoutIdx rv span localDecls layouts defPath args layoutIdx sc val locals₁ locals₂ mem₁,
-    evalStmt_assign_uninit_array_field_index_oob_ub s dstLoc idxLocal fieldIdx elemKind count
-      arrLayoutIdx rv span localDecls layouts defPath args layoutIdx sc val locals₁ mem₁,
+    evalStmt_assign_uninit_array_field_elem_ub s dstLoc idxLocal fieldIdx elemKind count
+      arrLayoutIdx rest rv span localDecls layouts val locals₁ mem₁,
     evalStmt_assign_uninit_non_aggregate_ub s dstLoc proj rest rv span localDecls layouts
       val locals₁ mem₁⟩
 
