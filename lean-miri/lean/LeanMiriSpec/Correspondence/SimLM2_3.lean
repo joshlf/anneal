@@ -23,7 +23,13 @@ inductive WellTypedLM2_3EnumAggregate
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (dstIdx : Local) (defPath : DefPath) (variantIdx : VariantIdx)
     (ops : List MirAst.Operand) : Prop where
-  | mk (decl : LocalDecl) (hdecl : get? body.localDecls dstIdx = some decl)
+  | mk (decl : LocalDecl)
+       (fields : List StructFieldDesc)
+       (paths : List (List ProjectionElem))
+       (decl_lookup : get? body.localDecls dstIdx = some decl)
+       (env_lookup : env decl.ty = some (fields, paths))
+       (is_adt : ∃ args, decl.ty.kind = .adt defPath args)
+       (valid_layout : ValidStructLayout (translateTy decl.ty body.layouts).layout fields)
 
 theorem evalRvalue_aggregate_enum_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -44,7 +50,8 @@ theorem evalRvalue_aggregate_enum_simulation
 inductive WellTypedLM2_3SetDiscriminant
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (place : Place) (variantIdx : VariantIdx) : Prop where
-  | mk (decl : LocalDecl) (hdecl : get? body.localDecls place.local_ = some decl)
+  | mk (decl : LocalDecl)
+       (decl_lookup : get? body.localDecls place.local_ = some decl)
 
 theorem step_setDiscriminant_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -63,7 +70,10 @@ theorem step_setDiscriminant_simulation
 inductive WellTypedLM2_3DiscriminantRead
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (dstIdx : Local) (place : Place) : Prop where
-  | mk (decl : LocalDecl) (hdecl : get? body.localDecls dstIdx = some decl)
+  | mk (decl : LocalDecl)
+       (placeDecl : LocalDecl)
+       (decl_lookup : get? body.localDecls dstIdx = some decl)
+       (place_lookup : get? body.localDecls place.local_ = some placeDecl)
 
 theorem evalRvalue_discriminant_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -82,7 +92,10 @@ theorem evalRvalue_discriminant_simulation
 inductive WellTypedLM2_3Downcast
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (dstIdx : Local) (place : Place) (variantIdx : VariantIdx) : Prop where
-  | mk (decl : LocalDecl) (hdecl : get? body.localDecls dstIdx = some decl)
+  | mk (decl : LocalDecl)
+       (placeDecl : LocalDecl)
+       (decl_lookup : get? body.localDecls dstIdx = some decl)
+       (place_lookup : get? body.localDecls place.local_ = some placeDecl)
 
 theorem evalProjection_downcast_field_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -103,7 +116,8 @@ theorem evalProjection_downcast_field_simulation
 inductive WellTypedLM2_3SwitchInt
     (body : CapturedMir) (env : StructTypeEnv) (stEnv : LM2_2StaticEnv)
     (discr : MirAst.Operand) (targets : SwitchTargets) : Prop where
-  | mk (h : True)
+  | mk (ty : Ty)
+       (wt_discr : WellTypedLM2_2Operand body env stEnv discr ty)
 
 theorem enum_match_switchInt_simulation
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
