@@ -27,6 +27,9 @@ import LeanMiriSpec.Correspondence.WitLM2_1
 import LeanMiriSpec.Correspondence.PtrLM3_1
 import LeanMiriSpec.Correspondence.SimLM3_1
 import LeanMiriSpec.Correspondence.WitLM3_1
+import LeanMiriSpec.Correspondence.RefLM3_2
+import LeanMiriSpec.Correspondence.SimLM3_2
+import LeanMiriSpec.Correspondence.WitLM3_2
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -5515,6 +5518,877 @@ example :
       Miri.Interpreter.Step.step hooks () m₀ =
         (m₁, .error (.undefinedBehavior "pointer Offset out of bounds"))) :=
   Witness.wit_lm3_1_cmp_symm_move_ub_and_unified_step_real_steps
+
+
+
+
+
+
+/-! ### `LM-3.2` statement pins -/
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {decl : MirAst.LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_2 mach allocMap decl layouts slot mls) :
+    ∀ l ∈ mls.layout, l = translateTy decl.ty layouts :=
+  LocalRelLM3_2.cachedLayout_eq h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (e : AllocMapEntry) {decl : MirAst.LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_2 mach allocMap decl layouts slot mls) :
+    LocalRelLM3_2 mach (e :: allocMap) decl layouts slot mls :=
+  LocalRelLM3_2.mono_cons e h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (f : AllocMapEntry → AllocMapEntry)
+    (htag : ∀ e, (f e).tag = e.tag)
+    (halloc : ∀ e, (f e).allocId = e.allocId)
+    {decl : MirAst.LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_2 mach allocMap decl layouts slot mls) :
+    LocalRelLM3_2 mach (allocMap.map f) decl layouts slot mls :=
+  LocalRelLM3_2.map_preserve f htag halloc h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach mach' : AnnealMachine} {allocMap : List AllocMapEntry}
+    {decl : MirAst.LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (hlive : ∀ e, e ∈ mach.memory.live.toList → e ∈ mach'.memory.live.toList)
+    (hbase : ∀ a la, (a, la) ∈ mach.memory.live.toList →
+      mach'.lookupBaseAddr a = mach.lookupBaseAddr a)
+    (h : LocalRelLM3_2 mach allocMap decl layouts slot mls) :
+    LocalRelLM3_2 mach' allocMap decl layouts slot mls :=
+  LocalRelLM3_2.of_live_base hlive hbase h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {decl : MirAst.LocalDecl} {layouts : LayoutTable} {slot : LocalSlot}
+    {mp : Miri.Interpreter.MemPlace AnnealProv} {lay : Option Miri.Interpreter.LocalLayout}
+    (h : LocalRelLM3_2 mach allocMap decl layouts slot ⟨.live (.indirect mp), lay⟩) :
+    LocalRelLM3_1 mach allocMap decl layouts slot ⟨.live (.indirect mp), lay⟩ :=
+  LocalRelLM3_2.indirect_base h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine}
+    {allocMap : List AllocMapEntry} {af : StackFrame}
+    {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : FrameRelLM3_1 body mach allocMap af mf) :
+    FrameRelLM3_2 body mach allocMap af mf :=
+  FrameRelLM3_1.toLM3_2 h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (h : StateRelLM3_1 body s m allocMap) :
+    StateRelLM3_2 body s m allocMap :=
+  StateRelLM3_1.toLM3_2 h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepRelLM3_1 body m allocMap aRes mRes) :
+    StepRelLM3_2 body m allocMap aRes mRes :=
+  StepRelLM3_1.toLM3_2 h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine}
+    {allocMap : List AllocMapEntry} {af : StackFrame}
+    {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : FrameRelLM3_2 body mach allocMap af mf)
+    (hnoref : ∀ i decl, get? body.localDecls i = some decl →
+      ∀ mutability pointeeKind, decl.ty.kind ≠ .ref mutability pointeeKind) :
+    FrameRelLM3_1 body mach allocMap af mf :=
+  FrameRelLM3_2.toLM3_1 h hnoref
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (h : StateRelLM3_2 body s m allocMap)
+    (hnoref : ∀ i decl, get? body.localDecls i = some decl →
+      ∀ mutability pointeeKind, decl.ty.kind ≠ .ref mutability pointeeKind) :
+    StateRelLM3_1 body s m allocMap :=
+  StateRelLM3_2.toLM3_1 h hnoref
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_2 body mach allocMap af mf)
+    {idx : Nat} {decl : MirAst.LocalDecl}
+    (hdecl : get? body.localDecls idx = some decl) :
+    ∃ (slot : LocalSlot) (mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout)
+      (_ : idx < af.locals.length) (hlt_mf : idx < mf.locals.size),
+      get? af.locals idx = some slot ∧
+      mf.locals[idx]? = some mls ∧
+      mf.locals[idx]'hlt_mf = mls ∧
+      LocalRelLM3_2 mach allocMap decl body.layouts slot mls :=
+  FrameRelLM3_2.lookup_local hfr hdecl
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_2 body mach allocMap af mf)
+    {idx : Nat} {decl : MirAst.LocalDecl}
+    (hdecl : get? body.localDecls idx = some decl)
+    (hlt : idx < mf.locals.size) :
+    FrameRelLM3_2 body mach allocMap af
+      (cacheFrameLocalLayout mf idx hlt (translateTy decl.ty body.layouts)) :=
+  FrameRelLM3_2.cache_local_layout hfr hdecl hlt
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    (e : AllocMapEntry)
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_2 body mach allocMap af mf) :
+    FrameRelLM3_2 body mach (e :: allocMap) af mf :=
+  FrameRelLM3_2.mono_cons e hfr
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach mach' : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hlive : ∀ e, e ∈ mach.memory.live.toList → e ∈ mach'.memory.live.toList)
+    (hbase : ∀ a la, (a, la) ∈ mach.memory.live.toList →
+      mach'.lookupBaseAddr a = mach.lookupBaseAddr a)
+    (h : FrameRelLM3_2 body mach allocMap af mf) :
+    FrameRelLM3_2 body mach' allocMap af mf :=
+  FrameRelLM3_2.of_live_base hlive hbase h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hrel : FrameRelLM3_2 body mach allocMap af mf)
+    {idx : Nat} {decl : MirAst.LocalDecl}
+    (hdecl : get? body.localDecls idx = some decl)
+    {hlt_mf : idx < mf.locals.size}
+    (newSlot : LocalSlot) (newVal : Miri.Interpreter.LocalValue AnnealProv)
+    (hnew : LocalRelLM3_2 mach allocMap decl body.layouts newSlot
+      { mf.locals[idx]'hlt_mf with value := newVal }) :
+    FrameRelLM3_2 body mach allocMap
+      { af with locals := af.locals.set idx newSlot }
+      { mf with locals := mf.locals.set idx { mf.locals[idx]'hlt_mf with value := newVal } hlt_mf } :=
+  FrameRelLM3_2.update_local hrel hdecl newSlot newVal hnew
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hfr : FrameRelLM3_2 body mach allocMap af mf)
+    {j : Nat} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {lay : Option Miri.Interpreter.LocalLayout}
+    (hj : mf.locals[j]? = some ⟨.live (.indirect mp), lay⟩) :
+    ∃ a la, mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId = some a ∧
+      (a, la) ∈ mach.memory.live.toList :=
+  FrameRelLM3_2.indirect_allocId hfr hj
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {af : StackFrame} {mf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (h : FrameRelLM3_2 body mach allocMap af mf) :
+    FrameRelLM3_2 body mach allocMap
+      { af with stmtIdx := Nat.add af.stmtIdx 1 }
+      { mf with location := .mir ⟨af.blockIdx, af.stmtIdx + 1⟩ } :=
+  FrameRelLM3_2.advance h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) :
+    FrameRelLM3_2 body m.machine allocMap s.frame tf :=
+  StateRelLM3_2.frame_rel_singleton hstate hframes
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {idx : Nat} {decl : MirAst.LocalDecl} (hdecl : get? body.localDecls idx = some decl)
+    (hlt : idx < tf.locals.size) :
+    StateRelLM3_2 body s
+      { m with stack := ⟨#[cacheFrameLocalLayout tf idx hlt
+          (translateTy decl.ty body.layouts)]⟩ }
+      allocMap :=
+  StateRelLM3_2.cache_layout hstate hframes hdecl hlt
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    {idx : Local} {slot : LocalSlot}
+    (hslot : get? s.frame.locals idx = some slot)
+    (hne_dead : slot ≠ .dead)
+    (himm : IsImmediateFrameLocal tf idx) :
+    ∀ e ∈ allocMap, e.localIdx ≠ idx :=
+  StateRelLM3_2.immediate_not_in_allocMap hstate hframes hslot hne_dead himm
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (id : Miri.Memory.AllocId) (offsetBytes : Nat)
+    (hid : id.value.toNat < 2 ^ 32) (hoff : offsetBytes < 2 ^ 32) :
+    (annealStackBaseAddr id + UInt64.ofNat offsetBytes == 0) = false :=
+  annealStackBaseAddr_add_ne_zero id offsetBytes hid hoff
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} (id : Miri.Memory.AllocId) (borTag : Miri.Memory.BorTag)
+    (offsetBytes : Nat) (pointeeLay : Miri.Interpreter.LocalLayout)
+    (localAlloc :
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind)
+    (hid : id.value.toNat < 2 ^ 32) (hoff : offsetBytes < 2 ^ 32)
+    (hbase : mach.lookupBaseAddr id = some (annealStackBaseAddr id))
+    (hlive : mach.memory.live.find? (fun entry => entry.1 == id) = some (id, localAlloc))
+    (hsz : Miri.Memory.sizeAsI64 pointeeLay.layout.size =
+      .ok (pointeeLay.layout.size.bytes.toNat : Int))
+    (hpos : 0 < pointeeLay.layout.size.bytes.toNat)
+    (hfit : (pointeeLay.layout.size.bytes.toNat : Int) < 2 ^ 63)
+    (hinbounds : offsetBytes + pointeeLay.layout.size.bytes.toNat ≤
+      localAlloc.allocation.byteSize.bytes.toNat)
+    (haligned : annealOffsetMisalignment
+      (Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes))
+      pointeeLay.layout.align.abi = .ok none) :
+    annealSafeRefDerefCheck mach
+        (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+            .concrete id borTag⟩))
+        pointeeLay =
+      .ok ⟨⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+        some (.concrete id borTag)⟩, .none, none⟩ :=
+  annealSafeRefDerefCheck_live_ok id borTag offsetBytes pointeeLay localAlloc hid hoff hbase hlive hsz hpos hfit hinbounds haligned
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} (id : Miri.Memory.AllocId) (borTag : Miri.Memory.BorTag)
+    (offsetBytes : Nat) (pointeeLay : Miri.Interpreter.LocalLayout)
+    (hid : id.value.toNat < 2 ^ 32) (hoff : offsetBytes < 2 ^ 32)
+    (hbase : mach.lookupBaseAddr id = some (annealStackBaseAddr id))
+    (hdead : mach.memory.live.find? (fun entry => entry.1 == id) = none)
+    (hsz : Miri.Memory.sizeAsI64 pointeeLay.layout.size =
+      .ok (pointeeLay.layout.size.bytes.toNat : Int))
+    (hpos : 0 < pointeeLay.layout.size.bytes.toNat)
+    (hfit : (pointeeLay.layout.size.bytes.toNat : Int) < 2 ^ 63) :
+    annealSafeRefDerefCheck mach
+        (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+            .concrete id borTag⟩))
+        pointeeLay =
+      .error (.undefinedBehavior "dereferencing a dangling reference") :=
+  annealSafeRefDerefCheck_dead_err id borTag offsetBytes pointeeLay hid hoff hbase hdead hsz hpos hfit
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} (id : Miri.Memory.AllocId) (borTag : Miri.Memory.BorTag)
+    (offsetBytes : Nat) (pointeeLay : Miri.Interpreter.LocalLayout)
+    (localAlloc :
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind)
+    (hid : id.value.toNat < 2 ^ 32) (hoff : offsetBytes < 2 ^ 32)
+    (hbase : mach.lookupBaseAddr id = some (annealStackBaseAddr id))
+    (hlive : mach.memory.live.find? (fun entry => entry.1 == id) = some (id, localAlloc))
+    (hsz : Miri.Memory.sizeAsI64 pointeeLay.layout.size =
+      .ok (pointeeLay.layout.size.bytes.toNat : Int))
+    (hpos : 0 < pointeeLay.layout.size.bytes.toNat)
+    (hfit : (pointeeLay.layout.size.bytes.toNat : Int) < 2 ^ 63)
+    (hoob : localAlloc.allocation.byteSize.bytes.toNat <
+      offsetBytes + pointeeLay.layout.size.bytes.toNat) :
+    annealSafeRefDerefCheck mach
+        (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+            .concrete id borTag⟩))
+        pointeeLay =
+      .error (.undefinedBehavior "dereferencing a dangling reference") :=
+  annealSafeRefDerefCheck_oob_err id borTag offsetBytes pointeeLay localAlloc hid hoff hbase hlive hsz hpos hfit hoob
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} (id : Miri.Memory.AllocId) (borTag : Miri.Memory.BorTag)
+    (offsetBytes : Nat) (pointeeLay : Miri.Interpreter.LocalLayout)
+    (localAlloc :
+      Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+        Miri.Memory.MiriMemoryKind)
+    (hid : id.value.toNat < 2 ^ 32) (hoff : offsetBytes < 2 ^ 32)
+    (hbase : mach.lookupBaseAddr id = some (annealStackBaseAddr id))
+    (hlive : mach.memory.live.find? (fun entry => entry.1 == id) = some (id, localAlloc))
+    (hsz : Miri.Memory.sizeAsI64 pointeeLay.layout.size =
+      .ok (pointeeLay.layout.size.bytes.toNat : Int))
+    (hpos : 0 < pointeeLay.layout.size.bytes.toNat)
+    (hfit : (pointeeLay.layout.size.bytes.toNat : Int) < 2 ^ 63)
+    (hinbounds : offsetBytes + pointeeLay.layout.size.bytes.toNat ≤
+      localAlloc.allocation.byteSize.bytes.toNat)
+    {mis : Miri.Memory.Misalignment}
+    (hmis : annealOffsetMisalignment
+      (Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes))
+      pointeeLay.layout.align.abi = .ok (some mis)) :
+    annealSafeRefDerefCheck mach
+        (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+            .concrete id borTag⟩))
+        pointeeLay =
+      .error (.undefinedBehavior "dereferencing an unaligned reference") :=
+  annealSafeRefDerefCheck_misaligned_err id borTag offsetBytes pointeeLay localAlloc hid hoff hbase hlive hsz hpos hfit hinbounds hmis
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (mach : AnnealMachine) (pointeeLay : Miri.Interpreter.LocalLayout)
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (hsz8 : sc.sizeBytes = 8) (h0 : sc.bits = 0) :
+    annealSafeRefDerefCheck mach (.scalar (Miri.Memory.Scalar.fromScalarInt msc)) pointeeLay =
+      .error (.undefinedBehavior "dereferencing a null reference") :=
+  annealSafeRefDerefCheck_int_null_err mach pointeeLay hrel hsz8 h0
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (mach : AnnealMachine) (pointeeLay : Miri.Interpreter.LocalLayout)
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (hsz8 : sc.sizeBytes = 8) (hne : sc.bits ≠ 0)
+    (hsz : Miri.Memory.sizeAsI64 pointeeLay.layout.size =
+      .ok (pointeeLay.layout.size.bytes.toNat : Int))
+    (hpos : 0 < pointeeLay.layout.size.bytes.toNat)
+    (hfit : (pointeeLay.layout.size.bytes.toNat : Int) < 2 ^ 63) :
+    annealSafeRefDerefCheck mach (.scalar (Miri.Memory.Scalar.fromScalarInt msc)) pointeeLay =
+      .error (.undefinedBehavior "dereferencing a dangling reference") :=
+  annealSafeRefDerefCheck_int_dangling_err mach pointeeLay hrel hsz8 hne hsz hpos hfit
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) {idx : Nat} (hlt : idx < tf.locals.size)
+    {imm : Miri.Interpreter.Immediate AnnealProv}
+    (hval : (tf.locals[idx]'hlt).value = .live (.immediate imm))
+    (lay : Miri.Interpreter.LocalLayout) :
+    annealValidityPlaceOperand ⟨.local 0 idx none tf.localsIdentity, lay⟩ m =
+      .ok (.immediate imm) m :=
+  annealValidityPlaceOperand_local hframes hlt hval lay
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (layouts : LayoutTable) (c : Ty) {ty : Ty}
+    (st : AnnealStepState) :
+    (ty.kind = .bool →
+      annealValidityClassify c (translateTy ty layouts).ty st = .ok .boolean st) ∧
+    (ty.kind = .char →
+      annealValidityClassify c (translateTy ty layouts).ty st = .ok .character st) ∧
+    (∀ it, ty.kind = .int it →
+      annealValidityClassify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+    (∀ ut, ty.kind = .uint ut →
+      annealValidityClassify c (translateTy ty layouts).ty st = .ok .integer st) ∧
+    (ty.kind = .never →
+      annealValidityClassify c (translateTy ty layouts).ty st = .ok .never st) :=
+  annealValidityClassify_prim layouts c st
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (hsz1 : sc.sizeBytes = 1) :
+    (∃ b, (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toBool = .ok b) ↔
+      (sc.bits = 0 ∨ sc.bits = 1) :=
+  fromScalarInt_toBool_ok_iff hrel hsz1
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (layouts : LayoutTable) (c : Ty)
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) {idx : Nat} (hlt : idx < tf.locals.size)
+    {sc : Miri.Memory.Scalar AnnealProv}
+    (hval : (tf.locals[idx]'hlt).value = .live (.immediate (.scalar sc)))
+    (lay : Miri.Interpreter.LocalLayout) (ev : Miri.Memory.ExpectedValue) :
+    (annealValidityHooks layouts).readImmediate c ⟨.local 0 idx none tf.localsIdentity, lay⟩ ev m =
+      .ok ⟨.scalar sc, lay⟩ m :=
+  annealValidityHooks_readImmediate_local layouts c hframes hlt hval lay ev
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (layouts : LayoutTable) (c : Ty) {ty : Ty}
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} (hrel : ScalarRel sc msc)
+    (hsz : (translateTy ty layouts).layout.size = translateSizeBytes sc.sizeBytes)
+    {m : AnnealStepState}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf]) {idx : Nat} (hlt : idx < tf.locals.size)
+    (hval : (tf.locals[idx]'hlt).value = .live (.immediate (.scalar (.fromScalarInt msc))))
+    (ev : Miri.Memory.ExpectedValue) :
+    (annealValidityHooks layouts).readImmediate c
+        ⟨.local 0 idx none tf.localsIdentity, translateTy ty layouts⟩ ev m =
+      .ok ⟨.scalar (.fromScalarInt msc), translateTy ty layouts⟩ m ∧
+    (ty.kind = .bool →
+      annealValidityClassify c (translateTy ty layouts).ty m = .ok .boolean m ∧
+      ((∃ b, (Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) msc).toBool = .ok b) ↔
+        AnnealScalarValid ty sc)) ∧
+    (ty.kind = .char →
+      annealValidityClassify c (translateTy ty layouts).ty m = .ok .character m) ∧
+    ((∃ it, ty.kind = .int it) ∨ (∃ ut, ty.kind = .uint ut) →
+      annealValidityClassify c (translateTy ty layouts).ty m = .ok .integer m ∧
+      AnnealScalarValid ty sc) ∧
+    (ty.kind = .never →
+      annealValidityClassify c (translateTy ty layouts).ty m = .ok .never m) :=
+  validityVisitor_scalar_bool_simulation layouts c hrel hsz hframes hlt hval ev
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {α β : Type} {f : α → β} :
+    ∀ {l : List α}, (l.map f).Nodup → ∀ {a b : α}, a ∈ l → b ∈ l → f a = f b → a = b :=
+  mem_eq_of_map_nodup
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState}
+    {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    (halloc : AllocMapRel body s m allocMap)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+    (hptr : PtrRel allocMap p mptr) {e : AllocMapEntry} (he : e ∈ allocMap)
+    (htag : e.tag = p.tag) :
+    ∃ borTag, mptr =
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId + UInt64.ofNat p.offsetBytes),
+        .concrete e.allocId borTag⟩ ∧ p.offsetBytes < 2 ^ 32 :=
+  PtrRel.allocId_of_entry halloc hptr he htag
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (layouts : LayoutTable) (c : Ty)
+    (m : AnnealStepState) (ptr : Miri.Memory.Pointer (Option AnnealProv))
+    (size : Miri.ABI.Size) :
+    (annealValidityHooks layouts).checkPointerAccess c ptr size m =
+      .ok (annealValidityAccessCheck m.machine ptr size) m :=
+  annealValidityHooks_checkPointerAccess_eq layouts c m ptr size
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (mach : AnnealMachine)
+    (id : Miri.Memory.AllocId) (borTag : Miri.Memory.BorTag) (offsetBytes : Nat)
+    (size : Miri.ABI.Size)
+    (hid : id.value.toNat < 2 ^ 32) (hoff : offsetBytes < 2 ^ 32)
+    (hbase : mach.lookupBaseAddr id = some (annealStackBaseAddr id))
+    (hsz : Miri.Memory.sizeAsI64 size = .ok (size.bytes.toNat : Int))
+    (hpos : 0 < size.bytes.toNat) (hfit : (size.bytes.toNat : Int) < 2 ^ 63) :
+    (∀ localAlloc, mach.memory.live.find? (fun entry => entry.1 == id) =
+        some (id, localAlloc) →
+      offsetBytes + size.bytes.toNat ≤ localAlloc.allocation.byteSize.bytes.toNat →
+      annealValidityAccessCheck mach
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+            some (.concrete id borTag)⟩ size = .ok ()) ∧
+    (∀ localAlloc, mach.memory.live.find? (fun entry => entry.1 == id) =
+        some (id, localAlloc) →
+      localAlloc.allocation.byteSize.bytes.toNat < offsetBytes + size.bytes.toNat →
+      ∃ err, annealValidityAccessCheck mach
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+            some (.concrete id borTag)⟩ size = .error err) ∧
+    (mach.memory.live.find? (fun entry => entry.1 == id) = none →
+      ∃ err, annealValidityAccessCheck mach
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr id + UInt64.ofNat offsetBytes),
+            some (.concrete id borTag)⟩ size = .error err) :=
+  annealValidityAccessCheck_stack mach id borTag offsetBytes size hid hoff hbase hsz hpos hfit
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {p : ProvenancePtr} {mptr : Miri.Memory.Pointer AnnealProv}
+    (hptr : PtrRel allocMap p mptr) (hoff0 : p.offsetBytes = 0)
+    {e : AllocMapEntry} (he : e ∈ allocMap) (htag : e.tag = p.tag)
+    {targetDecl : MirAst.LocalDecl} (hdecl_t : get? body.localDecls e.localIdx = some targetDecl)
+    {refTy : Ty} {refMut : Mutability}
+    (hrefTy : refTy.kind = .ref refMut targetDecl.ty.kind) :
+    (∀ slot, get? s.frame.locals e.localIdx = some slot → slot ≠ .dead →
+      annealValidityPointeeLayout body.layouts refTy =
+        some (translateTy targetDecl.ty body.layouts) ∧
+      (annealValidityHooks body.layouts).checkPointerAccess refTy mptr.withOptionalProvenance
+          (translateTy targetDecl.ty body.layouts).layout.size m = .ok (.ok ()) m ∧
+      (annealValidityHooks body.layouts).checkPointerAlignResult refTy
+          mptr.withOptionalProvenance
+          (translateTy targetDecl.ty body.layouts).layout.align.abi m = .ok (.ok ()) m ∧
+      annealSafeRefDerefCheck m.machine
+          (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
+          (translateTy targetDecl.ty body.layouts) =
+        .ok ⟨mptr.withOptionalProvenance, .none, none⟩) ∧
+    (get? s.frame.locals e.localIdx = some .dead →
+      (∃ err, (annealValidityHooks body.layouts).checkPointerAccess refTy
+          mptr.withOptionalProvenance
+          (translateTy targetDecl.ty body.layouts).layout.size m = .ok (.error err) m) ∧
+      annealSafeRefDerefCheck m.machine
+          (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))
+          (translateTy targetDecl.ty body.layouts) =
+        .error (.undefinedBehavior "dereferencing a dangling reference") ∧
+      ∀ refIdx, get? s.frame.locals refIdx = some (.init (.ptr p 8)) →
+        evalOperand s.frame.locals (.copy ⟨refIdx, .cons .deref .nil⟩) s.memory.borrows
+          s.memory.globals body.layouts s.memory.callerLocals = .ub) :=
+  validityVisitor_ref_dereferenceable_simulation hstate hptr hoff0 he htag hdecl_t hrefTy
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (s : MachineState) (localDecls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (bk : BorrowKind) (targetIdx : Local) (slot : LocalSlot)
+    (hslot : get? s.frame.locals targetIdx = some slot)
+    (hlive : slot ≠ .dead) :
+    let perm : TreeBorrowPerm := refBorrowPerm localDecls layouts bk targetIdx
+    let entry : BorrowEntry :=
+      { tag := s.memory.nextTag
+        targetLocal := targetIdx
+        targetProjection := .nil
+        perm := perm }
+    evalRvalue s.frame.locals (.ref bk ⟨targetIdx, .nil⟩) s.memory localDecls layouts =
+      .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8)
+        s.frame.locals
+        { s.memory with
+          borrows := .cons entry s.memory.borrows
+          nextTag := s.memory.nextTag + 1 } :=
+  evalRvalue_ref_live_eq s localDecls layouts bk targetIdx slot hslot hlive
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example (s : MachineState) (localDecls : List MirAst.LocalDecl) (layouts : LayoutTable)
+    (bk : BorrowKind) (targetIdx : Local)
+    (hdead : get? s.frame.locals targetIdx = some .dead) :
+    evalRvalue s.frame.locals (.ref bk ⟨targetIdx, .nil⟩) s.memory localDecls layouts =
+      .ub :=
+  evalRvalue_ref_dead_eq s localDecls layouts bk targetIdx hdead
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {ld : List MirAst.LocalDecl} {ly : LayoutTable} {region : Miri.MIR.Region}
+    {borrow : Miri.MIR.BorrowKind}
+    {dst src : Miri.MIR.Place} {m m₁ m₂ m₃ : AnnealStepState}
+    {dest srcPlace : Miri.Interpreter.RuntimePlace AnnealProv}
+    {mp : Miri.Interpreter.MemPlace AnnealProv} {imm : Miri.Interpreter.Immediate AnnealProv}
+    (hdst : annealEvalPlace ld ly dst m = .ok dest m₁)
+    (hsrc : annealEvalPlace ld ly src m₁ = .ok srcPlace m₂)
+    (hforce : annealForceAllocation ld ly srcPlace m₂ = .ok mp m₃)
+    (href : mp.toRef annealTargetDataLayout = .ok imm) :
+    Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks ld ly) ()
+        (.Ref region borrow src) dst m =
+      annealWriteImmediate imm dest m₃ :=
+  evalRvalueIntoPlace_ref_ok hdst hsrc hforce href
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {ld : List MirAst.LocalDecl} {ly : LayoutTable} {region : Miri.MIR.Region}
+    {borrow : Miri.MIR.BorrowKind}
+    {dst src : Miri.MIR.Place} {m m₁ m₂ m₃ : AnnealStepState}
+    {dest srcPlace : Miri.Interpreter.RuntimePlace AnnealProv}
+    {err : Miri.Interpreter.StepError}
+    (hdst : annealEvalPlace ld ly dst m = .ok dest m₁)
+    (hsrc : annealEvalPlace ld ly src m₁ = .ok srcPlace m₂)
+    (hforce : annealForceAllocation ld ly srcPlace m₂ = .error err m₃) :
+    Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks ld ly) ()
+        (.Ref region borrow src) dst m =
+      .error err m₃ :=
+  evalRvalueIntoPlace_ref_force_error hdst hsrc hforce
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx targetIdx : Local} {bk : BorrowKind} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨targetIdx, .nil⟩), span⟩)
+    {dstDecl targetDecl : MirAst.LocalDecl} {refMut : Mutability} {pointeeKind : RigidTy}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_tgt : get? body.localDecls targetIdx = some targetDecl)
+    (hdst_ty : dstDecl.ty.kind = .ref refMut pointeeKind)
+    (htgt_ty : IsPrimScalarTy targetDecl.ty)
+    (hne : dstIdx ≠ targetIdx)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame targetIdx)
+    (hsupply : AllocIdSupplyReady m.machine.memory) :
+    StepRelLM3_2 body m
+      (refAllocMapEntry body.localDecls body.layouts bk targetIdx s.memory.nextTag
+        ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩ :: allocMap)
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
+  evalRvalue_ref_simulation hstate hphase hbb hstmt hdecl_dst hdecl_tgt hdst_ty htgt_ty hne himm hsupply
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine}
+    {allocMap : List AllocMapEntry} {decl : MirAst.LocalDecl} {layouts : LayoutTable}
+    {slot : LocalSlot}
+    {mls : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    {mutability : Mutability} {pointeeKind : RigidTy}
+    (hty : decl.ty.kind = .rawPtr mutability pointeeKind)
+    (h : LocalRelLM3_2 mach allocMap decl layouts slot mls) :
+    LocalRelLM3_1 mach allocMap decl layouts slot mls :=
+  LocalRelLM3_2.toLM3_1_of_rawPtr hty h
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {mach : AnnealMachine} {allocMap : List AllocMapEntry}
+    {refDecl : MirAst.LocalDecl} {layouts : LayoutTable}
+    {mutability : Mutability} {pointeeKind : RigidTy}
+    (hty : refDecl.ty.kind = .ref mutability pointeeKind)
+    {slot_p : LocalSlot}
+    {mls_p : Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout}
+    (hloc : LocalRelLM3_2 mach allocMap refDecl layouts slot_p mls_p)
+    (hnot_ind : ∀ mp, mls_p.value ≠ .live (.indirect mp)) :
+    (slot_p = .dead ∧ mls_p.value = .dead) ∨
+    (slot_p = .uninit ∧ mls_p.value = .live (.immediate .uninit)) ∨
+    (∃ sc msc, slot_p = .init (.scalar sc) ∧ sc.sizeBytes = 8 ∧ ScalarRel sc msc ∧
+      mls_p.value = .live (.immediate (.scalar (.fromScalarInt msc)))) ∨
+    (∃ ptrVal mptr, slot_p = .init (.ptr ptrVal 8) ∧ PtrRel allocMap ptrVal mptr ∧
+      mls_p.value = .live (.immediate (.scalar
+        (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)))) :=
+  LocalRelLM3_2.ref_immediate_cases hty hloc hnot_ind
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local}
+    {dstDecl ptrDecl : MirAst.LocalDecl}
+    {bk : BorrowKind} {ptrMut dstMut : Mutability} {pointeeKind dstPointee : RigidTy} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨ptrIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    (hno_int : ∀ sc, get? s.frame.locals ptrIdx ≠ some (.init (.scalar sc)))
+    (hzero_perm : ∀ ptrVal e,
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared)) :
+    ((stepMirFn body s = MirStepNode.fail .ub) ↔
+      ∃ m' msg,
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+          (m', .error (.undefinedBehavior msg))) ∧
+    (∀ ptrVal e,
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      get? s.frame.locals dstIdx ≠ some .dead →
+      (∃ s', stepMirFn body s = .step s' ∧
+        get? s'.frame.locals dstIdx =
+          some (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8))) ∧
+      ∃ m' tf' borTag,
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+          (m', .ok true) ∧
+        m'.stack.frames = #[tf'] ∧ m'.machine = m.machine ∧
+        (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+          some (.live (.immediate (.scalar
+            (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+              ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+                .concrete e.allocId borTag⟩))))) :=
+  evalRvalue_reborrow_simulation hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hno_int hzero_perm
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local}
+    {dstDecl ptrDecl : MirAst.LocalDecl}
+    {bk : BorrowKind} {ptrMut dstMut : Mutability} {pointeeKind dstPointee : RigidTy} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨ptrIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    (hno_int : ∀ sc, get? s.frame.locals ptrIdx ≠ some (.init (.scalar sc)))
+    (hzero_perm : ∀ ptrVal e,
+      get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ allocMap → e.tag = ptrVal.tag →
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared))
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry}
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hdead_t : get? s.frame.locals e.localIdx = some .dead)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    {targetDecl : MirAst.LocalDecl} (hdecl_t : get? body.localDecls e.localIdx = some targetDecl) :
+    (∃ s', stepMirFn body s = .step s' ∧
+      get? s'.frame.locals dstIdx =
+        some (.init (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8))) ∧
+    ∃ m' tf' borTag,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+              .concrete e.allocId borTag⟩)))) ∧
+      (∃ err, annealValidityAccessCheck m'.machine
+        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId), some (.concrete e.allocId borTag)⟩
+        (translateTy targetDecl.ty body.layouts).layout.size = .error err) ∧
+      annealSafeRefDerefCheck m'.machine
+          (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr e.allocId),
+              .concrete e.allocId borTag⟩))
+          (translateTy targetDecl.ty body.layouts) =
+        .error (.undefinedBehavior "dereferencing a dangling reference") :=
+  evalRvalue_reborrow_dangling_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hno_int hzero_perm hslot_p he htag hdead_t hdst_live hdecl_t
+
+open Trusted.Rustc.V2026_06_01.Layout in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx ptrIdx : Local}
+    {dstDecl ptrDecl : MirAst.LocalDecl}
+    {bk : BorrowKind} {ptrMut dstMut : Mutability} {pointeeKind dstPointee : RigidTy}
+    {ptrVal : ProvenancePtr} {e : AllocMapEntry} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨ptrIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ptr : get? body.localDecls ptrIdx = some ptrDecl)
+    (hptr_ty : ptrDecl.ty.kind = .rawPtr ptrMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame ptrIdx)
+    (hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hslot_p : get? s.frame.locals ptrIdx = some (.init (.ptr ptrVal 8)))
+    (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hperm : e.perm = .disabled ∨ (e.perm = .frozen ∧ bk ≠ .shared)) :
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ m' tf' borTag,
+      Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+        (m', .ok true) ∧
+      m'.stack.frames = #[tf'] ∧
+      (tf'.locals[dstIdx]?).map Miri.Interpreter.LocalState.value =
+        some (.live (.immediate (.scalar
+          (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+            ⟨Miri.ABI.Size.ofBytes
+              (annealStackBaseAddr e.allocId + UInt64.ofNat ptrVal.offsetBytes),
+              .concrete e.allocId borTag⟩)))) :=
+  evalRvalue_reborrow_perm_divergence hstate hphase hbb hstmt hdecl_dst hdecl_ptr hptr_ty hdst_ty hpk_prim himm hdst_live hslot_p he htag hperm
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    StateRel lm32RefBody lm32RefAnnealPre lm32RefMiriPre :=
+  Witness.lm32Ref_stateRel_pre
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    ∀ topFrame, lm32RefMiriPre.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame 2 ∧ IsImmediateFrameLocal topFrame 1 :=
+  Witness.lm32Ref_immediate_pre
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    ∃ (s' : MachineState) (m' : AnnealStepState),
+      stepMirFn lm32RefBody lm32RefAnnealPre = .step s' ∧
+      Miri.Interpreter.Step.step
+          (annealStepHooks lm32RefBody.localDecls lm32RefBody.layouts) ()
+          lm32RefMiriPre = (m', .ok true) ∧
+      StateRelLM3_2 lm32RefBody s' m'
+        [refAllocMapEntry lm32RefBody.localDecls lm32RefBody.layouts .shared 1 1
+          lm31AllocId1] :=
+  Witness.wit_lm3_2_ref_step
+
+open Trusted.Rustc.V2026_06_01.Layout in
+open Witness in
+example :
+    lm32Validate boolTyLM32 (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 1))) =
+      .ok () (lm32ValidityState (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 1)))) ∧
+    (∃ msg, lm32Validate boolTyLM32 (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 2))) =
+      .error (.undefinedBehavior msg)
+        (lm32ValidityState (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 2))))) ∧
+    lm32Validate charTyLM32 (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 0x41))) =
+      .ok () (lm32ValidityState
+        (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 0x41)))) ∧
+    (∃ msg, lm32Validate charTyLM32
+        (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 0xD800))) =
+      .error (.undefinedBehavior msg)
+        (lm32ValidityState (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 0xD800))))) ∧
+    (∃ msg, lm32Validate neverTyLM32 .uninit =
+      .error (.undefinedBehavior msg) (lm32ValidityState .uninit)) ∧
+    (∃ msg, lm32Validate refU64Ty
+        (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
+            .concrete lm31AllocId1 Miri.Memory.BorTag.one⟩)) =
+      .error (.undefinedBehavior msg)
+        (lm32ValidityState (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr lm31AllocId1),
+            .concrete lm31AllocId1 Miri.Memory.BorTag.one⟩)))) ∧
+    (∃ msg, lm32Validate refU64Ty (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 0))) =
+      .error (.undefinedBehavior msg)
+        (lm32ValidityState (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt64 0))))) :=
+  Witness.wit_lm3_2_validity_visitor_runs
+
+/-! ## `LM-3.2`: safe references, reborrows, and validity -/
+
+open LeanMiriSpec.Correspondence in
+#assert_standard_axioms
+  lookupRefDerefPointeeLayout
+  annealSafeRefDerefCheck
+  annealDerefSafeRefToMemPlace
+  LocalRelLM3_2
+  FrameRelLM3_2
+  StateRelLM3_2
+  ImmediateRelLM3_2
+  StepRelLM3_2
+  annealValidityPlaceHooks
+  annealValidityProjectionHooks
+  annealValidityClassify
+  annealValidityPointeeLayout
+  annealValidityPlaceOperand
+  annealValidityAccessCheck
+  annealValidityHooks
+  AnnealScalarValid
+  refBorrowPerm
+  refAllocMapEntry
+  Witness.refU64Ty
+  Witness.refU64Decl
+  Witness.lm32RefBody
+  Witness.lm32RefAnnealPre
+  Witness.lm32RefMiriFramePre
+  Witness.lm32RefMiriPre
+  Witness.lm32ValidityFrame
+  Witness.lm32ValidityState
+  Witness.lm32Validate
+  Witness.charTyLM32
+  Witness.boolTyLM32
+  Witness.neverTyLM32
+  LocalRelLM3_2.cachedLayout_eq
+  LocalRelLM3_2.mono_cons
+  LocalRelLM3_2.map_preserve
+  LocalRelLM3_2.of_live_base
+  LocalRelLM3_2.indirect_base
+  FrameRelLM3_1.toLM3_2
+  StateRelLM3_1.toLM3_2
+  StepRelLM3_1.toLM3_2
+  FrameRelLM3_2.toLM3_1
+  StateRelLM3_2.toLM3_1
+  FrameRelLM3_2.lookup_local
+  FrameRelLM3_2.cache_local_layout
+  FrameRelLM3_2.mono_cons
+  FrameRelLM3_2.of_live_base
+  FrameRelLM3_2.update_local
+  FrameRelLM3_2.indirect_allocId
+  FrameRelLM3_2.advance
+  StateRelLM3_2.frame_rel_singleton
+  StateRelLM3_2.cache_layout
+  StateRelLM3_2.immediate_not_in_allocMap
+  annealStackBaseAddr_add_ne_zero
+  annealSafeRefDerefCheck_live_ok
+  annealSafeRefDerefCheck_dead_err
+  annealSafeRefDerefCheck_oob_err
+  annealSafeRefDerefCheck_misaligned_err
+  annealSafeRefDerefCheck_int_null_err
+  annealSafeRefDerefCheck_int_dangling_err
+  annealValidityPlaceOperand_local
+  annealValidityClassify_prim
+  fromScalarInt_toBool_ok_iff
+  annealValidityHooks_readImmediate_local
+  validityVisitor_scalar_bool_simulation
+  mem_eq_of_map_nodup
+  PtrRel.allocId_of_entry
+  annealValidityHooks_checkPointerAccess_eq
+  annealValidityAccessCheck_stack
+  validityVisitor_ref_dereferenceable_simulation
+  evalRvalue_ref_live_eq
+  evalRvalue_ref_dead_eq
+  evalRvalueIntoPlace_ref_ok
+  evalRvalueIntoPlace_ref_force_error
+  evalRvalue_ref_simulation
+  LocalRelLM3_2.toLM3_1_of_rawPtr
+  LocalRelLM3_2.ref_immediate_cases
+  evalRvalue_reborrow_simulation
+  evalRvalue_reborrow_dangling_divergence
+  evalRvalue_reborrow_perm_divergence
+  Witness.lm32Ref_stateRel_pre
+  Witness.lm32Ref_immediate_pre
+  Witness.wit_lm3_2_ref_step
+  Witness.wit_lm3_2_validity_visitor_runs
 
 end StatementPins
 

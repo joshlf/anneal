@@ -894,6 +894,29 @@ private theorem annealReadImmediate_preserves (op : Miri.Interpreter.OpTy Anneal
     RvaluePreservesAllImm (annealReadImmediate op) :=
   rvaluePreservesAllImm_of_eq (fun _ _ _ => annealReadImmediate_eq)
 
+private theorem annealDerefSafeRefToMemPlace_preserves
+    (ld : List LocalDecl) (ly : LayoutTable)
+    (loc : Miri.MIR.LocalId) (op : Miri.Interpreter.Operand AnnealProv)
+    (lay : Miri.Interpreter.LocalLayout) :
+    RvaluePreservesAllImm (annealDerefSafeRefToMemPlace ld ly loc op lay) := by
+  unfold annealDerefSafeRefToMemPlace
+  cases lookupRefDerefPointeeLayout ld ly loc with
+  | none => exact rvaluePreservesAllImm_throw _
+  | some pointeeLay =>
+    dsimp only []
+    refine rvaluePreservesAllImm_bind (annealReadImmediate_preserves _) (fun ptrImm => ?_)
+    apply rvaluePreservesAllImm_of_eq
+    intro m a m' h
+    dsimp only [bind, EStateM.bind, get, getThe, MonadStateOf.get, EStateM.get] at h
+    cases hc : annealSafeRefDerefCheck m.machine ptrImm.imm pointeeLay with
+    | ok mp =>
+      rw [hc] at h
+      cases h
+      exact ⟨rfl, rfl⟩
+    | error e =>
+      rw [hc] at h
+      cases h
+
 private theorem annealDerefOperandToMemPlace_preserves
     (ld : List LocalDecl) (ly : LayoutTable)
     (loc : Miri.MIR.LocalId) (op : Miri.Interpreter.Operand AnnealProv)
@@ -901,7 +924,7 @@ private theorem annealDerefOperandToMemPlace_preserves
     RvaluePreservesAllImm (annealDerefOperandToMemPlace ld ly loc op lay) := by
   unfold annealDerefOperandToMemPlace
   cases lookupDerefPointeeLayout ld ly loc lay with
-  | none => exact rvaluePreservesAllImm_throw _
+  | none => exact annealDerefSafeRefToMemPlace_preserves ld ly loc op lay
   | some pointeeLay =>
     dsimp only []
     refine rvaluePreservesAllImm_bind (annealReadImmediate_preserves _) (fun ptrImm => ?_)
