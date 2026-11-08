@@ -469,6 +469,92 @@ theorem mir_disableLocalBorrows_algebraic_properties
       candidateTag ancestorTag hGet hSetDead hGetDead hSetRevived hNoProt
   exact ⟨hRev.1, hRev.2.2.1⟩
 
+/-- Unified correspondence consumer for the remaining `Statements.lean`
+universal characterizations of `StorageDead`/`StorageLive` borrow-table framing,
+protector conflict subsumption, post-revival stale-pointer dereference UB
+(including `StatementKind.setDiscriminant`), and `PlaceMention` operand
+initialization (including the biconditional `evalStmt_placeMention_nonDeref_index_iff`):
+1. `hasProtectedLocalBorrow_of_hasProtectedWriteConflict`: whole-local write
+   protector conflicts imply deallocation protector conflicts;
+2. `lookupBorrow_disableLocalBorrows_of_targetLocal_ne` and
+   `lookupBorrow_disableLocalBorrows_of_eq_none`: `disableLocalBorrows` preserves
+   tags targeting other stack locals and leaves non-stack (global) tags unresolved;
+3. `evalStmt_storageRevive_old_ptr_deref_ub`: any tag targeting `loc` resolves to
+   `.disabled` after `disableLocalBorrows` and faults with `.ub` across all 10
+   dereferencing read, write, reborrow, retag, `setDiscriminant`, and
+   non-zero-length `copy_nonoverlapping` operations; and
+4. `evalStmt_placeMention_local_uninit_ok`, `evalStmt_placeMention_deref_init_ok`,
+   `evalStmt_placeMention_deref_uninit_ub`, and
+   `evalStmt_placeMention_nonDeref_index_iff`: complete characterization of
+   `StatementKind.placeMention` across bare, dereferencing, and non-dereferencing
+   projection paths. -/
+theorem mir_storageRevive_and_placeMention_characterizations
+    (s : MachineState) (loc ptrLoc : Local) (tag n : Nat)
+    (slot : LocalSlot) (v writeVal otherVal : Value)
+    (ptrVal : ProvenancePtr) (sz : Nat)
+    (proj restProj : List ProjectionElem) (localsAfter : List LocalSlot)
+    (borrowKind : BorrowKind) (retagKind : RetagKind) (span : String)
+    (srcOp dstOp : Operand) (entry : BorrowEntry)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors loc .none .nil = true →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true) ∧
+    (lookupBorrow s.memory.borrows tag = .some entry →
+      entry.targetLocal ≠ loc →
+      lookupBorrow (disableLocalBorrows s.memory.borrows loc) tag = .some entry) ∧
+    (lookupBorrow s.memory.borrows tag = .none →
+      lookupBorrow (disableLocalBorrows s.memory.borrows loc) tag = .none) ∧
+    (lookupBorrow s.memory.borrows ptrVal.tag = .some entry →
+      entry.targetLocal = loc →
+      get? localsAfter ptrLoc = .some (.init (.ptr ptrVal sz)) →
+      let borrowsAfter := disableLocalBorrows s.memory.borrows loc
+      let derefPlace : Place := { local_ := ptrLoc, projection := .deref :: restProj }
+      let sAfter : MachineState :=
+        { s with
+          frame := { s.frame with locals := localsAfter }
+          memory := { s.memory with borrows := borrowsAfter } }
+      lookupBorrow borrowsAfter ptrVal.tag = .some { entry with perm := .disabled } ∧
+      evalStmt sAfter ⟨.setDiscriminant derefPlace n, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    ((get? s.frame.locals loc = .some .uninit →
+        evalStmt s ⟨.placeMention ⟨loc, .nil⟩, span⟩ localDecls layouts =
+          MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+      (get? s.frame.locals loc = .some (.init v) →
+        placeIndexLocalsInit s.frame.locals restProj = true →
+        evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+          MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+      (get? s.frame.locals loc = .some slot →
+        placeIndexLocalsInit s.frame.locals restProj = false →
+        evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+          MirStepNode.fail .ub) ∧
+      (projectionHasDeref proj = false →
+        get? s.frame.locals loc = .some slot →
+        slot ≠ .dead →
+        (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+            MirStepNode.step (advanceStmt s s.frame.locals) ↔
+          placeIndexLocalsInit s.frame.locals proj = true) ∧
+        (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+            MirStepNode.fail .ub ↔
+          placeIndexLocalsInit s.frame.locals proj = false))) := by
+  refine ⟨
+    hasProtectedLocalBorrow_of_hasProtectedWriteConflict
+      s.memory.borrows s.memory.activeProtectors loc,
+    lookupBorrow_disableLocalBorrows_of_targetLocal_ne
+      s.memory.borrows loc tag entry,
+    lookupBorrow_disableLocalBorrows_of_eq_none
+      s.memory.borrows loc tag,
+    fun hLook hTarget hPtr =>
+      let hAll :=
+        evalStmt_storageRevive_old_ptr_deref_ub
+          s s.memory.borrows s.memory.globals s.memory.callerLocals
+          s.memory.activeProtectors localDecls layouts s.memory
+          loc ptrLoc ptrVal sz restProj localsAfter writeVal borrowKind
+          retagKind span srcOp dstOp otherVal n entry hLook hTarget hPtr
+      ⟨hAll.1, hAll.2.2.2.2.2.2.2.2.1⟩,
+    ⟨(evalStmt_placeMention_local_uninit_ok s loc span localDecls layouts).1,
+      evalStmt_placeMention_deref_init_ok s loc v restProj span localDecls layouts,
+      (evalStmt_placeMention_deref_uninit_ub s loc restProj span localDecls layouts).2.2.2 slot,
+      evalStmt_placeMention_nonDeref_index_iff s loc slot proj span localDecls layouts⟩⟩
+
 /-! ## 2. Terminator Dispatch, Unwinding, and Call-Stack Correspondence -/
 
 /-- Universal proof by structural induction on `branches : List (Nat × BasicBlockIdx)`
@@ -5254,6 +5340,74 @@ theorem stmt_div_storage_revive_ptr_offset_is_ub :
     diffCProbeBounded 16 stmtDivRevivePtrOffsetBody
       (.running (initMachineState stmtDivRevivePtrOffsetBody [])) =
       .some (.some .ub, "_3 = Offset(_2, 1)", .none) := by
+  rfl
+
+/-- `D2` `SetDiscriminant` after `StorageDead` + `StorageLive` revival:
+writing a discriminant through the two-phase mutable borrow `_2 = &two-phase mut _1`
+(whose `.reserved` tag survives the direct write `_1 = [3, 4]` at base `12c9ecb8`)
+after `_1` has been deallocated by `StorageDead(_1)`, revived by
+`StorageLive(_1)`, and re-initialized faults with `FailureKind.ub` (Anneal
+previously updated the revived `_1`'s discriminant and returned `0`):
+```text
+StorageLive(_1); StorageLive(_2);
+_1 = [const 1_u64, const 2_u64]; _2 = &two-phase mut _1;
+StorageDead(_1); StorageLive(_1); _1 = [const 3_u64, const 4_u64];
+SetDiscriminant(*_2, 1); _0 = const 0_u64; return
+``` -/
+private def stmtDivReviveSetDiscrBody : CapturedMir :=
+  stmtDivBody "stmt_div::set_discriminant_through_revived_local_borrow"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy,
+      stmtDivDecl { kind := .ref .mut (.array (.uint .u64) 2), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
+        span := "_1 = [1, 2]" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 3, stmtDivConstU64 4]),
+        span := "_1 = [3, 4]" },
+      { kind := .setDiscriminant ⟨2, [.deref]⟩ 1, span := "SetDiscriminant(*_2, 1)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_storage_revive_set_discriminant_is_ub :
+    diffCProbeBounded 16 stmtDivReviveSetDiscrBody
+      (.running (initMachineState stmtDivReviveSetDiscrBody [])) =
+      .some (.some .ub, "SetDiscriminant(*_2, 1)", .none) := by
+  rfl
+
+/-- `D9` compound deref-plus-uninitialized-index regression: mentioning
+`(*_2)[_3]` when the root pointer `_2 = &raw const _1` is initialized (so the
+leading `.deref` check passes) but the subsequent `.index 3` operand `_3` is
+uninitialized (`placeIndexLocalsInit locals [.deref, .index 3] = false`) faults
+with `FailureKind.ub` (Anneal previously checked only that root local `_2` was
+live and returned `0`):
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = [const 1_u64, const 2_u64]; _2 = &raw const _1;
+PlaceMention((*_2)[_3]); _0 = const 0_u64; return
+``` -/
+private def stmtDivPlaceMentionDerefIndexUninitBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_deref_with_uninit_index"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy,
+      stmtDivDecl { kind := .rawPtr .not (.array (.uint .u64) 2), layoutIdx := 0 },
+      stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
+        span := "_1 = [1, 2]" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .placeMention ⟨2, [.deref, .index 3]⟩, span := "PlaceMention((*_2)[_3])" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_placeMention_deref_index_uninit_is_ub :
+    diffCProbeBounded 16 stmtDivPlaceMentionDerefIndexUninitBody
+      (.running (initMachineState stmtDivPlaceMentionDerefIndexUninitBody [])) =
+      .some (.some .ub, "PlaceMention((*_2)[_3])", .none) := by
   rfl
 
 end StatementDivergenceRegressions
