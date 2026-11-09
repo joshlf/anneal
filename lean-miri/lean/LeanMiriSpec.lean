@@ -41,6 +41,9 @@ import LeanMiriSpec.Correspondence.WitLM3_2
 import LeanMiriSpec.Correspondence.TreeBorrowsRel
 import LeanMiriSpec.Correspondence.SimLM3_3
 import LeanMiriSpec.Correspondence.WitLM3_3
+import LeanMiriSpec.Correspondence.CallLM4_1
+import LeanMiriSpec.Correspondence.SimLM4_1
+import LeanMiriSpec.Correspondence.WitLM4_1
 import LeanMiriSpec.Correspondence.BitsLM4_2
 import LeanMiriSpec.Correspondence.IntrinsicLM4_2
 import LeanMiriSpec.Correspondence.NumericLM4_2
@@ -232,6 +235,31 @@ import LeanMiriSpec.Audit
   disjoint vs. overlapping sub-projections, protected `Cell` chains surviving
   under `.disabled` ancestors, and wrapper ZST/`Freeze`/uninhabited cell
   retags (`LM-3.3`).
+* `LeanMiriSpec.Correspondence.CallLM4_1`: arbitrary-depth multi-frame call
+  stack simulation relation (`MultiFrameStateRel` / `CallStackStateRel`,
+  `FrameStackRel`, `CallerDestinationRel`, `CallerStackLinksRel`,
+  `MultiFrameAllocDisjoint`, `BorrowTrackerStackRel`), bidirectional depth-1
+  bridges to `StateRel` and `TreeBorrowsStateRel`, `ActiveProtectorsValid`,
+  `BorrowTree.releaseProtector` 2-node simulation and 3-node foreign-ancestor
+  counterexample (`borrowTree_protectorEndAccess_simulation`,
+  `borrowTree_releaseProtector_full_simulation`,
+  `cex_end_of_call_foreign_unique_frozen_divergence`), `GlobalState.endCall`
+  frame-pop hook (`annealPopFrameLM4_1`), ZST-aware `annealReturnOperandLM4_1`,
+  and `Stack.cleanupStackFrame` local deallocation correspondence (`LM-4.1`).
+* `LeanMiriSpec.Correspondence.SimLM4_1`: small-step multi-frame terminator
+  correspondence (`step_terminator_call_simulation`,
+  `step_terminator_call_unreachable_unchecked_ub_simulation`,
+  `step_terminator_return_callee_simulation`,
+  `step_terminator_return_root_simulation`,
+  `step_terminator_drop_noop_simulation`,
+  `canonical_drop_no_glue_preserves_local_divergence`,
+  `step_terminator_unreachable_ub_simulation`) (`LM-4.1`).
+* `LeanMiriSpec.Correspondence.WitLM4_1`: concrete multi-frame call (including
+  `copy`/`move` scalar arguments and `.indirect` caller destinations), callee
+  return with `CallId` + `GlobalState.endCall` protector release, ZST `()`
+  callee/root return, scalar root return, `Drop`, `Unreachable`,
+  `BorrowTree.releaseProtector`, and cross-frame unscoped `BorrowEntry`
+  divergence witnesses (`LM-4.1`).
 * `LeanMiriSpec.Correspondence.BitsLM4_2`: `BitVec.ofNat` bit-level lemmas for
   `ctpop`, `ctlz`, `cttz`, `bswap`, and `bitreverse` (`LM-4.2`).
 * `LeanMiriSpec.Correspondence.IntrinsicLM4_2`: `AnnealIntrinsic` catalog,
