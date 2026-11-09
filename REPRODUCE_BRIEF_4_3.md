@@ -4,8 +4,8 @@
 This document verifies the target functions in Fuchsia's `usercopy` (`do_hermetic_copy`, `Usercopy::raw_hermetic_copy`, `copyout`, `copyin`, `copyin_until_null_byte`, `atomic_load_u32_relaxed`, `atomic_load_u32_acquire`) in place using the completed MIR semantics, default `core` lowering, and explicit `#[external_spec]` contracts for FFI/OS boundaries.
 
 ## Worktrees
-1. **Anneal Worktree**: `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4-3` (branch `adv/brief-4-3`)
-2. **Fuchsia Worktree**: `/usr/local/google/Projects/anneal-workspace/fuchsia-wt-brief-4-3` (contains the `examples/fuchsia-usercopy` crate)
+1. **Anneal Worktree**: `<path/to/anneal>` (branch `adv/brief-4-3`)
+2. **Fuchsia Worktree**: `<path/to/anneal>` (contains the `examples/fuchsia-usercopy` crate)
 
 ## Steps to Reproduce
 
@@ -13,10 +13,10 @@ This document verifies the target functions in Fuchsia's `usercopy` (`do_hermeti
 Execute the following command to run the end-to-end verification of the `fuchsia-usercopy` crate against the Anneal semantics:
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4-3
+cd <path/to/anneal>
 export PATH="$(pwd)/target/debug:$PATH"
 cargo build -p cargo-anneal -p anneal-rustc-capture
-cargo run --manifest-path Cargo.toml -p cargo-anneal -- agent-verify --manifest-path /usr/local/google/Projects/anneal-workspace/fuchsia-wt-brief-4-3/examples/fuchsia-usercopy/Cargo.toml
+cargo run --manifest-path Cargo.toml -p cargo-anneal -- agent-verify --manifest-path <path/to/anneal>/examples/fuchsia-usercopy/Cargo.toml
 ```
 
 **Expected Outcome:**
@@ -26,7 +26,7 @@ The command should exit with code `0`. You should see `125/125` jobs completed s
 You can also manually audit individual Lean proof files using `anneal-lean-run` or by opening them in VS Code with the Lean 4 extension.
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/fuchsia-wt-brief-4-3/examples/fuchsia-usercopy
+cd <path/to/anneal>/examples/fuchsia-usercopy
 lake env lean .anneal/generated/Proof/FuchsiaUsercopy/hermetic_copy_stub.lean
 ```
 
