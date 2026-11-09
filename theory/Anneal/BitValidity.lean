@@ -37,7 +37,11 @@ transmutation:
   (`ScalarLayout.initialized pk validRange`, `wrappingRangeContains`, and
   `decodeScalarLayoutBytes`) to `IsFromBytes`, `IsFromZeros`, and exact
   `IsTryFromBytes` decodability for `.primitive` ADTs such as fieldless enum
-  tags and `NonZero*` niches.
+  tags and `NonZero*` niches. It also proves explicit witnesses for the cases
+  where `Trusted`'s codec departs from Rust's validity invariants: generic
+  `NonZero<T>` decoded at its type argument, niches recorded only on a wrapper's
+  backend representation, explicit enum discriminants, and layout certificates
+  that ignore backend scalar niches.
 -/
 
 /-! ## 1. Byte-Sequence Validity Modes and Initialized-Byte Helpers -/
@@ -1974,6 +1978,45 @@ theorem checkIntoBytes_strictly_extends_checkFromBytes
       checkFromBytes layouts { kind := .array .char n, layoutIdx := idx } = false) :=
   ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩⟩
 
+/--
+Struct-level strictness of the strengthened `checkIntoBytes`: on a contiguous
+padding-free `struct { a: u8, b: bool }` layout (fields at offsets `0` and `1`,
+size `2`), `checkIntoBytes` accepts the struct, so it satisfies `IsIntoBytes`,
+while `checkFromBytes` rejects it because of the `bool` field.
+-/
+theorem checkIntoBytes_struct_u8_bool_strict
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx : Nat) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩, ⟨1⟩] memoryOrder)
+    (hSz : l.size.bytes = 2) :
+    checkIntoBytes layouts { kind := .adt defPath [.uint .u8, .bool], layoutIdx := idx } = true ∧
+    checkFromBytes layouts { kind := .adt defPath [.uint .u8, .bool], layoutIdx := idx } = false ∧
+    IsIntoBytes layouts { kind := .adt defPath [.uint .u8, .bool], layoutIdx := idx } := by
+  have hInto :
+      checkIntoBytes layouts { kind := .adt defPath [.uint .u8, .bool], layoutIdx := idx } =
+        true := by
+    rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts⟩
+    dsimp only at hInhab hVar hFields hSz
+    subst hInhab hVar hFields hSz
+    unfold checkIntoBytes checkAdtContiguousIntoBytesLayout
+    dsimp only
+    rw [hLookup]
+    rfl
+  have hFrom :
+      checkFromBytes layouts { kind := .adt defPath [.uint .u8, .bool], layoutIdx := idx } =
+        false := by
+    rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts⟩
+    dsimp only at hInhab hVar hFields hSz
+    subst hInhab hVar hFields hSz
+    unfold checkFromBytes checkAdtContiguousLayout
+    dsimp only
+    rw [hLookup]
+    rfl
+  exact ⟨hInto, hFrom, checkIntoBytes_sound layouts _ hInto⟩
+
 /-! ## 6. `ScalarLayout.validRange` & `wrappingRangeContains` Bridges -/
 
 /-- Every little-endian byte sequence decodes to a bit pattern strictly below `scalarModulus (length bs)`. -/
@@ -3832,9 +3875,12 @@ theorem adt_fieldLayout_path_outer_niche_unenforced
 Every inhabited single-variant `.primitive` ADT (`l.variants = .single variantIdx`,
 `l.fields = .primitive`) satisfies `IsIntoBytes`: its encoder only accepts `.scalar sv`
 with `sv.sizeBytes = l.size.bytes` and emits `l.size.bytes` initialized bytes via
-`encodeScalarBytes`. In particular, `.primitive` `NonZero*` and `#[repr(Int)]` enum
-layouts satisfy `IsIntoBytes` and can serve as the source of safe `IntoBytes -> FromBytes`
-transmutes (e.g., `NonZeroU32 -> u32`, `#[repr(u8)] Enum -> u8`).
+`encodeScalarBytes`. The encoder does not check the recorded scalar niche, so
+`IsIntoBytes` here is only about length and initialization. `.primitive` is the
+layout shape of scalar fields decoded through `l.fieldLayouts` and of the
+scalar-niche models of this section. Captured `NonZero<T>` and multi-variant enum
+layouts are `.arbitrary` / `.multiple` instead; see the Section 6.4 note and
+`adt_multiple_enum_fieldless_isIntoBytes`.
 -/
 theorem adt_primitive_isIntoBytes
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -4009,5 +4055,38 @@ theorem adt_fieldLayout_path_inner_primitive_not_isFromZeros
   dsimp only at hDec
   rw [hZeroInvalid] at hDec
   nomatch hDec
+
+/--
+**Divergence (layout certificates ignore backend scalar niches).**
+`checkFromBytes` inspects only field kinds and field offsets, never
+`l.backendRepr`. On a `NonZero<u32>`-shaped layout carried by the monomorphized
+type `.adt defPath [.uint .u32]`, it therefore certifies `FromBytes` even though
+the layout records the niche `⟨1, 2^32 - 1⟩`. This agrees with `Trusted`'s
+decoder on the type-argument path
+(`adt_generic_nonZero_typeArg_path_niche_unenforced`), but not with Rust, where
+`NonZero<u32>` is not `FromBytes`. A `checkFromBytes` certificate thus
+establishes `FromBytes` only relative to `Trusted`'s decoder.
+-/
+theorem checkFromBytes_generic_nonZero_ignores_niche
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx : Nat) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz : l.size.bytes = 4)
+    (_hRepr : l.backendRepr = .scalar (.initialized (.int 32 false) ⟨1, scalarModulus 4 - 1⟩)) :
+    checkFromBytes layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } = true ∧
+    IsFromBytes layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } := by
+  have hCheck :
+      checkFromBytes layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } = true := by
+    rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts⟩
+    dsimp only at hInhab hVar hFields hSz
+    subst hInhab hVar hFields hSz
+    unfold checkFromBytes checkAdtContiguousLayout
+    dsimp only
+    rw [hLookup]
+    rfl
+  exact ⟨hCheck, checkFromBytes_sound layouts _ hCheck⟩
 
 end Anneal.BitValidity

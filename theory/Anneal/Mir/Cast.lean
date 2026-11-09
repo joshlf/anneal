@@ -8387,9 +8387,12 @@ theorem evalByteCast_tryTransmute_of_checkInto_tryFrom_bytes
 /--
 **Safe `IntoBytes -> FromBytes` transmute from a `.primitive` ADT into a same-width integral scalar (`evalByteCast_adt_primitive_to_scalar_ok`).**
 Transmuting any `.scalar ⟨bits, dst.sizeBytes .bits64⟩` (`bits < scalarModulus (dst.sizeBytes .bits64)`)
-of an inhabited single-variant `.primitive` ADT (such as a `.primitive` `NonZero*` or `#[repr(u8)]` / `#[repr(Int)]` enum)
-into a same-width integral scalar `dst` (`dst.isIntegral = true`) via `Trusted.MirSemantics.evalByteCast`
-always succeeds and preserves the bit pattern (`ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals' mem`).
+of an inhabited single-variant `.primitive` ADT into a same-width integral scalar `dst`
+(`dst.isIntegral = true`) via `Trusted.MirSemantics.evalByteCast` always succeeds and preserves the
+bit pattern (`ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals' mem`). The `Trusted` encoder does
+not check the source layout's scalar niche, so this holds even for bit patterns outside it. For
+captured `NonZero<T>` and enum layouts (`.arbitrary` / `.multiple`), use the general
+`evalByteCast_ok_of_into_from_bytes` with the corresponding `IsIntoBytes` theorem.
 -/
 theorem evalByteCast_adt_primitive_to_scalar_ok
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
