@@ -2230,7 +2230,8 @@ fn bound_to_top_level_decl(decl_src: &str) -> &str {
     ];
     let mut offset = 0usize;
     for (idx, line) in decl_src.split_inclusive('\n').enumerate() {
-        if idx > 0 && TOP_LEVEL_COMMANDS.iter().any(|cmd| line.starts_with(cmd)) {
+        let trimmed = line.trim_start();
+        if idx > 0 && TOP_LEVEL_COMMANDS.iter().any(|cmd| trimmed.starts_with(cmd)) {
             return &decl_src[..offset];
         }
         offset += line.len();
@@ -2240,9 +2241,13 @@ fn bound_to_top_level_decl(decl_src: &str) -> &str {
 
 fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let clean = strip_lean_comments_and_strings(mir_src);
-    let body_clean = match clean.find("def body : CapturedMir") {
-        Some(idx) => bound_to_top_level_decl(&clean[idx..]),
-        None => clean.as_str(),
+    let body_clean = if let Some(idx) = clean.find("def body : CapturedMir") {
+        bound_to_top_level_decl(&clean[idx..])
+    } else if let Some(idx) = clean.find(": CapturedMir") {
+        let line_start = clean[..idx].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        bound_to_top_level_decl(&clean[line_start..])
+    } else {
+        clean.as_str()
     };
     let Some(bb) = body_clean.find("basicBlocks :=") else {
         return MirBodyScan {
@@ -2306,8 +2311,10 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let norm_blocks = normalize_parens_and_ws(blocks_slice);
     let block_toks: Vec<&str> = norm_blocks.split_whitespace().collect();
 
-    let (basic_block_count, has_cfg_back_edge) = detect_blocks_and_back_edges(blocks_slice);
-    let unscannable_token = first_unscannable_block_token(&block_toks);
+    let (basic_block_count, has_cfg_back_edge, malformed_blocks_reason) =
+        detect_blocks_and_back_edges(blocks_slice, &block_toks);
+    let unscannable_token =
+        first_unscannable_block_token(&block_toks).or(malformed_blocks_reason);
     let has_unscannable_syntax = unscannable_token.is_some();
 
     let has_deref_projection = has_ast_ctor(&norm_blocks, "ProjectionElem", "deref");
@@ -2643,6 +2650,67 @@ const RIGID_TY_CTORS: &[&str] = &[
     "slice", "ref", "rawPtr", "adt", "fnDef", "fnPtr", "closure", "dynamic", "foreign", "other",
 ];
 
+/// Closed set of structure field names that can appear before `:=` inside an
+/// inline `CapturedMir.basicBlocks` literal (`BasicBlockData`, `Statement`,
+/// `Terminator`, `SwitchTargets`, `Place`, `Ty`, `ScalarInt`, `ProvenancePtr`,
+/// `WrappingRange`, `ConstOperand`).
+const MIR_BLOCK_FIELD_VOCAB: &[&str] = &[
+    "statements",
+    "terminator",
+    "isCleanup",
+    "kind",
+    "span",
+    "branches",
+    "otherwise",
+    "local_",
+    "projection",
+    "layoutIdx",
+    "bits",
+    "sizeBytes",
+    "allocId",
+    "offsetBytes",
+    "start",
+    "end_",
+    "ty",
+    "val",
+];
+
+/// Validate that a namespace qualifier `qual` (the prefix before `.ctor`) is a
+/// canonical qualifier for `type_name`, rejecting spoofed user namespaces such
+/// as `MyHelper.Option.none` or `Evil.Mutability.not`.
+fn is_valid_mir_type_qualifier(qual: &str, type_name: &str) -> bool {
+    let qual = qual.strip_prefix("_root_.").unwrap_or(qual);
+    if qual == type_name {
+        return true;
+    }
+    if matches!(type_name, "List" | "Option" | "Bool") {
+        return false;
+    }
+    let Some(prefix) = qual.strip_suffix(type_name).and_then(|p| p.strip_suffix('.')) else {
+        return false;
+    };
+    if type_name == "CallConv"
+        && matches!(
+            prefix,
+            "Layout"
+                | "V2026_06_01.Layout"
+                | "Rustc.V2026_06_01.Layout"
+                | "Trusted.Rustc.V2026_06_01.Layout"
+                | "Trusted.Layout"
+        )
+    {
+        return true;
+    }
+    matches!(
+        prefix,
+        "MirAst"
+            | "V2026_06_01.MirAst"
+            | "Rustc.V2026_06_01.MirAst"
+            | "Trusted.Rustc.V2026_06_01.MirAst"
+            | "Trusted.MirAst"
+    )
+}
+
 /// Return the constructor name of `tok` when it is a dotted shorthand
 /// constructor (`.ctor`) or a (possibly namespace-qualified, `@`-prefixed)
 /// `TypeName.ctor` token for `type_name`.
@@ -2652,8 +2720,7 @@ fn ast_ctor<'a>(tok: &'a str, type_name: &str) -> Option<&'a str> {
         return (!ctor.is_empty() && !ctor.contains('.')).then_some(ctor);
     }
     let (qual, ctor) = tok.rsplit_once('.')?;
-    let ty = qual.rsplit('.').next().unwrap_or(qual);
-    (ty == type_name && !ctor.is_empty()).then_some(ctor)
+    (is_valid_mir_type_qualifier(qual, type_name) && !ctor.is_empty()).then_some(ctor)
 }
 
 /// `true` when `tok` is the *qualified* (`TypeName.ctor` / `*.TypeName.ctor`)
@@ -2672,13 +2739,7 @@ fn has_ast_ctor(norm_blocks: &str, type_name: &str, ctor_name: &str) -> bool {
         .any(|tok| ast_ctor(tok, type_name) == Some(ctor_name))
 }
 
-fn is_lean_ident(tok: &str) -> bool {
-    let mut chars = tok.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
-}
-
-/// `true` when `tok` is a dotted shorthand (`.ctor`) or qualified
+/// `true` when `tok` is a dotted shorthand (`.ctor`) or canonical qualified
 /// (`TypeName.ctor`) constructor of the closed `MIR_BLOCK_CTOR_VOCAB`.
 fn is_mir_vocab_ctor(tok: &str) -> bool {
     let tok = tok.strip_prefix('@').unwrap_or(tok);
@@ -2689,23 +2750,31 @@ fn is_mir_vocab_ctor(tok: &str) -> bool {
         return false;
     };
     let ty = qual.rsplit('.').next().unwrap_or(qual);
-    MIR_BLOCK_CTOR_VOCAB.iter().any(|(t, ctors)| *t == ty && ctors.contains(&ctor))
+    is_valid_mir_type_qualifier(qual, ty)
+        && MIR_BLOCK_CTOR_VOCAB
+            .iter()
+            .any(|(t, ctors)| *t == ty && ctors.contains(&ctor))
 }
 
 /// Return the first token of a normalized `basicBlocks` slice that lies outside
 /// the closed inline `MirAst` literal grammar: numerals, stripped `""` string
-/// literals, `true` / `false` / `some` / `none`, record field names followed by
-/// `:=`, and `MIR_BLOCK_CTOR_VOCAB` constructors. Anything else (a helper `def`
-/// reference such as `u32Ty` or `mkTerm`, `let` / `fun` / `with`, positional
-/// `Place.mk`, `⟨..⟩`, `++`) can hide arbitrary MIR constructs from a textual
-/// scan, so the classifier fails closed to `MirFragment::FullMir`.
+/// literals, `true` / `false` / `some` / `none`, closed-vocabulary record field
+/// names (`MIR_BLOCK_FIELD_VOCAB`) followed by `:=`, and `MIR_BLOCK_CTOR_VOCAB`
+/// constructors. Anything else (a helper `def` reference such as `u32Ty` or
+/// `mkTerm`, named constructor arguments such as `(target := 0)`, `let` / `fun`
+/// / `with`, positional `Place.mk`, `⟨..⟩`, `++`) can hide arbitrary MIR
+/// constructs from a textual scan, so the classifier fails closed to
+/// `MirFragment::FullMir`.
 fn first_unscannable_block_token(block_toks: &[&str]) -> Option<String> {
     block_toks.iter().enumerate().find_map(|(i, &tok)| {
+        let is_valid_field = MIR_BLOCK_FIELD_VOCAB.contains(&tok)
+            && block_toks.get(i + 1) == Some(&":=")
+            && (i == 0 || !matches!(block_toks[i - 1], "let" | "have"));
         let allowed = tok == ":="
             || tok == "\"\""
             || tok.bytes().all(|b| b.is_ascii_digit())
             || matches!(tok, "true" | "false" | "some" | "none")
-            || (is_lean_ident(tok) && block_toks.get(i + 1) == Some(&":="))
+            || is_valid_field
             || is_mir_vocab_ctor(tok);
         (!allowed).then(|| tok.to_string())
     })
@@ -2817,13 +2886,45 @@ fn detect_const_slice_ptr(toks: &[&str]) -> bool {
     })
 }
 
-fn detect_blocks_and_back_edges(blocks_slice: &str) -> (usize, bool) {
+fn count_field_assign(block_toks: &[&str], field: &str) -> usize {
+    block_toks
+        .windows(2)
+        .filter(|w| w[0] == field && w[1] == ":=")
+        .count()
+}
+
+fn detect_blocks_and_back_edges(
+    blocks_slice: &str,
+    block_toks: &[&str],
+) -> (usize, bool, Option<String>) {
     let parts: Vec<&str> = blocks_slice.split("terminator :=").collect();
-    if parts.len() <= 1 {
-        return (0, false);
+    let term_count = parts.len().saturating_sub(1);
+    let stmt_count = count_field_assign(block_toks, "statements");
+    let cleanup_count = count_field_assign(block_toks, "isCleanup");
+    let is_empty_list = block_toks.is_empty()
+        || (block_toks.len() == 1
+            && ast_ctor(block_toks[0], "List") == Some("nil"));
+
+    if term_count == 0 {
+        if is_empty_list {
+            return (0, false, None);
+        }
+        return (
+            0,
+            true,
+            Some("missing `terminator :=` in non-empty basicBlocks".to_string()),
+        );
     }
-    let count = parts.len() - 1;
+    if stmt_count != term_count || cleanup_count != term_count {
+        return (
+            term_count,
+            true,
+            Some("mismatched BasicBlockData fields in basicBlocks".to_string()),
+        );
+    }
+
     let mut back_edge = false;
+    let mut malformed = None;
     for (bb_idx, raw_part) in parts.iter().skip(1).enumerate() {
         let end = raw_part
             .find("isCleanup :=")
@@ -2831,15 +2932,24 @@ fn detect_blocks_and_back_edges(blocks_slice: &str) -> (usize, bool) {
             .chain(raw_part.find("statements :="))
             .min()
             .unwrap_or(raw_part.len());
-        let cleaned_term = raw_part[..end].replace("span := \"\"", " ");
-        let term = normalize_parens_and_ws(&cleaned_term);
-        for target in extract_terminator_targets(&term) {
-            if target <= bb_idx {
+        let term = normalize_parens_and_ws(&raw_part[..end]).replace(" span := \"\" ", " ");
+        match extract_terminator_targets(&term) {
+            Some(targets) => {
+                for target in targets {
+                    if target <= bb_idx {
+                        back_edge = true;
+                    }
+                }
+            }
+            None => {
                 back_edge = true;
+                if malformed.is_none() {
+                    malformed = Some(format!("malformed terminator in bb{bb_idx}"));
+                }
             }
         }
     }
-    (count, back_edge)
+    (term_count, back_edge, malformed)
 }
 
 fn is_unwind_action_tok(tok: &str) -> bool {
@@ -2853,108 +2963,115 @@ fn is_unwind_cleanup_tok(tok: &str) -> bool {
     ast_ctor(tok, "UnwindAction") == Some("cleanup")
 }
 
-fn extract_terminator_targets(norm_term: &str) -> Vec<usize> {
+fn extract_terminator_targets(norm_term: &str) -> Option<Vec<usize>> {
     let tokens: Vec<&str> = norm_term.split_whitespace().collect();
     let mut targets = Vec::new();
 
-    // Locate the terminator constructor after `kind :=` (or at index 0).
+    // Locate the terminator constructor after `kind :=` (must be present on `Terminator`).
     let kind_pos = tokens
         .windows(2)
         .position(|w| w[0] == "kind" && w[1] == ":=")
-        .map(|p| p + 2)
-        .unwrap_or(0);
-    let Some(&head_tok) = tokens.get(kind_pos) else {
-        return targets;
-    };
+        .map(|p| p + 2)?;
+    let &head_tok = tokens.get(kind_pos)?;
     // Accept `.goto`, `TerminatorKind.goto`, and fully-qualified
     // `Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.goto` heads alike.
-    let head = ast_ctor(head_tok, "TerminatorKind").unwrap_or("");
+    let head = ast_ctor(head_tok, "TerminatorKind")?;
+
+    if matches!(
+        head,
+        "return_" | "unreachable" | "unwindResume" | "unwindTerminate" | "tailCall"
+    ) {
+        return Some(targets);
+    }
 
     if head == "goto" {
-        if let Some(n) = tokens.get(kind_pos + 1).and_then(|s| s.parse::<usize>().ok()) {
-            targets.push(n);
-        }
-        return targets;
+        let n = tokens
+            .get(kind_pos + 1)
+            .and_then(|s| s.parse::<usize>().ok())?;
+        targets.push(n);
+        return Some(targets);
     }
 
     if head == "switchInt" {
-        if let Some(br_idx) = norm_term.find("branches :=") {
-            let after_br = &norm_term[br_idx + "branches :=".len()..];
-            let br_end = after_br.find("otherwise :=").unwrap_or(after_br.len());
-            // Switch branch discriminants are `u128` bit patterns (`0..=u128::MAX`);
-            // parsing both elements as `u128` keeps `(val, target_bb)` pairs aligned
-            // even when `val > usize::MAX`.
-            let nums: Vec<u128> = after_br[..br_end]
-                .split_whitespace()
-                .filter_map(|t| t.parse::<u128>().ok())
-                .collect();
-            for pair in nums.chunks_exact(2) {
-                if let Ok(target_bb) = usize::try_from(pair[1]) {
-                    targets.push(target_bb);
-                }
-            }
+        let br_idx = norm_term.find("branches :=")?;
+        let after_br = &norm_term[br_idx + "branches :=".len()..];
+        let br_end = after_br.find("otherwise :=").unwrap_or(after_br.len());
+        // Switch branch discriminants are `u128` bit patterns (`0..=u128::MAX`);
+        // parsing both elements as `u128` keeps `(val, target_bb)` pairs aligned
+        // even when `val > usize::MAX`.
+        let nums: Vec<u128> = after_br[..br_end]
+            .split_whitespace()
+            .filter_map(|t| t.parse::<u128>().ok())
+            .collect();
+        if nums.len() % 2 != 0 {
+            return None;
         }
+        for pair in nums.chunks_exact(2) {
+            let target_bb = usize::try_from(pair[1]).ok()?;
+            targets.push(target_bb);
+        }
+        let mut found_otherwise = false;
         for i in kind_pos..tokens.len() {
-            if tokens[i] == "otherwise"
-                && tokens.get(i + 1) == Some(&":=")
-                && let Some(n) = tokens.get(i + 2).and_then(|s| s.parse::<usize>().ok())
-            {
+            if tokens[i] == "otherwise" && tokens.get(i + 1) == Some(&":=") {
+                let n = tokens.get(i + 2).and_then(|s| s.parse::<usize>().ok())?;
                 targets.push(n);
+                found_otherwise = true;
             }
         }
-        return targets;
+        return found_otherwise.then_some(targets);
     }
 
     // `drop`, `assert`, `call`, and `inlineAsm` all end with `UnwindAction`
     // right before `span :=`. Anchoring on that trailing `UnwindAction` avoids
     // false matches on inner `Option.some` or boolean literals inside operands.
-    let unwind_pos = (kind_pos + 1..tokens.len())
+    let u = (kind_pos + 1..tokens.len())
         .rev()
-        .find(|&i| is_unwind_action_tok(tokens[i]));
+        .find(|&i| is_unwind_action_tok(tokens[i]))?;
 
     if head == "drop" || head == "assert" {
-        if let Some(u) = unwind_pos {
-            if u > kind_pos
-                && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
-            {
-                targets.push(n);
-            }
-            if is_unwind_cleanup_tok(tokens[u])
-                && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
-            {
-                targets.push(cleanup_bb);
-            }
+        if u <= kind_pos {
+            return None;
         }
+        let n = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())?;
+        targets.push(n);
+        if is_unwind_cleanup_tok(tokens[u]) {
+            let cleanup_bb = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())?;
+            targets.push(cleanup_bb);
+        }
+        return Some(targets);
     } else if head == "call" {
-        if let Some(u) = unwind_pos {
-            if u >= kind_pos + 2
-                && (tokens[u - 2] == "some" || ast_ctor(tokens[u - 2], "Option") == Some("some"))
-                && let Some(n) = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())
-            {
-                targets.push(n);
-            }
-            if is_unwind_cleanup_tok(tokens[u])
-                && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
-            {
-                targets.push(cleanup_bb);
-            }
+        if u < kind_pos + 1 {
+            return None;
         }
+        if tokens[u - 1] == "none" || ast_ctor(tokens[u - 1], "Option") == Some("none") {
+            // Diverging call (`target := none`).
+        } else if u >= kind_pos + 2
+            && (tokens[u - 2] == "some" || ast_ctor(tokens[u - 2], "Option") == Some("some"))
+        {
+            let n = tokens.get(u - 1).and_then(|s| s.parse::<usize>().ok())?;
+            targets.push(n);
+        } else {
+            return None;
+        }
+        if is_unwind_cleanup_tok(tokens[u]) {
+            let cleanup_bb = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())?;
+            targets.push(cleanup_bb);
+        }
+        return Some(targets);
     } else if head == "inlineAsm" {
-        let end = unwind_pos.unwrap_or(tokens.len());
-        for tok in &tokens[kind_pos + 1..end] {
+        for tok in &tokens[kind_pos + 1..u] {
             if let Ok(n) = tok.parse::<usize>() {
                 targets.push(n);
             }
         }
-        if let Some(u) = unwind_pos
-            && is_unwind_cleanup_tok(tokens[u])
-            && let Some(cleanup_bb) = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())
-        {
+        if is_unwind_cleanup_tok(tokens[u]) {
+            let cleanup_bb = tokens.get(u + 1).and_then(|s| s.parse::<usize>().ok())?;
             targets.push(cleanup_bb);
         }
+        return Some(targets);
     }
 
-    targets
+    None
 }
 
 /// Render 80-column-wrapped `--` Lean comment hints recommending the fuel-free
@@ -4928,7 +5045,7 @@ def body : CapturedMir :=
         let claims = lean_witness_claims();
         let frag_claims = claims.iter().filter(|(f, _, _)| f == "inferMinFragment").count();
         let edge_claims = claims.iter().filter(|(f, _, _)| f == "hasCfgBackedge").count();
-        assert!(frag_claims >= 11, "expected >= 11 inferMinFragment witness theorems: {claims:?}");
+        assert!(frag_claims >= 12, "expected >= 12 inferMinFragment witness theorems: {claims:?}");
         assert!(edge_claims >= 5, "expected >= 5 hasCfgBackedge witness theorems: {claims:?}");
         let mut seen_levels = BTreeSet::new();
         for (func, witness, value) in &claims {
@@ -5024,6 +5141,12 @@ def body : CapturedMir :=
             ("positional place", "[{ statements := [{ kind := .assign (Place.mk 0 []) (.use (.copy (Place.mk 1 []))), span := \"\" }], terminator := { kind := .return_, span := \"\" }, isCleanup := false }]"),
             ("anonymous ctor", "[{ statements := [], terminator := ⟨.goto 0, \"\"⟩, isCleanup := false }]"),
             ("structure update", "[{ pureBlock with terminator := { kind := .return_, span := \"\" } }]"),
+            ("named goto arg", "[{ statements := [], terminator := { kind := .goto (target := 0), span := \"\" }, isCleanup := false }]"),
+            ("named slice arg", "[{ statements := [{ kind := .assign { local_ := 0, projection := [] } (.use (.constant { ty := { kind := .uint .u32, layoutIdx := 0 }, val := .slice (data := .ptr { allocId := 0, offsetBytes := 0 } 8) (meta_ := 1) })), span := \"\" }], terminator := { kind := .return_, span := \"\" }, isCleanup := false }]"),
+            ("spoofed namespace ctor", "[{ statements := MyHelper.List.nil, terminator := { kind := .return_, span := \"\" }, isCleanup := false }]"),
+            ("let binding with field ident", "[{ statements := (let val := []; val), terminator := { kind := .return_, span := \"\" }, isCleanup := false }]"),
+            ("mismatched block fields", "[{ terminator := { kind := .return_, span := \"\" } }]"),
+            ("malformed goto target", "[{ statements := [], terminator := { kind := .goto, span := \"\" }, isCleanup := false }]"),
         ] {
             let mir = format!("def body : CapturedMir := {{ basicBlocks := {blocks} }}");
             let prof = classify_profile(&mir);
@@ -5040,11 +5163,17 @@ def body : CapturedMir :=
         }
 
         // 4. A non-inline alias followed by an unrelated inline body must not
-        //    borrow that body's (pure) blocks.
-        let alias_then_pure = "import Trusted\ndef body : CapturedMir := impureHelperBody\n\ndef pureOther : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\n";
-        let prof = classify_profile(alias_then_pure);
-        assert!(!prof.has_captured_mir, "{prof:?}");
-        assert_eq!(classify_mir_fragment(alias_then_pure).inferred_fragment, MirFragment::FullMir);
+        //    borrow that body's (pure) blocks, even when the first declaration
+        //    is not named `body` or the second declaration is preceded by an
+        //    inline comment (`/- doc -/`).
+        for alias_src in [
+            "import Trusted\ndef body : CapturedMir := impureHelperBody\n\ndef pureOther : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\n",
+            "import Trusted\ndef customBody : CapturedMir := impureHelperBody\n/- doc -/ def pureOther : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }\n",
+        ] {
+            let prof = classify_profile(alias_src);
+            assert!(!prof.has_captured_mir, "{prof:?}");
+            assert_eq!(classify_mir_fragment(alias_src).inferred_fragment, MirFragment::FullMir);
+        }
 
         // 5. Fully-qualified / `@`-explicit terminator heads still yield CFG targets.
         for head in [

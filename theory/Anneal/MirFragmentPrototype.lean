@@ -440,6 +440,22 @@ theorem hasCfgBackedge_eq_true_iff (body : CapturedMir) :
     · exact absurd h_le (Nat.not_le_of_lt (cfgEdge_lt_of_hasCfgBackedge_false h_b h_edge))
     · rfl
 
+/--
+**Exact forward-numbering characterization of `hasCfgBackedge = false`**:
+`hasCfgBackedge body = false` iff every CFG edge `u → v` of `body` strictly
+increases basic-block index (`u < v`).
+-/
+theorem hasCfgBackedge_eq_false_iff (body : CapturedMir) :
+    hasCfgBackedge body = false ↔ ∀ u v, CfgEdge body u v → u < v := by
+  constructor
+  · intro h u v h_edge
+    exact cfgEdge_lt_of_hasCfgBackedge_false h h_edge
+  · intro h_lt
+    cases h_b : hasCfgBackedge body
+    · rfl
+    · obtain ⟨u, v, h_edge, h_le⟩ := (hasCfgBackedge_eq_true_iff body).mp h_b
+      exact absurd h_le (Nat.not_le_of_lt (h_lt u v h_edge))
+
 /-- The source block of every CFG edge is an in-range block index. -/
 theorem lt_length_of_cfgEdge {body : CapturedMir} {u v : BasicBlockIdx}
     (h : CfgEdge body u v) : u < body.basicBlocks.length := by
@@ -567,6 +583,15 @@ of `no_cfg_cycle_of_hasRankViolation_false`.
 theorem hasRankViolation_id_eq_hasCfgBackedge (body : CapturedMir) :
     hasRankViolation (fun i => i) body = hasCfgBackedge body :=
   hasRankViolationAux_id_eq_hasCfgBackedgeAux 0 body.basicBlocks (by simp)
+
+/--
+Every MIR body without an index-order back-edge (`hasCfgBackedge body = false`)
+admits an explicit violation-free rank certificate (`rank = id`).
+-/
+theorem exists_rank_certificate_of_hasCfgBackedge_false
+    {body : CapturedMir} (h : hasCfgBackedge body = false) :
+    ∃ rank : Nat → Nat, hasRankViolation rank body = false :=
+  ⟨fun i => i, (hasRankViolation_id_eq_hasCfgBackedge body).trans h⟩
 
 /-- In-range CFG edges `(u, v)` (`v < n`) of a suffix of `body.basicBlocks` starting at `u`. -/
 def cfgEdgeListAux (n : Nat) : Nat → List BasicBlockData → List (Nat × Nat)
@@ -1228,6 +1253,114 @@ theorem no_inlineAsm_below_fullMir (f : MirFragment) (hf : f < .fullMir)
     checkTerminatorFragment f (.inlineAsm template targets unwind) = false := by
   cases f <;> first | rfl | exact absurd hf (by decide)
 
+/-- `Rvalue.ref` and `Rvalue.rawPtr` are rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_ref_or_rawPtr_below_treeBorrowsLocal (f : MirFragment) (hf : f < .treeBorrowsLocal)
+    (bk : BorrowKind) (m : Mutability) (p : Place) :
+    checkRvalueFragment f (.ref bk p) = false ∧
+    checkRvalueFragment f (.rawPtr m p) = false := by
+  cases f <;> first | exact ⟨rfl, rfl⟩ | exact absurd hf (by decide)
+
+/-- `Rvalue.copyForDeref` is rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_copyForDeref_below_treeBorrowsLocal (f : MirFragment) (hf : f < .treeBorrowsLocal)
+    (p : Place) :
+    checkRvalueFragment f (.copyForDeref p) = false := by
+  cases f <;> first | rfl | exact absurd hf (by decide)
+
+/-- `BinOp.offset` is rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_offset_below_treeBorrowsLocal (f : MirFragment) (hf : f < .treeBorrowsLocal) :
+    checkBinOpFragment f .offset = false := by
+  cases f <;> first | rfl | exact absurd hf (by decide)
+
+/-- `CastKind.pointerCoercion` and `.ptrToPtr` are rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_ptrCast_below_treeBorrowsLocal (f : MirFragment) (hf : f < .treeBorrowsLocal)
+    (tag : String) :
+    checkCastFragment f (.pointerCoercion tag) = false ∧
+    checkCastFragment f .ptrToPtr = false := by
+  cases f <;> first | exact ⟨rfl, rfl⟩ | exact absurd hf (by decide)
+
+/-- `ProjectionElem.unwrapUnsafeBinder` is rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_unwrapUnsafeBinder_below_treeBorrowsLocal (f : MirFragment) (hf : f < .treeBorrowsLocal)
+    (ty : Ty) :
+    checkProjElemFragment f (.unwrapUnsafeBinder ty) = false := by
+  cases f <;> first | rfl | exact absurd hf (by decide)
+
+/-- `ConstValue.indirect` and pointer-backed `.slice (.ptr ..)` are rejected at every level `f < .intrinsicCopy`. -/
+theorem no_globalAllocConst_below_intrinsicCopy (f : MirFragment) (hf : f < .intrinsicCopy)
+    (allocId offset : Nat) (ptr : ProvenancePtr) (sz meta_ : Nat) :
+    checkConstFragment f (.indirect allocId offset) = false ∧
+    checkConstFragment f (.slice (.ptr ptr sz) meta_) = false := by
+  cases f <;> first | exact ⟨rfl, rfl⟩ | exact absurd hf (by decide)
+
+/-- `Rvalue.threadLocalRef`, `Rvalue.shallowInitBox`, `CastKind.fnPtrToPtr`, and `StatementKind.backwardIncompatibleDropHint` are rejected at every level `f < .fullMir`. -/
+theorem no_fullMirOnlyConstructs_below_fullMir (f : MirFragment) (hf : f < .fullMir)
+    (path : DefPath) (op : Operand) (ty : Ty) (p : Place) :
+    checkRvalueFragment f (.threadLocalRef path) = false ∧
+    checkRvalueFragment f (.shallowInitBox op ty) = false ∧
+    checkCastFragment f .fnPtrToPtr = false ∧
+    checkStmtFragment f (.backwardIncompatibleDropHint p) = false := by
+  cases f <;> first | exact ⟨rfl, rfl, rfl, rfl⟩ | exact absurd hf (by decide)
+
+/-- Any body containing `StatementKind.retag` is rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_retag_body_below_treeBorrowsLocal
+    (f : MirFragment) (hf : f < .treeBorrowsLocal)
+    (body : CapturedMir) (bb : BasicBlockData) (stmt : Statement)
+    (rk : RetagKind) (p : Place)
+    (h_bb : bb ∈ body.basicBlocks) (h_stmt : stmt ∈ bb.statements)
+    (h_kind : stmt.kind = .retag rk p) :
+    checkBodyFragment f body = false := by
+  cases h_chk : checkBodyFragment f body
+  · rfl
+  · have h_le : checkBodyFragment .pureBoundedLoop body = true := by
+      refine checkBodyFragment_mono ?_ body h_chk
+      cases f <;> first | decide | exact absurd hf (by decide)
+    exact absurd h_le (by rw [no_retag_body_in_pureBoundedLoop body bb stmt rk p h_bb h_stmt h_kind]; decide)
+
+/-- Any body containing `copyNonOverlapping` is rejected at every level `f < .intrinsicCopy`. -/
+theorem no_copyNonOverlapping_body_below_intrinsicCopy
+    (f : MirFragment) (hf : f < .intrinsicCopy)
+    (body : CapturedMir) (bb : BasicBlockData) (stmt : Statement)
+    (src dst count : Operand)
+    (h_bb : bb ∈ body.basicBlocks) (h_stmt : stmt ∈ bb.statements)
+    (h_kind : stmt.kind = .intrinsic (.copyNonOverlapping src dst count)) :
+    checkBodyFragment f body = false := by
+  cases h_chk : checkBodyFragment f body
+  · rfl
+  · have h_le : checkBodyFragment .treeBorrowsLocal body = true := by
+      refine checkBodyFragment_mono ?_ body h_chk
+      cases f <;> first | decide | exact absurd hf (by decide)
+    exact absurd h_le (by rw [no_copyNonOverlapping_body_in_treeBorrowsLocal body bb stmt src dst count h_bb h_stmt h_kind]; decide)
+
+/-- Any body containing `TerminatorKind.call` is rejected at every level `f < .fullMir`. -/
+theorem no_call_body_below_fullMir
+    (f : MirFragment) (hf : f < .fullMir)
+    (body : CapturedMir) (bb : BasicBlockData)
+    (func : Operand) (args : List Operand) (dest : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction)
+    (h_bb : bb ∈ body.basicBlocks)
+    (h_term : bb.terminator.kind = .call func args dest target unwind) :
+    checkBodyFragment f body = false := by
+  cases h_chk : checkBodyFragment f body
+  · rfl
+  · have h_le : checkBodyFragment .intrinsicCopy body = true := by
+      refine checkBodyFragment_mono ?_ body h_chk
+      cases f <;> first | decide | exact absurd hf (by decide)
+    exact absurd h_le (by rw [no_call_body_in_intrinsicCopy body bb func args dest target unwind h_bb h_term]; decide)
+
+/-- Any body containing `TerminatorKind.inlineAsm` is rejected at every level `f < .fullMir`. -/
+theorem no_inlineAsm_body_below_fullMir
+    (f : MirFragment) (hf : f < .fullMir)
+    (body : CapturedMir) (bb : BasicBlockData)
+    (template : String) (targets : List BasicBlockIdx) (unwind : UnwindAction)
+    (h_bb : bb ∈ body.basicBlocks)
+    (h_term : bb.terminator.kind = .inlineAsm template targets unwind) :
+    checkBodyFragment f body = false := by
+  cases h_chk : checkBodyFragment f body
+  · rfl
+  · have h_le : checkBodyFragment .intrinsicCopy body = true := by
+      refine checkBodyFragment_mono ?_ body h_chk
+      cases f <;> first | decide | exact absurd hf (by decide)
+    exact absurd h_le (by rw [no_inlineAsm_body_in_intrinsicCopy body bb template targets unwind h_bb h_term]; decide)
+
 /-! ## 6. Exact `Anneal.PureMirExec.checkPureMir` Bridge Theorems -/
 
 @[simp]
@@ -1357,6 +1490,21 @@ theorem verifyMirNoPanic_of_inferMinFragment_le_pureBoundedLoop
       PureMirConverges c.body (initPureState c.body args) (c.post args)) :
     VerificationResult c :=
   Anneal.PureMirExec.verifyMirNoPanic_of_pureExec c
+    (checkPureMir_of_inferMinFragment_le_pureBoundedLoop c.body h_frag)
+    h_exec
+
+/--
+Direct partial-correctness verification bridge from
+`inferMinFragment c.body ≤ .pureBoundedLoop` and `PureMirSafeConverges` to
+`VerificationResult c` via `Anneal.PureMirExec.verifyMirSafe_of_pureExec`.
+-/
+theorem verifyMirSafe_of_inferMinFragment_le_pureBoundedLoop
+    (c : Claim)
+    (h_frag : inferMinFragment c.body ≤ .pureBoundedLoop)
+    (h_exec : ∀ args, c.pre args →
+      PureMirSafeConverges c.body (initPureState c.body args) (c.post args)) :
+    VerificationResult c :=
+  Anneal.PureMirExec.verifyMirSafe_of_pureExec c
     (checkPureMir_of_inferMinFragment_le_pureBoundedLoop c.body h_frag)
     h_exec
 
@@ -1529,6 +1677,97 @@ theorem inferMinFragment_instantiate
     inferMinFragment (body.instantiate args) = inferMinFragment body := by
   unfold inferMinFragment
   simp only [checkBodyFragment_instantiate]
+
+@[simp]
+theorem BasicBlockData.instantiateList_length
+    (tbl : LayoutTable) (args : TypeSubst) :
+    ∀ (bbs : List BasicBlockData),
+      (BasicBlockData.instantiateList tbl args bbs).length = bbs.length
+  | [] => rfl
+  | _ :: rest => by
+    simp only [BasicBlockData.instantiateList, List.length_cons,
+      BasicBlockData.instantiateList_length tbl args rest]
+
+@[simp]
+theorem hasBlockRankViolation_instantiate
+    (rank : Nat → Nat) (n u : Nat) (tbl : LayoutTable) (args : TypeSubst) (bb : BasicBlockData) :
+    hasBlockRankViolation rank n u (bb.instantiate tbl args) = hasBlockRankViolation rank n u bb := by
+  dsimp only [BasicBlockData.instantiate, Terminator.instantiate, hasBlockRankViolation, blockTargets]
+  rw [terminatorTargets_instantiate]
+
+@[simp]
+theorem hasRankViolationAux_instantiate
+    (rank : Nat → Nat) (n : Nat) (tbl : LayoutTable) (args : TypeSubst) :
+    ∀ (u : Nat) (bbs : List BasicBlockData),
+      hasRankViolationAux rank n u (BasicBlockData.instantiateList tbl args bbs) =
+        hasRankViolationAux rank n u bbs
+  | _, [] => rfl
+  | u, bb :: rest => by
+    have h_hd := hasBlockRankViolation_instantiate rank n u tbl args bb
+    have h_tl := hasRankViolationAux_instantiate rank n tbl args (u + 1) rest
+    dsimp only [BasicBlockData.instantiateList, hasRankViolationAux]
+    rw [h_hd, h_tl]
+
+@[simp]
+theorem hasRankViolation_instantiate
+    (rank : Nat → Nat) (body : CapturedMir) (args : TypeSubst) :
+    hasRankViolation rank (body.instantiate args) = hasRankViolation rank body := by
+  dsimp only [CapturedMir.instantiate, hasRankViolation]
+  rw [BasicBlockData.instantiateList_length, hasRankViolationAux_instantiate]
+
+@[simp]
+theorem cfgEdgeListAux_instantiate
+    (n : Nat) (tbl : LayoutTable) (args : TypeSubst) :
+    ∀ (u : Nat) (bbs : List BasicBlockData),
+      cfgEdgeListAux n u (BasicBlockData.instantiateList tbl args bbs) =
+        cfgEdgeListAux n u bbs
+  | _, [] => rfl
+  | u, bb :: rest => by
+    have h_tl := cfgEdgeListAux_instantiate n tbl args (u + 1) rest
+    dsimp only [BasicBlockData.instantiateList, cfgEdgeListAux,
+      BasicBlockData.instantiate, Terminator.instantiate, blockTargets]
+    rw [terminatorTargets_instantiate, h_tl]
+
+@[simp]
+theorem cfgEdgeList_instantiate
+    (body : CapturedMir) (args : TypeSubst) :
+    cfgEdgeList (body.instantiate args) = cfgEdgeList body := by
+  dsimp only [CapturedMir.instantiate, cfgEdgeList]
+  rw [BasicBlockData.instantiateList_length, cfgEdgeListAux_instantiate]
+
+@[simp]
+theorem dagRanks_instantiate
+    (body : CapturedMir) (args : TypeSubst) :
+    dagRanks (body.instantiate args) = dagRanks body := by
+  unfold dagRanks
+  rw [cfgEdgeList_instantiate]
+  dsimp only [CapturedMir.instantiate]
+  rw [BasicBlockData.instantiateList_length]
+
+@[simp]
+theorem dagRank_instantiate
+    (body : CapturedMir) (args : TypeSubst) (i : Nat) :
+    dagRank (body.instantiate args) i = dagRank body i := by
+  unfold dagRank
+  rw [dagRanks_instantiate]
+
+theorem dagRank_instantiate_fun
+    (body : CapturedMir) (args : TypeSubst) :
+    dagRank (body.instantiate args) = dagRank body := by
+  funext i
+  exact dagRank_instantiate body args i
+
+/--
+**Polymorphic DAG Acyclicity Invariance**:
+Instantiating generic type parameters via `CapturedMir.instantiate` preserves
+`isCfgDag` (`isCfgDag (body.instantiate args) = isCfgDag body`).
+-/
+@[simp]
+theorem isCfgDag_instantiate
+    (body : CapturedMir) (args : TypeSubst) :
+    isCfgDag (body.instantiate args) = isCfgDag body := by
+  unfold isCfgDag
+  rw [dagRank_instantiate_fun, hasRankViolation_instantiate]
 
 /-! ## 8. Concrete `CapturedMir` Witnesses Across All 5 Lattice Levels -/
 
@@ -1780,6 +2019,26 @@ def witnessFullMirNoCall : CapturedMir :=
          terminator := { kind := .return_, span := "proto.rs:10:3" }
          isCleanup := false }] }
 
+/--
+Out-of-order record fields & parenthesized span witness (`.pureBoundedLoop`):
+`BasicBlockData` writes `isCleanup` before `terminator` and `statements` last;
+`Terminator` writes parenthesized `span := ("...")` before `kind :=`; and
+`SwitchTargets` writes `otherwise := 0` (back-edge `0 ≤ 0`) before `branches :=`.
+-/
+def witnessOutOfOrderFieldsAndParenSpan : CapturedMir :=
+  { protoBase with
+    defPath := "proto::witness_out_of_order_fields_and_paren_span"
+    basicBlocks :=
+      [{ isCleanup := false
+         terminator :=
+           { span := ("proto.rs:11:1")
+             kind := .switchInt (.copy { projection := [], local_ := 0 })
+               { otherwise := 0, branches := [(1, 1)] } }
+         statements := [] },
+       { isCleanup := false
+         terminator := { span := ("proto.rs:11:2"), kind := .return_ }
+         statements := [] }] }
+
 theorem inferMinFragment_witnessPureLoopFree :
     inferMinFragment witnessPureLoopFree = .pureLoopFree := rfl
 
@@ -1812,6 +2071,9 @@ theorem inferMinFragment_witnessIndirectConst :
 
 theorem inferMinFragment_witnessFullMirNoCall :
     inferMinFragment witnessFullMirNoCall = .fullMir := rfl
+
+theorem inferMinFragment_witnessOutOfOrderFieldsAndParenSpan :
+    inferMinFragment witnessOutOfOrderFieldsAndParenSpan = .pureBoundedLoop := rfl
 
 theorem hasCfgBackedge_witnessPureLoopFree : hasCfgBackedge witnessPureLoopFree = false := rfl
 
@@ -2152,6 +2414,112 @@ theorem inferMinFragmentSinglePass_eq_inferMinFragment (body : CapturedMir) :
     rw [checkBodyFragment_eq_decide_singlePass, decide_eq_true_eq]
     exact MirFragment.le_refl _
 
+/--
+**Polymorphic Single-Pass Fragment Inference Invariance**:
+`inferMinFragmentSinglePass (body.instantiate args) = inferMinFragmentSinglePass body`.
+-/
+@[simp]
+theorem inferMinFragmentSinglePass_instantiate
+    (body : CapturedMir) (args : TypeSubst) :
+    inferMinFragmentSinglePass (body.instantiate args) = inferMinFragmentSinglePass body := by
+  rw [inferMinFragmentSinglePass_eq_inferMinFragment,
+    inferMinFragmentSinglePass_eq_inferMinFragment,
+    inferMinFragment_instantiate]
+
+theorem le_joinList_of_mem {α : Type} (g : α → MirFragment) {x : α} {xs : List α}
+    (h_mem : x ∈ xs) : g x ≤ joinList g xs := by
+  induction xs with
+  | nil => cases h_mem
+  | cons hd tl ih =>
+    simp only [List.mem_cons] at h_mem
+    rcases h_mem with rfl | h_tl
+    · exact MirFragment.le_join_left _ _
+    · exact MirFragment.le_trans (ih h_tl) (MirFragment.le_join_right _ _)
+
+theorem joinList_minBlockFragment_le_inferMinFragment (body : CapturedMir) :
+    joinList minBlockFragment body.basicBlocks ≤ inferMinFragment body := by
+  rw [← inferMinFragmentSinglePass_eq_inferMinFragment]
+  unfold inferMinFragmentSinglePass
+  cases hasCfgBackedge body
+  · exact MirFragment.le_refl _
+  · exact MirFragment.le_join_left _ _
+
+/--
+**Universal Block Lower-Bound Theorem**:
+Every basic block `bb ∈ body.basicBlocks` bounds `inferMinFragment body` from below
+(`minBlockFragment bb ≤ inferMinFragment body`).
+-/
+theorem minBlockFragment_le_inferMinFragment_of_mem
+    {body : CapturedMir} {bb : BasicBlockData} (h_bb : bb ∈ body.basicBlocks) :
+    minBlockFragment bb ≤ inferMinFragment body :=
+  MirFragment.le_trans
+    (le_joinList_of_mem minBlockFragment h_bb)
+    (joinList_minBlockFragment_le_inferMinFragment body)
+
+/--
+**Universal Statement Lower-Bound Theorem**:
+Every statement `stmt ∈ bb.statements` in any block `bb ∈ body.basicBlocks`
+bounds `inferMinFragment body` from below (`minStmtFragment stmt.kind ≤ inferMinFragment body`).
+-/
+theorem minStmtFragment_le_inferMinFragment_of_mem
+    {body : CapturedMir} {bb : BasicBlockData} {stmt : Statement}
+    (h_bb : bb ∈ body.basicBlocks) (h_stmt : stmt ∈ bb.statements) :
+    minStmtFragment stmt.kind ≤ inferMinFragment body := by
+  have h_s : minStmtFragment stmt.kind ≤ minBlockFragment bb :=
+    MirFragment.le_trans
+      (le_joinList_of_mem (fun (s : Statement) => minStmtFragment s.kind) h_stmt)
+      (MirFragment.le_join_left _ _)
+  exact MirFragment.le_trans h_s (minBlockFragment_le_inferMinFragment_of_mem h_bb)
+
+/--
+**Universal Terminator Lower-Bound Theorem**:
+Every block terminator `bb.terminator` in `bb ∈ body.basicBlocks` bounds
+`inferMinFragment body` from below (`minTerminatorFragment bb.terminator.kind ≤ inferMinFragment body`).
+-/
+theorem minTerminatorFragment_le_inferMinFragment_of_mem
+    {body : CapturedMir} {bb : BasicBlockData} (h_bb : bb ∈ body.basicBlocks) :
+    minTerminatorFragment bb.terminator.kind ≤ inferMinFragment body :=
+  MirFragment.le_trans
+    (MirFragment.le_join_right _ _)
+    (minBlockFragment_le_inferMinFragment_of_mem h_bb)
+
+/--
+If `f < inferMinFragment body`, then `checkBodyFragment f body = false`.
+-/
+theorem checkBodyFragment_false_of_lt_inferMinFragment
+    {body : CapturedMir} {f : MirFragment}
+    (hf : f < inferMinFragment body) :
+    checkBodyFragment f body = false := by
+  cases h : checkBodyFragment f body
+  · rfl
+  · exact absurd (inferMinFragment_minimal body f h) (Nat.not_le_of_lt hf)
+
+/--
+**Universal Statement Downward-Closed Exclusion Theorem**:
+If `stmt ∈ bb.statements` (`bb ∈ body.basicBlocks`) and `f < minStmtFragment stmt.kind`,
+then `checkBodyFragment f body = false`.
+-/
+theorem checkBodyFragment_false_of_lt_minStmtFragment
+    {body : CapturedMir} {bb : BasicBlockData} {stmt : Statement} {f : MirFragment}
+    (h_bb : bb ∈ body.basicBlocks) (h_stmt : stmt ∈ bb.statements)
+    (hf : f < minStmtFragment stmt.kind) :
+    checkBodyFragment f body = false := by
+  apply checkBodyFragment_false_of_lt_inferMinFragment
+  exact Nat.lt_of_lt_of_le hf (minStmtFragment_le_inferMinFragment_of_mem h_bb h_stmt)
+
+/--
+**Universal Terminator Downward-Closed Exclusion Theorem**:
+If `bb ∈ body.basicBlocks` and `f < minTerminatorFragment bb.terminator.kind`,
+then `checkBodyFragment f body = false`.
+-/
+theorem checkBodyFragment_false_of_lt_minTerminatorFragment
+    {body : CapturedMir} {bb : BasicBlockData} {f : MirFragment}
+    (h_bb : bb ∈ body.basicBlocks)
+    (hf : f < minTerminatorFragment bb.terminator.kind) :
+    checkBodyFragment f body = false := by
+  apply checkBodyFragment_false_of_lt_inferMinFragment
+  exact Nat.lt_of_lt_of_le hf (minTerminatorFragment_le_inferMinFragment_of_mem h_bb)
+
 /-! ## 10. Rank 1 Is a Pure CFG Property (`.pureLoopFree` Characterization) -/
 
 theorem join_ne_pureBoundedLoop {a b : MirFragment}
@@ -2291,5 +2659,36 @@ theorem inferMinFragment_eq_pureLoopFree_iff (body : CapturedMir) :
     exact MirFragment.le_refl _
   · intro h
     exact MirFragment.le_antisymm (h_iff.mp h) (MirFragment.bot_le _)
+
+/--
+**Exact characterization of `.pureBoundedLoop`**:
+`inferMinFragment body = .pureBoundedLoop` iff `checkPureMir body = true` and
+`hasCfgBackedge body = true`.
+-/
+theorem inferMinFragment_eq_pureBoundedLoop_iff (body : CapturedMir) :
+    inferMinFragment body = .pureBoundedLoop ↔
+      checkPureMir body = true ∧ hasCfgBackedge body = true := by
+  constructor
+  · intro h
+    have h_le : inferMinFragment body ≤ .pureBoundedLoop := by
+      rw [h]; exact MirFragment.le_refl _
+    have h_pure : checkPureMir body = true :=
+      (inferMinFragment_le_pureBoundedLoop_iff_checkPureMir body).mp h_le
+    cases h_be : hasCfgBackedge body
+    · have h_plf : inferMinFragment body = .pureLoopFree :=
+        (inferMinFragment_eq_pureLoopFree_iff body).mpr ⟨h_pure, h_be⟩
+      rw [h] at h_plf
+      cases h_plf
+    · exact ⟨h_pure, rfl⟩
+  · rintro ⟨h_pure, h_be⟩
+    have h_le : inferMinFragment body ≤ .pureBoundedLoop :=
+      (inferMinFragment_le_pureBoundedLoop_iff_checkPureMir body).mpr h_pure
+    have h_not_plf : inferMinFragment body ≠ .pureLoopFree := by
+      intro h_eq
+      have h_be_false := ((inferMinFragment_eq_pureLoopFree_iff body).mp h_eq).2
+      rw [h_be] at h_be_false
+      cases h_be_false
+    generalize inferMinFragment body = m at h_le h_not_plf
+    cases m <;> first | rfl | exact absurd rfl h_not_plf | exact absurd h_le (by decide)
 
 end Anneal.MirFragmentPrototype
