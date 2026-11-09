@@ -71,7 +71,7 @@ cargo run -q -p anneal-minirust-gen -- generate --check
 
 # Build the generated model, the interpretation, the proofs, the witnesses,
 # and the axiom audit (which fails on any non-standard axiom).
-(cd examples && lake build MiniRustSpec)
+(cd examples && anneal-lean-run --mode build --concurrency 3 -- lake build MiniRustSpec)
 
 # Translator tests: determinism, freshness of the checked-in output,
 # independent block/item/opaque-node recounts, tamper detection, and a check
@@ -120,25 +120,115 @@ executable meaning of the fragment is `Interp.lean`.
 ## The interpretation
 
 `Interp.lean` transcribes, against the *generated* types, the specr-lang
-functions needed to run the fragment below on `Machine<BasicMemory<x86_64>>`:
-`Machine::step` (single enabled thread), `Statement::{Assign, PlaceMention}`,
-`PlaceExpr::Local`, `ValueExpr::{Constant, Load, UnOp, BinOp}` with
-`IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants), `CastOp::IntToInt`, and
+functions needed to run the fragment below on both `Machine<BasicMemory<x86_64>>`
+(`Mach`) and polymorphic `Machine<M>` (`MemoryOps M`, instantiated on both
+`BasicMemory<x86_64>` and `TreeBorrowsMemory<x86_64>`, `MachTB`, via `stepM` /
+`stepsM` and `stepTB` / `stepsTB`):
+`Machine::step` (single enabled thread),
+`Statement::{Assign, PlaceMention, Validate, StorageLive, StorageDead, Deinit}`
+(with `StackFrame::{storage_live, storage_dead}`, `ConcurrentMemory::deinit`,
+and `Machine::{retag_val, retag_ptr}`),
+`PlaceExpr::{Local, Field, Index, Deref}` (`Field` indexing `(offset, field_ty)`
+on `Type::Tuple` and `Type::Union`, `Index` on `Type::Array` and `Type::Slice`,
+with `Machine::ptr_offset_inbounds`, `Memory::{dereferenceable,
+signed_dereferenceable}`, and the `Machine::compute_size` sanity check, and
+`Deref` evaluating its operand, checking a safe pointee's alignment and
+dereferenceability, and recording whether the place is aligned),
+`ValueExpr::{Constant, Load, Tuple, UnOp, BinOp}` (`ValueExpr::Tuple` evaluating
+each element or field expression in order and returning `(Value::Tuple(vals),
+ty)` for both `Type::Tuple` and `Type::Array`, while `check_value` and
+`Type::encode` validate length and element/field values at `typed_store` /
+`typed_load`) with
+`IntUnOp::{Neg, BitNot, CountOnes}` (all 3 `IntUnOp` variants),
+`CastOp::{IntToInt, Transmute}` (both `CastOp` variants; `Transmute` runs
+`Machine::transmute`, which encodes the value at the old type and decodes
+and checks it at the new one),
 `IntBinOp::{Add, AddUnchecked, Sub, SubUnchecked, Mul, MulUnchecked, Div, DivExact, Rem, Shl, Shr, ShlUnchecked, ShrUnchecked, BitAnd, BitOr, BitXor}` (all 16 `IntBinOp` variants),
-`Terminator::{Goto, Switch, Return, Unreachable}` including
-frame teardown and both stack-pop actions, the representation relation for
-`Int` and `Bool`, `Type::layout`, `BasicMemory`'s `check_ptr`, `load`, `store`,
-and `deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+`BinOp::IntWithOverflow` with `IntBinOpWithOverflow::{Add, Sub, Mul}` (all 3
+`IntBinOpWithOverflow` variants, through `Machine::eval_int_bin_op_with_overflow`
+and `IntType::with_overflow`, returning `(Value::Int(res_wrapped), Value::Bool(res != res_wrapped))` at `ty.with_overflow()`),
+`BinOp::Rel` with `RelOp::{Lt, Gt, Le, Ge, Eq, Ne, Cmp}` (all 7 `RelOp`
+variants, through `Machine::eval_rel_op`) on integers, Booleans, and thin
+pointers (`comparePtr`, which compares addresses),
+`Constant::{Int, Bool, FnPointer, GlobalPointer, VTablePointer,
+PointerWithoutProvenance}` and `Machine::fn_from_ptr`,
+`Terminator::{Goto, Switch, Call, Return, Unreachable, Intrinsic}` (including
+`check_abi_compatibility` across all 7 `Type` variants,
+`Machine::prepare_for_inplace_passing`, `Machine::eval_argument` for `ByValue`
+and `InPlace`, `Machine::create_frame`, `Machine::eval_call`,
+`Machine::mutate_cur_stack`, frame teardown, and both `StackPopAction`s
+`BottomOfStack` and `BackToCaller`; for `Terminator::Intrinsic`,
+`Machine::eval_intrinsic` on `Exit` (with `ConcurrentMemory::leak_check`),
+`Abort`, `Assume`, `PrintStdout`, `PrintStderr`, `Allocate`, `Deallocate`,
+`RawEq` (with `Machine::load_raw_data` and structural `Type` equality),
+`PointerExposeProvenance` (with `IntPtrCast::expose`),
+`PointerWithExposedProvenance` (with `IntPtrCast::int2ptr`, whose angelic
+provenance choice `int2ptrProvenance` resolves), and `GetUnwindPayload`; the
+thread, lock, and atomic intrinsics report `Stop.unsupported`), the
+representation relation (`Type::{decode, encode}`) for `Int`, `Bool`, `Ptr`,
+`Array`, sized `Tuple`, `Union`, `Enum` (through `decode_discriminant` and
+`encode_discriminant`), `Slice`, and `TraitObject`, `check_value` for those
+types, `Type::layout` across all 9 `Type` variants (with
+`PtrType::{safe_pointee, meta_kind}` and `LayoutStrategy::meta_kind`) and
+`LayoutStrategy::compute_size_and_align`
+/ `TupleHeadLayout::full_size_and_align`, `BasicMemory`'s `check_ptr`,
+`dereferenceable`, `signed_dereferenceable`, `load`, `store`, `allocate`, and
+`deallocate`, and `ConcurrentMemory`'s access log and data-race check.
+For raw pointers (MR-3.1) and references (MR-3.2) it adds `Type::Ptr` with
+`PtrType::Raw`, `PtrType::Ref`, and `PtrType::Box` (layout, `decode_ptr` /
+`encode_ptr` with per-byte provenance fragments, wide pointers with
+`PointerMetaKind::ElementCount` metadata, and `check_value` / `check_ptr` —
+including safe-pointer non-null, pointee-alignment, inhabitedness, and
+`ConcurrentMemory::dereferenceable` checks via the machine's live allocations;
+`PointerMetaKind::VTablePointer` metadata remains `unsupported`),
+`ValueExpr::AddrOf` (with `BasicMemory`'s identity `retag_ptr`),
+`Statement::Validate` (`Machine::retag_val` across `Ptr`, `Tuple`, `Array`, and
+scalar values), the full 6-module Tree Borrows memory model
+(`spec/mem/tree_borrows/{reborrow_settings,state_machine_unprotected,state_machine_protected,state_machine,tree,memory}.md`:
+`ReborrowSettings::new` / `perm`, `UnsafeCellStrategy::freeze_mask`,
+`PermissionUnprot`, `PermissionProt`, `Permission`, `Node`,
+`TreeBorrowsFrameExtra`, and `TreeBorrowsMemory` — `new`, `allocate`,
+`deallocate`, `load`, `store`, `dereferenceable`, `retag_ptr`, `reborrow`,
+`new_call`, `end_call`, `release_protector`, and `leak_check`, backed by
+polymorphic `BasicMemory<x86_64, ProvExtra, AllocExtra>`),
+`PlaceExpr::Deref` (whose `aligned` flag makes a load or store through a
+misaligned pointer UB), `UnOp::GetThinPointer`, `BinOp::PtrOffset` with both
+`inbounds: true` (`Machine::ptr_offset_inbounds`) and `inbounds: false`
+(`ptr_offset_wrapping`), `BinOp::PtrOffsetFrom`,
+`Constant::PointerWithoutProvenance`, and `Terminator::Intrinsic` for
+`IntrinsicOp::{PointerExposeProvenance, PointerWithExposedProvenance}` with
+`IntPtrCast::{expose, int2ptr}` (`spec/mem/intptrcast.md`). `int2ptr` predicts
+a provenance with the angelic choice `predict`; the interpretation
+(`int2ptrProvenance`) returns no provenance when nothing is exposed, the exposed
+provenance when exactly one is exposed, and otherwise the unique exposed live
+allocation whose address range (one-past-the-end included) contains the
+address, reporting `Stop.unsupported` when none or several qualify. Its
+successful runs are runs of the spec (`int2ptrProvenance_admissible`), it never
+fabricates UB (`int2ptrProvenance_error_unsupported`), and UB on the
+reconstructed pointer's first access is UB for every admissible choice
+(`int2ptr_checkPtr_ub_forced`; see `Correspondence/Provenance.lean`).
+`BasicMemory::allocate` picks the address with the daemonic choice `pick`,
+which never has a unique solution; the interpretation commits to one valid
+resolution (`BM.pickAddr`): the first multiple of `2^32` in `[2^32, 2^64)`
+that satisfies every test of the upstream predicate (`BM.allocAddrOk`), and
+reports `Stop.unsupported` when there is none. The recursion over
+nested types, array elements, tuple fields, union chunks, enum variants, and
+discriminator trees is structural (Lean `mutual` blocks), so the kernel
+evaluates it.
+MiniRust has no Boolean `!`: `UnOp::Int` on a `Value::Bool` is a spec panic,
+as upstream, and `minimize` expresses `!b` with transmutes instead (see below).
 Every definition quotes the upstream code it transcribes and cites its exact
 vendored source file, and `crates/anneal-minirust-gen/tests/quotes.rs` parses
 every Lean doc comment (`/-! ... -/` and `/-- ... -/`) and checks each quoted
 substring against its cited vendored file (ignoring only whitespace and `//`
 comments; `..` marks elided code). Effects are
-`Except Stop` with `Stop.ub` (`throw_ub!`), `Stop.deadlock`, `Stop.specPanic`
-(a panic in the spec, which upstream calls a spec bug), and
-`Stop.unsupported` (outside the interpreted fragment; never silently wrong).
+`Except Stop` with `Stop.ub` (`throw_ub!`), `Stop.abort` (`throw_abort!`),
+`Stop.machineStop` (`throw_machine_stop!`), `Stop.memoryLeak`
+(`throw_memory_leak!`), `Stop.deadlock`, `Stop.specPanic` (a panic in the
+spec, which upstream calls a spec bug), and `Stop.unsupported` (outside the
+interpreted fragment; never silently wrong).
 
-`Anchors.lean` lists the 39 upstream items that `Interp.lean` transcribes,
+`Anchors.lean` lists the 104 upstream items that `Interp.lean` transcribes,
 each with its file path, item name, line, and token hash, and proves by `decide`
 that the generated model contains them unchanged (`anchors_ok`) with no
 duplicate entries (`anchors_nodup`). Re-pinning MiniRust therefore breaks
@@ -153,42 +243,331 @@ MiniRust's `minimize` (vendored under `vendor/<commit>/tooling/minimize/src/`,
 quoted in the doc comments, quotations checked by `tests/quotes.rs`)
 restricted to the fragment checked by `inFragment`:
 
-* the body is `Runtime(PostCleanup)` MIR and declares only the return place
-  and the arguments, all of integer type (`u8`..`u128`, `i8`..`i128`,
-  `usize`, `isize`);
-* statements are `_i = Use(op)`, `_i = UnaryOp(Neg | Not, op)`,
-  `_i = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
-  `_i = Cast(CastKind::IntToInt, op, targetTy)`, or `PlaceMention(_i)`,
-  with `op`, `opL`, `opR` projection-free `copy _j` or integer constants (of `_i`'s
-  type for `Use`, `UnaryOp`, `opL`, and non-shift `opR`, or of any integer type
-  for shift `opR` and `Cast(IntToInt)`);
-* terminators are `Goto`, `SwitchInt` on any integer fragment operand (`copy _j`
-  or constant) with distinct in-range values, `Return`, and `Unreachable`; all
-  targets are blocks of the body; no cleanup blocks.
+* the body is `Runtime(PostCleanup)` MIR and declares the return place, the
+  arguments, and any number of temporaries (`argCount + 1 <= localDecls.length
+  < 2^31`); the return place `_0` has integer type (`u8`..`u128`, `i8`..`i128`,
+  `usize`, `isize`), `bool`, `core::cmp::Ordering`, or a 2-tuple `(Int, bool)`,
+  each temporary (`argCount < i`) has one of those scalar-family types or a thin
+  raw pointer or reference type `*const T` / `*mut T` / `&T` / `&mut T` to an
+  integer pointee `T` (`ptrPointeeOf`, `isRefLocal`), and each argument local
+  additionally may be a homogeneous
+  one-dimensional integer array `[T; N]` whose byte size `N * size_of::<T>()` is
+  below `2^63` or a well-formed nested tuple or single-variant struct
+  (`TupleSpec`: `RigidTy::Tuple` or `RigidTy::Adt` with `FieldsShape::Arbitrary`,
+  `VariantsShape::Single(0)`, integer leaf fields or `()`, and explicit
+  inter-field and trailing padding);
+* the body's ABI calling convention (`body.fnAbi.conv`) is `Rust` or `C`, the
+  two conventions `minimize`'s `translate_calling_convention` supports
+  (`translateCallConv`; `minimize` panics on any other);
+* `StorageLive(_i)` and `StorageDead(_i)` of scalar-family or thin pointer /
+  reference locals (`StorageDead` only of temporaries, as MiniRust's
+  well-formedness check requires), and `Deinit(_i)` of a scalar-family or thin
+  pointer / reference root local, which `minimize` does not translate and we
+  translate to `Statement::Deinit(PlaceExpr::Local(_i))`;
+* scalar-family operands may be `copy` or `move` of `_j`, `_j.0`, or `_j.1` (and
+  integer operands may also `copy` an array element `_j[p]` or a nested
+  tuple/struct scalar field chain `_j.f1...fk`). `minimize` translates `move`
+  like `copy`; Anneal's `move` of a root local leaves it uninitialized while
+  MiniRust's is a plain load, so `movesOk` rejects any body that reads a
+  possibly moved-out local before re-initializing it, propagating moved-out sets
+  forward from `[]` at `bb0` across `Goto` and `SwitchInt` edges
+  (`movedAtEntry`) and treating `Return` as reading `_0`;
+* temporaries without storage markers (`alwaysStorageLiveLocals`, which
+  `minimize`'s init block allocates) are never mentioned (`mentionsOk`);
+* integer destination places are an integer local `_i`, an array element
+  `_i[p]` where `p` is `Index(_k)` (`_k` an integer local; a signed `_k` is
+  accepted only when `N <= 2^(bits(_k) - 1)`, see the gaps) or
+  `ConstantIndex { offset, min_length, from_end }` (`min_length <= N`,
+  `offset < 2^63`, and `1 <= offset <= N` when `from_end`), or a scalar field
+  chain `_i.f1...fk` of a `TupleSpec` local; statements assigning to an integer
+  place `dst` are `dst = Use(op)`, `dst = UnaryOp(Neg | Not, op)`,
+  `dst = BinaryOp(Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | AddUnchecked | SubUnchecked | MulUnchecked | ShlUnchecked | ShrUnchecked, opL, opR)`,
+  `dst = Cast(CastKind::IntToInt, op, targetTy)` (from any integer or `bool`
+  type, where `minimize` casts `bool` via `transmute::<u8>` followed by
+  `CastOp::IntToInt`), or (into a `usize` place) `dst = Len(_j)` of an array
+  local;
+* for a `bool` `_i`: `_i = Use(op)`, `_i = UnaryOp(Not, op)`, and
+  `_i = BinaryOp(BitAnd | BitOr | BitXor, opL, opR)` with `bool` operands, and
+  `_i = BinaryOp(Eq | Ne | Lt | Le | Gt | Ge, opL, opR)` with two integer
+  operands of one type or two `bool` operands. `minimize` translates the
+  comparisons to `BinOp::Rel`, `!b` to `build::not(b)` (a transmute of
+  `1u8 - transmute::<u8>(b)` back to `bool`), `BitAnd | BitOr | BitXor` on
+  `bool` to `build::bool_and`, `build::bool_or`, and `build::bool_xor`
+  (`boolBitOp`: integer `BitAnd | BitOr | BitXor` on the `transmute::<u8>`
+  views, transmuted back to `bool`), and a `bool` constant to `Constant::Bool`;
+* for a `core::cmp::Ordering` `_i`: `_i = Use(copy _j | move _j)` of an
+  `Ordering` local, and the three-way comparison `_i = BinaryOp(Cmp, opL, opR)`
+  of two integer operands of one type or two `bool` operands. MiniRust's
+  `RelOp::Cmp` returns the `i8` `-1`, `0`, or `1`, and `minimize` transmutes it
+  to its translation of `Ordering` (`orderingTy`: a one-byte `Type::Enum` with a
+  directly encoded `i8` tag, built as `translate_enum` does for
+  `#[repr(i8)] enum Ordering { Less = -1, Equal = 0, Greater = 1 }`), so the
+  tag is re-validated by `decode_discriminant`;
+* for a 2-tuple `(Int, bool)` `_i`: `_i = Use(copy _j | move _j)` of a
+  `(Int, bool)` local of the same type,
+  `_i = BinaryOp(AddWithOverflow | SubWithOverflow | MulWithOverflow, opL, opR)`
+  with two integer operands `opL`, `opR` of type `Int` (`BinOp::IntWithOverflow`),
+  and `_i = Aggregate(AggregateKind::Tuple, [opInt, opBool])` (`ValueExpr::Tuple`
+  at `IntType::with_overflow`); field projections `_j.0` and `_j.1` translate to
+  `PlaceExpr::Field(PlaceExpr::Local(_j), 0)` and `PlaceExpr::Field(PlaceExpr::Local(_j), 1)`;
+* for an array local `_i : [T; N]`: `_i = Use(copy _j)` of an array local of the
+  same type, `_i = Aggregate(Array(T), [op_0, .., op_{N-1}])`, or
+  `_i = Repeat(op, N)` with `N > 0` (or `N = 0` when `op` is a constant);
+* for a layout-backed tuple or single-variant struct place `dst` (`_i` or a
+  nested sub-tuple/struct field chain `_i.f1...fk`): `dst = Use(copy p)` of a
+  place of the same `TupleSpec`, or
+  `dst = Aggregate(Tuple | Adt(_, 0, None), [op_0, .., op_{M-1}])`;
+* for a thin raw pointer or reference temporary `_i : *const T | *mut T | &T | &mut T`:
+  `_i = &raw const q` / `_i = &raw mut q` (for raw pointer destinations) and
+  `_i = &q` / `_i = &mut q` / `_i = &two_phase mut q` (any `BorrowKind`:
+  `.shared`, `.mut false`, or `.mut true`, for reference destinations) of the
+  same mutability, where `q` is
+  either a direct parameter borrow target of pointee type `T` (`ptrTargetSpec`:
+  an integer parameter, an in-bounds `ConstantIndex` element of an array
+  parameter, or a scalar field chain of a `TupleSpec` parameter) or a reborrow
+  `(*_p)` of a raw pointer or reference local `_p` to `T` that does not add
+  mutability, `_i = Use(copy _p | move _p)` or `_i = CopyForDeref(_p)` of a
+  pointer/reference local of the exact same type (`isRefLocal _p = isRefLocal _i`),
+  `_i = Cast(PtrToPtr, copy _p, _)` between raw pointers to `T` that does not add
+  mutability, `_i = Cast(Transmute, copy _p | move _p, dstTy)` between any thin
+  raw pointer or reference types (`*const T` / `*mut T` / `&T` / `&mut T`) to `T`
+  that does not add mutability, and `_i = BinaryOp(Offset, copy _p, const 0)` on
+  a raw pointer `_p`;
+  an integer local `_i : T` may also be assigned `Use(copy (*_p) | move (*_p))`
+  or `CopyForDeref(*_p)` through a raw pointer or reference `_p` to `T`
+  (`ptrDerefReadOk`), and `(*_p) = rv` writes an integer rvalue `rv` of type `T`
+  (including `move` operands via `copyRv rv`, as well as pointer-to-pointer
+  dereference copies `(*_w) = Use(copy (*_r) | move (*_r))` and
+  `(*_w) = CopyForDeref(*_r)` through a raw pointer or reference `_r` to `T`)
+  through a `*mut T` or `&mut T` local `_p`; every borrowed parameter and
+  pointer/reference flow across the CFG is subject to the flow-sensitive borrow
+  discipline `ptrAliasingOk` (see the gaps);
+* `PlaceMention(p)` on any unprojected local `_i`, `(Int, bool)` field `_i.0` /
+  `_i.1`, or `TupleSpec` field chain `_i.f1...fk`, and `Retag(kind, _i)` with
+  non-`FnEntry` `RetagKind` (`.default`, `.twoPhase`, or `.raw`, which
+  `minimize` lowers to `Statement::Validate { place: Local(_i), fn_entry: false }`)
+  on any thin raw pointer or reference root local `_i` whose abstract borrow
+  state in `ptrAliasingOk` is not `.disabled`;
+* terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
+  with distinct in-range values (`minimize` switches on `transmute::<u8>(b)` for
+  a `bool`), `Return`, and `Unreachable`; all targets are blocks of the body; no
+  cleanup blocks.
+
+`minimize` translates `Index(_k)` to `PlaceExpr::Index` with index `Load(_k)`,
+field chains `p.f1...fk` to nested `PlaceExpr::Field` projections,
+`Aggregate(Array | Tuple | Adt)` and `Repeat(op, N)` to `ValueExpr::Tuple` (the
+latter with `N` copies of `op`), and `Len` of an array to the constant `N`.
+Upstream `minimize` rejects `ConstantIndex` (`span_bug!`); `translateFn` lowers
+it to `PlaceExpr::Index` with the constant `usize` index `offset` (or
+`N - offset` when `from_end`), which is the index MIR defines for it.
+
+`translateFn` also transcribes `minimize`'s raw pointer and reference cases, and
+`inFragment` admits thin raw pointer and reference temporaries
+(`*const T` / `*mut T` / `&T` / `&mut T` to integer pointees) under
+`ptrAliasingOk` (see the gaps for excluded pointer and reference constructs):
+`*const T` / `*mut T` become `Type::Ptr(PtrType::Raw { meta_kind })`
+(`rawPtrTypeOf`), `&T` / `&mut T` become
+`Type::Ptr(PtrType::Ref { mutbl, pointee })` and `alloc::boxed::Box<T>` becomes
+`Type::Ptr(PtrType::Box { pointee })` (`refTypeOf` / `boxTypeOf`, computing
+`PointeeInfo` across integer types, `bool`, `Ordering`, `(Int, bool)`, arrays,
+tuples/structs, nested references/boxes, raw pointers, and `core::cell::UnsafeCell<T>`
+with `unsafe_cells = Sized([(0, sizeof(T))])` and `freeze = false`), `&raw const q` /
+`&raw mut q` and `&q` / `&mut q` / `&two_phase mut q` on parameter places
+(`ptrTargetSpec`) or reborrow places `(*_p)` become `ValueExpr::AddrOf` at
+`PtrType::Raw` or `PtrType::Ref`, `*_j` becomes `PlaceExpr::Deref(Load(_j), T)`,
+a `PtrToPtr` cast between thin raw pointers is its operand (admitted by
+`inFragment` when pointee types match and mutability is not added), a
+`CastKind::Transmute` cast becomes `UnOp::Cast(CastOp::Transmute(ty))`
+(admitted by `inFragment` between thin raw pointers and references to the same
+integer pointee `T` when mutability is not added), and `Offset(l, r)` becomes
+`PtrOffset { inbounds: true }(l, MulUnchecked(r, size_of::<T>()))`
+(`ptrOffsetExpr`, admitted by `inFragment` when `r` is the constant `0` via
+`zeroOffsetConstOk`). `minimize`'s translation of `PointerExposeProvenance` and
+`PointerWithExposedProvenance` casts, which ends the block with an intrinsic
+call and continues in a fresh block, is not transcribed (`translateFn` returns
+`none`).
 
 ### States
 
 `Correspondence/Relation.lean` defines `StateRel body f ctx s m` (for execution
 within MIR blocks) and `StartRel body f ctx s mInit` (for entry at `minimize`'s
-synthesized `f.start` block without requiring a phantom `bb0` machine): the
+synthesized `f.start` block without requiring a phantom `bb0` machine), and
+`Correspondence/Simulation.lean` defines `StateRelN body f ctx s m` (bundling
+`StateRelAt` with `NonScalarLive`, `BorrowsOk`, and `LocalsOk` at
+`ctxWithBorrows body ctx s.memory.borrows` so each Anneal borrow tag is tied to
+the MiniRust address and provenance of its target place): the
 MiniRust machine has one enabled thread whose stack is `[caller, callee]`; the
-callee runs `f` at the corresponding program point; every MIR local `_i` is a
-live MiniRust local pointing to its own `Stack` allocation whose bytes are the
-encoding of Anneal's slot (`Uninit` bytes for an uninitialized slot,
-little-endian bytes for an initialized scalar); the caller's return place is a
-live, large-enough, aligned allocation (`CtxOk`); and Anneal's memory has no
-borrows, protectors, call stack, or caller-owned referents. `ctx` fixes
-everything the callee does not determine: caller frame, unwind payloads, the
-allocations below the callee's locals, the locals' addresses (arbitrary,
-subject only to alignment, so every MiniRust address choice is covered), and
-the caller's continuation.
+callee runs `f` at the corresponding program point; a MIR local `_i` is in the
+callee's locals map exactly when Anneal's slot is live (or `_i` is a
+temporary that the init block allocated), pointing to its own `Stack`
+allocation whose bytes are the encoding of a slot (`Uninit` bytes for an
+uninitialized slot, little-endian bytes for an initialized scalar, only `0` or
+`1` for an initialized `bool`, only the tags `255`, `0`, or `1` for an
+initialized `Ordering`, 8-byte `ptrBytes` carrying the target allocation's
+provenance and byte address for an initialized thin raw pointer, concatenated
+element encodings for an initialized `[T; N]` array, and field encodings placed
+at compiler layout offsets with `AbstractByte::Uninit` preserved at all
+inter-field and trailing padding bytes for `(Int, bool)` and `TupleSpec`
+tuples/structs; `LocalsOk`, with non-scalar array and `TupleSpec` arguments
+remaining live and initialized under `StateRelN`); MiniRust's bytes encode
+Anneal's slots except for locals that Anneal's `move` de-initialized and that
+`movesOk` keeps unread (`StaleOk`, with address-taken locals never moved so
+`StaleOk.addrTaken_eq` holds); the caller's return place is a live,
+large-enough, aligned allocation and the caller's allocations and initial
+argument allocations lie below `2^32`, clear of `BM.pickAddr`'s candidates
+(`CtxOk`); and Anneal's memory has no protectors, call stack, or caller-owned
+referents, while its borrow table satisfies `BorrowsOk` (empty for all-scalar
+bodies). `ctx` fixes everything the callee does not determine: caller frame,
+unwind payloads, the allocations below the callee's locals, the addresses of
+the return place and the arguments (arbitrary below `2^32`, subject to
+alignment and in-bounds size), and the caller's continuation.
+* in `progInFragment` (`progStatementOk`), non-diverging
+  `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))` on any `bool`
+  fragment operand `op` (`copy _j`, `move _j`, `copy (_j.1)`, `move (_j.1)`, or
+  `bool` constant): `minimize`'s `translate_bb` (`splitStmts`) ends the open
+  MiniRust block in `Terminator::Intrinsic(IntrinsicOp::Assume, [op],
+  build::unit_place(), some nextBb)` and continues subsequent MIR statements in
+  a fresh continuation block `nextBb` (`SegChain`, `SegPc`), while `stmtReadsOk`
+  and `stmtMoved` track `op` just like any other statement read/move;
+* terminators are `Goto`, `SwitchInt` on any integer or `bool` fragment operand
+  (`copy _j`, `move _j`, `copy (_j.0)`, `move (_j.0)`, `copy (_j.1)`,
+  `move (_j.1)`, or constant) with distinct in-range values (`minimize` switches
+  on `transmute::<u8>(b)` for a `bool`), `Return`, `Unreachable`, and — in the
+  multi-function fragment `progInFragment entry callees` translated by
+  `translateProg` (`translateFnInProg` + `mkStartFn`, with `translateCallConv`
+  translating `CallConv.rust` and `CallConv.c` per `minimize`'s
+  `translate_calling_convention` and rejecting unsupported ABIs) — direct
+  monomorphic `TerminatorKind.call` with `some targetBb` and non-cleanup
+  `UnwindAction` (`Continue`, `Unreachable`, or `Terminate`): the call edge
+  carries the callee's own calling convention (`lookupFnTarget`, as `minimize`
+  derives it from `fn_abi_of_instance`), `translateCallArg` lowers
+  `Operand::Move` to `ArgumentExpr::InPlace` (writing `Uninit` bytes in
+  MiniRust too, restricted by `callArgOk` to root locals `move _j`) and
+  `Copy`/`Constant` to `ArgumentExpr::ByValue`; `callArgsOk` and `callDestOk`
+  require each argument and the return place to have the callee's parameter
+  and return types (so `check_abi_compatibility` succeeds); `callDestOk` uses
+  the greatest fixed points verified by `livenessOk` and `tupleInitOk` to
+  require that `destination` is live (and an initialized `(Int, bool)` tuple
+  when writing `_dst.0` or `_dst.1`), and `callTerminatorOk` requires it to be
+  disjoint from `argOps`; `termReadsOk` checks `readsOk (dst :: mo) argOps`
+  (allowing `_dst ∈ mo` on root overwrites `⟨dst, []⟩` while requiring
+  `!mo.contains dst` on projected writes `⟨dst, _ :: _⟩`), and `termMoved`
+  clears root `dst` from `mo`; and `maxStackLocals entry callees < 2^31` bounds
+  worst-case stack allocations across acyclic call graphs; all targets are
+  blocks of the body; no cleanup blocks. For each of the liveness,
+  tuple-initialization, parameter-type, return-type, argument-count,
+  return-place/argument disjointness, root-only `move`, and stale-argument
+  (`termReadsOk`) checks, `Witness.lean` refutes the conclusion of
+  `mirCallWithCallees_noUB` or `mirCallWithCallees_ub` for a caller that the
+  check rejects, so none of them can be dropped.
+
+### Multi-frame states
+
+Next to the single-frame relations above, `Correspondence/Relation.lean`
+defines multi-frame `CallStackRel callees prog fnMap rootCtx stack frames m`,
+`MultiStateRel entry callees prog rootCtx s m`, and
+`MultiStartRel entry callees prog fEntry rootCtx s mInit`: for a multi-function
+call stack of depth `D` the MiniRust stack is
+`rootCtx.caller :: suspendedCaller_1 :: .. :: suspendedCaller_D :: activeCallee`
+aligned frame-for-frame with Anneal's `s.memory.callStack` (`SavedCallerFrame`s)
+and `s.memory.activeCallee`; the active frame (and each suspended caller's
+return target) runs `f` at the `SegPc`-aligned split-block program point
+matching MIR `(blockIdx, stmtIdx)`; a MIR local `_i` is in a frame's locals map
+exactly when Anneal's
+slot is live (or `_i` is a temporary that the init block allocated), pointing to
+its own `Stack` allocation whose bytes are the encoding of a slot (`Uninit`
+bytes for an uninitialized slot, little-endian bytes for an initialized scalar,
+only `0` or `1` for an initialized `bool`, and only the tags `255`, `0`, or `1`
+for an initialized `Ordering`, so that the byte decodes at the local's MiniRust
+type; `LocalsOkA` parameterized by `AddrClass`: `< 2^32` for `rootCtx` arguments
+and return place, or `allocCandidate k` at multiples of `2^32` for locals
+allocated by `BM.allocate` in `initBlock`, `StorageLive`, and `create_frame`);
+MiniRust's bytes encode Anneal's slots except for locals that Anneal's statement
+or switch `move` de-initialized and that `movesOk` keeps unread (`StaleOk`);
+each suspended caller's return destination (`CallerDestRel` for root `_dst`,
+`_dst.0`, or `_dst.1`) has already been `deinit`ed by MiniRust's
+`prepare_for_inplace_passing` and awaits `StackPopAction::BackToCaller` on
+`Terminator::Return`; `ProgEnvOk` maps each `(fnName idx)` in `m.fn_ptrs` and
+`m.prog.functions` to its translated `Gen.Function`; and Anneal's memory has no
+borrows, protectors, or caller-owned referents. `rootCtx` fixes everything above
+the root entry frame: external caller frame, unwind payloads, base allocations
+below `2^32` (`CtxOk`), and external continuation.
 
 ### Theorems
 
 All proofs are complete; `Audit.lean` fails the build unless each of the
 following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
 
-* `step_correspondence` (`Simulation.lean`): for a fragment body, its
+* `step_correspondence_N`, `step_correspondence` (`Simulation.lean`): for a
+  fragment body, its translation, and `StateRelN`-related states (or `StateRel`
+  for all-scalar bodies), one step of Anneal's coalgebra
+  `stepMirFn body s` and one `Machine::step` satisfy `StepRelN` / `StepRel`: a
+  silent Anneal step and an Anneal branch observation (the `switchInt` leakage
+  tag) match a MiniRust step to a `StateRelN`-related state; an Anneal normal
+  return of `v` matches a MiniRust step that pops the callee, writes the
+  encoding of `v` to the caller's return place, deallocates every callee local,
+  and continues the caller (`ReturnRel`); Anneal UB matches MiniRust UB
+  (`throw_ub!`, never a spec panic, deadlock, or unsupported construct); every
+  other Anneal outcome, including `unsupported`, is impossible.
+* `translateFnInProg_funcCfgWf`, `translateFn_funcCfgWf`, `mkStartFn_funcCfgWf`,
+  `translateProg_progWf` (`Translate.lean`, `Lemmas.lean`): every translated
+  fragment function (`bodyInProgFragment` / `inFragment`), synthesized `start`
+  function (`mkStartFn`), and multi-function program (`progInFragment`) satisfies
+  MiniRust's syntactic CFG and program well-formedness predicates (`funcCfgWf`
+  and `progWf`, transcribed from `spec/lang/well-formed.md`), including distinct
+  local/block/function names, `f.ret :: f.args` local declarations, `StorageLive`
+  and `StorageDead` restriction to non-argument/non-return locals across split
+  `Assume` segments, `Regular` vs `Cleanup`/`Catch`/`Terminate` jump-target
+  checks (`check_next_block`, `check_unwind_block`) across `Goto`, `Switch`,
+  `Intrinsic`, `Call`, and `Return`, and `Program::check_wf`'s `start` ABI,
+  0-argument, and `Sized(0, 1)` return-layout requirements.
+* `multi_step_correspondence`, `multi_step_start`,
+  `initMachineStateWithCallees_startRel` (`Simulation.lean`): for any
+  multi-function program in `progInFragment entry callees`, one step of Anneal's
+  `stepMirFn entry s` from `MultiStateRel` matches `1 ≤ k` MiniRust steps
+  (`MultiStepRel`: `k = 1 + initLen callee` steps on `TerminatorKind.call`,
+  executing `Terminator::Call` plus `callee`'s synthesized `initBlock` to reach
+  `callee` `bb0:0` with a pushed `CallStackRel` frame; `k = 1` step on nested
+  callee `Return` via `StackPopAction::BackToCaller`, tearing down callee
+  locals, writing `caller_ret_ptr`, and popping `CallStackRel` back to the
+  resumed caller at `targetBb:0`; `k = 1` step on root `Return` to `ReturnRel`,
+  ordinary statements/branches, and UB via `MultiStepRel.ub'`).
+* `multi_run_ret`, `multi_run_ret_from_start`, `multi_run_ub`,
+  `multi_run_ub_from_start`, `multi_run_ub_rel`, `multi_run_ub_rel_from_start`,
+  `multi_steps_error`, `multi_steps_error_from_start`, `multi_mirNoUB_safe`,
+  `multi_mirNoUB_safe_from_start`, `multi_steps_outcome`,
+  `multi_steps_outcome_from_start`, `multi_steps_outcome_any_from_start`,
+  `multi_mirNoUB_progress`, `multi_mirNoUB_progress_from_start`,
+  `multi_mirNoUB_progress_any_from_start`, `multi_mirNoUB_diverges_steps_ok`,
+  `multi_mirNoUB_diverges_from_start`, `multi_mirNoUB_diverges_rel_from_start`,
+  and `mirCallWithCallees_{ret, ub, ub_rel, noUB, steps_error, progress,
+  progress_any, outcome, outcome_any, diverges_steps_ok, diverges_rel}`
+  (`Run.lean`): lift `MultiStepRel` (using `steps_ok_mono` and prefix-wide
+  `¬ ReturnRel` across every intermediate step `1 ≤ j ≤ k` of `Call + initBlock`
+  so neither an intermediate error nor a transient root return can ever hide) to
+  full forward return, forward UB (localized by `multi_run_ub_rel`,
+  `multi_run_ub_rel_from_start`, and `mirCallWithCallees_ub_rel` to step `n + 1`
+  from a `MultiStateRel`-related machine `mLast` with `¬ ReturnRel` at every
+  prefix step `k ≤ n`, via `MultiStateRel.not_returnRel`,
+  `multi_step_start_no_returnRel`, and `steps_add_no_returnRel`), converse
+  `n`-step error soundness, `MirNoUBTree` safety, arbitrary `n : Nat` outcome
+  trichotomy and forward progress (including startup steps `n ≤ initLen entry`),
+  and diverging call-loop liveness on
+  `mirCallTreeWithCallees entry args callees`.
+* `iterLiveEntries_stabilizes`, `livenessOk_eq_true`, `liveAtEntry_greatest`,
+  `liveAtEntry_zero_mem`, `iterTupleInitEntries_stabilizes`,
+  `tupleInitOk_eq_true`, `tupleInitAtEntry_greatest` (`Simulation.lean`):
+  unconditional finite-fuel (`N * (L + 1)`) fixed-point convergence of must-live
+  (`liveAtEntry`) and must-initialized `(Int, bool)` 2-tuple
+  (`tupleInitAtEntry`) CFG intersection, unconditional truth of `livenessOk`
+  (whenever `argCount ≤ localDecls.length`) and `tupleInitOk`, and
+  Knaster–Tarski greatest post-fixed-point optimality. `livenessOk` and
+  `tupleInitOk` therefore never reject a body; `bodyInProgFragment` keeps them
+  as executable certificates whose post-fixed-point property the simulation
+  consumes, and `callDestOk`'s membership tests on `mustLiveBefore` and
+  `tupleInitBefore` (computed from `liveAtEntry` and `tupleInitAtEntry`) are
+  the actual restrictions.
+* `step_correspondence` (`Simulation.lean`): for a single-body fragment, its
   translation, and related states, one step of Anneal's coalgebra
   `stepMirFn body s` and one `Machine::step` satisfy `StepRel`: a silent
   Anneal step and an Anneal branch observation (the `switchInt` leakage tag)
@@ -198,45 +577,249 @@ following depends only on `propext`, `Quot.sound`, and `Classical.choice`.
   the caller (`ReturnRel`); Anneal UB matches MiniRust UB (`throw_ub!`, never a
   spec panic, deadlock, or unsupported construct); every other Anneal outcome,
   including `unsupported`, is impossible.
-* `step_initBlock`, `step_start`, `initMachineState_startRel`
-  (`Simulation.lean`): proves for every translated function `f` that
-  `initMachineState body args` (with `argsOk body args = true` and `CtxOk body ctx`)
-  satisfies `StartRel` at `f.start`, and that `minimize`'s synthesized entry
-  block (`f.start = bbName body.basicBlocks.length`) steps in 1 step (`Goto bb0`)
-  to `StateRel`.
-* `run_ret`, `run_ub`, `run_ret_from_start`, `run_ub_from_start`,
-  `mirCall_ret`, `mirCall_ub` (`Run.lean`): lifted to Anneal's interaction
+* `iterMovedEntries_stabilizes`, `movesOk_iff_blockMovesOk`,
+  `movedAtEntry_least`, `blockMovesOk_antitone`, `movesOk_of_preFixedPoint`,
+  `movesOk_iff_exists_preFixedPoint` (`Simulation.lean`): unconditional
+  finite-fuel stabilization of forward CFG move propagation (`movedAtEntry`),
+  Knaster–Tarski least fixed-point optimality, antitonicity of `blockMovesOk`,
+  and Park-induction soundness and completeness for inductive pre-fixed-point
+  certificates on well-typed CFGs.
+* `step_start_N`, `step_start`, `initMachineState_startRel` (`Simulation.lean`):
+  proves for every translated function `f` that `initMachineState body args`
+  (with `argsOk body args = true` and `CtxOk body ctx`) satisfies `StartRel` at
+  `f.start`, and that `minimize`'s synthesized entry block
+  (`f.start = bbName body.basicBlocks.length`: `StorageLive` of each temporary
+  of `alwaysStorageLiveLocals`, then `Goto(bb0)`) runs in `initLen body` steps
+  to `StateRelN` (and `StateRel`).
+* `reaches_rel_N`, `reaches_rel`, `run_ret_N`, `run_ret`, `run_ub_N`, `run_ub`,
+  `run_ub_rel_N`, `run_ub_rel`, `run_ret_from_start`, `run_ub_from_start`,
+  `run_ub_rel_from_start_N`, `run_ub_rel_from_start`, `mirCall_ret`,
+  `mirCall_ub`, `mirCall_ub_rel` (`Run.lean`): lifted to Anneal's interaction
   trees `mirTree body s` and `mirCallTree body args`: if Anneal returns `v` (or
   can reach UB), then MiniRust started either at `bb0` or at `f.start` performs
-  the corresponding return (or raises UB) within finitely many steps.
-* `steps_error`, `steps_error_from_start`, `mirCall_steps_error` (`Run.lean`):
-  conversely, if MiniRust stops with *any* error within `n` steps from
-  `StateRel`, `StartRel`, or `mirCallTree body args`, either the error is UB and
-  Anneal can reach UB, or MiniRust already completed the callee's return
-  (`ReturnRel`, matching an Anneal `ReachesRet`) in `k < n` steps and only
-  errored later inside the unmodeled caller frame.
-* `mirNoUB_safe`, `mirNoUB_safe_from_start`, `mirCall_noUB`, `runA_noUB`
-  (`Run.lean`): if Anneal's interaction tree satisfies `MirNoUBTree`
+  the corresponding return (or raises UB, localized by the `_rel` variants to
+  step `n + 1` from a `StateRelN`- or `StateRel`-related machine `mLast` with
+  `¬ ReturnRel` at every prefix step `k ≤ n` via `reaches_rel_no_returnRel_N`,
+  `StateRel.not_returnRel`, and `step_start_no_returnRel`) within finitely many
+  steps. Only `run_ub_rel` and `reaches_rel_no_returnRel`, which start from an
+  arbitrary `StateRel` machine, need the all-scalar `hall` hypothesis.
+* `steps_error_N`, `steps_error`, `steps_error_from_start`,
+  `mirCall_steps_error` (`Run.lean`): conversely, if MiniRust stops with *any*
+  error within `n` steps from `StateRelN`, `StateRel`, `StartRel`, or
+  `mirCallTree body args`, either the error is UB and Anneal can reach UB, or
+  MiniRust already completed the callee's return (`ReturnRel`, matching an
+  Anneal `ReachesRet`) in `k < n` steps and only errored later inside the
+  unmodeled caller frame.
+* `mirNoUB_safe_N`, `mirNoUB_safe`, `mirNoUB_safe_from_start`, `mirCall_noUB`,
+  `runA_noUB` (`Run.lean`): if Anneal's interaction tree satisfies `MirNoUBTree`
   (`TreeSafe`), MiniRust never stops with any error (`.ub`, `.specPanic`,
   `.deadlock`, or `.unsupported`) anywhere during the callee's execution.
-* `steps_outcome`, `steps_outcome_from_start`, `mirCall_outcome`,
-  `mirNoUB_progress`, `mirNoUB_progress_from_start`, `mirCall_progress`,
-  `mirNoUB_diverges_steps_ok`, `mirNoUB_diverges_from_start`,
+* `steps_outcome_N`, `steps_outcome`, `steps_outcome_N_from_start`,
+  `steps_outcome_from_start`, `mirCall_outcome_N`, `mirCall_outcome`,
+  `mirNoUB_progress_N`, `mirNoUB_progress`, `mirNoUB_progress_N_from_start`,
+  `mirNoUB_progress_from_start`, `mirCall_progress_N`, `mirCall_progress`,
+  `mirNoUB_diverges_steps_ok_N`, `mirNoUB_diverges_steps_ok`,
+  `mirNoUB_diverges_from_start`, `mirNoUB_diverges_rel_N_from_start`,
   `mirNoUB_diverges_rel_from_start`, `mirCall_diverges_steps_ok`,
-  `mirCall_diverges_rel`, `treeSafe_of_step_inv`, `noRet_of_step_inv`,
-  `treeSafe_of_tau_inv`, `noRet_of_tau_inv` (`Run.lean`): total `n`-step
-  outcome trichotomy and forward progress for all `n : Nat` (either still
-  running in lockstep `StateRel`, already returned via `ReturnRel` in `k ≤ n`
-  steps, or stopped with `.ub` matching `FaultNow`), specializing under
-  `MirNoUBTree` and non-termination to prove that diverging UB-free loops
-  (both silent-step and branch-observing) step forever in lockstep
-  `StateRel` + `Reaches`.
+  `mirCall_diverges_rel_N`, `mirCall_diverges_rel`, `treeSafe_of_step_inv`,
+  `noRet_of_step_inv`, `treeSafe_of_tau_inv`, `noRet_of_tau_inv` (`Run.lean`):
+  total `n`-step outcome trichotomy and forward progress for all `n : Nat`
+  (either still running in lockstep `StateRelN` / `StateRel`, already returned
+  via `ReturnRel` in `k ≤ n` steps, or stopped with `.ub` matching `FaultNow`),
+  specializing under `MirNoUBTree` and non-termination to prove that diverging
+  UB-free loops (both silent-step and branch-observing) step forever in lockstep
+  `StateRelN` / `StateRel` + `Reaches`.
 
 ### Witnesses
 
 `Correspondence/Witness.lean` discharges every hypothesis for concrete
 programs, computing both semantics in the kernel (`decide`/`rfl`, no
 `native_decide`):
+
+* `callerMain`/`calleePair`, `projDestCaller`,
+  `chainEntry`/`chainMid`/`chainLeaf`, `callArgUbCaller`, `calleeDivZeroCaller`,
+  `calleeRetUninitCaller`, `callSpinCaller`, `liveCallDestSpinCaller`,
+  `callMoveReuse`, `moveReinitByCall`, `condCallMoveJoin`,
+  `cAbiCaller`/`cAbiCallee`, and `diamondCallEntry`/`diamondMidA`/`diamondMidB`
+  (MR-4.1): `callerMain` invokes `calleePair` (`initLen calleePair = 2`, 3-step
+  `Call + initBlock` entry) passing `_1` via `ArgumentExpr::ByValue` and
+  `(u32, bool)` tuple `_3` via `ArgumentExpr::InPlace`, exercising
+  `mirCallWithCallees_{ret, progress, progress_any, outcome_any}` on both
+  overflow and non-overflow paths (`callerCallee20_*`, `callerCalleeOv_*`,
+  `callerCallee20_midCall_step5`); `projDestCaller` writes sequential call
+  results into projected fields `_0.0` (`UnwindAction.unreachable`) and `_0.1`
+  (`UnwindAction.terminate`) of an `(i8, bool)` return place (`projDest127_*`);
+  `chainEntry -> chainMid -> chainLeaf` exercises a 3-deep nested call stack
+  (`depth 4` at `chainNeg5_depth4_step7`) returning `core::cmp::Ordering` across
+  frames (`chainNeg5_*`); `cAbiCaller`/`cAbiCallee` exercises `CallConv.c`
+  calling convention translation (`cAbi32_*`), while `diamondCallEntry ->
+  {diamondMidA, diamondMidB} -> cAbiCallee` exercises a diamond DAG call graph
+  with shared leaf `cAbiCallee` (`diamondCall5_*`); `callArgUbCaller`,
+  `calleeDivZeroCaller`, `calleeRetUninitCaller`, and `callMoveReuse` exercise
+  UB during argument evaluation, inside a pushed callee frame, on a callee's
+  `Return` of an uninitialized `_0`, and on post-call reuse of an
+  `InPlace`-moved local via `mirCallWithCallees_ub`,
+  `mirCallWithCallees_ub_rel` (`callArgUb_minirust_ub_rel`,
+  `calleeDivZero_minirust_ub_rel`, `calleeRetUninit_minirust_ub_rel`,
+  `callMoveReuse_minirust_ub_rel`, alongside single-body
+  `retUninit_minirust_ub_rel_from_start` and
+  `negMention0_minirust_ub_rel_from_start`), and
+  `mirCallWithCallees_steps_error`, while `projDestCaller_liveness_stabilizes`,
+  `projDestCaller_tupleInit_stabilizes`, `projDestCaller_liveAtEntry_greatest`,
+  and `projDestCaller_tupleInitAtEntry_greatest` instantiate the fixed-point
+  stabilization and greatest-fixed-point theorems; `callSpinCaller` proves
+  infinite lockstep call/return divergence (`callSpin_minirust_diverges_rel`)
+  and
+  `liveCallDestSpinCaller` divergence inside a callee that never returns
+  (`liveCallDestSpin_minirust_diverges_rel`); `moveReinitByCall`
+  re-initializes a moved-out local via a root call destination, and
+  `condCallMoveJoin` exercises a branch-correlated `InPlace` call move across a
+  CFG join (`condCallMoveJoin1_*`, `condCallMoveJoin0_*`);
+  `deadCallDestSpinCaller` (dead return place), `uninitProjCallDestCaller`
+  (uninitialized tuple under a projected return place), `abiArgMismatchCaller`
+  and `abiRetMismatchCaller` (parameter and return types),
+  `argCountMismatchCaller` (argument count), `callDestArgAlias` (return place
+  read by an argument), `callProjMoveReuse` (projected `move` argument), and
+  `stmtMoveThenCallArg` (stale argument after a statement `move`) are each
+  rejected by `progInFragment` and refute the conclusion of
+  `mirCallWithCallees_noUB` (`*_noUB_transfer_fails`: Anneal's tree is
+  `MirNoUBTree`, yet MiniRust raises UB before any root return, via
+  `no_returnRel_before`) or of `mirCallWithCallees_ub`
+  (`*_ub_transfer_fails`: Anneal reaches UB, yet MiniRust never raises UB, via
+  `never_ub_of_nonUb_stop`), while `deadCallDestCaller`,
+  `recCycleA`/`recCycleB`,
+  and `badCallConvCallee`/`badCallConvSysvBody`/`badCallConvCaller` mark the
+  remaining boundaries (a dead return place with a returning callee, where both
+  semantics fault; cyclic call graphs; unsupported calling conventions); and
+  `layout_ptr_and_array_mr41`, `evalConstant_and_fnFromPtr_mr41`,
+  `checkAbiCompatibility_all_variants_mr41`, `createFrame_ub_mr41`, and
+  `evalReturn_missingNextBlock_and_bottomOfStack_ub` directly verify every
+  transcribed MR-4.1 spec item, while `progStart_outside_fragment` shows why
+  the theorems start at `fEntry.start` rather than `prog.start`.
+* `evalIntrinsic_*`, `evalTerminator_abortTerminator`, `translateRsIntrinsic_witness`,
+  `assumeSub`, `assumeTupleCallCaller`, `assumeMultiFrameCaller`/`assumeChainCallee`,
+  `assumeDeadLocal`, `assumeMoveReuse`, and
+  `assumeAfterMove` (MR-4.2): direct checks of every transcribed `eval_intrinsic`
+  arm (`Abort`, `Exit`, each UB check of `Assume`, `PrintStdout`/`PrintStderr`
+  output and UB, `Allocate`/`Deallocate` with `Heap` leak checking, full `RawEq`
+  with `load_raw_data` and `typeEq`, `PointerExposeProvenance`,
+  `PointerWithExposedProvenance`, and `GetUnwindPayload`), `build::abort()`, and
+  `translateRsIntrinsic` (`raw_eq`, `ctpop`, `exact_div`, `cold_path`, `abort`);
+  and end-to-end `progInFragment` block-splitting correspondence (`mirCallWithCallees_ret`
+  and `mirCallWithCallees_ub_rel`) for `Assume` statements across two `Assume`s in
+  one MIR block (`assumeSub20_minirust_ret`, `assumeSubFalse_minirust_ub_rel`,
+  `assumeSub20_split_point`), `Assume(move _)` + tuple-field projection +
+  `Terminator::Call` across split blocks (`assumeTupleCall10_minirust_ret`,
+  `assumeTupleCallOv_minirust_ub_rel`), multi-frame pre-call, split-callee
+  continuation, and post-call `Assume` chains with `StorageLive`/`StorageDead`
+  straddling splits (`assumeMultiFrame5_minirust_ret`,
+  `assumeMultiFramePreUb_minirust_ub_rel`,
+  `assumeMultiFrameCalleeSeg2Ub_minirust_ub_rel`,
+  `assumeMultiFramePostUb_minirust_ub_rel`, `assumeMultiFrame_prog_wf`),
+  dead-local `Assume` UB (`assumeDeadLocal_minirust_ub_rel`), and necessity
+  witnesses proving that neither `stmtMoved` (`assumeMoveReuse_diverges`) nor
+  `stmtReadsOk` (`assumeAfterMove_diverges`) on `Assume` can be dropped.
+* `Correspondence/IntrinsicFallback.lean` (MR-4.2): calls to
+  `core::intrinsics::{ctlz, cttz, bswap, bitreverse, saturating_add,
+  saturating_sub, black_box}` and `u32::{wrapping_shl, wrapping_shr}` whose
+  callee is a hand-written fallback body in `callees` are ordinary direct calls
+  of the MR-4.1 fragment (`fb*_inFragment`). Each body is checked against a
+  pure Lean reference (`fb*Spec`) by kernel-evaluated Anneal runs
+  (exhaustively over all 256 inputs for `ctlz`, `cttz`, and `bitreverse`; for
+  every `u32` input of `black_box`; over full rows, columns, and boundary grids
+  for the saturating operations; over every shift amount below 64 for one
+  value of the shifts; and over sampled inputs for `bswap`), transferred to
+  MiniRust by `mirCallWithCallees_ret` (`fb*_minirust_*`) and cross-checked by
+  direct `Interp.steps` runs. Upstream `minimize` aborts with `span_bug!` on
+  calls to these seven intrinsics (`translate_rs_intrinsic` has no arm for
+  them); the witnesses relate Anneal to the MiniRust program that calls the
+  fallback body instead.
+* `Correspondence/IntrinsicBoundary.lean` (MR-4.2): kernel-checked handler
+  correspondence (`mirHandledTree` / `handleMirExternalCalls`) and boundary
+  witnesses for compiler intrinsics. For `cold_path`, `ctpop`,
+  session-configured `ub_checks` calls, and per-`IntType` `exact_div`, concrete
+  `ExternalCallHandler`s (`coldPathHandler`, `ctpopHandler`, `ubChecksHandler`,
+  `exactDivHandler`) match `minimize`'s `translateRsIntrinsic` lowerings
+  (`bdColdPath_handled`, `bdCtpop_handled`, `bdUbChecksCall_handled`,
+  `bdExactDiv_handled`, `exactDivHandler_iff_minirust`), supported by a symbolic
+  proof that MiniRust's `UnOp::Int(CountOnes)` equals the unsigned bit-pattern
+  popcount at every signed and unsigned `IntType` width
+  (`evalCountOnes_intFromBits`, `evalCountOnes_signedness_indep`). Without type
+  specialization, Anneal's `MirCallReq` erases generic `IntType` signedness, so
+  `exact_div::<i32>(-6, 3)` and `exact_div::<u32>(4294967290, 3)` issue identical
+  requests even though MiniRust's `DivExact` returns `-2` for the first and
+  raises UB for the second (`bdExactDiv_same_request`, `bdExactDiv_minirust_i32`,
+  `bdExactDiv_minirust_u32`). For pointer/target intrinsics outside the fragment:
+  `Rvalue::NullaryOp(UbChecks)` is `unsupported` in Anneal (`bdUbChecks_step`)
+  but a session-fixed `bool` constant in `minimize` (whereas an unlowered call
+  to `core::intrinsics::ub_checks` emits `MirStepNode.extCall` and is handled by
+  `ubChecksHandler`); `CopyNonOverlapping` aborts `minimize` (`span_bug!`) while
+  Anneal executes it and returns normally even on a two-element `u32` copy
+  between 4-byte locals (`bdCopy2_noUB`); Anneal's `BinOp::Offset` adds the raw
+  count without pointee scaling or inbounds checks (`bdOffsetNeg1_noUB`);
+  `write_bytes` (`bdWriteBytes_extCall`, `bdWriteBytes_unhandled_fault`),
+  `raw_eq`, and `arith_offset` issue external calls; diverging `abort` (`target = none`) is `unsupported` in Anneal
+  (`bdAbort_unsupported`); and `core::hint::unreachable_unchecked()` faults with
+  UB in Anneal, matching `Terminator::Unreachable` (`bdUnreach_anneal_ub`,
+  `bd_minirust_unreachable_ub`).
+* `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
+  `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
+  `tempMove` is
+  `fn(x: u32) -> u32 { let y = (x + 1) * 2; if y == 8 { 100 } else { y } }`
+  with `u32` and `bool` temporaries, `StorageLive`/`StorageDead`, root `move`
+  in a `BinaryOp`, a `Use`, and a `switchInt` discriminant, `Deinit` of a
+  moved-from temporary, and an unused temporary `_4` that the init block
+  allocates (`tempMove3_*`, `tempMove2_*`, including `StorageLive` reusing the
+  first-fit address that `StorageDead` released); `crossBlockMove` is a 4-block
+  CFG exercising forward dataflow `movesOk` (`movedAtEntry`) across `Goto` and
+  `SwitchInt` edges, moving the incoming argument `_1`, projected tuple moves
+  `move (_2.0)` and `move (_2.1)` on a `(u32, bool)` temporary, `StorageLive`
+  re-allocating already-live locals, `Deinit` of a `(u32, bool)` tuple, and
+  idempotent `StorageDead` (`crossBlockMove20_*`, `crossBlockMoveOv_*`);
+  `loopTempMove` is a cyclic 4-block loop CFG with two heterogeneous unmarked
+  temporaries (`alwaysStorageLiveLocals = [4, 5]`, `initLen = 3`), multi-pass
+  back-edge fixpoint convergence of `iterMovedEntries`, per-iteration
+  `StorageLive`/`StorageDead`/`Deinit`/`SwitchInt(move _3)`, live re-allocation
+  of `_2`, and idempotent `StorageDead(_2)` on `n = 0` (`loopTempMove3_*`,
+  `loopTempMove0_*`); `storageLiveArgRet` re-allocates an argument local `_1`
+  and the return place `_0` via `StorageLive` from their initial `< 2^32`
+  addresses onto first-fit `allocCandidate` addresses before returning;
+  `diamondMoveJoin` merges asymmetric moved-out sets across a 4-block diamond
+  CFG (`movedAtEntry` joining outgoing `[1]` and `[2, 1]` to `[1, 2]` at `bb3`)
+  while returning a join-initialized temporary (`diamondMoveJoinTrue_*`,
+  `diamondMoveJoinFalse_*`); `tupleAggCastMove` exercises `Operand::Move`
+  inside `Rvalue::UnaryOp(Neg, move _1)`,
+  `Rvalue::Cast(IntToInt, move _2, u32)`, `Rvalue::UnaryOp(Not, move _4)`
+  (self-assign move), `Rvalue::Aggregate(Tuple, [move _3, move _4])`, and
+  projected field move `Use(move (_5.0))` (`tupleAggCastMoveNeg5_*`, plus
+  `ctx0_ok_trailing_temp_addrs` witnessing that `CtxOk.addrs` constrains only
+  `i ≤ argCount`); `ordBoolCastTempMove` exercises `Cast(IntToInt, move _3,
+  u32)` from a moved `bool`, `SwitchInt(move _4)`, and `StorageLive`,
+  `BinaryOp(Cmp, move _, move _)`, `Use(move _5)`, `Deinit`, and `StorageDead`
+  on a `core::cmp::Ordering` temporary local reusing `_4`'s freed `2^32` slot,
+  together with a concrete Park-induction certificate witness
+  (`ordBoolCastTempMove_movesOk_by_preFixedPoint`, `ordBoolCastTempMoveTrue_*`,
+  `ordBoolCastTempMoveFalse_*`); `deadRead`, `deadAssign`, `deadDeinit`, and
+  `deadPlaceMention` access a local (including projected `PlaceMention(_1.0)`)
+  after `StorageDead` (UB in both models via `mirCall_ub`,
+  `mirCall_steps_error`, `mirCall_outcome`, and direct runs); `moveReuse`,
+  `crossBlockMoveReuse`, `loopBackEdgeReuse`, `projAssignMoveReuse`,
+  `projFieldMoveReuse`, `sameRvalueMoveReuse`, `moveRetPlace`, and
+  `diamondHalfMoveReuse` read a local after moving out of it — across
+  statements, blocks, cyclic back-edges, projected assignments, projected
+  field reads after a root tuple move, operands of a single rvalue (`readsOk`),
+  `Return` (`termReadsOk`), and one-armed diamond merges — rejected by `movesOk`
+  with concrete semantic disagreements (`moveReuse7_*`, `loopBackEdgeReuse1_*`,
+  `projFieldMoveReuse_*`, `sameRvalueMoveReuse5_*`, `moveRetPlace_*`,
+  `diamondHalfMoveReuseFalse_*`); `unmarkedTempAssign`, `storageDeadRet`,
+  `storageDeadArg`, `storageDeadArgReadAfter`, and `projectedDeinit` exercise
+  the soundness and well-formedness boundaries of `mentionsOk`, `storageDeadOk`
+  (for both `_0` and arguments), and projection-free `Deinit` with concrete
+  execution and UB witnesses; and `bm_allocate_and_deallocate_ub_cases` /
+  `evalStatement_deinit_ok_dead_and_misaligned` directly verify the UB and
+  normal paths of `BM.allocate`, `BM.deallocate` (including exact
+  `AllocationKind` diagnostic formatting across all five `AllocationKind`
+  variants), and `Statement::Deinit`.
 
 * `sumTo`, the MIR of a `u32` loop with `switchInt`, wrapping `Add`/`Sub`,
   constants, and `Goto`: Anneal returns `6` for `n = 3`
@@ -323,29 +906,751 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   `mirCall_steps_error`, and direct checks of MiniRust's `"load at type but the
   data in memory violates the language invariant"` UB), alongside ground-truth
   checks of all four `IntBinOp::DivExact` outcomes.
+* `arrayOpsI8`, `arraySignedIdxI8`, `zeroArrayI8`, `arrayUninitIdxI8`,
+  `arrayU32Idx`, `arrayConstIdxOobI8`, and `arrayComposeI8`, bodies with
+  `[i8; 3]`, `[i8; 2]`, `[i8; 0]`, and `[u32; 3]` arguments exercising
+  `Aggregate(Array)`, `Repeat` (including `[const 5i8; 0]`), whole-array copies,
+  `PlaceMention` on an array local, `Len`, and `Index` / `ConstantIndex` (from
+  the start and from the end) reads and in-place element writes
+  (`*_minirust_ret_from_start`, `*_noUB`, direct runs, and byte-level checks
+  that each in-place write rewrites exactly the element's bytes at offset
+  `index * size_of::<T>()` and leaves its siblings intact:
+  `arrayOpsOk_minirust_inplace_bytes`, `arrayOpsOk_minirust_ret_dealloc`,
+  `arrayU32IdxOk_minirust_inplace_bytes`),
+  projected array operands (`copy _1[proj]`) composed with `SwitchInt`,
+  `Repeat`, `Aggregate(Array)`, `UnaryOp(Neg)`, and `Cast(IntToInt)`
+  (`arrayComposeOk_*`), plus UB for an out-of-bounds `Index` or `ConstantIndex`
+  (`idx >= N`, including every index of `[i8; 0]` and projected `SwitchInt`
+  discriminants), a negative signed index, an uninitialized index local,
+  faulting array-producing rvalues (`Aggregate(Array)` and `Repeat` with
+  uninitialized or out-of-bounds element operands: `arrayComposeAggUb_*`,
+  `arrayComposeRepeatUb_*`), and in-place indexed writes with a faulting RHS
+  (`arrayComposeRhsUb_*`, `arrayComposeBothUb_*`), each via `mirCall_ub` and a
+  direct check of MiniRust's `throw_ub!` message, alongside ground-truth checks
+  of `Size.mulInt`, `Type.encode`, `Type.decode`, and `tryMapM`
+  (`sizeMulInt_zero_neg`, `array_encode_decode_edge_cases`).
+* `paddedStructOps` and `nestedTupleOps` (plus
+  `tuple_encode_decode_place_edge_cases`), bodies with a padded single-variant
+  struct `Padded(u8, u32, u16)` (`offsets = [0, 4, 8]`, `size = 12`,
+  `align = 4`) and a nested padded tuple `((u8, u32), u16, ())` (including
+  zero-sized `()` at offset `10`), exercising whole-struct and zero-sized field
+  `Use(Copy)`, `AggregateKind.adt` and nested `AggregateKind.tuple`
+  construction, multi-step `ProjectionElem.field` reads (`copy _4.0.1`),
+  in-place sub-tuple writes (`_4.0 = ...`), and in-place scalar field writes
+  (`_1.1 = ...`, `_4.0.1 = ...`), with byte-level theorems confirming that
+  `AbstractByte::Uninit` is preserved at all inter-field and trailing padding
+  offsets (`paddedStructOk_minirust_padding_bytes`,
+  `nestedTupleOk_minirust_padding_bytes`), stack frame teardown across
+  heterogeneous layouts (`*_minirust_ret_dealloc`), `*_minirust_noUB` and
+  `*_minirust_progress`, and UB paths for faulting aggregate operands, faulting
+  nested field write RHS, and uninitialized tuple copies (`nestedTuple*Ub_*`).
+
+* `cmpNotSwitch`, an `(i8, i8, bool) -> i8` body that compares integers with
+  signed `<` and `==`, negates a `bool` (`!b`, through `build::not`'s
+  transmutes), compares `bool`s (`b > false`), and branches with `SwitchInt` on
+  `bool` (through the transmute to `u8`) across four blocks: for
+  `(-1, 1, false)` both semantics return `-1i8` (`cmpNotNeg1_anneal_ret`,
+  `cmpNotNeg1_minirust_ret_from_start`, and the direct 9-step run
+  `cmpNotNeg1_minirust_direct`), which an unsigned comparison of the bit
+  patterns would get wrong; for `(3, 2, true)` both return `2i8`
+  (`cmpNot3_*`).
+* `leNeGe`, a `(u8, u8) -> bool` body whose `bool` return place is also the
+  `SwitchInt` scrutinee, exercising `<=`, `!=`, `>=`, and `bool` returns
+  (`leNeGe250_*` returns `true`, `leNeGe5_*` returns `false`).
+* `boolCastI8`, a `bool -> i8` body exercising `Cast(CastKind::IntToInt)` on
+  `bool` across both `true` and `false` branches, plus `argsOk` rejection of
+  the invalid `bool` byte `2` (`boolCastTrue_*`, `boolCastFalse_*`,
+  `boolCastInvalidArg_rejected`).
+* `uninitBool`, `uninitBoolNot`, `uninitBoolRel`, `uninitBoolBitAnd`, and
+  `uninitBoolBitOrRhs`, whose `SwitchInt`, `UnaryOp(Not)`, `BinaryOp(Eq)`,
+  `BinaryOp(BitAnd)` (uninitialized LHS), and `BinaryOp(BitOr)` (`const true`
+  LHS, uninitialized RHS — confirming MIR `BitOr` on `bool` does not
+  short-circuit) on an uninitialized `bool` are UB in both semantics
+  (`uninitBool*_minirust_ub_from_start`, `uninitBool*_minirust_direct`).
+* `cmpSel` and `boolBitOrdUse`, `(i8, i8, bool) -> Ordering` and
+  `(bool, u8, Ordering) -> Ordering` bodies that switch on `bool` (including
+  `PlaceMention(_0)` on the uninitialized `Ordering` return place and
+  `build::bool_and`, `build::bool_or`, and `build::bool_xor` in
+  `boolBitOrdUse`) and return signed `i8` `Cmp`, unsigned `u8` `Cmp`
+  (`255u8.cmp(&1u8) = Greater`), `bool` `Cmp`, or `Use(copy _3)` of an
+  `Ordering` argument (`cmpSelLess_*`, `cmpSelEqual_*`, `cmpSelGreater_*`,
+  `boolBitOrdUseCmp_*`, `boolBitOrdUseCopy_*`, and `argsOk` rejection of
+  invalid `Ordering` tag bytes `2` and `128` in `boolBitOrdInvalidTag_rejected`);
+  and `uninitOrdering`, whose return of an uninitialized `Ordering` is UB in
+  both semantics (`uninitOrdering_*`).
+* `checkedArithI8`, a signed `i8` body with a `(i8, bool)` local `_3` and a
+  `bool` local `_4`, exercising `AddWithOverflow`, `SubWithOverflow`, and
+  `MulWithOverflow`, field projections `_3.0` and `_3.1` in `Use`, `BinaryOp`,
+  `UnaryOp`, and `SwitchInt`, across no-overflow inputs (`checkedArithOk_*`),
+  `INT_MAX + 1` (`127i8 + 1i8 = (-128i8, true)`, `checkedArithAddOv_*`),
+  `INT_MIN - 1` (`-128i8 - 1i8 = (127i8, true)`, `checkedArithSubOv_*`), and
+  signed multiplication overflow (`64i8 * 2i8 = (-128i8, true)`,
+  `checkedArithMulOv_*`), plus `argsOk` rejection of an invalid `bool` byte in
+  a tuple argument (`checkedArithInvalidTupleArg_rejected`).
+* `checkedTupleU32`, a `(u32, u32) -> (u32, bool)` body returning a padded
+  8-byte `(u32, bool)` 2-tuple in `_0`, exercising `PlaceMention(_0)`,
+  `PlaceMention(_0.0)`, and `PlaceMention(_0.1)` on the uninitialized tuple
+  return place, unsigned `0u32 - 1u32 = (u32::MAX, true)`
+  underflow followed by `u32::MAX + 1u32 = (0u32, true)` overflow
+  (`checkedTupleUnderAddOv_*`), unsigned multiplication overflow
+  `65536u32 * 65536u32 = (0u32, true)` and `Aggregate(Tuple, [copy (_0.0), copy (_0.1)])`
+  (`checkedTupleMulOv_*`), and no-overflow execution (`checkedTupleOk_*`),
+  writing 4-byte `u32` at offset `0`, 1-byte `bool` at offset `4`, and 3
+  trailing `AbstractByte::Uninit` padding bytes at offsets `5..8`; plus
+  `uninitTupleField0` and `uninitTupleField1`, whose reads of `_0.0` and `_0.1`
+  from an uninitialized `(u32, bool)` local raise UB in both semantics (with
+  converse error soundness `uninitTupleField0_converse_error` via
+  `mirCall_steps_error` and total outcome trichotomy `uninitTupleField1_outcome`
+  via `mirCall_outcome`).
+* Ground-truth checks of the interpreted operators: signed and unsigned
+  `BinOp::Rel`, `RelOp::Cmp` returning `i8`, `bool` ordering, a value-type
+  mismatch being a spec panic, `CastOp::Transmute` between `bool` and `u8`
+  (including the invalid byte `2` and a size mismatch, both UB),
+  `Type::Bool` decoding, `UnOp::Int` on a `bool` being a spec panic
+  (`relLt_signed`, ..., `bitNot_bool_panics`), `IntType::with_overflow` layouts
+  and encodings on `i8` and `u32`, `TupleHeadLayout::full_size_and_align` and
+  `LayoutStrategy::compute_size_and_align` on sized and unsized layouts,
+  `BinOp::IntWithOverflow` on `INT_MAX + 1`, `INT_MIN - 1`, `UINT_MAX + 1`,
+  `0 - 1`, multiplication overflow, and a non-integer operand (`specPanic`),
+  `Machine::ptr_offset_inbounds` in-bounds and out-of-bounds UB,
+  `ValueExpr::Tuple`, and `PlaceExpr::Field` (including `Type::Union` field
+  projections, `specPanic`s on invalid field indices, missing unsized tail,
+  out-of-bounds field offset, and non-projectable types, and
+  `IntType::with_overflow` / `BinOp::IntWithOverflow` across `u8`, `i8`, `i16`,
+  `u16`, `i32`, `u32`, `i64`, `u64`, `i128`, and `u128`;
+  `withOverflow_i8_layout`, ..., `evalPlace_field_union_and_offset_panic`); and of
+  the representation of
+  enums, tuples, unions, slices, and trait objects: exactly the bytes `0`, `1`,
+  `255` are valid at `orderingTy` (`ordering_validTags`), decoding, encoding,
+  `check_value`, and transmutes at `orderingTy` (including invalid tags, an
+  `Uninit` byte, and `decode_discriminant` short-circuiting before its
+  `fallback` continuation in `decodeDiscriminant_short_circuits`), a padded
+  `(i8, bool)` tuple whose size rounds up to its alignment and whose padding
+  encodes as `Uninit` and is ignored by decoding (`decode_ordering_less`, ...,
+  `checkValue_tuple_arity`), `Type::Union` chunk decoding, encoding,
+  `check_value`, and `CastOp::Transmute` round-tripping with `paddedPairTy`
+  (including UB when an `Uninit` union chunk overlaps a non-padding tuple
+  field; `layout_union`, `decode_union`, `encode_union`,
+  `checkValue_union_chunk_size`, `checkValue_union_chunk_data`,
+  `transmute_union_paddedPair`, `transmute_paddedPair_union`,
+  `transmute_union_paddedPair_uninit_ub`), and unsized `Slice`, `TraitObject`,
+  and unsized `Tuple` layouts and `specPanic`s (`layout_slice`, ...,
+  `checkValue_unsized_panics`).
+
+`Correspondence/PointerWitness.lean`, `Correspondence/RefWitness.lean`, and
+`Correspondence/TbWitness.lean` run raw pointer, reference, reborrowing,
+`Retag`/`Validate`, `CastKind.transmute`, `Box<T>`, `UnsafeCell<T>`,
+`IntPtrCast`, and Tree Borrows programs to completion across Anneal (`runA_sound`
+/ `faultsA_sound`), MiniRust `Machine<BasicMemory<x86_64>>` (`Mach`, via
+`retAfter` / `ubAfter` on `minimize`'s translation), and MiniRust
+`Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`, via `retAfterTB` / `ubAfterTB`
+running `stepsTB` directly on `minimize`'s translation), on top of the
+per-construct lemmas of `Correspondence/Pointers.lean` (MiniRust's thin pointer
+bytes `ptrBytes` and their `decode`, `encode`, and `check_value` at both
+`PtrType::Raw` and `PtrType::Ref`; Anneal's `&raw`, `&`, `&mut`, reborrowing,
+`*p`, `Offset`, `PtrToPtr`, and exposure rules; symbolic Tree Borrows
+state-machine, `ReborrowSettings`, and `TreeBorrowsMemory` structural invariants
+`Permission.prevents_deallocation_iff_foreign_write_err`,
+`Permission.transition_preserves_matches_protector`,
+`Permission.transition_no_specPanic`, `ReborrowSettings.new_matches_protector`,
+`reborrow_childPermissions_matches_protector`, `Permission.unprotect_matches_no`,
+`Node.access_wf`, `Node.access_no_specPanic`,
+`TreeBorrowsMemory.{new_wf,allocate_wf,load_wf,store_wf,deallocate_wf,reborrow_wf,retag_ptr_wf}`,
+`TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
+`TreeBorrowsMemory.{release_protector_wfLive,end_call_wfLive}`; and the
+unconditional polymorphic specialization theorems `stepM_bm_eq` and
+`stepsM_bm_eq` proving `stepM (M := BM) = step` and `stepsM (M := BM) = steps`)
+and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
+`step_correspondence_N` rests for raw pointers and references.
+
+* In the fragment (`*_inFragment`), and proved end to end through
+  `mirCall_ret`, `mirCall_noUB`, and `mirCall_progress_N` (returns),
+  `mirCall_diverges_steps_ok` and `mirCall_diverges_rel_N` (divergence), or
+  `mirCall_ub`, `mirCall_steps_error`, and `mirCall_outcome_N` (UB) besides the
+  direct runs, both semantics return the same value on `ptrRoundTrip`
+  (`&raw mut x`, a read and a write through the pointer, a `PtrToPtr` cast,
+  and a read through the cast pointer; `6` for `x = 5`), `arrayParamPtr`
+  (disjoint `&raw mut a[-2 of 2]` and `&raw mut a[-1 of 2]` borrows, that is
+  of `a[0]` and `a[1]`, on an array parameter `a: [u32; 2]`, `Offset(p, 0)`,
+  `move` and `StorageDead`/`Deinit` on pointer temporaries, and dereference
+  reads and writes through both pointers; `19` for `a = [5, 7]`), `fieldPtr`
+  (`&raw mut s.1` at byte offset `4` of `Padded`; `100`), `nestedFieldPtr`
+  (disjoint `&raw mut t.0.1` at byte offset `4` with pointee `u32` and
+  `&raw mut t.1` at byte offset `8` with pointee `u16` on
+  `t: ((u8, u32), u16, ())`, preserving `.Uninit` padding; `59`),
+  `ptrCountdown` (a four-block loop that counts `x` down through
+  `&raw mut x`, reading `*p` before each `switchInt`, then reads `x` directly;
+  `3` for `x = 3`), `constBorrowLoop` (a fresh `&raw const x` read through and
+  killed by `StorageDead` in each iteration of a loop; `15` for `x = 5`),
+  `repointPtr` (`&raw mut a[0 of 2]` and `&raw mut a[1 of 2]`, a read through
+  a copy of the first pointer, then the same initialized pointer local
+  overwritten with the second pointer and written through; `105` for
+  `a = [5, 7]`), `refSharedRead` (`&x`, reference `copy`/`move`, and a
+  dereference read; `5` for `x = 5`), `refMutRoundTrip` (`&mut x`, a read and
+  write through `r`, shared reborrow `&*r`, raw reborrow `&raw const *s`, and
+  read; `6` for `x = 5`), `refArrayReborrowChain` (disjoint `&mut a[0]` and
+  `&mut a[1]`, writes through both, and a five-step reborrowing chain
+  `&mut -> &mut -> & -> & -> *const` and `&mut -> *mut`; `42` for
+  `a = [5, 7]`), `refPaddedStructReborrow` (disjoint `&mut s.1` and `&s.2`
+  on `Padded`, a dereference write, shared reborrows of both references, and
+  preserved `.Uninit` padding; `1641`), `refMutReborrowWrite` (`r = &mut x`,
+  `CopyForDeref` reborrow `r2 = &mut (*tmp)`, dereference write `*r2 = 42`
+  disabling `r`'s tag while keeping `r2` active, then NLL sequential `&x`;
+  `42`), `refDisjointReborrowWrite` (`r0 = &mut a[0]` and `r1 = &mut a[1]`,
+  mutable reborrow + write through `r0_sub` leaving disjoint `r1` active for a
+  subsequent write and read; `30`), and `refLoopCountdown` (multi-block loop
+  with repeated `&mut x`, `CopyForDeref` mutable reborrow `&mut (*tmp)`,
+  dereference write, and sequential `&x` in the loop exit block; `6` for
+  `x = 3`), `refTwoPhaseBorrowRoundTrip` (`r = &two_phase mut x` in `Reserved`,
+  foreign shared borrow `s = &x` and read `*s` while `r` stays `Reserved`, then
+  dereference write `*r = *s + 37` activating `r` to `Active` and disabling `s`;
+  `42` for `x = 5`), `retagRefReborrowChain` (`r = &mut x` followed by
+  `Retag(Default, r)`, raw/reference reborrow chain `&mut -> *mut -> &mut -> &`
+  with `Retag(Raw)` / `Retag(Default)` / `Retag(TwoPhase)` and dereference write;
+  `12` for `x = 5`), and `refRawTransmuteChain` (`&mut u32 -> *mut u32` via
+  `Operand::Move`, dereference read and write through `*mut u32`, then
+  `*mut u32 -> &u32 -> *const u32` via `CastKind::Transmute`; `15` for `x = 5`),
+  and `swapRefs` (2-argument `(u32, u32) -> u32` swap via pointer-to-pointer
+  dereference copy `(*_3) = copy (*_4)`, `move`-operand dereference write
+  `(*_4) = move _5`, shared reborrows, `move (*_6)`, and `CopyForDeref(*_7)`;
+  `940` for `(40, 9)` across Anneal, `Mach`, and `MachTB`);
+  both diverge in lockstep (`StateRelN` + `Reaches`) on `ptrSpinLoop`
+  (`_2 = &raw mut _1` in `bb0`, then `PlaceMention(_2)`, self-assignment
+  `_2 = Offset(copy _2, const 0_usize)`, `_0 = copy (*_2)`, and
+  `(*_2) = copy _0` in `bb1`); and both raise UB on `uninitPtrReadUb` and
+  `uninitPtrWriteUb` (reading or writing through an uninitialized pointer
+  temporary), `deadPtrReadUb` (reading through a pointer temporary after its
+  `StorageDead`), `uninitPtrOffsetUb` (`Offset(copy _p, 0)` on an uninitialized
+  pointer temporary), `uninitRefReadUb`, `uninitRefReborrowUb`,
+  `retagUninitRefUb`, and `transmuteUninitRefUb` (reading, reborrowing `&(*_p)`,
+  executing `Retag(Default, _p)` / `Statement::Validate`, or transmuting an
+  uninitialized reference temporary), `derefCopyUninitSrcUb` and
+  `derefWriteMoveUninitUb` (`(*_2) = copy (*_3)` from an uninitialized `&mut u32`
+  and `(*_2) = move _3` from an uninitialized `u32`),
+  `refMutDivZeroUb` (division by zero inside `(*r) = (*r) / y` through `&mut x`),
+  and `derefWriteRhsUb`, `derefIdxWriteRhsUb`, and `derefFieldWriteRhsUb`
+  (writing an uninitialized rvalue operand through a valid `*mut` pointer to an
+  integer local, to a `ConstantIndex` array element, or to a `TupleSpec` scalar
+  field chain).
+* Outside the fragment (`*_notInFragment`), both semantics agree on
+  `arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`) and `dangling`
+  (UB on a read after `StorageDead` of the borrowed temporary), and they
+  disagree on the divergences listed under the gaps: `offsetDeref`
+  (`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in Anneal;
+  `offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB in
+  MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
+  `misalignedRef` (`"Value::Ptr: unaligned safe pointer"` on merely forming
+  `&*q` without reading in MiniRust, vs returning `5` in Anneal), `danglingRef`
+  (`"Value::Ptr: non-dereferenceable safe pointer"` on copying a dangling `&u32`
+  without dereferencing in MiniRust, vs returning `5` in Anneal),
+  `exposeTwice` (`0` in MiniRust, `65536` in Anneal), `directWrite` and
+  `frozenWrite` (UB in Anneal only, while returning `9` on both `BasicMemory`
+  and `MachTB` because `PtrType::Raw` has `safe_pointee = None` so
+  `ReborrowSettings::new` is `None`), `twoPhaseForeignWriteDiscrepancy` and
+  `twoPhaseDirectWriteTreeBorrowsGap` (foreign dereference write faulting in
+  both Anneal and `MachTB` vs returning `99` in `BasicMemory`, and direct write
+  `_1 = 99` returning `99` in both Anneal — whose `updateBorrowPerm` leaves
+  `.reserved` unchanged when `writerTag = .none` — and `BasicMemory`, while
+  faulting on `MachTB` with `"Tree Borrows: local read of Disabled reference"`),
+  `frozenRefMutReborrow`, `frozenRefMutReborrowWrite`, and
+  `disabledRefReborrow` (`frozenRefMutReborrow` faulting eagerly at `&mut (*_2)`
+  in Anneal while returning `5` on both `BasicMemory` and `MachTB` because lazy
+  `Reserved` is never written, whereas `frozenRefMutReborrowWrite` faults in
+  both Anneal and `MachTB` — `"Tree Borrows: local write of Frozen reference"` —
+  while returning `9` on `BasicMemory`, and `disabledRefReborrow` faults at the
+  reborrow in both Anneal and `MachTB` while returning `9` on `BasicMemory`),
+  `childReborrowWriteDisablesParent` (UB in Anneal's flat `List BorrowEntry`
+  model because writing through a child `&mut` disables its parent entry, vs
+  returning `9` on both `BasicMemory` and `MachTB`),
+  `retagFnEntryProtectorWrite`, `retagDisabledRefDiscrepancy`,
+  `retagTrulyDisabledRefUb`, `retagFnEntryLocalDeallocUb`, and
+  `retagScalarDiscrepancy` (`retagFnEntryProtectorWrite` faulting at `_1 = 9` in
+  both Anneal and `MachTB` while returning `9` on `BasicMemory`;
+  `retagDisabledRefDiscrepancy` faulting in Anneal after a child write while
+  returning `9` on both `BasicMemory` and `MachTB`, contrasted with
+  `retagTrulyDisabledRefUb` where a foreign direct write disables `_2` so both
+  Anneal and `MachTB` fault at `Retag(Default, _2)`;
+  `retagFnEntryLocalDeallocUb` returning `5` in both Anneal and `BasicMemory`
+  while faulting at `Terminator::Return` on `MachTB` because `deallocAllM`
+  deallocates the strongly protected callee local `_1` before `end_call`; and
+  `Retag(Default, _1)` on a `u32` scalar local faulting in Anneal while
+  `Machine::retag_val` treats `Value::Int` as a no-op on both `BasicMemory` and
+  `MachTB`), and `transmuteSharedRefToMutWriteDiscrepancy` /
+  `transmuteDanglingIntToRefDiscrepancy` (transmuting `&u32` to `&mut u32` and
+  writing faulting on `Frozen` in both Anneal and `MachTB` vs returning `77` on
+  `BasicMemory`, and transmuting `4_usize` to `&u32` without dereferencing
+  returning `5` in Anneal vs raising `"Value::Ptr: non-dereferenceable safe pointer"`
+  on both `BasicMemory` and `MachTB`);
+  alongside ground-truth checks `checkValue_refTy_safe_ptr_ub`,
+  `transmute_refTy_machine_checks`, `validate_refTy_machine_checks`,
+  `retagTupleFields_machine_checks`, `reborrowSettings_u32_examples`, and
+  executable `TreeBorrowsMemory` trace witnesses
+  `treeBorrowsChildWritePreservesParent`, `treeBorrowsFrozenAndDisabledUb`,
+  `treeBorrowsDirectWriteDisablesUnprotReserved`, and
+  `treeBorrowsProtectorEndAndDeallocChecks`, and the 3-way `TbWitness.lean`
+  witnesses: `pairSplitReborrowOk` vs. `pairParentWriteDisablesChild` (`(u32, u32)`
+  disjoint field `&mut` reborrows succeeding across all three vs. parent write
+  disabling child `p0` on Anneal and `MachTB`), `unsafeCellUnprotInteriorMut`
+  (`77` across all three) vs. `unsafeCellProtectedInteriorMut` (`Retag([fn entry], r)`
+  on `&UnsafeCell<u32>` returning `77` on `Mach` and `MachTB` via `PermissionProt::Cell`
+  with `prevents_deallocation = false` while faulting in Anneal's
+  `hasProtectedWriteConflict`), `exposeSingleRefMutRoundTrip` (`88` across all
+  three), `exposeSharedRefWriteUb` (UB on Anneal and `MachTB` vs. `88` on `Mach`),
+  `exposeTwoRefMutAngelicUnsupported` (`88` on Anneal and `Mach` vs.
+  `Stop.unsupported` on `MachTB` when two live `&mut` tags meet at `int2ptr`),
+  `boolMutRefToggle` and `boolInvalidByteRefUb`, and two upstream MiniRust
+  specification findings (`zstWrappingSubReborrow_tb_specPanic` /
+  `nonZstWrappingSubReborrow_bm_and_tb_ub`, where reborrowing a negative-offset
+  `ptr_offset_wrapping(-8)` pointer at ZST `&()` passes `BasicMemory::check_ptr`
+  and panics `Offset::from_bytes(ptr.addr - allocation.addr).unwrap()` on `MachTB`,
+  and `treeBorrowsWeakBoxDeallocAndDeadRelease`, where deallocating a weakly
+  protected `Box<u32>` before `end_call` leaves `child.protected = Weak` with
+  `Unprot` permissions on the dead allocation after `release_protector`'s early
+  `!allocation.live` return).
+
+`Correspondence/Provenance.lean` proves the angelic `IntPtrCast::int2ptr`
+resolution sound and characterizes where it stops: every predicted provenance is
+admissible for `predict` (`int2ptrProvenance_admissible`,
+`int2ptrProvenanceM_admissible` for both `BM` and `TBM`), `None` is predicted
+exactly when nothing is exposed (`int2ptrProvenance_eq_none_iff`), the
+prediction fails only with `Stop.unsupported`
+(`int2ptrProvenance_error_unsupported`), any exposed live allocation containing
+the address is the predicted one (`int2ptrProvenanceM_unique`), if any
+admissible provenance passes `BasicMemory::check_ptr` the predicted pointer does
+too (`int2ptr_checkPtr_angelic_optimal`, `int2ptr_checkPtr_ub_forced`), two
+distinct candidates arise exactly where one live exposed allocation ends and
+another begins (`int2ptrCandidates_two_boundary`,
+`int2ptrProvenance_boundary_unsupported`), exposing and casting back round-trips
+(`IntPtrCast.int2ptr_expose_empty_roundtrip`,
+`IntPtrCast.int2ptr_expose_unique_roundtrip`), and two exposed Tree Borrows tags
+of one allocation always stop (`int2ptrProvenanceM_tb_two_tags_unsupported`).
+
+`inFragmentWithIntrinsics` (`Translate.lean`) admits `PointerExposeProvenance`
+and `PointerWithExposedProvenance` casts lowered by `translateFnWithIntrinsics`
+under `provCastFlowOk` (exposed-address locals are non-argument temporaries,
+written only by `PointerExposeProvenance`, read only by
+`PointerWithExposedProvenance` at the exposed pointer's pointee and without
+adding mutability, and never otherwise observed; no forged addresses) and
+`ptrAliasingOk (provCastAliasView body)` (the round trip is a tag-sharing
+pointer copy, as in Anneal's `tag * 65536 + offsetBytes` encoding).
+`Correspondence/ProvenanceWitness.lean` records why: the extended fragment
+without these checks (`inFragmentWithIntrinsicsA1`) admits `exposeTwice`
+(Anneal `65536` vs. `0` on `Mach` and `MachTB`), `int2ptrForgedTag` (Anneal
+returns `5` from the forged address `65536` while both MiniRust machines raise
+UB), `directWrite`, and `exposeSharedRefWriteUb`, all rejected now; and it runs
+the brief's suite across all three semantics: `int2ptrRoundTripOk_three_way`
+(`77`), `int2ptrUnexposedUb_three_way`, `int2ptrAmbiguityUnsupported_three_way`
+(two adjacent exposed arguments under `ctxAdj`: Anneal `9`, `Stop.unsupported`
+on `Mach` and `MachTB`; `9` everywhere when the arguments are apart), and
+`int2ptrDeadAllocUb_three_way` (the cast after `StorageDead`), plus
+`int2ptrDeadAllocDerefUb_provenanceRel_fails` (Pass A1's `ProvenanceRel` fails
+after `StorageDead` of an exposed temporary) and
+`int2ptrAfterStorageDeadTwoExposed_three_way` (`Stop.unsupported` although every
+admissible provenance faults).
+
+`Audit.lean` logs `[ANCHOR-AUDIT]`, `[SIMULATION-AUDIT]`, three
+`[WITNESS-AUDIT]` lines (`Witness`, `IntrinsicFallback`, and
+`IntrinsicBoundary`), `[POINTER-AUDIT]`, `[REF-AUDIT]`, `[TB-AUDIT]`, and
+`[PROV-AUDIT]` lines ending in `sorry_free=true` (via `#check_theorem_deps`, which also rejects duplicate
+declaration names and non-`theorem` constants) and fails the build if any listed
+declaration (or any declaration in any `MiniRustSpec.*` module via
+`#assert_all_minirustspec_standard_axioms`) depends on `sorryAx` or a
+non-standard axiom.
 
 ### Gaps
 
 These are deliberate and are the first things to lift:
 
-* **`Operand::Move` is excluded.** `minimize` translates `Move` exactly like
-  `Copy`, whereas Anneal de-initializes the moved-from place, so the models
-  disagree on later reads of a moved-from local.
-* **Only the return place and arguments.** Bodies with other locals need
-  `StorageLive`/`StorageDead` (and `minimize`'s init block would allocate
-  some of them), which the fragment and the interpretation do not cover.
+* **Moves are checked path-insensitively over the CFG.** `movesOk` propagates
+  possibly moved-out locals forward from `[]` at `bb0` across `Goto` and
+  `SwitchInt` edges (`movedAtEntry`), taking the union at control-flow merges; a
+  body that moves out of a local on only one incoming branch and reads it after
+  the merge without re-initializing it on that branch is rejected unless branch
+  correlation is tracked. Only root moves de-initialize in Anneal; projected
+  moves read like copies.
+* **Temporaries of the init block are never mentioned.** Anneal keeps a
+  temporary without storage markers dead, whereas `minimize`'s init block
+  allocates it, so the fragment requires that the body never mentions one.
+* **One resolution of the address choice.** `BasicMemory::allocate`'s `pick`
+  is resolved by first fit over the multiples of `2^32`; results hold for that
+  resolution, which the correspondence fragment cannot observe (it has no
+  pointer-to-integer casts or pointer comparisons). The interpretation itself
+  can now observe addresses (`PointerExposeProvenance`, `comparePtr`, and
+  alignment checks), so pointer witnesses hold for this resolution only.
 * **One thread, called from a caller frame.** MiniRust makes it UB for the
   bottom frame of the main thread to return, while Anneal's root body returns
-  normally, so the relation places the callee above an arbitrary caller. What
-  the caller does after the return is outside the relation. Call setup
-  (`Terminator::Call`, argument passing) is not interpreted; witnesses start
-  at the callee's entry.
+  normally, so the relation places the root execution above an arbitrary
+  external caller. While the plain `run_ub`, `mirCall_ub`, and
+  `mirCallWithCallees_ub` signatures conclude only `∃ n msg, Interp.steps n m =
+  .error (.ub msg)`, the localized forward UB theorems `run_ub_rel`,
+  `run_ub_rel_from_start`, `mirCall_ub_rel`, `multi_run_ub_rel`,
+  `multi_run_ub_rel_from_start`, and `mirCallWithCallees_ub_rel` close that gap
+  for both single-body and multi-function programs: the faulting step `n + 1` is
+  taken from a `StateRel`- or `MultiStateRel`-related machine `mLast` after an
+  `.ok` prefix in which `ReturnRel` holds at *no* step `k ≤ n`
+  (`StateRel.not_returnRel`, `MultiStateRel.not_returnRel`,
+  `step_start_no_returnRel`, `multi_step_start_no_returnRel`,
+  `steps_add_no_returnRel`), so the UB occurs strictly inside the subject call
+  tree prior to any root return. The converse theorems (`steps_error`,
+  `mirCall_noUB`, `mirCallWithCallees_steps_error`, `mirCallWithCallees_noUB`)
+  likewise separate pre-return faults from post-return caller steps via
+  `ReturnRel`, and the witnesses' external caller (`callerFn`, with no blocks)
+  stops with a `specPanic`, never UB, right after the return
+  (`never_ub_of_nonUb_stop`).
+* **`prog.start` is not modeled.** `mkStartFn` transcribes `minimize`'s
+  `mk_start_fn`, which calls the entry with `CallingConvention::Rust`, no
+  arguments, and a `()` return place built by `build::unit_place()`. That
+  `PlaceExpr::Deref` now evaluates (to the aligned, zero-sized place at address
+  `1`), but the call fails `create_frame` for any entry that takes arguments,
+  returns a non-`()` type, or has `CallConv.c` (`progStart_outside_fragment`
+  checks this for `callerMain` and `cAbiCallee`). The correspondence theorems
+  therefore start at `fEntry.start` under an external `rootCtx` that supplies
+  the arguments and a return place of the entry's own type.
 * **Branch observations.** Anneal's `switchInt` emits the scrutinee as a
   visible leakage event; MiniRust has no counterpart, so `StepRel` matches it
   with an ordinary MiniRust step.
-* **Integers only.** No `bool` discriminants (`minimize` inserts a transmute),
-  no pointers, references, aggregates, non-integer casts, comparisons,
-  checked arithmetic, calls, drops, or assertions.
+* **Scalar-family locals vs. array and `TupleSpec` argument locals.** Scalar
+  fragment types (`Int`, `bool`, `Ordering`, and `(Int, bool)` 2-tuples) are
+  supported across `_0`, arguments, and temporaries (with
+  `StorageLive`/`StorageDead`/`Deinit` and `move`), whereas homogeneous `[T; N]`
+  arrays and general nested padded tuples and single-variant structs
+  (`TupleSpec`, with integer leaf fields and `()`) appear on argument locals
+  that stay live and initialized throughout execution (no `StorageLive`,
+  `StorageDead`, `Deinit`, or `move`, and `_0` does not return `[T; N]` or
+  general `TupleSpec`). An `Ordering` local is written by `Cmp` or `Use` and
+  read by `Use` or `Return` (no `Ordering` constants, `Discriminant`, or
+  `SwitchInt` on it); `Type::Enum` (beyond `Ordering`) and `Type::Union` are
+  interpreted as representations (layout, `decode`, `encode`, `check_value`)
+  without `ValueExpr::{Union, Variant, GetDiscriminant}`,
+  `Statement::SetDiscriminant`, or downcast projections. Raw pointers and
+  references are restricted (below); there are no slices, nested arrays,
+  multi-variant ADTs, other casts, calls, drops, or assertions.
+* **`Repeat(copy p, 0)` is excluded (while `Repeat(const c, 0)` is included).**
+  Anneal evaluates `op` once before replicating it, while `minimize`'s
+  `list![op; 0]` never evaluates `op`, so the models disagree when `op` is a
+  `copy` that can fault (an uninitialized local or out-of-bounds array index),
+  whereas a constant operand never faults in either semantics.
+* **Projected `PlaceMention(_j[p])` is excluded (while `PlaceMention` on `_j`,
+  `_j.0`/`_j.1`, and `TupleSpec` field chains `_j.f1...fk` is included).**
+  Anneal's `.placeMention` checks only `place.local_` and ignores
+  `place.projection`, whereas MiniRust's `eval_statement(PlaceMention(place))`
+  calls `eval_place(place)`, which evaluates index operands and bounds checks on
+  `PlaceExpr::Index`.
+* **`Len` does not evaluate its place in MiniRust.** `minimize` emits the
+  constant `N` (its own `FIXME` notes the place might have UB), while Anneal
+  reads the place; this is harmless only because array slots in the fragment
+  are always initialized.
+* **Evaluation order of `Statement::Assign` (`destination` vs `source`).**
+  MiniRust's `eval_statement(Assign { destination, source })` evaluates
+  `eval_place(destination)` before `eval_value(source)`, whereas Anneal's
+  `evalStmt(.assign dst rv)` evaluates `evalRvalue` before `writeProjectedValue`.
+  Because neither expression evaluation mutates memory in the fragment, both
+  models raise UB under the exact same conditions (`projIdx = none ∨ rvBits = none`)
+  and produce identical stores otherwise (`StepRel.ub'` / `StepRel.tau'`),
+  differing only in which UB reason fires first when *both* the destination
+  projection and the RHS rvalue fault (`arrayComposeBothUb_*`).
+* **Index locals of non-`usize` type.** MIR requires `usize` index locals,
+  but the fragment also accepts other integer types. Anneal indexes with the
+  raw bit pattern and MiniRust with the decoded value, which agree for
+  unsigned types and, for a signed type, as long as `N <= 2^(bits - 1)` (a
+  negative index then has a bit pattern `>= N`), which the fragment
+  requires.
+* **Raw pointers and references are in the correspondence under a borrow and
+  reborrow discipline (MR-3.1, MR-3.2).** The fragment admits thin raw pointer
+  and reference temporaries (`*const T`, `*mut T`, `&T`, `&mut T`) to integer
+  pointees; `_i = &raw const q` / `&raw mut q` and `_i = &q` / `&mut q` /
+  `&two_phase mut q` (any `BorrowKind`: `.shared`, `.mut false`, or `.mut true`)
+  of either a parameter `q` that is
+  an integer local, an in-bounds `ConstantIndex` element of an array, or a
+  scalar field chain of a `TupleSpec` (`ptrTargetSpec`), or a reborrow `(*_p)`
+  of a pointer/reference local `_p` to `T` that does not add mutability;
+  pointer/reference copies (`Use(copy _p | move _p)`, `CopyForDeref(_p)`), raw
+  `PtrToPtr` casts between equal pointee types that never add mutability,
+  `CastKind::Transmute` casts (`copy _p` or `move _p`) between any thin raw
+  pointer or reference types to `T` that never add mutability, and raw
+  `Offset(_p, 0)`; reads `Use(copy (*_p) | move (*_p))` or `CopyForDeref(*_p)`
+  through any such pointer or reference and writes `(*_p) = rv` through `*mut` /
+  `&mut` locals (including `move` operands via `copyRv rv` and pointer-to-pointer
+  dereference copies `(*_w) = copy (*_r) | move (*_r) | CopyForDeref(*_r)`), both
+  at the pointee type; non-`FnEntry` `Retag` statements
+  (`Statement::Validate { fn_entry: false }`) on pointer/reference temporaries;
+  and storage statements on pointer/reference temporaries. `ptrAliasingOk`
+  requires every borrowed local to be a parameter that is never written
+  directly, deinitialized, storage-cycled, or moved, and computes the least
+  fixed point (`ptrEnvAtEntry`, proved to converge unconditionally in
+  `B * n * (n + 3) + 1` iterations by `iterPtrAliasEntries_stabilizes`,
+  characterized by `ptrAliasingOk_iff_blockPtrAliasOk`, and proved least by
+  `ptrEnvAtEntry_least`) of the flow-sensitive join-semilattice `PtrLocalState`
+  (`.empty` `⊥`, `.live target peers`, `.disabled` `⊤`) across the CFG: direct
+  borrows set `.live (some (k, borrowProjSteps projs)) [i]`, copies/casts/zero-offsets
+  add the destination to the source's tag-peer set `peers`, reborrows allocate a
+  fresh singleton peer set `[i]` inheriting the parent's target, and dereference
+  writes keep every local in `wPeers` or with a provably disjoint target
+  (`targetsDefinitelyDisjoint`) `.live` while invalidating all other `.live`
+  locals to `.disabled`, admitting mutable reborrows followed by dereference
+  writes, NLL sequential shared/mutable borrows, and multi-block / loop borrows
+  without falsely invalidating disjoint sibling borrows. `AddrOk` requires parameter allocations to be non-null
+  (`0 < a`), aligned, and in-bounds so every `PtrType::Ref` value satisfies
+  MiniRust's safe-pointer validity invariant (`checkValue_refTy`, including
+  `CastOp::Transmute` and `Statement::Validate` on reference types with live machine state). `StateRelN` relates each Anneal
+  borrow tag to the MiniRust address and provenance of its target (`BorrowsOk`,
+  and `LocalsOk` at `ctxWithBorrows`), and `step_correspondence_N` simulates
+  every such statement (`Correspondence/PointerStep.lean`). The fragment
+  excludes the forms on which Anneal's model and MiniRust (`BasicMemory` /
+  Tree Borrows) diverge:
+  - *Safe-pointer validity without dereferencing*: MiniRust's `checkPtr` checks
+    non-null, alignment, inhabitedness, and `dereferenceable` on every load or
+    store of a `PtrType::Ref`, so forming an unused misaligned `&u32`
+    (`misalignedRef`) or copying a dangling `&u32` (`danglingRef`) is
+    immediate UB in MiniRust, whereas Anneal stores `(tag, offset)` pairs and
+    checks liveness only on dereference.
+  - *Flat borrow list vs. Tree Borrows parent-child tree*: Anneal's
+    `MirSemantics` stores a flat `List BorrowEntry` without parent pointers;
+    reborrowing `(*_p)` appends an entry targeting `_p`'s root `(local, proj)`
+    after checking `parentEntry.perm`, and writing `(*_child) = rv` runs
+    `invalidateDerefWriteBorrows`, which disables every overlapping entry whose
+    `tag ≠ child.tag` — including the *parent* `&mut` entry
+    (`childReborrowWriteDisablesParent`, `retagDisabledRefDiscrepancy`), whereas
+    Tree Borrows (`MachTB` and `treeBorrowsChildWritePreservesParent`) and
+    `BasicMemory` permit parent reuse after child writes. Polymorphic
+    `Machine<M>` (`MemoryOps M`) in `Interp.lean` runs both `BasicMemory<x86_64>`
+    (`stepM_bm_eq` / `stepsM_bm_eq` proving unconditional equality with `step` /
+    `steps`) and the full 6-module `TreeBorrowsMemory<x86_64>` (`MachTB`,
+    `stepTB` / `stepsTB`, with `stepTB_wfLive` / `stepsTB_wfLive` /
+    `startMachineTB_stepsTB_wfLive` proving machine-level live-allocation
+    borrow-tree well-formedness `MachTB.wfLive` across arbitrary multi-step
+    runs and `TreeBorrowsMemory.{allocate,load,store,deallocate}_no_specPanic`
+    proving freedom from `Stop.specPanic` whenever pointer `AllocId`s are valid):
+    on `MachTB`, raw pointers (`directWrite`,
+    `frozenWrite`) keep root provenance (`safe_pointee = None`) and return `9`,
+    read-only mutable reborrows from `&T` (`frozenRefMutReborrow`) stay in lazy
+    `Reserved` and return `5`, scalar `Retag` (`retagScalarDiscrepancy`) is a
+    no-op, self-aliasing `(*r) = copy (*r)` (`selfDerefCopyOk`) and cyclic loop
+    reference deref-copy/move chains (`loopDerefCopyCountdown`) satisfy full
+    in-fragment correspondence across Anneal, `Mach`, and `MachTB`, and
+    `&mut std::cmp::Ordering` (`stdOrderingMutRefCmp`) and zero-sized
+    `&mut ()` / `&()` (`unitTupleMutRefRoundTrip`) agree 3-way, whereas writing
+    through a mutable reborrow or transmute of `&T`
+    (`frozenRefMutReborrowWrite`, `transmuteSharedRefToMutWriteDiscrepancy`),
+    reading or reborrowing/retagging a foreign-invalidated reference
+    (`twoPhaseForeignWriteDiscrepancy`, `disabledRefReborrow`,
+    `retagTrulyDisabledRefUb`, `parentDerefCopyDisablesChild`), writing directly while a function-entry protector
+    is active (`retagFnEntryProtectorWrite`), writing directly to a local with an
+    unprotected `Freeze` `Reserved` two-phase borrow
+    (`twoPhaseDirectWriteTreeBorrowsGap`, where Anneal's `writerTag = .none`
+    unsoundly preserves `.reserved`), and returning with a function-entry
+    protector attached to a callee-owned local (`retagFnEntryLocalDeallocUb`,
+    where `deallocAllM` runs `StorageDead` before `end_call` while Anneal skips
+    local-teardown protector checks) all raise ground-truth Tree Borrows UB on
+    `MachTB`, whereas on `!Freeze` `&UnsafeCell<T>` with `Retag([fn entry], r)`
+    (`unsafeCellProtectedInteriorMut`), `MachTB` uses `PermissionProt::Cell`
+    (`prevents_deallocation = false`) and succeeds while Anneal's
+    `hasProtectedWriteConflict` over-approximates `writerTag = some _` as
+    conflicting even for `!Freeze` `.reserved` entries.
+  - *Raw-pointer offsets, integer-to-pointer transmutes, and provenance exposure*:
+    Anneal ignores `offsetBytes`
+    on dereference (`offsetDeref 1`, `misaligned`, `offsetDeref 2`), does not
+    scale or bounds-check `Offset` (`offsetDeref 3`, `offsetDeref usizeMax`),
+    checks only `bits != 0` when decoding provenance-free integer bytes at `&T`
+    (`transmuteDanglingIntToRefDiscrepancy`), and encodes
+    `PointerExposeProvenance` as `tag * 65536 + offsetBytes` (`exposeTwice`;
+    conversely, exposing two distinct live `&mut` tags at one address stops with
+    `Stop.unsupported` on `MachTB`'s angelic `int2ptr` choice in
+    `exposeTwoRefMutAngelicUnsupported`),
+    while `Retag(FnEntry)` / reference arguments and reference returns remain
+    outside `inFragment`. Two upstream MiniRust `TreeBorrowsMemory` edge cases
+    are also exhibited and isolated (`zstWrappingSubReborrow_tb_specPanic` vs.
+    `TreeBorrowsMemory.reborrow_nonzst_no_offset_panic`, and
+    `treeBorrowsWeakBoxDeallocAndDeadRelease` vs.
+    `TreeBorrowsMemory.end_call_wfLive`).
+* **Provenance casts have synchronized 1-step and 2-step round-trip simulation
+  lemmas, not yet a whole-CFG `StateRelN` induction.**
+  `ProvenanceRel.expose_step`, `ProvenanceRel.withExposed_step`, and their
+  Pass A3 strengthenings `ProvenanceRel.expose_step_synced`,
+  `ProvenanceRel.withExposed_step_synced`, and
+  `ProvenanceRel.expose_then_withExposed_step` (`Correspondence/Simulation.lean`,
+  on top of `evalStmt_assign_expose_op`, `evalStmt_assign_withExposed_op`, and
+  `evalTerminator_intrinsic_*` in `Correspondence/PointerStep.lean`) prove across
+  both `.copy` and `.move` operands (`copyOp op = .copy ⟨p, []⟩`) that Anneal's
+  cast statement and MiniRust's `Terminator::Intrinsic` both step, that the
+  MiniRust step changes `intptrcast` exactly by the exposure and the allocations
+  only in their bytes (`AllocShapeEq`), that `ProvenanceRel` is preserved, and
+  that `ExposedLocalSynced` (`Correspondence/Relation.lean`, via
+  `BM.load_of_store`, `placeLoad_of_placeStore_usize`, `jumpToBlock_curFrame`,
+  and `evalPlace_local_of_curFrame`) records *both* the Anneal scalar tag slot
+  and the MiniRust `usize` load result (`evalValue m4 (.Load (.Local (localName i)))
+  = .ok ((.Int tAddr, .Int usizeIt), m_load)`). Consequently,
+  `ProvenanceRel.expose_then_withExposed_step` chains `PointerExposeProvenance`
+  into `PointerWithExposedProvenance` (`rtState_withExposed_subevals_ok`,
+  `rtState_expose_then_withExposed_synced`) without assuming an external load
+  hypothesis for the exposed-address local, and `ExposedTargetAtAddr` (connected
+  to `BorrowsOk` via `BorrowsOk.exposedTargetAtAddr_of_ptr_slot`, alongside
+  `BorrowsOk.target_ptrs_vacuous_of_hasProvCast` and `AddrTakenTargetsOk`)
+  unifies `ExposedTargetOk` with the in-bounds address witness. (Pass A2's first
+  versions assumed `m4.mem.memory.allocations = m.mem.memory.allocations` for the
+  post-state, which no real step satisfies:
+  `passA2_hm4_allocs_unsatisfiable_expose`, `..._withExposed`.)
+  `Correspondence/Provenance.lean` proves arbitrary-offset singleton optimality
+  for `BasicMemory` (`int2ptr_singleton_offset_checkPtr_optimal`) alongside a
+  `TreeBorrowsMemory` counterexample to singleton `Some(p)` dominance on
+  negative-offset zero-sized reborrows
+  (`int2ptrSingletonZstNegOffset_tb_specPanic_vs_none_ok`); `singleExposeSiteOk`
+  requires both `countExposeStmts body ≤ 1` and `isAcyclicCfg body = true`
+  (`singleExposeSiteOk_imp_acyclic`, rejecting loop-borne single syntactic expose
+  sites such as `exposeLoopSingleSite_singleExposeSiteOk_false`). Whole-CFG
+  induction over `splitBlockAtIntrinsics`'s continuation blocks remains separate
+  from `step_correspondence_N`.
+  `ProvenanceRel.expose_then_withExposed_reconstructs` generalizes the 2-step
+  round trip to states with prior exposures (no other live exposed allocation
+  containing the address, witnessed concretely on `int2ptrAdjacentArgsAmbiguous`
+  under `ctx0_2` by `int2ptrAdjacentArgsAmbiguous_spaced_reconstructs_with_prior_exposure`)
+  and states that `IntPtrCast.int2ptr` reconstructs
+  exactly the pointer loaded from `_p` before the exposure while Anneal's
+  destination receives exactly `_p`'s `pv`. Pass A4 further introduces
+  `FrameOkWithIntrinsics` (the `translateFnWithIntrinsics` analogue of `FrameOk`,
+  via `translateFnWithIntrinsics_locals`), `inFragmentWithIntrinsics_addrTaken_spec`
+  and `AddrTakenTargetsOk.{of_start,set,set_init,opPost}`, and the
+  `inFragment`-free `evalPtrLoad_withIntrinsics` (on top of
+  `ptrTargetSpec_aligned_and_good` and `ptrTargetSpec_valid_withIntrinsics`),
+  culminating in `ProvenanceRel.expose_step_from_frameOk`,
+  `ProvenanceRel.withExposed_step_from_frameOk`, and
+  `ProvenanceRel.expose_then_withExposed_from_frameOk`: these derive all
+  MiniRust `evalPlace`, pointer/integer `evalValue` load, `placeStore`,
+  `jumpToBlock`, and `ExposedTargetAtAddr` obligations directly from
+  `FrameOkWithIntrinsics`, `BorrowsOk`, `AddrTakenTargetsOk`, and `ProvenanceRel`
+  with zero external MiniRust evaluation hypotheses, while preserving
+  `FrameOkWithIntrinsics` and `AddrTakenTargetsOk` in the post-state.
+  Pass B2 (MR-4.3) unifies `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+  into `translateStmtOrIntrinsic`, `statementOkWithIntrinsics` (via
+  `progStatementOk`), and `inFragmentWithIntrinsics`, and proves the one-step
+  lemma `FrameOkWithIntrinsics.assume_step`; Pass B3/A3 strengthens it to
+  `ProvenanceRel.assume_step_from_frameOk` (preserving `FrameOkWithIntrinsics`,
+  `StaleOk`, `BorrowsOk`, `AddrTakenTargetsOk`, `m4.mem.memory = m.mem.memory`,
+  `m4.intptrcast = m.intptrcast`, and `ProvenanceRel`) and composes it in Pass A3
+  into `ProvenanceRel.assume_then_expose_then_withExposed_from_frameOk` across
+  three MiniRust segments (`Assume -> PointerExposeProvenance ->
+  PointerWithExposedProvenance`). Pass B4 strengthens this composition to
+  `ProvenanceRel.assume_then_expose_then_withExposed_usable_from_frameOk` (via
+  `exposeSourceCompatible_iff` and `BorrowsOk.ptr_slots_after_expose_withExposed`),
+  and Pass A4 closes the full inductive invariant tuple in
+  `BorrowsOk.after_expose_withExposed` and
+  `ProvenanceRel.assume_then_expose_then_withExposed_closed_from_frameOk`: at
+  `(s2, m8, view2, nb3, 0)`, all four correspondence invariants
+  (`ProvenanceRel`, `FrameOkWithIntrinsics`, bundled `BorrowsOk` including
+  `alias_ok` across `ptrStmtStep` for both provenance casts, and
+  `AddrTakenTargetsOk`) hold simultaneously, `evalValue m8 (.Load (.Local (localName d)))`
+  evaluates via `evalPtrLoad_withIntrinsics` to the exact target pointer
+  `offsetPtr (localPtr ctx entry.targetLocal) relOff` while preserving
+  `FrameOkWithIntrinsics`, and `_d` retains non-`.disabled` (and `.active`/`.reserved`
+  for `.mut`) dereference usability in `s2.memory.borrows`.
+  Passes B3, A3, B4, and A4 also unify multi-function translation (`translateFnInProgWithIntrinsics`
+  and `translateProgWithIntrinsics`, agreeing with `translateProg` on
+  provenance-cast-free programs via `translateProgWithIntrinsics_eq_of_no_provCast`
+  and `translateProgWithIntrinsics_eq_of_progInFragment`) while separating two
+  decidable predicates:
+  1. **`progInFragmentWithIntrinsics`** (`bodyInProgFragmentWithIntrinsics`): the
+     sound unified correspondence fragment combining intra-frame pointers,
+     references, reborrows, `Transmute`, `Assume`, `PointerExposeProvenance`, and
+     `PointerWithExposedProvenance` (`provCastFlowOk` and
+     `ptrAliasingProgOk (provCastAliasView body)`) with scalar-boundary `Call`
+     terminators. Both `progInFragment` and `inFragmentWithIntrinsics` embed
+     into it (`progInFragment_implies_progInFragmentWithIntrinsics`,
+     `inFragmentWithIntrinsics_implies_progInFragmentWithIntrinsics`,
+     `inFragment_implies_progInFragmentWithIntrinsics`, and
+     `inFragmentWithIntrinsics_and_singleExpose_implies_prog`), and
+     `callerBorrowExposeAndScalarCall_three_way` witnesses a strict 2-function
+     superset combining `Call`, `&mut`, `&raw mut`, `Retag`, `Assume`, and
+     provenance casts with 3-way agreement (`92` + `MirNoUBTree`). Across
+     returning `Call`s, `ptrAliasingProgOk` (`ptrTermStep`) disables active caller
+     borrows because Anneal's `Statements.evalStmt` runs
+     `invalidateConflictingBorrows` on the shared `s.memory.borrows` table for
+     every callee root assignment (`callerBorrowAcrossScalarCall_divergence`,
+     where both bodies individually satisfy `ptrAliasingOk = true` yet Anneal
+     faults after `Return` while `Mach` and `MachTB` return `42`). Moreover,
+     because `ptrTermStep` forces a caller that mutates `_1` through a borrow both
+     before and after a scalar `Call` to create a fresh borrow after `Return`,
+     exposing both the pre-call borrow and the post-call fresh borrow in the same
+     caller (`callerPrePostCallExpose_three_way_divergence`) satisfies
+     `progInFragmentWithIntrinsics = true` and returns `42` on Anneal and `Mach`
+     (`BasicMemory`), yet halts with `Stop.unsupported` on `MachTB`
+     (`TreeBorrowsMemory`) because the caller's live stack allocation accumulates
+     two distinct exposed Tree Borrows tags; `progSingleExposeSiteOk`
+     (`progSingleExposeSiteOk_nil`, `progInFragment_implies_progSingleExposeSiteOk`,
+     `inFragment_implies_progSingleExposeSiteOk`,
+     `inFragmentWithIntrinsics_and_singleExpose_implies_prog`, and
+     `callerBorrowExposeAndScalarCall_progSingleExposeSiteOk`) rules out
+     multi-expose caller bodies while permitting cyclic loop callers that invoke
+     an acyclic exposing callee across iterations
+     (`callerLoopCallExposeCallee_three_way`, where two loop calls reuse the exact
+     same first-fit callee stack address `5 * 2 ^ 32`, deallocate the first call's
+     allocation on `Return`, and achieve 3-way agreement `79` + `MirNoUBTree`
+     across Anneal, `Mach`, and `MachTB`).
+  2. **`progCrossFrameTranslatable`** (`bodyCrossFrameTranslatable` and
+     `progStmtOkWithIntrinsics`, restricting `.retag .fnEntry` to `isRefTy`
+     reference parameters as witnessed by `callerRawPtrRetagFnEntry_B3_divergence`):
+     the syntactic translatability check for multi-function programs that pass
+     pointers or references across `Call` boundaries
+     (`progInFragmentWithIntrinsics_implies_progCrossFrameTranslatable`). Such
+     programs lie outside sound Anneal–MiniRust correspondence because Anneal's
+     `Terminators.evalTerminator` saves caller locals on `s.memory.callStack`
+     without rebinding `BorrowEntry.targetLocal : Nat` across frames — which not
+     only faults on `callRefMutProtectedRoundTrip_three_way` (and overwrites
+     `callee.frame.locals[1]` on `callRefMutProtectorViolation_three_way`), but
+     can **silently return a wrong scalar with `MirNoUBTree`** when the callee's
+     colliding local slot holds a same-typed scalar
+     (`callerRefMutSilentWrongLocal_divergence`: Anneal returns `137` with no UB
+     while `Mach` and `MachTB` return `42`). Single-body divergences admitted by
+     Pass B3's unguarded predicate (`progInFragmentWithIntrinsicsB3`) are also
+     recorded in `exposeTwice_B3_divergence`, `int2ptrForgedTag_B3_divergence`,
+     `childReborrowWriteDisablesParent_B3_divergence`, and
+     `exposeSharedRefWriteUb_B3_divergence`.
+  Threading `FrameOkWithIntrinsics` into a whole-CFG `StateRelN` induction across
+  the continuation blocks synthesized by `splitBlockAtIntrinsics` remains separate
+  from `step_correspondence_N`. A single exposure site in a loop
+  does accumulate Tree Borrows tags when the loop retags (`exposeLoopReborrow`,
+  in the fragment: `MachTB` stops with `Stop.unsupported` on the second
+  iteration while `Mach` runs on), whereas `exposeLoopSingleSite`'s raw-pointer
+  loop keeps a singleton exposed set (`exposeLoopSingleSite_tb_exposed_singleton`).
+* **Direct monomorphic calls on acyclic call graphs only.** `progInFragment`
+  verifies multi-function programs whose static call graph is acyclic and whose
+  worst-case stack-local budget satisfies `maxStackLocals < 2^31`; recursive
+  call cycles, indirect function-pointer or virtual calls, and unwinding across
+  stack frames (`UnwindResume` / cleanup blocks) remain outside the fragment.
+* **Multi-function correspondence (`multi_step_correspondence`) vs. unified
+  multi-function fragment (`progInFragmentWithIntrinsics`).** `progInFragment`
+  (`bodyInProgFragment`) admits integer, `bool`, `Ordering`, and `(Int, bool)`
+  locals for the symbolic `multi_step_correspondence` induction, while
+  `progInFragmentWithIntrinsics` (`bodyInProgFragmentWithIntrinsics` and
+  `translateProgWithIntrinsics`) unifies `progInFragment` and
+  `inFragmentWithIntrinsics` under `provCastFlowOk` and
+  `ptrAliasingProgOk (provCastAliasView body)` (and `progCrossFrameTranslatable`
+  checks syntactic `translateProgWithIntrinsics` lowering for cross-frame
+  pointer/reference witnesses). The
+  multi-frame relations (`MultiStartRel`, `CallStackRel`) state per-local facts
+  at the default layout table, and `itOf_scalar_layouts`,
+  `tyOf_scalar_layouts`, `declSlotData_scalar_layouts`, and
+  `localAllocsFrom_scalar_layouts` bridge them to the single-frame relations
+  at `body.layouts`; the call and return lemmas (`callArgOk_cases`,
+  `evalArguments_spec`, `evalCall_spec`, `evalReturn_caller_spec`) take the
+  scalar-only hypothesis explicitly.
+* **Compiler call intrinsics and pointer/target intrinsics (MR-4.2).**
+  `progInFragment` admits `StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op))`
+  directly in the multi-function simulation (`SegChain`, `SegPc`), and
+  `IntrinsicFallback` proves full `mirCallWithCallees_ret` correspondence for
+  callee-body fallbacks (`ctlz`, `cttz`, `bswap`, `bitreverse`,
+  `saturating_add`, `saturating_sub`, `wrapping_shl`, `wrapping_shr`,
+  `black_box`). Compiler intrinsics called via `TerminatorKind.call` without a
+  callee body emit `MirCallE` external calls in Anneal (`MirStepNode.extCall`):
+  `IntrinsicBoundary` transcribes `minimize`'s `translateRsIntrinsic` (`raw_eq`,
+  `ctpop`, `exact_div`, `cold_path`, `abort`) and relates `cold_path`, `ctpop`,
+  and type-specialized `exact_div` under `mirHandledTree`
+  (`ExternalCallHandler`), while documenting why `MirCallReq`'s erased generic
+  types prevent a single type-blind handler from simultaneously matching signed
+  and unsigned `exact_div`, why diverging `abort` (`target = none`) is
+  `unsupported` in Anneal, and how `Rvalue::NullaryOp(UbChecks)`,
+  `CopyNonOverlapping`, `arith_offset`/`BinOp::Offset`, `write_bytes`, and
+  `raw_eq` behave outside the fragment (which admits only a zero constant
+  `Offset`).
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.
