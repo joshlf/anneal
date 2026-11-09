@@ -1,13 +1,13 @@
 # BRIEF-3 Reproduction Guide: Default Multi-Crate / `core` Lowering & Explicit `#[external_spec]` Dependency Abstraction
 
-This document provides exact, copy-pasteable commands to reproduce and verify Workstream 3 (`BRIEF-3`, integrating `BRIEF-3.1` and `BRIEF-3.2`) in `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3` on branch `sup/brief-3` (`adv/brief-3`).
+This document provides exact, copy-pasteable commands to reproduce and verify Workstream 3 (`BRIEF-3`, integrating `BRIEF-3.1` and `BRIEF-3.2`) in `<path/to/anneal>` on branch `sup/brief-3` (`adv/brief-3`).
 
 ## 1. Environment Setup
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
 export ELAN_TOOLCHAIN=leanprover/lean4:v4.34.1
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3
+cd <path/to/anneal>
 git status --porcelain
 git log --oneline -15
 ```
@@ -17,9 +17,9 @@ git log --oneline -15
 Build `Trusted` (`trusted/lean/Trusted/VerificationResult.lean` and `trusted/lean/Trusted/Rustc/{V2026_06_01,V2026_08_01}/MirSemantics/Places.lean`) and `Anneal`:
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode build --concurrency 2 -- lake build Trusted Anneal
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3
+cd <path/to/anneal>
 ```
 
 ## 3. `BRIEF-3.1`: Whole-Graph Crate & Sysroot (`core`/`alloc`) MIR Capture
