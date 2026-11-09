@@ -2202,7 +2202,7 @@ pub fn analyze_mir_lifting_profile(
     profile
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct MirBodyScan {
     has_body: bool,
     basic_block_count: usize,
@@ -2295,6 +2295,31 @@ fn basic_blocks_value_extent(after_bb: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+/// Locate `<field> <ws>* :=` in `src` at a Lean identifier boundary, returning
+/// `(field_start_byte, after_assign_byte)` so column-aligned (`basicBlocks  :=`)
+/// or compact (`basicBlocks:=`) field assignments are matched uniformly.
+fn find_field_assign(src: &str, field: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0usize;
+    while let Some(rel) = src[search_from..].find(field) {
+        let start = search_from + rel;
+        let prev_ok = src[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !crate::agent::is_lean_ident_char(c) && c != '.');
+        let after_field = start + field.len();
+        if prev_ok {
+            let rest = &src[after_field..];
+            let trimmed = rest.trim_start();
+            if let Some(after_eq) = trimmed.strip_prefix(":=") {
+                let consumed = rest.len() - after_eq.len();
+                return Some((start, after_field + consumed));
+            }
+        }
+        search_from = after_field;
+    }
+    None
+}
+
 fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let clean = strip_lean_comments_and_strings(mir_src);
     let body_clean = if let Some(idx) = clean.find("def body : CapturedMir") {
@@ -2305,45 +2330,27 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     } else {
         clean.as_str()
     };
-    let Some(bb) = body_clean.find("basicBlocks :=") else {
+    let Some((_, bb_val_start)) = find_field_assign(body_clean, "basicBlocks") else {
         return MirBodyScan {
             inferred_fragment: MirFragment::FullMir,
             ..MirBodyScan::default()
         };
     };
-    let type_param_count = body_clean
-        .find("typeParamCount :=")
-        .and_then(|idx| {
-            body_clean[idx + "typeParamCount :=".len()..]
+    let type_param_count = find_field_assign(body_clean, "typeParamCount")
+        .and_then(|(_, val_start)| {
+            body_clean[val_start..]
                 .split(|c: char| !c.is_ascii_digit())
                 .find(|s| !s.is_empty())
                 .and_then(|s| s.parse::<usize>().ok())
         })
         .unwrap_or(0);
-    let local_decls_slice = if let Some(ld) = body_clean.find("localDecls :=") {
-        let after_ld = &body_clean[ld + "localDecls :=".len()..];
-        let end_idx = [
-            "defPath :=",
-            "phase :=",
-            "role :=",
-            "argCount :=",
-            "basicBlocks :=",
-            "fnAbi :=",
-            "layouts :=",
-            "allocations :=",
-            "typeParamCount :=",
-            "genericParams :=",
-            "traitImpls :=",
-        ]
-        .iter()
-        .filter_map(|kw| after_ld.find(kw))
-        .min()
-        .unwrap_or(after_ld.len());
-        &after_ld[..end_idx]
+    let local_decls_slice = if let Some((_, ld_val_start)) = find_field_assign(body_clean, "localDecls") {
+        let after_ld = &body_clean[ld_val_start..];
+        basic_blocks_value_extent(after_ld).unwrap_or(after_ld)
     } else {
         ""
     };
-    let after_bb = &body_clean[bb + "basicBlocks :=".len()..];
+    let after_bb = &body_clean[bb_val_start..];
     // Delimit the `basicBlocks` value by bracket structure rather than by the
     // first textual `<field> :=`, so named constructor arguments that reuse a
     // `CapturedMir` field name (`.unevaluated (defPath := ..)`) cannot truncate
@@ -2356,7 +2363,7 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let block_toks: Vec<&str> = norm_blocks.split_whitespace().collect();
 
     let (basic_block_count, has_cfg_back_edge, malformed_blocks_reason) =
-        detect_blocks_and_back_edges(blocks_slice, &block_toks);
+        detect_blocks_and_back_edges(&norm_blocks, &block_toks);
     let unscannable_token = blocks_value
         .is_none()
         .then(|| "unbalanced, truncated, or empty basicBlocks literal".to_string())
@@ -2564,10 +2571,13 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
         }
 
         // Guillemet-quoted identifiers (`«...»`) are opaque: their contents may
-        // contain `"`, `--`, or `/-` without starting a string or comment.
+        // contain `"`, `--`, `/-`, `,`, `]`, or `terminator :=` without starting
+        // a string, comment, bracket, or field delimiter. Replace with a single
+        // opaque placeholder token `«ident»` so interior punctuation cannot
+        // confuse `basic_blocks_value_extent` or `normalize_parens_and_ws`.
         if src[i..].starts_with('«') {
             let end = src[i..].find('»').map_or(src.len(), |p| i + p + '»'.len_utf8());
-            out.push_str(&src[i..end]);
+            out.push_str(" «ident» ");
             i = end;
             prev_ch = Some('»');
             continue;
@@ -2584,16 +2594,18 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
         }
 
         if bytes[i] == b'"' {
-            if prev_ch == Some('!') {
+            if prev_ch == Some('!')
+                && out[..out.len() - 1].ends_with(crate::agent::is_lean_ident_char)
+            {
                 // Interpolated string (`s!"..{term}.."`, `m!"..."`): the `{..}`
-                // interpolations may nest string literals and braces. The whole
-                // literal (including its `s!` prefix) only produces a `String`
-                // value, so it is replaced by `""` like any other string.
+                // interpolations may nest string/char literals, comments, and
+                // braces. The whole literal (including its `s!` prefix) only
+                // produces a `String` value, so it is replaced by `""`.
                 out.pop();
                 while out.ends_with(|c: char| crate::agent::is_lean_ident_char(c) || c == '.') {
                     out.pop();
                 }
-                i = lean_interpolated_string_end(bytes, i);
+                i = lean_interpolated_string_end(src, i);
                 out.push_str("\"\"");
                 prev_ch = None;
                 continue;
@@ -2680,35 +2692,79 @@ fn lean_plain_string_end(bytes: &[u8], i: usize) -> usize {
 }
 
 /// Return the byte index just past a Lean interpolated string literal
-/// (`s!"..."`) whose opening quote is at `bytes[i]`, skipping `{..}`
-/// interpolations that may themselves contain strings and braces.
-fn lean_interpolated_string_end(bytes: &[u8], i: usize) -> usize {
+/// (`s!"..."`) whose opening quote is at `src.as_bytes()[i]`, skipping `{..}`
+/// interpolations that may themselves contain strings, char literals, comments,
+/// guillemets, and braces.
+fn lean_interpolated_string_end(src: &str, i: usize) -> usize {
+    let bytes = src.as_bytes();
     let mut j = i + 1;
     while j < bytes.len() {
         match bytes[j] {
-            b'\\' => j += 2,
+            b'\\' => {
+                j += 1;
+                if let Some(ch) = src[j..].chars().next() {
+                    j += ch.len_utf8();
+                }
+            }
             b'"' => return j + 1,
-            b'{' => j = lean_interpolation_end(bytes, j + 1),
+            b'{' => j = lean_interpolation_end(src, j + 1),
             _ => j += 1,
         }
     }
     bytes.len()
 }
 
-/// Skip Lean term syntax inside an interpolation starting at `bytes[j]` (just
-/// past `{`), returning the byte index just past the matching `}`.
-fn lean_interpolation_end(bytes: &[u8], mut j: usize) -> usize {
+/// Skip Lean term syntax inside an interpolation starting at `src.as_bytes()[j]`
+/// (just past `{`), returning the byte index just past the matching `}`.
+fn lean_interpolation_end(src: &str, mut j: usize) -> usize {
+    let bytes = src.as_bytes();
     let mut depth = 0usize;
+    let mut prev_ch: Option<char> = None;
     while j < bytes.len() {
-        let prev = (j > 0 && bytes[j - 1].is_ascii()).then(|| bytes[j - 1] as char);
-        if let Some(end) = lean_raw_string_end(bytes, j, prev) {
+        if src[j..].starts_with('«') {
+            j = src[j..].find('»').map_or(src.len(), |p| j + p + '»'.len_utf8());
+            prev_ch = Some('»');
+            continue;
+        }
+        if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'-' {
+            let mut bdepth = 1usize;
+            j += 2;
+            while j < bytes.len() && bdepth > 0 {
+                if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'-' {
+                    bdepth += 1;
+                    j += 2;
+                } else if j + 1 < bytes.len() && bytes[j] == b'-' && bytes[j + 1] == b'/' {
+                    bdepth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            prev_ch = None;
+            continue;
+        }
+        if j + 1 < bytes.len() && bytes[j] == b'-' && bytes[j + 1] == b'-' {
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            prev_ch = None;
+            continue;
+        }
+        if let Some(char_len) = crate::agent::lean_char_literal_len(src, j, prev_ch) {
+            j += char_len;
+            prev_ch = None;
+            continue;
+        }
+        if let Some(end) = lean_raw_string_end(bytes, j, prev_ch) {
             j = end;
+            prev_ch = None;
             continue;
         }
         match bytes[j] {
             b'{' => {
                 depth += 1;
                 j += 1;
+                prev_ch = Some('{');
             }
             b'}' => {
                 if depth == 0 {
@@ -2716,21 +2772,39 @@ fn lean_interpolation_end(bytes: &[u8], mut j: usize) -> usize {
                 }
                 depth -= 1;
                 j += 1;
+                prev_ch = Some('}');
             }
-            b'"' if prev == Some('!') => j = lean_interpolated_string_end(bytes, j),
-            b'"' => j = lean_plain_string_end(bytes, j),
-            _ => j += 1,
+            b'"' if prev_ch == Some('!') => {
+                j = lean_interpolated_string_end(src, j);
+                prev_ch = None;
+            }
+            b'"' => {
+                j = lean_plain_string_end(bytes, j);
+                prev_ch = None;
+            }
+            _ => {
+                if let Some(ch) = src[j..].chars().next() {
+                    j += ch.len_utf8();
+                    prev_ch = Some(ch);
+                } else {
+                    break;
+                }
+            }
         }
     }
     bytes.len()
 }
 
 fn normalize_parens_and_ws(src: &str) -> String {
-    let mut spaced = String::with_capacity(src.len() + 2);
+    let mut spaced = String::with_capacity(src.len() + 16);
     spaced.push(' ');
-    for ch in src.chars() {
+    let mut chars = src.chars().peekable();
+    while let Some(ch) = chars.next() {
         if matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',') {
             spaced.push(' ');
+        } else if ch == ':' && chars.peek() == Some(&'=') {
+            chars.next();
+            spaced.push_str(" := ");
         } else {
             spaced.push(ch);
         }
@@ -3068,10 +3142,10 @@ fn count_field_assign(block_toks: &[&str], field: &str) -> usize {
 }
 
 fn detect_blocks_and_back_edges(
-    blocks_slice: &str,
+    norm_blocks: &str,
     block_toks: &[&str],
 ) -> (usize, bool, Option<String>) {
-    let parts: Vec<&str> = blocks_slice.split("terminator :=").collect();
+    let parts: Vec<&str> = norm_blocks.split(" terminator := ").collect();
     let term_count = parts.len().saturating_sub(1);
     let stmt_count = count_field_assign(block_toks, "statements");
     let cleanup_count = count_field_assign(block_toks, "isCleanup");
@@ -3100,13 +3174,14 @@ fn detect_blocks_and_back_edges(
     let mut back_edge = false;
     let mut malformed = None;
     for (bb_idx, raw_part) in parts.iter().skip(1).enumerate() {
-        let end = raw_part
-            .find("isCleanup :=")
+        let padded = format!(" {raw_part} ");
+        let end = padded
+            .find(" isCleanup := ")
             .into_iter()
-            .chain(raw_part.find("statements :="))
+            .chain(padded.find(" statements := "))
             .min()
-            .unwrap_or(raw_part.len());
-        let term = normalize_parens_and_ws(&raw_part[..end]).replace(" span := \"\" ", " ");
+            .unwrap_or(padded.len());
+        let term = padded[..end].replace(" span := \"\" ", " ");
         match extract_terminator_targets(&term) {
             Some(targets) => {
                 for target in targets {
@@ -3234,8 +3309,8 @@ fn extract_terminator_targets(norm_term: &str) -> Option<Vec<usize>> {
         return Some(targets);
     } else if head == "inlineAsm" {
         for tok in &tokens[kind_pos + 1..u] {
-            if let Ok(n) = tok.parse::<usize>() {
-                targets.push(n);
+            if tok.bytes().all(|b| b.is_ascii_digit()) {
+                targets.push(tok.parse::<usize>().ok()?);
             }
         }
         if is_unwind_cleanup_tok(tokens[u]) {
@@ -5219,8 +5294,8 @@ def body : CapturedMir :=
         let claims = lean_witness_claims();
         let frag_claims = claims.iter().filter(|(f, _, _)| f == "inferMinFragment").count();
         let edge_claims = claims.iter().filter(|(f, _, _)| f == "hasCfgBackedge").count();
-        assert!(frag_claims >= 12, "expected >= 12 inferMinFragment witness theorems: {claims:?}");
-        assert!(edge_claims >= 5, "expected >= 5 hasCfgBackedge witness theorems: {claims:?}");
+        assert!(frag_claims >= 15, "expected >= 15 inferMinFragment witness theorems: {claims:?}");
+        assert!(edge_claims >= 6, "expected >= 6 hasCfgBackedge witness theorems: {claims:?}");
         let mut seen_levels = BTreeSet::new();
         for (func, witness, value) in &claims {
             let def_src = lean_witness_def(witness);
@@ -5393,7 +5468,8 @@ def body : CapturedMir :=
         for (label, src) in [
             ("raw string", body_with("", "r#\"demo\"x\"#")),
             ("interpolated string", body_with("", "s!\"demo{\"\\\"\"}x\"")),
-            ("guillemet identifier", body_with("def «weird\"name -- /-» : Nat := 0\n", "\"demo\"")),
+            ("interpolated char & comment", body_with("", "s!\"demo{if '}' == '\"' /- \" } -/ then \"a\" else \"b\"}\"")),
+            ("guillemet identifier", body_with("def «weird\"name -- /- , ] terminator :=» : Nat := 0\n", "\"demo\"")),
         ] {
             let scan = scan_captured_mir_body(&src);
             let class = classify_mir_fragment(&src);
@@ -5425,15 +5501,29 @@ def body : CapturedMir :=
         assert_eq!(class.inferred_fragment, MirFragment::TreeBorrowsLocal, "{class:?}");
         assert_eq!(class.escalation_reasons, vec!["ProjectionElem.deref".to_string()]);
 
-        // 7. Unbalanced or empty `basicBlocks` values fail closed.
+        // 7. Unbalanced or empty `basicBlocks` values, or guillemet identifiers
+        //    containing `,` / `]` after a list, fail closed.
         for src in [
             "def body : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }",
             "def body : CapturedMir := { basicBlocks := }",
             "def body : CapturedMir := { basicBlocks := [{ statements := [), terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }",
+            "def body : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] |>.«fnAbi :=» }",
         ] {
             let class = classify_mir_fragment(src);
             assert_eq!(class.inferred_fragment, MirFragment::FullMir, "{src}: {class:?}");
         }
+
+        // 8. Column-aligned `basicBlocks  :=` / `isCleanup  :=` and compact
+        //    zero-space `basicBlocks:=[{statements:=[],terminator:={kind:=.goto 0,span:=""},isCleanup:=false}]`
+        //    and `(defPath := "...")` inside `localDecls` before a `&mut` local.
+        let aligned = lean_witness_def("witnessAlignedAndInterpCharDefPath");
+        assert_eq!(classify_mir_fragment(aligned).inferred_fragment, MirFragment::FullMir);
+        let compact = "def body : CapturedMir := { basicBlocks:=[{statements:=[],terminator:={kind:=.goto 0,span:=\"\"},isCleanup:=false}] }";
+        let compact_class = classify_mir_fragment(compact);
+        assert_eq!(compact_class.inferred_fragment, MirFragment::PureBoundedLoop, "{compact_class:?}");
+        let ld_defpath_mut = "def body : CapturedMir := { localDecls := [{ mutability := .not, ty := { kind := .adt (defPath := \"demo::S\") [], layoutIdx := 0 }, debugName := none }, { mutability := .not, ty := { kind := .ref .mut (.uint .u32), layoutIdx := 1 }, debugName := none }], basicBlocks := [{ statements := [{ kind := .assign { local_ := 0, projection := [] } (.use (.copy { local_ := 2, projection := [.deref] })), span := \"\" }], terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }";
+        let ld_scan = scan_captured_mir_body(ld_defpath_mut);
+        assert!(ld_scan.has_mut_borrow, "defPath := inside localDecls must not truncate localDecls before &mut local: {ld_scan:?}");
         assert_eq!(basic_blocks_value_extent(" [] }"), Some(" [] "));
         assert_eq!(basic_blocks_value_extent(" (List.cons a List.nil),\n fnAbi := x"), Some(" (List.cons a List.nil)"));
         assert_eq!(basic_blocks_value_extent(" [a]\n  fnAbi := x"), Some(" [a]\n  "));

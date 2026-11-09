@@ -636,6 +636,20 @@ theorem no_cfg_cycle_of_isCfgDag {body : CapturedMir}
     simpa [isCfgDag] using h
   exact no_cfg_cycle_of_hasRankViolation_false h_no u
 
+/-- Every `isCfgDag body = true` body yields an explicit violation-free rank certificate (`dagRank body`). -/
+theorem exists_rank_certificate_of_isCfgDag {body : CapturedMir}
+    (h : isCfgDag body = true) :
+    ∃ rank : Nat → Nat, hasRankViolation rank body = false := by
+  refine ⟨dagRank body, ?_⟩
+  simpa [isCfgDag] using h
+
+/-- Existential rank-certificate soundness: any violation-free rank certificate rules out all CFG cycles. -/
+theorem no_cfg_cycle_of_exists_rank_certificate {body : CapturedMir}
+    (h : ∃ rank : Nat → Nat, hasRankViolation rank body = false) (u : BasicBlockIdx) :
+    ¬ CfgPath body u u := by
+  rcases h with ⟨rank, h_no⟩
+  exact no_cfg_cycle_of_hasRankViolation_false h_no u
+
 /-! ## 3. Per-Construct Structural Fragment Checkers -/
 
 /--
@@ -2083,6 +2097,29 @@ def witnessNamedDefPathArg : CapturedMir :=
                 (.use (.copy { local_ := 2, projection := [.deref] }))
               span := "proto.rs:13:3" }] }] }
 
+/--
+Column-aligned fields & interpolated-char-literal lexer witness (`.fullMir`):
+`defPath` uses an interpolated string `s!"proto::{if '}' == '"' then "a" else "b"}"`
+whose `{..}` interpolation contains `'}'` and `'"'` character literals; `basicBlocks`
+and `isCleanup` use multi-space column alignment (`basicBlocks  :=`, `isCleanup  :=`);
+and `bb0` ends in a `TerminatorKind.call` whose `span` contains `" basicBlocks := [] fnAbi := "`.
+-/
+def witnessAlignedAndInterpCharDefPath : CapturedMir :=
+  { protoBase with
+    defPath      := s!"proto::{if '}' == '"' then "a" else "b"}"
+    basicBlocks  :=
+      [{ statements := []
+         terminator :=
+           { kind := .call
+               (.constant { ty := { kind := .fnDef "proto::callee" [], layoutIdx := 0 },
+                            val := .zeroSized })
+               [] { local_ := 0, projection := [] } (some 1) .continue_
+             span := " basicBlocks := [] fnAbi := " }
+         isCleanup  := false },
+       { statements := []
+         terminator := { kind := .return_, span := "proto.rs:14:2" }
+         isCleanup  := false }] }
+
 theorem inferMinFragment_witnessPureLoopFree :
     inferMinFragment witnessPureLoopFree = .pureLoopFree := rfl
 
@@ -2125,6 +2162,9 @@ theorem inferMinFragment_witnessRawStringDefPath :
 theorem inferMinFragment_witnessNamedDefPathArg :
     inferMinFragment witnessNamedDefPathArg = .treeBorrowsLocal := rfl
 
+theorem inferMinFragment_witnessAlignedAndInterpCharDefPath :
+    inferMinFragment witnessAlignedAndInterpCharDefPath = .fullMir := rfl
+
 theorem hasCfgBackedge_witnessPureLoopFree : hasCfgBackedge witnessPureLoopFree = false := rfl
 
 theorem hasCfgBackedge_witnessPureBoundedLoop : hasCfgBackedge witnessPureBoundedLoop = true := rfl
@@ -2135,6 +2175,9 @@ theorem hasCfgBackedge_nonTopoDagWitness : hasCfgBackedge nonTopoDagWitness = tr
 
 theorem hasCfgBackedge_witnessRustcSharedReturn :
     hasCfgBackedge witnessRustcSharedReturn = true := rfl
+
+theorem hasCfgBackedge_witnessAlignedAndInterpCharDefPath :
+    hasCfgBackedge witnessAlignedAndInterpCharDefPath = false := rfl
 
 /--
 **Index-order vs. general DAG acyclicity**: `nonTopoDagWitness` has an index
