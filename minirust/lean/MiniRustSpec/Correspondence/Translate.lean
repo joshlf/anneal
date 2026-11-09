@@ -1695,8 +1695,11 @@ def copyOp : MirAst.Operand → MirAst.Operand
   | op => op
 
 /-- An rvalue with every `move` operand replaced by `copy` and `CopyForDeref(p)`
-normalized to `Use(copy p)` (both Anneal's `evalRvalue` and `minimize`'s
-`translate_rvalue_smir` evaluate `CopyForDeref(p)` identically to `Use(copy p)`). -/
+normalized to `Use(copy p)` (`minimize`'s `translate_rvalue_smir` translates
+`CopyForDeref(p)` identically to `Use(copy p)`, and Anneal's `evalRvalue`
+evaluates the two identically, including the dereference-read borrow freeze
+`freezeDerefReadBorrowsAt`, except that only `Use(copy p)` applies typed-load
+validation `validateLoadedValue`). -/
 def copyRv : MirAst.Rvalue → MirAst.Rvalue
   | .use op => .use (copyOp op)
   | .copyForDeref p => .use (.copy p)

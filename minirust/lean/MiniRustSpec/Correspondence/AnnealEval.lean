@@ -2361,7 +2361,9 @@ evaluating `op`, validating the loaded value against the operand's type
 conflicting foreign borrow (`freezeDerefReadBorrowsAt`). On a direct
 (non-dereferencing) operand whose value is valid at its type it therefore
 returns the operand's value and slots with memory unchanged
-(`evalRvalue_use_ok`). Fragment slots always hold type-valid values (`SlotOk`):
+(`evalRvalue_use_ok`); on a dereferencing operand it updates the borrow table
+exactly by `freezeDerefReadBorrowsAt` (`evalRvalue_use_deref`,
+`evalRvalue_derefRead_freeze`). Fragment slots always hold type-valid values (`SlotOk`):
 integer, tuple, `Ordering`, and pointer loads pass validation at any value
 (`validateLoadedValue_of_operandTy`) and `bool` loads read a valid bit
 (`validateLoadedValue_of_validBool`). -/
@@ -2722,7 +2724,8 @@ theorem validateLoadedValue_deref_of_ptrPointeeOf {layouts : Layout.LayoutTable}
 /-- `Rvalue.use` on any operand (including a dereferencing read `copy (*_p)…`
 or `move (*_p)…`) whose loaded value passes `validateLoadedValue` and whose
 read freezes no borrows (`freezeDerefReadBorrowsAt ... = mem.borrows`) returns
-`v` and `locals'` with `mem` unchanged. -/
+`v` and `locals'` with `mem` unchanged. When the read may freeze foreign
+`.active` borrows, use the exact characterization `evalRvalue_use_deref`. -/
 theorem evalRvalue_use_deref_ok {locals : List LocalSlot} {op : Operand}
     {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
     {v : Value} {locals' : List LocalSlot}
@@ -2769,6 +2772,303 @@ theorem evalRvalue_wrapUnsafeBinder_eq_use (locals : List LocalSlot) (op : Opera
     (layouts : Layout.LayoutTable) :
     evalRvalue locals (.wrapUnsafeBinder op ty) mem decls layouts =
       evalRvalue locals (.use op) mem decls layouts := rfl
+
+/-! ### Dereference reads: Tree Borrows foreign-read freezing
+
+Since `b076d6a3`, a dereference read (`Use(copy (*_p)…)`, `Use(move (*_p)…)`,
+or `CopyForDeref((*_p)…)`) updates the borrow table by
+`freezeDerefReadBorrowsAt` whenever at least two borrow entries exist: every
+foreign `.active` entry whose target overlaps the read moves to `.frozen`
+(MiniRust `PermissionUnprot::foreign_read`); every other entry is unchanged.
+Reborrows `&*_p` / `&mut *_p` perform the same initial read through
+`freezeTreeBorrowsOnReadAtProj`. The lemmas below characterize the update
+exactly: it maps every entry through a `FreezeOrSelf` update
+(`freezeDerefReadBorrowsAt_eq_map`, `freezeTreeBorrowsOnReadAtProj_eq_map`),
+so it preserves the table's length, tags, targets, projections, and
+`.disabled` entries, never touches entries of other locals or the reader's own
+ancestors (`updateBorrowPermOnReadAtProj_of_targetLocal_ne`,
+`updateBorrowPermOnReadAtProj_of_descendant`), and is the identity on tables
+with fewer than two entries (`freezeDerefReadBorrowsAt_nil`/`_singleton`), so
+`evalRvalue_use_deref`, `evalRvalue_copyForDeref_deref`, and
+`evalRvalue_derefRead_freeze` state the result uniformly. -/
+
+/-- A per-entry borrow update that leaves an entry unchanged or moves an
+`.active` entry to `.frozen` (MiniRust `PermissionUnprot::foreign_read`),
+keeping its tag, target, projection, byte range, protector, and parent. -/
+def FreezeOrSelf (f : BorrowEntry → BorrowEntry) : Prop :=
+  ∀ e, f e = e ∨ (e.perm = .active ∧ f e = { e with perm := .frozen })
+
+theorem freezeOrSelf_id : FreezeOrSelf id := fun _ => .inl rfl
+
+theorem FreezeOrSelf.tag {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).tag = e.tag := by
+  rcases hf e with h | ⟨_, h⟩ <;> rw [h]
+
+theorem FreezeOrSelf.targetLocal {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).targetLocal = e.targetLocal := by
+  rcases hf e with h | ⟨_, h⟩ <;> rw [h]
+
+theorem FreezeOrSelf.targetProjection {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).targetProjection = e.targetProjection := by
+  rcases hf e with h | ⟨_, h⟩ <;> rw [h]
+
+theorem FreezeOrSelf.eq_of_perm_ne_active {f : BorrowEntry → BorrowEntry}
+    (hf : FreezeOrSelf f) {e : BorrowEntry} (h : e.perm ≠ .active) : f e = e :=
+  (hf e).resolve_right fun ⟨ha, _⟩ => h ha
+
+theorem FreezeOrSelf.perm_eq_disabled_iff {f : BorrowEntry → BorrowEntry}
+    (hf : FreezeOrSelf f) (e : BorrowEntry) : (f e).perm = .disabled ↔ e.perm = .disabled := by
+  rcases hf e with h | ⟨ha, h⟩
+  · rw [h]
+  · rw [h, ha]; simp
+
+theorem FreezeOrSelf.map_eq_self {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    {bs : List BorrowEntry} (h : ∀ e ∈ bs, e.perm ≠ .active) : bs.map f = bs := by
+  induction bs with
+  | nil => rfl
+  | cons e rest ih =>
+    rw [List.map_cons, hf.eq_of_perm_ne_active (h e (.head _)),
+      ih (fun e' he' => h e' (.tail _ he'))]
+
+theorem FreezeOrSelf.mem_map {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    {bs : List BorrowEntry} {e' : BorrowEntry} (h : e' ∈ bs.map f) :
+    ∃ e ∈ bs, e' = e ∨ (e.perm = .active ∧ e' = { e with perm := .frozen }) := by
+  obtain ⟨e, he, rfl⟩ := List.mem_map.mp h
+  exact ⟨e, he, hf e⟩
+
+theorem FreezeOrSelf.lookupBorrow_map {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (bs : List BorrowEntry) (tag : Nat) :
+    lookupBorrow (bs.map f) tag = (lookupBorrow bs tag).map f := by
+  induction bs with
+  | nil => rfl
+  | cons e rest ih =>
+    simp only [List.map_cons, lookupBorrow, hf.tag]
+    cases Nat.beq e.tag tag
+    · exact ih
+    · rfl
+
+/-- `updateBorrowPermOnReadAtProj` leaves an entry unchanged or freezes an
+`.active` entry. -/
+theorem updateBorrowPermOnReadAtProj_freezeOrSelf (all : List BorrowEntry) (t : Nat)
+    (r : Option Nat) (proj : List ProjectionElem) (off len : Nat) :
+    FreezeOrSelf (fun e => MirSemantics.updateBorrowPermOnReadAtProj all e t r proj off len) := by
+  intro e
+  dsimp only
+  unfold MirSemantics.updateBorrowPermOnReadAtProj
+  dsimp only
+  cases e.perm <;> dsimp only <;> (repeat' split) <;>
+    first | exact .inl rfl | exact .inr ⟨rfl, rfl⟩ | contradiction
+
+/-- A read at another local leaves an entry unchanged. -/
+theorem updateBorrowPermOnReadAtProj_of_targetLocal_ne {all : List BorrowEntry}
+    {e : BorrowEntry} {t : Nat} (r : Option Nat) (proj : List ProjectionElem) (off len : Nat)
+    (h : e.targetLocal ≠ t) :
+    MirSemantics.updateBorrowPermOnReadAtProj all e t r proj off len = e := by
+  unfold MirSemantics.updateBorrowPermOnReadAtProj
+  cases hb : Nat.beq e.targetLocal t with
+  | false => rfl
+  | true => exact absurd (Nat.eq_of_beq_eq_true hb) h
+
+/-- A read through a descendant (or the entry's own tag) is a local read for the
+entry and leaves it unchanged; in particular the reader's own entry is never
+frozen by its own read. -/
+theorem updateBorrowPermOnReadAtProj_of_descendant {all : List BorrowEntry} {e : BorrowEntry}
+    (t : Nat) {rTag : Nat} (proj : List ProjectionElem) (off len : Nat)
+    (h : MirSemantics.isBorrowDescendantOrSelf all rTag e.tag = true) :
+    MirSemantics.updateBorrowPermOnReadAtProj all e t (some rTag) proj off len = e := by
+  unfold MirSemantics.updateBorrowPermOnReadAtProj
+  dsimp only
+  simp only [h]
+  split <;> (try split) <;> rfl
+
+theorem freezeTreeBorrowsOnReadAtProj_eq_map (all bs : List BorrowEntry) (t : Nat)
+    (r : Option Nat) (proj : List ProjectionElem) (off len : Nat) :
+    MirSemantics.freezeTreeBorrowsOnReadAtProj all bs t r proj off len =
+      bs.map (fun e => MirSemantics.updateBorrowPermOnReadAtProj all e t r proj off len) := by
+  induction bs with
+  | nil => rfl
+  | cons e rest ih => rw [MirSemantics.freezeTreeBorrowsOnReadAtProj, ih, List.map_cons]
+
+/-- `freezeDerefReadBorrowsAt` maps every entry through a `FreezeOrSelf` update. -/
+theorem freezeDerefReadBorrowsAt_eq_map (locals : List LocalSlot) (ptrLoc : Nat)
+    (restProj : List ProjectionElem) (bs : List BorrowEntry) :
+    ∃ f, FreezeOrSelf f ∧ MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj bs = bs.map f := by
+  unfold MirSemantics.freezeDerefReadBorrowsAt
+  split
+  · split
+    · exact ⟨_, updateBorrowPermOnReadAtProj_freezeOrSelf _ _ _ _ _ _,
+        freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _⟩
+    · exact ⟨id, freezeOrSelf_id, (List.map_id bs).symm⟩
+  · exact ⟨id, freezeOrSelf_id, (List.map_id bs).symm⟩
+
+theorem freezeDerefReadBorrowsAt_length (locals : List LocalSlot) (ptrLoc : Nat)
+    (restProj : List ProjectionElem) (bs : List BorrowEntry) :
+    (MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj bs).length = bs.length := by
+  obtain ⟨f, _, h⟩ := freezeDerefReadBorrowsAt_eq_map locals ptrLoc restProj bs
+  rw [h, List.length_map]
+
+theorem mem_freezeDerefReadBorrowsAt {locals : List LocalSlot} {ptrLoc : Nat}
+    {restProj : List ProjectionElem} {bs : List BorrowEntry} {e' : BorrowEntry}
+    (h : e' ∈ MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj bs) :
+    ∃ e ∈ bs, e' = e ∨ (e.perm = .active ∧ e' = { e with perm := .frozen }) := by
+  obtain ⟨f, hf, heq⟩ := freezeDerefReadBorrowsAt_eq_map locals ptrLoc restProj bs
+  rw [heq] at h
+  exact hf.mem_map h
+
+theorem lookupBorrow_freezeDerefReadBorrowsAt (locals : List LocalSlot) (ptrLoc : Nat)
+    (restProj : List ProjectionElem) (bs : List BorrowEntry) (tag : Nat) :
+    ∃ f, FreezeOrSelf f ∧
+      lookupBorrow (MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj bs) tag =
+        (lookupBorrow bs tag).map f := by
+  obtain ⟨f, hf, heq⟩ := freezeDerefReadBorrowsAt_eq_map locals ptrLoc restProj bs
+  exact ⟨f, hf, by rw [heq, hf.lookupBorrow_map]⟩
+
+theorem freezeDerefReadBorrowsAt_eq_self_of_no_active (locals : List LocalSlot) (ptrLoc : Nat)
+    (restProj : List ProjectionElem) {bs : List BorrowEntry} (h : ∀ e ∈ bs, e.perm ≠ .active) :
+    MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj bs = bs := by
+  obtain ⟨f, hf, heq⟩ := freezeDerefReadBorrowsAt_eq_map locals ptrLoc restProj bs
+  rw [heq, hf.map_eq_self h]
+
+theorem isBorrowDescendantOrSelfAux_self (fuel : Nat) (bs : List BorrowEntry) (t : Nat) :
+    MirSemantics.isBorrowDescendantOrSelfAux fuel bs t t = true := by
+  cases fuel <;> simp [MirSemantics.isBorrowDescendantOrSelfAux]
+
+theorem isBorrowDescendantOrSelf_self (bs : List BorrowEntry) (t : Nat) :
+    MirSemantics.isBorrowDescendantOrSelf bs t t = true :=
+  isBorrowDescendantOrSelfAux_self _ _ _
+
+theorem freezeDerefReadBorrowsAt_nil (locals : List LocalSlot) (ptrLoc : Nat)
+    (restProj : List ProjectionElem) :
+    MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj [] = [] := by
+  obtain ⟨f, _, h⟩ := freezeDerefReadBorrowsAt_eq_map locals ptrLoc restProj []
+  rw [h, List.map_nil]
+
+/-- A single borrow entry is never foreign to a read through its own tag. -/
+theorem freezeDerefReadBorrowsAt_singleton (locals : List LocalSlot) (ptrLoc : Nat)
+    (restProj : List ProjectionElem) (b : BorrowEntry) :
+    MirSemantics.freezeDerefReadBorrowsAt locals ptrLoc restProj [b] = [b] := by
+  unfold MirSemantics.freezeDerefReadBorrowsAt
+  split
+  · rename_i ptrVal _ _
+    cases hb : Nat.beq b.tag ptrVal.tag with
+    | false => simp only [lookupBorrow, hb]
+    | true =>
+      have ht : b.tag = ptrVal.tag := Nat.eq_of_beq_eq_true hb
+      simp only [lookupBorrow, MirSemantics.freezeTreeBorrowsOnReadAtProj,
+        MirSemantics.updateBorrowPermOnReadAtProj, Nat.beq_refl, ← ht,
+        isBorrowDescendantOrSelf_self, List.cons.injEq, and_true]
+      split <;> rfl
+  · rfl
+
+/-- `validateLoadedValue` reads only the operand's place type, which `copy` and
+`move` share. -/
+theorem validateLoadedValue_move_eq_copy (layouts : Layout.LayoutTable)
+    (decls : List LocalDecl) (pl : Place) (v : Value) :
+    MirSemantics.validateLoadedValue layouts decls (.move pl) v =
+      MirSemantics.validateLoadedValue layouts decls (.copy pl) v := rfl
+
+/-- Exact characterization of a dereference read `Use(copy (*_p).rest)` or
+`Use(move (*_p).rest)`: after typed-load validation, Anneal returns the loaded
+value and the post-read slots, and updates the borrow table by the Tree Borrows
+foreign-read freeze `freezeDerefReadBorrowsAt` (the identity on tables with fewer
+than two entries, `freezeDerefReadBorrowsAt_nil`/`_singleton`). -/
+theorem evalRvalue_use_deref {locals : List LocalSlot} {op : Operand} {p : Nat}
+    {rest : List ProjectionElem}
+    (hform : op = .copy ⟨p, .deref :: rest⟩ ∨ op = .move ⟨p, .deref :: rest⟩)
+    {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    {v : Value} {locals' : List LocalSlot}
+    (hop : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals = .ok v locals')
+    (hval : MirSemantics.validateLoadedValue layouts decls op v = true) :
+    evalRvalue locals (.use op) mem decls layouts =
+      .ok v locals' { mem with borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows } := by
+  rcases hform with rfl | rfl <;>
+  · rw [evalRvalue, hop]
+    dsimp only
+    rw [hval]
+    dsimp only
+    obtain ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee,
+      activeProtectors, nextProtector, callerLocals, fnPtrs⟩ := mem
+    rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩
+    · rw [freezeDerefReadBorrowsAt_nil]
+    · rw [freezeDerefReadBorrowsAt_singleton]
+    · rfl
+
+/-- `CopyForDeref((*_p).rest)` (no typed-load validation) returns the loaded value
+and updates the borrow table by `freezeDerefReadBorrowsAt`. -/
+theorem evalRvalue_copyForDeref_deref {locals : List LocalSlot} {p : Nat}
+    {rest : List ProjectionElem} {mem : MirSemantics.Memory} {decls : List LocalDecl}
+    {layouts : Layout.LayoutTable} {v : Value} {locals' : List LocalSlot}
+    (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
+      mem.callerLocals = .ok v locals') :
+    evalRvalue locals (.copyForDeref ⟨p, .deref :: rest⟩) mem decls layouts =
+      .ok v locals' { mem with borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows } := by
+  rw [evalRvalue, hop]
+  dsimp only
+  obtain ⟨nextAllocId, globals, borrows, nextTag, callees, traitImpls, callStack, activeCallee,
+    activeProtectors, nextProtector, callerLocals, fnPtrs⟩ := mem
+  rcases borrows with _ | ⟨b1, _ | ⟨b2, bs⟩⟩
+  · rw [freezeDerefReadBorrowsAt_nil]
+  · rw [freezeDerefReadBorrowsAt_singleton]
+  · rfl
+
+/-- `CopyForDeref(pl)` of a place that does not start with a dereference returns
+the loaded value with `mem` unchanged. -/
+theorem evalRvalue_copyForDeref_ok {locals : List LocalSlot} {pl : Place}
+    {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    {v : Value} {locals' : List LocalSlot}
+    (hop : evalOperand locals (.copy pl) mem.borrows mem.globals layouts mem.callerLocals =
+      .ok v locals')
+    (hnd : ∀ rest, pl.projection ≠ .deref :: rest) :
+    evalRvalue locals (.copyForDeref pl) mem decls layouts = .ok v locals' mem := by
+  rw [evalRvalue, hop]
+  dsimp only
+  rcases pl with ⟨j, projs⟩
+  cases projs with
+  | nil => rfl
+  | cons e rest =>
+    cases e <;> first | rfl | exact absurd rfl (hnd rest)
+
+theorem evalRvalue_copyForDeref_ub {locals : List LocalSlot} {pl : Place}
+    {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    (hop : evalOperand locals (.copy pl) mem.borrows mem.globals layouts mem.callerLocals = .ub) :
+    evalRvalue locals (.copyForDeref pl) mem decls layouts = .ub := by
+  rw [evalRvalue, hop]
+
+theorem evalRvalue_copyForDeref_unsupported {locals : List LocalSlot} {pl : Place}
+    {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    (hop : evalOperand locals (.copy pl) mem.borrows mem.globals layouts mem.callerLocals =
+      .unsupported) :
+    evalRvalue locals (.copyForDeref pl) mem decls layouts = .unsupported := by
+  rw [evalRvalue, hop]
+
+theorem copyRv_eq_use_copy_deref {rv : Rvalue} {p : Nat} {rest : List ProjectionElem}
+    (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩)) :
+    rv = .use (.copy ⟨p, .deref :: rest⟩) ∨ rv = .use (.move ⟨p, .deref :: rest⟩) ∨
+      rv = .copyForDeref ⟨p, .deref :: rest⟩ := by
+  cases rv <;> simp [copyRv] at hcrv
+  · rename_i op
+    cases op <;> simp [copyOp] at hcrv <;> simp [hcrv]
+  · simp [hcrv]
+
+/-- Every dereference read whose `copyRv` form is `Use(copy (*_p).rest)`
+(`Use(copy …)`, `Use(move …)`, or `CopyForDeref(…)`) returns the value loaded by
+`copy (*_p).rest` and freezes foreign `.active` borrows overlapping the read
+(`freezeDerefReadBorrowsAt`), provided the loaded value passes typed-load
+validation (`validateLoadedValue_deref_of_ptrPointeeOf` discharges it for integer
+pointees). -/
+theorem evalRvalue_derefRead_freeze {locals : List LocalSlot} {rv : Rvalue} {p : Nat}
+    {rest : List ProjectionElem} (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩))
+    {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    {v : Value} {locals' : List LocalSlot}
+    (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
+      mem.callerLocals = .ok v locals')
+    (hval : MirSemantics.validateLoadedValue layouts decls (.copy ⟨p, .deref :: rest⟩) v = true) :
+    evalRvalue locals rv mem decls layouts =
+      .ok v locals' { mem with borrows := MirSemantics.freezeDerefReadBorrowsAt locals p rest mem.borrows } := by
+  rcases copyRv_eq_use_copy_deref hcrv with rfl | rfl | rfl
+  · exact evalRvalue_use_deref (.inl rfl) hop hval
+  · exact evalRvalue_use_deref (.inr rfl) hop hval
+  · exact evalRvalue_copyForDeref_deref hop
 
 theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
@@ -5550,6 +5850,31 @@ theorem moveFrameOk_of_ptrRvalueOk {layouts : Layout.LayoutTable} {decls : List 
             simp only [opMoved, ne_eq, Option.some.injEq]
             exact (hnotPtrTarget entry (lookupBorrow_mem hlk) p d hd hptr).symm
   | _ => trivial
+
+/-- Fragment pointer dereference reads (`ptrDerefReadOk` on `copyRv rv`) satisfy
+`MoveFrameOk`: the `CopyForDeref((*_p))` form reads an integer pointee, which
+passes typed-load validation. -/
+theorem moveFrameOk_of_ptrDerefReadOk {decls : List LocalDecl} {it : Gen.IntType} {rv : Rvalue}
+    (hok : ptrDerefReadOk decls it (copyRv rv) = true) {locals : List LocalSlot}
+    {mem : MirSemantics.Memory} {layouts : Layout.LayoutTable} :
+    MoveFrameOk locals rv mem decls layouts := by
+  unfold ptrDerefReadOk at hok
+  split at hok
+  · rename_i p heq
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at hok
+    obtain ⟨_, hm⟩ := hok
+    cases hdp : decls[p]? with
+    | none => simp [hdp] at hm
+    | some dp =>
+      cases hpt : ptrPointeeOf dp.ty with
+      | none => simp [hdp, hpt] at hm
+      | some pr =>
+        obtain ⟨m, it'⟩ := pr
+        rcases copyRv_eq_use_copy_deref heq with rfl | rfl | rfl
+        · trivial
+        · trivial
+        · exact fun v _ _ => (validateLoadedValue_deref_of_ptrPointeeOf (v := v) hdp hpt).1
+  · simp at hok
 
 theorem splitLastDeref?_eq_none_of_allFields {projs : List ProjectionElem}
     (h : allFields projs = true) : MirSemantics.splitLastDeref? projs = none := by
