@@ -7245,20 +7245,15 @@ theorem scalarTy_isTryFromBytes_validBits
 
 /--
 Every thin raw pointer `.rawPtr m pointee` (`isThinPointee pointee = true`) satisfies
-`IsTryFromBytes` with validity predicate characterizing the decoded `.ptr p 8` value
-(`ScalarTy.rawPtr.validBits .bits64 bits` and provenance/page-model reconstruction).
+`IsTryFromBytes` with the exact value-level image of `Trusted`'s decoder: a thin
+pointer value `.ptr p 8` whose offset is below `scalarModulus 8`
+(`ScalarTy.rawPtr.validBits .bits64 p.offsetBytes`).
 -/
 theorem thin_rawPtr_isTryFromBytes
     (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy)
     (lIdx : LayoutIdx) (hThin : isThinPointee pointee = true) :
     IsTryFromBytes layouts { kind := .rawPtr m pointee, layoutIdx := lIdx }
-      (fun v =>
-        ∃ (p : ProvenancePtr) (bits : Nat) (prov : Option (Nat × Nat)),
-          v = .ptr p 8 ∧
-          ScalarTy.rawPtr.validBits .bits64 bits ∧
-          p = match prov with
-              | some (allocId, _) => { allocId := allocId, offsetBytes := bits }
-              | none => addressToPtr bits) := by
+      (fun v => ∃ p : ProvenancePtr, v = .ptr p 8 ∧ p.offsetBytes < scalarModulus 8) := by
   refine ⟨8, trusted_rigidTyByteSize_thin_rawPtr layouts m pointee lIdx hThin, ?_⟩
   intro bs v hDec
   rw [show defaultCodecFuel = 15 + 1 from rfl,
@@ -7272,17 +7267,20 @@ theorem thin_rawPtr_isTryFromBytes
       rcases pair with ⟨sv, prov⟩
       dsimp only at hDec
       have hBsLen : Trusted.Sequence.length bs = 8 := Nat.eq_of_beq_eq_true hLen
-      have ⟨hSvSz, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
-      rw [hBsLen] at hSvSz hSvLt
+      have ⟨_, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
+      rw [hBsLen] at hSvLt
       cases prov with
       | none =>
         injection hDec with hV
-        exact ⟨addressToPtr sv.bits, sv.bits, none, hV.symm, ⟨hSvLt, trivial⟩, rfl⟩
+        refine ⟨addressToPtr sv.bits, hV.symm, ?_⟩
+        show sv.bits % 65536 < scalarModulus 8
+        have hMod : sv.bits % 65536 < 65536 := Nat.mod_lt _ (by decide)
+        have h8 : (65536 : Nat) < scalarModulus 8 := by decide
+        omega
       | some ap =>
         rcases ap with ⟨allocId, tag⟩
         injection hDec with hV
-        exact ⟨{ allocId := allocId, offsetBytes := sv.bits }, sv.bits, some (allocId, tag),
-          hV.symm, ⟨hSvLt, trivial⟩, rfl⟩
+        exact ⟨{ allocId := allocId, offsetBytes := sv.bits }, hV.symm, hSvLt⟩
 
 /--
 Every thin reference `.ref m pointee` (`isThinPointee pointee = true`) satisfies
@@ -7331,6 +7329,40 @@ theorem thin_refPtr_isTryFromBytes
         rcases ap with ⟨allocId, tag⟩
         injection hDec with hV
         exact ⟨{ allocId := allocId, offsetBytes := sv.bits }, hV.symm, hSvLt⟩
+
+/--
+**Exactness of the thin-pointer `IsTryFromBytes` value predicate (`thin_ptrTy_decode_image_iff`).**
+For any thin pointer descriptor `dst` (`dst.isPtr = true`, `isThinPointee pointee = true`),
+a runtime value `v` is in the image of `decodeValueFromBytes` at `{ kind := dst.toTrustedRigidTy m pointee, layoutIdx := lIdx }`
+**if and only if** `∃ p : ProvenancePtr, v = .ptr p 8 ∧ p.offsetBytes < scalarModulus 8`.
+In particular, the predicate in `thin_rawPtr_isTryFromBytes` and `thin_refPtr_isTryFromBytes`
+is the exact (strongest possible) value-level `IsTryFromBytes` invariant.
+-/
+theorem thin_ptrTy_decode_image_iff
+    (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy)
+    (dst : ScalarTy) (lIdx : LayoutIdx) (v : Value)
+    (hPtr : dst.isPtr = true) (hThin : isThinPointee pointee = true) :
+    (∃ bs,
+      decodeValueFromBytes defaultCodecFuel layouts
+        { kind := dst.toTrustedRigidTy m pointee, layoutIdx := lIdx } bs = some v) ↔
+      (∃ p : ProvenancePtr, v = .ptr p 8 ∧ p.offsetBytes < scalarModulus 8) := by
+  constructor
+  · rintro ⟨bs, hDec⟩
+    cases dst with
+    | rawPtr =>
+      rcases thin_rawPtr_isTryFromBytes layouts m pointee lIdx hThin with ⟨_, _, hTry⟩
+      exact hTry bs v hDec
+    | refPtr =>
+      rcases thin_refPtr_isTryFromBytes layouts m pointee lIdx hThin with ⟨_, _, hTry⟩
+      exact hTry bs v hDec
+    | bool | char | int _ | uint _ => contradiction
+  · rintro ⟨p, rfl, hOff⟩
+    refine ⟨encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag)), ?_⟩
+    rw [show defaultCodecFuel = 15 + 1 from rfl]
+    exact trusted_decodeValueFromBytes_thin_ptrTy 15 layouts m pointee dst lIdx _ p hPtr hThin
+      (trusted_length_encodeLittleEndianBytes p.offsetBytes 8 _)
+      (trusted_decodeScalarBytes_encodeLittleEndianBytes 8 p.offsetBytes
+        (some (p.allocId, p.tag)) false (by decide) hOff)
 
 /--
 **Divergence (null-offset references are admitted at the value level).**
@@ -8275,5 +8307,138 @@ theorem tryTransmute_adt_fieldLayout_inner_primitive_scalarLayout_eq
   rw [trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts _ _ dstTy _ _
     hOp hDstSz hTy hSrcSz hEnc (trusted_length_encodeLittleEndianBytes bits _ none), hDec]
   cases wrappingRangeContains validRange bits <;> rfl
+
+/--
+**General `Ty`-level `try_transmute` soundness (`evalByteCast_tryTransmute_of_into_tryFrom_bytes`).**
+For any `srcTy` satisfying `IsIntoBytes layouts srcTy` and any `dstTy` satisfying
+`IsTryFromBytes layouts dstTy validPred` of the same byte size (`rigidTyByteSize layouts srcTy = rigidTyByteSize layouts dstTy`):
+whenever `op` evaluates to `v` of type `srcTy` with encoding `encodeValueToBytes defaultCodecFuel layouts srcTy v = some bs`:
+1. `evalByteCast locals op dstTy mem localDecls layouts` reduces directly to matching on `decodeValueFromBytes defaultCodecFuel layouts dstTy bs`.
+2. Whenever `decodeValueFromBytes defaultCodecFuel layouts dstTy bs = some v'`, `evalByteCast` succeeds with `ok v' locals' mem` AND `validPred v'` holds.
+3. `evalByteCast` returns `ub` iff `decodeValueFromBytes defaultCodecFuel layouts dstTy bs = none`.
+-/
+theorem evalByteCast_tryTransmute_of_into_tryFrom_bytes
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcTy dstTy : Ty) (validPred : Value → Prop)
+    (v : Value) (bs : List AbstractByte)
+    (hInto : IsIntoBytes layouts srcTy)
+    (hTryFrom : IsTryFromBytes layouts dstTy validPred)
+    (hSizeEq : rigidTyByteSize layouts srcTy = rigidTyByteSize layouts dstTy)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals = .ok v locals')
+    (hTy : operandTy localDecls layouts op = some srcTy)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts srcTy v = some bs) :
+    evalByteCast locals op dstTy mem localDecls layouts =
+      (match decodeValueFromBytes defaultCodecFuel layouts dstTy bs with
+       | some v' => ok v' locals' mem
+       | none => ub) ∧
+    (∀ v',
+      decodeValueFromBytes defaultCodecFuel layouts dstTy bs = some v' →
+      evalByteCast locals op dstTy mem localDecls layouts = ok v' locals' mem ∧
+      validPred v') ∧
+    (evalByteCast locals op dstTy mem localDecls layouts = ub ↔
+      decodeValueFromBytes defaultCodecFuel layouts dstTy bs = none) := by
+  rcases hInto with ⟨szSrc, hSzSrc, hEncProps⟩
+  rcases hTryFrom with ⟨szDst, hSzDst, hTryProps⟩
+  have hSzEq : szSrc = szDst := by
+    rw [hSzSrc, hSzDst] at hSizeEq
+    exact Option.some.inj hSizeEq
+  subst hSzEq
+  have ⟨hLen, _⟩ := hEncProps v bs hEnc
+  have hRed := trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts v srcTy
+    dstTy szSrc bs hOp hSzDst hTy hSzSrc hEnc hLen
+  refine ⟨hRed, ?_, ?_⟩
+  · intro v' hDec
+    refine ⟨?_, hTryProps bs v' hDec⟩
+    rw [hRed, hDec]
+  · rw [hRed]
+    cases decodeValueFromBytes defaultCodecFuel layouts dstTy bs <;> simp
+
+/--
+**Decidable-certificate corollary (`evalByteCast_tryTransmute_of_checkInto_tryFrom_bytes`).**
+Discharges the `IsIntoBytes` source obligation of `evalByteCast_tryTransmute_of_into_tryFrom_bytes`
+from `checkIntoBytes layouts srcTy = true`.
+-/
+theorem evalByteCast_tryTransmute_of_checkInto_tryFrom_bytes
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcTy dstTy : Ty) (validPred : Value → Prop)
+    (v : Value) (bs : List AbstractByte)
+    (hCheckInto : checkIntoBytes layouts srcTy = true)
+    (hTryFrom : IsTryFromBytes layouts dstTy validPred)
+    (hSizeEq : rigidTyByteSize layouts srcTy = rigidTyByteSize layouts dstTy)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals = .ok v locals')
+    (hTy : operandTy localDecls layouts op = some srcTy)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts srcTy v = some bs) :
+    evalByteCast locals op dstTy mem localDecls layouts =
+      (match decodeValueFromBytes defaultCodecFuel layouts dstTy bs with
+       | some v' => ok v' locals' mem
+       | none => ub) ∧
+    (∀ v',
+      decodeValueFromBytes defaultCodecFuel layouts dstTy bs = some v' →
+      evalByteCast locals op dstTy mem localDecls layouts = ok v' locals' mem ∧
+      validPred v') ∧
+    (evalByteCast locals op dstTy mem localDecls layouts = ub ↔
+      decodeValueFromBytes defaultCodecFuel layouts dstTy bs = none) :=
+  evalByteCast_tryTransmute_of_into_tryFrom_bytes locals locals' op mem localDecls layouts
+    srcTy dstTy validPred v bs (checkIntoBytes_sound layouts srcTy hCheckInto)
+    hTryFrom hSizeEq hOp hTy hEnc
+
+/--
+**Safe `IntoBytes -> FromBytes` transmute from a `.primitive` ADT into a same-width integral scalar (`evalByteCast_adt_primitive_to_scalar_ok`).**
+Transmuting any `.scalar ⟨bits, dst.sizeBytes .bits64⟩` (`bits < scalarModulus (dst.sizeBytes .bits64)`)
+of an inhabited single-variant `.primitive` ADT (such as a `.primitive` `NonZero*` or `#[repr(u8)]` / `#[repr(Int)]` enum)
+into a same-width integral scalar `dst` (`dst.isIntegral = true`) via `Trusted.MirSemantics.evalByteCast`
+always succeeds and preserves the bit pattern (`ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals' mem`).
+-/
+theorem evalByteCast_adt_primitive_to_scalar_ok
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (defPath : DefPath) (args : List RigidTy) (srcLIdx dstLIdx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bits : Nat)
+    (m : Mutability) (pointee : RigidTy) (dst : ScalarTy)
+    (hDstInt : dst.isIntegral = true)
+    (hBits : bits < scalarModulus (dst.sizeBytes .bits64))
+    (hLookup : LayoutTable.lookup layouts srcLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .primitive)
+    (hLSz : l.size.bytes = dst.sizeBytes .bits64)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := .adt defPath args, layoutIdx := srcLIdx }) :
+    let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
+    evalByteCast locals op dstTy mem localDecls layouts =
+      ok (.scalar ⟨bits, dst.sizeBytes .bits64⟩) locals' mem := by
+  intro dstTy
+  let srcTy : Ty := { kind := .adt defPath args, layoutIdx := srcLIdx }
+  have hDstNp : dst.isPtr = false := ScalarTy.isPtr_eq_false_of_isIntegral dst hDstInt
+  have hSrcSz : rigidTyByteSize layouts srcTy = some (dst.sizeBytes .bits64) := by
+    simp [srcTy, rigidTyByteSize, hLookup, hLSz]
+  have hDstSz : rigidTyByteSize layouts dstTy = some (dst.sizeBytes .bits64) :=
+    ScalarTy.rigidTyByteSize_toTrustedRigidTy_of_not_isPtr layouts m pointee dst dstLIdx hDstNp
+  have hNz : Nat.beq (dst.sizeBytes .bits64) 0 = false :=
+    ScalarTy.sizeBytes_bits64_beq_zero dst
+  have hEnc :
+      encodeValueToBytes defaultCodecFuel layouts srcTy (.scalar ⟨bits, dst.sizeBytes .bits64⟩) =
+        some (encodeLittleEndianBytes bits (dst.sizeBytes .bits64) none) := by
+    unfold defaultCodecFuel encodeValueToBytes
+    dsimp only [srcTy]
+    rw [hLookup]
+    dsimp only
+    rw [hInhab, hVar, hFields, hLSz]
+    dsimp only
+    rw [Nat.beq_refl]
+    unfold encodeScalarBytes
+    dsimp only
+    rw [hNz]
+  have hValidDst : dst.isValidBits .bits64 bits = true :=
+    ScalarTy.isValidBits_of_isIntegral .bits64 dst bits hDstInt hBits
+  rw [trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts _ srcTy dstTy _ _
+        hOp hDstSz hTy hSrcSz hEnc (trusted_length_encodeLittleEndianBytes bits _ none),
+      show defaultCodecFuel = 15 + 1 from rfl,
+      trusted_decodeValueFromBytes_scalar 15 layouts m pointee dst dstLIdx bits hDstNp hBits,
+      hValidDst]
 
 end Anneal.Mir.Cast
