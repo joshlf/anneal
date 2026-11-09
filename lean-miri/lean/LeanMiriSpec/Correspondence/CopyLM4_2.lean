@@ -9,6 +9,8 @@ those terms.
 -/
 
 import LeanMiriSpec.Correspondence.WriteBytesLM4_2
+import LeanMiriSpec.Correspondence.UnfoldPrivate
+import Lean
 
 /-!
 # `copy_nonoverlapping` Statement Simulation for `LM-4.2`
@@ -5521,7 +5523,7 @@ private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
   have hiter0 : (Miri.Memory.InitChunkIter.mk
       (Miri.Memory.InitMask.new (translateSizeBytes n) false) false
       ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok (some (.Uninit ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩, ⟨Miri.Memory.InitMask.new (translateSizeBytes n) false, false, ⟨UInt64.ofNat (off + total)⟩, ⟨UInt64.ofNat (off + total)⟩⟩)) := by
-    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new Miri.ABI.Size.sizeBytes
+    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new
     dsimp only [bind, Except.bind, pure, Except.pure]
     have hcond1 :
         ((UInt64.ofNat off > UInt64.ofNat (off + total)) ||
@@ -5539,18 +5541,15 @@ private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
       · split
         · rename_i h3
           contradiction
-        · dsimp only
-          split
+        · split
           · rfl
           · rename_i h4
             have hnot_le : ¬ ((UInt64.ofNat (off + total)).toNat ≤ (UInt64.ofNat off).toNat) := by omega
             contradiction
-  rw [hiter0]
-  unfold Miri.Memory.collectChunksAux
   have hiter1 : (Miri.Memory.InitChunkIter.mk
       (Miri.Memory.InitMask.new (translateSizeBytes n) false) false
       ⟨UInt64.ofNat (off + total)⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok none := by
-    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new Miri.ABI.Size.sizeBytes
+    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new
     dsimp only [bind, Except.bind, pure, Except.pure]
     have hcond2 :
         ((UInt64.ofNat (off + total) > UInt64.ofNat (off + total)) ||
@@ -5562,18 +5561,35 @@ private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
     · split
       · rfl
       · rename_i h
-        have hge : ((UInt64.ofNat (off + total)).toNat ≥ (UInt64.ofNat (off + total)).toNat) := by omega
-        contradiction
-  rw [hiter1]
+        change ¬ ((UInt64.ofNat (off + total)).toNat ≥ (UInt64.ofNat (off + total)).toNat) at h
+        have hge : (UInt64.ofNat (off + total)).toNat ≥ (UInt64.ofNat (off + total)).toNat := by omega
+        exact False.elim (h hge)
   have hfuel : (UInt64.ofNat (off + total)).toNat - (UInt64.ofNat off).toNat + 1 = total + 1 := by
     omega
   with_unfolding_all erw [hfuel]
-  match total, hpos with
-  | 1, _ => rfl
-  | 2, _ => rfl
-  | 4, _ => rfl
-  | 8, _ => rfl
-  | 16, _ => rfl
+  have htot_le : total ≤ 16 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have h_sub_false : ¬ (UInt64.ofNat (off + total) < UInt64.ofNat off) := by
+    have h1 : (UInt64.ofNat off).toNat = off := UInt64.toNat_ofNat_of_lt (by omega)
+    have h2 : (UInt64.ofNat (off + total)).toNat = off + total := UInt64.toNat_ofNat_of_lt (by omega)
+    rw [UInt64.lt_iff_toNat_lt, h1, h2]; omega
+  have h_sub : UInt64.ofNat (off + total) - UInt64.ofNat off = UInt64.ofNat total := by
+    have : UInt64.ofNat (off + total) - UInt64.ofNat off = UInt64.ofNat (off + total - off) := by
+      rw [UInt64.ofNat_sub (by omega)]
+    rw [this]; congr 1; omega
+  match htot : total with
+  | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 =>
+    unfold_private_collect
+    conv => { lhs; rw [WellFounded.Nat.fix_eq] }
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    with_unfolding_all erw [hiter0]
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    conv => { lhs; rw [WellFounded.Nat.fix_eq] }
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    with_unfolding_all erw [hiter1]
+    dsimp only [bind, Except.bind, pure, Except.pure, Array.append]
+    simp only [Miri.Memory.InitChunk.range, Miri.Memory.AllocRange.fromEndpoints, Miri.ABI.Size.sub, h_sub_false, ↓reduceIte, Except.mapError, bind, Except.bind, pure, Except.pure, Miri.ABI.Size.ofBytes, h_sub]
+  | 0 => omega
+  | _ + 17 => omega
 
 lemma allocRange_size (start size : Miri.ABI.Size) :
   (Miri.Memory.allocRange start size).size = size := rfl
