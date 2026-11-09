@@ -4319,11 +4319,68 @@ def stepDerefWrite (n : Nat) (env : List PtrLocalState) (w : Nat) : List PtrLoca
         else
           .disabled
 
+/-- Whether local `q` is declared as a mutable raw pointer or mutable reference
+(`*mut T` / `&mut T`): the only pointer/reference locals through which the
+fragment writes (`(*_q) = rv`) or reborrows mutably (`&mut *_q`, `&raw mut *_q`). -/
+def isMutPtrLocal (decls : List MirAst.LocalDecl) (q : Nat) : Bool :=
+  match decls[q]? >>= (ptrPointeeOf ·.ty) with
+  | some (.mut, _) => true
+  | _ => false
+
+/-- Whether a Tree Borrows read through `r`'s tag provably leaves `q`'s abstract
+state valid: `q` is `r` itself, `q` holds no pointer (`.empty`) or is already
+`.disabled`, `r` holds no pointer (the read is UB), or both are `.live` and `q`
+shares `r`'s tag (`q ∈ rPeers`) or targets a place that cannot overlap `r`'s
+target (`targetsDefinitelyDisjoint`). A `.disabled` reader keeps no `.live` `q`
+(so that `stepForeignRead` is monotone). -/
+def foreignReadKeeps (env : List PtrLocalState) (r q : Nat) : Bool :=
+  q == r ||
+  match env.getD r .disabled, env.getD q .disabled with
+  | .empty, _ => true
+  | _, .empty => true
+  | _, .disabled => true
+  | .live rTarget rPeers, .live qTarget _ =>
+    rPeers.contains q || targetsDefinitelyDisjoint qTarget rTarget
+  | .disabled, .live _ _ => false
+
+/-- Abstract transfer for a Tree Borrows read through `r`'s tag: a dereference
+read `*_r` (`freezeDerefReadBorrowsAt`) or the initial read of a reborrow
+`&*_r` / `&mut *_r` (`freezeTreeBorrowsOnReadAtProj`). Anneal freezes every
+foreign `.active` entry overlapping the read (MiniRust
+`PermissionUnprot::foreign_read`), after which writes and mutable reborrows
+through that entry are UB while MiniRust's `BasicMemory` accepts them, so every
+`.live` mutable pointer/reference local (`isMutPtrLocal`) that the read may
+freeze (`foreignReadKeeps = false`) becomes `.disabled`. Shared
+pointer/reference locals stay `.live`: the fragment only reads through them,
+which a frozen entry permits. -/
+def stepForeignRead (decls : List MirAst.LocalDecl) (n : Nat) (env : List PtrLocalState)
+    (r : Nat) : List PtrLocalState :=
+  (List.range n).map fun q =>
+    if isMutPtrLocal decls q && !foreignReadKeeps env r q then .disabled
+    else env.getD q .disabled
+
+/-- Extract the parent local `p` of a reference reborrow (`&*_p`, `&mut *_p`),
+which, unlike a raw reborrow `&raw *_p`, performs an initial read through `p`'s
+tag (`PermissionUnprot::init_access`). -/
+def refReborrowParentOf : MirAst.Rvalue → Option Nat
+  | .ref _ ⟨p, .deref :: _⟩ => some p
+  | _ => none
+
+/-- `stepForeignRead` for the initial read of a reference reborrow
+(`refReborrowParentOf`); the identity on every other rvalue. -/
+def stepReborrowRead (decls : List MirAst.LocalDecl) (n : Nat) (env : List PtrLocalState)
+    (rv : MirAst.Rvalue) : List PtrLocalState :=
+  match refReborrowParentOf rv with
+  | some p => stepForeignRead decls n env p
+  | none => env
+
 /-- Whether statement `s` never dereferences (for reading, reborrowing, or
 writing), offsets (`BinOp::Offset`), or retags (`StatementKind::Retag`) a
 `.disabled` pointer or reference local. `.empty` (uninitialized or dead) is
 permitted because both Anneal and MiniRust raise UB when loading or validating
-an uninitialized or dead pointer local. -/
+an uninitialized or dead pointer local. A pointer-to-pointer copy
+`(*_w) = copy (*_p)` additionally requires the read through `_p`, which Anneal
+evaluates before the write, to keep `_w`'s entry unfrozen (`foreignReadKeeps`). -/
 def ptrStmtOk (env : List PtrLocalState) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign ⟨_, []⟩ rv =>
@@ -4339,7 +4396,7 @@ def ptrStmtOk (env : List PtrLocalState) (s : MirAst.Statement) : Bool :=
   | .assign ⟨w, [.deref]⟩ rv =>
     env.getD w .disabled != .disabled &&
     match ptrDerefReadSrc rv with
-    | some p => env.getD p .disabled != .disabled
+    | some p => env.getD p .disabled != .disabled && foreignReadKeeps env p w
     | none => true
   | .retag _ ⟨p, []⟩ => env.getD p .disabled != .disabled
   | _ => true
@@ -4356,14 +4413,19 @@ def ptrStmtStep (decls : List MirAst.LocalDecl) (env : List PtrLocalState)
         setPtrLocal n env i (.live (some (k, borrowProjSteps projs)) [i])
       | none =>
         match reborrowParentOf rv with
-        | some p => stepReborrow n env i p
+        | some p => stepReborrow n (stepReborrowRead decls n env rv) i p
         | none =>
           match ptrCopySrcOf decls rv with
           | some p => stepPtrCopy n env i p
           | none => setPtrLocal n env i .disabled
     else
-      (List.range n).map (fun q => env.getD q .disabled)
-  | .assign ⟨w, [.deref]⟩ _ => stepDerefWrite n env w
+      match ptrDerefReadSrc rv with
+      | some r => stepForeignRead decls n env r
+      | none => (List.range n).map (fun q => env.getD q .disabled)
+  | .assign ⟨w, [.deref]⟩ rv =>
+    match ptrDerefReadSrc rv with
+    | some r => stepDerefWrite n (stepForeignRead decls n env r) w
+    | none => stepDerefWrite n env w
   | .storageLive i | .storageDead i | .deinit ⟨i, []⟩ =>
     if isDeclPtrLocal decls i then
       setPtrLocal n env i .empty
@@ -6175,6 +6237,31 @@ private theorem map_getD_initPtrEnv_prog (n : Nat) :
   rw [List.getD_eq_getElem?_getD, List.getElem?_map, List.getElem?_range (List.mem_range.mp hq)]
   rfl
 
+private theorem initPtrEnv_getD_cases (n x : Nat) :
+    (initPtrEnv n).getD x .disabled = .empty ∨ (initPtrEnv n).getD x .disabled = .disabled := by
+  unfold initPtrEnv
+  by_cases h : x < n
+  · left
+    rw [List.getD_eq_getElem?_getD, List.getElem?_map, List.getElem?_range h]
+    rfl
+  · right
+    rw [List.getD_eq_getElem?_getD, List.getElem?_map,
+      List.getElem?_eq_none (by simpa using Nat.le_of_not_lt h)]
+    rfl
+
+private theorem foreignReadKeeps_initPtrEnv (n r q : Nat) :
+    foreignReadKeeps (initPtrEnv n) r q = true := by
+  unfold foreignReadKeeps
+  rcases initPtrEnv_getD_cases n r with hr | hr <;>
+    rcases initPtrEnv_getD_cases n q with hq | hq <;> rw [hr, hq] <;> simp
+
+private theorem stepForeignRead_initPtrEnv (decls : List MirAst.LocalDecl) (n r : Nat) :
+    stepForeignRead decls n (initPtrEnv n) r = initPtrEnv n := by
+  unfold stepForeignRead
+  simp only [foreignReadKeeps_initPtrEnv, Bool.not_true, Bool.and_false, Bool.false_eq_true,
+    ↓reduceIte]
+  exact map_getD_initPtrEnv_prog n
+
 private theorem statementOk_not_deref_assign_of_scalar {decls : List MirAst.LocalDecl}
     {w : Nat} {rv : MirAst.Rvalue} {span : String} {layouts : Layout.LayoutTable}
     (hsc : ∀ d ∈ decls, (scalarTypeOf d.ty).isSome = true)
@@ -6202,7 +6289,9 @@ private theorem progStatementOk_ptrStmtStep_initPtrEnv {decls : List MirAst.Loca
     cases projs with
     | nil =>
       simp only [ptrStmtStep, hnoPtr i, Bool.false_eq_true, ↓reduceIte]
-      exact map_getD_initPtrEnv_prog _
+      cases ptrDerefReadSrc rv with
+      | some r => exact stepForeignRead_initPtrEnv decls _ r
+      | none => exact map_getD_initPtrEnv_prog _
     | cons p rest =>
       cases p with
       | deref =>
