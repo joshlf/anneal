@@ -121,7 +121,7 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
 1. **Configure `PATH` and Enter the Worktree**
    ```bash
    export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
-   cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-2
+   cd <path/to/anneal>
    ```
 
 2. **Run Repository Hygiene and Trusted Computing Base Audits**
@@ -134,7 +134,7 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
 
 3. **Fast Single-File Kernel Typecheck (`PureMirExec.lean`)**
    ```bash
-   cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-2/examples
+   cd <path/to/anneal>/examples
    anneal-lean-run --mode file --concurrency 2 -- \
      lake env lean ../theory/Anneal/PureMirExec.lean
    ```
@@ -142,7 +142,7 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
 
 4. **Full `Anneal` Library Build Receipt (Including `MirLift*` Dependents)**
    ```bash
-   cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-2/examples
+   cd <path/to/anneal>/examples
    anneal-lean-run --mode build --concurrency 2 -- lake build Anneal
    ```
    Expected result: `Build completed successfully (64 jobs).` (`exit 0`).
@@ -218,17 +218,17 @@ modification. `theory/Anneal/PureMirExec.lean` adds:
    #print axioms captureFreeFirstClosure_calleeRuntimeEval_sound
    #print axioms verify_localFnItemAndCleanupModular
    EOF
-   cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-2/examples
+   cd <path/to/anneal>/examples
    anneal-lean-run --mode file --concurrency 2 -- lake env lean "$TMP_AXIOMS"
    rm -f "$TMP_AXIOMS"
    ```
 
 ## Audit Notes
 
-- `[diversity-reduced]`: Under `anneal-model-policy` quota reserve routing for
+- `[diversity-reduced]`: Under `model-policy-cli` quota reserve routing for
   Tier `P1`, Agent A (`ff22a`) and Agent B (`ff22b`, switched from
-  `gemini-launch-candidate-high` prior to `B1` due to `Family Y` quota floor)
-  ran on `gemini-pro-coordinator`.
+  `model-family-y-primary` prior to `B1` due to `Family Y` quota floor)
+  ran on `supervisor-model-primary`.
 - Pass `B1` generalized `ActiveRootMemory` for arbitrary `activeBody` on tail
   returns, added compositional `tailCall_summary` / `tailCall_nested_summary`
   rules across `MirWpConverges`, `PureMirConvergesWithCallees`,

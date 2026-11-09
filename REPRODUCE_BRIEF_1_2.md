@@ -1,7 +1,7 @@
 # Step-by-Step Reproduction Instructions for `BRIEF-1.2`
 
 - **Item ID**: `BRIEF-1.2` (Diverging Calls (`target = .none`) and Unwind Cleanup Terminators (`unwindResume`, `unwindTerminate`))
-- **Worktree**: `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-2`
+- **Worktree**: `<path/to/anneal>`
 - **Branch**: `adv/brief-1-2`
 - **Base Commit (`adv/brief-1-1`)**: `f515de96b6f6e123139680516e77ff985d3d53a8`
 - **Adversarial Round Checkpoints (`N = 4`, 9 commits)**:
@@ -18,7 +18,7 @@
 ## 1. Verify Worktree & Commit History
 
 ```bash
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-2
+cd <path/to/anneal>
 git status --porcelain
 git log --oneline -10
 ```
@@ -29,7 +29,7 @@ Expected: `git status --porcelain` is empty and `git log --oneline -10` shows al
 
 ```bash
 export PATH="$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-2/examples
+cd <path/to/anneal>/examples
 lake build Trusted Anneal Correspondence.V2026_06_01.L5_ControlAndCalls Correspondence.V2026_08_01.L5_ControlAndCalls
 ```
 
@@ -42,7 +42,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-1-2
+cd <path/to/anneal>
 python3 trusted/audit/check_trusted.py --fast
 ```
 

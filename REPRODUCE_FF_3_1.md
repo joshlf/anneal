@@ -6,7 +6,7 @@ This guide documents how to compile and kernel-check the 10+ basic block benchma
 
 Navigate to the worktree root:
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-3-1
+cd <path/to/anneal>
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 ```
 
@@ -31,4 +31,4 @@ anneal-lean-run --mode file --concurrency 2 -- lake env lean ../theory/Anneal/Mi
 If it succeeds with no output (and specifically no warnings about `sorry` or `sorryAx`), the proof is kernel-checked and complete!
 
 ## 4. Audit Compliance
-- `[diversity-reduced]`: This unit was evaluated under reduced model diversity (pinned to `gemini-pro-coordinator` / `gemini-3.1-pro-high`) due to quota constraints.
+- `[diversity-reduced]`: This unit was evaluated under reduced model diversity (pinned to `supervisor-model-primary` / `supervisor-model-fallback`) due to quota constraints.
