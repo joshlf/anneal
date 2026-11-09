@@ -171,7 +171,11 @@ pub struct MutationChainShrinkOutcome<T> {
     /// accepted reduction step.
     pub succeeded: bool,
     /// `true` iff `succeeded` is `true` and deleting any single element from
-    /// `minimized_steps` falsifies `predicate`.
+    /// `minimized_steps` falsifies `predicate`. The shrinker only terminates after a
+    /// complete single-deletion sweep over `minimized_steps` in which every deletion was
+    /// rejected (the single-element case relies on the initial `predicate(&[])` check),
+    /// so this holds for every deterministic `predicate`; with a nondeterministic oracle
+    /// it holds relative to the answers the oracle actually gave.
     pub is_one_minimal: bool,
 }
 
@@ -435,6 +439,217 @@ mod tests {
         assert!(coupled.succeeded);
         assert!(coupled.is_one_minimal);
         assert_eq!(coupled.minimized_steps, vec!["M4"]);
+    }
+
+    fn splitmix64(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Transliteration of the Lean `windowDelete` (`theory/Anneal/DiffTestShrinkerPrototype.lean`).
+    fn lean_window_delete(xs: &[usize], pos: usize, chunk: usize) -> Vec<usize> {
+        let stop = (pos + chunk).min(xs.len());
+        xs[..pos.min(xs.len())]
+            .iter()
+            .chain(xs[stop.max(pos.min(xs.len()))..].iter())
+            .copied()
+            .collect()
+    }
+
+    /// Transliteration of the Lean `ddminSweep` (same fuel discipline).
+    fn lean_ddmin_sweep(
+        pred: &mut dyn FnMut(&[usize]) -> bool,
+        chunk: usize,
+        fuel: usize,
+        best: Vec<usize>,
+        pos: usize,
+        improved: bool,
+    ) -> Option<(Vec<usize>, bool)> {
+        if fuel == 0 {
+            return None;
+        }
+        if pos < best.len() {
+            if (pos + chunk).min(best.len()) - pos == best.len() {
+                Some((best, improved))
+            } else {
+                let cand = lean_window_delete(&best, pos, chunk);
+                if pred(&cand) {
+                    lean_ddmin_sweep(pred, chunk, fuel - 1, cand, pos, true)
+                } else {
+                    lean_ddmin_sweep(pred, chunk, fuel - 1, best, pos + 1, improved)
+                }
+            }
+        } else {
+            Some((best, improved))
+        }
+    }
+
+    /// Transliteration of the Lean `ddminNextChunk`.
+    fn lean_ddmin_next_chunk(chunk: usize, best: &[usize]) -> usize {
+        if chunk == 1 {
+            if 2 <= best.len() { best.len().div_ceil(2) } else { 1 }
+        } else {
+            1.max(chunk.div_ceil(2).min(best.len().div_ceil(2)))
+        }
+    }
+
+    /// Transliteration of the Lean `ddminLoop`.
+    fn lean_ddmin_loop(
+        pred: &mut dyn FnMut(&[usize]) -> bool,
+        fuel: usize,
+        best: Vec<usize>,
+        chunk: usize,
+    ) -> Option<Vec<usize>> {
+        if fuel == 0 {
+            return None;
+        }
+        let sweep_fuel = 2 * best.len() + 1;
+        let (best2, improved) = lean_ddmin_sweep(pred, chunk, sweep_fuel, best, 0, false)?;
+        if chunk == 1 && !improved {
+            Some(best2)
+        } else {
+            let next = lean_ddmin_next_chunk(chunk, &best2);
+            lean_ddmin_loop(pred, fuel - 1, best2, next)
+        }
+    }
+
+    /// Transliteration of the Lean `ddminReference`.
+    fn lean_ddmin_reference(
+        pred: &mut dyn FnMut(&[usize]) -> bool,
+        fuel: usize,
+        xs: &[usize],
+    ) -> Option<Vec<usize>> {
+        if pred(xs) {
+            if xs.is_empty() {
+                Some(Vec::new())
+            } else if pred(&[]) {
+                Some(Vec::new())
+            } else {
+                lean_ddmin_loop(pred, fuel, xs.to_vec(), xs.len().div_ceil(2))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Ties `shrink_mutation_chain_detailed` to the Lean reference model whose results are
+    /// proved 1-minimal (`ddminReference_one_minimal`) and which provably answers with the
+    /// fuel used here (`ddminReference_total`): on 1200 arbitrary deterministic predicates
+    /// both make exactly the same predicate calls, in the same order, and return the same
+    /// chain.
+    #[test]
+    fn shrink_mutation_chain_detailed_matches_lean_ddmin_reference_call_for_call() {
+        let mut seed = 0x1357_9BDF_2468_ACE0u64;
+        for trial in 0..1200usize {
+            seed = splitmix64(seed);
+            let n = trial % 10;
+            let steps: Vec<usize> = (0..n).collect();
+            let full_mask = (1u64 << n) - 1;
+            let salt = seed;
+            let modulus = 2 + (seed >> 60) % 4;
+            let initial_true = trial % 13 != 0;
+            let truth = move |sub: &[usize]| -> bool {
+                let mask = sub.iter().fold(0u64, |m, &i| m | (1u64 << i));
+                if mask == full_mask {
+                    return initial_true;
+                }
+                splitmix64(mask ^ salt) % modulus == 0
+            };
+
+            let mut impl_calls: Vec<Vec<usize>> = Vec::new();
+            let outcome = shrink_mutation_chain_detailed(&steps, |s| {
+                impl_calls.push(s.to_vec());
+                truth(s)
+            });
+
+            let mut model_calls: Vec<Vec<usize>> = Vec::new();
+            // Fuel strictly above the `ddminReference_total` bound `n * (n + 1) + ⌈n / 2⌉`.
+            let fuel = n * (n + 1) + n.div_ceil(2) + 1;
+            let mut model_pred = |s: &[usize]| {
+                model_calls.push(s.to_vec());
+                truth(s)
+            };
+            let model = lean_ddmin_reference(&mut model_pred, fuel, &steps);
+
+            assert_eq!(impl_calls, model_calls, "trial {trial}: predicate call sequence");
+            assert_eq!(outcome.predicate_evaluations, model_calls.len(), "trial {trial}");
+            match model {
+                None => {
+                    assert!(!initial_true, "trial {trial}: model ran out of fuel");
+                    assert!(!outcome.succeeded, "trial {trial}");
+                }
+                Some(chain) => {
+                    assert!(outcome.succeeded && outcome.is_one_minimal, "trial {trial}");
+                    assert_eq!(outcome.minimized_steps, chain, "trial {trial}: result");
+                }
+            }
+        }
+    }
+
+    /// Differential check of `shrink_mutation_chain_detailed` against a brute-force
+    /// 1-minimality oracle over 1200 arbitrary (non-monotone) deterministic predicates on
+    /// chains of length `0..=9`. Steps are the distinct indices `0..n`, so a result is a
+    /// subsequence of the input iff it is strictly increasing.
+    #[test]
+    fn shrink_mutation_chain_detailed_is_one_minimal_for_arbitrary_deterministic_predicates() {
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut minimized_strictly = 0usize;
+        for trial in 0..1200usize {
+            seed = splitmix64(seed);
+            let n = trial % 10;
+            let steps: Vec<usize> = (0..n).collect();
+            let full_mask = (1u64 << n) - 1;
+            let salt = seed;
+            let modulus = 2 + (seed >> 60) % 4;
+            let initial_true = trial % 11 != 0;
+            // Truth table over the set of kept original indices; arbitrary, so neither
+            // monotone nor anti-monotone.
+            let truth = |sub: &[usize]| -> bool {
+                let mask = sub.iter().fold(0u64, |m, &i| m | (1u64 << i));
+                if mask == full_mask {
+                    return initial_true;
+                }
+                splitmix64(mask ^ salt) % modulus == 0
+            };
+
+            let mut calls = 0usize;
+            let out = shrink_mutation_chain_detailed(&steps, |s| {
+                calls += 1;
+                truth(s)
+            });
+
+            assert_eq!(out.predicate_evaluations, calls, "trial {trial}: evaluation count");
+            assert_eq!(out.original_steps, steps, "trial {trial}: original steps");
+            if !initial_true {
+                assert!(!out.succeeded && !out.is_one_minimal, "trial {trial}");
+                assert_eq!(out.minimized_steps, steps, "trial {trial}");
+                assert_eq!(calls, 1, "trial {trial}: only the initial check may run");
+                continue;
+            }
+            assert!(out.succeeded && out.is_one_minimal, "trial {trial}");
+            assert!(
+                out.minimized_steps.windows(2).all(|w| w[0] < w[1])
+                    && out.minimized_steps.iter().all(|&i| i < n),
+                "trial {trial}: {:?} is not a subsequence of 0..{n}",
+                out.minimized_steps
+            );
+            assert!(truth(&out.minimized_steps), "trial {trial}: predicate not preserved");
+            for i in 0..out.minimized_steps.len() {
+                let mut deleted = out.minimized_steps.clone();
+                deleted.remove(i);
+                assert!(
+                    !truth(&deleted),
+                    "trial {trial}: deleting index {i} of {:?} still satisfies the predicate",
+                    out.minimized_steps
+                );
+            }
+            if out.minimized_steps.len() < n {
+                minimized_strictly += 1;
+            }
+        }
+        assert!(minimized_strictly > 500, "only {minimized_strictly} trials shrank");
     }
 
     #[test]

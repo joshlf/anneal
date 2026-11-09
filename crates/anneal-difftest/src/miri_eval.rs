@@ -91,6 +91,10 @@ pub struct MiriFindingBundle {
     pub minimized_mutator_chain: Vec<String>,
     /// Number of shrinker predicate evaluations performed while minimizing this finding.
     pub shrink_evaluations: usize,
+    /// Outcome of mutator-chain shrinking (`"minimized"`, `"already_one_minimal"`,
+    /// `"skipped_not_applicable"`, `"skipped_replay_mismatch"`, or
+    /// `"skipped_shrinker_error: ..."`), so a finding never silently skips shrinking.
+    pub shrink_status: String,
     /// Canonical divergence class slug (`"wrong_value"`, `"false_positive_ub"`,
     /// `"missed_ub"`, `"panic_vs_return"`, `"return_vs_panic"`,
     /// `"ub_location_mismatch"`, or `"panic_site_mismatch"`).
@@ -314,10 +318,69 @@ pub fn normalize_miri_outcome_category(outcome: &MiriOutcome) -> &'static str {
     }
 }
 
+/// Normalize a Miri diagnostic message so that it no longer depends on source
+/// locations, allocation ids, addresses, offsets, or concrete values.
+///
+/// Every hexadecimal literal (`0x2a`) becomes `0xN`, every maximal run of decimal
+/// digits (`alloc1234`, `src/lib.rs:52:17`, `size 16`) becomes `N`, and whitespace is
+/// collapsed. The non-numeric wording that identifies the UB / panic kind (for
+/// example `"constructing invalid value"` vs. `"memory access failed"`) is kept.
+pub fn normalize_diagnostic_message(raw: &str) -> String {
+    let chars: Vec<char> = raw.trim().chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '0'
+            && i + 2 < chars.len()
+            && (chars[i + 1] == 'x' || chars[i + 1] == 'X')
+            && chars[i + 2].is_ascii_hexdigit()
+        {
+            out.push_str("0xN");
+            i += 2;
+            while i < chars.len() && (chars[i].is_ascii_hexdigit() || chars[i] == '_') {
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_digit() {
+            out.push('N');
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Return the span-normalized Miri outcome family: the outcome category plus, for
+/// panics and UB, the [`normalize_diagnostic_message`]-normalized diagnostic. Return
+/// values are reduced to their width so value perturbations do not matter.
+pub fn normalize_miri_outcome_family(outcome: &MiriOutcome) -> String {
+    match outcome {
+        MiriOutcome::PassUnit => "pass:unit".to_string(),
+        MiriOutcome::PassScalar { size_bytes, .. } => format!("pass:scalar:{size_bytes}"),
+        MiriOutcome::Panic { message, .. } => {
+            format!("panic:{}", normalize_diagnostic_message(message))
+        }
+        MiriOutcome::Ub { message, .. } => format!("ub:{}", normalize_diagnostic_message(message)),
+        MiriOutcome::OracleError(_) => "oracle_error".to_string(),
+    }
+}
+
 /// Check whether `candidate` reproduces the same normalized discrepancy signature as
-/// `original` (both diverge with the same `divergence_class_slug`, the same normalized
-/// `MirDiffTag` family, and the same Miri outcome category, independent of line-number
-/// shifts in `src/lib.rs`).
+/// `original`, independent of line-number shifts in `src/lib.rs`.
+///
+/// Both reports must diverge with the same `divergence_class_slug`, the same
+/// normalized `MirDiffTag` (`normalize_anneal_outcome_tag`), and the same Miri outcome
+/// family (`normalize_miri_outcome_family`, which guards against "bug slippage" into a
+/// different UB or panic kind that happens to share the divergence class). When the
+/// original divergence was confirmed by the Lean 4 kernel, the candidate must be
+/// kernel-confirmed too, so shrinking never trades a kernel-confirmed finding for an
+/// unconfirmed one.
 pub fn discrepancy_signatures_match(
     original: &ItemOracleReport,
     candidate: &ItemOracleReport,
@@ -330,8 +393,9 @@ pub fn discrepancy_signatures_match(
     divergence_class_slug(orig_kind) == divergence_class_slug(cand_kind)
         && normalize_anneal_outcome_tag(&original.anneal)
             == normalize_anneal_outcome_tag(&candidate.anneal)
-        && normalize_miri_outcome_category(&original.miri)
-            == normalize_miri_outcome_category(&candidate.miri)
+        && normalize_miri_outcome_family(&original.miri)
+            == normalize_miri_outcome_family(&candidate.miri)
+        && (!original.kernel_confirmed || candidate.kernel_confirmed)
 }
 
 /// Snapshot of a single deterministic AST mutation pass for subsequence replay.
@@ -347,6 +411,33 @@ pub struct RecordedMutationStep {
     pub rng_before_step: DetRng,
 }
 
+/// Outcome of attempting to shrink a divergent candidate's mutator chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiriShrinkStatus {
+    /// A strictly shorter 1-minimal mutator chain reproducing the signature was found.
+    Minimized,
+    /// The full chain is already 1-minimal (every single-step deletion was rejected).
+    AlreadyOneMinimal,
+    /// Not attempted: the candidate has no mutators or did not diverge.
+    SkippedNotApplicable,
+    /// Not attempted: replaying the recorded mutation steps does not reproduce the
+    /// candidate's `fn_source` byte-for-byte (for example a hand-built candidate), so
+    /// no subsequence would be a faithful reduction of the reported program.
+    SkippedReplayMismatch,
+}
+
+impl MiriShrinkStatus {
+    /// Stable slug recorded in `finding.json` and `SUMMARY.md`.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Minimized => "minimized",
+            Self::AlreadyOneMinimal => "already_one_minimal",
+            Self::SkippedNotApplicable => "skipped_not_applicable",
+            Self::SkippedReplayMismatch => "skipped_replay_mismatch",
+        }
+    }
+}
+
 /// Result of shrinking a divergent [`GeneratedMiriCandidate`]'s mutator chain.
 #[derive(Debug, Clone)]
 pub struct MiriCandidateShrinkResult {
@@ -354,8 +445,18 @@ pub struct MiriCandidateShrinkResult {
     pub original_mutator_chain: Vec<String>,
     /// Minimized 1-minimal mutator sequence after shrinking.
     pub minimized_mutator_chain: Vec<String>,
-    /// Number of oracle/predicate evaluations performed during shrinking.
+    /// Number of shrinker predicate evaluations on proper subsequences of the original
+    /// chain (each one is a replay followed by a `rustc` check and, if that passes, an
+    /// oracle run). The full chain is never re-evaluated: its divergence is the original
+    /// report.
     pub shrink_evaluations: usize,
+    /// Number of oracle invocations (`eval_fn` calls) performed while shrinking.
+    pub oracle_evaluations: usize,
+    /// Number of replayed subsequences rejected by the `rustc` pre-check without
+    /// invoking the oracle.
+    pub compile_rejections: usize,
+    /// Whether shrinking ran and what it concluded.
+    pub status: MiriShrinkStatus,
     /// Minimized candidate with updated `applied_mutators`, `fn_source`, and `source`.
     pub minimized_candidate: GeneratedMiriCandidate,
     /// Oracle report corresponding to `minimized_candidate`.
@@ -493,6 +594,12 @@ fn find_mutator_by_name(name: &str) -> Option<&'static dyn MiriAstMutator> {
 
 /// Reconstruct the closed base seed AST and the per-pass [`RecordedMutationStep`] chain
 /// for `cand` against `seeds`.
+///
+/// For candidates produced by `generate_miri_batch` / `generate_miri_corpus_batch` this
+/// re-derives the generator's PRNG schedule exactly. For any other candidate the
+/// returned steps are a best-effort reconstruction from `applied_mutators`; callers
+/// must check [`candidate_replay_is_faithful`] before treating the steps as the
+/// candidate's real mutation history.
 pub fn extract_candidate_mutation_steps(
     cand: &GeneratedMiriCandidate,
     seeds: &[&str],
@@ -516,11 +623,9 @@ pub fn extract_candidate_mutation_steps(
         return None;
     }
 
-    let seed_src = if cand.seed_index < effective_seeds.len() {
-        effective_seeds[cand.seed_index]
-    } else {
-        effective_seeds.first().copied()?
-    };
+    // A candidate whose `seed_index` does not name a seed in `effective_seeds` cannot
+    // have been produced from these seeds; refuse rather than replaying a different seed.
+    let seed_src = effective_seeds.get(cand.seed_index).copied()?;
 
     let non_fault_seed_indices = collect_non_fault_seed_indices(&effective_seeds);
     let mut cand_rng = DetRng::new(cand.seed_u64);
@@ -686,6 +791,47 @@ pub fn replay_candidate_mutation_steps(
     }
 }
 
+/// Return `true` iff replaying the full recorded step chain `steps` from `base_parsed`
+/// reproduces `cand.fn_source` byte-for-byte (and the same `applied_mutators`).
+///
+/// Shrinking is only meaningful when this holds: it is the runtime counterpart of the
+/// `full_chain_replay_matches_generated_corpus_batch_identically` unit test, and it is
+/// what licenses treating the full chain as already known to diverge (its divergence
+/// is the original oracle report) without re-running the oracle on it.
+pub fn candidate_replay_is_faithful(
+    cand: &GeneratedMiriCandidate,
+    base_parsed: &File,
+    steps: &[RecordedMutationStep],
+) -> bool {
+    if steps.len() != cand.applied_mutators.len() {
+        return false;
+    }
+    let replayed = replay_candidate_mutation_steps(cand, base_parsed, steps);
+    replayed.applied_mutators == cand.applied_mutators && replayed.fn_source == cand.fn_source
+}
+
+fn unshrunk_result(
+    cand: &GeneratedMiriCandidate,
+    original_report: &ItemOracleReport,
+    status: MiriShrinkStatus,
+    shrink_evaluations: usize,
+    oracle_evaluations: usize,
+    compile_rejections: usize,
+) -> MiriCandidateShrinkResult {
+    MiriCandidateShrinkResult {
+        original_mutator_chain: cand.applied_mutators.clone(),
+        minimized_mutator_chain: cand.applied_mutators.clone(),
+        shrink_evaluations,
+        oracle_evaluations,
+        compile_rejections,
+        status,
+        minimized_candidate: cand.clone(),
+        minimized_report: original_report.clone(),
+        mir_neighborhood: None,
+        kernel_confirm_theorems: None,
+    }
+}
+
 /// Minimize a divergent [`GeneratedMiriCandidate`]'s mutator chain using a caller-supplied
 /// oracle evaluator `eval_fn` (allowing fast deterministic unit testing as well as live
 /// Miri + Anneal oracle execution).
@@ -697,90 +843,131 @@ pub fn minimize_miri_candidate_mutations_with<F>(
     cand: &GeneratedMiriCandidate,
     seeds: &[&str],
     original_report: &ItemOracleReport,
-    mut eval_fn: F,
+    eval_fn: F,
 ) -> MiriCandidateShrinkResult
 where
     F: FnMut(&GeneratedMiriCandidate) -> Option<ItemOracleReport>,
 {
-    let original_chain = cand.applied_mutators.clone();
-    if original_chain.is_empty()
+    let mut compile_counter = 0usize;
+    minimize_miri_candidate_mutations_with_compile_check(
+        cand,
+        seeds,
+        original_report,
+        |sub_cand| {
+            compile_counter += 1;
+            compile_rust_snippet(
+                &format!("shrink_{}_{}", sub_cand.fn_name, compile_counter),
+                &sub_cand.source,
+            )
+        },
+        eval_fn,
+    )
+}
+
+/// Core of [`minimize_miri_candidate_mutations_with`] with an injectable `rustc`
+/// pre-check `compile_fn` (so unit tests can exercise compile rejection without
+/// spawning `rustc`).
+///
+/// Shrinking runs [`shrink_mutation_chain_detailed`] over the candidate's recorded
+/// mutation steps with the predicate "the replayed subsequence compiles, the oracle
+/// returns a report, and [`discrepancy_signatures_match`] holds against
+/// `original_report`". The unmutated seed `[]` is evaluated like any other
+/// subsequence, so a seed that already diverges with the same signature shrinks to
+/// `[]`. Shrinking is skipped (status `SkippedReplayMismatch`) unless
+/// [`candidate_replay_is_faithful`] holds, because only then is the full chain known
+/// to reproduce `original_report` without re-running the oracle.
+pub fn minimize_miri_candidate_mutations_with_compile_check<C, F>(
+    cand: &GeneratedMiriCandidate,
+    seeds: &[&str],
+    original_report: &ItemOracleReport,
+    mut compile_fn: C,
+    mut eval_fn: F,
+) -> MiriCandidateShrinkResult
+where
+    C: FnMut(&GeneratedMiriCandidate) -> bool,
+    F: FnMut(&GeneratedMiriCandidate) -> Option<ItemOracleReport>,
+{
+    if cand.applied_mutators.is_empty()
         || !matches!(original_report.verdict, ComparisonVerdict::Diverge(_))
     {
-        return MiriCandidateShrinkResult {
-            original_mutator_chain: original_chain.clone(),
-            minimized_mutator_chain: original_chain,
-            shrink_evaluations: 0,
-            minimized_candidate: cand.clone(),
-            minimized_report: original_report.clone(),
-            mir_neighborhood: None,
-            kernel_confirm_theorems: None,
-        };
+        return unshrunk_result(
+            cand,
+            original_report,
+            MiriShrinkStatus::SkippedNotApplicable,
+            0,
+            0,
+            0,
+        );
     }
 
     let Some((base_parsed, steps)) = extract_candidate_mutation_steps(cand, seeds) else {
-        return MiriCandidateShrinkResult {
-            original_mutator_chain: original_chain.clone(),
-            minimized_mutator_chain: original_chain,
-            shrink_evaluations: 0,
-            minimized_candidate: cand.clone(),
-            minimized_report: original_report.clone(),
-            mir_neighborhood: None,
-            kernel_confirm_theorems: None,
-        };
+        return unshrunk_result(
+            cand,
+            original_report,
+            MiriShrinkStatus::SkippedReplayMismatch,
+            0,
+            0,
+            0,
+        );
     };
+    if !candidate_replay_is_faithful(cand, &base_parsed, &steps) {
+        return unshrunk_result(
+            cand,
+            original_report,
+            MiriShrinkStatus::SkippedReplayMismatch,
+            0,
+            0,
+            0,
+        );
+    }
 
     let full_len = steps.len();
-    let mut accepted_sub: Option<(Vec<String>, GeneratedMiriCandidate, ItemOracleReport)> = None;
-    let mut step_counter = 0usize;
+    let mut oracle_evaluations = 0usize;
+    let mut compile_rejections = 0usize;
+    // Last accepted reduction, keyed by the original pass indices it retains (mutator
+    // names alone are ambiguous when the same mutator appears twice in a chain).
+    let mut last_accepted: Option<(Vec<usize>, GeneratedMiriCandidate, ItemOracleReport)> =
+        None;
 
     let outcome = shrink_mutation_chain_detailed(&steps, |sub_steps| {
         if sub_steps.len() == full_len {
+            // The faithful full replay is byte-identical to `cand`, whose divergence is
+            // `original_report` itself.
             return true;
         }
-        step_counter += 1;
         let sub_cand = replay_candidate_mutation_steps(cand, &base_parsed, sub_steps);
-        let label = format!("shrink_{}_{}", cand.fn_name, step_counter);
-        if !compile_rust_snippet(&label, &sub_cand.source) {
+        if !compile_fn(&sub_cand) {
+            compile_rejections += 1;
             return false;
         }
+        oracle_evaluations += 1;
         let Some(rep) = eval_fn(&sub_cand) else {
             return false;
         };
-        if discrepancy_signatures_match(original_report, &rep) {
-            let names = sub_steps.iter().map(|s| s.mutator_name.clone()).collect();
-            accepted_sub = Some((names, sub_cand, rep));
-            true
-        } else {
-            false
+        if !discrepancy_signatures_match(original_report, &rep) {
+            return false;
         }
+        let kept: Vec<usize> = sub_steps.iter().map(|s| s.pass_index).collect();
+        last_accepted = Some((kept, sub_cand, rep));
+        true
     });
 
-    let minimized_chain: Vec<String> = outcome
-        .minimized_steps
-        .iter()
-        .map(|s| s.mutator_name.clone())
-        .collect();
+    // The initial full-chain predicate call is free (see above) and is not counted.
+    let shrink_evaluations = outcome.predicate_evaluations.saturating_sub(1);
+    let minimized_indices: Vec<usize> =
+        outcome.minimized_steps.iter().map(|s| s.pass_index).collect();
 
-    if minimized_chain.len() < original_chain.len() {
-        if let Some((accepted_names, min_cand, min_rep)) = accepted_sub
-            && accepted_names == minimized_chain
-        {
-            return MiriCandidateShrinkResult {
-                original_mutator_chain: original_chain,
-                minimized_mutator_chain: minimized_chain,
-                shrink_evaluations: outcome.predicate_evaluations,
-                minimized_candidate: min_cand,
-                minimized_report: min_rep,
-                mir_neighborhood: None,
-                kernel_confirm_theorems: None,
-            };
-        }
-        let min_cand = replay_candidate_mutation_steps(cand, &base_parsed, &outcome.minimized_steps);
-        let min_rep = eval_fn(&min_cand).unwrap_or_else(|| original_report.clone());
+    if minimized_indices.len() < full_len
+        && let Some((kept, min_cand, min_rep)) = last_accepted
+        && kept == minimized_indices
+    {
         return MiriCandidateShrinkResult {
-            original_mutator_chain: original_chain,
-            minimized_mutator_chain: minimized_chain,
-            shrink_evaluations: outcome.predicate_evaluations,
+            original_mutator_chain: cand.applied_mutators.clone(),
+            minimized_mutator_chain: min_cand.applied_mutators.clone(),
+            shrink_evaluations,
+            oracle_evaluations,
+            compile_rejections,
+            status: MiriShrinkStatus::Minimized,
             minimized_candidate: min_cand,
             minimized_report: min_rep,
             mir_neighborhood: None,
@@ -788,60 +975,45 @@ where
         };
     }
 
-    MiriCandidateShrinkResult {
-        original_mutator_chain: original_chain.clone(),
-        minimized_mutator_chain: original_chain,
-        shrink_evaluations: outcome.predicate_evaluations,
-        minimized_candidate: cand.clone(),
-        minimized_report: original_report.clone(),
-        mir_neighborhood: None,
-        kernel_confirm_theorems: None,
-    }
+    // Either no proper subsequence reproduced the signature (the full chain is
+    // 1-minimal), or (only possible with a nondeterministic oracle) the shrinker's
+    // final chain is not the last accepted reduction; never attach a report to a
+    // candidate it was not produced from.
+    unshrunk_result(
+        cand,
+        original_report,
+        MiriShrinkStatus::AlreadyOneMinimal,
+        shrink_evaluations,
+        oracle_evaluations,
+        compile_rejections,
+    )
 }
 
-/// Corpus seeds that currently diverge even with zero mutations (`--identity`).
-const KNOWN_DIVERGENT_CORPUS_SEEDS: [&str; 4] = [
-    "ub_transmute_invalid_bool_through_ptr",
-    "pass_ptr_offset_within_array",
-    "ub_ptr_offset_oob_read",
-    "ub_ptr_offset_oob_write",
-];
+/// Report and diagnostic artifacts from a live single-candidate oracle run.
+#[derive(Debug, Clone)]
+pub struct LiveCandidateEvaluation {
+    /// Oracle report for the candidate item.
+    pub report: ItemOracleReport,
+    /// Extracted `.anneal/generated/Mir/...` snippet for the candidate.
+    pub mir_neighborhood: String,
+    /// Extracted kernel confirmation theorem block from `MiriOracleConfirm.lean`.
+    pub kernel_confirm_theorems: String,
+}
 
-/// Minimize a divergent [`GeneratedMiriCandidate`]'s mutator chain against the live
-/// Miri + Anneal oracle pipeline (`run_difftest_oracle_pipeline`).
-pub fn minimize_miri_candidate_mutations(
+/// Run the live Miri + Anneal oracle pipeline (`run_difftest_oracle_pipeline`) on the
+/// single candidate `cand` in a fresh staging crate whose `src/lib.rs` is exactly
+/// `cand.source` (so reported positions are already in `repro.rs` coordinates).
+pub fn evaluate_candidate_live(
     cand: &GeneratedMiriCandidate,
-    seeds: &[&str],
-    original_report: &ItemOracleReport,
+    toolchain: &MiriToolchain,
     anneal_repo_root: Option<&Path>,
-) -> Result<MiriCandidateShrinkResult, String> {
-    let seed_is_known_divergent =
-        KNOWN_DIVERGENT_CORPUS_SEEDS.contains(&cand.seed_name.as_str());
-    if cand.applied_mutators.len() == 1 && !seed_is_known_divergent {
-        return Ok(MiriCandidateShrinkResult {
-            original_mutator_chain: cand.applied_mutators.clone(),
-            minimized_mutator_chain: cand.applied_mutators.clone(),
-            shrink_evaluations: 2,
-            minimized_candidate: cand.clone(),
-            minimized_report: original_report.clone(),
-            mir_neighborhood: None,
-            kernel_confirm_theorems: None,
-        });
-    }
-    let toolchain = MiriToolchain::resolve(None, None, None)?;
-    let mut latest_artifacts: Option<(Vec<String>, String, String)> = None;
-
-    let mut eval_live = |sub_cand: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
-        if sub_cand.applied_mutators.is_empty() && !seed_is_known_divergent {
-            return None;
-        }
-        let staging_dir = create_staging_dir("shrink").ok()?;
-        if fs::write(staging_dir.join("src/lib.rs"), &sub_cand.source).is_err() {
-            let _ = fs::remove_dir_all(&staging_dir);
-            return None;
-        }
+) -> Result<LiveCandidateEvaluation, String> {
+    let staging_dir = create_staging_dir("shrink")?;
+    let result = (|| {
+        fs::write(staging_dir.join("src/lib.rs"), &cand.source)
+            .map_err(|e| format!("failed to write staged src/lib.rs: {e}"))?;
         let specs = vec![OracleItemSpec::with_fuel(
-            sub_cand.fn_name.clone(),
+            cand.fn_name.clone(),
             MIRI_DIFFTEST_CANDIDATE_FUEL,
         )];
         let cfg = DifftestOracleConfig {
@@ -855,65 +1027,62 @@ pub fn minimize_miri_candidate_mutations(
             rustc_wrapper: None,
             toolchain: toolchain.clone(),
         };
-        let pipeline_res = run_difftest_oracle_pipeline(&cfg, &specs).ok();
-        let item_rep = pipeline_res.and_then(|mut rep| {
-            let item = rep.items.drain(..).next()?;
-            if discrepancy_signatures_match(original_report, &item) {
-                let confirm_src = rep
-                    .confirm_module_path
-                    .as_ref()
-                    .and_then(|p| fs::read_to_string(p).ok())
-                    .unwrap_or_default();
-                let mir_neigh =
-                    extract_mir_neighborhood(&staging_dir, &rep.crate_camel, &item.name);
-                let confirm_thms = extract_confirm_theorems(&confirm_src, &item.name);
-                latest_artifacts = Some((
-                    sub_cand.applied_mutators.clone(),
-                    mir_neigh,
-                    confirm_thms,
-                ));
-            }
-            Some(item)
-        });
-        let _ = fs::remove_dir_all(&staging_dir);
-        item_rep
+        let rep = run_difftest_oracle_pipeline(&cfg, &specs)?;
+        let report = rep
+            .items
+            .iter()
+            .find(|it| it.name == cand.fn_name)
+            .cloned()
+            .ok_or_else(|| format!("oracle pipeline returned no report for `{}`", cand.fn_name))?;
+        let confirm_src = rep
+            .confirm_module_path
+            .as_ref()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        let mir_neighborhood = extract_mir_neighborhood(&staging_dir, &rep.crate_camel, &report.name);
+        let kernel_confirm_theorems = extract_confirm_theorems(&confirm_src, &report.name);
+        Ok(LiveCandidateEvaluation {
+            report,
+            mir_neighborhood,
+            kernel_confirm_theorems,
+        })
+    })();
+    let _ = fs::remove_dir_all(&staging_dir);
+    result
+}
+
+/// Minimize a divergent [`GeneratedMiriCandidate`]'s mutator chain against the live
+/// Miri + Anneal oracle pipeline (`run_difftest_oracle_pipeline`).
+///
+/// Every subsequence (including the unmutated seed `[]`) is judged by a real oracle run
+/// ([`evaluate_candidate_live`]) in a fresh single-candidate staging crate; there are no
+/// hard-coded shortcuts. The captured MIR neighborhood and kernel confirmation theorems
+/// of the minimized candidate are taken from the oracle run that accepted it.
+pub fn minimize_miri_candidate_mutations(
+    cand: &GeneratedMiriCandidate,
+    seeds: &[&str],
+    original_report: &ItemOracleReport,
+    anneal_repo_root: Option<&Path>,
+) -> Result<MiriCandidateShrinkResult, String> {
+    let toolchain = MiriToolchain::resolve(None, None, None)?;
+    // Artifacts of signature-matching oracle runs, keyed by the evaluated `fn_source`.
+    let mut artifacts_by_source: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    let eval_live = |sub_cand: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
+        let live = evaluate_candidate_live(sub_cand, &toolchain, anneal_repo_root).ok()?;
+        if discrepancy_signatures_match(original_report, &live.report) {
+            artifacts_by_source.insert(
+                sub_cand.fn_source.clone(),
+                (live.mir_neighborhood, live.kernel_confirm_theorems),
+            );
+        }
+        Some(live.report)
     };
 
-    // Fast 1-step prefix probe for multi-mutator candidates on non-divergent corpus seeds:
-    // in `generate_miri_batch`, pass 0 (`steps[0]`) is the primary fault mutator. If `[steps[0]]`
-    // alone compiles and reproduces the exact normalized discrepancy signature while `[]` does
-    // not diverge, `[steps[0]]` is immediately 1-minimal after a single live oracle check.
-    if cand.applied_mutators.len() >= 2
-        && !seed_is_known_divergent
-        && let Some((base_parsed, steps)) = extract_candidate_mutation_steps(cand, seeds)
-        && !steps.is_empty()
-    {
-        let first_only = replay_candidate_mutation_steps(cand, &base_parsed, &steps[..1]);
-        if compile_rust_snippet(&format!("shrink_first_{}", cand.fn_name), &first_only.source)
-            && let Some(rep) = eval_live(&first_only)
-            && discrepancy_signatures_match(original_report, &rep)
-        {
-            let min_chain = vec![steps[0].mutator_name.clone()];
-            let (mir_neighborhood, kernel_confirm_theorems) = latest_artifacts
-                .take()
-                .map(|(_, m, k)| (Some(m), Some(k)))
-                .unwrap_or((None, None));
-            return Ok(MiriCandidateShrinkResult {
-                original_mutator_chain: cand.applied_mutators.clone(),
-                minimized_mutator_chain: min_chain,
-                shrink_evaluations: 3,
-                minimized_candidate: first_only,
-                minimized_report: rep,
-                mir_neighborhood,
-                kernel_confirm_theorems,
-            });
-        }
-    }
-
     let mut res = minimize_miri_candidate_mutations_with(cand, seeds, original_report, eval_live);
-
-    if let Some((art_chain, mir_neigh, confirm_thms)) = latest_artifacts
-        && art_chain == res.minimized_mutator_chain
+    if res.status == MiriShrinkStatus::Minimized
+        && let Some((mir_neigh, confirm_thms)) =
+            artifacts_by_source.remove(&res.minimized_candidate.fn_source)
     {
         res.mir_neighborhood = Some(mir_neigh);
         res.kernel_confirm_theorems = Some(confirm_thms);
@@ -1072,6 +1241,7 @@ fn write_finding_bundle_to_dir(
          - **Original mutator chain**: `{}`\n\
          - **Minimized mutator chain**: `{}`\n\
          - **Shrink evaluations**: `{}`\n\
+         - **Shrink status**: `{}`\n\
          - **Divergence class**: `{}`\n\
          - **Miri outcome**: `{}` (repro position: `{}`)\n\
          - **Anneal outcome**: `{}` (`{}` at `{}`)\n\
@@ -1104,6 +1274,7 @@ fn write_finding_bundle_to_dir(
             finding.minimized_mutator_chain.join(", ")
         },
         finding.shrink_evaluations,
+        finding.shrink_status,
         finding.divergence_class,
         finding.miri_outcome_tag,
         finding.miri_pos.as_deref().unwrap_or("none"),
@@ -1334,24 +1505,30 @@ pub fn evaluate_miri_batches(
                 }
 
                 if let Some((cand, batch_start_line)) = cand_by_name.get(&item_rep.name) {
-                    let shrink_opt = if !cand.applied_mutators.is_empty() {
-                        let corpus_seeds = load_miri_diff_corpus_seeds();
-                        let seed_refs: Vec<&str> =
-                            corpus_seeds.iter().map(|s| s.fn_source.as_str()).collect();
-                        minimize_miri_candidate_mutations(
-                            cand,
-                            &seed_refs,
-                            item_rep,
-                            anneal_repo_root,
-                        )
-                        .ok()
-                    } else {
-                        None
+                    let shrink_res: Option<Result<MiriCandidateShrinkResult, String>> =
+                        if !cand.applied_mutators.is_empty() {
+                            let corpus_seeds = load_miri_diff_corpus_seeds();
+                            let seed_refs: Vec<&str> =
+                                corpus_seeds.iter().map(|s| s.fn_source.as_str()).collect();
+                            Some(minimize_miri_candidate_mutations(
+                                cand,
+                                &seed_refs,
+                                item_rep,
+                                anneal_repo_root,
+                            ))
+                        } else {
+                            None
+                        };
+                    let shrink_status = match &shrink_res {
+                        None => MiriShrinkStatus::SkippedNotApplicable.slug().to_string(),
+                        Some(Ok(sr)) => sr.status.slug().to_string(),
+                        Some(Err(e)) => format!("skipped_shrinker_error: {e}"),
                     };
+                    let shrink_opt = shrink_res.and_then(Result::ok);
 
-                    let shrunk_reduced = shrink_opt.as_ref().is_some_and(|sr| {
-                        sr.minimized_mutator_chain.len() < sr.original_mutator_chain.len()
-                    });
+                    let shrunk_reduced = shrink_opt
+                        .as_ref()
+                        .is_some_and(|sr| sr.status == MiriShrinkStatus::Minimized);
                     let eff_item_rep = shrink_opt
                         .as_ref()
                         .filter(|_| shrunk_reduced)
@@ -1433,26 +1610,32 @@ pub fn evaluate_miri_batches(
                         .anneal
                         .to_lean_mir_diff_tag()
                         .unwrap_or_else(|| "none".to_string());
-                    let mir_neighborhood = shrink_opt
-                        .as_ref()
-                        .and_then(|sr| sr.mir_neighborhood.clone())
-                        .unwrap_or_else(|| {
+                    // MIR neighborhood and kernel confirmation theorems must describe the
+                    // program in `repro.rs`: take them from the oracle run that accepted the
+                    // minimized candidate, never from the original batch item.
+                    let (mir_neighborhood, kernel_confirm_theorems) = match &shrink_opt {
+                        Some(sr) if shrunk_reduced => (
+                            sr.mir_neighborhood.clone().unwrap_or_else(|| {
+                                "(MIR neighborhood not captured for the minimized candidate)"
+                                    .to_string()
+                            }),
+                            sr.kernel_confirm_theorems.clone().unwrap_or_default(),
+                        ),
+                        _ => (
                             extract_mir_neighborhood(
                                 &staging_dir,
                                 &oracle_report.crate_camel,
                                 &item_rep.name,
-                            )
-                        });
-                    let kernel_confirm_theorems = shrink_opt
-                        .as_ref()
-                        .and_then(|sr| sr.kernel_confirm_theorems.clone())
-                        .unwrap_or_else(|| extract_confirm_theorems(&confirm_src, &item_rep.name));
+                            ),
+                            extract_confirm_theorems(&confirm_src, &item_rep.name),
+                        ),
+                    };
 
                     let original_mutator_chain = cand.applied_mutators.clone();
-                    let minimized_mutator_chain = shrink_opt
-                        .as_ref()
-                        .map(|sr| sr.minimized_mutator_chain.clone())
-                        .unwrap_or_else(|| cand.applied_mutators.clone());
+                    let minimized_mutator_chain = match &shrink_opt {
+                        Some(sr) if shrunk_reduced => sr.minimized_mutator_chain.clone(),
+                        _ => cand.applied_mutators.clone(),
+                    };
                     let shrink_evaluations = shrink_opt
                         .as_ref()
                         .map(|sr| sr.shrink_evaluations)
@@ -1467,6 +1650,7 @@ pub fn evaluate_miri_batches(
                         original_mutator_chain,
                         minimized_mutator_chain,
                         shrink_evaluations,
+                        shrink_status,
                         divergence_class: class_slug,
                         miri_outcome_tag,
                         miri_excerpt,
@@ -1657,6 +1841,7 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
          {inner}\"original_mutator_chain\": [{orig_mutators_json}],\n\
          {inner}\"minimized_mutator_chain\": [{min_mutators_json}],\n\
          {inner}\"shrink_evaluations\": {},\n\
+         {inner}\"shrink_status\": {},\n\
          {inner}\"divergence_class\": {},\n\
          {inner}\"miri_outcome\": {},\n\
          {inner}\"miri_excerpt\": {},\n\
@@ -1676,6 +1861,7 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
         json_escape(&finding.fn_name),
         json_escape(&finding.seed_name),
         finding.shrink_evaluations,
+        json_escape(&finding.shrink_status),
         json_escape(&finding.divergence_class),
         json_escape(&finding.miri_outcome_tag),
         json_escape(&finding.miri_excerpt),
@@ -1846,189 +2032,527 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::mutators_miri::generate_miri_corpus_batch;
 
+    fn corpus_seed_sources() -> Vec<String> {
+        load_miri_diff_corpus_seeds()
+            .into_iter()
+            .map(|s| s.fn_source)
+            .collect()
+    }
+
+    fn lib_pos(line: u32, col: u32) -> SourcePos {
+        SourcePos {
+            file: "src/lib.rs".to_string(),
+            line,
+            col,
+        }
+    }
+
+    fn lib_span(line: u32) -> SourceSpan {
+        SourceSpan {
+            file: "src/lib.rs".to_string(),
+            start_line: line,
+            start_col: 9,
+            end_line: line,
+            end_col: 42,
+        }
+    }
+
+    /// `missed_ub` report: Miri raises UB `miri_msg` at `line`, Anneal returns `anneal`.
+    fn missed_ub_report(
+        name: &str,
+        line: u32,
+        miri_msg: &str,
+        anneal: AnnealOutcome,
+        kernel_confirmed: bool,
+    ) -> ItemOracleReport {
+        ItemOracleReport {
+            name: name.to_string(),
+            fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+            miri: MiriOutcome::Ub {
+                pos: Some(lib_pos(line, 14)),
+                message: miri_msg.to_string(),
+            },
+            verdict: ComparisonVerdict::Diverge(DivergenceKind::MissedUb {
+                miri_pos: Some(lib_pos(line, 14)),
+                miri_msg: miri_msg.to_string(),
+                anneal: anneal.summary_tag(),
+            }),
+            anneal,
+            kernel_confirmed,
+        }
+    }
+
+    fn agree_report(name: &str) -> ItemOracleReport {
+        ItemOracleReport {
+            name: name.to_string(),
+            fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+            miri: MiriOutcome::PassScalar {
+                bits: 10,
+                size_bytes: 4,
+            },
+            anneal: AnnealOutcome::PassScalar {
+                bits: 10,
+                size_bytes: 4,
+            },
+            verdict: ComparisonVerdict::Agree,
+            kernel_confirmed: true,
+        }
+    }
+
+    /// Replays every subset of `cand`'s recorded steps and maps each replayed `fn_source`
+    /// to its subset bitmask (bit `i` = original pass `i` kept). Returns `None` if two
+    /// subsets replay to the same source (the mock oracle could not tell them apart).
+    fn subset_source_map(
+        cand: &GeneratedMiriCandidate,
+        seed_refs: &[&str],
+    ) -> Option<BTreeMap<String, u32>> {
+        let (base, steps) = extract_candidate_mutation_steps(cand, seed_refs)?;
+        let mut map = BTreeMap::new();
+        for mask in 0u32..(1u32 << steps.len()) {
+            let sub: Vec<RecordedMutationStep> = steps
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (mask >> i) & 1 == 1)
+                .map(|(_, s)| s.clone())
+                .collect();
+            let src = replay_candidate_mutation_steps(cand, &base, &sub).fn_source;
+            if map.insert(src, mask).is_some() {
+                return None;
+            }
+        }
+        Some(map)
+    }
+
+    /// First corpus candidate with exactly `n` mutators whose `2^n` subset replays are
+    /// pairwise distinct.
+    fn find_candidate_with_distinct_subsets(
+        n: usize,
+        seed_refs: &[&str],
+    ) -> (GeneratedMiriCandidate, BTreeMap<String, u32>) {
+        for batch_seed in 1u64..64 {
+            for cand in generate_miri_corpus_batch(24, 0x5EED_0000 + batch_seed, 0) {
+                if cand.applied_mutators.len() != n {
+                    continue;
+                }
+                if let Some(map) = subset_source_map(&cand, seed_refs) {
+                    return (cand, map);
+                }
+            }
+        }
+        panic!("no {n}-mutator corpus candidate with pairwise-distinct subset replays");
+    }
+
     #[test]
     fn full_chain_replay_matches_generated_corpus_batch_identically() {
-        let seeds = load_miri_diff_corpus_seeds();
-        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
-        let batch = generate_miri_corpus_batch(16, 0xCAFE_BABE_1234_5678, 0);
-        assert_eq!(batch.len(), 16);
-
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
         let mut saw_multi_pass = false;
-        for cand in &batch {
-            if cand.applied_mutators.len() >= 2 {
-                saw_multi_pass = true;
+        let mut checked = 0usize;
+        for (batch_idx, batch_seed) in [0xCAFE_BABE_1234_5678u64, 0x5EED_0001, 0x0BAD_F00D]
+            .into_iter()
+            .enumerate()
+        {
+            let batch = generate_miri_corpus_batch(16, batch_seed, batch_idx);
+            assert_eq!(batch.len(), 16);
+            for cand in &batch {
+                if cand.applied_mutators.len() >= 2 {
+                    saw_multi_pass = true;
+                }
+                let (base_parsed, steps) = extract_candidate_mutation_steps(cand, &seed_refs)
+                    .expect("extract mutation steps for corpus candidate");
+                assert_eq!(steps.len(), cand.applied_mutators.len());
+                let replayed = replay_candidate_mutation_steps(cand, &base_parsed, &steps);
+                assert_eq!(
+                    replayed.applied_mutators, cand.applied_mutators,
+                    "replayed mutator chain must match candidate {}",
+                    cand.fn_name
+                );
+                assert_eq!(
+                    replayed.fn_source, cand.fn_source,
+                    "full-chain AST replay must reproduce fn_source byte-for-byte for {}",
+                    cand.fn_name
+                );
+                assert_eq!(
+                    replayed.source, cand.source,
+                    "full-chain AST replay must reproduce standalone source byte-for-byte for {}",
+                    cand.fn_name
+                );
+                assert!(candidate_replay_is_faithful(cand, &base_parsed, &steps));
+                checked += 1;
             }
-            let (base_parsed, steps) = extract_candidate_mutation_steps(cand, &seed_refs)
-                .expect("extract mutation steps for corpus candidate");
-            assert_eq!(steps.len(), cand.applied_mutators.len());
-            let replayed = replay_candidate_mutation_steps(cand, &base_parsed, &steps);
-            assert_eq!(
-                replayed.applied_mutators, cand.applied_mutators,
-                "replayed mutator chain must match candidate {}",
-                cand.fn_name
+        }
+        assert_eq!(checked, 48);
+        assert!(saw_multi_pass, "expected multi-mutator candidates across 48 candidates");
+    }
+
+    #[test]
+    fn replay_fidelity_rejects_tampered_and_hand_built_candidates_without_oracle_calls() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let batch = generate_miri_corpus_batch(16, 0x5EED_0001, 0);
+        let cand = batch
+            .iter()
+            .find(|c| !c.applied_mutators.is_empty())
+            .expect("mutated candidate")
+            .clone();
+        let report = missed_ub_report(
+            &cand.fn_name,
+            40,
+            "constructing invalid value: encountered 0x02, but expected a boolean",
+            AnnealOutcome::PassScalar {
+                bits: 1,
+                size_bytes: 4,
+            },
+            true,
+        );
+
+        // 1. Tampered source: the recorded steps no longer describe the program.
+        let mut tampered = cand.clone();
+        tampered.fn_source.push_str("\n// tampered\n");
+        let (base, steps) =
+            extract_candidate_mutation_steps(&tampered, &seed_refs).expect("extract steps");
+        assert!(!candidate_replay_is_faithful(&tampered, &base, &steps));
+
+        // 2. Hand-built candidate (as in the integration suite's broken candidate).
+        let broken_fn = "pub fn broken_cand__b0_c2() -> u32 {\n    7u32\n}\n";
+        let hand_built = GeneratedMiriCandidate {
+            id: 2,
+            seed_index: 0,
+            seed_name: "pass_integer_arith_basic".to_string(),
+            fn_name: "broken_cand__b0_c2".to_string(),
+            seed_u64: 0x9999,
+            applied_mutators: vec!["ArithmeticCastMutator".to_string()],
+            tracked_locals: Vec::new(),
+            fn_source: broken_fn.to_string(),
+            source: build_standalone_candidate_source(broken_fn),
+        };
+
+        // 3. Out-of-range seed index: refuse instead of replaying another seed.
+        let mut bad_seed = cand.clone();
+        bad_seed.seed_index = seed_refs.len() + 5;
+        assert!(extract_candidate_mutation_steps(&bad_seed, &seed_refs).is_none());
+
+        for victim in [&tampered, &hand_built, &bad_seed] {
+            let res = minimize_miri_candidate_mutations_with_compile_check(
+                victim,
+                &seed_refs,
+                &report,
+                |_| panic!("compile check must not run for an unfaithful replay"),
+                |_| panic!("oracle must not run for an unfaithful replay"),
             );
+            assert_eq!(res.status, MiriShrinkStatus::SkippedReplayMismatch);
+            assert_eq!(res.minimized_mutator_chain, victim.applied_mutators);
+            assert_eq!(res.minimized_candidate, *victim);
             assert_eq!(
-                replayed.fn_source, cand.fn_source,
-                "full-chain AST replay must reproduce fn_source byte-for-byte for {}",
-                cand.fn_name
-            );
-            assert_eq!(
-                replayed.source, cand.source,
-                "full-chain AST replay must reproduce standalone source byte-for-byte for {}",
-                cand.fn_name
+                (res.shrink_evaluations, res.oracle_evaluations, res.compile_rejections),
+                (0, 0, 0)
             );
         }
+    }
+
+    #[test]
+    fn signature_match_is_span_and_digit_insensitive_but_class_tag_and_family_sensitive() {
+        let scalar = AnnealOutcome::PassScalar {
+            bits: 1,
+            size_bytes: 4,
+        };
+        let original = missed_ub_report(
+            "f",
+            84,
+            "constructing invalid value at alloc1234+0x8: encountered 0x02, but expected a boolean",
+            scalar.clone(),
+            true,
+        );
+        // Same divergence after an earlier statement was deleted: different line,
+        // allocation id, offset, byte value, and returned scalar bits.
+        let shifted = missed_ub_report(
+            "f",
+            52,
+            "constructing invalid value at alloc77+0x4: encountered 0x03, but expected a boolean",
+            AnnealOutcome::PassScalar {
+                bits: 99,
+                size_bytes: 4,
+            },
+            true,
+        );
+        assert!(discrepancy_signatures_match(&original, &shifted));
+
+        // Bug slippage: same class and Anneal tag, different UB kind.
+        let slipped = missed_ub_report(
+            "f",
+            52,
+            "memory access failed: alloc77 has been freed, so this pointer is dangling",
+            scalar.clone(),
+            true,
+        );
+        assert!(!discrepancy_signatures_match(&original, &slipped));
+
+        // Same class, different normalized Anneal tag (`MirDiffTag.panic`).
+        let tag_changed = missed_ub_report(
+            "f",
+            52,
+            "constructing invalid value at alloc77+0x4: encountered 0x03, but expected a boolean",
+            AnnealOutcome::Panic {
+                span: Some(lib_span(52)),
+            },
+            true,
+        );
+        assert!(!discrepancy_signatures_match(&original, &tag_changed));
+
+        // Not kernel-confirmed while the original was.
+        let mut unconfirmed = shifted.clone();
+        unconfirmed.kernel_confirmed = false;
+        assert!(!discrepancy_signatures_match(&original, &unconfirmed));
+
+        // Different divergence class.
+        let mut class_changed = shifted.clone();
+        class_changed.verdict = ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch {
+            miri_pos: Some(lib_pos(52, 14)),
+            miri_msg: "x".to_string(),
+            anneal_span: Some(lib_span(53)),
+        });
+        assert!(!discrepancy_signatures_match(&original, &class_changed));
+
+        // Agreement never matches a divergence signature.
+        assert!(!discrepancy_signatures_match(&original, &agree_report("f")));
+
+        assert_eq!(
+            normalize_diagnostic_message("  panicked at src/lib.rs:12:5:  attempt to divide by zero "),
+            "panicked at src/lib.rs:N:N: attempt to divide by zero"
+        );
+        assert_eq!(normalize_diagnostic_message("encountered 0xFF_FF"), "encountered 0xN");
+    }
+
+    #[test]
+    fn shrinks_3_mutator_chain_rejecting_compile_failures_tag_changes_and_bug_slippage() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let (cand3, subsets) = find_candidate_with_distinct_subsets(3, &seed_refs);
+        let names = cand3.applied_mutators.clone();
+        let bool_ub = |b: u32| {
+            format!("constructing invalid value: encountered 0x0{b}, but expected a boolean")
+        };
+        let scalar = |bits: u128| AnnealOutcome::PassScalar {
+            bits,
+            size_bytes: 4,
+        };
+        let original = missed_ub_report(&cand3.fn_name, 88, &bool_ub(2), scalar(1), true);
+
+        // Subset semantics (bit i = original pass i kept; pass 0 is the fault mutator):
+        //   {0}       -> does not compile (rejected before the oracle),
+        //   {0, 1}    -> same class, but Anneal panics (normalized tag changes),
+        //   {0, 2}    -> same signature, shifted lines / different digits (accepted),
+        //   no pass 0 -> different UB kind (bug slippage), or `[]` agrees.
+        let compile_calls = RefCell::new(Vec::<u32>::new());
+        let oracle_calls = RefCell::new(Vec::<u32>::new());
+        let res = minimize_miri_candidate_mutations_with_compile_check(
+            &cand3,
+            &seed_refs,
+            &original,
+            |sub| {
+                let mask = subsets[&sub.fn_source];
+                compile_calls.borrow_mut().push(mask);
+                mask != 0b001
+            },
+            |sub| {
+                let mask = subsets[&sub.fn_source];
+                assert_ne!(mask, 0b001, "non-compiling subsequence reached the oracle");
+                assert_ne!(mask, 0b111, "the full chain must never be re-evaluated");
+                oracle_calls.borrow_mut().push(mask);
+                let name = sub.fn_name.as_str();
+                Some(match mask {
+                    0b000 => agree_report(name),
+                    0b011 => missed_ub_report(
+                        name,
+                        60,
+                        &bool_ub(2),
+                        AnnealOutcome::Panic {
+                            span: Some(lib_span(61)),
+                        },
+                        true,
+                    ),
+                    0b101 => missed_ub_report(name, 52, &bool_ub(3), scalar(7), true),
+                    _ => missed_ub_report(
+                        name,
+                        44,
+                        "memory access failed: alloc9 has been freed, so this pointer is dangling",
+                        scalar(1),
+                        true,
+                    ),
+                })
+            },
+        );
+
+        assert_eq!(res.status, MiriShrinkStatus::Minimized);
+        assert_eq!(res.original_mutator_chain, names);
+        assert_eq!(res.minimized_mutator_chain, vec![names[0].clone(), names[2].clone()]);
+        assert_eq!(subsets[&res.minimized_candidate.fn_source], 0b101);
+        assert_eq!(res.minimized_candidate.applied_mutators, res.minimized_mutator_chain);
+        assert_eq!(res.minimized_report.miri, MiriOutcome::Ub {
+            pos: Some(lib_pos(52, 14)),
+            message: bool_ub(3),
+        });
+        let compile_calls = compile_calls.into_inner();
+        let oracle_calls = oracle_calls.into_inner();
+        assert!(compile_calls.contains(&0b001), "{{0}} must be compile-checked");
+        assert_eq!(res.compile_rejections, compile_calls.iter().filter(|&&m| m == 0b001).count());
+        assert_eq!(res.oracle_evaluations, oracle_calls.len());
+        assert_eq!(res.shrink_evaluations, compile_calls.len());
+        assert_eq!(res.shrink_evaluations, res.oracle_evaluations + res.compile_rejections);
+        assert!(oracle_calls.contains(&0b000), "the unmutated seed `[]` must be evaluated");
+        // 1-minimality of {0, 2}: both single deletions were judged and rejected.
+        assert!(oracle_calls.contains(&0b100), "{{2}} must be evaluated and rejected");
+        assert!(compile_calls.contains(&0b001), "{{0}} must be rejected by rustc");
         assert!(
-            saw_multi_pass,
-            "expected at least one multi-mutator candidate in 16-item batch"
+            res.minimized_candidate.source.len() < cand3.source.len(),
+            "minimized candidate source must be shorter than the 3-mutator source"
         );
     }
 
     #[test]
-    fn minimize_miri_candidate_mutations_with_shrinks_3_mutator_chain_and_tolerates_line_shifts() {
-        let seeds = load_miri_diff_corpus_seeds();
-        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
-        let batch = generate_miri_corpus_batch(24, 0x5EED_0001, 0);
-        let cand3 = batch
-            .into_iter()
-            .find(|c| c.applied_mutators.len() == 3)
-            .expect("find 3-mutator candidate in batch");
-
-        let fault_mutator = cand3.applied_mutators[0].clone();
-        let orig_report = ItemOracleReport {
-            name: cand3.fn_name.clone(),
-            fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
-            miri: MiriOutcome::Ub {
-                pos: Some(SourcePos {
-                    file: "src/lib.rs".to_string(),
-                    line: 84,
-                    col: 17,
-                }),
-                message: "out-of-bounds pointer arithmetic".to_string(),
+    fn unmutated_seed_with_same_signature_shrinks_to_empty_chain_after_one_oracle_run() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let (cand, subsets) = find_candidate_with_distinct_subsets(2, &seed_refs);
+        let original = missed_ub_report(
+            &cand.fn_name,
+            70,
+            "out-of-bounds pointer arithmetic: alloc5 has size 16, so pointer to 20 bytes starting at offset 0 is out-of-bounds",
+            AnnealOutcome::PassUnit,
+            true,
+        );
+        let res = minimize_miri_candidate_mutations_with_compile_check(
+            &cand,
+            &seed_refs,
+            &original,
+            |_| true,
+            |sub| {
+                assert_eq!(subsets[&sub.fn_source], 0, "only `[]` should be evaluated");
+                Some(missed_ub_report(
+                    &sub.fn_name,
+                    31,
+                    "out-of-bounds pointer arithmetic: alloc2 has size 16, so pointer to 24 bytes starting at offset 0 is out-of-bounds",
+                    AnnealOutcome::PassUnit,
+                    true,
+                ))
             },
-            anneal: AnnealOutcome::Ub {
-                span: Some(SourceSpan {
-                    file: "src/lib.rs".to_string(),
-                    start_line: 88,
-                    start_col: 9,
-                    end_line: 88,
-                    end_col: 42,
-                }),
+        );
+        assert_eq!(res.status, MiriShrinkStatus::Minimized);
+        assert!(res.minimized_mutator_chain.is_empty());
+        assert!(res.minimized_candidate.applied_mutators.is_empty());
+        assert_eq!(subsets[&res.minimized_candidate.fn_source], 0);
+        assert_eq!(
+            (res.shrink_evaluations, res.oracle_evaluations, res.compile_rejections),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn single_mutator_chain_is_judged_by_a_real_evaluation_not_assumed_minimal() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let (cand, _) = find_candidate_with_distinct_subsets(1, &seed_refs);
+        let original = missed_ub_report(
+            &cand.fn_name,
+            70,
+            "constructing invalid value: encountered 0x02, but expected a boolean",
+            AnnealOutcome::PassScalar {
+                bits: 2,
+                size_bytes: 1,
             },
-            verdict: ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch {
-                miri_pos: Some(SourcePos {
-                    file: "src/lib.rs".to_string(),
-                    line: 84,
-                    col: 17,
-                }),
-                miri_msg: "out-of-bounds pointer arithmetic".to_string(),
-                anneal_span: Some(SourceSpan {
-                    file: "src/lib.rs".to_string(),
-                    start_line: 88,
-                    start_col: 9,
-                    end_line: 88,
-                    end_col: 42,
-                }),
-            }),
-            kernel_confirmed: true,
-        };
+            true,
+        );
+        let mut oracle_calls = 0usize;
+        let res = minimize_miri_candidate_mutations_with_compile_check(
+            &cand,
+            &seed_refs,
+            &original,
+            |_| true,
+            |sub| {
+                oracle_calls += 1;
+                Some(agree_report(&sub.fn_name))
+            },
+        );
+        assert_eq!(oracle_calls, 1);
+        assert_eq!(res.status, MiriShrinkStatus::AlreadyOneMinimal);
+        assert_eq!(res.minimized_mutator_chain, cand.applied_mutators);
+        assert_eq!(res.minimized_candidate, cand);
+        assert_eq!(res.minimized_report, original);
+        assert_eq!(
+            (res.shrink_evaluations, res.oracle_evaluations, res.compile_rejections),
+            (1, 1, 0)
+        );
 
-        let shrink_res =
-            minimize_miri_candidate_mutations_with(&cand3, &seed_refs, &orig_report, |sub_cand| {
-                // Unmutated seed `[]` agrees.
-                if sub_cand.applied_mutators.is_empty() {
-                    return Some(ItemOracleReport {
-                        name: sub_cand.fn_name.clone(),
-                        fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
-                        miri: MiriOutcome::PassScalar {
-                            bits: 10,
-                            size_bytes: 4,
-                        },
-                        anneal: AnnealOutcome::PassScalar {
-                            bits: 10,
-                            size_bytes: 4,
-                        },
-                        verdict: ComparisonVerdict::Agree,
-                        kernel_confirmed: true,
-                    });
-                }
-                // Subsequences missing the fault mutator trigger a different divergence class
-                // (`missed_ub` with `MirDiffTag.normalScalar`) and must be rejected.
-                if sub_cand.applied_mutators.as_slice() != [fault_mutator.as_str()] {
-                    return Some(ItemOracleReport {
-                        name: sub_cand.fn_name.clone(),
-                        fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
-                        miri: MiriOutcome::Ub {
-                            pos: Some(SourcePos {
-                                file: "src/lib.rs".to_string(),
-                                line: 60,
-                                col: 5,
-                            }),
-                            message: "different ub".to_string(),
-                        },
-                        anneal: AnnealOutcome::PassScalar {
-                            bits: 99,
-                            size_bytes: 4,
-                        },
-                        verdict: ComparisonVerdict::Diverge(DivergenceKind::MissedUb {
-                            miri_pos: None,
-                            miri_msg: "different ub".to_string(),
-                            anneal: "pass:scalar:99:4".to_string(),
-                        }),
-                        kernel_confirmed: true,
-                    });
-                }
-                // The 1-minimal subsequence `[fault_mutator]` reproduces the exact
-                // `ub_location_mismatch` + `MirDiffTag.ub` signature, even though its
-                // statement line numbers shifted from 84/88 to 52/56!
-                Some(ItemOracleReport {
-                    name: sub_cand.fn_name.clone(),
-                    fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
-                    miri: MiriOutcome::Ub {
-                        pos: Some(SourcePos {
-                            file: "src/lib.rs".to_string(),
-                            line: 52,
-                            col: 17,
-                        }),
-                        message: "out-of-bounds pointer arithmetic".to_string(),
-                    },
-                    anneal: AnnealOutcome::Ub {
-                        span: Some(SourceSpan {
-                            file: "src/lib.rs".to_string(),
-                            start_line: 56,
-                            start_col: 9,
-                            end_line: 56,
-                            end_col: 42,
-                        }),
-                    },
-                    verdict: ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch {
-                        miri_pos: Some(SourcePos {
-                            file: "src/lib.rs".to_string(),
-                            line: 52,
-                            col: 17,
-                        }),
-                        miri_msg: "out-of-bounds pointer arithmetic".to_string(),
-                        anneal_span: Some(SourceSpan {
-                            file: "src/lib.rs".to_string(),
-                            start_line: 56,
-                            start_col: 9,
-                            end_line: 56,
-                            end_col: 42,
-                        }),
-                    }),
-                    kernel_confirmed: true,
-                })
-            });
+        // Identity candidates and non-divergent reports are never shrunk.
+        let mut identity = cand.clone();
+        identity.applied_mutators.clear();
+        for (c, r) in [(&identity, &original), (&cand, &agree_report(&cand.fn_name))] {
+            let res = minimize_miri_candidate_mutations_with_compile_check(
+                c,
+                &seed_refs,
+                r,
+                |_| panic!("no compile check expected"),
+                |_| panic!("no oracle run expected"),
+            );
+            assert_eq!(res.status, MiriShrinkStatus::SkippedNotApplicable);
+            assert_eq!(res.shrink_evaluations, 0);
+        }
+    }
 
-        assert_eq!(shrink_res.original_mutator_chain.len(), 3);
-        assert_eq!(shrink_res.minimized_mutator_chain, vec![fault_mutator]);
-        assert!(shrink_res.shrink_evaluations >= 2);
+    /// Exercises the live single-candidate oracle plumbing used by the shrinker
+    /// (staging crate, `run_difftest_oracle_pipeline`, item lookup, artifact
+    /// extraction) and checks that live shrinking reports honest evaluation counts.
+    #[test]
+    fn live_single_candidate_oracle_run_and_honest_live_shrink_counts() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let (cand, _) = find_candidate_with_distinct_subsets(1, &seed_refs);
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repository root")
+            .to_path_buf();
+        let toolchain = MiriToolchain::resolve(None, None, None).expect("resolve Miri toolchain");
+
+        let live = evaluate_candidate_live(&cand, &toolchain, Some(&repo_root))
+            .expect("live oracle run on a corpus candidate");
+        assert_eq!(live.report.name, cand.fn_name);
         assert!(
-            shrink_res.minimized_candidate.source.len() < cand3.source.len(),
-            "1-minimal candidate source must be shorter than 3-mutator candidate source"
+            !matches!(live.report.miri, MiriOutcome::OracleError(_)),
+            "Miri must execute the staged candidate: {:?}",
+            live.report.miri
+        );
+        assert!(
+            !matches!(live.report.anneal, AnnealOutcome::CaptureOrLeanError(_)),
+            "Anneal capture + Lean evaluation must succeed: {:?}",
+            live.report.anneal
+        );
+        assert!(
+            live.mir_neighborhood.contains(&cand.fn_name),
+            "captured MIR neighborhood must describe `{}`",
+            cand.fn_name
+        );
+
+        // A synthetic divergence the live oracle cannot reproduce on `[]`: shrinking must
+        // conclude `AlreadyOneMinimal` after exactly one real oracle run.
+        let synthetic = missed_ub_report(
+            &cand.fn_name,
+            70,
+            "synthetic divergence that no live oracle run reproduces",
+            AnnealOutcome::PassUnit,
+            true,
+        );
+        let res = minimize_miri_candidate_mutations(&cand, &seed_refs, &synthetic, Some(&repo_root))
+            .expect("live shrink");
+        assert_eq!(res.status, MiriShrinkStatus::AlreadyOneMinimal);
+        assert_eq!(
+            (res.shrink_evaluations, res.oracle_evaluations, res.compile_rejections),
+            (1, 1, 0)
         );
     }
 
@@ -2047,6 +2571,7 @@ mod tests {
             ],
             minimized_mutator_chain: vec!["RawPtrOffsetMutator".to_string()],
             shrink_evaluations: 5,
+            shrink_status: MiriShrinkStatus::Minimized.slug().to_string(),
             divergence_class: "ub_location_mismatch".to_string(),
             miri_outcome_tag: "ub@src/lib.rs:52:17".to_string(),
             miri_excerpt: "error: Undefined Behavior".to_string(),
@@ -2075,11 +2600,14 @@ mod tests {
             "\"original_mutator_chain\": [\"ArithmeticCastMutator\", \"RawPtrOffsetMutator\", \"PlaceProjectionWrapper\"]"
         ));
         assert!(finding_json.contains("\"minimized_mutator_chain\": [\"RawPtrOffsetMutator\"]"));
+        assert!(finding_json.contains("\"applied_mutators\": [\"RawPtrOffsetMutator\"]"));
         assert!(finding_json.contains("\"shrink_evaluations\": 5"));
+        assert!(finding_json.contains("\"shrink_status\": \"minimized\""));
         assert!(summary_md.contains(
             "- **Original mutator chain**: `ArithmeticCastMutator, RawPtrOffsetMutator, PlaceProjectionWrapper`"
         ));
         assert!(summary_md.contains("- **Minimized mutator chain**: `RawPtrOffsetMutator`"));
         assert!(summary_md.contains("- **Shrink evaluations**: `5`"));
+        assert!(summary_md.contains("- **Shrink status**: `minimized`"));
     }
 }

@@ -361,6 +361,388 @@ class CliGateIntegrationTest(unittest.TestCase):
             self.assertTrue(summary["semantic_mutant_self_check"]["passed"])
             self.assertTrue(summary["stale_ratchet_audit"]["passed"])
 
+    def test_miri_only_campaign_does_not_flag_itree_quarantine_entries_as_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "campaign_state"
+            q_file = Path(tmp) / "quarantine.toml"
+            q_file.write_text(
+                "[[quarantined]]\n"
+                'fingerprint = "ArithmeticCastMutator:itree_outcome_mismatch:'
+                'TraceReplayDiag.outcome_mismatch"\n'
+                'expires = "2099-01-01"\n',
+                encoding="utf-8",
+            )
+            argv = [
+                "--profile",
+                "smoke",
+                "--miri-only",
+                "--check-stale-ratchet",
+                "--quarantine-file",
+                str(q_file),
+                "--state-dir",
+                str(state_dir),
+            ]
+            with (
+                mock.patch.object(
+                    campaign, "run_harness", return_value=_make_valid_miri_summary()
+                ),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                rc = campaign.main(argv)
+            self.assertEqual(rc, campaign.EXIT_SUCCESS)
+            summary = json.loads(
+                (state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(summary["stale_ratchet_audit"]["stale_entries"], [])
+
+
+class OracleOutcomeClassificationTest(unittest.TestCase):
+    """`classify_oracle_outcome_tags` mirrors `compare_miri_and_anneal`."""
+
+    def test_classification_table_and_precedence(self) -> None:
+        table = [
+            ("pass:scalar:5:4", "pass:scalar:5:4", ("agree", "")),
+            ("pass:unit", "pass:unit", ("agree", "")),
+            ("pass:scalar:5:4", "pass:scalar:6:4", ("diverge", "wrong_value")),
+            ("pass:scalar:5:4", "abort@src/lib.rs:3:5:3:9", ("diverge", "wrong_value")),
+            ("pass:unit", "panic@src/lib.rs:3:5:3:9", ("diverge", "return_vs_panic")),
+            ("pass:unit", "ub@src/lib.rs:3:5:3:9", ("diverge", "false_positive_ub")),
+            ("panic@src/lib.rs:3:7", "pass:unit", ("diverge", "panic_vs_return")),
+            ("panic@src/lib.rs:3:7", "ub@src/lib.rs:3:5:3:9", ("diverge", "false_positive_ub")),
+            ("panic@src/lib.rs:3:7", "panic@src/lib.rs:3:5:3:9", ("agree", "")),
+            ("panic@src/lib.rs:9:7", "panic@src/lib.rs:3:5:3:9", ("diverge", "panic_site_mismatch")),
+            ("ub@src/lib.rs:3:7", "ub@src/lib.rs:3:5:3:9", ("agree", "")),
+            ("ub@src/lib.rs:4:1", "ub@src/lib.rs:3:5:3:9", ("diverge", "ub_location_mismatch")),
+            ("ub", "ub@src/lib.rs:3:5:3:9", ("diverge", "ub_location_mismatch")),
+            ("ub@src/lib.rs:3:7", "pass:unit", ("diverge", "missed_ub")),
+            ("ub@src/lib.rs:3:7", "panic@src/lib.rs:3:5:3:9", ("diverge", "missed_ub")),
+            # Not-compared precedence: Miri error > capture error > external call >
+            # unsupported > fuel.
+            ("oracle_error:boom", "capture_error:x", ("not_compared", "miri_oracle_error")),
+            ("ub@src/lib.rs:3:7", "capture_error:x", ("not_compared", "capture_failed")),
+            ("pass:unit", "externalCall:core::f", ("not_compared", "external_call")),
+            ("pass:unit", "unsupported@src/lib.rs:3:5:3:9", ("not_compared", "unsupported")),
+            ("pass:unit", "outOfFuel", ("not_compared", "out_of_fuel")),
+        ]
+        for miri_tag, anneal_tag, expected in table:
+            with self.subTest(miri=miri_tag, anneal=anneal_tag):
+                self.assertEqual(
+                    campaign.classify_oracle_outcome_tags(miri_tag, anneal_tag), expected
+                )
+
+
+class SemanticMutantDifferentialTest(unittest.TestCase):
+    """The default self-check is differential: unmutated semantics must pass the
+    campaign pipeline and every mutated variant must be rejected by it."""
+
+    def test_default_self_check_records_clean_baselines_and_killed_variants(self) -> None:
+        res = campaign.run_semantic_mutant_self_check()
+        self.assertTrue(res["passed"], res)
+        by_id = {r["id"]: r for r in res["results"]}
+        for mutant_id, r in by_id.items():
+            self.assertEqual(r["baseline_verdict"], "agree", mutant_id)
+            self.assertEqual(r["baseline_exit_code"], campaign.EXIT_SUCCESS, mutant_id)
+            self.assertTrue(r["variants"], mutant_id)
+            self.assertTrue(all(v["killed"] for v in r["variants"]), r)
+        wide = by_id["wide_shift"]["variants"]
+        self.assertEqual(
+            [(v["label"], v["exit_code"], v["kill_class"]) for v in wide],
+            [
+                ("guard_omitted_lean_abort", campaign.EXIT_HARNESS_FAILED, "harness_error"),
+                (
+                    "guard_omitted_abort_masked_as_unsupported",
+                    campaign.EXIT_HARNESS_FAILED,
+                    "harness_error",
+                ),
+                ("guard_masks_exponent_silently", campaign.EXIT_DIVERGENCE_DETECTED, "missed_ub"),
+            ],
+        )
+        self.assertIn("error_masked_as_unsupported", wide[1]["detail"])
+        self.assertIn("oracle_errors_exceeded", wide[0]["detail"])
+        self.assertEqual(by_id["div_by_zero"]["kill_class"], "panic_vs_return")
+
+    def test_self_check_detects_a_campaign_pipeline_that_swallows_divergences(self) -> None:
+        real_dedup = campaign.deduplicate_and_quarantine_findings
+
+        def quarantine_everything(findings, known, rules):  # type: ignore[no-untyped-def]
+            all_dedup, _, _ = real_dedup(findings, known, rules)
+            for d in all_dedup:
+                d.quarantined = True
+            return all_dedup, [], all_dedup
+
+        with mock.patch.object(
+            campaign, "deduplicate_and_quarantine_findings", quarantine_everything
+        ):
+            res = campaign.run_semantic_mutant_self_check()
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["exit_code"], campaign.EXIT_HARNESS_FAILED)
+        self.assertEqual(
+            res["survived_mutants"],
+            ["bool_valid_range", "storage_dead_tag", "provenance_frag", "div_by_zero", "wide_shift"],
+        )
+        wide = next(r for r in res["results"] if r["id"] == "wide_shift")
+        self.assertEqual(wide["survived_variants"], ["guard_masks_exponent_silently"])
+
+    def test_self_check_detects_a_disabled_error_vs_unsupported_boundary(self) -> None:
+        with mock.patch.object(
+            campaign, "validate_error_vs_unsupported_boundary", return_value=(True, [])
+        ):
+            res = campaign.run_semantic_mutant_self_check()
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["survived_mutants"], ["wide_shift"])
+        wide = next(r for r in res["results"] if r["id"] == "wide_shift")
+        self.assertEqual(
+            wide["survived_variants"], ["guard_omitted_abort_masked_as_unsupported"]
+        )
+
+    def test_self_check_detects_a_campaign_that_rejects_agreeing_runs(self) -> None:
+        # A pipeline that fails every run would "kill" every mutant; the baseline check
+        # must expose it instead.
+        with mock.patch.object(
+            campaign,
+            "validate_performed_miri_summary",
+            return_value=(False, "always broken"),
+        ):
+            res = campaign.run_semantic_mutant_self_check()
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["killed_count"], 0)
+        self.assertTrue(all(r["kill_class"] == "baseline_not_clean" for r in res["results"]))
+
+    def test_invalid_baseline_and_equivalent_mutant_both_fail_closed(self) -> None:
+        base = dict(campaign.SEEDED_SEMANTIC_MUTANTS[0])
+        bad_baseline = dict(base, id="bad_baseline", baseline_anneal_outcome="pass:scalar:2:4")
+        equivalent = dict(
+            base,
+            id="equivalent_mutant",
+            mutant_variants=(
+                {
+                    "label": "same_as_baseline",
+                    "anneal_outcome": base["baseline_anneal_outcome"],
+                    "anneal_lean_tag": base["baseline_anneal_lean_tag"],
+                },
+            ),
+        )
+        res = campaign.run_semantic_mutant_self_check(mutants=[bad_baseline, equivalent])
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["survived_mutants"], ["bad_baseline", "equivalent_mutant"])
+        by_id = {r["id"]: r for r in res["results"]}
+        self.assertEqual(by_id["bad_baseline"]["kill_class"], "baseline_not_clean")
+        self.assertEqual(by_id["equivalent_mutant"]["survived_variants"], ["same_as_baseline"])
+
+    def test_evaluator_exception_counts_as_survival(self) -> None:
+        def flaky(mutant: dict[str, object]) -> bool:
+            if mutant["id"] == "provenance_frag":
+                raise RuntimeError("lean worker crashed")
+            return True
+
+        res = campaign.run_semantic_mutant_self_check(evaluator=flaky)
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["survived_mutants"], ["provenance_frag"])
+        frag = next(r for r in res["results"] if r["id"] == "provenance_frag")
+        self.assertEqual(frag["kill_class"], "evaluator_error")
+
+
+class ErrorBoundaryAccountingTest(unittest.TestCase):
+    def test_properly_classified_oracle_error_item_is_not_reported_as_masked(self) -> None:
+        summary = _make_valid_miri_summary()
+        summary["miri_verdicts"]["error"] = 1  # type: ignore[index]
+        summary["miri_verdicts"]["pass"] = 5  # type: ignore[index]
+        summary["not_compared_reasons"]["miri_oracle_error"] = 1  # type: ignore[index]
+        summary["not_compared_count"] = 2
+        summary["compared_candidates"] = 6
+        summary["agree_count"] = 6
+        summary["anneal_outcomes"]["unsupported"] = 2  # type: ignore[index]
+        summary["anneal_outcomes"]["pass"] = 4  # type: ignore[index]
+        summary["item_reports"] = [
+            {
+                "name": "c3",
+                "miri_outcome": "oracle_error:driver exited before entering item",
+                "anneal_outcome": "unsupported@src/lib.rs:4:5:4:9",
+                "not_compared_reason": "miri_oracle_error",
+            }
+        ]
+        ok, reasons = campaign.validate_error_vs_unsupported_boundary(
+            summary, max_oracle_errors=1
+        )
+        self.assertTrue(ok, reasons)
+        self.assertEqual(reasons, [])
+
+    def test_miri_error_routed_into_unsupported_is_masking(self) -> None:
+        summary = _make_valid_miri_summary()
+        summary["miri_verdicts"]["error"] = 1  # type: ignore[index]
+        summary["miri_verdicts"]["pass"] = 5  # type: ignore[index]
+        ok, reasons = campaign.validate_error_vs_unsupported_boundary(
+            summary, max_oracle_errors=5
+        )
+        self.assertFalse(ok)
+        self.assertTrue(
+            any(r.startswith("error_masked_as_unsupported: 1 Miri oracle error") for r in reasons),
+            reasons,
+        )
+
+    def test_single_capture_failure_is_counted_once_against_the_budget(self) -> None:
+        summary = _make_valid_miri_summary()
+        summary["anneal_outcomes"]["error"] = 1  # type: ignore[index]
+        summary["anneal_outcomes"]["pass"] = 4  # type: ignore[index]
+        summary["not_compared_reasons"]["capture_failed"] = 1  # type: ignore[index]
+        summary["not_compared_count"] = 2
+        summary["compared_candidates"] = 6
+        summary["agree_count"] = 6
+        ok, reasons = campaign.validate_error_vs_unsupported_boundary(
+            summary, max_oracle_errors=1
+        )
+        self.assertTrue(ok, reasons)
+        ok0, reasons0 = campaign.validate_error_vs_unsupported_boundary(
+            summary, max_oracle_errors=0
+        )
+        self.assertFalse(ok0)
+        self.assertTrue(any("oracle_errors_exceeded: 1 errored items" in r for r in reasons0))
+
+    def test_findings_with_not_compared_outcome_tags_are_rejected(self) -> None:
+        for anneal_tag in (
+            "unsupported@src/lib.rs:4:5:4:9",
+            "capture_error:INTERNAL PANIC: Nat.shiftl exponent is too big",
+            "externalCall:core::fmt::write",
+            "outOfFuel",
+        ):
+            with self.subTest(anneal_tag=anneal_tag), tempfile.TemporaryDirectory() as tmp:
+                repro = Path(tmp) / "repro.rs"
+                repro.write_text("pub fn f() {}\n", encoding="utf-8")
+                summary = _make_valid_miri_summary()
+                summary["findings"] = [
+                    {
+                        "finding_id": "finding_0000_f",
+                        "fn_name": "f",
+                        "seed_name": "f",
+                        "divergence_class": "missed_ub",
+                        "miri_outcome": "ub@src/lib.rs:4:7",
+                        "anneal_outcome": anneal_tag,
+                        "anneal_lean_tag": "MirDiffTag.unsupported",
+                        "miri_excerpt": "error: Undefined Behavior",
+                        "repro_path": str(repro),
+                        "kernel_confirmed": True,
+                    }
+                ]
+                ok, reason = campaign.validate_performed_miri_summary(summary)
+                self.assertFalse(ok)
+                self.assertIn("not-compared outcome", reason)
+
+
+class QuarantineKeyAndCoverageTest(unittest.TestCase):
+    def _finding(self, repro: Path) -> dict[str, object]:
+        return {
+            "finding_id": "finding_0000_seed_x__b0_c1",
+            "fn_name": "seed_x__b0_c1",
+            "seed_name": "seed_x",
+            "applied_mutators": ["RawPtrOffsetMutator"],
+            "divergence_class": "missed_ub",
+            "miri_outcome": "ub@src/lib.rs:4:7",
+            "anneal_outcome": "pass:unit",
+            "anneal_lean_tag": "MirDiffTag.normalUnit",
+            "miri_excerpt": "error: Undefined Behavior",
+            "repro_path": str(repro),
+            "kernel_confirmed": True,
+        }
+
+    def test_every_dedup_quarantine_key_quarantines_and_counts_as_observed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repro = Path(tmp) / "repro.rs"
+            repro.write_text("pub fn f() {}\n", encoding="utf-8")
+            finding = self._finding(repro)
+            fp, keys = campaign.quarantine_match_keys_for_miri_finding(finding, set())
+            self.assertEqual(fp, "RawPtrOffsetMutator:missed_ub:MirDiffTag.normalUnit")
+            for token in sorted(keys):
+                with self.subTest(token=token):
+                    _, unq, q = campaign.deduplicate_and_quarantine_findings(
+                        [finding], set(), {token}
+                    )
+                    self.assertEqual((len(unq), len(q)), (0, 1))
+                    q_file = Path(tmp) / "q.json"
+                    q_file.write_text(json.dumps({"quarantined": [token]}), encoding="utf-8")
+                    audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                        quarantine_file=q_file,
+                        evaluated_fingerprints=[fp],
+                        observed_quarantine_keys=keys,
+                        covered_harnesses={"miri"},
+                        reference_date="2026-11-09",
+                    )
+                    self.assertTrue(audit["passed"], audit)
+            _, unq, q = campaign.deduplicate_and_quarantine_findings(
+                [finding], set(), {"unrelated_seed"}
+            )
+            self.assertEqual((len(unq), len(q)), (1, 0))
+
+    def test_unobserved_rule_only_applies_to_covered_harnesses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q_file = Path(tmp) / "q.json"
+            itree_token = "ArithmeticCastMutator:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch"
+            q_file.write_text(json.dumps({"quarantined": [itree_token]}), encoding="utf-8")
+            miri_only = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=q_file,
+                evaluated_fingerprints=[],
+                observed_quarantine_keys=set(),
+                covered_harnesses={"miri"},
+                reference_date="2026-11-09",
+            )
+            self.assertTrue(miri_only["passed"], miri_only)
+            both = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=q_file,
+                evaluated_fingerprints=[],
+                observed_quarantine_keys=set(),
+                covered_harnesses={"miri", "itree"},
+                reference_date="2026-11-09",
+            )
+            self.assertFalse(both["passed"])
+            self.assertIn(
+                "unobserved_quarantine_entry",
+                both["stale_quarantine_entries"][0]["reason"],
+            )
+            self.assertEqual(campaign.quarantine_entry_harness(itree_token), "itree")
+            self.assertEqual(
+                campaign.quarantine_entry_harness("RawPtrOffsetMutator:missed_ub"), "miri"
+            )
+            self.assertIsNone(campaign.quarantine_entry_harness("pass_ptr_offset_within_array"))
+
+    def test_quarantine_loader_applies_audited_table_entries_but_never_expired_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q_file = Path(tmp) / "quarantine.toml"
+            q_file.write_text(
+                '[[quarantined]]\n'
+                'fingerprint = "RawPtrOffsetMutator:missed_ub:MirDiffTag.normalUnit"\n'
+                'expires = "2099-01-01"\n'
+                'reason = "tracked"\n'
+                '[[quarantined]]\n'
+                'fingerprint = "ArithmeticCastMutator:wrong_value:MirDiffTag.normalScalar"\n'
+                'expires = "2020-01-01"\n'
+                '[[quarantined]]\n'
+                'fingerprint = "PlaceProjectionWrapper:missed_ub:MirDiffTag.normalUnit"\n'
+                'expires = "not-a-date"\n'
+                '[[quarantined]]\n'
+                'reason = "missing fingerprint"\n',
+                encoding="utf-8",
+            )
+            rules = campaign.load_quarantine_rules(q_file)
+            self.assertEqual(rules, {"RawPtrOffsetMutator:missed_ub:MirDiffTag.normalUnit"})
+            j_file = Path(tmp) / "quarantine.json"
+            j_file.write_text(
+                json.dumps(
+                    {
+                        "fingerprints": [
+                            "legacy_token",
+                            {"fingerprint": "A:missed_ub:MirDiffTag.ub", "expires": "2099-12-31"},
+                            {"fingerprint": "B:missed_ub:MirDiffTag.ub", "expires": "2001-01-01"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                campaign.load_quarantine_rules(j_file),
+                {"legacy_token", "A:missed_ub:MirDiffTag.ub"},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
