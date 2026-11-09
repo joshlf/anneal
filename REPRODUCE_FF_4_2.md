@@ -155,7 +155,7 @@ half of that (`2,972` lines, 45%) moved into reusable theory.
 ### 4.1 Wall clock
 
 Wall-clock time of one sequential `lake env lean` per file (Section 6, step 6)
-on `cpl-direct-electron-37838` with `anneal-lean-run --mode file
+on `<build-host>` with `anneal-lean-run --mode file
 --concurrency 1`, after `cargo-anneal verify` has built the imports. Each file
 sets `maxHeartbeats` itself; no file raises it above `800,000`. The host ran
 other Lean jobs during every measurement, so differences of a few seconds on
@@ -335,7 +335,7 @@ are not measured here.
 ## 6. Reproduction commands
 
 Run from the worktree root
-(`/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4-2`):
+(`<path/to/anneal>`):
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
