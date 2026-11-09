@@ -823,9 +823,7 @@ def evalCopyNonOverlappingWithCount
               Bool.and srcOk dstOk
           let isSingleDirect :=
             Bool.and
-              (Bool.and
-                (Nat.beq n 1)
-                (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0)))
+              (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
               singleSizeMatches
           match isSingleDirect with
           | true =>

@@ -5483,4 +5483,234 @@ theorem step_intrinsic_copyNonOverlapping_perm_divergence
   cases hpS : e_s.perm <;> cases hpD : e_d.perm <;>
     first | rfl | (simp [hpS, hpD] at hperm_bad)
 
+
+private theorem allocRange_size (st sz : Miri.ABI.Size) : (Miri.Memory.allocRange st sz).size = sz := rfl
+
+private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
+    (hn : ValidScalarBytes n) (hpos : 0 < total) (hinb : off + total ≤ n) :
+    (Miri.Memory.InitMask.new (translateSizeBytes n) false).prepareCopy
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) =
+      .ok ⟨false, #[UInt64.ofNat total]⟩ := by
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hlt64 : off + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinb hn64
+  have hoff64 : off < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right off total) hlt64
+  have htot64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total off) hlt64
+  have hend := copyRange_endExclusive hlt64
+  have hoff_nat : (UInt64.ofNat off).toNat = off := UInt64.toNat_ofNat_of_lt hoff64
+  have htot_nat : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot64
+  have hend_nat : (UInt64.ofNat (off + total)).toNat = off + total := UInt64.toNat_ofNat_of_lt hlt64
+  have hnz : (UInt64.ofNat total == 0) = false := by
+    cases hb : (UInt64.ofNat total == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at htot_nat; simp at htot_nat; omega
+  have hnot_oob : ¬ (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes) := by
+    rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_nat, hn_eq]; omega
+  have hlt_sf : UInt64.ofNat off < UInt64.ofNat (off + total) := by
+    rw [UInt64.lt_iff_toNat_lt, hoff_nat, hend_nat]; omega
+  unfold Miri.Memory.InitMask.prepareCopy Miri.Memory.InitMask.rangeAsInitChunks
+  rw [hend]
+  have hlen_new : (Miri.Memory.InitMask.new (translateSizeBytes n) false).len =
+      translateSizeBytes n := rfl
+  simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hlen_new,
+    hnz, Bool.false_eq_true, ↓reduceIte, hnot_oob, hlt_sf, Miri.Memory.InitMask.lazy_get,
+    bind, Except.bind, pure, Except.pure]
+  unfold Miri.Memory.InitMask.collectChunks
+  have hiter0 : (Miri.Memory.InitChunkIter.mk
+      (Miri.Memory.InitMask.new (translateSizeBytes n) false) false
+      ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok (some (.Uninit ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩, ⟨Miri.Memory.InitMask.new (translateSizeBytes n) false, false, ⟨UInt64.ofNat (off + total)⟩, ⟨UInt64.ofNat (off + total)⟩⟩)) := by
+    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new Miri.ABI.Size.sizeBytes
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    have hcond1 :
+        ((UInt64.ofNat off > UInt64.ofNat (off + total)) ||
+          (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes)) = false := by
+      have hnot_gt_sf : ¬ (UInt64.ofNat off > UInt64.ofNat (off + total)) := by
+        rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hoff_nat, hend_nat]; omega
+      rw [Bool.or_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+      exact ⟨hnot_gt_sf, hnot_oob⟩
+    split
+    · rename_i h; rw [hcond1] at h; contradiction
+    · split
+      · rename_i h2
+        have hnot_ge : ¬ ((UInt64.ofNat off).toNat ≥ (UInt64.ofNat (off + total)).toNat) := by omega
+        contradiction
+      · split
+        · rename_i h3
+          contradiction
+        · dsimp only
+          split
+          · rfl
+          · rename_i h4
+            have hnot_le : ¬ ((UInt64.ofNat (off + total)).toNat ≤ (UInt64.ofNat off).toNat) := by omega
+            contradiction
+  rw [hiter0]
+  unfold Miri.Memory.collectChunksAux
+  have hiter1 : (Miri.Memory.InitChunkIter.mk
+      (Miri.Memory.InitMask.new (translateSizeBytes n) false) false
+      ⟨UInt64.ofNat (off + total)⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok none := by
+    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new Miri.ABI.Size.sizeBytes
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    have hcond2 :
+        ((UInt64.ofNat (off + total) > UInt64.ofNat (off + total)) ||
+          (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes)) = false := by
+      rw [Bool.or_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+      exact ⟨UInt64.lt_irrefl _, hnot_oob⟩
+    split
+    · rename_i h; rw [hcond2] at h; contradiction
+    · split
+      · rfl
+      · rename_i h
+        have hge : ((UInt64.ofNat (off + total)).toNat ≥ (UInt64.ofNat (off + total)).toNat) := by omega
+        contradiction
+  rw [hiter1]
+  have hfuel : (UInt64.ofNat (off + total)).toNat - (UInt64.ofNat off).toNat + 1 = total + 1 := by
+    omega
+  with_unfolding_all erw [hfuel]
+  match total, hpos with
+  | 1, _ => rfl
+  | 2, _ => rfl
+  | 4, _ => rfl
+  | 8, _ => rfl
+  | 16, _ => rfl
+
+lemma allocRange_size (start size : Miri.ABI.Size) :
+  (Miri.Memory.allocRange start size).size = size := rfl
+
+theorem StackScalarAllocShape.copyRepeatedly_range_uninit {E : Type}
+    {srcBytes dstBytes : Nat}
+    (hnS : ValidScalarBytes srcBytes) (hnD : ValidScalarBytes dstBytes)
+    {srcStart dstStart total : Nat}
+    (hpos : 0 < total) (hinS : srcStart + total ≤ srcBytes) (hinD : dstStart + total ≤ dstBytes)
+    {S D : Miri.Memory.Allocation AnnealProv E}
+    (hshapeS : StackScalarAllocShape (translateSizeBytes srcBytes) S)
+    (huninitS : S.initializationMask = Miri.Memory.InitMask.new (translateSizeBytes srcBytes) false)
+    (hshapeD : StackScalarAllocShape (translateSizeBytes dstBytes) D)
+    (sameAlloc : Bool)
+    (hdisj : sameAlloc = true → srcStart + total ≤ dstStart ∨ dstStart + total ≤ srcStart) :
+    ∃ alloc' : Miri.Memory.Allocation AnnealProv E,
+      Miri.Memory.Allocation.copyRepeatedly S
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart)) (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart)) 1 (Miri.ABI.Size.ofBytes 8) sameAlloc true D = .ok () alloc' := by
+  have hs64 : srcBytes < 2 ^ 64 := by rcases hnS with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hd64 : dstBytes < 2 ^ 64 := by rcases hnD with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hltS : srcStart + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinS hs64
+  have hltD : dstStart + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinD hd64
+  have hmask_prep := copyInitMask_prepareCopy_false_range hnS hpos hinS
+  unfold Miri.Memory.Allocation.copyRepeatedly
+  have hallocSize : (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart)) (Miri.ABI.Size.ofBytes (UInt64.ofNat total))).size = (Miri.ABI.Size.ofBytes (UInt64.ofNat total)) := allocRange_size _ _
+  have htot64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total srcStart) hltS
+  have hz_decide : decide ((UInt64.ofNat total).toNat == 0) = false := by
+    cases hb : (UInt64.ofNat total == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at htot64; have htot_nat : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot64; simp at htot_nat; omega
+  simp only [hallocSize, hz_decide, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure]
+  dsimp only
+  unfold Miri.Memory.Allocation.prepareCopy
+  rw [huninitS]
+  rw [hmask_prep]
+  dsimp only [bind, Except.bind, pure, Except.pure]
+  split
+  · rename_i hcond
+    have hsame_eq : sameAlloc = false := by
+      cases sameAlloc <;> simp at hcond <;> assumption
+    rw [hsame_eq]
+    dsimp only [ite_false]
+    unfold Miri.Memory.Allocation.writeUninit
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    have hnot_oob : (UInt64.ofNat (dstStart + total) > (translateSizeBytes dstBytes).bytes) = false := by
+      have hn_eq : (translateSizeBytes dstBytes).bytes.toNat = dstBytes := by rcases hnD with rfl | rfl | rfl | rfl | rfl <;> rfl
+      have hend_nat : (UInt64.ofNat (dstStart + total)).toNat = dstStart + total := UInt64.toNat_ofNat_of_lt hltD
+      rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_nat, hn_eq]; omega
+    have hnot_oob_decide : decide (UInt64.ofNat (dstStart + total) > (translateSizeBytes dstBytes).bytes) = false := decide_eq_false (by rw [hnot_oob]; exact not_false)
+    split
+    · rename_i h; rw [hnot_oob_decide] at h; contradiction
+    · exact ⟨_, rfl⟩
+  · rename_i hcond
+    have hsame_eq : sameAlloc = true := by
+      cases sameAlloc <;> simp at hcond <;> rfl
+    rw [hsame_eq]
+    dsimp only [ite_true]
+    have hdisj2 : srcStart + total ≤ dstStart ∨ dstStart + total ≤ srcStart := hdisj rfl
+    have hdisj3 : decide (Miri.Memory.allocRangeOverlap (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart)) (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart)) (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))) = false := by
+      unfold Miri.Memory.allocRangeOverlap
+      simp only [hallocSize, Miri.Memory.allocRange, Miri.ABI.Size.ofBytes]
+      rw [Bool.and_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+      have hsrc_nat : (UInt64.ofNat srcStart).toNat = srcStart := UInt64.toNat_ofNat_of_lt hltS
+      have hdst_nat : (UInt64.ofNat dstStart).toNat = dstStart := UInt64.toNat_ofNat_of_lt hltD
+      have htot_nat : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt (Nat.lt_of_le_of_lt (Nat.le_add_left total dstStart) hltD)
+      have h1 : ((UInt64.ofNat srcStart).toNat + (UInt64.ofNat total).toNat) = srcStart + total := by omega
+      have h2 : ((UInt64.ofNat dstStart).toNat + (UInt64.ofNat total).toNat) = dstStart + total := by omega
+      cases hdisj2 with
+      | inl hle => right; omega
+      | inr hle => left; omega
+    split
+    · rename_i h; rw [hdisj3] at h; contradiction
+    · dsimp only
+      unfold Miri.Memory.Allocation.writeUninit
+      dsimp only [bind, Except.bind, pure, Except.pure]
+      have hnot_oob : (UInt64.ofNat (dstStart + total) > (translateSizeBytes dstBytes).bytes) = false := by
+        have hn_eq : (translateSizeBytes dstBytes).bytes.toNat = dstBytes := by rcases hnD with rfl | rfl | rfl | rfl | rfl <;> rfl
+        have hend_nat : (UInt64.ofNat (dstStart + total)).toNat = dstStart + total := UInt64.toNat_ofNat_of_lt hltD
+        rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_nat, hn_eq]; omega
+      have hnot_oob_decide : decide (UInt64.ofNat (dstStart + total) > (translateSizeBytes dstBytes).bytes) = false := decide_eq_false (by rw [hnot_oob]; exact not_false)
+      split
+      · rename_i h; rw [hnot_oob_decide] at h; contradiction
+      · exact ⟨_, rfl⟩
+
+theorem annealMemCopy_live_uninit_range_ok
+    {st : AnnealStepState}
+    {srcBytes dstBytes : Nat}
+    (hnS : ValidScalarBytes srcBytes) (hnD : ValidScalarBytes dstBytes)
+    {srcStart dstStart total : Nat}
+    (hpos : 0 < total) (hinS : srcStart + total ≤ srcBytes) (hinD : dstStart + total ≤ dstBytes)
+    (srcId : Miri.Memory.AllocId) (srcTag : Miri.Memory.BorTag)
+    (srcLA : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+      Miri.Memory.MiriMemoryKind)
+    (dstId : Miri.Memory.AllocId) (dstTag : Miri.Memory.BorTag)
+    (dstLA : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+      Miri.Memory.MiriMemoryKind)
+    (hdisj : srcId = dstId → srcStart + total ≤ dstStart ∨ dstStart + total ≤ srcStart)
+    (hsrc_id : srcId.value.toNat < 2 ^ 32)
+    (hsrc_base : st.machine.lookupBaseAddr srcId = some (annealStackBaseAddr srcId))
+    (hsrc_live : st.machine.memory.live.find? (fun entry => entry.1 == srcId) = some (srcId, srcLA))
+    (hsrc_shape : StackScalarAllocShape (translateSizeBytes srcBytes) srcLA.allocation)
+    (hsrc_uninit : srcLA.allocation.initializationMask =
+      Miri.Memory.InitMask.new (translateSizeBytes srcBytes) false)
+    (hdst_id : dstId.value.toNat < 2 ^ 32)
+    (hdst_base : st.machine.lookupBaseAddr dstId = some (annealStackBaseAddr dstId))
+    (hdst_live : st.machine.memory.live.find? (fun entry => entry.1 == dstId) = some (dstId, dstLA))
+    (hdst_shape : StackScalarAllocShape (translateSizeBytes dstBytes) dstLA.allocation) :
+    ∃ mach', annealMemCopy
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr srcId + UInt64.ofNat srcStart),
+        some (.concrete srcId srcTag)⟩
+      ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dstId + UInt64.ofNat dstStart),
+        some (.concrete dstId dstTag)⟩
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat total)) true st = .ok () { st with machine := mach' } := by
+  have hle : total ≤ isizeMaxBytes := by
+    unfold isizeMaxBytes; rcases hnS with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hts : Miri.ABI.Size.ofBytes (UInt64.ofNat total) = translateSizeBytes total := by
+    have _ : total < 2^64 := by rcases hnS with rfl | rfl | rfl | rfl | rfl <;> omega
+    rfl
+  have hsrc_sz : srcLA.allocation.byteSize.bytes.toNat = srcBytes := by
+    rw [hsrc_shape.byteSize_eq]; rcases hnS with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hdst_sz : dstLA.allocation.byteSize.bytes.toNat = dstBytes := by
+    rw [hdst_shape.byteSize_eq]; rcases hnD with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hsame : (srcId == dstId) = true → srcStart + total ≤ dstStart ∨ dstStart + total ≤ srcStart := by
+    intro h
+    exact hdisj (eq_of_beq h)
+  obtain ⟨alloc', hcopy⟩ := hsrc_shape.copyRepeatedly_range_uninit hnS hnD hpos hinS hinD
+    hsrc_uninit hdst_shape (srcId == dstId) hsame
+  have hsrc_lt : srcStart < 2^32 := by rcases hnS with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hdst_lt : dstStart < 2^32 := by rcases hnD with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hinS' : srcStart + total ≤ srcLA.allocation.byteSize.bytes.toNat := by rw [hsrc_sz]; exact hinS
+  have hinD' : dstStart + total ≤ dstLA.allocation.byteSize.bytes.toNat := by rw [hdst_sz]; exact hinD
+  have heq := annealMemCopy_live_inbounds_eq (st := st) srcId srcTag srcStart srcLA dstId dstTag dstStart dstLA
+    hsrc_id hsrc_lt hsrc_base hsrc_live hinS'
+    hdst_id hdst_lt hdst_base hdst_live hinD' hpos hle
+  rw [hcopy] at heq
+  rw [hts] at heq
+  exact ⟨_, heq⟩
+
 end LeanMiriSpec.Correspondence

@@ -774,6 +774,9 @@ def ptr4MiriFramePre (b : CapturedMir) (d₀ : RigidTy) :
   { body := translateBody b
     bodyIdentity := .ofCanonicalIndex 0
     functionInstance := { kind := .Item 0, args := #[] }
+    vaList := none
+    trackCallerArg := none
+    location := none
     extra := ()
     returnContinuation := .stop false
     returnPlace := .frameLocal 0 0 none (translateTy (tyOf d₀)) (.ofAllocationToken 0)
@@ -2357,6 +2360,9 @@ def copy6MiriFramePre (b : CapturedMir) (initSrc : Bool) :
   { body := translateBody b
     bodyIdentity := .ofCanonicalIndex 0
     functionInstance := { kind := .Item 0, args := #[] }
+    vaList := none
+    trackCallerArg := none
+    location := none
     extra := ()
     returnContinuation := .stop false
     returnPlace := .frameLocal 0 0 none (translateTy (tyOf unitK)) (.ofAllocationToken 0)
@@ -2825,9 +2831,6 @@ theorem wit_lm4_2_copy_nonoverlapping_perm_divergence :
     (Or.inr (Or.inl rfl))
   exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, m₄, hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, ha₄, hm₄⟩
 
-end WitnessLM4_2
-
-end LeanMiriSpec.Correspondence
 
 def rawMutU32K : RigidTy := .rawPtr .mut u32K
 def rawConstU8K : RigidTy := .rawPtr .not u8K
@@ -2856,17 +2859,21 @@ def ptr6MiriFramePre (b : CapturedMir) (d₀ d₂ d₃ d₄ d₅ : RigidTy) : Mi
   { body := translateBody b
     bodyIdentity := .ofCanonicalIndex 0
     functionInstance := { kind := .Item 0, args := #[] }
+    vaList := none
+    trackCallerArg := none
+    location := none
     extra := ()
     returnContinuation := .stop false
     returnPlace := .frameLocal 0 0 none (translateTy (tyOf d₀)) (.ofAllocationToken 0)
     localsIdentity := .ofAllocationToken 0
     locals := #[
-      (none, .uninitialized),
-      (some (translateTy (tyOf u64K)), .initialized (Miri.Memory.Allocation.fromScalar (Miri.ABI.Size.ofBytes 8) (.fromScalarInt ⟨42, 8⟩))),
-      (none, .uninitialized),
-      (none, .uninitialized),
-      (none, .uninitialized),
-      (none, .uninitialized)
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+        layout := some (translateTy (tyOf u64K)) },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate .uninit), layout := none }
     ] }
 
 def ptr6MiriPre (b : CapturedMir) (d₀ d₂ d₃ d₄ d₅ : RigidTy) : AnnealStepState :=
@@ -2907,10 +2914,14 @@ theorem ptr6_stateRel (d₀ d₂ d₃ d₄ d₅ : RigidTy) (stmts : List MirAst.
     exact .immediate _ _ none (fun _ h => Option.some.inj h.symm) (Or.inl ⟨rfl, rfl⟩)
   | 1 =>
     have hs : slot = .init (.scalar ⟨42, 8⟩) := by simpa [ptr6AnnealPre, get?] using hslot.symm
-    have hm : mls = { value := .live (.immediate (.scalar (.fromScalarInt ⟨42, 8⟩))), layout := some (translateTy (tyOf u64K)) } := by
+    have hm : mls = { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))), layout := some (translateTy (tyOf u64K)) } := by
       simpa [ptr6MiriFramePre] using hmls.symm
     subst hd hs hm
     exact .immediate _ _ (some (translateTy (tyOf u64K))) (fun _ h => Option.some.inj h.symm)
       (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩)
   | _ + 6 => simp [ptr6Body, get?] at hdecl
 
+
+end WitnessLM4_2
+
+end LeanMiriSpec.Correspondence
