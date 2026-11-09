@@ -311,7 +311,7 @@ added, and `trusted/` differs from `087b015b` only as the brief allows.
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4-2b
+cd <path/to/anneal>
 git merge-base --is-ancestor 087b015b HEAD && echo "087b015b IS ANCESTOR"
 git merge-base --is-ancestor 1642f8aa HEAD && echo "1642f8aa IS ANCESTOR"
 git diff --stat 087b015b..HEAD -- crates/ docs/ ci/ .github/ .gemini/ \
@@ -335,11 +335,11 @@ git status --porcelain   # move untracked .anneal/ and Cargo.lock out first
 
 ## 7. `[diversity-reduced]` 3rd-party audit notice
 
-`anneal-model-policy` assigned `ff42b-a` to Model X `opus-5.5-max`, and
-`ff42b-b`'s Model Y slot (`gemini-launch-candidate-high`) to the Reserve
-Frontier Pool `gemini-pro-coordinator` at Pass `A0`, because the
-`gemini-google-teamfood-wtu-v2` bucket was at 0.0% (below the 15% `P1`
+`model-policy-cli` assigned `ff42b-a` to Model X `model-family-x-primary`, and
+`ff42b-b`'s Model Y slot (`model-family-y-primary`) to the Reserve
+Frontier Pool `supervisor-model-primary` at Pass `A0`, because the
+`family-y-quota-pool` bucket was at 0.0% (below the 15% `P1`
 floor). Every pass of this unit (`A0` through `A2`) therefore runs with
 reduced cross-family diversity, and the merged result **needs a 3rd-party
-(different-model) audit** before it lands. In addition, `opus-5.5-max` fell to
+(different-model) audit** before it lands. In addition, `model-family-x-primary` fell to
 12% (below the `P1` floor) during Pass `A0`.
