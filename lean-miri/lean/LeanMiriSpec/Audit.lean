@@ -1045,6 +1045,11 @@ open LeanMiriSpec.Correspondence in
   step_downcast_field_write_inactive_divergence
   step_downcast_field_write_uninit_divergence
   step_enum_self_move_simulation
+  EnumMemRel.copy_self_overlap_err
+  UninitEnumMemRel.copy_uninit_self_ok
+  step_enum_self_copy_dead_or_uninit_simulation
+  step_enum_self_copy_overlap_divergence
+  step_enum_copy_move_uninitInd_divergence
   Witness.lm23EnumLayout
   Witness.lm23Layouts
   Witness.lm23Variants
@@ -1069,6 +1074,10 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm2_3_downcast_write_inactive_divergence
   Witness.wit_lm2_3_downcast_write_uninit_divergence
   Witness.wit_lm2_3_field_overwrite_self_move_and_copy_overwrite
+  Witness.lm23_materialize_uninitInd
+  Witness.wit_lm2_3_self_copy_dead_and_uninit_ub
+  Witness.wit_lm2_3_self_copy_overlap_divergence
+  Witness.wit_lm2_3_uninitInd_copy_and_move_divergence
 
 /-- Exhaustively verify that every declaration across every imported
 `LeanMiriSpec.*` and `Miri.*` module in the environment — as well as every
@@ -7519,6 +7528,186 @@ example :
       Miri.Interpreter.Step.step Witness.lm23Hooks () m₇ = (m₈, .ok true) ∧
       StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0 Witness.lm23Bb21S8 m₈ :=
   Witness.wit_lm2_3_field_overwrite_self_move_and_copy_overwrite
+
+example :
+    ∀ {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+      {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+      {v_act : Nat} {fieldVals : List Value}
+      {mp : Miri.Interpreter.MemPlace AnnealProv}
+      {allocId : Miri.Memory.AllocId} {tag : Miri.Memory.BorTag}
+      {localAlloc : AnnealLocalAlloc},
+      EnumMemRel mach ty layouts tagBytes variants v_act fieldVals mp →
+      mp.ptr.provenance = some (.concrete allocId tag) →
+      LiveAllocEntry mach.memory.live allocId localAlloc →
+      ∃ alloc',
+        Miri.Memory.Allocation.copy localAlloc.allocation
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+            (translateTy ty layouts).layout.size)
+          Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) true true
+          localAlloc.allocation = .error .copyRangesOverlap alloc' :=
+  @EnumMemRel.copy_self_overlap_err
+
+example :
+    ∀ {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+      {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+      {mp : Miri.Interpreter.MemPlace AnnealProv}
+      {allocId : Miri.Memory.AllocId} {tag : Miri.Memory.BorTag}
+      {localAlloc : AnnealLocalAlloc},
+      UninitEnumMemRel mach ty layouts tagBytes variants mp →
+      mp.ptr.provenance = some (.concrete allocId tag) →
+      LiveAllocEntry mach.memory.live allocId localAlloc →
+      ∃ alloc',
+        Miri.Memory.Allocation.copy localAlloc.allocation
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+            (translateTy ty layouts).layout.size)
+          Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) true true
+          localAlloc.allocation = .ok () alloc' :=
+  @UninitEnumMemRel.copy_uninit_self_ok
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env allocBudget s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {idx : Local} {decl : MirAst.LocalDecl}
+        {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .assign ⟨idx, .nil⟩ (.use (.copy ⟨idx, .nil⟩)) →
+        get? body.localDecls idx = some decl →
+        env decl.ty = some (tagBytes, variants) →
+        (∀ v, get? s.frame.locals idx ≠ some (.init v)) →
+        (get? s.frame.locals idx = some .uninit →
+          IsImmediateStepLocal m idx) →
+        let mRes :=
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m
+        StepRelLM2_3 body env allocBudget m (stepMirFn body s) mRes ∧
+        ((∀ msg, mRes.2 ≠ .error (.undefinedBehavior msg)) →
+          (∀ enumId b,
+            EnumLocalByteUninit m enumId b →
+            EnumLocalByteUninit mRes.1 enumId b) ∧
+          (∀ j, j ≠ idx → IsImmediateStepLocal m j →
+            IsImmediateStepLocal mRes.1 j)) :=
+  @step_enum_self_copy_dead_or_uninit_simulation
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env allocBudget s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {idx : Local} {decl : MirAst.LocalDecl} {rootVal : Value}
+        {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .assign ⟨idx, .nil⟩ (.use (.copy ⟨idx, .nil⟩)) →
+        get? body.localDecls idx = some decl →
+        env decl.ty = some (tagBytes, variants) →
+        get? s.frame.locals idx = some (.init rootVal) →
+        stepMirFn body s =
+          MirStepNode.step
+            (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) ∧
+        ∃ m_err,
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m =
+          (m_err,
+            .error
+              (.undefinedBehavior
+                "whole-value copy between overlapping ranges")) :=
+  @step_enum_self_copy_overlap_divergence
+
+example :
+    ∀ {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+      {s : MachineState} {m : AnnealStepState},
+      StateRelLM2_3 body env (allocBudget + 1) s m →
+      (∀ p, body.phase ≠ .other p) →
+      (∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs) →
+      ∀ {bb : BasicBlockData} {stmt : Statement}
+        {dstIdx srcIdx : Local} {dstDecl srcDecl : MirAst.LocalDecl}
+        {isMove : Bool} {tagBytes : Nat} {variants : List (List StructFieldDesc)},
+        get? body.basicBlocks s.frame.blockIdx = some bb →
+        get? bb.statements s.frame.stmtIdx = some stmt →
+        stmt.kind = .assign ⟨dstIdx, .nil⟩
+          (.use (if isMove then .move ⟨srcIdx, .nil⟩ else .copy ⟨srcIdx, .nil⟩)) →
+        get? body.localDecls srcIdx = some srcDecl →
+        get? body.localDecls dstIdx = some dstDecl →
+        env srcDecl.ty = some (tagBytes, variants) →
+        dstDecl.ty = srcDecl.ty →
+        get? s.frame.locals srcIdx = some .uninit →
+        ¬ IsImmediateStepLocal m srcIdx →
+        get? s.frame.locals dstIdx ≠ some .dead →
+        stepMirFn body s = MirStepNode.fail .ub ∧
+        ∃ m',
+          Miri.Interpreter.Step.step
+            (annealStepHooksLM2_3 body.localDecls body.layouts) () m =
+          (m', .ok true) :=
+  @step_enum_copy_move_uninitInd_divergence
+
+example :
+    (∃ m₁ msg₁,
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 22) = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks ()
+          (Witness.lm23InitMiri 22) =
+        (m₁, .error (.undefinedBehavior msg₁))) ∧
+    (∃ m₂ m₃ msg₂,
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 23) =
+        .step Witness.lm23Bb23S1 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks ()
+          (Witness.lm23InitMiri 23) = (m₂, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0
+        Witness.lm23Bb23S1 m₂ ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb23S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₂ =
+        (m₃, .error (.undefinedBehavior msg₂))) :=
+  Witness.wit_lm2_3_self_copy_dead_and_uninit_ub
+
+example :
+    ∃ (m₁ m_err : AnnealStepState),
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 24) =
+        .step Witness.lm23Bb24S1 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks ()
+          (Witness.lm23InitMiri 24) = (m₁, .ok true) ∧
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 0
+        Witness.lm23Bb24S1 m₁ ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb24S1 =
+        .step Witness.lm23Bb24S2 ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m₁ =
+        (m_err,
+          .error
+            (.undefinedBehavior
+              "whole-value copy between overlapping ranges")) :=
+  Witness.wit_lm2_3_self_copy_overlap_divergence
+
+example :
+    (∃ m_u1 m₁,
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1
+        (Witness.lm23InitAnneal 22) m_u1 ∧
+      ¬ IsImmediateStepLocal m_u1 1 ∧
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 22) = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m_u1 = (m₁, .ok true)) ∧
+    (∃ m_u2 m₂,
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1
+        (Witness.lm23InitAnneal 26) m_u2 ∧
+      ¬ IsImmediateStepLocal m_u2 1 ∧
+      stepMirFn Witness.lm23Body (Witness.lm23InitAnneal 26) = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m_u2 = (m₂, .ok true)) ∧
+    (∃ m_u3 m₃,
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1
+        Witness.lm23Bb25S1 m_u3 ∧
+      ¬ IsImmediateStepLocal m_u3 1 ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb25S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m_u3 = (m₃, .ok true)) ∧
+    (∃ m_u4 m₄,
+      StateRelLM2_3 Witness.lm23Body Witness.lm23Env 1
+        Witness.lm23Bb18S1 m_u4 ∧
+      ¬ IsImmediateStepLocal m_u4 1 ∧
+      stepMirFn Witness.lm23Body Witness.lm23Bb18S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step Witness.lm23Hooks () m_u4 = (m₄, .ok true)) :=
+  Witness.wit_lm2_3_uninitInd_copy_and_move_divergence
 
 end LM2_3Pins
 

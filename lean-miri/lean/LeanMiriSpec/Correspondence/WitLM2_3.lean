@@ -104,6 +104,20 @@ exercising all five `LM-2.3` simulation theorems plus control-flow helpers and
     (`step_enum_self_move_simulation`), `StorageLive(_4)`, `_4 = Lm23Enum::V0`,
     in-place indirect enum copy overwrite `_4 = copy _1`,
     `_3 = copy ((_4 as 1).0 : u32)` reading `77_u32`, and `StorageDead(_4)`.
+16. `wit_lm2_3_self_copy_dead_and_uninit_ub`: lockstep undefined-behavior
+    simulation for whole-enum self-copy `_1 = copy _1` on immediate `.uninit`
+    `_1` and on `.dead` `_1` after `StorageDead(_1)`
+    (`step_enum_self_copy_dead_or_uninit_simulation`).
+17. `wit_lm2_3_self_copy_overlap_divergence`: after `_1 = Lm23Enum::V1(42_u32)`,
+    whole-enum self-copy `_1 = copy _1` steps in Anneal while unconditionally
+    failing with `"whole-value copy between overlapping ranges"` in `lean-miri`
+    (`step_enum_self_copy_overlap_divergence`).
+18. `wit_lm2_3_uninitInd_copy_and_move_divergence`: constructs concrete
+    `StateRelLM2_3` states with `_1` in `LocalRelLM2_3.enumUninitInd`
+    (`¬ IsImmediateStepLocal m 1`) and proves all four `(self vs. distinct) ×
+    (copy vs. move)` quadrants (`_1 = copy _1`, `_1 = move _1`, `_4 = copy _1`,
+    and `_4 = move _1`) fail `.ub` in Anneal while stepping `.ok true` in
+    `lean-miri` (`step_enum_copy_move_uninitInd_divergence`).
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness
@@ -576,8 +590,8 @@ def lm23Body : CapturedMir where
           [ lm23DowncastWriteConstU32Stmt 1 (some "V1") 1 0 42 ]
         terminator := lm23Term .return_
         isCleanup := false }
-    , -- bb21: V1(42) -> overwrite ((_1 as 1).0) = 77 -> self-move _1 = move _1 ->
-      --       StorageLive(_4) -> _4 = V0 -> in-place _4 = copy _1 ->
+    , -- bb21: V1(42) -> overwrite ((_1 as 1).0) = 77 -> self-move _1 = move _1
+      --       -> StorageLive(_4) -> _4 = V0 -> in-place _4 = copy _1 ->
       --       _3 = copy ((_4 as 1).0) -> StorageDead(_4)
       { statements :=
           [ lm23AggV1Stmt 1 42
@@ -588,6 +602,34 @@ def lm23Body : CapturedMir where
           , lm23EnumCopyMoveStmt false 4 1
           , lm23DowncastReadStmt false 3 4 (some "V1") 1 0 lm23U32Ty
           , lm23StorageDeadStmt 4 ]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb22: _1 = copy _1 on uninit _1 (UB if immediate; divergence if
+      --       indirect enumUninitInd)
+      { statements := [lm23EnumCopyMoveStmt false 1 1]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb23: StorageDead(_1); _1 = copy _1 on dead _1 -> lockstep UB
+      { statements :=
+          [ lm23StorageDeadStmt 1
+          , lm23EnumCopyMoveStmt false 1 1 ]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb24: _1 = V1(42); _1 = copy _1 (overlapping self-copy divergence)
+      { statements :=
+          [ lm23AggV1Stmt 1 42
+          , lm23EnumCopyMoveStmt false 1 1 ]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb25: StorageLive(_4); _4 = copy _1 (distinct-local enumUninitInd copy
+      --       divergence)
+      { statements :=
+          [ lm23StorageLiveStmt 4
+          , lm23EnumCopyMoveStmt false 4 1 ]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , -- bb26: _1 = move _1 on uninit _1 (self-move enumUninitInd divergence)
+      { statements := [lm23EnumCopyMoveStmt true 1 1]
         terminator := lm23Term .return_
         isCleanup := false } ]
   fnAbi := lm23FnAbi
@@ -2038,5 +2080,279 @@ theorem wit_lm2_3_field_overwrite_self_move_and_copy_overwrite :
   exact ⟨m₁, m₂, m₃, m₄, m₅, m₆, m₇, m₈,
     hm₁, hst₁, hm₂, hst₂, hm₃, hst₃, hm₄, hst₄,
     hm₅, hst₅, hm₆, hst₆, hm₇, hst₇, hm₈, hst₈⟩
+
+/-! ## 17. Witness 16: Self-Copy Dead & Immediate-Uninit UB (`bb22`, `bb23`) -/
+
+def lm23Bb23S1 : MachineState :=
+  { frame := { blockIdx := 23, stmtIdx := 1,
+               locals := [.uninit, .dead, .uninit, .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+theorem lm23_bb22_ub : stepMirFn lm23Body (lm23InitAnneal 22) = .fail .ub := rfl
+theorem lm23_bb23_a1 : stepMirFn lm23Body (lm23InitAnneal 23) = .step lm23Bb23S1 := rfl
+theorem lm23_bb23_ub : stepMirFn lm23Body lm23Bb23S1 = .fail .ub := rfl
+
+/-- **Witness 16 (`wit_lm2_3_self_copy_dead_and_uninit_ub`)**:
+Lockstep undefined-behavior simulation via
+`step_enum_self_copy_dead_or_uninit_simulation` across:
+1. `bb22`: `_1 = copy _1` when `_1` is immediate `.uninit`,
+2. `bb23`: `StorageDead(_1)` followed by `_1 = copy _1` when `_1` is `.dead`. -/
+theorem wit_lm2_3_self_copy_dead_and_uninit_ub :
+    (∃ m₁ msg₁,
+      stepMirFn lm23Body (lm23InitAnneal 22) = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 22) =
+        (m₁, .error (.undefinedBehavior msg₁))) ∧
+    (∃ m₂ m₃ msg₂,
+      stepMirFn lm23Body (lm23InitAnneal 23) = .step lm23Bb23S1 ∧
+      Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 23) = (m₂, .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 lm23Bb23S1 m₂ ∧
+      stepMirFn lm23Body lm23Bb23S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23Hooks () m₂ =
+        (m₃, .error (.undefinedBehavior msg₂))) := by
+  refine ⟨?_, ?_⟩
+  · have hsim := step_enum_self_copy_dead_or_uninit_simulation
+      (lm23_init_stateRelLM2_3 22 0 (by decide)) lm23_phase lm23_env_valid
+      rfl rfl rfl (decl := lm23Decl lm23EnumTy) rfl rfl
+      (by intro _ h; cases h) (fun _ => lm23_init_imm 22 1)
+    dsimp only at hsim
+    rcases hsim with ⟨hrel, _⟩
+    rw [lm23_bb22_ub] at hrel
+    obtain ⟨m₁, msg₁, hm₁⟩ := stepRelLM2_3_inv_ub hrel
+    exact ⟨m₁, msg₁, lm23_bb22_ub, hm₁⟩
+  · have hsim₁ := step_storageDead_LM2_3_simulation
+      (lm23_init_stateRelLM2_3 23 0 (by decide)) lm23_phase
+      rfl rfl (decl := lm23Decl lm23EnumTy) rfl (by decide)
+    dsimp only at hsim₁
+    rcases hsim₁ with ⟨hrel₁, _, _⟩
+    rw [lm23_bb23_a1] at hrel₁
+    obtain ⟨m₂, hm₂, hst₁⟩ := stepRelLM2_3_inv_step hrel₁
+    have hsim₂ := step_enum_self_copy_dead_or_uninit_simulation
+      hst₁ lm23_phase lm23_env_valid rfl rfl rfl
+      (decl := lm23Decl lm23EnumTy) rfl rfl
+      (by intro _ h; cases h) (by intro h; cases h)
+    dsimp only at hsim₂
+    rcases hsim₂ with ⟨hrel₂, _⟩
+    rw [lm23_bb23_ub] at hrel₂
+    obtain ⟨m₃, msg₂, hm₃⟩ := stepRelLM2_3_inv_ub hrel₂
+    exact ⟨m₂, m₃, msg₂, lm23_bb23_a1, hm₂, hst₁, lm23_bb23_ub, hm₃⟩
+
+/-! ## 18. Witness 17: Whole-Enum Self-Copy Overlap Divergence (`bb24`) -/
+
+def lm23Bb24S1 : MachineState :=
+  { frame := { blockIdx := 24, stmtIdx := 1,
+               locals := [.uninit, .init (.aggregate 1 [.scalar ⟨42, 4⟩]),
+                          .uninit, .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+def lm23Bb24S2 : MachineState :=
+  { frame := { blockIdx := 24, stmtIdx := 2,
+               locals := [.uninit, .init (.aggregate 1 [.scalar ⟨42, 4⟩]),
+                          .uninit, .uninit, .dead] }
+    memory := (initMachineState lm23Body []).memory }
+
+theorem lm23_bb24_a1 : stepMirFn lm23Body (lm23InitAnneal 24) = .step lm23Bb24S1 := rfl
+
+/-- **Witness 17 (`wit_lm2_3_self_copy_overlap_divergence`)**:
+After `_1 = Lm23Enum::V1(42_u32)`, whole-enum self-copy `_1 = copy _1` steps in
+Anneal's value-tree semantics to `lm23Bb24S2`, while vendored `lean-miri`
+unconditionally diagnoses `"whole-value copy between overlapping ranges"`
+(`step_enum_self_copy_overlap_divergence`). -/
+theorem wit_lm2_3_self_copy_overlap_divergence :
+    ∃ (m₁ m_err : AnnealStepState),
+      stepMirFn lm23Body (lm23InitAnneal 24) = .step lm23Bb24S1 ∧
+      Miri.Interpreter.Step.step lm23Hooks () (lm23InitMiri 24) = (m₁, .ok true) ∧
+      StateRelLM2_3 lm23Body lm23Env 0 lm23Bb24S1 m₁ ∧
+      stepMirFn lm23Body lm23Bb24S1 = .step lm23Bb24S2 ∧
+      Miri.Interpreter.Step.step lm23Hooks () m₁ =
+        (m_err,
+          .error
+            (.undefinedBehavior "whole-value copy between overlapping ranges")) := by
+  obtain ⟨m₁, hm₁, hst₁, _, _⟩ :=
+    lm23_step_agg_v1_at (b := 24) (budget := 0) (by decide) rfl rfl lm23_bb24_a1
+  obtain ⟨ha_ok, m_err, hm_err⟩ := step_enum_self_copy_overlap_divergence
+    hst₁ lm23_phase lm23_env_valid rfl rfl rfl
+    (decl := lm23Decl lm23EnumTy) rfl rfl
+    (rootVal := .aggregate 1 [.scalar ⟨42, 4⟩]) rfl
+  exact ⟨m₁, m_err, lm23_bb24_a1, hm₁, hst₁, ha_ok, hm_err⟩
+
+/-! ## 19. Witness 18: Indirect-Uninit Copy/Move Divergence -/
+
+def lm23Bb25S1 : MachineState :=
+  { frame := { blockIdx := 25, stmtIdx := 1,
+               locals := [.uninit, .uninit, .uninit, .uninit, .uninit] }
+    memory := (initMachineState lm23Body []).memory }
+
+theorem lm23_bb25_a1 : stepMirFn lm23Body (lm23InitAnneal 25) = .step lm23Bb25S1 := rfl
+
+/-- Given any `StateRelLM2_3` state `(s, m)` with `.uninit` `_1` and all other
+locals immediate, materializing an uninitialized backing stack slot for `_1`
+produces a `StateRelLM2_3` state `(s, m_u)` in `LocalRelLM2_3.enumUninitInd`
+(`¬ IsImmediateStepLocal m_u 1`). -/
+theorem lm23_materialize_uninitInd {budget : Nat} {s : MachineState}
+    {m : AnnealStepState}
+    (hst : StateRelLM2_3 lm23Body lm23Env (budget + 1) s m)
+    (hs1 : get? s.frame.locals 1 = some .uninit)
+    (himm_other : ∀ k, k ≠ 1 → IsImmediateStepLocal m k) :
+    ∃ m_u : AnnealStepState,
+      StateRelLM2_3 lm23Body lm23Env budget s m_u ∧
+      ¬ IsImmediateStepLocal m_u 1 := by
+  rcases hst with ⟨topFrame, hframes, hretC, ⟨retLay, hretP⟩, hframe, halloc,
+    hcal, hcs, hbor, hprot, hcaller, _⟩
+  let wholeLay := translateTy lm23EnumTy lm23Layouts
+  have hlt1 : 1 < topFrame.locals.size := by
+    rw [hframe.mf_locals_size]; decide
+  obtain ⟨rawAlloc, _, hbs0, hlen0, hmut0, hpmap0, hmask0⟩ :=
+    tryNew_uninit_of_pow2_le_29 wholeLay.layout.size wholeLay.layout.align.abi
+      lm23_validEnumLayout.align_pow2_le
+  obtain ⟨mem', newId, hres, _, hlive_eq, hfresh_old, hwm_next, hovf_all⟩ :=
+    halloc.of_succ.reserve_step
+  let a0 := rawAlloc.withExtra (none : Option Miri.TreeBorrows.BorrowTree)
+  let mach_u := stackAllocMachine m.machine mem' newId a0
+  let tf_u :=
+    { topFrame with
+      locals := topFrame.locals.set 1
+        ⟨.live (.indirect (stackAllocPlace newId)), some wholeLay⟩ hlt1 }
+  let m_u : AnnealStepState := ⟨⟨#[tf_u]⟩, mach_u⟩
+  have hfresh : mem'.live.any (fun entry => entry.1 == newId) = false := by
+    rw [hlive_eq]; exact hfresh_old
+  have hlive_u : LiveAllocEntry mach_u.memory.live newId ⟨.stack, a0⟩ :=
+    LiveAllocEntry.of_push_fresh_self ⟨.stack, a0⟩ hfresh
+  have hbase_u : mach_u.lookupBaseAddr newId = some (annealStackBaseAddr newId) :=
+    lookupBaseAddr_stackAllocMachine_self m.machine mem' newId a0
+  have hovf_u := hovf_all _ lm23_validEnumLayout.size_lt_4gib
+  have halign_u :=
+    annealStackBaseAddr_isAligned newId _ lm23_validEnumLayout.align_pow2_le
+  have hlen_a0 : a0.len = a0.byteSize.bytes.toNat := by
+    dsimp [a0]; rw [hlen0, ← hbs0]
+  have humpr :
+      UninitEnumMemRel mach_u lm23EnumTy lm23Layouts 4 lm23Variants
+        (stackAllocPlace newId) :=
+    .mk newId Miri.Memory.BorTag.one (annealStackBaseAddr newId) ⟨.stack, a0⟩
+      lm23_validEnumLayout rfl rfl rfl hlive_u hbase_u rfl hovf_u hmut0 halign_u
+      hbs0 hlen_a0 hpmap0 hmask0
+  have hdecl1 : get? lm23Body.localDecls 1 = some (lm23Decl lm23EnumTy) := rfl
+  have hfr_u : FrameRelLM2_3 lm23Body lm23Env mach_u s.frame tf_u := by
+    refine ⟨hframe.body_eq, hframe.location_eq, hframe.af_locals_len, ?_, ?_⟩
+    · dsimp [tf_u]; rw [Array.size_set]; exact hframe.mf_locals_size
+    · intro j d sl mls hd hsl hm
+      dsimp [tf_u] at hm
+      by_cases hj : 1 = j
+      · subst hj
+        rw [hdecl1] at hd
+        have hd_eq : d = lm23Decl lm23EnumTy := (Option.some.inj hd).symm
+        have hsl_eq : sl = .uninit := by
+          rw [hs1] at hsl; exact (Option.some.inj hsl).symm
+        rw [Array.getElem?_set_self hlt1] at hm
+        have hm_eq :
+            mls = ⟨.live (.indirect (stackAllocPlace newId)), some wholeLay⟩ :=
+          (Option.some.inj hm).symm
+        subst hd_eq hsl_eq hm_eq
+        exact .enumUninitInd 4 lm23Variants (stackAllocPlace newId)
+          (some wholeLay) rfl
+          (fun _ hl => (Option.some.inj (Option.mem_def.mp hl)).symm) humpr
+      · rw [Array.getElem?_set_ne _ hj] at hm
+        exact (hframe.locals_rel j d sl mls hd hsl hm).of_stackAlloc_other hres
+  have hdisj_u : MemoryAllocDisjoint tf_u := by
+    intro i j mpi mpj ci cj hij hi hj
+    by_cases hi1 : 1 = i
+    · subst hi1
+      have hj1 : j ≠ 1 := Ne.symm hij
+      dsimp [tf_u] at hj
+      rw [Array.getElem?_set_ne _ hij] at hj
+      exact False.elim (himm_other j hj1 topFrame hframes _ hj mpj rfl)
+    · dsimp [tf_u] at hi
+      rw [Array.getElem?_set_ne _ hi1] at hi
+      exact False.elim (himm_other i (Ne.symm hi1) topFrame hframes _ hi mpi rfl)
+  have hnot_imm : ¬ IsImmediateStepLocal m_u 1 := by
+    intro himm
+    have hget_u :
+        tf_u.locals[1]? =
+          some ⟨.live (.indirect (stackAllocPlace newId)), some wholeLay⟩ := by
+      dsimp [tf_u]; rw [Array.getElem?_set_self hlt1]
+    exact himm tf_u rfl _ hget_u (stackAllocPlace newId) rfl
+  exact ⟨m_u,
+    .mk tf_u rfl hretC ⟨retLay, hretP⟩ hfr_u (Or.inr (hwm_next _))
+      hcal hcs hbor hprot hcaller hdisj_u,
+    hnot_imm⟩
+
+/-- **Witness 18 (`wit_lm2_3_uninitInd_copy_and_move_divergence`)**:
+Constructs concrete `StateRelLM2_3` states with `_1` in
+`LocalRelLM2_3.enumUninitInd` (`¬ IsImmediateStepLocal m_u 1`) and certifies all
+four `(self vs. distinct) × (copy vs. move)` quadrants of
+`step_enum_copy_move_uninitInd_divergence`:
+1. `bb22`: self-copy `_1 = copy _1` (contrast Witness 16(1), where immediate
+   `_1` in `lm23InitMiri 22` traps in lockstep),
+2. `bb26`: self-move `_1 = move _1`,
+3. `bb25`: distinct-local copy `_4 = copy _1` after `StorageLive(_4)`,
+4. `bb18`: distinct-local move `_4 = move _1` after `StorageLive(_4)` (contrast
+   Witness 12(3), where immediate `_1` traps in lockstep). -/
+theorem wit_lm2_3_uninitInd_copy_and_move_divergence :
+    (∃ m_u1 m₁,
+      StateRelLM2_3 lm23Body lm23Env 1 (lm23InitAnneal 22) m_u1 ∧
+      ¬ IsImmediateStepLocal m_u1 1 ∧
+      stepMirFn lm23Body (lm23InitAnneal 22) = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23Hooks () m_u1 = (m₁, .ok true)) ∧
+    (∃ m_u2 m₂,
+      StateRelLM2_3 lm23Body lm23Env 1 (lm23InitAnneal 26) m_u2 ∧
+      ¬ IsImmediateStepLocal m_u2 1 ∧
+      stepMirFn lm23Body (lm23InitAnneal 26) = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23Hooks () m_u2 = (m₂, .ok true)) ∧
+    (∃ m_u3 m₃,
+      StateRelLM2_3 lm23Body lm23Env 1 lm23Bb25S1 m_u3 ∧
+      ¬ IsImmediateStepLocal m_u3 1 ∧
+      stepMirFn lm23Body lm23Bb25S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23Hooks () m_u3 = (m₃, .ok true)) ∧
+    (∃ m_u4 m₄,
+      StateRelLM2_3 lm23Body lm23Env 1 lm23Bb18S1 m_u4 ∧
+      ¬ IsImmediateStepLocal m_u4 1 ∧
+      stepMirFn lm23Body lm23Bb18S1 = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23Hooks () m_u4 = (m₄, .ok true)) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · obtain ⟨m_u1, hst_u1, hnot_imm1⟩ := lm23_materialize_uninitInd
+      (budget := 1) (lm23_init_stateRelLM2_3 22 2 (by decide)) rfl
+      (fun k _ => lm23_init_imm 22 k)
+    obtain ⟨ha_ub, m₁, hm₁⟩ := step_enum_copy_move_uninitInd_divergence
+      hst_u1 lm23_phase lm23_env_valid rfl rfl (isMove := false) rfl
+      (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23EnumTy)
+      rfl rfl rfl rfl rfl hnot_imm1 (by intro h; cases h)
+    exact ⟨m_u1, m₁, hst_u1, hnot_imm1, ha_ub, hm₁⟩
+  · obtain ⟨m_u2, hst_u2, hnot_imm2⟩ := lm23_materialize_uninitInd
+      (budget := 1) (lm23_init_stateRelLM2_3 26 2 (by decide)) rfl
+      (fun k _ => lm23_init_imm 26 k)
+    obtain ⟨ha_ub, m₂, hm₂⟩ := step_enum_copy_move_uninitInd_divergence
+      hst_u2 lm23_phase lm23_env_valid rfl rfl (isMove := true) rfl
+      (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23EnumTy)
+      rfl rfl rfl rfl rfl hnot_imm2 (by intro h; cases h)
+    exact ⟨m_u2, m₂, hst_u2, hnot_imm2, ha_ub, hm₂⟩
+  · have hsim_sl := step_storageLive_LM2_3_simulation
+      (lm23_init_stateRelLM2_3 25 2 (by decide)) lm23_phase
+      rfl rfl (decl := lm23Decl lm23EnumTy) rfl
+    dsimp only at hsim_sl
+    rcases hsim_sl with ⟨hrel_sl, _, _, himm_fn⟩
+    rw [lm23_bb25_a1] at hrel_sl
+    obtain ⟨m_sl, hm_sl, hst_sl⟩ := stepRelLM2_3_inv_step hrel_sl
+    obtain ⟨m_u3, hst_u3, hnot_imm3⟩ := lm23_materialize_uninitInd
+      (budget := 1) hst_sl rfl
+      (fun k _ => by simpa [hm_sl] using himm_fn k (lm23_init_imm 25 k))
+    obtain ⟨ha_ub, m₃, hm₃⟩ := step_enum_copy_move_uninitInd_divergence
+      hst_u3 lm23_phase lm23_env_valid rfl rfl (isMove := false) rfl
+      (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23EnumTy)
+      rfl rfl rfl rfl rfl hnot_imm3 (by intro h; cases h)
+    exact ⟨m_u3, m₃, hst_u3, hnot_imm3, ha_ub, hm₃⟩
+  · have hsim_sl := step_storageLive_LM2_3_simulation
+      (lm23_init_stateRelLM2_3 18 2 (by decide)) lm23_phase
+      rfl rfl (decl := lm23Decl lm23EnumTy) rfl
+    dsimp only at hsim_sl
+    rcases hsim_sl with ⟨hrel_sl, _, _, himm_fn⟩
+    rw [lm23_bb18_a1] at hrel_sl
+    obtain ⟨m_sl, hm_sl, hst_sl⟩ := stepRelLM2_3_inv_step hrel_sl
+    obtain ⟨m_u4, hst_u4, hnot_imm4⟩ := lm23_materialize_uninitInd
+      (budget := 1) hst_sl rfl
+      (fun k _ => by simpa [hm_sl] using himm_fn k (lm23_init_imm 18 k))
+    obtain ⟨ha_ub, m₄, hm₄⟩ := step_enum_copy_move_uninitInd_divergence
+      hst_u4 lm23_phase lm23_env_valid rfl rfl (isMove := true) rfl
+      (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23EnumTy)
+      rfl rfl rfl rfl rfl hnot_imm4 (by intro h; cases h)
+    exact ⟨m_u4, m₄, hst_u4, hnot_imm4, ha_ub, hm₄⟩
 
 end LeanMiriSpec.Correspondence.Witness
