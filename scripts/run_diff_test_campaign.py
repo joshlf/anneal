@@ -1225,7 +1225,7 @@ def verify_no_stale_quarantine_or_known_bugs(
             if isinstance(q_data, list):
                 raw_entries.extend(q_data)
             elif isinstance(q_data, dict):
-                recognized_key = "tests" in q_data
+                recognized_key = False
                 for key in QUARANTINE_LIST_KEYS:
                     if key in q_data:
                         recognized_key = True
@@ -1240,6 +1240,79 @@ def verify_no_stale_quarantine_or_known_bugs(
                                 "reason": f"malformed_quarantine_file: key {key!r} must be a list",
                             }
                         )
+                if "tests" in q_data:
+                    recognized_key = True
+                    q_tests = q_data.get("tests")
+                    if not isinstance(q_tests, list):
+                        stale_quarantine.append(
+                            {
+                                "source": str(quarantine_file),
+                                "entry": "tests",
+                                "reason": "malformed_quarantine_file: key 'tests' must be a list",
+                            }
+                        )
+                    else:
+                        for t_idx, t_entry in enumerate(q_tests):
+                            if not isinstance(t_entry, dict) or "known_anneal_bug" not in t_entry:
+                                continue
+                            t_name = t_entry.get("name")
+                            t_bug = t_entry.get("known_anneal_bug")
+                            if not isinstance(t_name, str) or not t_name.strip():
+                                checked_quarantine_count += 1
+                                stale_quarantine.append(
+                                    {
+                                        "source": str(quarantine_file),
+                                        "entry": f"tests[{t_idx}]",
+                                        "reason": "malformed_or_missing_fingerprint: missing test name on known_anneal_bug",
+                                    }
+                                )
+                                continue
+                            clean_t_name = t_name.strip()
+                            if not isinstance(t_bug, dict):
+                                checked_quarantine_count += 1
+                                stale_quarantine.append(
+                                    {
+                                        "source": str(quarantine_file),
+                                        "entry": clean_t_name,
+                                        "reason": "malformed_known_anneal_bug: expected table",
+                                    }
+                                )
+                                continue
+                            obs_t = t_bug.get("observed_anneal_tag")
+                            reas_t = t_bug.get("summary") or t_bug.get("reason")
+                            if not isinstance(obs_t, str) or not obs_t.strip():
+                                stale_quarantine.append(
+                                    {
+                                        "source": str(quarantine_file),
+                                        "entry": clean_t_name,
+                                        "reason": "missing_known_anneal_bug_metadata: missing observed_anneal_tag",
+                                    }
+                                )
+                            if not isinstance(reas_t, str) or not reas_t.strip():
+                                stale_quarantine.append(
+                                    {
+                                        "source": str(quarantine_file),
+                                        "entry": clean_t_name,
+                                        "reason": "missing_known_anneal_bug_metadata: missing summary/reason",
+                                    }
+                                )
+                            div_cls = t_bug.get("divergence_class")
+                            fp_tok = (
+                                f"{clean_t_name}:{div_cls.strip()}"
+                                if isinstance(div_cls, str) and div_cls.strip()
+                                else clean_t_name
+                            )
+                            raw_entries.append(
+                                (
+                                    {"fingerprint": fp_tok, "expires": t_bug.get("expires")}
+                                    if ":" in fp_tok
+                                    else (
+                                        {"fingerprint": f"{fp_tok}:known_anneal_bug", "expires": t_bug["expires"]}
+                                        if "expires" in t_bug and ":" not in fp_tok
+                                        else fp_tok
+                                    )
+                                )
+                            )
                 if q_data and not recognized_key:
                     stale_quarantine.append(
                         {
@@ -1321,12 +1394,13 @@ def verify_no_stale_quarantine_or_known_bugs(
                 entry_harness = quarantine_entry_harness(fp)
                 harness_covered = entry_harness is None or entry_harness in covered
                 if run_evaluated and harness_covered:
-                    matched_eval = (observed_keys is not None and fp in observed_keys) or any(
-                        obs == fp
-                        or obs.startswith(f"{fp}:")
-                        or f":{fp}:" in obs
-                        for obs in (eval_fp_set or set())
-                    )
+                    if observed_keys is not None:
+                        matched_eval = fp in observed_keys or fp in (eval_fp_set or set())
+                    else:
+                        matched_eval = any(
+                            obs == fp or obs.startswith(f"{fp}:")
+                            for obs in (eval_fp_set or set())
+                        )
                     if not matched_eval:
                         stale_quarantine.append(
                             {
@@ -2385,10 +2459,26 @@ def load_quarantine_rules(quarantine_file: Path | None) -> set[str]:
             if isinstance(entry, dict) and "known_anneal_bug" in entry:
                 name = entry.get("name")
                 bug = entry.get("known_anneal_bug")
-                if isinstance(name, str):
-                    rules.add(name)
-                    if isinstance(bug, dict) and isinstance(bug.get("divergence_class"), str):
-                        rules.add(f"{name}:{bug['divergence_class']}")
+                if not isinstance(name, str) or not name.strip() or not isinstance(bug, dict):
+                    continue
+                obs_t = bug.get("observed_anneal_tag")
+                reas_t = bug.get("summary") or bug.get("reason")
+                if not isinstance(obs_t, str) or not obs_t.strip():
+                    continue
+                if not isinstance(reas_t, str) or not reas_t.strip():
+                    continue
+                expires = bug.get("expires")
+                if expires is not None and (
+                    not isinstance(expires, str)
+                    or not _is_valid_iso_date(expires)
+                    or expires < today
+                ):
+                    continue
+                clean_name = name.strip()
+                rules.add(clean_name)
+                div_cls = bug.get("divergence_class")
+                if isinstance(div_cls, str) and div_cls.strip():
+                    rules.add(f"{clean_name}:{div_cls.strip()}")
     else:
         try:
             data = json.loads(text)

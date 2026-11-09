@@ -972,6 +972,72 @@ theorem containsAll_monotone [DecidableEq α] (req : List α) :
   simp only [List.all_eq_true, decide_eq_true_eq] at h ⊢
   exact fun a ha => hsub.subset (h a ha)
 
+/-- A sublist whose length is at least the ambient list's length is equal to it. -/
+theorem sublist_eq_of_length_le {ys xs : List α} (hsub : ys.Sublist xs)
+    (hlen : xs.length ≤ ys.length) : ys = xs := by
+  induction hsub with
+  | slnil => rfl
+  | cons a h _ =>
+    have hle := h.length_le
+    simp only [List.length_cons] at hlen
+    omega
+  | cons_cons a h ih =>
+    simp only [List.length_cons] at hlen
+    rw [ih (by omega)]
+
+/-- Antisymmetry of 1-minimal witnesses under a monotone predicate: if `r₁` and `r₂` are
+both 1-minimal and `r₁` is a sublist of `r₂`, then `r₁ = r₂`. -/
+theorem isOneMinimal_eq_of_sublist_of_monotone (pred : List α → Bool)
+    (h_mono : ∀ ys xs : List α, ys.Sublist xs → pred ys = true → pred xs = true)
+    {r₁ r₂ : List α} (h₁ : IsOneMinimal pred r₁) (h₂ : IsOneMinimal pred r₂)
+    (hsub : r₁.Sublist r₂) : r₁ = r₂ := by
+  by_cases hlt : r₁.length < r₂.length
+  · have hfalse := isOneMinimal_globally_minimal_of_monotone pred h_mono h₂ r₁ hsub hlt
+    rw [h₁.1] at hfalse
+    contradiction
+  · exact sublist_eq_of_length_le hsub (by omega)
+
+/-- Uniqueness of 1-minimal witnesses when `pred` is monotone and closed under common
+sublist lower bounds on sublists of `xs`. -/
+theorem isOneMinimal_unique_of_monotone_inf (pred : List α → Bool) (xs : List α)
+    (h_mono : ∀ ys zs : List α, ys.Sublist zs → pred ys = true → pred zs = true)
+    (h_inf : ∀ y₁ y₂ : List α, y₁.Sublist xs → y₂.Sublist xs →
+      pred y₁ = true → pred y₂ = true →
+      ∃ w, w.Sublist y₁ ∧ w.Sublist y₂ ∧ pred w = true)
+    {r₁ r₂ : List α} (hsub₁ : r₁.Sublist xs) (hsub₂ : r₂.Sublist xs)
+    (hmin₁ : IsOneMinimal pred r₁) (hmin₂ : IsOneMinimal pred r₂) : r₁ = r₂ := by
+  obtain ⟨w, hw₁, hw₂, hpw⟩ := h_inf r₁ r₂ hsub₁ hsub₂ hmin₁.1 hmin₂.1
+  have heq₁ : w = r₁ := by
+    by_cases hlt : w.length < r₁.length
+    · have hf := isOneMinimal_globally_minimal_of_monotone pred h_mono hmin₁ w hw₁ hlt
+      rw [hpw] at hf
+      contradiction
+    · exact sublist_eq_of_length_le hw₁ (by omega)
+  have heq₂ : w = r₂ := by
+    by_cases hlt : w.length < r₂.length
+    · have hf := isOneMinimal_globally_minimal_of_monotone pred h_mono hmin₂ w hw₂ hlt
+      rw [hpw] at hf
+      contradiction
+    · exact sublist_eq_of_length_le hw₂ (by omega)
+  exact heq₁.symm.trans heq₂
+
+/-- Under monotonicity and sublist lower-bound closure, the specification shrinker
+`shrinkMutatorChain` and the Rust reference model `ddminReference` return the exact same
+1-minimal witness `r`. -/
+theorem shrinkMutatorChain_eq_ddminReference_of_monotone_inf (pred : List α → Bool)
+    (xs r : List α) (fuel_s fuel_d : Nat)
+    (h_mono : ∀ ys zs : List α, ys.Sublist zs → pred ys = true → pred zs = true)
+    (h_inf : ∀ y₁ y₂ : List α, y₁.Sublist xs → y₂.Sublist xs →
+      pred y₁ = true → pred y₂ = true →
+      ∃ w, w.Sublist y₁ ∧ w.Sublist y₂ ∧ pred w = true)
+    (h_ddmin : ddminReference pred fuel_d xs = some r)
+    (h_fuel : xs.length ≤ fuel_s) :
+    shrinkMutatorChain fuel_s pred xs = r := by
+  obtain ⟨h_pred, hmin_r, hsub_r⟩ := ddminReference_one_minimal pred fuel_d xs r h_ddmin
+  have hmin_s := shrinkMutatorChain_one_minimal fuel_s pred xs h_pred h_fuel
+  have hsub_s := shrinkMutatorChain_sublist fuel_s pred xs
+  exact isOneMinimal_unique_of_monotone_inf pred xs h_mono h_inf hsub_s hsub_r hmin_s hmin_r
+
 /-- Non-monotone (coupled) predicate: `[1, 2, 3]` is 1-minimal although the smaller
 `[3]` also satisfies it, so 1-minimality is not global minimality in general. -/
 theorem coupled_window_one_minimal_not_globally_minimal :
@@ -1338,6 +1404,48 @@ theorem bvAshrOverflowing_fst_msb_eq {w : Nat} (lhs rhs : BitVec w) :
   · exact BitVec.msb_sshiftRight
   · rfl
 
+/-- Zero-shift right-identity for `bvShlSafe` at any positive width `w > 0`. -/
+@[simp]
+theorem bvShlSafe_zero_right {w : Nat} (lhs : BitVec w) (hw : w > 0) :
+    bvShlSafe lhs (0 : BitVec w) = some lhs := by
+  rw [bvShlSafe_eq_of_lt lhs 0 (by simpa using hw)]
+  simp
+
+/-- Zero-shift right-identity for `bvLshrSafe` at any positive width `w > 0`. -/
+@[simp]
+theorem bvLshrSafe_zero_right {w : Nat} (lhs : BitVec w) (hw : w > 0) :
+    bvLshrSafe lhs (0 : BitVec w) = some lhs := by
+  rw [bvLshrSafe_eq_of_lt lhs 0 (by simpa using hw)]
+  simp
+
+/-- Zero-shift right-identity for `bvAshrSafe` at any positive width `w > 0`. -/
+@[simp]
+theorem bvAshrSafe_zero_right {w : Nat} (lhs : BitVec w) (hw : w > 0) :
+    bvAshrSafe lhs (0 : BitVec w) = some lhs := by
+  rw [bvAshrSafe_eq_of_lt lhs 0 (by simpa using hw)]
+  simp
+
+/-- Zero-shift right-identity for `bvShlOverflowing` at any positive width `w > 0`. -/
+@[simp]
+theorem bvShlOverflowing_zero_right {w : Nat} (lhs : BitVec w) (hw : w > 0) :
+    bvShlOverflowing lhs (0 : BitVec w) = (lhs, false) := by
+  rw [bvShlOverflowing_eq_of_lt lhs 0 (by simpa using hw)]
+  simp
+
+/-- Zero-shift right-identity for `bvLshrOverflowing` at any positive width `w > 0`. -/
+@[simp]
+theorem bvLshrOverflowing_zero_right {w : Nat} (lhs : BitVec w) (hw : w > 0) :
+    bvLshrOverflowing lhs (0 : BitVec w) = (lhs, false) := by
+  rw [bvLshrOverflowing_eq_of_lt lhs 0 (by simpa using hw)]
+  simp
+
+/-- Zero-shift right-identity for `bvAshrOverflowing` at any positive width `w > 0`. -/
+@[simp]
+theorem bvAshrOverflowing_zero_right {w : Nat} (lhs : BitVec w) (hw : w > 0) :
+    bvAshrOverflowing lhs (0 : BitVec w) = (lhs, false) := by
+  rw [bvAshrOverflowing_eq_of_lt lhs 0 (by simpa using hw)]
+  simp
+
 /-! ## Part 3: Concrete Kernel Regression Witnesses (Zero `native_decide`) -/
 
 /-- On non-negative operands (`msb = false`) the guarded arithmetic and logical right
@@ -1656,6 +1764,8 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms ddminReference_eq_some_self_of_isOneMinimal_le_two
 #print axioms isOneMinimal_globally_minimal_of_monotone
 #print axioms ddminReference_globally_minimal_of_monotone
+#print axioms isOneMinimal_unique_of_monotone_inf
+#print axioms shrinkMutatorChain_eq_ddminReference_of_monotone_inf
 #print axioms coupled_window_one_minimal_not_globally_minimal
 #print axioms shrinkMutatorChain_fuel_bound_tight
 #print axioms bvAshrOverflowing_eq_bvLshrOverflowing_of_msb_false
@@ -1669,6 +1779,8 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms bvAshrOverflowing_snd_eq_true_iff
 #print axioms bvAshrSafe_msb_eq
 #print axioms bvAshrOverflowing_fst_msb_eq
+#print axioms bvShlSafe_zero_right
+#print axioms bvAshrOverflowing_zero_right
 #print axioms bvShlSafe_u128_exp_2pow64_plus_13
 #print axioms bvShlOverflowing_u128_exp_2pow64_plus_13
 #print axioms bvAshrOverflowing_u128_exp_2pow64_plus_13_masks_to_13

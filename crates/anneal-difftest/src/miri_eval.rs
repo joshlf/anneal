@@ -1096,18 +1096,30 @@ pub fn minimize_miri_candidate_mutations(
     anneal_repo_root: Option<&Path>,
 ) -> Result<MiriCandidateShrinkResult, String> {
     let toolchain = MiriToolchain::resolve(None, None, None)?;
-    // Artifacts of signature-matching oracle runs, keyed by the evaluated `fn_source`.
+    // Artifacts of signature-matching oracle runs, keyed by the evaluated `fn_source`,
+    // plus an evaluation cache so repeated `ddmin` queries on the same `fn_source`
+    // across sweeps do not re-run the live Miri + Lean oracle pipeline.
     let mut artifacts_by_source: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut report_cache: BTreeMap<String, Option<ItemOracleReport>> = BTreeMap::new();
 
     let eval_live = |sub_cand: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
-        let live = evaluate_candidate_live(sub_cand, &toolchain, anneal_repo_root).ok()?;
+        if let Some(cached) = report_cache.get(&sub_cand.fn_source) {
+            return cached.clone();
+        }
+        let Some(live) = evaluate_candidate_live(sub_cand, &toolchain, anneal_repo_root).ok()
+        else {
+            report_cache.insert(sub_cand.fn_source.clone(), None);
+            return None;
+        };
         if discrepancy_signatures_match(original_report, &live.report) {
             artifacts_by_source.insert(
                 sub_cand.fn_source.clone(),
                 (live.mir_neighborhood, live.kernel_confirm_theorems),
             );
         }
-        Some(live.report)
+        let rep = Some(live.report);
+        report_cache.insert(sub_cand.fn_source.clone(), rep.clone());
+        rep
     };
 
     let mut res = minimize_miri_candidate_mutations_with(cand, seeds, original_report, eval_live);
