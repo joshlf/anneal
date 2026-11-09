@@ -1,11 +1,11 @@
 # BRIEF-3.1 Reproduction Guide: Whole-Graph Crate & Sysroot (`core`/`alloc`) MIR Capture
 
-This document provides exact, copy-pasteable commands to reproduce and verify `BRIEF-3.1` in `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-3-1`.
+This document provides exact, copy-pasteable commands to reproduce and verify `BRIEF-3.1` in `<path/to/anneal>`.
 
 ## 1. Environment Setup
 
 ```bash
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-3-1
+cd <path/to/anneal>
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
 ```
 
