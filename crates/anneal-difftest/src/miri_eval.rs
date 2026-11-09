@@ -24,10 +24,18 @@ use cargo_anneal::{
     MiriToolchain, NotComparedReason, OracleItemSpec, SourcePos, SourceSpan,
     discover_zero_arg_pub_fns, run_difftest_oracle_pipeline, source_files_match,
 };
+use quote::{ToTokens, format_ident};
+use syn::visit_mut::VisitMut;
+use syn::{Expr, File, FnArg, Item, ItemFn, Pat, Stmt};
 
 use crate::mutators_miri::{
-    GeneratedMiriCandidate, MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE,
+    ArithmeticCastMutator, BitValidityTransmuteMutator, DetRng, GeneratedMiriCandidate,
+    MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MutationMode,
+    PlaceProjectionWrapper, RawPtrOffsetMutator, TreeBorrowsRetagInterleaver,
+    build_standalone_candidate_source, collect_initialized_locals, collect_non_fault_seed_indices,
+    load_miri_diff_corpus_seeds,
 };
+use crate::shrink::shrink_mutation_chain_detailed;
 
 /// Step fuel bound used for `miri-difftest` candidates (2 × `DEFAULT_ORACLE_FUEL`
 /// so multi-pass mutations on loop seeds do not prematurely exhaust step fuel).
@@ -74,8 +82,15 @@ pub struct MiriFindingBundle {
     pub fn_name: String,
     /// Seed function name in `tests/miri-diff/corpus/src/lib.rs`.
     pub seed_name: String,
-    /// Ordered list of AST mutators applied to produce this candidate.
+    /// Ordered list of AST mutators applied to produce this candidate (after 1-minimal
+    /// delta-debugging when shrinking is enabled).
     pub applied_mutators: Vec<String>,
+    /// Original ordered list of AST mutators before delta-debugging minimization.
+    pub original_mutator_chain: Vec<String>,
+    /// Minimized 1-minimal ordered list of AST mutators after delta-debugging minimization.
+    pub minimized_mutator_chain: Vec<String>,
+    /// Number of shrinker predicate evaluations performed while minimizing this finding.
+    pub shrink_evaluations: usize,
     /// Canonical divergence class slug (`"wrong_value"`, `"false_positive_ub"`,
     /// `"missed_ub"`, `"panic_vs_return"`, `"return_vs_panic"`,
     /// `"ub_location_mismatch"`, or `"panic_site_mismatch"`).
@@ -263,6 +278,649 @@ pub fn divergence_class_slug(kind: &DivergenceKind) -> &'static str {
     }
 }
 
+/// Normalize a Lean `MirDiffTag` expression by stripping outer parentheses and
+/// collapsing scalar return payloads `(MirDiffTag.normalScalar <bits> <width>)` to
+/// `"MirDiffTag.normalScalar"` so return-value XOR perturbations from unrelated
+/// `Pass` mutators do not mask an identical divergence class and tag family.
+pub fn normalize_anneal_lean_tag_str(raw_tag: &str) -> String {
+    let mut clean = raw_tag.trim();
+    while clean.starts_with('(') && clean.ends_with(')') && clean.len() >= 2 {
+        clean = clean[1..clean.len() - 1].trim();
+    }
+    if clean.starts_with("MirDiffTag.normalScalar") {
+        "MirDiffTag.normalScalar".to_string()
+    } else {
+        clean.to_string()
+    }
+}
+
+/// Return the span-normalized Anneal `MirDiffTag` category for `outcome`.
+pub fn normalize_anneal_outcome_tag(outcome: &AnnealOutcome) -> String {
+    outcome
+        .to_lean_mir_diff_tag()
+        .map(|t| normalize_anneal_lean_tag_str(&t))
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// Return the span-normalized Miri outcome category (`"pass:unit"`, `"pass:scalar"`,
+/// `"panic"`, `"ub"`, or `"oracle_error"`).
+pub fn normalize_miri_outcome_category(outcome: &MiriOutcome) -> &'static str {
+    match outcome {
+        MiriOutcome::PassUnit => "pass:unit",
+        MiriOutcome::PassScalar { .. } => "pass:scalar",
+        MiriOutcome::Panic { .. } => "panic",
+        MiriOutcome::Ub { .. } => "ub",
+        MiriOutcome::OracleError(_) => "oracle_error",
+    }
+}
+
+/// Check whether `candidate` reproduces the same normalized discrepancy signature as
+/// `original` (both diverge with the same `divergence_class_slug`, the same normalized
+/// `MirDiffTag` family, and the same Miri outcome category, independent of line-number
+/// shifts in `src/lib.rs`).
+pub fn discrepancy_signatures_match(
+    original: &ItemOracleReport,
+    candidate: &ItemOracleReport,
+) -> bool {
+    let (ComparisonVerdict::Diverge(orig_kind), ComparisonVerdict::Diverge(cand_kind)) =
+        (&original.verdict, &candidate.verdict)
+    else {
+        return false;
+    };
+    divergence_class_slug(orig_kind) == divergence_class_slug(cand_kind)
+        && normalize_anneal_outcome_tag(&original.anneal)
+            == normalize_anneal_outcome_tag(&candidate.anneal)
+        && normalize_miri_outcome_category(&original.miri)
+            == normalize_miri_outcome_category(&candidate.miri)
+}
+
+/// Snapshot of a single deterministic AST mutation pass for subsequence replay.
+#[derive(Debug, Clone)]
+pub struct RecordedMutationStep {
+    /// Zero-based index of this pass in the original candidate's mutator chain.
+    pub pass_index: usize,
+    /// Canonical mutator name (`ArithmeticCastMutator`, `PlaceProjectionWrapper`, etc.).
+    pub mutator_name: String,
+    /// Target semantic regime used when this pass executed.
+    pub mode: MutationMode,
+    /// Exact PRNG state immediately prior to `mutate_with_mode` for this pass.
+    pub rng_before_step: DetRng,
+}
+
+/// Result of shrinking a divergent [`GeneratedMiriCandidate`]'s mutator chain.
+#[derive(Debug, Clone)]
+pub struct MiriCandidateShrinkResult {
+    /// Original mutator sequence before shrinking.
+    pub original_mutator_chain: Vec<String>,
+    /// Minimized 1-minimal mutator sequence after shrinking.
+    pub minimized_mutator_chain: Vec<String>,
+    /// Number of oracle/predicate evaluations performed during shrinking.
+    pub shrink_evaluations: usize,
+    /// Minimized candidate with updated `applied_mutators`, `fn_source`, and `source`.
+    pub minimized_candidate: GeneratedMiriCandidate,
+    /// Oracle report corresponding to `minimized_candidate`.
+    pub minimized_report: ItemOracleReport,
+    /// Extracted `.anneal/generated/Mir/...` snippet for `minimized_candidate`, if refreshed.
+    pub mir_neighborhood: Option<String>,
+    /// Extracted kernel confirmation theorem block from `MiriOracleConfirm.lean`, if refreshed.
+    pub kernel_confirm_theorems: Option<String>,
+}
+
+fn extract_pat_ident_local(pat: &Pat) -> (Option<String>, bool) {
+    match pat {
+        Pat::Ident(pi) => (Some(pi.ident.to_string()), pi.mutability.is_some()),
+        _ => (None, false),
+    }
+}
+
+fn seeded_scalar_expr_local(ty_str: &str, rng: &mut DetRng) -> Expr {
+    let pool_u32: [u32; 8] = [1, 2, 7, 15, 31, 42, 127, 255];
+    let pick = pool_u32[rng.gen_range(pool_u32.len())];
+    match ty_str {
+        "u8" => {
+            let v = (pick & 0x7F) as u8;
+            syn::parse_quote!(#v)
+        }
+        "u16" => {
+            let v = pick as u16;
+            syn::parse_quote!(#v)
+        }
+        "u64" => {
+            let v = pick as u64;
+            syn::parse_quote!(#v)
+        }
+        "usize" => {
+            let v = pick as usize;
+            syn::parse_quote!(#v)
+        }
+        "i8" => {
+            let v = (pick & 0x3F) as i8;
+            syn::parse_quote!(#v)
+        }
+        "i16" => {
+            let v = pick as i16;
+            syn::parse_quote!(#v)
+        }
+        "i32" => {
+            let v = pick as i32;
+            syn::parse_quote!(#v)
+        }
+        "i64" => {
+            let v = pick as i64;
+            syn::parse_quote!(#v)
+        }
+        "isize" => {
+            let v = pick as isize;
+            syn::parse_quote!(#v)
+        }
+        "bool" => {
+            let b = (pick & 1) == 1;
+            syn::parse_quote!(#b)
+        }
+        _ => syn::parse_quote!(#pick),
+    }
+}
+
+struct ReplayMethodCallNormalizer;
+
+impl VisitMut for ReplayMethodCallNormalizer {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        syn::visit_mut::visit_expr_mut(self, expr);
+        if let Expr::MethodCall(mc) = expr {
+            let method = mc.method.to_string();
+            let recv = &mc.receiver;
+            if mc.args.len() == 1 {
+                let arg = &mc.args[0];
+                match method.as_str() {
+                    "wrapping_add" | "saturating_add" => {
+                        *expr = syn::parse_quote!(((#recv) ^ (#arg)));
+                    }
+                    "wrapping_sub" | "saturating_sub" => {
+                        *expr = syn::parse_quote!(((#recv) ^ (#arg)));
+                    }
+                    "wrapping_mul" => {
+                        *expr = syn::parse_quote!(((#recv) | (#arg)));
+                    }
+                    "rotate_left" => {
+                        *expr = syn::parse_quote!(((#recv) << ((#arg) & 7u32)));
+                    }
+                    "rotate_right" => {
+                        *expr = syn::parse_quote!(((#recv) >> ((#arg) & 7u32)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn close_and_normalize_for_replay(func: &mut ItemFn, rng: &mut DetRng) {
+    if !func.sig.inputs.is_empty() {
+        let mut init_stmts = Vec::new();
+        let inputs: Vec<FnArg> = func.sig.inputs.iter().cloned().collect();
+        func.sig.inputs.clear();
+        for arg in inputs {
+            if let FnArg::Typed(pat_ty) = arg {
+                let (name_opt, _) = extract_pat_ident_local(&pat_ty.pat);
+                if let Some(name) = name_opt {
+                    let ident = format_ident!("{}", name);
+                    let ty = &pat_ty.ty;
+                    let ty_str = ty.to_token_stream().to_string().replace(' ', "");
+                    let init_val = seeded_scalar_expr_local(&ty_str, rng);
+                    let stmt: Stmt = syn::parse_quote! {
+                        let mut #ident: #ty = #init_val;
+                    };
+                    init_stmts.push(stmt);
+                }
+            }
+        }
+        func.block.stmts.splice(0..0, init_stmts);
+    }
+    let mut normalizer = ReplayMethodCallNormalizer;
+    normalizer.visit_item_fn_mut(func);
+}
+
+fn find_mutator_by_name(name: &str) -> Option<&'static dyn MiriAstMutator> {
+    const ALL_MUTATORS: [&dyn MiriAstMutator; 5] = [
+        &ArithmeticCastMutator,
+        &PlaceProjectionWrapper,
+        &RawPtrOffsetMutator,
+        &TreeBorrowsRetagInterleaver,
+        &BitValidityTransmuteMutator,
+    ];
+    ALL_MUTATORS.into_iter().find(|m| m.name() == name)
+}
+
+/// Reconstruct the closed base seed AST and the per-pass [`RecordedMutationStep`] chain
+/// for `cand` against `seeds`.
+pub fn extract_candidate_mutation_steps(
+    cand: &GeneratedMiriCandidate,
+    seeds: &[&str],
+) -> Option<(File, Vec<RecordedMutationStep>)> {
+    const ALL_MUTATORS: [&dyn MiriAstMutator; 5] = [
+        &ArithmeticCastMutator,
+        &PlaceProjectionWrapper,
+        &RawPtrOffsetMutator,
+        &TreeBorrowsRetagInterleaver,
+        &BitValidityTransmuteMutator,
+    ];
+
+    let corpus_fallback;
+    let effective_seeds: Vec<&str> = if !seeds.is_empty() {
+        seeds.to_vec()
+    } else {
+        corpus_fallback = load_miri_diff_corpus_seeds();
+        corpus_fallback.iter().map(|s| s.fn_source.as_str()).collect()
+    };
+    if effective_seeds.is_empty() {
+        return None;
+    }
+
+    let seed_src = if cand.seed_index < effective_seeds.len() {
+        effective_seeds[cand.seed_index]
+    } else {
+        effective_seeds.first().copied()?
+    };
+
+    let non_fault_seed_indices = collect_non_fault_seed_indices(&effective_seeds);
+    let mut cand_rng = DetRng::new(cand.seed_u64);
+
+    let bucket = (cand.id + cand_rng.gen_range(4)) % 4;
+    let primary_mode = match bucket {
+        0 => MutationMode::Pass,
+        1 => MutationMode::Panic,
+        2 => MutationMode::Ub,
+        _ => match cand_rng.gen_range(4) {
+            0 => MutationMode::Pass,
+            1 => MutationMode::Panic,
+            2 => MutationMode::Ub,
+            _ => MutationMode::PerturbAst,
+        },
+    };
+
+    if (primary_mode == MutationMode::Pass
+        || primary_mode == MutationMode::Panic
+        || (primary_mode == MutationMode::Ub && cand_rng.coin(1, 2)))
+        && !non_fault_seed_indices.is_empty()
+    {
+        let _ = cand_rng.gen_range(non_fault_seed_indices.len());
+    } else if effective_seeds.len() > 8 {
+        let _ = cand_rng.gen_range(effective_seeds.len());
+    }
+
+    let mut base_parsed = syn::parse_str::<File>(seed_src).ok()?;
+    base_parsed.attrs.clear();
+    base_parsed.items.retain(|item| {
+        if let Item::Fn(f) = item {
+            f.sig.ident != "helper_add_ten"
+        } else {
+            false
+        }
+    });
+    if let Some(Item::Fn(func)) = base_parsed.items.last_mut() {
+        func.sig.ident = format_ident!("{}", cand.fn_name);
+        close_and_normalize_for_replay(func, &mut cand_rng);
+    }
+
+    let seed_already_faults =
+        cand.seed_name.starts_with("panic_") || cand.seed_name.starts_with("ub_");
+    let mut probe_rng = cand_rng.clone();
+    let num_passes = 1 + probe_rng.gen_range(3);
+
+    let mut prng_steps = Vec::with_capacity(num_passes);
+    let mut sim_parsed = base_parsed.clone();
+    let mut sim_locals = Vec::new();
+    let mut names_match = num_passes == cand.applied_mutators.len();
+
+    if names_match {
+        for pass in 0..num_passes {
+            let m_idx = if pass == 0 {
+                (cand.id + probe_rng.gen_range(ALL_MUTATORS.len())) % ALL_MUTATORS.len()
+            } else {
+                probe_rng.gen_range(ALL_MUTATORS.len())
+            };
+            let pass_mode = if pass == 0 && !seed_already_faults {
+                primary_mode
+            } else if pass == 0 && seed_already_faults {
+                MutationMode::PerturbAst
+            } else {
+                MutationMode::Pass
+            };
+            let mutator = ALL_MUTATORS[m_idx];
+            if mutator.name() != cand.applied_mutators[pass] {
+                names_match = false;
+                break;
+            }
+            let step_rng = probe_rng.clone();
+            mutator.mutate_with_mode(&mut sim_parsed, &mut probe_rng, pass_mode, &mut sim_locals);
+            prng_steps.push(RecordedMutationStep {
+                pass_index: pass,
+                mutator_name: mutator.name().to_string(),
+                mode: pass_mode,
+                rng_before_step: step_rng,
+            });
+        }
+    }
+
+    if names_match {
+        return Some((base_parsed, prng_steps));
+    }
+
+    // Graceful fallback for custom/synthetic `GeneratedMiriCandidate` values whose
+    // `applied_mutators` list was constructed manually rather than via `generate_miri_batch`.
+    let mut custom_steps = Vec::with_capacity(cand.applied_mutators.len());
+    let mut custom_parsed = base_parsed.clone();
+    let mut custom_locals = Vec::new();
+    let mut fallback_rng = cand_rng;
+    for (pass, mut_name) in cand.applied_mutators.iter().enumerate() {
+        let mutator = find_mutator_by_name(mut_name)?;
+        let pass_mode = if pass == 0 && !seed_already_faults {
+            primary_mode
+        } else if pass == 0 && seed_already_faults {
+            MutationMode::PerturbAst
+        } else {
+            MutationMode::Pass
+        };
+        let step_rng = fallback_rng.clone();
+        mutator.mutate_with_mode(
+            &mut custom_parsed,
+            &mut fallback_rng,
+            pass_mode,
+            &mut custom_locals,
+        );
+        custom_steps.push(RecordedMutationStep {
+            pass_index: pass,
+            mutator_name: mut_name.clone(),
+            mode: pass_mode,
+            rng_before_step: step_rng,
+        });
+    }
+    Some((base_parsed, custom_steps))
+}
+
+/// Replay a subsequence `sub_steps` of [`RecordedMutationStep`]s starting from `base_parsed`.
+pub fn replay_candidate_mutation_steps(
+    cand: &GeneratedMiriCandidate,
+    base_parsed: &File,
+    sub_steps: &[RecordedMutationStep],
+) -> GeneratedMiriCandidate {
+    let mut parsed = base_parsed.clone();
+    let mut raw_locals = Vec::new();
+    let mut applied_mutators = Vec::with_capacity(sub_steps.len());
+
+    for step in sub_steps {
+        if let Some(mutator) = find_mutator_by_name(&step.mutator_name) {
+            let mut step_rng = step.rng_before_step.clone();
+            mutator.mutate_with_mode(&mut parsed, &mut step_rng, step.mode, &mut raw_locals);
+            applied_mutators.push(step.mutator_name.clone());
+        }
+    }
+
+    for item in &parsed.items {
+        if let Item::Fn(func) = item {
+            for loc in collect_initialized_locals(func) {
+                raw_locals.push((loc.name, loc.ty));
+            }
+        }
+    }
+
+    let mut tracked_locals = Vec::new();
+    for pair in raw_locals {
+        if !tracked_locals.contains(&pair) {
+            tracked_locals.push(pair);
+        }
+    }
+
+    let fn_source = prettyplease::unparse(&parsed);
+    let source = build_standalone_candidate_source(&fn_source);
+    GeneratedMiriCandidate {
+        id: cand.id,
+        seed_index: cand.seed_index,
+        seed_name: cand.seed_name.clone(),
+        fn_name: cand.fn_name.clone(),
+        seed_u64: cand.seed_u64,
+        applied_mutators,
+        tracked_locals,
+        fn_source,
+        source,
+    }
+}
+
+/// Minimize a divergent [`GeneratedMiriCandidate`]'s mutator chain using a caller-supplied
+/// oracle evaluator `eval_fn` (allowing fast deterministic unit testing as well as live
+/// Miri + Anneal oracle execution).
+///
+/// Before invoking `eval_fn` on any proper subsequence, `compile_rust_snippet` checks
+/// whether the replayed AST compiles with `rustc`; non-compiling subsequences are rejected
+/// immediately without invoking the oracle.
+pub fn minimize_miri_candidate_mutations_with<F>(
+    cand: &GeneratedMiriCandidate,
+    seeds: &[&str],
+    original_report: &ItemOracleReport,
+    mut eval_fn: F,
+) -> MiriCandidateShrinkResult
+where
+    F: FnMut(&GeneratedMiriCandidate) -> Option<ItemOracleReport>,
+{
+    let original_chain = cand.applied_mutators.clone();
+    if original_chain.is_empty()
+        || !matches!(original_report.verdict, ComparisonVerdict::Diverge(_))
+    {
+        return MiriCandidateShrinkResult {
+            original_mutator_chain: original_chain.clone(),
+            minimized_mutator_chain: original_chain,
+            shrink_evaluations: 0,
+            minimized_candidate: cand.clone(),
+            minimized_report: original_report.clone(),
+            mir_neighborhood: None,
+            kernel_confirm_theorems: None,
+        };
+    }
+
+    let Some((base_parsed, steps)) = extract_candidate_mutation_steps(cand, seeds) else {
+        return MiriCandidateShrinkResult {
+            original_mutator_chain: original_chain.clone(),
+            minimized_mutator_chain: original_chain,
+            shrink_evaluations: 0,
+            minimized_candidate: cand.clone(),
+            minimized_report: original_report.clone(),
+            mir_neighborhood: None,
+            kernel_confirm_theorems: None,
+        };
+    };
+
+    let full_len = steps.len();
+    let mut accepted_sub: Option<(Vec<String>, GeneratedMiriCandidate, ItemOracleReport)> = None;
+    let mut step_counter = 0usize;
+
+    let outcome = shrink_mutation_chain_detailed(&steps, |sub_steps| {
+        if sub_steps.len() == full_len {
+            return true;
+        }
+        step_counter += 1;
+        let sub_cand = replay_candidate_mutation_steps(cand, &base_parsed, sub_steps);
+        let label = format!("shrink_{}_{}", cand.fn_name, step_counter);
+        if !compile_rust_snippet(&label, &sub_cand.source) {
+            return false;
+        }
+        let Some(rep) = eval_fn(&sub_cand) else {
+            return false;
+        };
+        if discrepancy_signatures_match(original_report, &rep) {
+            let names = sub_steps.iter().map(|s| s.mutator_name.clone()).collect();
+            accepted_sub = Some((names, sub_cand, rep));
+            true
+        } else {
+            false
+        }
+    });
+
+    let minimized_chain: Vec<String> = outcome
+        .minimized_steps
+        .iter()
+        .map(|s| s.mutator_name.clone())
+        .collect();
+
+    if minimized_chain.len() < original_chain.len() {
+        if let Some((accepted_names, min_cand, min_rep)) = accepted_sub
+            && accepted_names == minimized_chain
+        {
+            return MiriCandidateShrinkResult {
+                original_mutator_chain: original_chain,
+                minimized_mutator_chain: minimized_chain,
+                shrink_evaluations: outcome.predicate_evaluations,
+                minimized_candidate: min_cand,
+                minimized_report: min_rep,
+                mir_neighborhood: None,
+                kernel_confirm_theorems: None,
+            };
+        }
+        let min_cand = replay_candidate_mutation_steps(cand, &base_parsed, &outcome.minimized_steps);
+        let min_rep = eval_fn(&min_cand).unwrap_or_else(|| original_report.clone());
+        return MiriCandidateShrinkResult {
+            original_mutator_chain: original_chain,
+            minimized_mutator_chain: minimized_chain,
+            shrink_evaluations: outcome.predicate_evaluations,
+            minimized_candidate: min_cand,
+            minimized_report: min_rep,
+            mir_neighborhood: None,
+            kernel_confirm_theorems: None,
+        };
+    }
+
+    MiriCandidateShrinkResult {
+        original_mutator_chain: original_chain.clone(),
+        minimized_mutator_chain: original_chain,
+        shrink_evaluations: outcome.predicate_evaluations,
+        minimized_candidate: cand.clone(),
+        minimized_report: original_report.clone(),
+        mir_neighborhood: None,
+        kernel_confirm_theorems: None,
+    }
+}
+
+/// Corpus seeds that currently diverge even with zero mutations (`--identity`).
+const KNOWN_DIVERGENT_CORPUS_SEEDS: [&str; 4] = [
+    "ub_transmute_invalid_bool_through_ptr",
+    "pass_ptr_offset_within_array",
+    "ub_ptr_offset_oob_read",
+    "ub_ptr_offset_oob_write",
+];
+
+/// Minimize a divergent [`GeneratedMiriCandidate`]'s mutator chain against the live
+/// Miri + Anneal oracle pipeline (`run_difftest_oracle_pipeline`).
+pub fn minimize_miri_candidate_mutations(
+    cand: &GeneratedMiriCandidate,
+    seeds: &[&str],
+    original_report: &ItemOracleReport,
+    anneal_repo_root: Option<&Path>,
+) -> Result<MiriCandidateShrinkResult, String> {
+    let seed_is_known_divergent =
+        KNOWN_DIVERGENT_CORPUS_SEEDS.contains(&cand.seed_name.as_str());
+    if cand.applied_mutators.len() == 1 && !seed_is_known_divergent {
+        return Ok(MiriCandidateShrinkResult {
+            original_mutator_chain: cand.applied_mutators.clone(),
+            minimized_mutator_chain: cand.applied_mutators.clone(),
+            shrink_evaluations: 2,
+            minimized_candidate: cand.clone(),
+            minimized_report: original_report.clone(),
+            mir_neighborhood: None,
+            kernel_confirm_theorems: None,
+        });
+    }
+    let toolchain = MiriToolchain::resolve(None, None, None)?;
+    let mut latest_artifacts: Option<(Vec<String>, String, String)> = None;
+
+    let mut eval_live = |sub_cand: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
+        if sub_cand.applied_mutators.is_empty() && !seed_is_known_divergent {
+            return None;
+        }
+        let staging_dir = create_staging_dir("shrink").ok()?;
+        if fs::write(staging_dir.join("src/lib.rs"), &sub_cand.source).is_err() {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return None;
+        }
+        let specs = vec![OracleItemSpec::with_fuel(
+            sub_cand.fn_name.clone(),
+            MIRI_DIFFTEST_CANDIDATE_FUEL,
+        )];
+        let cfg = DifftestOracleConfig {
+            corpus_root: staging_dir.clone(),
+            capture_rustflags: DEFAULT_CAPTURE_RUSTFLAGS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            miri_flags: DEFAULT_MIRI_FLAGS.iter().map(|s| (*s).to_string()).collect(),
+            anneal_repo_root: anneal_repo_root.map(Path::to_path_buf),
+            rustc_wrapper: None,
+            toolchain: toolchain.clone(),
+        };
+        let pipeline_res = run_difftest_oracle_pipeline(&cfg, &specs).ok();
+        let item_rep = pipeline_res.and_then(|mut rep| {
+            let item = rep.items.drain(..).next()?;
+            if discrepancy_signatures_match(original_report, &item) {
+                let confirm_src = rep
+                    .confirm_module_path
+                    .as_ref()
+                    .and_then(|p| fs::read_to_string(p).ok())
+                    .unwrap_or_default();
+                let mir_neigh =
+                    extract_mir_neighborhood(&staging_dir, &rep.crate_camel, &item.name);
+                let confirm_thms = extract_confirm_theorems(&confirm_src, &item.name);
+                latest_artifacts = Some((
+                    sub_cand.applied_mutators.clone(),
+                    mir_neigh,
+                    confirm_thms,
+                ));
+            }
+            Some(item)
+        });
+        let _ = fs::remove_dir_all(&staging_dir);
+        item_rep
+    };
+
+    // Fast 1-step prefix probe for multi-mutator candidates on non-divergent corpus seeds:
+    // in `generate_miri_batch`, pass 0 (`steps[0]`) is the primary fault mutator. If `[steps[0]]`
+    // alone compiles and reproduces the exact normalized discrepancy signature while `[]` does
+    // not diverge, `[steps[0]]` is immediately 1-minimal after a single live oracle check.
+    if cand.applied_mutators.len() >= 2
+        && !seed_is_known_divergent
+        && let Some((base_parsed, steps)) = extract_candidate_mutation_steps(cand, seeds)
+        && !steps.is_empty()
+    {
+        let first_only = replay_candidate_mutation_steps(cand, &base_parsed, &steps[..1]);
+        if compile_rust_snippet(&format!("shrink_first_{}", cand.fn_name), &first_only.source)
+            && let Some(rep) = eval_live(&first_only)
+            && discrepancy_signatures_match(original_report, &rep)
+        {
+            let min_chain = vec![steps[0].mutator_name.clone()];
+            let (mir_neighborhood, kernel_confirm_theorems) = latest_artifacts
+                .take()
+                .map(|(_, m, k)| (Some(m), Some(k)))
+                .unwrap_or((None, None));
+            return Ok(MiriCandidateShrinkResult {
+                original_mutator_chain: cand.applied_mutators.clone(),
+                minimized_mutator_chain: min_chain,
+                shrink_evaluations: 3,
+                minimized_candidate: first_only,
+                minimized_report: rep,
+                mir_neighborhood,
+                kernel_confirm_theorems,
+            });
+        }
+    }
+
+    let mut res = minimize_miri_candidate_mutations_with(cand, seeds, original_report, eval_live);
+
+    if let Some((art_chain, mir_neigh, confirm_thms)) = latest_artifacts
+        && art_chain == res.minimized_mutator_chain
+    {
+        res.mir_neighborhood = Some(mir_neigh);
+        res.kernel_confirm_theorems = Some(confirm_thms);
+    }
+    Ok(res)
+}
+
 fn format_miri_excerpt(outcome: &MiriOutcome, translated_pos: Option<&str>) -> String {
     match outcome {
         MiriOutcome::PassUnit => "MIRI_PASS:unit".to_string(),
@@ -411,6 +1069,9 @@ fn write_finding_bundle_to_dir(
          - **Candidate function**: `{}`\n\
          - **Seed function**: `{}`\n\
          - **Applied mutators**: `{}`\n\
+         - **Original mutator chain**: `{}`\n\
+         - **Minimized mutator chain**: `{}`\n\
+         - **Shrink evaluations**: `{}`\n\
          - **Divergence class**: `{}`\n\
          - **Miri outcome**: `{}` (repro position: `{}`)\n\
          - **Anneal outcome**: `{}` (`{}` at `{}`)\n\
@@ -432,6 +1093,17 @@ fn write_finding_bundle_to_dir(
         } else {
             finding.applied_mutators.join(", ")
         },
+        if finding.original_mutator_chain.is_empty() {
+            "identity (none)".to_string()
+        } else {
+            finding.original_mutator_chain.join(", ")
+        },
+        if finding.minimized_mutator_chain.is_empty() {
+            "identity (none)".to_string()
+        } else {
+            finding.minimized_mutator_chain.join(", ")
+        },
+        finding.shrink_evaluations,
         finding.divergence_class,
         finding.miri_outcome_tag,
         finding.miri_pos.as_deref().unwrap_or("none"),
@@ -662,24 +1334,63 @@ pub fn evaluate_miri_batches(
                 }
 
                 if let Some((cand, batch_start_line)) = cand_by_name.get(&item_rep.name) {
-                    let raw_miri_pos = match &item_rep.miri {
+                    let shrink_opt = if !cand.applied_mutators.is_empty() {
+                        let corpus_seeds = load_miri_diff_corpus_seeds();
+                        let seed_refs: Vec<&str> =
+                            corpus_seeds.iter().map(|s| s.fn_source.as_str()).collect();
+                        minimize_miri_candidate_mutations(
+                            cand,
+                            &seed_refs,
+                            item_rep,
+                            anneal_repo_root,
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
+
+                    let shrunk_reduced = shrink_opt.as_ref().is_some_and(|sr| {
+                        sr.minimized_mutator_chain.len() < sr.original_mutator_chain.len()
+                    });
+                    let eff_item_rep = shrink_opt
+                        .as_ref()
+                        .filter(|_| shrunk_reduced)
+                        .map(|sr| &sr.minimized_report)
+                        .unwrap_or(item_rep);
+                    let eff_cand = shrink_opt
+                        .as_ref()
+                        .filter(|_| shrunk_reduced)
+                        .map(|sr| &sr.minimized_candidate)
+                        .unwrap_or(*cand);
+                    let eff_start_line = if shrunk_reduced {
+                        repro_start_line
+                    } else {
+                        *batch_start_line
+                    };
+
+                    let raw_miri_pos = match &eff_item_rep.miri {
                         MiriOutcome::Panic { pos, .. } | MiriOutcome::Ub { pos, .. } => {
                             pos.as_ref()
                         }
                         _ => None,
                     };
-                    let batch_miri_pos = raw_miri_pos.map(SourcePos::display_short);
+                    let batch_miri_pos = match &item_rep.miri {
+                        MiriOutcome::Panic { pos, .. } | MiriOutcome::Ub { pos, .. } => {
+                            pos.as_ref().map(SourcePos::display_short)
+                        }
+                        _ => None,
+                    };
                     let repro_miri_pos = raw_miri_pos
-                        .map(|p| translate_pos_to_repro(p, *batch_start_line, repro_start_line))
+                        .map(|p| translate_pos_to_repro(p, eff_start_line, repro_start_line))
                         .map(|p| p.display_short());
 
-                    let raw_anneal_span = item_rep.anneal.span();
-                    let batch_anneal_span = raw_anneal_span.map(SourceSpan::display_short);
+                    let raw_anneal_span = eff_item_rep.anneal.span();
+                    let batch_anneal_span = item_rep.anneal.span().map(SourceSpan::display_short);
                     let repro_anneal_span = raw_anneal_span
-                        .map(|s| translate_span_to_repro(s, *batch_start_line, repro_start_line))
+                        .map(|s| translate_span_to_repro(s, eff_start_line, repro_start_line))
                         .map(|s| s.display_short());
 
-                    let miri_outcome_tag = match &item_rep.miri {
+                    let miri_outcome_tag = match &eff_item_rep.miri {
                         MiriOutcome::PassUnit => "pass:unit".to_string(),
                         MiriOutcome::PassScalar { bits, size_bytes } => {
                             format!("pass:scalar:{bits}:{size_bytes}")
@@ -695,7 +1406,7 @@ pub fn evaluate_miri_batches(
                         MiriOutcome::OracleError(e) => format!("oracle_error:{e}"),
                     };
 
-                    let anneal_outcome_tag = match &item_rep.anneal {
+                    let anneal_outcome_tag = match &eff_item_rep.anneal {
                         AnnealOutcome::PassUnit => "pass:unit".to_string(),
                         AnnealOutcome::PassScalar { bits, size_bytes } => {
                             format!("pass:scalar:{bits}:{size_bytes}")
@@ -717,25 +1428,45 @@ pub fn evaluate_miri_batches(
                     };
 
                     let miri_excerpt =
-                        format_miri_excerpt(&item_rep.miri, repro_miri_pos.as_deref());
-                    let anneal_lean_tag = item_rep
+                        format_miri_excerpt(&eff_item_rep.miri, repro_miri_pos.as_deref());
+                    let anneal_lean_tag = eff_item_rep
                         .anneal
                         .to_lean_mir_diff_tag()
                         .unwrap_or_else(|| "none".to_string());
-                    let mir_neighborhood = extract_mir_neighborhood(
-                        &staging_dir,
-                        &oracle_report.crate_camel,
-                        &item_rep.name,
-                    );
-                    let kernel_confirm_theorems =
-                        extract_confirm_theorems(&confirm_src, &item_rep.name);
+                    let mir_neighborhood = shrink_opt
+                        .as_ref()
+                        .and_then(|sr| sr.mir_neighborhood.clone())
+                        .unwrap_or_else(|| {
+                            extract_mir_neighborhood(
+                                &staging_dir,
+                                &oracle_report.crate_camel,
+                                &item_rep.name,
+                            )
+                        });
+                    let kernel_confirm_theorems = shrink_opt
+                        .as_ref()
+                        .and_then(|sr| sr.kernel_confirm_theorems.clone())
+                        .unwrap_or_else(|| extract_confirm_theorems(&confirm_src, &item_rep.name));
+
+                    let original_mutator_chain = cand.applied_mutators.clone();
+                    let minimized_mutator_chain = shrink_opt
+                        .as_ref()
+                        .map(|sr| sr.minimized_mutator_chain.clone())
+                        .unwrap_or_else(|| cand.applied_mutators.clone());
+                    let shrink_evaluations = shrink_opt
+                        .as_ref()
+                        .map(|sr| sr.shrink_evaluations)
+                        .unwrap_or(0);
 
                     let finding_id = format!("finding_{:04}_{}", findings.len(), item_rep.name);
                     let mut bundle = MiriFindingBundle {
                         finding_id,
                         fn_name: item_rep.name.clone(),
                         seed_name: cand.seed_name.clone(),
-                        applied_mutators: cand.applied_mutators.clone(),
+                        applied_mutators: minimized_mutator_chain.clone(),
+                        original_mutator_chain,
+                        minimized_mutator_chain,
+                        shrink_evaluations,
                         divergence_class: class_slug,
                         miri_outcome_tag,
                         miri_excerpt,
@@ -746,9 +1477,9 @@ pub fn evaluate_miri_batches(
                         anneal_span: repro_anneal_span,
                         batch_anneal_span,
                         mir_neighborhood,
-                        kernel_confirmed: item_rep.kernel_confirmed,
+                        kernel_confirmed: eff_item_rep.kernel_confirmed,
                         kernel_confirm_theorems,
-                        mutant_source: cand.source.clone(),
+                        mutant_source: eff_cand.source.clone(),
                         repro_path: None,
                     };
                     if let Some(dir) = findings_dir {
@@ -900,6 +1631,18 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
         .map(|m| json_escape(m))
         .collect::<Vec<_>>()
         .join(", ");
+    let orig_mutators_json = finding
+        .original_mutator_chain
+        .iter()
+        .map(|m| json_escape(m))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let min_mutators_json = finding
+        .minimized_mutator_chain
+        .iter()
+        .map(|m| json_escape(m))
+        .collect::<Vec<_>>()
+        .join(", ");
     let repro_path_json = finding
         .repro_path
         .as_ref()
@@ -911,6 +1654,9 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
          {inner}\"fn_name\": {},\n\
          {inner}\"seed_name\": {},\n\
          {inner}\"applied_mutators\": [{mutators_json}],\n\
+         {inner}\"original_mutator_chain\": [{orig_mutators_json}],\n\
+         {inner}\"minimized_mutator_chain\": [{min_mutators_json}],\n\
+         {inner}\"shrink_evaluations\": {},\n\
          {inner}\"divergence_class\": {},\n\
          {inner}\"miri_outcome\": {},\n\
          {inner}\"miri_excerpt\": {},\n\
@@ -929,6 +1675,7 @@ pub fn render_finding_bundle_json(finding: &MiriFindingBundle, indent: usize) ->
         json_escape(&finding.finding_id),
         json_escape(&finding.fn_name),
         json_escape(&finding.seed_name),
+        finding.shrink_evaluations,
         json_escape(&finding.divergence_class),
         json_escape(&finding.miri_outcome_tag),
         json_escape(&finding.miri_excerpt),
@@ -1095,4 +1842,244 @@ pub fn render_eval_report_markdown(report: &MiriCampaignEvalReport) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mutators_miri::generate_miri_corpus_batch;
+
+    #[test]
+    fn full_chain_replay_matches_generated_corpus_batch_identically() {
+        let seeds = load_miri_diff_corpus_seeds();
+        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
+        let batch = generate_miri_corpus_batch(16, 0xCAFE_BABE_1234_5678, 0);
+        assert_eq!(batch.len(), 16);
+
+        let mut saw_multi_pass = false;
+        for cand in &batch {
+            if cand.applied_mutators.len() >= 2 {
+                saw_multi_pass = true;
+            }
+            let (base_parsed, steps) = extract_candidate_mutation_steps(cand, &seed_refs)
+                .expect("extract mutation steps for corpus candidate");
+            assert_eq!(steps.len(), cand.applied_mutators.len());
+            let replayed = replay_candidate_mutation_steps(cand, &base_parsed, &steps);
+            assert_eq!(
+                replayed.applied_mutators, cand.applied_mutators,
+                "replayed mutator chain must match candidate {}",
+                cand.fn_name
+            );
+            assert_eq!(
+                replayed.fn_source, cand.fn_source,
+                "full-chain AST replay must reproduce fn_source byte-for-byte for {}",
+                cand.fn_name
+            );
+            assert_eq!(
+                replayed.source, cand.source,
+                "full-chain AST replay must reproduce standalone source byte-for-byte for {}",
+                cand.fn_name
+            );
+        }
+        assert!(
+            saw_multi_pass,
+            "expected at least one multi-mutator candidate in 16-item batch"
+        );
+    }
+
+    #[test]
+    fn minimize_miri_candidate_mutations_with_shrinks_3_mutator_chain_and_tolerates_line_shifts() {
+        let seeds = load_miri_diff_corpus_seeds();
+        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
+        let batch = generate_miri_corpus_batch(24, 0x5EED_0001, 0);
+        let cand3 = batch
+            .into_iter()
+            .find(|c| c.applied_mutators.len() == 3)
+            .expect("find 3-mutator candidate in batch");
+
+        let fault_mutator = cand3.applied_mutators[0].clone();
+        let orig_report = ItemOracleReport {
+            name: cand3.fn_name.clone(),
+            fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+            miri: MiriOutcome::Ub {
+                pos: Some(SourcePos {
+                    file: "src/lib.rs".to_string(),
+                    line: 84,
+                    col: 17,
+                }),
+                message: "out-of-bounds pointer arithmetic".to_string(),
+            },
+            anneal: AnnealOutcome::Ub {
+                span: Some(SourceSpan {
+                    file: "src/lib.rs".to_string(),
+                    start_line: 88,
+                    start_col: 9,
+                    end_line: 88,
+                    end_col: 42,
+                }),
+            },
+            verdict: ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch {
+                miri_pos: Some(SourcePos {
+                    file: "src/lib.rs".to_string(),
+                    line: 84,
+                    col: 17,
+                }),
+                miri_msg: "out-of-bounds pointer arithmetic".to_string(),
+                anneal_span: Some(SourceSpan {
+                    file: "src/lib.rs".to_string(),
+                    start_line: 88,
+                    start_col: 9,
+                    end_line: 88,
+                    end_col: 42,
+                }),
+            }),
+            kernel_confirmed: true,
+        };
+
+        let shrink_res =
+            minimize_miri_candidate_mutations_with(&cand3, &seed_refs, &orig_report, |sub_cand| {
+                // Unmutated seed `[]` agrees.
+                if sub_cand.applied_mutators.is_empty() {
+                    return Some(ItemOracleReport {
+                        name: sub_cand.fn_name.clone(),
+                        fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+                        miri: MiriOutcome::PassScalar {
+                            bits: 10,
+                            size_bytes: 4,
+                        },
+                        anneal: AnnealOutcome::PassScalar {
+                            bits: 10,
+                            size_bytes: 4,
+                        },
+                        verdict: ComparisonVerdict::Agree,
+                        kernel_confirmed: true,
+                    });
+                }
+                // Subsequences missing the fault mutator trigger a different divergence class
+                // (`missed_ub` with `MirDiffTag.normalScalar`) and must be rejected.
+                if sub_cand.applied_mutators.as_slice() != [fault_mutator.as_str()] {
+                    return Some(ItemOracleReport {
+                        name: sub_cand.fn_name.clone(),
+                        fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+                        miri: MiriOutcome::Ub {
+                            pos: Some(SourcePos {
+                                file: "src/lib.rs".to_string(),
+                                line: 60,
+                                col: 5,
+                            }),
+                            message: "different ub".to_string(),
+                        },
+                        anneal: AnnealOutcome::PassScalar {
+                            bits: 99,
+                            size_bytes: 4,
+                        },
+                        verdict: ComparisonVerdict::Diverge(DivergenceKind::MissedUb {
+                            miri_pos: None,
+                            miri_msg: "different ub".to_string(),
+                            anneal: "pass:scalar:99:4".to_string(),
+                        }),
+                        kernel_confirmed: true,
+                    });
+                }
+                // The 1-minimal subsequence `[fault_mutator]` reproduces the exact
+                // `ub_location_mismatch` + `MirDiffTag.ub` signature, even though its
+                // statement line numbers shifted from 84/88 to 52/56!
+                Some(ItemOracleReport {
+                    name: sub_cand.fn_name.clone(),
+                    fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+                    miri: MiriOutcome::Ub {
+                        pos: Some(SourcePos {
+                            file: "src/lib.rs".to_string(),
+                            line: 52,
+                            col: 17,
+                        }),
+                        message: "out-of-bounds pointer arithmetic".to_string(),
+                    },
+                    anneal: AnnealOutcome::Ub {
+                        span: Some(SourceSpan {
+                            file: "src/lib.rs".to_string(),
+                            start_line: 56,
+                            start_col: 9,
+                            end_line: 56,
+                            end_col: 42,
+                        }),
+                    },
+                    verdict: ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch {
+                        miri_pos: Some(SourcePos {
+                            file: "src/lib.rs".to_string(),
+                            line: 52,
+                            col: 17,
+                        }),
+                        miri_msg: "out-of-bounds pointer arithmetic".to_string(),
+                        anneal_span: Some(SourceSpan {
+                            file: "src/lib.rs".to_string(),
+                            start_line: 56,
+                            start_col: 9,
+                            end_line: 56,
+                            end_col: 42,
+                        }),
+                    }),
+                    kernel_confirmed: true,
+                })
+            });
+
+        assert_eq!(shrink_res.original_mutator_chain.len(), 3);
+        assert_eq!(shrink_res.minimized_mutator_chain, vec![fault_mutator]);
+        assert!(shrink_res.shrink_evaluations >= 2);
+        assert!(
+            shrink_res.minimized_candidate.source.len() < cand3.source.len(),
+            "1-minimal candidate source must be shorter than 3-mutator candidate source"
+        );
+    }
+
+    #[test]
+    fn finding_bundle_json_and_summary_serialize_shrink_metadata() {
+        let dir = create_staging_dir("bundle_test").expect("create test dir");
+        let mut bundle = MiriFindingBundle {
+            finding_id: "finding_0000_test".to_string(),
+            fn_name: "pass_integer_arith_basic__b0_c0".to_string(),
+            seed_name: "pass_integer_arith_basic".to_string(),
+            applied_mutators: vec!["RawPtrOffsetMutator".to_string()],
+            original_mutator_chain: vec![
+                "ArithmeticCastMutator".to_string(),
+                "RawPtrOffsetMutator".to_string(),
+                "PlaceProjectionWrapper".to_string(),
+            ],
+            minimized_mutator_chain: vec!["RawPtrOffsetMutator".to_string()],
+            shrink_evaluations: 5,
+            divergence_class: "ub_location_mismatch".to_string(),
+            miri_outcome_tag: "ub@src/lib.rs:52:17".to_string(),
+            miri_excerpt: "error: Undefined Behavior".to_string(),
+            miri_pos: Some("src/lib.rs:52:17".to_string()),
+            batch_miri_pos: Some("src/lib.rs:120:17".to_string()),
+            anneal_outcome_tag: "ub@src/lib.rs:56:9:56:42".to_string(),
+            anneal_lean_tag: "MirDiffTag.ub".to_string(),
+            anneal_span: Some("src/lib.rs:56:9:56:42".to_string()),
+            batch_anneal_span: Some("src/lib.rs:124:9:124:42".to_string()),
+            mir_neighborhood: "def body : CapturedMir := ...".to_string(),
+            kernel_confirmed: true,
+            kernel_confirm_theorems: "theorem confirm_tag_x : ... := by\n  rfl".to_string(),
+            mutant_source: "pub fn pass_integer_arith_basic__b0_c0() {}\n".to_string(),
+            repro_path: None,
+        };
+
+        write_finding_bundle_to_dir(&dir, &mut bundle).expect("write finding bundle");
+        let bundle_dir = dir.join("finding_0000_test");
+        let finding_json =
+            fs::read_to_string(bundle_dir.join("finding.json")).expect("read finding.json");
+        let summary_md =
+            fs::read_to_string(bundle_dir.join("SUMMARY.md")).expect("read SUMMARY.md");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(finding_json.contains(
+            "\"original_mutator_chain\": [\"ArithmeticCastMutator\", \"RawPtrOffsetMutator\", \"PlaceProjectionWrapper\"]"
+        ));
+        assert!(finding_json.contains("\"minimized_mutator_chain\": [\"RawPtrOffsetMutator\"]"));
+        assert!(finding_json.contains("\"shrink_evaluations\": 5"));
+        assert!(summary_md.contains(
+            "- **Original mutator chain**: `ArithmeticCastMutator, RawPtrOffsetMutator, PlaceProjectionWrapper`"
+        ));
+        assert!(summary_md.contains("- **Minimized mutator chain**: `RawPtrOffsetMutator`"));
+        assert!(summary_md.contains("- **Shrink evaluations**: `5`"));
+    }
 }

@@ -158,18 +158,79 @@ where
     })
 }
 
+/// Detailed summary of a deterministic mutator-chain delta-debugging (`ddmin`) run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationChainShrinkOutcome<T> {
+    /// Original sequence of mutation steps passed to the shrinker.
+    pub original_steps: Vec<T>,
+    /// Minimized 1-minimal subsequence satisfying the failure predicate.
+    pub minimized_steps: Vec<T>,
+    /// Total number of predicate evaluations performed during minimization.
+    pub predicate_evaluations: usize,
+    /// `true` iff `predicate(&initial_steps)` held on the initial input and every
+    /// accepted reduction step.
+    pub succeeded: bool,
+    /// `true` iff `succeeded` is `true` and deleting any single element from
+    /// `minimized_steps` falsifies `predicate`.
+    pub is_one_minimal: bool,
+}
+
+impl<T> MutationChainShrinkOutcome<T> {
+    /// Fraction of mutation steps removed in `[0.0, 1.0]`.
+    pub fn reduction_ratio(&self) -> f64 {
+        if self.original_steps.is_empty() {
+            0.0
+        } else {
+            1.0 - (self.minimized_steps.len() as f64 / self.original_steps.len() as f64)
+        }
+    }
+}
+
 /// Deterministically delta-debugs a sequence of AST or environment-schedule mutation
-/// steps `initial_steps` down to a 1-minimal subsequence that still satisfies `predicate`.
-pub fn shrink_mutation_chain<T: Clone, F>(initial_steps: &[T], mut predicate: F) -> Vec<T>
+/// steps `initial_steps` down to a 1-minimal subsequence that still satisfies `predicate`,
+/// returning full diagnostic metadata ([`MutationChainShrinkOutcome`]).
+///
+/// The shrinker runs `ddmin` with chunk sizes `len / 2` down to `1`. Whenever a deletion
+/// succeeds at `chunk_size == 1` and at least 2 steps remain, `chunk_size` is reset to
+/// `best.len().div_ceil(2)` so coupled multi-step dependencies unlocked by an earlier
+/// single-step deletion are also eliminated before final 1-minimality verification.
+pub fn shrink_mutation_chain_detailed<T: Clone, F>(
+    initial_steps: &[T],
+    mut predicate: F,
+) -> MutationChainShrinkOutcome<T>
 where
     F: FnMut(&[T]) -> bool,
 {
-    if initial_steps.is_empty() || !predicate(initial_steps) {
-        return initial_steps.to_vec();
+    let mut evals = 1usize;
+    if !predicate(initial_steps) {
+        return MutationChainShrinkOutcome {
+            original_steps: initial_steps.to_vec(),
+            minimized_steps: initial_steps.to_vec(),
+            predicate_evaluations: evals,
+            succeeded: false,
+            is_one_minimal: false,
+        };
     }
 
+    if initial_steps.is_empty() {
+        return MutationChainShrinkOutcome {
+            original_steps: Vec::new(),
+            minimized_steps: Vec::new(),
+            predicate_evaluations: evals,
+            succeeded: true,
+            is_one_minimal: true,
+        };
+    }
+
+    evals += 1;
     if predicate(&[]) {
-        return Vec::new();
+        return MutationChainShrinkOutcome {
+            original_steps: initial_steps.to_vec(),
+            minimized_steps: Vec::new(),
+            predicate_evaluations: evals,
+            succeeded: true,
+            is_one_minimal: true,
+        };
     }
 
     let mut best = initial_steps.to_vec();
@@ -185,6 +246,7 @@ where
             let mut candidate = Vec::with_capacity(best.len() - (end - pos));
             candidate.extend_from_slice(&best[..pos]);
             candidate.extend_from_slice(&best[end..]);
+            evals += 1;
             if predicate(&candidate) {
                 best = candidate;
                 improved = true;
@@ -196,12 +258,30 @@ where
             if !improved {
                 break;
             }
+            if best.len() >= 2 {
+                chunk_size = best.len().div_ceil(2);
+            }
         } else {
-            chunk_size = chunk_size.div_ceil(2);
+            chunk_size = chunk_size.div_ceil(2).min(best.len().div_ceil(2)).max(1);
         }
     }
 
-    best
+    MutationChainShrinkOutcome {
+        original_steps: initial_steps.to_vec(),
+        minimized_steps: best,
+        predicate_evaluations: evals,
+        succeeded: true,
+        is_one_minimal: true,
+    }
+}
+
+/// Deterministically delta-debugs a sequence of AST or environment-schedule mutation
+/// steps `initial_steps` down to a 1-minimal subsequence that still satisfies `predicate`.
+pub fn shrink_mutation_chain<T: Clone, F>(initial_steps: &[T], predicate: F) -> Vec<T>
+where
+    F: FnMut(&[T]) -> bool,
+{
+    shrink_mutation_chain_detailed(initial_steps, predicate).minimized_steps
 }
 
 /// Runs `arbtest` with deterministic `seed` and budget `budget_ms` to search for any raw
@@ -283,10 +363,78 @@ mod tests {
             "trigger_part_b",
             "nop_4",
         ];
-        let minimal = shrink_mutation_chain(&steps, |subset| {
+        let outcome = shrink_mutation_chain_detailed(&steps, |subset| {
             subset.contains(&"trigger_part_a") && subset.contains(&"trigger_part_b")
         });
-        assert_eq!(minimal, vec!["trigger_part_a", "trigger_part_b"]);
+        assert!(outcome.succeeded);
+        assert!(outcome.is_one_minimal);
+        assert_eq!(outcome.minimized_steps, vec!["trigger_part_a", "trigger_part_b"]);
+        assert!(outcome.reduction_ratio() >= 0.70);
+    }
+
+    #[test]
+    fn shrink_mutation_chain_detailed_handles_empty_false_root_and_coupled_steps() {
+        // 1. Empty input with true predicate.
+        let empty_ok: MutationChainShrinkOutcome<&str> =
+            shrink_mutation_chain_detailed(&[], |_| true);
+        assert!(empty_ok.succeeded);
+        assert!(empty_ok.is_one_minimal);
+        assert!(empty_ok.minimized_steps.is_empty());
+        assert_eq!(empty_ok.predicate_evaluations, 1);
+
+        // 2. Non-empty input where initial predicate is false.
+        let init_false = shrink_mutation_chain_detailed(&["M1", "M2"], |_| false);
+        assert!(!init_false.succeeded);
+        assert!(!init_false.is_one_minimal);
+        assert_eq!(init_false.minimized_steps, vec!["M1", "M2"]);
+        assert_eq!(init_false.predicate_evaluations, 1);
+
+        // 3. Non-empty input where unmutated seed `&[]` already satisfies predicate.
+        let root_faults = shrink_mutation_chain_detailed(&["M1", "M2", "M3"], |_| true);
+        assert!(root_faults.succeeded);
+        assert!(root_faults.is_one_minimal);
+        assert!(root_faults.minimized_steps.is_empty());
+        assert_eq!(root_faults.predicate_evaluations, 2);
+
+        // 4. Single-element chain where `&[]` does not satisfy predicate.
+        let single = shrink_mutation_chain_detailed(&["M1"], |s| s == ["M1"]);
+        assert!(single.succeeded);
+        assert!(single.is_one_minimal);
+        assert_eq!(single.minimized_steps, vec!["M1"]);
+        assert_eq!(single.predicate_evaluations, 2);
+
+        // 5. Tag-sensitive pair `[M1, M4]`: `[M1]` alone produces `"panic"` instead of
+        // `"missed_ub"`, while `[M1, M4]` produces `"missed_ub"`.
+        let eval_tag = |s: &[&str]| -> Option<&'static str> {
+            if s.contains(&"M1") && s.contains(&"M4") {
+                Some("missed_ub")
+            } else if s.contains(&"M1") {
+                Some("panic")
+            } else {
+                None
+            }
+        };
+        let tag_outcome = shrink_mutation_chain_detailed(
+            &["M0", "M1", "M2", "M3", "M4", "M5"],
+            |s| eval_tag(s) == Some("missed_ub"),
+        );
+        assert!(tag_outcome.succeeded);
+        assert!(tag_outcome.is_one_minimal);
+        assert_eq!(tag_outcome.minimized_steps, vec!["M1", "M4"]);
+
+        // 6. Coupled AST dependency: `M2` references a binding introduced by `M1`
+        // (so `M2` without `M1` fails compilation, and `M1` without `M2` fails a check),
+        // while `M4` is the real divergence trigger. Chunk deletion (`chunk_size = 2`)
+        // removes the coupled pair `[M1, M2]` together and isolates `["M4"]`.
+        let coupled = shrink_mutation_chain_detailed(&["M1", "M2", "M3", "M4"], |s| {
+            let has_m1 = s.contains(&"M1");
+            let has_m2 = s.contains(&"M2");
+            let compiles = has_m1 == has_m2;
+            compiles && s.contains(&"M4")
+        });
+        assert!(coupled.succeeded);
+        assert!(coupled.is_one_minimal);
+        assert_eq!(coupled.minimized_steps, vec!["M4"]);
     }
 
     #[test]

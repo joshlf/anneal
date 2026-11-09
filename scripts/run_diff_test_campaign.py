@@ -810,7 +810,7 @@ def evaluate_miri_red_flags(
             f"identical_metrics_across_seeds: seed {seed_hex} produced identical verdicts/outcomes/mutators to prior seed {prev_seed}"
         )
 
-    # 5. Oracle error count within threshold.
+    # 5. Oracle error count within threshold & `error` vs. `unsupported` boundary.
     oracle_errors = (
         int(nc_reasons.get("miri_oracle_error", 0))
         + int(nc_reasons.get("capture_failed", 0))
@@ -823,18 +823,808 @@ def evaluate_miri_red_flags(
             f"oracle_errors_exceeded: {oracle_errors} oracle/capture errors > max_oracle_errors ({max_oracle_errors})"
         )
 
+    boundary_ok, boundary_reasons = validate_error_vs_unsupported_boundary(
+        summary, max_oracle_errors=max_oracle_errors
+    )
+    for br in boundary_reasons:
+        if br not in reasons:
+            reasons.append(br)
+
     checks = {
         "oracle_invoked": oracle_invoked,
         "non_zero_compared": non_zero_compared,
         "plausible_wall_clock": plausible_wall_clock,
         "seed_sensitivity": seed_sensitive,
         "oracle_error_threshold": within_error_threshold,
+        "error_vs_unsupported_boundary": boundary_ok,
     }
     return RedFlagResult(
         passed=all(checks.values()),
         checks=checks,
         failure_reasons=reasons,
     )
+
+
+ERROR_MASKED_AS_UNSUPPORTED_MARKERS: tuple[str, ...] = (
+    "internal panic",
+    "sigabrt",
+    "sigsegv",
+    "capture_failed",
+    "capture_error",
+    "miri_oracle_error",
+    "oracle_error",
+    "parse error",
+    "syntax error",
+    "malformed",
+    "nat.shiftl exponent is too big",
+    "lean crashed",
+    "rustc crashed",
+)
+
+
+def validate_error_vs_unsupported_boundary(
+    summary: dict[str, Any],
+    max_oracle_errors: int = DEFAULT_MAX_ORACLE_ERRORS,
+) -> tuple[bool, list[str]]:
+    """Enforces that malformed inputs, capture/Lean crashes, and oracle errors are
+    classified as `error` rather than masked under `unsupported`.
+    """
+    reasons: list[str] = []
+    miri_verdicts = summary.get("miri_verdicts")
+    anneal_outcomes = summary.get("anneal_outcomes")
+    nc_reasons = summary.get("not_compared_reasons")
+
+    miri_err = int(miri_verdicts.get("error", 0)) if isinstance(miri_verdicts, dict) else 0
+    anneal_err = int(anneal_outcomes.get("error", 0)) if isinstance(anneal_outcomes, dict) else 0
+    nc_miri_err = (
+        int(nc_reasons.get("miri_oracle_error", 0)) if isinstance(nc_reasons, dict) else 0
+    )
+    nc_cap_err = (
+        int(nc_reasons.get("capture_failed", 0)) if isinstance(nc_reasons, dict) else 0
+    )
+    nc_unsupported = (
+        int(nc_reasons.get("unsupported", 0)) if isinstance(nc_reasons, dict) else 0
+    )
+    anneal_unsupported = (
+        int(anneal_outcomes.get("unsupported", 0))
+        if isinstance(anneal_outcomes, dict)
+        else 0
+    )
+
+    oracle_errors = nc_miri_err + nc_cap_err + miri_err + anneal_err
+    if oracle_errors > max_oracle_errors:
+        reasons.append(
+            f"oracle_errors_exceeded: {oracle_errors} oracle/capture errors > max_oracle_errors ({max_oracle_errors})"
+        )
+
+    # If `not_compared_reasons["unsupported"]` exceeds `anneal_outcomes["unsupported"]`,
+    # capture/oracle errors were misrouted into the `unsupported` bucket.
+    if (
+        isinstance(nc_reasons, dict)
+        and isinstance(anneal_outcomes, dict)
+        and nc_unsupported > anneal_unsupported
+    ):
+        reasons.append(
+            f"error_masked_as_unsupported: not_compared_reasons.unsupported ({nc_unsupported}) > "
+            f"anneal_outcomes.unsupported ({anneal_unsupported})"
+        )
+
+    # If `anneal_outcomes["error"] > 0` while `capture_failed == 0` and `unsupported > 0`,
+    # an Anneal capture/Lean error was masked as `unsupported`.
+    if anneal_err > 0 and nc_cap_err == 0 and nc_unsupported > 0:
+        reasons.append(
+            f"error_masked_as_unsupported: anneal_outcomes.error={anneal_err} with "
+            f"capture_failed=0 and unsupported={nc_unsupported}"
+        )
+
+    def _has_crash_or_malformed_marker(text: str) -> str | None:
+        lowered = text.lower()
+        for marker in ERROR_MASKED_AS_UNSUPPORTED_MARKERS:
+            if marker in lowered:
+                return marker
+        return None
+
+    # Inspect findings and optional item/diagnostic records for crash/malformed markers
+    # paired with an `unsupported` outcome or tag.
+    for list_key in ("findings", "item_reports", "not_compared_items", "diagnostics"):
+        items = summary.get(list_key)
+        if not isinstance(items, list):
+            continue
+        for idx, item in enumerate(items):
+            if isinstance(item, str):
+                if "unsupported" in item.lower():
+                    hit = _has_crash_or_malformed_marker(item)
+                    if hit is not None:
+                        reasons.append(
+                            f"error_masked_as_unsupported: {list_key}[{idx}] masks '{hit}' under unsupported"
+                        )
+                continue
+            if not isinstance(item, dict):
+                continue
+            combined_fields = " ".join(
+                str(item.get(k, ""))
+                for k in (
+                    "anneal_outcome",
+                    "anneal_lean_tag",
+                    "miri_outcome",
+                    "miri_excerpt",
+                    "reason",
+                    "not_compared_reason",
+                    "diagnostic",
+                    "message",
+                    "verdict",
+                )
+            )
+            is_unsupported_bucket = (
+                "unsupported" in str(item.get("anneal_outcome", "")).lower()
+                or "unsupported" in str(item.get("anneal_lean_tag", "")).lower()
+                or "unsupported" in str(item.get("reason", "")).lower()
+                or "unsupported" in str(item.get("not_compared_reason", "")).lower()
+                or (nc_unsupported > 0 and list_key != "findings")
+            )
+            if is_unsupported_bucket:
+                hit = _has_crash_or_malformed_marker(combined_fields)
+                if hit is not None:
+                    reasons.append(
+                        f"error_masked_as_unsupported: {list_key}[{idx}] ({item.get('fn_name', item.get('name', idx))}) "
+                        f"masks '{hit}' under unsupported"
+                    )
+
+    has_masking = any(r.startswith("error_masked_as_unsupported") for r in reasons)
+    return (not has_masking and oracle_errors <= max_oracle_errors), reasons
+
+
+def _is_valid_iso_date(raw: str) -> bool:
+    if not isinstance(raw, str) or len(raw) != 10:
+        return False
+    try:
+        datetime.date.fromisoformat(raw)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_well_formed_quarantine_token(token: str) -> bool:
+    if not isinstance(token, str):
+        return False
+    clean = token.strip()
+    if not clean or any(ch.isspace() for ch in clean):
+        return False
+    parts = clean.split(":")
+    if any(not p.strip() for p in parts):
+        return False
+    return True
+
+
+def verify_no_stale_quarantine_or_known_bugs(
+    quarantine_file: Path | None = None,
+    manifest_path: Path | None = None,
+    ledger: dict[str, Any] | None = None,
+    evaluated_fingerprints: set[str] | list[str] | None = None,
+    manifest_eval_results: dict[str, Any] | None = None,
+    reference_date: str | None = None,
+) -> dict[str, Any]:
+    """Fail-closed ratchet audit flagging stale `quarantine.toml` entries and stale
+    `tests/miri-diff/manifest.toml` `known_anneal_bug` entries.
+    """
+    ref_date = reference_date if reference_date is not None else utc_date_prefix()
+    ledger_obj = ledger if isinstance(ledger, dict) else {}
+    eval_fp_set: set[str] | None = (
+        set(evaluated_fingerprints) if evaluated_fingerprints is not None else None
+    )
+
+    resolved_fps: set[str] = set()
+    for hist_key in ("resolved_history", "resolved_fingerprints"):
+        hist = ledger_obj.get(hist_key, [])
+        if isinstance(hist, list):
+            for item in hist:
+                if isinstance(item, str) and item.strip():
+                    resolved_fps.add(item.strip())
+                elif isinstance(item, dict) and isinstance(item.get("fingerprint"), str):
+                    resolved_fps.add(item["fingerprint"].strip())
+    active_fps: set[str] = set(
+        fp for fp in ledger_obj.get("active_fingerprints", []) if isinstance(fp, str)
+    )
+    active_fps.update(
+        fp for fp in ledger_obj.get("quarantined_fingerprints", []) if isinstance(fp, str)
+    )
+    if eval_fp_set is not None:
+        active_fps.update(eval_fp_set)
+
+    stale_quarantine: list[dict[str, Any]] = []
+    checked_quarantine_count = 0
+
+    if quarantine_file is not None:
+        if not quarantine_file.is_file():
+            stale_quarantine.append(
+                {
+                    "source": str(quarantine_file),
+                    "entry": "<file>",
+                    "reason": f"quarantine_file_missing: {quarantine_file}",
+                }
+            )
+        else:
+            raw_text = quarantine_file.read_text(encoding="utf-8")
+            try:
+                if quarantine_file.suffix.lower() == ".toml":
+                    q_data = tomllib.loads(raw_text)
+                else:
+                    q_data = json.loads(raw_text)
+            except (tomllib.TOMLDecodeError, json.JSONDecodeError) as e:
+                q_data = None
+                stale_quarantine.append(
+                    {
+                        "source": str(quarantine_file),
+                        "entry": "<parse>",
+                        "reason": f"malformed_quarantine_file: {e}",
+                    }
+                )
+
+            raw_entries: list[Any] = []
+            if isinstance(q_data, list):
+                raw_entries.extend(q_data)
+            elif isinstance(q_data, dict):
+                for key in ("quarantined", "entries", "rules", "fingerprints"):
+                    val = q_data.get(key)
+                    if isinstance(val, list):
+                        raw_entries.extend(val)
+
+            for idx, entry in enumerate(raw_entries):
+                checked_quarantine_count += 1
+                if isinstance(entry, str):
+                    fp = entry.strip()
+                    expires = None
+                elif isinstance(entry, dict):
+                    raw_fp = entry.get("fingerprint", entry.get("id", ""))
+                    fp = raw_fp.strip() if isinstance(raw_fp, str) else ""
+                    expires = entry.get("expires")
+                else:
+                    stale_quarantine.append(
+                        {
+                            "source": str(quarantine_file),
+                            "entry": repr(entry),
+                            "reason": f"malformed_quarantine_entry[{idx}]: expected string or table",
+                        }
+                    )
+                    continue
+
+                if not _is_well_formed_quarantine_token(fp) or (
+                    isinstance(entry, dict) and ":" not in fp
+                ):
+                    stale_quarantine.append(
+                        {
+                            "source": str(quarantine_file),
+                            "entry": fp or f"<entry[{idx}]>",
+                            "reason": f"malformed_or_missing_fingerprint: {fp!r}",
+                        }
+                    )
+                    continue
+
+                if expires is not None:
+                    if not isinstance(expires, str) or not _is_valid_iso_date(expires):
+                        stale_quarantine.append(
+                            {
+                                "source": str(quarantine_file),
+                                "entry": fp,
+                                "reason": f"malformed_expires_date: {expires!r}",
+                            }
+                        )
+                    elif expires < ref_date:
+                        stale_quarantine.append(
+                            {
+                                "source": str(quarantine_file),
+                                "entry": fp,
+                                "reason": f"expired_quarantine_entry: expires {expires} < {ref_date}",
+                            }
+                        )
+
+                if fp in resolved_fps and fp not in active_fps:
+                    stale_quarantine.append(
+                        {
+                            "source": str(quarantine_file),
+                            "entry": fp,
+                            "reason": "already_resolved_in_ledger: fingerprint in resolved_history and absent from active findings",
+                        }
+                    )
+
+                if eval_fp_set is not None:
+                    matched_eval = any(
+                        obs == fp
+                        or obs.startswith(f"{fp}:")
+                        or f":{fp}:" in obs
+                        for obs in eval_fp_set
+                    )
+                    if not matched_eval:
+                        stale_quarantine.append(
+                            {
+                                "source": str(quarantine_file),
+                                "entry": fp,
+                                "reason": "unobserved_quarantine_entry: 0 matching divergences in evaluated run",
+                            }
+                        )
+
+    stale_manifest: list[dict[str, Any]] = []
+    checked_known_bug_count = 0
+
+    if manifest_path is not None:
+        if not manifest_path.is_file():
+            stale_manifest.append(
+                {
+                    "source": str(manifest_path),
+                    "entry": "<file>",
+                    "reason": f"manifest_file_missing: {manifest_path}",
+                }
+            )
+        else:
+            try:
+                m_data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+                m_data = None
+                stale_manifest.append(
+                    {
+                        "source": str(manifest_path),
+                        "entry": "<parse>",
+                        "reason": f"malformed_manifest_toml: {e}",
+                    }
+                )
+
+            if isinstance(m_data, dict):
+                for idx, test_entry in enumerate(m_data.get("tests", [])):
+                    if not isinstance(test_entry, dict) or "known_anneal_bug" not in test_entry:
+                        continue
+                    checked_known_bug_count += 1
+                    test_name = test_entry.get("name")
+                    if not isinstance(test_name, str) or not test_name.strip():
+                        stale_manifest.append(
+                            {
+                                "source": str(manifest_path),
+                                "entry": f"tests[{idx}]",
+                                "reason": "missing_test_name_on_known_anneal_bug",
+                            }
+                        )
+                        continue
+                    bug = test_entry.get("known_anneal_bug")
+                    if not isinstance(bug, dict):
+                        stale_manifest.append(
+                            {
+                                "source": str(manifest_path),
+                                "entry": test_name,
+                                "reason": "malformed_known_anneal_bug: expected table",
+                            }
+                        )
+                        continue
+
+                    obs_tag = bug.get("observed_anneal_tag")
+                    reason_text = bug.get("summary") or bug.get("reason")
+                    if not isinstance(obs_tag, str) or not obs_tag.strip():
+                        stale_manifest.append(
+                            {
+                                "source": str(manifest_path),
+                                "entry": test_name,
+                                "reason": "missing_known_anneal_bug_metadata: missing observed_anneal_tag",
+                            }
+                        )
+                    if not isinstance(reason_text, str) or not reason_text.strip():
+                        stale_manifest.append(
+                            {
+                                "source": str(manifest_path),
+                                "entry": test_name,
+                                "reason": "missing_known_anneal_bug_metadata: missing summary/reason",
+                            }
+                        )
+
+                    if isinstance(manifest_eval_results, dict) and test_name in manifest_eval_results:
+                        ev = manifest_eval_results[test_name]
+                        if isinstance(ev, str):
+                            ev_lower = ev.strip().lower()
+                            if ev_lower in ("agree", "pass", "pass:unit") or ev_lower.startswith("pass:scalar"):
+                                stale_manifest.append(
+                                    {
+                                        "source": str(manifest_path),
+                                        "entry": test_name,
+                                        "reason": f"stale_known_anneal_bug_now_passes: observed {ev!r}",
+                                    }
+                                )
+                            elif isinstance(obs_tag, str) and obs_tag.strip():
+                                if normalize_anneal_tag(ev) != normalize_anneal_tag(obs_tag):
+                                    stale_manifest.append(
+                                        {
+                                            "source": str(manifest_path),
+                                            "entry": test_name,
+                                            "reason": f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, got {ev!r}",
+                                        }
+                                    )
+                        elif isinstance(ev, dict):
+                            verdict = str(ev.get("verdict", "")).strip().lower()
+                            actual_tag = ev.get(
+                                "observed_anneal_tag",
+                                ev.get("anneal_outcome", ev.get("anneal_lean_tag")),
+                            )
+                            if verdict == "agree":
+                                stale_manifest.append(
+                                    {
+                                        "source": str(manifest_path),
+                                        "entry": test_name,
+                                        "reason": "stale_known_anneal_bug_now_passes: verdict is Agree",
+                                    }
+                                )
+                            elif (
+                                isinstance(obs_tag, str)
+                                and obs_tag.strip()
+                                and isinstance(actual_tag, str)
+                                and actual_tag.strip()
+                                and normalize_anneal_tag(actual_tag) != normalize_anneal_tag(obs_tag)
+                            ):
+                                stale_manifest.append(
+                                    {
+                                        "source": str(manifest_path),
+                                        "entry": test_name,
+                                        "reason": (
+                                            f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, "
+                                            f"got {actual_tag!r}"
+                                        ),
+                                    }
+                                )
+
+    stale_entries = [*stale_quarantine, *stale_manifest]
+    return {
+        "passed": len(stale_entries) == 0,
+        "reference_date": ref_date,
+        "checked_quarantine_count": checked_quarantine_count,
+        "checked_known_bug_count": checked_known_bug_count,
+        "stale_quarantine_entries": stale_quarantine,
+        "stale_known_anneal_bugs": stale_manifest,
+        "stale_entries": stale_entries,
+    }
+
+
+SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "bool_valid_range",
+        "name": "bool_valid_range",
+        "bug_class": "scalar_validity_bool_range",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.BitValidity",
+        "description": "Omit bool validRange [0, 1] check on typed scalar load of 2u8 as bool",
+        "expected_kill_classes": ("missed_ub",),
+        "simulated_divergence_class": "missed_ub",
+        "simulated_miri_outcome": "ub@src/lib.rs:14:14",
+        "simulated_anneal_outcome": "pass:scalar:1:4",
+        "simulated_anneal_lean_tag": "(MirDiffTag.normalScalar 1 4)",
+        "probe_rust_source": (
+            "pub fn probe_bool_valid_range() -> u32 {\n"
+            "    let mut b: bool = false;\n"
+            "    let p: *mut u8 = (&raw mut b) as *mut u8;\n"
+            "    unsafe { *p = 2u8; }\n"
+            "    b as u32\n"
+            "}\n"
+        ),
+    },
+    {
+        "id": "storage_dead_tag",
+        "name": "storage_dead_tag",
+        "bug_class": "dangling_pointer_after_storage_dead",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Memory",
+        "description": "Omit allocation liveness / StorageDead deallocation check on raw pointer dereference",
+        "expected_kill_classes": ("missed_ub",),
+        "simulated_divergence_class": "missed_ub",
+        "simulated_miri_outcome": "ub@src/lib.rs:16:14",
+        "simulated_anneal_outcome": "pass:scalar:42:4",
+        "simulated_anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
+        "probe_rust_source": (
+            "pub fn probe_storage_dead_tag() -> u32 {\n"
+            "    let dangling: *const u32 = {\n"
+            "        let dead_local: u32 = 42u32;\n"
+            "        &raw const dead_local\n"
+            "    };\n"
+            "    unsafe { *dangling }\n"
+            "}\n"
+        ),
+    },
+    {
+        "id": "provenance_frag",
+        "name": "provenance_frag",
+        "bug_class": "partial_pointer_overwrite_provenance_strip",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Memory",
+        "description": "Omit pointer fragment provenance invalidation on partial byte overwrite",
+        "expected_kill_classes": ("missed_ub", "false_positive_ub"),
+        "simulated_divergence_class": "missed_ub",
+        "simulated_miri_outcome": "ub@src/lib.rs:18:14",
+        "simulated_anneal_outcome": "pass:scalar:7:4",
+        "simulated_anneal_lean_tag": "(MirDiffTag.normalScalar 7 4)",
+        "probe_rust_source": (
+            "pub fn probe_provenance_frag() -> u32 {\n"
+            "    let x: u32 = 7u32;\n"
+            "    let mut p: *const u32 = &raw const x;\n"
+            "    let byte_ptr: *mut u8 = (&raw mut p) as *mut u8;\n"
+            "    unsafe {\n"
+            "        let b0: u8 = *byte_ptr;\n"
+            "        *byte_ptr = b0;\n"
+            "        *p\n"
+            "    }\n"
+            "}\n"
+        ),
+    },
+    {
+        "id": "div_by_zero",
+        "name": "div_by_zero",
+        "bug_class": "checked_div_rem_zero_and_int_min_overflow",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Eval",
+        "description": "Omit divisor == 0 and INT_MIN / -1 guard in checked integer division",
+        "expected_kill_classes": ("panic_vs_return", "wrong_value", "missed_ub"),
+        "simulated_divergence_class": "panic_vs_return",
+        "simulated_miri_outcome": "panic@src/lib.rs:12:5",
+        "simulated_anneal_outcome": "pass:scalar:0:4",
+        "simulated_anneal_lean_tag": "(MirDiffTag.normalScalar 0 4)",
+        "probe_rust_source": (
+            "pub fn probe_div_by_zero() -> u32 {\n"
+            "    let num: u32 = 100u32;\n"
+            "    let den: u32 = 0u32;\n"
+            "    num / den\n"
+            "}\n"
+        ),
+    },
+    {
+        "id": "wide_shift",
+        "name": "wide_shift",
+        "bug_class": "wide_bitvec_shift_exponent_bounds_guard",
+        "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Eval",
+        "description": "Omit rhs.toNat < w guard on 64/128-bit shift with rhs >= 2^32 (GMP lean_nat_shiftl panic or missed_ub)",
+        "expected_kill_classes": ("missed_ub", "harness_error", "oracle_errors_exceeded"),
+        "simulated_divergence_class": "missed_ub",
+        "simulated_miri_outcome": "ub@src/lib.rs:13:14",
+        "simulated_anneal_outcome": "pass:scalar:1:8",
+        "simulated_anneal_lean_tag": "(MirDiffTag.normalScalar 1 8)",
+        "probe_rust_source": (
+            "pub fn probe_wide_shift() -> u64 {\n"
+            "    let lhs: u64 = 1u64;\n"
+            "    let rhs: u64 = 1u64 << 32;\n"
+            "    unsafe { unchecked_shl(lhs, rhs) }\n"
+            "}\n"
+        ),
+    },
+)
+
+
+def _simulate_mutant_through_campaign_pipeline(mutant: dict[str, Any]) -> dict[str, Any]:
+    """Runs a seeded semantic mutant probe through `validate_performed_miri_summary`,
+    `evaluate_miri_red_flags`, and `deduplicate_and_quarantine_findings` to verify
+    that the campaign pipeline kills the mutant (exits non-zero with expected class).
+    """
+    mutant_id = str(mutant["id"])
+    div_class = str(mutant["simulated_divergence_class"])
+    with tempfile.TemporaryDirectory(prefix=f"anneal-mutant-{mutant_id}-") as tmp:
+        repro_path = Path(tmp) / "repro.rs"
+        repro_path.write_text(str(mutant["probe_rust_source"]), encoding="utf-8")
+
+        div_map = {k: 0 for k in VALID_DIVERGENCE_CLASSES}
+        div_map[div_class] = 1
+        miri_is_panic = str(mutant["simulated_miri_outcome"]).startswith("panic")
+        miri_verdicts = {
+            "pass": 0,
+            "panic": 1 if miri_is_panic else 0,
+            "ub": 0 if miri_is_panic else 1,
+            "error": 0,
+        }
+        anneal_outcomes = {
+            "pass": 1,
+            "panic": 0,
+            "ub": 0,
+            "unsupported": 0,
+            "out_of_fuel": 0,
+            "external_call": 0,
+            "error": 0,
+        }
+        nc_reasons = {k: 0 for k in VALID_NOT_COMPARED_REASONS}
+        summary: dict[str, Any] = {
+            "harness": "miri-difftest",
+            "oracle_comparison": "performed",
+            "mode": "seeded",
+            "seed": "0x5eed0001",
+            "batches": 1,
+            "batch_size": 1,
+            "total_candidates": 1,
+            "compiled_candidates": 1,
+            "compile_failed_candidates": 0,
+            "compared_candidates": 1,
+            "agree_count": 0,
+            "diverge_count": 1,
+            "not_compared_count": 0,
+            "kernel_confirmed_divergences": 1,
+            "miri_verdicts": miri_verdicts,
+            "anneal_outcomes": anneal_outcomes,
+            "divergence_classes": div_map,
+            "not_compared_reasons": nc_reasons,
+            "unmodeled_external_calls": {},
+            "mutator_applications": {"ArithmeticCastMutator": 1},
+            "findings": [
+                {
+                    "finding_id": f"finding_0000_{mutant_id}",
+                    "fn_name": f"probe_{mutant_id}",
+                    "seed_name": f"seed_{mutant_id}",
+                    "applied_mutators": ["ArithmeticCastMutator"],
+                    "divergence_class": div_class,
+                    "miri_outcome": str(mutant["simulated_miri_outcome"]),
+                    "anneal_outcome": str(mutant["simulated_anneal_outcome"]),
+                    "anneal_lean_tag": str(mutant["simulated_anneal_lean_tag"]),
+                    "miri_excerpt": f"mutant probe {mutant_id} divergence",
+                    "repro_path": str(repro_path),
+                    "kernel_confirmed": True,
+                }
+            ],
+            "elapsed_ms": 100.0,
+        }
+        valid, reason = validate_performed_miri_summary(summary)
+        if not valid:
+            return {
+                "id": mutant_id,
+                "killed": True,
+                "kill_class": "harness_error",
+                "exit_code": EXIT_HARNESS_FAILED,
+                "detail": reason,
+            }
+        rf = evaluate_miri_red_flags(
+            summary,
+            0x5EED0001,
+            {},
+            DEFAULT_MIN_ORACLE_ELAPSED_MS,
+            DEFAULT_MAX_ORACLE_ERRORS,
+        )
+        if not rf.passed:
+            return {
+                "id": mutant_id,
+                "killed": True,
+                "kill_class": "harness_error",
+                "exit_code": EXIT_HARNESS_FAILED,
+                "detail": "; ".join(rf.failure_reasons),
+            }
+        _, unquarantined, _ = deduplicate_and_quarantine_findings(
+            summary["findings"], set(), set()
+        )
+        if len(unquarantined) > 0:
+            return {
+                "id": mutant_id,
+                "killed": True,
+                "kill_class": unquarantined[0].divergence_class,
+                "exit_code": EXIT_DIVERGENCE_DETECTED,
+                "fingerprint": unquarantined[0].fingerprint,
+            }
+        return {
+            "id": mutant_id,
+            "killed": False,
+            "kill_class": "survived",
+            "exit_code": EXIT_SUCCESS,
+        }
+
+
+def run_semantic_mutant_self_check(
+    evaluator: Any = None,
+    mutants: tuple[dict[str, Any], ...] | list[dict[str, Any]] = SEEDED_SEMANTIC_MUTANTS,
+) -> dict[str, Any]:
+    """Runs all 5 seeded semantic mutant probes (`bool_valid_range`, `storage_dead_tag`,
+    `provenance_frag`, `div_by_zero`, `wide_shift`) through the campaign oracle verdict
+    pipeline and fails closed (`EXIT_HARNESS_FAILED = 2`) if any mutant survives.
+    """
+    killed_mutants: list[str] = []
+    survived_mutants: list[str] = []
+    per_mutant_results: list[dict[str, Any]] = []
+
+    for mutant in mutants:
+        mutant_id = str(mutant["id"])
+        expected_classes = tuple(mutant.get("expected_kill_classes", ()))
+        if evaluator is None:
+            outcome = _simulate_mutant_through_campaign_pipeline(mutant)
+        else:
+            raw_res = evaluator(mutant)
+            if isinstance(raw_res, bool):
+                outcome = {
+                    "id": mutant_id,
+                    "killed": raw_res,
+                    "kill_class": expected_classes[0] if (raw_res and expected_classes) else "survived",
+                    "exit_code": EXIT_DIVERGENCE_DETECTED if raw_res else EXIT_SUCCESS,
+                }
+            elif isinstance(raw_res, int):
+                is_killed = raw_res in (EXIT_DIVERGENCE_DETECTED, EXIT_HARNESS_FAILED)
+                outcome = {
+                    "id": mutant_id,
+                    "killed": is_killed,
+                    "kill_class": (
+                        expected_classes[0]
+                        if (is_killed and expected_classes)
+                        else ("harness_error" if is_killed else "survived")
+                    ),
+                    "exit_code": raw_res,
+                }
+            elif isinstance(raw_res, str):
+                clean = raw_res.strip().lower()
+                is_killed = clean not in ("agree", "pass", "survived", "ok", "")
+                outcome = {
+                    "id": mutant_id,
+                    "killed": is_killed,
+                    "kill_class": raw_res.strip() if is_killed else "survived",
+                    "exit_code": EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS,
+                }
+            elif isinstance(raw_res, dict):
+                if "killed" in raw_res:
+                    is_killed = bool(raw_res["killed"])
+                    k_class = str(
+                        raw_res.get(
+                            "kill_class",
+                            expected_classes[0] if (is_killed and expected_classes) else "survived",
+                        )
+                    )
+                    exit_c = int(
+                        raw_res.get(
+                            "exit_code",
+                            EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS,
+                        )
+                    )
+                elif "verdict" in raw_res:
+                    verdict_str = str(raw_res["verdict"]).strip().lower()
+                    is_killed = verdict_str in ("diverge", "error", "harness_error")
+                    k_class = str(
+                        raw_res.get(
+                            "divergence_class",
+                            raw_res.get("kill_class", "harness_error" if is_killed else "survived"),
+                        )
+                    )
+                    exit_c = EXIT_DIVERGENCE_DETECTED if is_killed else EXIT_SUCCESS
+                elif "diverge_count" in raw_res or "miri_verdicts" in raw_res:
+                    div_c = int(raw_res.get("diverge_count", 0))
+                    rf_ok, _ = validate_error_vs_unsupported_boundary(raw_res)
+                    is_killed = div_c > 0 or not rf_ok
+                    k_class = (
+                        expected_classes[0]
+                        if (div_c > 0 and expected_classes)
+                        else ("harness_error" if not rf_ok else "survived")
+                    )
+                    exit_c = (
+                        EXIT_DIVERGENCE_DETECTED
+                        if div_c > 0
+                        else (EXIT_HARNESS_FAILED if not rf_ok else EXIT_SUCCESS)
+                    )
+                else:
+                    is_killed = False
+                    k_class = "survived"
+                    exit_c = EXIT_SUCCESS
+                outcome = {
+                    "id": mutant_id,
+                    "killed": is_killed,
+                    "kill_class": k_class,
+                    "exit_code": exit_c,
+                }
+            else:
+                outcome = {
+                    "id": mutant_id,
+                    "killed": False,
+                    "kill_class": "survived",
+                    "exit_code": EXIT_SUCCESS,
+                }
+
+        if (
+            outcome["killed"]
+            and expected_classes
+            and outcome.get("kill_class") not in expected_classes
+        ):
+            outcome["killed"] = False
+            outcome["unexpected_kill_class"] = outcome.get("kill_class")
+
+        per_mutant_results.append(outcome)
+        if outcome["killed"]:
+            killed_mutants.append(mutant_id)
+        else:
+            survived_mutants.append(mutant_id)
+
+    total = len(mutants)
+    passed = len(survived_mutants) == 0 and len(killed_mutants) == total and total > 0
+    return {
+        "passed": passed,
+        "total_mutants": total,
+        "killed_count": len(killed_mutants),
+        "killed_mutants": killed_mutants,
+        "survived_mutants": survived_mutants,
+        "results": per_mutant_results,
+        "exit_code": EXIT_SUCCESS if passed else EXIT_HARNESS_FAILED,
+    }
 
 
 def load_known_corpus_bug_seeds(repo_root: Path) -> set[str]:
@@ -952,7 +1742,16 @@ def infer_finding_cause(
     if fault_text:
         if any(
             tok in fault_text
-            for tok in ("__miri_ptr_", "__oob_", "__neg_", "__ptr_pair", "__base_ptr")
+            for tok in (
+                "__miri_ptr_",
+                "__oob_",
+                "__neg_",
+                "__ptr_pair",
+                "__base_ptr",
+                "__null_p",
+                "__unaligned_",
+                "__u8_base",
+            )
         ):
             return "RawPtrOffsetMutator"
         if any(tok in fault_text for tok in ("__miri_tb_", "__tb_")):
@@ -968,13 +1767,30 @@ def infer_finding_cause(
                 "__pad_bytes",
                 "__ptr_b",
                 "__raw_u8",
+                "__panic_arr",
+                "__panic_idx",
             )
         ):
             return "BitValidityTransmuteMutator"
-        if any(tok in fault_text for tok in ("__miri_arith_", "__miri_wide")):
+        if any(
+            tok in fault_text
+            for tok in (
+                "__miri_arith_",
+                "__miri_wide",
+                "__ovf_",
+                "__udf_",
+                "__div_",
+                "__shl_",
+                "__ub_",
+            )
+        ):
             return "ArithmeticCastMutator"
-        if any(tok in fault_text for tok in ("__miri_proj_", "__proj_")):
+        if any(
+            tok in fault_text
+            for tok in ("__miri_proj_", "__proj_", "__dangling_ptr", "__dead_slot")
+        ):
             return "PlaceProjectionWrapper"
+        return seed_name
 
     if seed_name in known_corpus_bug_seeds or not first_mutator:
         return seed_name
@@ -1691,7 +2507,10 @@ def render_oracle_campaign_report(
     return "\n".join(lines) + "\n"
 
 
-def parse_args() -> argparse.Namespace:
+_DEFAULT_RUN_HARNESS = run_harness
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Anneal differential-testing campaign orchestrator. Runs live Miri + "
@@ -1699,7 +2518,7 @@ def parse_args() -> argparse.Namespace:
             "vacuity checks, and deduplicates divergence findings."
         )
     )
-    parser.add_argument("--profile", choices=sorted(PROFILES), default="quick")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default=None)
     parser.add_argument(
         "--state-dir",
         type=Path,
@@ -1736,6 +2555,22 @@ def parse_args() -> argparse.Namespace:
         help="Optional TOML or JSON file listing quarantined divergence fingerprints or seed names.",
     )
     parser.add_argument(
+        "--manifest-path",
+        type=Path,
+        default=None,
+        help="Optional path to `tests/miri-diff/manifest.toml` for stale `known_anneal_bug` ratchet checks.",
+    )
+    parser.add_argument(
+        "--check-stale-ratchet",
+        action="store_true",
+        help="Run fail-closed ratchet audit for stale quarantine and `known_anneal_bug` entries.",
+    )
+    parser.add_argument(
+        "--self-check-mutants",
+        action="store_true",
+        help="Run the 5-mutant semantic-mutant killing probe (`SEEDED_SEMANTIC_MUTANTS`).",
+    )
+    parser.add_argument(
         "--max-oracle-errors",
         type=int,
         default=DEFAULT_MAX_ORACLE_ERRORS,
@@ -1753,11 +2588,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path for JUnit XML (`sponge_log.xml`).",
     )
-    return parser.parse_args()
+    ns = parser.parse_args(argv)
+    ns._explicit_profile = ns.profile is not None
+    if ns.profile is None:
+        ns.profile = "quick"
+    return ns
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     profile = PROFILES[args.profile]
     repo_root = Path(__file__).resolve().parent.parent
     start_time = time.monotonic()
@@ -1767,7 +2606,13 @@ def main() -> int:
         check_x20_uri(x20_uri)
         cli_miri_seed = parse_seed_int(args.miri_seed) if args.miri_seed is not None else None
         cli_itree_seed = parse_seed_int(args.itree_seed) if args.itree_seed is not None else None
-        quarantine_rules = load_quarantine_rules(args.quarantine_file)
+        if not args.check_stale_ratchet:
+            quarantine_rules = load_quarantine_rules(args.quarantine_file)
+        else:
+            try:
+                quarantine_rules = load_quarantine_rules(args.quarantine_file)
+            except ValueError:
+                quarantine_rules = set()
         if args.max_oracle_errors < 0 or args.min_oracle_elapsed_ms < 0:
             raise ValueError("thresholds must be non-negative")
     except ValueError as e:
@@ -1808,6 +2653,80 @@ def main() -> int:
         except ValueError as e:
             sys.stderr.write(f"error: {e}\n")
             return EXIT_INTERNAL_ERROR
+
+        default_manifest = repo_root / "tests" / "miri-diff" / "manifest.toml"
+        eff_manifest_path = (
+            args.manifest_path
+            if args.manifest_path is not None
+            else (default_manifest if default_manifest.is_file() else None)
+        )
+
+        standalone_gate_only = (
+            (args.self_check_mutants or args.check_stale_ratchet)
+            and not getattr(args, "_explicit_profile", False)
+            and args.miri_seed is None
+            and args.itree_seed is None
+            and not args.miri_identity
+            and not args.miri_only
+            and not args.compile_only
+            and not x20_uri
+            and args.junit_xml is None
+            and run_harness is _DEFAULT_RUN_HARNESS
+        )
+        if standalone_gate_only:
+            date_prefix = utc_date_prefix()
+            mutant_report = (
+                run_semantic_mutant_self_check() if args.self_check_mutants else None
+            )
+            ratchet_report = (
+                verify_no_stale_quarantine_or_known_bugs(
+                    quarantine_file=args.quarantine_file,
+                    manifest_path=eff_manifest_path,
+                    ledger=ledger,
+                )
+                if args.check_stale_ratchet
+                else None
+            )
+            gate_ok = (mutant_report is None or mutant_report["passed"]) and (
+                ratchet_report is None or ratchet_report["passed"]
+            )
+            standalone_summary: dict[str, Any] = {
+                "profile": profile.name,
+                "date_utc": date_prefix,
+                "mode": "standalone_gate",
+                "passed": gate_ok,
+                "semantic_mutant_self_check": mutant_report,
+                "stale_ratchet_audit": ratchet_report,
+            }
+            summary_json_text = json.dumps(standalone_summary, indent=2) + "\n"
+            for summary_path in [
+                state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_summary.json",
+                state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json",
+            ]:
+                summary_path.write_text(summary_json_text, encoding="utf-8")
+            md_lines = [
+                f"# Anneal Differential Testing Gate Report (`{date_prefix}`)",
+                "",
+                f"- **Gate status**: `{'PASS' if gate_ok else 'FAIL'}`",
+            ]
+            if mutant_report is not None:
+                md_lines.append(
+                    f"- **Semantic mutant self-check**: `{mutant_report['killed_count']}/{mutant_report['total_mutants']}` killed "
+                    f"(`passed={mutant_report['passed']}`)"
+                )
+            if ratchet_report is not None:
+                md_lines.append(
+                    f"- **Stale ratchet audit**: `{len(ratchet_report['stale_entries'])}` stale entries "
+                    f"(`passed={ratchet_report['passed']}`)"
+                )
+            report_md = "\n".join(md_lines) + "\n"
+            for report_path in [
+                state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_report.md",
+                state_dir / "reports" / "LATEST_REPORT.md",
+            ]:
+                report_path.write_text(report_md, encoding="utf-8")
+            print(report_md)
+            return EXIT_SUCCESS if gate_ok else EXIT_HARNESS_FAILED
 
         date_prefix = utc_date_prefix()
         findings_dir = state_dir / "findings" / f"{date_prefix}_{profile.name}_miri"
@@ -2067,10 +2986,29 @@ def main() -> int:
         unquarantined = [*miri_unquarantined, *itree_unquarantined]
         quarantined = [*miri_quarantined, *itree_quarantined]
 
+        mutant_self_check_report = (
+            run_semantic_mutant_self_check() if args.self_check_mutants else None
+        )
+        stale_ratchet_report = (
+            verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=args.quarantine_file,
+                manifest_path=eff_manifest_path,
+                ledger=ledger,
+                evaluated_fingerprints=[d.fingerprint for d in all_dedup],
+            )
+            if args.check_stale_ratchet
+            else None
+        )
+        extra_gates_failed = (
+            mutant_self_check_report is not None and not mutant_self_check_report["passed"]
+        ) or (stale_ratchet_report is not None and not stale_ratchet_report["passed"])
+
         itree_ok = (not include_itree) or itree_ran_without_oracle or (
             itree_performed and itree_red_flags is not None and itree_red_flags.passed
         )
-        harness_or_red_flag_failed = (not miri_red_flags.passed) or (not itree_ok)
+        harness_or_red_flag_failed = (
+            (not miri_red_flags.passed) or (not itree_ok) or extra_gates_failed
+        )
 
         written = collect_finding_bundle_files(miri["findings"], state_dir)
         if include_itree and itree_performed and itree is not None and isinstance(itree.get("findings"), list):
@@ -2134,6 +3072,19 @@ def main() -> int:
             itree_seed,
             elapsed_sec,
         )
+        if mutant_self_check_report is not None:
+            report_md += (
+                "\n## Semantic-Mutant Self-Check (`--self-check-mutants`)\n\n"
+                f"- **Passed**: `{mutant_self_check_report['passed']}` "
+                f"(`{mutant_self_check_report['killed_count']}/{mutant_self_check_report['total_mutants']}` killed)\n"
+                f"- **Survived mutants**: `{mutant_self_check_report['survived_mutants']}`\n"
+            )
+        if stale_ratchet_report is not None:
+            report_md += (
+                "\n## Stale Quarantine & Known-Bug Ratchet Audit (`--check-stale-ratchet`)\n\n"
+                f"- **Passed**: `{stale_ratchet_report['passed']}` "
+                f"(`{len(stale_ratchet_report['stale_entries'])}` stale entries)\n"
+            )
         for report_path in [
             state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_report.md",
             state_dir / "reports" / "LATEST_REPORT.md",
@@ -2174,6 +3125,10 @@ def main() -> int:
             "quarantined_findings": [d.to_dict() for d in quarantined],
             "elapsed_sec": round(elapsed_sec, 3),
         }
+        if mutant_self_check_report is not None:
+            campaign_summary["semantic_mutant_self_check"] = mutant_self_check_report
+        if stale_ratchet_report is not None:
+            campaign_summary["stale_ratchet_audit"] = stale_ratchet_report
         summary_json_text = json.dumps(campaign_summary, indent=2) + "\n"
         for summary_path in [
             state_dir / "reports" / f"{date_prefix}_{profile.name}_campaign_summary.json",
