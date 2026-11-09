@@ -2,7 +2,7 @@
 
 Portable MCP server, warm `lake serve` worker pool daemon, lifecycle hooks, and
 live InfoView sidecar for interactive Lean 4 (`v4.34.1` `lake serve`) and Rust
-verification development across Claude Code, Gemini CLI, Jetski, and Codex.
+verification development across Claude Code, Gemini CLI, Antigravity, and Codex.
 
 See [`../../docs/agent-harness-setup.md`](../../docs/agent-harness-setup.md) for
 complete step-by-step installation and configuration instructions.
@@ -33,7 +33,7 @@ complete step-by-step installation and configuration instructions.
      open `sorry` goals directly to `edit_file` / `write_file` / `Edit` / `Write`
      tool results on `*.lean` files.
 
-3. **Jetski Web AuxPane UI (`sidecars/infoview/`)**:
+3. **Antigravity Web AuxPane UI (`sidecars/infoview/`)**:
    - **Anneal Lean 4 InfoView** panel in the conversation's right-hand Auxiliary Pane:
      live proof goals, compiler diagnostics, interactive zero-disk Multi-Attempt
      tactic sandbox, Anneal crate obligation scoreboard, and LSP worker pool monitor.
