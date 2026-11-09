@@ -3419,3 +3419,309 @@ fn test_ep1_a3_index_local_decls_and_lowered_type_invariants() {
         Err(RvalueEvalError::DeadLocal(Local(0)))
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv B4] Property test: the unified partial-shell walker against a reference model
+// ---------------------------------------------------------------------------------------------
+
+/// Outcome classes of the shell reference model.
+#[derive(Debug, PartialEq)]
+enum ShellRef {
+    Value(MirValue),
+    /// The place reaches a leaf (or a whole tuple) that is not fully written.
+    Uninit,
+    /// The place is invalid at run time (inactive variant, out-of-bounds index, ...).
+    Fault,
+}
+
+/// Collects the field-index paths of every non-tuple leaf below `shape`.
+fn shell_leaves(shape: &DShape, at: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+    match shape {
+        DShape::Tup(fields) => {
+            for (i, f) in fields.iter().enumerate() {
+                at.push(i);
+                shell_leaves(f, at, out);
+                at.pop();
+            }
+        }
+        _ => out.push(at.clone()),
+    }
+}
+
+fn value_at<'a>(val: &'a MirValue, at: &[usize]) -> &'a MirValue {
+    at.iter().fold(val, |v, i| match v {
+        MirValue::Tuple(fields) | MirValue::Adt { fields, .. } => &fields[*i],
+        other => panic!("not a tuple: {other:?}"),
+    })
+}
+
+fn shape_at<'a>(shape: &'a DShape, at: &[usize]) -> &'a DShape {
+    at.iter().fold(shape, |s, i| match s {
+        DShape::Tup(fields) => &fields[*i],
+        other => panic!("not a tuple shape: {other:?}"),
+    })
+}
+
+/// Reference read of a statically valid place on a local built field by field: `written` holds
+/// the written leaf paths, `root_variant` is `Some(v)` when the root was written through
+/// `Downcast(v)` (an enum shell) and `tag` records whether `SetDiscriminant` ran.
+#[allow(clippy::too_many_arguments)]
+fn ref_shell_read(
+    shape: &DShape,
+    full: &MirValue,
+    written: &[Vec<usize>],
+    at: &mut Vec<usize>,
+    proj: &[ProjectionElem],
+    idx: u128,
+    root_variant: Option<usize>,
+    tag: bool,
+    downcast: Option<usize>,
+) -> ShellRef {
+    let node_shape = shape_at(shape, at);
+    if !matches!(node_shape, DShape::Tup(_)) {
+        if !written.iter().any(|w| w == at) {
+            return ShellRef::Uninit;
+        }
+        return match ref_read(value_at(full, at), proj, idx, downcast) {
+            Some(v) => ShellRef::Value(v),
+            None => ShellRef::Fault,
+        };
+    }
+    let actual_variant = if at.is_empty() {
+        root_variant.unwrap_or(0)
+    } else {
+        0
+    };
+    // A tuple node none of whose leaves were written has no value and no variant yet, so every
+    // place through it reads uninitialized memory.
+    let mut node_leaves = Vec::new();
+    shell_leaves(node_shape, &mut at.clone(), &mut node_leaves);
+    if !node_leaves.iter().any(|l| written.contains(l)) {
+        return ShellRef::Uninit;
+    }
+    let Some((first, rest)) = proj.split_first() else {
+        let mut leaves = Vec::new();
+        shell_leaves(node_shape, &mut at.clone(), &mut leaves);
+        let complete = leaves.iter().all(|l| written.contains(l))
+            && (!at.is_empty() || root_variant.is_none() || tag);
+        if !complete {
+            return ShellRef::Uninit;
+        }
+        let sub = value_at(full, at).clone();
+        return ShellRef::Value(match (at.is_empty(), root_variant, sub) {
+            (true, Some(v), MirValue::Tuple(fields)) => MirValue::Adt {
+                def_path: String::new(),
+                variant_idx: v,
+                active_field: None,
+                fields,
+            },
+            (_, _, sub) => sub,
+        });
+    };
+    match first {
+        ProjectionElem::Downcast(w) => {
+            if *w != actual_variant {
+                return ShellRef::Fault;
+            }
+            ref_shell_read(
+                shape,
+                full,
+                written,
+                at,
+                rest,
+                idx,
+                root_variant,
+                tag,
+                Some(*w),
+            )
+        }
+        ProjectionElem::Field(i, _) => {
+            if downcast.unwrap_or(0) != actual_variant {
+                return ShellRef::Fault;
+            }
+            at.push(*i);
+            let out = ref_shell_read(shape, full, written, at, rest, idx, root_variant, tag, None);
+            at.pop();
+            out
+        }
+        other => panic!("statically valid tuple projection cannot start with {other:?}"),
+    }
+}
+
+/// Builds random nested tuples (with scalar, `()`, and array leaves) field by field in random
+/// order, as a plain tuple or as an enum variant (`Downcast(v)` writes plus `SetDiscriminant`
+/// at a random point), and after every step checks random places (`Field`, `Downcast`,
+/// `Index`, `ConstantIndex`, `Subslice`, valid and invalid) against a reference model via
+/// `read_place`, stateful `Rvalue::Len`, and `Rvalue::Discriminant`:
+/// - statically invalid places fail with an error other than `UninitializedLocal`;
+/// - places reaching an unwritten leaf, or a tuple that is not fully written (or an enum whose
+///   tag is unwritten), fail with `UninitializedLocal`;
+/// - places invalid at run time fail with another error; all others return the reference value.
+#[test]
+fn test_ep1_b4_property_partial_shell_walker_matches_reference_model() {
+    let mut rng = Rng(0xBF58_476D_1CE4_E5B9);
+    let mut checked = [0usize; 3];
+    for _ in 0..200 {
+        // Interior tuple nodes are `MirValue::Tuple`s (as `D13b` promotion builds them).
+        let shape = DShape::Tup(vec![
+            DShape::random(&mut rng, 3),
+            DShape::random(&mut rng, 3),
+        ]);
+        let mut full = shape.value(&mut rng);
+        fn tuplify(v: &mut MirValue) {
+            match v {
+                MirValue::Adt { fields, .. } => {
+                    let fields = std::mem::take(fields);
+                    *v = MirValue::Tuple(fields);
+                    tuplify(v);
+                }
+                MirValue::Tuple(fields) => fields.iter_mut().for_each(tuplify),
+                MirValue::Array { elements, .. } => elements.iter_mut().for_each(tuplify),
+                _ => {}
+            }
+        }
+        tuplify(&mut full);
+        let ty = shape.ty();
+        let root_variant = (rng.below(2) == 1).then(|| rng.below(3) as usize);
+        let mut leaves = Vec::new();
+        shell_leaves(&shape, &mut Vec::new(), &mut leaves);
+        for i in (1..leaves.len()).rev() {
+            leaves.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        let n_writes = 1 + rng.below(leaves.len() as u64) as usize;
+        let set_discr_after = 1 + rng.below(n_writes as u64) as usize;
+        let idx = u128::from(rng.below(4));
+        let local_decls = vec![ty.clone(), usize_ty(), Ty::Int(IntTy::Isize)];
+        let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+        state.slots[1] = LocalSlotState::Init(usizev(idx));
+        let mut written: Vec<Vec<usize>> = Vec::new();
+        let mut tag = false;
+        let root_prefix: Vec<ProjectionElem> = root_variant
+            .map(ProjectionElem::Downcast)
+            .into_iter()
+            .collect();
+        for (step, leaf) in leaves.iter().take(n_writes).enumerate() {
+            let mut projection = root_prefix.clone();
+            let mut cur = &shape;
+            for i in leaf {
+                let DShape::Tup(fields) = cur else {
+                    unreachable!()
+                };
+                projection.push(field(*i, fields[*i].ty()));
+                cur = &fields[*i];
+            }
+            state
+                .write_place(
+                    &proj(0, projection),
+                    &cur.ty(),
+                    value_at(&full, leaf).clone(),
+                )
+                .unwrap();
+            written.push(leaf.clone());
+            if let Some(v) = root_variant {
+                if step + 1 == set_discr_after {
+                    let set = LoweredStatement::SetDiscriminant {
+                        place: Place::from_local(0),
+                        place_ty: ty.clone(),
+                        variant_index: v,
+                    };
+                    eval_lowered_statement(&set, &mut state).unwrap();
+                    tag = true;
+                }
+            }
+
+            for _ in 0..12 {
+                let mut projection = Vec::new();
+                random_projection(&mut rng, &shape, &mut projection);
+                if let (Some(v), Some(ProjectionElem::Field(..)) | None) =
+                    (root_variant, projection.first())
+                {
+                    if rng.below(4) != 0 {
+                        projection.insert(0, ProjectionElem::Downcast(v));
+                    }
+                }
+                let place = proj(0, projection.clone());
+                let got = state.read_place(&place);
+                let statically_valid =
+                    anneal_mir::lower::resolve_place_ty(&place, &local_decls).is_ok();
+                let expected = if statically_valid {
+                    ref_shell_read(
+                        &shape,
+                        &full,
+                        &written,
+                        &mut Vec::new(),
+                        &projection,
+                        idx,
+                        root_variant,
+                        tag,
+                        None,
+                    )
+                } else {
+                    ShellRef::Fault
+                };
+                let ctx = format!(
+                    "{place:?} written={written:?} variant={root_variant:?} tag={tag} full={full:?}"
+                );
+                match &expected {
+                    ShellRef::Value(v) => assert_eq!(got.as_ref(), Ok(v), "{ctx}"),
+                    ShellRef::Uninit => {
+                        assert_eq!(
+                            got,
+                            Err(RvalueEvalError::UninitializedLocal(Local(0))),
+                            "{ctx}"
+                        )
+                    }
+                    ShellRef::Fault => assert!(
+                        got.is_err() && got != Err(RvalueEvalError::UninitializedLocal(Local(0))),
+                        "{ctx}: {got:?}"
+                    ),
+                }
+                checked[0] += 1;
+
+                if let Ok(lowered) = lower_rvalue(&Rvalue::Len(place.clone()), &local_decls, PW) {
+                    let len = anneal_mir::lower::eval_lowered_rvalue_in_state(&lowered, &mut state);
+                    match &expected {
+                        ShellRef::Value(MirValue::Array { elements, .. }) => {
+                            assert_eq!(len, Ok(usizev(elements.len() as u128)), "Len {ctx}")
+                        }
+                        ShellRef::Value(other) => panic!("Len target {other:?} is not an array"),
+                        ShellRef::Uninit => {
+                            assert_eq!(
+                                len,
+                                Err(RvalueEvalError::UninitializedLocal(Local(0))),
+                                "Len {ctx}"
+                            )
+                        }
+                        ShellRef::Fault => assert!(
+                            len.is_err()
+                                && len != Err(RvalueEvalError::UninitializedLocal(Local(0))),
+                            "Len {ctx}: {len:?}"
+                        ),
+                    }
+                    checked[1] += 1;
+                }
+            }
+            if let Some(v) = root_variant {
+                let discr = anneal_mir::lower::eval_lowered_rvalue_in_state(
+                    &lower_rvalue(
+                        &Rvalue::Discriminant(Place::from_local(0)),
+                        &local_decls,
+                        PW,
+                    )
+                    .unwrap(),
+                    &mut state,
+                );
+                if tag {
+                    assert_eq!(discr, Ok(MirValue::signed(v as i128, IntTy::Isize, PW)));
+                } else {
+                    assert_eq!(discr, Err(RvalueEvalError::UninitializedLocal(Local(0))));
+                }
+                checked[2] += 1;
+            }
+        }
+    }
+    assert!(
+        checked[0] > 1000 && checked[1] > 50 && checked[2] > 50,
+        "{checked:?}"
+    );
+}
