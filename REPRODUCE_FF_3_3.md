@@ -20,7 +20,7 @@ artifact and checks that the new theorems are kernel-checked and free of
 Run every command from the worktree root:
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-3-3
+cd <path/to/anneal>
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 ```
 
