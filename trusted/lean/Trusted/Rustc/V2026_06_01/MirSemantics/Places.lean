@@ -6112,37 +6112,145 @@ def overlayRawAbstractByteVals :
   | _, _ => .none
 
 /--
-Write initialized union field values in `fieldVals` (ignoring `.unit`
-placeholders) at offset `0` into `buf` using each field's layout index from
-`fieldLayouts`, plus an optional trailing raw-byte overlay slot at index
-`remTypedSlots` (`count`).
+Merge union slot image `slotBytes` (stored at offset `0`) into the union image
+`acc`, returning `.none` when some byte is initialized in both with different
+contents. Every union field starts at offset `0`, so all slots of a consistent
+union value describe the same storage bytes.
+-/
+def mergeAgreeingAbstractBytes :
+    List AbstractByte → List AbstractByte → Option (List AbstractByte)
+  | acc, .nil => .some acc
+  | .nil, _ :: _ => .none
+  | a :: aRest, b :: bRest =>
+    match mergeAgreeingAbstractBytes aRest bRest with
+    | .none => .none
+    | .some tail =>
+      match a, b with
+      | .uninit, _ => .some (b :: tail)
+      | _, .uninit => .some (a :: tail)
+      | .init _ _, .init _ _ =>
+        match abstractByteEq a b with
+        | true => .some (a :: tail)
+        | false => .none
+
+/--
+Split a union field list into its `count` typed slots and the optional trailing
+raw-byte overlay values (`.none` when the list is malformed).
+-/
+def splitUnionTypedAndOverlay :
+    Nat → List Value → Option (List Value × Option (List Value))
+  | .zero, .nil => .some (.nil, .none)
+  | .zero, .aggregate 0 rawVals :: .nil => .some (.nil, .some rawVals)
+  | .zero, _ :: _ => .none
+  | .succ _, .nil => .some (.nil, .none)
+  | .succ k, v :: rest =>
+    match splitUnionTypedAndOverlay k rest with
+    | .some (typedVals, overlayOpt) => .some (v :: typedVals, overlayOpt)
+    | .none => .none
+
+/--
+Merge the images of the non-`.unit` typed union slots `fieldVals` into `buf`
+(`mergeAgreeingAbstractBytes`), using each slot's layout index from
+`fieldLayouts`. When `skipUntypedAggregates = true` (a raw-byte overlay is
+present), aggregate slots without a recorded field layout are skipped since
+their layout-free encoding is not authoritative.
+-/
+def mergeUnionTypedSlotsAux
+    (encodeSlot : Nat → Value → Option (List AbstractByte))
+    (fallbackLayoutIdx : Nat)
+    (skipUntypedAggregates : Bool) :
+    List Nat → List Value → List AbstractByte → Option (List AbstractByte)
+  | _, .nil, buf => .some buf
+  | flIdxs, fv :: vRest, buf =>
+    let (flIdxOpt, nextIdxs) : Option Nat × List Nat :=
+      match flIdxs with
+      | f :: fRest => (.some f, fRest)
+      | .nil => (.none, .nil)
+    let skipSlot : Bool :=
+      match fv, skipUntypedAggregates, flIdxOpt with
+      | .unit, _, _ => true
+      | .aggregate _ _, true, .none => true
+      | _, _, _ => false
+    match skipSlot with
+    | true =>
+      mergeUnionTypedSlotsAux encodeSlot fallbackLayoutIdx skipUntypedAggregates nextIdxs vRest buf
+    | false =>
+      let flIdx :=
+        match flIdxOpt with
+        | .some f => f
+        | .none => fallbackLayoutIdx
+      match encodeSlot flIdx fv with
+      | .none => .none
+      | .some fBytes =>
+        match mergeAgreeingAbstractBytes buf fBytes with
+        | .none => .none
+        | .some buf' =>
+          mergeUnionTypedSlotsAux
+            encodeSlot
+            fallbackLayoutIdx
+            skipUntypedAggregates
+            nextIdxs
+            vRest
+            buf'
+
+/--
+Encode a `count`-slot union field list `fieldVals` of byte size `unionSize`:
+starts from the trailing raw-byte overlay image (if any, else all `.uninit`)
+and merges every non-`.unit` typed slot image into it, failing (`.none`) when
+two slots, or a slot and the overlay, disagree on an initialized byte. Such a
+disagreement means the slots were updated non-atomically (e.g. by a
+union-unaware projected write), so no single storage image is determined.
 -/
 def encodeUnionSlotsIntoBufAux
     (encodeSlot : Nat → Value → Option (List AbstractByte))
-    (fallbackLayoutIdx : Nat) :
-    Nat → List Nat → List Value → List AbstractByte → Option (List AbstractByte)
-  | _, _, .nil, buf => .some buf
-  | .zero, _, .aggregate 0 rawVals :: .nil, buf =>
-    overlayRawAbstractByteVals rawVals buf
-  | .zero, _, _, _ => .none
-  | .succ remSlots, flIdxs, .unit :: vRest, buf =>
-    let nextIdxs :=
-      match flIdxs with
-      | _ :: fRest => fRest
-      | .nil => .nil
-    encodeUnionSlotsIntoBufAux encodeSlot fallbackLayoutIdx remSlots nextIdxs vRest buf
-  | .succ remSlots, flIdxs, fv :: vRest, buf =>
-    let (flIdx, nextIdxs) :=
-      match flIdxs with
-      | f :: fRest => (f, fRest)
-      | .nil => (fallbackLayoutIdx, .nil)
-    match encodeSlot flIdx fv with
+    (fallbackLayoutIdx : Nat)
+    (count : Nat)
+    (fieldLayouts : List Nat)
+    (fieldVals : List Value)
+    (unionSize : Nat) :
+    Option (List AbstractByte) :=
+  match splitUnionTypedAndOverlay count fieldVals with
+  | .none => .none
+  | .some (typedVals, .none) =>
+    mergeUnionTypedSlotsAux
+      encodeSlot
+      fallbackLayoutIdx
+      false
+      fieldLayouts
+      typedVals
+      (replicateUninitBytes unionSize)
+  | .some (typedVals, .some rawVals) =>
+    match overlayRawAbstractByteVals rawVals (replicateUninitBytes unionSize) with
     | .none => .none
-    | .some fBytes =>
-      match writeAbstractBytesAt buf 0 fBytes with
-      | .none => .none
-      | .some buf' =>
-        encodeUnionSlotsIntoBufAux encodeSlot fallbackLayoutIdx remSlots nextIdxs vRest buf'
+    | .some rawImage =>
+      mergeUnionTypedSlotsAux
+        encodeSlot
+        fallbackLayoutIdx
+        true
+        fieldLayouts
+        typedVals
+        rawImage
+
+/--
+Count the non-`.unit` values among the first `count` typed slots of a union
+field list.
+-/
+def unionNonUnitTypedSlotCount : Nat → List Value → Nat
+  | .zero, _ => 0
+  | _, .nil => 0
+  | .succ k, .unit :: rest => unionNonUnitTypedSlotCount k rest
+  | .succ k, _ :: rest => .succ (unionNonUnitTypedSlotCount k rest)
+
+/--
+`true` when a `count`-slot union field list may hold mutually inconsistent
+slots (a raw-byte overlay is present, or at least two typed slots are
+non-`.unit`), so a direct slot read must first validate the union image.
+-/
+@[reducible]
+def unionNeedsConsistencyCheck (count : Nat) (fields : List Value) : Bool :=
+  Bool.or
+    (Nat.blt count (length fields))
+    (Nat.ble 2 (unionNonUnitTypedSlotCount count fields))
 
 /--
 Write struct/tuple field values in `fieldVals` at `offsets` into `buf` using
@@ -6269,7 +6377,7 @@ def encodeByLayoutIdxAux :
               count
               l.fieldLayouts
               fieldVals
-              (replicateUninitBytes l.size.bytes)
+              l.size.bytes
         | .arbitrary offsets _ =>
           match l.variants with
           | .single expectedVar =>
@@ -6409,10 +6517,115 @@ def decodeTypedKindsAndLayoutsAtOffsets
   | _, _, _ => .none
 
 /--
+`true` when some byte of `bytes` is initialized with pointer provenance
+(`AbstractByte.init _ (.some _)`).
+-/
+@[reducible]
+def abstractBytesHaveProv : List AbstractByte → Bool
+  | .nil => false
+  | .init _ (.some _) :: _ => true
+  | _ :: rest => abstractBytesHaveProv rest
+
+/--
+`true` when every byte of `bytes` is initialized with exactly the provenance pair
+`(allocId, tag)`.
+-/
+def abstractBytesAllProvAux (allocId tag : Nat) : List AbstractByte → Bool
+  | .nil => true
+  | .init _ (.some (a, t)) :: rest =>
+    Bool.and
+      (Bool.and (Nat.beq a allocId) (Nat.beq t tag))
+      (abstractBytesAllProvAux allocId tag rest)
+  | _ :: _ => false
+
+/--
+`true` when `bytes` is non-empty and every byte carries the same pointer
+provenance as its first byte, i.e. `bytes` is an intact (non-spliced) pointer
+image. Pointer bytes with no provenance, or with mixed provenance, yield a
+provenance-less address.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Accessing (loading from or storing to) a place that is dangling or based on
+> a misaligned pointer."
+-/
+@[reducible]
+def abstractBytesUniformProv : List AbstractByte → Bool
+  | .init _ (.some (a, t)) :: rest => abstractBytesAllProvAux a t rest
+  | _ => false
+
+/--
+Decode a raw pointer or reference image `bytes` of pointee `pointee` at pointer
+width `ptrBytes`, without fabricating provenance:
+- an intact pointer image (`abstractBytesUniformProv`) decodes to
+  `Value.ptr { allocId, offsetBytes := bits } ptrBytes`;
+- a provenance-less (or spliced) raw pointer image decodes to the provenance-less
+  address `Value.scalar ⟨bits, ptrBytes⟩`;
+- a provenance-less (or spliced) reference image is invalid (`.none`);
+- wide pointers decode their data half as above and their metadata half as
+  `Value.scalar ⟨meta, ptrBytes⟩` (slice/`str` lengths must not carry provenance;
+  `dyn` vtable pointers keep intact provenance).
+-/
+def decodePtrBytesNoForge
+    (isRef : Bool)
+    (pointee : RigidTy)
+    (ptrBytes : Nat)
+    (bytes : List AbstractByte) :
+    Option Value :=
+  let dataOf (dataBytes : List AbstractByte) : Option Value :=
+    match Nat.beq (length dataBytes) ptrBytes, decodeScalarBytes dataBytes false with
+    | true, .some (sv, prov) =>
+      match abstractBytesUniformProv dataBytes, prov with
+      | true, .some (allocId, _) =>
+        .some (.ptr { allocId := allocId, offsetBytes := sv.bits } ptrBytes)
+      | _, _ =>
+        match isRef with
+        | true => .none
+        | false => .some (.scalar ⟨sv.bits, ptrBytes⟩)
+    | _, _ => .none
+  let wideMetaIsDyn : Option Bool :=
+    match pointee with
+    | .slice _ => .some false
+    | .str => .some false
+    | .dynamic _ => .some true
+    | _ => .none
+  match wideMetaIsDyn with
+  | .none => dataOf bytes
+  | .some isDyn =>
+    match Nat.beq (length bytes) (Nat.add ptrBytes ptrBytes) with
+    | false => .none
+    | true =>
+      let metaBytes := dropAbstractBytes ptrBytes bytes
+      let metaOpt : Option Value :=
+        match decodeScalarBytes metaBytes false with
+        | .none => .none
+        | .some (metaSv, metaProv) =>
+          match isDyn, abstractBytesUniformProv metaBytes, metaProv with
+          | true, true, .some (vtAllocId, _) =>
+            .some (.ptr { allocId := vtAllocId, offsetBytes := metaSv.bits } ptrBytes)
+          | true, _, _ => .some (.scalar ⟨metaSv.bits, ptrBytes⟩)
+          | false, _, _ =>
+            match abstractBytesHaveProv metaBytes with
+            | true => .none
+            | false => .some (.scalar ⟨metaSv.bits, ptrBytes⟩)
+      match dataOf (takeAbstractBytes ptrBytes bytes), metaOpt with
+      | .some dataVal, .some metaVal => .some (.aggregate 0 (dataVal :: metaVal :: .nil))
+      | _, _ => .none
+
+/--
 Fuel-bounded layout- and type-aware byte decoder extending `decodeValueFromBytes`
 with union raw-byte preservation (`decodeUnionBytesWithCount`), per-element
-`fieldLayouts` propagation on arrays/tuples/generic structs, and `char`
-UTF-16 surrogate rejection on layout-only `.primitive` fields.
+`fieldLayouts` propagation on arrays/tuples/structs, `char` UTF-16 surrogate
+rejection on layout-only `.primitive` fields, and provenance-faithful scalar
+decoding:
+- integer, `bool`, and `char` images carrying pointer provenance are rejected
+  (the abstract address of a pointer is not recoverable from its byte image);
+- raw pointer images without intact provenance decode to provenance-less
+  addresses (`Value.scalar`), and reference images without intact provenance are
+  rejected, so transmutes and union reads never fabricate provenance;
+- ADT fields are decoded by their `fieldLayouts` (generic arguments are not
+  field types).
 -/
 def decodeTypedValueFromBytes :
     Nat → LayoutTable → Ty → List AbstractByte → Option Value
@@ -6470,7 +6683,7 @@ def decodeTypedValueFromBytes :
           | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
         | _, _ => decodeValueFromBytes (.succ fuel') layouts rTy bytes
       | .none => decodeValueFromBytes (.succ fuel') layouts rTy bytes
-    | .adt defPath args =>
+    | .adt defPath _ =>
       match LayoutTable.lookup layouts rTy.layoutIdx with
       | .none => decodeValueFromBytes (.succ fuel') layouts rTy bytes
       | .some l =>
@@ -6487,38 +6700,20 @@ def decodeTypedValueFromBytes :
           | .single variantIdx, .arbitrary .nil _ =>
             .some (.aggregate variantIdx .nil)
           | .single variantIdx, .arbitrary offsets _ =>
-            let byArgsAndLayouts : Option (List Value) :=
+            match Nat.beq (length l.fieldLayouts) (length offsets) with
+            | true =>
               match
-                Bool.and
-                  (Nat.beq (length args) (length offsets))
-                  (Nat.beq (length l.fieldLayouts) (length offsets))
-              with
-              | true =>
-                decodeTypedKindsAndLayoutsAtOffsets
-                  decodeChild
+                decodeFieldsByLayoutIdxs
+                  (fun fIdx fSlice =>
+                    decodeChild { kind := .adt "" .nil, layoutIdx := fIdx } fSlice)
                   layouts
                   bytes
                   offsets
-                  args
                   l.fieldLayouts
-              | false => .none
-            match byArgsAndLayouts with
-            | .some vals => .some (.aggregate variantIdx vals)
-            | .none =>
-              match Nat.beq (length l.fieldLayouts) (length offsets) with
-              | true =>
-                match
-                  decodeFieldsByLayoutIdxs
-                    (fun fIdx fSlice =>
-                      decodeChild { kind := .adt "" .nil, layoutIdx := fIdx } fSlice)
-                    layouts
-                    bytes
-                    offsets
-                    l.fieldLayouts
-                with
-                | .some vals => .some (.aggregate variantIdx vals)
-                | .none => .none
-              | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+              with
+              | .some vals => .some (.aggregate variantIdx vals)
+              | .none => .none
+            | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
           | .single variantIdx, .array stride count =>
             match Nat.beq count 0 with
             | true =>
@@ -6539,23 +6734,48 @@ def decodeTypedValueFromBytes :
                 | .none => .none
               | .nil => decodeValueFromBytes (.succ fuel') layouts rTy bytes
           | .single _, .primitive =>
-            match decodeValueFromBytes (.succ fuel') layouts rTy bytes with
-            | .some (.scalar sv) =>
-              match stringEq defPath "", l.backendRepr with
-              | true, .scalar (.initialized _ vr) =>
-                match
-                  Bool.and
-                    (Nat.beq sv.sizeBytes 4)
-                    (Bool.and (Nat.beq vr.start 0) (Nat.beq vr.end_ 0x10FFFF))
-                with
-                | true =>
-                  match isValidCharCode sv.bits with
+            let decodeNonPtrLeaf : Option Value :=
+              match decodeValueFromBytes (.succ fuel') layouts rTy bytes with
+              | .some (.scalar sv) =>
+                match stringEq defPath "", l.backendRepr with
+                | true, .scalar (.initialized _ vr) =>
+                  match
+                    Bool.and
+                      (Nat.beq sv.sizeBytes 4)
+                      (Bool.and (Nat.beq vr.start 0) (Nat.beq vr.end_ 0x10FFFF))
+                  with
+                  | true =>
+                    match isValidCharCode sv.bits with
+                    | true => .some (.scalar sv)
+                    | false => .none
+                  | false => .some (.scalar sv)
+                | _, _ => .some (.scalar sv)
+              | other => other
+            match l.backendRepr with
+            | .scalar (.initialized (.pointer _) vr) =>
+              match abstractBytesUniformProv bytes with
+              | true => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+              | false =>
+                match decodeScalarBytes bytes false with
+                | .some (sv, _) =>
+                  match wrappingRangeContains vr sv.bits with
                   | true => .some (.scalar sv)
                   | false => .none
-                | false => .some (.scalar sv)
-              | _, _ => .some (.scalar sv)
-            | other => other
+                | .none => .none
+            | .scalar (.initialized _ _) =>
+              match abstractBytesHaveProv bytes with
+              | true => .none
+              | false => decodeNonPtrLeaf
+            | _ => decodeNonPtrLeaf
           | _, _ => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+    | .bool | .char | .int _ | .uint _ =>
+      match abstractBytesHaveProv bytes with
+      | true => .none
+      | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+    | .rawPtr _ pointee =>
+      decodePtrBytesNoForge false pointee (layoutPointerBytes layouts) bytes
+    | .ref _ pointee =>
+      decodePtrBytesNoForge true pointee (layoutPointerBytes layouts) bytes
     | _ => decodeValueFromBytes (.succ fuel') layouts rTy bytes
 
 /--
@@ -6855,10 +7075,22 @@ def readProjectedValueUnionAware
             | _ => .none
           | .some fv => .some fv
           | .none => .none
-        match directFvOpt with
-        | .some fv =>
+        -- A union value whose slots (or raw-byte overlay) disagree on some
+        -- initialized byte does not determine a storage image (e.g. after a
+        -- union-unaware projected write updated one slot without resetting its
+        -- siblings), so no slot may be trusted: fail closed.
+        let unionImageOk : Bool :=
+          match unionNeedsConsistencyCheck count fields with
+          | false => true
+          | true =>
+            match encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields) with
+            | .some _ => true
+            | .none => false
+        match unionImageOk, directFvOpt with
+        | false, _ => .unsupported
+        | true, .some fv =>
           readProjectedValueUnionAware locals localDecls layouts fv rFieldTy rest
-        | .none =>
+        | true, .none =>
           let directSubReadOpt : Option ProjReadResult :=
             match rest with
             | .nil => .none
@@ -7192,89 +7424,96 @@ def writeProjectedValueUnionAware
         match rest with
         | .nil => commitFullFieldUpdate newVal
         | rHead :: rTail =>
-          match
-            readProjectedValueUnionAware
-              locals
-              localDecls
-              layouts
-              (.aggregate 0 fields)
-              rBase
-              (.field idx rFieldTy :: .nil)
-          with
-          | .ok curFv =>
+          -- A write to a statically addressed sub-place `u.f.<rest>` stores
+          -- exactly `size_of(leaf)` bytes at the sub-place offset: sibling bytes
+          -- of the union (including padding bytes of `f` itself) keep their
+          -- current contents, so it is applied as a byte patch on the union
+          -- image rather than as a read-modify-write of the whole field `f`
+          -- (which would re-encode `f`'s padding as uninitialized).
+          let staticLeafPatchOpt : Option (List AbstractByte) :=
+            match resolveUnionSubProjIndices locals (rHead :: rTail) with
+            | .none => .none
+            | .some idxResolved =>
+              let normRest :=
+                normalizeSubsliceProjections (stripTransparentProjections idxResolved)
+              match checkStaticSubProjBounds localDecls layouts rFieldTy normRest with
+              | false => .none
+              | true =>
+                match
+                  projectionChainByteOffset?
+                    layouts
+                    (.some rFieldTy)
+                    .none
+                    .none
+                    0
+                    localDecls
+                    normRest,
+                  resolveProjectedTyResolved localDecls layouts rFieldTy normRest
+                with
+                | .some subOff, .some leafTy =>
+                  match encodeTypedValueToBytes layouts leafTy newVal with
+                  | .none => .none
+                  | .some patchBytes => writeAbstractBytesAt baseBytes subOff patchBytes
+                | _, _ => .none
+          match staticLeafPatchOpt with
+          | .some mergedBytes =>
+            let fullFvOpt : Option Value :=
+              match tyByteSize localDecls layouts rFieldTy with
+              | .some fSz =>
+                match sliceAbstractBytes mergedBytes 0 fSz with
+                | .some fSlice =>
+                  decodeTypedValueFromBytes defaultCodecFuel layouts rFieldTy fSlice
+                | .none => .none
+              | .none => .none
+            let slotFv : Value :=
+              match fullFvOpt with
+              | .some fv => fv
+              | .none => .unit
+            let typedFields :=
+              rebuildUnionFieldsAfterWriteAux
+                layouts
+                idx
+                0
+                slotFv
+                count
+                l.fieldLayouts
+                fields
+            let finalFields :=
+              finalizeUnionFieldsWithRawOverlay
+                layouts
+                rBase.layoutIdx
+                typedFields
+                mergedBytes
+            .ok (.aggregate 0 finalFields)
+          | .none =>
             match
-              writeProjectedValueUnionAware
+              readProjectedValueUnionAware
                 locals
                 localDecls
                 layouts
-                curFv
-                rFieldTy
-                (rHead :: rTail)
-                newVal
+                (.aggregate 0 fields)
+                rBase
+                (.field idx rFieldTy :: .nil)
             with
-            | .ok updatedFv => commitFullFieldUpdate updatedFv
-            | .ub => .ub
+            | .ok curFv =>
+              match
+                writeProjectedValueUnionAware
+                  locals
+                  localDecls
+                  layouts
+                  curFv
+                  rFieldTy
+                  (rHead :: rTail)
+                  newVal
+              with
+              | .ok updatedFv => commitFullFieldUpdate updatedFv
+              | .ub => .ub
+              | .unsupported => .unsupported
             | .unsupported => .unsupported
-          | .unsupported => .unsupported
-          | .ub =>
-            match wrapFullWidthInitChain? localDecls layouts rFieldTy (rHead :: rTail) newVal with
-            | .some wrappedFv => commitFullFieldUpdate wrappedFv
-            | .none =>
-              match resolveUnionSubProjIndices locals (rHead :: rTail) with
+            | .ub =>
+              match wrapFullWidthInitChain? localDecls layouts rFieldTy (rHead :: rTail) newVal with
+              | .some wrappedFv => commitFullFieldUpdate wrappedFv
               | .none => .ub
-              | .some idxResolved =>
-                let normRest :=
-                  normalizeSubsliceProjections (stripTransparentProjections idxResolved)
-                match checkStaticSubProjBounds localDecls layouts rFieldTy normRest with
-                | false => .ub
-                | true =>
-                  match
-                    projectionChainByteOffset?
-                      layouts
-                      (.some rFieldTy)
-                      .none
-                      .none
-                      0
-                      localDecls
-                      normRest,
-                    resolveProjectedTyResolved localDecls layouts rFieldTy normRest
-                  with
-                  | .some subOff, .some leafTy =>
-                    match encodeTypedValueToBytes layouts leafTy newVal with
-                    | .none => .ub
-                    | .some patchBytes =>
-                      match writeAbstractBytesAt baseBytes subOff patchBytes with
-                      | .none => .ub
-                      | .some mergedBytes =>
-                        let fullFvOpt : Option Value :=
-                          match tyByteSize localDecls layouts rFieldTy with
-                          | .some fSz =>
-                            match sliceAbstractBytes mergedBytes 0 fSz with
-                            | .some fSlice =>
-                              decodeTypedValueFromBytes defaultCodecFuel layouts rFieldTy fSlice
-                            | .none => .none
-                          | .none => .none
-                        let slotFv : Value :=
-                          match fullFvOpt with
-                          | .some fv => fv
-                          | .none => .unit
-                        let typedFields :=
-                          rebuildUnionFieldsAfterWriteAux
-                            layouts
-                            idx
-                            0
-                            slotFv
-                            count
-                            l.fieldLayouts
-                            fields
-                        let finalFields :=
-                          finalizeUnionFieldsWithRawOverlay
-                            layouts
-                            rBase.layoutIdx
-                            typedFields
-                            mergedBytes
-                        .ok (.aggregate 0 finalFields)
-                  | _, _ => .ub
       | _, _ => .ub
     | .none =>
       let nextTy : Ty :=
@@ -10254,6 +10493,24 @@ def invalidateDerefWriteBorrows
     | _ => allBorrows
 
 /--
+Encode the source value `v` of a byte cast at static type `srcTy`: uses
+`encodeTypedValueToBytes`, falling back to the layout-free encoding only for
+non-union types (a union value without a determined storage image, e.g. one
+with mutually inconsistent slots, has no byte representation).
+-/
+def encodeByteCastSourceBytes
+    (layouts : LayoutTable)
+    (srcTy : Ty)
+    (v : Value) :
+    Option (List AbstractByte) :=
+  match encodeTypedValueToBytes layouts srcTy v with
+  | .some bs => .some bs
+  | .none =>
+    match isUnionLayout layouts (normalizeCodecTy srcTy) with
+    | true => .none
+    | false => encodeUntypedValueToBytes defaultCodecFuel v
+
+/--
 Evaluate a byte-level representation cast (`CastKind.transmute` or
 `CastKind.subtype`) from operand `op` to `targetTy` by encoding the source
 `Value` into `List AbstractByte` and decoding at `targetTy`.
@@ -10313,9 +10570,7 @@ def evalByteCast
           | false => .unsupported
           | true =>
             let encodedOpt : Option (List AbstractByte) :=
-              match encodeTypedValueToBytes layouts rSrcTy v with
-              | .some bs => .some bs
-              | .none => encodeUntypedValueToBytes defaultCodecFuel v
+              encodeByteCastSourceBytes layouts rSrcTy v
             match encodedOpt with
             | .none => .ub
             | .some bs =>

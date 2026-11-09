@@ -2327,9 +2327,7 @@ def evalByteCastAfterOperand
         | false => .unsupported
         | true =>
           let encodedOpt : Option (List AbstractByte) :=
-            match encodeTypedValueToBytes body.layouts rSrcTy v with
-            | .some bs => .some bs
-            | .none => encodeUntypedValueToBytes defaultCodecFuel v
+            encodeByteCastSourceBytes body.layouts rSrcTy v
           match encodedOpt with
           | .none => .ub
           | .some bs =>
