@@ -72,7 +72,16 @@ theorem mir_evalStmt_nop_coverage_constEvalCounter
     (advanceStmt s s.frame.locals).frame.stmtIdx = mrAdvanceStmtPc s.frame.stmtIdx := by
   exact ⟨rfl, rfl, rfl, rfl⟩
 
-/-- Universal characterization of `StatementKind.placeMention`. -/
+/-- Universal characterization of `StatementKind.placeMention`
+(`Statements.lean` vs. `spec/lang/step/statements.md`): mentioning an
+out-of-bounds or `.dead` local faults with `MirStepNode.fail .ub`; mentioning a
+live (`.uninit` or `.init`) local advances the statement program counter without
+mutating locals or memory exactly when every operand read while computing the
+place is initialized, i.e. a dereferenced root local holds a value and every
+`Index` local holds an initialized scalar (`placeMentionOperandsInit`), and
+faults with `MirStepNode.fail .ub` otherwise. In particular, a bare mention of
+an uninitialized local (`place.projection = []`) steps, whereas dereferencing an
+uninitialized root local or indexing by an uninitialized local faults. -/
 theorem mir_evalStmt_placeMention_dead_is_ub
     (s : MachineState) (place : Place) (span : String) :
     (get? s.frame.locals place.local_ = .none →
@@ -80,30 +89,87 @@ theorem mir_evalStmt_placeMention_dead_is_ub
     (get? s.frame.locals place.local_ = .some .dead →
       evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals place.local_ = .some .uninit →
+      projectionHasDeref place.projection = false →
+      placeIndexLocalsInit s.frame.locals place.projection = true →
       evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) ∧
     (∀ v : Value, get? s.frame.locals place.local_ = .some (.init v) →
-      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) := by
-  refine ⟨?_, ?_, ?_, ?_⟩
+      placeIndexLocalsInit s.frame.locals place.projection = true →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+    (get? s.frame.locals place.local_ = .some .uninit →
+      place.projection = .nil →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+    (get? s.frame.locals place.local_ = .some .uninit →
+      projectionHasDeref place.projection = true →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.fail .ub) ∧
+    (∀ slot : LocalSlot, get? s.frame.locals place.local_ = .some slot →
+      placeIndexLocalsInit s.frame.locals place.projection = false →
+      evalStmt s ⟨.placeMention place, span⟩ = MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro h; simp [evalStmt, h]
   · intro h; simp [evalStmt, h]
-  · intro h; simp [evalStmt, h]
-  · intro v h; simp [evalStmt, h]
+  · intro h hDeref hIdx
+    simp [evalStmt, placeMentionOperandsInit, h, hDeref, hIdx]
+  · intro v h hIdx
+    cases hDeref : projectionHasDeref place.projection <;>
+      simp [evalStmt, placeMentionOperandsInit, h, hDeref, hIdx]
+  · intro h hNil
+    simp [evalStmt, h, hNil]
+  · intro h hDeref
+    simp [evalStmt, placeMentionOperandsInit, h, hDeref]
+  · intro slot h hIdx
+    cases slot <;> cases hDeref : projectionHasDeref place.projection <;>
+      simp [evalStmt, placeMentionOperandsInit, h, hDeref, hIdx]
 
 /-- Universal characterization of `StatementKind.storageLive`,
-`StatementKind.storageDead`, and protected-tag write conflict checking in `evalStmt`. -/
+`StatementKind.storageDead`, and protected-tag write conflict checking in
+`evalStmt` (`Statements.lean`):
+1. `.storageLive loc` transitions an in-bounds slot to `.uninit` and disables
+   every borrow-table entry minted from `loc` (`disableLocalBorrows`) unless an
+   entry targeting `loc` is still protected by an active function-entry
+   protector (`hasProtectedLocalBorrow`), in which case it faults with `.ub`,
+   or faults with `.ub` if `loc` is out of bounds;
+2. `.storageDead loc` transitions an in-bounds slot to `.dead` and disables
+   every borrow-table entry minted from `loc` unless an entry targeting `loc` is
+   still protected by an active function-entry protector
+   (`hasProtectedLocalBorrow`), in which case it faults with `.ub`, or faults
+   with `.ub` if `loc` is out of bounds;
+3. Disabling leaves every entry targeting `loc` `.disabled` (so no stale tag can
+   reach a revived `loc`) and is the identity when no entry targets `loc`; and
+4. Writing to a root local when `hasProtectedWriteConflict` is `true` faults
+   immediately with `MirStepNode.fail .ub`. -/
 theorem mir_evalStmt_storageLive_and_storageDead
     (s : MachineState) (loc : Local) (slot : LocalSlot)
     (localsUninit localsDead : List LocalSlot) (span : String) :
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .uninit = .some localsUninit →
-      evalStmt s ⟨.storageLive loc, span⟩ = MirStepNode.step (advanceStmt s localsUninit)) ∧
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      evalStmt s ⟨.storageLive loc, span⟩ =
+        MirStepNode.step
+          (advanceStmt s localsUninit
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })) ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .uninit = .some localsUninit →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      evalStmt s ⟨.storageLive loc, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .none →
       evalStmt s ⟨.storageLive loc, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .some slot →
       set? s.frame.locals loc .dead = .some localsDead →
-      evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.step (advanceStmt s localsDead)) ∧
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      evalStmt s ⟨.storageDead loc, span⟩ =
+        MirStepNode.step
+          (advanceStmt s localsDead
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })) ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.fail .ub) ∧
     (get? s.frame.locals loc = .none →
       evalStmt s ⟨.storageDead loc, span⟩ = MirStepNode.fail .ub) ∧
+    (∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
+      entry.targetLocal = loc → entry.perm = .disabled) ∧
+    ((∀ entry ∈ s.memory.borrows, entry.targetLocal ≠ loc) →
+      disableLocalBorrows s.memory.borrows loc = s.memory.borrows) ∧
     (∀ (rv : Rvalue) (val : Value) (locals₁ locals₂ : List LocalSlot) (mem₁ : Memory)
        (protHead : Nat) (protTail : List Nat),
       evalRvalue s.frame.locals rv s.memory = .ok val locals₁ mem₁ →
@@ -112,13 +178,377 @@ theorem mir_evalStmt_storageLive_and_storageDead
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none .nil = true →
       evalStmt s ⟨.assign ⟨loc, .nil⟩ rv, span⟩ = MirStepNode.fail .ub) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
-  · intro hGet hSet; simp [evalStmt, hGet, hSet]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro hGet hSet hP
+    cases hAP : s.memory.activeProtectors with
+    | nil => simp [evalStmt, hGet, hSet, hAP]
+    | cons p ps =>
+      rw [hAP] at hP
+      simp [evalStmt, hGet, hSet, hAP, hP]
+  · intro hGet hSet hP
+    cases hAP : s.memory.activeProtectors with
+    | nil =>
+      rw [hAP, hasProtectedLocalBorrow_nil_protectors] at hP
+      nomatch hP
+    | cons p ps =>
+      rw [hAP] at hP
+      simp [evalStmt, hGet, hSet, hAP, hP]
   · intro hGet; simp [evalStmt, hGet]
-  · intro hGet hSet; simp [evalStmt, hGet, hSet]
+  · intro hGet hSet hP
+    cases hAP : s.memory.activeProtectors with
+    | nil => simp [evalStmt, hGet, hSet, hAP]
+    | cons p ps =>
+      rw [hAP] at hP
+      simp [evalStmt, hGet, hSet, hAP, hP]
+  · intro hGet hSet hP
+    cases hAP : s.memory.activeProtectors with
+    | nil =>
+      rw [hAP, hasProtectedLocalBorrow_nil_protectors] at hP
+      nomatch hP
+    | cons p ps =>
+      rw [hAP] at hP
+      simp [evalStmt, hGet, hSet, hAP, hP]
   · intro hGet; simp [evalStmt, hGet]
+  · exact perm_eq_disabled_of_mem_disableLocalBorrows s.memory.borrows loc
+  · exact disableLocalBorrows_eq_self_of_forall_ne s.memory.borrows loc
   · intro rv val locals₁ locals₂ mem₁ protHead protTail hEval hGet hSet hProt hConflict
     simp [evalStmt, hEval, hGet, hSet, hProt, hConflict]
+
+/--
+`disableLocalBorrows` preserves the length of the borrow table (`Trusted.Sequence.length`),
+ensuring that fuel bounds parameterized by `Trusted.Sequence.length borrows` (such as
+`isBorrowDescendantOrSelf`) are unchanged.
+-/
+@[simp]
+theorem length_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    Trusted.Sequence.length (disableLocalBorrows borrows loc) =
+      Trusted.Sequence.length borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases hB : Nat.beq hd.targetLocal loc <;>
+      simp [disableLocalBorrows, Trusted.Sequence.length, hB] at ih ⊢ <;>
+        exact ih
+
+/--
+`disableLocalBorrows` is idempotent on the same local: disabling `loc`'s
+borrows a second time (e.g. when `StorageLive(loc)` follows `StorageDead(loc)`)
+produces the identical borrow table.
+-/
+@[simp]
+theorem disableLocalBorrows_idem
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    disableLocalBorrows (disableLocalBorrows borrows loc) loc =
+      disableLocalBorrows borrows loc := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases hB : Nat.beq hd.targetLocal loc <;>
+      simp only [disableLocalBorrows, hB, ih]
+
+/--
+`disableLocalBorrows` commutes across arbitrary locals `loc₁` and `loc₂`.
+-/
+theorem disableLocalBorrows_comm
+    (borrows : List BorrowEntry)
+    (loc₁ loc₂ : Local) :
+    disableLocalBorrows (disableLocalBorrows borrows loc₁) loc₂ =
+      disableLocalBorrows (disableLocalBorrows borrows loc₂) loc₁ := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases h₁ : Nat.beq hd.targetLocal loc₁ <;>
+      cases h₂ : Nat.beq hd.targetLocal loc₂ <;>
+        simp only [disableLocalBorrows, h₁, h₂, ih]
+
+/--
+Disabling borrows targeting `loc₁` preserves `hasProtectedLocalBorrow` for
+every local `loc₂`, because `disableLocalBorrows` modifies only `perm` while
+preserving `targetLocal` and `protector`.
+-/
+@[simp]
+theorem hasProtectedLocalBorrow_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc₁ loc₂ : Local) :
+    hasProtectedLocalBorrow (disableLocalBorrows borrows loc₁) activeProtectors loc₂ =
+      hasProtectedLocalBorrow borrows activeProtectors loc₂ := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases h₁ : Nat.beq hd.targetLocal loc₁ with
+    | false =>
+      cases hC : Bool.and (Nat.beq hd.targetLocal loc₂) (isBorrowProtected activeProtectors hd) <;>
+        simp only [disableLocalBorrows, h₁, hasProtectedLocalBorrow, hC, ih]
+    | true =>
+      have hProt :
+          isBorrowProtected activeProtectors { hd with perm := .disabled } =
+            isBorrowProtected activeProtectors hd := rfl
+      cases hC : Bool.and (Nat.beq hd.targetLocal loc₂) (isBorrowProtected activeProtectors hd) <;>
+        simp only [disableLocalBorrows, h₁, hasProtectedLocalBorrow, hProt, hC, ih]
+
+/--
+`disableLocalBorrows` preserves the parent-tag chain (`tag` and `parentTag`) of
+every entry in `borrows`, so Tree Borrows ancestor-descendant reachability
+(`isBorrowDescendantOrSelfAux`) is invariant under `disableLocalBorrows`.
+-/
+theorem isBorrowDescendantOrSelfAux_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (fuel candidateTag ancestorTag : Nat) :
+    isBorrowDescendantOrSelfAux fuel (disableLocalBorrows borrows loc) candidateTag ancestorTag =
+      isBorrowDescendantOrSelfAux fuel borrows candidateTag ancestorTag := by
+  induction fuel generalizing candidateTag with
+  | zero => rfl
+  | succ fuel' ih =>
+    unfold isBorrowDescendantOrSelfAux
+    cases hEq : Nat.beq candidateTag ancestorTag with
+    | true => rfl
+    | false =>
+      dsimp only
+      rw [lookupBorrow_disableLocalBorrows]
+      cases hLook : lookupBorrow borrows candidateTag with
+      | none => rfl
+      | some entry =>
+        dsimp only
+        cases hB : Nat.beq entry.targetLocal loc <;>
+          cases hP : entry.parentTag <;>
+            simp only [hP] <;>
+              exact ih _
+
+/--
+Tree Borrows ancestor-descendant reachability (`isBorrowDescendantOrSelf`) is
+invariant under `disableLocalBorrows`.
+-/
+@[simp]
+theorem isBorrowDescendantOrSelf_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (candidateTag ancestorTag : Nat) :
+    isBorrowDescendantOrSelf (disableLocalBorrows borrows loc) candidateTag ancestorTag =
+      isBorrowDescendantOrSelf borrows candidateTag ancestorTag := by
+  unfold isBorrowDescendantOrSelf
+  rw [length_disableLocalBorrows, isBorrowDescendantOrSelfAux_disableLocalBorrows]
+
+/--
+Two-step `StorageDead(loc)` followed by `StorageLive(loc)` revival theorem
+(`D2` / `D14a-storage`): when `loc` is in bounds and unprotected
+(`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
+executing `StorageDead(loc)` and then `StorageLive(loc)` steps cleanly in both
+transitions without faulting, advances `stmtIdx` twice, sets `loc` to `.uninit`
+(`localsRevived`), and leaves the borrow table equal to the single pass
+`disableLocalBorrows s.memory.borrows loc` (by `disableLocalBorrows_idem`),
+preserving `hasProtectedLocalBorrow` and `isBorrowDescendantOrSelf`.
+-/
+theorem evalStmt_storageDead_then_storageLive_revive
+    (s : MachineState)
+    (loc loc₂ : Local)
+    (slot : LocalSlot)
+    (localsDead localsRevived : List LocalSlot)
+    (spanDead spanLive : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (candidateTag ancestorTag : Nat)
+    (hGet : get? s.frame.locals loc = .some slot)
+    (hSetDead : set? s.frame.locals loc .dead = .some localsDead)
+    (hGetDead : get? localsDead loc = .some .dead)
+    (hSetRevived : set? localsDead loc .uninit = .some localsRevived)
+    (hNoProt : hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false) :
+    let borrowsDis := disableLocalBorrows s.memory.borrows loc
+    let memDis : Memory := { s.memory with borrows := borrowsDis }
+    let sDead : MachineState := advanceStmt s localsDead memDis
+    let sRevived : MachineState := advanceStmt sDead localsRevived memDis
+    evalStmt s ⟨.storageDead loc, spanDead⟩ localDecls layouts =
+      MirStepNode.step sDead ∧
+    disableLocalBorrows borrowsDis loc = borrowsDis ∧
+    evalStmt sDead ⟨.storageLive loc, spanLive⟩ localDecls layouts =
+      MirStepNode.step sRevived ∧
+    hasProtectedLocalBorrow borrowsDis s.memory.activeProtectors loc₂ =
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc₂ ∧
+    isBorrowDescendantOrSelf borrowsDis candidateTag ancestorTag =
+      isBorrowDescendantOrSelf s.memory.borrows candidateTag ancestorTag := by
+  dsimp only
+  have hDeadStep :
+      evalStmt s ⟨.storageDead loc, spanDead⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s localsDead
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) :=
+    ((evalStmt_storageDead_purges_borrows
+        s loc slot localsDead spanDead localDecls layouts).1
+      hGet hSetDead hNoProt).1
+  have hIdem :
+      disableLocalBorrows (disableLocalBorrows s.memory.borrows loc) loc =
+        disableLocalBorrows s.memory.borrows loc :=
+    disableLocalBorrows_idem s.memory.borrows loc
+  have hNoProtDis :
+      hasProtectedLocalBorrow
+        (disableLocalBorrows s.memory.borrows loc)
+        s.memory.activeProtectors
+        loc = false := by
+    rw [hasProtectedLocalBorrow_disableLocalBorrows]
+    exact hNoProt
+  have hLiveStep :
+      evalStmt
+        (advanceStmt s localsDead
+          { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+        ⟨.storageLive loc, spanLive⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt
+            (advanceStmt s localsDead
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+            localsRevived
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) := by
+    have hRaw :=
+      ((evalStmt_storageLive_purges_borrows
+          (advanceStmt s localsDead
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+          loc .dead localsRevived spanLive localDecls layouts).1
+        hGetDead hSetRevived hNoProtDis).1
+    dsimp [advanceStmt] at hRaw ⊢
+    rw [hIdem] at hRaw
+    exact hRaw
+  refine ⟨hDeadStep, hIdem, hLiveStep,
+    hasProtectedLocalBorrow_disableLocalBorrows s.memory.borrows s.memory.activeProtectors loc loc₂,
+    isBorrowDescendantOrSelf_disableLocalBorrows s.memory.borrows loc candidateTag ancestorTag⟩
+
+/-- Algebraic and structural invariants of `disableLocalBorrows` and two-step
+`StorageDead(loc)` + `StorageLive(loc)` revival (`Statements.lean`):
+1. `disableLocalBorrows` is idempotent on the same local (`disableLocalBorrows_idem`),
+2. `disableLocalBorrows` commutes across locals (`disableLocalBorrows_comm`),
+3. `disableLocalBorrows` preserves borrow-table length (`length_disableLocalBorrows`),
+   active-protector conflict status (`hasProtectedLocalBorrow_disableLocalBorrows`),
+   and Tree Borrows ancestor-descendant reachability
+   (`isBorrowDescendantOrSelf_disableLocalBorrows`), and
+4. Executing `StorageDead(loc)` followed by `StorageLive(loc)` steps cleanly in
+   two steps to the idempotently disabled borrow table
+   (`evalStmt_storageDead_then_storageLive_revive`). -/
+theorem mir_disableLocalBorrows_algebraic_properties
+    (s : MachineState) (loc loc₂ : Local) (slot : LocalSlot)
+    (localsDead localsRevived : List LocalSlot)
+    (spanDead spanLive : String) (candidateTag ancestorTag : Nat) :
+    disableLocalBorrows (disableLocalBorrows s.memory.borrows loc) loc =
+      disableLocalBorrows s.memory.borrows loc ∧
+    disableLocalBorrows (disableLocalBorrows s.memory.borrows loc) loc₂ =
+      disableLocalBorrows (disableLocalBorrows s.memory.borrows loc₂) loc ∧
+    Trusted.Sequence.length (disableLocalBorrows s.memory.borrows loc) =
+      Trusted.Sequence.length s.memory.borrows ∧
+    hasProtectedLocalBorrow (disableLocalBorrows s.memory.borrows loc)
+      s.memory.activeProtectors loc₂ =
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc₂ ∧
+    isBorrowDescendantOrSelf (disableLocalBorrows s.memory.borrows loc)
+      candidateTag ancestorTag =
+      isBorrowDescendantOrSelf s.memory.borrows candidateTag ancestorTag ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      get? localsDead loc = .some .dead →
+      set? localsDead loc .uninit = .some localsRevived →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      let memDis : Memory := { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }
+      let sDead : MachineState := advanceStmt s localsDead memDis
+      let sRevived : MachineState := advanceStmt sDead localsRevived memDis
+      evalStmt s ⟨.storageDead loc, spanDead⟩ = MirStepNode.step sDead ∧
+      evalStmt sDead ⟨.storageLive loc, spanLive⟩ = MirStepNode.step sRevived) := by
+  refine ⟨disableLocalBorrows_idem s.memory.borrows loc,
+    disableLocalBorrows_comm s.memory.borrows loc loc₂,
+    length_disableLocalBorrows s.memory.borrows loc,
+    hasProtectedLocalBorrow_disableLocalBorrows s.memory.borrows s.memory.activeProtectors loc loc₂,
+    isBorrowDescendantOrSelf_disableLocalBorrows s.memory.borrows loc candidateTag ancestorTag,
+    ?_⟩
+  intro hGet hSetDead hGetDead hSetRevived hNoProt
+  have hRev :=
+    evalStmt_storageDead_then_storageLive_revive
+      s loc loc₂ slot localsDead localsRevived spanDead spanLive .nil emptyLayoutTable
+      candidateTag ancestorTag hGet hSetDead hGetDead hSetRevived hNoProt
+  exact ⟨hRev.1, hRev.2.2.1⟩
+
+/-- Unified correspondence consumer for the remaining `Statements.lean`
+universal characterizations of `StorageDead`/`StorageLive` borrow-table framing,
+protector conflict subsumption, post-revival stale-pointer dereference UB
+(including `StatementKind.setDiscriminant`), and `PlaceMention` operand
+initialization (including the biconditional `evalStmt_placeMention_nonDeref_index_iff`):
+1. `hasProtectedLocalBorrow_of_hasProtectedWriteConflict`: whole-local write
+   protector conflicts imply deallocation protector conflicts;
+2. `lookupBorrow_disableLocalBorrows_of_targetLocal_ne` and
+   `lookupBorrow_disableLocalBorrows_of_eq_none`: `disableLocalBorrows` preserves
+   tags targeting other stack locals and leaves non-stack (global) tags unresolved;
+3. `evalStmt_storageRevive_old_ptr_deref_ub`: any tag targeting `loc` resolves to
+   `.disabled` after `disableLocalBorrows` and faults with `.ub` across all 10
+   dereferencing read, write, reborrow, retag, `setDiscriminant`, and
+   non-zero-length `copy_nonoverlapping` operations; and
+4. `evalStmt_placeMention_local_uninit_ok`, `evalStmt_placeMention_deref_init_ok`,
+   `evalStmt_placeMention_deref_uninit_ub`, and
+   `evalStmt_placeMention_nonDeref_index_iff`: complete characterization of
+   `StatementKind.placeMention` across bare, dereferencing, and non-dereferencing
+   projection paths. -/
+theorem mir_storageRevive_and_placeMention_characterizations
+    (s : MachineState) (loc ptrLoc : Local) (tag n : Nat)
+    (slot : LocalSlot) (v writeVal otherVal : Value)
+    (ptrVal : ProvenancePtr) (sz : Nat)
+    (proj restProj : List ProjectionElem) (localsAfter : List LocalSlot)
+    (borrowKind : BorrowKind) (retagKind : RetagKind) (span : String)
+    (srcOp dstOp : Operand) (entry : BorrowEntry)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    (hasProtectedWriteConflict s.memory.borrows s.memory.activeProtectors loc .none .nil = true →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true) ∧
+    (lookupBorrow s.memory.borrows tag = .some entry →
+      entry.targetLocal ≠ loc →
+      lookupBorrow (disableLocalBorrows s.memory.borrows loc) tag = .some entry) ∧
+    (lookupBorrow s.memory.borrows tag = .none →
+      lookupBorrow (disableLocalBorrows s.memory.borrows loc) tag = .none) ∧
+    (lookupBorrow s.memory.borrows ptrVal.tag = .some entry →
+      entry.targetLocal = loc →
+      get? localsAfter ptrLoc = .some (.init (.ptr ptrVal sz)) →
+      let borrowsAfter := disableLocalBorrows s.memory.borrows loc
+      let derefPlace : Place := { local_ := ptrLoc, projection := .deref :: restProj }
+      let sAfter : MachineState :=
+        { s with
+          frame := { s.frame with locals := localsAfter }
+          memory := { s.memory with borrows := borrowsAfter } }
+      lookupBorrow borrowsAfter ptrVal.tag = .some { entry with perm := .disabled } ∧
+      evalStmt sAfter ⟨.setDiscriminant derefPlace n, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    ((get? s.frame.locals loc = .some .uninit →
+        evalStmt s ⟨.placeMention ⟨loc, .nil⟩, span⟩ localDecls layouts =
+          MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+      (get? s.frame.locals loc = .some (.init v) →
+        placeIndexLocalsInit s.frame.locals restProj = true →
+        evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+          MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+      (get? s.frame.locals loc = .some slot →
+        placeIndexLocalsInit s.frame.locals restProj = false →
+        evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+          MirStepNode.fail .ub) ∧
+      (projectionHasDeref proj = false →
+        get? s.frame.locals loc = .some slot →
+        slot ≠ .dead →
+        (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+            MirStepNode.step (advanceStmt s s.frame.locals) ↔
+          placeIndexLocalsInit s.frame.locals proj = true) ∧
+        (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+            MirStepNode.fail .ub ↔
+          placeIndexLocalsInit s.frame.locals proj = false))) := by
+  refine ⟨
+    hasProtectedLocalBorrow_of_hasProtectedWriteConflict
+      s.memory.borrows s.memory.activeProtectors loc,
+    lookupBorrow_disableLocalBorrows_of_targetLocal_ne
+      s.memory.borrows loc tag entry,
+    lookupBorrow_disableLocalBorrows_of_eq_none
+      s.memory.borrows loc tag,
+    fun hLook hTarget hPtr =>
+      let hAll :=
+        evalStmt_storageRevive_old_ptr_deref_ub
+          s s.memory.borrows s.memory.globals s.memory.callerLocals
+          s.memory.activeProtectors localDecls layouts s.memory
+          loc ptrLoc ptrVal sz restProj localsAfter writeVal borrowKind
+          retagKind span srcOp dstOp otherVal n entry hLook hTarget hPtr
+      ⟨hAll.1, hAll.2.2.2.2.2.2.2.2.1⟩,
+    ⟨(evalStmt_placeMention_local_uninit_ok s loc span localDecls layouts).1,
+      evalStmt_placeMention_deref_init_ok s loc v restProj span localDecls layouts,
+      (evalStmt_placeMention_deref_uninit_ub s loc restProj span localDecls layouts).2.2.2 slot,
+      evalStmt_placeMention_nonDeref_index_iff s loc slot proj span localDecls layouts⟩⟩
 
 /-! ## 2. Terminator Dispatch, Unwinding, Call-Stack, and `exact_div` Intrinsic Correspondence -/
 
@@ -4224,5 +4654,1514 @@ theorem confirm_copy_nonoverlapping_union_ub_and_edge_cases :
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end DiffCUnionCopyConfirmation
+
+/-! ## 6. Statement-Level Divergence Regressions (`D2`, `D14a-storage`, `D9`)
+
+Kernel-checked executions of `Runtime(PostCleanup)` MIR bodies exercising the
+`StorageDead`/`StorageLive` borrow invalidation (`disableLocalBorrows`), the
+`StorageDead`/`StorageLive` protector checks, and the `PlaceMention`
+operand-initialization checks in `evalStmt`. Unless noted otherwise, each
+`*_is_ub` witness below terminated without `.ub` before these checks existed. -/
+
+section StatementDivergenceRegressions
+
+open Trusted.Effect
+
+/-- `u64` local type used by the statement divergence regression bodies. -/
+private def stmtDivU64Ty : Ty := { kind := .uint .u64, layoutIdx := 0 }
+
+/-- `usize` local type used by the statement divergence regression bodies. -/
+private def stmtDivUsizeTy : Ty := { kind := .uint .usize, layoutIdx := 0 }
+
+/-- `[u64; 2]` local type used by the `Index` regression body. -/
+private def stmtDivArrTy : Ty := { kind := .array (.uint .u64) 2, layoutIdx := 0 }
+
+/-- `*mut u64` local type used by the statement divergence regression bodies. -/
+private def stmtDivRawMutU64Ty : Ty := { kind := .rawPtr .mut (.uint .u64), layoutIdx := 0 }
+
+/-- `&u64` local type used by the dangling-reborrow regression body. -/
+private def stmtDivRefU64Ty : Ty := { kind := .ref .not (.uint .u64), layoutIdx := 0 }
+
+/-- `&mut u64` local type used by the two-phase-borrow revival regression bodies. -/
+private def stmtDivRefMutU64Ty : Ty := { kind := .ref .mut (.uint .u64), layoutIdx := 0 }
+
+/-- `u64` constant operand. -/
+private def stmtDivConstU64 (n : Nat) : Operand :=
+  .constant ⟨stmtDivU64Ty, .scalar (.int ⟨n, 8⟩)⟩
+
+/-- `usize` constant operand. -/
+private def stmtDivConstUsize (n : Nat) : Operand :=
+  .constant ⟨stmtDivUsizeTy, .scalar (.int ⟨n, 8⟩)⟩
+
+/-- Mutable local declaration of type `ty`. -/
+private def stmtDivDecl (ty : Ty) : LocalDecl :=
+  { mutability := .mut, ty := ty, debugName := .none }
+
+/-- `extern "Rust"` ABI returning a `u64` directly. -/
+private def stmtDivFnAbiU64 : FnAbi :=
+  { args := [],
+    ret := {
+      layout := {
+        size := { bytes := 8 }, align := { bytes := 8 },
+        backendRepr :=
+          .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false
+      },
+      mode := .direct
+    },
+    conv := .rust, canUnwind := true }
+
+/-- Single-block `Runtime(PostCleanup)` body with locals `decls` and
+statements `stmts` that returns `_0`. -/
+private def stmtDivBody (name : String) (decls : List LocalDecl)
+    (stmts : List Statement) : CapturedMir :=
+  { defPath := name,
+    phase := .runtimePostCleanup,
+    role := .subject,
+    argCount := 0,
+    localDecls := decls,
+    basicBlocks := [
+      { statements := stmts,
+        terminator := { kind := .return_, span := "return" },
+        isCleanup := false }],
+    fnAbi := stmtDivFnAbiU64,
+    layouts := emptyLayoutTable,
+    allocations := [] }
+
+/-- `D2` (`wit_lm3_1_storage_revive_prog`): read through a raw pointer
+`&raw const _1` after `_1` is deallocated by `StorageDead(_1)`, revived by
+`StorageLive(_1)`, and re-initialized to `20`:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &raw const _1;
+StorageDead(_1); StorageLive(_1); _1 = const 20_u64; _0 = copy *_2; return
+```
+Noted exception: this program already faulted before `disableLocalBorrows`
+existed, because the direct write `_1 = 20` disables the `.frozen` tag of
+`&raw const _1` (a Tree Borrows foreign write), so it is kept only as a
+regression guard. The variant through a two-phase mutable borrow, whose
+`.reserved` tag survives that write, did return `20`
+(`stmt_div_storage_revive_two_phase_read_is_ub`). -/
+private def stmtDivReviveReadBody : CapturedMir :=
+  stmtDivBody "stmt_div::read_through_pointer_into_revived_and_reinit_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "stmt5: _0 = copy (*_2)" } ]
+
+/-- `D2` read-after-revive-and-reinit regression (`wit_lm3_1_storage_revive_prog`):
+even after `_1` is revived by `StorageLive(_1)` and re-initialized to `20`,
+reading `*_2` through the pointer minted before `StorageDead(_1)` faults with
+`FailureKind.ub`. -/
+theorem stmt_div_storage_revive_dangling_read_is_ub :
+    diffCProbeBounded 16 stmtDivReviveReadBody
+      (.running (initMachineState stmtDivReviveReadBody [])) =
+      .some (.some .ub, "stmt5: _0 = copy (*_2)", .none) := by
+  rfl
+
+/-- `D2` implicit-deallocation regression: calling `StorageLive(_1)` on an
+already-allocated local `_1` (without an intervening `StorageDead(_1)`)
+implicitly deallocates the old allocation of `_1` and disables its borrows, so
+a subsequent read through the two-phase mutable borrow `_2` after
+re-initializing `_1 = 20` faults with `FailureKind.ub` (Anneal previously
+returned `20`, since the `.reserved` tag of `_2` survives the direct write):
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &two-phase mut _1;
+StorageLive(_1); _1 = const 20_u64; _0 = copy *_2; return
+``` -/
+private def stmtDivReviveWithoutDeadBody : CapturedMir :=
+  stmtDivBody "stmt_div::storage_live_implicit_dealloc_disables_borrows"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRefMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
+      { kind := .storageLive 1, span := "revive _1 directly" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy (*_2)" } ]
+
+theorem stmt_div_storage_live_implicit_dealloc_dangling_read_is_ub :
+    diffCProbeBounded 16 stmtDivReviveWithoutDeadBody
+      (.running (initMachineState stmtDivReviveWithoutDeadBody [])) =
+      .some (.some .ub, "_0 = copy (*_2)", .none) := by
+  rfl
+
+/-- `D2` read-after-revive regression through a two-phase mutable borrow, whose
+`.reserved` Tree Borrows tag survives the direct write `_1 = 20`:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &two-phase mut _1;
+StorageDead(_1); StorageLive(_1); _1 = const 20_u64; _0 = copy *_2; return
+```
+Anneal previously returned `20` from the revived allocation of `_1`. -/
+private def stmtDivReviveTwoPhaseReadBody : CapturedMir :=
+  stmtDivBody "stmt_div::read_through_two_phase_borrow_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRefMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- `D2` read-after-revive regression: reading `*_2` through the stale two-phase
+borrow faults with `FailureKind.ub`. -/
+theorem stmt_div_storage_revive_two_phase_read_is_ub :
+    diffCProbeBounded 16 stmtDivReviveTwoPhaseReadBody
+      (.running (initMachineState stmtDivReviveTwoPhaseReadBody [])) =
+      .some (.some .ub, "_0 = copy *_2", .none) := by
+  rfl
+
+/-- Captured global allocation with identifier `1` holding the `u64` value `42`.
+`anneal-rustc-capture` numbers captured global allocations from `1`, the same
+numbering that stack borrow tags use (`Memory.nextTag` starts at `1`). -/
+private def stmtDivGlobal1 : CapturedAllocation :=
+  { allocId := 1,
+    bytes := [.some 42, .some 0, .some 0, .some 0, .some 0, .some 0, .some 0, .some 0],
+    relocations := [], align := ⟨8⟩, mutability := .not }
+
+/-- `stmtDivBody` with the single captured global allocation `stmtDivGlobal1`. -/
+private def stmtDivBodyWithGlobal (name : String) (decls : List LocalDecl)
+    (stmts : List Statement) : CapturedMir :=
+  { stmtDivBody name decls stmts with allocations := [stmtDivGlobal1] }
+
+/-- `D2` tag/global aliasing body: the stack borrow tag `1` minted for `_2`
+equals the identifier of the captured global `stmtDivGlobal1`:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &raw const _1;
+StorageDead(_1); _0 = copy *_2; return
+``` -/
+private def stmtDivDeadGlobalAliasReadBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::read_through_dead_pointer_aliasing_global"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- `D2` tag/global aliasing regression: reading through the dangling pointer
+faults with `FailureKind.ub`. Removing (rather than disabling) `_1`'s borrow
+entries on `StorageDead(_1)` made `*_2` fall back to `lookupGlobalAlloc` and
+return the global's `42`. -/
+theorem stmt_div_storage_dead_global_alias_read_is_ub :
+    diffCProbeBounded 16 stmtDivDeadGlobalAliasReadBody
+      (.running (initMachineState stmtDivDeadGlobalAliasReadBody [])) =
+      .some (.some .ub, "_0 = copy *_2", .none) := by
+  rfl
+
+/-- `D14a-storage` tag/global aliasing body: reborrow through the dangling
+pointer, then read through the reborrow:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3); _1 = const 10_u64;
+_2 = &raw const _1; StorageDead(_1); _3 = &*_2; _0 = copy *_3; return
+``` -/
+private def stmtDivDeadGlobalAliasReborrowBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::reborrow_through_dead_pointer_aliasing_global"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 },
+      stmtDivDecl stmtDivRefU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .assign ⟨3, []⟩ (.ref .shared ⟨2, [.deref]⟩), span := "_3 = &*_2" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨3, [.deref]⟩)), span := "_0 = copy *_3" } ]
+
+/-- `D14a-storage` tag/global aliasing regression: the reborrow through the
+dangling pointer faults with `FailureKind.ub`. Removing (rather than disabling)
+`_1`'s borrow entries made the reborrow resolve to the global allocation and
+the body return the global's `42`. -/
+theorem stmt_div_storage_dead_global_alias_reborrow_is_ub :
+    diffCProbeBounded 16 stmtDivDeadGlobalAliasReborrowBody
+      (.running (initMachineState stmtDivDeadGlobalAliasReborrowBody [])) =
+      .some (.some .ub, "_3 = &*_2", .none) := by
+  rfl
+
+/-- Positive control for the aliasing regressions: a pointer to the captured
+global `stmtDivGlobal1` reads its `42` when no stack borrow shares its
+identifier:
+```text
+StorageLive(_1); _1 = const {alloc1: *const u64}; _0 = copy *_1; return
+``` -/
+private def stmtDivGlobalReadOkBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::read_through_global_pointer"
+    [stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, []⟩
+          (.use (.constant ⟨{ kind := .rawPtr .not (.uint .u64), layoutIdx := 0 },
+            .scalar (.ptr { allocId := 1, offsetBytes := 0 } 8)⟩)),
+        span := "_1 = &GLOBAL" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.deref]⟩)), span := "_0 = copy *_1" } ]
+
+/-- Positive control: the body returns the global's `42`. -/
+theorem stmt_div_global_read_ok :
+    diffCProbeBounded 16 stmtDivGlobalReadOkBody
+      (.running (initMachineState stmtDivGlobalReadOkBody [])) =
+      .some (.none, "none", .some (.scalar ⟨42, 8⟩)) := by
+  rfl
+
+/-- `D2` (`wit_lm3_1_anneal_storage_revive_divergence`): write and read through a
+raw pointer after its pointee's storage has ended and restarted:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 42_u64; _2 = &raw mut _1;
+StorageDead(_1); StorageLive(_1); *_2 = const 7_u64; _0 = copy *_2; return
+``` -/
+private def stmtDivReviveBody : CapturedMir :=
+  stmtDivBody "stmt_div::write_through_pointer_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 42)), span := "_1 = 42" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨2, [.deref]⟩ (.use (stmtDivConstU64 7)), span := "*_2 = 7" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- `D2` regression: the write through the stale pointer `_2` into the revived
+local `_1` faults with `FailureKind.ub` (Anneal previously returned `7`). -/
+theorem stmt_div_storage_revive_write_is_ub :
+    diffCProbeBounded 16 stmtDivReviveBody
+      (.running (initMachineState stmtDivReviveBody [])) =
+      .some (.some .ub, "*_2 = 7", .none) := by
+  rfl
+
+/-- Positive control for `D2`: a pointer freshly minted after `StorageLive(_1)`
+revives `_1` still reads and writes the new storage:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 42_u64; _2 = &raw mut _1;
+StorageDead(_1); StorageLive(_1); _1 = const 9_u64; _2 = &raw mut _1;
+*_2 = const 7_u64; _0 = copy *_2; return
+``` -/
+private def stmtDivReviveFreshBody : CapturedMir :=
+  stmtDivBody "stmt_div::write_through_fresh_pointer_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 42)), span := "_1 = 42" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 9)), span := "_1 = 9" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1 (fresh)" },
+      { kind := .assign ⟨2, [.deref]⟩ (.use (stmtDivConstU64 7)), span := "*_2 = 7" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨2, [.deref]⟩)), span := "_0 = copy *_2" } ]
+
+/-- Positive control for `D2`: the fresh pointer returns `7`. -/
+theorem stmt_div_storage_revive_fresh_pointer_ok :
+    diffCProbeBounded 16 stmtDivReviveFreshBody
+      (.running (initMachineState stmtDivReviveFreshBody [])) =
+      .some (.none, "none", .some (.scalar ⟨7, 8⟩)) := by
+  rfl
+
+/-- `D14a-storage` (`evalRvalue_reborrow_dangling_divergence`): reborrow a shared
+reference through a raw pointer whose pointee was killed by `StorageDead`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3); _1 = const 42_u64;
+_2 = &raw mut _1; StorageDead(_1); _3 = &*_2; _0 = const 0_u64; return
+``` -/
+private def stmtDivDanglingReborrowBody : CapturedMir :=
+  stmtDivBody "stmt_div::reborrow_through_dangling_pointer"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty,
+      stmtDivDecl stmtDivRefU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 42)), span := "_1 = 42" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .assign ⟨3, []⟩ (.ref .shared ⟨2, [.deref]⟩), span := "_3 = &*_2" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+/-- `D14a-storage` regression: reborrowing through the dangling pointer faults
+with `FailureKind.ub` instead of minting a dangling reference. -/
+theorem stmt_div_storage_dead_reborrow_is_ub :
+    diffCProbeBounded 16 stmtDivDanglingReborrowBody
+      (.running (initMachineState stmtDivDanglingReborrowBody [])) =
+      .some (.some .ub, "_3 = &*_2", .none) := by
+  rfl
+
+/-- `D9` (`step_placeMention_deref_uninit_divergence`): mention a dereference of
+an uninitialized raw-pointer local:
+```text
+StorageLive(_1); PlaceMention(*_1); _0 = const 0_u64; return
+``` -/
+private def stmtDivPlaceMentionDerefUninitBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_deref_uninit_pointer"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .placeMention ⟨1, [.deref]⟩, span := "PlaceMention(*_1)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+/-- `D9` regression: computing `*_1` loads the uninitialized pointer `_1` and
+faults with `FailureKind.ub`. -/
+theorem stmt_div_placeMention_deref_uninit_is_ub :
+    diffCProbeBounded 8 stmtDivPlaceMentionDerefUninitBody
+      (.running (initMachineState stmtDivPlaceMentionDerefUninitBody [])) =
+      .some (.some .ub, "PlaceMention(*_1)", .none) := by
+  rfl
+
+/-- `D9` index regression body: mention `_1[_2]` with an uninitialized index:
+```text
+StorageLive(_1); StorageLive(_2); _1 = [const 1_u64, const 2_u64];
+PlaceMention(_1[_2]); _0 = const 0_u64; return
+``` -/
+private def stmtDivPlaceMentionIndexUninitBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_index_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy, stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
+        span := "_1 = [1, 2]" },
+      { kind := .placeMention ⟨1, [.index 2]⟩, span := "PlaceMention(_1[_2])" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+/-- `D9` regression: computing `_1[_2]` reads the uninitialized index local `_2`
+and faults with `FailureKind.ub`. -/
+theorem stmt_div_placeMention_index_uninit_is_ub :
+    diffCProbeBounded 8 stmtDivPlaceMentionIndexUninitBody
+      (.running (initMachineState stmtDivPlaceMentionIndexUninitBody [])) =
+      .some (.some .ub, "PlaceMention(_1[_2])", .none) := by
+  rfl
+
+/-- Positive control for `D9`: mentioning an uninitialized local without
+projections (`let _ = x;` on a live local) and mentioning an initialized index
+both remain defined:
+```text
+StorageLive(_1); StorageLive(_2); PlaceMention(_2); _2 = const 1_usize;
+_1 = [const 1_u64, const 2_u64]; PlaceMention(_1[_2]); _0 = const 5_u64; return
+``` -/
+private def stmtDivPlaceMentionOkBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_defined"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy, stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .placeMention ⟨2, []⟩, span := "PlaceMention(_2)" },
+      { kind := .assign ⟨2, []⟩ (.use (stmtDivConstUsize 1)), span := "_2 = 1" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
+        span := "_1 = [1, 2]" },
+      { kind := .placeMention ⟨1, [.index 2]⟩, span := "PlaceMention(_1[_2])" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 5)), span := "_0 = 5" } ]
+
+/-- Positive control for `D9`: the body returns `5`. -/
+theorem stmt_div_placeMention_defined_ok :
+    diffCProbeBounded 16 stmtDivPlaceMentionOkBody
+      (.running (initMachineState stmtDivPlaceMentionOkBody [])) =
+      .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
+  rfl
+
+/-- Machine state at `StorageDead(_1)` in which `_1` is borrowed by a tag
+carrying function-entry protector `protId`, with active protectors `prots`. -/
+private def stmtDivProtectedState (prots : List Nat) : MachineState :=
+  { frame := {
+      blockIdx := 0
+      stmtIdx := 0
+      locals := [.uninit, .init (.scalar ⟨42, 8⟩)]
+    }
+    memory := {
+      emptyMemory with
+      borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                    perm := .active, protector := .some 1 }]
+      nextTag := 2
+      activeProtectors := prots
+      nextProtector := 2
+    } }
+
+/-- `D2` protector regression: `StorageDead(_1)` faults with `FailureKind.ub`
+while a tag minted from `_1` is protected by an active function-entry
+protector. -/
+theorem stmt_div_storage_dead_protected_is_ub :
+    evalStmt (stmtDivProtectedState [1]) ⟨.storageDead 1, "dead _1"⟩ =
+      MirStepNode.fail .ub := by
+  rfl
+
+/-- Once the protector is no longer active, `StorageDead(_1)` succeeds and
+disables every tag minted from `_1` in the borrow table. -/
+theorem stmt_div_storage_dead_unprotected_disables :
+    evalStmt (stmtDivProtectedState []) ⟨.storageDead 1, "dead _1"⟩ =
+      MirStepNode.step
+        (advanceStmt (stmtDivProtectedState []) [.uninit, .dead]
+          { (stmtDivProtectedState []).memory with
+            borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                          perm := .disabled, protector := .some 1 }] }) := by
+  rfl
+
+/-- `D2` protector regression on `StorageLive(_1)`: implicitly deallocating an
+already-allocated local `_1` via `StorageLive(_1)` while a tag minted from `_1`
+is protected by an active function-entry protector faults with `FailureKind.ub`. -/
+theorem stmt_div_storage_live_protected_is_ub :
+    evalStmt (stmtDivProtectedState [1]) ⟨.storageLive 1, "live _1"⟩ =
+      MirStepNode.fail .ub := by
+  rfl
+
+/-- Once the protector is no longer active, `StorageLive(_1)` succeeds and
+disables every tag minted from `_1` in the borrow table. -/
+theorem stmt_div_storage_live_unprotected_disables :
+    evalStmt (stmtDivProtectedState []) ⟨.storageLive 1, "live _1"⟩ =
+      MirStepNode.step
+        (advanceStmt (stmtDivProtectedState []) [.uninit, .uninit]
+          { (stmtDivProtectedState []).memory with
+            borrows := [{ tag := 1, targetLocal := 1, targetProjection := [],
+                          perm := .disabled, protector := .some 1 }] }) := by
+  rfl
+
+/-- `D2` retag-after-`StorageDead` regression (with global-allocation tag
+aliasing): retagging a reference `_2` after `StorageDead(_1)` faults with
+`FailureKind.ub` even when captured global allocation `stmtDivGlobal1` shares
+`allocId = 1` (removing `_1`'s borrow entry instead of disabling it would fall
+back to `lookupGlobalAlloc` and allow `Retag(_2)` to succeed):
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &_1;
+StorageDead(_1); Retag([default] _2); _0 = const 0_u64; return
+``` -/
+private def stmtDivDeadGlobalAliasRetagBody : CapturedMir :=
+  stmtDivBodyWithGlobal "stmt_div::retag_dead_reference_aliasing_global"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivRefU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref .shared ⟨1, []⟩), span := "_2 = &_1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .retag .default ⟨2, []⟩, span := "Retag(_2)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_storage_dead_retag_is_ub :
+    diffCProbeBounded 16 stmtDivDeadGlobalAliasRetagBody
+      (.running (initMachineState stmtDivDeadGlobalAliasRetagBody [])) =
+      .some (.some .ub, "Retag(_2)", .none) := by
+  rfl
+
+/-- `D2` `copy_nonoverlapping` source after `StorageDead` + `StorageLive`
+revival: copying 1 element out of the revived and re-initialized `_1` through
+the two-phase mutable borrow `_2` minted before `StorageDead(_1)` (whose
+`.reserved` tag survives the direct write `_1 = 20`):
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &two-phase mut _1; _0 = const 0_u64; _3 = &raw mut _0;
+StorageDead(_1); StorageLive(_1); _1 = const 20_u64;
+copy_nonoverlapping(src = copy _2, dst = copy _3, count = const 1_usize); return
+``` -/
+private def stmtDivReviveCopySrcBody : CapturedMir :=
+  stmtDivBody "stmt_div::copy_nonoverlapping_from_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRefMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" },
+      { kind := .assign ⟨3, []⟩ (.rawPtr .mut ⟨0, []⟩), span := "_3 = &raw mut _0" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .intrinsic (.copyNonOverlapping (.copy ⟨2, []⟩) (.copy ⟨3, []⟩) (stmtDivConstUsize 1)),
+        span := "copy_nonoverlapping(src=_2, dst=_3, 1)" } ]
+
+/-- `D2` `copy_nonoverlapping` source regression: the copy faults with
+`FailureKind.ub` (Anneal previously copied the revived `20` into `_0` and
+returned it). -/
+theorem stmt_div_storage_revive_copy_nonoverlapping_is_ub :
+    diffCProbeBounded 20 stmtDivReviveCopySrcBody
+      (.running (initMachineState stmtDivReviveCopySrcBody [])) =
+      .some (.some .ub, "copy_nonoverlapping(src=_2, dst=_3, 1)", .none) := by
+  rfl
+
+/-- `D2` `copy_nonoverlapping` destination after `StorageDead` + `StorageLive`
+revival: copying 1 element into the revived `_1` through the raw pointer `_2`
+minted before `StorageDead(_1)`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &raw mut _1; _0 = const 5_u64; _3 = &raw mut _0;
+StorageDead(_1); StorageLive(_1);
+copy_nonoverlapping(src = copy _3, dst = copy _2, count = const 1_usize);
+_0 = copy _1; return
+``` -/
+private def stmtDivReviveCopyDstBody : CapturedMir :=
+  stmtDivBody "stmt_div::copy_nonoverlapping_into_revived_local"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 5)), span := "_0 = 5" },
+      { kind := .assign ⟨3, []⟩ (.rawPtr .mut ⟨0, []⟩), span := "_3 = &raw mut _0" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .intrinsic (.copyNonOverlapping (.copy ⟨3, []⟩) (.copy ⟨2, []⟩) (stmtDivConstUsize 1)),
+        span := "copy_nonoverlapping(src=_3, dst=_2, 1)" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, []⟩)), span := "_0 = copy _1" } ]
+
+/-- `D2` `copy_nonoverlapping` destination regression: the copy faults with
+`FailureKind.ub` (Anneal previously wrote `5` into the revived `_1` through the
+stale pointer and returned it). -/
+theorem stmt_div_storage_revive_copy_nonoverlapping_dst_is_ub :
+    diffCProbeBounded 20 stmtDivReviveCopyDstBody
+      (.running (initMachineState stmtDivReviveCopyDstBody [])) =
+      .some (.some .ub, "copy_nonoverlapping(src=_3, dst=_2, 1)", .none) := by
+  rfl
+
+/-- Positive control for `D9` + `D2` (`rustc_middle/src/mir/syntax.rs`:
+"`let _ = *ptr;` is fine even if the pointer is dangling"): mentioning `*_2` via
+`PlaceMention(*_2)` when `_2` is initialized succeeds even after its pointee
+`_1` has been deallocated by `StorageDead(_1)`:
+```text
+StorageLive(_1); StorageLive(_2); _1 = const 10_u64; _2 = &raw const _1;
+StorageDead(_1); PlaceMention(*_2); _0 = const 99_u64; return
+``` -/
+private def stmtDivPlaceMentionDanglingPtrOkBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_deref_dangling_pointer_ok"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl { kind := .rawPtr .not (.uint .u64), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .placeMention ⟨2, [.deref]⟩, span := "PlaceMention(*_2)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 99)), span := "_0 = 99" } ]
+
+theorem stmt_div_placeMention_deref_dangling_ok :
+    diffCProbeBounded 16 stmtDivPlaceMentionDanglingPtrOkBody
+      (.running (initMachineState stmtDivPlaceMentionDanglingPtrOkBody [])) =
+      .some (.none, "none", .some (.scalar ⟨99, 8⟩)) := by
+  rfl
+
+/-- `D2` transitive child-reborrow revival regression: reborrowing a mutable
+reference `_3 = &mut *_2` (`parentTag = .some 1`, `targetLocal = 1`, initialized
+in `.reserved` permission) from raw pointer `_2 = &raw mut _1` before
+`StorageDead(_1)`, reviving and re-initializing `_1 = 20` (which only disables
+`.active` tags at base `12c9ecb8`, leaving `.reserved` child tag `2` alive),
+and reading `_0 = copy *_3`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &raw mut _1; _3 = &mut *_2;
+StorageDead(_1); StorageLive(_1); _1 = const 20_u64;
+_0 = copy *_3; return
+``` -/
+private def stmtDivReviveChildReborrowReadBody : CapturedMir :=
+  stmtDivBody "stmt_div::read_through_child_reborrow_after_revival"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRefMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .assign ⟨3, []⟩ (.ref (.mut false) ⟨2, [.deref]⟩), span := "_3 = &mut *_2" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 20)), span := "_1 = 20" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨3, [.deref]⟩)), span := "_0 = copy *_3" } ]
+
+/-- `D2` child-reborrow revival regression: `disableLocalBorrows` disables every
+borrow entry with `targetLocal = 1` (both parent tag `1` and child reborrow tag
+`2`), so reading `*_3` after revival faults with `FailureKind.ub` (Anneal
+previously returned the revived `20`). -/
+theorem stmt_div_storage_revive_child_reborrow_read_is_ub :
+    diffCProbeBounded 20 stmtDivReviveChildReborrowReadBody
+      (.running (initMachineState stmtDivReviveChildReborrowReadBody [])) =
+      .some (.some .ub, "_0 = copy *_3", .none) := by
+  rfl
+
+/-- `D2` pointer-offset (`BinOp.offset`) after `StorageDead` + `StorageLive`
+revival: offsetting the raw pointer `_2 = &raw mut _1` minted before
+`StorageDead(_1)` by one `u64` element (a non-zero byte offset, which MiniRust
+`ptr_offset_inbounds` and `ptr::offset` only allow inside a live allocation)
+faults with `FailureKind.ub` (Anneal previously allowed `Offset` on the stale
+tag and returned `0`):
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = const 10_u64; _2 = &raw mut _1;
+StorageDead(_1); StorageLive(_1);
+_3 = Offset(copy _2, const 1_isize); _0 = const 0_u64; return
+```
+A zero offset is defined on dangling pointers in MiniRust and Miri; Anneal
+currently also faults on it because `evalPtrOffsetBinOp` (`Places.lean`)
+rejects disabled tags before inspecting the offset. -/
+private def stmtDivRevivePtrOffsetBody : CapturedMir :=
+  stmtDivBody "stmt_div::ptr_offset_after_storage_revival"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivU64Ty,
+      stmtDivDecl stmtDivRawMutU64Ty, stmtDivDecl stmtDivRawMutU64Ty]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩ (.use (stmtDivConstU64 10)), span := "_1 = 10" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .mut ⟨1, []⟩), span := "_2 = &raw mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨3, []⟩
+          (.binaryOp .offset (.copy ⟨2, []⟩)
+            (.constant ⟨{ kind := .int .isize, layoutIdx := 0 }, .scalar (.int ⟨1, 8⟩)⟩)),
+        span := "_3 = Offset(_2, 1)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_storage_revive_ptr_offset_is_ub :
+    diffCProbeBounded 16 stmtDivRevivePtrOffsetBody
+      (.running (initMachineState stmtDivRevivePtrOffsetBody [])) =
+      .some (.some .ub, "_3 = Offset(_2, 1)", .none) := by
+  rfl
+
+/-- Two-variant enum `enum E { A(u64), B(u64) }` used by the `SetDiscriminant`
+regression body (`SetDiscriminant` is only well-formed on enums). -/
+private def stmtDivEnumTy : Ty := { kind := .adt "stmt_div::E" [], layoutIdx := 0 }
+
+/-- `D2` `SetDiscriminant` after `StorageDead` + `StorageLive` revival:
+writing a discriminant through the two-phase mutable borrow `_2 = &two-phase mut _1`
+(whose `.reserved` tag survives the direct write `_1 = E::A(20)` at base
+`12c9ecb8`) after `_1` has been deallocated by `StorageDead(_1)`, revived by
+`StorageLive(_1)`, and re-initialized faults with `FailureKind.ub` (Anneal
+previously updated the revived `_1`'s discriminant and returned `0`):
+```text
+StorageLive(_1); StorageLive(_2);
+_1 = E::A(const 10_u64); _2 = &two-phase mut _1;
+StorageDead(_1); StorageLive(_1); _1 = E::A(const 20_u64);
+SetDiscriminant(*_2, 1); _0 = const 0_u64; return
+``` -/
+private def stmtDivReviveSetDiscrBody : CapturedMir :=
+  stmtDivBody "stmt_div::set_discriminant_through_revived_local_borrow"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivEnumTy,
+      stmtDivDecl { kind := .ref .mut (.adt "stmt_div::E" []), layoutIdx := 0 }]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.adt "stmt_div::E" 0 .none) [stmtDivConstU64 10]),
+        span := "_1 = E::A(10)" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut true) ⟨1, []⟩), span := "_2 = &two-phase mut _1" },
+      { kind := .storageDead 1, span := "dead _1" },
+      { kind := .storageLive 1, span := "revive _1" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.adt "stmt_div::E" 0 .none) [stmtDivConstU64 20]),
+        span := "_1 = E::A(20)" },
+      { kind := .setDiscriminant ⟨2, [.deref]⟩ 1, span := "SetDiscriminant(*_2, 1)" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_storage_revive_set_discriminant_is_ub :
+    diffCProbeBounded 16 stmtDivReviveSetDiscrBody
+      (.running (initMachineState stmtDivReviveSetDiscrBody [])) =
+      .some (.some .ub, "SetDiscriminant(*_2, 1)", .none) := by
+  rfl
+
+/-- `D9` compound deref-plus-uninitialized-index regression: mentioning
+`(*_2)[_3]` when the root pointer `_2 = &raw const _1` is initialized (so the
+leading `.deref` check passes) but the subsequent `.index 3` operand `_3` is
+uninitialized (`placeIndexLocalsInit locals [.deref, .index 3] = false`) faults
+with `FailureKind.ub` (Anneal previously checked only that root local `_2` was
+live and returned `0`):
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_1 = [const 1_u64, const 2_u64]; _2 = &raw const _1;
+PlaceMention((*_2)[_3]); _0 = const 0_u64; return
+``` -/
+private def stmtDivPlaceMentionDerefIndexUninitBody : CapturedMir :=
+  stmtDivBody "stmt_div::place_mention_deref_with_uninit_index"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy,
+      stmtDivDecl { kind := .rawPtr .not (.array (.uint .u64) 2), layoutIdx := 0 },
+      stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨1, []⟩
+          (.aggregate (.array stmtDivU64Ty) [stmtDivConstU64 1, stmtDivConstU64 2]),
+        span := "_1 = [1, 2]" },
+      { kind := .assign ⟨2, []⟩ (.rawPtr .not ⟨1, []⟩), span := "_2 = &raw const _1" },
+      { kind := .placeMention ⟨2, [.deref, .index 3]⟩, span := "PlaceMention((*_2)[_3])" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_placeMention_deref_index_uninit_is_ub :
+    diffCProbeBounded 16 stmtDivPlaceMentionDerefIndexUninitBody
+      (.running (initMachineState stmtDivPlaceMentionDerefIndexUninitBody [])) =
+      .some (.some .ub, "PlaceMention((*_2)[_3])", .none) := by
+  rfl
+
+end StatementDivergenceRegressions
+
+/-! ## 7. Uninitialized Aggregate Field Writes (`D13b`)
+
+Kernel-checked executions of projected assignments into a field of a live but
+uninitialized struct, union, or tuple local (`uninitFieldWriteShell?` in
+`evalStmt`). Each body faulted with `.ub` at its first field write before the
+default aggregate shell was introduced. -/
+
+section UninitAggregateFieldWrites
+
+open Trusted.Effect
+
+/-- `u32` local type used by the union field regression body. -/
+private def stmtDivU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+
+/-- `u32` constant operand. -/
+private def stmtDivConstU32 (n : Nat) : Operand :=
+  .constant ⟨stmtDivU32Ty, .scalar (.int ⟨n, 4⟩)⟩
+
+/-- `union U { f0: u32, f1: u32 }`. -/
+private def stmtDivUnionTy : Ty := { kind := .adt "stmt_div::U" [], layoutIdx := 0 }
+
+/-- `struct S { a: u64, b: u64 }`. -/
+private def stmtDivStructTy : Ty := { kind := .adt "stmt_div::S" [], layoutIdx := 0 }
+
+/-- `(u64, u64)`. -/
+private def stmtDivPairTy : Ty := { kind := .tuple [.uint .u64, .uint .u64], layoutIdx := 0 }
+
+/-- `D13b` (`step_union_field_write_uninit_divergence`): initialize field `f0`
+of an uninitialized union local and read it back:
+```text
+StorageLive(_1); _1.f0 = const 42_u32; _0 = copy (_1.f0); return
+``` -/
+private def stmtDivUnionFieldInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::union_field_write_into_uninit"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU32Ty]⟩ (.use (stmtDivConstU32 42)),
+        span := "_1.f0 = 42" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 0 stmtDivU32Ty]⟩)),
+        span := "_0 = copy _1.f0" } ]
+
+/-- `D13b` regression: the union field write initializes `_1.f0` and the body
+returns `42` (Anneal previously faulted with `.ub` at `_1.f0 = 42`). -/
+theorem stmt_div_assign_uninit_union_field_ok :
+    diffCProbeBounded 16 stmtDivUnionFieldInitBody
+      (.running (initMachineState stmtDivUnionFieldInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨42, 4⟩)) := by
+  rfl
+
+/-- `D13b` struct variant: initialize both fields of an uninitialized struct
+local out of declaration order and read the first one back:
+```text
+StorageLive(_1); _1.b = const 7_u64; _1.a = const 5_u64; _0 = copy (_1.a); return
+``` -/
+private def stmtDivStructFieldInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::struct_fields_written_out_of_order_into_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivStructTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 7)),
+        span := "_1.b = 7" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 5)),
+        span := "_1.a = 5" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 0 stmtDivU64Ty]⟩)),
+        span := "_0 = copy _1.a" } ]
+
+/-- `D13b` struct regression: the body returns `5` (Anneal previously faulted
+with `.ub` at `_1.b = 7`). -/
+theorem stmt_div_assign_uninit_struct_fields_ok :
+    diffCProbeBounded 16 stmtDivStructFieldInitBody
+      (.running (initMachineState stmtDivStructFieldInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨5, 8⟩)) := by
+  rfl
+
+/-- `D13b` tuple variant: initialize both fields of an uninitialized pair local
+and read the second one back:
+```text
+StorageLive(_1); _1.0 = const 3_u64; _1.1 = const 4_u64; _0 = copy (_1.1); return
+``` -/
+private def stmtDivPairFieldInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::tuple_fields_written_into_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivPairTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 3)),
+        span := "_1.0 = 3" },
+      { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 4)),
+        span := "_1.1 = 4" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 1 stmtDivU64Ty]⟩)),
+        span := "_0 = copy _1.1" } ]
+
+/-- `D13b` tuple regression: the body returns `4` (Anneal previously faulted
+with `.ub` at `_1.0 = 3`). -/
+theorem stmt_div_assign_uninit_tuple_fields_ok :
+    diffCProbeBounded 16 stmtDivPairFieldInitBody
+      (.running (initMachineState stmtDivPairFieldInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨4, 8⟩)) := by
+  rfl
+
+/-- `struct Outer { a: S, b: S }` with two nested struct fields. -/
+private def stmtDivOuterStructTy : Ty :=
+  { kind := .adt "stmt_div::Outer" [], layoutIdx := 0 }
+
+/-- `(u32, u32)` pair type used inside a union field. -/
+private def stmtDivU32PairTy : Ty :=
+  { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 0 }
+
+/-- `D13b` nested aggregate regression (reverse field order): initialize all
+four leaf fields of an uninitialized `Outer { a: S, b: S }` local in reverse
+order (`_1.b.b`, `_1.b.a`, `_1.a.b`, `_1.a.a`) and read `_1.a.a` back:
+```text
+StorageLive(_1);
+(_1.b).b = const 40_u64; (_1.b).a = const 30_u64;
+(_1.a).b = const 20_u64; (_1.a).a = const 10_u64;
+_0 = copy ((_1.a).a); return
+```
+Without `ensureNestedFieldShells`, `_1.b.b = 40` faulted with `.ub` against the
+flat shell `.aggregate 0 []`, and `_1.a.b = 20` faulted against the `.unit`
+padding left at field `0` by `setOrExtendFields`. -/
+private def stmtDivNestedStructRevInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::nested_struct_fields_reverse_order_into_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 40)),
+        span := "(_1.b).b = 40" },
+      { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .field 0 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 30)),
+        span := "(_1.b).a = 30" },
+      { kind := .assign ⟨1, [.field 0 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 20)),
+        span := "(_1.a).b = 20" },
+      { kind := .assign ⟨1, [.field 0 stmtDivStructTy, .field 0 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 10)),
+        span := "(_1.a).a = 10" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivStructTy, .field 0 stmtDivU64Ty]⟩)),
+        span := "_0 = copy (_1.a).a" } ]
+
+theorem stmt_div_assign_uninit_nested_struct_rev_ok :
+    diffCProbeBounded 16 stmtDivNestedStructRevInitBody
+      (.running (initMachineState stmtDivNestedStructRevInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨10, 8⟩)) := by
+  rfl
+
+/-- `D13b` nested aggregate regression (forward field order): initialize all
+four leaf fields of an uninitialized `Outer { a: S, b: S }` local in declaration
+order (`_1.a.a`, `_1.a.b`, `_1.b.a`, `_1.b.b`) and read `_1.b.b` back:
+```text
+StorageLive(_1);
+(_1.a).a = const 10_u64; (_1.a).b = const 20_u64;
+(_1.b).a = const 30_u64; (_1.b).b = const 40_u64;
+_0 = copy ((_1.b).b); return
+```
+Without `ensureNestedFieldShells`, `(_1.a).a = 10` collapsed `.field 0` onto
+`.unit` in `writeProjectedValue` (storing a bare scalar `10` at `_1.a`), causing
+the second statement `(_1.a).b = 20` to fault with `.ub`. -/
+private def stmtDivNestedStructFwdInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::nested_struct_fields_forward_order_into_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivStructTy, .field 0 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 10)),
+        span := "(_1.a).a = 10" },
+      { kind := .assign ⟨1, [.field 0 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 20)),
+        span := "(_1.a).b = 20" },
+      { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .field 0 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 30)),
+        span := "(_1.b).a = 30" },
+      { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 40)),
+        span := "(_1.b).b = 40" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 1 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩)),
+        span := "_0 = copy (_1.b).b" } ]
+
+theorem stmt_div_assign_uninit_nested_struct_fwd_ok :
+    diffCProbeBounded 16 stmtDivNestedStructFwdInitBody
+      (.running (initMachineState stmtDivNestedStructFwdInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨40, 8⟩)) := by
+  rfl
+
+/-- `D13b` union with nested tuple field (`union U { pair: (u32, u32), raw: u64 }`):
+initialize both elements of `_1.pair` on an uninitialized union local and read
+`(_1.pair).1` back:
+```text
+StorageLive(_1); (_1.pair).1 = const 99_u32; (_1.pair).0 = const 77_u32;
+_0 = copy ((_1.pair).1); return
+``` -/
+private def stmtDivUnionNestedPairInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::union_nested_pair_field_write_into_uninit"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU32PairTy, .field 1 stmtDivU32Ty]⟩
+          (.use (stmtDivConstU32 99)),
+        span := "(_1.pair).1 = 99" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU32PairTy, .field 0 stmtDivU32Ty]⟩
+          (.use (stmtDivConstU32 77)),
+        span := "(_1.pair).0 = 77" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivU32PairTy, .field 1 stmtDivU32Ty]⟩)),
+        span := "_0 = copy (_1.pair).1" } ]
+
+theorem stmt_div_assign_uninit_union_nested_pair_ok :
+    diffCProbeBounded 16 stmtDivUnionNestedPairInitBody
+      (.running (initMachineState stmtDivUnionNestedPairInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨99, 4⟩)) := by
+  rfl
+
+/-- `D13b` nested aggregate regression with transparent `.opaqueCast` and
+`.unwrapUnsafeBinder` wrappers: initialize `(_1.b as S).b = 40` on an
+uninitialized `Outer { a: S, b: S }` local and then initialize
+`(unwrap_unsafe_binder(_1.a)).b = 20` into the `.unit`-padded sibling slot at
+`_1.a`, reading `(_1.a).b` back:
+```text
+StorageLive(_1);
+((_1.b) as S).b = const 40_u64;
+(unwrap_unsafe_binder(_1.a)).b = const 20_u64;
+_0 = copy ((_1.a).b); return
+```
+Without stripping transparent projections in `ensureNestedFieldShells` and
+`fieldShellChainPopulated`, both writes faulted with `.ub` because the
+intermediate `.opaqueCast` / `.unwrapUnsafeBinder` hid the trailing `.field`
+projection. -/
+private def stmtDivNestedOpaqueCastInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::nested_struct_fields_with_transparent_projections"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivOuterStructTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 1 stmtDivStructTy, .opaqueCast stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 40)),
+        span := "((_1.b) as S).b = 40" },
+      { kind := .assign ⟨1, [.field 0 stmtDivStructTy, .unwrapUnsafeBinder stmtDivStructTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 20)),
+        span := "(unwrap(_1.a)).b = 20" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivStructTy, .field 1 stmtDivU64Ty]⟩)),
+        span := "_0 = copy (_1.a).b" } ]
+
+theorem stmt_div_assign_uninit_nested_opaque_cast_field_ok :
+    diffCProbeBounded 16 stmtDivNestedOpaqueCastInitBody
+      (.running (initMachineState stmtDivNestedOpaqueCastInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨20, 8⟩)) := by
+  rfl
+
+/-- `((u64, u64), u64)` nested tuple type. -/
+private def stmtDivNestedTupleTy : Ty :=
+  { kind := .tuple [.tuple [.uint .u64, .uint .u64], .uint .u64], layoutIdx := 0 }
+
+/-- `D13b` nested tuple-in-tuple regression (`((u64, u64), u64)`): initialize
+`(_1.0).1 = 88`, `(_1.0).0 = 66`, and `_1.1 = 99` on an uninitialized nested
+tuple local and read `(_1.0).0` back:
+```text
+StorageLive(_1); (_1.0).1 = const 88_u64; (_1.0).0 = const 66_u64;
+_1.1 = const 99_u64; _0 = copy ((_1.0).0); return
+``` -/
+private def stmtDivNestedTupleInitBody : CapturedMir :=
+  stmtDivBody "stmt_div::nested_tuple_fields_written_into_uninit"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivNestedTupleTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivPairTy, .field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 88)),
+        span := "(_1.0).1 = 88" },
+      { kind := .assign ⟨1, [.field 0 stmtDivPairTy, .field 0 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 66)),
+        span := "(_1.0).0 = 66" },
+      { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 99)),
+        span := "_1.1 = 99" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivPairTy, .field 0 stmtDivU64Ty]⟩)),
+        span := "_0 = copy (_1.0).0" } ]
+
+theorem stmt_div_assign_uninit_nested_tuple_fields_ok :
+    diffCProbeBounded 16 stmtDivNestedTupleInitBody
+      (.running (initMachineState stmtDivNestedTupleInitBody [])) =
+      .some (.none, "none", .some (.scalar ⟨66, 8⟩)) := by
+  rfl
+
+/-- `&U` shared reference type to `union U`. -/
+private def stmtDivRefUnionTy : Ty :=
+  { kind := .ref .not (.adt "stmt_div::U" []), layoutIdx := 0 }
+
+/-- `&mut U` mutable reference type to `union U`. -/
+private def stmtDivRefMutUnionTy : Ty :=
+  { kind := .ref .mut (.adt "stmt_div::U" []), layoutIdx := 0 }
+
+/-- `struct PairOfUnions { a: U, b: U }` containing two union fields (valid
+while uninitialized in Rust, Miri, and MiniRust). -/
+private def stmtDivPairOfUnionsTy : Ty :=
+  { kind := .adt "stmt_div::PairOfUnions" [], layoutIdx := 0 }
+
+/-- `D13b` Tree Borrows invalidation regression on an uninitialized union field
+write: taking a shared reference `_2 = &_1` to an uninitialized `Freeze` union
+local `_1 : U` (accepted at the MIR level by Miri and MiniRust, whose reference
+validity does not require an initialized pointee; surface Rust rejects the
+borrow statically) mints a `.frozen` borrow on `_1`; initializing
+`_1.f0 = const 42_u32` via the `D13b` `.uninit` branch disables that conflicting
+`.frozen` borrow, so a subsequent read `_0 = copy ((*_2).f0)` faults with
+`FailureKind.ub` at the read (whereas Anneal previously faulted earlier at
+`_1.f0 = 42`):
+```text
+StorageLive(_1); StorageLive(_2); _2 = &_1; _1.f0 = const 42_u32;
+_0 = copy ((*_2).f0); return
+``` -/
+private def stmtDivUninitUnionInvalidatesSharedRefBody : CapturedMir :=
+  stmtDivBody "stmt_div::uninit_union_field_write_invalidates_shared_ref"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivUnionTy, stmtDivDecl stmtDivRefUnionTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨2, []⟩ (.ref .shared ⟨1, []⟩), span := "_2 = &_1" },
+      { kind := .assign ⟨1, [.field 0 stmtDivU32Ty]⟩ (.use (stmtDivConstU32 42)),
+        span := "_1.f0 = 42" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨2, [.deref, .field 0 stmtDivU32Ty]⟩)),
+        span := "_0 = copy (*_2).f0" } ]
+
+theorem stmt_div_assign_uninit_union_field_invalidates_shared_ref_ub :
+    diffCProbeBounded 16 stmtDivUninitUnionInvalidatesSharedRefBody
+      (.running (initMachineState stmtDivUninitUnionInvalidatesSharedRefBody [])) =
+      .some (.some .ub, "_0 = copy (*_2).f0", .none) := by
+  rfl
+
+/-- `D13b` projection-aware borrow preservation on an uninitialized sibling
+field write: taking `_2 = &mut (_1.a)` on an uninitialized
+`PairOfUnions { a: U, b: U }` local `_1` mints an `.active` borrow on `_1` at
+`[.field 0 U]`; initializing the disjoint sibling field `(_1.b).f0 = 20_u32` via
+`D13b` + `ensureNestedFieldShells` preserves `_2` via
+`invalidateConflictingBorrowsAtProj`, so writing `(*_2) = move _3` (`U { f0: 10 }`)
+and reading `(_1.a).f0` succeeds and returns `10` (whereas Anneal previously
+faulted at `_3.f0 = 10` / `(_1.b).f0 = 20`, and whole-local borrow invalidation
+would fault at `(*_2) = move _3`):
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_3.f0 = const 10_u32; _2 = &mut (_1.a); (_1.b).f0 = const 20_u32;
+(*_2) = move _3; _0 = copy ((_1.a).f0); return
+``` -/
+private def stmtDivUninitSiblingPreservesMutRefBody : CapturedMir :=
+  stmtDivBody "stmt_div::uninit_sibling_union_field_write_preserves_mut_ref"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivPairOfUnionsTy,
+      stmtDivDecl stmtDivRefMutUnionTy, stmtDivDecl stmtDivUnionTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨3, [.field 0 stmtDivU32Ty]⟩ (.use (stmtDivConstU32 10)),
+        span := "_3.f0 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut false) ⟨1, [.field 0 stmtDivUnionTy]⟩),
+        span := "_2 = &mut (_1.a)" },
+      { kind := .assign ⟨1, [.field 1 stmtDivUnionTy, .field 0 stmtDivU32Ty]⟩
+          (.use (stmtDivConstU32 20)),
+        span := "(_1.b).f0 = 20" },
+      { kind := .assign ⟨2, [.deref]⟩ (.use (.move ⟨3, []⟩)),
+        span := "(*_2) = move _3" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivUnionTy, .field 0 stmtDivU32Ty]⟩)),
+        span := "_0 = copy (_1.a).f0" } ]
+
+theorem stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok :
+    diffCProbeBounded 16 stmtDivUninitSiblingPreservesMutRefBody
+      (.running (initMachineState stmtDivUninitSiblingPreservesMutRefBody [])) =
+      .some (.none, "none", .some (.scalar ⟨10, 4⟩)) := by
+  rfl
+
+/-- `D13b` overlapping-field complement of
+`stmt_div_assign_uninit_sibling_union_field_preserves_mut_ref_ok`: the same body
+with the nested `D13b` write moved from the disjoint sibling `(_1.b).f0` onto the
+borrowed field `(_1.a).f0` disables the `.active` borrow `_2 = &mut (_1.a)`
+(`invalidateConflictingBorrowsAtProj` on the overlapping two-level path
+`[.field 0 U, .field 0 u32]`), so the later write through `_2` faults with
+`FailureKind.ub`. Miri reports UB at the same statement (the direct write to
+`_1.a` is a foreign write that disables `_2` under Tree Borrows, and pops it
+under Stacked Borrows). Together with the sibling witness, this pins
+projection-aware invalidation on the nested `.uninit` path: dropping the
+invalidation would return `10` here, and whole-local invalidation would fault
+in the sibling witness. Anneal previously faulted at `_3.f0 = 10`:
+```text
+StorageLive(_1); StorageLive(_2); StorageLive(_3);
+_3.f0 = const 10_u32; _2 = &mut (_1.a); (_1.a).f0 = const 20_u32;
+(*_2) = move _3; _0 = copy ((_1.a).f0); return
+``` -/
+private def stmtDivUninitOverlapDisablesMutRefBody : CapturedMir :=
+  stmtDivBody "stmt_div::uninit_overlapping_union_field_write_disables_mut_ref"
+    [stmtDivDecl stmtDivU32Ty, stmtDivDecl stmtDivPairOfUnionsTy,
+      stmtDivDecl stmtDivRefMutUnionTy, stmtDivDecl stmtDivUnionTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .storageLive 3, span := "live _3" },
+      { kind := .assign ⟨3, [.field 0 stmtDivU32Ty]⟩ (.use (stmtDivConstU32 10)),
+        span := "_3.f0 = 10" },
+      { kind := .assign ⟨2, []⟩ (.ref (.mut false) ⟨1, [.field 0 stmtDivUnionTy]⟩),
+        span := "_2 = &mut (_1.a)" },
+      { kind := .assign ⟨1, [.field 0 stmtDivUnionTy, .field 0 stmtDivU32Ty]⟩
+          (.use (stmtDivConstU32 20)),
+        span := "(_1.a).f0 = 20" },
+      { kind := .assign ⟨2, [.deref]⟩ (.use (.move ⟨3, []⟩)),
+        span := "(*_2) = move _3" },
+      { kind := .assign ⟨0, []⟩
+          (.use (.copy ⟨1, [.field 0 stmtDivUnionTy, .field 0 stmtDivU32Ty]⟩)),
+        span := "_0 = copy (_1.a).f0" } ]
+
+theorem stmt_div_assign_uninit_overlapping_nested_field_write_disables_mut_ref_ub :
+    diffCProbeBounded 16 stmtDivUninitOverlapDisablesMutRefBody
+      (.running (initMachineState stmtDivUninitOverlapDisablesMutRefBody [])) =
+      .some (.some .ub, "(*_2) = move _3", .none) := by
+  rfl
+
+/-- Known `D13b` limitation, pinned so that a future fix is noticed: after an
+out-of-order write that initializes only field `b` of an uninitialized struct
+local, reading the never-written field `a` returns the `.unit` padding that
+`setOrExtendFields` (`Places.lean`) inserted below `b`, instead of faulting as
+MiniRust and Miri do for a read of uninitialized memory. Closing this gap needs
+an uninitialized-field representation in `Value` (or a typed-copy validity
+check), both outside the `Statements.lean` scope:
+```text
+StorageLive(_1); _1.b = const 7_u64; _0 = copy (_1.a); return
+``` -/
+private def stmtDivUnwrittenLowerFieldBody : CapturedMir :=
+  stmtDivBody "stmt_div::struct_read_of_unwritten_lower_field"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivStructTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.field 1 stmtDivU64Ty]⟩ (.use (stmtDivConstU64 7)),
+        span := "_1.b = 7" },
+      { kind := .assign ⟨0, []⟩ (.use (.copy ⟨1, [.field 0 stmtDivU64Ty]⟩)),
+        span := "_0 = copy _1.a" } ]
+
+/-- Known `D13b` limitation witness: the body returns the `.unit` padding. -/
+theorem stmt_div_known_limitation_unwritten_lower_field_reads_unit :
+    diffCProbeBounded 16 stmtDivUnwrittenLowerFieldBody
+      (.running (initMachineState stmtDivUnwrittenLowerFieldBody [])) =
+      .some (.none, "none", .some .unit) := by
+  rfl
+
+/-- `D13b` array-field scope-boundary witness
+(`evalStmt_assign_uninit_array_field_elem_ub`): writing element `_2` of the
+never-written array field `_1.arr` of an uninitialized union local
+(`union U { arr: [u64; 2], wide: u64 }`) still faults with `FailureKind.ub`:
+```text
+StorageLive(_1); StorageLive(_2); _2 = const 0_usize;
+(_1.arr)[_2] = const 11_u64; _0 = const 0_u64; return
+```
+MiniRust and Miri accept this write. Anneal keeps the fault: materializing the
+array would fill the unwritten element `(_1.arr)[1]` with a `.unit` placeholder
+that a later `copy (_1.arr)[1]` would return instead of faulting on the
+uninitialized element. -/
+private def stmtDivUnionArrayFieldElemBody : CapturedMir :=
+  stmtDivBody "stmt_div::union_array_field_elem_write_into_uninit_is_ub"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivUnionTy, stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨2, []⟩
+          (.use (.constant ⟨stmtDivUsizeTy, .scalar (.int ⟨0, 8⟩)⟩)),
+        span := "_2 = 0" },
+      { kind := .assign ⟨1, [.field 0 stmtDivArrTy, .index 2]⟩
+          (.use (stmtDivConstU64 11)),
+        span := "(_1.arr)[_2] = 11" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_assign_uninit_array_field_elem_is_ub :
+    diffCProbeBounded 16 stmtDivUnionArrayFieldElemBody
+      (.running (initMachineState stmtDivUnionArrayFieldElemBody [])) =
+      .some (.some .ub, "(_1.arr)[_2] = 11", .none) := by
+  rfl
+
+/-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
+writing an array element `_1[_2] = const 10_u64` into an uninitialized array
+local `_1` (where `_2 = const 0_usize`) still faults with `FailureKind.ub`.
+MiniRust (`eval_place` on `PlaceExpr::Index` only checks the index against the
+static element count) and Miri accept this write; Anneal keeps the fault because
+the `D13b` repair is scoped to field projections, so this witness guards that
+boundary rather than asserting Rust semantics:
+```text
+StorageLive(_1); StorageLive(_2); _2 = const 0_usize;
+_1[_2] = const 10_u64; _0 = const 0_u64; return
+``` -/
+private def stmtDivUninitArrayIndexWriteBody : CapturedMir :=
+  stmtDivBody "stmt_div::array_index_write_into_uninit_is_ub"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivArrTy, stmtDivDecl stmtDivUsizeTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .storageLive 2, span := "live _2" },
+      { kind := .assign ⟨2, []⟩
+          (.use (.constant ⟨stmtDivUsizeTy, .scalar (.int ⟨0, 8⟩)⟩)),
+        span := "_2 = 0" },
+      { kind := .assign ⟨1, [.index 2]⟩ (.use (stmtDivConstU64 10)),
+        span := "_1[_2] = 10" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_assign_uninit_array_index_is_ub :
+    diffCProbeBounded 16 stmtDivUninitArrayIndexWriteBody
+      (.running (initMachineState stmtDivUninitArrayIndexWriteBody [])) =
+      .some (.some .ub, "_1[_2] = 10", .none) := by
+  rfl
+
+/-- `D13b` scope-boundary witness (`evalStmt_assign_uninit_non_aggregate_ub`):
+writing an enum variant field `((_1 as Variant#0).0) = const 10_u64` into an
+uninitialized enum local `_1` (without `SetDiscriminant`) still faults with
+`FailureKind.ub`. MiniRust (`eval_place` on `PlaceExpr::Downcast` returns the
+root place at the variant type without any check) and Miri accept this write;
+Anneal keeps the fault because the `D13b` repair is scoped to field projections,
+so this witness guards that boundary rather than asserting Rust semantics:
+```text
+StorageLive(_1); ((_1 as A).0) = const 10_u64; _0 = const 0_u64; return
+``` -/
+private def stmtDivUninitDowncastWriteBody : CapturedMir :=
+  stmtDivBody "stmt_div::enum_downcast_field_write_into_uninit_is_ub"
+    [stmtDivDecl stmtDivU64Ty, stmtDivDecl stmtDivEnumTy]
+    [ { kind := .storageLive 1, span := "live _1" },
+      { kind := .assign ⟨1, [.downcast "A" 0, .field 0 stmtDivU64Ty]⟩
+          (.use (stmtDivConstU64 10)),
+        span := "((_1 as A).0) = 10" },
+      { kind := .assign ⟨0, []⟩ (.use (stmtDivConstU64 0)), span := "_0 = 0" } ]
+
+theorem stmt_div_assign_uninit_downcast_is_ub :
+    diffCProbeBounded 16 stmtDivUninitDowncastWriteBody
+      (.running (initMachineState stmtDivUninitDowncastWriteBody [])) =
+      .some (.some .ub, "((_1 as A).0) = 10", .none) := by
+  rfl
+
+/-- **Theorem L5.24 (`mir_uninit_aggregate_field_write_characterizations`)**:
+Consolidates the `Statements.lean` universal characterizations for `D13b`
+(`ensureNestedFieldShells`, `fieldShellChainPopulated`, `uninitFieldWriteShell?`,
+and `evalStmt` on projected writes into live uninitialized and initialized locals):
+1. `ensureNestedFieldShells` is the identity on any single-element projection
+   list (`ensureNestedFieldShells_singleton`) and on any root whose intermediate
+   field slots along the written chain are populated
+   (`ensureNestedFieldShells_eq_self_of_populated`,
+   `writeProjectedValue_ensureNestedFieldShells_of_populated`,
+   `evalStmt_assign_init_projected_step`), while materializing inner aggregate
+   shells when writing into an unpopulated (`.none` or `.some .unit`) outer
+   field slot of an already-initialized aggregate
+   (`evalStmt_assign_init_unpopulated_nested_field_ok`).
+2. `uninitFieldWriteShell?` returns `.some (.aggregate 0 .nil)` for single-level
+   field projections on `.adt` and `.tuple` locals (`uninitFieldWriteShell?_field_adt`,
+   `uninitFieldWriteShell?_field_tuple`) and `.none` for non-field projection
+   heads or non-aggregate root types (`uninitFieldWriteShell?_eq_none_of_not_field`,
+   `uninitFieldWriteShell?_eq_none_of_non_aggregate_ty`,
+   `uninitFieldWriteShell?_eq_none_iff`).
+3. `evalStmt` initializes `.uninit` struct, union, tuple, and nested aggregate
+   locals when `writeProjectedValue` succeeds and no active protector conflicts
+   (`evalStmt_assign_uninit_aggregate_field_step`,
+   `evalStmt_assign_uninit_union_field_ok`,
+   `evalStmt_assign_uninit_tuple_field_ok`,
+   `evalStmt_assign_uninit_nested_field_ok`), and faults with
+   `MirStepNode.fail .ub` when a protected borrow conflicts
+   (`evalStmt_assign_uninit_aggregate_field_protected_conflict_ub`), when the
+   write goes through a never-written array field or non-field sub-projection
+   (`evalStmt_assign_uninit_array_field_elem_ub`,
+   `evalStmt_assign_uninit_field_non_field_subproj_ub`), or when no aggregate
+   shell applies (`evalStmt_assign_uninit_non_aggregate_ub`). -/
+theorem mir_uninit_aggregate_field_write_characterizations
+    (s : MachineState)
+    (dstLoc idxLocal : Local)
+    (variantIdx : VariantIdx)
+    (fields : List Value)
+    (fieldIdx innerIdx : FieldIdx)
+    (outerTy fieldTy : Ty)
+    (elemKind : RigidTy)
+    (count arrLayoutIdx : Nat)
+    (proj nextProj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (defPath : DefPath)
+    (args tupleFields : List RigidTy)
+    (layoutIdx : Nat)
+    (val rootVal : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (shell rootVal' : Value)
+    (locals₂ : List LocalSlot)
+    (protHead : Nat)
+    (protTail : List Nat) :
+    ensureNestedFieldShells val [proj] = val ∧
+    (fieldShellChainPopulated rootVal (proj :: rest) = true →
+      ensureNestedFieldShells rootVal (proj :: rest) = rootVal) ∧
+    (fieldShellChainPopulated rootVal (proj :: rest) = true →
+      writeProjectedValue locals₁ (ensureNestedFieldShells rootVal (proj :: rest))
+        (proj :: rest) val =
+        writeProjectedValue locals₁ rootVal (proj :: rest) val) ∧
+    (proj ≠ .deref →
+      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some (.init rootVal) →
+      fieldShellChainPopulated rootVal (proj :: rest) = true →
+      writeProjectedValue locals₁ rootVal (proj :: rest) val = .ok rootVal' →
+      set? locals₁ dstLoc (.init rootVal') = .some locals₂ →
+      (∀ (pH : Nat) (pT : List Nat),
+        mem₁.activeProtectors = pH :: pT →
+        hasProtectedWriteConflict mem₁.borrows (pH :: pT) dstLoc .none
+          (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+           | .some rp => rp
+           | .none => proj :: rest) = false) →
+      evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals₂
+            { mem₁ with
+              borrows :=
+                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                  (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+                   | .some rp => rp
+                   | .none => proj :: rest) })) ∧
+    (let projs : List ProjectionElem := [.field fieldIdx outerTy, .field innerIdx fieldTy];
+      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some (.init (.aggregate variantIdx fields)) →
+      ((∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
+       (∃ innerFields, outerTy.kind = .tuple innerFields)) →
+      (get? fields fieldIdx = .none ∨ get? fields fieldIdx = .some .unit) →
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate variantIdx
+            (setOrExtendFields fields fieldIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂ →
+      mem₁.activeProtectors = .nil →
+      evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals₂
+            { mem₁ with
+              borrows :=
+                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                  (match resolveBorrowProjectionElems locals₁ projs with
+                   | .some rp => rp
+                   | .none => projs) })) ∧
+    (placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+        .some { kind := .adt defPath args, layoutIdx := layoutIdx } →
+      uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
+        .some (.aggregate 0 .nil)) ∧
+    (placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+        .some { kind := .tuple tupleFields, layoutIdx := layoutIdx } →
+      uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) =
+        .some (.aggregate 0 .nil)) ∧
+    ((∀ (fIdx : FieldIdx) (fTy : Ty), proj ≠ .field fIdx fTy) →
+      uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none) ∧
+    ((∀ (dp : DefPath) (as_ : List RigidTy) (lIdx : Nat),
+        placeTy localDecls layouts { local_ := dstLoc, projection := .nil } ≠
+          .some { kind := .adt dp as_, layoutIdx := lIdx }) →
+      (∀ (fs : List RigidTy) (lIdx : Nat),
+        placeTy localDecls layouts { local_ := dstLoc, projection := .nil } ≠
+          .some { kind := .tuple fs, layoutIdx := lIdx }) →
+      uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none) ∧
+    (uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none ↔
+      uninitFieldWriteShell? localDecls layouts dstLoc proj .nil = .none) ∧
+    (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
+        .some shell →
+      writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
+        .ok rootVal' →
+      set? locals₁ dstLoc (.init rootVal') = .some locals₂ →
+      mem₁.activeProtectors = protHead :: protTail →
+      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
+        (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
+         | .some rp => rp
+         | .none => .field fieldIdx fieldTy :: rest) = true →
+      evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩
+        localDecls layouts = MirStepNode.fail .ub) ∧
+    (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+        .some { kind := .adt defPath args, layoutIdx := layoutIdx } →
+      set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+        .some locals₂ →
+      mem₁.activeProtectors = .nil →
+      evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: .nil⟩ rv, span⟩
+        localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals₂
+            { mem₁ with
+              borrows :=
+                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                  (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
+                   | .some rp => rp
+                   | .none => .field fieldIdx fieldTy :: .nil) })) ∧
+    (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+        .some { kind := .tuple tupleFields, layoutIdx := layoutIdx } →
+      set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+        .some locals₂ →
+      mem₁.activeProtectors = .nil →
+      evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: .nil⟩ rv, span⟩
+        localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals₂
+            { mem₁ with
+              borrows :=
+                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                  (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
+                   | .some rp => rp
+                   | .none => .field fieldIdx fieldTy :: .nil) })) ∧
+    (let projs : List ProjectionElem := [.field fieldIdx outerTy, .field innerIdx fieldTy];
+      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      ((∃ dp as_ lIdx,
+          placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+            .some { kind := .adt dp as_, layoutIdx := lIdx }) ∨
+       (∃ tfs lIdx,
+          placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+            .some { kind := .tuple tfs, layoutIdx := lIdx })) →
+      ((∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
+       (∃ innerFields, outerTy.kind = .tuple innerFields)) →
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate 0
+            (setOrExtendFields .nil fieldIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂ →
+      mem₁.activeProtectors = .nil →
+      evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s locals₂
+            { mem₁ with
+              borrows :=
+                invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                  (match resolveBorrowProjectionElems locals₁ projs with
+                   | .some rp => rp
+                   | .none => projs) })) ∧
+    (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      evalStmt s
+          ⟨.assign
+            ⟨dstLoc,
+              .field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+                .index idxLocal :: rest⟩ rv,
+            span⟩
+          localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      ((∃ iLoc, nextProj = .index iLoc) ∨
+       (∃ offset minLen fromEnd, nextProj = .constantIndex offset minLen fromEnd) ∨
+       (∃ fromIdx toIdx fromEnd, nextProj = .subslice fromIdx toIdx fromEnd) ∨
+       (∃ variantName vIdx, nextProj = .downcast variantName vIdx)) →
+      evalStmt s
+          ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: nextProj :: rest⟩ rv, span⟩
+          localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (proj ≠ .deref →
+      evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁ →
+      get? locals₁ dstLoc = .some .uninit →
+      uninitFieldWriteShell? localDecls layouts dstLoc proj = .none →
+      evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) := by
+  refine ⟨ensureNestedFieldShells_singleton val proj,
+    ensureNestedFieldShells_eq_self_of_populated (proj :: rest) rootVal,
+    writeProjectedValue_ensureNestedFieldShells_of_populated locals₁ rootVal (proj :: rest) val,
+    evalStmt_assign_init_projected_step s dstLoc proj rest rv span localDecls layouts
+      val rootVal rootVal' locals₁ locals₂ mem₁,
+    evalStmt_assign_init_unpopulated_nested_field_ok s dstLoc variantIdx fields
+      fieldIdx innerIdx outerTy fieldTy rv span localDecls layouts val locals₁ locals₂ mem₁,
+    uninitFieldWriteShell?_field_adt localDecls layouts dstLoc fieldIdx fieldTy
+      defPath args layoutIdx,
+    uninitFieldWriteShell?_field_tuple localDecls layouts dstLoc fieldIdx fieldTy
+      tupleFields layoutIdx,
+    uninitFieldWriteShell?_eq_none_of_not_field localDecls layouts dstLoc proj rest,
+    uninitFieldWriteShell?_eq_none_of_non_aggregate_ty localDecls layouts dstLoc proj rest,
+    uninitFieldWriteShell?_eq_none_iff localDecls layouts dstLoc proj rest,
+    evalStmt_assign_uninit_aggregate_field_protected_conflict_ub s dstLoc fieldIdx fieldTy
+      rest rv span localDecls layouts val locals₁ mem₁ shell rootVal' locals₂ protHead protTail,
+    evalStmt_assign_uninit_union_field_ok s dstLoc fieldIdx fieldTy rv span localDecls layouts
+      defPath args layoutIdx val locals₁ mem₁ locals₂,
+    evalStmt_assign_uninit_tuple_field_ok s dstLoc fieldIdx fieldTy rv span localDecls layouts
+      tupleFields layoutIdx val locals₁ mem₁ locals₂,
+    evalStmt_assign_uninit_nested_field_ok s dstLoc fieldIdx innerIdx outerTy fieldTy rv span
+      localDecls layouts val locals₁ mem₁ locals₂,
+    evalStmt_assign_uninit_array_field_elem_ub s dstLoc idxLocal fieldIdx elemKind count
+      arrLayoutIdx rest rv span localDecls layouts val locals₁ mem₁,
+    evalStmt_assign_uninit_field_non_field_subproj_ub s dstLoc fieldIdx fieldTy nextProj
+      rest rv span localDecls layouts val locals₁ mem₁,
+    evalStmt_assign_uninit_non_aggregate_ub s dstLoc proj rest rv span localDecls layouts
+      val locals₁ mem₁⟩
+
+end UninitAggregateFieldWrites
 
 end Correspondence.V2026_08_01.L5_ControlAndCalls

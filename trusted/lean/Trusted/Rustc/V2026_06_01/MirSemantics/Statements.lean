@@ -1773,8 +1773,624 @@ def evalCopyNonOverlapping
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
+Test whether any `BorrowEntry` in `borrows` targeting stack local `loc` carries a
+function-entry lifetime protector (`RetagKind.fnEntry`) that is still active in
+`activeProtectors` (`isBorrowProtected`).
+
+Freeing `loc`'s storage (`StorageDead(loc)`, or the implicit deallocation
+performed by `StorageLive(loc)`) acts as a write to every byte of the local that
+disables every tag minted from it (`disableLocalBorrows`), so the presence of
+such a protected tag makes the deallocation immediate undefined behavior. This
+check subsumes the whole-local foreign-write conflict check
+`hasProtectedWriteConflict borrows activeProtectors loc .none .nil`: unlike a
+foreign write, which tolerates `.reserved` (and already-`.disabled`) tags,
+deallocation rejects every protected tag regardless of its current permission.
+Function-entry protectors only cover memory owned by other frames (argument
+pointees), so with frame-relative `BorrowEntry.targetLocal` indices a protected
+entry can only match a local of the running frame through an index collision
+with a caller-frame local inside an inline callee frame, where the check errs
+on the side of `.ub`.
+
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L7-L8>
+
+> "When a reborrow occurs at function entry (i.e. the original reference is
+> passed as an argument), we add a *protector* to the reborrow. When a node is
+> protected, it is UB for this node to become `Disabled`."
+
+Reference (MiniRust `spec/mem/tree_borrows/memory.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/mem/tree_borrows/memory.md#L209-L215>
+
+> "// Check that ptr has the permission to write the entire allocation.
+> extra.root.access(Some(path), AccessKind::Write, Offset::ZERO, size)?;
+>
+> // Check that allocation is not strongly protected.
+> if extra.root.contains_strong_protector_preventing_deallocation() {
+>     throw_ub!("Tree Borrows: deallocating strongly protected allocation")
+> }"
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L366-L373>
+
+> "`StorageLive`/`StorageDead` act like the heap operations
+> `allocate`/`deallocate`, but for stack-allocated local variables."
+-/
+def hasProtectedLocalBorrow
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc : Local) :
+    Bool :=
+  match borrows with
+  | .nil => false
+  | entry :: rest =>
+    match
+      Bool.and
+        (Nat.beq entry.targetLocal loc)
+        (isBorrowProtected activeProtectors entry)
+    with
+    | true => true
+    | false => hasProtectedLocalBorrow rest activeProtectors loc
+
+/--
+Disable every `BorrowEntry` in `borrows` targeting stack local `loc` (setting its
+Tree Borrows permission to `.disabled`), leaving every other entry unchanged.
+
+`StorageDead(loc)` frees `loc`'s storage and `StorageLive(loc)` allocates fresh
+storage for it (implicitly freeing any previous allocation), so every
+provenance tag minted from the previous allocation of `loc` (including reborrow
+descendants, which inherit `targetLocal` from their parent entry) becomes
+dangling. As in Tree Borrows, where deallocation is a write access to the whole
+allocation that leaves every tag of the dead allocation unusable, the entries
+stay in the borrow table but lose every permission: each place read, place
+write, safe reborrow (`Rvalue.ref`), retag, `copy_nonoverlapping`, unsizing
+coercion, or pointer offset that resolves a disabled tag faults with `.ub`.
+
+The entries are disabled rather than removed because a provenance tag with no
+stack borrow entry falls back to `lookupGlobalAlloc` on `ptrVal.allocId`, and
+stack borrow tags (`Memory.nextTag`, starting at `1`) share their numbering with
+captured global allocation identifiers (also numbered from `1`): a removed
+stale tag would silently read or write an unrelated global allocation instead
+of faulting. Because tags are minted from the monotonically increasing
+`Memory.nextTag`, no reference or raw pointer created after `StorageLive(loc)`
+can share a disabled tag, so stale pointers are never revived into the new
+allocation.
+
+`BorrowEntry.targetLocal` indexes the locals of the frame that minted the tag,
+while the borrow table is shared by every inline call frame on
+`Memory.callStack`, so inside an inline callee frame this also disables
+caller-frame entries whose local index equals `loc`. The approximation is
+conservative: it can only make a later access through such a caller tag fault
+with `.ub` after the callee returns, never hide undefined behavior.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs>
+
+> "If the local is already allocated, calling `StorageLive` again will
+> implicitly free the local and then allocate fresh uninitialized memory. If a
+> local is already deallocated, calling `StorageDead` again is a NOP."
+
+Reference (MiniRust `spec/lang/step/statements.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/lang/step/statements.md#L166-L169>
+
+> "fn storage_live(&mut self, mem: &mut ConcurrentMemory<M>, local: LocalName) -> NdResult {
+>     // First remove the old storage, if any.
+>     // This means the same address may be re-used for the new stoage.
+>     self.storage_dead(mem, local)?;"
+-/
+def disableLocalBorrows : List BorrowEntry → Local → List BorrowEntry
+  | .nil, _ => .nil
+  | entry :: rest, loc =>
+    match Nat.beq entry.targetLocal loc with
+    | true => { entry with perm := .disabled } :: disableLocalBorrows rest loc
+    | false => entry :: disableLocalBorrows rest loc
+
+/--
+Definitional simplification equation for `disableLocalBorrows` on the empty
+borrow table.
+-/
+@[simp]
+theorem disableLocalBorrows_nil (loc : Local) :
+    disableLocalBorrows .nil loc = .nil := rfl
+
+/--
+No borrow entry is protected when no function-entry protector is active, so
+`hasProtectedLocalBorrow borrows .nil loc` is always `false`.
+-/
+@[simp]
+theorem hasProtectedLocalBorrow_nil_protectors
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    hasProtectedLocalBorrow borrows .nil loc = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hProt : isBorrowProtected .nil entry = false := by
+      unfold isBorrowProtected
+      cases entry.protector <;> rfl
+    simp only [hasProtectedLocalBorrow, hProt, Bool.and_false]
+    exact ih
+
+/--
+`hasProtectedLocalBorrow` subsumes the whole-local foreign-write protector
+check: whenever a direct write to the whole of `loc` would disable a protected
+tag (`hasProtectedWriteConflict borrows activeProtectors loc .none .nil`), so
+does deallocating `loc`.
+-/
+theorem hasProtectedLocalBorrow_of_hasProtectedWriteConflict
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc : Local)
+    (h : hasProtectedWriteConflict borrows activeProtectors loc .none .nil = true) :
+    hasProtectedLocalBorrow borrows activeProtectors loc = true := by
+  induction borrows with
+  | nil => exact h
+  | cons entry rest ih =>
+    unfold hasProtectedWriteConflict at h
+    unfold hasProtectedLocalBorrow
+    cases hT : Nat.beq entry.targetLocal loc with
+    | false =>
+      simp only [hT, Bool.false_and] at h ⊢
+      exact ih h
+    | true =>
+      cases hP : isBorrowProtected activeProtectors entry with
+      | false =>
+        simp only [hT, hP, Bool.false_and, Bool.and_false] at h ⊢
+        exact ih h
+      | true => rfl
+
+/--
+`hasProtectedLocalBorrow borrows activeProtectors loc` is `false` when no entry
+targets `loc`.
+-/
+theorem hasProtectedLocalBorrow_eq_false_of_forall_ne
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (loc : Local)
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
+    hasProtectedLocalBorrow borrows activeProtectors loc = false := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
+    have hBeq : Nat.beq entry.targetLocal loc = false := by
+      cases hB : Nat.beq entry.targetLocal loc with
+      | false => rfl
+      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
+    simp only [hasProtectedLocalBorrow, hBeq, Bool.false_and]
+    exact ih (fun e he => h e (List.Mem.tail entry he))
+
+/--
+`disableLocalBorrows borrows loc` leaves `borrows` unchanged when no entry
+targets `loc`.
+-/
+theorem disableLocalBorrows_eq_self_of_forall_ne
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (h : ∀ entry ∈ borrows, entry.targetLocal ≠ loc) :
+    disableLocalBorrows borrows loc = borrows := by
+  induction borrows with
+  | nil => rfl
+  | cons entry rest ih =>
+    have hNe : entry.targetLocal ≠ loc := h entry (List.Mem.head rest)
+    have hBeq : Nat.beq entry.targetLocal loc = false := by
+      cases hB : Nat.beq entry.targetLocal loc with
+      | false => rfl
+      | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
+    simp only [disableLocalBorrows, hBeq]
+    rw [ih (fun e he => h e (List.Mem.tail entry he))]
+
+/--
+Every entry of `disableLocalBorrows borrows loc` that targets `loc` is
+`.disabled`: no provenance tag minted from a previous allocation of `loc`
+retains any access permission.
+-/
+theorem perm_eq_disabled_of_mem_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local) :
+    ∀ entry ∈ disableLocalBorrows borrows loc,
+      entry.targetLocal = loc → entry.perm = .disabled := by
+  induction borrows with
+  | nil => intro entry hMem; nomatch hMem
+  | cons hd rest ih =>
+    intro entry hMem hT
+    cases hB : Nat.beq hd.targetLocal loc with
+    | true =>
+      simp only [disableLocalBorrows, hB] at hMem
+      cases hMem with
+      | head => rfl
+      | tail _ hMemRest => exact ih entry hMemRest hT
+    | false =>
+      simp only [disableLocalBorrows, hB] at hMem
+      cases hMem with
+      | head => exact absurd hT (Nat.ne_of_beq_eq_false hB)
+      | tail _ hMemRest => exact ih entry hMemRest hT
+
+/--
+Resolving provenance tag `tag` in `disableLocalBorrows borrows loc` yields the
+entry that `tag` resolves to in `borrows`, disabled exactly when it targets
+`loc`; tags without a stack borrow entry remain unresolved.
+-/
+theorem lookupBorrow_disableLocalBorrows
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag =
+      (match lookupBorrow borrows tag with
+       | .some entry =>
+         match Nat.beq entry.targetLocal loc with
+         | true => .some { entry with perm := .disabled }
+         | false => .some entry
+       | .none => .none) := by
+  induction borrows with
+  | nil => rfl
+  | cons hd rest ih =>
+    cases hB : Nat.beq hd.targetLocal loc <;>
+      cases hT : Nat.beq hd.tag tag <;>
+        simp only [disableLocalBorrows, lookupBorrow, hB, hT, ih]
+
+/--
+A provenance tag that resolved to a borrow entry targeting `loc` resolves to
+that entry disabled after `disableLocalBorrows borrows loc`.
+-/
+theorem lookupBorrow_disableLocalBorrows_of_targetLocal_eq
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (entry : BorrowEntry)
+    (hLookup : lookupBorrow borrows tag = .some entry)
+    (hTarget : entry.targetLocal = loc) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag =
+      .some { entry with perm := .disabled } := by
+  rw [lookupBorrow_disableLocalBorrows, hLookup]
+  have hB : Nat.beq entry.targetLocal loc = true := by
+    rw [hTarget]
+    exact Nat.beq_refl loc
+  simp only [hB]
+
+/--
+A provenance tag that resolved to a borrow entry targeting a local other than
+`loc` resolves to the same entry after `disableLocalBorrows borrows loc`.
+-/
+theorem lookupBorrow_disableLocalBorrows_of_targetLocal_ne
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (entry : BorrowEntry)
+    (hLookup : lookupBorrow borrows tag = .some entry)
+    (hTarget : entry.targetLocal ≠ loc) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag = .some entry := by
+  rw [lookupBorrow_disableLocalBorrows, hLookup]
+  have hB : Nat.beq entry.targetLocal loc = false := by
+    cases hB' : Nat.beq entry.targetLocal loc with
+    | false => rfl
+    | true => exact False.elim (hTarget (Nat.eq_of_beq_eq_true hB'))
+  simp only [hB]
+
+/--
+A provenance tag without a stack borrow entry in `borrows` (e.g. a pointer to a
+captured global allocation) remains unresolved after
+`disableLocalBorrows borrows loc`.
+-/
+theorem lookupBorrow_disableLocalBorrows_of_eq_none
+    (borrows : List BorrowEntry)
+    (loc : Local)
+    (tag : Nat)
+    (hLookup : lookupBorrow borrows tag = .none) :
+    lookupBorrow (disableLocalBorrows borrows loc) tag = .none := by
+  rw [lookupBorrow_disableLocalBorrows, hLookup]
+
+/--
+Test whether projection path `proj` contains a `.deref` projection, i.e.
+whether computing the place loads a pointer value out of (a sub-place of) its
+root local. In `Runtime(PostCleanup)` MIR a `Deref` may only appear as the
+first projection of a place, so this coincides with `proj` starting with
+`.deref` on well-formed bodies.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L114-L115>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1166-L1171>
+
+> "Furthermore, `Deref` projections must be the first projection within any
+> place (if they appear at all)"
+>
+> "A `Deref` projection begins by loading a value from the parent place, as if
+> by [`Operand::Copy`]. It then dereferences the resulting pointer, creating a
+> place of the pointee's type. The resulting address is the address that was
+> stored in the pointer."
+-/
+def projectionHasDeref : List ProjectionElem → Bool
+  | .nil => false
+  | .deref :: _ => true
+  | _ :: rest => projectionHasDeref rest
+
+/--
+Test whether every `.index idxLocal` projection in `proj` names a local of
+`locals` holding an initialized scalar (`.init (.scalar _)`), i.e. whether
+every index operand read while computing the place is initialized.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1192-L1279>
+
+> "/// Index into a slice/array.
+> ...
+> Index(V),"
+-/
+def placeIndexLocalsInit (locals : List LocalSlot) : List ProjectionElem → Bool
+  | .nil => true
+  | .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar _)) => placeIndexLocalsInit locals rest
+    | _ => false
+  | _ :: rest => placeIndexLocalsInit locals rest
+
+/--
+Test whether every operand that `StatementKind.placeMention` reads while
+computing a place with live root slot `rootSlot` and projection path `proj` in
+`locals` is initialized:
+
+1. when `proj` dereferences its root (`projectionHasDeref proj`), the root local
+   must hold an initialized value (`.init _`) from which the pointer is loaded;
+2. every `.index idxLocal` projection must name an initialized scalar local
+   (`placeIndexLocalsInit locals proj`).
+
+A bare mention of a live but uninitialized local (`proj = []`, `rootSlot =
+.uninit`) reads nothing and remains defined. The place itself is never loaded,
+so the pointee of a dereferenced raw pointer may be dangling. MiniRust
+additionally requires the pointee of a dereferenced safe pointer (`&T`,
+`&mut T`, `Box<T>`) to be dereferenceable when the place is computed; that
+check is not modeled here, so `PlaceMention(*r)` through a dangling reference
+`r` steps where MiniRust faults.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs>
+
+> "This statement exists to preserve a trace of a scrutinee matched against a
+> wildcard binding. This is especially useful for `let _ = PLACE;` bindings that
+> desugar to a single `PlaceMention(PLACE)`.
+>
+> When executed at runtime, this computes the given place, but then discards
+> it without doing a load. `let _ = *ptr;` is fine even if the pointer is
+> dangling."
+
+Reference (MiniRust `spec/lang/step/expressions.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/lang/step/expressions.md#L250-L256>
+
+> "// We know the pointer is valid for its type, but make sure safe pointers are also dereferenceable.
+> // (We don't do a full retag here, this is not considered creating a new pointer.)
+> if let Some(pointee) = ptr_type.safe_pointee() {
+> ...
+>     self.mem.dereferenceable(ptr.thin_pointer, self.compute_size(pointee.layout, ptr.metadata))?;
+> }"
+-/
+def placeMentionOperandsInit
+    (locals : List LocalSlot)
+    (rootSlot : LocalSlot)
+    (proj : List ProjectionElem) :
+    Bool :=
+  match projectionHasDeref proj, rootSlot with
+  | true, .init _ => placeIndexLocalsInit locals proj
+  | true, _ => false
+  | false, _ => placeIndexLocalsInit locals proj
+
+/--
+Definitional simplification equation for `projectionHasDeref` on the empty
+projection.
+-/
+@[simp]
+theorem projectionHasDeref_nil : projectionHasDeref .nil = false := rfl
+
+/--
+Definitional simplification equation for `placeIndexLocalsInit` on the empty
+projection.
+-/
+@[simp]
+theorem placeIndexLocalsInit_nil (locals : List LocalSlot) :
+    placeIndexLocalsInit locals .nil = true := rfl
+
+/--
+A bare `PlaceMention` of a local (empty projection) reads no operand, so
+`placeMentionOperandsInit` holds for every root slot.
+-/
+@[simp]
+theorem placeMentionOperandsInit_nil (locals : List LocalSlot) (rootSlot : LocalSlot) :
+    placeMentionOperandsInit locals rootSlot .nil = true := by
+  cases rootSlot <;> rfl
+
+/--
+Materialize default `.aggregate 0 .nil` shells along a chain of intermediate
+aggregate `.field` projections inside `val` whenever the current slot at
+`fieldIdx` is either absent (`fieldIdx ≥ length fields`) or `.unit` padding
+produced by an earlier `setOrExtendFields` on a higher-index sibling field.
+
+1. When `fieldTy.kind` is a struct/union (`.adt _ _`) or tuple (`.tuple _`) and
+   the remaining projection path continues with `.field _ _`, materializing an
+   inner `.aggregate 0 ...` shell prevents `writeProjectedValue` from collapsing
+   `.field 0` onto `.unit` (losing the inner aggregate wrapper) or faulting with
+   `.ub` on `.field (k + 1)` against `.unit`.
+2. Fixed-length array fields (`.array _ _`) are never materialized, so an
+   element write through a never-written array field (`_u.arr[i] = val`) still
+   faults with `.ub`. An array shell would have to fill every unwritten element
+   with a `.unit` placeholder, and a later read of such an element
+   (`copy _u.arr[j]`) would return that placeholder instead of faulting on the
+   uninitialized element as MiniRust and Miri do.
+
+`evalStmt` applies this both to the default shell of an uninitialized
+destination (`uninitFieldWriteShell?`) and to the current value of an
+initialized destination before a projected write. Transparent metadata
+projections (`.opaqueCast` and `.unwrapUnsafeBinder`) are traversed without
+altering the value, and `stripTransparentProjections` is used when checking
+whether the remaining projection chain continues with a `.field` projection.
+Every slot it visits that is already present and not `.unit` is kept as is, so
+on a root whose intermediate field slots along the chain are all populated
+(`fieldShellChainPopulated`) the result is the root itself and the write
+coincides with `writeProjectedValue` on the original root.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
+-/
+def ensureNestedFieldShells (val : Value) (projs : List ProjectionElem) : Value :=
+  match projs with
+  | .opaqueCast _ :: nextProj :: rest =>
+    ensureNestedFieldShells val (nextProj :: rest)
+  | .unwrapUnsafeBinder _ :: nextProj :: rest =>
+    ensureNestedFieldShells val (nextProj :: rest)
+  | .field fieldIdx fieldTy :: nextProj :: rest =>
+    match val with
+    | .aggregate variantIdx fields =>
+      let isInnerAggField :=
+        match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+        | .field _ _ :: _, .adt _ _ => true
+        | .field _ _ :: _, .tuple _ => true
+        | _, _ => false
+      match isInnerAggField with
+      | true =>
+        match get? fields fieldIdx with
+        | .none =>
+          let childShell :=
+            ensureNestedFieldShells (.aggregate 0 .nil) (nextProj :: rest)
+          .aggregate variantIdx (setOrExtendFields fields fieldIdx childShell)
+        | .some .unit =>
+          let childShell :=
+            ensureNestedFieldShells (.aggregate 0 .nil) (nextProj :: rest)
+          .aggregate variantIdx (setOrExtendFields fields fieldIdx childShell)
+        | .some childVal =>
+          let childVal' :=
+            ensureNestedFieldShells childVal (nextProj :: rest)
+          match set? fields fieldIdx childVal' with
+          | .some fields' => .aggregate variantIdx fields'
+          | .none => .aggregate variantIdx fields
+      | false => .aggregate variantIdx fields
+    | _ => val
+  | _ => val
+
+/--
+Whether every intermediate struct, union, or tuple field slot that
+`ensureNestedFieldShells val projs` inspects along `projs` is already present
+and not `.unit` padding.
+
+When `fieldShellChainPopulated val projs = true`, `ensureNestedFieldShells val projs`
+returns `val` unchanged (`ensureNestedFieldShells_eq_self_of_populated`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1135-L1165>
+
+> "- [`Field`](ProjectionElem::Field): `Field` projections take their parent
+>   place and create a place referring to one of the fields of the type."
+-/
+def fieldShellChainPopulated : Value → List ProjectionElem → Bool
+  | val, .opaqueCast _ :: nextProj :: rest =>
+    fieldShellChainPopulated val (nextProj :: rest)
+  | val, .unwrapUnsafeBinder _ :: nextProj :: rest =>
+    fieldShellChainPopulated val (nextProj :: rest)
+  | .aggregate _ fields, .field fieldIdx fieldTy :: nextProj :: rest =>
+    let isInnerAggField :=
+      match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+      | .field _ _ :: _, .adt _ _ => true
+      | .field _ _ :: _, .tuple _ => true
+      | _, _ => false
+    match isInnerAggField with
+    | true =>
+      match get? fields fieldIdx with
+      | .none => false
+      | .some .unit => false
+      | .some childVal => fieldShellChainPopulated childVal (nextProj :: rest)
+    | false => true
+  | _, _ => true
+
+/--
+Default root value for a projected assignment `dst = rv` into a live but
+uninitialized destination local `loc` (`.uninit`) whose first projection
+`proj` is a field projection (`.field _ _`) and whose declared type
+(`placeTy localDecls layouts { local_ := loc, projection := .nil }`) is a
+struct, union, or tuple (`.adt _ _` or `.tuple _`).
+
+The shell starts as `.aggregate 0 .nil` and uses `ensureNestedFieldShells` along
+`.field fieldIdx fieldTy :: rest` so both single-level field writes (`_1.f = v`)
+and nested aggregate field writes (`_1.a.b = v` or `_1.0.1 = v`) materialize
+`.aggregate 0 ...` shells at every intermediate `.adt` or `.tuple` field.
+A field with a higher index that was never written still faults with `.ub` when
+read, while a lower-index field that was never written reads as the `.unit`
+padding that `setOrExtendFields` also uses for union fields. Every other
+projection head (`.index`, `.constantIndex`, `.subslice`, `.downcast`,
+`.opaqueCast`, `.unwrapUnsafeBinder`; `.deref` writes never reach this helper)
+and every non-aggregate declared type yields `.none`, preserving the fault on
+projected writes into uninitialized locals.
+
+Reference (MiniRust `spec/lang/step/statements.md` at commit
+`d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
+<https://github.com/minirust/minirust/blob/d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed/spec/lang/step/statements.md#L32-L38>
+
+> "fn eval_statement(&mut self, Statement::Assign { destination, source }: Statement) -> NdResult {
+>     let (place, ty) = self.eval_place(destination)?;
+>     let (val, _) = self.eval_value(source)?;
+>     self.place_store(place, val, ty)?;"
+
+Reference (The Rust Reference, "Union types"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Unions have no notion of an \"active field\". Instead, every union access
+> just interprets the storage as the type of the field used for the access."
+-/
+def uninitFieldWriteShell?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem := .nil) :
+    Option Value :=
+  match proj with
+  | .field fieldIdx fieldTy =>
+    match placeTy localDecls layouts { local_ := loc, projection := .nil } with
+    | .some { kind := .adt _ _, .. } =>
+      .some
+        (ensureNestedFieldShells
+          (.aggregate 0 .nil)
+          (.field fieldIdx fieldTy :: rest))
+    | .some { kind := .tuple _, .. } =>
+      .some
+        (ensureNestedFieldShells
+          (.aggregate 0 .nil)
+          (.field fieldIdx fieldTy :: rest))
+    | _ => .none
+  | _ => .none
+
+/--
 Execute a single MIR `Statement` from state `s` using `localDecls` and `layouts`
 for type- and layout-aware rvalue and intrinsic evaluation.
+
+`StorageDead(loc)` and `StorageLive(loc)` (which implicitly frees any previous
+allocation of `loc`) fault with `MirStepNode.fail .ub` when a tag minted from
+`loc` is still protected by an active function-entry protector
+(`hasProtectedLocalBorrow`, only consulted when some protector is active), and
+otherwise disable every tag minted from `loc` (`disableLocalBorrows`) before
+marking `loc` `.dead` or `.uninit`. Together these ensure that deallocating a
+local bearing an active protector is immediate UB, and that references and raw
+pointers created before `StorageDead(loc)` or a second `StorageLive(loc)` fault
+with `.ub` on every later access or reborrow instead of reaching the storage
+allocated by `StorageLive(loc)` (or a global allocation sharing their tag).
+`PlaceMention(place)` requires every operand read while computing `place` (the
+root pointer of a dereference and every `Index` local) to be initialized
+(`placeMentionOperandsInit`). A projected assignment into a live but
+uninitialized local writes into the default shell from `uninitFieldWriteShell?`
+when the projection starts with a field of a struct, union, or tuple local, and
+otherwise faults with `.ub`. A projected assignment into an initialized local
+first materializes missing or `.unit`-padded intermediate struct, union, and
+tuple field shells along the written field chain (`ensureNestedFieldShells`),
+which leaves roots whose intermediate field slots are all populated unchanged.
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -1809,7 +2425,10 @@ def evalStmt
     match get? s.frame.locals place.local_ with
     | .none => MirStepNode.fail .ub
     | .some .dead => MirStepNode.fail .ub
-    | .some _ => MirStepNode.step (advanceStmt s s.frame.locals)
+    | .some rootSlot =>
+      match placeMentionOperandsInit s.frame.locals rootSlot place.projection with
+      | true => MirStepNode.step (advanceStmt s s.frame.locals)
+      | false => MirStepNode.fail .ub
   | .retag retagKind place =>
     match
       evalOperand
@@ -1911,14 +2530,48 @@ def evalStmt
     match get? s.frame.locals loc with
     | .some _ =>
       match set? s.frame.locals loc .uninit with
-      | .some locals' => MirStepNode.step (advanceStmt s locals')
+      | .some locals' =>
+        match s.memory.activeProtectors with
+        | .nil =>
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+        | protHead :: protTail =>
+          match
+            hasProtectedLocalBorrow
+              s.memory.borrows
+              (protHead :: protTail)
+              loc
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.step
+              (advanceStmt s locals'
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .storageDead loc =>
     match get? s.frame.locals loc with
     | .some _ =>
       match set? s.frame.locals loc .dead with
-      | .some locals' => MirStepNode.step (advanceStmt s locals')
+      | .some locals' =>
+        match s.memory.activeProtectors with
+        | .nil =>
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
+        | protHead :: protTail =>
+          match
+            hasProtectedLocalBorrow
+              s.memory.borrows
+              (protHead :: protTail)
+              loc
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            MirStepNode.step
+              (advanceStmt s locals'
+                { s.memory with borrows := disableLocalBorrows s.memory.borrows loc })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .deinit p =>
@@ -2071,7 +2724,13 @@ def evalStmt
       | proj :: rest =>
         match get? locals₁ dst.local_ with
         | .some (.init rootVal) =>
-          match writeProjectedValue locals₁ rootVal (proj :: rest) val with
+          match
+            writeProjectedValue
+              locals₁
+              (ensureNestedFieldShells rootVal (proj :: rest))
+              (proj :: rest)
+              val
+          with
           | .ok rootVal' =>
             match set? locals₁ dst.local_ (.init rootVal') with
             | .some locals₂ =>
@@ -2111,10 +2770,1288 @@ def evalStmt
             | .none => MirStepNode.fail .ub
           | .ub => MirStepNode.fail .ub
           | .unsupported => MirStepNode.unsupported
-        | .some .uninit => MirStepNode.fail .ub
+        | .some .uninit =>
+          match uninitFieldWriteShell? localDecls layouts dst.local_ proj rest with
+          | .some rootVal =>
+            match writeProjectedValue locals₁ rootVal (proj :: rest) val with
+            | .ok rootVal' =>
+              match set? locals₁ dst.local_ (.init rootVal') with
+              | .some locals₂ =>
+                let resolvedLocalProj :=
+                  match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+                  | .some rp => rp
+                  | .none => proj :: rest
+                match mem₁.activeProtectors with
+                | .nil =>
+                  let borrows' :=
+                    invalidateConflictingBorrowsAtProj
+                      mem₁.borrows
+                      dst.local_
+                      .none
+                      resolvedLocalProj
+                  MirStepNode.step
+                    (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+                | protHead :: protTail =>
+                  match
+                    hasProtectedWriteConflict
+                      mem₁.borrows
+                      (protHead :: protTail)
+                      dst.local_
+                      .none
+                      resolvedLocalProj
+                  with
+                  | true => MirStepNode.fail .ub
+                  | false =>
+                    let borrows' :=
+                      invalidateConflictingBorrowsAtProj
+                        mem₁.borrows
+                        dst.local_
+                        .none
+                        resolvedLocalProj
+                    MirStepNode.step
+                      (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+              | .none => MirStepNode.fail .ub
+            | .ub => MirStepNode.fail .ub
+            | .unsupported => MirStepNode.unsupported
+          | .none => MirStepNode.fail .ub
         | .some .dead => MirStepNode.fail .ub
         | .none => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
+
+/--
+Universal characterization of `StatementKind.storageDead loc` in `evalStmt`
+(`D2` / `D14a-storage`):
+1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
+   `set? s.frame.locals loc .dead = .some localsDead`) and no borrow entry
+   targeting `loc` is protected by `s.memory.activeProtectors`
+   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
+   `evalStmt` steps to `advanceStmt s localsDead { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }`,
+   in which every borrow entry targeting `loc` is `.disabled`.
+2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
+   `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), `evalStmt`
+   faults with `MirStepNode.fail .ub`.
+3. When `loc` is out of bounds (`get? s.frame.locals loc = .none`), `evalStmt`
+   faults with `MirStepNode.fail .ub`.
+-/
+theorem evalStmt_storageDead_purges_borrows
+    (s : MachineState)
+    (loc : Local)
+    (slot : LocalSlot)
+    (localsDead : List LocalSlot)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s localsDead
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
+        entry.targetLocal = loc → entry.perm = .disabled) ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .dead = .some localsDead →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .none →
+      evalStmt s ⟨.storageDead loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro hGet hSet hProt
+    refine ⟨?_, perm_eq_disabled_of_mem_disableLocalBorrows s.memory.borrows loc⟩
+    cases hAP : s.memory.activeProtectors with
+    | nil => simp [evalStmt, hGet, hSet, hAP]
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hGet hSet hProt
+    cases hAP : s.memory.activeProtectors with
+    | nil =>
+      rw [hAP, hasProtectedLocalBorrow_nil_protectors] at hProt
+      nomatch hProt
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hNone
+    simp [evalStmt, hNone]
+
+/--
+Universal characterization of `StatementKind.storageLive loc` in `evalStmt`
+(`D2` / `D14a-storage`):
+1. When `loc` is in bounds (`get? s.frame.locals loc = .some slot`,
+   `set? s.frame.locals loc .uninit = .some localsUninit`) and no borrow entry
+   targeting `loc` is protected by `s.memory.activeProtectors`
+   (`hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false`),
+   `evalStmt` steps to `advanceStmt s localsUninit { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }`,
+   in which every borrow entry targeting `loc` is `.disabled`.
+2. When `loc` is in bounds and a borrow entry targeting `loc` is protected by
+   `s.memory.activeProtectors` (`hasProtectedLocalBorrow = true`), the implicit
+   deallocation of `loc`'s previous storage makes `evalStmt` fault with
+   `MirStepNode.fail .ub`.
+3. When `loc` is out of bounds (`get? s.frame.locals loc = .none`), `evalStmt`
+   faults with `MirStepNode.fail .ub`.
+-/
+theorem evalStmt_storageLive_purges_borrows
+    (s : MachineState)
+    (loc : Local)
+    (slot : LocalSlot)
+    (localsUninit : List LocalSlot)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .uninit = .some localsUninit →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = false →
+      evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts =
+        MirStepNode.step
+          (advanceStmt s localsUninit
+            { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+      ∀ entry ∈ disableLocalBorrows s.memory.borrows loc,
+        entry.targetLocal = loc → entry.perm = .disabled) ∧
+    (get? s.frame.locals loc = .some slot →
+      set? s.frame.locals loc .uninit = .some localsUninit →
+      hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc = true →
+      evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .none →
+      evalStmt s ⟨.storageLive loc, span⟩ localDecls layouts = MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro hGet hSet hProt
+    refine ⟨?_, perm_eq_disabled_of_mem_disableLocalBorrows s.memory.borrows loc⟩
+    cases hAP : s.memory.activeProtectors with
+    | nil => simp [evalStmt, hGet, hSet, hAP]
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hGet hSet hProt
+    cases hAP : s.memory.activeProtectors with
+    | nil =>
+      rw [hAP, hasProtectedLocalBorrow_nil_protectors] at hProt
+      nomatch hProt
+    | cons p ps =>
+      rw [hAP] at hProt
+      simp [evalStmt, hGet, hSet, hAP, hProt]
+  · intro hNone
+    simp [evalStmt, hNone]
+
+/--
+Universal proof (`D2` / `D14a-storage`) that once `StorageDead(loc)` or
+`StorageLive(loc)` has disabled `loc`'s borrows (`disableLocalBorrows borrows loc`),
+a pointer `ptrVal` whose provenance tag resolved to a borrow entry targeting
+`loc` (`lookupBorrow borrows ptrVal.tag = .some entry`,
+`entry.targetLocal = loc`) resolves to that entry disabled, and faults with
+`.ub` on every dereferencing read (`evalPlaceRead`, `evalOperand` copy/move),
+every dereferencing write (`writePlaceValue`, `evalPlaceWrite`,
+`StatementKind.setDiscriminant`), every safe reborrow (`Rvalue.ref`), every
+reference retag (`StatementKind.retag`), and every non-zero-length
+`copy_nonoverlapping` (`evalCopyNonOverlappingWithCount`) through it. This holds
+for arbitrary frame locals `localsAfter` (in particular after `loc` has been
+revived by `StorageLive(loc)` and re-initialized) and arbitrary captured global
+allocations `globals`: the disabled stack borrow entry keeps shadowing any
+global allocation that shares the pointer's allocation identifier.
+
+Pointer arithmetic (`evalPtrOffsetBinOp`) and raw address-of (`Rvalue.rawPtr`)
+are deliberately not characterized: `Places.lean` currently faults on any
+disabled tag before inspecting the offset or the access, which is stricter than
+MiniRust and Miri for zero-byte offsets and raw address-of (both defined on
+dangling pointers), and those rules belong to `ws-lm-div-places-ptr`.
+-/
+theorem evalStmt_storageRevive_old_ptr_deref_ub
+    (s : MachineState)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (callerLocals : List LocalSlot)
+    (activeProtectors : List Nat)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (mem : Memory)
+    (loc ptrLoc : Local)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (restProj : List ProjectionElem)
+    (localsAfter : List LocalSlot)
+    (writeVal : Value)
+    (borrowKind : BorrowKind)
+    (retagKind : RetagKind)
+    (span : String)
+    (srcOp dstOp : Operand)
+    (otherVal : Value)
+    (n : Nat)
+    (entry : BorrowEntry)
+    (hLookup : lookupBorrow borrows ptrVal.tag = .some entry)
+    (hTarget : entry.targetLocal = loc)
+    (hPtrSlot : get? localsAfter ptrLoc = .some (.init (.ptr ptrVal sz))) :
+    let borrowsAfter := disableLocalBorrows borrows loc
+    let derefPlace : Place := { local_ := ptrLoc, projection := .deref :: restProj }
+    let sAfter : MachineState :=
+      { s with
+        frame := { s.frame with locals := localsAfter }
+        memory := { s.memory with borrows := borrowsAfter } }
+    lookupBorrow borrowsAfter ptrVal.tag = .some { entry with perm := .disabled } ∧
+    evalPlaceRead localsAfter derefPlace borrowsAfter globals layouts callerLocals localDecls = .ub ∧
+    evalOperand localsAfter (.copy derefPlace) borrowsAfter globals layouts callerLocals = .ub ∧
+    evalOperand localsAfter (.move derefPlace) borrowsAfter globals layouts callerLocals = .ub ∧
+    writePlaceValue localsAfter borrowsAfter derefPlace writeVal = .ub ∧
+    evalPlaceWrite localsAfter borrowsAfter derefPlace writeVal activeProtectors = .ub ∧
+    evalRvalue localsAfter (.ref borrowKind derefPlace)
+      { mem with borrows := borrowsAfter } localDecls layouts = .ub ∧
+    evalStmt sAfter ⟨.retag retagKind ⟨ptrLoc, .nil⟩, span⟩ localDecls layouts =
+      MirStepNode.fail .ub ∧
+    evalStmt sAfter ⟨.setDiscriminant derefPlace n, span⟩ localDecls layouts =
+      MirStepNode.fail .ub ∧
+    evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
+      (.ptr ptrVal sz) otherVal (n + 1) localsAfter = MirStepNode.fail .ub ∧
+    evalCopyNonOverlappingWithCount sAfter srcOp dstOp localDecls layouts
+      otherVal (.ptr ptrVal sz) (n + 1) localsAfter = MirStepNode.fail .ub := by
+  dsimp only
+  have hDis : lookupBorrow (disableLocalBorrows borrows loc) ptrVal.tag =
+      .some { entry with perm := .disabled } :=
+    lookupBorrow_disableLocalBorrows_of_targetLocal_eq borrows loc ptrVal.tag entry hLookup hTarget
+  have hWrite :
+      writePlaceValue localsAfter (disableLocalBorrows borrows loc)
+        { local_ := ptrLoc, projection := .deref :: restProj } writeVal = .ub := by
+    simp [writePlaceValue, hPtrSlot, hDis]
+  refine ⟨hDis, ?_, ?_, ?_, hWrite, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [evalPlaceRead, hPtrSlot, hDis]
+  · simp [evalOperand, hPtrSlot, hDis]
+  · simp [evalOperand, hPtrSlot, hDis]
+  · unfold evalPlaceWrite
+    cases activeProtectors with
+    | nil => exact hWrite
+    | cons p ps =>
+      dsimp only
+      split
+      · rfl
+      · exact hWrite
+  · cases borrowKind <;> simp [evalRvalue, hPtrSlot, hDis]
+  · simp [evalStmt, evalOperand, readProjectedValue, hPtrSlot, hDis]
+  · simp [evalStmt, evalOperand, hPtrSlot, hDis]
+  · unfold evalCopyNonOverlappingWithCount
+    simp only [Nat.beq]
+    cases otherVal with
+    | ptr dstPtr dstSz =>
+      dsimp only
+      rw [hDis]
+      cases hDst : lookupBorrow (disableLocalBorrows borrows loc) dstPtr.tag <;> rfl
+    | _ => rfl
+  · unfold evalCopyNonOverlappingWithCount
+    simp only [Nat.beq]
+    cases otherVal with
+    | ptr srcPtr srcSz =>
+      dsimp only
+      rw [hDis]
+      cases hSrc : lookupBorrow (disableLocalBorrows borrows loc) srcPtr.tag with
+      | none => rfl
+      | some srcEntry =>
+        dsimp only
+        cases hPerm : srcEntry.perm <;> rfl
+    | _ => rfl
+
+/--
+Universal proof that a bare `StatementKind.placeMention` (`place.projection = []`)
+on a live local (`get? s.frame.locals loc = .some .uninit` or `.some (.init v)`)
+steps cleanly to `advanceStmt s s.frame.locals` without loading or mutating the
+local.
+-/
+theorem evalStmt_placeMention_local_uninit_ok
+    (s : MachineState)
+    (loc : Local)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some .uninit →
+      evalStmt s ⟨.placeMention ⟨loc, .nil⟩, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+    (∀ v : Value,
+      get? s.frame.locals loc = .some (.init v) →
+      evalStmt s ⟨.placeMention ⟨loc, .nil⟩, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s s.frame.locals)) := by
+  refine ⟨?_, ?_⟩
+  · intro hUninit
+    simp [evalStmt, hUninit]
+  · intro v hInit
+    simp [evalStmt, hInit]
+
+/--
+Universal proof that a dereferencing `StatementKind.placeMention`
+(`place.projection = .deref :: restProj`) steps cleanly to
+`advanceStmt s s.frame.locals` whenever the root pointer local is initialized
+(`get? s.frame.locals loc = .some (.init v)`) and every `.index idxLocal` along
+`restProj` is an initialized scalar
+(`placeIndexLocalsInit s.frame.locals restProj = true`), even if the pointee
+is dangling (`let _ = *ptr;`). For safe pointers this is more permissive than
+MiniRust, which also requires the pointee to be dereferenceable (see
+`placeMentionOperandsInit`).
+-/
+theorem evalStmt_placeMention_deref_init_ok
+    (s : MachineState)
+    (loc : Local)
+    (v : Value)
+    (restProj : List ProjectionElem)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hInit : get? s.frame.locals loc = .some (.init v))
+    (hIdxOk : placeIndexLocalsInit s.frame.locals restProj = true) :
+    evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+      MirStepNode.step (advanceStmt s s.frame.locals) := by
+  simp [evalStmt, placeMentionOperandsInit, projectionHasDeref,
+    placeIndexLocalsInit, hInit, hIdxOk]
+
+/--
+Universal proof that a dereferencing `StatementKind.placeMention`
+(`place.projection = .deref :: restProj`) faults with `MirStepNode.fail .ub`
+whenever the root local is uninitialized (`.some .uninit`), dead (`.some .dead`),
+or out of bounds (`.none`), or whenever any `.index idxLocal` along `restProj`
+is not an initialized scalar (`placeIndexLocalsInit s.frame.locals restProj = false`).
+-/
+theorem evalStmt_placeMention_deref_uninit_ub
+    (s : MachineState)
+    (loc : Local)
+    (restProj : List ProjectionElem)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    (get? s.frame.locals loc = .some .uninit →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .some .dead →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (get? s.frame.locals loc = .none →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) ∧
+    (∀ slot : LocalSlot,
+      get? s.frame.locals loc = .some slot →
+      placeIndexLocalsInit s.frame.locals restProj = false →
+      evalStmt s ⟨.placeMention ⟨loc, .deref :: restProj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro hUninit
+    simp [evalStmt, placeMentionOperandsInit, projectionHasDeref, hUninit]
+  · intro hDead
+    simp [evalStmt, hDead]
+  · intro hNone
+    simp [evalStmt, hNone]
+  · intro slot hSlot hIdxFalse
+    cases slot <;>
+      simp [evalStmt, placeMentionOperandsInit, projectionHasDeref, placeIndexLocalsInit, hSlot, hIdxFalse]
+
+/--
+Biconditional (`↔`) characterization of `StatementKind.placeMention` along a
+non-dereferencing projection path (`projectionHasDeref proj = false`) on a live
+local (`get? s.frame.locals loc = .some slot`, `slot ≠ .dead`):
+1. `evalStmt` steps cleanly to `advanceStmt s s.frame.locals` if and only if
+   every `.index idxLocal` along `proj` is an initialized scalar
+   (`placeIndexLocalsInit s.frame.locals proj = true`).
+2. `evalStmt` faults with `MirStepNode.fail .ub` if and only if some
+   `.index idxLocal` along `proj` is not an initialized scalar
+   (`placeIndexLocalsInit s.frame.locals proj = false`).
+-/
+theorem evalStmt_placeMention_nonDeref_index_iff
+    (s : MachineState)
+    (loc : Local)
+    (slot : LocalSlot)
+    (proj : List ProjectionElem)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hNoDeref : projectionHasDeref proj = false)
+    (hSlot : get? s.frame.locals loc = .some slot)
+    (hLive : slot ≠ .dead) :
+    (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s s.frame.locals) ↔
+      placeIndexLocalsInit s.frame.locals proj = true) ∧
+    (evalStmt s ⟨.placeMention ⟨loc, proj⟩, span⟩ localDecls layouts =
+        MirStepNode.fail .ub ↔
+      placeIndexLocalsInit s.frame.locals proj = false) := by
+  cases slot with
+  | dead => exact False.elim (hLive rfl)
+  | uninit =>
+    cases hIdx : placeIndexLocalsInit s.frame.locals proj <;>
+      simp [evalStmt, placeMentionOperandsInit, hNoDeref, hSlot, hIdx] <;>
+        intro h <;> nomatch h
+  | init v =>
+    cases hIdx : placeIndexLocalsInit s.frame.locals proj <;>
+      simp [evalStmt, placeMentionOperandsInit, hNoDeref, hSlot, hIdx] <;>
+        intro h <;> nomatch h
+
+/--
+`ensureNestedFieldShells` on a single-element projection list `[proj]` is the
+identity on `val`.
+-/
+@[simp]
+theorem ensureNestedFieldShells_singleton
+    (val : Value)
+    (proj : ProjectionElem) :
+    ensureNestedFieldShells val [proj] = val := by
+  cases proj <;> rfl
+
+/--
+`uninitFieldWriteShell?` returns the empty aggregate shell for a single-level
+field projection on a local whose declared type is a struct or union.
+-/
+theorem uninitFieldWriteShell?_field_adt
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (defPath : DefPath)
+    (args : List RigidTy)
+    (layoutIdx : Nat)
+    (hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } =
+      .some { kind := .adt defPath args, layoutIdx := layoutIdx }) :
+    uninitFieldWriteShell? localDecls layouts loc (.field fieldIdx fieldTy) =
+      .some (.aggregate 0 .nil) := by
+  simp [uninitFieldWriteShell?, hTy]
+
+/--
+`uninitFieldWriteShell?` returns the empty aggregate shell for a single-level
+field projection on a tuple-typed local.
+-/
+theorem uninitFieldWriteShell?_field_tuple
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (fields : List RigidTy)
+    (layoutIdx : Nat)
+    (hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } =
+      .some { kind := .tuple fields, layoutIdx := layoutIdx }) :
+    uninitFieldWriteShell? localDecls layouts loc (.field fieldIdx fieldTy) =
+      .some (.aggregate 0 .nil) := by
+  simp [uninitFieldWriteShell?, hTy]
+
+/--
+`uninitFieldWriteShell?` yields `.none` for every projection head other than a
+field projection, regardless of any trailing projections `rest`.
+-/
+theorem uninitFieldWriteShell?_eq_none_of_not_field
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem := .nil)
+    (hNotField : ∀ (fieldIdx : FieldIdx) (fieldTy : Ty), proj ≠ .field fieldIdx fieldTy) :
+    uninitFieldWriteShell? localDecls layouts loc proj rest = .none := by
+  cases proj with
+  | field fieldIdx fieldTy => exact False.elim (hNotField fieldIdx fieldTy rfl)
+  | _ => rfl
+
+/--
+`uninitFieldWriteShell?` yields `.none` whenever the destination local's
+declared root type is neither a struct/union (`.adt _ _`) nor a tuple
+(`.tuple _`).
+-/
+theorem uninitFieldWriteShell?_eq_none_of_non_aggregate_ty
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem := .nil)
+    (hNotAdt : ∀ (defPath : DefPath) (args : List RigidTy) (layoutIdx : Nat),
+      placeTy localDecls layouts { local_ := loc, projection := .nil } ≠
+        .some { kind := .adt defPath args, layoutIdx := layoutIdx })
+    (hNotTuple : ∀ (fields : List RigidTy) (layoutIdx : Nat),
+      placeTy localDecls layouts { local_ := loc, projection := .nil } ≠
+        .some { kind := .tuple fields, layoutIdx := layoutIdx }) :
+    uninitFieldWriteShell? localDecls layouts loc proj rest = .none := by
+  cases proj with
+  | field fieldIdx fieldTy =>
+    unfold uninitFieldWriteShell?
+    cases hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } with
+    | none => rfl
+    | some ty =>
+      rcases ty with ⟨kind, layoutIdx⟩
+      cases kind with
+      | adt defPath args => exact False.elim (hNotAdt defPath args layoutIdx hTy)
+      | tuple fields => exact False.elim (hNotTuple fields layoutIdx hTy)
+      | _ => rfl
+  | _ => rfl
+
+/--
+Whether `uninitFieldWriteShell?` returns `.none` depends only on the root local
+and the head projection `proj`, not on the trailing projection path `rest`.
+-/
+@[simp]
+theorem uninitFieldWriteShell?_eq_none_iff
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem) :
+    uninitFieldWriteShell? localDecls layouts loc proj rest = .none ↔
+      uninitFieldWriteShell? localDecls layouts loc proj .nil = .none := by
+  cases proj with
+  | field fieldIdx fieldTy =>
+    unfold uninitFieldWriteShell?
+    cases hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } with
+    | none => simp
+    | some ty =>
+      rcases ty with ⟨kind, layoutIdx⟩
+      cases kind <;> simp
+  | _ => simp [uninitFieldWriteShell?]
+
+/--
+Universal characterization (`D13b`) of a projected assignment
+`dst = rv` with `dst.projection = .field fieldIdx fieldTy :: rest` into a live
+but uninitialized local `dstLoc` with a struct, union, or tuple shell
+(`uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
+.some shell`):
+1. When the projected write into the shell succeeds
+   (`writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
+   .ok rootVal'`) and no active protector conflicts with the write, `evalStmt`
+   initializes `dstLoc` to `rootVal'`, invalidates the borrows conflicting with
+   the written projection, and steps.
+2. When an active function-entry protector conflicts with the write
+   (`hasProtectedWriteConflict = true`), `evalStmt` faults with
+   `MirStepNode.fail .ub`.
+-/
+theorem evalStmt_assign_uninit_aggregate_field_step
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (shell rootVal' : Value)
+    (locals₂ : List LocalSlot)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hShell : uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
+      .some shell)
+    (hWrite : writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
+      .ok rootVal')
+    (hSet : set? locals₁ dstLoc (.init rootVal') = .some locals₂)
+    (hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail →
+      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
+        (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
+         | .some rp => rp
+         | .none => .field fieldIdx fieldTy :: rest) = false) :
+    evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
+                 | .some rp => rp
+                 | .none => .field fieldIdx fieldTy :: rest) }) := by
+  cases hAP : mem₁.activeProtectors with
+  | nil => simp [evalStmt, hRv, hUninit, hShell, hWrite, hSet, hAP]
+  | cons protHead protTail =>
+    have hC := hNoConflict protHead protTail hAP
+    simp [evalStmt, hRv, hUninit, hShell, hWrite, hSet, hAP, hC]
+
+/--
+`D13b` protected-write conflict boundary: when an uninitialized aggregate field
+write would disable a borrow protected by an active function-entry protector
+(`hasProtectedWriteConflict = true`), `evalStmt` faults with
+`MirStepNode.fail .ub`.
+-/
+theorem evalStmt_assign_uninit_aggregate_field_protected_conflict_ub
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (shell rootVal' : Value)
+    (locals₂ : List LocalSlot)
+    (protHead : Nat)
+    (protTail : List Nat)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hShell : uninitFieldWriteShell? localDecls layouts dstLoc (.field fieldIdx fieldTy) rest =
+      .some shell)
+    (hWrite : writeProjectedValue locals₁ shell (.field fieldIdx fieldTy :: rest) val =
+      .ok rootVal')
+    (hSet : set? locals₁ dstLoc (.init rootVal') = .some locals₂)
+    (hAP : mem₁.activeProtectors = protHead :: protTail)
+    (hConflict :
+      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
+        (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: rest) with
+         | .some rp => rp
+         | .none => .field fieldIdx fieldTy :: rest) = true) :
+    evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: rest⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.fail .ub := by
+  simp [evalStmt, hRv, hUninit, hShell, hWrite, hSet, hAP, hConflict]
+
+/--
+`D13b` union / struct field initialization (`evalStmt_assign_uninit_union_field_ok`):
+writing `val` into field `fieldIdx` of a live but uninitialized local `dstLoc`
+whose declared type is a struct or union (`.adt defPath args`), with no active
+protector, initializes `dstLoc` to the aggregate holding `val` at `fieldIdx`
+(`.aggregate 0 (setOrExtendFields .nil fieldIdx val)`) and steps.
+-/
+theorem evalStmt_assign_uninit_union_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (defPath : DefPath)
+    (args : List RigidTy)
+    (layoutIdx : Nat)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (locals₂ : List LocalSlot)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+      .some { kind := .adt defPath args, layoutIdx := layoutIdx })
+    (hSet : set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+      .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: .nil⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
+                 | .some rp => rp
+                 | .none => .field fieldIdx fieldTy :: .nil) }) := by
+  have hShell :=
+    uninitFieldWriteShell?_field_adt localDecls layouts dstLoc fieldIdx fieldTy
+      defPath args layoutIdx hTy
+  have hWrite :
+      writeProjectedValue locals₁ (.aggregate 0 .nil) (.field fieldIdx fieldTy :: .nil) val =
+        .ok (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) := by
+    cases fieldIdx <;> rfl
+  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx fieldTy .nil rv span
+    localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil)
+    (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) locals₂ hRv hUninit hShell hWrite hSet
+    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+
+/--
+`D13b` tuple field initialization (`evalStmt_assign_uninit_tuple_field_ok`):
+writing `val` into field `fieldIdx` of a live but uninitialized local `dstLoc`
+whose declared type is a tuple (`.tuple fields`), with no active protector,
+initializes `dstLoc` to `.aggregate 0 (setOrExtendFields .nil fieldIdx val)`
+and steps.
+-/
+theorem evalStmt_assign_uninit_tuple_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (fields : List RigidTy)
+    (layoutIdx : Nat)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (locals₂ : List LocalSlot)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hTy : placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+      .some { kind := .tuple fields, layoutIdx := layoutIdx })
+    (hSet : set? locals₁ dstLoc (.init (.aggregate 0 (setOrExtendFields .nil fieldIdx val))) =
+      .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    evalStmt s ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: .nil⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ (.field fieldIdx fieldTy :: .nil) with
+                 | .some rp => rp
+                 | .none => .field fieldIdx fieldTy :: .nil) }) := by
+  have hShell :=
+    uninitFieldWriteShell?_field_tuple localDecls layouts dstLoc fieldIdx fieldTy
+      fields layoutIdx hTy
+  have hWrite :
+      writeProjectedValue locals₁ (.aggregate 0 .nil) (.field fieldIdx fieldTy :: .nil) val =
+        .ok (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) := by
+    cases fieldIdx <;> rfl
+  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc fieldIdx fieldTy .nil rv span
+    localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil)
+    (.aggregate 0 (setOrExtendFields .nil fieldIdx val)) locals₂ hRv hUninit hShell hWrite hSet
+    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+
+/--
+`D13b` nested aggregate field initialization (`evalStmt_assign_uninit_nested_field_ok`):
+writing `val` into a 2-level nested field path
+`[.field outerIdx outerTy, .field innerIdx innerTy]` on a live but uninitialized
+struct, union, or tuple local `dstLoc` whose outer field `outerTy` is itself a
+struct/union (`.adt _ _`) or tuple (`.tuple _`), with no active protector,
+materializes both the outer and inner `.aggregate 0 ...` shells, stores `val`
+at `innerIdx` inside `outerIdx`, and steps.
+-/
+theorem evalStmt_assign_uninit_nested_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (outerIdx innerIdx : FieldIdx)
+    (outerTy innerTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (locals₂ : List LocalSlot)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hRootAgg :
+      (∃ defPath args layoutIdx,
+        placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+          .some { kind := .adt defPath args, layoutIdx := layoutIdx }) ∨
+      (∃ tupleFields layoutIdx,
+        placeTy localDecls layouts { local_ := dstLoc, projection := .nil } =
+          .some { kind := .tuple tupleFields, layoutIdx := layoutIdx }))
+    (hOuterAgg :
+      (∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
+      (∃ innerFields, outerTy.kind = .tuple innerFields))
+    (hSet :
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate 0
+            (setOrExtendFields .nil outerIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    let projs : List ProjectionElem := [.field outerIdx outerTy, .field innerIdx innerTy]
+    evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ projs with
+                 | .some rp => rp
+                 | .none => projs) }) := by
+  dsimp only
+  let shell : Value :=
+    .aggregate 0 (setOrExtendFields .nil outerIdx (.aggregate 0 .nil))
+  let rootVal' : Value :=
+    .aggregate 0
+      (setOrExtendFields .nil outerIdx
+        (.aggregate 0 (setOrExtendFields .nil innerIdx val)))
+  have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
+    intro k; cases k <;> rfl
+  have hGetExt : ∀ (k : Nat) (v : Value),
+      get? (setOrExtendFields .nil k v) k = .some v := by
+    intro k v
+    induction k with
+    | zero => rfl
+    | succ n ih => exact ih
+  have hLenExt : ∀ (k : Nat) (v : Value),
+      (setOrExtendFields .nil k v).length = k + 1 := by
+    intro k v
+    induction k with
+    | zero => rfl
+    | succ n ih =>
+      change (Value.unit :: setOrExtendFields .nil n v).length = n + 1 + 1
+      simp [ih]
+  have hListSetExt : ∀ (k : Nat) (v w : Value),
+      (setOrExtendFields .nil k v).set k w = setOrExtendFields .nil k w := by
+    intro k v w
+    induction k with
+    | zero => rfl
+    | succ n ih =>
+      change (Value.unit :: setOrExtendFields .nil n v).set (n + 1) w =
+        Value.unit :: setOrExtendFields .nil n w
+      simp [ih]
+  have hSetExt : ∀ (k : Nat) (v w : Value),
+      set? (setOrExtendFields .nil k v) k w = .some (setOrExtendFields .nil k w) := by
+    intro k v w
+    change (if k < (setOrExtendFields .nil k v).length then
+        some ((setOrExtendFields .nil k v).set k w) else none) =
+      .some (setOrExtendFields .nil k w)
+    simp [hLenExt k v, hListSetExt k v w]
+  have hShell :
+      uninitFieldWriteShell? localDecls layouts dstLoc (.field outerIdx outerTy)
+        [.field innerIdx innerTy] = .some shell := by
+    rcases outerTy with ⟨outerKind, outerLayoutIdx⟩
+    rcases hRootAgg with ⟨defPath, args, layoutIdx, hTy⟩ | ⟨tupleFields, layoutIdx, hTy⟩ <;>
+      rcases hOuterAgg with ⟨innerDefPath, innerArgs, hKind⟩ | ⟨innerFields, hKind⟩ <;>
+      dsimp only at hKind <;> subst hKind <;>
+      simp [uninitFieldWriteShell?, ensureNestedFieldShells, stripTransparentProjections,
+        hTy, hGetNil outerIdx, shell]
+  have hWrite :
+      writeProjectedValue locals₁ shell
+        [.field outerIdx outerTy, .field innerIdx innerTy] val = .ok rootVal' := by
+    dsimp only [shell, rootVal', writeProjectedValue]
+    rw [hGetExt outerIdx (.aggregate 0 .nil)]
+    dsimp only [writeProjectedValue]
+    rw [hGetNil innerIdx]
+    dsimp only [writeProjectedValue]
+    rw [hSetExt outerIdx (.aggregate 0 .nil)
+      (.aggregate 0 (setOrExtendFields .nil innerIdx val))]
+  exact evalStmt_assign_uninit_aggregate_field_step s dstLoc outerIdx outerTy
+    [.field innerIdx innerTy] rv span localDecls layouts val locals₁ mem₁ shell rootVal'
+    locals₂ hRv hUninit hShell hWrite hSet
+    (fun protHead protTail hAP => by rw [hProt] at hAP; nomatch hAP)
+
+/--
+`D13b` boundary (`evalStmt_assign_uninit_non_aggregate_ub`): a projected
+assignment into a live but uninitialized local still faults with
+`MirStepNode.fail .ub` whenever no default shell applies
+(`uninitFieldWriteShell? localDecls layouts dstLoc proj = .none`), i.e. when the
+projection does not start with a field projection (`.index`, `.constantIndex`,
+`.subslice`, `.downcast`, ...) or the local's declared type is not a struct,
+union, or tuple.
+-/
+theorem evalStmt_assign_uninit_non_aggregate_ub
+    (s : MachineState)
+    (dstLoc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (hNotDeref : proj ≠ .deref)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hNoShell : uninitFieldWriteShell? localDecls layouts dstLoc proj = .none) :
+    evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.fail .ub := by
+  have hNoShellRest :
+      uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none :=
+    (uninitFieldWriteShell?_eq_none_iff localDecls layouts dstLoc proj rest).mpr hNoShell
+  cases proj with
+  | deref => exact False.elim (hNotDeref rfl)
+  | _ => simp [evalStmt, hRv, hUninit, hNoShellRest]
+
+/--
+Writing back the element already stored at `i` in `xs` leaves `xs` unchanged.
+-/
+private theorem set?_self_of_get?
+    {α : Type}
+    (xs : List α)
+    (i : Nat)
+    (x : α)
+    (h : get? xs i = .some x) :
+    set? xs i x = .some xs := by
+  change xs[i]? = .some x at h
+  change (if i < xs.length then some (xs.set i x) else none) = .some xs
+  have hlt : i < xs.length := (List.getElem?_eq_some_iff.mp h).1
+  have hx : xs[i] = x := (List.getElem?_eq_some_iff.mp h).2
+  simp [hlt, ← hx]
+
+/--
+Non-regression for initialized roots (`D13b`): `ensureNestedFieldShells` is the
+identity on every value whose field chain along `projs` is populated
+(`fieldShellChainPopulated val projs = true`).
+-/
+theorem ensureNestedFieldShells_eq_self_of_populated :
+    ∀ (projs : List ProjectionElem) (val : Value),
+      fieldShellChainPopulated val projs = true →
+      ensureNestedFieldShells val projs = val := by
+  intro projs
+  induction projs with
+  | nil => intro val _; cases val <;> rfl
+  | cons p tl ih =>
+    intro val hPop
+    cases tl with
+    | nil => cases p <;> cases val <;> rfl
+    | cons nextProj rest =>
+      cases p with
+      | opaqueCast ty =>
+        cases val <;> exact ih _ hPop
+      | unwrapUnsafeBinder ty =>
+        cases val <;> exact ih _ hPop
+      | field fieldIdx fieldTy =>
+        cases val with
+        | aggregate variantIdx fields =>
+          unfold fieldShellChainPopulated at hPop
+          unfold ensureNestedFieldShells
+          have key : ∀ (childVal : Value),
+              get? fields fieldIdx = .some childVal →
+              fieldShellChainPopulated childVal (nextProj :: rest) = true →
+              (match set? fields fieldIdx (ensureNestedFieldShells childVal (nextProj :: rest)) with
+                | .some fields' => Value.aggregate variantIdx fields'
+                | .none => Value.aggregate variantIdx fields) = .aggregate variantIdx fields := by
+            intro childVal hGet hPop'
+            rw [ih childVal hPop', set?_self_of_get? fields fieldIdx _ hGet]
+          have hInner :
+              (match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+               | .field _ _ :: _, .adt _ _ => true
+               | .field _ _ :: _, .tuple _ => true
+               | _, _ => false) = true ∨
+              (match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+               | .field _ _ :: _, .adt _ _ => true
+               | .field _ _ :: _, .tuple _ => true
+               | _, _ => false) = false := by
+            cases (match stripTransparentProjections (nextProj :: rest), fieldTy.kind with
+                   | .field _ _ :: _, .adt _ _ => true
+                   | .field _ _ :: _, .tuple _ => true
+                   | _, _ => false) <;> simp
+          rcases hInner with hTrue | hFalse
+          · rw [hTrue] at hPop ⊢
+            dsimp only at hPop ⊢
+            cases hGet : get? fields fieldIdx with
+            | none => rw [hGet] at hPop; nomatch hPop
+            | some childVal =>
+              rw [hGet] at hPop
+              cases childVal with
+              | unit => nomatch hPop
+              | scalar sc => exact key _ hGet hPop
+              | ptr pv sz => exact key _ hGet hPop
+              | aggregate v fs => exact key _ hGet hPop
+          · rw [hFalse]
+        | _ => rfl
+      | _ => cases val <;> rfl
+
+/--
+Non-regression for initialized roots (`D13b`): on a root whose field chain along
+the written projection is populated (`fieldShellChainPopulated rootVal projs = true`),
+the projected write after `ensureNestedFieldShells` coincides with
+`writeProjectedValue` on the original root.
+-/
+theorem writeProjectedValue_ensureNestedFieldShells_of_populated
+    (locals : List LocalSlot)
+    (rootVal : Value)
+    (projs : List ProjectionElem)
+    (val : Value)
+    (hPop : fieldShellChainPopulated rootVal projs = true) :
+    writeProjectedValue locals (ensureNestedFieldShells rootVal projs) projs val =
+      writeProjectedValue locals rootVal projs val := by
+  rw [ensureNestedFieldShells_eq_self_of_populated projs rootVal hPop]
+
+/--
+`evalStmt`-level non-regression for initialized roots (`D13b`): when `dstLoc`
+holds `.init rootVal` whose intermediate field slots along `proj :: rest` are
+populated (`fieldShellChainPopulated rootVal (proj :: rest) = true`), a
+non-dereference projected assignment `dst = rv` evaluates
+`writeProjectedValue locals₁ rootVal (proj :: rest) val` on the original
+`rootVal` and steps identically to pre-`D13b` semantics.
+-/
+theorem evalStmt_assign_init_projected_step
+    (s : MachineState)
+    (dstLoc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val rootVal rootVal' : Value)
+    (locals₁ locals₂ : List LocalSlot)
+    (mem₁ : Memory)
+    (hNotDeref : proj ≠ .deref)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hInit : get? locals₁ dstLoc = .some (.init rootVal))
+    (hPop : fieldShellChainPopulated rootVal (proj :: rest) = true)
+    (hWrite : writeProjectedValue locals₁ rootVal (proj :: rest) val = .ok rootVal')
+    (hSet : set? locals₁ dstLoc (.init rootVal') = .some locals₂)
+    (hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail →
+      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
+        (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+         | .some rp => rp
+         | .none => proj :: rest) = false) :
+    evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+                 | .some rp => rp
+                 | .none => proj :: rest) }) := by
+  have hWriteShell :
+      writeProjectedValue locals₁ (ensureNestedFieldShells rootVal (proj :: rest))
+        (proj :: rest) val = .ok rootVal' := by
+    rw [writeProjectedValue_ensureNestedFieldShells_of_populated locals₁ rootVal (proj :: rest) val hPop]
+    exact hWrite
+  cases proj with
+  | deref => exact False.elim (hNotDeref rfl)
+  | _ =>
+    cases hAP : mem₁.activeProtectors with
+    | nil => simp [evalStmt, hRv, hInit, hWriteShell, hSet, hAP]
+    | cons protHead protTail =>
+      have hC := hNoConflict protHead protTail hAP
+      simp [evalStmt, hRv, hInit, hWriteShell, hSet, hAP, hC]
+
+/--
+`D13b` nested field write into an unpopulated slot of an already-initialized
+aggregate (`evalStmt_assign_init_unpopulated_nested_field_ok`): when `dstLoc`
+holds `.init (.aggregate variantIdx fields)` (for instance, after an earlier
+field write initialized a sibling field of `dstLoc` or after `SetDiscriminant`
+initialized an enum variant), `outerTy` is a struct/union (`.adt _ _`) or tuple
+(`.tuple _`), and the slot at `outerIdx` is still unpopulated
+(`get? fields outerIdx = .none ∨ get? fields outerIdx = .some .unit`), writing
+`val` into `[.field outerIdx outerTy, .field innerIdx innerTy]` materializes the
+inner `.aggregate 0 ...` shell at `outerIdx`, stores `val` at `innerIdx`, and
+steps.
+-/
+theorem evalStmt_assign_init_unpopulated_nested_field_ok
+    (s : MachineState)
+    (dstLoc : Local)
+    (variantIdx : VariantIdx)
+    (fields : List Value)
+    (outerIdx innerIdx : FieldIdx)
+    (outerTy innerTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ locals₂ : List LocalSlot)
+    (mem₁ : Memory)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hInit : get? locals₁ dstLoc = .some (.init (.aggregate variantIdx fields)))
+    (hOuterAgg :
+      (∃ innerDefPath innerArgs, outerTy.kind = .adt innerDefPath innerArgs) ∨
+      (∃ innerFields, outerTy.kind = .tuple innerFields))
+    (hSlot : get? fields outerIdx = .none ∨ get? fields outerIdx = .some .unit)
+    (hSet :
+      set? locals₁ dstLoc
+        (.init
+          (.aggregate variantIdx
+            (setOrExtendFields fields outerIdx
+              (.aggregate 0 (setOrExtendFields .nil innerIdx val))))) =
+        .some locals₂)
+    (hProt : mem₁.activeProtectors = .nil) :
+    let projs : List ProjectionElem := [.field outerIdx outerTy, .field innerIdx innerTy]
+    evalStmt s ⟨.assign ⟨dstLoc, projs⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.step
+        (advanceStmt s locals₂
+          { mem₁ with
+            borrows :=
+              invalidateConflictingBorrowsAtProj mem₁.borrows dstLoc .none
+                (match resolveBorrowProjectionElems locals₁ projs with
+                 | .some rp => rp
+                 | .none => projs) }) := by
+  dsimp only
+  have hGetNil : ∀ k : Nat, get? (.nil : List Value) k = .none := by
+    intro k; cases k <;> rfl
+  have hGetExt : ∀ (fs : List Value) (k : Nat) (v : Value),
+      get? (setOrExtendFields fs k v) k = .some v := by
+    intro fs
+    induction fs with
+    | nil =>
+      intro k v
+      induction k with
+      | zero => rfl
+      | succ n ih => exact ih
+    | cons hd tl ihFs =>
+      intro k v
+      cases k with
+      | zero => rfl
+      | succ n => exact ihFs n v
+  have hLenLtExt : ∀ (fs : List Value) (k : Nat) (v : Value),
+      k < (setOrExtendFields fs k v).length := by
+    intro fs
+    induction fs with
+    | nil =>
+      intro k v
+      induction k with
+      | zero => exact Nat.zero_lt_succ 0
+      | succ n ih =>
+        change n + 1 < (Value.unit :: setOrExtendFields .nil n v).length
+        simp only [List.length_cons]
+        exact Nat.succ_lt_succ ih
+    | cons hd tl ihFs =>
+      intro k v
+      cases k with
+      | zero => exact Nat.zero_lt_succ tl.length
+      | succ n =>
+        change n + 1 < (hd :: setOrExtendFields tl n v).length
+        simp only [List.length_cons]
+        exact Nat.succ_lt_succ (ihFs n v)
+  have hListSetExt : ∀ (fs : List Value) (k : Nat) (v w : Value),
+      (setOrExtendFields fs k v).set k w = setOrExtendFields fs k w := by
+    intro fs
+    induction fs with
+    | nil =>
+      intro k v w
+      induction k with
+      | zero => rfl
+      | succ n ih =>
+        change (Value.unit :: setOrExtendFields .nil n v).set (n + 1) w =
+          Value.unit :: setOrExtendFields .nil n w
+        simp [ih]
+    | cons hd tl ihFs =>
+      intro k v w
+      cases k with
+      | zero => rfl
+      | succ n =>
+        change (hd :: setOrExtendFields tl n v).set (n + 1) w =
+          hd :: setOrExtendFields tl n w
+        simp [ihFs n v w]
+  have hSetExt : ∀ (fs : List Value) (k : Nat) (v w : Value),
+      set? (setOrExtendFields fs k v) k w = .some (setOrExtendFields fs k w) := by
+    intro fs k v w
+    change (if k < (setOrExtendFields fs k v).length then
+        some ((setOrExtendFields fs k v).set k w) else none) =
+      .some (setOrExtendFields fs k w)
+    simp [hLenLtExt fs k v, hListSetExt fs k v w]
+  have hEns :
+      ensureNestedFieldShells (.aggregate variantIdx fields)
+        [.field outerIdx outerTy, .field innerIdx innerTy] =
+        .aggregate variantIdx (setOrExtendFields fields outerIdx (.aggregate 0 .nil)) := by
+    rcases outerTy with ⟨outerKind, outerLayoutIdx⟩
+    rcases hOuterAgg with ⟨innerDefPath, innerArgs, hKind⟩ | ⟨innerFields, hKind⟩ <;>
+      dsimp only at hKind <;> subst hKind <;>
+      (rcases hSlot with hS | hS <;>
+        simp [ensureNestedFieldShells, stripTransparentProjections, hS])
+  have hWrite :
+      writeProjectedValue locals₁
+        (.aggregate variantIdx (setOrExtendFields fields outerIdx (.aggregate 0 .nil)))
+        [.field outerIdx outerTy, .field innerIdx innerTy] val =
+        .ok (.aggregate variantIdx
+          (setOrExtendFields fields outerIdx
+            (.aggregate 0 (setOrExtendFields .nil innerIdx val)))) := by
+    dsimp only [writeProjectedValue]
+    rw [hGetExt fields outerIdx (.aggregate 0 .nil)]
+    dsimp only [writeProjectedValue]
+    rw [hGetNil innerIdx]
+    dsimp only [writeProjectedValue]
+    rw [hSetExt fields outerIdx (.aggregate 0 .nil)
+      (.aggregate 0 (setOrExtendFields .nil innerIdx val))]
+  simp [evalStmt, hRv, hInit, hEns, hWrite, hSet, hProt]
+
+/--
+`D13b` array-field boundary (`evalStmt_assign_uninit_array_field_elem_ub`):
+writing an element of a never-written fixed-length array field
+(`.field fieldIdx { kind := .array elemKind count, .. } :: .index idxLocal :: rest`)
+of a live but uninitialized local still faults with `MirStepNode.fail .ub`,
+whatever the local's declared type. `ensureNestedFieldShells` materializes no
+array shell, because filling the unwritten elements with `.unit` placeholders
+would let later reads of those elements succeed where MiniRust and Miri report
+a read of uninitialized memory.
+-/
+theorem evalStmt_assign_uninit_array_field_elem_ub
+    (s : MachineState)
+    (dstLoc idxLocal : Local)
+    (fieldIdx : FieldIdx)
+    (elemKind : RigidTy)
+    (count arrLayoutIdx : Nat)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit) :
+    evalStmt s
+        ⟨.assign
+          ⟨dstLoc,
+            .field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+              .index idxLocal :: rest⟩ rv,
+          span⟩
+        localDecls layouts =
+      MirStepNode.fail .ub := by
+  cases hSh : uninitFieldWriteShell? localDecls layouts dstLoc
+      (.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx })
+      (.index idxLocal :: rest) with
+  | none => simp [evalStmt, hRv, hUninit, hSh]
+  | some shell =>
+    have hShell : shell = .aggregate 0 .nil := by
+      have hEns :
+          ensureNestedFieldShells (.aggregate 0 .nil)
+            (.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+              .index idxLocal :: rest) = .aggregate 0 .nil := rfl
+      unfold uninitFieldWriteShell? at hSh
+      dsimp only at hSh
+      rw [hEns] at hSh
+      split at hSh <;> first | (injection hSh with h; exact h.symm) | nomatch hSh
+    subst hShell
+    have hW :
+        writeProjectedValue locals₁ (.aggregate 0 .nil)
+          (.field fieldIdx { kind := .array elemKind count, layoutIdx := arrLayoutIdx } ::
+            .index idxLocal :: rest) val = .ub := by
+      cases fieldIdx <;> rfl
+    simp [evalStmt, hRv, hUninit, hSh, hW]
+
+/--
+`D13b` sub-projection boundary (`evalStmt_assign_uninit_field_non_field_subproj_ub`):
+writing through a never-written field of a live but uninitialized local `dstLoc`
+followed immediately by an array index (`.index`), constant index
+(`.constantIndex`), subslice (`.subslice`), or enum variant downcast
+(`.downcast`) faults with `MirStepNode.fail .ub` for every `fieldTy` and every
+declared root type.
+-/
+theorem evalStmt_assign_uninit_field_non_field_subproj_ub
+    (s : MachineState)
+    (dstLoc : Local)
+    (fieldIdx : FieldIdx)
+    (fieldTy : Ty)
+    (nextProj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit)
+    (hSub :
+      (∃ idxLocal, nextProj = .index idxLocal) ∨
+      (∃ offset minLen fromEnd, nextProj = .constantIndex offset minLen fromEnd) ∨
+      (∃ fromIdx toIdx fromEnd, nextProj = .subslice fromIdx toIdx fromEnd) ∨
+      (∃ variantName variantIdx, nextProj = .downcast variantName variantIdx)) :
+    evalStmt s
+        ⟨.assign ⟨dstLoc, .field fieldIdx fieldTy :: nextProj :: rest⟩ rv, span⟩
+        localDecls layouts =
+      MirStepNode.fail .ub := by
+  have hSubCases :
+      ensureNestedFieldShells (.aggregate 0 .nil)
+        (.field fieldIdx fieldTy :: nextProj :: rest) = .aggregate 0 .nil ∧
+      writeProjectedValue locals₁ (.aggregate 0 .nil)
+        (.field fieldIdx fieldTy :: nextProj :: rest) val = .ub := by
+    rcases fieldTy with ⟨kind, lIdx⟩
+    rcases hSub with ⟨idxLocal, rfl⟩ | ⟨offset, minLen, fromEnd, rfl⟩ |
+        ⟨fromIdx, toIdx, fromEnd, rfl⟩ | ⟨variantName, variantIdx, rfl⟩
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+    · refine ⟨?_, ?_⟩
+      · cases kind <;> rfl
+      · cases fieldIdx <;> rfl
+  rcases hSubCases with ⟨hEns, hW⟩
+  cases hSh : uninitFieldWriteShell? localDecls layouts dstLoc
+      (.field fieldIdx fieldTy) (nextProj :: rest) with
+  | none => simp [evalStmt, hRv, hUninit, hSh]
+  | some shell =>
+    have hShell : shell = .aggregate 0 .nil := by
+      unfold uninitFieldWriteShell? at hSh
+      dsimp only at hSh
+      rw [hEns] at hSh
+      split at hSh <;> first | (injection hSh with h; exact h.symm) | nomatch hSh
+    subst hShell
+    simp [evalStmt, hRv, hUninit, hSh, hW]
 
 end Trusted.Rustc.V2026_06_01.MirSemantics
