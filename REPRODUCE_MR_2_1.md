@@ -17,7 +17,7 @@ proofs and witnesses.
 
 ## 1. Environment Setup
 
-From the repository root (`/usr/local/google/Projects/anneal-workspace/anneal-wt-mr-2-1`):
+From the repository root (`<path/to/anneal>`):
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"

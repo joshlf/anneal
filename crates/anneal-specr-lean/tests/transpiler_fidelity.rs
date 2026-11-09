@@ -253,7 +253,7 @@ fn gate1_domain_classification_gc_cow_effects_and_mutual_recursion() {
 fn gate1_generated_lean_hygiene_and_snapshot_lock_tamper_detection() {
     let root = repo_root();
     let forbidden_task_marker = ["TO", "DO"].concat();
-    let forbidden_corp_path = ["/google/", "src"].concat();
+    let forbidden_corp_path = ["/internal/", "src"].concat();
 
     for (snap_id, vendor_rel) in [
         (
