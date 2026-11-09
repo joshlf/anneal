@@ -320,4 +320,83 @@ theorem sim_lm3_3_reborrow_parent_write_invalidates_child_step
     | exact Or.inl ⟨by decide, _, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
     | exact Or.inr ⟨by decide, rfl⟩
 
+/-! ## `StatementKind.retag` across all 4 `RetagKind`s & raw-pointer modes -/
+
+/-- Pointee type for `retagRefBody`: `u32` (`Freeze`) when `frozen = true`,
+`UnsafeCell<u32>` (`!Freeze`) when `frozen = false`. -/
+def retagPointeeTy (frozen : Bool) : Ty :=
+  if frozen then u32T else unsafeCellU32T
+
+/-- `Retag(rk, _2)` where `_2` is a reference (`&mut T` or `&T`) to `_1`. -/
+def retagRefBody (rk : RetagKind) (mutability : Mutability) (frozen : Bool) : CapturedMir :=
+  witBody "lm_3_3_sim::retag_ref" 4
+    [declOf u32T, declOf (retagPointeeTy frozen),
+      declOf { kind := .ref mutability (retagPointeeTy frozen).kind, layoutIdx := 0 }]
+    [stmt (.retag rk (loc 2))]
+
+/-- Pre-retag state with `_1 = 7_u32`, `_2` holding parent tag `1` (`Unique`),
+and a sibling `Unique` borrow tag `2` on `_1` that freezes to `Frozen` iff the
+retag performs an initial child read (`childPerm ≠ .cell`). -/
+def retagRefState : MachineState :=
+  simState [.uninit, .init (.scalar ⟨7, 4⟩), .init (.ptr ⟨1, 0⟩ 8)]
+    [entry 2 .unique, entry 1 .unique] false
+
+/-- **`sim_lm3_3_retag_ref_step`**: across all `4 × 2 × 2 = 16` combinations of
+`(rk, mutability, frozen)`, Anneal's real step of `StatementKind.retag rk _2` on
+a reference `_2`:
+1. allocates fresh child tag `3` under `parentTag = some 1` (`I-10`) with
+   permission `annealRetagPerm (retagKindToAnnealMode rk) mutability frozen` and
+   installs protector `2` iff `rk = .fnEntry`;
+2. skips the initial child read (preserving the sibling `entry 2 .unique`) iff
+   the new permission is `.cell` (`&UnsafeCell<u32>`, certifying `I-11`), and
+   otherwise freezes sibling `entry 2` to `.frozen`;
+3. updates `_2` to provenance tag `3` and preserves `TreeBorrowsRel` on the
+   successor borrow table. -/
+theorem sim_lm3_3_retag_ref_step
+    (rk : RetagKind) (mutability : Mutability) (frozen : Bool) :
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability frozen
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let siblingPerm := match childPerm with | .cell => TreeBorrowPerm.unique | _ => .frozen
+    let activeProts := match rk with | .fnEntry => [2] | _ => []
+    ∃ s' : MachineState,
+      stepMirFn (retagRefBody rk mutability frozen) retagRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt, entry 2 siblingPerm, entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) := by
+  cases rk <;> cases mutability <;> cases frozen <;>
+    exact ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
+
+/-- `Retag(rk, _2)` where `_2` is a raw pointer (`*mut u64` or `*const u64`). -/
+def retagRawBody (rk : RetagKind) (mutability : Mutability) : CapturedMir :=
+  witBody "lm_3_3_sim::retag_raw" 8
+    [declOf u64T, declOf u64T,
+      declOf { kind := .rawPtr mutability (.uint .u64), layoutIdx := 0 }]
+    [stmt (.retag rk (loc 2))]
+
+/-- **`sim_lm3_3_retag_raw_step`**: across all `4` `RetagKind`s, both raw-pointer
+mutabilities, all 6 permissions (including `.disabled`), and both protector
+settings, `StatementKind.retag rk _2` on a raw pointer `_2` succeeds without
+allocating a tag or failing on `.disabled` provenance when `rk = .raw`, and
+faults with `.fail .ub` (`rawPointerWrongMode`) for every non-`.raw` mode,
+matching `retagPointerValue_rawPointer_simulation`. -/
+theorem sim_lm3_3_retag_raw_step
+    (rk : RetagKind) (mutability : Mutability)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    match rk with
+    | .raw =>
+      ∃ s' : MachineState,
+        stepMirFn (retagRawBody rk mutability) (childState perm isProtected) = .step s' ∧
+        s'.memory = (childState perm isProtected).memory ∧
+        get? s'.frame.locals 2 = some (.init (.ptr ⟨1, 0⟩ 8))
+    | .default | .twoPhase | .fnEntry =>
+      stepMirFn (retagRawBody rk mutability) (childState perm isProtected) = .fail .ub := by
+  cases mutability <;> cases rk
+  all_goals
+    first
+    | exact ⟨_, rfl, rfl, rfl⟩
+    | rfl
+
 end LeanMiriSpec.Correspondence.SimLM3_3

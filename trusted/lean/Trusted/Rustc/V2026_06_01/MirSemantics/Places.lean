@@ -3238,6 +3238,51 @@ def fnEntryRetagPerm
   | .mut => TreeBorrowPerm.reservedFrz false
 
 /--
+Determine the initial Tree Borrows permission of the tag created by a MIR
+`StatementKind.retag` of `retagKind` on a reference with mutability
+`mutability` to a pointee of kind `pointee`:
+- `.fnEntry` delegates to `fnEntryRetagPerm` (protected mutable references
+  always receive `.reservedFrz false` so no protected `.reservedIM` exists);
+- `.default`, `.twoPhase`, and `.raw` select `.frozen` / `.cell` on shared
+  references and `.reservedFrz false` / `.reservedIM` on mutable references
+  according to `rigidTyIsFreeze 16 pointee`, matching Miri's unprotected
+  `NewPermission::new` selection.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L139-L192>
+
+> "let is_protected = mode == RetagMode::FnEntry;"
+> ...
+> "} else if is_protected || frozen {
+>     // We also use this for protected `&mut UnsafeCell` as otherwise adding
+>     // `noalias` would not be sound.
+>     Permission::new_reserved_frz()
+> } else {
+>     Permission::new_reserved_im()
+> }"
+-/
+@[reducible]
+def retagPerm
+    (retagKind : RetagKind)
+    (mutability : Mutability)
+    (pointee : RigidTy) :
+    TreeBorrowPerm :=
+  match retagKind with
+  | .fnEntry => fnEntryRetagPerm mutability pointee
+  | .default | .twoPhase | .raw =>
+    match mutability with
+    | .not =>
+      match rigidTyIsFreeze 16 pointee with
+      | true => TreeBorrowPerm.frozen
+      | false => TreeBorrowPerm.cell
+    | .mut =>
+      match rigidTyIsFreeze 16 pointee with
+      | true => TreeBorrowPerm.reservedFrz false
+      | false => TreeBorrowPerm.reservedIM
+
+/--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
 resolve operand types, signedness, and byte layouts for `Rvalue.binaryOp`,
 `Rvalue.unaryOp`, `Rvalue.cast`, and `Rvalue.aggregate`.

@@ -537,6 +537,1122 @@ theorem retagPointerValue_rawPointer_simulation
   subst hshape
   cases mode <;> rfl
 
+/-- Bijection from Anneal's MIR `RetagKind` to `AnnealRetagMode`. -/
+def retagKindToAnnealMode : RetagKind → AnnealRetagMode
+  | .default => .default
+  | .twoPhase => .twoPhase
+  | .raw => .raw
+  | .fnEntry => .fnEntry
+
+/-- **`annealRetagPerm_eq_retagPerm`**: Anneal's `MirSemantics.retagPerm`
+(used by `evalStmt` on `StatementKind.retag` across all four `RetagKind`s)
+agrees identically with `annealRetagPerm` under `rigidTyIsFreeze 16`. -/
+theorem annealRetagPerm_eq_retagPerm
+    (retagKind : RetagKind) (mutability : Mutability) (pointee : RigidTy) :
+    retagPerm retagKind mutability pointee =
+      annealRetagPerm (retagKindToAnnealMode retagKind) mutability
+        (rigidTyIsFreeze 16 pointee) := by
+  cases retagKind <;> cases mutability <;>
+    simp only [retagPerm, fnEntryRetagPerm, retagKindToAnnealMode, annealRetagPerm] <;>
+    cases rigidTyIsFreeze 16 pointee <;> rfl
+
+private def isExceptOkTB {ε α : Type} : Except ε α → Bool
+  | .ok _ => true
+  | .error _ => false
+
+private def extractExceptOkTB {ε α : Type} (r : Except ε α) (h : isExceptOkTB r = true) : α :=
+  match r, h with
+  | .ok a, _ => a
+
+/-- Canonical live 8-byte allocation ID for operational `RetagPipeline` and
+`MachineMemoryHooks` correspondence. -/
+def retagTestAllocId : Miri.Memory.AllocId := ⟨1, by decide⟩
+
+/-- Root/parent `BorTag` (`1`) on `retagTestAllocId`. -/
+def retagParentTag : Miri.Memory.BorTag := Miri.Memory.BorTag.one
+
+/-- Newly allocated child `BorTag` (`2`) on `retagTestAllocId`. -/
+def retagChildTag : Miri.Memory.BorTag := ⟨2, by decide⟩
+
+/-- Base 8-byte mutable `Allocation` (with unit extra) before attaching a `BorrowTree`. -/
+def baseRetagAllocation : Miri.Memory.Allocation Miri.Memory.Provenance Unit :=
+  extractExceptOkTB
+    (Miri.Memory.Allocation.fromBytes (Prov := Miri.Memory.Provenance)
+      #[0, 0, 0, 0, 0, 0, 0, 0] Miri.ABI.Align.ONE .Mut)
+    (by decide)
+
+/-- Live 8-byte mutable `Allocation` carrying `tree` as its `BorrowTree` extra. -/
+def liveTreeAllocation (tree : Miri.TreeBorrows.BorrowTree) :
+    Miri.Memory.Allocation Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree :=
+  baseRetagAllocation.withExtra tree
+
+/-- Live `MemoryState` containing `retagTestAllocId` backed by `tree`. -/
+def liveTreeMemory (tree : Miri.TreeBorrows.BorrowTree) :
+    Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit :=
+  { (Miri.Memory.MemoryState.empty :
+      Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit) with
+    nextAllocId := 2
+    live := #[(retagTestAllocId, { kind := .stack, allocation := liveTreeAllocation tree })] }
+
+private theorem liveTreeAllocation_extra (tree : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeAllocation tree).extra = tree := rfl
+
+private theorem baseRetagAllocation_byteSize :
+    baseRetagAllocation.byteSize = Miri.ABI.Size.ofBytes 8 := by decide
+
+private theorem baseRetagAllocation_align :
+    baseRetagAllocation.align = Miri.ABI.Align.ONE := by decide
+
+private theorem baseRetagAllocation_mutability :
+    baseRetagAllocation.mutability = .Mut := by decide
+
+private theorem liveTreeAllocation_byteSize (tree : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeAllocation tree).byteSize = Miri.ABI.Size.ofBytes 8 :=
+  baseRetagAllocation_byteSize
+
+private theorem liveTreeAllocation_align (tree : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeAllocation tree).align = Miri.ABI.Align.ONE :=
+  baseRetagAllocation_align
+
+private theorem liveTreeAllocation_mutability (tree : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeAllocation tree).mutability = .Mut :=
+  baseRetagAllocation_mutability
+
+private theorem liveTreeAllocation_setExtra (tree tree' : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeAllocation tree).setExtra tree' = liveTreeAllocation tree' := rfl
+
+private theorem liveTreeMemory_find (tree : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeMemory tree).live.find? (fun entry => entry.1 == retagTestAllocId) =
+      some (retagTestAllocId, { kind := .stack, allocation := liveTreeAllocation tree }) := rfl
+
+private theorem liveTreeMemory_setLiveAllocation (tree tree' : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeMemory tree).setLiveAllocation retagTestAllocId (liveTreeAllocation tree') =
+      .ok (liveTreeMemory tree') := by
+  rw [Miri.Memory.MemoryState.setLiveAllocation_of_find _ _ _ _ (liveTreeMemory_find tree)]
+  rfl
+
+private theorem liveTreeMemory_getAllocInfo (tree : Miri.TreeBorrows.BorrowTree) :
+    (liveTreeMemory tree).getAllocInfo retagTestAllocId =
+      .ok ⟨Miri.ABI.Size.ofBytes 8, Miri.ABI.Align.ONE, .liveData, .Mut⟩ := by
+  unfold Miri.Memory.MemoryState.getAllocInfo
+  rw [liveTreeMemory_find tree]
+  dsimp only [pure, Pure.pure, Except.pure]
+  rw [liveTreeAllocation_byteSize, liveTreeAllocation_align, liveTreeAllocation_mutability]
+
+/-- Read the `LocationState` of `tag` in the first homogeneous range segment of
+`tree`. -/
+def borrowTreeTagLocationState (tree : Miri.TreeBorrows.BorrowTree)
+    (tag : Miri.Memory.BorTag) : Option Miri.TreeBorrows.Tree.LocationState :=
+  tree.locations.entries[0]?.bind fun seg =>
+    (tree.indexOfTag tag).bind (tree.locationStateAt seg.data)
+
+/-- Read the `LocationState` of `tag` in the first homogeneous range segment of
+`retagTestAllocId`'s `BorrowTree` in `memory`. -/
+def liveTagLocationState
+    (memory : Miri.Memory.MemoryState Miri.Memory.Provenance Miri.TreeBorrows.BorrowTree Unit)
+    (tag : Miri.Memory.BorTag) : Option Miri.TreeBorrows.Tree.LocationState :=
+  (memory.live.find? fun entry => entry.1 == retagTestAllocId).bind fun liveEntry =>
+    borrowTreeTagLocationState liveEntry.2.allocation.extra tag
+
+private theorem liveTagLocationState_liveTreeMemory (tree : Miri.TreeBorrows.BorrowTree)
+    (tag : Miri.Memory.BorTag) :
+    liveTagLocationState (liveTreeMemory tree) tag = borrowTreeTagLocationState tree tag := rfl
+
+/-- Initial `RetagPipeline.MachineState` with root tag `1` (`Unique`) on
+`retagTestAllocId` and `nextPointerTag = 2`. -/
+def retagInitialMachineState : Miri.TreeBorrows.RetagPipeline.MachineState Unit :=
+  { memory := liveTreeMemory (Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8))
+    global :=
+      { nextPointerTag := retagChildTag
+        rootPointerTags := #[(retagTestAllocId, retagParentTag)]
+        protectedTags := {}
+        trackedPointerTags := #[] }
+    frame := {} }
+
+/-- Reference retag request on `retagTestAllocId` (under `retagParentTag`) for
+`layoutSize`, `mode`, `mutability`, and `frozen` (`Unpin` pointee, default Miri
+config). -/
+def retagRefRequest (layoutSize : Miri.ABI.Size)
+    (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    Miri.TreeBorrows.RetagPipeline.Request :=
+  { typeShape := .reference
+    typeFacts := { isUnpin := true, isUnsafeUnpin := true, isFreeze := frozen }
+    referenceKind := annealRefKindToMiri mutability
+    mode := annealRetagModeToMiri mode
+    config := { implicitWrites := false, rustcNoWritable := false }
+    layoutSize := layoutSize
+    originalProvenance := some (.concrete retagTestAllocId retagParentTag)
+    pointeeIsFreeze := frozen
+    preciseInteriorMut := false
+    hooks :=
+      { allocationResolution :=
+          some ⟨retagTestAllocId, Miri.ABI.Size.ZERO, .concrete retagParentTag⟩ } }
+
+private theorem modifyRange_new_full {α : Type} [DecidableEq α]
+    (size : Miri.ABI.Size) (value : α) (positive : size.bytes ≠ 0)
+    (modify : Miri.DataStructures.ByteRange → α → α) :
+    (Miri.DataStructures.DedupRangeMap.new size value).modifyRange Miri.ABI.Size.ZERO size modify =
+      ⟨Miri.DataStructures.DedupRangeMap.new size (modify ⟨0, size.bytes⟩ value),
+       #[0], #[⟨⟨0, size.bytes⟩, modify ⟨0, size.bytes⟩ value⟩], .ok ()⟩ := by
+  have hiter :
+      (Miri.DataStructures.DedupRangeMap.new size value).iterMutWithClone
+        Miri.ABI.Size.ZERO size id =
+      ⟨Miri.DataStructures.DedupRangeMap.new size value,
+       #[0], #[⟨⟨0, size.bytes⟩, value⟩], .ok ()⟩ :=
+    Miri.DataStructures.DedupRangeMap.iterMut_new_full size value positive
+  unfold Miri.DataStructures.DedupRangeMap.modifyRange
+    Miri.DataStructures.DedupRangeMap.modifyRangeWithClone
+  rw [hiter]
+  simp only [Miri.DataStructures.DedupRangeMap.new, positive, beq_iff_eq, ↓reduceIte,
+    Id.run, bind, Bind.bind, pure, Pure.pure, ← Array.forIn_toList, List.forIn_cons, List.forIn_nil]
+  rfl
+
+private def rootTreeParentDepth :
+    Miri.TreeBorrows.BorrowTree.ZeroProtection.ParentDepth
+      (Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)).nodes where
+  depth := fun _ => 0
+  bounded := fun _ _ _ => Nat.zero_le _
+  parent := by
+    intro idx node hget bef hpar
+    have hlt : idx.toNat < 1 :=
+      Miri.TreeBorrows.BorrowTree.ZeroProtection.lookup_valid _ idx node hget
+    have hidx : idx = ⟨0⟩ :=
+      Miri.TreeBorrows.BorrowTree.ZeroProtection.index_injective idx ⟨0⟩ (Nat.lt_one_iff.mp hlt)
+    subst hidx
+    have hget0 :
+        (Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)).nodes.get ⟨0⟩ =
+          some ⟨retagParentTag, none, #[], .Disabled, .None, false, none⟩ := by decide
+    rw [hget0] at hget
+    injection hget with hnode
+    subst hnode
+    cases hpar
+
+private theorem nthParent_one_of_treeShape
+    {cNode rNode : Miri.TreeBorrows.TreeNode}
+    (after staged : Miri.TreeBorrows.BorrowTree)
+    (hshape : Miri.TreeBorrows.BorrowTree.ZeroProtection.View.treeShape after =
+      Miri.TreeBorrows.BorrowTree.ZeroProtection.View.treeShape staged)
+    (hmap : staged.tagMapping.get retagChildTag = some ⟨1⟩)
+    (hchild : staged.nodes.get ⟨1⟩ = some cNode)
+    (hcpar : cNode.parent = some ⟨0⟩)
+    (hroot : staged.nodes.get ⟨0⟩ = some rNode)
+    (hrtag : rNode.tag = retagParentTag) :
+    after.nthParent retagChildTag 1 = .ok retagParentTag := by
+  have htm : after.tagMapping = staged.tagMapping := congrArg (fun s => s.1) hshape
+  have hnd : after.nodes.data.map (Option.map Miri.TreeBorrows.BorrowTree.ZeroProtection.View.nodeShape) =
+      staged.nodes.data.map (Option.map Miri.TreeBorrows.BorrowTree.ZeroProtection.View.nodeShape) :=
+    congrArg (fun s => s.2.1) hshape
+  have hc_obs := congrArg (fun a => (a[(⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat]?).getD none) hnd
+  rw [Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup,
+      Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup, hchild] at hc_obs
+  have hr_obs := congrArg (fun a => (a[(⟨0⟩ : Miri.TreeBorrows.UniIndex).toNat]?).getD none) hnd
+  rw [Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup,
+      Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup, hroot] at hr_obs
+  cases hca : after.nodes.get ⟨1⟩ with
+  | none => simp [hca] at hc_obs
+  | some ca =>
+    rw [hca] at hc_obs
+    have hca_par : ca.parent = some ⟨0⟩ :=
+      (congrArg (fun x => x.2.1) (Option.some.inj hc_obs)).trans hcpar
+    cases hra : after.nodes.get ⟨0⟩ with
+    | none => simp [hra] at hr_obs
+    | some ra =>
+      rw [hra] at hr_obs
+      have hra_tag : ra.tag = retagParentTag :=
+        (congrArg (fun x => x.1) (Option.some.inj hr_obs)).trans hrtag
+      unfold Miri.TreeBorrows.BorrowTree.nthParent
+      simp only [htm, hmap, bind, Bind.bind, pure, Pure.pure, Except.bind, Except.pure,
+        Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+        Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one, List.range', List.forIn_cons, List.forIn_nil,
+        hca, hca_par, hra, hra_tag]
+
+private theorem tagLocationShape_of_treeShape
+    {cNode : Miri.TreeBorrows.TreeNode}
+    {seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree}
+    {st : Miri.TreeBorrows.Tree.LocationState}
+    (after staged : Miri.TreeBorrows.BorrowTree)
+    (hshape : Miri.TreeBorrows.BorrowTree.ZeroProtection.View.treeShape after =
+      Miri.TreeBorrows.BorrowTree.ZeroProtection.View.treeShape staged)
+    (hmap : staged.tagMapping.get retagChildTag = some ⟨1⟩)
+    (hchild : staged.nodes.get ⟨1⟩ = some cNode)
+    (hseg : staged.locations.entries[0]? = some seg)
+    (hperm : seg.data.perms.get ⟨1⟩ = some st) :
+    (borrowTreeTagLocationState after retagChildTag).map (fun s => (s.permission, s.accessed)) =
+      some (st.permission, st.accessed) := by
+  have htm : after.tagMapping = staged.tagMapping := congrArg (fun s => s.1) hshape
+  have hnd : after.nodes.data.map (Option.map Miri.TreeBorrows.BorrowTree.ZeroProtection.View.nodeShape) =
+      staged.nodes.data.map (Option.map Miri.TreeBorrows.BorrowTree.ZeroProtection.View.nodeShape) :=
+    congrArg (fun s => s.2.1) hshape
+  have hc_obs := congrArg (fun a => (a[(⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat]?).getD none) hnd
+  rw [Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup,
+      Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup, hchild] at hc_obs
+  have hloc :
+      after.locations.entries.map
+          (fun segment => (segment.range, Miri.TreeBorrows.BorrowTree.ZeroProtection.View.locationShape segment.data)) =
+        staged.locations.entries.map
+          (fun segment => (segment.range, Miri.TreeBorrows.BorrowTree.ZeroProtection.View.locationShape segment.data)) :=
+    congrArg (fun s => s.2.2.1) hshape
+  have hloc0 := congrArg (fun a => a[0]?) hloc
+  simp only [Array.getElem?_map, hseg, Option.map_some] at hloc0
+  cases hca : after.nodes.get ⟨1⟩ with
+  | none => simp [hca] at hc_obs
+  | some ca =>
+    cases hsa : after.locations.entries[0]? with
+    | none => simp [hsa] at hloc0
+    | some sa =>
+      rw [hsa] at hloc0
+      have hlshape := congrArg Prod.snd (Option.some.inj hloc0)
+      have hp_obs := congrArg (fun d => (d[(⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat]?).getD none) hlshape
+      change ((sa.data.perms.data.map (Option.map Miri.TreeBorrows.BorrowTree.ZeroProtection.View.stateShape))[(⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat]?).getD none =
+        ((seg.data.perms.data.map (Option.map Miri.TreeBorrows.BorrowTree.ZeroProtection.View.stateShape))[(⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat]?).getD none at hp_obs
+      rw [Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup,
+          Miri.TreeBorrows.BorrowTree.ZeroProtection.View.mapped_lookup, hperm] at hp_obs
+      cases hpa : sa.data.perms.get ⟨1⟩ with
+      | none => simp [hpa] at hp_obs
+      | some pa =>
+        rw [hpa] at hp_obs
+        have hpa_eq : (pa.permission, pa.accessed) = (st.permission, st.accessed) :=
+          Option.some.inj hp_obs
+        unfold borrowTreeTagLocationState Miri.TreeBorrows.BorrowTree.indexOfTag
+          Miri.TreeBorrows.BorrowTree.locationStateAt Miri.TreeBorrows.BorrowTree.nodeAt
+        simp [htm, hmap, hsa, hca, hpa, hpa_eq]
+
+private def extractSifa (p : Miri.TreeBorrows.Permission) (prot : Bool) :
+    Miri.TreeBorrows.IdempotentForeignAccess :=
+  match p.strongestIdempotentForeignAccess prot with
+  | .Access s => s
+  | .ImpossibleProtectedReservedIM => .None
+
+private theorem rootTree_hatEnd :
+    (⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat =
+      (Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)).nodes.data.size := by
+  decide
+
+section NewChildOperational
+
+attribute [local irreducible] Miri.TreeBorrows.UniValMap.insert
+
+private theorem borrowTree_newChild_8byte_core
+    (st : Miri.TreeBorrows.Tree.LocationState)
+    (outsidePerm : Miri.TreeBorrows.Permission)
+    (isProtected : Bool)
+    (hout_init : outsidePerm.isInitial = true)
+    (hout_nuniq : outsidePerm.isUnique = false)
+    (hout_sifa : outsidePerm.strongestIdempotentForeignAccess isProtected =
+      .Access (extractSifa outsidePerm isProtected))
+    (hin_init : st.permission.isInitial = true)
+    (hin_sifa : st.permission.strongestIdempotentForeignAccess isProtected =
+      .Access st.idempotentForeignAccess) :
+    let rootTree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let inside := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) st
+    let child := rootTree.newChild Miri.ABI.Size.ZERO (.concrete retagParentTag)
+      retagChildTag inside outsidePerm isProtected
+    child.outcome = .ok () ∧
+    child.tree.nthParent retagChildTag 1 = .ok retagParentTag ∧
+    (borrowTreeTagLocationState child.tree retagChildTag).map (fun s => (s.permission, s.accessed)) =
+      some (st.permission, st.accessed) := by
+  let rootTree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+  let outSifa := extractSifa outsidePerm isProtected
+  let rootNode : Miri.TreeBorrows.TreeNode :=
+    ⟨retagParentTag, none, #[], .Disabled, .None, false, none⟩
+  let childNode : Miri.TreeBorrows.TreeNode :=
+    ⟨retagChildTag, some ⟨0⟩, #[], outsidePerm, outSifa, false, none⟩
+  let freshLoc : Miri.TreeBorrows.LocationTree :=
+    { perms := ({} : Miri.TreeBorrows.UniValMap Miri.TreeBorrows.Tree.LocationState).insert
+        ⟨0⟩ ⟨.Unique, true, .None⟩
+      exposedCache := {} }
+  let mapping : Miri.TreeBorrows.UniKeyMap Miri.Memory.BorTag :=
+    { mapping := #[(retagParentTag, ⟨0⟩), (retagChildTag, ⟨1⟩)], deassigned := #[] }
+  have hinserted : rootTree.tagMapping.insert retagChildTag = .Inserted mapping ⟨1⟩ := rfl
+  have htagged : rootTree.tagMapping.get retagParentTag = some ⟨0⟩ := by decide
+  have hrpres : rootTree.nodes.get ⟨0⟩ = some rootNode :=
+    Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_same {} ⟨0⟩ rootNode
+  have hatEnd : (⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat = rootTree.nodes.data.size :=
+    rootTree_hatEnd
+  have hdiff := Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.parent_not_fresh
+    rootTree.nodes ⟨1⟩ ⟨0⟩ rootNode hatEnd hrpres
+  have hlookup := (Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.append_get_other
+    rootTree.nodes ⟨1⟩ ⟨0⟩ childNode hatEnd hdiff).trans hrpres
+  have hloc : rootTree.locations =
+      Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) freshLoc := rfl
+  have hmod := modifyRange_new_full (Miri.ABI.Size.ofBytes 8) freshLoc (by decide)
+    (fun _ location => { location with perms := location.perms.insert ⟨1⟩ st })
+  have hiter8 : (Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) st).iterAll =
+      #[⟨⟨0, 8⟩, st⟩] := rfl
+  have hadd0 : Miri.ABI.Size.add (Miri.ABI.Size.ofBytes 0) Miri.ABI.Size.ZERO =
+      .ok Miri.ABI.Size.ZERO := rfl
+  have hsub8 : Miri.ABI.Size.ofBytes ((8 : UInt64) - 0) = Miri.ABI.Size.ofBytes 8 := rfl
+  dsimp only [rootTree, childNode] at hinserted htagged hrpres hlookup hloc ⊢
+  unfold Miri.TreeBorrows.BorrowTree.newChild
+  rw [hinserted]
+  simp only [htagged, Option.map_some, Bool.false_eq_true, ↓reduceIte,
+    hout_init, hout_nuniq, hout_sifa, Bool.not_true, Id.run, bind, Bind.bind, pure, Pure.pure]
+  rw [hlookup, hiter8]
+  simp only [← Array.forIn_toList, List.forIn_cons, List.forIn_nil,
+    hin_init, hin_sifa, bne_self_eq_false, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    hadd0, bind, Bind.bind, pure, Pure.pure]
+  rw [hloc, hsub8, hmod]
+  dsimp only []
+  let modLocs := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8)
+    { freshLoc with perms := freshLoc.perms.insert ⟨1⟩ st }
+  let baseForSifa : Miri.TreeBorrows.BorrowTree :=
+    { rootTree with tagMapping := mapping, locations := modLocs }
+  let staged : Miri.TreeBorrows.BorrowTree :=
+    { baseForSifa with
+      nodes := Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.attachedNodes
+        rootTree.nodes ⟨1⟩ ⟨0⟩ rootNode childNode }
+  have hmap1 : staged.tagMapping.get retagChildTag = some ⟨1⟩ := rfl
+  have hchild1 : staged.nodes.get ⟨1⟩ = some childNode := by
+    change ((rootTree.nodes.insert ⟨1⟩ childNode).insert ⟨0⟩
+      { rootNode with children := rootNode.children.push ⟨1⟩ }).get ⟨1⟩ = some childNode
+    rw [Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_other _ ⟨0⟩ ⟨1⟩ _ (Ne.symm hdiff),
+        Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_same]
+  have hroot0 : staged.nodes.get ⟨0⟩ = some { rootNode with children := #[⟨1⟩] } :=
+    Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_same _ ⟨0⟩ _
+  have hseg0 : staged.locations.entries[0]? =
+      some ⟨⟨0, 8⟩, { freshLoc with perms := freshLoc.perms.insert ⟨1⟩ st }⟩ := rfl
+  have hperm1 : ({ freshLoc with perms := freshLoc.perms.insert ⟨1⟩ st } :
+      Miri.TreeBorrows.LocationTree).perms.get ⟨1⟩ = some st :=
+    Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_same freshLoc.perms ⟨1⟩ st
+  refine ⟨?_, ?_, ?_⟩
+  · exact Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.sifa_after_attach
+      baseForSifa rootTreeParentDepth ⟨1⟩ ⟨0⟩ rootNode childNode hatEnd hrpres rfl _
+  · exact nthParent_one_of_treeShape _ staged
+      (Miri.TreeBorrows.BorrowTree.ZeroProtection.View.preserves staged ⟨0⟩ _)
+      hmap1 hchild1 rfl hroot0 rfl
+  · exact tagLocationShape_of_treeShape _ staged
+      (Miri.TreeBorrows.BorrowTree.ZeroProtection.View.preserves staged ⟨0⟩ _)
+      hmap1 hchild1 hseg0 hperm1
+
+private theorem borrowTree_newChild_zst_core
+    (st : Miri.TreeBorrows.Tree.LocationState)
+    (outsidePerm : Miri.TreeBorrows.Permission)
+    (isProtected : Bool)
+    (hout_init : outsidePerm.isInitial = true)
+    (hout_nuniq : outsidePerm.isUnique = false)
+    (hout_sifa : outsidePerm.strongestIdempotentForeignAccess isProtected =
+      .Access (extractSifa outsidePerm isProtected)) :
+    let rootTree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let inside := Miri.DataStructures.DedupRangeMap.new Miri.ABI.Size.ZERO st
+    let child := rootTree.newChild Miri.ABI.Size.ZERO (.concrete retagParentTag)
+      retagChildTag inside outsidePerm isProtected
+    child.outcome = .ok () ∧
+    child.tree.nthParent retagChildTag 1 = .ok retagParentTag := by
+  let rootTree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+  let outSifa := extractSifa outsidePerm isProtected
+  let mapping : Miri.TreeBorrows.UniKeyMap Miri.Memory.BorTag :=
+    { mapping := #[(retagParentTag, ⟨0⟩), (retagChildTag, ⟨1⟩)], deassigned := #[] }
+  let rootNode : Miri.TreeBorrows.TreeNode :=
+    ⟨retagParentTag, none, #[], .Disabled, .None, false, none⟩
+  let childNode : Miri.TreeBorrows.TreeNode :=
+    ⟨retagChildTag, some ⟨0⟩, #[], outsidePerm, outSifa, false, none⟩
+  have hinserted : rootTree.tagMapping.insert retagChildTag = .Inserted mapping ⟨1⟩ := rfl
+  have htagged : rootTree.tagMapping.get retagParentTag = some ⟨0⟩ := by decide
+  have hrpres : rootTree.nodes.get ⟨0⟩ = some rootNode :=
+    Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_same {} ⟨0⟩ rootNode
+  have hatEnd : (⟨1⟩ : Miri.TreeBorrows.UniIndex).toNat = rootTree.nodes.data.size :=
+    rootTree_hatEnd
+  have hdiff := Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.parent_not_fresh
+    rootTree.nodes ⟨1⟩ ⟨0⟩ rootNode hatEnd hrpres
+  have hlookup := (Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.append_get_other
+    rootTree.nodes ⟨1⟩ ⟨0⟩ childNode hatEnd hdiff).trans hrpres
+  have hiter0 : (Miri.DataStructures.DedupRangeMap.new Miri.ABI.Size.ZERO st).iterAll = #[] := rfl
+  dsimp only [rootTree, childNode] at hinserted htagged hrpres hlookup ⊢
+  unfold Miri.TreeBorrows.BorrowTree.newChild
+  rw [hinserted]
+  simp only [htagged, Option.map_some, Bool.false_eq_true, ↓reduceIte,
+    hout_init, hout_nuniq, hout_sifa, Bool.not_true, Id.run, bind, Bind.bind, pure, Pure.pure]
+  rw [hlookup, hiter0]
+  simp only [← Array.forIn_toList, List.forIn_nil, pure, Pure.pure]
+  let baseForSifa : Miri.TreeBorrows.BorrowTree := { rootTree with tagMapping := mapping }
+  let staged : Miri.TreeBorrows.BorrowTree :=
+    { baseForSifa with
+      nodes := Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.attachedNodes
+        rootTree.nodes ⟨1⟩ ⟨0⟩ rootNode childNode }
+  have hmap1 : staged.tagMapping.get retagChildTag = some ⟨1⟩ := rfl
+  have hchild1 : staged.nodes.get ⟨1⟩ = some childNode := by
+    change ((rootTree.nodes.insert ⟨1⟩ childNode).insert ⟨0⟩
+      { rootNode with children := rootNode.children.push ⟨1⟩ }).get ⟨1⟩ = some childNode
+    rw [Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_other _ ⟨0⟩ ⟨1⟩ _ (Ne.symm hdiff),
+        Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_same]
+  have hroot0 : staged.nodes.get ⟨0⟩ = some { rootNode with children := #[⟨1⟩] } :=
+    Miri.TreeBorrows.BorrowTree.ZeroProtection.Sparse.get_same _ ⟨0⟩ _
+  refine ⟨?_, ?_⟩
+  · exact Miri.TreeBorrows.BorrowTree.ZeroProtection.Append.sifa_after_attach
+      baseForSifa rootTreeParentDepth ⟨1⟩ ⟨0⟩ rootNode childNode hatEnd hrpres rfl outSifa
+  · exact nthParent_one_of_treeShape _ staged
+      (Miri.TreeBorrows.BorrowTree.ZeroProtection.View.preserves staged ⟨0⟩ outSifa)
+      hmap1 hchild1 rfl hroot0 rfl
+
+end NewChildOperational
+
+/-- **`borrowTree_newChild_reference_simulation`**: on an 8-byte live allocation
+whose root tag is `retagParentTag`, Miri's `BorrowTree.newChild` across all
+`4 × 2 × 2 = 16` `(mode, mutability, frozen)` combinations succeeds (`.ok ()`),
+links `retagChildTag`'s parent to `retagParentTag` (`nthParent = .ok retagParentTag`,
+certifying `I-10`), and initializes `retagChildTag`'s `[0, 8)` `LocationState`
+with `(permission := annealPermToMiri perm, accessed := annealPermToMiri perm != .Cell)`. -/
+theorem borrowTree_newChild_reference_simulation
+    (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    let rootTree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let facts : Miri.TreeBorrows.RetagPolicy.TypeFacts :=
+      { isUnpin := true, isUnsafeUnpin := true, isFreeze := frozen }
+    let perm := annealRetagPerm mode mutability frozen
+    ∃ policy st,
+      Miri.TreeBorrows.RetagPolicy.create facts (annealRefKindToMiri mutability)
+        (annealRetagModeToMiri mode) ⟨false, false⟩ = some policy ∧
+      Miri.TreeBorrows.RetagPolicy.initialLocationState policy frozen = .ok st ∧
+      let inside := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) st
+      let child := rootTree.newChild Miri.ABI.Size.ZERO (.concrete retagParentTag)
+        retagChildTag inside policy.outsidePermission policy.protector.isSome
+      child.outcome = .ok () ∧
+      child.tree.nthParent retagChildTag 1 = .ok retagParentTag ∧
+      (borrowTreeTagLocationState child.tree retagChildTag).map (fun s => (s.permission, s.accessed)) =
+        some (annealPermToMiri perm, annealPermToMiri perm != .Cell) := by
+  obtain ⟨policy, hpol, -, -, -, ⟨st, hst, hp, ha⟩, -⟩ :=
+    retag_pipeline_simulation mode mutability frozen
+      { isUnpin := true, isUnsafeUnpin := true, isFreeze := frozen } rfl rfl rfl
+  refine ⟨policy, st, hpol, hst, ?_⟩
+  cases mode <;> cases mutability <;> cases frozen <;>
+  · have hpol_eq : policy = _ := Option.some.inj (hpol.symm.trans rfl)
+    have hst_eq : st = _ := Except.ok.inj (hst.symm.trans (by rw [hpol_eq]; rfl))
+    obtain ⟨h1, h2, h3⟩ := borrowTree_newChild_8byte_core st
+      policy.outsidePermission policy.protector.isSome
+      (by rw [hpol_eq]; decide) (by rw [hpol_eq]; decide) (by rw [hpol_eq]; decide)
+      (by rw [hst_eq]; decide) (by rw [hpol_eq, hst_eq]; decide)
+    have ha_eq : st.accessed = (st.permission != .Cell) := by
+      rw [hst_eq]; decide
+    refine ⟨h1, h2, ?_⟩
+    rw [ha_eq, hp] at h3
+    exact h3
+
+private def expectedAccessTreeForReborrow
+    (result : Miri.TreeBorrows.RetagPipeline.Result Unit)
+    (request : Miri.TreeBorrows.RetagPipeline.Request)
+    (inside : Miri.DataStructures.DedupRangeMap Miri.TreeBorrows.Tree.LocationState)
+    (c : Miri.TreeBorrows.BorrowTree.ChildInsertResult) :
+    Miri.TreeBorrows.RetagPipeline.Result Unit := Id.run do
+  let location : Miri.TreeBorrows.RetagPipeline.ResolvedLocation :=
+    ⟨retagTestAllocId, Miri.ABI.Size.ZERO, .concrete retagParentTag⟩
+  let allocationMutability : Miri.Memory.Mutability := .Mut
+  let newTag := retagChildTag
+  let mut current := result
+  let mut dataRacePosition := 0
+  for segment in inside.iterAll do
+    match segment.data.permission.associatedAccess with
+    | none => pure ()
+    | some kind =>
+        if kind == .Write && allocationMutability == .Not then
+          return { current with outcome := .error (.writeToReadOnly location.allocId) }
+        let absoluteOffset? := match Miri.ABI.Size.add location.baseOffset
+            (Miri.ABI.Size.ofBytes segment.range.start) with
+          | .ok offset => some offset
+          | .error _ => none
+        let some absoluteOffset := absoluteOffset?
+          | return { current with outcome := .error (.offsetOverflow location.baseOffset segment.range.start) }
+        let length := Miri.ABI.Size.ofBytes (segment.range.stop - segment.range.start)
+        let absoluteEnd? := match Miri.ABI.Size.add absoluteOffset length with
+          | .ok endOffset => some endOffset
+          | .error _ => none
+        let some absoluteEnd := absoluteEnd?
+          | return { current with outcome := .error (.rangeEndOverflow absoluteOffset length) }
+        let range : Miri.DataStructures.ByteRange := ⟨absoluteOffset.bytes, absoluteEnd.bytes⟩
+        current := { current with events := current.events.push (.parentTreeAccess kind range) }
+        let some localEntry := current.state.memory.live.find? fun entry => entry.1 == location.allocId
+          | return { current with outcome := .error (.treeExtraUnavailable location.allocId) }
+        let access := localEntry.2.allocation.extra.performBorrowAccessRange
+          location.parentProvenance absoluteOffset length kind
+          current.state.global.protectedTags .VisitChildrenOfAccessed
+        let nextMemory ← match (match current.state.memory.live.find? fun entry => entry.1 == location.allocId with
+            | none => Except.error (Miri.Memory.AllocationLookupError.unavailable location.allocId)
+            | some le => current.state.memory.setLiveAllocation location.allocId (le.2.allocation.setExtra access.tree)) with
+          | .ok memory => pure memory
+          | .error error => return { current with outcome := .error (.memoryUpdate error) }
+        current := { current with state := { current.state with memory := nextMemory } }
+        if access.status != .Completed then
+          return { current with outcome := .error (.treeAccess range access.status) }
+        if length.bytes != 0 then
+          match request.hooks.dataRace with
+          | none => pure ()
+          | some hooks =>
+              current := { current with events := current.events.push (.dataRaceAccess kind range) }
+              match hooks[dataRacePosition]? with
+              | none => return { current with outcome := .error (.missingDataRaceResult dataRacePosition) }
+              | some (Except.error message) => return { current with outcome := .error (.dataRace message) }
+              | some (Except.ok ()) => pure ()
+              dataRacePosition := dataRacePosition + 1
+  let some liveEntry := current.state.memory.live.find? fun entry => entry.1 == location.allocId
+    | return { current with outcome := .error (.treeExtraUnavailable location.allocId) }
+  let nextMemory ← match (match current.state.memory.live.find? fun entry => entry.1 == location.allocId with
+      | none => Except.error (Miri.Memory.AllocationLookupError.unavailable location.allocId)
+      | some le => current.state.memory.setLiveAllocation location.allocId (le.2.allocation.setExtra c.tree)) with
+    | .ok memory => pure memory
+    | .error error => return { current with outcome := .error (.memoryUpdate error) }
+  let _ := liveEntry
+  current := { current with state := { current.state with memory := nextMemory } }
+  match c.outcome with
+  | .error error => return { current with outcome := .error (.childInsert error) }
+  | .ok () => pure ()
+  return { current with events := current.events.push (.childInserted newTag) }
+
+private def expectedRetagResult (sz : Miri.ABI.Size)
+    (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool)
+    (prot : Option Miri.TreeBorrows.ProtectorKind)
+    (st : Miri.TreeBorrows.Tree.LocationState)
+    (c : Miri.TreeBorrows.BorrowTree.ChildInsertResult) :
+    Miri.TreeBorrows.RetagPipeline.Result Unit := Id.run do
+  let req := retagRefRequest sz mode mutability frozen
+  let g0 := retagInitialMachineState.global
+  let g1 := { g0 with nextPointerTag := ⟨3, by decide⟩ }
+  let tracked := g1.isTrackedPointerTag retagChildTag
+  let (g2, f2) := match prot with
+    | some p => g1.addProtector {} retagTestAllocId retagChildTag p
+    | none => (g1, {})
+  let evs0 : Array Miri.TreeBorrows.RetagPipeline.Event :=
+    #[.placeConverted, .reborrowSizeSelected sz, .pointerTagAllocated retagChildTag,
+      .pointerAccessChecked, .allocationResolution (some retagTestAllocId),
+      .creationLogCalled retagChildTag (some retagTestAllocId) tracked]
+  let evs1 := match prot with
+    | some p => evs0.push (.protectorRegistered retagChildTag p)
+    | none => evs0
+  let baseEvs := (evs1.push (.allocationKindChecked retagTestAllocId .liveData)).push
+    (.allocationExtraLoaded retagTestAllocId)
+  let baseRes : Miri.TreeBorrows.RetagPipeline.Result Unit :=
+    { state := { memory := retagInitialMachineState.memory, global := g2, frame := f2 }
+      outcome := .ok none
+      events := baseEvs }
+  let inside := Miri.DataStructures.DedupRangeMap.new sz st
+  let afterAccess := expectedAccessTreeForReborrow baseRes req inside c
+  let prov := some (Miri.Memory.Provenance.concrete retagTestAllocId retagChildTag)
+  let reborrowed : Miri.TreeBorrows.RetagPipeline.Result Unit :=
+    match afterAccess.outcome with
+    | .error _ => afterAccess
+    | .ok _ => { afterAccess with outcome := .ok prov, events := afterAccess.events.push (.reborrowReturned prov) }
+  match reborrowed.outcome with
+  | .error _ => return reborrowed
+  | .ok provenance =>
+    return { reborrowed with
+      events := (reborrowed.events.push (.placeProvenanceReplaced provenance)).push
+        .retaggedValueReconstructed }
+
+private def retagPolOf (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    Miri.TreeBorrows.RetagPolicy.NewPermission :=
+  (Miri.TreeBorrows.RetagPolicy.create
+    { isUnpin := true, isUnsafeUnpin := true, isFreeze := frozen }
+    (annealRefKindToMiri mutability) (annealRetagModeToMiri mode) ⟨false, false⟩).getD
+    ⟨.Frozen, .Frozen, .Frozen, none⟩
+
+private def retagStOf (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    Miri.TreeBorrows.Tree.LocationState :=
+  match Miri.TreeBorrows.RetagPolicy.initialLocationState (retagPolOf mode mutability frozen) frozen with
+  | .ok s => s
+  | .error _ => ⟨.Disabled, false, .None⟩
+
+private def retagChildOf (sz : Miri.ABI.Size)
+    (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    Miri.TreeBorrows.BorrowTree.ChildInsertResult :=
+  let pol := retagPolOf mode mutability frozen
+  let st := retagStOf mode mutability frozen
+  (Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)).newChild
+    Miri.ABI.Size.ZERO (.concrete retagParentTag) retagChildTag
+    (Miri.DataStructures.DedupRangeMap.new sz st)
+    pol.outsidePermission pol.protector.isSome
+
+section RetagOperational
+
+attribute [local irreducible] Miri.TreeBorrows.BorrowTree.newChild
+
+private theorem retagPointerValue_zst_eq_expected
+    (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest Miri.ABI.Size.ZERO mode mutability frozen) =
+    expectedRetagResult Miri.ABI.Size.ZERO mode mutability frozen
+      (retagPolOf mode mutability frozen).protector
+      (retagStOf mode mutability frozen)
+      (retagChildOf Miri.ABI.Size.ZERO mode mutability frozen) := by
+  cases mode <;> cases mutability <;> cases frozen <;> rfl
+
+private theorem retagPointerValue_cell_8byte_eq_expected (mode : AnnealRetagMode) :
+    Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest (Miri.ABI.Size.ofBytes 8) mode .not false) =
+    expectedRetagResult (Miri.ABI.Size.ofBytes 8) mode .not false
+      (retagPolOf mode .not false).protector
+      (retagStOf mode .not false)
+      (retagChildOf (Miri.ABI.Size.ofBytes 8) mode .not false) := by
+  cases mode <;> rfl
+
+end RetagOperational
+
+private theorem not_tracked_retagChildTag :
+    ({ retagInitialMachineState.global with nextPointerTag := ⟨3, by decide⟩ } :
+      Miri.TreeBorrows.GlobalState).isTrackedPointerTag retagChildTag = false := by
+  simp [retagInitialMachineState, Miri.TreeBorrows.GlobalState.isTrackedPointerTag]
+
+private theorem retagInitialMachineState_memory :
+    retagInitialMachineState.memory =
+      liveTreeMemory (Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)) :=
+  rfl
+
+/-- **`retagPointerValue_zst_reference_simulation`**: executing Miri's operational
+`RetagPipeline.retagPointerValue` on `retagInitialMachineState` for zero-sized
+(`Size.ZERO`) reference reborrows across all `4 × 2 × 2 = 16`
+`(mode, mutability, frozen)` combinations:
+1. allocates `retagChildTag` and returns `.ok (some (.concrete retagTestAllocId retagChildTag))`;
+2. registers `retagChildTag` in both `GlobalState.protectedTags` and
+   `FrameState.protectedTags` iff `mode = .fnEntry`, and `GlobalState.endCall`
+   removes that protector on return;
+3. emits `Event.childInserted retagChildTag` and links `nthParent retagChildTag 1`
+   to `retagParentTag` in `retagTestAllocId`'s live `BorrowTree`. -/
+theorem retagPointerValue_zst_reference_simulation
+    (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest Miri.ABI.Size.ZERO mode mutability frozen)
+    res.outcome = .ok (some (.concrete retagTestAllocId retagChildTag)) ∧
+    res.state.global.protectedTags.contains retagChildTag = (mode == .fnEntry) ∧
+    res.state.frame.protectedTags =
+      (if mode == .fnEntry then #[(retagTestAllocId, retagChildTag)] else #[]) ∧
+    (res.state.global.endCall res.state.frame).protectedTags.contains retagChildTag = false ∧
+    Miri.TreeBorrows.RetagPipeline.Event.childInserted retagChildTag ∈ res.events.toList ∧
+    (res.state.memory.live.find? fun e => e.1 == retagTestAllocId).bind
+        (fun e => (e.2.allocation.extra.nthParent retagChildTag 1).toOption) =
+      some retagParentTag := by
+  dsimp only []
+  rw [retagPointerValue_zst_eq_expected]
+  obtain ⟨hch_ok, hch_par⟩ := borrowTree_newChild_zst_core
+    (retagStOf mode mutability frozen) (retagPolOf mode mutability frozen).outsidePermission
+    (retagPolOf mode mutability frozen).protector.isSome
+    (by cases mode <;> cases mutability <;> cases frozen <;> decide)
+    (by cases mode <;> cases mutability <;> cases frozen <;> decide)
+    (by cases mode <;> cases mutability <;> cases frozen <;> decide)
+  have hiter0 :
+      (Miri.DataStructures.DedupRangeMap.new Miri.ABI.Size.ZERO (retagStOf mode mutability frozen)).iterAll = #[] := rfl
+  unfold expectedRetagResult expectedAccessTreeForReborrow
+  dsimp only [retagChildOf]
+  rw [hiter0]
+  simp +zetaHave only [Id.run, bind, Bind.bind, pure, Pure.pure,
+    ← Array.forIn_toList, List.forIn_nil, not_tracked_retagChildTag,
+    retagInitialMachineState_memory, liveTreeMemory_find,
+    liveTreeAllocation_setExtra, liveTreeMemory_setLiveAllocation, hch_ok]
+  cases mode <;> cases mutability <;> cases frozen <;>
+  · refine ⟨trivial, ?_, ?_, ?_, by decide, ?_⟩
+    · simp [retagInitialMachineState, retagPolOf, Miri.TreeBorrows.RetagPolicy.create,
+        annealRefKindToMiri, annealRetagModeToMiri, Miri.TreeBorrows.GlobalState.addProtector,
+        Miri.TreeBorrows.ProtectedTags.contains, Miri.TreeBorrows.ProtectedTags.get,
+        Miri.TreeBorrows.ProtectedTags.insert, retagChildTag]
+    · simp [retagPolOf, Miri.TreeBorrows.RetagPolicy.create,
+        annealRefKindToMiri, annealRetagModeToMiri, Miri.TreeBorrows.GlobalState.addProtector,
+        Miri.TreeBorrows.FrameState.addProtector]
+    · simp [retagInitialMachineState, retagPolOf, Miri.TreeBorrows.RetagPolicy.create,
+        annealRefKindToMiri, annealRetagModeToMiri, Miri.TreeBorrows.GlobalState.addProtector,
+        Miri.TreeBorrows.FrameState.addProtector, Miri.TreeBorrows.GlobalState.endCall,
+        Miri.TreeBorrows.ProtectedTags.contains, Miri.TreeBorrows.ProtectedTags.get,
+        Miri.TreeBorrows.ProtectedTags.insert, Miri.TreeBorrows.ProtectedTags.remove, retagChildTag]
+    · dsimp only [Option.bind]
+      rw [liveTreeAllocation_extra, hch_par]
+      rfl
+
+/-- **`retagPointerValue_cell_8byte_simulation`** (certifying `I-11` retag):
+executing Miri's operational `RetagPipeline.retagPointerValue` on an 8-byte
+shared `!Freeze` reference (`&UnsafeCell<u64>`, i.e. `mutability = .not, frozen = false`)
+across all 4 `AnnealRetagMode`s:
+1. allocates `retagChildTag`, registers/releases function-entry protectors iff
+   `mode = .fnEntry`, and returns `.ok (some (.concrete retagTestAllocId retagChildTag))`;
+2. emits **no** `Event.parentTreeAccess` (matching `Permission.Cell.associatedAccess = none`
+   and Anneal's `Places.lean` / `Statements.lean` skip of the initial child read
+   when `perm = .cell`);
+3. inserts `retagChildTag` under `retagParentTag` (`nthParent = .ok retagParentTag`)
+   across `[0, 8)` with `(permission := .Cell, accessed := false)`. -/
+theorem retagPointerValue_cell_8byte_simulation (mode : AnnealRetagMode) :
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest (Miri.ABI.Size.ofBytes 8) mode .not false)
+    res.outcome = .ok (some (.concrete retagTestAllocId retagChildTag)) ∧
+    res.state.global.protectedTags.contains retagChildTag = (mode == .fnEntry) ∧
+    res.state.frame.protectedTags =
+      (if mode == .fnEntry then #[(retagTestAllocId, retagChildTag)] else #[]) ∧
+    (res.state.global.endCall res.state.frame).protectedTags.contains retagChildTag = false ∧
+    (∀ k r, Miri.TreeBorrows.RetagPipeline.Event.parentTreeAccess k r ∉ res.events.toList) ∧
+    Miri.TreeBorrows.RetagPipeline.Event.childInserted retagChildTag ∈ res.events.toList ∧
+    (res.state.memory.live.find? fun e => e.1 == retagTestAllocId).bind
+        (fun e => (e.2.allocation.extra.nthParent retagChildTag 1).toOption) =
+      some retagParentTag ∧
+    (liveTagLocationState res.state.memory retagChildTag).map (fun s => (s.permission, s.accessed)) =
+      some (.Cell, false) := by
+  dsimp only []
+  rw [retagPointerValue_cell_8byte_eq_expected]
+  obtain ⟨hch_ok, hch_par, hch_loc⟩ := borrowTree_newChild_8byte_core
+    (retagStOf mode .not false) (retagPolOf mode .not false).outsidePermission
+    (retagPolOf mode .not false).protector.isSome
+    (by cases mode <;> decide) (by cases mode <;> decide) (by cases mode <;> decide)
+    (by cases mode <;> decide) (by cases mode <;> decide)
+  have hiter8 :
+      (Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) (retagStOf mode .not false)).iterAll =
+        #[⟨⟨0, 8⟩, retagStOf mode .not false⟩] := rfl
+  have hassoc : (retagStOf mode .not false).permission.associatedAccess = none := by
+    cases mode <;> decide
+  unfold expectedRetagResult expectedAccessTreeForReborrow
+  dsimp only [retagChildOf]
+  rw [hiter8]
+  simp +zetaHave only [Id.run, bind, Bind.bind, pure, Pure.pure,
+    ← Array.forIn_toList, List.forIn_cons, List.forIn_nil, hassoc, not_tracked_retagChildTag,
+    retagInitialMachineState_memory, liveTreeMemory_find,
+    liveTreeAllocation_setExtra, liveTreeMemory_setLiveAllocation, hch_ok]
+  cases mode <;>
+  · refine ⟨trivial, ?_, ?_, ?_, ?_, by decide, ?_, ?_⟩
+    · simp [retagInitialMachineState, retagPolOf, Miri.TreeBorrows.RetagPolicy.create,
+        annealRefKindToMiri, annealRetagModeToMiri, Miri.TreeBorrows.GlobalState.addProtector,
+        Miri.TreeBorrows.ProtectedTags.contains, Miri.TreeBorrows.ProtectedTags.get,
+        Miri.TreeBorrows.ProtectedTags.insert, retagChildTag]
+    · simp [retagPolOf, Miri.TreeBorrows.RetagPolicy.create,
+        annealRefKindToMiri, annealRetagModeToMiri, Miri.TreeBorrows.GlobalState.addProtector,
+        Miri.TreeBorrows.FrameState.addProtector]
+    · simp [retagInitialMachineState, retagPolOf, Miri.TreeBorrows.RetagPolicy.create,
+        annealRefKindToMiri, annealRetagModeToMiri, Miri.TreeBorrows.GlobalState.addProtector,
+        Miri.TreeBorrows.FrameState.addProtector, Miri.TreeBorrows.GlobalState.endCall,
+        Miri.TreeBorrows.ProtectedTags.contains, Miri.TreeBorrows.ProtectedTags.get,
+        Miri.TreeBorrows.ProtectedTags.insert, Miri.TreeBorrows.ProtectedTags.remove, retagChildTag]
+    · intro k r hmem
+      simp [retagPolOf, Miri.TreeBorrows.RetagPolicy.create,
+        annealRefKindToMiri, annealRetagModeToMiri] at hmem
+    · dsimp only [Option.bind]
+      rw [liveTreeAllocation_extra, hch_par]
+      rfl
+    · rw [liveTagLocationState_liveTreeMemory]
+      exact hch_loc
+
+/-- Location tree for `hooksTwoNodeTree`: root `UniIndex 0` (`Unique`) and child
+`UniIndex 1` (`annealPermToMiri perm`, accessed). -/
+def hooksLocTree (perm : TreeBorrowPerm) : Miri.TreeBorrows.LocationTree :=
+  { perms :=
+      ⟨#[some ⟨.Unique, true, .None⟩,
+         some ⟨annealPermToMiri perm, true, .None⟩]⟩
+    exposedCache := {} }
+
+/-- Two-node `UniValMap` for `hooksTwoNodeTree`. -/
+def hooksTwoNodes : Miri.TreeBorrows.UniValMap Miri.TreeBorrows.TreeNode :=
+  let rootIdx : Miri.TreeBorrows.UniIndex := ⟨0⟩
+  let childIdx : Miri.TreeBorrows.UniIndex := ⟨1⟩
+  let rootNode : Miri.TreeBorrows.TreeNode :=
+    { tag := retagParentTag
+      parent := none
+      children := #[childIdx]
+      defaultInitialPermission := .Disabled
+      defaultInitialSifa := .None }
+  let childNode : Miri.TreeBorrows.TreeNode :=
+    { tag := retagChildTag
+      parent := some rootIdx
+      children := #[]
+      defaultInitialPermission := .Disabled
+      defaultInitialSifa := .None }
+  ⟨#[some rootNode, some childNode]⟩
+
+/-- Two-node `BorrowTree` on `[0, 8)` with root `retagParentTag` (`Unique`,
+`UniIndex 0`) and child `retagChildTag` (`annealPermToMiri perm`, accessed,
+`UniIndex 1`) for operational `TreeState` and `MachineMemoryHooks` correspondence. -/
+def hooksTwoNodeTree (perm : TreeBorrowPerm) : Miri.TreeBorrows.BorrowTree :=
+  { tagMapping :=
+      { mapping := #[(retagParentTag, ⟨0⟩), (retagChildTag, ⟨1⟩)]
+        deassigned := #[] }
+    nodes := hooksTwoNodes
+    locations := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) (hooksLocTree perm)
+    roots := #[⟨0⟩] }
+
+/-- Trivial data-race/sync callback bundle for `MachineMemoryHooks` with
+`retagChildTag` protected iff `isProtected = true`. -/
+def hooksForChildProtected (isProtected : Bool) :
+    Miri.TreeBorrows.MachineMemoryHooks.Hooks Unit Unit Unit :=
+  { protectedTags :=
+      if isProtected then
+        ({} : Miri.TreeBorrows.ProtectedTags).insert retagChildTag .StrongProtector
+      else {}
+    emitDiagnostic := fun s _ _ => s
+    dataRaceRead := fun s _ _ _ => ⟨s, .ok ()⟩
+    dataRaceWrite := fun s _ _ _ => ⟨s, .ok ()⟩
+    dataRaceDeallocate := fun s _ _ _ _ => ⟨s, .ok ()⟩
+    syncOnAccess := fun s _ _ => ⟨s, .ok ()⟩
+    deleteOnWrite := fun _ => false
+    recordDeallocatedSpan := fun s _ => s
+    freeAllocId := fun s _ _ _ _ => s }
+
+/-- Node index in `hooksTwoNodeTree` corresponding to a `localAccess` (`⟨1⟩`,
+`retagChildTag`) vs `foreignAccess` (`⟨0⟩`, `retagParentTag`) relative to
+`retagChildTag`. -/
+def hooksAccessIndex : TreeBorrowRelatedness → Miri.TreeBorrows.UniIndex
+  | .localAccess => ⟨1⟩
+  | .foreignAccess => ⟨0⟩
+
+private theorem hooksTwoNodes_entries :
+    hooksTwoNodes.entries =
+      #[(⟨0⟩, ⟨retagParentTag, none, #[⟨1⟩], .Disabled, .None, false, none⟩),
+        (⟨1⟩, ⟨retagChildTag, some ⟨0⟩, #[], .Disabled, .None, false, none⟩)] := by
+  unfold hooksTwoNodes Miri.TreeBorrows.UniValMap.entries
+  simp only [Id.run, bind, Bind.bind, pure, Pure.pure,
+    Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+    Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+  decide
+
+private def hooksFailingNode? : Miri.TreeBorrows.Tree.NormalAccessStatus → Option Nat
+  | .Completed => none
+  | .TransitionError node _
+  | .RecordDebugAssertion node
+  | .PermissionInvariantFailure node
+  | .TransitionApplicationInvariantFailure node
+  | .PossibleInvariantFailure node
+  | .MissingLocationState node => some node
+
+private def hooksExpectedNormalProj (perm : TreeBorrowPerm)
+    (ents : Array (Miri.TreeBorrows.UniIndex × Miri.TreeBorrows.TreeNode))
+    (isProtected : Bool) : Miri.TreeBorrows.Tree.NormalTreeState :=
+  let tree := hooksTwoNodeTree perm
+  let location := hooksLocTree perm
+  let protectedTags := (hooksForChildProtected isProtected).protectedTags
+  let defaults := tree.nodes.data.map fun entry =>
+    match entry with
+    | some node => node.defaultLocationState
+    | none => ⟨.Disabled, false, .None⟩
+  let locationStates := tree.nodes.data.mapIdx fun position _ =>
+    match Miri.TreeBorrows.UniIndex.ofNat? position with
+    | none => none
+    | some index => location.perms.get index
+  let protectedNodes := ents.toList.filterMap fun (index, node) =>
+    if protectedTags.contains node.tag then some index.toNat else none
+  { topology :=
+      ⟨tree.nodes.data.map fun entry =>
+        match entry with
+        | none => ⟨none, []⟩
+        | some node =>
+            ⟨node.parent.map Miri.TreeBorrows.UniIndex.toNat,
+              node.children.toList.map Miri.TreeBorrows.UniIndex.toNat⟩⟩
+    defaultStates := defaults
+    protectedNodes
+    locationStates }
+
+private def hooksExpectedPerformAt (perm : TreeBorrowPerm)
+    (ents : Array (Miri.TreeBorrows.UniIndex × Miri.TreeBorrows.TreeNode))
+    (rel : TreeBorrowRelatedness) (kind : TreeBorrowAccessKind) (isProtected : Bool) :
+    Miri.TreeBorrows.BorrowTree.NormalLocationAccessResult := Id.run do
+  let tree := hooksTwoNodeTree perm
+  let location := hooksLocTree perm
+  let protectedTags := (hooksForChildProtected isProtected).protectedTags
+  let access := Miri.TreeBorrows.Tree.NormalTreeState.performAccess
+    (hooksExpectedNormalProj perm ents isProtected)
+    (hooksAccessIndex rel).toNat (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+  let mut nextLocation := location
+  for position in [:access.tree.locationStates.size] do
+    match access.tree.locationStates[position]? with
+    | some (some state) =>
+        match Miri.TreeBorrows.UniIndex.ofNat? position with
+        | some index =>
+            nextLocation := { nextLocation with perms := nextLocation.perms.insert index state }
+        | none => pure ()
+    | _ => pure ()
+  let mut cacheOutcome : Except Miri.TreeBorrows.ExposedCacheError Unit := .ok ()
+  for event in access.visited do
+    if cacheOutcome matches .ok _ then
+      match Miri.TreeBorrows.UniIndex.ofNat? event.node with
+      | none => cacheOutcome := .error (.InvalidIndex event.node)
+      | some index =>
+        match tree.nodeAt index with
+        | none => cacheOutcome := .error (.MissingNode index)
+        | some node =>
+          if node.isExposed && hooksFailingNode? access.status != some event.node then
+            match tree.locationStateAt location index, access.tree.stateAt event.node with
+            | some oldState, some newState =>
+                match Miri.TreeBorrows.performAccessTransition
+                    (annealAccessKindToMiri kind) event.relatedness oldState.permission
+                    (protectedTags.contains node.tag) with
+                | .Transition transition =>
+                    if !transition.isNoop then
+                      let oldLevel := oldState.permission.strongestAllowedLocalAccess
+                        (protectedTags.contains node.tag)
+                      let newLevel := newState.permission.strongestAllowedLocalAccess
+                        (protectedTags.contains node.tag)
+                      let update := nextLocation.exposedCache.updateExposure tree.nodes index
+                        oldLevel newLevel
+                      nextLocation := { nextLocation with exposedCache := update.cache }
+                      cacheOutcome := update.outcome
+                | .UndefinedBehavior | .ImpossibleProtectedReservedIM => pure ()
+            | _, _ => cacheOutcome := .error (.MissingNode index)
+  return { location := nextLocation, access, outcome := cacheOutcome }
+
+section NormalAccessAtStep
+
+attribute [local irreducible] Miri.TreeBorrows.UniValMap.entries
+attribute [local irreducible] Miri.TreeBorrows.Tree.NormalTreeState.performAccess
+
+private theorem performNormalAccessAt_eq_expected
+    (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    (hooksTwoNodeTree perm).performNormalAccessAt (hooksLocTree perm)
+      (hooksAccessIndex rel) (annealAccessKindToMiri kind)
+      (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed =
+    hooksExpectedPerformAt perm hooksTwoNodes.entries rel kind isProtected := by
+  cases kind <;> cases rel <;> (rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;> cases isProtected <;> rfl
+
+end NormalAccessAtStep
+
+private def normalAccessAtGoal
+    (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) : Prop :=
+  let res := (hooksTwoNodeTree perm).performNormalAccessAt (hooksLocTree perm)
+    (hooksAccessIndex rel) (annealAccessKindToMiri kind)
+    (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed
+  let out := treeBorrowNodeAccess kind rel perm isProtected
+  let dummy : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := perm }
+  res.outcome = .ok () ∧
+  (res.access.status = .Completed ↔ treeBorrowTransitionIsUB out = false) ∧
+  (res.access.status = .Completed →
+    (res.location.perms.get ⟨1⟩).map (·.permission) =
+      some (annealPermToMiri (applyTreeBorrowTransition dummy out).perm))
+
+private theorem hooksExpectedNormalProj_eq (perm : TreeBorrowPerm) (isProtected : Bool) :
+    hooksExpectedNormalProj perm
+        #[(⟨0⟩, ⟨retagParentTag, none, #[⟨1⟩], .Disabled, .None, false, none⟩),
+          (⟨1⟩, ⟨retagChildTag, some ⟨0⟩, #[], .Disabled, .None, false, none⟩)]
+        isProtected =
+      { topology := ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩
+        defaultStates := #[⟨.Disabled, false, .None⟩, ⟨.Disabled, false, .None⟩]
+        protectedNodes := if isProtected then [1] else []
+        locationStates :=
+          #[some ⟨.Unique, true, .None⟩, some ⟨annealPermToMiri perm, true, .None⟩] } := by
+  cases isProtected <;>
+    simp [hooksExpectedNormalProj, hooksTwoNodeTree, hooksTwoNodes, hooksLocTree,
+      hooksForChildProtected, Miri.TreeBorrows.TreeNode.defaultLocationState,
+      Miri.TreeBorrows.UniIndex.ofNat?, Miri.TreeBorrows.UniIndex.toNat,
+      Miri.TreeBorrows.UniValMap.get,
+      Miri.TreeBorrows.ProtectedTags.contains, Miri.TreeBorrows.ProtectedTags.get,
+      Miri.TreeBorrows.ProtectedTags.insert, retagParentTag, retagChildTag,
+      Miri.Memory.BorTag.one]
+
+private theorem normalAccessAt_read_local (perm : TreeBorrowPerm) (isProtected : Bool) :
+    normalAccessAtGoal .read .localAccess perm isProtected := by
+  dsimp only [normalAccessAtGoal]
+  rw [performNormalAccessAt_eq_expected, hooksTwoNodes_entries]
+  unfold hooksExpectedPerformAt
+  rw [hooksExpectedNormalProj_eq]
+  (rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;> cases isProtected <;>
+  · simp +zetaHave only [Id.run, bind, Bind.bind, pure, Pure.pure,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+    decide
+
+private theorem normalAccessAt_read_foreign (perm : TreeBorrowPerm) (isProtected : Bool) :
+    normalAccessAtGoal .read .foreignAccess perm isProtected := by
+  dsimp only [normalAccessAtGoal]
+  rw [performNormalAccessAt_eq_expected, hooksTwoNodes_entries]
+  unfold hooksExpectedPerformAt
+  rw [hooksExpectedNormalProj_eq]
+  (rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;> cases isProtected <;>
+  · simp +zetaHave only [Id.run, bind, Bind.bind, pure, Pure.pure,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+    decide
+
+private theorem normalAccessAt_write_local (perm : TreeBorrowPerm) (isProtected : Bool) :
+    normalAccessAtGoal .write .localAccess perm isProtected := by
+  dsimp only [normalAccessAtGoal]
+  rw [performNormalAccessAt_eq_expected, hooksTwoNodes_entries]
+  unfold hooksExpectedPerformAt
+  rw [hooksExpectedNormalProj_eq]
+  (rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;> cases isProtected <;>
+  · simp +zetaHave only [Id.run, bind, Bind.bind, pure, Pure.pure,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+    decide
+
+private theorem normalAccessAt_write_foreign (perm : TreeBorrowPerm) (isProtected : Bool) :
+    normalAccessAtGoal .write .foreignAccess perm isProtected := by
+  dsimp only [normalAccessAtGoal]
+  rw [performNormalAccessAt_eq_expected, hooksTwoNodes_entries]
+  unfold hooksExpectedPerformAt
+  rw [hooksExpectedNormalProj_eq]
+  (rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;> cases isProtected <;>
+  · simp +zetaHave only [Id.run, bind, Bind.bind, pure, Pure.pure,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+    decide
+
+/-- **`borrowTree_performNormalAccessAt_simulation`**: Miri's operational
+`BorrowTree.performNormalAccessAt` (`TreeState.lean`) on `hooksTwoNodeTree perm`
+across all `2 × 2 × 7 × 2 = 56` `(kind, rel, perm, isProtected)` combinations
+has `outcome = .ok ()`, completes (`access.status = .Completed`) iff Anneal's
+`treeBorrowNodeAccess kind rel perm isProtected` is non-UB, and whenever it
+completes, writes back the exact mapped Anneal successor permission at child
+index `⟨1⟩`. -/
+theorem borrowTree_performNormalAccessAt_simulation
+    (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let res := (hooksTwoNodeTree perm).performNormalAccessAt (hooksLocTree perm)
+      (hooksAccessIndex rel) (annealAccessKindToMiri kind)
+      (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed
+    let out := treeBorrowNodeAccess kind rel perm isProtected
+    let dummy : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := perm }
+    res.outcome = .ok () ∧
+    (res.access.status = .Completed ↔ treeBorrowTransitionIsUB out = false) ∧
+    (res.access.status = .Completed →
+      (res.location.perms.get ⟨1⟩).map (·.permission) =
+        some (annealPermToMiri (applyTreeBorrowTransition dummy out).perm)) := by
+  cases kind <;> cases rel
+  · exact normalAccessAt_read_local perm isProtected
+  · exact normalAccessAt_read_foreign perm isProtected
+  · exact normalAccessAt_write_local perm isProtected
+  · exact normalAccessAt_write_foreign perm isProtected
+
+private def expectedHooksWriteResult
+    (acc : Miri.TreeBorrows.BorrowTree.BorrowTreeAccessResult) :
+    Miri.TreeBorrows.MachineMemoryHooks.AccessResult Unit Unit Unit :=
+  let nextMem := liveTreeMemory acc.tree
+  if acc.status != .Completed then
+    { memory := nextMem
+      context := ⟨(), .empty, false, #[]⟩
+      outcome := .error s!"Tree Borrows write failed: {reprStr acc.status}" }
+  else
+    { memory := nextMem
+      context := ⟨(), Miri.TreeBorrows.MachineMemoryHooks.SyncObjectStore.empty.set retagTestAllocId .empty, false, #[]⟩
+      outcome := .ok () }
+
+section HooksWriteOperational
+
+attribute [local irreducible] Miri.TreeBorrows.BorrowTree.performBorrowAccessRange
+
+/-- **`machineMemoryHooks_fresh_root_write_simulation`**: Miri's operational
+`MachineMemoryHooks.beforeMemoryWrite` across the full 8-byte range `[0, 8)` on
+a live allocation carrying `BorrowTree.new retagParentTag (Size.ofBytes 8)`
+succeeds (`.ok ()`) and preserves `liveTreeMemory` for any global `protectedTags`
+map (via vendored `BorrowTree.fresh_root_full_write`). -/
+theorem machineMemoryHooks_fresh_root_write_simulation
+    (isProtected : Bool) :
+    let tree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let mem := liveTreeMemory tree
+    let alloc := liveTreeAllocation tree
+    let ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance) :=
+      ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId retagParentTag)⟩
+    let range := Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+    let res := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite
+      mem ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      alloc ptr retagTestAllocId (.concrete retagParentTag) range
+    res.outcome = .ok () ∧ res.memory = mem := by
+  let tree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+  have hfresh := Miri.TreeBorrows.BorrowTree.fresh_root_full_write
+    retagParentTag (Miri.ABI.Size.ofBytes 8) (hooksForChildProtected isProtected).protectedTags
+  dsimp only [] at hfresh
+  let acc := tree.performBorrowAccessRange (.concrete retagParentTag)
+    Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) .Write
+    (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed
+  have hstep : Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite
+      (liveTreeMemory tree) ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      (liveTreeAllocation tree) ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId retagParentTag)⟩
+      retagTestAllocId (.concrete retagParentTag)
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)) =
+      expectedHooksWriteResult acc := by
+    cases isProtected <;> rfl
+  dsimp only []
+  rw [hstep]
+  dsimp only [expectedHooksWriteResult]
+  rw [hfresh.1, hfresh.2]
+  exact ⟨rfl, rfl⟩
+
+end HooksWriteOperational
+
 /-- Transparent copy of the vendored (private) `ancestorPathAux`: the start node
 followed by its successive parents, for at most `fuel` parent steps. -/
 def traversalAncestorPathAux (tree : Miri.TreeBorrows.Tree.TraversalTree) :
@@ -1422,5 +2538,86 @@ theorem invalidateTreeBorrowsAtProj_preserves_rel
           writeProj writeRangeOff writeRangeLen).map BorrowEntry.tag).Nodup := by
     rw [htags]; exact hnodup
   exact ⟨hnodup', basedNormalTree_rel _ activeProtectors hnodup'⟩
+
+section RangedOperational
+
+attribute [local irreducible] Miri.TreeBorrows.Tree.NormalTreeState.performAccess
+
+/-- **`rangedNormalTree_performAccessRange_simulation`**: for any positive
+allocation size (`size.bytes ≠ 0`) and any Anneal borrow table `borrows`,
+executing Miri's `RangedNormalTreeState.performAccessRange` across the full
+byte range `[0, size.bytes)` delegates directly to
+`NormalTreeState.performAccess (basedNormalTree borrows activeProtectors)`,
+completes iff that normal access completes, and commits the resulting
+per-node `locationStates` into the `[0, size.bytes)` range segment. -/
+theorem rangedNormalTree_performAccessRange_simulation
+    (size : Miri.ABI.Size) (hpos : size.bytes ≠ 0)
+    (borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (start : Nat) (kind : Miri.TreeBorrows.AccessKind)
+    (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode) :
+    let nt := basedNormalTree borrows activeProtectors
+    let rt := Miri.TreeBorrows.Tree.RangedNormalTreeState.new size
+      nt.topology nt.defaultStates nt.protectedNodes nt.locationStates
+    let nres := nt.performAccess start kind mode
+    let rres := rt.performAccessRange Miri.ABI.Size.ZERO size start kind mode
+    rres.locations = #[⟨⟨0, size.bytes⟩, nres⟩] ∧
+    (rres.status = .Completed ↔ nres.status = .Completed) ∧
+    rres.state.locations = Miri.DataStructures.DedupRangeMap.new size nres.tree.locationStates := by
+  dsimp only []
+  generalize basedNormalTree borrows activeProtectors = nt
+  rcases nt with ⟨topo, defs, prots, locs⟩
+  have hiter :
+      (Miri.DataStructures.DedupRangeMap.new size locs).iterMut Miri.ABI.Size.ZERO size =
+      ⟨Miri.DataStructures.DedupRangeMap.new size locs, #[0], #[⟨⟨0, size.bytes⟩, locs⟩], .ok ()⟩ :=
+    Miri.DataStructures.DedupRangeMap.iterMut_new_full size locs hpos
+  have hset : ∀ s',
+      (Miri.DataStructures.DedupRangeMap.new size locs).setAtPos 0 s' =
+      ⟨Miri.DataStructures.DedupRangeMap.new size s', .ok ()⟩ := by
+    intro s'
+    simp only [Miri.DataStructures.DedupRangeMap.new, hpos, beq_iff_eq, ↓reduceIte]
+    rfl
+  have hstep :
+      (Miri.TreeBorrows.Tree.RangedNormalTreeState.new size topo defs prots locs).performAccessRange
+          Miri.ABI.Size.ZERO size start kind mode =
+      (Id.run do
+        let prepared := (Miri.DataStructures.DedupRangeMap.new size locs).iterMut Miri.ABI.Size.ZERO size
+        let mut currentMap := prepared.state
+        let mut visited : Array Miri.TreeBorrows.Tree.RangedLocationResult := #[]
+        let mut status := Miri.TreeBorrows.Tree.RangedAccessStatus.Completed
+        match prepared.outcome with
+        | .error error => status := .RangeMapFailure error
+        | .ok _ =>
+          for cursor in [:prepared.positions.size] do
+            if status == .Completed then
+              match prepared.positions[cursor]?, prepared.segments[cursor]? with
+              | some position, some segment =>
+                let tree : Miri.TreeBorrows.Tree.NormalTreeState :=
+                  { topology := topo, defaultStates := defs, protectedNodes := prots, locationStates := segment.data }
+                let result := tree.performAccess start kind mode
+                let mutation := currentMap.setAtPos position result.tree.locationStates
+                currentMap := mutation.state
+                visited := visited.push ⟨segment.range, result⟩
+                match mutation.outcome with
+                | .error error => status := .LocationMapFailure segment.range error
+                | .ok _ =>
+                  if result.status != .Completed then
+                    status := .AccessFailure segment.range result.status
+              | _, _ =>
+                status := .RangeMapFailure (.indexOutOfBounds cursor prepared.positions.size)
+        return {
+          state := { topology := topo, defaultStates := defs, protectedNodes := prots, locations := currentMap }
+          locations := visited
+          status := status
+        }) := rfl
+  rw [hstep, hiter]
+  simp +zetaHave only [Id.run, bind, Bind.bind, pure, Pure.pure,
+    Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+    Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+  cases hstat :
+    (({ topology := topo, defaultStates := defs, protectedNodes := prots, locationStates := locs } :
+      Miri.TreeBorrows.Tree.NormalTreeState).performAccess start kind mode).status <;>
+    simp [hstat, hset, bind, Bind.bind, pure, Pure.pure]
+
+end RangedOperational
 
 end LeanMiriSpec.Correspondence

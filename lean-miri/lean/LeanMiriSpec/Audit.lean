@@ -9462,6 +9462,104 @@ example (allBorrows borrows : List BorrowEntry)
   @invalidateTreeBorrowsAtProj_preserves_rel allBorrows borrows targetLocal
     writerTag writeProj writeRangeOff writeRangeLen activeProtectors hnodup
 
+example (retagKind : RetagKind) (mutability : Mutability) (pointee : RigidTy) :
+    retagPerm retagKind mutability pointee =
+      annealRetagPerm (retagKindToAnnealMode retagKind) mutability
+        (rigidTyIsFreeze 16 pointee) :=
+  @annealRetagPerm_eq_retagPerm retagKind mutability pointee
+
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    let rootTree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let facts : Miri.TreeBorrows.RetagPolicy.TypeFacts :=
+      { isUnpin := true, isUnsafeUnpin := true, isFreeze := frozen }
+    let perm := annealRetagPerm mode mutability frozen
+    ∃ policy st,
+      Miri.TreeBorrows.RetagPolicy.create facts (annealRefKindToMiri mutability)
+        (annealRetagModeToMiri mode) ⟨false, false⟩ = some policy ∧
+      Miri.TreeBorrows.RetagPolicy.initialLocationState policy frozen = .ok st ∧
+      let inside := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) st
+      let child := rootTree.newChild Miri.ABI.Size.ZERO (.concrete retagParentTag)
+        retagChildTag inside policy.outsidePermission policy.protector.isSome
+      child.outcome = .ok () ∧
+      child.tree.nthParent retagChildTag 1 = .ok retagParentTag ∧
+      (borrowTreeTagLocationState child.tree retagChildTag).map
+          (fun s => (s.permission, s.accessed)) =
+        some (annealPermToMiri perm, annealPermToMiri perm != .Cell) :=
+  @borrowTree_newChild_reference_simulation mode mutability frozen
+
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest Miri.ABI.Size.ZERO mode mutability frozen)
+    res.outcome = .ok (some (.concrete retagTestAllocId retagChildTag)) ∧
+    res.state.global.protectedTags.contains retagChildTag = (mode == .fnEntry) ∧
+    res.state.frame.protectedTags =
+      (if mode == .fnEntry then #[(retagTestAllocId, retagChildTag)] else #[]) ∧
+    (res.state.global.endCall res.state.frame).protectedTags.contains retagChildTag = false ∧
+    Miri.TreeBorrows.RetagPipeline.Event.childInserted retagChildTag ∈ res.events.toList ∧
+    (res.state.memory.live.find? fun e => e.1 == retagTestAllocId).bind
+        (fun e => (e.2.allocation.extra.nthParent retagChildTag 1).toOption) =
+      some retagParentTag :=
+  @retagPointerValue_zst_reference_simulation mode mutability frozen
+
+example (mode : AnnealRetagMode) :
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest (Miri.ABI.Size.ofBytes 8) mode .not false)
+    res.outcome = .ok (some (.concrete retagTestAllocId retagChildTag)) ∧
+    res.state.global.protectedTags.contains retagChildTag = (mode == .fnEntry) ∧
+    res.state.frame.protectedTags =
+      (if mode == .fnEntry then #[(retagTestAllocId, retagChildTag)] else #[]) ∧
+    (res.state.global.endCall res.state.frame).protectedTags.contains retagChildTag = false ∧
+    (∀ k r, Miri.TreeBorrows.RetagPipeline.Event.parentTreeAccess k r ∉ res.events.toList) ∧
+    Miri.TreeBorrows.RetagPipeline.Event.childInserted retagChildTag ∈ res.events.toList ∧
+    (res.state.memory.live.find? fun e => e.1 == retagTestAllocId).bind
+        (fun e => (e.2.allocation.extra.nthParent retagChildTag 1).toOption) =
+      some retagParentTag ∧
+    (liveTagLocationState res.state.memory retagChildTag).map
+        (fun s => (s.permission, s.accessed)) =
+      some (.Cell, false) :=
+  @retagPointerValue_cell_8byte_simulation mode
+
+example (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let res := (hooksTwoNodeTree perm).performNormalAccessAt (hooksLocTree perm)
+      (hooksAccessIndex rel) (annealAccessKindToMiri kind)
+      (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed
+    let out := treeBorrowNodeAccess kind rel perm isProtected
+    let dummy : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := perm }
+    res.outcome = .ok () ∧
+    (res.access.status = .Completed ↔ treeBorrowTransitionIsUB out = false) ∧
+    (res.access.status = .Completed →
+      (res.location.perms.get ⟨1⟩).map (·.permission) =
+        some (annealPermToMiri (applyTreeBorrowTransition dummy out).perm)) :=
+  @borrowTree_performNormalAccessAt_simulation kind rel perm isProtected
+
+example (isProtected : Bool) :
+    let tree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let mem := liveTreeMemory tree
+    let alloc := liveTreeAllocation tree
+    let ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance) :=
+      ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId retagParentTag)⟩
+    let range := Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+    let res := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite
+      mem ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      alloc ptr retagTestAllocId (.concrete retagParentTag) range
+    res.outcome = .ok () ∧ res.memory = mem :=
+  @machineMemoryHooks_fresh_root_write_simulation isProtected
+
+example (size : Miri.ABI.Size) (hpos : size.bytes ≠ 0)
+    (borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (start : Nat) (kind : Miri.TreeBorrows.AccessKind)
+    (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode) :
+    let nt := basedNormalTree borrows activeProtectors
+    let rt := Miri.TreeBorrows.Tree.RangedNormalTreeState.new size
+      nt.topology nt.defaultStates nt.protectedNodes nt.locationStates
+    let nres := nt.performAccess start kind mode
+    let rres := rt.performAccessRange Miri.ABI.Size.ZERO size start kind mode
+    rres.locations = #[⟨⟨0, size.bytes⟩, nres⟩] ∧
+    (rres.status = .Completed ↔ nres.status = .Completed) ∧
+    rres.state.locations = Miri.DataStructures.DedupRangeMap.new size nres.tree.locationStates :=
+  @rangedNormalTree_performAccessRange_simulation size hpos borrows activeProtectors start kind mode
+
 open LeanMiriSpec.Correspondence.SimLM3_3 in
 example (perm : TreeBorrowPerm) (isProtected : Bool) :
     TreeBorrowsRel (childState perm isProtected).memory.borrows (activeOf isProtected)
@@ -9517,6 +9615,35 @@ example (childPerm : TreeBorrowPerm) (isProtected : Bool) :
         (activeOf isProtected)).performAccess 1 .Write .VisitChildrenOfAccessed) :=
   @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_reborrow_parent_write_invalidates_child_step
     childPerm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability) (frozen : Bool) :
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability frozen
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let siblingPerm := match childPerm with | .cell => TreeBorrowPerm.unique | _ => .frozen
+    let activeProts := match rk with | .fnEntry => [2] | _ => []
+    ∃ s' : MachineState,
+      stepMirFn (retagRefBody rk mutability frozen) retagRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt, entry 2 siblingPerm, entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_ref_step rk mutability frozen
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    match rk with
+    | .raw =>
+      ∃ s' : MachineState,
+        stepMirFn (retagRawBody rk mutability) (childState perm isProtected) = .step s' ∧
+        s'.memory = (childState perm isProtected).memory ∧
+        get? s'.frame.locals 2 = some (.init (.ptr ⟨1, 0⟩ 8))
+    | .default | .twoPhase | .fnEntry =>
+      stepMirFn (retagRawBody rk mutability) (childState perm isProtected) = .fail .ub :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_raw_step rk mutability perm isProtected
 
 open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
 example :
@@ -9693,6 +9820,22 @@ open LeanMiriSpec.Correspondence in
   annealRetagModeToMiri
   annealRetagPerm
   annealRefKindToMiri
+  retagKindToAnnealMode
+  retagTestAllocId
+  retagParentTag
+  retagChildTag
+  baseRetagAllocation
+  liveTreeAllocation
+  liveTreeMemory
+  borrowTreeTagLocationState
+  liveTagLocationState
+  retagInitialMachineState
+  retagRefRequest
+  hooksLocTree
+  hooksTwoNodes
+  hooksTwoNodeTree
+  hooksForChildProtected
+  hooksAccessIndex
   traversalAncestorPathAux
   traversalForeignPostorder
   borrowIndexOfTag
@@ -9715,6 +9858,10 @@ open LeanMiriSpec.Correspondence in
   SimLM3_3.childState
   SimLM3_3.foreignState
   SimLM3_3.reborrowHierarchyState
+  SimLM3_3.retagPointeeTy
+  SimLM3_3.retagRefBody
+  SimLM3_3.retagRefState
+  SimLM3_3.retagRawBody
   WitnessLM3_3.bodyA
   WitnessLM3_3.bodyB
   WitnessLM3_3.bodyC
@@ -9738,10 +9885,16 @@ open LeanMiriSpec.Correspondence in
   reservedFrz_conflicted_bijection
   reservedFrz_conflicted_protected_foreign
   annealRetagPerm_eq_trusted
+  annealRetagPerm_eq_retagPerm
   retag_pipeline_simulation
   miri_fnEntry_policy_never_reservedIM
   retagPointerValue_associatedAccess_simulation
   retagPointerValue_rawPointer_simulation
+  borrowTree_newChild_reference_simulation
+  retagPointerValue_zst_reference_simulation
+  retagPointerValue_cell_8byte_simulation
+  borrowTree_performNormalAccessAt_simulation
+  machineMemoryHooks_fresh_root_write_simulation
   ancestorPath_eq_traversalAncestorPathAux
   traversalForeignPostorder_foreign
   traverse_local_then_foreign
@@ -9773,12 +9926,15 @@ open LeanMiriSpec.Correspondence in
   basedNormalTree_rel
   freezeTreeBorrowsOnReadAtProj_preserves_rel
   invalidateTreeBorrowsAtProj_preserves_rel
+  rangedNormalTree_performAccessRange_simulation
   SimLM3_3.sim_lm3_3_child_write_step
   SimLM3_3.sim_lm3_3_child_read_step
   SimLM3_3.sim_lm3_3_foreign_write_step
   SimLM3_3.sim_lm3_3_foreign_read_step
   SimLM3_3.sim_lm3_3_reborrow_child_write_step
   SimLM3_3.sim_lm3_3_reborrow_parent_write_invalidates_child_step
+  SimLM3_3.sim_lm3_3_retag_ref_step
+  SimLM3_3.sim_lm3_3_retag_raw_step
   WitnessLM3_3.wit_lm3_3_reborrow_hierarchy_real_steps
   WitnessLM3_3.wit_lm3_3_protected_conflict_ub_real_steps
   WitnessLM3_3.wit_lm3_3_protected_unique_foreign_read_ub_real_steps
