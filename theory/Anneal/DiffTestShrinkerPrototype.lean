@@ -1135,6 +1135,44 @@ theorem bvAshrOverflowing_snd_eq_true_iff {w : Nat} (lhs rhs : BitVec w) :
     unfold bvAshrOverflowing
     split <;> simp [Nat.not_lt.mp h]
 
+/-! ### Agreement with Rust's `overflowing_shl` / `overflowing_shr`
+
+Every MIR integer type has a power-of-two width `w = 2^k`. Rust's
+`overflowing_shl` / `overflowing_shr` (and MIR's wrapping `Shl` / `Shr`) shift by
+`rhs & (BITS - 1)` and report overflow iff `rhs >= BITS`; for such widths the
+overflowing companions compute exactly that. -/
+
+theorem bvShlOverflowing_eq_rust_mask {k : Nat} (lhs rhs : BitVec (2 ^ k)) :
+    bvShlOverflowing lhs rhs =
+      (lhs <<< (rhs.toNat &&& (2 ^ k - 1)), decide (2 ^ k ≤ rhs.toNat)) := by
+  rw [bvShlOverflowing_eq_of_pos lhs rhs (Nat.two_pow_pos k), Nat.and_two_pow_sub_one_eq_mod]
+
+theorem bvLshrOverflowing_eq_rust_mask {k : Nat} (lhs rhs : BitVec (2 ^ k)) :
+    bvLshrOverflowing lhs rhs =
+      (lhs >>> (rhs.toNat &&& (2 ^ k - 1)), decide (2 ^ k ≤ rhs.toNat)) := by
+  rw [bvLshrOverflowing_eq_of_pos lhs rhs (Nat.two_pow_pos k), Nat.and_two_pow_sub_one_eq_mod]
+
+theorem bvAshrOverflowing_eq_rust_mask {k : Nat} (lhs rhs : BitVec (2 ^ k)) :
+    bvAshrOverflowing lhs rhs =
+      (BitVec.sshiftRight lhs (rhs.toNat &&& (2 ^ k - 1)), decide (2 ^ k ≤ rhs.toNat)) := by
+  rw [bvAshrOverflowing_eq_of_pos lhs rhs (Nat.two_pow_pos k), Nat.and_two_pow_sub_one_eq_mod]
+
+/-- `u64::overflowing_shl`: shift by `rhs & 63`, overflow iff `rhs ≥ 64`. -/
+theorem bvShlOverflowing_u64_eq_rust_mask (lhs rhs : BitVec 64) :
+    bvShlOverflowing lhs rhs = (lhs <<< (rhs.toNat &&& 63), decide (64 ≤ rhs.toNat)) :=
+  bvShlOverflowing_eq_rust_mask (k := 6) lhs rhs
+
+/-- `u128::overflowing_shl`: shift by `rhs & 127`, overflow iff `rhs ≥ 128`. -/
+theorem bvShlOverflowing_u128_eq_rust_mask (lhs rhs : BitVec 128) :
+    bvShlOverflowing lhs rhs = (lhs <<< (rhs.toNat &&& 127), decide (128 ≤ rhs.toNat)) :=
+  bvShlOverflowing_eq_rust_mask (k := 7) lhs rhs
+
+/-- `i64::overflowing_shr` (arithmetic): shift by `rhs & 63`, overflow iff `rhs ≥ 64`. -/
+theorem bvAshrOverflowing_u64_eq_rust_mask (lhs rhs : BitVec 64) :
+    bvAshrOverflowing lhs rhs =
+      (BitVec.sshiftRight lhs (rhs.toNat &&& 63), decide (64 ≤ rhs.toNat)) :=
+  bvAshrOverflowing_eq_rust_mask (k := 6) lhs rhs
+
 /-! ## Part 3: Concrete Kernel Regression Witnesses (Zero `native_decide`) -/
 
 /-- Wide `BitVec 64` shifts with exponent `2^32` (`4294967296`) evaluate cleanly
@@ -1281,6 +1319,106 @@ theorem bvAshrOverflowing_u128_exp_2pow40 :
 theorem bvAshrOverflowing_u128_exp_2pow64_plus_13_masks_to_13 :
     bvAshrOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 64 + 13)) =
       (BitVec.ofNat 128 (2 ^ 128 - 2 ^ 114), true) := by rfl
+
+/-! ### Signed, boundary, odd-width, and zero-width corner cases -/
+
+/-- A negative signed shift amount (`-1`, i.e. all ones in two's complement) is out
+of range, and the overflowing companion masks it to `63` with the flag raised. -/
+theorem bvShlSafe_u64_neg_one_amount :
+    bvShlSafe (BitVec.ofNat 64 1) (BitVec.ofInt 64 (-1)) = none := by rfl
+
+theorem bvShlOverflowing_u64_neg_one_amount :
+    bvShlOverflowing (BitVec.ofNat 64 1) (BitVec.ofInt 64 (-1)) =
+      (BitVec.ofNat 64 (2 ^ 63), true) := by rfl
+
+/-- Shift amount exactly equal to the width is rejected; `w - 1` is accepted. -/
+theorem bvLshrSafe_u8_amount_eq_width :
+    bvLshrSafe (BitVec.ofNat 8 0xFF) (BitVec.ofNat 8 8) = none := by rfl
+
+theorem bvLshrSafe_u8_amount_width_sub_one :
+    bvLshrSafe (BitVec.ofNat 8 0xFF) (BitVec.ofNat 8 7) = some (BitVec.ofNat 8 1) := by rfl
+
+/-- `i8::MIN >> 7` (arithmetic) is `-1`; `i8::MIN >> 8` overflows and masks to `>> 0`. -/
+theorem bvAshrSafe_i8_min_by_7 :
+    bvAshrSafe (BitVec.ofInt 8 (-128)) (BitVec.ofNat 8 7) = some (BitVec.ofInt 8 (-1)) := by rfl
+
+theorem bvAshrOverflowing_i8_min_by_8 :
+    bvAshrOverflowing (BitVec.ofInt 8 (-128)) (BitVec.ofNat 8 8) =
+      (BitVec.ofInt 8 (-128), true) := by rfl
+
+/-- Width `33` is the smallest width admitting an exponent `2^32`: the guarded shift
+refuses it, and the overflowing companion uses `2^32 % 33 = 4`. -/
+theorem bvShlSafe_u33_exp_2pow32 :
+    bvShlSafe (BitVec.ofNat 33 1) (BitVec.ofNat 33 (2 ^ 32)) = none := by rfl
+
+theorem bvShlOverflowing_u33_exp_2pow32 :
+    bvShlOverflowing (BitVec.ofNat 33 1) (BitVec.ofNat 33 (2 ^ 32)) =
+      (BitVec.ofNat 33 16, true) := by rfl
+
+/-- Degenerate width `0`: every shift is refused / flagged and the operand is kept. -/
+theorem bvShlSafe_width_zero : bvShlSafe (0 : BitVec 0) 0 = none := by rfl
+
+theorem bvShlOverflowing_width_zero : bvShlOverflowing (0 : BitVec 0) 0 = (0, true) := by rfl
+
+/-! ## Part 3b: Compiled-Code Regression Guards
+
+The `by rfl` witnesses above are checked by the kernel. The abort this module guards
+against happens in the *runtime*: in this toolchain, `#eval` of the unguarded
+`(BitVec.ofNat 64 1) <<< (2 ^ 32 : Nat)` terminates the Lean process with
+`INTERNAL PANIC: Nat.shiftl exponent is too big`, because `BitVec.shiftLeft x s`
+computes `x.toNat <<< s` before truncating. Each `#guard` below evaluates a guarded
+operation in the interpreter, so removing or weakening a guard makes elaboration of
+this very file abort instead of silently passing. -/
+
+#guard bvShlSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 32)) == none
+#guard bvShlSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 40)) == none
+#guard bvShlSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 64 + 13)) == some (BitVec.ofNat 64 0x2000)
+#guard bvLshrSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 32)) == none
+#guard bvLshrSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 40)) == none
+#guard bvLshrSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 64 + 13)) == some (BitVec.ofNat 64 (2 ^ 50))
+#guard bvAshrSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 32)) == none
+#guard bvAshrSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 40)) == none
+#guard bvAshrSafe wideLhs64 (BitVec.ofNat 64 (2 ^ 64 + 13)) ==
+  some (BitVec.ofNat 64 0xFFFC_0000_0000_0000)
+#guard bvShlOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 32)) == (wideLhs64, true)
+#guard bvShlOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 40)) == (wideLhs64, true)
+#guard bvShlOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 64 + 13)) ==
+  (BitVec.ofNat 64 0x2000, false)
+#guard bvLshrOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 32)) == (wideLhs64, true)
+#guard bvLshrOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 40)) == (wideLhs64, true)
+#guard bvLshrOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 64 + 13)) ==
+  (BitVec.ofNat 64 (2 ^ 50), false)
+#guard bvAshrOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 32)) == (wideLhs64, true)
+#guard bvAshrOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 40)) == (wideLhs64, true)
+#guard bvAshrOverflowing wideLhs64 (BitVec.ofNat 64 (2 ^ 64 + 13)) ==
+  (BitVec.ofNat 64 0xFFFC_0000_0000_0000, false)
+#guard bvShlSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 32)) == none
+#guard bvShlSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 40)) == none
+#guard bvShlSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 64 + 13)) == none
+#guard bvLshrSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 32)) == none
+#guard bvLshrSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 40)) == none
+#guard bvLshrSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 64 + 13)) == none
+#guard bvAshrSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 32)) == none
+#guard bvAshrSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 40)) == none
+#guard bvAshrSafe wideLhs128 (BitVec.ofNat 128 (2 ^ 64 + 13)) == none
+#guard bvShlOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 32)) == (wideLhs128, true)
+#guard bvShlOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 40)) == (wideLhs128, true)
+#guard bvShlOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 64 + 13)) ==
+  (BitVec.ofNat 128 0x2000, true)
+#guard bvLshrOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 32)) == (wideLhs128, true)
+#guard bvLshrOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 40)) == (wideLhs128, true)
+#guard bvLshrOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 64 + 13)) ==
+  (BitVec.ofNat 128 (2 ^ 114), true)
+#guard bvAshrOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 32)) == (wideLhs128, true)
+#guard bvAshrOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 40)) == (wideLhs128, true)
+#guard bvAshrOverflowing wideLhs128 (BitVec.ofNat 128 (2 ^ 64 + 13)) ==
+  (BitVec.ofNat 128 (2 ^ 128 - 2 ^ 114), true)
+#guard bvShlSafe (BitVec.ofNat 64 1) (BitVec.ofInt 64 (-1)) == none
+#guard bvShlOverflowing (BitVec.ofNat 64 1) (BitVec.ofInt 64 (-1)) ==
+  (BitVec.ofNat 64 (2 ^ 63), true)
+#guard bvShlSafe (BitVec.ofNat 33 1) (BitVec.ofNat 33 (2 ^ 32)) == none
+#guard bvShlOverflowing (BitVec.ofNat 33 1) (BitVec.ofNat 33 (2 ^ 32)) ==
+  (BitVec.ofNat 33 16, true)
 
 /-- Concrete kernel execution of `shrinkMutatorChain` reducing a 5-step mutator chain
 down to its 2-step 1-minimal subsequence `[2, 4]`. -/

@@ -2500,6 +2500,156 @@ mod tests {
     }
 
     #[test]
+    fn shrinks_3_mutator_chain_to_single_mutator_rejecting_compile_class_and_tag_changes() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let (cand3, subsets) = find_candidate_with_distinct_subsets(3, &seed_refs);
+        let names = cand3.applied_mutators.clone();
+        let oob = |size: u32, end: u32| {
+            format!(
+                "out-of-bounds pointer arithmetic: alloc{size}{end} has size {size}, so pointer \
+                 to {end} bytes starting at offset 0 is out-of-bounds"
+            )
+        };
+        let original = missed_ub_report(&cand3.fn_name, 88, &oob(16, 20), AnnealOutcome::PassUnit, true);
+
+        // Subset semantics (bit i = original pass i kept; pass 1 is the fault mutator):
+        //   {0, 1} -> does not compile (must never reach the oracle),
+        //   {0}    -> diverges with a different class (`ub_location_mismatch`),
+        //   {2}    -> same class, but Anneal panics (normalized tag changes),
+        //   {1, 2} -> same signature with shifted lines / digits (accepted),
+        //   {1}    -> same signature with shifted lines / digits (accepted, 1-minimal),
+        //   {} and {0, 2} -> agree.
+        let compile_calls = RefCell::new(Vec::<u32>::new());
+        let oracle_calls = RefCell::new(Vec::<u32>::new());
+        let res = minimize_miri_candidate_mutations_with_compile_check(
+            &cand3,
+            &seed_refs,
+            &original,
+            |sub| {
+                let mask = subsets[&sub.fn_source];
+                compile_calls.borrow_mut().push(mask);
+                mask != 0b011
+            },
+            |sub| {
+                let mask = subsets[&sub.fn_source];
+                assert_ne!(mask, 0b011, "non-compiling subsequence reached the oracle");
+                assert_ne!(mask, 0b111, "the full chain must never be re-evaluated");
+                oracle_calls.borrow_mut().push(mask);
+                let name = sub.fn_name.as_str();
+                Some(match mask {
+                    0b110 => missed_ub_report(name, 61, &oob(8, 12), AnnealOutcome::PassUnit, true),
+                    0b010 => missed_ub_report(name, 34, &oob(4, 8), AnnealOutcome::PassUnit, true),
+                    0b001 => ItemOracleReport {
+                        name: name.to_string(),
+                        fuel: MIRI_DIFFTEST_CANDIDATE_FUEL,
+                        miri: MiriOutcome::Ub {
+                            pos: Some(lib_pos(30, 14)),
+                            message: oob(16, 20),
+                        },
+                        anneal: AnnealOutcome::Ub {
+                            span: Some(lib_span(31)),
+                        },
+                        verdict: ComparisonVerdict::Diverge(DivergenceKind::UbLocationMismatch {
+                            miri_pos: Some(lib_pos(30, 14)),
+                            miri_msg: oob(16, 20),
+                            anneal_span: Some(lib_span(31)),
+                        }),
+                        kernel_confirmed: true,
+                    },
+                    0b100 => missed_ub_report(
+                        name,
+                        40,
+                        &oob(16, 20),
+                        AnnealOutcome::Panic {
+                            span: Some(lib_span(41)),
+                        },
+                        true,
+                    ),
+                    _ => agree_report(name),
+                })
+            },
+        );
+
+        assert_eq!(res.status, MiriShrinkStatus::Minimized);
+        assert_eq!(res.original_mutator_chain, names);
+        assert_eq!(res.minimized_mutator_chain, vec![names[1].clone()]);
+        assert_eq!(subsets[&res.minimized_candidate.fn_source], 0b010);
+        assert_eq!(
+            res.minimized_report.miri,
+            MiriOutcome::Ub {
+                pos: Some(lib_pos(34, 14)),
+                message: oob(4, 8),
+            }
+        );
+        let compile_calls = compile_calls.into_inner();
+        let oracle_calls = oracle_calls.into_inner();
+        assert!(compile_calls.contains(&0b011), "{{0, 1}} must be rejected by the compile check");
+        assert!(oracle_calls.contains(&0b001), "class-changing {{0}} must be judged and rejected");
+        assert!(oracle_calls.contains(&0b100), "tag-changing {{2}} must be judged and rejected");
+        assert!(oracle_calls.contains(&0b110), "{{1, 2}} must be accepted on the way to {{1}}");
+        assert!(oracle_calls.contains(&0b000), "the unmutated seed `[]` must be evaluated");
+        assert_eq!(res.compile_rejections, compile_calls.iter().filter(|&&m| m == 0b011).count());
+        assert_eq!(res.oracle_evaluations, oracle_calls.len());
+        assert_eq!(res.shrink_evaluations, compile_calls.len());
+    }
+
+    /// `minimize_miri_candidate_mutations_with` (the brief's public entry point) runs the
+    /// real `rustc` pre-check before every oracle call.
+    #[test]
+    fn minimize_with_runs_the_real_rustc_precheck_before_each_oracle_call() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let mut chosen: Option<(GeneratedMiriCandidate, BTreeMap<String, u32>)> = None;
+        'search: for batch_seed in 1u64..64 {
+            for cand in generate_miri_corpus_batch(24, 0x5EED_0000 + batch_seed, 0) {
+                if cand.applied_mutators.len() != 2 {
+                    continue;
+                }
+                let Some(map) = subset_source_map(&cand, &seed_refs) else {
+                    continue;
+                };
+                let (base, steps) =
+                    extract_candidate_mutation_steps(&cand, &seed_refs).expect("steps");
+                let all_compile = (0u32..3).all(|mask| {
+                    let sub: Vec<RecordedMutationStep> = steps
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| (mask >> i) & 1 == 1)
+                        .map(|(_, s)| s.clone())
+                        .collect();
+                    let replayed = replay_candidate_mutation_steps(&cand, &base, &sub);
+                    compile_rust_snippet(&format!("precheck_{mask}_{}", cand.fn_name), &replayed.source)
+                });
+                if all_compile {
+                    chosen = Some((cand, map));
+                    break 'search;
+                }
+            }
+        }
+        let (cand, subsets) = chosen.expect("2-mutator candidate whose proper subsets all compile");
+        let msg = "constructing invalid value: encountered 0x02, but expected a boolean";
+        let original = missed_ub_report(&cand.fn_name, 50, msg, AnnealOutcome::PassUnit, true);
+        let mut oracle_masks: Vec<u32> = Vec::new();
+        let res = minimize_miri_candidate_mutations_with(&cand, &seed_refs, &original, |sub| {
+            let mask = subsets[&sub.fn_source];
+            oracle_masks.push(mask);
+            Some(if mask == 0b01 {
+                missed_ub_report(&sub.fn_name, 30, msg, AnnealOutcome::PassUnit, true)
+            } else {
+                agree_report(&sub.fn_name)
+            })
+        });
+        assert_eq!(res.status, MiriShrinkStatus::Minimized);
+        assert_eq!(res.minimized_mutator_chain, vec![cand.applied_mutators[0].clone()]);
+        assert_eq!(subsets[&res.minimized_candidate.fn_source], 0b01);
+        assert!(oracle_masks.contains(&0b00), "the unmutated seed `[]` must be evaluated");
+        assert_eq!(res.compile_rejections, 0, "every proper subsequence compiles");
+        assert_eq!(res.oracle_evaluations, oracle_masks.len());
+        assert_eq!(res.shrink_evaluations, oracle_masks.len());
+    }
+
+    #[test]
     fn unmutated_seed_with_same_signature_shrinks_to_empty_chain_after_one_oracle_run() {
         let seed_sources = corpus_seed_sources();
         let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();

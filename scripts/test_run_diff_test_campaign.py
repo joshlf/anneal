@@ -77,6 +77,69 @@ def _make_valid_miri_summary() -> dict[str, object]:
     }
 
 
+def _with_consistent_item_outcomes(
+    summary: dict[str, object], direct_call: str = "unsupported"
+) -> dict[str, object]:
+    """Attaches `item_outcomes` (real `summary_tag` formats, including the
+    `file:l:c: l:c` span rendering) consistent with `_make_valid_miri_summary`'s counts:
+    5 agreeing passes, 1 agreeing panic, 1 agreeing UB, and 1 not-compared item whose
+    Anneal outcome is `direct_call` (`"unsupported"`, `"external_call"`, or `"agree"`)."""
+    items: dict[str, dict[str, str]] = {
+        f"pass_item_{i}": {
+            "verdict": "agree",
+            "miri_outcome": f"pass:scalar:{i}:4",
+            "anneal_outcome": f"pass:scalar:{i}:4",
+            "anneal_lean_tag": f"(MirDiffTag.normalScalar {i} 4)",
+        }
+        for i in range(5)
+    }
+    items["panic_item"] = {
+        "verdict": "agree",
+        "miri_outcome": "panic@/tmp/anneal_miri_eval_seeded/src/lib.rs:30:7",
+        "anneal_outcome": "panic@src/lib.rs:30:5: 30:12",
+        "anneal_lean_tag": "MirDiffTag.panic",
+    }
+    items["ub_item"] = {
+        "verdict": "agree",
+        "miri_outcome": "ub@src/lib.rs:41:14",
+        "anneal_outcome": "ub@src/lib.rs:41:9: 41:20",
+        "anneal_lean_tag": "MirDiffTag.ub",
+    }
+    if direct_call == "unsupported":
+        items["pass_direct_fn_call"] = {
+            "verdict": "not_compared",
+            "miri_outcome": "pass:scalar:42:4",
+            "anneal_outcome": "unsupported@src/lib.rs:50:5: 50:20",
+            "anneal_lean_tag": "MirDiffTag.unsupported",
+        }
+    elif direct_call == "external_call":
+        items["pass_direct_fn_call"] = {
+            "verdict": "not_compared",
+            "miri_outcome": "pass:scalar:42:4",
+            "anneal_outcome": "externalCall:miri_diff_corpus::helper_add_ten",
+            "anneal_lean_tag": '(MirDiffTag.externalCall "miri_diff_corpus::helper_add_ten")',
+        }
+        summary["anneal_outcomes"]["unsupported"] = 0  # type: ignore[index]
+        summary["anneal_outcomes"]["external_call"] = 1  # type: ignore[index]
+        summary["not_compared_reasons"]["unsupported"] = 0  # type: ignore[index]
+        summary["not_compared_reasons"]["external_call"] = 1  # type: ignore[index]
+    else:
+        items["pass_direct_fn_call"] = {
+            "verdict": "agree",
+            "miri_outcome": "pass:scalar:42:4",
+            "anneal_outcome": "pass:scalar:42:4",
+            "anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
+        }
+        summary["anneal_outcomes"]["unsupported"] = 0  # type: ignore[index]
+        summary["anneal_outcomes"]["pass"] = 6  # type: ignore[index]
+        summary["not_compared_reasons"]["unsupported"] = 0  # type: ignore[index]
+        summary["not_compared_count"] = 0
+        summary["compared_candidates"] = 8
+        summary["agree_count"] = 8
+    summary["item_outcomes"] = items
+    return summary
+
+
 class StaleRatchetGateTest(unittest.TestCase):
     def test_real_manifest_and_valid_quarantine_pass(self) -> None:
         repo_root = SCRIPT_DIR.parent
@@ -600,6 +663,74 @@ class ErrorBoundaryAccountingTest(unittest.TestCase):
         self.assertFalse(ok0)
         self.assertTrue(any("oracle_errors_exceeded: 1 errored items" in r for r in reasons0))
 
+    def test_item_outcome_audit_accepts_consistent_real_format_summary(self) -> None:
+        summary = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        self.assertEqual(campaign.audit_item_outcomes_against_summary(summary), [])
+        ok, reasons = campaign.validate_error_vs_unsupported_boundary(summary)
+        self.assertTrue(ok, reasons)
+        rf = campaign.evaluate_miri_red_flags(summary, 0x5EED0001, {}, 50.0, 0)
+        self.assertTrue(rf.passed, rf.failure_reasons)
+
+    def test_item_outcome_audit_catches_capture_error_hidden_in_unsupported(self) -> None:
+        # Every aggregate invariant holds (the harness even "counted" the item as an
+        # Anneal `unsupported` outcome); only the per-item recomputation sees that the
+        # reported Anneal outcome is a capture / Lean crash.
+        summary = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        summary["item_outcomes"]["pass_direct_fn_call"]["anneal_outcome"] = (  # type: ignore[index]
+            "capture_error:INTERNAL PANIC: Nat.shiftl exponent is too big"
+        )
+        ok, reasons = campaign.validate_error_vs_unsupported_boundary(summary, max_oracle_errors=5)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any(
+                r.startswith("error_masked_as_unsupported: not_compared_reasons.capture_failed")
+                for r in reasons
+            ),
+            reasons,
+        )
+        self.assertTrue(
+            any(r.startswith("item_accounting_mismatch: not_compared_reasons.unsupported") for r in reasons),
+            reasons,
+        )
+
+    def test_item_outcome_audit_catches_verdict_flips_and_missing_items(self) -> None:
+        summary = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        # A missed UB reported as agreement (and counted as such).
+        summary["item_outcomes"]["ub_item"]["anneal_outcome"] = "pass:unit"  # type: ignore[index]
+        reasons = campaign.audit_item_outcomes_against_summary(summary)
+        self.assertTrue(
+            any("item 'ub_item' reported 'agree'" in r and "diverge:missed_ub" in r for r in reasons),
+            reasons,
+        )
+        self.assertTrue(any("divergence_classes.missed_ub reported 0" in r for r in reasons), reasons)
+        # A dropped item.
+        summary = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        del summary["item_outcomes"]["pass_item_0"]  # type: ignore[attr-defined]
+        reasons = campaign.audit_item_outcomes_against_summary(summary)
+        self.assertTrue(any("covers 7 items but compiled_candidates is 8" in r for r in reasons))
+        ok, _ = campaign.validate_error_vs_unsupported_boundary(summary)
+        self.assertFalse(ok)
+
+    def test_span_parser_matches_harness_rendering_and_file_suffixes(self) -> None:
+        # `SourceSpan::display_short` renders `file:l:c: l:c`; Miri positions may be
+        # absolute paths ending in the span's relative file.
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags(
+                "panic@/tmp/x/src/lib.rs:12:7", "panic@src/lib.rs:12:5: 12:14"
+            ),
+            ("agree", ""),
+        )
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags(
+                "panic@/tmp/x/src/main.rs:12:7", "panic@src/lib.rs:12:5: 12:14"
+            ),
+            ("diverge", "panic_site_mismatch"),
+        )
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("ub@./src/lib.rs:3:1", "ub@src/lib.rs:2:5: 3:9"),
+            ("agree", ""),
+        )
+
     def test_findings_with_not_compared_outcome_tags_are_rejected(self) -> None:
         for anneal_tag in (
             "unsupported@src/lib.rs:4:5:4:9",
@@ -809,16 +940,12 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
                 'summary = "unlinked intra-crate callee"\n',
                 encoding="utf-8",
             )
-            summary = _make_valid_miri_summary()
+            summary = _with_consistent_item_outcomes(
+                _make_valid_miri_summary(), direct_call="external_call"
+            )
             summary["mode"] = "identity"
-            summary["item_outcomes"] = {
-                "pass_direct_fn_call": {
-                    "verdict": "not_compared",
-                    "miri_outcome": "pass:scalar:42:4",
-                    "anneal_outcome": "externalCall:miri_diff_corpus::helper_add_ten",
-                    "anneal_lean_tag": '(MirDiffTag.externalCall "miri_diff_corpus::helper_add_ten")',
-                }
-            }
+            ok, reasons = campaign.validate_error_vs_unsupported_boundary(summary)
+            self.assertTrue(ok, reasons)
             extracted = campaign.extract_manifest_eval_results_from_miri_summary(summary, m_file)
             audit_ok = campaign.verify_no_stale_quarantine_or_known_bugs(
                 manifest_path=m_file,
@@ -828,14 +955,12 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
             self.assertTrue(audit_ok["passed"], audit_ok)
 
             # Now suppose the bug was fixed and `pass_direct_fn_call` agrees in identity mode.
-            summary["item_outcomes"] = {
-                "pass_direct_fn_call": {
-                    "verdict": "agree",
-                    "miri_outcome": "pass:scalar:42:4",
-                    "anneal_outcome": "pass:scalar:42:4",
-                    "anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
-                }
-            }
+            summary = _with_consistent_item_outcomes(
+                _make_valid_miri_summary(), direct_call="agree"
+            )
+            summary["mode"] = "identity"
+            ok, reasons = campaign.validate_error_vs_unsupported_boundary(summary)
+            self.assertTrue(ok, reasons)
             state_dir = Path(tmp) / "state"
             with (
                 mock.patch.object(campaign, "run_harness", return_value=summary),
@@ -866,6 +991,75 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
                     "stale_known_anneal_bug_now_passes" in e["reason"]
                     for e in report["stale_ratchet_audit"]["stale_known_anneal_bugs"]
                 )
+            )
+            # The harness failure is due to the ratchet alone, not to the red flags.
+            self.assertTrue(report["red_flags"]["passed"], report["red_flags"])
+
+    def test_identity_summary_without_item_outcomes_never_fabricates_agree_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "ub_not_evaluated_in_this_run"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "open bug"\n',
+                encoding="utf-8",
+            )
+            # A fully compared identity summary from a harness that does not emit
+            # `item_outcomes`: nothing is known about `ub_not_evaluated_in_this_run`.
+            summary = _make_valid_miri_summary()
+            summary["mode"] = "identity"
+            summary["anneal_outcomes"]["unsupported"] = 0  # type: ignore[index]
+            summary["anneal_outcomes"]["pass"] = 6  # type: ignore[index]
+            summary["not_compared_reasons"]["unsupported"] = 0  # type: ignore[index]
+            summary["not_compared_count"] = 0
+            summary["compared_candidates"] = 8
+            summary["agree_count"] = 8
+            self.assertIsNone(
+                campaign.extract_manifest_eval_results_from_miri_summary(summary, m_file)
+            )
+            audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file,
+                manifest_eval_results=campaign.extract_manifest_eval_results_from_miri_summary(
+                    summary, m_file
+                ),
+                reference_date="2026-11-09",
+            )
+            self.assertTrue(audit["passed"], audit)
+
+            # A divergent identity finding is still reported under its test name.
+            with_finding = dict(summary)
+            with_finding["findings"] = [
+                {
+                    "fn_name": "ub_not_evaluated_in_this_run",
+                    "seed_name": "ub_not_evaluated_in_this_run",
+                    "divergence_class": "missed_ub",
+                    "anneal_outcome": "pass:unit",
+                    "anneal_lean_tag": "MirDiffTag.normalUnit",
+                }
+            ]
+            extracted = campaign.extract_manifest_eval_results_from_miri_summary(with_finding)
+            self.assertEqual(
+                extracted,
+                {
+                    "ub_not_evaluated_in_this_run": {
+                        "verdict": "diverge",
+                        "divergence_class": "missed_ub",
+                        "anneal_outcome": "pass:unit",
+                        "anneal_lean_tag": "MirDiffTag.normalUnit",
+                    }
+                },
+            )
+            mismatch = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file,
+                manifest_eval_results=extracted,
+                reference_date="2026-11-09",
+            )
+            self.assertFalse(mismatch["passed"])
+            self.assertIn(
+                "stale_known_anneal_bug_tag_mismatch",
+                mismatch["stale_known_anneal_bugs"][0]["reason"],
             )
 
     def test_external_call_and_out_of_fuel_error_masking_rejected(self) -> None:

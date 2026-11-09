@@ -953,6 +953,9 @@ def validate_error_vs_unsupported_boundary(
        classification is `unsupported` but whose text carries a crash or
        malformed-input marker (`INTERNAL PANIC`, `SIGABRT`, `capture_failed`,
        `parse error`, `malformed`, ...) is rejected as `error_masked_as_unsupported`.
+    4. When the harness emits `item_outcomes`, every item's verdict is recomputed
+       from its outcome tags (`audit_item_outcomes_against_summary`) and the
+       aggregates must match the recomputation.
     """
     reasons: list[str] = []
     miri_verdicts = summary.get("miri_verdicts")
@@ -1057,8 +1060,15 @@ def validate_error_vs_unsupported_boundary(
                     f"under unsupported"
                 )
 
+    # 4. Per-item recomputation of verdicts from the reported outcome tags (when the
+    #    harness emits `item_outcomes`): catches an error counted as `unsupported` even
+    #    when every aggregate count is internally consistent.
+    reasons.extend(audit_item_outcomes_against_summary(summary))
+
     failed = any(
-        r.startswith(("error_masked_as_unsupported", "error_accounting_mismatch"))
+        r.startswith(
+            ("error_masked_as_unsupported", "error_accounting_mismatch", "item_accounting_mismatch")
+        )
         for r in reasons
     )
     return (not failed and errored_items <= max_oracle_errors), reasons
@@ -1446,21 +1456,23 @@ def extract_manifest_eval_results_from_miri_summary(
 ) -> dict[str, Any] | None:
     """Extracts per-item evaluation verdicts and tags from a `miri-difftest` summary so
     `verify_no_stale_quarantine_or_known_bugs` can audit `manifest.toml` `known_anneal_bug`
-    entries on `--miri-identity --check-stale-ratchet` runs."""
-    results: dict[str, Any] = {}
-    is_identity = miri.get("mode") == "identity"
+    entries on `--miri-identity --check-stale-ratchet` runs.
 
+    Only items the harness actually reported are returned (`item_outcomes`, plus the
+    divergent identity `findings`): a manifest test that was not evaluated is never
+    assumed to agree, because inferring `agree` for unreported names would fabricate
+    `stale_known_anneal_bug_now_passes` verdicts. `manifest_path` is accepted for
+    backward compatibility and is not consulted.
+    """
+    del manifest_path
+    results: dict[str, Any] = {}
     item_outcomes = miri.get("item_outcomes")
     if isinstance(item_outcomes, dict):
         for fn_name, entry in item_outcomes.items():
-            if not isinstance(fn_name, str) or not isinstance(entry, dict):
-                continue
-            results[fn_name] = dict(entry)
-            if is_identity and "__b" in fn_name:
-                seed_key = fn_name.split("__b", 1)[0]
-                results.setdefault(seed_key, dict(entry))
+            if isinstance(fn_name, str) and isinstance(entry, dict):
+                results[fn_name] = dict(entry)
 
-    if is_identity:
+    if miri.get("mode") == "identity":
         findings = miri.get("findings")
         if isinstance(findings, list):
             for f in findings:
@@ -1472,53 +1484,52 @@ def extract_manifest_eval_results_from_miri_summary(
                     "anneal_outcome": str(f.get("anneal_outcome", "")),
                     "anneal_lean_tag": str(f.get("anneal_lean_tag", "")),
                 }
-                for k in ("seed_name", "fn_name"):
-                    name_val = f.get(k)
-                    if isinstance(name_val, str) and name_val.strip():
-                        results[name_val.strip()] = rec
-
-        if (
-            not isinstance(item_outcomes, dict)
-            and _int_field(miri, "not_compared_count") == 0
-            and _int_field(miri, "compile_failed_candidates") == 0
-            and _int_field(miri, "compared_candidates") > 0
-            and manifest_path is not None
-            and manifest_path.is_file()
-        ):
-            try:
-                m_data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-                if isinstance(m_data, dict):
-                    for t_entry in m_data.get("tests", []):
-                        if isinstance(t_entry, dict) and isinstance(t_entry.get("name"), str):
-                            t_name = t_entry["name"].strip()
-                            if t_name and t_name not in results:
-                                results[t_name] = {"verdict": "agree"}
-            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-                pass
+                # Identity candidates are the unmutated corpus seeds: `fn_name` is the
+                # manifest test name.
+                name_val = f.get("fn_name")
+                if isinstance(name_val, str) and name_val.strip():
+                    results.setdefault(name_val.strip(), rec)
 
     return results if results else None
 
 
 def _parse_src_pos(raw: str) -> tuple[str, int, int] | None:
-    """Parses `file:line:col` (a Miri `SourcePos::display_short`)."""
-    parts = raw.rsplit(":", 2)
+    """Parses `file:line:col` (`SourcePos::display_short`)."""
+    parts = [p.strip() for p in raw.rsplit(":", 2)]
     if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
         return None
     return parts[0], int(parts[1]), int(parts[2])
 
 
 def _parse_src_span(raw: str) -> tuple[str, int, int, int, int] | None:
-    """Parses `file:start_line:start_col:end_line:end_col` (`SourceSpan::display_short`)."""
-    parts = raw.rsplit(":", 4)
+    """Parses `SourceSpan::display_short`, which the harness renders as
+    `file:start_line:start_col: end_line:end_col` (note the space); the compact
+    `file:start_line:start_col:end_line:end_col` form is accepted too."""
+    parts = [p.strip() for p in raw.rsplit(":", 4)]
     if len(parts) != 5 or not all(p.isdigit() for p in parts[1:]):
         return None
     return parts[0], int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
 
 
+def _source_files_match(a: str, b: str) -> bool:
+    """Port of `cargo_anneal::source_files_match` (`src/lib.rs` matches an absolute
+    `/tmp/.../src/lib.rs` Miri path)."""
+
+    def _norm(raw: str) -> str:
+        s = raw.replace("\\", "/").strip()
+        return s[2:] if s.startswith("./") else s
+
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    return na == nb or na.endswith(f"/{nb}") or nb.endswith(f"/{na}")
+
+
 def _span_contains_pos(span_raw: str, pos_raw: str) -> bool:
+    """Port of `SourceSpan::contains_pos`."""
     span = _parse_src_span(span_raw)
     pos = _parse_src_pos(pos_raw)
-    if span is None or pos is None or span[0] != pos[0]:
+    if span is None or pos is None or not _source_files_match(span[0], pos[0]):
         return False
     return (span[1], span[2]) <= (pos[1], pos[2]) <= (span[3], span[4])
 
@@ -1571,6 +1582,96 @@ def classify_oracle_outcome_tags(miri_outcome: str, anneal_outcome: str) -> tupl
             return "diverge", "ub_location_mismatch"
         return "diverge", "missed_ub"
     return "not_compared", "miri_oracle_error"
+
+
+def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
+    """Recomputes every reported item's verdict from its Miri / Anneal outcome tags.
+
+    `item_outcomes` (emitted by `miri-difftest`) carries each evaluated item's
+    `verdict` plus the lossless `summary_tag` of both outcomes. Because
+    `classify_oracle_outcome_tags` is an exact port of `compare_miri_and_anneal`, the
+    harness's per-item verdicts and its aggregate `agree_count`, `divergence_classes`,
+    and `not_compared_reasons` must equal the recomputation. A capture/Lean or Miri
+    error that the harness counted anywhere else (for example under `unsupported`) is
+    reported as `error_masked_as_unsupported`; every other disagreement as
+    `item_accounting_mismatch`. Summaries without `item_outcomes` are not audited.
+    """
+    items = summary.get("item_outcomes")
+    if not isinstance(items, dict):
+        return []
+    reasons: list[str] = []
+    agree = 0
+    classes: dict[str, int] = {}
+    nc_counts: dict[str, int] = {}
+    error_reasons = ("miri_oracle_error", "capture_failed")
+    for name, entry in sorted(items.items()):
+        miri_tag = entry.get("miri_outcome") if isinstance(entry, dict) else None
+        anneal_tag = entry.get("anneal_outcome") if isinstance(entry, dict) else None
+        if not isinstance(miri_tag, str) or not isinstance(anneal_tag, str):
+            reasons.append(
+                f"item_accounting_mismatch: item_outcomes[{name!r}] lacks string "
+                f"miri_outcome / anneal_outcome"
+            )
+            continue
+        verdict, detail = classify_oracle_outcome_tags(miri_tag, anneal_tag)
+        reported = str(entry.get("verdict", "")).strip().lower()
+        if reported != verdict:
+            label = (
+                "error_masked_as_unsupported"
+                if verdict == "not_compared" and detail in error_reasons
+                else "item_accounting_mismatch"
+            )
+            reasons.append(
+                f"{label}: item {name!r} reported {reported!r} but its outcomes "
+                f"({miri_tag!r}, {anneal_tag!r}) classify as {verdict}:{detail}"
+            )
+        if verdict == "agree":
+            agree += 1
+        elif verdict == "diverge":
+            classes[detail] = classes.get(detail, 0) + 1
+        else:
+            nc_counts[detail] = nc_counts.get(detail, 0) + 1
+
+    compiled = summary.get("compiled_candidates")
+    if isinstance(compiled, int) and not isinstance(compiled, bool) and len(items) != compiled:
+        reasons.append(
+            f"item_accounting_mismatch: item_outcomes covers {len(items)} items but "
+            f"compiled_candidates is {compiled}"
+        )
+    reported_agree = summary.get("agree_count")
+    if isinstance(reported_agree, int) and reported_agree != agree:
+        reasons.append(
+            f"item_accounting_mismatch: agree_count reported {reported_agree} but item "
+            f"outcomes classify {agree} as agree"
+        )
+    div_map = summary.get("divergence_classes")
+    if isinstance(div_map, dict):
+        for cls in sorted(set(VALID_DIVERGENCE_CLASSES) | set(classes)):
+            rep = _int_field(div_map, cls)
+            rec = classes.get(cls, 0)
+            if rep != rec:
+                reasons.append(
+                    f"item_accounting_mismatch: divergence_classes.{cls} reported {rep} but "
+                    f"item outcomes classify {rec}"
+                )
+    nc_map = summary.get("not_compared_reasons")
+    if isinstance(nc_map, dict):
+        for reason in sorted(set(VALID_NOT_COMPARED_REASONS) | set(nc_counts)):
+            if reason == "compile_failed":
+                continue  # compile failures are never evaluated, so carry no item outcome
+            rep = _int_field(nc_map, reason)
+            rec = nc_counts.get(reason, 0)
+            if rep != rec:
+                label = (
+                    "error_masked_as_unsupported"
+                    if reason in error_reasons and rec > rep
+                    else "item_accounting_mismatch"
+                )
+                reasons.append(
+                    f"{label}: not_compared_reasons.{reason} reported {rep} but item "
+                    f"outcomes classify {rec}"
+                )
+    return reasons
 
 
 def _bump(counts: dict[str, int], key: str) -> None:
@@ -1670,6 +1771,22 @@ def build_simulated_miri_summary(
         "findings": findings,
         "elapsed_ms": 10.0 * DEFAULT_MIN_ORACLE_ELAPSED_MS,
     }
+    item_outcomes: dict[str, Any] = {
+        f"background_{i}": {
+            "verdict": "agree",
+            "miri_outcome": "pass:scalar:1:4",
+            "anneal_outcome": "pass:scalar:1:4",
+            "anneal_lean_tag": "(MirDiffTag.normalScalar 1 4)",
+        }
+        for i in range(background_agreeing)
+    }
+    item_outcomes[f"probe_{probe_id}"] = {
+        "verdict": verdict,
+        "miri_outcome": miri_outcome,
+        "anneal_outcome": anneal_outcome,
+        "anneal_lean_tag": anneal_lean_tag,
+    }
+    summary["item_outcomes"] = item_outcomes
     if diagnostics:
         summary["diagnostics"] = diagnostics
     return summary
@@ -1707,7 +1824,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "description": "Omit bool validRange [0, 1] check on typed scalar load of 2u8 as bool",
         "expected_kill_classes": ("missed_ub",),
         "reference_miri_outcome": "ub@src/lib.rs:5:5",
-        "baseline_anneal_outcome": "ub@src/lib.rs:5:5:5:13",
+        "baseline_anneal_outcome": "ub@src/lib.rs:5:5: 5:13",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
         "mutant_variants": (
             {
@@ -1733,7 +1850,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "description": "Omit allocation liveness / StorageDead deallocation check on raw pointer dereference",
         "expected_kill_classes": ("missed_ub",),
         "reference_miri_outcome": "ub@src/lib.rs:6:14",
-        "baseline_anneal_outcome": "ub@src/lib.rs:6:14:6:24",
+        "baseline_anneal_outcome": "ub@src/lib.rs:6:14: 6:24",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
         "mutant_variants": (
             {
@@ -1760,7 +1877,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "description": "Omit pointer fragment provenance invalidation on partial byte overwrite",
         "expected_kill_classes": ("missed_ub", "false_positive_ub"),
         "reference_miri_outcome": "ub@src/lib.rs:8:9",
-        "baseline_anneal_outcome": "ub@src/lib.rs:8:9:8:11",
+        "baseline_anneal_outcome": "ub@src/lib.rs:8:9: 8:11",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
         "mutant_variants": (
             {
@@ -1790,7 +1907,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "description": "Omit divisor == 0 and INT_MIN / -1 guard in checked integer division",
         "expected_kill_classes": ("panic_vs_return", "wrong_value", "missed_ub"),
         "reference_miri_outcome": "panic@src/lib.rs:4:5",
-        "baseline_anneal_outcome": "panic@src/lib.rs:4:5:4:14",
+        "baseline_anneal_outcome": "panic@src/lib.rs:4:5: 4:14",
         "baseline_anneal_lean_tag": "MirDiffTag.panic",
         "mutant_variants": (
             {
@@ -1815,7 +1932,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "description": "Omit rhs.toNat < w guard on 64/128-bit shift with rhs >= 2^32 (GMP lean_nat_shiftl abort)",
         "expected_kill_classes": ("missed_ub", "harness_error"),
         "reference_miri_outcome": "ub@src/lib.rs:4:14",
-        "baseline_anneal_outcome": "ub@src/lib.rs:4:14:4:36",
+        "baseline_anneal_outcome": "ub@src/lib.rs:4:14: 4:36",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
         "mutant_variants": (
             {
@@ -1827,7 +1944,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
             {
                 # The same abort misreported as an unmodeled construct must still fail.
                 "label": "guard_omitted_abort_masked_as_unsupported",
-                "anneal_outcome": "unsupported@src/lib.rs:4:14:4:36",
+                "anneal_outcome": "unsupported@src/lib.rs:4:14: 4:36",
                 "anneal_lean_tag": "MirDiffTag.unsupported",
                 "diagnostics": (
                     {
