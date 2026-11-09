@@ -11,7 +11,7 @@ those terms. -->
 This document provides exact, copy-pasteable commands to reproduce and verify
 Workstream 4 (`BRIEF-4`, integrating `BRIEF-4.1`, `BRIEF-4.2`, and `BRIEF-4.3`
 along with `BRIEF-1`, `BRIEF-2`, `BRIEF-3`, and `unstable`) in
-`/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4` on branch
+`<path/to/anneal>` on branch
 `sup/brief-4`.
 
 ## 1. Environment Setup
@@ -19,7 +19,7 @@ along with `BRIEF-1`, `BRIEF-2`, `BRIEF-3`, and `unstable`) in
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
 export ELAN_TOOLCHAIN=leanprover/lean4:v4.34.1
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4
+cd <path/to/anneal>
 git status --porcelain
 git log --oneline -15
 ```
@@ -30,9 +30,9 @@ Build `Trusted`, `Anneal`, `Correspondence`, `Smoke`, `ToyYDiagram`,
 `ToyMachine`, `ToyCFG`, and `MirVerification`:
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode build --concurrency 2 -- lake build Trusted Anneal Correspondence Smoke ToyYDiagram ToyMachine ToyCFG MirVerification
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4
+cd <path/to/anneal>
 ```
 
 ## 3. Symbolic Evaluator, Functional Translation, & Tactic Automation
@@ -45,11 +45,11 @@ functional translation (`translateFuncWithFuel`), and `O(1)` lookup context
 witnesses (`BlockCtx`, `CalleeCtx`):
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode file --concurrency 2 -- lake env lean -DwarningAsError=true ../tests/mir/SymbolicEvalTests.lean
 anneal-lean-run --mode file --concurrency 2 -- lake env lean -DwarningAsError=true ../tests/mir/FunctionalTranslationTests.lean
 anneal-lean-run --mode file --concurrency 2 -- lake env lean -DwarningAsError=true ../tests/mir/FunctionalTranslationEquivTests.lean
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4
+cd <path/to/anneal>
 ```
 
 ## 4. Scaffolded Proof Emission & End-to-End Multi-Crate / `core` Verification

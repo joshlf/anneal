@@ -1,10 +1,10 @@
 # Reproduction & Verification Guide — `BRIEF-2`: Option 1B First-Class Polymorphism in `MirAst`, `MirSemantics`, and `anneal-rustc-capture`
 
-This document provides copy-pasteable commands to reproduce and verify the complete integrated `BRIEF-2` workstream (`BRIEF-2.1`, `BRIEF-2.2`, and `BRIEF-2.3`, integrated with `BRIEF-1.1`) in `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2`.
+This document provides copy-pasteable commands to reproduce and verify the complete integrated `BRIEF-2` workstream (`BRIEF-2.1`, `BRIEF-2.2`, and `BRIEF-2.3`, integrated with `BRIEF-1.1`) in `<path/to/anneal>`.
 
 ## 1. Worktree & Branch State
 
-- **Supervisor Worktree**: `/home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2`
+- **Supervisor Worktree**: `<path/to/anneal>`
 - **Branches**: `sup/brief-2` (also aliased to `adv/brief-2`)
 - **Leaf Branches Integrated**:
   - `adv/brief-2-1` (`f4e8bf6b2a3d88c25fd5adf75968a827c1c64f8a`): Polymorphic `MirAst` (`RigidTy.param`, `RigidTy.alias`, `GenericParamDef`, `TraitRef`, `TraitImplEntry`, `TypeSubst`, parametric `LayoutTable` slots, and `CapturedMir.instantiate`) across `V2026_06_01` and `V2026_08_01`.
@@ -17,7 +17,7 @@ This document provides copy-pasteable commands to reproduce and verify the compl
 ### Step 2.1: Lean 4 Kernel Build (`Trusted`, `Anneal`, `Correspondence`)
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2/examples
+cd <path/to/anneal>/examples
 lake build Trusted Anneal Correspondence
 ```
 Expected output: `Build completed successfully (83 jobs).` with exit code `0` and zero warnings, `sorry`, or `axiom`.
@@ -25,7 +25,7 @@ Expected output: `Build completed successfully (83 jobs).` with exit code `0` an
 ### Step 2.2: Single-File Kernel Verification of Polymorphic AST & Call Semantics (`V2026_06_01` & `V2026_08_01`)
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2/examples
+cd <path/to/anneal>/examples
 lake env lean ../theory/Correspondence/V2026_06_01/L1_TypesAndLayouts.lean
 lake env lean ../theory/Correspondence/V2026_08_01/L1_TypesAndLayouts.lean
 lake env lean ../theory/Correspondence/V2026_06_01/L5_ControlAndCalls.lean
@@ -38,7 +38,7 @@ Expected output: Exit code `0` for all 6 files with zero warnings.
 ### Step 2.3: Rust Compiler Driver & Polymorphic MIR Emission Tests (`anneal-rustc-capture`)
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2
+cd <path/to/anneal>
 cargo test -p anneal-rustc-capture
 ```
 Expected output: All unit and integration tests (including `driver_captures_generic_functions_and_trait_impls`) pass with exit code `0`.
@@ -46,7 +46,7 @@ Expected output: All unit and integration tests (including `driver_captures_gene
 ### Step 2.4: Trusted Boundary & Citation Audit
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /home/groupagent-anneal-bot/Projects/markdittmer/anneal-wt-brief-2
+cd <path/to/anneal>
 python3 trusted/audit/check_trusted.py --fast
 ```
 Expected output: `PASS: kernel dependency closure, statement-origin separation, and Cargo DAG boundary (40 Trusted modules; 8239 Trusted kernel declarations; 16381 total replayed declarations; 11 claim theorem statements origin-checked; axioms=['propext', 'Classical.choice', 'Quot.sound'])` with exit code `0`.

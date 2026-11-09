@@ -310,18 +310,18 @@ class RunDiffTestCampaignTest(unittest.TestCase):
                 }
                 return None
 
-            fileutil_calls: list[list[str]] = []
+            remote_sync_calls: list[list[str]] = []
 
-            def fake_run_fileutil(args: list[str]) -> subprocess.CompletedProcess[str]:
-                fileutil_calls.append(list(args))
+            def fake_run_remote_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
+                remote_sync_calls.append(list(args))
                 return subprocess.CompletedProcess(args, 0, "", "")
 
             with mock.patch.object(
                 campaign, "run_harness", side_effect=fake_run_harness
             ), mock.patch.object(
-                campaign, "has_x20_fileutil", return_value=True
+                campaign, "has_remote_sync", return_value=True
             ), mock.patch.object(
-                campaign, "run_fileutil", side_effect=fake_run_fileutil
+                campaign, "run_remote_sync", side_effect=fake_run_remote_sync
             ):
                 rc = campaign.main(
                     [
@@ -329,8 +329,8 @@ class RunDiffTestCampaignTest(unittest.TestCase):
                         "smoke",
                         "--state-dir",
                         str(state_dir),
-                        "--x20-uri",
-                        "/x20/teams/anneal-agent/difftest",
+                        "--remote-uri",
+                        "/remote/teams/anneal-agent/difftest",
                     ]
                 )
 
@@ -367,7 +367,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
                 ledger["fingerprint_history"][itree_fp]["campaigns_failing"], 2
             )
 
-            # coverage_ratchet.json updated from miri-difftest only and uploaded to stub x20
+            # coverage_ratchet.json updated from miri-difftest only and uploaded to stub remote
             ratchet_path = state_dir / "state" / "coverage_ratchet.json"
             self.assertTrue(ratchet_path.is_file())
             ratchet = json.loads(ratchet_path.read_text(encoding="utf-8"))
@@ -379,10 +379,10 @@ class RunDiffTestCampaignTest(unittest.TestCase):
                 ratchet["per_suite_distinct_obs_paths"]["itree"],
                 0,
             )
-            cp_calls = [c for c in fileutil_calls if c and c[0] == "cp"]
+            cp_calls = [c for c in remote_sync_calls if c and c[0] == "cp"]
             self.assertTrue(
                 any(c[3].endswith("/state/coverage_ratchet.json") for c in cp_calls),
-                f"expected coverage_ratchet.json upload to x20 in {cp_calls}",
+                f"expected coverage_ratchet.json upload to remote in {cp_calls}",
             )
 
     def test_reverse_partial_suite_failure_miri_crashed_itree_healthy(self) -> None:
@@ -392,7 +392,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
             miri_fp = "BitValidityTransmuteMutator:false_positive_ub:MirDiffTag.ub:invalid_value_load"
             ledger_path = write_initial_ledger(state_dir, active_fingerprints=[miri_fp])
             before = json.loads(ledger_path.read_text(encoding="utf-8"))
-            junit = state_dir / "sponge_log.xml"
+            junit = state_dir / "diff_test_report.xml"
 
             def fake_run_harness(repo_root, bin_name, harness_args, json_path):
                 if bin_name == "miri-difftest":
@@ -418,7 +418,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
                         "smoke",
                         "--state-dir",
                         str(state_dir),
-                        "--x20-uri",
+                        "--remote-uri",
                         "",
                         "--junit-xml",
                         str(junit),
@@ -484,7 +484,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
 
             with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
                 rc = campaign.main(
-                    ["--profile", "smoke", "--state-dir", str(state_dir), "--x20-uri", ""]
+                    ["--profile", "smoke", "--state-dir", str(state_dir), "--remote-uri", ""]
                 )
 
             self.assertEqual(rc, campaign.EXIT_HARNESS_FAILED)
@@ -514,7 +514,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
 
             with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
                 rc = campaign.main(
-                    ["--profile", "smoke", "--state-dir", str(state_dir), "--x20-uri", ""]
+                    ["--profile", "smoke", "--state-dir", str(state_dir), "--remote-uri", ""]
                 )
 
             # fp_new is an unquarantined divergence -> EXIT_DIVERGENCE_DETECTED (4)
@@ -538,8 +538,8 @@ class RunDiffTestCampaignTest(unittest.TestCase):
                 ledger["fingerprint_history"][fp_new]["suite"], "miri-difftest"
             )
 
-    def test_coverage_ratchet_monotonicity_and_x20_sync_round_trip(self) -> None:
-        """5. coverage_ratchet.json grows monotonically across runs and syncs with x20."""
+    def test_coverage_ratchet_monotonicity_and_remote_sync_round_trip(self) -> None:
+        """5. coverage_ratchet.json grows monotonically across runs and syncs with remote."""
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp)
             write_initial_ledger(state_dir, active_fingerprints=[])
@@ -574,7 +574,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
 
             with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
                 rc1 = campaign.main(
-                    ["--profile", "smoke", "--state-dir", str(state_dir), "--x20-uri", ""]
+                    ["--profile", "smoke", "--state-dir", str(state_dir), "--remote-uri", ""]
                 )
                 self.assertEqual(rc1, campaign.EXIT_SUCCESS)
                 ratchet1 = json.loads(
@@ -589,7 +589,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
 
                 run_counter["count"] = 1
                 rc2 = campaign.main(
-                    ["--profile", "smoke", "--state-dir", str(state_dir), "--x20-uri", ""]
+                    ["--profile", "smoke", "--state-dir", str(state_dir), "--remote-uri", ""]
                 )
                 self.assertEqual(rc2, campaign.EXIT_SUCCESS)
                 ratchet2 = json.loads(
@@ -605,31 +605,31 @@ class RunDiffTestCampaignTest(unittest.TestCase):
                 self.assertEqual(itree_after, 3)
                 self.assertEqual(total_after, 6)
 
-            # Verify x20 sync round-trip includes state/coverage_ratchet.json
-            fileutil_calls: list[list[str]] = []
+            # Verify remote sync round-trip includes state/coverage_ratchet.json
+            remote_sync_calls: list[list[str]] = []
 
-            def fake_run_fileutil(args: list[str]) -> subprocess.CompletedProcess[str]:
-                fileutil_calls.append(list(args))
+            def fake_run_remote_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
+                remote_sync_calls.append(list(args))
                 return subprocess.CompletedProcess(args, 0, "", "")
 
             with mock.patch.object(
-                campaign, "has_x20_fileutil", return_value=True
+                campaign, "has_remote_sync", return_value=True
             ), mock.patch.object(
-                campaign, "run_fileutil", side_effect=fake_run_fileutil
+                campaign, "run_remote_sync", side_effect=fake_run_remote_sync
             ):
-                campaign.sync_state_from_x20(
-                    "/x20/teams/anneal-agent/difftest", state_dir, include_ratchet=True
+                campaign.sync_state_from_remote(
+                    "/remote/teams/anneal-agent/difftest", state_dir, include_ratchet=True
                 )
-                campaign.sync_state_to_x20(
+                campaign.sync_state_to_remote(
                     state_dir,
-                    "/x20/teams/anneal-agent/difftest",
+                    "/remote/teams/anneal-agent/difftest",
                     [
                         state_dir / "state" / "campaign_ledger.json",
                         state_dir / "state" / "coverage_ratchet.json",
                     ],
                 )
 
-            cp_calls = [c for c in fileutil_calls if c and c[0] == "cp"]
+            cp_calls = [c for c in remote_sync_calls if c and c[0] == "cp"]
             self.assertTrue(
                 any(
                     c[2].endswith("/state/coverage_ratchet.json")
@@ -670,7 +670,7 @@ class RunDiffTestCampaignTest(unittest.TestCase):
 
             with mock.patch.object(campaign, "run_harness", side_effect=fake_run_harness):
                 rc = campaign.main(
-                    ["--profile", "smoke", "--state-dir", str(state_dir), "--x20-uri", ""]
+                    ["--profile", "smoke", "--state-dir", str(state_dir), "--remote-uri", ""]
                 )
 
             self.assertEqual(rc, campaign.EXIT_HARNESS_FAILED)
@@ -701,10 +701,10 @@ class RunDiffTestCampaignTest(unittest.TestCase):
             )
 
 
-# The real `/x20/teams/anneal-agent/differential-testing/state/campaign_ledger.json`
+# The real `/remote/teams/anneal-agent/differential-testing/state/campaign_ledger.json`
 # snapshot taken before the `2026-11-08` nightly (no `schema_version`,
 # `per_suite_runs`, `fingerprint_history`, or `resolved_history`).
-LEGACY_X20_LEDGER = {
+LEGACY_REMOTE_LEDGER = {
     "active_fingerprints": [
         "BitValidityTransmuteMutator:missed_ub:MirDiffTag.normalScalar",
         "PlaceProjectionWrapper:missed_ub:MirDiffTag.normalScalar",
@@ -748,7 +748,7 @@ def healthy_diag(bin_name: str) -> None:
 
 def run_main(state_dir: Path, *extra: str) -> int:
     return campaign.main(
-        ["--profile", "smoke", "--state-dir", str(state_dir), "--x20-uri", "", *extra]
+        ["--profile", "smoke", "--state-dir", str(state_dir), "--remote-uri", "", *extra]
     )
 
 
@@ -896,14 +896,14 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
             self.assertIn('<failure message="harness failed">', junit_text)
             self.assertNotIn("red-flag vacuity check failed", junit_text)
 
-    def test_legacy_x20_ledger_upgrade_on_partial_failure(self) -> None:
-        """The real pre-2026-11-08 x20 ledger upgrades cleanly when itree crashes."""
+    def test_legacy_remote_ledger_upgrade_on_partial_failure(self) -> None:
+        """The real pre-2026-11-08 remote ledger upgrades cleanly when itree crashes."""
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp)
             itree_legacy_fp = (
                 "CallBoundaryOutliner:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch"
             )
-            legacy = copy.deepcopy(LEGACY_X20_LEDGER)
+            legacy = copy.deepcopy(LEGACY_REMOTE_LEDGER)
             legacy["active_fingerprints"].append(itree_legacy_fp)
             ledger_path = state_dir / "state" / "campaign_ledger.json"
             ledger_path.parent.mkdir(parents=True)
@@ -949,7 +949,7 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
                 self.assertEqual(ledger[key], legacy[key], key)
             self.assertEqual(ledger["last_oracle_comparison"], "miri_performed_itree_failed")
             # Both legacy Miri fingerprints resolve, dated by when they were last seen.
-            for fp in LEGACY_X20_LEDGER["active_fingerprints"]:
+            for fp in LEGACY_REMOTE_LEDGER["active_fingerprints"]:
                 self.assertNotIn(fp, ledger["active_fingerprints"])
                 self.assertEqual(
                     ledger["resolved_history"][fp],
@@ -1275,7 +1275,7 @@ class RedFlagAndLedgerHardeningTest(unittest.TestCase):
         The capsule launcher uploads `state/` after every run, so stripping
         `fingerprint_history` / `resolved_history` / `last_*_signature` /
         `per_suite_runs` on a pass-through `--compile-only` run would erase the
-        shared x20 ledger's aging history and seed-sensitivity baselines.
+        shared remote ledger's aging history and seed-sensitivity baselines.
         """
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp)
