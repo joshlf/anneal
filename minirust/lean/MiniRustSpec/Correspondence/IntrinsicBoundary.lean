@@ -26,27 +26,26 @@ that `StatementKind::Intrinsic(Assume)` *is* now inside `progInFragment`; see
    `minimize` aborts translation. With `count = 0` Anneal never checks that
    `src` and `dst` are pointers, and a two-element `u32` copy between two
    4-byte locals returns normally with no UB (`bdCopy2_noUB`).
-3. `BinOp::Offset`: Anneal adds the raw count to `offsetBytes`, without
-   scaling, a bounds check, or a sign interpretation; `minimize` scales by the
-   pointee size and emits an in-bounds byte offset. `arith_offset` remains an
-   external call in Anneal.
-4. Calls to `core::intrinsics::*` without a body in `callees` become external
-   `MirCallReq` requests carrying only `defPath`, `args`, and `memory`. When
-   interpreted via `mirHandledTree` (`Trusted.VerificationResult`), an
-   `ExternalCallHandler` can return values or raise UB (`ITree.fail .ub` in
-   `MirClosedEffect`):
-   * `cold_path` (`coldPathHandler`) corresponds to `minimize`'s no-op `Goto`.
-   * `ctpop` (`ctpopHandler`) corresponds uniformly across all signed and
-     unsigned `IntType`s because `evalCountOnes (intFromBits bits it) it`
-     depends only on the low `8 * it.size.bytes` bits (`evalCountOnes_intFromBits`,
-     `evalCountOnes_signedness_indep`).
-   * `exact_div::<T>` erases `Signedness` in `MirCallReq` (`bdExactDiv_same_request`),
-     so a single untyped handler cannot simultaneously match `exact_div::<i32>`
-     and `exact_div::<u32>`, whereas the monomorphized handler
-     `exactDivHandler it` matches MiniRust's `IntBinOp::DivExact` on both valid
-     quotients and all three UB conditions (`/ 0`, signed `MIN / -1`, and
-     `left % right != 0`).
-   * Diverging `abort` calls hit `MirStepNode.unsupported` before `MirCallE`.
+3. `BinOp::Offset`: Anneal scales the signed count by `size_of::<T>()` and
+   enforces in-bounds byte arithmetic (`bdOffset1_anneal_ret`,
+   `bdOffsetNeg1_anneal_ub`, `bdOffsetNeg1_not_noUB`), matching `minimize`'s
+   `ptr_offset(.., InBounds::Yes)`, while `arith_offset` evaluates inline with
+   wrapping byte arithmetic (`bdArithOffset_anneal_ret`).
+4. Calls to `core::intrinsics::*` without a body in `callees`:
+   * Compiler intrinsics modeled in `evalDirectRustIntrinsic?` (`arith_offset`,
+     `ctpop`, `exact_div`, `ub_checks`) evaluate inline in `stepMirFn`, using
+     the callee `FnDef`'s generic `typeArgs` (`bdCtpop_inline`,
+     `bdExactDiv_inline`, `bdUbChecksCall_anneal_ret`), and diverging
+     `core::intrinsics::abort` steps to `MirStepNode.retOutcome .abort`
+     (`bdAbort_anneal_abort`).
+   * Unmodeled intrinsics (`write_bytes`, `raw_eq`, `cold_path`) emit external
+     `MirCallReq` requests carrying `defPath`, `typeArgs`, `args`, and `memory`
+     (`bdMirCallReq_fields`). When interpreted via `mirHandledTree`
+     (`Trusted.VerificationResult`), `coldPathHandler` corresponds to
+     `minimize`'s no-op `Goto` (`bdColdPath_handled`), `ctpopHandler` matches
+     `evalCountOnes` uniformly across signedness (`evalCountOnes_intFromBits`,
+     `evalCountOnes_signedness_indep`), and `exactDivHandler it` matches
+     MiniRust's `IntBinOp::DivExact` (`exactDivHandler_iff_minirust`).
 5. `core::hint::unreachable_unchecked()`: Anneal raises UB, like MiniRust's
    `Terminator::Unreachable`; the fragment rejects the call form but covers
    MIR's own `TerminatorKind::Unreachable`.
@@ -57,7 +56,8 @@ namespace MiniRustSpec.Correspondence
 open Trusted.Effect
 open Trusted.ITree
 open Trusted.VerificationResult (MirClosedEffect ExternalCallHandler
-  handleMirExternalCalls mirHandledTree mirStatefulTree
+  handleMirExternalCalls mirHandledTree mirHandledTreeWithCallees
+  mirStatefulTree mirStatefulTreeWithCallees
   initMachineStateWithMemory)
 open Trusted.Rustc.V2026_06_01
 open Trusted.Rustc.V2026_06_01.MirAst
@@ -258,20 +258,11 @@ elements (`k` an `isize` bit pattern) and returns it:
 ```text
 bb0: _0 = &raw const _1; _0 = Offset(copy _0, const k_isize); return
 ```
-Anneal: the `.binaryOp` arm of `evalRvalue` (`Places.lean:2160-2184`) handles
-a pointer left operand and a scalar right operand only for `.offset`
-(`Places.lean:2171-2178`), returning the pointer with
-`offsetBytes := ptrVal.offsetBytes + offsetSc.bits`: the count is neither
-multiplied by the pointee size nor read as signed, and no bounds check
-applies. (`ProvenancePtr.offsetBytes` is documented as a byte offset, while
-`evalCopyNonOverlappingWithCount` uses it as an element index into array
-values.)
-
-`minimize`: the `(Offset, Type::Ptr(_))` arm of `translate_rvalue_smir`
-(`rvalue.rs:22-35`) multiplies the count by the pointee's size
-(`build::mul_unchecked`) and emits `build::ptr_offset(.., InBounds::Yes)`, an
-in-bounds offset in bytes; for `u32` and `k = 1` that is 4 bytes, and for
-`k = -1` it is `-4` bytes from the start of `_1`. -/
+Both Anneal (`evalBinOpOffset` in `Places.lean`) and `minimize`
+(`translate_rvalue_smir` in `rvalue.rs:22-35`) scale the signed count `k` by
+`size_of::<u32>() = 4` and require the resulting byte offset to remain in bounds
+of `_1` (`0..=4`): `k = 1` produces the one-past-the-end byte offset `4`, while
+`k = -1` (`2^64 - 1`) faults with UB. -/
 def bdOffsetBody (k : Nat) : CapturedMir :=
   bdBody "boundary::offset" 1 [bdDecl bdRawConstU32Ty, u32Decl] [
     { statements := [
@@ -279,30 +270,31 @@ def bdOffsetBody (k : Nat) : CapturedMir :=
         mkStmt (.assign (local_ 0) (.binaryOp .offset (.copy (local_ 0)) (bdConstIsize k)))],
       terminator := mkTerm .return_, isCleanup := false }]
 
-/-- `k = 1`: the raw pointer `_0` (borrow tag `1`) ends at `offsetBytes = 1`,
-not `4 = size_of::<u32>()`. -/
+/-- `k = 1`: the raw pointer `_0` (borrow tag `1`) ends at the stride-scaled
+one-past-the-end byte offset `offsetBytes = 4 = size_of::<u32>()`. -/
 theorem bdOffset1_anneal_ret :
     ∃ mem, ReachesRet (mirCallTree (bdOffsetBody 1) [.scalar ⟨7, 4⟩]) []
-      (.normal (.ptr ⟨1, 1⟩ 8, mem)) :=
+      (.normal (.ptr ⟨1, 4⟩ 8, mem)) :=
   ⟨_, runA_sound (bdOffsetBody 1) 30 _ _ _ rfl⟩
 
-/-- `k = -1` (bits `2^64 - 1`): the pointer ends at
-`offsetBytes = 2^64 - 1`, with no wraparound and no UB, although the offset
-moves before the start of `_1`. -/
-theorem bdOffsetNeg1_anneal_ret :
-    ∃ mem, ReachesRet (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) []
-      (.normal (.ptr ⟨1, 18446744073709551615⟩ 8, mem)) :=
-  ⟨_, runA_sound (bdOffsetBody 18446744073709551615) 30 _ _ _ rfl⟩
+/-- `k = -1` (bits `2^64 - 1`): moving `-4` bytes before the start of `_1`
+faults with UB in Anneal, matching MiniRust's `InBounds::Yes` `ptr_offset`. -/
+theorem bdOffsetNeg1_anneal_ub :
+    ∃ tr u,
+      Reaches (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) tr u ∧
+      FaultNow u :=
+  faultsA_sound (bdOffsetBody 18446744073709551615) 30 _ rfl
 
-theorem bdOffsetNeg1_noUB :
-    MirNoUBTree (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) :=
-  runA_noUB (bdOffsetBody 18446744073709551615) 30 _ _ _ rfl
+theorem bdOffsetNeg1_not_noUB :
+    ¬ MirNoUBTree (mirCallTree (bdOffsetBody 18446744073709551615) [.scalar ⟨7, 4⟩]) := by
+  obtain ⟨tr, u, hr, hf⟩ := bdOffsetNeg1_anneal_ub
+  exact fun hsafe => hsafe tr u hr hf
 
 /-- `BinOp::Offset` is not an integer `BinOp` (`translateBinOp`).
 `translateRvalue` lowers it as `minimize` does (`ptrOffsetExpr`, which scales
-the count by the pointee size), but the fragment admits only a zero constant
-offset (`zeroOffsetConstOk`), on which Anneal's unscaled `offsetBytes` agrees
-with MiniRust, so `inFragment` rejects `bdOffsetBody 1`. -/
+the count by the pointee size), and `inFragment` conservatively restricts
+`BinOp::Offset` to zero constant offsets (`zeroOffsetConstOk`), rejecting
+`bdOffsetBody 1`. -/
 theorem bdOffset_rejected :
     translateBinOp .offset = none ∧
       (translateRvalue ⟨64, true, []⟩ [bdDecl bdRawConstU32Ty, u32Decl] none
@@ -311,38 +303,32 @@ theorem bdOffset_rejected :
   ⟨rfl, rfl, by decide⟩
 
 /-- MIR of `fn arith_offset_caller(p: *const u32, k: isize) -> *const u32`,
-which calls `core::intrinsics::arith_offset::<u32>(p, k)`. `arith_offset`
-reaches MIR as a `Call` terminator (which is why `minimize` handles it in
-`translate_rs_intrinsic`), so Anneal treats it like the calls of the next
-section: as an external call request (`Terminators.lean:338-341`). `minimize`
-lowers it (`bb.rs:502-523`) to an assignment of
-`build::ptr_offset(p, k * size_of::<u32>(), InBounds::No)`, a byte offset
-without the in-bounds requirement, followed by a `Goto`. -/
+which calls `core::intrinsics::arith_offset::<u32>(p, k)`. Anneal's
+`evalDirectRustIntrinsic?` (`evalArithOffset` in `Terminators.lean`) evaluates
+it inline with wrapping `usize` byte arithmetic (`offsetBytes = 4`), matching
+`minimize`'s `build::ptr_offset(p, k * size_of::<u32>(), InBounds::No)`
+(`bb.rs:502-523`). -/
 def bdArithOffsetCaller : CapturedMir :=
   bdCallBody "boundary::arith_offset_caller" "core::intrinsics::arith_offset" [.uint .u32] 2
     [bdDecl bdRawConstU32Ty, bdDecl bdRawConstU32Ty, bdDecl bdIsizeTy] (some 1)
 
 def bdArithOffsetArgs : List Value := [.ptr ⟨1, 0⟩ 8, .scalar ⟨1, 8⟩]
 
-theorem bdArithOffset_extCall :
-    ∃ k, stepMirFn bdArithOffsetCaller (initMachineState bdArithOffsetCaller bdArithOffsetArgs) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::arith_offset", args := bdArithOffsetArgs,
-          memory := (initMachineState bdArithOffsetCaller bdArithOffsetArgs).memory } k :=
-  ⟨_, rfl⟩
+theorem bdArithOffset_anneal_ret :
+    ∃ mem, ReachesRet (mirCallTree bdArithOffsetCaller bdArithOffsetArgs) []
+      (.normal (.ptr ⟨1, 4⟩ 8, mem)) :=
+  ⟨_, runA_sound bdArithOffsetCaller 10 _ _ _ rfl⟩
 
 /-! ## 4. Intrinsic calls without a body in `callees` -/
 
-/-- An external request records a `DefPath`, the untyped argument `Value`s, and
-the `Memory` (`State.lean:314-320`); in particular it erases generic type
-arguments `T` and integer `Signedness` (`ScalarInt` carries only `bits` and
-`sizeBytes`). While `MirCallAns` (`State.lean:335-341`) has constructors
-`returned`, `panicked`, and `aborted`, Anneal interprets `MirCallE` via an
-`ExternalCallHandler : MirCallReq → ITree MirClosedEffect MirCallAns`
-(`Trusted/VerificationResult.lean:225-240`), which *can* directly raise UB via
+/-- An external request records `defPath`, generic `typeArgs`, the argument
+`Value`s, and `memory` (`State.lean:458-466`). While `MirCallAns` has
+constructors `returned`, `panicked`, and `aborted`, Anneal interprets `MirCallE`
+via an `ExternalCallHandler : MirCallReq → ITree MirClosedEffect MirCallAns`
+(`Trusted/VerificationResult.lean`), which can also raise UB via
 `ITree.fail .ub` in `MirClosedEffect`. -/
 theorem bdMirCallReq_fields (r : MirCallReq) :
-    r = { defPath := r.defPath, args := r.args, memory := r.memory } := rfl
+    r = { defPath := r.defPath, typeArgs := r.typeArgs, args := r.args, memory := r.memory } := rfl
 
 /-- `fn write_bytes_caller(dst: *mut u32, val: u8, count: usize)`, calling
 `core::intrinsics::write_bytes::<u32>`. When a call resolves to an intrinsic
@@ -403,51 +389,49 @@ to `build::abort()` (`bb.rs:611-614`). -/
 def bdAbortCaller : CapturedMir :=
   bdCallBody "boundary::abort_caller" "core::intrinsics::abort" [] 0 [bdDecl bdNeverTy] none
 
-/-- Anneal: a call with a return target whose `DefPath` has no body in
-`Memory.callees` evaluates its arguments and emits an external call node
-(`Terminators.lean:298-341`, the node at `339-341`), and the same holds for
-each of the following callers. -/
+/-- Anneal: unmodeled intrinsics with a return target and no body in
+`Memory.callees` (`write_bytes`, `raw_eq`, `cold_path`) emit `MirStepNode.extCall`
+with `typeArgs` preserved, whereas `ctpop` and `exact_div` evaluate inline via
+`evalDirectRustIntrinsic?` and `abort` returns `MirOutcome.abort`. -/
 theorem bdWriteBytes_extCall :
     ∃ k, stepMirFn bdWriteBytesCaller (initMachineState bdWriteBytesCaller bdWriteBytesArgs) =
       MirStepNode.extCall
-        { defPath := "core::intrinsics::write_bytes", args := bdWriteBytesArgs,
+        { defPath := "core::intrinsics::write_bytes", typeArgs := [.uint .u32],
+          args := bdWriteBytesArgs,
           memory := (initMachineState bdWriteBytesCaller bdWriteBytesArgs).memory } k :=
   ⟨_, rfl⟩
 
 theorem bdRawEq_extCall :
     ∃ k, stepMirFn bdRawEqCaller (initMachineState bdRawEqCaller bdRawEqArgs) =
       MirStepNode.extCall
-        { defPath := "core::intrinsics::raw_eq", args := bdRawEqArgs,
+        { defPath := "core::intrinsics::raw_eq", typeArgs := [.uint .u32],
+          args := bdRawEqArgs,
           memory := (initMachineState bdRawEqCaller bdRawEqArgs).memory } k :=
   ⟨_, rfl⟩
 
 theorem bdColdPath_extCall :
     ∃ k, stepMirFn bdColdPathCaller (initMachineState bdColdPathCaller []) =
       MirStepNode.extCall
-        { defPath := "core::intrinsics::cold_path", args := [],
+        { defPath := "core::intrinsics::cold_path", typeArgs := [], args := [],
           memory := (initMachineState bdColdPathCaller []).memory } k :=
   ⟨_, rfl⟩
 
-theorem bdCtpop_extCall :
-    ∃ k, stepMirFn bdCtpopCaller (initMachineState bdCtpopCaller bdCtpopArgs) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::ctpop", args := bdCtpopArgs,
-          memory := (initMachineState bdCtpopCaller bdCtpopArgs).memory } k :=
-  ⟨_, rfl⟩
+theorem bdCtpop_anneal_ret :
+    ∃ mem, ReachesRet (mirCallTree bdCtpopCaller bdCtpopArgs) []
+      (.normal (.scalar ⟨4, 4⟩, mem)) :=
+  ⟨_, runA_sound bdCtpopCaller 10 _ _ _ rfl⟩
 
-theorem bdExactDivI32_extCall :
-    ∃ k, stepMirFn bdExactDivI32Caller (initMachineState bdExactDivI32Caller bdExactDivArgs) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::exact_div", args := bdExactDivArgs,
-          memory := (initMachineState bdExactDivI32Caller bdExactDivArgs).memory } k :=
-  ⟨_, rfl⟩
+theorem bdExactDivI32_anneal_ret :
+    ∃ mem, ReachesRet (mirCallTree bdExactDivI32Caller bdExactDivArgs) []
+      (.normal (.scalar ⟨4294967294, 4⟩, mem)) :=
+  ⟨_, runA_sound bdExactDivI32Caller 10 _ _ _ rfl⟩
 
-/-- Anneal: a call without a return target is UB only for
-`core::hint::unreachable_unchecked`; every other diverging call, including
-`abort`, is `unsupported` (`Terminators.lean:350-353`), not an external
-call. -/
-theorem bdAbort_unsupported :
-    stepMirFn bdAbortCaller (initMachineState bdAbortCaller []) = MirStepNode.unsupported := rfl
+/-- Anneal: `core::intrinsics::abort` is recognized in `isAbortingPanicDefPath`
+and terminates with `MirStepNode.retOutcome .abort`, matching MiniRust's
+`Terminator::Abort`. -/
+theorem bdAbort_anneal_abort :
+    stepMirFn bdAbortCaller (initMachineState bdAbortCaller []) =
+      MirStepNode.retOutcome .abort := rfl
 
 /-- The two `exact_div` callers declare parameters of different types. -/
 theorem bdExactDiv_param_types :
@@ -456,14 +440,13 @@ theorem bdExactDiv_param_types :
         some ⟨.Unsigned, ⟨4⟩⟩ :=
   ⟨rfl, rfl⟩
 
-/-- Nevertheless, on the same argument bits, Anneal's two external requests
-are identical: the request cannot tell `exact_div::<i32>` from
-`exact_div::<u32>`. -/
-theorem bdExactDiv_same_request :
-    bdCallReq?
-        (stepMirFn bdExactDivI32Caller (initMachineState bdExactDivI32Caller bdExactDivArgs)) =
-      bdCallReq?
-        (stepMirFn bdExactDivU32Caller (initMachineState bdExactDivU32Caller bdExactDivArgs)) :=
+/-- On the same argument bits `(-6i32, 3i32)` vs. `(4294967290u32, 3u32)`,
+Anneal's inline `evalDirectExactDiv` inspects the callee `FnDef` `typeArgs`
+(`[.int .i32]` vs. `[.uint .u32]`): `exact_div::<i32>` steps normally while
+`exact_div::<u32>` immediately faults with `.ub` on non-zero remainder. -/
+theorem bdExactDiv_typeArgs_distinct :
+    stepMirFn bdExactDivU32Caller (initMachineState bdExactDivU32Caller bdExactDivArgs) =
+      MirStepNode.fail .ub :=
   rfl
 
 /-- The bits `4294967290` decode to `-6` at `i32` and to `4294967290` at
@@ -617,9 +600,9 @@ private theorem mirHandledTree_extCall_ret {body : CapturedMir} {args : List Val
     simp [stepMirState, hstep0, MirStepNode.extCall, ITreeF.map]
   have hobs1 : (mirHandledTree body args mem h).observe =
       .tau (interpF (.inl (ITree.cofix (stepMirState body) (.running s1)))) := by
-    rw [mirHandledTree, ITree.interp, ITree.observe_cofix]
+    rw [mirHandledTree, mirHandledTreeWithCallees, ITree.interp, ITree.observe_cofix]
     dsimp only [ITree.interpStep]
-    rw [hobs0]
+    erw [hobs0]
     dsimp only [handleMirExternalCalls]
     erw [hreq, ITree.observe_ret]
     dsimp only
@@ -659,9 +642,9 @@ private theorem mirHandledTree_extCall_ub {body : CapturedMir} {args : List Valu
   have hobsH : ∃ (kOut : PEmpty → ITree MirClosedEffect MirOutcome),
       (mirHandledTree body args mem h).observe =
       .vis (.inl (FailReq.fail fk : (FailE FailureKind).I)) kOut := by
-    rw [mirHandledTree, ITree.interp, ITree.observe_cofix]
+    rw [mirHandledTree, mirHandledTreeWithCallees, ITree.interp, ITree.observe_cofix]
     dsimp only [ITree.interpStep]
-    rw [hobs0]
+    erw [hobs0]
     dsimp only [handleMirExternalCalls]
     erw [hreq, hkFail]
     exact ⟨_, rfl⟩
@@ -726,47 +709,46 @@ theorem bdColdPath_handled :
       (.normal (.unit, emptyMemory)) :=
   mirHandledTree_extCall_ret rfl rfl rfl rfl
 
-/-- The single untyped `ctpopHandler` handles both `ctpop::<u32>(240u32) == 4u32`
+/-- Anneal's inline `evalCtpop` and `ctpopHandler` both produce `ctpop::<u32>(240u32) == 4u32`
 and signed `ctpop::<i8>(-1i8) == 8u32` (bits `255`), matching MiniRust's
 `evalUnOp (.Int .CountOnes)` in both cases. -/
-theorem bdCtpop_handled :
-    ReachesRet (mirHandledTree bdCtpopCaller [.scalar ⟨240, 4⟩] emptyMemory ctpopHandler) []
-        (.normal (.scalar ⟨4, 4⟩, emptyMemory)) ∧
+theorem bdCtpop_inline :
+    (∃ mem, ReachesRet (mirCallTree bdCtpopCaller [.scalar ⟨240, 4⟩]) []
+      (.normal (.scalar ⟨4, 4⟩, mem))) ∧
       evalUnOp (.Int .CountOnes) (.Int 240, .Int u32) = .ok (.Int 4, .Int u32) ∧
-      ReachesRet (mirHandledTree bdCtpopI8Caller [.scalar ⟨255, 1⟩] emptyMemory ctpopHandler) []
-        (.normal (.scalar ⟨8, 4⟩, emptyMemory)) ∧
+      (∃ mem, ReachesRet (mirCallTree bdCtpopI8Caller [.scalar ⟨255, 1⟩]) []
+        (.normal (.scalar ⟨8, 4⟩, mem))) ∧
       evalUnOp (.Int .CountOnes) (.Int (-1), .Int IntType.I8) = .ok (.Int 8, .Int u32) :=
-  ⟨mirHandledTree_extCall_ret rfl rfl rfl rfl, rfl,
-   mirHandledTree_extCall_ret rfl rfl rfl rfl, rfl⟩
+  ⟨⟨_, runA_sound bdCtpopCaller 10 _ _ _ rfl⟩, rfl,
+   ⟨_, runA_sound bdCtpopI8Caller 10 _ _ _ rfl⟩, rfl⟩
 
-/-- `exactDivHandler` on `bdExactDivI32Caller` and `bdExactDivU32Caller` matches
-MiniRust's `IntBinOp::DivExact` across exact division (`-6i32 / 3i32 = -2i32`,
-bits `4294967294`) and all three UB conditions: non-zero remainder
-(`4294967290u32 / 3u32`), division by zero (`6i32 / 0i32`), and signed overflow
-(`i32::MIN / -1i32`). -/
-theorem bdExactDiv_handled :
-    ReachesRet
-        (mirHandledTree bdExactDivI32Caller [.scalar ⟨4294967290, 4⟩, .scalar ⟨3, 4⟩]
-          emptyMemory (exactDivHandler i32))
-        [] (.normal (.scalar ⟨4294967294, 4⟩, emptyMemory)) ∧
-      FaultNow
-        (mirHandledTree bdExactDivU32Caller [.scalar ⟨4294967290, 4⟩, .scalar ⟨3, 4⟩]
-          emptyMemory (exactDivHandler u32)) ∧
-      FaultNow
-        (mirHandledTree bdExactDivI32Caller [.scalar ⟨6, 4⟩, .scalar ⟨0, 4⟩]
-          emptyMemory (exactDivHandler i32)) ∧
+/-- Anneal's inline `evalDirectExactDiv` on `bdExactDivI32Caller` and
+`bdExactDivU32Caller` matches MiniRust's `IntBinOp::DivExact` across exact
+division (`-6i32 / 3i32 = -2i32`, bits `4294967294`) and all three UB
+conditions: non-zero remainder (`4294967290u32 / 3u32`), division by zero
+(`6i32 / 0i32`), and signed overflow (`i32::MIN / -1i32`). -/
+theorem bdExactDiv_inline :
+    (∃ mem, ReachesRet
+        (mirCallTree bdExactDivI32Caller [.scalar ⟨4294967290, 4⟩, .scalar ⟨3, 4⟩])
+        [] (.normal (.scalar ⟨4294967294, 4⟩, mem))) ∧
+      (∃ tr u,
+        Reaches (mirCallTree bdExactDivU32Caller [.scalar ⟨4294967290, 4⟩, .scalar ⟨3, 4⟩]) tr u ∧
+        FaultNow u) ∧
+      (∃ tr u,
+        Reaches (mirCallTree bdExactDivI32Caller [.scalar ⟨6, 4⟩, .scalar ⟨0, 4⟩]) tr u ∧
+        FaultNow u) ∧
       evalBinOp (.Int .DivExact) (.Int 6, .Int i32) (.Int 0, .Int i32) =
         .error (.ub "division by zero") ∧
-      FaultNow
-        (mirHandledTree bdExactDivI32Caller [.scalar ⟨2147483648, 4⟩, .scalar ⟨4294967295, 4⟩]
-          emptyMemory (exactDivHandler i32)) ∧
+      (∃ tr u,
+        Reaches (mirCallTree bdExactDivI32Caller [.scalar ⟨2147483648, 4⟩, .scalar ⟨4294967295, 4⟩]) tr u ∧
+        FaultNow u) ∧
       evalBinOp (.Int .DivExact) (.Int (-2147483648), .Int i32) (.Int (-1), .Int i32) =
         .error (.ub "overflow in division") :=
-  ⟨mirHandledTree_extCall_ret rfl rfl rfl rfl,
-   mirHandledTree_extCall_ub rfl rfl,
-   mirHandledTree_extCall_ub rfl rfl,
+  ⟨⟨_, runA_sound bdExactDivI32Caller 10 _ _ _ rfl⟩,
+   faultsA_sound bdExactDivU32Caller 10 _ rfl,
+   faultsA_sound bdExactDivI32Caller 10 _ rfl,
    rfl,
-   mirHandledTree_extCall_ub rfl rfl,
+   faultsA_sound bdExactDivI32Caller 10 _ rfl,
    rfl⟩
 
 /-- Symbolic correspondence between `exactDivHandler it` and MiniRust's
@@ -860,14 +842,15 @@ def bdUbChecksCallCaller : CapturedMir :=
   bdCallBody "boundary::ub_checks_call_caller" "core::intrinsics::ub_checks" [] 0
     [boolDecl] (some 1)
 
-theorem bdUbChecksCall_extCall :
-    ∃ k, stepMirFn bdUbChecksCallCaller (initMachineState bdUbChecksCallCaller []) =
-      MirStepNode.extCall
-        { defPath := "core::intrinsics::ub_checks", args := [],
-          memory := (initMachineState bdUbChecksCallCaller []).memory } k :=
-  ⟨_, rfl⟩
+/-- Direct calls to `core::intrinsics::ub_checks` evaluate inline in
+`evalDirectRustIntrinsic?` to `true` (`1 : u8`), enabling `core` runtime UB
+assertions in Anneal. -/
+theorem bdUbChecksCall_anneal_ret :
+    ∃ mem, ReachesRet (mirCallTree bdUbChecksCallCaller []) []
+      (.normal (.scalar ⟨1, 1⟩, mem)) :=
+  ⟨_, runA_sound bdUbChecksCallCaller 10 _ _ _ rfl⟩
 
-/-- Session-parameterized `ExternalCallHandler` for unlowered calls to
+/-- Session-parameterized `ExternalCallHandler` for external calls to
 `core::intrinsics::ub_checks`: returns `flag` as a 1-byte scalar (`0` or `1`)
 with unchanged memory, matching `minimize`'s
 `build::const_bool(self.tcx.sess.ub_checks())` (`bb.rs:607-610`). -/
@@ -878,10 +861,10 @@ def ubChecksHandler (flag : Bool) : ExternalCallHandler := fun req =>
     ITree.fail FailureKind.unsupported
 
 theorem bdUbChecksCall_handled (flag : Bool) (m : Mach) :
-    ReachesRet (mirHandledTree bdUbChecksCallCaller [] emptyMemory (ubChecksHandler flag)) []
-        (.normal (.scalar ⟨if flag then 1 else 0, 1⟩, emptyMemory)) ∧
+    ubChecksHandler flag { defPath := "core::intrinsics::ub_checks", args := [], memory := emptyMemory } =
+        ITree.ret (.returned (.scalar ⟨if flag then 1 else 0, 1⟩) emptyMemory) ∧
       Interp.evalValue m (.Constant (.Bool flag) .Bool) = .ok ((.Bool flag, .Bool), m) := by
-  cases flag <;> exact ⟨mirHandledTree_extCall_ret rfl rfl rfl rfl, rfl⟩
+  cases flag <;> exact ⟨rfl, rfl⟩
 
 /-! ## 5. `core::hint::unreachable_unchecked()` -/
 
@@ -925,83 +908,25 @@ theorem bdUnreachableTerminator_covered :
       translateTerminator ⟨64, true, []⟩ [] (mkTerm .unreachable) = some .Unreachable :=
   ⟨rfl, rfl⟩
 
+/-! ## 6. Polymorphic types and `monoCallee?` fail-closed rejection -/
 
+/-- Unmonomorphized `RigidTy.param` / `RigidTy.alias` types fail closed in
+`translateTy`, and `monoCallee?` / `progInFragment` reject both callers passing
+non-empty generic `tys` (`RigidTy.param`, `RigidTy.alias`, or concrete type
+arguments) to a monomorphic callee (`typeParamCount = 0`) and callees with
+`typeParamCount ≠ 0`. -/
+theorem bdPolymorphicCallee_rejected :
+    translateTy ⟨64, true, []⟩ { kind := .param 0 "T", layoutIdx := 0 } = none ∧
+      translateTy ⟨64, true, []⟩ { kind := .alias "T::Item" [], layoutIdx := 0 } = none ∧
+      monoCallee? [fbBlackBoxCallee] (fbFnOp "core::intrinsics::black_box" [.uint .u32])
+        "core::intrinsics::black_box" = none ∧
+      monoCallee? [{ fbBlackBoxCallee with typeParamCount := 1 }]
+        (fbFnOp "core::intrinsics::black_box" []) "core::intrinsics::black_box" = none ∧
+      progInFragment
+        (fbCaller "boundary::poly_caller" "core::intrinsics::black_box" [.param 0 "T"]
+          [u32Decl, u32Decl] (fbAbi [u32Layout] u32Layout))
+        [fbBlackBoxCallee] = false ∧
+      progInFragment fbBlackBoxCaller [{ fbBlackBoxCallee with typeParamCount := 1 }] = false :=
+  ⟨rfl, rfl, rfl, rfl, by decide, by decide⟩
 
-/-! ### `ExternalCallHandler` instances translated to MiniRust -/
-
-def bdCtpopCallerProg : Gen.Program := (translateProg bdCtpopCaller []).getD emptyProg
-def bdCtpopCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdCtpopCaller []) bdCtpopCaller).getD callerFn
-def bdCtpopCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdCtpopCallerProg 1 bdCtpopCaller bdCtpopCallerFn
-  (initMachineStateWithCallees bdCtpopCaller bdCtpopArgs []).frame.locals bdCtpopCallerFn.start
-
-def bdCtpopI8CallerProg : Gen.Program := (translateProg bdCtpopI8Caller []).getD emptyProg
-def bdCtpopI8CallerFn : Gen.Function := (translateFnInProg (fnNameMap bdCtpopI8Caller []) bdCtpopI8Caller).getD callerFn
-def bdCtpopI8CallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdCtpopI8CallerProg 1 bdCtpopI8Caller bdCtpopI8CallerFn
-  (initMachineStateWithCallees bdCtpopI8Caller [.scalar ⟨255, 1⟩] []).frame.locals bdCtpopI8CallerFn.start
-
--- theorem bdCtpop_minirust_direct :
---     (Interp.steps 20 bdCtpopCallerMInit).toOption.map
---         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
---       some (some { retAlloc with data := scalarBytes u32 4 }, [1]) := rfl
--- 
--- theorem bdCtpopI8_minirust_direct :
---     (Interp.steps 20 bdCtpopI8CallerMInit).toOption.map
---         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
---       some (some { retAlloc with data := scalarBytes u32 8 }, [1]) := rfl
--- 
--- def bdExactDivI32CallerProg : Gen.Program := (translateProg bdExactDivI32Caller []).getD emptyProg
--- def bdExactDivI32CallerFn : Gen.Function := (translateFnInProg (fnNameMap bdExactDivI32Caller []) bdExactDivI32Caller).getD callerFn
--- def bdExactDivI32CallerMInit (l r : Nat) : Mach := multiMachineWithCtx ctxCallSpin bdExactDivI32CallerProg 1 bdExactDivI32Caller bdExactDivI32CallerFn
---   (initMachineStateWithCallees bdExactDivI32Caller [.scalar ⟨l, 4⟩, .scalar ⟨r, 4⟩] []).frame.locals bdExactDivI32CallerFn.start
--- 
--- def bdExactDivU32CallerProg : Gen.Program := (translateProg bdExactDivU32Caller []).getD emptyProg
--- def bdExactDivU32CallerFn : Gen.Function := (translateFnInProg (fnNameMap bdExactDivU32Caller []) bdExactDivU32Caller).getD callerFn
--- def bdExactDivU32CallerMInit (l r : Nat) : Mach := multiMachineWithCtx ctxCallSpin bdExactDivU32CallerProg 1 bdExactDivU32Caller bdExactDivU32CallerFn
---   (initMachineStateWithCallees bdExactDivU32Caller [.scalar ⟨l, 4⟩, .scalar ⟨r, 4⟩] []).frame.locals bdExactDivU32CallerFn.start
--- 
--- theorem bdExactDivI32_minirust_direct :
---     (Interp.steps 20 (bdExactDivI32CallerMInit 4294967290 3)).toOption.map
---         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
---       some (some { retAlloc with data := scalarBytes u32 4294967294 }, [1]) := rfl
--- 
--- theorem bdExactDivU32_minirust_ub :
---     Interp.steps 20 (bdExactDivU32CallerMInit 4294967290 3) =
---       .error (.ub "exact division with remainder") := rfl
--- 
--- theorem bdExactDivI32_zero_ub :
---     Interp.steps 20 (bdExactDivI32CallerMInit 6 0) =
---       .error (.ub "division by zero") := rfl
--- 
--- theorem bdExactDivI32_overflow_ub :
---     Interp.steps 20 (bdExactDivI32CallerMInit 2147483648 4294967295) =
---       .error (.ub "overflow in division") := rfl
--- 
--- def bdColdPathCallerProg : Gen.Program := (translateProg bdColdPathCaller []).getD emptyProg
--- def bdColdPathCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdColdPathCaller []) bdColdPathCaller).getD callerFn
--- def bdColdPathCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdColdPathCallerProg 1 bdColdPathCaller bdColdPathCallerFn
---   (initMachineStateWithCallees bdColdPathCaller [] []).frame.locals bdColdPathCallerFn.start
--- 
--- theorem bdColdPath_minirust_direct :
---     (Interp.steps 20 bdColdPathCallerMInit).toOption.map
---         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
---       some (some { retAlloc with data := scalarBytes u32 0 }, [1]) := rfl
--- 
-def bdAbortCallerProg : Gen.Program := (translateProg bdAbortCaller []).getD emptyProg
-def bdAbortCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdAbortCaller []) bdAbortCaller).getD callerFn
-def bdAbortCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdAbortCallerProg 1 bdAbortCaller bdAbortCallerFn
-  (initMachineStateWithCallees bdAbortCaller [] []).frame.locals bdAbortCallerFn.start
--- 
--- -- theorem bdAbort_minirust_ub :
--- --     Interp.steps 20 bdAbortCallerMInit = .error .abort := rfl
--- -- 
--- -- def bdUbChecksCallCallerProg : Gen.Program := (translateProg bdUbChecksCallCaller []).getD emptyProg
--- -- def bdUbChecksCallCallerFn : Gen.Function := (translateFnInProg (fnNameMap bdUbChecksCallCaller []) bdUbChecksCallCaller).getD callerFn
--- -- def bdUbChecksCallCallerMInit : Mach := multiMachineWithCtx ctxCallSpin bdUbChecksCallCallerProg 1 bdUbChecksCallCaller bdUbChecksCallCallerFn
--- --   (initMachineStateWithCallees bdUbChecksCallCaller [] []).frame.locals bdUbChecksCallCallerFn.start
--- -- 
--- -- theorem bdUbChecksCall_minirust_direct :
--- --     (Interp.steps 20 bdUbChecksCallCallerMInit).toOption.map
--- --         (fun m => (m.mem.memory.allocations[0]?, m.threads.map (·.stack.length))) =
--- --       some (some { retAlloc with data := scalarBytes u8 0 }, [1]) := rfl
--- -- 
--- -- end MiniRustSpec.Correspondence
+end MiniRustSpec.Correspondence

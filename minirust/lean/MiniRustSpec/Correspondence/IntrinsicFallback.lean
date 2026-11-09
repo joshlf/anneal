@@ -38,10 +38,13 @@ operation, expressed in the fragment's MIR; none is captured or quoted from
 
 Every callee has the Rust calling convention (`CallConv.rust`): the fragment
 requires a convention that `translateCallConv` accepts, and it rejects
-`CallConv.rustIntrinsic`. Since `findCallee?` compares `DefPath`s only, each
-program contains a single monomorphic instance of its callee; the generic
-arguments recorded in the call's `FnDef` type document that instance but are
-never consulted.
+`CallConv.rustIntrinsic`. Because `MirSemantics.lookupCallee` and
+`monoCallee?` resolve a monomorphic callee body (`typeParamCount = 0`) only
+when the call's `FnDef` carries no generic type arguments (`tys = []`), each
+caller below invokes its monomorphized fallback body with `tys = []`; calls
+carrying generic type arguments (`RigidTy.param`, `RigidTy.alias`, or concrete
+substitutions) or targeting polymorphic bodies (`typeParamCount ≠ 0`) fail
+closed outside `progInFragment`.
 
 This is a statement about Anneal's capture model and about `translateProg`,
 not about upstream `minimize`. `minimize`'s `translate_call`
@@ -507,7 +510,7 @@ def fbCtlzCallee : CapturedMir where
 
 /-- `fn ctlz_caller(x: u8) -> u32 { core::intrinsics::ctlz(x) }`. -/
 def fbCtlzCaller : CapturedMir :=
-  fbCaller "fallback::ctlz_caller" "core::intrinsics::ctlz" [.uint .u8] [u32Decl, u8Decl]
+  fbCaller "fallback::ctlz_caller" "core::intrinsics::ctlz" [] [u32Decl, u8Decl]
     (fbAbi [i8Layout] u32Layout)
 
 theorem fbCtlz_inFragment : progInFragment fbCtlzCaller [fbCtlzCallee] = true := by decide
@@ -675,7 +678,7 @@ def fbCttzCallee : CapturedMir where
 
 /-- `fn cttz_caller(x: u8) -> u32 { core::intrinsics::cttz(x) }`. -/
 def fbCttzCaller : CapturedMir :=
-  fbCaller "fallback::cttz_caller" "core::intrinsics::cttz" [.uint .u8] [u32Decl, u8Decl]
+  fbCaller "fallback::cttz_caller" "core::intrinsics::cttz" [] [u32Decl, u8Decl]
     (fbAbi [i8Layout] u32Layout)
 
 theorem fbCttz_inFragment : progInFragment fbCttzCaller [fbCttzCallee] = true := by decide
@@ -819,7 +822,7 @@ def fbBswapCallee : CapturedMir where
 
 /-- `fn bswap_caller(x: u32) -> u32 { core::intrinsics::bswap(x) }`. -/
 def fbBswapCaller : CapturedMir :=
-  fbCaller "fallback::bswap_caller" "core::intrinsics::bswap" [.uint .u32] [u32Decl, u32Decl]
+  fbCaller "fallback::bswap_caller" "core::intrinsics::bswap" [] [u32Decl, u32Decl]
     (fbAbi [u32Layout] u32Layout)
 
 theorem fbBswap_inFragment : progInFragment fbBswapCaller [fbBswapCallee] = true := by decide
@@ -980,7 +983,7 @@ def fbBitrevCallee : CapturedMir where
 
 /-- `fn bitreverse_caller(x: u8) -> u8 { core::intrinsics::bitreverse(x) }`. -/
 def fbBitrevCaller : CapturedMir :=
-  fbCaller "fallback::bitreverse_caller" "core::intrinsics::bitreverse" [.uint .u8]
+  fbCaller "fallback::bitreverse_caller" "core::intrinsics::bitreverse" []
     [u8Decl, u8Decl] (fbAbi [i8Layout] i8Layout)
 
 theorem fbBitrev_inFragment : progInFragment fbBitrevCaller [fbBitrevCallee] = true := by decide
@@ -1144,7 +1147,7 @@ def fbSatAddCallee : CapturedMir where
 
 /-- `fn saturating_add_caller(a: u8, b: u8) -> u8 { saturating_add(a, b) }`. -/
 def fbSatAddCaller : CapturedMir :=
-  fbCaller "fallback::saturating_add_caller" "core::intrinsics::saturating_add" [.uint .u8]
+  fbCaller "fallback::saturating_add_caller" "core::intrinsics::saturating_add" []
     [u8Decl, u8Decl, u8Decl] (fbAbi [i8Layout, i8Layout] i8Layout)
 
 theorem fbSatAdd_inFragment : progInFragment fbSatAddCaller [fbSatAddCallee] = true := by decide
@@ -1315,7 +1318,7 @@ def fbSatSubCallee : CapturedMir where
 
 /-- `fn saturating_sub_caller(a: i8, b: i8) -> i8 { saturating_sub(a, b) }`. -/
 def fbSatSubCaller : CapturedMir :=
-  fbCaller "fallback::saturating_sub_caller" "core::intrinsics::saturating_sub" [.int .i8]
+  fbCaller "fallback::saturating_sub_caller" "core::intrinsics::saturating_sub" []
     [i8Decl, i8Decl, i8Decl] (fbAbi [i8Layout, i8Layout] i8Layout)
 
 theorem fbSatSub_inFragment : progInFragment fbSatSubCaller [fbSatSubCallee] = true := by decide
@@ -1738,7 +1741,7 @@ def fbBlackBoxCallee : CapturedMir where
 
 /-- `fn black_box_caller(x: u32) -> u32 { core::intrinsics::black_box(x) }`. -/
 def fbBlackBoxCaller : CapturedMir :=
-  fbCaller "fallback::black_box_caller" "core::intrinsics::black_box" [.uint .u32]
+  fbCaller "fallback::black_box_caller" "core::intrinsics::black_box" []
     [u32Decl, u32Decl] (fbAbi [u32Layout] u32Layout)
 
 theorem fbBlackBox_inFragment : progInFragment fbBlackBoxCaller [fbBlackBoxCallee] = true := by

@@ -2573,9 +2573,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   BorrowsOk.jump
   BorrowsOk.rawPtr
   BorrowsOk.derefWrite
+  BorrowsOk.derefWriteRead
   LocalsOk.rawPtr_extend
   evalStmt_assign_rawPtr
+  evalStmt_assign_val_mem
   evalStmt_assign_derefWrite
+  evalStmt_assign_derefWrite_mem
   evalOperand_deref_eq_target
   evalRvalue_ptrRvalue
   evalRvalue_derefRead_eq
@@ -2729,6 +2732,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   offsetDeref3_translate
   offsetDerefMax_translate
   offsetDeref_anneal_ret
+  offsetDeref_anneal_ub
   offsetDeref1_minirust_direct
   offsetDeref2_minirust_direct
   offsetDeref3_minirust_direct
@@ -2793,9 +2797,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   BorrowsOk.jump
   BorrowsOk.rawPtr
   BorrowsOk.derefWrite
+  BorrowsOk.derefWriteRead
   LocalsOk.rawPtr_extend
   evalStmt_assign_rawPtr
+  evalStmt_assign_val_mem
   evalStmt_assign_derefWrite
+  evalStmt_assign_derefWrite_mem
   evalOperand_deref_eq_target
   evalRvalue_ptrRvalue
   evalRvalue_derefRead_eq
@@ -2949,6 +2956,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   offsetDeref3_translate
   offsetDerefMax_translate
   offsetDeref_anneal_ret
+  offsetDeref_anneal_ub
   offsetDeref1_minirust_direct
   offsetDeref2_minirust_direct
   offsetDeref3_minirust_direct
@@ -5041,19 +5049,19 @@ open MiniRustSpec.Correspondence in
   bdCopy_translateStatement
   bdCopy_rejected
   bdOffset1_anneal_ret
-  bdOffsetNeg1_anneal_ret
-  bdOffsetNeg1_noUB
+  bdOffsetNeg1_anneal_ub
+  bdOffsetNeg1_not_noUB
   bdOffset_rejected
-  bdArithOffset_extCall
+  bdArithOffset_anneal_ret
   bdMirCallReq_fields
   bdWriteBytes_extCall
   bdRawEq_extCall
   bdColdPath_extCall
-  bdCtpop_extCall
-  bdExactDivI32_extCall
-  bdAbort_unsupported
+  bdCtpop_anneal_ret
+  bdExactDivI32_anneal_ret
+  bdAbort_anneal_abort
   bdExactDiv_param_types
-  bdExactDiv_same_request
+  bdExactDiv_typeArgs_distinct
   bdExactDiv_decode
   bdExactDiv_minirust_i32
   bdExactDiv_minirust_u32
@@ -5062,17 +5070,18 @@ open MiniRustSpec.Correspondence in
   evalCountOnes_intFromBits
   evalCountOnes_signedness_indep
   bdColdPath_handled
-  bdCtpop_handled
-  bdExactDiv_handled
+  bdCtpop_inline
+  bdExactDiv_inline
   exactDivHandler_iff_minirust
   bdWriteBytes_unhandled_fault
-  bdUbChecksCall_extCall
+  bdUbChecksCall_anneal_ret
   bdUbChecksCall_handled
   bdUnreach_anneal_ub
   bdUnreach_anneal_fault
   bd_minirust_unreachable_ub
   bdUnreach_rejected
   bdUnreachableTerminator_covered
+  bdPolymorphicCallee_rejected
 
 /-- Exhaustively verify that every declaration across every imported
 `MiniRustSpec.*` module in the environment depends only on Lean's standard

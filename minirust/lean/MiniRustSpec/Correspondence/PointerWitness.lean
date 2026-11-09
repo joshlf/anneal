@@ -83,17 +83,16 @@ uninitialized pointer temporary), `derefWriteRhsUb`, `derefIdxWriteRhsUb`, and
 `TupleSpec` scalar field chain), and `dangling` (a read through a pointer to a
 temporary after its `StorageDead`).
 
+and `offsetDeref` (outside `inFragment` because `&raw const (_2[0 of 2])`
+borrows an array element subplace and `k ≠ 0` uses a non-zero `Offset`, yet
+Anneal's stride-scaled `BinOp::Offset` and subobject byte-offset dereference
+match MiniRust: `offsetDeref 0` returns `a[0] = 5`, `offsetDeref 1` returns
+`a[1] = 7`, and `offsetDeref 2`, `offsetDeref 3`, and `offsetDeref usizeMax`
+raise UB).
+
 **Divergence, Anneal unsound.** Anneal returns a value where MiniRust, the
 ground truth, returns a different value or raises UB:
 
-* `offsetDeref 1`: `*a[0..].offset(1)` reads `a[1]` in MiniRust and `a[0]` in
-  Anneal, whose dereference ignores the pointer's offset;
-* `offsetDeref 2`: the one-past-the-end pointer may be computed, but reading
-  through it is UB in MiniRust;
-* `offsetDeref 3`: computing a pointer beyond one-past-the-end is UB in
-  MiniRust (`ptr_offset_inbounds`);
-* `offsetDeref usizeMax`: the byte count `usize::MAX * 4` overflows, which is UB
-  in MiniRust (`MulUnchecked`);
 * `misaligned`: reading a `u32` through a pointer one byte into a `u32` is UB in
   MiniRust;
 * `exposeTwice`: two `&raw const x` expose the same address in MiniRust, but
@@ -2220,22 +2219,33 @@ theorem offsetDeref3_translate : translateFn (offsetDeref 3) = some (offsetDeref
 theorem offsetDerefMax_translate :
     translateFn (offsetDeref usizeMax) = some (offsetDerefFn usizeMax) := rfl
 
-/-- Anneal returns `a[0] = x` for every offset `k ∈ {0, 1, 2, 3, usize::MAX}`:
-`Offset` adds the raw count to the pointer's `offsetBytes`, and the
-dereference reads the borrow entry's place `_2[0 of 2]` regardless. -/
+/-- `offsetDeref` is outside `inFragment` (`&raw const (_2[0 of 2])` borrows an
+indexed array subplace, and `k ≠ 0` uses a non-zero `BinOp::Offset`). -/
 theorem offsetDeref_notInFragment :
     ∀ k ∈ [0, 1, 2, 3, usizeMax], inFragment (offsetDeref k) = false := by decide +kernel
 
-theorem offsetDeref_anneal_ret (k : Nat) (hk : k ∈ [0, 1, 2, 3, usizeMax]) :
-    ∃ mem, ReachesRet (mirTree (offsetDeref k) (initMachineState (offsetDeref k) [.scalar ⟨5, 4⟩]))
-      [] (.normal (.scalar ⟨5, 4⟩, mem)) := by
+/-- Anneal's stride-scaled `BinOp::Offset` and array byte-offset dereference
+return `a[0] = 5` for `k = 0` and `a[1] = 7` for `k = 1`, matching MiniRust. -/
+theorem offsetDeref_anneal_ret :
+    (∃ mem, ReachesRet (mirTree (offsetDeref 0) (initMachineState (offsetDeref 0) [.scalar ⟨5, 4⟩]))
+      [] (.normal (.scalar ⟨5, 4⟩, mem))) ∧
+    (∃ mem, ReachesRet (mirTree (offsetDeref 1) (initMachineState (offsetDeref 1) [.scalar ⟨5, 4⟩]))
+      [] (.normal (.scalar ⟨7, 4⟩, mem))) :=
+  ⟨⟨_, runA_sound (offsetDeref 0) 30 _ _ _ rfl⟩,
+   ⟨_, runA_sound (offsetDeref 1) 30 _ _ _ rfl⟩⟩
+
+/-- For `k ∈ {2, 3, usize::MAX}`, Anneal faults with UB (reading through
+one-past-the-end `p.offset(2)`, out-of-bounds `p.offset(3)`, and overflowing
+`p.offset(usize::MAX)`), matching MiniRust. -/
+theorem offsetDeref_anneal_ub (k : Nat) (hk : k ∈ [2, 3, usizeMax]) :
+    ∃ tr u,
+      Reaches (mirTree (offsetDeref k) (initMachineState (offsetDeref k) [.scalar ⟨5, 4⟩])) tr u ∧
+      FaultNow u := by
   simp only [List.mem_cons, List.not_mem_nil, or_false] at hk
-  rcases hk with rfl | rfl | rfl | rfl | rfl
-  · exact ⟨_, runA_sound (offsetDeref 0) 30 _ _ _ rfl⟩
-  · exact ⟨_, runA_sound (offsetDeref 1) 30 _ _ _ rfl⟩
-  · exact ⟨_, runA_sound (offsetDeref 2) 30 _ _ _ rfl⟩
-  · exact ⟨_, runA_sound (offsetDeref 3) 30 _ _ _ rfl⟩
-  · exact ⟨_, runA_sound (offsetDeref usizeMax) 30 _ _ _ rfl⟩
+  rcases hk with rfl | rfl | rfl
+  · exact faultsA_sound (offsetDeref 2) 30 _ rfl
+  · exact faultsA_sound (offsetDeref 3) 30 _ rfl
+  · exact faultsA_sound (offsetDeref usizeMax) 30 _ rfl
 
 /-- MiniRust reads `a[1] = 7` through `p.offset(1)`. -/
 theorem offsetDeref1_minirust_direct :
