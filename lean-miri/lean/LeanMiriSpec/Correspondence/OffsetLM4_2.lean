@@ -622,9 +622,10 @@ theorem StateRelLM3_1.write_dead_return
 /-! ## 3. One-step `arith_offset` / `wrapping_offset` call simulation -/
 
 /-- **`call_intrinsic_offset_simulation` (`LM-4.2`)**: one real step of a
-translated call of `core::intrinsics::arith_offset::<T>(ptr, count)` or its
-`core::intrinsics::wrapping_offset::<T>(ptr, count)` alias (`hk : k =
-.arithOffset ∨ k = .wrappingOffset`) in both machines, from any
+translated call of `{core,std}::intrinsics::arith_offset::<T>(ptr, count)` or
+its `{core,std}::intrinsics::wrapping_offset::<T>(ptr, count)` alias
+(`hpath : AnnealIntrinsic.ofDefPath? calleePath = some k`,
+`hk : k = .arithOffset ∨ k = .wrappingOffset`) in both machines, from any
 `StateRelLM3_1`-related states.
 
 Pointee byte size `elemBytes` agrees across Anneal (`helem_anneal`) and
@@ -655,13 +656,14 @@ theorem call_intrinsic_offset_simulation
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
     (hstmt_len : s.frame.stmtIdx = length bb.statements)
-    {k : AnnealIntrinsic} (hk : k = .arithOffset ∨ k = .wrappingOffset)
+    {calleePath : DefPath} {k : AnnealIntrinsic} (hk : k = .arithOffset ∨ k = .wrappingOffset)
     {pointeeKind : RigidTy} {c : ConstOperand} {ptrIdx : Local} {countOp : MirAst.Operand}
     {dstIdx : Local} {targetBb : BasicBlockIdx} {unwind : UnwindAction}
     (hterm : bb.terminator.kind =
       .call (.constant c) [.copy ⟨ptrIdx, []⟩, countOp] ⟨dstIdx, []⟩ (some targetBb) unwind)
-    (hc : c.ty.kind = .fnDef k.defPath [pointeeKind])
-    (hcallee : findCallee? s.memory.callees k.defPath = none)
+    (hc : c.ty.kind = .fnDef calleePath [pointeeKind])
+    (hcallee : findCallee? s.memory.callees calleePath = none)
+    (hpath : AnnealIntrinsic.ofDefPath? calleePath = some k)
     (hprog : targetBb ≠ s.frame.blockIdx ∨ s.frame.stmtIdx ≠ 0)
     {ptrDecl : LocalDecl} {ptrMut : Mutability}
     (hptrDecl : get? body.localDecls ptrIdx = some ptrDecl)
@@ -694,9 +696,9 @@ theorem call_intrinsic_offset_simulation
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
   simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
-  rw [evalTerminator_inline_intrinsic_call hterm hc hcallee hk_ne,
+  rw [evalTerminator_inline_intrinsic_call_ofDefPath? hterm hc hcallee hpath hk_ne,
     miri_step_at_terminator hframes hfr.body_eq hfr.location_eq hbb hstmt_none,
-    translateTerminator_intrinsic_call hterm hc]
+    translateTerminator_intrinsic_call_ofDefPath? hterm hc hpath]
   simp only [List.map_cons, List.map_nil]
   have hptr_ne_move : ∀ p, translateOperand (.copy ⟨ptrIdx, []⟩) ≠ .Move p :=
     fun _ h => by cases h
@@ -727,12 +729,22 @@ theorem call_intrinsic_offset_simulation
       2 ^ 63 := by
     dsimp only [argTyId]; rw [helem_miri]; exact helem_lt
   have hinline : ∀ v₁ v₂ L,
-      evalInlineIntrinsicCall? s k.defPath [.copy ⟨ptrIdx, []⟩, countOp]
+      evalInlineIntrinsicCall? s calleePath [.copy ⟨ptrIdx, []⟩, countOp]
         [v₁, v₂] L ⟨dstIdx, []⟩ targetBb body.localDecls body.layouts =
       some (evalArithOffsetCall s (.copy ⟨ptrIdx, []⟩) v₁ v₂ L ⟨dstIdx, []⟩ targetBb
         body.localDecls body.layouts) := by
     intro v₁ v₂ L
-    rcases hk with rfl | rfl <;> rfl
+    unfold evalInlineIntrinsicCall? integerBitIntrinsicOfPath?
+    rcases AnnealIntrinsic.ofDefPath?_cases hpath with hdef | ⟨_, hstd⟩ | ⟨_, hstd⟩
+    · rw [stringEq_congr_left hdef, stringEq_congr_left hdef, stringEq_congr_left hdef,
+        stringEq_congr_left hdef, stringEq_congr_left hdef, stringEq_congr_left hdef,
+        stringEq_congr_left hdef, stringEq_congr_left hdef, stringEq_congr_left hdef,
+        stringEq_congr_left hdef, stringEq_congr_left hdef, stringEq_congr_left hdef,
+        stringEq_congr_left hdef, stringEq_congr_left hdef, stringEq_congr_left hdef,
+        stringEq_congr_left hdef]
+      rcases hk with rfl | rfl <;> rfl
+    · simp only [stringEq_congr_left hstd]; rfl
+    · simp only [stringEq_congr_left hstd]; rfl
   -- Pointer operand `ptrIdx`.
   rcases annealEvalOperand_rawPtr_copy_lm3_1 hstate₁ rfl hptrDecl hptrTy
       (himm₁ ptrIdx (hptrImm tf hframes)) with

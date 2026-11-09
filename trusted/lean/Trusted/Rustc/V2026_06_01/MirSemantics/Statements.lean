@@ -520,6 +520,185 @@ def lookupCopyBorrowChecked
     | false => .none
 
 /--
+Extract `totalBytes` little-endian bytes starting at byte offset `srcStart` from
+canonicalized `srcBytes`-byte unsigned integer `srcBits`:
+`(wrapScalarBits srcBits (scalarModulus srcBytes) / scalarModulus srcStart) %
+scalarModulus totalBytes`.
+-/
+@[reducible]
+def sliceScalarBytes (srcBits srcBytes srcStart totalBytes : Nat) : Nat :=
+  Nat.mod
+    (Nat.div
+      (wrapScalarBits srcBits (scalarModulus srcBytes))
+      (scalarModulus srcStart))
+    (scalarModulus totalBytes)
+
+/--
+Splice `totalBytes`-byte little-endian integer `chunkBits`
+(`chunkBits < scalarModulus totalBytes`) into `dstBytes`-byte unsigned integer
+`dstBits` at byte offset `dstStart` (`dstStart + totalBytes <= dstBytes`),
+preserving bytes `[0, dstStart)` and `[dstStart + totalBytes, dstBytes)`.
+-/
+@[reducible]
+def spliceScalarBytes
+    (dstBits chunkBits dstStart totalBytes dstBytes : Nat) : Nat :=
+  let lowMod := scalarModulus dstStart
+  let highMod := scalarModulus (Nat.add dstStart totalBytes)
+  let old := wrapScalarBits dstBits (scalarModulus dstBytes)
+  Nat.add (Nat.mod old lowMod)
+    (Nat.add (Nat.mul chunkBits lowMod)
+      (Nat.mul (Nat.div old highMod) highMod))
+
+/--
+Look up a root-local `LocalSlot` for `copy_nonoverlapping` in `locals₃`, falling
+back to `s.memory.callerLocals` when `targetLocal` names a caller slot.
+-/
+@[reducible]
+def lookupCopyRootSlot
+    (s : MachineState)
+    (locals₃ : List LocalSlot)
+    (targetLocal : Local) :
+    Option LocalSlot :=
+  match get? locals₃ targetLocal with
+  | .some slot => .some slot
+  | .none =>
+    match get? s.memory.callerLocals targetLocal with
+    | .some slot => .some slot
+    | .none =>
+      get? s.memory.callerLocals (Nat.sub targetLocal (length locals₃))
+
+/--
+Write `newSlot` to root local `dstLocal` (in `locals₃` or `callerLocals`),
+invalidate conflicting borrows on `dstLocal` relative to `dstPtr.tag`, and
+advance the current statement.
+-/
+def writeCopyRootSlot
+    (s : MachineState)
+    (locals₃ : List LocalSlot)
+    (dstPtr : ProvenancePtr)
+    (dstLocal : Local)
+    (newSlot : LocalSlot) :
+    MirStepNode :=
+  match get? locals₃ dstLocal with
+  | .some .dead => MirStepNode.fail .ub
+  | .some _ =>
+    match set? locals₃ dstLocal newSlot with
+    | .some locals₄ =>
+      let borrows' :=
+        invalidateConflictingBorrows
+          s.memory.borrows
+          dstLocal
+          (.some dstPtr.tag)
+      MirStepNode.step
+        (advanceStmt
+          s
+          locals₄
+          { s.memory with borrows := borrows' })
+    | .none => MirStepNode.fail .ub
+  | .none =>
+    let callerIdx :=
+      match get? s.memory.callerLocals dstLocal with
+      | .some _ => dstLocal
+      | .none => Nat.sub dstLocal (length locals₃)
+    match get? s.memory.callerLocals callerIdx with
+    | .some .dead => MirStepNode.fail .ub
+    | .some _ =>
+      match set? s.memory.callerLocals callerIdx newSlot with
+      | .some callerLocals' =>
+        let borrows' :=
+          invalidateConflictingBorrows
+            s.memory.borrows
+            dstLocal
+            (.some dstPtr.tag)
+        MirStepNode.step
+          (advanceStmt
+            s
+            locals₃
+            { s.memory with
+              borrows := borrows'
+              callerLocals := callerLocals' })
+      | .none => MirStepNode.fail .ub
+    | .none => MirStepNode.fail .ub
+
+/--
+Evaluate a positive-byte `copy_nonoverlapping` of `totalBytes` bytes between two
+root-local primitive integer locals (`srcBytes`, `dstBytes`) once in-bounds and
+permission checks have passed:
+1. Dead or out-of-frame source or destination locals, or an uninitialized source
+   local, are undefined behavior.
+2. Same-local overlapping byte ranges (`srcStart < dstStart + totalBytes` and
+   `dstStart < srcStart + totalBytes`) are undefined behavior, whereas disjoint
+   sub-ranges of the same local succeed.
+3. Slices `totalBytes` little-endian bytes at `srcStart` via `sliceScalarBytes`
+   and either initializes/overwrites all `dstBytes` bytes of `dst` when
+   `dstStart == 0 && totalBytes == dstBytes` (even when `dst` was `.uninit`),
+   splices them into an initialized destination scalar via `spliceScalarBytes`,
+   or leaves a partially written `.uninit` destination `.uninit` (matching
+   `evalWriteBytesCall`).
+-/
+def evalCopyRootIntScalars
+    (s : MachineState)
+    (locals₃ : List LocalSlot)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (srcBytes dstBytes totalBytes : Nat) :
+    MirStepNode :=
+  let srcStart := srcPtr.offsetBytes
+  let dstStart := dstPtr.offsetBytes
+  match
+    lookupCopyRootSlot s locals₃ srcEntry.targetLocal,
+    lookupCopyRootSlot s locals₃ dstEntry.targetLocal
+  with
+  | .none, _ => MirStepNode.fail .ub
+  | .some .dead, _ => MirStepNode.fail .ub
+  | _, .none => MirStepNode.fail .ub
+  | _, .some .dead => MirStepNode.fail .ub
+  | .some .uninit, _ => MirStepNode.fail .ub
+  | .some (.init (.scalar srcSc)), .some dstSlot =>
+    match Nat.beq srcSc.sizeBytes srcBytes with
+    | false => MirStepNode.unsupported
+    | true =>
+      let overlaps : Bool :=
+        Bool.and
+          (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+          (Bool.not
+            (Bool.or
+              (Nat.ble (Nat.add srcStart totalBytes) dstStart)
+              (Nat.ble (Nat.add dstStart totalBytes) srcStart)))
+      match overlaps with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let chunk := sliceScalarBytes srcSc.bits srcBytes srcStart totalBytes
+        match Bool.and (Nat.beq dstStart 0) (Nat.beq totalBytes dstBytes) with
+        | true =>
+          writeCopyRootSlot
+            s
+            locals₃
+            dstPtr
+            dstEntry.targetLocal
+            (.init (.scalar { bits := chunk, sizeBytes := dstBytes }))
+        | false =>
+          match dstSlot with
+          | .dead => MirStepNode.fail .ub
+          | .uninit =>
+            writeCopyRootSlot s locals₃ dstPtr dstEntry.targetLocal .uninit
+          | .init (.scalar dstSc) =>
+            match Nat.beq dstSc.sizeBytes dstBytes with
+            | false => MirStepNode.unsupported
+            | true =>
+              let spliced :=
+                spliceScalarBytes
+                  dstSc.bits chunk dstStart totalBytes dstBytes
+              writeCopyRootSlot
+                s
+                locals₃
+                dstPtr
+                dstEntry.targetLocal
+                (.init (.scalar { bits := spliced, sizeBytes := dstBytes }))
+          | .init _ => MirStepNode.unsupported
+  | .some (.init _), _ => MirStepNode.unsupported
+
+/--
 Evaluate `copy_nonoverlapping` once `srcVal`, `dstVal`, and scalar `countBits`
 have been evaluated into `locals₃`, enforcing `count * size_of::<T>() <=
 isize::MAX`, pointer alignment to `align_of::<T>()` (including when `count ==
@@ -578,13 +757,76 @@ def evalCopyNonOverlappingWithCount
         | _, .frozen => MirStepNode.fail .ub
         | _, .disabled => MirStepNode.fail .ub
         | _, _ =>
+          let rootIntStep? : Option MirStepNode :=
+            match
+              totalBytesOpt,
+              srcEntry.targetProjection,
+              dstEntry.targetProjection
+            with
+            | .some totalBytes, .nil, .nil =>
+              match
+                get? localDecls srcEntry.targetLocal,
+                get? localDecls dstEntry.targetLocal
+              with
+              | .some srcDecl, .some dstDecl =>
+                match
+                  intCastTargetBytes srcDecl.ty.kind,
+                  intCastTargetBytes dstDecl.ty.kind
+                with
+                | .some srcBytes, .some dstBytes =>
+                  .some
+                    (evalCopyRootIntScalars
+                      s
+                      locals₃
+                      srcPtr
+                      dstPtr
+                      srcEntry
+                      dstEntry
+                      srcBytes
+                      dstBytes
+                      totalBytes)
+                | _, _ => .none
+              | _, _ => .none
+            | _, _, _ => .none
+          match rootIntStep? with
+          | .some stepNode => stepNode
+          | .none =>
           let n := countBits
           let srcStart := srcPtr.offsetBytes
           let dstStart := dstPtr.offsetBytes
+          let singleSizeMatches : Bool :=
+            match totalBytesOpt with
+            | .none => true
+            | .some totalBytes =>
+              let srcPlace : Place := {
+                local_ := srcEntry.targetLocal
+                projection := srcEntry.targetProjection
+              }
+              let dstPlace : Place := {
+                local_ := dstEntry.targetLocal
+                projection := dstEntry.targetProjection
+              }
+              let srcOk : Bool :=
+                match placeTy localDecls layouts srcPlace with
+                | .some st =>
+                  match rigidTyByteSize layouts st with
+                  | .some sBytes => Nat.beq totalBytes sBytes
+                  | .none => true
+                | .none => true
+              let dstOk : Bool :=
+                match placeTy localDecls layouts dstPlace with
+                | .some dt =>
+                  match rigidTyByteSize layouts dt with
+                  | .some dBytes => Nat.beq totalBytes dBytes
+                  | .none => true
+                | .none => true
+              Bool.and srcOk dstOk
           let isSingleDirect :=
             Bool.and
-              (Nat.beq n 1)
-              (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+              (Bool.and
+                (Nat.beq n 1)
+                (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0)))
+              singleSizeMatches
           match isSingleDirect with
           | true =>
             evalCopySingleDirect

@@ -14,9 +14,9 @@ import LeanMiriSpec.Correspondence.WriteBytesLM4_2
 # `copy_nonoverlapping` Statement Simulation for `LM-4.2`
 
 One-step correspondence between Anneal's `stepMirFn` (`evalCopyNonOverlapping` /
-`evalCopyNonOverlappingWithCount`) and `lean-miri`'s `Miri.Interpreter.Step.step`
-(`Intrinsics.evalNondiverging (.CopyNonOverlapping ...)` / `annealCopyEval` /
-`annealCheckPtrAlign` / `annealMemCopy`) from `StateRelLM3_1`:
+`evalCopyNonOverlappingWithCount` / `evalCopyRootIntScalars`) and `lean-miri`'s
+`Miri.Interpreter.Step.step` (`Intrinsics.evalNondiverging (.CopyNonOverlapping ...)` /
+`annealCopyEval` / `annealCheckPtrAlign` / `annealMemCopy`) from `StateRelLM3_1`:
 
 * `step_intrinsic_copyNonOverlapping_simulation` (and its explicit-`allocMap'`
   counterpart `step_intrinsic_copyNonOverlapping_simulation_explicit`) proves
@@ -32,11 +32,15 @@ One-step correspondence between Anneal's `stepMirFn` (`evalCopyNonOverlapping` /
   5. positive-byte copy with provenance-free `.scalar` `src` or `dst`, dead
      source or destination stack local, or out-of-bounds byte range (UB in
      both);
-  6. positive-byte copy on the same live initialized allocation
-     (`e_src.localIdx = e_dst.localIdx` ↔ `e_src.allocId = e_dst.allocId`):
-     overlap UB (`AllocError.copyRangesOverlap`) in both;
-  7. positive-byte copy between distinct live allocations
-     (`e_src.localIdx ≠ e_dst.localIdx`) with initialized `src` and valid
+  6. positive-byte copy on overlapping byte ranges of the same live initialized
+     allocation (`e_src.localIdx = e_dst.localIdx` with
+     `srcStart < dstStart + total` and `dstStart < srcStart + total`): overlap UB
+     (`AllocError.copyRangesOverlap`) in both;
+  7. positive-byte copy across arbitrary in-bounds byte ranges (`CopyTargetCompatible`:
+     cross-type integer byte copies such as `*const u8 -> *mut u64`, multi-element
+     counts `count > 1`, non-zero byte offsets, partial sub-local byte splices,
+     whole-local `.uninit` destination initialization, disjoint byte sub-ranges
+     of the same local, and `.bool` / `.char` same-type copies) with valid
      Tree Borrows permissions: copies `rawBytes`, `InitMask`, and
      `ProvenanceMap` byte-for-byte, invalidates conflicting borrows on `dst`,
      and preserves `StateRelLM3_1`.
@@ -938,6 +942,1419 @@ theorem StackScalarAllocShape.copyRepeatedly_uninit {E : Type} {n : Nat}
     { rw [copyAlloc_array_eta rawS _ hlenS, copyAlloc_array_eta rawD _ hlenD]
       with_unfolding_all exact ⟨_, rfl⟩ }
 
+/-! ### 4b. Byte-range `Allocation.copyRepeatedly` lemmas -/
+
+private theorem copyIte_pos {P : Prop} [Decidable P] {α : Type _} {a b : α} (h : P) :
+    (if P then a else b) = a := by simp [h]
+
+private theorem copyIte_neg {P : Prop} [Decidable P] {α : Type _} {a b : α} (h : ¬ P) :
+    (if P then a else b) = b := by simp [h]
+
+private def copyLe_pointerSize (layout : Miri.ABI.TargetDataLayout) : Miri.ABI.Size :=
+  Miri.ABI.Size.fromBits layout.pointerWidth.bits
+
+private def copyLe_readTargetUInt (layout : Miri.ABI.TargetDataLayout)
+    (bytes : Array UInt8) : Except Miri.Memory.AllocError Miri.ABI.U128 := do
+  if bytes.size > 16 then
+    throw (.scalarBytesTooWide (Miri.ABI.Size.ofBytes (UInt64.ofNat bytes.size)))
+  let mut value := 0
+  for index in [:bytes.size] do
+    let some byte := bytes[index]? | throw (.invalidSliceEndpoints index (index + 1) bytes.size)
+    let valueIndex := if layout.endian == .little then index else bytes.size - index - 1
+    value := value + byte.toNat * 2 ^ (8 * valueIndex)
+  return BitVec.ofNat 128 value
+
+private def copyLe_readScalar {P E : Type} [DecidableEq P] [Miri.Memory.PointerProvenance P]
+    (allocation : Miri.Memory.Allocation P E) (layout : Miri.ABI.TargetDataLayout)
+    (range : Miri.Memory.AllocRange) (readProvenance : Bool) :
+    Except Miri.Memory.AllocError (Miri.Memory.Scalar P) := do
+  match ← (allocation.initializationMask.isRangeInitialized range).mapError
+      Miri.Memory.AllocError.memory with
+  | .error bad => throw (.invalidUninitBytes (some ⟨range, bad⟩))
+  | .ok () => pure ()
+  let bytes ← Miri.Memory.Allocation.getBytesUnchecked allocation range
+  let bits ← copyLe_readTargetUInt layout bytes
+  if readProvenance then
+    let targetSize := copyLe_pointerSize layout
+    if range.size != targetSize then
+      throw (.scalarPointerNotTargetSized range.size targetSize)
+    let provenance ← match allocation.provenanceMap.readPtr range.start targetSize with
+      | .ok provenance => pure provenance
+      | .error (.readPartialPointer offset) => throw (.readPartialPointer offset)
+      | .error reason => throw (.provenance reason)
+    match provenance with
+    | some provenance =>
+      if bits.toNat > 18446744073709551615 then
+        throw (.pointerBitsDoNotFitOffset bits)
+      return Miri.Memory.Scalar.fromPointer layout
+        (Miri.Memory.Pointer.new provenance (Miri.ABI.Size.ofBytes (UInt64.ofNat bits.toNat)))
+    | none =>
+      let scalar ← (Miri.Memory.Scalar.fromUInt bits range.size).mapError
+        Miri.Memory.AllocError.scalar
+      return scalar
+  else
+    if Miri.Memory.PointerProvenance.offsetIsAddr (Prov := P) then
+      let scalar ← (Miri.Memory.Scalar.fromUInt bits range.size).mapError
+        Miri.Memory.AllocError.scalar
+      return scalar
+    let isEmpty ←
+      (allocation.provenanceMap.rangeEmpty range (copyLe_pointerSize layout)).mapError
+        Miri.Memory.AllocError.provenance
+    if isEmpty then
+      let scalar ← (Miri.Memory.Scalar.fromUInt bits range.size).mapError
+        Miri.Memory.AllocError.scalar
+      return scalar
+    throw (.readPointerAsInt none)
+
+private theorem copyLe_readScalar_eq {P E : Type} [DecidableEq P]
+    [Miri.Memory.PointerProvenance P]
+    (allocation : Miri.Memory.Allocation P E) (layout : Miri.ABI.TargetDataLayout)
+    (range : Miri.Memory.AllocRange) (readProvenance : Bool) :
+    allocation.readScalar layout range readProvenance =
+      copyLe_readScalar allocation layout range readProvenance := rfl
+
+private def copyLe_bytes (x n : Nat) : Array UInt8 :=
+  ((List.range' 0 n).map fun i => UInt8.ofNat ((x / 2 ^ (8 * i)) % 256)).toArray
+
+private theorem copyLe_bytes_size (x n : Nat) : (copyLe_bytes x n).size = n := by
+  simp [copyLe_bytes]
+
+private def copyLe_sum (x k : Nat) : Nat → Nat
+  | 0 => 0
+  | m + 1 => x / 2 ^ (8 * k) % 256 * 2 ^ (8 * k) + copyLe_sum x (k + 1) m
+
+private theorem copyLe_sum_spec (x : Nat) :
+    ∀ m k, x % 2 ^ (8 * k) + copyLe_sum x k m = x % 2 ^ (8 * (k + m)) := by
+  intro m
+  induction m with
+  | zero => intro k; simp [copyLe_sum]
+  | succ m ih =>
+    intro k
+    have hstep : x % 2 ^ (8 * k) + x / 2 ^ (8 * k) % 256 * 2 ^ (8 * k) =
+        x % 2 ^ (8 * (k + 1)) := by
+      rw [show 8 * (k + 1) = 8 * k + 8 by omega, Nat.pow_add, Nat.mod_mul]
+      simp only [show (2 : Nat) ^ 8 = 256 by rfl]
+      rw [Nat.mul_comm (2 ^ (8 * k))]
+    simp only [copyLe_sum]
+    rw [← Nat.add_assoc, hstep, ih (k + 1), show k + 1 + m = k + (m + 1) by omega]
+
+private theorem copyLe_decode_loop (x n : Nat)
+    (f : Nat → Nat → Except Miri.Memory.AllocError (ForInStep Nat))
+    (hf : ∀ index s, index < n →
+      f index s = .ok (.yield (s + x / 2 ^ (8 * index) % 256 * 2 ^ (8 * index)))) :
+    ∀ m k acc, k + m ≤ n →
+      forIn (List.range' k m) acc f = .ok (acc + copyLe_sum x k m) := by
+  intro m
+  induction m with
+  | zero => intro k acc _; simp [copyLe_sum, pure, Except.pure]
+  | succ m ih =>
+    intro k acc hkm
+    rw [List.range'_succ, List.forIn_cons, hf k acc (by omega)]
+    simp only [copyLe_sum]
+    rw [show (Except.ok (ForInStep.yield (acc + x / 2 ^ (8 * k) % 256 * 2 ^ (8 * k))) :
+        Except Miri.Memory.AllocError (ForInStep Nat)) = pure (ForInStep.yield _) from rfl,
+      pure_bind]
+    simp only
+    rw [ih (k + 1) _ (by omega), Nat.add_assoc]
+
+private theorem copyLe_readTargetUInt_bytes (x n : Nat) (hn : n ≤ 16) :
+    copyLe_readTargetUInt annealTargetDataLayout (copyLe_bytes x n) =
+      .ok (BitVec.ofNat 128 (x % 2 ^ (8 * n))) := by
+  have small : ¬ n > 16 := by omega
+  have hendian : (annealTargetDataLayout.endian == Miri.ABI.Endian.little) = true := rfl
+  have hlsize : (copyLe_bytes x n).size = n := copyLe_bytes_size x n
+  unfold copyLe_readTargetUInt
+  simp only [hlsize, small, ↓reduceIte, Std.Legacy.Range.forIn_eq_forIn_range',
+    hendian, Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one]
+  rw [copyLe_decode_loop x n _ ?hf n 0 0 (by omega)]
+  · have := copyLe_sum_spec x n 0
+    simp only [Nat.mul_zero, Nat.pow_zero, Nat.mod_one, Nat.zero_add] at this
+    simp [this, pure, Except.pure, bind, Except.bind]
+  · intro index s hi
+    have hb : (x / 2 ^ (8 * index) % 256) < 256 := Nat.mod_lt _ (by decide)
+    simp [copyLe_bytes, hi, pure, Except.pure, Nat.mod_eq_of_lt hb]
+
+private theorem copyScalarModulus_eq_two_pow (sz : Nat) :
+    scalarModulus sz = 2 ^ (8 * sz) := by
+  induction sz with
+  | zero => rfl
+  | succ k ih =>
+    show 256 * scalarModulus k = 2 ^ (8 * (k + 1))
+    rw [ih, show 8 * (k + 1) = 8 * k + 8 by omega, Nat.pow_add, Nat.mul_comm]
+
+private theorem copyScalarModulus_pos (sz : Nat) : 0 < scalarModulus sz := by
+  rw [copyScalarModulus_eq_two_pow]; exact Nat.two_pow_pos _
+
+private theorem copyWrapScalarBits_lt (bits sz : Nat) :
+    wrapScalarBits bits (scalarModulus sz) < scalarModulus sz := by
+  unfold wrapScalarBits
+  cases hble : (scalarModulus sz).ble bits
+  · dsimp only
+    exact Nat.lt_of_not_ge (fun hle => Bool.noConfusion ((Nat.ble_eq.mpr hle).symm.trans hble))
+  · dsimp only
+    exact Nat.mod_lt _ (copyScalarModulus_pos sz)
+
+private theorem copyWrapScalarBits_eq_of_lt {bits sz : Nat} (h : bits < scalarModulus sz) :
+    wrapScalarBits bits (scalarModulus sz) = bits := by
+  unfold wrapScalarBits
+  have hble : (scalarModulus sz).ble bits = false := by
+    cases hb : (scalarModulus sz).ble bits
+    · rfl
+    · exact absurd (Nat.ble_eq.mp hb) (Nat.not_le_of_lt h)
+  rw [hble]
+
+private theorem copyFromUInt {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) :
+    Miri.Memory.Scalar.fromUInt (Prov := AnnealProv) (BitVec.ofNat 128 sc.bits)
+        (translateSizeBytes sc.sizeBytes) = .ok (Miri.Memory.Scalar.fromScalarInt msc) := by
+  obtain ⟨msc', htry, hrel'⟩ := tryFromUInt_of_valid_canonical hrel.validBytes hrel.canonical
+  have heq : msc' = msc := by
+    cases msc'; cases msc
+    have hd := hrel'.data_eq.trans hrel.data_eq.symm
+    have hs := hrel'.size_eq.trans hrel.size_eq.symm
+    simp only [Miri.Memory.ScalarInt.data, Miri.Memory.ScalarInt.size] at hd hs
+    subst hd hs; rfl
+  subst heq
+  unfold Miri.Memory.Scalar.fromUInt
+  simp [htry, Except.mapError, bind, Except.bind, pure, Except.pure]
+
+private def copyFromLeBytes : List UInt8 → Nat
+  | [] => 0
+  | b :: bs => b.toNat + 256 * copyFromLeBytes bs
+
+private theorem copyFromLeBytes_lt :
+    ∀ l : List UInt8, copyFromLeBytes l < 2 ^ (8 * l.length)
+  | [] => by simp [copyFromLeBytes]
+  | b :: bs => by
+    have ih := copyFromLeBytes_lt bs
+    have hb := b.toNat_lt
+    simp only [copyFromLeBytes, List.length_cons]
+    rw [show 8 * (bs.length + 1) = 8 + 8 * bs.length by omega, Nat.pow_add]
+    have hle : copyFromLeBytes bs + 1 ≤ 2 ^ (8 * bs.length) := ih
+    have hmul : 256 * (copyFromLeBytes bs + 1) ≤ 2 ^ 8 * 2 ^ (8 * bs.length) :=
+      Nat.mul_le_mul_left 256 hle
+    omega
+
+private theorem copyFromLeBytes_byte :
+    ∀ (l : List UInt8) (i : Nat) (hi : i < l.length),
+      (copyFromLeBytes l / 2 ^ (8 * i)) % 256 = (l[i]'hi).toNat
+  | [], _, hi => absurd hi (Nat.not_lt_zero _)
+  | b :: bs, 0, _ => by
+    have hb := b.toNat_lt
+    show (b.toNat + 256 * copyFromLeBytes bs) / 1 % 256 = b.toNat
+    omega
+  | b :: bs, j + 1, hi => by
+    have hb := b.toNat_lt
+    have hj : j < bs.length := by simp at hi; omega
+    have hpow : 2 ^ (8 * (j + 1)) = 256 * 2 ^ (8 * j) := by
+      rw [show 8 * (j + 1) = 8 + 8 * j by omega, Nat.pow_add]
+    have hdiv : (b.toNat + 256 * copyFromLeBytes bs) / (256 * 2 ^ (8 * j)) =
+        copyFromLeBytes bs / 2 ^ (8 * j) := by
+      rw [← Nat.div_div_eq_div_mul]
+      have h1 : (b.toNat + 256 * copyFromLeBytes bs) / 256 = copyFromLeBytes bs := by omega
+      rw [h1]
+    show (b.toNat + 256 * copyFromLeBytes bs) / 2 ^ (8 * (j + 1)) % 256 = bs[j].toNat
+    rw [hpow, hdiv]
+    exact copyFromLeBytes_byte bs j hj
+
+private theorem copyLe_bytes_fromLeBytes (bytes : Array UInt8) :
+    copyLe_bytes (copyFromLeBytes bytes.toList) bytes.size = bytes := by
+  apply Array.ext
+  · simp [copyLe_bytes]
+  · intro i hi₁ hi₂
+    have hi_list : i < bytes.toList.length := by simpa using hi₂
+    have hbyte := copyFromLeBytes_byte bytes.toList i hi_list
+    simp [copyLe_bytes, hbyte]
+
+private theorem copyLe_decode_readScalar {E : Type} {n : Nat}
+    (hn : ValidScalarBytes n) {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (hsz : sc.sizeBytes = n)
+    {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape (translateSizeBytes n) A)
+    (hread : A.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) false =
+      .ok (.fromScalarInt msc)) :
+    A.initializationMask = Miri.Memory.InitMask.new (translateSizeBytes n) true ∧
+    copyAlloc_raw A = copyLe_bytes sc.bits n := by
+  have hold_can : sc.bits < scalarModulus n := hsz ▸ hrel.canonical
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn16 : n ≤ 16 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hn16_tr : (translateSizeBytes n).bytes.toNat ≤ 16 := by rw [hn_eq]; exact hn16
+  have hend_full := copyAlloc_allocRange_end (translateSizeBytes n)
+  have hinitA : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) = .ok (.ok ()) :=
+    Classical.byContradiction fun hni => by
+      obtain ⟨_, herr⟩ := hshape.uninit_readScalar_err hni false
+      rw [hread] at herr
+      cases herr
+  have hmask_true : A.initializationMask = Miri.Memory.InitMask.new (translateSizeBytes n) true := by
+    obtain ⟨b, hb⟩ := hshape.initMask_lazy
+    cases b with
+    | true => exact hb
+    | false =>
+      rw [hb] at hinitA
+      rcases hn with rfl | rfl | rfl | rfl | rfl <;> cases hinitA
+  refine ⟨hmask_true, ?_⟩
+  have hraw_sz : (copyAlloc_raw A).size = n := hshape.len_eq.trans hn_eq
+  let x := copyFromLeBytes (copyAlloc_raw A).toList
+  have hx_can : x < scalarModulus n := by
+    rw [copyScalarModulus_eq_two_pow]
+    have hlt := copyFromLeBytes_lt (copyAlloc_raw A).toList
+    have hlen_l : (copyAlloc_raw A).toList.length = n := by simpa using hraw_sz
+    rw [hlen_l] at hlt
+    exact hlt
+  obtain ⟨xmsc, _, hx_rel⟩ := tryFromUInt_of_valid_canonical (sc := ⟨x, n⟩) hn hx_can
+  have hraw_x : copyAlloc_raw A = copyLe_bytes x n := by
+    have := copyLe_bytes_fromLeBytes (copyAlloc_raw A)
+    rw [hraw_sz] at this
+    exact this.symm
+  have hslice_A : copyAlloc_checkedSlice A
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) =
+      .ok (copyLe_bytes x (translateSizeBytes n).bytes.toNat) := by
+    have hrawsize : (copyAlloc_raw A).size = (translateSizeBytes n).bytes.toNat := hshape.len_eq
+    unfold copyAlloc_checkedSlice
+    simp only [hrawsize, hshape.byteSize_eq, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+      hend_full, Except.mapError, bind, Except.bind]
+    simp [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, pure, Except.pure, hraw_x, hn_eq,
+      copyLe_bytes_size]
+  have hoff_addr : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+  have hx_mod : x % 2 ^ (8 * (translateSizeBytes n).bytes.toNat) = x := by
+    rw [hn_eq, ← copyScalarModulus_eq_two_pow]
+    exact Nat.mod_eq_of_lt hx_can
+  have hrange_sz :
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)).size =
+        translateSizeBytes n := rfl
+  have hread_x : A.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) false =
+      .ok (Miri.Memory.Scalar.fromScalarInt xmsc) := by
+    rw [copyLe_readScalar_eq]
+    unfold copyLe_readScalar
+    rw [hinitA]
+    simp only [Except.mapError, bind, Except.bind]
+    rw [copyAlloc_getBytesUnchecked_eq, hslice_A]
+    simp only []
+    rw [copyLe_readTargetUInt_bytes _ _ hn16_tr, hx_mod]
+    simp only [Bool.false_eq_true, ↓reduceIte, hoff_addr, hrange_sz, copyFromUInt hx_rel]
+  have hsc_eq : Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) xmsc =
+      Miri.Memory.Scalar.fromScalarInt msc :=
+    Except.ok.inj (hread_x.symm.trans hread)
+  have hdata_eq : BitVec.ofNat 128 x = BitVec.ofNat 128 sc.bits := by
+    unfold Miri.Memory.Scalar.fromScalarInt at hsc_eq
+    injection hsc_eq with hpay _
+    injection hpay with hmsc_eq
+    exact hx_rel.data_eq.symm.trans ((congrArg Miri.Memory.ScalarInt.data hmsc_eq).trans
+      hrel.data_eq)
+  have hx_eq : x = sc.bits := by
+    have hpow128 : scalarModulus n ≤ 2 ^ 128 := by
+      rw [copyScalarModulus_eq_two_pow]
+      exact Nat.pow_le_pow_right (by decide) (by omega)
+    have h1 : (BitVec.ofNat 128 x).toNat = x := by
+      rw [BitVec.toNat_ofNat]; exact Nat.mod_eq_of_lt (Nat.lt_of_lt_of_le hx_can hpow128)
+    have h2 : (BitVec.ofNat 128 sc.bits).toNat = sc.bits := by
+      rw [BitVec.toNat_ofNat]; exact Nat.mod_eq_of_lt (Nat.lt_of_lt_of_le hold_can hpow128)
+    rw [← h1, ← h2, hdata_eq]
+  rw [hraw_x, hx_eq]
+
+private theorem copyLe_encode_readScalar {E : Type} {n : Nat}
+    (hn : ValidScalarBytes n) {bits : Nat} (hcan : bits < scalarModulus n)
+    {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape (translateSizeBytes n) A)
+    (hmask : A.initializationMask = Miri.Memory.InitMask.new (translateSizeBytes n) true)
+    (hraw : copyAlloc_raw A = copyLe_bytes bits n) :
+    ∃ msc : Miri.Memory.ScalarInt,
+      ScalarRel ⟨bits, n⟩ msc ∧
+      A.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) = .ok (.ok ()) ∧
+      A.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) false =
+        .ok (.fromScalarInt msc) := by
+  obtain ⟨msc, _, hrel⟩ := tryFromUInt_of_valid_canonical (sc := ⟨bits, n⟩) hn hcan
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn16 : n ≤ 16 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hn16_tr : (translateSizeBytes n).bytes.toNat ≤ 16 := by rw [hn_eq]; exact hn16
+  have hend_full := copyAlloc_allocRange_end (translateSizeBytes n)
+  have hinit : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) = .ok (.ok ()) := by
+    rw [hmask]; rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  refine ⟨msc, hrel, hinit, ?_⟩
+  have hraw_le : copyAlloc_raw A = copyLe_bytes bits (translateSizeBytes n).bytes.toNat := by
+    rw [hraw, hn_eq]
+  have hslice_read : copyAlloc_checkedSlice A
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) =
+      .ok (copyLe_bytes bits (translateSizeBytes n).bytes.toNat) := by
+    have hrawsize : (copyAlloc_raw A).size = (translateSizeBytes n).bytes.toNat := hshape.len_eq
+    unfold copyAlloc_checkedSlice
+    simp only [hrawsize, hshape.byteSize_eq, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+      hend_full, Except.mapError, bind, Except.bind]
+    simp [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, pure, Except.pure, hraw_le, copyLe_bytes_size]
+  have hoff_addr : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+  have hmod : bits % 2 ^ (8 * (translateSizeBytes n).bytes.toNat) = bits := by
+    rw [hn_eq, ← copyScalarModulus_eq_two_pow]
+    exact Nat.mod_eq_of_lt hcan
+  have hrange_sz :
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)).size =
+        translateSizeBytes n := rfl
+  rw [copyLe_readScalar_eq]
+  unfold copyLe_readScalar
+  rw [hinit]
+  simp only [Except.mapError, bind, Except.bind]
+  rw [copyAlloc_getBytesUnchecked_eq, hslice_read]
+  simp only []
+  rw [copyLe_readTargetUInt_bytes _ _ hn16_tr, hmod]
+  simp only [Bool.false_eq_true, ↓reduceIte, hoff_addr, hrange_sz, copyFromUInt hrel]
+
+private theorem copyByte_of_split {a b k i : Nat} (ha : a < 2 ^ (8 * k)) :
+    ((a + b * 2 ^ (8 * k)) / 2 ^ (8 * i)) % 256 =
+      if i < k then (a / 2 ^ (8 * i)) % 256 else (b / 2 ^ (8 * (i - k))) % 256 := by
+  by_cases hik : i < k
+  · simp only [hik, ↓reduceIte]
+    have hpow : 2 ^ (8 * k) = (256 * 2 ^ (8 * (k - i - 1))) * 2 ^ (8 * i) := by
+      rw [show (256 : Nat) = 2 ^ 8 from rfl, ← Nat.pow_add, ← Nat.pow_add]
+      exact congrArg (2 ^ ·) (by omega)
+    have hmul : b * 2 ^ (8 * k) = (b * 2 ^ (8 * (k - i - 1)) * 256) * 2 ^ (8 * i) := by
+      rw [hpow]; ac_rfl
+    rw [hmul, Nat.add_mul_div_right _ _ (Nat.two_pow_pos _), Nat.add_mul_mod_self_right]
+  · simp only [hik, ↓reduceIte]
+    have hpow : 2 ^ (8 * i) = 2 ^ (8 * k) * 2 ^ (8 * (i - k)) := by
+      rw [← Nat.pow_add]
+      exact congrArg (2 ^ ·) (by omega)
+    rw [hpow, ← Nat.div_div_eq_div_mul, Nat.add_mul_div_right _ _ (Nat.two_pow_pos _),
+      Nat.div_eq_of_lt ha, Nat.zero_add]
+
+theorem sliceScalarBytes_lt_scalarModulus (srcBits srcBytes srcStart total : Nat) :
+    sliceScalarBytes srcBits srcBytes srcStart total < scalarModulus total :=
+  Nat.mod_lt _ (copyScalarModulus_pos total)
+
+theorem sliceScalarBytes_byte {srcBits srcBytes srcStart total i : Nat}
+    (hsrc : srcBits < scalarModulus srcBytes) (hi : i < total) :
+    (sliceScalarBytes srcBits srcBytes srcStart total / 2 ^ (8 * i)) % 256 =
+      (srcBits / 2 ^ (8 * (srcStart + i))) % 256 := by
+  let y := srcBits / 2 ^ (8 * srcStart)
+  have hwrap := copyWrapScalarBits_eq_of_lt hsrc
+  have hmod_s := copyScalarModulus_eq_two_pow srcStart
+  have hmod_t := copyScalarModulus_eq_two_pow total
+  have hsl : sliceScalarBytes srcBits srcBytes srcStart total = y % 2 ^ (8 * total) := by
+    change (wrapScalarBits srcBits (scalarModulus srcBytes) / scalarModulus srcStart) %
+      scalarModulus total = _
+    rw [hwrap, hmod_s, hmod_t]
+  have hy_lt : y % 2 ^ (8 * total) < 2 ^ (8 * total) := Nat.mod_lt _ (Nat.two_pow_pos _)
+  have hy_decomp : y = y % 2 ^ (8 * total) + (y / 2 ^ (8 * total)) * 2 ^ (8 * total) := by
+    have h := (Nat.mod_add_div y (2 ^ (8 * total))).symm
+    rwa [Nat.mul_comm (2 ^ (8 * total))] at h
+  have hsplit := copyByte_of_split (i := i) hy_lt (b := y / 2 ^ (8 * total))
+  rw [← hy_decomp, copyIte_pos hi] at hsplit
+  rw [hsl, ← hsplit]
+  dsimp only [y]
+  rw [Nat.div_div_eq_div_mul, ← Nat.pow_add, ← Nat.mul_add]
+
+private theorem copyLe_extract_eq_slice {srcBits srcBytes srcStart total : Nat}
+    (hsrc : srcBits < scalarModulus srcBytes) (hinS : srcStart + total ≤ srcBytes) :
+    (copyLe_bytes srcBits srcBytes).extract srcStart (srcStart + total) =
+      copyLe_bytes (sliceScalarBytes srcBits srcBytes srcStart total) total := by
+  apply Array.ext
+  · simp only [Array.size_extract, copyLe_bytes_size]; omega
+  · intro i hi₁ hi₂
+    have hi_tot : i < total := by rw [copyLe_bytes_size] at hi₂; exact hi₂
+    rw [Array.getElem_extract]
+    simp [copyLe_bytes, sliceScalarBytes_byte hsrc hi_tot]
+
+theorem spliceScalarBytes_lt_scalarModulus (dstBits : Nat) {chunk dstStart total dstBytes : Nat}
+    (hchunk : chunk < scalarModulus total) (hinD : dstStart + total ≤ dstBytes) :
+    spliceScalarBytes dstBits chunk dstStart total dstBytes < scalarModulus dstBytes := by
+  unfold spliceScalarBytes
+  have hlow_pos := copyScalarModulus_pos dstStart
+  have hmod_lt : wrapScalarBits dstBits (scalarModulus dstBytes) % scalarModulus dstStart <
+      scalarModulus dstStart := Nat.mod_lt _ hlow_pos
+  have hhigh_eq : scalarModulus (Nat.add dstStart total) =
+      scalarModulus total * scalarModulus dstStart := by
+    simp only [Nat.add_eq, copyScalarModulus_eq_two_pow]
+    rw [show 8 * (dstStart + total) = 8 * total + 8 * dstStart by omega, Nat.pow_add]
+  have hmid_lt :
+      wrapScalarBits dstBits (scalarModulus dstBytes) % scalarModulus dstStart +
+        chunk * scalarModulus dstStart <
+      scalarModulus (Nat.add dstStart total) := by
+    have hmul_le : chunk * scalarModulus dstStart + scalarModulus dstStart ≤
+        scalarModulus total * scalarModulus dstStart := by
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right _ hchunk
+    rw [hhigh_eq]; omega
+  have hold_lt := copyWrapScalarBits_lt dstBits dstBytes
+  have htop_eq : scalarModulus dstBytes =
+      scalarModulus (dstBytes - (dstStart + total)) * scalarModulus (Nat.add dstStart total) := by
+    simp only [Nat.add_eq, copyScalarModulus_eq_two_pow]
+    rw [← Nat.pow_add,
+      show 8 * (dstBytes - (dstStart + total)) + 8 * (dstStart + total) = 8 * dstBytes by omega]
+  have hhigh_pos := copyScalarModulus_pos (Nat.add dstStart total)
+  have hdiv_lt : wrapScalarBits dstBits (scalarModulus dstBytes) /
+      scalarModulus (Nat.add dstStart total) <
+      scalarModulus (dstBytes - (dstStart + total)) := by
+    rw [Nat.div_lt_iff_lt_mul hhigh_pos, ← htop_eq]
+    exact hold_lt
+  have htop_le :
+      (wrapScalarBits dstBits (scalarModulus dstBytes) /
+        scalarModulus (Nat.add dstStart total)) *
+        scalarModulus (Nat.add dstStart total) + scalarModulus (Nat.add dstStart total) ≤
+      scalarModulus dstBytes := by
+    calc (wrapScalarBits dstBits (scalarModulus dstBytes) /
+            scalarModulus (Nat.add dstStart total)) *
+            scalarModulus (Nat.add dstStart total) + scalarModulus (Nat.add dstStart total)
+        = (wrapScalarBits dstBits (scalarModulus dstBytes) /
+            scalarModulus (Nat.add dstStart total) + 1) *
+            scalarModulus (Nat.add dstStart total) := by rw [← Nat.succ_mul]
+      _ ≤ scalarModulus (dstBytes - (dstStart + total)) *
+            scalarModulus (Nat.add dstStart total) := Nat.mul_le_mul_right _ hdiv_lt
+      _ = scalarModulus dstBytes := htop_eq.symm
+  change (wrapScalarBits dstBits (scalarModulus dstBytes) % scalarModulus dstStart) +
+    (chunk * scalarModulus dstStart +
+      (wrapScalarBits dstBits (scalarModulus dstBytes) /
+        scalarModulus (Nat.add dstStart total)) *
+        scalarModulus (Nat.add dstStart total)) < scalarModulus dstBytes
+  omega
+
+theorem spliceScalarBytes_byte {dstBits chunk dstStart total dstBytes i : Nat}
+    (hdst : dstBits < scalarModulus dstBytes) (hchunk : chunk < scalarModulus total)
+    (_hinD : dstStart + total ≤ dstBytes) (_hi : i < dstBytes) :
+    (spliceScalarBytes dstBits chunk dstStart total dstBytes / 2 ^ (8 * i)) % 256 =
+      if dstStart ≤ i ∧ i < dstStart + total then
+        (chunk / 2 ^ (8 * (i - dstStart))) % 256
+      else
+        (dstBits / 2 ^ (8 * i)) % 256 := by
+  have hwrap := copyWrapScalarBits_eq_of_lt hdst
+  have hlow_eq := copyScalarModulus_eq_two_pow dstStart
+  have hhigh_eq : scalarModulus (Nat.add dstStart total) = 2 ^ (8 * (dstStart + total)) :=
+    copyScalarModulus_eq_two_pow (dstStart + total)
+  have hlow_lt : dstBits % 2 ^ (8 * dstStart) < 2 ^ (8 * dstStart) :=
+    Nat.mod_lt _ (Nat.two_pow_pos _)
+  have hchunk_lt : chunk < 2 ^ (8 * total) := by
+    rwa [← copyScalarModulus_eq_two_pow]
+  have hmid_lt :
+      dstBits % 2 ^ (8 * dstStart) + chunk * 2 ^ (8 * dstStart) <
+        2 ^ (8 * (dstStart + total)) := by
+    have hpow : 2 ^ (8 * (dstStart + total)) = 2 ^ (8 * total) * 2 ^ (8 * dstStart) := by
+      rw [← Nat.pow_add, show 8 * total + 8 * dstStart = 8 * (dstStart + total) by omega]
+    have hle : chunk * 2 ^ (8 * dstStart) + 2 ^ (8 * dstStart) ≤
+        2 ^ (8 * total) * 2 ^ (8 * dstStart) := by
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right _ hchunk_lt
+    rw [hpow]; omega
+  have hsum :
+      spliceScalarBytes dstBits chunk dstStart total dstBytes =
+        (dstBits % 2 ^ (8 * dstStart) + chunk * 2 ^ (8 * dstStart)) +
+          (dstBits / 2 ^ (8 * (dstStart + total))) * 2 ^ (8 * (dstStart + total)) := by
+    change wrapScalarBits dstBits (scalarModulus dstBytes) % scalarModulus dstStart +
+        (chunk * scalarModulus dstStart +
+          (wrapScalarBits dstBits (scalarModulus dstBytes) /
+            scalarModulus (Nat.add dstStart total)) *
+            scalarModulus (Nat.add dstStart total)) = _
+    rw [hwrap, hlow_eq, hhigh_eq, ← Nat.add_assoc]
+  rw [hsum, copyByte_of_split hmid_lt]
+  by_cases hhi : i < dstStart + total
+  · simp only [hhi, and_true, ↓reduceIte, copyByte_of_split hlow_lt]
+    by_cases hlo : i < dstStart
+    · have hnot_ge : ¬ (dstStart ≤ i) := by omega
+      simp only [hlo, hnot_ge, ↓reduceIte]
+      have hold_decomp : dstBits =
+          dstBits % 2 ^ (8 * dstStart) + (dstBits / 2 ^ (8 * dstStart)) * 2 ^ (8 * dstStart) := by
+        have h := (Nat.mod_add_div dstBits (2 ^ (8 * dstStart))).symm
+        rwa [Nat.mul_comm (2 ^ (8 * dstStart))] at h
+      conv => rhs; rw [hold_decomp]
+      rw [copyByte_of_split hlow_lt]
+      simp [hlo]
+    · have hge : dstStart ≤ i := by omega
+      simp [hlo, hge]
+  · simp only [hhi, and_false, ↓reduceIte]
+    rw [Nat.div_div_eq_div_mul, ← Nat.pow_add,
+      show 8 * (dstStart + total) + 8 * (i - (dstStart + total)) = 8 * i by omega]
+
+private theorem copyLe_bytes_getElem (bits n i : Nat) (hi : i < (copyLe_bytes bits n).size) :
+    (copyLe_bytes bits n)[i]'hi = UInt8.ofNat (bits / 2 ^ (8 * i) % 256) := by
+  simp [copyLe_bytes]
+
+private theorem copyLe_overwrite_eq_splice {dstBits chunk dstStart total dstBytes : Nat}
+    (hdst : dstBits < scalarModulus dstBytes) (hchunk : chunk < scalarModulus total)
+    (hinD : dstStart + total ≤ dstBytes) :
+    (copyLe_bytes dstBits dstBytes).extract 0 dstStart ++ copyLe_bytes chunk total ++
+      (copyLe_bytes dstBits dstBytes).extract (dstStart + total)
+        (copyLe_bytes dstBits dstBytes).size =
+      copyLe_bytes (spliceScalarBytes dstBits chunk dstStart total dstBytes) dstBytes := by
+  have hsz_pre : ((copyLe_bytes dstBits dstBytes).extract 0 dstStart).size = dstStart := by
+    simp only [Array.size_extract, copyLe_bytes_size]; omega
+  have hsz_mid : (copyLe_bytes chunk total).size = total := copyLe_bytes_size chunk total
+  have hsz_left :
+      ((copyLe_bytes dstBits dstBytes).extract 0 dstStart ++ copyLe_bytes chunk total).size =
+        dstStart + total := by
+    rw [Array.size_append, hsz_pre, hsz_mid]
+  apply Array.ext
+  · simp only [Array.size_append, Array.size_extract, copyLe_bytes_size]; omega
+  · intro i hi₁ hi₂
+    have hi_dst : i < dstBytes := by rw [copyLe_bytes_size] at hi₂; exact hi₂
+    have hs := spliceScalarBytes_byte hdst hchunk hinD hi_dst
+    rw [copyLe_bytes_getElem _ _ i hi₂]
+    by_cases hlt_hi : i < dstStart + total
+    · rw [Array.getElem_append_left (by omega)]
+      by_cases hlt_lo : i < dstStart
+      · have hnot : ¬ (dstStart ≤ i ∧ i < dstStart + total) := by omega
+        rw [Array.getElem_append_left (by omega), Array.getElem_extract,
+          copyLe_bytes_getElem _ _ (0 + i) (by rw [copyLe_bytes_size]; omega),
+          Nat.zero_add, hs, copyIte_neg hnot]
+      · have hcond : dstStart ≤ i ∧ i < dstStart + total := by omega
+        rw [Array.getElem_append_right (by omega),
+          copyLe_bytes_getElem _ _ (i - ((copyLe_bytes dstBits dstBytes).extract 0 dstStart).size)
+            (by rw [copyLe_bytes_size, hsz_pre]; omega),
+          hsz_pre, hs, copyIte_pos hcond]
+    · have hnot : ¬ (dstStart ≤ i ∧ i < dstStart + total) := by omega
+      rw [Array.getElem_append_right (by omega), Array.getElem_extract,
+        copyLe_bytes_getElem _ _
+          (dstStart + total +
+            (i - ((copyLe_bytes dstBits dstBytes).extract 0 dstStart ++
+              copyLe_bytes chunk total).size))
+          (by rw [copyLe_bytes_size, hsz_left]; omega),
+        hsz_left, show dstStart + total + (i - (dstStart + total)) = i by omega,
+        hs, copyIte_neg hnot]
+
+private theorem copySize_mul_one (s : Miri.ABI.Size) : s.mul 1 = .ok s := by
+  cases s with
+  | mk b =>
+    simp [Miri.ABI.Size.mul, Miri.ABI.Size.ofBytes, UInt64.mul_one, UInt64.div_one]
+
+private theorem copyRange_endExclusive {off total : Nat} (hlt : off + total < 2 ^ 64) :
+    (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat total))).endExclusive =
+      .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total))) := by
+  have hsum : UInt64.ofNat off + UInt64.ofNat total = UInt64.ofNat (off + total) :=
+    (UInt64.ofNat_add off total).symm
+  have hoff_lt : off < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right off total) hlt
+  have h1 : (UInt64.ofNat off).toNat = off := UInt64.toNat_ofNat_of_lt hoff_lt
+  have h2 : (UInt64.ofNat (off + total)).toNat = off + total := UInt64.toNat_ofNat_of_lt hlt
+  have hnot_lt : ¬ (UInt64.ofNat (off + total) < UInt64.ofNat off) := by
+    rw [UInt64.lt_iff_toNat_lt, h1, h2]; omega
+  unfold Miri.Memory.AllocRange.endExclusive Miri.Memory.AllocRange.end Miri.Memory.allocRange
+    Miri.ABI.Size.add Miri.ABI.Size.ofBytes
+  simp only [hsum, hnot_lt, ↓reduceIte, Except.mapError]
+
+private theorem copyRange_zero_endExclusive (s : Miri.ABI.Size) :
+    (Miri.Memory.allocRange s Miri.ABI.Size.ZERO).endExclusive = .ok s := by
+  cases s
+  simp [Miri.Memory.AllocRange.endExclusive, Miri.Memory.AllocRange.end, Miri.Memory.allocRange,
+    Miri.ABI.Size.ZERO, Miri.ABI.Size.add, Miri.ABI.Size.ofBytes, UInt64.add_zero, Except.mapError]
+
+private theorem copyCheckedSlice_range {P E : Type} {n off total : Nat}
+    (hn : ValidScalarBytes n) (hinb : off + total ≤ n)
+    {A : Miri.Memory.Allocation P E}
+    (hsz : A.byteSize = translateSizeBytes n)
+    (hlen : (copyAlloc_raw A).size = (translateSizeBytes n).bytes.toNat) :
+    Miri.Memory.Allocation.getBytesUnchecked A
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) =
+      .ok ((copyAlloc_raw A).extract off (off + total)) := by
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hlt64 : off + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinb hn64
+  have hoff64 : off < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right off total) hlt64
+  rw [copyAlloc_getBytesUnchecked_eq]; unfold copyAlloc_checkedSlice
+  have hend := copyRange_endExclusive hlt64
+  have hoff_u64 : (UInt64.ofNat off).toNat = off := UInt64.toNat_ofNat_of_lt hoff64
+  have hend_u64 : (UInt64.ofNat (off + total)).toNat = off + total :=
+    UInt64.toNat_ofNat_of_lt hlt64
+  have hnot_gt1 : ¬ (UInt64.ofNat off > UInt64.ofNat (off + total)) := by
+    rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hoff_u64, hend_u64]; omega
+  have hnot_gt2 : ¬ (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes) := by
+    rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_u64, hn_eq]; omega
+  have hcond_false :
+      (decide (UInt64.ofNat off > UInt64.ofNat (off + total)) ||
+        decide (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes)) = false := by
+    rw [Bool.or_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+    exact ⟨hnot_gt1, hnot_gt2⟩
+  rw [hend]
+  simp only [hlen, hsz, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+    Except.mapError, bind, Except.bind, Miri.Memory.allocRange, Miri.ABI.Size.ofBytes]
+  erw [hcond_false]
+  simp only [Bool.false_eq_true, ↓reduceIte, hoff_u64, hend_u64, pure, Except.pure]
+
+private theorem copyRangePtrs_new_eq_empty (range : Miri.Memory.AllocRange)
+    {finish : Miri.ABI.Size} (hend : range.endExclusive = .ok finish) :
+    (Miri.Memory.ProvenanceMap.new (Prov := AnnealProv)).rangePtrs range (Miri.ABI.Size.ofBytes 8) =
+      .ok #[] := by
+  unfold Miri.Memory.ProvenanceMap.rangePtrs
+  simp only [bind, Except.bind]
+  with_unfolding_all (conv => lhs; whnf)
+  split
+  · next r hv =>
+    with_unfolding_all (conv at hv => lhs; whnf)
+    rw [hend] at hv
+    cases hv
+  · next v hv =>
+    with_unfolding_all (conv at hv => lhs; whnf)
+    rw [hend] at hv
+    cases hv
+    with_unfolding_all rfl
+
+private theorem copyProv_prepareCopy_new_range {off total : Nat} (hlt : off + total < 2 ^ 64)
+    (raw : Array UInt8) :
+    (Miri.Memory.ProvenanceMap.new (Prov := AnnealProv)).prepareCopy
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+      raw (Miri.ABI.Size.ofBytes 8) = .ok ⟨#[], #[]⟩ := by
+  have hend := copyRange_endExclusive hlt
+  have hrp1 := copyRangePtrs_new_eq_empty
+    (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off)) Miri.ABI.Size.ZERO)
+    (copyRange_zero_endExclusive _)
+  have hrp2 := copyRangePtrs_new_eq_empty
+    (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total))) Miri.ABI.Size.ZERO)
+    (copyRange_zero_endExclusive _)
+  have htot_lt : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total off) hlt
+  have htot_nat : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot_lt
+  have hend_nat : (UInt64.ofNat (off + total)).toNat = off + total := UInt64.toNat_ofNat_of_lt hlt
+  unfold Miri.Memory.ProvenanceMap.prepareCopy
+  have hpz : ((Miri.ABI.Size.ofBytes 8).bytes == 0) = false := rfl
+  simp only [hpz, Bool.false_eq_true, ↓reduceIte, bind, Except.bind]
+  have hre : (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat total))).endExclusive.mapError
+      Miri.Memory.ProvenanceMapError.memory =
+      .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total))) := by
+    rw [hend]; rfl
+  split
+  · next e hv =>
+    have h2 : Except.error e =
+        Except.ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total))) :=
+      hv.symm.trans (by with_unfolding_all exact hre)
+    cases h2
+  · next finish hv =>
+    have h2 : Except.ok finish =
+        Except.ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total))) :=
+      hv.symm.trans (by with_unfolding_all exact hre)
+    injection h2 with hfin; subst hfin
+    simp only [pure, Except.pure,
+      Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hrp1 hrp2 ⊢
+    by_cases hge8 : UInt64.ofNat total ≥ 8
+    · have hlt7 : ¬ (UInt64.ofNat (off + total) < 7) := by
+        have hle8 : (8 : UInt64) ≤ UInt64.ofNat total := hge8
+        rw [UInt64.le_iff_toNat_le, htot_nat] at hle8
+        rw [UInt64.lt_iff_toNat_lt, hend_nat]
+        change ¬ (off + total < 7)
+        change 8 ≤ total at hle8
+        omega
+      simp only [hge8, ↓reduceIte]
+      have hsub_ok :
+          (Miri.ABI.Size.sub { bytes := UInt64.ofNat (off + total) }
+            { bytes := (8 : UInt64) - 1 }).mapError
+            (Miri.Memory.ProvenanceMapError.memory ∘ Miri.Memory.MemoryError.sizeError) =
+            .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total) - 7)) := by
+        simp only [Miri.ABI.Size.sub, Miri.ABI.Size.ofBytes,
+          show ((8 : UInt64) - 1) = 7 from rfl, hlt7, ↓reduceIte, Except.mapError]
+      split
+      · next e' hv' =>
+        have h3 : Except.error e' = .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total) - 7)) :=
+          hv'.symm.trans (by with_unfolding_all exact hsub_ok)
+        cases h3
+      · next adj hv' =>
+        have h3 : Except.ok adj = .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total) - 7)) :=
+          hv'.symm.trans (by with_unfolding_all exact hsub_ok)
+        injection h3 with hadj; subst hadj
+        erw [hrp1, hrp2]
+        with_unfolding_all rfl
+    · simp only [hge8, ↓reduceIte]
+      erw [hrp1, hrp2]
+      with_unfolding_all rfl
+
+private theorem copyInitMask_prepareCopy_true_range {n off total : Nat}
+    (hn : ValidScalarBytes n) (hpos : 0 < total) (hinb : off + total ≤ n) :
+    (Miri.Memory.InitMask.new (translateSizeBytes n) true).prepareCopy
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) =
+      .ok ⟨true, #[UInt64.ofNat total]⟩ := by
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hlt64 : off + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinb hn64
+  have hoff64 : off < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right off total) hlt64
+  have htot64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total off) hlt64
+  have hend := copyRange_endExclusive hlt64
+  have hoff_nat : (UInt64.ofNat off).toNat = off := UInt64.toNat_ofNat_of_lt hoff64
+  have htot_nat : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot64
+  have hend_nat : (UInt64.ofNat (off + total)).toNat = off + total := UInt64.toNat_ofNat_of_lt hlt64
+  have hnz : (UInt64.ofNat total == 0) = false := by
+    cases hb : (UInt64.ofNat total == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at htot_nat; simp at htot_nat; omega
+  have hnot_oob : ¬ (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes) := by
+    rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_nat, hn_eq]; omega
+  have hlt_sf : UInt64.ofNat off < UInt64.ofNat (off + total) := by
+    rw [UInt64.lt_iff_toNat_lt, hoff_nat, hend_nat]; omega
+  have hnot_gt_sf : ¬ (UInt64.ofNat off > UInt64.ofNat (off + total)) := by
+    rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hoff_nat, hend_nat]; omega
+  have hnot_le_fs : ¬ (UInt64.ofNat (off + total) ≤ UInt64.ofNat off) := by
+    rw [UInt64.le_iff_toNat_le, hoff_nat, hend_nat]; omega
+  have hfuel : (UInt64.ofNat (off + total)).toNat - (UInt64.ofNat off).toNat + 1 = total + 1 := by
+    omega
+  have hsub_u64 : UInt64.ofNat (off + total) - UInt64.ofNat off = UInt64.ofNat total := by
+    apply UInt64.toNat_inj.mp
+    rw [UInt64.toNat_sub_of_le _ _ (UInt64.le_of_lt hlt_sf), hend_nat, hoff_nat, htot_nat]
+    omega
+  unfold Miri.Memory.InitMask.prepareCopy Miri.Memory.InitMask.rangeAsInitChunks
+  rw [hend]
+  have hlen_new : (Miri.Memory.InitMask.new (translateSizeBytes n) true).len =
+      translateSizeBytes n := rfl
+  simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hlen_new,
+    hnz, Bool.false_eq_true, ↓reduceIte, hnot_oob, hlt_sf, Miri.Memory.InitMask.lazy_get,
+    bind, Except.bind, pure, Except.pure]
+  have hcond1 :
+      (decide (UInt64.ofNat off > UInt64.ofNat (off + total)) ||
+        decide (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes)) = false := by
+    rw [Bool.or_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+    exact ⟨hnot_gt_sf, hnot_oob⟩
+  have hcond2 :
+      (decide (UInt64.ofNat (off + total) > UInt64.ofNat (off + total)) ||
+        decide (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes)) = false := by
+    rw [Bool.or_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+    exact ⟨UInt64.lt_irrefl _, hnot_oob⟩
+  have hiter0 : (Miri.Memory.InitChunkIter.mk
+      (Miri.Memory.InitMask.new (translateSizeBytes n) true) true
+      ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩).next? =
+      .ok (some (.Init ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩,
+        ⟨Miri.Memory.InitMask.new (translateSizeBytes n) true, false,
+          ⟨UInt64.ofNat (off + total)⟩, ⟨UInt64.ofNat (off + total)⟩⟩)) := by
+    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    erw [hcond1]
+    have hnot_ge : ¬ ((UInt64.ofNat off).toNat ≥ (UInt64.ofNat (off + total)).toNat) := by
+      omega
+    with_unfolding_all dsimp
+    simp only [↓reduceIte, hnot_le_fs]
+    with_unfolding_all change
+      (if (UInt64.ofNat off).toNat ≥ (UInt64.ofNat (off + total)).toNat then _ else _) = _
+    rw [copyIte_neg hnot_ge]
+    rfl
+  have hiter1 : (Miri.Memory.InitChunkIter.mk
+      (Miri.Memory.InitMask.new (translateSizeBytes n) true) false
+      ⟨UInt64.ofNat (off + total)⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok none := by
+    unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new
+    dsimp only [bind, Except.bind, pure, Except.pure]
+    erw [hcond2]
+    with_unfolding_all simp
+  have htot16 : total ≤ 16 := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hchunks : Miri.Memory.InitMask.collectChunks
+      ⟨Miri.Memory.InitMask.new (translateSizeBytes n) true, true,
+        ⟨UInt64.ofNat off⟩, ⟨UInt64.ofNat (off + total)⟩⟩ =
+      .ok #[.Init ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩] := by
+    unfold Miri.Memory.InitMask.collectChunks
+    with_unfolding_all erw [hfuel]
+    match total, hpos, htot16 with
+    | 1, _, _ | 2, _, _ | 3, _, _ | 4, _, _ | 5, _, _ | 6, _, _ | 7, _, _ | 8, _, _
+    | 9, _, _ | 10, _, _ | 11, _, _ | 12, _, _ | 13, _, _ | 14, _, _ | 15, _, _ | 16, _, _ =>
+      with_unfolding_all (conv => lhs; whnf)
+      with_unfolding_all erw [hiter0]
+      dsimp only [bind, Except.bind, pure, Except.pure]
+      with_unfolding_all (conv => lhs; whnf)
+      with_unfolding_all erw [hiter1]
+      rfl
+    | k + 17, _, hle => omega
+  rw [hchunks]
+  have hnot_lt_fs : ¬ (UInt64.ofNat (off + total) < UInt64.ofNat off) := hnot_gt_sf
+  have hcr : (Miri.Memory.InitChunk.Init ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩).range =
+      .ok ⟨⟨UInt64.ofNat off⟩, ⟨UInt64.ofNat total⟩⟩ := by
+    unfold Miri.Memory.InitChunk.range Miri.Memory.AllocRange.fromEndpoints Miri.ABI.Size.sub
+    simp only [hnot_lt_fs, ↓reduceIte, hsub_u64, Except.mapError, bind, Except.bind,
+      pure, Except.pure, Miri.ABI.Size.ofBytes]
+  simp only [List.forIn_toArray, List.forIn_cons, List.forIn_nil, hcr,
+    Miri.Memory.InitChunk.isInit, bind, Except.bind, pure, Except.pure]
+  rfl
+
+private theorem copyInitMask_setRange_true_range {off total n : Nat} (hn : ValidScalarBytes n)
+    (hinb : off + total ≤ n) :
+    (Miri.Memory.InitMask.new (translateSizeBytes n) true).setRange
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) true =
+      .ok (Miri.Memory.InitMask.new (translateSizeBytes n) true) := by
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hlt64 : off + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinb hn64
+  have hend := copyRange_endExclusive hlt64
+  have hend_nat : (UInt64.ofNat (off + total)).toNat = off + total :=
+    UInt64.toNat_ofNat_of_lt hlt64
+  have hle_bytes : UInt64.ofNat (off + total) ≤ (translateSizeBytes n).bytes := by
+    rw [UInt64.le_iff_toNat_le, hend_nat, hn_eq]; exact hinb
+  have hnot_gt : ¬ ((UInt64.ofNat (off + total)) > (translateSizeBytes n).bytes) := by
+    rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_nat, hn_eq]; omega
+  unfold Miri.Memory.InitMask.setRange Miri.Memory.InitMask.new
+  rw [hend]
+  dsimp only [bind, Except.bind, Miri.Memory.allocRange, Miri.ABI.Size.ofBytes]
+  by_cases hfull : UInt64.ofNat off = 0 ∧ (translateSizeBytes n).bytes ≤ UInt64.ofNat (off + total)
+  · have hsz_eq : (⟨UInt64.ofNat (off + total)⟩ : Miri.ABI.Size) = translateSizeBytes n := by
+      cases hs : translateSizeBytes n with
+      | mk nb =>
+        rw [hs] at hle_bytes hfull
+        exact congrArg Miri.ABI.Size.mk (UInt64.le_antisymm hle_bytes hfull.2)
+    rw [copyIte_pos hfull, hsz_eq]
+    rfl
+  · rw [copyIte_neg hfull]
+    simp only [beq_self_eq_true, ↓reduceIte, hnot_gt, pure, Except.pure]
+
+private theorem copyInitMask_setRange_full_true {n : Nat} (hn : ValidScalarBytes n) (bD : Bool) :
+    (Miri.Memory.InitMask.new (translateSizeBytes n) bD).setRange
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat 0))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat n))) true =
+      .ok (Miri.Memory.InitMask.new (translateSizeBytes n) true) := by
+  have hts : Miri.ABI.Size.ofBytes (UInt64.ofNat n) = translateSizeBytes n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hz : Miri.ABI.Size.ofBytes (UInt64.ofNat 0) = Miri.ABI.Size.ZERO := rfl
+  rw [hz, hts]
+  exact Miri.Memory.InitMask.full_overwrite_stays_lazy (translateSizeBytes n)
+    (translateSizeBytes n) bD true _ (copyAlloc_allocRange_end _) rfl (UInt64.le_refl _)
+
+private theorem copyInitMask_applyCopy_true_range {off total n : Nat}
+    (hn : ValidScalarBytes n) (hpos : 0 < total) (hinb : off + total ≤ n) :
+    (Miri.Memory.InitMask.new (translateSizeBytes n) true).applyCopy
+      ⟨true, #[UInt64.ofNat total]⟩
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) 1 =
+      .ok (Miri.Memory.InitMask.new (translateSizeBytes n) true) := by
+  have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have htot64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total off)
+    (Nat.lt_of_le_of_lt hinb hn64)
+  have htot_nat : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot64
+  have hnz : (UInt64.ofNat total == 0) = false := by
+    cases hb : (UInt64.ofNat total == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at htot_nat; simp at htot_nat; omega
+  have hany : (#[UInt64.ofNat total].isEmpty || #[UInt64.ofNat total].any (· == 0)) = false := by
+    simp [hnz]
+  have hmul := copySize_mul_one (Miri.ABI.Size.ofBytes (UInt64.ofNat total))
+  unfold Miri.Memory.InitMask.applyCopy
+  erw [hany]
+  simp only [Bool.false_eq_true, ↓reduceIte, List.size_toArray, List.length_cons,
+    List.length_nil, Nat.zero_add, Nat.le_refl, Miri.Memory.allocRange, hmul,
+    Except.mapError, bind, Except.bind]
+  exact copyInitMask_setRange_true_range hn hinb
+
+/-- Same-allocation (`sameAllocation = true`, `nonoverlapping = true`,
+`repeatCount = 1`) byte-range `Allocation.copyRepeatedly` on an initialized
+`StackScalarAllocShape` allocation fails with `AllocError.copyRangesOverlap`
+whenever the positive byte ranges `[srcStart, srcStart + total)` and
+`[dstStart, dstStart + total)` overlap. -/
+theorem StackScalarAllocShape.copyRepeatedly_range_overlap_err {E : Type} {n : Nat}
+    (hn : ValidScalarBytes n) {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel sc msc) (hsz : sc.sizeBytes = n)
+    {srcStart dstStart total : Nat}
+    (hpos : 0 < total) (hinS : srcStart + total ≤ n) (hinD : dstStart + total ≤ n)
+    (hoverlap : ¬ (srcStart + total ≤ dstStart ∨ dstStart + total ≤ srcStart))
+    {S : Miri.Memory.Allocation AnnealProv E}
+    (hshapeS : StackScalarAllocShape (translateSizeBytes n) S)
+    (hreadS : S.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) false =
+      .ok (.fromScalarInt msc)) :
+    ∃ S' : Miri.Memory.Allocation AnnealProv E,
+      Miri.Memory.Allocation.copyRepeatedly S
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart))
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart)) 1 (Miri.ABI.Size.ofBytes 8)
+        true true S = .error .copyRangesOverlap S' := by
+  obtain ⟨hmaskS, _⟩ := copyLe_decode_readScalar hn hrel hsz hshapeS hreadS
+  have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hltS : srcStart + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinS hn64
+  have hltD : dstStart + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinD hn64
+  have hs64 : srcStart < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hltS
+  have hd64 : dstStart < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hltD
+  have ht64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hltS
+  have hsliceS := copyCheckedSlice_range hn hinS hshapeS.byteSize_eq hshapeS.len_eq
+  have hsliceD := copyCheckedSlice_range hn hinD hshapeS.byteSize_eq hshapeS.len_eq
+  unfold Miri.Memory.Allocation.getBytesUnchecked at hsliceS hsliceD
+  have hmul := copySize_mul_one (Miri.ABI.Size.ofBytes (UInt64.ofNat total))
+  have hprov_prep := copyProv_prepareCopy_new_range hltS (copyAlloc_raw S)
+  have hmask_prep := copyInitMask_prepareCopy_true_range hn hpos hinS
+  have hmask_set := copyInitMask_setRange_true_range hn hinD
+  have hendS := copyRange_endExclusive hltS
+  have hendD := copyRange_endExclusive hltD
+  have hclear := Miri.Memory.ProvenanceMap.clear_new (P := AnnealProv)
+    (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart))
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+    (copyAlloc_raw S) (Miri.ABI.Size.ofBytes 8) _ (by decide) hendD
+  have hnz_tot : (UInt64.ofNat total == 0) = false := by
+    have ht : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt ht64
+    cases hb : (UInt64.ofNat total == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at ht; simp at ht; omega
+  have hov_cond :
+      (decide (UInt64.ofNat srcStart < UInt64.ofNat (dstStart + total)) &&
+        decide (UInt64.ofNat dstStart < UInt64.ofNat (srcStart + total))) = true := by
+    rw [Bool.and_eq_true, decide_eq_true_iff, decide_eq_true_iff,
+      UInt64.lt_iff_toNat_lt, UInt64.lt_iff_toNat_lt]
+    erw [UInt64.toNat_ofNat_of_lt hs64, UInt64.toNat_ofNat_of_lt hltD,
+      UInt64.toNat_ofNat_of_lt hd64, UInt64.toNat_ofNat_of_lt hltS]
+    omega
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  rcases hshapeS with ⟨hszS, hlenS, hmutS, hprovS, _⟩
+  cases S with | _ rawS szS provS maskS alignS mutS extraS nbS =>
+  change szS = _ at hszS; change rawS.size = _ at hlenS
+  change mutS = _ at hmutS; change provS = _ at hprovS; change maskS = _ at hmaskS
+  subst hszS hmutS hprovS hmaskS
+  unfold Miri.Memory.Allocation.copyRepeatedly
+  rw [hsliceS]; dsimp only [bind, Pure.pure, pure, copyAlloc_raw] at hprov_prep hclear ⊢
+  erw [hmul]; dsimp only [bind, Pure.pure, pure]
+  rw [hsliceD, hprov_prep, hmask_prep]
+  simp only [Miri.Memory.InitCopy.noBytesInit, Bool.not_true, Bool.false_and, Bool.and_false,
+    Bool.false_eq_true, ↓reduceIte, prov_applyCopy_empty_fn,
+    show ((1 : UInt64) == 0) = false from rfl,
+    h1, Array.empty_append,
+    Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+    Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+    List.range'_succ, List.range'_zero, List.forIn_cons, List.forIn_nil, Id.run]
+  split
+  · next afterClear _ =>
+    have hendD' :
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart))
+          (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart))
+            (Miri.ABI.Size.ofBytes (UInt64.ofNat total))).size).endExclusive =
+          .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (dstStart + total))) := hendD
+    dsimp only [bind, Bind.bind, pure, Pure.pure]
+    simp only [Bool.and_self, ↓reduceIte, hendS, hendD']
+    dsimp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes]
+    erw [hov_cond]
+    exact ⟨_, rfl⟩
+  · next reason updated hprep =>
+    simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_set hclear
+    with_unfolding_all (conv at hprep => lhs; whnf)
+    with_unfolding_all erw [hsliceD] at hprep
+    simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hnz_tot, bne_self_eq_false,
+      Bool.false_eq_true, ↓reduceIte] at hprep
+    split at hprep
+    · next initialized heq =>
+      with_unfolding_all (conv at heq => lhs; whnf)
+      rw [hmask_set] at heq
+      with_unfolding_all (conv at heq => lhs; whnf)
+      injection heq with hinit_eq
+      subst hinit_eq
+      dsimp only [bind, Bind.bind, pure, Pure.pure] at hprep
+      with_unfolding_all erw [hclear] at hprep
+      with_unfolding_all cases hprep
+    · next _ heq =>
+      with_unfolding_all (conv at heq => lhs; whnf)
+      rw [hmask_set] at heq
+      with_unfolding_all (conv at heq => lhs; whnf)
+      cases heq
+
+/-- Distinct-allocation (`sameAllocation = false`) byte-range
+`Allocation.copyRepeatedly` copying `dstBytes` bytes from `[srcStart, srcStart + dstBytes)`
+of an initialized `srcBytes`-byte `StackScalarAllocShape` allocation `S` into
+`[0, dstBytes)` of a `dstBytes`-byte `StackScalarAllocShape` allocation `D`
+(whether `D` was `.init` or `.uninit`) initializes all of `D`, preserves
+`StackScalarAllocShape`, and stores `sliceScalarBytes srcSc.bits srcBytes srcStart dstBytes`. -/
+theorem StackScalarAllocShape.copyRepeatedly_range_whole_dst {E : Type}
+    {srcBytes dstBytes : Nat}
+    (hnS : ValidScalarBytes srcBytes) (hnD : ValidScalarBytes dstBytes)
+    {srcSc : MirAst.ScalarInt} {srcMsc : Miri.Memory.ScalarInt}
+    (hrelS : ScalarRel srcSc srcMsc) (hszSc : srcSc.sizeBytes = srcBytes)
+    {srcStart : Nat} (hinS : srcStart + dstBytes ≤ srcBytes)
+    {S D : Miri.Memory.Allocation AnnealProv E}
+    (hshapeS : StackScalarAllocShape (translateSizeBytes srcBytes) S)
+    (hshapeD : StackScalarAllocShape (translateSizeBytes dstBytes) D)
+    (hreadS : S.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes srcBytes)) false =
+      .ok (.fromScalarInt srcMsc)) :
+    ∃ (alloc' : Miri.Memory.Allocation AnnealProv E) (msc' : Miri.Memory.ScalarInt),
+      Miri.Memory.Allocation.copyRepeatedly S
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart))
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat dstBytes)))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat 0)) 1 (Miri.ABI.Size.ofBytes 8)
+        false true D = .ok () alloc' ∧
+      ScalarRel ⟨sliceScalarBytes srcSc.bits srcBytes srcStart dstBytes, dstBytes⟩ msc' ∧
+      alloc'.align = D.align ∧
+      StackScalarAllocShape (translateSizeBytes dstBytes) alloc' ∧
+      alloc'.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes dstBytes)) = .ok (.ok ()) ∧
+      alloc'.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes dstBytes)) false =
+        .ok (.fromScalarInt msc') := by
+  obtain ⟨hmaskS, hrawS_eq⟩ := copyLe_decode_readScalar hnS hrelS hszSc hshapeS hreadS
+  have hsrc_can : srcSc.bits < scalarModulus srcBytes := hszSc ▸ hrelS.canonical
+  have hposD : 0 < dstBytes := by rcases hnD with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hd_eq : (translateSizeBytes dstBytes).bytes.toNat = dstBytes := by
+    rcases hnD with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hs64 : srcBytes < 2 ^ 64 := by rcases hnS with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hd64 : dstBytes < 2 ^ 64 := by rcases hnD with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hltS : srcStart + dstBytes < 2 ^ 64 := Nat.lt_of_le_of_lt hinS hs64
+  have hltD : 0 + dstBytes < 2 ^ 64 := by simpa using hd64
+  have hsliceS := copyCheckedSlice_range hnS hinS hshapeS.byteSize_eq hshapeS.len_eq
+  have hsliceD := copyCheckedSlice_range (off := 0) (total := dstBytes) hnD (by omega)
+    hshapeD.byteSize_eq hshapeD.len_eq
+  unfold Miri.Memory.Allocation.getBytesUnchecked at hsliceS hsliceD
+  have hmul := copySize_mul_one (Miri.ABI.Size.ofBytes (UInt64.ofNat dstBytes))
+  have hprov_prep := copyProv_prepareCopy_new_range hltS (copyAlloc_raw S)
+  have hmask_prep := copyInitMask_prepareCopy_true_range hnS hposD hinS
+  have hendD := copyRange_endExclusive hltD
+  have hmask_app := copyInitMask_applyCopy_true_range (off := 0) hnD hposD (by omega)
+  have hnz_tot : (UInt64.ofNat dstBytes == 0) = false := by
+    have ht : (UInt64.ofNat dstBytes).toNat = dstBytes := UInt64.toNat_ofNat_of_lt hd64
+    cases hb : (UInt64.ofNat dstBytes == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at ht; simp at ht; omega
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  let chunk := sliceScalarBytes srcSc.bits srcBytes srcStart dstBytes
+  have hex_slice : (copyAlloc_raw S).extract srcStart (srcStart + dstBytes) =
+      copyLe_bytes chunk dstBytes := by
+    rw [hrawS_eq]; exact copyLe_extract_eq_slice hsrc_can hinS
+  obtain ⟨alloc', hcopy, halign', hshape', hmask', hraw'⟩ :
+      ∃ alloc' : Miri.Memory.Allocation AnnealProv E,
+        Miri.Memory.Allocation.copyRepeatedly S
+          (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart))
+            (Miri.ABI.Size.ofBytes (UInt64.ofNat dstBytes)))
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat 0)) 1 (Miri.ABI.Size.ofBytes 8)
+          false true D = .ok () alloc' ∧
+        alloc'.align = D.align ∧
+        StackScalarAllocShape (translateSizeBytes dstBytes) alloc' ∧
+        alloc'.initializationMask = Miri.Memory.InitMask.new (translateSizeBytes dstBytes) true ∧
+        copyAlloc_raw alloc' = copyLe_bytes chunk dstBytes := by
+    rcases hshapeS with ⟨hszS, hlenS, hmutS, hprovS, _⟩
+    rcases hshapeD with ⟨hszD, hlenD, hmutD, hprovD, ⟨bD, hmaskD⟩⟩
+    have hmask_set := copyInitMask_setRange_full_true hnD bD
+    have hclear := Miri.Memory.ProvenanceMap.clear_new (P := AnnealProv)
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat 0))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat dstBytes)))
+      (copyAlloc_raw D) (Miri.ABI.Size.ofBytes 8) _ (by decide) hendD
+    cases S with | _ rawS szS provS maskS alignS mutS extraS nbS =>
+    cases D with | _ rawD szD provD maskD alignD mutD extraD nbD =>
+    change szS = _ at hszS; change rawS.size = _ at hlenS
+    change mutS = _ at hmutS; change provS = _ at hprovS; change maskS = _ at hmaskS
+    change szD = _ at hszD; change rawD.size = _ at hlenD
+    change mutD = _ at hmutD; change provD = _ at hprovD; change maskD = _ at hmaskD
+    subst hszS hmutS hprovS hmaskS hszD hmutD hprovD hmaskD
+    dsimp only [copyAlloc_raw] at hprov_prep hclear hex_slice
+    have hex0 : rawD.extract 0 0 = #[] := array_extract_zero_zero rawD
+    have hexN : rawD.extract dstBytes rawD.size = #[] :=
+      array_extract_self_size rawD dstBytes (hlenD.trans hd_eq)
+    have hd_nat : (UInt64.ofNat dstBytes).toNat = dstBytes :=
+      UInt64.toNat_ofNat_of_lt hd64
+    have h0_nat : (UInt64.ofNat 0).toNat = 0 := rfl
+    unfold Miri.Memory.Allocation.copyRepeatedly
+    rw [hsliceS]; dsimp only [bind, Pure.pure, pure]
+    erw [hmul]; dsimp only [bind, Pure.pure, pure]
+    rw [hsliceD, hprov_prep, hmask_prep]
+    simp only [Miri.Memory.InitCopy.noBytesInit, Bool.not_true, Bool.false_and, Bool.and_false,
+      Bool.false_eq_true, ↓reduceIte, prov_applyCopy_empty_fn,
+      show ((1 : UInt64) == 0) = false from rfl,
+      h1, Array.empty_append,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+      List.range'_succ, List.range'_zero, List.forIn_cons, List.forIn_nil, Id.run]
+    split
+    · next afterClear hprep =>
+      have hp := hprep
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_set hclear
+      with_unfolding_all (conv at hp => lhs; whnf)
+      with_unfolding_all erw [hsliceD] at hp
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hnz_tot, bne_self_eq_false,
+        Bool.false_eq_true, ↓reduceIte] at hp
+      split at hp
+      rotate_left
+      · next _ heq =>
+        with_unfolding_all (conv at heq => lhs; whnf)
+        rw [hmask_set] at heq
+        with_unfolding_all (conv at heq => lhs; whnf)
+        cases heq
+      next initialized heq =>
+      with_unfolding_all (conv at heq => lhs; whnf)
+      rw [hmask_set] at heq
+      with_unfolding_all (conv at heq => lhs; whnf)
+      injection heq with hinit_eq
+      subst hinit_eq
+      dsimp only [bind, Bind.bind, pure, Pure.pure] at hp
+      with_unfolding_all erw [hclear] at hp
+      with_unfolding_all cases hp
+      have h0_add : UInt64.ofNat 0 + UInt64.ofNat dstBytes = UInt64.ofNat dstBytes :=
+        UInt64.zero_add _
+      dsimp only [bind, Bind.bind, pure, Pure.pure]
+      split
+      · next afterBytes hover =>
+        have ho := hover
+        with_unfolding_all (conv at ho => lhs; whnf)
+        dsimp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at ho
+        with_unfolding_all erw [h0_add, h0_nat, hd_nat, hex0, hexN, hex_slice,
+          Array.empty_append, copyLe_bytes_size, bne_self_eq_false] at ho
+        with_unfolding_all cases ho
+        simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_app
+        with_unfolding_all erw [hmask_app]
+        with_unfolding_all refine ⟨_, rfl, rfl, ⟨rfl, ?_, rfl, rfl, ⟨true, rfl⟩⟩, rfl, rfl⟩
+        change (copyLe_bytes chunk dstBytes).size = (translateSizeBytes dstBytes).bytes.toNat
+        rw [copyLe_bytes_size, hd_eq]
+      · next reason hover =>
+        with_unfolding_all (conv at hover => lhs; whnf)
+        dsimp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hover
+        with_unfolding_all erw [h0_add, h0_nat, hd_nat, hex0, hexN, hex_slice,
+          Array.empty_append, copyLe_bytes_size, bne_self_eq_false] at hover
+        with_unfolding_all cases hover
+    · next reason updated hprep =>
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_set hclear
+      with_unfolding_all (conv at hprep => lhs; whnf)
+      with_unfolding_all erw [hsliceD] at hprep
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hnz_tot, bne_self_eq_false,
+        Bool.false_eq_true, ↓reduceIte] at hprep
+      split at hprep
+      · next initialized heq =>
+        with_unfolding_all (conv at heq => lhs; whnf)
+        rw [hmask_set] at heq
+        with_unfolding_all (conv at heq => lhs; whnf)
+        injection heq with hinit_eq
+        subst hinit_eq
+        dsimp only [bind, Bind.bind, pure, Pure.pure] at hprep
+        with_unfolding_all erw [hclear] at hprep
+        with_unfolding_all cases hprep
+      · next _ heq =>
+        with_unfolding_all (conv at heq => lhs; whnf)
+        rw [hmask_set] at heq
+        with_unfolding_all (conv at heq => lhs; whnf)
+        cases heq
+  obtain ⟨msc', hrel', hinit', hread'⟩ :=
+    copyLe_encode_readScalar hnD (sliceScalarBytes_lt_scalarModulus _ _ _ _) hshape' hmask' hraw'
+  exact ⟨alloc', msc', hcopy, hrel', halign', hshape', hinit', hread'⟩
+
+/-- In-bounds positive byte-range `Allocation.copyRepeatedly` copying `total`
+bytes from `[srcStart, srcStart + total)` of an initialized `srcBytes`-byte
+`StackScalarAllocShape` allocation `S` into `[dstStart, dstStart + total)` of an
+initialized `dstBytes`-byte `StackScalarAllocShape` allocation `D` (either on
+distinct allocations `sameAlloc = false`, or on disjoint sub-ranges of the same
+allocation `sameAlloc = true`) splices the copied bytes via `spliceScalarBytes`
+and preserves `StackScalarAllocShape`. -/
+theorem StackScalarAllocShape.copyRepeatedly_range_partial_dst {E : Type}
+    {srcBytes dstBytes : Nat}
+    (hnS : ValidScalarBytes srcBytes) (hnD : ValidScalarBytes dstBytes)
+    {srcSc dstSc : MirAst.ScalarInt} {srcMsc dstMsc : Miri.Memory.ScalarInt}
+    (hrelS : ScalarRel srcSc srcMsc) (hszSc : srcSc.sizeBytes = srcBytes)
+    (hrelD : ScalarRel dstSc dstMsc) (hszDc : dstSc.sizeBytes = dstBytes)
+    {srcStart dstStart total : Nat}
+    (hpos : 0 < total) (hinS : srcStart + total ≤ srcBytes) (hinD : dstStart + total ≤ dstBytes)
+    {sameAlloc : Bool}
+    (hdisj : sameAlloc = true → srcStart + total ≤ dstStart ∨ dstStart + total ≤ srcStart)
+    {S D : Miri.Memory.Allocation AnnealProv E}
+    (hshapeS : StackScalarAllocShape (translateSizeBytes srcBytes) S)
+    (hshapeD : StackScalarAllocShape (translateSizeBytes dstBytes) D)
+    (hreadS : S.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes srcBytes)) false =
+      .ok (.fromScalarInt srcMsc))
+    (hreadD : D.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes dstBytes)) false =
+      .ok (.fromScalarInt dstMsc)) :
+    ∃ (alloc' : Miri.Memory.Allocation AnnealProv E) (msc' : Miri.Memory.ScalarInt),
+      Miri.Memory.Allocation.copyRepeatedly S
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart))
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart)) 1 (Miri.ABI.Size.ofBytes 8)
+        sameAlloc true D = .ok () alloc' ∧
+      ScalarRel
+        ⟨spliceScalarBytes dstSc.bits (sliceScalarBytes srcSc.bits srcBytes srcStart total)
+          dstStart total dstBytes, dstBytes⟩ msc' ∧
+      alloc'.align = D.align ∧
+      StackScalarAllocShape (translateSizeBytes dstBytes) alloc' ∧
+      alloc'.initializationMask.isRangeInitialized
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes dstBytes)) = .ok (.ok ()) ∧
+      alloc'.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes dstBytes)) false =
+        .ok (.fromScalarInt msc') := by
+  obtain ⟨hmaskS, hrawS_eq⟩ := copyLe_decode_readScalar hnS hrelS hszSc hshapeS hreadS
+  obtain ⟨hmaskD, hrawD_eq⟩ := copyLe_decode_readScalar hnD hrelD hszDc hshapeD hreadD
+  have hsrc_can : srcSc.bits < scalarModulus srcBytes := hszSc ▸ hrelS.canonical
+  have hdst_can : dstSc.bits < scalarModulus dstBytes := hszDc ▸ hrelD.canonical
+  have hd_eq : (translateSizeBytes dstBytes).bytes.toNat = dstBytes := by
+    rcases hnD with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hs64 : srcBytes < 2 ^ 64 := by rcases hnS with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hd64 : dstBytes < 2 ^ 64 := by rcases hnD with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hltS : srcStart + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinS hs64
+  have hltD : dstStart + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinD hd64
+  have hs0_64 : srcStart < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hltS
+  have hd0_64 : dstStart < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hltD
+  have ht64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hltS
+  have hsliceS := copyCheckedSlice_range hnS hinS hshapeS.byteSize_eq hshapeS.len_eq
+  have hsliceD := copyCheckedSlice_range hnD hinD hshapeD.byteSize_eq hshapeD.len_eq
+  unfold Miri.Memory.Allocation.getBytesUnchecked at hsliceS hsliceD
+  have hmul := copySize_mul_one (Miri.ABI.Size.ofBytes (UInt64.ofNat total))
+  have hprov_prep := copyProv_prepareCopy_new_range hltS (copyAlloc_raw S)
+  have hmask_prep := copyInitMask_prepareCopy_true_range hnS hpos hinS
+  have hmask_set := copyInitMask_setRange_true_range hnD hinD
+  have hendS := copyRange_endExclusive hltS
+  have hendD := copyRange_endExclusive hltD
+  have hclear := Miri.Memory.ProvenanceMap.clear_new (P := AnnealProv)
+    (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart))
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+    (copyAlloc_raw D) (Miri.ABI.Size.ofBytes 8) _ (by decide) hendD
+  have hmask_app := copyInitMask_applyCopy_true_range hnD hpos hinD
+  have hnz_tot : (UInt64.ofNat total == 0) = false := by
+    have ht : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt ht64
+    cases hb : (UInt64.ofNat total == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at ht; simp at ht; omega
+  have h1 : (1 : UInt64).toNat = 1 := rfl
+  let chunk := sliceScalarBytes srcSc.bits srcBytes srcStart total
+  let spliced := spliceScalarBytes dstSc.bits chunk dstStart total dstBytes
+  have hchunk_can : chunk < scalarModulus total := sliceScalarBytes_lt_scalarModulus _ _ _ _
+  have hex_slice : (copyAlloc_raw S).extract srcStart (srcStart + total) =
+      copyLe_bytes chunk total := by
+    rw [hrawS_eq]; exact copyLe_extract_eq_slice hsrc_can hinS
+  have hover_eq : (copyAlloc_raw D).extract 0 dstStart ++ copyLe_bytes chunk total ++
+      (copyAlloc_raw D).extract (dstStart + total) (copyAlloc_raw D).size =
+      copyLe_bytes spliced dstBytes := by
+    rw [hrawD_eq]; exact copyLe_overwrite_eq_splice hdst_can hchunk_can hinD
+  obtain ⟨alloc', hcopy, halign', hshape', hmask', hraw'⟩ :
+      ∃ alloc' : Miri.Memory.Allocation AnnealProv E,
+        Miri.Memory.Allocation.copyRepeatedly S
+          (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart))
+            (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart)) 1 (Miri.ABI.Size.ofBytes 8)
+          sameAlloc true D = .ok () alloc' ∧
+        alloc'.align = D.align ∧
+        StackScalarAllocShape (translateSizeBytes dstBytes) alloc' ∧
+        alloc'.initializationMask = Miri.Memory.InitMask.new (translateSizeBytes dstBytes) true ∧
+        copyAlloc_raw alloc' = copyLe_bytes spliced dstBytes := by
+    rcases hshapeS with ⟨hszS, hlenS, hmutS, hprovS, _⟩
+    rcases hshapeD with ⟨hszD, hlenD, hmutD, hprovD, _⟩
+    cases S with | _ rawS szS provS maskS alignS mutS extraS nbS =>
+    cases D with | _ rawD szD provD maskD alignD mutD extraD nbD =>
+    change szS = _ at hszS; change rawS.size = _ at hlenS
+    change mutS = _ at hmutS; change provS = _ at hprovS; change maskS = _ at hmaskS
+    change szD = _ at hszD; change rawD.size = _ at hlenD
+    change mutD = _ at hmutD; change provD = _ at hprovD; change maskD = _ at hmaskD
+    subst hszS hmutS hprovS hmaskS hszD hmutD hprovD hmaskD
+    dsimp only [copyAlloc_raw] at hprov_prep hclear hex_slice hover_eq
+    have hd0_nat : (UInt64.ofNat dstStart).toNat = dstStart := UInt64.toNat_ofNat_of_lt hd0_64
+    have hdt_nat : (UInt64.ofNat (dstStart + total)).toNat = dstStart + total :=
+      UInt64.toNat_ofNat_of_lt hltD
+    unfold Miri.Memory.Allocation.copyRepeatedly
+    rw [hsliceS]; dsimp only [bind, Pure.pure, pure]
+    erw [hmul]; dsimp only [bind, Pure.pure, pure]
+    rw [hsliceD, hprov_prep, hmask_prep]
+    simp only [Miri.Memory.InitCopy.noBytesInit, Bool.not_true, Bool.false_and, Bool.and_false,
+      Bool.false_eq_true, ↓reduceIte, prov_applyCopy_empty_fn,
+      show ((1 : UInt64) == 0) = false from rfl,
+      h1, Array.empty_append,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+      List.range'_succ, List.range'_zero, List.forIn_cons, List.forIn_nil, Id.run]
+    split
+    · next afterClear hprep =>
+      have hp := hprep
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_set hclear
+      with_unfolding_all (conv at hp => lhs; whnf)
+      with_unfolding_all erw [hsliceD] at hp
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hnz_tot, bne_self_eq_false,
+        Bool.false_eq_true, ↓reduceIte] at hp
+      split at hp
+      rotate_left
+      · next _ heq =>
+        with_unfolding_all (conv at heq => lhs; whnf)
+        rw [hmask_set] at heq
+        with_unfolding_all (conv at heq => lhs; whnf)
+        cases heq
+      next initialized heq =>
+      with_unfolding_all (conv at heq => lhs; whnf)
+      rw [hmask_set] at heq
+      with_unfolding_all (conv at heq => lhs; whnf)
+      injection heq with hinit_eq
+      subst hinit_eq
+      dsimp only [bind, Bind.bind, pure, Pure.pure] at hp
+      with_unfolding_all erw [hclear] at hp
+      dsimp only [bind, Bind.bind, pure, Pure.pure]
+      cases hsame : sameAlloc with
+      | false =>
+        simp only [Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+        with_unfolding_all cases hp
+        split
+        · next afterBytes hover =>
+          have ho := hover
+          with_unfolding_all (conv at ho => lhs; whnf)
+          simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hendD
+          with_unfolding_all erw [hendD] at ho
+          dsimp only [Except.mapError, bind, Except.bind, pure, Except.pure,
+            Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at ho
+          with_unfolding_all erw [hd0_nat, hdt_nat, hex_slice, hover_eq,
+            copyLe_bytes_size, hd_eq, bne_self_eq_false] at ho
+          with_unfolding_all cases ho
+          simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_app
+          with_unfolding_all erw [hmask_app]
+          with_unfolding_all refine ⟨_, rfl, rfl, ⟨rfl, ?_, rfl, rfl, ⟨true, rfl⟩⟩, rfl, rfl⟩
+          change (copyLe_bytes spliced dstBytes).size = (translateSizeBytes dstBytes).bytes.toNat
+          rw [copyLe_bytes_size, hd_eq]
+        · next reason hover =>
+          with_unfolding_all (conv at hover => lhs; whnf)
+          simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hendD
+          with_unfolding_all erw [hendD] at hover
+          dsimp only [Except.mapError, bind, Except.bind, pure, Except.pure,
+            Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hover
+          with_unfolding_all erw [hd0_nat, hdt_nat, hex_slice, hover_eq,
+            copyLe_bytes_size, hd_eq, bne_self_eq_false] at hover
+          with_unfolding_all cases hover
+      | true =>
+        have hov_false :
+            (decide (UInt64.ofNat srcStart < UInt64.ofNat (dstStart + total)) &&
+              decide (UInt64.ofNat dstStart < UInt64.ofNat (srcStart + total))) = false := by
+          rw [Bool.and_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not,
+            UInt64.lt_iff_toNat_lt, UInt64.lt_iff_toNat_lt]
+          erw [UInt64.toNat_ofNat_of_lt hs0_64, UInt64.toNat_ofNat_of_lt hltD,
+            UInt64.toNat_ofNat_of_lt hd0_64, UInt64.toNat_ofNat_of_lt hltS]
+          rcases hdisj hsame with hd | hd <;> omega
+        have hendD' :
+            (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat dstStart))
+              (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart))
+                (Miri.ABI.Size.ofBytes (UInt64.ofNat total))).size).endExclusive =
+              .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (dstStart + total))) := hendD
+        simp only [Bool.true_and, ↓reduceIte, hendS, hendD']
+        dsimp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes]
+        erw [hov_false]
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        with_unfolding_all cases hp
+        split
+        · next afterBytes hover =>
+          have ho := hover
+          with_unfolding_all (conv at ho => lhs; whnf)
+          simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hendD
+          with_unfolding_all erw [hendD] at ho
+          dsimp only [Except.mapError, bind, Except.bind, pure, Except.pure,
+            Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at ho
+          with_unfolding_all erw [hd0_nat, hdt_nat, hex_slice, hover_eq,
+            copyLe_bytes_size, hd_eq, bne_self_eq_false] at ho
+          with_unfolding_all cases ho
+          simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_app
+          with_unfolding_all erw [hmask_app]
+          with_unfolding_all refine ⟨_, rfl, rfl, ⟨rfl, ?_, rfl, rfl, ⟨true, rfl⟩⟩, rfl, rfl⟩
+          change (copyLe_bytes spliced dstBytes).size = (translateSizeBytes dstBytes).bytes.toNat
+          rw [copyLe_bytes_size, hd_eq]
+        · next reason hover =>
+          with_unfolding_all (conv at hover => lhs; whnf)
+          simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hendD
+          with_unfolding_all erw [hendD] at hover
+          dsimp only [Except.mapError, bind, Except.bind, pure, Except.pure,
+            Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hover
+          with_unfolding_all erw [hd0_nat, hdt_nat, hex_slice, hover_eq,
+            copyLe_bytes_size, hd_eq, bne_self_eq_false] at hover
+          with_unfolding_all cases hover
+    · next reason updated hprep =>
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes] at hmask_set hclear
+      with_unfolding_all (conv at hprep => lhs; whnf)
+      with_unfolding_all erw [hsliceD] at hprep
+      simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hnz_tot, bne_self_eq_false,
+        Bool.false_eq_true, ↓reduceIte] at hprep
+      split at hprep
+      · next initialized heq =>
+        with_unfolding_all (conv at heq => lhs; whnf)
+        rw [hmask_set] at heq
+        with_unfolding_all (conv at heq => lhs; whnf)
+        injection heq with hinit_eq
+        subst hinit_eq
+        dsimp only [bind, Bind.bind, pure, Pure.pure] at hprep
+        with_unfolding_all erw [hclear] at hprep
+        with_unfolding_all cases hprep
+      · next _ heq =>
+        with_unfolding_all (conv at heq => lhs; whnf)
+        rw [hmask_set] at heq
+        with_unfolding_all (conv at heq => lhs; whnf)
+        cases heq
+  obtain ⟨msc', hrel', hinit', hread'⟩ :=
+    copyLe_encode_readScalar hnD (spliceScalarBytes_lt_scalarModulus _ hchunk_can hinD)
+      hshape' hmask' hraw'
+  exact ⟨alloc', msc', hcopy, hrel', halign', hshape', hinit', hread'⟩
+
 /-! ## 5. `annealMemCopy`, `annealCopyEval`, and `copyNextAllocMap` -/
 
 private theorem annealMemoryCopyHooks_sync_self (mach : AnnealMachine) :
@@ -965,16 +2382,6 @@ private theorem annealTryGetAllocId_self (mach : AnnealMachine)
       match annealResolvePtr mach ptr (Int.ofNat bytes.toNat) with
       | .ok resolved => some resolved.allocId
       | .error _ => none := rfl
-
-private theorem size_mul_one (size : Miri.ABI.Size) :
-    Miri.ABI.Size.mul size 1 = .ok size := by
-  rcases size with ⟨b⟩
-  unfold Miri.ABI.Size.mul Miri.ABI.Size.ofBytes
-  have h1 : b * 1 = b := UInt64.mul_one b
-  have h2 : b / 1 = b := by
-    apply UInt64.toNat_inj.mp
-    simp
-  simp [h1, h2]
 
 private theorem copySizeAsI64_of_le_isizeMax {total : Nat} (hle : total ≤ isizeMaxBytes) :
     Miri.Memory.sizeAsI64 (Miri.ABI.Size.ofBytes (UInt64.ofNat total)) =
@@ -1053,7 +2460,7 @@ private theorem annealMemCopy_of_dst_check_err
     exact ⟨_, rfl⟩
   | ok opt =>
     cases opt <;>
-    · simp only [size_mul_one size, hsz, hchk]
+    · simp only [copySize_mul_one size, hsz, hchk]
       exact ⟨_, rfl⟩
 
 /-- Non-zero `annealMemCopy` from a provenance-free `source` reports UB. -/
@@ -1318,7 +2725,7 @@ private theorem annealMemCopy_live_inbounds_eq
   have hpw : Miri.ABI.Size.fromBits annealTargetDataLayout.pointerWidth.bits =
       Miri.ABI.Size.ofBytes 8 := rfl
   have hmcr := memCopyRepeatedly_ok_eq (mach := st.machine)
-    (fun _ _ => rfl) rfl hpaS (size_mul_one _) hpaD (fun _ => rfl)
+    (fun _ _ => rfl) rfl hpaS (copySize_mul_one _) hpaD (fun _ => rfl)
     hsrc_live (fun _ _ _ _ _ => rfl) hanyD hdst_live (fun _ _ _ _ _ => rfl)
     (pointerSize := Miri.ABI.Size.ofBytes 8)
   unfold annealMemCopy Miri.Interpreter.Intrinsics.memoryCopyAdapter
@@ -2423,6 +3830,112 @@ private theorem copyEvalSrcDst_lockstep
             (copyIntrinsicPointer_fromPointer mptr_d (translateTy dstDecl.ty body.layouts) _)
             hrelC hszC
 
+/-- Target-local compatibility for `copy_nonoverlapping::<T>` on tracked
+primitive-scalar stack allocations: either both `src` and `dst` point to
+integral stack locals (`i8..i128` / `isize` / `u8..u128` / `usize` of any
+widths, supporting cross-type byte copies such as `*const u8 -> *mut u64`,
+multi-element counts, non-zero byte offsets, partial byte splices, whole-local
+`.uninit` initialization, and disjoint sub-ranges of the same local), or both
+point to stack locals of the exact pointee type `pointeeKind` (including `.bool`
+and `.char`). -/
+def CopyTargetCompatible (decl_s decl_d : LocalDecl) (pointeeKind : RigidTy) : Prop :=
+  ((∃ srcKind, IsIntegralTy decl_s.ty srcKind) ∧
+    (∃ dstKind, IsIntegralTy decl_d.ty dstKind)) ∨
+  (decl_s.ty.kind = pointeeKind ∧ decl_d.ty.kind = pointeeKind)
+
+private theorem IsIntegralTy.size_spec {ty : Ty} {kind : Miri.MIR.IntegerKind}
+    (ly : LayoutTable) (h : IsIntegralTy ty kind) :
+    rigidTyByteSize ly ty = some (integerKindByteWidth kind) ∧
+    (translateTy ty ly).layout.size = translateSizeBytes (integerKindByteWidth kind) ∧
+    ValidScalarBytes (integerKindByteWidth kind) := by
+  have hp := h.prim
+  rw [← hp.translateTy_layoutIdx ly]
+  rcases h with ⟨it, hk⟩ | ⟨ut, hk⟩
+  · cases it <;>
+      (simp only [rigidTyByteSize, rigidTyKindByteSize, hk, translateIntTy,
+        integerKindByteWidth, translateTy, translateSizeBytes]
+       exact ⟨rfl, rfl, by simp [ValidScalarBytes]⟩)
+  · cases ut <;>
+      (simp only [rigidTyByteSize, rigidTyKindByteSize, hk, translateUintTy,
+        integerKindByteWidth, translateTy, translateSizeBytes]
+       exact ⟨rfl, rfl, by simp [ValidScalarBytes]⟩)
+
+private theorem intCastTargetBytes_eq_none_of_not_integral {ty : Ty}
+    (hprim : IsPrimScalarTy ty) (hnot : ¬ ∃ k, IsIntegralTy ty k) :
+    intCastTargetBytes ty.kind = none := by
+  rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
+  · rw [hk]; rfl
+  · rw [hk]; rfl
+  · exact absurd ⟨translateIntTy it, .int it hk⟩ hnot
+  · exact absurd ⟨translateUintTy ut, .uint ut hk⟩ hnot
+
+private theorem placeTy_root_eq {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {idx : Local} {decl : LocalDecl} (hdecl : get? localDecls idx = some decl) :
+    placeTy localDecls layouts { local_ := idx, projection := .nil } = some decl.ty := by
+  unfold placeTy resolveProjectedTy
+  rw [hdecl]
+
+private theorem writeCopyRootSlot_local_ok {s : MachineState} {dstPtr : ProvenancePtr}
+    {dstIdx : Local} {slot_d newSlot : LocalSlot}
+    (hslot_d : get? s.frame.locals dstIdx = some slot_d)
+    (hne_dead : slot_d ≠ .dead) :
+    writeCopyRootSlot s s.frame.locals dstPtr dstIdx newSlot =
+      MirStepNode.step
+        (advanceStmt s (s.frame.locals.set dstIdx newSlot)
+          { s.memory with
+            borrows := invalidateConflictingBorrows s.memory.borrows dstIdx
+              (some dstPtr.tag) }) := by
+  have hlt_d : dstIdx < s.frame.locals.length := by
+    rw [get?_eq_getElem?] at hslot_d
+    exact (List.getElem?_eq_some_iff.mp hslot_d).1
+  have hset_d := set?_eq_some_set hlt_d newSlot
+  unfold writeCopyRootSlot
+  rw [hslot_d]
+  cases slot_d with
+  | dead => exact absurd rfl hne_dead
+  | uninit => dsimp only; rw [hset_d]
+  | init _ => dsimp only; rw [hset_d]
+
+private theorem evalCopyRootIntScalars_dead_src_ub {s : MachineState}
+    {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
+    {srcBytes dstBytes total : Nat}
+    (hdead : get? s.frame.locals e_s.localIdx = some .dead) :
+    evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+      e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes total =
+      MirStepNode.fail .ub := by
+  unfold evalCopyRootIntScalars lookupCopyRootSlot
+  dsimp only [AllocMapEntry.toBorrowEntry]
+  rw [hdead]
+
+private theorem evalCopyRootIntScalars_dead_dst_ub {s : MachineState}
+    {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
+    {srcBytes dstBytes total : Nat} {slot_s : LocalSlot}
+    (hslot_s : get? s.frame.locals e_s.localIdx = some slot_s)
+    (hdead_d : get? s.frame.locals e_d.localIdx = some .dead) :
+    evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+      e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes total =
+      MirStepNode.fail .ub := by
+  unfold evalCopyRootIntScalars lookupCopyRootSlot
+  dsimp only [AllocMapEntry.toBorrowEntry]
+  rw [hslot_s, hdead_d]
+  cases slot_s <;> rfl
+
+private theorem evalCopyRootIntScalars_uninit_src_ub {s : MachineState}
+    {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
+    {srcBytes dstBytes total : Nat}
+    (huninit : get? s.frame.locals e_s.localIdx = some .uninit) :
+    evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+      e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes total =
+      MirStepNode.fail .ub := by
+  have hls : lookupCopyRootSlot s s.frame.locals e_s.localIdx = some .uninit := by
+    unfold lookupCopyRootSlot; rw [huninit]
+  unfold evalCopyRootIntScalars
+  dsimp only [AllocMapEntry.toBorrowEntry]
+  rw [hls]
+  cases lookupCopyRootSlot s s.frame.locals e_d.localIdx with
+  | none => rfl
+  | some d => cases d <;> rfl
+
 private theorem evalCopyNonOverlappingWithCount_of_perm_or_single
     {s : MachineState} {src dst : MirAst.Operand}
     {localDecls : List LocalDecl} {layouts : LayoutTable}
@@ -2451,23 +3964,77 @@ private theorem evalCopyNonOverlappingWithCount_of_perm_or_single
       | _, .frozen => MirStepNode.fail .ub
       | _, .disabled => MirStepNode.fail .ub
       | _, _ =>
-        evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr
-          e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals := by
+        match intCastTargetBytes decl_s.ty.kind, intCastTargetBytes decl_d.ty.kind with
+        | some srcBytes, some dstBytes =>
+          evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+            e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes elemBytes
+        | _, _ =>
+          evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr
+            e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals := by
   have hle1 : 1 * elemBytes ≤ isizeMaxBytes := by simpa using hle
   have hnz1 : ¬ (1 * elemBytes = 0) := by omega
-  have hinS : srcPtr.offsetBytes + 1 * elemBytes ≤ elemBytes := by omega
-  have hinD : dstPtr.offsetBytes + 1 * elemBytes ≤ elemBytes := by omega
+  have hplS := placeTy_root_eq (layouts := layouts) hdeclS
+  have hplD := placeTy_root_eq (layouts := layouts) hdeclD
   unfold evalCopyNonOverlappingWithCount
   rw [copyPrecheck_eq _ _ 1 hopS hszPt halPt]
   simp only [hle1, halS, halD, Bool.and_self, hnz1, ↓reduceIte]
   rw [lookupCopyBorrowChecked_root hlookS hdeclS hszS,
     lookupCopyBorrowChecked_root hlookD hdeclD hszD]
-  simp only [hinS, hinD, ↓reduceIte]
+  simp only [Nat.one_mul, hoffS, hoffD, Nat.zero_add, Nat.le_refl, ↓reduceIte]
   dsimp only [AllocMapEntry.toBorrowEntry]
+  simp only [hdeclS, hdeclD]
   cases e_s.perm <;> cases e_d.perm <;>
-    simp [hoffS, hoffD, Nat.beq_refl]
+    (cases intCastTargetBytes decl_s.ty.kind <;> cases intCastTargetBytes decl_d.ty.kind <;>
+      simp [Bool.and, hplS, hplD, hszS, hszD, Nat.beq_refl])
 
-private theorem evalCopyNonOverlappingWithCount_dead_ub
+private theorem evalCopyNonOverlappingWithCount_int_reduce
+    {s : MachineState} {src dst : MirAst.Operand}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {srcPt : Ty} {elemBytes elemAlign countBits srcBytes dstBytes : Nat}
+    {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
+    {decl_s decl_d : LocalDecl}
+    (hopS : operandPointeeTy localDecls layouts src = some srcPt)
+    (hszPt : rigidTyByteSize layouts srcPt = some elemBytes)
+    (halPt : rigidTyAlignBytes layouts srcPt = some elemAlign)
+    (hle : countBits * elemBytes ≤ isizeMaxBytes)
+    (hpos : 0 < countBits * elemBytes)
+    (halS : ptrValueAligned elemAlign (.ptr srcPtr 8) = true)
+    (halD : ptrValueAligned elemAlign (.ptr dstPtr 8) = true)
+    (hlookS : lookupBorrow s.memory.borrows srcPtr.tag = some e_s.toBorrowEntry)
+    (hdeclS : get? localDecls e_s.localIdx = some decl_s)
+    (hszS : rigidTyByteSize layouts decl_s.ty = some srcBytes)
+    (hintS : intCastTargetBytes decl_s.ty.kind = some srcBytes)
+    (hlookD : lookupBorrow s.memory.borrows dstPtr.tag = some e_d.toBorrowEntry)
+    (hdeclD : get? localDecls e_d.localIdx = some decl_d)
+    (hszD : rigidTyByteSize layouts decl_d.ty = some dstBytes)
+    (hintD : intCastTargetBytes decl_d.ty.kind = some dstBytes) :
+    evalCopyNonOverlappingWithCount s src dst localDecls layouts
+        (.ptr srcPtr 8) (.ptr dstPtr 8) countBits s.frame.locals =
+      if srcPtr.offsetBytes + countBits * elemBytes ≤ srcBytes ∧
+          dstPtr.offsetBytes + countBits * elemBytes ≤ dstBytes then
+        match e_s.perm, e_d.perm with
+        | .disabled, _ => MirStepNode.fail .ub
+        | _, .frozen => MirStepNode.fail .ub
+        | _, .disabled => MirStepNode.fail .ub
+        | _, _ =>
+          evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+            e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes (countBits * elemBytes)
+      else MirStepNode.fail .ub := by
+  have hnz : ¬ (countBits * elemBytes = 0) := by omega
+  unfold evalCopyNonOverlappingWithCount
+  rw [copyPrecheck_eq _ _ countBits hopS hszPt halPt]
+  simp only [hle, halS, halD, Bool.and_self, hnz, ↓reduceIte]
+  rw [lookupCopyBorrowChecked_root hlookS hdeclS hszS,
+    lookupCopyBorrowChecked_root hlookD hdeclD hszD]
+  by_cases hinS : srcPtr.offsetBytes + countBits * elemBytes ≤ srcBytes
+  · by_cases hinD : dstPtr.offsetBytes + countBits * elemBytes ≤ dstBytes
+    · simp only [hinS, hinD, and_self, ↓reduceIte]
+      dsimp only [AllocMapEntry.toBorrowEntry]
+      cases e_s.perm <;> cases e_d.perm <;> simp [hdeclS, hdeclD, hintS, hintD]
+    · simp [hinS, hinD]
+  · simp [hinS]
+
+private theorem evalCopyNonOverlappingWithCount_nonint_dead_ub
     {s : MachineState} {src dst : MirAst.Operand}
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     {srcPt : Ty} {elemBytes elemAlign countBits : Nat}
@@ -2483,6 +4050,7 @@ private theorem evalCopyNonOverlappingWithCount_dead_ub
     (hlookS : lookupBorrow s.memory.borrows srcPtr.tag = some e_s.toBorrowEntry)
     (hdeclS : get? localDecls e_s.localIdx = some decl_s)
     (hszS : rigidTyByteSize layouts decl_s.ty = some elemBytes)
+    (hnonS : intCastTargetBytes decl_s.ty.kind = none)
     (hlookD : lookupBorrow s.memory.borrows dstPtr.tag = some e_d.toBorrowEntry)
     (hdeclD : get? localDecls e_d.localIdx = some decl_d)
     (hszD : rigidTyByteSize layouts decl_d.ty = some elemBytes)
@@ -2493,6 +4061,8 @@ private theorem evalCopyNonOverlappingWithCount_dead_ub
         (.ptr srcPtr 8) (.ptr dstPtr 8) countBits s.frame.locals =
       MirStepNode.fail .ub := by
   have hnz : ¬ (countBits * elemBytes = 0) := by omega
+  have hplS := placeTy_root_eq (layouts := layouts) hdeclS
+  have hplD := placeTy_root_eq (layouts := layouts) hdeclD
   unfold evalCopyNonOverlappingWithCount
   rw [copyPrecheck_eq _ _ countBits hopS hszPt halPt]
   simp only [hle, halS, halD, Bool.and_self, hnz, ↓reduceIte]
@@ -2508,7 +4078,9 @@ private theorem evalCopyNonOverlappingWithCount_dead_ub
       cases e_s.perm <;> cases e_d.perm <;>
         first
         | rfl
-        | (simp only [hoffS, hoffD, hcnt1, Nat.beq_refl, Bool.and_self]; exact hsd)
+        | (simp only [hdeclS, hdeclD, hnonS, hplS, hplD, hszS, hszD,
+             hoffS, hoffD, hcnt1, Nat.one_mul, Nat.beq_refl, Bool.and_self]
+           exact hsd)
     · simp [hinS, hinD]
   · simp [hinS]
 
@@ -2526,10 +4098,14 @@ Covers all non-diverging paths without assuming the outcome of either machine:
   provenance-free / dead / out-of-bounds pointers (no-op step preserving
   `StateRelLM3_1` in both);
 * positive-byte copies with provenance-free `.scalar` pointers, dead stack
-  locals, out-of-bounds offsets/counts, or same-allocation overlap (UB in both);
-* positive-byte copies between distinct live initialized primitive-scalar stack
-  locals with valid Tree Borrows permissions (copies the scalar & raw bytes and
-  preserves `StateRelLM3_1` under `copyNextAllocMap`). -/
+  locals, out-of-bounds offsets/counts, or overlapping byte ranges on the same
+  stack allocation (UB in both);
+* positive-byte copies across arbitrary `CopyTargetCompatible` primitive-scalar
+  stack byte ranges (cross-type integer copies, `count > 1`, non-zero offsets,
+  partial byte splices, whole-local `.uninit` initialization, same-local
+  disjoint sub-ranges, and `.bool`/`.char` same-type copies) with valid Tree
+  Borrows permissions (copies the scalar & raw bytes and preserves
+  `StateRelLM3_1` under `copyNextAllocMap`). -/
 theorem step_intrinsic_copyNonOverlapping_simulation_explicit
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -2551,17 +4127,16 @@ theorem step_intrinsic_copyNonOverlapping_simulation_explicit
     (hcountInt : IsIntegralTy countTy .usize)
     (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
     (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
-    (hsrc_tgt : ∀ srcPtr e_s decl_s,
+    (htgt_compat : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
-      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
-      get? body.localDecls e_s.localIdx = some decl_s →
-      0 < elemBytes → decl_s.ty.kind = pointeeTy.kind)
-    (hdst_tgt : ∀ dstPtr e_d decl_d,
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
       e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
       get? body.localDecls e_d.localIdx = some decl_d →
-      0 < elemBytes → decl_d.ty.kind = pointeeTy.kind)
-    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d,
+      0 < elemBytes →
+      CopyTargetCompatible decl_s decl_d pointeeTy.kind)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d decl_s decl_d srcBytes dstBytes,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
@@ -2569,13 +4144,19 @@ theorem step_intrinsic_copyNonOverlapping_simulation_explicit
       countSc.bits * elemBytes ≤ isizeMaxBytes →
       e_s ∈ allocMap → e_s.tag = srcPtr.tag →
       e_d ∈ allocMap → e_d.tag = dstPtr.tag →
-      srcPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes →
-      dstPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      rigidTyByteSize body.layouts decl_s.ty = some srcBytes →
+      rigidTyByteSize body.layouts decl_d.ty = some dstBytes →
+      srcPtr.offsetBytes + countSc.bits * elemBytes ≤ srcBytes →
+      dstPtr.offsetBytes + countSc.bits * elemBytes ≤ dstBytes →
       get? s.frame.locals e_s.localIdx ≠ some .dead →
       get? s.frame.locals e_d.localIdx ≠ some .dead →
       e_s.perm ≠ .disabled ∧
         (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
-        get? s.frame.locals e_s.localIdx ≠ some .uninit) :
+        get? s.frame.locals e_s.localIdx ≠ some .uninit ∧
+        ((dstPtr.offsetBytes = 0 ∧ countSc.bits * elemBytes = dstBytes) ∨
+          get? s.frame.locals e_d.localIdx ≠ some .uninit)) :
     StepRelLM3_1 body m
       (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
       (stepMirFn body s)
@@ -2711,13 +4292,8 @@ theorem step_intrinsic_copyNonOverlapping_simulation_explicit
                 rw [hp_s_eq, hp_d_eq] at hm_mem
                 obtain ⟨decl_s, hdecl_s, hprim_s⟩ := halloc.target_decl e_s he_s
                 obtain ⟨decl_d, hdecl_d, hprim_d⟩ := halloc.target_decl e_d he_d
-                have hk_s := hsrc_tgt srcPtr e_s decl_s hsrc_loc_eq he_s het_s hdecl_s helem_pos
-                have hk_d := hdst_tgt dstPtr e_d decl_d hdst_loc_eq he_d het_d hdecl_d helem_pos
-                have hprim_pt := isPrimScalarTy_of_kind_eq hprim_s hk_s
-                obtain ⟨hrig_s, htr_s, hvalid_sz⟩ :=
-                  primScalar_size_of_writeBytesPointee hprim_s (hk_s.symm ▸ hpt.wb)
-                obtain ⟨hrig_d, htr_d, _⟩ :=
-                  primScalar_size_of_writeBytesPointee hprim_d (hk_d.symm ▸ hpt.wb)
+                have hcompat := htgt_compat srcPtr dstPtr e_s e_d decl_s decl_d
+                  hsrc_loc_eq hdst_loc_eq he_s het_s he_d het_d hdecl_s hdecl_d helem_pos
                 have hlook_s : lookupBorrow s.memory.borrows srcPtr.tag = some e_s.toBorrowEntry := by
                   rw [← het_s]; exact (halloc.borrow_sync e_s he_s).2
                 have hlook_d : lookupBorrow s.memory.borrows dstPtr.tag = some e_d.toBorrowEntry := by
@@ -2727,168 +4303,131 @@ theorem step_intrinsic_copyNonOverlapping_simulation_explicit
                 have hbase_d : m.machine.lookupBaseAddr dstId = some (annealStackBaseAddr dstId) := by
                   rw [← hea_d]; exact (halloc.base_addr_valid e_d he_d).2.2
                 obtain ⟨slot_s, mls_s, _, _, hslot_s, hmls_s, _, hloc_s⟩ := hfr₃.lookup_local hdecl_s
-                obtain ⟨slot_d, _, _, _, hslot_d, _, _, _⟩ := hfr₃.lookup_local hdecl_d
-                -- 4a. Dead source local.
-                by_cases hd_s : slot_s = .dead
-                · subst hd_s
-                  have hnone_s : m.machine.memory.live.find? (fun x => x.1 == srcId) = none := by
-                    rw [← hea_s]; exact (halloc.local_alloc_sync tf₃ rfl e_s he_s).2 hslot_s
-                  obtain ⟨msg, herr⟩ := annealMemCopy_src_dead_err
-                    (st := { m with stack := ⟨#[tf₃]⟩ }) srcId srcBorTag srcPtr.offsetBytes _
-                    hid_s hoff_s hbase_s hnone_s hpos hle
-                  refine mk_ub ?_ (hm_mem.trans herr)
-                  rw [ha_red]
-                  exact evalCopyNonOverlappingWithCount_dead_ub hopS hpt.wb.anneal_size
-                    hpt.anneal_align hle hpos hs_al hd_al hlook_s hdecl_s hrig_s hlook_d hdecl_d
-                    hrig_d (fun _ _ _ => evalCopySingleDirect_dead_src_ub hcaller hslot_s)
-                · -- 4b. Dead destination local.
-                  by_cases hd_d : slot_d = .dead
-                  · subst hd_d
-                    have hnone_d : m.machine.memory.live.find? (fun x => x.1 == dstId) = none := by
-                      rw [← hea_d]; exact (halloc.local_alloc_sync tf₃ rfl e_d he_d).2 hslot_d
-                    obtain ⟨msg, herr⟩ := annealMemCopy_dst_dead_err
-                      (st := { m with stack := ⟨#[tf₃]⟩ }) _ dstId dstBorTag dstPtr.offsetBytes
-                      hid_d hoff_d hbase_d hnone_d hpos hle
+                obtain ⟨slot_d, mls_d, _, _, hslot_d, hmls_d, _, hloc_d⟩ := hfr₃.lookup_local hdecl_d
+                -- Split on integral target pair vs. non-integral same-type (`.bool` / `.char`).
+                by_cases hint_pair :
+                    (∃ srcKind, IsIntegralTy decl_s.ty srcKind) ∧
+                    (∃ dstKind, IsIntegralTy decl_d.ty dstKind)
+                · -- Case A: Integral target pair (`evalCopyRootIntScalars`).
+                  obtain ⟨⟨srcKind, hsrcInt⟩, ⟨dstKind, hdstInt⟩⟩ := hint_pair
+                  let srcBytes := integerKindByteWidth srcKind
+                  let dstBytes := integerKindByteWidth dstKind
+                  obtain ⟨hrig_s, htr_s, hvalid_s⟩ := hsrcInt.size_spec body.layouts
+                  obtain ⟨hrig_d, htr_d, hvalid_d⟩ := hdstInt.size_spec body.layouts
+                  have hint_s : intCastTargetBytes decl_s.ty.kind = some srcBytes :=
+                    hsrcInt.intCastTargetBytes_eq
+                  have hint_d : intCastTargetBytes decl_d.ty.kind = some dstBytes :=
+                    hdstInt.intCastTargetBytes_eq
+                  have ha_int := evalCopyNonOverlappingWithCount_int_reduce hopS
+                    hpt.wb.anneal_size hpt.anneal_align hle hpos hs_al hd_al
+                    hlook_s hdecl_s hrig_s hint_s hlook_d hdecl_d hrig_d hint_d
+                    (dst := .copy ⟨dstIdx, []⟩)
+                  -- 4a(int). Dead source local.
+                  by_cases hd_s : slot_s = .dead
+                  · subst hd_s
+                    have hnone_s : m.machine.memory.live.find? (fun x => x.1 == srcId) = none := by
+                      rw [← hea_s]; exact (halloc.local_alloc_sync tf₃ rfl e_s he_s).2 hslot_s
+                    obtain ⟨msg, herr⟩ := annealMemCopy_src_dead_err
+                      (st := { m with stack := ⟨#[tf₃]⟩ }) srcId srcBorTag srcPtr.offsetBytes _
+                      hid_s hoff_s hbase_s hnone_s hpos hle
                     refine mk_ub ?_ (hm_mem.trans herr)
-                    rw [ha_red]
-                    exact evalCopyNonOverlappingWithCount_dead_ub hopS hpt.wb.anneal_size
-                      hpt.anneal_align hle hpos hs_al hd_al hlook_s hdecl_s hrig_s hlook_d hdecl_d
-                      hrig_d (fun _ _ _ =>
-                        evalCopySingleDirect_dead_dst_ub hcaller hprim_pt hopS hopD hslot_s hslot_d)
-                  · -- 4c. Both target locals are live.
-                    obtain ⟨⟨lay_s, hlay_s⟩, hsc_only_s, hshape_fn_s⟩ :=
-                      (halloc.local_alloc_sync tf₃ rfl e_s he_s).1 slot_s hslot_s hd_s
-                    obtain ⟨srcLA, hfind_s', _, _, hshape_s'⟩ := hshape_fn_s decl_s hdecl_s
-                    have hfind_s : m.machine.memory.live.find? (fun x => x.1 == srcId) =
-                        some (srcId, srcLA) := by rw [← hea_s]; exact hfind_s'
-                    have hshape_s : StackScalarAllocShape (translateSizeBytes elemBytes)
-                        srcLA.allocation := htr_s ▸ hshape_s'
-                    obtain ⟨_, _, hshape_fn_d⟩ :=
-                      (halloc.local_alloc_sync tf₃ rfl e_d he_d).1 slot_d hslot_d hd_d
-                    obtain ⟨dstLA, hfind_d', hkind_d, halign_d, hshape_d'⟩ :=
-                      hshape_fn_d decl_d hdecl_d
-                    have hfind_d : m.machine.memory.live.find? (fun x => x.1 == dstId) =
-                        some (dstId, dstLA) := by rw [← hea_d]; exact hfind_d'
-                    have hshape_d : StackScalarAllocShape (translateSizeBytes elemBytes)
-                        dstLA.allocation := htr_d ▸ hshape_d'
-                    have hts_nat : (translateSizeBytes elemBytes).bytes.toNat = elemBytes := by
-                      rcases hvalid_sz with rfl | rfl | rfl | rfl | rfl <;> rfl
-                    have hsz_la_s : srcLA.allocation.byteSize.bytes.toNat = elemBytes := by
-                      rw [hshape_s.byteSize_eq, hts_nat]
-                    have hsz_la_d : dstLA.allocation.byteSize.bytes.toNat = elemBytes := by
-                      rw [hshape_d.byteSize_eq, hts_nat]
-                    -- 4d. Source OOB.
-                    by_cases hinS : srcPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes
-                    · -- 4e. Destination OOB.
-                      by_cases hinD : dstPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes
-                      · -- 4f. Both in-bounds (`offsetBytes = 0`, `countSc.bits = 1`).
-                        obtain ⟨hoff0_s, hcnt1, _⟩ := copy_inbounds_pos_eq hpos hinS
-                        obtain ⟨hoff0_d, _, _⟩ := copy_inbounds_pos_eq hpos hinD
-                        have hlive_s_ne : get? s.frame.locals e_s.localIdx ≠ some .dead := by
-                          rw [hslot_s]; intro h; injection h with h; exact hd_s h
-                        have hlive_d_ne : get? s.frame.locals e_d.localIdx ≠ some .dead := by
-                          rw [hslot_d]; intro h; injection h with h; exact hd_d h
-                        obtain ⟨hperm_s, hperm_d, hnot_un_s⟩ := hlive_ok srcPtr dstPtr countSc
-                          e_s e_d hsrc_loc_eq hdst_loc_eq hc_pre hpos hle he_s het_s he_d het_d
-                          hinS hinD hlive_s_ne hlive_d_ne
-                        -- `slot_s` is initialized (`slot_s = .init (.scalar sc_s)`).
-                        have hs_init : ∃ sc_s, slot_s = .init (.scalar sc_s) := by
-                          cases hs : slot_s with
-                          | dead => exact absurd hs hd_s
-                          | uninit => exact absurd (hslot_s.trans (congrArg some hs)) hnot_un_s
-                          | init v =>
-                            obtain ⟨sc_s, rfl⟩ := hsc_only_s v hs
-                            exact ⟨sc_s, rfl⟩
-                        obtain ⟨sc_s, rfl⟩ := hs_init
-                        -- Extract `msc_s` and `readScalar` via `indirect_stackAllocPlace_spec`.
-                        have hmls_s_eq : mls_s = ⟨.live (.indirect (stackAllocPlace e_s.allocId)), lay_s⟩ := by
-                          rw [hlay_s] at hmls_s; exact Option.some.inj hmls_s.symm
-                        have hnz_sz_s : (translateTy decl_s.ty body.layouts).layout.size ≠
-                            Miri.ABI.Size.ZERO := by
-                          rw [htr_s]; intro h
-                          have := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
-                          rw [hts_nat] at this; change elemBytes = 0 at this; omega
-                        obtain ⟨_, hsc_spec⟩ := hloc_s.indirect_stackAllocPlace_spec hmls_s_eq
-                          (halloc.base_addr_valid e_s he_s).2.2 hfind_s'
-                          (halloc.live_key_unique e_s he_s) hnz_sz_s
-                        obtain ⟨hsz_sc_eq, hbool_s, hchar_s, msc_s, hrel_sc, hread_s⟩ :=
-                          hsc_spec sc_s rfl
-                        have hsc_bytes : sc_s.sizeBytes = elemBytes := by
-                          have h := htr_s.symm.trans hsz_sc_eq
-                          have h1 : (translateSizeBytes sc_s.sizeBytes).bytes.toNat = sc_s.sizeBytes := by
-                            rcases hrel_sc.validBytes with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
-                          have := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
-                          omega
-                        rw [htr_s] at hread_s
-                        have hle1 : elemBytes ≤ isizeMaxBytes := by simpa [hcnt1] using hle
-                        have ha_step1 : evalCopyNonOverlappingWithCount s (.copy ⟨srcIdx, []⟩)
-                            (.copy ⟨dstIdx, []⟩) body.localDecls body.layouts
-                            (.ptr srcPtr 8) (.ptr dstPtr 8) countSc.bits s.frame.locals =
-                            evalCopySingleDirect s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩)
-                              body.localDecls body.layouts srcPtr dstPtr
-                              e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals := by
-                          rw [hcnt1, evalCopyNonOverlappingWithCount_of_perm_or_single hopS
-                            hpt.wb.anneal_size hpt.anneal_align hle1 helem_pos hs_al hd_al
-                            hlook_s hdecl_s hrig_s hoff0_s hlook_d hdecl_d hrig_d hoff0_d]
-                          rcases hperm_d with hp_d | hp_d <;> rw [hp_d] <;>
-                            (cases hp_s : e_s.perm <;> simp_all)
-                        -- 4g. Same allocation (overlap) vs. distinct allocations.
-                        by_cases hsame : e_s.localIdx = e_d.localIdx
-                        · have heq_id : srcId = dstId := by
-                            rw [← hea_s, ← hea_d]
-                            exact halloc.local_to_alloc_unique e_s he_s e_d he_d hsame
-                          obtain ⟨alloc', hcopy_err⟩ :=
-                            hshape_s.copyRepeatedly_init_overlap_err hvalid_sz hread_s
-                          obtain ⟨st', herr⟩ := annealMemCopy_live_overlap_err
-                            (st := { m with stack := ⟨#[tf₃]⟩ }) hvalid_sz srcId srcBorTag dstBorTag
-                            srcLA alloc' hid_s hbase_s hfind_s hsz_la_s hcopy_err
-                          have hm_err : copyMiriStmtAction body srcIdx dstIdx countOp m =
-                              .error (.undefinedBehavior "copy_nonoverlapping called on overlapping ranges")
-                                st' := by
-                            rw [hm_mem, hcnt1, Nat.one_mul, hoff0_s, hoff0_d, ← heq_id]
-                            exact herr
-                          refine mk_ub ?_ hm_err
-                          rw [ha_red, ha_step1, evalCopySingleDirect_overlap_ub hsame]
-                        · -- Distinct live allocations (`e_s.localIdx ≠ e_d.localIdx`).
-                          have hne_id : srcId ≠ e_d.allocId := by
-                            intro hid
-                            apply hsame
-                            exact halloc.alloc_to_local_injective e_s he_s e_d he_d
-                              (hea_s.trans hid)
-                          have hne_tag : srcPtr.tag ≠ dstPtr.tag := by
-                            intro htag
-                            have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s het_s
-                            have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d
-                              (het_d.trans htag.symm)
-                            rw [hl1] at hl2; injection hl2 with heq; exact hsame (congrArg _ heq)
-                          have hid_d' : e_d.allocId.value.toNat < 2 ^ 32 := hea_d.symm ▸ hid_d
-                          have hbase_d' : m.machine.lookupBaseAddr e_d.allocId =
-                              some (annealStackBaseAddr e_d.allocId) :=
-                            (halloc.base_addr_valid e_d he_d).2.2
-                          obtain ⟨alloc', hcopy_ok, halign_a', hshape_a', hinit_a', hread_a'⟩ :=
-                            hshape_s.copyRepeatedly_init_distinct hvalid_sz hshape_d hread_s
-                          have hm_copy := annealMemCopy_live_distinct_ok
-                            (st := { m with stack := ⟨#[tf₃]⟩ }) hvalid_sz srcId srcBorTag srcLA
-                            e_d.allocId dstBorTag dstLA alloc' hne_id hid_s hbase_s hfind_s hsz_la_s
-                            hid_d' hbase_d' hfind_d' hsz_la_d hcopy_ok
-                          have hm_act : copyMiriStmtAction body srcIdx dstIdx countOp m =
-                              .ok () { stack := ⟨#[tf₃]⟩, machine := { m.machine with
-                                memory := { m.machine.memory with
-                                  live := (m.machine.memory.live.filter (fun x => x.1 != e_d.allocId)).push
-                                    (e_d.allocId, ⟨dstLA.kind, alloc'⟩) } } } := by
-                            rw [hm_mem, hcnt1, Nat.one_mul, hoff0_s, hoff0_d, ← hea_d]
-                            exact hm_copy
-                          have ha_ok : evalCopyNonOverlapping s (.copy ⟨srcIdx, []⟩)
-                              (.copy ⟨dstIdx, []⟩) countOp body.localDecls body.layouts =
-                              MirStepNode.step
-                                (advanceStmt s (s.frame.locals.set e_d.localIdx (.init (.scalar sc_s)))
-                                  { s.memory with
-                                    borrows := (updateAllocMapOnWrite allocMap e_d.localIdx
-                                      (some dstPtr.tag)).map AllocMapEntry.toBorrowEntry }) := by
-                            rw [ha_red, ha_step1,
-                              evalCopySingleDirect_distinct_ok hprim_pt hopS hopD hne_tag hsame
-                                hslot_s hslot_d hd_d,
-                              hbor, copyInvalidateConflictingBorrows_eq_map_updateAllocMapOnWrite]
+                    rw [ha_red, ha_int]
+                    split
+                    · cases e_s.perm <;> cases e_d.perm <;>
+                        first | rfl | exact evalCopyRootIntScalars_dead_src_ub hslot_s
+                    · rfl
+                  · -- 4b(int). Dead destination local.
+                    by_cases hd_d : slot_d = .dead
+                    · subst hd_d
+                      have hnone_d : m.machine.memory.live.find? (fun x => x.1 == dstId) = none := by
+                        rw [← hea_d]; exact (halloc.local_alloc_sync tf₃ rfl e_d he_d).2 hslot_d
+                      obtain ⟨msg, herr⟩ := annealMemCopy_dst_dead_err
+                        (st := { m with stack := ⟨#[tf₃]⟩ }) _ dstId dstBorTag dstPtr.offsetBytes
+                        hid_d hoff_d hbase_d hnone_d hpos hle
+                      refine mk_ub ?_ (hm_mem.trans herr)
+                      rw [ha_red, ha_int]
+                      split
+                      · cases e_s.perm <;> cases e_d.perm <;>
+                          first | rfl | exact evalCopyRootIntScalars_dead_dst_ub hslot_s hslot_d
+                      · rfl
+                    · -- 4c(int). Both target locals are live.
+                      obtain ⟨⟨lay_s, hlay_s⟩, hsc_only_s, hshape_fn_s⟩ :=
+                        (halloc.local_alloc_sync tf₃ rfl e_s he_s).1 slot_s hslot_s hd_s
+                      obtain ⟨srcLA, hfind_s', _, _, hshape_s'⟩ := hshape_fn_s decl_s hdecl_s
+                      have hfind_s : m.machine.memory.live.find? (fun x => x.1 == srcId) =
+                          some (srcId, srcLA) := by rw [← hea_s]; exact hfind_s'
+                      have hshape_s : StackScalarAllocShape (translateSizeBytes srcBytes)
+                          srcLA.allocation := htr_s ▸ hshape_s'
+                      obtain ⟨⟨lay_d, hlay_d⟩, hsc_only_d, hshape_fn_d⟩ :=
+                        (halloc.local_alloc_sync tf₃ rfl e_d he_d).1 slot_d hslot_d hd_d
+                      obtain ⟨dstLA, hfind_d', hkind_d, halign_d, hshape_d'⟩ :=
+                        hshape_fn_d decl_d hdecl_d
+                      have hfind_d : m.machine.memory.live.find? (fun x => x.1 == dstId) =
+                          some (dstId, dstLA) := by rw [← hea_d]; exact hfind_d'
+                      have hshape_d : StackScalarAllocShape (translateSizeBytes dstBytes)
+                          dstLA.allocation := htr_d ▸ hshape_d'
+                      have hts_s : (translateSizeBytes srcBytes).bytes.toNat = srcBytes := by
+                        dsimp only [srcBytes]
+                        rcases hvalid_s with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
+                      have hts_d : (translateSizeBytes dstBytes).bytes.toNat = dstBytes := by
+                        dsimp only [dstBytes]
+                        rcases hvalid_d with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
+                      have hsz_la_s : srcLA.allocation.byteSize.bytes.toNat = srcBytes := by
+                        rw [hshape_s.byteSize_eq, hts_s]
+                      have hsz_la_d : dstLA.allocation.byteSize.bytes.toNat = dstBytes := by
+                        rw [hshape_d.byteSize_eq, hts_d]
+                      let total := countSc.bits * elemBytes
+                      -- 4d(int). Source OOB.
+                      by_cases hinS : srcPtr.offsetBytes + total ≤ srcBytes
+                      · -- 4e(int). Destination OOB.
+                        by_cases hinD : dstPtr.offsetBytes + total ≤ dstBytes
+                        · -- 4f(int). Both in-bounds (`srcOff + total ≤ srcBytes` and `dstOff + total ≤ dstBytes`).
+                          have hlive_s_ne : get? s.frame.locals e_s.localIdx ≠ some .dead := by
+                            rw [hslot_s]; intro h; injection h with h; exact hd_s h
+                          have hlive_d_ne : get? s.frame.locals e_d.localIdx ≠ some .dead := by
+                            rw [hslot_d]; intro h; injection h with h; exact hd_d h
+                          obtain ⟨hperm_s, hperm_d, hnot_un_s, hdst_init_cond⟩ :=
+                            hlive_ok srcPtr dstPtr countSc e_s e_d decl_s decl_d srcBytes dstBytes
+                              hsrc_loc_eq hdst_loc_eq hc_pre hpos hle he_s het_s he_d het_d
+                              hdecl_s hdecl_d hrig_s hrig_d hinS hinD hlive_s_ne hlive_d_ne
+                          have hs_init : ∃ sc_s, slot_s = .init (.scalar sc_s) := by
+                            cases hs : slot_s with
+                            | dead => exact absurd hs hd_s
+                            | uninit => exact absurd (hslot_s.trans (congrArg some hs)) hnot_un_s
+                            | init v =>
+                              obtain ⟨sc_s, rfl⟩ := hsc_only_s v hs
+                              exact ⟨sc_s, rfl⟩
+                          obtain ⟨sc_s, rfl⟩ := hs_init
+                          have hmls_s_eq : mls_s = ⟨.live (.indirect (stackAllocPlace e_s.allocId)), lay_s⟩ := by
+                            rw [hlay_s] at hmls_s; exact Option.some.inj hmls_s.symm
+                          have hnz_sz_s : (translateTy decl_s.ty body.layouts).layout.size ≠
+                              Miri.ABI.Size.ZERO := by
+                            rw [htr_s]; intro h
+                            have := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
+                            rw [hts_s] at this
+                            have hs_pos : 0 < srcBytes := by
+                              rcases hvalid_s with h0 | h0 | h0 | h0 | h0 <;> omega
+                            change srcBytes = 0 at this; omega
+                          obtain ⟨_, hsc_spec⟩ := hloc_s.indirect_stackAllocPlace_spec hmls_s_eq
+                            (halloc.base_addr_valid e_s he_s).2.2 hfind_s'
+                            (halloc.live_key_unique e_s he_s) hnz_sz_s
+                          obtain ⟨hsz_sc_eq, _, _, msc_s, hrel_sc, hread_s⟩ := hsc_spec sc_s rfl
+                          have hsc_bytes : sc_s.sizeBytes = srcBytes := by
+                            have h := htr_s.symm.trans hsz_sc_eq
+                            have h1 : (translateSizeBytes sc_s.sizeBytes).bytes.toNat = sc_s.sizeBytes := by
+                              rcases hrel_sc.validBytes with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
+                            have h2 := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
+                            rw [hts_s, h1] at h2
+                            exact h2.symm
+                          rw [htr_s] at hread_s
+                          have ha_step1 : evalCopyNonOverlappingWithCount s (.copy ⟨srcIdx, []⟩)
+                              (.copy ⟨dstIdx, []⟩) body.localDecls body.layouts
+                              (.ptr srcPtr 8) (.ptr dstPtr 8) countSc.bits s.frame.locals =
+                              evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+                                e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes total := by
+                            rw [ha_int, copyIte_pos ⟨hinS, hinD⟩]
+                            rcases hperm_d with hp_d | hp_d <;> rw [hp_d] <;>
+                              (cases hp_s : e_s.perm <;> first | rfl | exact absurd hp_s hperm_s)
                           have hmap_eq : copyNextAllocMap s.frame.locals allocMap dstIdx countOp
                               elemBytes =
                               updateAllocMapOnWrite allocMap e_d.localIdx (some dstPtr.tag) := by
@@ -2896,37 +4435,550 @@ theorem step_intrinsic_copyNonOverlapping_simulation_explicit
                             rw [hc_opt]
                             simp only [hz, ↓reduceIte, hdst_loc_eq,
                               copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d het_d]
-                          have hkind_eq : decl_d.ty.kind = decl_s.ty.kind := hk_d.trans hk_s.symm
-                          have hbool_d : decl_d.ty.kind = .bool →
-                              sc_s.sizeBytes = 1 ∧ (sc_s.bits = 0 ∨ sc_s.bits = 1) :=
-                            fun h => hbool_s (hkind_eq ▸ h)
-                          have hchar_d : decl_d.ty.kind = .char →
-                              sc_s.sizeBytes = 4 ∧ isValidCharCode sc_s.bits = true :=
-                            fun h => hchar_s (hkind_eq ▸ h)
-                          have hsz_tgt_d : (translateTy decl_d.ty body.layouts).layout.size =
-                              translateSizeBytes sc_s.sizeBytes := by
-                            rw [htr_d, hsc_bytes]
-                          have hpost := StateRelLM3_1.advance_write_deref_scalar hstate₃ rfl
-                            (fun x => x.updateOnWrite e_d.localIdx (some dstPtr.tag))
-                            (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
-                            he_d hdecl_d hprim_d hslot_d hd_d hfind_d' hkind_d halign_d
-                            hrel_sc hsz_tgt_d hbool_d hchar_d halign_a'
-                            (hsc_bytes.symm ▸ hshape_a')
-                            (hsc_bytes.symm ▸ hinit_a')
-                            (hsc_bytes.symm ▸ hread_a')
-                          rw [hanneal_step, ha_ok, hmap_eq,
-                            copyStep_miri_ok hframes hfr.body_eq hfr.location_eq hfr₃.location_eq
-                              hbb hstmt hm_act]
-                          exact .step _ _ hpost
-                      · -- Destination OOB (`elemBytes < dstPtr.offsetBytes + total`).
-                        have hoobD : dstLA.allocation.byteSize.bytes.toNat <
-                            dstPtr.offsetBytes + countSc.bits * elemBytes := by omega
-                        obtain ⟨msg, herr⟩ := annealMemCopy_dst_oob_err
-                          (st := { m with stack := ⟨#[tf₃]⟩ })
-                          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr srcId + UInt64.ofNat srcPtr.offsetBytes),
-                            some (.concrete srcId srcBorTag)⟩
-                          dstId dstBorTag dstPtr.offsetBytes
-                          dstLA hid_d hoff_d hbase_d hfind_d hpos hle hoobD
+                          -- 4g(int). Same-local overlapping byte ranges vs. non-overlapping.
+                          by_cases hov : e_s.localIdx = e_d.localIdx ∧
+                              ¬ (srcPtr.offsetBytes + total ≤ dstPtr.offsetBytes ∨
+                                dstPtr.offsetBytes + total ≤ srcPtr.offsetBytes)
+                          · obtain ⟨hsame, hoverlap⟩ := hov
+                            have heq_id : srcId = dstId := by
+                              rw [← hea_s, ← hea_d]
+                              exact halloc.local_to_alloc_unique e_s he_s e_d he_d hsame
+                            have hdecl_eq : decl_s = decl_d :=
+                              Option.some.inj (hdecl_s.symm.trans (hsame ▸ hdecl_d))
+                            have hsz_eq_sd : srcBytes = dstBytes := by
+                              have h := hrig_s.symm.trans (hdecl_eq ▸ hrig_d)
+                              exact Option.some.inj h
+                            have hinD' : dstPtr.offsetBytes + total ≤ srcBytes := hsz_eq_sd ▸ hinD
+                            obtain ⟨S', hcopy_err⟩ := hshape_s.copyRepeatedly_range_overlap_err
+                              hvalid_s hrel_sc hsc_bytes hpos hinS hinD' hoverlap hread_s
+                            have hm_eq := annealMemCopy_live_inbounds_eq
+                              (st := { m with stack := ⟨#[tf₃]⟩ })
+                              srcId srcBorTag srcPtr.offsetBytes srcLA
+                              srcId dstBorTag dstPtr.offsetBytes srcLA
+                              hid_s hoff_s hbase_s hfind_s (hsz_la_s ▸ hinS)
+                              hid_s hoff_d hbase_s hfind_s (hsz_la_s ▸ hinD') hpos hle
+                            rw [beq_self_eq_true, hcopy_err] at hm_eq
+                            obtain ⟨m_err, hm_err⟩ : ∃ m_err,
+                                copyMiriStmtAction body srcIdx dstIdx countOp m =
+                                  .error (.undefinedBehavior
+                                    "copy_nonoverlapping called on overlapping ranges") m_err :=
+                              ⟨_, by rw [hm_mem, ← heq_id]; exact hm_eq⟩
+                            refine mk_ub ?_ hm_err
+                            have hls_ov : lookupCopyRootSlot s s.frame.locals e_s.localIdx =
+                                some (.init (.scalar sc_s)) := by
+                              unfold lookupCopyRootSlot; rw [hslot_s]
+                            have hld_ov : lookupCopyRootSlot s s.frame.locals e_d.localIdx =
+                                some slot_d := by
+                              unfold lookupCopyRootSlot; rw [hslot_d]
+                            rw [ha_red, ha_step1]
+                            unfold evalCopyRootIntScalars
+                            dsimp only [AllocMapEntry.toBorrowEntry]
+                            have hov_true :
+                                (Nat.beq e_s.localIdx e_d.localIdx &&
+                                  !(Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes ||
+                                    Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes)) = true := by
+                              rw [hsame, Nat.beq_refl, Bool.true_and, Bool.not_eq_true',
+                                Bool.or_eq_false_iff]
+                              refine ⟨?_, ?_⟩
+                              · exact copyBle_eq_false_of_gt (fun h => hoverlap (Or.inl h))
+                              · exact copyBle_eq_false_of_gt (fun h => hoverlap (Or.inr h))
+                            rw [hls_ov, hld_ov]
+                            cases hd_case : slot_d with
+                            | dead => exact absurd hd_case hd_d
+                            | uninit | init _ =>
+                              dsimp only
+                              rw [hsc_bytes, Nat.beq_refl]
+                              dsimp only
+                              rw [show Nat.add srcPtr.offsetBytes total = srcPtr.offsetBytes + total from rfl,
+                                show Nat.add dstPtr.offsetBytes total = dstPtr.offsetBytes + total from rfl,
+                                show Bool.and (Nat.beq e_s.localIdx e_d.localIdx)
+                                  (Bool.not (Bool.or (Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes)
+                                    (Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes))) =
+                                  (Nat.beq e_s.localIdx e_d.localIdx &&
+                                    !(Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes ||
+                                      Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes)) from rfl,
+                                hov_true]
+                          · -- Non-overlapping byte ranges!
+                            have hov_false :
+                                (Nat.beq e_s.localIdx e_d.localIdx &&
+                                  !(Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes ||
+                                    Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes)) = false := by
+                              cases hb_same : Nat.beq e_s.localIdx e_d.localIdx
+                              · rfl
+                              · have hsame := Nat.eq_of_beq_eq_true hb_same
+                                have hdisj : srcPtr.offsetBytes + total ≤ dstPtr.offsetBytes ∨
+                                    dstPtr.offsetBytes + total ≤ srcPtr.offsetBytes :=
+                                  Classical.byContradiction (fun hn => hov ⟨hsame, hn⟩)
+                                rw [Bool.true_and, Bool.not_eq_false']
+                                rcases hdisj with hd | hd
+                                · rw [Nat.ble_eq.mpr hd]; rfl
+                                · rw [Nat.ble_eq.mpr hd, Bool.or_true]
+                            have hid_d' : e_d.allocId.value.toNat < 2 ^ 32 := hea_d.symm ▸ hid_d
+                            have hbase_d' : m.machine.lookupBaseAddr e_d.allocId =
+                                some (annealStackBaseAddr e_d.allocId) :=
+                              (halloc.base_addr_valid e_d he_d).2.2
+                            -- Split on whole-destination overwrite (`dstStart = 0 ∧ total = dstBytes`) vs. partial splice.
+                            by_cases hwhole : dstPtr.offsetBytes = 0 ∧ total = dstBytes
+                            · obtain ⟨hoff0_d, htot_eq⟩ := hwhole
+                              have hne_loc : e_s.localIdx ≠ e_d.localIdx := by
+                                intro hsame
+                                have hdecl_eq : decl_s = decl_d :=
+                                  Option.some.inj (hdecl_s.symm.trans (hsame ▸ hdecl_d))
+                                have hsz_eq_sd : srcBytes = dstBytes :=
+                                  Option.some.inj (hrig_s.symm.trans (hdecl_eq ▸ hrig_d))
+                                apply hov
+                                refine ⟨hsame, ?_⟩
+                                intro hdisj
+                                omega
+                              have hne_id : srcId ≠ e_d.allocId := by
+                                intro hid
+                                exact hne_loc (halloc.alloc_to_local_injective e_s he_s e_d he_d
+                                  (hea_s.trans hid))
+                              have hinS_d : srcPtr.offsetBytes + dstBytes ≤ srcBytes := htot_eq ▸ hinS
+                              obtain ⟨alloc', msc', hcopy_ok, hrel_new, halign_a', hshape_a',
+                                hinit_a', hread_a'⟩ :=
+                                hshape_s.copyRepeatedly_range_whole_dst hvalid_s hvalid_d
+                                  hrel_sc hsc_bytes hinS_d hshape_d hread_s
+                              have hm_eq := annealMemCopy_live_inbounds_eq
+                                (st := { m with stack := ⟨#[tf₃]⟩ })
+                                srcId srcBorTag srcPtr.offsetBytes srcLA
+                                e_d.allocId dstBorTag 0 dstLA
+                                hid_s hoff_s hbase_s hfind_s (hsz_la_s ▸ hinS_d)
+                                hid_d' (by decide) hbase_d' hfind_d' (by omega)
+                                (htot_eq ▸ hpos) (htot_eq ▸ hle)
+                              rw [beq_false_of_ne hne_id, hcopy_ok] at hm_eq
+                              have hm_act : copyMiriStmtAction body srcIdx dstIdx countOp m =
+                                  .ok () { stack := ⟨#[tf₃]⟩, machine := { m.machine with
+                                    memory := { m.machine.memory with
+                                      live := (m.machine.memory.live.filter (fun x => x.1 != e_d.allocId)).push
+                                        (e_d.allocId, ⟨dstLA.kind, alloc'⟩) } } } := by
+                                rw [hm_mem, show countSc.bits * elemBytes = dstBytes from htot_eq,
+                                  hoff0_d, ← hea_d]
+                                exact hm_eq
+                              let newSc : MirAst.ScalarInt :=
+                                ⟨sliceScalarBytes sc_s.bits srcBytes srcPtr.offsetBytes dstBytes,
+                                  dstBytes⟩
+                              have ha_ok : evalCopyNonOverlapping s (.copy ⟨srcIdx, []⟩)
+                                  (.copy ⟨dstIdx, []⟩) countOp body.localDecls body.layouts =
+                                  MirStepNode.step
+                                    (advanceStmt s (s.frame.locals.set e_d.localIdx (.init (.scalar newSc)))
+                                      { s.memory with
+                                        borrows := (updateAllocMapOnWrite allocMap e_d.localIdx
+                                          (some dstPtr.tag)).map AllocMapEntry.toBorrowEntry }) := by
+                                have hls_ok : lookupCopyRootSlot s s.frame.locals e_s.localIdx =
+                                    some (.init (.scalar sc_s)) := by
+                                  unfold lookupCopyRootSlot; rw [hslot_s]
+                                have hld_ok : lookupCopyRootSlot s s.frame.locals e_d.localIdx =
+                                    some slot_d := by
+                                  unfold lookupCopyRootSlot; rw [hslot_d]
+                                rw [ha_red, ha_step1]
+                                unfold evalCopyRootIntScalars
+                                dsimp only [AllocMapEntry.toBorrowEntry]
+                                rw [hls_ok, hld_ok]
+                                cases hd_case : slot_d with
+                                | dead => exact absurd hd_case hd_d
+                                | uninit | init _ =>
+                                  dsimp only
+                                  rw [hsc_bytes, Nat.beq_refl]
+                                  dsimp only
+                                  rw [show Nat.add srcPtr.offsetBytes total = srcPtr.offsetBytes + total from rfl,
+                                    show Nat.add dstPtr.offsetBytes total = dstPtr.offsetBytes + total from rfl,
+                                    show Bool.and (Nat.beq e_s.localIdx e_d.localIdx)
+                                      (Bool.not (Bool.or (Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes)
+                                        (Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes))) =
+                                      (Nat.beq e_s.localIdx e_d.localIdx &&
+                                        !(Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes ||
+                                          Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes)) from rfl,
+                                    hov_false]
+                                  dsimp only
+                                  simp only [hoff0_d, htot_eq, Nat.beq_refl, Bool.and_self]
+                                  rw [writeCopyRootSlot_local_ok (hslot_d.trans (congrArg some hd_case)) (by nofun),
+                                    hbor, copyInvalidateConflictingBorrows_eq_map_updateAllocMapOnWrite]
+                              have hpost := StateRelLM3_1.advance_write_deref_scalar hstate₃ rfl
+                                (fun x => x.updateOnWrite e_d.localIdx (some dstPtr.tag))
+                                (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
+                                he_d hdecl_d hprim_d hslot_d hd_d hfind_d' hkind_d halign_d
+                                hrel_new htr_d
+                                (fun h => absurd h hdstInt.ne_bool)
+                                (fun h => absurd h hdstInt.ne_char)
+                                halign_a' hshape_a' hinit_a' hread_a'
+                              rw [hanneal_step, ha_ok, hmap_eq,
+                                copyStep_miri_ok hframes hfr.body_eq hfr.location_eq hfr₃.location_eq
+                                  hbb hstmt hm_act]
+                              exact .step _ _ hpost
+                            · -- Partial destination splice (`¬(dstStart = 0 ∧ total = dstBytes)`).
+                              have hnot_un_d : get? s.frame.locals e_d.localIdx ≠ some .uninit := by
+                                rcases hdst_init_cond with hw | hnu
+                                · exact absurd hw hwhole
+                                · exact hnu
+                              have hd_init : ∃ sc_d, slot_d = .init (.scalar sc_d) := by
+                                cases hd_case : slot_d with
+                                | dead => exact absurd hd_case hd_d
+                                | uninit => exact absurd (hslot_d.trans (congrArg some hd_case)) hnot_un_d
+                                | init v =>
+                                  obtain ⟨sc_d, rfl⟩ := hsc_only_d v hd_case
+                                  exact ⟨sc_d, rfl⟩
+                              obtain ⟨sc_d, hsd_eq⟩ := hd_init
+                              have hmls_d_eq : mls_d = ⟨.live (.indirect (stackAllocPlace e_d.allocId)), lay_d⟩ := by
+                                rw [hlay_d] at hmls_d; exact Option.some.inj hmls_d.symm
+                              have hnz_sz_d : (translateTy decl_d.ty body.layouts).layout.size ≠
+                                  Miri.ABI.Size.ZERO := by
+                                rw [htr_d]; intro h
+                                have := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
+                                rw [hts_d] at this
+                                have hd_pos : 0 < dstBytes := by
+                                  rcases hvalid_d with h0 | h0 | h0 | h0 | h0 <;> omega
+                                change dstBytes = 0 at this; omega
+                              obtain ⟨_, hsc_spec_d⟩ := hloc_d.indirect_stackAllocPlace_spec hmls_d_eq
+                                (halloc.base_addr_valid e_d he_d).2.2 hfind_d'
+                                (halloc.live_key_unique e_d he_d) hnz_sz_d
+                              obtain ⟨hsz_scd_eq, _, _, msc_d, hrel_scd, hread_d⟩ := hsc_spec_d sc_d hsd_eq
+                              have hscd_bytes : sc_d.sizeBytes = dstBytes := by
+                                have h := htr_d.symm.trans hsz_scd_eq
+                                have h1 : (translateSizeBytes sc_d.sizeBytes).bytes.toNat = sc_d.sizeBytes := by
+                                  rcases hrel_scd.validBytes with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
+                                have h2 := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
+                                rw [hts_d, h1] at h2
+                                exact h2.symm
+                              rw [htr_d] at hread_d
+                              have hdisj_same : (srcId == e_d.allocId) = true →
+                                  srcPtr.offsetBytes + total ≤ dstPtr.offsetBytes ∨
+                                  dstPtr.offsetBytes + total ≤ srcPtr.offsetBytes := by
+                                intro hbeq
+                                have hid_eq : e_s.allocId = e_d.allocId := hea_s.trans (eq_of_beq hbeq)
+                                have hsame := halloc.alloc_to_local_injective e_s he_s e_d he_d hid_eq
+                                exact Classical.byContradiction (fun hn => hov ⟨hsame, hn⟩)
+                              obtain ⟨alloc', msc', hcopy_ok, hrel_new, halign_a', hshape_a',
+                                hinit_a', hread_a'⟩ :=
+                                hshape_s.copyRepeatedly_range_partial_dst hvalid_s hvalid_d
+                                  hrel_sc hsc_bytes hrel_scd hscd_bytes hpos hinS hinD hdisj_same
+                                  hshape_d hread_s hread_d
+                              have hm_eq := annealMemCopy_live_inbounds_eq
+                                (st := { m with stack := ⟨#[tf₃]⟩ })
+                                srcId srcBorTag srcPtr.offsetBytes srcLA
+                                e_d.allocId dstBorTag dstPtr.offsetBytes dstLA
+                                hid_s hoff_s hbase_s hfind_s (hsz_la_s ▸ hinS)
+                                hid_d' hoff_d hbase_d' hfind_d' (hsz_la_d ▸ hinD) hpos hle
+                              rw [hcopy_ok] at hm_eq
+                              have hm_act : copyMiriStmtAction body srcIdx dstIdx countOp m =
+                                  .ok () { stack := ⟨#[tf₃]⟩, machine := { m.machine with
+                                    memory := { m.machine.memory with
+                                      live := (m.machine.memory.live.filter (fun x => x.1 != e_d.allocId)).push
+                                        (e_d.allocId, ⟨dstLA.kind, alloc'⟩) } } } := by
+                                rw [hm_mem, ← hea_d]; exact hm_eq
+                              have hwhole_false :
+                                  (Nat.beq dstPtr.offsetBytes 0 && Nat.beq total dstBytes) = false := by
+                                cases h1 : Nat.beq dstPtr.offsetBytes 0
+                                · rfl
+                                · cases h2 : Nat.beq total dstBytes
+                                  · rfl
+                                  · exact absurd ⟨Nat.eq_of_beq_eq_true h1, Nat.eq_of_beq_eq_true h2⟩ hwhole
+                              let newSc : MirAst.ScalarInt :=
+                                ⟨spliceScalarBytes sc_d.bits
+                                  (sliceScalarBytes sc_s.bits srcBytes srcPtr.offsetBytes total)
+                                  dstPtr.offsetBytes total dstBytes, dstBytes⟩
+                              have ha_ok : evalCopyNonOverlapping s (.copy ⟨srcIdx, []⟩)
+                                  (.copy ⟨dstIdx, []⟩) countOp body.localDecls body.layouts =
+                                  MirStepNode.step
+                                    (advanceStmt s (s.frame.locals.set e_d.localIdx (.init (.scalar newSc)))
+                                      { s.memory with
+                                        borrows := (updateAllocMapOnWrite allocMap e_d.localIdx
+                                          (some dstPtr.tag)).map AllocMapEntry.toBorrowEntry }) := by
+                                have hls_ok : lookupCopyRootSlot s s.frame.locals e_s.localIdx =
+                                    some (.init (.scalar sc_s)) := by
+                                  unfold lookupCopyRootSlot; rw [hslot_s]
+                                have hld_ok : lookupCopyRootSlot s s.frame.locals e_d.localIdx =
+                                    some (.init (.scalar sc_d)) := by
+                                  unfold lookupCopyRootSlot; rw [hslot_d, hsd_eq]
+                                rw [ha_red, ha_step1]
+                                unfold evalCopyRootIntScalars
+                                dsimp only [AllocMapEntry.toBorrowEntry]
+                                rw [hls_ok, hld_ok]
+                                dsimp only
+                                rw [hsc_bytes, Nat.beq_refl]
+                                dsimp only
+                                rw [show Nat.add srcPtr.offsetBytes total = srcPtr.offsetBytes + total from rfl,
+                                  show Nat.add dstPtr.offsetBytes total = dstPtr.offsetBytes + total from rfl,
+                                  show Bool.and (Nat.beq e_s.localIdx e_d.localIdx)
+                                    (Bool.not (Bool.or (Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes)
+                                      (Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes))) =
+                                    (Nat.beq e_s.localIdx e_d.localIdx &&
+                                      !(Nat.ble (srcPtr.offsetBytes + total) dstPtr.offsetBytes ||
+                                        Nat.ble (dstPtr.offsetBytes + total) srcPtr.offsetBytes)) from rfl,
+                                  hov_false]
+                                dsimp only
+                                rw [show Bool.and (Nat.beq dstPtr.offsetBytes 0) (Nat.beq total dstBytes) =
+                                    (Nat.beq dstPtr.offsetBytes 0 && Nat.beq total dstBytes) from rfl,
+                                  hwhole_false]
+                                dsimp only
+                                rw [hscd_bytes, Nat.beq_refl]
+                                dsimp only
+                                rw [writeCopyRootSlot_local_ok hslot_d hd_d,
+                                  hbor, copyInvalidateConflictingBorrows_eq_map_updateAllocMapOnWrite]
+                              have hpost := StateRelLM3_1.advance_write_deref_scalar hstate₃ rfl
+                                (fun x => x.updateOnWrite e_d.localIdx (some dstPtr.tag))
+                                (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
+                                he_d hdecl_d hprim_d hslot_d hd_d hfind_d' hkind_d halign_d
+                                hrel_new htr_d
+                                (fun h => absurd h hdstInt.ne_bool)
+                                (fun h => absurd h hdstInt.ne_char)
+                                halign_a' hshape_a' hinit_a' hread_a'
+                              rw [hanneal_step, ha_ok, hmap_eq,
+                                copyStep_miri_ok hframes hfr.body_eq hfr.location_eq hfr₃.location_eq
+                                  hbb hstmt hm_act]
+                              exact .step _ _ hpost
+                        · -- Destination OOB (`dstBytes < dstPtr.offsetBytes + total`).
+                          have hoobD : dstLA.allocation.byteSize.bytes.toNat <
+                              dstPtr.offsetBytes + total := by omega
+                          obtain ⟨msg, herr⟩ := annealMemCopy_dst_oob_err
+                            (st := { m with stack := ⟨#[tf₃]⟩ })
+                            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr srcId + UInt64.ofNat srcPtr.offsetBytes),
+                              some (.concrete srcId srcBorTag)⟩
+                            dstId dstBorTag dstPtr.offsetBytes
+                            dstLA hid_d hoff_d hbase_d hfind_d hpos hle hoobD
+                          refine mk_ub ?_ (hm_mem.trans herr)
+                          rw [ha_red, ha_int, copyIte_neg (fun h => hinD h.2)]
+                      · -- Source OOB (`srcBytes < srcPtr.offsetBytes + total`).
+                        have hoobS : srcLA.allocation.byteSize.bytes.toNat <
+                            srcPtr.offsetBytes + total := by omega
+                        obtain ⟨msg, herr⟩ := annealMemCopy_src_oob_err
+                          (st := { m with stack := ⟨#[tf₃]⟩ }) srcId srcBorTag srcPtr.offsetBytes
+                          srcLA
+                          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dstId + UInt64.ofNat dstPtr.offsetBytes),
+                            some (.concrete dstId dstBorTag)⟩
+                          hid_s hoff_s hbase_s hfind_s hpos hle hoobS
+                        refine mk_ub ?_ (hm_mem.trans herr)
+                        rw [ha_red, ha_int, copyIte_neg (fun h => hinS h.1)]
+                · -- Case B: Non-integral target pair (`.bool` / `.char` with `decl_s.ty.kind = pointeeTy.kind = decl_d.ty.kind`).
+                  have hsame_kinds : decl_s.ty.kind = pointeeTy.kind ∧ decl_d.ty.kind = pointeeTy.kind := by
+                    rcases hcompat with hp | hk
+                    · exact absurd hp hint_pair
+                    · exact hk
+                  obtain ⟨hk_s, hk_d⟩ := hsame_kinds
+                  have hnot_int_s : ¬ ∃ k, IsIntegralTy decl_s.ty k := by
+                    intro ⟨k, hk⟩
+                    apply hint_pair
+                    refine ⟨⟨k, hk⟩, ?_⟩
+                    rcases hk with ⟨it, hit⟩ | ⟨ut, hut⟩
+                    · exact ⟨translateIntTy it, .int it (hk_d.trans (hk_s.symm.trans hit))⟩
+                    · exact ⟨translateUintTy ut, .uint ut (hk_d.trans (hk_s.symm.trans hut))⟩
+                  have hnon_s := intCastTargetBytes_eq_none_of_not_integral hprim_s hnot_int_s
+                  have hprim_pt := isPrimScalarTy_of_kind_eq hprim_s hk_s
+                  obtain ⟨hrig_s, htr_s, hvalid_sz⟩ :=
+                    primScalar_size_of_writeBytesPointee hprim_s (hk_s.symm ▸ hpt.wb)
+                  obtain ⟨hrig_d, htr_d, _⟩ :=
+                    primScalar_size_of_writeBytesPointee hprim_d (hk_d.symm ▸ hpt.wb)
+                  -- 4a(nonint). Dead source local.
+                  by_cases hd_s : slot_s = .dead
+                  · subst hd_s
+                    have hnone_s : m.machine.memory.live.find? (fun x => x.1 == srcId) = none := by
+                      rw [← hea_s]; exact (halloc.local_alloc_sync tf₃ rfl e_s he_s).2 hslot_s
+                    obtain ⟨msg, herr⟩ := annealMemCopy_src_dead_err
+                      (st := { m with stack := ⟨#[tf₃]⟩ }) srcId srcBorTag srcPtr.offsetBytes _
+                      hid_s hoff_s hbase_s hnone_s hpos hle
+                    refine mk_ub ?_ (hm_mem.trans herr)
+                    rw [ha_red]
+                    exact evalCopyNonOverlappingWithCount_nonint_dead_ub hopS hpt.wb.anneal_size
+                      hpt.anneal_align hle hpos hs_al hd_al hlook_s hdecl_s hrig_s hnon_s
+                      hlook_d hdecl_d hrig_d (fun _ _ _ => evalCopySingleDirect_dead_src_ub hcaller hslot_s)
+                  · -- 4b(nonint). Dead destination local.
+                    by_cases hd_d : slot_d = .dead
+                    · subst hd_d
+                      have hnone_d : m.machine.memory.live.find? (fun x => x.1 == dstId) = none := by
+                        rw [← hea_d]; exact (halloc.local_alloc_sync tf₃ rfl e_d he_d).2 hslot_d
+                      obtain ⟨msg, herr⟩ := annealMemCopy_dst_dead_err
+                        (st := { m with stack := ⟨#[tf₃]⟩ }) _ dstId dstBorTag dstPtr.offsetBytes
+                        hid_d hoff_d hbase_d hnone_d hpos hle
+                      refine mk_ub ?_ (hm_mem.trans herr)
+                      rw [ha_red]
+                      exact evalCopyNonOverlappingWithCount_nonint_dead_ub hopS hpt.wb.anneal_size
+                        hpt.anneal_align hle hpos hs_al hd_al hlook_s hdecl_s hrig_s hnon_s
+                        hlook_d hdecl_d hrig_d (fun _ _ _ =>
+                          evalCopySingleDirect_dead_dst_ub hcaller hprim_pt hopS hopD hslot_s hslot_d)
+                    · -- 4c(nonint). Both target locals are live.
+                      obtain ⟨⟨lay_s, hlay_s⟩, hsc_only_s, hshape_fn_s⟩ :=
+                        (halloc.local_alloc_sync tf₃ rfl e_s he_s).1 slot_s hslot_s hd_s
+                      obtain ⟨srcLA, hfind_s', _, _, hshape_s'⟩ := hshape_fn_s decl_s hdecl_s
+                      have hfind_s : m.machine.memory.live.find? (fun x => x.1 == srcId) =
+                          some (srcId, srcLA) := by rw [← hea_s]; exact hfind_s'
+                      have hshape_s : StackScalarAllocShape (translateSizeBytes elemBytes)
+                          srcLA.allocation := htr_s ▸ hshape_s'
+                      obtain ⟨_, _, hshape_fn_d⟩ :=
+                        (halloc.local_alloc_sync tf₃ rfl e_d he_d).1 slot_d hslot_d hd_d
+                      obtain ⟨dstLA, hfind_d', hkind_d, halign_d, hshape_d'⟩ :=
+                        hshape_fn_d decl_d hdecl_d
+                      have hfind_d : m.machine.memory.live.find? (fun x => x.1 == dstId) =
+                          some (dstId, dstLA) := by rw [← hea_d]; exact hfind_d'
+                      have hshape_d : StackScalarAllocShape (translateSizeBytes elemBytes)
+                          dstLA.allocation := htr_d ▸ hshape_d'
+                      have hts_nat : (translateSizeBytes elemBytes).bytes.toNat = elemBytes := by
+                        rcases hvalid_sz with rfl | rfl | rfl | rfl | rfl <;> rfl
+                      have hsz_la_s : srcLA.allocation.byteSize.bytes.toNat = elemBytes := by
+                        rw [hshape_s.byteSize_eq, hts_nat]
+                      have hsz_la_d : dstLA.allocation.byteSize.bytes.toNat = elemBytes := by
+                        rw [hshape_d.byteSize_eq, hts_nat]
+                      by_cases hinS : srcPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes
+                      · by_cases hinD : dstPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes
+                        · obtain ⟨hoff0_s, hcnt1, _⟩ := copy_inbounds_pos_eq hpos hinS
+                          obtain ⟨hoff0_d, _, _⟩ := copy_inbounds_pos_eq hpos hinD
+                          have hlive_s_ne : get? s.frame.locals e_s.localIdx ≠ some .dead := by
+                            rw [hslot_s]; intro h; injection h with h; exact hd_s h
+                          have hlive_d_ne : get? s.frame.locals e_d.localIdx ≠ some .dead := by
+                            rw [hslot_d]; intro h; injection h with h; exact hd_d h
+                          obtain ⟨hperm_s, hperm_d, hnot_un_s, _⟩ :=
+                            hlive_ok srcPtr dstPtr countSc e_s e_d decl_s decl_d elemBytes elemBytes
+                              hsrc_loc_eq hdst_loc_eq hc_pre hpos hle he_s het_s he_d het_d
+                              hdecl_s hdecl_d hrig_s hrig_d hinS hinD hlive_s_ne hlive_d_ne
+                          have hs_init : ∃ sc_s, slot_s = .init (.scalar sc_s) := by
+                            cases hs : slot_s with
+                            | dead => exact absurd hs hd_s
+                            | uninit => exact absurd (hslot_s.trans (congrArg some hs)) hnot_un_s
+                            | init v =>
+                              obtain ⟨sc_s, rfl⟩ := hsc_only_s v hs
+                              exact ⟨sc_s, rfl⟩
+                          obtain ⟨sc_s, rfl⟩ := hs_init
+                          have hmls_s_eq : mls_s = ⟨.live (.indirect (stackAllocPlace e_s.allocId)), lay_s⟩ := by
+                            rw [hlay_s] at hmls_s; exact Option.some.inj hmls_s.symm
+                          have hnz_sz_s : (translateTy decl_s.ty body.layouts).layout.size ≠
+                              Miri.ABI.Size.ZERO := by
+                            rw [htr_s]; intro h
+                            have := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
+                            rw [hts_nat] at this; change elemBytes = 0 at this; omega
+                          obtain ⟨_, hsc_spec⟩ := hloc_s.indirect_stackAllocPlace_spec hmls_s_eq
+                            (halloc.base_addr_valid e_s he_s).2.2 hfind_s'
+                            (halloc.live_key_unique e_s he_s) hnz_sz_s
+                          obtain ⟨hsz_sc_eq, hbool_s, hchar_s, msc_s, hrel_sc, hread_s⟩ :=
+                            hsc_spec sc_s rfl
+                          have hsc_bytes : sc_s.sizeBytes = elemBytes := by
+                            have h := htr_s.symm.trans hsz_sc_eq
+                            have h1 : (translateSizeBytes sc_s.sizeBytes).bytes.toNat = sc_s.sizeBytes := by
+                              rcases hrel_sc.validBytes with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
+                            have := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
+                            omega
+                          rw [htr_s] at hread_s
+                          have hle1 : elemBytes ≤ isizeMaxBytes := by simpa [hcnt1] using hle
+                          have ha_step1 : evalCopyNonOverlappingWithCount s (.copy ⟨srcIdx, []⟩)
+                              (.copy ⟨dstIdx, []⟩) body.localDecls body.layouts
+                              (.ptr srcPtr 8) (.ptr dstPtr 8) countSc.bits s.frame.locals =
+                              evalCopySingleDirect s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩)
+                                body.localDecls body.layouts srcPtr dstPtr
+                                e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals := by
+                            rw [hcnt1, evalCopyNonOverlappingWithCount_of_perm_or_single hopS
+                              hpt.wb.anneal_size hpt.anneal_align hle1 helem_pos hs_al hd_al
+                              hlook_s hdecl_s hrig_s hoff0_s hlook_d hdecl_d hrig_d hoff0_d,
+                              hnon_s]
+                            rcases hperm_d with hp_d | hp_d <;> rw [hp_d] <;>
+                              (cases hp_s : e_s.perm <;> first | rfl | exact absurd hp_s hperm_s)
+                          by_cases hsame : e_s.localIdx = e_d.localIdx
+                          · have heq_id : srcId = dstId := by
+                              rw [← hea_s, ← hea_d]
+                              exact halloc.local_to_alloc_unique e_s he_s e_d he_d hsame
+                            obtain ⟨alloc', hcopy_err⟩ :=
+                              hshape_s.copyRepeatedly_init_overlap_err hvalid_sz hread_s
+                            obtain ⟨st', herr⟩ := annealMemCopy_live_overlap_err
+                              (st := { m with stack := ⟨#[tf₃]⟩ }) hvalid_sz srcId srcBorTag dstBorTag
+                              srcLA alloc' hid_s hbase_s hfind_s hsz_la_s hcopy_err
+                            have hm_err : copyMiriStmtAction body srcIdx dstIdx countOp m =
+                                .error (.undefinedBehavior "copy_nonoverlapping called on overlapping ranges")
+                                  st' := by
+                              rw [hm_mem, hcnt1, Nat.one_mul, hoff0_s, hoff0_d, ← heq_id]
+                              exact herr
+                            refine mk_ub ?_ hm_err
+                            rw [ha_red, ha_step1, evalCopySingleDirect_overlap_ub hsame]
+                          · have hne_id : srcId ≠ e_d.allocId := by
+                              intro hid
+                              apply hsame
+                              exact halloc.alloc_to_local_injective e_s he_s e_d he_d
+                                (hea_s.trans hid)
+                            have hne_tag : srcPtr.tag ≠ dstPtr.tag := by
+                              intro htag
+                              have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s het_s
+                              have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d
+                                (het_d.trans htag.symm)
+                              rw [hl1] at hl2; injection hl2 with heq; exact hsame (congrArg _ heq)
+                            have hid_d' : e_d.allocId.value.toNat < 2 ^ 32 := hea_d.symm ▸ hid_d
+                            have hbase_d' : m.machine.lookupBaseAddr e_d.allocId =
+                                some (annealStackBaseAddr e_d.allocId) :=
+                              (halloc.base_addr_valid e_d he_d).2.2
+                            obtain ⟨alloc', hcopy_ok, halign_a', hshape_a', hinit_a', hread_a'⟩ :=
+                              hshape_s.copyRepeatedly_init_distinct hvalid_sz hshape_d hread_s
+                            have hm_copy := annealMemCopy_live_distinct_ok
+                              (st := { m with stack := ⟨#[tf₃]⟩ }) hvalid_sz srcId srcBorTag srcLA
+                              e_d.allocId dstBorTag dstLA alloc' hne_id hid_s hbase_s hfind_s hsz_la_s
+                              hid_d' hbase_d' hfind_d' hsz_la_d hcopy_ok
+                            have hm_act : copyMiriStmtAction body srcIdx dstIdx countOp m =
+                                .ok () { stack := ⟨#[tf₃]⟩, machine := { m.machine with
+                                  memory := { m.machine.memory with
+                                    live := (m.machine.memory.live.filter (fun x => x.1 != e_d.allocId)).push
+                                      (e_d.allocId, ⟨dstLA.kind, alloc'⟩) } } } := by
+                              rw [hm_mem, hcnt1, Nat.one_mul, hoff0_s, hoff0_d, ← hea_d]
+                              exact hm_copy
+                            have ha_ok : evalCopyNonOverlapping s (.copy ⟨srcIdx, []⟩)
+                                (.copy ⟨dstIdx, []⟩) countOp body.localDecls body.layouts =
+                                MirStepNode.step
+                                  (advanceStmt s (s.frame.locals.set e_d.localIdx (.init (.scalar sc_s)))
+                                    { s.memory with
+                                      borrows := (updateAllocMapOnWrite allocMap e_d.localIdx
+                                        (some dstPtr.tag)).map AllocMapEntry.toBorrowEntry }) := by
+                              rw [ha_red, ha_step1,
+                                evalCopySingleDirect_distinct_ok hprim_pt hopS hopD hne_tag hsame
+                                  hslot_s hslot_d hd_d,
+                                hbor, copyInvalidateConflictingBorrows_eq_map_updateAllocMapOnWrite]
+                            have hmap_eq : copyNextAllocMap s.frame.locals allocMap dstIdx countOp
+                                elemBytes =
+                                updateAllocMapOnWrite allocMap e_d.localIdx (some dstPtr.tag) := by
+                              unfold copyNextAllocMap writeBytesNextAllocMap
+                              rw [hc_opt]
+                              simp only [hz, ↓reduceIte, hdst_loc_eq,
+                                copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d het_d]
+                            have hkind_eq : decl_d.ty.kind = decl_s.ty.kind := hk_d.trans hk_s.symm
+                            have hbool_d : decl_d.ty.kind = .bool →
+                                sc_s.sizeBytes = 1 ∧ (sc_s.bits = 0 ∨ sc_s.bits = 1) :=
+                              fun h => hbool_s (hkind_eq ▸ h)
+                            have hchar_d : decl_d.ty.kind = .char →
+                                sc_s.sizeBytes = 4 ∧ isValidCharCode sc_s.bits = true :=
+                              fun h => hchar_s (hkind_eq ▸ h)
+                            have hsz_tgt_d : (translateTy decl_d.ty body.layouts).layout.size =
+                                translateSizeBytes sc_s.sizeBytes := by
+                              rw [htr_d, hsc_bytes]
+                            have hpost := StateRelLM3_1.advance_write_deref_scalar hstate₃ rfl
+                              (fun x => x.updateOnWrite e_d.localIdx (some dstPtr.tag))
+                              (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
+                              he_d hdecl_d hprim_d hslot_d hd_d hfind_d' hkind_d halign_d
+                              hrel_sc hsz_tgt_d hbool_d hchar_d halign_a'
+                              (hsc_bytes.symm ▸ hshape_a')
+                              (hsc_bytes.symm ▸ hinit_a')
+                              (hsc_bytes.symm ▸ hread_a')
+                            rw [hanneal_step, ha_ok, hmap_eq,
+                              copyStep_miri_ok hframes hfr.body_eq hfr.location_eq hfr₃.location_eq
+                                hbb hstmt hm_act]
+                            exact .step _ _ hpost
+                        · have hoobD : dstLA.allocation.byteSize.bytes.toNat <
+                              dstPtr.offsetBytes + countSc.bits * elemBytes := by omega
+                          obtain ⟨msg, herr⟩ := annealMemCopy_dst_oob_err
+                            (st := { m with stack := ⟨#[tf₃]⟩ })
+                            ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr srcId + UInt64.ofNat srcPtr.offsetBytes),
+                              some (.concrete srcId srcBorTag)⟩
+                            dstId dstBorTag dstPtr.offsetBytes
+                            dstLA hid_d hoff_d hbase_d hfind_d hpos hle hoobD
+                          have hm_err : copyMiriStmtAction body srcIdx dstIdx countOp m =
+                              .error (.undefinedBehavior msg) { m with stack := ⟨#[tf₃]⟩ } := by
+                            rw [hm_mem]; exact herr
+                          refine mk_ub ?_ hm_err
+                          rw [ha_red]; unfold evalCopyNonOverlappingWithCount
+                          rw [copyPrecheck_eq _ _ _ hopS hpt.wb.anneal_size hpt.anneal_align]
+                          simp only [hle, hs_al, hd_al, Bool.and_self, hz, ↓reduceIte]
+                          rw [lookupCopyBorrowChecked_root hlook_s hdecl_s hrig_s,
+                            lookupCopyBorrowChecked_root hlook_d hdecl_d hrig_d]
+                          simp only [hinS, hinD, ↓reduceIte]
+                      · have hoobS : srcLA.allocation.byteSize.bytes.toNat <
+                            srcPtr.offsetBytes + countSc.bits * elemBytes := by omega
+                        obtain ⟨msg, herr⟩ := annealMemCopy_src_oob_err
+                          (st := { m with stack := ⟨#[tf₃]⟩ }) srcId srcBorTag srcPtr.offsetBytes
+                          srcLA
+                          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dstId + UInt64.ofNat dstPtr.offsetBytes),
+                            some (.concrete dstId dstBorTag)⟩
+                          hid_s hoff_s hbase_s hfind_s hpos hle hoobS
                         have hm_err : copyMiriStmtAction body srcIdx dstIdx countOp m =
                             .error (.undefinedBehavior msg) { m with stack := ⟨#[tf₃]⟩ } := by
                           rw [hm_mem]; exact herr
@@ -2934,27 +4986,8 @@ theorem step_intrinsic_copyNonOverlapping_simulation_explicit
                         rw [ha_red]; unfold evalCopyNonOverlappingWithCount
                         rw [copyPrecheck_eq _ _ _ hopS hpt.wb.anneal_size hpt.anneal_align]
                         simp only [hle, hs_al, hd_al, Bool.and_self, hz, ↓reduceIte]
-                        rw [lookupCopyBorrowChecked_root hlook_s hdecl_s hrig_s,
-                          lookupCopyBorrowChecked_root hlook_d hdecl_d hrig_d]
-                        simp only [hinS, hinD, ↓reduceIte]
-                    · -- Source OOB (`elemBytes < srcPtr.offsetBytes + total`).
-                      have hoobS : srcLA.allocation.byteSize.bytes.toNat <
-                          srcPtr.offsetBytes + countSc.bits * elemBytes := by omega
-                      obtain ⟨msg, herr⟩ := annealMemCopy_src_oob_err
-                        (st := { m with stack := ⟨#[tf₃]⟩ }) srcId srcBorTag srcPtr.offsetBytes
-                        srcLA
-                        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr dstId + UInt64.ofNat dstPtr.offsetBytes),
-                          some (.concrete dstId dstBorTag)⟩
-                        hid_s hoff_s hbase_s hfind_s hpos hle hoobS
-                      have hm_err : copyMiriStmtAction body srcIdx dstIdx countOp m =
-                          .error (.undefinedBehavior msg) { m with stack := ⟨#[tf₃]⟩ } := by
-                        rw [hm_mem]; exact herr
-                      refine mk_ub ?_ hm_err
-                      rw [ha_red]; unfold evalCopyNonOverlappingWithCount
-                      rw [copyPrecheck_eq _ _ _ hopS hpt.wb.anneal_size hpt.anneal_align]
-                      simp only [hle, hs_al, hd_al, Bool.and_self, hz, ↓reduceIte]
-                      rw [lookupCopyBorrowChecked_root hlook_s hdecl_s hrig_s]
-                      simp only [hinS, ↓reduceIte]
+                        rw [lookupCopyBorrowChecked_root hlook_s hdecl_s hrig_s]
+                        simp only [hinS, ↓reduceIte]
     · -- Size overflow (`¬ countSc.bits * elemBytes ≤ isizeMaxBytes`).
       simp only [hle, ↓reduceIte] at hm_red
       refine mk_ub ?_ hm_red
@@ -2987,17 +5020,16 @@ theorem step_intrinsic_copyNonOverlapping_simulation
     (hcountInt : IsIntegralTy countTy .usize)
     (hcountOp : ∀ tf, m.stack.frames = #[tf] → WellTypedScalarOperand body tf countOp countTy)
     (hpt : CopyPointee body.layouts pointeeTy.kind ptId elemBytes elemAlign)
-    (hsrc_tgt : ∀ srcPtr e_s decl_s,
+    (htgt_compat : ∀ srcPtr dstPtr e_s e_d decl_s decl_d,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
-      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
-      get? body.localDecls e_s.localIdx = some decl_s →
-      0 < elemBytes → decl_s.ty.kind = pointeeTy.kind)
-    (hdst_tgt : ∀ dstPtr e_d decl_d,
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
+      e_s ∈ allocMap → e_s.tag = srcPtr.tag →
       e_d ∈ allocMap → e_d.tag = dstPtr.tag →
+      get? body.localDecls e_s.localIdx = some decl_s →
       get? body.localDecls e_d.localIdx = some decl_d →
-      0 < elemBytes → decl_d.ty.kind = pointeeTy.kind)
-    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d,
+      0 < elemBytes →
+      CopyTargetCompatible decl_s decl_d pointeeTy.kind)
+    (hlive_ok : ∀ srcPtr dstPtr countSc e_s e_d decl_s decl_d srcBytes dstBytes,
       get? s.frame.locals srcIdx = some (.init (.ptr srcPtr 8)) →
       get? s.frame.locals dstIdx = some (.init (.ptr dstPtr 8)) →
       WriteBytesScalarPreVal s.frame.locals countOp countSc →
@@ -3005,13 +5037,19 @@ theorem step_intrinsic_copyNonOverlapping_simulation
       countSc.bits * elemBytes ≤ isizeMaxBytes →
       e_s ∈ allocMap → e_s.tag = srcPtr.tag →
       e_d ∈ allocMap → e_d.tag = dstPtr.tag →
-      srcPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes →
-      dstPtr.offsetBytes + countSc.bits * elemBytes ≤ elemBytes →
+      get? body.localDecls e_s.localIdx = some decl_s →
+      get? body.localDecls e_d.localIdx = some decl_d →
+      rigidTyByteSize body.layouts decl_s.ty = some srcBytes →
+      rigidTyByteSize body.layouts decl_d.ty = some dstBytes →
+      srcPtr.offsetBytes + countSc.bits * elemBytes ≤ srcBytes →
+      dstPtr.offsetBytes + countSc.bits * elemBytes ≤ dstBytes →
       get? s.frame.locals e_s.localIdx ≠ some .dead →
       get? s.frame.locals e_d.localIdx ≠ some .dead →
       e_s.perm ≠ .disabled ∧
         (e_d.perm = .active ∨ e_d.perm = .reserved) ∧
-        get? s.frame.locals e_s.localIdx ≠ some .uninit) :
+        get? s.frame.locals e_s.localIdx ≠ some .uninit ∧
+        ((dstPtr.offsetBytes = 0 ∧ countSc.bits * elemBytes = dstBytes) ∨
+          get? s.frame.locals e_d.localIdx ≠ some .uninit)) :
     ∃ allocMap',
       StepRelLM3_1 body m allocMap'
         (stepMirFn body s)
@@ -3019,7 +5057,7 @@ theorem step_intrinsic_copyNonOverlapping_simulation
   ⟨copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes,
     step_intrinsic_copyNonOverlapping_simulation_explicit hstate hphase hbb hstmt
       hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt
-      hsrc_tgt hdst_tgt hlive_ok⟩
+      htgt_compat hlive_ok⟩
 
 private theorem ptrValueAligned_of_offset_zero {elemAlign : Nat}
     (hal : ValidCopyAlign elemAlign) {p : ProvenancePtr} (hoff : p.offsetBytes = 0) :
@@ -3030,9 +5068,9 @@ private theorem ptrValueAligned_of_offset_zero {elemAlign : Nat}
 
 /-- Shared reduction for the `CopyNonOverlapping` divergence theorems (`count = 1`
 at root offset `0` on live primitive-scalar stack locals): reduces Anneal's
-`stepMirFn` to the Tree Borrows permission table + `evalCopySingleDirect` and
-proves `lean-miri`'s `Step.step` returns `(m', .ok true)` whenever `slot_s = .uninit`
-or `e_s.localIdx ≠ e_d.localIdx`. -/
+`stepMirFn` to the Tree Borrows permission table + `evalCopyRootIntScalars` /
+`evalCopySingleDirect` and proves `lean-miri`'s `Step.step` returns `(m', .ok true)`
+whenever `slot_s = .uninit` or `e_s.localIdx ≠ e_d.localIdx`. -/
 private theorem copyDivergence_core
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -3072,15 +5110,19 @@ private theorem copyDivergence_core
     (hdst_live : get? s.frame.locals e_d.localIdx ≠ some .dead)
     (hun_or_dist : get? s.frame.locals e_s.localIdx = some .uninit ∨
       e_s.localIdx ≠ e_d.localIdx) :
-    stepMirFn body s =
-      (match e_s.perm, e_d.perm with
-      | .disabled, _ => MirStepNode.fail .ub
-      | _, .frozen => MirStepNode.fail .ub
-      | _, .disabled => MirStepNode.fail .ub
-      | _, _ =>
-        evalCopySingleDirect s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩)
+    (∃ stepBody : MirStepNode,
+      (stepBody = evalCopySingleDirect s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩)
           body.localDecls body.layouts srcPtr dstPtr
-          e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals) ∧
+          e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals ∨
+        ∃ srcBytes dstBytes,
+          stepBody = evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+            e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes elemBytes) ∧
+      stepMirFn body s =
+        match e_s.perm, e_d.perm with
+        | .disabled, _ => MirStepNode.fail .ub
+        | _, .frozen => MirStepNode.fail .ub
+        | _, .disabled => MirStepNode.fail .ub
+        | _, _ => stepBody) ∧
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .ok true) := by
@@ -3152,22 +5194,40 @@ private theorem copyDivergence_core
           rw [← het_d]; exact (halloc.borrow_sync e_d he_d).2
         have hopS := operandPointeeTy_copy_rawPtr (layouts := body.layouts) hsrcDecl hsrcTy
         -- Anneal side reduction.
-        have ha_eq : stepMirFn body s =
-            match e_s.perm, e_d.perm with
-            | .disabled, _ => MirStepNode.fail .ub
-            | _, .frozen => MirStepNode.fail .ub
-            | _, .disabled => MirStepNode.fail .ub
+        have ha_eq : ∃ stepBody : MirStepNode,
+            (stepBody = evalCopySingleDirect s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩)
+                body.localDecls body.layouts srcPtr dstPtr
+                e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals ∨
+              ∃ srcBytes dstBytes,
+                stepBody = evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+                  e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes elemBytes) ∧
+            stepMirFn body s =
+              match e_s.perm, e_d.perm with
+              | .disabled, _ => MirStepNode.fail .ub
+              | _, .frozen => MirStepNode.fail .ub
+              | _, .disabled => MirStepNode.fail .ub
+              | _, _ => stepBody := by
+          refine ⟨match intCastTargetBytes decl_s.ty.kind, intCastTargetBytes decl_d.ty.kind with
+            | some srcBytes, some dstBytes =>
+              evalCopyRootIntScalars s s.frame.locals srcPtr dstPtr
+                e_s.toBorrowEntry e_d.toBorrowEntry srcBytes dstBytes elemBytes
             | _, _ =>
               evalCopySingleDirect s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩)
                 body.localDecls body.layouts srcPtr dstPtr
-                e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals := by
-          rw [hanneal_step]
-          unfold evalCopyNonOverlapping
-          rw [ha₁]; dsimp only; rw [ha₂]; dsimp only; rw [ha₃]; dsimp only
-          rw [hcnt1]
-          exact evalCopyNonOverlappingWithCount_of_perm_or_single hopS
-            hpt.wb.anneal_size hpt.anneal_align hle1 helem_pos halS halD
-            hlook_s hdecl_s hrig_s hoff0_s hlook_d hdecl_d hrig_d hoff0_d
+                e_s.toBorrowEntry e_d.toBorrowEntry s.frame.locals, ?_, ?_⟩
+          · cases intCastTargetBytes decl_s.ty.kind with
+            | none => exact Or.inl rfl
+            | some srcBytes =>
+              cases intCastTargetBytes decl_d.ty.kind with
+              | none => exact Or.inl rfl
+              | some dstBytes => exact Or.inr ⟨srcBytes, dstBytes, rfl⟩
+          · rw [hanneal_step]
+            unfold evalCopyNonOverlapping
+            rw [ha₁]; dsimp only; rw [ha₂]; dsimp only; rw [ha₃]; dsimp only
+            rw [hcnt1]
+            exact evalCopyNonOverlappingWithCount_of_perm_or_single hopS
+              hpt.wb.anneal_size hpt.anneal_align hle1 helem_pos halS halD
+              hlook_s hdecl_s hrig_s hoff0_s hlook_d hdecl_d hrig_d hoff0_d
         refine ⟨ha_eq, ?_⟩
         -- `lean-miri` side reduction.
         have hchkS := annealCheckPtrAlign_stackPtr hstate₃ rfl hpt.align_pair hptrRel_s
@@ -3304,8 +5364,8 @@ private theorem copyDivergence_core
 uninitialized (`.uninit`) live primitive-scalar stack local into a live
 primitive-scalar destination local:
 
-* Anneal's typed `evalCopySingleDirect` rejects reading `.uninit` for a
-  non-union scalar local (`stepMirFn body s = MirStepNode.fail .ub`);
+* Anneal's typed `evalCopyRootIntScalars` / `evalCopySingleDirect` rejects reading
+  `.uninit` for a non-union scalar local (`stepMirFn body s = MirStepNode.fail .ub`);
 * `lean-miri`'s untyped `Allocation.copyRepeatedly` copies uninitialized bytes
   (`initialized.noBytesInit`) and returns `.ok true`. -/
 theorem step_intrinsic_copyNonOverlapping_uninit_src_divergence
@@ -3351,16 +5411,17 @@ theorem step_intrinsic_copyNonOverlapping_uninit_src_divergence
         (m', .ok true) := by
   have hsrc_live : get? s.frame.locals e_s.localIdx ≠ some .dead := by
     rw [huninit_s]; nofun
-  obtain ⟨ha_eq, hm_ok⟩ := copyDivergence_core hstate hphase hbb hstmt
+  obtain ⟨⟨stepBody, hbody, ha_eq⟩, hm_ok⟩ := copyDivergence_core hstate hphase hbb hstmt
     hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt
     hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt1 he_s het_s he_d het_d
     hsrc_tgt hdst_tgt hsrc_live hdst_live (Or.inl huninit_s)
   refine ⟨?_, hm_ok⟩
-  rw [ha_eq]
-  have hsd := evalCopySingleDirect_uninit_src_ub (s := s) (src := .copy ⟨srcIdx, []⟩)
-    (dst := .copy ⟨dstIdx, []⟩) (localDecls := body.localDecls) (layouts := body.layouts)
-    (srcPtr := srcPtr) (dstPtr := dstPtr) (e_s := e_s) (e_d := e_d) huninit_s
-  cases e_s.perm <;> cases e_d.perm <;> first | rfl | exact hsd
+  have hbody_ub : stepBody = MirStepNode.fail .ub := by
+    rcases hbody with rfl | ⟨srcBytes, dstBytes, rfl⟩
+    · exact evalCopySingleDirect_uninit_src_ub huninit_s
+    · exact evalCopyRootIntScalars_uninit_src_ub huninit_s
+  rw [ha_eq, hbody_ub]
+  cases e_s.perm <;> cases e_d.perm <;> rfl
 
 /-- **Characterized divergence (`LM-4.2`)**: copying `count = 1` element between
 distinct live primitive-scalar stack locals when `e_s.perm = .disabled` or
@@ -3413,7 +5474,7 @@ theorem step_intrinsic_copyNonOverlapping_perm_divergence
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .ok true) := by
-  obtain ⟨ha_eq, hm_ok⟩ := copyDivergence_core hstate hphase hbb hstmt
+  obtain ⟨⟨stepBody, _, ha_eq⟩, hm_ok⟩ := copyDivergence_core hstate hphase hbb hstmt
     hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt
     hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt1 he_s het_s he_d het_d
     hsrc_tgt hdst_tgt hsrc_live hdst_live (Or.inr hne_loc)

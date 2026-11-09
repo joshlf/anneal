@@ -63,7 +63,9 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalRvalue evalRvalueWithMemory advanceStmt projectionsOverlap appendValues
   spliceValues sameRigidTyShape operandPointeeTy rigidTyKindAlignBytes
   rigidTyAlignBytes CopyPrecheckResult ptrValueAligned copyPrecheck
-  copyBorrowInRootBounds lookupCopyBorrowChecked evalCopySingleDirect
+  copyBorrowInRootBounds lookupCopyBorrowChecked
+  sliceScalarBytes spliceScalarBytes lookupCopyRootSlot writeCopyRootSlot
+  evalCopyRootIntScalars evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   evalStmt lookupSwitchTarget findCallee?
   extractCalleeDefPath? applyUnwindAction resumeExternalCall

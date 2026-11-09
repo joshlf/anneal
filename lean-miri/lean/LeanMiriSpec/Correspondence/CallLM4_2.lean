@@ -370,6 +370,29 @@ theorem WellTypedScalarOperand.translate_ne_move {body : CapturedMir}
   | copyLocal idx _ _ _ _ =>
     simp only [translateOperand, reduceCtorEq] at hp
 
+/-- The translation of a call of intrinsic `k` at any recognized `calleePath`
+(`AnnealIntrinsic.ofDefPath? calleePath = some k`) with generic argument `argKind`,
+a root-local destination, and a target. -/
+theorem translateTerminator_intrinsic_call_ofDefPath?
+    {term : Terminator} {c : ConstOperand} {args : List MirAst.Operand} {dstIdx : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {calleePath : DefPath} {k : AnnealIntrinsic} {argKind : RigidTy}
+    (hterm : term.kind = .call (.constant c) args ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef calleePath [argKind])
+    (hpath : AnnealIntrinsic.ofDefPath? calleePath = some k) :
+    translateTerminator term =
+      { sourceInfo := defaultSourceInfo
+        kind := .Call
+          (.Constant (annealFnItemConst k (encodeTyId { kind := argKind, layoutIdx := 0 })))
+          (args.map fun a =>
+            ({ span := defaultSpanRef, operand := translateOperand a } : Miri.MIR.SpannedOperand)).toArray
+          ⟨dstIdx, #[]⟩ (some targetBb) (translateUnwindAction unwind) .Normal
+          defaultSpanRef } := by
+  unfold translateTerminator
+  rw [hterm]
+  simp only [translateTerminatorKind, translateCalleeOperand, hc, hpath]
+  rfl
+
 /-- The translation of a call of intrinsic `k` with generic argument `argKind`,
 a root-local destination, and a target. -/
 theorem translateTerminator_intrinsic_call
@@ -384,12 +407,8 @@ theorem translateTerminator_intrinsic_call
           (args.map fun a =>
             ({ span := defaultSpanRef, operand := translateOperand a } : Miri.MIR.SpannedOperand)).toArray
           ⟨dstIdx, #[]⟩ (some targetBb) (translateUnwindAction unwind) .Normal
-          defaultSpanRef } := by
-  unfold translateTerminator
-  rw [hterm]
-  simp only [translateTerminatorKind, translateCalleeOperand, hc,
-    AnnealIntrinsic.ofDefPath?_defPath]
-  rfl
+          defaultSpanRef } :=
+  translateTerminator_intrinsic_call_ofDefPath? hterm hc (AnnealIntrinsic.ofDefPath?_defPath k)
 
 /-- The location check of `Call.evalCallTerminator` and
 `ControlFlow.evalTerminator` passes when the call moves to another location. -/
@@ -752,6 +771,106 @@ theorem step_intrinsic_call_one_simulation
           option_frameLocation_beq_false hprog, Bool.and_false, Except.map]
         exact .step _ _ hstate₄
 
+private theorem listByteEq_eq_true_iff {xs ys : List UInt8} :
+    listByteEq xs ys = true ↔ xs = ys := by
+  induction xs generalizing ys with
+  | nil =>
+    cases ys <;> simp [listByteEq]
+  | cons x xs ih =>
+    cases ys with
+    | nil => simp [listByteEq]
+    | cons y ys =>
+      unfold listByteEq
+      cases hb : Nat.beq x.toBitVec.toNat y.toBitVec.toNat with
+      | false =>
+        refine ⟨(fun h => nomatch h), fun h => ?_⟩
+        cases h; simp [Nat.beq_refl] at hb
+      | true =>
+        have hxy : x = y :=
+          UInt8.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq (Nat.eq_of_beq_eq_true hb))
+        subst hxy
+        simpa using ih
+
+/-- If `stringEq a a' = true`, `a` and `a'` have identical UTF-8 byte lists, so
+`stringEq a b = stringEq a' b` for every `b`. -/
+theorem stringEq_congr_left {a a' : String} (h : stringEq a a' = true) (b : String) :
+    stringEq a b = stringEq a' b := by
+  unfold stringEq at h ⊢
+  rw [listByteEq_eq_true_iff.mp h]
+
+/-- Classification of `DefPath`s recognized by `AnnealIntrinsic.ofDefPath?`:
+every match satisfies `stringEq p k.defPath = true` or one of the two
+`std::intrinsics::*` offset aliases. -/
+theorem AnnealIntrinsic.ofDefPath?_cases {p : DefPath} {k : AnnealIntrinsic}
+    (h : AnnealIntrinsic.ofDefPath? p = some k) :
+    stringEq p k.defPath = true ∨
+      (k = .arithOffset ∧ stringEq p "std::intrinsics::arith_offset" = true) ∨
+      (k = .wrappingOffset ∧ stringEq p "std::intrinsics::wrapping_offset" = true) := by
+  unfold AnnealIntrinsic.ofDefPath? at h
+  cases hfind : AnnealIntrinsic.all.find? (fun x => stringEq p x.defPath) with
+  | some k' =>
+    rw [hfind] at h
+    injection h with hk
+    subst hk
+    exact Or.inl (by simpa using List.find?_some hfind)
+  | none =>
+    rw [hfind] at h
+    by_cases h1 : stringEq p "std::intrinsics::arith_offset" = true
+    · simp only [h1, ↓reduceIte] at h
+      injection h with hk
+      exact Or.inr (Or.inl ⟨hk.symm, h1⟩)
+    · have h1f : stringEq p "std::intrinsics::arith_offset" = false :=
+        Bool.eq_false_iff.mpr h1
+      simp only [h1f, Bool.false_eq_true, ↓reduceIte] at h
+      by_cases h2 : stringEq p "std::intrinsics::wrapping_offset" = true
+      · simp only [h2, ↓reduceIte] at h
+        injection h with hk
+        exact Or.inr (Or.inr ⟨hk.symm, h2⟩)
+      · have h2f : stringEq p "std::intrinsics::wrapping_offset" = false :=
+          Bool.eq_false_iff.mpr h2
+        simp only [h2f, Bool.false_eq_true, ↓reduceIte] at h
+        cases h
+
+/-- Anneal's `evalTerminator` on a call at any recognized `calleePath` of an
+inline `AnnealIntrinsic` other than `exact_div` with no transparent body:
+evaluate the arguments, then `evalInlineIntrinsicCall?`. -/
+theorem evalTerminator_inline_intrinsic_call_ofDefPath?
+    {s : MachineState} {body : CapturedMir} {term : Terminator}
+    {c : ConstOperand} {args : List MirAst.Operand} {dstIdx : Local}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction}
+    {calleePath : DefPath} {k : AnnealIntrinsic} {argKind : RigidTy}
+    (hterm : term.kind = .call (.constant c) args ⟨dstIdx, []⟩ (some targetBb) unwind)
+    (hc : c.ty.kind = .fnDef calleePath [argKind])
+    (hcallee : findCallee? s.memory.callees calleePath = none)
+    (hpath : AnnealIntrinsic.ofDefPath? calleePath = some k)
+    (hk : k ≠ .exactDiv) :
+    evalTerminator s term (some body) =
+      match evalOperands s.frame.locals args s.memory.borrows s.memory.globals body.layouts
+          s.memory.callerLocals with
+      | .ok vs locals' =>
+        match evalInlineIntrinsicCall? s calleePath args vs locals' ⟨dstIdx, []⟩ targetBb
+            body.localDecls body.layouts with
+        | some node => node
+        | none =>
+          MirStepNode.extCall { defPath := calleePath, args := vs, memory := s.memory }
+            (resumeExternalCall s locals' ⟨dstIdx, []⟩ targetBb unwind)
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported := by
+  have hne : stringEq calleePath "core::intrinsics::exact_div" = false := by
+    rcases AnnealIntrinsic.ofDefPath?_cases hpath with hdef | ⟨_, hstd⟩ | ⟨_, hstd⟩
+    · rw [stringEq_congr_left hdef]
+      cases k <;> first | rfl | exact absurd rfl hk
+    · rw [stringEq_congr_left hstd]; rfl
+    · rw [stringEq_congr_left hstd]; rfl
+  unfold evalTerminator
+  rw [hterm]
+  simp only [extractCalleeDefPath?, hc]
+  cases evalOperands s.frame.locals args s.memory.borrows s.memory.globals body.layouts
+      s.memory.callerLocals with
+  | ok vs locals' => simp only [hcallee, hne] <;> rfl
+  | ub => rfl
+  | unsupported => rfl
+
 /-- Anneal's `evalTerminator` on a call of an inline `AnnealIntrinsic` other
 than `exact_div` with no transparent body: evaluate the arguments, then
 `evalInlineIntrinsicCall?`. -/
@@ -774,17 +893,9 @@ theorem evalTerminator_inline_intrinsic_call
           MirStepNode.extCall { defPath := k.defPath, args := vs, memory := s.memory }
             (resumeExternalCall s locals' ⟨dstIdx, []⟩ targetBb unwind)
       | .ub => MirStepNode.fail .ub
-      | .unsupported => MirStepNode.unsupported := by
-  have hne : stringEq k.defPath "core::intrinsics::exact_div" = false := by
-    cases k <;> first | rfl | exact absurd rfl hk
-  unfold evalTerminator
-  rw [hterm]
-  simp only [extractCalleeDefPath?, hc]
-  cases evalOperands s.frame.locals args s.memory.borrows s.memory.globals body.layouts
-      s.memory.callerLocals with
-  | ok vs locals' => simp only [hcallee, hne] <;> rfl
-  | ub => rfl
-  | unsupported => rfl
+      | .unsupported => MirStepNode.unsupported :=
+  evalTerminator_inline_intrinsic_call_ofDefPath? hterm hc hcallee
+    (AnnealIntrinsic.ofDefPath?_defPath k) hk
 
 /-- The `AnnealIntrinsic` of a one-operand integer bit intrinsic. -/
 def AnnealIntrinsic.ofBit : IntegerBitIntrinsic → AnnealIntrinsic

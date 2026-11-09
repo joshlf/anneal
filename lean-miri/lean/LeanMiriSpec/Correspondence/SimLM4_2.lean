@@ -34,8 +34,9 @@ intrinsic statements and the inline intrinsic calls of `LM-4.2`:
   (with `call_intrinsic_write_bytes_simulation_explicit` and Tree Borrows
   permission divergence `call_intrinsic_write_bytes_perm_divergence`; proved in
   `WriteBytesLM4_2`).
-* `call_intrinsic_offset_simulation`: `core::intrinsics::arith_offset` and
-  `core::intrinsics::wrapping_offset` (to which
+* `call_intrinsic_offset_simulation`: `core::intrinsics::arith_offset`,
+  `std::intrinsics::arith_offset`, `core::intrinsics::wrapping_offset`, and
+  `std::intrinsics::wrapping_offset` (to which
   `core::ptr::{const_ptr,mut_ptr}::wrapping_offset` lowers in `Runtime(PostCleanup)`
   MIR; proved in `OffsetLM4_2`).
 * `call_intrinsic_bitops_simulation`: bundles
@@ -323,7 +324,9 @@ theorem call_intrinsic_rotate_simulation
     {dstDecl : LocalDecl} (hdst : get? body.localDecls dstIdx = some dstDecl) :
     ((∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.unsupported msg))) ∧
-      (stepMirFn body s = MirStepNode.fail .ub ∨
+      ((evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+          body.layouts s.memory.callerLocals = .ub ∧
+        stepMirFn body s = MirStepNode.fail .ub) ∨
         ∃ x shift mr,
           evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
             body.layouts s.memory.callerLocals = .ok [.scalar x, .scalar shift] s.frame.locals ∧
@@ -381,7 +384,7 @@ theorem call_intrinsic_rotate_simulation
     rcases evalOperands_two_scalar_lm3_1 hstate hframes (hop₁ tf hframes) (hop₂ tf hframes)
         hint.prim hshift.prim with hub | ⟨x, shift, mx, mshift, hok, hrelx, hrelshift⟩
     · left
-      rw [hstepA, hub]
+      exact ⟨hub, by rw [hstepA, hub]⟩
     · right
       have hxsz := ImmediateRel.integral_sizeBytes hint hrelx
       have hshsz := ImmediateRel.integral_sizeBytes hshift hrelshift
@@ -745,7 +748,9 @@ theorem call_intrinsic_bitops_simulation :
                     Miri.Interpreter.Step.step
                       (annealStepHooks body.localDecls body.layouts) () m =
                       (m', .error (.unsupported msg))) ∧
-                  (stepMirFn body s = MirStepNode.fail .ub ∨
+                  ((evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+                      body.layouts s.memory.callerLocals = .ub ∧
+                    stepMirFn body s = MirStepNode.fail .ub) ∨
                     ∃ x shift mr,
                       evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
                         body.layouts s.memory.callerLocals =
