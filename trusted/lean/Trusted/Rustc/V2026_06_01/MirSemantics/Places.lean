@@ -6342,7 +6342,10 @@ def unionNonUnitNonZstTypedSlotCount (layouts : LayoutTable) :
 `true` when some non-zero-sized multi-variant enum layout in `layouts` encodes
 `.aggregate varIdx .nil` (`encodeValueToBytes`) to a non-empty byte image whose
 non-padding value bytes agree with `(buf, bufMask)` under
-`mergeMaskedAbstractBytes`.
+`mergeMaskedAbstractBytes`. Without `fieldLayouts` the slot's enum type is
+unknown, so this existential check keeps freshly constructed unions readable but
+cannot reject a stale overlay that happens to match an unrelated enum layout
+(e.g. a `u16`-tagged enum's image of the same variant index).
 -/
 def existsEnumLayoutMatchingBufAux
     (layouts : LayoutTable)
@@ -6490,11 +6493,7 @@ def mergeUnionTypedSlotsAux
                   buf'
                   bufMask'
           | .some (b :: bs) =>
-            match
-              Bool.and
-                (Bool.not (valueContainsUnit fv))
-                (abstractByteSubseq (b :: bs) buf)
-            with
+            match abstractByteSubseq (b :: bs) buf with
             | false => .none
             | true =>
               mergeUnionTypedSlotsAux
@@ -6540,24 +6539,21 @@ def mergeUnionTypedSlotsAux
                   buf'
                   bufMask'
           | .some (b :: bs) =>
-            match valueContainsUnit fv with
-            | true => .none
-            | false =>
-              let fBytes := b :: bs
-              let fMask := replicateBool (length fBytes) true
-              match mergeMaskedAbstractBytes buf bufMask fBytes fMask with
-              | .none => .none
-              | .some (buf', bufMask') =>
-                mergeUnionTypedSlotsAux
-                  layouts
-                  encodeSlot
-                  fallbackLayoutIdx
-                  hasOverlay
-                  unionSize
-                  nextIdxs
-                  vRest
-                  buf'
-                  bufMask'
+            let fBytes := b :: bs
+            let fMask := replicateBool (length fBytes) true
+            match mergeMaskedAbstractBytes buf bufMask fBytes fMask with
+            | .none => .none
+            | .some (buf', bufMask') =>
+              mergeUnionTypedSlotsAux
+                layouts
+                encodeSlot
+                fallbackLayoutIdx
+                hasOverlay
+                unionSize
+                nextIdxs
+                vRest
+                buf'
+                bufMask'
 
 /--
 Count the non-`.unit` values among the first `count` typed slots of a union
@@ -8053,29 +8049,33 @@ def writeProjectedValueUnionAware
                 | .some mbs => mbs
                 | .none => baseBytes
               | .none => baseBytes
-            let slotUpdatedFv : Value :=
-              match unionActiveSlotIsZstPlaceholder localDecls layouts (.some rFieldTy) updatedFv with
-              | true => .unit
-              | false => updatedFv
-            let typedFields :=
-              rebuildUnionFieldsAfterWriteAux
-                layouts
-                idx
-                0
-                slotUpdatedFv
-                count
-                l.fieldLayouts
-                fields
-            let finalFields :=
-              match patchBytesOpt with
-              | .some _ =>
-                finalizeUnionFieldsWithRawOverlay
+            -- The `.unit` placeholder choice is a `match` taken before `.ok` is
+            -- built (continuation `finish`), so the stored union value carries
+            -- no unreduced application of the check (see
+            -- `evalAggregateAdtUnionValue?`).
+            let finish : Value → ProjWriteResult := fun slotFv =>
+              let typedFields :=
+                rebuildUnionFieldsAfterWriteAux
                   layouts
-                  rBase.layoutIdx
-                  typedFields
-                  mergedBytes
-              | .none => typedFields
-            .ok (.aggregate 0 finalFields)
+                  idx
+                  0
+                  slotFv
+                  count
+                  l.fieldLayouts
+                  fields
+              let finalFields :=
+                match patchBytesOpt with
+                | .some _ =>
+                  finalizeUnionFieldsWithRawOverlay
+                    layouts
+                    rBase.layoutIdx
+                    typedFields
+                    mergedBytes
+                | .none => typedFields
+              .ok (.aggregate 0 finalFields)
+            match unionActiveSlotIsZstPlaceholder localDecls layouts (.some rFieldTy) updatedFv with
+            | true => finish .unit
+            | false => finish updatedFv
         match rest with
         | .nil => commitFullFieldUpdate newVal
         | rHead :: rTail =>
