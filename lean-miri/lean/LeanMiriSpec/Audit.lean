@@ -9420,6 +9420,66 @@ example :
       ∃ b, Miri.Memory.ScalarInt.truncateFromUInt (BitVec.ofNat 128 3) (translateSizeBytes 4) = .ok (mr, b) :=
   WitnessLM4_2.wit_lm4_2_rotate_left_mod_mask
 
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ s₄ s₅ : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+      let b := copyDisjointSubrangeBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let entry := rawPtrAllocMapEntry b.localDecls b.layouts .mut 1 1 Witness.lm31AllocId1
+      stepMirFn b (ptr6AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr6MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [entry] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [entry] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [entry] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [entry] ∧
+      stepMirFn b s₄ = .step s₅ ∧
+      Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
+      StateRelLM3_1 b s₅ m₅ [entry] ∧
+      get? s₅.frame.locals 1 = some (.init (.scalar ⟨0x00000000002A002A, 8⟩)) ∧
+      (∃ la msc,
+        m₅.machine.memory.live.find? (fun x => x.1 == Witness.lm31AllocId1) =
+          some (Witness.lm31AllocId1, la) ∧
+        ScalarRel ⟨0x00000000002A002A, 8⟩ msc ∧
+        la.allocation.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes 8)) false =
+          .ok (.fromScalarInt msc)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_disjoint_subrange_ok
+
+open WitnessLM4_2 in
+example :
+    ∃ (s₁ s₂ s₃ s₄ : MachineState) (m₁ m₂ m₃ m₄ : AnnealStepState),
+      let b := copyCrossTypeBody
+      let hooks := annealStepHooks b.localDecls b.layouts
+      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
+      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
+      stepMirFn b (ptr6AnnealPre b) = .step s₁ ∧
+      Miri.Interpreter.Step.step hooks () (ptr6MiriPre b unitK) = (m₁, .ok true) ∧
+      StateRelLM3_1 b s₁ m₁ [e₁] ∧
+      stepMirFn b s₁ = .step s₂ ∧
+      Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
+      StateRelLM3_1 b s₂ m₂ [e₂, e₁] ∧
+      stepMirFn b s₂ = .step s₃ ∧
+      Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
+      StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
+      stepMirFn b s₃ = .step s₄ ∧
+      Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
+      StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
+      get? s₄.frame.locals 2 = some (.init (.scalar ⟨42, 4⟩)) ∧
+      (∃ la msc,
+        m₄.machine.memory.live.find? (fun x => x.1 == Witness.lm31AllocId2) =
+          some (Witness.lm31AllocId2, la) ∧
+        ScalarRel ⟨42, 4⟩ msc ∧
+        la.allocation.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes 4)) false =
+          .ok (.fromScalarInt msc)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_ok
+
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
   Trusted.Rustc.V2026_06_01.MirSemantics.sliceScalarBytes
@@ -9451,6 +9511,7 @@ open LeanMiriSpec.Correspondence in
   CopyPointee
   CopyTargetCompatible
   copyNextAllocMap
+  copyNextAllocMap_eq_self
   step_intrinsic_assume_simulation
   call_intrinsic_bitcount_simulation
   call_intrinsic_rotate_simulation
@@ -9463,8 +9524,11 @@ open LeanMiriSpec.Correspondence in
   call_intrinsic_write_bytes_perm_divergence
   step_intrinsic_copyNonOverlapping_simulation_explicit
   step_intrinsic_copyNonOverlapping_simulation
+  step_intrinsic_copyNonOverlapping_simulation_same_allocMap
   step_intrinsic_copyNonOverlapping_uninit_src_divergence
   step_intrinsic_copyNonOverlapping_perm_divergence
+  step_intrinsic_copyNonOverlapping_uninit_src_range_divergence
+  step_intrinsic_copyNonOverlapping_perm_range_divergence
   WitnessLM4_2.wit_lm4_2_assume_true
   WitnessLM4_2.wit_lm4_2_assume_false
   WitnessLM4_2.wit_lm4_2_assume_invalid_bool
@@ -9509,8 +9573,12 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_overflow_ub
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_zero_misaligned_ub
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_disjoint_subrange_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_ok
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_uninit_src_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_perm_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_uninit_src_range_divergence
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_perm_range_divergence
 
 end StatementPins
 
