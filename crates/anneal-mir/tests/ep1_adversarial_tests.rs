@@ -2472,6 +2472,13 @@ fn random_projection(rng: &mut Rng, shape: &DShape, out: &mut Vec<ProjectionElem
         DShape::Tup(fields) => {
             if rng.below(3) == 0 {
                 out.push(ProjectionElem::Downcast(rng.below(2) as usize));
+                // Occasionally stop at a trailing `Downcast` or emit consecutive `Downcast`s so
+                // differential testing exercises malformed `Downcast` tails too.
+                match rng.below(8) {
+                    0 => return,
+                    1 => out.push(ProjectionElem::Downcast(rng.below(2) as usize)),
+                    _ => {}
+                }
             }
             let i = rng.below(fields.len() as u64 + 1) as usize;
             match fields.get(i) {
@@ -2949,4 +2956,466 @@ fn shape_of_ty(ty: &Ty) -> DShape {
         Ty::Array(elem, n) => DShape::Arr(Box::new(shape_of_ty(elem)), *n),
         other => panic!("unexpected type {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A3] Trailing & consecutive `Downcast` projections are rejected across all entry points
+// ---------------------------------------------------------------------------------------------
+
+/// In `rustc` MIR (`PlaceElem::Downcast`), a `Downcast` only narrows the variant for an
+/// immediately following `Field` projection and is never a valid leaf place. In B3,
+/// `resolve_place_ty`, `validate_projection_tail`, `eval_place_read`, `StatementEvalState::read_place`,
+/// `eval_place_write`, and `StatementEvalState::write_place` (on `Init` locals) used
+/// `if let Some(next) = rest.first()` and accepted trailing `Downcast`s (`_0 as V`,
+/// `(_0.0 as V)`), diverging from `write_to_partial_slot` (on `Uninit`/`PartialShell`) and from
+/// `ref_read`/`ref_write`. Every lowering and evaluation entry point now rejects trailing and
+/// consecutive `Downcast` projections.
+#[test]
+fn test_ep1_a3_trailing_and_consecutive_downcasts_rejected_everywhere() {
+    let enum_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let outer_ty = Ty::Tuple(vec![enum_ty.clone(), u32_ty()]);
+    let ref_enum_ty = Ty::Ref(Box::new(enum_ty.clone()), Mutability::Not);
+    let local_decls = vec![
+        enum_ty.clone(),     // _0: Enum (Init)
+        outer_ty.clone(),    // _1: (Enum, u32) (Init)
+        enum_ty.clone(),     // _2: Enum (PartialShell)
+        enum_ty.clone(),     // _3: Enum (Uninit)
+        ref_enum_ty.clone(), // _4: &Enum (Init)
+    ];
+
+    let enum_v1 = MirValue::Adt {
+        def_path: "E".into(),
+        variant_idx: 1,
+        active_field: None,
+        fields: vec![u32v(10), u8v(20)],
+    };
+    let outer_val = MirValue::Tuple(vec![enum_v1.clone(), u32v(99)]);
+    let ptr_val = MirValue::Ptr {
+        ptr: PointerValue::with_provenance(0x1000, 1, 1),
+        ty: ref_enum_ty.clone(),
+    };
+
+    let trailing_root = proj(0, vec![ProjectionElem::Downcast(1)]);
+    let trailing_nested = proj(
+        1,
+        vec![field(0, enum_ty.clone()), ProjectionElem::Downcast(1)],
+    );
+    let trailing_shell = proj(2, vec![ProjectionElem::Downcast(1)]);
+    let trailing_uninit = proj(3, vec![ProjectionElem::Downcast(1)]);
+    let consecutive_downcast = proj(
+        0,
+        vec![
+            ProjectionElem::Downcast(1),
+            ProjectionElem::Downcast(1),
+            field(0, u32_ty()),
+        ],
+    );
+    let deref_trailing = proj(4, vec![ProjectionElem::Deref, ProjectionElem::Downcast(1)]);
+    let before_deref_trailing = proj(4, vec![ProjectionElem::Downcast(0), ProjectionElem::Deref]);
+
+    for bad_place in [
+        &trailing_root,
+        &trailing_nested,
+        &trailing_shell,
+        &trailing_uninit,
+        &consecutive_downcast,
+        &deref_trailing,
+        &before_deref_trailing,
+    ] {
+        assert!(
+            anneal_mir::lower::resolve_place_ty(bad_place, &local_decls).is_err(),
+            "resolve_place_ty should reject {bad_place:?}"
+        );
+        assert!(
+            lower_rvalue(&use_copy(bad_place.clone()), &local_decls, PW).is_err(),
+            "lower_rvalue(Use(Copy)) should reject {bad_place:?}"
+        );
+        assert!(
+            lower_rvalue(&Rvalue::Discriminant(bad_place.clone()), &local_decls, PW).is_err(),
+            "lower_rvalue(Discriminant) should reject {bad_place:?}"
+        );
+        assert!(
+            lower_rvalue(&Rvalue::Len(bad_place.clone()), &local_decls, PW).is_err(),
+            "lower_rvalue(Len) should reject {bad_place:?}"
+        );
+        assert!(
+            lower_statement(
+                &Statement::PlaceMention(bad_place.clone()),
+                &local_decls,
+                PW
+            )
+            .is_err(),
+            "lower_statement(PlaceMention) should reject {bad_place:?}"
+        );
+        assert!(
+            lower_statement(
+                &Statement::SetDiscriminant {
+                    place: bad_place.clone(),
+                    variant_index: 1,
+                },
+                &local_decls,
+                PW,
+            )
+            .is_err(),
+            "lower_statement(SetDiscriminant) should reject {bad_place:?}"
+        );
+    }
+
+    // Pure `eval_place_read` and `eval_place_write` must also reject trailing/consecutive Downcasts.
+    let mut locals = vec![
+        enum_v1.clone(),
+        outer_val.clone(),
+        enum_v1.clone(),
+        enum_v1.clone(),
+        ptr_val.clone(),
+    ];
+    let locals_snapshot = locals.clone();
+    for bad_place in [&trailing_root, &trailing_nested, &consecutive_downcast] {
+        assert!(matches!(
+            eval_place_read(bad_place, &locals, PW),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            eval_place_write(bad_place, enum_v1.clone(), &mut locals, PW),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert_eq!(locals, locals_snapshot);
+    }
+
+    // Stateful `StatementEvalState` across `Init`, `PartialShell`, and `Uninit` slots.
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[0] = LocalSlotState::Init(enum_v1.clone());
+    state.slots[1] = LocalSlotState::Init(outer_val);
+    state.slots[4] = LocalSlotState::Init(ptr_val);
+    // Make `_2` a tagged `PartialShell` on variant 1 with field 0 initialized and field 1 uninit.
+    state
+        .write_place(
+            &proj(2, vec![ProjectionElem::Downcast(1), field(0, u32_ty())]),
+            &u32_ty(),
+            u32v(77),
+        )
+        .unwrap();
+    eval_lowered_statement(
+        &LoweredStatement::SetDiscriminant {
+            place: Place::from_local(2),
+            place_ty: enum_ty.clone(),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(2)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    let slots_snapshot = state.slots.clone();
+
+    for bad_place in [
+        &trailing_root,
+        &trailing_nested,
+        &trailing_shell,
+        &trailing_uninit,
+        &consecutive_downcast,
+    ] {
+        assert!(matches!(
+            state.read_place(bad_place),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            state.move_place(bad_place),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            state.write_place(bad_place, &enum_ty, enum_v1.clone()),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            anneal_mir::lower::eval_lowered_rvalue_in_state(
+                &anneal_mir::lower::LoweredRvalue::Discriminant {
+                    place: bad_place.clone(),
+                    place_ty: enum_ty.clone(),
+                    ty: Ty::Int(IntTy::Isize),
+                },
+                &mut state,
+            ),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            eval_lowered_statement(
+                &LoweredStatement::SetDiscriminant {
+                    place: bad_place.clone(),
+                    place_ty: enum_ty.clone(),
+                    variant_index: 0,
+                },
+                &mut state,
+            ),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            eval_lowered_statement(
+                &LoweredStatement::PlaceMention {
+                    place: bad_place.clone(),
+                    place_ty: enum_ty.clone(),
+                },
+                &mut state,
+            ),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert_eq!(state.slots, slots_snapshot);
+    }
+
+    for bad_deref_place in [&deref_trailing, &before_deref_trailing] {
+        assert!(matches!(
+            eval_lowered_statement(
+                &LoweredStatement::PlaceMention {
+                    place: bad_deref_place.clone(),
+                    place_ty: enum_ty.clone(),
+                },
+                &mut state,
+            ),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert_eq!(state.slots, slots_snapshot);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A3] `Index(idx_local)` declaration checks & lowered `place_ty` / `ty` / `static_len` guards
+// ---------------------------------------------------------------------------------------------
+
+/// Verifies two invariants across all stateful and pure evaluators:
+/// 1. `ProjectionElem::Index(idx_local)` checks `local_decls[idx_local]` is `usize` before
+///    reporting `UninitializedLocal` / `DeadLocal` on an uninitialized array or index slot.
+/// 2. Hand-constructed `LoweredStatement` and `LoweredRvalue` values with mismatched `place_ty`,
+///    `ty`, `mutability`, or `static_len` fail closed with `TypeMismatch` across `Init`,
+///    `PartialShell`, and `Uninit` states without mutating `state`.
+#[test]
+fn test_ep1_a3_index_local_decls_and_lowered_type_invariants() {
+    let arr_ty = Ty::Array(Box::new(u32_ty()), 2);
+    let enum_ty = Ty::Tuple(vec![arr_ty.clone(), u8_ty()]);
+    let union_2_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let union_1_ty = Ty::Tuple(vec![u32_ty()]);
+    let ref_arr_ty = Ty::Ref(Box::new(arr_ty.clone()), Mutability::Not);
+    let local_decls = vec![
+        arr_ty.clone(),     // _0: [u32; 2] (starts Uninit)
+        Ty::Bool,           // _1: bool (ill-typed index local, starts Uninit)
+        usize_ty(),         // _2: usize (valid index local, starts Uninit)
+        enum_ty.clone(),    // _3: ([u32; 2], u8) enum/tuple (PartialShell)
+        union_2_ty.clone(), // _4: union (u32, u8)
+        ref_arr_ty.clone(), // _5: &[u32; 2]
+    ];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[5] = LocalSlotState::Init(MirValue::Ptr {
+        ptr: PointerValue::with_provenance(0x1000, 1, 1),
+        ty: ref_arr_ty.clone(),
+    });
+    // Make `_3` a tagged `PartialShell` where `_3.0` (`[u32; 2]`) is `Uninit` and `_3.1` is `Init`.
+    state
+        .write_place(
+            &proj(3, vec![ProjectionElem::Downcast(1), field(1, u8_ty())]),
+            &u8_ty(),
+            u8v(7),
+        )
+        .unwrap();
+    eval_lowered_statement(
+        &LoweredStatement::SetDiscriminant {
+            place: Place::from_local(3),
+            place_ty: enum_ty.clone(),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    let slots_snapshot = state.slots.clone();
+
+    // 1. `Index(Local(1))` where `_1` is declared as `Ty::Bool` (or `Local(99)` out of bounds)
+    // must fail with `TypeMismatch`, NOT `UninitializedLocal`, even when `_0`, `_1`, and `_3.0`
+    // are `Uninit`.
+    let bad_idx_places = [
+        proj(0, vec![ProjectionElem::Index(Local(1))]),
+        proj(0, vec![ProjectionElem::Index(Local(99))]),
+        proj(
+            3,
+            vec![field(0, arr_ty.clone()), ProjectionElem::Index(Local(1))],
+        ),
+    ];
+    for p in &bad_idx_places {
+        assert!(matches!(
+            state.read_place(p),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            state.write_place(p, &u32_ty(), u32v(1)),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert!(matches!(
+            eval_lowered_statement(
+                &LoweredStatement::PlaceMention {
+                    place: p.clone(),
+                    place_ty: u32_ty(),
+                },
+                &mut state,
+            ),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert_eq!(state.slots, slots_snapshot);
+    }
+
+    // `PlaceMention` with `Index(Local(1))` *after* `Deref` must also check `local_decls`.
+    let deref_bad_idx = proj(
+        5,
+        vec![ProjectionElem::Deref, ProjectionElem::Index(Local(1))],
+    );
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::PlaceMention {
+                place: deref_bad_idx,
+                place_ty: u32_ty(),
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // 2. `write_place` on bare local `_4` (`(u32, u8)`) with a union value `active_field: Some(0)`
+    // that matches both `union_1_ty` (`(u32,)`) and `union_2_ty` (`(u32, u8)`) must reject
+    // `place_ty = union_1_ty` because `place_ty != local_decls[4]`.
+    let u_val = MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![u32v(42)],
+    };
+    assert!(matches!(
+        state.write_place(&Place::from_local(4), &union_1_ty, u_val.clone()),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.slots, slots_snapshot);
+    state
+        .write_place(&Place::from_local(4), &union_2_ty, u_val)
+        .unwrap();
+    state.slots[4] = LocalSlotState::Uninit;
+
+    // 3. `PlaceMention` and `SetDiscriminant` must reject mismatched `place_ty`.
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::PlaceMention {
+                place: Place::from_local(0),
+                place_ty: u32_ty(), // declared is `[u32; 2]`
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::PlaceMention {
+                place: proj(5, vec![ProjectionElem::Deref]),
+                place_ty: u32_ty(), // pointee is `[u32; 2]`
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::SetDiscriminant {
+                place: Place::from_local(3),
+                place_ty: union_1_ty.clone(), // declared is `enum_ty`
+                variant_index: 0,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.slots, slots_snapshot);
+
+    // 4. `LoweredRvalue::Discriminant` on a tagged `PartialShell` (`_3`) or `Uninit` slot must
+    // still validate `place_ty` against `local_decls` and reject uninhabited `place_ty`.
+    assert!(matches!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(
+            &anneal_mir::lower::LoweredRvalue::Discriminant {
+                place: Place::from_local(3),
+                place_ty: union_1_ty, // wrong place_ty on tagged PartialShell
+                ty: Ty::Int(IntTy::Isize),
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(
+            &anneal_mir::lower::LoweredRvalue::Discriminant {
+                place: Place::from_local(3),
+                place_ty: enum_ty.clone(),
+                ty: Ty::Int(IntTy::Isize),
+            },
+            &mut state,
+        ),
+        Ok(MirValue::signed(1, IntTy::Isize, PW))
+    );
+
+    // 5. `LoweredRvalue::Len` on an `Uninit` array local (`_0`) or `Uninit` field inside a
+    // `PartialShell` (`_3.0`) must check `static_len` against the declared array length (`2`)
+    // before returning `UninitializedLocal`.
+    assert!(matches!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(
+            &anneal_mir::lower::LoweredRvalue::Len {
+                place: Place::from_local(0),
+                static_len: 99,
+                ty: usize_ty(),
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(
+            &anneal_mir::lower::LoweredRvalue::Len {
+                place: Place::from_local(0),
+                static_len: 2,
+                ty: usize_ty(),
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+
+    // 6. `LoweredRvalue::Ref` / `RawPtr` must validate `ty` constructor/mutability, and on
+    // sub-local borrows (`&_0[_2]`) must check root liveness, place types, and index operands
+    // before returning `UnsupportedPlaceProjection`.
+    assert!(matches!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(
+            &anneal_mir::lower::LoweredRvalue::Ref {
+                place: Place::from_local(0),
+                mutability: Mutability::Not,
+                ty: Ty::RawPtr(Box::new(arr_ty.clone()), Mutability::Not),
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(
+            &anneal_mir::lower::LoweredRvalue::Ref {
+                place: proj(0, vec![ProjectionElem::Index(Local(2))]),
+                mutability: Mutability::Not,
+                ty: Ty::Ref(Box::new(u32_ty()), Mutability::Not),
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(2)))
+    );
+    state.slots[0] = LocalSlotState::Dead;
+    assert_eq!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(
+            &anneal_mir::lower::LoweredRvalue::Ref {
+                place: proj(0, vec![ProjectionElem::Index(Local(2))]),
+                mutability: Mutability::Not,
+                ty: Ty::Ref(Box::new(u32_ty()), Mutability::Not),
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::DeadLocal(Local(0)))
+    );
 }

@@ -359,7 +359,7 @@ pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueL
     };
     let mut cur_ty = base_ty.clone();
 
-    for elem in &place.projection {
+    for (i, elem) in place.projection.iter().enumerate() {
         let invalid = |current_ty: Ty| RvalueLowerError::InvalidProjection {
             place: place.clone(),
             current_ty,
@@ -416,7 +416,12 @@ pub fn resolve_place_ty(place: &Place, local_decls: &[Ty]) -> Result<Ty, RvalueL
                 };
                 Ty::Array(elem_ty, new_len as usize)
             }
-            (ProjectionElem::Downcast(_), Ty::Tuple(fields)) => Ty::Tuple(fields),
+            (ProjectionElem::Downcast(_), Ty::Tuple(fields)) => {
+                if !matches!(place.projection.get(i + 1), Some(ProjectionElem::Field(..))) {
+                    return Err(invalid(Ty::Tuple(fields)));
+                }
+                Ty::Tuple(fields)
+            }
             (_, other) => return Err(invalid(other)),
         };
     }
@@ -2670,11 +2675,11 @@ fn mir_value_head_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
 }
 
 /// Checks a value selected by a projection step against the step's type: in full when no
-/// later step selects a part of it (`rest` is empty or a single trailing `Downcast`, so it is
-/// the leaf value a read returns or a write replaces), otherwise only its outermost constructor
-/// ([`mir_value_head_matches_ty`]), since the later steps check the parts they select.
+/// later step selects a part of it (`rest` is empty, so it is the leaf value a read returns
+/// or a write replaces), otherwise only its outermost constructor ([`mir_value_head_matches_ty`]),
+/// since the later steps check the parts they select.
 fn projected_value_matches_ty(val: &MirValue, ty: &Ty, rest: &[ProjectionElem]) -> bool {
-    if matches!(rest, [] | [ProjectionElem::Downcast(_)]) {
+    if rest.is_empty() {
         mir_value_matches_ty(val, ty)
     } else {
         mir_value_head_matches_ty(val, ty)
@@ -2749,20 +2754,28 @@ fn resolve_subslice_range(
 }
 
 /// Validates that a remaining projection path `proj` is structurally compatible with `cur_ty`,
-/// returning `(leaf_ty, trailing_downcast)`. When `read_index` is `Some`, also checks dynamic
-/// `Index(idx_local)` bounds against `Ty::Array` length.
+/// returning `leaf_ty`. Every `Downcast` must be immediately followed by `Field`. When
+/// `local_decls` is `Some`, also checks that every `Index(idx_local)` local has declared type
+/// `usize`; when `read_index` is `Some`, also checks dynamic `Index(idx_local)` bounds against
+/// `Ty::Array` length.
 fn validate_projection_tail<F>(
     cur_ty: &Ty,
     proj: &[ProjectionElem],
+    local_decls: Option<&[Ty]>,
     read_index: Option<&F>,
     full_place: &Place,
     active_downcast: Option<usize>,
-) -> Result<(Ty, Option<usize>), RvalueEvalError>
+) -> Result<Ty, RvalueEvalError>
 where
     F: Fn(Local) -> Result<u128, RvalueEvalError>,
 {
     let Some((first, rest)) = proj.split_first() else {
-        return Ok((cur_ty.clone(), active_downcast));
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Downcast projection must be followed by Field",
+            ));
+        }
+        return Ok(cur_ty.clone());
     };
     match first {
         ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
@@ -2774,24 +2787,22 @@ where
                     "consecutive Downcast projections without Field",
                 ));
             }
-            if let Some(next) = rest.first() {
-                if matches!(next, ProjectionElem::Deref) {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                        full_place.clone(),
-                    ));
-                }
-                if !matches!(next, ProjectionElem::Field(..)) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Downcast projection must be followed by Field",
-                    ));
-                }
+            if matches!(rest.first(), Some(ProjectionElem::Deref)) {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                ));
+            }
+            if !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
             }
             if !matches!(cur_ty, Ty::Tuple(_)) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Downcast projection requires a tuple-typed (ADT) place",
                 ));
             }
-            validate_projection_tail(cur_ty, rest, read_index, full_place, Some(*v))
+            validate_projection_tail(cur_ty, rest, local_decls, read_index, full_place, Some(*v))
         }
         ProjectionElem::Field(idx, expected_ty) => {
             let Ty::Tuple(field_tys) = cur_ty else {
@@ -2810,7 +2821,14 @@ where
                     "projected field type does not match declared tuple field type",
                 ));
             }
-            validate_projection_tail(&field_tys[*idx], rest, read_index, full_place, None)
+            validate_projection_tail(
+                &field_tys[*idx],
+                rest,
+                local_decls,
+                read_index,
+                full_place,
+                None,
+            )
         }
         ProjectionElem::Index(idx_local) => {
             if active_downcast.is_some() {
@@ -2823,6 +2841,13 @@ where
                     "array projection applied to a non-array place",
                 ));
             };
+            if let Some(decls) = local_decls {
+                if decls.get(idx_local.0) != Some(&Ty::Uint(UintTy::Usize)) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "array index local must have declared type usize",
+                    ));
+                }
+            }
             if let Some(read_idx) = read_index {
                 let idx_bits = read_idx(*idx_local)?;
                 let Ok(i) = usize::try_from(idx_bits) else {
@@ -2838,7 +2863,7 @@ where
                     });
                 }
             }
-            validate_projection_tail(elem_ty, rest, read_index, full_place, None)
+            validate_projection_tail(elem_ty, rest, local_decls, read_index, full_place, None)
         }
         ProjectionElem::ConstantIndex {
             offset,
@@ -2856,7 +2881,7 @@ where
                 ));
             };
             let _ = resolve_constant_index(*len, *offset, *min_length, *from_end)?;
-            validate_projection_tail(elem_ty, rest, read_index, full_place, None)
+            validate_projection_tail(elem_ty, rest, local_decls, read_index, full_place, None)
         }
         ProjectionElem::Subslice {
             from,
@@ -2875,34 +2900,91 @@ where
             };
             let (start, end) = resolve_subslice_range(*len, *from, *to, *from_end)?;
             let sub_ty = Ty::Array(elem_ty.clone(), end - start);
-            validate_projection_tail(&sub_ty, rest, read_index, full_place, None)
+            validate_projection_tail(&sub_ty, rest, local_decls, read_index, full_place, None)
         }
     }
 }
 
-/// Traverses `proj` over an array window `window` of element type `elem_ty` for a value-tree
-/// read, narrowing `Subslice` windows in `O(1)` without cloning or scanning unselected elements
-/// when `rest` continues with further projections.
-fn read_projected_array_window(
-    window: &[MirValue],
-    elem_ty: &Ty,
-    proj: &[ProjectionElem],
-    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
-    ptr_width: PtrWidth,
-    full_place: &Place,
+/// Borrowed target designated by an immutable projection walk over a [`MirValue`]: either a
+/// single [`MirValue`] node or a `Subslice` window `&[MirValue]` with its element type.
+enum ProjectedRef<'a> {
+    Value(&'a MirValue),
+    ArrayWindow {
+        window: &'a [MirValue],
+        elem_ty: &'a Ty,
+    },
+}
+
+/// Converts a [`ProjectedRef`] into an owned [`MirValue`], checking the returned value or
+/// window elements in full against `leaf_ty` / `elem_ty`.
+fn projected_ref_into_mir_value(
+    target: ProjectedRef<'_>,
+    leaf_ty: Option<&Ty>,
 ) -> Result<MirValue, RvalueEvalError> {
-    let Some((first, rest)) = proj.split_first() else {
-        for elem_val in window {
-            if !mir_value_matches_ty(elem_val, elem_ty) {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Array element runtime type does not match elem_ty",
-                ));
+    match target {
+        ProjectedRef::Value(v) => {
+            if let Some(ty) = leaf_ty {
+                if !mir_value_matches_ty(v, ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "projected leaf runtime value does not match expected type",
+                    ));
+                }
             }
+            Ok(v.clone())
         }
-        return Ok(MirValue::Array {
-            elements: window.to_vec(),
-            elem_ty: elem_ty.clone(),
-        });
+        ProjectedRef::ArrayWindow { window, elem_ty } => {
+            for elem_val in window {
+                if !mir_value_matches_ty(elem_val, elem_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Array element runtime type does not match elem_ty",
+                    ));
+                }
+            }
+            Ok(MirValue::Array {
+                elements: window.to_vec(),
+                elem_ty: elem_ty.clone(),
+            })
+        }
+    }
+}
+
+/// Converts a [`ProjectedRef`] into an array length for `Rvalue::Len` in `O(1)` time without
+/// cloning or scanning array elements.
+fn projected_ref_into_array_len(
+    target: ProjectedRef<'_>,
+    leaf_ty: Option<&Ty>,
+) -> Result<usize, RvalueEvalError> {
+    match target {
+        ProjectedRef::Value(v) => {
+            let MirValue::Array { elements, .. } = v else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Len target runtime value must be MirValue::Array",
+                ));
+            };
+            if let Some(ty) = leaf_ty {
+                if !mir_value_head_matches_ty(v, ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Len target runtime value does not match declared array type",
+                    ));
+                }
+            }
+            Ok(elements.len())
+        }
+        ProjectedRef::ArrayWindow { window, .. } => Ok(window.len()),
+    }
+}
+
+/// Walks `proj` over an immutable array window `window` of element type `elem_ty`, narrowing
+/// `Subslice` windows in `O(1)` without cloning or scanning unselected elements.
+fn project_array_window<'a>(
+    window: &'a [MirValue],
+    elem_ty: &'a Ty,
+    proj: &'a [ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    full_place: &Place,
+) -> Result<(ProjectedRef<'a>, Option<&'a Ty>), RvalueEvalError> {
+    let Some((first, rest)) = proj.split_first() else {
+        return Ok((ProjectedRef::ArrayWindow { window, elem_ty }, None));
     };
 
     match first {
@@ -2923,20 +3005,12 @@ fn read_projected_array_window(
                     len: window.len(),
                 });
             };
-            if !projected_value_matches_ty(elem_val, elem_ty, rest) {
+            if !mir_value_head_matches_ty(elem_val, elem_ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Array element runtime type does not match elem_ty",
                 ));
             }
-            read_projected_mir_value(
-                elem_val,
-                Some(elem_ty),
-                rest,
-                read_index,
-                ptr_width,
-                full_place,
-                None,
-            )
+            project_mir_value(elem_val, Some(elem_ty), rest, read_index, full_place, None)
         }
         ProjectionElem::ConstantIndex {
             offset,
@@ -2945,20 +3019,12 @@ fn read_projected_array_window(
         } => {
             let idx = resolve_constant_index(window.len(), *offset, *min_length, *from_end)?;
             let elem_val = &window[idx];
-            if !projected_value_matches_ty(elem_val, elem_ty, rest) {
+            if !mir_value_head_matches_ty(elem_val, elem_ty) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Array element runtime type does not match elem_ty",
                 ));
             }
-            read_projected_mir_value(
-                elem_val,
-                Some(elem_ty),
-                rest,
-                read_index,
-                ptr_width,
-                full_place,
-                None,
-            )
+            project_mir_value(elem_val, Some(elem_ty), rest, read_index, full_place, None)
         }
         ProjectionElem::Subslice {
             from,
@@ -2966,14 +3032,7 @@ fn read_projected_array_window(
             from_end,
         } => {
             let (start, end) = resolve_subslice_range(window.len(), *from, *to, *from_end)?;
-            read_projected_array_window(
-                &window[start..end],
-                elem_ty,
-                rest,
-                read_index,
-                ptr_width,
-                full_place,
-            )
+            project_array_window(&window[start..end], elem_ty, rest, read_index, full_place)
         }
         ProjectionElem::Downcast(_) => {
             if matches!(rest.first(), Some(ProjectionElem::Deref)) {
@@ -2991,25 +3050,24 @@ fn read_projected_array_window(
     }
 }
 
-/// Traverses `proj` on `val` for a value-tree read.
-///
-/// Each step checks the value it selects against the step's expected type. A value that is
-/// only passed through to later steps is checked with [`mir_value_head_matches_ty`] (its
-/// outermost constructor), because the later steps check the parts of it they select; the
-/// value the read returns is checked in full with [`mir_value_matches_ty`]. A read therefore
-/// costs time proportional to the projection length plus the size of the returned value,
-/// not the size of the containing local.
-fn read_projected_mir_value(
-    val: &MirValue,
-    declared_ty: Option<&Ty>,
-    proj: &[ProjectionElem],
+/// Walks `proj` over `val`, checking each step's outermost constructor with
+/// [`mir_value_head_matches_ty`] and returning the borrowed leaf [`ProjectedRef`] and its
+/// expected [`Ty`] in `O(proj.len())` time.
+fn project_mir_value<'a>(
+    val: &'a MirValue,
+    declared_ty: Option<&'a Ty>,
+    proj: &'a [ProjectionElem],
     read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
-    ptr_width: PtrWidth,
     full_place: &Place,
     active_downcast: Option<usize>,
-) -> Result<MirValue, RvalueEvalError> {
+) -> Result<(ProjectedRef<'a>, Option<&'a Ty>), RvalueEvalError> {
     let Some((first, rest)) = proj.split_first() else {
-        return Ok(val.clone());
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Downcast projection must be followed by Field",
+            ));
+        }
+        return Ok((ProjectedRef::Value(val), declared_ty));
     };
 
     match first {
@@ -3022,17 +3080,15 @@ fn read_projected_mir_value(
                     "consecutive Downcast projections without Field",
                 ));
             }
-            if let Some(next) = rest.first() {
-                if matches!(next, ProjectionElem::Deref) {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                        full_place.clone(),
-                    ));
-                }
-                if !matches!(next, ProjectionElem::Field(..)) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Downcast projection must be followed by Field",
-                    ));
-                }
+            if matches!(rest.first(), Some(ProjectionElem::Deref)) {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                ));
+            }
+            if !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
             }
             match val {
                 MirValue::Adt {
@@ -3046,12 +3102,11 @@ fn read_projected_mir_value(
                             actual: *variant_idx,
                         });
                     }
-                    read_projected_mir_value(
+                    project_mir_value(
                         val,
                         declared_ty,
                         rest,
                         read_index,
-                        ptr_width,
                         full_place,
                         Some(*expected_variant),
                     )
@@ -3063,15 +3118,7 @@ fn read_projected_mir_value(
                             actual: 0,
                         });
                     }
-                    read_projected_mir_value(
-                        val,
-                        declared_ty,
-                        rest,
-                        read_index,
-                        ptr_width,
-                        full_place,
-                        Some(0),
-                    )
+                    project_mir_value(val, declared_ty, rest, read_index, full_place, Some(0))
                 }
                 _ => Err(RvalueEvalError::TypeMismatch(
                     "Downcast requires a non-union Adt or Tuple value",
@@ -3094,20 +3141,12 @@ fn read_projected_mir_value(
                         field_count: fields.len(),
                     });
                 };
-                if !projected_value_matches_ty(field_val, expected_ty, rest) {
+                if !mir_value_head_matches_ty(field_val, expected_ty) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "projected tuple field runtime type does not match expected type",
                     ));
                 }
-                read_projected_mir_value(
-                    field_val,
-                    Some(expected_ty),
-                    rest,
-                    read_index,
-                    ptr_width,
-                    full_place,
-                    None,
-                )
+                project_mir_value(field_val, Some(expected_ty), rest, read_index, full_place, None)
             }
             MirValue::Unit => {
                 if let Some(v) = active_downcast {
@@ -3142,20 +3181,12 @@ fn read_projected_mir_value(
                         field_count: fields.len(),
                     });
                 };
-                if !projected_value_matches_ty(field_val, expected_ty, rest) {
+                if !mir_value_head_matches_ty(field_val, expected_ty) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "projected ADT field runtime type does not match expected type",
                     ));
                 }
-                read_projected_mir_value(
-                    field_val,
-                    Some(expected_ty),
-                    rest,
-                    read_index,
-                    ptr_width,
-                    full_place,
-                    None,
-                )
+                project_mir_value(field_val, Some(expected_ty), rest, read_index, full_place, None)
             }
             MirValue::Adt {
                 variant_idx,
@@ -3204,26 +3235,25 @@ fn read_projected_mir_value(
                     }
                 }
                 if *active != *idx {
-                    validate_projection_tail(expected_ty, rest, Some(read_index), full_place, None)?;
+                    validate_projection_tail(
+                        expected_ty,
+                        rest,
+                        None,
+                        Some(read_index),
+                        full_place,
+                        None,
+                    )?;
                     return Err(RvalueEvalError::InactiveUnionField {
                         active_field: *active,
                         requested_field: *idx,
                     });
                 }
-                if !projected_value_matches_ty(active_val, expected_ty, rest) {
+                if !mir_value_head_matches_ty(active_val, expected_ty) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "projected union field runtime type does not match expected type",
                     ));
                 }
-                read_projected_mir_value(
-                    active_val,
-                    Some(expected_ty),
-                    rest,
-                    read_index,
-                    ptr_width,
-                    full_place,
-                    None,
-                )
+                project_mir_value(active_val, Some(expected_ty), rest, read_index, full_place, None)
             }
             _ => Err(RvalueEvalError::TypeMismatch(
                 "Field projection requires Tuple or Adt value",
@@ -3242,16 +3272,40 @@ fn read_projected_mir_value(
                     "array projection requires Array value",
                 ));
             };
-            read_projected_array_window(
-                elements.as_slice(),
-                elem_ty,
-                proj,
-                read_index,
-                ptr_width,
-                full_place,
-            )
+            project_array_window(elements.as_slice(), elem_ty, proj, read_index, full_place)
         }
     }
+}
+
+/// Traverses `proj` on `val` for a value-tree read.
+///
+/// Each step checks the value it selects against the step's expected type. A value that is
+/// only passed through to later steps is checked with [`mir_value_head_matches_ty`] (its
+/// outermost constructor), because the later steps check the parts of it they select; the
+/// value the read returns is checked in full with [`mir_value_matches_ty`]. A read therefore
+/// costs time proportional to the projection length plus the size of the returned value,
+/// not the size of the containing local.
+fn read_projected_mir_value(
+    val: &MirValue,
+    declared_ty: Option<&Ty>,
+    proj: &[ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    _ptr_width: PtrWidth,
+    full_place: &Place,
+    active_downcast: Option<usize>,
+) -> Result<MirValue, RvalueEvalError> {
+    let (target, leaf_ty) = project_mir_value(
+        val,
+        declared_ty,
+        proj,
+        read_index,
+        full_place,
+        active_downcast,
+    )?;
+    // When `proj` is empty and `declared_ty` is `None` (pure `eval_place_read` on a bare local),
+    // `leaf_ty` is `None`; when `proj` is non-empty, `project_mir_value` supplies the last
+    // step's type as `leaf_ty`.
+    projected_ref_into_mir_value(target, if proj.is_empty() { None } else { leaf_ty })
 }
 
 /// Traverses `proj` over a mutable array window `window` of element type `elem_ty` for an
@@ -3438,20 +3492,10 @@ fn write_projected_mir_value(
     active_downcast: Option<usize>,
 ) -> Result<(), RvalueEvalError> {
     let Some((first, rest)) = proj.split_first() else {
-        if let Some(expected_variant) = active_downcast {
-            match &new_val {
-                MirValue::Adt {
-                    variant_idx,
-                    active_field: None,
-                    ..
-                } if *variant_idx == expected_variant => {}
-                MirValue::Tuple(_) | MirValue::Unit if expected_variant == 0 => {}
-                _ => {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "written value does not match active Downcast variant",
-                    ));
-                }
-            }
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Downcast projection must be followed by Field",
+            ));
         }
         if let Some(decl_ty) = declared_ty {
             if !mir_value_matches_ty(&new_val, decl_ty) {
@@ -3474,17 +3518,15 @@ fn write_projected_mir_value(
                     "consecutive Downcast projections without Field",
                 ));
             }
-            if let Some(next) = rest.first() {
-                if matches!(next, ProjectionElem::Deref) {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                        full_place.clone(),
-                    ));
-                }
-                if !matches!(next, ProjectionElem::Field(..)) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Downcast projection must be followed by Field",
-                    ));
-                }
+            if matches!(rest.first(), Some(ProjectionElem::Deref)) {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                ));
+            }
+            if !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
             }
             match val {
                 MirValue::Adt {
@@ -3726,28 +3768,14 @@ fn write_projected_mir_value(
                     }
                 } else {
                     if *active != *idx {
-                        let (leaf_ty, trailing_downcast) = validate_projection_tail(
+                        let leaf_ty = validate_projection_tail(
                             expected_ty,
                             rest,
+                            None,
                             Some(read_index),
                             full_place,
                             None,
                         )?;
-                        if let Some(expected_variant) = trailing_downcast {
-                            match &new_val {
-                                MirValue::Adt {
-                                    variant_idx,
-                                    active_field: None,
-                                    ..
-                                } if *variant_idx == expected_variant => {}
-                                MirValue::Tuple(_) | MirValue::Unit if expected_variant == 0 => {}
-                                _ => {
-                                    return Err(RvalueEvalError::TypeMismatch(
-                                        "written value does not match active Downcast variant",
-                                    ));
-                                }
-                            }
-                        }
                         if !mir_value_matches_ty(&new_val, &leaf_ty) {
                             return Err(RvalueEvalError::TypeMismatch(
                                 "written value runtime type does not match projected leaf type",
@@ -3818,107 +3846,6 @@ fn write_projected_mir_value(
     }
 }
 
-/// Traverses `proj` over an array window `window` of element type `elem_ty` to compute the
-/// length of the target array or subslice in `O(proj.len())` time without cloning or scanning
-/// unselected array elements.
-fn read_projected_array_window_len(
-    window: &[MirValue],
-    elem_ty: &Ty,
-    proj: &[ProjectionElem],
-    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
-    ptr_width: PtrWidth,
-    full_place: &Place,
-) -> Result<usize, RvalueEvalError> {
-    let Some((first, rest)) = proj.split_first() else {
-        return Ok(window.len());
-    };
-
-    match first {
-        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
-            full_place.clone(),
-        )),
-        ProjectionElem::Index(idx_local) => {
-            let idx_bits = read_index(*idx_local)?;
-            let Ok(i) = usize::try_from(idx_bits) else {
-                return Err(RvalueEvalError::IndexOutOfBounds {
-                    index: idx_bits,
-                    len: window.len(),
-                });
-            };
-            let Some(elem_val) = window.get(i) else {
-                return Err(RvalueEvalError::IndexOutOfBounds {
-                    index: idx_bits,
-                    len: window.len(),
-                });
-            };
-            if !mir_value_head_matches_ty(elem_val, elem_ty) {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Array element runtime type does not match elem_ty",
-                ));
-            }
-            read_projected_array_len(
-                elem_val,
-                Some(elem_ty),
-                rest,
-                read_index,
-                ptr_width,
-                full_place,
-                None,
-            )
-        }
-        ProjectionElem::ConstantIndex {
-            offset,
-            min_length,
-            from_end,
-        } => {
-            let idx = resolve_constant_index(window.len(), *offset, *min_length, *from_end)?;
-            let elem_val = &window[idx];
-            if !mir_value_head_matches_ty(elem_val, elem_ty) {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Array element runtime type does not match elem_ty",
-                ));
-            }
-            read_projected_array_len(
-                elem_val,
-                Some(elem_ty),
-                rest,
-                read_index,
-                ptr_width,
-                full_place,
-                None,
-            )
-        }
-        ProjectionElem::Subslice {
-            from,
-            to,
-            from_end,
-        } => {
-            let (start, end) = resolve_subslice_range(window.len(), *from, *to, *from_end)?;
-            read_projected_array_window_len(
-                &window[start..end],
-                elem_ty,
-                rest,
-                read_index,
-                ptr_width,
-                full_place,
-            )
-        }
-        ProjectionElem::Downcast(_) => {
-            if matches!(rest.first(), Some(ProjectionElem::Deref)) {
-                return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                    full_place.clone(),
-                ));
-            }
-            Err(RvalueEvalError::TypeMismatch(
-                "Downcast requires a non-union Adt or Tuple value",
-            ))
-        }
-        ProjectionElem::Field(..) => Err(RvalueEvalError::TypeMismatch(
-            "Field projection requires Tuple or Adt value",
-        )),
-    }
-}
-
 /// Traverses `proj` on `val` to resolve the length of the target `MirValue::Array` for
 /// `Rvalue::Len` in `O(proj.len())` time without cloning or scanning array elements.
 fn read_projected_array_len(
@@ -3926,271 +3853,19 @@ fn read_projected_array_len(
     declared_ty: Option<&Ty>,
     proj: &[ProjectionElem],
     read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
-    ptr_width: PtrWidth,
+    _ptr_width: PtrWidth,
     full_place: &Place,
     active_downcast: Option<usize>,
 ) -> Result<usize, RvalueEvalError> {
-    let Some((first, rest)) = proj.split_first() else {
-        if active_downcast.is_some() {
-            return Err(RvalueEvalError::TypeMismatch(
-                "Downcast projection must be followed by Field",
-            ));
-        }
-        let MirValue::Array { elements, .. } = val else {
-            return Err(RvalueEvalError::TypeMismatch(
-                "Len target runtime value must be MirValue::Array",
-            ));
-        };
-        if let Some(decl_ty) = declared_ty {
-            if !mir_value_head_matches_ty(val, decl_ty) {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Len target runtime value does not match declared array type",
-                ));
-            }
-        }
-        return Ok(elements.len());
-    };
-
-    match first {
-        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
-            full_place.clone(),
-        )),
-        ProjectionElem::Downcast(expected_variant) => {
-            if active_downcast.is_some() {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "consecutive Downcast projections without Field",
-                ));
-            }
-            if let Some(next) = rest.first() {
-                if matches!(next, ProjectionElem::Deref) {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                        full_place.clone(),
-                    ));
-                }
-                if !matches!(next, ProjectionElem::Field(..)) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Downcast projection must be followed by Field",
-                    ));
-                }
-            }
-            match val {
-                MirValue::Adt {
-                    variant_idx,
-                    active_field: None,
-                    ..
-                } => {
-                    if *variant_idx != *expected_variant {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: *expected_variant,
-                            actual: *variant_idx,
-                        });
-                    }
-                    read_projected_array_len(
-                        val,
-                        declared_ty,
-                        rest,
-                        read_index,
-                        ptr_width,
-                        full_place,
-                        Some(*expected_variant),
-                    )
-                }
-                MirValue::Tuple(_) | MirValue::Unit => {
-                    if *expected_variant != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: *expected_variant,
-                            actual: 0,
-                        });
-                    }
-                    read_projected_array_len(
-                        val,
-                        declared_ty,
-                        rest,
-                        read_index,
-                        ptr_width,
-                        full_place,
-                        Some(0),
-                    )
-                }
-                _ => Err(RvalueEvalError::TypeMismatch(
-                    "Downcast requires a non-union Adt or Tuple value",
-                )),
-            }
-        }
-        ProjectionElem::Field(idx, expected_ty) => match val {
-            MirValue::Tuple(fields) => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
-                }
-                let Some(field_val) = fields.get(*idx) else {
-                    return Err(RvalueEvalError::FieldOutOfBounds {
-                        field_idx: *idx,
-                        field_count: fields.len(),
-                    });
-                };
-                if !mir_value_head_matches_ty(field_val, expected_ty) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "projected tuple field runtime type does not match expected type",
-                    ));
-                }
-                read_projected_array_len(
-                    field_val,
-                    Some(expected_ty),
-                    rest,
-                    read_index,
-                    ptr_width,
-                    full_place,
-                    None,
-                )
-            }
-            MirValue::Unit => {
-                if let Some(v) = active_downcast {
-                    if v != 0 {
-                        return Err(RvalueEvalError::InactiveVariantProjection {
-                            expected: v,
-                            actual: 0,
-                        });
-                    }
-                }
-                Err(RvalueEvalError::FieldOutOfBounds {
-                    field_idx: *idx,
-                    field_count: 0,
-                })
-            }
-            MirValue::Adt {
-                variant_idx,
-                active_field: None,
-                fields,
-                ..
-            } => {
-                let expected_variant = active_downcast.unwrap_or(0);
-                if *variant_idx != expected_variant {
-                    return Err(RvalueEvalError::InactiveVariantProjection {
-                        expected: expected_variant,
-                        actual: *variant_idx,
-                    });
-                }
-                let Some(field_val) = fields.get(*idx) else {
-                    return Err(RvalueEvalError::FieldOutOfBounds {
-                        field_idx: *idx,
-                        field_count: fields.len(),
-                    });
-                };
-                if !mir_value_head_matches_ty(field_val, expected_ty) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "projected ADT field runtime type does not match expected type",
-                    ));
-                }
-                read_projected_array_len(
-                    field_val,
-                    Some(expected_ty),
-                    rest,
-                    read_index,
-                    ptr_width,
-                    full_place,
-                    None,
-                )
-            }
-            MirValue::Adt {
-                variant_idx,
-                active_field: Some(active),
-                fields,
-                ..
-            } => {
-                if active_downcast.is_some() || *variant_idx != 0 || fields.is_empty() {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "union ADT must have variant 0, at least one field, and cannot be downcast",
-                    ));
-                }
-                let active_val = if fields.len() == 1 {
-                    &fields[0]
-                } else {
-                    fields.get(*active).ok_or(RvalueEvalError::TypeMismatch(
-                        "union ADT active_field index out of bounds of fields",
-                    ))?
-                };
-                if let Some(decl_ty) = declared_ty {
-                    let Ty::Tuple(union_field_tys) = decl_ty else {
-                        return Err(RvalueEvalError::TypeMismatch(
-                            "union ADT declared type must be Ty::Tuple",
-                        ));
-                    };
-                    let Some(active_ty) = union_field_tys.get(*active) else {
-                        return Err(RvalueEvalError::TypeMismatch(
-                            "union ADT active_field index out of bounds of declared fields",
-                        ));
-                    };
-                    if *idx >= union_field_tys.len() {
-                        return Err(RvalueEvalError::FieldOutOfBounds {
-                            field_idx: *idx,
-                            field_count: union_field_tys.len(),
-                        });
-                    }
-                    if union_field_tys[*idx] != *expected_ty {
-                        return Err(RvalueEvalError::TypeMismatch(
-                            "projected union field type does not match declared union field type",
-                        ));
-                    }
-                    if *active != *idx && !mir_value_matches_ty(active_val, active_ty) {
-                        return Err(RvalueEvalError::TypeMismatch(
-                            "union ADT active field runtime value does not match declared type",
-                        ));
-                    }
-                }
-                if *active != *idx {
-                    validate_projection_tail(expected_ty, rest, Some(read_index), full_place, None)?;
-                    return Err(RvalueEvalError::InactiveUnionField {
-                        active_field: *active,
-                        requested_field: *idx,
-                    });
-                }
-                if !mir_value_head_matches_ty(active_val, expected_ty) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "projected union field runtime type does not match expected type",
-                    ));
-                }
-                read_projected_array_len(
-                    active_val,
-                    Some(expected_ty),
-                    rest,
-                    read_index,
-                    ptr_width,
-                    full_place,
-                    None,
-                )
-            }
-            _ => Err(RvalueEvalError::TypeMismatch(
-                "Field projection requires Tuple or Adt value",
-            )),
-        },
-        ProjectionElem::Index(_)
-        | ProjectionElem::ConstantIndex { .. }
-        | ProjectionElem::Subslice { .. } => {
-            if active_downcast.is_some() {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Downcast projection must be followed by Field",
-                ));
-            }
-            let MirValue::Array { elements, elem_ty } = val else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "array projection requires Array value",
-                ));
-            };
-            read_projected_array_window_len(
-                elements.as_slice(),
-                elem_ty,
-                proj,
-                read_index,
-                ptr_width,
-                full_place,
-            )
-        }
-    }
+    let (target, leaf_ty) = project_mir_value(
+        val,
+        declared_ty,
+        proj,
+        read_index,
+        full_place,
+        active_downcast,
+    )?;
+    projected_ref_into_array_len(target, leaf_ty)
 }
 
 /// Evaluates the runtime array length at `place` over `locals` under `ptr_width` in
@@ -4472,11 +4147,26 @@ pub fn eval_lowered_rvalue(
             })
         }
         LoweredRvalue::Ref {
-            place, ty: ref_ty, ..
+            place,
+            mutability,
+            ty: ref_ty,
         }
         | LoweredRvalue::RawPtr {
-            place, ty: ref_ty, ..
+            place,
+            mutability,
+            ty: ref_ty,
         } => {
+            let expected_ref = matches!(rvalue, LoweredRvalue::Ref { .. });
+            let ty_ok = match ref_ty {
+                Ty::Ref(_, m) => expected_ref && m == mutability,
+                Ty::RawPtr(_, m) => !expected_ref && m == mutability,
+                _ => false,
+            };
+            if !ty_ok {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Ref/RawPtr lowered ty does not match rvalue kind and mutability",
+                ));
+            }
             let ptr = match place.projection.as_slice() {
                 [] => {
                     // Synthetic, page-aligned per-local allocation with a fresh provenance.
@@ -4544,7 +4234,7 @@ pub fn eval_lowered_rvalue(
             }
             Ok(MirValue::unsigned(*static_len as u128, UintTy::Usize, ptr_width))
         }
-        LoweredRvalue::Cast { cast, .. } => {
+        LoweredRvalue::Cast { cast, ty } => {
             let op = match cast {
                 LoweredCast::PtrToInt { operand, .. }
                 | LoweredCast::IntToPtr { operand, .. }
@@ -4554,7 +4244,13 @@ pub fn eval_lowered_rvalue(
                 | LoweredCast::Transmute { operand, .. } => operand,
             };
             let v = eval_op(op)?;
-            eval_lowered_cast(cast, &v, ptr_width, policy, tracker)
+            let out = eval_lowered_cast(cast, &v, ptr_width, policy, tracker)?;
+            if !mir_value_matches_ty(&out, ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Cast result runtime type does not match lowered ty",
+                ));
+            }
+            Ok(out)
         }
         LoweredRvalue::BinaryOp {
             op,
@@ -4644,9 +4340,9 @@ pub fn eval_lowered_rvalue(
             place_ty,
             ty,
         } => {
-            if *ty != Ty::Int(IntTy::Isize) {
+            if *ty != Ty::Int(IntTy::Isize) || !place_ty.is_inhabited() {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Discriminant result type must be isize",
+                    "Discriminant requires an inhabited place_ty and isize result ty",
                 ));
             }
             let val = read_place(place)?;
@@ -4669,7 +4365,7 @@ pub fn eval_lowered_rvalue(
             kind,
             operands,
             operand_tys,
-            ..
+            ty,
         } => {
             if operands.len() != operand_tys.len() {
                 return Err(RvalueEvalError::TypeMismatch(
@@ -4686,7 +4382,20 @@ pub fn eval_lowered_rvalue(
                 }
                 vals.push(v);
             }
-            eval_aggregate(kind, vals, ptr_width)
+            let out = eval_aggregate(kind, vals, ptr_width)?;
+            let ty_ok = match kind {
+                AggregateKind::Adt {
+                    active_field: Some(_),
+                    ..
+                } => *ty == Ty::Tuple(operand_tys.clone()) || mir_value_matches_ty(&out, ty),
+                _ => mir_value_matches_ty(&out, ty),
+            };
+            if !ty_ok {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Aggregate result runtime type does not match lowered ty",
+                ));
+            }
+            Ok(out)
         }
         LoweredRvalue::CopyForDeref { place, ty } => match read_place(place)? {
             MirValue::Ptr { ptr, ty: val_ty } if val_ty == *ty && ty.is_any_ptr() => {
@@ -4915,9 +4624,23 @@ impl StatementEvalState {
         }
     }
 
-    /// Reads an index local as a `usize` bit pattern, returning `DeadLocal` or
-    /// `UninitializedLocal` if the index local is not initialized.
+    /// Reads an index local as a `usize` bit pattern, returning `TypeMismatch` if the local is
+    /// out of bounds or not declared as `usize`, and `DeadLocal` or `UninitializedLocal` if its
+    /// slot is not initialized.
     fn read_index_local(&self, idx_local: Local) -> Result<u128, RvalueEvalError> {
+        match self.local_decls.get(idx_local.0) {
+            None => {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "index local index out of bounds",
+                ));
+            }
+            Some(Ty::Uint(UintTy::Usize)) => {}
+            Some(_) => {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "array index local must have declared type usize",
+                ));
+            }
+        }
         match self.slots.get(idx_local.0) {
             None => Err(RvalueEvalError::TypeMismatch(
                 "index local index out of bounds",
@@ -4936,25 +4659,23 @@ impl StatementEvalState {
         }
     }
 
-    /// Checks every projection step of `place` against the declared type of its root local:
-    /// field indices and `Field` type annotations, array projections on array types,
-    /// `Downcast` on tuple types, and static `ConstantIndex` / `Subslice` bounds. Returns the
-    /// declared type of the place and any trailing `Downcast` variant.
+    /// Checks every projection step of `place` against `self.local_decls`: field indices and
+    /// `Field` type annotations, array projections on array types, `Index(idx_local)` local
+    /// bounds and `usize` declaration, `Downcast` followed immediately by `Field`, and static
+    /// `ConstantIndex` / `Subslice` bounds. Returns the declared type of `place`.
     ///
     /// This is a type-level check whose cost depends on the projection and the declared types
     /// only, not on the size of the local's value. Projection traversals check intermediate
     /// values by their outermost constructor, so this check is what rejects a `Field`
     /// annotation that differs from the declared field type below the outermost constructor.
-    fn check_place_against_decls(
-        &self,
-        place: &Place,
-    ) -> Result<(Ty, Option<usize>), RvalueEvalError> {
+    fn check_place_against_decls(&self, place: &Place) -> Result<Ty, RvalueEvalError> {
         let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
         validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
             base_decl_ty,
             &place.projection,
+            Some(&self.local_decls),
             None,
             place,
             None,
@@ -5012,8 +4733,13 @@ impl StatementEvalState {
     }
 
     /// Resolves the runtime array length at `place` from `self.slots` in `O(place.projection.len())`
-    /// time without cloning or scanning array elements.
-    fn read_place_array_len(&self, place: &Place) -> Result<usize, RvalueEvalError> {
+    /// time without cloning or scanning array elements, verifying that the declared array length
+    /// matches `expected_static_len`.
+    fn read_place_array_len(
+        &self,
+        place: &Place,
+        expected_static_len: usize,
+    ) -> Result<usize, RvalueEvalError> {
         if place
             .projection
             .iter()
@@ -5021,10 +4747,14 @@ impl StatementEvalState {
         {
             return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
         }
-        let (leaf_ty, trailing_downcast) = self.check_place_against_decls(place)?;
-        if trailing_downcast.is_some() || !matches!(leaf_ty, Ty::Array(_, _)) {
+        let Ty::Array(_, decl_len) = self.check_place_against_decls(place)? else {
             return Err(RvalueEvalError::TypeMismatch(
                 "Len target place must have array type",
+            ));
+        };
+        if decl_len != expected_static_len {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Len target declared array length does not match static_len",
             ));
         }
         let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
@@ -5093,8 +4823,24 @@ impl StatementEvalState {
         let Some(LocalSlotState::PartialShell(root)) = self.slots.get(place.local.0) else {
             return None;
         };
-        let shell = partial_shell_at(root, base_decl_ty, &place.projection, None)?;
-        (shell.is_adt && shell.discriminant_set).then_some(shell.variant_idx)
+        let read_index = |loc: Local| self.read_index_local(loc);
+        match project_from_partial_shell(
+            root,
+            base_decl_ty,
+            &place.projection,
+            &read_index,
+            self.ptr_width,
+            place.local,
+            place,
+            None,
+        )
+        .ok()?
+        {
+            ProjectedShellRef::Shell(shell) if shell.is_adt && shell.discriminant_set => {
+                Some(shell.variant_idx)
+            }
+            _ => None,
+        }
     }
 
     /// Writes `val` to `place` (of declared leaf type `place_ty`), supporting `D13b` nested
@@ -5112,6 +4858,12 @@ impl StatementEvalState {
             .any(|p| matches!(p, ProjectionElem::Deref))
         {
             return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+        }
+        let decl_place_ty = self.check_place_against_decls(place)?;
+        if decl_place_ty != *place_ty {
+            return Err(RvalueEvalError::TypeMismatch(
+                "destination place_ty does not match declared place type",
+            ));
         }
         let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
@@ -5135,7 +4887,6 @@ impl StatementEvalState {
             self.slots[place.local.0] = LocalSlotState::Init(val);
             return Ok(());
         }
-        self.check_place_against_decls(place)?;
 
         // Pre-validate any `Index(idx_local)` operands before mutating `self.slots[place.local.0]`.
         let mut index_cache: Vec<(Local, u128)> = Vec::new();
@@ -5198,171 +4949,35 @@ impl StatementEvalState {
     }
 }
 
-/// Resolves the runtime array length at `proj` out of a `PartialAggregate` shell for
-/// `Rvalue::Len` without cloning or scanning array elements.
-#[allow(clippy::too_many_arguments)]
-fn read_array_len_from_partial_shell(
-    shell: &PartialAggregate,
-    declared_ty: &Ty,
-    proj: &[ProjectionElem],
-    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
-    ptr_width: PtrWidth,
-    base_local: Local,
-    full_place: &Place,
-    active_downcast: Option<usize>,
-) -> Result<usize, RvalueEvalError> {
-    let Some((first, rest)) = proj.split_first() else {
-        return Err(RvalueEvalError::TypeMismatch(
-            "Len target runtime value must be MirValue::Array",
-        ));
-    };
-
-    match first {
-        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
-            full_place.clone(),
-        )),
-        ProjectionElem::Downcast(expected_variant) => {
-            if active_downcast.is_some() {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "consecutive Downcast projections without Field",
-                ));
-            }
-            if let Some(next) = rest.first() {
-                if matches!(next, ProjectionElem::Deref) {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(
-                        full_place.clone(),
-                    ));
-                }
-                if !matches!(next, ProjectionElem::Field(..)) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Downcast projection must be followed by Field",
-                    ));
-                }
-            }
-            if !matches!(declared_ty, Ty::Tuple(_)) {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Downcast projection requires a tuple-typed (ADT) place",
-                ));
-            }
-            let actual = if shell.is_adt { shell.variant_idx } else { 0 };
-            if actual != *expected_variant {
-                return Err(RvalueEvalError::InactiveVariantProjection {
-                    expected: *expected_variant,
-                    actual,
-                });
-            }
-            read_array_len_from_partial_shell(
-                shell,
-                declared_ty,
-                rest,
-                read_index,
-                ptr_width,
-                base_local,
-                full_place,
-                Some(*expected_variant),
-            )
-        }
-        ProjectionElem::Field(idx, expected_ty) => {
-            let Ty::Tuple(field_tys) = declared_ty else {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "Field projection requires a tuple-typed place",
-                ));
-            };
-            let expected_variant = active_downcast.unwrap_or(0);
-            let actual = if shell.is_adt { shell.variant_idx } else { 0 };
-            if actual != expected_variant {
-                return Err(RvalueEvalError::InactiveVariantProjection {
-                    expected: expected_variant,
-                    actual,
-                });
-            }
-            let Some(field_slot) = shell.fields.get(*idx) else {
-                return Err(RvalueEvalError::FieldOutOfBounds {
-                    field_idx: *idx,
-                    field_count: shell.fields.len(),
-                });
-            };
-            if *idx >= field_tys.len() {
-                return Err(RvalueEvalError::FieldOutOfBounds {
-                    field_idx: *idx,
-                    field_count: field_tys.len(),
-                });
-            }
-            if field_tys[*idx] != *expected_ty {
-                return Err(RvalueEvalError::TypeMismatch(
-                    "projected field type does not match declared tuple field type",
-                ));
-            }
-            match field_slot {
-                FieldSlot::Uninit => {
-                    let (leaf_ty, trailing_downcast) =
-                        validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
-                            &field_tys[*idx],
-                            rest,
-                            None,
-                            full_place,
-                            None,
-                        )?;
-                    if trailing_downcast.is_some() || !matches!(leaf_ty, Ty::Array(_, _)) {
-                        return Err(RvalueEvalError::TypeMismatch(
-                            "Len target place must have array type",
-                        ));
-                    }
-                    Err(RvalueEvalError::UninitializedLocal(base_local))
-                }
-                FieldSlot::Partial(child_shell) => read_array_len_from_partial_shell(
-                    child_shell,
-                    &field_tys[*idx],
-                    rest,
-                    read_index,
-                    ptr_width,
-                    base_local,
-                    full_place,
-                    None,
-                ),
-                FieldSlot::Init(field_val) => {
-                    if !mir_value_head_matches_ty(field_val, expected_ty) {
-                        return Err(RvalueEvalError::TypeMismatch(
-                            "projected field runtime type does not match expected type",
-                        ));
-                    }
-                    read_projected_array_len(
-                        field_val,
-                        Some(expected_ty),
-                        rest,
-                        read_index,
-                        ptr_width,
-                        full_place,
-                        None,
-                    )
-                }
-            }
-        }
-        ProjectionElem::Index(_)
-        | ProjectionElem::ConstantIndex { .. }
-        | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::TypeMismatch(
-            "array projection applied to a partially initialized tuple/ADT shell",
-        )),
-    }
+/// Borrowed target of projecting into a [`PartialAggregate`] shell.
+enum ProjectedShellRef<'a> {
+    /// A nested (or root) `PartialAggregate` shell at the end of `proj`.
+    Shell(&'a PartialAggregate),
+    /// A projected reference into an initialized `FieldSlot::Init` child value.
+    Init(ProjectedRef<'a>, Option<&'a Ty>),
 }
 
-/// Reads a projected value out of a `PartialAggregate` shell.
+/// Projects `proj` through a `PartialAggregate` shell in `O(proj.len())` time without cloning
+/// or scanning sibling fields, returning either the reached `PartialAggregate` shell or a
+/// [`ProjectedRef`] inside an initialized field slot.
 #[allow(clippy::too_many_arguments)]
-fn read_from_partial_shell(
-    shell: &PartialAggregate,
-    declared_ty: &Ty,
-    proj: &[ProjectionElem],
+fn project_from_partial_shell<'a>(
+    shell: &'a PartialAggregate,
+    declared_ty: &'a Ty,
+    proj: &'a [ProjectionElem],
     read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
     ptr_width: PtrWidth,
     base_local: Local,
     full_place: &Place,
     active_downcast: Option<usize>,
-) -> Result<MirValue, RvalueEvalError> {
+) -> Result<ProjectedShellRef<'a>, RvalueEvalError> {
     let Some((first, rest)) = proj.split_first() else {
-        if let Some(full_val) = shell.try_into_mir_value() {
-            return Ok(full_val);
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Downcast projection must be followed by Field",
+            ));
         }
-        return Err(RvalueEvalError::UninitializedLocal(base_local));
+        return Ok(ProjectedShellRef::Shell(shell));
     };
 
     match first {
@@ -5375,13 +4990,14 @@ fn read_from_partial_shell(
                     "consecutive Downcast projections without Field",
                 ));
             }
-            if let Some(next) = rest.first() {
-                if matches!(next, ProjectionElem::Deref) {
+            match rest.first() {
+                Some(ProjectionElem::Deref) => {
                     return Err(RvalueEvalError::UnsupportedPlaceProjection(
                         full_place.clone(),
                     ));
                 }
-                if !matches!(next, ProjectionElem::Field(..)) {
+                Some(ProjectionElem::Field(..)) => {}
+                _ => {
                     return Err(RvalueEvalError::TypeMismatch(
                         "Downcast projection must be followed by Field",
                     ));
@@ -5399,7 +5015,7 @@ fn read_from_partial_shell(
                     actual,
                 });
             }
-            read_from_partial_shell(
+            project_from_partial_shell(
                 shell,
                 declared_ty,
                 rest,
@@ -5447,12 +5063,13 @@ fn read_from_partial_shell(
                         &field_tys[*idx],
                         rest,
                         None,
+                        None,
                         full_place,
                         None,
                     )?;
                     Err(RvalueEvalError::UninitializedLocal(base_local))
                 }
-                FieldSlot::Partial(child_shell) => read_from_partial_shell(
+                FieldSlot::Partial(child_shell) => project_from_partial_shell(
                     child_shell,
                     &field_tys[*idx],
                     rest,
@@ -5468,15 +5085,15 @@ fn read_from_partial_shell(
                             "projected field runtime type does not match expected type",
                         ));
                     }
-                    read_projected_mir_value(
+                    project_mir_value(
                         field_val,
                         Some(expected_ty),
                         rest,
                         read_index,
-                        ptr_width,
                         full_place,
                         None,
                     )
+                    .map(|(projected, leaf_ty)| ProjectedShellRef::Init(projected, leaf_ty))
                 }
             }
         }
@@ -5490,37 +5107,66 @@ fn read_from_partial_shell(
     }
 }
 
-/// Follows a pure `Field` / `Downcast`+`Field` chain through nested partially initialized
-/// shells and returns the shell that `proj` designates, or `None` if `proj` reaches an
-/// initialized or uninitialized field slot, selects an inactive variant, ends in `Downcast`,
-/// has a static type mismatch, or contains any other projection.
-fn partial_shell_at<'a>(
-    shell: &'a PartialAggregate,
+/// Resolves the runtime array length at `proj` out of a `PartialAggregate` shell for
+/// `Rvalue::Len` without cloning or scanning array elements.
+#[allow(clippy::too_many_arguments)]
+fn read_array_len_from_partial_shell(
+    shell: &PartialAggregate,
     declared_ty: &Ty,
     proj: &[ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    ptr_width: PtrWidth,
+    base_local: Local,
+    full_place: &Place,
     active_downcast: Option<usize>,
-) -> Option<&'a PartialAggregate> {
-    let Some((first, rest)) = proj.split_first() else {
-        return active_downcast.is_none().then_some(shell);
-    };
-    let Ty::Tuple(field_tys) = declared_ty else {
-        return None;
-    };
-    let actual = if shell.is_adt { shell.variant_idx } else { 0 };
-    match first {
-        ProjectionElem::Downcast(v) if active_downcast.is_none() && actual == *v => {
-            partial_shell_at(shell, declared_ty, rest, Some(*v))
+) -> Result<usize, RvalueEvalError> {
+    match project_from_partial_shell(
+        shell,
+        declared_ty,
+        proj,
+        read_index,
+        ptr_width,
+        base_local,
+        full_place,
+        active_downcast,
+    )? {
+        ProjectedShellRef::Shell(_) => Err(RvalueEvalError::TypeMismatch(
+            "Len target runtime value must be MirValue::Array",
+        )),
+        ProjectedShellRef::Init(projected, leaf_ty) => {
+            projected_ref_into_array_len(projected, leaf_ty)
         }
-        ProjectionElem::Field(idx, expected_ty) if actual == active_downcast.unwrap_or(0) => {
-            if field_tys.get(*idx) != Some(expected_ty) {
-                return None;
-            }
-            match shell.fields.get(*idx)? {
-                FieldSlot::Partial(child) => partial_shell_at(child, &field_tys[*idx], rest, None),
-                FieldSlot::Uninit | FieldSlot::Init(_) => None,
-            }
+    }
+}
+
+/// Reads a projected value out of a `PartialAggregate` shell.
+#[allow(clippy::too_many_arguments)]
+fn read_from_partial_shell(
+    shell: &PartialAggregate,
+    declared_ty: &Ty,
+    proj: &[ProjectionElem],
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    ptr_width: PtrWidth,
+    base_local: Local,
+    full_place: &Place,
+    active_downcast: Option<usize>,
+) -> Result<MirValue, RvalueEvalError> {
+    match project_from_partial_shell(
+        shell,
+        declared_ty,
+        proj,
+        read_index,
+        ptr_width,
+        base_local,
+        full_place,
+        active_downcast,
+    )? {
+        ProjectedShellRef::Shell(reached) => reached
+            .try_into_mir_value()
+            .ok_or(RvalueEvalError::UninitializedLocal(base_local)),
+        ProjectedShellRef::Init(projected, leaf_ty) => {
+            projected_ref_into_mir_value(projected, leaf_ty)
         }
-        _ => None,
     }
 }
 
@@ -5701,15 +5347,16 @@ fn write_to_partial_slot(
         | ProjectionElem::ConstantIndex { .. }
         | ProjectionElem::Subslice { .. } => match (slot, declared_ty) {
             (FieldSlot::Uninit, Ty::Array(_, _)) => {
-                let (leaf_ty, trailing_downcast) =
+                let leaf_ty =
                     validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
                         declared_ty,
                         proj,
                         None,
+                        None,
                         full_place,
                         active_downcast,
                     )?;
-                if trailing_downcast.is_some() || !mir_value_matches_ty(&new_val, &leaf_ty) {
+                if !mir_value_matches_ty(&new_val, &leaf_ty) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "assigned value runtime type does not match projected array leaf type",
                     ));
@@ -5835,19 +5482,14 @@ fn set_discriminant_in_slot(
             active_downcast,
         )
     } else if matches!(slot, FieldSlot::Uninit) {
-        let (leaf_ty, trailing_downcast) =
-            validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
-                declared_ty,
-                proj,
-                None,
-                full_place,
-                active_downcast,
-            )?;
-        if trailing_downcast.is_some() {
-            return Err(RvalueEvalError::TypeMismatch(
-                "SetDiscriminant target cannot end with Downcast",
-            ));
-        }
+        let leaf_ty = validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+            declared_ty,
+            proj,
+            None,
+            None,
+            full_place,
+            active_downcast,
+        )?;
         if !matches!(leaf_ty, Ty::Tuple(_)) {
             return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
         }
@@ -6012,14 +5654,28 @@ pub fn eval_lowered_rvalue_in_state(
             })
         }
         LoweredRvalue::Ref {
-            place, ty: ref_ty, ..
+            place,
+            mutability,
+            ty: ref_ty,
         }
         | LoweredRvalue::RawPtr {
-            place, ty: ref_ty, ..
+            place,
+            mutability,
+            ty: ref_ty,
         } => {
+            let expected_ref = matches!(rvalue, LoweredRvalue::Ref { .. });
+            let pointee_ty = match ref_ty {
+                Ty::Ref(pointee, m) if expected_ref && m == mutability => pointee.as_ref(),
+                Ty::RawPtr(pointee, m) if !expected_ref && m == mutability => pointee.as_ref(),
+                _ => {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Ref/RawPtr lowered ty does not match rvalue kind and mutability",
+                    ));
+                }
+            };
             let ptr = match place.projection.as_slice() {
                 [] => {
-                    if state.local_decls.get(place.local.0) != ref_ty.pointee_ty() {
+                    if state.local_decls.get(place.local.0) != Some(pointee_ty) {
                         return Err(RvalueEvalError::TypeMismatch(
                             "Ref/RawPtr local declaration type does not match pointee type",
                         ));
@@ -6042,7 +5698,7 @@ pub fn eval_lowered_rvalue_in_state(
                 }
                 [ProjectionElem::Deref] => match state.read_place(&Place::from_local(place.local.0))? {
                     MirValue::Ptr { ptr, ty } => {
-                        if !ty.is_any_ptr() || ty.pointee_ty() != ref_ty.pointee_ty() {
+                        if !ty.is_any_ptr() || ty.pointee_ty() != Some(pointee_ty) {
                             return Err(RvalueEvalError::TypeMismatch(
                                 "Deref projection requires a pointer value with matching pointee type",
                             ));
@@ -6067,7 +5723,36 @@ pub fn eval_lowered_rvalue_in_state(
                         ));
                     }
                 },
-                _ => return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone())),
+                _ => {
+                    if place
+                        .projection
+                        .iter()
+                        .any(|p| matches!(p, ProjectionElem::Deref))
+                    {
+                        return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+                    }
+                    let leaf_ty = state.check_place_against_decls(place)?;
+                    if leaf_ty != *pointee_ty {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Ref/RawPtr projected place type does not match pointee type",
+                        ));
+                    }
+                    match state.slots.get(place.local.0) {
+                        None => {
+                            return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
+                        }
+                        Some(LocalSlotState::Dead) => {
+                            return Err(RvalueEvalError::DeadLocal(place.local));
+                        }
+                        Some(_) => {}
+                    }
+                    for elem in &place.projection {
+                        if let ProjectionElem::Index(idx_local) = elem {
+                            let _ = state.read_index_local(*idx_local)?;
+                        }
+                    }
+                    return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+                }
             };
             if ref_ty.is_ref() && ptr.addr == 0 {
                 return Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
@@ -6092,7 +5777,7 @@ pub fn eval_lowered_rvalue_in_state(
                     "Len result type must be a representable usize",
                 ));
             }
-            let len = state.read_place_array_len(place)?;
+            let len = state.read_place_array_len(place, *static_len)?;
             if len != *static_len {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Len target array length does not match static_len",
@@ -6104,7 +5789,7 @@ pub fn eval_lowered_rvalue_in_state(
                 state.ptr_width,
             ))
         }
-        LoweredRvalue::Cast { cast, .. } => {
+        LoweredRvalue::Cast { cast, ty } => {
             let op = match cast {
                 LoweredCast::PtrToInt { operand, .. }
                 | LoweredCast::IntToPtr { operand, .. }
@@ -6114,7 +5799,14 @@ pub fn eval_lowered_rvalue_in_state(
                 | LoweredCast::Transmute { operand, .. } => operand,
             };
             let v = eval_op(op, state)?;
-            eval_lowered_cast(cast, &v, state.ptr_width, state.policy, &mut state.tracker)
+            let out =
+                eval_lowered_cast(cast, &v, state.ptr_width, state.policy, &mut state.tracker)?;
+            if !mir_value_matches_ty(&out, ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Cast result runtime type does not match lowered ty",
+                ));
+            }
+            Ok(out)
         }
         LoweredRvalue::BinaryOp {
             op,
@@ -6213,9 +5905,22 @@ pub fn eval_lowered_rvalue_in_state(
             place_ty,
             ty,
         } => {
-            if *ty != Ty::Int(IntTy::Isize) {
+            if *ty != Ty::Int(IntTy::Isize) || !place_ty.is_inhabited() {
                 return Err(RvalueEvalError::TypeMismatch(
-                    "Discriminant result type must be isize",
+                    "Discriminant requires an inhabited place_ty and isize result ty",
+                ));
+            }
+            if place
+                .projection
+                .iter()
+                .any(|p| matches!(p, ProjectionElem::Deref))
+            {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
+            }
+            let decl_place_ty = state.check_place_against_decls(place)?;
+            if decl_place_ty != *place_ty {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Discriminant lowered place_ty does not match declared place type",
                 ));
             }
             let discr = match state.read_place(place) {
@@ -6252,7 +5957,7 @@ pub fn eval_lowered_rvalue_in_state(
             kind,
             operands,
             operand_tys,
-            ..
+            ty,
         } => {
             if operands.len() != operand_tys.len() {
                 return Err(RvalueEvalError::TypeMismatch(
@@ -6269,7 +5974,20 @@ pub fn eval_lowered_rvalue_in_state(
                 }
                 vals.push(v);
             }
-            eval_aggregate(kind, vals, state.ptr_width)
+            let out = eval_aggregate(kind, vals, state.ptr_width)?;
+            let ty_ok = match kind {
+                AggregateKind::Adt {
+                    active_field: Some(_),
+                    ..
+                } => *ty == Ty::Tuple(operand_tys.clone()) || mir_value_matches_ty(&out, ty),
+                _ => mir_value_matches_ty(&out, ty),
+            };
+            if !ty_ok {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Aggregate result runtime type does not match lowered ty",
+                ));
+            }
+            Ok(out)
         }
         LoweredRvalue::CopyForDeref { place, ty } => match state.read_place(place)? {
             MirValue::Ptr { ptr, ty: val_ty } if val_ty == *ty && ty.is_any_ptr() => {
@@ -6343,7 +6061,7 @@ pub fn eval_lowered_statement(
             state.slots[loc.0] = LocalSlotState::Dead;
             Ok(())
         }
-        LoweredStatement::PlaceMention { place, .. } => {
+        LoweredStatement::PlaceMention { place, place_ty } => {
             match state.slots.get(place.local.0) {
                 None => return Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
                 Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(place.local)),
@@ -6358,15 +6076,11 @@ pub fn eval_lowered_statement(
                 .position(|p| matches!(p, ProjectionElem::Deref));
             let prefix = Place {
                 local: place.local,
-                projection: place.projection[..first_deref.unwrap_or(place.projection.len())].to_vec(),
+                projection: place.projection[..first_deref.unwrap_or(place.projection.len())]
+                    .to_vec(),
             };
-            let (prefix_ty, trailing_downcast) = state.check_place_against_decls(&prefix)?;
-            if let Some(pos) = first_deref {
-                if trailing_downcast.is_some() {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Downcast projection must be followed by Field",
-                    ));
-                }
+            let prefix_ty = state.check_place_against_decls(&prefix)?;
+            let resolved_ty = if let Some(pos) = first_deref {
                 let Some(pointee_ty) = prefix_ty.pointee_ty() else {
                     return Err(RvalueEvalError::TypeMismatch(
                         "Deref projection requires a pointer-typed place",
@@ -6375,10 +6089,18 @@ pub fn eval_lowered_statement(
                 validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
                     pointee_ty,
                     &place.projection[pos + 1..],
+                    Some(&state.local_decls),
                     None,
                     place,
                     None,
-                )?;
+                )?
+            } else {
+                prefix_ty
+            };
+            if resolved_ty != *place_ty {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "PlaceMention place_ty does not match declared place type",
+                ));
             }
             // Validate every `Index(idx_local)` operand read while computing `place`.
             for elem in &place.projection {
@@ -6388,17 +6110,7 @@ pub fn eval_lowered_statement(
             }
             // If `place.projection` contains `Deref`, the pointer sub-place before the first
             // `Deref` is read to compute the dereferenced place's address (`D9`).
-            if let Some(first_deref_pos) = place
-                .projection
-                .iter()
-                .position(|p| matches!(p, ProjectionElem::Deref))
-            {
-                if place.projection[first_deref_pos + 1..]
-                    .iter()
-                    .any(|p| matches!(p, ProjectionElem::Deref))
-                {
-                    return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
-                }
+            if let Some(first_deref_pos) = first_deref {
                 let ptr_place = Place {
                     local: place.local,
                     projection: place.projection[..first_deref_pos].to_vec(),
@@ -6441,8 +6153,8 @@ pub fn eval_lowered_statement(
         }
         LoweredStatement::SetDiscriminant {
             place,
+            place_ty,
             variant_index,
-            ..
         } => {
             if place
                 .projection
@@ -6454,7 +6166,12 @@ pub fn eval_lowered_statement(
             let Some(base_decl_ty) = state.local_decls.get(place.local.0).cloned() else {
                 return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
             };
-            state.check_place_against_decls(place)?;
+            let decl_place_ty = state.check_place_against_decls(place)?;
+            if decl_place_ty != *place_ty {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "SetDiscriminant place_ty does not match declared place type",
+                ));
+            }
             let mut index_cache: Vec<(Local, u128)> = Vec::new();
             for elem in &place.projection {
                 if let ProjectionElem::Index(idx_local) = elem {
