@@ -652,6 +652,118 @@ theorem sim_lm3_3_retag_inhabited_never_container_zst_step
       ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩,
       ⟨_, rfl, rfl, rfl⟩⟩
 
+/-- **`sim_lm3_3_retag_unsafecell_zst_vs_never_step`**: across all `4 × 2 = 8`
+`(rk, mutability)` combinations:
+1. transparent/same-size wrappers `core::cell::UnsafeCell<()>` (`!Freeze`) and
+   `core::mem::MaybeUninit<!>` (`Freeze`) are inhabited
+   (`rigidTyIsUninhabited 16 = false`) and zero-sized
+   (`rigidTyIsZeroSized 16 = true`), so `StatementKind.retag rk _2` steps
+   cleanly on both provenance pointers (`retagZstRefState`, skipping the 0-byte
+   initial child read even for `&mut UnsafeCell<()>` in `ReservedIM` /
+   `ReservedFrz false` so protected `Unique` sibling `entry 2` survives) and
+   non-null dangling scalars (`retagZstScalarState true`);
+2. transparent wrappers `core::cell::UnsafeCell<!>`, `core::cell::Cell<!>`, and
+   `core::mem::ManuallyDrop<!>` around `!` are uninhabited
+   (`rigidTyIsUninhabited 16 = true`), so `StatementKind.retag rk _2`
+   immediately faults with `.fail .ub` for every `val`, `borrows`, and
+   `isProtected`. -/
+theorem sim_lm3_3_retag_unsafecell_zst_vs_never_step
+    (rk : RetagKind) (mutability : Mutability) (useMaybeUninit : Bool)
+    (val : Value) (borrows : List BorrowEntry) (isProtected : Bool) :
+    let zstPointee : RigidTy :=
+      if useMaybeUninit then .adt "core::mem::MaybeUninit" [.never]
+      else .adt "core::cell::UnsafeCell" [.tuple []]
+    let childPerm :=
+      annealRetagPerm (retagKindToAnnealMode rk) mutability useMaybeUninit
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    rigidTyIsUninhabited 16 zstPointee = false ∧
+    rigidTyIsZeroSized 16 zstPointee = true ∧
+    rigidTyIsFreeze 16 zstPointee = useMaybeUninit ∧
+    (∃ s' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability zstPointee) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) ∧
+    (∃ s'' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability zstPointee) (retagZstScalarState true) =
+        .step s'' ∧
+      s''.memory = (retagZstScalarState true).memory ∧
+      get? s''.frame.locals 2 = some (.init (.scalar ⟨8, 8⟩))) ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::UnsafeCell" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::Cell" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::mem::ManuallyDrop" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub := by
+  have hub_uc :
+      stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::UnsafeCell" [.never]))
+        (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
+    sim_lm3_3_retag_uninhabited_ref_ub_step rk mutability
+      (.adt "core::cell::UnsafeCell" [.never]) val borrows isProtected rfl
+  have hub_c :
+      stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::Cell" [.never]))
+        (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
+    sim_lm3_3_retag_uninhabited_ref_ub_step rk mutability
+      (.adt "core::cell::Cell" [.never]) val borrows isProtected rfl
+  have hub_md :
+      stepMirFn (retagPointeeRefBody rk mutability (.adt "core::mem::ManuallyDrop" [.never]))
+        (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
+    sim_lm3_3_retag_uninhabited_ref_ub_step rk mutability
+      (.adt "core::mem::ManuallyDrop" [.never]) val borrows isProtected rfl
+  cases useMaybeUninit <;> cases rk <;> cases mutability <;>
+    exact ⟨rfl, rfl, rfl,
+      ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩,
+      ⟨_, rfl, rfl, rfl⟩,
+      hub_uc, hub_c, hub_md⟩
+
+/-- **`sim_lm3_3_retag_phantom_unsafecell_vs_cell_step`**: across all
+`4 × 2 = 8` `(rk, mutability)` combinations:
+1. `core::marker::PhantomData<core::cell::UnsafeCell<u64>>` is `Freeze`
+   (`rigidTyIsFreeze 16 = true`, `unsafe impl<T: ?Sized> Freeze for PhantomData<T>`)
+   and zero-sized (`rigidTyIsZeroSized 16 = true`), so `StatementKind.retag rk _2`
+   assigns `annealRetagPerm (retagKindToAnnealMode rk) mutability true`
+   (`.frozen` / `.reservedFrz false`, never `.cell` / `.reservedIM`) and skips
+   the 0-byte initial read;
+2. `core::cell::Cell<u64>` is `!Freeze` (`rigidTyIsFreeze 16 = false`) even
+   though its generic argument `u64` is `Freeze`, so `StatementKind.retag rk _2`
+   assigns `annealRetagPerm (retagKindToAnnealMode rk) mutability false`
+   (`.cell` on shared references and `.reservedIM` / `.reservedFrz false` on
+   mutable references). -/
+theorem sim_lm3_3_retag_phantom_unsafecell_vs_cell_step
+    (rk : RetagKind) (mutability : Mutability) :
+    let phantomCellPt : RigidTy :=
+      .adt "core::marker::PhantomData" [.adt "core::cell::UnsafeCell" [.uint .u64]]
+    let cellU64Pt : RigidTy := .adt "core::cell::Cell" [.uint .u64]
+    let mode := retagKindToAnnealMode rk
+    let phPerm := annealRetagPerm mode mutability true
+    let cellPerm := annealRetagPerm mode mutability false
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    rigidTyIsFreeze 16 phantomCellPt = true ∧
+    rigidTyIsZeroSized 16 phantomCellPt = true ∧
+    rigidTyIsFreeze 16 cellU64Pt = false ∧
+    fnEntryRetagPerm mutability cellU64Pt = annealRetagPerm .fnEntry mutability false ∧
+    retagPerm rk mutability cellU64Pt = cellPerm ∧
+    (∃ s' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability phantomCellPt) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 phPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) := by
+  cases rk <;> cases mutability <;>
+    exact ⟨rfl, rfl, rfl, rfl, rfl,
+      ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩⟩
+
 /-! ## General 6-State `Miri.Interpreter.Step.step` + `TreeBorrowsRel` Lockstep -/
 
 /-- **`stateRelLM3_2Tree_treeBorrowsRel`**: every `StateRelLM3_2Tree` state

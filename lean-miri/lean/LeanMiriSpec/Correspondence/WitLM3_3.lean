@@ -1004,4 +1004,114 @@ theorem wit_lm3_3_protected_cell_chain_under_disabled_root_real_steps :
     rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩,
     rfl, by decide⟩
 
+/-! ## (n) Transparent wrapper ZST (`UnsafeCell<()>`), `PhantomData<UnsafeCell<u32>>` `Freeze`, `Cell<u32>` `!Freeze`, and uninhabited `&UnsafeCell<!>` -/
+
+/-- `core::cell::UnsafeCell<()>` (`!Freeze` and 0-byte ZST). -/
+def unsafeCellUnitT : Ty :=
+  { kind := .adt "core::cell::UnsafeCell" [.tuple []], layoutIdx := 0 }
+
+/-- `core::marker::PhantomData<core::cell::UnsafeCell<u32>>` (`Freeze` and 0-byte ZST). -/
+def phantomUnsafeCellU32T : Ty :=
+  { kind := .adt "core::marker::PhantomData" [.adt "core::cell::UnsafeCell" [.uint .u32]],
+    layoutIdx := 0 }
+
+/-- `core::cell::Cell<u32>` (`!Freeze` even though `u32` is `Freeze`). -/
+def cellU32T : Ty :=
+  { kind := .adt "core::cell::Cell" [.uint .u32], layoutIdx := 0 }
+
+/-- Witness body exercising `&mut UnsafeCell<()>` ZST retag (`ReservedIM`
+skipping 0-byte read), `&PhantomData<UnsafeCell<u32>>` (`Frozen`), and
+`&Cell<u32>` (`Cell` surviving foreign writes):
+```text
+bb0: _2 = &mut _1;               // tag 1: ReservedIM on _1 : UnsafeCell<()>
+     Retag([fn entry] _2);       // tag 2: protected ReservedFrz false, parent 1 (skips ZST read)
+     (*_2) = copy _1;            // child write activates tags 2 & 1 to Unique (tag 2 protected!)
+     _3 = &mut _1;               // tag 3: ReservedIM sibling on _1 : UnsafeCell<()>
+     Retag([default] _3);        // tag 4: ReservedIM child of 3 — skips ZST read so tag 2 survives!
+     _5 = &_4;                   // tag 5: Frozen on _4 : PhantomData<UnsafeCell<u32>> (Freeze!)
+     _7 = &_6;                   // tag 6: Cell on _6 : Cell<u32> (!Freeze!)
+     _6 = const 99_u32;          // foreign write to _6: tag 6 survives as Cell!
+     return
+``` -/
+def bodyN : CapturedMir :=
+  witBody "lm_3_3_witness::wrapper_zst_freeze_and_cell" 4
+    [declOf u32T,
+      declOf unsafeCellUnitT,
+      refMutDecl unsafeCellUnitT.kind,
+      refMutDecl unsafeCellUnitT.kind,
+      declOf phantomUnsafeCellU32T,
+      refDecl phantomUnsafeCellU32T.kind,
+      declOf cellU32T,
+      refDecl cellU32T.kind]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.retag .fnEntry (loc 2)),
+     stmt (.assign (deref 2) (.use (.copy (loc 1)))),
+     stmt (.assign (loc 3) (.ref (.mut false) (loc 1))),
+     stmt (.retag .default (loc 3)),
+     stmt (.assign (loc 5) (.ref .shared (loc 4))),
+     stmt (.assign (loc 7) (.ref .shared (loc 6))),
+     stmt (.assign (loc 6) (.use (cU32 99)))]
+
+/-- Initial state for `bodyN`. -/
+def initN : MachineState :=
+  witInit
+    [.uninit, .init .unit, .uninit, .uninit,
+     .init .unit, .uninit, .init (.scalar ⟨7, 4⟩), .uninit]
+
+/-- Uninhabited `&UnsafeCell<!>` retag body (`Retag([fn entry] _2)` on
+`_2 : &UnsafeCell<!>`). -/
+def bodyNUnsafeCellNever : CapturedMir :=
+  witBody "lm_3_3_witness::uninhabited_unsafecell_never_ref" 0
+    [declOf unitT,
+      declOf { kind := .adt "core::cell::UnsafeCell" [.never], layoutIdx := 0 },
+      refDecl (.adt "core::cell::UnsafeCell" [.never])]
+    [stmt (.retag .fnEntry (loc 2))]
+
+/-- **(n) `wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps`**:
+1. On `_1 : UnsafeCell<()>`, `_2 = &mut _1`, `Retag([fn entry] _2)`, and
+   `(*_2) = copy _1` activate protected `tag 2` (`protector = some 1`) and
+   `tag 1` to `Unique`; then `_3 = &mut _1` (`tag 3`, `ReservedIM`) and
+   `Retag([default] _3)` (`tag 4`, `ReservedIM`, `parentTag = some 3`) skip the
+   0-byte initial child read via `rigidTyIsZeroSized` on `UnsafeCell<()>`, so
+   protected `Unique` sibling `tag 2` survives without `ProtectedDisabled` UB;
+2. On `_4 : PhantomData<UnsafeCell<u32>>`, `_5 = &_4` allocates `tag 5` with
+   permission `.frozen` (`PhantomData<T>` is unconditionally `Freeze`);
+3. On `_6 : Cell<u32>`, `_7 = &_6` allocates `tag 6` with permission `.cell`
+   (`Cell<T>` is `!Freeze`), which survives the foreign write `_6 = 99_u32`;
+4. On `bodyNUnsafeCellNever` (`_2 : &UnsafeCell<!>`), `Retag([fn entry] _2)`
+   immediately faults with `.fail .ub` for both provenance pointers and
+   dangling scalars (`rigidTyIsUninhabited 16 = true`). -/
+theorem wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps :
+    (∃ s₁ s₂ s₃ s₄ s₅ s₆ s₇ s₈ : MachineState,
+      stepMirFn bodyN initN = .step s₁ ∧
+      stepMirFn bodyN s₁ = .step s₂ ∧
+      stepMirFn bodyN s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyN s₃ = .step s₄ ∧
+      stepMirFn bodyN s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 4 .reservedIM (some 3),
+         entry 3 .reservedIM,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      stepMirFn bodyN s₅ = .step s₆ ∧
+      stepMirFn bodyN s₆ = .step s₇ ∧
+      stepMirFn bodyN s₇ = .step s₈ ∧
+      s₈.memory.borrows =
+        [{ tag := 6, targetLocal := 6, targetProjection := .nil, perm := .cell,
+           protector := none, parentTag := none },
+         { tag := 5, targetLocal := 4, targetProjection := .nil, perm := .frozen,
+           protector := none, parentTag := none },
+         entry 4 .reservedIM (some 3),
+         entry 3 .reservedIM,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      TreeBorrowsRel s₈.memory.borrows s₈.memory.activeProtectors
+        (basedNormalTree s₈.memory.borrows s₈.memory.activeProtectors)) ∧
+    stepMirFn bodyNUnsafeCellNever (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyNUnsafeCellNever (initLUninhabited true) = .fail .ub := by
+  refine ⟨⟨_, _, _, _, _, _, _, _,
+    rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl, rfl⟩
+
 end LeanMiriSpec.Correspondence.WitnessLM3_3

@@ -3010,15 +3010,20 @@ Determine whether a monomorphized `RigidTy` is `Freeze` (contains no
 `UnsafeCell` interior mutability or raw pointer), using structural recursion
 with `fuel`.
 
-Returns `false` (`!Freeze`) for `.rawPtr`, for `core::cell::UnsafeCell` /
-`std::cell::UnsafeCell`, and for any `.adt`, `.tuple`, `.array`, or `.slice`
-whose type arguments or element types contain a `!Freeze` component; returns
-`true` (`Freeze`) otherwise.
+Returns `true` (`Freeze`) unconditionally for `core::marker::PhantomData` /
+`std::marker::PhantomData` (`unsafe impl<T: ?Sized> Freeze for PhantomData<T>`);
+returns `false` (`!Freeze`) for `.rawPtr`, for standard interior-mutable cells
+(`core::cell::UnsafeCell`, `std::cell::UnsafeCell`,
+`core::cell::SyncUnsafeCell`, `std::cell::SyncUnsafeCell`, `core::cell::Cell`,
+`std::cell::Cell`, `core::cell::RefCell`, `std::cell::RefCell`), and for any
+other `.adt`, `.tuple`, `.array`, or `.slice` whose type arguments or element
+types contain a `!Freeze` component; returns `true` (`Freeze`) otherwise.
 Modeling choice: Because `RigidTy.adt` carries generic `args` rather than full
-field declarations, `rigidTyIsFreeze` recurses structurally on `args` and also
-classifies `.rawPtr` as `!Freeze` so raw-pointer wrapper cells (such as `Cell`
-or custom interior-mutable wrappers) conservatively receive `.cell` (shared)
-or `.reservedIM` (mutable).
+field declarations, `rigidTyIsFreeze` explicitly recognizes `PhantomData` as
+`Freeze` and `UnsafeCell` / `SyncUnsafeCell` / `Cell` / `RefCell` as `!Freeze`,
+recurses structurally on `args` for other ADTs, and classifies `.rawPtr` as
+`!Freeze` so custom interior-mutable wrappers conservatively receive `.cell`
+(shared) or `.reservedIM` (mutable).
 
 Reference (The Rust Reference, "Interior mutability"):
 <https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
@@ -3042,17 +3047,36 @@ def rigidTyIsFreeze : Nat → RigidTy → Bool
   | .succ fuel, .adt defPath args =>
     match
       Bool.or
-        (stringEq defPath "core::cell::UnsafeCell")
-        (stringEq defPath "std::cell::UnsafeCell")
+        (stringEq defPath "core::marker::PhantomData")
+        (stringEq defPath "std::marker::PhantomData")
     with
-    | true => false
+    | true => true
     | false =>
-      match args with
-      | .nil => true
-      | arg :: restArgs =>
-        Bool.and
-          (rigidTyIsFreeze fuel arg)
-          (rigidTyIsFreeze fuel (.tuple restArgs))
+      match
+        Bool.or
+          (Bool.or
+            (stringEq defPath "core::cell::UnsafeCell")
+            (stringEq defPath "std::cell::UnsafeCell"))
+          (Bool.or
+            (Bool.or
+              (stringEq defPath "core::cell::SyncUnsafeCell")
+              (stringEq defPath "std::cell::SyncUnsafeCell"))
+            (Bool.or
+              (Bool.or
+                (stringEq defPath "core::cell::Cell")
+                (stringEq defPath "std::cell::Cell"))
+              (Bool.or
+                (stringEq defPath "core::cell::RefCell")
+                (stringEq defPath "std::cell::RefCell"))))
+      with
+      | true => false
+      | false =>
+        match args with
+        | .nil => true
+        | arg :: restArgs =>
+          Bool.and
+            (rigidTyIsFreeze fuel arg)
+            (rigidTyIsFreeze fuel (.tuple restArgs))
   | .succ fuel, .tuple fields =>
     match fields with
     | .nil => true
@@ -3103,19 +3127,23 @@ def placeIsFreeze
 Determine whether a structural `RigidTy` is statically known to have zero byte
 size (`!`, `()`, nested zero-sized tuples, zero-length arrays `[T; 0]`, arrays
 of zero-sized elements, `fn` item types, non-capturing or zero-sized-capturing
-closures, or `core::marker::PhantomData` / `std::marker::PhantomData`) in
-`Runtime(PostCleanup)` MIR on a 64-bit target (`rustc 1.98.0-nightly (14210df0e
-2026-05-31)`), using bounded recursion with `fuel`.
+closures, `core::marker::PhantomData` / `std::marker::PhantomData`, or standard
+single-field transparent/same-size wrappers `UnsafeCell<T>`,
+`SyncUnsafeCell<T>`, `Cell<T>`, `ManuallyDrop<T>`, and `MaybeUninit<T>` around a
+zero-sized `T`) in `Runtime(PostCleanup)` MIR on a 64-bit target (`rustc
+1.98.0-nightly (14210df0e 2026-05-31)`), using bounded recursion with `fuel`.
 
 Modeling choice vs. stable Rust Reference: For general user-defined
 `RigidTy.adt` types, byte size is stored in `LayoutTable` (`Ty.layoutIdx`)
 rather than on `RigidTy` itself, so `rigidTyIsZeroSized` recognizes
-`PhantomData<T>` directly and conservatively returns `false` on other
-`RigidTy.adt` constructors. During reference reborrows (`evalRvalue` `.ref`)
-and retagging (`evalFnEntryRetag`, `evalNonFnEntryRetag`, and `evalStmt`
-`.retag`), a zero-sized pointee covers an empty `[offset, offset + 0)` byte
-range, so Miri and MiniRust perform zero initial read accesses and accept
-non-null provenance-free dangling references without allocating a tag.
+`PhantomData<T>` and standard transparent/same-size wrappers (`UnsafeCell<T>`,
+`SyncUnsafeCell<T>`, `Cell<T>`, `ManuallyDrop<T>`, `MaybeUninit<T>`) directly
+and conservatively returns `false` on other `RigidTy.adt` constructors. During
+reference reborrows (`evalRvalue` `.ref`) and retagging (`evalFnEntryRetag`,
+`evalNonFnEntryRetag`, and `evalStmt` `.retag`), a zero-sized pointee covers an
+empty `[offset, offset + 0)` byte range, so Miri and MiniRust perform zero
+initial read accesses and accept non-null provenance-free dangling references
+without allocating a tag.
 
 Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
@@ -3157,10 +3185,38 @@ def rigidTyIsZeroSized : Nat → RigidTy → Bool
   | .succ _, .closure _ .nil => true
   | .succ fuel, .closure _ (u :: us) =>
     Bool.and (rigidTyIsZeroSized fuel u) (rigidTyIsZeroSized fuel (.tuple us))
-  | .succ _, .adt defPath _ =>
-    Bool.or
-      (stringEq defPath "core::marker::PhantomData")
-      (stringEq defPath "std::marker::PhantomData")
+  | .succ fuel, .adt defPath args =>
+    match
+      Bool.or
+        (stringEq defPath "core::marker::PhantomData")
+        (stringEq defPath "std::marker::PhantomData")
+    with
+    | true => true
+    | false =>
+      match
+        Bool.or
+          (Bool.or
+            (stringEq defPath "core::cell::UnsafeCell")
+            (stringEq defPath "std::cell::UnsafeCell"))
+          (Bool.or
+            (Bool.or
+              (stringEq defPath "core::cell::SyncUnsafeCell")
+              (stringEq defPath "std::cell::SyncUnsafeCell"))
+            (Bool.or
+              (Bool.or
+                (stringEq defPath "core::cell::Cell")
+                (stringEq defPath "std::cell::Cell"))
+              (Bool.or
+                (Bool.or
+                  (stringEq defPath "core::mem::ManuallyDrop")
+                  (stringEq defPath "std::mem::ManuallyDrop"))
+                (Bool.or
+                  (stringEq defPath "core::mem::MaybeUninit")
+                  (stringEq defPath "std::mem::MaybeUninit"))))),
+        args
+      with
+      | true, inner :: .nil => rigidTyIsZeroSized fuel inner
+      | _, _ => false
   | .succ _, k =>
     match rigidTyKindByteSize k with
     | .some .zero => true
@@ -3204,27 +3260,32 @@ def placeIsZeroSized
 /--
 Determine whether a structural `RigidTy` is statically known to be uninhabited
 (`!`, tuples containing an uninhabited element, non-empty arrays `[T; n + 1]`
-of an uninhabited element, closures capturing an uninhabited upvar, or
-`core::convert::Infallible` / `std::convert::Infallible`) in
-`Runtime(PostCleanup)` MIR (`rustc 1.98.0-nightly (14210df0e 2026-05-31)`),
-using bounded recursion with `fuel`.
+of an uninhabited element, closures capturing an uninhabited upvar,
+`core::convert::Infallible` / `std::convert::Infallible`, or `#[repr(transparent)]`
+single-field wrappers `UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`, and
+`ManuallyDrop<T>` around an uninhabited `T`) in `Runtime(PostCleanup)` MIR
+(`rustc 1.98.0-nightly (14210df0e 2026-05-31)`), using bounded recursion with
+`fuel`.
 
-Zero-length arrays `[T; 0]` and `core::marker::PhantomData<T>` /
-`std::marker::PhantomData<T>` are inhabited (`[]` and `PhantomData`) even when
-`T` is uninhabited (`[!; 0]`, `PhantomData<!>`).
+Zero-length arrays `[T; 0]`, `core::marker::PhantomData<T>` /
+`std::marker::PhantomData<T>`, and `core::mem::MaybeUninit<T>` /
+`std::mem::MaybeUninit<T>` are inhabited (`[]`, `PhantomData`, and
+`MaybeUninit::uninit()`) even when `T` is uninhabited (`[!; 0]`,
+`PhantomData<!>`, `MaybeUninit<!>`).
 
 Modeling choice vs. stable Rust Reference: For general user-defined
 `RigidTy.adt` types, uninhabitedness (`TypeLayout.isUninhabited` /
 `VariantsShape.empty`) is stored in `LayoutTable` (`Ty.layoutIdx`) rather than
 on `RigidTy` itself, so `rigidTyIsUninhabited` recognizes
-`core::convert::Infallible` / `std::convert::Infallible` directly and
-conservatively returns `false` on other `RigidTy.adt` constructors
+`core::convert::Infallible` / `std::convert::Infallible` and transparent
+wrappers (`UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`, `ManuallyDrop<T>`)
+directly and conservatively returns `false` on other `RigidTy.adt` constructors
 (`tyIsUninhabited` additionally consults `LayoutTable.lookup`). During MIR
 reference retagging (`evalFnEntryRetag`, `evalNonFnEntryRetag`, and `evalStmt`
 `.retag`), producing or retagging a reference `&T` or `&mut T` whose pointee
 `T` is uninhabited (`rigidTyIsUninhabited 16 pointee = true`) is immediate
 undefined behavior even when `T` has zero byte size (`&!`, `&[!; 1]`,
-`&(!, ())`).
+`&(!, ())`, `&UnsafeCell<!>`).
 
 Reference (The Rust Reference, "Never type", Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/reference/types/never.html>
@@ -3255,10 +3316,34 @@ def rigidTyIsUninhabited : Nat → RigidTy → Bool
     Bool.or
       (rigidTyIsUninhabited fuel u)
       (rigidTyIsUninhabited fuel (.closure defPath us))
-  | .succ _, .adt defPath _ =>
-    Bool.or
-      (stringEq defPath "core::convert::Infallible")
-      (stringEq defPath "std::convert::Infallible")
+  | .succ fuel, .adt defPath args =>
+    match
+      Bool.or
+        (stringEq defPath "core::convert::Infallible")
+        (stringEq defPath "std::convert::Infallible")
+    with
+    | true => true
+    | false =>
+      match
+        Bool.or
+          (Bool.or
+            (stringEq defPath "core::cell::UnsafeCell")
+            (stringEq defPath "std::cell::UnsafeCell"))
+          (Bool.or
+            (Bool.or
+              (stringEq defPath "core::cell::SyncUnsafeCell")
+              (stringEq defPath "std::cell::SyncUnsafeCell"))
+            (Bool.or
+              (Bool.or
+                (stringEq defPath "core::cell::Cell")
+                (stringEq defPath "std::cell::Cell"))
+              (Bool.or
+                (stringEq defPath "core::mem::ManuallyDrop")
+                (stringEq defPath "std::mem::ManuallyDrop")))),
+        args
+      with
+      | true, inner :: .nil => rigidTyIsUninhabited fuel inner
+      | _, _ => false
   | .succ _, _ => false
 
 /--
