@@ -322,9 +322,12 @@ pub fn normalize_miri_outcome_category(outcome: &MiriOutcome) -> &'static str {
 /// locations, allocation ids, addresses, offsets, or concrete values.
 ///
 /// Every hexadecimal literal (`0x2a`) becomes `0xN`, every maximal run of decimal
-/// digits (`alloc1234`, `src/lib.rs:52:17`, `size 16`) becomes `N`, and whitespace is
-/// collapsed. The non-numeric wording that identifies the UB / panic kind (for
-/// example `"constructing invalid value"` vs. `"memory access failed"`) is kept.
+/// digits (`alloc1234`, `src/lib.rs:52:17`, `size 16`) becomes `N` (except Rust
+/// primitive numeric type tokens `u8`/`u16`/`u32`/`u64`/`u128`, `i8`..`i128`,
+/// `f32`/`f64`, which keep their bit-width so type-width changes are not masked),
+/// and whitespace is collapsed. The non-numeric wording that identifies the UB /
+/// panic kind (for example `"constructing invalid value"` vs. `"memory access failed"`)
+/// is kept.
 pub fn normalize_diagnostic_message(raw: &str) -> String {
     let chars: Vec<char> = raw.trim().chars().collect();
     let mut out = String::with_capacity(chars.len());
@@ -344,9 +347,30 @@ pub fn normalize_diagnostic_message(raw: &str) -> String {
             continue;
         }
         if c.is_ascii_digit() {
-            out.push('N');
+            let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
                 i += 1;
+            }
+            let digit_str: String = chars[start..i].iter().collect();
+            let preceded_by_type_prefix = start >= 1
+                && matches!(chars[start - 1], 'u' | 'i' | 'f')
+                && (start == 1
+                    || !(chars[start - 2].is_ascii_alphanumeric() || chars[start - 2] == '_'));
+            let followed_by_ident =
+                i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_');
+            let is_primitive_width = if preceded_by_type_prefix && !followed_by_ident {
+                match chars[start - 1] {
+                    'u' | 'i' => matches!(digit_str.as_str(), "8" | "16" | "32" | "64" | "128"),
+                    'f' => matches!(digit_str.as_str(), "32" | "64"),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if is_primitive_width {
+                out.push_str(&digit_str);
+            } else {
+                out.push('N');
             }
             continue;
         }
@@ -663,8 +687,13 @@ pub fn extract_candidate_mutation_steps(
         }
     });
     if let Some(Item::Fn(func)) = base_parsed.items.last_mut() {
+        if func.sig.ident != cand.seed_name {
+            return None;
+        }
         func.sig.ident = format_ident!("{}", cand.fn_name);
         close_and_normalize_for_replay(func, &mut cand_rng);
+    } else {
+        return None;
     }
 
     let seed_already_faults =
@@ -1891,6 +1920,35 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
         format!("[\n{}\n  ]", items.join(",\n"))
     };
 
+    let item_outcomes_json = if report.item_reports.is_empty() {
+        "{}".to_string()
+    } else {
+        let rows: Vec<String> = report
+            .item_reports
+            .iter()
+            .map(|item_rep| {
+                let verdict_str = match &item_rep.verdict {
+                    ComparisonVerdict::Agree => "agree",
+                    ComparisonVerdict::Diverge(_) => "diverge",
+                    ComparisonVerdict::NotCompared(_) => "not_compared",
+                };
+                let lean_tag = item_rep
+                    .anneal
+                    .to_lean_mir_diff_tag()
+                    .unwrap_or_else(|| "none".to_string());
+                format!(
+                    "    {}: {{\"verdict\": {}, \"miri_outcome\": {}, \"anneal_outcome\": {}, \"anneal_lean_tag\": {}}}",
+                    json_escape(&item_rep.name),
+                    json_escape(verdict_str),
+                    json_escape(&item_rep.miri.summary_tag()),
+                    json_escape(&item_rep.anneal.summary_tag()),
+                    json_escape(&lean_tag),
+                )
+            })
+            .collect();
+        format!("{{\n{}\n  }}", rows.join(",\n"))
+    };
+
     format!(
         "{{\n\
          \x20 \"harness\": \"miri-difftest\",\n\
@@ -1914,6 +1972,7 @@ pub fn render_eval_report_json(report: &MiriCampaignEvalReport) -> String {
          \x20 \"not_compared_reasons\": {},\n\
          \x20 \"unmodeled_external_calls\": {},\n\
          \x20 \"mutator_applications\": {},\n\
+         \x20 \"item_outcomes\": {item_outcomes_json},\n\
          \x20 \"findings_count\": {},\n\
          \x20 \"findings\": {findings_json},\n\
          \x20 \"elapsed_ms\": {:.2}\n\
@@ -2237,7 +2296,12 @@ mod tests {
         bad_seed.seed_index = seed_refs.len() + 5;
         assert!(extract_candidate_mutation_steps(&bad_seed, &seed_refs).is_none());
 
-        for victim in [&tampered, &hand_built, &bad_seed] {
+        // 4. In-range seed index whose function name does not match `seed_name`: refuse.
+        let mut mismatched_seed_name = cand.clone();
+        mismatched_seed_name.seed_name = "nonexistent_seed_fn".to_string();
+        assert!(extract_candidate_mutation_steps(&mismatched_seed_name, &seed_refs).is_none());
+
+        for victim in [&tampered, &hand_built, &bad_seed, &mismatched_seed_name] {
             let res = minimize_miri_candidate_mutations_with_compile_check(
                 victim,
                 &seed_refs,
@@ -2326,6 +2390,27 @@ mod tests {
             "panicked at src/lib.rs:N:N: attempt to divide by zero"
         );
         assert_eq!(normalize_diagnostic_message("encountered 0xFF_FF"), "encountered 0xN");
+        assert_eq!(
+            normalize_diagnostic_message(
+                "transmuting between 4-byte type u32 and [u8; 4] at alloc128"
+            ),
+            "transmuting between N-byte type u32 and [u8; N] at allocN"
+        );
+        let width_u32 = missed_ub_report(
+            "f",
+            52,
+            "invalid value of type u32 at alloc10",
+            scalar.clone(),
+            true,
+        );
+        let width_u8 = missed_ub_report(
+            "f",
+            52,
+            "invalid value of type u8 at alloc10",
+            scalar.clone(),
+            true,
+        );
+        assert!(!discrepancy_signatures_match(&width_u32, &width_u8));
     }
 
     #[test]

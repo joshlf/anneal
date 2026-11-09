@@ -743,6 +743,142 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
                 {"legacy_token", "A:missed_ub:MirDiffTag.ub"},
             )
 
+    def test_quarantine_keys_unified_between_loader_and_ratchet_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # JSON `seeds` and `mutators` must be audited by `verify_no_stale_quarantine_or_known_bugs`
+            # just like `quarantined` and `fingerprints`.
+            j_file = Path(tmp) / "q_seeds.json"
+            j_file.write_text(
+                json.dumps(
+                    {
+                        "seeds": ["pass_integer_arith_basic"],
+                        "mutators": ["RawPtrOffsetMutator"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                campaign.load_quarantine_rules(j_file),
+                {"pass_integer_arith_basic", "RawPtrOffsetMutator"},
+            )
+            audit_unobs = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=j_file,
+                evaluated_fingerprints=[],
+                observed_quarantine_keys=set(),
+                covered_harnesses={"miri"},
+                reference_date="2026-11-09",
+            )
+            self.assertFalse(audit_unobs["passed"])
+            self.assertEqual(audit_unobs["checked_quarantine_count"], 2)
+
+            # TOML `entries` and `rules` must be loaded by `load_quarantine_rules` too.
+            t_file = Path(tmp) / "q_entries.toml"
+            t_file.write_text(
+                'entries = ["RawPtrOffsetMutator:missed_ub"]\n'
+                'rules = ["ArithmeticCastMutator:wrong_value"]\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                campaign.load_quarantine_rules(t_file),
+                {"RawPtrOffsetMutator:missed_ub", "ArithmeticCastMutator:wrong_value"},
+            )
+
+            # Unrecognized quarantine dictionary keys fail closed.
+            bad_file = Path(tmp) / "q_typo.json"
+            bad_file.write_text(
+                json.dumps({"quarantned": ["RawPtrOffsetMutator:missed_ub"]}),
+                encoding="utf-8",
+            )
+            audit_bad = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=bad_file,
+                reference_date="2026-11-09",
+            )
+            self.assertFalse(audit_bad["passed"])
+            self.assertTrue(
+                any("unrecognized quarantine keys" in e["reason"] for e in audit_bad["stale_entries"])
+            )
+
+    def test_identity_run_wires_manifest_eval_results_into_stale_ratchet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            m_file = Path(tmp) / "manifest.toml"
+            m_file.write_text(
+                '[[tests]]\n'
+                'name = "pass_direct_fn_call"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "externalCall:miri_diff_corpus::helper_add_ten"\n'
+                'summary = "unlinked intra-crate callee"\n',
+                encoding="utf-8",
+            )
+            summary = _make_valid_miri_summary()
+            summary["mode"] = "identity"
+            summary["item_outcomes"] = {
+                "pass_direct_fn_call": {
+                    "verdict": "not_compared",
+                    "miri_outcome": "pass:scalar:42:4",
+                    "anneal_outcome": "externalCall:miri_diff_corpus::helper_add_ten",
+                    "anneal_lean_tag": '(MirDiffTag.externalCall "miri_diff_corpus::helper_add_ten")',
+                }
+            }
+            extracted = campaign.extract_manifest_eval_results_from_miri_summary(summary, m_file)
+            audit_ok = campaign.verify_no_stale_quarantine_or_known_bugs(
+                manifest_path=m_file,
+                manifest_eval_results=extracted,
+                reference_date="2026-11-09",
+            )
+            self.assertTrue(audit_ok["passed"], audit_ok)
+
+            # Now suppose the bug was fixed and `pass_direct_fn_call` agrees in identity mode.
+            summary["item_outcomes"] = {
+                "pass_direct_fn_call": {
+                    "verdict": "agree",
+                    "miri_outcome": "pass:scalar:42:4",
+                    "anneal_outcome": "pass:scalar:42:4",
+                    "anneal_lean_tag": "(MirDiffTag.normalScalar 42 4)",
+                }
+            }
+            state_dir = Path(tmp) / "state"
+            with (
+                mock.patch.object(campaign, "run_harness", return_value=summary),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                rc = campaign.main(
+                    [
+                        "--profile",
+                        "smoke",
+                        "--miri-only",
+                        "--miri-identity",
+                        "--check-stale-ratchet",
+                        "--manifest-path",
+                        str(m_file),
+                        "--state-dir",
+                        str(state_dir),
+                    ]
+                )
+            self.assertEqual(rc, campaign.EXIT_HARNESS_FAILED)
+            report = json.loads(
+                (state_dir / "reports" / "LATEST_CAMPAIGN_SUMMARY.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(report["stale_ratchet_audit"]["passed"])
+            self.assertTrue(
+                any(
+                    "stale_known_anneal_bug_now_passes" in e["reason"]
+                    for e in report["stale_ratchet_audit"]["stale_known_anneal_bugs"]
+                )
+            )
+
+    def test_external_call_and_out_of_fuel_error_masking_rejected(self) -> None:
+        summary = _make_valid_miri_summary()
+        summary["not_compared_reasons"]["external_call"] = 1  # type: ignore[index]
+        summary["anneal_outcomes"]["external_call"] = 0  # type: ignore[index]
+        ok, reasons = campaign.validate_error_vs_unsupported_boundary(summary)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("not_compared_reasons.external_call" in r for r in reasons),
+            reasons,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

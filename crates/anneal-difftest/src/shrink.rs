@@ -648,6 +648,17 @@ mod tests {
             if out.minimized_steps.len() < n {
                 minimized_strictly += 1;
             }
+            if out.minimized_steps.len() <= 2 {
+                // Mirror `ddminLoop_one_eq_some_of_isOneMinimal`: on any 1-minimal chain
+                // of length <= 2 (where the initial chunk size is `len.div_ceil(2) == 1`),
+                // re-running `shrink_mutation_chain_detailed` is strictly idempotent.
+                let rerun = shrink_mutation_chain_detailed(&out.minimized_steps, &truth);
+                assert!(rerun.succeeded && rerun.is_one_minimal, "trial {trial}: rerun");
+                assert_eq!(
+                    rerun.minimized_steps, out.minimized_steps,
+                    "trial {trial}: 1-minimal chain of len <= 2 must be a fixed point"
+                );
+            }
         }
         assert!(minimized_strictly > 500, "only {minimized_strictly} trials shrank");
     }

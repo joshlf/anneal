@@ -306,6 +306,81 @@ theorem shrinkChain_one_minimal (fuel : Nat) (pred : List α → Bool) (xs : Lis
     IsOneMinimal pred (shrinkChain fuel pred xs) :=
   shrinkMutatorChain_one_minimal fuel pred xs h_pred h_fuel
 
+/-- `dropOneStep pred xs` leaves `xs` unchanged iff every single-deletion candidate
+falsifies `pred`. -/
+theorem dropOneStep_eq_self_iff (pred : List α → Bool) (xs : List α) :
+    dropOneStep pred xs = xs ↔ ∀ ys ∈ dropOneCandidates xs, pred ys = false := by
+  unfold dropOneStep
+  cases h_find : (dropOneCandidates xs).find? pred with
+  | none =>
+    simp only [true_iff]
+    intro ys h_mem
+    have h_not := List.find?_eq_none.mp h_find ys h_mem
+    cases h_b : pred ys with
+    | false => rfl
+    | true => exact False.elim (h_not h_b)
+  | some ys =>
+    have h_mem : ys ∈ dropOneCandidates xs := List.mem_of_find?_eq_some h_find
+    have h_pred : pred ys = true := List.find?_some h_find
+    have h_len : ys.length + 1 = xs.length := mem_dropOneCandidates_length h_mem
+    constructor
+    · intro h_eq
+      have h_eq' : ys = xs := h_eq
+      rw [h_eq'] at h_len
+      omega
+    · intro h_all
+      have h_false := h_all ys h_mem
+      rw [h_pred] at h_false
+      contradiction
+
+/-- Fixed-point characterization of 1-minimality: `xs` is 1-minimal under `pred`
+iff `pred xs = true` and `dropOneStep pred xs = xs`. -/
+theorem isOneMinimal_iff_dropOneStep_fixed (pred : List α → Bool) (xs : List α) :
+    IsOneMinimal pred xs ↔ pred xs = true ∧ dropOneStep pred xs = xs := by
+  unfold IsOneMinimal
+  rw [dropOneStep_eq_self_iff]
+
+/-- With `xs.length ≤ fuel`, `shrinkMutatorChain` only terminates at a chain where
+`shrinkStepCandidates` contains no candidate satisfying `pred` (both half-chunk and
+single-deletion candidates are exhausted). -/
+theorem shrinkMutatorChain_find?_eq_none (fuel : Nat) (pred : List α → Bool) (xs : List α)
+    (h_fuel : xs.length ≤ fuel) :
+    (shrinkStepCandidates (shrinkMutatorChain fuel pred xs)).find? pred = none := by
+  induction fuel generalizing xs with
+  | zero =>
+    have h_nil : xs = [] := List.eq_nil_of_length_eq_zero (by omega)
+    subst h_nil
+    simp [shrinkMutatorChain, shrinkStepCandidates]
+  | succ n ih =>
+    unfold shrinkMutatorChain
+    cases h_find : (shrinkStepCandidates xs).find? pred with
+    | none => exact h_find
+    | some ys =>
+      have h_mem : ys ∈ shrinkStepCandidates xs := List.mem_of_find?_eq_some h_find
+      have h_lt : ys.length < xs.length := mem_shrinkStepCandidates_length_lt h_mem
+      exact ih ys (by omega)
+
+/-- Any chain where `shrinkStepCandidates` has no match is a fixed point of
+`shrinkMutatorChain` for every `fuel`. -/
+theorem shrinkMutatorChain_eq_self_of_find?_eq_none (fuel : Nat) (pred : List α → Bool)
+    (xs : List α) (h_none : (shrinkStepCandidates xs).find? pred = none) :
+    shrinkMutatorChain fuel pred xs = xs := by
+  cases fuel with
+  | zero => rfl
+  | succ n =>
+    unfold shrinkMutatorChain
+    rw [h_none]
+
+/-- Idempotence of `shrinkMutatorChain`: re-running `shrinkMutatorChain` with any fuel
+`fuel₂` on an already-minimized chain returns that chain unchanged. -/
+theorem shrinkMutatorChain_idempotent (fuel₁ fuel₂ : Nat) (pred : List α → Bool) (xs : List α)
+    (h_fuel : xs.length ≤ fuel₁) :
+    shrinkMutatorChain fuel₂ pred (shrinkMutatorChain fuel₁ pred xs) =
+      shrinkMutatorChain fuel₁ pred xs :=
+  shrinkMutatorChain_eq_self_of_find?_eq_none fuel₂ pred
+    (shrinkMutatorChain fuel₁ pred xs)
+    (shrinkMutatorChain_find?_eq_none fuel₁ pred xs h_fuel)
+
 /-- Tag-specialized predicate checking whether `eval ys` reproduces `some tag`. -/
 def evalMatchesTag [DecidableEq τ] (eval : List α → Option τ) (tag : τ) (ys : List α) : Bool :=
   decide (eval ys = some tag)
@@ -512,6 +587,57 @@ theorem windowDelete_one_eq (xs : List α) {i : Nat} (hi : i < xs.length) :
     windowDelete xs i 1 = xs.take i ++ xs.drop (i + 1) := by
   unfold windowDelete
   rw [Nat.min_eq_left (by omega)]
+
+theorem take_append_drop_succ_mem_dropOneCandidates (xs : List α) {i : Nat} (hi : i < xs.length) :
+    xs.take i ++ xs.drop (i + 1) ∈ dropOneCandidates xs := by
+  induction xs generalizing i with
+  | nil => simp at hi
+  | cons x rest ih =>
+    cases i with
+    | zero => simp [dropOneCandidates]
+    | succ j =>
+      simp only [List.length_cons] at hi
+      have hj : j < rest.length := by omega
+      simp only [dropOneCandidates, List.take_succ_cons, List.drop_succ_cons, List.cons_append,
+        List.mem_cons, List.mem_map]
+      exact Or.inr ⟨rest.take j ++ rest.drop (j + 1), ih hj, rfl⟩
+
+/-- On any 1-minimal chain `best`, a `chunk = 1` sweep rejects every single-element
+deletion and returns `some (best, false)`. -/
+theorem ddminSweep_one_of_isOneMinimal (pred : List α → Bool) (best : List α)
+    (h_min : IsOneMinimal pred best) :
+    ∀ (fuel : Nat) (pos : Nat),
+      best.length - pos < fuel →
+      ddminSweep pred 1 fuel best pos false = some (best, false) := by
+  intro fuel
+  induction fuel with
+  | zero => intro pos hfuel; omega
+  | succ n ih =>
+    intro pos hfuel
+    unfold ddminSweep
+    split
+    · rename_i hpos
+      split
+      · rfl
+      · have h_mem : windowDelete best pos 1 ∈ dropOneCandidates best := by
+          rw [windowDelete_one_eq best hpos]
+          exact take_append_drop_succ_mem_dropOneCandidates best hpos
+        have h_false : pred (windowDelete best pos 1) = false := h_min.2 _ h_mem
+        rw [h_false]
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        exact ih (pos + 1) (by omega)
+    · rfl
+
+/-- When `ddminLoop` reaches `chunk = 1` on a 1-minimal chain `best`, it terminates in
+one sweep and returns `some best` unchanged. -/
+theorem ddminLoop_one_eq_some_of_isOneMinimal (pred : List α → Bool) (fuel : Nat)
+    (best : List α) (h_min : IsOneMinimal pred best) :
+    ddminLoop pred (fuel + 1) best 1 = some best := by
+  unfold ddminLoop
+  have hsweep : ddminSweep pred 1 (2 * best.length + 1) best 0 false = some (best, false) :=
+    ddminSweep_one_of_isOneMinimal pred best h_min (2 * best.length + 1) 0 (by omega)
+  rw [hsweep]
+  simp
 
 theorem ddminLoop_spec (pred : List α → Bool) (h_nil : pred [] = false) :
     ∀ (fuel : Nat) (best : List α) (chunk : Nat) (r : List α),
@@ -1196,10 +1322,13 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms shrinkMutatorChain_sublist
 #print axioms shrinkMutatorChain_len_le
 #print axioms shrinkMutatorChain_one_minimal
+#print axioms isOneMinimal_iff_dropOneStep_fixed
+#print axioms shrinkMutatorChain_idempotent
 #print axioms shrinkDiscrepancyWitness_one_minimal
 #print axioms shrinkMutatorChain_eval_tag_sound
 #print axioms ddminReference_one_minimal
 #print axioms ddminReference_total
+#print axioms ddminLoop_one_eq_some_of_isOneMinimal
 #print axioms ddminReference_coupled_pair_witness
 #print axioms bvShlOverflowing_shift_bound
 #print axioms bvShlOverflowing_shift_lt_two_pow_32

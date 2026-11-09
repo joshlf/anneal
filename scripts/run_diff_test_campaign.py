@@ -861,8 +861,11 @@ def evaluate_miri_red_flags(
 
 ERROR_MASKED_AS_UNSUPPORTED_MARKERS: tuple[str, ...] = (
     "internal panic",
+    "internal compiler error",
+    "thread 'rustc' panicked",
     "sigabrt",
     "sigsegv",
+    "segmentation fault",
     "capture_failed",
     "capture_error",
     "miri_oracle_error",
@@ -873,6 +876,15 @@ ERROR_MASKED_AS_UNSUPPORTED_MARKERS: tuple[str, ...] = (
     "nat.shiftl exponent is too big",
     "lean crashed",
     "rustc crashed",
+)
+
+QUARANTINE_LIST_KEYS: tuple[str, ...] = (
+    "quarantined",
+    "entries",
+    "rules",
+    "fingerprints",
+    "seeds",
+    "mutators",
 )
 
 # Fields of a finding / item / diagnostic record that state its own classification.
@@ -950,9 +962,13 @@ def validate_error_vs_unsupported_boundary(
     miri_err = _int_field(miri_verdicts, "error")
     anneal_err = _int_field(anneal_outcomes, "error")
     anneal_unsupported = _int_field(anneal_outcomes, "unsupported")
+    anneal_ext = _int_field(anneal_outcomes, "external_call")
+    anneal_oof = _int_field(anneal_outcomes, "out_of_fuel")
     nc_miri_err = _int_field(nc_reasons, "miri_oracle_error")
     nc_cap_err = _int_field(nc_reasons, "capture_failed")
     nc_unsupported = _int_field(nc_reasons, "unsupported")
+    nc_ext = _int_field(nc_reasons, "external_call")
+    nc_oof = _int_field(nc_reasons, "out_of_fuel")
 
     # 1. Oracle-error budget over distinct errored items.
     errored_items = max(nc_miri_err + nc_cap_err, miri_err, anneal_err)
@@ -997,6 +1013,16 @@ def validate_error_vs_unsupported_boundary(
             reasons.append(
                 f"error_masked_as_unsupported: not_compared_reasons.unsupported ({nc_unsupported}) > "
                 f"anneal_outcomes.unsupported ({anneal_unsupported})"
+            )
+        if nc_ext > anneal_ext:
+            reasons.append(
+                f"error_masked_as_unsupported: not_compared_reasons.external_call ({nc_ext}) > "
+                f"anneal_outcomes.external_call ({anneal_ext})"
+            )
+        if nc_oof > anneal_oof:
+            reasons.append(
+                f"error_masked_as_unsupported: not_compared_reasons.out_of_fuel ({nc_oof}) > "
+                f"anneal_outcomes.out_of_fuel ({anneal_oof})"
             )
 
     # 3. Records classified as `unsupported` that carry crash / malformed markers.
@@ -1158,10 +1184,40 @@ def verify_no_stale_quarantine_or_known_bugs(
             if isinstance(q_data, list):
                 raw_entries.extend(q_data)
             elif isinstance(q_data, dict):
-                for key in ("quarantined", "entries", "rules", "fingerprints"):
+                recognized_key = "tests" in q_data
+                for key in QUARANTINE_LIST_KEYS:
+                    if key in q_data:
+                        recognized_key = True
                     val = q_data.get(key)
                     if isinstance(val, list):
                         raw_entries.extend(val)
+                    elif val is not None:
+                        stale_quarantine.append(
+                            {
+                                "source": str(quarantine_file),
+                                "entry": key,
+                                "reason": f"malformed_quarantine_file: key {key!r} must be a list",
+                            }
+                        )
+                if q_data and not recognized_key:
+                    stale_quarantine.append(
+                        {
+                            "source": str(quarantine_file),
+                            "entry": "<keys>",
+                            "reason": (
+                                f"malformed_quarantine_file: unrecognized quarantine keys "
+                                f"{sorted(q_data.keys())!r}"
+                            ),
+                        }
+                    )
+            elif q_data is not None:
+                stale_quarantine.append(
+                    {
+                        "source": str(quarantine_file),
+                        "entry": "<root>",
+                        "reason": "malformed_quarantine_file: expected list or table",
+                    }
+                )
 
             for idx, entry in enumerate(raw_entries):
                 checked_quarantine_count += 1
@@ -1332,10 +1388,18 @@ def verify_no_stale_quarantine_or_known_bugs(
                                     )
                         elif isinstance(ev, dict):
                             verdict = str(ev.get("verdict", "")).strip().lower()
-                            actual_tag = ev.get(
+                            candidate_tags: list[str] = []
+                            for tag_key in (
                                 "observed_anneal_tag",
-                                ev.get("anneal_outcome", ev.get("anneal_lean_tag")),
-                            )
+                                "anneal_outcome",
+                                "anneal_lean_tag",
+                            ):
+                                raw_t = ev.get(tag_key)
+                                if isinstance(raw_t, str) and raw_t.strip():
+                                    candidate_tags.append(raw_t.strip())
+                                    if "@" in raw_t and isinstance(obs_tag, str) and "@" not in obs_tag:
+                                        candidate_tags.append(raw_t.split("@", 1)[0].strip())
+                            primary_actual = candidate_tags[0] if candidate_tags else None
                             if verdict == "agree":
                                 stale_manifest.append(
                                     {
@@ -1347,9 +1411,11 @@ def verify_no_stale_quarantine_or_known_bugs(
                             elif (
                                 isinstance(obs_tag, str)
                                 and obs_tag.strip()
-                                and isinstance(actual_tag, str)
-                                and actual_tag.strip()
-                                and normalize_anneal_tag(actual_tag) != normalize_anneal_tag(obs_tag)
+                                and candidate_tags
+                                and not any(
+                                    normalize_anneal_tag(t) == normalize_anneal_tag(obs_tag)
+                                    for t in candidate_tags
+                                )
                             ):
                                 stale_manifest.append(
                                     {
@@ -1357,7 +1423,7 @@ def verify_no_stale_quarantine_or_known_bugs(
                                         "entry": test_name,
                                         "reason": (
                                             f"stale_known_anneal_bug_tag_mismatch: expected {obs_tag!r}, "
-                                            f"got {actual_tag!r}"
+                                            f"got {primary_actual!r}"
                                         ),
                                     }
                                 )
@@ -1372,6 +1438,65 @@ def verify_no_stale_quarantine_or_known_bugs(
         "stale_known_anneal_bugs": stale_manifest,
         "stale_entries": stale_entries,
     }
+
+
+def extract_manifest_eval_results_from_miri_summary(
+    miri: dict[str, Any],
+    manifest_path: Path | None = None,
+) -> dict[str, Any] | None:
+    """Extracts per-item evaluation verdicts and tags from a `miri-difftest` summary so
+    `verify_no_stale_quarantine_or_known_bugs` can audit `manifest.toml` `known_anneal_bug`
+    entries on `--miri-identity --check-stale-ratchet` runs."""
+    results: dict[str, Any] = {}
+    is_identity = miri.get("mode") == "identity"
+
+    item_outcomes = miri.get("item_outcomes")
+    if isinstance(item_outcomes, dict):
+        for fn_name, entry in item_outcomes.items():
+            if not isinstance(fn_name, str) or not isinstance(entry, dict):
+                continue
+            results[fn_name] = dict(entry)
+            if is_identity and "__b" in fn_name:
+                seed_key = fn_name.split("__b", 1)[0]
+                results.setdefault(seed_key, dict(entry))
+
+    if is_identity:
+        findings = miri.get("findings")
+        if isinstance(findings, list):
+            for f in findings:
+                if not isinstance(f, dict):
+                    continue
+                rec = {
+                    "verdict": "diverge",
+                    "divergence_class": str(f.get("divergence_class", "")),
+                    "anneal_outcome": str(f.get("anneal_outcome", "")),
+                    "anneal_lean_tag": str(f.get("anneal_lean_tag", "")),
+                }
+                for k in ("seed_name", "fn_name"):
+                    name_val = f.get(k)
+                    if isinstance(name_val, str) and name_val.strip():
+                        results[name_val.strip()] = rec
+
+        if (
+            not isinstance(item_outcomes, dict)
+            and _int_field(miri, "not_compared_count") == 0
+            and _int_field(miri, "compile_failed_candidates") == 0
+            and _int_field(miri, "compared_candidates") > 0
+            and manifest_path is not None
+            and manifest_path.is_file()
+        ):
+            try:
+                m_data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(m_data, dict):
+                    for t_entry in m_data.get("tests", []):
+                        if isinstance(t_entry, dict) and isinstance(t_entry.get("name"), str):
+                            t_name = t_entry["name"].strip()
+                            if t_name and t_name not in results:
+                                results[t_name] = {"verdict": "agree"}
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                pass
+
+    return results if results else None
 
 
 def _parse_src_pos(raw: str) -> tuple[str, int, int] | None:
@@ -1997,13 +2122,16 @@ def load_quarantine_rules(quarantine_file: Path | None) -> set[str]:
             data = tomllib.loads(text)
         except tomllib.TOMLDecodeError as e:
             raise ValueError(f"invalid TOML in {quarantine_file}: {e}") from e
-        for item in data.get("quarantined", []):
-            if isinstance(item, str):
-                rules.add(item)
-            elif isinstance(item, dict):
-                token = _quarantine_table_token(item, today)
-                if token is not None:
-                    rules.add(token)
+        for k in QUARANTINE_LIST_KEYS:
+            vals = data.get(k, [])
+            if isinstance(vals, list):
+                for item in vals:
+                    if isinstance(item, str) and item.strip():
+                        rules.add(item.strip())
+                    elif isinstance(item, dict):
+                        token = _quarantine_table_token(item, today)
+                        if token is not None:
+                            rules.add(token)
         for entry in data.get("tests", []):
             if isinstance(entry, dict) and "known_anneal_bug" in entry:
                 name = entry.get("name")
@@ -2019,15 +2147,19 @@ def load_quarantine_rules(quarantine_file: Path | None) -> set[str]:
             raise ValueError(f"invalid JSON in {quarantine_file}: {e}") from e
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, str):
-                    rules.add(item)
+                if isinstance(item, str) and item.strip():
+                    rules.add(item.strip())
+                elif isinstance(item, dict):
+                    token = _quarantine_table_token(item, today)
+                    if token is not None:
+                        rules.add(token)
         elif isinstance(data, dict):
-            for k in ("quarantined", "fingerprints", "seeds", "mutators"):
+            for k in QUARANTINE_LIST_KEYS:
                 vals = data.get(k, [])
                 if isinstance(vals, list):
                     for item in vals:
-                        if isinstance(item, str):
-                            rules.add(item)
+                        if isinstance(item, str) and item.strip():
+                            rules.add(item.strip())
                         elif isinstance(item, dict):
                             token = _quarantine_table_token(item, today)
                             if token is not None:
@@ -3370,6 +3502,9 @@ def main(argv: list[str] | None = None) -> int:
                 manifest_path=eff_manifest_path,
                 ledger=ledger,
                 evaluated_fingerprints=[d.fingerprint for d in all_dedup],
+                manifest_eval_results=extract_manifest_eval_results_from_miri_summary(
+                    miri, eff_manifest_path
+                ),
                 observed_quarantine_keys=observed_quarantine_keys,
                 covered_harnesses=covered_harnesses,
             )
