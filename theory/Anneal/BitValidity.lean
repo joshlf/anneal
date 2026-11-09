@@ -2739,7 +2739,27 @@ theorem adt_primitive_nonZero_not_isFromZeros
     pk ⟨1, scalarModulus l.size.bytes - 1⟩ hLookup hInhab hVar hFields hRepr hNz hWidth
     (wrappingRangeContains_nonZeroRange_zero hPos)
 
-/-! ### 6.4 Single-Field Scalar-Wrapper Newtype ADTs (`FieldsShape.arbitrary [⟨0⟩]`) & Multi-Variant Fieldless Enums (`VariantsShape.multiple`) -/
+/-! ### 6.4 Single-Field Scalar-Wrapper Newtype ADTs (`FieldsShape.arbitrary [⟨0⟩]`) & Multi-Variant Fieldless Enums (`VariantsShape.multiple`)
+
+Which decoding path applies. For a single-variant `.adt defPath args` with
+`FieldsShape.arbitrary offsets`, `decodeValueFromBytes` first decodes the fields
+at the type arguments `args` when `args` has the same length as `offsets`, then
+at the recorded per-field layouts `l.fieldLayouts` when those have the same
+length, and only otherwise falls back to the backend scalar representation
+`l.backendRepr`. Only that last path enforces a scalar niche recorded in
+`l.backendRepr`. The `adt_newtype_*` theorems below assume it (`args = []` and
+`l.fieldLayouts = []`). A monomorphized generic wrapper such as `NonZero<u32>`
+(`args = [u32]`) takes the type-argument path, where the niche is **not**
+enforced (`adt_generic_nonZero_typeArg_path_niche_unenforced`). The
+field-layout path does not read the wrapper's `l.backendRepr` either: it decodes
+each field at its own recorded layout.
+
+The `.multiple` decoder uses the tag value itself as the variant index
+(`get? variantShapes tag`), and the encoder writes the variant index as the tag.
+This matches `rustc` only for direct tags whose discriminants are the variant
+indices `0..n-1`; explicit discriminants diverge
+(`adt_multiple_enum_explicit_discriminant_divergence`).
+-/
 
 @[simp]
 theorem sliceAbstractBytes_zero_full
@@ -2760,9 +2780,12 @@ theorem sliceAbstractBytes_zero_full
 /--
 Unfolding lemma for `decodeValueFromBytes` on an inhabited single-variant
 single-field scalar-wrapper newtype `.adt defPath []` (`l.fields = .arbitrary [⟨0⟩] memoryOrder`,
-`l.fieldLayouts = []`, `l.backendRepr = .scalar sl`, `scalarLayoutByteWidth sl = some l.size.bytes`),
-matching the layout emitted by `rustc` for `#[repr(transparent)]` scalar-niche wrappers
-such as `core::num::NonZero*`.
+`l.fieldLayouts = []`, `l.backendRepr = .scalar sl`, `scalarLayoutByteWidth sl = some l.size.bytes`):
+with no type arguments and no recorded field layouts, decoding reaches the
+backend scalar path and enforces `sl`. This is the shape of a scalar-niche
+wrapper such as `core::num::NonZero*` when its layout entry records no per-field
+layouts; see the section note for the type-argument path, which does not
+enforce the niche.
 -/
 theorem decodeValueFromBytes_adt_newtype_scalarLayout
     (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
@@ -3107,8 +3130,9 @@ theorem adt_newtype_scalarLayout_isTryFromBytes
         exact ⟨sv, hV.symm, hSvSz, hSvLt, hRange⟩
 
 /--
-Concrete `IsTryFromBytes` theorem for real `rustc` `NonZero*` single-field newtype layouts
-(`FieldsShape.arbitrary [⟨0⟩] memoryOrder`, `validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`):
+Concrete `IsTryFromBytes` theorem for `NonZero*`-style single-field newtype layouts
+(`FieldsShape.arbitrary [⟨0⟩] memoryOrder`, `validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`)
+decoded on the backend scalar path (`.adt defPath []`, `l.fieldLayouts = []`):
 every decoded value is `.aggregate variantIdx [.scalar sv]` with `0 < sv.bits < scalarModulus l.size.bytes`.
 -/
 theorem adt_newtype_nonZero_isTryFromBytes
@@ -3174,7 +3198,10 @@ theorem adt_newtype_nonZero_not_isFromZeros
 Unfolding lemma for `decodeValueFromBytes` on an inhabited multi-variant enum
 `.adt defPath args` (`l.variants = .multiple tagLayout 0 variantShapes`,
 `l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout = some l.size.bytes`),
-matching the layout emitted by `rustc` for multi-variant `#[repr(u8)]` / `#[repr(Int)]` enums.
+the layout shape of a fieldless multi-variant `#[repr(u8)]` / `#[repr(Int)]` enum
+whose tag fills the whole value. The decoded tag value is used directly as the
+variant index, which matches `rustc` only when the discriminants are the variant
+indices (`adt_multiple_enum_explicit_discriminant_divergence`).
 -/
 theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
     (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
@@ -3479,5 +3506,107 @@ theorem adt_multiple_enum_fieldless_isIntoBytes
           | cons _ _ => nomatch hEnc
       | _ => nomatch hEnc
   | _ => nomatch hEnc
+
+/--
+**Divergence (generic `NonZero<T>` niche on the type-argument decoding path).**
+For a single-variant `.adt defPath args` whose `FieldsShape.arbitrary` offsets
+have the same length as `args`, `decodeValueFromBytes` decodes each field at the
+corresponding *type argument* and never reads `l.backendRepr`. Take a
+`NonZero<u32>`-shaped layout: one field at offset `0`, `4` bytes, and backend
+representation `ScalarLayout.initialized (.int 32 false) ⟨1, 2^32 - 1⟩`. Carried
+by the monomorphized type `.adt defPath [.uint .u32]`, it accepts the all-zero
+candidate even though the recorded niche excludes `0`. So `Trusted` does not
+enforce the `NonZero*` niche on this path, and the type satisfies `IsFromZeros`,
+whereas in Rust all-zero bytes are not a valid `NonZero<u32>`. The
+niche-enforcing `.primitive` and `adt_newtype_*` theorems apply only when
+decoding reaches the backend scalar path.
+-/
+theorem adt_generic_nonZero_typeArg_path_niche_unenforced
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx : Nat) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz : l.size.bytes = 4)
+    (_hRepr : l.backendRepr = .scalar (.initialized (.int 32 false) ⟨1, scalarModulus 4 - 1⟩)) :
+    wrappingRangeContains ⟨1, scalarModulus 4 - 1⟩ 0 = false ∧
+    decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .adt defPath [.uint .u32], layoutIdx := idx } (zeroInitBytes 4) =
+      some (.aggregate variantIdx [.scalar ⟨0, 4⟩]) ∧
+    IsFromZeros layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } := by
+  have hDec : decodeValueFromBytes defaultCodecFuel layouts
+      { kind := .adt defPath [.uint .u32], layoutIdx := idx } (zeroInitBytes 4) =
+      some (.aggregate variantIdx [.scalar ⟨0, 4⟩]) := by
+    rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts⟩
+    dsimp only at hInhab hVar hFields hSz
+    subst hInhab hVar hFields hSz
+    rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only
+    rw [hLookup]
+    rfl
+  have hSize : rigidTyByteSize layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } =
+      some 4 := by
+    simp [rigidTyByteSize, hLookup, hSz]
+  exact ⟨rfl, hDec, ⟨4, _, hSize, hDec⟩⟩
+
+/--
+**Divergence (explicit enum discriminants).** The `.multiple` codec identifies
+the tag value with the variant index: `decodeValueFromBytes` looks up
+`get? variantShapes tag`, and `encodeValueToBytes` writes the variant index as
+the tag. For a fieldless `#[repr(u8)] enum E { A = 1, B = 2 }`-shaped layout
+(`validRange = ⟨1, 2⟩`, two fieldless variants):
+1. the valid discriminant `2` is inside `validRange` but is rejected;
+2. the discriminant `1` (which is `E::A` in Rust) decodes to variant index `1`
+   (`E::B`);
+3. encoding `E::A` (`.aggregate 0 []`) writes the byte `0`, which lies outside
+   `validRange`, and the same layout rejects it when decoding.
+Theorems over `.multiple` enum layouts are therefore faithful to `rustc` only
+when the discriminants are the variant indices `0..n-1`.
+-/
+theorem adt_multiple_enum_explicit_discriminant_divergence
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (memoryOrder vm0 vm1 : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants =
+      .multiple (.initialized (.int 8 false) ⟨1, 2⟩) 0 [.arbitrary [] vm0, .arbitrary [] vm1])
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz : l.size.bytes = 1) :
+    let enumTy : Ty := { kind := .adt defPath args, layoutIdx := idx }
+    wrappingRangeContains ⟨1, 2⟩ 2 = true ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 2 1 none) = none ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 1 1 none) =
+      some (.aggregate 1 []) ∧
+    encodeValueToBytes defaultCodecFuel layouts enumTy (.aggregate 0 []) =
+      some (encodeLittleEndianBytes 0 1 none) ∧
+    decodeValueFromBytes defaultCodecFuel layouts enumTy (encodeLittleEndianBytes 0 1 none) =
+      none := by
+  intro enumTy
+  rcases l with ⟨⟨sb⟩, lAlign, lRepr, lFields, lVariants, lUninhabited, lFieldLayouts⟩
+  dsimp only at hInhab hVar hFields hSz
+  subst hInhab hVar hFields hSz
+  refine ⟨rfl, ?_, ?_, ?_, ?_⟩
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold encodeValueToBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    unfold decodeValueFromBytes
+    dsimp only [enumTy]
+    rw [hLookup]
+    rfl
 
 end Anneal.BitValidity

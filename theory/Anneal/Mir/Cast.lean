@@ -6622,6 +6622,10 @@ provenance-bearing pointers and page-0 provenance-free pointers with
 `p.offsetBytes < 65536`, where `addressToPtr p.offsetBytes = p`) and every
 same-sized `IsFromBytes` destination, `Trusted.MirSemantics.evalByteCast`
 computes exactly the `Trusted` image of Anneal's `evalTransmuteSameSize`.
+The bound on provenance-free pointers is necessary: `Trusted.Value` represents
+them through the 64 KiB page model (`addressToPtr`), so beyond page `0` a
+`Ptr -> Int` transmute returns the in-page offset instead of the full address
+(`trusted_evalByteCast_provFree_ptr_to_int_page_divergence`).
 -/
 theorem evalTransmuteSameSize_into_from_bytes_trusted_agreement
     (policy : TransmutePolicy) (layouts : LayoutTable) (m1 m2 : Mutability) (pt1 pt2 : RigidTy)
@@ -6726,6 +6730,61 @@ theorem evalTransmuteSameSize_into_from_bytes_trusted_agreement
         rw [hAddrEq]
 
 /--
+**Divergence (provenance-free pointers beyond page `0`).** `CastVal.toTrustedValue`
+maps the provenance-free pointer `.ptr ⟨0, 65536⟩ none` to `Trusted`'s page-model
+pointer `.ptr (addressToPtr 65536) 8 = .ptr ⟨1, 0⟩ 8`. Anneal's opt-in `Ptr -> Int`
+transmute returns the full address `65536`, whereas `Trusted.MirSemantics.evalByteCast`
+on that image returns the in-page offset `0`. So the page-`0` bound in
+`evalTransmuteSameSize_into_from_bytes_trusted_agreement` cannot be dropped.
+-/
+theorem trusted_evalByteCast_provFree_ptr_to_int_page_divergence
+    (dst : ScalarTy) (m1 m2 : Mutability) (pt1 pt2 : RigidTy)
+    (exposed : ExposedProvenance)
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (srcLIdx dstLIdx : Nat)
+    (h_thin1 : isThinPointee pt1 = true)
+    (h_int : dst.isIntegral = true) (h_sz : dst.sizeBytes .bits64 = 8)
+    (h_op : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok ((CastVal.ptr { allocId := 0, offsetBytes := 65536 } none).toTrustedValue .bits64
+        .rawPtr) locals')
+    (h_ty : operandTy localDecls layouts op =
+      some { kind := .rawPtr m1 pt1, layoutIdx := srcLIdx }) :
+    CastVal.WellTyped .bits64 .rawPtr (.ptr { allocId := 0, offsetBytes := 65536 } none) ∧
+    evalTransmuteSameSize .bits64 .allowPtrToIntStripProvenance .rawPtr dst
+        (.ptr { allocId := 0, offsetBytes := 65536 } none) exposed =
+      .ok (.scalar 65536) exposed ∧
+    evalByteCast locals op { kind := dst.toTrustedRigidTy m2 pt2, layoutIdx := dstLIdx }
+        mem localDecls layouts = ok (.scalar ⟨0, 8⟩) locals' mem ∧
+    evalByteCast locals op { kind := dst.toTrustedRigidTy m2 pt2, layoutIdx := dstLIdx }
+        mem localDecls layouts ≠
+      CastOutcome.toTrustedResult .bits64 dst locals' mem
+        (evalTransmuteSameSize .bits64 .allowPtrToIntStripProvenance .rawPtr dst
+          (.ptr { allocId := 0, offsetBytes := 65536 } none) exposed) := by
+  have hValid : ScalarTy.rawPtr.validBits .bits64 65536 := ⟨by decide, trivial⟩
+  have hWt : CastVal.WellTyped .bits64 .rawPtr (.ptr { allocId := 0, offsetBytes := 65536 } none) :=
+    ⟨rfl, hValid, Or.inr ⟨rfl, rfl⟩⟩
+  have hDstNp := ScalarTy.isPtr_eq_false_of_isIntegral dst h_int
+  have hSzEq : ScalarTy.rawPtr.sizeBytes .bits64 = dst.sizeBytes .bits64 := by rw [h_sz]
+  have hDstValid : dst.isValidBits .bits64 65536 = true :=
+    ScalarTy.isValidBits_of_isIntegral .bits64 dst 65536 h_int (by rw [h_sz]; decide)
+  have hAnneal : evalTransmuteSameSize .bits64 .allowPtrToIntStripProvenance .rawPtr dst
+      (.ptr { allocId := 0, offsetBytes := 65536 } none) exposed = .ok (.scalar 65536) exposed := by
+    rw [evalTransmuteSameSize_ptr_to_nonPtr_allow_eq .bits64 .rawPtr dst _ none exposed rfl hDstNp
+      hSzEq hValid, hDstValid]
+  have hOp' : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok (.ptr { allocId := 1, offsetBytes := 0 } 8) locals' := h_op
+  have hTrusted := (trusted_evalByteCast_thin_ptr_to_int_transmute_correspondence .rawPtr dst m1 m2
+    pt1 pt2 { allocId := 1, offsetBytes := 0 } exposed locals locals' op mem localDecls layouts
+    srcLIdx dstLIdx rfl h_thin1 h_int h_sz ⟨by decide, trivial⟩ hOp' h_ty).2.2.1
+  refine ⟨hWt, hAnneal, hTrusted, ?_⟩
+  rw [hTrusted, hAnneal]
+  intro h
+  injection h with h1
+  injection h1 with h2
+  injection h2 with h3
+  exact absurd h3 (by decide)
+
+/--
 **`evalTransmuteSameSize_ok_of_into_from_bytes`**:
 If `src` and `dst` have matching byte sizes (`src.sizeBytes pw = dst.sizeBytes pw`),
 `src` satisfies `IsIntoBytes`, and `dst` satisfies `IsFromBytes`, then for every
@@ -6740,6 +6799,10 @@ well-typed `val : CastVal` (under `policy = .allowPtrToIntStripProvenance` when
    `Trusted.MirSemantics.evalByteCast` succeeds with exactly the `Trusted` image of the same
    `outVal` (no undefined behavior), see
    `evalTransmuteSameSize_into_from_bytes_trusted_agreement`.
+
+The `IsIntoBytes` hypothesis mirrors the `zerocopy::transmute!` interface. It holds for every
+`ScalarTy` image (`scalarTy_isIntoBytes`), so the conclusions depend only on the `IsFromBytes`
+destination.
 -/
 theorem evalTransmuteSameSize_ok_of_into_from_bytes
     (pw : PtrWidth) (policy : TransmutePolicy)
@@ -7650,10 +7713,13 @@ theorem tryTransmute_enumRange_evalByteCast_iff
 
 /--
 **`try_transmute` into a single-field scalar-wrapper newtype ADT (`FieldsShape.arbitrary [⟨0⟩]`) at the `Trusted` step level.**
-Matches the real `rustc` layout of `#[repr(transparent)]` scalar-niche newtypes such as
-`core::num::NonZero*`: both `decodeValueFromBytes` and `Trusted.MirSemantics.evalByteCast`
+For a scalar-niche wrapper decoded on the backend scalar path (`.adt defPath []` with
+`l.fieldLayouts = []`), both `decodeValueFromBytes` and `Trusted.MirSemantics.evalByteCast`
 succeed (producing `.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]`) iff
-`wrappingRangeContains validRange bits = true`, and otherwise return `none` / `ub`.
+`wrappingRangeContains validRange bits = true`, and otherwise return `none` / `ub`. A
+monomorphized generic wrapper such as `NonZero<u32>` (type arguments `[u32]`) is decoded at its
+type argument instead, where `Trusted` does not enforce the niche
+(`adt_generic_nonZero_typeArg_path_niche_unenforced`).
 -/
 theorem tryTransmute_adt_newtype_scalarLayout_eq
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
@@ -7714,10 +7780,12 @@ theorem tryTransmute_adt_newtype_scalarLayout_eq
 
 /--
 **`NonZero*` single-field newtype (`FieldsShape.arbitrary [⟨0⟩]`) niche validation at the `Trusted` step level.**
-Transmuting a valid same-width non-pointer scalar into a real `rustc` `NonZero*` newtype layout
-(`validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`) with `Trusted.MirSemantics.evalByteCast`
+Transmuting a valid same-width non-pointer scalar into a `NonZero*`-style newtype layout
+(`validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`) decoded on the backend scalar path
+(`.adt defPath []`, `l.fieldLayouts = []`) with `Trusted.MirSemantics.evalByteCast`
 succeeds with `ok (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]) locals' mem`
-iff `0 < bits`, and is `ub` iff `bits = 0`.
+iff `0 < bits`, and is `ub` iff `bits = 0`. On the type-argument path of a generic wrapper the
+niche is not enforced (`adt_generic_nonZero_typeArg_path_niche_unenforced`).
 -/
 theorem tryTransmute_adt_newtype_nonZero_evalByteCast_iff
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
@@ -7769,9 +7837,11 @@ theorem tryTransmute_adt_newtype_nonZero_evalByteCast_iff
 
 /--
 **`try_transmute` into a multi-variant fieldless `#[repr(Int)]` / `#[repr(u8)]` enum ADT (`VariantsShape.multiple`) at the `Trusted` step level.**
-Matches the real `rustc` layout of multi-variant fieldless enums (`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`, `l.fields = .arbitrary [⟨0⟩] memoryOrder`):
+For the layout shape of multi-variant fieldless enums (`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`, `l.fields = .arbitrary [⟨0⟩] memoryOrder`) whose in-range tags all index fieldless variants (`hFieldless`):
 both `decodeValueFromBytes` and `Trusted.MirSemantics.evalByteCast` succeed (producing `.aggregate bits []`)
-iff `wrappingRangeContains validRange bits = true`, and otherwise return `none` / `ub`.
+iff `wrappingRangeContains validRange bits = true`, and otherwise return `none` / `ub`. Because `Trusted`
+uses the tag value as the variant index, `hFieldless` holds for real `rustc` layouts only when the
+discriminants are the variant indices `0..n-1` (`adt_multiple_enum_explicit_discriminant_divergence`).
 -/
 theorem tryTransmute_adt_multiple_enum_scalarLayout_eq
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
@@ -7836,6 +7906,9 @@ theorem tryTransmute_adt_multiple_enum_scalarLayout_eq
 **Multi-variant `#[repr(u8)]` / `#[repr(Int)]` contiguous enum-tag validation (`VariantsShape.multiple`) at the `Trusted` step level.**
 Transmuting a valid same-width non-pointer scalar into a multi-variant fieldless enum with tag range `⟨lo, hi⟩` (`lo ≤ hi`)
 succeeds with `ok (.aggregate bits []) locals' mem` iff `lo ≤ bits ∧ bits ≤ hi`, and returns `ub` iff `bits < lo ∨ hi < bits`.
+For real `rustc` layouts, `hFieldless` (every tag in `lo..=hi` indexes a fieldless variant) requires the
+discriminants to be the variant indices, i.e. `lo = 0` and `hi = n - 1`
+(`adt_multiple_enum_explicit_discriminant_divergence`).
 -/
 theorem tryTransmute_adt_multiple_enumRange_evalByteCast_iff
     (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
