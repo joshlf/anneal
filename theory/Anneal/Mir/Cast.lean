@@ -8444,4 +8444,88 @@ theorem evalByteCast_adt_primitive_to_scalar_ok
       trusted_decodeValueFromBytes_scalar 15 layouts m pointee dst dstLIdx bits hDstNp hBits,
       hValidDst]
 
+/--
+**Safe `IntoBytes -> FromBytes` transmute from a multi-variant fieldless `#[repr(Int)]` / `#[repr(u8)]` enum (`VariantsShape.multiple`) into a same-width integral scalar (`evalByteCast_adt_multiple_enum_to_scalar_ok`).**
+Transmuting `.aggregate varIdx []` (`varIdx < scalarModulus (dst.sizeBytes .bits64)`) of a
+fieldless `.multiple` enum (where variant `varIdx` has empty field offsets `.arbitrary [] varMemOrder`)
+into a same-width integral scalar `dst` (`dst.isIntegral = true`, e.g. `#[repr(u8)] Enum -> u8`)
+via `Trusted.MirSemantics.evalByteCast` succeeds and produces `ok (.scalar ⟨varIdx, dst.sizeBytes .bits64⟩) locals' mem`.
+-/
+theorem evalByteCast_adt_multiple_enum_to_scalar_ok
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (defPath : DefPath) (args : List RigidTy) (srcLIdx dstLIdx : LayoutIdx)
+    (l : TypeLayout) (bitsWidth varIdx : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder varMemOrder : List Nat)
+    (m : Mutability) (pointee : RigidTy) (dst : ScalarTy)
+    (hDstInt : dst.isIntegral = true)
+    (hVarLt : varIdx < scalarModulus (dst.sizeBytes .bits64))
+    (hInRange : wrappingRangeContains validRange varIdx = true)
+    (hLookup : LayoutTable.lookup layouts srcLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hLSz : l.size.bytes = dst.sizeBytes .bits64)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hGetVar : Trusted.Sequence.get? variantShapes varIdx = some (.arbitrary [] varMemOrder))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok (.aggregate varIdx []) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := .adt defPath args, layoutIdx := srcLIdx }) :
+    let dstTy : Ty := { kind := dst.toTrustedRigidTy m pointee, layoutIdx := dstLIdx }
+    evalByteCast locals op dstTy mem localDecls layouts =
+      ok (.scalar ⟨varIdx, dst.sizeBytes .bits64⟩) locals' mem := by
+  intro dstTy
+  let srcTy : Ty := { kind := .adt defPath args, layoutIdx := srcLIdx }
+  have hDstNp : dst.isPtr = false := ScalarTy.isPtr_eq_false_of_isIntegral dst hDstInt
+  have hSrcSz : rigidTyByteSize layouts srcTy = some (dst.sizeBytes .bits64) := by
+    simp [srcTy, rigidTyByteSize, hLookup, hLSz]
+  have hDstSz : rigidTyByteSize layouts dstTy = some (dst.sizeBytes .bits64) :=
+    ScalarTy.rigidTyByteSize_toTrustedRigidTy_of_not_isPtr layouts m pointee dst dstLIdx hDstNp
+  have hNz : Nat.beq l.size.bytes 0 = false := by
+    rw [hLSz]
+    exact ScalarTy.sizeBytes_bits64_beq_zero dst
+  have hVarLtL : varIdx < scalarModulus l.size.bytes := hLSz ▸ hVarLt
+  have hEnc :
+      encodeValueToBytes defaultCodecFuel layouts srcTy (.aggregate varIdx []) =
+        some (encodeLittleEndianBytes varIdx (dst.sizeBytes .bits64) none) := by
+    have hRt := (adt_multiple_enum_encode_decode_roundtrip layouts defPath args srcLIdx l
+      bitsWidth varIdx signed validRange variantShapes memoryOrder varMemOrder
+      hLookup hInhab hVar hFields hNz hWidth hVarLtL hInRange hGetVar).1
+    rw [hLSz] at hRt
+    exact hRt
+  have hValidDst : dst.isValidBits .bits64 varIdx = true :=
+    ScalarTy.isValidBits_of_isIntegral .bits64 dst varIdx hDstInt hVarLt
+  rw [trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts _ srcTy dstTy _ _
+        hOp hDstSz hTy hSrcSz hEnc (trusted_length_encodeLittleEndianBytes varIdx _ none),
+      show defaultCodecFuel = 15 + 1 from rfl,
+      trusted_decodeValueFromBytes_scalar 15 layouts m pointee dst dstLIdx varIdx hDstNp hVarLt,
+      hValidDst]
+
+/--
+**Niche-aware decidable-certificate corollary (`evalByteCast_ok_of_checkIntoFromBytesNicheAware`).**
+Discharges `Trusted.MirSemantics.evalByteCast` from `checkIntoBytes layouts srcTy = true`
+and `checkFromBytesNicheAware layouts dstTy = true`, guaranteeing both `Trusted`
+transmute soundness and absence of any scalar `validRange` niche on `dstTy`'s
+backend representation.
+-/
+theorem evalByteCast_ok_of_checkIntoFromBytesNicheAware
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcTy dstTy : Ty) (v : Value) (bs : List AbstractByte)
+    (hCheckInto : checkIntoBytes layouts srcTy = true)
+    (hCheckFrom : checkFromBytesNicheAware layouts dstTy = true)
+    (hSizeEq : rigidTyByteSize layouts srcTy = rigidTyByteSize layouts dstTy)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals = .ok v locals')
+    (hTy : operandTy localDecls layouts op = some srcTy)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts srcTy v = some bs) :
+    ∃ v',
+      decodeValueFromBytes defaultCodecFuel layouts dstTy bs = some v' ∧
+      evalByteCast locals op dstTy mem localDecls layouts = ok v' locals' mem ∧
+      evalRvalue locals (.cast .transmute op dstTy) mem localDecls layouts = ok v' locals' mem :=
+  evalByteCast_ok_of_into_from_bytes locals locals' op mem localDecls layouts srcTy dstTy v bs
+    (checkIntoBytes_sound layouts srcTy hCheckInto)
+    (checkFromBytesNicheAware_sound layouts dstTy hCheckFrom)
+    hSizeEq hOp hTy hEnc
+
 end Anneal.Mir.Cast

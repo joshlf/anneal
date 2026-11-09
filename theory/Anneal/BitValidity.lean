@@ -1030,6 +1030,108 @@ theorem array_char_isIntoBytes
   refine ⟨4 * n, by simp [rigidTyByteSize], ?_⟩
   exact array_char_encode_anyFuel 14 layouts n idx
 
+/-- Homogeneous boolean arrays `[bool; n]` satisfy `IsFromBytes` if and only if `n = 0`. -/
+theorem array_bool_isFromBytes_iff_zero
+    (layouts : LayoutTable) (n : Nat) (idx : LayoutIdx) :
+    IsFromBytes layouts { kind := .array .bool n, layoutIdx := idx } ↔ n = 0 := by
+  constructor
+  · rintro ⟨sz, hSz, hDec⟩
+    cases n with
+    | zero => rfl
+    | succ k =>
+      injection hSz with hSzEq
+      subst hSzEq
+      let badBs := .init (UInt8.ofNat 2) none :: zeroInitBytes k
+      have hZ : (zeroInitBytes k).length = k := length_zeroInitBytes k
+      have hBadLen : length badBs = 1 * (k + 1) := by
+        change (zeroInitBytes k).length + 1 = 1 * (k + 1)
+        rw [hZ]
+        omega
+      have hBadInit : allBytesInitialized badBs = true :=
+        allBytesInitialized_zeroInitBytes k
+      have hBadLenMul : length badBs = Nat.mul 1 (k + 1) := hBadLen
+      rcases hDec badBs hBadLenMul hBadInit with ⟨v, hv⟩
+      rw [show defaultCodecFuel = 15 + 1 from rfl] at hv
+      unfold decodeValueFromBytes at hv
+      have hK : Nat.beq (k + 1) 0 = false := rfl
+      have hBeqLen : Nat.beq (length badBs) (Nat.mul 1 (k + 1)) = true := by
+        change Nat.beq (length badBs) (1 * (k + 1)) = true
+        rw [hBadLen]; exact Nat.beq_refl _
+      have hBle : Nat.ble 1 (length badBs) = true := by
+        rw [hBadLen]
+        exact Nat.ble_eq_true_of_le (by omega)
+      dsimp only [rigidTyKindByteSize] at hv
+      rw [hK] at hv
+      dsimp only at hv
+      rw [hBeqLen] at hv
+      dsimp only at hv
+      unfold decodeArrayChunksWith at hv
+      rw [hBle] at hv
+      dsimp only [badBs, takeAbstractBytes] at hv
+      have hChunkNone :
+          decodeValueFromBytes 15 layouts { kind := .bool, layoutIdx := 0 }
+            [.init (UInt8.ofNat 2) none] = none := rfl
+      rw [hChunkNone] at hv
+      nomatch hv
+  · intro hZero
+    subst hZero
+    refine ⟨0, rfl, ?_⟩
+    intro bs hLen _
+    cases bs with
+    | nil => exact ⟨.aggregate 0 [], rfl⟩
+    | cons _ _ => nomatch hLen
+
+/-- Homogeneous character arrays `[char; n]` satisfy `IsFromBytes` if and only if `n = 0`. -/
+theorem array_char_isFromBytes_iff_zero
+    (layouts : LayoutTable) (n : Nat) (idx : LayoutIdx) :
+    IsFromBytes layouts { kind := .array .char n, layoutIdx := idx } ↔ n = 0 := by
+  constructor
+  · rintro ⟨sz, hSz, hDec⟩
+    cases n with
+    | zero => rfl
+    | succ k =>
+      injection hSz with hSzEq
+      subst hSzEq
+      let surr : List AbstractByte :=
+        [.init (UInt8.ofNat 0) none, .init (UInt8.ofNat 216) none,
+         .init (UInt8.ofNat 0) none, .init (UInt8.ofNat 0) none]
+      let badBs := surr ++ zeroInitBytes (4 * k)
+      have hZ : (zeroInitBytes (4 * k)).length = 4 * k := length_zeroInitBytes (4 * k)
+      have hBadLen : length badBs = 4 * (k + 1) := by
+        simp [badBs, surr, length, hZ]
+        omega
+      have hBadInit : allBytesInitialized badBs = true :=
+        allBytesInitialized_append rfl (allBytesInitialized_zeroInitBytes (4 * k))
+      rcases hDec badBs hBadLen hBadInit with ⟨v, hv⟩
+      rw [show defaultCodecFuel = 15 + 1 from rfl] at hv
+      unfold decodeValueFromBytes at hv
+      have hK : Nat.beq (k + 1) 0 = false := rfl
+      have hBeqLen : Nat.beq (length badBs) (Nat.mul 4 (k + 1)) = true := by
+        change Nat.beq (length badBs) (4 * (k + 1)) = true
+        rw [hBadLen]; exact Nat.beq_refl _
+      have hBle : Nat.ble 4 (length badBs) = true := by
+        rw [hBadLen]
+        exact Nat.ble_eq_true_of_le (by omega)
+      dsimp only [rigidTyKindByteSize] at hv
+      rw [hK] at hv
+      dsimp only at hv
+      rw [hBeqLen] at hv
+      dsimp only at hv
+      unfold decodeArrayChunksWith at hv
+      rw [hBle] at hv
+      dsimp only [badBs, surr, List.cons_append, List.nil_append, takeAbstractBytes] at hv
+      have hChunkNone :
+          decodeValueFromBytes 15 layouts { kind := .char, layoutIdx := 0 } surr = none := rfl
+      rw [hChunkNone] at hv
+      nomatch hv
+  · intro hZero
+    subst hZero
+    refine ⟨0, rfl, ?_⟩
+    intro bs hLen _
+    cases bs with
+    | nil => exact ⟨.aggregate 0 [], rfl⟩
+    | cons _ _ => nomatch hLen
+
 /-! ## 5. Decidable Layout Certificate Checkers -/
 
 /-- Decidable certificate checker for `IsUnaligned`. -/
@@ -4088,5 +4190,89 @@ theorem checkFromBytes_generic_nonZero_ignores_niche
     rw [hLookup]
     rfl
   exact ⟨hCheck, checkFromBytes_sound layouts _ hCheck⟩
+
+/--
+Decidable check that `l.backendRepr` imposes no scalar `validRange` niche restriction
+narrower than `[0, scalarModulus l.size.bytes)` (requiring `validRange.start = 0` and
+`scalarModulus l.size.bytes - 1 ≤ validRange.end_` on `.scalar (.initialized _ validRange)`).
+-/
+def checkBackendReprFullRange (l : TypeLayout) : Bool :=
+  match l.backendRepr with
+  | .scalar (.initialized _ validRange) =>
+    (validRange.start == 0) && Nat.ble (scalarModulus l.size.bytes - 1) validRange.end_
+  | .scalarPair (.initialized _ r0) (.initialized _ r1) =>
+    (r0.start == 0) && (r1.start == 0)
+  | _ => true
+
+/--
+Whenever `checkBackendReprFullRange l = true` and `l.backendRepr = .scalar (.initialized pk validRange)`,
+every bit pattern `bits < scalarModulus l.size.bytes` lies inside `validRange`.
+-/
+theorem checkBackendReprFullRange_implies_wrappingRangeContains
+    (l : TypeLayout) (pk : PrimitiveKind) (validRange : WrappingRange) (bits : Nat)
+    (hFull : checkBackendReprFullRange l = true)
+    (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
+    (hBits : bits < scalarModulus l.size.bytes) :
+    wrappingRangeContains validRange bits = true := by
+  unfold checkBackendReprFullRange at hFull
+  rw [hRepr] at hFull
+  dsimp only at hFull
+  simp only [Bool.and_eq_true, beq_iff_eq] at hFull
+  rcases hFull with ⟨hStart, hEndBle⟩
+  have hEndLe : scalarModulus l.size.bytes - 1 ≤ validRange.end_ :=
+    Nat.le_of_ble_eq_true hEndBle
+  rcases validRange with ⟨start, end_⟩
+  dsimp only at hStart hEndLe
+  subst hStart
+  exact (wrappingRangeContains_zero_max_iff end_ bits).mpr (by omega)
+
+/--
+Niche-aware decidable certificate checker for `FromBytes`: requires both
+`checkFromBytes layouts ty = true` and (when `ty.kind = .adt _ _`)
+`checkBackendReprFullRange l = true`, rejecting `NonZero<T>` and other
+niche-carrying wrapper structs even when monomorphized with unconstrained type
+arguments.
+-/
+def checkFromBytesNicheAware (layouts : LayoutTable) (ty : Ty) : Bool :=
+  checkFromBytes layouts ty &&
+    match ty.kind with
+    | .adt _ _ =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | some l => checkBackendReprFullRange l
+      | none => false
+    | _ => true
+
+theorem checkFromBytesNicheAware_implies_checkFromBytes
+    (layouts : LayoutTable) (ty : Ty)
+    (h : checkFromBytesNicheAware layouts ty = true) :
+    checkFromBytes layouts ty = true := by
+  unfold checkFromBytesNicheAware at h
+  simp only [Bool.and_eq_true] at h
+  exact h.1
+
+theorem checkFromBytesNicheAware_sound
+    (layouts : LayoutTable) (ty : Ty)
+    (h : checkFromBytesNicheAware layouts ty = true) :
+    IsFromBytes layouts ty :=
+  checkFromBytes_sound layouts ty (checkFromBytesNicheAware_implies_checkFromBytes layouts ty h)
+
+/--
+Unlike `checkFromBytes`, `checkFromBytesNicheAware` rejects the `NonZero<u32>`-shaped
+layout carried by `.adt defPath [.uint .u32]` because `l.backendRepr` has
+`validRange.start = 1 ≠ 0`.
+-/
+theorem checkFromBytesNicheAware_rejects_generic_nonZero
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hRepr : l.backendRepr = .scalar (.initialized (.int 32 false) ⟨1, scalarModulus 4 - 1⟩)) :
+    checkFromBytesNicheAware layouts { kind := .adt defPath [.uint .u32], layoutIdx := idx } =
+      false := by
+  unfold checkFromBytesNicheAware checkBackendReprFullRange
+  dsimp only
+  rw [hLookup]
+  dsimp only
+  rw [hRepr]
+  simp
 
 end Anneal.BitValidity
