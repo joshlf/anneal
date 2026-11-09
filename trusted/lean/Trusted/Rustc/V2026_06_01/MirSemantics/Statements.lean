@@ -1175,7 +1175,11 @@ def evalStmt
         s.memory.callerLocals
     with
     | .ok val locals' =>
-      let retagPtrVal (ptrVal : ProvenancePtr) (sz : Nat) (allowGlobal : Bool) : MirStepNode :=
+      let retagPtrVal
+          (ptrVal : ProvenancePtr)
+          (sz : Nat)
+          (allowGlobal : Bool) :
+          MirStepNode :=
         match lookupBorrow s.memory.borrows ptrVal.tag with
         | .some entry =>
           match entry.perm with
@@ -1183,7 +1187,8 @@ def evalStmt
           | _ =>
             match retagKind with
             | .fnEntry =>
-              evalFnEntryRetag s localDecls layouts place ptrVal sz entry locals'
+              evalFnEntryRetag
+                s localDecls layouts place ptrVal sz entry locals'
             | .default | .twoPhase | .raw =>
               evalNonFnEntryRetag
                 retagKind s localDecls layouts place ptrVal sz entry locals'

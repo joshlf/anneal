@@ -662,11 +662,12 @@ theorem sim_lm3_3_retag_inhabited_never_container_zst_step
    initial child read even for `&mut UnsafeCell<()>` in `ReservedIM` /
    `ReservedFrz false` so protected `Unique` sibling `entry 2` survives) and
    non-null dangling scalars (`retagZstScalarState true`);
-2. transparent wrappers `core::cell::UnsafeCell<!>`, `core::cell::Cell<!>`, and
-   `core::mem::ManuallyDrop<!>` around `!` are uninhabited
-   (`rigidTyIsUninhabited 16 = true`), so `StatementKind.retag rk _2`
-   immediately faults with `.fail .ub` for every `val`, `borrows`, and
-   `isProtected`. -/
+2. by-value `T` wrappers `core::cell::UnsafeCell<!>`, `core::cell::Cell<!>`,
+   `core::cell::RefCell<!>`, and `core::mem::ManuallyDrop<!>` around `!` are
+   uninhabited (`rigidTyIsUninhabited 16 = true`), so
+   `StatementKind.retag rk _2` immediately faults with `.fail .ub` for every
+   `val`, `borrows`, and `isProtected` (while `RefCell<()>` remains inhabited
+   and non-zero-sized because of its `BorrowFlag` field). -/
 theorem sim_lm3_3_retag_unsafecell_zst_vs_never_step
     (rk : RetagKind) (mutability : Mutability) (useMaybeUninit : Bool)
     (val : Value) (borrows : List BorrowEntry) (isProtected : Bool) :
@@ -680,6 +681,9 @@ theorem sim_lm3_3_retag_unsafecell_zst_vs_never_step
     rigidTyIsUninhabited 16 zstPointee = false ∧
     rigidTyIsZeroSized 16 zstPointee = true ∧
     rigidTyIsFreeze 16 zstPointee = useMaybeUninit ∧
+    rigidTyIsUninhabited 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
+    rigidTyIsZeroSized 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
+    rigidTyIsFreeze 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
     (∃ s' : MachineState,
       stepMirFn (retagPointeeRefBody rk mutability zstPointee) retagZstRefState = .step s' ∧
       get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
@@ -699,6 +703,8 @@ theorem sim_lm3_3_retag_unsafecell_zst_vs_never_step
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
     stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::Cell" [.never]))
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::RefCell" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
     stepMirFn (retagPointeeRefBody rk mutability (.adt "core::mem::ManuallyDrop" [.never]))
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub := by
   have hub_uc :
@@ -711,16 +717,21 @@ theorem sim_lm3_3_retag_unsafecell_zst_vs_never_step
         (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
     sim_lm3_3_retag_uninhabited_ref_ub_step rk mutability
       (.adt "core::cell::Cell" [.never]) val borrows isProtected rfl
+  have hub_rc :
+      stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::RefCell" [.never]))
+        (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
+    sim_lm3_3_retag_uninhabited_ref_ub_step rk mutability
+      (.adt "core::cell::RefCell" [.never]) val borrows isProtected rfl
   have hub_md :
       stepMirFn (retagPointeeRefBody rk mutability (.adt "core::mem::ManuallyDrop" [.never]))
         (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
     sim_lm3_3_retag_uninhabited_ref_ub_step rk mutability
       (.adt "core::mem::ManuallyDrop" [.never]) val borrows isProtected rfl
   cases useMaybeUninit <;> cases rk <;> cases mutability <;>
-    exact ⟨rfl, rfl, rfl,
+    exact ⟨rfl, rfl, rfl, rfl, rfl, rfl,
       ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩,
       ⟨_, rfl, rfl, rfl⟩,
-      hub_uc, hub_c, hub_md⟩
+      hub_uc, hub_c, hub_rc, hub_md⟩
 
 /-- **`sim_lm3_3_retag_phantom_unsafecell_vs_cell_step`**: across all
 `4 × 2 = 8` `(rk, mutability)` combinations:

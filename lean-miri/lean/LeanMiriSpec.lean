@@ -131,15 +131,18 @@ import LeanMiriSpec.Audit
   (`LM-3.3`, certifying `I-10` & `I-11`).
 * `LeanMiriSpec.Correspondence.SimLM3_3`: end-to-end MIR step simulations of
   dereferencing reads/writes, parent-child hierarchies, `StatementKind.retag`
-  (references, raw pointers, ZSTs, and uninhabited vs. inhabited `!`-container
-  pointees), deref reborrows, and general 6-state
+  (references, raw pointers, ZSTs, standard wrapper `Freeze` / ZST / uninhabited
+  classification across `PhantomData`, `MaybeUninit`, `ManuallyDrop`,
+  `UnsafeCell`, `SyncUnsafeCell`, `Cell`, and `RefCell`, and uninhabited vs.
+  inhabited `!`-container pointees), deref reborrows, and general 6-state
   `Miri.Interpreter.Step.step` + `TreeBorrowsRel` lockstep (`LM-3.3`).
 * `LeanMiriSpec.Correspondence.WitLM3_3`: real-step safe and undefined-behavior
-  witnesses `(a)..(m)` for reborrow hierarchies, protector conflicts and return
+  witnesses `(a)..(n)` for reborrow hierarchies, protector conflicts and return
   release, protected `Unique` disables, `UnsafeCell` (`Cell` & `ReservedIM`) vs.
   `Freeze`, non-`fnEntry`/raw retags, ZST & uninhabited-reference retags,
-  disjoint vs. overlapping sub-projections, and protected `Cell` chains
-  surviving under `.disabled` ancestors (`LM-3.3`).
+  disjoint vs. overlapping sub-projections, protected `Cell` chains surviving
+  under `.disabled` ancestors, and wrapper ZST/`Freeze`/uninhabited cell
+  retags (`LM-3.3`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

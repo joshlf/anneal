@@ -25,13 +25,15 @@ automata in `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops` and
    - `mir_updateBorrowPerm_self_write_activates_reserved`: writing through `writerTag = some entry.tag`
      activates `.reserved → .active` and preserves `.active`, `.frozen`, `.disabled`.
    - `mir_updateBorrowPerm_foreign_ptr_write_disables`: writing through any foreign pointer tag
-     `writerTag = some wTag` with `entry.tag ≠ wTag` transitions `entry.perm` to `.disabled`.
+     `writerTag = some wTag` with `entry.tag ≠ wTag` transitions `entry.perm` to `.disabled`
+     unless `entry.perm` is `.cell` or `.reservedIM`.
    - `mir_updateBorrowPerm_direct_local_write`: direct write to `entry.targetLocal` (`writerTag = none`)
-     disables `.active` and `.frozen` while preserving `.reserved` (two-phase borrow reservation!).
+     disables `.active`, `.frozen`, and `Freeze` reservations (`.reserved`) while preserving
+     interior-mutable `.reservedIM` and `.cell` tags.
    - `mir_updateBorrowPerm_corresponds_to_minirust_write`: universal theorem proving that
-     `Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm` equals
-     `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm` across all `BorrowEntry`
-     states and `writerTag`s.
+     `Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm` equals `mrExpectedWritePerm`
+     (`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition`) across all
+     6-state `BorrowEntry` states and `writerTag`s.
    - `mir_updateBorrowPermAtProj_characterization`: disjoint field/index/range writes leave
      sibling borrows untouched.
 2. **Direct Universal Theorems Over Borrow List Invalidation & Function-Entry Protectors**:
@@ -40,10 +42,12 @@ automata in `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops` and
      pointwise across the active borrow list.
    - `mir_attachBorrowProtector_and_hasProtectedWriteConflict`: universal theorems over
      `attachBorrowProtector`, `isBorrowProtected`, `hasProtectedWriteConflict`, and `evalPlaceWrite`.
-3. **Direct Universal Root-Cause Theorem for `GAP-MR-0001` Over `MirSemantics.{evalRvalue,writePlaceValue}`**:
+3. **Direct Universal Theorem Over `Freeze` vs. `UnsafeCell` Shared Borrows (`MirSemantics.{evalRvalue,writePlaceValue}`)**:
    - `mir_shared_ref_always_assigns_frozen_and_rejects_write`: proves directly on `evalRvalue`
-     (`Places.lean:1798`) and `writePlaceValue` (`Places.lean:1368`) that `BorrowKind.shared`
-     unconditionally creates `perm := .frozen` and rejects subsequent dereference writes with `.ub`.
+     and `writePlaceValue` that `BorrowKind.shared` on `Freeze` (or untyped default) places
+     creates `perm := .frozen` and rejects dereference writes with `.ub`, whereas on
+     `core::cell::UnsafeCell<u32>` (`!Freeze`) it creates `perm := .cell` and permits
+     interior-mutable dereference writes.
 4. **Mechanical Cross-Snapshot Tree Borrows Comparison (`S2026_05_Matched` vs. `S2026_07_BleedingEdge`)**:
    - `unprotected_transition_agrees_across_snapshots`: `PermissionUnprot.transition` agrees 100%
      across all 24 `(PermissionUnprot × AccessKind × NodeRelation)` combinations between the two
@@ -269,7 +273,7 @@ theorem mir_updateBorrowPerm_direct_local_write (entry : BorrowEntry) :
 /--
 **Theorem L4.5 (`mir_updateBorrowPerm_corresponds_to_minirust_write`)**:
 Universal correspondence theorem directly over `Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm`
-and `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm`:
+and `mrExpectedWritePerm` (`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition`):
 for EVERY `entry : BorrowEntry`, EVERY `targetLocal : Local`, and EVERY `writerTag : Option Nat`,
 `(updateBorrowPerm entry targetLocal writerTag).perm` equals `mrExpectedWritePerm`
 while preserving `tag` and `targetLocal`.

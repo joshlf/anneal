@@ -10785,6 +10785,9 @@ example
     rigidTyIsUninhabited 16 zstPointee = false ∧
     rigidTyIsZeroSized 16 zstPointee = true ∧
     rigidTyIsFreeze 16 zstPointee = useMaybeUninit ∧
+    rigidTyIsUninhabited 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
+    rigidTyIsZeroSized 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
+    rigidTyIsFreeze 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
     (∃ s' : MachineState,
       stepMirFn (retagPointeeRefBody rk mutability zstPointee) retagZstRefState = .step s' ∧
       get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
@@ -10803,6 +10806,8 @@ example
     stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::UnsafeCell" [.never]))
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
     stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::Cell" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::RefCell" [.never]))
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
     stepMirFn (retagPointeeRefBody rk mutability (.adt "core::mem::ManuallyDrop" [.never]))
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
@@ -10866,7 +10871,9 @@ example :
       TreeBorrowsRel s₈.memory.borrows s₈.memory.activeProtectors
         (basedNormalTree s₈.memory.borrows s₈.memory.activeProtectors)) ∧
     stepMirFn bodyNUnsafeCellNever (initLUninhabited false) = .fail .ub ∧
-    stepMirFn bodyNUnsafeCellNever (initLUninhabited true) = .fail .ub :=
+    stepMirFn bodyNUnsafeCellNever (initLUninhabited true) = .fail .ub ∧
+    stepMirFn bodyNRefCellNever (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyNRefCellNever (initLUninhabited true) = .fail .ub :=
   @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps
 
 open LeanMiriSpec.Correspondence in
@@ -10924,7 +10931,26 @@ open LeanMiriSpec.Correspondence in
   treeBorrowsBranch3ProtInv
   borrowListChain3ProtInv
   borrowListBranch3ProtInv
+  SimLM3_3.stmt
+  SimLM3_3.loc
+  SimLM3_3.deref
+  SimLM3_3.u64T
+  SimLM3_3.u32T
+  SimLM3_3.unsafeCellU32T
+  SimLM3_3.declOf
+  SimLM3_3.refMutDecl
+  SimLM3_3.refDecl
+  SimLM3_3.rawMutDecl
+  SimLM3_3.cU64
+  SimLM3_3.cU32
+  SimLM3_3.scalarLayout
+  SimLM3_3.witBody
+  SimLM3_3.witInit
+  SimLM3_3.entry
   SimLM3_3.StepTreeRel
+  SimLM3_3.protOf
+  SimLM3_3.activeOf
+  SimLM3_3.simState
   SimLM3_3.childWriteBody
   SimLM3_3.childReadBody
   SimLM3_3.foreignWriteBody
@@ -10985,6 +11011,7 @@ open LeanMiriSpec.Correspondence in
   WitnessLM3_3.bodyN
   WitnessLM3_3.initN
   WitnessLM3_3.bodyNUnsafeCellNever
+  WitnessLM3_3.bodyNRefCellNever
   miriPermToAnneal_annealPermToMiri
   annealPermToMiri_miriPermToAnneal
   TreeBorrowsBijection

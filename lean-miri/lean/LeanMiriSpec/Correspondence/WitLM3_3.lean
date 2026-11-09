@@ -1067,6 +1067,15 @@ def bodyNUnsafeCellNever : CapturedMir :=
       refDecl (.adt "core::cell::UnsafeCell" [.never])]
     [stmt (.retag .fnEntry (loc 2))]
 
+/-- Uninhabited `&RefCell<!>` retag body (`Retag([fn entry] _2)` on
+`_2 : &RefCell<!>`). -/
+def bodyNRefCellNever : CapturedMir :=
+  witBody "lm_3_3_witness::uninhabited_refcell_never_ref" 0
+    [declOf unitT,
+      declOf { kind := .adt "core::cell::RefCell" [.never], layoutIdx := 0 },
+      refDecl (.adt "core::cell::RefCell" [.never])]
+    [stmt (.retag .fnEntry (loc 2))]
+
 /-- **(n) `wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps`**:
 1. On `_1 : UnsafeCell<()>`, `_2 = &mut _1`, `Retag([fn entry] _2)`, and
    `(*_2) = copy _1` activate protected `tag 2` (`protector = some 1`) and
@@ -1078,9 +1087,10 @@ def bodyNUnsafeCellNever : CapturedMir :=
    permission `.frozen` (`PhantomData<T>` is unconditionally `Freeze`);
 3. On `_6 : Cell<u32>`, `_7 = &_6` allocates `tag 6` with permission `.cell`
    (`Cell<T>` is `!Freeze`), which survives the foreign write `_6 = 99_u32`;
-4. On `bodyNUnsafeCellNever` (`_2 : &UnsafeCell<!>`), `Retag([fn entry] _2)`
-   immediately faults with `.fail .ub` for both provenance pointers and
-   dangling scalars (`rigidTyIsUninhabited 16 = true`). -/
+4. On `bodyNUnsafeCellNever` (`_2 : &UnsafeCell<!>`) and `bodyNRefCellNever`
+   (`_2 : &RefCell<!>`), `Retag([fn entry] _2)` immediately faults with
+   `.fail .ub` for both provenance pointers and dangling scalars
+   (`rigidTyIsUninhabited 16 = true`). -/
 theorem wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps :
     (∃ s₁ s₂ s₃ s₄ s₅ s₆ s₇ s₈ : MachineState,
       stepMirFn bodyN initN = .step s₁ ∧
@@ -1109,9 +1119,11 @@ theorem wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps :
       TreeBorrowsRel s₈.memory.borrows s₈.memory.activeProtectors
         (basedNormalTree s₈.memory.borrows s₈.memory.activeProtectors)) ∧
     stepMirFn bodyNUnsafeCellNever (initLUninhabited false) = .fail .ub ∧
-    stepMirFn bodyNUnsafeCellNever (initLUninhabited true) = .fail .ub := by
+    stepMirFn bodyNUnsafeCellNever (initLUninhabited true) = .fail .ub ∧
+    stepMirFn bodyNRefCellNever (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyNRefCellNever (initLUninhabited true) = .fail .ub := by
   refine ⟨⟨_, _, _, _, _, _, _, _,
     rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl, rfl⟩
+    ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl, rfl, rfl, rfl⟩
 
 end LeanMiriSpec.Correspondence.WitnessLM3_3

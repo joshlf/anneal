@@ -672,7 +672,8 @@ def treeBorrowProtectorCheck
     | true => .ub
     | false => .transition .disabled
   | .transition .cell => .transition .cell
-  | .transition (.reservedFrz conflicted) => .transition (.reservedFrz conflicted)
+  | .transition (.reservedFrz conflicted) =>
+    .transition (.reservedFrz conflicted)
   | .transition .reservedIM => .transition .reservedIM
   | .transition .unique => .transition .unique
   | .transition .frozen => .transition .frozen
@@ -3011,19 +3012,20 @@ Determine whether a monomorphized `RigidTy` is `Freeze` (contains no
 with `fuel`.
 
 Returns `true` (`Freeze`) unconditionally for `core::marker::PhantomData` /
-`std::marker::PhantomData` (`unsafe impl<T: ?Sized> Freeze for PhantomData<T>`);
-returns `false` (`!Freeze`) for `.rawPtr`, for standard interior-mutable cells
-(`core::cell::UnsafeCell`, `std::cell::UnsafeCell`,
+`std::marker::PhantomData` (a zero-field marker type containing no
+`UnsafeCell<T>` regardless of its type parameter `T`); returns `false`
+(`!Freeze`) for `.rawPtr`, for standard interior-mutable cells containing
+`UnsafeCell<T>` (`core::cell::UnsafeCell`, `std::cell::UnsafeCell`,
 `core::cell::SyncUnsafeCell`, `std::cell::SyncUnsafeCell`, `core::cell::Cell`,
 `std::cell::Cell`, `core::cell::RefCell`, `std::cell::RefCell`), and for any
 other `.adt`, `.tuple`, `.array`, or `.slice` whose type arguments or element
 types contain a `!Freeze` component; returns `true` (`Freeze`) otherwise.
-Modeling choice: Because `RigidTy.adt` carries generic `args` rather than full
-field declarations, `rigidTyIsFreeze` explicitly recognizes `PhantomData` as
-`Freeze` and `UnsafeCell` / `SyncUnsafeCell` / `Cell` / `RefCell` as `!Freeze`,
-recurses structurally on `args` for other ADTs, and classifies `.rawPtr` as
-`!Freeze` so custom interior-mutable wrappers conservatively receive `.cell`
-(shared) or `.reservedIM` (mutable).
+Modeling choice vs. stable Rust Reference: Because `RigidTy.adt` carries generic
+`args` rather than full field declarations, `rigidTyIsFreeze` explicitly
+recognizes `PhantomData` as `Freeze` and `UnsafeCell` / `SyncUnsafeCell` /
+`Cell` / `RefCell` as `!Freeze`, recurses structurally on `args` for other ADTs,
+and classifies `.rawPtr` as `!Freeze` so custom interior-mutable wrappers
+conservatively receive `.cell` (shared) or `.reservedIM` (mutable).
 
 Reference (The Rust Reference, "Interior mutability"):
 <https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
@@ -3261,11 +3263,11 @@ def placeIsZeroSized
 Determine whether a structural `RigidTy` is statically known to be uninhabited
 (`!`, tuples containing an uninhabited element, non-empty arrays `[T; n + 1]`
 of an uninhabited element, closures capturing an uninhabited upvar,
-`core::convert::Infallible` / `std::convert::Infallible`, or `#[repr(transparent)]`
-single-field wrappers `UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`, and
-`ManuallyDrop<T>` around an uninhabited `T`) in `Runtime(PostCleanup)` MIR
-(`rustc 1.98.0-nightly (14210df0e 2026-05-31)`), using bounded recursion with
-`fuel`.
+`core::convert::Infallible` / `std::convert::Infallible`, or standard
+by-value `T` wrappers `UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`,
+`RefCell<T>`, and `ManuallyDrop<T>` around an uninhabited `T`) in
+`Runtime(PostCleanup)` MIR (`rustc 1.98.0-nightly (14210df0e 2026-05-31)`),
+using bounded recursion with `fuel`.
 
 Zero-length arrays `[T; 0]`, `core::marker::PhantomData<T>` /
 `std::marker::PhantomData<T>`, and `core::mem::MaybeUninit<T>` /
@@ -3277,15 +3279,16 @@ Modeling choice vs. stable Rust Reference: For general user-defined
 `RigidTy.adt` types, uninhabitedness (`TypeLayout.isUninhabited` /
 `VariantsShape.empty`) is stored in `LayoutTable` (`Ty.layoutIdx`) rather than
 on `RigidTy` itself, so `rigidTyIsUninhabited` recognizes
-`core::convert::Infallible` / `std::convert::Infallible` and transparent
-wrappers (`UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`, `ManuallyDrop<T>`)
-directly and conservatively returns `false` on other `RigidTy.adt` constructors
-(`tyIsUninhabited` additionally consults `LayoutTable.lookup`). During MIR
-reference retagging (`evalFnEntryRetag`, `evalNonFnEntryRetag`, and `evalStmt`
-`.retag`), producing or retagging a reference `&T` or `&mut T` whose pointee
-`T` is uninhabited (`rigidTyIsUninhabited 16 pointee = true`) is immediate
-undefined behavior even when `T` has zero byte size (`&!`, `&[!; 1]`,
-`&(!, ())`, `&UnsafeCell<!>`).
+`core::convert::Infallible` / `std::convert::Infallible` and standard by-value
+`T` wrappers (`UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`, `RefCell<T>`,
+`ManuallyDrop<T>`) directly and conservatively returns `false` on other
+`RigidTy.adt` constructors (`tyIsUninhabited` additionally consults
+`LayoutTable.lookup`). During MIR reference retagging (`evalFnEntryRetag`,
+`evalNonFnEntryRetag`, and `evalStmt` `.retag`), producing or retagging a
+reference `&T` or `&mut T` whose pointee `T` is uninhabited
+(`rigidTyIsUninhabited 16 pointee = true`) is immediate undefined behavior even
+when `T` has zero byte size (`&!`, `&[!; 1]`, `&(!, ())`, `&UnsafeCell<!>`,
+`&RefCell<!>`).
 
 Reference (The Rust Reference, "Never type", Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/reference/types/never.html>
@@ -3338,8 +3341,12 @@ def rigidTyIsUninhabited : Nat → RigidTy → Bool
                 (stringEq defPath "core::cell::Cell")
                 (stringEq defPath "std::cell::Cell"))
               (Bool.or
-                (stringEq defPath "core::mem::ManuallyDrop")
-                (stringEq defPath "std::mem::ManuallyDrop")))),
+                (Bool.or
+                  (stringEq defPath "core::cell::RefCell")
+                  (stringEq defPath "std::cell::RefCell"))
+                (Bool.or
+                  (stringEq defPath "core::mem::ManuallyDrop")
+                  (stringEq defPath "std::mem::ManuallyDrop"))))),
         args
       with
       | true, inner :: .nil => rigidTyIsUninhabited fuel inner
