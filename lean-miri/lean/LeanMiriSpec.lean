@@ -139,9 +139,11 @@ import LeanMiriSpec.Audit
   `Copy`/`Move` (`step_enum_copy_move_simulation`,
   `step_enum_self_move_simulation`,
   `step_enum_self_copy_dead_or_uninit_simulation`, plus unconditional self-copy
-  `copyRangesOverlap` and `enumUninitInd` copy/move boundaries), and
-  `Goto`/`Return` helpers.
-* `LeanMiriSpec.Correspondence.WitLM2_3`: 18 kernel-checked `LM-2.3`
+  `copyRangesOverlap` and `enumUninitInd` copy/move boundaries), and `Goto` plus
+  scalar and enum-returning root-frame `Return`
+  (`step_return_scalar_lm2_3_simulation`, `step_return_enum_lm2_3_simulation`,
+  and `step_return_enum_uninitInd_divergence`).
+* `LeanMiriSpec.Correspondence.WitLM2_3`: 19 kernel-checked `LM-2.3`
   multi-variant `Lm23Enum` execution, lockstep-UB, divergence, and
   `BodyFreeOfLM2_3` witnesses exercising every `SimLM2_3` theorem and boundary.
 * `LeanMiriSpec.Correspondence.UnionLM2_4`: the `LM-2.4` union and `Subslice`

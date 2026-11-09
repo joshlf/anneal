@@ -37,10 +37,12 @@ enums (`Variants.Multiple` + `TagEncoding.Direct`):
 15. `step_enum_self_copy_dead_or_uninit_simulation`
 16. `step_enum_self_copy_overlap_divergence`
 17. `step_enum_copy_move_uninitInd_divergence`
+18. `step_return_enum_lm2_3_simulation`
+19. `step_return_enum_uninitInd_divergence`
 
-Every lockstep simulation theorem covers both valid `.step` / `.emitStep`
-transitions and lockstep `.ub` transitions on `.dead`, `.uninit`, and
-inactive-variant accesses, paired with explicit divergence theorems at the
+Every lockstep simulation theorem covers both valid `.step` / `.emitStep` /
+`.retNormal` transitions and lockstep `.ub` transitions on `.dead`, `.uninit`,
+and inactive-variant accesses, paired with explicit divergence theorems at the
 typed-value vs. raw-byte abstraction boundaries.
 -/
 
@@ -10427,5 +10429,214 @@ theorem step_enum_copy_move_uninitInd_divergence
           exact ⟨_, miri_step_at_statement_ok _ hframes hframe.body_eq
             hframe.location_eq hbb hstmt hm_ok rfl
             (hloc_end.trans hframe.location_eq)⟩
+
+/-! ## 12. Root-Frame Enum-Returning `Terminator.Return` Simulation -/
+
+/-- `annealControlHooks.returnOperand` extracts `.ok (.indirect mp)` when root
+return local `_0` holds `.live (.indirect mp)`. -/
+theorem annealControlHooks_returnOperand_indirect_lm2_3
+    {m : AnnealStepState}
+    {topFrame :
+      Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {mp : Miri.Interpreter.MemPlace AnnealProv}
+    {lay : Option Miri.Interpreter.LocalLayout}
+    (hframes : m.stack.frames = #[topFrame])
+    (hget0 : topFrame.getLocal 0 = .ok ⟨.live (.indirect mp), lay⟩) :
+    annealControlHooks.returnOperand () m = (m, .ok (.indirect mp)) := by
+  unfold annealControlHooks
+  dsimp only
+  rw [stack_currentFrame?_singleton m.stack topFrame hframes]
+  dsimp only
+  rw [hget0]
+
+/-- Outcome correspondence for root-frame `Terminator.Return` when `_0` is a
+multi-variant enum in `env` (`env decl0.ty = some (tagBytes, variants)`):
+* `retRootEnum`: Anneal returns `.retNormal (.aggregate v_act fieldVals) mem'`,
+  while `lean-miri` returns `.indirect mp0` via `returnOperand`, pops the root
+  frame (`m' = { m with stack := ⟨#[]⟩ }`), and preserves
+  `EnumMemRel m'.machine decl0.ty body.layouts tagBytes variants v_act
+  fieldVals mp0` in the post-return machine `m'`;
+* `ub`: dead or immediate-uninitialized `_0` raises undefined behavior on both
+  sides. -/
+inductive StepRelEnumReturnLM2_3
+    (body : CapturedMir)
+    (env : EnumTypeEnv)
+    (m : AnnealStepState) :
+    MirStepNode →
+    Miri.Interpreter.StepResult AnnealStepState Bool →
+    Prop where
+  | retRootEnum (decl0 : LocalDecl) (tagBytes : Nat)
+      (variants : List (List StructFieldDesc))
+      (v_act : Nat) (fieldVals : List Value)
+      (mp0 : Miri.Interpreter.MemPlace AnnealProv)
+      (mem' : Memory) (m' : AnnealStepState) :
+      get? body.localDecls 0 = some decl0 →
+      env decl0.ty = some (tagBytes, variants) →
+      annealControlHooks.returnOperand () m = (m, .ok (.indirect mp0)) →
+      EnumMemRel m'.machine decl0.ty body.layouts tagBytes variants
+        v_act fieldVals mp0 →
+      m' = { m with stack := ⟨#[]⟩ } →
+      StepRelEnumReturnLM2_3 body env m
+        (.retNormal (.aggregate v_act fieldVals) mem') (m', .ok true)
+  | ub (m' : AnnealStepState) (msg : String) :
+      StepRelEnumReturnLM2_3 body env m
+        (.fail .ub) (m', .error (.undefinedBehavior msg))
+
+/-- Root-frame `Terminator.Return` step simulation when `_0` is a multi-variant
+enum in `env` (`env decl0.ty = some (tagBytes, variants)`):
+* `.dead` `_0` → lockstep `StepRelEnumReturnLM2_3.ub` (`"read of dead local"`).
+* `.uninit` immediate `_0` → lockstep `StepRelEnumReturnLM2_3.ub`
+  (`"read of uninitialized local"`).
+* `.init (.aggregate v_act fieldVals)` `_0` → lockstep
+  `StepRelEnumReturnLM2_3.retRootEnum`, returning
+  `.retNormal (.aggregate v_act fieldVals) s.memory` in Anneal and popping the
+  root frame in `lean-miri` with `returnOperand () m = (m, .ok (.indirect mp0))`
+  and `EnumMemRel` holding on `mp0` in the post-return machine. -/
+theorem step_return_enum_lm2_3_simulation
+    {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_3 body env allocBudget s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {decl0 : LocalDecl}
+    {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hcleanup : bb.isCleanup = false)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .return_)
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (henv0 : env decl0.ty = some (tagBytes, variants))
+    (huninit_imm0 : get? s.frame.locals 0 = some .uninit →
+      IsImmediateStepLocal m 0) :
+    StepRelEnumReturnLM2_3 body env m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step
+        (annealStepHooksLM2_3 body.localDecls body.layouts) () m) := by
+  rcases hstate with ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+    _, hcal, hstack, _, _, _, _⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by
+    simp [hstmt_len]
+  simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+  rw [miri_step_LM2_3_eq_at_terminator hframes hframe.body_eq
+      hframe.location_eq hbb hstmt_none,
+    miri_step_at_terminator hframes hframe.body_eq hframe.location_eq
+      hbb hstmt_none]
+  obtain ⟨slot0, mls0, hlt0, hslot0, hmls0_eq, hloc0⟩ :=
+    hframe.lookup_local hdecl0
+  have hmls0 : topFrame.locals[0]? = some mls0 := by
+    rw [Array.getElem?_eq_getElem hlt0, hmls0_eq]
+  have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
+  unfold evalTerminator translateTerminator
+    Miri.Interpreter.ControlFlow.evalTerminator
+  rw [hterm, hstack, annealTerminatorHooks_toControlHooks, hslot0]
+  dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  cases hloc0 with
+  | base _ _ hnone _ =>
+    rw [henv0] at hnone; cases hnone
+  | enumDead _ _ _ _ _ _ =>
+    rw [returnFromCurrentFrame_of_error annealControlHooks hframes
+      hframe.body_eq hframe.location_eq hbb hcleanup
+      (annealControlHooks_returnOperand_dead hframes hget0)]
+    exact .ub _ _
+  | enumUninitImm _ _ _ _ _ _ =>
+    rw [returnFromCurrentFrame_of_error annealControlHooks hframes
+      hframe.body_eq hframe.location_eq hbb hcleanup
+      (annealControlHooks_returnOperand_uninit hframes hget0)]
+    exact .ub _ _
+  | enumUninitInd _ _ mp0 c0 _ _ _ =>
+    exact False.elim
+      (huninit_imm0 hslot0 topFrame hframes ⟨.live (.indirect mp0), c0⟩
+        hmls0 mp0 rfl)
+  | enumInd tb0 vs0 v_act fieldVals mp0 _ henv_0 _ hemr =>
+    rw [henv0] at henv_0
+    injection henv_0 with hp0; rcases hp0 with ⟨rfl, rfl⟩
+    have hop0 := annealControlHooks_returnOperand_indirect_lm2_3 hframes hget0
+    rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+      hframe.location_eq hbb hcleanup hretCont hop0
+      (annealControlHooks_popFrame_singleton hframes)
+      (annealControlHooks_copyReturn_empty _ hretPlace)
+      (annealControlHooks_cleanupFrame_eq false topFrame _)]
+    exact .retRootEnum decl0 tagBytes variants v_act fieldVals mp0 s.memory _
+      hdecl0 henv0 hop0 hemr rfl
+
+/-- Indirect-uninitialized root-frame enum return divergence
+(`Terminator.Return` when `_0` is in `LocalRelLM2_3.enumUninitInd` — i.e.,
+`get? s.frame.locals 0 = some .uninit` and `¬ IsImmediateStepLocal m 0`):
+* Anneal's `evalTerminator` checks `get? s.frame.locals 0 = some .uninit` and
+  fails with `MirStepNode.fail .ub`.
+* Vendored `lean-miri`'s `returnOperand` inspects `topFrame.locals[0]`, sees
+  `.live (.indirect mp0)` without checking whether `mp0`'s backing bytes are
+  initialized, pops the root frame, and steps
+  `({ m with stack := ⟨#[]⟩ }, .ok true)` with `UninitEnumMemRel` holding on
+  `mp0`.
+This proves that the `get? s.frame.locals 0 = some .uninit →
+IsImmediateStepLocal m 0` hypothesis in `step_return_enum_lm2_3_simulation` is
+exact and sharp. -/
+theorem step_return_enum_uninitInd_divergence
+    {body : CapturedMir} {env : EnumTypeEnv} {allocBudget : Nat}
+    {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_3 body env allocBudget s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {decl0 : LocalDecl}
+    {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hcleanup : bb.isCleanup = false)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hterm : bb.terminator.kind = .return_)
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (henv0 : env decl0.ty = some (tagBytes, variants))
+    (huninit0 : get? s.frame.locals 0 = some .uninit)
+    (hnot_imm0 : ¬ IsImmediateStepLocal m 0) :
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    ∃ mp0,
+      annealControlHooks.returnOperand () m = (m, .ok (.indirect mp0)) ∧
+      UninitEnumMemRel m.machine decl0.ty body.layouts tagBytes variants mp0 ∧
+      Miri.Interpreter.Step.step
+        (annealStepHooksLM2_3 body.localDecls body.layouts) () m =
+      ({ m with stack := ⟨#[]⟩ }, .ok true) := by
+  rcases hstate with ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+    _, hcal, hstack, _, _, _, _⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by
+    simp [hstmt_len]
+  simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+  rw [miri_step_LM2_3_eq_at_terminator hframes hframe.body_eq
+      hframe.location_eq hbb hstmt_none,
+    miri_step_at_terminator hframes hframe.body_eq hframe.location_eq
+      hbb hstmt_none]
+  obtain ⟨slot0, mls0, hlt0, hslot0, hmls0_eq, hloc0⟩ :=
+    hframe.lookup_local hdecl0
+  rw [huninit0] at hslot0
+  injection hslot0 with hs0; subst hs0
+  have hmls0 : topFrame.locals[0]? = some mls0 := by
+    rw [Array.getElem?_eq_getElem hlt0, hmls0_eq]
+  have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
+  unfold evalTerminator translateTerminator
+    Miri.Interpreter.ControlFlow.evalTerminator
+  rw [hterm, hstack, annealTerminatorHooks_toControlHooks, huninit0]
+  dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  refine ⟨rfl, ?_⟩
+  cases hloc0 with
+  | base _ _ hnone _ =>
+    rw [henv0] at hnone; cases hnone
+  | enumUninitImm _ _ _ _ _ _ =>
+    exfalso; apply hnot_imm0
+    intro tf' hf' mls' hget' mp' hcontr
+    rw [hframes] at hf'
+    injection hf' with ha; injection ha with ht; subst ht
+    rw [hmls0] at hget'
+    injection hget' with hm_eq; subst hm_eq; cases hcontr
+  | enumUninitInd tb0 vs0 mp0 _ henv_0 _ humpr =>
+    rw [henv0] at henv_0
+    injection henv_0 with hp0; rcases hp0 with ⟨rfl, rfl⟩
+    have hop0 := annealControlHooks_returnOperand_indirect_lm2_3 hframes hget0
+    rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+      hframe.location_eq hbb hcleanup hretCont hop0
+      (annealControlHooks_popFrame_singleton hframes)
+      (annealControlHooks_copyReturn_empty _ hretPlace)
+      (annealControlHooks_cleanupFrame_eq false topFrame _)]
+    exact ⟨mp0, hop0, humpr, rfl⟩
 
 end LeanMiriSpec.Correspondence

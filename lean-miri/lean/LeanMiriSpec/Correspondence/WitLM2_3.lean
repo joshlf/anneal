@@ -118,6 +118,17 @@ exercising all five `LM-2.3` simulation theorems plus control-flow helpers and
     (copy vs. move)` quadrants (`_1 = copy _1`, `_1 = move _1`, `_4 = copy _1`,
     and `_4 = move _1`) fail `.ub` in Anneal while stepping `.ok true` in
     `lean-miri` (`step_enum_copy_move_uninitInd_divergence`).
+19. `wit_lm2_3_return_enum_and_ub`: constructs an enum-returning MIR body
+    `lm23ReturnEnumBody` (`_0 : Lm23Enum`) and proves:
+    - `_0 = Lm23Enum::V2(42_u32, 99_u64); return` returns
+      `.aggregate 2 [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩]` in lockstep with
+      `returnOperand = .ok (.indirect mp0)` and `EnumMemRel` on `mp0`
+      (`step_return_enum_lm2_3_simulation`);
+    - `return` on immediate `.uninit` `_0` and on `.dead` `_0` traps with
+      undefined behavior in lockstep (`step_return_enum_lm2_3_simulation`);
+    - `return` on indirect `.uninit` (`enumUninitInd`) `_0` fails `.ub` in
+      Anneal while returning `.indirect mp0` and stepping `.ok true` in
+      `lean-miri` (`step_return_enum_uninitInd_divergence`).
 -/
 
 namespace LeanMiriSpec.Correspondence.Witness
@@ -2354,5 +2365,378 @@ theorem wit_lm2_3_uninitInd_copy_and_move_divergence :
       (srcDecl := lm23Decl lm23EnumTy) (dstDecl := lm23Decl lm23EnumTy)
       rfl rfl rfl rfl rfl hnot_imm4 (by intro h; cases h)
     exact ⟨m_u4, m₄, hst_u4, hnot_imm4, ha_ub, hm₄⟩
+
+/-! ## 20. Witness 19: Root-Frame Enum Return and `enumUninitInd` Boundary -/
+
+theorem stepRelEnumReturnLM2_3_inv_ret {body : CapturedMir} {env : EnumTypeEnv}
+    {m : AnnealStepState} {v_act : Nat} {fieldVals : List Value} {mem : Memory}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepRelEnumReturnLM2_3 body env m
+      (.retNormal (.aggregate v_act fieldVals) mem) mRes) :
+    ∃ d0 tagBytes variants mp0 m',
+      mRes = (m', .ok true) ∧
+      get? body.localDecls 0 = some d0 ∧
+      env d0.ty = some (tagBytes, variants) ∧
+      annealControlHooks.returnOperand () m = (m, .ok (.indirect mp0)) ∧
+      EnumMemRel m'.machine d0.ty body.layouts tagBytes variants
+        v_act fieldVals mp0 ∧
+      m' = { m with stack := ⟨#[]⟩ } := by
+  generalize ha :
+    MirStepNode.retNormal (.aggregate v_act fieldVals) mem = aRes at h
+  cases h with
+  | retRootEnum d0 tb vs v₁ fvs mp0 mem₁ m' hd0 henv0 hop0 hemr hm' =>
+    dsimp [MirStepNode.retNormal] at ha
+    injection ha with hr
+    injection hr with hp
+    injection hp with hv _
+    injection hv with hv_eq hf_eq
+    subst hv_eq hf_eq
+    exact ⟨d0, tb, vs, mp0, m', rfl, hd0, henv0, hop0, hemr, hm'⟩
+  | ub _ _ => cases ha
+
+theorem stepRelEnumReturnLM2_3_inv_ub {body : CapturedMir} {env : EnumTypeEnv}
+    {m : AnnealStepState}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    (h : StepRelEnumReturnLM2_3 body env m (.fail .ub) mRes) :
+    ∃ m' msg, mRes = (m', .error (.undefinedBehavior msg)) := by
+  generalize ha : MirStepNode.fail .ub = aRes at h
+  cases h with
+  | retRootEnum _ _ _ _ _ _ _ _ _ _ _ _ _ => cases ha
+  | ub m' msg => exact ⟨m', msg, rfl⟩
+
+def lm23ReturnEnumFnAbi : FnAbi :=
+  { args := [], ret := { layout := lm23EnumLayout, mode := .direct },
+    conv := .rust, canUnwind := false }
+
+/-- Enum-returning MIR body (`fn() -> Lm23Enum`, `_0 : Lm23Enum`):
+* `bb0`: `_0 = Lm23Enum::V2(42_u32, 99_u64); return`;
+* `bb1`: `return` (exercising immediate `.uninit` `_0` UB, `.dead` `_0` UB, and
+  indirect `enumUninitInd` `_0` return divergence). -/
+def lm23ReturnEnumBody : CapturedMir where
+  defPath := "lm_2_3_witness::return_enum"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [lm23Decl lm23EnumTy]
+  basicBlocks :=
+    [ { statements := [lm23AggV2ConstStmt 0 42 99]
+        terminator := lm23Term .return_
+        isCleanup := false }
+    , { statements := []
+        terminator := lm23Term .return_
+        isCleanup := false } ]
+  fnAbi := lm23ReturnEnumFnAbi
+  layouts := lm23Layouts
+  allocations := []
+
+theorem lm23Ret_phase : ∀ p, lm23ReturnEnumBody.phase ≠ .other p := by
+  intro p h; cases h
+
+abbrev lm23RetHooks :=
+  annealStepHooksLM2_3 lm23ReturnEnumBody.localDecls lm23ReturnEnumBody.layouts
+
+def lm23RetInitAnneal (b : Nat) : MachineState :=
+  { frame := { blockIdx := b, stmtIdx := 0, locals := [.uninit] }
+    memory := (initMachineState lm23ReturnEnumBody []).memory }
+
+def lm23RetInitMiriFrame (b : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody lm23ReturnEnumBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace :=
+      .frameLocal 0 0 none (translateTy lm23EnumTy lm23Layouts)
+        (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[{ value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨b, 0⟩ }
+
+def lm23RetInitMiri (b : Nat) : AnnealStepState :=
+  { stack := ⟨#[lm23RetInitMiriFrame b]⟩, machine := AnnealMachine.empty }
+
+theorem lm23Ret_init_stateRelLM2_3 (b budget : Nat)
+    (hbud : 1 + budget < 2 ^ 32) :
+    StateRelLM2_3 lm23ReturnEnumBody lm23Env budget
+      (lm23RetInitAnneal b) (lm23RetInitMiri b) := by
+  refine StateRelLM2_3.mk (lm23RetInitMiriFrame b) rfl rfl
+    ⟨translateTy lm23EnumTy lm23Layouts, rfl⟩
+    ⟨rfl, rfl, rfl, rfl, ?_⟩
+    (Or.inr (AllocIdWatermark.empty budget hbud))
+    rfl rfl rfl rfl rfl
+    (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 => rintro ⟨⟩
+      | _ + 1 => rintro ⟨⟩)
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hd : decl = lm23Decl lm23EnumTy := by
+      simpa [lm23ReturnEnumBody, get?] using hdecl.symm
+    have hs : slot = .uninit := by
+      simpa [lm23RetInitAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [lm23RetInitMiriFrame] using hmls.symm
+    subst hd hs hm
+    exact .enumUninitImm 4 lm23Variants none rfl lm23_validEnumLayout
+      (fun _ h => nomatch h)
+  | _ + 1 =>
+    simp [lm23ReturnEnumBody, get?] at hdecl
+
+theorem lm23Ret_init_imm (b j : Nat) :
+    IsImmediateStepLocal (lm23RetInitMiri b) j := by
+  intro tf hframes mls hmls mp hv
+  have htf : lm23RetInitMiriFrame b = tf := by
+    simpa [lm23RetInitMiri] using hframes
+  subst htf
+  match j with
+  | 0 => simp [lm23RetInitMiriFrame] at hmls; subst hmls; cases hv
+  | _ + 1 => simp [lm23RetInitMiriFrame] at hmls
+
+def lm23RetDeadAnneal (b : Nat) : MachineState :=
+  { frame := { blockIdx := b, stmtIdx := 0, locals := [.dead] }
+    memory := (initMachineState lm23ReturnEnumBody []).memory }
+
+def lm23RetDeadMiriFrame (b : Nat) :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { lm23RetInitMiriFrame b with
+    locals := #[{ value := .dead, layout := none }] }
+
+def lm23RetDeadMiri (b : Nat) : AnnealStepState :=
+  { stack := ⟨#[lm23RetDeadMiriFrame b]⟩, machine := AnnealMachine.empty }
+
+theorem lm23Ret_dead_stateRelLM2_3 (b budget : Nat)
+    (hbud : 1 + budget < 2 ^ 32) :
+    StateRelLM2_3 lm23ReturnEnumBody lm23Env budget
+      (lm23RetDeadAnneal b) (lm23RetDeadMiri b) := by
+  refine StateRelLM2_3.mk (lm23RetDeadMiriFrame b) rfl rfl
+    ⟨translateTy lm23EnumTy lm23Layouts, rfl⟩
+    ⟨rfl, rfl, rfl, rfl, ?_⟩
+    (Or.inr (AllocIdWatermark.empty budget hbud))
+    rfl rfl rfl rfl rfl
+    (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 => rintro ⟨⟩
+      | _ + 1 => rintro ⟨⟩)
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hd : decl = lm23Decl lm23EnumTy := by
+      simpa [lm23ReturnEnumBody, get?] using hdecl.symm
+    have hs : slot = .dead := by
+      simpa [lm23RetDeadAnneal, get?] using hslot.symm
+    have hm : mls = { value := .dead, layout := none } := by
+      simpa [lm23RetDeadMiriFrame, lm23RetInitMiriFrame] using hmls.symm
+    subst hd hs hm
+    exact .enumDead 4 lm23Variants none rfl lm23_validEnumLayout
+      (fun _ h => nomatch h)
+  | _ + 1 =>
+    simp [lm23ReturnEnumBody, get?] at hdecl
+
+theorem lm23Ret_materialize_uninitInd0 {budget : Nat} {s : MachineState}
+    {m : AnnealStepState}
+    (hst : StateRelLM2_3 lm23ReturnEnumBody lm23Env (budget + 1) s m)
+    (hs0 : get? s.frame.locals 0 = some .uninit) :
+    ∃ m_u : AnnealStepState,
+      StateRelLM2_3 lm23ReturnEnumBody lm23Env budget s m_u ∧
+      ¬ IsImmediateStepLocal m_u 0 := by
+  rcases hst with ⟨topFrame, hframes, hretC, ⟨retLay, hretP⟩, hframe, halloc,
+    hcal, hcs, hbor, hprot, hcaller, _⟩
+  let wholeLay := translateTy lm23EnumTy lm23Layouts
+  have hlt0 : 0 < topFrame.locals.size := by
+    rw [hframe.mf_locals_size]; decide
+  obtain ⟨rawAlloc, _, hbs0, hlen0, hmut0, hpmap0, hmask0⟩ :=
+    tryNew_uninit_of_pow2_le_29 wholeLay.layout.size wholeLay.layout.align.abi
+      lm23_validEnumLayout.align_pow2_le
+  obtain ⟨mem', newId, hres, _, hlive_eq, hfresh_old, hwm_next, hovf_all⟩ :=
+    halloc.of_succ.reserve_step
+  let a0 := rawAlloc.withExtra (none : Option Miri.TreeBorrows.BorrowTree)
+  let mach_u := stackAllocMachine m.machine mem' newId a0
+  let tf_u :=
+    { topFrame with
+      locals := topFrame.locals.set 0
+        ⟨.live (.indirect (stackAllocPlace newId)), some wholeLay⟩ hlt0 }
+  let m_u : AnnealStepState := ⟨⟨#[tf_u]⟩, mach_u⟩
+  have hfresh : mem'.live.any (fun entry => entry.1 == newId) = false := by
+    rw [hlive_eq]; exact hfresh_old
+  have hlive_u : LiveAllocEntry mach_u.memory.live newId ⟨.stack, a0⟩ :=
+    LiveAllocEntry.of_push_fresh_self ⟨.stack, a0⟩ hfresh
+  have hbase_u :
+      mach_u.lookupBaseAddr newId = some (annealStackBaseAddr newId) :=
+    lookupBaseAddr_stackAllocMachine_self m.machine mem' newId a0
+  have hovf_u := hovf_all _ lm23_validEnumLayout.size_lt_4gib
+  have halign_u :=
+    annealStackBaseAddr_isAligned newId _ lm23_validEnumLayout.align_pow2_le
+  have hlen_a0 : a0.len = a0.byteSize.bytes.toNat := by
+    dsimp [a0]; rw [hlen0, ← hbs0]
+  have humpr :
+      UninitEnumMemRel mach_u lm23EnumTy lm23Layouts 4 lm23Variants
+        (stackAllocPlace newId) :=
+    .mk newId Miri.Memory.BorTag.one (annealStackBaseAddr newId) ⟨.stack, a0⟩
+      lm23_validEnumLayout rfl rfl rfl hlive_u hbase_u rfl hovf_u hmut0 halign_u
+      hbs0 hlen_a0 hpmap0 hmask0
+  have hdecl0 :
+      get? lm23ReturnEnumBody.localDecls 0 = some (lm23Decl lm23EnumTy) := rfl
+  have hfr_u : FrameRelLM2_3 lm23ReturnEnumBody lm23Env mach_u s.frame tf_u := by
+    refine ⟨hframe.body_eq, hframe.location_eq, hframe.af_locals_len, ?_, ?_⟩
+    · dsimp [tf_u]; rw [Array.size_set]; exact hframe.mf_locals_size
+    · intro j d sl mls hd hsl hm
+      match j with
+      | 0 =>
+        rw [hdecl0] at hd
+        have hd_eq : d = lm23Decl lm23EnumTy := (Option.some.inj hd).symm
+        have hsl_eq : sl = .uninit := by
+          rw [hs0] at hsl; exact (Option.some.inj hsl).symm
+        dsimp [tf_u] at hm
+        rw [Array.getElem?_set_self hlt0] at hm
+        have hm_eq :
+            mls = ⟨.live (.indirect (stackAllocPlace newId)), some wholeLay⟩ :=
+          (Option.some.inj hm).symm
+        subst hd_eq hsl_eq hm_eq
+        exact .enumUninitInd 4 lm23Variants (stackAllocPlace newId)
+          (some wholeLay) rfl
+          (fun _ hl => (Option.some.inj (Option.mem_def.mp hl)).symm) humpr
+      | _ + 1 =>
+        simp [lm23ReturnEnumBody, get?] at hd
+  have hdisj_u : MemoryAllocDisjoint tf_u := by
+    intro i j _ _ _ _ hij hi hj
+    have hsz : tf_u.locals.size = 1 := by
+      dsimp [tf_u]; rw [Array.size_set]; exact hframe.mf_locals_size
+    have hi_lt := (Array.getElem?_eq_some_iff.mp hi).1
+    have hj_lt := (Array.getElem?_eq_some_iff.mp hj).1
+    omega
+  have hnot_imm : ¬ IsImmediateStepLocal m_u 0 := by
+    intro himm
+    have hget_u :
+        tf_u.locals[0]? =
+          some ⟨.live (.indirect (stackAllocPlace newId)), some wholeLay⟩ := by
+      dsimp [tf_u]; rw [Array.getElem?_set_self hlt0]
+    exact himm tf_u rfl _ hget_u (stackAllocPlace newId) rfl
+  exact ⟨m_u,
+    .mk tf_u rfl hretC ⟨retLay, hretP⟩ hfr_u (Or.inr (hwm_next _))
+      hcal hcs hbor hprot hcaller hdisj_u,
+    hnot_imm⟩
+
+def lm23RetBb0S1 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 1,
+               locals := [.init (.aggregate 2
+                 [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩])] }
+    memory := (initMachineState lm23ReturnEnumBody []).memory }
+
+theorem lm23Ret_bb0_a1 :
+    stepMirFn lm23ReturnEnumBody (lm23RetInitAnneal 0) = .step lm23RetBb0S1 := rfl
+
+theorem lm23Ret_bb0_a2 :
+    stepMirFn lm23ReturnEnumBody lm23RetBb0S1 =
+      .retNormal (.aggregate 2 [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩])
+        lm23RetBb0S1.memory := rfl
+
+/-- **Witness 19 (`wit_lm2_3_return_enum_and_ub`)**:
+Exercises `step_return_enum_lm2_3_simulation` and
+`step_return_enum_uninitInd_divergence` on `lm23ReturnEnumBody`
+(`_0 : Lm23Enum`):
+1. `bb0`: `_0 = Lm23Enum::V2(42_u32, 99_u64); return` steps to `lm23RetBb0S1`
+   and returns `.retNormal (.aggregate 2 [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩])`
+   in lockstep with
+   `annealControlHooks.returnOperand () m₁ = (m₁, .ok (.indirect mp0))`
+   and `EnumMemRel m₂.machine lm23EnumTy lm23Layouts 4 lm23Variants 2
+   [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩] mp0` in `m₂ = { m₁ with stack := ⟨#[]⟩ }`;
+2. `bb1` on immediate `.uninit` `_0`: `return` traps with `.ub` in lockstep;
+3. `bb1` on `.dead` `_0`: `return` traps with `.ub` in lockstep;
+4. `bb1` on indirect `.uninit` (`enumUninitInd`) `_0`: Anneal traps with
+   `.fail .ub`, while `lean-miri` returns `.indirect mp_u0` with
+   `UninitEnumMemRel` and steps `({ m_u0 with stack := ⟨#[]⟩ }, .ok true)`. -/
+theorem wit_lm2_3_return_enum_and_ub :
+    (∃ m₁ m₂ mp0,
+      Miri.Interpreter.Step.step lm23RetHooks () (lm23RetInitMiri 0) =
+        (m₁, .ok true) ∧
+      StateRelLM2_3 lm23ReturnEnumBody lm23Env 0 lm23RetBb0S1 m₁ ∧
+      Miri.Interpreter.Step.step lm23RetHooks () m₁ = (m₂, .ok true) ∧
+      annealControlHooks.returnOperand () m₁ = (m₁, .ok (.indirect mp0)) ∧
+      EnumMemRel m₂.machine lm23EnumTy lm23Layouts 4 lm23Variants 2
+        [.scalar ⟨42, 4⟩, .scalar ⟨99, 8⟩] mp0 ∧
+      m₂ = { m₁ with stack := ⟨#[]⟩ }) ∧
+    (∃ m_err1 msg1,
+      stepMirFn lm23ReturnEnumBody (lm23RetInitAnneal 1) = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23RetHooks () (lm23RetInitMiri 1) =
+        (m_err1, .error (.undefinedBehavior msg1))) ∧
+    (∃ m_err2 msg2,
+      stepMirFn lm23ReturnEnumBody (lm23RetDeadAnneal 1) = .fail .ub ∧
+      Miri.Interpreter.Step.step lm23RetHooks () (lm23RetDeadMiri 1) =
+        (m_err2, .error (.undefinedBehavior msg2))) ∧
+    (∃ m_u0 mp_u0,
+      StateRelLM2_3 lm23ReturnEnumBody lm23Env 0 (lm23RetInitAnneal 1) m_u0 ∧
+      ¬ IsImmediateStepLocal m_u0 0 ∧
+      stepMirFn lm23ReturnEnumBody (lm23RetInitAnneal 1) = .fail .ub ∧
+      annealControlHooks.returnOperand () m_u0 = (m_u0, .ok (.indirect mp_u0)) ∧
+      UninitEnumMemRel m_u0.machine lm23EnumTy lm23Layouts 4 lm23Variants
+        mp_u0 ∧
+      Miri.Interpreter.Step.step lm23RetHooks () m_u0 =
+        ({ m_u0 with stack := ⟨#[]⟩ }, .ok true)) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · have hsim1 := evalRvalue_aggregate_enum_simulation
+      (lm23Ret_init_stateRelLM2_3 0 1 (by decide)) lm23_env_valid lm23Ret_phase
+      rfl rfl rfl (dstDecl := lm23Decl lm23EnumTy) rfl
+      (tagBytes := 4) (variants := lm23Variants) rfl (by decide) rfl
+      (fun tf i hi _ => by
+        have hi' : i < 2 := hi
+        match i with
+        | 0 =>
+          exact .constScalar (lm23ConstU32 42) ⟨42, 4⟩ rfl lm23_isPrim_u32
+            (Or.inr (Or.inr (Or.inl rfl))) (by decide) rfl
+            (fun h => nomatch h) (fun h => nomatch h)
+        | 1 =>
+          exact .constScalar (lm23ConstU64 99) ⟨99, 8⟩ rfl lm23_isPrim_u64
+            (Or.inr (Or.inr (Or.inr (Or.inl rfl)))) (by decide) rfl
+            (fun h => nomatch h) (fun h => nomatch h)
+        | _ + 2 => omega)
+    dsimp only at hsim1
+    rcases hsim1 with ⟨hrel1, _⟩
+    rw [lm23Ret_bb0_a1] at hrel1
+    obtain ⟨m₁, hm₁, hst₁⟩ := stepRelLM2_3_inv_step hrel1
+    have hsim2 := step_return_enum_lm2_3_simulation
+      hst₁ lm23Ret_phase rfl rfl rfl rfl rfl
+      (decl0 := lm23Decl lm23EnumTy) rfl rfl
+      (by intro h; cases h)
+    rw [lm23Ret_bb0_a2] at hsim2
+    obtain ⟨d0, tb, vs, mp0, m₂, hm₂, hd0, henv0, hop0, hemr, hm₂_eq⟩ :=
+      stepRelEnumReturnLM2_3_inv_ret hsim2
+    have hd0_eq : d0 = lm23Decl lm23EnumTy := Option.some.inj hd0.symm
+    subst hd0_eq
+    have henv0_eq : (tb, vs) = (4, lm23Variants) := Option.some.inj henv0.symm
+    rcases Prod.mk.inj henv0_eq with ⟨rfl, rfl⟩
+    exact ⟨m₁, m₂, mp0, hm₁, hst₁, hm₂, hop0, hemr, hm₂_eq⟩
+  · have hsim := step_return_enum_lm2_3_simulation
+      (lm23Ret_init_stateRelLM2_3 1 0 (by decide)) lm23Ret_phase
+      rfl rfl rfl rfl rfl (decl0 := lm23Decl lm23EnumTy) rfl rfl
+      (fun _ => lm23Ret_init_imm 1 0)
+    have ha_ub :
+        stepMirFn lm23ReturnEnumBody (lm23RetInitAnneal 1) = .fail .ub := rfl
+    rw [ha_ub] at hsim
+    obtain ⟨m_err1, msg1, hm_err1⟩ := stepRelEnumReturnLM2_3_inv_ub hsim
+    exact ⟨m_err1, msg1, ha_ub, hm_err1⟩
+  · have hsim := step_return_enum_lm2_3_simulation
+      (lm23Ret_dead_stateRelLM2_3 1 0 (by decide)) lm23Ret_phase
+      rfl rfl rfl rfl rfl (decl0 := lm23Decl lm23EnumTy) rfl rfl
+      (by intro h; cases h)
+    have ha_ub :
+        stepMirFn lm23ReturnEnumBody (lm23RetDeadAnneal 1) = .fail .ub := rfl
+    rw [ha_ub] at hsim
+    obtain ⟨m_err2, msg2, hm_err2⟩ := stepRelEnumReturnLM2_3_inv_ub hsim
+    exact ⟨m_err2, msg2, ha_ub, hm_err2⟩
+  · obtain ⟨m_u0, hst_u0, hnot_imm0⟩ := lm23Ret_materialize_uninitInd0
+      (budget := 0) (lm23Ret_init_stateRelLM2_3 1 1 (by decide)) rfl
+    obtain ⟨ha_ub, mp_u0, hop_u0, humpr_u0, hm_u0⟩ :=
+      step_return_enum_uninitInd_divergence
+        hst_u0 lm23Ret_phase rfl rfl rfl rfl rfl
+        (decl0 := lm23Decl lm23EnumTy) rfl rfl rfl hnot_imm0
+    exact ⟨m_u0, mp_u0, hst_u0, hnot_imm0, ha_ub, hop_u0, humpr_u0, hm_u0⟩
 
 end LeanMiriSpec.Correspondence.Witness
