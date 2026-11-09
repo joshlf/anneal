@@ -17739,6 +17739,164 @@ example :
   ⟨w6_write_bytes_oob_ub, w3_arith_offset_uninit_ub, w6_exact_div_non_multiple_ub,
     w6_assume_false_ub⟩
 
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir} (hfrag : InSafeScalarFragment body) (postA : Value → Prop)
+    (postM : Miri.Interpreter.Operand AnnealProv → Prop)
+    (hpost : ∀ retVal v, ImmediateRetRel body retVal v → (postA retVal ↔ postM v))
+    (k : Trusted.Effect.FailureKind) :
+    ((miriSystem (annealMiriHooks body)).PartialCorrect (miriEntryState body) postM ↔
+      ∀ tr retVal mem, ReachesRet (mirCallTree body []) tr (.normal (retVal, mem)) →
+        postA retVal) ∧
+    (∀ o, (miriSystem (annealMiriHooks body)).ReachesOutcome (miriEntryState body) o →
+      o.isReturn ∨ ∃ e, o = .undefinedBehavior e) ∧
+    (MirReachesFault (mirCallTree body []) k → k = .ub) ∧
+    (MirReachesFault (mirCallTree body []) k ↔
+      ∃ o, (miriSystem (annealMiriHooks body)).ReachesOutcome (miriEntryState body) o ∧
+        outcomeFaultClass o = some (annealFaultClass k)) :=
+  ⟨scalarFragment_partialCorrect_iff hfrag postA postM hpost, scalarFragment_outcomes hfrag,
+    scalarFragment_faults_ub hfrag, scalarFragment_reachesFault_iff hfrag k⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m a, StateRelLM3_1 body s m a → Frag s m → ∃ a',
+      StepObsRelLM3_1 body m a' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_1 body s' m' a' → Frag s' m') :
+    StepClosedSim body (rootHooks core) (fun s m => (∃ a, StateRelLM3_1 body s m a) ∧ Frag s m)
+      (fun r v => ∃ a, PtrRetRel body a r v) :=
+  stepClosedSim_of_stepObsRelLM3_1 h
+
+open LeanMiriSpec.Correspondence.Safety in
+example {body : CapturedMir}
+    {core : Unit → AnnealStepState → Miri.Interpreter.StepResult AnnealStepState Bool}
+    {env : StructTypeEnv} {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m stEnv b, StateRelLM2_2 body env stEnv b s m → Frag s m →
+      (∃ stEnv' b', StepRelLM2_2 body env stEnv' b' m (stepMirFn body s) (core () m) ∧
+        ∀ s' m', core () m = (m', .ok true) → StateRelLM2_2 body env stEnv' b' s' m' →
+          Frag s' m') ∨
+      StepRelStructReturnLM2_2 body fields paths m (stepMirFn body s) (core () m) ∨
+      ((∃ retVal mem, stepMirFn body s = .retNormal retVal mem) ∧
+        StepRel body m (stepMirFn body s) (core () m))) :
+    StepClosedSim body (rootHooks core)
+      (fun s m => (∃ stEnv b, StateRelLM2_2 body env stEnv b s m) ∧ Frag s m)
+      (fun r v => ImmediateRetRel body r v ∨ StructRetRel body fields paths r v) :=
+  stepClosedSim_of_stepRelLM2_2 h
+
+open LeanMiriSpec.Correspondence.Safety in
+example (body : CapturedMir) (env : StructTypeEnv) (immLocals : List Local) {env' : EnumTypeEnv}
+    (henv_valid : ∀ ty tb vs, env' ty = some (tb, vs) → ValidEnumLayout ty body.layouts tb vs)
+    {b : Nat} (hb : b = 0 ∨ 1 + b < 2 ^ 32) :
+    StateRelLM2_2 body env { initLocals := [], immLocals := immLocals } b
+      (initMachineState body []) (miriEntryState body) ∧
+    StateRelLM2_3 body env' b (initMachineState body []) (miriEntryState body) :=
+  ⟨stateRelLM2_2_entry_env body env immLocals hb,
+    stateRelLM2_3_entry_of_budget body henv_valid hb⟩
+
+open LeanMiriSpec.Correspondence.Safety in
+example (m' : AnnealStepState)
+    (r : Except Miri.Interpreter.StepError (Miri.Interpreter.Operand AnnealProv)) :
+    popOutcome m' r = match r with
+      | .ok v => .returned m' v
+      | .error e => .stopped m' e :=
+  by cases r <;> rfl
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ e, (miriSystem (annealMiriHooks tailCallBody)).ReachesOutcome
+      (miriEntryState tailCallBody) (.unsupported e)) ∧
+    ¬ (miriSystem (annealMiriHooks tailCallBody)).Safe (miriEntryState tailCallBody) ∧
+    MirReachesFault (mirCallTree tailCallBody []) .unsupported ∧
+    ¬ TreeSafe (mirCallTree tailCallBody []) :=
+  w1_tail_call_unsupported
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (miriSystem (annealMiriHooks storageDeadZeroBody)).ReachesOutcome
+      (miriEntryState storageDeadZeroBody) (.blocked (.stack .cannotMakeReturnPlaceDead)) ∧
+    ¬ (miriSystem (annealMiriHooks storageDeadZeroBody)).Safe (miriEntryState storageDeadZeroBody) ∧
+    MirReachesUB (mirCallTree storageDeadZeroBody []) ∧
+    ¬ TreeSafe (mirCallTree storageDeadZeroBody []) :=
+  w1_storageDead_returnPlace_class_divergence
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    AgreeReturnsBits ctlzBody (annealMiriHooks ctlzBody) (initMachineState ctlzBody [])
+      (miriEntryState ctlzBody) 4 31 ∧
+    AgreeReturnsBits saturatingAddBody (annealMiriHooks saturatingAddBody)
+      (initMachineState saturatingAddBody []) (miriEntryState saturatingAddBody) 1 255 ∧
+    AgreeReturnsBits (exactDivBody 42) (annealMiriHooks (exactDivBody 42))
+      (initMachineState (exactDivBody 42) []) (miriEntryState (exactDivBody 42)) 4 6 ∧
+    AgreeReturnsBits (assumeBody true) (annealMiriHooks (assumeBody true))
+      (initMachineState (assumeBody true) []) (miriEntryState (assumeBody true)) 1 7 :=
+  ⟨w6_ctlz_returns, w6_saturating_add_returns, w6_exact_div_valid, w6_assume_true⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    TreeSafe (mirCallTree rotateLeftBody []) ∧
+    (∃ tr mem, ReachesRet (mirCallTree rotateLeftBody []) tr (.normal (.scalar ⟨3, 4⟩, mem))) ∧
+    (∃ msg, (miriSystem (annealMiriHooks rotateLeftBody)).ReachesOutcome
+      (miriEntryState rotateLeftBody) (.unsupported (.unsupported msg))) ∧
+    ¬ (miriSystem (annealMiriHooks rotateLeftBody)).Safe (miriEntryState rotateLeftBody) :=
+  w6_rotate_left_unsupported_divergence
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ imm0, AgreeReturns Witness.lm23Body (.ofHooks Witness.lm23Hooks annealControlHooks)
+        (Witness.lm23InitAnneal 0) (Witness.lm23InitMiri 0) (.scalar ⟨99, 8⟩) (.immediate imm0) ∧
+      ImmediateRel Witness.lm23U64Ty Witness.lm23Layouts (.scalar ⟨99, 8⟩) imm0) ∧
+    (∃ v, AgreeReturns Witness.lm22PaddedBody
+        (rootHooks (Miri.Interpreter.Step.step
+          (annealStepHooksLM2_2 Witness.lm22PaddedBody.localDecls Witness.lm22PaddedBody.layouts)))
+        (initMachineState Witness.lm22PaddedBody []) Witness.lm22PaddedMiriInit (.scalar ⟨99, 4⟩) v ∧
+      operandScalarBits? 4 v = some 99) ∧
+    AgreeUB Witness.lm24Body
+      (.ofHooks (annealStepHooksLM2_4 Witness.lm24Body.localDecls Witness.lm24Body.layouts)
+        annealControlHooks)
+      (Witness.lm24InitAnneal 2) (Witness.lm24InitMiri 2) :=
+  ⟨w2_enum_downcast_switch_returns, w2_padded_struct_returns, w2_union_uninit_bytes_ub⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns WitnessLM4_2.arithOffsetPosBody (annealMiriHooks WitnessLM4_2.arithOffsetPosBody)
+        (WitnessLM4_2.ptr4AnnealPre WitnessLM4_2.arithOffsetPosBody)
+        (WitnessLM4_2.ptr4MiriPre WitnessLM4_2.arithOffsetPosBody WitnessLM4_2.rawMutU64K)
+        (.ptr { allocId := 1, offsetBytes := 40 } 8) (.immediate imm0) ∧
+      get? WitnessLM4_2.arithOffsetPosBody.localDecls 0 = some decl0 ∧
+      ImmediateRelLM3_1
+        [rawPtrAllocMapEntry WitnessLM4_2.arithOffsetPosBody.localDecls
+          WitnessLM4_2.arithOffsetPosBody.layouts .mut 1 1 Witness.lm31AllocId1]
+        decl0.ty WitnessLM4_2.arithOffsetPosBody.layouts
+        (.ptr { allocId := 1, offsetBytes := 40 } 8) imm0) ∧
+    (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns retCopyBody (annealMiriHooks retCopyBody) retCopyAnnealPre retCopyMiriPre
+        (.scalar ⟨42, 8⟩) (.immediate imm0) ∧
+      get? retCopyBody.localDecls 0 = some decl0 ∧
+      ImmediateRel decl0.ty retCopyBody.layouts (.scalar ⟨42, 8⟩) imm0) ∧
+    (∃ imm0,
+      AgreeReturns retWriteBytesBody (annealMiriHooks retWriteBytesBody)
+        (WitnessLM4_2.ptr4AnnealPre retWriteBytesBody)
+        (WitnessLM4_2.ptr4MiriPre retWriteBytesBody WitnessLM4_2.u64K)
+        (.scalar ⟨7, 8⟩) (.immediate imm0)) :=
+  ⟨w3_arith_offset_returns, w6_copy_nonoverlapping_disjoint_returns, w6_write_bytes_returns.1⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example (rhs : Nat) (hrhs : rhs < 65536) :
+    StepClosedSim (checkedAddBody rhs) (annealMiriHooks (checkedAddBody rhs)) (CheckedAddInv rhs)
+      (ImmediateRetRel (checkedAddBody rhs)) ∧
+    (TreeSafe (mirCallTree (checkedAddBody rhs) []) ↔
+      (miriSystem (annealMiriHooks (checkedAddBody rhs))).Safe (miriEntryState (checkedAddBody rhs))) :=
+  ⟨checkedAdd_stepClosedSim rhs hrhs, checkedAdd_treeSafe_iff_miriSafe rhs hrhs⟩
+
 open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 #assert_standard_axioms
   CoStep
@@ -17950,15 +18108,51 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   w1_count_loop_returns
   runLoopFuel_of_runMiriBounded
   w2_array_index_returns
-  w2_union_init_prefix_read
-  w3_arith_offset_steps
+  w2_union_init_prefix_lockstep
+  retArithOffsetCall_preserves_imm
+  retArithOffset_trace
+  w3_arith_offset_returns
   w3_arith_offset_uninit_ub
   w4_safe_ref_return
   protReturnHooks
   w5_protector_release_step
-  w6_copy_nonoverlapping_disjoint_steps
-  w6_write_bytes_steps
+  w6_copy_nonoverlapping_disjoint_lockstep
+  w6_write_bytes_lockstep
+  popOutcome
+  PtrRetRel
+  StepObsRelLM3_1.toLockstep
+  stepClosedSim_of_stepObsRelLM3_1
+  StepRel.toLockstepOfRet
+  stateRelLM2_3_entry_of_budget
+  stateRelLM2_2_entry_env
+  anneal_reachesFault_of_runAnnealBounded_faulted
+  rawPtrReturnBody
+  w3_rawPtr_return
+  storageDeadZeroBody
+  w1_storageDead_returnPlace_class_divergence
+  tailCallBody
+  w1_tail_call_unsupported
+  ctlzBody
+  w6_ctlz_returns
+  saturatingAddBody
+  w6_saturating_add_returns
+  rotateLeftBody
+  w6_rotate_left_unsupported_divergence
   w6_write_bytes_oob_ub
+  retWriteBytesBody
+  retWriteBytes_trace
+  w6_write_bytes_returns
+  retCopy_copyStep_preserves_imm
+  retCopyBody
+  retCopy_trace
+  w6_copy_nonoverlapping_disjoint_returns
+  CheckedAddInv
+  checkedAdd_stepClosedSim
+  checkedAdd_entry
+  checkedAdd_treeSafe_iff_miriSafe
+  checkedAdd_reachesUB_iff
+  checkedAdd_partialCorrect_iff
+  w1_checked_add_treeSafe_iff_miriSafe
 
 end StatementPins
 

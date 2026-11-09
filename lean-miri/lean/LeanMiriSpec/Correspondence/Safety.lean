@@ -71,6 +71,10 @@ whole-program statements relating
 4. Run certificates (`MiriPath`, `AnnealPath`, `runLoopFuel` and
    `runAnnealBounded` observations, lassos, `wholeProgram_returns`,
    `wholeProgram_ub`) that turn concrete executions into whole-program facts.
+   `runLoopFuel` reports a root pop whose return-operand read fails as
+   `.stopped` (`popOutcome`), so its outcomes match `miriSystem`'s terminal
+   outcomes one-to-one (`miri_safe_of_runLoopFuel_returned`,
+   `miri_outcome_of_runLoopFuel_stopped`).
 5. The unconditional closed fragment `InSafeScalarFragment`
    (`WellTypedBodyExt`): `LM-1.1` scalar statements, `LM-1.2` `bool`
    comparisons and `IntToInt` casts, `LM-1.4` immediate moves
@@ -84,16 +88,19 @@ whole-program statements relating
    loops (`scalarFragment_infiniteRun_iff`); every fault of the fragment is
    undefined behavior (`scalarFragmentExt_ubOnly`, `scalarFragment_outcomes`).
 6. Bridges from `StepObsRel`, `StepRel`, `StepRelLM2_2` with
-   `StepRelStructReturnLM2_2`, `StepRelLM2_3` with `StepRelEnumReturnLM2_3`,
-   `StepRelLM2_4`, `StepRelLM3_1`, `StepRelLM3_2`, `StepRelLM3_2Tree`, and
+   `StepRelStructReturnLM2_2` and scalar `StepRel` returns, `StepRelLM2_3` with
+   `StepRelEnumReturnLM2_3`, `StepRelLM2_4`, `StepRelLM3_1`, `StepObsRelLM3_1`
+   (raw-pointer returns, `SwitchInt`), `StepRelLM3_2`, `StepRelLM3_2Tree`, and
    `StepRelMultiFrame` to `Lockstep`; the liftings
    `stepClosedSim_of_stepRelLM2_2`, `stepClosedSim_of_stepRelLM2_3`,
    `stepClosedSim_of_stepRelLM2_3_enumReturn`, `stepClosedSim_of_stepRelLM2_4`,
-   `stepClosedSim_of_stepRelLM3_1`, `stepClosedSim_of_stepRelLM3_2`,
-   `stepClosedSim_of_stepRelLM3_2Tree`, and `stepClosedSim_of_stepRelMultiFrame`
-   turn any step-closed fragment of those relations into the whole-program
-   theorems; and the entry pair is related by every relation
-   (`stateRel_entry`, `stateRelLM2_2_entry`, `stateRelLM2_3_entry`,
+   `stepClosedSim_of_stepRelLM3_1`, `stepClosedSim_of_stepObsRelLM3_1`,
+   `stepClosedSim_of_stepRelLM3_2`, `stepClosedSim_of_stepRelLM3_2Tree`, and
+   `stepClosedSim_of_stepRelMultiFrame` turn any step-closed fragment of those
+   relations into the whole-program theorems; and the entry pair is related by
+   every relation (`stateRel_entry`, `stateRelLM2_2_entry`,
+   `stateRelLM2_2_entry_env` for every struct environment and allocation
+   budget, `stateRelLM2_3_entry` and `stateRelLM2_3_entry_of_budget`,
    `stateRelLM2_4_entry`, `stateRelLM3_1_entry`, `stateRelLM3_2_entry`,
    `stateRelLM3_2Tree_entry`, `multiFrameStateRel_entry`).
 
@@ -102,10 +109,10 @@ whole-program statements relating
 Agreed fragments (kernel-certified per step, lifted here):
 
 * `LM-1.1` scalar statements, `LM-1.2` `bool` comparisons, `IntToInt` casts,
-  and `SwitchInt`, `LM-1.3` checked arithmetic with `Assert` and
-  `UnwindAction::Unreachable`, and `LM-1.4` immediate moves, closed and
-  unconditional (`InSafeScalarFragment`); `LM-1.4` storage and
-  `PlaceMention` per step.
+  and `SwitchInt`, `Assert` with `UnwindAction::Unreachable` on unprojected
+  `bool` operands, and `LM-1.4` immediate moves, closed and unconditional
+  (`InSafeScalarFragment`); `LM-1.3` checked arithmetic (projections of the
+  `(T, bool)` result pair), `LM-1.4` storage, and `PlaceMention` per step.
 * `LM-2.1` arrays (`Index`, `ConstantIndex`, `Len`, `Repeat`); `LM-2.2` structs
   and tuples with padding; `LM-2.3` multi-variant enums (`Downcast`,
   `SetDiscriminant`, `Discriminant`, `SwitchInt`); `LM-2.4` unions (initialized
@@ -205,11 +212,29 @@ active `lean-miri` frame (`MiriDiffWitnesses.callHooks`), a function of the
 `lean-miri` state alone; the `LM-4.1` per-step theorems instantiate it at
 Anneal's `activeMirBody`.
 
-Return correspondence: the certified root-return steps
-(`step_terminator_goto_return_simulation` and its `LM-3.1` / `LM-3.2`
-versions) require a sized `_0` and, from `LM-3.1` on, a non-pointer `_0`; the
-witness suite therefore certifies the lockstep prefix (`AgreeReaches`) of
-runs that end by returning `()` or a raw pointer.
+Return correspondence: the certified single-frame root-return steps are
+`step_terminator_goto_return_simulation` (and its `LM-2.2`, `LM-3.1`, `LM-3.2`
+versions) for a sized scalar `_0`, `step_terminator_return_rawPtr_lm3_1_simulation`
+for a raw-pointer `_0` (`StepObsRelLM3_1`, `PtrRetRel`), and the `LM-2.2` /
+`LM-2.3` aggregate returns; a zero-sized `()` root return is certified only
+for the `LM-4.1` interpreter (`wit_lm4_1_zst_unit_return_simulation`).
+
+Further boundaries of the whole-program agreement:
+
+* `StatementKind.retag` and `StatementKind.deinit` step in Anneal but are not
+  lowered to `lean-miri` steps (`annealStepHooks_retag_ne_ok`,
+  `annealStepHooks_deinit_ne_ok`), so they are outside every fragment.
+* The memory accesses of this `lean-miri` instantiation do not run the
+  borrow tracker's access hooks (`annealMemoryCopyHooks`): Tree Borrows
+  permissions are certified per access through `TreeBorrowsRel` (`LM-3.3`),
+  and a `miriSystem` run need not report the permission violations that make
+  Anneal fault (such as the `Disabled` read of
+  `MiriDiffWitnesses.w4_unsafe_cell_vs_freeze`), Anneal's `TreeBorrowPerm`
+  checks being stricter.
+* A `Call` to a function outside Anneal's `callees` is an external
+  interaction (`MirCallE`) whose responses `TreeSafe` and `ReachesRet`
+  quantify over; the instantiations here model no external functions, so
+  whole-program call agreement is stated for linked callees (`callHooks`).
 -/
 
 namespace LeanMiriSpec.Correspondence.Safety
@@ -1409,11 +1434,18 @@ end WholeProgram
 inductive MiriRunLoopOutcome : Type where
   /-- Still running after the iterations performed. -/
   | running (state : AnnealStepState)
-  /-- An iteration popped the root frame; `retOperand` is the root's return operand. -/
-  | returned (state : AnnealStepState)
-      (retOperand : Except Miri.Interpreter.StepError (Miri.Interpreter.Operand AnnealProv))
-  /-- An iteration stopped with error `err`. -/
+  /-- An iteration popped the root frame, whose return operand is `retOperand`. -/
+  | returned (state : AnnealStepState) (retOperand : Miri.Interpreter.Operand AnnealProv)
+  /-- An iteration stopped with error `err`, or popped the root frame and reading
+  its return operand failed with `err`. -/
   | stopped (state : AnnealStepState) (err : Miri.Interpreter.StepError)
+
+/-- The `runLoopFuel` outcome of an iteration that popped the root frame, given
+the result of reading the root frame's return operand (as `rootPopOutcome`). -/
+def popOutcome (m' : AnnealStepState) :
+    Except Miri.Interpreter.StepError (Miri.Interpreter.Operand AnnealProv) → MiriRunLoopOutcome
+  | .ok v => .returned m' v
+  | .error e => .stopped m' e
 
 /-- Fuel-bounded execution of `lean-miri`'s scheduler loop (`RunLoop.iteration`). -/
 def runLoopFuel (H : AnnealMiriHooks) : Nat → AnnealStepState → MiriRunLoopOutcome
@@ -1421,7 +1453,7 @@ def runLoopFuel (H : AnnealMiriHooks) : Nat → AnnealStepState → MiriRunLoopO
   | fuel + 1, m =>
     match miriIter H m with
     | (m', .ok _) =>
-      if m'.stack.frames.isEmpty then .returned m' (H.returnOperand () m).2
+      if m'.stack.frames.isEmpty then popOutcome m' (H.returnOperand () m).2
       else runLoopFuel H fuel m'
     | (m', .error e) => .stopped m' e
 
@@ -1433,7 +1465,7 @@ inductive RunLoopRel (Inv : MachineState → AnnealStepState → Prop)
       Inv s m → RunLoopRel Inv RetRel (.running s) (.running m)
   | returned (retVal : Value) (mem : Memory) (m : AnnealStepState)
       (v : Miri.Interpreter.Operand AnnealProv) :
-      RetRel retVal v → RunLoopRel Inv RetRel (.returned retVal mem) (.returned m (.ok v))
+      RetRel retVal v → RunLoopRel Inv RetRel (.returned retVal mem) (.returned m v)
   | fault (k : FailureKind) (m : AnnealStepState) (e : Miri.Interpreter.StepError) :
       FaultAgrees k e → RunLoopRel Inv RetRel (.faulted k) (.stopped m e)
 
@@ -1476,7 +1508,7 @@ theorem runLoop_universal_simulation (hsim : StepClosedSim body H Inv RetRel) (f
       rw [hA]
       unfold runLoopFuel
       rw [hm]
-      simp only [array_isEmpty_eq_true hemp, ↓reduceIte, hop]
+      simp only [array_isEmpty_eq_true hemp, ↓reduceIte, hop, popOutcome]
       exact .returned retVal mem m' v hrel
     · have hA : runAnnealBounded body (fuel + 1) s = .faulted k := by
         unfold runAnnealBounded; rw [ha]; rfl
@@ -1510,7 +1542,7 @@ theorem runLoop_ub_iff (hsim : StepClosedSim body H Inv RetRel) (fuel : Nat)
 theorem runLoop_returned_iff (hsim : StepClosedSim body H Inv RetRel) (fuel : Nat)
     {s : MachineState} {m : AnnealStepState} (hinv : Inv s m) :
     (∃ retVal mem, runAnnealBounded body fuel s = .returned retVal mem) ↔
-      ∃ m' v, runLoopFuel H fuel m = .returned m' (.ok v) := by
+      ∃ m' v, runLoopFuel H fuel m = .returned m' v := by
   have h := runLoop_universal_simulation hsim fuel hinv
   generalize runAnnealBounded body fuel s = aOut at h
   generalize runLoopFuel H fuel m = mOut at h
@@ -1550,7 +1582,7 @@ theorem runLoopFuel_succ (H : AnnealMiriHooks) (n : Nat) (m : AnnealStepState) :
     runLoopFuel H (n + 1) m =
       match miriIter H m with
       | (m', .ok _) =>
-        if m'.stack.frames.isEmpty then .returned m' (H.returnOperand () m).2
+        if m'.stack.frames.isEmpty then popOutcome m' (H.returnOperand () m).2
         else runLoopFuel H n m'
       | (m', .error e) => .stopped m' e := rfl
 
@@ -1566,7 +1598,8 @@ theorem runLoopFuel_add (H : AnnealMiriHooks) (n k : Nat) (m : AnnealStepState) 
       cases hemp : m'.stack.frames.isEmpty
       · simp only [Bool.false_eq_true, ↓reduceIte]
         exact ih m'
-      · rfl
+      · simp only [↓reduceIte]
+        cases (H.returnOperand () m).2 <;> rfl
 
 theorem runLoopFuel_running_of_le {n N : Nat} {m m' : AnnealStepState}
     (h : runLoopFuel H N m = .running m') (hle : n ≤ N) :
@@ -1588,7 +1621,7 @@ theorem runLoopFuel_of_step {n : Nat} {m m₁ : AnnealStepState}
 /-- A `RunLoop` run that pops the root frame with return operand `v` is
 `System.Safe`, reaches `.returned v`, and reaches no other outcome. -/
 theorem miri_safe_of_runLoopFuel_returned {N : Nat} {m m' : AnnealStepState}
-    {v : Miri.Interpreter.Operand AnnealProv} (h : runLoopFuel H N m = .returned m' (.ok v)) :
+    {v : Miri.Interpreter.Operand AnnealProv} (h : runLoopFuel H N m = .returned m' v) :
     (miriSystem H).Safe m ∧ (miriSystem H).ReachesOutcome m (.returned v) ∧
       ∀ o, (miriSystem H).ReachesOutcome m o → o = .returned v := by
   induction N generalizing m with
@@ -1622,7 +1655,13 @@ theorem miri_safe_of_runLoopFuel_returned {N : Nat} {m m' : AnnealStepState}
           · exact huniq o ⟨f, hf', ht⟩
       · rw [hemp] at h
         simp only [↓reduceIte] at h
-        injection h with _ hv
+        have hv : (H.returnOperand () m).2 = .ok v := by
+          generalize (H.returnOperand () m).2 = r at h ⊢
+          cases r with
+          | ok v' =>
+            simp only [popOutcome, MiriRunLoopOutcome.returned.injEq] at h
+            rw [h.2]
+          | error e => simp [popOutcome] at h
         have hemp' := array_eq_empty_of_isEmpty hemp
         have hno : ∀ b, ¬ (miriSystem H).step m b := fun b => miriSystem_not_step_of_ok_empty hm hemp'
         have hterm : ∀ o, (miriSystem H).terminal m o ↔ o = .returned v :=
@@ -1659,7 +1698,17 @@ theorem miri_outcome_of_runLoopFuel_stopped {N : Nat} {m m' : AnnealStepState}
           simp only [Bool.false_eq_true, ↓reduceIte] at h
           obtain ⟨f, hf, ht⟩ := ih h
           exact ⟨f, miriSystem_reaches_head ⟨hm, array_ne_empty_of_isEmpty hemp⟩ hf, ht⟩
-        · rw [hemp] at h; cases h
+        · rw [hemp] at h
+          simp only [↓reduceIte] at h
+          have hemp' := array_eq_empty_of_isEmpty hemp
+          rcases hr : (H.returnOperand () m).2 with e'' | v
+          · rw [hr] at h
+            simp only [popOutcome, MiriRunLoopOutcome.stopped.injEq] at h
+            obtain ⟨_, rfl⟩ := h
+            exact ⟨m, .refl m,
+              (miriSystem_terminal_of_pop hm hemp' _).2 (rootPopOutcome_of_error hr).symm⟩
+          · rw [hr] at h
+            simp [popOutcome] at h
   exact ⟨hreach, fun hsafe => classifyError_not_isReturn e (hsafe.2 _ hreach)⟩
 
 /-- A `RunLoop` loop that keeps running forever has an infinite run, is
@@ -1694,7 +1743,10 @@ theorem miri_infinite_of_forall_running {m : AnnealStepState}
         injection h1 with h1
         subst h1
         exact ⟨hm, array_ne_empty_of_isEmpty hemp⟩
-      · rw [hemp] at h1; cases h1
+      · rw [hemp] at h1
+        simp only [↓reduceIte] at h1
+        generalize (H.returnOperand () (run n)).2 = r at h1
+        cases r <;> simp [popOutcome] at h1
   have h0 : run 0 = m := rfl
   have hreach : ∀ c, (miriSystem H).Reaches m c → ∃ n, c = run n := by
     intro c hc
@@ -1750,7 +1802,7 @@ def operandScalarBits? (sizeBytes : Nat) : Miri.Interpreter.Operand AnnealProv �
 /-- The return operand of a `runLoopFuel` outcome that popped the root frame. -/
 def MiriRunLoopOutcome.returnedOperand? :
     MiriRunLoopOutcome → Option (Miri.Interpreter.Operand AnnealProv)
-  | .returned _ (.ok v) => some v
+  | .returned _ v => some v
   | _ => none
 
 /-- The error of a `runLoopFuel` outcome that stopped. -/
@@ -1765,13 +1817,10 @@ def MiriRunLoopOutcome.isRunning : MiriRunLoopOutcome → Bool
 
 theorem MiriRunLoopOutcome.returnedOperand?_spec {o : MiriRunLoopOutcome}
     {v : Miri.Interpreter.Operand AnnealProv} (h : o.returnedOperand? = some v) :
-    ∃ m', o = .returned m' (.ok v) := by
+    ∃ m', o = .returned m' v := by
   cases o with
   | running _ => cases h
-  | returned m' r =>
-    cases r with
-    | ok v' => injection h with h; subst h; exact ⟨m', rfl⟩
-    | error _ => cases h
+  | returned m' v' => injection h with h; subst h; exact ⟨m', rfl⟩
   | stopped _ _ => cases h
 
 theorem MiriRunLoopOutcome.stoppedError?_spec {o : MiriRunLoopOutcome}
@@ -1847,9 +1896,9 @@ theorem MiriPath.run_shift {m m' : AnnealStepState} (h : MiriPath H m m') :
 theorem runLoopFuel_one_returned {m m' : AnnealStepState}
     {v : Miri.Interpreter.Operand AnnealProv} (hret : H.coreStep () m = (m', .ok true))
     (hemp : m'.stack.frames = #[]) (hop : (H.returnOperand () m).2 = .ok v) :
-    runLoopFuel H 1 m = .returned m' (.ok v) := by
+    runLoopFuel H 1 m = .returned m' v := by
   rw [runLoopFuel_succ, miriIter_eq, hret]
-  simp only [stepToIteration, array_isEmpty_eq_true hemp, ↓reduceIte, hop]
+  simp only [stepToIteration, array_isEmpty_eq_true hemp, ↓reduceIte, hop, popOutcome]
 
 theorem runLoopFuel_one_stopped {m m' : AnnealStepState} {e : Miri.Interpreter.StepError}
     (herr : H.coreStep () m = (m', .error e)) : runLoopFuel H 1 m = .stopped m' e := by
@@ -1885,7 +1934,10 @@ theorem MiriPath.of_runLoopFuel {n : Nat} {m m' : AnnealStepState}
       · rw [hemp] at h
         simp only [Bool.false_eq_true, ↓reduceIte] at h
         exact .step hc (array_ne_empty_of_isEmpty hemp) (ih h)
-      · rw [hemp] at h; cases h
+      · rw [hemp] at h
+        simp only [↓reduceIte] at h
+        generalize (H.returnOperand () m).2 = r at h
+        cases r <;> simp [popOutcome] at h
 
 /-- Whole-program certificate: a path to a root-frame return with operand `v`. -/
 theorem miri_safe_of_path_return {m mₙ m' : AnnealStepState}
@@ -1897,7 +1949,7 @@ theorem miri_safe_of_path_return {m mₙ m' : AnnealStepState}
   obtain ⟨n, hn⟩ := hpath.run_shift
   apply miri_safe_of_runLoopFuel_returned (N := n + 1) (m' := m')
   rw [hn 1, runLoopFuel_succ, miriIter_eq, hret]
-  simp only [stepToIteration, array_isEmpty_eq_true hemp, ↓reduceIte, hop]
+  simp only [stepToIteration, array_isEmpty_eq_true hemp, ↓reduceIte, hop, popOutcome]
 
 /-- Whole-program certificate: a path to a core step failing with `e`. -/
 theorem miri_outcome_of_path_error {m mₙ m' : AnnealStepState} {e : Miri.Interpreter.StepError}
@@ -2198,6 +2250,33 @@ theorem anneal_fault_of_runAnnealBounded_faulted {body : CapturedMir} {N : Nat}
     refine ⟨fun hsafe => treeSafe_cofix_iff.1 hsafe y hy ⟨_, f, hf, mir_isFault_inl _⟩,
       fun hk => ?_⟩
     subst hk
+    obtain ⟨tr, htr⟩ := reaches_cofix_of_coReach hy
+    exact ⟨tr, _, _, htr, by rw [observe_cofix_eq, hf]; rfl⟩
+  induction N generalizing s with
+  | zero => cases h
+  | succ N ih =>
+    rcases anneal_step_classify body s with
+      ⟨s', hrun, hsucc⟩ | ⟨out, hrun, _, _⟩ | ⟨k', hrun, hex⟩ | hrun
+    · rw [hrun] at h
+      obtain ⟨y, hy, hf⟩ := ih h
+      exact ⟨y, .head ((hsucc _).2 rfl) hy, hf⟩
+    · rw [hrun] at h
+      rcases out with ⟨rv, mm⟩ | _ | _ <;> cases h
+    · rw [hrun] at h
+      injection h with h
+      subst h
+      exact hex
+    · rw [hrun] at h; cases h
+
+/-- An Anneal bounded run that faults with kind `k` reaches a fault of kind `k`
+(`MirReachesFault`), for every failure class. -/
+theorem anneal_reachesFault_of_runAnnealBounded_faulted {body : CapturedMir} {N : Nat}
+    {s : MachineState} {k : FailureKind} (h : runAnnealBounded body N s = .faulted k) :
+    MirReachesFault (mirTree body s) k := by
+  suffices hreach : ∃ y, CoReach (stepMirState body) (.running s) y ∧
+      ∃ f, stepMirState body y = .vis (.inl (.fail k)) f by
+    obtain ⟨y, hy, f, hf⟩ := hreach
+    rw [mirTree_eq_cofix]
     obtain ⟨tr, htr⟩ := reaches_cofix_of_coReach hy
     exact ⟨tr, _, _, htr, by rw [observe_cofix_eq, hf]; rfl⟩
   induction N generalizing s with
@@ -4700,9 +4779,30 @@ theorem StepRelStructReturnLM2_2.toLockstep {body : CapturedMir}
       ⟨decl0, hdecl, Or.inr ⟨_, mp0, rfl, hmem⟩⟩
   | ub m' msg => exact .fault .ub m' (.undefinedBehavior msg) (ub_faultAgrees msg)
 
+/-- A root-return `StepRel` step (`step_terminator_return_lm2_2_simulation` and
+the other scalar-return lemmas) as `Lockstep`, for any invariant: a return has
+no post-state to relate. -/
+theorem StepRel.toLockstepOfRet {body : CapturedMir} {m : AnnealStepState} {aRes : MirStepNode}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Inv : MachineState → AnnealStepState → Prop} (h : StepRel body m aRes mRes)
+    (hret : ∃ retVal mem, aRes = .retNormal retVal mem) :
+    Lockstep (rootHooks core) Inv (ImmediateRetRel body) m aRes mRes := by
+  cases h with
+  | step s' m' _ =>
+    obtain ⟨_, _, h⟩ := hret
+    cases h
+  | retRoot decl0 retVal imm0 mem' m' hdecl hop himm hm' =>
+    subst hm'
+    exact .retRoot retVal mem' _ (.immediate imm0) rfl (retRoot_operand hop)
+      ⟨decl0, imm0, hdecl, rfl, himm⟩
+  | ub m' msg =>
+    obtain ⟨_, _, h⟩ := hret
+    cases h
+
 /-- `LM-2.2` lifting: non-return steps through `StepRelLM2_2` (any static
 environment and allocation budget), root returns of a tuple / struct `_0`
-through `StepRelStructReturnLM2_2`. -/
+through `StepRelStructReturnLM2_2`, and root returns of a scalar `_0` through
+`StepRel` (`step_terminator_return_lm2_2_simulation`). -/
 theorem stepClosedSim_of_stepRelLM2_2 {body : CapturedMir} {env : StructTypeEnv}
     {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
     {Frag : MachineState → AnnealStepState → Prop}
@@ -4710,15 +4810,22 @@ theorem stepClosedSim_of_stepRelLM2_2 {body : CapturedMir} {env : StructTypeEnv}
       (∃ stEnv' b', StepRelLM2_2 body env stEnv' b' m (stepMirFn body s) (core () m) ∧
         ∀ s' m', core () m = (m', .ok true) → StateRelLM2_2 body env stEnv' b' s' m' →
           Frag s' m') ∨
-      StepRelStructReturnLM2_2 body fields paths m (stepMirFn body s) (core () m)) :
+      StepRelStructReturnLM2_2 body fields paths m (stepMirFn body s) (core () m) ∨
+      ((∃ retVal mem, stepMirFn body s = .retNormal retVal mem) ∧
+        StepRel body m (stepMirFn body s) (core () m))) :
     StepClosedSim body (rootHooks core)
       (fun s m => (∃ stEnv b, StateRelLM2_2 body env stEnv b s m) ∧ Frag s m)
-      (StructRetRel body fields paths) := by
+      (fun r v => ImmediateRetRel body r v ∨ StructRetRel body fields paths r v) := by
   refine ⟨fun s m ⟨⟨stEnv, b, hrel⟩, hfrag⟩ => ?_⟩
-  rcases h s m stEnv b hrel hfrag with ⟨stEnv', b', hstep, hpres⟩ | hret
+  rcases h s m stEnv b hrel hfrag with ⟨stEnv', b', hstep, hpres⟩ | hret | ⟨hisret, hret⟩
   · exact StepRelLM2_2.toLockstep hstep fun s' m' hm hrel' =>
       ⟨⟨stEnv', b', hrel'⟩, hpres s' m' hm hrel'⟩
-  · exact StepRelStructReturnLM2_2.toLockstep hret
+  · exact Lockstep.mono (StepRelStructReturnLM2_2.toLockstep
+      (Inv := fun s m => (∃ stEnv b, StateRelLM2_2 body env stEnv b s m) ∧ Frag s m) hret)
+      (fun _ _ h => h) (fun _ _ h => Or.inr h)
+  · exact Lockstep.mono (StepRel.toLockstepOfRet
+      (Inv := fun s m => (∃ stEnv b, StateRelLM2_2 body env stEnv b s m) ∧ Frag s m) hret hisret)
+      (fun _ _ h => h) (fun _ _ h => Or.inl h)
 
 /-- Return relation of `LM-2.3` enum returns: a memory place holding the
 `EnumMemRel`-related active variant and fields in some machine. -/
@@ -4838,6 +4945,49 @@ theorem stepClosedSim_of_stepRelLM3_2Tree {body : CapturedMir}
       hstep fun s' m' hm hrel' => ⟨⟨t', hrel'⟩, hpres s' m' hm hrel'⟩)
     (fun _ _ h => h) (fun _ _ h => ⟨t', h⟩)
 
+/-- Return relation of `LM-3.1` / `LM-4.2`: an immediate `ImmediateRelLM3_1`-related
+at `_0`'s type, including tracked raw pointers (`ImmediateRelLM3_1.rawPtr`). -/
+def PtrRetRel (body : CapturedMir) (allocMap : List AllocMapEntry) (retVal : Value)
+    (v : Miri.Interpreter.Operand AnnealProv) : Prop :=
+  ∃ decl0 imm0, get? body.localDecls 0 = some decl0 ∧ v = .immediate imm0 ∧
+    ImmediateRelLM3_1 allocMap decl0.ty body.layouts retVal imm0
+
+/-- `LM-3.1` / `LM-4.2` `StepObsRelLM3_1` (raw-pointer root returns,
+`step_terminator_return_rawPtr_lm3_1_simulation`, and `SwitchInt` observations;
+the unified `step_mir_lm3_1_state_simulation`) as `Lockstep`. -/
+theorem StepObsRelLM3_1.toLockstep {body : CapturedMir} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry} {aRes : MirStepNode}
+    {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {Inv : MachineState → AnnealStepState → Prop}
+    (h : StepObsRelLM3_1 body m allocMap aRes mRes)
+    (hinv : ∀ s' m', mRes = (m', .ok true) → StateRelLM3_1 body s' m' allocMap → Inv s' m') :
+    Lockstep (rootHooks core) Inv (PtrRetRel body allocMap) m aRes mRes := by
+  cases h with
+  | emitStep obs s' m' hrel =>
+    obtain ⟨tf, hf, _⟩ := id hrel
+    exact .emitStep obs s' m' (hinv s' m' rfl hrel) (frames_ne_of_eq_singleton hf)
+  | retRoot decl0 retVal imm0 mem' m' hdecl hop himm hm' =>
+    subst hm'
+    exact .retRoot retVal mem' _ (.immediate imm0) rfl (retRoot_operand hop)
+      ⟨decl0, imm0, hdecl, rfl, himm⟩
+  | ub m' msg => exact .fault .ub m' (.undefinedBehavior msg) (ub_faultAgrees msg)
+
+/-- `LM-3.1` / `LM-4.2` lifting through `StepObsRelLM3_1` (any allocation map),
+covering raw-pointer root returns and `SwitchInt`. -/
+theorem stepClosedSim_of_stepObsRelLM3_1 {body : CapturedMir}
+    {Frag : MachineState → AnnealStepState → Prop}
+    (h : ∀ s m a, StateRelLM3_1 body s m a → Frag s m → ∃ a',
+      StepObsRelLM3_1 body m a' (stepMirFn body s) (core () m) ∧
+      ∀ s' m', core () m = (m', .ok true) → StateRelLM3_1 body s' m' a' → Frag s' m') :
+    StepClosedSim body (rootHooks core) (fun s m => (∃ a, StateRelLM3_1 body s m a) ∧ Frag s m)
+      (fun r v => ∃ a, PtrRetRel body a r v) := by
+  refine ⟨fun s m ⟨⟨a, hrel⟩, hfrag⟩ => ?_⟩
+  obtain ⟨a', hstep, hpres⟩ := h s m a hrel hfrag
+  exact Lockstep.mono
+    (StepObsRelLM3_1.toLockstep (Inv := fun s m => (∃ a, StateRelLM3_1 body s m a) ∧ Frag s m)
+      hstep fun s' m' hm hrel' => ⟨⟨a', hrel'⟩, hpres s' m' hm hrel'⟩)
+    (fun _ _ h => h) (fun _ _ h => ⟨a', h⟩)
+
 /-! ### Entry states of the `LM-2` … `LM-4.1` relations
 
 The entry pair `(initMachineState body [], miriEntryState body)` is related by
@@ -4875,6 +5025,66 @@ theorem stateRelLM2_3_entry (body : CapturedMir) {env : EnumTypeEnv}
   · simp only [h0, ↓reduceIte] at hslot
     injection hslot with hslot
     exact Or.inl hslot.symm
+
+/-- `stateRelLM2_3_entry` for every allocation budget below the `AllocId` bound. -/
+theorem stateRelLM2_3_entry_of_budget (body : CapturedMir) {env : EnumTypeEnv}
+    (henv_valid : ∀ ty tb vs, env ty = some (tb, vs) → ValidEnumLayout ty body.layouts tb vs)
+    {b : Nat} (hb : b = 0 ∨ 1 + b < 2 ^ 32) :
+    StateRelLM2_3 body env b (initMachineState body []) (miriEntryState body) := by
+  rcases stateRelLM2_3_entry body henv_valid with
+    ⟨tf, hf, hrc, hrp, hfr, _, hcal, hst, hbor, hprot, hcaller, hdisj⟩
+  refine .mk tf hf hrc hrp hfr ?_ hcal hst hbor hprot hcaller hdisj
+  rcases hb with rfl | hb
+  · exact Or.inl rfl
+  · exact Or.inr (AllocIdWatermark.empty b hb)
+
+/-- Every struct environment, static environment without initialized locals,
+and allocation budget below the `AllocId` bound relates the entry states: on
+entry every local other than `_0` is dead, `_0` is an uninitialized immediate,
+and no local is memory-backed. -/
+theorem stateRelLM2_2_entry_env (body : CapturedMir) (env : StructTypeEnv)
+    (immLocals : List Local) {b : Nat} (hb : b = 0 ∨ 1 + b < 2 ^ 32) :
+    StateRelLM2_2 body env { initLocals := [], immLocals := immLocals } b
+      (initMachineState body []) (miriEntryState body) := by
+  rcases stateRel_entry body with ⟨tf, hf, hrc, hrp, hfr, hcal, hst, hbor, hprot, hcaller, hdisj⟩
+  have htf : tf = miriEntryFrame body := by
+    injection hf with h; injection h with h; exact h.symm
+  subst htf
+  refine .mk (miriEntryFrame body) hf hrc hrp
+    ⟨hfr.body_eq, hfr.location_eq, hfr.af_locals_len, hfr.mf_locals_size, ?_⟩
+    (fun _ hmem => nomatch hmem) ?_ ?_ hcal hst hbor hprot hcaller hdisj
+  · intro i decl slot mls hdecl hslot hmls
+    cases henv : env decl.ty with
+    | none => exact .base slot mls henv (hfr.locals_rel i decl slot mls hdecl hslot hmls)
+    | some fp =>
+      obtain ⟨fields, paths⟩ := fp
+      have hi : i < body.localDecls.length := by
+        rw [get?_eq_getElem?] at hdecl
+        exact (List.getElem?_eq_some_iff.1 hdecl).1
+      rw [entry_locals_get] at hslot
+      change (miriEntryLocals body.localDecls.length)[i]? = some mls at hmls
+      rw [miriEntryLocals_getElem?] at hmls
+      simp only [hi, ↓reduceIte] at hslot hmls
+      by_cases h0 : i = 0
+      · simp only [h0, ↓reduceIte] at hslot hmls
+        injection hslot with hslot
+        injection hmls with hmls
+        subst hslot hmls
+        exact .structUninitImm fields paths none henv (fun _ h => nomatch h)
+      · simp only [h0, ↓reduceIte] at hslot hmls
+        injection hslot with hslot
+        injection hmls with hmls
+        subst hslot hmls
+        exact .structDead fields paths none henv (fun _ h => nomatch h)
+  · intro idx _ mp lay hmls
+    change (miriEntryLocals body.localDecls.length)[idx]? = some _ at hmls
+    rw [miriEntryLocals_getElem?] at hmls
+    split at hmls
+    · split at hmls <;> simp at hmls
+    · cases hmls
+  · rcases hb with rfl | hb
+    · exact Or.inl rfl
+    · exact Or.inr (AllocIdWatermark.empty b hb)
 
 theorem stateRelLM2_4_entry (body : CapturedMir) :
     StateRelLM2_4 body (initMachineState body []) (miriEntryState body) :=
