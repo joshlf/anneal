@@ -2752,7 +2752,10 @@ length, and only otherwise falls back to the backend scalar representation
 (`args = [u32]`) takes the type-argument path, where the niche is **not**
 enforced (`adt_generic_nonZero_typeArg_path_niche_unenforced`). The
 field-layout path does not read the wrapper's `l.backendRepr` either: it decodes
-each field at its own recorded layout.
+each field at its own recorded layout. So it enforces exactly the niches recorded
+on those field layouts (`adt_fieldLayout_path_inner_primitive_scalarLayout_decode_encode_eq`)
+and ignores a niche recorded only on the wrapper
+(`adt_fieldLayout_path_outer_niche_unenforced`).
 
 The `.multiple` decoder uses the tag value itself as the variant index
 (`get? variantShapes tag`), and the encoder writes the variant index as the tag.

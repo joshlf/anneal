@@ -7286,22 +7286,21 @@ theorem thin_rawPtr_isTryFromBytes
 
 /--
 Every thin reference `.ref m pointee` (`isThinPointee pointee = true`) satisfies
-`IsTryFromBytes` with validity predicate characterizing the decoded `.ptr p 8` value:
-`bits < scalarModulus 8`, and whenever the bytes carry no provenance (`prov = none`),
-the non-null reference niche `ScalarTy.refPtr.validBits .bits64 bits` (`0 < bits`) holds.
+`IsTryFromBytes` with the exact value-level image of `Trusted`'s decoder: a thin
+pointer value `.ptr p 8` whose offset is below `scalarModulus 8`.
+
+The non-null niche of `&T` constrains provenance-free *byte sequences*, not decoded
+values: on provenance-free bytes the decoder rejects address `0`
+(`trusted_decodeValueFromBytes_thin_ptrTy_no_prov`), but it also accepts
+provenance-carrying bytes with offset `0`. So every validity predicate for `&T`
+must hold at a null-offset pointer `.ptr ⟨a, 0⟩ 8`
+(`thin_refPtr_isTryFromBytes_admits_null_offset`).
 -/
 theorem thin_refPtr_isTryFromBytes
     (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy)
     (lIdx : LayoutIdx) (hThin : isThinPointee pointee = true) :
     IsTryFromBytes layouts { kind := .ref m pointee, layoutIdx := lIdx }
-      (fun v =>
-        ∃ (p : ProvenancePtr) (bits : Nat) (prov : Option (Nat × Nat)),
-          v = .ptr p 8 ∧
-          bits < scalarModulus 8 ∧
-          (prov = none → ScalarTy.refPtr.validBits .bits64 bits) ∧
-          p = match prov with
-              | some (allocId, _) => { allocId := allocId, offsetBytes := bits }
-              | none => addressToPtr bits) := by
+      (fun v => ∃ p : ProvenancePtr, v = .ptr p 8 ∧ p.offsetBytes < scalarModulus 8) := by
   refine ⟨8, trusted_rigidTyByteSize_thin_ref layouts m pointee lIdx hThin, ?_⟩
   intro bs v hDec
   rw [show defaultCodecFuel = 15 + 1 from rfl,
@@ -7315,25 +7314,115 @@ theorem thin_refPtr_isTryFromBytes
       rcases pair with ⟨sv, prov⟩
       dsimp only at hDec
       have hBsLen : Trusted.Sequence.length bs = 8 := Nat.eq_of_beq_eq_true hLen
-      have ⟨hSvSz, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
-      rw [hBsLen] at hSvSz hSvLt
+      have ⟨_, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
+      rw [hBsLen] at hSvLt
       cases prov with
       | none =>
         dsimp only at hDec
         cases hZero : Nat.beq sv.bits 0 <;> rw [hZero] at hDec
-        · have hPos : 0 < sv.bits := by
-            cases hb : sv.bits with
-            | zero => rw [hb] at hZero; nomatch hZero
-            | succ k => exact Nat.succ_pos k
-          injection hDec with hV
-          exact ⟨addressToPtr sv.bits, sv.bits, none, hV.symm, hSvLt,
-            fun _ => ⟨hSvLt, hPos⟩, rfl⟩
+        · injection hDec with hV
+          refine ⟨addressToPtr sv.bits, hV.symm, ?_⟩
+          show sv.bits % 65536 < scalarModulus 8
+          have hMod : sv.bits % 65536 < 65536 := Nat.mod_lt _ (by decide)
+          have h8 : (65536 : Nat) < scalarModulus 8 := by decide
+          omega
         · nomatch hDec
       | some ap =>
         rcases ap with ⟨allocId, tag⟩
         injection hDec with hV
-        exact ⟨{ allocId := allocId, offsetBytes := sv.bits }, sv.bits, some (allocId, tag),
-          hV.symm, hSvLt, (fun h => by nomatch h), rfl⟩
+        exact ⟨{ allocId := allocId, offsetBytes := sv.bits }, hV.symm, hSvLt⟩
+
+/--
+**Divergence (null-offset references are admitted at the value level).**
+`Trusted`'s decoder at a thin reference type null-checks only provenance-free
+bytes. The provenance-carrying encoding of offset `0` in allocation `a` decodes to
+the null-offset pointer `.ptr ⟨a, 0⟩ 8`, so every `IsTryFromBytes` validity
+predicate for `&T` holds at that value. Anneal's address model rejects such a
+pointer as a null reference (`trusted_evalByteCast_null_offset_ref_divergence`).
+-/
+theorem thin_refPtr_isTryFromBytes_admits_null_offset
+    (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy)
+    (lIdx : LayoutIdx) (a : Nat) (hThin : isThinPointee pointee = true) :
+    decodeValueFromBytes defaultCodecFuel layouts { kind := .ref m pointee, layoutIdx := lIdx }
+        (encodeLittleEndianBytes 0 8 (some (a, a))) =
+      some (.ptr { allocId := a, offsetBytes := 0 } 8) ∧
+    ∀ validPred : Value → Prop,
+      IsTryFromBytes layouts { kind := .ref m pointee, layoutIdx := lIdx } validPred →
+      validPred (.ptr { allocId := a, offsetBytes := 0 } 8) := by
+  have hDec : decodeValueFromBytes defaultCodecFuel layouts
+      { kind := .ref m pointee, layoutIdx := lIdx }
+      (encodeLittleEndianBytes 0 8 (some (a, a))) =
+        some (.ptr { allocId := a, offsetBytes := 0 } 8) := by
+    rw [show defaultCodecFuel = 15 + 1 from rfl]
+    exact trusted_decodeValueFromBytes_thin_ref 15 layouts m pointee lIdx _
+      { allocId := a, offsetBytes := 0 } hThin
+      (trusted_length_encodeLittleEndianBytes 0 8 _)
+      (trusted_decodeScalarBytes_encodeLittleEndianBytes 8 0 (some (a, a)) false (by decide)
+        (by decide))
+  refine ⟨hDec, ?_⟩
+  rintro validPred ⟨_, _, hPred⟩
+  exact hPred _ _ hDec
+
+/--
+**`try_transmute` and the `IsTryFromBytes` validity predicate.** For a
+non-pointer source and destination of equal width on 64-bit targets and a valid
+source bit pattern, the destination satisfies `IsTryFromBytes` with the predicate
+of `scalarTy_isTryFromBytes_validBits`. Anneal's `evalTransmuteSameSize` succeeds
+iff `Trusted` decodes the candidate bytes at the destination to a value
+satisfying that predicate, and any decoded value is exactly
+`.scalar ⟨bits, dst.sizeBytes .bits64⟩`.
+-/
+theorem tryTransmute_valid_iff_isTryFromBytes_validPred
+    (policy : TransmutePolicy)
+    (layouts : LayoutTable) (m2 : Mutability) (pt2 : RigidTy) (dstLIdx : LayoutIdx)
+    (src dst : ScalarTy) (bits : Nat) (exposed : ExposedProvenance)
+    (hSrcNp : src.isPtr = false) (hDstNp : dst.isPtr = false)
+    (hSz : src.sizeBytes .bits64 = dst.sizeBytes .bits64)
+    (hValid : src.validBits .bits64 bits) :
+    let dstTy : Ty := { kind := dst.toTrustedRigidTy m2 pt2, layoutIdx := dstLIdx }
+    IsTryFromBytes layouts dstTy
+      (fun v => ∃ b, dst.validBits .bits64 b ∧ v = .scalar ⟨b, dst.sizeBytes .bits64⟩) ∧
+    ((∃ outVal,
+        evalTransmuteSameSize .bits64 policy src dst (.scalar bits) exposed = .ok outVal exposed) ↔
+      ∃ v,
+        decodeValueFromBytes defaultCodecFuel layouts dstTy
+          (encodeLittleEndianBytes bits (src.sizeBytes .bits64) none) = some v ∧
+        ∃ b, dst.validBits .bits64 b ∧ v = .scalar ⟨b, dst.sizeBytes .bits64⟩) ∧
+    (∀ v,
+      decodeValueFromBytes defaultCodecFuel layouts dstTy
+          (encodeLittleEndianBytes bits (src.sizeBytes .bits64) none) = some v →
+      v = .scalar ⟨bits, dst.sizeBytes .bits64⟩) := by
+  intro dstTy
+  have hTry := scalarTy_isTryFromBytes_validBits layouts m2 pt2 dst dstLIdx hDstNp
+  have hMain := tryTransmute_valid_iff_isValidBits .bits64 policy layouts m2 pt2 dstLIdx src dst bits
+    exposed hSrcNp hSz hValid
+  have hBitsDst : bits < scalarModulus (dst.sizeBytes .bits64) := hSz ▸ hValid.1
+  have hDecEq : decodeValueFromBytes defaultCodecFuel layouts dstTy
+      (encodeLittleEndianBytes bits (src.sizeBytes .bits64) none) =
+        match dst.isValidBits .bits64 bits with
+        | true => some (.scalar ⟨bits, dst.sizeBytes .bits64⟩)
+        | false => none := by
+    rw [hSz, show defaultCodecFuel = 15 + 1 from rfl]
+    exact trusted_decodeValueFromBytes_scalar 15 layouts m2 pt2 dst dstLIdx bits hDstNp hBitsDst
+  refine ⟨hTry, ?_, ?_⟩
+  · rw [hMain.1]
+    constructor
+    · intro hV
+      refine ⟨.scalar ⟨bits, dst.sizeBytes .bits64⟩, ?_, bits,
+        (ScalarTy.isValidBits_iff_validBits .bits64 dst bits).mp hV, rfl⟩
+      rw [hDecEq, hV]
+    · rintro ⟨v, hDec, _⟩
+      rw [hDecEq] at hDec
+      cases hV : dst.isValidBits .bits64 bits
+      · rw [hV] at hDec; nomatch hDec
+      · rfl
+  · intro v hDec
+    rw [hDecEq] at hDec
+    cases hV : dst.isValidBits .bits64 bits
+    · rw [hV] at hDec; nomatch hDec
+    · rw [hV] at hDec
+      injection hDec with hEq
+      exact hEq.symm
 
 /--
 **`try_transmute` instantiation for `u8 -> bool`**:
