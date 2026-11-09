@@ -563,6 +563,33 @@ def tupleTypeOf (layouts : Layout.LayoutTable := ⟨64, true, []⟩) (t : MirAst
       | _ => none
     | _ => none
 
+mutual
+
+/-- Whether `t` is free of unmonomorphized generic type parameters
+(`RigidTy.param`, `ty::Param`) and unnormalized associated-type projections
+(`RigidTy.alias`, `ty::Alias`), including inside recursive container types
+(`tuple`, `array`, `slice`, `adt`, `rawPtr`, `ref`, `fnDef`, `fnPtr`,
+`closure`). MiniRust and `minimize` operate strictly over fully monomorphized
+`rustc` types (`rs_layout_of` panics on `ty::Param` or `ty::Alias` anywhere
+inside a type). -/
+def isMonoRigidTy : MirAst.RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _ | .str | .never => true
+  | .tuple elems | .adt _ elems | .fnDef _ elems | .closure _ elems =>
+    isMonoRigidTyList elems
+  | .array elem _ | .slice elem | .rawPtr _ elem | .ref _ elem =>
+    isMonoRigidTy elem
+  | .fnPtr inputs output _ _ =>
+    isMonoRigidTyList inputs && isMonoRigidTy output
+  | .dynamic _ | .foreign _ | .other _ => true
+  | .param _ _ | .alias _ _ => false
+
+/-- Pointwise `isMonoRigidTy` across a list of `RigidTy` arguments or fields. -/
+def isMonoRigidTyList : List MirAst.RigidTy → Bool
+  | [] => true
+  | t :: ts => isMonoRigidTy t && isMonoRigidTyList ts
+
+end
+
 /-- The metadata kind of a raw pointer to `pointee`, as `minimize` computes it
 from the pointee's layout (`pointee_info_of(..).layout.meta_kind()`): no
 metadata (`PointerMetaKind::None`) for sized pointees, and an element count
@@ -571,14 +598,22 @@ and extern foreign types are outside the translation.
 
 MiniRust (and `minimize`) only ever sees fully monomorphized types, so an
 unsubstituted generic parameter (`RigidTy.param`, `ty::Param`) or an
-unnormalized associated-type projection (`RigidTy.alias`, `ty::Alias`) has no
-layout from which a metadata kind could be read: both fail closed (`none`),
+unnormalized associated-type projection (`RigidTy.alias`, `ty::Alias`) — either
+directly or nested inside a container type (`tuple`, `array`, `slice`, `adt`,
+`rawPtr`, `ref`, `fnDef`, `fnPtr`, `closure`) — has no layout from which a
+metadata kind could be read: all unmonomorphized pointees fail closed (`none`),
 which keeps every pointer to such a pointee out of the translation. -/
 def rawPtrMetaKind : MirAst.RigidTy → Option Gen.PointerMetaKind
-  | .bool | .char | .int _ | .uint _ | .float _ | .never
-  | .tuple _ | .array _ _ | .ref _ _ | .rawPtr _ _ | .adt _ _
-  | .fnDef _ _ | .fnPtr _ _ _ _ | .closure _ _ => some .None
-  | .slice _ | .str => some .ElementCount
+  | .bool | .char | .int _ | .uint _ | .float _ | .never => some .None
+  | .tuple elems | .adt _ elems | .fnDef _ elems | .closure _ elems =>
+    if isMonoRigidTyList elems then some .None else none
+  | .array elem _ | .ref _ elem | .rawPtr _ elem =>
+    if isMonoRigidTy elem then some .None else none
+  | .fnPtr inputs output _ _ =>
+    if isMonoRigidTyList inputs && isMonoRigidTy output then some .None else none
+  | .slice elem =>
+    if isMonoRigidTy elem then some .ElementCount else none
+  | .str => some .ElementCount
   | .dynamic _ | .foreign _ | .other _ => none
   | .param _ _ | .alias _ _ => none
 
@@ -681,11 +716,9 @@ def pointeeInfoOfRigidTyAux : Nat → MirAst.RigidTy → Option Gen.PointeeInfo
       | .bool =>
         some { layout := .Sized ⟨1⟩ ⟨1⟩, inhabited := true,
                unsafe_cells := .Sized [], freeze := true, unpin := true }
-      | .adt "core::cmp::Ordering" [] | .adt "std::cmp::Ordering" [] =>
-        some { layout := .Sized ⟨1⟩ ⟨1⟩, inhabited := true,
-               unsafe_cells := .Sized [], freeze := true, unpin := true }
-      | .adt defPath (inner :: _) =>
-        if isUnsafeCellPath defPath then do
+      | .adt defPath (inner :: rest) =>
+        if !isMonoRigidTyList rest then none
+        else if isUnsafeCellPath defPath then do
           let innerInfo ← pointeeInfoOfRigidTyAux fuel inner
           match innerInfo.layout with
           | .Sized sz al =>
@@ -700,6 +733,9 @@ def pointeeInfoOfRigidTyAux : Nat → MirAst.RigidTy → Option Gen.PointeeInfo
                    unsafe_cells := .Sized [], freeze := true, unpin := true }
           | _ => none
         else none
+      | .adt "core::cmp::Ordering" [] | .adt "std::cmp::Ordering" [] =>
+        some { layout := .Sized ⟨1⟩ ⟨1⟩, inhabited := true,
+               unsafe_cells := .Sized [], freeze := true, unpin := true }
       | .tuple [] =>
         some { layout := .Sized ⟨0⟩ ⟨1⟩, inhabited := true,
                unsafe_cells := .Sized [], freeze := true, unpin := true }
@@ -768,8 +804,8 @@ def refTypeOf (t : MirAst.Ty) : Option Gen.Type :=
 > }" -/
 def boxTypeOf (t : MirAst.Ty) : Option Gen.Type :=
   match t.kind with
-  | .adt defPath (pointee :: _) =>
-    if isBoxPath defPath then
+  | .adt defPath (pointee :: rest) =>
+    if isMonoRigidTyList rest && isBoxPath defPath then
       (pointeeInfoOfRigidTy pointee).map fun info => .Ptr (.Box info)
     else none
   | _ => none
@@ -923,9 +959,9 @@ def translatePointeeRigidTyAux : Nat → MirAst.RigidTy → Option Gen.Type
     | none =>
       match pointee with
       | .bool => some .Bool
-      | .adt "core::cmp::Ordering" [] | .adt "std::cmp::Ordering" [] => some orderingTy
-      | .adt defPath (inner :: _) =>
-        if isUnsafeCellPath defPath then do
+      | .adt defPath (inner :: rest) =>
+        if !isMonoRigidTyList rest then none
+        else if isUnsafeCellPath defPath then do
           let innerTy ← translatePointeeRigidTyAux fuel inner
           let innerInfo ← pointeeInfoOfRigidTy inner
           match innerInfo.layout with
@@ -935,6 +971,7 @@ def translatePointeeRigidTyAux : Nat → MirAst.RigidTy → Option Gen.Type
         else if isBoxPath defPath then
           (pointeeInfoOfRigidTy inner).map fun info => .Ptr (.Box info)
         else none
+      | .adt "core::cmp::Ordering" [] | .adt "std::cmp::Ordering" [] => some orderingTy
       | .tuple [] =>
         some (.Tuple [] { «end» := ⟨0⟩, align := ⟨1⟩, packed_align := none } none)
       | .tuple [elem, .bool] => (intTyBytes elem).map (fun (s, n) => intBoolTupleTy ⟨s, ⟨n⟩⟩)
@@ -964,8 +1001,8 @@ in `translatePlace`). -/
 def derefPointeeTy (t : MirAst.Ty) : Option Gen.Type :=
   match t.kind with
   | .rawPtr _ pointee | .ref _ pointee => translatePointeeRigidTy pointee
-  | .adt defPath (pointee :: _) =>
-    if isBoxPath defPath then translatePointeeRigidTy pointee else none
+  | .adt defPath (pointee :: rest) =>
+    if isMonoRigidTyList rest && isBoxPath defPath then translatePointeeRigidTy pointee else none
   | _ => none
 
 /-! ### Unmonomorphized types fail closed
@@ -1044,6 +1081,365 @@ theorem translateTy_ptr_alias (layouts : Layout.LayoutTable) (m : MirAst.Mutabil
     derefPointeeTy ⟨.rawPtr m (.alias p args), layoutIdx⟩ = none ∧
     derefPointeeTy ⟨.ref m (.alias p args), layoutIdx⟩ = none :=
   ⟨rfl, rfl, rfl, rfl⟩
+
+theorem isMonoRigidTy_of_intTyBytes {k : MirAst.RigidTy} {p : LibSpecr.Signedness × Nat}
+    (h : intTyBytes k = some p) : isMonoRigidTy k = true := by
+  cases k <;> first | rfl | simp [intTyBytes] at h
+
+theorem intTyBytes_eq_none_of_not_isMonoRigidTy {k : MirAst.RigidTy}
+    (h : isMonoRigidTy k = false) : intTyBytes k = none := by
+  cases hb : intTyBytes k with
+  | none => rfl
+  | some p => rw [isMonoRigidTy_of_intTyBytes hb] at h; cases h
+
+theorem rawPtrMetaKind_eq_none_of_not_isMonoRigidTy {k : MirAst.RigidTy}
+    (h : isMonoRigidTy k = false) : rawPtrMetaKind k = none := by
+  cases k <;> simp_all [isMonoRigidTy, rawPtrMetaKind]
+
+theorem isMonoRigidTyList_eq_false_of_mem {k : MirAst.RigidTy} {ks : List MirAst.RigidTy}
+    (hmem : k ∈ ks) (hk : isMonoRigidTy k = false) : isMonoRigidTyList ks = false := by
+  induction ks with
+  | nil => cases hmem
+  | cons hd tl ih =>
+    rcases List.mem_cons.mp hmem with rfl | htl
+    · simp [isMonoRigidTyList, hk]
+    · simp [isMonoRigidTyList, ih htl]
+
+mutual
+
+theorem specOfRigidTy_eq_none_of_not_isMonoRigidTy (layouts : Layout.LayoutTable) :
+    ∀ (k : MirAst.RigidTy) (layoutIdx : Nat),
+      isMonoRigidTy k = false → specOfRigidTy layouts k layoutIdx = none
+  | .bool, _, h | .char, _, h | .int _, _, h | .uint _, _, h | .float _, _, h
+  | .str, _, h | .never, _, h | .dynamic _, _, h | .foreign _, _, h
+  | .other _, _, h => by simp [isMonoRigidTy] at h
+  | .param _ _, _, _ | .alias _ _, _, _
+  | .array _ _, _, _ | .slice _, _, _ | .rawPtr _ _, _, _ | .ref _ _, _, _
+  | .fnDef _ _, _, _ | .fnPtr _ _ _ _, _, _ | .closure _ _, _, _ => by
+    simp [specOfRigidTy]
+  | .tuple fieldKinds, layoutIdx, h => by
+    simp only [isMonoRigidTy] at h
+    unfold specOfRigidTy
+    cases Layout.LayoutTable.lookup layouts layoutIdx with
+    | none => rfl
+    | some l =>
+      dsimp only [Option.bind_eq_bind, Option.bind]
+      split
+      · split
+        · rw [specOfFieldList_eq_none_of_not_isMonoRigidTyList layouts _ fieldKinds l.fieldLayouts h]
+        · rfl
+      · rfl
+  | .adt defPath fieldKinds, layoutIdx, h => by
+    simp only [isMonoRigidTy] at h
+    unfold specOfRigidTy
+    cases Layout.LayoutTable.lookup layouts layoutIdx with
+    | none => rfl
+    | some l =>
+      dsimp only [Option.bind_eq_bind, Option.bind]
+      split
+      · split
+        · rw [specOfFieldList_eq_none_of_not_isMonoRigidTyList layouts _ fieldKinds l.fieldLayouts h]
+        · rfl
+      · rfl
+
+theorem specOfFieldList_eq_none_of_not_isMonoRigidTyList (layouts : Layout.LayoutTable) :
+    ∀ (offs : List Layout.Size) (fks : List MirAst.RigidTy) (fls : List Nat),
+      isMonoRigidTyList fks = false → specOfFieldList layouts offs fks fls = none
+  | _, [], _, h => by simp [isMonoRigidTyList] at h
+  | [], _ :: _, _, _ => rfl
+  | off :: offs, fk :: fks, fls, h => by
+    simp only [isMonoRigidTyList, Bool.and_eq_false_iff] at h
+    unfold specOfFieldList
+    dsimp only [Option.bind_eq_bind, Option.bind]
+    rcases h with hfk | hfks
+    · rw [specOfRigidTy_eq_none_of_not_isMonoRigidTy layouts fk (fls.head?.getD 0) hfk]
+    · cases specOfRigidTy layouts fk (fls.head?.getD 0) with
+      | none => rfl
+      | some fSpec =>
+        dsimp only
+        rw [specOfFieldList_eq_none_of_not_isMonoRigidTyList layouts offs fks (fls.tailD []) hfks]
+
+end
+
+theorem eqAlignIntPairOf_eq_none_of_not_isMonoRigidTy {k : MirAst.RigidTy}
+    (h : isMonoRigidTy k = false) : eqAlignIntPairOf k = none := by
+  unfold eqAlignIntPairOf
+  split
+  · rename_i t0 t1
+    simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_true, Bool.and_eq_false_iff] at h
+    rcases h with h0 | h1
+    · rw [intTyBytes_eq_none_of_not_isMonoRigidTy h0]; rfl
+    · cases intTyBytes t0 with
+      | none => rfl
+      | some p0 => rw [intTyBytes_eq_none_of_not_isMonoRigidTy h1]; rfl
+  · rfl
+
+theorem pointeeInfoOfRigidTyAux_eq_none_of_not_isMonoRigidTy :
+    ∀ (fuel : Nat) (k : MirAst.RigidTy),
+      isMonoRigidTy k = false → pointeeInfoOfRigidTyAux fuel k = none
+  | 0, _, _ => rfl
+  | fuel + 1, k, h => by
+    unfold pointeeInfoOfRigidTyAux
+    rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]
+    dsimp only
+    cases k with
+    | bool | char | int _ | uint _ | float _ | str | never
+    | dynamic _ | foreign _ | other _ => simp [isMonoRigidTy] at h
+    | param _ _ | alias _ _ | slice _ | fnDef _ _ | fnPtr _ _ _ _ | closure _ _ => rfl
+    | adt defPath args =>
+      cases args with
+      | nil => simp [isMonoRigidTy, isMonoRigidTyList] at h
+      | cons inner rest =>
+        simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_eq_false_iff] at h
+        dsimp only
+        cases hrest : isMonoRigidTyList rest with
+        | false => rfl
+        | true =>
+          have hinner : isMonoRigidTy inner = false := h.resolve_right (by simp [hrest])
+          rw [pointeeInfoOfRigidTyAux_eq_none_of_not_isMonoRigidTy fuel inner hinner,
+            rawPtrMetaKind_eq_none_of_not_isMonoRigidTy hinner]
+          cases isUnsafeCellPath defPath <;> cases isBoxPath defPath <;> rfl
+    | tuple elems =>
+      rcases elems with _ | ⟨e0, _ | ⟨e1, rest⟩⟩
+      · simp [isMonoRigidTy, isMonoRigidTyList] at h
+      · rfl
+      · cases rest with
+        | cons _ _ => cases e1 <;> rfl
+        | nil =>
+          have hp := eqAlignIntPairOf_eq_none_of_not_isMonoRigidTy h
+          cases e1 <;> try (dsimp only; rw [hp]; rfl)
+          simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_true] at h
+          dsimp only
+          rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]; rfl
+    | array elem count =>
+      simp only [isMonoRigidTy] at h
+      dsimp only
+      rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]; rfl
+    | rawPtr m inner =>
+      simp only [isMonoRigidTy] at h
+      dsimp only
+      rw [rawPtrMetaKind_eq_none_of_not_isMonoRigidTy h]
+    | ref m inner =>
+      simp only [isMonoRigidTy] at h
+      dsimp only
+      rw [pointeeInfoOfRigidTyAux_eq_none_of_not_isMonoRigidTy fuel inner h]; rfl
+
+theorem pointeeInfoOfRigidTy_eq_none_of_not_isMonoRigidTy {k : MirAst.RigidTy}
+    (h : isMonoRigidTy k = false) : pointeeInfoOfRigidTy k = none :=
+  pointeeInfoOfRigidTyAux_eq_none_of_not_isMonoRigidTy 16 k h
+
+theorem translatePointeeRigidTyAux_eq_none_of_not_isMonoRigidTy :
+    ∀ (fuel : Nat) (k : MirAst.RigidTy),
+      isMonoRigidTy k = false → translatePointeeRigidTyAux fuel k = none
+  | 0, _, _ => rfl
+  | fuel + 1, k, h => by
+    unfold translatePointeeRigidTyAux
+    rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]
+    dsimp only
+    cases k with
+    | bool | char | int _ | uint _ | float _ | str | never
+    | dynamic _ | foreign _ | other _ => simp [isMonoRigidTy] at h
+    | param _ _ | alias _ _ | slice _ | fnDef _ _ | fnPtr _ _ _ _ | closure _ _ => rfl
+    | adt defPath args =>
+      cases args with
+      | nil => simp [isMonoRigidTy, isMonoRigidTyList] at h
+      | cons inner rest =>
+        simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_eq_false_iff] at h
+        dsimp only
+        cases hrest : isMonoRigidTyList rest with
+        | false => rfl
+        | true =>
+          have hinner : isMonoRigidTy inner = false := h.resolve_right (by simp [hrest])
+          rw [translatePointeeRigidTyAux_eq_none_of_not_isMonoRigidTy fuel inner hinner,
+            pointeeInfoOfRigidTy_eq_none_of_not_isMonoRigidTy hinner]
+          cases isUnsafeCellPath defPath <;> cases isBoxPath defPath <;> rfl
+    | tuple elems =>
+      rcases elems with _ | ⟨e0, _ | ⟨e1, rest⟩⟩
+      · simp [isMonoRigidTy, isMonoRigidTyList] at h
+      · rfl
+      · cases rest with
+        | cons _ _ => cases e1 <;> rfl
+        | nil =>
+          have hp := eqAlignIntPairOf_eq_none_of_not_isMonoRigidTy h
+          cases e1 <;> try (dsimp only; rw [hp]; rfl)
+          simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_true] at h
+          dsimp only
+          rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]; rfl
+    | array elem count =>
+      simp only [isMonoRigidTy] at h
+      dsimp only
+      rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]; rfl
+    | rawPtr m inner =>
+      simp only [isMonoRigidTy] at h
+      dsimp only
+      rw [rawPtrMetaKind_eq_none_of_not_isMonoRigidTy h]; rfl
+    | ref m inner =>
+      simp only [isMonoRigidTy] at h
+      dsimp only
+      rw [intTyBytes_eq_none_of_not_isMonoRigidTy h,
+        pointeeInfoOfRigidTy_eq_none_of_not_isMonoRigidTy h]; rfl
+
+theorem translatePointeeRigidTy_eq_none_of_not_isMonoRigidTy {k : MirAst.RigidTy}
+    (h : isMonoRigidTy k = false) : translatePointeeRigidTy k = none :=
+  translatePointeeRigidTyAux_eq_none_of_not_isMonoRigidTy 16 k h
+
+theorem intBoolTupleOf_eq_none_of_not_isMonoRigidTy {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : intBoolTupleOf t = none := by
+  rcases t with ⟨kind, lidx⟩
+  unfold intBoolTupleOf
+  cases kind with
+  | tuple elems =>
+    dsimp only at h ⊢
+    rcases elems with _ | ⟨e0, _ | ⟨e1, rest⟩⟩
+    · rfl
+    · rfl
+    · cases rest with
+      | cons _ _ => cases e1 <;> rfl
+      | nil =>
+        cases e1 <;> try rfl
+        simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_true] at h
+        dsimp only
+        rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]; rfl
+  | _ => rfl
+
+theorem scalarTypeOf_eq_none_of_not_isMonoRigidTy {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : scalarTypeOf t = none := by
+  have hb : isBoolTy t = false := by
+    unfold isBoolTy; cases hk : t.kind <;> first | rfl | (rw [hk] at h; simp [isMonoRigidTy] at h)
+  have ho : isOrderingTy t = false := by
+    unfold isOrderingTy
+    cases hk : t.kind with
+    | adt dp args =>
+      cases args with
+      | nil => rw [hk] at h; simp [isMonoRigidTy, isMonoRigidTyList] at h
+      | cons _ _ => rfl
+    | _ => rfl
+  have hibt := intBoolTupleOf_eq_none_of_not_isMonoRigidTy h
+  have hint : intTypeOf t = none := by
+    simp [intTypeOf, intTyBytes_eq_none_of_not_isMonoRigidTy h]
+  simp [scalarTypeOf, hb, ho, hibt, hint]
+
+theorem arrayTypeOf_eq_none_of_not_isMonoRigidTy {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : arrayTypeOf t = none := by
+  rcases t with ⟨kind, lidx⟩
+  unfold arrayTypeOf
+  cases kind with
+  | array elem count =>
+    simp only [isMonoRigidTy] at h
+    dsimp only
+    rw [intTyBytes_eq_none_of_not_isMonoRigidTy h]; rfl
+  | _ => rfl
+
+theorem tupleTypeOf_eq_none_of_not_isMonoRigidTy (layouts : Layout.LayoutTable) {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : tupleTypeOf layouts t = none := by
+  unfold tupleTypeOf
+  rw [specOfRigidTy_eq_none_of_not_isMonoRigidTy layouts t.kind t.layoutIdx h]
+  split <;> first | rfl | (split <;> rfl)
+
+theorem rawPtrTypeOf_eq_none_of_not_isMonoRigidTy {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : rawPtrTypeOf t = none := by
+  rcases t with ⟨kind, lidx⟩
+  unfold rawPtrTypeOf rawPtrMetaOf
+  cases kind with
+  | rawPtr m pointee =>
+    simp only [isMonoRigidTy] at h
+    dsimp only
+    rw [rawPtrMetaKind_eq_none_of_not_isMonoRigidTy h]; rfl
+  | _ => rfl
+
+theorem refTypeOf_eq_none_of_not_isMonoRigidTy {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : refTypeOf t = none := by
+  rcases t with ⟨kind, lidx⟩
+  unfold refTypeOf
+  cases kind with
+  | ref m pointee =>
+    simp only [isMonoRigidTy] at h
+    dsimp only
+    rw [intTyBytes_eq_none_of_not_isMonoRigidTy h,
+      pointeeInfoOfRigidTy_eq_none_of_not_isMonoRigidTy h]; rfl
+  | _ => rfl
+
+theorem boxTypeOf_eq_none_of_not_isMonoRigidTy {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : boxTypeOf t = none := by
+  rcases t with ⟨kind, lidx⟩
+  unfold boxTypeOf
+  cases kind with
+  | adt defPath args =>
+    cases args with
+    | nil => rfl
+    | cons pointee rest =>
+      simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_eq_false_iff] at h
+      dsimp only
+      cases hrest : isMonoRigidTyList rest with
+      | false => rfl
+      | true =>
+        have hpt : isMonoRigidTy pointee = false := h.resolve_right (by simp [hrest])
+        rw [pointeeInfoOfRigidTy_eq_none_of_not_isMonoRigidTy hpt]
+        split <;> rfl
+  | _ => rfl
+
+/-- Master monomorphization fail-closed theorem: any `MirAst.Ty` containing an
+unsubstituted generic parameter (`RigidTy.param`) or unnormalized associated-type
+projection (`RigidTy.alias`) anywhere in its `RigidTy` tree has no MiniRust type
+translation (`translateTy layouts t = none`). -/
+theorem translateTy_eq_none_of_not_isMonoRigidTy (layouts : Layout.LayoutTable) {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : translateTy layouts t = none := by
+  simp [translateTy, scalarTypeOf_eq_none_of_not_isMonoRigidTy h,
+    arrayTypeOf_eq_none_of_not_isMonoRigidTy h,
+    tupleTypeOf_eq_none_of_not_isMonoRigidTy layouts h,
+    rawPtrTypeOf_eq_none_of_not_isMonoRigidTy h,
+    refTypeOf_eq_none_of_not_isMonoRigidTy h,
+    boxTypeOf_eq_none_of_not_isMonoRigidTy h]
+
+/-- Dereferencing any pointer, reference, or `Box` type that contains an
+unmonomorphized `.param` or `.alias` fails closed (`derefPointeeTy t = none`). -/
+theorem derefPointeeTy_eq_none_of_not_isMonoRigidTy {t : MirAst.Ty}
+    (h : isMonoRigidTy t.kind = false) : derefPointeeTy t = none := by
+  rcases t with ⟨kind, lidx⟩
+  unfold derefPointeeTy
+  cases kind with
+  | rawPtr m pointee | ref m pointee =>
+    simp only [isMonoRigidTy] at h
+    exact translatePointeeRigidTy_eq_none_of_not_isMonoRigidTy h
+  | adt defPath args =>
+    cases args with
+    | nil => rfl
+    | cons pointee rest =>
+      simp only [isMonoRigidTy, isMonoRigidTyList, Bool.and_eq_false_iff] at h
+      dsimp only
+      cases hrest : isMonoRigidTyList rest with
+      | false => rfl
+      | true =>
+        have hpt : isMonoRigidTy pointee = false := h.resolve_right (by simp [hrest])
+        rw [translatePointeeRigidTy_eq_none_of_not_isMonoRigidTy hpt]
+        split <;> rfl
+  | _ => rfl
+
+/-- Concrete container fail-closed corollaries: arrays, tuples, structs, slices,
+and raw pointers/references wrapping `.param` or `.alias` all fail closed in
+`translateTy`. -/
+theorem translateTy_container_param (layouts : Layout.LayoutTable) (m : MirAst.Mutability)
+    (idx : Nat) (name : String) (count : Nat) (defPath : String) (layoutIdx : Nat) :
+    translateTy layouts ⟨.array (.param idx name) count, layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.tuple [.param idx name], layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.adt defPath [.param idx name], layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.rawPtr m (.tuple [.param idx name]), layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.rawPtr m (.array (.param idx name) count), layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.rawPtr m (.slice (.param idx name)), layoutIdx⟩ = none := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    exact translateTy_eq_none_of_not_isMonoRigidTy layouts rfl
+
+theorem translateTy_container_alias (layouts : Layout.LayoutTable) (m : MirAst.Mutability)
+    (p : MirAst.DefPath) (args : List MirAst.RigidTy) (count : Nat) (defPath : String)
+    (layoutIdx : Nat) :
+    translateTy layouts ⟨.array (.alias p args) count, layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.tuple [.alias p args], layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.adt defPath [.alias p args], layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.rawPtr m (.tuple [.alias p args]), layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.rawPtr m (.array (.alias p args) count), layoutIdx⟩ = none ∧
+    translateTy layouts ⟨.rawPtr m (.slice (.alias p args)), layoutIdx⟩ = none := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    exact translateTy_eq_none_of_not_isMonoRigidTy layouts rfl
 
 /-- Left-to-right fold translating a chain of `ProjectionElem.field` projections
 into nested `PlaceExpr.Field` expressions (`tooling/minimize/src/rvalue.rs`):
@@ -1225,7 +1621,8 @@ def borrowPlacePointeeInfo (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
       let d ← decls[p]?
       let pointeeRt ← match d.ty.kind with
         | .rawPtr _ rt | .ref _ rt => some rt
-        | .adt defPath (rt :: _) => if isBoxPath defPath then some rt else none
+        | .adt defPath (rt :: rest') =>
+          if isMonoRigidTyList rest' && isBoxPath defPath then some rt else none
         | _ => none
       let leafRt ← match rest with
         | [] => some pointeeRt
@@ -2952,6 +3349,43 @@ def rvalueOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
       -- scalar, which is MiniRust's 8-byte `usize` only on a 64-bit layout table.
       decide (MirSemantics.layoutPointerBytes layouts = 8))
   | _ => false
+
+/-- `RigidTy.char` (`DIFF-AB`) is outside the MiniRust translation and integer
+fragment (`intTyBytes .char = none`), so `char -> int` and `int -> char` casts
+(`CastKind.intToInt`) fail closed in `translateTy`, `translateRvalue`, and
+`rvalueOk`. -/
+theorem intTyBytes_char : intTyBytes .char = none := rfl
+
+theorem scalarTypeOf_char (layoutIdx : Nat) :
+    scalarTypeOf ⟨.char, layoutIdx⟩ = none := rfl
+
+theorem translateTy_char (layouts : Layout.LayoutTable) (layoutIdx : Nat) :
+    translateTy layouts ⟨.char, layoutIdx⟩ = none := rfl
+
+theorem translateRvalue_cast_intToInt_to_char_eq_none (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) (targetTy : Option MirAst.Ty)
+    (op : MirAst.Operand) (layoutIdx : Nat) :
+    translateRvalue layouts decls targetTy (.cast .intToInt op ⟨.char, layoutIdx⟩) = none := rfl
+
+theorem rvalueOk_cast_intToInt_to_char_eq_false (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) (it : Gen.IntType)
+    (op : MirAst.Operand) (layoutIdx : Nat) :
+    rvalueOk layouts decls it (.cast .intToInt op ⟨.char, layoutIdx⟩) = false := rfl
+
+theorem translateRvalue_cast_intToInt_from_char_const_eq_none (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) (targetTy : Option MirAst.Ty)
+    (val : MirAst.ConstValue) (cLayoutIdx : Nat) (castTy : MirAst.Ty) :
+    translateRvalue layouts decls targetTy
+      (.cast .intToInt (.constant ⟨⟨.char, cLayoutIdx⟩, val⟩) castTy) = none := by
+  simp [translateRvalue, Option.bind_eq_bind, operandType, scalarTypeOf_char]
+
+theorem rvalueOk_cast_intToInt_from_char_const_eq_false (layouts : Layout.LayoutTable)
+    (decls : List MirAst.LocalDecl) (it : Gen.IntType)
+    (val : MirAst.ConstValue) (cLayoutIdx : Nat) (castTy : MirAst.Ty) :
+    rvalueOk layouts decls it
+      (.cast .intToInt (.constant ⟨⟨.char, cLayoutIdx⟩, val⟩) castTy) = false := by
+  simp [rvalueOk, operandIntType, intTypeOf, intTyBytes, operandOkB, operandIsBool, operandType,
+    scalarTypeOf_char]
 
 /-- The operands of a fragment comparison: both integers of one type, or both
 `bool`s (MiniRust requires both operands of `BinOp::Rel` to have the same

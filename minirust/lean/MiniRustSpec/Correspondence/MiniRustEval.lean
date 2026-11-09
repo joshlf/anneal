@@ -5848,10 +5848,11 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
     (h : FrameOk body f ctx locals lm m blk stmt)
     (p : Place) (hp : mentionPlaceOk body.layouts body.localDecls p = true) (pe : Gen.PlaceExpr)
     (hpe : translatePlace body.localDecls p = some pe) :
-    p.local_ < body.localDecls.length ∧
+    mentionPlaceOk body.layouts body.localDecls p = true ∧
     (locals[p.local_]? ≠ some .dead → evalStatement m (.PlaceMention pe) = .ok m) ∧
     (locals[p.local_]? = some .dead → p.local_ ∉ alwaysStorageLiveLocals body →
       ∃ msg, evalStatement m (.PlaceMention pe) = .error (.ub msg)) := by
+  have hp0 := hp
   match p, hp, hpe with
   | ⟨i, []⟩, hp, hpe =>
     simp only [mentionPlaceOk, decide_eq_true_eq] at hp
@@ -5859,7 +5860,7 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
     subst hpe
     obtain ⟨d, slot, hd, hs⟩ := h.slot_exists i hp
     have hspec := h.hf.2 i d hd
-    refine ⟨hp, fun hlive => ?_, fun hdead hal => ?_⟩
+    refine ⟨hp0, fun hlive => ?_, fun hdead hal => ?_⟩
     · obtain ⟨q, hq⟩ := h.locs.some_of_live hs (fun hc => hlive (hc ▸ hs))
       simp [evalStatement, evalPlace_local_some h.shape i _ hspec.2 q hq]
     · have hq := h.locs.none_of_dead hdead hal
@@ -5881,7 +5882,7 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
         obtain ⟨hTd, hitd⟩ := tyOf_tuple (layouts := body.layouts) htup
         have hloc := (h.hf.2 i d hd).2
         rw [hTd] at hloc
-        refine ⟨hi, fun hlive => ?_, fun hdead hal => ?_⟩
+        refine ⟨hp0, fun hlive => ?_, fun hdead hal => ?_⟩
         · obtain ⟨q, hq⟩ := h.locs.some_of_live hs (fun hc => hlive (hc ▸ hs))
           obtain ⟨k, hqk, _⟩ := h.locs.storage i d slot q hd hs hq
           obtain ⟨_, haddr, _, _, _⟩ :=
@@ -5899,7 +5900,7 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
         have hgood := intBoolTupleOf_good htup
         have hloc := (h.hf.2 i d hd).2
         rw [hTd] at hloc
-        refine ⟨hi, fun hlive => ?_, fun hdead hal => ?_⟩
+        refine ⟨hp0, fun hlive => ?_, fun hdead hal => ?_⟩
         · obtain ⟨q, hq⟩ := h.locs.some_of_live hs (fun hc => hlive (hc ▸ hs))
           obtain ⟨k, hqk, _⟩ := h.locs.storage i d slot q hd hs hq
           obtain ⟨_, haddr, _, _, hA⟩ :=
@@ -5927,7 +5928,7 @@ theorem evalStatement_placeMention_place {body : CapturedMir} {f : Gen.Function}
         obtain ⟨hrootWf, _⟩ :=
           (DeclSlotOk_of_tupleTypeOf htspec (.init rootVal)).mp
             (h.slots i d (.init rootVal) hd hs)
-        refine ⟨hi, fun _ => ?_, fun hdead _ => by rw [hs] at hdead; cases hdead⟩
+        refine ⟨hp0, fun _ => ?_, fun hdead _ => by rw [hs] at hdead; cases hdead⟩
         obtain ⟨q, hq⟩ := h.locs.some_of_live hs (by simp)
         obtain ⟨k, hqk, _, haddr, haddrMax, _, hA⟩ :=
           h.locs.storage_nonptr i d (.init rootVal) q hd hs hq
