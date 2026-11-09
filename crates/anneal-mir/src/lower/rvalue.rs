@@ -1267,8 +1267,9 @@ pub enum RvalueEvalError {
         addr: u64,
         byte_offset: i128,
     },
-    /// Place projection that cannot be evaluated without a memory model (only bare locals,
-    /// and `&(*p)` / `&raw (*p)` reborrows, are supported).
+    /// Place that cannot be evaluated without a byte-level memory model: a `Deref` read or
+    /// write (other than the `&(*p)` / `&raw (*p)` reborrows), the address of a projected
+    /// place, or a nested write into an inactive union field.
     UnsupportedPlaceProjection(Place),
     /// Ill-formed `Constant` (wrong type, out-of-range bits, or null `&T`).
     InvalidConstant(&'static str),
@@ -1291,7 +1292,9 @@ pub enum RvalueEvalError {
         expected: usize,
         actual: usize,
     },
-    /// Union `Field` read (or nested write) on a field other than the union's active field.
+    /// Union `Field` read on a field other than the union's active field. (A nested write into
+    /// an inactive union field is `UnsupportedPlaceProjection` instead: it is defined in Rust
+    /// but needs a byte-level memory model.)
     InactiveUnionField {
         active_field: usize,
         requested_field: usize,
@@ -3046,6 +3049,13 @@ fn write_projected_mir_value(
                     });
                 };
                 if rest.is_empty() {
+                    // Both the replaced field and the written value must have the projected
+                    // field type, so a write never changes the tuple's type.
+                    if !mir_value_matches_ty(field_slot, expected_ty) {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "projected tuple field runtime type does not match expected type",
+                        ));
+                    }
                     if !mir_value_matches_ty(&new_val, expected_ty) {
                         return Err(RvalueEvalError::TypeMismatch(
                             "written tuple field runtime type does not match expected type",
@@ -3111,6 +3121,13 @@ fn write_projected_mir_value(
                     });
                 };
                 if rest.is_empty() {
+                    // Both the replaced field and the written value must have the projected
+                    // field type, so a write never changes the ADT variant's field types.
+                    if !mir_value_matches_ty(field_slot, expected_ty) {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "projected ADT field runtime type does not match expected type",
+                        ));
+                    }
                     if !mir_value_matches_ty(&new_val, expected_ty) {
                         return Err(RvalueEvalError::TypeMismatch(
                             "written ADT field runtime type does not match expected type",
@@ -3174,10 +3191,14 @@ fn write_projected_mir_value(
                     }
                 } else {
                     if *active != *idx {
-                        return Err(RvalueEvalError::InactiveUnionField {
-                            active_field: *active,
-                            requested_field: *idx,
-                        });
+                        // A write into a sub-place of an inactive union field (`u.b.0 = x`
+                        // while `u.a` is active) is defined in Rust: it overwrites part of the
+                        // union's storage. The value tree has no bytes for the inactive field to
+                        // update, so this needs a byte-level memory model and is unsupported
+                        // rather than undefined behavior.
+                        return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                            full_place.clone(),
+                        ));
                     }
                     let field_count = fields.len();
                     let field_slot = if field_count == 1 {
@@ -3475,6 +3496,11 @@ pub fn eval_place_read(
 /// Supports arbitrary chains of `Field`, `Index`, `ConstantIndex`, `Subslice`, and `Downcast`
 /// projections over `MirValue::{Tuple, Array, Adt}`. Any `ProjectionElem::Deref` returns
 /// `Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()))`.
+///
+/// A projected write never changes the type of a container along `place`: the replaced value
+/// and `new_val` must both have the projected field or element type (a union write may switch
+/// the active field), and a `Subslice` write must supply an array of the window's exact length
+/// and element type. On any error `locals` is left unchanged.
 pub fn eval_place_write(
     place: &Place,
     new_val: MirValue,
@@ -3825,6 +3851,16 @@ pub enum FieldSlot {
 }
 
 /// Partially initialized tuple, struct, or enum variant shell (`D13b`).
+///
+/// A shell is created only by field writes into an uninitialized local (or uninitialized
+/// tuple field) whose declared type is a `Ty::Tuple`; arrays never get shells, so an element
+/// write into an uninitialized array fails closed (`c6d2ad74`).
+///
+/// Anneal types structs, enums, and unions alike as the `Ty::Tuple` of their fields, so a
+/// field-by-field initialization of an uninitialized *union* local also builds a per-field
+/// shell. Such a shell keeps every written field instead of modeling the overlapping storage
+/// of union fields; union values built by `Rvalue::Aggregate` carry `active_field` and do not
+/// have this limitation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialAggregate {
     /// Optional ADT definition path (if known from prior ADT value).
@@ -3835,54 +3871,37 @@ pub struct PartialAggregate {
     /// True if this shell represents an enum/ADT variant (via `Downcast` or `SetDiscriminant`)
     /// rather than a plain tuple.
     pub is_adt: bool,
+    /// True once `Statement::SetDiscriminant` has written this shell's variant tag.
+    ///
+    /// `rustc` MIR builds enum values in place as `((_1 as V).0) = x; discriminant(_1) = V;`.
+    /// Before `SetDiscriminant` runs, the tag bytes are uninitialized, so an enum shell
+    /// narrowed only by `Downcast(v)` field writes is never promoted to an initialized
+    /// `MirValue::Adt` (a whole-value read fails with `UninitializedLocal`) and cannot answer
+    /// `Rvalue::Discriminant`, even when every field of the variant has been written.
+    pub discriminant_set: bool,
     /// Per-field initialization states in declaration order.
     pub fields: Vec<FieldSlot>,
 }
 
 impl PartialAggregate {
-    /// Creates an all-uninitialized tuple/ADT shell with `field_count` fields.
+    /// Creates an all-uninitialized tuple/ADT shell with `field_count` fields and an unwritten
+    /// variant tag (`discriminant_set == false`).
     pub fn new_uninit(field_count: usize, variant_idx: usize, is_adt: bool) -> Self {
         PartialAggregate {
             def_path: None,
             variant_idx,
             is_adt,
+            discriminant_set: false,
             fields: vec![FieldSlot::Uninit; field_count],
         }
     }
 
-    /// Converts an initialized `MirValue::Tuple` or non-union `MirValue::Adt` into a
-    /// `PartialAggregate` for partial field deinitialization (`Operand::Move`).
-    pub fn from_mir_value(val: &MirValue) -> Option<Self> {
-        match val {
-            MirValue::Tuple(vals) => Some(PartialAggregate {
-                def_path: None,
-                variant_idx: 0,
-                is_adt: false,
-                fields: vals.iter().cloned().map(FieldSlot::Init).collect(),
-            }),
-            MirValue::Unit => Some(PartialAggregate {
-                def_path: None,
-                variant_idx: 0,
-                is_adt: false,
-                fields: Vec::new(),
-            }),
-            MirValue::Adt {
-                def_path,
-                variant_idx,
-                active_field: None,
-                fields: vals,
-            } => Some(PartialAggregate {
-                def_path: Some(def_path.clone()),
-                variant_idx: *variant_idx,
-                is_adt: true,
-                fields: vals.iter().cloned().map(FieldSlot::Init).collect(),
-            }),
-            _ => None,
-        }
-    }
-
-    /// Returns `Some(MirValue)` if every field in `self.fields` is `FieldSlot::Init`.
+    /// Returns `Some(MirValue)` if every field in `self.fields` is `FieldSlot::Init` and, for
+    /// an enum/ADT shell (`is_adt`), the variant tag has been written by `SetDiscriminant`.
     pub fn try_into_mir_value(&self) -> Option<MirValue> {
+        if self.is_adt && !self.discriminant_set {
+            return None;
+        }
         let mut init_fields = Vec::with_capacity(self.fields.len());
         for f in &self.fields {
             match f {
@@ -3900,17 +3919,6 @@ impl PartialAggregate {
         } else {
             Some(MirValue::Tuple(init_fields))
         }
-    }
-
-    /// Returns true if all fields in this shell (and any nested shells) are `Uninit`
-    /// and no ADT variant discriminant has been set.
-    pub fn is_all_uninit(&self) -> bool {
-        !self.is_adt
-            && self.fields.iter().all(|f| match f {
-                FieldSlot::Uninit => true,
-                FieldSlot::Partial(sub) => sub.is_all_uninit(),
-                FieldSlot::Init(_) => false,
-            })
     }
 }
 
@@ -4083,34 +4091,36 @@ impl StatementEvalState {
         }
     }
 
-    /// Reads the value at `place` and deinitializes `place` (`Operand::Move`).
+    /// Reads the value at `place` for `Operand::Move`, matching
+    /// `Trusted.MirSemantics.evalOperand` on `.move`:
+    /// - a bare local (`place.projection` empty) is read and then becomes
+    ///   `LocalSlotState::Uninit`;
+    /// - a projected place (`_1.0`, `(_1 as V).0`, `_1[_2]`, ...) is read and the root local's
+    ///   slot is left unchanged, so the parent aggregate stays initialized.
+    ///
+    /// `rustc`'s borrow checker rejects every later use of a moved-from place until it is
+    /// re-initialized, so keeping projected move sources initialized only differs from a
+    /// deinitializing model on MIR that `rustc` does not emit.
     pub fn move_place(&mut self, place: &Place) -> Result<MirValue, RvalueEvalError> {
         let val = self.read_place(place)?;
         if place.projection.is_empty() {
             self.slots[place.local.0] = LocalSlotState::Uninit;
-            return Ok(val);
-        }
-        // Deinitialize along a pure `Field` / `Downcast`+`Field` chain on a tuple or non-union ADT.
-        let mut slot = match &self.slots[place.local.0] {
-            LocalSlotState::PartialShell(shell) => FieldSlot::Partial(shell.clone()),
-            LocalSlotState::Init(root_val) => {
-                if let Some(shell) = PartialAggregate::from_mir_value(root_val) {
-                    FieldSlot::Partial(shell)
-                } else {
-                    return Ok(val);
-                }
-            }
-            _ => return Ok(val),
-        };
-        if deinit_partial_slot(&mut slot, &place.projection, None) {
-            self.slots[place.local.0] = match slot {
-                FieldSlot::Uninit => LocalSlotState::Uninit,
-                FieldSlot::Partial(shell) if shell.is_all_uninit() => LocalSlotState::Uninit,
-                FieldSlot::Partial(shell) => LocalSlotState::PartialShell(shell),
-                FieldSlot::Init(v) => LocalSlotState::Init(v),
-            };
         }
         Ok(val)
+    }
+
+    /// Returns the variant index of the enum shell designated by `place` when `place` resolves,
+    /// through `Field` / `Downcast`+`Field` steps over partially initialized shells, to a
+    /// [`PartialAggregate`] whose variant tag has been written by `SetDiscriminant`.
+    ///
+    /// `Rvalue::Discriminant` reads only the tag, so it is defined on such a shell even while
+    /// some variant fields are still uninitialized.
+    fn tagged_shell_variant(&self, place: &Place) -> Option<usize> {
+        let Some(LocalSlotState::PartialShell(root)) = self.slots.get(place.local.0) else {
+            return None;
+        };
+        let shell = partial_shell_at(root, &place.projection, None)?;
+        (shell.is_adt && shell.discriminant_set).then_some(shell.variant_idx)
     }
 
     /// Writes `val` to `place` (of declared leaf type `place_ty`), supporting `D13b` nested
@@ -4302,46 +4312,40 @@ fn read_from_partial_shell(
                 }
             }
         }
+        // Shells only model tuple/struct/enum-variant values, so an array projection directly on
+        // a shell is a static type error, not an uninitialized read.
         ProjectionElem::Index(_)
         | ProjectionElem::ConstantIndex { .. }
-        | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::UninitializedLocal(base_local)),
+        | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::TypeMismatch(
+            "array projection applied to a partially initialized tuple/ADT shell",
+        )),
     }
 }
 
-/// Deinitializes a field along a pure `Field` / `Downcast`+`Field` chain inside `slot`.
-/// Returns `true` if `slot` was modified.
-fn deinit_partial_slot(
-    slot: &mut FieldSlot,
+/// Follows a pure `Field` / `Downcast`+`Field` chain through nested partially initialized
+/// shells and returns the shell that `proj` designates, or `None` if `proj` reaches an
+/// initialized or uninitialized field slot, selects an inactive variant, ends in `Downcast`,
+/// or contains any other projection.
+fn partial_shell_at<'a>(
+    shell: &'a PartialAggregate,
     proj: &[ProjectionElem],
     active_downcast: Option<usize>,
-) -> bool {
+) -> Option<&'a PartialAggregate> {
     let Some((first, rest)) = proj.split_first() else {
-        *slot = FieldSlot::Uninit;
-        return true;
+        return active_downcast.is_none().then_some(shell);
     };
+    let actual = if shell.is_adt { shell.variant_idx } else { 0 };
     match first {
-        ProjectionElem::Downcast(v) => {
-            if active_downcast.is_some() {
-                return false;
-            }
-            deinit_partial_slot(slot, rest, Some(*v))
+        ProjectionElem::Downcast(v) if active_downcast.is_none() && actual == *v => {
+            partial_shell_at(shell, rest, Some(*v))
         }
-        ProjectionElem::Field(idx, _) => {
-            if let FieldSlot::Init(val) = slot {
-                let Some(shell) = PartialAggregate::from_mir_value(val) else {
-                    return false;
-                };
-                *slot = FieldSlot::Partial(shell);
+        ProjectionElem::Field(idx, _) if actual == active_downcast.unwrap_or(0) => {
+            match shell.fields.get(*idx)? {
+                FieldSlot::Partial(child) => partial_shell_at(child, rest, None),
+                FieldSlot::Uninit | FieldSlot::Init(_) => None,
             }
-            let FieldSlot::Partial(shell) = slot else {
-                return false;
-            };
-            let Some(child_slot) = shell.fields.get_mut(*idx) else {
-                return false;
-            };
-            deinit_partial_slot(child_slot, rest, None)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -4404,10 +4408,14 @@ fn write_to_partial_slot(
                         full_place.clone(),
                     ));
                 }
-                return Err(RvalueEvalError::UninitializedLocal(base_local));
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
             }
             let Ty::Tuple(field_tys) = declared_ty else {
-                return Err(RvalueEvalError::UninitializedLocal(base_local));
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection requires a tuple-typed (ADT) place",
+                ));
             };
             match slot {
                 FieldSlot::Uninit => {
@@ -4442,7 +4450,9 @@ fn write_to_partial_slot(
         }
         ProjectionElem::Field(idx, expected_ty) => {
             let Ty::Tuple(field_tys) = declared_ty else {
-                return Err(RvalueEvalError::UninitializedLocal(base_local));
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Field projection requires a tuple-typed place",
+                ));
             };
             if *idx >= field_tys.len() {
                 return Err(RvalueEvalError::FieldOutOfBounds {
@@ -4494,9 +4504,19 @@ fn write_to_partial_slot(
             }
             Ok(())
         }
+        // `c6d2ad74`: an element or window write into an uninitialized array is undefined
+        // behavior (no array shell is ever materialized). An array projection on a
+        // tuple/ADT shell or a non-array declared type is a static type error.
         ProjectionElem::Index(_)
         | ProjectionElem::ConstantIndex { .. }
-        | ProjectionElem::Subslice { .. } => Err(RvalueEvalError::UninitializedLocal(base_local)),
+        | ProjectionElem::Subslice { .. } => match (slot, declared_ty) {
+            (FieldSlot::Uninit, Ty::Array(_, _)) => {
+                Err(RvalueEvalError::UninitializedLocal(base_local))
+            }
+            _ => Err(RvalueEvalError::TypeMismatch(
+                "array projection applied to a non-array place",
+            )),
+        },
     }
 }
 
@@ -4522,6 +4542,7 @@ fn set_discriminant_in_slot(
             FieldSlot::Partial(shell) => {
                 shell.variant_idx = variant_index;
                 shell.is_adt = true;
+                shell.discriminant_set = true;
                 if let Some(full_val) = shell.try_into_mir_value() {
                     *slot = FieldSlot::Init(full_val);
                 }
@@ -4649,7 +4670,11 @@ fn set_discriminant_in_slot(
                     None,
                 )
             }
-            (FieldSlot::Partial(_), _) => Err(RvalueEvalError::UninitializedLocal(base_local)),
+            // A shell is a tuple/struct/enum-variant value: an array projection on it is a
+            // static type error.
+            (FieldSlot::Partial(_), _) => Err(RvalueEvalError::TypeMismatch(
+                "array projection applied to a partially initialized tuple/ADT shell",
+            )),
             (FieldSlot::Init(_), _) => unreachable!(),
         };
         res?;
@@ -4663,8 +4688,11 @@ fn set_discriminant_in_slot(
 }
 
 /// Evaluates a `LoweredRvalue` in a stateful [`StatementEvalState`], respecting
-/// `LocalSlotState` (`Dead`, `Uninit`, `PartialShell`, `Init`) and `Operand::Move`
-/// deinitialization.
+/// `LocalSlotState` (`Dead`, `Uninit`, `PartialShell`, `Init`).
+///
+/// Operands are evaluated left to right. `Operand::Move` of a bare local leaves that local
+/// `Uninit` for every later operand; `Operand::Move` of a projected place leaves the root
+/// local unchanged (see [`StatementEvalState::move_place`]).
 pub fn eval_lowered_rvalue_in_state(
     rvalue: &LoweredRvalue,
     state: &mut StatementEvalState,
@@ -4861,23 +4889,15 @@ pub fn eval_lowered_rvalue_in_state(
                     ..
                 }) => variant_idx as i128,
                 Ok(_) => 0,
-                Err(RvalueEvalError::UninitializedLocal(loc)) => {
-                    // If `place` is a bare local holding an ADT `PartialShell` whose discriminant
-                    // was set via `Downcast` or `SetDiscriminant`, return its variant index.
-                    if place.projection.is_empty() {
-                        if let Some(LocalSlotState::PartialShell(shell)) =
-                            state.slots.get(place.local.0)
-                        {
-                            if shell.is_adt {
-                                return Ok(MirValue::signed(
-                                    shell.variant_idx as i128,
-                                    IntTy::Isize,
-                                    state.ptr_width,
-                                ));
-                            }
-                        }
+                Err(err @ RvalueEvalError::UninitializedLocal(_)) => {
+                    // `Rvalue::Discriminant` reads only the variant tag: an enum shell (bare or
+                    // nested) whose tag was written by `SetDiscriminant` has a defined
+                    // discriminant even while some of its variant fields are uninitialized. A
+                    // shell narrowed only by `Downcast` writes has an unwritten tag.
+                    match state.tagged_shell_variant(place) {
+                        Some(variant_idx) => variant_idx as i128,
+                        None => return Err(err),
                     }
-                    return Err(RvalueEvalError::UninitializedLocal(loc));
                 }
                 Err(e) => return Err(e),
             };
@@ -4927,10 +4947,17 @@ pub fn eval_lowered_rvalue_in_state(
 ///   returning `Err(RvalueEvalError::AssumeFalse)` on `false`.
 /// - `SetDiscriminant { place, variant_index, .. }`: updates `variant_idx` on an initialized
 ///   `Adt`/`Tuple` or `PartialShell` at `place`, failing closed on `Dead`, `Uninit`, or
-///   non-aggregate places (`Trusted.MirSemantics.Statements.evalStmt`).
+///   non-aggregate places (`Trusted.MirSemantics.Statements.evalStmt`). On a `PartialShell` it
+///   also records that the variant tag is written ([`PartialAggregate::discriminant_set`]),
+///   which is required before an enum shell can be read as a whole value.
 /// - `Assign { place, place_ty, rvalue }`: evaluates `rvalue` first (including `Operand::Move`),
-///   then writes `place` supporting `D13b` nested tuple/ADT field initialization while rejecting
-///   array-element writes on uninitialized arrays (`c6d2ad74`).
+///   then writes `place` (reading any `Index` locals of `place` *after* the rvalue, as
+///   `evalStmt` writes the destination in the post-rvalue locals), supporting `D13b` nested
+///   tuple/ADT field initialization while rejecting array-element writes on uninitialized
+///   arrays (`c6d2ad74`).
+///
+/// `Operand::Move` follows `Trusted.MirSemantics.evalOperand`: moving a bare local leaves it
+/// `Uninit`, while moving a projected place leaves the root local unchanged.
 pub fn eval_lowered_statement(
     stmt: &LoweredStatement,
     state: &mut StatementEvalState,

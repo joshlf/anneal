@@ -1,0 +1,1291 @@
+//! Episode 1 adversarial regression and property tests for value-tree place projections,
+//! `CastKind::CharToInt`, `Rvalue::NullaryOp`, and stateful statement evaluation.
+//!
+//! Each `test_ep1_b<k>_*` / `test_ep1_a<k>_*` test pins behavior that an adversarial review
+//! pass found missing or wrong, and cites the `Trusted.Rustc.V2026_06_01.MirSemantics`
+//! definition (or `rustc` behavior) it is checked against.
+
+use anneal_mir::ir::{
+    AggregateKind, CastKind, Constant, IntTy, Local, Mutability, NullOp, Operand, Place,
+    PointerValue, ProjectionElem, PtrWidth, Rvalue, Statement, Ty, UintTy,
+};
+use anneal_mir::lower::{
+    ExposedProvenanceTracker, LocalSlotState, LoweredStatement, MirValue, RvalueEvalError,
+    RvalueLowerError, StatementEvalState, TransmutePolicy, eval_lowered_rvalue,
+    eval_lowered_statement, eval_place_read, eval_place_write, lower_rvalue, lower_statement,
+    resolve_offset_of,
+};
+
+const PW: PtrWidth = PtrWidth::Bits64;
+
+fn u8_ty() -> Ty {
+    Ty::Uint(UintTy::U8)
+}
+
+fn u16_ty() -> Ty {
+    Ty::Uint(UintTy::U16)
+}
+
+fn u32_ty() -> Ty {
+    Ty::Uint(UintTy::U32)
+}
+
+fn usize_ty() -> Ty {
+    Ty::Uint(UintTy::Usize)
+}
+
+fn u8v(v: u128) -> MirValue {
+    MirValue::unsigned(v, UintTy::U8, PW)
+}
+
+fn u16v(v: u128) -> MirValue {
+    MirValue::unsigned(v, UintTy::U16, PW)
+}
+
+fn u32v(v: u128) -> MirValue {
+    MirValue::unsigned(v, UintTy::U32, PW)
+}
+
+fn usizev(v: u128) -> MirValue {
+    MirValue::unsigned(v, UintTy::Usize, PW)
+}
+
+fn field(idx: usize, ty: Ty) -> ProjectionElem {
+    ProjectionElem::Field(idx, ty)
+}
+
+fn proj(local: usize, projection: Vec<ProjectionElem>) -> Place {
+    Place::with_projection(local, projection)
+}
+
+fn stmt(s: Statement, local_decls: &[Ty]) -> LoweredStatement {
+    lower_statement(&s, local_decls, PW).expect("statement must lower")
+}
+
+fn run(s: Statement, state: &mut StatementEvalState) -> Result<(), RvalueEvalError> {
+    let lowered = stmt(s, &state.local_decls.clone());
+    eval_lowered_statement(&lowered, state)
+}
+
+fn assign(place: Place, rvalue: Rvalue) -> Statement {
+    Statement::Assign(place, rvalue)
+}
+
+fn use_copy(place: Place) -> Rvalue {
+    Rvalue::Use(Operand::Copy(place))
+}
+
+fn use_move(place: Place) -> Rvalue {
+    Rvalue::Use(Operand::Move(place))
+}
+
+fn use_const(c: Constant) -> Rvalue {
+    Rvalue::Use(Operand::Constant(c))
+}
+
+/// Deterministic xorshift64* generator for property tests (the crate has no dependencies).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] `Operand::Move` parity with `Trusted.MirSemantics.evalOperand`
+// ---------------------------------------------------------------------------------------------
+
+/// `Trusted.MirSemantics.evalOperand` (`Places.lean`, `.move p`): a root-local move sets the
+/// slot to `.uninit`, whereas a projected (non-`Deref`) move reads the sub-value and keeps the
+/// parent aggregate slot initialized. A0 deinitialized the moved field instead, which made
+/// later reads of the field (and of the whole local) fail where the trusted semantics steps.
+#[test]
+fn test_ep1_b1_projected_move_keeps_parent_initialized_like_trusted_eval_operand() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let local_decls = vec![
+        pair_ty.clone(),                     // _0: (u32, u8)
+        u32_ty(),                            // _1: u32
+        Ty::Tuple(vec![u32_ty(), u32_ty()]), // _2: (u32, u32)
+        u8_ty(),                             // _3: u8
+    ];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    let pair = MirValue::Tuple(vec![u32v(5), u8v(7)]);
+    state.slots[0] = LocalSlotState::Init(pair.clone());
+
+    let p00 = proj(0, vec![field(0, u32_ty())]);
+    let p01 = proj(0, vec![field(1, u8_ty())]);
+
+    // `_1 = move _0.0` reads 5 and leaves `_0` fully initialized.
+    run(
+        assign(Place::from_local(1), use_move(p00.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(1)), Some(&u32v(5)));
+    assert_eq!(
+        state.get_local(Local(0)),
+        Some(&LocalSlotState::Init(pair.clone()))
+    );
+
+    // `_2 = (move _0.0, copy _0.0)`: the second operand still reads the field.
+    run(
+        assign(
+            Place::from_local(2),
+            Rvalue::Aggregate(
+                AggregateKind::Tuple,
+                vec![Operand::Move(p00.clone()), Operand::Copy(p00.clone())],
+            ),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::Tuple(vec![u32v(5), u32v(5)]))
+    );
+
+    // `_0.1 = move _0.1` and `_0.0 = move _1` keep `_0` a fully initialized tuple.
+    run(assign(p01.clone(), use_move(p01.clone())), &mut state).unwrap();
+    run(
+        assign(p00.clone(), use_move(Place::from_local(1))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_local(Local(0)),
+        Some(&LocalSlotState::Init(pair.clone()))
+    );
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+    assert_eq!(state.read_place(&Place::from_local(0)), Ok(pair.clone()));
+
+    // `_3 = move _0.1` is another projected move. `_1` was moved out as a bare local above, so
+    // `_1 = Add(move _1, 1)` faults on the uninitialized `_1`.
+    run(assign(Place::from_local(3), use_move(p01)), &mut state).unwrap();
+    assert_eq!(state.get_init(Local(3)), Some(&u8v(7)));
+    assert_eq!(
+        run(
+            assign(
+                Place::from_local(1),
+                Rvalue::BinaryOp(
+                    anneal_mir::ir::BinOp::Add,
+                    Operand::Move(Place::from_local(1)),
+                    Operand::Constant(Constant::Int(1, u32_ty())),
+                ),
+            ),
+            &mut state,
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+
+    // Left-to-right operand order: `Add(move _1, copy _1)` reads `_1` after moving it.
+    state.slots[1] = LocalSlotState::Init(u32v(9));
+    assert_eq!(
+        run(
+            assign(
+                Place::from_local(1),
+                Rvalue::BinaryOp(
+                    anneal_mir::ir::BinOp::Add,
+                    Operand::Move(Place::from_local(1)),
+                    Operand::Copy(Place::from_local(1)),
+                ),
+            ),
+            &mut state,
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+}
+
+/// A projected move out of a partially initialized shell (`D13b`) reads the initialized field
+/// and leaves the shell unchanged.
+#[test]
+fn test_ep1_b1_projected_move_out_of_partial_shell_leaves_shell_unchanged() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let local_decls = vec![pair_ty, u32_ty()];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    let p00 = proj(0, vec![field(0, u32_ty())]);
+    run(
+        assign(p00.clone(), use_const(Constant::Int(11, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    let before = state.get_local(Local(0)).cloned();
+    assert!(matches!(before, Some(LocalSlotState::PartialShell(_))));
+
+    run(
+        assign(Place::from_local(1), use_move(p00.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(1)), Some(&u32v(11)));
+    assert_eq!(state.get_local(Local(0)).cloned(), before);
+    assert_eq!(state.read_place(&p00), Ok(u32v(11)));
+    assert_eq!(
+        state.read_place(&Place::from_local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] Enum shells: the tag is uninitialized until `SetDiscriminant`
+// ---------------------------------------------------------------------------------------------
+
+/// `rustc` MIR builds enum values in place as `((_1 as V).0) = x; discriminant(_1) = V;`.
+/// Until `SetDiscriminant` runs, the enum's tag bytes are uninitialized, so a typed copy of
+/// `_1` or `Rvalue::Discriminant(_1)` is undefined behavior (Miri reports a read of
+/// uninitialized memory). A0 promoted a `Downcast`-written shell to an initialized
+/// `MirValue::Adt` as soon as its fields were written, false-accepting both reads.
+#[test]
+fn test_ep1_b1_downcast_field_writes_do_not_initialize_enum_tag_until_set_discriminant() {
+    let enum1_ty = Ty::Tuple(vec![u32_ty()]); // variant fields modeled as a tuple
+    let enum2_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let local_decls = vec![
+        Ty::Int(IntTy::Isize),                      // _0: discriminant result
+        enum1_ty.clone(),                           // _1: one-field variant enum
+        enum1_ty.clone(),                           // _2: copy target
+        u32_ty(),                                   // _3: field copy target
+        enum2_ty.clone(),                           // _4: two-field variant enum
+        Ty::Tuple(vec![enum2_ty.clone(), u8_ty()]), // _5: (enum2, u8)
+    ];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+
+    let v1_f0 = proj(1, vec![ProjectionElem::Downcast(1), field(0, u32_ty())]);
+    run(
+        assign(v1_f0.clone(), use_const(Constant::Int(99, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+
+    // The tag has not been written: whole-value reads and `Discriminant` fail closed.
+    assert_eq!(state.get_init(Local(1)), None);
+    assert_eq!(
+        state.read_place(&Place::from_local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(
+        run(
+            assign(Place::from_local(2), use_copy(Place::from_local(1))),
+            &mut state
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(
+        run(
+            assign(
+                Place::from_local(0),
+                Rvalue::Discriminant(Place::from_local(1))
+            ),
+            &mut state
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    // The written variant field itself is readable.
+    run(
+        assign(Place::from_local(3), use_copy(v1_f0.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(3)), Some(&u32v(99)));
+
+    // `discriminant(_1) = 1` writes the tag and completes the value.
+    run(
+        Statement::SetDiscriminant {
+            place: Place::from_local(1),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    let full = MirValue::Adt {
+        def_path: String::new(),
+        variant_idx: 1,
+        active_field: None,
+        fields: vec![u32v(99)],
+    };
+    assert_eq!(state.get_init(Local(1)), Some(&full));
+    run(
+        assign(Place::from_local(2), use_copy(Place::from_local(1))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(2)), Some(&full));
+    run(
+        assign(
+            Place::from_local(0),
+            Rvalue::Discriminant(Place::from_local(1)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::signed(1, IntTy::Isize, PW))
+    );
+
+    // Tag written before the last field: the discriminant is readable while the value is not.
+    let v2_f0 = proj(4, vec![ProjectionElem::Downcast(2), field(0, u32_ty())]);
+    let v2_f1 = proj(4, vec![ProjectionElem::Downcast(2), field(1, u8_ty())]);
+    run(
+        assign(v2_f1, use_const(Constant::Int(7, u8_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::SetDiscriminant {
+            place: Place::from_local(4),
+            variant_index: 2,
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(4)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    run(
+        assign(
+            Place::from_local(0),
+            Rvalue::Discriminant(Place::from_local(4)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::signed(2, IntTy::Isize, PW))
+    );
+    assert_eq!(
+        state.read_place(&Place::from_local(4)),
+        Err(RvalueEvalError::UninitializedLocal(Local(4)))
+    );
+    run(
+        assign(v2_f0, use_const(Constant::Int(5, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(4)),
+        Some(&MirValue::Adt {
+            def_path: String::new(),
+            variant_idx: 2,
+            active_field: None,
+            fields: vec![u32v(5), u8v(7)],
+        })
+    );
+
+    // Nested enum shell `_5.0`: the tag set through a projection is readable before the
+    // variant's second field is written, and `_5` only becomes initialized at the end.
+    let p50 = proj(5, vec![field(0, enum2_ty.clone())]);
+    let p50_v1_f0 = proj(
+        5,
+        vec![
+            field(0, enum2_ty.clone()),
+            ProjectionElem::Downcast(1),
+            field(0, u32_ty()),
+        ],
+    );
+    let p50_v1_f1 = proj(
+        5,
+        vec![
+            field(0, enum2_ty.clone()),
+            ProjectionElem::Downcast(1),
+            field(1, u8_ty()),
+        ],
+    );
+    let p51 = proj(5, vec![field(1, u8_ty())]);
+    run(
+        assign(p50_v1_f0, use_const(Constant::Int(1, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        run(
+            assign(Place::from_local(0), Rvalue::Discriminant(p50.clone())),
+            &mut state
+        ),
+        Err(RvalueEvalError::UninitializedLocal(Local(5)))
+    );
+    run(
+        Statement::SetDiscriminant {
+            place: p50.clone(),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(Place::from_local(0), Rvalue::Discriminant(p50.clone())),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::signed(1, IntTy::Isize, PW))
+    );
+    run(
+        assign(p51, use_const(Constant::Int(3, u8_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(5)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    run(
+        assign(p50_v1_f1, use_const(Constant::Int(2, u8_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(5)),
+        Some(&MirValue::Tuple(vec![
+            MirValue::Adt {
+                def_path: String::new(),
+                variant_idx: 1,
+                active_field: None,
+                fields: vec![u32v(1), u8v(2)],
+            },
+            u8v(3),
+        ]))
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] Value-tree writes preserve the container's field types
+// ---------------------------------------------------------------------------------------------
+
+/// `eval_place_read` checks a projected tuple/ADT field's runtime type against the
+/// projection's `Field(idx, ty)`; the leaf write path only checked the *new* value, so a
+/// mistyped `Field(1, u16)` projection silently changed a `(u32, u8)` value into a
+/// `(u32, u16)` value. Writes must leave every container's type unchanged.
+#[test]
+fn test_ep1_b1_projected_leaf_writes_preserve_field_types() {
+    let original = vec![
+        MirValue::Tuple(vec![u32v(1), u8v(2)]),
+        MirValue::Adt {
+            def_path: "S".into(),
+            variant_idx: 0,
+            active_field: None,
+            fields: vec![u32v(3), u8v(4)],
+        },
+    ];
+    for local in 0..2 {
+        let mut locals = original.clone();
+        let bad = proj(local, vec![field(1, u16_ty())]);
+        assert!(matches!(
+            eval_place_write(&bad, u16v(0x1234), &mut locals, PW),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert_eq!(locals, original, "failed writes must not modify locals");
+        assert!(matches!(
+            eval_place_read(&bad, &locals, PW),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+
+        let good = proj(local, vec![field(1, u8_ty())]);
+        eval_place_write(&good, u8v(0xAB), &mut locals, PW).unwrap();
+        assert_eq!(eval_place_read(&good, &locals, PW), Ok(u8v(0xAB)));
+        assert_eq!(locals[local].ty(), original[local].ty());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] Property tests: projection lens laws over random arrays, windows, and indices
+// ---------------------------------------------------------------------------------------------
+
+fn subslice_bounds(len: u64, from: u64, to: u64, from_end: bool) -> Option<(usize, usize)> {
+    if from_end {
+        let sum = from.checked_add(to)?;
+        (sum <= len).then(|| (from as usize, (len - to) as usize))
+    } else {
+        (from <= to && to <= len).then(|| (from as usize, to as usize))
+    }
+}
+
+fn constant_index(len: u64, offset: u64, min_length: u64, from_end: bool) -> Option<usize> {
+    if len < min_length {
+        return None;
+    }
+    if from_end {
+        (offset >= 1 && offset <= len).then(|| (len - offset) as usize)
+    } else {
+        (offset < len).then_some(offset as usize)
+    }
+}
+
+/// Random `Subslice` windows followed by `ConstantIndex` / `Index` / `Field` steps on
+/// `[(u32, u8); n]` arrays: reads agree with direct index arithmetic, out-of-bounds steps fail
+/// with `IndexOutOfBounds`, and successful writes satisfy the lens laws
+/// (`get(put(v)) == v`, `put(get()) == id`, `put(b, put(a)) == put(b)`).
+#[test]
+fn test_ep1_b1_property_chained_subslice_constant_index_lens_laws() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..600 {
+        let len = rng.below(7) as usize;
+        let elems: Vec<MirValue> = (0..len)
+            .map(|i| MirValue::Tuple(vec![u32v(100 + i as u128), u8v(i as u128)]))
+            .collect();
+        let arr = MirValue::Array {
+            elements: elems.clone(),
+            elem_ty: pair_ty.clone(),
+        };
+        let from = rng.below(len as u64 + 2);
+        let to = rng.below(len as u64 + 2);
+        let from_end = rng.below(2) == 1;
+        let offset = rng.below(len as u64 + 2);
+        let min_length = rng.below(len as u64 + 2);
+        let ci_from_end = rng.below(2) == 1;
+        let use_dynamic_index = rng.below(3) == 0;
+
+        let window = subslice_bounds(len as u64, from, to, from_end);
+        let sub_len = window.map(|(s, e)| e - s);
+        let mut projection = vec![ProjectionElem::Subslice { from, to, from_end }];
+        let inner = if use_dynamic_index {
+            projection.push(ProjectionElem::Index(Local(1)));
+            sub_len.and_then(|n| (offset < n as u64).then_some(offset as usize))
+        } else {
+            projection.push(ProjectionElem::ConstantIndex {
+                offset,
+                min_length,
+                from_end: ci_from_end,
+            });
+            sub_len.and_then(|n| constant_index(n as u64, offset, min_length, ci_from_end))
+        };
+        projection.push(field(1, u8_ty()));
+        let place = proj(0, projection);
+        let mut locals = vec![arr.clone(), usizev(u128::from(offset))];
+
+        let expected = window.zip(inner).map(|((start, _), i)| start + i);
+        match expected {
+            Some(abs) => {
+                assert_eq!(eval_place_read(&place, &locals, PW), Ok(u8v(abs as u128)));
+                // put(get()) == id
+                let cur = eval_place_read(&place, &locals, PW).unwrap();
+                eval_place_write(&place, cur, &mut locals, PW).unwrap();
+                assert_eq!(locals[0], arr);
+                // get(put(v)) == v, and only element `abs` changes.
+                eval_place_write(&place, u8v(0xEE), &mut locals, PW).unwrap();
+                assert_eq!(eval_place_read(&place, &locals, PW), Ok(u8v(0xEE)));
+                let MirValue::Array { elements, .. } = &locals[0] else {
+                    panic!("array local must stay an array");
+                };
+                for (i, e) in elements.iter().enumerate() {
+                    if i == abs {
+                        assert_eq!(e, &MirValue::Tuple(vec![u32v(100 + i as u128), u8v(0xEE)]));
+                    } else {
+                        assert_eq!(e, &elems[i]);
+                    }
+                }
+                // put(b, put(a)) == put(b)
+                eval_place_write(&place, u8v(0x11), &mut locals, PW).unwrap();
+                let mut fresh = vec![arr.clone(), usizev(u128::from(offset))];
+                eval_place_write(&place, u8v(0x11), &mut fresh, PW).unwrap();
+                assert_eq!(locals, fresh);
+            }
+            None => {
+                assert!(
+                    matches!(
+                        eval_place_read(&place, &locals, PW),
+                        Err(RvalueEvalError::IndexOutOfBounds { .. })
+                    ),
+                    "len={len} from={from} to={to} from_end={from_end} offset={offset} \
+                     min_length={min_length} ci_from_end={ci_from_end} dyn={use_dynamic_index}"
+                );
+                let before = locals.clone();
+                assert!(matches!(
+                    eval_place_write(&place, u8v(0xEE), &mut locals, PW),
+                    Err(RvalueEvalError::IndexOutOfBounds { .. })
+                ));
+                assert_eq!(locals, before);
+            }
+        }
+    }
+}
+
+/// `Subslice` writes splice exactly `end - start` elements back into the parent array, and a
+/// whole-window write of the wrong length or element type fails without modifying the array.
+#[test]
+fn test_ep1_b1_property_subslice_window_writes_splice_exactly() {
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    for _ in 0..300 {
+        let len = 1 + rng.below(6) as usize;
+        let elems: Vec<MirValue> = (0..len).map(|i| u32v(i as u128)).collect();
+        let arr = MirValue::Array {
+            elements: elems.clone(),
+            elem_ty: u32_ty(),
+        };
+        let from = rng.below(len as u64 + 1);
+        let to = rng.below(len as u64 + 1);
+        let from_end = rng.below(2) == 1;
+        let Some((start, end)) = subslice_bounds(len as u64, from, to, from_end) else {
+            continue;
+        };
+        let place = proj(0, vec![ProjectionElem::Subslice { from, to, from_end }]);
+        let mut locals = vec![arr.clone()];
+        let replacement: Vec<MirValue> = (start..end).map(|i| u32v(1000 + i as u128)).collect();
+        eval_place_write(
+            &place,
+            MirValue::Array {
+                elements: replacement.clone(),
+                elem_ty: u32_ty(),
+            },
+            &mut locals,
+            PW,
+        )
+        .unwrap();
+        let mut expected = elems.clone();
+        expected.splice(start..end, replacement);
+        assert_eq!(
+            locals[0],
+            MirValue::Array {
+                elements: expected,
+                elem_ty: u32_ty(),
+            }
+        );
+
+        let mut locals = vec![arr.clone()];
+        let wrong_len = MirValue::Array {
+            elements: vec![u32v(0); end - start + 1],
+            elem_ty: u32_ty(),
+        };
+        assert!(matches!(
+            eval_place_write(&place, wrong_len, &mut locals, PW),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        let wrong_elem = MirValue::Array {
+            elements: vec![u8v(0); end - start],
+            elem_ty: u8_ty(),
+        };
+        assert!(matches!(
+            eval_place_write(&place, wrong_elem, &mut locals, PW),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+        assert_eq!(locals[0], arr);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] `CastKind::CharToInt` differential check against `CastKind::IntToInt`
+// ---------------------------------------------------------------------------------------------
+
+/// `char as T` lowered as `CastKind::CharToInt` must agree with the pre-existing
+/// `CastKind::IntToInt` path (which zero-extends `char` sources) on every integer target and
+/// both pointer widths, and with Rust's own `as` casts for the fixed-width targets.
+#[test]
+fn test_ep1_b1_char_to_int_agrees_with_int_to_int_and_rust_as_casts() {
+    let targets = [
+        Ty::Uint(UintTy::U8),
+        Ty::Uint(UintTy::U16),
+        Ty::Uint(UintTy::U32),
+        Ty::Uint(UintTy::U64),
+        Ty::Uint(UintTy::U128),
+        Ty::Uint(UintTy::Usize),
+        Ty::Int(IntTy::I8),
+        Ty::Int(IntTy::I16),
+        Ty::Int(IntTy::I32),
+        Ty::Int(IntTy::I64),
+        Ty::Int(IntTy::I128),
+        Ty::Int(IntTy::Isize),
+    ];
+    let mut tracker = ExposedProvenanceTracker::new();
+    let mut rng = Rng(0xA076_1D64_78BD_642F);
+    let mut chars = vec![
+        '\0', '\u{7F}', '\u{80}', '\u{FF}', '\u{100}', '\u{D7FF}', '\u{E000}',
+    ];
+    chars.extend(['\u{FFFF}', '\u{10000}', '\u{1F600}', '\u{10FFFF}']);
+    while chars.len() < 200 {
+        if let Some(c) = char::from_u32(rng.below(0x11_0000) as u32) {
+            chars.push(c);
+        }
+    }
+    for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        for target in &targets {
+            for &c in &chars {
+                let op = Operand::Constant(Constant::Char(c));
+                let via_char = lower_rvalue(
+                    &Rvalue::Cast(CastKind::CharToInt, op.clone(), target.clone()),
+                    &[],
+                    pw,
+                )
+                .unwrap();
+                let via_int = lower_rvalue(
+                    &Rvalue::Cast(CastKind::IntToInt, op, target.clone()),
+                    &[],
+                    pw,
+                )
+                .unwrap();
+                let policy = TransmutePolicy::RejectPtrToInt;
+                let a = eval_lowered_rvalue(&via_char, &[], pw, policy, &mut tracker).unwrap();
+                let b = eval_lowered_rvalue(&via_int, &[], pw, policy, &mut tracker).unwrap();
+                assert_eq!(a, b, "char {c:?} as {target:?} on {pw:?}");
+                let code = u32::from(c);
+                let rust_bits: Option<u128> = match target {
+                    Ty::Uint(UintTy::U8) => Some(u128::from(code as u8)),
+                    Ty::Uint(UintTy::U16) => Some(u128::from(code as u16)),
+                    Ty::Int(IntTy::I8) => Some(u128::from(code as i8 as u8)),
+                    Ty::Int(IntTy::I16) => Some(u128::from(code as i16 as u16)),
+                    Ty::Uint(_) | Ty::Int(_) => Some(u128::from(code)),
+                    _ => None,
+                };
+                assert_eq!(a.as_bits(), rust_bits, "char {c:?} as {target:?} on {pw:?}");
+            }
+        }
+    }
+    assert!(tracker.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] `NullOp::OffsetOf` matches `rustc` on canonical tuples with trailing ZST fields
+// ---------------------------------------------------------------------------------------------
+
+/// Offsets observed with `core::mem::offset_of!` on `rustc` `nightly-2026-06-01` (the
+/// workspace toolchain) for canonical tuples, including trailing zero-sized fields, which
+/// `rustc` keeps in declaration order for these layouts.
+#[test]
+fn test_ep1_b1_offset_of_matches_rustc_for_canonical_tuples_with_zst_fields() {
+    let unit = Ty::unit();
+    let cases: Vec<(Ty, usize, usize)> = vec![
+        (Ty::Tuple(vec![u32_ty(), unit.clone()]), 1, 4),
+        (Ty::Tuple(vec![u32_ty(), u32_ty(), unit.clone()]), 2, 8),
+        (
+            Ty::Tuple(vec![u32_ty(), Ty::Array(Box::new(u32_ty()), 0)]),
+            1,
+            4,
+        ),
+        (
+            Ty::Tuple(vec![
+                u32_ty(),
+                u8_ty(),
+                u8_ty(),
+                u8_ty(),
+                u8_ty(),
+                unit.clone(),
+            ]),
+            5,
+            8,
+        ),
+        (Ty::Tuple(vec![u32_ty(), u16_ty(), u16_ty()]), 2, 6),
+    ];
+    for (ty, field_idx, offset) in cases {
+        assert!(ty.has_canonical_byte_layout(PW), "{ty:?} must be canonical");
+        assert_eq!(
+            resolve_offset_of(&ty, &[(0, field_idx)], PW),
+            Ok(offset),
+            "{ty:?}"
+        );
+    }
+    // `((), u32)` and `(u32, (), u32)` are not canonical (alignment increases after the ZST),
+    // so `OffsetOf` fails closed instead of guessing `rustc`'s placement.
+    for ty in [
+        Ty::Tuple(vec![unit.clone(), u32_ty()]),
+        Ty::Tuple(vec![u32_ty(), unit.clone(), u32_ty()]),
+    ] {
+        assert_eq!(
+            lower_rvalue(
+                &Rvalue::NullaryOp(NullOp::OffsetOf(vec![(0, 1)]), ty.clone()),
+                &[],
+                PW
+            ),
+            Err(RvalueLowerError::UnsupportedOffsetOfLayout(ty))
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] Union writes: defined-but-unmodeled writes are unsupported, not undefined behavior
+// ---------------------------------------------------------------------------------------------
+
+/// Writing a whole union field switches the active field, and a nested write into the
+/// active field updates it in place. A nested write into an *inactive* field (`u.b.0 = x`
+/// while `u.a` is active) is defined in Rust, but the value tree has no bytes for `u.b`, so it
+/// must report `UnsupportedPlaceProjection` (A0 reported `InactiveUnionField`, i.e. claimed
+/// undefined behavior). Reads of the inactive field keep failing with `InactiveUnionField`.
+#[test]
+fn test_ep1_b1_union_nested_write_to_inactive_field_is_unsupported_not_ub() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let union_val = MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![u32v(0x1234)],
+    };
+    let mut locals = vec![union_val.clone()];
+    let a = proj(0, vec![field(0, u32_ty())]);
+    let b = proj(0, vec![field(1, pair_ty.clone())]);
+    let b0 = proj(0, vec![field(1, pair_ty.clone()), field(0, u32_ty())]);
+
+    assert_eq!(
+        eval_place_write(&b0, u32v(5), &mut locals, PW),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(b0.clone()))
+    );
+    assert_eq!(locals[0], union_val);
+    assert_eq!(
+        eval_place_read(&b0, &locals, PW),
+        Err(RvalueEvalError::InactiveUnionField {
+            active_field: 0,
+            requested_field: 1,
+        })
+    );
+
+    // Whole-field write of `u.b` switches the active field; then the nested write succeeds.
+    eval_place_write(&b, MirValue::Tuple(vec![u32v(1), u8v(2)]), &mut locals, PW).unwrap();
+    eval_place_write(&b0, u32v(5), &mut locals, PW).unwrap();
+    assert_eq!(
+        eval_place_read(&b, &locals, PW),
+        Ok(MirValue::Tuple(vec![u32v(5), u8v(2)]))
+    );
+    assert_eq!(
+        eval_place_read(&a, &locals, PW),
+        Err(RvalueEvalError::InactiveUnionField {
+            active_field: 1,
+            requested_field: 0,
+        })
+    );
+
+    // The stateful evaluator classifies the same write identically.
+    let local_decls = vec![Ty::Tuple(vec![u32_ty(), pair_ty])];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[0] = LocalSlotState::Init(union_val.clone());
+    assert_eq!(
+        run(
+            assign(b0.clone(), use_const(Constant::Int(5, u32_ty()))),
+            &mut state
+        ),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(b0))
+    );
+    assert_eq!(state.get_init(Local(0)), Some(&union_val));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] Shell misuse is a static type error, not an uninitialized read
+// ---------------------------------------------------------------------------------------------
+
+/// Hand-built `LoweredStatement`s that bypass `lower_statement`'s type checks must not be
+/// reported as undefined behavior: an array projection on a tuple shell, a `Downcast` that is
+/// not followed by `Field`, and a `Field` on a non-tuple declared type are static type errors.
+/// An element write into an uninitialized array stays `UninitializedLocal` (`c6d2ad74`).
+#[test]
+fn test_ep1_b1_shell_misuse_is_type_error_while_uninit_array_writes_stay_ub() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let arr_ty = Ty::Array(Box::new(u32_ty()), 2);
+    let local_decls = vec![pair_ty.clone(), arr_ty.clone(), usize_ty()];
+    let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+    state.slots[2] = LocalSlotState::Init(usizev(0));
+    run(
+        assign(
+            proj(0, vec![field(0, u32_ty())]),
+            use_const(Constant::Int(1, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    let shell_before = state.get_local(Local(0)).cloned();
+
+    let one = Rvalue::Use(Operand::Constant(Constant::Int(9, u32_ty())));
+    let lowered_one = lower_rvalue(&one, &local_decls, PW).unwrap();
+    let hand_built = |place: Place, place_ty: Ty| LoweredStatement::Assign {
+        place,
+        place_ty,
+        rvalue: lowered_one.clone(),
+    };
+
+    // `_0[_2] = 9` on a tuple shell.
+    let bad_index = hand_built(proj(0, vec![ProjectionElem::Index(Local(2))]), u32_ty());
+    assert!(matches!(
+        eval_lowered_statement(&bad_index, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    // `(_1 as V0)[_2] = 9`: `Downcast` not followed by `Field`.
+    let bad_downcast = hand_built(
+        proj(
+            1,
+            vec![ProjectionElem::Downcast(0), ProjectionElem::Index(Local(2))],
+        ),
+        u32_ty(),
+    );
+    assert!(matches!(
+        eval_lowered_statement(&bad_downcast, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    // `_1.0 = 9` on an uninitialized array local.
+    let bad_field = hand_built(proj(1, vec![field(0, u32_ty())]), u32_ty());
+    assert!(matches!(
+        eval_lowered_statement(&bad_field, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    // Reading `_0[_2]` from the shell is also a type error, not an uninitialized read.
+    assert!(matches!(
+        state.read_place(&proj(0, vec![ProjectionElem::Index(Local(2))])),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_local(Local(0)).cloned(), shell_before);
+
+    // `_1[_2] = 9` on the uninitialized array: undefined behavior per `c6d2ad74`.
+    let uninit_elem = stmt(
+        assign(proj(1, vec![ProjectionElem::Index(Local(2))]), one.clone()),
+        &local_decls,
+    );
+    assert_eq!(
+        eval_lowered_statement(&uninit_elem, &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    let uninit_const = stmt(
+        assign(
+            proj(
+                1,
+                vec![ProjectionElem::ConstantIndex {
+                    offset: 1,
+                    min_length: 2,
+                    from_end: true,
+                }],
+            ),
+            one,
+        ),
+        &local_decls,
+    );
+    assert_eq!(
+        eval_lowered_statement(&uninit_const, &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] Property test: `D13b` field-by-field initialization in random orders
+// ---------------------------------------------------------------------------------------------
+
+/// Field types used by the random `D13b` shapes: scalars, `()` (whose unwritten slot must not
+/// read as `MirValue::Unit`), whole `[u8; 2]` arrays, and nested tuples.
+#[derive(Clone, Debug)]
+enum Shape {
+    U8,
+    U32,
+    Unit,
+    Arr2,
+    Tup(Vec<Shape>),
+}
+
+impl Shape {
+    fn random(rng: &mut Rng, depth: u32) -> Shape {
+        match rng.below(if depth == 0 { 4 } else { 6 }) {
+            0 => Shape::U8,
+            1 => Shape::U32,
+            2 => Shape::Unit,
+            3 => Shape::Arr2,
+            _ => Shape::random_tuple(rng, depth - 1),
+        }
+    }
+
+    fn random_tuple(rng: &mut Rng, depth: u32) -> Shape {
+        let n = 1 + rng.below(3) as usize;
+        Shape::Tup((0..n).map(|_| Shape::random(rng, depth)).collect())
+    }
+
+    fn ty(&self) -> Ty {
+        match self {
+            Shape::U8 => u8_ty(),
+            Shape::U32 => u32_ty(),
+            Shape::Unit => Ty::unit(),
+            Shape::Arr2 => Ty::Array(Box::new(u8_ty()), 2),
+            Shape::Tup(fields) => Ty::Tuple(fields.iter().map(Shape::ty).collect()),
+        }
+    }
+
+    fn value(&self, rng: &mut Rng) -> MirValue {
+        match self {
+            Shape::U8 => u8v(u128::from(rng.below(256))),
+            Shape::U32 => u32v(u128::from(rng.below(1 << 32))),
+            Shape::Unit => MirValue::Unit,
+            Shape::Arr2 => MirValue::Array {
+                elements: vec![
+                    u8v(u128::from(rng.below(256))),
+                    u8v(u128::from(rng.below(256))),
+                ],
+                elem_ty: u8_ty(),
+            },
+            Shape::Tup(fields) => MirValue::Tuple(fields.iter().map(|f| f.value(rng)).collect()),
+        }
+    }
+
+    /// Collects `(field path, is_leaf)` for every sub-place below `self` (excluding `self`).
+    fn paths(&self, prefix: &mut Vec<ProjectionElem>, out: &mut Vec<(Vec<ProjectionElem>, bool)>) {
+        if let Shape::Tup(fields) = self {
+            for (i, f) in fields.iter().enumerate() {
+                prefix.push(field(i, f.ty()));
+                out.push((prefix.clone(), !matches!(f, Shape::Tup(_))));
+                f.paths(prefix, out);
+                prefix.pop();
+            }
+        }
+    }
+}
+
+fn sub_value<'a>(val: &'a MirValue, path: &[ProjectionElem]) -> &'a MirValue {
+    path.iter().fold(val, |v, p| match (v, p) {
+        (MirValue::Tuple(fields), ProjectionElem::Field(i, _)) => &fields[*i],
+        _ => panic!("path must follow tuple fields"),
+    })
+}
+
+fn leaf_rvalue(val: &MirValue) -> Rvalue {
+    match val {
+        MirValue::Int { bits, ty } => use_const(Constant::Int(*bits, ty.clone())),
+        MirValue::Unit => use_const(Constant::Unit),
+        MirValue::Array { elements, elem_ty } => Rvalue::Aggregate(
+            AggregateKind::Array(elem_ty.clone()),
+            elements
+                .iter()
+                .map(|e| Operand::Constant(Constant::Int(e.as_bits().unwrap(), elem_ty.clone())))
+                .collect(),
+        ),
+        other => panic!("unexpected leaf value {other:?}"),
+    }
+}
+
+/// Builds random nested tuple values field by field into an uninitialized local, in a random
+/// leaf order, either as a plain tuple or as an enum variant (`Downcast(v)` paths plus a
+/// `SetDiscriminant` at a random point after the first write). After every step:
+/// - a written leaf reads back its value and an unwritten leaf (including `()`) fails with
+///   `UninitializedLocal`;
+/// - an intermediate tuple (and the root) is readable iff all of its leaves are written (and,
+///   for the enum root, the tag has been written);
+/// - `Rvalue::Discriminant` of the enum root is defined iff the tag has been written.
+#[test]
+fn test_ep1_b1_property_d13b_random_field_orders_never_false_accept() {
+    let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+    for _ in 0..250 {
+        let shape = Shape::random_tuple(&mut rng, 2);
+        let ty = shape.ty();
+        let expected = shape.value(&mut rng);
+        let as_enum = rng.below(2) == 1;
+        let variant = rng.below(3) as usize;
+        let root_prefix: Vec<ProjectionElem> = if as_enum {
+            vec![ProjectionElem::Downcast(variant)]
+        } else {
+            Vec::new()
+        };
+        let mut paths = Vec::new();
+        shape.paths(&mut Vec::new(), &mut paths);
+        let mut leaves: Vec<Vec<ProjectionElem>> = paths
+            .iter()
+            .filter(|(_, leaf)| *leaf)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for i in (1..leaves.len()).rev() {
+            let j = rng.below(i as u64 + 1) as usize;
+            leaves.swap(i, j);
+        }
+        let set_discr_after = 1 + rng.below(leaves.len() as u64) as usize;
+        // Actions: `Some(leaf)` writes a leaf, `None` runs `SetDiscriminant` (enum mode only).
+        let mut actions: Vec<Option<Vec<ProjectionElem>>> = Vec::new();
+        for (step, leaf) in leaves.iter().enumerate() {
+            actions.push(Some(leaf.clone()));
+            if as_enum && step + 1 == set_discr_after {
+                actions.push(None);
+            }
+        }
+
+        let local_decls = vec![Ty::Int(IntTy::Isize), ty.clone()];
+        let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+        let mut written: Vec<Vec<ProjectionElem>> = Vec::new();
+        let mut tag_written = false;
+        let full_place = |path: &[ProjectionElem]| {
+            let mut projection = root_prefix.clone();
+            projection.extend_from_slice(path);
+            proj(1, projection)
+        };
+        for action in &actions {
+            match action {
+                Some(leaf) => {
+                    let value = sub_value(&expected, leaf);
+                    run(assign(full_place(leaf), leaf_rvalue(value)), &mut state).unwrap();
+                    written.push(leaf.clone());
+                }
+                None => {
+                    run(
+                        Statement::SetDiscriminant {
+                            place: Place::from_local(1),
+                            variant_index: variant,
+                        },
+                        &mut state,
+                    )
+                    .unwrap();
+                    tag_written = true;
+                }
+            }
+
+            for (path, is_leaf) in &paths {
+                let complete = written.iter().any(|w| w == path)
+                    || (!*is_leaf
+                        && written.iter().filter(|w| w.starts_with(path)).count()
+                            == paths
+                                .iter()
+                                .filter(|(p, l)| *l && p.starts_with(path))
+                                .count());
+                let got = state.read_place(&full_place(path));
+                if complete {
+                    assert_eq!(
+                        got,
+                        Ok(sub_value(&expected, path).clone()),
+                        "{shape:?} {path:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        got,
+                        Err(RvalueEvalError::UninitializedLocal(Local(1))),
+                        "{shape:?} {path:?}"
+                    );
+                }
+            }
+            let all_written = written.len() == leaves.len();
+            let root_readable = all_written && (!as_enum || tag_written);
+            let root = state.read_place(&Place::from_local(1));
+            let expected_root = if as_enum {
+                let MirValue::Tuple(fields) = expected.clone() else {
+                    unreachable!()
+                };
+                MirValue::Adt {
+                    def_path: String::new(),
+                    variant_idx: variant,
+                    active_field: None,
+                    fields,
+                }
+            } else {
+                expected.clone()
+            };
+            if root_readable {
+                assert_eq!(root, Ok(expected_root.clone()), "{shape:?}");
+                assert_eq!(state.get_init(Local(1)), Some(&expected_root));
+            } else {
+                assert_eq!(
+                    root,
+                    Err(RvalueEvalError::UninitializedLocal(Local(1))),
+                    "{shape:?}"
+                );
+            }
+            if as_enum {
+                let discr = run(
+                    assign(
+                        Place::from_local(0),
+                        Rvalue::Discriminant(Place::from_local(1)),
+                    ),
+                    &mut state,
+                );
+                if tag_written {
+                    discr.unwrap();
+                    assert_eq!(
+                        state.get_init(Local(0)),
+                        Some(&MirValue::signed(variant as i128, IntTy::Isize, PW))
+                    );
+                } else {
+                    assert_eq!(discr, Err(RvalueEvalError::UninitializedLocal(Local(1))));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B1] `PlaceMention` matrix against `Trusted.MirSemantics.placeMentionOperandsInit`
+// ---------------------------------------------------------------------------------------------
+
+/// `evalStmt` on `.placeMention place` faults iff the root slot is `.dead`, a dereferenced
+/// root is not initialized, or an `Index` local is not an initialized scalar; it never loads
+/// the mentioned place itself.
+#[test]
+fn test_ep1_b1_place_mention_matrix_matches_place_mention_operands_init() {
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty()), Mutability::Not);
+    let arr_ty = Ty::Array(Box::new(u32_ty()), 2);
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let local_decls = vec![
+        arr_ty.clone(),  // _0: [u32; 2]
+        usize_ty(),      // _1: index
+        raw_u32.clone(), // _2: *const u32
+        pair_ty.clone(), // _3: (u32, u8)
+    ];
+    let ptr = MirValue::ptr(PointerValue::without_provenance(0xDEAD_BEE0), raw_u32);
+    let mention = |p: Place| Statement::PlaceMention(p);
+
+    // (root slot of `_0`/`_3`, index slot, pointer slot)
+    let root_states = [
+        LocalSlotState::Dead,
+        LocalSlotState::Uninit,
+        LocalSlotState::Init(MirValue::Array {
+            elements: vec![u32v(1), u32v(2)],
+            elem_ty: u32_ty(),
+        }),
+    ];
+    let idx_states = [
+        LocalSlotState::Dead,
+        LocalSlotState::Uninit,
+        LocalSlotState::Init(usizev(7)), // out of bounds: never loaded, so still fine
+    ];
+    for root in &root_states {
+        for idx in &idx_states {
+            let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+            state.slots[0] = root.clone();
+            state.slots[1] = idx.clone();
+            let root_dead = matches!(root, LocalSlotState::Dead);
+            let idx_init = matches!(idx, LocalSlotState::Init(_));
+
+            let bare = run(mention(Place::from_local(0)), &mut state);
+            assert_eq!(bare.is_ok(), !root_dead, "bare mention root={root:?}");
+            let indexed = run(
+                mention(proj(0, vec![ProjectionElem::Index(Local(1))])),
+                &mut state,
+            );
+            assert_eq!(
+                indexed.is_ok(),
+                !root_dead && idx_init,
+                "root={root:?} idx={idx:?}"
+            );
+            let constant = run(
+                mention(proj(
+                    0,
+                    vec![ProjectionElem::ConstantIndex {
+                        offset: 1,
+                        min_length: 2,
+                        from_end: false,
+                    }],
+                )),
+                &mut state,
+            );
+            assert_eq!(constant.is_ok(), !root_dead, "constant index root={root:?}");
+        }
+    }
+
+    // Deref roots: initialized pointer ok (even dangling), uninit/dead pointer faults.
+    for (ptr_state, ok) in [
+        (LocalSlotState::Init(ptr.clone()), true),
+        (LocalSlotState::Uninit, false),
+        (LocalSlotState::Dead, false),
+    ] {
+        let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+        state.slots[2] = ptr_state.clone();
+        let deref = run(mention(proj(2, vec![ProjectionElem::Deref])), &mut state);
+        assert_eq!(deref.is_ok(), ok, "deref ptr={ptr_state:?}");
+    }
+
+    // Field mentions of an uninitialized or partially initialized tuple never load the field.
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    run(mention(proj(3, vec![field(1, u8_ty())])), &mut state).unwrap();
+    run(
+        assign(
+            proj(3, vec![field(0, u32_ty())]),
+            use_const(Constant::Int(1, u32_ty())),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    run(mention(proj(3, vec![field(1, u8_ty())])), &mut state).unwrap();
+    run(mention(Place::from_local(3)), &mut state).unwrap();
+}

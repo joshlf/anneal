@@ -6,7 +6,7 @@ use anneal_mir::ir::{
     UnOp,
 };
 use anneal_mir::lower::{
-    CastEvalError, CastLowerError, ExposedProvenanceTracker, FieldSlot, LocalSlotState,
+    CastEvalError, CastLowerError, ExposedProvenanceTracker, LocalSlotState,
     LoweredCast, LoweredRvalue, LoweredStatement, MirValue, RvalueEvalError, RvalueLowerError,
     StatementEvalState, TransmutePolicy, eval_aggregate, eval_binop, eval_checked_binop,
     eval_constant, eval_lowered_block, eval_lowered_cast, eval_lowered_rvalue,
@@ -2380,20 +2380,16 @@ fn test_ep1_statement_and_block_evaluation_d9_d13b_set_discriminant_assume_and_m
     ]);
     assert_eq!(state.get_init(Local(0)), Some(&expected_full_0));
 
-    // Partial move out of `_0.1` transitions `_0` back to `PartialShell` where `_0.0` is still readable!
+    // A projected move out of `_0.1` reads the field and, as in `Trusted.MirSemantics.evalOperand`
+    // (`.move` with a non-empty projection), leaves the parent `_0` fully initialized.
     assert_eq!(
         state.move_place(&place_0_1),
         Ok(MirValue::unsigned(7, UintTy::U8, pw))
     );
-    if let Some(LocalSlotState::PartialShell(shell)) = state.get_local(Local(0)) {
-        assert!(matches!(shell.fields[0], FieldSlot::Init(_)));
-        assert_eq!(shell.fields[1], FieldSlot::Uninit);
-    } else {
-        panic!("expected PartialShell after moving _0.1");
-    }
+    assert_eq!(state.get_init(Local(0)), Some(&expected_full_0));
     assert_eq!(
         state.read_place(&place_0_1),
-        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+        Ok(MirValue::unsigned(7, UintTy::U8, pw))
     );
     assert!(state.read_place(&place_0_0).is_ok());
 
