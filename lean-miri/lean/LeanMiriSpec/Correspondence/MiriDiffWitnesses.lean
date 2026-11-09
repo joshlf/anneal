@@ -34,26 +34,42 @@ agreeing whole-program facts.
 
 1. Scalars: `w1_div_returns`, `w1_div_by_zero_ub`, `w1_div_treeSafe_iff_miriSafe`
    (the unconditional equivalence for every divisor), `w1_switch_case`,
-   `w1_switch_otherwise`, `w1_cast_sign_extend`, `w1_checked_add_no_overflow`,
-   `w1_checked_add_overflow_ub`, the diverging safe loop
-   `w1_loop_diverges_safely` (`InfiniteRun`, `System.Safe`, `TreeSafe`), and
-   the divergence `w1_assert_continue_divergence`.
-2. Aggregates: `w2_enum_downcast_switch_returns`, `w2_padded_struct_returns`,
-   `w2_array_index_oob_ub`, `w2_union_uninit_bytes_ub`.
-3. Raw pointers: `w3_rawPtr_write_read_returns`, `w3_use_after_storageDead_ub`.
+   `w1_switch_otherwise`, `w1_switch_treeSafe_iff_miriSafe` (for every
+   scrutinee), `w1_cast_sign_extend`, `w1_cast_treeSafe_iff_miriSafe`,
+   `w1_checked_add_no_overflow`, `w1_checked_add_overflow_ub`, the terminating
+   conditional loop `w1_count_loop_returns` (`SwitchInt` exit, in the
+   unconditional fragment), the diverging safe loop `w1_loop_diverges_safely`
+   (`InfiniteRun`, `System.Safe`, `TreeSafe`), and the divergence
+   `w1_assert_continue_divergence`.
+2. Aggregates: `w2_array_index_returns` (safe `Index` and `ConstantIndex`, from
+   entry), `w2_array_index_oob_ub`, `w2_padded_struct_returns`,
+   `w2_enum_downcast_switch_returns`, `w2_union_init_prefix_read`, and
+   `w2_union_uninit_bytes_ub`.
+3. Raw pointers: `w3_rawPtr_write_read_returns`, `w3_use_after_storageDead_ub`,
+   `w3_arith_offset_steps`, and `w3_arith_offset_uninit_ub`.
 4. Tree Borrows: `w4_child_write_then_parent_read_returns` (`I-10`),
-   `w4_unsafe_cell_vs_freeze` (`I-11`), `w4_protected_reservedFrz_conflict_ub`.
-5. Multi-frame calls: `w5_call_return`, `w5_callee_unreachable_ub`,
-   `w5_callee_uninit_return_ub`.
+   `w4_safe_ref_return` (a returned `&u64`), `w4_unsafe_cell_vs_freeze`
+   (`I-11`), and `w4_protected_reservedFrz_conflict_ub`, the last two with the
+   agreeing `lean-miri` Tree Borrows accesses (`TreeBorrowsRel`,
+   `Tree.NormalTreeState.performAccess`).
+5. Multi-frame calls: `w5_call_return`, `w5_protector_release_step`
+   (`GlobalState.endCall` releasing a live protector), `w5_callee_unreachable_ub`,
+   and `w5_callee_uninit_return_ub`.
 6. Intrinsics: `w6_assume_true`, `w6_assume_false_ub`, `w6_exact_div_valid`,
-   `w6_exact_div_non_multiple_ub`, `w6_copy_nonoverlapping_overlap_ub`.
+   `w6_exact_div_non_multiple_ub`, `w6_write_bytes_steps`,
+   `w6_write_bytes_oob_ub`, `w6_copy_nonoverlapping_disjoint_steps`, and
+   `w6_copy_nonoverlapping_overlap_ub`.
 
-Executions without memory allocation are checked by kernel evaluation
-(`decide`, `decide +kernel`) of `runLoopFuel` and `runAnnealBounded`; executions
-that allocate reuse the step-by-step traces of the `LM-2` … `LM-4.2` witness
-modules through `MiriPath` / `AnnealPath`. The `I-11` and protector witnesses
-are whole-program on the Anneal side and agree with `lean-miri` at the level of
-Tree Borrows tree accesses (`WitnessLM3_3`).
+`AgreeReturns` / `AgreeReturnsBits` (both machines `TreeSafe` / `System.Safe`
+and returning the same value), `AgreeUB` (both reach undefined behavior and
+neither is safe), and `AgreeReaches` (both run in lockstep to related states)
+bundle the agreeing whole-program facts. Executions without memory allocation
+are checked by kernel evaluation (`decide`, `decide +kernel`) of `runLoopFuel`
+and `runAnnealBounded`; executions that allocate reuse the step-by-step traces
+of the `LM-2` … `LM-4.2` witness modules through `MiriPath` / `AnnealPath`.
+Runs ending in a root return of `()` or of a raw pointer are certified up to
+that return (`AgreeReaches`), since the certified return steps require a sized,
+non-pointer `_0`.
 -/
 
 namespace LeanMiriSpec.Correspondence.MiriDiffWitnesses
@@ -139,6 +155,118 @@ theorem miri_ub_of_obs {H : AnnealMiriHooks} {N : Nat} {m : AnnealStepState}
     exact ⟨⟨e, hr⟩, hns⟩
   · cases h
 
+/-- Both machines run `body` from `entryA` / `entryM` to a normal root return:
+Anneal is `TreeSafe` and returns `retVal`; `lean-miri`'s `RunLoop` semantics is
+`System.Safe`, reaches `.returned v`, and is partially correct only for `v`. -/
+def AgreeReturns (body : CapturedMir) (H : AnnealMiriHooks) (entryA : MachineState)
+    (entryM : AnnealStepState) (retVal : Value) (v : Miri.Interpreter.Operand AnnealProv) : Prop :=
+  TreeSafe (mirTree body entryA) ∧
+  (∃ tr mem, ReachesRet (mirTree body entryA) tr (.normal (retVal, mem))) ∧
+  (miriSystem H).Safe entryM ∧
+  (miriSystem H).ReachesOutcome entryM (.returned v) ∧
+  (miriSystem H).PartialCorrect entryM (· = v)
+
+/-- Both machines reach undefined behavior when running `body` from `entryA` / `entryM`. -/
+def AgreeUB (body : CapturedMir) (H : AnnealMiriHooks) (entryA : MachineState)
+    (entryM : AnnealStepState) : Prop :=
+  MirReachesUB (mirTree body entryA) ∧ ¬ TreeSafe (mirTree body entryA) ∧
+  (∃ e, (miriSystem H).ReachesOutcome entryM (.undefinedBehavior e)) ∧
+  ¬ (miriSystem H).Safe entryM
+
+theorem agreeReturns_of_paths {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA preA sₙ : MachineState} {entryM preM mₙ m' : AnnealStepState} {p : Nat}
+    {retVal : Value} {mem : Memory} {v : Miri.Interpreter.Operand AnnealProv}
+    (hpa : runAnnealBounded body p entryA = .running preA)
+    (hpm : runLoopFuel H p entryM = .running preM)
+    (hA : AnnealPath body preA sₙ) (hAr : stepMirFn body sₙ = .retNormal retVal mem)
+    (hM : MiriPath H preM mₙ) (hMr : H.coreStep () mₙ = (m', .ok true))
+    (hemp : m'.stack.frames = #[]) (hop : (H.returnOperand () mₙ).2 = .ok v) :
+    AgreeReturns body H entryA entryM retVal v := by
+  obtain ⟨⟨hts, ⟨tr, hrr⟩, _⟩, hsafe, hreach, huniq⟩ :=
+    wholeProgram_returns hpa hpm hA hAr hM hMr hemp hop
+  refine ⟨hts, ⟨tr, mem, hrr⟩, hsafe, hreach, fun v' hv' => ?_⟩
+  have := huniq _ hv'
+  injection this
+
+theorem agreeUB_of_paths {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA preA sₙ : MachineState} {entryM preM mₙ m' : AnnealStepState} {p : Nat}
+    {e : Miri.Interpreter.StepError}
+    (hpa : runAnnealBounded body p entryA = .running preA)
+    (hpm : runLoopFuel H p entryM = .running preM)
+    (hA : AnnealPath body preA sₙ) (hAf : stepMirFn body sₙ = .fail .ub)
+    (hM : MiriPath H preM mₙ) (hMe : H.coreStep () mₙ = (m', .error e))
+    (hub : Miri.Interpreter.RunLoop.reportsUB e = true) :
+    AgreeUB body H entryA entryM := by
+  obtain ⟨⟨hub', hns⟩, hreach, hnsafe⟩ := wholeProgram_ub hpa hpm hA hAf hM hMe hub
+  exact ⟨hub', hns, ⟨e, hreach⟩, hnsafe⟩
+
+theorem agreeReturns_of_bits_path {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA : MachineState} {entryM mₙ m' : AnnealStepState} {N sz b : Nat}
+    {v : Miri.Interpreter.Operand AnnealProv}
+    (ha : annealRetBits? sz (runAnnealBounded body N entryA) = some b)
+    (hM : MiriPath H entryM mₙ) (hMr : H.coreStep () mₙ = (m', .ok true))
+    (hemp : m'.stack.frames = #[]) (hop : (H.returnOperand () mₙ).2 = .ok v) :
+    AgreeReturns body H entryA entryM (.scalar ⟨b, sz⟩) v := by
+  obtain ⟨hts, hrr⟩ := anneal_returns_of_bits ha
+  obtain ⟨hsafe, hreach, huniq⟩ := miri_safe_of_path_return hM hMr hemp hop
+  refine ⟨hts, hrr, hsafe, hreach, fun v' hv' => ?_⟩
+  have := huniq _ hv'
+  injection this
+
+theorem agreeUB_of_obs_path {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA : MachineState} {entryM mₙ m' : AnnealStepState} {N : Nat}
+    {e : Miri.Interpreter.StepError}
+    (ha : annealIsUB (runAnnealBounded body N entryA) = true)
+    (hM : MiriPath H entryM mₙ) (hMe : H.coreStep () mₙ = (m', .error e))
+    (hub : Miri.Interpreter.RunLoop.reportsUB e = true) :
+    AgreeUB body H entryA entryM := by
+  obtain ⟨hub', hns⟩ := anneal_ub_of_obs ha
+  have h := miri_outcome_of_path_error hM hMe
+  rw [classifyError_eq_ub_iff.2 ⟨hub, rfl⟩] at h
+  exact ⟨hub', hns, ⟨e, h.1⟩, h.2⟩
+
+/-- Both machines return the `sz`-byte scalar `b` when running `body` from
+`entryA` / `entryM`: Anneal is `TreeSafe` and returns `b`; `lean-miri`'s
+`RunLoop` semantics is `System.Safe`, reaches a return operand with scalar
+bits `b`, and is partially correct for that postcondition. -/
+def AgreeReturnsBits (body : CapturedMir) (H : AnnealMiriHooks) (entryA : MachineState)
+    (entryM : AnnealStepState) (sz b : Nat) : Prop :=
+  TreeSafe (mirTree body entryA) ∧
+  (∃ tr mem, ReachesRet (mirTree body entryA) tr (.normal (.scalar ⟨b, sz⟩, mem))) ∧
+  (miriSystem H).Safe entryM ∧
+  (∃ v, (miriSystem H).ReachesOutcome entryM (.returned v) ∧ operandScalarBits? sz v = some b) ∧
+  (miriSystem H).PartialCorrect entryM (fun v => operandScalarBits? sz v = some b)
+
+/-- Both machines run `body` from `entryA` / `entryM` to the running states
+`sA` / `mB` without stopping: a finite Anneal trace leads from `mirTree body
+entryA` to the residual `mirTree body sA`, and `miriSystem` reaches `mB`. -/
+def AgreeReaches (body : CapturedMir) (H : AnnealMiriHooks) (entryA sA : MachineState)
+    (entryM mB : AnnealStepState) : Prop :=
+  (∃ tr, Reaches (mirTree body entryA) tr (mirTree body sA)) ∧ (miriSystem H).Reaches entryM mB
+
+theorem agreeReturnsBits_of_obs {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA : MachineState} {entryM : AnnealStepState} {N M sz b : Nat}
+    (ha : annealRetBits? sz (runAnnealBounded body N entryA) = some b)
+    (hm : (runLoopFuel H M entryM).returnedOperand?.bind (operandScalarBits? sz) = some b) :
+    AgreeReturnsBits body H entryA entryM sz b := by
+  obtain ⟨hts, hrr⟩ := anneal_returns_of_bits ha
+  obtain ⟨hsafe, hpc, hreach⟩ := miri_returns_of_bits hm
+  exact ⟨hts, hrr, hsafe, hreach, hpc⟩
+
+theorem agreeUB_of_obs {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA : MachineState} {entryM : AnnealStepState} {N M : Nat}
+    (ha : annealIsUB (runAnnealBounded body N entryA) = true)
+    (hm : miriIsUB (runLoopFuel H M entryM) = true) : AgreeUB body H entryA entryM := by
+  obtain ⟨hub, hns⟩ := anneal_ub_of_obs ha
+  obtain ⟨hr, hnm⟩ := miri_ub_of_obs hm
+  exact ⟨hub, hns, hr, hnm⟩
+
+theorem agreeReaches_of_paths {body : CapturedMir} {H : AnnealMiriHooks}
+    {entryA sA : MachineState} {entryM mB : AnnealStepState}
+    (hA : AnnealPath body entryA sA) (hM : MiriPath H entryM mB) :
+    AgreeReaches body H entryA sA entryM mB :=
+  ⟨reaches_cofix_of_coReach hA.coReach, hM.reaches⟩
+
 /-! ## 1. Scalar arithmetic, casts, `SwitchInt`, `Assert`, and a diverging loop -/
 
 def st (k : StatementKind) : Statement := { kind := k, span := "lm-4.3-witness" }
@@ -165,33 +293,19 @@ def mkBody (name : String) (decls : List LocalDecl) (bbs : List BasicBlockData)
 
 /-- `fn div() -> u8 { let x = 7; x / 7 }`: both machines return `1`. -/
 theorem w1_div_returns :
-    (miriSystem (annealMiriHooks (Witness.divBody 7))).Safe (miriEntryState (Witness.divBody 7)) ∧
-    (miriSystem (annealMiriHooks (Witness.divBody 7))).PartialCorrect
-      (miriEntryState (Witness.divBody 7)) (fun v => operandScalarBits? 1 v = some 1) ∧
-    TreeSafe (mirCallTree (Witness.divBody 7) []) ∧
-    ∃ tr mem, ReachesRet (mirCallTree (Witness.divBody 7) []) tr (.normal (.scalar ⟨1, 1⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := annealMiriHooks (Witness.divBody 7)) (N := 6)
-    (m := miriEntryState (Witness.divBody 7)) (sz := 1) (b := 1) (by decide)
-  have ha := anneal_returns_of_bits (body := Witness.divBody 7) (N := 6)
-    (s := initMachineState (Witness.divBody 7) []) (sz := 1) (b := 1) (by decide)
-  exact ⟨hm.1, hm.2.1, ha⟩
+    AgreeReturnsBits (Witness.divBody 7) (annealMiriHooks (Witness.divBody 7))
+      (initMachineState (Witness.divBody 7) []) (miriEntryState (Witness.divBody 7)) 1 1 :=
+  agreeReturnsBits_of_obs (N := 6) (M := 6) (by decide) (by decide)
 
 /-- Division by zero is undefined behavior in both machines. -/
 theorem w1_div_by_zero_ub :
-    (∃ e, (miriSystem (annealMiriHooks (Witness.divBody 0))).ReachesOutcome
-      (miriEntryState (Witness.divBody 0)) (.undefinedBehavior e)) ∧
-    ¬ (miriSystem (annealMiriHooks (Witness.divBody 0))).Safe (miriEntryState (Witness.divBody 0)) ∧
-    MirReachesUB (mirCallTree (Witness.divBody 0) []) ∧
-    ¬ TreeSafe (mirCallTree (Witness.divBody 0) []) := by
-  have hm := miri_ub_of_obs (H := annealMiriHooks (Witness.divBody 0)) (N := 6)
-    (m := miriEntryState (Witness.divBody 0)) (by decide)
-  have ha := anneal_ub_of_obs (body := Witness.divBody 0) (N := 6)
-    (s := initMachineState (Witness.divBody 0) []) (by decide)
-  exact ⟨hm.1, hm.2, ha⟩
+    AgreeUB (Witness.divBody 0) (annealMiriHooks (Witness.divBody 0))
+      (initMachineState (Witness.divBody 0) []) (miriEntryState (Witness.divBody 0)) :=
+  agreeUB_of_obs (N := 6) (M := 6) (by decide) (by decide)
 
 /-- `divBody d` is in the unconditional closed fragment for every divisor. -/
 theorem w1_div_inFragment (d : Nat) (hd : d < 256) : InSafeScalarFragment (Witness.divBody d) :=
-  ⟨Witness.wellTypedBody d hd, by simp [Witness.divBody]⟩
+  ⟨WellTypedBody.toExt (Witness.wellTypedBody d hd), by simp [Witness.divBody]⟩
 
 /-- The unconditional equivalence, for every divisor at once. -/
 theorem w1_div_treeSafe_iff_miriSafe (d : Nat) (hd : d < 256) :
@@ -201,42 +315,92 @@ theorem w1_div_treeSafe_iff_miriSafe (d : Nat) (hd : d < 256) :
 
 /-- `SwitchInt` takes case `7` (returning `20`) in both machines. -/
 theorem w1_switch_case :
-    (miriSystem (annealMiriHooks (Witness.lm12SwitchBody 7))).Safe
-      (miriEntryState (Witness.lm12SwitchBody 7)) ∧
-    (miriSystem (annealMiriHooks (Witness.lm12SwitchBody 7))).PartialCorrect
-      (miriEntryState (Witness.lm12SwitchBody 7)) (fun v => operandScalarBits? 1 v = some 20) ∧
-    TreeSafe (mirCallTree (Witness.lm12SwitchBody 7) []) ∧
-    ∃ tr mem, ReachesRet (mirCallTree (Witness.lm12SwitchBody 7) []) tr
-      (.normal (.scalar ⟨20, 1⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := annealMiriHooks (Witness.lm12SwitchBody 7)) (N := 4)
-    (m := miriEntryState (Witness.lm12SwitchBody 7)) (sz := 1) (b := 20) (by decide)
-  have ha := anneal_returns_of_bits (body := Witness.lm12SwitchBody 7) (N := 4)
-    (s := initMachineState (Witness.lm12SwitchBody 7) []) (sz := 1) (b := 20) (by decide)
-  exact ⟨hm.1, hm.2.1, ha⟩
+    AgreeReturnsBits (Witness.lm12SwitchBody 7) (annealMiriHooks (Witness.lm12SwitchBody 7))
+      (initMachineState (Witness.lm12SwitchBody 7) []) (miriEntryState (Witness.lm12SwitchBody 7))
+      1 20 :=
+  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide) (by decide)
 
 /-- `SwitchInt` falls back to `otherwise` (returning `30`) in both machines. -/
 theorem w1_switch_otherwise :
-    (miriSystem (annealMiriHooks (Witness.lm12SwitchBody 9))).PartialCorrect
-      (miriEntryState (Witness.lm12SwitchBody 9)) (fun v => operandScalarBits? 1 v = some 30) ∧
-    ∃ tr mem, ReachesRet (mirCallTree (Witness.lm12SwitchBody 9) []) tr
-      (.normal (.scalar ⟨30, 1⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := annealMiriHooks (Witness.lm12SwitchBody 9)) (N := 4)
-    (m := miriEntryState (Witness.lm12SwitchBody 9)) (sz := 1) (b := 30) (by decide)
-  have ha := anneal_returns_of_bits (body := Witness.lm12SwitchBody 9) (N := 4)
-    (s := initMachineState (Witness.lm12SwitchBody 9) []) (sz := 1) (b := 30) (by decide)
-  exact ⟨hm.2.1, ha.2⟩
+    AgreeReturnsBits (Witness.lm12SwitchBody 9) (annealMiriHooks (Witness.lm12SwitchBody 9))
+      (initMachineState (Witness.lm12SwitchBody 9) []) (miriEntryState (Witness.lm12SwitchBody 9))
+      1 30 :=
+  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide) (by decide)
+
+/-- `lm12SwitchBody d` (a `SwitchInt` on `const d_u8` with cases `0`, `7`, and
+`otherwise`) is in the unconditional closed fragment for every `d`. -/
+theorem w1_switch_inFragment (d : Nat) (hd : d < 256) :
+    InSafeScalarFragment (Witness.lm12SwitchBody d) := by
+  have hu8 : IsPrimScalarTy Witness.u8Ty := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
+  have hc : ∀ n, n < 256 → WellTypedScalarOperandSyn (Witness.lm12SwitchBody d) (fun _ => True)
+      (.constant (Witness.constU8 n)) Witness.u8Ty :=
+    fun n hn => .constScalar _ ⟨n, 1⟩ rfl hu8 (Or.inl rfl)
+      (by rw [scalarModulus_eq_two_pow]; simpa using hn) rfl (fun h => nomatch h)
+      (fun h => nomatch h)
+  have hret : ∀ k, k < 256 → WellTypedBasicBlockExt (Witness.lm12SwitchBody d) (fun _ => True)
+      { statements := [Witness.mkStmt (.assign (Witness.local_ 0) (.use (.constant (Witness.constU8 k))))],
+        terminator := Witness.mkTerm .return_, isCleanup := false } := by
+    intro k hk
+    refine ⟨rfl, fun stmt hstmt => ?_,
+      .return_ Witness.u8Decl rfl trivial rfl (IsPrimScalarTy.size_ne_zero hu8)⟩
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hstmt
+    subst hstmt
+    exact .syn _ (.assign _ 0 Witness.u8Decl _ rfl rfl trivial (.use _ _ (hc k hk)))
+  refine ⟨⟨(fun p h => nomatch h), fun bb hbb => ?_⟩, by simp [Witness.lm12SwitchBody]⟩
+  simp only [Witness.lm12SwitchBody, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl | rfl | rfl
+  · refine ⟨rfl, (fun stmt hstmt => nomatch hstmt), ?_⟩
+    refine .switchInt _ _ Witness.u8Ty rfl (Or.inr (Or.inr ⟨.u8, rfl⟩)) (hc d hd) ?_
+      ⟨_, rfl⟩ ?_
+    · intro v b hmem
+      simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at hmem
+      rcases hmem with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+      · exact ⟨by decide, fun h => nomatch h⟩
+      · exact ⟨by decide, fun h => nomatch h⟩
+    · intro v b hmem
+      simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at hmem
+      rcases hmem with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
+      · exact ⟨_, rfl⟩
+      · exact ⟨_, rfl⟩
+  · exact hret 10 (by decide)
+  · exact hret 20 (by decide)
+  · exact hret 30 (by decide)
+
+/-- The unconditional equivalence for `SwitchInt` branching, for every scrutinee. -/
+theorem w1_switch_treeSafe_iff_miriSafe (d : Nat) (hd : d < 256) :
+    TreeSafe (mirCallTree (Witness.lm12SwitchBody d) []) ↔
+      (miriSystem (annealMiriHooks (Witness.lm12SwitchBody d))).Safe
+        (miriEntryState (Witness.lm12SwitchBody d)) :=
+  scalarFragment_treeSafe_iff_miriSafe (w1_switch_inFragment d hd)
 
 /-- `-1_i8 as i16` sign-extends to `0xFFFF` in both machines. -/
 theorem w1_cast_sign_extend :
-    (miriSystem (annealMiriHooks Witness.lm12CastBody)).PartialCorrect
-      (miriEntryState Witness.lm12CastBody) (fun v => operandScalarBits? 2 v = some 0xFFFF) ∧
-    ∃ tr mem, ReachesRet (mirCallTree Witness.lm12CastBody []) tr
-      (.normal (.scalar ⟨0xFFFF, 2⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := annealMiriHooks Witness.lm12CastBody) (N := 3)
-    (m := miriEntryState Witness.lm12CastBody) (sz := 2) (b := 0xFFFF) (by decide)
-  have ha := anneal_returns_of_bits (body := Witness.lm12CastBody) (N := 3)
-    (s := initMachineState Witness.lm12CastBody []) (sz := 2) (b := 0xFFFF) (by decide)
-  exact ⟨hm.2.1, ha.2⟩
+    AgreeReturnsBits Witness.lm12CastBody (annealMiriHooks Witness.lm12CastBody)
+      (initMachineState Witness.lm12CastBody []) (miriEntryState Witness.lm12CastBody) 2 0xFFFF :=
+  agreeReturnsBits_of_obs (N := 3) (M := 3) (by decide) (by decide)
+
+/-- `lm12CastBody` (an `IntToInt` cast) is in the unconditional closed fragment. -/
+theorem w1_cast_inFragment : InSafeScalarFragment Witness.lm12CastBody := by
+  have hi8 : IsPrimScalarTy Witness.i8TyW := Or.inr (Or.inr (Or.inl ⟨.i8, rfl⟩))
+  have hi16 : IsPrimScalarTy Witness.lm12I16Ty := Or.inr (Or.inr (Or.inl ⟨.i16, rfl⟩))
+  refine ⟨⟨(fun p h => nomatch h), fun bb hbb => ?_⟩,
+    by simp [Witness.lm12CastBody, Witness.lm12CastBodyOf]⟩
+  simp only [Witness.lm12CastBody, Witness.lm12CastBodyOf, List.mem_singleton] at hbb
+  subst hbb
+  refine ⟨rfl, fun stmt hstmt => ?_,
+    .return_ Witness.lm12I16Decl rfl trivial rfl (IsPrimScalarTy.size_ne_zero hi16)⟩
+  simp only [List.mem_singleton] at hstmt
+  subst hstmt
+  exact .intToInt _ 0 Witness.lm12I16Decl _ Witness.i8TyW rfl rfl trivial
+    (.constScalar _ ⟨0xFF, 1⟩ rfl hi8 (Or.inl rfl) (by rw [scalarModulus_eq_two_pow]; decide) rfl
+      (fun h => nomatch h) (fun h => nomatch h))
+    (Or.inr (Or.inl ⟨.i8, rfl⟩)) (Or.inl ⟨.i16, rfl⟩)
+
+/-- The unconditional equivalence for the `IntToInt` cast body. -/
+theorem w1_cast_treeSafe_iff_miriSafe :
+    TreeSafe (mirCallTree Witness.lm12CastBody []) ↔
+      (miriSystem (annealMiriHooks Witness.lm12CastBody)).Safe (miriEntryState Witness.lm12CastBody) :=
+  scalarFragment_treeSafe_iff_miriSafe w1_cast_inFragment
 
 /-- Checked addition guarded by an overflow `Assert` (`UnwindAction::Unreachable`):
 ```text
@@ -256,29 +420,98 @@ def checkedAddBody (rhs : Nat) : CapturedMir :=
 
 /-- Without overflow (`65500 + 35`), the assertion passes and both machines return `65535`. -/
 theorem w1_checked_add_no_overflow :
-    (miriSystem (annealMiriHooks (checkedAddBody 35))).Safe (miriEntryState (checkedAddBody 35)) ∧
-    (miriSystem (annealMiriHooks (checkedAddBody 35))).PartialCorrect
-      (miriEntryState (checkedAddBody 35)) (fun v => operandScalarBits? 2 v = some 65535) ∧
-    TreeSafe (mirCallTree (checkedAddBody 35) []) ∧
-    ∃ tr mem, ReachesRet (mirCallTree (checkedAddBody 35) []) tr
-      (.normal (.scalar ⟨65535, 2⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := annealMiriHooks (checkedAddBody 35)) (N := 7)
-    (m := miriEntryState (checkedAddBody 35)) (sz := 2) (b := 65535) (by decide)
-  have ha := anneal_returns_of_bits (body := checkedAddBody 35) (N := 7)
-    (s := initMachineState (checkedAddBody 35) []) (sz := 2) (b := 65535) (by decide)
-  exact ⟨hm.1, hm.2.1, ha⟩
+    AgreeReturnsBits (checkedAddBody 35) (annealMiriHooks (checkedAddBody 35))
+      (initMachineState (checkedAddBody 35) []) (miriEntryState (checkedAddBody 35)) 2 65535 :=
+  agreeReturnsBits_of_obs (N := 7) (M := 7) (by decide) (by decide)
 
 /-- On overflow (`65500 + 36`), the failed assertion with `unwind: unreachable`
 is undefined behavior in both machines. -/
 theorem w1_checked_add_overflow_ub :
-    (∃ e, (miriSystem (annealMiriHooks (checkedAddBody 36))).ReachesOutcome
-      (miriEntryState (checkedAddBody 36)) (.undefinedBehavior e)) ∧
-    MirReachesUB (mirCallTree (checkedAddBody 36) []) := by
-  have hm := miri_ub_of_obs (H := annealMiriHooks (checkedAddBody 36)) (N := 7)
-    (m := miriEntryState (checkedAddBody 36)) (by decide)
-  have ha := anneal_ub_of_obs (body := checkedAddBody 36) (N := 7)
-    (s := initMachineState (checkedAddBody 36) []) (by decide)
-  exact ⟨hm.1, ha.1⟩
+    AgreeUB (checkedAddBody 36) (annealMiriHooks (checkedAddBody 36))
+      (initMachineState (checkedAddBody 36) []) (miriEntryState (checkedAddBody 36)) :=
+  agreeUB_of_obs (N := 7) (M := 7) (by decide) (by decide)
+
+/-- A terminating conditional loop (`while i < 3 { i += 1 }`) in the
+unconditional fragment: a `SwitchInt` on the `bool` comparison exits the loop.
+```text
+bb0: StorageLive(_1); StorageLive(_2); _1 = const 0_u8; goto bb1
+bb1: _2 = Lt(copy _1, const 3_u8); switchInt(copy _2) -> [0: bb3, otherwise: bb2]
+bb2: _1 = Add(copy _1, const 1_u8); goto bb1
+bb3: _0 = copy _1; StorageDead(_2); StorageDead(_1); return
+``` -/
+def countLoopBody : CapturedMir :=
+  mkBody "lm_4_3_witness::count_loop" [dcl tyU8, dcl tyU8, dcl Witness.boolTy]
+    [blk [st (.storageLive 1), st (.storageLive 2), st (.assign (pl 1) (.use (cU8 0)))] (.goto 1),
+     blk [st (.assign (pl 2) (.binaryOp .lt (.copy (pl 1)) (cU8 3)))]
+       (.switchInt (.copy (pl 2)) { branches := [(0, 3)], otherwise := 2 }),
+     blk [st (.assign (pl 1) (.binaryOp .add (.copy (pl 1)) (cU8 1)))] (.goto 1),
+     blk [st (.assign (pl 0) (.use (.copy (pl 1)))), st (.storageDead 2), st (.storageDead 1)]
+       .return_]
+
+theorem countLoop_inFragment : InSafeScalarFragment countLoopBody := by
+  have hu8 : IsPrimScalarTy tyU8 := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
+  have hbool : IsPrimScalarTy Witness.boolTy := Or.inl rfl
+  have hu8int : IsIntegralTy tyU8 (translateUintTy .u8) := .uint .u8 rfl
+  have hc : ∀ n, n < 256 → WellTypedScalarOperandSyn countLoopBody (fun _ => True) (cU8 n) tyU8 :=
+    fun n hn => .constScalar _ ⟨n, 1⟩ rfl hu8 (Or.inl rfl)
+      (by rw [scalarModulus_eq_two_pow]; simpa using hn) rfl (fun h => nomatch h)
+      (fun h => nomatch h)
+  have hcp1 : WellTypedScalarOperandSyn countLoopBody (fun _ => True) (.copy (pl 1)) tyU8 :=
+    .copyLocal 1 (dcl tyU8) rfl (IsPrimScalarTy.size_ne_zero hu8) trivial
+  refine ⟨⟨(fun p h => nomatch h), fun bb hbb => ?_⟩, by simp [countLoopBody, mkBody]⟩
+  simp only [countLoopBody, mkBody, List.mem_cons, List.not_mem_nil, or_false] at hbb
+  rcases hbb with rfl | rfl | rfl | rfl
+  · refine ⟨rfl, fun stmt hstmt => ?_, .goto 1 _ rfl rfl⟩
+    simp only [blk, List.mem_cons, List.not_mem_nil, or_false] at hstmt
+    rcases hstmt with rfl | rfl | rfl
+    · exact .syn _ (.storageLive _ 1 (dcl tyU8) rfl rfl trivial)
+    · exact .syn _ (.storageLive _ 2 (dcl Witness.boolTy) rfl rfl trivial)
+    · exact .syn _ (.assign _ 1 (dcl tyU8) _ rfl rfl trivial (.use _ _ (hc 0 (by decide))))
+  · refine ⟨rfl, fun stmt hstmt => ?_, ?_⟩
+    · simp only [blk, List.mem_cons, List.not_mem_nil, or_false] at hstmt
+      subst hstmt
+      exact .syn _ (.assign _ 2 (dcl Witness.boolTy) _ rfl rfl trivial
+        (.binaryOp .lt _ _ tyU8 tyU8 Witness.boolTy hcp1 (hc 3 (by decide))
+          (.intCmp .lt tyU8 tyU8 Witness.boolTy _ (Or.inr (Or.inr (Or.inl rfl))) hu8int hu8int rfl)))
+    · refine .switchInt _ _ Witness.boolTy rfl (Or.inl rfl)
+        (.copyLocal 2 (dcl Witness.boolTy) rfl (IsPrimScalarTy.size_ne_zero hbool) trivial)
+        ?_ ⟨_, rfl⟩ ?_
+      · intro v b hmem
+        simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at hmem
+        obtain ⟨rfl, rfl⟩ := hmem
+        exact ⟨by decide, fun _ => Or.inl rfl⟩
+      · intro v b hmem
+        simp only [List.mem_cons, Prod.mk.injEq, List.not_mem_nil, or_false] at hmem
+        obtain ⟨rfl, rfl⟩ := hmem
+        exact ⟨_, rfl⟩
+  · refine ⟨rfl, fun stmt hstmt => ?_, .goto 1 _ rfl rfl⟩
+    simp only [blk, List.mem_cons, List.not_mem_nil, or_false] at hstmt
+    subst hstmt
+    exact .syn _ (.assign _ 1 (dcl tyU8) _ rfl rfl trivial
+      (.binaryOp .add _ _ tyU8 tyU8 tyU8 hcp1 (hc 1 (by decide))
+        (.intArithOrBitwise .add tyU8 tyU8 tyU8 .u8 (Or.inl rfl) (.uint .u8 rfl) (.uint .u8 rfl)
+          (.uint .u8 rfl))))
+  · refine ⟨rfl, fun stmt hstmt => ?_,
+      .return_ (dcl tyU8) rfl trivial rfl (IsPrimScalarTy.size_ne_zero hu8)⟩
+    simp only [blk, List.mem_cons, List.not_mem_nil, or_false] at hstmt
+    rcases hstmt with rfl | rfl | rfl
+    · exact .syn _ (.assign _ 0 (dcl tyU8) _ rfl rfl trivial (.use _ _ hcp1))
+    · exact .syn _ (.storageDead _ 2 (dcl Witness.boolTy) rfl rfl (by decide) trivial)
+    · exact .syn _ (.storageDead _ 1 (dcl tyU8) rfl rfl (by decide) trivial)
+
+/-- **Conditional loop.** Both machines run the `SwitchInt`-guarded loop three
+times and return `3`; by the unconditional fragment, every reachable
+`lean-miri` outcome is a return or undefined behavior and safety coincides. -/
+theorem w1_count_loop_returns :
+    AgreeReturnsBits countLoopBody (annealMiriHooks countLoopBody)
+      (initMachineState countLoopBody []) (miriEntryState countLoopBody) 1 3 ∧
+    (TreeSafe (mirCallTree countLoopBody []) ↔
+      (miriSystem (annealMiriHooks countLoopBody)).Safe (miriEntryState countLoopBody)) ∧
+    (∀ o, (miriSystem (annealMiriHooks countLoopBody)).ReachesOutcome
+      (miriEntryState countLoopBody) o → o.isReturn ∨ ∃ e, o = .undefinedBehavior e) :=
+  ⟨agreeReturnsBits_of_obs (N := 24) (M := 24) (by decide) (by decide),
+    scalarFragment_treeSafe_iff_miriSafe countLoop_inFragment,
+    scalarFragment_outcomes countLoop_inFragment⟩
 
 /-- A diverging safe loop in the unconditional fragment:
 ```text
@@ -304,8 +537,8 @@ theorem loop_prefix : runAnnealBounded loopBody 6 (initMachineState loopBody [])
 
 theorem loop_cycle : runAnnealBounded loopBody (5 + 1) loopHead = .running loopHead := rfl
 
-theorem loop_inFragment : InSafeScalarFragment loopBody := by
-  refine ⟨⟨(fun p h => nomatch h), fun bb hbb => ?_⟩, by simp [loopBody, mkBody]⟩
+theorem loop_wellTyped : WellTypedBody loopBody := by
+  refine ⟨(fun p h => nomatch h), fun bb hbb => ?_⟩
   have hu8 : IsPrimScalarTy tyU8 := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
   have hc : ∀ n, n < 256 → WellTypedScalarOperandSyn loopBody (fun _ => True) (cU8 n) tyU8 :=
     fun n hn => .constScalar _ ⟨n, 1⟩ rfl hu8 (Or.inl rfl)
@@ -326,6 +559,9 @@ theorem loop_inFragment : InSafeScalarFragment loopBody := by
     · exact .storageDead _ 1 (dcl tyU8) rfl rfl (by decide) trivial
   · exact ⟨rfl, (fun stmt hstmt => nomatch hstmt), Or.inl ⟨0, _, rfl, rfl⟩⟩
 
+theorem loop_inFragment : InSafeScalarFragment loopBody :=
+  ⟨WellTypedBody.toExt loop_wellTyped, by simp [loopBody, mkBody]⟩
+
 /-- **Diverging safe loop.** Anneal never stops and is `TreeSafe` and never
 returns; `lean-miri`'s `RunLoop` semantics has an `InfiniteRun`, is
 `System.Safe`, and reaches no terminal outcome. -/
@@ -338,7 +574,7 @@ theorem w1_loop_diverges_safely :
     (∀ tr r, ¬ ReachesRet (mirCallTree loopBody []) tr r) := by
   have hforever := anneal_forall_running_of_lasso loop_prefix loop_cycle
   obtain ⟨hinf, hsafe, hno⟩ := miri_infiniteRun_of_anneal_forever
-    (scalarFragment_stepClosedSim loop_inFragment.wellTyped) (scalarFragment_entry loop_inFragment)
+    (scalarFragmentExt_stepClosedSim loop_inFragment.wellTyped) (scalarFragment_entry loop_inFragment)
     hforever
   exact ⟨hinf, hsafe, hno, anneal_safe_of_forall_running hforever⟩
 
@@ -391,27 +627,15 @@ def assumeBody (b : Bool) : CapturedMir :=
 
 /-- `assume(true)` is a no-op: both machines return `7`. -/
 theorem w6_assume_true :
-    (miriSystem (annealMiriHooks (assumeBody true))).Safe (miriEntryState (assumeBody true)) ∧
-    (miriSystem (annealMiriHooks (assumeBody true))).PartialCorrect
-      (miriEntryState (assumeBody true)) (fun v => operandScalarBits? 1 v = some 7) ∧
-    TreeSafe (mirCallTree (assumeBody true) []) ∧
-    ∃ tr mem, ReachesRet (mirCallTree (assumeBody true) []) tr (.normal (.scalar ⟨7, 1⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := annealMiriHooks (assumeBody true)) (N := 4)
-    (m := miriEntryState (assumeBody true)) (sz := 1) (b := 7) (by decide)
-  have ha := anneal_returns_of_bits (body := assumeBody true) (N := 4)
-    (s := initMachineState (assumeBody true) []) (sz := 1) (b := 7) (by decide)
-  exact ⟨hm.1, hm.2.1, ha⟩
+    AgreeReturnsBits (assumeBody true) (annealMiriHooks (assumeBody true))
+      (initMachineState (assumeBody true) []) (miriEntryState (assumeBody true)) 1 7 :=
+  agreeReturnsBits_of_obs (N := 4) (M := 4) (by decide) (by decide)
 
 /-- `assume(false)` is undefined behavior in both machines. -/
 theorem w6_assume_false_ub :
-    (∃ e, (miriSystem (annealMiriHooks (assumeBody false))).ReachesOutcome
-      (miriEntryState (assumeBody false)) (.undefinedBehavior e)) ∧
-    MirReachesUB (mirCallTree (assumeBody false) []) := by
-  have hm := miri_ub_of_obs (H := annealMiriHooks (assumeBody false)) (N := 4)
-    (m := miriEntryState (assumeBody false)) (by decide)
-  have ha := anneal_ub_of_obs (body := assumeBody false) (N := 4)
-    (s := initMachineState (assumeBody false) []) (by decide)
-  exact ⟨hm.1, ha.1⟩
+    AgreeUB (assumeBody false) (annealMiriHooks (assumeBody false))
+      (initMachineState (assumeBody false) []) (miriEntryState (assumeBody false)) :=
+  agreeUB_of_obs (N := 4) (M := 4) (by decide) (by decide)
 
 /-- `exact_div::<u32>(a, 7)` (`bb0: _0 = exact_div(const a, const 7) -> bb1; bb1: return`). -/
 def exactDivBody (a : Nat) : CapturedMir :=
@@ -420,73 +644,15 @@ def exactDivBody (a : Nat) : CapturedMir :=
 
 /-- `exact_div(42, 7)` (`pass_exact_div_valid`) returns `6` in both machines. -/
 theorem w6_exact_div_valid :
-    (miriSystem (annealMiriHooks (exactDivBody 42))).Safe (miriEntryState (exactDivBody 42)) ∧
-    (miriSystem (annealMiriHooks (exactDivBody 42))).PartialCorrect
-      (miriEntryState (exactDivBody 42)) (fun v => operandScalarBits? 4 v = some 6) ∧
-    TreeSafe (mirCallTree (exactDivBody 42) []) ∧
-    ∃ tr mem, ReachesRet (mirCallTree (exactDivBody 42) []) tr (.normal (.scalar ⟨6, 4⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := annealMiriHooks (exactDivBody 42)) (N := 3)
-    (m := miriEntryState (exactDivBody 42)) (sz := 4) (b := 6) (by decide +kernel)
-  have ha := anneal_returns_of_bits (body := exactDivBody 42) (N := 3)
-    (s := initMachineState (exactDivBody 42) []) (sz := 4) (b := 6) (by decide +kernel)
-  exact ⟨hm.1, hm.2.1, ha⟩
+    AgreeReturnsBits (exactDivBody 42) (annealMiriHooks (exactDivBody 42))
+      (initMachineState (exactDivBody 42) []) (miriEntryState (exactDivBody 42)) 4 6 :=
+  agreeReturnsBits_of_obs (N := 3) (M := 3) (by decide +kernel) (by decide +kernel)
 
 /-- `exact_div(43, 7)` (`ub_exact_div_non_multiple`) is undefined behavior in both machines. -/
 theorem w6_exact_div_non_multiple_ub :
-    (∃ e, (miriSystem (annealMiriHooks (exactDivBody 43))).ReachesOutcome
-      (miriEntryState (exactDivBody 43)) (.undefinedBehavior e)) ∧
-    MirReachesUB (mirCallTree (exactDivBody 43) []) := by
-  have hm := miri_ub_of_obs (H := annealMiriHooks (exactDivBody 43)) (N := 3)
-    (m := miriEntryState (exactDivBody 43)) (by decide +kernel)
-  have ha := anneal_ub_of_obs (body := exactDivBody 43) (N := 3)
-    (s := initMachineState (exactDivBody 43) []) (by decide +kernel)
-  exact ⟨hm.1, ha.1⟩
-
-
-/-- Both machines run `body` from `entryA` / `entryM` to a normal root return:
-Anneal is `TreeSafe` and returns `retVal`; `lean-miri`'s `RunLoop` semantics is
-`System.Safe`, reaches `.returned v`, and is partially correct only for `v`. -/
-def AgreeReturns (body : CapturedMir) (H : AnnealMiriHooks) (entryA : MachineState)
-    (entryM : AnnealStepState) (retVal : Value) (v : Miri.Interpreter.Operand AnnealProv) : Prop :=
-  TreeSafe (mirTree body entryA) ∧
-  (∃ tr mem, ReachesRet (mirTree body entryA) tr (.normal (retVal, mem))) ∧
-  (miriSystem H).Safe entryM ∧
-  (miriSystem H).ReachesOutcome entryM (.returned v) ∧
-  (miriSystem H).PartialCorrect entryM (· = v)
-
-/-- Both machines reach undefined behavior when running `body` from `entryA` / `entryM`. -/
-def AgreeUB (body : CapturedMir) (H : AnnealMiriHooks) (entryA : MachineState)
-    (entryM : AnnealStepState) : Prop :=
-  MirReachesUB (mirTree body entryA) ∧ ¬ TreeSafe (mirTree body entryA) ∧
-  (∃ e, (miriSystem H).ReachesOutcome entryM (.undefinedBehavior e)) ∧
-  ¬ (miriSystem H).Safe entryM
-
-theorem agreeReturns_of_paths {body : CapturedMir} {H : AnnealMiriHooks}
-    {entryA preA sₙ : MachineState} {entryM preM mₙ m' : AnnealStepState} {p : Nat}
-    {retVal : Value} {mem : Memory} {v : Miri.Interpreter.Operand AnnealProv}
-    (hpa : runAnnealBounded body p entryA = .running preA)
-    (hpm : runLoopFuel H p entryM = .running preM)
-    (hA : AnnealPath body preA sₙ) (hAr : stepMirFn body sₙ = .retNormal retVal mem)
-    (hM : MiriPath H preM mₙ) (hMr : H.coreStep () mₙ = (m', .ok true))
-    (hemp : m'.stack.frames = #[]) (hop : (H.returnOperand () mₙ).2 = .ok v) :
-    AgreeReturns body H entryA entryM retVal v := by
-  obtain ⟨⟨hts, ⟨tr, hrr⟩, _⟩, hsafe, hreach, huniq⟩ :=
-    wholeProgram_returns hpa hpm hA hAr hM hMr hemp hop
-  refine ⟨hts, ⟨tr, mem, hrr⟩, hsafe, hreach, fun v' hv' => ?_⟩
-  have := huniq _ hv'
-  injection this
-
-theorem agreeUB_of_paths {body : CapturedMir} {H : AnnealMiriHooks}
-    {entryA preA sₙ : MachineState} {entryM preM mₙ m' : AnnealStepState} {p : Nat}
-    {e : Miri.Interpreter.StepError}
-    (hpa : runAnnealBounded body p entryA = .running preA)
-    (hpm : runLoopFuel H p entryM = .running preM)
-    (hA : AnnealPath body preA sₙ) (hAf : stepMirFn body sₙ = .fail .ub)
-    (hM : MiriPath H preM mₙ) (hMe : H.coreStep () mₙ = (m', .error e))
-    (hub : Miri.Interpreter.RunLoop.reportsUB e = true) :
-    AgreeUB body H entryA entryM := by
-  obtain ⟨⟨hub', hns⟩, hreach, hnsafe⟩ := wholeProgram_ub hpa hpm hA hAf hM hMe hub
-  exact ⟨hub', hns, ⟨e, hreach⟩, hnsafe⟩
+    AgreeUB (exactDivBody 43) (annealMiriHooks (exactDivBody 43))
+      (initMachineState (exactDivBody 43) []) (miriEntryState (exactDivBody 43)) :=
+  agreeUB_of_obs (N := 3) (M := 3) (by decide +kernel) (by decide +kernel)
 
 /-! ## 3. Raw pointers -/
 
@@ -539,6 +705,41 @@ theorem w3_use_after_storageDead_ub :
     (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _)))
     herr rfl
 
+/-- `arith_offset` (`LM-4.2`, `arithOffsetPosBody`): `_2 = &raw mut _1` and
+`_0 = arith_offset(copy _2, 5)` step both machines in lockstep from the
+pre-state to `StateRelLM3_1`-related states, with `_0` pointing `40` bytes
+past `_1`. (The root return of the raw pointer `_0` is outside the certified
+return correspondence: `step_terminator_goto_return_lm3_1_simulation` requires
+a non-pointer `_0`.) -/
+theorem w3_arith_offset_steps :
+    ∃ s₂ m₂,
+      AgreeReaches WitnessLM4_2.arithOffsetPosBody (annealMiriHooks WitnessLM4_2.arithOffsetPosBody)
+        (WitnessLM4_2.ptr4AnnealPre WitnessLM4_2.arithOffsetPosBody) s₂
+        (WitnessLM4_2.ptr4MiriPre WitnessLM4_2.arithOffsetPosBody WitnessLM4_2.rawMutU64K) m₂ ∧
+      StateRelLM3_1 WitnessLM4_2.arithOffsetPosBody s₂ m₂
+        [rawPtrAllocMapEntry WitnessLM4_2.arithOffsetPosBody.localDecls
+          WitnessLM4_2.arithOffsetPosBody.layouts .mut 1 1 Witness.lm31AllocId1] ∧
+      get? s₂.frame.locals 0 = some (.init (.ptr { allocId := 1, offsetBytes := 40 } 8)) := by
+  obtain ⟨s₁, s₂, m₁, m₂, hs₁, hm₁, _, hs₂, hm₂, hrel₂, hget⟩ :=
+    WitnessLM4_2.wit_lm4_2_arith_offset_pos
+  obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
+  exact ⟨s₂, m₂, agreeReaches_of_paths (.step .silent hs₁ (.step .silent hs₂ (.refl _)))
+    (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _))),
+    hrel₂, hget⟩
+
+/-- `arith_offset(copy _2, 1)` with `_2` uninitialized. -/
+def arithOffsetUninitBody : CapturedMir :=
+  WitnessLM4_2.ptr4Body WitnessLM4_2.rawMutU64K WitnessLM4_2.rawMutU64K WitnessLM4_2.rawMutU64K []
+    (WitnessLM4_2.arithOffsetTerm 2 1)
+
+/-- `arith_offset` on an uninitialized pointer is undefined behavior in both machines. -/
+theorem w3_arith_offset_uninit_ub :
+    AgreeUB arithOffsetUninitBody (annealMiriHooks arithOffsetUninitBody)
+      (WitnessLM4_2.ptr4AnnealPre arithOffsetUninitBody)
+      (WitnessLM4_2.ptr4MiriPre arithOffsetUninitBody WitnessLM4_2.rawMutU64K) := by
+  obtain ⟨hfail, m', msg, herr⟩ := WitnessLM4_2.wit_lm4_2_arith_offset_uninit_ub
+  exact agreeUB_of_paths (p := 0) rfl rfl (.refl _) hfail (.refl _) herr rfl
+
 /-! ## 4. Tree Borrows -/
 
 /-- `I-10` child write then parent read through a two-level reborrow
@@ -571,31 +772,37 @@ theorem w4_child_write_then_parent_read_returns :
         (.refl _)))))
     hmret rfl (by change (annealControlHooks.returnOperand () m₄).2 = _; rw [hop])
 
+/-- A safe reference `&u64` returned from the root frame (`LM-3.2`,
+`wit_lm3_2_placeMention_and_unified_return_ref_real_steps`):
+```text
+bb0: _2 = &mut _1; PlaceMention(_2); PlaceMention(*_2); *_2 = const 55_u64;
+     _0 = move _2; return
+```
+Both machines run from the pre-state to a normal return of the reference
+(`ImmediateRelLM3_2`-related to the `Active` reborrow of `_1`). -/
+theorem w4_safe_ref_return :
+    ∃ (b : CapturedMir) (decl0 : LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns b (annealMiriHooks b) (Witness.mkPre4AnnealLM32 b .uninit)
+        (Witness.mkPre4MiriLM32 b Witness.refU64Ty
+          { value := .live (.immediate .uninit), layout := none })
+        (.ptr { allocId := 1, offsetBytes := 0 } 8) (.immediate imm0) ∧
+      get? b.localDecls 0 = some decl0 ∧
+      ImmediateRelLM3_2
+        [{ refAllocMapEntry b.localDecls b.layouts (.mut false) 1 1 Witness.lm31AllocId1 with
+            perm := .active }]
+        decl0.ty b.layouts (.ptr { allocId := 1, offsetBytes := 0 } 8) imm0 := by
+  obtain ⟨b, s₁, s₂, s₃, s₄, s₅, m₁, m₂, m₃, m₄, m₅, decl0, imm0, hs₁, hm₁, hs₂, hm₂, hs₃, hm₃,
+    hs₄, hm₄, hs₅, hm₅, _, _, hret, hmret, hdecl0, hop, himm⟩ :=
+    Witness.wit_lm3_2_placeMention_and_unified_return_ref_real_steps.1
+  refine ⟨b, decl0, imm0, ?_, hdecl0, himm⟩
+  exact agreeReturns_of_paths (p := 0) rfl rfl
+    (.step .silent hs₁ (.step .silent hs₂ (.step .silent hs₃ (.step .silent hs₄
+      (.step .silent hs₅ (.refl _)))))) hret
+    (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_step_ok_true hm₃)
+      (.step hm₃ (frames_ne_of_step_ok_true hm₄) (.step hm₄ (frames_ne_of_step_ok_true hm₅)
+        (.step hm₅ (frames_ne_of_step_ok_true hmret) (.refl _))))))
+    hmret rfl (by change (annealControlHooks.returnOperand () m₅).2 = _; rw [hop])
 
-theorem agreeReturns_of_bits_path {body : CapturedMir} {H : AnnealMiriHooks}
-    {entryA : MachineState} {entryM mₙ m' : AnnealStepState} {N sz b : Nat}
-    {v : Miri.Interpreter.Operand AnnealProv}
-    (ha : annealRetBits? sz (runAnnealBounded body N entryA) = some b)
-    (hM : MiriPath H entryM mₙ) (hMr : H.coreStep () mₙ = (m', .ok true))
-    (hemp : m'.stack.frames = #[]) (hop : (H.returnOperand () mₙ).2 = .ok v) :
-    AgreeReturns body H entryA entryM (.scalar ⟨b, sz⟩) v := by
-  obtain ⟨hts, hrr⟩ := anneal_returns_of_bits ha
-  obtain ⟨hsafe, hreach, huniq⟩ := miri_safe_of_path_return hM hMr hemp hop
-  refine ⟨hts, hrr, hsafe, hreach, fun v' hv' => ?_⟩
-  have := huniq _ hv'
-  injection this
-
-theorem agreeUB_of_obs_path {body : CapturedMir} {H : AnnealMiriHooks}
-    {entryA : MachineState} {entryM mₙ m' : AnnealStepState} {N : Nat}
-    {e : Miri.Interpreter.StepError}
-    (ha : annealIsUB (runAnnealBounded body N entryA) = true)
-    (hM : MiriPath H entryM mₙ) (hMe : H.coreStep () mₙ = (m', .error e))
-    (hub : Miri.Interpreter.RunLoop.reportsUB e = true) :
-    AgreeUB body H entryA entryM := by
-  obtain ⟨hub', hns⟩ := anneal_ub_of_obs ha
-  have h := miri_outcome_of_path_error hM hMe
-  rw [classifyError_eq_ub_iff.2 ⟨hub, rfl⟩] at h
-  exact ⟨hub', hns, ⟨e, h.1⟩, h.2⟩
 
 /-- `runMiriBoundedLM2_2` returns transfer to `RunLoop` returns. -/
 theorem runLoopFuel_of_runMiriBoundedLM2_2 {body : CapturedMir} {n : Nat} {m m' : AnnealStepState}
@@ -670,6 +877,49 @@ theorem w2_padded_struct_returns :
   have := huniq _ hv'
   injection this
 
+/-- `runMiriBounded` returns transfer to `RunLoop` returns of `annealMiriHooks`. -/
+theorem runLoopFuel_of_runMiriBounded {body : CapturedMir} {n : Nat} {m m' : AnnealStepState}
+    {v : Miri.Interpreter.Operand AnnealProv}
+    (h : runMiriBounded body n m = .returned m' (.ok v)) :
+    runLoopFuel (annealMiriHooks body) n m = .returned m' (.ok v) := by
+  induction n generalizing m with
+  | zero => cases h
+  | succ n ih =>
+    rw [runLoopFuel_succ, miriIter_eq]
+    simp only [annealMiriHooks, AnnealMiriHooks.ofHooks]
+    rcases hc : Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m with
+      ⟨m₁, (e | (_ | _))⟩
+    · simp only [runMiriBounded, hc] at h; cases h
+    · simp only [runMiriBounded, hc] at h; cases h
+    · simp only [runMiriBounded, hc] at h
+      simp only [stepToIteration]
+      cases hemp : m₁.stack.frames.isEmpty
+      · simp only [hemp, Bool.false_eq_true, ↓reduceIte] at h ⊢
+        exact ih h
+      · simp only [hemp, ↓reduceIte] at h ⊢
+        injection h with h₁ h₂
+        rw [h₁, h₂]
+
+/-- `LM-2.1` arrays (`pass_array_index_and_mutation`, `lm21FullFnBody`): from the
+entry state, `[i32; 3]`, `[bool; 2]`, and `[char; 2]` locals with
+`ConstantIndex` writes and reads, a safe `Index` read `_5 = copy _1[_4]`, a
+`ConstantIndex` move, and `25 + (-3)` run to a normal return of `22_i32` in
+both machines. -/
+theorem w2_array_index_returns :
+    AgreeReturns Witness.lm21FullFnBody (annealMiriHooks Witness.lm21FullFnBody)
+      (initMachineState Witness.lm21FullFnBody []) (miriEntryState Witness.lm21FullFnBody)
+      (.scalar ⟨22, 4⟩)
+      (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt32 22)))) := by
+  obtain ⟨mem', m', _, ha, hm, _⟩ := Witness.lm21_signed_bool_char_runBounded_return
+  have hentry : miriEntryState Witness.lm21FullFnBody = Witness.lm21FullFnInitMiri := rfl
+  have hloop := runLoopFuel_of_runMiriBounded hm
+  rw [← hentry] at hloop
+  obtain ⟨hts, ⟨tr, hrr⟩, _⟩ := anneal_safe_of_runAnnealBounded_returned ha
+  obtain ⟨hsafe, hreach, huniq⟩ := miri_safe_of_runLoopFuel_returned hloop
+  refine ⟨hts, ⟨tr, mem', hrr⟩, hsafe, hreach, fun v' hv' => ?_⟩
+  have := huniq _ hv'
+  injection this
+
 /-- `LM-2.1` array `Index` out of bounds (`_2 = 3_usize` on `[u16; 3]`):
 both machines reach undefined behavior from the state before the read. -/
 theorem w2_array_index_oob_ub :
@@ -693,6 +943,25 @@ theorem w2_union_uninit_bytes_ub :
     (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _)))
     herr rfl
 
+/-- `LM-2.4` union initialized prefix (`I-11`, block `1` of `lm24Body`):
+`_1 = U { a: 5_u8 }` and `_2 = copy (_1.0: u8)` step both machines in lockstep to
+`StateRelLM2_4`-related states with `_2 = 5_u8`: reading the initialized
+prefix is defined in both machines (contrast `w2_union_uninit_bytes_ub`). -/
+theorem w2_union_init_prefix_read :
+    ∃ m₂,
+      AgreeReaches Witness.lm24Body
+        (.ofHooks (annealStepHooksLM2_4 Witness.lm24Body.localDecls Witness.lm24Body.layouts)
+          annealControlHooks)
+        (Witness.lm24InitAnneal 1) Witness.lm24Bb1S2 (Witness.lm24InitMiri 1) m₂ ∧
+      StateRelLM2_4 Witness.lm24Body Witness.lm24Bb1S2 m₂ ∧
+      get? Witness.lm24Bb1S2.frame.locals 2 = some (.init (.scalar ⟨5, 1⟩)) := by
+  obtain ⟨m₁, m₂, hm₁, _, hm₂, hrel₂, hget⟩ := Witness.lm24_write_read_same_field_steps
+  obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
+  exact ⟨m₂, agreeReaches_of_paths
+    (.step .silent Witness.lm24_bb1_anneal₁ (.step .silent Witness.lm24_bb1_anneal₂ (.refl _)))
+    (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _))),
+    hrel₂, hget⟩
+
 /-! ## 6. Intrinsics (memory) -/
 
 /-- `CopyNonOverlapping` with overlapping source and destination
@@ -708,34 +977,154 @@ theorem w6_copy_nonoverlapping_overlap_ub :
     (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _)) herr rfl
 
 
+/-- Valid `CopyNonOverlapping` between disjoint allocations
+(`pass_copy_nonoverlapping_disjoint_locals`, `copyDistinctBody`): both machines
+take the reborrow and copy steps in lockstep to `StateRelLM3_1`-related states,
+and the destination `_2` holds `42_u64` in both (Anneal's local and
+`lean-miri`'s allocation bytes). -/
+theorem w6_copy_nonoverlapping_disjoint_steps :
+    ∃ s₃ m₃,
+      AgreeReaches WitnessLM4_2.copyDistinctBody (annealMiriHooks WitnessLM4_2.copyDistinctBody)
+        (WitnessLM4_2.copy6AnnealPre WitnessLM4_2.copyDistinctBody true) s₃
+        (WitnessLM4_2.copy6MiriPre WitnessLM4_2.copyDistinctBody true) m₃ ∧
+      get? s₃.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩)) ∧
+      ∃ la msc,
+        m₃.machine.memory.live.find? (fun x => x.1 == Witness.lm31AllocId2) =
+          some (Witness.lm31AllocId2, la) ∧
+        ScalarRel ⟨42, 8⟩ msc ∧
+        la.allocation.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes 8)) false =
+          .ok (.fromScalarInt msc) := by
+  obtain ⟨s₁, s₂, s₃, m₁, m₂, m₃, hs₁, hm₁, _, hs₂, hm₂, _, hs₃, hm₃, hrel₃, hget, hmem⟩ :=
+    WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_ok
+  obtain ⟨tf₃, htf₃, _⟩ := id hrel₃
+  exact ⟨s₃, m₃, agreeReaches_of_paths
+    (.step .silent hs₁ (.step .silent hs₂ (.step .silent hs₃ (.refl _))))
+    (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_step_ok_true hm₃)
+      (.step hm₃ (frames_ne_of_eq_singleton htf₃) (.refl _)))),
+    hget, hmem⟩
+
+/-- `write_bytes::<u64>(ptr, 0xAB, 1)` (`LM-4.2`, `writeBytesMutBody 0xAB 1`): both
+machines take the reborrow and the intrinsic call in lockstep to
+`StateRelLM3_1`-related states, with `_1 = 0xABABABABABABABAB`. (The call's
+`()` result in `_0` is a zero-sized return, outside the certified return
+correspondence, `H1`.) -/
+theorem w6_write_bytes_steps :
+    ∃ s₂ m₂,
+      AgreeReaches (WitnessLM4_2.writeBytesMutBody 0xAB 1)
+        (annealMiriHooks (WitnessLM4_2.writeBytesMutBody 0xAB 1))
+        (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 1)) s₂
+        (WitnessLM4_2.ptr4MiriPre (WitnessLM4_2.writeBytesMutBody 0xAB 1) WitnessLM4_2.unitK) m₂ ∧
+      get? s₂.frame.locals 1 = some (.init (.scalar ⟨0xABABABABABABABAB, 8⟩)) := by
+  obtain ⟨s₁, s₂, m₁, m₂, hs₁, hm₁, _, hs₂, hm₂, hrel₂, hget⟩ :=
+    WitnessLM4_2.wit_lm4_2_write_bytes_ok
+  obtain ⟨tf₂, htf₂, _⟩ := id hrel₂
+  exact ⟨s₂, m₂, agreeReaches_of_paths (.step .silent hs₁ (.step .silent hs₂ (.refl _)))
+    (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_eq_singleton htf₂) (.refl _))),
+    hget⟩
+
+/-- `write_bytes::<u64>(ptr, 0xAB, 2)` past the end of `_1` (`ub_write_bytes_oob`)
+is undefined behavior in both machines. -/
+theorem w6_write_bytes_oob_ub :
+    AgreeUB (WitnessLM4_2.writeBytesMutBody 0xAB 2)
+      (annealMiriHooks (WitnessLM4_2.writeBytesMutBody 0xAB 2))
+      (WitnessLM4_2.ptr4AnnealPre (WitnessLM4_2.writeBytesMutBody 0xAB 2))
+      (WitnessLM4_2.ptr4MiriPre (WitnessLM4_2.writeBytesMutBody 0xAB 2) WitnessLM4_2.unitK) := by
+  obtain ⟨s₁, m₁, m₂, msg, hs₁, hm₁, hrel₁, hfail, herr⟩ := WitnessLM4_2.wit_lm4_2_write_bytes_oob_ub
+  obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
+  exact agreeUB_of_paths (p := 0) rfl rfl (.step .silent hs₁ (.refl _)) hfail
+    (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _)) herr rfl
+
 /-- `I-11` (`pass_tb_unsafe_cell_shared_mutation`): through `&UnsafeCell<u32>`
 (a `Cell` tag), a foreign write through an unrelated raw pointer leaves the
 shared reborrow usable and Anneal's whole program returns `7_u32`; through `&u32`
 (a `Frozen` tag) the same foreign write disables the reborrow and the child read
-is undefined behavior. `lean-miri`'s Tree Borrows tree accesses agree step by
-step (`WitnessLM3_3.wit_lm3_3_unsafe_cell_vs_freeze_real_steps`: `Completed`
-accesses for `Cell`, `ChildAccessForbidden Disabled` for `Frozen`). -/
+is undefined behavior. At every step of both executions `lean-miri`'s Tree
+Borrows tree (`basedNormalTree` of Anneal's borrow table) agrees through
+`TreeBorrowsRel`: the foreign write is a `Completed` access in both trees, and
+the child read is `Completed` under `Cell` but the transition error
+`ChildAccessForbidden Disabled` under `Frozen`
+(`WitnessLM3_3.wit_lm3_3_unsafe_cell_vs_freeze_real_steps`). -/
 theorem w4_unsafe_cell_vs_freeze :
-    (TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD) ∧
+    ((TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD) ∧
       ∃ tr mem, ReachesRet (mirTree (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD)
         tr (.normal (.scalar ⟨7, 4⟩, mem))) ∧
-    (MirReachesUB (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD) ∧
-      ¬ TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD)) :=
-  ⟨anneal_returns_of_bits (body := WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) (N := 6)
+     ∃ s₂ s₃ : MachineState,
+      AnnealPath (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD s₂ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) s₂ = .step s₃ ∧
+      s₂.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .cell] ∧
+      s₃.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .cell] ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status = .Completed) ∧
+    ((MirReachesUB (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD) ∧
+      ¬ TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD)) ∧
+     ∃ s₂ s₃ : MachineState,
+      AnnealPath (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD s₂ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.u32T) s₂ = .step s₃ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.u32T) s₃ = .fail .ub ∧
+      s₂.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .frozen] ∧
+      s₃.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .disabled] ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden .Disabled)) := by
+  obtain ⟨⟨c₁, c₂, c₃, c₄, hc₁, _, hc₂, hcb₂, hc₃, hcb₃, hc₄, _, hcw, hcrel, hcr⟩,
+    ⟨f₁, f₂, f₃, hf₁, _, hf₂, hfb₂, hf₃, hfb₃, hfail, hfw, hfrel, hfr⟩⟩ :=
+    WitnessLM3_3.wit_lm3_3_unsafe_cell_vs_freeze_real_steps
+  refine ⟨⟨anneal_returns_of_bits (body := WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) (N := 6)
       (s := WitnessLM3_3.initD) (sz := 4) (b := 7) (by decide),
-    anneal_ub_of_obs (body := WitnessLM3_3.bodyD SimLM3_3.u32T) (N := 6) (s := WitnessLM3_3.initD)
-      (by decide)⟩
+      c₂, c₃, .step .silent hc₁ (.step .silent hc₂ (.refl _)), hc₃, hcb₂, hcb₃,
+      hcw, hcrel, hcr⟩,
+    ⟨anneal_ub_of_obs (body := WitnessLM3_3.bodyD SimLM3_3.u32T) (N := 6) (s := WitnessLM3_3.initD)
+      (by decide),
+      f₂, f₃, .step .silent hf₁ (.step .silent hf₂ (.refl _)), hf₃, hfail, hfb₂, hfb₃,
+      hfw, hfrel, hfr⟩⟩
 
 /-- Protected `ReservedFrz` conflict (`LM-3.3`): after a function-entry retag
-protects a `ReservedFrz` child, a foreign read sets its `conflicted` latch and
-the protected child write is undefined behavior for Anneal's whole program;
-`lean-miri`'s tree write from the protected node is the transition error
-`ChildAccessForbidden (ReservedFrz true)`
-(`WitnessLM3_3.wit_lm3_3_protected_conflict_ub_real_steps`). -/
+protects a `ReservedFrz` child (`activeProtectors = [1]`), a foreign read sets
+its `conflicted` latch and the protected child write is undefined behavior for
+Anneal's whole program. `lean-miri`'s Tree Borrows tree agrees through
+`TreeBorrowsRel`: the foreign read is a `Completed` access, and the write from
+the protected node is the transition error `ChildAccessForbidden (ReservedFrz
+true)` (`WitnessLM3_3.wit_lm3_3_protected_conflict_ub_real_steps`). -/
 theorem w4_protected_reservedFrz_conflict_ub :
-    MirReachesUB (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC) ∧
-      ¬ TreeSafe (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC) :=
-  anneal_ub_of_obs (body := WitnessLM3_3.bodyB) (N := 6) (s := WitnessLM3_3.initBC) (by decide)
+    (MirReachesUB (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC) ∧
+      ¬ TreeSafe (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC)) ∧
+    ∃ s₂ s₃ s₄ : MachineState,
+      AnnealPath WitnessLM3_3.bodyB WitnessLM3_3.initBC s₂ ∧
+      stepMirFn WitnessLM3_3.bodyB s₂ = .step s₃ ∧ stepMirFn WitnessLM3_3.bodyB s₃ = .step s₄ ∧
+      stepMirFn WitnessLM3_3.bodyB s₄ = .fail .ub ∧
+      s₂.memory.activeProtectors = [1] ∧
+      s₄.memory.borrows =
+        [SimLM3_3.entry 3 .frozen, SimLM3_3.entry 2 (.reservedFrz true) (some 1) (some 1),
+          SimLM3_3.entry 1 .reserved] ∧
+      TreeBorrowsRel s₃.memory.borrows [1] (basedNormalTree s₃.memory.borrows [1]) ∧
+      ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₄.memory.borrows [1]
+        ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Write
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden (.ReservedFrz true)) := by
+  obtain ⟨s₁, s₂, s₃, s₄, h₁, _, h₂, _, hprot, _, h₃, _, h₄, hb₄, _, hfail, hrel₃, hread, hrel₄,
+    hwrite⟩ := WitnessLM3_3.wit_lm3_3_protected_conflict_ub_real_steps
+  exact ⟨anneal_ub_of_obs (body := WitnessLM3_3.bodyB) (N := 6) (s := WitnessLM3_3.initBC)
+      (by decide),
+    s₂, s₃, s₄, .step .silent h₁ (.step .silent h₂ (.refl _)), h₃, h₄,
+    hfail, hprot, hb₄, hrel₃, hread, hrel₄, hwrite⟩
 
 /-! ## 5. Multi-frame calls -/
 
@@ -771,17 +1160,50 @@ def callFiveBody : CapturedMir :=
 which returns `5_u8` into `_1`; the caller returns `5_u8`. Both machines run the
 whole program from their entry states (Anneal with `crate::five` as a callee). -/
 theorem w5_call_return :
-    (miriSystem (callHooks callFiveBody [fiveBody])).Safe (miriEntryState callFiveBody) ∧
-    (miriSystem (callHooks callFiveBody [fiveBody])).PartialCorrect (miriEntryState callFiveBody)
-      (fun v => operandScalarBits? 1 v = some 5) ∧
-    TreeSafe (mirTree callFiveBody (initMachineStateWithCallees callFiveBody [] [fiveBody])) ∧
-    ∃ tr mem, ReachesRet (mirTree callFiveBody (initMachineStateWithCallees callFiveBody [] [fiveBody]))
-      tr (.normal (.scalar ⟨5, 1⟩, mem)) := by
-  have hm := miri_returns_of_bits (H := callHooks callFiveBody [fiveBody]) (N := 8)
-    (m := miriEntryState callFiveBody) (sz := 1) (b := 5) (by decide +kernel)
-  have ha := anneal_returns_of_bits (body := callFiveBody) (N := 8)
-    (s := initMachineStateWithCallees callFiveBody [] [fiveBody]) (sz := 1) (b := 5) (by decide)
-  exact ⟨hm.1, hm.2.1, ha⟩
+    AgreeReturnsBits callFiveBody (callHooks callFiveBody [fiveBody])
+      (initMachineStateWithCallees callFiveBody [] [fiveBody]) (miriEntryState callFiveBody) 1 5 :=
+  agreeReturnsBits_of_obs (N := 8) (M := 8) (by decide) (by decide +kernel)
+
+/-- The `LM-4.1` interpreter at the callee-return state of `witCallerBody`,
+whose callee frame holds the function-entry protector `CallId 1`. -/
+def protReturnHooks : AnnealMiriHooks :=
+  multiFrameHooks WitnessLM4_1.witCallerBody fun c m =>
+    Miri.Interpreter.Step.step
+      (annealStepHooksLM4_1
+        (activeMirBody WitnessLM4_1.witCallerBody WitnessLM4_1.witCalleeReadyToReturnAnneal)
+        WitnessLM4_1.witCalleeReadyToReturnAnneal.memory.callees
+        (annealPoppedFrameState WitnessLM4_1.witCalleeReadyToReturnAnneal)) c m
+
+/-- **Protector release on return** (`Terminator.Return` with
+`GlobalState.endCall`, `LM-4.1`): from the callee-return state, whose callee
+frame is protected by `CallId 1`, one Anneal transition and one `miriSystem`
+transition (`RunLoop.iteration`) pop the callee frame into
+`MultiFrameStateRel`-related caller states; `GlobalState.endCall` empties the
+borrow tracker's `protectedTags`, and Anneal's `activeProtectors` and
+`callStack` become empty. -/
+theorem w5_protector_release_step :
+    ∃ s' m',
+      CoStep (stepMirState WitnessLM4_1.witCallerBody)
+        (.running WitnessLM4_1.witCalleeReadyToReturnAnneal) (.running s') ∧
+      (miriSystem protReturnHooks).step WitnessLM4_1.witCalleeReadyToReturnMiri m' ∧
+      MultiFrameStateRel WitnessLM4_1.witCallerBody s' m' ∧
+      s'.memory.activeProtectors = [] ∧ s'.memory.callStack = [] ∧
+      ∃ tracker', m'.machine.borrowTracker = some tracker' ∧
+        tracker'.global.protectedTags.entries = #[] := by
+  obtain ⟨hrel, ⟨s', hs', hcs, hprot, _, _⟩, _, ⟨tracker', htr, hpt, _, _⟩⟩ :=
+    WitnessLM4_1.wit_lm4_1_callee_return_simulation
+  generalize hmr : Miri.Interpreter.Step.step
+    (annealStepHooksLM4_1
+      (activeMirBody WitnessLM4_1.witCallerBody WitnessLM4_1.witCalleeReadyToReturnAnneal)
+      WitnessLM4_1.witCalleeReadyToReturnAnneal.memory.callees
+      (annealPoppedFrameState WitnessLM4_1.witCalleeReadyToReturnAnneal))
+    () WitnessLM4_1.witCalleeReadyToReturnMiri = mRes at hrel htr
+  rw [hs'] at hrel
+  cases hrel with
+  | step _ m' hmf =>
+    exact ⟨s', m', coStep_of_emitStep (obs := .silent) hs',
+      miriSystem_step_of_coreStep (H := protReturnHooks) hmr hmf.frames_ne_empty, hmf, hprot, hcs,
+      tracker', htr, hpt⟩
 
 /-- Callee `crate::stuck`: `bb0: unreachable`. -/
 def stuckBody : CapturedMir :=
@@ -798,14 +1220,9 @@ def callStuckBody : CapturedMir :=
 
 /-- Reaching `Unreachable` inside a callee frame is undefined behavior in both machines. -/
 theorem w5_callee_unreachable_ub :
-    (∃ e, (miriSystem (callHooks callStuckBody [stuckBody])).ReachesOutcome
-      (miriEntryState callStuckBody) (.undefinedBehavior e)) ∧
-    MirReachesUB (mirTree callStuckBody (initMachineStateWithCallees callStuckBody [] [stuckBody])) := by
-  have hm := miri_ub_of_obs (H := callHooks callStuckBody [stuckBody]) (N := 4)
-    (m := miriEntryState callStuckBody) (by decide +kernel)
-  have ha := anneal_ub_of_obs (body := callStuckBody) (N := 4)
-    (s := initMachineStateWithCallees callStuckBody [] [stuckBody]) (by decide)
-  exact ⟨hm.1, ha.1⟩
+    AgreeUB callStuckBody (callHooks callStuckBody [stuckBody])
+      (initMachineStateWithCallees callStuckBody [] [stuckBody]) (miriEntryState callStuckBody) :=
+  agreeUB_of_obs (N := 4) (M := 4) (by decide) (by decide +kernel)
 
 /-- Callee `crate::noret`: `bb0: return` with `_0` never written. -/
 def noRetBody : CapturedMir :=
@@ -822,13 +1239,8 @@ def callNoRetBody : CapturedMir :=
 
 /-- Returning from a callee whose `_0` is uninitialized is undefined behavior in both machines. -/
 theorem w5_callee_uninit_return_ub :
-    (∃ e, (miriSystem (callHooks callNoRetBody [noRetBody])).ReachesOutcome
-      (miriEntryState callNoRetBody) (.undefinedBehavior e)) ∧
-    MirReachesUB (mirTree callNoRetBody (initMachineStateWithCallees callNoRetBody [] [noRetBody])) := by
-  have hm := miri_ub_of_obs (H := callHooks callNoRetBody [noRetBody]) (N := 4)
-    (m := miriEntryState callNoRetBody) (by decide +kernel)
-  have ha := anneal_ub_of_obs (body := callNoRetBody) (N := 4)
-    (s := initMachineStateWithCallees callNoRetBody [] [noRetBody]) (by decide)
-  exact ⟨hm.1, ha.1⟩
+    AgreeUB callNoRetBody (callHooks callNoRetBody [noRetBody])
+      (initMachineStateWithCallees callNoRetBody [] [noRetBody]) (miriEntryState callNoRetBody) :=
+  agreeUB_of_obs (N := 4) (M := 4) (by decide) (by decide +kernel)
 
 end LeanMiriSpec.Correspondence.MiriDiffWitnesses
