@@ -71,14 +71,35 @@ theorem BorrowsOk.perm_eq {body : CapturedMir} {ctx : Ctx} {view : List LocalSlo
     {s : MachineState} {lm : Map Gen.LocalName Ptr} (hb : BorrowsOk body ctx view s lm)
     {e : BorrowEntry} (he : e ∈ s.memory.borrows) :
     ∃ mutbl, (e.perm = rawPtrPerm mutbl ∨ (mutbl = .mut ∧ e.perm = .reserved) ∨
-      e.perm = .disabled) ∧ e.rangeOffset = 0 ∧ e.rangeLen = 0 := by
+      e.perm = .disabled) ∧ e.protector = none ∧ e.rangeOffset = 0 ∧ e.rangeLen = 0 := by
   obtain ⟨mutbl, _, _, heq | ⟨hm, heq⟩ | heq, _, _⟩ := hb.entries_ok e he
   · exact ⟨mutbl, .inl (congrArg BorrowEntry.perm heq),
+      congrArg BorrowEntry.protector heq,
       congrArg BorrowEntry.rangeOffset heq, congrArg BorrowEntry.rangeLen heq⟩
   · exact ⟨mutbl, .inr (.inl ⟨hm, congrArg BorrowEntry.perm heq⟩),
+      congrArg BorrowEntry.protector heq,
       congrArg BorrowEntry.rangeOffset heq, congrArg BorrowEntry.rangeLen heq⟩
   · exact ⟨mutbl, .inr (.inr (congrArg BorrowEntry.perm heq)),
+      congrArg BorrowEntry.protector heq,
       congrArg BorrowEntry.rangeOffset heq, congrArg BorrowEntry.rangeLen heq⟩
+
+theorem borrowEntry_form_of_unranged (e : BorrowEntry)
+    (hprot : e.protector = none) (hroff : e.rangeOffset = 0) (hrlen : e.rangeLen = 0) :
+    ∃ mutbl : MirAst.Mutability,
+      e = { rawPtrEntry e.tag mutbl ⟨e.targetLocal, e.targetProjection⟩ with
+            parentTag := e.parentTag } ∨
+      (mutbl = .mut ∧ e = { rawPtrEntry e.tag .mut ⟨e.targetLocal, e.targetProjection⟩ with
+                            perm := .reserved, parentTag := e.parentTag }) ∨
+      e = { rawPtrEntry e.tag mutbl ⟨e.targetLocal, e.targetProjection⟩ with
+            perm := .disabled, parentTag := e.parentTag } := by
+  rcases e with ⟨tag, tloc, tproj, perm, prot, roff, rlen, ptag⟩
+  dsimp only at hprot hroff hrlen ⊢
+  subst hprot hroff hrlen
+  cases perm with
+  | active => exact ⟨.mut, .inl rfl⟩
+  | frozen => exact ⟨.not, .inl rfl⟩
+  | reserved => exact ⟨.mut, .inr (.inl ⟨rfl, rfl⟩)⟩
+  | disabled => exact ⟨.mut, .inr (.inr rfl)⟩
 
 /-- Updating local `i` to `slot'` and its abstract state to `st'` while extending
 the borrow table monotonically on existing tags preserves `PtrEnvOk`. -/
@@ -113,8 +134,8 @@ theorem PtrEnvOk.setPtrLocal {body : CapturedMir} {view : List LocalSlot}
       dsimp only [removePeerFromState, PtrLocalOk]
       intro dp pv hdp hpty hv
       rw [List.getElem?_set_ne (Ne.symm hpi)] at hv
-      obtain ⟨⟨entry, hlk, hndis, ht⟩, hpeers⟩ := hp_ok dp pv hdp hpty hv
-      refine ⟨⟨entry, hext_lk pv.tag entry hlk, hndis, ht⟩, ?_⟩
+      obtain ⟨⟨entry, hlk, hndis, hnf, ht⟩, hpeers⟩ := hp_ok dp pv hdp hpty hv
+      refine ⟨⟨entry, hext_lk pv.tag entry hlk, hndis, hnf, ht⟩, ?_⟩
       intro r hr dr pv_r hdr hptr hvr
       simp only [List.mem_filter, bne_iff_ne, ne_eq] at hr
       rw [List.getElem?_set_ne (Ne.symm hr.2)] at hvr
@@ -226,7 +247,7 @@ theorem LocalsOk.rawPtr_extend {body : CapturedMir} {ctx : Ctx} {view : List Loc
   obtain ⟨⟨mutbl, pointeeIt⟩, hpt⟩ : ∃ r, ptrPointeeOf d.ty = some r := by
     unfold isPtrTy at hpty
     exact Option.isSome_iff_exists.mp hpty
-  obtain ⟨entry, _, _, hlookup, _, _⟩ := hb.ptr_slots i d mutbl pointeeIt pv hd hpt hv
+  obtain ⟨entry, _, _, hlookup, _⟩ := hb.ptr_slots i d mutbl pointeeIt pv hd hpt hv
   obtain ⟨hmem, htag⟩ := lookupBorrow_mem_and_tag hlookup
   have hlt := hb.tags_lt entry hmem
   have hne : e.tag ≠ pv.allocId := by
@@ -329,7 +350,17 @@ theorem BorrowsOk.directBorrow {body : CapturedMir} {ctx : Ctx} {view : List Loc
     rw [List.getElem?_set_self hi_vlt] at hv
     simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hv
     obtain ⟨rfl, -⟩ := hv
-    refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2,
+    have hnf_i : isMutPtrLocal body.localDecls i = true → entry.perm ≠ .frozen := by
+      intro hmut_i
+      have hmut : mutbl = .mut := by
+        unfold isMutPtrLocal at hmut_i
+        rw [hdi] at hmut_i
+        dsimp only [Option.bind_eq_bind, Option.bind_some] at hmut_i
+        rw [hpt_i] at hmut_i
+        cases mutbl <;> simp at hmut_i <;> rfl
+      subst hmut
+      rcases hentry with rfl | ⟨_, rfl⟩ <;> simp [rawPtrEntry, rawPtrPerm]
+    refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2, hnf_i,
       fun q' hq' => by
         injection hq' with hq'
         rw [← hq', hentry_fields.2.1, hentry_fields.2.2.1]⟩, ?_⟩
@@ -352,16 +383,12 @@ theorem BorrowsOk.directBorrow {body : CapturedMir} {ctx : Ctx} {view : List Loc
       rw [hpt_i] at hpt
       simp only [Option.some.injEq, Prod.mk.injEq] at hpt
       obtain ⟨rfl, rfl⟩ := hpt
-      refine ⟨entry, relOff, rfl, hself_lk, fun hm => ?_, ?_⟩
-      · subst hm
-        rcases hentry with rfl | ⟨_, rfl⟩
-        · exact .inl rfl
-        · exact .inr (.inl rfl)
-      · rwa [hentry_fields.2.1, hentry_fields.2.2.1]
+      refine ⟨entry, relOff, rfl, hself_lk, ?_⟩
+      rwa [hentry_fields.2.1, hentry_fields.2.2.1]
     · rw [List.getElem?_set_ne hip] at hv
-      obtain ⟨entry', relOff', hoff, hlookup, hact, htspec⟩ :=
+      obtain ⟨entry', relOff', hoff, hlookup, htspec⟩ :=
         hb.ptr_slots p dp mutbl' pointeeIt' ptrVal hdp hpt hv
-      exact ⟨entry', relOff', hoff, hext_lk ptrVal.tag entry' hlookup, hact, htspec⟩
+      exact ⟨entry', relOff', hoff, hext_lk ptrVal.tag entry' hlookup, htspec⟩
 
 /-- `BorrowsOk` after `_i = &raw mutbl q` pushed the entry
 `rawPtrEntry nextTag mutbl q` and stored its tag in the pointer local `_i`. -/
@@ -407,6 +434,74 @@ theorem directBorrowOf_eq_none_of_reborrowParentOf {rv : Rvalue} {p : Nat}
       cases ph <;> first | rfl | (simp [reborrowParentOf] at hrb)
   | _ => simp [reborrowParentOf] at hrb
 
+theorem BorrowsOk.freezeRead {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
+    {s : MachineState} {lm : Map Gen.LocalName Ptr} (hb : BorrowsOk body ctx view s lm)
+    (targetLocal : Nat) (readerTag : Option Nat) (targetProjection : List ProjectionElem)
+    (rangeOffset rangeLen : Nat) :
+    let borrows' := MirSemantics.freezeTreeBorrowsOnReadAtProj s.memory.borrows s.memory.borrows
+      targetLocal readerTag targetProjection rangeOffset rangeLen
+    (∀ e' ∈ borrows', e'.tag < s.memory.nextTag) ∧
+    (∀ e' ∈ borrows',
+      ∃ (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType) (relOff : Nat),
+        (e' = { rawPtrEntry e'.tag mutbl ⟨e'.targetLocal, e'.targetProjection⟩ with
+                parentTag := e'.parentTag } ∨
+          (mutbl = .mut ∧
+            e' = { rawPtrEntry e'.tag .mut ⟨e'.targetLocal, e'.targetProjection⟩ with
+                   perm := .reserved, parentTag := e'.parentTag }) ∨
+          e' = { rawPtrEntry e'.tag mutbl ⟨e'.targetLocal, e'.targetProjection⟩ with
+                 perm := .disabled, parentTag := e'.parentTag }) ∧
+        e'.targetLocal ∈ bodyAddrTakenLocals body ∧
+        ptrTargetSpec body.layouts body.localDecls ⟨e'.targetLocal, e'.targetProjection⟩ =
+          some (pointeeIt, relOff)) ∧
+    (∀ (p : Nat) (dp : LocalDecl) (mutbl : MirAst.Mutability)
+       (pointeeIt : Gen.IntType) (ptrVal : ProvenancePtr),
+      body.localDecls[p]? = some dp →
+      ptrPointeeOf dp.ty = some (mutbl, pointeeIt) →
+      view[p]? = some (.init (.ptr ptrVal 8)) →
+      ∃ (entry : BorrowEntry) (relOff : Nat),
+        ptrVal.offsetBytes = 0 ∧
+        lookupBorrow borrows' ptrVal.tag = some entry ∧
+        ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
+          some (pointeeIt, relOff)) := by
+  intro borrows'
+  have hmap : borrows' = s.memory.borrows.map
+      (fun e => MirSemantics.updateBorrowPermOnReadAtProj s.memory.borrows e targetLocal readerTag
+        targetProjection rangeOffset rangeLen) :=
+    freezeTreeBorrowsOnReadAtProj_eq_map _ _ _ _ _ _ _
+  have hf := updateBorrowPermOnReadAtProj_freezeOrSelf s.memory.borrows targetLocal readerTag
+    targetProjection rangeOffset rangeLen
+  refine ⟨?_, ?_, ?_⟩
+  · intro e' he'
+    rw [hmap, List.mem_map] at he'
+    obtain ⟨e, he, rfl⟩ := he'
+    rw [hf.tag]
+    exact hb.tags_lt e he
+  · intro e' he'
+    rw [hmap, List.mem_map] at he'
+    obtain ⟨e, he, rfl⟩ := he'
+    obtain ⟨_, pointeeIt, relOff, _, hk_addr, htspec⟩ := hb.entries_ok e he
+    obtain ⟨_, _, hprot, hroff, hrlen⟩ := hb.perm_eq he
+    obtain ⟨mutbl', hform'⟩ := borrowEntry_form_of_unranged _
+      ((hf.protector e).trans hprot) ((hf.rangeOffset e).trans hroff)
+      ((hf.rangeLen e).trans hrlen)
+    refine ⟨mutbl', pointeeIt, relOff, hform', ?_, ?_⟩
+    · rw [hf.targetLocal]; exact hk_addr
+    · rw [hf.targetLocal, hf.targetProjection]; exact htspec
+  · intro p dp mutbl pointeeIt ptrVal hdp hpt hv
+    obtain ⟨e, relOff, hoff, hlk, htspec⟩ := hb.ptr_slots p dp mutbl pointeeIt ptrVal hdp hpt hv
+    refine ⟨MirSemantics.updateBorrowPermOnReadAtProj s.memory.borrows e targetLocal readerTag
+      targetProjection rangeOffset rangeLen, relOff, hoff, ?_, ?_⟩
+    · rw [hmap, hf.lookupBorrow_map, hlk]; rfl
+    · rw [hf.targetLocal, hf.targetProjection]; exact htspec
+
+theorem stepForeignRead_getD_self (decls : List LocalDecl) (env : List PtrLocalState)
+    (p : Nat) (hp : p < decls.length) :
+    (stepForeignRead decls decls.length env p).getD p .disabled = env.getD p .disabled := by
+  rw [stepForeignRead_getD hp]
+  have hkeep : foreignReadKeeps env p p = true := by
+    simp [foreignReadKeeps]
+  simp [hkeep]
+
 /-- `BorrowsOk` after a reborrow statement (`&*_p`, `&mut *_p`,
 `&two_phase mut *_p`, `&raw const *_p`, `&raw mut *_p`) pushed a child entry
 inheriting `parentEntry`'s target place and stored its fresh tag in `_i`. -/
@@ -423,42 +518,84 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
     (parentPtr : ProvenancePtr) (hvp : view[p]? = some (.init (.ptr parentPtr 8)))
     (parentEntry : BorrowEntry)
     (hlk_parent : lookupBorrow s.memory.borrows parentPtr.tag = some parentEntry)
+    (hparent_ndis : parentEntry.perm ≠ .disabled)
     (pointeeIt : Gen.IntType) (relOff : Nat)
     (hspec : ptrTargetSpec body.layouts body.localDecls
       ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ = some (pointeeIt, relOff))
     (hpt_i : ptrPointeeOf d.ty = some (mutbl, pointeeIt))
     (hi_addr : i ∉ bodyAddrTakenLocals body) (locals' : List LocalSlot)
+    {borrowsAfterRead : List BorrowEntry}
+    (hread : (refReborrowParentOf rv = none ∧ borrowsAfterRead = s.memory.borrows) ∨
+      (refReborrowParentOf rv = some p ∧
+        borrowsAfterRead = MirSemantics.freezeTreeBorrowsOnReadAtProj s.memory.borrows
+          s.memory.borrows parentEntry.targetLocal (some parentPtr.tag)
+          parentEntry.targetProjection parentEntry.rangeOffset parentEntry.rangeLen))
     {entry : BorrowEntry}
-    (hentry : entry = rawPtrEntry s.memory.nextTag mutbl
-        ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ ∨
-      (mutbl = .mut ∧ entry = { rawPtrEntry s.memory.nextTag .mut
-        ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ with perm := .reserved })) :
+    (hentry : entry = rawReborrowEntry s.memory.nextTag mutbl parentEntry parentPtr.tag ∨
+      ∃ bkind, borrowKindMutbl bkind = mutbl ∧
+        entry = refReborrowEntry s.memory.nextTag bkind parentEntry parentPtr.tag) :
     BorrowsOk body ctx (view.set i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)))
       (advanceStmt s locals' { s.memory with
-        borrows := entry :: s.memory.borrows,
+        borrows := entry :: borrowsAfterRead,
         nextTag := s.memory.nextTag + 1 }) lm := by
   have hparent_mem := (lookupBorrow_mem_and_tag hlk_parent).1
+  obtain ⟨_, _, _, hparent_roff, hparent_rlen⟩ := hb.perm_eq hparent_mem
   have hentry_fields :
       entry.tag = s.memory.nextTag ∧ entry.targetLocal = parentEntry.targetLocal ∧
-      entry.targetProjection = parentEntry.targetProjection ∧ entry.perm ≠ .disabled := by
-    rcases hentry with rfl | ⟨_, rfl⟩
-    · refine ⟨rfl, rfl, rfl, by cases mutbl <;> simp [rawPtrEntry, rawPtrPerm]⟩
-    · exact ⟨rfl, rfl, rfl, by simp⟩
-  have hself_lk : lookupBorrow (entry :: s.memory.borrows) s.memory.nextTag = some entry := by
-    have hl := lookupBorrow_cons_self entry s.memory.borrows
+      entry.targetProjection = parentEntry.targetProjection ∧ entry.perm ≠ .disabled ∧
+      entry.protector = none ∧ entry.rangeOffset = 0 ∧ entry.rangeLen = 0 ∧
+      (mutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved) := by
+    rcases hentry with rfl | ⟨bkind, hbm, rfl⟩
+    · refine ⟨rfl, rfl, rfl, ?_, rfl, hparent_roff, hparent_rlen, fun hm => ?_⟩
+      · cases mutbl <;> cases hpe : parentEntry.perm <;>
+          simp [rawReborrowEntry, rawReborrowPerm]
+      · subst hm; exact .inl rfl
+    · subst hbm
+      cases bkind <;> refine ⟨rfl, rfl, rfl, ?_, rfl, hparent_roff, hparent_rlen, ?_⟩ <;>
+        simp [refReborrowEntry, refReborrowPerm, borrowKindMutbl]
+  have hself_lk : lookupBorrow (entry :: borrowsAfterRead) s.memory.nextTag = some entry := by
+    have hl := lookupBorrow_cons_self entry borrowsAfterRead
     rwa [hentry_fields.1] at hl
-  have hfresh : ∀ e' ∈ s.memory.borrows, e'.tag ≠ s.memory.nextTag :=
-    fun e' he' h => by have := hb.tags_lt e' he'; omega
+  have hAfter :
+      (∀ e' ∈ borrowsAfterRead, e'.tag < s.memory.nextTag) ∧
+      (∀ e' ∈ borrowsAfterRead,
+        ∃ (mutbl : MirAst.Mutability) (pointeeIt : Gen.IntType) (relOff : Nat),
+          (e' = { rawPtrEntry e'.tag mutbl ⟨e'.targetLocal, e'.targetProjection⟩ with
+                  parentTag := e'.parentTag } ∨
+            (mutbl = .mut ∧
+              e' = { rawPtrEntry e'.tag .mut ⟨e'.targetLocal, e'.targetProjection⟩ with
+                     perm := .reserved, parentTag := e'.parentTag }) ∨
+            e' = { rawPtrEntry e'.tag mutbl ⟨e'.targetLocal, e'.targetProjection⟩ with
+                   perm := .disabled, parentTag := e'.parentTag }) ∧
+          e'.targetLocal ∈ bodyAddrTakenLocals body ∧
+          ptrTargetSpec body.layouts body.localDecls ⟨e'.targetLocal, e'.targetProjection⟩ =
+            some (pointeeIt, relOff)) ∧
+      (∀ (q : Nat) (dq : LocalDecl) (mutbl' : MirAst.Mutability)
+         (pointeeIt' : Gen.IntType) (ptrVal : ProvenancePtr),
+        body.localDecls[q]? = some dq →
+        ptrPointeeOf dq.ty = some (mutbl', pointeeIt') →
+        view[q]? = some (.init (.ptr ptrVal 8)) →
+        ∃ (entry' : BorrowEntry) (relOff' : Nat),
+          ptrVal.offsetBytes = 0 ∧
+          lookupBorrow borrowsAfterRead ptrVal.tag = some entry' ∧
+          ptrTargetSpec body.layouts body.localDecls ⟨entry'.targetLocal, entry'.targetProjection⟩ =
+            some (pointeeIt', relOff')) := by
+    rcases hread with ⟨_, rfl⟩ | ⟨_, rfl⟩
+    · exact ⟨hb.tags_lt, hb.entries_ok, hb.ptr_slots⟩
+    · exact hb.freezeRead parentEntry.targetLocal (some parentPtr.tag)
+        parentEntry.targetProjection parentEntry.rangeOffset parentEntry.rangeLen
+  have hfresh : ∀ e' ∈ borrowsAfterRead, e'.tag ≠ s.memory.nextTag :=
+    fun e' he' h => by have := hAfter.1 e' he'; omega
   obtain ⟨_, _, _, _, hq_addr, _⟩ := hb.entries_ok parentEntry hparent_mem
   have hisPtr_i : isPtrTy d.ty = true := by simp [isPtrTy, hpt_i]
   have hdecl_ptr : isDeclPtrLocal body.localDecls i = true := by
     simp [isDeclPtrLocal, hdi, hisPtr_i]
   have hdb_none := directBorrowOf_eq_none_of_reborrowParentOf hrb
-  have hext_lk : ∀ tag e, lookupBorrow s.memory.borrows tag = some e →
-      lookupBorrow (entry :: s.memory.borrows) tag = some e := by
+  have hext_lk : ∀ tag e, lookupBorrow borrowsAfterRead tag = some e →
+      lookupBorrow (entry :: borrowsAfterRead) tag = some e := by
     intro tag e hlk
     obtain ⟨hmem, htag⟩ := lookupBorrow_mem_and_tag hlk
-    rw [lookupBorrow_cons_ne _ s.memory.borrows tag (by
+    rw [lookupBorrow_cons_ne _ borrowsAfterRead tag (by
       rw [hentry_fields.1, ← htag]
       exact (hfresh e hmem).symm)]
     exact hlk
@@ -472,17 +609,15 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
     simp only [advanceStmt, List.mem_cons] at he' ⊢
     rcases he' with rfl | he'
     · rw [hentry_fields.1]; omega
-    · have := hb.tags_lt e' he'; omega
+    · have := hAfter.1 e' he'; omega
   · intro e' he'
     simp only [advanceStmt, List.mem_cons] at he'
     rcases he' with rfl | he'
-    · refine ⟨mutbl, pointeeIt, relOff, ?_, hentry_fields.2.1 ▸ hq_addr, ?_⟩
-      · rw [hentry_fields.1, hentry_fields.2.1, hentry_fields.2.2.1]
-        rcases hentry with rfl | ⟨hm, rfl⟩
-        · exact .inl rfl
-        · exact .inr (.inl ⟨hm, rfl⟩)
-      · rwa [hentry_fields.2.1, hentry_fields.2.2.1]
-    · exact hb.entries_ok e' he'
+    · obtain ⟨mutbl_e, hform_e⟩ := borrowEntry_form_of_unranged entry
+        hentry_fields.2.2.2.2.1 hentry_fields.2.2.2.2.2.1 hentry_fields.2.2.2.2.2.2.1
+      refine ⟨mutbl_e, pointeeIt, relOff, hform_e, hentry_fields.2.1 ▸ hq_addr, ?_⟩
+      rwa [hentry_fields.2.1, hentry_fields.2.2.1]
+    · exact hAfter.2.1 e' he'
   · intro hfrag k' hk'
     obtain ⟨hnd, hlm, hd⟩ := hb.target_ptrs hfrag k' hk'
     refine ⟨?_, hlm, hd⟩
@@ -492,14 +627,34 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
   · simp only [advanceStmt]
     rw [Nat.add_eq, ptrEnvBefore_succ hbb hst]
     let env := ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx
-    have hstep : ptrStmtStep body.localDecls env st = stepReborrow body.localDecls.length env i p := by
+    have hstep : ptrStmtStep body.localDecls env st =
+        stepReborrow body.localDecls.length
+          (stepReborrowRead body.localDecls body.localDecls.length env rv) i p := by
       simp [ptrStmtStep, hkind, hdecl_ptr, hdb_none, hrb]
     rw [hstep]
+    let envRead := stepReborrowRead body.localDecls body.localDecls.length env rv
+    have hranges : ∀ e ∈ s.memory.borrows, e.rangeLen = 0 :=
+      fun e he => (hb.perm_eq he).2.2.2.2
+    have henvRead_ok : PtrEnvOk body view borrowsAfterRead envRead ∧
+        envRead.getD p .disabled = env.getD p .disabled := by
+      rcases hread with ⟨href_none, rfl⟩ | ⟨href_p, rfl⟩
+      · refine ⟨?_, ?_⟩
+        · dsimp only [envRead, stepReborrowRead]
+          rw [href_none]
+          exact hb.alias_ok
+        · dsimp only [envRead, stepReborrowRead]
+          rw [href_none]
+      · dsimp only [envRead, stepReborrowRead]
+        rw [href_p]
+        refine ⟨hb.alias_ok.foreignRead hranges hdp hp_ptr hvp hlk_parent, ?_⟩
+        exact stepForeignRead_getD_self body.localDecls env p
+          (List.getElem?_eq_some_iff.mp hdp).1
     unfold stepReborrow
     have hp_lt : p < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdp).1
-    have hp_ok := hb.alias_ok p hp_lt
-    refine hb.alias_ok.setPtrLocal hext_lk i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)) _ (fun hi_lt => ?_)
-    cases hst_p : env.getD p .disabled with
+    have hp_ok := henvRead_ok.1 p hp_lt
+    refine henvRead_ok.1.setPtrLocal hext_lk i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)) _
+      (fun hi_lt => ?_)
+    cases hst_p : envRead.getD p .disabled with
     | empty =>
       rw [hst_p] at hp_ok
       exact False.elim (hp_ok dp parentPtr hdp hp_ptr hvp)
@@ -507,7 +662,9 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
       trivial
     | live target peers =>
       rw [hst_p] at hp_ok
-      obtain ⟨⟨entry', hlk', _, ht_parent⟩, _⟩ := hp_ok dp parentPtr hdp hp_ptr hvp
+      have hp_ok_orig := hb.alias_ok p hp_lt
+      rw [← henvRead_ok.2, hst_p] at hp_ok_orig
+      obtain ⟨⟨entry', hlk', _, _, ht_parent⟩, _⟩ := hp_ok_orig dp parentPtr hdp hp_ptr hvp
       rw [hlk_parent] at hlk'
       injection hlk' with heq
       subst heq
@@ -516,7 +673,16 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
       rw [List.getElem?_set_self hi_vlt] at hv
       simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hv
       obtain ⟨rfl, -⟩ := hv
-      refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2,
+      have hnf_i : isMutPtrLocal body.localDecls i = true → entry.perm ≠ .frozen := by
+        intro hmut_i
+        have hmut : mutbl = .mut := by
+          unfold isMutPtrLocal at hmut_i
+          rw [hdi] at hmut_i
+          dsimp only [Option.bind_eq_bind, Option.bind_some] at hmut_i
+          rw [hpt_i] at hmut_i
+          cases mutbl <;> simp at hmut_i <;> rfl
+        rcases hentry_fields.2.2.2.2.2.2.2 hmut with hperm | hperm <;> simp [hperm]
+      refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2.1, hnf_i,
         fun q' hq' => by
           rw [hentry_fields.2.1, hentry_fields.2.2.1]
           exact ht_parent q' hq'⟩, ?_⟩
@@ -539,16 +705,12 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
       rw [hpt_i] at hpt
       simp only [Option.some.injEq, Prod.mk.injEq] at hpt
       obtain ⟨rfl, rfl⟩ := hpt
-      refine ⟨entry, relOff, rfl, hself_lk, fun hm => ?_, ?_⟩
-      · subst hm
-        rcases hentry with rfl | ⟨_, rfl⟩
-        · exact .inl rfl
-        · exact .inr (.inl rfl)
-      · rwa [hentry_fields.2.1, hentry_fields.2.2.1]
+      refine ⟨entry, relOff, rfl, hself_lk, ?_⟩
+      rwa [hentry_fields.2.1, hentry_fields.2.2.1]
     · rw [List.getElem?_set_ne hiq] at hv
-      obtain ⟨entry', relOff', hoff, hlookup, hact, htspec⟩ :=
-        hb.ptr_slots q dq mutbl' pointeeIt' ptrVal hdq hpt hv
-      exact ⟨entry', relOff', hoff, hext_lk ptrVal.tag entry' hlookup, hact, htspec⟩
+      obtain ⟨entry', relOff', hoff, hlookup, htspec⟩ :=
+        hAfter.2.2 q dq mutbl' pointeeIt' ptrVal hdq hpt hv
+      exact ⟨entry', relOff', hoff, hext_lk ptrVal.tag entry' hlookup, htspec⟩
 
 theorem ptrCopySrcOf_of_ptrRvalueOk {layouts : Layout.LayoutTable} {decls : List LocalDecl}
     {mutbl : MirAst.Mutability} {pointeeIt : Gen.IntType} {isRef : Bool} {rv : Rvalue}
@@ -632,7 +794,8 @@ theorem PtrEnvOk.stepPtrCopy {body : CapturedMir} {view : List LocalSlot}
     (hlen : view.length = body.localDecls.length)
     (i p : Nat) (pv : ProvenancePtr) {dp : LocalDecl}
     (hdp : body.localDecls[p]? = some dp) (hp_ptr : isPtrTy dp.ty = true)
-    (hvp : view[p]? = some (.init (.ptr pv 8))) :
+    (hvp : view[p]? = some (.init (.ptr pv 8)))
+    (hmut_ip : isMutPtrLocal body.localDecls i = true → isMutPtrLocal body.localDecls p = true) :
     PtrEnvOk body (view.set i (.init (.ptr pv 8))) borrows
       (Correspondence.stepPtrCopy body.localDecls.length env i p) := by
   have hp_lt : p < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdp).1
@@ -662,13 +825,14 @@ theorem PtrEnvOk.stepPtrCopy {body : CapturedMir} {view : List LocalSlot}
         trivial
       | live target peers =>
         rw [hst_p] at hp_ok
-        obtain ⟨hent_p, hpeers_p⟩ := hp_ok dp pv hdp hp_ptr hvp
+        obtain ⟨⟨entry_p, hlk_p, hndis_p, hnf_p, ht_p⟩, hpeers_p⟩ := hp_ok dp pv hdp hp_ptr hvp
         dsimp only [addPeerToState, PtrLocalOk]
         intro _ pv_q _ _ hvq
         rw [List.getElem?_set_self hq_vlt] at hvq
         simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvq
         obtain ⟨rfl, -⟩ := hvq
-        refine ⟨hent_p, fun r hr dr pv_r hdr hptr hvr => ?_⟩
+        refine ⟨⟨entry_p, hlk_p, hndis_p, fun hm => hnf_p (hmut_ip hm), ht_p⟩,
+          fun r hr dr pv_r hdr hptr hvr => ?_⟩
         by_cases hri : r = q
         · subst hri
           rw [List.getElem?_set_self hq_vlt] at hvr
@@ -745,6 +909,7 @@ theorem BorrowsOk.ptrCopy {body : CapturedMir} {ctx : Ctx} {view : List LocalSlo
     {i p : Nat} {d dp : LocalDecl} (hdi : body.localDecls[i]? = some d)
     (hi_ptr : isPtrTy d.ty = true)
     (hdp : body.localDecls[p]? = some dp) (hp_ptr : isPtrTy dp.ty = true)
+    (hmut_ip : isMutPtrLocal body.localDecls i = true → isMutPtrLocal body.localDecls p = true)
     {rv : Rvalue} (hkind : st.kind = .assign ⟨i, []⟩ rv)
     (hdb_none : directBorrowOf rv = none) (hrb_none : reborrowParentOf rv = none)
     (hsrc_p : ptrCopySrcOf body.localDecls rv = some p)
@@ -756,7 +921,6 @@ theorem BorrowsOk.ptrCopy {body : CapturedMir} {ctx : Ctx} {view : List LocalSlo
       ∃ (entry : BorrowEntry) (relOff : Nat),
         pv.offsetBytes = 0 ∧
         lookupBorrow s.memory.borrows pv.tag = some entry ∧
-        (mutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved ∨ entry.perm = .disabled) ∧
         ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
           some (pointeeIt, relOff)) :
     BorrowsOk body ctx (view.set i (.init (.ptr pv 8))) (advanceStmt s locals' s.memory) lm where
@@ -774,7 +938,7 @@ theorem BorrowsOk.ptrCopy {body : CapturedMir} {ctx : Ctx} {view : List LocalSlo
     simp only [advanceStmt]
     rw [Nat.add_eq, ptrEnvBefore_succ hbb hst]
     simp only [ptrStmtStep, hkind, hi_decl, ↓reduceIte, hdb_none, hrb_none, hsrc_p]
-    exact hb.alias_ok.stepPtrCopy hlen i p pv hdp hp_ptr hvp
+    exact hb.alias_ok.stepPtrCopy hlen i p pv hdp hp_ptr hvp hmut_ip
   ptr_slots q dq mutbl pointeeIt ptrVal hdq hpt hv := by
     by_cases hiq : i = q
     · subst hiq
@@ -788,6 +952,88 @@ theorem BorrowsOk.ptrCopy {body : CapturedMir} {ctx : Ctx} {view : List LocalSlo
     · rw [List.getElem?_set_ne hiq] at hv
       exact hb.ptr_slots q dq mutbl pointeeIt ptrVal hdq hpt hv
 
+/-- `BorrowsOk` after a dereference read `_i = *_r`, where Anneal freezes
+foreign active borrows via `freezeDerefReadBorrowsAt` and writes a non-dead,
+non-pointer value `slot'` to `_i`. -/
+theorem BorrowsOk.derefRead {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot}
+    {s : MachineState} {lm : Map Gen.LocalName Ptr} (hb : BorrowsOk body ctx view s lm)
+    {bb : BasicBlockData} (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
+    {st : MirAst.Statement} (hst : bb.statements[s.frame.stmtIdx]? = some st)
+    {i r : Nat} {rv : Rvalue} (hkind : st.kind = .assign ⟨i, []⟩ rv)
+    (hnd_i : isDeclPtrLocal body.localDecls i = false)
+    (hi_addr : i ∉ bodyAddrTakenLocals body)
+    (hsrc : ptrDerefReadSrc rv = some r)
+    {dr : LocalDecl} (hdr : body.localDecls[r]? = some dr) (hr_ptr : isPtrTy dr.ty = true)
+    (ptrVal : ProvenancePtr) (entry : BorrowEntry)
+    (hvr : view[r]? = some (.init (.ptr ptrVal 8)))
+    (hrA : s.frame.locals[r]? = some (.init (.ptr ptrVal 8)))
+    (hlookup : lookupBorrow s.memory.borrows ptrVal.tag = some entry)
+    {locals' : List LocalSlot} (slot' : LocalSlot)
+    (hnp : ∀ dp pv, body.localDecls[i]? = some dp → isPtrTy dp.ty = true →
+      slot' ≠ .init (.ptr pv 8)) :
+    BorrowsOk body ctx (view.set i slot')
+      (advanceStmt s locals'
+        { s.memory with
+          borrows := MirSemantics.freezeDerefReadBorrowsAt s.frame.locals r [] s.memory.borrows })
+      lm := by
+  have hfrz_eq :
+      MirSemantics.freezeDerefReadBorrowsAt s.frame.locals r [] s.memory.borrows =
+        MirSemantics.freezeTreeBorrowsOnReadAtProj s.memory.borrows s.memory.borrows
+          entry.targetLocal (some ptrVal.tag) entry.targetProjection
+          entry.rangeOffset entry.rangeLen := by
+    cases hbs : s.memory.borrows with
+    | nil => rw [hbs] at hlookup; simp [lookupBorrow] at hlookup
+    | cons b1 rest =>
+      cases rest with
+      | nil =>
+        rw [hbs] at hlookup
+        obtain ⟨hmem, htag⟩ := lookupBorrow_mem_and_tag hlookup
+        have hb1 : entry = b1 := by simpa using hmem
+        subst hb1
+        rw [freezeDerefReadBorrowsAt_singleton, freezeTreeBorrowsOnReadAtProj_eq_map,
+          List.map_singleton, updateBorrowPermOnReadAtProj_of_descendant _ _ _ _
+            (by rw [htag]; exact isBorrowDescendantOrSelf_self _ _)]
+      | cons b2 bs =>
+        unfold MirSemantics.freezeDerefReadBorrowsAt
+        dsimp only []
+        rw [← hbs]
+        simp [get?, hrA, hlookup, appendProjections_nil_right]
+  have hAfter := hb.freezeRead entry.targetLocal (some ptrVal.tag) entry.targetProjection
+    entry.rangeOffset entry.rangeLen
+  have hranges : ∀ e ∈ s.memory.borrows, e.rangeLen = 0 :=
+    fun e he => (hb.perm_eq he).2.2.2.2
+  refine {
+    tags_lt := fun e' he' => by
+      simp only [advanceStmt, hfrz_eq] at he' ⊢
+      exact hAfter.1 e' he'
+    entries_ok := fun e' he' => by
+      simp only [advanceStmt, hfrz_eq] at he' ⊢
+      exact hAfter.2.1 e' he'
+    target_ptrs := fun hfrag k hk => by
+      obtain ⟨hnd, hlmk, hd⟩ := hb.target_ptrs hfrag k hk
+      refine ⟨?_, hlmk, hd⟩
+      have hik : i ≠ k := fun h => hi_addr (h ▸ hk)
+      rw [List.getElem?_set_ne hik]
+      exact hnd
+    alias_ok := by
+      simp only [advanceStmt, hfrz_eq]
+      rw [Nat.add_eq, ptrEnvBefore_succ hbb hst]
+      simp only [ptrStmtStep, hkind, hnd_i, Bool.false_eq_true, ↓reduceIte, hsrc]
+      exact (hb.alias_ok.foreignRead hranges hdr hr_ptr hvr hlookup).set_nonptr i slot' hnp
+    ptr_slots := fun p dp mutbl pointeeIt pv hdp hpt hv => by
+      have hp_ptr : isPtrTy dp.ty = true := by simp [isPtrTy, hpt]
+      have hv_old : view[p]? = some (.init (.ptr pv 8)) := by
+        by_cases hip : i = p
+        · subst hip
+          by_cases hlt : i < view.length
+          · rw [List.getElem?_set_self hlt] at hv
+            injection hv with hs
+            exact False.elim (hnp dp pv hdp hp_ptr hs)
+          · rwa [List.set_eq_of_length_le (Nat.not_lt.mp hlt)] at hv
+        · rwa [List.getElem?_set_ne hip] at hv
+      simp only [advanceStmt, hfrz_eq]
+      exact hAfter.2.2 p dp mutbl pointeeIt pv hdp hpt hv_old }
+
 /-- `BorrowsOk` after a dereference write `(*_w) = rv`, where Anneal updates the
 borrow table via `invalidateDerefWriteBorrows` and writes a non-dead,
 non-pointer value `slot'` to `entry.targetLocal`. -/
@@ -796,6 +1042,7 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
     {bb : BasicBlockData} (hbb : body.basicBlocks[s.frame.blockIdx]? = some bb)
     {st : MirAst.Statement} (hst : bb.statements[s.frame.stmtIdx]? = some st)
     {w : Nat} {rv : Rvalue} (hkind : st.kind = .assign ⟨w, [.deref]⟩ rv)
+    (hsrc_none : ptrDerefReadSrc rv = none)
     {dw : LocalDecl} (hdw : body.localDecls[w]? = some dw) (hw_ptr : isPtrTy dw.ty = true)
     (ptrVal : ProvenancePtr) (entry : BorrowEntry)
     (hvw : view[w]? = some (.init (.ptr ptrVal 8)))
@@ -811,20 +1058,36 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
           borrows := invalidateDerefWriteBorrows s.frame.locals s.memory.borrows ⟨w, [.deref]⟩ [] })
       lm := by
   have hentry_mem : entry ∈ s.memory.borrows := (lookupBorrow_mem_and_tag hlookup).1
-  obtain ⟨_, _, hroff, hrlen⟩ := hb.perm_eq hentry_mem
+  obtain ⟨_, _, _, hroff, hrlen⟩ := hb.perm_eq hentry_mem
+  obtain ⟨wMutbl, wIt, hw_pt⟩ : ∃ m it, ptrPointeeOf dw.ty = some (m, it) := by
+    unfold isPtrTy at hw_ptr
+    obtain ⟨⟨m, it⟩, h⟩ := Option.isSome_iff_exists.mp hw_ptr
+    exact ⟨m, it, h⟩
+  obtain ⟨entry_slot, relOff_w, hoff0_w, hlk_slot, htspec_w⟩ :=
+    hb.ptr_slots w dw wMutbl wIt ptrVal hdw hw_pt hvw
+  rw [hlookup] at hlk_slot
+  injection hlk_slot with heq_slot
+  subst heq_slot
+  have hfull :
+      MirSemantics.resolveDerefWriteFullProj s.frame.locals s.frame.locals
+        (.ptr ptrVal 8) entry [] = entry.targetProjection :=
+    resolveDerefWriteFullProj_of_ptrTargetSpec s.frame.locals ptrVal entry wIt relOff_w
+      htspec_w hoff0_w
   let upd : BorrowEntry → BorrowEntry := fun e =>
-    updateBorrowPermAtProj e entry.targetLocal (some ptrVal.tag) entry.targetProjection 0 0
+    MirSemantics.updateBorrowPermTreeAtProj s.memory.borrows e entry.targetLocal
+      (some ptrVal.tag) entry.targetProjection 0 0
   have hmap :
       invalidateDerefWriteBorrows s.frame.locals s.memory.borrows ⟨w, [.deref]⟩ [] =
         s.memory.borrows.map upd :=
     invalidateDerefWriteBorrows_eq_map s.frame.locals s.memory.borrows w ptrVal entry
-      hwA hlookup hrlen hroff
+      hwA hlookup hrlen hroff hfull
   have hupd_fields : ∀ e,
       (upd e).tag = e.tag ∧ (upd e).targetLocal = e.targetLocal ∧
-      (upd e).targetProjection = e.targetProjection := fun e => by
-    have hf := updateBorrowPermAtProj_fields e entry.targetLocal (some ptrVal.tag)
-      entry.targetProjection 0 0
-    exact ⟨hf.1, hf.2.1, hf.2.2.1⟩
+      (upd e).targetProjection = e.targetProjection ∧
+      (upd e).rangeOffset = e.rangeOffset ∧ (upd e).rangeLen = e.rangeLen ∧
+      (upd e).protector = e.protector ∧ (upd e).parentTag = e.parentTag := fun e => by
+    exact updateBorrowPermTreeAtProj_fields s.memory.borrows e entry.targetLocal
+      (some ptrVal.tag) entry.targetProjection 0 0
   refine {
     tags_lt := fun e' he' => by
       simp only [advanceStmt, hmap, List.mem_map] at he' ⊢
@@ -834,34 +1097,13 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
     entries_ok := fun e' he' => by
       simp only [advanceStmt, hmap, List.mem_map] at he' ⊢
       obtain ⟨e, he, rfl⟩ := he'
-      obtain ⟨mutbl, pointeeIt, relOff, he_form, hk_addr, htspec⟩ := hb.entries_ok e he
-      obtain ⟨htag, hloc, hproj⟩ := hupd_fields e
-      refine ⟨mutbl, pointeeIt, relOff, ?_, hloc ▸ hk_addr, ?_⟩
-      · rcases updateBorrowPermAtProj_cases e entry.targetLocal ptrVal.tag entry.targetProjection
-            with hsame | ⟨hres_e, hact_e⟩ | hdis
-        · change upd e = e at hsame
-          rw [htag, hloc, hproj, hsame]
-          exact he_form
-        · change upd e = { e with perm := .active } at hact_e
-          rw [htag, hloc, hproj, hact_e]
-          rcases he_form with heq | ⟨hm, heq⟩ | heq
-          · have hp : e.perm = rawPtrPerm mutbl := congrArg BorrowEntry.perm heq
-            rw [hres_e] at hp
-            cases mutbl <;> simp [rawPtrPerm] at hp
-          · left
-            subst hm
-            exact (congrArg (fun x : BorrowEntry => { x with perm := .active }) heq).trans rfl
-          · have hp : e.perm = .disabled := congrArg BorrowEntry.perm heq
-            rw [hres_e] at hp
-            cases hp
-        · change upd e = { e with perm := .disabled } at hdis
-          right; right
-          rw [htag, hloc, hproj, hdis]
-          rcases he_form with heq | ⟨rfl, heq⟩ | heq
-          · exact congrArg (fun x : BorrowEntry => { x with perm := .disabled }) heq
-          · exact (congrArg (fun x : BorrowEntry => { x with perm := .disabled }) heq).trans rfl
-          · exact congrArg (fun x : BorrowEntry => { x with perm := .disabled }) heq
-      · rwa [hloc, hproj]
+      obtain ⟨_, pointeeIt, relOff, _, hk_addr, htspec⟩ := hb.entries_ok e he
+      obtain ⟨_, _, hprot_e, hroff_e, hrlen_e⟩ := hb.perm_eq he
+      obtain ⟨_, hloc, hproj, hroff_u, hrlen_u, hprot_u, _⟩ := hupd_fields e
+      obtain ⟨mutbl', hform'⟩ := borrowEntry_form_of_unranged (upd e)
+        (hprot_u.trans hprot_e) (hroff_u.trans hroff_e) (hrlen_u.trans hrlen_e)
+      refine ⟨mutbl', pointeeIt, relOff, hform', hloc ▸ hk_addr, ?_⟩
+      rwa [hloc, hproj]
     target_ptrs := fun hfrag k hk => by
       obtain ⟨hnd, hlmk, hd⟩ := hb.target_ptrs hfrag k hk
       refine ⟨?_, hlmk, hd⟩
@@ -888,31 +1130,17 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
             exact False.elim (hnp dp pv hdp hp_ptr hs)
           · rwa [List.set_eq_of_length_le (Nat.not_lt.mp hlt)] at hv
         · rwa [List.getElem?_set_ne htp] at hv
-      obtain ⟨e_p, relOff, hoff0, hlk_p, hmut_p, htspec_p⟩ :=
+      obtain ⟨e_p, relOff, hoff0, hlk_p, htspec_p⟩ :=
         hb.ptr_slots p dp mutbl pointeeIt pv hdp hpt hv_old
-      have he_p_mem : e_p ∈ s.memory.borrows := (lookupBorrow_mem_and_tag hlk_p).1
-      obtain ⟨_, hloc_p, hproj_p⟩ := hupd_fields e_p
-      refine ⟨upd e_p, relOff, hoff0, ?_, ?_, ?_⟩
+      obtain ⟨_, hloc_p, hproj_p, _⟩ := hupd_fields e_p
+      refine ⟨upd e_p, relOff, hoff0, ?_, ?_⟩
       · simp only [advanceStmt, hmap]
         rw [lookupBorrow_map_eq (fun e => (hupd_fields e).1) pv.tag, hlk_p]
         rfl
-      · rcases updateBorrowPermAtProj_cases e_p entry.targetLocal ptrVal.tag entry.targetProjection
-            with hsame | ⟨_, hact_p⟩ | hdis
-        · change upd e_p = e_p at hsame
-          rw [hsame]
-          exact hmut_p
-        · change upd e_p = { e_p with perm := .active } at hact_p
-          intro _
-          left
-          rw [hact_p]
-        · change upd e_p = { e_p with perm := .disabled } at hdis
-          intro _
-          right; right
-          rw [hdis]
       · rwa [hloc_p, hproj_p] }
   simp only [advanceStmt, hmap]
   rw [Nat.add_eq, ptrEnvBefore_succ hbb hst]
-  simp only [ptrStmtStep, hkind]
+  simp only [ptrStmtStep, hkind, hsrc_none]
   apply PtrEnvOk.set_nonptr _ entry.targetLocal slot' hnp
   let env := ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx
   have hw_lt : w < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdw).1
@@ -928,7 +1156,7 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
     trivial
   | live wTarget wPeers =>
     rw [hst_w] at hw_ok
-    obtain ⟨⟨entry_w, hlk_w, _, hw_tgt⟩, hw_peers⟩ := hw_ok dw ptrVal hdw hw_ptr hvw
+    obtain ⟨⟨entry_w, hlk_w, _, _, hw_tgt⟩, hw_peers⟩ := hw_ok dw ptrVal hdw hw_ptr hvw
     rw [hlookup] at hlk_w
     injection hlk_w with heq_w
     subst heq_w
@@ -946,10 +1174,10 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
       by_cases hkeep : (wPeers.contains q || targetsDefinitelyDisjoint qTarget wTarget) = true
       · simp only [hkeep, ↓reduceIte]
         intro dq pv_q hdq hq_ptr hvq
-        obtain ⟨⟨e_q, hlk_q, hndis_q, hq_tgt⟩, hq_peers⟩ := hq_ok dq pv_q hdq hq_ptr hvq
+        obtain ⟨⟨e_q, hlk_q, hndis_q, hnf_q, hq_tgt⟩, hq_peers⟩ := hq_ok dq pv_q hdq hq_ptr hvq
         obtain ⟨_, he_q_tag⟩ := lookupBorrow_mem_and_tag hlk_q
         have hkeep_q : upd e_q = e_q ∨ upd e_q = { e_q with perm := .active } := by
-          apply updateBorrowPermAtProj_self_or_disjoint_keep
+          apply updateBorrowPermTreeAtProj_self_or_disjoint_keep
           intro hloc
           have hkeep' : wPeers.contains q = true ∨ targetsDefinitelyDisjoint qTarget wTarget = true := by
             simpa only [Bool.or_eq_true] using hkeep
@@ -976,19 +1204,64 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
                   simp only [targetsDefinitelyDisjoint, hloc, ne_eq, not_true_eq_false,
                     decide_false, Bool.false_or, Bool.not_eq_true'] at hdisj
                   rwa [← borrowProjOverlap_borrowProjSteps]
-        refine ⟨⟨upd e_q, ?_, ?_, ?_⟩, hq_peers⟩
+        refine ⟨⟨upd e_q, ?_, ?_, ?_, ?_⟩, hq_peers⟩
         · rw [lookupBorrow_map_eq (fun e => (hupd_fields e).1) pv_q.tag, hlk_q]
           rfl
         · rcases hkeep_q with hsame | hact_q
           · rwa [hsame]
           · simp [hact_q]
+        · intro hmut_q
+          rcases hkeep_q with hsame | hact_q
+          · rw [hsame]; exact hnf_q hmut_q
+          · simp [hact_q]
         · intro qp hqp
-          rw [(hupd_fields e_q).2.1, (hupd_fields e_q).2.2]
+          rw [(hupd_fields e_q).2.1, (hupd_fields e_q).2.2.1]
           exact hq_tgt qp hqp
       · simp only [hkeep, Bool.false_eq_true, ↓reduceIte]
         trivial
 
 /-! ## Anneal -/
+
+/-- Anneal's assignment to the root local `_i` (not a borrow target) of an
+rvalue that pushes `entry` targeting `q.local_` onto `borrowsAfterRead` and
+returns `s.memory.nextTag`. -/
+theorem evalStmt_assign_pushBorrow_on (s : MachineState) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (i : Nat) (rv : Rvalue) (entry : BorrowEntry)
+    (borrowsAfterRead : List BorrowEntry) (q : Place)
+    (hq_loc : entry.targetLocal = q.local_)
+    (span : String)
+    (hrv : evalRvalue s.frame.locals rv s.memory decls layouts =
+      .ok (.ptr { allocId := s.memory.nextTag, offsetBytes := 0 } 8) s.frame.locals
+        { s.memory with
+          borrows := entry :: borrowsAfterRead,
+          nextTag := s.memory.nextTag + 1 })
+    (hi : i < s.frame.locals.length)
+    (hbor : ∀ e ∈ borrowsAfterRead, e.targetLocal ≠ i) (hqi : q.local_ ≠ i)
+    (hprot : s.memory.activeProtectors = []) :
+    (s.frame.locals[i]? ≠ some .dead →
+      evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts =
+        .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)))
+          { s.memory with
+            borrows := entry :: borrowsAfterRead,
+            nextTag := s.memory.nextTag + 1 }))) ∧
+    (s.frame.locals[i]? = some .dead →
+      evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
+  have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
+  have hinv : invalidateConflictingBorrows (entry :: borrowsAfterRead)
+      i .none = entry :: borrowsAfterRead := by
+    apply invalidateConflictingBorrows_of_ne
+    intro e he
+    rcases List.mem_cons.mp he with rfl | he'
+    · rwa [hq_loc]
+    · exact hbor e he'
+  refine ⟨fun hlive => ?_, fun hdead => ?_⟩
+  · have hlive' : s.frame.locals[i] ≠ .dead := fun h => hlive (by rw [hs, h])
+    simp only [evalStmt, hrv, get?, hs, set?, hi, ↓reduceIte, hprot, hinv]
+    cases hsl : s.frame.locals[i] with
+    | dead => exact absurd hsl hlive'
+    | uninit => rfl
+    | init v => rfl
+  · simp [evalStmt, hrv, get?, hdead]
 
 /-- Anneal's assignment to the root local `_i` (not a borrow target) of an
 rvalue that pushes `entry` targeting `q.local_` and returns `s.memory.nextTag`. -/
@@ -1011,29 +1284,17 @@ theorem evalStmt_assign_pushBorrow (s : MachineState) (decls : List LocalDecl)
             borrows := entry :: s.memory.borrows,
             nextTag := s.memory.nextTag + 1 }))) ∧
     (s.frame.locals[i]? = some .dead →
-      evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
-  have hs : s.frame.locals[i]? = some s.frame.locals[i] := by simp [hi]
-  have hinv : invalidateConflictingBorrows (entry :: s.memory.borrows)
-      i .none = entry :: s.memory.borrows := by
-    apply invalidateConflictingBorrows_of_ne
-    intro e he
-    rcases List.mem_cons.mp he with rfl | he'
-    · rwa [hq_loc]
-    · exact hbor e he'
-  refine ⟨fun hlive => ?_, fun hdead => ?_⟩
-  · have hlive' : s.frame.locals[i] ≠ .dead := fun h => hlive (by rw [hs, h])
-    simp only [evalStmt, hrv, get?, hs, set?, hi, ↓reduceIte, hprot, hinv]
-    cases hsl : s.frame.locals[i] with
-    | dead => exact absurd hsl hlive'
-    | uninit => rfl
-    | init v => rfl
-  · simp [evalStmt, hrv, get?, hdead]
+      evalStmt s ⟨.assign ⟨i, []⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) :=
+  evalStmt_assign_pushBorrow_on s decls layouts i rv entry s.memory.borrows q hq_loc span hrv
+    hi hbor hqi hprot
 
 /-- Anneal's `_i = &raw mutbl q` on a live borrow target `q` (neither a
 dereference nor indexed): a fresh entry is pushed and its tag stored in `_i`
 (UB when `_i` is dead). -/
 theorem evalStmt_assign_rawPtr (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (i : Nat) (mutbl : MirAst.Mutability) (q : Place)
+    (pointeeIt : Gen.IntType) (relOff : Nat)
+    (hspec : ptrTargetSpec layouts decls q = some (pointeeIt, relOff))
     (span : String) (hnd : ∀ rest, q.projection ≠ .deref :: rest)
     (hni : noIndexProj q.projection = true) (slotq : LocalSlot)
     (hsq : s.frame.locals[q.local_]? = some slotq) (hliveq : slotq ≠ .dead)
@@ -1050,7 +1311,8 @@ theorem evalStmt_assign_rawPtr (s : MachineState) (decls : List LocalDecl)
       evalStmt s ⟨.assign ⟨i, []⟩ (.rawPtr mutbl q), span⟩ decls layouts = MirStepNode.fail .ub) :=
   evalStmt_assign_pushBorrow s decls layouts i (.rawPtr mutbl q)
     (rawPtrEntry s.memory.nextTag mutbl q) q rfl span
-    (evalRvalue_rawPtr_local s.frame.locals mutbl q s.memory decls layouts hnd hni slotq hsq hliveq)
+    (evalRvalue_rawPtr_local s.frame.locals mutbl q s.memory decls layouts
+      (sharedBorrowPerm_of_ptrTargetSpec hspec) hnd hni slotq hsq hliveq)
     hi hbor hqi hprot
 
 /-- Anneal's `_i = &q` / `_i = &mut q` / `_i = &two_phase mut q` on a live
@@ -1084,9 +1346,12 @@ theorem evalStmt_assign_ref (s : MachineState) (decls : List LocalDecl)
 local `_p` whose entry `parentEntry` has compatible permission. -/
 theorem evalStmt_assign_rawPtr_reborrow (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (i : Nat) (mutbl : MirAst.Mutability) (p : Nat)
+    (dp : LocalDecl) (srcMutbl : MirAst.Mutability) (pointeeIt : Gen.IntType)
+    (hdp : decls[p]? = some dp) (hp_ty : ptrPointeeOf dp.ty = some (srcMutbl, pointeeIt))
     (span : String)
     (parentPtr : ProvenancePtr) (hp : s.frame.locals[p]? = some (.init (.ptr parentPtr 8)))
     (parentEntry : BorrowEntry) (he : lookupBorrow s.memory.borrows parentPtr.tag = some parentEntry)
+    (hthin : needsThinPtrElemResolution parentEntry.targetProjection parentPtr.offsetBytes = false)
     (hndis : parentEntry.perm ≠ .disabled)
     (hmut : mutbl = .mut → parentEntry.perm = .active ∨ parentEntry.perm = .reserved)
     (hi : i < s.frame.locals.length)
@@ -1096,17 +1361,17 @@ theorem evalStmt_assign_rawPtr_reborrow (s : MachineState) (decls : List LocalDe
       evalStmt s ⟨.assign ⟨i, []⟩ (.rawPtr mutbl ⟨p, [.deref]⟩), span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)))
           { s.memory with
-            borrows := rawPtrEntry s.memory.nextTag mutbl
-              ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ :: s.memory.borrows,
+            borrows := rawReborrowEntry s.memory.nextTag mutbl parentEntry parentPtr.tag ::
+              s.memory.borrows,
             nextTag := s.memory.nextTag + 1 }))) ∧
     (s.frame.locals[i]? = some .dead →
       evalStmt s ⟨.assign ⟨i, []⟩ (.rawPtr mutbl ⟨p, [.deref]⟩), span⟩ decls layouts =
         MirStepNode.fail .ub) :=
   evalStmt_assign_pushBorrow s decls layouts i (.rawPtr mutbl ⟨p, [.deref]⟩)
-    (rawPtrEntry s.memory.nextTag mutbl ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩)
+    (rawReborrowEntry s.memory.nextTag mutbl parentEntry parentPtr.tag)
     ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ rfl span
-    (evalRvalue_rawPtr_reborrow s.frame.locals mutbl p s.memory decls layouts parentPtr hp
-      parentEntry he hndis hmut)
+    (evalRvalue_rawPtr_reborrow s.frame.locals mutbl p s.memory decls layouts dp srcMutbl
+      pointeeIt hdp hp_ty parentPtr hp parentEntry he hndis hmut hthin)
     hi hbor (hbor parentEntry (lookupBorrow_mem_and_tag he).1) hprot
 
 /-- Anneal's `_i = &(*_p)` / `_i = &mut (*_p)` / `_i = &two_phase mut (*_p)`
@@ -1120,6 +1385,7 @@ theorem evalStmt_assign_ref_reborrow (s : MachineState) (decls : List LocalDecl)
     (span : String)
     (parentPtr : ProvenancePtr) (hp : s.frame.locals[p]? = some (.init (.ptr parentPtr 8)))
     (parentEntry : BorrowEntry) (he : lookupBorrow s.memory.borrows parentPtr.tag = some parentEntry)
+    (hthin : needsThinPtrElemResolution parentEntry.targetProjection parentPtr.offsetBytes = false)
     (hndis : parentEntry.perm ≠ .disabled)
     (hmut : borrowKindMutbl bkind = .mut → parentEntry.perm = .active ∨ parentEntry.perm = .reserved)
     (hi : i < s.frame.locals.length)
@@ -1129,18 +1395,34 @@ theorem evalStmt_assign_ref_reborrow (s : MachineState) (decls : List LocalDecl)
       evalStmt s ⟨.assign ⟨i, []⟩ (.ref bkind ⟨p, [.deref]⟩), span⟩ decls layouts =
         .tau (.running (advanceStmt s (s.frame.locals.set i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)))
           { s.memory with
-            borrows := refBorrowEntry s.memory.nextTag bkind
-              ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ :: s.memory.borrows,
+            borrows := refReborrowEntry s.memory.nextTag bkind parentEntry parentPtr.tag ::
+              MirSemantics.freezeTreeBorrowsOnReadAtProj s.memory.borrows s.memory.borrows
+                parentEntry.targetLocal (some parentPtr.tag) parentEntry.targetProjection
+                parentEntry.rangeOffset parentEntry.rangeLen,
             nextTag := s.memory.nextTag + 1 }))) ∧
     (s.frame.locals[i]? = some .dead →
       evalStmt s ⟨.assign ⟨i, []⟩ (.ref bkind ⟨p, [.deref]⟩), span⟩ decls layouts =
-        MirStepNode.fail .ub) :=
-  evalStmt_assign_pushBorrow s decls layouts i (.ref bkind ⟨p, [.deref]⟩)
-    (refBorrowEntry s.memory.nextTag bkind ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩)
+        MirStepNode.fail .ub) := by
+  have hbor_frz : ∀ e ∈ MirSemantics.freezeTreeBorrowsOnReadAtProj s.memory.borrows s.memory.borrows
+      parentEntry.targetLocal (some parentPtr.tag) parentEntry.targetProjection
+      parentEntry.rangeOffset parentEntry.rangeLen, e.targetLocal ≠ i := by
+    intro e' he'
+    rw [freezeTreeBorrowsOnReadAtProj_eq_map, List.mem_map] at he'
+    obtain ⟨e, he_mem, rfl⟩ := he'
+    have hf := updateBorrowPermOnReadAtProj_freezeOrSelf s.memory.borrows
+      parentEntry.targetLocal (some parentPtr.tag) parentEntry.targetProjection
+      parentEntry.rangeOffset parentEntry.rangeLen
+    rw [hf.targetLocal]
+    exact hbor e he_mem
+  exact evalStmt_assign_pushBorrow_on s decls layouts i (.ref bkind ⟨p, [.deref]⟩)
+    (refReborrowEntry s.memory.nextTag bkind parentEntry parentPtr.tag)
+    (MirSemantics.freezeTreeBorrowsOnReadAtProj s.memory.borrows s.memory.borrows
+      parentEntry.targetLocal (some parentPtr.tag) parentEntry.targetProjection
+      parentEntry.rangeOffset parentEntry.rangeLen)
     ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ rfl span
     (evalRvalue_ref_reborrow s.frame.locals bkind p s.memory decls layouts dp srcMutbl
-      pointeeIt hdp hp_ty parentPtr hp parentEntry he hndis hmut)
-    hi hbor (hbor parentEntry (lookupBorrow_mem_and_tag he).1) hprot
+      pointeeIt hdp hp_ty parentPtr hp parentEntry he hndis hmut hthin)
+    hi hbor_frz (hbor parentEntry (lookupBorrow_mem_and_tag he).1) hprot
 
 theorem evalStmt_assign_ub (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (dst : Place) (rv : Rvalue) (span : String)
@@ -1155,6 +1437,7 @@ theorem evalOperand_deref_eq_target (locals : List LocalSlot) (p : Nat)
     (layouts : Layout.LayoutTable) (callerLocals : List LocalSlot)
     (ptrVal : ProvenancePtr) (sz : Nat) (hp : locals[p]? = some (.init (.ptr ptrVal sz)))
     (entry : BorrowEntry) (he : lookupBorrow borrows ptrVal.tag = some entry)
+    (hthin : needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes = false)
     (hperm : entry.perm ≠ .disabled)
     (hnd : ∀ rest, entry.targetProjection ≠ .deref :: rest)
     (slot : LocalSlot) (ht : locals[entry.targetLocal]? = some slot) :
@@ -1171,9 +1454,11 @@ theorem evalOperand_deref_eq_target (locals : List LocalSlot) (p : Nat)
     | cons ph pt =>
       have hph : ph ≠ .deref := fun h => hnd pt (by rw [htp, h])
       have hpt : appendProjections pt [] = pt := appendProjections_nil_right pt
+      have hthin' : needsThinPtrElemResolution (ph :: pt) ptrVal.offsetBytes = false := by
+        rwa [← htp]
       cases ph with
       | deref => exact absurd rfl hph
-      | _ => cases slot <;> simp [evalOperand, get?, hp, he, hpe, ht, htp, hpt]
+      | _ => cases slot <;> simp [evalOperand, get?, hp, he, hpe, ht, htp, hpt, hthin']
 
 /-- Anneal's assignment to the root local `_i` (not a borrow target) of an
 rvalue that evaluates without changing the slots or the memory. -/
@@ -1233,6 +1518,13 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
         (mutbl = .mut → srcMutbl = .mut)) ∧
       ∀ (locals : List LocalSlot) (mem : MirSemantics.Memory),
         (∀ pv, pv.offsetBytes = 0 → locals[p]? = some (.init (.ptr pv 8)) →
+          (ptrOffsetSrcOf rv = some p →
+            ∃ (entry : BorrowEntry) (relOff : Nat),
+              lookupBorrow mem.borrows pv.tag = some entry ∧
+              entry.perm ≠ .disabled ∧
+              ptrTargetSpec layouts decls ⟨entry.targetLocal, entry.targetProjection⟩ =
+                some (pointeeIt, relOff) ∧
+              ∃ slot, locals[entry.targetLocal]? = some slot ∧ slot ≠ .dead) →
           evalRvalue locals rv mem decls layouts = .ok (.ptr pv 8) locals mem) ∧
         ((locals[p]? = some .uninit ∨ locals[p]? = some .dead) →
           evalRvalue locals rv mem decls layouts = .ub) := by
@@ -1251,7 +1543,7 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
           | false => exact ptrPointeeOf_bind_of_rawPtrPointeeOf (by simpa using hok.2)
           | true => exact ptrPointeeOf_bind_of_refPointeeOf (by simpa using hok.2)
         refine ⟨p, hok.1, by simp [rvOperands], ⟨mutbl, hpt, fun h => h⟩,
-          fun locals mem => ⟨fun pv _ hp => ?_, fun hu => ?_⟩⟩
+          fun locals mem => ⟨fun pv _ hp _ => ?_, fun hu => ?_⟩⟩
         · simp [evalRvalue, evalOperand, get?, hp, readProjectedValue]
         · rcases hu with hu | hu <;> simp [evalRvalue, evalOperand, get?, hu]
       | cons _ _ => simp [ptrRvalueOk] at hok
@@ -1265,7 +1557,7 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
         cases projs with
         | nil =>
           simp only [ptrRvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
-          obtain ⟨⟨⟨_, hp⟩, _⟩, hsrc⟩ := hok
+          obtain ⟨⟨⟨_, hp⟩, hcast_raw⟩, hsrc⟩ := hok
           cases hsp : (decls[p]? >>= (rawPtrPointeeOf ·.ty)) with
           | none => simp [hsp] at hsrc
           | some pr =>
@@ -1273,14 +1565,23 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
             simp only [hsp, Bool.and_eq_true, decide_eq_true_eq, Bool.or_eq_true] at hsrc
             obtain ⟨hit, hm⟩ := hsrc
             subst hit
-            refine ⟨p, hp, by simp [rvOperands],
-              ⟨srcMutbl, ptrPointeeOf_bind_of_rawPtrPointeeOf hsp, fun h => ?_⟩,
-              fun locals mem => ⟨fun pv _ hpv => ?_, fun hu => ?_⟩⟩
-            · rcases hm with hm | hm
+            have hpt_bind := ptrPointeeOf_bind_of_rawPtrPointeeOf hsp
+            cases hdp : decls[p]? with
+            | none => simp [hdp] at hpt_bind
+            | some dp =>
+              have hsrc_pt : ptrPointeeOf dp.ty = some (srcMutbl, pointeeIt) := by
+                simpa [hdp] using hpt_bind
+              refine ⟨p, hp, by simp [rvOperands],
+                ⟨srcMutbl, hpt_bind, fun h => ?_⟩,
+                fun locals mem => ⟨fun pv _ hpv _ =>
+                  (evalRvalue_ptrToPtr_of_rawPtrPointeeOf locals p castTy mem decls layouts
+                    hdp hsrc_pt hcast_raw).1 pv 8 hpv,
+                  fun hu =>
+                  (evalRvalue_ptrToPtr_of_rawPtrPointeeOf locals p castTy mem decls layouts
+                    hdp hsrc_pt hcast_raw).2 hu⟩⟩
+              rcases hm with hm | hm
               · exact hm
               · subst h; cases hm
-            · simp [evalRvalue, evalOperand, get?, hpv, readProjectedValue]
-            · rcases hu with hu | hu <;> simp [evalRvalue, evalOperand, get?, hu]
         | cons _ _ => simp [ptrRvalueOk] at hok
       | _ => simp [ptrRvalueOk] at hok
     | transmute =>
@@ -1309,8 +1610,12 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
                 simpa [hdp] using hsp
               refine ⟨p, hp, by simp [rvOperands],
                 ⟨srcMutbl, hsp, fun h => ?_⟩,
-                fun locals mem =>
-                  evalRvalue_transmute_ptr locals p castTy mem decls layouts hdp hsrc_pt hdst⟩
+                fun locals mem => ⟨fun pv hoff hpv _ =>
+                  (evalRvalue_transmute_ptr locals p castTy mem decls layouts
+                    hdp hsrc_pt hdst).1 pv hoff hpv,
+                  fun hu =>
+                  (evalRvalue_transmute_ptr locals p castTy mem decls layouts
+                    hdp hsrc_pt hdst).2 hu⟩⟩
               rcases hm with hm | hm
               · exact hm
               · subst h; cases hm
@@ -1329,17 +1634,28 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
           | constant c =>
             simp only [ptrRvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
             obtain ⟨⟨⟨_, hp⟩, hpt⟩, hz⟩ := hok
-            have hc : ∃ sz, c.val = .scalar (.int ⟨0, sz⟩) := by
-              unfold zeroOffsetConstOk at hz
-              split at hz
-              · next sz _ hval _ => exact ⟨sz, hval⟩
-              · simp at hz
-            obtain ⟨sz, hval⟩ := hc
-            refine ⟨p, hp, by simp [rvOperands],
-              ⟨mutbl, ptrPointeeOf_bind_of_rawPtrPointeeOf hpt, fun h => h⟩,
-              fun locals mem => ⟨fun pv _ hpv => ?_, fun hu => ?_⟩⟩
-            · simp [evalRvalue, evalOperand, get?, hpv, readProjectedValue, hval, evalConstValue]
-            · rcases hu with hu | hu <;> simp [evalRvalue, evalOperand, get?, hu]
+            obtain ⟨rIt, hval, _, _⟩ := zeroOffsetConstOk_iff.mp hz
+            cases hdp : decls[p]? with
+            | none => simp [hdp] at hpt
+            | some dp =>
+              have hpt_raw : rawPtrPointeeOf dp.ty = some (mutbl, pointeeIt) := by
+                simpa [hdp] using hpt
+              refine ⟨p, hp, by simp [rvOperands],
+                ⟨mutbl, ptrPointeeOf_bind_of_rawPtrPointeeOf hpt, fun h => h⟩,
+                fun locals mem => ⟨fun pv hoff0 hpv hoff_pre => ?_, fun hu => ?_⟩⟩
+              · obtain ⟨entry, relOff, hlk, hndis, htspec, slot, hslot, hndead⟩ :=
+                  hoff_pre (by simp [ptrOffsetSrcOf])
+                have hop_l : evalOperand locals (.copy ⟨p, []⟩) mem.borrows mem.globals
+                    layouts mem.callerLocals = .ok (.ptr pv 8) locals := by
+                  simp [evalOperand, get?, hpv, readProjectedValue]
+                have hop_r : evalOperand locals (.constant c) mem.borrows mem.globals
+                    layouts mem.callerLocals = .ok (.scalar ⟨0, rIt.size.bytes⟩) locals := by
+                  simp [evalOperand, hval, evalConstValue]
+                have hbin := evalPtrOffsetBinOp_zero locals mem decls layouts p dp mutbl pointeeIt
+                  pv entry relOff rIt.size.bytes hdp hpt_raw hoff0 hlk hndis htspec
+                  ⟨slot, hslot, hndead⟩
+                simp [evalRvalue, hop_l, hop_r, hbin]
+              · rcases hu with hu | hu <;> simp [evalRvalue, evalOperand, get?, hu]
           | _ => simp [ptrRvalueOk] at hok
         | cons _ _ => simp [ptrRvalueOk] at hok
       | _ => simp [ptrRvalueOk] at hok
@@ -1378,6 +1694,7 @@ conflicting borrows via `invalidateDerefWriteBorrows`. -/
 theorem evalStmt_assign_derefWrite_move (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (p : Nat) (rv : Rvalue) (span : String)
     (hk : moveKind rv = true) (hr : readsOk [] (rvOperands rv) = true)
+    (hframe : MoveFrameOk s.frame.locals s.memory.borrows rv)
     (hprot : s.memory.activeProtectors = []) (hcl : s.memory.callerLocals = []) :
     (∀ v locals', evalRvalue s.frame.locals (copyRv rv) s.memory decls layouts =
           .ok v s.frame.locals s.memory →
@@ -1393,7 +1710,7 @@ theorem evalStmt_assign_derefWrite_move (s : MachineState) (decls : List LocalDe
       evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) ∧
     (evalRvalue s.frame.locals (copyRv rv) s.memory decls layouts = .ub →
       evalStmt s ⟨.assign ⟨p, [.deref]⟩ rv, span⟩ decls layouts = MirStepNode.fail .ub) := by
-  have hR := evalRvalue_move s.frame.locals rv hk hr s.memory decls layouts
+  have hR := evalRvalue_move s.frame.locals rv hk hr hframe s.memory decls layouts
   refine ⟨fun v locals' hv hw => ?_, fun v hv hw => ?_, fun hu => ?_⟩
   · simp only [evalStmt]
     rw [hR, hv]
@@ -1407,16 +1724,25 @@ theorem evalStmt_assign_derefWrite_move (s : MachineState) (decls : List LocalDe
     rw [hR, hu]
     rfl
 
-theorem invalidateDerefWriteBorrows_congr_local (L1 L2 : List LocalSlot)
+theorem invalidateDerefWriteBorrows_congr_local {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} (L1 L2 : List LocalSlot)
     (borrows : List BorrowEntry) (p : Nat) (ptrVal : ProvenancePtr) (entry : BorrowEntry)
+    {pointeeIt : Gen.IntType} {relOff : Nat}
+    (htspec : ptrTargetSpec layouts decls ⟨entry.targetLocal, entry.targetProjection⟩ =
+      some (pointeeIt, relOff))
+    (hoff0 : ptrVal.offsetBytes = 0)
     (hp1 : L1[p]? = some (.init (.ptr ptrVal 8)))
     (hp2 : L2[p]? = some (.init (.ptr ptrVal 8)))
     (he : lookupBorrow borrows ptrVal.tag = some entry)
     (hrlen : entry.rangeLen = 0) (hroff : entry.rangeOffset = 0) :
     invalidateDerefWriteBorrows L1 borrows ⟨p, [.deref]⟩ [] =
       invalidateDerefWriteBorrows L2 borrows ⟨p, [.deref]⟩ [] := by
-  rw [invalidateDerefWriteBorrows_eq_map L1 borrows p ptrVal entry hp1 he hrlen hroff,
-    invalidateDerefWriteBorrows_eq_map L2 borrows p ptrVal entry hp2 he hrlen hroff]
+  have hfull1 := resolveDerefWriteFullProj_of_ptrTargetSpec L1 ptrVal entry pointeeIt relOff
+    htspec hoff0
+  have hfull2 := resolveDerefWriteFullProj_of_ptrTargetSpec L2 ptrVal entry pointeeIt relOff
+    htspec hoff0
+  rw [invalidateDerefWriteBorrows_eq_map L1 borrows p ptrVal entry hp1 he hrlen hroff hfull1,
+    invalidateDerefWriteBorrows_eq_map L2 borrows p ptrVal entry hp2 he hrlen hroff hfull2]
 
 /-! ## MiniRust -/
 
@@ -1498,8 +1824,8 @@ theorem evalPlace_deref {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     (hp_ty : ptrPointeeOf dp.ty = some (srcMutbl, it)) :
     (∃ (ptrVal : ProvenancePtr) (entry : BorrowEntry) (relOff : Nat) (m1 : Mach),
       view[p]? = some (.init (.ptr ptrVal 8)) ∧
+      ptrVal.offsetBytes = 0 ∧
       lookupBorrow s.memory.borrows ptrVal.tag = some entry ∧
-      (srcMutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved ∨ entry.perm = .disabled) ∧
       entry.targetLocal ∈ bodyAddrTakenLocals body ∧
       ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
         some (it, relOff) ∧
@@ -1515,7 +1841,7 @@ theorem evalPlace_deref {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     ((view[p]? = some .uninit ∨ view[p]? = some .dead) ∧
       ∃ msg, evalPlace m (.Deref (.Load (.Local (localName p))) (.Int it)) = .error (.ub msg)) := by
   rcases evalPtrLoad h hb hns hfrag p dp srcMutbl it hdp hp_ty with
-    ⟨ptrVal, entry, relOff, m1, hv, _, hlookup, hact, hk_addr, htspec, hload, h1⟩ |
+    ⟨ptrVal, entry, relOff, m1, hv, hoff0, hlookup, hk_addr, htspec, hload, h1⟩ |
       ⟨hnot, msg, hmsg⟩
   · left
     obtain ⟨_, _, hgood, _, _, hal, htgt⟩ :=
@@ -1524,7 +1850,7 @@ theorem evalPlace_deref {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     obtain ⟨_, htderef⟩ :=
       evalTargetPlace_deref h1 hb hfrag ⟨entry.targetLocal, entry.targetProjection⟩ it relOff htspec
         hk_addr
-    refine ⟨ptrVal, entry, relOff, m1, hv, hlookup, hact, hk_addr, htspec, ?_, h1, htgt⟩
+    refine ⟨ptrVal, entry, relOff, m1, hv, hoff0, hlookup, hk_addr, htspec, ?_, h1, htgt⟩
     rcases declPtrTy_cases dp.ty with hty | ⟨m', it', href, hty⟩
     · rw [hty] at hload
       rw [evalPlace, hload, ok_bind]
@@ -2030,9 +2356,8 @@ theorem evalStatement_assign_reborrow_mr {body : CapturedMir} {f : Gen.Function}
     (he : translateRvalue body.layouts body.localDecls targetTy rv = some e) :
     (∃ (parentPtr : ProvenancePtr) (parentEntry : BorrowEntry) (relOff : Nat),
       view[p]? = some (.init (.ptr parentPtr 8)) ∧
+      parentPtr.offsetBytes = 0 ∧
       lookupBorrow s.memory.borrows parentPtr.tag = some parentEntry ∧
-      (srcMutbl = .mut →
-        parentEntry.perm = .active ∨ parentEntry.perm = .reserved ∨ parentEntry.perm = .disabled) ∧
       ptrTargetSpec body.layouts body.localDecls
         ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩ = some (pointeeIt, relOff) ∧
       (view[i]? ≠ some .dead →
@@ -2062,10 +2387,10 @@ theorem evalStatement_assign_reborrow_mr {body : CapturedMir} {f : Gen.Function}
       simp [translateRvalue, borrowPlacePointeeInfo, hbpi, htpe, hbm] at he
       exact he.symm
   rcases evalPlace_deref h hb hns hfrag p dp srcMutbl pointeeIt hdp hp_pt with
-    ⟨parentPtr, parentEntry, relOff, m1, hv, hlookup, hact, hk_addr, htspec, hderefPl, h1, _⟩ |
+    ⟨parentPtr, parentEntry, relOff, m1, hv, hoff0, hlookup, hk_addr, htspec, hderefPl, h1, _⟩ |
       ⟨hnot, msg, hmsg⟩
   · left
-    refine ⟨parentPtr, parentEntry, relOff, hv, hlookup, hact, htspec, fun hlive => ?_⟩
+    refine ⟨parentPtr, parentEntry, relOff, hv, hoff0, hlookup, htspec, fun hlive => ?_⟩
     obtain ⟨_, _, hgood, htlt, hptrEq, hal, _⟩ :=
       evalTargetPlace h1 hb hns hfrag ⟨parentEntry.targetLocal, parentEntry.targetProjection⟩
         pointeeIt relOff htspec hk_addr
@@ -2229,19 +2554,14 @@ theorem translateRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List L
             simp only [ptrRvalueOk, Bool.and_eq_true, decide_eq_true_eq] at hok
             obtain ⟨⟨⟨_, _⟩, hpt_raw⟩, hz⟩ := hok
             have hpt := ptrPointeeOf_bind_of_rawPtrPointeeOf hpt_raw
-            unfold zeroOffsetConstOk at hz
-            split at hz
-            · next sz' rIt hval hit =>
-              have hsz : sz' = rIt.size.bytes := by simpa using hz
-              have hnb : isBoolTy c.ty = false := intTypeOf_isBoolTy hit
-              have hpos : 0 < 2 ^ (8 * rIt.size.bytes) := Nat.two_pow_pos _
-              refine ⟨rIt, intFromBits 0 rIt, pointeeIt.size.bytes, ?_, ?_⟩
-              · cases hs : rIt.signed <;> simp [intFromBits, hs, Nat.two_pow_pos]
-              · simp [translateRvalue, translateOperand, translatePlace, translateRelOp, translateBinOp,
-                  translateCheckedBinOp, operandPtrPointee, operandIntType, hpt, hval, hit, hnb, hsz,
-                  hpos, ptrOffsetExpr] at he
-                exact he.symm
-            · simp at hz
+            obtain ⟨rIt, hval, hit, _⟩ := zeroOffsetConstOk_iff.mp hz
+            have hnb : isBoolTy c.ty = false := intTypeOf_isBoolTy hit
+            refine ⟨rIt, intFromBits 0 rIt, pointeeIt.size.bytes, ?_, ?_⟩
+            · cases hs : rIt.signed <;> simp [intFromBits, hs, Nat.two_pow_pos]
+            · simp [translateRvalue, translateOperand, translatePlace, translateRelOp, translateBinOp,
+                translateCheckedBinOp, operandPtrPointee, operandIntType, hpt, hval, hit, hnb,
+                ptrOffsetExpr] at he
+              exact he.symm
           | _ => simp [ptrRvalueOk] at hok
         | cons _ _ => simp [ptrRvalueOk] at hok
       | _ => simp [ptrRvalueOk] at hok
@@ -2291,6 +2611,7 @@ theorem evalStatement_assign_ptrRvalue_mr {body : CapturedMir} {f : Gen.Function
     {targetTy : Option MirAst.Ty} (e : Gen.ValueExpr)
     (he : translateRvalue body.layouts body.localDecls targetTy rv = some e) :
     ∃ p, .copy ⟨p, []⟩ ∈ rvOperands rv ∧
+      (isMutPtrLocal body.localDecls i = true → isMutPtrLocal body.localDecls p = true) ∧
       (∀ pv, view[p]? = some (.init (.ptr pv 8)) →
         (view[i]? ≠ some .dead →
           ∃ m', evalStatement m (.Assign (.Local (localName i)) e) = .ok m' ∧
@@ -2298,7 +2619,6 @@ theorem evalStatement_assign_ptrRvalue_mr {body : CapturedMir} {f : Gen.Function
             lm m' blk stmt) ∧
         ∃ (entry : BorrowEntry) (relOff : Nat), pv.offsetBytes = 0 ∧
           lookupBorrow s.memory.borrows pv.tag = some entry ∧
-          (mutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved ∨ entry.perm = .disabled) ∧
           ptrTargetSpec body.layouts body.localDecls ⟨entry.targetLocal, entry.targetProjection⟩ =
             some (pointeeIt, relOff)) ∧
       ((view[p]? = some .uninit ∨ view[p]? = some .dead) → view[i]? ≠ some .dead →
@@ -2312,10 +2632,20 @@ theorem evalStatement_assign_ptrRvalue_mr {body : CapturedMir} {f : Gen.Function
     cases hdp : body.localDecls[p]? with
     | none => simp [hdp] at hsrc
     | some dp => exact ⟨dp, rfl, by simpa [hdp] using hsrc⟩
+  have hmut_ip : isMutPtrLocal body.localDecls i = true → isMutPtrLocal body.localDecls p = true := by
+    intro hmi
+    unfold isMutPtrLocal at hmi ⊢
+    rw [hd] at hmi
+    rw [hdp]
+    dsimp only [Option.bind_eq_bind, Option.bind_some] at hmi ⊢
+    rw [hpt] at hmi
+    rw [hp_pt]
+    have hm : mutbl = .mut := by cases mutbl <;> simp at hmi <;> rfl
+    rw [hmut hm]
   have he_form := translateRvalue_ptrRvalue hok hnraw hnref he p hpmem
-  refine ⟨p, hpmem, fun pv hpv => ?_, fun hu hlive => ?_⟩
+  refine ⟨p, hpmem, hmut_ip, fun pv hpv => ?_, fun hu hlive => ?_⟩
   · rcases evalPtrLoad h hb hns hfrag p dp srcMutbl pointeeIt hdp hp_pt with
-      ⟨ptrVal, entry, relOff, m1, hv, hoff0, hlookup, hact, hk_addr, htspec, hload, h1⟩ |
+      ⟨ptrVal, entry, relOff, m1, hv, hoff0, hlookup, hk_addr, htspec, hload, h1⟩ |
         ⟨hnot, _⟩
     · rw [hv] at hpv
       simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hpv
@@ -2358,8 +2688,7 @@ theorem evalStatement_assign_ptrRvalue_mr {body : CapturedMir} {f : Gen.Function
         simp only [Option.some.injEq, Prod.mk.injEq] at h2
         exact ⟨h2.1, h2.2⟩
       exact ⟨fun hlive => evalStatement_assign_ptr_of h i d hd hpt hlive e _ htpos htlt _ hal T'
-        m1 hm1 h1 htderef ptrVal htgt, entry, relOff, hoff0, hlookup, fun hm => hact (hmut hm),
-        htspec⟩
+        m1 hm1 h1 htderef ptrVal htgt, entry, relOff, hoff0, hlookup, htspec⟩
     · rcases hnot with h' | h' <;> rw [h'] at hpv <;> cases hpv
   · obtain ⟨pi, hpi⟩ := h.locs.some_of_live hs (fun hc => hlive (hc ▸ hs))
     have hplace := evalPlace_local_some h.shape i _ hspecF.2 pi hpi
@@ -2862,19 +3191,29 @@ theorem readsAgree_copy_target {L V : List LocalSlot} {q : Place}
 theorem evalRvalue_derefRead_eq (locals : List LocalSlot) {rv : Rvalue} {p : Nat}
     (hcrv : copyRv rv = .use (.copy ⟨p, [.deref]⟩)) (mem : MirSemantics.Memory)
     (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    {dp : LocalDecl} {srcMutbl : MirAst.Mutability} {pointeeIt : Gen.IntType}
+    (hdp : decls[p]? = some dp) (hp_pt : ptrPointeeOf dp.ty = some (srcMutbl, pointeeIt))
     (ptrVal : ProvenancePtr) (sz : Nat) (hp : locals[p]? = some (.init (.ptr ptrVal sz)))
     (entry : BorrowEntry) (he : lookupBorrow mem.borrows ptrVal.tag = some entry)
+    (hthin : needsThinPtrElemResolution entry.targetProjection ptrVal.offsetBytes = false)
     (hperm : entry.perm ≠ .disabled) (hnd : ∀ rest, entry.targetProjection ≠ .deref :: rest)
     (slot : LocalSlot) (ht : locals[entry.targetLocal]? = some slot) :
-    evalRvalue locals rv mem decls layouts =
-      evalRvalue locals (.use (.copy ⟨entry.targetLocal, entry.targetProjection⟩)) mem decls
-        layouts := by
+    (∀ v, evalOperand locals (.copy ⟨entry.targetLocal, entry.targetProjection⟩)
+        mem.borrows mem.globals layouts mem.callerLocals = .ok v locals →
+      evalRvalue locals rv mem decls layouts =
+        .ok v locals
+          { mem with borrows := MirSemantics.freezeDerefReadBorrowsAt locals p [] mem.borrows }) ∧
+    (evalOperand locals (.copy ⟨entry.targetLocal, entry.targetProjection⟩)
+        mem.borrows mem.globals layouts mem.callerLocals = .ub →
+      evalRvalue locals rv mem decls layouts = .ub) := by
   have hop := evalOperand_deref_eq_target locals p mem.borrows mem.globals layouts mem.callerLocals
-    ptrVal sz hp entry he hperm hnd slot ht
-  rcases copyRv_derefRead hcrv with rfl | rfl | rfl
-  · simp only [evalRvalue, hop]
-  · simp only [evalRvalue, evalOperand_move_deref_eq, hop]
-  · simp only [evalRvalue, hop]
+    ptrVal sz hp entry he hthin hperm hnd slot ht
+  refine ⟨fun v hv => ?_, fun hu => ?_⟩
+  · exact evalRvalue_derefRead_freeze locals rv p hcrv mem decls layouts v locals
+      (hop.trans hv) (validateLoadedValue_deref_of_ptrPointeeOf layouts decls p dp srcMutbl
+        pointeeIt v hdp hp_pt)
+  · exact evalRvalue_derefRead_ub_of_evalOperand locals rv p hcrv mem decls layouts
+      (hop.trans hu)
 
 theorem evalRvalue_derefRead_ub (locals : List LocalSlot) {rv : Rvalue} {p : Nat}
     (hcrv : copyRv rv = .use (.copy ⟨p, [.deref]⟩)) (mem : MirSemantics.Memory)
@@ -3092,8 +3431,9 @@ theorem statementOk_retag_spec {layouts : Layout.LayoutTable} {decls : List Loca
 
 /-- Anneal's execution of `StatementKind.retag` (`isRetagFnEntry kind = false`) on
 a thin pointer or reference local `_i`: advances the program counter unchanged when
-`_i` holds an initialized pointer whose `BorrowEntry` is not `.disabled`, and
-raises UB when `_i` is uninitialized or dead. -/
+`_i` holds an initialized pointer whose `BorrowEntry` is not `.disabled` (and not
+`.frozen` when `_i` is a mutable reference), and raises UB when `_i` is
+uninitialized or dead. -/
 theorem evalStmt_retag_local (s : MachineState) (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) (kind : RetagKind) (i : Nat) (span : String)
     (hkind : isRetagFnEntry kind = false) :
@@ -3101,20 +3441,65 @@ theorem evalStmt_retag_local (s : MachineState) (decls : List LocalDecl)
       s.frame.locals[i]? = some (.init (.ptr ptrVal sz)) →
       lookupBorrow s.memory.borrows ptrVal.tag = some entry →
       entry.perm ≠ .disabled →
+      ((match placeTy decls layouts ⟨i, []⟩ with
+        | some { kind := .ref .mut _, .. } => true
+        | _ => false) = true → entry.perm ≠ .frozen) →
       evalStmt s ⟨.retag kind ⟨i, []⟩, span⟩ decls layouts =
         .tau (.running (advanceStmt s s.frame.locals s.memory))) ∧
     ((s.frame.locals[i]? = some .uninit ∨ s.frame.locals[i]? = some .dead) →
       evalStmt s ⟨.retag kind ⟨i, []⟩, span⟩ decls layouts = MirStepNode.fail .ub) := by
-  refine ⟨fun ptrVal sz entry hi hlk hndis => ?_, fun hu => ?_⟩
+  refine ⟨fun ptrVal sz entry hi hlk hndis hnf => ?_, fun hu => ?_⟩
   · cases hperm : entry.perm with
     | disabled => exact absurd hperm hndis
-    | active | frozen | reserved =>
+    | active | reserved =>
       cases kind with
       | fnEntry => simp [isRetagFnEntry] at hkind
       | default | twoPhase | raw =>
         simp [evalStmt, evalOperand, get?, hi, readProjectedValue, hlk, hperm,
           MirStepNode.step, advanceStmt]
+    | frozen =>
+      have hnot_mut : (match placeTy decls layouts ⟨i, []⟩ with
+          | some { kind := .ref .mut _, .. } => true
+          | _ => false) = false := by
+        cases hm : (match placeTy decls layouts ⟨i, []⟩ with
+          | some { kind := .ref .mut _, .. } => true
+          | _ => false) with
+        | false => rfl
+        | true => exact absurd hperm (hnf hm)
+      cases kind with
+      | fnEntry => simp [isRetagFnEntry] at hkind
+      | default | twoPhase | raw =>
+        simp [evalStmt, evalOperand, get?, hi, readProjectedValue, hlk, hperm,
+          MirStepNode.step, advanceStmt]
+        rw [hnot_mut]
+        rfl
   · rcases hu with hu | hu <;> simp [evalStmt, evalOperand, get?, hu]
+
+theorem retag_not_frozen_of_usable {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    {i : Nat} {di : LocalDecl} {mutbl : MirAst.Mutability} {pointeeIt : Gen.IntType}
+    {entry : BorrowEntry}
+    (hdi : decls[i]? = some di)
+    (hi_ty : ptrPointeeOf di.ty = some (mutbl, pointeeIt))
+    (hmut : mutbl = .mut → entry.perm = .active ∨ entry.perm = .reserved) :
+    (match placeTy decls layouts ⟨i, []⟩ with
+      | some { kind := .ref .mut _, .. } => true
+      | _ => false) = true → entry.perm ≠ .frozen := by
+  intro hm
+  have hpl : placeTy decls layouts ⟨i, []⟩ = some di.ty := by
+    simp [placeTy, resolveProjectedTy, get?, hdi]
+  rw [hpl] at hm
+  have hmut_eq : mutbl = .mut := by
+    unfold ptrPointeeOf at hi_ty
+    rcases di with ⟨_, ⟨kind, _⟩, _⟩
+    dsimp only at hm hi_ty
+    cases kind <;> try (simp at hm)
+    rename_i m inner
+    cases m
+    · simp at hm
+    · simp only [Option.map_eq_some_iff] at hi_ty
+      obtain ⟨_, _, heq⟩ := hi_ty
+      exact (Prod.mk.inj heq).1.symm
+  rcases hmut hmut_eq with hp | hp <;> simp [hp]
 
 /-- MiniRust's execution of `Statement::Validate` on a declared pointer or
 reference local `_i`: when `view[i]?` holds an initialized pointer, validates
@@ -3173,7 +3558,7 @@ theorem evalStatement_validate_local_mr {body : CapturedMir} {f : Gen.Function} 
   | init v =>
     left
     obtain ⟨ptrVal, rfl⟩ := (DeclSlotOk_of_isPtrTy hisPtr (.init v)).mp hslotOk
-    obtain ⟨entry, relOff, _, hlookup, _, htspec⟩ :=
+    obtain ⟨entry, relOff, _, hlookup, htspec⟩ :=
       hb.ptr_slots i di srcMutbl srcIt ptrVal hdi hi_ty hsi
     obtain ⟨hentry_mem, _⟩ := lookupBorrow_mem_and_tag hlookup
     obtain ⟨_, _, _, _, hk_addr, _⟩ := hb.entries_ok entry hentry_mem
