@@ -6312,9 +6312,8 @@ Count the typed union slots among the first `count` entries of a union field
 list whose value occupies storage alongside a raw-byte overlay: `.unit`
 placeholders are empty, and a field-less `.aggregate 0 .nil` is empty when its
 field layout (from `fieldLayouts`) is zero-sized or absent (while
-`layoutFreeAmbiguous` in `encodeUnionSlotsIntoBufAux` and
-`existsEnumLayoutMatchingBufAux` in `mergeUnionTypedSlotsAux` validate
-`fieldLayouts = .nil` enum variants).
+`layoutFreeAmbiguous` in `encodeUnionSlotsIntoBufAux` and the overlay check in
+`mergeUnionTypedSlotsAux` validate `fieldLayouts = .nil` enum variants).
 -/
 def unionNonUnitNonZstTypedSlotCount (layouts : LayoutTable) :
     Nat → List Nat → List Value → Nat
@@ -6337,45 +6336,6 @@ def unionNonUnitNonZstTypedSlotCount (layouts : LayoutTable) :
     match slotEmpty with
     | true => unionNonUnitNonZstTypedSlotCount layouts k nextIdxs rest
     | false => .succ (unionNonUnitNonZstTypedSlotCount layouts k nextIdxs rest)
-
-/--
-`true` when some non-zero-sized multi-variant enum layout in `layouts` encodes
-`.aggregate varIdx .nil` (`encodeValueToBytes`) to a non-empty byte image whose
-non-padding value bytes agree with `(buf, bufMask)` under
-`mergeMaskedAbstractBytes`. Without `fieldLayouts` the slot's enum type is
-unknown, so this existential check keeps freshly constructed unions readable but
-cannot reject a stale overlay that happens to match an unrelated enum layout
-(e.g. a `u16`-tagged enum's image of the same variant index).
--/
-def existsEnumLayoutMatchingBufAux
-    (layouts : LayoutTable)
-    (varIdx : Nat)
-    (buf : List AbstractByte)
-    (bufMask : List Bool) :
-    Nat → List TypeLayout → Bool
-  | _, .nil => false
-  | idx, l :: rest =>
-    let matchesHere : Bool :=
-      match Nat.ble 1 l.size.bytes, l.variants with
-      | true, .multiple _ _ _ =>
-        match
-          encodeValueToBytes
-            defaultCodecFuel
-            layouts
-            { kind := .adt "" .nil, layoutIdx := idx }
-            (.aggregate varIdx .nil)
-        with
-        | .some (b :: bs) =>
-          let fBytes := b :: bs
-          let fMask := replicateBool (length fBytes) true
-          match mergeMaskedAbstractBytes buf bufMask fBytes fMask with
-          | .some _ => true
-          | .none => false
-        | _ => false
-      | _, _ => false
-    match matchesHere with
-    | true => true
-    | false => existsEnumLayoutMatchingBufAux layouts varIdx buf bufMask (.succ idx) rest
 
 /--
 Merge the images of the non-`.unit` typed union slots `fieldVals` into
@@ -6430,11 +6390,11 @@ def mergeUnionTypedSlotsAux
       | .none =>
         match fv, hasOverlay with
         | .aggregate varIdx .nil, true =>
-          let needsEnumMatch : Bool :=
+          let isStaleEnumSlot : Bool :=
             match varIdx with
             | .zero => layoutEntriesHaveNonZstFieldlessEnum0 layouts.entries
             | .succ _ => true
-          match needsEnumMatch with
+          match isStaleEnumSlot with
           | false =>
             mergeUnionTypedSlotsAux
               layouts
@@ -6446,20 +6406,7 @@ def mergeUnionTypedSlotsAux
               vRest
               buf
               bufMask
-          | true =>
-            match existsEnumLayoutMatchingBufAux layouts varIdx buf bufMask 0 layouts.entries with
-            | false => .none
-            | true =>
-              mergeUnionTypedSlotsAux
-                layouts
-                encodeSlot
-                fallbackLayoutIdx
-                hasOverlay
-                unionSize
-                nextIdxs
-                vRest
-                buf
-                bufMask
+          | true => .none
         | .aggregate _ (_ :: _), true =>
           match encodeUntypedValueToBytes defaultCodecFuel fv with
           | .none => .none
@@ -7923,23 +7870,34 @@ def rebuildUnionFieldsAfterWriteAux
 
 /--
 `true` when the active value `v` of a union field must be stored as the `.unit`
-placeholder: `v` has no faithful layout-free image
-(`unionSlotLacksLayoutFreeImage`, e.g. a field-less `.aggregate 0 .nil` while
-`layouts` holds a non-zero-sized enum with a field-less variant `0`) but its
-field/operand type is statically zero-sized, so it contributes no storage bytes
-and must never be mistaken for an enum tag when the union's slots are merged.
+placeholder in `typedFields`:
+- `v` has no faithful layout-free image (`unionSlotLacksLayoutFreeImage`) and its
+  field/operand type is statically zero-sized; or
+- the union has no `fieldLayouts` (`unionFieldLayouts = .nil`) and `v` is a
+  field-less aggregate `.aggregate _ .nil` whose typed byte image (`opTyOpt`) is
+  non-empty, so `v`'s exact tag/padding bytes are carried by the raw-byte overlay
+  and any non-ZST `.aggregate _ .nil` later found in `typedFields` alongside an
+  overlay can only come from a stale union-unaware `writeProjectedValue`.
 -/
 def unionActiveSlotIsZstPlaceholder
     (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (opTyOpt : Option Ty)
-    (v : Value) :
+    (v : Value)
+    (unionFieldLayouts : List Nat := .nil) :
     Bool :=
   match unionSlotLacksLayoutFreeImage layouts v, opTyOpt with
   | true, .some opTy =>
-    match tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts opTy) with
+    let rOpTy := resolveTyWithLocalDecls localDecls layouts opTy
+    match tyByteSize localDecls layouts rOpTy with
     | .some 0 => true
-    | _ => false
+    | _ =>
+      match unionFieldLayouts, v with
+      | .nil, .aggregate _ .nil =>
+        match encodeTypedValueToBytes layouts rOpTy v with
+        | .some (_ :: _) => true
+        | _ => false
+      | _, _ => false
   | _, _ => false
 
 /--
@@ -8073,7 +8031,14 @@ def writeProjectedValueUnionAware
                     mergedBytes
                 | .none => typedFields
               .ok (.aggregate 0 finalFields)
-            match unionActiveSlotIsZstPlaceholder localDecls layouts (.some rFieldTy) updatedFv with
+            match
+              unionActiveSlotIsZstPlaceholder
+                localDecls
+                layouts
+                (.some rFieldTy)
+                updatedFv
+                l.fieldLayouts
+            with
             | true => finish .unit
             | false => finish updatedFv
         match rest with
@@ -17848,7 +17813,14 @@ def evalAggregateAdtUnionValue?
                 v
                 opTyOpt
             .some (.aggregate 0 fields)
-          match unionActiveSlotIsZstPlaceholder localDecls layouts opTyOpt v with
+          match
+            unionActiveSlotIsZstPlaceholder
+              localDecls
+              layouts
+              opTyOpt
+              v
+              unionLayout.fieldLayouts
+          with
           | true => mk .unit
           | false => mk v
         | .none =>
@@ -17890,7 +17862,14 @@ def evalAggregateAdtUnionValue?
                     activeVal
                     activeOpTyOpt
                 .some (.aggregate 0 fields)
-              match unionActiveSlotIsZstPlaceholder localDecls layouts activeOpTyOpt activeVal with
+              match
+                unionActiveSlotIsZstPlaceholder
+                  localDecls
+                  layouts
+                  activeOpTyOpt
+                  activeVal
+                  unionLayout.fieldLayouts
+              with
               | true => mk .unit
               | false => mk activeVal
           | .none =>
