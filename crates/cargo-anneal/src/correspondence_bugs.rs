@@ -270,7 +270,7 @@ pub struct FileIssueOptions {
     pub gap_id: String,
     /// Target GitHub repository (`"<owner>/<repo>"`).
     pub repo: String,
-    /// Optional explicit `--ldap <ldap>` forwarded to the `gh` x20 bridge when
+    /// Optional explicit `--ldap <ldap>` forwarded to the `gh` remote bridge when
     /// `execute == true`.
     pub ldap: Option<String>,
     /// When `false` (the mandatory default), NO external process is ever
