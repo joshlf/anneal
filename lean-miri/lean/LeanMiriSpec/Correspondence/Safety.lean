@@ -14,6 +14,7 @@ import LeanMiriSpec.Correspondence.EnumLM2_3
 import LeanMiriSpec.Correspondence.SimLM2_2
 import LeanMiriSpec.Correspondence.SimLM2_3
 import LeanMiriSpec.Correspondence.UnionLM2_4
+import LeanMiriSpec.Correspondence.SimLM2_4
 import LeanMiriSpec.Correspondence.RefLM3_2
 import LeanMiriSpec.Correspondence.CallLM4_1
 
@@ -225,12 +226,18 @@ Further boundaries of the whole-program agreement:
   lowered to `lean-miri` steps (`annealStepHooks_retag_ne_ok`,
   `annealStepHooks_deinit_ne_ok`), so they are outside every fragment.
 * The memory accesses of this `lean-miri` instantiation do not run the
-  borrow tracker's access hooks (`annealMemoryCopyHooks`): Tree Borrows
-  permissions are certified per access through `TreeBorrowsRel` (`LM-3.3`),
-  and a `miriSystem` run need not report the permission violations that make
-  Anneal fault (such as the `Disabled` read of
-  `MiriDiffWitnesses.w4_unsafe_cell_vs_freeze`), Anneal's `TreeBorrowPerm`
-  checks being stricter.
+  borrow tracker's access hooks (`annealMemoryCopyHooks_access_ok`): Tree
+  Borrows permissions are certified per access through `TreeBorrowsRel`
+  (`LM-3.3`), and a `miriSystem` run does not report the permission
+  violations that make Anneal fault, Anneal's `TreeBorrowPerm` checks being
+  stricter: `MiriDiffWitnesses.w4_disabled_read_divergence` reads through a
+  `Disabled` reference, which is undefined behavior in Anneal while
+  `lean-miri`'s run continues with the read value.
+* `CastKind.transmute` and `CastKind.pointerCoercion` step in Anneal but fail
+  closed in `annealCastHooks` (`StepError.unsupported`):
+  `MiriDiffWitnesses.w1_transmute_bool_divergence` (a valid `bool` transmute
+  returns in Anneal; an invalid one is undefined behavior in Anneal; both are
+  `.unsupported` in `lean-miri`).
 * A `Call` to a function outside Anneal's `callees` is an external
   interaction (`MirCallE`) whose responses `TreeSafe` and `ReachesRet`
   quantify over; the instantiations here model no external functions, so
@@ -767,6 +774,19 @@ theorem miriIter_after_root_pop (body : CapturedMir) {m' : AnnealStepState}
     step_of_frames_empty _ hemp
   exact ⟨hcore, rfl, miriIter_of_coreStep_false hcore, rfl⟩
 
+/-- The memory-access hooks of this `lean-miri` instantiation
+(`annealMemoryCopyHooks`) succeed without effect: no borrow-tracker check runs
+on the accesses of `lean-miri`'s memory copies (the ledger's Tree Borrows
+boundary). -/
+theorem annealMemoryCopyHooks_access_ok :
+    (∀ mach memory a b c d e,
+      annealMemoryCopyHooks.beforeMemoryRead mach memory a b c d e =
+        { memory := memory, hooks := mach, outcome := .ok () }) ∧
+    (∀ mach memory a b c d e,
+      annealMemoryCopyHooks.beforeMemoryWrite mach memory a b c d e =
+        { memory := memory, hooks := mach, outcome := .ok () }) :=
+  ⟨fun _ _ _ _ _ _ _ => rfl, fun _ _ _ _ _ _ _ => rfl⟩
+
 /-! ## 3. Anneal's MIR coalgebra (`stepMirState`) -/
 
 /-- Some finitely reachable residual of `t` immediately emits the
@@ -966,7 +986,8 @@ return-value relation `RetRel`, between Anneal's `stepMirFn` result and
   `Inv`-related pair with a nonempty `lean-miri` stack;
 * Anneal returns normally from the root frame while `lean-miri` pops it, with
   `RetRel`-related return value and return operand; or
-* both fail, agreeing on whether the failure is undefined behavior. -/
+* both fail with the same three-way failure class (`FaultAgrees`: undefined
+  behavior, unsupported, or blocked). -/
 inductive Lockstep (H : AnnealMiriHooks) (Inv : MachineState → AnnealStepState → Prop)
     (RetRel : Value → Miri.Interpreter.Operand AnnealProv → Prop) (m : AnnealStepState) :
     MirStepNode → Miri.Interpreter.StepResult AnnealStepState Bool → Prop where
@@ -1487,8 +1508,8 @@ variable {body : CapturedMir} {H : AnnealMiriHooks}
 /-- **Master multi-step theorem.** Under a step-closed simulation, after any
 number `fuel` of steps, Anneal's `runAnnealBounded` and `lean-miri`'s
 `RunLoop.iteration` loop (`runLoopFuel`) are both running in `Inv`-related
-states, both returned with `RetRel`-related values, or both failed agreeing on
-undefined behavior. -/
+states, both returned with `RetRel`-related values, or both failed with the
+same three-way failure class (`FaultAgrees`). -/
 theorem runLoop_universal_simulation (hsim : StepClosedSim body H Inv RetRel) (fuel : Nat)
     {s : MachineState} {m : AnnealStepState} (hinv : Inv s m) :
     RunLoopRel Inv RetRel (runAnnealBounded body fuel s) (runLoopFuel H fuel m) := by
@@ -4875,9 +4896,112 @@ theorem stepClosedSim_of_stepRelLM2_3_enumReturn {body : CapturedMir} {env : Enu
         (Inv := fun s m => (∃ b, StateRelLM2_3 body env b s m) ∧ Frag s m) hret)
       (fun _ _ h => h) (fun _ _ h => Or.inr h)
 
+/-- At a terminator, `annealStepHooksLM2_4` (which overrides only
+`StepHooks.assign`) runs `annealTerminatorHooksLM2_2`, whose control hooks are
+`annealControlHooks`. -/
+theorem miri_step_at_terminator_lm2_4
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {bb : BasicBlockData}
+    (hframes : m.stack.frames = #[topFrame])
+    (hbody : topFrame.body = translateBody body)
+    (hloc : topFrame.location = .mir ⟨s.frame.blockIdx, s.frame.stmtIdx⟩)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none) :
+    Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m =
+      let res := Miri.Interpreter.ControlFlow.evalTerminator
+        (annealTerminatorHooksLM2_2 body.localDecls body.layouts) ()
+        (translateTerminator bb.terminator) m
+      (res.1, res.2.map fun _ => true) := by
+  unfold Miri.Interpreter.Step.step
+  rw [stack_currentFrame?_singleton m.stack topFrame hframes]
+  dsimp only
+  rw [hloc, hbody]
+  dsimp only
+  rw [translateBody_basicBlocks_getElem?, hbb]
+  dsimp only [Option.map]
+  rw [translateBasicBlockData_statements_getElem?, hstmt_none]
+  rfl
+
+/-- **`LM-2.4` root return** (`StateRelLM2_4`, `annealStepHooksLM2_4`): the root
+`Return` of a sized immediate `_0` steps both machines in lockstep (`StepRel`)
+even while initialized, memory-backed union locals remain live in the frame:
+a union local is always `.live (.indirect _)`, so an immediate `_0` is related
+by the base `LocalRel`. -/
+theorem step_terminator_return_lm2_4_simulation
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    (hstate : StateRelLM2_4 body s m)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt_none : get? bb.statements s.frame.stmtIdx = none)
+    (hstmt_len : s.frame.stmtIdx = length bb.statements)
+    (hcleanup : bb.isCleanup = false)
+    (hret : bb.terminator.kind = .return_)
+    {decl0 : LocalDecl}
+    (hdecl0 : get? body.localDecls 0 = some decl0)
+    (hsz0 : (translateTy decl0.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (himm0 : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame 0) :
+    StepRel body m
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooksLM2_4 body.localDecls body.layouts) () m) := by
+  rcases hstate with
+    ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
+      hcal, hstack, hbor, hprot, hcaller, _⟩
+  rw [stepMirFn_eq_of_not_other body s hcal hphase]
+  have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
+  simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
+  rw [miri_step_at_terminator_lm2_4 hframes hframe.body_eq hframe.location_eq hbb hstmt_none]
+  obtain ⟨slot0, mls0, _, _, hslot0, hmls0, _, huloc0⟩ := hframe.lookup_local hdecl0
+  have hget0 := frame_getLocal_of_getElem? topFrame 0 mls0 hmls0
+  have himm0' := himm0 topFrame hframes mls0 hmls0
+  have hloc0 : LocalRel m.machine decl0 body.layouts slot0 mls0 := by
+    cases huloc0 with
+    | base _ _ h => exact h
+    | union _ _ _ mp _ _ _ _ => exact False.elim (himm0' mp rfl)
+  have hctrl_eq :
+      (annealTerminatorHooksLM2_2 body.localDecls body.layouts).toControlHooks =
+        annealControlHooks := rfl
+  unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
+  rw [hret, hstack, hctrl_eq, hslot0]
+  dsimp only [translateTerminatorKind, Id.run, Pure.pure]
+  cases hloc0 with
+  | dead _ _ =>
+    rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
+      hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_dead hframes hget0)]
+    exact StepRel.ub _ _
+  | indirect _ mp _ _ _ _ =>
+    exact False.elim (himm0' mp rfl)
+  | immediate _ imm _ _ hval =>
+    rcases hval with ⟨rfl, rfl⟩ | ⟨retVal, rfl, himmRel⟩
+    · rw [returnFromCurrentFrame_of_error annealControlHooks hframes hframe.body_eq
+        hframe.location_eq hbb hcleanup (annealControlHooks_returnOperand_uninit hframes hget0)]
+      exact StepRel.ub _ _
+    · cases himmRel with
+      | unit hzero => exact False.elim (hsz0 hzero)
+      | scalar sc msc hsc hsz_sc hbool_sc hchar_sc =>
+        have hop0 := annealControlHooks_returnOperand_scalar hframes hget0
+        rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+          hframe.location_eq hbb hcleanup hretCont hop0
+          (annealControlHooks_popFrame_singleton hframes)
+          (annealControlHooks_copyReturn_empty _ hretPlace)
+          (annealControlHooks_cleanupFrame_eq false topFrame _)]
+        exact StepRel.retRoot decl0 _ _ s.memory _ hdecl0 hop0
+          (.scalar sc msc hsc hsz_sc hbool_sc hchar_sc) rfl
+      | scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair =>
+        have hop0 := annealControlHooks_returnOperand_scalarPair hframes hget0
+        rw [returnFromCurrentFrame_of_ok annealControlHooks hframes hframe.body_eq
+          hframe.location_eq hbb hcleanup hretCont hop0
+          (annealControlHooks_popFrame_singleton hframes)
+          (annealControlHooks_copyReturn_empty _ hretPlace)
+          (annealControlHooks_cleanupFrame_eq false topFrame _)]
+        exact StepRel.retRoot decl0 _ _ s.memory _ hdecl0 hop0
+          (.scalarPair sc₁ sc₂ msc₁ msc₂ hsc₁ hsc₂ hagg hpair) rfl
+
 /-- `LM-2.4` lifting (`StateRelLM2_4`): union steps through `StepRelLM2_4`,
 other steps and scalar root returns through the base `StepRel` (whose
-post-states embed by `StateRel.toLM2_4`). -/
+post-states embed by `StateRel.toLM2_4`); root returns under `StateRelLM2_4`
+with live union locals are supplied by `step_terminator_return_lm2_4_simulation`. -/
 theorem stepClosedSim_of_stepRelLM2_4 {body : CapturedMir}
     {Frag : MachineState → AnnealStepState → Prop}
     (h : ∀ s m, StateRelLM2_4 body s m → Frag s m →
