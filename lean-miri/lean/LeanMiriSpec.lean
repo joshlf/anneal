@@ -28,6 +28,17 @@ import LeanMiriSpec.Correspondence.WitLM3_1
 import LeanMiriSpec.Correspondence.RefLM3_2
 import LeanMiriSpec.Correspondence.SimLM3_2
 import LeanMiriSpec.Correspondence.WitLM3_2
+import LeanMiriSpec.Correspondence.BitsLM4_2
+import LeanMiriSpec.Correspondence.IntrinsicLM4_2
+import LeanMiriSpec.Correspondence.NumericLM4_2
+import LeanMiriSpec.Correspondence.SaturatingLM4_2
+import LeanMiriSpec.Correspondence.ExactDivLM4_2
+import LeanMiriSpec.Correspondence.CallLM4_2
+import LeanMiriSpec.Correspondence.OffsetLM4_2
+import LeanMiriSpec.Correspondence.WriteBytesLM4_2
+import LeanMiriSpec.Correspondence.CopyLM4_2
+import LeanMiriSpec.Correspondence.SimLM4_2
+import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Audit
 
 /-!
@@ -109,6 +120,32 @@ import LeanMiriSpec.Audit
   (`evalRvalue_reborrow_simulation`), and the dangling-reborrow divergence.
 * `LeanMiriSpec.Correspondence.WitLM3_2`: `LM-3.2` witnesses, including end-to-end
   runs of `ValidityVisitor.validatePlace`.
+* `LeanMiriSpec.Correspondence.BitsLM4_2`: `BitVec.ofNat` bit-level lemmas for
+  `ctpop`, `ctlz`, `cttz`, `bswap`, and `bitreverse` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.IntrinsicLM4_2`: `AnnealIntrinsic` catalog,
+  function-item type encoding (`encodeTyId`, `decodeFnItemIntrinsic?`), and
+  `annealStepHooks` intrinsic wiring (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.NumericLM4_2`: `ScalarRel` agreement for integer
+  bit-manipulation intrinsics across all 12 integer widths (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.SaturatingLM4_2`: `ScalarRel` agreement for
+  signed and unsigned `saturating_add` and `saturating_sub` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.ExactDivLM4_2`: `ScalarRel` and UB equivalence
+  for signed and unsigned `exact_div` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.CallLM4_2`: `TerminatorKind.Call` intrinsic
+  plumbing and `StateRelLM3_1` return-place write lemmas (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.OffsetLM4_2`: real-step `StateRelLM3_1`
+  simulation for `arith_offset` / `wrapping_offset` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.WriteBytesLM4_2`: real-step `StateRelLM3_1`
+  simulation and Tree Borrows divergence for `write_bytes` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.CopyLM4_2`: real-step `StateRelLM3_1` simulation
+  and uninitialized-source / Tree Borrows divergences for
+  `NonDivergingIntrinsic.CopyNonOverlapping` (`LM-4.2`).
+* `LeanMiriSpec.Correspondence.SimLM4_2`: unified `LM-4.2` simulation theorems
+  for `Assume`, `CopyNonOverlapping`, `exact_div`, `write_bytes`,
+  `arith_offset`/`wrapping_offset`, and integer bit-manipulation / saturating
+  intrinsics.
+* `LeanMiriSpec.Correspondence.WitLM4_2`: concrete safe, UB, and divergence
+  real-step `StateRelLM3_1` witnesses for `LM-4.2`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

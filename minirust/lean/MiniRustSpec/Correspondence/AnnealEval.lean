@@ -1478,8 +1478,25 @@ theorem evalRvalue_frag (decls : List LocalDecl) (locals : List LocalSlot)
     obtain ⟨hsome, hnone⟩ :=
       evalOperand_frag decls locals hslots hn it op hok mem.borrows mem.globals layouts mem.callerLocals
     refine ⟨fun r hr => ?_, fun h => ?_⟩
-    · simp [evalRvalue, hsome r hr]
-    · simp [evalRvalue, hnone h]
+    -- `operandOk` admits only constants and unprojected copies, so the
+    -- dereference-read arms of `evalRvalue (.use _)`, which freeze borrows,
+    -- never apply.
+    · cases op with
+      | copy p =>
+        obtain ⟨j, proj⟩ := p
+        cases proj with
+        | nil => simp [evalRvalue, hsome r hr]
+        | cons _ _ => simp [operandOk] at hok
+      | move p => simp [operandOk] at hok
+      | constant c => simp [evalRvalue, hsome r hr]
+    · cases op with
+      | copy p =>
+        obtain ⟨j, proj⟩ := p
+        cases proj with
+        | nil => simp [evalRvalue, hnone h]
+        | cons _ _ => simp [operandOk] at hok
+      | move p => simp [operandOk] at hok
+      | constant c => simp [evalRvalue, hnone h]
   | .unaryOp uop op, hok =>
     simp only [rvalueOk, Bool.and_eq_true] at hok
     obtain ⟨huop, hok⟩ := hok

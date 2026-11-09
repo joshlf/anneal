@@ -203,8 +203,8 @@ def evalCopySingleDirect
             | true => .some copiedVal
             | false =>
               match
-                rigidTyByteSize layouts srcPt,
-                rigidTyByteSize layouts dstPt
+                rigidTyKindByteSize srcPt.kind,
+                rigidTyKindByteSize dstPt.kind
               with
               | .some sSz, .some dSz =>
                 match Nat.beq sSz dSz with
@@ -351,13 +351,374 @@ def evalCopySingleDirect
     | _ => MirStepNode.fail .ub
 
 /--
+ABI alignment in bytes on a 64-bit x86-64 target for a `RigidTy` whose
+alignment is determined structurally without consulting `LayoutTable`:
+`bool` and `()` / zero-sized function items have alignment `1`, `char` has
+alignment `4`, primitive integers (`u8`..`u128`, `usize`, `i8`..`i128`,
+`isize`) have alignment equal to their byte width (`1, 2, 4, 8, 16`), thin and
+wide pointers/references have alignment `8`, and `[T; N]` has the alignment of
+`T`.
+
+Reference (The Rust Reference, "Type Layout — Size and Alignment", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of primitives is platform-specific. In most cases, their
+> alignment is equal to their size, although it may be less. In particular,
+> `i128` and `u128` are often aligned to 4 or 8 bytes even though their size is
+> 16, and on many 32-bit platforms `i64`, `u64`, and `f64` are only aligned to
+> 4 bytes, not 8."
+>
+> "Pointers to sized types have the same size and alignment as `usize`."
+>
+> "An array of `[T; N]` has a size of `size_of::<T>() * N` and the same
+> alignment of `T`."
+-/
+@[reducible]
+def rigidTyKindAlignBytes : RigidTy → Option Nat
+  | .bool => .some 1
+  | .char => .some 4
+  | .uint w => intCastTargetBytes (.uint w)
+  | .int w => intCastTargetBytes (.int w)
+  | .tuple .nil => .some 1
+  | .fnDef _ _ => .some 1
+  | .fnPtr _ _ _ _ => .some 8
+  | .ref _ _ => .some 8
+  | .rawPtr _ _ => .some 8
+  | .array elemKind _ => rigidTyKindAlignBytes elemKind
+  | _ => .none
+
+/--
+Determine the ABI alignment in bytes of `ty` using `rigidTyKindAlignBytes` for
+primitives, pointers, and homogeneous arrays, or `LayoutTable.lookup layouts
+ty.layoutIdx` for ADTs and layout-indexed aggregates.
+-/
+@[reducible]
+def rigidTyAlignBytes (layouts : LayoutTable) (ty : Ty) : Option Nat :=
+  match rigidTyKindAlignBytes ty.kind with
+  | .some al => .some al
+  | .none =>
+    match LayoutTable.lookup layouts ty.layoutIdx with
+    | .some l => .some l.align.bytes
+    | .none => .none
+
+/--
+Outcome of `copy_nonoverlapping` size-overflow, alignment, and zero-byte
+prechecks prior to live-allocation dereference.
+-/
+inductive CopyPrecheckResult where
+  | ub
+  | unsupported
+  | zero
+  | nonZero (totalBytesOpt : Option Nat)
+
+/--
+Test whether runtime pointer operand `v` satisfies byte alignment `elemAlign`
+(either as a provenance-carrying `ProvenancePtr` at aligned `offsetBytes` or as
+an 8-byte provenance-free integer scalar at aligned `bits`).
+-/
+@[reducible]
+def ptrValueAligned (elemAlign : Nat) : Value → Bool
+  | .ptr p _ =>
+    Bool.or (Nat.beq elemAlign 0) (Nat.beq (Nat.mod p.offsetBytes elemAlign) 0)
+  | .scalar sc =>
+    Bool.and
+      (Nat.beq sc.sizeBytes 8)
+      (Bool.or (Nat.beq elemAlign 0) (Nat.beq (Nat.mod sc.bits elemAlign) 0))
+  | _ => false
+
+/--
+Check `count * size_of::<T>() <= isize::MAX` (`9223372036854775807`), pointer
+alignment of both `srcVal` and `dstVal` to `align_of::<T>()` (including when
+`count == 0`), and zero-byte short-circuiting (`count == 0` or `size_of::<T>()
+== 0`). Pointee size and alignment are resolved directly from `srcPt.kind` via
+`rigidTyKindByteSize` and `rigidTyKindAlignBytes` (never consulting
+`LayoutTable.lookup` on `pointeeTyOf`'s synthetic placeholder `layoutIdx := 0`),
+failing closed with `.unsupported` when unresolved.
+-/
+@[reducible]
+def copyPrecheck
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (src : Operand)
+    (srcVal dstVal : Value)
+    (countBits : Nat) :
+    CopyPrecheckResult :=
+  match operandPointeeTy localDecls layouts src with
+  | .none => .unsupported
+  | .some srcPt =>
+    match
+      rigidTyKindByteSize srcPt.kind,
+      rigidTyKindAlignBytes srcPt.kind
+    with
+    | .some elemBytes, .some elemAlign =>
+      let totalBytes := Nat.mul countBits elemBytes
+      match Nat.ble totalBytes 9223372036854775807 with
+      | false => .ub
+      | true =>
+        let alignOk : Bool :=
+          Bool.and
+            (ptrValueAligned elemAlign srcVal)
+            (ptrValueAligned elemAlign dstVal)
+        match alignOk with
+        | false => .ub
+        | true =>
+          match Nat.beq countBits 0 with
+          | true => .zero
+          | false =>
+            match Nat.beq totalBytes 0 with
+            | true => .zero
+            | false => .nonZero (.some totalBytes)
+    | _, _ => .unsupported
+
+/--
+Check that a borrow access of `totalBytes` starting at `ptr.offsetBytes` targets
+a declared local in `localDecls` and, for a root-local borrow whose byte size
+`layouts` resolves, fits within that local's byte size.
+-/
+@[reducible]
+def copyBorrowInRootBounds
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ptr : ProvenancePtr)
+    (entry : BorrowEntry)
+    (totalBytesOpt : Option Nat) :
+    Bool :=
+  match totalBytesOpt with
+  | .none => true
+  | .some totalBytes =>
+    match get? localDecls entry.targetLocal with
+    | .none => false
+    | .some decl =>
+      match entry.targetProjection with
+      | .nil =>
+        match rigidTyByteSize layouts decl.ty with
+        | .some localBytes =>
+          Nat.ble (Nat.add ptr.offsetBytes totalBytes) localBytes
+        | .none => true
+      | _ :: _ => true
+
+/--
+Look up `ptr.tag` in `borrows` and verify `copyBorrowInRootBounds` for
+`totalBytesOpt`.
+-/
+@[reducible]
+def lookupCopyBorrowChecked
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (borrows : List BorrowEntry)
+    (ptr : ProvenancePtr)
+    (totalBytesOpt : Option Nat) :
+    Option BorrowEntry :=
+  match lookupBorrow borrows ptr.tag with
+  | .none => .none
+  | .some entry =>
+    match copyBorrowInRootBounds localDecls layouts ptr entry totalBytesOpt with
+    | true => .some entry
+    | false => .none
+
+/--
+Extract `totalBytes` little-endian bytes starting at byte offset `srcStart` from
+canonicalized `srcBytes`-byte unsigned integer `srcBits`:
+`(wrapScalarBits srcBits (scalarModulus srcBytes) / scalarModulus srcStart) %
+scalarModulus totalBytes`.
+-/
+@[reducible]
+def sliceScalarBytes (srcBits srcBytes srcStart totalBytes : Nat) : Nat :=
+  Nat.mod
+    (Nat.div
+      (wrapScalarBits srcBits (scalarModulus srcBytes))
+      (scalarModulus srcStart))
+    (scalarModulus totalBytes)
+
+/--
+Splice `totalBytes`-byte little-endian integer `chunkBits`
+(`chunkBits < scalarModulus totalBytes`) into `dstBytes`-byte unsigned integer
+`dstBits` at byte offset `dstStart` (`dstStart + totalBytes <= dstBytes`),
+preserving bytes `[0, dstStart)` and `[dstStart + totalBytes, dstBytes)`.
+-/
+@[reducible]
+def spliceScalarBytes
+    (dstBits chunkBits dstStart totalBytes dstBytes : Nat) : Nat :=
+  let lowMod := scalarModulus dstStart
+  let highMod := scalarModulus (Nat.add dstStart totalBytes)
+  let old := wrapScalarBits dstBits (scalarModulus dstBytes)
+  Nat.add (Nat.mod old lowMod)
+    (Nat.add (Nat.mul chunkBits lowMod)
+      (Nat.mul (Nat.div old highMod) highMod))
+
+/--
+Look up a root-local `LocalSlot` for `copy_nonoverlapping` in `locals₃`, falling
+back to `s.memory.callerLocals` when `targetLocal` names a caller slot.
+-/
+@[reducible]
+def lookupCopyRootSlot
+    (s : MachineState)
+    (locals₃ : List LocalSlot)
+    (targetLocal : Local) :
+    Option LocalSlot :=
+  match get? locals₃ targetLocal with
+  | .some slot => .some slot
+  | .none =>
+    match get? s.memory.callerLocals targetLocal with
+    | .some slot => .some slot
+    | .none =>
+      get? s.memory.callerLocals (Nat.sub targetLocal (length locals₃))
+
+/--
+Write `newSlot` to root local `dstLocal` (in `locals₃` or `callerLocals`),
+invalidate conflicting borrows on `dstLocal` relative to `dstPtr.tag`, and
+advance the current statement.
+-/
+def writeCopyRootSlot
+    (s : MachineState)
+    (locals₃ : List LocalSlot)
+    (dstPtr : ProvenancePtr)
+    (dstLocal : Local)
+    (newSlot : LocalSlot) :
+    MirStepNode :=
+  match get? locals₃ dstLocal with
+  | .some .dead => MirStepNode.fail .ub
+  | .some _ =>
+    match set? locals₃ dstLocal newSlot with
+    | .some locals₄ =>
+      let borrows' :=
+        invalidateConflictingBorrows
+          s.memory.borrows
+          dstLocal
+          (.some dstPtr.tag)
+      MirStepNode.step
+        (advanceStmt
+          s
+          locals₄
+          { s.memory with borrows := borrows' })
+    | .none => MirStepNode.fail .ub
+  | .none =>
+    let callerIdx :=
+      match get? s.memory.callerLocals dstLocal with
+      | .some _ => dstLocal
+      | .none => Nat.sub dstLocal (length locals₃)
+    match get? s.memory.callerLocals callerIdx with
+    | .some .dead => MirStepNode.fail .ub
+    | .some _ =>
+      match set? s.memory.callerLocals callerIdx newSlot with
+      | .some callerLocals' =>
+        let borrows' :=
+          invalidateConflictingBorrows
+            s.memory.borrows
+            dstLocal
+            (.some dstPtr.tag)
+        MirStepNode.step
+          (advanceStmt
+            s
+            locals₃
+            { s.memory with
+              borrows := borrows'
+              callerLocals := callerLocals' })
+      | .none => MirStepNode.fail .ub
+    | .none => MirStepNode.fail .ub
+
+/--
+Evaluate a positive-byte `copy_nonoverlapping` of `totalBytes` bytes between two
+root-local primitive integer locals (`srcBytes`, `dstBytes`) once in-bounds and
+permission checks have passed:
+1. Dead or out-of-frame source or destination locals, or an uninitialized source
+   local, are undefined behavior.
+2. Same-local overlapping byte ranges (`srcStart < dstStart + totalBytes` and
+   `dstStart < srcStart + totalBytes`) are undefined behavior, whereas disjoint
+   sub-ranges of the same local succeed.
+3. Slices `totalBytes` little-endian bytes at `srcStart` via `sliceScalarBytes`
+   and either initializes/overwrites all `dstBytes` bytes of `dst` when
+   `dstStart == 0 && totalBytes == dstBytes` (even when `dst` was `.uninit`),
+   splices them into an initialized destination scalar via `spliceScalarBytes`,
+   or leaves a partially written `.uninit` destination `.uninit` (matching
+   `evalWriteBytesCall`).
+-/
+def evalCopyRootIntScalars
+    (s : MachineState)
+    (locals₃ : List LocalSlot)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (srcBytes dstBytes totalBytes : Nat) :
+    MirStepNode :=
+  let srcStart := srcPtr.offsetBytes
+  let dstStart := dstPtr.offsetBytes
+  match
+    lookupCopyRootSlot s locals₃ srcEntry.targetLocal,
+    lookupCopyRootSlot s locals₃ dstEntry.targetLocal
+  with
+  | .none, _ => MirStepNode.fail .ub
+  | .some .dead, _ => MirStepNode.fail .ub
+  | _, .none => MirStepNode.fail .ub
+  | _, .some .dead => MirStepNode.fail .ub
+  | .some .uninit, _ => MirStepNode.fail .ub
+  | .some (.init (.scalar srcSc)), .some dstSlot =>
+    match Nat.beq srcSc.sizeBytes srcBytes with
+    | false => MirStepNode.unsupported
+    | true =>
+      let overlaps : Bool :=
+        Bool.and
+          (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
+          (Bool.not
+            (Bool.or
+              (Nat.ble (Nat.add srcStart totalBytes) dstStart)
+              (Nat.ble (Nat.add dstStart totalBytes) srcStart)))
+      match overlaps with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let chunk := sliceScalarBytes srcSc.bits srcBytes srcStart totalBytes
+        match Bool.and (Nat.beq dstStart 0) (Nat.beq totalBytes dstBytes) with
+        | true =>
+          writeCopyRootSlot
+            s
+            locals₃
+            dstPtr
+            dstEntry.targetLocal
+            (.init (.scalar { bits := chunk, sizeBytes := dstBytes }))
+        | false =>
+          match dstSlot with
+          | .dead => MirStepNode.fail .ub
+          | .uninit =>
+            writeCopyRootSlot s locals₃ dstPtr dstEntry.targetLocal .uninit
+          | .init (.scalar dstSc) =>
+            match Nat.beq dstSc.sizeBytes dstBytes with
+            | false => MirStepNode.unsupported
+            | true =>
+              let spliced :=
+                spliceScalarBytes
+                  dstSc.bits chunk dstStart totalBytes dstBytes
+              writeCopyRootSlot
+                s
+                locals₃
+                dstPtr
+                dstEntry.targetLocal
+                (.init (.scalar { bits := spliced, sizeBytes := dstBytes }))
+          | .init _ => MirStepNode.unsupported
+  | .some (.init _), _ => MirStepNode.unsupported
+
+/--
 Evaluate `copy_nonoverlapping` once `srcVal`, `dstVal`, and scalar `countBits`
-have been evaluated into `locals₃`, supporting direct element copies,
-byte-encoded copies into initialized or union destinations, and untyped copies
-of uninitialized union bytes (`FieldsShape.union`) into a union destination.
+have been evaluated into `locals₃`, enforcing `count * size_of::<T>() <=
+isize::MAX`, pointer alignment to `align_of::<T>()` (including when `count ==
+0`), and root-local byte bounds when `localDecls` / `layouts` resolve `T`, and
+supporting direct element copies, byte-encoded copies into initialized or union
+destinations, and untyped copies of uninitialized union bytes
+(`FieldsShape.union`) into a union destination.
 
 Reference (`core::intrinsics::copy_nonoverlapping`, Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.copy_nonoverlapping.html>
+
+> "Behavior is undefined if any of the following conditions are violated:
+>
+> - `src` must be valid for reads of `count * size_of::<T>()` bytes, and must
+>   remain valid even when `dst` is written for `count * size_of::<T>()` bytes.
+>   (This means if the memory ranges overlap, the two pointers must not be
+>   subject to aliasing restrictions relative to each other.)
+> - `dst` must be valid for writes of `count * size_of::<T>()` bytes, and must
+>   remain valid even when `src` is read for `count * size_of::<T>()` bytes.
+> - Both `src` and `dst` must be properly aligned.
+> - The region of memory beginning at `src` with a size of `count *
+>   size_of::<T>()` bytes must *not* overlap with the region of memory
+>   beginning at `dst` with the same size."
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -375,14 +736,18 @@ def evalCopyNonOverlappingWithCount
     (countBits : Nat)
     (locals₃ : List LocalSlot) :
     MirStepNode :=
-  match Nat.beq countBits 0 with
-  | true => MirStepNode.step (advanceStmt s locals₃)
-  | false =>
+  match copyPrecheck localDecls layouts src srcVal dstVal countBits with
+  | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
+  | .zero => MirStepNode.step (advanceStmt s locals₃)
+  | .nonZero totalBytesOpt =>
     match srcVal, dstVal with
     | .ptr srcPtr _, .ptr dstPtr _ =>
       match
-        lookupBorrow s.memory.borrows srcPtr.tag,
-        lookupBorrow s.memory.borrows dstPtr.tag
+        lookupCopyBorrowChecked
+          localDecls layouts s.memory.borrows srcPtr totalBytesOpt,
+        lookupCopyBorrowChecked
+          localDecls layouts s.memory.borrows dstPtr totalBytesOpt
       with
       | .some srcEntry, .some dstEntry =>
         match srcEntry.perm, dstEntry.perm with
@@ -390,13 +755,76 @@ def evalCopyNonOverlappingWithCount
         | _, .frozen => MirStepNode.fail .ub
         | _, .disabled => MirStepNode.fail .ub
         | _, _ =>
+          let rootIntStep? : Option MirStepNode :=
+            match
+              totalBytesOpt,
+              srcEntry.targetProjection,
+              dstEntry.targetProjection
+            with
+            | .some totalBytes, .nil, .nil =>
+              match
+                get? localDecls srcEntry.targetLocal,
+                get? localDecls dstEntry.targetLocal
+              with
+              | .some srcDecl, .some dstDecl =>
+                match
+                  intCastTargetBytes srcDecl.ty.kind,
+                  intCastTargetBytes dstDecl.ty.kind
+                with
+                | .some srcBytes, .some dstBytes =>
+                  .some
+                    (evalCopyRootIntScalars
+                      s
+                      locals₃
+                      srcPtr
+                      dstPtr
+                      srcEntry
+                      dstEntry
+                      srcBytes
+                      dstBytes
+                      totalBytes)
+                | _, _ => .none
+              | _, _ => .none
+            | _, _, _ => .none
+          match rootIntStep? with
+          | .some stepNode => stepNode
+          | .none =>
           let n := countBits
           let srcStart := srcPtr.offsetBytes
           let dstStart := dstPtr.offsetBytes
+          let singleSizeMatches : Bool :=
+            match totalBytesOpt with
+            | .none => true
+            | .some totalBytes =>
+              let srcPlace : Place := {
+                local_ := srcEntry.targetLocal
+                projection := srcEntry.targetProjection
+              }
+              let dstPlace : Place := {
+                local_ := dstEntry.targetLocal
+                projection := dstEntry.targetProjection
+              }
+              let srcOk : Bool :=
+                match placeTy localDecls layouts srcPlace with
+                | .some st =>
+                  match rigidTyByteSize layouts st with
+                  | .some sBytes => Nat.beq totalBytes sBytes
+                  | .none => true
+                | .none => true
+              let dstOk : Bool :=
+                match placeTy localDecls layouts dstPlace with
+                | .some dt =>
+                  match rigidTyByteSize layouts dt with
+                  | .some dBytes => Nat.beq totalBytes dBytes
+                  | .none => true
+                | .none => true
+              Bool.and srcOk dstOk
           let isSingleDirect :=
             Bool.and
-              (Nat.beq n 1)
-              (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+              (Bool.and
+                (Nat.beq n 1)
+                (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0)))
+              singleSizeMatches
           match isSingleDirect with
           | true =>
             evalCopySingleDirect
@@ -561,6 +989,13 @@ def evalCopyNonOverlappingWithCount
                     match dstLocalPlaceTy with
                     | .some t => .some t
                     | .none => operandPointeeTy localDecls layouts dst
+                  let dstTargetBytesOpt : Option Nat :=
+                    match dstLocalPlaceTy with
+                    | .some t => rigidTyByteSize layouts t
+                    | .none =>
+                      match operandPointeeTy localDecls layouts dst with
+                      | .some pt => rigidTyKindByteSize pt.kind
+                      | .none => .none
                   match srcSliceVal with
                   | .none => MirStepNode.fail .ub
                   | .some sVal =>
@@ -604,7 +1039,7 @@ def evalCopyNonOverlappingWithCount
                       | _, _ =>
                         match dstTargetTyOpt with
                         | .some dstPt =>
-                          match rigidTyByteSize layouts dstPt with
+                          match dstTargetBytesOpt with
                           | .some dstBytes =>
                             match Nat.beq (length bs) dstBytes with
                             | true =>
@@ -714,8 +1149,8 @@ def evalCopyNonOverlappingWithCount
                   | false =>
                     let elemBytesOpt : Option Nat :=
                       match operandPointeeTy localDecls layouts src with
-                      | .some pt => rigidTyByteSize layouts pt
-                      | .none => .some 1
+                      | .some pt => rigidTyKindByteSize pt.kind
+                      | .none => .none
                     match
                       elemBytesOpt,
                       rigidTyByteSize layouts srcFieldTy,
