@@ -287,13 +287,14 @@ theorem evalCopyNonOverlapping_zero_of_obligations
         .ok dstVal s.frame.locals)
     (hCnt :
       evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
-        .ok (.scalar ⟨0, 8⟩) s.frame.locals) :
+        .ok (.scalar ⟨0, 8⟩) s.frame.locals)
+    (hSrcPt : operandPointeeTy [] emptyLayoutTable srcOp = none) :
     evalCopyNonOverlapping s srcOp dstOp countOp =
       MirStepNode.step (advanceStmt s s.frame.locals) ∧
     NonOverlappingPtrs src dst 0 := by
   refine ⟨?_, hNonoverlap⟩
-  unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
-  simp [hSrc, hDst, hCnt]
+  unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount copyPrecheck
+  simp [hSrc, hDst, hCnt, hSrcPt]
 
 /--
 Bridge theorem connecting `NonOverlappingPtrs`, `HasTreeBorrowAccess`, and
@@ -345,6 +346,7 @@ theorem evalCopyNonOverlapping_one_of_obligations
   have hSrcZero : src.toProvenancePtr.offsetBytes = 0 := hSrcOff
   have hDstZero : dst.toProvenancePtr.offsetBytes = 0 := hDstOff
   unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
+    copyPrecheck lookupCopyBorrowChecked copyBorrowInRootBounds
     evalCopySingleDirect writePlaceValue
   simp [hSrc, hDst, hCnt, hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
         hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,

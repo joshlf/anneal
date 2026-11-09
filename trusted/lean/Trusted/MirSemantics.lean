@@ -34,7 +34,10 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   tyIsSigned placeIsSigned operandIsSigned evalUnaryNot signedOverflowAdd
   signedOverflowSub signedOverflowMul evalSignedDiv evalSignedRem
   signedHalfModulus evalExactDiv evalScalarExactDiv
-  evalScalarBinOp intCastTargetBytes ScalarVal AbstractByte mergeByteProvenance
+  evalScalarBinOp intCastTargetBytes countOnesBits bitLengthBits
+  countTrailingZerosBits reverseBytesBits reverseBitsBits rotateLeftBits
+  rotateRightBits IntegerBitIntrinsic evalIntegerBitIntrinsic evalRotate
+  evalSaturatingArith ScalarVal AbstractByte mergeByteProvenance
   encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
   appendAbstractBytes sliceAbstractBytes writeAbstractBytesAt
@@ -58,11 +61,16 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   sliceConstElemKind evalOperand evalOperands writePlaceValue evalByteCast
   resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze sharedBorrowPerm
   evalRvalue evalRvalueWithMemory advanceStmt projectionsOverlap appendValues
-  spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
+  spliceValues sameRigidTyShape operandPointeeTy rigidTyKindAlignBytes
+  rigidTyAlignBytes CopyPrecheckResult ptrValueAligned copyPrecheck
+  copyBorrowInRootBounds lookupCopyBorrowChecked evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping
   evalStmt lookupSwitchTarget findCallee?
   extractCalleeDefPath? applyUnwindAction resumeExternalCall
-  resumeExternalTailCall evalTerminator
+  resumeExternalTailCall integerBitIntrinsicOfPath? integerOperandBytes?
+  operandPointeeBytes? intrinsicReturnTo intrinsicWriteReturn isizeMaxBytes
+  repeatByteBits evalWriteBytesCall evalArithOffsetCall evalInlineIntrinsicCall?
+  evalTerminator
   initMachineState initMachineStateWithCallees
   stepMirFn stepMirState mirTree mirCallTree MirCallInstance
   MirLang MirNoUBTree

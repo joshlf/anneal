@@ -1222,4 +1222,287 @@ def intCastTargetBytes : RigidTy → Option Nat
   | .int .isize => .some 8
   | _ => .none
 
+/-!
+## Integer bit-manipulation and saturating intrinsics
+
+Inline semantics of the integer intrinsics `ctpop`, `ctlz`, `ctlz_nonzero`,
+`cttz`, `cttz_nonzero`, `bswap`, `bitreverse`, `rotate_left`, `rotate_right`,
+`saturating_add`, and `saturating_sub` from `core::intrinsics` at Rust 1.98.0.
+Each operand is the canonical unsigned bit pattern `bits` of an integer type of
+byte width `sizeBytes` (`8 * sizeBytes` bits); the helpers below recurse
+structurally on the bit or byte count so the kernel evaluates them directly.
+`evalTerminator` applies them only to operands whose declared type is an
+integer type (`intCastTargetBytes`), as the intrinsics require.
+-/
+
+/--
+Number of set bits among the low `numBits` bits of `bits`.
+
+Reference (`core::intrinsics::ctpop`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.ctpop.html>
+
+> "Returns the number of bits set in an integer type `T`"
+-/
+def countOnesBits : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ k, bits => Nat.add (Nat.mod bits 2) (countOnesBits k (Nat.div bits 2))
+
+/--
+Number of significant bits among the low `numBits` bits of `bits`: `0` for
+`bits = 0`, and otherwise one more than the index of the highest set bit. The
+leading-zero count of a `numBits`-bit integer is `numBits` minus this length.
+
+Reference (`core::intrinsics::ctlz`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.ctlz.html>
+
+> "Returns the number of leading unset bits (zeroes) in an integer type `T`."
+-/
+def bitLengthBits : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ k, bits =>
+    match Nat.beq bits 0 with
+    | true => 0
+    | false => Nat.add 1 (bitLengthBits k (Nat.div bits 2))
+
+/--
+Number of trailing zero bits among the low `numBits` bits of `bits`, which is
+`numBits` when those bits are all zero.
+
+Reference (`core::intrinsics::cttz`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.cttz.html>
+
+> "Returns the number of trailing unset bits (zeroes) in an integer type `T`."
+>
+> "An `x` with value `0` will return the bit width of `T`."
+-/
+def countTrailingZerosBits : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ k, bits =>
+    match Nat.beq (Nat.mod bits 2) 0 with
+    | false => 0
+    | true => Nat.add 1 (countTrailingZerosBits k (Nat.div bits 2))
+
+/--
+Reverse the order of the low `byteCount` bytes of `bits`: the least
+significant byte moves to position `byteCount - 1`.
+
+Reference (`core::intrinsics::bswap`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.bswap.html>
+
+> "Reverses the bytes in an integer type `T`."
+-/
+def reverseBytesBits : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ k, bits =>
+    Nat.add (Nat.mul (Nat.mod bits 256) (scalarModulus k))
+      (reverseBytesBits k (Nat.div bits 256))
+
+/--
+Reverse the order of the low `numBits` bits of `bits`: bit `0` moves to
+position `numBits - 1`.
+
+Reference (`core::intrinsics::bitreverse`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.bitreverse.html>
+
+> "Reverses the bits in an integer type `T`."
+-/
+def reverseBitsBits : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ k, bits =>
+    Nat.add (Nat.mul (Nat.mod bits 2) (scalarPow2 k))
+      (reverseBitsBits k (Nat.div bits 2))
+
+/--
+Rotate the `numBits`-bit pattern `bits` (`bits < 2^numBits`) left by
+`shift mod numBits` bits.
+
+The shift amount is reduced modulo the bit width, as the stabilized
+`rotate_left` methods document; a rotation by `0` returns `bits`.
+
+Reference (`core::intrinsics::rotate_left`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.rotate_left.html>
+
+> "Performs rotate left."
+
+Reference (`u32::rotate_left`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/primitive.u32.html#method.rotate_left>
+
+> "Shifts the bits to the left by a specified amount, `n`, wrapping the
+> truncated bits to the end of the resulting integer."
+-/
+def rotateLeftBits (bits shift numBits : Nat) : Nat :=
+  let s := Nat.mod shift numBits
+  Nat.mod
+    (Nat.add (Nat.mul bits (scalarPow2 s)) (Nat.div bits (scalarPow2 (Nat.sub numBits s))))
+    (scalarPow2 numBits)
+
+/--
+Rotate the `numBits`-bit pattern `bits` (`bits < 2^numBits`) right by
+`shift mod numBits` bits.
+
+Reference (`core::intrinsics::rotate_right`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.rotate_right.html>
+
+> "Performs rotate right."
+
+Reference (`u32::rotate_right`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/primitive.u32.html#method.rotate_right>
+
+> "Shifts the bits to the right by a specified amount, `n`, wrapping the
+> truncated bits to the beginning of the resulting integer."
+-/
+def rotateRightBits (bits shift numBits : Nat) : Nat :=
+  let s := Nat.mod shift numBits
+  Nat.mod
+    (Nat.add (Nat.div bits (scalarPow2 s)) (Nat.mul bits (scalarPow2 (Nat.sub numBits s))))
+    (scalarPow2 numBits)
+
+/--
+The one-operand integer intrinsics of `core::intrinsics` that count or permute
+bits: `ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`, `cttz_nonzero`, `bswap`, and
+`bitreverse`.
+-/
+inductive IntegerBitIntrinsic : Type where
+  | ctpop
+  | ctlz
+  | ctlzNonzero
+  | cttz
+  | cttzNonzero
+  | bswap
+  | bitreverse
+
+/--
+Evaluate a one-operand integer bit intrinsic on `x`, returning `.none` on
+undefined behavior.
+
+The counting intrinsics return a `u32` (`⟨count, 4⟩`); `bswap` and `bitreverse`
+return a value of the operand's own width. `ctlz_nonzero` and `cttz_nonzero`
+are undefined behavior on a zero operand. Signedness never matters: each
+intrinsic acts on the operand's bit pattern.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, the declarations of the
+intrinsics):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs>
+
+> "pub const fn ctpop<T: Copy>(x: T) -> u32;"
+>
+> "pub const fn ctlz<T: Copy>(x: T) -> u32;"
+>
+> "pub const unsafe fn ctlz_nonzero<T: Copy>(x: T) -> u32;"
+>
+> "pub const fn cttz<T: Copy>(x: T) -> u32;"
+>
+> "pub const unsafe fn cttz_nonzero<T: Copy>(x: T) -> u32;"
+>
+> "pub const fn bswap<T: Copy>(x: T) -> T;"
+>
+> "pub const fn bitreverse<T: Copy>(x: T) -> T;"
+
+Reference (`core::intrinsics::ctlz_nonzero`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.ctlz_nonzero.html>
+
+> "Like `ctlz`, but extra-unsafe as it returns `undef` when given an `x` with
+> value `0`."
+
+Reference (`core::intrinsics::cttz_nonzero`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.cttz_nonzero.html>
+
+> "Like `cttz`, but extra-unsafe as it returns `undef` when given an `x` with
+> value `0`."
+
+Modeling choice: a zero operand to `ctlz_nonzero` or `cttz_nonzero` is
+undefined behavior rather than an `undef` result, as in rustc's interpreter,
+which rejects it.
+-/
+def evalIntegerBitIntrinsic (op : IntegerBitIntrinsic) (x : ScalarInt) :
+    Option ScalarInt :=
+  let numBits := Nat.mul x.sizeBytes 8
+  let bits := wrapScalarBits x.bits (scalarModulus x.sizeBytes)
+  match op with
+  | .ctpop => .some ⟨countOnesBits numBits bits, 4⟩
+  | .ctlz => .some ⟨Nat.sub numBits (bitLengthBits numBits bits), 4⟩
+  | .ctlzNonzero =>
+    match Nat.beq bits 0 with
+    | true => .none
+    | false => .some ⟨Nat.sub numBits (bitLengthBits numBits bits), 4⟩
+  | .cttz => .some ⟨countTrailingZerosBits numBits bits, 4⟩
+  | .cttzNonzero =>
+    match Nat.beq bits 0 with
+    | true => .none
+    | false => .some ⟨countTrailingZerosBits numBits bits, 4⟩
+  | .bswap => .some ⟨reverseBytesBits x.sizeBytes bits, x.sizeBytes⟩
+  | .bitreverse => .some ⟨reverseBitsBits numBits bits, x.sizeBytes⟩
+
+/--
+Evaluate `rotate_left(x, shift)` (`isLeft = true`) or `rotate_right(x, shift)`
+(`isLeft = false`) on an integer `x`, whose result has the width of `x`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs>
+
+> "pub const fn rotate_left<T: Copy>(x: T, shift: u32) -> T"
+>
+> "pub const fn rotate_right<T: Copy>(x: T, shift: u32) -> T"
+-/
+def evalRotate (isLeft : Bool) (x shift : ScalarInt) : ScalarInt :=
+  let numBits := Nat.mul x.sizeBytes 8
+  let bits := wrapScalarBits x.bits (scalarModulus x.sizeBytes)
+  match isLeft with
+  | true => ⟨rotateLeftBits bits shift.bits numBits, x.sizeBytes⟩
+  | false => ⟨rotateRightBits bits shift.bits numBits, x.sizeBytes⟩
+
+/--
+Evaluate `saturating_add(lhs, rhs)` (`isAdd = true`) or
+`saturating_sub(lhs, rhs)` (`isAdd = false`) on two integers of equal width.
+
+The overflowing operation (`addWithOverflow` / `subWithOverflow` of
+`evalScalarBinOp`) supplies the wrapped result and the overflow flag. Without
+overflow the wrapped result is exact. On overflow the result saturates: for an
+unsigned type at `2^N - 1` (addition) or `0` (subtraction); for a signed type at
+`2^(N-1) - 1` when `lhs` is non-negative and at `-2^(N-1)` when it is negative,
+because a signed sum or difference can only overflow in the direction of the
+sign of `lhs`.
+
+Reference (`core::intrinsics::saturating_add`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.saturating_add.html>
+
+> "Computes `a + b`, saturating at numeric bounds."
+
+Reference (`core::intrinsics::saturating_sub`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.saturating_sub.html>
+
+> "Computes `a - b`, saturating at numeric bounds."
+-/
+def evalSaturatingArith
+    (isAdd : Bool)
+    (lhs rhs : ScalarInt)
+    (locals : List LocalSlot)
+    (mem : Memory := {})
+    (isSigned : Bool := false) :
+    RvalueEvalResult :=
+  let op : BinOp :=
+    match isAdd with
+    | true => .addWithOverflow
+    | false => .subWithOverflow
+  match evalScalarBinOp op lhs rhs locals mem isSigned with
+  | .ok (.aggregate 0 (.scalar wrapped :: .scalar overflow :: .nil)) locals' mem' =>
+    match Nat.beq overflow.bits 0 with
+    | true => .ok (.scalar wrapped) locals' mem'
+    | false =>
+      let sz := lhs.sizeBytes
+      match isSigned with
+      | true =>
+        match isSignedNegative lhs.bits sz with
+        | false => .ok (.scalar ⟨Nat.sub (signedHalfModulus sz) 1, sz⟩) locals' mem'
+        | true => .ok (.scalar ⟨signedHalfModulus sz, sz⟩) locals' mem'
+      | false =>
+        match isAdd with
+        | true => .ok (.scalar ⟨Nat.sub (scalarModulus sz) 1, sz⟩) locals' mem'
+        | false => .ok (.scalar ⟨0, sz⟩) locals' mem'
+  | .ok _ _ _ => .unsupported
+  | .ub => .ub
+  | .unsupported => .unsupported
+
 end Trusted.Rustc.V2026_06_01.MirSemantics

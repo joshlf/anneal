@@ -351,13 +351,195 @@ def evalCopySingleDirect
     | _ => MirStepNode.fail .ub
 
 /--
+ABI alignment in bytes on a 64-bit x86-64 target for a `RigidTy` whose
+alignment is determined structurally without consulting `LayoutTable`:
+`bool` and `()` / zero-sized function items have alignment `1`, `char` has
+alignment `4`, primitive integers (`u8`..`u128`, `usize`, `i8`..`i128`,
+`isize`) have alignment equal to their byte width (`1, 2, 4, 8, 16`), thin and
+wide pointers/references have alignment `8`, and `[T; N]` has the alignment of
+`T`.
+
+Reference (The Rust Reference, "Type Layout — Size and Alignment", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The alignment of primitives is platform-specific. In most cases, their
+> alignment is equal to their size, although it may be less. In particular,
+> `i128` and `u128` are often aligned to 4 or 8 bytes even though their size is
+> 16, and on many 32-bit platforms `i64`, `u64`, and `f64` are only aligned to
+> 4 bytes, not 8."
+>
+> "Pointers to sized types have the same size and alignment as `usize`."
+>
+> "An array of `[T; N]` has a size of `size_of::<T>() * N` and the same
+> alignment of `T`."
+-/
+@[reducible]
+def rigidTyKindAlignBytes : RigidTy → Option Nat
+  | .bool => .some 1
+  | .char => .some 4
+  | .uint w => intCastTargetBytes (.uint w)
+  | .int w => intCastTargetBytes (.int w)
+  | .tuple .nil => .some 1
+  | .fnDef _ _ => .some 1
+  | .fnPtr _ _ _ _ => .some 8
+  | .ref _ _ => .some 8
+  | .rawPtr _ _ => .some 8
+  | .array elemKind _ => rigidTyKindAlignBytes elemKind
+  | _ => .none
+
+/--
+Determine the ABI alignment in bytes of `ty` using `rigidTyKindAlignBytes` for
+primitives, pointers, and homogeneous arrays, or `LayoutTable.lookup layouts
+ty.layoutIdx` for ADTs and layout-indexed aggregates.
+-/
+@[reducible]
+def rigidTyAlignBytes (layouts : LayoutTable) (ty : Ty) : Option Nat :=
+  match rigidTyKindAlignBytes ty.kind with
+  | .some al => .some al
+  | .none =>
+    match LayoutTable.lookup layouts ty.layoutIdx with
+    | .some l => .some l.align.bytes
+    | .none => .none
+
+/--
+Outcome of `copy_nonoverlapping` size-overflow, alignment, and zero-byte
+prechecks prior to live-allocation dereference.
+-/
+inductive CopyPrecheckResult where
+  | ub
+  | zero
+  | nonZero (totalBytesOpt : Option Nat)
+
+/--
+Test whether runtime pointer operand `v` satisfies byte alignment `elemAlign`
+(either as a provenance-carrying `ProvenancePtr` at aligned `offsetBytes` or as
+an 8-byte provenance-free integer scalar at aligned `bits`).
+-/
+@[reducible]
+def ptrValueAligned (elemAlign : Nat) : Value → Bool
+  | .ptr p _ =>
+    Bool.or (Nat.beq elemAlign 0) (Nat.beq (Nat.mod p.offsetBytes elemAlign) 0)
+  | .scalar sc =>
+    Bool.and
+      (Nat.beq sc.sizeBytes 8)
+      (Bool.or (Nat.beq elemAlign 0) (Nat.beq (Nat.mod sc.bits elemAlign) 0))
+  | _ => false
+
+/--
+Check `count * size_of::<T>() <= isize::MAX` (`9223372036854775807`), pointer
+alignment of both `srcVal` and `dstVal` to `align_of::<T>()` (including when
+`count == 0`), and zero-byte short-circuiting (`count == 0` or `size_of::<T>()
+== 0`).
+-/
+@[reducible]
+def copyPrecheck
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (src : Operand)
+    (srcVal dstVal : Value)
+    (countBits : Nat) :
+    CopyPrecheckResult :=
+  match operandPointeeTy localDecls layouts src with
+  | .none =>
+    match Nat.beq countBits 0 with
+    | true => .zero
+    | false => .nonZero .none
+  | .some srcPt =>
+    let totalRes : Option (Option Nat) :=
+      match rigidTyByteSize layouts srcPt with
+      | .none => .some .none
+      | .some elemBytes =>
+        let totalBytes := Nat.mul countBits elemBytes
+        match Nat.ble totalBytes 9223372036854775807 with
+        | false => .none
+        | true => .some (.some totalBytes)
+    match totalRes with
+    | .none => .ub
+    | .some totalBytesOpt =>
+      let alignOk : Bool :=
+        match rigidTyAlignBytes layouts srcPt with
+        | .some elemAlign =>
+          Bool.and
+            (ptrValueAligned elemAlign srcVal)
+            (ptrValueAligned elemAlign dstVal)
+        | .none => true
+      match alignOk with
+      | false => .ub
+      | true =>
+        match Nat.beq countBits 0 with
+        | true => .zero
+        | false =>
+          match totalBytesOpt with
+          | .some 0 => .zero
+          | _ => .nonZero totalBytesOpt
+
+/--
+Check that a root-local borrow access of `totalBytes` starting at
+`ptr.offsetBytes` fits within the declared byte size of `entry.targetLocal` when
+`localDecls` and `layouts` resolve that byte size.
+-/
+@[reducible]
+def copyBorrowInRootBounds
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (ptr : ProvenancePtr)
+    (entry : BorrowEntry)
+    (totalBytesOpt : Option Nat) :
+    Bool :=
+  match totalBytesOpt, entry.targetProjection with
+  | .some totalBytes, .nil =>
+    match get? localDecls entry.targetLocal with
+    | .some decl =>
+      match rigidTyByteSize layouts decl.ty with
+      | .some localBytes =>
+        Nat.ble (Nat.add ptr.offsetBytes totalBytes) localBytes
+      | .none => true
+    | .none => true
+  | _, _ => true
+
+/--
+Look up `ptr.tag` in `borrows` and verify `copyBorrowInRootBounds` for
+`totalBytesOpt`.
+-/
+@[reducible]
+def lookupCopyBorrowChecked
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (borrows : List BorrowEntry)
+    (ptr : ProvenancePtr)
+    (totalBytesOpt : Option Nat) :
+    Option BorrowEntry :=
+  match lookupBorrow borrows ptr.tag with
+  | .none => .none
+  | .some entry =>
+    match copyBorrowInRootBounds localDecls layouts ptr entry totalBytesOpt with
+    | true => .some entry
+    | false => .none
+
+/--
 Evaluate `copy_nonoverlapping` once `srcVal`, `dstVal`, and scalar `countBits`
-have been evaluated into `locals₃`, supporting direct element copies,
-byte-encoded copies into initialized or union destinations, and untyped copies
-of uninitialized union bytes (`FieldsShape.union`) into a union destination.
+have been evaluated into `locals₃`, enforcing `count * size_of::<T>() <=
+isize::MAX`, pointer alignment to `align_of::<T>()` (including when `count ==
+0`), and root-local byte bounds when `localDecls` / `layouts` resolve `T`, and
+supporting direct element copies, byte-encoded copies into initialized or union
+destinations, and untyped copies of uninitialized union bytes
+(`FieldsShape.union`) into a union destination.
 
 Reference (`core::intrinsics::copy_nonoverlapping`, Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.copy_nonoverlapping.html>
+
+> "Behavior is undefined if any of the following conditions are violated:
+>
+> - `src` must be valid for reads of `count * size_of::<T>()` bytes, and must
+>   remain valid even when `dst` is written for `count * size_of::<T>()` bytes.
+>   (This means if the memory ranges overlap, the two pointers must not be
+>   subject to aliasing restrictions relative to each other.)
+> - `dst` must be valid for writes of `count * size_of::<T>()` bytes, and must
+>   remain valid even when `src` is read for `count * size_of::<T>()` bytes.
+> - Both `src` and `dst` must be properly aligned.
+> - The region of memory beginning at `src` with a size of `count *
+>   size_of::<T>()` bytes must *not* overlap with the region of memory
+>   beginning at `dst` with the same size."
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -375,14 +557,17 @@ def evalCopyNonOverlappingWithCount
     (countBits : Nat)
     (locals₃ : List LocalSlot) :
     MirStepNode :=
-  match Nat.beq countBits 0 with
-  | true => MirStepNode.step (advanceStmt s locals₃)
-  | false =>
+  match copyPrecheck localDecls layouts src srcVal dstVal countBits with
+  | .ub => MirStepNode.fail .ub
+  | .zero => MirStepNode.step (advanceStmt s locals₃)
+  | .nonZero totalBytesOpt =>
     match srcVal, dstVal with
     | .ptr srcPtr _, .ptr dstPtr _ =>
       match
-        lookupBorrow s.memory.borrows srcPtr.tag,
-        lookupBorrow s.memory.borrows dstPtr.tag
+        lookupCopyBorrowChecked
+          localDecls layouts s.memory.borrows srcPtr totalBytesOpt,
+        lookupCopyBorrowChecked
+          localDecls layouts s.memory.borrows dstPtr totalBytesOpt
       with
       | .some srcEntry, .some dstEntry =>
         match srcEntry.perm, dstEntry.perm with
