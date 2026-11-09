@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Warm Lean 4 (`lake serve`) + Rust semantic daemon for Anneal in Jetski.
+"""Warm Lean 4 (`lake serve`) + Rust semantic daemon for Anneal in Antigravity.
 
 Listens on a local mode-0600 Unix domain socket (`/tmp/anneal-lean-lsp.sock`) so:
-1. The Jetski `stdio` MCP server (`anneal_lsp_mcp.py`),
+1. The Antigravity `stdio` MCP server (`anneal_lsp_mcp.py`),
 2. Synchronous `<100ms` `PostToolUse` hooks (`hooks/post_tool_use.py`), and
-3. The Jetski Web AuxPane Live InfoView UI sidecar (`sidecars/infoview/main.mjs`)
+3. The Antigravity Web AuxPane Live InfoView UI sidecar (`sidecars/infoview/main.mjs`)
 all share one warm LRU pool of `lake serve` (and optional `rust-analyzer`) workers
 across `~/Projects/<ldap>/{anneal,anneal-private,zerocopy}`.
 """
@@ -33,7 +33,7 @@ DEFAULT_SOCKET_PATH = os.environ.get("ANNEAL_LSP_SOCKET", "/tmp/anneal-lean-lsp.
 LOCK_PATH = DEFAULT_SOCKET_PATH + ".lock"
 MAX_WORKERS = int(os.environ.get("ANNEAL_LSP_MAX_WORKERS", "4"))
 IDLE_TTL_SECONDS = int(os.environ.get("ANNEAL_LSP_IDLE_TTL_SECONDS", "900"))
-MAX_INLINE_BYTES = 3800  # Keep MCP tool responses <4,000 bytes so Jetski never spills to temp files.
+MAX_INLINE_BYTES = 3800  # Keep MCP tool responses <4,000 bytes so Antigravity never spills to temp files.
 
 HOME_DIR = Path.home()
 DEFAULT_ENV_PATH = (

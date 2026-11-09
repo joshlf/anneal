@@ -1,14 +1,14 @@
 # Step-by-Step Reproduction Instructions for `BRIEF-1.3`
 
 - **Item ID**: `BRIEF-1.3` (`CallConv.rustIntrinsic` Compiler Intrinsics Executed Inside `core`)
-- **Worktree**: `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3`
+- **Worktree**: `<path/to/anneal>`
 - **Branch**: `adv/brief-1-3`
 - **Base Commit (`sup/brief-1`)**: `163ff6068da17eacfa4bb581f841e527e03ae455`
 
 ## 1. Verify Worktree & Commit History
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3
+cd <path/to/anneal>
 git status --porcelain
 git log --oneline -10
 ```
@@ -30,7 +30,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode build --concurrency 3 -- lake build Trusted Anneal Correspondence.V2026_06_01.L5_ControlAndCalls Correspondence.V2026_08_01.L5_ControlAndCalls
 ```
 
@@ -44,7 +44,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3/examples
+cd <path/to/anneal>/examples
 python3 - > /tmp/brief_1_3_axioms.lean <<'PY'
 names = """mir_evalTerminator_exact_div_intrinsic_corresponds
 mir_evalTerminator_ub_checks_intrinsic_corresponds
@@ -82,7 +82,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3
+cd <path/to/anneal>
 python3 trusted/audit/check_trusted.py --fast
 ./ci/check_todo.sh
 ```
@@ -95,7 +95,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3
+cd <path/to/anneal>
 cargo test -p anneal-rustc-capture
 ```
 
@@ -106,7 +106,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-3
+cd <path/to/anneal>
 cargo test -p cargo-anneal --test end_to_end_miri_diff
 ```
 

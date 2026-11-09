@@ -27,7 +27,7 @@ efforts structured either as:
 
 Keep public repository artifacts free of environment-specific model identifiers
 and quota bucket names by routing all roles through five abstract model slots
-resolved at runtime via `anneal-model-policy` (configured in your host
+resolved at runtime via `model-policy-cli` (configured in your host
 environment):
 
 | Abstract Slot | Assigned Roles | Why This Pool Is Separated |
@@ -59,7 +59,7 @@ soundness-critical proofs or cross-family critics:
     crate verification obligations outside `trusted/`.
   - **Policy**: Allocates `<MODEL_X>` $\leftrightarrow$ `<MODEL_Y>` while both
     pools remain above `15%`. When either pool drops below `15%`,
-    `anneal-model-policy assign-pair --tier P1` substitutes `<MODEL_Z_RESERVE>`
+    `model-policy-cli assign-pair --tier P1` substitutes `<MODEL_Z_RESERVE>`
     for the depleted side, sets `DIVERSITY_REDUCED=true`, and logs the entry to
     `<scratch>/quota_ledger.json` so `P0` tasks retain a `15%` frontier reserve.
 3. **`P2` (`P2-Mechanical` — `40%` quota reserve floor)**:
@@ -74,23 +74,23 @@ soundness-critical proofs or cross-family critics:
 
 Do not run a separate LLM "quota monitoring agent" that broadcasts messages
 across conversations; instead, have each supervising agent query the
-zero-token local policy CLI (`anneal-model-policy`) at **dispatch** and
+zero-token local policy CLI (`model-policy-cli`) at **dispatch** and
 **handoff** boundaries:
 
 ```mermaid
 flowchart TD
-    W["Supervisor Wakes Up<br/>(Wave Dispatch, [QUOTA] Escalation, or Leaf [A_N Final])"] --> Q["Run: anneal-model-policy status<br/>&amp; check-restore --scratch &lt;dir&gt;"]
+    W["Supervisor Wakes Up<br/>(Wave Dispatch, [QUOTA] Escalation, or Leaf [A_N Final])"] --> Q["Run: model-policy-cli status<br/>&amp; check-restore --scratch &lt;dir&gt;"]
     Q --> R{"Any Degraded Worker<br/>Restorable (&gt;= 20% Quota)?"}
     R -- Yes --> U["Wait for That Worker's Next Turn Boundary,<br/>Then swarm{action: 'model'} Back to Primary"]
     R -- No --> D{"Spawning New Leaf<br/>or Critic?"}
-    D -- "Adversarial Leaf Pair" --> AP["anneal-model-policy assign-pair<br/>--unit &lt;ID&gt; --tier &lt;P0|P1|P2&gt; --scratch &lt;dir&gt;"]
-    D -- "Sequential Critic Subagent" --> SC["anneal-model-policy select-critic<br/>--implementer &lt;family&gt; --tier &lt;P0|P1|P2&gt;"]
+    D -- "Adversarial Leaf Pair" --> AP["model-policy-cli assign-pair<br/>--unit &lt;ID&gt; --tier &lt;P0|P1|P2&gt; --scratch &lt;dir&gt;"]
+    D -- "Sequential Critic Subagent" --> SC["model-policy-cli select-critic<br/>--implementer &lt;family&gt; --tier &lt;P0|P1|P2&gt;"]
 ```
 
 ### Critical Rules for Model Switching in `swarm` and `invoke_subagent`
 
 1. **Flat-Board Ownership (`swarm{action: "model"}` Authority)**:
-  In Jetski's `swarm` tool, a non-root worker (`sup-*`) may only call
+  In Antigravity's `swarm` tool, a non-root worker (`sup-*`) may only call
   `swarm{action: "model"}` or `swarm{action: "kill"}` on workers **that `sup-*`
   itself spawned** via `swarm{action: "add"}`. If the root `coordinator` spawned
   the leaf workers, `sup-*` must request model switches from `@coordinator` (or
@@ -113,7 +113,7 @@ flowchart TD
   may have failed over to the same model family. Before calling
   `invoke_subagent`, run:
   ```bash
-  anneal-model-policy select-critic --implementer "<current_model_or_family>" --tier "<P0|P1|P2>"
+  model-policy-cli select-critic --implementer "<current_model_or_family>" --tier "<P0|P1|P2>"
   ```
   and pass the returned `CRITIC_MODEL` explicitly to `invoke_subagent` so every
   critique runs on an independent frontier family.
