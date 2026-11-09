@@ -44,7 +44,7 @@ fn write_executable(path: &Path, script: &str) {
     fs::set_permissions(path, perms).expect("chmod script");
 }
 
-fn write_fileutil_stub(stub: &Path, log: &Path, exit_code: i32) {
+fn write_remote_sync_stub(stub: &Path, log: &Path, exit_code: i32) {
     write_executable(
         stub,
         &format!(
@@ -60,7 +60,7 @@ spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
 runner = importlib.util.module_from_spec(spec)
 sys.modules["runner"] = runner
 spec.loader.exec_module(runner)
-runner.FILEUTIL_BIN = sys.argv[2]
+runner.REMOTE_SYNC_BIN = sys.argv[2]
 args = sys.argv[3:]
 miri_override = None
 itree_override = None
@@ -86,7 +86,7 @@ sys.exit(runner.main())
 "#;
 
 fn run_campaign_driver(
-    fileutil_stub: &Path,
+    remote_sync_stub: &Path,
     env_vars: &[(&str, &Path)],
     removed_env_vars: &[&str],
     overrides: &[String],
@@ -98,7 +98,7 @@ fn run_campaign_driver(
     cmd.arg("-c")
         .arg(RUNNER_DRIVER)
         .arg(root.join("scripts/run_diff_test_campaign.py"))
-        .arg(fileutil_stub)
+        .arg(remote_sync_stub)
         .args(overrides)
         .args(runner_args)
         .arg("--state-dir")
@@ -118,11 +118,11 @@ fn run_campaign_driver(
 fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() {
     let dir = unique_temp_dir("live_smoke");
     let state_dir = dir.join("state_dir");
-    let junit = dir.join("sponge_log.xml");
+    let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let fileutil_log = dir.join("fileutil.log");
-    let fileutil = dir.join("fileutil_stub.sh");
-    write_fileutil_stub(&fileutil, &fileutil_log, 0);
+    let remote_sync_log = dir.join("remote_sync.log");
+    let remote_sync = dir.join("remote_sync_stub.sh");
+    write_remote_sync_stub(&remote_sync, &remote_sync_log, 0);
 
     // 1. Live smoke run with default seed `0x5eed0001` and no quarantine file:
     // must run real Miri + Anneal, separate compared/agreed/diverged/not-compared,
@@ -131,14 +131,14 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     // (`pass_tb_unsafe_cell_shared_mutation__b1_c0`) agrees with Miri since
     // I-11 fixed `&raw const` reborrows of `!Freeze` places.
     let out1 = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[],
         &[
             "--profile",
             "smoke",
-            "--x20-uri",
+            "--remote-uri",
             "",
             "--junit-xml",
             &junit_arg,
@@ -153,8 +153,8 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
         "live smoke campaign with unquarantined divergences must exit 4:\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
     );
     assert!(
-        !fileutil_log.exists(),
-        "campaign without --x20-uri must not invoke fileutil"
+        !remote_sync_log.exists(),
+        "campaign without --remote-uri must not invoke remote_sync"
     );
 
     let report1 =
@@ -285,7 +285,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     .expect("write partial quarantine");
     let state_dir_partial = dir.join("state_dir_partial");
     let out_partial = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[],
@@ -329,7 +329,7 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
     .expect("write full quarantine");
     let state_dir_clean = dir.join("state_dir_clean");
     let out_clean = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[],
@@ -374,11 +374,11 @@ fn live_smoke_campaign_separates_outcomes_reproduces_findings_and_quarantines() 
 fn campaign_orchestrator_fails_when_miri_removed_from_path() {
     let dir = unique_temp_dir("no_miri_path");
     let state_dir = dir.join("state_dir");
-    let junit = dir.join("sponge_log.xml");
+    let junit = dir.join("diff_test_report.xml");
     let junit_arg = junit.to_string_lossy().into_owned();
-    let fileutil_log = dir.join("fileutil.log");
-    let fileutil = dir.join("fileutil_stub.sh");
-    write_fileutil_stub(&fileutil, &fileutil_log, 1);
+    let remote_sync_log = dir.join("remote_sync.log");
+    let remote_sync = dir.join("remote_sync_stub.sh");
+    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     fs::create_dir_all(state_dir.join("state")).expect("create state dir");
     let initial_ledger =
@@ -409,7 +409,7 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
     }
 
     let out = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[("PATH", &no_miri_bin)],
         &["ANNEAL_MIRI_BIN"],
         &[],
@@ -417,7 +417,7 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
             "--profile",
             "smoke",
             "--miri-only",
-            "--x20-uri",
+            "--remote-uri",
             "",
             "--junit-xml",
             &junit_arg,
@@ -454,9 +454,9 @@ fn campaign_orchestrator_fails_when_miri_removed_from_path() {
 #[test]
 fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     let dir = unique_temp_dir("red_flags");
-    let fileutil_log = dir.join("fileutil.log");
-    let fileutil = dir.join("fileutil_stub.sh");
-    write_fileutil_stub(&fileutil, &fileutil_log, 1);
+    let remote_sync_log = dir.join("remote_sync.log");
+    let remote_sync = dir.join("remote_sync_stub.sh");
+    write_remote_sync_stub(&remote_sync, &remote_sync_log, 1);
 
     let initial_ledger = r#"{
   "last_miri_seed": "0x00000011",
@@ -633,14 +633,14 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
         ),
     ] {
         let case_dir = dir.join(label);
-        let junit = case_dir.join("sponge_log.xml");
+        let junit = case_dir.join("diff_test_report.xml");
         let junit_arg = junit.to_string_lossy().into_owned();
         fs::create_dir_all(case_dir.join("state")).expect("create state dir");
         fs::write(case_dir.join("state/campaign_ledger.json"), initial_ledger)
             .expect("write ledger");
 
         let out = run_campaign_driver(
-            &fileutil,
+            &remote_sync,
             &[],
             &[],
             &[format!("miri_summary={payload}")],
@@ -648,7 +648,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
                 "--profile",
                 "smoke",
                 "--miri-only",
-                "--x20-uri",
+                "--remote-uri",
                 "",
                 "--junit-xml",
                 &junit_arg,
@@ -794,7 +794,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
     .expect("write collision quarantine");
     let collision_state = dir.join("collision_state");
     let out_coll = run_campaign_driver(
-        &fileutil,
+        &remote_sync,
         &[],
         &[],
         &[format!("miri_summary={collision_payload}")],
@@ -804,7 +804,7 @@ fn campaign_orchestrator_red_flag_checks_reject_vacuous_and_faulty_runs() {
             "--miri-only",
             "--quarantine-file",
             &collision_quarantine.to_string_lossy(),
-            "--x20-uri",
+            "--remote-uri",
             "",
         ],
         &collision_state,
