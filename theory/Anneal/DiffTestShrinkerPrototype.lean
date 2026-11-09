@@ -901,6 +901,112 @@ theorem ddminReference_total (pred : List α → Bool) (xs : List α) (fuel : Na
   exact ⟨r, hr, (ddminReference_one_minimal pred fuel xs r hr).2⟩
 
 
+/-! ## Part 1c: When Is a 1-Minimal Witness Globally Minimal?
+
+1-minimality only rules out single-step deletions. For *monotone* predicates (adding
+mutation steps never destroys a reproduction, e.g. "every trigger step is present"),
+it already implies that **no proper subsequence** reproduces the discrepancy, so both
+shrinkers return globally minimal witnesses. Without monotonicity (coupled AST
+dependencies, tag-sensitive steps) the guarantee is genuinely local, and the chunk
+phase of the reference `ddmin` can reach strictly smaller witnesses than single-step
+deletion. -/
+
+/-- Every proper sublist of `xs` is a sublist of some single-step deletion of `xs`. -/
+theorem exists_mem_dropOneCandidates_of_sublist {ys xs : List α} (h : ys.Sublist xs)
+    (hlt : ys.length < xs.length) : ∃ zs ∈ dropOneCandidates xs, ys.Sublist zs := by
+  revert hlt
+  induction h with
+  | slnil => intro hlt; simp at hlt
+  | cons a h _ =>
+    intro _
+    exact ⟨_, by simp [dropOneCandidates], h⟩
+  | cons_cons a _ ih =>
+    intro hlt
+    simp only [List.length_cons] at hlt
+    obtain ⟨zs, hzs, hsub⟩ := ih (by omega)
+    refine ⟨a :: zs, ?_, hsub.cons_cons a⟩
+    simp only [dropOneCandidates, List.mem_cons, List.mem_map]
+    exact Or.inr ⟨zs, hzs, rfl⟩
+
+/-- For predicates that are monotone under adding steps, a 1-minimal witness is globally
+minimal: no proper subsequence satisfies `pred`. -/
+theorem isOneMinimal_globally_minimal_of_monotone (pred : List α → Bool)
+    (h_mono : ∀ ys xs : List α, ys.Sublist xs → pred ys = true → pred xs = true)
+    {r : List α} (h_min : IsOneMinimal pred r) :
+    ∀ ys, ys.Sublist r → ys.length < r.length → pred ys = false := by
+  intro ys hsub hlt
+  obtain ⟨zs, hzs, hys⟩ := exists_mem_dropOneCandidates_of_sublist hsub hlt
+  cases h : pred ys with
+  | false => rfl
+  | true =>
+    have h_zs := h_mono ys zs hys h
+    rw [h_min.2 zs hzs] at h_zs
+    exact absurd h_zs (by simp)
+
+/-- The specification shrinker returns a globally minimal witness for monotone
+predicates. -/
+theorem shrinkMutatorChain_globally_minimal_of_monotone (fuel : Nat) (pred : List α → Bool)
+    (xs : List α)
+    (h_mono : ∀ ys xs : List α, ys.Sublist xs → pred ys = true → pred xs = true)
+    (h_pred : pred xs = true) (h_fuel : xs.length ≤ fuel) :
+    ∀ ys, ys.Sublist (shrinkMutatorChain fuel pred xs) →
+      ys.length < (shrinkMutatorChain fuel pred xs).length → pred ys = false :=
+  isOneMinimal_globally_minimal_of_monotone pred h_mono
+    (shrinkMutatorChain_one_minimal fuel pred xs h_pred h_fuel)
+
+/-- The reference model of the Rust `ddmin` returns a globally minimal witness for
+monotone predicates. -/
+theorem ddminReference_globally_minimal_of_monotone (pred : List α → Bool) (fuel : Nat)
+    (xs r : List α)
+    (h_mono : ∀ ys xs : List α, ys.Sublist xs → pred ys = true → pred xs = true)
+    (h : ddminReference pred fuel xs = some r) :
+    ∀ ys, ys.Sublist r → ys.length < r.length → pred ys = false :=
+  isOneMinimal_globally_minimal_of_monotone pred h_mono
+    (ddminReference_one_minimal pred fuel xs r h).2.1
+
+/-- "Every trigger step in `req` is present" predicates are monotone. -/
+theorem containsAll_monotone [DecidableEq α] (req : List α) :
+    ∀ ys xs : List α, ys.Sublist xs →
+      req.all (fun a => decide (a ∈ ys)) = true → req.all (fun a => decide (a ∈ xs)) = true := by
+  intro ys xs hsub h
+  simp only [List.all_eq_true, decide_eq_true_eq] at h ⊢
+  exact fun a ha => hsub.subset (h a ha)
+
+/-- Non-monotone (coupled) predicate: `[1, 2, 3]` is 1-minimal although the smaller
+`[3]` also satisfies it, so 1-minimality is not global minimality in general. -/
+theorem coupled_window_one_minimal_not_globally_minimal :
+    IsOneMinimal (fun xs : List Nat => xs == [1, 2, 3] || xs == [3]) [1, 2, 3] ∧
+      (fun xs : List Nat => xs == [1, 2, 3] || xs == [3]) [3] = true := by
+  refine ⟨⟨rfl, ?_⟩, rfl⟩
+  intro ys hys
+  simp only [dropOneCandidates, List.map, List.mem_cons, List.not_mem_nil, or_false] at hys
+  rcases hys with rfl | rfl | rfl <;> rfl
+
+/-- On that predicate the specification shrinker (single-step deletions only, since
+`3 / 2 < 2`) stops at the local minimum `[1, 2, 3]`. -/
+theorem coupled_window_spec_shrinker_stops_at_local_minimum :
+    shrinkMutatorChain 3 (fun xs : List Nat => xs == [1, 2, 3] || xs == [3]) [1, 2, 3] =
+      [1, 2, 3] := by rfl
+
+/-- The reference `ddmin` deletes the coupled window `[1, 2]` at chunk size `2` and
+reaches the smaller witness `[3]`. -/
+theorem coupled_window_ddmin_reaches_smaller_witness :
+    ddminReference (fun xs : List Nat => xs == [1, 2, 3] || xs == [3]) 16 [1, 2, 3] =
+      some [3] := by rfl
+
+/-- The fuel hypothesis `xs.length ≤ fuel` of `shrinkMutatorChain_one_minimal` is tight:
+with `fuel = xs.length - 1` the result need not be 1-minimal. -/
+theorem shrinkMutatorChain_fuel_bound_tight :
+    shrinkMutatorChain 2 (fun _ : List Nat => true) [1, 2, 3] = [3] ∧
+      ¬ IsOneMinimal (fun _ : List Nat => true)
+        (shrinkMutatorChain 2 (fun _ : List Nat => true) [1, 2, 3]) := by
+  have hval : shrinkMutatorChain 2 (fun _ : List Nat => true) [1, 2, 3] = [3] := by rfl
+  refine ⟨hval, ?_⟩
+  rw [hval]
+  intro h
+  have h_nil := h.2 [] (by simp [dropOneCandidates])
+  exact absurd h_nil (by simp)
+
 /-! ## Part 2: Wide `BitVec` Shift-Exponent Bounds Guard -/
 
 /-- Guarded left shift that checks `rhs.toNat < w` before invoking `lhs <<< rhs.toNat`,
@@ -1234,6 +1340,27 @@ theorem bvAshrOverflowing_fst_msb_eq {w : Nat} (lhs rhs : BitVec w) :
 
 /-! ## Part 3: Concrete Kernel Regression Witnesses (Zero `native_decide`) -/
 
+/-- On non-negative operands (`msb = false`) the guarded arithmetic and logical right
+shifts coincide. -/
+theorem bvAshrSafe_eq_bvLshrSafe_of_msb_false {w : Nat} (lhs rhs : BitVec w)
+    (h : lhs.msb = false) : bvAshrSafe lhs rhs = bvLshrSafe lhs rhs := by
+  unfold bvAshrSafe bvLshrSafe
+  split <;> simp [BitVec.sshiftRight_eq_of_msb_false h]
+
+/-- On non-negative operands the overflowing arithmetic and logical right shifts
+coincide (shifted value and overflow flag). -/
+theorem bvAshrOverflowing_eq_bvLshrOverflowing_of_msb_false {w : Nat} (lhs rhs : BitVec w)
+    (h : lhs.msb = false) : bvAshrOverflowing lhs rhs = bvLshrOverflowing lhs rhs := by
+  unfold bvAshrOverflowing bvLshrOverflowing
+  split <;> simp [BitVec.sshiftRight_eq_of_msb_false h]
+
+/-- On negative operands they differ: `i8::MIN >> 1` is `0xC0` arithmetically but `0x40`
+logically. -/
+theorem bvAshrSafe_ne_bvLshrSafe_i8_min :
+    bvAshrSafe (BitVec.ofInt 8 (-128)) (BitVec.ofNat 8 1) = some (BitVec.ofNat 8 0xC0) ∧
+      bvLshrSafe (BitVec.ofInt 8 (-128)) (BitVec.ofNat 8 1) = some (BitVec.ofNat 8 0x40) := by
+  constructor <;> rfl
+
 /-- Wide `BitVec 64` shifts with exponent `2^32` (`4294967296`) evaluate cleanly
 in the Lean 4 kernel without triggering `lean_nat_shiftl` `SIGABRT`. -/
 theorem bvShlSafe_u64_exp_2pow32 :
@@ -1527,6 +1654,11 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms ddminReference_total
 #print axioms ddminLoop_one_eq_some_of_isOneMinimal
 #print axioms ddminReference_eq_some_self_of_isOneMinimal_le_two
+#print axioms isOneMinimal_globally_minimal_of_monotone
+#print axioms ddminReference_globally_minimal_of_monotone
+#print axioms coupled_window_one_minimal_not_globally_minimal
+#print axioms shrinkMutatorChain_fuel_bound_tight
+#print axioms bvAshrOverflowing_eq_bvLshrOverflowing_of_msb_false
 #print axioms ddminReference_coupled_pair_witness
 #print axioms bvShlOverflowing_shift_bound
 #print axioms bvShlOverflowing_shift_lt_two_pow_32

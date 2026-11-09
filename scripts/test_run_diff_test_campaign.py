@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -593,6 +594,26 @@ class SemanticMutantDifferentialTest(unittest.TestCase):
         by_id = {r["id"]: r for r in res["results"]}
         self.assertEqual(by_id["bad_baseline"]["kill_class"], "baseline_not_clean")
         self.assertEqual(by_id["equivalent_mutant"]["survived_variants"], ["same_as_baseline"])
+
+    def test_seeded_probe_sources_match_the_live_validated_rust_probes(self) -> None:
+        # `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` runs
+        # these exact probe sources through the live, unmutated Miri + Anneal pipeline,
+        # which is what justifies each simulated clean baseline.
+        rust_src = (
+            SCRIPT_DIR.parent / "crates" / "anneal-difftest" / "src" / "miri_eval.rs"
+        ).read_text(encoding="utf-8")
+        start = rust_src.index("const SEMANTIC_MUTANT_PROBES")
+        end = rust_src.index("const KNOWN_PROVENANCE_GAP_PROBES", start)
+        rust_probes = dict(
+            re.findall(r'\(\s*"(\w+)",\s*r#"(.*?)"#,\s*\)', rust_src[start:end], re.S)
+        )
+        py_probes = {
+            str(m["id"]): str(m["probe_rust_source"]) for m in campaign.SEEDED_SEMANTIC_MUTANTS
+        }
+        self.assertEqual(sorted(rust_probes), sorted(py_probes))
+        for mutant_id, source in py_probes.items():
+            with self.subTest(mutant=mutant_id):
+                self.assertEqual(rust_probes[mutant_id], source)
 
     def test_evaluator_exception_counts_as_survival(self) -> None:
         def flaky(mutant: dict[str, object]) -> bool:

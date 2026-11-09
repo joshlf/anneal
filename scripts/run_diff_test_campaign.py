@@ -1934,6 +1934,17 @@ def campaign_exit_for_miri_summary(summary: dict[str, Any]) -> tuple[int, str, s
     return EXIT_SUCCESS, "agree", "no divergence"
 
 
+# Every probe below was run through the live, *unmutated* Miri + Anneal pipeline
+# (`miri-difftest --reproduce`) and agrees, so each simulated `baseline_anneal_outcome`
+# describes the real engine; the Rust test
+# `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` (in
+# `crates/anneal-difftest/src/miri_eval.rs`, which embeds byte-identical probe sources)
+# re-checks this on every `cargo test`. Two provenance variants were rejected as probes
+# because the live engine already diverges on them (kernel-confirmed `missed_ub`): a
+# `u8` load/store round trip of one pointer byte, and one byte copied from another
+# pointer with `copy_nonoverlapping`. A "check omitted" mutant would be equivalent to the
+# current engine there, so those probes could never kill it; they are pinned as known
+# engine gaps by the same Rust test instead.
 SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
     {
         "id": "bool_valid_range",
@@ -1993,10 +2004,13 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
         "name": "provenance_frag",
         "bug_class": "partial_pointer_overwrite_provenance_strip",
         "target_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Memory",
-        "description": "Omit pointer fragment provenance invalidation on partial byte overwrite",
+        "description": (
+            "Omit pointer provenance invalidation when one byte of a stored pointer is "
+            "overwritten with integer data"
+        ),
         "expected_kill_classes": ("missed_ub", "false_positive_ub"),
-        "reference_miri_outcome": "ub@src/lib.rs:8:9",
-        "baseline_anneal_outcome": "ub@src/lib.rs:8:9: 8:11",
+        "reference_miri_outcome": "ub@src/lib.rs:7:9",
+        "baseline_anneal_outcome": "ub@src/lib.rs:7:9: 7:11",
         "baseline_anneal_lean_tag": "MirDiffTag.ub",
         "mutant_variants": (
             {
@@ -2011,8 +2025,7 @@ SEEDED_SEMANTIC_MUTANTS: tuple[dict[str, Any], ...] = (
             "    let mut p: *const u32 = &raw const x;\n"
             "    let byte_ptr: *mut u8 = (&raw mut p) as *mut u8;\n"
             "    unsafe {\n"
-            "        let b0: u8 = *byte_ptr;\n"
-            "        *byte_ptr = b0;\n"
+            "        *byte_ptr = 0u8;\n"
             "        *p\n"
             "    }\n"
             "}\n"

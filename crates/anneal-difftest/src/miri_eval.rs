@@ -2806,6 +2806,178 @@ mod tests {
         );
     }
 
+    /// Probe sources of `SEEDED_SEMANTIC_MUTANTS` in `scripts/run_diff_test_campaign.py`
+    /// (a Python unit test checks that both copies stay byte-identical).
+    const SEMANTIC_MUTANT_PROBES: [(&str, &str); 5] = [
+        (
+            "bool_valid_range",
+            r#"pub fn probe_bool_valid_range() -> u32 {
+    let mut b: bool = false;
+    let p: *mut u8 = (&raw mut b) as *mut u8;
+    unsafe { *p = 2u8; }
+    b as u32
+}
+"#,
+        ),
+        (
+            "storage_dead_tag",
+            r#"pub fn probe_storage_dead_tag() -> u32 {
+    let dangling: *const u32 = {
+        let dead_local: u32 = 42u32;
+        &raw const dead_local
+    };
+    unsafe { *dangling }
+}
+"#,
+        ),
+        (
+            "provenance_frag",
+            r#"pub fn probe_provenance_frag() -> u32 {
+    let x: u32 = 7u32;
+    let mut p: *const u32 = &raw const x;
+    let byte_ptr: *mut u8 = (&raw mut p) as *mut u8;
+    unsafe {
+        *byte_ptr = 0u8;
+        *p
+    }
+}
+"#,
+        ),
+        (
+            "div_by_zero",
+            r#"pub fn probe_div_by_zero() -> u32 {
+    let num: u32 = 100u32;
+    let den: u32 = 0u32;
+    num / den
+}
+"#,
+        ),
+        (
+            "wide_shift",
+            r#"pub fn probe_wide_shift() -> u64 {
+    let lhs: u64 = 1u64;
+    let rhs: u64 = 1u64 << 32;
+    unsafe { unchecked_shl(lhs, rhs) }
+}
+"#,
+        ),
+    ];
+
+    /// Provenance probes on which the live engine currently misses Miri's UB.
+    const KNOWN_PROVENANCE_GAP_PROBES: [&str; 2] = [
+        r#"pub fn probe_gap_provenance_u8_roundtrip() -> u32 {
+    let x: u32 = 7u32;
+    let mut p: *const u32 = &raw const x;
+    let byte_ptr: *mut u8 = (&raw mut p) as *mut u8;
+    unsafe {
+        let b0: u8 = *byte_ptr;
+        *byte_ptr = b0;
+        *p
+    }
+}
+"#,
+        r#"pub fn probe_gap_provenance_mixed_fragments() -> u32 {
+    let x: u32 = 7u32;
+    let y: u32 = 9u32;
+    let mut p: *const u32 = &raw const x;
+    let q: *const u32 = &raw const y;
+    let dst: *mut u8 = (&raw mut p) as *mut u8;
+    let src: *const u8 = (&raw const q) as *const u8;
+    unsafe {
+        copy_nonoverlapping(src, dst, 1);
+        *p
+    }
+}
+"#,
+    ];
+
+    /// Grounds the Python semantic-mutant self-check in the real engine: every seeded
+    /// probe must agree between live Miri and the *unmutated* Anneal semantics (so a
+    /// mutant that omits the corresponding check is killable), and the two provenance
+    /// variants on which the engine currently misses Miri's UB stay pinned as
+    /// kernel-confirmed `missed_ub` divergences. When the engine gap is fixed, the pin
+    /// fails and must be removed (ratchet), exactly like a `known_anneal_bug` entry.
+    #[test]
+    fn semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repository root")
+            .to_path_buf();
+        let toolchain = MiriToolchain::resolve(None, None, None).expect("resolve Miri toolchain");
+        let fn_sources: Vec<&str> = SEMANTIC_MUTANT_PROBES
+            .iter()
+            .map(|(_, src)| *src)
+            .chain(KNOWN_PROVENANCE_GAP_PROBES)
+            .collect();
+        let staging_dir = create_staging_dir("probes").expect("staging dir");
+        let crate_source = build_standalone_candidate_source(&fn_sources.join("\n"));
+        fs::write(staging_dir.join("src/lib.rs"), &crate_source).expect("write probes");
+        let names: Vec<String> = SEMANTIC_MUTANT_PROBES
+            .iter()
+            .map(|(id, _)| format!("probe_{id}"))
+            .chain([
+                "probe_gap_provenance_u8_roundtrip".to_string(),
+                "probe_gap_provenance_mixed_fragments".to_string(),
+            ])
+            .collect();
+        let specs: Vec<OracleItemSpec> = names
+            .iter()
+            .map(|n| OracleItemSpec::with_fuel(n.clone(), MIRI_DIFFTEST_CANDIDATE_FUEL))
+            .collect();
+        let cfg = DifftestOracleConfig {
+            corpus_root: staging_dir.clone(),
+            capture_rustflags: DEFAULT_CAPTURE_RUSTFLAGS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            miri_flags: DEFAULT_MIRI_FLAGS.iter().map(|s| (*s).to_string()).collect(),
+            anneal_repo_root: Some(repo_root),
+            rustc_wrapper: None,
+            toolchain,
+        };
+        let report = run_difftest_oracle_pipeline(&cfg, &specs);
+        let _ = fs::remove_dir_all(&staging_dir);
+        let report = report.expect("live oracle pipeline over the semantic-mutant probes");
+        let by_name: BTreeMap<&str, &ItemOracleReport> =
+            report.items.iter().map(|it| (it.name.as_str(), it)).collect();
+
+        for (id, _) in SEMANTIC_MUTANT_PROBES {
+            let item = by_name[format!("probe_{id}").as_str()];
+            assert_eq!(
+                item.verdict,
+                ComparisonVerdict::Agree,
+                "probe `{id}` must agree with the unmutated engine: miri={:?} anneal={:?}",
+                item.miri,
+                item.anneal
+            );
+            assert!(
+                matches!(item.miri, MiriOutcome::Ub { .. } | MiriOutcome::Panic { .. }),
+                "probe `{id}` must exercise a UB / panic check: {:?}",
+                item.miri
+            );
+        }
+        for gap in ["probe_gap_provenance_u8_roundtrip", "probe_gap_provenance_mixed_fragments"] {
+            let item = by_name[gap];
+            assert!(
+                matches!(
+                    (&item.verdict, &item.miri, &item.anneal),
+                    (
+                        ComparisonVerdict::Diverge(DivergenceKind::MissedUb { .. }),
+                        MiriOutcome::Ub { .. },
+                        AnnealOutcome::PassScalar { .. }
+                    )
+                ),
+                "known engine gap `{gap}` changed (fixed?): verdict={:?} miri={:?} anneal={:?}; \
+                 update the pin and consider promoting the probe",
+                item.verdict,
+                item.miri,
+                item.anneal
+            );
+            assert!(item.kernel_confirmed, "`{gap}` divergence must be kernel-confirmed");
+        }
+    }
+
     #[test]
     fn finding_bundle_json_and_summary_serialize_shrink_metadata() {
         let dir = create_staging_dir("bundle_test").expect("create test dir");

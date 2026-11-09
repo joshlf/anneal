@@ -441,6 +441,42 @@ mod tests {
         assert_eq!(coupled.minimized_steps, vec!["M4"]);
     }
 
+    /// Mirrors `ddminReference_globally_minimal_of_monotone`: for monotone "every trigger
+    /// step is present" predicates the 1-minimal result is the trigger set itself, i.e.
+    /// globally minimal among all subsequences (600 random trigger sets, lengths `0..=10`).
+    #[test]
+    fn shrink_mutation_chain_detailed_is_globally_minimal_for_monotone_predicates() {
+        let mut seed = 0x0DDB_A11u64;
+        for trial in 0..600usize {
+            seed = splitmix64(seed);
+            let n = trial % 11;
+            let steps: Vec<usize> = (0..n).collect();
+            let required: Vec<usize> =
+                steps.iter().copied().filter(|i| (seed >> i) & 1 == 1).collect();
+            let out =
+                shrink_mutation_chain_detailed(&steps, |s| required.iter().all(|r| s.contains(r)));
+            assert!(out.succeeded && out.is_one_minimal, "trial {trial}");
+            assert_eq!(out.minimized_steps, required, "trial {trial}: not globally minimal");
+        }
+    }
+
+    /// Mirrors `coupled_window_one_minimal_not_globally_minimal` and
+    /// `coupled_window_ddmin_reaches_smaller_witness`: the predicate holds exactly on
+    /// `[1, 2, 3]` and `[3]`, so `[1, 2, 3]` is already 1-minimal, yet the chunk phase
+    /// deletes the coupled window `[1, 2]` at `chunk_size == 2` and reaches `[3]`.
+    #[test]
+    fn ddmin_chunk_phase_reaches_witness_below_single_step_local_minimum() {
+        let pred = |s: &[u32]| s == [1, 2, 3] || s == [3];
+        for i in 0..3 {
+            let mut deleted = vec![1u32, 2, 3];
+            deleted.remove(i);
+            assert!(!pred(&deleted), "[1, 2, 3] must be 1-minimal");
+        }
+        let out = shrink_mutation_chain_detailed(&[1u32, 2, 3], pred);
+        assert_eq!(out.minimized_steps, vec![3]);
+        assert!(out.succeeded && out.is_one_minimal);
+    }
+
     fn splitmix64(mut z: u64) -> u64 {
         z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
