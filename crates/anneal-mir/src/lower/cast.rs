@@ -29,14 +29,16 @@ pub enum TransmutePolicy {
     AllowPtrToIntStripProvenance,
 }
 
-/// Lowered transmute descriptor distinguishing scalar-to-scalar transmutes from
-/// composite/aggregate byte transmutes.
+/// Lowered transmute and cast descriptor distinguishing scalar-to-scalar transmutes,
+/// composite/aggregate byte transmutes, and `char -> Int/Uint` conversions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CastOp {
     /// Scalar-to-scalar bit reinterpretation (`ScalarTy -> ScalarTy`).
     Transmute { src: ScalarTy, dst: ScalarTy },
     /// Same-size aggregate/composite byte reinterpretation (e.g. `[u8; 4] <-> u32`).
     AggregateTransmute { size_bytes: usize },
+    /// Unicode scalar (`char`) to integer conversion (`CastKind::CharToInt`).
+    CharToInt,
 }
 
 /// Errors encountered during MIR cast lowering.
@@ -158,6 +160,11 @@ pub enum LoweredCast {
         src_ty: Ty,
         target_ty: Ty,
         operand: Operand,
+    },
+    /// Unicode scalar (`char`) to integer conversion (`CastKind::CharToInt`).
+    CharToInt {
+        operand: Operand,
+        target_ty: Ty,
     },
     /// Raw pointer to raw pointer reinterpretation (`CastKind::PtrToPtr`).
     PtrToPtr {
@@ -443,6 +450,7 @@ pub fn lower_cast_rvalue_with_ptr_width(
                 operand: operand.clone(),
             })
         }
+        CastKind::CharToInt => lower_char_to_int(operand, src_ty, target_ty, ptr_width),
         CastKind::PtrToPtr => {
             if !src_ty.is_raw_ptr() {
                 return Err(CastLowerError::InvalidSourceType {
@@ -830,6 +838,70 @@ pub fn eval_int_to_ptr(
     predicted_prov: Option<Provenance>,
 ) -> Result<PointerValue, CastEvalError> {
     eval_int_to_ptr_with_ptr_width(addr, target_ty, PtrWidth::Bits64, tracker, predicted_prov)
+}
+
+/// Lowers a `CastKind::CharToInt` cast (`char -> Int/Uint`) under `ptr_width`.
+///
+/// Preconditions:
+/// - `src_ty` must be `Ty::Char`.
+/// - `target_ty` must be an integral type (`Ty::Int(_)` or `Ty::Uint(_)`) with a
+///   representable layout under `ptr_width`.
+pub fn lower_char_to_int(
+    operand: &Operand,
+    src_ty: &Ty,
+    target_ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<LoweredCast, CastLowerError> {
+    if *src_ty != Ty::Char {
+        return Err(CastLowerError::InvalidSourceType {
+            expected: "char",
+            got: src_ty.clone(),
+        });
+    }
+    if !target_ty.is_integral() {
+        return Err(CastLowerError::InvalidTargetType {
+            expected: "integral type",
+            got: target_ty.clone(),
+        });
+    }
+    if target_ty.layout_size_for(ptr_width).is_none() {
+        return Err(CastLowerError::LayoutTooLarge {
+            ty: target_ty.clone(),
+        });
+    }
+    Ok(LoweredCast::CharToInt {
+        operand: operand.clone(),
+        target_ty: target_ty.clone(),
+    })
+}
+
+/// Evaluates a `CastKind::CharToInt` conversion on a `char` codepoint bit pattern.
+///
+/// Validates that `codepoint_bits` is a Unicode scalar value (`codepoint_bits <= 0xD7FF`
+/// or `0xE000 <= codepoint_bits <= 0x10FFFF`), returning
+/// `CastEvalError::InvalidBitPattern { target_ty: Ty::Char, bits: codepoint_bits }`
+/// otherwise, and masks the codepoint to `target_ty`'s bit width under `ptr_width`.
+pub fn eval_char_to_int(
+    codepoint_bits: u128,
+    target_ty: &Ty,
+    ptr_width: PtrWidth,
+) -> Result<u128, CastEvalError> {
+    let dst_mask = match target_ty {
+        Ty::Int(it) => it.mask(ptr_width),
+        Ty::Uint(ut) => ut.mask(ptr_width),
+        _ => {
+            return Err(CastEvalError::TypeMismatch(
+                "CharToInt target must be Int or Uint",
+            ));
+        }
+    };
+    if !ScalarTy::Char.is_valid_bits(codepoint_bits, ptr_width) {
+        return Err(CastEvalError::InvalidBitPattern {
+            target_ty: Ty::Char,
+            bits: codepoint_bits,
+        });
+    }
+    Ok(codepoint_bits & dst_mask)
 }
 
 /// Evaluates a numeric `CastKind::IntToInt` conversion (including `bool`/`char` as integer).

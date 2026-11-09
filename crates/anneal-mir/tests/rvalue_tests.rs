@@ -2,13 +2,16 @@
 
 use anneal_mir::ir::{
     AggregateKind, BasicBlockData, BinOp, Body, CastKind, Constant, IntTy, Local, Mutability,
-    Operand, Place, PointerValue, ProjectionElem, PtrWidth, Rvalue, Statement, Ty, UintTy, UnOp,
+    NullOp, Operand, Place, PointerValue, ProjectionElem, PtrWidth, Rvalue, Statement, Ty, UintTy,
+    UnOp,
 };
 use anneal_mir::lower::{
-    CastEvalError, CastLowerError, ExposedProvenanceTracker, LoweredCast, LoweredRvalue,
-    LoweredStatement, MirValue, RvalueEvalError, RvalueLowerError, TransmutePolicy, eval_aggregate,
-    eval_binop, eval_checked_binop, eval_constant, eval_lowered_cast, eval_lowered_rvalue,
-    eval_unop, lower_body, lower_rvalue, lower_rvalue_with_policy, lower_statement,
+    CastEvalError, CastLowerError, ExposedProvenanceTracker, LocalSlotState,
+    LoweredCast, LoweredRvalue, LoweredStatement, MirValue, RvalueEvalError, RvalueLowerError,
+    StatementEvalState, TransmutePolicy, eval_aggregate, eval_binop, eval_checked_binop,
+    eval_constant, eval_lowered_block, eval_lowered_cast, eval_lowered_rvalue,
+    eval_lowered_statement, eval_nullary_op, eval_place_read, eval_place_write, eval_unop,
+    lower_body, lower_rvalue, lower_rvalue_with_policy, lower_statement, resolve_offset_of,
     resolve_place_ty,
 };
 
@@ -1053,10 +1056,35 @@ fn test_b1_place_evaluation_respects_projections() {
         Err(RvalueEvalError::UnsupportedPlaceProjection(field1))
     );
     // A0 returned the *base local's* discriminant (3) for `discriminant(_3.0)` (truly 1).
-    let inner_place = Place::with_projection(3, vec![ProjectionElem::Field(0, inner)]);
+    // Without `Downcast(3)`, projecting field 0 of `Outer` (variant 3) is an inactive-variant UB;
+    // with `Downcast(3)`, `discriminant((_3 as variant#3).0)` evaluates to the inner variant `1`,
+    // and dereferenced discriminant `discriminant(*_1)` requires a memory model.
+    let inner_place = Place::with_projection(3, vec![ProjectionElem::Field(0, inner.clone())]);
     assert_eq!(
-        eval_rv(&Rvalue::Discriminant(inner_place.clone()), &local_decls, &locals, pw, policy, &mut tracker),
-        Err(RvalueEvalError::UnsupportedPlaceProjection(inner_place))
+        eval_rv(&Rvalue::Discriminant(inner_place), &local_decls, &locals, pw, policy, &mut tracker),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 0,
+            actual: 3,
+        })
+    );
+    let downcast_inner_place = Place::with_projection(
+        3,
+        vec![ProjectionElem::Downcast(3), ProjectionElem::Field(0, inner)],
+    );
+    assert_eq!(
+        eval_rv(
+            &Rvalue::Discriminant(downcast_inner_place),
+            &local_decls,
+            &locals,
+            pw,
+            policy,
+            &mut tracker
+        ),
+        Ok(MirValue::signed(1, IntTy::Isize, pw))
+    );
+    assert_eq!(
+        eval_rv(&Rvalue::Discriminant(deref(1)), &local_decls, &locals, pw, policy, &mut tracker),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(deref(1)))
     );
     assert_eq!(
         eval_rv(&Rvalue::Discriminant(Place::from_local(3)), &local_decls, &locals, pw, policy, &mut tracker),
@@ -1706,4 +1734,800 @@ fn test_a2_identity_transmute_handles_canonical_structs_unions_and_32bit_ptr_mas
         eval_lowered_rvalue(&copy_deref_ref, &[null_ref], pw64, policy, &mut tracker),
         Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern { .. }))
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Episode 1 (`ep1-rust-place-proj-nullary-stmt`) tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_ep1_nullary_op_size_of_align_of_offset_of_and_ub_checks() {
+    let mut tracker = ExposedProvenanceTracker::new();
+    let policy = TransmutePolicy::RejectPtrToInt;
+
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u16_ty = Ty::Uint(UintTy::U16);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let u64_ty = Ty::Uint(UintTy::U64);
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let raw_u8 = Ty::RawPtr(Box::new(u8_ty.clone()), Mutability::Not);
+
+    // 1. SizeOf and AlignOf across Bits32 and Bits64, including uninhabited types (`!`, `(!, u32)`)
+    let layout_cases = [
+        (Ty::Never, 0usize, 1usize, 0usize, 1usize),
+        (Ty::unit(), 0, 1, 0, 1),
+        (Ty::Bool, 1, 1, 1, 1),
+        (Ty::Char, 4, 4, 4, 4),
+        (usize_ty.clone(), 4, 4, 8, 8),
+        (raw_u8.clone(), 4, 4, 8, 8),
+        (Ty::Tuple(vec![Ty::Never, u32_ty.clone()]), 4, 4, 4, 4),
+        (Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone()]), 8, 4, 8, 4),
+        (Ty::Tuple(vec![raw_u8.clone(), u64_ty.clone()]), 16, 8, 16, 8),
+    ];
+
+    for (ty, sz32, al32, sz64, al64) in &layout_cases {
+        for (pw, exp_sz, exp_al) in [
+            (PtrWidth::Bits32, *sz32, *al32),
+            (PtrWidth::Bits64, *sz64, *al64),
+        ] {
+            let size_rv = Rvalue::NullaryOp(NullOp::SizeOf, ty.clone());
+            let align_rv = Rvalue::NullaryOp(NullOp::AlignOf, ty.clone());
+            assert_eq!(
+                eval_rv(&size_rv, &[], &[], pw, policy, &mut tracker),
+                Ok(MirValue::unsigned(exp_sz as u128, UintTy::Usize, pw))
+            );
+            assert_eq!(
+                eval_rv(&align_rv, &[], &[], pw, policy, &mut tracker),
+                Ok(MirValue::unsigned(exp_al as u128, UintTy::Usize, pw))
+            );
+        }
+    }
+
+    // 2. OffsetOf on canonical tuples and nested canonical tuples
+    let canon_triple = Ty::Tuple(vec![u32_ty.clone(), u16_ty.clone(), u16_ty.clone()]);
+    let nested_canon = Ty::Tuple(vec![
+        Ty::Tuple(vec![u64_ty.clone(), u64_ty.clone()]),
+        canon_triple.clone(),
+    ]);
+    for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        assert_eq!(resolve_offset_of(&canon_triple, &[], pw), Ok(0));
+        assert_eq!(resolve_offset_of(&canon_triple, &[(0, 0)], pw), Ok(0));
+        assert_eq!(resolve_offset_of(&canon_triple, &[(0, 1)], pw), Ok(4));
+        assert_eq!(resolve_offset_of(&canon_triple, &[(0, 2)], pw), Ok(6));
+        assert_eq!(resolve_offset_of(&nested_canon, &[(0, 1), (0, 2)], pw), Ok(22));
+
+        let off_rv = Rvalue::NullaryOp(
+            NullOp::OffsetOf(vec![(0, 1), (0, 2)]),
+            nested_canon.clone(),
+        );
+        assert_eq!(
+            eval_rv(&off_rv, &[], &[], pw, policy, &mut tracker),
+            Ok(MirValue::unsigned(22, UintTy::Usize, pw))
+        );
+    }
+
+    // `(*const u8, u64)` is canonical on Bits64 (offset 8 for field 1) but non-canonical on Bits32!
+    let ptr_u64 = Ty::Tuple(vec![raw_u8.clone(), u64_ty.clone()]);
+    assert_eq!(resolve_offset_of(&ptr_u64, &[(0, 1)], PtrWidth::Bits64), Ok(8));
+    assert_eq!(
+        resolve_offset_of(&ptr_u64, &[(0, 1)], PtrWidth::Bits32),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(ptr_u64.clone()))
+    );
+
+    // 3. Fail-closed OffsetOf rejection on non-canonical tuples and invalid field paths
+    for non_canon in [
+        Ty::Tuple(vec![u8_ty.clone(), u32_ty.clone()]),
+        Ty::Tuple(vec![u8_ty.clone(), Ty::Bool]),
+        Ty::Tuple(vec![u32_ty.clone(), u64_ty.clone()]),
+        Ty::Tuple(vec![Ty::Array(Box::new(u8_ty.clone()), 4), u32_ty.clone()]),
+    ] {
+        let rv = Rvalue::NullaryOp(NullOp::OffsetOf(vec![(0, 1)]), non_canon.clone());
+        assert_eq!(
+            lower_rvalue(&rv, &[], PtrWidth::Bits64),
+            Err(RvalueLowerError::UnsupportedOffsetOfLayout(non_canon))
+        );
+    }
+
+    // Non-zero variant_idx, out-of-bounds field_idx, or non-tuple container rejected
+    assert_eq!(
+        lower_rvalue(
+            &Rvalue::NullaryOp(NullOp::OffsetOf(vec![(1, 0)]), canon_triple.clone()),
+            &[],
+            PtrWidth::Bits64
+        ),
+        Err(RvalueLowerError::InvalidOffsetOfField {
+            container_ty: canon_triple.clone(),
+            variant_idx: 1,
+            field_idx: 0,
+        })
+    );
+    assert_eq!(
+        lower_rvalue(
+            &Rvalue::NullaryOp(NullOp::OffsetOf(vec![(0, 5)]), canon_triple),
+            &[],
+            PtrWidth::Bits64
+        ),
+        Err(RvalueLowerError::InvalidOffsetOfField {
+            container_ty: Ty::Tuple(vec![u32_ty.clone(), u16_ty.clone(), u16_ty]),
+            variant_idx: 0,
+            field_idx: 5,
+        })
+    );
+    let arr_u32 = Ty::Array(Box::new(u32_ty.clone()), 4);
+    assert_eq!(
+        lower_rvalue(
+            &Rvalue::NullaryOp(NullOp::OffsetOf(vec![(0, 0)]), arr_u32.clone()),
+            &[],
+            PtrWidth::Bits64
+        ),
+        Err(RvalueLowerError::InvalidOffsetOfField {
+            container_ty: arr_u32,
+            variant_idx: 0,
+            field_idx: 0,
+        })
+    );
+
+    // 4. LayoutTooLarge rejected in SizeOf, AlignOf, OffsetOf
+    let too_big_32 = Ty::Array(Box::new(u8_ty), 1 << 31);
+    for op in [
+        NullOp::SizeOf,
+        NullOp::AlignOf,
+        NullOp::OffsetOf(vec![]),
+    ] {
+        assert_eq!(
+            lower_rvalue(
+                &Rvalue::NullaryOp(op.clone(), too_big_32.clone()),
+                &[],
+                PtrWidth::Bits32
+            ),
+            Err(RvalueLowerError::LayoutTooLarge(too_big_32.clone()))
+        );
+        assert!(matches!(
+            eval_nullary_op(&op, &too_big_32, PtrWidth::Bits32),
+            Err(RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge { .. }))
+        ));
+    }
+
+    // 5. UbChecks requires Ty::Bool and evaluates to MirValue::Bool(true)
+    let ub_ok = Rvalue::NullaryOp(NullOp::UbChecks, Ty::Bool);
+    assert_eq!(
+        eval_rv(&ub_ok, &[], &[], PtrWidth::Bits64, policy, &mut tracker),
+        Ok(MirValue::Bool(true))
+    );
+    let ub_bad = Rvalue::NullaryOp(NullOp::UbChecks, u32_ty.clone());
+    assert_eq!(
+        lower_rvalue(&ub_bad, &[], PtrWidth::Bits64),
+        Err(RvalueLowerError::InvalidNullaryOpType {
+            op: NullOp::UbChecks,
+            arg_ty: u32_ty,
+        })
+    );
+}
+
+#[test]
+fn test_ep1_value_tree_place_projections_read_write_and_rvalue_integration() {
+    let pw = PtrWidth::Bits64;
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let mut tracker = ExposedProvenanceTracker::new();
+
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty.clone()), Mutability::Mut);
+    let pair_ty = Ty::Tuple(vec![u32_ty.clone(), u8_ty.clone()]);
+    let arr_pair_ty = Ty::Array(Box::new(pair_ty.clone()), 4);
+    let outer_ty = Ty::Tuple(vec![arr_pair_ty.clone(), raw_u32.clone()]);
+
+    let ptr_val = PointerValue::with_provenance(0x9000, 12, 34);
+    let make_pair = |a: u128, b: u128| {
+        MirValue::Tuple(vec![
+            MirValue::unsigned(a, UintTy::U32, pw),
+            MirValue::unsigned(b, UintTy::U8, pw),
+        ])
+    };
+
+    let local_decls = vec![
+        outer_ty.clone(), // _0: ([(u32, u8); 4], *mut u32)
+        usize_ty.clone(), // _1: dynamic index usize
+        pair_ty.clone(),  // _2: enum / union ADT local
+    ];
+
+    let mut locals = vec![
+        MirValue::Tuple(vec![
+            MirValue::Array {
+                elements: vec![
+                    make_pair(10, 1),
+                    make_pair(20, 2),
+                    make_pair(30, 3),
+                    make_pair(40, 4),
+                ],
+                elem_ty: pair_ty.clone(),
+            },
+            MirValue::ptr(ptr_val, raw_u32.clone()),
+        ]),
+        MirValue::unsigned(2, UintTy::Usize, pw),
+        MirValue::Adt {
+            def_path: "MyEnum".into(),
+            variant_idx: 1,
+            active_field: None,
+            fields: vec![
+                MirValue::unsigned(777, UintTy::U32, pw),
+                MirValue::unsigned(9, UintTy::U8, pw),
+            ],
+        },
+    ];
+
+    // 1. Chained Field -> Index -> Field read & write (`_0.0[_1].0`)
+    let elem2_field0 = Place::with_projection(
+        0,
+        vec![
+            ProjectionElem::Field(0, arr_pair_ty.clone()),
+            ProjectionElem::Index(Local(1)),
+            ProjectionElem::Field(0, u32_ty.clone()),
+        ],
+    );
+    assert_eq!(eval_place_read(&elem2_field0, &locals, pw), Ok(MirValue::unsigned(30, UintTy::U32, pw)));
+    eval_place_write(
+        &elem2_field0,
+        MirValue::unsigned(300, UintTy::U32, pw),
+        &mut locals,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(eval_place_read(&elem2_field0, &locals, pw), Ok(MirValue::unsigned(300, UintTy::U32, pw)));
+
+    // Out-of-bounds dynamic Index (`_1 = 99`)
+    locals[1] = MirValue::unsigned(99, UintTy::Usize, pw);
+    assert_eq!(
+        eval_place_read(&elem2_field0, &locals, pw),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 99, len: 4 })
+    );
+    assert_eq!(
+        eval_place_write(
+            &elem2_field0,
+            MirValue::unsigned(1, UintTy::U32, pw),
+            &mut locals,
+            pw
+        ),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 99, len: 4 })
+    );
+    locals[1] = MirValue::unsigned(2, UintTy::Usize, pw);
+
+    // 2. ConstantIndex (`from_end: false` and `from_end: true`, `offset == 0` with `from_end: true` rejected)
+    let const_from_end = Place::with_projection(
+        0,
+        vec![
+            ProjectionElem::Field(0, arr_pair_ty.clone()),
+            ProjectionElem::ConstantIndex {
+                offset: 1,
+                min_length: 4,
+                from_end: true,
+            },
+            ProjectionElem::Field(1, u8_ty.clone()),
+        ],
+    );
+    assert_eq!(eval_place_read(&const_from_end, &locals, pw), Ok(MirValue::unsigned(4, UintTy::U8, pw)));
+    eval_place_write(
+        &const_from_end,
+        MirValue::unsigned(44, UintTy::U8, pw),
+        &mut locals,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(eval_place_read(&const_from_end, &locals, pw), Ok(MirValue::unsigned(44, UintTy::U8, pw)));
+
+    let bad_const_zero_from_end = Place::with_projection(
+        0,
+        vec![
+            ProjectionElem::Field(0, arr_pair_ty.clone()),
+            ProjectionElem::ConstantIndex {
+                offset: 0,
+                min_length: 1,
+                from_end: true,
+            },
+        ],
+    );
+    assert_eq!(
+        eval_place_read(&bad_const_zero_from_end, &locals, pw),
+        Err(RvalueEvalError::IndexOutOfBounds { index: 0, len: 4 })
+    );
+
+    // 3. Subslice (`from_end: false` and `from_end: true`, chained indexing, and write splicing)
+    let subslice_from_end = Place::with_projection(
+        0,
+        vec![
+            ProjectionElem::Field(0, arr_pair_ty.clone()),
+            ProjectionElem::Subslice {
+                from: 1,
+                to: 1,
+                from_end: true,
+            },
+        ],
+    );
+    let sub_val = eval_place_read(&subslice_from_end, &locals, pw).unwrap();
+    assert_eq!(
+        sub_val,
+        MirValue::Array {
+            elements: vec![make_pair(20, 2), make_pair(300, 3)],
+            elem_ty: pair_ty.clone(),
+        }
+    );
+
+    // Write a new 2-element array into the subslice `_0.0[1..3]`
+    eval_place_write(
+        &subslice_from_end,
+        MirValue::Array {
+            elements: vec![make_pair(222, 22), make_pair(333, 33)],
+            elem_ty: pair_ty.clone(),
+        },
+        &mut locals,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(
+        eval_place_read(&elem2_field0, &locals, pw),
+        Ok(MirValue::unsigned(333, UintTy::U32, pw))
+    );
+
+    // Subslice write with mismatched array length must fail closed
+    assert!(matches!(
+        eval_place_write(
+            &subslice_from_end,
+            MirValue::Array {
+                elements: vec![make_pair(1, 1)],
+                elem_ty: pair_ty.clone(),
+            },
+            &mut locals,
+            pw,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // 4. Downcast + Field on Enum ADT and Union active_field read/write
+    let enum_downcast_ok = Place::with_projection(
+        2,
+        vec![
+            ProjectionElem::Downcast(1),
+            ProjectionElem::Field(0, u32_ty.clone()),
+        ],
+    );
+    let enum_downcast_wrong = Place::with_projection(
+        2,
+        vec![
+            ProjectionElem::Downcast(0),
+            ProjectionElem::Field(0, u32_ty.clone()),
+        ],
+    );
+    let enum_no_downcast = Place::with_projection(2, vec![ProjectionElem::Field(0, u32_ty.clone())]);
+
+    assert_eq!(
+        eval_place_read(&enum_downcast_ok, &locals, pw),
+        Ok(MirValue::unsigned(777, UintTy::U32, pw))
+    );
+    assert_eq!(
+        eval_place_read(&enum_downcast_wrong, &locals, pw),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 0,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        eval_place_read(&enum_no_downcast, &locals, pw),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 0,
+            actual: 1,
+        })
+    );
+    eval_place_write(
+        &enum_downcast_ok,
+        MirValue::unsigned(888, UintTy::U32, pw),
+        &mut locals,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(
+        eval_place_read(&enum_downcast_ok, &locals, pw),
+        Ok(MirValue::unsigned(888, UintTy::U32, pw))
+    );
+
+    // Union active_field: reading active field 0 succeeds, reading inactive field 1 fails,
+    // writing field 1 switches active_field to Some(1)!
+    locals[2] = MirValue::Adt {
+        def_path: "MyUnion".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![MirValue::unsigned(0x1234, UintTy::U32, pw)],
+    };
+    let union_f0 = Place::with_projection(2, vec![ProjectionElem::Field(0, u32_ty.clone())]);
+    let union_f1 = Place::with_projection(2, vec![ProjectionElem::Field(1, u8_ty)]);
+    assert_eq!(
+        eval_place_read(&union_f0, &locals, pw),
+        Ok(MirValue::unsigned(0x1234, UintTy::U32, pw))
+    );
+    assert_eq!(
+        eval_place_read(&union_f1, &locals, pw),
+        Err(RvalueEvalError::InactiveUnionField {
+            active_field: 0,
+            requested_field: 1,
+        })
+    );
+    eval_place_write(
+        &union_f1,
+        MirValue::unsigned(0xAB, UintTy::U8, pw),
+        &mut locals,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(
+        eval_place_read(&union_f1, &locals, pw),
+        Ok(MirValue::unsigned(0xAB, UintTy::U8, pw))
+    );
+    assert_eq!(
+        eval_place_read(&union_f0, &locals, pw),
+        Err(RvalueEvalError::InactiveUnionField {
+            active_field: 1,
+            requested_field: 0,
+        })
+    );
+
+    // 5. Projected places wired into `eval_lowered_rvalue` (`Len`, `CopyForDeref`, `BinaryOp`)
+    let len_subslice = Rvalue::Len(subslice_from_end);
+    assert_eq!(
+        eval_rv(&len_subslice, &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::unsigned(2, UintTy::Usize, pw))
+    );
+
+    let ptr_field_place = Place::with_projection(0, vec![ProjectionElem::Field(1, raw_u32.clone())]);
+    let copy_for_deref_proj = Rvalue::CopyForDeref(ptr_field_place);
+    assert_eq!(
+        eval_rv(&copy_for_deref_proj, &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::ptr(ptr_val, raw_u32))
+    );
+
+    let add_proj = Rvalue::BinaryOp(
+        BinOp::Add,
+        Operand::Copy(elem2_field0),
+        Operand::Constant(Constant::Int(67, u32_ty.clone())),
+    );
+    assert_eq!(
+        eval_rv(&add_proj, &local_decls, &locals, pw, policy, &mut tracker),
+        Ok(MirValue::unsigned(400, UintTy::U32, pw))
+    );
+}
+
+#[test]
+fn test_ep1_statement_and_block_evaluation_d9_d13b_set_discriminant_assume_and_move() {
+    let pw = PtrWidth::Bits64;
+    let u8_ty = Ty::Uint(UintTy::U8);
+    let u32_ty = Ty::Uint(UintTy::U32);
+    let usize_ty = Ty::Uint(UintTy::Usize);
+    let unit_ty = Ty::unit();
+    let raw_u32 = Ty::RawPtr(Box::new(u32_ty.clone()), Mutability::Not);
+    let inner_pair_ty = Ty::Tuple(vec![u32_ty.clone(), unit_ty.clone()]);
+    let nested_tuple_ty = Ty::Tuple(vec![inner_pair_ty.clone(), u8_ty.clone()]);
+    let arr_u32_2 = Ty::Array(Box::new(u32_ty.clone()), 2);
+
+    let local_decls = vec![
+        nested_tuple_ty.clone(), // _0: ((u32, ()), u8)
+        u32_ty.clone(),          // _1: argument u32
+        arr_u32_2.clone(),       // _2: [u32; 2]
+        usize_ty.clone(),        // _3: usize index
+        raw_u32.clone(),         // _4: *const u32
+        Ty::Bool,                // _5: bool
+        Ty::Tuple(vec![u32_ty.clone()]), // _6: enum local (1 payload field)
+    ];
+
+    // 1. StorageLive / StorageDead lifecycle & D9 PlaceMention
+    let mut state = StatementEvalState::from_local_decls(local_decls.clone(), pw);
+    state.slots[1] = LocalSlotState::Init(MirValue::unsigned(42, UintTy::U32, pw));
+    state.slots[2] = LocalSlotState::Dead;
+
+    // Accessing or mentioning a Dead local fails with DeadLocal
+    let mention_dead =
+        lower_statement(&Statement::PlaceMention(Place::from_local(2)), &local_decls, pw).unwrap();
+    assert_eq!(
+        eval_lowered_statement(&mention_dead, &mut state),
+        Err(RvalueEvalError::DeadLocal(Local(2)))
+    );
+
+    // StorageLive(2) transitions _2 to Uninit; PlaceMention(_2) and PlaceMention(_0.0.1) succeed!
+    let live_2 = lower_statement(&Statement::StorageLive(Local(2)), &local_decls, pw).unwrap();
+    eval_lowered_statement(&live_2, &mut state).unwrap();
+    assert_eq!(state.get_local(Local(2)), Some(&LocalSlotState::Uninit));
+    eval_lowered_statement(&mention_dead, &mut state).unwrap();
+
+    let uninit_field_place = Place::with_projection(
+        0,
+        vec![
+            ProjectionElem::Field(0, inner_pair_ty.clone()),
+            ProjectionElem::Field(1, unit_ty.clone()),
+        ],
+    );
+    let mention_uninit_field =
+        lower_statement(&Statement::PlaceMention(uninit_field_place.clone()), &local_decls, pw)
+            .unwrap();
+    eval_lowered_statement(&mention_uninit_field, &mut state).unwrap();
+
+    // PlaceMention(*_4) when _4 is Uninit fails with UninitializedLocal(Local(4));
+    // once _4 is initialized to a pointer, PlaceMention(*_4) succeeds without dereferencing!
+    let deref_4 = Place::with_projection(4, vec![ProjectionElem::Deref]);
+    let mention_deref_4 =
+        lower_statement(&Statement::PlaceMention(deref_4), &local_decls, pw).unwrap();
+    assert_eq!(
+        eval_lowered_statement(&mention_deref_4, &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(4)))
+    );
+    state.slots[4] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::without_provenance(0xDEAD_0000),
+        raw_u32.clone(),
+    ));
+    eval_lowered_statement(&mention_deref_4, &mut state).unwrap();
+
+    // PlaceMention(_2[_3]) when _3 is Uninit fails with UninitializedLocal(Local(3));
+    // when _3 is initialized to 0usize, PlaceMention(_2[_3]) succeeds even while _2 is Uninit!
+    let arr_idx_place = Place::with_projection(2, vec![ProjectionElem::Index(Local(3))]);
+    let mention_arr_idx =
+        lower_statement(&Statement::PlaceMention(arr_idx_place.clone()), &local_decls, pw).unwrap();
+    assert_eq!(
+        eval_lowered_statement(&mention_arr_idx, &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(3)))
+    );
+    state.slots[3] = LocalSlotState::Init(MirValue::unsigned(0, UintTy::Usize, pw));
+    eval_lowered_statement(&mention_arr_idx, &mut state).unwrap();
+
+    // 2. C6d2ad74 parity: writing `_2[_3] = 42` when `_2` (an array) is Uninit MUST fail!
+    let write_uninit_arr = lower_statement(
+        &Statement::Assign(arr_idx_place, Rvalue::Use(Operand::Copy(Place::from_local(1)))),
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(
+        eval_lowered_statement(&write_uninit_arr, &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(2)))
+    );
+
+    // 3. D13b nested field-by-field initialization & unwritten `()` sibling field check:
+    // Write `_0.0.0 = Move(_1)` (moves _1 -> Uninit, initializes _0.0.0 while _0.0.1: () is Uninit!)
+    let place_0_0_0 = Place::with_projection(
+        0,
+        vec![
+            ProjectionElem::Field(0, inner_pair_ty.clone()),
+            ProjectionElem::Field(0, u32_ty.clone()),
+        ],
+    );
+    let place_0_0 = Place::with_projection(0, vec![ProjectionElem::Field(0, inner_pair_ty.clone())]);
+    let place_0_1 = Place::with_projection(0, vec![ProjectionElem::Field(1, u8_ty.clone())]);
+
+    let assign_0_0_0 = lower_statement(
+        &Statement::Assign(place_0_0_0.clone(), Rvalue::Use(Operand::Move(Place::from_local(1)))),
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    eval_lowered_statement(&assign_0_0_0, &mut state).unwrap();
+
+    // _1 was moved so it is now Uninit!
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+    assert_eq!(
+        state.read_place(&Place::from_local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    // Reading `_0.0.0` succeeds (42u32), but reading unwritten `()` sibling `_0.0.1`,
+    // inner pair `_0.0`, or root `_0` MUST fail with `UninitializedLocal(Local(0))`!
+    assert_eq!(
+        state.read_place(&place_0_0_0),
+        Ok(MirValue::unsigned(42, UintTy::U32, pw))
+    );
+    assert_eq!(
+        state.read_place(&uninit_field_place),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    assert_eq!(
+        state.read_place(&place_0_0),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    assert_eq!(
+        state.read_place(&Place::from_local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+
+    // Now initialize `_0.0.1 = ()`: `_0.0` promotes to `FieldSlot::Init`, so reading `_0.0` succeeds,
+    // while reading `_0` still fails because `_0.1` is still `Uninit`!
+    let assign_0_0_1 = lower_statement(
+        &Statement::Assign(
+            uninit_field_place.clone(),
+            Rvalue::Use(Operand::Constant(Constant::Unit)),
+        ),
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    eval_lowered_statement(&assign_0_0_1, &mut state).unwrap();
+    assert_eq!(
+        state.read_place(&uninit_field_place),
+        Ok(MirValue::Unit)
+    );
+    assert_eq!(
+        state.read_place(&place_0_0),
+        Ok(MirValue::Tuple(vec![
+            MirValue::unsigned(42, UintTy::U32, pw),
+            MirValue::Unit,
+        ]))
+    );
+    assert_eq!(
+        state.read_place(&Place::from_local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+
+    // Now initialize `_0.1 = 7u8`: `_0` promotes to `LocalSlotState::Init`!
+    let assign_0_1 = lower_statement(
+        &Statement::Assign(
+            place_0_1.clone(),
+            Rvalue::Use(Operand::Constant(Constant::Int(7, u8_ty.clone()))),
+        ),
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    eval_lowered_statement(&assign_0_1, &mut state).unwrap();
+    let expected_full_0 = MirValue::Tuple(vec![
+        MirValue::Tuple(vec![
+            MirValue::unsigned(42, UintTy::U32, pw),
+            MirValue::Unit,
+        ]),
+        MirValue::unsigned(7, UintTy::U8, pw),
+    ]);
+    assert_eq!(state.get_init(Local(0)), Some(&expected_full_0));
+
+    // A projected move out of `_0.1` reads the field and, as in `Trusted.MirSemantics.evalOperand`
+    // (`.move` with a non-empty projection), leaves the parent `_0` fully initialized.
+    assert_eq!(
+        state.move_place(&place_0_1),
+        Ok(MirValue::unsigned(7, UintTy::U8, pw))
+    );
+    assert_eq!(state.get_init(Local(0)), Some(&expected_full_0));
+    assert_eq!(
+        state.read_place(&place_0_1),
+        Ok(MirValue::unsigned(7, UintTy::U8, pw))
+    );
+    assert!(state.read_place(&place_0_0).is_ok());
+
+    // 4. SetDiscriminant & enum variant initialization (`((_6 as Variant2).0) = 99; discriminant(_6) = 2;`)
+    // SetDiscriminant on Uninit local _6 must fail with UninitializedLocal(Local(6))!
+    let set_discr_6 = lower_statement(
+        &Statement::SetDiscriminant {
+            place: Place::from_local(6),
+            variant_index: 2,
+        },
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(
+        eval_lowered_statement(&set_discr_6, &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(6)))
+    );
+
+    let enum_v2_f0 = Place::with_projection(
+        6,
+        vec![
+            ProjectionElem::Downcast(2),
+            ProjectionElem::Field(0, u32_ty.clone()),
+        ],
+    );
+    let init_enum_f0 = lower_statement(
+        &Statement::Assign(
+            enum_v2_f0,
+            Rvalue::Use(Operand::Constant(Constant::Int(99, u32_ty.clone()))),
+        ),
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    eval_lowered_statement(&init_enum_f0, &mut state).unwrap();
+    eval_lowered_statement(&set_discr_6, &mut state).unwrap();
+    assert_eq!(
+        state.get_init(Local(6)),
+        Some(&MirValue::Adt {
+            def_path: String::new(),
+            variant_idx: 2,
+            active_field: None,
+            fields: vec![MirValue::unsigned(99, UintTy::U32, pw)],
+        })
+    );
+
+    // SetDiscriminant on non-tuple place type is rejected statically
+    assert_eq!(
+        lower_statement(
+            &Statement::SetDiscriminant {
+                place: Place::from_local(1),
+                variant_index: 0,
+            },
+            &local_decls,
+            pw,
+        ),
+        Err(RvalueLowerError::InvalidSetDiscriminantTarget(u32_ty.clone()))
+    );
+
+    // 5. Assume(true) vs Assume(false) and Assume static type check
+    assert_eq!(
+        lower_statement(
+            &Statement::Assume(Operand::Constant(Constant::Int(1, u32_ty.clone()))),
+            &local_decls,
+            pw,
+        ),
+        Err(RvalueLowerError::InvalidAssumeType(u32_ty))
+    );
+    state.slots[5] = LocalSlotState::Init(MirValue::Bool(true));
+    let assume_move_5 = lower_statement(
+        &Statement::Assume(Operand::Move(Place::from_local(5))),
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    eval_lowered_statement(&assume_move_5, &mut state).unwrap();
+    assert_eq!(state.get_local(Local(5)), Some(&LocalSlotState::Uninit));
+
+    let assume_false = lower_statement(
+        &Statement::Assume(Operand::Constant(Constant::Bool(false))),
+        &local_decls,
+        pw,
+    )
+    .unwrap();
+    assert_eq!(
+        eval_lowered_statement(&assume_false, &mut state),
+        Err(RvalueEvalError::AssumeFalse)
+    );
+
+    // 6. End-to-end LoweredBody + eval_lowered_block execution
+    let body = Body {
+        local_decls: vec![
+            Ty::Uint(UintTy::Usize), // _0: return usize
+            Ty::Char,                // _1: arg char
+            Ty::Uint(UintTy::Usize), // _2: temp usize
+            Ty::Bool,                // _3: temp bool
+        ],
+        basic_blocks: vec![BasicBlockData {
+            statements: vec![
+                Statement::StorageLive(Local(2)),
+                Statement::StorageLive(Local(3)),
+                Statement::Assign(
+                    Place::from_local(3),
+                    Rvalue::NullaryOp(NullOp::UbChecks, Ty::Bool),
+                ),
+                Statement::Assume(Operand::Move(Place::from_local(3))),
+                Statement::Assign(
+                    Place::from_local(2),
+                    Rvalue::Cast(
+                        CastKind::CharToInt,
+                        Operand::Move(Place::from_local(1)),
+                        Ty::Uint(UintTy::Usize),
+                    ),
+                ),
+                Statement::Assign(
+                    Place::from_local(0),
+                    Rvalue::BinaryOp(
+                        BinOp::Add,
+                        Operand::Move(Place::from_local(2)),
+                        Operand::Constant(Constant::Int(10, Ty::Uint(UintTy::Usize))),
+                    ),
+                ),
+                Statement::StorageDead(Local(3)),
+                Statement::StorageDead(Local(2)),
+            ],
+            is_cleanup: false,
+        }],
+    };
+    let lowered_body = lower_body(&body, pw).unwrap();
+    let mut body_state =
+        StatementEvalState::from_body(&lowered_body, &[MirValue::Char('A')]).unwrap();
+    eval_lowered_block(&lowered_body.basic_blocks[0], &mut body_state).unwrap();
+    assert_eq!(
+        body_state.get_init(Local(0)),
+        Some(&MirValue::unsigned(75, UintTy::Usize, pw))
+    );
+    assert_eq!(body_state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+    assert_eq!(body_state.get_local(Local(2)), Some(&LocalSlotState::Dead));
+    assert_eq!(body_state.get_local(Local(3)), Some(&LocalSlotState::Dead));
 }
