@@ -278,6 +278,7 @@ Bridge theorem connecting `NonOverlappingPtrs src dst 0` directly to
 theorem evalCopyNonOverlapping_zero_of_obligations
     (s : MachineState) (srcOp dstOp countOp : Operand)
     (src dst : RawPtrVal) (srcVal dstVal : Value)
+    {srcPt : Ty} {elemBytes elemAlign : Nat}
     (hNonoverlap : NonOverlappingPtrs src dst 0)
     (hSrc :
       evalOperand s.frame.locals srcOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
@@ -287,13 +288,18 @@ theorem evalCopyNonOverlapping_zero_of_obligations
         .ok dstVal s.frame.locals)
     (hCnt :
       evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
-        .ok (.scalar ⟨0, 8⟩) s.frame.locals) :
+        .ok (.scalar ⟨0, 8⟩) s.frame.locals)
+    (hSrcPt : operandPointeeTy [] emptyLayoutTable srcOp = some srcPt)
+    (hSz : rigidTyKindByteSize srcPt.kind = some elemBytes)
+    (hAlign : rigidTyKindAlignBytes srcPt.kind = some elemAlign)
+    (hSrcAlign : ptrValueAligned elemAlign srcVal = true)
+    (hDstAlign : ptrValueAligned elemAlign dstVal = true) :
     evalCopyNonOverlapping s srcOp dstOp countOp =
       MirStepNode.step (advanceStmt s s.frame.locals) ∧
     NonOverlappingPtrs src dst 0 := by
   refine ⟨?_, hNonoverlap⟩
-  unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
-  simp [hSrc, hDst, hCnt]
+  unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount copyPrecheck
+  simp [hSrc, hDst, hCnt, hSrcPt, hSz, hAlign, hSrcAlign, hDstAlign]
 
 /--
 Bridge theorem connecting `NonOverlappingPtrs`, `HasTreeBorrowAccess`, and
@@ -302,8 +308,10 @@ at base offset `0`.
 -/
 theorem evalCopyNonOverlapping_one_of_obligations
     (s : MachineState) (srcOp dstOp countOp : Operand)
+    (localDecls : List LocalDecl)
     (src dst : RawPtrVal) (sz : Nat) (srcEntry dstEntry : BorrowEntry)
     (copiedVal oldDstVal : Value) (locals' : List LocalValue)
+    {srcPt : Ty} {elemBytes elemAlign : Nat} {srcDecl dstDecl : LocalDecl}
     (hNonoverlap : NonOverlappingPtrs src dst 1)
     (hSrcOff : src.offset = 0)
     (hDstOff : dst.offset = 0)
@@ -316,7 +324,18 @@ theorem evalCopyNonOverlapping_one_of_obligations
     (hCnt :
       evalOperand s.frame.locals countOp s.memory.borrows s.memory.globals emptyLayoutTable s.memory.callerLocals =
         .ok (.scalar ⟨1, 8⟩) s.frame.locals)
-    (hSrcPt : operandPointeeTy [] emptyLayoutTable srcOp = none)
+    (hSrcPt : operandPointeeTy localDecls emptyLayoutTable srcOp = some srcPt)
+    (hDstPt : operandPointeeTy localDecls emptyLayoutTable dstOp = some srcPt)
+    (hSame : sameRigidTyShape srcPt.kind srcPt.kind = true)
+    (hSz : rigidTyKindByteSize srcPt.kind = some elemBytes)
+    (hAlign : rigidTyKindAlignBytes srcPt.kind = some elemAlign)
+    (hPos : Nat.beq elemBytes 0 = false)
+    (hMax : Nat.ble elemBytes 9223372036854775807 = true)
+    (hSrcDecl : get? localDecls srcEntry.targetLocal = some srcDecl)
+    (hDstDecl : get? localDecls dstEntry.targetLocal = some dstDecl)
+    (hSrcBytes : rigidTyByteSize emptyLayoutTable srcDecl.ty = some elemBytes)
+    (hDstBytes : rigidTyByteSize emptyLayoutTable dstDecl.ty = some elemBytes)
+    (hSrcNonInt : intCastTargetBytes srcDecl.ty.kind = none)
     (hSrcLookup :
       lookupBorrow s.memory.borrows src.toProvenancePtr.tag = some srcEntry)
     (hDstLookup :
@@ -332,7 +351,7 @@ theorem evalCopyNonOverlapping_one_of_obligations
     (hWrite :
       set? s.frame.locals dstEntry.targetLocal (.init copiedVal) =
         some locals') :
-    evalCopyNonOverlapping s srcOp dstOp countOp =
+    evalCopyNonOverlapping s srcOp dstOp countOp localDecls =
       MirStepNode.step
         (advanceStmt s locals'
           { s.memory with
@@ -344,11 +363,17 @@ theorem evalCopyNonOverlapping_one_of_obligations
   refine ⟨?_, hNonoverlap⟩
   have hSrcZero : src.toProvenancePtr.offsetBytes = 0 := hSrcOff
   have hDstZero : dst.toProvenancePtr.offsetBytes = 0 := hDstOff
+  have hMod : Nat.mod 0 elemAlign = 0 := Nat.zero_mod elemAlign
+  have hBle : Nat.ble elemBytes elemBytes = true := Nat.ble_self_eq_true elemBytes
   unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
+    copyPrecheck ptrValueAligned lookupCopyBorrowChecked copyBorrowInRootBounds
     evalCopySingleDirect writePlaceValue
   simp [hSrc, hDst, hCnt, hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
-        hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,
-        hDstProj, hDstVal, hWrite, readProjectedValue]
+        hSrcZero, hDstZero, hMod, hBle, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,
+        hDstPt, hSame, hSz, hAlign, hPos, hMax, hSrcDecl, hDstDecl,
+        hSrcBytes, hDstBytes, hSrcNonInt,
+        hDstProj, hDstVal, hWrite, readProjectedValue,
+        placeTy]
 
 /-! ## 3. Slice-Split, Unaligned Raw-Pointer, and Array-to-Slice Obligations -/
 

@@ -181,13 +181,442 @@ def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
   | .panicked _ => .halted .panic
   | .aborted => .halted .abort
 
+/-!
+## Inline intrinsic calls
+
+`evalTerminator` evaluates a `TerminatorKind.call` of the following
+`core::intrinsics` items inline, in one step, when no transparent body for the
+item is available: `exact_div` (handled directly in `evalTerminator`), the
+integer bit intrinsics (`IntegerBitIntrinsic`), `rotate_left`, `rotate_right`,
+`saturating_add`, `saturating_sub`, `write_bytes`, and `arith_offset` (along
+with its `wrapping_offset` alias). Each returns to `target` with `stmtIdx := 0`,
+as a returning call does.
+-/
+
+/--
+Map the canonical `DefPath` of a one-operand integer bit intrinsic to its
+`IntegerBitIntrinsic`.
+-/
+def integerBitIntrinsicOfPath? (defPath : DefPath) : Option IntegerBitIntrinsic :=
+  match stringEq defPath "core::intrinsics::ctpop" with
+  | true => .some .ctpop
+  | false =>
+  match stringEq defPath "core::intrinsics::ctlz" with
+  | true => .some .ctlz
+  | false =>
+  match stringEq defPath "core::intrinsics::ctlz_nonzero" with
+  | true => .some .ctlzNonzero
+  | false =>
+  match stringEq defPath "core::intrinsics::cttz" with
+  | true => .some .cttz
+  | false =>
+  match stringEq defPath "core::intrinsics::cttz_nonzero" with
+  | true => .some .cttzNonzero
+  | false =>
+  match stringEq defPath "core::intrinsics::bswap" with
+  | true => .some .bswap
+  | false =>
+  match stringEq defPath "core::intrinsics::bitreverse" with
+  | true => .some .bitreverse
+  | false => .none
+
+/--
+Byte width of an operand whose declared type is a primitive integer type
+(`u8`..`u128`, `usize`, `i8`..`i128`, `isize`), and `.none` for every other
+operand type.
+-/
+def integerOperandBytes?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (op : Operand) :
+    Option Nat :=
+  match operandTy localDecls layouts op with
+  | .some ty => intCastTargetBytes ty.kind
+  | .none => .none
+
+/--
+Byte size of the pointee `T` of an operand of type `*const T`, `*mut T`, `&T`,
+or `&mut T`, resolved directly from `pointeeTy.kind` via `rigidTyKindByteSize`
+(never consulting `LayoutTable.lookup` on `pointeeTyOf`'s synthetic placeholder
+`layoutIdx := 0`).
+-/
+def operandPointeeBytes?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (op : Operand) :
+    Option Nat :=
+  match operandTy localDecls layouts op with
+  | .some ptrTy =>
+    match pointeeTyOf ptrTy with
+    | .some pointeeTy => rigidTyKindByteSize pointeeTy.kind
+    | .none => .none
+  | .none => .none
+
+/--
+Step to block `targetBb` (statement `0`) with `locals` and `mem`, the
+continuation of a returning intrinsic call.
+-/
+def intrinsicReturnTo
+    (s : MachineState)
+    (targetBb : BasicBlockIdx)
+    (locals : List LocalSlot)
+    (mem : Memory) :
+    MirStepNode :=
+  MirStepNode.step {
+    frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := locals }
+    memory := mem
+  }
+
+/--
+Write the return value `retVal` of an intrinsic call to `destination` and step
+to `targetBb`; writing to a dead or otherwise invalid destination is undefined
+behavior, exactly as for `exact_div`.
+-/
+def intrinsicWriteReturn
+    (s : MachineState)
+    (locals : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (retVal : Value) :
+    MirStepNode :=
+  match writePlaceValue locals s.memory.borrows destination retVal with
+  | .ok updatedLocals => intrinsicReturnTo s targetBb updatedLocals s.memory
+  | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
+
+/--
+Largest byte count of a Rust value or memory access on a 64-bit target,
+`isize::MAX = 2^63 - 1`.
+
+Reference (`core::ptr::write_bytes`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.write_bytes.html>
+
+> "`dst` must be valid for writes of `count * size_of::<T>()` bytes."
+
+Reference (`core::ptr`, \"Allocation\", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/index.html#allocation>
+
+> "For any allocation with base address, size, and a set of addresses, the
+> following are guaranteed: ... The size of an allocation is at most
+> `isize::MAX` bytes."
+
+An access of more than `isize::MAX` bytes therefore cannot lie inside any
+allocation, so such a `write_bytes` is undefined behavior.
+-/
+@[reducible]
+def isizeMaxBytes : Nat := 9223372036854775807
+
+/--
+Fill `byteCount` little-endian bytes with the byte `byte`:
+`∑_{i < byteCount} byte * 256^i`.
+-/
+def repeatByteBits (byte : Nat) : Nat → Nat
+  | .zero => 0
+  | .succ k => Nat.add byte (Nat.mul 256 (repeatByteBits byte k))
+
+/--
+Evaluate `core::intrinsics::write_bytes::<T>(dst, val, count)` on the
+evaluated arguments `dstVal` (a pointer carrying provenance `.ptr dstPtr _` or
+an 8-byte provenance-free address `.scalar addr`), `val`, and `count`.
+
+1. `count * size_of::<T>()` bytes are written; a byte count above
+   `isize::MAX` is undefined behavior.
+2. A zero byte count writes nothing (even when `dstVal` carries no provenance
+   or names a dead or out-of-bounds local).
+3. Otherwise `dstVal` must carry a borrow tag (`dstVal = .ptr dstPtr _`) that
+   names a live declared local and permits writes (neither `.frozen` nor
+   `.disabled`, matching `writePlaceValue`), and for a root-local borrow the
+   written range
+   `[dstPtr.offsetBytes, dstPtr.offsetBytes + count * size_of::<T>())` must lie
+   inside that local; every violation (including a provenance-free address or a
+   dead local on a projected borrow) is undefined behavior.
+4. The fill is supported for a root local of integer type, whose every byte
+   pattern is a valid value. The byte `val` replaces the written bytes of the
+   local's little-endian representation. When the local is uninitialized and
+   the write covers only part of it, the local stays uninitialized, because a
+   partially initialized integer has no `Value`; every later read of it is
+   undefined behavior, as it is in Rust.
+5. The write invalidates the conflicting borrows of the local, as a write
+   through `dstPtr` does (`invalidateConflictingBorrows`). Like rustc's
+   interpreter, which evaluates `write_bytes` without writing its `()` return
+   value, the call leaves `destination` unchanged.
+
+Reference (`core::ptr::write_bytes`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.write_bytes.html>
+
+> "Sets `count * size_of::<T>()` bytes of memory starting at `dst` to `val`."
+>
+> "Behavior is undefined if any of the following conditions are violated:
+>
+> - `dst` must be valid for writes of `count * size_of::<T>()` bytes.
+> - `dst` must be properly aligned.
+>
+> Note that even if the effectively copied size (`count * size_of::<T>()`) is
+> `0`, the pointer must be properly aligned."
+
+Modeling gap: Anneal's pointers carry no address, so this evaluation does not
+check alignment; rustc's interpreter (`write_bytes_intrinsic`) does not check
+it either.
+-/
+def evalWriteBytesCall
+    (s : MachineState)
+    (dstOp : Operand)
+    (dstVal : Value)
+    (val count : ScalarInt)
+    (locals' : List LocalSlot)
+    (targetBb : BasicBlockIdx)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    MirStepNode :=
+  let dstPtr? : Option (Option ProvenancePtr) :=
+    match dstVal with
+    | .ptr dstPtr _ => .some (.some dstPtr)
+    | .scalar addr =>
+      match Nat.beq addr.sizeBytes 8 with
+      | true => .some .none
+      | false => .none
+    | _ => .none
+  match dstPtr?, operandPointeeBytes? localDecls layouts dstOp with
+  | .some maybePtr, .some elemBytes =>
+    let total := Nat.mul count.bits elemBytes
+    match Nat.ble total isizeMaxBytes with
+    | false => MirStepNode.fail .ub
+    | true =>
+      match Nat.beq total 0 with
+      | true => intrinsicReturnTo s targetBb locals' s.memory
+      | false =>
+        match maybePtr with
+        | .none => MirStepNode.fail .ub
+        | .some dstPtr =>
+          match lookupBorrow s.memory.borrows dstPtr.tag with
+          | .none => MirStepNode.fail .ub
+          | .some entry =>
+            match entry.perm with
+            | .frozen => MirStepNode.fail .ub
+            | .disabled => MirStepNode.fail .ub
+            | _ =>
+              match get? locals' entry.targetLocal, get? localDecls entry.targetLocal with
+              | .none, _ => MirStepNode.fail .ub
+              | .some .dead, _ => MirStepNode.fail .ub
+              | _, .none => MirStepNode.fail .ub
+              | .some slot, .some decl =>
+                match entry.targetProjection with
+                | _ :: _ => MirStepNode.unsupported
+                | .nil =>
+                  match intCastTargetBytes decl.ty.kind with
+                  | .none => MirStepNode.unsupported
+                  | .some targetBytes =>
+                    match Nat.ble (Nat.add dstPtr.offsetBytes total) targetBytes with
+                    | false => MirStepNode.fail .ub
+                    | true =>
+                      let off := dstPtr.offsetBytes
+                      let fill := repeatByteBits (Nat.mod val.bits 256) total
+                      let newSlot? : Option LocalSlot :=
+                        match slot with
+                        | .dead => .none
+                        | .uninit =>
+                          match Bool.and (Nat.beq off 0) (Nat.beq total targetBytes) with
+                          | true => .some (.init (.scalar ⟨fill, targetBytes⟩))
+                          | false => .some .uninit
+                        | .init (.scalar sc) =>
+                          let lowMod := scalarModulus off
+                          let highMod := scalarModulus (Nat.add off total)
+                          let old := wrapScalarBits sc.bits (scalarModulus targetBytes)
+                          .some (.init (.scalar ⟨
+                            Nat.add (Nat.mod old lowMod)
+                              (Nat.add (Nat.mul fill lowMod)
+                                (Nat.mul (Nat.div old highMod) highMod)),
+                            targetBytes⟩))
+                        | .init _ => .none
+                      match newSlot? with
+                      | .none => MirStepNode.fail .ub
+                      | .some newSlot =>
+                        match set? locals' entry.targetLocal newSlot with
+                        | .none => MirStepNode.fail .ub
+                        | .some locals'' =>
+                          intrinsicReturnTo s targetBb locals''
+                            { s.memory with
+                              borrows :=
+                                invalidateConflictingBorrows
+                                  s.memory.borrows
+                                  entry.targetLocal
+                                  (.some dstPtr.tag) }
+  | _, _ => MirStepNode.unsupported
+
+/--
+Evaluate `core::intrinsics::arith_offset::<T>(ptr, count)`: offset `ptr` by
+`count * size_of::<T>()` bytes with two's-complement wrapping, keeping its
+provenance and requiring neither a live allocation nor an in-bounds result.
+
+`count : isize` is the 8-byte two's-complement pattern `count.bits`, so the
+byte offset `count * size_of::<T>()` modulo `2^64` is
+`count.bits * size_of::<T>()` modulo `2^64`. For a pointer carrying a borrow
+tag the offset is added to `offsetBytes`, and for an address without provenance
+(`.scalar`) to the address itself; both wrap modulo `2^64`.
+
+Reference (`core::intrinsics::arith_offset`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.arith_offset.html>
+
+> "Calculates the offset from a pointer, potentially wrapping."
+>
+> "Unlike the `offset` intrinsic, this intrinsic does not restrict the
+> resulting pointer to point into or at the end of an allocated object, and it
+> wraps with two's complement arithmetic. The resulting value is not
+> necessarily valid to be used to actually access memory."
+-/
+def evalArithOffsetCall
+    (s : MachineState)
+    (ptrOp : Operand)
+    (ptrVal count : Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    MirStepNode :=
+  match operandPointeeBytes? localDecls layouts ptrOp, count with
+  | .some elemBytes, .scalar countSc =>
+    match Nat.beq countSc.sizeBytes 8 with
+    | false => MirStepNode.unsupported
+    | true =>
+      let delta := Nat.mul countSc.bits elemBytes
+      let addrModulus := scalarModulus 8
+      match ptrVal with
+      | .ptr p sz =>
+        intrinsicWriteReturn s locals' destination targetBb
+          (.ptr { p with offsetBytes := Nat.mod (Nat.add p.offsetBytes delta) addrModulus } sz)
+      | .scalar addr =>
+        match Nat.beq addr.sizeBytes 8 with
+        | false => MirStepNode.unsupported
+        | true =>
+          intrinsicWriteReturn s locals' destination targetBb
+            (.scalar ⟨Nat.mod (Nat.add addr.bits delta) addrModulus, 8⟩)
+      | _ => MirStepNode.fail .ub
+  | _, _ => MirStepNode.unsupported
+
+/--
+Evaluate a call to one of the inline intrinsics other than `exact_div` on the
+evaluated arguments `argVals` (with `locals'` after evaluating them), or return
+`.none` when `defPath` names none of them.
+
+Integer intrinsics require operands of integer type whose values have the
+type's width, and `rotate_left` / `rotate_right` a `u32` shift amount; other
+argument shapes fail closed with `MirStepNode.unsupported`.
+
+Reference (`library/core/src/intrinsics/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/intrinsics/mod.rs>
+
+> "pub const fn rotate_left<T: Copy>(x: T, shift: u32) -> T"
+>
+> "pub const fn saturating_add<T: Copy>(a: T, b: T) -> T;"
+>
+> "pub const fn saturating_sub<T: Copy>(a: T, b: T) -> T;"
+>
+> "pub const unsafe fn write_bytes<T>(dst: *mut T, val: u8, count: usize);"
+>
+> "pub const unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;"
+-/
+def evalInlineIntrinsicCall?
+    (s : MachineState)
+    (defPath : DefPath)
+    (argOps : List Operand)
+    (argVals : List Value)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    Option MirStepNode :=
+  match integerBitIntrinsicOfPath? defPath with
+  | .some op =>
+    .some
+      (match argOps, argVals with
+      | xOp :: .nil, .scalar x :: .nil =>
+        match integerOperandBytes? localDecls layouts xOp with
+        | .some n =>
+          match Nat.beq x.sizeBytes n with
+          | true =>
+            match evalIntegerBitIntrinsic op x with
+            | .some r => intrinsicWriteReturn s locals' destination targetBb (.scalar r)
+            | .none => MirStepNode.fail .ub
+          | false => MirStepNode.unsupported
+        | .none => MirStepNode.unsupported
+      | _, _ => MirStepNode.unsupported)
+  | .none =>
+  let rotateOrSaturating? : Option (Bool × Bool) :=
+    match stringEq defPath "core::intrinsics::rotate_left" with
+    | true => .some (true, true)
+    | false =>
+    match stringEq defPath "core::intrinsics::rotate_right" with
+    | true => .some (true, false)
+    | false =>
+    match stringEq defPath "core::intrinsics::saturating_add" with
+    | true => .some (false, true)
+    | false =>
+    match stringEq defPath "core::intrinsics::saturating_sub" with
+    | true => .some (false, false)
+    | false => .none
+  match rotateOrSaturating? with
+  | .some (isRotate, flag) =>
+    .some
+      (match argOps, argVals with
+      | lhsOp :: _ :: .nil, .scalar a :: .scalar b :: .nil =>
+        match integerOperandBytes? localDecls layouts lhsOp with
+        | .some n =>
+          match Nat.beq a.sizeBytes n with
+          | false => MirStepNode.unsupported
+          | true =>
+            match isRotate with
+            | true =>
+              match Nat.beq b.sizeBytes 4 with
+              | true => intrinsicWriteReturn s locals' destination targetBb (.scalar (evalRotate flag a b))
+              | false => MirStepNode.unsupported
+            | false =>
+              match
+                evalSaturatingArith flag a b locals' s.memory
+                  (operandIsSigned localDecls lhsOp layouts)
+              with
+              | .ok retVal localsAfter _ =>
+                intrinsicWriteReturn s localsAfter destination targetBb retVal
+              | .ub => MirStepNode.fail .ub
+              | .unsupported => MirStepNode.unsupported
+        | .none => MirStepNode.unsupported
+      | _, _ => MirStepNode.unsupported)
+  | .none =>
+  match stringEq defPath "core::intrinsics::write_bytes" with
+  | true =>
+    .some
+      (match argOps, argVals with
+      | dstOp :: _ :: _ :: .nil, dstVal :: .scalar val :: .scalar count :: .nil =>
+        evalWriteBytesCall s dstOp dstVal val count locals' targetBb localDecls layouts
+      | _, _ => MirStepNode.unsupported)
+  | false =>
+  let isOffsetPath : Bool :=
+    Bool.or
+      (Bool.or
+        (stringEq defPath "core::intrinsics::arith_offset")
+        (stringEq defPath "core::intrinsics::wrapping_offset"))
+      (Bool.or
+        (stringEq defPath "std::intrinsics::arith_offset")
+        (stringEq defPath "std::intrinsics::wrapping_offset"))
+  match isOffsetPath with
+  | true =>
+    .some
+      (match argOps, argVals with
+      | ptrOp :: _ :: .nil, ptrVal :: count :: .nil =>
+        evalArithOffsetCall s ptrOp ptrVal count locals' destination targetBb localDecls layouts
+      | _, _ => MirStepNode.unsupported)
+  | false => .none
+
 /--
 Execute a basic-block `Terminator` from state `s`.
 
 Supports `.goto`, `.return_` (both root-frame termination and interprocedural
 return to `Memory.callStack`), `.unreachable`, `.switchInt`, `.assert`, `.drop`,
 `.call` (including inline evaluation of `core::intrinsics::exact_div` via
-`evalScalarExactDiv`), and `.tailCall`. When `.call` or `.tailCall` targets a
+`evalScalarExactDiv` and of the intrinsics of `evalInlineIntrinsicCall?`), and
+`.tailCall`. When `.call` or `.tailCall` targets a
 `defPath` without a transparent body in `s.memory.callees` (other than inline
 intrinsics), execution emits a `MirCallE` effect interaction carrying
 `(defPath, argVals, s.memory)`.
@@ -386,9 +815,18 @@ def evalTerminator
               | .unsupported => MirStepNode.unsupported
             | _ => MirStepNode.unsupported
           | false =>
-            MirStepNode.extCall
-              { defPath := defPath, args := argVals, memory := s.memory }
-              (resumeExternalCall s locals' destination targetBb unwind)
+            match
+              evalInlineIntrinsicCall? s defPath argOps argVals locals' destination targetBb
+                (match currentBody with
+                | .some b => b.localDecls
+                | .none => .nil)
+                bodyLayouts
+            with
+            | .some node => node
+            | .none =>
+              MirStepNode.extCall
+                { defPath := defPath, args := argVals, memory := s.memory }
+                (resumeExternalCall s locals' destination targetBb unwind)
   -- Diverging call (`target == Option.none`, return type `!`):
   -- `core::hint::unreachable_unchecked` (`library/core/src/hint.rs` at commit
   -- `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65` and The Rust Reference 1.98.0,

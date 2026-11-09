@@ -838,6 +838,184 @@ def defaultInlineAsmOptions : Miri.MIR.InlineAsmOptions :=
     raw := false
     mayUnwind := false }
 
+/-- The `core::intrinsics` items whose calls Anneal's
+`MirSemantics.evalTerminator` evaluates inline (`exact_div`, and every intrinsic
+of `MirSemantics.evalInlineIntrinsicCall?`) and whose translated calls
+`annealCallHooks` dispatches through `lean-miri`'s
+`Miri.Interpreter.Intrinsics.eval` (`LM-4.2`). -/
+inductive AnnealIntrinsic where
+  | exactDiv
+  | writeBytes
+  | arithOffset
+  | wrappingOffset
+  | ctpop
+  | ctlz
+  | ctlzNonzero
+  | cttz
+  | cttzNonzero
+  | bswap
+  | bitreverse
+  | rotateLeft
+  | rotateRight
+  | saturatingAdd
+  | saturatingSub
+  deriving DecidableEq, Repr
+
+namespace AnnealIntrinsic
+
+/-- Canonical `DefPath` that `rustc-capture` records for the intrinsic's
+function item. -/
+def defPath : AnnealIntrinsic → DefPath
+  | .exactDiv => "core::intrinsics::exact_div"
+  | .writeBytes => "core::intrinsics::write_bytes"
+  | .arithOffset => "core::intrinsics::arith_offset"
+  | .wrappingOffset => "core::intrinsics::wrapping_offset"
+  | .ctpop => "core::intrinsics::ctpop"
+  | .ctlz => "core::intrinsics::ctlz"
+  | .ctlzNonzero => "core::intrinsics::ctlz_nonzero"
+  | .cttz => "core::intrinsics::cttz"
+  | .cttzNonzero => "core::intrinsics::cttz_nonzero"
+  | .bswap => "core::intrinsics::bswap"
+  | .bitreverse => "core::intrinsics::bitreverse"
+  | .rotateLeft => "core::intrinsics::rotate_left"
+  | .rotateRight => "core::intrinsics::rotate_right"
+  | .saturatingAdd => "core::intrinsics::saturating_add"
+  | .saturatingSub => "core::intrinsics::saturating_sub"
+
+/-- The intrinsic's name (rustc's `sym::*` symbol), on which
+`Miri.Interpreter.Intrinsics.eval` dispatches. Both `arith_offset` and its
+`wrapping_offset` alias dispatch to `"arith_offset"`. -/
+def name : AnnealIntrinsic → String
+  | .exactDiv => "exact_div"
+  | .writeBytes => "write_bytes"
+  | .arithOffset | .wrappingOffset => "arith_offset"
+  | .ctpop => "ctpop"
+  | .ctlz => "ctlz"
+  | .ctlzNonzero => "ctlz_nonzero"
+  | .cttz => "cttz"
+  | .cttzNonzero => "cttz_nonzero"
+  | .bswap => "bswap"
+  | .bitreverse => "bitreverse"
+  | .rotateLeft => "rotate_left"
+  | .rotateRight => "rotate_right"
+  | .saturatingAdd => "saturating_add"
+  | .saturatingSub => "saturating_sub"
+
+/-- Number of value arguments of the intrinsic's signature. -/
+def arity : AnnealIntrinsic → Nat
+  | .writeBytes => 3
+  | .ctpop | .ctlz | .ctlzNonzero | .cttz | .cttzNonzero | .bswap | .bitreverse => 1
+  | .exactDiv | .arithOffset | .wrappingOffset | .rotateLeft | .rotateRight
+  | .saturatingAdd | .saturatingSub => 2
+
+/-- The correspondence-local `Miri.MIR.DefId` of the intrinsic. Every value is
+below `64`, so `annealFnItemTyId` can pack it with a generic argument. -/
+def defId : AnnealIntrinsic → Miri.MIR.DefId
+  | .exactDiv => 1
+  | .writeBytes => 2
+  | .arithOffset => 3
+  | .ctpop => 4
+  | .ctlz => 5
+  | .ctlzNonzero => 6
+  | .cttz => 7
+  | .cttzNonzero => 8
+  | .bswap => 9
+  | .bitreverse => 10
+  | .rotateLeft => 11
+  | .rotateRight => 12
+  | .saturatingAdd => 13
+  | .saturatingSub => 14
+  | .wrappingOffset => 15
+
+/-- Inverse of `defId`. -/
+def ofDefId? : Miri.MIR.DefId → Option AnnealIntrinsic
+  | 1 => some .exactDiv
+  | 2 => some .writeBytes
+  | 3 => some .arithOffset
+  | 4 => some .ctpop
+  | 5 => some .ctlz
+  | 6 => some .ctlzNonzero
+  | 7 => some .cttz
+  | 8 => some .cttzNonzero
+  | 9 => some .bswap
+  | 10 => some .bitreverse
+  | 11 => some .rotateLeft
+  | 12 => some .rotateRight
+  | 13 => some .saturatingAdd
+  | 14 => some .saturatingSub
+  | 15 => some .wrappingOffset
+  | _ => none
+
+/-- All intrinsics, in `defId` order. -/
+def all : List AnnealIntrinsic :=
+  [.exactDiv, .writeBytes, .arithOffset, .ctpop, .ctlz, .ctlzNonzero, .cttz, .cttzNonzero,
+    .bswap, .bitreverse, .rotateLeft, .rotateRight, .saturatingAdd, .saturatingSub,
+    .wrappingOffset]
+
+/-- Recognize an intrinsic by the canonical `DefPath` of its function item (and
+`std::intrinsics::arith_offset` / `wrapping_offset` aliases), with the same byte
+comparison (`stringEq`) that `MirSemantics.evalTerminator` uses. -/
+def ofDefPath? (p : DefPath) : Option AnnealIntrinsic :=
+  match all.find? (fun k => stringEq p k.defPath) with
+  | some k => some k
+  | none =>
+    if stringEq p "std::intrinsics::arith_offset" then some .arithOffset
+    else if stringEq p "std::intrinsics::wrapping_offset" then some .wrappingOffset
+    else none
+
+end AnnealIntrinsic
+
+/-- Smallest `Miri.MIR.TyId` that `annealFnItemTyId` assigns. Only callee
+operands are decoded with `annealDecodeFnItemTyId`, and the callee operand of a
+translated call is an `annealFnItemTyId` constant, another function item
+(`TyId 51`), or a function pointer (`TyId 42`), so every TyId at or above this
+base that reaches the decoder names an intrinsic. -/
+def annealFnItemTyIdBase : Miri.MIR.TyId := 128
+
+/-- `Miri.MIR.TyId` of the function item type `FnDef(k, [T])` of intrinsic `k`
+instantiated at the type whose encoding is `argTy`.
+
+`encodeTyId` maps every function item type to `51`, which drops the identity of
+the called function. In rustc that identity lives in the callee operand's type
+`FnDef(def_id, args)`, which `eval_callee_and_args` passes to `resolve`. The
+callee operand of a translated intrinsic call therefore carries this TyId
+instead, and `annealCallHooks.functionKind` decodes it with
+`annealDecodeFnItemTyId`. The packing `base + defId + 64 * argTy` is injective
+because every `defId` is below `64`. -/
+def annealFnItemTyId (k : AnnealIntrinsic) (argTy : Miri.MIR.TyId) : Miri.MIR.TyId :=
+  annealFnItemTyIdBase + k.defId + 64 * argTy
+
+/-- Decode a TyId produced by `annealFnItemTyId`. -/
+def annealDecodeFnItemTyId (tyId : Miri.MIR.TyId) : Option (AnnealIntrinsic × Miri.MIR.TyId) :=
+  if annealFnItemTyIdBase ≤ tyId then
+    match AnnealIntrinsic.ofDefId? ((tyId - annealFnItemTyIdBase) % 64) with
+    | some k => some (k, (tyId - annealFnItemTyIdBase) / 64)
+    | none => none
+  else
+    none
+
+/-- Translate the callee operand of a `TerminatorKind.call`.
+
+A constant function item of an `AnnealIntrinsic` with one generic type argument
+`T` (`fnDef p [T]`) becomes the zero-sized constant of type
+`annealFnItemTyId k (encodeTyId T)`, which records the intrinsic and its type
+argument; every other callee is translated by `translateOperand`. -/
+def translateCalleeOperand (func : Operand) : Miri.MIR.Operand :=
+  match func with
+  | .constant c =>
+    match c.ty.kind with
+    | .fnDef p (argKind :: .nil) =>
+      match AnnealIntrinsic.ofDefPath? p with
+      | some k =>
+        .Constant
+          { span := defaultSpanRef
+            userType := none
+            value := .Val .ZeroSized
+              (annealFnItemTyId k (encodeTyId { kind := argKind, layoutIdx := 0 })) }
+      | none => translateOperand func
+    | _ => translateOperand func
+  | _ => translateOperand func
+
 /-- Translate an Anneal `TerminatorKind` to `Miri.MIR.TerminatorKind`. -/
 def translateTerminatorKind : TerminatorKind → Miri.MIR.TerminatorKind
   | .goto target => .Goto target #[]
@@ -850,7 +1028,7 @@ def translateTerminatorKind : TerminatorKind → Miri.MIR.TerminatorKind
   | .drop place target unwind =>
       .Drop (translatePlace place) target (translateUnwindAction unwind) false none
   | .call func args destination target unwind =>
-      .Call (translateOperand func)
+      .Call (translateCalleeOperand func)
         (args.map fun a => ({ span := defaultSpanRef, operand := translateOperand a } : Miri.MIR.SpannedOperand)).toArray
         (translatePlace destination)
         target
@@ -2747,6 +2925,530 @@ def annealRvalueHooks (localDecls : List LocalDecl := .nil)
   readDiscriminant := fun _ _ => throw (.unsupported "readDiscriminant")
   discriminantForVariant := fun _ _ _ => throw (.unsupported "discriminantForVariant")
 
+/-! ## 4. Intrinsic Calls and Non-Diverging Intrinsic Statements (`LM-4.2`)
+
+`annealIntrinsicHooks` instantiates `Miri.Interpreter.IntrinsicHooks` for
+Anneal's single-threaded machine, so that the vendored
+`Miri.Interpreter.Intrinsics.eval` and `Intrinsics.evalNondiverging` evaluate
+intrinsic calls and `StatementKind::Intrinsic` statements. `annealCallHooks`
+instantiates `Miri.Interpreter.CallHooks` so that the vendored call pipeline
+`Miri.Interpreter.Call.evalCallTerminator` evaluates a `TerminatorKind::Call`
+of an `AnnealIntrinsic` and dispatches it to `Intrinsics.eval`. The memory
+leaves are the vendored operations: `MemoryLifecycle.memCopyRepeatedly` (through
+`Intrinsics.memoryCopyAdapter`) for copies, `Allocation.writeRepeatedByte` for
+`write_bytes`, `Memory.checkAndDerefPtr` for bounds and liveness, and
+`Memory.checkPtrAlign` for alignment. Leaves that no `AnnealIntrinsic` reaches
+fail closed with `StepError.unsupported`. -/
+
+/-- Throw `StepError.unsupported` for a machine leaf that Anneal's intrinsic
+fragment does not provide. -/
+def annealUnsupportedLeaf {S A : Type} (leaf : String) : EStateM Miri.Interpreter.StepError S A :=
+  throw (.unsupported s!"{leaf} is outside Anneal's intrinsic fragment")
+
+/-- Float operation leaves; no `AnnealIntrinsic` reads a float. -/
+def annealUnsupportedFloatOps :
+    Miri.Interpreter.FloatOpsHooks AnnealProv AnnealStepState Unit where
+  integerKindOf := fun _ _ => annealUnsupportedLeaf "floatOps.integerKindOf"
+  formatOf := fun _ _ => annealUnsupportedLeaf "floatOps.formatOf"
+  boolLayout := fun _ => pure (translateTy { kind := .bool, layoutIdx := 0 })
+  floatNondeterministic := false
+  chooseNaN := fun _ _ => annealUnsupportedLeaf "floatOps.chooseNaN"
+
+/-- Allocation lookup for `Miri.Memory.checkPtrAlign`.
+
+rustc's `is_ptr_misaligned` asks `get_alloc_info`, which also answers for a
+deallocated allocation (`AllocKind::Dead`). Anneal's machine keeps no table of
+freed allocations, so a lookup of an allocation that is no longer live reports
+a dead allocation of alignment `1`. For `AnnealProv`
+(`PointerProvenance.offsetIsAddr`) and the default machine alignment check,
+`isPtrMisaligned` never consults the allocation's alignment or kind: it tests
+the absolute address, so this fallback only keeps the lookup total. -/
+def annealAlignLookup (mach : AnnealMachine) :
+    Miri.Memory.AllocId → Except Miri.Memory.AllocationLookupError Miri.Memory.AllocationInfo :=
+  fun allocId =>
+    match annealLookupAlloc mach allocId with
+    | .ok info => .ok info
+    | .error _ =>
+      .ok { size := Miri.ABI.Size.ZERO, align := Miri.ABI.Align.ONE, kind := .dead,
+            mutability := .Not }
+
+/-- rustc's `check_ptr_align` with alignment enforced (Miri's default
+`-Zmiri-check-alignment`), through the vendored `Miri.Memory.checkPtrAlign`.
+A misaligned pointer is undefined behavior. -/
+def annealCheckPtrAlign (ptr : Miri.Memory.Pointer (Option AnnealProv))
+    (align : Miri.ABI.Align) : Miri.Interpreter.RvalueM AnnealStepState Unit :=
+  fun st =>
+    match Miri.Memory.checkPtrAlign ptr align true (annealResolvePtr st.machine)
+        (annealAlignLookup st.machine) (fun _ _ _ _ _ => none) with
+    | .ok () => .ok () st
+    | .error (.alignmentCheckFailed _) =>
+      .error (.undefinedBehavior "accessing memory with an unaligned pointer") st
+    | .error err => .error (.invalidProgram s!"alignment check: {err}") st
+
+/-- Pointer access leaf of `MemoryCopyHooks` (rustc's `get_ptr_access`): check
+`size` bytes at `ptr` with `Miri.Memory.checkAndDerefPtr` against the memory
+`memory` and the cached base addresses of `mach`. A zero-sized access needs no
+allocation (`none`); a dangling, out-of-bounds, or provenance-free access of
+non-zero size fails. -/
+def annealCopyPointerAccess (memory : AnnealMemory) (mach : AnnealMachine)
+    (ptr : Miri.Memory.Pointer (Option AnnealProv)) (size : Miri.ABI.Size) :
+    Miri.Memory.MemoryStateHookResult AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+      Miri.Memory.MiriMemoryKind AnnealMachine
+      (Option (Miri.Memory.AllocId × Miri.ABI.Size × Miri.Memory.BorTag)) :=
+  let mach' : AnnealMachine := { mach with memory := memory }
+  { memory := memory
+    state := mach'
+    outcome :=
+      match Miri.Memory.sizeAsI64 size with
+      | .error err => .error (toString err)
+      | .ok signedSize =>
+        match Miri.Memory.checkAndDerefPtr annealPointerArithmetic ptr signedSize .memoryAccess
+            (annealResolvePtr mach') (annealLookupAlloc mach') with
+        | .ok none => .ok none
+        | .ok (some access) =>
+          .ok (some (access.pointer.allocId, access.pointer.offset, access.pointer.extra))
+        | .error err => .error (toString err) }
+
+/-- `MemoryCopyHooks` of `MemoryLifecycle.memCopyRepeatedly` for Anneal's
+machine, whose hook state is the machine itself.
+
+* `pointerAccess` is `annealCopyPointerAccess`.
+* `tryGetAllocId` resolves the pointer's allocation through the cached base
+  addresses (rustc's `ptr_try_get_alloc_id`).
+* `beforeAllocationAccess`, `beforeMemoryRead`, and `beforeMemoryWrite` succeed
+  without effect. They are the machine's access hooks (data-race detection and
+  the aliasing model); Anneal's single-threaded machine has no data races, and
+  like every other memory access of this instantiation they track no borrow
+  state, so Tree Borrows violations are not detected here (Anneal's own
+  `TreeBorrowPerm` checks are stricter). -/
+def annealMemoryCopyHooks :
+    Miri.Memory.MemoryCopyHooks AnnealProv (Option Miri.TreeBorrows.BorrowTree)
+      Miri.Memory.MiriMemoryKind AnnealMachine Miri.Memory.BorTag where
+  synchronizeMemory := fun memory mach => { mach with memory := memory }
+  pointerAccess := annealCopyPointerAccess
+  tryGetAllocId := fun memory mach ptr size =>
+    match annealResolvePtr { mach with memory := memory } ptr (Int.ofNat size.toNat) with
+    | .ok resolved => some resolved.allocId
+    | .error _ => none
+  beforeAllocationAccess := fun memory mach _ =>
+    { memory := memory, state := mach, outcome := .ok () }
+  beforeMemoryRead := fun mach memory _ _ _ _ _ =>
+    { memory := memory, hooks := mach, outcome := .ok () }
+  beforeMemoryWrite := fun mach memory _ _ _ _ _ =>
+    { memory := memory, hooks := mach, outcome := .ok () }
+
+/-- Classify a failure of `MemoryLifecycle.memCopyRepeatedly`: a failed pointer
+access (dangling, out-of-bounds, or provenance-free), overlapping
+non-overlapping ranges (`copy_nonoverlapping`'s `copyRangesOverlap`), and a
+write to read-only memory are undefined behavior, as in rustc's
+`mem_copy_repeatedly`. -/
+def annealClassifyMemCopyError : Miri.Memory.MemoryLifecycleError → Miri.Interpreter.StepError
+  | .hookFailure hook message =>
+    .undefinedBehavior s!"memory copy pointer check failed ({hook}): {message}"
+  | .allocation .copyRangesOverlap =>
+    .undefinedBehavior "copy_nonoverlapping called on overlapping ranges"
+  | .allocation .readOnlyAllocation => .undefinedBehavior "write to read-only allocation"
+  | .allocation (.outOfBounds _ _) => .undefinedBehavior "memory copy out of bounds"
+  | .allocationNotLocal _ => .unsupported "memory copy of a non-local allocation"
+  | err => .invalidProgram s!"memory copy: {err}"
+
+/-- Copy `size` bytes from `source` to `dest` (rustc's `mem_copy`), lifting the
+vendored `Intrinsics.memoryCopyAdapter` (`MemoryLifecycle.memCopyRepeatedly`
+with one copy) from the memory/hook-state pair to `AnnealStepState`. Memory
+mutations persist even when the copy fails. -/
+def annealMemCopy (source dest : Miri.Memory.Pointer (Option AnnealProv))
+    (size : Miri.ABI.Size) (nonoverlapping : Bool) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit :=
+  fun st =>
+    match Miri.Interpreter.Intrinsics.memoryCopyAdapter annealTargetDataLayout
+        annealMemoryCopyHooks annealClassifyMemCopyError () source dest size nonoverlapping
+        (st.machine.memory, st.machine) with
+    | .ok () (memory, mach) => .ok () { st with machine := { mach with memory := memory } }
+    | .error err (memory, mach) => .error err { st with machine := { mach with memory := memory } }
+
+/-- Write `size` copies of `byte` at `ptr` (rustc's `write_bytes_ptr` with
+`repeat_n`): a zero-sized write touches no allocation; otherwise the access is
+checked with `Miri.Memory.checkAndDerefPtr` and performed by the vendored
+`Allocation.writeRepeatedByte`, which initializes the bytes and clears their
+provenance. Neither rustc's `write_bytes_intrinsic` nor this leaf checks
+alignment. -/
+def annealWriteRepeatedBytes (ptr : Miri.Memory.Pointer (Option AnnealProv)) (byte : UInt8)
+    (size : Miri.ABI.Size) : Miri.Interpreter.RvalueM AnnealStepState Unit :=
+  fun st =>
+    match Miri.Memory.sizeAsI64 size with
+    | .error _ => .error (.invalidProgram "write_bytes size does not fit i64") st
+    | .ok signedSize =>
+      match Miri.Memory.checkAndDerefPtr annealPointerArithmetic ptr signedSize .memoryAccess
+          (annealResolvePtr st.machine) (annealLookupAlloc st.machine) with
+      | .error _ => .error (.undefinedBehavior "write_bytes pointer check failed") st
+      | .ok none => .ok () st
+      | .ok (some access) =>
+        match st.machine.memory.live.find? (fun entry => entry.1 == access.pointer.allocId) with
+        | none => .error (.undefinedBehavior "write_bytes to a dead allocation") st
+        | some (_, localAlloc) =>
+          match Miri.Memory.Allocation.writeRepeatedByte access.pointer.offset byte size.bytes
+              (Miri.ABI.Size.ofBytes 8) localAlloc.allocation with
+          | .ok () alloc' =>
+            match st.machine.memory.setLiveAllocation access.pointer.allocId alloc' with
+            | .ok nextMem => .ok () { st with machine := { st.machine with memory := nextMem } }
+            | .error _ => .error (.undefinedBehavior "write_bytes to a dead allocation") st
+          | .error .readOnlyAllocation _ =>
+            .error (.undefinedBehavior "write to read-only allocation") st
+          | .error _ _ => .error (.invalidProgram "write_bytes allocation error") st
+
+/-- Write a pointer immediate (`Scalar::from_maybe_pointer`) to `dest`. -/
+def annealWritePointer (ptr : Miri.Memory.Pointer (Option AnnealProv))
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit :=
+  match Miri.Memory.Scalar.fromMaybePointer annealTargetDataLayout ptr with
+  | .ok sc => annealWriteImmediate (.scalar sc) dest
+  | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err)
+
+/-- Lift `Miri.Interpreter.ControlFlow.returnToBlock` (rustc's
+`return_to_block`) to `RvalueM`. -/
+def annealReturnToBlock (target : Option Miri.MIR.BasicBlockId) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit :=
+  fun st =>
+    match Miri.Interpreter.ControlFlow.returnToBlock target st with
+    | (st', .ok ()) => .ok () st'
+    | (st', .error err) => .error err st'
+
+/-- SIMD leaves; no `AnnealIntrinsic` is a SIMD intrinsic. -/
+def annealIntrinsicSimdHooks (layouts : LayoutTable) :
+    Miri.Interpreter.IntrinsicSimdHooks AnnealProv AnnealStepState Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  target := annealTargetDataLayout
+  boolTy := 1
+  u8Ty := 20
+  isSimd := fun _ _ => pure false
+  simdSizeAndType := fun _ _ => annealUnsupportedLeaf "simd.simdSizeAndType"
+  forceAllocation := fun _ _ => annealUnsupportedLeaf "simd.forceAllocation"
+  placeLayout := fun p => p.layout
+  placePointer := fun _ => .error (.unsupported "simd.placePointer")
+  fieldRead := fun _ _ _ => annealUnsupportedLeaf "simd.fieldRead"
+  fieldWrite := fun _ _ _ => annealUnsupportedLeaf "simd.fieldWrite"
+  fieldLayout := fun _ _ _ => annealUnsupportedLeaf "simd.fieldLayout"
+  indexRead := fun _ _ _ => annealUnsupportedLeaf "simd.indexRead"
+  indexWrite := fun _ _ _ => annealUnsupportedLeaf "simd.indexWrite"
+  readImmediate := fun _ _ => annealUnsupportedLeaf "simd.readImmediate"
+  writeImmediate := fun _ _ _ => annealUnsupportedLeaf "simd.writeImmediate"
+  copyOp := fun _ _ _ => annealUnsupportedLeaf "simd.copyOp"
+  derefImmediate := fun _ _ => annealUnsupportedLeaf "simd.derefImmediate"
+  readPlaceImmediate := fun _ _ => annealUnsupportedLeaf "simd.readPlaceImmediate"
+  unalignedPlace := fun _ _ _ => annealUnsupportedLeaf "simd.unalignedPlace"
+  checkAlign := fun _ _ _ => annealUnsupportedLeaf "simd.checkAlign"
+  readBytes := fun _ _ _ => annealUnsupportedLeaf "simd.readBytes"
+  writeBytes := fun _ _ _ => annealUnsupportedLeaf "simd.writeBytes"
+  shuffleConst := fun _ _ => annealUnsupportedLeaf "simd.shuffleConst"
+  alignmentConst := fun _ _ => annealUnsupportedLeaf "simd.alignmentConst"
+  scalarOps := annealScalarOpsHooks .nil layouts
+  floatOps := annealUnsupportedFloatOps
+  castHooks := annealCastHooks layouts
+  chooseEqualFloatRight := fun _ _ _ => annealUnsupportedLeaf "simd.chooseEqualFloatRight"
+  fuseMulAdd := fun _ => annealUnsupportedLeaf "simd.fuseMulAdd"
+  mathLane := fun _ _ _ _ => annealUnsupportedLeaf "simd.mathLane"
+  returnToBlock := fun _ target => annealReturnToBlock target
+
+/-- Atomic leaves; no `AnnealIntrinsic` is an atomic intrinsic. -/
+def annealIntrinsicAtomicHooks (layouts : LayoutTable) :
+    Miri.Interpreter.IntrinsicAtomicHooks AnnealProv AnnealStepState Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  target := annealTargetDataLayout
+  getGlobal := fun _ => none
+  setGlobal := fun st _ => st
+  threads := fun _ => Miri.Concurrency.ThreadManager.initial true
+  getAtomic := fun _ _ => .error (.unsupported "atomic.getAtomic")
+  setAtomic := fun _ _ => annealUnsupportedLeaf "atomic.setAtomic"
+  placeLayout := fun p => p.layout
+  placePointer := fun _ => .error (.unsupported "atomic.placePointer")
+  physicalRead := fun _ _ => annealUnsupportedLeaf "atomic.physicalRead"
+  physicalWrite := fun _ _ _ => annealUnsupportedLeaf "atomic.physicalWrite"
+  ghostRead := fun _ _ => annealUnsupportedLeaf "atomic.ghostRead"
+  checkPointerAlign := fun _ _ _ => annealUnsupportedLeaf "atomic.checkPointerAlign"
+  resolveAllocation := fun _ _ => annealUnsupportedLeaf "atomic.resolveAllocation"
+  mutability := fun _ _ => annealUnsupportedLeaf "atomic.mutability"
+  scalarOps := annealScalarOpsHooks .nil layouts
+  loadChoiceRank := fun _ _ => annealUnsupportedLeaf "atomic.loadChoiceRank"
+  weakPolicy := .neverFail
+  weakSuccessChoice := fun _ => annealUnsupportedLeaf "atomic.weakSuccessChoice"
+  diagnostic := fun _ _ => annealUnsupportedLeaf "atomic.diagnostic"
+  classifyDispatchError := fun _ => .unsupported "atomic dispatch"
+  classifyGlobalError := fun _ => .unsupported "atomic global state"
+  orderingConst := fun _ _ => annealUnsupportedLeaf "atomic.orderingConst"
+  volatileConst := fun _ _ => annealUnsupportedLeaf "atomic.volatileConst"
+  derefPointer := fun _ _ => annealUnsupportedLeaf "atomic.derefPointer"
+  readImmediate := fun _ _ => annealUnsupportedLeaf "atomic.readImmediate"
+  writeImmediate := fun _ _ _ => annealUnsupportedLeaf "atomic.writeImmediate"
+  returnToBlock := fun _ target => annealReturnToBlock target
+
+/-- `type_id` leaves; no `AnnealIntrinsic` queries type identity. -/
+def annealIntrinsicTypeIdHooks :
+    Miri.Interpreter.IntrinsicTypeIdHooks AnnealProv AnnealStepState Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  target := annealTargetDataLayout
+  hasErasableRegions := fun _ _ => annealUnsupportedLeaf "typeId.hasErasableRegions"
+  typeHash := fun _ _ => annealUnsupportedLeaf "typeId.typeHash"
+  u128Layout := fun _ => annealUnsupportedLeaf "typeId.u128Layout"
+  unitLayout := fun _ => annealUnsupportedLeaf "typeId.unitLayout"
+  reserveTypeId := fun _ _ => annealUnsupportedLeaf "typeId.reserveTypeId"
+  globalRootPointer := fun _ _ _ => annealUnsupportedLeaf "typeId.globalRootPointer"
+  resolvePointer := fun _ _ => annealUnsupportedLeaf "typeId.resolvePointer"
+  globalTypeId := fun _ _ => annealUnsupportedLeaf "typeId.globalTypeId"
+  placeLayout := fun p => p.layout
+  copyAllowTransmute := fun _ _ _ => annealUnsupportedLeaf "typeId.copyAllowTransmute"
+  projectFieldRead := fun _ _ _ => annealUnsupportedLeaf "typeId.projectFieldRead"
+  projectFieldWrite := fun _ _ _ => annealUnsupportedLeaf "typeId.projectFieldWrite"
+  elementLayout := fun _ _ => annealUnsupportedLeaf "typeId.elementLayout"
+  offsetRead := fun _ _ _ _ _ => annealUnsupportedLeaf "typeId.offsetRead"
+  offsetWrite := fun _ _ _ _ _ => annealUnsupportedLeaf "typeId.offsetWrite"
+  readImmediate := fun _ _ => annealUnsupportedLeaf "typeId.readImmediate"
+  readPlaceScalar := fun _ _ => annealUnsupportedLeaf "typeId.readPlaceScalar"
+  writeScalar := fun _ _ _ => annealUnsupportedLeaf "typeId.writeScalar"
+
+/-- C variadic-argument leaves; no `AnnealIntrinsic` uses `va_list`. -/
+def annealIntrinsicVarArgsHooks :
+    Miri.Interpreter.IntrinsicVarArgsHooks AnnealProv AnnealStepState Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  getLists := fun _ => #[]
+  setLists := fun st _ => st
+  markDead := fun st _ _ _ => st
+  reserveAllocId := fun _ => annealUnsupportedLeaf "varArgs.reserveAllocId"
+  globalRootPointer := fun _ _ => annealUnsupportedLeaf "varArgs.globalRootPointer"
+  resolvePointer := fun _ _ => annealUnsupportedLeaf "varArgs.resolvePointer"
+  destLayout := fun p => p.layout
+  layoutOf := fun _ _ => annealUnsupportedLeaf "varArgs.layoutOf"
+  typeInfo := fun _ _ => annealUnsupportedLeaf "varArgs.typeInfo"
+  identicalCTypes := fun _ _ _ => annealUnsupportedLeaf "varArgs.identicalCTypes"
+  isCVoid := fun _ _ => annealUnsupportedLeaf "varArgs.isCVoid"
+  vaListFields := fun _ _ => annealUnsupportedLeaf "varArgs.vaListFields"
+  isRawPointer := fun _ _ => annealUnsupportedLeaf "varArgs.isRawPointer"
+  projectField := fun _ _ _ => annealUnsupportedLeaf "varArgs.projectField"
+  derefPointer := fun _ _ => annealUnsupportedLeaf "varArgs.derefPointer"
+  placePointer := fun _ => .error (.unsupported "varArgs.placePointer")
+  readPointer := fun _ _ => annealUnsupportedLeaf "varArgs.readPointer"
+  readScalar := fun _ _ => annealUnsupportedLeaf "varArgs.readScalar"
+  writePointer := fun _ _ _ => annealUnsupportedLeaf "varArgs.writePointer"
+  forceAllocation := fun _ _ => annealUnsupportedLeaf "varArgs.forceAllocation"
+  writeBytesPointer := fun _ _ _ _ => annealUnsupportedLeaf "varArgs.writeBytesPointer"
+  copyAllowTransmute := fun _ _ _ => annealUnsupportedLeaf "varArgs.copyAllowTransmute"
+
+/-- Integer kind of an integral `Miri.MIR.TyId` (`IntrinsicHooks.integerKind`);
+an integer intrinsic applied to any other type is an invalid program. -/
+def annealIntegerKindOf (tyId : Miri.MIR.TyId) :
+    Miri.Interpreter.RvalueM AnnealStepState Miri.MIR.IntegerKind :=
+  match classifyEncodedTyId tyId with
+  | .ok (.integer kind) => pure kind
+  | .ok _ => throw (.invalidProgram s!"integer intrinsic on non-integer TyId {tyId}")
+  | .error err => throw err
+
+/-- `IntrinsicHooks` instantiated for Anneal's single-threaded machine
+(`LM-4.2`).
+
+* Operands, places, and immediates use the same leaves as `annealRvalueHooks`
+  (`annealEvalOperand`, `annealReadImmediate`, `annealWriteImmediate`), and
+  integer arithmetic uses `annealScalarOpsHooks`.
+* `layoutOf` and `pointeeType` decode the encoded TyIds of `encodeTyId`;
+  `maxSizeOfVal` is `isize::MAX` (rustc's `max_size_of_val`).
+* `checkAlign` is `annealCheckPtrAlign`, `memCopy` is `annealMemCopy`, and
+  `writeBytes` is `annealWriteRepeatedBytes`.
+* `returnToBlock` is `ControlFlow.returnToBlock`.
+* Every other leaf fails closed with `StepError.unsupported`. -/
+def annealIntrinsicHooks (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.IntrinsicHooks AnnealProv AnnealStepState Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  simdHooks := annealIntrinsicSimdHooks layouts
+  atomicHooks := annealIntrinsicAtomicHooks layouts
+  typeIdHooks := annealIntrinsicTypeIdHooks
+  varArgsHooks := annealIntrinsicVarArgsHooks
+  varArgsFuel := 0
+  target := annealTargetDataLayout
+  pointerOffset := Miri.ABI.Size.ofBytes 8
+  maxSizeOfVal := Miri.ABI.Size.ofBytes 0x7fff_ffff_ffff_ffff
+  destLayout := fun p => p.layout
+  layoutOf := fun _ tyId => pure (layoutOfEncodedTyId tyId layouts)
+  pointeeType := fun _ tyId =>
+    match rawPtrPointeeEncodedTyId? tyId with
+    | some pointee => pure pointee
+    | none => throw (.unsupported s!"pointee of TyId {tyId} is not encoded")
+  integerKind := fun _ tyId => annealIntegerKindOf tyId
+  usizeLayout := fun _ => pure (translateTy { kind := .uint .usize, layoutIdx := 0 })
+  isizeLayout := fun _ => pure (translateTy { kind := .int .isize, layoutIdx := 0 })
+  readImmediate := fun _ op => annealReadImmediate op
+  evalOperand := fun _ op => annealEvalOperand localDecls layouts op none
+  evalOperandAt := fun _ _ op => annealEvalOperand localDecls layouts op none
+  writeImmediate := fun _ imm dest => annealWriteImmediate imm dest
+  writePointer := fun _ ptr dest => annealWritePointer ptr dest
+  copyOp := fun _ _ _ => annealUnsupportedLeaf "intrinsic.copyOp"
+  placeToOp := fun _ _ => annealUnsupportedLeaf "intrinsic.placeToOp"
+  placePointer := fun _ => .error (.unsupported "intrinsic.placePointer")
+  derefPointer := fun _ _ => annealUnsupportedLeaf "intrinsic.derefPointer"
+  immPointerToPlace := fun _ _ => annealUnsupportedLeaf "intrinsic.immPointerToPlace"
+  dynamicSizeAlign := fun _ _ => annealUnsupportedLeaf "intrinsic.dynamicSizeAlign"
+  scalarOps := annealScalarOpsHooks localDecls layouts
+  floatOps := annealUnsupportedFloatOps
+  applyFloatNondeterminism := fun _ _ => annealUnsupportedLeaf "intrinsic.applyFloatNondeterminism"
+  chooseEqualFloatRight := fun _ _ _ => annealUnsupportedLeaf "intrinsic.chooseEqualFloatRight"
+  fuseMulAdd := fun _ => annealUnsupportedLeaf "intrinsic.fuseMulAdd"
+  floatFastError := fun _ _ _ => annealUnsupportedLeaf "intrinsic.floatFastError"
+  checkAlign := fun _ ptr align => annealCheckPtrAlign ptr align
+  memCopy := fun _ source dest size nonoverlapping => annealMemCopy source dest size nonoverlapping
+  writeBytes := fun _ ptr byte size => annealWriteRepeatedBytes ptr byte size
+  readBytesStripProvenance := fun _ _ _ => annealUnsupportedLeaf "intrinsic.readBytesStripProvenance"
+  allocateStack := fun _ _ => annealUnsupportedLeaf "intrinsic.allocateStack"
+  deallocateStack := fun _ _ => annealUnsupportedLeaf "intrinsic.deallocateStack"
+  enforceValidity := fun _ _ => pure true
+  enforceValidityRecursively := fun _ _ => pure true
+  validatePlace := fun _ _ _ _ => annealUnsupportedLeaf "intrinsic.validatePlace"
+  tryAllocId := fun _ _ => annealUnsupportedLeaf "intrinsic.tryAllocId"
+  checkSignedAccess := fun _ _ _ => annealUnsupportedLeaf "intrinsic.checkSignedAccess"
+  vtableSizeAlign := fun _ _ _ => annealUnsupportedLeaf "intrinsic.vtableSizeAlign"
+  readDiscriminant := fun _ _ => annealUnsupportedLeaf "intrinsic.readDiscriminant"
+  discriminantForVariant := fun _ _ _ => annealUnsupportedLeaf "intrinsic.discriminantForVariant"
+  variantLayout := fun _ _ _ => annealUnsupportedLeaf "intrinsic.variantLayout"
+  ensureMonomorphic := fun _ _ => pure ()
+  typeNameConstant := fun _ _ _ => annealUnsupportedLeaf "intrinsic.typeNameConstant"
+  needsDrop := fun _ _ => annealUnsupportedLeaf "intrinsic.needsDrop"
+  variantCount := fun _ _ => annealUnsupportedLeaf "intrinsic.variantCount"
+  callerLocationConstant := fun _ _ => annealUnsupportedLeaf "intrinsic.callerLocationConstant"
+  chooseStaticKnown := fun _ => annealUnsupportedLeaf "intrinsic.chooseStaticKnown"
+  catchUnwind := fun _ _ _ _ _ _ => annealUnsupportedLeaf "intrinsic.catchUnwind"
+  returnToBlock := fun _ target => annealReturnToBlock target
+  mathHooks := none
+
+/-- Read a saved call destination or argument place as an operand (rustc's
+`place_to_op`): a frame local is read like `Operand::Copy` of the local, and a
+memory place is an indirect operand. -/
+def annealStackPlaceToOp (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (place : Miri.Interpreter.RuntimeStackPlace AnnealProv) :
+    Miri.Interpreter.CallM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) :=
+  match place with
+  | .frameLocal _ localId none _ _ =>
+    annealEvalOperand localDecls layouts (.Copy ⟨localId, #[]⟩) none
+  | .memory mp => pure ⟨.indirect mp.mplace, mp.layout⟩
+  | .frameLocal _ _ (some _) _ _ => annealUnsupportedLeaf "call.placeToOp of a projected local"
+
+/-- Dispatch an intrinsic call (rustc's `Machine::call_intrinsic`): evaluate it
+with the vendored `Miri.Interpreter.Intrinsics.eval` under the intrinsic's name
+and generic type arguments. When `Intrinsics.eval` does not handle the name it
+returns `false`, and the call continues with the intrinsic's MIR fallback body
+(`Instance { def: Item(def_id) }`), as rustc does for intrinsics with a
+fallback body. -/
+def annealCallIntrinsic (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (inst : Miri.Interpreter.CallInstance) (args : Array (Miri.Interpreter.OpTy AnnealProv))
+    (dest : Miri.Interpreter.RuntimeStackPlace AnnealProv)
+    (target : Option Miri.MIR.BasicBlockId) :
+    Miri.Interpreter.CallM AnnealStepState (Option Miri.Interpreter.CallInstance) :=
+  match AnnealIntrinsic.ofDefId? inst.defId with
+  | none => annealUnsupportedLeaf "call of an intrinsic outside AnnealIntrinsic"
+  | some k => do
+    let types := inst.args.filterMap fun
+      | .Type ty => some ty
+      | _ => none
+    let handled ← Miri.Interpreter.Intrinsics.eval (annealIntrinsicHooks localDecls layouts) ()
+      k.name types args dest.toRuntimePlace target
+    if handled then
+      pure none
+    else
+      pure (some { kind := .Item inst.defId, args := inst.args })
+
+/-- `CallHooks` instantiated for Anneal's single-threaded machine (`LM-4.2`),
+for the vendored call pipeline `Miri.Interpreter.Call.evalCallTerminator`.
+
+* `functionSignature`, `functionKind`, and `resolve` recognize the callee
+  operand's function item type `annealFnItemTyId k T` (`translateCalleeOperand`)
+  as `FnDef(k, [T])` and resolve it to `Instance { def: Intrinsic(k) }`.
+  Intrinsics take no caller location, cannot unwind, and have the Rust ABI on
+  both sides of the call (`FnABI`, `ArgABI`, and the extern ABI are `Unit`).
+* `callIntrinsic` is `annealCallIntrinsic`. `findMirOrEvalFn`, the only way to
+  reach an MIR body, fails closed: Anneal's correspondence relates a single
+  frame and provides no callee bodies, including the MIR fallback bodies of
+  intrinsics that `Intrinsics.eval` leaves unhandled.
+* Every frame-construction and unwinding leaf fails closed with
+  `StepError.unsupported`; no intrinsic call reaches them. -/
+def annealCallHooks (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.CallHooks AnnealProv AnnealStepState Unit Unit Unit Unit Unit Unit where
+  debugAssertions := false
+  getFrame := (annealPlaceHooks localDecls layouts).getFrame
+  setFrame := (annealPlaceHooks localDecls layouts).setFrame
+  frameIndex := (annealPlaceHooks localDecls layouts).frameIndex
+  evalOperand := fun _ op => annealEvalOperand localDecls layouts op none
+  evalOperandAt := fun _ _ op => annealEvalOperand localDecls layouts op none
+  evalPlace := fun _ place _ => do
+    let runtimePlace ← annealEvalPlace localDecls layouts place
+    pure runtimePlace.stackView
+  placeToOp := fun _ place => annealStackPlaceToOp localDecls layouts place
+  forceAllocation := fun _ _ => annealUnsupportedLeaf "call.forceAllocation"
+  functionSignature := fun _ layout =>
+    match annealDecodeFnItemTyId layout.ty with
+    | some (k, _) => pure (k.arity, ())
+    | none => annealUnsupportedLeaf "call of a function other than an AnnealIntrinsic"
+  functionKind := fun tyId =>
+    match annealDecodeFnItemTyId tyId with
+    | some (k, argTy) => pure (.FnDef k.defId #[.Type argTy])
+    | none => annealUnsupportedLeaf "call of a function other than an AnnealIntrinsic"
+  readPointer := fun _ _ => annealUnsupportedLeaf "call.readPointer"
+  getPtrFn := fun _ _ => annealUnsupportedLeaf "call.getPtrFn"
+  resolve := fun _ defId args =>
+    match AnnealIntrinsic.ofDefId? defId with
+    | some _ => pure { kind := .Intrinsic defId, args := args }
+    | none => annealUnsupportedLeaf "call.resolve of a non-intrinsic item"
+  fnAbiOfFnPtr := fun _ _ _ => annealUnsupportedLeaf "call.fnAbiOfFnPtr"
+  fnAbiOfInstance := fun _ _ _ => pure ()
+  requiresCallerLocation := fun _ => pure false
+  callerLocation := annealUnsupportedLeaf "call.callerLocation"
+  abiCanUnwind := fun _ => false
+  abiVariadic := fun _ => false
+  abiFixedCount := fun _ => 0
+  abiArgs := fun _ => #[]
+  abiReturn := fun _ => ()
+  sameConvention := fun _ _ => true
+  isRustCall := fun _ => false
+  rustAbi := ()
+  argLayout := fun _ => translateTy { kind := .tuple .nil, layoutIdx := 0 }
+  argIsIgnore := fun _ => false
+  isOneZst := fun _ => false
+  checkArgumentCompat := fun _ _ _ => pure true
+  checkTargetFeatures := fun _ _ => pure ()
+  tupleFields := fun _ => annealUnsupportedLeaf "call.tupleFields"
+  projectFnArg := fun _ _ _ => annealUnsupportedLeaf "call.projectFnArg"
+  localLayout := fun _ _ => annealUnsupportedLeaf "call.localLayout"
+  localSpan := fun _ _ => annealUnsupportedLeaf "call.localSpan"
+  storageLiveDyn := fun _ _ _ => annealUnsupportedLeaf "call.storageLiveDyn"
+  copyAllowTransmute := fun _ _ _ => annealUnsupportedLeaf "call.copyAllowTransmute"
+  protectArgument := fun _ _ => annealUnsupportedLeaf "call.protectArgument"
+  withRetagMode := fun _ _ action => action
+  nonCapturingClosure := fun _ _ _ => pure false
+  allocateStack := fun _ _ => annealUnsupportedLeaf "call.allocateStack"
+  copyToMemory := fun _ _ _ => annealUnsupportedLeaf "call.copyToMemory"
+  vaListPtr := fun _ _ => annealUnsupportedLeaf "call.vaListPtr"
+  writeZeroBytes := fun _ _ _ => annealUnsupportedLeaf "call.writeZeroBytes"
+  vaListKeyField := fun _ _ => annealUnsupportedLeaf "call.vaListKeyField"
+  writePointerToMemory := fun _ _ _ => annealUnsupportedLeaf "call.writePointerToMemory"
+  pushRaw := fun _ _ _ _ _ => annealUnsupportedLeaf "call.pushRaw"
+  pushDone := fun _ => annealUnsupportedLeaf "call.pushDone"
+  popRaw := fun _ => annealUnsupportedLeaf "call.popRaw"
+  cleanup := fun _ _ _ => annealUnsupportedLeaf "call.cleanup"
+  afterFrameInit := fun _ => annealUnsupportedLeaf "call.afterFrameInit"
+  callExtra := fun _ _ _ _ _ _ _ => annealUnsupportedLeaf "call.callExtra"
+  callIntrinsic := fun _ inst args dest target _ =>
+    annealCallIntrinsic localDecls layouts inst args dest target
+  callLlvmIntrinsic := fun _ _ _ _ _ => annealUnsupportedLeaf "call.callLlvmIntrinsic"
+  findMirOrEvalFn := fun _ _ _ _ _ _ _ =>
+    annealUnsupportedLeaf "call.findMirOrEvalFn (MIR bodies, including intrinsic fallback bodies)"
+  resolveVirtual := fun _ _ _ _ _ _ => annealUnsupportedLeaf "call.resolveVirtual"
+  isDynamic := fun _ => annealUnsupportedLeaf "call.isDynamic"
+  unpackDynForDrop := fun _ _ => annealUnsupportedLeaf "call.unpackDynForDrop"
+  resolveDropGlue := fun _ _ => annealUnsupportedLeaf "call.resolveDropGlue"
+  mplaceToMutRef := fun _ _ => annealUnsupportedLeaf "call.mplaceToMutRef"
+  fakeUnitReturn := fun _ => annealUnsupportedLeaf "call.fakeUnitReturn"
+
+/-- Dispatch budget of `Call.evalCallTerminator` for Anneal's machine: one step
+for the intrinsic itself and one for a MIR fallback, which `findMirOrEvalFn`
+then rejects. -/
+def annealCallBudget : Nat := 2
+
 /-- `ControlHooks` instantiated for Anneal's single-threaded machine. -/
 def annealControlHooks :
     Miri.Interpreter.ControlHooks
@@ -2842,7 +3544,11 @@ def annealTerminatorHooks (localDecls : List LocalDecl := .nil)
         | .ok b => return b
         | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err))
       state
-  call := fun _ _ state => (state, .error (.unsupported "call terminator"))
+  call := fun choice term state =>
+    Miri.Interpreter.Call.run
+      (Miri.Interpreter.Call.evalCallTerminator (annealCallHooks localDecls layouts) choice
+        annealCallBudget term)
+      state
   tailCall := fun _ _ state => (state, .error (.unsupported "tailCall terminator"))
   drop := fun _ _ _ _ state => (state, .error (.unsupported "drop terminator"))
   ignoreOptionalOverflowChecks := fun _ => false
@@ -2958,7 +3664,11 @@ def annealStepHooks (localDecls : List LocalDecl := .nil)
     annealRunFrameStorage
       (fun frame mem => frame.storageDead mem (annealLocalStorageHooks localDecls layouts) localId)
       state
-  intrinsic := fun _ _ state => (state, .error (.unsupported "intrinsic"))
+  intrinsic := fun choice intrinsic state =>
+    Miri.Interpreter.runRvalue
+      (Miri.Interpreter.Intrinsics.evalNondiverging (annealIntrinsicHooks localDecls layouts)
+        choice intrinsic)
+      state
   incrementConstEvalCounter := fun _ state => (state, .ok ())
   returnFromCurrentFrame := fun choice unwinding state =>
     Miri.Interpreter.ControlFlow.returnFromCurrentFrame annealControlHooks choice unwinding state
