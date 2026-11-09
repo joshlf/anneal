@@ -503,60 +503,6 @@ private theorem fastSliceSum_header_switch_raw
             fastSliceSumMkState elems n 3 i (some (.scalar sc)) o6) := by
   cases o5 <;> rfl
 
-private theorem tyProjTouchesUnion_emptyLayoutTable
-    (localDecls : List LocalDecl) :
-    ∀ (proj : List ProjectionElem) (baseTy : Ty),
-      tyProjTouchesUnion localDecls emptyLayoutTable baseTy proj = false
-  | [], _ => rfl
-  | .deref :: _, _ => rfl
-  | .field _ _ :: rest, baseTy => by
-    dsimp only [tyProjTouchesUnion]
-    have hU :
-        isUnionLayout emptyLayoutTable
-          (resolveTyWithLocalDecls localDecls emptyLayoutTable baseTy) = false := by
-      unfold isUnionLayout
-      cases (resolveTyWithLocalDecls localDecls emptyLayoutTable baseTy).kind <;> rfl
-    rw [hU]
-    exact tyProjTouchesUnion_emptyLayoutTable localDecls rest _
-  | .opaqueCast _ :: rest, _ =>
-    tyProjTouchesUnion_emptyLayoutTable localDecls rest _
-  | .unwrapUnsafeBinder _ :: rest, _ =>
-    tyProjTouchesUnion_emptyLayoutTable localDecls rest _
-  | .index _ :: rest, baseTy => by
-    dsimp only [tyProjTouchesUnion]
-    cases elemTyOf (resolveTyWithLocalDecls localDecls emptyLayoutTable baseTy) with
-    | none => rfl
-    | some _ => exact tyProjTouchesUnion_emptyLayoutTable localDecls rest _
-  | .constantIndex _ _ _ :: rest, baseTy => by
-    dsimp only [tyProjTouchesUnion]
-    cases elemTyOf (resolveTyWithLocalDecls localDecls emptyLayoutTable baseTy) with
-    | none => rfl
-    | some _ => exact tyProjTouchesUnion_emptyLayoutTable localDecls rest _
-  | .subslice _ _ _ :: rest, _ =>
-    tyProjTouchesUnion_emptyLayoutTable localDecls rest _
-  | .downcast _ _ :: rest, _ =>
-    tyProjTouchesUnion_emptyLayoutTable localDecls rest _
-
-private theorem placeTouchesUnion_emptyLayoutTable
-    (localDecls : List LocalDecl) (p : Place) :
-    placeTouchesUnion localDecls emptyLayoutTable p = false := by
-  rcases p with ⟨loc, proj⟩
-  cases proj with
-  | nil => rfl
-  | cons hd tl =>
-    cases hd with
-    | deref => rfl
-    | field _ _ | opaqueCast _ | unwrapUnsafeBinder _ | index _
-    | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ =>
-      dsimp only [placeTouchesUnion]
-      cases localDecls with
-      | nil => rfl
-      | cons d ds =>
-        cases get? (d :: ds) loc with
-        | none => rfl
-        | some decl =>
-          exact tyProjTouchesUnion_emptyLayoutTable (d :: ds) (_ :: tl) decl.ty
-
 private theorem fastSliceSum_h_body
     (elems : List Nat) (n i : Nat) (temps : Option (Value × Value))
     (h_i_lt_len : i < elems.length)
@@ -570,7 +516,7 @@ private theorem fastSliceSum_h_body
     (dsimp only [fastSliceSumMkState, fastSliceSumBody, encodeU32Slice, Option.map]
      rw [runMirTauToBlock_succ]
      dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy, tyIsSigned, optSlot, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]
-     rw [placeTouchesUnion_emptyLayoutTable, get?_map_u32 h_i_lt_len]
+     rw [get?_map_u32 h_i_lt_len]
      dsimp only [MirStepNode.step, advanceStmt, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]
      rw [runMirTauToBlock_succ]
      dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, evalPlaceWrite, operandIsSigned, operandTy, placeTy, tyIsSigned, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]
@@ -735,14 +681,14 @@ private theorem safeSliceSum_h_body
      dsimp only [MirStepNode.step, advanceStmt, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]
      (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, evalPlaceWrite, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
      (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, readProjectedValue_index, evalPlaceWrite, operandIsSigned, operandTy, placeTy, tyIsSigned, optSlot, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
-     rw [placeTouchesUnion_emptyLayoutTable, get?_map_u32 h_i_lt_len]
+     rw [get?_map_u32 h_i_lt_len]
      dsimp only [MirStepNode.step, advanceStmt, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]
      (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, evalPlaceWrite, operandIsSigned, operandTy, placeTy, tyIsSigned, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
      rw [evalScalarBinOp_addWithOverflow_u32 h_add_u32]
      dsimp only [MirStepNode.step, advanceStmt, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]
-     (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]; rw [placeTouchesUnion_emptyLayoutTable]; dsimp only [MirStepNode.step, advanceStmt, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
+     (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
      (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
-     (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, readProjectedValue, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows]; rw [placeTouchesUnion_emptyLayoutTable]; dsimp only [MirStepNode.step, advanceStmt, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
+     (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, readProjectedValue, evalPlaceWrite, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
      (rw [runMirTauToBlock_succ]; dsimp only [stepMirFn, stepMirState, MirStepNode.step, evalStmt, advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue, evalPlaceWrite, operandIsSigned, operandTy, placeTy, tyIsSigned, Option.getD, GetElem?.getElem?, List.instGetElem?NatLtLength, List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq, instDecidableEqNat, Nat.ble, Nat.beq, Bool.decEq, instDecidableEqBool, Bool.and, Bool.or, List.length, List.set, BEq.beq, instBEqOfDecidableEq, get?, set?, length, emptyMemory, invalidateConflictingBorrows])
      rw [evalScalarBinOp_add_usize h_add_usize]
      rfl)

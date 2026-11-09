@@ -6039,9 +6039,12 @@ def placeTouchesUnion
     match localDecls with
     | .nil => false
     | _ :: _ =>
-      match get? localDecls p.local_ with
-      | .some decl => tyProjTouchesUnion localDecls layouts decl.ty (projHead :: projTail)
-      | .none => false
+      match layouts.entries with
+      | .nil => false
+      | _ :: _ =>
+        match get? localDecls p.local_ with
+        | .some decl => tyProjTouchesUnion localDecls layouts decl.ty (projHead :: projTail)
+        | .none => false
 
 /--
 Structural equality on `AbstractByte` provenance pairs `Option (Nat × Nat)`.
@@ -6288,11 +6291,28 @@ def splitUnionTypedAndOverlay :
     | .none => .none
 
 /--
+`true` when `entries` contains a non-zero-sized multi-variant enum layout whose
+variant `0` has `0` fields (so `.aggregate 0 .nil` in a union with
+`fieldLayouts = .nil` may represent a non-ZST enum variant `E::A` rather than a
+zero-sized `()`/`ZST`).
+-/
+def layoutEntriesHaveNonZstFieldlessEnum0 : List TypeLayout → Bool
+  | .nil => false
+  | l :: rest =>
+    let isNonZstEnum0 : Bool :=
+      match Nat.ble 1 l.size.bytes, l.variants with
+      | true, .multiple _ _ (.arbitrary .nil _ :: _) => true
+      | _, _ => false
+    match isNonZstEnum0 with
+    | true => true
+    | false => layoutEntriesHaveNonZstFieldlessEnum0 rest
+
+/--
 Count the typed union slots among the first `count` entries of a union field
 list whose value occupies storage: `.unit` placeholders are empty, and a
-field-less `.aggregate 0 .nil` is empty only when its field layout (from
-`fieldLayouts`) is zero-sized or unknown. A field-less enum variant such as
-`E::A` is also `.aggregate 0 .nil` but still stores its tag bytes.
+field-less `.aggregate 0 .nil` is empty when its field layout (from
+`fieldLayouts`) is zero-sized, or when `fieldLayouts` is absent and `layouts`
+contains no non-ZST enum with a field-less variant `0`.
 -/
 def unionNonUnitNonZstTypedSlotCount (layouts : LayoutTable) :
     Nat → List Nat → List Value → Nat
@@ -6464,6 +6484,24 @@ def mergeUnionTypedSlotsAux
                 bufMask'
 
 /--
+Count the non-`.unit` values among the first `count` typed slots of a union
+field list.
+-/
+def unionNonUnitTypedSlotCount : Nat → List Value → Nat
+  | .zero, _ => 0
+  | _, .nil => 0
+  | .succ k, .unit :: rest => unionNonUnitTypedSlotCount k rest
+  | .succ k, _ :: rest => .succ (unionNonUnitTypedSlotCount k rest)
+
+/--
+`true` when `vals` contains a field-less aggregate `.aggregate _ .nil`.
+-/
+def valueListHasEmptyAggregate : List Value → Bool
+  | .nil => false
+  | .aggregate _ .nil :: _ => true
+  | _ :: rest => valueListHasEmptyAggregate rest
+
+/--
 Encode a `count`-slot union field list `fieldVals` of byte size `unionSize`:
 starts from the trailing raw-byte overlay image (if any, else all `.uninit`)
 and merges every non-`.unit` typed slot image into it, failing (`.none`) when
@@ -6510,16 +6548,6 @@ def encodeUnionSlotsIntoBufAux
           typedVals
           rawImage
           (replicateBool unionSize true)
-
-/--
-Count the non-`.unit` values among the first `count` typed slots of a union
-field list.
--/
-def unionNonUnitTypedSlotCount : Nat → List Value → Nat
-  | .zero, _ => 0
-  | _, .nil => 0
-  | .succ k, .unit :: rest => unionNonUnitTypedSlotCount k rest
-  | .succ k, _ :: rest => .succ (unionNonUnitTypedSlotCount k rest)
 
 /--
 `true` when a `count`-slot union field list may hold mutually inconsistent
@@ -7500,8 +7528,24 @@ def readProjectedValueUnionAware
           | false => true
           | true =>
             match encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields) with
-            | .some _ => true
             | .none => false
+            | .some unionBytes =>
+              match l.fieldLayouts, get? fields idx with
+              | .nil, .some (.aggregate varIdx aggFs) =>
+                match encodeTypedValueToBytes layouts rFieldTy (.aggregate varIdx aggFs) with
+                | .none => false
+                | .some fBytes =>
+                  let fMask := layoutValueMaskAux 8 layouts rFieldTy.layoutIdx
+                  match
+                    mergeMaskedAbstractBytes
+                      unionBytes
+                      (replicateBool (length unionBytes) true)
+                      fBytes
+                      fMask
+                  with
+                  | .some _ => true
+                  | .none => false
+              | _, _ => true
         match unionImageOk, directFvOpt with
         | false, _ => .unsupported
         | true, .some fv =>
@@ -7721,7 +7765,10 @@ def rebuildUnionFieldsAfterWriteAux
       | true => newFieldVal
       | false =>
         match flIdxOpt, oldFvOpt with
-        | .none, .some (.aggregate 0 .nil) => .aggregate 0 .nil
+        | .none, .some (.aggregate 0 .nil) =>
+          match layoutEntriesHaveNonZstFieldlessEnum0 layouts.entries with
+          | true => .unit
+          | false => .aggregate 0 .nil
         | .some sibFlIdx, .some (.aggregate 0 .nil) =>
           match LayoutTable.lookup layouts sibFlIdx with
           | .some sibL =>
@@ -7809,7 +7856,23 @@ def writeProjectedValueUnionAware
           encodeByLayoutIdxAux 8 layouts rBase.layoutIdx (.aggregate 0 fields)
         let baseConsistent : Bool :=
           match baseBytesOpt with
-          | .some _ => true
+          | .some unionBytes =>
+            match unionNeedsConsistencyCheck count fields, l.fieldLayouts, get? fields idx with
+            | true, .nil, .some (.aggregate varIdx aggFs) =>
+              match encodeTypedValueToBytes layouts rFieldTy (.aggregate varIdx aggFs) with
+              | .none => false
+              | .some fBytes =>
+                let fMask := layoutValueMaskAux 8 layouts rFieldTy.layoutIdx
+                match
+                  mergeMaskedAbstractBytes
+                    unionBytes
+                    (replicateBool (length unionBytes) true)
+                    fBytes
+                    fMask
+                with
+                | .some _ => true
+                | .none => false
+            | _, _, _ => true
           | .none => Bool.not (unionNeedsConsistencyCheck count fields)
         let baseBytes :=
           match baseBytesOpt with
@@ -8372,9 +8435,21 @@ def inferCallerTargetDecls
     (effPointeeTyOpt : Option Ty) :
     List LocalDecl :=
   let placeholderTy : Ty :=
-    { kind := .tuple .nil, layoutIdx := unresolvedLayoutIdx layouts }
+    { kind := .adt "" .nil, layoutIdx := unresolvedLayoutIdx layouts }
+  let projEndsAtUnion : List ProjectionElem → Bool
+    | .nil => false
+    | pHead :: pTail =>
+      match resolveProjectedTyResolved localDecls layouts placeholderTy (pHead :: pTail) with
+      | .some leafTy => isUnionLayout layouts leafTy
+      | .none => false
   let annotatedRootOpt : Option Ty :=
-    match tyProjTouchesUnion localDecls layouts placeholderTy rawFullProj with
+    match
+      Bool.or
+        (tyProjTouchesUnion localDecls layouts placeholderTy rawFullProj)
+        (Bool.or
+          (projEndsAtUnion rawFullProj)
+          (projEndsAtUnion entry.targetProjection))
+    with
     | true => .some placeholderTy
     | false => .none
   let rootTyOpt : Option Ty :=
@@ -15182,10 +15257,25 @@ def resolveRefDerefTargetCore?
     (isSyntheticFieldOnScalarPointee : Bool := false)
     (localDecls : List LocalDecl := targetDecls) :
     Option (Option (List ProjectionElem × Nat)) :=
-  let codecDecls : List LocalDecl :=
+  let rawFull :=
+    match parentEntry.targetProjection with
+    | .nil => resolvedRest
+    | ph :: pt => ph :: appendProjections pt resolvedRest
+  let effTargetDecls : List LocalDecl :=
     match targetDecls with
-    | .nil => localDecls
     | _ :: _ => targetDecls
+    | .nil =>
+      inferCallerTargetDecls
+        localDecls
+        layouts
+        parentEntry
+        rawFull
+        parentPtr.offsetBytes
+        effPointeeTyOpt
+  let codecDecls : List LocalDecl :=
+    match effTargetDecls with
+    | .nil => localDecls
+    | _ :: _ => effTargetDecls
   let resolvedAccTyOpt : Option Ty :=
     match accessedTyOpt with
     | .some accTy => .some (resolveTyWithLocalDecls codecDecls layouts accTy)
@@ -15204,10 +15294,6 @@ def resolveRefDerefTargetCore?
     match resolvedRest with
     | .nil => accBytesOpt
     | _ :: _ => .none
-  let rawFull :=
-    match parentEntry.targetProjection with
-    | .nil => resolvedRest
-    | ph :: pt => ph :: appendProjections pt resolvedRest
   let resolvedFullProjOpt : Option (List ProjectionElem × Nat) :=
     match isSyntheticFieldOnScalarPointee, parentEntry.targetProjection with
     | true, .nil => .some (rawFull, 0)
@@ -15219,7 +15305,7 @@ def resolveRefDerefTargetCore?
           parentEntry
           parentPtr
           resolvedRest
-          targetDecls
+          effTargetDecls
           layouts
           effPointeeTyOpt
           reqBytesOpt
@@ -15248,7 +15334,7 @@ def resolveRefDerefTargetCore?
           | .ok (.aggregate aggVar aggFields) =>
             let rawSubTyOpt :=
               placeTyResolved
-                targetDecls
+                effTargetDecls
                 layouts
                 { local_ := parentEntry.targetLocal, projection := rawFull }
             match
@@ -15282,7 +15368,7 @@ def resolveRefDerefTargetCore?
     | .ok targetSubVal =>
       let subTyOpt : Option Ty :=
         placeTyResolved
-          targetDecls
+          effTargetDecls
           layouts
           { local_ := parentEntry.targetLocal, projection := fullProj }
       let widthOk : Bool :=
@@ -15426,6 +15512,21 @@ def resolveRefDerefTarget?
     (isSyntheticFieldOnScalarPointee : Bool := false)
     (localDecls : List LocalDecl := targetDecls) :
     Option (Option (List ProjectionElem × Nat)) :=
+  let rawFull :=
+    match parentEntry.targetProjection with
+    | .nil => resolvedRest
+    | ph :: pt => ph :: appendProjections pt resolvedRest
+  let effTargetDecls : List LocalDecl :=
+    match targetDecls with
+    | _ :: _ => targetDecls
+    | .nil =>
+      inferCallerTargetDecls
+        localDecls
+        layouts
+        parentEntry
+        rawFull
+        parentPtr.offsetBytes
+        effPointeeTyOpt
   let alignTyOpt : Option Ty :=
     match effPointeeTyOpt, resolvedRest with
     | .some pt, _ => .some pt
@@ -15433,7 +15534,7 @@ def resolveRefDerefTarget?
     | .none, _ :: _ => .none
   match
     checkTargetPlaceAlign
-      targetDecls
+      effTargetDecls
       layouts
       alignTyOpt
       parentEntry
@@ -15449,7 +15550,7 @@ def resolveRefDerefTarget?
         parentEntry
         parentPtr
         resolvedRest
-        targetDecls
+        effTargetDecls
         layouts
         effPointeeTyOpt
         accessedTyOpt
@@ -15466,7 +15567,7 @@ def resolveRefDerefTarget?
           Bool.and
             (checkDerefAlign localDecls layouts accessedTyOpt residualOffset)
             (checkTargetPlaceAlign
-              targetDecls
+              effTargetDecls
               layouts
               accessedTyOpt
               { parentEntry with targetProjection := fullProj }
@@ -15493,14 +15594,25 @@ def resolveRawPtrDerefTarget?
     (isSyntheticFieldOnScalarPointee : Bool)
     (localDecls : List LocalDecl := targetDecls) :
     Option (List ProjectionElem × Nat) :=
-  let codecDecls : List LocalDecl :=
-    match targetDecls with
-    | .nil => localDecls
-    | _ :: _ => targetDecls
   let rawFull :=
     match parentEntry.targetProjection with
     | .nil => resolvedRest
     | ph :: pt => ph :: appendProjections pt resolvedRest
+  let effTargetDecls : List LocalDecl :=
+    match targetDecls with
+    | _ :: _ => targetDecls
+    | .nil =>
+      inferCallerTargetDecls
+        localDecls
+        layouts
+        parentEntry
+        rawFull
+        parentPtr.offsetBytes
+        effPointeeTyOpt
+  let codecDecls : List LocalDecl :=
+    match effTargetDecls with
+    | .nil => localDecls
+    | _ :: _ => effTargetDecls
   let reqBytesOpt : Option Nat :=
     match resolvedRest, accessedTyOpt with
     | .nil, .some accTy =>
@@ -15521,7 +15633,7 @@ def resolveRawPtrDerefTarget?
         parentEntry
         parentPtr
         resolvedRest
-        targetDecls
+        effTargetDecls
         layouts
         effPointeeTyOpt
         reqBytesOpt
@@ -15562,7 +15674,7 @@ def resolveRawPtrDerefTarget?
       | .some accTy, .ok (.aggregate aggVar aggFields) =>
         let rawSubTyOpt :=
           placeTyResolved
-            targetDecls
+            effTargetDecls
             layouts
             { local_ := parentEntry.targetLocal, projection := rawFull }
         let resolvedAccTy := resolveTyWithLocalDecls codecDecls layouts accTy
@@ -17524,15 +17636,87 @@ def attachUnionActiveFieldOverlayIfNeeded
   | _, _ => typedFields
 
 /--
-Evaluate `Rvalue.aggregate (.adt defPath variantIdx activeField) ops`:
-- When `activeField = .none` (struct or enum variant construction), preserves
-  `.ok (.aggregate variantIdx vals) locals' mem`.
-- When `activeField = .some fIdx` (union construction `MyUnion { field_fIdx: v }`),
-  validates `variantIdx == 0`, active-field operand validity, and union layout
-  bounds (`findAdtUnionInfo`), placing the active field value `v` at index `fIdx`
-  and padding all inactive sibling indices (`< fIdx` and `> fIdx` up to the
-  union's field count) with `Value.unit`.
+Construct the union `Value` for `evalAggregateAdt` when `activeField = .some fIdx`
+(returning `.none` on UB: non-zero `variantIdx`, empty or out-of-bounds operand
+list, invalid active-field operand, or invalid union field index).
 -/
+def evalAggregateAdtUnionValue?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (defPath : DefPath)
+    (variantIdx : VariantIdx)
+    (fIdx : FieldIdx)
+    (ops : List Operand)
+    (vals : List Value) :
+    Option Value :=
+  match Nat.beq variantIdx 0 with
+  | false => .none
+  | true =>
+    match vals with
+    | .nil => .none
+    | v :: .nil =>
+      let opTyOpt : Option Ty :=
+        match ops with
+        | op :: .nil => operandTy localDecls layouts op
+        | _ => .none
+      match validateValueForTy? layouts opTyOpt v with
+      | false => .none
+      | true =>
+        match findAdtUnionInfo localDecls layouts defPath fIdx (.some v) opTyOpt with
+        | .some .none => .none
+        | .some (.some (count, unionLayout)) =>
+          let prefixUnits := replicateValue fIdx .unit
+          let suffixUnits := replicateValue (Nat.sub count (.succ fIdx)) .unit
+          let typedFields := appendValueList prefixUnits (v :: suffixUnits)
+          let fields :=
+            attachUnionActiveFieldOverlayIfNeeded
+              localDecls
+              layouts
+              unionLayout
+              typedFields
+              v
+              opTyOpt
+          .some (.aggregate 0 fields)
+        | .none =>
+          let fields := appendValueList (replicateValue fIdx .unit) (v :: .nil)
+          .some (.aggregate 0 fields)
+    | v₀ :: v₁ :: vRest =>
+      let fullVals := v₀ :: v₁ :: vRest
+      let nVals := length fullVals
+      match get? fullVals fIdx with
+      | .none => .none
+      | .some activeVal =>
+        let activeOpTyOpt : Option Ty :=
+          match get? ops fIdx with
+          | .some activeOp => operandTy localDecls layouts activeOp
+          | .none => .none
+        match validateValueForTy? layouts activeOpTyOpt activeVal with
+        | false => .none
+        | true =>
+          match findAdtUnionInfo localDecls layouts defPath fIdx (.some activeVal) activeOpTyOpt with
+          | .some .none => .none
+          | .some (.some (count, unionLayout)) =>
+            match Nat.ble nVals count with
+            | false => .none
+            | true =>
+              let prefixUnits := replicateValue fIdx .unit
+              let suffixUnits := replicateValue (Nat.sub count (.succ fIdx)) .unit
+              let typedFields := appendValueList prefixUnits (activeVal :: suffixUnits)
+              let fields :=
+                attachUnionActiveFieldOverlayIfNeeded
+                  localDecls
+                  layouts
+                  unionLayout
+                  typedFields
+                  activeVal
+                  activeOpTyOpt
+              .some (.aggregate 0 fields)
+          | .none =>
+            let prefixUnits := replicateValue fIdx .unit
+            let suffixUnits := replicateValue (Nat.sub nVals (.succ fIdx)) .unit
+            let fields := appendValueList prefixUnits (activeVal :: suffixUnits)
+            .some (.aggregate 0 fields)
+
 @[reducible]
 def evalAggregateAdt
     (locals : List LocalSlot)
@@ -17551,73 +17735,9 @@ def evalAggregateAdt
     match activeField with
     | .none => .ok (.aggregate variantIdx vals) locals' mem
     | .some fIdx =>
-      match Nat.beq variantIdx 0 with
-      | false => .ub
-      | true =>
-        match vals with
-        | .nil => .ub
-        | v :: .nil =>
-          let opTyOpt : Option Ty :=
-            match ops with
-            | op :: .nil => operandTy localDecls layouts op
-            | _ => .none
-          match validateValueForTy? layouts opTyOpt v with
-          | false => .ub
-          | true =>
-            match findAdtUnionInfo localDecls layouts defPath fIdx (.some v) opTyOpt with
-            | .some .none => .ub
-            | .some (.some (count, unionLayout)) =>
-              let prefixUnits := replicateValue fIdx .unit
-              let suffixUnits := replicateValue (Nat.sub count (.succ fIdx)) .unit
-              let typedFields := appendValueList prefixUnits (v :: suffixUnits)
-              let fields :=
-                attachUnionActiveFieldOverlayIfNeeded
-                  localDecls
-                  layouts
-                  unionLayout
-                  typedFields
-                  v
-                  opTyOpt
-              .ok (.aggregate 0 fields) locals' mem
-            | .none =>
-              let fields := appendValueList (replicateValue fIdx .unit) (v :: .nil)
-              .ok (.aggregate 0 fields) locals' mem
-        | v₀ :: v₁ :: vRest =>
-          let fullVals := v₀ :: v₁ :: vRest
-          let nVals := length fullVals
-          match get? fullVals fIdx with
-          | .none => .ub
-          | .some activeVal =>
-            let activeOpTyOpt : Option Ty :=
-              match get? ops fIdx with
-              | .some activeOp => operandTy localDecls layouts activeOp
-              | .none => .none
-            match validateValueForTy? layouts activeOpTyOpt activeVal with
-            | false => .ub
-            | true =>
-              match findAdtUnionInfo localDecls layouts defPath fIdx (.some activeVal) activeOpTyOpt with
-              | .some .none => .ub
-              | .some (.some (count, unionLayout)) =>
-                match Nat.ble nVals count with
-                | false => .ub
-                | true =>
-                  let prefixUnits := replicateValue fIdx .unit
-                  let suffixUnits := replicateValue (Nat.sub count (.succ fIdx)) .unit
-                  let typedFields := appendValueList prefixUnits (activeVal :: suffixUnits)
-                  let fields :=
-                    attachUnionActiveFieldOverlayIfNeeded
-                      localDecls
-                      layouts
-                      unionLayout
-                      typedFields
-                      activeVal
-                      activeOpTyOpt
-                  .ok (.aggregate 0 fields) locals' mem
-              | .none =>
-                let prefixUnits := replicateValue fIdx .unit
-                let suffixUnits := replicateValue (Nat.sub nVals (.succ fIdx)) .unit
-                let fields := appendValueList prefixUnits (activeVal :: suffixUnits)
-                .ok (.aggregate 0 fields) locals' mem
+      match evalAggregateAdtUnionValue? localDecls layouts defPath variantIdx fIdx ops vals with
+      | .some v => .ok v locals' mem
+      | .none => .ub
 
 /--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
