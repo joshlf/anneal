@@ -6,16 +6,16 @@
 
 """Unified Anneal dual differential-testing campaign orchestrator.
 
-Shared entrypoint for Option A (dedicated Capsule + `/x20/` RPC sync) and
-Option B (Kokoro V2 / GCB).
+Shared entrypoint for Option A (dedicated Agent Host + `/remote/` RPC sync) and
+Option B (CI Batch / GCB).
 
 Responsibilities:
 1. Pull persistent differential-testing state (`campaign_ledger.json`,
    `coverage_ratchet.json`, `quarantine.toml`, and existing `findings/`) from
-   shared `/x20/teams/anneal-agent/differential-testing/` using
-   `/usr/bin/fileutil --x20_force_client_creation_at_head` (never
-   `/google/data/rw/...` FUSE), or from a local `--state-dir` when running on
-   Kokoro V2 / local dev.
+   shared `/remote/teams/anneal-agent/differential-testing/` using
+   `/usr/bin/remote_sync --force_client_creation_at_head` (never
+   `/mnt/fuse/rw/...` FUSE), or from a local `--state-dir` when running on
+   CI Batch / local dev.
 2. Execute `miri-difftest` (`2.a` Anneal MIR Evaluator vs. `2.b` Miri Reference)
    and `itree-difftest` (`2.a` Anneal `mirStatefulTree` vs. `2.c` Native
    Instrumented Execution at `-O0` and `-O2`) under configurable campaign
@@ -36,7 +36,7 @@ Responsibilities:
 4. Deduplicate findings by `SHA-256(harness, diag_tag, block_idx, stmt_idx,
    mir_construct)` and filter known issues against `quarantine.toml`.
 5. Optionally emit Sponge/Test-Fusion-compatible JUnit XML (`--junit-xml`) for
-   zero-friction graduation from Option A to Option B (`ci/kokoro_diff_test.sh`).
+   zero-friction graduation from Option A to Option B (`ci/ci_diff_test.sh`).
 """
 
 from __future__ import annotations
@@ -58,9 +58,9 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 
-FILEUTIL_BIN = "/usr/bin/fileutil"
-FILEUTIL_X20_FLAG = "--x20_force_client_creation_at_head"
-DEFAULT_X20_DIFF_TEST_URI = "/x20/teams/anneal-agent/differential-testing"
+REMOTE_SYNC_BIN = "/usr/bin/remote-sync"
+REMOTE_SYNC_FLAG = "--force_client_creation_at_head"
+DEFAULT_REMOTE_DIFF_TEST_URI = "/remote/teams/anneal-agent/differential-testing"
 
 
 @dataclass(frozen=True)
@@ -190,25 +190,25 @@ def utc_date_prefix() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
-def has_x20_fileutil() -> bool:
-    return os.path.isfile(FILEUTIL_BIN) and os.access(FILEUTIL_BIN, os.X_OK)
+def has_remote_sync() -> bool:
+    return os.path.isfile(REMOTE_SYNC_BIN) and os.access(REMOTE_SYNC_BIN, os.X_OK)
 
 
-def run_fileutil(
+def run_remote_sync(
     args: list[str], check: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    cmd = [FILEUTIL_BIN, FILEUTIL_X20_FLAG, *args]
+    cmd = [REMOTE_SYNC_BIN, REMOTE_SYNC_FLAG, *args]
     return subprocess.run(cmd, text=True, capture_output=True, check=check)
 
 
-def sync_state_from_x20(x20_uri: str, local_state_dir: Path) -> None:
-    """Pulls mutable state files from `/x20/` via `fileutil` RPC."""
-    if not x20_uri or not has_x20_fileutil():
+def sync_state_from_remote(remote_uri: str, local_state_dir: Path) -> None:
+    """Pulls mutable state files from `/remote/` via `remote_sync` RPC."""
+    if not remote_uri or not has_remote_sync():
         return
-    if x20_uri.startswith("/google/data/rw/"):
+    if remote_uri.startswith("/mnt/fuse/rw/"):
         raise ValueError(
-            f"Refusing FUSE path `{x20_uri}`; always use `/x20/...` URIs with "
-            f"`{FILEUTIL_BIN} {FILEUTIL_X20_FLAG}`."
+            f"Refusing FUSE path `{remote_uri}`; always use `/remote/...` URIs with "
+            f"`{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
         )
     (local_state_dir / "state").mkdir(parents=True, exist_ok=True)
     (local_state_dir / "reports").mkdir(parents=True, exist_ok=True)
@@ -219,23 +219,23 @@ def sync_state_from_x20(x20_uri: str, local_state_dir: Path) -> None:
         "state/coverage_ratchet.json",
         "state/quarantine.toml",
     ]:
-        src = f"{x20_uri.rstrip('/')}/{rel}"
+        src = f"{remote_uri.rstrip('/')}/{rel}"
         dst = str(local_state_dir / rel)
-        run_fileutil(["cp", "-f", src, dst], check=False)
+        run_remote_sync(["cp", "-f", src, dst], check=False)
 
 
-def sync_state_to_x20(local_state_dir: Path, x20_uri: str) -> None:
-    """Uploads updated state, reports, and finding bundles to `/x20/`."""
-    if not x20_uri or not has_x20_fileutil():
+def sync_state_to_remote(local_state_dir: Path, remote_uri: str) -> None:
+    """Uploads updated state, reports, and finding bundles to `/remote/`."""
+    if not remote_uri or not has_remote_sync():
         return
-    if x20_uri.startswith("/google/data/rw/"):
+    if remote_uri.startswith("/mnt/fuse/rw/"):
         raise ValueError(
-            f"Refusing FUSE path `{x20_uri}`; always use `/x20/...` URIs with "
-            f"`{FILEUTIL_BIN} {FILEUTIL_X20_FLAG}`."
+            f"Refusing FUSE path `{remote_uri}`; always use `/remote/...` URIs with "
+            f"`{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
         )
-    base = x20_uri.rstrip("/")
+    base = remote_uri.rstrip("/")
     for subdir in ["state", "reports", "findings"]:
-        run_fileutil(["mkdir", "-p", f"{base}/{subdir}"], check=False)
+        run_remote_sync(["mkdir", "-p", f"{base}/{subdir}"], check=False)
 
     for rel in [
         "state/campaign_ledger.json",
@@ -244,7 +244,7 @@ def sync_state_to_x20(local_state_dir: Path, x20_uri: str) -> None:
     ]:
         local_file = local_state_dir / rel
         if local_file.is_file():
-            run_fileutil(
+            run_remote_sync(
                 ["cp", "-f", str(local_file), f"{base}/{rel}"], check=False
             )
 
@@ -252,7 +252,7 @@ def sync_state_to_x20(local_state_dir: Path, x20_uri: str) -> None:
     if reports_dir.is_dir():
         for rfile in sorted(reports_dir.glob("*")):
             if rfile.is_file():
-                run_fileutil(
+                run_remote_sync(
                     [
                         "cp",
                         "-f",
@@ -267,10 +267,10 @@ def sync_state_to_x20(local_state_dir: Path, x20_uri: str) -> None:
         for bundle_dir in sorted(findings_dir.iterdir()):
             if bundle_dir.is_dir():
                 remote_bundle = f"{base}/findings/{bundle_dir.name}"
-                run_fileutil(["mkdir", "-p", remote_bundle], check=False)
+                run_remote_sync(["mkdir", "-p", remote_bundle], check=False)
                 for bfile in sorted(bundle_dir.iterdir()):
                     if bfile.is_file():
-                        run_fileutil(
+                        run_remote_sync(
                             [
                                 "cp",
                                 "-f",
@@ -773,7 +773,7 @@ def write_junit_xml(
     findings: list[DualAudienceFinding],
     elapsed_sec: float,
 ) -> None:
-    """Writes a Sponge / Test-Fusion-compatible JUnit XML report (`sponge_log.xml`)."""
+    """Writes a Sponge / Test-Fusion-compatible JUnit XML report (`diff_test_report.xml`)."""
     junit_path.parent.mkdir(parents=True, exist_ok=True)
     unquarantined = [f for f in findings if not f.quarantined]
 
@@ -890,10 +890,10 @@ def parse_args() -> argparse.Namespace:
         help="Local staging directory for campaign state, reports, and finding bundles.",
     )
     parser.add_argument(
-        "--x20-uri",
+        "--remote-uri",
         type=str,
-        default=DEFAULT_X20_DIFF_TEST_URI,
-        help="Shared x20 URI for persistent campaign state (`/x20/teams/anneal-agent/differential-testing`); pass empty string to disable x20 sync.",
+        default=DEFAULT_REMOTE_DIFF_TEST_URI,
+        help="Shared remote URI for persistent campaign state (`/remote/teams/anneal-agent/differential-testing`); pass empty string to disable remote sync.",
     )
     parser.add_argument(
         "--miri-seed",
@@ -911,7 +911,7 @@ def parse_args() -> argparse.Namespace:
         "--junit-xml",
         type=Path,
         default=None,
-        help="Optional path to emit a Sponge / Test-Fusion JUnit XML report (`sponge_log.xml`).",
+        help="Optional path to emit a Sponge / Test-Fusion JUnit XML report (`diff_test_report.xml`).",
     )
     parser.add_argument(
         "--inject-synthetic-divergence",
@@ -948,9 +948,9 @@ def main() -> int:
     )
 
     try:
-        x20_uri = args.x20_uri.strip()
-        if x20_uri:
-            sync_state_from_x20(x20_uri, state_dir)
+        remote_uri = args.remote_uri.strip()
+        if remote_uri:
+            sync_state_from_remote(remote_uri, state_dir)
         ensure_default_state_files(state_dir)
 
         ledger_path = state_dir / "state" / "campaign_ledger.json"
@@ -1180,8 +1180,8 @@ def main() -> int:
                 elapsed_sec,
             )
 
-        if x20_uri:
-            sync_state_to_x20(state_dir, x20_uri)
+        if remote_uri:
+            sync_state_to_remote(state_dir, remote_uri)
 
         print(report_md)
         return 0
