@@ -20,15 +20,15 @@ and in-place Fuchsia `usercopy` verification) from a clean shell.
 ## 0. Clean-Shell Environment & Branch Check
 
 Integrated branches:
-- `sup/brief-0` (worktree `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-0`)
+- `sup/brief-0` (worktree `<path/to/anneal>`)
 - `adv/brief-0-integrated` (fast-forward alias at the same commit)
-- `sup/brief-4` (worktree `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-4`)
-- `fuchsia-wt-brief-4-3` (worktree `/usr/local/google/Projects/anneal-workspace/fuchsia-wt-brief-4-3`, `6c6d2dcd`)
+- `sup/brief-4` (worktree `<path/to/anneal>`)
+- `fuchsia-wt-brief-4-3` (worktree `<path/to/anneal>`, `6c6d2dcd`)
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
 export ELAN_TOOLCHAIN=leanprover/lean4:v4.34.1
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-0
+cd <path/to/anneal>
 git status --porcelain
 git rev-parse HEAD sup/brief-0 adv/brief-0-integrated sup/brief-4
 ```
@@ -39,7 +39,7 @@ Expected: empty `git status --porcelain`, and identical commit SHAs for `HEAD`,
 ## 1. Environment A — Anneal Trusted Boundary & Compiler Capture
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-0
+cd <path/to/anneal>
 (cd trusted/lean && anneal-lean-run --mode build --concurrency 2 -- lake build)
 anneal-lean-run --mode build --concurrency 2 -- python3 trusted/audit/check_trusted.py
 anneal-lean-run --mode build --concurrency 2 -- cargo test -p anneal-rustc-capture
@@ -55,7 +55,7 @@ Expected:
 ## 2. Environment B — Anneal Theory, Correspondence & Differential Harnesses
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-0
+cd <path/to/anneal>
 (cd theory && anneal-lean-run --mode build --concurrency 2 -- lake build)
 (cd examples && anneal-lean-run --mode build --concurrency 2 -- lake build Trusted Anneal Correspondence Smoke ToyYDiagram ToyMachine ToyCFG MirVerification)
 (cd examples && anneal-lean-run --mode file --concurrency 2 -- lake env lean -DwarningAsError=true ../tests/mir/SymbolicEvalTests.lean)
@@ -73,7 +73,7 @@ Expected:
 ## 3. Environment C — End-to-End Polymorphic & Cross-Crate / `core` Verification
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-0
+cd <path/to/anneal>
 anneal-lean-run --mode build --concurrency 2 -- cargo test -p cargo-anneal --lib -- driver::tests::multi_crate_transitive_callees_and_external_spec_override_end_to_end --exact --nocapture
 anneal-lean-run --mode build --concurrency 2 -- cargo test --test end_to_end_demo_journeys -p cargo-anneal
 ```
@@ -84,11 +84,11 @@ Expected:
 ## 4. Environment D — Fuchsia `usercopy` In-Place Verification Pilot
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-0
+cd <path/to/anneal>
 export PATH="$(pwd)/target/debug:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
 anneal-lean-run --mode build --concurrency 2 -- cargo build -p cargo-anneal -p anneal-rustc-capture
 anneal-lean-run --mode build --concurrency 2 -- cargo run --manifest-path Cargo.toml -p cargo-anneal -- \
-  agent-verify --manifest-path /usr/local/google/Projects/anneal-workspace/fuchsia-wt-brief-4-3/examples/fuchsia-usercopy/Cargo.toml
+  agent-verify --manifest-path <path/to/anneal>/examples/fuchsia-usercopy/Cargo.toml
 ```
 
 Expected:

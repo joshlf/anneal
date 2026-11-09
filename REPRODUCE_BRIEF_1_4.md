@@ -5,7 +5,7 @@ Slice Unsizing (`CastKind.pointerCoercion "Unsize"` `[T; N]` $\rightarrow$ `[T]`
 ## 1. Environment & Worktree Setup
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-4
+cd <path/to/anneal>
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
 git status --porcelain
 ```
@@ -15,7 +15,7 @@ git status --porcelain
 Verify `L3_PlacesAndBasicMem.lean` (including Theorems `L3.17`–`L3.29`) in both `V2026_06_01` and `V2026_08_01`:
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-4/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode file --concurrency 3 -- lake env lean ../theory/Correspondence/V2026_06_01/L3_PlacesAndBasicMem.lean
 anneal-lean-run --mode file --concurrency 3 -- lake env lean ../theory/Correspondence/V2026_08_01/L3_PlacesAndBasicMem.lean
 ```
@@ -25,7 +25,7 @@ anneal-lean-run --mode file --concurrency 3 -- lake env lean ../theory/Correspon
 Build `Trusted`, `Anneal`, `MiniRust`, `Correspondence`, `MirVerification`, and all `examples/` targets under `anneal-lean-run`:
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-4/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode build --concurrency 3 -- lake build Trusted Anneal MiniRust Correspondence MirVerification
 anneal-lean-run --mode build --concurrency 3 -- lake build
 ```
@@ -35,7 +35,7 @@ anneal-lean-run --mode build --concurrency 3 -- lake build
 Verify kernel dependency closure, statement-origin separation, Cargo DAG boundary, and zero `sorry`/`admit`/`axiom`:
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1-4
+cd <path/to/anneal>
 python3 trusted/audit/check_trusted.py --fast
 ./ci/check_todo.sh
 ```

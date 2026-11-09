@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook enforcing Anneal `.anneal/spec-lock.json` write boundaries in <5 ms.
 
-Compatible with both Jetski / Gemini CLI (`toolCall.args`) and Claude Code
+Compatible with both Antigravity / Gemini CLI (`toolCall.args`) and Claude Code
 (`tool_input`) PreToolUse hook payloads. Respects `mutable_subjects` recorded by
 `cargo anneal lock-specs --allow-impl-edit <item>` so locked implementation
 authoring can edit `src/**/*.rs` while `Specs/**`, `Assumptions/**`,
