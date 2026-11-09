@@ -8120,8 +8120,12 @@ theorem projPrefixBeforeDeref_eq_none_iff (proj : List ProjectionElem) :
    - Reading an uninitialized pointer local or uninitialized field of a `PartialShell` yields `.ub`.
    - Reading `.ok (.ptr p _)` checks that if the deref is a safe reference deref
      (`isSafeRefDeref = true`, i.e. `&T` or `&mut T` rather than `*const T` / `*mut T`),
-     the pointer is non-null (`p.offsetBytes != 0`); a null reference yields `.ub`
-     (`rvalue.rs:6505-6510`), whereas a raw pointer deref succeeds even if null.
+     the pointer is non-null; a null reference yields `.ub` (`rvalue.rs:6505-6510`),
+     whereas a raw pointer deref succeeds even if null. In Trusted's pointer model
+     the null pointer is the provenance-free address `0`
+     (`p.allocId = 0 ∧ p.offsetBytes = 0`, as in Trusted's `isNonNullEmptySlice`);
+     a reference to the first byte of an allocation (`p.allocId ≠ 0`,
+     `p.offsetBytes = 0`, e.g. `&_2` to a stack local) is not null.
    - Reading a non-pointer value before `.deref` yields `.ub`.
 4. If `place.projection` contains no `.deref`, returns `.ok ()` (allowing `PlaceMention`
    on uninitialized locals or partially-initialized `PartialShell` fields without UB). -/
@@ -8141,7 +8145,10 @@ def evalPlaceMentionStateE1
       | .some preProj =>
         match readPlaceState slots ⟨place.local_, preProj⟩ with
         | .ok (.ptr p _) =>
-          match Bool.and isSafeRefDeref (Nat.beq p.offsetBytes 0) with
+          match
+            Bool.and isSafeRefDeref
+              (Bool.and (Nat.beq p.allocId 0) (Nat.beq p.offsetBytes 0))
+          with
           | true => .ub
           | false => .ok ()
         | .ok _ => .ub
@@ -8266,6 +8273,71 @@ theorem evalPlaceMentionStateE1_projected_deref_and_null_ref (ty : Ty) :
     evalPlaceMentionStateE1 [.partialShell nullShell] 8 projDerefPlace true = .ub ∧
     evalPlaceMentionStateE1 [.partialShell nullShell] 8 projDerefPlace false = .ok () := by
   refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Regression (null-reference test): a reference to the first byte of a
+non-null allocation (`allocId = 5`, `offsetBytes = 0`, e.g. `&_2`) is not null, so
+`PlaceMention(*(_0.0))` through it is accepted even as a safe-reference deref,
+while the provenance-free address `0` (`allocId = 0`, `offsetBytes = 0`) is
+rejected. Testing `offsetBytes = 0` alone would reject every reference to the
+start of an allocation. -/
+example (ty : Ty) :
+    evalPlaceMentionStateE1
+        [.partialShell
+          { variantIdx := 0, isAdt := false, discriminantSet := false
+            fields := [.init (.ptr ⟨5, 0⟩ 8), .uninit] }]
+        8 ⟨0, [.field 0 ty, .deref]⟩ true = .ok () ∧
+    evalPlaceMentionStateE1
+        [.partialShell
+          { variantIdx := 0, isAdt := false, discriminantSet := false
+            fields := [.init (.ptr ⟨0, 0⟩ 8), .uninit] }]
+        8 ⟨0, [.field 0 ty, .deref]⟩ true = .ub := by
+  exact ⟨rfl, rfl⟩
+
+/-- Whether the pointer loaded by the first `.deref` of `place` is a safe
+reference (`&T` / `&mut T`) according to the local declarations
+(`placeTy` of the prefix before the first `.deref`), matching `ty.is_ref()` in
+Episode 1's `PlaceMention` (`rvalue.rs:6495-6497`). -/
+def placeDerefIsSafeRef
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) : Bool :=
+  match projPrefixBeforeDeref place.projection with
+  | .some preProj =>
+    match placeTy localDecls layouts ⟨place.local_, preProj⟩ with
+    | .some { kind := .ref _ _, .. } => true
+    | _ => false
+  | .none => false
+
+/-- Type-directed Episode 1 `PlaceMention`: `evalPlaceMentionStateE1` with the
+null-reference check enabled exactly when the dereferenced pointer is declared
+as a reference (`placeDerefIsSafeRef`), instead of a caller-supplied flag. -/
+def evalPlaceMentionStateTyped
+    (slots : List LocalSlotState)
+    (ptrBytes : Nat)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) : SlotWriteResult Unit :=
+  evalPlaceMentionStateE1 slots ptrBytes place (placeDerefIsSafeRef localDecls layouts place)
+
+/-- **Typed `PlaceMention` Refinement (`evalPlaceMentionStateTyped_flat_refines`)**:
+On every frame related by `SlotsRefine FlatSlotStateRefines`, a successful
+type-directed `PlaceMention` is matched by Trusted's `evalStmt` stepping with
+unchanged locals. -/
+theorem evalPlaceMentionStateTyped_flat_refines
+    (s : MachineState)
+    (slots : List LocalSlotState)
+    (ptrBytes : Nat)
+    (place : Place)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hRel : SlotsRefine FlatSlotStateRefines slots s.frame.locals)
+    (hOk : evalPlaceMentionStateTyped slots ptrBytes localDecls layouts place = .ok ()) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+      s ⟨.placeMention place, span⟩ localDecls layouts =
+      MirStepNode.step (advanceStmt s s.frame.locals) :=
+  evalPlaceMentionStateE1_flat_refines s slots ptrBytes place
+    (placeDerefIsSafeRef localDecls layouts place) span localDecls layouts hRel hOk
 
 /-- **General Flat-Frame `SetDiscriminant` Refinement (`evalSetDiscriminantState_general_flat_refines`)**:
 Lifts `evalSetDiscriminantState_trusted_correspondence` from `PromotedSlotRefines`
@@ -8402,6 +8474,194 @@ theorem evalSetDiscriminantState_general_flat_refines
                 (s.frame.locals.set loc (.init rootVal'))
                 span localDecls layouts).2 hNotDeref hGetT hRead hWrite hSetT
       | _ => nomatch hOk
+
+/-- Trusted's `setOrExtendFields` coincides with `List.set` on in-bounds indices. -/
+theorem setOrExtendFields_eq_set_of_lt
+    (tfs : List Value)
+    (i : Nat)
+    (v : Value)
+    (hLt : i < tfs.length) :
+    setOrExtendFields tfs i v = tfs.set i v := by
+  apply List.ext_getElem?
+  intro j
+  have hChar := get?_setOrExtendFields tfs i j v
+  simp only [get?_eq_getElem?] at hChar
+  rw [hChar]
+  by_cases hJI : j = i
+  · subst hJI
+    simp [List.getElem?_set_self hLt]
+  · rw [List.getElem?_set_ne (Ne.symm hJI)]
+    by_cases hJLen : j < tfs.length
+    · simp [hJI, hJLen]
+    · rw [List.getElem?_eq_none (by omega)]
+      have hJI' : ¬ j < i := fun h => hJLen (Nat.lt_trans h hLt)
+      simp [hJI, hJLen, hJI']
+
+/-- Inversion of `setDiscriminantProjectedValue` on a target that does not read as
+`()`: the target reads as an aggregate and the result is the aggregate with the
+new tag written back along the same path. -/
+theorem setDiscriminantProjectedValue_inv_of_not_unit
+    (locals : List LocalSlot)
+    (w w' : Value)
+    (rest : List ProjectionElem)
+    (variantIdx : VariantIdx)
+    (hNotUnit : evalValueProjRead locals w rest ≠ .ok .unit)
+    (hSet : setDiscriminantProjectedValue locals w rest variantIdx = .ok w') :
+    ∃ oldVar fields,
+      evalValueProjRead locals w rest = .ok (.aggregate oldVar fields) ∧
+      evalValueProjWrite locals w rest (.aggregate variantIdx fields) = .ok w' := by
+  cases rest with
+  | nil =>
+    unfold setDiscriminantProjectedValue at hSet
+    cases w with
+    | aggregate oldVar fields =>
+      injection hSet with hW
+      exact ⟨oldVar, fields, rfl, by rw [← hW]; rfl⟩
+    | unit => exact False.elim (hNotUnit rfl)
+    | scalar _ => nomatch hSet
+    | ptr _ _ => nomatch hSet
+  | cons p rest' =>
+    unfold setDiscriminantProjectedValue at hSet
+    dsimp only at hSet
+    cases hRead : evalValueProjRead locals w (p :: rest') with
+    | ub => rw [hRead] at hSet; nomatch hSet
+    | unsupported => rw [hRead] at hSet; nomatch hSet
+    | ok target =>
+      rw [hRead] at hSet
+      cases target with
+      | aggregate oldVar fields =>
+        exact ⟨oldVar, fields, rfl, hSet⟩
+      | unit => exact False.elim (hNotUnit hRead)
+      | scalar _ => nomatch hSet
+      | ptr _ _ => nomatch hSet
+
+/-- **`SetDiscriminant` Inside an Initialized Field of a Flat Partial Shell (`evalSetDiscriminantState_partialShell_field_flat_refines`)**:
+`evalSetDiscriminantState_general_flat_refines` covers `.init` roots only. This
+covers the D13b case `discriminant(_l.i.rest) = v` where `_l` is still an
+incomplete flat tuple shell, its field `i` holds an initialized value `w`, and the
+target inside `w` is not `()` (see `evalSetDiscriminantState_unit_vs_trusted_ub`).
+Whenever Anneal's `evalSetDiscriminantState` succeeds, Trusted's `evalStmt` on the
+`.unit`-padded aggregate steps, and the resulting frames are again related by
+`SlotsRefine FlatSlotStateRefines`. -/
+theorem evalSetDiscriminantState_partialShell_field_flat_refines
+    (s : MachineState)
+    (slots slots' : List LocalSlotState)
+    (loc : Local)
+    (shell : PartialAggregate)
+    (i : FieldIdx)
+    (fieldTy : Ty)
+    (rest : List ProjectionElem)
+    (variantIdx : VariantIdx)
+    (w : Value)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hRel : SlotsRefine FlatSlotStateRefines slots s.frame.locals)
+    (hSlot : get? slots loc = .some (.partialShell shell))
+    (hField : get? shell.fields i = .some (.init w))
+    (hNotUnit : evalValueProjRead s.frame.locals w rest ≠ .ok .unit)
+    (hOk :
+      evalSetDiscriminantState slots ⟨loc, .field i fieldTy :: rest⟩ variantIdx = .ok slots') :
+    ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.setDiscriminant ⟨loc, .field i fieldTy :: rest⟩ variantIdx, span⟩
+          localDecls layouts =
+        MirStepNode.step (advanceStmt s locals') ∧
+      SlotsRefine FlatSlotStateRefines slots' locals' := by
+  have hSame := sameScalarLocals_of_flatSlotStateRefines hRel
+  -- The Trusted counterpart of the partial shell is a padded aggregate.
+  rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+  · rw [hNoneS] at hSlot; nomatch hSlot
+  rw [hSlot] at hGetS
+  injection hGetS with hA
+  subst hA
+  cases t with
+  | dead => nomatch hAT
+  | uninit => nomatch hAT
+  | init tv =>
+  obtain ⟨hTuple, tfs, hTv, hShellRef⟩ := hAT
+  subst hTv
+  have hTField : get? tfs i = .some w := by
+    have h := hShellRef.2 i (.init w) hField
+    simpa [FlatFieldRefines] using h
+  have hLtT : i < tfs.length := by
+    simp only [get?_eq_getElem?] at hTField
+    exact (List.getElem?_eq_some_iff.mp hTField).1
+  have hLtS : i < shell.fields.length := by
+    simp only [get?_eq_getElem?] at hField
+    exact (List.getElem?_eq_some_iff.mp hField).1
+  have hLtLoc : loc < s.frame.locals.length := by
+    simp only [get?_eq_getElem?] at hGetT
+    exact (List.getElem?_eq_some_iff.mp hGetT).1
+  -- Invert the Anneal step.
+  rcases shell with ⟨sVar, sAdt, sDisc, sFields⟩
+  dsimp only at hTuple hField hShellRef hLtS
+  subst hTuple
+  unfold evalSetDiscriminantState at hOk
+  dsimp only at hOk
+  rw [hSlot] at hOk
+  dsimp only [PartialAggregate.toFieldSlot, setDiscriminantInFieldSlot] at hOk
+  rw [hField] at hOk
+  have hInitEq :
+      setDiscriminantInFieldSlot (slotsToTrustedLocals slots) (.init w) rest variantIdx =
+        match setDiscriminantProjectedValue (slotsToTrustedLocals slots) w rest variantIdx with
+        | .ok u => .ok (.init u)
+        | .ub => .ub
+        | .unsupported => .unsupported := by
+    unfold setDiscriminantInFieldSlot
+    rfl
+  dsimp only at hOk
+  rw [hInitEq] at hOk
+  cases hSD : setDiscriminantProjectedValue (slotsToTrustedLocals slots) w rest variantIdx with
+  | ub => rw [hSD] at hOk; nomatch hOk
+  | unsupported => rw [hSD] at hOk; nomatch hOk
+  | ok w' =>
+  rw [hSD] at hOk
+  dsimp only at hOk
+  have hSetS : set? sFields i (.init w') = .some (sFields.set i (.init w')) :=
+    set?_eq_some_iff.mpr ⟨hLtS, rfl⟩
+  rw [hSetS] at hOk
+  injection hOk with hSlots
+  subst hSlots
+  have hNotUnit' : evalValueProjRead (slotsToTrustedLocals slots) w rest ≠ .ok .unit := by
+    rw [evalValueProjRead_congr_scalar_locals hSame]
+    exact hNotUnit
+  obtain ⟨oldVar, fields, hReadW, hWriteW⟩ :=
+    setDiscriminantProjectedValue_inv_of_not_unit (slotsToTrustedLocals slots) w w' rest
+      variantIdx hNotUnit' hSD
+  rw [evalValueProjRead_congr_scalar_locals hSame] at hReadW
+  rw [evalValueProjWrite_congr_scalar_locals hSame] at hWriteW
+  -- The Trusted step on the padded aggregate.
+  have hTRead :
+      evalValueProjRead s.frame.locals (.aggregate 0 tfs) (.field i fieldTy :: rest) =
+        .ok (.aggregate oldVar fields) := by
+    dsimp only [evalValueProjRead]
+    rw [hTField]
+    exact hReadW
+  have hTSet : set? tfs i w' = .some (tfs.set i w') := set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+  have hTWrite :
+      evalValueProjWrite s.frame.locals (.aggregate 0 tfs) (.field i fieldTy :: rest)
+          (.aggregate variantIdx fields) =
+        .ok (.aggregate 0 (tfs.set i w')) := by
+    dsimp only [evalValueProjWrite]
+    rw [hTField]
+    dsimp only
+    rw [hWriteW]
+    dsimp only
+    rw [hTSet]
+  have hSetLoc :
+      set? s.frame.locals loc (.init (.aggregate 0 (tfs.set i w'))) =
+        .some (s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w')))) :=
+    set?_eq_some_iff.mpr ⟨hLtLoc, rfl⟩
+  refine ⟨s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w'))),
+    (evalStmt_setDiscriminant_correspondence s loc (.field i fieldTy) rest variantIdx oldVar
+      fields (.aggregate 0 tfs) (.aggregate 0 (tfs.set i w'))
+      (s.frame.locals.set loc (.init (.aggregate 0 (tfs.set i w')))) span localDecls layouts).2
+      (by intro h; nomatch h) hGetT hTRead hTWrite hSetLoc, ?_⟩
+  -- The frames stay related.
+  have hRef' := flatShellRefines_write sFields tfs i w' hShellRef hLtS
+  rw [setOrExtendFields_eq_set_of_lt tfs i w' hLtT] at hRef'
+  exact SlotsRefine.set (fieldSlotToLocalSlotState_promote_flat sVar sDisc _ _ hRef') loc hRel
 
 /-! #### Arbitrary-Depth Nested Partial-Shell Refinement (`NestedFieldRefines` & `NestedShellRefines`) -/
 
