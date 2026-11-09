@@ -3182,7 +3182,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   disabledRefReborrow_anneal_ub
   disabledRefReborrow_minirust_direct
   childReborrowWriteDisablesParent_notInFragment
-  childReborrowWriteDisablesParent_anneal_ub
+  childReborrowWriteDisablesParent_anneal_ret
   childReborrowWriteDisablesParent_minirust_direct
   reborrowSettings_u32_examples
   refMutReborrowWrite_inFragment
@@ -3275,7 +3275,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagFnEntryProtectorWrite_minirust_direct
   retagDisabledRefDiscrepancy_translate
   retagDisabledRefDiscrepancy_notInFragment
-  retagDisabledRefDiscrepancy_anneal_ub
+  retagDisabledRefDiscrepancy_anneal_ret
   retagDisabledRefDiscrepancy_minirust_direct
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment
@@ -3603,7 +3603,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   disabledRefReborrow_anneal_ub
   disabledRefReborrow_minirust_direct
   childReborrowWriteDisablesParent_notInFragment
-  childReborrowWriteDisablesParent_anneal_ub
+  childReborrowWriteDisablesParent_anneal_ret
   childReborrowWriteDisablesParent_minirust_direct
   reborrowSettings_u32_examples
   refMutReborrowWrite_inFragment
@@ -3696,7 +3696,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagFnEntryProtectorWrite_minirust_direct
   retagDisabledRefDiscrepancy_translate
   retagDisabledRefDiscrepancy_notInFragment
-  retagDisabledRefDiscrepancy_anneal_ub
+  retagDisabledRefDiscrepancy_anneal_ret
   retagDisabledRefDiscrepancy_minirust_direct
   retagScalarDiscrepancy_translate
   retagScalarDiscrepancy_notInFragment

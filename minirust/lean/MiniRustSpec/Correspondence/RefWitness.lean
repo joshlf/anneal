@@ -338,7 +338,8 @@ theorem refMutRoundTrip_anneal_ret :
     ReachesRet (mirTree refMutRoundTrip refMutRoundTripS0) []
       (.normal (.scalar ⟨6, 4⟩,
         { refMutRoundTripS0.memory with
-          borrows := [rawPtrEntry 3 .not (local_ 1), rawPtrEntry 2 .not (local_ 1),
+          borrows := [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
+                      { rawPtrEntry 2 .not (local_ 1) with parentTag := some 1 },
                       rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 4 })) :=
   runA_sound refMutRoundTrip 30 _ _ _ rfl
@@ -494,11 +495,12 @@ theorem refArrayReborrowChain_anneal_ret :
     ReachesRet (mirTree refArrayReborrowChain refArrayReborrowChainS0) []
       (.normal (.scalar ⟨42, 4⟩,
         { refArrayReborrowChainS0.memory with
-          borrows := [rawPtrEntry 7 .not (placeConstIdx 1 0 2 false),
-                      rawPtrEntry 6 .mut (placeConstIdx 1 1 2 false),
-                      rawPtrEntry 5 .not (placeConstIdx 1 0 2 false),
-                      rawPtrEntry 4 .not (placeConstIdx 1 0 2 false),
-                      rawPtrEntry 3 .mut (placeConstIdx 1 0 2 false),
+          borrows := [{ rawPtrEntry 7 .not (placeConstIdx 1 0 2 false) with parentTag := some 5 },
+                      { rawPtrEntry 6 .mut (placeConstIdx 1 1 2 false) with parentTag := some 2 },
+                      { rawPtrEntry 5 .not (placeConstIdx 1 0 2 false) with parentTag := some 4 },
+                      { rawPtrEntry 4 .not (placeConstIdx 1 0 2 false) with parentTag := some 3 },
+                      { rawPtrEntry 3 .mut (placeConstIdx 1 0 2 false) with
+                          perm := .reserved, parentTag := some 1 },
                       rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
                       rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false)],
           nextTag := 8 })) :=
@@ -641,8 +643,8 @@ theorem refPaddedStructReborrow_anneal_ret :
     ReachesRet (mirTree refPaddedStructReborrow refPaddedStructReborrowS0) []
       (.normal (.scalar ⟨1641, 4⟩,
         { refPaddedStructReborrowS0.memory with
-          borrows := [rawPtrEntry 4 .not (placeField 1 [(2, u16Ty)]),
-                      rawPtrEntry 3 .not (placeField 1 [(1, u32Ty)]),
+          borrows := [{ rawPtrEntry 4 .not (placeField 1 [(2, u16Ty)]) with parentTag := some 2 },
+                      { rawPtrEntry 3 .not (placeField 1 [(1, u32Ty)]) with parentTag := some 1 },
                       rawPtrEntry 2 .not (placeField 1 [(2, u16Ty)]),
                       rawPtrEntry 1 .mut (placeField 1 [(1, u32Ty)])],
           nextTag := 5 })) :=
@@ -778,9 +780,9 @@ theorem refMutReborrowWrite_anneal_ret :
     ReachesRet (mirTree refMutReborrowWrite refMutReborrowWriteS0) []
       (.normal (.scalar ⟨15, 4⟩,
         { refMutReborrowWriteS0.memory with
-          borrows := [rawPtrEntry 3 .not (local_ 1),
-                      rawPtrEntry 2 .mut (local_ 1),
-                      { rawPtrEntry 1 .mut (local_ 1) with perm := .disabled }],
+          borrows := [{ rawPtrEntry 3 .not (local_ 1) with parentTag := some 2 },
+                      { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
+                      rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 4 })) :=
   runA_sound refMutReborrowWrite 40 _ _ _ rfl
 
@@ -931,10 +933,10 @@ theorem refDisjointReborrowWrite_anneal_ret :
     ReachesRet (mirTree refDisjointReborrowWrite refDisjointReborrowWriteS0) []
       (.normal (.scalar ⟨42, 4⟩,
         { refDisjointReborrowWriteS0.memory with
-          borrows := [rawPtrEntry 4 .mut (placeConstIdx 1 1 2 false),
-                      rawPtrEntry 3 .mut (placeConstIdx 1 0 2 false),
-                      { rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false) with perm := .disabled },
-                      { rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false) with perm := .disabled }],
+          borrows := [{ rawPtrEntry 4 .mut (placeConstIdx 1 1 2 false) with parentTag := some 2 },
+                      { rawPtrEntry 3 .mut (placeConstIdx 1 0 2 false) with parentTag := some 1 },
+                      rawPtrEntry 2 .mut (placeConstIdx 1 1 2 false),
+                      rawPtrEntry 1 .mut (placeConstIdx 1 0 2 false)],
           nextTag := 5 })) :=
   runA_sound refDisjointReborrowWrite 50 _ _ _ rfl
 
@@ -1109,13 +1111,13 @@ theorem refLoopCountdown_anneal_ret :
       (.normal (.scalar ⟨6, 4⟩,
         { refLoopCountdownS0.memory with
           borrows := [rawPtrEntry 10 .not (local_ 1),
-                      rawPtrEntry 9 .mut (local_ 1),
-                      { rawPtrEntry 8 .mut (local_ 1) with perm := .disabled },
+                      { rawPtrEntry 9 .mut (local_ 1) with perm := .frozen, parentTag := some 8 },
+                      { rawPtrEntry 8 .mut (local_ 1) with perm := .frozen },
                       { rawPtrEntry 7 .not (local_ 1) with perm := .disabled },
-                      { rawPtrEntry 6 .mut (local_ 1) with perm := .disabled },
+                      { rawPtrEntry 6 .mut (local_ 1) with perm := .disabled, parentTag := some 5 },
                       { rawPtrEntry 5 .mut (local_ 1) with perm := .disabled },
                       { rawPtrEntry 4 .not (local_ 1) with perm := .disabled },
-                      { rawPtrEntry 3 .mut (local_ 1) with perm := .disabled },
+                      { rawPtrEntry 3 .mut (local_ 1) with perm := .disabled, parentTag := some 2 },
                       { rawPtrEntry 2 .mut (local_ 1) with perm := .disabled },
                       { rawPtrEntry 1 .not (local_ 1) with perm := .disabled }],
           nextTag := 11 })) :=
@@ -1783,12 +1785,13 @@ theorem disabledRefReborrow_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 9 }, [1]) := by
   decide +kernel
 
-/-- Modeling boundary between Anneal's flat `List BorrowEntry` and Tree Borrows'
-parent-child tree: in `_2 = &mut _1; _3 = &mut (*_2); (*_3) = 9; _0 = copy (*_2)`,
-writing through the child reborrow `_3` (tag `2`) runs `invalidateDerefWriteBorrows`
-and disables every other overlapping entry on `_1` — including the parent `_2`
-(tag `1`), so a later read through `_2` faults in Anneal even though Tree Borrows
-(and `BasicMemory`) permits parent reuse after child writes. Whereas mutable
+/-- Parent reuse after a child write: in
+`_2 = &mut _1; _3 = &mut (*_2); (*_3) = 9; _0 = copy (*_2)`, the reborrow `_3`
+(tag `2`) is a Tree Borrows child of `_2` (tag `1`, `parentTag`, unstable
+`b076d6a3`), so writing through `_3` is a local write for `_2` and the later read
+through `_2` succeeds (freezing the child) and returns `9`, as in Tree Borrows
+and `BasicMemory`. (Before `b076d6a3`, Anneal's flat borrow list disabled the
+parent and faulted here.) Whereas mutable
 reborrow + dereference write is admitted in-fragment when the invalidated parent
 is not subsequently dereferenced (`refMutReborrowWrite`,
 `refDisjointReborrowWrite`, `refLoopCountdown`), `ptrAliasingOk`'s flow-sensitive
@@ -1806,10 +1809,15 @@ def childReborrowWriteDisablesParent : CapturedMir :=
 theorem childReborrowWriteDisablesParent_notInFragment :
     inFragment childReborrowWriteDisablesParent = false := by decide +kernel
 
-theorem childReborrowWriteDisablesParent_anneal_ub :
-    ∃ tr u, Reaches (mirTree childReborrowWriteDisablesParent
-      (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound childReborrowWriteDisablesParent 30 _ (by decide)
+theorem childReborrowWriteDisablesParent_anneal_ret :
+    ReachesRet (mirTree childReborrowWriteDisablesParent
+      (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨9, 4⟩,
+        { (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]).memory with
+          borrows := [{ rawPtrEntry 2 .mut (local_ 1) with perm := .frozen, parentTag := some 1 },
+                      rawPtrEntry 1 .mut (local_ 1)],
+          nextTag := 3 })) :=
+  runA_sound childReborrowWriteDisablesParent 30 _ _ _ rfl
 
 theorem childReborrowWriteDisablesParent_minirust_direct :
     retAfter childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩] 8 =
@@ -2039,10 +2047,10 @@ theorem retagRefReborrowChain_anneal_ret :
     ReachesRet (mirTree retagRefReborrowChain retagRefReborrowChainS0) []
       (.normal (.scalar ⟨12, 4⟩,
         { retagRefReborrowChainS0.memory with
-          borrows := [rawPtrEntry 4 .not (local_ 1),
-                      rawPtrEntry 3 .mut (local_ 1),
-                      { rawPtrEntry 2 .mut (local_ 1) with perm := .disabled },
-                      { rawPtrEntry 1 .mut (local_ 1) with perm := .disabled }],
+          borrows := [{ rawPtrEntry 4 .not (local_ 1) with parentTag := some 3 },
+                      { rawPtrEntry 3 .mut (local_ 1) with parentTag := some 2 },
+                      { rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
+                      rawPtrEntry 1 .mut (local_ 1)],
           nextTag := 5 })) :=
   runA_sound retagRefReborrowChain 40 _ _ _ rfl
 
@@ -2233,11 +2241,13 @@ theorem retagFnEntryProtectorWrite_minirust_direct :
       some (some { retAlloc with data := scalarBytes u32 9 }, [1]) := by
   decide +kernel
 
-/-- Retagging a disabled reference (`_2 = &mut _1; _3 = &mut (*_2); (*_3) = 9; Retag([default], _2)`):
-`ptrStmtOk` rejects `Retag` on `_2` because `stepDerefWrite` marks `_2`
-`.disabled` after `(*_3) = 9`. Anneal faults at `Retag([default], _2)`
-(`entry.perm == .disabled`), while MiniRust's `BasicMemory` validates `_2`'s
-still-live aligned stack target and returns `9`. -/
+/-- Retagging a parent after a child write
+(`_2 = &mut _1; _3 = &mut (*_2); (*_3) = 9; Retag([default], _2)`): `ptrStmtOk`
+still rejects `Retag` on `_2` because `stepDerefWrite` conservatively marks
+`_2` `.disabled` after `(*_3) = 9`, but since unstable `b076d6a3` Anneal links
+`_3` to its parent `_2` (`parentTag`), the child write keeps `_2` active, and
+Anneal returns `9` like MiniRust's `BasicMemory` (before `b076d6a3`, Anneal's
+flat borrow list disabled `_2` and faulted at the `Retag`). -/
 def retagDisabledRefDiscrepancy : CapturedMir :=
   ptrBody "witness::retag_disabled_ref_discrepancy"
     [u32Decl, u32Decl, refMutU32Decl, refMutU32Decl]
@@ -2254,10 +2264,15 @@ theorem retagDisabledRefDiscrepancy_translate :
 theorem retagDisabledRefDiscrepancy_notInFragment :
     inFragment retagDisabledRefDiscrepancy = false := by decide +kernel
 
-theorem retagDisabledRefDiscrepancy_anneal_ub :
-    ∃ tr u, Reaches (mirTree retagDisabledRefDiscrepancy
-      (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u :=
-  faultsA_sound retagDisabledRefDiscrepancy 25 _ (by decide)
+theorem retagDisabledRefDiscrepancy_anneal_ret :
+    ReachesRet (mirTree retagDisabledRefDiscrepancy
+      (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨9, 4⟩,
+        { (initMachineState retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩]).memory with
+          borrows := [{ rawPtrEntry 2 .mut (local_ 1) with parentTag := some 1 },
+                      rawPtrEntry 1 .mut (local_ 1)],
+          nextTag := 3 })) :=
+  runA_sound retagDisabledRefDiscrepancy 25 _ _ _ rfl
 
 theorem retagDisabledRefDiscrepancy_minirust_direct :
     retAfter retagDisabledRefDiscrepancy [.scalar ⟨5, 4⟩] 9 =

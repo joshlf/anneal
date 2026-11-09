@@ -1814,16 +1814,27 @@ theorem int2ptrForgedTag_B3_divergence :
   ⟨by decide +kernel, by decide +kernel,
    int2ptrForgedTag_anneal_ret, int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
 
+/-- `childReborrowWriteDisablesParent` under the B3 fragment. Before unstable
+`b076d6a3` this was a divergence (Anneal's flat borrow list faulted on the
+parent read while `BasicMemory` and Tree Borrows returned `9`); with
+parent-linked Tree Borrows entries Anneal now also returns `9`, so the program
+is accepted by B3, still rejected by the conservative standard fragment, and
+all three semantics agree. -/
 theorem childReborrowWriteDisablesParent_B3_divergence :
     progInFragmentWithIntrinsicsB3 childReborrowWriteDisablesParent [] = true ∧
     progInFragmentWithIntrinsics childReborrowWriteDisablesParent [] = false ∧
-    (∃ tr u, Reaches (mirTree childReborrowWriteDisablesParent
-      (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    ReachesRet (mirTree childReborrowWriteDisablesParent
+      (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩])) []
+      (.normal (.scalar ⟨9, 4⟩,
+        { (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩]).memory with
+          borrows := [{ rawPtrEntry 2 .mut (local_ 1) with perm := .frozen, parentTag := some 1 },
+                      rawPtrEntry 1 .mut (local_ 1)],
+          nextTag := 3 })) ∧
     retAfter childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩] 8 =
       some (some { retAlloc with data := scalarBytes u32 9 }, [1]) ∧
     retAfterTB childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩] 8 = tbRetU32 9 :=
   ⟨by decide +kernel, by decide +kernel,
-   childReborrowWriteDisablesParent_anneal_ub,
+   childReborrowWriteDisablesParent_anneal_ret,
    childReborrowWriteDisablesParent_minirust_direct,
    childReborrowWriteDisablesParent_tb_direct⟩
 
