@@ -1146,7 +1146,7 @@ def evalStmt
         layouts
         s.memory.callerLocals
     with
-    | .ok (.ptr ptrVal sz) locals' =>
+    | .ok val locals' =>
       let isRawPtrTy :=
         match placeTy localDecls layouts place with
         | .some { kind := .rawPtr _ _, .. } => true
@@ -1157,19 +1157,21 @@ def evalStmt
         | .raw => MirStepNode.step (advanceStmt s locals')
         | .default | .twoPhase | .fnEntry => MirStepNode.fail .ub
       | false =>
-        match lookupBorrow s.memory.borrows ptrVal.tag with
-        | .some entry =>
-          match entry.perm with
-          | .disabled => MirStepNode.fail .ub
-          | _ =>
-            match retagKind with
-            | .fnEntry =>
-              evalFnEntryRetag s localDecls layouts place ptrVal sz entry locals'
-            | .default | .twoPhase | .raw =>
-              evalNonFnEntryRetag
-                retagKind s localDecls layouts place ptrVal sz entry locals'
-        | .none => MirStepNode.fail .ub
-    | .ok _ _ => MirStepNode.fail .ub
+        match val with
+        | .ptr ptrVal sz =>
+          match lookupBorrow s.memory.borrows ptrVal.tag with
+          | .some entry =>
+            match entry.perm with
+            | .disabled => MirStepNode.fail .ub
+            | _ =>
+              match retagKind with
+              | .fnEntry =>
+                evalFnEntryRetag s localDecls layouts place ptrVal sz entry locals'
+              | .default | .twoPhase | .raw =>
+                evalNonFnEntryRetag
+                  retagKind s localDecls layouts place ptrVal sz entry locals'
+          | .none => MirStepNode.fail .ub
+        | _ => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
   | .storageLive loc =>

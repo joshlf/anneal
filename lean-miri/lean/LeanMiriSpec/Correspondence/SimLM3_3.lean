@@ -399,4 +399,31 @@ theorem sim_lm3_3_retag_raw_step
     | exact ⟨_, rfl, rfl, rfl⟩
     | rfl
 
+/-- State where `_2` holds a provenance-free scalar raw pointer (`0 as *mut u64` /
+`0 as *const u64`, `.scalar ⟨0, 8⟩`). -/
+def childScalarRawState : MachineState :=
+  simState [.uninit, .init (.scalar ⟨7, 8⟩), .init (.scalar ⟨0, 8⟩)] [] false
+
+/-- **`sim_lm3_3_retag_raw_scalar_step`**: across all `4` `RetagKind`s and both
+raw-pointer mutabilities, `StatementKind.retag rk _2` on a provenance-free
+scalar raw pointer (`_2 = .scalar ⟨0, 8⟩`, e.g., `0 as *const u64`) steps cleanly
+without allocating a tag when `rk = .raw`, and faults with `.fail .ub`
+(`rawPointerWrongMode`) for every non-`.raw` mode, matching
+`retagPointerValue_rawPointer_simulation`. -/
+theorem sim_lm3_3_retag_raw_scalar_step
+    (rk : RetagKind) (mutability : Mutability) :
+    match rk with
+    | .raw =>
+      ∃ s' : MachineState,
+        stepMirFn (retagRawBody rk mutability) childScalarRawState = .step s' ∧
+        s'.memory = childScalarRawState.memory ∧
+        get? s'.frame.locals 2 = some (.init (.scalar ⟨0, 8⟩))
+    | .default | .twoPhase | .fnEntry =>
+      stepMirFn (retagRawBody rk mutability) childScalarRawState = .fail .ub := by
+  cases mutability <;> cases rk
+  all_goals
+    first
+    | exact ⟨_, rfl, rfl, rfl⟩
+    | rfl
+
 end LeanMiriSpec.Correspondence.SimLM3_3

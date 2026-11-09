@@ -402,4 +402,153 @@ theorem wit_lm3_3_cell_reborrow_preserves_unique_real_steps :
       get? s₅.frame.locals 1 = some (.init (.scalar ⟨99, 4⟩)) := by
   exact ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-! ## (g) Protector release on `TerminatorKind.return_` allows conflicted `ReservedFrz true` activation -/
+
+/-- Callee body that performs `Retag([fn entry] _2)`, triggers a foreign read
+that sets `conflicted := true` on protected tag `2` (`ReservedFrz true`), and
+then executes `TerminatorKind.return_` to release protector `1`. -/
+def calleeG : CapturedMir :=
+  witBody "lm_3_3_witness::callee_release_protector" 8
+    [declOf u64T, declOf u64T, refMutDecl (.uint .u64), refDecl (.uint .u64)]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.retag .fnEntry (loc 2)),
+     stmt (.assign (loc 3) (.ref .shared (loc 1))),
+     stmt (.assign (loc 0) (.use (.copy (deref 3))))]
+
+/-- Caller body resumed after `calleeG` returns: writes `(*_2) = const 9_u64`
+through the now-unprotected conflicted tag `2` (`ReservedFrz true → Unique`). -/
+def callerG : CapturedMir :=
+  witBody "lm_3_3_witness::caller_after_protector_release" 8
+    [declOf u64T, declOf u64T, refMutDecl (.uint .u64)]
+    [stmt (.assign (deref 2) (.use (cU64 9)))]
+
+/-- Initial state inside `calleeG` with `callerG` on `callStack` waiting at
+`bb0` with `_2` holding tag `2` (`&mut _1`). -/
+def initG : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨5, 8⟩), .uninit, .uninit] }
+    memory :=
+      { emptyMemory with
+        callStack :=
+          [{ callerBody := callerG
+             frame :=
+               { blockIdx := 0
+                 stmtIdx := 0
+                 locals := [.uninit, .init (.scalar ⟨5, 8⟩), .init (.ptr ⟨2, 0⟩ 8)] }
+             destination := loc 0
+             returnTarget := 0
+             callerProtector := none
+             calleeProtectors := [] }]
+        activeCallee := some calleeG } }
+
+/-- **(g) `wit_lm3_3_protector_release_on_return_real_steps`**:
+contrasting directly with `wit_lm3_3_protected_conflict_ub_real_steps` (`bodyB`),
+where writing through a conflicted `ReservedFrz true` tag while its protector is
+active faults with `.fail .ub`:
+1. inside `calleeG`, `_2 = &mut _1` creates root tag `1` (`ReservedFrz false`),
+   `Retag([fn entry] _2)` creates protected child tag `2` (`ReservedFrz false`,
+   `protector = some 1`, `activeProtectors = [1]`), `_3 = &_1` creates shared
+   tag `3` (`Frozen`), and `_0 = copy (*_3)` performs a foreign read that sets
+   `conflicted := true` on tag `2` (`ReservedFrz true`);
+2. executing `TerminatorKind.return_` at the end of `calleeG` returns to
+   `callerG` and releases protector `1` (`activeProtectors = []`);
+3. in `callerG`, the subsequent child write `(*_2) = const 9_u64` through tag `2`
+   now **succeeds** and activates tag `2` (from `ReservedFrz true`) and parent
+   tag `1` (from `ReservedFrz false`) to `Unique` while disabling tag `3`, in
+   lockstep with Miri's normal-tree write on `basedNormalTree s₅.memory.borrows []`. -/
+theorem wit_lm3_3_protector_release_on_return_real_steps :
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+      stepMirFn callerG initG = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn callerG s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      s₂.memory.activeProtectors = [1] ∧
+      stepMirFn callerG s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn callerG s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz true) (some 1) (some 1), entry 1 .reserved] ∧
+      s₄.memory.activeProtectors = [1] ∧
+      stepMirFn callerG s₄ = .step s₅ ∧
+      s₅.memory.activeProtectors = [] ∧
+      s₅.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz true) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn callerG s₅ = .step s₆ ∧
+      s₆.memory.borrows =
+        [entry 3 .disabled, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      get? s₆.frame.locals 1 = some (.init (.scalar ⟨9, 8⟩)) ∧
+      ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₆.memory.borrows []
+        ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).tree := by
+  refine ⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl, rfl, rfl, rfl, rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
+
+/-! ## (h) Non-`fnEntry` reference retags (`Default`, `TwoPhase`) and `Raw` scalar pointer retag -/
+
+/-- ```text
+bb0: _2 = &mut _1;               // tag 1: ReservedFrz false
+     Retag([default] _2);        // tag 2: ReservedFrz false, parent 1, unprotected
+     Retag([2phase] _2);         // tag 3: ReservedFrz false, parent 2, unprotected
+     Retag([raw] _3);            // raw scalar pointer 0 as *mut u64: no-op, no tag allocated
+     (*_2) = const 77_u64;       // child write through tag 3: activates 3, 2, 1 to Unique!
+     return
+``` -/
+def bodyH : CapturedMir :=
+  witBody "lm_3_3_witness::non_fn_entry_and_raw_retag" 8
+    [declOf u64T, declOf u64T, refMutDecl (.uint .u64), rawMutDecl (.uint .u64)]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.retag .default (loc 2)),
+     stmt (.retag .twoPhase (loc 2)),
+     stmt (.retag .raw (loc 3)),
+     stmt (.assign (deref 2) (.use (cU64 77)))]
+
+/-- Initial state of `bodyH`: `_1 = 5_u64` and `_3 = 0 as *mut u64`
+(provenance-free scalar raw pointer). -/
+def initH : MachineState :=
+  witInit [.uninit, .init (.scalar ⟨5, 8⟩), .uninit, .init (.scalar ⟨0, 8⟩)]
+
+/-- **(h) `wit_lm3_3_non_fnEntry_retag_and_raw_retag_real_steps`**:
+real Anneal steps of `bodyH` exercising `StatementKind.retag` across `.default`,
+`.twoPhase`, and `.raw`:
+1. `_2 = &mut _1` creates root tag `1` (`ReservedFrz false`);
+2. `Retag([default] _2)` allocates unprotected child tag `2` (`ReservedFrz false`,
+   `parentTag = some 1`);
+3. `Retag([2phase] _2)` allocates unprotected grandchild tag `3`
+   (`ReservedFrz false`, `parentTag = some 2`);
+4. `Retag([raw] _3)` on provenance-free scalar raw pointer `_3 = .scalar ⟨0, 8⟩`
+   steps cleanly without allocating a tag (`nextTag` remains `4`);
+5. `(*_2) = const 77_u64` writes through grandchild tag `3`, activating the
+   3-level chain (`tag 3`, `tag 2`, `tag 1`) to `Unique` in lockstep with Miri's
+   normal-tree write on `basedNormalTree s₄.memory.borrows []`. -/
+theorem wit_lm3_3_non_fnEntry_retag_and_raw_retag_real_steps :
+    ∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyH initH = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn bodyH s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .reserved (some 1), entry 1 .reserved] ∧
+      s₂.memory.activeProtectors = [] ∧
+      stepMirFn bodyH s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entry 3 .reserved (some 2), entry 2 .reserved (some 1), entry 1 .reserved] ∧
+      s₃.memory.nextTag = 4 ∧
+      stepMirFn bodyH s₃ = .step s₄ ∧
+      s₄.memory.borrows = s₃.memory.borrows ∧
+      s₄.memory.nextTag = 4 ∧
+      stepMirFn bodyH s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 3 .unique (some 2), entry 2 .unique (some 1), entry 1 .unique] ∧
+      get? s₅.frame.locals 1 = some (.init (.scalar ⟨77, 8⟩)) ∧
+      ((basedNormalTree s₄.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₅.memory.borrows []
+        ((basedNormalTree s₄.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree := by
+  refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl, rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
+
 end LeanMiriSpec.Correspondence.WitnessLM3_3
