@@ -3100,6 +3100,108 @@ def placeIsFreeze
   | .none => true
 
 /--
+Determine whether a structural `RigidTy` is statically known to have zero byte
+size (`!`, `()`, nested zero-sized tuples, zero-length arrays `[T; 0]`, arrays
+of zero-sized elements, `fn` item types, non-capturing or zero-sized-capturing
+closures, or `core::marker::PhantomData` / `std::marker::PhantomData`) in
+`Runtime(PostCleanup)` MIR on a 64-bit target (`rustc 1.98.0-nightly (14210df0e
+2026-05-31)`), using bounded recursion with `fuel`.
+
+Modeling choice vs. stable Rust Reference: For general user-defined
+`RigidTy.adt` types, byte size is stored in `LayoutTable` (`Ty.layoutIdx`)
+rather than on `RigidTy` itself, so `rigidTyIsZeroSized` recognizes
+`PhantomData<T>` directly and conservatively returns `false` on other
+`RigidTy.adt` constructors. During reference reborrows (`evalRvalue` `.ref`)
+and retagging (`evalFnEntryRetag`, `evalNonFnEntryRetag`, and `evalStmt`
+`.retag`), a zero-sized pointee covers an empty `[offset, offset + 0)` byte
+range, so Miri and MiniRust perform zero initial read accesses and accept
+non-null provenance-free dangling references without allocating a tag.
+
+Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+
+Reference (MiniRust `spec/mem/tree_borrows/memory.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L81-L86>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L116-L123>
+
+> "let Some((alloc_id, parent_path)) = ptr.provenance else {
+>     assert!(pointee_size.is_zero());
+>     // Pointers without provenance cannot access any memory, so giving them a new
+>     // tag makes no sense.
+>     return ret(ptr);
+> };"
+>
+> "// Perform a read access on all bytes inside the pointee whose permission requires such an access.
+> for (idx, perm) in settings.inside.iter().enumerate() {
+>     let idx = Int::from(idx); // FIXME: we need a version of `enumerate` that yields `Int`s.
+>     let idx = Size::from_bytes(idx).unwrap();
+>     if let Some(access) = perm.init_access() {
+>         allocation.extra.root.access(Some(child_path), access, offset+idx, Offset::from_bytes_const(1))?
+>     }
+> }"
+-/
+@[reducible]
+def rigidTyIsZeroSized : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ _, .never => true
+  | .succ _, .tuple .nil => true
+  | .succ fuel, .tuple (k :: ks) =>
+    Bool.and (rigidTyIsZeroSized fuel k) (rigidTyIsZeroSized fuel (.tuple ks))
+  | .succ _, .array _ .zero => true
+  | .succ fuel, .array elem _ => rigidTyIsZeroSized fuel elem
+  | .succ _, .fnDef _ _ => true
+  | .succ _, .closure _ .nil => true
+  | .succ fuel, .closure _ (u :: us) =>
+    Bool.and (rigidTyIsZeroSized fuel u) (rigidTyIsZeroSized fuel (.tuple us))
+  | .succ _, .adt defPath _ =>
+    Bool.or
+      (stringEq defPath "core::marker::PhantomData")
+      (stringEq defPath "std::marker::PhantomData")
+  | .succ _, k =>
+    match rigidTyKindByteSize k with
+    | .some .zero => true
+    | _ => false
+
+/--
+Determine whether a `Ty` is statically zero-sized by inspecting `ty.kind` with
+fuel `16` (`rigidTyIsZeroSized 16 ty.kind`).
+
+Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+-/
+@[reducible]
+def tyIsZeroSized (ty : Ty) : Bool :=
+  rigidTyIsZeroSized 16 ty.kind
+
+/--
+Determine whether `place`'s resolved type in `localDecls` and `layouts` is
+statically zero-sized (`tyIsZeroSized`), defaulting to `false` when `localDecls`
+is omitted or does not determine a type for `place`.
+
+Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+-/
+@[reducible]
+def placeIsZeroSized
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) :
+    Bool :=
+  match placeTy localDecls layouts place with
+  | .some ty => tyIsZeroSized ty
+  | .none => false
+
+/--
 Determine the initial Tree Borrows permission for a shared borrow (`&place`)
 based on whether `place`'s resolved type in `localDecls` and `layouts` is
 `Freeze`.
@@ -3299,14 +3401,16 @@ Tree Borrows modeling in `Rvalue.use`, `Rvalue.copyForDeref`, `Rvalue.ref`, and
   are checked only against the reader's own permission by `evalOperand`.
 - Dereference reborrows (`.ref borrowKind (.deref :: restProj)`) link the new
   tag to `parentTag := .some parentPtr.tag`, perform the initial child read
-  through the parent when `perm` is not `.cell` (rejecting it with
+  through the parent unless `perm` is `.cell` or `place` is zero-sized
+  (`placeIsZeroSized localDecls layouts place`, rejecting the read with
   `hasTreeReadUB` when two or more entries exist, then applying
   `freezeTreeBorrowsOnReadAtProj` with protector status, matching Miri's
   `Permission::associated_access` and MiniRust's
-  `PermissionUnprot::init_access`), and initialize the new tag with
-  Miri's unprotected `NewPermission::new` choice: `sharedBorrowPerm`
-  (`.frozen` or `.cell`) for shared reborrows and `mutableBorrowPerm`
-  (`.reservedFrz false` or `.reservedIM`) for mutable and two-phase reborrows.
+  `PermissionUnprot::init_access` over the pointee's byte range), and
+  initialize the new tag with Miri's unprotected `NewPermission::new` choice:
+  `sharedBorrowPerm` (`.frozen` or `.cell`) for shared reborrows and
+  `mutableBorrowPerm` (`.reservedFrz false` or `.reservedIM`) for mutable and
+  two-phase reborrows.
   A mutable reborrow through a `.frozen` parent is rejected eagerly; Miri
   instead rejects the first write through the new tag (a child write of the
   `.frozen` ancestor), so Anneal's choice reports undefined behavior no later
@@ -3501,12 +3605,16 @@ def evalRvalue
                 match parentEntry.targetProjection with
                 | .nil => resolvedRest
                 | ph :: pt => ph :: appendProjections pt resolvedRest
+              let skipInitRead :=
+                match perm with
+                | .cell => true
+                | _ => placeIsZeroSized localDecls layouts place
               let readUB :=
                 match mem.borrows with
                 | _ :: _ :: _ =>
-                  match perm with
-                  | .cell => false
-                  | _ =>
+                  match skipInitRead with
+                  | true => false
+                  | false =>
                     hasTreeReadUB
                       mem.borrows
                       mem.borrows
@@ -3521,9 +3629,9 @@ def evalRvalue
               | true => .ub
               | false =>
                 let borrowsAfterRead :=
-                  match perm with
-                  | .cell => mem.borrows
-                  | _ =>
+                  match skipInitRead with
+                  | true => mem.borrows
+                  | false =>
                     freezeTreeBorrowsOnReadAtProj
                       mem.borrows
                       mem.borrows

@@ -888,6 +888,7 @@ theorem evalRvalue_reborrow_root_ok
       rw [hrd]
       cases sharedBorrowPerm localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩ <;>
         cases mutableBorrowPerm localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩ <;>
+        cases placeIsZeroSized localDecls layouts ⟨ptrIdx, .cons .deref .nil⟩ <;>
         cases hp : e.perm <;> rcases hm : bk with _ | ⟨_ | _⟩
       all_goals first
         | exact absurd hp hne_dis
@@ -9216,12 +9217,20 @@ theorem step_reborrow_safeRef_tree_simulation_explicit
           (dsimp only at hpk;
            unfold mutableBorrowPerm placeTy resolveProjectedTy pointeeTyOf tyIsFreeze rigidTyIsFreeze;
            dsimp only []; rw [hdecl_ref]; dsimp only []; rw [href_ty]; dsimp only []; rw [hpk])
+      have hzst :
+          placeIsZeroSized body.localDecls body.layouts ⟨refIdx, .cons .deref .nil⟩ = false := by
+        rcases hpk_prim with hpk | hpk | ⟨w, hpk⟩ | ⟨w, hpk⟩ <;>
+          (dsimp only at hpk;
+           unfold placeIsZeroSized placeTy resolveProjectedTy pointeeTyOf tyIsZeroSized
+             rigidTyIsZeroSized;
+           dsimp only []; rw [hdecl_ref]; dsimp only []; rw [href_ty]; dsimp only []; rw [hpk];
+           try cases w <;> rfl)
       unfold evalRvalue; dsimp only []
       rw [hsr_full]; dsimp only []
       rw [hlook_s]; dsimp only [ReborrowMapEntry.toBorrowEntry]
       rw [hbor_s, hprot, htm'_eq]
       dsimp only [List.map_cons, ReborrowMapEntry.toBorrowEntry, reborrowPermOf]
-      rw [hsh_perm, hmut_perm, hfrz]
+      rw [hsh_perm, hmut_perm, hzst, hfrz]
       generalize treeMap.map ReborrowMapEntry.toBorrowEntry = B at hrd ⊢
       cases B with
       | nil =>

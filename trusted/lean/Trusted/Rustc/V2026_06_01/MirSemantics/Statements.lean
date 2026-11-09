@@ -864,63 +864,6 @@ def evalCopyNonOverlapping
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
-Determine whether a structural `RigidTy` is statically known to have zero byte
-size (`()`, nested zero-sized tuples, zero-length arrays `[T; 0]`, arrays of
-zero-sized elements, or `fn` item types) in `Runtime(PostCleanup)` MIR on a
-64-bit target (`rustc 1.98.0-nightly (14210df0e 2026-05-31)`), using bounded
-recursion with `fuel`.
-
-Modeling choice vs. stable Rust Reference: For `RigidTy.adt` types, byte size is
-stored in `LayoutTable` (`Ty.layoutIdx`) rather than on `RigidTy` itself, so
-`rigidTyIsZeroSized` conservatively returns `false` on `RigidTy.adt` and
-identifies structural zero-sized pointee `RigidTy`s directly. During reference
-retagging (`evalFnEntryRetag`, `evalNonFnEntryRetag`, and `evalStmt` `.retag`),
-a zero-sized pointee covers an empty `[offset, offset + 0)` byte range, so Miri
-and MiniRust perform zero initial read accesses and accept non-null
-provenance-free dangling references without allocating a tag.
-
-Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
-<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
-
-> "The size of a value is the offset in bytes between successive elements in an
-> array with that item type including alignment padding."
-
-Reference (MiniRust `spec/mem/tree_borrows/memory.md` at commit
-`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
-<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L81-L86>
-<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L116-L123>
-
-> "let Some((alloc_id, parent_path)) = ptr.provenance else {
->     assert!(pointee_size.is_zero());
->     // Pointers without provenance cannot access any memory, so giving them a new
->     // tag makes no sense.
->     return ret(ptr);
-> };"
->
-> "// Perform a read access on all bytes inside the pointee whose permission requires such an access.
-> for (idx, perm) in settings.inside.iter().enumerate() {
->     let idx = Int::from(idx); // FIXME: we need a version of `enumerate` that yields `Int`s.
->     let idx = Size::from_bytes(idx).unwrap();
->     if let Some(access) = perm.init_access() {
->         allocation.extra.root.access(Some(child_path), access, offset+idx, Offset::from_bytes_const(1))?
->     }
-> }"
--/
-@[reducible]
-def rigidTyIsZeroSized : Nat → RigidTy → Bool
-  | .zero, _ => false
-  | .succ _, .tuple .nil => true
-  | .succ fuel, .tuple (k :: ks) =>
-    Bool.and (rigidTyIsZeroSized fuel k) (rigidTyIsZeroSized fuel (.tuple ks))
-  | .succ _, .array _ .zero => true
-  | .succ fuel, .array elem _ => rigidTyIsZeroSized fuel elem
-  | .succ _, .fnDef _ _ => true
-  | .succ _, k =>
-    match rigidTyKindByteSize k with
-    | .some .zero => true
-    | _ => false
-
-/--
 Execute a function-entry retag (`RetagKind::FnEntry`) of the reference stored
 in `place`, whose current value is `.ptr ptrVal sz` with live borrow entry
 `parentEntry`, after `evalOperand` produced `locals'`.

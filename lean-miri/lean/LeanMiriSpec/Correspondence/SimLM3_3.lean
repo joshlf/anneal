@@ -27,16 +27,21 @@ MIR interpreter engines (`Tree.NormalTreeState.performAccess` and
   `sim_lm3_3_reborrow_parent_write_invalidates_child_step`: exhaustive `6 × 6 × 2`
   parent-child hierarchy simulations certifying `I-10` and `I-11`;
 * `sim_lm3_3_retag_ref_step`, `sim_lm3_3_retag_raw_step`,
-  `sim_lm3_3_retag_raw_scalar_step`, `sim_lm3_3_retag_zst_ref_step`, and
-  `sim_lm3_3_retag_zst_scalar_step`: `StatementKind.retag` simulations across all
-  4 `RetagKind`s, `Freeze` vs. `!Freeze` (`UnsafeCell`), raw pointers, and ZST
-  references (certifying skipped initial reads and provenance-free scalar ZSTs);
+  `sim_lm3_3_retag_raw_scalar_step`, `sim_lm3_3_retag_zst_ref_step`,
+  `sim_lm3_3_retag_zst_scalar_step`, `sim_lm3_3_retag_phantom_ref_step`, and
+  `sim_lm3_3_zst_deref_reborrow_step`: `StatementKind.retag` and deref-reborrow
+  simulations across all 4 `RetagKind`s, `Freeze` vs. `!Freeze` (`UnsafeCell`),
+  raw pointers, and ZST references (`()` and `PhantomData<u64>`, certifying
+  skipped initial reads across both `retag` and `Rvalue.ref` deref reborrows
+  plus provenance-free scalar ZSTs);
 * `stateRelLM3_2Tree_treeBorrowsRel`,
-  `sim_lm3_3_interpreter_deref_read_step`, and
-  `sim_lm3_3_interpreter_deref_write_step`: general 3-way lockstep of
+  `sim_lm3_3_interpreter_deref_read_step`,
+  `sim_lm3_3_interpreter_deref_write_step`, and
+  `sim_lm3_3_interpreter_reborrow_step`: general 3-way lockstep of
   `stepMirFn`, `Miri.Interpreter.Step.step` (`annealStepHooks`), and
-  `TreeBorrowsRel` across all 5 readable (`perm ≠ .disabled`) and all 5 writable
-  (`perm ≠ .frozen ∧ perm ≠ .disabled`) 6-state permissions.
+  `TreeBorrowsRel` across all 5 readable (`perm ≠ .disabled`), all 5 writable
+  (`perm ≠ .frozen ∧ perm ≠ .disabled`), and all reborrowable 6-state
+  permissions.
 -/
 
 namespace LeanMiriSpec.Correspondence.SimLM3_3
@@ -496,6 +501,89 @@ theorem sim_lm3_3_retag_zst_scalar_step
     | exact ⟨_, rfl, rfl, rfl⟩
     | rfl
 
+/-- Zero-sized `core::marker::PhantomData<u64>` type (`Freeze` and 0-byte ZST
+even when `layoutIdx = 0` points to a non-zero layout entry). -/
+def phantomU64T : Ty :=
+  { kind := .adt "core::marker::PhantomData" [.uint .u64], layoutIdx := 0 }
+
+/-- `Retag(rk, _2)` where `_2` is a reference (`&PhantomData<u64>` or
+`&mut PhantomData<u64>`) in a body whose `layouts[0]` has non-zero size (`8`),
+testing structural `rigidTyIsZeroSized` on `PhantomData`. -/
+def retagPhantomRefBody (rk : RetagKind) (mutability : Mutability) : CapturedMir :=
+  witBody "lm_3_3_sim::retag_phantom_ref" 8
+    [declOf phantomU64T, declOf phantomU64T,
+      declOf { kind := .ref mutability phantomU64T.kind, layoutIdx := 0 }]
+    [stmt (.retag rk (loc 2))]
+
+/-- **`sim_lm3_3_retag_phantom_ref_step`**: across all `4 × 2 = 8`
+`(rk, mutability)` combinations on `core::marker::PhantomData<u64>` (even when
+`layouts[0]` has `8`-byte size), `StatementKind.retag rk _2` recognizes
+`PhantomData` as zero-sized via `rigidTyIsZeroSized`, allocates child tag `3`
+under `parentTag = some 1`, skips the initial child read so the protected
+`Unique` sibling `entry 2` survives without UB or freezing, and preserves
+`TreeBorrowsRel`. -/
+theorem sim_lm3_3_retag_phantom_ref_step
+    (rk : RetagKind) (mutability : Mutability) :
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability true
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    ∃ s' : MachineState,
+      stepMirFn (retagPhantomRefBody rk mutability) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) := by
+  cases rk <;> cases mutability <;>
+    exact ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
+
+/-- `_3 = &bk (*_2)` where `_2 : &mut ()` and `_1 : ()` (even when `layouts[0]`
+has `8`-byte size), testing that `evalRvalue` deref reborrows consult
+`placeIsZeroSized` and skip the initial child read on ZST pointees. -/
+def zstDerefReborrowBody (bk : BorrowKind) : CapturedMir :=
+  let dstMut : Mutability := match bk with | .shared => .not | .mut _ => .mut
+  witBody "lm_3_3_sim::zst_deref_reborrow" 8
+    [declOf unitT, declOf unitT,
+      refMutDecl (.tuple []),
+      declOf { kind := .ref dstMut (.tuple []), layoutIdx := 0 }]
+    [stmt (.assign (loc 3) (.ref bk (deref 2)))]
+
+/-- Pre-reborrow state for `zstDerefReborrowBody`: `_1 = ()`, `_2` holds parent
+tag `1` (`Unique`), `_3` is uninitialized, and sibling `entry 2` is a
+**protected** `Unique` borrow (`prot = some 1`, `activeProtectors = [1]`) that
+would fault with UB if `evalRvalue` performed a 1+-byte initial read. -/
+def zstDerefReborrowState : MachineState :=
+  simState [.uninit, .init .unit, .init (.ptr ⟨1, 0⟩ 8), .uninit]
+    [entry 2 .unique none (some 1), entry 1 .unique] true
+
+/-- **`sim_lm3_3_zst_deref_reborrow_step`**: across all 3 `BorrowKind`s
+(`.shared`, `.mut false`, `.mut true`) on a zero-sized deref place `(*_2) : ()`,
+`stepMirFn` executing `_3 = &bk (*_2)` allocates child tag `3` under
+`parentTag = some 1` with permission `.frozen` (shared) or `.reservedFrz false`
+(mutable) and **skips** the 0-byte initial child read via `placeIsZeroSized`, so
+the protected `Unique` sibling `entry 2` survives without UB or freezing and
+`TreeBorrowsRel` holds after the step. -/
+theorem sim_lm3_3_zst_deref_reborrow_step (bk : BorrowKind) :
+    let childPerm : TreeBorrowPerm :=
+      match bk with
+      | .shared => .frozen
+      | .mut _ => .reservedFrz false
+    ∃ s' : MachineState,
+      stepMirFn (zstDerefReborrowBody bk) zstDerefReborrowState = .step s' ∧
+      get? s'.frame.locals 3 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) none,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = [1] ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) := by
+  rcases bk with _ | ⟨_ | _⟩ <;>
+    exact ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
+
 /-! ## General 6-State `Miri.Interpreter.Step.step` + `TreeBorrowsRel` Lockstep -/
 
 /-- **`stateRelLM3_2Tree_treeBorrowsRel`**: every `StateRelLM3_2Tree` state
@@ -928,6 +1016,71 @@ theorem sim_lm3_3_interpreter_deref_write_step
     at hstep_main ⊢
   rw [hs'] at hstep_main
   cases hstep_main with
+  | step _ m' _ htree' =>
+    exact ⟨m', rfl, htree', (stateRelLM3_2Tree_treeBorrowsRel htree').2⟩
+
+/-- **`sim_lm3_3_interpreter_reborrow_step`**: general 3-way lockstep of
+Anneal's `stepMirFn`, `lean-miri`'s `Miri.Interpreter.Step.step`
+(`annealStepHooks`), and `TreeBorrowsRel` on `basedNormalTree` for safe-reference
+dereference reborrows `_d = &bk (*_r)` across **all reborrowable 6-state
+permissions** (`e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared)`),
+minting child tag `s.memory.nextTag` with `parentTag = some ptrVal.tag` and
+performing the initial child read across the borrow hierarchy (`I-10`). -/
+theorem sim_lm3_3_interpreter_reborrow_step
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {dstDecl refDecl : LocalDecl}
+    {bk : BorrowKind} {refMut dstMut : Mutability}
+    {pointeeKind dstPointee : RigidTy}
+    {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨refIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref refMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
+    (hlive_zero_perm : ∀ ptrVal e,
+      get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      get? s.frame.locals e.localIdx ≠ some .dead ∧
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
+      (∀ tgtDecl, get? body.localDecls e.localIdx = some tgtDecl →
+        tgtDecl.ty.kind = pointeeKind))
+    (hanc_read : ∀ ptrVal e,
+      get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
+    let treeMap' :=
+      reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx
+        s.memory.nextTag
+    TreeBorrowsRel s.memory.borrows s.memory.activeProtectors
+      (basedNormalTree s.memory.borrows s.memory.activeProtectors) ∧
+    StepRelLM3_2Tree body m treeMap'
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    (∀ s', stepMirFn body s = .step s' →
+      ∃ m',
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+          (m', .ok true) ∧
+        StateRelLM3_2Tree body s' m' treeMap' ∧
+        TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+          (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) := by
+  dsimp only []
+  have hpre := (stateRelLM3_2Tree_treeBorrowsRel htree).2
+  have hstep := step_reborrow_safeRef_tree_simulation_explicit htree hphase hbb hstmt
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm hanc_read
+  refine ⟨hpre, hstep, fun s' hs' => ?_⟩
+  generalize hm :
+    Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mr at hstep ⊢
+  rw [hs'] at hstep
+  cases hstep with
   | step _ m' _ htree' =>
     exact ⟨m', rfl, htree', (stateRelLM3_2Tree_treeBorrowsRel htree').2⟩
 

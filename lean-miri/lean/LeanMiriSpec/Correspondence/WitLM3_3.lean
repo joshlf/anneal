@@ -49,6 +49,16 @@ one-location Tree Borrows access (`Tree.NormalTreeState.performAccess`) on the
   protected `Unique` sibling survives without UB), and `Retag([default])` on a
   non-null provenance-free dangling `&()` steps cleanly while null `&()` faults
   with `.fail .ub`.
+* (j) `wit_lm3_3_subprojection_disjoint_vs_overlapping_real_steps`: borrowing
+  disjoint tuple fields `&mut (_1.0)` and `&(_1.1)` with a function-entry
+  protector on `_1.1` allows writing through `&mut (_1.0)` without disabling or
+  conflicting with the protected borrow of `_1.1`, whereas borrowing the
+  overlapping field `&(_1.0)` causes the write to fault with `.fail .ub`.
+* (k) `wit_lm3_3_zst_deref_reborrow_and_phantom_retag_real_steps`: a shared
+  deref reborrow `_4 = &(*_3)` on `_3 : &mut ()` and a function-entry retag on
+  `&PhantomData<u64>` both skip the 0-byte initial child read via
+  `placeIsZeroSized` / `rigidTyIsZeroSized`, preserving a protected `Unique`
+  sibling without UB.
 -/
 
 namespace LeanMiriSpec.Correspondence.WitnessLM3_3
@@ -644,5 +654,189 @@ theorem wit_lm3_3_zst_retag_skips_read_and_dangling_scalar_real_steps :
     stepMirFn bodyI initINullAt5 = .fail .ub := by
   refine ⟨⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
       rfl, rfl, rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl⟩
+
+/-! ## (j) Disjoint vs. overlapping sub-place projections (`&mut (_1.0)` vs. `&(_1.1)` / `&(_1.0)`) -/
+
+/-- `(u64, u64)` tuple type. -/
+def tupleU64U64T : Ty :=
+  { kind := .tuple [.uint .u64, .uint .u64], layoutIdx := 0 }
+
+/-- Field projection `_(localIdx).(fieldIdx)` of type `u64`. -/
+def fieldU64 (localIdx fieldIdx : Nat) : Place :=
+  { local_ := localIdx, projection := [.field fieldIdx u64T] }
+
+/-- `BorrowEntry` on `_1` at projection `proj`. -/
+def entryProj (tag : Nat) (perm : TreeBorrowPerm) (proj : List ProjectionElem)
+    (parentTag : Option Nat := none) (protector : Option Nat := none) : BorrowEntry :=
+  { tag := tag
+    targetLocal := 1
+    targetProjection := proj
+    perm := perm
+    protector := protector
+    parentTag := parentTag }
+
+/-- Disjoint-field witness body:
+```text
+bb0: _2 = &mut (_1.0);           // tag 1: ReservedFrz false at [.field 0 u64T]
+     _3 = &(_1.1);               // tag 2: Frozen at [.field 1 u64T]
+     Retag([fn entry] _3);       // tag 3: protected Frozen at [.field 1 u64T], parent 2
+     (*_2) = const 99_u64;       // writes _1.0: activates tag 1 to Unique, leaves tags 2 & 3 Frozen!
+     _0 = copy (*_3);            // reads _1.1 = 20_u64 through protected tag 3!
+     return
+``` -/
+def bodyJDisjoint : CapturedMir :=
+  witBody "lm_3_3_witness::subproj_disjoint" 8
+    [declOf u64T, declOf tupleU64U64T, refMutDecl (.uint .u64), refDecl (.uint .u64)]
+    [stmt (.assign (loc 2) (.ref (.mut false) (fieldU64 1 0))),
+     stmt (.assign (loc 3) (.ref .shared (fieldU64 1 1))),
+     stmt (.retag .fnEntry (loc 3)),
+     stmt (.assign (deref 2) (.use (cU64 99))),
+     stmt (.assign (loc 0) (.use (.copy (deref 3))))]
+
+/-- Overlapping-field witness body (borrowing `_1.0` instead of `_1.1`):
+```text
+bb0: _2 = &mut (_1.0);           // tag 1: ReservedFrz false at [.field 0 u64T]
+     _3 = &(_1.0);               // tag 2: Frozen at [.field 0 u64T]
+     Retag([fn entry] _3);       // tag 3: protected Frozen at [.field 0 u64T], parent 2
+     (*_2) = const 99_u64;       // writes _1.0 while overlapping tag 3 is protected Frozen -> UB!
+     return
+``` -/
+def bodyJOverlap : CapturedMir :=
+  witBody "lm_3_3_witness::subproj_overlap" 8
+    [declOf u64T, declOf tupleU64U64T, refMutDecl (.uint .u64), refDecl (.uint .u64)]
+    [stmt (.assign (loc 2) (.ref (.mut false) (fieldU64 1 0))),
+     stmt (.assign (loc 3) (.ref .shared (fieldU64 1 0))),
+     stmt (.retag .fnEntry (loc 3)),
+     stmt (.assign (deref 2) (.use (cU64 99)))]
+
+/-- Initial state for `bodyJDisjoint` and `bodyJOverlap`: `_1 = (10_u64, 20_u64)`. -/
+def initJ : MachineState :=
+  witInit
+    [.uninit,
+     .init (.aggregate 0 [.scalar ⟨10, 8⟩, .scalar ⟨20, 8⟩]),
+     .uninit,
+     .uninit]
+
+/-- **(j) `wit_lm3_3_subprojection_disjoint_vs_overlapping_real_steps`**:
+contrasts disjoint vs. overlapping tuple-field borrows under an active
+function-entry protector:
+1. In `bodyJDisjoint`, `_2 = &mut (_1.0)` (`tag 1` at `[.field 0 u64T]`) and
+   `Retag([fn entry] _3)` on `_3 = &(_1.1)` (`tag 3` protected `Frozen` at
+   `[.field 1 u64T]`, `activeProtectors = [1]`) target disjoint projections
+   (`borrowEntryOverlapsWrite = false`), so writing `(*_2) = 99` activates
+   `tag 1` to `Unique` while leaving `tag 2` and protected `tag 3` untouched as
+   `Frozen`, and `_0 = copy (*_3)` reads `20_u64`.
+2. In `bodyJOverlap`, `_3 = &(_1.0)` borrows the same field `[.field 0 u64T]`;
+   after `Retag([fn entry] _3)` protects `tag 3` on `_1.0`, the write
+   `(*_2) = 99` faults with `.fail .ub` (`hasProtectedTreeWriteConflict = true`). -/
+theorem wit_lm3_3_subprojection_disjoint_vs_overlapping_real_steps :
+    (∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyJDisjoint initJ = .step s₁ ∧
+      s₁.memory.borrows = [entryProj 1 .reserved [.field 0 u64T]] ∧
+      stepMirFn bodyJDisjoint s₁ = .step s₂ ∧
+      s₂.memory.borrows =
+        [entryProj 2 .frozen [.field 1 u64T],
+         entryProj 1 .reserved [.field 0 u64T]] ∧
+      stepMirFn bodyJDisjoint s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entryProj 3 .frozen [.field 1 u64T] (some 2) (some 1),
+         entryProj 2 .frozen [.field 1 u64T],
+         entryProj 1 .reserved [.field 0 u64T]] ∧
+      s₃.memory.activeProtectors = [1] ∧
+      stepMirFn bodyJDisjoint s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entryProj 3 .frozen [.field 1 u64T] (some 2) (some 1),
+         entryProj 2 .frozen [.field 1 u64T],
+         entryProj 1 .unique [.field 0 u64T]] ∧
+      get? s₄.frame.locals 1 =
+        some (.init (.aggregate 0 [.scalar ⟨99, 8⟩, .scalar ⟨20, 8⟩])) ∧
+      stepMirFn bodyJDisjoint s₄ = .step s₅ ∧
+      get? s₅.frame.locals 0 = some (.init (.scalar ⟨20, 8⟩))) ∧
+    (∃ o₁ o₂ o₃ : MachineState,
+      stepMirFn bodyJOverlap initJ = .step o₁ ∧
+      stepMirFn bodyJOverlap o₁ = .step o₂ ∧
+      stepMirFn bodyJOverlap o₂ = .step o₃ ∧
+      o₃.memory.borrows =
+        [entryProj 3 .frozen [.field 0 u64T] (some 2) (some 1),
+         entryProj 2 .frozen [.field 0 u64T],
+         entryProj 1 (.reservedFrz false) [.field 0 u64T]] ∧
+      stepMirFn bodyJOverlap o₃ = .fail .ub) := by
+  refine ⟨⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩,
+    ⟨_, _, _, rfl, rfl, rfl, rfl, rfl⟩⟩
+
+/-! ## (k) ZST deref reborrow `&(*_3)` and `PhantomData<u64>` retag skip initial reads -/
+
+/-- ```text
+bb0: _2 = &mut _1;               // tag 1: ReservedFrz false on _1 : ()
+     Retag([fn entry] _2);       // tag 2: protected ReservedFrz false, parent 1
+     (*_2) = copy _1;            // child write activates tags 2 & 1 to Unique (tag 2 protected!)
+     _3 = &mut _1;               // tag 3: ReservedFrz false sibling on _1 : ()
+     _4 = &(*_3);                // tag 4: Frozen, parent 3 — ZST deref reborrow skips read!
+     _6 = &_5;                   // tag 5: Frozen on _5 : PhantomData<u64>
+     Retag([fn entry] _6);       // tag 6: protected Frozen, parent 5 — PhantomData skips read!
+     return
+``` -/
+def bodyK : CapturedMir :=
+  witBody "lm_3_3_witness::zst_deref_reborrow_and_phantom" 8
+    [declOf unitT, declOf unitT,
+      refMutDecl (.tuple []), refMutDecl (.tuple []), refDecl (.tuple []),
+      declOf phantomU64T, refDecl phantomU64T.kind]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.retag .fnEntry (loc 2)),
+     stmt (.assign (deref 2) (.use (.copy (loc 1)))),
+     stmt (.assign (loc 3) (.ref (.mut false) (loc 1))),
+     stmt (.assign (loc 4) (.ref .shared (deref 3))),
+     stmt (.assign (loc 6) (.ref .shared (loc 5))),
+     stmt (.retag .fnEntry (loc 6))]
+
+/-- Initial state of `bodyK` with `_1 = ()` and `_5 = PhantomData<u64>`. -/
+def initK : MachineState :=
+  witInit [.uninit, .init .unit, .uninit, .uninit, .uninit, .init .unit, .uninit]
+
+/-- **(k) `wit_lm3_3_zst_deref_reborrow_and_phantom_retag_real_steps`**:
+1. `_2 = &mut _1`, `Retag([fn entry] _2)`, and `(*_2) = copy _1` activate
+   protected child tag `2` (`protector = some 1`, `activeProtectors = [1]`) and
+   parent tag `1` to `Unique` on `_1 : ()` (even when `layouts[0]` has size `8`,
+   via structural `placeIsZeroSized`);
+2. `_3 = &mut _1` creates sibling `ReservedFrz false` tag `3`, and the shared
+   deref reborrow `_4 = &(*_3)` allocates `Frozen` child tag `4`
+   (`parentTag = some 3`) while **skipping** the 0-byte initial child read via
+   `placeIsZeroSized`, so protected `Unique` sibling `tag 2` survives untouched
+   without triggering `ProtectedDisabled` UB;
+3. `_6 = &_5` and `Retag([fn entry] _6)` on `_5 : core::marker::PhantomData<u64>`
+   allocate `Frozen` tag `5` and protected `Frozen` child tag `6`
+   (`parentTag = some 5`, `protector = some 2`), also skipping the 0-byte
+   initial child read via `rigidTyIsZeroSized` on `PhantomData`. -/
+theorem wit_lm3_3_zst_deref_reborrow_and_phantom_retag_real_steps :
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ s₇ : MachineState,
+      stepMirFn bodyK initK = .step s₁ ∧
+      stepMirFn bodyK s₁ = .step s₂ ∧
+      stepMirFn bodyK s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyK s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .reserved, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyK s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 4 .frozen (some 3),
+         entry 3 .reserved,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      stepMirFn bodyK s₅ = .step s₆ ∧
+      stepMirFn bodyK s₆ = .step s₇ ∧
+      s₇.memory.borrows =
+        [{ tag := 6, targetLocal := 5, targetProjection := .nil, perm := .frozen,
+           protector := some 2, parentTag := some 5 },
+         { tag := 5, targetLocal := 5, targetProjection := .nil, perm := .frozen,
+           protector := none, parentTag := none },
+         entry 4 .frozen (some 3),
+         entry 3 .reserved,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      s₇.memory.activeProtectors = [2, 1] ∧
+      TreeBorrowsRel s₇.memory.borrows s₇.memory.activeProtectors
+        (basedNormalTree s₇.memory.borrows s₇.memory.activeProtectors) := by
+  refine ⟨_, _, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
 
 end LeanMiriSpec.Correspondence.WitnessLM3_3
