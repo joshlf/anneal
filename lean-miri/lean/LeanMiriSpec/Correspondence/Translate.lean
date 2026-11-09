@@ -521,7 +521,7 @@ def layoutOfEncodedTyId (tyId : Miri.MIR.TyId) (layouts : LayoutTable := emptyLa
   | 50 => translateTy { kind := .never, layoutIdx := 0 }
   | 51 => translateTy { kind := .tuple .nil, layoutIdx := 0 }
   | n =>
-      let idx := if n ≥ 1000 then (n - 1000) / 100 else n - 100
+      let idx := n - 100
       match layouts.lookup idx with
       | some tl => { ty := tyId, layout := translateTypeLayout tl }
       | none => { ty := tyId, layout := zstLayoutData }
@@ -1289,6 +1289,100 @@ def annealResolveAndCacheLocalLayout (localDecls : List LocalDecl) (layouts : La
       else
         throw (.stack .emptyStack)
 
+/-- Resolve the `LocalLayout` of field `fieldIdx` of `parent` using `hintFieldTy`
+when supplied by a `ProjectionElem.Field`, or `TypeLayout.fieldLayouts` /
+`BackendRepr` when called from `Miri.Interpreter.writeAggregate`. -/
+def annealFieldLayout (layouts : LayoutTable) (hintFieldTy : Option Miri.MIR.TyId)
+    (parent : Miri.Interpreter.LocalLayout) (fieldIdx : Nat) :
+    Except Miri.Interpreter.ProjectionError Miri.Interpreter.LocalLayout :=
+  match hintFieldTy with
+  | some ft => .ok (layoutOfEncodedTyId ft layouts)
+  | none =>
+      let fromTable : Option Miri.Interpreter.LocalLayout :=
+        if parent.ty ≥ 100 && parent.ty < 900 then
+          match layouts.lookup (parent.ty - 100) with
+          | some tl =>
+              match get? tl.fieldLayouts fieldIdx with
+              | some fLayoutIdx =>
+                  match layouts.lookup fLayoutIdx with
+                  | some fTl => some { ty := 100 + fLayoutIdx, layout := translateTypeLayout fTl }
+                  | none => none
+              | none => none
+          | none => none
+        else
+          none
+      match fromTable with
+      | some fl => .ok fl
+      | none =>
+          match parent.layout.backendRepr with
+          | .Scalar s =>
+              if fieldIdx == 0 then
+                let sz := (s.size annealRuntimeDataLayout).toOption.getD parent.layout.size
+                let al := translateAlignBytes sz.bytes.toNat
+                .ok { ty := 0
+                      layout := { parent.layout with
+                        fields := .Primitive
+                        variants := .Single 0
+                        size := sz
+                        align := ⟨al⟩
+                        unadjustedAbiAlign := al } }
+              else
+                .error (.invariant "scalar layout has only field 0")
+          | .ScalarPair (a := a) (b := b) (bOffset := _) =>
+              if fieldIdx == 0 then
+                let sz := (a.size annealRuntimeDataLayout).toOption.getD Miri.ABI.Size.ZERO
+                let al := translateAlignBytes sz.bytes.toNat
+                .ok { ty := 0
+                      layout := { parent.layout with
+                        fields := .Primitive
+                        variants := .Single 0
+                        backendRepr := .Scalar a
+                        size := sz
+                        align := ⟨al⟩
+                        unadjustedAbiAlign := al } }
+              else if fieldIdx == 1 then
+                let sz := (b.size annealRuntimeDataLayout).toOption.getD Miri.ABI.Size.ZERO
+                let al := translateAlignBytes sz.bytes.toNat
+                .ok { ty := 0
+                      layout := { parent.layout with
+                        fields := .Primitive
+                        variants := .Single 0
+                        backendRepr := .Scalar b
+                        size := sz
+                        align := ⟨al⟩
+                        unadjustedAbiAlign := al } }
+              else
+                .error (.invariant "scalarPair layout has only fields 0 and 1")
+          | _ => .error (.invariant "missing field layout in LayoutTable")
+
+/-- `ProjectionCx` instantiated for struct and tuple field projections in
+Anneal's single-threaded machine, wiring upstream
+`Miri.Interpreter.projectionImmediateOffset` and thin-pointer offset arithmetic
+for `Miri.Interpreter.project` / `Miri.Interpreter.projectField`. -/
+def annealStructProjectionCx (layouts : LayoutTable)
+    (hintFieldTy : Option Miri.MIR.TyId := none)
+    (localIdx : Miri.MIR.LocalId → Except Miri.Interpreter.ProjectionError UInt64 := fun _ => .error (.invariant "localIndex not wired in LM-2.2")) :
+    Miri.Interpreter.ProjectionCx AnnealProv where
+  target := annealTargetDataLayout
+  maxSizeOfVal := Miri.ABI.Size.ofBytes (UInt64.ofNat (2 ^ 63 - 1))
+  isSliceOrStr := fun _ => .ok false
+  field := fun parent fieldIdx => annealFieldLayout layouts hintFieldTy parent fieldIdx
+  variant := fun parent vIdx =>
+    if vIdx == 0 then .ok parent
+    else .error (.invariant "multi-variant downcast not wired in LM-2.2")
+  dynamicAlign := fun _ lay => .ok (some lay.layout.align.abi)
+  packedAlign := fun _ => .ok none
+  immediateOffset := fun value source offset target =>
+    Miri.Interpreter.projectionImmediateOffset (fun _ _ => .ok ()) value source offset target false
+  memoryOffset := fun place offset _ metadata => do
+    if metadata.hasMeta then throw (.invariant "metadata on thin memory projection")
+    let newOffset ← place.ptr.offset.add offset |>.mapError .size
+    return { place with ptr := { place.ptr with offset := newOffset }, metadata := .none }
+  subsliceLayout := fun _ _ => .error (.invariant "subsliceLayout not wired in LM-2.2")
+  layoutOf := fun tyId => .ok (layoutOfEncodedTyId tyId layouts)
+  deref := fun _ => .error (.invariant "deref not wired in LM-2.2")
+  localIndex := localIdx
+
 /-- Map a `Miri.Interpreter.ProjectionError` to a `Miri.Interpreter.StepError`.
 
 The vendored interpreter has no such lifting for operand projections (its
@@ -1751,6 +1845,24 @@ def annealDerefOperandToMemPlace (localDecls : List LocalDecl) (layouts : Layout
     | .error err => throw (.invalidProgram (toString err))
   return (⟨ptr, .none, mismatch⟩, pointeeLay)
 
+/-- Project an `OpTy AnnealProv` along a sequence of `Miri.MIR.ProjectionElem`s
+using upstream `Miri.Interpreter.project` (`Miri.Interpreter.projectField`). -/
+def annealEvalProjection (layouts : LayoutTable)
+    (base : Miri.Interpreter.OpTy AnnealProv) :
+    List Miri.MIR.ProjectionElem →
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv)
+  | [] => return base
+  | elem :: rest => do
+      let hintTy :=
+        match elem with
+        | .Field _ ft => some ft
+        | _ => none
+      let next ←
+        match Miri.Interpreter.project (annealStructProjectionCx layouts hintTy) base elem with
+        | .ok opTy => pure opTy
+        | .error err => throw (annealLiftProjectionError err)
+      annealEvalProjection layouts next rest
+
 /-- Evaluate a local, a dereferenced pointer place (`*_p`), one field of a
 scalar-pair local, an indexed array element, or a constant `Miri.MIR.Operand`
 in the top frame of `AnnealStepState`.
@@ -1836,9 +1948,19 @@ def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
       | [Miri.MIR.ProjectionElem.Field idx fieldTy] =>
           match operand with
           | .immediate (.scalarPair s0 s1) =>
-              let fieldImm := if idx == 0 then s0 else s1
-              return ⟨.immediate (.scalar fieldImm), ⟨fieldTy, layout.layout⟩⟩
-          | _ => throw (Miri.Interpreter.StepError.unsupported "projected operand not scalarPair")
+              if idx == 0 then
+                return ⟨.immediate (.scalar s0), ⟨fieldTy, layout.layout⟩⟩
+              else if idx == 1 then
+                return ⟨.immediate (.scalar s1), ⟨fieldTy, layout.layout⟩⟩
+              else
+                annealEvalProjection layouts ⟨operand, layout⟩
+                  [Miri.MIR.ProjectionElem.Field idx fieldTy]
+          | _ =>
+              annealEvalProjection layouts ⟨operand, layout⟩
+                [Miri.MIR.ProjectionElem.Field idx fieldTy]
+      | projs@(Miri.MIR.ProjectionElem.Field _ _ :: _)
+      | projs@(Miri.MIR.ProjectionElem.Downcast _ _ :: _) =>
+          annealEvalProjection layouts ⟨operand, layout⟩ projs
       | _ =>
           match operand with
           | .immediate .uninit =>
@@ -1860,6 +1982,68 @@ def annealEvalOperand (localDecls : List LocalDecl) (layouts : LayoutTable)
       | .error e => throw e
   | .RuntimeChecks _ =>
       throw (.unsupported "RuntimeChecks operand")
+
+/-- Project a `RuntimePlace AnnealProv` to field `fieldIdx` using upstream
+`Miri.Interpreter.projectField` (`Place.projectRuntimePlace` carrier semantics). -/
+def annealProjectFieldPlace (layouts : LayoutTable)
+    (hintFieldTy : Option Miri.MIR.TyId)
+    (place : Miri.Interpreter.RuntimePlace AnnealProv)
+    (fieldIdx : Nat) :
+    Except Miri.Interpreter.StepError (Miri.Interpreter.RuntimePlace AnnealProv) := do
+  let cx := annealStructProjectionCx layouts hintFieldTy
+  match place.ref with
+  | .memory mplace =>
+      match Miri.Interpreter.projectField cx ⟨.indirect mplace, place.layout⟩ fieldIdx with
+      | .ok ⟨.indirect mplace', layout'⟩ => return ⟨.memory mplace', layout'⟩
+      | .ok ⟨.immediate _, _⟩ => throw (.invalidProgram "memory projection returned immediate")
+      | .error err => throw (annealLiftProjectionError err)
+  | .local frame localId offset identity =>
+      let baseOffset := offset.getD Miri.ABI.Size.ZERO
+      let carrier : Miri.Interpreter.MemPlace AnnealProv := ⟨⟨baseOffset, none⟩, .none, none⟩
+      match Miri.Interpreter.projectField cx ⟨.indirect carrier, place.layout⟩ fieldIdx with
+      | .ok ⟨.indirect result, layout'⟩ =>
+          let bound ←
+            match result.ptr.offset.add layout'.layout.size with
+            | .ok b => pure b
+            | .error _ => throw (.invalidProgram "projected local size overflow")
+          let endOffset ←
+            match baseOffset.add place.layout.layout.size with
+            | .ok e => pure e
+            | .error _ => throw (.invalidProgram "local size overflow")
+          if result.ptr.offset.bytes < baseOffset.bytes || bound.bytes > endOffset.bytes then
+            throw (.invalidProgram "projected local is out of bounds")
+          else
+            return ⟨.local frame localId (some result.ptr.offset) identity, layout'⟩
+      | .ok ⟨.immediate _, _⟩ => throw (.invalidProgram "local projection returned immediate")
+      | .error err => throw (annealLiftProjectionError err)
+
+/-- Project a `RuntimePlace AnnealProv` along a list of `Miri.MIR.ProjectionElem`s. -/
+def annealProjectPlaceList (layouts : LayoutTable)
+    (place : Miri.Interpreter.RuntimePlace AnnealProv) :
+    List Miri.MIR.ProjectionElem →
+    Except Miri.Interpreter.StepError (Miri.Interpreter.RuntimePlace AnnealProv)
+  | [] => .ok place
+  | .Field fieldIdx fieldTy :: rest => do
+      let next ← annealProjectFieldPlace layouts (some fieldTy) place fieldIdx
+      annealProjectPlaceList layouts next rest
+  | .Downcast _ 0 :: rest =>
+      annealProjectPlaceList layouts place rest
+  | _ :: _ => .error (.unsupported "non-field place projection in LM-2.2")
+
+/-- Resolve a projected `Miri.MIR.Place` to a `RuntimePlace AnnealProv` in the top frame. -/
+def annealEvalProjectedPlace (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (place : Miri.MIR.Place) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.RuntimePlace AnnealProv) := do
+  let st ← get
+  if st.stack.currentFrame?.isNone then
+    throw (.stack .emptyStack)
+  let frameIdx := st.stack.frames.size - 1
+  let (frame', layout) ← annealResolveAndCacheLocalLayout localDecls layouts place.localId none
+  let base : Miri.Interpreter.RuntimePlace AnnealProv :=
+    ⟨.local frameIdx place.localId none frame'.localsIdentity, layout⟩
+  match annealProjectPlaceList layouts base place.projection.toList with
+  | .ok p => return p
+  | .error err => throw err
 
 /-- Resolve an unprojected local `Miri.MIR.Place`, a single-deref pointer place
 (`*_p`), or an indexed array element projection (`Index` / `ConstantIndex`) on
@@ -1885,6 +2069,8 @@ def annealEvalPlace (localDecls : List LocalDecl) (layouts : LayoutTable)
         let (mplace, pointeeLay) ←
           annealDerefOperandToMemPlace localDecls layouts place.localId operand layout
         return ⟨.memory mplace, pointeeLay⟩
+    | .Field _ _ :: _ | .Downcast _ _ :: _ =>
+        annealEvalProjectedPlace localDecls layouts place
     | _ =>
         let st ← get
         if st.stack.currentFrame?.isNone then
@@ -2779,5 +2965,654 @@ def annealStepHooks (localDecls : List LocalDecl := .nil)
   beforeTerminator := fun _ state => (state, .ok ())
   terminator := fun choice term state =>
     Miri.Interpreter.ControlFlow.evalTerminator (annealTerminatorHooks localDecls layouts) choice term state
+
+
+/-! ## `LM-2.2` Aggregate / Struct / Tuple / Enum / Union Hook Suite -/
+
+/-- Read an `Immediate` from a memory-backed `MemPlace AnnealProv` at `layout`,
+diagnosing `StepError.undefinedBehavior` when the field's byte range in the
+underlying `Allocation` is uninitialized (`InvalidUninitBytes`), extracting
+`(address, length)` metadata exclusively for `arraySliceMetaTyId` (`Rvalue.len`),
+and failing closed (`StepError.unsupported`) on whole-array immediate reads. -/
+def annealReadIndirectImmediate (mp : Miri.Interpreter.MemPlace AnnealProv)
+    (layout : Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.RvalueImmTy AnnealProv) := do
+  let state ← get
+  let memory := state.machine.memory
+  let some id := mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
+    | throw (.unsupported "memory read through a pointer without an allocation")
+  let some base := state.machine.lookupBaseAddr id
+    | throw (.unsupported "memory read from an allocation without a base address")
+  let offset := Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes - base)
+  match memory.live.find? (fun (k, _) => k == id) with
+  | none => throw (.undefinedBehavior "dangling allocation in memory read")
+  | some (_, ⟨_, alloc⟩) =>
+      match layout.layout.fields with
+      | .Array _ count =>
+          if layout.ty == arraySliceMetaTyId then
+            match alloc.initializationMask.isRangeInitialized (Miri.Memory.allocRange offset layout.layout.size) with
+            | Except.ok (Except.ok ()) =>
+                let some countSc := (Miri.Memory.ScalarInt.tryFromUInt (BitVec.ofNat 128 count.toNat) (Miri.ABI.Size.ofBytes 8)).toOption.join
+                  | throw (.invalidProgram "array length overflow")
+                let some prov := mp.ptr.provenance
+                  | throw (.unsupported "indirect array operand without provenance")
+                let ptrSc := Miri.Memory.Scalar.fromPointer annealTargetDataLayout ⟨mp.ptr.offset, prov⟩
+                return ⟨.scalarPair ptrSc (.fromScalarInt countSc), translateTy { kind := .ref .not (.slice .bool), layoutIdx := 0 }⟩
+            | _ => throw (.undefinedBehavior "len of uninitialized array")
+          else
+            throw (.unsupported "whole-array immediate read not supported")
+      | _ =>
+          if layout.layout.size == Miri.ABI.Size.ZERO then
+            return ⟨.uninit, layout⟩
+          else
+            match layout.layout.backendRepr with
+            | .Scalar _ =>
+                match alloc.readScalar annealTargetDataLayout
+                    (Miri.Memory.allocRange offset layout.layout.size) false with
+                | .ok s => return ⟨.scalar s, layout⟩
+                | .error (.invalidUninitBytes _) =>
+                    throw (.undefinedBehavior "read of uninitialized memory field")
+                | .error (.outOfBounds ..) =>
+                    throw (.undefinedBehavior "out-of-bounds memory field read")
+                | .error _ => throw (.unsupported "readScalar failed")
+            | .ScalarPair (a := a) (b := b) (bOffset := bOff) =>
+                let szA := (a.size annealRuntimeDataLayout).toOption.getD Miri.ABI.Size.ZERO
+                let szB := (b.size annealRuntimeDataLayout).toOption.getD Miri.ABI.Size.ZERO
+                let offB := Miri.ABI.Size.ofBytes (offset.bytes + bOff.bytes)
+                let s0 ←
+                  match alloc.readScalar annealTargetDataLayout
+                      (Miri.Memory.allocRange offset szA) false with
+                  | .ok s => pure s
+                  | .error (.invalidUninitBytes _) =>
+                      throw (.undefinedBehavior "read of uninitialized scalarPair field 0")
+                  | .error (.outOfBounds ..) =>
+                      throw (.undefinedBehavior "out-of-bounds scalarPair field 0 read")
+                  | .error _ => throw (.unsupported "readScalar field 0 failed")
+                let s1 ←
+                  match alloc.readScalar annealTargetDataLayout
+                      (Miri.Memory.allocRange offB szB) false with
+                  | .ok s => pure s
+                  | .error (.invalidUninitBytes _) =>
+                      throw (.undefinedBehavior "read of uninitialized scalarPair field 1")
+                  | .error (.outOfBounds ..) =>
+                      throw (.undefinedBehavior "out-of-bounds scalarPair field 1 read")
+                  | .error _ => throw (.unsupported "readScalar field 1 failed")
+                return ⟨.scalarPair s0 s1, layout⟩
+            | _ => throw (.unsupported "indirect non-scalar readImmediate")
+
+/-- Read an `Immediate` from an `OpTy AnnealProv` in `AnnealStepState`, raising
+`StepError.undefinedBehavior` on `.uninit` just as `MirSemantics.evalOperand` raises
+`.fail .ub`, and reading scalar/scalarPair fields from memory on `.indirect`. -/
+def annealReadImmediateLM2_2 (op : Miri.Interpreter.OpTy AnnealProv) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.RvalueImmTy AnnealProv) := do
+  match op.op with
+  | .immediate (.scalar s) => return ⟨.scalar s, op.layout⟩
+  | .immediate (.scalarPair s1 s2) => return ⟨.scalarPair s1 s2, op.layout⟩
+  | .immediate .uninit => throw (.undefinedBehavior "read of uninitialized local")
+  | .indirect mp => annealReadIndirectImmediate mp op.layout
+
+/-- Write an `Immediate AnnealProv` into a memory-backed `MemPlace AnnealProv` at
+relative byte offset `relOffset` and field layout `fieldLayout`. -/
+def annealWriteIndirectImmediate (val : Miri.Interpreter.Immediate AnnealProv)
+    (mp : Miri.Interpreter.MemPlace AnnealProv)
+    (relOffset : Miri.ABI.Size)
+    (fieldLayout : Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit := do
+  let state ← get
+  let memory := state.machine.memory
+  let some id := mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
+    | throw (.unsupported "memory write through a pointer without an allocation")
+  let some base := state.machine.lookupBaseAddr id
+    | throw (.unsupported "memory write to an allocation without a base address")
+  let offset := Miri.ABI.Size.ofBytes ((mp.ptr.offset.bytes - base) + relOffset.bytes)
+  match memory.live.findIdx? (fun (k, _) => k == id) with
+  | some idx =>
+      match memory.live[idx]? with
+      | some (k, ⟨kind, alloc⟩) =>
+          let alloc' ←
+            match val with
+            | .uninit =>
+                if fieldLayout.layout.size == Miri.ABI.Size.ZERO then
+                  pure alloc
+                else
+                  match Miri.Memory.Allocation.writeUninit
+                      (Miri.Memory.allocRange offset fieldLayout.layout.size)
+                      (Miri.ABI.Size.ofBytes 8) alloc with
+                  | EStateM.Result.ok _ a => pure a
+                  | EStateM.Result.error _ _ => throw (.unsupported "writeUninit failed")
+            | .scalar s =>
+                match Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+                    (Miri.Memory.allocRange offset s.size) s alloc with
+                | EStateM.Result.ok _ a => pure a
+                | EStateM.Result.error _ _ => throw (.unsupported "writeScalar failed")
+            | .scalarPair s0 s1 =>
+                match fieldLayout.layout.backendRepr with
+                | .ScalarPair (a := _) (b := _) (bOffset := bOff) =>
+                    let alloc₁ ←
+                      match Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+                          (Miri.Memory.allocRange offset s0.size) s0 alloc with
+                      | EStateM.Result.ok _ a => pure a
+                      | EStateM.Result.error _ _ => throw (.unsupported "writeScalar s0 failed")
+                    let offB := Miri.ABI.Size.ofBytes (offset.bytes + bOff.bytes)
+                    match Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+                        (Miri.Memory.allocRange offB s1.size) s1 alloc₁ with
+                    | EStateM.Result.ok _ a => pure a
+                    | EStateM.Result.error _ _ => throw (.unsupported "writeScalar s1 failed")
+                | _ => throw (.unsupported "scalarPair in writeMemoryNoValidate")
+          set { state with machine := { state.machine with
+            memory := { memory with live := memory.live.set! idx (k, ⟨kind, alloc'⟩) } } }
+      | none => throw (.unsupported "allocation not found")
+  | none => throw (.unsupported "allocation not found")
+
+/-- Extended `PlaceHooks` for projected local writes and aggregate construction
+(`Miri.Interpreter.asMplaceOrMutableLocal` / `Miri.Interpreter.writePlaceImmediateNoValidate`),
+supporting thin-pointer `memoryOffset` and `.scalarPair` writes in
+`writeMemoryNoValidate` via `annealWriteIndirectImmediate` while keeping
+`annealPlaceHooks` unchanged for `LM-1.4`. -/
+def annealMutablePlaceHooks (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.PlaceHooks AnnealProv AnnealStepState Unit Unit :=
+  { annealPlaceHooks localDecls layouts with
+    writeMemoryNoValidate := fun _ value mplace =>
+      annealWriteIndirectImmediate value mplace.mplace Miri.ABI.Size.ZERO mplace.layout
+    memoryOffset := fun _ place offset _ metadata => do
+      if metadata.hasMeta then
+        throw (.invalidProgram "metadata on thin memory place offset")
+      match place.ptr.offset.add offset with
+      | .ok newOffset =>
+          return { place with ptr := { place.ptr with offset := newOffset }, metadata := .none }
+      | .error _ =>
+          throw (.invalidProgram "place memory offset overflow") }
+
+/-- Write an `Immediate AnnealProv` into a projected local place
+`.local frameIdx localId (some relOffset) _` using upstream
+`Miri.Interpreter.writePlaceImmediateNoValidate` (`asMplaceOrMutableLocal` →
+`forceAllocation`), materializing `.Scalar`, `.ScalarPair`, and `.Memory`
+immediate locals into stack `Allocation`s before writing the projected field and
+mapping dead-local `StackError.localExpectedLive` to `StepError.undefinedBehavior`.
+
+Upstream `forceAllocation` obtains the local's layout from
+`Miri.Interpreter.placeLayoutOfLocal`, which returns the layout cached in the
+frame and calls `PlaceHooks.resolveLayout` only when nothing is cached.
+`annealWriteImmediateLM2_2` calls this function with the default empty `localDecls`
+and `layouts`, so the write relies on the cache. That holds because
+`annealEvalPlace` (`annealResolveAndCacheLocalLayout`) caches the root local's
+layout before any projected write. For an uncached local, `resolveLayout` would
+fail with `StackError.missingLocalType`. -/
+def annealWriteProjectedLocalImmediate (val : Miri.Interpreter.Immediate AnnealProv)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit := fun st =>
+  match Miri.Interpreter.writePlaceImmediateNoValidate
+      (annealMutablePlaceHooks localDecls layouts) () val dest st with
+  | .ok () st' => .ok () st'
+  | .error (.stack (.localExpectedLive _)) st' =>
+      .error (.undefinedBehavior "write to dead local") st'
+  | .error err st' => .error err st'
+
+/-- Write an `Immediate AnnealProv` into a `RuntimePlace AnnealProv` in the top frame.
+
+* Out-of-bounds `localId`s propagate `StepError.stack (.invalidLocal ...)`.
+* Writing to a `.dead` local (`StackError.localExpectedLive` from
+  `Frame.getLocalOperand`) raises `StepError.undefinedBehavior` (matching rustc's
+  `err_ub!(DeadLocal)` and `MirSemantics.evalStmt` on `.assign`).
+* Unprojected writes to an `.indirect` (memory-backed) local write through its
+  `MemPlace` with `annealWriteIndirectImmediate`, exactly as upstream
+  `Miri.Interpreter.writePlaceImmediateNoValidate` does: there
+  `asMplaceOrMutableLocal` returns `.memory` for an `.indirect` local and the
+  value goes to `writeMemoryNoValidate` (`annealMutablePlaceHooks`). Since
+  aggregate construction and projected field writes move `.Scalar`/`.ScalarPair`
+  struct locals into memory (`forceAllocation`), a later whole-value assignment
+  `_1 = copy _2` must take this path.
+* Projected field writes delegate to upstream
+  `Miri.Interpreter.writePlaceImmediateNoValidate` via
+  `annealWriteProjectedLocalImmediate`, and `.memory` places delegate to
+  `annealWriteIndirectImmediate`. -/
+def annealWriteImmediateLM2_2 (val : Miri.Interpreter.Immediate AnnealProv)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit := do
+  let st ← get
+  let some frame := st.stack.currentFrame?
+    | throw (.stack .emptyStack)
+  match dest.ref with
+  | .local frameIdx localId none _ =>
+      if frameIdx != st.stack.frames.size - 1 then
+        throw (.invalidProgram "place refers to another frame")
+      match frame.getLocalOperand localId with
+      | .error (.localExpectedLive _) =>
+          throw (.undefinedBehavior "write to dead local")
+      | .error e =>
+          throw (.stack e)
+      | .ok (.indirect mp) =>
+          annealWriteIndirectImmediate val mp Miri.ABI.Size.ZERO dest.layout
+      | .ok (.immediate _) =>
+          let updatedFrame ←
+            match frame.replaceLocalValue localId (.live (.immediate val)) with
+            | .ok f => pure f
+            | .error e => throw (.stack e)
+          let idx := st.stack.frames.size - 1
+          if h : idx < st.stack.frames.size then
+            set { st with stack := { frames := st.stack.frames.set idx updatedFrame h } }
+          else
+            throw (.stack .emptyStack)
+  | .local _ _ (some _) _ =>
+      annealWriteProjectedLocalImmediate val dest
+  | .memory mp =>
+      annealWriteIndirectImmediate val mp Miri.ABI.Size.ZERO dest.layout
+
+/-- `CastHooks` instantiated for Anneal's single-threaded machine, supporting
+integer-like `CastKind.IntToInt` via `Miri.Interpreter.Cast.cast` and failing
+closed (`StepError.unsupported`) on float, pointer-provenance, unsizing, and
+transmute leaves. -/
+def annealCastHooksLM2_2 (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.CastHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  target := annealTargetDataLayout
+  typeInfo := fun _ tyId =>
+    match castTypeInfoOfEncodedTyId tyId with
+    | .ok info => pure info
+    | .error err => throw err
+  layoutOf := fun _ tyId => pure (layoutOfEncodedTyId tyId layouts)
+  destLayout := fun p => p.layout
+  readImmediate := fun _ op => annealReadImmediateLM2_2 op
+  writeImmediate := fun _ val dest => annealWriteImmediateLM2_2 val dest
+  writePointer := fun _ _ _ => throw (.unsupported "writePointer in cast")
+  enforceValidity := fun _ _ => pure true
+  enforceValidityRecursively := fun _ _ => pure true
+  validatePlace := fun _ _ _ _ => throw (.unsupported "validatePlace in cast")
+  derefPointer := fun _ _ => throw (.unsupported "derefPointer in cast")
+  checkFunctionPointer := fun _ _ => throw (.unsupported "checkFunctionPointer in cast")
+  exposeProvenance := fun _ _ => throw (.unsupported "exposeProvenance in cast")
+  pointerFromExposedAddress := fun _ _ => throw (.unsupported "pointerFromExposedAddress in cast")
+  usizeLayout := fun _ => pure (translateTy { kind := .uint .usize, layoutIdx := 0 })
+  floatOps := {
+    integerKindOf := fun _ _ => throw (.unsupported "floatOps.integerKindOf")
+    formatOf := fun _ _ => throw (.unsupported "floatOps.formatOf")
+    boolLayout := fun _ => pure (translateTy { kind := .bool, layoutIdx := 0 })
+    floatNondeterministic := false
+    chooseNaN := fun _ _ => throw (.unsupported "floatOps.chooseNaN") }
+  ensureMonomorphic := fun _ _ => pure ()
+  requireNoBoundVars := fun _ _ => pure ()
+  resolveFunction := fun _ _ _ => throw (.unsupported "resolveFunction in cast")
+  resolveClosureFnOnce := fun _ _ _ => throw (.unsupported "resolveClosureFnOnce in cast")
+  functionPointer := fun _ _ => throw (.unsupported "functionPointer in cast")
+  builtinDeref := fun _ _ _ => throw (.unsupported "builtinDeref in cast")
+  boxLayout := fun _ _ => throw (.unsupported "boxLayout in cast")
+  validateImmediateABI := fun _ _ => .error (.unsupported "validateImmediateABI in cast")
+  copyAllowTransmute := fun _ _ _ => throw (.unsupported "copyAllowTransmute in cast")
+  copyNoValidate := fun _ _ _ _ => throw (.unsupported "copyNoValidate in cast")
+  projectRead := fun _ _ _ => throw (.unsupported "projectRead in cast")
+  projectWrite := fun _ _ _ => throw (.unsupported "projectWrite in cast")
+  fieldLayout := fun _ _ _ => throw (.unsupported "fieldLayout in cast")
+  lockstepTails := fun _ _ _ => throw (.unsupported "lockstepTails in cast")
+  vtableType := fun _ _ _ => throw (.unsupported "vtableType in cast")
+  vtablePointer := fun _ _ _ => throw (.unsupported "vtablePointer in cast")
+  principal := fun _ _ => throw (.unsupported "principal in cast")
+  vtableEntries := fun _ _ _ => throw (.unsupported "vtableEntries in cast")
+  supertraitSlot := fun _ _ _ => throw (.unsupported "supertraitSlot in cast")
+  eraseSelfTraitRef := fun _ _ => throw (.unsupported "eraseSelfTraitRef in cast")
+  normalizePrincipal := fun _ _ => throw (.unsupported "normalizePrincipal in cast")
+
+/-- Whether `copy_op` into `dest` takes rustc's memory-to-memory `mem_copy` path
+for a non-zero-sized `AbiRepr.Memory (sized := true)` struct/tuple layout
+(`FieldsShape.Arbitrary`). -/
+def usesStructMemCopyDest (dest : Miri.Interpreter.RuntimePlace AnnealProv) : Bool :=
+  match dest.layout.layout.backendRepr with
+  | .Memory (sized := true) =>
+      match dest.layout.layout.fields with
+      | .Arbitrary _ _ => dest.layout.layout.size != Miri.ABI.Size.ZERO
+      | _ => false
+  | _ => false
+
+/-- Map an `AllocError` of a whole-value struct copy to a `StepError`. -/
+def annealStructMemCopyError : Miri.Memory.AllocError → Miri.Interpreter.StepError
+  | .copyRangesOverlap => .undefinedBehavior "whole-value copy between overlapping ranges"
+  | .outOfBounds _ _ => .undefinedBehavior "whole-value copy out of bounds"
+  | .readOnlyAllocation => .undefinedBehavior "write to read-only allocation"
+  | _ => .unsupported "whole-value copy failed"
+
+/-- Whether a copy of `size` bytes from offset `srcOff` of `srcAlloc` to offset
+`destOff` of `destAlloc` (in a different allocation) covers both allocations
+entirely and targets a mutable destination allocation (`Mutability.Mut`). -/
+def isWholeStructAllocationCopy
+    (srcAlloc destAlloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree))
+    (srcOff destOff size : Miri.ABI.Size) (sameAlloc : Bool) : Bool :=
+  !sameAlloc && srcOff.bytes == 0 && destOff.bytes == 0 &&
+    size == srcAlloc.byteSize && size == destAlloc.byteSize &&
+    destAlloc.mutability == .Mut
+
+/-- Build the mutable destination allocation produced by copying all bytes,
+initialization bits, and pointer provenance of `srcAlloc` into a mutable
+destination allocation carrying metadata `destExtra`. -/
+def copyWholeStructAllocation
+    (srcAlloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree))
+    (destExtra : Option Miri.TreeBorrows.BorrowTree) :
+    Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  (srcAlloc.withoutNativeBuffer.withMutability .Mut).setExtra destExtra
+
+/-- rustc's `copy_op` memory path for a `.Memory (sized := true)` struct/tuple
+(`usesStructMemCopyDest`): `dest.force_mplace` (`Miri.Interpreter.forceAllocation`)
+followed by `mem_copy(src, dest, dest_size, nonoverlapping = true)`, copying the
+raw bytes, initialization mask (preserving uninitialized padding bytes), and
+provenance map from `src` to `dest`. -/
+def annealStructMemCopyOp (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (src : Miri.Interpreter.OpTy AnnealProv)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv) :
+    Miri.Interpreter.RvalueM AnnealStepState Unit := do
+  match src.op with
+  | .immediate .uninit =>
+      throw (.undefinedBehavior "read of uninitialized local")
+  | .immediate imm =>
+      annealWriteImmediateLM2_2 imm dest
+  | .indirect srcMp =>
+      let forced ← fun st =>
+        match Miri.Interpreter.forceAllocation (annealMutablePlaceHooks localDecls layouts) () dest st with
+        | .ok res st' => .ok res st'
+        | .error (.stack (.localExpectedLive _)) st' =>
+            .error (.undefinedBehavior "write to dead local") st'
+        | .error err st' => .error err st'
+      let destMp := forced.mplace
+      let st ← get
+      let some srcId := srcMp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
+        | throw (.unsupported "copy source without an allocation")
+      let some srcBase := st.machine.lookupBaseAddr srcId
+        | throw (.unsupported "copy source without a base address")
+      let some (_, srcLocal) := st.machine.memory.live.find? (fun (k, _) => k == srcId)
+        | throw (.undefinedBehavior "dangling allocation in memory copy")
+      let some destId := destMp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId
+        | throw (.unsupported "copy destination without an allocation")
+      let some destBase := st.machine.lookupBaseAddr destId
+        | throw (.unsupported "copy destination without a base address")
+      let srcOff := Miri.ABI.Size.ofBytes (srcMp.ptr.offset.bytes - srcBase)
+      let destOff := Miri.ABI.Size.ofBytes (destMp.ptr.offset.bytes - destBase)
+      match st.machine.memory.live.findIdx? (fun (k, _) => k == destId) with
+      | none => throw (.undefinedBehavior "dangling allocation in memory copy")
+      | some destIdx =>
+          match st.machine.memory.live[destIdx]? with
+          | none => throw (.undefinedBehavior "dangling allocation in memory copy")
+          | some (k, ⟨kind, destAlloc⟩) =>
+              let size := dest.layout.layout.size
+              if isWholeStructAllocationCopy srcLocal.allocation destAlloc srcOff destOff size
+                  (srcId == destId) then
+                let destAlloc' := copyWholeStructAllocation srcLocal.allocation destAlloc.extra
+                set { st with machine := { st.machine with
+                  memory := { st.machine.memory with
+                    live := st.machine.memory.live.set! destIdx (k, ⟨kind, destAlloc'⟩) } } }
+              else
+                match Miri.Memory.Allocation.copy srcLocal.allocation
+                    (Miri.Memory.allocRange srcOff size) destOff
+                    (Miri.ABI.Size.ofBytes 8) (srcId == destId) true destAlloc with
+                | EStateM.Result.ok () destAlloc' =>
+                    set { st with machine := { st.machine with
+                      memory := { st.machine.memory with
+                        live := st.machine.memory.live.set! destIdx (k, ⟨kind, destAlloc'⟩) } } }
+                | EStateM.Result.error err _ => throw (annealStructMemCopyError err)
+
+/-- `AggregateHooks` instantiated for Anneal's single-threaded machine, wiring
+upstream `Miri.Interpreter.writeAggregate` and `Miri.Interpreter.writeRepeat`
+across homogeneous arrays (`annealEnsureAllocated`, `writeScalarRepeatedly`) and
+`AbiRepr.Scalar`, `AbiRepr.ScalarPair`, and `AbiRepr.Memory` structs/tuples
+(`annealProjectFieldPlace`, `annealStructMemCopyOp`, `annealWriteImmediateLM2_2`). -/
+def annealAggregateHooksLM2_2 (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.AggregateHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  target := annealTargetDataLayout
+  placeLayout := fun p => p.layout
+  evalOperand := fun _ op known => annealEvalOperand localDecls layouts op known
+  evalOperandAt := fun _ _ op known => do
+    let opTy ← annealEvalOperand localDecls layouts op known
+    match opTy.op with
+    | .immediate _ =>
+        let imm ← annealReadImmediateLM2_2 opTy
+        return ⟨.immediate imm.imm, imm.layout⟩
+    | .indirect _ =>
+        return opTy
+  readPointer := fun _ op => do
+    let imm ← annealReadImmediateLM2_2 op
+    match imm.imm.toScalar with
+    | .ok sc =>
+        match sc.toPointer annealTargetDataLayout with
+        | .ok p => return p
+        | .error _ => throw (.invalidProgram "expected pointer scalar")
+    | .error _ => throw (.invalidProgram "expected scalar immediate")
+  readScalar := fun _ op => do
+    let imm ← annealReadImmediateLM2_2 op
+    match imm.imm.toScalar with
+    | .ok sc => return sc
+    | .error _ => throw (.invalidProgram "expected scalar immediate")
+  projectDowncast := fun _ dest variant =>
+    if variant == 0 then pure dest
+    else throw (.unsupported "multi-variant aggregate downcast not wired in LM-2.2")
+  projectField := fun _ dest fieldIdx =>
+    match dest.layout.layout.fields with
+    | .Array stride _ => do
+        let mp ← annealEnsureAllocated dest
+        let elemLay := arrayElemLayoutOf layouts dest.layout stride
+        let elemOff := Miri.ABI.Size.ofBytes (UInt64.ofNat (fieldIdx * stride.bytes.toNat))
+        return ⟨.memory { mp with ptr := { mp.ptr with offset := Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes + elemOff.bytes) } }, elemLay⟩
+    | _ =>
+        match annealProjectFieldPlace layouts none dest fieldIdx with
+        | .ok p => pure p
+        | .error err => throw err
+  copyOp := fun _ src dest =>
+    if usesStructMemCopyDest ⟨dest.ref, src.layout⟩ && usesStructMemCopyDest dest then
+      annealStructMemCopyOp localDecls layouts src dest
+    else do
+      let imm ← annealReadImmediateLM2_2 src
+      annealWriteImmediateLM2_2 imm.imm dest
+  copyOpNoValidate := fun _ src dest _ =>
+    if usesStructMemCopyDest ⟨dest.ref, src.layout⟩ && usesStructMemCopyDest dest then
+      annealStructMemCopyOp localDecls layouts src dest
+    else do
+      let imm ← annealReadImmediateLM2_2 src
+      annealWriteImmediateLM2_2 imm.imm dest
+  writeDiscriminant := fun _ variant dest =>
+    match dest.layout.layout.fields with
+    | .Array _ _ | .Union _ => do
+        let _ ← annealEnsureAllocated dest
+        pure ()
+    | _ =>
+        if variant == 0 then pure ()
+        else throw (.unsupported "multi-variant aggregate writeDiscriminant not wired in LM-2.2")
+  enforceValidity := fun _ _ => pure true
+  validate := fun _ _ => pure ()
+  forceAllocation := fun _ dest => do
+    let mp ← annealEnsureAllocated dest
+    return ⟨.memory mp, dest.layout⟩
+  length := fun _ dest =>
+    match dest.layout.layout.fields with
+    | .Array _ count => pure count
+    | _ => throw (.invalidProgram "repeat destination is not an array")
+  getPlaceAllocMut := fun _ _ => pure ()
+  projectIndex := fun _ dest idx => do
+    match dest.ref, dest.layout.layout.fields with
+    | .memory mp, .Array stride _ =>
+        let elemLay := arrayElemLayoutOf layouts dest.layout stride
+        let elemOff := Miri.ABI.Size.ofBytes (UInt64.ofNat (idx.toNat * stride.bytes.toNat))
+        return ⟨.memory { mp with ptr := { mp.ptr with offset := Miri.ABI.Size.ofBytes (mp.ptr.offset.bytes + elemOff.bytes) } }, elemLay⟩
+    | _, _ => throw (.unsupported "projectIndex in aggregate")
+  placePointer := fun dest =>
+    match dest.ref with
+    | .memory mp => .ok mp.ptr
+    | _ => .error (.invalidProgram "placePointer requires mplace")
+  wrappingOffset := Miri.Interpreter.aggregateWrappingOffset annealPointerArithmetic
+  memCopyRepeatedly := fun _ firstPtr restPtr elemSize count _ => do
+    if count == 0 then
+      pure ()
+    else
+      let st ← get
+      let some id := firstPtr.provenance.bind Miri.Memory.Provenance.getAllocId
+        | throw (.unsupported "repeat pointer without allocation id")
+      let some base := st.machine.lookupBaseAddr id
+        | throw (.unsupported "repeat pointer without base address")
+      let firstOff := Miri.ABI.Size.ofBytes (firstPtr.offset.bytes - base)
+      let restOff := Miri.ABI.Size.ofBytes (restPtr.offset.bytes - base)
+      match st.machine.memory.live.findIdx? (fun (k, _) => k == id) with
+      | some allocIdx =>
+          match st.machine.memory.live[allocIdx]? with
+          | some (k, ⟨kind, alloc⟩) =>
+              let sc ←
+                match alloc.readScalar annealTargetDataLayout
+                    (Miri.Memory.allocRange firstOff elemSize) false with
+                | .ok s => pure s
+                | .error _ => throw (.unsupported "repeat readScalar failed")
+              let alloc' ←
+                match writeScalarRepeatedly restOff elemSize count.toNat sc alloc with
+                | .ok a => pure a
+                | .error err => throw err
+              set { st with machine := { st.machine with
+                memory := { st.machine.memory with
+                  live := st.machine.memory.live.set! allocIdx (k, ⟨kind, alloc'⟩) } } }
+          | none => throw (.unsupported "repeat allocation not found")
+      | none => throw (.unsupported "repeat allocation not found")
+
+/-- `RvalueHooks` instantiated for Anneal's single-threaded machine. -/
+def annealRvalueHooksLM2_2 (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.RvalueHooks
+      AnnealProv
+      AnnealStepState
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) where
+  placeLayout := fun p => p.layout
+  evalPlace := fun _ p _ => annealEvalPlace localDecls layouts p
+  evalOperand := fun _ op known => annealEvalOperand localDecls layouts op known
+  evalPlaceToOp := fun _ p known => annealEvalOperand localDecls layouts (.Copy p) known
+  readImmediate := fun _ op => annealReadImmediateLM2_2 op
+  writeImmediate := fun _ val dest => annealWriteImmediateLM2_2 val dest
+  writePointer := fun _ _ _ => throw (.unsupported "writePointer")
+  threadLocalPointer := fun _ _ => throw (.unsupported "threadLocalPointer")
+  withRetagMode := fun _ _ action => action
+  copyOp := fun _ src dest =>
+    if usesStructMemCopyDest dest then
+      annealStructMemCopyOp localDecls layouts src dest
+    else do
+      let imm ← annealReadImmediateLM2_2 src
+      annealWriteImmediateLM2_2 imm.imm dest
+  copyOpAllowTransmute := fun _ src dest =>
+    if usesStructMemCopyDest dest then
+      annealStructMemCopyOp localDecls layouts src dest
+    else do
+      let imm ← annealReadImmediateLM2_2 src
+      annealWriteImmediateLM2_2 imm.imm dest
+  binaryOp := fun c op l r => Miri.Interpreter.ScalarOps.binary (annealScalarOpsHooks localDecls layouts) c op l r
+  unaryOp := fun c op v => Miri.Interpreter.ScalarOps.unary (annealScalarOpsHooks localDecls layouts) c op v
+  writeAggregate := fun c k os d =>
+    Miri.Interpreter.writeAggregate (annealAggregateHooksLM2_2 localDecls layouts) c k os d
+  writeRepeat := fun c o d => Miri.Interpreter.writeRepeat (annealAggregateHooksLM2_2 localDecls layouts) c o d
+  forceAllocation := fun c v => do
+    let res ← Miri.Interpreter.forceAllocation (annealPlaceHooks localDecls layouts) c v
+    pure res.mplace
+  toRef := fun _ _ => throw (.unsupported "toRef")
+  enforceValidity := fun _ _ => pure true
+  retagPtrValue := fun _ _ _ => pure none
+  placeBaseRaw := fun _ _ => pure false
+  normalize := fun _ tyId => pure tyId
+  cast := fun c src kind ty dest =>
+    Miri.Interpreter.Cast.cast (annealCastHooksLM2_2 layouts) c 16 src kind ty dest
+  readDiscriminant := fun _ _ => throw (.unsupported "readDiscriminant")
+  discriminantForVariant := fun _ _ _ => throw (.unsupported "discriminantForVariant")
+
+theorem copyOp_eq_read_write_of_immediate
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (imm : Miri.Interpreter.Immediate AnnealProv)
+    (lay : Miri.Interpreter.LocalLayout)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv)
+    (st : AnnealStepState) :
+    (annealRvalueHooksLM2_2 localDecls layouts).copyOp () ⟨.immediate imm, lay⟩ dest st =
+      (annealReadImmediateLM2_2 ⟨.immediate imm, lay⟩ >>= fun r => annealWriteImmediateLM2_2 r.imm dest) st := by
+  unfold annealRvalueHooksLM2_2
+  dsimp only
+  cases usesStructMemCopyDest dest <;> cases imm <;> rfl
+
+theorem bind_copyOp_eq_of_immediate
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {f : Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv)}
+    {dest : Miri.Interpreter.RuntimePlace AnnealProv}
+    {m₀ : AnnealStepState}
+    (h : ∀ src m₁, f m₀ = .ok src m₁ → ∃ imm, src.op = .immediate imm) :
+    (f >>= fun src => (annealRvalueHooksLM2_2 localDecls layouts).copyOp () src dest) m₀ =
+      ((f >>= annealReadImmediateLM2_2) >>= fun imm => annealWriteImmediateLM2_2 imm.imm dest) m₀ := by
+  dsimp only [Bind.bind, EStateM.bind]
+  cases hf : f m₀ with
+  | error e s => rfl
+  | ok src m₁ =>
+    obtain ⟨imm, himm⟩ := h src m₁ hf
+    rcases src with ⟨op, lay⟩
+    dsimp only at himm
+    subst himm
+    exact copyOp_eq_read_write_of_immediate localDecls layouts imm lay dest m₁
+
+theorem bind_copyOp_eq_of_not_usesStructMemCopyDest
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {f : Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv)}
+    {dest : Miri.Interpreter.RuntimePlace AnnealProv}
+    (h : usesStructMemCopyDest dest = false)
+    (m₀ : AnnealStepState) :
+    (f >>= fun src => (annealRvalueHooksLM2_2 localDecls layouts).copyOp () src dest) m₀ =
+      ((f >>= annealReadImmediateLM2_2) >>= fun imm => annealWriteImmediateLM2_2 imm.imm dest) m₀ := by
+  unfold annealRvalueHooksLM2_2
+  dsimp only
+  rw [h]
+  dsimp only [↓reduceIte, Bind.bind, EStateM.bind]
+  cases f m₀ <;> rfl
+
+/-- `TerminatorHooks` instantiated for the `LM-2.2` aggregate hook suite. -/
+def annealTerminatorHooksLM2_2 (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.TerminatorHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      AnnealMachine
+      Unit
+      (Miri.Interpreter.Operand AnnealProv)
+      (Miri.Interpreter.RvalueImmTy AnnealProv) :=
+  { annealTerminatorHooks localDecls layouts with
+    evalDiscriminant := fun _ op state =>
+      Miri.Interpreter.runRvalue
+        (do
+          let opTy ← annealEvalOperand localDecls layouts op none
+          annealReadImmediateLM2_2 opTy)
+        state
+    readAssertCondition := fun _ op state =>
+      Miri.Interpreter.runRvalue
+        (do
+          let opTy ← annealEvalOperand localDecls layouts op none
+          let imm ← annealReadImmediateLM2_2 opTy
+          let sc ←
+            match imm.imm.toScalar with
+            | .ok sc => pure sc
+            | .error err => throw (Miri.Interpreter.ScalarOps.immediateError err)
+          match sc.toBool with
+          | .ok b => return b
+          | .error err => throw (Miri.Interpreter.ScalarOps.scalarError err))
+        state }
+
+/-- `StepHooks` instantiated for the `LM-2.2` aggregate hook suite (`LM-2.2`..`LM-2.4`). -/
+def annealStepHooksLM2_2 (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Miri.Interpreter.StepHooks
+      AnnealProv
+      Miri.Interpreter.LocalLayout
+      Unit
+      AnnealMachine
+      Unit
+      (Miri.Interpreter.RuntimePlace AnnealProv) :=
+  { annealStepHooks localDecls layouts with
+    assign := fun choice place rvalue state =>
+      Miri.Interpreter.runRvalue
+        (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooksLM2_2 localDecls layouts) choice rvalue place)
+        state
+    terminator := fun choice term state =>
+      Miri.Interpreter.ControlFlow.evalTerminator (annealTerminatorHooksLM2_2 localDecls layouts) choice term state }
 
 end LeanMiriSpec.Correspondence

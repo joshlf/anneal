@@ -22,6 +22,16 @@ import LeanMiriSpec.Correspondence.WitLM1_4
 import LeanMiriSpec.Correspondence.AllocLM2_1
 import LeanMiriSpec.Correspondence.SimLM2_1
 import LeanMiriSpec.Correspondence.WitLM2_1
+import LeanMiriSpec.Correspondence.LayoutLM2_2
+import LeanMiriSpec.Correspondence.ProjLM2_2
+import LeanMiriSpec.Correspondence.SimLM2_2
+import LeanMiriSpec.Correspondence.WitLM2_2
+import LeanMiriSpec.Correspondence.EnumLM2_3
+import LeanMiriSpec.Correspondence.SimLM2_3
+import LeanMiriSpec.Correspondence.WitLM2_3
+import LeanMiriSpec.Correspondence.UnionLM2_4
+import LeanMiriSpec.Correspondence.SimLM2_4
+import LeanMiriSpec.Correspondence.WitLM2_4
 import LeanMiriSpec.Correspondence.PtrLM3_1
 import LeanMiriSpec.Correspondence.SimLM3_1
 import LeanMiriSpec.Correspondence.WitLM3_1
@@ -84,6 +94,74 @@ import LeanMiriSpec.Audit
   re-establishing `LiveAllocsNodup` and local immediacy so that array statements
   chain.
 * `LeanMiriSpec.Correspondence.WitLM2_1`: non-vacuity witnesses for `LM-2.1`.
+* `LeanMiriSpec.Correspondence.LayoutLM2_2`: byte-level `InitMaskWordRel`,
+  arbitrary-offset `Allocation.readScalar`/`writeScalar` round-trip,
+  `ValidStructLayout`, field-write preservation across disjoint scalar fields
+  and uninitialized padding bytes, and unpadded vs. padded byte-counting
+  dichotomy (`LM-2.2`).
+* `LeanMiriSpec.Correspondence.ProjLM2_2`: nested `Field` projection chains,
+  `StructMemPlaceRel` / `ImmediateStructRel`, `StateRelLM2_2`, base `StateRel`
+  bridge theorems (`StateRel.toLM2_2`, `StateRelLM2_2.toStateRel_of_flat_imm`),
+  and nested `Field` read simulation (`LM-2.2`).
+* `LeanMiriSpec.Correspondence.SimLM2_2`: state-independent `LM-2.2` typing
+  judgments and lockstep simulation for `Rvalue.Aggregate` (`Tuple` / single-variant
+  `Adt`), nested `Field` scalar and immediate sub-struct reads/writes (`.Scalar`
+  wrappers and `.ScalarPair` sub-structs), whole-value `Use` copies/moves across
+  both immediate-ABI and `.Memory`-ABI aggregates (`annealStructMemCopyOp`,
+  including self-move `_idx = move _idx` lockstep simulation and self-copy
+  `_idx = copy _idx` `copyRangesOverlap` UB characterization),
+  `StorageLive`/`StorageDead`, block-level composition (`step_stmts_lm2_2_simulation`),
+  and `Goto`/`Unreachable`/`Return` terminators (including tuple- and
+  struct-returning root functions via `step_terminator_return_struct_lm2_2_simulation`)
+  under `StateRelLM2_2`.
+* `LeanMiriSpec.Correspondence.WitLM2_2`: seventeen kernel-checked `LM-2.2`
+  execution witnesses covering `AbiRepr.ScalarPair` (`forceAllocation` +
+  `StorageDead` + memory-backed reassignment), unpadded and padded
+  `AbiRepr.Memory`, nested `AbiRepr.Scalar` wrapper (`_3 = copy _1.1`,
+  `_1.1 = move _2`, plus immediate `ScalarPair` + `Scalar` wrapper
+  `_4 = copy _3.1`) and `ScalarPair` (`_3 = copy _2.1`, `_2.1 = move _4`)
+  sub-struct reads/writes, whole-value `.Memory` struct move/copy
+  (`_3 = move _2`, `_4 = copy _3`), self-move (`_1 = move _1`) vs. self-copy
+  (`_1 = copy _1` `copyRangesOverlap` UB), dangling/read-only/move-then-use UB,
+  2-level 3-field `.Memory` sub-struct construction/mutation/read,
+  tuple/struct-returning root functions (`fn() -> PaddedOuter`), root `return`
+  with live padded memory, and `> 64`-byte multi-block `InitMask` `#[repr(C)]`
+  structs (`80` bytes across two 64-bit `InitMask` words).
+* `LeanMiriSpec.Correspondence.EnumLM2_3`: `LM-2.3` multi-variant direct-tagged
+  enum overlay (`annealStepHooksLM2_3`, proved conservatively extending
+  `annealStepHooks` via `step_LM2_3_eq_of_bodyFree`), `ValidEnumLayout`
+  (`Variants.Multiple` + `TagEncoding.Direct`), `EnumMemRel`,
+  `UninitEnumMemRel`, `EnumLocalByteUninit`, `StateRelLM2_3`, `StepRelLM2_3`,
+  and entry bridges (`StateRel.toLM2_3_empty`, `StateRel.toLM2_3`).
+* `LeanMiriSpec.Correspondence.SimLM2_3`: `LM-2.3` correspondence for
+  multi-variant enum `Rvalue.Aggregate`
+  (`evalRvalue_aggregate_enum_simulation`), `StatementKind.SetDiscriminant`
+  (`step_setDiscriminant_simulation` and `.uninit` divergence),
+  `Rvalue.Discriminant` (`evalRvalue_discriminant_simulation`), `Downcast` +
+  `Field` reads and writes (`evalProjection_downcast_field_simulation`,
+  `step_downcast_field_write_simulation`, plus inactive-initialized and
+  inactive/`.uninit` write boundaries), `Terminator.SwitchInt`
+  (`enum_match_switchInt_simulation`), `StorageLive`/`StorageDead`, whole-enum
+  `Copy`/`Move` (`step_enum_copy_move_simulation`,
+  `step_enum_self_move_simulation`,
+  `step_enum_self_copy_dead_or_uninit_simulation`, plus unconditional self-copy
+  `copyRangesOverlap` and `enumUninitInd` copy/move boundaries), and `Goto` plus
+  scalar and enum-returning root-frame `Return`
+  (`step_return_scalar_lm2_3_simulation`, `step_return_enum_lm2_3_simulation`,
+  and `step_return_enum_uninitInd_divergence`).
+* `LeanMiriSpec.Correspondence.WitLM2_3`: 19 kernel-checked `LM-2.3`
+  multi-variant `Lm23Enum` execution, lockstep-UB, divergence, and
+  `BodyFreeOfLM2_3` witnesses exercising every `SimLM2_3` theorem and boundary.
+* `LeanMiriSpec.Correspondence.UnionLM2_4`: the `LM-2.4` union and `Subslice`
+  hooks (`annealStepHooksLM2_4`, a conservative extension of `annealStepHooks`),
+  the union initialization masks of `I-11` (`unionPrefixMask`, certified against
+  the vendored chunk copy by `unionPrefixMask_vendoredCopy`), and the union state
+  relation `StateRelLM2_4`.
+* `LeanMiriSpec.Correspondence.SimLM2_4`: `LM-2.4` correspondence for union
+  aggregates, union field reads (including reads of uninitialized bytes),
+  whole-union copies that preserve the initialization mask, and `Subslice`
+  projections, with the boundaries of the agreeing fragment.
+* `LeanMiriSpec.Correspondence.WitLM2_4`: non-vacuity witnesses for `LM-2.4`.
 * `LeanMiriSpec.Correspondence.PtrLM3_1`: raw pointer and allocation-map invariants
   (`AllocMapRel`, `PtrRel`), pointer resolution (`annealResolvePtr`), bounds/alignment
   validation (`checkAndDerefPtr`), and `Miri.Interpreter.ptrOffsetInbounds` (`LM-3.1`).

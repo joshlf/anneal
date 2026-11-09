@@ -1344,6 +1344,57 @@ private theorem annealEvalOperand_proj_tail_preserves
     cases annealEvalOperand_proj_tail_eq frame' layouts operand layout projs h'
     exact ⟨rfl, rfl⟩
 
+private theorem annealEvalProjection_eq
+    (layouts : LayoutTable)
+    (base : Miri.Interpreter.OpTy AnnealProv) :
+    ∀ (projs : List Miri.MIR.ProjectionElem) {m a m'},
+      annealEvalProjection layouts base projs m = .ok a m' → m' = m
+  | [], _, _, _, h => by cases h; rfl
+  | elem :: rest, m, a, m', h => by
+    unfold annealEvalProjection at h
+    dsimp only [bind, Bind.bind, EStateM.bind, pure, Pure.pure, EStateM.pure,
+      throw, throwThe, MonadExceptOf.throw, EStateM.throw] at h
+    let hintTy := match elem with | .Field _ ft => some ft | _ => none
+    change (match Miri.Interpreter.project (annealStructProjectionCx layouts hintTy) base elem with
+      | .ok opTy => (EStateM.pure opTy).bind fun next => annealEvalProjection layouts next rest
+      | .error err => (EStateM.throw (annealLiftProjectionError err)).bind fun next =>
+          annealEvalProjection layouts next rest) m = .ok a m' at h
+    cases hp : Miri.Interpreter.project (annealStructProjectionCx layouts hintTy) base elem with
+    | error _ => rw [hp] at h; cases h
+    | ok next =>
+      rw [hp] at h
+      exact annealEvalProjection_eq layouts next rest h
+
+private theorem annealEvalProjection_preserves
+    (layouts : LayoutTable)
+    (base : Miri.Interpreter.OpTy AnnealProv)
+    (projs : List Miri.MIR.ProjectionElem) :
+    RvaluePreservesAllImm (annealEvalProjection layouts base projs) :=
+  rvaluePreservesAllImm_of_eq fun _ _ _ h' => by
+    cases annealEvalProjection_eq layouts base projs h'
+    exact ⟨rfl, rfl⟩
+
+private theorem annealEvalProjectedPlace_preserves
+    (ld : List LocalDecl) (ly : LayoutTable) (place : Miri.MIR.Place) :
+    RvaluePreservesAllImm (annealEvalProjectedPlace ld ly place) := by
+  intro m a m' h
+  unfold annealEvalProjectedPlace at h
+  dsimp only [get, getThe, MonadStateOf.get, EStateM.get, bind, Bind.bind,
+    EStateM.bind, pure, Pure.pure, EStateM.pure,
+    throw, throwThe, MonadExceptOf.throw, EStateM.throw] at h
+  by_cases hnone : m.stack.currentFrame?.isNone = true
+  · simp only [hnone, ↓reduceIte, EStateM.bind, EStateM.throw] at h; cases h
+  · have hnf : m.stack.currentFrame?.isNone = false := Bool.eq_false_iff.mpr hnone
+    simp only [hnf, Bool.false_eq_true, ↓reduceIte] at h
+    refine (rvaluePreservesAllImm_bind
+      (annealResolveAndCacheLocalLayout_preserves ld ly place.localId none)
+      (fun fl => ?_)) m a m' h
+    cases annealProjectPlaceList ly
+        ⟨.local (m.stack.frames.size - 1) place.localId none fl.1.localsIdentity, fl.2⟩
+        place.projection.toList with
+    | ok p => exact rvaluePreservesAllImm_pure p
+    | error err => exact rvaluePreservesAllImm_throw err
+
 private theorem annealEvalPlace_preserves
     (ld : List LocalDecl) (ly : LayoutTable) (place : Miri.MIR.Place) :
     RvaluePreservesAllImm (annealEvalPlace ld ly place) := by
@@ -1363,6 +1414,9 @@ private theorem annealEvalPlace_preserves
           cases ps <;>
             (rw [hlist] at h; dsimp only [EStateM.bind, EStateM.get] at h;
              simp only [hnone, ↓reduceIte, EStateM.bind, EStateM.throw] at h; cases h)
+        | Field _ _ | Downcast _ _ =>
+          rw [hlist] at h
+          exact annealEvalProjectedPlace_preserves ld ly place m a m' h
         | _ =>
           rw [hlist] at h; dsimp only [EStateM.bind, EStateM.get] at h
           simp only [hnone, ↓reduceIte, EStateM.bind, EStateM.throw] at h; cases h
@@ -1398,11 +1452,8 @@ private theorem annealEvalPlace_preserves
               (annealEvalPlace_fallback_inner_preserves ly place.localId
                 (.Deref :: p1 :: ps'))) m a m' h
         | Field idx ft =>
-          rw [hlist] at h; dsimp only [EStateM.bind, EStateM.get] at h
-          simp only [hnf, Bool.false_eq_true, ↓reduceIte] at h
-          exact (rvaluePreservesAllImm_bind
-            (annealResolveAndCacheLocalLayout_preserves ld ly place.localId none)
-            (annealEvalPlace_fallback_inner_preserves ly place.localId (.Field idx ft :: ps))) m a m' h
+          rw [hlist] at h
+          exact annealEvalProjectedPlace_preserves ld ly place m a m' h
         | Index idx =>
           rw [hlist] at h; dsimp only [EStateM.bind, EStateM.get] at h
           simp only [hnf, Bool.false_eq_true, ↓reduceIte] at h
@@ -1424,12 +1475,8 @@ private theorem annealEvalPlace_preserves
             (annealEvalPlace_fallback_inner_preserves ly place.localId
               (.Subslice fromIdx toIdx fromEnd :: ps))) m a m' h
         | Downcast name v =>
-          rw [hlist] at h; dsimp only [EStateM.bind, EStateM.get] at h
-          simp only [hnf, Bool.false_eq_true, ↓reduceIte] at h
-          exact (rvaluePreservesAllImm_bind
-            (annealResolveAndCacheLocalLayout_preserves ld ly place.localId none)
-            (annealEvalPlace_fallback_inner_preserves ly place.localId
-              (.Downcast name v :: ps))) m a m' h
+          rw [hlist] at h
+          exact annealEvalProjectedPlace_preserves ld ly place m a m' h
         | OpaqueCast ty =>
           rw [hlist] at h; dsimp only [EStateM.bind, EStateM.get] at h
           simp only [hnf, Bool.false_eq_true, ↓reduceIte] at h
@@ -1517,11 +1564,22 @@ private theorem annealEvalOperand_nonMove_preserves
               cases operand with
               | immediate imm =>
                 cases imm with
-                | scalarPair _ _ => exact rvaluePreservesAllImm_pure _
-                | _ => exact rvaluePreservesAllImm_throw _
-              | indirect _ => exact rvaluePreservesAllImm_throw _
+                | scalarPair _ _ =>
+                  by_cases h0 : (idx == 0) = true
+                  · simp only [h0, ↓reduceIte]
+                    exact rvaluePreservesAllImm_pure _
+                  · have h0f : (idx == 0) = false := Bool.eq_false_iff.mpr h0
+                    simp only [h0f, Bool.false_eq_true, ↓reduceIte]
+                    by_cases h1 : (idx == 1) = true
+                    · simp only [h1, ↓reduceIte]
+                      exact rvaluePreservesAllImm_pure _
+                    · have h1f : (idx == 1) = false := Bool.eq_false_iff.mpr h1
+                      simp only [h1f, Bool.false_eq_true, ↓reduceIte]
+                      exact annealEvalProjection_preserves ly _ _
+                | _ => exact annealEvalProjection_preserves ly _ _
+              | indirect _ => exact annealEvalProjection_preserves ly _ _
             | cons p1 ps' =>
-              exact annealEvalOperand_proj_tail_preserves fl.1 ly operand fl.2
+              exact annealEvalProjection_preserves ly ⟨operand, fl.2⟩
                 (.Field idx ft :: p1 :: ps')
           | Index idx =>
             exact annealEvalOperand_proj_tail_preserves fl.1 ly operand fl.2 (.Index idx :: ps)
@@ -1532,7 +1590,7 @@ private theorem annealEvalOperand_nonMove_preserves
             exact annealEvalOperand_proj_tail_preserves fl.1 ly operand fl.2
               (.Subslice fromIdx toIdx fromEnd :: ps)
           | Downcast name v =>
-            exact annealEvalOperand_proj_tail_preserves fl.1 ly operand fl.2
+            exact annealEvalProjection_preserves ly ⟨operand, fl.2⟩
               (.Downcast name v :: ps)
           | OpaqueCast ty =>
             exact annealEvalOperand_proj_tail_preserves fl.1 ly operand fl.2
@@ -2031,6 +2089,18 @@ private theorem annealEvalOperand_any_preserves
             refine ⟨haddr₁, fun tf htf => ?_⟩
             obtain ⟨hm₁_stk, hloc₁, himm₁⟩ := hstk₁ tf htf
             exact ⟨fl.1, hm₁_stk, hloc₁, himm₁⟩
+          have hproj_eval : ∀ projs,
+              annealEvalProjection ly ⟨operand, fl.2⟩ projs m₁ = .ok a m' →
+              m'.machine.addresses = m.machine.addresses ∧
+              (∀ tf, m.stack.frames = #[tf] →
+                ∃ tf', m'.stack.frames = #[tf'] ∧
+                  tf'.location = tf.location ∧
+                  (∀ k, IsImmediateFrameLocal tf k → IsImmediateFrameLocal tf' k)) := by
+            intro projs h'
+            cases annealEvalProjection_eq ly ⟨operand, fl.2⟩ projs h'
+            refine ⟨haddr₁, fun tf htf => ?_⟩
+            obtain ⟨hm₁_stk, hloc₁, himm₁⟩ := hstk₁ tf htf
+            exact ⟨fl.1, hm₁_stk, hloc₁, himm₁⟩
           rcases hlist : place.projection.toList with _ | ⟨p0, ps⟩
           · rw [hlist] at h
             dsimp only [EStateM.bind, EStateM.get, EStateM.set, EStateM.pure, EStateM.throw] at h
@@ -2071,15 +2141,27 @@ private theorem annealEvalOperand_any_preserves
                 | immediate imm =>
                   cases imm with
                   | scalarPair _ _ =>
-                    dsimp only [EStateM.pure] at h
-                    cases h
-                    refine ⟨haddr₁, fun tf htf => ?_⟩
-                    obtain ⟨hm₁_stk, hloc₁, himm₁⟩ := hstk₁ tf htf
-                    exact ⟨fl.1, hm₁_stk, hloc₁, himm₁⟩
-                  | _ => cases h
-                | indirect _ => cases h
+                    by_cases h0 : (idx == 0) = true
+                    · simp only [h0, ↓reduceIte, EStateM.pure] at h
+                      cases h
+                      refine ⟨haddr₁, fun tf htf => ?_⟩
+                      obtain ⟨hm₁_stk, hloc₁, himm₁⟩ := hstk₁ tf htf
+                      exact ⟨fl.1, hm₁_stk, hloc₁, himm₁⟩
+                    · have h0f : (idx == 0) = false := Bool.eq_false_iff.mpr h0
+                      simp only [h0f, Bool.false_eq_true, ↓reduceIte] at h
+                      by_cases h1 : (idx == 1) = true
+                      · simp only [h1, ↓reduceIte, EStateM.pure] at h
+                        cases h
+                        refine ⟨haddr₁, fun tf htf => ?_⟩
+                        obtain ⟨hm₁_stk, hloc₁, himm₁⟩ := hstk₁ tf htf
+                        exact ⟨fl.1, hm₁_stk, hloc₁, himm₁⟩
+                      · have h1f : (idx == 1) = false := Bool.eq_false_iff.mpr h1
+                        simp only [h1f, Bool.false_eq_true, ↓reduceIte] at h
+                        exact hproj_eval [.Field idx ft] h
+                  | _ => exact hproj_eval [.Field idx ft] h
+                | indirect _ => exact hproj_eval [.Field idx ft] h
               | cons p1 ps' =>
-                rw [hlist] at h; exact hproj_other (.Field idx ft :: p1 :: ps') h
+                rw [hlist] at h; exact hproj_eval (.Field idx ft :: p1 :: ps') h
             | Index idx =>
               rw [hlist] at h; exact hproj_other (.Index idx :: ps) h
             | ConstantIndex offset minLength fromEnd =>
@@ -2087,7 +2169,7 @@ private theorem annealEvalOperand_any_preserves
             | Subslice fromIdx toIdx fromEnd =>
               rw [hlist] at h; exact hproj_other (.Subslice fromIdx toIdx fromEnd :: ps) h
             | Downcast name v =>
-              rw [hlist] at h; exact hproj_other (.Downcast name v :: ps) h
+              rw [hlist] at h; exact hproj_eval (.Downcast name v :: ps) h
             | OpaqueCast ty =>
               rw [hlist] at h; exact hproj_other (.OpaqueCast ty :: ps) h
             | UnwrapUnsafeBinder ty =>
