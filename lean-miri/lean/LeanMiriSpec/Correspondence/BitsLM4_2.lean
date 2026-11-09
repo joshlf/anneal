@@ -16,7 +16,8 @@ import LeanMiriSpec.Correspondence.Simulation
 Correspondence between Anneal's inline integer bit intrinsics
 (`evalIntegerBitIntrinsic`: `ctpop`, `ctlz`, `ctlz_nonzero`, `cttz`,
 `cttz_nonzero`, `bswap`, and `bitreverse`) and `lean-miri`'s
-`Miri.Interpreter.IntegerIntrinsic.run`.
+`Miri.Interpreter.IntegerIntrinsic.run`, together with `BitVec` and `ScalarRel`
+correspondence for `evalRotate` (`rotate_left` and `rotate_right`).
 
 1. **Public mirror (`miriIntegerIntrinsicRun`)**: `IntegerIntrinsic.run` calls
    the private loops `countTrailingZeros` and `reverseBytes`, which other
@@ -25,16 +26,17 @@ Correspondence between Anneal's inline integer bit intrinsics
    definitionally equal to `run`, so the copy cannot drift from the vendored
    source without breaking that proof.
 2. **Per-intrinsic arithmetic**: each of Anneal's structurally recursive bit
-   helpers equals the `lean-miri` computation that it models:
+   helpers equals the `lean-miri` / `BitVec` computation that it models:
    `countOnesBits_eq_cpop` (`BitVec.cpop`), `bitLengthBits_eq_log2`
-   (`Nat.log2`), `miriCountTrailingZeros_eq`, `miriReverseBytes_eq`, and
+   (`Nat.log2`), `miriCountTrailingZeros_eq`, `miriReverseBytes_eq`,
    `reverse_shiftLeft_toNat_eq` (`BitVec.reverse` of the operand shifted to
-   the top of the `u128`).
-3. **Simulation (`integerBitIntrinsic_run_simulation`)**: on a
-   `ScalarRel`-related operand, every result that Anneal defines matches a
-   successful `lean-miri` run, and Anneal's undefined behavior (a zero operand
-   to `ctlz_nonzero` or `cttz_nonzero`) matches `lean-miri`'s
-   `undefinedBehaviorOnZero` error.
+   the top of the `u128`), `rotateLeftBits_eq_bitVec` (`BitVec.rotateLeft`),
+   and `rotateRightBits_eq_bitVec` (`BitVec.rotateRight`).
+3. **Simulation (`integerBitIntrinsic_run_simulation`, `evalRotate_scalarRel`)**:
+   on a `ScalarRel`-related operand, every result that Anneal defines matches a
+   successful `lean-miri` run (or `BitVec` rotation + `truncateFromUInt`), and
+   Anneal's undefined behavior (a zero operand to `ctlz_nonzero` or
+   `cttz_nonzero`) matches `lean-miri`'s `undefinedBehaviorOnZero` error.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -610,5 +612,186 @@ theorem integerBitIntrinsic_run_simulation
         hrel.toBits_eq, hbits, Except.mapError, bind, Except.bind, pure, Except.pure,
         hraw, hbitsNat, BEq.beq, reduceCtorEq, decide_false, Bool.false_or,
         Bool.false_and, Bool.false_eq_true, ↓reduceIte, bne_self_eq_false, hrb, htr]
+
+/-! ## Bit rotation (`rotate_left` and `rotate_right`) -/
+
+private theorem testBit_div_two_pow : ∀ (k x i : Nat),
+    (x / 2 ^ k).testBit i = x.testBit (k + i)
+  | 0, x, i => by simp
+  | k + 1, x, i => by
+    rw [Nat.pow_succ, ← Nat.div_div_eq_div_mul, Nat.testBit_div_two,
+      testBit_div_two_pow k x (i + 1)]
+    congr 1; omega
+
+/-- `rotateLeftBits bits shift w` is strictly below `2 ^ w`. -/
+theorem rotateLeftBits_lt (bits shift w : Nat) : rotateLeftBits bits shift w < 2 ^ w := by
+  simp only [rotateLeftBits, scalarPow2_eq_two_pow w]
+  exact Nat.mod_lt _ (Nat.two_pow_pos w)
+
+/-- `rotateRightBits bits shift w` is strictly below `2 ^ w`. -/
+theorem rotateRightBits_lt (bits shift w : Nat) : rotateRightBits bits shift w < 2 ^ w := by
+  simp only [rotateRightBits, scalarPow2_eq_two_pow w]
+  exact Nat.mod_lt _ (Nat.two_pow_pos w)
+
+/-- For any `w`-bit pattern `bits < 2 ^ w` and arbitrary `shift` (including
+`shift ≥ w`, masked modulo `w`), Anneal's `rotateLeftBits bits shift w` agrees
+with `((BitVec.ofNat w bits).rotateLeft shift).toNat`. -/
+theorem rotateLeftBits_eq_bitVec {w bits : Nat} (hx : bits < 2 ^ w) (shift : Nat) :
+    rotateLeftBits bits shift w = ((BitVec.ofNat w bits).rotateLeft shift).toNat := by
+  rcases Nat.eq_zero_or_pos w with rfl | hw
+  · have hlt := rotateLeftBits_lt bits shift 0
+    have hbv := ((BitVec.ofNat 0 bits).rotateLeft shift).isLt
+    omega
+  · let s := shift % w
+    have hs : s < w := Nat.mod_lt _ hw
+    have hpow_split : 2 ^ w = 2 ^ (w - s) * 2 ^ s := by
+      rw [← Nat.pow_add, Nat.sub_add_cancel (Nat.le_of_lt hs)]
+    let low := bits % 2 ^ (w - s)
+    let high := bits / 2 ^ (w - s)
+    have hbits_eq : bits = low + 2 ^ (w - s) * high := (Nat.mod_add_div bits (2 ^ (w - s))).symm
+    have hlow_lt : low < 2 ^ (w - s) := Nat.mod_lt _ (Nat.two_pow_pos _)
+    have hhigh_lt : high < 2 ^ s := by
+      have hx' : low + 2 ^ (w - s) * high < 2 ^ (w - s) * 2 ^ s := by
+        rw [← hbits_eq, ← hpow_split]; exact hx
+      exact Nat.lt_of_mul_lt_mul_left (a := 2 ^ (w - s)) (by omega)
+    have hcomb_lt : 2 ^ s * low + high < 2 ^ w := by
+      have hle1 : low + 1 ≤ 2 ^ (w - s) := hlow_lt
+      have hmul : 2 ^ s * (low + 1) ≤ 2 ^ s * 2 ^ (w - s) := Nat.mul_le_mul_left _ hle1
+      rw [Nat.mul_add, Nat.mul_one, Nat.mul_comm (2 ^ s) (2 ^ (w - s)), ← hpow_split] at hmul
+      omega
+    have hsum : bits * 2 ^ s + high = (2 ^ s * low + high) + 2 ^ w * high := by
+      calc bits * 2 ^ s + high
+          = (low + 2 ^ (w - s) * high) * 2 ^ s + high := by rw [← hbits_eq]
+        _ = low * 2 ^ s + (2 ^ (w - s) * 2 ^ s) * high + high := by
+            rw [Nat.add_mul, Nat.mul_right_comm (2 ^ (w - s)) high (2 ^ s)]
+        _ = (2 ^ s * low + high) + 2 ^ w * high := by
+            rw [← hpow_split, Nat.mul_comm low (2 ^ s)]; omega
+    have hrot_eq : rotateLeftBits bits shift w = 2 ^ s * low + high := by
+      unfold rotateLeftBits
+      change (bits * scalarPow2 s + bits / scalarPow2 (w - s)) % scalarPow2 w = _
+      rw [scalarPow2_eq_two_pow, scalarPow2_eq_two_pow, scalarPow2_eq_two_pow]
+      change (bits * 2 ^ s + high) % 2 ^ w = 2 ^ s * low + high
+      rw [hsum, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hcomb_lt]
+    rw [hrot_eq]
+    apply Nat.eq_of_testBit_eq
+    intro i
+    rw [Nat.testBit_two_pow_mul_add _ hhigh_lt, BitVec.testBit_toNat, BitVec.getLsbD_rotateLeft]
+    change (if i < s then high.testBit i else low.testBit (i - s)) =
+      if i < s then (BitVec.ofNat w bits).getLsbD (w - s + i)
+      else decide (i < w) && (BitVec.ofNat w bits).getLsbD (i - s)
+    by_cases his : i < s
+    · simp only [his, ↓reduceIte, BitVec.getLsbD_ofNat,
+        show w - s + i < w by omega, decide_true, Bool.true_and]
+      exact testBit_div_two_pow (w - s) bits i
+    · simp only [his, ↓reduceIte, BitVec.getLsbD_ofNat, low, Nat.testBit_mod_two_pow]
+      by_cases hiw : i < w
+      · simp [hiw, show i - s < w - s by omega, show i - s < w by omega]
+      · simp [hiw, show ¬ (i - s < w - s) by omega]
+
+/-- For any `w`-bit pattern `bits < 2 ^ w` and arbitrary `shift` (including
+`shift ≥ w`, masked modulo `w`), Anneal's `rotateRightBits bits shift w` agrees
+with `((BitVec.ofNat w bits).rotateRight shift).toNat`. -/
+theorem rotateRightBits_eq_bitVec {w bits : Nat} (hx : bits < 2 ^ w) (shift : Nat) :
+    rotateRightBits bits shift w = ((BitVec.ofNat w bits).rotateRight shift).toNat := by
+  rcases Nat.eq_zero_or_pos w with rfl | hw
+  · have hlt := rotateRightBits_lt bits shift 0
+    have hbv := ((BitVec.ofNat 0 bits).rotateRight shift).isLt
+    omega
+  · let s := shift % w
+    have hs : s < w := Nat.mod_lt _ hw
+    have hpow_split : 2 ^ w = 2 ^ s * 2 ^ (w - s) := by
+      rw [← Nat.pow_add, Nat.add_sub_cancel' (Nat.le_of_lt hs)]
+    let low := bits % 2 ^ s
+    let high := bits / 2 ^ s
+    have hbits_eq : bits = low + 2 ^ s * high := (Nat.mod_add_div bits (2 ^ s)).symm
+    have hlow_lt : low < 2 ^ s := Nat.mod_lt _ (Nat.two_pow_pos _)
+    have hhigh_lt : high < 2 ^ (w - s) := by
+      have hx' : low + 2 ^ s * high < 2 ^ s * 2 ^ (w - s) := by
+        rw [← hbits_eq, ← hpow_split]; exact hx
+      exact Nat.lt_of_mul_lt_mul_left (a := 2 ^ s) (by omega)
+    have hcomb_lt : 2 ^ (w - s) * low + high < 2 ^ w := by
+      have hle1 : low + 1 ≤ 2 ^ s := hlow_lt
+      have hmul : 2 ^ (w - s) * (low + 1) ≤ 2 ^ (w - s) * 2 ^ s := Nat.mul_le_mul_left _ hle1
+      rw [Nat.mul_add, Nat.mul_one, Nat.mul_comm (2 ^ (w - s)) (2 ^ s), ← hpow_split] at hmul
+      omega
+    have hsum : high + bits * 2 ^ (w - s) = (2 ^ (w - s) * low + high) + 2 ^ w * high := by
+      calc high + bits * 2 ^ (w - s)
+          = high + (low + 2 ^ s * high) * 2 ^ (w - s) := by rw [← hbits_eq]
+        _ = high + (low * 2 ^ (w - s) + (2 ^ s * 2 ^ (w - s)) * high) := by
+            rw [Nat.add_mul, Nat.mul_right_comm (2 ^ s) high (2 ^ (w - s))]
+        _ = (2 ^ (w - s) * low + high) + 2 ^ w * high := by
+            rw [← hpow_split, Nat.mul_comm low (2 ^ (w - s))]; omega
+    have hrot_eq : rotateRightBits bits shift w = 2 ^ (w - s) * low + high := by
+      unfold rotateRightBits
+      change (bits / scalarPow2 s + bits * scalarPow2 (w - s)) % scalarPow2 w = _
+      rw [scalarPow2_eq_two_pow, scalarPow2_eq_two_pow, scalarPow2_eq_two_pow]
+      change (high + bits * 2 ^ (w - s)) % 2 ^ w = 2 ^ (w - s) * low + high
+      rw [hsum, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hcomb_lt]
+    rw [hrot_eq]
+    apply Nat.eq_of_testBit_eq
+    intro i
+    rw [Nat.testBit_two_pow_mul_add _ hhigh_lt, BitVec.testBit_toNat, BitVec.getLsbD_rotateRight]
+    change (if i < w - s then high.testBit i else low.testBit (i - (w - s))) =
+      if i < w - s then (BitVec.ofNat w bits).getLsbD (s + i)
+      else decide (i < w) && (BitVec.ofNat w bits).getLsbD (i - (w - s))
+    by_cases his : i < w - s
+    · simp only [his, ↓reduceIte, BitVec.getLsbD_ofNat,
+        show s + i < w by omega, decide_true, Bool.true_and]
+      exact testBit_div_two_pow s bits i
+    · simp only [his, ↓reduceIte, BitVec.getLsbD_ofNat, low, Nat.testBit_mod_two_pow]
+      by_cases hiw : i < w
+      · simp [hiw, show i - (w - s) < s by omega, show i - (w - s) < w by omega]
+      · simp [hiw, show ¬ (i - (w - s) < s) by omega]
+
+/-- `evalRotate` preserves the byte width of `x`. -/
+theorem evalRotate_sizeBytes (isLeft : Bool) (x shift : MirAst.ScalarInt) :
+    (evalRotate isLeft x shift).sizeBytes = x.sizeBytes := by
+  cases isLeft <;> rfl
+
+/-- `evalRotate` always produces a canonical bit pattern `< scalarModulus x.sizeBytes`. -/
+theorem evalRotate_canonical (isLeft : Bool) (x shift : MirAst.ScalarInt) :
+    (evalRotate isLeft x shift).bits < scalarModulus x.sizeBytes := by
+  rw [scalarModulus_eq_two_pow, Nat.mul_comm 8 x.sizeBytes]
+  cases isLeft
+  · exact rotateRightBits_lt _ _ _
+  · exact rotateLeftBits_lt _ _ _
+
+/-- On any `ScalarRel`-related integer `x`, `evalRotate` computes the exact
+`BitVec.rotateLeft` (`isLeft = true`) or `BitVec.rotateRight` (`isLeft = false`)
+of the `(x.sizeBytes * 8)`-bit pattern `x.bits` by `shift.bits` (with modular
+shift masking modulo `x.sizeBytes * 8`). -/
+theorem evalRotate_bits_eq_bitVec {x : MirAst.ScalarInt} {mx : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel x mx) (shift : MirAst.ScalarInt) (isLeft : Bool) :
+    (evalRotate isLeft x shift).bits =
+      (if isLeft then
+        (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateLeft shift.bits
+      else
+        (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateRight shift.bits).toNat := by
+  have hcan : x.bits < 2 ^ (x.sizeBytes * 8) := by
+    have h := hrel.canonical
+    rwa [scalarModulus_eq_two_pow, Nat.mul_comm] at h
+  have hwrap := hrel.wrapScalarBits_self
+  cases isLeft
+  · simp only [evalRotate, hwrap, Nat.mul_eq, Bool.false_eq_true, ↓reduceIte]
+    exact rotateRightBits_eq_bitVec hcan shift.bits
+  · simp only [evalRotate, hwrap, Nat.mul_eq, ↓reduceIte]
+    exact rotateLeftBits_eq_bitVec hcan shift.bits
+
+/-- On any `ScalarRel`-related integer `x`, truncating `(evalRotate isLeft x shift).bits`
+through `Miri.Memory.ScalarInt.truncateFromUInt` succeeds and yields a
+`Miri.Memory.ScalarInt` related to `evalRotate isLeft x shift` by `ScalarRel`. -/
+theorem evalRotate_scalarRel {x : MirAst.ScalarInt} {mx : Miri.Memory.ScalarInt}
+    (hrel : ScalarRel x mx) (shift : MirAst.ScalarInt) (isLeft : Bool) :
+    ∃ mr b, Miri.Memory.ScalarInt.truncateFromUInt
+        (BitVec.ofNat 128 (evalRotate isLeft x shift).bits)
+        (translateSizeBytes x.sizeBytes) = .ok (mr, b) ∧
+      ScalarRel (evalRotate isLeft x shift) mr := by
+  obtain ⟨mr, b, htr, hrel'⟩ :=
+    truncateFromUInt_ofNat_rel hrel.validBytes (evalRotate_canonical isLeft x shift)
+  have heta : (⟨(evalRotate isLeft x shift).bits, x.sizeBytes⟩ : MirAst.ScalarInt) =
+      evalRotate isLeft x shift := by
+    cases isLeft <;> rfl
+  rw [heta] at hrel'
+  exact ⟨mr, b, htr, hrel'⟩
 
 end LeanMiriSpec.Correspondence

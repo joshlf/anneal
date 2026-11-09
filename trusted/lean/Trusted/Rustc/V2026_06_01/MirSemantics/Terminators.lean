@@ -188,8 +188,9 @@ def resumeExternalTailCall (ans : MirCallAns) : MirExecState :=
 `core::intrinsics` items inline, in one step, when no transparent body for the
 item is available: `exact_div` (handled directly in `evalTerminator`), the
 integer bit intrinsics (`IntegerBitIntrinsic`), `rotate_left`, `rotate_right`,
-`saturating_add`, `saturating_sub`, `write_bytes`, and `arith_offset`. Each
-returns to `target` with `stmtIdx := 0`, as a returning call does.
+`saturating_add`, `saturating_sub`, `write_bytes`, and `arith_offset` (along
+with its `wrapping_offset` alias). Each returns to `target` with `stmtIdx := 0`,
+as a returning call does.
 -/
 
 /--
@@ -313,20 +314,24 @@ def repeatByteBits (byte : Nat) : Nat → Nat
 
 /--
 Evaluate `core::intrinsics::write_bytes::<T>(dst, val, count)` on the
-evaluated arguments `dst = .ptr dstPtr _`, `val`, and `count`.
+evaluated arguments `dstVal` (a pointer carrying provenance `.ptr dstPtr _` or
+an 8-byte provenance-free address `.scalar addr`), `val`, and `count`.
 
 1. `count * size_of::<T>()` bytes are written; a byte count above
    `isize::MAX` is undefined behavior.
-2. A zero byte count writes nothing.
-3. Otherwise `dst` must carry a borrow tag that names a live root local and
-   permits writes (neither `.frozen` nor `.disabled`, matching
-   `writePlaceValue`), and the written range
+2. A zero byte count writes nothing (even when `dstVal` carries no provenance
+   or names a dead or out-of-bounds local).
+3. Otherwise `dstVal` must carry a borrow tag (`dstVal = .ptr dstPtr _`) that
+   names a live declared local and permits writes (neither `.frozen` nor
+   `.disabled`, matching `writePlaceValue`), and for a root-local borrow the
+   written range
    `[dstPtr.offsetBytes, dstPtr.offsetBytes + count * size_of::<T>())` must lie
-   inside that local; every violation is undefined behavior.
-4. The fill is supported for a local of integer type, whose every byte pattern
-   is a valid value. The byte `val` replaces the written bytes of the local's
-   little-endian representation. When the local is uninitialized and the
-   write covers only part of it, the local stays uninitialized, because a
+   inside that local; every violation (including a provenance-free address or a
+   dead local on a projected borrow) is undefined behavior.
+4. The fill is supported for a root local of integer type, whose every byte
+   pattern is a valid value. The byte `val` replaces the written bytes of the
+   local's little-endian representation. When the local is uninitialized and
+   the write covers only part of it, the local stays uninitialized, because a
    partially initialized integer has no `Value`; every later read of it is
    undefined behavior, as it is in Rust.
 5. The write invalidates the conflicting borrows of the local, as a write
@@ -354,16 +359,23 @@ it either.
 def evalWriteBytesCall
     (s : MachineState)
     (dstOp : Operand)
-    (dstPtr : ProvenancePtr)
+    (dstVal : Value)
     (val count : ScalarInt)
     (locals' : List LocalSlot)
     (targetBb : BasicBlockIdx)
     (localDecls : List LocalDecl)
     (layouts : LayoutTable) :
     MirStepNode :=
-  match operandPointeeBytes? localDecls layouts dstOp with
-  | .none => MirStepNode.unsupported
-  | .some elemBytes =>
+  let dstPtr? : Option (Option ProvenancePtr) :=
+    match dstVal with
+    | .ptr dstPtr _ => .some (.some dstPtr)
+    | .scalar addr =>
+      match Nat.beq addr.sizeBytes 8 with
+      | true => .some .none
+      | false => .none
+    | _ => .none
+  match dstPtr?, operandPointeeBytes? localDecls layouts dstOp with
+  | .some maybePtr, .some elemBytes =>
     let total := Nat.mul count.bits elemBytes
     match Nat.ble total isizeMaxBytes with
     | false => MirStepNode.fail .ub
@@ -371,58 +383,63 @@ def evalWriteBytesCall
       match Nat.beq total 0 with
       | true => intrinsicReturnTo s targetBb locals' s.memory
       | false =>
-        match lookupBorrow s.memory.borrows dstPtr.tag with
+        match maybePtr with
         | .none => MirStepNode.fail .ub
-        | .some entry =>
-          match entry.perm with
-          | .frozen => MirStepNode.fail .ub
-          | .disabled => MirStepNode.fail .ub
-          | _ =>
-            match entry.targetProjection with
-            | _ :: _ => MirStepNode.unsupported
-            | .nil =>
-              match get? localDecls entry.targetLocal with
-              | .none => MirStepNode.fail .ub
-              | .some decl =>
-                match intCastTargetBytes decl.ty.kind with
-                | .none => MirStepNode.unsupported
-                | .some targetBytes =>
-                  match Nat.ble (Nat.add dstPtr.offsetBytes total) targetBytes with
-                  | false => MirStepNode.fail .ub
-                  | true =>
-                    let off := dstPtr.offsetBytes
-                    let fill := repeatByteBits (Nat.mod val.bits 256) total
-                    let newSlot? : Option LocalSlot :=
-                      match get? locals' entry.targetLocal with
-                      | .none => .none
-                      | .some .dead => .none
-                      | .some .uninit =>
-                        match Bool.and (Nat.beq off 0) (Nat.beq total targetBytes) with
-                        | true => .some (.init (.scalar ⟨fill, targetBytes⟩))
-                        | false => .some .uninit
-                      | .some (.init (.scalar sc)) =>
-                        let lowMod := scalarModulus off
-                        let highMod := scalarModulus (Nat.add off total)
-                        let old := wrapScalarBits sc.bits (scalarModulus targetBytes)
-                        .some (.init (.scalar ⟨
-                          Nat.add (Nat.mod old lowMod)
-                            (Nat.add (Nat.mul fill lowMod)
-                              (Nat.mul (Nat.div old highMod) highMod)),
-                          targetBytes⟩))
-                      | .some (.init _) => .none
-                    match newSlot? with
-                    | .none => MirStepNode.fail .ub
-                    | .some newSlot =>
-                      match set? locals' entry.targetLocal newSlot with
+        | .some dstPtr =>
+          match lookupBorrow s.memory.borrows dstPtr.tag with
+          | .none => MirStepNode.fail .ub
+          | .some entry =>
+            match entry.perm with
+            | .frozen => MirStepNode.fail .ub
+            | .disabled => MirStepNode.fail .ub
+            | _ =>
+              match get? locals' entry.targetLocal, get? localDecls entry.targetLocal with
+              | .none, _ => MirStepNode.fail .ub
+              | .some .dead, _ => MirStepNode.fail .ub
+              | _, .none => MirStepNode.fail .ub
+              | .some slot, .some decl =>
+                match entry.targetProjection with
+                | _ :: _ => MirStepNode.unsupported
+                | .nil =>
+                  match intCastTargetBytes decl.ty.kind with
+                  | .none => MirStepNode.unsupported
+                  | .some targetBytes =>
+                    match Nat.ble (Nat.add dstPtr.offsetBytes total) targetBytes with
+                    | false => MirStepNode.fail .ub
+                    | true =>
+                      let off := dstPtr.offsetBytes
+                      let fill := repeatByteBits (Nat.mod val.bits 256) total
+                      let newSlot? : Option LocalSlot :=
+                        match slot with
+                        | .dead => .none
+                        | .uninit =>
+                          match Bool.and (Nat.beq off 0) (Nat.beq total targetBytes) with
+                          | true => .some (.init (.scalar ⟨fill, targetBytes⟩))
+                          | false => .some .uninit
+                        | .init (.scalar sc) =>
+                          let lowMod := scalarModulus off
+                          let highMod := scalarModulus (Nat.add off total)
+                          let old := wrapScalarBits sc.bits (scalarModulus targetBytes)
+                          .some (.init (.scalar ⟨
+                            Nat.add (Nat.mod old lowMod)
+                              (Nat.add (Nat.mul fill lowMod)
+                                (Nat.mul (Nat.div old highMod) highMod)),
+                            targetBytes⟩))
+                        | .init _ => .none
+                      match newSlot? with
                       | .none => MirStepNode.fail .ub
-                      | .some locals'' =>
-                        intrinsicReturnTo s targetBb locals''
-                          { s.memory with
-                            borrows :=
-                              invalidateConflictingBorrows
-                                s.memory.borrows
-                                entry.targetLocal
-                                (.some dstPtr.tag) }
+                      | .some newSlot =>
+                        match set? locals' entry.targetLocal newSlot with
+                        | .none => MirStepNode.fail .ub
+                        | .some locals'' =>
+                          intrinsicReturnTo s targetBb locals''
+                            { s.memory with
+                              borrows :=
+                                invalidateConflictingBorrows
+                                  s.memory.borrows
+                                  entry.targetLocal
+                                  (.some dstPtr.tag) }
+  | _, _ => MirStepNode.unsupported
 
 /--
 Evaluate `core::intrinsics::arith_offset::<T>(ptr, count)`: offset `ptr` by
@@ -569,20 +586,19 @@ def evalInlineIntrinsicCall?
   | true =>
     .some
       (match argOps, argVals with
-      | dstOp :: _ :: _ :: .nil, .ptr dstPtr _ :: .scalar val :: .scalar count :: .nil =>
-        evalWriteBytesCall s dstOp dstPtr val count locals' targetBb localDecls layouts
-      | dstOp :: _ :: _ :: .nil, .scalar _ :: .scalar _ :: .scalar count :: .nil =>
-        -- An address without provenance names no local, so it is valid only
-        -- for a write of zero bytes.
-        match operandPointeeBytes? localDecls layouts dstOp with
-        | .some elemBytes =>
-          match Nat.beq (Nat.mul count.bits elemBytes) 0 with
-          | true => intrinsicReturnTo s targetBb locals' s.memory
-          | false => MirStepNode.fail .ub
-        | .none => MirStepNode.unsupported
+      | dstOp :: _ :: _ :: .nil, dstVal :: .scalar val :: .scalar count :: .nil =>
+        evalWriteBytesCall s dstOp dstVal val count locals' targetBb localDecls layouts
       | _, _ => MirStepNode.unsupported)
   | false =>
-  match stringEq defPath "core::intrinsics::arith_offset" with
+  let isOffsetPath : Bool :=
+    Bool.or
+      (Bool.or
+        (stringEq defPath "core::intrinsics::arith_offset")
+        (stringEq defPath "core::intrinsics::wrapping_offset"))
+      (Bool.or
+        (stringEq defPath "std::intrinsics::arith_offset")
+        (stringEq defPath "std::intrinsics::wrapping_offset"))
+  match isOffsetPath with
   | true =>
     .some
       (match argOps, argVals with

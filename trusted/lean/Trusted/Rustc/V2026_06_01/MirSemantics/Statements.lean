@@ -474,9 +474,9 @@ def copyPrecheck
           | _ => .nonZero totalBytesOpt
 
 /--
-Check that a root-local borrow access of `totalBytes` starting at
-`ptr.offsetBytes` fits within the declared byte size of `entry.targetLocal` when
-`localDecls` and `layouts` resolve that byte size.
+Check that a borrow access of `totalBytes` starting at `ptr.offsetBytes` targets
+a declared local in `localDecls` and, for a root-local borrow whose byte size
+`layouts` resolves, fits within that local's byte size.
 -/
 @[reducible]
 def copyBorrowInRootBounds
@@ -486,16 +486,19 @@ def copyBorrowInRootBounds
     (entry : BorrowEntry)
     (totalBytesOpt : Option Nat) :
     Bool :=
-  match totalBytesOpt, entry.targetProjection with
-  | .some totalBytes, .nil =>
+  match totalBytesOpt with
+  | .none => true
+  | .some totalBytes =>
     match get? localDecls entry.targetLocal with
+    | .none => false
     | .some decl =>
-      match rigidTyByteSize layouts decl.ty with
-      | .some localBytes =>
-        Nat.ble (Nat.add ptr.offsetBytes totalBytes) localBytes
-      | .none => true
-    | .none => true
-  | _, _ => true
+      match entry.targetProjection with
+      | .nil =>
+        match rigidTyByteSize layouts decl.ty with
+        | .some localBytes =>
+          Nat.ble (Nat.add ptr.offsetBytes totalBytes) localBytes
+        | .none => true
+      | _ :: _ => true
 
 /--
 Look up `ptr.tag` in `borrows` and verify `copyBorrowInRootBounds` for

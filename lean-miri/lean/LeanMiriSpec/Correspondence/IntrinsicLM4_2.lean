@@ -588,6 +588,14 @@ theorem intrinsics_eval_arithOffset (ld : List LocalDecl) (ly : LayoutTable)
     Bool.false_eq_true, ↓reduceIte]
   rfl
 
+theorem intrinsics_eval_wrappingOffset (ld : List LocalDecl) (ly : LayoutTable)
+    (argTy : Miri.MIR.TyId) (v₁ v₂ : Miri.Interpreter.OpTy AnnealProv)
+    (dest : Miri.Interpreter.RuntimePlace AnnealProv) (target : Option Miri.MIR.BasicBlockId) :
+    Miri.Interpreter.Intrinsics.eval (annealIntrinsicHooks ld ly) ()
+        AnnealIntrinsic.wrappingOffset.name #[argTy] #[v₁, v₂] dest target =
+      annealArithOffsetEval ly argTy v₁ v₂ dest target :=
+  intrinsics_eval_arithOffset ld ly argTy v₁ v₂ dest target
+
 /-- `IntrinsicHooks.pointeeType` of `annealIntrinsicHooks`. -/
 def annealPointeeTypeOf (tyId : Miri.MIR.TyId) :
     Miri.Interpreter.RvalueM AnnealStepState Miri.MIR.TyId :=

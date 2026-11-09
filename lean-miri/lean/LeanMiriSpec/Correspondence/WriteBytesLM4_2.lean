@@ -35,10 +35,15 @@ One-step correspondence between Anneal's `stepMirFn` (`evalWriteBytesCall`) and
   4. `dst` holding a `PtrRel`-related `.ptr ptrVal 8` into an address-taken
      primitive integer local (`StackScalarAllocShape`) reports UB in both
      machines on out-of-bounds positive size (`targetBytes < offset + total`),
-     and writes `repeatByteBits` while preserving `StateRelLM3_1` on whole-local
-     in-bounds fills (`offset = 0`, `total = targetBytes`). Partial-fill
-     in-bounds writes (`0 < total < targetBytes` or `0 < offset`) are outside
-     `hlive_inbounds` scope.
+     writes `repeatByteBits` while preserving `StateRelLM3_1` on whole-local
+     in-bounds fills (`offset = 0`, `total = targetBytes`, whether previously
+     `.uninit` or `.init`), and splices `[offset, offset + total)` via
+     `spliceRepeatedBytes` while preserving surrounding bytes and
+     `StateRelLM3_1` on partial in-bounds fills into an initialized scalar
+     local (`∃ oldSc, get? s.frame.locals e.localIdx = some (.init (.scalar oldSc))`).
+     Only partial fills into an `.uninit` scalar local remain outside
+     `hlive_inbounds` scope (Miri tracks per-byte `InitMask`, whereas Anneal's
+     `LocalSlot` tracks whole-local initialization).
 * Characterized divergences and shared modeling gaps:
   - **Tree Borrows permissions (`call_intrinsic_write_bytes_perm_divergence`)**:
     on a live in-bounds whole-local fill through a `.frozen` or `.disabled`
@@ -67,15 +72,8 @@ theorem evalInlineIntrinsicCall?_writeBytes (s : MachineState) (argOps : List Mi
     evalInlineIntrinsicCall? s AnnealIntrinsic.writeBytes.defPath argOps argVals locals'
         destination targetBb localDecls layouts =
       some (match argOps, argVals with
-        | dstOp :: _ :: _ :: .nil, .ptr dstPtr _ :: .scalar val :: .scalar count :: .nil =>
-          evalWriteBytesCall s dstOp dstPtr val count locals' targetBb localDecls layouts
-        | dstOp :: _ :: _ :: .nil, .scalar _ :: .scalar _ :: .scalar count :: .nil =>
-          match operandPointeeBytes? localDecls layouts dstOp with
-          | .some elemBytes =>
-            match Nat.beq (Nat.mul count.bits elemBytes) 0 with
-            | true => intrinsicReturnTo s targetBb locals' s.memory
-            | false => MirStepNode.fail .ub
-          | .none => MirStepNode.unsupported
+        | dstOp :: _ :: _ :: .nil, dstVal :: .scalar val :: .scalar count :: .nil =>
+          evalWriteBytesCall s dstOp dstVal val count locals' targetBb localDecls layouts
         | _, _ => MirStepNode.unsupported) := by
   rfl
 
@@ -968,6 +966,599 @@ theorem StackScalarAllocShape.writeRepeatedByte_full {E : Type} {n : Nat}
   rw [wbAlloc_readTargetUInt_leBytes _ _ hn16, hmod]
   simp only [Bool.false_eq_true, ↓reduceIte, hoff, hrange, wbAlloc_fromUInt hrel]
 
+/-- Byte-splice result of overwriting bytes `[off, off + total)` of an
+`n`-byte unsigned integer `oldBits` with `total` copies of `byteVal` (`< 256`)
+in little-endian order, matching `evalWriteBytesCall` on `.init (.scalar sc)`. -/
+def spliceRepeatedBytes (oldBits byteVal off total n : Nat) : Nat :=
+  let fill := repeatByteBits byteVal total
+  let lowMod := scalarModulus off
+  let highMod := scalarModulus (Nat.add off total)
+  let old := wrapScalarBits oldBits (scalarModulus n)
+  Nat.add (Nat.mod old lowMod)
+    (Nat.add (Nat.mul fill lowMod)
+      (Nat.mul (Nat.div old highMod) highMod))
+
+private theorem wbScalarModulus_pos (sz : Nat) : 0 < scalarModulus sz := by
+  rw [wbAlloc_scalarModulus_eq_two_pow]; exact Nat.two_pow_pos _
+
+private theorem wbWrapScalarBits_lt (bits sz : Nat) :
+    wrapScalarBits bits (scalarModulus sz) < scalarModulus sz := by
+  unfold wrapScalarBits
+  cases hble : (scalarModulus sz).ble bits
+  · dsimp only
+    exact Nat.lt_of_not_ge (fun hle => Bool.noConfusion ((Nat.ble_eq.mpr hle).symm.trans hble))
+  · dsimp only
+    exact Nat.mod_lt _ (wbScalarModulus_pos sz)
+
+private theorem wbWrapScalarBits_eq_of_lt {bits sz : Nat} (h : bits < scalarModulus sz) :
+    wrapScalarBits bits (scalarModulus sz) = bits := by
+  unfold wrapScalarBits
+  have hble : (scalarModulus sz).ble bits = false := by
+    cases hb : (scalarModulus sz).ble bits
+    · rfl
+    · exact absurd (Nat.ble_eq.mp hb) (Nat.not_le_of_lt h)
+  rw [hble]
+
+/-- `spliceRepeatedBytes` produces a canonical `n`-byte unsigned integer
+whenever `byteVal < 256` and `off + total ≤ n`. -/
+theorem spliceRepeatedBytes_lt_scalarModulus (oldBits : Nat) {byteVal off total n : Nat}
+    (hb : byteVal < 256) (hinb : off + total ≤ n) :
+    spliceRepeatedBytes oldBits byteVal off total n < scalarModulus n := by
+  unfold spliceRepeatedBytes
+  have hlow_pos := wbScalarModulus_pos off
+  have hmod_lt : wrapScalarBits oldBits (scalarModulus n) % scalarModulus off <
+      scalarModulus off := Nat.mod_lt _ hlow_pos
+  have hfill_lt : repeatByteBits byteVal total < scalarModulus total :=
+    repeatByteBits_lt_scalarModulus hb total
+  have hhigh_eq : scalarModulus (Nat.add off total) =
+      scalarModulus total * scalarModulus off := by
+    simp only [Nat.add_eq, wbAlloc_scalarModulus_eq_two_pow]
+    rw [show 8 * (off + total) = 8 * total + 8 * off by omega, Nat.pow_add]
+  have hmid_lt :
+      wrapScalarBits oldBits (scalarModulus n) % scalarModulus off +
+        repeatByteBits byteVal total * scalarModulus off <
+      scalarModulus (Nat.add off total) := by
+    have hmul_le : repeatByteBits byteVal total * scalarModulus off + scalarModulus off ≤
+        scalarModulus total * scalarModulus off := by
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right _ hfill_lt
+    rw [hhigh_eq]; omega
+  have hold_lt := wbWrapScalarBits_lt oldBits n
+  have htop_eq : scalarModulus n =
+      scalarModulus (n - (off + total)) * scalarModulus (Nat.add off total) := by
+    simp only [Nat.add_eq, wbAlloc_scalarModulus_eq_two_pow]
+    rw [← Nat.pow_add, show 8 * (n - (off + total)) + 8 * (off + total) = 8 * n by omega]
+  have hhigh_pos := wbScalarModulus_pos (Nat.add off total)
+  have hdiv_lt : wrapScalarBits oldBits (scalarModulus n) / scalarModulus (Nat.add off total) <
+      scalarModulus (n - (off + total)) := by
+    rw [Nat.div_lt_iff_lt_mul hhigh_pos, ← htop_eq]
+    exact hold_lt
+  have htop_le :
+      (wrapScalarBits oldBits (scalarModulus n) / scalarModulus (Nat.add off total)) *
+        scalarModulus (Nat.add off total) + scalarModulus (Nat.add off total) ≤
+      scalarModulus n := by
+    calc (wrapScalarBits oldBits (scalarModulus n) / scalarModulus (Nat.add off total)) *
+            scalarModulus (Nat.add off total) + scalarModulus (Nat.add off total)
+        = (wrapScalarBits oldBits (scalarModulus n) / scalarModulus (Nat.add off total) + 1) *
+            scalarModulus (Nat.add off total) := by rw [← Nat.succ_mul]
+      _ ≤ scalarModulus (n - (off + total)) * scalarModulus (Nat.add off total) :=
+            Nat.mul_le_mul_right _ hdiv_lt
+      _ = scalarModulus n := htop_eq.symm
+  change (wrapScalarBits oldBits (scalarModulus n) % scalarModulus off) +
+    (repeatByteBits byteVal total * scalarModulus off +
+      (wrapScalarBits oldBits (scalarModulus n) / scalarModulus (Nat.add off total)) *
+        scalarModulus (Nat.add off total)) < scalarModulus n
+  omega
+
+private theorem wbByte_of_split {a b k i : Nat} (ha : a < 2 ^ (8 * k)) :
+    ((a + b * 2 ^ (8 * k)) / 2 ^ (8 * i)) % 256 =
+      if i < k then (a / 2 ^ (8 * i)) % 256 else (b / 2 ^ (8 * (i - k))) % 256 := by
+  by_cases hik : i < k
+  · simp only [hik, ↓reduceIte]
+    have hpow : 2 ^ (8 * k) = (256 * 2 ^ (8 * (k - i - 1))) * 2 ^ (8 * i) := by
+      rw [show (256 : Nat) = 2 ^ 8 from rfl, ← Nat.pow_add, ← Nat.pow_add]
+      exact congrArg (2 ^ ·) (by omega)
+    have hmul : b * 2 ^ (8 * k) = (b * 2 ^ (8 * (k - i - 1)) * 256) * 2 ^ (8 * i) := by
+      rw [hpow]; ac_rfl
+    rw [hmul, Nat.add_mul_div_right _ _ (Nat.two_pow_pos _), Nat.add_mul_mod_self_right]
+  · simp only [hik, ↓reduceIte]
+    have hpow : 2 ^ (8 * i) = 2 ^ (8 * k) * 2 ^ (8 * (i - k)) := by
+      rw [← Nat.pow_add]
+      exact congrArg (2 ^ ·) (by omega)
+    rw [hpow, ← Nat.div_div_eq_div_mul, Nat.add_mul_div_right _ _ (Nat.two_pow_pos _),
+      Nat.div_eq_of_lt ha, Nat.zero_add]
+
+/-- Every little-endian byte `i < n` of `spliceRepeatedBytes` equals `byteVal`
+inside `[off, off + total)` and the original byte `(oldBits / 2^(8*i)) % 256`
+outside `[off, off + total)`. -/
+theorem spliceRepeatedBytes_byte {oldBits byteVal off total n i : Nat}
+    (hold : oldBits < scalarModulus n) (hb : byteVal < 256)
+    (_hinb : off + total ≤ n) (_hi : i < n) :
+    (spliceRepeatedBytes oldBits byteVal off total n / 2 ^ (8 * i)) % 256 =
+      if off ≤ i ∧ i < off + total then byteVal else (oldBits / 2 ^ (8 * i)) % 256 := by
+  have hwrap := wbWrapScalarBits_eq_of_lt hold
+  have hlow_eq := wbAlloc_scalarModulus_eq_two_pow off
+  have hhigh_eq : scalarModulus (Nat.add off total) = 2 ^ (8 * (off + total)) :=
+    wbAlloc_scalarModulus_eq_two_pow (off + total)
+  have hlow_lt : oldBits % 2 ^ (8 * off) < 2 ^ (8 * off) :=
+    Nat.mod_lt _ (Nat.two_pow_pos _)
+  have hfill_lt : repeatByteBits byteVal total < 2 ^ (8 * total) := by
+    rw [← wbAlloc_scalarModulus_eq_two_pow]
+    exact repeatByteBits_lt_scalarModulus hb total
+  have hmid_lt :
+      oldBits % 2 ^ (8 * off) + repeatByteBits byteVal total * 2 ^ (8 * off) <
+        2 ^ (8 * (off + total)) := by
+    have hpow : 2 ^ (8 * (off + total)) = 2 ^ (8 * total) * 2 ^ (8 * off) := by
+      rw [← Nat.pow_add, show 8 * total + 8 * off = 8 * (off + total) by omega]
+    have hle : repeatByteBits byteVal total * 2 ^ (8 * off) + 2 ^ (8 * off) ≤
+        2 ^ (8 * total) * 2 ^ (8 * off) := by
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right _ hfill_lt
+    rw [hpow]; omega
+  have hsum :
+      spliceRepeatedBytes oldBits byteVal off total n =
+        (oldBits % 2 ^ (8 * off) + repeatByteBits byteVal total * 2 ^ (8 * off)) +
+          (oldBits / 2 ^ (8 * (off + total))) * 2 ^ (8 * (off + total)) := by
+    change wrapScalarBits oldBits (scalarModulus n) % scalarModulus off +
+        (repeatByteBits byteVal total * scalarModulus off +
+          (wrapScalarBits oldBits (scalarModulus n) / scalarModulus (Nat.add off total)) *
+            scalarModulus (Nat.add off total)) = _
+    rw [hwrap, hlow_eq, hhigh_eq, ← Nat.add_assoc]
+  rw [hsum, wbByte_of_split hmid_lt]
+  by_cases hhi : i < off + total
+  · simp only [hhi, and_true, ↓reduceIte, wbByte_of_split hlow_lt]
+    by_cases hlo : i < off
+    · have hnot_ge : ¬ (off ≤ i) := by omega
+      simp only [hlo, hnot_ge, ↓reduceIte]
+      have hold_decomp : oldBits =
+          oldBits % 2 ^ (8 * off) + (oldBits / 2 ^ (8 * off)) * 2 ^ (8 * off) := by
+        have h := (Nat.mod_add_div oldBits (2 ^ (8 * off))).symm
+        rwa [Nat.mul_comm (2 ^ (8 * off))] at h
+      conv => rhs; rw [hold_decomp]
+      rw [wbByte_of_split hlow_lt]
+      simp [hlo]
+    · have hge : off ≤ i := by omega
+      simp only [hlo, hge, ↓reduceIte]
+      exact wbAlloc_repeatByteBits_byte byteVal hb total (i - off) (by omega)
+  · simp only [hhi, and_false, ↓reduceIte]
+    rw [Nat.div_div_eq_div_mul, ← Nat.pow_add,
+      show 8 * (off + total) + 8 * (i - (off + total)) = 8 * i by omega]
+
+private def wbAlloc_fromLeBytes : List UInt8 → Nat
+  | [] => 0
+  | b :: bs => b.toNat + 256 * wbAlloc_fromLeBytes bs
+
+private theorem wbAlloc_fromLeBytes_lt :
+    ∀ l : List UInt8, wbAlloc_fromLeBytes l < 2 ^ (8 * l.length)
+  | [] => by simp [wbAlloc_fromLeBytes]
+  | b :: bs => by
+    have ih := wbAlloc_fromLeBytes_lt bs
+    have hb := b.toNat_lt
+    simp only [wbAlloc_fromLeBytes, List.length_cons]
+    rw [show 8 * (bs.length + 1) = 8 + 8 * bs.length by omega, Nat.pow_add]
+    have hle : wbAlloc_fromLeBytes bs + 1 ≤ 2 ^ (8 * bs.length) := ih
+    have hmul : 256 * (wbAlloc_fromLeBytes bs + 1) ≤ 2 ^ 8 * 2 ^ (8 * bs.length) :=
+      Nat.mul_le_mul_left 256 hle
+    omega
+
+private theorem wbAlloc_fromLeBytes_byte :
+    ∀ (l : List UInt8) (i : Nat) (hi : i < l.length),
+      (wbAlloc_fromLeBytes l / 2 ^ (8 * i)) % 256 = (l[i]'hi).toNat
+  | [], _, hi => absurd hi (Nat.not_lt_zero _)
+  | b :: bs, 0, _ => by
+    have hb := b.toNat_lt
+    show (b.toNat + 256 * wbAlloc_fromLeBytes bs) / 1 % 256 = b.toNat
+    omega
+  | b :: bs, j + 1, hi => by
+    have hb := b.toNat_lt
+    have hj : j < bs.length := by simp at hi; omega
+    have hpow : 2 ^ (8 * (j + 1)) = 256 * 2 ^ (8 * j) := by
+      rw [show 8 * (j + 1) = 8 + 8 * j by omega, Nat.pow_add]
+    have hdiv : (b.toNat + 256 * wbAlloc_fromLeBytes bs) / (256 * 2 ^ (8 * j)) =
+        wbAlloc_fromLeBytes bs / 2 ^ (8 * j) := by
+      rw [← Nat.div_div_eq_div_mul]
+      have h1 : (b.toNat + 256 * wbAlloc_fromLeBytes bs) / 256 = wbAlloc_fromLeBytes bs := by
+        omega
+      rw [h1]
+    show (b.toNat + 256 * wbAlloc_fromLeBytes bs) / 2 ^ (8 * (j + 1)) % 256 = bs[j].toNat
+    rw [hpow, hdiv]
+    exact wbAlloc_fromLeBytes_byte bs j hj
+
+private theorem wbAlloc_leBytes_fromLeBytes (bytes : Array UInt8) :
+    wbAlloc_leBytes (wbAlloc_fromLeBytes bytes.toList) bytes.size = bytes := by
+  apply Array.ext
+  · simp [wbAlloc_leBytes]
+  · intro i hi₁ hi₂
+    have hi_list : i < bytes.toList.length := by simpa using hi₂
+    have hbyte := wbAlloc_fromLeBytes_byte bytes.toList i hi_list
+    simp [wbAlloc_leBytes, hbyte]
+
+private theorem wbIte_pos {P : Prop} [Decidable P] {α : Type _} {a b : α} (h : P) :
+    (if P then a else b) = a := by simp [h]
+
+private theorem wbIte_neg {P : Prop} [Decidable P] {α : Type _} {a b : α} (h : ¬ P) :
+    (if P then a else b) = b := by simp [h]
+
+private theorem wbAlloc_setList_leBytes_eq_splice
+    {oldBits : Nat} {n : Nat} (hold : oldBits < scalarModulus n)
+    (byte : UInt8) {off total : Nat} (hinb : off + total ≤ n) :
+    wbAlloc_setList off byte (List.range' 0 total) (wbAlloc_leBytes oldBits n) =
+      wbAlloc_leBytes (spliceRepeatedBytes oldBits byte.toNat off total n) n := by
+  have hsz_old : (wbAlloc_leBytes oldBits n).size = n := wbAlloc_leBytes_size oldBits n
+  apply Array.ext
+  · rw [wbAlloc_setList_size, hsz_old, wbAlloc_leBytes_size]
+  · intro i hi₁ hi₂
+    have hi_n : i < n := by rw [wbAlloc_leBytes_size] at hi₂; exact hi₂
+    have hget := wbAlloc_setList_getElem? off byte total 0 (wbAlloc_leBytes oldBits n) i (by omega)
+    simp only [Array.getElem?_eq_getElem hi₁, Nat.add_zero, Nat.zero_add] at hget
+    have hs := spliceRepeatedBytes_byte hold byte.toNat_lt hinb hi_n
+    by_cases hcond : off ≤ i ∧ i < off + total
+    · rw [wbIte_pos hcond] at hget hs
+      injection hget with hget'
+      rw [hget']
+      simp [wbAlloc_leBytes, hs]
+    · rw [wbIte_neg hcond] at hget hs
+      have hi_old : i < (wbAlloc_leBytes oldBits n).size := by omega
+      rw [Array.getElem?_eq_getElem hi_old] at hget
+      injection hget with hget'
+      rw [hget']
+      simp [wbAlloc_leBytes, hs]
+
+private theorem wbAlloc_range_endExclusive {off total : Nat} (hlt : off + total < 2 ^ 64) :
+    (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      (Miri.ABI.Size.ofBytes (UInt64.ofNat total))).endExclusive =
+      .ok (Miri.ABI.Size.ofBytes (UInt64.ofNat (off + total))) := by
+  have hsum : UInt64.ofNat off + UInt64.ofNat total = UInt64.ofNat (off + total) :=
+    (UInt64.ofNat_add off total).symm
+  have hoff_lt : off < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right off total) hlt
+  have h1 : (UInt64.ofNat off).toNat = off := UInt64.toNat_ofNat_of_lt hoff_lt
+  have h2 : (UInt64.ofNat (off + total)).toNat = off + total := UInt64.toNat_ofNat_of_lt hlt
+  have hnot_lt : ¬ (UInt64.ofNat (off + total) < UInt64.ofNat off) := by
+    rw [UInt64.lt_iff_toNat_lt, h1, h2]; omega
+  unfold Miri.Memory.AllocRange.endExclusive Miri.Memory.AllocRange.end Miri.Memory.allocRange
+    Miri.ABI.Size.add Miri.ABI.Size.ofBytes
+  simp only [hsum, hnot_lt, ↓reduceIte, Except.mapError]
+
+private theorem wbInitMask_setRange_true {off total n : Nat} (hn : ValidScalarBytes n)
+    (hinb : off + total ≤ n) :
+    (Miri.Memory.InitMask.new (translateSizeBytes n) true).setRange
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) true =
+      .ok (Miri.Memory.InitMask.new (translateSizeBytes n) true) := by
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hlt64 : off + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinb hn64
+  have hend := wbAlloc_range_endExclusive hlt64
+  have hend_nat : (UInt64.ofNat (off + total)).toNat = off + total :=
+    UInt64.toNat_ofNat_of_lt hlt64
+  have hle_bytes : UInt64.ofNat (off + total) ≤ (translateSizeBytes n).bytes := by
+    rw [UInt64.le_iff_toNat_le, hend_nat, hn_eq]; exact hinb
+  have hnot_gt : ¬ ((UInt64.ofNat (off + total)) > (translateSizeBytes n).bytes) := by
+    rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_nat, hn_eq]; omega
+  unfold Miri.Memory.InitMask.setRange Miri.Memory.InitMask.new
+  rw [hend]
+  dsimp only [bind, Except.bind, Miri.Memory.allocRange, Miri.ABI.Size.ofBytes]
+  by_cases hfull : UInt64.ofNat off = 0 ∧ (translateSizeBytes n).bytes ≤ UInt64.ofNat (off + total)
+  · have hsz_eq : (⟨UInt64.ofNat (off + total)⟩ : Miri.ABI.Size) = translateSizeBytes n := by
+      cases hs : translateSizeBytes n with
+      | mk nb =>
+        rw [hs] at hle_bytes hfull
+        exact congrArg Miri.ABI.Size.mk (UInt64.le_antisymm hle_bytes hfull.2)
+    rw [wbIte_pos hfull, hsz_eq]
+    rfl
+  · rw [wbIte_neg hfull]
+    simp only [beq_self_eq_true, ↓reduceIte, hnot_gt, pure, Except.pure]
+
+private theorem wbProv_clear_new {off total : Nat} (hpos : 0 < total) (hlt : off + total < 2 ^ 64)
+    (raw : Array UInt8) :
+    Miri.Memory.ProvenanceMap.clear
+      (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat total)))
+      raw (Miri.ABI.Size.ofBytes 8) (Miri.Memory.ProvenanceMap.new (Prov := AnnealProv)) =
+      EStateM.Result.ok () Miri.Memory.ProvenanceMap.new := by
+  have htot_lt : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total off) hlt
+  have hnz : (UInt64.ofNat total == 0) = false := by
+    have ht : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot_lt
+    cases hb : (UInt64.ofNat total == 0)
+    · rfl
+    · have := eq_of_beq hb; rw [this] at ht; simp at ht; omega
+  have hend' :
+      ({ start := { bytes := UInt64.ofNat off }, size := { bytes := UInt64.ofNat total } } :
+        Miri.Memory.AllocRange).endExclusive =
+      Except.ok { bytes := UInt64.ofNat (off + total) } := wbAlloc_range_endExclusive hlt
+  have hrp : Miri.Memory.ProvenanceMap.new.rangePtrs (Prov := AnnealProv)
+      { start := { bytes := UInt64.ofNat off }, size := { bytes := UInt64.ofNat total } }
+      { bytes := 8 } = .ok #[] := by
+    unfold Miri.Memory.ProvenanceMap.rangePtrs
+    simp only [bind, Except.bind]
+    with_unfolding_all (conv => lhs; whnf)
+    split
+    · next r hv =>
+      with_unfolding_all (conv at hv => lhs; whnf)
+      rw [hend'] at hv
+      cases hv
+    · next v hv =>
+      with_unfolding_all (conv at hv => lhs; whnf)
+      rw [hend'] at hv
+      cases hv
+      with_unfolding_all rfl
+  unfold Miri.Memory.ProvenanceMap.clear
+  simp only [Miri.Memory.allocRange, Miri.ABI.Size.ofBytes, hnz, Bool.false_eq_true, ↓reduceIte,
+    bind, EStateM.bind, EStateM.get, EStateM.set]
+  split
+  · next a s heq =>
+    with_unfolding_all (conv at heq => lhs; whnf)
+    split at heq
+    · next v hv =>
+      with_unfolding_all (conv at hv => lhs; whnf)
+      rw [hend'] at hv
+      cases hv
+      injection heq with ha hs
+      subst ha hs
+      dsimp only []
+      with_unfolding_all erw [hrp]
+      with_unfolding_all rfl
+    · next r hv =>
+      with_unfolding_all (conv at hv => lhs; whnf)
+      rw [hend'] at hv
+      cases hv
+  · next e s heq =>
+    with_unfolding_all (conv at heq => lhs; whnf)
+    split at heq
+    · next v hv => cases heq
+    · next r hv =>
+      with_unfolding_all (conv at hv => lhs; whnf)
+      rw [hend'] at hv
+      cases hv
+
+/-- Any in-bounds positive `Allocation.writeRepeatedByte` (`0 < total`,
+`off + total ≤ n`) on an already initialized `StackScalarAllocShape` scalar
+allocation storing `oldSc` (`ScalarRel oldSc oldMsc`) splices bytes
+`[off, off + total)` with `byte`, preserves `StackScalarAllocShape` and
+initialization, and yields `readScalar = .ok (.fromScalarInt msc)` with
+`ScalarRel ⟨spliceRepeatedBytes oldSc.bits byte.toNat off total n, n⟩ msc`. -/
+theorem StackScalarAllocShape.writeRepeatedByte_partial {E : Type} {n : Nat}
+    (hn : ValidScalarBytes n) {oldSc : MirAst.ScalarInt} {oldMsc : Miri.Memory.ScalarInt}
+    (holdRel : ScalarRel oldSc oldMsc) (holdSz : oldSc.sizeBytes = n)
+    (byte : UInt8) {off total : Nat} (hpos : 0 < total) (hinb : off + total ≤ n)
+    {A : Miri.Memory.Allocation AnnealProv E}
+    (hshape : StackScalarAllocShape (translateSizeBytes n) A)
+    (hread_old : A.readScalar annealTargetDataLayout
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) false =
+      .ok (Miri.Memory.Scalar.fromScalarInt oldMsc)) :
+    ∃ (alloc' : Miri.Memory.Allocation AnnealProv E) (msc : Miri.Memory.ScalarInt),
+      Miri.Memory.Allocation.writeRepeatedByte (Miri.ABI.Size.ofBytes (UInt64.ofNat off)) byte
+          (UInt64.ofNat total) (Miri.ABI.Size.ofBytes 8) A = .ok () alloc' ∧
+      ScalarRel ⟨spliceRepeatedBytes oldSc.bits byte.toNat off total n, n⟩ msc ∧
+      alloc'.align = A.align ∧
+      StackScalarAllocShape (translateSizeBytes n) alloc' ∧
+      alloc'.initializationMask.isRangeInitialized
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) = .ok (.ok ()) ∧
+      alloc'.readScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) false =
+        .ok (Miri.Memory.Scalar.fromScalarInt msc) := by
+  have hold_can : oldSc.bits < scalarModulus n := holdSz ▸ holdRel.canonical
+  have hcan : spliceRepeatedBytes oldSc.bits byte.toNat off total n < scalarModulus n :=
+    spliceRepeatedBytes_lt_scalarModulus oldSc.bits byte.toNat_lt hinb
+  obtain ⟨msc, _, hrel⟩ :=
+    tryFromUInt_of_valid_canonical
+      (sc := ⟨spliceRepeatedBytes oldSc.bits byte.toNat off total n, n⟩) hn hcan
+  have hn_eq : (translateSizeBytes n).bytes.toNat = n := by
+    rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+  have hn16 : n ≤ 16 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+  have hn16_tr : (translateSizeBytes n).bytes.toNat ≤ 16 := by rw [hn_eq]; exact hn16
+  have hend_full := wbAlloc_allocRange_end (translateSizeBytes n)
+  have hinitA : A.initializationMask.isRangeInitialized
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) = .ok (.ok ()) :=
+    Classical.byContradiction fun hni => by
+      obtain ⟨_, herr⟩ := hshape.uninit_readScalar_err hni false
+      rw [hread_old] at herr
+      cases herr
+  -- Decode `wbAlloc_raw A = wbAlloc_leBytes oldSc.bits n`.
+  have hraw_old : wbAlloc_raw A = wbAlloc_leBytes oldSc.bits n := by
+    have hraw_sz : (wbAlloc_raw A).size = n := hshape.len_eq.trans hn_eq
+    let x := wbAlloc_fromLeBytes (wbAlloc_raw A).toList
+    have hx_can : x < scalarModulus n := by
+      rw [wbAlloc_scalarModulus_eq_two_pow]
+      have hlt := wbAlloc_fromLeBytes_lt (wbAlloc_raw A).toList
+      have hlen_l : (wbAlloc_raw A).toList.length = n := by simpa using hraw_sz
+      rw [hlen_l] at hlt
+      exact hlt
+    obtain ⟨xmsc, _, hx_rel⟩ := tryFromUInt_of_valid_canonical (sc := ⟨x, n⟩) hn hx_can
+    have hraw_x : wbAlloc_raw A = wbAlloc_leBytes x n := by
+      have := wbAlloc_leBytes_fromLeBytes (wbAlloc_raw A)
+      rw [hraw_sz] at this
+      exact this.symm
+    have hslice_A : wbAlloc_checkedSlice A
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) =
+        .ok (wbAlloc_leBytes x (translateSizeBytes n).bytes.toNat) := by
+      have hrawsize : (wbAlloc_raw A).size = (translateSizeBytes n).bytes.toNat := hshape.len_eq
+      unfold wbAlloc_checkedSlice
+      simp only [hrawsize, hshape.byteSize_eq, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+        hend_full, Except.mapError, bind, Except.bind]
+      simp [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, pure, Except.pure, hraw_x, hn_eq,
+        wbAlloc_leBytes_size]
+    have hoff_addr : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+    have hx_mod : x % 2 ^ (8 * (translateSizeBytes n).bytes.toNat) = x := by
+      rw [hn_eq, ← wbAlloc_scalarModulus_eq_two_pow]
+      exact Nat.mod_eq_of_lt hx_can
+    have hrange_sz :
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)).size =
+          translateSizeBytes n := rfl
+    have hread_x : A.readScalar annealTargetDataLayout
+        (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) false =
+        .ok (Miri.Memory.Scalar.fromScalarInt xmsc) := by
+      rw [wbAlloc_readScalar_eq]
+      unfold wbAlloc_readScalar
+      rw [hinitA]
+      simp only [Except.mapError, bind, Except.bind]
+      rw [wbAlloc_getBytesUnchecked_eq, hslice_A]
+      simp only []
+      rw [wbAlloc_readTargetUInt_leBytes _ _ hn16_tr, hx_mod]
+      simp only [Bool.false_eq_true, ↓reduceIte, hoff_addr, hrange_sz, wbAlloc_fromUInt hx_rel]
+    have hsc_eq : Miri.Memory.Scalar.fromScalarInt (Prov := AnnealProv) xmsc =
+        Miri.Memory.Scalar.fromScalarInt oldMsc :=
+      Except.ok.inj (hread_x.symm.trans hread_old)
+    have hdata_eq : BitVec.ofNat 128 x = BitVec.ofNat 128 oldSc.bits := by
+      unfold Miri.Memory.Scalar.fromScalarInt at hsc_eq
+      injection hsc_eq with hpay _
+      injection hpay with hmsc_eq
+      exact hx_rel.data_eq.symm.trans ((congrArg Miri.Memory.ScalarInt.data hmsc_eq).trans
+        holdRel.data_eq)
+    have hx_eq : x = oldSc.bits := by
+      have hpow128 : scalarModulus n ≤ 2 ^ 128 := by
+        rw [wbAlloc_scalarModulus_eq_two_pow]
+        exact Nat.pow_le_pow_right (by decide) (by omega)
+      have h1 : (BitVec.ofNat 128 x).toNat = x := by
+        rw [BitVec.toNat_ofNat]; exact Nat.mod_eq_of_lt (Nat.lt_of_lt_of_le hx_can hpow128)
+      have h2 : (BitVec.ofNat 128 oldSc.bits).toNat = oldSc.bits := by
+        rw [BitVec.toNat_ofNat]; exact Nat.mod_eq_of_lt (Nat.lt_of_lt_of_le hold_can hpow128)
+      rw [← h1, ← h2, hdata_eq]
+    rw [hraw_x, hx_eq]
+  -- Evaluate `Allocation.writeRepeatedByte` on `A`.
+  obtain ⟨alloc', hw, halign', hshape', hinit', hraw'⟩ :
+      ∃ alloc' : Miri.Memory.Allocation AnnealProv E,
+        Miri.Memory.Allocation.writeRepeatedByte (Miri.ABI.Size.ofBytes (UInt64.ofNat off)) byte
+            (UInt64.ofNat total) (Miri.ABI.Size.ofBytes 8) A = .ok () alloc' ∧
+        alloc'.align = A.align ∧
+        StackScalarAllocShape (translateSizeBytes n) alloc' ∧
+        alloc'.initializationMask.isRangeInitialized
+            (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) = .ok (.ok ()) ∧
+        wbAlloc_raw alloc' =
+          wbAlloc_leBytes (spliceRepeatedBytes oldSc.bits byte.toNat off total n) n := by
+    have hn64 : n < 2 ^ 64 := by rcases hn with rfl | rfl | rfl | rfl | rfl <;> omega
+    have hlt64 : off + total < 2 ^ 64 := Nat.lt_of_le_of_lt hinb hn64
+    have hoff64 : off < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_right off total) hlt64
+    have htot64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total off) hlt64
+    have hslice_sub : Miri.Memory.Allocation.getBytesUnchecked A
+        (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+          (Miri.ABI.Size.ofBytes (UInt64.ofNat total))) =
+        .ok ((wbAlloc_raw A).extract off (off + total)) := by
+      rw [wbAlloc_getBytesUnchecked_eq]; unfold wbAlloc_checkedSlice
+      have hrawsize : (wbAlloc_raw A).size = (translateSizeBytes n).bytes.toNat := hshape.len_eq
+      have hend_sub := wbAlloc_range_endExclusive hlt64
+      have hoff_u64 : (UInt64.ofNat off).toNat = off := UInt64.toNat_ofNat_of_lt hoff64
+      have hend_u64 : (UInt64.ofNat (off + total)).toNat = off + total :=
+        UInt64.toNat_ofNat_of_lt hlt64
+      have hnot_gt1 : ¬ (UInt64.ofNat off > UInt64.ofNat (off + total)) := by
+        rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hoff_u64, hend_u64]; omega
+      have hnot_gt2 : ¬ (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes) := by
+        rw [gt_iff_lt, UInt64.lt_iff_toNat_lt, hend_u64, hn_eq]; omega
+      have hcond_false :
+          (decide (UInt64.ofNat off > UInt64.ofNat (off + total)) ||
+            decide (UInt64.ofNat (off + total) > (translateSizeBytes n).bytes)) = false := by
+        rw [Bool.or_eq_false_iff, decide_eq_false_iff_not, decide_eq_false_iff_not]
+        exact ⟨hnot_gt1, hnot_gt2⟩
+      rw [hend_sub]
+      simp only [hrawsize, hshape.byteSize_eq, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+        Except.mapError, bind, Except.bind, Miri.Memory.allocRange, Miri.ABI.Size.ofBytes]
+      erw [hcond_false]
+      simp only [Bool.false_eq_true, ↓reduceIte, hoff_u64, hend_u64, pure, Except.pure]
+    unfold Miri.Memory.Allocation.getBytesUnchecked at hslice_sub
+    rcases hshape with ⟨hsz, hlen, hmut, hprov, ⟨initBool, hmask⟩⟩
+    have hbInit : initBool = true := by
+      cases initBool with
+      | true => rfl
+      | false =>
+        rw [hmask] at hinitA
+        rcases hn with rfl | rfl | rfl | rfl | rfl <;> cases hinitA
+    subst hbInit
+    let res := Miri.Memory.Allocation.writeRepeatedByte (Miri.ABI.Size.ofBytes (UInt64.ofNat off))
+      byte (UInt64.ofNat total) (Miri.ABI.Size.ofBytes 8) A
+    have hres_def : res = Miri.Memory.Allocation.writeRepeatedByte
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat off)) byte (UInt64.ofNat total)
+        (Miri.ABI.Size.ofBytes 8) A := rfl
+    rcases A with ⟨rawBytes, size, provenance, initMask, align, mutability, extra, nativeBuffer⟩
+    unfold Miri.Memory.Allocation.byteSize at hsz
+    unfold Miri.Memory.Allocation.len at hlen
+    unfold Miri.Memory.Allocation.provenanceMap at hprov
+    unfold Miri.Memory.Allocation.initializationMask at hmask
+    dsimp only [wbAlloc_raw] at hsz hlen hmut hprov hmask hraw_old
+    subst hsz hmut hprov hmask hraw_old
+    have hcnt_nz : (UInt64.ofNat total == 0) = false := by
+      have ht : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot64
+      cases hb : (UInt64.ofNat total == 0)
+      · rfl
+      · have := eq_of_beq hb; rw [this] at ht; simp at ht; omega
+    have hstart_nat :
+        (Miri.ABI.Size.ofBytes (UInt64.ofNat off)).bytes.toNat = off :=
+      UInt64.toNat_ofNat_of_lt hoff64
+    have hcnt_nat : (UInt64.ofNat total).toNat = total :=
+      UInt64.toNat_ofNat_of_lt htot64
+    have hmask_ok := wbInitMask_setRange_true hn hinb
+    have hprov_ok := wbProv_clear_new hpos hlt64 (wbAlloc_leBytes oldSc.bits n)
+    have hset_eq := wbAlloc_setList_leBytes_eq_splice hold_can byte hinb
+    have hloop_inb : off + (0 + total) ≤ (wbAlloc_leBytes oldSc.bits n).size := by
+      rw [wbAlloc_leBytes_size]; omega
+    unfold Miri.Memory.Allocation.writeRepeatedByte at hres_def
+    dsimp only [] at hres_def
+    rw [hslice_sub] at hres_def
+    dsimp only [] at hres_def
+    rw [hcnt_nz] at hres_def
+    simp only [Bool.false_eq_true, ↓reduceIte, bne_self_eq_false, pure_bind, Id.run] at hres_def
+    split at hres_def
+    · next initialized heq =>
+      have heq' := heq
+      with_unfolding_all (conv at heq' => lhs; whnf)
+      rw [hmask_ok] at heq'
+      with_unfolding_all (conv at heq' => lhs; whnf)
+      injection heq' with hinit_eq
+      subst hinit_eq
+      dsimp only [] at hres_def
+      with_unfolding_all erw [hprov_ok] at hres_def
+      simp only [hstart_nat, hcnt_nat, Std.Legacy.Range.forIn_eq_forIn_range',
+        Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+        wbAlloc_forIn_eq_fallback, wbAlloc_fallback_eq_setList _ _ _ total 0 _ hloop_inb,
+        hset_eq] at hres_def
+      have hinit_res :
+          (Miri.Memory.InitMask.new (translateSizeBytes n) true).isRangeInitialized
+            (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) = .ok (.ok ()) := by
+        rcases hn with rfl | rfl | rfl | rfl | rfl <;> rfl
+      refine ⟨_, hres_def, rfl, ⟨rfl, ?_, rfl, rfl, ⟨true, rfl⟩⟩, hinit_res, rfl⟩
+      change (wbAlloc_leBytes (spliceRepeatedBytes oldSc.bits byte.toNat off total n) n).size =
+        (translateSizeBytes n).bytes.toNat
+      rw [wbAlloc_leBytes_size, hn_eq]
+    · next reason heq =>
+      with_unfolding_all (conv at heq => lhs; whnf)
+      rw [hmask_ok] at heq
+      with_unfolding_all (conv at heq => lhs; whnf)
+      cases heq
+  refine ⟨alloc', msc, hw, hrel, halign', hshape', hinit', ?_⟩
+  have hraw_le : wbAlloc_raw alloc' =
+      wbAlloc_leBytes (spliceRepeatedBytes oldSc.bits byte.toNat off total n)
+        (translateSizeBytes n).bytes.toNat := by
+    rw [hraw', hn_eq]
+  have hslice_read : wbAlloc_checkedSlice alloc'
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)) =
+      .ok (wbAlloc_leBytes (spliceRepeatedBytes oldSc.bits byte.toNat off total n)
+        (translateSizeBytes n).bytes.toNat) := by
+    have hrawsize : (wbAlloc_raw alloc').size = (translateSizeBytes n).bytes.toNat :=
+      hshape'.len_eq
+    unfold wbAlloc_checkedSlice
+    simp only [hrawsize, hshape'.byteSize_eq, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+      hend_full, Except.mapError, bind, Except.bind]
+    simp [Miri.Memory.allocRange, Miri.ABI.Size.ZERO, pure, Except.pure, hraw_le,
+      wbAlloc_leBytes_size]
+  have hoff_addr : Miri.Memory.PointerProvenance.offsetIsAddr AnnealProv = true := rfl
+  have hmod :
+      spliceRepeatedBytes oldSc.bits byte.toNat off total n %
+        2 ^ (8 * (translateSizeBytes n).bytes.toNat) =
+      spliceRepeatedBytes oldSc.bits byte.toNat off total n := by
+    rw [hn_eq, ← wbAlloc_scalarModulus_eq_two_pow]
+    exact Nat.mod_eq_of_lt hcan
+  have hrange :
+      (Miri.Memory.allocRange Miri.ABI.Size.ZERO (translateSizeBytes n)).size =
+        translateSizeBytes n := rfl
+  rw [wbAlloc_readScalar_eq]
+  unfold wbAlloc_readScalar
+  rw [hinit']
+  simp only [Except.mapError, bind, Except.bind]
+  rw [wbAlloc_getBytesUnchecked_eq, hslice_read]
+  simp only []
+  rw [wbAlloc_readTargetUInt_leBytes _ _ hn16_tr, hmod]
+  simp only [Bool.false_eq_true, ↓reduceIte, hoff_addr, hrange, wbAlloc_fromUInt hrel]
+
 /-! ## 5. `annealWriteBytesEval` reduction and post-step `allocMap` -/
 
 private theorem wbAnnealWriteBytesEval_uninit_dst {ly : LayoutTable}
@@ -1405,13 +1996,66 @@ private theorem wbBeq_zero_eq_false_of_pos {n : Nat} (h : 0 < n) : Nat.beq n 0 =
   · rfl
   · have heq := Nat.eq_of_beq_eq_true hb; omega
 
+private theorem wbEvalWriteBytesCall_scalar_overflow_ub
+    {s : MachineState} {dstOp : MirAst.Operand} {sc_p valSc countSc : MirAst.ScalarInt}
+    {targetBb : BasicBlockIdx} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {elemBytes : Nat}
+    (hsz8 : sc_p.sizeBytes = 8)
+    (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
+    (hovf : ¬ countSc.bits * elemBytes ≤ isizeMaxBytes) :
+    evalWriteBytesCall s dstOp (.scalar sc_p) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
+      MirStepNode.fail .ub := by
+  unfold evalWriteBytesCall
+  dsimp only
+  rw [hsz8, hop]; dsimp only
+  rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
+    wbBle_eq_false_of_gt hovf]
+
+private theorem wbEvalWriteBytesCall_scalar_zero_ok
+    {s : MachineState} {dstOp : MirAst.Operand} {sc_p valSc countSc : MirAst.ScalarInt}
+    {targetBb : BasicBlockIdx} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {elemBytes : Nat}
+    (hsz8 : sc_p.sizeBytes = 8)
+    (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
+    (hz : countSc.bits * elemBytes = 0) :
+    evalWriteBytesCall s dstOp (.scalar sc_p) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
+      intrinsicReturnTo s targetBb s.frame.locals s.memory := by
+  have hle : Nat.ble (countSc.bits * elemBytes) isizeMaxBytes = true := by
+    rw [hz]; rfl
+  have hbeq : Nat.beq (countSc.bits * elemBytes) 0 = true := by
+    rw [hz]; rfl
+  unfold evalWriteBytesCall
+  dsimp only
+  rw [hsz8, hop]; dsimp only
+  rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl, hle, hbeq]
+
+private theorem wbEvalWriteBytesCall_scalar_pos_ub
+    {s : MachineState} {dstOp : MirAst.Operand} {sc_p valSc countSc : MirAst.ScalarInt}
+    {targetBb : BasicBlockIdx} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {elemBytes : Nat}
+    (hsz8 : sc_p.sizeBytes = 8)
+    (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
+    (hpos : 0 < countSc.bits * elemBytes)
+    (hle : countSc.bits * elemBytes ≤ isizeMaxBytes) :
+    evalWriteBytesCall s dstOp (.scalar sc_p) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
+      MirStepNode.fail .ub := by
+  unfold evalWriteBytesCall
+  dsimp only
+  rw [hsz8, hop]; dsimp only
+  rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
+    Nat.ble_eq.mpr hle, wbBeq_zero_eq_false_of_pos hpos]
+
 private theorem wbEvalWriteBytesCall_overflow_ub
     {s : MachineState} {dstOp : MirAst.Operand} {dstPtr : ProvenancePtr}
     {valSc countSc : MirAst.ScalarInt} {targetBb : BasicBlockIdx}
     {localDecls : List LocalDecl} {layouts : LayoutTable} {elemBytes : Nat}
     (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
     (hovf : ¬ countSc.bits * elemBytes ≤ isizeMaxBytes) :
-    evalWriteBytesCall s dstOp dstPtr valSc countSc s.frame.locals targetBb localDecls layouts =
+    evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
       MirStepNode.fail .ub := by
   unfold evalWriteBytesCall
   rw [hop]; dsimp only
@@ -1424,7 +2068,8 @@ private theorem wbEvalWriteBytesCall_zero_ok
     {localDecls : List LocalDecl} {layouts : LayoutTable} {elemBytes : Nat}
     (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
     (hz : countSc.bits * elemBytes = 0) :
-    evalWriteBytesCall s dstOp dstPtr valSc countSc s.frame.locals targetBb localDecls layouts =
+    evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
       intrinsicReturnTo s targetBb s.frame.locals s.memory := by
   have hle : Nat.ble (countSc.bits * elemBytes) isizeMaxBytes = true := by
     rw [hz]; rfl
@@ -1445,7 +2090,8 @@ private theorem wbEvalWriteBytesCall_perm_ub
     (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
       some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
     (hperm : e.perm = .frozen ∨ e.perm = .disabled) :
-    evalWriteBytesCall s dstOp dstPtr valSc countSc s.frame.locals targetBb localDecls layouts =
+    evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
       MirStepNode.fail .ub := by
   unfold evalWriteBytesCall
   rw [hop]; dsimp only
@@ -1464,9 +2110,10 @@ private theorem wbEvalWriteBytesCall_dead_ub
     (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
       some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
     (hdecl : get? localDecls e.localIdx = some tgtDecl)
-    (htgt : IsIntegralTy tgtDecl.ty tgtKind)
+    (_htgt : IsIntegralTy tgtDecl.ty tgtKind)
     (hdead : get? s.frame.locals e.localIdx = some .dead) :
-    evalWriteBytesCall s dstOp dstPtr valSc countSc s.frame.locals targetBb localDecls layouts =
+    evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
       MirStepNode.fail .ub := by
   unfold evalWriteBytesCall
   rw [hop]; dsimp only
@@ -1478,12 +2125,7 @@ private theorem wbEvalWriteBytesCall_dead_ub
   | disabled => rfl
   | active | reserved =>
     dsimp only
-    rw [hdecl]; dsimp only
-    rw [htgt.intCastTargetBytes_eq]; dsimp only
-    cases Nat.ble (Nat.add dstPtr.offsetBytes (countSc.bits * elemBytes))
-        (integerKindByteWidth tgtKind) with
-    | false => rfl
-    | true => simp [hdead]
+    rw [hdead, hdecl]
 
 private theorem wbEvalWriteBytesCall_oob_ub
     {s : MachineState} {dstOp : MirAst.Operand} {dstPtr : ProvenancePtr}
@@ -1498,7 +2140,8 @@ private theorem wbEvalWriteBytesCall_oob_ub
     (hdecl : get? localDecls e.localIdx = some tgtDecl)
     (htgt : IsIntegralTy tgtDecl.ty tgtKind)
     (hoob : ¬ dstPtr.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind) :
-    evalWriteBytesCall s dstOp dstPtr valSc countSc s.frame.locals targetBb localDecls layouts =
+    evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
       MirStepNode.fail .ub := by
   unfold evalWriteBytesCall
   rw [hop]; dsimp only
@@ -1510,11 +2153,18 @@ private theorem wbEvalWriteBytesCall_oob_ub
   | disabled => rfl
   | active | reserved =>
     dsimp only
-    rw [hdecl]; dsimp only
-    rw [htgt.intCastTargetBytes_eq]; dsimp only
-    rw [show Nat.add dstPtr.offsetBytes (countSc.bits * elemBytes) =
-        dstPtr.offsetBytes + countSc.bits * elemBytes from rfl,
-      wbBle_eq_false_of_gt hoob]
+    rw [hdecl]
+    cases get? s.frame.locals e.localIdx with
+    | none => rfl
+    | some slot =>
+      cases slot with
+      | dead => rfl
+      | uninit | init _ =>
+        dsimp only
+        rw [htgt.intCastTargetBytes_eq]; dsimp only
+        rw [show Nat.add dstPtr.offsetBytes (countSc.bits * elemBytes) =
+            dstPtr.offsetBytes + countSc.bits * elemBytes from rfl,
+          wbBle_eq_false_of_gt hoob]
 
 private theorem wbEvalWriteBytesCall_full_ok
     {s : MachineState} {dstOp : MirAst.Operand} {dstPtr : ProvenancePtr}
@@ -1536,7 +2186,8 @@ private theorem wbEvalWriteBytesCall_full_ok
     (hscalar : ∀ v, slot_t = .init v → ∃ sc, v = .scalar sc)
     (hoff0 : dstPtr.offsetBytes = 0)
     (hfull : countSc.bits * elemBytes = integerKindByteWidth tgtKind) :
-    evalWriteBytesCall s dstOp dstPtr valSc countSc s.frame.locals targetBb localDecls layouts =
+    evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
       intrinsicReturnTo s targetBb
         (s.frame.locals.set e.localIdx
           (.init (.scalar ⟨repeatByteBits (valSc.bits % 256) (integerKindByteWidth tgtKind),
@@ -1557,24 +2208,74 @@ private theorem wbEvalWriteBytesCall_full_ok
   dsimp only
   rcases hperm with hp | hp <;> rw [hp] <;>
   · dsimp only
-    rw [hdecl]; dsimp only
-    rw [htgt.intCastTargetBytes_eq]; dsimp only
-    rw [hble_in]; dsimp only
-    rw [hslot]
+    rw [hslot, hdecl]
     cases slot_t with
     | dead => exact absurd rfl hne_dead
     | uninit =>
       dsimp only
+      rw [htgt.intCastTargetBytes_eq]; dsimp only
+      rw [hble_in]; dsimp only
       rw [hoff0, hfull]
       simp only [Nat.beq_refl, Bool.and_self]
       rw [show Nat.mod valSc.bits 256 = valSc.bits % 256 from rfl, hset]
     | init v =>
       obtain ⟨oldSc, rfl⟩ := hscalar v rfl
       dsimp only
+      rw [htgt.intCastTargetBytes_eq]; dsimp only
+      rw [hble_in]; dsimp only
       rw [hoff0, hfull, show Nat.mod valSc.bits 256 = valSc.bits % 256 from rfl,
         evalWriteBytesCall_full_merge oldSc.bits
           (repeatByteBits (valSc.bits % 256) targetBytes) targetBytes,
         hset]
+
+private theorem wbEvalWriteBytesCall_partial_ok
+    {s : MachineState} {dstOp : MirAst.Operand} {dstPtr : ProvenancePtr}
+    {valSc countSc oldSc : MirAst.ScalarInt} {targetBb : BasicBlockIdx}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {elemBytes : Nat}
+    {e : AllocMapEntry} {tgtDecl : LocalDecl} {tgtKind : Miri.MIR.IntegerKind}
+    (hop : operandPointeeBytes? localDecls layouts dstOp = some elemBytes)
+    (hpos : 0 < countSc.bits * elemBytes)
+    (hle : countSc.bits * elemBytes ≤ isizeMaxBytes)
+    (hbor : lookupBorrow s.memory.borrows dstPtr.tag =
+      some { tag := e.tag, targetLocal := e.localIdx, targetProjection := [], perm := e.perm })
+    (hperm : e.perm = .active ∨ e.perm = .reserved)
+    (hdecl : get? localDecls e.localIdx = some tgtDecl)
+    (htgt : IsIntegralTy tgtDecl.ty tgtKind)
+    (hslot : get? s.frame.locals e.localIdx = some (.init (.scalar oldSc)))
+    (hlt_af : e.localIdx < length s.frame.locals)
+    (hinb : dstPtr.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind) :
+    evalWriteBytesCall s dstOp (.ptr dstPtr 8) valSc countSc s.frame.locals targetBb
+        localDecls layouts =
+      intrinsicReturnTo s targetBb
+        (s.frame.locals.set e.localIdx
+          (.init (.scalar ⟨spliceRepeatedBytes oldSc.bits (valSc.bits % 256)
+            dstPtr.offsetBytes (countSc.bits * elemBytes) (integerKindByteWidth tgtKind),
+            integerKindByteWidth tgtKind⟩)))
+        { s.memory with
+          borrows := invalidateConflictingBorrows s.memory.borrows e.localIdx (some dstPtr.tag) } := by
+  let targetBytes := integerKindByteWidth tgtKind
+  have hble_max : Nat.ble (countSc.bits * elemBytes) isizeMaxBytes = true :=
+    Nat.ble_eq.mpr hle
+  have hble_in : Nat.ble (Nat.add dstPtr.offsetBytes (countSc.bits * elemBytes)) targetBytes = true := by
+    rw [show Nat.add dstPtr.offsetBytes (countSc.bits * elemBytes) =
+        dstPtr.offsetBytes + countSc.bits * elemBytes from rfl]
+    exact Nat.ble_eq.mpr hinb
+  have hset := set?_eq_some_set hlt_af
+    (.init (.scalar ⟨spliceRepeatedBytes oldSc.bits (valSc.bits % 256)
+      dstPtr.offsetBytes (countSc.bits * elemBytes) targetBytes, targetBytes⟩))
+  unfold evalWriteBytesCall
+  unfold spliceRepeatedBytes at hset ⊢
+  dsimp only at hset ⊢
+  rw [hop]; dsimp only
+  rw [show Nat.mul countSc.bits elemBytes = countSc.bits * elemBytes from rfl,
+    hble_max, wbBeq_zero_eq_false_of_pos hpos, hbor]
+  dsimp only
+  rcases hperm with hp | hp <;> rw [hp] <;>
+  · dsimp only
+    rw [hslot, hdecl]; dsimp only
+    rw [htgt.intCastTargetBytes_eq]; dsimp only
+    rw [hble_in]; dsimp only
+    rw [show Nat.mod valSc.bits 256 = valSc.bits % 256 from rfl, hset]
 
 private theorem WriteBytesScalarPreVal.evalOperand_ok
     {locals : List LocalSlot} {op : MirAst.Operand} {sc : MirAst.ScalarInt}
@@ -1604,12 +2305,6 @@ private theorem wbLookupAllocMapByTag_of_mem_nodup
           exact absurd (heq.trans htag.symm ▸ List.mem_map_of_mem hmem) hnodup.1
       rw [hne]
       exact ih hnodup.2 hmem
-
-private theorem wbIte_pos {P : Prop} [Decidable P] {α : Type _} {a b : α} (h : P) :
-    (if P then a else b) = a := by simp [h]
-
-private theorem wbIte_neg {P : Prop} [Decidable P] {α : Type _} {a b : α} (h : ¬ P) :
-    (if P then a else b) = b := by simp [h]
 
 private theorem wbMiriBodyAction_eval_eq {body : CapturedMir} {ptrIdx : Local}
     {valOp countOp : MirAst.Operand} {m : AnnealStepState}
@@ -1675,8 +2370,8 @@ private theorem wbCall_writeBytes_core
       get? s.frame.locals e.localIdx ≠ some .dead →
       ptrVal.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind →
       (e.perm = .active ∨ e.perm = .reserved) ∧
-        ptrVal.offsetBytes = 0 ∧
-        countSc.bits * elemBytes = integerKindByteWidth tgtKind) :
+        ((ptrVal.offsetBytes = 0 ∧ countSc.bits * elemBytes = integerKindByteWidth tgtKind) ∨
+          ∃ oldSc, get? s.frame.locals e.localIdx = some (.init (.scalar oldSc)))) :
     (stepMirFn body s = MirStepNode.fail .ub ∧
       ∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior msg))) ∨
@@ -1844,7 +2539,8 @@ private theorem wbCall_writeBytes_core
             refine ⟨_, _, ?_, ?_, ?_, hstate₄.relocate rfl targetBb 0⟩
             · rw [hanneal_step, hanneal_term, hevals]; dsimp only
               rw [evalInlineIntrinsicCall?_writeBytes]
-              simp [hop_pt, hz, intrinsicReturnTo]
+              dsimp only
+              exact wbEvalWriteBytesCall_scalar_zero_ok hsz8_p hop_pt hz
             · apply wbMiri_step_writeBytes_ok (tf₃ := tf₄) hframes hfr.body_eq hfr.location_eq hbb
                 hstmt_none hterm hc hprog hdst hlt_mf hcache_dst hval_nm hcount_nm
               rw [wbMiriBodyAction_eval_eq hm₁ hm₂ hm₃, hm_init, wbIte_pos hle, hz]
@@ -1857,18 +2553,19 @@ private theorem wbCall_writeBytes_core
               (msg := "write_bytes pointer check failed") ?_ ?_
             · rw [hanneal_step, hanneal_term, hevals]; dsimp only
               rw [evalInlineIntrinsicCall?_writeBytes]
-              simp [hop_pt, wbBeq_zero_eq_false_of_pos hpos]
+              dsimp only
+              exact wbEvalWriteBytesCall_scalar_pos_ub hsz8_p hop_pt hpos hle
             · rw [wbMiriBodyAction_eval_eq hm₁ hm₂ hm₃, hm_init, wbIte_pos hle]
               exact annealWriteRepeatedBytes_withoutProvenance_err (UInt64.ofNat sc_p.bits)
                 (UInt8.ofNat valSc.bits) hpos hle { m with stack := ⟨#[tf₄]⟩ }
         · -- `total > isizeMaxBytes` on `.scalar` pointer -> UB in both!
-          have hpos : 0 < countSc.bits * elemBytes := by unfold isizeMaxBytes at hle; omega
           left
           refine mk_ub (m' := { m with stack := ⟨#[tf₄]⟩ })
             (msg := "overflow computing total size of write_bytes") ?_ ?_
           · rw [hanneal_step, hanneal_term, hevals]; dsimp only
             rw [evalInlineIntrinsicCall?_writeBytes]
-            simp [hop_pt, wbBeq_zero_eq_false_of_pos hpos]
+            dsimp only
+            exact wbEvalWriteBytesCall_scalar_overflow_ub hsz8_p hop_pt hle
           · rw [wbMiriBodyAction_eval_eq hm₁ hm₂ hm₃, hm_init, wbIte_neg hle]
   · -- Branch 4: `ptrIdx` holds tracked `.ptr ptrVal 8` with `PtrRel`.
     have ha₁ : evalOperand s.frame.locals (.copy ⟨ptrIdx, []⟩) s.memory.borrows s.memory.globals
@@ -1963,7 +2660,8 @@ private theorem wbCall_writeBytes_core
             injection hframes₄ with h1_tf
             injection h1_tf with h2_tf
             subst h2_tf
-            obtain ⟨slot_t, _, hlt_af_t, _, hslot_t, _, _, _⟩ := hfr₄.lookup_local hdecl_tgt
+            obtain ⟨slot_t, mls_t, hlt_af_t, _, hslot_t, hmls_t, _, hloc_t⟩ :=
+              hfr₄.lookup_local hdecl_tgt
             obtain ⟨hlive_sync, hdead_sync⟩ := halloc₄.local_alloc_sync tf₄ rfl e he
             by_cases ht_dead : slot_t = .dead
             · -- Subcase 4b-i: `e.localIdx` is `.dead` -> UB in both!
@@ -1984,7 +2682,7 @@ private theorem wbCall_writeBytes_core
             · -- Subcase 4b-ii: `e.localIdx` is live (`slot_t ≠ .dead`).
               have hs_not_dead : get? s.frame.locals e.localIdx ≠ some .dead := by
                 rw [hslot_t]; exact fun h => ht_dead (Option.some.inj h)
-              obtain ⟨_, hslot_sc, hshape_fn⟩ := hlive_sync slot_t hslot_t ht_dead
+              obtain ⟨⟨lay_t, hlay_t⟩, hslot_sc, hshape_fn⟩ := hlive_sync slot_t hslot_t ht_dead
               obtain ⟨localAlloc, hfind_la, hkind_la, halign_la, hshape_la⟩ :=
                 hshape_fn tgtDecl hdecl_tgt
               let targetBytes := integerKindByteWidth tgtKind
@@ -1998,34 +2696,17 @@ private theorem wbCall_writeBytes_core
                 rw [hshape_la.byteSize_eq, hlay_tgt_sz]
                 cases tgtKind <;> rfl
               by_cases hinb : ptrVal.offsetBytes + countSc.bits * elemBytes ≤ targetBytes
-              · -- Live in-bounds write -> whole-local fill in both!
-                obtain ⟨hperm_ok, hoff0, hfull⟩ := hlive_inbounds ptrVal countSc e tgtDecl tgtKind
+              · -- Live in-bounds write -> whole-local fill or partial byte splice in both!
+                obtain ⟨hperm_ok, hinb_kind⟩ := hlive_inbounds ptrVal countSc e tgtDecl tgtKind
                   hptr_ok hcount_pre hpos hle he htag hdecl_tgt htgtInt hs_not_dead hinb
                 have hshape_tb : StackScalarAllocShape (translateSizeBytes targetBytes)
                     localAlloc.allocation := hlay_tgt_sz ▸ hshape_la
-                obtain ⟨alloc', msc_new, hw_alloc, hrel_raw, halign_alloc', hshape_alloc',
-                  hinit_alloc', hread_alloc'⟩ :=
-                  hshape_tb.writeRepeatedByte_full (wbValidScalarBytes_integerKind tgtKind)
-                    (UInt8.ofNat valSc.bits)
                 have hbyte_nat : (UInt8.ofNat valSc.bits).toNat = valSc.bits % 256 := by
                   have hlt256 := (wbScalar_fromScalarInt_toUInt8 hrelV hszV).1
                   simp [Nat.mod_eq_of_lt hlt256]
-                let newSc : MirAst.ScalarInt :=
-                  ⟨repeatByteBits (valSc.bits % 256) targetBytes, targetBytes⟩
-                have hrel_new : ScalarRel newSc msc_new := by
-                  simpa [newSc, hbyte_nat] using hrel_raw
-                have hw_alloc' : Miri.Memory.Allocation.writeRepeatedByte
-                    (Miri.ABI.Size.ofBytes (UInt64.ofNat ptrVal.offsetBytes))
-                    (UInt8.ofNat valSc.bits) (UInt64.ofNat (countSc.bits * elemBytes))
-                    (Miri.ABI.Size.ofBytes 8) localAlloc.allocation = .ok () alloc' := by
-                  rw [hoff0, hfull]; exact hw_alloc
                 have hinb_la : ptrVal.offsetBytes + countSc.bits * elemBytes ≤
                     localAlloc.allocation.byteSize.bytes.toNat := by
                   rw [halloc_bytes]; exact hinb
-                have hm_write := annealWriteRepeatedBytes_live_ok e.allocId borTag
-                  ptrVal.offsetBytes localAlloc alloc' (UInt8.ofNat valSc.bits)
-                  hid_lt hoff_lt hbase hfind_la hpos hle hinb_la hw_alloc'
-                  (st := { m with stack := ⟨#[tf₄]⟩ })
                 have hinv_eq : invalidateConflictingBorrows s.memory.borrows e.localIdx
                     (some ptrVal.tag) =
                     (updateAllocMapOnWrite allocMap e.localIdx (some ptrVal.tag)).map
@@ -2033,34 +2714,118 @@ private theorem wbCall_writeBytes_core
                   rw [hbor]
                   exact wbInvalidateConflictingBorrows_eq_map_updateAllocMapOnWrite allocMap
                     e.localIdx (some ptrVal.tag)
-                have hbool_tgt : tgtDecl.ty.kind = .bool →
-                    newSc.sizeBytes = 1 ∧ (newSc.bits = 0 ∨ newSc.bits = 1) := by
-                  intro hb; rcases htgtInt with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] at hb <;> cases hb
-                have hchar_tgt : tgtDecl.ty.kind = .char →
-                    newSc.sizeBytes = 4 ∧ isValidCharCode newSc.bits = true := by
-                  intro hc'; rcases htgtInt with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] at hc' <;> cases hc'
-                have hadv := hstate₄.advance_write_deref_scalar rfl
-                  (fun x => x.updateOnWrite e.localIdx (some ptrVal.tag))
-                  (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
-                  he hdecl_tgt htgtInt.prim hslot_t ht_dead hfind_la hkind_la halign_la
-                  hrel_new hlay_tgt_sz hbool_tgt hchar_tgt halign_alloc' hshape_alloc'
-                  hinit_alloc' hread_alloc'
-                right; right
-                refine ⟨_, _, ptrVal, countSc, e, tgtDecl, tgtKind, hptr_ok, hcount_pre, hpos, hle,
-                  he, htag, hdecl_tgt, htgtInt, hs_not_dead, hinb, ?_, ?_, ?_,
-                  hadv.relocate rfl targetBb 0⟩
-                · rw [hanneal_step, hanneal_term, hevals]; dsimp only
-                  rw [evalInlineIntrinsicCall?_writeBytes]
-                  dsimp only
-                  rw [wbEvalWriteBytesCall_full_ok hop_pt hpos hle hbor_look hperm_ok hdecl_tgt
-                    htgtInt hslot_t hlt_af_t ht_dead hslot_sc hoff0 hfull, hinv_eq]
-                  rfl
-                · apply wbMiri_step_writeBytes_ok (tf₃ := tf₄) hframes hfr.body_eq hfr.location_eq
-                    hbb hstmt_none hterm hc hprog hdst hlt_mf hcache_dst hval_nm hcount_nm
-                  rw [wbMiriBodyAction_eval_eq hm₁ hm₂ hm₃, hm_init, wbIte_pos hle, hmptr_opt]
-                  exact hm_write
-                · simp [writeBytesNextAllocMap, hcount_opt, hz, hptr_ok,
-                    wbLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he htag]
+                rcases hinb_kind with ⟨hoff0, hfull⟩ | ⟨oldSc, hold_slot⟩
+                · obtain ⟨alloc', msc_new, hw_alloc, hrel_raw, halign_alloc', hshape_alloc',
+                    hinit_alloc', hread_alloc'⟩ :=
+                    hshape_tb.writeRepeatedByte_full (wbValidScalarBytes_integerKind tgtKind)
+                      (UInt8.ofNat valSc.bits)
+                  let newSc : MirAst.ScalarInt :=
+                    ⟨repeatByteBits (valSc.bits % 256) targetBytes, targetBytes⟩
+                  have hrel_new : ScalarRel newSc msc_new := by
+                    simpa [newSc, hbyte_nat] using hrel_raw
+                  have hw_alloc' : Miri.Memory.Allocation.writeRepeatedByte
+                      (Miri.ABI.Size.ofBytes (UInt64.ofNat ptrVal.offsetBytes))
+                      (UInt8.ofNat valSc.bits) (UInt64.ofNat (countSc.bits * elemBytes))
+                      (Miri.ABI.Size.ofBytes 8) localAlloc.allocation = .ok () alloc' := by
+                    rw [hoff0, hfull]; exact hw_alloc
+                  have hm_write := annealWriteRepeatedBytes_live_ok e.allocId borTag
+                    ptrVal.offsetBytes localAlloc alloc' (UInt8.ofNat valSc.bits)
+                    hid_lt hoff_lt hbase hfind_la hpos hle hinb_la hw_alloc'
+                    (st := { m with stack := ⟨#[tf₄]⟩ })
+                  have hbool_tgt : tgtDecl.ty.kind = .bool →
+                      newSc.sizeBytes = 1 ∧ (newSc.bits = 0 ∨ newSc.bits = 1) := by
+                    intro hb; rcases htgtInt with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] at hb <;> cases hb
+                  have hchar_tgt : tgtDecl.ty.kind = .char →
+                      newSc.sizeBytes = 4 ∧ isValidCharCode newSc.bits = true := by
+                    intro hc'; rcases htgtInt with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] at hc' <;> cases hc'
+                  have hadv := hstate₄.advance_write_deref_scalar rfl
+                    (fun x => x.updateOnWrite e.localIdx (some ptrVal.tag))
+                    (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
+                    he hdecl_tgt htgtInt.prim hslot_t ht_dead hfind_la hkind_la halign_la
+                    hrel_new hlay_tgt_sz hbool_tgt hchar_tgt halign_alloc' hshape_alloc'
+                    hinit_alloc' hread_alloc'
+                  right; right
+                  refine ⟨_, _, ptrVal, countSc, e, tgtDecl, tgtKind, hptr_ok, hcount_pre, hpos, hle,
+                    he, htag, hdecl_tgt, htgtInt, hs_not_dead, hinb, ?_, ?_, ?_,
+                    hadv.relocate rfl targetBb 0⟩
+                  · rw [hanneal_step, hanneal_term, hevals]; dsimp only
+                    rw [evalInlineIntrinsicCall?_writeBytes]
+                    dsimp only
+                    rw [wbEvalWriteBytesCall_full_ok hop_pt hpos hle hbor_look hperm_ok hdecl_tgt
+                      htgtInt hslot_t hlt_af_t ht_dead hslot_sc hoff0 hfull, hinv_eq]
+                    rfl
+                  · apply wbMiri_step_writeBytes_ok (tf₃ := tf₄) hframes hfr.body_eq hfr.location_eq
+                      hbb hstmt_none hterm hc hprog hdst hlt_mf hcache_dst hval_nm hcount_nm
+                    rw [wbMiriBodyAction_eval_eq hm₁ hm₂ hm₃, hm_init, wbIte_pos hle, hmptr_opt]
+                    exact hm_write
+                  · simp [writeBytesNextAllocMap, hcount_opt, hz, hptr_ok,
+                      wbLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he htag]
+                · -- Partial (or full) in-bounds write into an initialized scalar local `oldSc`.
+                  have hslot_eq : slot_t = .init (.scalar oldSc) :=
+                    Option.some.inj (hslot_t.symm.trans hold_slot)
+                  subst hslot_eq
+                  have hmls_t_eq :
+                      mls_t = ⟨.live (.indirect (stackAllocPlace e.allocId)), lay_t⟩ := by
+                    rw [hlay_t] at hmls_t; exact Option.some.inj hmls_t.symm
+                  have hvalid_tgt := wbValidScalarBytes_integerKind tgtKind
+                  have hts_tgt_nat : (translateSizeBytes targetBytes).bytes.toNat = targetBytes := by
+                    dsimp only [targetBytes]
+                    rcases hvalid_tgt with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
+                  have hnz_sz_t :
+                      (translateTy tgtDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO := by
+                    rw [hlay_tgt_sz]; dsimp only [targetBytes]
+                    cases tgtKind <;> decide
+                  obtain ⟨_, hsc_spec⟩ := hloc_t.indirect_stackAllocPlace_spec hmls_t_eq
+                    hbase hfind_la (halloc₄.live_key_unique e he) hnz_sz_t
+                  obtain ⟨hsz_sc_eq, _, _, oldMsc, holdRel, hread_old⟩ := hsc_spec oldSc rfl
+                  have holdSz : oldSc.sizeBytes = targetBytes := by
+                    have h := hlay_tgt_sz.symm.trans hsz_sc_eq
+                    have h1 : (translateSizeBytes oldSc.sizeBytes).bytes.toNat = oldSc.sizeBytes := by
+                      rcases holdRel.validBytes with h0 | h0 | h0 | h0 | h0 <;> (rw [h0]; rfl)
+                    have := congrArg (fun z : Miri.ABI.Size => z.bytes.toNat) h
+                    omega
+                  rw [hlay_tgt_sz] at hread_old
+                  obtain ⟨alloc', msc_new, hw_alloc', hrel_raw, halign_alloc', hshape_alloc',
+                    hinit_alloc', hread_alloc'⟩ :=
+                    hshape_tb.writeRepeatedByte_partial hvalid_tgt holdRel holdSz
+                      (UInt8.ofNat valSc.bits) hpos hinb hread_old
+                  let newSc : MirAst.ScalarInt :=
+                    ⟨spliceRepeatedBytes oldSc.bits (valSc.bits % 256)
+                      ptrVal.offsetBytes (countSc.bits * elemBytes) targetBytes, targetBytes⟩
+                  have hrel_new : ScalarRel newSc msc_new := by
+                    simpa [newSc, hbyte_nat] using hrel_raw
+                  have hm_write := annealWriteRepeatedBytes_live_ok e.allocId borTag
+                    ptrVal.offsetBytes localAlloc alloc' (UInt8.ofNat valSc.bits)
+                    hid_lt hoff_lt hbase hfind_la hpos hle hinb_la hw_alloc'
+                    (st := { m with stack := ⟨#[tf₄]⟩ })
+                  have hbool_tgt : tgtDecl.ty.kind = .bool →
+                      newSc.sizeBytes = 1 ∧ (newSc.bits = 0 ∨ newSc.bits = 1) := by
+                    intro hb; rcases htgtInt with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] at hb <;> cases hb
+                  have hchar_tgt : tgtDecl.ty.kind = .char →
+                      newSc.sizeBytes = 4 ∧ isValidCharCode newSc.bits = true := by
+                    intro hc'; rcases htgtInt with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] at hc' <;> cases hc'
+                  have hadv := hstate₄.advance_write_deref_scalar rfl
+                    (fun x => x.updateOnWrite e.localIdx (some ptrVal.tag))
+                    (fun _ => rfl) (fun _ => rfl) (fun _ => rfl)
+                    he hdecl_tgt htgtInt.prim hslot_t ht_dead hfind_la hkind_la halign_la
+                    hrel_new hlay_tgt_sz hbool_tgt hchar_tgt halign_alloc' hshape_alloc'
+                    hinit_alloc' hread_alloc'
+                  right; right
+                  refine ⟨_, _, ptrVal, countSc, e, tgtDecl, tgtKind, hptr_ok, hcount_pre, hpos, hle,
+                    he, htag, hdecl_tgt, htgtInt, hs_not_dead, hinb, ?_, ?_, ?_,
+                    hadv.relocate rfl targetBb 0⟩
+                  · rw [hanneal_step, hanneal_term, hevals]; dsimp only
+                    rw [evalInlineIntrinsicCall?_writeBytes]
+                    dsimp only
+                    rw [wbEvalWriteBytesCall_partial_ok hop_pt hpos hle hbor_look hperm_ok hdecl_tgt
+                      htgtInt hold_slot hlt_af_t hinb, hinv_eq]
+                    rfl
+                  · apply wbMiri_step_writeBytes_ok (tf₃ := tf₄) hframes hfr.body_eq hfr.location_eq
+                      hbb hstmt_none hterm hc hprog hdst hlt_mf hcache_dst hval_nm hcount_nm
+                    rw [wbMiriBodyAction_eval_eq hm₁ hm₂ hm₃, hm_init, wbIte_pos hle, hmptr_opt]
+                    exact hm_write
+                  · simp [writeBytesNextAllocMap, hcount_opt, hz, hptr_ok,
+                      wbLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he htag]
               · -- Out-of-bounds write on live target allocation -> UB in both!
                 have hoob_la : localAlloc.allocation.byteSize.bytes.toNat <
                     ptrVal.offsetBytes + countSc.bits * elemBytes := by
@@ -2106,10 +2871,12 @@ Covers:
      (`targetBytes < offsetBytes + total`) reports UB in both machines across
      all borrow permissions;
    - whole-local in-bounds fill (`offsetBytes = 0`, `total = targetBytes`,
-     `e.perm = .active ∨ e.perm = .reserved`) writes `repeatByteBits` in both
-     machines and preserves `StateRelLM3_1` under `writeBytesNextAllocMap`
-     (activating `.reserved → .active` and disabling foreign borrows on
-     `e.localIdx`). -/
+     `e.perm = .active ∨ e.perm = .reserved`) or partial in-bounds fill into an
+     initialized scalar local (`∃ oldSc, get? locals e.localIdx = some (.init (.scalar oldSc))`,
+     `e.perm = .active ∨ e.perm = .reserved`) writes `repeatByteBits` /
+     `spliceRepeatedBytes` in both machines and preserves `StateRelLM3_1` under
+     `writeBytesNextAllocMap` (activating `.reserved → .active` and disabling
+     foreign borrows on `e.localIdx`). -/
 theorem call_intrinsic_write_bytes_simulation_explicit
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -2154,8 +2921,8 @@ theorem call_intrinsic_write_bytes_simulation_explicit
       get? s.frame.locals e.localIdx ≠ some .dead →
       ptrVal.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind →
       (e.perm = .active ∨ e.perm = .reserved) ∧
-        ptrVal.offsetBytes = 0 ∧
-        countSc.bits * elemBytes = integerKindByteWidth tgtKind) :
+        ((ptrVal.offsetBytes = 0 ∧ countSc.bits * elemBytes = integerKindByteWidth tgtKind) ∨
+          ∃ oldSc, get? s.frame.locals e.localIdx = some (.init (.scalar oldSc)))) :
     StepRelLM3_1 body m
       (writeBytesNextAllocMap s.frame.locals allocMap ptrIdx countOp elemBytes)
       (stepMirFn body s)
@@ -2175,13 +2942,17 @@ theorem call_intrinsic_write_bytes_simulation_explicit
 
 Concludes `StepRelLM3_1 body m allocMap (stepMirFn body s)` against
 `Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m`
-directly. On live in-bounds positive writes through `ptrVal`, requires
-`e.perm = .active` and that any foreign borrow of `e.localIdx` in `allocMap` is
-already `.disabled` (which holds automatically when `e` is the unique borrow of
-`e.localIdx`, e.g., `[⟨tag, localIdx, allocId, .active⟩]` from
-`_p = &raw mut _x`), so `updateAllocMapOnWrite` leaves `allocMap` unchanged. No
-permission restriction is imposed on zero-byte, overflow, dead-allocation, or
-out-of-bounds calls. -/
+directly. Covers both whole-local in-bounds fills (`offsetBytes = 0`,
+`total = targetBytes`, whether previously `.uninit` or `.init`) and partial
+in-bounds byte-splice fills (`0 < total`, `offsetBytes + total ≤ targetBytes` on
+an initialized scalar local
+`∃ oldSc, get? s.frame.locals e.localIdx = some (.init (.scalar oldSc))`).
+On live in-bounds positive writes through `ptrVal`, requires `e.perm = .active`
+and that any foreign borrow of `e.localIdx` in `allocMap` is already `.disabled`
+(which holds automatically when `e` is the unique borrow of `e.localIdx`, e.g.,
+`[⟨tag, localIdx, allocId, .active⟩]` from `_p = &raw mut _x`), so
+`updateAllocMapOnWrite` leaves `allocMap` unchanged. No permission restriction
+is imposed on zero-byte, overflow, dead-allocation, or out-of-bounds calls. -/
 theorem call_intrinsic_write_bytes_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -2227,8 +2998,8 @@ theorem call_intrinsic_write_bytes_simulation
       ptrVal.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind →
       (∀ x ∈ allocMap, x.localIdx = e.localIdx →
         (x.tag = ptrVal.tag ∧ x.perm = .active) ∨ (x.tag ≠ ptrVal.tag ∧ x.perm = .disabled)) ∧
-      ptrVal.offsetBytes = 0 ∧
-      countSc.bits * elemBytes = integerKindByteWidth tgtKind) :
+        ((ptrVal.offsetBytes = 0 ∧ countSc.bits * elemBytes = integerKindByteWidth tgtKind) ∨
+          ∃ oldSc, get? s.frame.locals e.localIdx = some (.init (.scalar oldSc)))) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
@@ -2243,13 +3014,13 @@ theorem call_intrinsic_write_bytes_simulation
       get? s.frame.locals e.localIdx ≠ some .dead →
       ptrVal.offsetBytes + countSc.bits * elemBytes ≤ integerKindByteWidth tgtKind →
       (e.perm = .active ∨ e.perm = .reserved) ∧
-        ptrVal.offsetBytes = 0 ∧
-        countSc.bits * elemBytes = integerKindByteWidth tgtKind := by
+        ((ptrVal.offsetBytes = 0 ∧ countSc.bits * elemBytes = integerKindByteWidth tgtKind) ∨
+          ∃ oldSc, get? s.frame.locals e.localIdx = some (.init (.scalar oldSc))) := by
     intro ptrVal countSc e tgtDecl tgtKind hp hc_pre hpos hle he htag hd ht hnd hinb
-    obtain ⟨hall, hoff0, hfull⟩ :=
+    obtain ⟨hall, hinb_kind⟩ :=
       hlive_inbounds ptrVal countSc e tgtDecl tgtKind hp hc_pre hpos hle he htag hd ht hnd hinb
     rcases hall e he rfl with ⟨_, hact⟩ | ⟨hne, _⟩
-    · exact ⟨Or.inl hact, hoff0, hfull⟩
+    · exact ⟨Or.inl hact, hinb_kind⟩
     · exact absurd htag hne
   rcases wbCall_writeBytes_core hstate hphase hbb hstmt_none hstmt_len hterm hc hcallee hprog
       hptrDecl hptrTy hptrImm hvalInt hvalOp hcountInt hcountOp hdst hpt htgt_int hlive_weak with
@@ -2259,7 +3030,7 @@ theorem call_intrinsic_write_bytes_simulation
       hnd, hinb, ha, hm, _, hst⟩
   · rw [ha, hm]; exact .ub _ _
   · rw [ha, hm]; exact .step _ _ hst
-  · obtain ⟨hall, _, _⟩ :=
+  · obtain ⟨hall, _⟩ :=
       hlive_inbounds ptrVal countSc e tgtDecl tgtKind hp hc_pre hpos hle he htag hd ht hnd hinb
     rw [updateAllocMapOnWrite_eq_self_of_active hall] at hst
     rw [ha, hm]

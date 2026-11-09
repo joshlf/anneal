@@ -34,7 +34,8 @@ intrinsic statements and the inline intrinsic calls of `LM-4.2`:
   (with `call_intrinsic_write_bytes_simulation_explicit` and Tree Borrows
   permission divergence `call_intrinsic_write_bytes_perm_divergence`; proved in
   `WriteBytesLM4_2`).
-* `call_intrinsic_offset_simulation`: `core::intrinsics::arith_offset` (to which
+* `call_intrinsic_offset_simulation`: `core::intrinsics::arith_offset` and
+  `core::intrinsics::wrapping_offset` (to which
   `core::ptr::{const_ptr,mut_ptr}::wrapping_offset` lowers in `Runtime(PostCleanup)`
   MIR; proved in `OffsetLM4_2`).
 * `call_intrinsic_bitops_simulation`: bundles
@@ -42,7 +43,8 @@ intrinsic statements and the inline intrinsic calls of `LM-4.2`:
   `cttz_nonzero`, `bswap`, `bitreverse`), `call_intrinsic_saturating_simulation`
   (`saturating_add`, `saturating_sub`), and `call_intrinsic_rotate_simulation`
   (`rotate_left` / `rotate_right`, a characterized divergence where `lean-miri`
-  fails closed).
+  fails closed and Anneal's inline evaluation matches `BitVec.rotateLeft` /
+  `BitVec.rotateRight` with modular shift masking and a `ScalarRel` certificate).
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -287,9 +289,13 @@ integer `x : T` and a `u32` shift, from `StateRelLM3_1`-related states.
 
 This is a characterized divergence. Anneal evaluates the intrinsic inline and
 writes `evalRotate isLeft x shift` to the destination (or reports undefined
-behavior for an uninitialized or dead argument). `lean-miri`'s pinned
-`Intrinsics.eval` has no `rotate_left` / `rotate_right` arm and leaves the call
-to the intrinsic's MIR fallback body, which is outside Anneal's correspondence
+behavior for an uninitialized or dead argument), with a kernel-checked semantic
+certificate equating `(evalRotate isLeft x shift).bits` to `BitVec.rotateLeft` /
+`BitVec.rotateRight` (including modular shift masking modulo `x.sizeBytes * 8`)
+and relating `evalRotate isLeft x shift` to a `lean-miri` `ScalarInt` via
+`ScalarRel` (`truncateFromUInt`). `lean-miri`'s pinned `Intrinsics.eval` has no
+`rotate_left` / `rotate_right` arm and leaves the call to the intrinsic's MIR
+fallback body, which is outside Anneal's correspondence
 (`annealCallHooks.findMirOrEvalFn`), so the real `lean-miri` step fails closed
 with `StepError.unsupported`, except that a dead argument is undefined behavior
 in both machines. Neither machine's outcome is assumed. -/
@@ -318,11 +324,23 @@ theorem call_intrinsic_rotate_simulation
     ((∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.unsupported msg))) ∧
       (stepMirFn body s = MirStepNode.fail .ub ∨
-        ∃ x shift, evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
+        ∃ x shift mr,
+          evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
             body.layouts s.memory.callerLocals = .ok [.scalar x, .scalar shift] s.frame.locals ∧
           stepMirFn body s =
             intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb
-              (.scalar (evalRotate isLeft x shift)))) ∨
+              (.scalar (evalRotate isLeft x shift)) ∧
+          (evalRotate isLeft x shift).sizeBytes = x.sizeBytes ∧
+          (evalRotate isLeft x shift).bits < scalarModulus x.sizeBytes ∧
+          (evalRotate isLeft x shift).bits =
+            (if isLeft then
+              (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateLeft shift.bits
+            else
+              (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateRight shift.bits).toNat ∧
+          ScalarRel (evalRotate isLeft x shift) mr ∧
+          ∃ b, Miri.Memory.ScalarInt.truncateFromUInt
+            (BitVec.ofNat 128 (evalRotate isLeft x shift).bits)
+            (translateSizeBytes x.sizeBytes) = .ok (mr, b))) ∨
     (∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior msg)) ∧
       stepMirFn body s = MirStepNode.fail .ub) := by
@@ -365,9 +383,14 @@ theorem call_intrinsic_rotate_simulation
     · left
       rw [hstepA, hub]
     · right
-      refine ⟨x, shift, hok, ?_⟩
       have hxsz := ImmediateRel.integral_sizeBytes hint hrelx
       have hshsz := ImmediateRel.integral_sizeBytes hshift hrelshift
+      cases hrelx with
+      | scalar _ _ hrel_x _ _ _ =>
+      obtain ⟨mr, b, htr, hrel_mr⟩ := evalRotate_scalarRel hrel_x shift isLeft
+      refine ⟨x, shift, mr, hok, ?_, evalRotate_sizeBytes isLeft x shift,
+        evalRotate_canonical isLeft x shift, evalRotate_bits_eq_bitVec hrel_x shift isLeft,
+        hrel_mr, b, htr⟩
       rw [hstepA, hok]
       rcases hrot with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;>
         simp only [evalInlineIntrinsicCall?, integerOperandBytes?, hopTy,
@@ -723,13 +746,24 @@ theorem call_intrinsic_bitops_simulation :
                       (annealStepHooks body.localDecls body.layouts) () m =
                       (m', .error (.unsupported msg))) ∧
                   (stepMirFn body s = MirStepNode.fail .ub ∨
-                    ∃ x shift,
+                    ∃ x shift mr,
                       evalOperands s.frame.locals [op₁, op₂] s.memory.borrows s.memory.globals
                         body.layouts s.memory.callerLocals =
                         .ok [.scalar x, .scalar shift] s.frame.locals ∧
                       stepMirFn body s =
                         intrinsicWriteReturn s s.frame.locals ⟨dstIdx, []⟩ targetBb
-                          (.scalar (evalRotate isLeft x shift)))) ∨
+                          (.scalar (evalRotate isLeft x shift)) ∧
+                      (evalRotate isLeft x shift).sizeBytes = x.sizeBytes ∧
+                      (evalRotate isLeft x shift).bits < scalarModulus x.sizeBytes ∧
+                      (evalRotate isLeft x shift).bits =
+                        (if isLeft then
+                          (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateLeft shift.bits
+                        else
+                          (BitVec.ofNat (x.sizeBytes * 8) x.bits).rotateRight shift.bits).toNat ∧
+                      ScalarRel (evalRotate isLeft x shift) mr ∧
+                      ∃ b, Miri.Memory.ScalarInt.truncateFromUInt
+                        (BitVec.ofNat 128 (evalRotate isLeft x shift).bits)
+                        (translateSizeBytes x.sizeBytes) = .ok (mr, b))) ∨
                 (∃ m' msg,
                   Miri.Interpreter.Step.step
                     (annealStepHooks body.localDecls body.layouts) () m =

@@ -847,6 +847,7 @@ inductive AnnealIntrinsic where
   | exactDiv
   | writeBytes
   | arithOffset
+  | wrappingOffset
   | ctpop
   | ctlz
   | ctlzNonzero
@@ -868,6 +869,7 @@ def defPath : AnnealIntrinsic → DefPath
   | .exactDiv => "core::intrinsics::exact_div"
   | .writeBytes => "core::intrinsics::write_bytes"
   | .arithOffset => "core::intrinsics::arith_offset"
+  | .wrappingOffset => "core::intrinsics::wrapping_offset"
   | .ctpop => "core::intrinsics::ctpop"
   | .ctlz => "core::intrinsics::ctlz"
   | .ctlzNonzero => "core::intrinsics::ctlz_nonzero"
@@ -881,11 +883,12 @@ def defPath : AnnealIntrinsic → DefPath
   | .saturatingSub => "core::intrinsics::saturating_sub"
 
 /-- The intrinsic's name (rustc's `sym::*` symbol), on which
-`Miri.Interpreter.Intrinsics.eval` dispatches. -/
+`Miri.Interpreter.Intrinsics.eval` dispatches. Both `arith_offset` and its
+`wrapping_offset` alias dispatch to `"arith_offset"`. -/
 def name : AnnealIntrinsic → String
   | .exactDiv => "exact_div"
   | .writeBytes => "write_bytes"
-  | .arithOffset => "arith_offset"
+  | .arithOffset | .wrappingOffset => "arith_offset"
   | .ctpop => "ctpop"
   | .ctlz => "ctlz"
   | .ctlzNonzero => "ctlz_nonzero"
@@ -902,8 +905,8 @@ def name : AnnealIntrinsic → String
 def arity : AnnealIntrinsic → Nat
   | .writeBytes => 3
   | .ctpop | .ctlz | .ctlzNonzero | .cttz | .cttzNonzero | .bswap | .bitreverse => 1
-  | .exactDiv | .arithOffset | .rotateLeft | .rotateRight | .saturatingAdd
-  | .saturatingSub => 2
+  | .exactDiv | .arithOffset | .wrappingOffset | .rotateLeft | .rotateRight
+  | .saturatingAdd | .saturatingSub => 2
 
 /-- The correspondence-local `Miri.MIR.DefId` of the intrinsic. Every value is
 below `64`, so `annealFnItemTyId` can pack it with a generic argument. -/
@@ -922,6 +925,7 @@ def defId : AnnealIntrinsic → Miri.MIR.DefId
   | .rotateRight => 12
   | .saturatingAdd => 13
   | .saturatingSub => 14
+  | .wrappingOffset => 15
 
 /-- Inverse of `defId`. -/
 def ofDefId? : Miri.MIR.DefId → Option AnnealIntrinsic
@@ -939,18 +943,25 @@ def ofDefId? : Miri.MIR.DefId → Option AnnealIntrinsic
   | 12 => some .rotateRight
   | 13 => some .saturatingAdd
   | 14 => some .saturatingSub
+  | 15 => some .wrappingOffset
   | _ => none
 
 /-- All intrinsics, in `defId` order. -/
 def all : List AnnealIntrinsic :=
   [.exactDiv, .writeBytes, .arithOffset, .ctpop, .ctlz, .ctlzNonzero, .cttz, .cttzNonzero,
-    .bswap, .bitreverse, .rotateLeft, .rotateRight, .saturatingAdd, .saturatingSub]
+    .bswap, .bitreverse, .rotateLeft, .rotateRight, .saturatingAdd, .saturatingSub,
+    .wrappingOffset]
 
-/-- Recognize an intrinsic by the canonical `DefPath` of its function item, with
-the same byte comparison (`stringEq`) that `MirSemantics.evalTerminator`
-uses. -/
+/-- Recognize an intrinsic by the canonical `DefPath` of its function item (and
+`std::intrinsics::arith_offset` / `wrapping_offset` aliases), with the same byte
+comparison (`stringEq`) that `MirSemantics.evalTerminator` uses. -/
 def ofDefPath? (p : DefPath) : Option AnnealIntrinsic :=
-  all.find? (fun k => stringEq p k.defPath)
+  match all.find? (fun k => stringEq p k.defPath) with
+  | some k => some k
+  | none =>
+    if stringEq p "std::intrinsics::arith_offset" then some .arithOffset
+    else if stringEq p "std::intrinsics::wrapping_offset" then some .wrappingOffset
+    else none
 
 end AnnealIntrinsic
 
