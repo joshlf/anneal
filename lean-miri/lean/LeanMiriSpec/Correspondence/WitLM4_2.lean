@@ -2828,3 +2828,89 @@ theorem wit_lm4_2_copy_nonoverlapping_perm_divergence :
 end WitnessLM4_2
 
 end LeanMiriSpec.Correspondence
+
+def rawMutU32K : RigidTy := .rawPtr .mut u32K
+def rawConstU8K : RigidTy := .rawPtr .not u8K
+
+def ptr6Body (d₀ d₂ d₃ d₄ d₅ : RigidTy) (stmts : List MirAst.Statement) (term0 : TerminatorKind) : CapturedMir where
+  defPath := "lm_4_2_witness::ptr6"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [declOf d₀, declOf u64K, declOf d₂, declOf d₃, declOf d₄, declOf d₅]
+  basicBlocks := [
+    { statements := stmts, terminator := mkTerm42 term0, isCleanup := false },
+    { statements := [], terminator := mkTerm42 .return_, isCleanup := false }]
+  fnAbi := Witness.fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+def ptr6AnnealPre (b : CapturedMir) : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨42, 8⟩), .uninit, .uninit, .uninit, .uninit] }
+    memory := (initMachineState b []).memory }
+
+def ptr6MiriFramePre (b : CapturedMir) (d₀ d₂ d₃ d₄ d₅ : RigidTy) : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody b
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy (tyOf d₀)) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      (none, .uninitialized),
+      (some (translateTy (tyOf u64K)), .initialized (Miri.Memory.Allocation.fromScalar (Miri.ABI.Size.ofBytes 8) (.fromScalarInt ⟨42, 8⟩))),
+      (none, .uninitialized),
+      (none, .uninitialized),
+      (none, .uninitialized),
+      (none, .uninitialized)
+    ] }
+
+def ptr6MiriPre (b : CapturedMir) (d₀ d₂ d₃ d₄ d₅ : RigidTy) : AnnealStepState :=
+  { stack := ⟨#[ptr6MiriFramePre b d₀ d₂ d₃ d₄ d₅]⟩, machine := AnnealMachine.empty }
+
+theorem ptr6_all_immediate (b : CapturedMir) (d₀ d₂ d₃ d₄ d₅ : RigidTy) :
+    ∀ tf, (ptr6MiriPre b d₀ d₂ d₃ d₄ d₅).stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k := by
+  intro tf h k mls hmls mp hmp
+  injection h with h₁; injection h₁ with h₂; subst h₂
+  match k with
+  | 0 | 1 | 2 | 3 | 4 | 5 => simp [ptr6MiriFramePre] at hmls; subst hmls; cases hmp
+  | _ + 6 => simp [ptr6MiriFramePre] at hmls
+
+theorem ptr6_stateRel (d₀ d₂ d₃ d₄ d₅ : RigidTy) (stmts : List MirAst.Statement) (term0 : TerminatorKind) :
+    StateRel (ptr6Body d₀ d₂ d₃ d₄ d₅ stmts term0)
+      (ptr6AnnealPre (ptr6Body d₀ d₂ d₃ d₄ d₅ stmts term0))
+      (ptr6MiriPre (ptr6Body d₀ d₂ d₃ d₄ d₅ stmts term0) d₀ d₂ d₃ d₄ d₅) := by
+  let b := ptr6Body d₀ d₂ d₃ d₄ d₅ stmts term0
+  refine StateRel.mk (ptr6MiriFramePre b d₀ d₂ d₃ d₄ d₅) rfl rfl ⟨translateTy (tyOf d₀), rfl⟩ ?_
+    rfl rfl rfl rfl rfl (by
+      intro i _ _ _ _ _ _ hi _
+      revert hi
+      match i with
+      | 0 | 1 | 2 | 3 | 4 | 5 | _ + 6 => rintro ⟨⟩)
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 | 2 | 3 | 4 | 5 =>
+    have hs : slot = .uninit := by simpa [ptr6AnnealPre, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      match i with
+      | 0 => simpa [ptr6MiriFramePre] using hmls.symm
+      | 2 => simpa [ptr6MiriFramePre] using hmls.symm
+      | 3 => simpa [ptr6MiriFramePre] using hmls.symm
+      | 4 => simpa [ptr6MiriFramePre] using hmls.symm
+      | 5 => simpa [ptr6MiriFramePre] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ none (fun _ h => Option.some.inj h.symm) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hs : slot = .init (.scalar ⟨42, 8⟩) := by simpa [ptr6AnnealPre, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate (.scalar (.fromScalarInt ⟨42, 8⟩))), layout := some (translateTy (tyOf u64K)) } := by
+      simpa [ptr6MiriFramePre] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ (some (translateTy (tyOf u64K))) (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩)
+  | _ + 6 => simp [ptr6Body, get?] at hdecl
+
