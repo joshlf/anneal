@@ -1,7 +1,7 @@
 # Step-by-Step Reproduction Instructions — `BRIEF-1`: `Trusted.MirSemantics` Completeness for Emit'able MIR & `CallConv.rustIntrinsic`
 
 - **Item ID**: `BRIEF-1` (Workstream 1 Supervisor Integration of `BRIEF-1.1`, `BRIEF-1.2`, `BRIEF-1.3`, and `BRIEF-1.4`)
-- **Worktree**: `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1`
+- **Worktree**: `<path/to/anneal>`
 - **Branches**: `sup/brief-1` and `adv/brief-1`
 - **Child Leaf Milestones**:
   - `BRIEF-1.1` (`f515de96` — Function-Item Reification `ReifyFnPointer`, `fnPtrToPtr` Casts, and Indirect `FnPtr` Calls): see [`REPRODUCE_BRIEF_1_1.md`](REPRODUCE_BRIEF_1_1.md).
@@ -13,7 +13,7 @@
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1
+cd <path/to/anneal>
 git status --porcelain
 git log --oneline -20
 ```
@@ -26,7 +26,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode build --concurrency 3 -- lake build Trusted Anneal MiniRust Correspondence MirVerification
 anneal-lean-run --mode build --concurrency 3 -- lake build
 ```
@@ -38,7 +38,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1
+cd <path/to/anneal>
 python3 trusted/audit/check_trusted.py --fast
 ./ci/check_todo.sh
 ```
@@ -51,7 +51,7 @@ Expected output:
 
 ```bash
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-1
+cd <path/to/anneal>
 cargo test -p anneal-rustc-capture
 cargo test -p cargo-anneal --test end_to_end_miri_diff
 ```

@@ -27,7 +27,7 @@
 
 ## Step-by-Step Verification Commands
 
-Run from `/usr/local/google/Projects/anneal-workspace/anneal-wt-ff-1-1`:
+Run from `<path/to/anneal>`:
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"

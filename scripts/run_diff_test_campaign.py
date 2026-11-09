@@ -51,8 +51,8 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 
-FILEUTIL_BIN = "/usr/bin/fileutil"
-FILEUTIL_X20_FLAG = "--x20_force_client_creation_at_head"
+REMOTE_SYNC_BIN = "/usr/bin/remote-sync"
+REMOTE_SYNC_FLAG = "--force_client_creation_at_head"
 
 EXIT_SUCCESS = 0
 EXIT_INTERNAL_ERROR = 1
@@ -156,7 +156,7 @@ HARNESS_INT_KEYS = (
 # `resolved_history`, `quarantined_fingerprints`, `last_*_signature`,
 # `per_suite_runs`, `schema_version`, ...) is deliberately NOT listed: the
 # capsule launcher uploads `state/` after every run, so stripping it on a
-# pass-through `--compile-only` run would erase the shared x20 ledger's aging
+# pass-through `--compile-only` run would erase the shared remote ledger's aging
 # history and seed-sensitivity baselines.
 OBSOLETE_LEDGER_KEYS = (
     "total_miri_candidates_evaluated",
@@ -238,72 +238,72 @@ def utc_date_prefix() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
-def has_x20_fileutil() -> bool:
-    return os.path.isfile(FILEUTIL_BIN) and os.access(FILEUTIL_BIN, os.X_OK)
+def has_remote_sync() -> bool:
+    return os.path.isfile(REMOTE_SYNC_BIN) and os.access(REMOTE_SYNC_BIN, os.X_OK)
 
 
-def run_fileutil(args: list[str]) -> subprocess.CompletedProcess[str]:
-    cmd = [FILEUTIL_BIN, FILEUTIL_X20_FLAG, *args]
+def run_remote_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
+    cmd = [REMOTE_SYNC_BIN, REMOTE_SYNC_FLAG, *args]
     return subprocess.run(cmd, text=True, capture_output=True, check=False)
 
 
-def check_x20_uri(x20_uri: str) -> None:
-    if x20_uri.startswith("/google/data/rw/"):
+def check_remote_uri(remote_uri: str) -> None:
+    if remote_uri.startswith("/mnt/fuse/rw/"):
         raise ValueError(
-            f"Refusing FUSE path `{x20_uri}`; always use `/x20/...` URIs with "
-            f"`{FILEUTIL_BIN} {FILEUTIL_X20_FLAG}`."
+            f"Refusing FUSE path `{remote_uri}`; always use `/remote/...` URIs with "
+            f"`{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
         )
 
 
-def sync_state_from_x20(
-    x20_uri: str, state_dir: Path, include_ratchet: bool = True
+def sync_state_from_remote(
+    remote_uri: str, state_dir: Path, include_ratchet: bool = True
 ) -> None:
-    """Pulls the ledger (and coverage ratchet in live mode) from `/x20/` via `fileutil` RPC."""
-    if not x20_uri or not has_x20_fileutil():
+    """Pulls the ledger (and coverage ratchet in live mode) from `/remote/` via `remote-sync` RPC."""
+    if not remote_uri or not has_remote_sync():
         return
-    check_x20_uri(x20_uri)
+    check_remote_uri(remote_uri)
     (state_dir / "state").mkdir(parents=True, exist_ok=True)
-    run_fileutil(
+    run_remote_sync(
         [
             "cp",
             "-f",
-            f"{x20_uri.rstrip('/')}/state/campaign_ledger.json",
+            f"{remote_uri.rstrip('/')}/state/campaign_ledger.json",
             str(state_dir / "state" / "campaign_ledger.json"),
         ]
     )
     if include_ratchet:
-        run_fileutil(
+        run_remote_sync(
             [
                 "cp",
                 "-f",
-                f"{x20_uri.rstrip('/')}/state/coverage_ratchet.json",
+                f"{remote_uri.rstrip('/')}/state/coverage_ratchet.json",
                 str(state_dir / "state" / "coverage_ratchet.json"),
             ]
         )
 
 
-def sync_state_to_x20(state_dir: Path, x20_uri: str, written: list[Path]) -> None:
-    """Uploads the files this run wrote under `state_dir` to `/x20/`.
+def sync_state_to_remote(state_dir: Path, remote_uri: str, written: list[Path]) -> None:
+    """Uploads the files this run wrote under `state_dir` to `/remote/`.
 
     Only `written` is uploaded, so stale files in a reused state directory are
     never republished.
     """
-    if not x20_uri or not has_x20_fileutil():
+    if not remote_uri or not has_remote_sync():
         return
-    check_x20_uri(x20_uri)
-    base = x20_uri.rstrip("/")
+    check_remote_uri(remote_uri)
+    base = remote_uri.rstrip("/")
     created_dirs: set[str] = set()
     for subdir in ["state", "reports"]:
         remote_dir = f"{base}/{subdir}"
-        run_fileutil(["mkdir", "-p", remote_dir])
+        run_remote_sync(["mkdir", "-p", remote_dir])
         created_dirs.add(remote_dir)
     for local_file in written:
         rel = local_file.relative_to(state_dir)
         remote_parent = f"{base}/{rel.parent}"
         if remote_parent not in created_dirs:
-            run_fileutil(["mkdir", "-p", remote_parent])
+            run_remote_sync(["mkdir", "-p", remote_parent])
             created_dirs.add(remote_parent)
-        run_fileutil(["cp", "-f", str(local_file), f"{base}/{rel}"])
+        run_remote_sync(["cp", "-f", str(local_file), f"{base}/{rel}"])
 
 
 def load_ledger(ledger_path: Path) -> dict[str, Any]:
@@ -2435,10 +2435,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Local directory for the ledger, findings, and reports (default: a temporary directory).",
     )
     parser.add_argument(
-        "--x20-uri",
+        "--remote-uri",
         type=str,
         default="",
-        help="x20 directory to synchronize the ledger and reports with (default: no x20 sync).",
+        help="remote directory to synchronize the ledger and reports with (default: no remote sync).",
     )
     parser.add_argument("--miri-seed", type=str, default=None)
     parser.add_argument("--itree-seed", type=str, default=None)
@@ -2484,7 +2484,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--junit-xml",
         type=Path,
         default=None,
-        help="Optional path for JUnit XML (`sponge_log.xml`).",
+        help="Optional path for JUnit XML (`diff_test_report.xml`).",
     )
     return parser.parse_args(argv)
 
@@ -2495,9 +2495,9 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     start_time = time.monotonic()
 
-    x20_uri = args.x20_uri.strip()
+    remote_uri = args.remote_uri.strip()
     try:
-        check_x20_uri(x20_uri)
+        check_remote_uri(remote_uri)
         cli_miri_seed = parse_seed_int(args.miri_seed) if args.miri_seed is not None else None
         cli_itree_seed = parse_seed_int(args.itree_seed) if args.itree_seed is not None else None
         quarantine_rules = load_quarantine_rules(args.quarantine_file)
@@ -2516,7 +2516,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         LAST_HARNESS_DIAGNOSTICS.clear()
-        sync_state_from_x20(x20_uri, state_dir, include_ratchet=not args.compile_only)
+        sync_state_from_remote(remote_uri, state_dir, include_ratchet=not args.compile_only)
         (state_dir / "state").mkdir(parents=True, exist_ok=True)
         (state_dir / "reports").mkdir(parents=True, exist_ok=True)
 
@@ -2723,7 +2723,7 @@ def main(argv: list[str] | None = None) -> int:
                     elapsed_sec,
                 )
 
-            sync_state_to_x20(state_dir, x20_uri, written)
+            sync_state_to_remote(state_dir, remote_uri, written)
             print(report_md)
             return EXIT_HARNESS_FAILED if harness_failed else EXIT_NOT_EVALUATED
 
@@ -2810,7 +2810,7 @@ def main(argv: list[str] | None = None) -> int:
                     ran_without_oracle,
                     elapsed_sec,
                 )
-            sync_state_to_x20(state_dir, x20_uri, written)
+            sync_state_to_remote(state_dir, remote_uri, written)
             print(report_md)
             return EXIT_HARNESS_FAILED
 
@@ -3095,7 +3095,7 @@ def main(argv: list[str] | None = None) -> int:
                 elapsed_sec,
             )
 
-        sync_state_to_x20(state_dir, x20_uri, written)
+        sync_state_to_remote(state_dir, remote_uri, written)
         print(report_md)
 
         if harness_or_red_flag_failed:
