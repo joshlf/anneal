@@ -1230,6 +1230,32 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
 
     def test_quarantine_tests_known_anneal_bug_entries_audited_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            q_valid = Path(tmp) / "q_valid.toml"
+            q_valid.write_text(
+                '[[tests]]\n'
+                'name = "valid_seed"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_bug_class = "incompleteness"\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'divergence_class = "missed_ub"\n'
+                'expires = "2099-01-01"\n'
+                'summary = "tracked bug"\n',
+                encoding="utf-8",
+            )
+            # When `divergence_class` is present, only `valid_seed:missed_ub` is loaded
+            # (not bare `valid_seed`, which would over-quarantine other divergence classes)
+            # and observing `valid_seed:missed_ub` satisfies the 1-entry audit.
+            self.assertEqual(campaign.load_quarantine_rules(q_valid), {"valid_seed:missed_ub"})
+            valid_audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=q_valid,
+                evaluated_fingerprints=[],
+                observed_quarantine_keys={"valid_seed:missed_ub"},
+                covered_harnesses={"miri"},
+                reference_date="2026-11-09",
+            )
+            self.assertTrue(valid_audit["passed"], valid_audit)
+            self.assertEqual(valid_audit["checked_quarantine_count"], 1)
+
             q_file = Path(tmp) / "q_tests.toml"
             q_file.write_text(
                 '[[tests]]\n'
@@ -1252,22 +1278,31 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
                 '[[tests]]\n'
                 'name = "missing_meta_seed"\n'
                 '[tests.known_anneal_bug]\n'
-                'divergence_class = "missed_ub"\n',
+                'divergence_class = "missed_ub"\n'
+                '\n'
+                '[[tests]]\n'
+                'name = "bad_class_seed"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'divergence_class = "not_a_real_class"\n'
+                'summary = "bad class"\n',
                 encoding="utf-8",
             )
             rules = campaign.load_quarantine_rules(q_file)
-            self.assertEqual(rules, {"valid_seed", "valid_seed:missed_ub"})
+            self.assertEqual(rules, {"valid_seed:missed_ub"})
             audit = campaign.verify_no_stale_quarantine_or_known_bugs(
                 quarantine_file=q_file,
                 evaluated_fingerprints=[],
-                observed_quarantine_keys={"valid_seed:missed_ub"},
+                observed_quarantine_keys=set(),
                 covered_harnesses={"miri"},
                 reference_date="2026-11-09",
             )
             self.assertFalse(audit["passed"])
+            self.assertEqual(audit["checked_quarantine_count"], 4)
             reasons = " | ".join(e["reason"] for e in audit["stale_quarantine_entries"])
             self.assertIn("expired_quarantine_entry", reasons)
             self.assertIn("missing_known_anneal_bug_metadata", reasons)
+            self.assertIn("invalid divergence_class", reasons)
             self.assertIn("unobserved_quarantine_entry", reasons)
 
 

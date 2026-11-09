@@ -1090,6 +1090,61 @@ theorem containsAll_shrinkMutatorChain_eq_ddminReference [DecidableEq α] (req x
   shrinkMutatorChain_eq_ddminReference_of_monotone_inf _ xs r fuel_s fuel_d
     (containsAll_monotone req) (containsAll_inf_closed req xs hnd) h_ddmin h_fuel
 
+/-- Closed-form characterization of 1-minimal trigger-set witnesses on a duplicate-free
+chain `xs`: any 1-minimal sublist `r` of `xs` for "every step in `req` is present"
+equals `xs.filter (fun a => decide (a ∈ req))`. -/
+theorem isOneMinimal_containsAll_eq_filter [DecidableEq α] (req xs r : List α)
+    (hsub : r.Sublist xs) (hnd : xs.Nodup)
+    (hmin : IsOneMinimal (fun ys => req.all (fun a => decide (a ∈ ys))) r) :
+    r = xs.filter (fun a => decide (a ∈ req)) := by
+  let pred := fun ys : List α => req.all (fun a => decide (a ∈ ys))
+  have hp_r : ∀ a ∈ req, a ∈ r := by
+    have h1 := hmin.1
+    simp only [List.all_eq_true, decide_eq_true_eq] at h1
+    exact h1
+  let w := r.filter (fun a => decide (a ∈ req))
+  have hw_sub : w.Sublist r := List.filter_sublist
+  have hp_w : pred w = true := by
+    simp only [pred, w, List.all_eq_true, decide_eq_true_eq, List.mem_filter]
+    exact fun a ha => ⟨hp_r a ha, by simpa using ha⟩
+  have hw_eq_r : w = r := by
+    by_cases hlt : w.length < r.length
+    · have hf :=
+        isOneMinimal_globally_minimal_of_monotone pred (containsAll_monotone req) hmin w hw_sub hlt
+      rw [hp_w] at hf
+      contradiction
+    · exact sublist_eq_of_length_le hw_sub (by omega)
+  have hw_eq_xs : w = xs.filter (fun a => decide (a ∈ req)) :=
+    filter_mem_eq_of_sublist_of_nodup req hsub hnd (fun a _ ha => hp_r a ha)
+  exact hw_eq_r.symm.trans hw_eq_xs
+
+/-- Closed-form theorem for `shrinkMutatorChain` on trigger-set predicates: on a
+duplicate-free chain `xs` with `xs.length ≤ fuel`, `shrinkMutatorChain` returns
+`xs.filter (fun a => decide (a ∈ req))`. -/
+theorem shrinkMutatorChain_containsAll_eq_filter [DecidableEq α] (req xs : List α) (fuel : Nat)
+    (hnd : xs.Nodup)
+    (h_pred : req.all (fun a => decide (a ∈ xs)) = true)
+    (h_fuel : xs.length ≤ fuel) :
+    shrinkMutatorChain fuel (fun ys => req.all (fun a => decide (a ∈ ys))) xs =
+      xs.filter (fun a => decide (a ∈ req)) :=
+  isOneMinimal_containsAll_eq_filter req xs _
+    (shrinkMutatorChain_sublist fuel _ xs) hnd
+    (shrinkMutatorChain_one_minimal fuel _ xs h_pred h_fuel)
+
+/-- Closed-form theorem for `ddminReference` on trigger-set predicates (proving the exact
+property tested over 600 random trials by `shrink_mutation_chain_detailed_is_globally_minimal_for_monotone_predicates`
+in `shrink.rs`): on a duplicate-free chain `xs` with sufficient fuel, `ddminReference`
+returns `some (xs.filter (fun a => decide (a ∈ req)))`. -/
+theorem ddminReference_containsAll_eq_some_filter [DecidableEq α] (req xs : List α) (fuel : Nat)
+    (hnd : xs.Nodup)
+    (h_pred : req.all (fun a => decide (a ∈ xs)) = true)
+    (h_fuel : xs.length * (xs.length + 1) + (xs.length + 1) / 2 < fuel) :
+    ddminReference (fun ys => req.all (fun a => decide (a ∈ ys))) fuel xs =
+      some (xs.filter (fun a => decide (a ∈ req))) := by
+  obtain ⟨r, hr, hmin, hsub⟩ :=
+    ddminReference_total (fun ys => req.all (fun a => decide (a ∈ ys))) xs fuel h_pred h_fuel
+  rw [hr, isOneMinimal_containsAll_eq_filter req xs r hsub hnd hmin]
+
 /-- Kernel witness of the instance: both shrinkers isolate exactly the trigger steps
 `[1, 4]` of a 6-step chain. -/
 theorem containsAll_shrinkers_agree_witness :
@@ -1838,6 +1893,9 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms shrinkMutatorChain_eq_ddminReference_of_monotone_inf
 #print axioms containsAll_inf_closed
 #print axioms containsAll_shrinkMutatorChain_eq_ddminReference
+#print axioms isOneMinimal_containsAll_eq_filter
+#print axioms shrinkMutatorChain_containsAll_eq_filter
+#print axioms ddminReference_containsAll_eq_some_filter
 #print axioms containsAll_shrinkers_disagree_on_repeated_step
 #print axioms coupled_window_one_minimal_not_globally_minimal
 #print axioms shrinkMutatorChain_fuel_bound_tight

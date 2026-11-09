@@ -885,16 +885,22 @@ where
     F: FnMut(&GeneratedMiriCandidate) -> Option<ItemOracleReport>,
 {
     let mut compile_counter = 0usize;
+    let mut compile_cache: BTreeMap<String, bool> = BTreeMap::new();
     minimize_miri_candidate_mutations_with_compile_check(
         cand,
         seeds,
         original_report,
         |sub_cand| {
+            if let Some(&cached) = compile_cache.get(&sub_cand.source) {
+                return cached;
+            }
             compile_counter += 1;
-            compile_rust_snippet(
+            let compiled = compile_rust_snippet(
                 &format!("shrink_{}_{}", sub_cand.fn_name, compile_counter),
                 &sub_cand.source,
-            )
+            );
+            compile_cache.insert(sub_cand.source.clone(), compiled);
+            compiled
         },
         eval_fn,
     )

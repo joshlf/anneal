@@ -1299,26 +1299,40 @@ def verify_no_stale_quarantine_or_known_bugs(
                                         "reason": "missing_known_anneal_bug_metadata: missing summary/reason",
                                     }
                                 )
+                            div_cls = t_bug.get("divergence_class")
+                            loader_tok = clean_t_name
+                            if div_cls is not None:
+                                if (
+                                    not isinstance(div_cls, str)
+                                    or div_cls.strip() not in VALID_DIVERGENCE_CLASSES
+                                ):
+                                    metadata_ok = False
+                                    stale_quarantine.append(
+                                        {
+                                            "source": str(quarantine_file),
+                                            "entry": clean_t_name,
+                                            "reason": (
+                                                f"malformed_known_anneal_bug: invalid divergence_class "
+                                                f"{div_cls!r}"
+                                            ),
+                                        }
+                                    )
+                                else:
+                                    loader_tok = f"{clean_t_name}:{div_cls.strip()}"
                             if not metadata_ok:
                                 # `load_quarantine_rules` never applies such an entry.
                                 checked_quarantine_count += 1
                                 continue
-                            # Audit exactly the tokens `load_quarantine_rules` applies for this
-                            # entry (`name`, plus `name:divergence_class` when present), with the
-                            # entry's own expiry; never a synthesized token that the loader does
-                            # not use (it could never be "observed").
-                            div_cls = t_bug.get("divergence_class")
-                            loader_tokens = [clean_t_name]
-                            if isinstance(div_cls, str) and div_cls.strip():
-                                loader_tokens.append(f"{clean_t_name}:{div_cls.strip()}")
-                            for tok in loader_tokens:
-                                raw_entries.append(
-                                    {
-                                        "fingerprint": tok,
-                                        "expires": t_bug.get("expires"),
-                                        "_loader_token": True,
-                                    }
-                                )
+                            # Audit the exact token `load_quarantine_rules` applies for this
+                            # entry (`name:divergence_class` when `divergence_class` is present,
+                            # otherwise `name`), with the entry's own expiry.
+                            raw_entries.append(
+                                {
+                                    "fingerprint": loader_tok,
+                                    "expires": t_bug.get("expires"),
+                                    "_loader_token": True,
+                                }
+                            )
                 if q_data and not recognized_key:
                     stale_quarantine.append(
                         {
@@ -2481,10 +2495,16 @@ def load_quarantine_rules(quarantine_file: Path | None) -> set[str]:
                 ):
                     continue
                 clean_name = name.strip()
-                rules.add(clean_name)
                 div_cls = bug.get("divergence_class")
-                if isinstance(div_cls, str) and div_cls.strip():
+                if div_cls is not None:
+                    if (
+                        not isinstance(div_cls, str)
+                        or div_cls.strip() not in VALID_DIVERGENCE_CLASSES
+                    ):
+                        continue
                     rules.add(f"{clean_name}:{div_cls.strip()}")
+                else:
+                    rules.add(clean_name)
     else:
         try:
             data = json.loads(text)
