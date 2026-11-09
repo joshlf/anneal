@@ -1788,6 +1788,408 @@ theorem evalValueProjWrite_refines_writeProjectedValue :
     | opaqueCast _ => cases val <;> nomatch hWrite
     | unwrapUnsafeBinder _ => cases val <;> nomatch hWrite
 
+/-- Well-formedness predicate for a pure value-tree read target `(val, proj)`
+where `evalValueProjRead` and `Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue`
+agree identically on all outcomes (`.ok`, `.ub`, `.unsupported`):
+- No `.deref`, `.opaqueCast`, or `.unwrapUnsafeBinder` projections;
+- Every `.downcast` is immediately followed by `.field` (`isFieldHead rest = true`);
+- Every `.field` targets an `.aggregate` value (excluding transparent `.field 0` on
+  `.scalar`, `.ptr`, or `.unit`);
+- Every `fromEnd = true` `.constantIndex offset minLen true` satisfies `1 ≤ offset ≤ minLen`. -/
+def WfValueReadTarget (locals : List LocalSlot) : Value → List ProjectionElem → Bool
+  | _, .nil => true
+  | .aggregate _ fields, .field idx _ :: rest =>
+    match get? fields idx with
+    | .some fieldVal => WfValueReadTarget locals fieldVal rest
+    | .none => true
+  | _, .field _ _ :: _ => false
+  | .aggregate actualVariant fields, .downcast _ variantIdx :: rest =>
+    Bool.and (isFieldHead rest)
+      (match Nat.beq actualVariant variantIdx with
+       | true => WfValueReadTarget locals (.aggregate actualVariant fields) rest
+       | false => true)
+  | _, .downcast _ _ :: _ => true
+  | .aggregate .zero fields, .index idxLocal :: rest =>
+    match get? locals idxLocal with
+    | .some (.init (.scalar sc)) =>
+      match get? fields sc.bits with
+      | .some elemVal => WfValueReadTarget locals elemVal rest
+      | .none => true
+    | _ => true
+  | _, .index _ :: _ => true
+  | .aggregate .zero fields, .constantIndex offset minLen fromEnd :: rest =>
+    let wfFromEnd :=
+      match fromEnd with
+      | true => Bool.and (Nat.ble 1 offset) (Nat.ble offset minLen)
+      | false => true
+    Bool.and wfFromEnd
+      (match evalConstantIndex (length fields) offset minLen fromEnd with
+       | .some idx =>
+         match get? fields idx with
+         | .some elemVal => WfValueReadTarget locals elemVal rest
+         | .none => true
+       | .none => true)
+  | _, .constantIndex _ _ _ :: _ => true
+  | .aggregate .zero fields, .subslice fromIdx toIdx fromEnd :: rest =>
+    match extractSubslice fields fromIdx toIdx fromEnd with
+    | .some subElems => WfValueReadTarget locals (.aggregate .zero subElems) rest
+    | .none => true
+  | _, .subslice _ _ _ :: _ => true
+  | _, .deref :: _ => false
+  | _, .opaqueCast _ :: _ => false
+  | _, .unwrapUnsafeBinder _ :: _ => false
+
+/-- **Read Completeness & Exact Outcome Agreement (`evalValueProjRead_eq_readProjectedValue_of_wf`)**:
+Whenever `WfValueReadTarget locals val proj = true`, `evalValueProjRead` and
+`Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue` produce the exact
+same `ProjReadResult` (hence `evalValueProjRead locals val proj = .ok outVal ↔
+readProjectedValue locals val proj = .ok outVal`). -/
+theorem evalValueProjRead_eq_readProjectedValue_of_wf :
+    ∀ (proj : List ProjectionElem) (locals : List LocalSlot) (val : Value),
+      WfValueReadTarget locals val proj = true →
+      evalValueProjRead locals val proj =
+        Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue locals val proj := by
+  intro proj
+  induction proj with
+  | nil =>
+    intro locals val _
+    rfl
+  | cons p rest ih =>
+    intro locals val hWf
+    cases p with
+    | field idx ty =>
+      cases val with
+      | aggregate variantIdx fields =>
+        dsimp only [WfValueReadTarget] at hWf
+        dsimp only [evalValueProjRead, Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
+        cases hGet : get? fields idx with
+        | none => rfl
+        | some fieldVal =>
+          rw [hGet] at hWf
+          exact ih locals fieldVal hWf
+      | _ => nomatch hWf
+    | downcast vName variantIdx =>
+      cases val with
+      | aggregate actualVariant fields =>
+        dsimp only [WfValueReadTarget] at hWf
+        have ⟨hHead, hWfRest⟩ := Bool.and_eq_true_iff.mp hWf
+        dsimp only [evalValueProjRead, Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
+        rw [hHead]
+        cases hEq : Nat.beq actualVariant variantIdx with
+        | false => rfl
+        | true =>
+          rw [hEq] at hWfRest
+          dsimp only
+          exact ih locals (.aggregate actualVariant fields) hWfRest
+      | _ => rfl
+    | index idxLocal =>
+      cases val with
+      | aggregate variantIdx fields =>
+        cases variantIdx with
+        | zero =>
+          dsimp only [WfValueReadTarget] at hWf
+          dsimp only [evalValueProjRead]
+          rw [readProjectedValue_index_zero]
+          cases hLoc : get? locals idxLocal with
+          | none => rfl
+          | some slot =>
+            rw [hLoc] at hWf
+            cases slot with
+            | dead => rfl
+            | uninit => rfl
+            | init idxVal =>
+              cases idxVal with
+              | scalar sc =>
+                dsimp only at hWf ⊢
+                cases hElem : get? fields sc.bits with
+                | none => rfl
+                | some elemVal =>
+                  rw [hElem] at hWf
+                  exact ih locals elemVal hWf
+              | _ => rfl
+        | succ _ => rfl
+      | _ => rfl
+    | constantIndex offset minLen fromEnd =>
+      cases val with
+      | aggregate variantIdx fields =>
+        cases variantIdx with
+        | zero =>
+          dsimp only [WfValueReadTarget] at hWf
+          have ⟨hFromEndWf, hWfRest⟩ := Bool.and_eq_true_iff.mp hWf
+          dsimp only [evalValueProjRead]
+          rw [readProjectedValue_constantIndex_zero]
+          dsimp only
+          unfold evalConstantIndex at hWfRest ⊢
+          cases hMin : Nat.ble minLen (length fields) with
+          | false => rfl
+          | true =>
+            rw [hMin] at hWfRest
+            dsimp only at hWfRest ⊢
+            cases fromEnd with
+            | false =>
+              cases hOff : Nat.ble (Nat.succ offset) (length fields) with
+              | false =>
+                dsimp only
+                have hNotLt : ¬ offset < fields.length := by
+                  intro hLt
+                  have hBle : Nat.ble (Nat.succ offset) (length fields) = true :=
+                    Nat.ble_eq.mpr hLt
+                  rw [hOff] at hBle
+                  nomatch hBle
+                have hGe : fields.length ≤ offset := Nat.le_of_not_lt hNotLt
+                have hNone : get? fields offset = .none := by
+                  simp [get?_eq_getElem?, List.getElem?_eq_none hGe]
+                rw [hNone]
+              | true =>
+                rw [hOff] at hWfRest
+                dsimp only at hWfRest ⊢
+                cases hElem : get? fields offset with
+                | none => rfl
+                | some elemVal =>
+                  rw [hElem] at hWfRest
+                  exact ih locals elemVal hWfRest
+            | true =>
+              dsimp only at hFromEndWf
+              have ⟨hGe1, hLeMin⟩ := Bool.and_eq_true_iff.mp hFromEndWf
+              have hLeLen : Nat.ble offset (length fields) = true := by
+                have h1 := Nat.le_of_ble_eq_true hLeMin
+                have h2 := Nat.le_of_ble_eq_true hMin
+                exact Nat.ble_eq.mpr (Nat.le_trans h1 h2)
+              have hBounds : Bool.and (Nat.ble 1 offset) (Nat.ble offset (length fields)) = true := by
+                rw [hGe1, hLeLen]; rfl
+              rw [hBounds] at hWfRest ⊢
+              dsimp only at hWfRest ⊢
+              cases hElem : get? fields (Nat.sub (length fields) offset) with
+              | none => rfl
+              | some elemVal =>
+                rw [hElem] at hWfRest
+                exact ih locals elemVal hWfRest
+        | succ _ => rfl
+      | _ => rfl
+    | subslice fromIdx toIdx fromEnd =>
+      cases val with
+      | aggregate variantIdx fields =>
+        cases variantIdx with
+        | zero =>
+          dsimp only [WfValueReadTarget] at hWf
+          dsimp only [evalValueProjRead]
+          rw [readProjectedValue_subslice_zero]
+          cases hExt : extractSubslice fields fromIdx toIdx fromEnd with
+          | none => rfl
+          | some subElems =>
+            rw [hExt] at hWf
+            exact ih locals (.aggregate .zero subElems) hWf
+        | succ _ => rfl
+      | _ => rfl
+    | deref => cases val <;> nomatch hWf
+    | opaqueCast _ => cases val <;> nomatch hWf
+    | unwrapUnsafeBinder _ => cases val <;> nomatch hWf
+
+/-- **Write Completeness on Readable Paths (`evalValueProjWrite_iff_writeProjectedValue_of_read_ok`)**:
+Whenever `proj` is a valid readable projection on `val`
+(`evalValueProjRead locals val proj = .ok oldLeaf`), `evalValueProjWrite` and
+`Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue` are **bidirectionally
+equivalent** (`evalValueProjWrite = .ok val' ↔ writeProjectedValue = .ok val'`) for
+every replacement value `newVal` and output value `val'`, with no additional
+hypotheses. -/
+theorem evalValueProjWrite_iff_writeProjectedValue_of_read_ok :
+    ∀ (proj : List ProjectionElem) (locals : List LocalSlot) (val oldLeaf newVal val' : Value),
+      evalValueProjRead locals val proj = .ok oldLeaf →
+      (evalValueProjWrite locals val proj newVal = .ok val' ↔
+        Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+          locals val proj newVal = .ok val') := by
+  intro proj
+  induction proj with
+  | nil =>
+    intro locals val _ newVal val' _
+    exact Iff.rfl
+  | cons p rest ih =>
+    intro locals val oldLeaf newVal val' hRead
+    refine ⟨evalValueProjWrite_refines_writeProjectedValue (p :: rest) locals val newVal val', ?_⟩
+    intro hWrite
+    cases p with
+    | field idx ty =>
+      cases val with
+      | aggregate variantIdx fields =>
+        dsimp only [evalValueProjRead] at hRead
+        dsimp only [evalValueProjWrite]
+        dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue] at hWrite
+        cases hGet : get? fields idx with
+        | none => rw [hGet] at hRead; nomatch hRead
+        | some oldFieldVal =>
+          rw [hGet] at hRead hWrite
+          dsimp only at hWrite ⊢
+          cases hSubT :
+              Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+                locals oldFieldVal rest newVal with
+          | ub => rw [hSubT] at hWrite; nomatch hWrite
+          | unsupported => rw [hSubT] at hWrite; nomatch hWrite
+          | ok updatedFieldVal =>
+            rw [hSubT] at hWrite
+            have hSubA : evalValueProjWrite locals oldFieldVal rest newVal = .ok updatedFieldVal :=
+              (ih locals oldFieldVal oldLeaf newVal updatedFieldVal hRead).mpr hSubT
+            rw [hSubA]
+            exact hWrite
+      | _ => nomatch hRead
+    | downcast vName variantIdx =>
+      cases val with
+      | aggregate actualVariant fields =>
+        dsimp only [evalValueProjRead] at hRead
+        dsimp only [evalValueProjWrite]
+        dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue] at hWrite
+        cases hHead : isFieldHead rest with
+        | false => simp [hHead] at hRead
+        | true =>
+          cases hEq : Nat.beq actualVariant variantIdx with
+          | false => simp [hHead, hEq] at hRead
+          | true =>
+            rw [hHead, hEq] at hRead
+            rw [hEq] at hWrite
+            dsimp only at hRead hWrite ⊢
+            exact (ih locals (.aggregate actualVariant fields) oldLeaf newVal val' hRead).mpr hWrite
+      | _ => nomatch hRead
+    | index idxLocal =>
+      cases val with
+      | aggregate variantIdx fields =>
+        cases variantIdx with
+        | zero =>
+          dsimp only [evalValueProjRead] at hRead
+          dsimp only [evalValueProjWrite]
+          rw [writeProjectedValue_index_zero] at hWrite
+          cases hLoc : get? locals idxLocal with
+          | none => rw [hLoc] at hRead; nomatch hRead
+          | some slot =>
+            rw [hLoc] at hRead hWrite
+            cases slot with
+            | dead => nomatch hRead
+            | uninit => nomatch hRead
+            | init idxVal =>
+              cases idxVal with
+              | scalar sc =>
+                dsimp only at hRead hWrite ⊢
+                cases hElem : get? fields sc.bits with
+                | none => rw [hElem] at hRead; nomatch hRead
+                | some oldElemVal =>
+                  rw [hElem] at hRead hWrite
+                  dsimp only at hWrite ⊢
+                  cases hSubT :
+                      Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+                        locals oldElemVal rest newVal with
+                  | ub => rw [hSubT] at hWrite; nomatch hWrite
+                  | unsupported => rw [hSubT] at hWrite; nomatch hWrite
+                  | ok updatedElemVal =>
+                    rw [hSubT] at hWrite
+                    have hSubA : evalValueProjWrite locals oldElemVal rest newVal = .ok updatedElemVal :=
+                      (ih locals oldElemVal oldLeaf newVal updatedElemVal hRead).mpr hSubT
+                    rw [hSubA]
+                    exact hWrite
+              | _ => nomatch hRead
+        | succ _ => nomatch hRead
+      | _ => nomatch hRead
+    | constantIndex offset minLen fromEnd =>
+      cases val with
+      | aggregate variantIdx fields =>
+        cases variantIdx with
+        | zero =>
+          dsimp only [evalValueProjRead] at hRead
+          dsimp only [evalValueProjWrite]
+          rw [writeProjectedValue_constantIndex_zero] at hWrite
+          dsimp only at hWrite
+          cases hIdx : evalConstantIndex (length fields) offset minLen fromEnd with
+          | none => rw [hIdx] at hRead; nomatch hRead
+          | some idx =>
+            rw [hIdx] at hRead
+            dsimp only at hRead ⊢
+            unfold evalConstantIndex at hIdx
+            cases hMin : Nat.ble minLen (length fields) with
+            | false => rw [hMin] at hIdx; nomatch hIdx
+            | true =>
+              rw [hMin] at hIdx hWrite
+              dsimp only at hIdx hWrite
+              cases fromEnd with
+              | false =>
+                cases hOff : Nat.ble (Nat.succ offset) (length fields) with
+                | false => rw [hOff] at hIdx; nomatch hIdx
+                | true =>
+                  rw [hOff] at hIdx
+                  injection hIdx with hIdxEq
+                  subst hIdxEq
+                  cases hElem : get? fields offset with
+                  | none => rw [hElem] at hRead; nomatch hRead
+                  | some oldElemVal =>
+                    rw [hElem] at hRead hWrite
+                    dsimp only at hWrite ⊢
+                    cases hSubT :
+                        Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+                          locals oldElemVal rest newVal with
+                    | ub => rw [hSubT] at hWrite; nomatch hWrite
+                    | unsupported => rw [hSubT] at hWrite; nomatch hWrite
+                    | ok updatedElemVal =>
+                      rw [hSubT] at hWrite
+                      have hSubA : evalValueProjWrite locals oldElemVal rest newVal = .ok updatedElemVal :=
+                        (ih locals oldElemVal oldLeaf newVal updatedElemVal hRead).mpr hSubT
+                      rw [hSubA]
+                      exact hWrite
+              | true =>
+                cases hBounds : Bool.and (Nat.ble 1 offset) (Nat.ble offset (length fields)) with
+                | false => rw [hBounds] at hIdx; nomatch hIdx
+                | true =>
+                  rw [hBounds] at hIdx
+                  injection hIdx with hIdxEq
+                  subst hIdxEq
+                  cases hElem : get? fields (Nat.sub (length fields) offset) with
+                  | none => rw [hElem] at hRead; nomatch hRead
+                  | some oldElemVal =>
+                    rw [hElem] at hRead hWrite
+                    dsimp only at hWrite ⊢
+                    cases hSubT :
+                        Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+                          locals oldElemVal rest newVal with
+                    | ub => rw [hSubT] at hWrite; nomatch hWrite
+                    | unsupported => rw [hSubT] at hWrite; nomatch hWrite
+                    | ok updatedElemVal =>
+                      rw [hSubT] at hWrite
+                      have hSubA : evalValueProjWrite locals oldElemVal rest newVal = .ok updatedElemVal :=
+                        (ih locals oldElemVal oldLeaf newVal updatedElemVal hRead).mpr hSubT
+                      rw [hSubA]
+                      exact hWrite
+        | succ _ => nomatch hRead
+      | _ => nomatch hRead
+    | subslice fromIdx toIdx fromEnd =>
+      cases val with
+      | aggregate variantIdx fields =>
+        cases variantIdx with
+        | zero =>
+          dsimp only [evalValueProjRead] at hRead
+          dsimp only [evalValueProjWrite]
+          rw [writeProjectedValue_subslice_zero] at hWrite
+          cases hExt : extractSubslice fields fromIdx toIdx fromEnd with
+          | none => rw [hExt] at hRead; nomatch hRead
+          | some subElems =>
+            rw [hExt] at hRead hWrite
+            dsimp only at hWrite ⊢
+            cases hSubT :
+                Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+                  locals (.aggregate .zero subElems) rest newVal with
+            | ub => rw [hSubT] at hWrite; nomatch hWrite
+            | unsupported => rw [hSubT] at hWrite; nomatch hWrite
+            | ok updatedSubVal =>
+              rw [hSubT] at hWrite
+              have hSubA :
+                  evalValueProjWrite locals (.aggregate .zero subElems) rest newVal =
+                    .ok updatedSubVal :=
+                (ih locals (.aggregate .zero subElems) oldLeaf newVal updatedSubVal hRead).mpr hSubT
+              rw [hSubA]
+              cases updatedSubVal with
+              | aggregate subVar updatedSubElems =>
+                cases subVar <;> exact hWrite
+              | _ => exact hWrite
+        | succ _ => nomatch hRead
+      | _ => nomatch hRead
+    | deref => cases val <;> nomatch hRead
+    | opaqueCast _ => cases val <;> nomatch hRead
+    | unwrapUnsafeBinder _ => cases val <;> nomatch hRead
+
 
 /-! ## Section 2: `CastKind.charToInt` Formalization & `Trusted.MirSemantics.evalRvalue` Correspondence -/
 
@@ -2114,13 +2516,30 @@ theorem evalCharToInt_rejects_invalid
     have hFalse := isValidUnicodeScalar_gt_max_false bits hGt
     simp [evalCharToInt, evalCharToIntByKind, hFalse]
 
+/-- Any `ScalarInt` returned by `evalCharToIntByKind` implies that the input
+codepoint `bits` is a valid Unicode scalar value (both in `isValidUnicodeScalar`
+and in `Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode`). -/
+theorem evalCharToIntByKind_some_implies_valid
+    {bits : Nat}
+    {targetKind : RigidTy}
+    {outSc : ScalarInt}
+    (hEval : evalCharToIntByKind bits targetKind = .some outSc) :
+    isValidUnicodeScalar bits = true ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode bits = true := by
+  unfold evalCharToIntByKind at hEval
+  cases hVal : isValidUnicodeScalar bits with
+  | false => rw [hVal] at hEval; nomatch hEval
+  | true =>
+    exact ⟨rfl, (isValidUnicodeScalar_eq_isValidCharCode bits).symm.trans hVal⟩
+
 /-- **Step Correspondence (`evalCharToInt_trusted_evalRvalue_correspondence`)**:
 In `Runtime(PostCleanup)` MIR, `rustc` lowers `char as Int` to
 `Rvalue.cast .intToInt op targetTy` on an unsigned 4-byte `RigidTy.char` operand.
 Whenever `op` has type `.char` (`operandTy localDecls layouts op = .some { kind := .char, .. }`)
-and evaluates to a valid 4-byte character scalar `.scalar ⟨bits, 4⟩` with
-`isValidUnicodeScalar bits = true`:
-1. If `evalCharToIntByKind bits targetTy.kind = .some outSc`, then
+and evaluates to a 4-byte scalar `.scalar ⟨bits, 4⟩` (without requiring
+`isValidUnicodeScalar bits = true` as an external hypothesis):
+1. If `evalCharToIntByKind bits targetTy.kind = .some outSc`, then `bits` is a
+   valid Unicode scalar value and
    `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue locals (.cast .intToInt op targetTy) mem localDecls layouts = .ok (.scalar outSc) locals' mem`.
 2. Conversely, if `intCastTargetBytes targetTy.kind = .none`, then
    `evalCharToIntByKind bits targetTy.kind = .none` and `evalRvalue` returns `.unsupported`. -/
@@ -2138,10 +2557,10 @@ theorem evalCharToInt_trusted_evalRvalue_correspondence
         .ok (.scalar ⟨bits, 4⟩) locals')
     (hOpTy :
       Trusted.Rustc.V2026_06_01.MirSemantics.operandTy localDecls layouts op =
-        .some { kind := .char, layoutIdx := charLayoutIdx })
-    (hValid : isValidUnicodeScalar bits = true) :
+        .some { kind := .char, layoutIdx := charLayoutIdx }) :
     (∀ outSc : ScalarInt,
       evalCharToIntByKind bits targetTy.kind = .some outSc →
+      isValidUnicodeScalar bits = true ∧
       Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
         locals (.cast .intToInt op targetTy) mem localDecls layouts =
         .ok (.scalar outSc) locals' mem) ∧
@@ -2154,6 +2573,8 @@ theorem evalCharToInt_trusted_evalRvalue_correspondence
     simp [hOpTy]
   refine ⟨?_, ?_⟩
   · intro outSc hCharCast
+    have hValid := (evalCharToIntByKind_some_implies_valid hCharCast).1
+    refine ⟨hValid, ?_⟩
     unfold evalCharToIntByKind at hCharCast
     rw [hValid] at hCharCast
     cases hTarget : intCastTargetBytes targetTy.kind with
@@ -2171,7 +2592,8 @@ theorem evalCharToInt_trusted_evalRvalue_correspondence
   · intro hNone
     refine ⟨?_, ?_⟩
     · unfold evalCharToIntByKind
-      rw [hValid, hNone]
+      rw [hNone]
+      cases isValidUnicodeScalar bits <;> rfl
     · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue]
       rw [hOpEval]
       dsimp only
@@ -2305,8 +2727,9 @@ def orderKeysNonIncreasing : List (Nat × Nat) → Bool
   | _ => true
 
 /-- Lay out the fields `ks` in declaration order starting at byte `off` without
-inserting padding, requiring every field offset to be a multiple of the field's
-alignment; returns the unpadded end offset. -/
+inserting padding, requiring every field alignment to be positive (`al > 0`) and
+every field offset to be a multiple of the field's alignment; returns the unpadded
+end offset. -/
 def tupleDeclOrderAlignedEnd?
     (fieldByteSize fieldAlign : RigidTy → Option Nat) :
     Nat → List RigidTy → Option Nat
@@ -2314,7 +2737,7 @@ def tupleDeclOrderAlignedEnd?
   | off, k :: ks =>
     match fieldByteSize k, fieldAlign k with
     | .some sz, .some al =>
-      match Nat.beq (Nat.mod off al) 0 with
+      match Bool.and (Bool.not (Nat.beq al 0)) (Nat.beq (Nat.mod off al) 0) with
       | true => tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign (Nat.add off sz) ks
       | false => .none
     | _, _ => .none
@@ -2327,8 +2750,9 @@ def rigidTyListAllEq : List RigidTy → Bool
 /-- Tuple-level conditions of `Ty::has_canonical_byte_layout`: the tuple has at
 most one field, or all fields have the same type, or no field contains a niche,
 both the field alignments and alignment-group keys are non-increasing in
-declaration order, every declaration-order field offset is aligned, and the
-unpadded size is a multiple of the tuple alignment (`tupleFieldsAlign`). -/
+declaration order, every declaration-order field offset is aligned (with positive
+field alignments), and the unpadded size is a multiple of the positive tuple
+alignment (`tupleFieldsAlign`). -/
 def tupleDeclOrderIsCanonical
     (fieldByteSize fieldAlign : RigidTy → Option Nat)
     (ks : List RigidTy) : Bool :=
@@ -2343,7 +2767,8 @@ def tupleDeclOrderIsCanonical
       tupleFieldsAlign fieldAlign ks
     with
     | false, .some keys, .some endOff, .some tupleAlign =>
-      Bool.and (orderKeysNonIncreasing keys) (Nat.beq (Nat.mod endOff tupleAlign) 0)
+      Bool.and (orderKeysNonIncreasing keys)
+        (Bool.and (Bool.not (Nat.beq tupleAlign 0)) (Nat.beq (Nat.mod endOff tupleAlign) 0))
     | _, _, _, _ => false
 
 mutual
@@ -2592,8 +3017,9 @@ theorem resolveTupleOffsetOf_single_step_bound
     exact ⟨hLeUnpadded, Nat.le_trans hLeUnpadded hLeAligned⟩
 
 /-- In a padding-free declaration-order layout starting at byte `off`
-(`tupleDeclOrderAlignedEnd?` succeeds), the offset `off + p` of every field
-(`p` = its unpadded prefix sum) is a multiple of that field's alignment. -/
+(`tupleDeclOrderAlignedEnd?` succeeds), every field has a positive alignment
+`0 < a` and the offset `off + p` of every field (`p` = its unpadded prefix sum)
+is a multiple of that field's alignment. -/
 theorem tupleDeclOrderAlignedEnd?_prefix_aligned
     (fieldByteSize fieldAlign : RigidTy → Option Nat) :
     ∀ (fs : List RigidTy) (off i : Nat) (k : RigidTy) (a p e : Nat),
@@ -2601,7 +3027,7 @@ theorem tupleDeclOrderAlignedEnd?_prefix_aligned
       get? fs i = .some k →
       fieldAlign k = .some a →
       sumPrefixFieldSizes fieldByteSize fs i = .some p →
-      (off + p) % a = 0 := by
+      0 < a ∧ (off + p) % a = 0 := by
   intro fs
   induction fs with
   | nil =>
@@ -2618,10 +3044,11 @@ theorem tupleDeclOrderAlignedEnd?_prefix_aligned
       | some a0 =>
         rw [hSz0, hAl0] at hEnd
         dsimp only at hEnd
-        cases hMod : Nat.beq (Nat.mod off a0) 0 with
+        cases hMod : Bool.and (Bool.not (Nat.beq a0 0)) (Nat.beq (Nat.mod off a0) 0) with
         | false => rw [hMod] at hEnd; nomatch hEnd
         | true =>
           rw [hMod] at hEnd
+          have ⟨hNotZ0, hMod0⟩ := Bool.and_eq_true_iff.mp hMod
           cases i with
           | zero =>
             simp only [get?_eq_getElem?, List.getElem?_cons_zero] at hGet
@@ -2633,8 +3060,12 @@ theorem tupleDeclOrderAlignedEnd?_prefix_aligned
             unfold sumPrefixFieldSizes at hPref
             injection hPref with hP
             subst hP
-            have hOff : off % a0 = 0 := Nat.eq_of_beq_eq_true hMod
-            simpa using hOff
+            have hPos0 : 0 < a0 := by
+              cases a0 with
+              | zero => nomatch hNotZ0
+              | succ n => omega
+            have hOff : off % a0 = 0 := Nat.eq_of_beq_eq_true hMod0
+            exact ⟨hPos0, by simpa using hOff⟩
           | succ i' =>
             simp only [get?_eq_getElem?, List.getElem?_cons_succ] at hGet
             unfold sumPrefixFieldSizes at hPref
@@ -2645,10 +3076,10 @@ theorem tupleDeclOrderAlignedEnd?_prefix_aligned
               rw [hRest] at hPref
               injection hPref with hP
               change s0 + p' = p at hP
-              have hIH := ih (Nat.add off s0) i' k a p' e hEnd hGet hAl hRest
+              have ⟨hPos, hIH⟩ := ih (Nat.add off s0) i' k a p' e hEnd hGet hAl hRest
               change (off + s0 + p') % a = 0 at hIH
               rw [← hP, ← Nat.add_assoc]
-              exact hIH
+              exact ⟨hPos, hIH⟩
 
 /-- If consecutive tuple fields are `rigidTyEq` (`rigidTyListAllEq`) and byte
 sizes respect `rigidTyEq`, every field has the byte size of the first field. -/
@@ -2726,17 +3157,95 @@ theorem sumPrefixFieldSizes_uniform
         rw [Nat.succ_mul]
         omega
 
+/-- Core single-step alignment lemma: on any canonical tuple `.tuple tupleFields`,
+the unpadded prefix sum `stepOff` of field `fieldIdx` (of kind `fieldKind` and
+alignment `fieldAlignBytes`) is a multiple of `fieldAlignBytes`. -/
+theorem canonicalTuple_stepOff_aligned
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
+    (tupleFields : List RigidTy)
+    (fieldIdx : FieldIdx)
+    (fieldKind : RigidTy)
+    (stepOff fieldAlignBytes : Nat)
+    (hSizeMulAlign :
+      ∀ k s a, fieldByteSize k = .some s → fieldAlign k = .some a → s % a = 0)
+    (hSizeCongr : ∀ k₁ k₂, rigidTyEq k₁ k₂ = true → fieldByteSize k₁ = fieldByteSize k₂)
+    (hCan : rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields) = true)
+    (hGet : get? tupleFields fieldIdx = .some fieldKind)
+    (hPref : sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx = .some stepOff)
+    (hAlign : fieldAlign fieldKind = .some fieldAlignBytes) :
+    stepOff % fieldAlignBytes = 0 := by
+  have hTupCan : tupleDeclOrderIsCanonical fieldByteSize fieldAlign tupleFields = true := by
+    unfold rigidTyHasCanonicalByteLayout at hCan
+    exact (Bool.and_eq_true_iff.mp hCan).2
+  cases hIdx : fieldIdx with
+  | zero =>
+    subst hIdx
+    cases tupleFields with
+    | nil => nomatch hGet
+    | cons _ _ =>
+      unfold sumPrefixFieldSizes at hPref
+      injection hPref with hP
+      subst hP
+      exact Nat.zero_mod _
+  | succ i' =>
+    subst hIdx
+    unfold tupleDeclOrderIsCanonical at hTupCan
+    cases hLen : Nat.ble (length tupleFields) 1 with
+    | true =>
+      have hLe : tupleFields.length ≤ 1 := Nat.le_of_ble_eq_true hLen
+      have hLt : i' + 1 < tupleFields.length := by
+        simp only [get?_eq_getElem?] at hGet
+        exact (List.getElem?_eq_some_iff.mp hGet).1
+      omega
+    | false =>
+      rw [hLen] at hTupCan
+      cases hAll : rigidTyListAllEq tupleFields with
+      | true =>
+        cases tupleFields with
+        | nil => nomatch hGet
+        | cons hd tl =>
+          unfold sumPrefixFieldSizes at hPref
+          cases hHd : fieldByteSize hd with
+          | none => rw [hHd] at hPref; nomatch hPref
+          | some s =>
+            have hUni : ∀ j k, get? (hd :: tl) j = .some k → fieldByteSize k = .some s := by
+              intro j k hGetJ
+              rw [rigidTyListAllEq_size_eq_head fieldByteSize hSizeCongr tl hd j k hAll hGetJ, hHd]
+            have hKindSz : fieldByteSize fieldKind = .some s := hUni (i' + 1) fieldKind hGet
+            have hSMod : s % fieldAlignBytes = 0 :=
+              hSizeMulAlign fieldKind s fieldAlignBytes hKindSz hAlign
+            have hPrefFull : sumPrefixFieldSizes fieldByteSize (hd :: tl) (i' + 1) = .some stepOff := by
+              unfold sumPrefixFieldSizes
+              exact hPref
+            have hOffMul : stepOff = (i' + 1) * s :=
+              sumPrefixFieldSizes_uniform fieldByteSize s (hd :: tl) (i' + 1) stepOff hUni hPrefFull
+            rw [hOffMul, Nat.mul_mod, hSMod, Nat.mul_zero, Nat.zero_mod]
+      | false =>
+        rw [hAll] at hTupCan
+        dsimp only at hTupCan
+        cases hNiche : rigidTyListContainsNiche tupleFields with
+        | true => rw [hNiche] at hTupCan; nomatch hTupCan
+        | false =>
+          rw [hNiche] at hTupCan
+          cases hKeys : tupleFieldOrderKeys? fieldByteSize fieldAlign tupleFields with
+          | none => rw [hKeys] at hTupCan; nomatch hTupCan
+          | some keys =>
+            rw [hKeys] at hTupCan
+            cases hEnd : tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign 0 tupleFields with
+            | none => rw [hEnd] at hTupCan; nomatch hTupCan
+            | some endOff =>
+              have ⟨_, hAligned⟩ :=
+                tupleDeclOrderAlignedEnd?_prefix_aligned fieldByteSize fieldAlign tupleFields 0 (i' + 1)
+                  fieldKind fieldAlignBytes stepOff endOff hEnd hGet hAlign hPref
+              simpa using hAligned
+
 /-- **Tuple `OffsetOf` Alignment Invariant (`resolveTupleOffsetOf_single_step_aligned`)**:
 Whenever a 1-step `OffsetOf` query `[(0, fieldIdx)]` on `.tuple tupleFields`
 resolves to `off` and the selected field has alignment `fieldAlignBytes`, the
 offset is a multiple of the field alignment (`fieldAlignBytes ∣ off`), provided
 the layout functions are well formed: every resolved size is a multiple of the
-resolved alignment (`hSizeMulAlign`, "the size of a value is always a multiple
-of its alignment") and sizes respect structural type equality (`hSizeCongr`).
-This holds for each of the three canonical-layout cases (at most one field, all
-fields of the same type, or a padding-free alignment-sorted declaration order);
-without the canonical-layout gate it fails, e.g. `(u8, u32)` would place the
-`u32` at the unaligned unpadded offset `1`. -/
+resolved alignment (`hSizeMulAlign`) and sizes respect structural type equality
+(`hSizeCongr`). -/
 theorem resolveTupleOffsetOf_single_step_aligned
     (fieldByteSize fieldAlign : RigidTy → Option Nat)
     (tupleFields : List RigidTy)
@@ -2759,86 +3268,285 @@ theorem resolveTupleOffsetOf_single_step_aligned
     rw [hCan] at hResolve
     nomatch hResolve
   | true =>
-  rw [hCan] at hResolve
-  have h00 : (Nat.beq 0 0 && true) = true := rfl
-  rw [h00] at hResolve
-  cases hPref : sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx with
-  | none => rw [hPref] at hResolve; nomatch hResolve
-  | some stepOff =>
-  rw [hPref] at hResolve
-  dsimp only at hResolve
-  rw [resolveTupleOffsetOf_nil] at hResolve
-  injection hResolve with hOffEq
-  have hStepEq : off = stepOff := by
-    change stepOff + 0 = off at hOffEq
+    rw [hCan] at hResolve
+    have h00 : (Nat.beq 0 0 && true) = true := rfl
+    rw [h00] at hResolve
+    cases hPref : sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx with
+    | none => rw [hPref] at hResolve; nomatch hResolve
+    | some stepOff =>
+      rw [hPref] at hResolve
+      dsimp only at hResolve
+      rw [resolveTupleOffsetOf_nil] at hResolve
+      injection hResolve with hOffEq
+      have hStepEq : off = stepOff := by
+        change stepOff + 0 = off at hOffEq
+        omega
+      subst hStepEq
+      exact canonicalTuple_stepOff_aligned
+        fieldByteSize fieldAlign tupleFields fieldIdx fieldKind off fieldAlignBytes
+        hSizeMulAlign hSizeCongr hCan hGet hPref hAlign
+
+/-- Resolve the leaf `RigidTy` reached by a multi-step `(variantIdx, fieldIdx)`
+tuple projection chain. -/
+def resolveTupleLeafKind : RigidTy → List (VariantIdx × FieldIdx) → Option RigidTy
+  | kind, .nil => .some kind
+  | .tuple tupleFields, (variantIdx, fieldIdx) :: rest =>
+    match Nat.beq variantIdx 0, get? tupleFields fieldIdx with
+    | true, .some childKind => resolveTupleLeafKind childKind rest
+    | _, _ => .none
+  | _, _ :: _ => .none
+
+/-- If `tupleFieldsByteSum fieldByteSize fs = .some totalSz`, every in-bounds
+field `get? fs idx = .some childKind` has a defined byte size. -/
+theorem tupleFieldsByteSum_get?_some
+    (fieldByteSize : RigidTy → Option Nat) :
+    ∀ (fs : List RigidTy) (idx : Nat) (childKind : RigidTy) (totalSz : Nat),
+      tupleFieldsByteSum fieldByteSize fs = .some totalSz →
+      get? fs idx = .some childKind →
+      ∃ childSz, fieldByteSize childKind = .some childSz := by
+  intro fs
+  induction fs with
+  | nil =>
+    intro idx _ _ _ hGet
+    nomatch hGet
+  | cons k rest ih =>
+    intro idx childKind totalSz hSum hGet
+    unfold tupleFieldsByteSum at hSum
+    cases hK : fieldByteSize k with
+    | none => rw [hK] at hSum; nomatch hSum
+    | some szK =>
+      cases hRest : tupleFieldsByteSum fieldByteSize rest with
+      | none => rw [hK, hRest] at hSum; nomatch hSum
+      | some restSz =>
+        cases idx with
+        | zero =>
+          simp only [get?_eq_getElem?, List.getElem?_cons_zero] at hGet
+          injection hGet with hEq
+          subst hEq
+          exact ⟨szK, hK⟩
+        | succ idx' =>
+          simp only [get?_eq_getElem?, List.getElem?_cons_succ] at hGet
+          exact ih idx' childKind restSz hRest hGet
+
+/-- **Multi-Step Tuple `OffsetOf` Upper-Bound Theorem (`resolveTupleOffsetOf_multi_step_bound`)**:
+For any multi-step `OffsetOf` path `path : List (VariantIdx × FieldIdx)` from
+`rootKind` reaching `leafKind`, whenever every canonical tuple's byte size is at
+least the unpadded sum of its field byte sizes (`hTupleSumLe`), the cumulative
+byte offset `off` plus the leaf field size `leafSz` never exceeds the root
+container size `rootSz`: `off + leafSz ≤ rootSz`. -/
+theorem resolveTupleOffsetOf_multi_step_bound
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
+    (hTupleSumLe :
+      ∀ fs tSz,
+        rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple fs) = true →
+        fieldByteSize (.tuple fs) = .some tSz →
+        ∃ totalUnpadded,
+          tupleFieldsByteSum fieldByteSize fs = .some totalUnpadded ∧
+          totalUnpadded ≤ tSz) :
+    ∀ (path : List (VariantIdx × FieldIdx)) (rootKind leafKind : RigidTy)
+      (off rootSz leafSz : Nat),
+      resolveTupleOffsetOf fieldByteSize fieldAlign rootKind path = .some off →
+      resolveTupleLeafKind rootKind path = .some leafKind →
+      fieldByteSize rootKind = .some rootSz →
+      fieldByteSize leafKind = .some leafSz →
+      off + leafSz ≤ rootSz := by
+  intro path
+  induction path with
+  | nil =>
+    intro rootKind leafKind off rootSz leafSz hRes hLeaf hRootSz hLeafSz
+    rw [resolveTupleOffsetOf_nil] at hRes
+    injection hRes with hOffZero
+    subst hOffZero
+    unfold resolveTupleLeafKind at hLeaf
+    injection hLeaf with hKindEq
+    subst hKindEq
+    rw [hRootSz] at hLeafSz
+    injection hLeafSz with hSzEq
     omega
-  subst hStepEq
-  have hTupCan : tupleDeclOrderIsCanonical fieldByteSize fieldAlign tupleFields = true := by
-    unfold rigidTyHasCanonicalByteLayout at hCan
-    exact (Bool.and_eq_true_iff.mp hCan).2
-  -- `fieldIdx = 0` always resolves to offset `0`.
-  cases hIdx : fieldIdx with
-  | zero =>
-    subst hIdx
-    cases tupleFields with
-    | nil => nomatch hGet
-    | cons _ _ =>
-      unfold sumPrefixFieldSizes at hPref
-      injection hPref with hP
-      subst hP
-      exact Nat.zero_mod _
-  | succ i' =>
-  subst hIdx
-  unfold tupleDeclOrderIsCanonical at hTupCan
-  cases hLen : Nat.ble (length tupleFields) 1 with
-  | true =>
-    -- At most one field: index `i' + 1` cannot be in bounds.
-    have hLe : tupleFields.length ≤ 1 := Nat.le_of_ble_eq_true hLen
-    have hLt : i' + 1 < tupleFields.length := by
-      simp only [get?_eq_getElem?] at hGet
-      exact (List.getElem?_eq_some_iff.mp hGet).1
-    omega
-  | false =>
-  rw [hLen] at hTupCan
-  cases hAll : rigidTyListAllEq tupleFields with
-  | true =>
-    -- All fields share one type: `off = (i' + 1) * size` and `align ∣ size`.
-    cases tupleFields with
-    | nil => nomatch hGet
-    | cons hd tl =>
-      unfold sumPrefixFieldSizes at hPref
-      cases hHd : fieldByteSize hd with
-      | none => rw [hHd] at hPref; nomatch hPref
-      | some s =>
-        have hUni : ∀ j k, get? (hd :: tl) j = .some k → fieldByteSize k = .some s := by
-          intro j k hGetJ
-          rw [rigidTyListAllEq_size_eq_head fieldByteSize hSizeCongr tl hd j k hAll hGetJ, hHd]
-        have hKindSz : fieldByteSize fieldKind = .some s := hUni (i' + 1) fieldKind hGet
-        have hSMod : s % fieldAlignBytes = 0 := hSizeMulAlign fieldKind s fieldAlignBytes hKindSz hAlign
-        have hPrefFull : sumPrefixFieldSizes fieldByteSize (hd :: tl) (i' + 1) = .some off := by
-          unfold sumPrefixFieldSizes
-          exact hPref
-        have hOffMul : off = (i' + 1) * s :=
-          sumPrefixFieldSizes_uniform fieldByteSize s (hd :: tl) (i' + 1) off hUni hPrefFull
-        rw [hOffMul, Nat.mul_mod, hSMod, Nat.mul_zero, Nat.zero_mod]
-  | false =>
-  rw [hAll] at hTupCan
-  dsimp only at hTupCan
-  cases hNiche : rigidTyListContainsNiche tupleFields with
-  | true => rw [hNiche] at hTupCan; nomatch hTupCan
-  | false =>
-  rw [hNiche] at hTupCan
-  cases hKeys : tupleFieldOrderKeys? fieldByteSize fieldAlign tupleFields with
-  | none => rw [hKeys] at hTupCan; nomatch hTupCan
-  | some keys =>
-  rw [hKeys] at hTupCan
-  cases hEnd : tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign 0 tupleFields with
-  | none => rw [hEnd] at hTupCan; nomatch hTupCan
-  | some endOff =>
-  have hAligned :=
-    tupleDeclOrderAlignedEnd?_prefix_aligned fieldByteSize fieldAlign tupleFields 0 (i' + 1)
-      fieldKind fieldAlignBytes off endOff hEnd hGet hAlign hPref
-  simpa using hAligned
+  | cons step rest ih =>
+    rcases step with ⟨variantIdx, fieldIdx⟩
+    intro rootKind leafKind off rootSz leafSz hRes hLeaf hRootSz hLeafSz
+    cases rootKind with
+    | tuple tupleFields =>
+      unfold resolveTupleOffsetOf at hRes
+      unfold resolveTupleLeafKind at hLeaf
+      cases hVar : Nat.beq variantIdx 0 with
+      | false => rw [hVar] at hRes; nomatch hRes
+      | true =>
+        cases hCan : rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields) with
+        | false => rw [hVar, hCan] at hRes; nomatch hRes
+        | true =>
+          rw [hVar, hCan, Bool.and_self] at hRes
+          rw [hVar] at hLeaf
+          cases hGet : get? tupleFields fieldIdx with
+          | none => rw [hGet] at hRes; nomatch hRes
+          | some childKind =>
+            rw [hGet] at hRes hLeaf
+            cases hPref : sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx with
+            | none => rw [hPref] at hRes; nomatch hRes
+            | some stepOff =>
+              rw [hPref] at hRes
+              dsimp only at hRes
+              cases hSub : resolveTupleOffsetOf fieldByteSize fieldAlign childKind rest with
+              | none => rw [hSub] at hRes; nomatch hRes
+              | some tailOff =>
+                rw [hSub] at hRes
+                injection hRes with hOffEq
+                change stepOff + tailOff = off at hOffEq
+                obtain ⟨totalUnpadded, hSum, hUnpadLe⟩ :=
+                  hTupleSumLe tupleFields rootSz hCan hRootSz
+                obtain ⟨childSz, hChildSz⟩ :=
+                  tupleFieldsByteSum_get?_some fieldByteSize tupleFields fieldIdx childKind
+                    totalUnpadded hSum hGet
+                have hStepBound :=
+                  sumPrefixFieldSizes_add_field_le_tupleFieldsByteSum
+                    fieldByteSize tupleFields fieldIdx childKind stepOff childSz totalUnpadded
+                    hGet hChildSz hPref hSum
+                have hTailBound :=
+                  ih childKind leafKind tailOff childSz leafSz hSub hLeaf hChildSz hLeafSz
+                omega
+    | _ => nomatch hRes
+
+private theorem nat_mod_trans {x b a : Nat} (hxb : x % b = 0) (hba : b % a = 0) :
+    x % a = 0 :=
+  Nat.mod_eq_zero_of_dvd (Nat.dvd_trans (Nat.dvd_of_mod_eq_zero hba) (Nat.dvd_of_mod_eq_zero hxb))
+
+/-- Along any resolved tuple path `path` from `rootKind` to `leafKind`, if every
+tuple's alignment is a multiple of each of its fields' alignments
+(`hTupleAlignDiv`), then the root container's alignment is a multiple of the
+leaf field's alignment (`rootAl % leafAl = 0`). -/
+theorem resolveTupleLeafKind_align_dvd
+    (fieldAlign : RigidTy → Option Nat)
+    (hTupleAlignDiv :
+      ∀ fs idx ck,
+        get? fs idx = .some ck →
+        ∃ aC, fieldAlign ck = .some aC ∧
+          ∀ aT, fieldAlign (.tuple fs) = .some aT → aT % aC = 0) :
+    ∀ (path : List (VariantIdx × FieldIdx)) (rootKind leafKind : RigidTy)
+      (rootAl leafAl : Nat),
+      resolveTupleLeafKind rootKind path = .some leafKind →
+      fieldAlign rootKind = .some rootAl →
+      fieldAlign leafKind = .some leafAl →
+      rootAl % leafAl = 0 := by
+  intro path
+  induction path with
+  | nil =>
+    intro rootKind leafKind rootAl leafAl hLeaf hRootAl hLeafAl
+    unfold resolveTupleLeafKind at hLeaf
+    injection hLeaf with hEq
+    subst hEq
+    rw [hRootAl] at hLeafAl
+    injection hLeafAl with hAlEq
+    subst hAlEq
+    exact Nat.mod_self _
+  | cons step rest ih =>
+    rcases step with ⟨variantIdx, fieldIdx⟩
+    intro rootKind leafKind rootAl leafAl hLeaf hRootAl hLeafAl
+    cases rootKind with
+    | tuple tupleFields =>
+      unfold resolveTupleLeafKind at hLeaf
+      cases hVar : Nat.beq variantIdx 0 with
+      | false => rw [hVar] at hLeaf; nomatch hLeaf
+      | true =>
+        cases hGet : get? tupleFields fieldIdx with
+        | none => rw [hVar, hGet] at hLeaf; nomatch hLeaf
+        | some childKind =>
+          rw [hVar, hGet] at hLeaf
+          dsimp only at hLeaf
+          obtain ⟨childAl, hChildAl, hDivRoot⟩ := hTupleAlignDiv tupleFields fieldIdx childKind hGet
+          have hRootChild : rootAl % childAl = 0 := hDivRoot rootAl hRootAl
+          have hChildLeaf : childAl % leafAl = 0 :=
+            ih childKind leafKind childAl leafAl hLeaf hChildAl hLeafAl
+          exact nat_mod_trans hRootChild hChildLeaf
+    | _ => nomatch hLeaf
+
+/-- **Multi-Step Tuple `OffsetOf` Alignment Theorem (`resolveTupleOffsetOf_multi_step_aligned`)**:
+For any multi-step `OffsetOf` path `path : List (VariantIdx × FieldIdx)` from
+`rootKind` reaching `leafKind` with byte offset `off` and leaf alignment
+`leafAlignBytes`, the cumulative offset `off` is a multiple of `leafAlignBytes`
+(`off % leafAlignBytes = 0`). -/
+theorem resolveTupleOffsetOf_multi_step_aligned
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
+    (hSizeMulAlign :
+      ∀ k s a, fieldByteSize k = .some s → fieldAlign k = .some a → s % a = 0)
+    (hSizeCongr : ∀ k₁ k₂, rigidTyEq k₁ k₂ = true → fieldByteSize k₁ = fieldByteSize k₂)
+    (hTupleAlignDiv :
+      ∀ fs idx ck,
+        get? fs idx = .some ck →
+        ∃ aC, fieldAlign ck = .some aC ∧
+          ∀ aT, fieldAlign (.tuple fs) = .some aT → aT % aC = 0) :
+    ∀ (path : List (VariantIdx × FieldIdx)) (rootKind leafKind : RigidTy)
+      (off leafAlignBytes : Nat),
+      resolveTupleOffsetOf fieldByteSize fieldAlign rootKind path = .some off →
+      resolveTupleLeafKind rootKind path = .some leafKind →
+      fieldAlign leafKind = .some leafAlignBytes →
+      off % leafAlignBytes = 0 := by
+  intro path
+  induction path with
+  | nil =>
+    intro rootKind leafKind off leafAlignBytes hRes _ _
+    rw [resolveTupleOffsetOf_nil] at hRes
+    injection hRes with hOffZero
+    subst hOffZero
+    exact Nat.zero_mod _
+  | cons step rest ih =>
+    rcases step with ⟨variantIdx, fieldIdx⟩
+    intro rootKind leafKind off leafAlignBytes hRes hLeaf hLeafAl
+    cases rootKind with
+    | tuple tupleFields =>
+      unfold resolveTupleOffsetOf at hRes
+      unfold resolveTupleLeafKind at hLeaf
+      cases hVar : Nat.beq variantIdx 0 with
+      | false => rw [hVar] at hRes; nomatch hRes
+      | true =>
+        cases hCan : rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields) with
+        | false => rw [hVar, hCan] at hRes; nomatch hRes
+        | true =>
+          rw [hVar, hCan, Bool.and_self] at hRes
+          rw [hVar] at hLeaf
+          cases hGet : get? tupleFields fieldIdx with
+          | none => rw [hGet] at hRes; nomatch hRes
+          | some childKind =>
+            rw [hGet] at hRes hLeaf
+            cases hPref : sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx with
+            | none => rw [hPref] at hRes; nomatch hRes
+            | some stepOff =>
+              rw [hPref] at hRes
+              dsimp only at hRes
+              cases hSub : resolveTupleOffsetOf fieldByteSize fieldAlign childKind rest with
+              | none => rw [hSub] at hRes; nomatch hRes
+              | some tailOff =>
+                rw [hSub] at hRes
+                injection hRes with hOffEq
+                change stepOff + tailOff = off at hOffEq
+                obtain ⟨childAl, hChildAl, _⟩ := hTupleAlignDiv tupleFields fieldIdx childKind hGet
+                have hStepChild : stepOff % childAl = 0 :=
+                  canonicalTuple_stepOff_aligned
+                    fieldByteSize fieldAlign tupleFields fieldIdx childKind stepOff childAl
+                    hSizeMulAlign hSizeCongr hCan hGet hPref hChildAl
+                have hChildLeaf : childAl % leafAlignBytes = 0 :=
+                  resolveTupleLeafKind_align_dvd fieldAlign hTupleAlignDiv
+                    rest childKind leafKind childAl leafAlignBytes hLeaf hChildAl hLeafAl
+                have hStepLeaf : stepOff % leafAlignBytes = 0 :=
+                  nat_mod_trans hStepChild hChildLeaf
+                have hTailLeaf : tailOff % leafAlignBytes = 0 :=
+                  ih childKind leafKind tailOff leafAlignBytes hSub hLeaf hLeafAl
+                rw [← hOffEq, Nat.add_mod, hStepLeaf, hTailLeaf, Nat.zero_mod]
+    | _ => nomatch hRes
+
+/-- Multi-step regression (`rustc 1.98`: `offset_of!(((u32, u16, u16), (u16, u16)), 1.1) = 10`):
+nested canonical tuple offset resolves to outer prefix `8` + inner prefix `2` = `10`,
+while a nested padded inner tuple `((u32, u32), (u8, u32))` fails closed (`.none`). -/
+example :
+    resolveTupleOffsetOf (intrinsicRigidTyByteSize .nil emptyLayoutTable)
+      (intrinsicRigidTyAlign .nil emptyLayoutTable)
+      (.tuple [.tuple [.uint .u32, .uint .u16, .uint .u16], .tuple [.uint .u16, .uint .u16]])
+      [(0, 1), (0, 1)] = .some 10 ∧
+    resolveTupleOffsetOf (intrinsicRigidTyByteSize .nil emptyLayoutTable)
+      (intrinsicRigidTyAlign .nil emptyLayoutTable)
+      (.tuple [.tuple [.uint .u32, .uint .u32], .tuple [.uint .u8, .uint .u32]])
+      [(0, 1), (0, 1)] = .none := by
+  exact ⟨rfl, rfl⟩
 
 /-- Prefix field offsets are monotonically increasing in `fieldIdx`: if `i <= j`
 and both `sumPrefixFieldSizes` calls succeed, then `offI <= offJ`. -/
@@ -3430,8 +4138,93 @@ theorem tryIntoValue?_of_all_init
   · rw [hTagged]
     cases shell.isAdt <;> rfl
 
+/-- Exact bidirectional characterization of `tryFieldsIntoValues?`:
+`tryFieldsIntoValues? slots = .some vals` if and only if `slots = vals.map FieldSlot.init`. -/
+theorem tryFieldsIntoValues?_eq_some_iff :
+    ∀ (slots : List FieldSlot) (vals : List Value),
+      tryFieldsIntoValues? slots = .some vals ↔ slots = vals.map FieldSlot.init := by
+  intro slots
+  induction slots with
+  | nil =>
+    intro vals
+    constructor
+    · intro h
+      unfold tryFieldsIntoValues? at h
+      injection h with hEq
+      subst hEq
+      rfl
+    · intro h
+      cases vals with
+      | nil => rfl
+      | cons _ _ => nomatch h
+  | cons hd tl ih =>
+    intro vals
+    constructor
+    · intro h
+      cases hd with
+      | uninit => nomatch h
+      | nested _ _ _ _ => nomatch h
+      | init v =>
+        unfold tryFieldsIntoValues? at h
+        cases hSub : tryFieldsIntoValues? tl with
+        | none => rw [hSub] at h; nomatch h
+        | some vs =>
+          rw [hSub] at h
+          injection h with hVals
+          subst hVals
+          have hTl := (ih vs).mp hSub
+          simp [hTl]
+    · intro h
+      cases vals with
+      | nil => nomatch h
+      | cons v vs =>
+        simp only [List.map_cons, List.cons.injEq] at h
+        rcases h with ⟨rfl, rfl⟩
+        exact tryFieldsIntoValues?_map_init (v :: vs)
+
+/-- **Order-Independent `n`-Field Promotion Equivalence (`tryIntoValue?_eq_some_iff`)**:
+For any `PartialAggregate` shell of arbitrary arity `n`, `shell.tryIntoValue? = .some outVal`
+if and only if either `shell.isAdt = false` or `shell.discriminantSet = true`, and
+there exists `vals : List Value` such that `shell.fields = vals.map FieldSlot.init`
+and `outVal = .aggregate (if shell.isAdt then shell.variantIdx else 0) vals`. -/
+theorem tryIntoValue?_eq_some_iff (shell : PartialAggregate) (outVal : Value) :
+    shell.tryIntoValue? = .some outVal ↔
+      (shell.isAdt = false ∨ shell.discriminantSet = true) ∧
+      ∃ vals : List Value,
+        shell.fields = vals.map FieldSlot.init ∧
+        outVal = .aggregate (match shell.isAdt with | true => shell.variantIdx | false => 0) vals := by
+  constructor
+  · intro hProm
+    unfold PartialAggregate.tryIntoValue? at hProm
+    cases hBlock : Bool.and shell.isAdt (Bool.not shell.discriminantSet) with
+    | true => rw [hBlock] at hProm; nomatch hProm
+    | false =>
+      rw [hBlock] at hProm
+      dsimp only at hProm
+      cases hTry : tryFieldsIntoValues? shell.fields with
+      | none => rw [hTry] at hProm; nomatch hProm
+      | some vals =>
+        rw [hTry] at hProm
+        injection hProm with hOutEq
+        have hTagOk : shell.isAdt = false ∨ shell.discriminantSet = true := by
+          cases hA : shell.isAdt with
+          | false => exact Or.inl rfl
+          | true =>
+            cases hD : shell.discriminantSet with
+            | true => exact Or.inr rfl
+            | false => rw [hA, hD] at hBlock; nomatch hBlock
+        exact ⟨hTagOk, vals, (tryFieldsIntoValues?_eq_some_iff shell.fields vals).mp hTry, hOutEq.symm⟩
+  · rintro ⟨hTagOk, vals, hFields, rfl⟩
+    exact tryIntoValue?_of_all_init shell vals hFields hTagOk
+
+/-- Convert a `PartialAggregate` shell to a `FieldSlot.nested` slot. -/
+@[reducible]
+def PartialAggregate.toFieldSlot (shell : PartialAggregate) : FieldSlot :=
+  .nested shell.variantIdx shell.isAdt shell.discriminantSet shell.fields
+
 /-- Read a projected value from a `PartialAggregate` shell (`read_from_partial_shell`
-in `crates/anneal-mir/src/lower/rvalue.rs`). -/
+and `project_from_partial_shell` in `crates/anneal-mir/src/lower/rvalue.rs`),
+recursing into `.nested` child shells along `proj`. -/
 def readFromPartialShell
     (locals : List LocalSlot)
     (shell : PartialAggregate)
@@ -3450,8 +4243,9 @@ def readFromPartialShell
       | .field idx _ :: tail =>
         match get? shell.fields idx with
         | .some (.init fieldVal) => evalValueProjRead locals fieldVal tail
+        | .some (.nested cVar cAdt cDisc cFields) =>
+          readFromPartialShell locals ⟨cVar, cAdt, cDisc, cFields⟩ tail
         | .some .uninit => .ub
-        | .some (.nested _ _ _ _) => .ub
         | .none => .ub
       | _ => .ub
     | false => .ub
@@ -3461,8 +4255,9 @@ def readFromPartialShell
     | true =>
       match get? shell.fields idx with
       | .some (.init fieldVal) => evalValueProjRead locals fieldVal rest
+      | .some (.nested cVar cAdt cDisc cFields) =>
+        readFromPartialShell locals ⟨cVar, cAdt, cDisc, cFields⟩ rest
       | .some .uninit => .ub
-      | .some (.nested _ _ _ _) => .ub
       | .none => .ub
     | false => .ub
   | .index _ :: _ => .ub
@@ -3506,6 +4301,440 @@ theorem readFromPartialShell_uninit_sibling_soundness
     dsimp only
     rw [hInitSlot]
     exact hSubRead
+
+/-- **Nested Partial-Shell Read Soundness (`readFromPartialShell_nested_soundness`)**:
+When field `outerIdx` of an outer `PartialAggregate` shell holds a nested
+`PartialAggregate` child shell `childShell` (`FieldSlot.nested`), reading an
+initialized leaf `initChildIdx` inside `childShell` succeeds with `.ok outVal`,
+while reading an uninitialized sibling `uninitChildIdx` inside `childShell` or
+reading the incomplete `childShell` as a whole (`proj = [.field outerIdx tyO]`)
+faults with `.ub`. -/
+theorem readFromPartialShell_nested_soundness
+    (locals : List LocalSlot)
+    (outerShell childShell : PartialAggregate)
+    (outerIdx uninitChildIdx initChildIdx : FieldIdx)
+    (tyO tyU tyI : Ty)
+    (rest : List ProjectionElem)
+    (v outVal : Value)
+    (hOuterVar0 : (match outerShell.isAdt with | true => outerShell.variantIdx | false => 0) = 0)
+    (hChildVar0 : (match childShell.isAdt with | true => childShell.variantIdx | false => 0) = 0)
+    (hNestedSlot : get? outerShell.fields outerIdx = .some childShell.toFieldSlot)
+    (hChildUninit : get? childShell.fields uninitChildIdx = .some .uninit)
+    (hChildInit : get? childShell.fields initChildIdx = .some (.init v))
+    (hSubRead : evalValueProjRead locals v rest = .ok outVal) :
+    readFromPartialShell locals outerShell [.field outerIdx tyO] = .ub ∧
+    readFromPartialShell locals outerShell
+      (.field outerIdx tyO :: .field uninitChildIdx tyU :: rest) = .ub ∧
+    readFromPartialShell locals outerShell
+      (.field outerIdx tyO :: .field initChildIdx tyI :: rest) = .ok outVal := by
+  have hChildSub :=
+    readFromPartialShell_uninit_sibling_soundness
+      locals childShell uninitChildIdx initChildIdx tyU tyI rest v outVal
+      hChildVar0 hChildUninit hChildInit hSubRead
+  refine ⟨?_, ?_, ?_⟩
+  · unfold readFromPartialShell
+    rw [hOuterVar0]
+    dsimp only
+    rw [hNestedSlot]
+    exact hChildSub.1
+  · unfold readFromPartialShell
+    rw [hOuterVar0]
+    dsimp only
+    rw [hNestedSlot]
+    exact hChildSub.2.1
+  · unfold readFromPartialShell
+    rw [hOuterVar0]
+    dsimp only
+    rw [hNestedSlot]
+    exact hChildSub.2.2
+
+/-- Outcome of a stateful partial-slot or frame mutation (`write_to_partial_slot`,
+`set_discriminant_in_slot`, `eval_lowered_statement`). -/
+inductive SlotWriteResult (α : Type) : Type where
+  | ok : α → SlotWriteResult α
+  | ub : SlotWriteResult α
+  | unsupported : SlotWriteResult α
+
+/-- Promote a `PartialAggregate` shell to `FieldSlot.init` if all fields (and
+enum discriminant tag, if `isAdt = true`) are initialized, or keep it as
+`FieldSlot.nested` otherwise. -/
+def promoteShellToFieldSlot (shell : PartialAggregate) : FieldSlot :=
+  match shell.tryIntoValue? with
+  | .some fullVal => .init fullVal
+  | .none => shell.toFieldSlot
+
+/-- Convert a `FieldSlot` back to `LocalSlotState`, promoting any completed
+`FieldSlot.nested` shell to `LocalSlotState.init`. -/
+def fieldSlotToLocalSlotState : FieldSlot → LocalSlotState
+  | .uninit => .uninit
+  | .init v => .init v
+  | .nested vIdx isAdt discSet fields =>
+    let shell : PartialAggregate := ⟨vIdx, isAdt, discSet, fields⟩
+    match shell.tryIntoValue? with
+    | .some fullVal => .init fullVal
+    | .none => .partialShell shell
+
+/-- Recursive `D13b` partial-slot writer (`write_to_partial_slot` in
+`crates/anneal-mir/src/lower/rvalue.rs:5177-5371`):
+- On `proj = .nil`: overwrites `slot` with `.init newVal`.
+- On `slot = .init existingVal`: delegates to `evalValueProjWrite locals existingVal proj newVal`.
+- On `slot = .uninit` + `.field idx fieldTy :: rest`: materializes
+  `PartialAggregate.newUninit fieldCount 0 false` (for `arityOf containerTy 0 false = .some fieldCount`),
+  recurses on child `idx`, and promotes bottom-up via `promoteShellToFieldSlot`.
+- On `slot = .uninit` + `.downcast _ variantIdx :: .field idx fieldTy :: tail`:
+  materializes `PartialAggregate.newUninit fieldCount variantIdx true` (`discriminantSet = false`),
+  recurses on child `idx`, and promotes bottom-up.
+- On `slot = .nested ...` + `.field` or `.downcast :: .field`: checks that the
+  active variant matches, recurses into child slot `idx`, updates `fields[idx]`,
+  and promotes bottom-up via `promoteShellToFieldSlot`.
+- On `slot = .uninit` or `.nested` + `.index` / `.constantIndex` / `.subslice`:
+  faults with `.ub` (`c6d2ad74`, never materializing an array shell). -/
+def writeToFieldSlot
+    (locals : List LocalSlot)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (slot : FieldSlot)
+    (containerTy : Ty) :
+    List ProjectionElem → Value → SlotWriteResult FieldSlot
+  | .nil, newVal => .ok (.init newVal)
+  | p :: rest, newVal =>
+    match slot with
+    | .init existingVal =>
+      match evalValueProjWrite locals existingVal (p :: rest) newVal with
+      | .ok updatedVal => .ok (.init updatedVal)
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .uninit =>
+      match p with
+      | .field idx fieldTy =>
+        match arityOf containerTy 0 false with
+        | .some fieldCount =>
+          match Nat.blt idx fieldCount with
+          | true =>
+            match writeToFieldSlot locals arityOf .uninit fieldTy rest newVal with
+            | .ok childSlot =>
+              let initShell := PartialAggregate.newUninit fieldCount 0 false
+              match set? initShell.fields idx childSlot with
+              | .some fields' =>
+                .ok (promoteShellToFieldSlot { initShell with fields := fields' })
+              | .none => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | false => .ub
+        | .none => .ub
+      | .downcast _ variantIdx =>
+        match rest with
+        | .field idx fieldTy :: tail =>
+          match arityOf containerTy variantIdx true with
+          | .some fieldCount =>
+            match Nat.blt idx fieldCount with
+            | true =>
+              match writeToFieldSlot locals arityOf .uninit fieldTy tail newVal with
+              | .ok childSlot =>
+                let initShell := PartialAggregate.newUninit fieldCount variantIdx true
+                match set? initShell.fields idx childSlot with
+                | .some fields' =>
+                  .ok (promoteShellToFieldSlot { initShell with fields := fields' })
+                | .none => .ub
+              | .ub => .ub
+              | .unsupported => .unsupported
+            | false => .ub
+          | .none => .ub
+        | .deref :: _ => .unsupported
+        | .opaqueCast _ :: _ => .unsupported
+        | .unwrapUnsafeBinder _ :: _ => .unsupported
+        | _ => .ub
+      | .index _ => .ub
+      | .constantIndex _ _ _ => .ub
+      | .subslice _ _ _ => .ub
+      | .deref => .unsupported
+      | .opaqueCast _ => .unsupported
+      | .unwrapUnsafeBinder _ => .unsupported
+    | .nested sVar sAdt sDisc sFields =>
+      let actual := match sAdt with | true => sVar | false => 0
+      match p with
+      | .field idx fieldTy =>
+        match Nat.beq actual 0, get? sFields idx with
+        | true, .some oldChildSlot =>
+          match writeToFieldSlot locals arityOf oldChildSlot fieldTy rest newVal with
+          | .ok newChildSlot =>
+            match set? sFields idx newChildSlot with
+            | .some fields' =>
+              .ok (promoteShellToFieldSlot ⟨sVar, sAdt, sDisc, fields'⟩)
+            | .none => .ub
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | _, _ => .ub
+      | .downcast _ variantIdx =>
+        match rest with
+        | .field idx fieldTy :: tail =>
+          match Nat.beq actual variantIdx, get? sFields idx with
+          | true, .some oldChildSlot =>
+            match writeToFieldSlot locals arityOf oldChildSlot fieldTy tail newVal with
+            | .ok newChildSlot =>
+              match set? sFields idx newChildSlot with
+              | .some fields' =>
+                .ok (promoteShellToFieldSlot ⟨sVar, sAdt, sDisc, fields'⟩)
+              | .none => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | _, _ => .ub
+        | .deref :: _ => .unsupported
+        | .opaqueCast _ :: _ => .unsupported
+        | .unwrapUnsafeBinder _ :: _ => .unsupported
+        | _ => .ub
+      | .index _ => .ub
+      | .constantIndex _ _ _ => .ub
+      | .subslice _ _ _ => .ub
+      | .deref => .unsupported
+      | .opaqueCast _ => .unsupported
+      | .unwrapUnsafeBinder _ => .unsupported
+
+/-- Canonical tuple arity function extracting `fieldTys.length` from
+`ty.kind = .tuple fieldTys` for non-ADT variant `0`. -/
+def tupleArityOf (ty : Ty) (variantIdx : VariantIdx) (isAdt : Bool) : Option Nat :=
+  match isAdt, Nat.beq variantIdx 0, ty.kind with
+  | false, true, .tuple fieldTys => .some fieldTys.length
+  | _, _, _ => .none
+
+/-- **`c6d2ad74` Array Write Rejection on Uninit / Partial Shells (`writeToFieldSlot_array_proj_ub`)**:
+Writing along `.index`, `.constantIndex`, or `.subslice` into an `.uninit` or
+`.nested` partial-shell slot always faults with `.ub`. -/
+theorem writeToFieldSlot_array_proj_ub
+    (locals : List LocalSlot)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (slot : FieldSlot)
+    (containerTy : Ty)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (newVal : Value)
+    (hNotInit : ∀ v, slot ≠ .init v)
+    (hArrProj :
+      (∃ idxLocal, proj = .index idxLocal) ∨
+      (∃ offset minLen fromEnd, proj = .constantIndex offset minLen fromEnd) ∨
+      (∃ fromIdx toIdx fromEnd, proj = .subslice fromIdx toIdx fromEnd)) :
+    writeToFieldSlot locals arityOf slot containerTy (proj :: rest) newVal = .ub := by
+  cases slot with
+  | init v => exact False.elim (hNotInit v rfl)
+  | uninit =>
+    rcases hArrProj with ⟨_, rfl⟩ | ⟨_, _, _, rfl⟩ | ⟨_, _, _, rfl⟩ <;> rfl
+  | nested _ _ _ _ =>
+    rcases hArrProj with ⟨_, rfl⟩ | ⟨_, _, _, rfl⟩ | ⟨_, _, _, rfl⟩ <;> rfl
+
+/-- On an initialized slot `.init existingVal`, `writeToFieldSlot` delegates
+directly to `evalValueProjWrite` (and therefore refines Trusted's
+`writeProjectedValue`). -/
+theorem writeToFieldSlot_init_correspondence
+    (locals : List LocalSlot)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (existingVal newVal updatedVal : Value)
+    (containerTy : Ty)
+    (proj : List ProjectionElem) :
+    (writeToFieldSlot locals arityOf (.init existingVal) containerTy proj newVal =
+      .ok (.init updatedVal) ↔
+      evalValueProjWrite locals existingVal proj newVal = .ok updatedVal) ∧
+    (writeToFieldSlot locals arityOf (.init existingVal) containerTy proj newVal =
+      .ok (.init updatedVal) →
+      Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+        locals existingVal proj newVal = .ok updatedVal) := by
+  have hIff :
+      writeToFieldSlot locals arityOf (.init existingVal) containerTy proj newVal =
+        .ok (.init updatedVal) ↔
+        evalValueProjWrite locals existingVal proj newVal = .ok updatedVal := by
+    cases proj with
+    | nil =>
+      constructor
+      · intro h
+        unfold writeToFieldSlot at h
+        injection h with hInit
+        injection hInit with hVal
+        subst hVal
+        rfl
+      · intro h
+        unfold evalValueProjWrite at h
+        injection h with hVal
+        subst hVal
+        rfl
+    | cons p rest =>
+      unfold writeToFieldSlot
+      dsimp only
+      cases evalValueProjWrite locals existingVal (p :: rest) newVal with
+      | ok v' =>
+        constructor
+        · intro h
+          injection h with hInit
+          injection hInit with hEq
+          rw [hEq]
+        · intro h
+          injection h with hEq
+          rw [hEq]
+      | ub =>
+        constructor <;> (intro h; nomatch h)
+      | unsupported =>
+        constructor <;> (intro h; nomatch h)
+  exact ⟨hIff, fun h => evalValueProjWrite_refines_writeProjectedValue
+    proj locals existingVal newVal updatedVal (hIff.mp h)⟩
+
+/-- **General `n`-Field Final-Write Promotion Theorem (`writeToFieldSlot_promotes_last_field_n`)**:
+Let `shell` be a `PartialAggregate` shell of arbitrary field count `n = vals.length`
+where field `idx` is the last remaining `.uninit` field (`get? shell.fields idx = .some .uninit`)
+and setting field `idx` to `.init v` completes `vals.map FieldSlot.init`
+(`set? shell.fields idx (.init v) = .some (vals.map FieldSlot.init)`):
+1. Before writing field `idx`, `shell.tryIntoValue? = .none` and reading field `idx`
+   faults with `.ub`.
+2. Writing `v` to `.field idx fieldTy` via `writeToFieldSlot` promotes the shell
+   in a single step to `.ok (.init (.aggregate 0 vals))`! -/
+theorem writeToFieldSlot_promotes_last_field_n
+    (locals : List LocalSlot)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (shell : PartialAggregate)
+    (containerTy fieldTy : Ty)
+    (idx : FieldIdx)
+    (v : Value)
+    (vals : List Value)
+    (hNotAdt : shell.isAdt = false)
+    (hUninitIdx : get? shell.fields idx = .some .uninit)
+    (hSetAllInit : set? shell.fields idx (.init v) = .some (vals.map FieldSlot.init)) :
+    shell.tryIntoValue? = .none ∧
+    readFromPartialShell locals shell [.field idx fieldTy] = .ub ∧
+    writeToFieldSlot locals arityOf shell.toFieldSlot containerTy [.field idx fieldTy] v =
+      .ok (.init (.aggregate 0 vals)) := by
+  have hNone : shell.tryIntoValue? = .none :=
+    tryIntoValue?_eq_none_of_uninit_field shell idx hUninitIdx
+  refine ⟨hNone, ?_, ?_⟩
+  · unfold readFromPartialShell
+    rw [hNotAdt]
+    dsimp only
+    rw [hUninitIdx]
+  · unfold PartialAggregate.toFieldSlot writeToFieldSlot
+    dsimp only
+    rw [hNotAdt]
+    dsimp only
+    rw [hUninitIdx]
+    dsimp only
+    unfold writeToFieldSlot
+    dsimp only
+    rw [hSetAllInit]
+    dsimp only
+    unfold promoteShellToFieldSlot PartialAggregate.tryIntoValue?
+    dsimp only
+    rw [tryFieldsIntoValues?_map_init]
+    rfl
+
+/-- In `Trusted.MirSemantics.setOrExtendFields`, writing index `idx` on an empty
+field list `.nil` pads every lower unwritten index `j < idx` with `Value.unit`. -/
+theorem get?_setOrExtendFields_nil_lt :
+    ∀ (idx j : Nat) (v : Value),
+      j < idx →
+      get? (setOrExtendFields .nil idx v) j = .some .unit := by
+  intro idx
+  induction idx with
+  | zero =>
+    intro j _ hLt
+    omega
+  | succ k ih =>
+    intro j v hLt
+    cases j with
+    | zero => rfl
+    | succ j' =>
+      simp only [setOrExtendFields, get?_eq_getElem?, List.getElem?_cons_succ]
+      rw [← get?_eq_getElem?]
+      exact ih j' v (by omega)
+
+/-- In `Trusted.MirSemantics.setOrExtendFields`, writing index `idx` on `.nil`
+stores `v` at index `idx`. -/
+theorem get?_setOrExtendFields_nil_self :
+    ∀ (idx : Nat) (v : Value),
+      get? (setOrExtendFields .nil idx v) idx = .some v := by
+  intro idx
+  induction idx with
+  | zero => intro v; rfl
+  | succ k ih =>
+    intro v
+    simp only [setOrExtendFields, get?_eq_getElem?, List.getElem?_cons_succ]
+    rw [← get?_eq_getElem?]
+    exact ih v
+
+/-- **General `n`-Field First-Write Divergence vs. Trusted `.unit` Padding (`writeToFieldSlot_first_field_n_vs_trusted_padding`)**:
+When an uninitialized `n`-field tuple local (`fieldTys.length = n`, `0 < idx < n`)
+has field `idx` initialized first (`_1.idx = v`):
+1. **Anneal (`writeToFieldSlot`)**: materializes a `PartialAggregate` shell of
+   length `n` whose `idx`-th slot is `.init v` and whose every other slot
+   `j < n` (`j ≠ idx`) is `FieldSlot.uninit`, so reading `[_1.idx]` returns
+   `.ok v` while reading ANY unwritten sibling field `[_1.j]` (`j < n`, `j ≠ idx`)
+   or reading the whole local `_1` returns `.ub` (`UninitializedLocal`).
+2. **Trusted (`writeProjectedValue` on `uninitFieldWriteShell? = .aggregate 0 []`)**:
+   extends the empty field list via `setOrExtendFields [] idx v`, padding every
+   lower unwritten field `j < idx` with `Value.unit` so `readProjectedValue` on
+   `[.field j tyJ]` falsely returns `.ok .unit`! -/
+theorem writeToFieldSlot_first_field_n_vs_trusted_padding
+    (locals : List LocalSlot)
+    (fieldTys : List RigidTy)
+    (lIdx : LayoutIdx)
+    (idx j : Nat)
+    (fieldTy tyJ : Ty)
+    (v : Value)
+    (hIdxLt : idx < fieldTys.length)
+    (hJLtIdx : j < idx) :
+    let containerTy : Ty := { kind := .tuple fieldTys, layoutIdx := lIdx }
+    let initFields := (replicateUninitFieldSlots fieldTys.length).set idx (.init v)
+    let expectedShell : PartialAggregate :=
+      { variantIdx := 0
+        isAdt := false
+        discriminantSet := false
+        fields := initFields }
+    writeToFieldSlot locals tupleArityOf .uninit containerTy [.field idx fieldTy] v =
+      .ok expectedShell.toFieldSlot ∧
+    readFromPartialShell locals expectedShell [.field idx fieldTy] = .ok v ∧
+    readFromPartialShell locals expectedShell [.field j tyJ] = .ub ∧
+    readFromPartialShell locals expectedShell .nil = .ub ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+      locals (.aggregate 0 .nil) [.field idx fieldTy] v =
+      .ok (.aggregate 0 (setOrExtendFields .nil idx v)) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue
+      locals (.aggregate 0 (setOrExtendFields .nil idx v)) [.field j tyJ] =
+      .ok .unit := by
+  intro containerTy initFields expectedShell
+  have hRepLen : (replicateUninitFieldSlots fieldTys.length).length = fieldTys.length :=
+    length_replicateUninitFieldSlots fieldTys.length
+  have hIdxLtRep : idx < (replicateUninitFieldSlots fieldTys.length).length := by omega
+  have hBlt : Nat.blt idx fieldTys.length = true := by simpa using hIdxLt
+  have hSet :
+      set? (replicateUninitFieldSlots fieldTys.length) idx (.init v) = .some initFields :=
+    set?_eq_some_iff.mpr ⟨hIdxLtRep, rfl⟩
+  have hJLtLen : j < fieldTys.length := by omega
+  have hJNe : idx ≠ j := by omega
+  have hGetIdx : get? initFields idx = .some (.init v) :=
+    get?_of_set?_same hSet
+  have hGetJ : get? initFields j = .some .uninit := by
+    rw [get?_of_set?_ne hSet hJNe]
+    exact get?_replicateUninitFieldSlots hJLtLen
+  have hNoneProm : expectedShell.tryIntoValue? = .none :=
+    tryIntoValue?_eq_none_of_uninit_field expectedShell j hGetJ
+  refine ⟨?_, ?_, ?_, ?_, rfl, ?_⟩
+  · unfold writeToFieldSlot tupleArityOf
+    dsimp only [containerTy]
+    rw [hBlt]
+    dsimp only
+    unfold writeToFieldSlot PartialAggregate.newUninit
+    dsimp only
+    rw [hSet]
+    dsimp only
+    unfold promoteShellToFieldSlot
+    change SlotWriteResult.ok (match expectedShell.tryIntoValue? with
+      | .some fullVal => FieldSlot.init fullVal
+      | .none => expectedShell.toFieldSlot) = .ok expectedShell.toFieldSlot
+    rw [hNoneProm]
+  · unfold readFromPartialShell
+    dsimp only [expectedShell]
+    rw [hGetIdx]
+    rfl
+  · unfold readFromPartialShell
+    dsimp only [expectedShell]
+    rw [hGetJ]
+  · unfold readFromPartialShell
+    rw [hNoneProm]
+  · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
+    rw [get?_setOrExtendFields_nil_lt idx j v hJLtIdx]
 
 /-- Field slots of a `PartialAggregate` shell after `SetDiscriminant(variantIdx)`
 (`set_discriminant_in_slot` in `crates/anneal-mir/src/lower/rvalue.rs`):
@@ -4198,5 +5427,1054 @@ theorem two_field_init_promotion_correspondence
       locals (.aggregate 0 [v0]) [.field 1 ty1] v1 =
       .ok (.aggregate 0 [v0, v1]) := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### Stateful `LocalSlotState` Evaluators (`PlaceMention`, `Assume`, `SetDiscriminant`, `writePlaceState`) & `SlotsRefine` Correspondence -/
+
+/-- Pointwise lookup preservation for `SlotsRefine`: at any index `i`, either both
+frames are out of bounds (`.none`) or both return related slots `R a t`. -/
+theorem SlotsRefine.get?_rel
+    {R : LocalSlotState → LocalSlot → Prop} :
+    ∀ {slots : List LocalSlotState} {locals : List LocalSlot} (i : Nat),
+      SlotsRefine R slots locals →
+      (get? slots i = .none ∧ get? locals i = .none) ∨
+      ∃ a t, get? slots i = .some a ∧ get? locals i = .some t ∧ R a t
+  | .nil, .nil, _, _ => Or.inl ⟨rfl, rfl⟩
+  | _ :: _, .nil, _, h => nomatch h
+  | .nil, _ :: _, _, h => nomatch h
+  | a :: _, t :: _, 0, h => Or.inr ⟨a, t, rfl, rfl, h.1⟩
+  | _ :: as, _ :: ts, i + 1, h => by
+    simp only [get?_eq_getElem?, List.getElem?_cons_succ]
+    simp only [← get?_eq_getElem?]
+    exact SlotsRefine.get?_rel (slots := as) (locals := ts) i h.2
+
+/-- Strict per-slot refinement relation on promoted states (where any completed
+`PartialAggregate` shell has already been promoted to `LocalSlotState.init`):
+- `.dead` refines `.dead`
+- `.uninit` refines `.uninit`
+- `.init v` refines `.init v`
+- `.partialShell _` does not refine any completed `LocalSlot`. -/
+def PromotedSlotRefines : LocalSlotState → LocalSlot → Prop
+  | .dead, .dead => True
+  | .uninit, .uninit => True
+  | .init v, .init w => v = w
+  | _, _ => False
+
+/-- Convert a single `LocalSlotState` to a `LocalSlot` for index/value projection
+helpers, mapping any incomplete `.partialShell` to `.uninit` so index reads
+through an incomplete shell fault with `.ub` (`UninitializedLocal`). -/
+def slotStateToTrustedLocal : LocalSlotState → LocalSlot
+  | .dead => .dead
+  | .uninit => .uninit
+  | .init v => .init v
+  | .partialShell shell =>
+    match shell.tryIntoValue? with
+    | .some v => .init v
+    | .none => .uninit
+
+/-- Map `slotStateToTrustedLocal` across a frame of `LocalSlotState`s. -/
+def slotsToTrustedLocals : List LocalSlotState → List LocalSlot
+  | .nil => .nil
+  | s :: rest => slotStateToTrustedLocal s :: slotsToTrustedLocals rest
+
+/-- When `SlotsRefine PromotedSlotRefines slots locals` holds, `slotsToTrustedLocals slots`
+is definitionally equal to `locals`. -/
+theorem slotsToTrustedLocals_eq_of_promoted :
+    ∀ {slots : List LocalSlotState} {locals : List LocalSlot},
+      SlotsRefine PromotedSlotRefines slots locals →
+      slotsToTrustedLocals slots = locals
+  | .nil, .nil, _ => rfl
+  | _ :: _, .nil, h => nomatch h
+  | .nil, _ :: _, h => nomatch h
+  | a :: as, t :: ts, ⟨hAT, hRest⟩ => by
+    have hTl := slotsToTrustedLocals_eq_of_promoted hRest
+    cases a with
+    | dead =>
+      cases t with
+      | dead => simp [slotsToTrustedLocals, slotStateToTrustedLocal, hTl]
+      | uninit => nomatch hAT
+      | init _ => nomatch hAT
+    | uninit =>
+      cases t with
+      | dead => nomatch hAT
+      | uninit => simp [slotsToTrustedLocals, slotStateToTrustedLocal, hTl]
+      | init _ => nomatch hAT
+    | partialShell _ => nomatch hAT
+    | init v =>
+      cases t with
+      | dead => nomatch hAT
+      | uninit => nomatch hAT
+      | init w =>
+        dsimp only [PromotedSlotRefines] at hAT
+        subst hAT
+        simp [slotsToTrustedLocals, slotStateToTrustedLocal, hTl]
+
+/-- Because `PartialAggregate.tryIntoValue?` only ever produces `.aggregate`
+values, an index local in `slotsToTrustedLocals slots` holds `.init (.scalar sc)`
+if and only if it holds `.init (.scalar sc)` in `slots` (never `.partialShell`). -/
+theorem get?_slotsToTrustedLocals_scalar_iff :
+    ∀ (slots : List LocalSlotState) (idxLocal : Local) (sc : ScalarInt),
+      get? (slotsToTrustedLocals slots) idxLocal = .some (.init (.scalar sc)) ↔
+        get? slots idxLocal = .some (.init (.scalar sc)) := by
+  intro slots
+  induction slots with
+  | nil =>
+    intro idxLocal sc
+    constructor <;> (intro h; nomatch h)
+  | cons hd tl ih =>
+    intro idxLocal sc
+    cases idxLocal with
+    | zero =>
+      simp only [slotsToTrustedLocals, get?_eq_getElem?, List.getElem?_cons_zero]
+      cases hd with
+      | dead => constructor <;> (intro h; nomatch h)
+      | uninit => constructor <;> (intro h; nomatch h)
+      | init v =>
+        dsimp only [slotStateToTrustedLocal]
+        constructor
+        · intro h
+          injection h with hSlot
+          injection hSlot with hVal
+          rw [hVal]
+        · intro h
+          injection h with hSlot
+          injection hSlot with hVal
+          rw [hVal]
+      | partialShell shell =>
+        dsimp only [slotStateToTrustedLocal]
+        unfold PartialAggregate.tryIntoValue?
+        cases Bool.and shell.isAdt (Bool.not shell.discriminantSet) with
+        | true => constructor <;> (intro h; nomatch h)
+        | false =>
+          dsimp only
+          cases tryFieldsIntoValues? shell.fields <;>
+            (constructor <;> (intro h; nomatch h))
+    | succ i' =>
+      simp only [slotsToTrustedLocals, get?_eq_getElem?, List.getElem?_cons_succ]
+      simp only [← get?_eq_getElem?]
+      exact ih i' sc
+
+/-- Read an array index local from `slots : List LocalSlotState`
+(`StatementEvalState::read_index_local` in `crates/anneal-mir/src/lower/rvalue.rs:4630-4659`):
+succeeds only when `idxLocal` holds an initialized `usize` scalar (`.init (.scalar sc)`
+with `sc.sizeBytes == ptrBytes`), rejecting `.dead`, `.uninit`, `.partialShell`,
+and non-`usize` values. -/
+def readIndexLocalState
+    (slots : List LocalSlotState)
+    (ptrBytes : Nat)
+    (idxLocal : Local) :
+    Option ScalarInt :=
+  match get? slots idxLocal with
+  | .some (.init (.scalar sc)) =>
+    match Nat.beq sc.sizeBytes ptrBytes with
+    | true => .some sc
+    | false => .none
+  | _ => .none
+
+/-- Validate that every `.index idxLocal` projection element in `proj` references
+an initialized `usize` scalar in `slots : List LocalSlotState`. -/
+def placeIndexLocalsInitState
+    (slots : List LocalSlotState)
+    (ptrBytes : Nat) :
+    List ProjectionElem → Bool
+  | .nil => true
+  | .index idxLocal :: rest =>
+    match readIndexLocalState slots ptrBytes idxLocal with
+    | .some _ => placeIndexLocalsInitState slots ptrBytes rest
+    | .none => false
+  | _ :: rest => placeIndexLocalsInitState slots ptrBytes rest
+
+/-- If `placeIndexLocalsInitState slots ptrBytes proj = true` and `R` maps
+`LocalSlotState.init v` to `LocalSlot.init v`, then Trusted's
+`placeIndexLocalsInit locals proj = true` holds on any `R`-related `locals`. -/
+theorem placeIndexLocalsInitState_implies_trusted
+    (R : LocalSlotState → LocalSlot → Prop)
+    (hInit : ∀ v t, R (.init v) t → t = .init v)
+    (slots : List LocalSlotState)
+    (locals : List LocalSlot)
+    (ptrBytes : Nat)
+    (hRel : SlotsRefine R slots locals) :
+    ∀ (proj : List ProjectionElem),
+      placeIndexLocalsInitState slots ptrBytes proj = true →
+      placeIndexLocalsInit locals proj = true := by
+  intro proj
+  induction proj with
+  | nil => intro _; rfl
+  | cons p rest ih =>
+    intro hState
+    cases p with
+    | index idxLocal =>
+      unfold placeIndexLocalsInitState at hState
+      cases hIdx : readIndexLocalState slots ptrBytes idxLocal with
+      | none => rw [hIdx] at hState; nomatch hState
+      | some sc =>
+        rw [hIdx] at hState
+        unfold readIndexLocalState at hIdx
+        rcases SlotsRefine.get?_rel idxLocal hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+        · rw [hNoneS] at hIdx; nomatch hIdx
+        · rw [hGetS] at hIdx
+          cases a with
+          | dead => nomatch hIdx
+          | uninit => nomatch hIdx
+          | partialShell _ => nomatch hIdx
+          | init v =>
+            cases v with
+            | scalar sc' =>
+              have hTEq := hInit (.scalar sc') t hAT
+              subst hTEq
+              unfold placeIndexLocalsInit
+              rw [hGetT]
+              exact ih hState
+            | _ => nomatch hIdx
+    | _ =>
+      unfold placeIndexLocalsInitState at hState
+      unfold placeIndexLocalsInit
+      exact ih hState
+
+/-- Read a `Place` from `slots : List LocalSlotState` (`StatementEvalState::read_place`
+in `crates/anneal-mir/src/lower/rvalue.rs:4686-4733`). -/
+def readPlaceState (slots : List LocalSlotState) (place : Place) : ProjReadResult :=
+  let locals := slotsToTrustedLocals slots
+  match get? slots place.local_ with
+  | .none => .ub
+  | .some .dead => .ub
+  | .some .uninit => .ub
+  | .some (.init rootVal) => evalValueProjRead locals rootVal place.projection
+  | .some (.partialShell shell) => readFromPartialShell locals shell place.projection
+
+/-- Move a `Place` from `slots : List LocalSlotState` (`StatementEvalState::move_place`
+in `crates/anneal-mir/src/lower/rvalue.rs:4807-4813`):
+moving a bare local (`place.projection = .nil`) transitions `place.local_` to
+`.uninit`, while moving a projected place leaves the root slot unchanged. -/
+def movePlaceState
+    (slots : List LocalSlotState)
+    (place : Place) :
+    ProjReadResult × List LocalSlotState :=
+  match readPlaceState slots place with
+  | .ok val =>
+    match place.projection with
+    | .nil => (.ok val, slots.set place.local_ .uninit)
+    | _ :: _ => (.ok val, slots)
+  | err => (err, slots)
+
+/-- Evaluate an `Operand` in `slots : List LocalSlotState`
+(`eval_op` in `crates/anneal-mir/src/lower/rvalue.rs:5993-5998`). -/
+def evalOperandState
+    (slots : List LocalSlotState)
+    (op : Operand)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (globals : List CapturedAllocation := .nil) :
+    ProjReadResult × List LocalSlotState :=
+  match op with
+  | .copy place => (readPlaceState slots place, slots)
+  | .move place => movePlaceState slots place
+  | .constant constOp =>
+    match constOp.val with
+    | .indirect _ _ => (.unsupported, slots)
+    | .unevaluated _ => (.unsupported, slots)
+    | cv =>
+      match evalConstValue cv constOp.ty globals layouts with
+      | .some val => (.ok val, slots)
+      | .none => (.unsupported, slots)
+
+/-- Stateful evaluator for `StatementKind.placeMention` over `slots : List LocalSlotState`
+(`eval_lowered_statement` on `LoweredStatement::PlaceMention` in
+`crates/anneal-mir/src/lower/rvalue.rs:6439-6513`):
+1. Requires `place.local_` to be in bounds and not `.dead`;
+2. Validates every `.index idxLocal` operand via `placeIndexLocalsInitState slots ptrBytes`;
+3. When `projectionHasDeref place.projection = true`, requires the root local to
+   hold an initialized pointer value (`.init (.ptr _ _)`), rejecting `.uninit` and
+   `.partialShell`. -/
+def evalPlaceMentionState
+    (slots : List LocalSlotState)
+    (ptrBytes : Nat)
+    (place : Place) :
+    Option Unit :=
+  match get? slots place.local_ with
+  | .none => .none
+  | .some .dead => .none
+  | .some rootSlot =>
+    match placeIndexLocalsInitState slots ptrBytes place.projection with
+    | false => .none
+    | true =>
+      match projectionHasDeref place.projection, rootSlot with
+      | false, _ => .some ()
+      | true, .init (.ptr _ _) => .some ()
+      | true, _ => .none
+
+/-- **Stateful `D9` `PlaceMention` Correspondence (`evalPlaceMentionState_trusted_correspondence`)**:
+Under `SlotsRefine PromotedSlotRefines slots s.frame.locals`:
+1. Whenever `evalPlaceMentionState slots ptrBytes place = .some ()`,
+   `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt s ⟨.placeMention place, span⟩ localDecls layouts`
+   steps to `advanceStmt s s.frame.locals` (leaving all slots and memory unchanged).
+2. On an out-of-bounds or `.dead` root local, or on a `.deref` projection when
+   the root local is `.uninit` or `.partialShell`, `evalPlaceMentionState` returns
+   `.none` and Trusted faults with `MirStepNode.fail .ub`. -/
+theorem evalPlaceMentionState_trusted_correspondence
+    (s : MachineState)
+    (slots : List LocalSlotState)
+    (ptrBytes : Nat)
+    (place : Place)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hRel : SlotsRefine PromotedSlotRefines slots s.frame.locals) :
+    (evalPlaceMentionState slots ptrBytes place = .some () →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.placeMention place, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s s.frame.locals)) ∧
+    ((get? slots place.local_ = .none ∨ get? slots place.local_ = .some .dead) →
+      evalPlaceMentionState slots ptrBytes place = .none ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.placeMention place, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) := by
+  have hIdxImp :=
+    placeIndexLocalsInitState_implies_trusted PromotedSlotRefines
+      (by
+        intro v t h
+        cases t with
+        | dead => nomatch h
+        | uninit => nomatch h
+        | init w =>
+          dsimp only [PromotedSlotRefines] at h
+          rw [h])
+      slots s.frame.locals ptrBytes hRel
+  refine ⟨?_, ?_⟩
+  · intro hOk
+    unfold evalPlaceMentionState at hOk
+    rcases SlotsRefine.get?_rel place.local_ hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+    · rw [hNoneS] at hOk; nomatch hOk
+    · rw [hGetS] at hOk
+      cases a with
+      | dead => nomatch hOk
+      | partialShell _ => nomatch hAT
+      | uninit =>
+        cases t with
+        | dead => nomatch hAT
+        | init _ => nomatch hAT
+        | uninit =>
+          dsimp only at hOk
+          cases hIdx : placeIndexLocalsInitState slots ptrBytes place.projection with
+          | false => rw [hIdx] at hOk; nomatch hOk
+          | true =>
+            rw [hIdx] at hOk
+            dsimp only at hOk
+            cases hDeref : projectionHasDeref place.projection with
+            | true => rw [hDeref] at hOk; nomatch hOk
+            | false =>
+              have hIdxT := hIdxImp place.projection hIdx
+              dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+              rw [hGetT]
+              dsimp only [placeMentionOperandsInit]
+              rw [hDeref, hIdxT]
+      | init v =>
+        cases t with
+        | dead => nomatch hAT
+        | uninit => nomatch hAT
+        | init w =>
+          dsimp only [PromotedSlotRefines] at hAT
+          subst hAT
+          dsimp only at hOk
+          cases hIdx : placeIndexLocalsInitState slots ptrBytes place.projection with
+          | false => rw [hIdx] at hOk; nomatch hOk
+          | true =>
+            have hIdxT := hIdxImp place.projection hIdx
+            dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+            rw [hGetT]
+            dsimp only [placeMentionOperandsInit]
+            cases projectionHasDeref place.projection <;> rw [hIdxT]
+  · intro hBad
+    rcases SlotsRefine.get?_rel place.local_ hRel with ⟨hNoneS, hNoneT⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+    · refine ⟨?_, ?_⟩
+      · unfold evalPlaceMentionState; rw [hNoneS]
+      · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]; rw [hNoneT]
+    · rcases hBad with hNoneS | hDeadS
+      · rw [hGetS] at hNoneS; nomatch hNoneS
+      · rw [hGetS] at hDeadS
+        injection hDeadS with hAEq
+        subst hAEq
+        cases t with
+        | uninit => nomatch hAT
+        | init _ => nomatch hAT
+        | dead =>
+          refine ⟨?_, ?_⟩
+          · unfold evalPlaceMentionState; rw [hGetS]
+          · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]; rw [hGetT]
+
+/-- Non-dereferencing operand predicate: for `.copy p` or `.move p`, `p.projection`
+does not start with `.deref` (`p.projection = .nil ∨ ∃ h t, p.projection = h :: t ∧ h ≠ .deref`). -/
+def OperandNonDeref : Operand → Prop
+  | .copy p => ∀ r, p.projection ≠ .deref :: r
+  | .move p => ∀ r, p.projection ≠ .deref :: r
+  | .constant _ => True
+
+/-- **Stateful `evalOperandState` Correspondence (`evalOperandState_trusted_correspondence`)**:
+Under `SlotsRefine PromotedSlotRefines slots locals` and `OperandNonDeref op`,
+every successful operand evaluation `evalOperandState slots op layouts globals = (.ok val, slots')`
+is matched by `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand` stepping to
+`.ok val locals'` with `SlotsRefine PromotedSlotRefines slots' locals'`. -/
+theorem evalOperandState_trusted_correspondence
+    (slots slots' : List LocalSlotState)
+    (locals : List LocalSlot)
+    (op : Operand)
+    (val : Value)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (hRel : SlotsRefine PromotedSlotRefines slots locals)
+    (hNoDeref : OperandNonDeref op)
+    (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
+    ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
+        locals op borrows globals layouts callerLocals = .ok val locals' ∧
+      SlotsRefine PromotedSlotRefines slots' locals' := by
+  have hLocEq : slotsToTrustedLocals slots = locals :=
+    slotsToTrustedLocals_eq_of_promoted hRel
+  cases op with
+  | constant constOp =>
+    unfold evalOperandState at hEval
+    dsimp only at hEval
+    cases hVal : constOp.val with
+    | indirect _ _ => rw [hVal] at hEval; nomatch hEval
+    | unevaluated _ => rw [hVal] at hEval; nomatch hEval
+    | zeroSized =>
+      rw [hVal] at hEval
+      dsimp only at hEval
+      cases hC : evalConstValue .zeroSized constOp.ty globals layouts with
+      | none => rw [hC] at hEval; nomatch hEval
+      | some cVal =>
+        rw [hC] at hEval
+        injection hEval with hRes hSlots
+        injection hRes with hV
+        subst hV hSlots
+        refine ⟨locals, ?_, hRel⟩
+        dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+        rw [hVal]
+        dsimp only
+        rw [hC]
+    | scalar sc =>
+      rw [hVal] at hEval
+      dsimp only at hEval
+      cases hC : evalConstValue (.scalar sc) constOp.ty globals layouts with
+      | none => rw [hC] at hEval; nomatch hEval
+      | some cVal =>
+        rw [hC] at hEval
+        injection hEval with hRes hSlots
+        injection hRes with hV
+        subst hV hSlots
+        refine ⟨locals, ?_, hRel⟩
+        dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+        rw [hVal]
+        dsimp only
+        rw [hC]
+    | slice aId len =>
+      rw [hVal] at hEval
+      dsimp only at hEval
+      cases hC : evalConstValue (.slice aId len) constOp.ty globals layouts with
+      | none => rw [hC] at hEval; nomatch hEval
+      | some cVal =>
+        rw [hC] at hEval
+        injection hEval with hRes hSlots
+        injection hRes with hV
+        subst hV hSlots
+        refine ⟨locals, ?_, hRel⟩
+        dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+        rw [hVal]
+        dsimp only
+        rw [hC]
+  | copy place =>
+    rcases place with ⟨loc, proj⟩
+    unfold evalOperandState readPlaceState at hEval
+    dsimp only at hEval
+    rw [hLocEq] at hEval
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+    · rw [hNoneS] at hEval; nomatch hEval
+    · rw [hGetS] at hEval
+      cases a with
+      | dead => nomatch hEval
+      | uninit => nomatch hEval
+      | partialShell _ => nomatch hAT
+      | init rootVal =>
+        cases t with
+        | dead => nomatch hAT
+        | uninit => nomatch hAT
+        | init w =>
+          dsimp only [PromotedSlotRefines] at hAT
+          subst hAT
+          dsimp only at hEval
+          injection hEval with hRead hSlots
+          subst hSlots
+          have hTRead := evalValueProjRead_refines_readProjectedValue proj locals rootVal val hRead
+          refine ⟨locals, ?_, hRel⟩
+          cases proj with
+          | nil =>
+            unfold evalValueProjRead at hRead
+            injection hRead with hV
+            subst hV
+            dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+            rw [hGetT]
+            rfl
+          | cons p rest =>
+            cases p with
+            | deref => exact False.elim (hNoDeref rest rfl)
+            | _ =>
+              dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+              rw [hGetT]
+              dsimp only
+              rw [hTRead]
+  | move place =>
+    rcases place with ⟨loc, proj⟩
+    unfold evalOperandState movePlaceState readPlaceState at hEval
+    dsimp only at hEval
+    rw [hLocEq] at hEval
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+    · rw [hNoneS] at hEval; nomatch hEval
+    · rw [hGetS] at hEval
+      cases a with
+      | dead => nomatch hEval
+      | uninit => nomatch hEval
+      | partialShell _ => nomatch hAT
+      | init rootVal =>
+        cases t with
+        | dead => nomatch hAT
+        | uninit => nomatch hAT
+        | init w =>
+          dsimp only [PromotedSlotRefines] at hAT
+          subst hAT
+          dsimp only at hEval
+          cases hRead : evalValueProjRead locals rootVal proj with
+          | ub => rw [hRead] at hEval; nomatch hEval
+          | unsupported => rw [hRead] at hEval; nomatch hEval
+          | ok outVal =>
+            rw [hRead] at hEval
+            dsimp only at hEval
+            have hTRead := evalValueProjRead_refines_readProjectedValue proj locals rootVal outVal hRead
+            cases proj with
+            | nil =>
+              injection hEval with hRes hSlots
+              injection hRes with hVal
+              subst hVal hSlots
+              unfold evalValueProjRead at hRead
+              injection hRead with hRootEq
+              subst hRootEq
+              have hLtT : loc < locals.length := by
+                simp only [get?_eq_getElem?] at hGetT
+                exact (List.getElem?_eq_some_iff.mp hGetT).1
+              have hSetT : set? locals loc .uninit = .some (locals.set loc .uninit) :=
+                set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+              refine ⟨locals.set loc .uninit, ?_,
+                SlotsRefine.set (R := PromotedSlotRefines) (a := .uninit) (t := .uninit) trivial loc hRel⟩
+              dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+              rw [hGetT]
+              dsimp only
+              rw [hSetT]
+            | cons p rest =>
+              injection hEval with hRes hSlots
+              injection hRes with hVal
+              subst hVal hSlots
+              refine ⟨locals, ?_, hRel⟩
+              cases p with
+              | deref => exact False.elim (hNoDeref rest rfl)
+              | _ =>
+                dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand]
+                rw [hGetT]
+                dsimp only
+                rw [hTRead]
+
+/-- Stateful evaluator for `StatementKind.intrinsic (.assume op)` over
+`slots : List LocalSlotState` (`LoweredStatement::Assume` in
+`crates/anneal-mir/src/lower/rvalue.rs:6515-6527`). -/
+def evalAssumeState
+    (slots : List LocalSlotState)
+    (op : Operand)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (globals : List CapturedAllocation := .nil) :
+    SlotWriteResult (List LocalSlotState) :=
+  let (res, slots') := evalOperandState slots op layouts globals
+  match res with
+  | .ok (.scalar sc) =>
+    match Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
+    | true => .ok slots'
+    | false => .ub
+  | .ok _ => .ub
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- **Stateful `Assume` Correspondence (`evalAssumeState_trusted_correspondence`)**:
+Under `SlotsRefine PromotedSlotRefines slots s.frame.locals` and `OperandNonDeref op`:
+1. Whenever `evalAssumeState slots op layouts s.memory.globals = .ok slots'`, there exists `locals'`
+   such that `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt s ⟨.intrinsic (.assume op), span⟩ localDecls layouts`
+   steps to `advanceStmt s locals'` and `SlotsRefine PromotedSlotRefines slots' locals'`.
+2. Whenever `evalOperandState slots op layouts s.memory.globals = (.ok (.scalar ⟨0, 1⟩), slots')`,
+   `evalAssumeState slots op layouts s.memory.globals = .ub` and Trusted's `evalStmt` faults with
+   `MirStepNode.fail .ub`. -/
+theorem evalAssumeState_trusted_correspondence
+    (s : MachineState)
+    (slots slots' : List LocalSlotState)
+    (op : Operand)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hRel : SlotsRefine PromotedSlotRefines slots s.frame.locals)
+    (hNoDeref : OperandNonDeref op) :
+    (evalAssumeState slots op layouts s.memory.globals = .ok slots' →
+      ∃ locals',
+        Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.intrinsic (.assume op), span⟩ localDecls layouts =
+          MirStepNode.step (advanceStmt s locals') ∧
+        SlotsRefine PromotedSlotRefines slots' locals') ∧
+    (evalOperandState slots op layouts s.memory.globals = (.ok (.scalar ⟨0, 1⟩), slots') →
+      evalAssumeState slots op layouts s.memory.globals = .ub ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+        s ⟨.intrinsic (.assume op), span⟩ localDecls layouts =
+        MirStepNode.fail .ub) := by
+  refine ⟨?_, ?_⟩
+  · intro hAssume
+    unfold evalAssumeState at hAssume
+    cases hOp : evalOperandState slots op layouts s.memory.globals with
+    | mk res nextSlots =>
+      rw [hOp] at hAssume
+      dsimp only at hAssume
+      cases res with
+      | ub => nomatch hAssume
+      | unsupported => nomatch hAssume
+      | ok val =>
+        cases val with
+        | scalar sc =>
+          dsimp only at hAssume
+          cases hTrue : Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with
+          | false => rw [hTrue] at hAssume; nomatch hAssume
+          | true =>
+            rw [hTrue] at hAssume
+            injection hAssume with hSlotsEq
+            subst hSlotsEq
+            obtain ⟨locals', hTOp, hRel'⟩ :=
+              evalOperandState_trusted_correspondence
+                slots nextSlots s.frame.locals op (.scalar sc)
+                s.memory.borrows s.memory.globals layouts s.memory.callerLocals
+                hRel hNoDeref hOp
+            refine ⟨locals', ?_, hRel'⟩
+            dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+            rw [hTOp]
+            dsimp only
+            rw [hTrue]
+        | _ => nomatch hAssume
+  · intro hFalseOp
+    obtain ⟨locals', hTOp, _⟩ :=
+      evalOperandState_trusted_correspondence
+        slots slots' s.frame.locals op (.scalar ⟨0, 1⟩)
+        s.memory.borrows s.memory.globals layouts s.memory.callerLocals
+        hRel hNoDeref hFalseOp
+    refine ⟨?_, ?_⟩
+    · unfold evalAssumeState
+      rw [hFalseOp]
+      rfl
+    · dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+      rw [hTOp]
+      rfl
+
+/-- Projected discriminant update on an initialized `Value`
+(`set_discriminant_projected_mir_value` in `crates/anneal-mir/src/lower/rvalue.rs:5478-5799`). -/
+def setDiscriminantProjectedValue
+    (locals : List LocalSlot)
+    (val : Value)
+    (proj : List ProjectionElem)
+    (variantIdx : VariantIdx) :
+    ProjWriteResult :=
+  match proj with
+  | .nil =>
+    match val with
+    | .aggregate _ fields => .ok (.aggregate variantIdx fields)
+    | .unit => .ok (.aggregate variantIdx .nil)
+    | _ => .ub
+  | p :: rest =>
+    match evalValueProjRead locals val (p :: rest) with
+    | .ok (.aggregate _ fields) =>
+      evalValueProjWrite locals val (p :: rest) (.aggregate variantIdx fields)
+    | .ok .unit =>
+      evalValueProjWrite locals val (p :: rest) (.aggregate variantIdx .nil)
+    | .ok _ => .ub
+    | .ub => .ub
+    | .unsupported => .unsupported
+
+/-- Recursive `SetDiscriminant` over a `FieldSlot` (`set_discriminant_in_slot` in
+`crates/anneal-mir/src/lower/rvalue.rs:5803-5980`):
+- On `.init existingVal`: updates the target aggregate via `setDiscriminantProjectedValue`.
+- On `.uninit`: faults with `.ub` (`UninitializedLocal`, or `.unsupported` on `.deref`).
+- On `.nested`: at `proj = .nil`, applies `setDiscriminantOnShell` (resetting fields
+  on variant switch and promoting via `tryIntoValue?`); at `.field` or `.downcast :: .field`,
+  recurses into the child slot and promotes bottom-up via `promoteShellToFieldSlot`. -/
+def setDiscriminantInFieldSlot
+    (locals : List LocalSlot)
+    (slot : FieldSlot) :
+    List ProjectionElem → VariantIdx → SlotWriteResult FieldSlot
+  | proj, variantIdx =>
+    match slot with
+    | .init existingVal =>
+      match setDiscriminantProjectedValue locals existingVal proj variantIdx with
+      | .ok updatedVal => .ok (.init updatedVal)
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .uninit =>
+      match proj with
+      | .deref :: _ => .unsupported
+      | .opaqueCast _ :: _ => .unsupported
+      | .unwrapUnsafeBinder _ :: _ => .unsupported
+      | _ => .ub
+    | .nested sVar sAdt sDisc sFields =>
+      match proj with
+      | .nil =>
+        match setDiscriminantOnShell ⟨sVar, sAdt, sDisc, sFields⟩ variantIdx with
+        | .init fullVal => .ok (.init fullVal)
+        | .partialShell updated => .ok updated.toFieldSlot
+        | _ => .ub
+      | .field idx _ :: rest =>
+        let actual := match sAdt with | true => sVar | false => 0
+        match Nat.beq actual 0, get? sFields idx with
+        | true, .some childSlot =>
+          match setDiscriminantInFieldSlot locals childSlot rest variantIdx with
+          | .ok childSlot' =>
+            match set? sFields idx childSlot' with
+            | .some fields' =>
+              .ok (promoteShellToFieldSlot ⟨sVar, sAdt, sDisc, fields'⟩)
+            | .none => .ub
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | _, _ => .ub
+      | .downcast _ expectedVar :: rest =>
+        let actual := match sAdt with | true => sVar | false => 0
+        match rest with
+        | .field idx _ :: tail =>
+          match Nat.beq actual expectedVar, get? sFields idx with
+          | true, .some childSlot =>
+            match setDiscriminantInFieldSlot locals childSlot tail variantIdx with
+            | .ok childSlot' =>
+              match set? sFields idx childSlot' with
+              | .some fields' =>
+                .ok (promoteShellToFieldSlot ⟨sVar, sAdt, sDisc, fields'⟩)
+              | .none => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | _, _ => .ub
+        | .deref :: _ => .unsupported
+        | .opaqueCast _ :: _ => .unsupported
+        | .unwrapUnsafeBinder _ :: _ => .unsupported
+        | _ => .ub
+      | .index _ :: _ => .ub
+      | .constantIndex _ _ _ :: _ => .ub
+      | .subslice _ _ _ :: _ => .ub
+      | .deref :: _ => .unsupported
+      | .opaqueCast _ :: _ => .unsupported
+      | .unwrapUnsafeBinder _ :: _ => .unsupported
+
+/-- **Nested Enum-in-Tuple `SetDiscriminant` Bottom-Up Promotion (`setDiscriminantInFieldSlot_nested_promotes`)**:
+Suppose an outer tuple/struct shell `outerShell` (`outerShell.isAdt = false`)
+holds a nested untagged enum shell `childShell` at field `idx` whose variant
+`variantIdx = childShell.variantIdx` has all payload fields initialized
+(`childShell.fields = childVals.map FieldSlot.init`), and setting field `idx`
+of `outerShell` to `.init (.aggregate variantIdx childVals)` completes all
+fields of `outerShell` (`set? outerShell.fields idx ... = .some (outerVals.map FieldSlot.init)`).
+Then executing `setDiscriminantInFieldSlot` at `[.field idx fieldTy]` with
+`variantIdx` promotes **both** the nested enum shell and the outer tuple shell
+bottom-up in a single step to `.ok (.init (.aggregate 0 outerVals))`! -/
+theorem setDiscriminantInFieldSlot_nested_promotes
+    (locals : List LocalSlot)
+    (outerShell childShell : PartialAggregate)
+    (idx : FieldIdx)
+    (fieldTy : Ty)
+    (variantIdx : VariantIdx)
+    (childVals outerVals : List Value)
+    (hOuterTuple : outerShell.isAdt = false)
+    (hGetChild : get? outerShell.fields idx = .some childShell.toFieldSlot)
+    (hSameVar : childShell.variantIdx = variantIdx)
+    (hChildFields : childShell.fields = childVals.map FieldSlot.init)
+    (hOuterComplete :
+      set? outerShell.fields idx (.init (.aggregate variantIdx childVals)) =
+        .some (outerVals.map FieldSlot.init)) :
+    setDiscriminantInFieldSlot locals outerShell.toFieldSlot [.field idx fieldTy] variantIdx =
+      .ok (.init (.aggregate 0 outerVals)) := by
+  have hChildProm :=
+    (setDiscriminantOnShell_promotes_initialized_variant
+      childShell variantIdx childVals hSameVar hChildFields).2
+  unfold PartialAggregate.toFieldSlot setDiscriminantInFieldSlot
+  dsimp only
+  rw [hOuterTuple]
+  dsimp only
+  rw [hGetChild]
+  dsimp only
+  unfold setDiscriminantInFieldSlot
+  dsimp only
+  change (match
+      match setDiscriminantOnShell childShell variantIdx with
+      | .init fullVal => SlotWriteResult.ok (FieldSlot.init fullVal)
+      | .partialShell updated => SlotWriteResult.ok updated.toFieldSlot
+      | _ => SlotWriteResult.ub with
+    | .ok childSlot' =>
+      match set? outerShell.fields idx childSlot' with
+      | .some fields' =>
+        SlotWriteResult.ok
+          (promoteShellToFieldSlot
+            ⟨outerShell.variantIdx, false, outerShell.discriminantSet, fields'⟩)
+      | .none => SlotWriteResult.ub
+    | .ub => SlotWriteResult.ub
+    | .unsupported => SlotWriteResult.unsupported) = _
+  rw [hChildProm]
+  dsimp only
+  rw [hOuterComplete]
+  dsimp only
+  unfold promoteShellToFieldSlot PartialAggregate.tryIntoValue?
+  dsimp only
+  rw [tryFieldsIntoValues?_map_init]
+  rfl
+
+/-- Stateful evaluator for `StatementKind.setDiscriminant` over `slots : List LocalSlotState`
+(`eval_lowered_statement` on `LoweredStatement::SetDiscriminant` in
+`crates/anneal-mir/src/lower/rvalue.rs:6529-6585`). -/
+def evalSetDiscriminantState
+    (slots : List LocalSlotState)
+    (place : Place)
+    (variantIdx : VariantIdx) :
+    SlotWriteResult (List LocalSlotState) :=
+  let locals := slotsToTrustedLocals slots
+  match get? slots place.local_ with
+  | .none => .ub
+  | .some .dead => .ub
+  | .some .uninit =>
+    match place.projection with
+    | .deref :: _ => .unsupported
+    | .opaqueCast _ :: _ => .unsupported
+    | .unwrapUnsafeBinder _ :: _ => .unsupported
+    | _ => .ub
+  | .some (.init existingVal) =>
+    match setDiscriminantInFieldSlot locals (.init existingVal) place.projection variantIdx with
+    | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .some (.partialShell shell) =>
+    match setDiscriminantInFieldSlot locals shell.toFieldSlot place.projection variantIdx with
+    | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
+    | .ub => .ub
+    | .unsupported => .unsupported
+
+/-- **Stateful `SetDiscriminant` Correspondence (`evalSetDiscriminantState_trusted_correspondence`)**:
+Under `SlotsRefine PromotedSlotRefines slots s.frame.locals`:
+1. On a bare local `⟨loc, .nil⟩` holding `.init (.aggregate oldVar fields)` in `slots`,
+   `evalSetDiscriminantState` returns `.ok (slots.set loc (.init (.aggregate variantIdx fields)))`,
+   Trusted's `evalStmt` steps to `advanceStmt s (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))`,
+   and the updated frames satisfy `SlotsRefine PromotedSlotRefines`.
+2. On a projected place `⟨loc, proj :: rest⟩` (`proj ≠ .deref`) where reading `proj :: rest`
+   from `rootVal` yields `.aggregate oldVar fields` and writing `.aggregate variantIdx fields`
+   back yields `rootVal'`, `evalSetDiscriminantState` returns `.ok (slots.set loc (.init rootVal'))`
+   and Trusted's `evalStmt` steps to a `PromotedSlotRefines`-related frame. -/
+theorem evalSetDiscriminantState_trusted_correspondence
+    (s : MachineState)
+    (slots : List LocalSlotState)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (variantIdx oldVar : VariantIdx)
+    (fields : List Value)
+    (rootVal rootVal' : Value)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hRel : SlotsRefine PromotedSlotRefines slots s.frame.locals) :
+    (get? slots loc = .some (.init (.aggregate oldVar fields)) →
+      evalSetDiscriminantState slots ⟨loc, .nil⟩ variantIdx =
+        .ok (slots.set loc (.init (.aggregate variantIdx fields))) ∧
+      ∃ locals',
+        Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.setDiscriminant ⟨loc, .nil⟩ variantIdx, span⟩ localDecls layouts =
+          MirStepNode.step (advanceStmt s locals') ∧
+        SlotsRefine PromotedSlotRefines
+          (slots.set loc (.init (.aggregate variantIdx fields))) locals') ∧
+    (proj ≠ .deref →
+      get? slots loc = .some (.init rootVal) →
+      evalValueProjRead s.frame.locals rootVal (proj :: rest) =
+        .ok (.aggregate oldVar fields) →
+      evalValueProjWrite s.frame.locals rootVal (proj :: rest)
+        (.aggregate variantIdx fields) = .ok rootVal' →
+      evalSetDiscriminantState slots ⟨loc, proj :: rest⟩ variantIdx =
+        .ok (slots.set loc (.init rootVal')) ∧
+      ∃ locals',
+        Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.setDiscriminant ⟨loc, proj :: rest⟩ variantIdx, span⟩ localDecls layouts =
+          MirStepNode.step (advanceStmt s locals') ∧
+        SlotsRefine PromotedSlotRefines
+          (slots.set loc (.init rootVal')) locals') := by
+  have hLocEq : slotsToTrustedLocals slots = s.frame.locals :=
+    slotsToTrustedLocals_eq_of_promoted hRel
+  refine ⟨?_, ?_⟩
+  · intro hGetS
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS', hGetT, hAT⟩
+    · rw [hNoneS] at hGetS; nomatch hGetS
+    · rw [hGetS] at hGetS'
+      injection hGetS' with hAEq
+      subst hAEq
+      cases t with
+      | dead => nomatch hAT
+      | uninit => nomatch hAT
+      | init w =>
+        dsimp only [PromotedSlotRefines] at hAT
+        subst hAT
+        have hLtT : loc < s.frame.locals.length := by
+          simp only [get?_eq_getElem?] at hGetT
+          exact (List.getElem?_eq_some_iff.mp hGetT).1
+        have hSetT :
+            set? s.frame.locals loc (.init (.aggregate variantIdx fields)) =
+              .some (s.frame.locals.set loc (.init (.aggregate variantIdx fields))) :=
+          set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+        refine ⟨?_, s.frame.locals.set loc (.init (.aggregate variantIdx fields)), ?_,
+          SlotsRefine.set (R := PromotedSlotRefines)
+            (a := .init (.aggregate variantIdx fields))
+            (t := .init (.aggregate variantIdx fields)) rfl loc hRel⟩
+        · unfold evalSetDiscriminantState
+          dsimp only
+          rw [hGetS]
+          rfl
+        · exact (evalStmt_setDiscriminant_correspondence
+            s loc proj rest variantIdx oldVar fields rootVal rootVal'
+            (s.frame.locals.set loc (.init (.aggregate variantIdx fields)))
+            span localDecls layouts).1 hGetT hSetT
+  · intro hNotDeref hGetS hRead hWrite
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS', hGetT, hAT⟩
+    · rw [hNoneS] at hGetS; nomatch hGetS
+    · rw [hGetS] at hGetS'
+      injection hGetS' with hAEq
+      subst hAEq
+      cases t with
+      | dead => nomatch hAT
+      | uninit => nomatch hAT
+      | init w =>
+        dsimp only [PromotedSlotRefines] at hAT
+        subst hAT
+        have hLtT : loc < s.frame.locals.length := by
+          simp only [get?_eq_getElem?] at hGetT
+          exact (List.getElem?_eq_some_iff.mp hGetT).1
+        have hSetT :
+            set? s.frame.locals loc (.init rootVal') =
+              .some (s.frame.locals.set loc (.init rootVal')) :=
+          set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+        refine ⟨?_, s.frame.locals.set loc (.init rootVal'), ?_,
+          SlotsRefine.set (R := PromotedSlotRefines)
+            (a := .init rootVal') (t := .init rootVal') rfl loc hRel⟩
+        · unfold evalSetDiscriminantState
+          dsimp only
+          rw [hLocEq, hGetS]
+          dsimp only [setDiscriminantInFieldSlot, setDiscriminantProjectedValue]
+          rw [hRead]
+          dsimp only
+          rw [hWrite]
+          rfl
+        · exact (evalStmt_setDiscriminant_correspondence
+            s loc proj rest variantIdx oldVar fields rootVal rootVal'
+            (s.frame.locals.set loc (.init rootVal'))
+            span localDecls layouts).2 hNotDeref hGetT hRead hWrite hSetT
+
+/-- Stateful place writer over `slots : List LocalSlotState`
+(`StatementEvalState::write_place` in `crates/anneal-mir/src/lower/rvalue.rs:4850-4949`). -/
+def writePlaceState
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (slots : List LocalSlotState)
+    (place : Place)
+    (rootTy : Ty)
+    (newVal : Value) :
+    SlotWriteResult (List LocalSlotState) :=
+  let locals := slotsToTrustedLocals slots
+  match get? slots place.local_ with
+  | .none => .ub
+  | .some .dead => .ub
+  | .some .uninit =>
+    match writeToFieldSlot locals arityOf .uninit rootTy place.projection newVal with
+    | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .some (.init existingVal) =>
+    match writeToFieldSlot locals arityOf (.init existingVal) rootTy place.projection newVal with
+    | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | .some (.partialShell shell) =>
+    match writeToFieldSlot locals arityOf shell.toFieldSlot rootTy place.projection newVal with
+    | .ok nextSlot => .ok (slots.set place.local_ (fieldSlotToLocalSlotState nextSlot))
+    | .ub => .ub
+    | .unsupported => .unsupported
+
+/-- **Stateful `writePlaceState` Correspondence on Initialized / Bare Places (`writePlaceState_trusted_correspondence`)**:
+Under `SlotsRefine PromotedSlotRefines slots locals`:
+1. Writing `newVal` to a bare live local `⟨loc, .nil⟩` (`get? slots loc = .some slot`,
+   `slot ≠ .dead`) updates `slots` to `slots.set loc (.init newVal)` and Trusted's
+   `writePlaceValue` (with `projection = .nil`) updates `locals` to
+   `locals.set loc (.init newVal)`, preserving `SlotsRefine PromotedSlotRefines`.
+2. Writing `newVal` to a projected non-`Deref` place `⟨loc, proj :: rest⟩` on an
+   initialized root local (`get? slots loc = .some (.init rootVal)`) where
+   `evalValueProjWrite locals rootVal (proj :: rest) newVal = .ok rootVal'`
+   updates `slots` to `slots.set loc (.init rootVal')` and Trusted's
+   `writeProjectedValue` returns `.ok rootVal'`, preserving `SlotsRefine PromotedSlotRefines`. -/
+theorem writePlaceState_trusted_correspondence
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (slots : List LocalSlotState)
+    (locals : List LocalSlot)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rootTy : Ty)
+    (rootVal newVal rootVal' : Value)
+    (hRel : SlotsRefine PromotedSlotRefines slots locals) :
+    (∀ slot : LocalSlotState,
+      get? slots loc = .some slot →
+      slot ≠ .dead →
+      writePlaceState arityOf slots ⟨loc, .nil⟩ rootTy newVal =
+        .ok (slots.set loc (.init newVal)) ∧
+      set? locals loc (.init newVal) = .some (locals.set loc (.init newVal)) ∧
+      SlotsRefine PromotedSlotRefines
+        (slots.set loc (.init newVal)) (locals.set loc (.init newVal))) ∧
+    (get? slots loc = .some (.init rootVal) →
+      evalValueProjWrite locals rootVal (proj :: rest) newVal = .ok rootVal' →
+      writePlaceState arityOf slots ⟨loc, proj :: rest⟩ rootTy newVal =
+        .ok (slots.set loc (.init rootVal')) ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+        locals rootVal (proj :: rest) newVal = .ok rootVal' ∧
+      SlotsRefine PromotedSlotRefines
+        (slots.set loc (.init rootVal')) (locals.set loc (.init rootVal'))) := by
+  have hLocEq : slotsToTrustedLocals slots = locals :=
+    slotsToTrustedLocals_eq_of_promoted hRel
+  refine ⟨?_, ?_⟩
+  · intro slot hGetS hNotDead
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS', hGetT, hAT⟩
+    · rw [hNoneS] at hGetS; nomatch hGetS
+    · rw [hGetS] at hGetS'
+      injection hGetS' with hAEq
+      subst hAEq
+      have hLtT : loc < locals.length := by
+        simp only [get?_eq_getElem?] at hGetT
+        exact (List.getElem?_eq_some_iff.mp hGetT).1
+      refine ⟨?_, set?_eq_some_iff.mpr ⟨hLtT, rfl⟩,
+        SlotsRefine.set (R := PromotedSlotRefines)
+          (a := .init newVal) (t := .init newVal) rfl loc hRel⟩
+      unfold writePlaceState
+      dsimp only
+      rw [hGetS]
+      cases slot with
+      | dead => exact False.elim (hNotDead rfl)
+      | uninit => rfl
+      | init _ => rfl
+      | partialShell _ => rfl
+  · intro hGetS hWrite
+    rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS', hGetT, hAT⟩
+    · rw [hNoneS] at hGetS; nomatch hGetS
+    · rw [hGetS] at hGetS'
+      injection hGetS' with hAEq
+      subst hAEq
+      refine ⟨?_,
+        evalValueProjWrite_refines_writeProjectedValue (proj :: rest) locals rootVal newVal rootVal' hWrite,
+        SlotsRefine.set (R := PromotedSlotRefines)
+          (a := .init rootVal') (t := .init rootVal') rfl loc hRel⟩
+      unfold writePlaceState
+      dsimp only
+      rw [hLocEq, hGetS]
+      dsimp only [writeToFieldSlot]
+      rw [hWrite]
+      rfl
 
 end Anneal.Mir.PlaceAndRvalue
