@@ -95,6 +95,14 @@ soundness invariants, lens laws, and step correspondence/refinement against
      reads agree with Trusted wherever Anneal accepts them
      (`readFromPartialShell_flat_refines`), and the promoted value equals
      Trusted's value (`flatShellRefines_complete`).
+   - Statement-level `.assign` refinement on frames that may contain nested
+     tuple partial shells (`NestedSlotStateRefines`): bare assignments
+     (`evalStmt_assign_bare_nested_refines`), projected writes into initialized
+     locals at any depth (`evalStmt_assign_init_root_nested_refines`), and
+     depth-1 / depth-2 field writes into partial shells
+     (`evalStmt_assign_field_nested_refines`,
+     `evalStmt_assign_two_level_field_nested_refines`), so arbitrary
+     interleavings of these writes keep the Anneal and Trusted frames related.
    - Documented Episode 1 / Trusted divergences outside the refinable fragment:
      in-place enum payload writes into `.uninit` locals
      (`evalStmt_assign_uninit_downcast_proj_ub`) and `SetDiscriminant` of a `()`
@@ -10372,6 +10380,430 @@ theorem writeToFieldSlot_uninit_nested_field_refines
         (nestedShellRefines_replicate_nil fieldTys.length) hLtRep rfl
     exact ⟨promoteShellToFieldSlot_ne_uninit _,
       promoteShellToFieldSlot_nestedFieldRefines 0 false _ _ hShellRef⟩
+
+/-- **Depth-1 Field Write on Nested Frames (`evalStmt_assign_field_nested_refines`)**:
+`evalStmt_assign_field_flat_refines` lifted from `FlatSlotStateRefines` to
+`NestedSlotStateRefines`: a direct field write `_l.i = rv` on a frame whose locals
+may hold arbitrarily nested tuple partial shells (overwriting field `i`, including
+an incomplete nested child shell, with `val`) refines Trusted's `evalStmt` `.assign`
+step and preserves `SlotsRefine NestedSlotStateRefines`. Together with
+`evalStmt_assign_two_level_field_nested_refines`, this shows that every
+interleaving of depth-1 (`_l.i = v`) and depth-2 (`_l.i.j = v`) field writes keeps
+the Anneal and Trusted frames related, not only traces of a single write shape. -/
+theorem evalStmt_assign_field_nested_refines
+    (s : MachineState)
+    (slots₁ slots₂ : List LocalSlotState)
+    (loc : Local)
+    (i : FieldIdx)
+    (fieldTy : Ty)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (fieldTys : List RigidTy)
+    (lIdx : LayoutIdx)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hRel : SlotsRefine NestedSlotStateRefines slots₁ locals₁)
+    (hTy :
+      placeTy localDecls layouts { local_ := loc, projection := .nil } =
+        .some { kind := .tuple fieldTys, layoutIdx := lIdx })
+    (hNoProt : mem₁.activeProtectors = .nil)
+    (hWrite :
+      writePlaceState tupleArityOf slots₁ ⟨loc, [.field i fieldTy]⟩
+        { kind := .tuple fieldTys, layoutIdx := lIdx } val = .ok slots₂) :
+    ∃ locals₂ mem₂,
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.assign ⟨loc, [.field i fieldTy]⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
+      SlotsRefine NestedSlotStateRefines slots₂ locals₂ := by
+  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail →
+      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
+        (match resolveBorrowProjectionElems locals₁ [.field i fieldTy] with
+         | .some rp => rp
+         | .none => [.field i fieldTy]) = false := by
+    intro protHead protTail hAP
+    rw [hNoProt] at hAP
+    nomatch hAP
+  unfold writePlaceState at hWrite
+  dsimp only at hWrite
+  rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+  · rw [hNoneS] at hWrite; nomatch hWrite
+  · rw [hGetS] at hWrite
+    have hLtT : loc < locals₁.length := by
+      simp only [get?_eq_getElem?] at hGetT
+      exact (List.getElem?_eq_some_iff.mp hGetT).1
+    cases a with
+    | dead => nomatch hWrite
+    | uninit =>
+      cases t with
+      | dead => nomatch hAT
+      | init _ => nomatch hAT
+      | uninit =>
+        dsimp only at hWrite
+        cases hW : writeToFieldSlot (slotsToTrustedLocals slots₁) tupleArityOf .uninit
+            { kind := .tuple fieldTys, layoutIdx := lIdx } [.field i fieldTy] val with
+        | ub => rw [hW] at hWrite; nomatch hWrite
+        | unsupported => rw [hW] at hWrite; nomatch hWrite
+        | ok slot' =>
+          rw [hW] at hWrite
+          injection hWrite with hSlots
+          subst hSlots
+          obtain ⟨hNotUninit, hSlotRef⟩ :=
+            writeToFieldSlot_uninit_nested_field_refines (slotsToTrustedLocals slots₁)
+              fieldTys lIdx fieldTy i val slot' hW
+          have hTW :
+              Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+                  locals₁ (.aggregate 0 .nil) [.field i fieldTy] val =
+                .ok (.aggregate 0 (setOrExtendFields .nil i val)) := rfl
+          have hSetT :
+              set? locals₁ loc (.init (.aggregate 0 (setOrExtendFields .nil i val))) =
+                .some (locals₁.set loc (.init (.aggregate 0 (setOrExtendFields .nil i val)))) :=
+            set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+          refine ⟨_, _,
+            evalStmt_assign_uninit_aggregate_field_step s loc i fieldTy .nil rv span
+              localDecls layouts val locals₁ mem₁ (.aggregate 0 .nil) _ _ hRv hGetT
+              (uninitFieldWriteShell?_field_tuple localDecls layouts loc i fieldTy fieldTys lIdx hTy)
+              hTW hSetT hNoConflict,
+            SlotsRefine.set
+              (fieldSlotToLocalSlotState_of_nestedFieldRefines slot' _ hNotUninit hSlotRef)
+              loc hRel⟩
+    | partialShell shell =>
+      cases t with
+      | dead => nomatch hAT
+      | uninit => nomatch hAT
+      | init tv =>
+        obtain ⟨hTuple, tfs, hTv, hShellRef⟩ := hAT
+        subst hTv
+        dsimp only at hWrite
+        cases hW : writeToFieldSlot (slotsToTrustedLocals slots₁) tupleArityOf shell.toFieldSlot
+            { kind := .tuple fieldTys, layoutIdx := lIdx } [.field i fieldTy] val with
+        | ub => rw [hW] at hWrite; nomatch hWrite
+        | unsupported => rw [hW] at hWrite; nomatch hWrite
+        | ok slot' =>
+          rw [hW] at hWrite
+          injection hWrite with hSlots
+          subst hSlots
+          obtain ⟨hTW, hNotUninit, hSlotRef⟩ :=
+            writeToFieldSlot_nested_field_refines (slotsToTrustedLocals slots₁) tupleArityOf
+              shell tfs { kind := .tuple fieldTys, layoutIdx := lIdx } fieldTy i val slot'
+              hTuple hShellRef hW
+          have hTW₁ :
+              Trusted.Rustc.V2026_06_01.MirSemantics.writeProjectedValue
+                  locals₁ (.aggregate 0 tfs) [.field i fieldTy] val =
+                .ok (.aggregate 0 (setOrExtendFields tfs i val)) := by
+            rw [← hTW]
+            rfl
+          have hSetT :
+              set? locals₁ loc (.init (.aggregate 0 (setOrExtendFields tfs i val))) =
+                .some (locals₁.set loc (.init (.aggregate 0 (setOrExtendFields tfs i val)))) :=
+            set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+          refine ⟨_, _,
+            evalStmt_assign_init_projected_step s loc (.field i fieldTy) .nil rv span
+              localDecls layouts val (.aggregate 0 tfs) _ locals₁ _ mem₁
+              (by intro h; nomatch h) hRv hGetT rfl hTW₁ hSetT hNoConflict,
+            SlotsRefine.set
+              (fieldSlotToLocalSlotState_of_nestedFieldRefines slot' _ hNotUninit hSlotRef)
+              loc hRel⟩
+    | init w =>
+      cases t with
+      | dead => nomatch hAT
+      | uninit => nomatch hAT
+      | init w' =>
+        simp only [NestedSlotStateRefines] at hAT
+        subst hAT
+        dsimp only at hWrite
+        cases hW : writeToFieldSlot (slotsToTrustedLocals slots₁) tupleArityOf (.init w)
+            { kind := .tuple fieldTys, layoutIdx := lIdx } [.field i fieldTy] val with
+        | ub => rw [hW] at hWrite; nomatch hWrite
+        | unsupported => rw [hW] at hWrite; nomatch hWrite
+        | ok slot' =>
+          rw [hW] at hWrite
+          injection hWrite with hSlots
+          subst hSlots
+          have hShape : ∃ w'', slot' = .init w'' ∧
+              evalValueProjWrite (slotsToTrustedLocals slots₁) w [.field i fieldTy] val =
+                .ok w'' := by
+            unfold writeToFieldSlot at hW
+            dsimp only at hW
+            cases hE : evalValueProjWrite (slotsToTrustedLocals slots₁) w [.field i fieldTy] val with
+            | ok w'' =>
+              rw [hE] at hW
+              injection hW with hSlotEq
+              exact ⟨w'', hSlotEq.symm, rfl⟩
+            | ub => rw [hE] at hW; nomatch hW
+            | unsupported => rw [hE] at hW; nomatch hW
+          obtain ⟨w'', hSlotEq, hE⟩ := hShape
+          subst hSlotEq
+          have hE₁ : evalValueProjWrite locals₁ w [.field i fieldTy] val = .ok w'' := by
+            rw [← hE]
+            cases w <;> rfl
+          have hTW := evalValueProjWrite_refines_writeProjectedValue
+            [.field i fieldTy] locals₁ w val w'' hE₁
+          have hSetT : set? locals₁ loc (.init w'') = .some (locals₁.set loc (.init w'')) :=
+            set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+          refine ⟨_, _,
+            evalStmt_assign_init_projected_step s loc (.field i fieldTy) .nil rv span
+              localDecls layouts val w w'' locals₁ _ mem₁
+              (by intro h; nomatch h) hRv hGetT
+              (by cases w <;> rfl) hTW hSetT hNoConflict,
+            SlotsRefine.set (a := .init w'') (t := .init w'') rfl loc hRel⟩
+
+/-- A successful pure value-tree write never traverses an absent or `.unit`
+intermediate field along a `.field` chain, so Trusted's
+`ensureNestedFieldShells` leaves the root unchanged (`fieldShellChainPopulated`). -/
+theorem fieldShellChainPopulated_of_evalValueProjWrite_ok
+    (locals : List LocalSlot) :
+    ∀ (proj : List ProjectionElem) (val newVal out : Value),
+      evalValueProjWrite locals val proj newVal = .ok out →
+      fieldShellChainPopulated val proj = true := by
+  intro proj
+  induction proj with
+  | nil => intro val _ _ _; cases val <;> rfl
+  | cons p rest ih =>
+    intro val newVal out hW
+    cases p with
+    | field idx fieldTy =>
+      cases val with
+      | aggregate vIdx fields =>
+        dsimp only [evalValueProjWrite] at hW
+        cases hGet : get? fields idx with
+        | none => rw [hGet] at hW; nomatch hW
+        | some old =>
+          rw [hGet] at hW
+          dsimp only at hW
+          cases hRec : evalValueProjWrite locals old rest newVal with
+          | ub => rw [hRec] at hW; nomatch hW
+          | unsupported => rw [hRec] at hW; nomatch hW
+          | ok upd =>
+            have hOldPop := ih old newVal upd hRec
+            cases rest with
+            | nil => rfl
+            | cons q rest' =>
+              cases q with
+              | field idx' ty' =>
+                -- The child is traversed by a `.field` step, so it is an aggregate.
+                cases old with
+                | aggregate _ _ =>
+                  dsimp only [fieldShellChainPopulated, stripTransparentProjections]
+                  rw [hGet]
+                  cases fieldTy.kind <;> first | rfl | exact hOldPop
+                | unit => nomatch hRec
+                | scalar _ => nomatch hRec
+                | ptr _ _ => nomatch hRec
+              | opaqueCast _ => cases old <;> nomatch hRec
+              | unwrapUnsafeBinder _ => cases old <;> nomatch hRec
+              | deref =>
+                dsimp only [fieldShellChainPopulated, stripTransparentProjections]
+              | index _ =>
+                dsimp only [fieldShellChainPopulated, stripTransparentProjections]
+              | constantIndex _ _ _ =>
+                dsimp only [fieldShellChainPopulated, stripTransparentProjections]
+              | subslice _ _ _ =>
+                dsimp only [fieldShellChainPopulated, stripTransparentProjections]
+              | downcast _ _ =>
+                dsimp only [fieldShellChainPopulated, stripTransparentProjections]
+      | _ => nomatch hW
+    | opaqueCast _ => cases val <;> nomatch hW
+    | unwrapUnsafeBinder _ => cases val <;> nomatch hW
+    | deref => cases val <;> rfl
+    | index _ => cases val <;> rfl
+    | constantIndex _ _ _ => cases val <;> rfl
+    | subslice _ _ _ => cases val <;> rfl
+    | downcast _ _ => cases val <;> rfl
+
+/-- **Bare Assignment on Nested Frames (`evalStmt_assign_bare_nested_refines`)**:
+The most common MIR statement, `_l = rv` with an empty destination projection:
+whenever Anneal's `writePlaceState` stores `val` into `_l` (any non-dead slot,
+including an incomplete partial shell, which is discarded), Trusted's `evalStmt`
+`.assign` steps and the frames stay related by `SlotsRefine NestedSlotStateRefines`
+(absent active protectors). -/
+theorem evalStmt_assign_bare_nested_refines
+    (s : MachineState)
+    (slots₁ slots₂ : List LocalSlotState)
+    (loc : Local)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (rootTy : Ty)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hRel : SlotsRefine NestedSlotStateRefines slots₁ locals₁)
+    (hNoProt : mem₁.activeProtectors = .nil)
+    (hWrite : writePlaceState arityOf slots₁ ⟨loc, .nil⟩ rootTy val = .ok slots₂) :
+    ∃ locals₂ mem₂,
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.assign ⟨loc, .nil⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
+      SlotsRefine NestedSlotStateRefines slots₂ locals₂ := by
+  unfold writePlaceState at hWrite
+  dsimp only at hWrite
+  rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+  · rw [hNoneS] at hWrite; nomatch hWrite
+  rw [hGetS] at hWrite
+  have hLtT : loc < locals₁.length := by
+    simp only [get?_eq_getElem?] at hGetT
+    exact (List.getElem?_eq_some_iff.mp hGetT).1
+  have hSetT : set? locals₁ loc (.init val) = .some (locals₁.set loc (.init val)) :=
+    set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+  -- Anneal stores `.init val` into every non-dead slot.
+  have hSlots : slots₂ = slots₁.set loc (.init val) ∧ a ≠ .dead := by
+    cases a with
+    | dead => nomatch hWrite
+    | uninit =>
+      dsimp only at hWrite
+      rw [writeToFieldSlot_nil] at hWrite
+      injection hWrite with h
+      exact ⟨h.symm, by intro h'; nomatch h'⟩
+    | init _ =>
+      dsimp only at hWrite
+      rw [writeToFieldSlot_nil] at hWrite
+      injection hWrite with h
+      exact ⟨h.symm, by intro h'; nomatch h'⟩
+    | partialShell _ =>
+      dsimp only at hWrite
+      rw [writeToFieldSlot_nil] at hWrite
+      injection hWrite with h
+      exact ⟨h.symm, by intro h'; nomatch h'⟩
+  obtain ⟨hSlotsEq, hNotDead⟩ := hSlots
+  subst hSlotsEq
+  have hRel' : SlotsRefine NestedSlotStateRefines (slots₁.set loc (.init val))
+      (locals₁.set loc (.init val)) :=
+    SlotsRefine.set (a := .init val) (t := .init val) rfl loc hRel
+  refine ⟨locals₁.set loc (.init val),
+    { mem₁ with borrows := invalidateConflictingBorrows mem₁.borrows loc .none }, ?_, hRel'⟩
+  cases t with
+  | dead =>
+    cases a with
+    | dead => exact False.elim (hNotDead rfl)
+    | uninit => nomatch hAT
+    | init _ => nomatch hAT
+    | partialShell _ => nomatch hAT
+  | uninit =>
+    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+    rw [hRv]
+    dsimp only
+    rw [hGetT]
+    dsimp only
+    rw [hSetT]
+    dsimp only
+    rw [hNoProt]
+  | init _ =>
+    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+    rw [hRv]
+    dsimp only
+    rw [hGetT]
+    dsimp only
+    rw [hSetT]
+    dsimp only
+    rw [hNoProt]
+
+/-- **Projected Assignment Into an Initialized Local on Nested Frames (`evalStmt_assign_init_root_nested_refines`)**:
+For any non-empty destination projection (fields, `Index`, `ConstantIndex`,
+`Subslice`, `Downcast`+`Field`, at any depth) into a local `_l` that holds an
+initialized value, on a frame that may contain partial shells elsewhere:
+whenever Anneal's `writePlaceState` succeeds, Trusted's `evalStmt` `.assign` steps
+(its `ensureNestedFieldShells` pass is the identity on such roots,
+`fieldShellChainPopulated_of_evalValueProjWrite_ok`) and the frames stay related
+by `SlotsRefine NestedSlotStateRefines` (absent active protectors). -/
+theorem evalStmt_assign_init_root_nested_refines
+    (s : MachineState)
+    (slots₁ slots₂ : List LocalSlotState)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val rootVal : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (rootTy : Ty)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hRel : SlotsRefine NestedSlotStateRefines slots₁ locals₁)
+    (hInitRoot : get? slots₁ loc = .some (.init rootVal))
+    (hNoProt : mem₁.activeProtectors = .nil)
+    (hWrite : writePlaceState arityOf slots₁ ⟨loc, proj :: rest⟩ rootTy val = .ok slots₂) :
+    ∃ locals₂ mem₂,
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.assign ⟨loc, proj :: rest⟩ rv, span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
+      SlotsRefine NestedSlotStateRefines slots₂ locals₂ := by
+  have hSame := sameScalarLocals_of_nestedSlotStateRefines hRel
+  have hNoConflict : ∀ (protHead : Nat) (protTail : List Nat),
+      mem₁.activeProtectors = protHead :: protTail →
+      hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) loc .none
+        (match resolveBorrowProjectionElems locals₁ (proj :: rest) with
+         | .some rp => rp
+         | .none => proj :: rest) = false := by
+    intro protHead protTail hAP
+    rw [hNoProt] at hAP
+    nomatch hAP
+  -- Invert the Anneal write on the initialized root.
+  have hShape : ∃ w', slots₂ = slots₁.set loc (.init w') ∧
+      evalValueProjWrite (slotsToTrustedLocals slots₁) rootVal (proj :: rest) val = .ok w' := by
+    unfold writePlaceState at hWrite
+    cases hDeref : Trusted.Rustc.V2026_06_01.MirSemantics.projectionHasDeref (proj :: rest) with
+    | true => rw [hDeref] at hWrite; nomatch hWrite
+    | false =>
+      rw [hDeref] at hWrite
+      dsimp only at hWrite
+      rw [hInitRoot] at hWrite
+      dsimp only [writeToFieldSlot] at hWrite
+      cases hE : evalValueProjWrite (slotsToTrustedLocals slots₁) rootVal (proj :: rest) val with
+      | ub => rw [hE] at hWrite; nomatch hWrite
+      | unsupported => rw [hE] at hWrite; nomatch hWrite
+      | ok w' =>
+        rw [hE] at hWrite
+        injection hWrite with h
+        exact ⟨w', h.symm, rfl⟩
+  obtain ⟨w', hSlotsEq, hE⟩ := hShape
+  subst hSlotsEq
+  rw [evalValueProjWrite_congr_scalar_locals hSame] at hE
+  -- The Trusted root holds the same initialized value.
+  rcases SlotsRefine.get?_rel loc hRel with ⟨hNoneS, _⟩ | ⟨a, t, hGetS, hGetT, hAT⟩
+  · rw [hNoneS] at hInitRoot; nomatch hInitRoot
+  rw [hInitRoot] at hGetS
+  injection hGetS with hA
+  subst hA
+  cases t with
+  | dead => nomatch hAT
+  | uninit => nomatch hAT
+  | init w =>
+  simp only [NestedSlotStateRefines] at hAT
+  subst hAT
+  have hLtT : loc < locals₁.length := by
+    simp only [get?_eq_getElem?] at hGetT
+    exact (List.getElem?_eq_some_iff.mp hGetT).1
+  have hSetT : set? locals₁ loc (.init w') = .some (locals₁.set loc (.init w')) :=
+    set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
+  have hNotDeref : proj ≠ .deref := by
+    intro hP
+    subst hP
+    have := evalValueProjWrite_ok_implies_no_deref locals₁ (.deref :: rest) rootVal val w' hE
+    nomatch this
+  refine ⟨_, _,
+    evalStmt_assign_init_projected_step s loc proj rest rv span localDecls layouts val
+      rootVal w' locals₁ _ mem₁ hNotDeref hRv hGetT
+      (fieldShellChainPopulated_of_evalValueProjWrite_ok locals₁ (proj :: rest) rootVal val w' hE)
+      (evalValueProjWrite_refines_writeProjectedValue (proj :: rest) locals₁ rootVal val w' hE)
+      hSetT hNoConflict,
+    SlotsRefine.set (a := .init w') (t := .init w') rfl loc hRel⟩
 
 /-- **Statement-Level 2-Level Nested Tuple `Assign` Refinement (`evalStmt_assign_two_level_field_nested_refines`)**:
 Generalizes `evalStmt_assign_field_flat_refines` from depth-1 flat writes `_l.i = rv`
