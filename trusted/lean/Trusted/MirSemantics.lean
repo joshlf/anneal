@@ -56,7 +56,10 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   dropValues takeValues extractSubslice readProjectedValue
   setOrExtendFields writeProjectedValue
   sliceConstElemKind evalOperand evalOperands writePlaceValue evalByteCast
-  resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze sharedBorrowPerm
+  resolveBorrowProjectionElems rigidTyIsFreeze tyIsFreeze placeIsFreeze
+  rigidTyIsZeroSized tyIsZeroSized placeIsZeroSized
+  rigidTyIsUninhabited tyIsUninhabited placeIsUninhabited
+  sharedBorrowPerm mutableBorrowPerm fnEntryRetagPerm retagPerm
   evalRvalue evalRvalueWithMemory advanceStmt projectionsOverlap appendValues
   spliceValues sameRigidTyShape operandPointeeTy evalCopySingleDirect
   evalCopyNonOverlappingWithCount evalCopyNonOverlapping

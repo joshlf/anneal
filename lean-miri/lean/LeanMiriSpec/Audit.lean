@@ -40,6 +40,9 @@ import LeanMiriSpec.Correspondence.WitLM3_1
 import LeanMiriSpec.Correspondence.RefLM3_2
 import LeanMiriSpec.Correspondence.SimLM3_2
 import LeanMiriSpec.Correspondence.WitLM3_2
+import LeanMiriSpec.Correspondence.TreeBorrowsRel
+import LeanMiriSpec.Correspondence.SimLM3_3
+import LeanMiriSpec.Correspondence.WitLM3_3
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -467,6 +470,11 @@ open LeanMiriSpec.Correspondence in
   Witness.wit_lm3_1_anneal_storage_revive_divergence
   Witness.wit_lm3_1_anneal_deref_type_pun_divergence
   step_deref_oob_divergence
+  lookupBorrow_map_toBorrowEntry_parentTag
+  derefWriteTreeUB_map_toBorrowEntry_eq_false
+  hasTreeReadUB_map_toBorrowEntry_eq_false
+  perm_ne_disabled_of_tag_eq_of_nodup
+  derefReadTreeUB_map_toBorrowEntry_eq_false
   Witness.wit_lm3_1_use_after_storageDead_ub
   Witness.wit_lm3_1_addrOf_deref_storageDead_real_steps
   Witness.wit_lm3_1_use_after_storageDead_real_steps
@@ -563,6 +571,10 @@ open LeanMiriSpec.Correspondence in
   evalRvalue_reborrow_safeRef_tree_simulation
   step_safeRef_deref_read_tree_simulation
   step_safeRef_deref_write_tree_simulation
+  treeMap_ancestorOrSelf_not_disabled
+  hasTreeReadUB_treeMap_eq_false
+  derefReadTreeUB_treeMap_eq_false
+  derefWriteTreeUB_treeMap_eq_false
   step_terminator_goto_return_tree_simulation
   Witness.wit_lm3_2_ref_never_and_enum_discriminant_validity
   Witness.wit_lm3_2_invalid_bool_deref_read_divergence_real_steps
@@ -7956,10 +7968,10 @@ example :
       get? s₂.frame.locals 2 = some .uninit ∧
       stepMirFn lm32MutRefChainBody s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      StateRelLM3_2 lm32MutRefChainBody s₃ m₃ [entry] ∧
+      StateRelLM3_2 lm32MutRefChainBody s₃ m₃ [{ entry with perm := .active }] ∧
       stepMirFn lm32MutRefChainBody s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_2 lm32MutRefChainBody s₄ m₄ [entry] ∧
+      StateRelLM3_2 lm32MutRefChainBody s₄ m₄ [{ entry with perm := .active }] ∧
       get? s₄.frame.locals 0 = some (.init (.scalar ⟨99, 8⟩)) ∧
       (m₄.stack.frames[0]?.bind (fun tf => (tf.locals[0]?).map Miri.Interpreter.LocalState.value)) =
         some (.live (.immediate (.scalar (.fromScalarInt lm31Scalar99)))) ∧
@@ -8101,6 +8113,7 @@ open LeanMiriSpec.Correspondence in
   evalRvalueIntoPlace_ref_ok
   evalRvalueIntoPlace_ref_force_error
   evalRvalue_ref_simulation
+  evalRvalue_reborrow_root_ok
   LocalRelLM3_2.toLM3_1_of_rawPtr
   LocalRelLM3_2.ref_immediate_cases
   evalRvalue_reborrow_simulation
@@ -9155,13 +9168,13 @@ example :
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       stepMirFn b s₄ = .step s₅ ∧
       Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
-      StateRelLM3_2 b s₅ m₅ [entry] ∧
+      StateRelLM3_2 b s₅ m₅ [{ entry with perm := .active }] ∧
       (∃ am, StepObsRelLM3_2 b m₅ am (stepMirFn b s₅) (Miri.Interpreter.Step.step hooks () m₅)) ∧
       stepMirFn b s₅ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8) s₅.memory ∧
       Miri.Interpreter.Step.step hooks () m₅ = ({ m₅ with stack := ⟨#[]⟩ }, .ok true) ∧
       get? b.localDecls 0 = some decl0 ∧
       annealControlHooks.returnOperand () m₅ = (m₅, .ok (.immediate imm0)) ∧
-      ImmediateRelLM3_2 [entry] decl0.ty b.layouts
+      ImmediateRelLM3_2 [{ entry with perm := .active }] decl0.ty b.layouts
         (.ptr { allocId := 1, offsetBytes := 0 } 8) imm0) ∧
     (∃ (b : CapturedMir) (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState) (msg : String),
       let hooks := annealStepHooks b.localDecls b.layouts
@@ -9292,14 +9305,18 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead ∧
       ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
       (∀ tgtDecl, Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
-        tgtDecl.ty.kind = pointeeKind)) :
+        tgtDecl.ty.kind = pointeeKind))
+    (hanc_read : ∀ ptrVal e,
+      Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
     StepRelLM3_2Tree body m
       (reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx
         s.memory.nextTag)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
   step_reborrow_safeRef_tree_simulation_explicit htree hphase hbb hstmt
-    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm hanc_read
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -9326,7 +9343,11 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead ∧
       ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
       (∀ tgtDecl, Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
-        tgtDecl.ty.kind = pointeeKind)) :
+        tgtDecl.ty.kind = pointeeKind))
+    (hanc_read : ∀ ptrVal e,
+      Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
     ((stepMirFn body s = MirStepNode.fail .ub) ↔
       ∃ m' msg,
         Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
@@ -9338,7 +9359,7 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       ∃ (treeMap' : List ReborrowMapEntry),
         StepRelLM3_2Tree body m treeMap' (MirStepNode.step s') (m', .ok true)) :=
   evalRvalue_reborrow_safeRef_tree_simulation htree hphase hbb hstmt
-    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm hanc_read
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -9362,12 +9383,16 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
         Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead →
           ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
           (∀ decl, Trusted.Sequence.get? body.localDecls e.localIdx = some decl →
-            decl.ty.kind = dstDecl.ty.kind)) :
+            decl.ty.kind = dstDecl.ty.kind))
+    (hanc_read : ∀ ptrVal,
+      Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      ∀ e ∈ treeMap, e.tag = ptrVal.tag →
+        treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
     StepRelLM3_2Tree body m (derefReadNextTreeMap s.frame.locals treeMap refIdx)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
   step_safeRef_deref_read_tree_simulation htree hphase hopKind hbb hstmt
-    hdecl_dst hdecl_ref href_ty hdst_prim himm hlive_ref
+    hdecl_dst hdecl_ref href_ty hdst_prim himm hlive_ref hanc_read
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -9392,12 +9417,16 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
       Trusted.Sequence.get? body.localDecls e.localIdx = some tgtDecl →
       Trusted.Sequence.get? s.frame.locals e.localIdx ≠ some .dead →
       ptrVal.offsetBytes = 0 ∧ (e.perm = .active ∨ e.perm = .reserved) ∧
-        tgtDecl.ty.kind = pointeeKind) :
+        tgtDecl.ty.kind = pointeeKind)
+    (hanc_write : ∀ ptrVal e,
+      Trusted.Sequence.get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      treeBorrowAncestorsChildAccessUB .write s.memory.borrows e.parentTag = false) :
     StepRelLM3_2Tree body m (derefWriteNextTreeMap s.frame.locals treeMap refIdx)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) :=
   step_safeRef_deref_write_tree_simulation htree hphase hbb hstmt
-    hdecl_ref href_ty hval_prim hval_kind hop himm_ref hlive_ref
+    hdecl_ref href_ty hval_prim hval_kind hop himm_ref hlive_ref hanc_write
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {treeMap : List ReborrowMapEntry}
@@ -9435,6 +9464,10 @@ open LeanMiriSpec.Correspondence in
   evalRvalue_reborrow_safeRef_tree_simulation
   step_safeRef_deref_read_tree_simulation
   step_safeRef_deref_write_tree_simulation
+  treeMap_ancestorOrSelf_not_disabled
+  hasTreeReadUB_treeMap_eq_false
+  derefReadTreeUB_treeMap_eq_false
+  derefWriteTreeUB_treeMap_eq_false
   step_terminator_goto_return_tree_simulation
 
 open Trusted.Rustc.V2026_06_01.Layout in
@@ -9504,10 +9537,10 @@ example :
       stepMirFn b (mkPre4AnnealLM32 b (.init (.scalar ⟨42, 8⟩))) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks () (mkPre4MiriLM32 b u64Ty lm32Mls42) =
         (m₁, .ok true) ∧
-      StateRelLM3_2Tree b s₁ m₁ [lm32TreeRoot .active] ∧
+      StateRelLM3_2Tree b s₁ m₁ [lm32TreeRoot .reserved] ∧
       stepMirFn b s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_2Tree b s₂ m₂ [lm32TreeChild .reserved, lm32TreeRoot .active] ∧
+      StateRelLM3_2Tree b s₂ m₂ [lm32TreeChild .reserved, lm32TreeRoot .reserved] ∧
       get? s₂.frame.locals 3 = some (.init (.ptr { allocId := 2, offsetBytes := 0 } 8)) ∧
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
@@ -14193,6 +14226,2220 @@ example :
 
 end LM2_3Pins
 
+
+/-! ### `LM-3.3`: six-state Tree Borrows correspondence -/
+
+example (perm : TreeBorrowPerm) :
+    miriPermToAnneal (annealPermToMiri perm) = perm :=
+  @miriPermToAnneal_annealPermToMiri perm
+
+example (perm : Miri.TreeBorrows.Permission) :
+    annealPermToMiri (miriPermToAnneal perm) = perm :=
+  @annealPermToMiri_miriPermToAnneal perm
+
+example :
+    (∀ perm : TreeBorrowPerm, miriPermToAnneal (annealPermToMiri perm) = perm) ∧
+    (∀ perm : Miri.TreeBorrows.Permission,
+      annealPermToMiri (miriPermToAnneal perm) = perm) :=
+  @TreeBorrowsBijection
+
+example {a b : TreeBorrowPerm}
+    (h : annealPermToMiri a = annealPermToMiri b) :
+    a = b :=
+  @annealPermToMiri_injective a b h
+
+example :
+    annealPermToMiri .active = .Unique ∧
+    annealPermToMiri .reserved = .ReservedFrz false ∧
+    annealPermToMiri .cell = .Cell ∧
+    annealPermToMiri .reservedIM = .ReservedIM ∧
+    TreeBorrowPerm.cell ≠ .reservedIM ∧
+    TreeBorrowPerm.cell ≠ .frozen :=
+  @annealPermToMiri_legacy
+
+example (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    annealTransitionToMiri (treeBorrowPermTransition kind rel perm isProtected) =
+      Miri.TreeBorrows.performAccess
+        (annealAccessKindToMiri kind) (annealRelatednessToMiri rel)
+        (annealPermToMiri perm) isProtected :=
+  @performAccess_permission_simulation kind rel perm isProtected
+
+example (kind : Miri.TreeBorrows.AccessKind) (rel : Miri.TreeBorrows.AccessRelatedness)
+    (perm : Miri.TreeBorrows.Permission) (isProtected : Bool) :
+    Miri.TreeBorrows.performAccess kind rel perm isProtected =
+      annealTransitionToMiri
+        (treeBorrowPermTransition
+          (miriAccessKindToAnneal kind) (miriRelatednessToAnneal rel)
+          (miriPermToAnneal perm) isProtected) :=
+  @performAccess_permission_simulation_miri kind rel perm isProtected
+
+example (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    treeBorrowPermTransition kind rel perm isProtected = .protectedReservedIM ↔
+      perm = .reservedIM ∧ isProtected = true ∧ rel = .foreignAccess :=
+  @protectedReservedIM_characterization kind rel perm isProtected
+
+example (mutability : Mutability) (pointee : RigidTy) :
+    fnEntryRetagPerm mutability pointee ≠ .reservedIM :=
+  @fnEntryRetagPerm_ne_reservedIM mutability pointee
+
+private theorem pin_nodeAccess_locationState_simulation (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool)
+    (sifa : Miri.TreeBorrows.IdempotentForeignAccess)
+    (hskip : rel = .foreignAccess → perm ≠ .disabled) :
+    match treeBorrowNodeAccess kind rel perm isProtected with
+    | .transition next =>
+      ∃ transition,
+        Miri.TreeBorrows.Tree.LocationState.performAccess
+            ⟨annealPermToMiri perm, true, sifa⟩
+            (annealAccessKindToMiri kind) (annealRelatednessToMiri rel) isProtected =
+          .Success ⟨annealPermToMiri next, true, sifa⟩ transition
+    | .ub =>
+      ∃ state error,
+        Miri.TreeBorrows.Tree.LocationState.performAccess
+            ⟨annealPermToMiri perm, true, sifa⟩
+            (annealAccessKindToMiri kind) (annealRelatednessToMiri rel) isProtected =
+          .Error state error
+    | .protectedReservedIM =>
+      Miri.TreeBorrows.Tree.LocationState.performAccess
+          ⟨annealPermToMiri perm, true, sifa⟩
+          (annealAccessKindToMiri kind) (annealRelatednessToMiri rel) isProtected =
+        .PermissionInvariantFailure ⟨annealPermToMiri perm, true, sifa⟩ :=
+  @nodeAccess_locationState_simulation kind rel perm isProtected sifa hskip
+
+example (accessed : Bool) (sifa : Miri.TreeBorrows.IdempotentForeignAccess)
+    (kind : TreeBorrowAccessKind) (isProtected : Bool) :
+    Miri.TreeBorrows.Tree.LocationState.skipIfKnownNoop
+        ⟨.Disabled, accessed, sifa⟩ (annealAccessKindToMiri kind) .ForeignAccess =
+      .SkipSelfAndChildren ∧
+    treeBorrowNodeAccess kind .foreignAccess .disabled isProtected =
+      .transition .disabled :=
+  @disabled_foreign_access_skipped accessed sifa kind isProtected
+
+example (rel : TreeBorrowRelatedness) (perm next : TreeBorrowPerm)
+    (h : treeBorrowNodeAccess .write rel perm true = .transition next) :
+    treeBorrowNodeAccess .write rel perm false = .transition next :=
+  @protected_write_success_eq_unprotected rel perm next h
+
+example :
+    (∀ (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) (place : Place)
+        (ty : Ty),
+      placeTy localDecls layouts place = some ty →
+      sharedBorrowPerm localDecls layouts place =
+        (if tyIsFreeze ty then .frozen else .cell)) ∧
+    (∀ (facts : Miri.TreeBorrows.RetagPolicy.TypeFacts)
+        (config : Miri.TreeBorrows.RetagPolicy.PolicyConfig)
+        (mode : Miri.TreeBorrows.RetagPolicy.RetagMode),
+      mode ≠ .None →
+      ∃ policy,
+        Miri.TreeBorrows.RetagPolicy.create facts .Shared mode config = some policy ∧
+        policy.outsidePermission =
+          annealPermToMiri (if facts.isFreeze then .frozen else .cell) ∧
+        policy.nonfreezePermission = annealPermToMiri .cell ∧
+        policy.freezePermission = annealPermToMiri .frozen) ∧
+    (∀ (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness) (isProtected : Bool),
+      treeBorrowNodeAccess kind rel .cell isProtected = .transition .cell ∧
+      Miri.TreeBorrows.performAccess
+          (annealAccessKindToMiri kind) (annealRelatednessToMiri rel) .Cell isProtected =
+        .Transition .Cell) ∧
+    (∀ isProtected : Bool,
+      treeBorrowNodeAccess .write .localAccess .frozen isProtected = .ub ∧
+      Miri.TreeBorrows.performAccess .Write .LocalAccess .Frozen isProtected =
+        .UndefinedBehavior) ∧
+    (treeBorrowNodeAccess .write .foreignAccess .frozen false = .transition .disabled ∧
+      Miri.TreeBorrows.performAccess .Write .ForeignAccess .Frozen false =
+        .Transition .Disabled) ∧
+    (treeBorrowNodeAccess .write .localAccess .reservedIM false = .transition .unique ∧
+      treeBorrowNodeAccess .read .foreignAccess .unique false = .transition .frozen ∧
+      treeBorrowNodeAccess .write .foreignAccess .unique false = .transition .disabled ∧
+      treeBorrowNodeAccess .write .foreignAccess .reservedIM false =
+        .transition .reservedIM ∧
+      Miri.TreeBorrows.performAccess .Write .LocalAccess .ReservedIM false =
+        .Transition .Unique ∧
+      Miri.TreeBorrows.performAccess .Read .ForeignAccess .Unique false =
+        .Transition .Frozen ∧
+      Miri.TreeBorrows.performAccess .Write .ForeignAccess .ReservedIM false =
+        .Transition .ReservedIM) :=
+  @unsafeCell_permission_simulation
+
+example :
+    (treeBorrowNodeAccess .read .foreignAccess (.reservedFrz false) true =
+        .transition (.reservedFrz true) ∧
+      Miri.TreeBorrows.performAccess .Read .ForeignAccess (.ReservedFrz false) true =
+        .Transition (.ReservedFrz true)) ∧
+    (treeBorrowNodeAccess .write .localAccess (.reservedFrz true) true = .ub ∧
+      Miri.TreeBorrows.performAccess .Write .LocalAccess (.ReservedFrz true) true =
+        .UndefinedBehavior) ∧
+    (treeBorrowNodeAccess .write .localAccess (.reservedFrz true) false =
+        .transition .unique ∧
+      Miri.TreeBorrows.performAccess .Write .LocalAccess (.ReservedFrz true) false =
+        .Transition .Unique) ∧
+    (∀ conflicted : Bool,
+      treeBorrowNodeAccess .read .foreignAccess (.reservedFrz conflicted) false =
+        .transition (.reservedFrz conflicted) ∧
+      Miri.TreeBorrows.performAccess .Read .ForeignAccess (.ReservedFrz conflicted) false =
+        .Transition (.ReservedFrz conflicted)) ∧
+    (∀ (conflicted isProtected : Bool) (kind : TreeBorrowAccessKind)
+        (rel : TreeBorrowRelatedness),
+      annealTransitionToMiri
+          (treeBorrowPermTransition kind rel (.reservedFrz conflicted) isProtected) =
+        Miri.TreeBorrows.performAccess (annealAccessKindToMiri kind)
+          (annealRelatednessToMiri rel) (.ReservedFrz conflicted) isProtected) :=
+  @reservedFrz_conflicted_bijection
+
+example :
+    treeBorrowNodeAccess .read .foreignAccess (.reservedFrz true) true =
+        .transition (.reservedFrz true) ∧
+    treeBorrowNodeAccess .write .foreignAccess (.reservedFrz true) true = .ub ∧
+    Miri.TreeBorrows.performAccess .Write .ForeignAccess (.ReservedFrz true) true =
+      .Transition .Disabled :=
+  @reservedFrz_conflicted_protected_foreign
+
+example (localDecls : List MirAst.LocalDecl) (layouts : Layout.LayoutTable) (place : Place)
+    (ty : Ty) (hty : placeTy localDecls layouts place = some ty)
+    (mutability : Mutability) (pointee : RigidTy) :
+    sharedBorrowPerm localDecls layouts place =
+      annealRetagPerm .default .not (tyIsFreeze ty) ∧
+    mutableBorrowPerm localDecls layouts place =
+      annealRetagPerm .default .mut (tyIsFreeze ty) ∧
+    mutableBorrowPerm localDecls layouts place =
+      annealRetagPerm .twoPhase .mut (tyIsFreeze ty) ∧
+    fnEntryRetagPerm mutability pointee =
+      annealRetagPerm .fnEntry mutability (rigidTyIsFreeze 16 pointee) :=
+  @annealRetagPerm_eq_trusted localDecls layouts place ty hty mutability pointee
+
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool)
+    (facts : Miri.TreeBorrows.RetagPolicy.TypeFacts)
+    (hunpin : facts.isUnpin = true) (hunsafeUnpin : facts.isUnsafeUnpin = true)
+    (hfreeze : facts.isFreeze = frozen) :
+    ∃ policy,
+      Miri.TreeBorrows.RetagPolicy.create facts (annealRefKindToMiri mutability)
+          (annealRetagModeToMiri mode) ⟨false, false⟩ = some policy ∧
+      policy.outsidePermission = annealPermToMiri (annealRetagPerm mode mutability frozen) ∧
+      (if frozen then policy.freezePermission else policy.nonfreezePermission) =
+        annealPermToMiri (annealRetagPerm mode mutability frozen) ∧
+      (policy.protector.isSome = true ↔ mode = .fnEntry) ∧
+      (∃ state,
+        Miri.TreeBorrows.RetagPolicy.initialLocationState policy frozen = .ok state ∧
+        state.permission = annealPermToMiri (annealRetagPerm mode mutability frozen) ∧
+        (state.accessed = true ↔ annealRetagPerm mode mutability frozen ≠ .cell)) ∧
+      (mode = .fnEntry → annealRetagPerm mode mutability frozen ≠ .reservedIM) :=
+  @retag_pipeline_simulation mode mutability frozen facts hunpin hunsafeUnpin hfreeze
+
+example (facts : Miri.TreeBorrows.RetagPolicy.TypeFacts)
+    (kind : Miri.TreeBorrows.RetagPolicy.ReferenceKind)
+    (config : Miri.TreeBorrows.RetagPolicy.PolicyConfig)
+    (policy : Miri.TreeBorrows.RetagPolicy.NewPermission)
+    (h : Miri.TreeBorrows.RetagPolicy.create facts kind .FnEntry config = some policy) :
+    policy.freezePermission ≠ .ReservedIM ∧
+    policy.nonfreezePermission ≠ .ReservedIM ∧
+    policy.outsidePermission ≠ .ReservedIM :=
+  @miri_fnEntry_policy_never_reservedIM facts kind config policy h
+
+example (tree : Miri.TreeBorrows.Tree.TraversalTree) (start : Nat) :
+    tree.ancestorPath start = traversalAncestorPathAux tree tree.nodes.size start :=
+  @ancestorPath_eq_traversalAncestorPathAux tree start
+
+example (tree : Miri.TreeBorrows.Tree.TraversalTree)
+    (skipNodes : List Nat) :
+    ∀ (fuel index : Nat) (event : Miri.TreeBorrows.Tree.TraversalEvent),
+      event ∈ traversalForeignPostorder tree skipNodes fuel index →
+      event.relatedness = .ForeignAccess :=
+  @traversalForeignPostorder_foreign tree skipNodes
+
+example (tree : Miri.TreeBorrows.Tree.TraversalTree)
+    (start : Nat) (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode) (skipNodes : List Nat) :
+    ∃ foreignEvents,
+      (tree.traverse start mode skipNodes).2 =
+        (tree.ancestorPath start).map (fun index => ⟨index, .LocalAccess⟩) ++ foreignEvents ∧
+      ∀ event ∈ foreignEvents, event.relatedness = .ForeignAccess :=
+  @traverse_local_then_foreign tree start mode skipNodes
+
+example {α : Type} (xs : List α) :
+    length xs = xs.length :=
+  @sequence_length_eq α xs
+
+example (borrows : List BorrowEntry) :
+    (annealTraversalTree borrows).nodes.size = borrows.length :=
+  @annealTraversalTree_size borrows
+
+example (borrows : List BorrowEntry) (s : Nat)
+    (hs : s < borrows.length) :
+    (annealTraversalTree borrows).nodes[s]?.getD ⟨none, []⟩ =
+      annealTraversalNode borrows borrows[s] :=
+  @annealTraversalTree_node borrows s hs
+
+example {entry : BorrowEntry} {rest : List BorrowEntry}
+    (h : BorrowTagsUnique (entry :: rest)) :
+    BorrowTagsUnique rest :=
+  @BorrowTagsUnique.tail entry rest h
+
+example {entry : BorrowEntry} {rest : List BorrowEntry}
+    (h : BorrowTagsUnique (entry :: rest)) (j : Nat) (hj : j < rest.length) :
+    entry.tag ≠ rest[j].tag :=
+  @BorrowTagsUnique.head_ne entry rest h j hj
+
+example (borrows : List BorrowEntry) (huniq : BorrowTagsUnique borrows)
+    (j : Nat) (hj : j < borrows.length) :
+    lookupBorrow borrows borrows[j].tag = some borrows[j] :=
+  @lookupBorrow_getElem borrows huniq j hj
+
+example (borrows : List BorrowEntry)
+    (huniq : BorrowTagsUnique borrows) (j : Nat) (hj : j < borrows.length) :
+    borrowIndexOfTag borrows borrows[j].tag = some j :=
+  @borrowIndexOfTag_getElem borrows huniq j hj
+
+example (borrows : List BorrowEntry) (tag p : Nat)
+    (h : borrowIndexOfTag borrows tag = some p) :
+    ∃ hp : p < borrows.length, borrows[p].tag = tag :=
+  @borrowIndexOfTag_some borrows tag p h
+
+example (borrows : List BorrowEntry) (tag : Nat)
+    (h : borrowIndexOfTag borrows tag = none) :
+    lookupBorrow borrows tag = none ∧
+      ∀ (j : Nat) (hj : j < borrows.length), borrows[j].tag ≠ tag :=
+  @borrowIndexOfTag_none borrows tag h
+
+example (borrows : List BorrowEntry) (tag : Nat)
+    (hlookup : lookupBorrow borrows tag = none)
+    (hne : ∀ (j : Nat) (hj : j < borrows.length), borrows[j].tag ≠ tag)
+    (n i : Nat) (hi : i < borrows.length) :
+    isBorrowDescendantOrSelfAux n borrows tag borrows[i].tag = false :=
+  @isBorrowDescendantOrSelfAux_absent borrows tag hlookup hne n i hi
+
+example (borrows : List BorrowEntry)
+    (huniq : BorrowTagsUnique borrows) (i : Nat) (hi : i < borrows.length) :
+    ∀ (n s : Nat) (hs : s < borrows.length),
+      i ∈ traversalAncestorPathAux (annealTraversalTree borrows) n s ↔
+        isBorrowDescendantOrSelfAux n borrows borrows[s].tag borrows[i].tag = true :=
+  @traversalAncestorPathAux_iff borrows huniq i hi
+
+example (borrows : List BorrowEntry)
+    (huniq : BorrowTagsUnique borrows) (s : Nat) (hs : s < borrows.length)
+    (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode) (skipNodes : List Nat) :
+    (∃ foreignEvents,
+      ((annealTraversalTree borrows).traverse s mode skipNodes).2 =
+        ((annealTraversalTree borrows).ancestorPath s).map
+            (fun index => ⟨index, .LocalAccess⟩) ++ foreignEvents ∧
+      ∀ event ∈ foreignEvents, event.relatedness = .ForeignAccess) ∧
+    (∀ (i : Nat) (hi : i < borrows.length),
+      i ∈ (annealTraversalTree borrows).ancestorPath s ↔
+        isBorrowDescendantOrSelf borrows borrows[s].tag borrows[i].tag = true) ∧
+    (∀ (i : Nat) (hi : i < borrows.length) (kind : TreeBorrowAccessKind)
+        (isProtected : Bool) (sifa : Miri.TreeBorrows.IdempotentForeignAccess),
+      let rel : TreeBorrowRelatedness :=
+        if isBorrowDescendantOrSelf borrows borrows[s].tag borrows[i].tag = true
+        then .localAccess else .foreignAccess
+      (rel = .foreignAccess → borrows[i].perm ≠ .disabled) →
+      match treeBorrowNodeAccess kind rel borrows[i].perm isProtected with
+      | .transition next =>
+        ∃ transition,
+          Miri.TreeBorrows.Tree.LocationState.performAccess
+              ⟨annealPermToMiri borrows[i].perm, true, sifa⟩
+              (annealAccessKindToMiri kind) (annealRelatednessToMiri rel) isProtected =
+            .Success ⟨annealPermToMiri next, true, sifa⟩ transition
+      | .ub =>
+        ∃ state error,
+          Miri.TreeBorrows.Tree.LocationState.performAccess
+              ⟨annealPermToMiri borrows[i].perm, true, sifa⟩
+              (annealAccessKindToMiri kind) (annealRelatednessToMiri rel) isProtected =
+            .Error state error
+      | .protectedReservedIM =>
+        Miri.TreeBorrows.Tree.LocationState.performAccess
+            ⟨annealPermToMiri borrows[i].perm, true, sifa⟩
+            (annealAccessKindToMiri kind) (annealRelatednessToMiri rel) isProtected =
+          .PermissionInvariantFailure ⟨annealPermToMiri borrows[i].perm, true, sifa⟩) :=
+  @normalTree_relative_access_simulation borrows huniq s hs mode skipNodes
+
+example (borrows : List BorrowEntry)
+    (h : (borrows.map BorrowEntry.tag).Nodup) :
+    BorrowTagsUnique borrows :=
+  @borrowTagsUnique_of_nodup borrows h
+
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    (annealPermToMiri (annealRetagPerm mode mutability frozen)).associatedAccess =
+      (match annealRetagPerm mode mutability frozen with
+       | .cell => none
+       | _ => some Miri.TreeBorrows.AccessKind.Read) :=
+  @retagPointerValue_associatedAccess_simulation mode mutability frozen
+
+example (state : Miri.TreeBorrows.RetagPipeline.MachineState Unit)
+    (request : Miri.TreeBorrows.RetagPipeline.Request)
+    (hshape : request.typeShape = .rawPointer) :
+    Miri.TreeBorrows.RetagPipeline.retagPointerValue state request =
+      if request.mode = .Raw then
+        { state := state, outcome := .ok none, events := #[] }
+      else
+        { state := state, outcome := .error .rawPointerWrongMode, events := #[] } :=
+  @retagPointerValue_rawPointer_simulation state request hshape
+
+example (allBorrows : List BorrowEntry) (tag : Nat) :
+    isBorrowDescendantOrSelf allBorrows tag tag = true :=
+  @isBorrowDescendantOrSelf_self_eq_true allBorrows tag
+
+example (allBorrows : List BorrowEntry)
+    (entry : BorrowEntry)
+    (writerTag : Option Nat) :
+    treeBorrowWriterRelatedness entry
+      (resolveTreeBorrowWriterTag allBorrows entry writerTag) =
+      treeBorrowAccessRelatedness allBorrows entry writerTag :=
+  @treeBorrowWriterRelatedness_resolveTreeBorrowWriterTag allBorrows entry writerTag
+
+example (allBorrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (entry : BorrowEntry)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat)
+    (hloc : entry.targetLocal = targetLocal)
+    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true) :
+    borrowEntryReadUB allBorrows activeProtectors entry targetLocal readerTag
+        readProj readRangeOff readRangeLen =
+      treeBorrowTransitionIsUB
+        (treeBorrowNodeAccess .read
+          (treeBorrowAccessRelatedness allBorrows entry readerTag)
+          entry.perm
+          (isBorrowProtected activeProtectors entry)) :=
+  @borrowEntryReadUB_eq_nodeAccess allBorrows activeProtectors entry targetLocal
+    readerTag readProj readRangeOff readRangeLen hloc hov
+
+example (allBorrows : List BorrowEntry)
+    (entry : BorrowEntry)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hloc : entry.targetLocal = targetLocal)
+    (hov : borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = true) :
+    updateBorrowPermOnReadAtProj allBorrows entry targetLocal readerTag
+        readProj readRangeOff readRangeLen activeProtectors =
+      applyTreeBorrowTransition entry
+        (treeBorrowNodeAccess .read
+          (treeBorrowAccessRelatedness allBorrows entry readerTag)
+          entry.perm
+          (isBorrowProtected activeProtectors entry)) :=
+  @updateBorrowPermOnReadAtProj_eq_nodeAccess allBorrows entry targetLocal readerTag
+    readProj readRangeOff readRangeLen activeProtectors hloc hov
+
+example (allBorrows borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat) :
+    hasTreeReadUB allBorrows borrows activeProtectors targetLocal readerTag
+        readProj readRangeOff readRangeLen = true ↔
+      ∃ entry ∈ borrows,
+        borrowEntryReadUB allBorrows activeProtectors entry targetLocal readerTag
+          readProj readRangeOff readRangeLen = true :=
+  @hasTreeReadUB_iff_exists allBorrows borrows activeProtectors targetLocal
+    readerTag readProj readRangeOff readRangeLen
+
+example (allBorrows : List BorrowEntry)
+    (entry : BorrowEntry)
+    (writerTag : Option Nat) :
+    borrowEntryWriteConflicts entry
+        (resolveTreeBorrowWriterTag allBorrows entry writerTag) =
+      treeBorrowTransitionIsUB
+        (treeBorrowNodeAccess .write
+          (treeBorrowAccessRelatedness allBorrows entry writerTag)
+          entry.perm
+          true) :=
+  @borrowEntryWriteConflicts_resolve_eq_nodeAccess allBorrows entry writerTag
+
+example (allBorrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (entry : BorrowEntry)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen : Nat)
+    (hloc : entry.targetLocal = targetLocal)
+    (hov : borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = true)
+    (hno_prot_ub :
+      Bool.and (isBorrowProtected activeProtectors entry)
+        (borrowEntryWriteConflicts entry
+          (resolveTreeBorrowWriterTag allBorrows entry writerTag)) = false) :
+    updateBorrowPermTreeAtProj allBorrows entry targetLocal writerTag
+        writeProj writeRangeOff writeRangeLen =
+      applyTreeBorrowTransition entry
+        (treeBorrowNodeAccess .write
+          (treeBorrowAccessRelatedness allBorrows entry writerTag)
+          entry.perm
+          (isBorrowProtected activeProtectors entry)) :=
+  @updateBorrowPermTreeAtProj_eq_nodeAccess allBorrows activeProtectors entry targetLocal
+    writerTag writeProj writeRangeOff writeRangeLen hloc hov hno_prot_ub
+
+example (allBorrows borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen : Nat) :
+    hasProtectedTreeWriteConflict allBorrows borrows activeProtectors targetLocal
+        writerTag writeProj writeRangeOff writeRangeLen = true ↔
+      ∃ entry ∈ borrows,
+        Bool.and (Nat.beq entry.targetLocal targetLocal)
+          (Bool.and (borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen)
+            (Bool.and (isBorrowProtected activeProtectors entry)
+              (treeBorrowTransitionIsUB
+                (treeBorrowNodeAccess .write
+                  (treeBorrowAccessRelatedness allBorrows entry writerTag)
+                  entry.perm true)))) = true :=
+  @hasProtectedTreeWriteConflict_iff_exists allBorrows borrows activeProtectors targetLocal
+    writerTag writeProj writeRangeOff writeRangeLen
+
+example (allBorrows borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat) :
+    freezeTreeBorrowsOnReadAtProj allBorrows borrows targetLocal readerTag
+        readProj readRangeOff readRangeLen activeProtectors =
+      borrows.map (fun e =>
+        updateBorrowPermOnReadAtProj allBorrows e targetLocal readerTag
+          readProj readRangeOff readRangeLen activeProtectors) :=
+  @freezeTreeBorrowsOnReadAtProj_eq_map allBorrows borrows targetLocal readerTag
+    readProj readRangeOff readRangeLen activeProtectors
+
+example (allBorrows borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen : Nat) :
+    invalidateTreeBorrowsAtProj allBorrows borrows targetLocal writerTag
+        writeProj writeRangeOff writeRangeLen =
+      borrows.map (fun e =>
+        updateBorrowPermTreeAtProj allBorrows e targetLocal writerTag
+          writeProj writeRangeOff writeRangeLen) :=
+  @invalidateTreeBorrowsAtProj_eq_map allBorrows borrows targetLocal writerTag
+    writeProj writeRangeOff writeRangeLen
+
+example (borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (i : Nat) (hi : i < borrows.length) :
+    (basedNormalTree borrows activeProtectors).stateAt i =
+      some ⟨annealPermToMiri borrows[i].perm, true, .None⟩ :=
+  @basedNormalTree_stateAt_lt borrows activeProtectors i hi
+
+example (borrows : List BorrowEntry) (activeProtectors : List Nat) :
+    (basedNormalTree borrows activeProtectors).stateAt borrows.length =
+      some ⟨.Unique, true, .None⟩ :=
+  @basedNormalTree_stateAt_base borrows activeProtectors
+
+example (borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (hnodup : (borrows.map BorrowEntry.tag).Nodup) :
+    TreeBorrowsRel borrows activeProtectors (basedNormalTree borrows activeProtectors) :=
+  @basedNormalTree_rel borrows activeProtectors hnodup
+
+example (allBorrows borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hnodup : (borrows.map BorrowEntry.tag).Nodup) :
+    let borrows' := freezeTreeBorrowsOnReadAtProj allBorrows borrows targetLocal
+      readerTag readProj readRangeOff readRangeLen activeProtectors
+    (borrows'.map BorrowEntry.tag).Nodup ∧
+      TreeBorrowsRel borrows' activeProtectors (basedNormalTree borrows' activeProtectors) :=
+  @freezeTreeBorrowsOnReadAtProj_preserves_rel allBorrows borrows targetLocal
+    readerTag readProj readRangeOff readRangeLen activeProtectors hnodup
+
+example (allBorrows borrows : List BorrowEntry)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hnodup : (borrows.map BorrowEntry.tag).Nodup) :
+    let borrows' := invalidateTreeBorrowsAtProj allBorrows borrows targetLocal
+      writerTag writeProj writeRangeOff writeRangeLen
+    (borrows'.map BorrowEntry.tag).Nodup ∧
+      TreeBorrowsRel borrows' activeProtectors (basedNormalTree borrows' activeProtectors) :=
+  @invalidateTreeBorrowsAtProj_preserves_rel allBorrows borrows targetLocal
+    writerTag writeProj writeRangeOff writeRangeLen activeProtectors hnodup
+
+example (retagKind : RetagKind) (mutability : Mutability) (pointee : RigidTy) :
+    retagPerm retagKind mutability pointee =
+      annealRetagPerm (retagKindToAnnealMode retagKind) mutability
+        (rigidTyIsFreeze 16 pointee) :=
+  @annealRetagPerm_eq_retagPerm retagKind mutability pointee
+
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    let rootTree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let facts : Miri.TreeBorrows.RetagPolicy.TypeFacts :=
+      { isUnpin := true, isUnsafeUnpin := true, isFreeze := frozen }
+    let perm := annealRetagPerm mode mutability frozen
+    ∃ policy st,
+      Miri.TreeBorrows.RetagPolicy.create facts (annealRefKindToMiri mutability)
+        (annealRetagModeToMiri mode) ⟨false, false⟩ = some policy ∧
+      Miri.TreeBorrows.RetagPolicy.initialLocationState policy frozen = .ok st ∧
+      let inside := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 8) st
+      let child := rootTree.newChild Miri.ABI.Size.ZERO (.concrete retagParentTag)
+        retagChildTag inside policy.outsidePermission policy.protector.isSome
+      child.outcome = .ok () ∧
+      child.tree.nthParent retagChildTag 1 = .ok retagParentTag ∧
+      (borrowTreeTagLocationState child.tree retagChildTag).map
+          (fun s => (s.permission, s.accessed)) =
+        some (annealPermToMiri perm, annealPermToMiri perm != .Cell) :=
+  @borrowTree_newChild_reference_simulation mode mutability frozen
+
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest Miri.ABI.Size.ZERO mode mutability frozen)
+    res.outcome = .ok (some (.concrete retagTestAllocId retagChildTag)) ∧
+    res.state.global.protectedTags.contains retagChildTag = (mode == .fnEntry) ∧
+    res.state.frame.protectedTags =
+      (if mode == .fnEntry then #[(retagTestAllocId, retagChildTag)] else #[]) ∧
+    (res.state.global.endCall res.state.frame).protectedTags.contains retagChildTag = false ∧
+    Miri.TreeBorrows.RetagPipeline.Event.childInserted retagChildTag ∈ res.events.toList ∧
+    (res.state.memory.live.find? fun e => e.1 == retagTestAllocId).bind
+        (fun e => (e.2.allocation.extra.nthParent retagChildTag 1).toOption) =
+      some retagParentTag :=
+  @retagPointerValue_zst_reference_simulation mode mutability frozen
+
+example (mode : AnnealRetagMode) :
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest (Miri.ABI.Size.ofBytes 8) mode .not false)
+    res.outcome = .ok (some (.concrete retagTestAllocId retagChildTag)) ∧
+    res.state.global.protectedTags.contains retagChildTag = (mode == .fnEntry) ∧
+    res.state.frame.protectedTags =
+      (if mode == .fnEntry then #[(retagTestAllocId, retagChildTag)] else #[]) ∧
+    (res.state.global.endCall res.state.frame).protectedTags.contains retagChildTag = false ∧
+    (∀ k r, Miri.TreeBorrows.RetagPipeline.Event.parentTreeAccess k r ∉ res.events.toList) ∧
+    Miri.TreeBorrows.RetagPipeline.Event.childInserted retagChildTag ∈ res.events.toList ∧
+    (res.state.memory.live.find? fun e => e.1 == retagTestAllocId).bind
+        (fun e => (e.2.allocation.extra.nthParent retagChildTag 1).toOption) =
+      some retagParentTag ∧
+    (liveTagLocationState res.state.memory retagChildTag).map
+        (fun s => (s.permission, s.accessed)) =
+      some (.Cell, false) :=
+  @retagPointerValue_cell_8byte_simulation mode
+
+example (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let res := (hooksTwoNodeTree perm).performNormalAccessAt (hooksLocTree perm)
+      (hooksAccessIndex rel) (annealAccessKindToMiri kind)
+      (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed
+    let out := treeBorrowNodeAccess kind rel perm isProtected
+    let dummy : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := perm }
+    res.outcome = .ok () ∧
+    res.access.root = 0 ∧
+    (res.access.status = .Completed ↔ treeBorrowTransitionIsUB out = false) ∧
+    (res.access.status = .Completed →
+      (res.location.perms.get ⟨1⟩).map (·.permission) =
+        some (annealPermToMiri (applyTreeBorrowTransition dummy out).perm)) :=
+  @borrowTree_performNormalAccessAt_simulation kind rel perm isProtected
+
+example (isProtected : Bool) :
+    let tree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let mem := liveTreeMemory tree
+    let alloc := liveTreeAllocation tree
+    let ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance) :=
+      ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId retagParentTag)⟩
+    let range := Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+    let res := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite
+      mem ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      alloc ptr retagTestAllocId (.concrete retagParentTag) range
+    res.outcome = .ok () ∧ res.memory = mem :=
+  @machineMemoryHooks_fresh_root_write_simulation isProtected
+
+example (size : Miri.ABI.Size) (hpos : size.bytes ≠ 0)
+    (borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (start : Nat) (kind : Miri.TreeBorrows.AccessKind)
+    (mode : Miri.TreeBorrows.Tree.ChildrenVisitMode) :
+    let nt := basedNormalTree borrows activeProtectors
+    let rt := Miri.TreeBorrows.Tree.RangedNormalTreeState.new size
+      nt.topology nt.defaultStates nt.protectedNodes nt.locationStates
+    let nres := nt.performAccess start kind mode
+    let rres := rt.performAccessRange Miri.ABI.Size.ZERO size start kind mode
+    rres.locations = #[⟨⟨0, size.bytes⟩, nres⟩] ∧
+    (rres.status = .Completed ↔ nres.status = .Completed) ∧
+    rres.state.locations = Miri.DataStructures.DedupRangeMap.new size nres.tree.locationStates :=
+  @rangedNormalTree_performAccessRange_simulation size hpos borrows activeProtectors start kind mode
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (perm : TreeBorrowPerm) (isProtected : Bool) :
+    TreeBorrowsRel (childState perm isProtected).memory.borrows (activeOf isProtected)
+      (basedNormalTree (childState perm isProtected).memory.borrows (activeOf isProtected)) ∧
+    StepTreeRel (stepMirFn childWriteBody (childState perm isProtected))
+      ((basedNormalTree (childState perm isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 0 .Write .VisitChildrenOfAccessed) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_child_write_step perm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (perm : TreeBorrowPerm) (isProtected : Bool) :
+    StepTreeRel (stepMirFn childReadBody (childState perm isProtected))
+      ((basedNormalTree (childState perm isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 0 .Read .VisitChildrenOfAccessed) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_child_read_step perm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (perm : TreeBorrowPerm) (isProtected : Bool) :
+    TreeBorrowsRel (foreignState perm .unique isProtected).memory.borrows
+      (activeOf isProtected)
+      (basedNormalTree (foreignState perm .unique isProtected).memory.borrows
+        (activeOf isProtected)) ∧
+    StepTreeRel (stepMirFn foreignWriteBody (foreignState perm .unique isProtected))
+      ((basedNormalTree (foreignState perm .unique isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 0 .Write .VisitChildrenOfAccessed) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_foreign_write_step perm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (perm : TreeBorrowPerm) (isProtected : Bool) :
+    StepTreeRel (stepMirFn foreignReadBody (foreignState perm .frozen isProtected))
+      ((basedNormalTree (foreignState perm .frozen isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 0 .Read .VisitChildrenOfAccessed) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_foreign_read_step perm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (parentPerm childPerm : TreeBorrowPerm) (isProtected : Bool) :
+    TreeBorrowsRel (reborrowHierarchyState parentPerm childPerm isProtected).memory.borrows
+      (activeOf isProtected)
+      (basedNormalTree (reborrowHierarchyState parentPerm childPerm isProtected).memory.borrows
+        (activeOf isProtected)) ∧
+    StepTreeRel
+      (stepMirFn foreignWriteBody (reborrowHierarchyState parentPerm childPerm isProtected))
+      ((basedNormalTree (reborrowHierarchyState parentPerm childPerm isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 0 .Write .VisitChildrenOfAccessed) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_reborrow_child_write_step
+    parentPerm childPerm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (childPerm : TreeBorrowPerm) (isProtected : Bool) :
+    StepTreeRel
+      (stepMirFn childWriteBody (reborrowHierarchyState .unique childPerm isProtected))
+      ((basedNormalTree (reborrowHierarchyState .unique childPerm isProtected).memory.borrows
+        (activeOf isProtected)).performAccess 1 .Write .VisitChildrenOfAccessed) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_reborrow_parent_write_invalidates_child_step
+    childPerm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability) (frozen : Bool) :
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability frozen
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let siblingPerm := match childPerm with | .cell => TreeBorrowPerm.unique | _ => .frozen
+    let activeProts := match rk with | .fnEntry => [2] | _ => []
+    ∃ s' : MachineState,
+      stepMirFn (retagRefBody rk mutability frozen) retagRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt, entry 2 siblingPerm, entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_ref_step rk mutability frozen
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+private theorem pin_sim_lm3_3_retag_raw_step (rk : RetagKind) (mutability : Mutability)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    match rk with
+    | .raw =>
+      ∃ s' : MachineState,
+        stepMirFn (retagRawBody rk mutability) (childState perm isProtected) = .step s' ∧
+        s'.memory = (childState perm isProtected).memory ∧
+        get? s'.frame.locals 2 = some (.init (.ptr ⟨1, 0⟩ 8))
+    | .default | .twoPhase | .fnEntry =>
+      stepMirFn (retagRawBody rk mutability) (childState perm isProtected) = .fail .ub :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_raw_step rk mutability perm isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyA initA = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn bodyA s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .reserved (some 1), entry 1 .reserved] ∧
+      stepMirFn bodyA s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entry 3 .frozen (some 1), entry 2 .reserved (some 1), entry 1 .reserved] ∧
+      stepMirFn bodyA s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .disabled (some 1), entry 2 .unique (some 1), entry 1 .unique] ∧
+      get? s₄.frame.locals 1 = some (.init (.scalar ⟨99, 8⟩)) ∧
+      stepMirFn bodyA s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 3 .disabled (some 1), entry 2 .frozen (some 1), entry 1 .unique] ∧
+      get? s₅.frame.locals 0 = some (.init (.scalar ⟨99, 8⟩)) ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        (basedNormalTree s₃.memory.borrows []) ∧
+      ((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₄.memory.borrows []
+        ((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 2 .Read
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₅.memory.borrows []
+        (((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 2 .Read
+          .VisitChildrenOfAccessed).tree :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_reborrow_hierarchy_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ : MachineState,
+      stepMirFn bodyB initBC = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn bodyB s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      s₂.memory.activeProtectors = [1] ∧
+      get? s₂.frame.locals 2 = some (.init (.ptr ⟨2, 0⟩ 8)) ∧
+      stepMirFn bodyB s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn bodyB s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz true) (some 1) (some 1), entry 1 .reserved] ∧
+      get? s₄.frame.locals 0 = some (.init (.scalar ⟨5, 8⟩)) ∧
+      stepMirFn bodyB s₄ = .fail .ub ∧
+      TreeBorrowsRel s₃.memory.borrows [1] (basedNormalTree s₃.memory.borrows [1]) ∧
+      ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₄.memory.borrows [1]
+        ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Write
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden (.ReservedFrz true)) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_protected_conflict_ub_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ : MachineState,
+      stepMirFn bodyC initBC = .step s₁ ∧
+      stepMirFn bodyC s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn bodyC s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      get? s₃.frame.locals 1 = some (.init (.scalar ⟨9, 8⟩)) ∧
+      stepMirFn bodyC s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .frozen, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyC s₄ = .fail .ub ∧
+      TreeBorrowsRel s₄.memory.borrows [1] (basedNormalTree s₄.memory.borrows [1]) ∧
+      ((basedNormalTree s₄.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ProtectedDisabled .Unique) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_protected_unique_foreign_read_ub_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    (∃ s₁ s₂ s₃ s₄ : MachineState,
+      stepMirFn (bodyD unsafeCellU32T) initD = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .cell] ∧
+      stepMirFn (bodyD unsafeCellU32T) s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .unique, entry 1 .cell] ∧
+      stepMirFn (bodyD unsafeCellU32T) s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique, entry 1 .cell] ∧
+      stepMirFn (bodyD unsafeCellU32T) s₃ = .step s₄ ∧
+      get? s₄.frame.locals 0 = some (.init (.scalar ⟨7, 4⟩)) ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status = .Completed) ∧
+    (∃ s₁ s₂ s₃ : MachineState,
+      stepMirFn (bodyD u32T) initD = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .frozen] ∧
+      stepMirFn (bodyD u32T) s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .unique, entry 1 .frozen] ∧
+      stepMirFn (bodyD u32T) s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique, entry 1 .disabled] ∧
+      stepMirFn (bodyD u32T) s₃ = .fail .ub ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden .Disabled)) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_unsafe_cell_vs_freeze_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyE initD = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reservedIM] ∧
+      stepMirFn bodyE s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .unique, entry 1 .reservedIM] ∧
+      stepMirFn bodyE s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique, entry 1 .reservedIM] ∧
+      get? s₃.frame.locals 1 = some (.init (.scalar ⟨10, 4⟩)) ∧
+      stepMirFn bodyE s₃ = .step s₄ ∧
+      s₄.memory.borrows = [entry 2 .disabled, entry 1 .unique] ∧
+      get? s₄.frame.locals 1 = some (.init (.scalar ⟨20, 4⟩)) ∧
+      stepMirFn bodyE s₄ = .step s₅ ∧
+      s₅.memory.borrows = [entry 2 .disabled, entry 1 .disabled] ∧
+      stepMirFn bodyE s₅ = .fail .ub ∧
+      ((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₄.memory.borrows []
+        ((basedNormalTree s₃.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden .Disabled) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_reservedIM_lifecycle_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyF initF = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .cell] ∧
+      stepMirFn bodyF s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .reservedIM, entry 1 .cell] ∧
+      stepMirFn bodyF s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique, entry 1 .cell] ∧
+      stepMirFn bodyF s₃ = .step s₄ ∧
+      s₄.memory.borrows = [entry 3 .cell (some 1), entry 2 .unique, entry 1 .cell] ∧
+      stepMirFn bodyF s₄ = .step s₅ ∧
+      s₅.memory.borrows = [entry 3 .cell (some 1), entry 2 .unique, entry 1 .cell] ∧
+      get? s₅.frame.locals 1 = some (.init (.scalar ⟨99, 4⟩)) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_cell_reborrow_preserves_unique_real_steps
+
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool) :
+    let res := Miri.TreeBorrows.RetagPipeline.retagPointerValue
+      retagInitialMachineState (retagRefRequest (Miri.ABI.Size.ofBytes 8) mode mutability frozen)
+    let perm := annealRetagPerm mode mutability frozen
+    res.outcome = .ok (some (.concrete retagTestAllocId retagChildTag)) ∧
+    res.state.global.protectedTags.contains retagChildTag = (mode == .fnEntry) ∧
+    res.state.frame.protectedTags =
+      (if mode == .fnEntry then #[(retagTestAllocId, retagChildTag)] else #[]) ∧
+    (res.state.global.endCall res.state.frame).protectedTags.contains retagChildTag = false ∧
+    (Miri.TreeBorrows.RetagPipeline.Event.parentTreeAccess .Read ⟨0, 8⟩ ∈ res.events.toList ↔
+      perm ≠ .cell) ∧
+    Miri.TreeBorrows.RetagPipeline.Event.childInserted retagChildTag ∈ res.events.toList ∧
+    (res.state.memory.live.find? fun e => e.1 == retagTestAllocId).bind
+        (fun e => (e.2.allocation.extra.nthParent retagChildTag 1).toOption) =
+      some retagParentTag ∧
+    (liveTagLocationState res.state.memory retagChildTag).map (fun s => (s.permission, s.accessed)) =
+      some (annealPermToMiri perm, annealPermToMiri perm != .Cell) :=
+  @retagPointerValue_8byte_reference_simulation mode mutability frozen
+
+example (kind : TreeBorrowAccessKind) (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let tree := hooksTwoNodeTree perm
+    let res := tree.performBorrowAccessRange (.concrete (hooksAccessTag rel))
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) (annealAccessKindToMiri kind)
+      (hooksForChildProtected isProtected).protectedTags .VisitChildrenOfAccessed
+    let out := treeBorrowNodeAccess kind rel perm isProtected
+    let dummy : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := perm }
+    (res.status = .Completed ↔ treeBorrowTransitionIsUB out = false) ∧
+    (res.status = .Completed →
+      (res.tree.locations.entries[0]?.bind (fun s => s.data.perms.get ⟨1⟩)).map (·.permission) =
+        some (annealPermToMiri (applyTreeBorrowTransition dummy out).perm)) :=
+  @borrowTree_performBorrowAccessRange_simulation kind rel perm isProtected
+
+example (isProtected : Bool) :
+    let tree := Miri.TreeBorrows.BorrowTree.new retagParentTag (Miri.ABI.Size.ofBytes 8)
+    let mem := liveTreeMemory tree
+    let alloc := liveTreeAllocation tree
+    let ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance) :=
+      ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId retagParentTag)⟩
+    let range := Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+    let res := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead
+      mem ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      alloc ptr retagTestAllocId (.concrete retagParentTag) range
+    res.outcome = .ok () ∧ res.memory = mem :=
+  @machineMemoryHooks_fresh_root_read_simulation isProtected
+
+example (rel : TreeBorrowRelatedness) (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let tree := hooksTwoNodeTree perm
+    let mem := liveTreeMemory tree
+    let alloc := liveTreeAllocation tree
+    let tag := hooksAccessTag rel
+    let ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance) :=
+      ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId tag)⟩
+    let range := Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+    let res := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryRead
+      mem ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      alloc ptr retagTestAllocId (.concrete tag) range
+    let out := treeBorrowNodeAccess .read rel perm isProtected
+    let dummy : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := perm }
+    (res.outcome = .ok () ↔ treeBorrowTransitionIsUB out = false) ∧
+    (res.outcome = .ok () →
+      (liveTagLocationState res.memory retagChildTag).map (·.permission) =
+        some (annealPermToMiri (applyTreeBorrowTransition dummy out).perm)) :=
+  @machineMemoryHooks_beforeMemoryRead_simulation rel perm isProtected
+
+example (rel : TreeBorrowRelatedness) (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let tree := hooksTwoNodeTree perm
+    let mem := liveTreeMemory tree
+    let alloc := liveTreeAllocation tree
+    let tag := hooksAccessTag rel
+    let ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance) :=
+      ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId tag)⟩
+    let range := Miri.Memory.allocRange Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+    let res := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite
+      mem ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      alloc ptr retagTestAllocId (.concrete tag) range
+    let out := treeBorrowNodeAccess .write rel perm isProtected
+    let dummy : BorrowEntry := { tag := 2, targetLocal := 1, targetProjection := [], perm := perm }
+    (res.outcome = .ok () ↔ treeBorrowTransitionIsUB out = false) ∧
+    (res.outcome = .ok () →
+      (liveTagLocationState res.memory retagChildTag).map (·.permission) =
+        some (annealPermToMiri (applyTreeBorrowTransition dummy out).perm)) :=
+  @machineMemoryHooks_beforeMemoryWrite_simulation rel perm isProtected
+
+example (allBorrows borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff readRangeLen : Nat)
+    (i : Nat) (hi : i < borrows.length)
+    (hloc : borrows[i].targetLocal = targetLocal)
+    (hov : borrowEntryOverlapsWrite borrows[i] readProj readRangeOff readRangeLen = true)
+    (hskip : treeBorrowAccessRelatedness allBorrows borrows[i] readerTag = .foreignAccess →
+      borrows[i].perm ≠ .disabled)
+    (hno_ub : hasTreeReadUB allBorrows borrows activeProtectors targetLocal readerTag
+      readProj readRangeOff readRangeLen = false) :
+    let borrows' := freezeTreeBorrowsOnReadAtProj allBorrows borrows targetLocal
+      readerTag readProj readRangeOff readRangeLen activeProtectors
+    let hi' : i < borrows'.length := by
+      dsimp only [borrows']
+      rw [freezeTreeBorrowsOnReadAtProj_length]
+      exact hi
+    let nt := basedNormalTree borrows activeProtectors
+    let nt' := basedNormalTree borrows' activeProtectors
+    let rel := treeBorrowAccessRelatedness allBorrows borrows[i] readerTag
+    let isProt := isBorrowProtected activeProtectors borrows[i]
+    borrowEntryReadUB allBorrows activeProtectors borrows[i] targetLocal readerTag
+      readProj readRangeOff readRangeLen = false ∧
+    nt.stateAt i = some ⟨annealPermToMiri borrows[i].perm, true, .None⟩ ∧
+    nt'.stateAt i = some ⟨annealPermToMiri (borrows'[i]'hi').perm, true, .None⟩ ∧
+    (∃ transition,
+      Miri.TreeBorrows.Tree.LocationState.performAccess
+        ⟨annealPermToMiri borrows[i].perm, true, .None⟩
+        .Read (annealRelatednessToMiri rel) isProt =
+      .Success ⟨annealPermToMiri (borrows'[i]'hi').perm, true, .None⟩ transition) :=
+  @freezeTreeBorrowsOnReadAtProj_locationState_simulation allBorrows borrows activeProtectors
+    targetLocal readerTag readProj readRangeOff readRangeLen i hi hloc hov hskip hno_ub
+
+example (allBorrows borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (writerTag : Option Nat)
+    (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen : Nat)
+    (i : Nat) (hi : i < borrows.length)
+    (hloc : borrows[i].targetLocal = targetLocal)
+    (hov : borrowEntryOverlapsWrite borrows[i] writeProj writeRangeOff writeRangeLen = true)
+    (hskip : treeBorrowAccessRelatedness allBorrows borrows[i] writerTag = .foreignAccess →
+      borrows[i].perm ≠ .disabled)
+    (hno_prot : hasProtectedTreeWriteConflict allBorrows borrows activeProtectors targetLocal
+      writerTag writeProj writeRangeOff writeRangeLen = false)
+    (hnode_ub :
+      treeBorrowTransitionIsUB
+        (treeBorrowNodeAccess .write
+          (treeBorrowAccessRelatedness allBorrows borrows[i] writerTag)
+          borrows[i].perm
+          (isBorrowProtected activeProtectors borrows[i])) = false) :
+    let borrows' := invalidateTreeBorrowsAtProj allBorrows borrows targetLocal
+      writerTag writeProj writeRangeOff writeRangeLen
+    let hi' : i < borrows'.length := by
+      dsimp only [borrows']
+      rw [invalidateTreeBorrowsAtProj_length]
+      exact hi
+    let nt := basedNormalTree borrows activeProtectors
+    let nt' := basedNormalTree borrows' activeProtectors
+    let rel := treeBorrowAccessRelatedness allBorrows borrows[i] writerTag
+    let isProt := isBorrowProtected activeProtectors borrows[i]
+    nt.stateAt i = some ⟨annealPermToMiri borrows[i].perm, true, .None⟩ ∧
+    nt'.stateAt i = some ⟨annealPermToMiri (borrows'[i]'hi').perm, true, .None⟩ ∧
+    (∃ transition,
+      Miri.TreeBorrows.Tree.LocationState.performAccess
+        ⟨annealPermToMiri borrows[i].perm, true, .None⟩
+        .Write (annealRelatednessToMiri rel) isProt =
+      .Success ⟨annealPermToMiri (borrows'[i]'hi').perm, true, .None⟩ transition) :=
+  @invalidateTreeBorrowsAtProj_locationState_simulation allBorrows borrows activeProtectors
+    targetLocal writerTag writeProj writeRangeOff writeRangeLen i hi hloc hov hskip hno_prot hnode_ub
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+private theorem pin_sim_lm3_3_retag_raw_scalar_step (rk : RetagKind) (mutability : Mutability) :
+    match rk with
+    | .raw =>
+      ∃ s' : MachineState,
+        stepMirFn (retagRawBody rk mutability) childScalarRawState = .step s' ∧
+        s'.memory = childScalarRawState.memory ∧
+        get? s'.frame.locals 2 = some (.init (.scalar ⟨0, 8⟩))
+    | .default | .twoPhase | .fnEntry =>
+      stepMirFn (retagRawBody rk mutability) childScalarRawState = .fail .ub :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_raw_scalar_step rk mutability
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+      stepMirFn callerG initG = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn callerG s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      s₂.memory.activeProtectors = [1] ∧
+      stepMirFn callerG s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn callerG s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz true) (some 1) (some 1), entry 1 .reserved] ∧
+      s₄.memory.activeProtectors = [1] ∧
+      stepMirFn callerG s₄ = .step s₅ ∧
+      s₅.memory.activeProtectors = [] ∧
+      s₅.memory.borrows =
+        [entry 3 .frozen, entry 2 (.reservedFrz true) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn callerG s₅ = .step s₆ ∧
+      s₆.memory.borrows =
+        [entry 3 .disabled, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      get? s₆.frame.locals 1 = some (.init (.scalar ⟨9, 8⟩)) ∧
+      ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₆.memory.borrows []
+        ((basedNormalTree s₅.memory.borrows []).performAccess 1 .Write
+          .VisitChildrenOfAccessed).tree :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_protector_release_on_return_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyH initH = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn bodyH s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .reserved (some 1), entry 1 .reserved] ∧
+      s₂.memory.activeProtectors = [] ∧
+      stepMirFn bodyH s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entry 3 .reserved (some 2), entry 2 .reserved (some 1), entry 1 .reserved] ∧
+      s₃.memory.nextTag = 4 ∧
+      stepMirFn bodyH s₃ = .step s₄ ∧
+      s₄.memory.borrows = s₃.memory.borrows ∧
+      s₄.memory.nextTag = 4 ∧
+      stepMirFn bodyH s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 3 .unique (some 2), entry 2 .unique (some 1), entry 1 .unique] ∧
+      get? s₅.frame.locals 1 = some (.init (.scalar ⟨77, 8⟩)) ∧
+      ((basedNormalTree s₄.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₅.memory.borrows []
+        ((basedNormalTree s₄.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_non_fnEntry_retag_and_raw_retag_real_steps
+
+example (offA lenA offB lenB : Nat) :
+    byteRangesOverlapBool offA lenA offB lenB = true ↔
+      0 < lenA ∧ 0 < lenB ∧ offA < offB + lenB ∧ offB < offA + lenA :=
+  @byteRangesOverlapBool_iff offA lenA offB lenB
+
+example (entry : BorrowEntry) (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen : Nat) :
+    borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = true ↔
+      if 0 < writeRangeLen ∧ 0 < entry.rangeLen then
+        entry.rangeOffset < writeRangeOff + writeRangeLen ∧
+          writeRangeOff < entry.rangeOffset + entry.rangeLen
+      else
+        projectionsOverlap entry.targetProjection writeProj = true :=
+  @borrowEntryOverlapsWrite_iff entry writeProj writeRangeOff writeRangeLen
+
+example (allBorrows : List BorrowEntry) (activeProtectors : List Nat)
+    (entry : BorrowEntry) (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (hdisj : entry.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = false) :
+    borrowEntryReadUB allBorrows activeProtectors entry targetLocal readerTag
+      readProj readRangeOff readRangeLen = false :=
+  @borrowEntryReadUB_of_disjoint allBorrows activeProtectors entry targetLocal
+    readerTag readProj readRangeOff readRangeLen hdisj
+
+example (allBorrows : List BorrowEntry) (entry : BorrowEntry)
+    (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hdisj : entry.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = false) :
+    updateBorrowPermOnReadAtProj allBorrows entry targetLocal readerTag
+      readProj readRangeOff readRangeLen activeProtectors = entry :=
+  @updateBorrowPermOnReadAtProj_of_disjoint allBorrows entry targetLocal
+    readerTag readProj readRangeOff readRangeLen activeProtectors hdisj
+
+example (allBorrows : List BorrowEntry) (entry : BorrowEntry)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff writeRangeLen : Nat)
+    (hdisj : entry.targetLocal ≠ targetLocal ∨
+      (treeBorrowAccessRelatedness allBorrows entry writerTag = .foreignAccess ∧
+        borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = false)) :
+    updateBorrowPermTreeAtProj allBorrows entry targetLocal writerTag
+      writeProj writeRangeOff writeRangeLen = entry :=
+  @updateBorrowPermTreeAtProj_of_foreign_disjoint allBorrows entry targetLocal
+    writerTag writeProj writeRangeOff writeRangeLen hdisj
+
+example (kind : TreeBorrowAccessKind) (b₀ : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
+    (hp₀ : b₀.parentTag = none) (hloc : b₀.targetLocal = targetLocal)
+    (hproj : b₀.targetProjection = .nil) :
+    let nres := (basedNormalTree [b₀] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [b₀] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [b₀] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
+  @basedNormalTree_performAccess_singleton_simulation kind b₀ activeProtectors
+    targetLocal start hp₀ hloc hproj
+
+example (kind : TreeBorrowAccessKind) (child parent : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
+    (hneq : child.tag ≠ parent.tag)
+    (hcpar : child.parentTag = some parent.tag)
+    (hppar : parent.parentTag = none)
+    (hcloc : child.targetLocal = targetLocal)
+    (hploc : parent.targetLocal = targetLocal)
+    (hcproj : child.targetProjection = .nil)
+    (hpproj : parent.targetProjection = .nil) :
+    let nres := (basedNormalTree [child, parent] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [child, parent] activeProtectors targetLocal
+      start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [child, parent] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
+  @basedNormalTree_performAccess_parent_child_simulation kind child parent activeProtectors
+    targetLocal start hneq hcpar hppar hcloc hploc hcproj hpproj
+
+example (kind : TreeBorrowAccessKind) (b₀ b₁ : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 3)
+    (hneq : b₀.tag ≠ b₁.tag)
+    (hp₀ : b₀.parentTag = none)
+    (hp₁ : b₁.parentTag = none)
+    (hloc₀ : b₀.targetLocal = targetLocal)
+    (hloc₁ : b₁.targetLocal = targetLocal)
+    (hproj₀ : b₀.targetProjection = .nil)
+    (hproj₁ : b₁.targetProjection = .nil) :
+    let nres := (basedNormalTree [b₀, b₁] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [b₀, b₁] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [b₀, b₁] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
+  @basedNormalTree_performAccess_siblings_simulation kind b₀ b₁ activeProtectors
+    targetLocal start hneq hp₀ hp₁ hloc₀ hloc₁ hproj₀ hproj₁
+
+example (allBorrows rest : List BorrowEntry) (activeProtectors : List Nat)
+    (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (hdisj : ∀ e ∈ rest, e.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite e readProj readRangeOff readRangeLen = false) :
+    hasTreeReadUB allBorrows rest activeProtectors targetLocal readerTag
+      readProj readRangeOff readRangeLen = false :=
+  @hasTreeReadUB_of_all_disjoint allBorrows rest activeProtectors targetLocal readerTag
+    readProj readRangeOff readRangeLen hdisj
+
+example (allBorrows : List BorrowEntry) (b₀ : BorrowEntry) (rest : List BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (hdisj : ∀ e ∈ rest, e.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite e readProj readRangeOff readRangeLen = false) :
+    hasTreeReadUB allBorrows (b₀ :: rest) activeProtectors targetLocal readerTag
+      readProj readRangeOff readRangeLen =
+    borrowEntryReadUB allBorrows activeProtectors b₀ targetLocal readerTag
+      readProj readRangeOff readRangeLen :=
+  @hasTreeReadUB_disjoint_tail allBorrows b₀ rest activeProtectors targetLocal readerTag
+    readProj readRangeOff readRangeLen hdisj
+
+example (allBorrows rest : List BorrowEntry) (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hdisj : ∀ e ∈ rest, e.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite e readProj readRangeOff readRangeLen = false) :
+    freezeTreeBorrowsOnReadAtProj allBorrows rest targetLocal readerTag
+      readProj readRangeOff readRangeLen activeProtectors = rest :=
+  @freezeTreeBorrowsOnReadAtProj_of_all_disjoint allBorrows rest targetLocal readerTag
+    readProj readRangeOff readRangeLen activeProtectors hdisj
+
+example (allBorrows : List BorrowEntry) (b₀ : BorrowEntry) (rest : List BorrowEntry)
+    (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hdisj : ∀ e ∈ rest, e.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite e readProj readRangeOff readRangeLen = false) :
+    freezeTreeBorrowsOnReadAtProj allBorrows (b₀ :: rest) targetLocal readerTag
+      readProj readRangeOff readRangeLen activeProtectors =
+    updateBorrowPermOnReadAtProj allBorrows b₀ targetLocal readerTag
+      readProj readRangeOff readRangeLen activeProtectors :: rest :=
+  @freezeTreeBorrowsOnReadAtProj_disjoint_tail allBorrows b₀ rest targetLocal readerTag
+    readProj readRangeOff readRangeLen activeProtectors hdisj
+
+example (allBorrows rest : List BorrowEntry) (activeProtectors : List Nat)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff writeRangeLen : Nat)
+    (hdisj : ∀ e ∈ rest, e.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite e writeProj writeRangeOff writeRangeLen = false) :
+    hasProtectedTreeWriteConflict allBorrows rest activeProtectors targetLocal
+      writerTag writeProj writeRangeOff writeRangeLen = false :=
+  @hasProtectedTreeWriteConflict_of_all_disjoint allBorrows rest activeProtectors targetLocal
+    writerTag writeProj writeRangeOff writeRangeLen hdisj
+
+example (allBorrows rest : List BorrowEntry) (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff writeRangeLen : Nat)
+    (hdisj : ∀ e ∈ rest, e.targetLocal ≠ targetLocal ∨
+      (treeBorrowAccessRelatedness allBorrows e writerTag = .foreignAccess ∧
+        borrowEntryOverlapsWrite e writeProj writeRangeOff writeRangeLen = false)) :
+    invalidateTreeBorrowsAtProj allBorrows rest targetLocal writerTag
+      writeProj writeRangeOff writeRangeLen = rest :=
+  @invalidateTreeBorrowsAtProj_of_all_foreign_disjoint allBorrows rest targetLocal writerTag
+    writeProj writeRangeOff writeRangeLen hdisj
+
+example (allBorrows : List BorrowEntry) (b₀ : BorrowEntry) (rest : List BorrowEntry)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff writeRangeLen : Nat)
+    (hdisj : ∀ e ∈ rest, e.targetLocal ≠ targetLocal ∨
+      (treeBorrowAccessRelatedness allBorrows e writerTag = .foreignAccess ∧
+        borrowEntryOverlapsWrite e writeProj writeRangeOff writeRangeLen = false)) :
+    invalidateTreeBorrowsAtProj allBorrows (b₀ :: rest) targetLocal writerTag
+      writeProj writeRangeOff writeRangeLen =
+    updateBorrowPermTreeAtProj allBorrows b₀ targetLocal writerTag
+      writeProj writeRangeOff writeRangeLen :: rest :=
+  @invalidateTreeBorrowsAtProj_disjoint_tail allBorrows b₀ rest targetLocal writerTag
+    writeProj writeRangeOff writeRangeLen hdisj
+
+example (kind : TreeBorrowAccessKind) (g c r : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 4)
+    (hneq_gc : g.tag ≠ c.tag) (hneq_gr : g.tag ≠ r.tag) (hneq_cr : c.tag ≠ r.tag)
+    (hgpar : g.parentTag = some c.tag)
+    (hcpar : c.parentTag = some r.tag)
+    (hrpar : r.parentTag = none)
+    (hgloc : g.targetLocal = targetLocal)
+    (hcloc : c.targetLocal = targetLocal)
+    (hrloc : r.targetLocal = targetLocal)
+    (hgproj : g.targetProjection = .nil)
+    (hcproj : c.targetProjection = .nil)
+    (hrproj : r.targetProjection = .nil)
+    (hgprot : isBorrowProtected activeProtectors g = false)
+    (hcprot : isBorrowProtected activeProtectors c = false)
+    (hrprot : isBorrowProtected activeProtectors r = false)
+    (hinv : treeBorrowsChain3Inv g.perm c.perm r.perm = true) :
+    let nres := (basedNormalTree [g, c, r] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [g, c, r] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [g, c, r] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
+  @basedNormalTree_performAccess_three_level_chain_simulation kind g c r activeProtectors
+    targetLocal start hneq_gc hneq_gr hneq_cr hgpar hcpar hrpar hgloc hcloc hrloc
+    hgproj hcproj hrproj hgprot hcprot hrprot hinv
+
+example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 4)
+    (hneq₀₁ : c₀.tag ≠ c₁.tag) (hneq₀p : c₀.tag ≠ p.tag) (hneq₁p : c₁.tag ≠ p.tag)
+    (hc₀par : c₀.parentTag = some p.tag)
+    (hc₁par : c₁.parentTag = some p.tag)
+    (hppar : p.parentTag = none)
+    (hloc₀ : c₀.targetLocal = targetLocal)
+    (hloc₁ : c₁.targetLocal = targetLocal)
+    (hlocp : p.targetLocal = targetLocal)
+    (hproj₀ : c₀.targetProjection = .nil)
+    (hproj₁ : c₁.targetProjection = .nil)
+    (hprojp : p.targetProjection = .nil)
+    (hc₀prot : isBorrowProtected activeProtectors c₀ = false)
+    (hc₁prot : isBorrowProtected activeProtectors c₁ = false)
+    (hpprot : isBorrowProtected activeProtectors p = false)
+    (hinv : treeBorrowsBranch3Inv c₀.perm c₁.perm p.perm = true) :
+    let nres := (basedNormalTree [c₀, c₁, p] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [c₀, c₁, p] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [c₀, c₁, p] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) :=
+  @basedNormalTree_performAccess_branching_children_simulation kind c₀ c₁ p activeProtectors
+    targetLocal start hneq₀₁ hneq₀p hneq₁p hc₀par hc₁par hppar hloc₀ hloc₁ hlocp
+    hproj₀ hproj₁ hprojp hc₀prot hc₁prot hpprot hinv
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability) :
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability true
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    ∃ s' : MachineState,
+      stepMirFn (retagZstRefBody rk mutability) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_zst_ref_step rk mutability
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+private theorem pin_sim_lm3_3_retag_zst_scalar_step
+    (rk : RetagKind) (mutability : Mutability) (nonNull : Bool) :
+    match nonNull with
+    | true =>
+      ∃ s' : MachineState,
+        stepMirFn (retagZstRefBody rk mutability) (retagZstScalarState true) = .step s' ∧
+        s'.memory = (retagZstScalarState true).memory ∧
+        get? s'.frame.locals 2 = some (.init (.scalar ⟨8, 8⟩))
+    | false =>
+      stepMirFn (retagZstRefBody rk mutability) (retagZstScalarState false) = .fail .ub :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_zst_scalar_step rk mutability nonNull
+
+open LeanMiriSpec.Correspondence in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap) :
+    (s.memory.borrows.map BorrowEntry.tag).Nodup ∧
+      TreeBorrowsRel s.memory.borrows s.memory.activeProtectors
+        (basedNormalTree s.memory.borrows s.memory.activeProtectors) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.stateRelLM3_2Tree_treeBorrowsRel
+    body s m treeMap htree
+
+open LeanMiriSpec.Correspondence in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {opKind : Place → MirAst.Operand} {span : String}
+    (hopKind : opKind = MirAst.Operand.copy ∨ opKind = MirAst.Operand.move)
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (opKind ⟨refIdx, .cons .deref .nil⟩)), span⟩)
+    {dstDecl refDecl : MirAst.LocalDecl} {mutability : Mutability}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability dstDecl.ty.kind)
+    (hdst_prim : IsPrimScalarTy dstDecl.ty)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
+    (hlive_ref : ∀ ptrVal, get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      ∀ e ∈ treeMap, e.tag = ptrVal.tag →
+        get? s.frame.locals e.localIdx ≠ some .dead →
+          ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
+          (∀ decl, get? body.localDecls e.localIdx = some decl →
+            decl.ty.kind = dstDecl.ty.kind))
+    (hanc_read : ∀ ptrVal,
+      get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      ∀ e ∈ treeMap, e.tag = ptrVal.tag →
+        treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
+    let treeMap' := derefReadNextTreeMap s.frame.locals treeMap refIdx
+    TreeBorrowsRel s.memory.borrows s.memory.activeProtectors
+      (basedNormalTree s.memory.borrows s.memory.activeProtectors) ∧
+    StepRelLM3_2Tree body m treeMap'
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    (∀ s', stepMirFn body s = .step s' →
+      ∃ m',
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+          (m', .ok true) ∧
+        StateRelLM3_2Tree body s' m' treeMap' ∧
+        TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+          (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_interpreter_deref_read_step
+    body s m treeMap htree hphase bb dstIdx refIdx opKind span hopKind hbb hstmt
+    dstDecl refDecl mutability hdecl_dst hdecl_ref href_ty hdst_prim himm hlive_ref hanc_read
+
+open LeanMiriSpec.Correspondence in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {refIdx : Local} {op : MirAst.Operand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨refIdx, .cons .deref .nil⟩ (.use op), span⟩)
+    {refDecl : MirAst.LocalDecl} {mutability : Mutability}
+    {pointeeKind : RigidTy} {valTy : Ty}
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref mutability pointeeKind)
+    (hval_prim : IsPrimScalarTy valTy)
+    (hval_kind : valTy.kind = pointeeKind)
+    (hop : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame op valTy)
+    (himm_ref : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame refIdx)
+    (hlive_ref : ∀ ptrVal e tgtDecl,
+      get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      get? body.localDecls e.localIdx = some tgtDecl →
+      get? s.frame.locals e.localIdx ≠ some .dead →
+      ptrVal.offsetBytes = 0 ∧ (e.perm ≠ .frozen ∧ e.perm ≠ .disabled) ∧
+        tgtDecl.ty.kind = pointeeKind)
+    (hanc_write : ∀ ptrVal e,
+      get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      treeBorrowAncestorsChildAccessUB .write s.memory.borrows e.parentTag = false) :
+    let treeMap' := derefWriteNextTreeMap s.frame.locals treeMap refIdx
+    TreeBorrowsRel s.memory.borrows s.memory.activeProtectors
+      (basedNormalTree s.memory.borrows s.memory.activeProtectors) ∧
+    StepRelLM3_2Tree body m treeMap'
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    (∀ s', stepMirFn body s = .step s' →
+      ∃ m',
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+          (m', .ok true) ∧
+        StateRelLM3_2Tree body s' m' treeMap' ∧
+        TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+          (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_interpreter_deref_write_step
+    body s m treeMap htree hphase bb refIdx op span hbb hstmt refDecl mutability
+    pointeeKind valTy hdecl_ref href_ty hval_prim hval_kind hop himm_ref hlive_ref hanc_write
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    (∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+      stepMirFn bodyI initI = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn bodyI s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn bodyI s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyI s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .frozen, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyI s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 4 .frozen (some 3) (some 2),
+          entry 3 .frozen,
+          entry 2 .unique (some 1) (some 1),
+          entry 1 .unique] ∧
+      s₅.memory.activeProtectors = [2, 1] ∧
+      s₅.memory.nextTag = 5 ∧
+      stepMirFn bodyI s₅ = .step s₆ ∧
+      s₆.memory = s₅.memory ∧
+      TreeBorrowsRel s₆.memory.borrows s₆.memory.activeProtectors
+        (basedNormalTree s₆.memory.borrows s₆.memory.activeProtectors)) ∧
+    stepMirFn bodyI initINullAt5 = .fail .ub :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_zst_retag_skips_read_and_dangling_scalar_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability) :
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability true
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    ∃ s' : MachineState,
+      stepMirFn (retagPhantomRefBody rk mutability) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_phantom_ref_step rk mutability
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (bk : BorrowKind) :
+    let childPerm : TreeBorrowPerm :=
+      match bk with
+      | .shared => .frozen
+      | .mut _ => .reservedFrz false
+    ∃ s' : MachineState,
+      stepMirFn (zstDerefReborrowBody bk) zstDerefReborrowState = .step s' ∧
+      get? s'.frame.locals 3 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) none,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = [1] ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_zst_deref_reborrow_step bk
+
+open LeanMiriSpec.Correspondence in
+example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {treeMap : List ReborrowMapEntry}
+    (htree : StateRelLM3_2Tree body s m treeMap)
+    (hphase : ∀ p, body.phase ≠ .other p)
+    {bb : BasicBlockData} {dstIdx refIdx : Local}
+    {dstDecl refDecl : MirAst.LocalDecl}
+    {bk : BorrowKind} {refMut dstMut : Mutability}
+    {pointeeKind dstPointee : RigidTy}
+    {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨refIdx, .cons .deref .nil⟩), span⟩)
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_ref : get? body.localDecls refIdx = some refDecl)
+    (href_ty : refDecl.ty.kind = .ref refMut pointeeKind)
+    (hdst_ty : dstDecl.ty.kind = .ref dstMut dstPointee)
+    (hpk_prim : IsPrimScalarTy { kind := pointeeKind, layoutIdx := 0 })
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame refIdx)
+    (hlive_zero_perm : ∀ ptrVal e,
+      get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      get? s.frame.locals e.localIdx ≠ some .dead ∧
+      ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
+      (∀ tgtDecl, get? body.localDecls e.localIdx = some tgtDecl →
+        tgtDecl.ty.kind = pointeeKind))
+    (hanc_read : ∀ ptrVal e,
+      get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
+      e ∈ treeMap → e.tag = ptrVal.tag →
+      treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
+    let treeMap' :=
+      reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx
+        s.memory.nextTag
+    TreeBorrowsRel s.memory.borrows s.memory.activeProtectors
+      (basedNormalTree s.memory.borrows s.memory.activeProtectors) ∧
+    StepRelLM3_2Tree body m treeMap'
+      (stepMirFn body s)
+      (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
+    (∀ s', stepMirFn body s = .step s' →
+      ∃ m',
+        Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
+          (m', .ok true) ∧
+        StateRelLM3_2Tree body s' m' treeMap' ∧
+        TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+          (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_interpreter_reborrow_step
+    body s m treeMap htree hphase bb dstIdx refIdx dstDecl refDecl bk refMut dstMut
+    pointeeKind dstPointee span hbb hstmt hdecl_dst hdecl_ref href_ty hdst_ty
+    hpk_prim himm hlive_zero_perm hanc_read
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    (∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      stepMirFn bodyJDisjoint initJ = .step s₁ ∧
+      s₁.memory.borrows = [entryProj 1 .reserved [.field 0 u64T]] ∧
+      stepMirFn bodyJDisjoint s₁ = .step s₂ ∧
+      s₂.memory.borrows =
+        [entryProj 2 .frozen [.field 1 u64T],
+         entryProj 1 .reserved [.field 0 u64T]] ∧
+      stepMirFn bodyJDisjoint s₂ = .step s₃ ∧
+      s₃.memory.borrows =
+        [entryProj 3 .frozen [.field 1 u64T] (some 2) (some 1),
+         entryProj 2 .frozen [.field 1 u64T],
+         entryProj 1 .reserved [.field 0 u64T]] ∧
+      s₃.memory.activeProtectors = [1] ∧
+      stepMirFn bodyJDisjoint s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entryProj 3 .frozen [.field 1 u64T] (some 2) (some 1),
+         entryProj 2 .frozen [.field 1 u64T],
+         entryProj 1 .unique [.field 0 u64T]] ∧
+      get? s₄.frame.locals 1 =
+        some (.init (.aggregate 0 [.scalar ⟨99, 8⟩, .scalar ⟨20, 8⟩])) ∧
+      stepMirFn bodyJDisjoint s₄ = .step s₅ ∧
+      get? s₅.frame.locals 0 = some (.init (.scalar ⟨20, 8⟩))) ∧
+    (∃ o₁ o₂ o₃ : MachineState,
+      stepMirFn bodyJOverlap initJ = .step o₁ ∧
+      stepMirFn bodyJOverlap o₁ = .step o₂ ∧
+      stepMirFn bodyJOverlap o₂ = .step o₃ ∧
+      o₃.memory.borrows =
+        [entryProj 3 .frozen [.field 0 u64T] (some 2) (some 1),
+         entryProj 2 .frozen [.field 0 u64T],
+         entryProj 1 (.reservedFrz false) [.field 0 u64T]] ∧
+      stepMirFn bodyJOverlap o₃ = .fail .ub) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_subprojection_disjoint_vs_overlapping_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ s₇ : MachineState,
+      stepMirFn bodyK initK = .step s₁ ∧
+      stepMirFn bodyK s₁ = .step s₂ ∧
+      stepMirFn bodyK s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyK s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .reserved, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyK s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 4 .frozen (some 3),
+         entry 3 .reserved,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      stepMirFn bodyK s₅ = .step s₆ ∧
+      stepMirFn bodyK s₆ = .step s₇ ∧
+      s₇.memory.borrows =
+        [{ tag := 6, targetLocal := 5, targetProjection := .nil, perm := .frozen,
+           protector := some 2, parentTag := some 5 },
+         { tag := 5, targetLocal := 5, targetProjection := .nil, perm := .frozen,
+           protector := none, parentTag := none },
+         entry 4 .frozen (some 3),
+         entry 3 .reserved,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      s₇.memory.activeProtectors = [2, 1] ∧
+      TreeBorrowsRel s₇.memory.borrows s₇.memory.activeProtectors
+        (basedNormalTree s₇.memory.borrows s₇.memory.activeProtectors) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_zst_deref_reborrow_and_phantom_retag_real_steps
+
+open LeanMiriSpec.Correspondence in
+example (rel : TreeBorrowRelatedness) (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let tree := hooksTwoNodeTree perm
+    let res := tree.deallocateBorrowRange (.concrete (hooksAccessTag rel))
+      Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8)
+      (hooksForChildProtected isProtected).protectedTags
+    let out := treeBorrowNodeAccess .write rel perm isProtected
+    (treeBorrowTransitionIsUB out = true → ∃ err, res.status = .AccessFailure err) ∧
+    (treeBorrowTransitionIsUB out = false → isProtected = true → perm ≠ .cell →
+      res.status = .ProtectedDealloc ⟨0, 8⟩ ⟨1⟩) ∧
+    (res.status = .Deallocated ↔
+      (treeBorrowTransitionIsUB out = false ∧ (isProtected = false ∨ perm = .cell))) :=
+  @borrowTree_deallocateBorrowRange_simulation rel perm isProtected
+
+open LeanMiriSpec.Correspondence in
+example (rel : TreeBorrowRelatedness) (perm : TreeBorrowPerm) (isProtected : Bool) :
+    let tree := hooksTwoNodeTree perm
+    let alloc := liveTreeAllocation tree
+    let tag := hooksAccessTag rel
+    let ptr : Miri.Memory.Pointer (Option Miri.Memory.Provenance) :=
+      ⟨Miri.ABI.Size.ZERO, some (.concrete retagTestAllocId tag)⟩
+    let res := Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryDeallocation
+      ⟨(), .empty, false, #[]⟩ (hooksForChildProtected isProtected)
+      alloc ptr retagTestAllocId (.concrete tag)
+      (Miri.ABI.Size.ofBytes 8) Miri.ABI.Align.ONE .stack
+    let out := treeBorrowNodeAccess .write rel perm isProtected
+    res.outcome = .ok () ↔
+      (treeBorrowTransitionIsUB out = false ∧ (isProtected = false ∨ perm = .cell)) :=
+  @machineMemoryHooks_beforeMemoryDeallocation_simulation rel perm isProtected
+
+open LeanMiriSpec.Correspondence in
+example (descPerm ancPerm : TreeBorrowPerm)
+    (h : treeBorrowsAncestorInv descPerm ancPerm = true) :
+    treeBorrowsProtAncestorInv descPerm false ancPerm false = true :=
+  @treeBorrowsAncestorInv_imp_prot_false descPerm ancPerm h
+
+open LeanMiriSpec.Correspondence in
+example (mode : AnnealRetagMode) (mutability : Mutability) (frozen : Bool)
+    (ancPerm : TreeBorrowPerm) (ancProt : Bool)
+    (hanc_ndis : ancPerm ≠ .disabled)
+    (hanc_nim : ancProt = true → ancPerm ≠ .reservedIM)
+    (hfrz_sh : ancPerm = .frozen → mutability = .not) :
+    treeBorrowsProtAncestorInv
+      (annealRetagPerm mode mutability frozen) (mode == .fnEntry)
+      ancPerm ancProt = true :=
+  @treeBorrowsProtAncestorInv_retag_init
+    mode mutability frozen ancPerm ancProt hanc_ndis hanc_nim hfrz_sh
+
+open LeanMiriSpec.Correspondence in
+example (descPerm : TreeBorrowPerm) (descProt descProt' : Bool)
+    (ancPerm : TreeBorrowPerm) (ancProt ancProt' : Bool)
+    (hd : descProt' = true → descProt = true)
+    (ha : ancProt' = true → ancProt = true)
+    (hinv : treeBorrowsProtAncestorInv descPerm descProt ancPerm ancProt = true) :
+    treeBorrowsProtAncestorInv descPerm descProt' ancPerm ancProt' = true :=
+  @treeBorrowsProtAncestorInv_release_protectors
+    descPerm descProt descProt' ancPerm ancProt ancProt' hd ha hinv
+
+open LeanMiriSpec.Correspondence in
+example (kind : TreeBorrowAccessKind) (g c r : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 4)
+    (hneq_gc : g.tag ≠ c.tag) (hneq_gr : g.tag ≠ r.tag) (hneq_cr : c.tag ≠ r.tag)
+    (hgpar : g.parentTag = some c.tag)
+    (hcpar : c.parentTag = some r.tag)
+    (hrpar : r.parentTag = none)
+    (hgloc : g.targetLocal = targetLocal)
+    (hcloc : c.targetLocal = targetLocal)
+    (hrloc : r.targetLocal = targetLocal)
+    (hgproj : g.targetProjection = .nil)
+    (hcproj : c.targetProjection = .nil)
+    (hrproj : r.targetProjection = .nil)
+    (hinv : borrowListChain3ProtInv [g, c, r] activeProtectors = true) :
+    let nres := (basedNormalTree [g, c, r] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [g, c, r] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [g, c, r] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed →
+      TreeBorrowsRel borrows' activeProtectors nres.tree ∧
+      borrowListChain3ProtInv borrows' activeProtectors = true) :=
+  @basedNormalTree_performAccess_three_level_chain_prot_simulation
+    kind g c r activeProtectors targetLocal start hneq_gc hneq_gr hneq_cr
+    hgpar hcpar hrpar hgloc hcloc hrloc hgproj hcproj hrproj hinv
+
+open LeanMiriSpec.Correspondence in
+example (kind : TreeBorrowAccessKind) (c₀ c₁ p : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 4)
+    (hneq₀₁ : c₀.tag ≠ c₁.tag) (hneq₀p : c₀.tag ≠ p.tag) (hneq₁p : c₁.tag ≠ p.tag)
+    (hc₀par : c₀.parentTag = some p.tag)
+    (hc₁par : c₁.parentTag = some p.tag)
+    (hppar : p.parentTag = none)
+    (hloc₀ : c₀.targetLocal = targetLocal)
+    (hloc₁ : c₁.targetLocal = targetLocal)
+    (hlocp : p.targetLocal = targetLocal)
+    (hproj₀ : c₀.targetProjection = .nil)
+    (hproj₁ : c₁.targetProjection = .nil)
+    (hprojp : p.targetProjection = .nil)
+    (hinv : borrowListBranch3ProtInv [c₀, c₁, p] activeProtectors = true) :
+    let nres := (basedNormalTree [c₀, c₁, p] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [c₀, c₁, p] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [c₀, c₁, p] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed →
+      TreeBorrowsRel borrows' activeProtectors nres.tree ∧
+      borrowListBranch3ProtInv borrows' activeProtectors = true) :=
+  @basedNormalTree_performAccess_branching_children_prot_simulation
+    kind c₀ c₁ p activeProtectors targetLocal start hneq₀₁ hneq₀p hneq₁p
+    hc₀par hc₁par hppar hloc₀ hloc₁ hlocp hproj₀ hproj₁ hprojp hinv
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability) (pointee : RigidTy)
+    (val : Value) (borrows : List BorrowEntry) (isProtected : Bool)
+    (huninhab : rigidTyIsUninhabited 16 pointee = true) :
+    stepMirFn (retagPointeeRefBody rk mutability pointee)
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_uninhabited_ref_ub_step
+    rk mutability pointee val borrows isProtected huninhab
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability) (usePhantom : Bool) :
+    let pointee : RigidTy :=
+      if usePhantom then .adt "core::marker::PhantomData" [.never]
+      else .array .never 0
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability true
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    rigidTyIsUninhabited 16 pointee = false ∧
+    rigidTyIsZeroSized 16 pointee = true ∧
+    (∃ s' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability pointee) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) ∧
+    (∃ s'' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability pointee) (retagZstScalarState true) =
+        .step s'' ∧
+      s''.memory = (retagZstScalarState true).memory ∧
+      get? s''.frame.locals 2 = some (.init (.scalar ⟨8, 8⟩))) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_inhabited_never_container_zst_step
+    rk mutability usePhantom
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    (∃ s₁ s₂ s₃ : MachineState,
+      stepMirFn bodyLInhabited initLInhabited = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .frozen] ∧
+      stepMirFn bodyLInhabited s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .frozen (some 1) (some 1), entry 1 .frozen] ∧
+      s₂.memory.activeProtectors = [1] ∧
+      stepMirFn bodyLInhabited s₂ = .step s₃ ∧
+      s₃.memory = s₂.memory ∧
+      TreeBorrowsRel s₃.memory.borrows s₃.memory.activeProtectors
+        (basedNormalTree s₃.memory.borrows s₃.memory.activeProtectors)) ∧
+    stepMirFn bodyLNever (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyLNever (initLUninhabited true) = .fail .ub ∧
+    stepMirFn bodyLNeverArr1 (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyLNeverArr1 (initLUninhabited true) = .fail .ub :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_uninhabited_ref_retag_ub_vs_inhabited_never_zst_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+      stepMirFn bodyM initM = .step s₁ ∧
+      stepMirFn bodyM s₁ = .step s₂ ∧
+      stepMirFn bodyM s₂ = .step s₃ ∧
+      stepMirFn bodyM s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .cell (some 2) (some 1), entry 2 .cell (some 1), entry 1 .unique] ∧
+      s₄.memory.activeProtectors = [1] ∧
+      borrowListChain3ProtInv s₄.memory.borrows [1] = true ∧
+      stepMirFn bodyM s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 3 .cell (some 2) (some 1), entry 2 .cell (some 1), entry 1 .disabled] ∧
+      treeBorrowsChain3Inv .cell .cell .disabled = false ∧
+      borrowListChain3ProtInv s₅.memory.borrows [1] = true ∧
+      ((basedNormalTree s₄.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₅.memory.borrows [1]
+        ((basedNormalTree s₄.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      stepMirFn bodyM s₅ = .step s₆ ∧
+      s₆.memory.borrows = s₅.memory.borrows ∧
+      ((basedNormalTree s₅.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₆.memory.borrows [1]
+        ((basedNormalTree s₅.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      stepMirFn bodyM s₆ = .fail .ub ∧
+      ((basedNormalTree s₆.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 2 (.ChildAccessForbidden .Disabled) :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_protected_cell_chain_under_disabled_root_real_steps
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example
+    (rk : RetagKind) (mutability : Mutability) (useMaybeUninit : Bool)
+    (val : Value) (borrows : List BorrowEntry) (isProtected : Bool) :
+    let zstPointee : RigidTy :=
+      if useMaybeUninit then .adt "core::mem::MaybeUninit" [.never]
+      else .adt "core::cell::UnsafeCell" [.tuple []]
+    let childPerm :=
+      annealRetagPerm (retagKindToAnnealMode rk) mutability useMaybeUninit
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    rigidTyIsUninhabited 16 zstPointee = false ∧
+    rigidTyIsZeroSized 16 zstPointee = true ∧
+    rigidTyIsFreeze 16 zstPointee = useMaybeUninit ∧
+    rigidTyIsUninhabited 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
+    rigidTyIsZeroSized 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
+    rigidTyIsFreeze 16 (.adt "core::cell::RefCell" [.tuple []]) = false ∧
+    (∃ s' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability zstPointee) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) ∧
+    (∃ s'' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability zstPointee) (retagZstScalarState true) =
+        .step s'' ∧
+      s''.memory = (retagZstScalarState true).memory ∧
+      get? s''.frame.locals 2 = some (.init (.scalar ⟨8, 8⟩))) ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::UnsafeCell" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::Cell" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::cell::RefCell" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub ∧
+    stepMirFn (retagPointeeRefBody rk mutability (.adt "core::mem::ManuallyDrop" [.never]))
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_unsafecell_zst_vs_never_step
+    rk mutability useMaybeUninit val borrows isProtected
+
+open LeanMiriSpec.Correspondence.SimLM3_3 in
+example (rk : RetagKind) (mutability : Mutability) :
+    let phantomCellPt : RigidTy :=
+      .adt "core::marker::PhantomData" [.adt "core::cell::UnsafeCell" [.uint .u64]]
+    let cellU64Pt : RigidTy := .adt "core::cell::Cell" [.uint .u64]
+    let mode := retagKindToAnnealMode rk
+    let phPerm := annealRetagPerm mode mutability true
+    let cellPerm := annealRetagPerm mode mutability false
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    rigidTyIsFreeze 16 phantomCellPt = true ∧
+    rigidTyIsZeroSized 16 phantomCellPt = true ∧
+    rigidTyIsFreeze 16 cellU64Pt = false ∧
+    fnEntryRetagPerm mutability cellU64Pt = annealRetagPerm .fnEntry mutability false ∧
+    retagPerm rk mutability cellU64Pt = cellPerm ∧
+    (∃ s' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability phantomCellPt) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 phPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) :=
+  @LeanMiriSpec.Correspondence.SimLM3_3.sim_lm3_3_retag_phantom_unsafecell_vs_cell_step
+    rk mutability
+
+open LeanMiriSpec.Correspondence.SimLM3_3 LeanMiriSpec.Correspondence.WitnessLM3_3 in
+example :
+    (∃ s₁ s₂ s₃ s₄ s₅ s₆ s₇ s₈ : MachineState,
+      stepMirFn bodyN initN = .step s₁ ∧
+      stepMirFn bodyN s₁ = .step s₂ ∧
+      stepMirFn bodyN s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyN s₃ = .step s₄ ∧
+      stepMirFn bodyN s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 4 .reservedIM (some 3),
+         entry 3 .reservedIM,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      stepMirFn bodyN s₅ = .step s₆ ∧
+      stepMirFn bodyN s₆ = .step s₇ ∧
+      stepMirFn bodyN s₇ = .step s₈ ∧
+      s₈.memory.borrows =
+        [{ tag := 6, targetLocal := 6, targetProjection := .nil, perm := .cell,
+           protector := none, parentTag := none },
+         { tag := 5, targetLocal := 4, targetProjection := .nil, perm := .frozen,
+           protector := none, parentTag := none },
+         entry 4 .reservedIM (some 3),
+         entry 3 .reservedIM,
+         entry 2 .unique (some 1) (some 1),
+         entry 1 .unique] ∧
+      TreeBorrowsRel s₈.memory.borrows s₈.memory.activeProtectors
+        (basedNormalTree s₈.memory.borrows s₈.memory.activeProtectors)) ∧
+    stepMirFn bodyNUnsafeCellNever (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyNUnsafeCellNever (initLUninhabited true) = .fail .ub ∧
+    stepMirFn bodyNRefCellNever (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyNRefCellNever (initLUninhabited true) = .fail .ub :=
+  @LeanMiriSpec.Correspondence.WitnessLM3_3.wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps
+
+open LeanMiriSpec.Correspondence in
+#assert_standard_axioms
+  annealPermToMiri
+  miriPermToAnneal
+  annealAccessKindToMiri
+  annealRelatednessToMiri
+  miriAccessKindToAnneal
+  miriRelatednessToAnneal
+  annealTransitionToMiri
+  AnnealRetagMode
+  annealRetagModeToMiri
+  annealRetagPerm
+  annealRefKindToMiri
+  retagKindToAnnealMode
+  retagTestAllocId
+  retagParentTag
+  retagChildTag
+  baseRetagAllocation
+  liveTreeAllocation
+  liveTreeMemory
+  borrowTreeTagLocationState
+  liveTagLocationState
+  retagInitialMachineState
+  retagRefRequest
+  hooksLocTree
+  hooksTwoNodes
+  hooksTwoNodeTree
+  hooksForChildProtected
+  hooksAccessIndex
+  hooksAccessTag
+  traversalAncestorPathAux
+  traversalForeignPostorder
+  borrowIndexOfTag
+  annealTraversalNode
+  annealTraversalTree
+  BorrowTagsUnique
+  basedParentIndex
+  basedChildren
+  basedTraversalTree
+  protectedIndices
+  basedNormalTree
+  normalTreePerms
+  TreeBorrowsRel
+  treeBorrowAccessRelatedness
+  basedAccessTag
+  annealTableAccessUB
+  annealTableAfterAccess
+  treeBorrowsAncestorInv
+  treeBorrowsChain3Inv
+  treeBorrowsBranch3Inv
+  treeBorrowsProtAncestorInv
+  treeBorrowsChain3ProtInv
+  treeBorrowsBranch3ProtInv
+  borrowListChain3ProtInv
+  borrowListBranch3ProtInv
+  SimLM3_3.stmt
+  SimLM3_3.loc
+  SimLM3_3.deref
+  SimLM3_3.u64T
+  SimLM3_3.u32T
+  SimLM3_3.unsafeCellU32T
+  SimLM3_3.declOf
+  SimLM3_3.refMutDecl
+  SimLM3_3.refDecl
+  SimLM3_3.rawMutDecl
+  SimLM3_3.cU64
+  SimLM3_3.cU32
+  SimLM3_3.scalarLayout
+  SimLM3_3.witBody
+  SimLM3_3.witInit
+  SimLM3_3.entry
+  SimLM3_3.StepTreeRel
+  SimLM3_3.protOf
+  SimLM3_3.activeOf
+  SimLM3_3.simState
+  SimLM3_3.childWriteBody
+  SimLM3_3.childReadBody
+  SimLM3_3.foreignWriteBody
+  SimLM3_3.foreignReadBody
+  SimLM3_3.childState
+  SimLM3_3.foreignState
+  SimLM3_3.reborrowHierarchyState
+  SimLM3_3.retagPointeeTy
+  SimLM3_3.retagRefBody
+  SimLM3_3.retagRefState
+  SimLM3_3.retagRawBody
+  SimLM3_3.childScalarRawState
+  SimLM3_3.unitT
+  SimLM3_3.retagZstRefBody
+  SimLM3_3.retagZstRefState
+  SimLM3_3.retagZstScalarState
+  SimLM3_3.phantomU64T
+  SimLM3_3.retagPhantomRefBody
+  SimLM3_3.zstDerefReborrowBody
+  SimLM3_3.zstDerefReborrowState
+  SimLM3_3.retagPointeeRefBody
+  WitnessLM3_3.bodyA
+  WitnessLM3_3.initA
+  WitnessLM3_3.bodyB
+  WitnessLM3_3.initBC
+  WitnessLM3_3.bodyC
+  WitnessLM3_3.bodyD
+  WitnessLM3_3.initD
+  WitnessLM3_3.bodyE
+  WitnessLM3_3.bodyF
+  WitnessLM3_3.initF
+  WitnessLM3_3.calleeG
+  WitnessLM3_3.callerG
+  WitnessLM3_3.initG
+  WitnessLM3_3.bodyH
+  WitnessLM3_3.initH
+  WitnessLM3_3.bodyI
+  WitnessLM3_3.initI
+  WitnessLM3_3.initINullAt5
+  WitnessLM3_3.tupleU64U64T
+  WitnessLM3_3.fieldU64
+  WitnessLM3_3.entryProj
+  WitnessLM3_3.bodyJDisjoint
+  WitnessLM3_3.bodyJOverlap
+  WitnessLM3_3.initJ
+  WitnessLM3_3.bodyK
+  WitnessLM3_3.initK
+  WitnessLM3_3.bodyLInhabited
+  WitnessLM3_3.initLInhabited
+  WitnessLM3_3.bodyLNever
+  WitnessLM3_3.bodyLNeverArr1
+  WitnessLM3_3.initLUninhabited
+  WitnessLM3_3.bodyM
+  WitnessLM3_3.initM
+  WitnessLM3_3.unsafeCellUnitT
+  WitnessLM3_3.phantomUnsafeCellU32T
+  WitnessLM3_3.cellU32T
+  WitnessLM3_3.bodyN
+  WitnessLM3_3.initN
+  WitnessLM3_3.bodyNUnsafeCellNever
+  WitnessLM3_3.bodyNRefCellNever
+  miriPermToAnneal_annealPermToMiri
+  annealPermToMiri_miriPermToAnneal
+  TreeBorrowsBijection
+  annealPermToMiri_injective
+  annealPermToMiri_legacy
+  performAccess_permission_simulation
+  performAccess_permission_simulation_miri
+  protectedReservedIM_characterization
+  fnEntryRetagPerm_ne_reservedIM
+  nodeAccess_locationState_simulation
+  disabled_foreign_access_skipped
+  protected_write_success_eq_unprotected
+  unsafeCell_permission_simulation
+  reservedFrz_conflicted_bijection
+  reservedFrz_conflicted_protected_foreign
+  annealRetagPerm_eq_trusted
+  annealRetagPerm_eq_retagPerm
+  retag_pipeline_simulation
+  miri_fnEntry_policy_never_reservedIM
+  retagPointerValue_associatedAccess_simulation
+  retagPointerValue_rawPointer_simulation
+  borrowTree_newChild_reference_simulation
+  retagPointerValue_zst_reference_simulation
+  retagPointerValue_cell_8byte_simulation
+  retagPointerValue_8byte_reference_simulation
+  borrowTree_performNormalAccessAt_simulation
+  borrowTree_performBorrowAccessRange_simulation
+  machineMemoryHooks_fresh_root_write_simulation
+  machineMemoryHooks_fresh_root_read_simulation
+  machineMemoryHooks_beforeMemoryRead_simulation
+  machineMemoryHooks_beforeMemoryWrite_simulation
+  borrowTree_deallocateBorrowRange_simulation
+  machineMemoryHooks_beforeMemoryDeallocation_simulation
+  ancestorPath_eq_traversalAncestorPathAux
+  traversalForeignPostorder_foreign
+  traverse_local_then_foreign
+  sequence_length_eq
+  annealTraversalTree_size
+  annealTraversalTree_node
+  BorrowTagsUnique.tail
+  BorrowTagsUnique.head_ne
+  lookupBorrow_getElem
+  borrowIndexOfTag_getElem
+  borrowIndexOfTag_some
+  borrowIndexOfTag_none
+  isBorrowDescendantOrSelfAux_absent
+  traversalAncestorPathAux_iff
+  normalTree_relative_access_simulation
+  borrowTagsUnique_of_nodup
+  isBorrowDescendantOrSelf_self_eq_true
+  treeBorrowWriterRelatedness_resolveTreeBorrowWriterTag
+  borrowEntryReadUB_eq_nodeAccess
+  updateBorrowPermOnReadAtProj_eq_nodeAccess
+  hasTreeReadUB_iff_exists
+  borrowEntryWriteConflicts_resolve_eq_nodeAccess
+  updateBorrowPermTreeAtProj_eq_nodeAccess
+  hasProtectedTreeWriteConflict_iff_exists
+  freezeTreeBorrowsOnReadAtProj_eq_map
+  invalidateTreeBorrowsAtProj_eq_map
+  basedNormalTree_stateAt_lt
+  basedNormalTree_stateAt_base
+  basedNormalTree_rel
+  freezeTreeBorrowsOnReadAtProj_preserves_rel
+  invalidateTreeBorrowsAtProj_preserves_rel
+  freezeTreeBorrowsOnReadAtProj_length
+  invalidateTreeBorrowsAtProj_length
+  treeBorrowNodeAccess_of_isUB_false
+  freezeTreeBorrowsOnReadAtProj_locationState_simulation
+  invalidateTreeBorrowsAtProj_locationState_simulation
+  byteRangesOverlapBool_iff
+  borrowEntryOverlapsWrite_iff
+  borrowEntryReadUB_of_disjoint
+  updateBorrowPermOnReadAtProj_of_disjoint
+  updateBorrowPermTreeAtProj_of_foreign_disjoint
+  hasTreeReadUB_of_all_disjoint
+  hasTreeReadUB_disjoint_tail
+  freezeTreeBorrowsOnReadAtProj_of_all_disjoint
+  freezeTreeBorrowsOnReadAtProj_disjoint_tail
+  hasProtectedTreeWriteConflict_of_all_disjoint
+  invalidateTreeBorrowsAtProj_of_all_foreign_disjoint
+  invalidateTreeBorrowsAtProj_disjoint_tail
+  basedNormalTree_performAccess_singleton_simulation
+  basedNormalTree_performAccess_parent_child_simulation
+  basedNormalTree_performAccess_siblings_simulation
+  basedNormalTree_performAccess_three_level_chain_simulation
+  basedNormalTree_performAccess_branching_children_simulation
+  treeBorrowsAncestorInv_imp_prot_false
+  treeBorrowsProtAncestorInv_retag_init
+  treeBorrowsProtAncestorInv_release_protectors
+  basedNormalTree_performAccess_three_level_chain_prot_simulation
+  basedNormalTree_performAccess_branching_children_prot_simulation
+  rangedNormalTree_performAccessRange_simulation
+  SimLM3_3.sim_lm3_3_child_write_step
+  SimLM3_3.sim_lm3_3_child_read_step
+  SimLM3_3.sim_lm3_3_foreign_write_step
+  SimLM3_3.sim_lm3_3_foreign_read_step
+  SimLM3_3.sim_lm3_3_reborrow_child_write_step
+  SimLM3_3.sim_lm3_3_reborrow_parent_write_invalidates_child_step
+  SimLM3_3.sim_lm3_3_retag_ref_step
+  SimLM3_3.sim_lm3_3_retag_raw_step
+  SimLM3_3.sim_lm3_3_retag_raw_scalar_step
+  SimLM3_3.sim_lm3_3_retag_zst_ref_step
+  SimLM3_3.sim_lm3_3_retag_zst_scalar_step
+  SimLM3_3.sim_lm3_3_retag_phantom_ref_step
+  SimLM3_3.sim_lm3_3_zst_deref_reborrow_step
+  SimLM3_3.sim_lm3_3_retag_uninhabited_ref_ub_step
+  SimLM3_3.sim_lm3_3_retag_inhabited_never_container_zst_step
+  SimLM3_3.sim_lm3_3_retag_unsafecell_zst_vs_never_step
+  SimLM3_3.sim_lm3_3_retag_phantom_unsafecell_vs_cell_step
+  SimLM3_3.stateRelLM3_2Tree_treeBorrowsRel
+  SimLM3_3.sim_lm3_3_interpreter_deref_read_step
+  SimLM3_3.sim_lm3_3_interpreter_deref_write_step
+  SimLM3_3.sim_lm3_3_interpreter_reborrow_step
+  WitnessLM3_3.wit_lm3_3_reborrow_hierarchy_real_steps
+  WitnessLM3_3.wit_lm3_3_protected_conflict_ub_real_steps
+  WitnessLM3_3.wit_lm3_3_protected_unique_foreign_read_ub_real_steps
+  WitnessLM3_3.wit_lm3_3_unsafe_cell_vs_freeze_real_steps
+  WitnessLM3_3.wit_lm3_3_reservedIM_lifecycle_real_steps
+  WitnessLM3_3.wit_lm3_3_cell_reborrow_preserves_unique_real_steps
+  WitnessLM3_3.wit_lm3_3_protector_release_on_return_real_steps
+  WitnessLM3_3.wit_lm3_3_non_fnEntry_retag_and_raw_retag_real_steps
+  WitnessLM3_3.wit_lm3_3_zst_retag_skips_read_and_dangling_scalar_real_steps
+  WitnessLM3_3.wit_lm3_3_subprojection_disjoint_vs_overlapping_real_steps
+  WitnessLM3_3.wit_lm3_3_zst_deref_reborrow_and_phantom_retag_real_steps
+  WitnessLM3_3.wit_lm3_3_uninhabited_ref_retag_ub_vs_inhabited_never_zst_real_steps
+  WitnessLM3_3.wit_lm3_3_protected_cell_chain_under_disabled_root_real_steps
+  WitnessLM3_3.wit_lm3_3_wrapper_zst_freeze_and_uninhabited_cell_real_steps
 
 end StatementPins
 

@@ -373,8 +373,424 @@ def isBorrowProtected
   | .none => false
 
 /--
-Test whether a write with `writerTag` would disable `entry`'s Tree Borrows
-permission if their regions overlap.
+With no active protectors, no borrow entry is protected.
+-/
+@[simp]
+theorem isBorrowProtected_nil (entry : BorrowEntry) :
+    isBorrowProtected .nil entry = false := by
+  unfold isBorrowProtected
+  cases entry.protector <;> rfl
+
+/--
+Kind of a Tree Borrows memory access, mirroring Miri's `AccessKind`.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L219-L231>
+
+> "pub(super) fn perform_access(
+>     kind: AccessKind,
+>     rel_pos: AccessRelatedness,
+>     child: PermissionPriv,
+>     protected: bool,
+> ) -> Option<PermissionPriv> {"
+-/
+inductive TreeBorrowAccessKind : Type where
+  /-- A read access. -/
+  | read : TreeBorrowAccessKind
+  /-- A write access. -/
+  | write : TreeBorrowAccessKind
+
+/--
+Position of the accessed tag relative to the borrow-tree node being updated,
+mirroring the `rel_pos.is_foreign()` test in Miri's `perform_access`.
+
+`.localAccess` means the access goes through the node itself or one of its
+descendants (a child access); `.foreignAccess` means every other access,
+including accesses through ancestors, siblings, cousins, and direct accesses to
+the borrowed local that do not go through any tag.
+
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L47-L55>
+
+> "When a node is accessed, each node in the tree can be divided into two
+> disjoint sets: *local nodes* and *foreign nodes*, based on its relative
+> position to the accessed node. The *local* set includes the node itself and
+> all its descendants, while the *foreign* set contains all other nodes."
+-/
+inductive TreeBorrowRelatedness : Type where
+  /-- Access through the node or one of its descendants. -/
+  | localAccess : TreeBorrowRelatedness
+  /-- Any other access. -/
+  | foreignAccess : TreeBorrowRelatedness
+
+/--
+Outcome of one per-node Tree Borrows transition, mirroring Miri's
+`Option<PermissionPriv>` result plus its `assert!(!protected)` branches.
+
+`.ub` is upstream `None` (a forbidden child access). `.protectedReservedIM` is
+the upstream assertion failure for a protected `ReservedIM` node, which Miri
+documents as unreachable because it never creates `ReservedIM` under a
+protector. Anneal treats `.protectedReservedIM` as undefined behavior wherever
+it consumes a transition, so a state that violates Miri's invariant fails
+closed instead of being silently accepted.
+-/
+inductive TreeBorrowTransition : Type where
+  /-- The access is permitted and the node moves to `perm`. -/
+  | transition (perm : TreeBorrowPerm) : TreeBorrowTransition
+  /-- The access is a forbidden child access (undefined behavior). -/
+  | ub : TreeBorrowTransition
+  /-- The access reached a protected `.reservedIM` node, which violates Miri's
+      protector invariant. -/
+  | protectedReservedIM : TreeBorrowTransition
+
+/--
+Child-read transition: undefined behavior on `.disabled`, no change otherwise.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L137-L145>
+
+> "/// A child node was read-accessed: UB on Disabled, noop on the rest.
+> fn child_read(state: PermissionPriv, _protected: bool) -> Option<PermissionPriv> {
+>     Some(match state {
+>         Disabled => return None,
+>         // The inner data `ty_is_freeze` of `Reserved` is always irrelevant for Read
+>         // accesses, since the data is not being mutated. Hence the `{ .. }`.
+>         readable @ (Cell | ReservedFrz { .. } | ReservedIM | Unique | Frozen) => readable,
+>     })
+> }"
+-/
+@[simp]
+def treeBorrowChildRead : TreeBorrowPerm → TreeBorrowTransition
+  | .cell => .transition .cell
+  | .reservedFrz conflicted => .transition (.reservedFrz conflicted)
+  | .reservedIM => .transition .reservedIM
+  | .unique => .transition .unique
+  | .frozen => .transition .frozen
+  | .disabled => .ub
+
+/--
+Foreign-read transition: `.cell`, `.frozen`, and `.disabled` are unchanged; a
+protected `.reservedFrz` sets its conflict latch; an unprotected reservation is
+unchanged; `.unique` freezes, or disables while protected.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L147-L182>
+
+> "fn foreign_read(state: PermissionPriv, protected: bool) -> Option<PermissionPriv> {
+>     Some(match state {
+>         // Cell ignores foreign reads.
+>         Cell => Cell,
+>         // Non-writeable states just ignore foreign reads.
+>         non_writeable @ (Frozen | Disabled) => non_writeable,
+>         ...
+>         ReservedFrz { .. } if protected => ReservedFrz { conflicted: true },
+>         // Before activation and without protectors, foreign reads are fine.
+>         // That's the entire point of 2-phase borrows.
+>         res @ (ReservedFrz { .. } | ReservedIM) => {
+>             // Even though we haven't checked `ReservedIM if protected` separately,
+>             // it is a state that cannot occur because under a protector we only
+>             // create `ReservedFrz` never `ReservedIM`.
+>             assert!(!protected);
+>             res
+>         }
+>         Unique =>
+>             if protected {
+>                 // We wrote, someone else reads -- that's bad.
+>                 // (Since Unique is always initialized, this move-to-protected will mean insta-UB.)
+>                 Disabled
+>             } else {
+>                 ...
+>                 Frozen
+>             },
+>     })
+> }"
+-/
+@[simp]
+def treeBorrowForeignRead
+    (perm : TreeBorrowPerm)
+    (isProtected : Bool) :
+    TreeBorrowTransition :=
+  match perm with
+  | .cell => .transition .cell
+  | .frozen => .transition .frozen
+  | .disabled => .transition .disabled
+  | .reservedFrz conflicted =>
+    match isProtected with
+    | true => .transition (.reservedFrz true)
+    | false => .transition (.reservedFrz conflicted)
+  | .reservedIM =>
+    match isProtected with
+    | true => .protectedReservedIM
+    | false => .transition .reservedIM
+  | .unique =>
+    match isProtected with
+    | true => .transition .disabled
+    | false => .transition .frozen
+
+/--
+Child-write transition: `.cell` is unchanged; a protected conflicted
+`.reservedFrz` is undefined behavior; every other reservation and `.unique`
+become `.unique`; `.frozen` and `.disabled` are undefined behavior.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L184-L199>
+
+> "fn child_write(state: PermissionPriv, protected: bool) -> Option<PermissionPriv> {
+>     Some(match state {
+>         // Cell ignores child writes.
+>         Cell => Cell,
+>         // If the `conflicted` flag is set, then there was a foreign read during
+>         // the function call that is still ongoing (still `protected`),
+>         // this is UB (`noalias` violation).
+>         ReservedFrz { conflicted: true } if protected => return None,
+>         // A write always activates the 2-phase borrow, even with interior
+>         // mutability
+>         ReservedFrz { .. } | ReservedIM | Unique => Unique,
+>         Frozen | Disabled => return None,
+>     })
+> }"
+-/
+@[simp]
+def treeBorrowChildWrite
+    (perm : TreeBorrowPerm)
+    (isProtected : Bool) :
+    TreeBorrowTransition :=
+  match perm with
+  | .cell => .transition .cell
+  | .reservedFrz true =>
+    match isProtected with
+    | true => .ub
+    | false => .transition .unique
+  | .reservedFrz false => .transition .unique
+  | .reservedIM => .transition .unique
+  | .unique => .transition .unique
+  | .frozen => .ub
+  | .disabled => .ub
+
+/--
+Foreign-write transition: `.cell` is unchanged; an unprotected `.reservedIM` is
+unchanged; every other state becomes `.disabled`.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L201-L217>
+
+> "fn foreign_write(state: PermissionPriv, protected: bool) -> Option<PermissionPriv> {
+>     ...
+>     Some(match state {
+>         // Cell ignores foreign writes.
+>         Cell => Cell,
+>         res @ ReservedIM => {
+>             // We can never create a `ReservedIM` under a protector, only `ReservedFrz`.
+>             assert!(!protected);
+>             res
+>         }
+>         _ => Disabled,
+>     })
+> }"
+-/
+@[simp]
+def treeBorrowForeignWrite
+    (perm : TreeBorrowPerm)
+    (isProtected : Bool) :
+    TreeBorrowTransition :=
+  match perm with
+  | .cell => .transition .cell
+  | .reservedIM =>
+    match isProtected with
+    | true => .protectedReservedIM
+    | false => .transition .reservedIM
+  | .reservedFrz _ => .transition .disabled
+  | .unique => .transition .disabled
+  | .frozen => .transition .disabled
+  | .disabled => .transition .disabled
+
+/--
+Per-node Tree Borrows permission transition: the same four-way dispatch on
+`(kind, rel)` as Miri's `perform_access`, over all six permission states and
+both protector settings.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L219-L231>
+
+> "match (kind, rel_pos.is_foreign()) {
+>     (AccessKind::Write, true) => foreign_write(child, protected),
+>     (AccessKind::Read, true) => foreign_read(child, protected),
+>     (AccessKind::Write, false) => child_write(child, protected),
+>     (AccessKind::Read, false) => child_read(child, protected),
+> }"
+-/
+@[simp]
+def treeBorrowPermTransition
+    (kind : TreeBorrowAccessKind)
+    (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm)
+    (isProtected : Bool) :
+    TreeBorrowTransition :=
+  match kind, rel with
+  | .write, .foreignAccess => treeBorrowForeignWrite perm isProtected
+  | .read, .foreignAccess => treeBorrowForeignRead perm isProtected
+  | .write, .localAccess => treeBorrowChildWrite perm isProtected
+  | .read, .localAccess => treeBorrowChildRead perm
+
+/--
+Protector rule applied after a per-node transition: a protected node whose
+transition produces `.disabled` is undefined behavior.
+
+Every Anneal `BorrowEntry` stands for an accessed (initialized) location: its
+creation performs the initial child access of its permission, except for
+`.cell`, which no transition ever disables. Miri's `accessed` guard is
+therefore always satisfied here.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/tree.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/tree.rs#L157-L159>
+
+> "if protected && self.accessed && transition.produces_disabled() {
+>     return Err(TransitionError::ProtectedDisabled(old_perm));
+> }"
+-/
+@[simp]
+def treeBorrowProtectorCheck
+    (isProtected : Bool) :
+    TreeBorrowTransition → TreeBorrowTransition
+  | .transition .disabled =>
+    match isProtected with
+    | true => .ub
+    | false => .transition .disabled
+  | .transition .cell => .transition .cell
+  | .transition (.reservedFrz conflicted) =>
+    .transition (.reservedFrz conflicted)
+  | .transition .reservedIM => .transition .reservedIM
+  | .transition .unique => .transition .unique
+  | .transition .frozen => .transition .frozen
+  | .ub => .ub
+  | .protectedReservedIM => .protectedReservedIM
+
+/--
+Full per-node access for one borrow entry: the permission transition, the
+protector rule, and the tree visitor's rule that a foreign access skips a
+`.disabled` node.
+
+Child accesses never produce `.disabled`, so the protector rule only matters
+for foreign accesses. Miri's visitor skips a foreign access to a `Disabled`
+node (`skip_if_known_noop`), so a protected `.disabled` entry is not reported
+again by later foreign accesses.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/tree.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/tree.rs#L130-L162>
+
+> "fn perform_access(
+>     &mut self,
+>     access_kind: AccessKind,
+>     rel_pos: AccessRelatedness,
+>     protected: bool,
+> ) -> Result<PermTransition, TransitionError> {
+>     let old_perm = self.permission;
+>     let transition = Permission::perform_access(access_kind, rel_pos, old_perm, protected)
+>         .ok_or(TransitionError::ChildAccessForbidden(old_perm))?;"
+-/
+@[simp]
+def treeBorrowNodeAccess
+    (kind : TreeBorrowAccessKind)
+    (rel : TreeBorrowRelatedness)
+    (perm : TreeBorrowPerm)
+    (isProtected : Bool) :
+    TreeBorrowTransition :=
+  match rel with
+  | .localAccess => treeBorrowPermTransition kind .localAccess perm isProtected
+  | .foreignAccess =>
+    match perm with
+    | .disabled => .transition .disabled
+    | _ =>
+      treeBorrowProtectorCheck isProtected
+        (treeBorrowPermTransition kind .foreignAccess perm isProtected)
+
+/--
+`true` exactly for transition outcomes that Anneal treats as undefined
+behavior (`.ub` and the fail-closed `.protectedReservedIM`).
+-/
+@[simp]
+def treeBorrowTransitionIsUB : TreeBorrowTransition → Bool
+  | .transition _ => false
+  | .ub => true
+  | .protectedReservedIM => true
+
+/--
+Apply a per-node transition outcome to `entry`. Undefined-behavior outcomes
+leave `entry` unchanged; callers detect them separately before committing the
+new borrow table.
+-/
+@[simp]
+def applyTreeBorrowTransition
+    (entry : BorrowEntry) :
+    TreeBorrowTransition → BorrowEntry
+  | .transition perm => { entry with perm := perm }
+  | .ub => entry
+  | .protectedReservedIM => entry
+
+/--
+`applyTreeBorrowTransition` changes only `perm`: every other `BorrowEntry`
+field is preserved.
+-/
+@[simp]
+theorem applyTreeBorrowTransition_fields
+    (entry : BorrowEntry)
+    (outcome : TreeBorrowTransition) :
+    (applyTreeBorrowTransition entry outcome).tag = entry.tag ∧
+    (applyTreeBorrowTransition entry outcome).targetLocal = entry.targetLocal ∧
+    (applyTreeBorrowTransition entry outcome).targetProjection =
+      entry.targetProjection ∧
+    (applyTreeBorrowTransition entry outcome).rangeOffset = entry.rangeOffset ∧
+    (applyTreeBorrowTransition entry outcome).rangeLen = entry.rangeLen ∧
+    (applyTreeBorrowTransition entry outcome).protector = entry.protector ∧
+    (applyTreeBorrowTransition entry outcome).parentTag = entry.parentTag := by
+  cases outcome <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+Relative position of a write through `writerTag` with respect to `entry` when
+the writer has already been normalized against the borrow hierarchy
+(`resolveTreeBorrowWriterTag`): a write through `entry`'s own tag is a child
+access, while a direct write to the local (`writerTag = .none`) or a write
+through any other tag is foreign.
+-/
+@[simp]
+def treeBorrowWriterRelatedness
+    (entry : BorrowEntry)
+    (writerTag : Option Nat) :
+    TreeBorrowRelatedness :=
+  match writerTag with
+  | .none => .foreignAccess
+  | .some tag =>
+    match Nat.beq entry.tag tag with
+    | true => .localAccess
+    | false => .foreignAccess
+
+/--
+Test whether a write with `writerTag` would be undefined behavior at `entry`
+if `entry` is protected and its region overlaps the write.
+
+The test runs the per-node access `treeBorrowNodeAccess` with
+`isProtected := true`: it reports a forbidden child write (a protected
+conflicted `.reservedFrz`, or `.frozen` / `.disabled`), a foreign write that
+would disable a protected node, and the fail-closed protected `.reservedIM`
+case. A protected `.cell` survives every write, and a foreign write skips a
+`.disabled` node.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -385,20 +801,12 @@ def borrowEntryWriteConflicts
     (entry : BorrowEntry)
     (writerTag : Option Nat) :
     Bool :=
-  match writerTag with
-  | .none =>
-    match entry.perm with
-    | .active => true
-    | .frozen => true
-    | .reserved => false
-    | .disabled => false
-  | .some tag =>
-    match Nat.beq entry.tag tag with
-    | true => false
-    | false =>
-      match entry.perm with
-      | .disabled => false
-      | _ => true
+  treeBorrowTransitionIsUB
+    (treeBorrowNodeAccess
+      .write
+      (treeBorrowWriterRelatedness entry writerTag)
+      entry.perm
+      true)
 
 /--
 Test whether any `BorrowEntry` in `borrows` targeting `targetLocal` at an
@@ -478,13 +886,17 @@ is mutated either directly (`writerTag = .none`) or through a pointer with
 provenance tag `writerTag = .some tag`.
 
 - When `writerTag = .none` (direct write to `targetLocal` not through a
-  pointer): every entry targeting `targetLocal` with permission `.active` or
-  `.frozen` transitions to `.disabled`, whereas `.reserved` borrows tolerate
-  parent writes until activated.
-- When `writerTag = .some tag` (write through pointer with tag `tag`): the entry
-  with `entry.tag == tag` transitions `.reserved -> .active` (or stays
-  `.active`), and any other entry (`entry.tag != tag`) targeting `targetLocal`
-  transitions to `.disabled`.
+  pointer), the write is a foreign write for every entry targeting
+  `targetLocal`: `.cell` and `.reservedIM` are unchanged and every other state
+  becomes `.disabled`.
+- When `writerTag = .some tag`, the entry with `entry.tag == tag` receives a
+  child write (reservations activate to `.unique`, `.cell` is unchanged), and
+  any other entry targeting `targetLocal` receives a foreign write.
+
+The update uses the unprotected transition. Whenever the protected transition
+of a write is not undefined behavior it agrees with the unprotected one, and
+callers reject protected undefined behavior (`hasProtectedWriteConflict`,
+`hasProtectedTreeWriteConflict`) before committing this update.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -500,20 +912,12 @@ def updateBorrowPerm
   match Nat.beq entry.targetLocal targetLocal with
   | false => entry
   | true =>
-    match writerTag with
-    | .none =>
-      match entry.perm with
-      | .active => { entry with perm := .disabled }
-      | .frozen => { entry with perm := .disabled }
-      | .reserved => entry
-      | .disabled => entry
-    | .some tag =>
-      match Nat.beq entry.tag tag with
-      | true =>
-        match entry.perm with
-        | .reserved => { entry with perm := .active }
-        | _ => entry
-      | false => { entry with perm := .disabled }
+    applyTreeBorrowTransition entry
+      (treeBorrowNodeAccess
+        .write
+        (treeBorrowWriterRelatedness entry writerTag)
+        entry.perm
+        false)
 
 /--
 Definitional simplification equation for `updateBorrowPerm`.
@@ -527,20 +931,12 @@ theorem updateBorrowPerm_eq
       (match Nat.beq entry.targetLocal targetLocal with
       | false => entry
       | true =>
-        match writerTag with
-        | .none =>
-          match entry.perm with
-          | .active => { entry with perm := .disabled }
-          | .frozen => { entry with perm := .disabled }
-          | .reserved => entry
-          | .disabled => entry
-        | .some tag =>
-          match Nat.beq entry.tag tag with
-          | true =>
-            match entry.perm with
-            | .reserved => { entry with perm := .active }
-            | _ => entry
-          | false => { entry with perm := .disabled }) := rfl
+        applyTreeBorrowTransition entry
+          (treeBorrowNodeAccess
+            .write
+            (treeBorrowWriterRelatedness entry writerTag)
+            entry.perm
+            false)) := rfl
 
 /--
 Transition all `BorrowEntry` records in `borrows` affected by a write to
@@ -609,35 +1005,23 @@ def updateBorrowPermAtProj
   match Nat.beq entry.targetLocal targetLocal with
   | false => entry
   | true =>
-    match writerTag with
-    | .none =>
+    match treeBorrowWriterRelatedness entry writerTag with
+    | .localAccess =>
+      applyTreeBorrowTransition entry
+        (treeBorrowNodeAccess .write .localAccess entry.perm false)
+    | .foreignAccess =>
       match
         borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen
       with
       | false => entry
       | true =>
-        match entry.perm with
-        | .active => { entry with perm := .disabled }
-        | .frozen => { entry with perm := .disabled }
-        | .reserved => entry
-        | .disabled => entry
-    | .some tag =>
-      match Nat.beq entry.tag tag with
-      | true =>
-        match entry.perm with
-        | .reserved => { entry with perm := .active }
-        | _ => entry
-      | false =>
-        match
-          borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen
-        with
-        | false => entry
-        | true => { entry with perm := .disabled }
+        applyTreeBorrowTransition entry
+          (treeBorrowNodeAccess .write .foreignAccess entry.perm false)
 
 /--
 When `writeProj = .nil` and `entry.targetProjection = .nil` (with default
-unranged write `writeRangeLen = 0`), `updateBorrowPermAtProj` reduces
-definitionally to `updateBorrowPerm`.
+unranged write `writeRangeLen = 0`), `updateBorrowPermAtProj` agrees with
+`updateBorrowPerm`.
 -/
 @[simp]
 theorem updateBorrowPermAtProj_nil_eq_updateBorrowPerm
@@ -647,9 +1031,17 @@ theorem updateBorrowPermAtProj_nil_eq_updateBorrowPerm
     (h_proj : entry.targetProjection = .nil) :
     updateBorrowPermAtProj entry targetLocal writerTag .nil =
       updateBorrowPerm entry targetLocal writerTag := by
-  unfold updateBorrowPermAtProj updateBorrowPerm borrowEntryOverlapsWrite
-  rw [h_proj]
-  rfl
+  have hov : borrowEntryOverlapsWrite entry .nil 0 0 = true := by
+    unfold borrowEntryOverlapsWrite
+    rw [h_proj]
+    rfl
+  unfold updateBorrowPermAtProj updateBorrowPerm
+  cases Nat.beq entry.targetLocal targetLocal with
+  | false => rfl
+  | true =>
+    cases hrel : treeBorrowWriterRelatedness entry writerTag with
+    | localAccess => rfl
+    | foreignAccess => simp only [hov]
 
 /--
 Transition all `BorrowEntry` records in `borrows` affected by a write to
@@ -836,6 +1228,58 @@ def isBorrowDescendantOrSelf
   isBorrowDescendantOrSelfAux (length borrows) borrows candidateTag ancestorTag
 
 /--
+Fuel-bounded walk up the `BorrowEntry.parentTag` chain starting at `startTag`,
+testing whether an unprotected child access of kind `kind` is undefined
+behavior at some entry on the chain: a child read of a `.disabled` entry, or a
+child write of a `.frozen` or `.disabled` entry.
+
+An access through a tag is a child (`NodeRelation::Local`) access for the tag's
+own node and for every ancestor, so Miri applies the child transition to each
+of them. A missing parent entry ends the walk, matching
+`isBorrowDescendantOrSelfAux`. Protector-dependent child-write undefined
+behavior (a protected conflicted `.reservedFrz`) is reported separately by
+`hasProtectedTreeWriteConflict`.
+
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L101-L106>
+
+> "// If `self` is an ancestor of the accessed node, the accessed node is local to `self`.
+> // Otherwise, the accessed node is a `foreign` of `self`.
+> let node_relation = if path.is_some() { NodeRelation::Local } else { NodeRelation::Foreign };"
+-/
+@[reducible]
+def treeBorrowChainChildAccessUBAux
+    (kind : TreeBorrowAccessKind) :
+    Nat → List BorrowEntry → Option Nat → Bool
+  | .zero, _, _ => false
+  | .succ _, _, .none => false
+  | .succ fuel, borrows, .some tag =>
+    match lookupBorrow borrows tag with
+    | .none => false
+    | .some ancestor =>
+      match
+        treeBorrowTransitionIsUB
+          (treeBorrowPermTransition kind .localAccess ancestor.perm false)
+      with
+      | true => true
+      | false =>
+        treeBorrowChainChildAccessUBAux kind fuel borrows ancestor.parentTag
+
+/--
+Test whether an unprotected child access of kind `kind` through a tag whose
+parent is `parentTag` is undefined behavior at some strict ancestor in
+`borrows` (`treeBorrowChainChildAccessUBAux` with fuel `length borrows`).
+-/
+@[reducible]
+def treeBorrowAncestorsChildAccessUB
+    (kind : TreeBorrowAccessKind)
+    (borrows : List BorrowEntry)
+    (parentTag : Option Nat) :
+    Bool :=
+  treeBorrowChainChildAccessUBAux kind (length borrows) borrows parentTag
+
+/--
 Resolve the effective writer provenance tag relative to `entry` in `borrows`
 under the Tree Borrows parent/child hierarchy.
 
@@ -843,7 +1287,8 @@ When `writerTag = .some wTag` and `wTag` is in the subtree rooted at `entry.tag`
 (`isBorrowDescendantOrSelf borrows wTag entry.tag == true`), the write is a
 child/self (`NodeRelation::Local`) write relative to `entry`, so
 `resolveTreeBorrowWriterTag` normalizes the writer tag to `.some entry.tag`
-(activating `entry` from `.reserved` to `.active` or preserving `.active`).
+(applying the child-write transition to `entry`: a reservation activates to
+`.unique`, `.unique` and `.cell` are preserved).
 Otherwise (`NodeRelation::Foreign` write), `writerTag` is returned unchanged so
 conflicting non-ancestor entries are disabled.
 
@@ -902,10 +1347,11 @@ range `[writeRangeOff, writeRangeOff + writeRangeLen)`.
 
 Writes through a descendant tag (`isBorrowDescendantOrSelf allBorrows wTag
 entry.tag == true`) act as `NodeRelation::Local` writes on `entry` (activating
-`.reserved -> .active` and preserving `.active` on ancestors), whereas writes
-through a non-descendant tag (`NodeRelation::Foreign` writes, including writes
-through an ancestor tag relative to its children) disable overlapping
-active/reserved/frozen entries.
+reservations to `.unique` and preserving `.unique` and `.cell` on ancestors),
+whereas writes through a non-descendant tag (`NodeRelation::Foreign` writes,
+including writes through an ancestor tag relative to its children) disable
+overlapping `.reservedFrz`, `.unique`, and `.frozen` entries while leaving
+`.cell` and `.reservedIM` entries unchanged.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -1017,10 +1463,14 @@ Tree-Borrows-aware read permission transition for `entry` within borrow table
 
 Under Tree Borrows, a child/self (`NodeRelation::Local`) read
 (`isBorrowDescendantOrSelf allBorrows rTag entry.tag == true`) preserves
-`entry.perm`, whereas a `NodeRelation::Foreign` read (such as reading through a
-parent pointer after a child mutable borrow has been activated) transitions an
-overlapping `.active` (`PermissionUnprot::Unique`) entry to `.frozen` while
-leaving `.reserved`, `.frozen`, and `.disabled` entries unchanged.
+`entry.perm` (child reads never change a permission; a child read of a
+`.disabled` entry is undefined behavior, which `hasTreeReadUB` reports before
+this update is committed), whereas a `NodeRelation::Foreign` read (such as
+reading through a parent pointer after a child mutable borrow has been
+activated) applies `treeBorrowNodeAccess .read .foreignAccess` with the
+entry's protector status in `activeProtectors`: `.unique` freezes when
+unprotected, a protected `.reservedFrz` sets its conflict latch, and `.cell`,
+`.frozen`, `.disabled`, and unprotected reservations are unchanged.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -1066,7 +1516,8 @@ def updateBorrowPermOnReadAtProj
     (readerTag : Option Nat)
     (readProj : List ProjectionElem)
     (readRangeOff : Nat := 0)
-    (readRangeLen : Nat := 0) :
+    (readRangeLen : Nat := 0)
+    (activeProtectors : List Nat := .nil) :
     BorrowEntry :=
   match Nat.beq entry.targetLocal targetLocal with
   | false => entry
@@ -1083,9 +1534,12 @@ def updateBorrowPermOnReadAtProj
       match isLocalRead with
       | true => entry
       | false =>
-        match entry.perm with
-        | .active => { entry with perm := .frozen }
-        | _ => entry
+        applyTreeBorrowTransition entry
+          (treeBorrowNodeAccess
+            .read
+            .foreignAccess
+            entry.perm
+            (isBorrowProtected activeProtectors entry))
 
 /--
 Apply `updateBorrowPermOnReadAtProj` across `borrows` for a read at
@@ -1120,7 +1574,8 @@ def freezeTreeBorrowsOnReadAtProj
     (readerTag : Option Nat)
     (readProj : List ProjectionElem)
     (readRangeOff : Nat := 0)
-    (readRangeLen : Nat := 0) :
+    (readRangeLen : Nat := 0)
+    (activeProtectors : List Nat := .nil) :
     List BorrowEntry :=
   match borrows with
   | .nil => .nil
@@ -1132,7 +1587,8 @@ def freezeTreeBorrowsOnReadAtProj
       readerTag
       readProj
       readRangeOff
-      readRangeLen ::
+      readRangeLen
+      activeProtectors ::
       freezeTreeBorrowsOnReadAtProj
         allBorrows
         rest
@@ -1141,11 +1597,14 @@ def freezeTreeBorrowsOnReadAtProj
         readProj
         readRangeOff
         readRangeLen
+        activeProtectors
 
 /--
 Update Tree Borrows permissions in `borrows` after a dereference read from
-pointer local `ptrLoc` with post-deref projection suffix `restProj`, freezing
-any foreign `.active` borrows whose target region overlaps the read.
+pointer local `ptrLoc` with post-deref projection suffix `restProj`, applying
+the foreign-read transition (with protector status from `activeProtectors`) to
+every borrow whose target region overlaps the read and that is not an ancestor
+of (or equal to) the reader's tag.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -1178,7 +1637,8 @@ def freezeDerefReadBorrowsAt
     (locals : List LocalSlot)
     (ptrLoc : Local)
     (restProj : List ProjectionElem)
-    (borrows : List BorrowEntry) :
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat := .nil) :
     List BorrowEntry :=
   match get? locals ptrLoc with
   | .some (.init (.ptr ptrVal _)) =>
@@ -1192,8 +1652,143 @@ def freezeDerefReadBorrowsAt
         (appendProjections readerEntry.targetProjection restProj)
         readerEntry.rangeOffset
         readerEntry.rangeLen
+        activeProtectors
     | .none => borrows
   | _ => borrows
+
+/--
+Test whether a read through `readerTag` (or a direct read of the local when
+`readerTag = .none`) at `targetLocal` / `readProj` and the optional byte range
+is undefined behavior at `entry`: a child read of a `.disabled` entry, a
+foreign read that disables a protected `.unique` entry, or a foreign read of a
+protected `.reservedIM` entry (fail-closed).
+
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L7-L8>
+
+> "When a reborrow occurs at function entry (i.e. the original reference is
+> passed as an argument), we add a *protector* to the reborrow. When a node is
+> protected, it is UB for this node to become `Disabled`."
+-/
+@[reducible]
+def borrowEntryReadUB
+    (allBorrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (entry : BorrowEntry)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff : Nat := 0)
+    (readRangeLen : Nat := 0) :
+    Bool :=
+  match Nat.beq entry.targetLocal targetLocal with
+  | false => false
+  | true =>
+    match
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen
+    with
+    | false => false
+    | true =>
+      let isLocalRead :=
+        match readerTag with
+        | .none => false
+        | .some rTag => isBorrowDescendantOrSelf allBorrows rTag entry.tag
+      match isLocalRead with
+      | true =>
+        treeBorrowTransitionIsUB
+          (treeBorrowNodeAccess
+            .read
+            .localAccess
+            entry.perm
+            (isBorrowProtected activeProtectors entry))
+      | false =>
+        treeBorrowTransitionIsUB
+          (treeBorrowNodeAccess
+            .read
+            .foreignAccess
+            entry.perm
+            (isBorrowProtected activeProtectors entry))
+
+/--
+Test whether a read through `readerTag` is undefined behavior at any entry of
+`borrows` within full borrow hierarchy `allBorrows` (`borrowEntryReadUB`).
+
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L89-L125>
+
+> "/// Recusively do state transition on `self` node and all its descendants.
+> /// `path` is the path from `self` to the accessed node.
+> /// `path` is None when the accessed node is not a descendant of `self`."
+-/
+@[reducible]
+def hasTreeReadUB
+    (allBorrows : List BorrowEntry)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (readerTag : Option Nat)
+    (readProj : List ProjectionElem)
+    (readRangeOff : Nat := 0)
+    (readRangeLen : Nat := 0) :
+    Bool :=
+  match borrows with
+  | .nil => false
+  | entry :: rest =>
+    match
+      borrowEntryReadUB
+        allBorrows
+        activeProtectors
+        entry
+        targetLocal
+        readerTag
+        readProj
+        readRangeOff
+        readRangeLen
+    with
+    | true => true
+    | false =>
+      hasTreeReadUB
+        allBorrows
+        rest
+        activeProtectors
+        targetLocal
+        readerTag
+        readProj
+        readRangeOff
+        readRangeLen
+
+/--
+Test whether a dereference read from pointer local `ptrLoc` with post-deref
+projection suffix `restProj` is undefined behavior under the Tree Borrows
+hierarchy `borrows` and active protectors `activeProtectors` (`hasTreeReadUB`
+at the reader's region). Returns `false` when `ptrLoc` does not hold a tracked
+pointer; `evalOperand` handles those cases.
+-/
+@[reducible]
+def derefReadTreeUB
+    (locals : List LocalSlot)
+    (ptrLoc : Local)
+    (restProj : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) :
+    Bool :=
+  match get? locals ptrLoc with
+  | .some (.init (.ptr ptrVal _)) =>
+    match lookupBorrow borrows ptrVal.tag with
+    | .some readerEntry =>
+      hasTreeReadUB
+        borrows
+        borrows
+        activeProtectors
+        readerEntry.targetLocal
+        (.some ptrVal.tag)
+        (appendProjections readerEntry.targetProjection restProj)
+        readerEntry.rangeOffset
+        readerEntry.rangeLen
+    | .none => false
+  | _ => false
 
 /--
 Test whether any `BorrowEntry` in `borrows` targeting `targetLocal` at an
@@ -2250,6 +2845,46 @@ def invalidateDerefWriteBorrows
     | _ => allBorrows
 
 /--
+Test whether a dereferenced write to `dst` through the pointer stored in
+`dst.local_` is undefined behavior at a strict ancestor of the writer's tag in
+the Tree Borrows hierarchy `borrows` (`treeBorrowAncestorsChildAccessUB
+.write`): a write through a reborrow is a child write for every ancestor, so a
+`.frozen` or `.disabled` ancestor makes it undefined behavior even when the
+writer's own permission allows the write.
+
+The writer's own permission is checked by `writePlaceValue` and protector
+conflicts by `evalPlaceWrite`. With fewer than two borrow entries the writer
+has no ancestor in `borrows`, so the test is `false`, mirroring the borrow-list
+cases of `invalidateDerefWriteBorrows`.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L184-L199>
+
+> "/// A child node was write-accessed: `Reserved` must become `Unique` to obtain
+> /// write permissions, `Frozen` and `Disabled` cannot obtain such permissions and produce UB."
+-/
+@[reducible]
+def derefWriteTreeUB
+    (locals₁ : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (dst : Place) :
+    Bool :=
+  match borrows with
+  | .nil => false
+  | _ :: .nil => false
+  | b₁ :: b₂ :: restBorrows =>
+    let allBorrows := b₁ :: b₂ :: restBorrows
+    match get? locals₁ dst.local_ with
+    | .some (.init (.ptr ptrVal _)) =>
+      match lookupBorrow allBorrows ptrVal.tag with
+      | .some entry =>
+        treeBorrowAncestorsChildAccessUB .write allBorrows entry.parentTag
+      | .none => false
+    | _ => false
+
+/--
 Evaluate a byte-level representation cast (`CastKind.transmute` or
 `CastKind.subtype`) from operand `op` to `targetTy` by encoding the source
 `Value` into `List AbstractByte` and decoding at `targetTy`.
@@ -2376,14 +3011,21 @@ Determine whether a monomorphized `RigidTy` is `Freeze` (contains no
 `UnsafeCell` interior mutability or raw pointer), using structural recursion
 with `fuel`.
 
-Returns `false` (`!Freeze`) for `.rawPtr`, for `core::cell::UnsafeCell` /
-`std::cell::UnsafeCell`, and for any `.adt`, `.tuple`, `.array`, or `.slice`
-whose type arguments or element types contain a `!Freeze` component; returns
-`true` (`Freeze`) otherwise.
-Modeling choice: Because `RigidTy.adt` carries generic `args` rather than full
-field declarations, `rigidTyIsFreeze` recurses structurally on `args` and also
-classifies `.rawPtr` as `!Freeze` so raw-pointer wrapper cells (such as `Cell`
-or custom interior-mutable wrappers) conservatively receive `.reserved`.
+Returns `true` (`Freeze`) unconditionally for `core::marker::PhantomData` /
+`std::marker::PhantomData` (a zero-field marker type containing no
+`UnsafeCell<T>` regardless of its type parameter `T`); returns `false`
+(`!Freeze`) for `.rawPtr`, for standard interior-mutable cells containing
+`UnsafeCell<T>` (`core::cell::UnsafeCell`, `std::cell::UnsafeCell`,
+`core::cell::SyncUnsafeCell`, `std::cell::SyncUnsafeCell`, `core::cell::Cell`,
+`std::cell::Cell`, `core::cell::RefCell`, `std::cell::RefCell`), and for any
+other `.adt`, `.tuple`, `.array`, or `.slice` whose type arguments or element
+types contain a `!Freeze` component; returns `true` (`Freeze`) otherwise.
+Modeling choice vs. stable Rust Reference: Because `RigidTy.adt` carries generic
+`args` rather than full field declarations, `rigidTyIsFreeze` explicitly
+recognizes `PhantomData` as `Freeze` and `UnsafeCell` / `SyncUnsafeCell` /
+`Cell` / `RefCell` as `!Freeze`, recurses structurally on `args` for other ADTs,
+and classifies `.rawPtr` as `!Freeze` so custom interior-mutable wrappers
+conservatively receive `.cell` (shared) or `.reservedIM` (mutable).
 
 Reference (The Rust Reference, "Interior mutability"):
 <https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
@@ -2407,17 +3049,36 @@ def rigidTyIsFreeze : Nat → RigidTy → Bool
   | .succ fuel, .adt defPath args =>
     match
       Bool.or
-        (stringEq defPath "core::cell::UnsafeCell")
-        (stringEq defPath "std::cell::UnsafeCell")
+        (stringEq defPath "core::marker::PhantomData")
+        (stringEq defPath "std::marker::PhantomData")
     with
-    | true => false
+    | true => true
     | false =>
-      match args with
-      | .nil => true
-      | arg :: restArgs =>
-        Bool.and
-          (rigidTyIsFreeze fuel arg)
-          (rigidTyIsFreeze fuel (.tuple restArgs))
+      match
+        Bool.or
+          (Bool.or
+            (stringEq defPath "core::cell::UnsafeCell")
+            (stringEq defPath "std::cell::UnsafeCell"))
+          (Bool.or
+            (Bool.or
+              (stringEq defPath "core::cell::SyncUnsafeCell")
+              (stringEq defPath "std::cell::SyncUnsafeCell"))
+            (Bool.or
+              (Bool.or
+                (stringEq defPath "core::cell::Cell")
+                (stringEq defPath "std::cell::Cell"))
+              (Bool.or
+                (stringEq defPath "core::cell::RefCell")
+                (stringEq defPath "std::cell::RefCell"))))
+      with
+      | true => false
+      | false =>
+        match args with
+        | .nil => true
+        | arg :: restArgs =>
+          Bool.and
+            (rigidTyIsFreeze fuel arg)
+            (rigidTyIsFreeze fuel (.tuple restArgs))
   | .succ fuel, .tuple fields =>
     match fields with
     | .nil => true
@@ -2444,16 +3105,309 @@ def tyIsFreeze (ty : Ty) : Bool :=
   rigidTyIsFreeze 16 ty.kind
 
 /--
+Determine whether `place`'s resolved type in `localDecls` and `layouts` is
+`Freeze` (`tyIsFreeze`), defaulting to `true` when `localDecls` is omitted or
+does not determine a type for `place`.
+
+Reference (The Rust Reference, "Interior mutability"):
+<https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
+
+> "All interior mutability in Rust is enabled by the UnsafeCell<T> type, which
+> is defined in the standard library."
+-/
+@[reducible]
+def placeIsFreeze
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) :
+    Bool :=
+  match placeTy localDecls layouts place with
+  | .some ty => tyIsFreeze ty
+  | .none => true
+
+/--
+Determine whether a structural `RigidTy` is statically known to have zero byte
+size (`!`, `()`, nested zero-sized tuples, zero-length arrays `[T; 0]`, arrays
+of zero-sized elements, `fn` item types, non-capturing or zero-sized-capturing
+closures, `core::marker::PhantomData` / `std::marker::PhantomData`, or standard
+single-field transparent/same-size wrappers `UnsafeCell<T>`,
+`SyncUnsafeCell<T>`, `Cell<T>`, `ManuallyDrop<T>`, and `MaybeUninit<T>` around a
+zero-sized `T`) in `Runtime(PostCleanup)` MIR on a 64-bit target (`rustc
+1.98.0-nightly (14210df0e 2026-05-31)`), using bounded recursion with `fuel`.
+
+Modeling choice vs. stable Rust Reference: For general user-defined
+`RigidTy.adt` types, byte size is stored in `LayoutTable` (`Ty.layoutIdx`)
+rather than on `RigidTy` itself, so `rigidTyIsZeroSized` recognizes
+`PhantomData<T>` and standard transparent/same-size wrappers (`UnsafeCell<T>`,
+`SyncUnsafeCell<T>`, `Cell<T>`, `ManuallyDrop<T>`, `MaybeUninit<T>`) directly
+and conservatively returns `false` on other `RigidTy.adt` constructors. During
+reference reborrows (`evalRvalue` `.ref`) and retagging (`evalFnEntryRetag`,
+`evalNonFnEntryRetag`, and `evalStmt` `.retag`), a zero-sized pointee covers an
+empty `[offset, offset + 0)` byte range, so Miri and MiniRust perform zero
+initial read accesses and accept non-null provenance-free dangling references
+without allocating a tag.
+
+Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+
+Reference (MiniRust `spec/mem/tree_borrows/memory.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L81-L86>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L116-L123>
+
+> "let Some((alloc_id, parent_path)) = ptr.provenance else {
+>     assert!(pointee_size.is_zero());
+>     // Pointers without provenance cannot access any memory, so giving them a new
+>     // tag makes no sense.
+>     return ret(ptr);
+> };"
+>
+> "// Perform a read access on all bytes inside the pointee whose permission requires such an access.
+> for (idx, perm) in settings.inside.iter().enumerate() {
+>     let idx = Int::from(idx); // FIXME: we need a version of `enumerate` that yields `Int`s.
+>     let idx = Size::from_bytes(idx).unwrap();
+>     if let Some(access) = perm.init_access() {
+>         allocation.extra.root.access(Some(child_path), access, offset+idx, Offset::from_bytes_const(1))?
+>     }
+> }"
+-/
+@[reducible]
+def rigidTyIsZeroSized : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ _, .never => true
+  | .succ _, .tuple .nil => true
+  | .succ fuel, .tuple (k :: ks) =>
+    Bool.and (rigidTyIsZeroSized fuel k) (rigidTyIsZeroSized fuel (.tuple ks))
+  | .succ _, .array _ .zero => true
+  | .succ fuel, .array elem _ => rigidTyIsZeroSized fuel elem
+  | .succ _, .fnDef _ _ => true
+  | .succ _, .closure _ .nil => true
+  | .succ fuel, .closure _ (u :: us) =>
+    Bool.and (rigidTyIsZeroSized fuel u) (rigidTyIsZeroSized fuel (.tuple us))
+  | .succ fuel, .adt defPath args =>
+    match
+      Bool.or
+        (stringEq defPath "core::marker::PhantomData")
+        (stringEq defPath "std::marker::PhantomData")
+    with
+    | true => true
+    | false =>
+      match
+        Bool.or
+          (Bool.or
+            (stringEq defPath "core::cell::UnsafeCell")
+            (stringEq defPath "std::cell::UnsafeCell"))
+          (Bool.or
+            (Bool.or
+              (stringEq defPath "core::cell::SyncUnsafeCell")
+              (stringEq defPath "std::cell::SyncUnsafeCell"))
+            (Bool.or
+              (Bool.or
+                (stringEq defPath "core::cell::Cell")
+                (stringEq defPath "std::cell::Cell"))
+              (Bool.or
+                (Bool.or
+                  (stringEq defPath "core::mem::ManuallyDrop")
+                  (stringEq defPath "std::mem::ManuallyDrop"))
+                (Bool.or
+                  (stringEq defPath "core::mem::MaybeUninit")
+                  (stringEq defPath "std::mem::MaybeUninit"))))),
+        args
+      with
+      | true, inner :: .nil => rigidTyIsZeroSized fuel inner
+      | _, _ => false
+  | .succ _, k =>
+    match rigidTyKindByteSize k with
+    | .some .zero => true
+    | _ => false
+
+/--
+Determine whether a `Ty` is statically zero-sized by inspecting `ty.kind` with
+fuel `16` (`rigidTyIsZeroSized 16 ty.kind`).
+
+Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+-/
+@[reducible]
+def tyIsZeroSized (ty : Ty) : Bool :=
+  rigidTyIsZeroSized 16 ty.kind
+
+/--
+Determine whether `place`'s resolved type in `localDecls` and `layouts` is
+statically zero-sized (`tyIsZeroSized`), defaulting to `false` when `localDecls`
+is omitted or does not determine a type for `place`.
+
+Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+-/
+@[reducible]
+def placeIsZeroSized
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) :
+    Bool :=
+  match placeTy localDecls layouts place with
+  | .some ty => tyIsZeroSized ty
+  | .none => false
+
+/--
+Determine whether a structural `RigidTy` is statically known to be uninhabited
+(`!`, tuples containing an uninhabited element, non-empty arrays `[T; n + 1]`
+of an uninhabited element, closures capturing an uninhabited upvar,
+`core::convert::Infallible` / `std::convert::Infallible`, or standard
+by-value `T` wrappers `UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`,
+`RefCell<T>`, and `ManuallyDrop<T>` around an uninhabited `T`) in
+`Runtime(PostCleanup)` MIR (`rustc 1.98.0-nightly (14210df0e 2026-05-31)`),
+using bounded recursion with `fuel`.
+
+Zero-length arrays `[T; 0]`, `core::marker::PhantomData<T>` /
+`std::marker::PhantomData<T>`, and `core::mem::MaybeUninit<T>` /
+`std::mem::MaybeUninit<T>` are inhabited (`[]`, `PhantomData`, and
+`MaybeUninit::uninit()`) even when `T` is uninhabited (`[!; 0]`,
+`PhantomData<!>`, `MaybeUninit<!>`).
+
+Modeling choice vs. stable Rust Reference: For general user-defined
+`RigidTy.adt` types, uninhabitedness (`TypeLayout.isUninhabited` /
+`VariantsShape.empty`) is stored in `LayoutTable` (`Ty.layoutIdx`) rather than
+on `RigidTy` itself, so `rigidTyIsUninhabited` recognizes
+`core::convert::Infallible` / `std::convert::Infallible` and standard by-value
+`T` wrappers (`UnsafeCell<T>`, `SyncUnsafeCell<T>`, `Cell<T>`, `RefCell<T>`,
+`ManuallyDrop<T>`) directly and conservatively returns `false` on other
+`RigidTy.adt` constructors (`tyIsUninhabited` additionally consults
+`LayoutTable.lookup`). During MIR reference retagging (`evalFnEntryRetag`,
+`evalNonFnEntryRetag`, and `evalStmt` `.retag`), producing or retagging a
+reference `&T` or `&mut T` whose pointee `T` is uninhabited
+(`rigidTyIsUninhabited 16 pointee = true`) is immediate undefined behavior even
+when `T` has zero byte size (`&!`, `&[!; 1]`, `&(!, ())`, `&UnsafeCell<!>`,
+`&RefCell<!>`).
+
+Reference (The Rust Reference, "Never type", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of
+> computations that never complete."
+
+Reference (The Rust Reference, "Behavior considered undefined", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. Producing a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+-/
+@[reducible]
+def rigidTyIsUninhabited : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ _, .never => true
+  | .succ _, .tuple .nil => false
+  | .succ fuel, .tuple (k :: ks) =>
+    Bool.or
+      (rigidTyIsUninhabited fuel k)
+      (rigidTyIsUninhabited fuel (.tuple ks))
+  | .succ _, .array _ .zero => false
+  | .succ fuel, .array elem (.succ _) => rigidTyIsUninhabited fuel elem
+  | .succ _, .closure _ .nil => false
+  | .succ fuel, .closure defPath (u :: us) =>
+    Bool.or
+      (rigidTyIsUninhabited fuel u)
+      (rigidTyIsUninhabited fuel (.closure defPath us))
+  | .succ fuel, .adt defPath args =>
+    match
+      Bool.or
+        (stringEq defPath "core::convert::Infallible")
+        (stringEq defPath "std::convert::Infallible")
+    with
+    | true => true
+    | false =>
+      match
+        Bool.or
+          (Bool.or
+            (stringEq defPath "core::cell::UnsafeCell")
+            (stringEq defPath "std::cell::UnsafeCell"))
+          (Bool.or
+            (Bool.or
+              (stringEq defPath "core::cell::SyncUnsafeCell")
+              (stringEq defPath "std::cell::SyncUnsafeCell"))
+            (Bool.or
+              (Bool.or
+                (stringEq defPath "core::cell::Cell")
+                (stringEq defPath "std::cell::Cell"))
+              (Bool.or
+                (Bool.or
+                  (stringEq defPath "core::cell::RefCell")
+                  (stringEq defPath "std::cell::RefCell"))
+                (Bool.or
+                  (stringEq defPath "core::mem::ManuallyDrop")
+                  (stringEq defPath "std::mem::ManuallyDrop"))))),
+        args
+      with
+      | true, inner :: .nil => rigidTyIsUninhabited fuel inner
+      | _, _ => false
+  | .succ _, _ => false
+
+/--
+Determine whether a `Ty` is uninhabited either structurally
+(`rigidTyIsUninhabited 16 ty.kind`) or via its compiler-captured
+`TypeLayout.isUninhabited` flag in `layouts`.
+
+Reference (The Rust Reference, "Never type", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of
+> computations that never complete."
+-/
+@[reducible]
+def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
+  match rigidTyIsUninhabited 16 ty.kind with
+  | true => true
+  | false =>
+    match LayoutTable.lookup layouts ty.layoutIdx with
+    | .some l => l.isUninhabited
+    | .none => false
+
+/--
+Determine whether `place`'s resolved type in `localDecls` and `layouts` is
+uninhabited (`tyIsUninhabited`), defaulting to `false` when `localDecls` is
+omitted or does not determine a type for `place`.
+
+Reference (The Rust Reference, "Never type", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of
+> computations that never complete."
+-/
+@[reducible]
+def placeIsUninhabited
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) :
+    Bool :=
+  match placeTy localDecls layouts place with
+  | .some ty => tyIsUninhabited layouts ty
+  | .none => false
+
+/--
 Determine the initial Tree Borrows permission for a shared borrow (`&place`)
 based on whether `place`'s resolved type in `localDecls` and `layouts` is
 `Freeze`.
 
 When `placeTy localDecls layouts place` resolves to a `!Freeze` type (such as
-`core::cell::UnsafeCell<T>`), a shared borrow starts in
-`TreeBorrowPerm.reserved` instead of `TreeBorrowPerm.frozen` so interior
-mutation through `&UnsafeCell<T>` is permitted; when `place` is `Freeze` (or
-when `localDecls` is omitted / does not declare a type for `place`), the shared
-borrow defaults to `TreeBorrowPerm.frozen`.
+`core::cell::UnsafeCell<T>`), a shared borrow starts in `TreeBorrowPerm.cell`
+instead of `TreeBorrowPerm.frozen` so interior mutation through
+`&UnsafeCell<T>` is permitted; when `place` is `Freeze` (or when `localDecls`
+is omitted / does not declare a type for `place`), the shared borrow defaults
+to `TreeBorrowPerm.frozen`. This is Miri's `NewPermission::new` choice for
+shared references at the granularity of the whole place; Miri additionally
+distinguishes `UnsafeCell` bytes from frozen bytes within one type, which
+Anneal approximates by the place's overall `Freeze`-ness.
 
 Reference (The Rust Reference, "Interior mutability"):
 <https://doc.rust-lang.org/1.98.0/reference/interior-mutability.html>
@@ -2463,6 +3417,20 @@ Reference (The Rust Reference, "Interior mutability"):
 > to mutate data behind a shared reference. This is known as interior mutability
 > in Rust, in contrast with exterior mutability, which happens through &mut or
 > directly on a value."
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L172-L179>
+
+> "match ref_mutability {
+>     // Shared references
+>     Some(Mutability::Not) =>
+>         if frozen {
+>             Permission::new_frozen()
+>         } else {
+>             Permission::new_cell()
+>         },"
 -/
 @[reducible]
 def sharedBorrowPerm
@@ -2474,8 +3442,139 @@ def sharedBorrowPerm
   | .some ty =>
     match tyIsFreeze ty with
     | true => TreeBorrowPerm.frozen
-    | false => TreeBorrowPerm.reserved
+    | false => TreeBorrowPerm.cell
   | .none => TreeBorrowPerm.frozen
+
+/--
+Determine the initial Tree Borrows permission for an unprotected mutable borrow
+(`&mut place`, including two-phase borrows) based on whether `place`'s resolved
+type is `Freeze`: `TreeBorrowPerm.reservedFrz false` for `Freeze` places and
+`TreeBorrowPerm.reservedIM` for `!Freeze` places.
+
+Miri retags two-phase borrows (`RetagKind::TwoPhase`) with the same permission
+as ordinary references; only function-entry retags are protected, and those
+always receive `ReservedFrz` (see `fnEntryRetagPerm`).
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L180-L192>
+
+> "// Mutable references
+> Some(Mutability::Mut) => {
+>     if implicit_writes_enabled && !matches!(part, Outside) {
+>         // We cannot use `Unique` for the outside part.
+>         Permission::new_unique()
+>     } else if is_protected || frozen {
+>         // We also use this for protected `&mut UnsafeCell` as otherwise adding
+>         // `noalias` would not be sound.
+>         Permission::new_reserved_frz()
+>     } else {
+>         Permission::new_reserved_im()
+>     }
+> }"
+-/
+@[reducible]
+def mutableBorrowPerm
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) :
+    TreeBorrowPerm :=
+  match placeTy localDecls layouts place with
+  | .some ty =>
+    match tyIsFreeze ty with
+    | true => TreeBorrowPerm.reservedFrz false
+    | false => TreeBorrowPerm.reservedIM
+  | .none => TreeBorrowPerm.reservedFrz false
+
+/--
+Determine the initial Tree Borrows permission of the protected tag created by a
+function-entry retag (`RetagKind::FnEntry`) of a reference with mutability
+`mutability` to a pointee of kind `pointee`: shared references receive
+`.frozen` (for `Freeze` pointees) or `.cell`, and mutable references always
+receive `.reservedFrz false`, independently of interior mutability, so that no
+protected `.reservedIM` is ever created.
+
+Modeling choice: Anneal does not model Miri's optional
+`-Zmiri-tree-borrows-implicit-writes` flag (off by default), under which
+protected mutable references would start as `Unique`.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L139-L192>
+
+> "let is_protected = mode == RetagMode::FnEntry;"
+> ...
+> "} else if is_protected || frozen {
+>     // We also use this for protected `&mut UnsafeCell` as otherwise adding
+>     // `noalias` would not be sound.
+>     Permission::new_reserved_frz()"
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L276-L279>
+
+> "pub enum RetagKind {
+>     /// The initial retag of arguments when entering a function.
+>     FnEntry,"
+-/
+@[reducible]
+def fnEntryRetagPerm
+    (mutability : Mutability)
+    (pointee : RigidTy) :
+    TreeBorrowPerm :=
+  match mutability with
+  | .not =>
+    match rigidTyIsFreeze 16 pointee with
+    | true => TreeBorrowPerm.frozen
+    | false => TreeBorrowPerm.cell
+  | .mut => TreeBorrowPerm.reservedFrz false
+
+/--
+Determine the initial Tree Borrows permission of the tag created by a MIR
+`StatementKind.retag` of `retagKind` on a reference with mutability
+`mutability` to a pointee of kind `pointee`:
+- `.fnEntry` delegates to `fnEntryRetagPerm` (protected mutable references
+  always receive `.reservedFrz false` so no protected `.reservedIM` exists);
+- `.default`, `.twoPhase`, and `.raw` select `.frozen` / `.cell` on shared
+  references and `.reservedFrz false` / `.reservedIM` on mutable references
+  according to `rigidTyIsFreeze 16 pointee`, matching Miri's unprotected
+  `NewPermission::new` selection.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L139-L192>
+
+> "let is_protected = mode == RetagMode::FnEntry;"
+> ...
+> "} else if is_protected || frozen {
+>     // We also use this for protected `&mut UnsafeCell` as otherwise adding
+>     // `noalias` would not be sound.
+>     Permission::new_reserved_frz()
+> } else {
+>     Permission::new_reserved_im()
+> }"
+-/
+@[reducible]
+def retagPerm
+    (retagKind : RetagKind)
+    (mutability : Mutability)
+    (pointee : RigidTy) :
+    TreeBorrowPerm :=
+  match retagKind with
+  | .fnEntry => fnEntryRetagPerm mutability pointee
+  | .default | .twoPhase | .raw =>
+    match mutability with
+    | .not =>
+      match rigidTyIsFreeze 16 pointee with
+      | true => TreeBorrowPerm.frozen
+      | false => TreeBorrowPerm.cell
+    | .mut =>
+      match rigidTyIsFreeze 16 pointee with
+      | true => TreeBorrowPerm.reservedFrz false
+      | false => TreeBorrowPerm.reservedIM
 
 /--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
@@ -2485,24 +3584,45 @@ resolve operand types, signedness, and byte layouts for `Rvalue.binaryOp`,
 Tree Borrows modeling in `Rvalue.use`, `Rvalue.copyForDeref`, `Rvalue.ref`, and
 `Rvalue.rawPtr`:
 - Dereference reads (`.use (.copy/.move (.deref :: _))` and `.copyForDeref
-  (.deref :: _)`) apply `freezeDerefReadBorrowsAt` when two or more borrow
-  entries exist, freezing any overlapping foreign `.active` borrow to `.frozen`.
+  (.deref :: _)`) with two or more borrow entries first reject reads that are
+  undefined behavior anywhere in the hierarchy (`derefReadTreeUB`: a
+  `.disabled` reader or ancestor, or a foreign read that would disable a
+  protected `.unique` entry), then apply the foreign-read transition with
+  protector status (`freezeDerefReadBorrowsAt`). With a single entry the
+  reader has no ancestor or foreign entry, and `evalOperand` already rejects a
+  `.disabled` reader. Dereference reads that occur inside other rvalue operands
+  are checked only against the reader's own permission by `evalOperand`.
 - Dereference reborrows (`.ref borrowKind (.deref :: restProj)`) link the new
-  tag to `parentTag := .some parentPtr.tag`, perform an initial read via
-  `freezeTreeBorrowsOnReadAtProj` (matching `PermissionUnprot::init_access`),
-  and initialize mutable reborrows (`BorrowKind.mut _`) in
-  `TreeBorrowPerm.reserved` (lazy activation upon first child write).
-- Root borrows of a stack local (`.ref (.mut false) local` with
-  `parentTag := .none`) start in `TreeBorrowPerm.active` because direct reads or
-  writes to the root local carry `writerTag = .none` (which is foreign to all
-  borrow tags rather than a parent tag in `mem.borrows`), whereas two-phase root
-  borrows (`.ref (.mut true) local`) start in `TreeBorrowPerm.reserved`.
+  tag to `parentTag := .some parentPtr.tag`, perform the initial child read
+  through the parent unless `perm` is `.cell` or `place` is zero-sized
+  (`placeIsZeroSized localDecls layouts place`, rejecting the read with
+  `hasTreeReadUB` when two or more entries exist, then applying
+  `freezeTreeBorrowsOnReadAtProj` with protector status, matching Miri's
+  `Permission::associated_access` and MiniRust's
+  `PermissionUnprot::init_access` over the pointee's byte range), and
+  initialize the new tag with Miri's unprotected `NewPermission::new` choice:
+  `sharedBorrowPerm` (`.frozen` or `.cell`) for shared reborrows and
+  `mutableBorrowPerm` (`.reservedFrz false` or `.reservedIM`) for mutable and
+  two-phase reborrows.
+  A mutable reborrow through a `.frozen` parent is rejected eagerly; Miri
+  instead rejects the first write through the new tag (a child write of the
+  `.frozen` ancestor), so Anneal's choice reports undefined behavior no later
+  than Miri does.
+- Root borrows of a stack local (`.ref borrowKind local` with
+  `parentTag := .none`) use the same `NewPermission::new` choice:
+  `sharedBorrowPerm` for shared borrows and `mutableBorrowPerm` for mutable and
+  two-phase borrows (Miri retags `RetagKind::TwoPhase` like a default retag).
+  Direct accesses to the local carry `writerTag = .none` and are foreign to
+  every tag.
 - Raw pointer creation (`.rawPtr mutability place`) assigns `sharedBorrowPerm
-  localDecls layouts place` when `mutability = .not` (preserving
-  `TreeBorrowPerm.reserved` for `!Freeze` interior-mutable pointees such as
-  `core::cell::UnsafeCell<T>` and inheriting `.reserved` from a `.reserved`
-  parent on `.deref :: restProj`, matching `ReborrowSettings::new` returning
-  `None` for `PtrType::Raw` in MiniRust `spec/mem/tree_borrows/reborrow_settings.md`).
+  localDecls layouts place` when `mutability = .not` and `.unique` when
+  `mutability = .mut`, inheriting a `.reservedFrz`, `.reservedIM`, or `.cell`
+  parent permission for `*const` pointers on `.deref :: restProj`. Miri gives
+  raw pointers their parent's tag instead of a new one (`tb_retag_ptr_value`:
+  "We don't give new tags to raw pointers."); Anneal's separate raw-pointer tag
+  receives the same child and foreign transitions as its parent for accesses
+  through itself and through tags outside its subtree, so it can only add
+  undefined behavior relative to Miri, never remove it.
 
 Reference (The Rust Reference, "Negation operators"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#negation-operators>
@@ -2574,28 +3694,50 @@ def evalRvalue
       match op, mem.borrows with
       | .copy { local_ := ptrLoc, projection := .deref :: restProj },
         b₁ :: b₂ :: restBorrows =>
-        .ok
-          v
-          locals'
-          { mem with
-            borrows :=
-              freezeDerefReadBorrowsAt
-                locals
-                ptrLoc
-                restProj
-                (b₁ :: b₂ :: restBorrows) }
+        match
+          derefReadTreeUB
+            locals
+            ptrLoc
+            restProj
+            (b₁ :: b₂ :: restBorrows)
+            mem.activeProtectors
+        with
+        | true => .ub
+        | false =>
+          .ok
+            v
+            locals'
+            { mem with
+              borrows :=
+                freezeDerefReadBorrowsAt
+                  locals
+                  ptrLoc
+                  restProj
+                  (b₁ :: b₂ :: restBorrows)
+                  mem.activeProtectors }
       | .move { local_ := ptrLoc, projection := .deref :: restProj },
         b₁ :: b₂ :: restBorrows =>
-        .ok
-          v
-          locals'
-          { mem with
-            borrows :=
-              freezeDerefReadBorrowsAt
-                locals
-                ptrLoc
-                restProj
-                (b₁ :: b₂ :: restBorrows) }
+        match
+          derefReadTreeUB
+            locals
+            ptrLoc
+            restProj
+            (b₁ :: b₂ :: restBorrows)
+            mem.activeProtectors
+        with
+        | true => .ub
+        | false =>
+          .ok
+            v
+            locals'
+            { mem with
+              borrows :=
+                freezeDerefReadBorrowsAt
+                  locals
+                  ptrLoc
+                  restProj
+                  (b₁ :: b₂ :: restBorrows)
+                  mem.activeProtectors }
       | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
@@ -2604,16 +3746,27 @@ def evalRvalue
     | .ok v locals' =>
       match place.projection, mem.borrows with
       | .deref :: restProj, b₁ :: b₂ :: restBorrows =>
-        .ok
-          v
-          locals'
-          { mem with
-            borrows :=
-              freezeDerefReadBorrowsAt
-                locals
-                place.local_
-                restProj
-                (b₁ :: b₂ :: restBorrows) }
+        match
+          derefReadTreeUB
+            locals
+            place.local_
+            restProj
+            (b₁ :: b₂ :: restBorrows)
+            mem.activeProtectors
+        with
+        | true => .ub
+        | false =>
+          .ok
+            v
+            locals'
+            { mem with
+              borrows :=
+                freezeDerefReadBorrowsAt
+                  locals
+                  place.local_
+                  restProj
+                  (b₁ :: b₂ :: restBorrows)
+                  mem.activeProtectors }
       | _, _ => .ok v locals' mem
     | .ub => .ub
     | .unsupported => .unsupported
@@ -2626,8 +3779,7 @@ def evalRvalue
     let perm :=
       match borrowKind with
       | .shared => sharedBorrowPerm localDecls layouts place
-      | .mut false => TreeBorrowPerm.active
-      | .mut true => TreeBorrowPerm.reserved
+      | .mut _ => mutableBorrowPerm localDecls layouts place
     match place.projection with
     | .deref :: restProj =>
       match get? locals place.local_ with
@@ -2646,34 +3798,57 @@ def evalRvalue
                 match parentEntry.targetProjection with
                 | .nil => resolvedRest
                 | ph :: pt => ph :: appendProjections pt resolvedRest
-              let reborrowPerm :=
-                match borrowKind with
-                | .shared => perm
-                | .mut _ => TreeBorrowPerm.reserved
-              let borrowsAfterRead :=
-                freezeTreeBorrowsOnReadAtProj
-                  mem.borrows
-                  mem.borrows
-                  parentEntry.targetLocal
-                  (.some parentPtr.tag)
-                  fullProj
-                  parentEntry.rangeOffset
-                  parentEntry.rangeLen
-              let entry : BorrowEntry := {
-                tag := tag
-                targetLocal := parentEntry.targetLocal
-                targetProjection := fullProj
-                perm := reborrowPerm
-                rangeOffset := parentEntry.rangeOffset
-                rangeLen := parentEntry.rangeLen
-                parentTag := .some parentPtr.tag
-              }
-              let mem' := {
-                mem with
-                borrows := entry :: borrowsAfterRead
-                nextTag := Nat.add tag 1
-              }
-              .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
+              let skipInitRead :=
+                match perm with
+                | .cell => true
+                | _ => placeIsZeroSized localDecls layouts place
+              let readUB :=
+                match mem.borrows with
+                | _ :: _ :: _ =>
+                  match skipInitRead with
+                  | true => false
+                  | false =>
+                    hasTreeReadUB
+                      mem.borrows
+                      mem.borrows
+                      mem.activeProtectors
+                      parentEntry.targetLocal
+                      (.some parentPtr.tag)
+                      fullProj
+                      parentEntry.rangeOffset
+                      parentEntry.rangeLen
+                | _ => false
+              match readUB with
+              | true => .ub
+              | false =>
+                let borrowsAfterRead :=
+                  match skipInitRead with
+                  | true => mem.borrows
+                  | false =>
+                    freezeTreeBorrowsOnReadAtProj
+                      mem.borrows
+                      mem.borrows
+                      parentEntry.targetLocal
+                      (.some parentPtr.tag)
+                      fullProj
+                      parentEntry.rangeOffset
+                      parentEntry.rangeLen
+                      mem.activeProtectors
+                let entry : BorrowEntry := {
+                  tag := tag
+                  targetLocal := parentEntry.targetLocal
+                  targetProjection := fullProj
+                  perm := perm
+                  rangeOffset := parentEntry.rangeOffset
+                  rangeLen := parentEntry.rangeLen
+                  parentTag := .some parentPtr.tag
+                }
+                let mem' := {
+                  mem with
+                  borrows := entry :: borrowsAfterRead
+                  nextTag := Nat.add tag 1
+                }
+                .ok (.ptr { allocId := tag, offsetBytes := 0 } 8) locals mem'
         | .none => .ub
       | _ => .ub
     | _ =>
@@ -2701,7 +3876,7 @@ def evalRvalue
     let perm :=
       match mutability with
       | .not => sharedBorrowPerm localDecls layouts place
-      | .mut => TreeBorrowPerm.active
+      | .mut => TreeBorrowPerm.unique
     match place.projection with
     | .deref :: restProj =>
       match get? locals place.local_ with
@@ -2722,7 +3897,10 @@ def evalRvalue
                 | ph :: pt => ph :: appendProjections pt resolvedRest
               let rawPerm :=
                 match mutability, parentEntry.perm with
-                | .not, .reserved => TreeBorrowPerm.reserved
+                | .not, .reservedFrz conflicted =>
+                  TreeBorrowPerm.reservedFrz conflicted
+                | .not, .reservedIM => TreeBorrowPerm.reservedIM
+                | .not, .cell => TreeBorrowPerm.cell
                 | _, _ => perm
               let entry : BorrowEntry := {
                 tag := tag

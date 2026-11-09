@@ -864,6 +864,270 @@ def evalCopyNonOverlapping
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
+Execute a function-entry retag (`RetagKind::FnEntry`) of the reference stored
+in `place`, whose current value is `.ptr ptrVal sz` with live borrow entry
+`parentEntry`, after `evalOperand` produced `locals'`.
+
+When `place` has a reference type `&T` / `&mut T` in `localDecls`, the retag
+creates a fresh protected child tag exactly as Miri's `tb_reborrow` does:
+1. allocate tag `s.memory.nextTag` and protector `s.memory.nextProtector`;
+2. choose the child's permission with `fnEntryRetagPerm` (`.frozen` or
+   `.cell` for shared references, `.reservedFrz false` for mutable ones);
+3. unless the child is `.cell` (whose associated access is `None`) or the
+   pointee is zero-sized (`rigidTyIsZeroSized 16 pointee`), perform the initial
+   child read through the parent's tag, rejecting it when it is undefined
+   behavior (`hasTreeReadUB`) and otherwise applying the foreign-read
+   transitions with the active protectors (`freezeTreeBorrowsOnReadAtProj`);
+4. insert the child with `parentTag := .some ptrVal.tag` and the new
+   protector, activate the protector, and store the retagged pointer back into
+   the root local `place.local_`.
+
+Retags of projected places with reference types are not modeled and fault with
+`MirStepNode.unsupported`. When `localDecls` does not give `place` a reference
+type, the retag keeps its earlier model: it attaches the new protector to
+`parentEntry` (`attachBorrowProtector`) without creating a child tag.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L276-L287>
+
+> "pub enum RetagKind {
+>     /// The initial retag of arguments when entering a function.
+>     FnEntry,
+>     /// Retagging for a two-phase borrow.
+>     TwoPhase,
+>     /// Retagging raw pointers.
+>     Raw,
+>     /// Normal retagging of references.
+>     Default,
+> }"
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L211-L216>
+
+> "protector: is_protected.then_some(if ref_mutability.is_some() {
+>     // Strong protector for references
+>     ProtectorKind::StrongProtector"
+
+Reference (MiniRust `spec/mem/tree_borrows/tree.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/tree.md#L7-L8>
+
+> "When a reborrow occurs at function entry (i.e. the original reference is
+> passed as an argument), we add a *protector* to the reborrow. When a node is
+> protected, it is UB for this node to become `Disabled`."
+-/
+def evalFnEntryRetag
+    (s : MachineState)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (parentEntry : BorrowEntry)
+    (locals' : List LocalSlot) :
+    MirStepNode :=
+  let protId := s.memory.nextProtector
+  let attachOnly :=
+    MirStepNode.step
+      (advanceStmt
+        s
+        locals'
+        { s.memory with
+          borrows := attachBorrowProtector s.memory.borrows ptrVal.tag protId
+          activeProtectors := protId :: s.memory.activeProtectors
+          nextProtector := Nat.add protId 1 })
+  match placeTy localDecls layouts place with
+  | .none => attachOnly
+  | .some ty =>
+    match ty.kind with
+    | .ref mutability pointee =>
+      match rigidTyIsUninhabited 16 pointee with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let childPerm := fnEntryRetagPerm mutability pointee
+        let skipInitRead :=
+          match childPerm with
+          | .cell => true
+          | _ => rigidTyIsZeroSized 16 pointee
+        let tag := s.memory.nextTag
+        let readUB :=
+          match skipInitRead with
+          | true => false
+          | false =>
+            hasTreeReadUB
+              s.memory.borrows
+              s.memory.borrows
+              s.memory.activeProtectors
+              parentEntry.targetLocal
+              (.some ptrVal.tag)
+              parentEntry.targetProjection
+              parentEntry.rangeOffset
+              parentEntry.rangeLen
+        match readUB with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrowsAfterRead :=
+            match skipInitRead with
+            | true => s.memory.borrows
+            | false =>
+              freezeTreeBorrowsOnReadAtProj
+                s.memory.borrows
+                s.memory.borrows
+                parentEntry.targetLocal
+                (.some ptrVal.tag)
+                parentEntry.targetProjection
+                parentEntry.rangeOffset
+                parentEntry.rangeLen
+                s.memory.activeProtectors
+          let child : BorrowEntry := {
+            tag := tag
+            targetLocal := parentEntry.targetLocal
+            targetProjection := parentEntry.targetProjection
+            perm := childPerm
+            rangeOffset := parentEntry.rangeOffset
+            rangeLen := parentEntry.rangeLen
+            protector := .some protId
+            parentTag := .some ptrVal.tag
+          }
+          match place.projection with
+          | .nil =>
+            match
+              set?
+                locals'
+                place.local_
+                (.init
+                  (.ptr
+                    { allocId := tag, offsetBytes := ptrVal.offsetBytes }
+                    sz))
+            with
+            | .some locals'' =>
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals''
+                  { s.memory with
+                    borrows := child :: borrowsAfterRead
+                    nextTag := Nat.add tag 1
+                    activeProtectors := protId :: s.memory.activeProtectors
+                    nextProtector := Nat.add protId 1 })
+            | .none => MirStepNode.fail .ub
+          | _ :: _ => MirStepNode.unsupported
+    | _ => attachOnly
+
+/--
+Execute a non-function-entry MIR retag (`RetagKind.default`, `.twoPhase`, or
+`.raw`) on `place`, whose value in `s.frame.locals` is `(.ptr ptrVal sz)` with
+existing non-disabled `parentEntry`.
+
+When `place` resolves in `localDecls` / `layouts` to a reference `&T` or
+`&mut T`, an uninhabited `pointee` (`rigidTyIsUninhabited 16 pointee = true`)
+faults immediately with `MirStepNode.fail .ub`; otherwise Miri's
+`tb_retag_ptr_value` / `tb_reborrow` allocates a fresh
+unprotected child tag under `ptrVal.tag` with `retagPerm retagKind mutability
+pointee`, performs an initial child read through `ptrVal.tag` unless the new
+permission is `.cell` (`Permission::associated_access`) or the pointee is
+zero-sized (`rigidTyIsZeroSized 16 pointee`), and writes the new provenance
+back into `place`. When `place`'s type is unknown or non-reference, falls back
+to advancing without creating a child tag.
+
+Reference (Miri Tree Borrows implementation,
+`src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
+<https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/mod.rs#L198-L212>
+
+> "let associated_access = perm.associated_access();"
+-/
+def evalNonFnEntryRetag
+    (retagKind : RetagKind)
+    (s : MachineState)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place)
+    (ptrVal : ProvenancePtr)
+    (sz : Nat)
+    (parentEntry : BorrowEntry)
+    (locals' : List LocalSlot) :
+    MirStepNode :=
+  match placeTy localDecls layouts place with
+  | .none => MirStepNode.step (advanceStmt s locals')
+  | .some ty =>
+    match ty.kind with
+    | .ref mutability pointee =>
+      match rigidTyIsUninhabited 16 pointee with
+      | true => MirStepNode.fail .ub
+      | false =>
+        let childPerm := retagPerm retagKind mutability pointee
+        let skipInitRead :=
+          match childPerm with
+          | .cell => true
+          | _ => rigidTyIsZeroSized 16 pointee
+        let tag := s.memory.nextTag
+        let readUB :=
+          match skipInitRead with
+          | true => false
+          | false =>
+            hasTreeReadUB
+              s.memory.borrows
+              s.memory.borrows
+              s.memory.activeProtectors
+              parentEntry.targetLocal
+              (.some ptrVal.tag)
+              parentEntry.targetProjection
+              parentEntry.rangeOffset
+              parentEntry.rangeLen
+        match readUB with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrowsAfterRead :=
+            match skipInitRead with
+            | true => s.memory.borrows
+            | false =>
+              freezeTreeBorrowsOnReadAtProj
+                s.memory.borrows
+                s.memory.borrows
+                parentEntry.targetLocal
+                (.some ptrVal.tag)
+                parentEntry.targetProjection
+                parentEntry.rangeOffset
+                parentEntry.rangeLen
+                s.memory.activeProtectors
+          let child : BorrowEntry := {
+            tag := tag
+            targetLocal := parentEntry.targetLocal
+            targetProjection := parentEntry.targetProjection
+            perm := childPerm
+            rangeOffset := parentEntry.rangeOffset
+            rangeLen := parentEntry.rangeLen
+            protector := .none
+            parentTag := .some ptrVal.tag
+          }
+          match place.projection with
+          | .nil =>
+            match
+              set?
+                locals'
+                place.local_
+                (.init
+                  (.ptr
+                    { allocId := tag, offsetBytes := ptrVal.offsetBytes }
+                    sz))
+            with
+            | .some locals'' =>
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals''
+                  { s.memory with
+                    borrows := child :: borrowsAfterRead
+                    nextTag := Nat.add tag 1 })
+            | .none => MirStepNode.fail .ub
+          | _ :: _ => MirStepNode.unsupported
+    | _ => MirStepNode.step (advanceStmt s locals')
+
+/--
 Execute a single MIR `Statement` from state `s` using `localDecls` and `layouts`
 for type- and layout-aware rvalue and intrinsic evaluation.
 
@@ -910,27 +1174,59 @@ def evalStmt
         layouts
         s.memory.callerLocals
     with
-    | .ok (.ptr ptrVal _) locals' =>
-      match lookupBorrow s.memory.borrows ptrVal.tag with
-      | .some entry =>
-        match entry.perm with
-        | .disabled => MirStepNode.fail .ub
-        | _ =>
-          match retagKind with
-          | .fnEntry =>
-            let protId := s.memory.nextProtector
-            let borrows' :=
-              attachBorrowProtector s.memory.borrows ptrVal.tag protId
-            let mem' : Memory := {
-              s.memory with
-              borrows := borrows'
-              activeProtectors := protId :: s.memory.activeProtectors
-              nextProtector := Nat.add protId 1
-            }
-            MirStepNode.step (advanceStmt s locals' mem')
-          | _ => MirStepNode.step (advanceStmt s locals')
-      | .none => MirStepNode.fail .ub
-    | .ok _ _ => MirStepNode.fail .ub
+    | .ok val locals' =>
+      let retagPtrVal
+          (ptrVal : ProvenancePtr)
+          (sz : Nat)
+          (allowGlobal : Bool) :
+          MirStepNode :=
+        match lookupBorrow s.memory.borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => MirStepNode.fail .ub
+          | _ =>
+            match retagKind with
+            | .fnEntry =>
+              evalFnEntryRetag
+                s localDecls layouts place ptrVal sz entry locals'
+            | .default | .twoPhase | .raw =>
+              evalNonFnEntryRetag
+                retagKind s localDecls layouts place ptrVal sz entry locals'
+        | .none =>
+          match allowGlobal with
+          | true =>
+            match lookupGlobalAlloc s.memory.globals ptrVal.allocId with
+            | .some _ => MirStepNode.step (advanceStmt s locals')
+            | .none => MirStepNode.fail .ub
+          | false => MirStepNode.fail .ub
+      match placeTy localDecls layouts place with
+      | .some { kind := .rawPtr _ _, .. } =>
+        match retagKind with
+        | .raw => MirStepNode.step (advanceStmt s locals')
+        | .default | .twoPhase | .fnEntry => MirStepNode.fail .ub
+      | .some { kind := .ref _ pointee, .. } =>
+        match rigidTyIsUninhabited 16 pointee with
+        | true => MirStepNode.fail .ub
+        | false =>
+          match val with
+          | .ptr ptrVal sz => retagPtrVal ptrVal sz true
+          | .scalar sc =>
+            match
+              Bool.and
+                (rigidTyIsZeroSized 16 pointee)
+                (Bool.not (Nat.beq sc.bits 0))
+            with
+            | true => MirStepNode.step (advanceStmt s locals')
+            | false => MirStepNode.fail .ub
+          | _ => MirStepNode.fail .ub
+      | .none =>
+        match val with
+        | .ptr ptrVal sz => retagPtrVal ptrVal sz false
+        | _ => MirStepNode.fail .ub
+      | .some _ =>
+        match val with
+        | .ptr ptrVal sz => retagPtrVal ptrVal sz true
+        | _ => MirStepNode.step (advanceStmt s locals')
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
   | .storageLive loc =>
@@ -1059,10 +1355,13 @@ def evalStmt
           evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors
         with
         | .ok locals₂ =>
-          let borrows' :=
-            invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
-          MirStepNode.step
-            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+          match derefWriteTreeUB locals₁ mem₁.borrows dst with
+          | true => MirStepNode.fail .ub
+          | false =>
+            let borrows' :=
+              invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .ub =>
           match mem₁.callerLocals with
           | .nil => MirStepNode.fail .ub
@@ -1077,15 +1376,18 @@ def evalStmt
                 mem₁.activeProtectors
             with
             | .ok callerLocals' =>
-              let borrows' :=
-                invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
-              MirStepNode.step
-                (advanceStmt
-                  s
-                  locals₁
-                  { mem₁ with
-                    borrows := borrows'
-                    callerLocals := callerLocals' })
+              match derefWriteTreeUB locals₁ mem₁.borrows dst with
+              | true => MirStepNode.fail .ub
+              | false =>
+                let borrows' :=
+                  invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+                MirStepNode.step
+                  (advanceStmt
+                    s
+                    locals₁
+                    { mem₁ with
+                      borrows := borrows'
+                      callerLocals := callerLocals' })
             | .ub => MirStepNode.fail .ub
             | .unsupported => MirStepNode.unsupported
         | .unsupported => MirStepNode.unsupported

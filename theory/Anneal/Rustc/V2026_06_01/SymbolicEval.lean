@@ -1157,10 +1157,13 @@ def finishAssignStmtNode
         evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors
       with
       | .ok locals₂ =>
-        let borrows' :=
-          invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
-        MirStepNode.step
-          (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        match derefWriteTreeUB locals₁ mem₁.borrows dst with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrows' :=
+            invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+          MirStepNode.step
+            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .ub =>
         match mem₁.callerLocals with
         | .nil => MirStepNode.fail .ub
@@ -1175,15 +1178,18 @@ def finishAssignStmtNode
               mem₁.activeProtectors
           with
           | .ok callerLocals' =>
-            let borrows' :=
-              invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
-            MirStepNode.step
-              (advanceStmt
-                s
-                locals₁
-                { mem₁ with
-                  borrows := borrows'
-                  callerLocals := callerLocals' })
+            match derefWriteTreeUB locals₁ mem₁.borrows dst with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let borrows' :=
+                invalidateDerefWriteBorrows locals₁ mem₁.borrows dst restProj
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals₁
+                  { mem₁ with
+                    borrows := borrows'
+                    callerLocals := callerLocals' })
           | .ub => MirStepNode.fail .ub
           | .unsupported => MirStepNode.unsupported
       | .unsupported => MirStepNode.unsupported
