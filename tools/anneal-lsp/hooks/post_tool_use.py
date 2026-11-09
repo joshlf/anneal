@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PostToolUse hook appending warm Lean 4 LSP diagnostics & open `sorry` goals on `*.lean` edits.
 
-Compatible with both Jetski / Gemini CLI (`toolCall.args`, `overwriteResult`)
+Compatible with both Antigravity / Gemini CLI (`toolCall.args`, `overwriteResult`)
 and Claude Code (`tool_input`, `additionalContext`) PostToolUse hook payloads.
 """
 
