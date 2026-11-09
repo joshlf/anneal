@@ -96,6 +96,145 @@ open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 
+/-! ## 0. Tree Borrows Hierarchy Checks on Root Borrow Tables
+
+`StateRelLM3_1` keeps `s.memory.borrows = allocMap.map AllocMapEntry.toBorrowEntry`
+with no active protector: every entry is an unprotected root borrow
+(`parentTag = none`) of a whole local. On such a table the hierarchy checks
+that `evalRvalue` and `evalStmt` run before committing a dereference read
+(`derefReadTreeUB`) or write (`derefWriteTreeUB`) never report undefined
+behavior beyond the reader's own `.disabled` permission, which `evalOperand`
+already rejects. -/
+
+/-- Every entry that `lookupBorrow` finds in a root borrow table is a root. -/
+theorem lookupBorrow_map_toBorrowEntry_parentTag
+    {allocMap : List AllocMapEntry} {tag : Nat} {entry : BorrowEntry}
+    (hlook : lookupBorrow (allocMap.map AllocMapEntry.toBorrowEntry) tag = some entry) :
+    entry.parentTag = none := by
+  induction allocMap with
+  | nil => cases hlook
+  | cons hd tl ih =>
+    rw [List.map_cons] at hlook
+    unfold lookupBorrow at hlook
+    cases hb : Nat.beq hd.toBorrowEntry.tag tag
+    · rw [hb] at hlook
+      exact ih hlook
+    · rw [hb] at hlook
+      injection hlook with h
+      subst h
+      rfl
+
+/-- A write through any tag of a root borrow table has no strict ancestor, so
+`derefWriteTreeUB` is `false`. -/
+theorem derefWriteTreeUB_map_toBorrowEntry_eq_false
+    (locals : List LocalSlot) (allocMap : List AllocMapEntry) (dst : Place) :
+    derefWriteTreeUB locals (allocMap.map AllocMapEntry.toBorrowEntry) dst = false := by
+  match allocMap with
+  | [] => rfl
+  | [_] => rfl
+  | e₁ :: e₂ :: rest =>
+    have hroot : ∀ (t : Nat) (entry : BorrowEntry),
+        lookupBorrow ((e₁ :: e₂ :: rest).map AllocMapEntry.toBorrowEntry) t = some entry →
+        treeBorrowAncestorsChildAccessUB .write
+          ((e₁ :: e₂ :: rest).map AllocMapEntry.toBorrowEntry) entry.parentTag = false := by
+      intro t entry hlook
+      rw [lookupBorrow_map_toBorrowEntry_parentTag hlook]
+      unfold treeBorrowAncestorsChildAccessUB
+      cases length ((e₁ :: e₂ :: rest).map AllocMapEntry.toBorrowEntry) <;> rfl
+    simp only [List.map_cons] at hroot
+    unfold derefWriteTreeUB
+    simp only [List.map_cons]
+    split
+    · rename_i ptrVal _ _
+      cases hlook : lookupBorrow
+          (e₁.toBorrowEntry :: e₂.toBorrowEntry :: rest.map AllocMapEntry.toBorrowEntry)
+          ptrVal.tag with
+      | none => rfl
+      | some entry => exact hroot ptrVal.tag entry hlook
+    · rfl
+
+/-- On a root borrow table without protectors, a read through tag `rTag` is
+undefined behavior only at a `.disabled` entry with tag `rTag`. -/
+theorem hasTreeReadUB_map_toBorrowEntry_eq_false
+    (allMap subMap : List AllocMapEntry) (targetLocal : Local) (rTag : Nat)
+    (hperm : ∀ x ∈ subMap, x.tag = rTag → x.perm ≠ .disabled) :
+    hasTreeReadUB (allMap.map AllocMapEntry.toBorrowEntry)
+      (subMap.map AllocMapEntry.toBorrowEntry) .nil targetLocal (some rTag) .nil 0 0 =
+      false := by
+  have hroot : ∀ b ∈ allMap.map AllocMapEntry.toBorrowEntry, b.parentTag = none := by
+    intro b hb
+    obtain ⟨e, _, rfl⟩ := List.mem_map.mp hb
+    rfl
+  induction subMap with
+  | nil => rfl
+  | cons hd tl ih =>
+    have hhd : borrowEntryReadUB (allMap.map AllocMapEntry.toBorrowEntry) .nil
+        hd.toBorrowEntry targetLocal (some rTag) .nil 0 0 = false := by
+      have hne := hperm hd (List.Mem.head _)
+      unfold borrowEntryReadUB
+      have hoverlap : borrowEntryOverlapsWrite hd.toBorrowEntry .nil 0 0 = true := rfl
+      have htl_eq : hd.toBorrowEntry.targetLocal = hd.localIdx := rfl
+      have htag_eq : hd.toBorrowEntry.tag = hd.tag := rfl
+      rw [htl_eq]
+      cases Nat.beq hd.localIdx targetLocal with
+      | false => rfl
+      | true =>
+        dsimp only
+        rw [hoverlap]
+        dsimp only
+        rw [htag_eq, isBorrowDescendantOrSelf_root_eq_beq hroot rTag hd.tag]
+        cases hb : Nat.beq rTag hd.tag with
+        | true =>
+          have hne' := hne (Nat.eq_of_beq_eq_true hb).symm
+          rcases hd with ⟨_, _, _, perm⟩
+          cases perm <;> first | rfl | exact absurd rfl hne'
+        | false =>
+          rcases hd with ⟨_, _, _, perm⟩
+          cases perm <;> rfl
+    rw [List.map_cons]
+    unfold hasTreeReadUB
+    rw [hhd]
+    exact ih (fun x hx => hperm x (List.mem_cons_of_mem _ hx))
+
+/-- With pairwise distinct tags, every entry of `allocMap` that shares `e`'s tag
+is `e` itself, so it is not `.disabled` when `e` is not. -/
+theorem perm_ne_disabled_of_tag_eq_of_nodup
+    {allocMap : List AllocMapEntry}
+    (hnodup : (allocMap.map AllocMapEntry.tag).Nodup)
+    {e : AllocMapEntry} (he : e ∈ allocMap) (hperm : e.perm ≠ .disabled) :
+    ∀ x ∈ allocMap, x.tag = e.tag → x.perm ≠ .disabled := by
+  intro x hx hxt hdis
+  have h1 := lookupBorrow_map_toBorrowEntry_of_nodup hnodup hx
+  rw [hxt, lookupBorrow_map_toBorrowEntry_of_nodup hnodup he] at h1
+  have hp : e.toBorrowEntry.perm = x.toBorrowEntry.perm := by
+    rw [Option.some.inj h1]
+  exact hperm (hp.trans hdis)
+
+/-- A dereference read through the pointer in `ptrLoc`, whose tag belongs to the
+non-`.disabled` entry `e`, is never undefined behavior on a root borrow table
+without protectors. -/
+theorem derefReadTreeUB_map_toBorrowEntry_eq_false
+    (locals : List LocalSlot) (allocMap : List AllocMapEntry)
+    (hnodup : (allocMap.map AllocMapEntry.tag).Nodup)
+    (ptrLoc : Local) (ptrVal : ProvenancePtr) (sz : Nat)
+    (e : AllocMapEntry) (he : e ∈ allocMap) (htag : e.tag = ptrVal.tag)
+    (hptr : get? locals ptrLoc = some (.init (.ptr ptrVal sz)))
+    (hperm : e.perm ≠ .disabled) :
+    derefReadTreeUB locals ptrLoc .nil (allocMap.map AllocMapEntry.toBorrowEntry) .nil =
+      false := by
+  have hlook := lookupBorrow_map_toBorrowEntry_of_nodup hnodup he
+  rw [htag] at hlook
+  have hperm_tag : ∀ x ∈ allocMap, x.tag = ptrVal.tag → x.perm ≠ .disabled := by
+    rw [← htag]
+    exact perm_ne_disabled_of_tag_eq_of_nodup hnodup he hperm
+  unfold derefReadTreeUB
+  rw [hptr]
+  dsimp only
+  rw [hlook]
+  dsimp only [AllocMapEntry.toBorrowEntry, appendProjections]
+  exact hasTreeReadUB_map_toBorrowEntry_eq_false allocMap allocMap e.localIdx ptrVal.tag
+    hperm_tag
+
 /-! ## 1. Extended Value Relation for Raw Pointers (`ImmediateRelLM3_1`) -/
 
 /-- `ImmediateRel` extended with raw-pointer immediates related by `PtrRel allocMap`. -/
@@ -1186,10 +1325,9 @@ theorem evalProjection_deref_read_ok
     rw [← htag, hbor]
     dsimp only []
     cases hperm_c : e.perm
-    · rw [htarget_slot]
-    · rw [htarget_slot]
-    · rw [htarget_slot]
-    · exact absurd hperm_c hperm
+    all_goals first
+      | exact absurd hperm_c hperm
+      | rw [htarget_slot]
   refine ⟨hanneal, ?_⟩
   rw [hsz8, halign8, hmptr]
   obtain ⟨hid_lt, _, hbase⟩ := hmap.base_addr_valid e he
@@ -1338,10 +1476,9 @@ theorem evalProjection_deref_deadAlloc_ub
     rw [hbor]
     dsimp only []
     cases hperm_c : entry.perm
-    · rw [hdead]
-    · rw [hdead]
-    · rw [hdead]
-    · exact absurd hperm_c hperm
+    all_goals first
+      | exact absurd hperm_c hperm
+      | rw [hdead]
   · rw [hsz8, hmptr]
     have hsz8_nat : (Miri.ABI.Size.ofBytes 8).bytes.toNat = 8 := rfl
     unfold evalDerefReadScalarMiri
@@ -4636,10 +4773,9 @@ theorem step_deref_read_simulation_explicit
                 rw [← htag, hbor_look]
                 dsimp only []
                 cases hp : e.perm
-                · rw [hslot_t, hs_t]
-                · rw [hslot_t, hs_t]
-                · rw [hslot_t, hs_t]
-                · exact absurd hp hperm_ok
+                all_goals first
+                  | exact absurd hp hperm_ok
+                  | rw [hslot_t, hs_t]
             have himm_dst_rel : ImmediateRel dstDecl.ty body.layouts (.scalar sc_t)
                 (.scalar (.fromScalarInt msc_t)) :=
               ImmediateRel.of_ty_kind_eq htgt_prim htgt_kind_eq
@@ -4698,8 +4834,12 @@ theorem step_deref_read_simulation_explicit
               | e₁ :: e₂ :: rest =>
                 have hfrz := freezeDerefReadBorrowsAt_map_toBorrowEntry s.frame.locals e₁ e₂ rest
                   (hm_cases ▸ halloc_a.tags_nodup) ptrIdx ptrVal 8 e (hm_cases ▸ he) htag hslot_p
+                have hub := derefReadTreeUB_map_toBorrowEntry_eq_false s.frame.locals
+                  (e₁ :: e₂ :: rest) (hm_cases ▸ halloc_a.tags_nodup) ptrIdx ptrVal 8 e
+                  (hm_cases ▸ he) htag hslot_p hperm_ok
                 rcases hopKind with rfl | rfl <;>
-                · simp only [hbor, List.map_cons] at hfrz ⊢
+                · simp only [hbor, hprot, List.map_cons] at hfrz hub ⊢
+                  simp only [hub]
                   rw [hfrz]
                   simp only [derefReadMapFn, updateAllocMapOnDerefRead, List.map_cons]
             have hval_t : annealValidateScalarForTyId (translateTy dstDecl.ty body.layouts).ty
@@ -5543,6 +5683,10 @@ theorem step_deref_write_simulation_explicit
         have hinv_bor := invalidateDerefWriteBorrows_map_toBorrowEntry s.frame.locals allocMap
           halloc.tags_nodup ptrIdx ptrVal 8 e he htag hslot_p
         rw [← hbor] at hinv_bor
+        have hwub : derefWriteTreeUB s.frame.locals s.memory.borrows
+            ⟨ptrIdx, .cons .deref .nil⟩ = false := by
+          rw [hbor]
+          exact derefWriteTreeUB_map_toBorrowEntry_eq_false _ _ _
         have ha_ok : evalStmt s ⟨.assign ⟨ptrIdx, .cons .deref .nil⟩ (.use op), span⟩
             body.localDecls body.layouts =
             MirStepNode.step
@@ -5564,8 +5708,8 @@ theorem step_deref_write_simulation_explicit
           · rw [hslot_t]
             cases slot_t with
             | dead => exact absurd rfl ht_dead
-            | uninit => simp only [set?_eq_some_set hlt_af_t, hinv_bor]
-            | init _ => simp only [set?_eq_some_set hlt_af_t, hinv_bor]
+            | uninit => simp only [set?_eq_some_set hlt_af_t, hinv_bor, hwub]
+            | init _ => simp only [set?_eq_some_set hlt_af_t, hinv_bor, hwub]
         have hnext_eq : derefWriteNextAllocMap s.frame.locals allocMap ptrIdx =
             updateAllocMapOnWrite allocMap e.localIdx (some ptrVal.tag) := by
           simp only [derefWriteNextAllocMap, hslot_p,
@@ -5908,7 +6052,12 @@ theorem step_deref_oob_divergence
         (m', .error (.undefinedBehavior msg)) := by
   refine ⟨?_, step_deref_oob_miri_ub hstate (opKind := MirAst.Operand.copy) (Or.inl rfl) hbb
     hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob⟩
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
+  have hub : derefReadTreeUB s.frame.locals ptrIdx .nil s.memory.borrows
+      s.memory.activeProtectors = false := by
+    rw [hprot, hbor]
+    exact derefReadTreeUB_map_toBorrowEntry_eq_false _ allocMap halloc.tags_nodup ptrIdx ptrVal
+      8 e he htag hslot_p hperm
   have hlookup := (halloc.borrow_sync e he).2
   rw [htag] at hlookup
   obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
@@ -5953,7 +6102,8 @@ theorem step_deref_oob_divergence
       | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
       | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
     | cons b₂ rest' =>
-      simp only [hslot_d]
+      rw [hb] at hub
+      simp only [hslot_d, hub]
       cases slot_d with
       | dead => exact absurd rfl hsd_ne
       | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
@@ -11792,7 +11942,12 @@ theorem step_deref_misaligned_divergence
   refine ⟨?_, step_deref_misaligned_miri_ub hstate (opKind := MirAst.Operand.copy) (Or.inl rfl)
     hbb hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hinbounds
     hmis⟩
-  obtain ⟨_, _, _, _, hfr, hcal, _, hprot, _, _, halloc, _⟩ := id hstate
+  obtain ⟨_, _, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
+  have hub : derefReadTreeUB s.frame.locals ptrIdx .nil s.memory.borrows
+      s.memory.activeProtectors = false := by
+    rw [hprot, hbor]
+    exact derefReadTreeUB_map_toBorrowEntry_eq_false _ allocMap halloc.tags_nodup ptrIdx ptrVal
+      8 e he htag hslot_p hperm
   have hlookup := (halloc.borrow_sync e he).2
   rw [htag] at hlookup
   obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
@@ -11827,7 +11982,8 @@ theorem step_deref_misaligned_divergence
       | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
       | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
     | cons b₂ rest' =>
-      simp only [hslot_d]
+      rw [hb] at hub
+      simp only [hslot_d, hub]
       cases slot_d with
       | dead => exact absurd rfl hsd_ne
       | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
@@ -11872,9 +12028,14 @@ theorem step_deref_invalid_bool_divergence
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "reading invalid value")) := by
   have hdst_prim : IsPrimScalarTy dstDecl.ty := Or.inl hdst_bool
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
   refine ⟨?_, ?_⟩
-  · have hlookup := (halloc.borrow_sync e he).2
+  · have hub : derefReadTreeUB s.frame.locals ptrIdx .nil s.memory.borrows
+        s.memory.activeProtectors = false := by
+      rw [hprot, hbor]
+      exact derefReadTreeUB_map_toBorrowEntry_eq_false _ allocMap halloc.tags_nodup ptrIdx ptrVal
+        8 e he htag hslot_p hperm
+    have hlookup := (halloc.borrow_sync e he).2
     rw [htag] at hlookup
     obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
     have hsd_ne : slot_d ≠ .dead := fun hd => hdst_live (hslot_d.trans (congrArg some hd))
@@ -11908,7 +12069,8 @@ theorem step_deref_invalid_bool_divergence
         | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
         | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
       | cons b₂ rest' =>
-        simp only [hslot_d]
+        rw [hb] at hub
+        simp only [hslot_d, hub]
         cases slot_d with
         | dead => exact absurd rfl hsd_ne
         | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
@@ -12954,9 +13116,14 @@ theorem step_deref_invalid_char_divergence
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "reading invalid value")) := by
   have hdst_prim : IsPrimScalarTy dstDecl.ty := Or.inr (Or.inl hdst_char)
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
   refine ⟨?_, ?_⟩
-  · have hlookup := (halloc.borrow_sync e he).2
+  · have hub : derefReadTreeUB s.frame.locals ptrIdx .nil s.memory.borrows
+        s.memory.activeProtectors = false := by
+      rw [hprot, hbor]
+      exact derefReadTreeUB_map_toBorrowEntry_eq_false _ allocMap halloc.tags_nodup ptrIdx ptrVal
+        8 e he htag hslot_p hperm
+    have hlookup := (halloc.borrow_sync e he).2
     rw [htag] at hlookup
     obtain ⟨slot_d, _, hlt_af_d, _, hslot_d, _, _, _⟩ := hfr.lookup_local hdecl_dst
     have hsd_ne : slot_d ≠ .dead := fun hd => hdst_live (hslot_d.trans (congrArg some hd))
@@ -12990,7 +13157,8 @@ theorem step_deref_invalid_char_divergence
         | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
         | init _ => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
       | cons b₂ rest' =>
-        simp only [hslot_d]
+        rw [hb] at hub
+        simp only [hslot_d, hub]
         cases slot_d with
         | dead => exact absurd rfl hsd_ne
         | uninit => simp only [hset, hprot]; exact ⟨_, rfl, hget_set⟩
@@ -13160,7 +13328,7 @@ theorem step_deref_write_invalid_bool_divergence
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "writing invalid value")) := by
   have hbool_prim : IsPrimScalarTy { kind := .bool, layoutIdx := 0 } := Or.inl rfl
-  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, _, halloc, _⟩ := id hstate
+  obtain ⟨tf, hframes, _, _, hfr, hcal, _, hprot, _, hbor, halloc, _⟩ := id hstate
   refine ⟨?_, ?_⟩
   · have hlookup := (halloc.borrow_sync e he).2
     rw [htag] at hlookup
@@ -13183,6 +13351,10 @@ theorem step_deref_write_invalid_bool_divergence
           | dead => exact absurd rfl hst_ne
           | uninit => simp only [hset_t]
           | init _ => simp only [hset_t])
+    have hwub : derefWriteTreeUB s.frame.locals s.memory.borrows
+        ⟨ptrIdx, .cons .deref .nil⟩ = false := by
+      rw [hbor]
+      exact derefWriteTreeUB_map_toBorrowEntry_eq_false _ _ _
     rw [stepMirFn_eq_of_not_other body s hcal hphase]
     simp only [hbb, hstmt]
     have hrv_c : evalRvalue s.frame.locals (.use (.constant c)) s.memory body.localDecls
@@ -13195,6 +13367,7 @@ theorem step_deref_write_invalid_bool_divergence
         | nil => dsimp only []; rw [hc_op]
         | cons b₂ rest' => dsimp only []; rw [hc_op]
     unfold evalStmt; dsimp only []; rw [hrv_c]; dsimp only []; rw [hw_anneal]
+    simp only [hwub]
     exact ⟨_, rfl, hget_set⟩
   · have himm_p := himm_ptr tf hframes
     have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
@@ -15187,14 +15360,10 @@ theorem step_rawPtr_deref_zero_offset_correspondence
         unfold evalRvalue; dsimp only []
         rw [hsp_full]; dsimp only []; rw [hlookup]; dsimp only [AllocMapEntry.toBorrowEntry]
         cases hp : e.perm <;> cases hm : rawMut
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact absurd ⟨hp, hm⟩ hnot_fmut
-        · exact absurd hp hne_dis
-        · exact absurd hp hne_dis
+        all_goals first
+          | exact absurd hp hne_dis
+          | exact absurd (And.intro hp hm) hnot_fmut
+          | exact ⟨_, rfl, hprot⟩
       obtain ⟨mem₁, hrv_a, hprot₁⟩ := hrv_a_ok
       have hmls_pa' : tfa.locals[ptrIdx]'hlt_pa =
           ⟨.live (.immediate (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr))),
@@ -15393,14 +15562,10 @@ theorem step_rawPtr_deref_zero_offset_correspondence
         unfold evalRvalue; dsimp only []
         rw [hsp]; dsimp only []; rw [hlookup]; dsimp only [AllocMapEntry.toBorrowEntry]
         cases hp : e.perm <;> cases hm : rawMut
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact ⟨_, rfl, hprot⟩
-        · exact absurd ⟨hp, hm⟩ hnot_fmut
-        · exact absurd hp hne_dis
-        · exact absurd hp hne_dis
+        all_goals first
+          | exact absurd hp hne_dis
+          | exact absurd (And.intro hp hm) hnot_fmut
+          | exact ⟨_, rfl, hprot⟩
       obtain ⟨mem₁, hrv₁, hprot₁⟩ := hrv_ok'
       rw [stepMirFn_eq_of_not_other body s hcal hphase] at ha_ub
       simp only [hbb, hstmt] at ha_ub

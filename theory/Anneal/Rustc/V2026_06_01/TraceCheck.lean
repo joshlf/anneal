@@ -1379,8 +1379,9 @@ def findBlockCallImpurePtrArgIdx?
 
 /--
 Structurally recursive fuel-bounded helper testing whether any runtime `Value`
-in a worklist contains a pointer whose borrow in `borrows` is mutable/non-frozen
-(`.active` or `.reserved`) or untracked (`none`, such as a raw pointer).
+in a worklist contains a pointer whose borrow in `borrows` is not `.frozen` (a
+mutable reservation, an activated `.unique` borrow, an interior-mutable `.cell`
+borrow, or a `.disabled` tag) or untracked (`none`, such as a raw pointer).
 -/
 @[reducible]
 def valueListHasImpureExtCallPtr (borrows : List BorrowEntry) : Nat → List Value → Bool :=
@@ -1398,7 +1399,8 @@ def valueListHasImpureExtCallPtr (borrows : List BorrowEntry) : Nat → List Val
             | some b =>
               match b.perm with
               | .frozen => false
-              | .reserved | .active | .disabled => true
+              | .cell | .reservedFrz _ | .reservedIM | .unique | .disabled =>
+                true
             | none => true
           | .aggregate _ fields =>
             ih fields
@@ -1410,8 +1412,8 @@ def valueListHasImpureExtCallPtr (borrows : List BorrowEntry) : Nat → List Val
 
 /--
 Test whether an evaluated runtime `Value` passed in a `MirCallReq` contains a
-pointer whose borrow in `borrows` is mutable/non-frozen (`.active` or
-`.reserved`) or untracked (`none`, such as a raw pointer).
+pointer whose borrow in `borrows` is not `.frozen` or untracked (`none`, such as
+a raw pointer); see `valueListHasImpureExtCallPtr`.
 -/
 @[reducible]
 def valueHasImpureExtCallPtr (borrows : List BorrowEntry) (fuel : Nat) (v : Value) : Bool :=
@@ -3298,14 +3300,17 @@ def ensureCallerLocalsPad (callerLocals : List LocalSlot) (minLen : Nat) : List 
 
 /--
 Determine the initial `TreeBorrowPerm` for an incoming pointer/reference
-parameter of mutability `mutbl` and pointee `pointee`.
+parameter of mutability `mutbl` and pointee `pointee`: `.active` (`.unique`)
+for mutable parameters, and for shared parameters the same choice as
+`sharedBorrowPerm` and `fnEntryRetagPerm .not`, `.frozen` for `Freeze`
+pointees and `.cell` for interior-mutable (`!Freeze`) pointees.
 -/
 @[reducible]
 def ptrParamBorrowPerm (mutbl : Mutability) (pointee : RigidTy) : TreeBorrowPerm :=
   match mutbl with
   | .mut => .active
   | .not =>
-    if rigidTyIsFreezeFuel 16 pointee then .frozen else .reserved
+    if rigidTyIsFreezeFuel 16 pointee then .frozen else .cell
 
 /--
 Populate `mem.borrows`, `mem.callerLocals`, and `mem.globals` for a single

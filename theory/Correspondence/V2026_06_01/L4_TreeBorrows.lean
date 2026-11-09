@@ -25,13 +25,15 @@ automata in `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops` and
    - `mir_updateBorrowPerm_self_write_activates_reserved`: writing through `writerTag = some entry.tag`
      activates `.reserved → .active` and preserves `.active`, `.frozen`, `.disabled`.
    - `mir_updateBorrowPerm_foreign_ptr_write_disables`: writing through any foreign pointer tag
-     `writerTag = some wTag` with `entry.tag ≠ wTag` transitions `entry.perm` to `.disabled`.
+     `writerTag = some wTag` with `entry.tag ≠ wTag` transitions `entry.perm` to `.disabled`
+     unless `entry.perm` is `.cell` or `.reservedIM`.
    - `mir_updateBorrowPerm_direct_local_write`: direct write to `entry.targetLocal` (`writerTag = none`)
-     disables `.active` and `.frozen` while preserving `.reserved` (two-phase borrow reservation!).
+     disables `.active`, `.frozen`, and `Freeze` reservations (`.reserved`) while preserving
+     interior-mutable `.reservedIM` and `.cell` tags.
    - `mir_updateBorrowPerm_corresponds_to_minirust_write`: universal theorem proving that
-     `Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm` equals
-     `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm` across all `BorrowEntry`
-     states and `writerTag`s.
+     `Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm` equals `mrExpectedWritePerm`
+     (`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition`) across all
+     6-state `BorrowEntry` states and `writerTag`s.
    - `mir_updateBorrowPermAtProj_characterization`: disjoint field/index/range writes leave
      sibling borrows untouched.
 2. **Direct Universal Theorems Over Borrow List Invalidation & Function-Entry Protectors**:
@@ -40,10 +42,12 @@ automata in `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops` and
      pointwise across the active borrow list.
    - `mir_attachBorrowProtector_and_hasProtectedWriteConflict`: universal theorems over
      `attachBorrowProtector`, `isBorrowProtected`, `hasProtectedWriteConflict`, and `evalPlaceWrite`.
-3. **Direct Universal Root-Cause Theorem for `GAP-MR-0001` Over `MirSemantics.{evalRvalue,writePlaceValue}`**:
+3. **Direct Universal Theorem Over `Freeze` vs. `UnsafeCell` Shared Borrows (`MirSemantics.{evalRvalue,writePlaceValue}`)**:
    - `mir_shared_ref_always_assigns_frozen_and_rejects_write`: proves directly on `evalRvalue`
-     (`Places.lean:1798`) and `writePlaceValue` (`Places.lean:1368`) that `BorrowKind.shared`
-     unconditionally creates `perm := .frozen` and rejects subsequent dereference writes with `.ub`.
+     and `writePlaceValue` that `BorrowKind.shared` on `Freeze` (or untyped default) places
+     creates `perm := .frozen` and rejects dereference writes with `.ub`, whereas on
+     `core::cell::UnsafeCell<u32>` (`!Freeze`) it creates `perm := .cell` and permits
+     interior-mutable dereference writes.
 4. **Mechanical Cross-Snapshot Tree Borrows Comparison (`S2026_05_Matched` vs. `S2026_07_BleedingEdge`)**:
    - `unprotected_transition_agrees_across_snapshots`: `PermissionUnprot.transition` agrees 100%
      across all 24 `(PermissionUnprot × AccessKind × NodeRelation)` combinations between the two
@@ -76,22 +80,29 @@ deriving instance DecidableEq, BEq, Repr for TreeBorrowPerm
 
 /-! ## 1. Translation Between Anneal `TreeBorrowPerm` and MiniRust `PermissionUnprot` -/
 
-/-- Translate Anneal's 4-state `TreeBorrowPerm` to MiniRust's `PermissionUnprot`. -/
+/-- Translate Anneal's six-state `TreeBorrowPerm` to MiniRust's
+`PermissionUnprot`, forgetting the protector-only `conflicted` latch of
+`.reservedFrz`. With `hasInteriorMut = false` this is MiniRust's exact
+unprotected state; the legacy `hasInteriorMut = true` view reinterprets a
+`Freeze`-style `.reservedFrz` / `.frozen` as `ReservedIm` / `Cell`. -/
 @[reducible]
 def toPermissionUnprot (hasInteriorMut : Bool := false) : TreeBorrowPerm → PermissionUnprot
-  | .active => .Unique
-  | .reserved => if hasInteriorMut then .ReservedIm else .Reserved
+  | .cell => .Cell
+  | .reservedFrz _ => if hasInteriorMut then .ReservedIm else .Reserved
+  | .reservedIM => .ReservedIm
+  | .unique => .Unique
   | .frozen => if hasInteriorMut then .Cell else .Frozen
   | .disabled => .Disabled
 
-/-- Project MiniRust's `PermissionUnprot` to Anneal's 4-state `TreeBorrowPerm`. -/
+/-- Embed MiniRust's `PermissionUnprot` into Anneal's six-state `TreeBorrowPerm`
+(`Reserved` is the unconflicted `.reservedFrz false`). -/
 @[reducible]
 def ofPermissionUnprot : PermissionUnprot → TreeBorrowPerm
   | .Unique => .active
   | .Reserved => .reserved
-  | .ReservedIm => .reserved
+  | .ReservedIm => .reservedIM
   | .Frozen => .frozen
-  | .Cell => .frozen
+  | .Cell => .cell
   | .Disabled => .disabled
 
 /-- Structural isomorphism from `S2026_05_Matched` to `S2026_07_BleedingEdge` `PermissionUnprot`. -/
@@ -162,19 +173,44 @@ def toS07Permission :
   | .Unprot p => .Unprot (toS07PermissionUnprot p)
   | .Prot p => .Prot (toS07PermissionProt p)
 
+/-- MiniRust node relation of a write through `writerTag` relative to `entry`
+(a write through `entry`'s own tag is `Local`; everything else is
+`Foreign`). -/
+@[reducible]
+def mrWriteNodeRelation (entry : BorrowEntry) (writerTag : Option Nat) : NodeRelation :=
+  match writerTag with
+  | .none => .Foreign
+  | .some tag =>
+    match Nat.beq entry.tag tag with
+    | true => .Local
+    | false => .Foreign
+
 /--
-Abbreviation wiring `mrExpectedWritePerm` directly to the generated
-`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm` function.
+Expected Anneal permission after a write, computed by the specr-generated
+MiniRust unprotected transition
+`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition`
+(`spec/mem/tree_borrows/state_machine_unprotected.md`). Entries on another
+local are unchanged, and a forbidden local write (MiniRust UB) leaves the
+entry unchanged, as Anneal reports that undefined behavior separately.
+
+The generated helper
+`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm`
+encodes the pre-`LM-3.3` Anneal rule under which a direct write to the local
+preserved `Reserved`; MiniRust's own `foreign_write` (and Miri's) disables it,
+so the correspondence is stated against `PermissionUnprot.transition`.
 -/
 abbrev mrExpectedWritePerm
     (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) :
     TreeBorrowPerm :=
-  ofPermissionUnprot
-    (MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm
-      (Nat.beq entry.targetLocal targetLocal)
-      writerTag
-      entry.tag
-      (toPermissionUnprot false entry.perm))
+  match Nat.beq entry.targetLocal targetLocal with
+  | false => entry.perm
+  | true =>
+    match
+      MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition
+        (toPermissionUnprot false entry.perm) .Write (mrWriteNodeRelation entry writerTag)
+    with
+    | .ok next => ofPermissionUnprot next
+    | .error _ => entry.perm
 
 /-! ## 2. Direct Universal Theorems Over `Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm` -/
 
@@ -203,37 +239,41 @@ theorem mir_updateBorrowPerm_self_write_activates_reserved
 
 /--
 **Theorem L4.3 (`mir_updateBorrowPerm_foreign_ptr_write_disables`)**:
-For EVERY `BorrowEntry` targeting `entry.targetLocal` and EVERY foreign writer tag
-`wTag` (`Nat.beq entry.tag wTag = false`), Anneal's real `updateBorrowPerm`
-transitions `perm` to `.disabled`.
+For EVERY `BorrowEntry` targeting `entry.targetLocal` that is neither `.cell` nor
+`.reservedIM` and EVERY foreign writer tag `wTag` (`Nat.beq entry.tag wTag =
+false`), Anneal's real `updateBorrowPerm` transitions `perm` to `.disabled`
+(`.cell` and unprotected `.reservedIM` tolerate foreign writes).
 -/
 theorem mir_updateBorrowPerm_foreign_ptr_write_disables
     (entry : BorrowEntry) (wTag : Nat)
-    (h_foreign : Nat.beq entry.tag wTag = false) :
+    (h_foreign : Nat.beq entry.tag wTag = false)
+    (h_not_cell : entry.perm ≠ .cell)
+    (h_not_im : entry.perm ≠ .reservedIM) :
     (updateBorrowPerm entry entry.targetLocal (.some wTag)).perm = .disabled := by
-  simp [updateBorrowPerm, Nat.beq_refl, h_foreign]
+  cases hp : entry.perm <;> simp_all [updateBorrowPerm, Nat.beq_refl]
 
 /--
 **Theorem L4.4 (`mir_updateBorrowPerm_direct_local_write`)**:
 For EVERY `BorrowEntry`, a direct write (`writerTag = .none`) to `entry.targetLocal`
 in Anneal's real `updateBorrowPerm`:
-1. Disables `.active` and `.frozen` tags (`perm = .disabled`); and
-2. Preserves `.reserved` tags (`perm = .reserved`), matching MiniRust's two-phase
-   borrow reservation rule where parent reads/writes prior to activation are tolerated.
+1. Disables `.active`, `.frozen`, and `Freeze` reservations (`.reserved`) because
+   a direct write is a foreign write for every tag (MiniRust and Miri
+   `foreign_write`); and
+2. Preserves interior-mutable reservations (`.reservedIM`) and `.cell` tags.
 -/
 theorem mir_updateBorrowPerm_direct_local_write (entry : BorrowEntry) :
     (entry.perm = .active → (updateBorrowPerm entry entry.targetLocal .none).perm = .disabled) ∧
     (entry.perm = .frozen → (updateBorrowPerm entry entry.targetLocal .none).perm = .disabled) ∧
-    (entry.perm = .reserved → (updateBorrowPerm entry entry.targetLocal .none).perm = .reserved) := by
-  refine ⟨?_, ?_, ?_⟩
-  · intro h; simp [updateBorrowPerm, Nat.beq_refl, h]
-  · intro h; simp [updateBorrowPerm, Nat.beq_refl, h]
-  · intro h; simp [updateBorrowPerm, Nat.beq_refl, h]
+    (entry.perm = .reserved → (updateBorrowPerm entry entry.targetLocal .none).perm = .disabled) ∧
+    (entry.perm = .reservedIM →
+      (updateBorrowPerm entry entry.targetLocal .none).perm = .reservedIM) ∧
+    (entry.perm = .cell → (updateBorrowPerm entry entry.targetLocal .none).perm = .cell) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> intro h <;> simp [updateBorrowPerm, Nat.beq_refl, h]
 
 /--
 **Theorem L4.5 (`mir_updateBorrowPerm_corresponds_to_minirust_write`)**:
 Universal correspondence theorem directly over `Trusted.Rustc.V2026_06_01.MirSemantics.updateBorrowPerm`
-and `MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm`:
+and `mrExpectedWritePerm` (`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition`):
 for EVERY `entry : BorrowEntry`, EVERY `targetLocal : Local`, and EVERY `writerTag : Option Nat`,
 `(updateBorrowPerm entry targetLocal writerTag).perm` equals `mrExpectedWritePerm`
 while preserving `tag` and `targetLocal`.
@@ -245,41 +285,71 @@ theorem mir_updateBorrowPerm_corresponds_to_minirust_write
     (updateBorrowPerm entry targetLocal writerTag).tag = entry.tag ∧
     (updateBorrowPerm entry targetLocal writerTag).targetLocal = entry.targetLocal := by
   cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag =>
-  unfold updateBorrowPerm mrExpectedWritePerm
-    MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm
-    toPermissionUnprot ofPermissionUnprot
-  cases hloc : Nat.beq tLoc targetLocal <;>
-    cases writerTag <;>
-    cases perm <;>
-    simp
-  all_goals
-    rename_i wTag
-    cases htag : Nat.beq tag wTag <;> simp
+  refine ⟨?_, ?_, ?_⟩
+  · cases hloc : Nat.beq tLoc targetLocal
+    · simp [updateBorrowPerm, mrExpectedWritePerm, hloc]
+    · cases writerTag with
+      | none =>
+        rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+          simp [updateBorrowPerm, mrExpectedWritePerm, hloc,
+            toPermissionUnprot, ofPermissionUnprot,
+            MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition,
+            MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.foreign_write]
+      | some wTag =>
+        cases htag : Nat.beq tag wTag <;>
+          rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+          simp [updateBorrowPerm, mrExpectedWritePerm, mrWriteNodeRelation, hloc,
+            toPermissionUnprot, ofPermissionUnprot, htag,
+            MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition,
+            MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.foreign_write,
+            MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.local_write]
+  · unfold updateBorrowPerm
+    split
+    · rfl
+    · exact (applyTreeBorrowTransition_fields _ _).1
+  · unfold updateBorrowPerm
+    split
+    · rfl
+    · exact (applyTreeBorrowTransition_fields _ _).2.1
 
 /--
 **Theorem L4.6 (`mir_updateBorrowPerm_unprot_eq_generated_ops`)**:
-Direct commutative diagram between `MirSemantics.updateBorrowPerm` and
-`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm` in `PermissionUnprot`.
+Direct commutative diagram between `MirSemantics.updateBorrowPerm` and the
+specr-generated MiniRust unprotected transition
+`MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition` in
+`PermissionUnprot`: an entry on another local is unchanged, and an entry on the
+written local takes MiniRust's write transition for the write's node relation
+(a forbidden local write leaves the entry unchanged; Anneal reports that
+undefined behavior separately).
 -/
 theorem mir_updateBorrowPerm_unprot_eq_generated_ops
     (entry : BorrowEntry) (targetLocal : Local) (writerTag : Option Nat) :
     toPermissionUnprot false (updateBorrowPerm entry targetLocal writerTag).perm =
-      MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm
-        (Nat.beq entry.targetLocal targetLocal)
-        writerTag
-        entry.tag
-        (toPermissionUnprot false entry.perm) := by
+      match Nat.beq entry.targetLocal targetLocal with
+      | false => toPermissionUnprot false entry.perm
+      | true =>
+        match
+          MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition
+            (toPermissionUnprot false entry.perm) .Write (mrWriteNodeRelation entry writerTag)
+        with
+        | .ok next => next
+        | .error _ => toPermissionUnprot false entry.perm := by
   cases entry with | mk tag tLoc tProj perm rOff rLen prot parentTag =>
-  unfold updateBorrowPerm
-    MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.mrExpectedWritePerm
-    toPermissionUnprot
-  cases hloc : Nat.beq tLoc targetLocal <;>
-    cases writerTag <;>
-    cases perm <;>
-    simp
-  all_goals
-    rename_i wTag
-    cases htag : Nat.beq tag wTag <;> simp
+  cases hloc : Nat.beq tLoc targetLocal
+  · simp [updateBorrowPerm, hloc]
+  · cases writerTag with
+    | none =>
+      rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+        simp [updateBorrowPerm, hloc, toPermissionUnprot,
+          MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition,
+          MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.foreign_write]
+    | some wTag =>
+      cases htag : Nat.beq tag wTag <;>
+        rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+        simp [updateBorrowPerm, mrWriteNodeRelation, hloc, htag, toPermissionUnprot,
+          MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.transition,
+          MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.foreign_write,
+          MiniRust.Snapshots.S2026_05_Matched.Generated.Ops.PermissionUnprot.local_write]
 
 /-! ## 3. Universal Theorems Over `updateBorrowPermAtProj`, `invalidateConflictingBorrows`, & Protectors -/
 
@@ -443,8 +513,8 @@ For `Freeze` (or untyped default `localDecls = .nil`) places, taking a shared re
 `BorrowEntry` with `perm := .frozen`, and writing `newVal` through that pointer via
 `writePlaceValue` returns `PlaceWriteResult.ub`.
 Conversely, when `localDecls` types local 0 as `core::cell::UnsafeCell<u32>` (`!Freeze`),
-`sharedBorrowPerm` returns `TreeBorrowPerm.reserved` and writing `newVal` through that
-pointer succeeds with `.ok [.init newVal, .init ptrVal]`.
+`sharedBorrowPerm` returns `TreeBorrowPerm.cell` (Miri's `Cell`) and writing `newVal`
+through that pointer succeeds with `.ok [.init newVal, .init ptrVal]`.
 -/
 theorem mir_shared_ref_always_assigns_frozen_and_rejects_write
     (initVal newVal : Value) (mem : Memory) :
@@ -455,11 +525,11 @@ theorem mir_shared_ref_always_assigns_frozen_and_rejects_write
       targetProjection := .nil
       perm := .frozen
     }
-    let reservedEntry : BorrowEntry := {
+    let cellEntry : BorrowEntry := {
       tag := mem.nextTag
       targetLocal := 0
       targetProjection := .nil
-      perm := .reserved
+      perm := .cell
     }
     let unsafeCellDecl : LocalDecl := {
       mutability := .not
@@ -474,7 +544,7 @@ theorem mir_shared_ref_always_assigns_frozen_and_rejects_write
     }
     let memAfterUnsafeCellRef : Memory := {
       mem with
-      borrows := reservedEntry :: mem.borrows
+      borrows := cellEntry :: mem.borrows
       nextTag := Nat.add mem.nextTag 1
     }
     evalRvalue initLocals (.ref .shared { local_ := 0, projection := .nil }) mem =
@@ -516,40 +586,48 @@ def toAccessKind : TbAccessKind → AccessKind
   | .read => .Read
   | .write => .Write
 
-/-- Base permission state transition table for `Freeze` pointees (`hasInteriorMut = false`). -/
+/-- Translate `TbAccessKind` to Anneal's `TreeBorrowAccessKind`. -/
+@[reducible]
+def toAnnealAccessKind : TbAccessKind → TreeBorrowAccessKind
+  | .read => .read
+  | .write => .write
+
+/-- Translate `TbLocality` to Anneal's `TreeBorrowRelatedness`. -/
+@[reducible]
+def toAnnealRelatedness : TbLocality → TreeBorrowRelatedness
+  | .childLocal => .localAccess
+  | .foreign => .foreignAccess
+
+/-- Anneal's unprotected per-node transition (`treeBorrowPermTransition` in
+`Places.lean`) as an `Option`: `none` is a forbidden child access. -/
 @[reducible]
 def rawNextPermFreeze
     (perm : TreeBorrowPerm) (loc : TbLocality) (acc : TbAccessKind) :
     Option TreeBorrowPerm :=
-  match perm, loc, acc with
-  | .disabled, .childLocal, _ => none
-  | .disabled, .foreign, _ => some .disabled
-  | .frozen, .childLocal, .read => some .frozen
-  | .frozen, .childLocal, .write => none
-  | .frozen, .foreign, .read => some .frozen
-  | .frozen, .foreign, .write => some .disabled
-  | .reserved, .childLocal, .read => some .reserved
-  | .reserved, .childLocal, .write => some .active
-  | .reserved, .foreign, .read => some .reserved
-  | .reserved, .foreign, .write => some .disabled
-  | .active, .childLocal, .read => some .active
-  | .active, .childLocal, .write => some .active
-  | .active, .foreign, .read => some .frozen
-  | .active, .foreign, .write => some .disabled
+  match
+    treeBorrowPermTransition (toAnnealAccessKind acc) (toAnnealRelatedness loc) perm false
+  with
+  | .transition next => some next
+  | _ => none
 
-/-- Anneal `V2026_06_01` single-node Tree Borrows step with protector enforcement. -/
+/-- Anneal `V2026_06_01` single-node Tree Borrows step with protector enforcement:
+the real per-node access `treeBorrowNodeAccess` from `Places.lean`. A forbidden
+child access reports `"tree borrows invalid local access"`; a foreign access
+that disables a protected tag (or reaches a protected `.reservedIM`) reports
+`"tree borrows protected tag invalidated by conflicting write"`. -/
 @[reducible]
 def annealStepTreeBorrowPerm
     (perm : TreeBorrowPerm) (loc : TbLocality) (acc : TbAccessKind) (prot : Bool) :
     Except TerminationInfo TreeBorrowPerm :=
-  match rawNextPermFreeze perm loc acc with
-  | none => .error (.ub "tree borrows invalid local access")
-  | some .disabled =>
-    if prot && (perm != .disabled) then
+  match
+    treeBorrowNodeAccess (toAnnealAccessKind acc) (toAnnealRelatedness loc) perm prot
+  with
+  | .transition next => .ok next
+  | _ =>
+    match loc with
+    | .childLocal => .error (.ub "tree borrows invalid local access")
+    | .foreign =>
       .error (.ub "tree borrows protected tag invalidated by conflicting write")
-    else
-      .ok .disabled
-  | some next => .ok next
 
 /--
 Single-node Tree Borrows step driven directly by the specr-generated
@@ -689,15 +767,21 @@ theorem epoch_delta_init_access_and_reborrow_permission
 
 /--
 **Theorem L4.13 (`treeBorrow_transition_corresponds_for_freeze`)**:
-Universal correspondence for `Freeze` pointees (`hasInteriorMut = false`) across both
-MiniRust snapshots.
+Universal correspondence of unprotected single-node steps (`hasInteriorMut = false`)
+across both MiniRust snapshots, for every Anneal state except the conflicted
+reservation. MiniRust's unprotected state machine (`PermissionUnprot`) has no
+`conflicted` latch and no protector rule; protected steps and the latch are
+related to Miri's protected transition function in
+`LeanMiriSpec.Correspondence.TreeBorrowsRel`.
 -/
 theorem treeBorrow_transition_corresponds_for_freeze
     (snap : MiniRustSnap) (perm : TreeBorrowPerm)
-    (loc : TbLocality) (acc : TbAccessKind) (prot : Bool) :
-    annealStepTreeBorrowPerm perm loc acc prot =
-      mrStepTreeBorrowPerm snap false perm loc acc prot := by
-  cases snap <;> cases perm <;> cases loc <;> cases acc <;> cases prot <;> rfl
+    (loc : TbLocality) (acc : TbAccessKind)
+    (h_unconflicted : perm ≠ .reservedFrz true) :
+    annealStepTreeBorrowPerm perm loc acc false =
+      mrStepTreeBorrowPerm snap false perm loc acc false := by
+  cases snap <;> rcases perm with _ | (_ | _) | _ | _ | _ | _ <;> cases loc <;> cases acc <;>
+    first | rfl | exact absurd rfl h_unconflicted
 
 theorem disabled_local_access_is_ub (acc : TbAccessKind) (prot : Bool) :
     annealStepTreeBorrowPerm .disabled .childLocal acc prot =
@@ -705,14 +789,11 @@ theorem disabled_local_access_is_ub (acc : TbAccessKind) (prot : Bool) :
   cases acc <;> cases prot <;> rfl
 
 theorem protected_live_tag_foreign_write_is_ub
-    (perm : TreeBorrowPerm) (h_live : perm ≠ .disabled) :
+    (perm : TreeBorrowPerm) (h_live : perm ≠ .disabled) (h_not_cell : perm ≠ .cell) :
     annealStepTreeBorrowPerm perm .foreign .write true =
       .error (.ub "tree borrows protected tag invalidated by conflicting write") := by
-  cases perm with
-  | active => rfl
-  | reserved => rfl
-  | frozen => rfl
-  | disabled => exact absurd rfl h_live
+  rcases perm with _ | (_ | _) | _ | _ | _ | _ <;>
+    first | rfl | exact absurd rfl h_live | exact absurd rfl h_not_cell
 
 theorem l4_shared_unsafecell_gap_witnessed :
     gapLayer .GAP_MR_0001 = .L4_TreeBorrows ∧
@@ -728,7 +809,7 @@ theorem shared_borrow_unsafe_cell_non_correspondence (snap : MiniRustSnap) :
     annealStepTreeBorrowPerm .frozen .childLocal .write false =
       .error (.ub "tree borrows invalid local access") ∧
     mrStepTreeBorrowPerm snap true .frozen .childLocal .write false =
-      .ok .frozen ∧
+      .ok .cell ∧
     VerifiedRemediationWitness
       (evalAnnealV2026_06_01 .sharedUnsafeCellWrite defaultFixtureState)
       (evalMiniRustSnapshot .S2026_05_Matched .sharedUnsafeCellWrite)
@@ -755,7 +836,8 @@ Universal characterization of Tree Borrows parent/child write transitions in
 1. A write through a descendant or self tag (`isBorrowDescendantOrSelf allBorrows wTag entry.tag = true`)
    activates a `.reserved` ancestor (`perm = .active`) and preserves an `.active` ancestor (`perm = .active`);
 2. An overlapping write through a foreign tag (`isBorrowDescendantOrSelf allBorrows wTag entry.tag = false`)
-   disables `entry` (`perm = .disabled`).
+   disables `entry` (`perm = .disabled`) unless `entry` is `.cell` or `.reservedIM`, which
+   tolerate foreign writes.
 -/
 theorem mir_updateBorrowPermTreeAtProj_characterization
     (allBorrows : List BorrowEntry) (entry : BorrowEntry) (wTag : Nat)
@@ -773,6 +855,7 @@ theorem mir_updateBorrowPermTreeAtProj_characterization
     (isBorrowDescendantOrSelf allBorrows wTag entry.tag = false →
       Nat.beq entry.tag wTag = false →
       borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = true →
+      entry.perm ≠ .cell → entry.perm ≠ .reservedIM →
       (updateBorrowPermTreeAtProj
         allBorrows entry entry.targetLocal (.some wTag)
         writeProj writeRangeOff writeRangeLen).perm = .disabled) := by
@@ -783,9 +866,10 @@ theorem mir_updateBorrowPermTreeAtProj_characterization
   · intro h_desc h_perm
     simp [updateBorrowPermTreeAtProj, resolveTreeBorrowWriterTag,
       updateBorrowPermAtProj, Nat.beq_refl, h_desc, h_perm]
-  · intro h_for h_neq h_ov
-    simp [updateBorrowPermTreeAtProj, resolveTreeBorrowWriterTag,
-      updateBorrowPermAtProj, Nat.beq_refl, h_for, h_neq, h_ov]
+  · intro h_for h_neq h_ov h_nc h_nim
+    cases hp : entry.perm <;>
+      simp_all [updateBorrowPermTreeAtProj, resolveTreeBorrowWriterTag,
+        updateBorrowPermAtProj, Nat.beq_refl]
 
 /--
 **Theorem L4.15 (`mir_updateBorrowPermOnReadAtProj_characterization`)**:
@@ -822,8 +906,12 @@ theorem mir_updateBorrowPermOnReadAtProj_characterization
     cases borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen <;>
       simp [Nat.beq_refl, h_desc]
   · intro h_for h_ov h_perm
-    simp [updateBorrowPermOnReadAtProj, Nat.beq_refl, h_for, h_ov, h_perm]
+    cases hprot : entry.protector <;>
+      simp [updateBorrowPermOnReadAtProj, Nat.beq_refl, h_for, h_ov, h_perm,
+        isBorrowProtected, hprot, natListContainsBool]
   · intro h_for h_ov h_perm
-    simp [updateBorrowPermOnReadAtProj, Nat.beq_refl, h_for, h_ov, h_perm]
+    cases hprot : entry.protector <;>
+      simp [updateBorrowPermOnReadAtProj, Nat.beq_refl, h_for, h_ov, h_perm,
+        isBorrowProtected, hprot, natListContainsBool]
 
 end Correspondence.V2026_06_01.L4_TreeBorrows
