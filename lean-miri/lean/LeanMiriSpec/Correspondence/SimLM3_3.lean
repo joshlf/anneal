@@ -584,6 +584,74 @@ theorem sim_lm3_3_zst_deref_reborrow_step (bk : BorrowKind) :
   rcases bk with _ | ⟨_ | _⟩ <;>
     exact ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩
 
+/-- `Retag(rk, _2)` where `_2` is a reference (`&pointee` or `&mut pointee`) to
+an arbitrary `pointee : RigidTy`. -/
+def retagPointeeRefBody (rk : RetagKind) (mutability : Mutability)
+    (pointee : RigidTy) : CapturedMir :=
+  witBody "lm_3_3_sim::retag_pointee_ref" 0
+    [declOf unitT, declOf { kind := pointee, layoutIdx := 0 },
+      declOf { kind := .ref mutability pointee, layoutIdx := 0 }]
+    [stmt (.retag rk (loc 2))]
+
+/-- **`sim_lm3_3_retag_uninhabited_ref_ub_step`**: for **every** `RetagKind`,
+reference `Mutability`, initialized local value `val` in `_2` (whether a live
+provenance pointer `.ptr ⟨1, 0⟩ 8` or a non-null dangling scalar `.scalar ⟨8, 8⟩`),
+borrow table `borrows`, protector state `isProtected`, and uninhabited pointee
+`pointee` (`rigidTyIsUninhabited 16 pointee = true`, e.g. `!`, `[!; 1]`,
+`(!, ())`, or `core::convert::Infallible`), `StatementKind.retag rk _2`
+immediately faults with `MirStepNode.fail .ub` rather than treating the
+uninhabited reference as a benign ZST. -/
+theorem sim_lm3_3_retag_uninhabited_ref_ub_step
+    (rk : RetagKind) (mutability : Mutability) (pointee : RigidTy)
+    (val : Value) (borrows : List BorrowEntry) (isProtected : Bool)
+    (huninhab : rigidTyIsUninhabited 16 pointee = true) :
+    stepMirFn (retagPointeeRefBody rk mutability pointee)
+      (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub := by
+  change
+    (match rigidTyIsUninhabited 16 pointee with
+     | true => MirStepNode.fail .ub
+     | false => _) = .fail .ub
+  rw [huninhab]
+
+/-- **`sim_lm3_3_retag_inhabited_never_container_zst_step`**: in contrast to
+`sim_lm3_3_retag_uninhabited_ref_ub_step` on `!` and `[!; 1]`, zero-sized
+containers `[!; 0]` (`.array .never 0`) and `core::marker::PhantomData<!>`
+(`.adt "core::marker::PhantomData" [.never]`) ARE inhabited
+(`rigidTyIsUninhabited 16 = false`) and zero-sized (`rigidTyIsZeroSized 16 = true`),
+so `StatementKind.retag rk _2` across all `4 × 2 = 8` `(rk, mutability)`
+combinations steps cleanly on both provenance pointers (`retagZstRefState`,
+preserving the protected `Unique` sibling `entry 2` and `TreeBorrowsRel`) and
+non-null provenance-free scalar references (`retagZstScalarState true`). -/
+theorem sim_lm3_3_retag_inhabited_never_container_zst_step
+    (rk : RetagKind) (mutability : Mutability) (usePhantom : Bool) :
+    let pointee : RigidTy :=
+      if usePhantom then .adt "core::marker::PhantomData" [.never]
+      else .array .never 0
+    let childPerm := annealRetagPerm (retagKindToAnnealMode rk) mutability true
+    let childProt := match rk with | .fnEntry => some 2 | _ => none
+    let activeProts := match rk with | .fnEntry => [2, 1] | _ => [1]
+    rigidTyIsUninhabited 16 pointee = false ∧
+    rigidTyIsZeroSized 16 pointee = true ∧
+    (∃ s' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability pointee) retagZstRefState = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.ptr ⟨3, 0⟩ 8)) ∧
+      s'.memory.borrows =
+        [entry 3 childPerm (some 1) childProt,
+          entry 2 .unique none (some 1),
+          entry 1 .unique] ∧
+      s'.memory.activeProtectors = activeProts ∧
+      TreeBorrowsRel s'.memory.borrows s'.memory.activeProtectors
+        (basedNormalTree s'.memory.borrows s'.memory.activeProtectors)) ∧
+    (∃ s'' : MachineState,
+      stepMirFn (retagPointeeRefBody rk mutability pointee) (retagZstScalarState true) =
+        .step s'' ∧
+      s''.memory = (retagZstScalarState true).memory ∧
+      get? s''.frame.locals 2 = some (.init (.scalar ⟨8, 8⟩))) := by
+  cases usePhantom <;> cases rk <;> cases mutability <;>
+    exact ⟨rfl, rfl,
+      ⟨_, rfl, rfl, rfl, rfl, ⟨rfl, by decide, rfl, rfl, rfl⟩⟩,
+      ⟨_, rfl, rfl, rfl⟩⟩
+
 /-! ## General 6-State `Miri.Interpreter.Step.step` + `TreeBorrowsRel` Lockstep -/
 
 /-- **`stateRelLM3_2Tree_treeBorrowsRel`**: every `StateRelLM3_2Tree` state

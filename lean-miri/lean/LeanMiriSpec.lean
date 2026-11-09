@@ -119,20 +119,27 @@ import LeanMiriSpec.Audit
   `nodeAccess_locationState_simulation`, `unsafeCell_permission_simulation`,
   `reservedFrz_conflicted_bijection`, `retag_pipeline_simulation`,
   `retagPointerValue_8byte_reference_simulation`,
+  `borrowTree_deallocateBorrowRange_simulation`,
   `machineMemoryHooks_beforeMemoryRead_simulation`,
   `machineMemoryHooks_beforeMemoryWrite_simulation`,
+  `machineMemoryHooks_beforeMemoryDeallocation_simulation`,
   `normalTree_relative_access_simulation`,
   `basedNormalTree_performAccess_parent_child_simulation`,
+  `basedNormalTree_performAccess_three_level_chain_prot_simulation`,
+  `basedNormalTree_performAccess_branching_children_prot_simulation`,
   `rangedNormalTree_performAccessRange_simulation`), and `TreeBorrowsRel`
   (`LM-3.3`, certifying `I-10` & `I-11`).
 * `LeanMiriSpec.Correspondence.SimLM3_3`: end-to-end MIR step simulations of
   dereferencing reads/writes, parent-child hierarchies, `StatementKind.retag`
-  (references, raw pointers, and ZSTs), and general 6-state
+  (references, raw pointers, ZSTs, and uninhabited vs. inhabited `!`-container
+  pointees), deref reborrows, and general 6-state
   `Miri.Interpreter.Step.step` + `TreeBorrowsRel` lockstep (`LM-3.3`).
 * `LeanMiriSpec.Correspondence.WitLM3_3`: real-step safe and undefined-behavior
-  witnesses `(a)..(i)` for reborrow hierarchies, protector conflicts and return
+  witnesses `(a)..(m)` for reborrow hierarchies, protector conflicts and return
   release, protected `Unique` disables, `UnsafeCell` (`Cell` & `ReservedIM`) vs.
-  `Freeze`, non-`fnEntry`/raw retags, and ZST retags (`LM-3.3`).
+  `Freeze`, non-`fnEntry`/raw retags, ZST & uninhabited-reference retags,
+  disjoint vs. overlapping sub-projections, and protected `Cell` chains
+  surviving under `.disabled` ancestors (`LM-3.3`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

@@ -3202,6 +3202,107 @@ def placeIsZeroSized
   | .none => false
 
 /--
+Determine whether a structural `RigidTy` is statically known to be uninhabited
+(`!`, tuples containing an uninhabited element, non-empty arrays `[T; n + 1]`
+of an uninhabited element, closures capturing an uninhabited upvar, or
+`core::convert::Infallible` / `std::convert::Infallible`) in
+`Runtime(PostCleanup)` MIR (`rustc 1.98.0-nightly (14210df0e 2026-05-31)`),
+using bounded recursion with `fuel`.
+
+Zero-length arrays `[T; 0]` and `core::marker::PhantomData<T>` /
+`std::marker::PhantomData<T>` are inhabited (`[]` and `PhantomData`) even when
+`T` is uninhabited (`[!; 0]`, `PhantomData<!>`).
+
+Modeling choice vs. stable Rust Reference: For general user-defined
+`RigidTy.adt` types, uninhabitedness (`TypeLayout.isUninhabited` /
+`VariantsShape.empty`) is stored in `LayoutTable` (`Ty.layoutIdx`) rather than
+on `RigidTy` itself, so `rigidTyIsUninhabited` recognizes
+`core::convert::Infallible` / `std::convert::Infallible` directly and
+conservatively returns `false` on other `RigidTy.adt` constructors
+(`tyIsUninhabited` additionally consults `LayoutTable.lookup`). During MIR
+reference retagging (`evalFnEntryRetag`, `evalNonFnEntryRetag`, and `evalStmt`
+`.retag`), producing or retagging a reference `&T` or `&mut T` whose pointee
+`T` is uninhabited (`rigidTyIsUninhabited 16 pointee = true`) is immediate
+undefined behavior even when `T` has zero byte size (`&!`, `&[!; 1]`,
+`&(!, ())`).
+
+Reference (The Rust Reference, "Never type", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of
+> computations that never complete."
+
+Reference (The Rust Reference, "Behavior considered undefined", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. Producing a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+-/
+@[reducible]
+def rigidTyIsUninhabited : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ _, .never => true
+  | .succ _, .tuple .nil => false
+  | .succ fuel, .tuple (k :: ks) =>
+    Bool.or
+      (rigidTyIsUninhabited fuel k)
+      (rigidTyIsUninhabited fuel (.tuple ks))
+  | .succ _, .array _ .zero => false
+  | .succ fuel, .array elem (.succ _) => rigidTyIsUninhabited fuel elem
+  | .succ _, .closure _ .nil => false
+  | .succ fuel, .closure defPath (u :: us) =>
+    Bool.or
+      (rigidTyIsUninhabited fuel u)
+      (rigidTyIsUninhabited fuel (.closure defPath us))
+  | .succ _, .adt defPath _ =>
+    Bool.or
+      (stringEq defPath "core::convert::Infallible")
+      (stringEq defPath "std::convert::Infallible")
+  | .succ _, _ => false
+
+/--
+Determine whether a `Ty` is uninhabited either structurally
+(`rigidTyIsUninhabited 16 ty.kind`) or via its compiler-captured
+`TypeLayout.isUninhabited` flag in `layouts`.
+
+Reference (The Rust Reference, "Never type", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of
+> computations that never complete."
+-/
+@[reducible]
+def tyIsUninhabited (layouts : LayoutTable) (ty : Ty) : Bool :=
+  match rigidTyIsUninhabited 16 ty.kind with
+  | true => true
+  | false =>
+    match LayoutTable.lookup layouts ty.layoutIdx with
+    | .some l => l.isUninhabited
+    | .none => false
+
+/--
+Determine whether `place`'s resolved type in `localDecls` and `layouts` is
+uninhabited (`tyIsUninhabited`), defaulting to `false` when `localDecls` is
+omitted or does not determine a type for `place`.
+
+Reference (The Rust Reference, "Never type", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/types/never.html>
+
+> "The never type ! is a type with no values, representing the result of
+> computations that never complete."
+-/
+@[reducible]
+def placeIsUninhabited
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (place : Place) :
+    Bool :=
+  match placeTy localDecls layouts place with
+  | .some ty => tyIsUninhabited layouts ty
+  | .none => false
+
+/--
 Determine the initial Tree Borrows permission for a shared borrow (`&place`)
 based on whether `place`'s resolved type in `localDecls` and `layouts` is
 `Freeze`.

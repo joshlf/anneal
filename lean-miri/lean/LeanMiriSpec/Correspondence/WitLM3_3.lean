@@ -59,6 +59,18 @@ one-location Tree Borrows access (`Tree.NormalTreeState.performAccess`) on the
   `&PhantomData<u64>` both skip the 0-byte initial child read via
   `placeIsZeroSized` / `rigidTyIsZeroSized`, preserving a protected `Unique`
   sibling without UB.
+* (l) `wit_lm3_3_uninhabited_ref_retag_ub_vs_inhabited_never_zst_real_steps`:
+  retagging inhabited zero-sized `[!; 0]` and `PhantomData<!>` references
+  succeeds cleanly (`rigidTyIsUninhabited = false`), whereas retagging
+  uninhabited `&!` and `&[!; 1]` references (both provenance pointers and
+  non-null dangling scalars) immediately faults with `.fail .ub`.
+* (m) `wit_lm3_3_protected_cell_chain_under_disabled_root_real_steps`: a
+  3-level interior-mutability chain `[g, c, r]` (`g` protected `Cell`, `c`
+  `Cell`, `r` `Unique`) where a foreign write disables `r` while `c` and
+  protected `g` survive as `Cell` (`borrowListChain3ProtInv = true` while
+  unprotected `treeBorrowsChain3Inv = false`), subsequent foreign writes skip
+  `r`'s subtree in lockstep (`SkipSelfAndChildren`), and a child read through
+  `g` faults in both engines due to its `.disabled` ancestor `r`.
 -/
 
 namespace LeanMiriSpec.Correspondence.WitnessLM3_3
@@ -838,5 +850,158 @@ theorem wit_lm3_3_zst_deref_reborrow_and_phantom_retag_real_steps :
         (basedNormalTree s₇.memory.borrows s₇.memory.activeProtectors) := by
   refine ⟨_, _, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
     rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
+
+/-! ## (l) Uninhabited reference retag UB (`&!`, `&[!; 1]`) vs. inhabited `[!; 0]` / `PhantomData<!>` -/
+
+/-- Inhabited zero-sized never-container witness body:
+```text
+bb0: _2 = &_1;                   // tag 1: Frozen on _1 : [!; 0]
+     Retag([fn entry] _2);       // tag 2: protected Frozen, parent 1 — inhabited ZST!
+     Retag([default] _3);        // _3 : &PhantomData<!> = 0x8 — inhabited ZST dangling!
+     return
+``` -/
+def bodyLInhabited : CapturedMir :=
+  witBody "lm_3_3_witness::inhabited_never_zst" 0
+    [declOf unitT,
+      declOf { kind := .array .never 0, layoutIdx := 0 },
+      refDecl (.array .never 0),
+      refDecl (.adt "core::marker::PhantomData" [.never])]
+    [stmt (.assign (loc 2) (.ref .shared (loc 1))),
+     stmt (.retag .fnEntry (loc 2)),
+     stmt (.retag .default (loc 3))]
+
+/-- Initial state for `bodyLInhabited`: `_1 = []` (`.aggregate 0 []`) and
+`_3 = 0x8 as &PhantomData<!>`. -/
+def initLInhabited : MachineState :=
+  witInit [.uninit, .init (.aggregate 0 []), .uninit, .init (.scalar ⟨8, 8⟩)]
+
+/-- Uninhabited `&!` retag body (`Retag([fn entry] _2)` on `_2 : &!`). -/
+def bodyLNever : CapturedMir :=
+  witBody "lm_3_3_witness::uninhabited_never_ref" 0
+    [declOf unitT, declOf { kind := .never, layoutIdx := 0 }, refDecl .never]
+    [stmt (.retag .fnEntry (loc 2))]
+
+/-- Uninhabited `&[!; 1]` retag body (`Retag([default] _2)` on `_2 : &[!; 1]`). -/
+def bodyLNeverArr1 : CapturedMir :=
+  witBody "lm_3_3_witness::uninhabited_never_arr1_ref" 0
+    [declOf unitT,
+      declOf { kind := .array .never 1, layoutIdx := 0 },
+      refDecl (.array .never 1)]
+    [stmt (.retag .default (loc 2))]
+
+/-- State for `bodyLNever` / `bodyLNeverArr1` with either provenance pointer
+(`useScalar = false`) or non-null aligned dangling scalar `0x8`
+(`useScalar = true`). -/
+def initLUninhabited (useScalar : Bool) : MachineState :=
+  simState
+    [.uninit, .init .unit,
+      .init (if useScalar then .scalar ⟨8, 8⟩ else .ptr ⟨1, 0⟩ 8)]
+    [entry 1 .frozen] false
+
+/-- **(l) `wit_lm3_3_uninhabited_ref_retag_ub_vs_inhabited_never_zst_real_steps`**:
+1. In `bodyLInhabited`, `_1 : [!; 0]` and `_3 : &PhantomData<!>` have inhabited
+   zero-sized pointees (`rigidTyIsUninhabited 16 = false`), so `_2 = &_1`,
+   `Retag([fn entry] _2)`, and `Retag([default] _3)` all step cleanly and
+   establish `TreeBorrowsRel`;
+2. In `bodyLNever` (`&!`) and `bodyLNeverArr1` (`&[!; 1]`), the pointees are
+   uninhabited (`rigidTyIsUninhabited 16 = true`), so `Retag` immediately
+   faults with `.fail .ub` for **both** provenance pointers (`.ptr ⟨1, 0⟩ 8`)
+   and non-null dangling scalars (`.scalar ⟨8, 8⟩`). -/
+theorem wit_lm3_3_uninhabited_ref_retag_ub_vs_inhabited_never_zst_real_steps :
+    (∃ s₁ s₂ s₃ : MachineState,
+      stepMirFn bodyLInhabited initLInhabited = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .frozen] ∧
+      stepMirFn bodyLInhabited s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 .frozen (some 1) (some 1), entry 1 .frozen] ∧
+      s₂.memory.activeProtectors = [1] ∧
+      stepMirFn bodyLInhabited s₂ = .step s₃ ∧
+      s₃.memory = s₂.memory ∧
+      TreeBorrowsRel s₃.memory.borrows s₃.memory.activeProtectors
+        (basedNormalTree s₃.memory.borrows s₃.memory.activeProtectors)) ∧
+    stepMirFn bodyLNever (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyLNever (initLUninhabited true) = .fail .ub ∧
+    stepMirFn bodyLNeverArr1 (initLUninhabited false) = .fail .ub ∧
+    stepMirFn bodyLNeverArr1 (initLUninhabited true) = .fail .ub := by
+  refine ⟨⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl, rfl, rfl, rfl⟩
+
+/-! ## (m) Protected `Cell` 3-level chain surviving under a `.disabled` root (`I-10` & `I-11`) -/
+
+/-- ```text
+bb0: _2 = &mut _1;               // tag 1 (root r): ReservedIM on _1 : UnsafeCell<u32>
+     (*_2) = const 10_u32;       // child write activates tag 1 -> Unique
+     _3 = &(*_2);                // tag 2 (child c): Cell, parent 1
+     Retag([fn entry] _3);       // tag 3 (grandchild g): protected Cell, parent 2, prot 1
+     _1 = const 55_u32;          // foreign write: disables tag 1; tags 2 & 3 survive as Cell!
+     _1 = const 88_u32;          // 2nd foreign write: Miri SkipSelfAndChildren on disabled r!
+     _0 = copy (*_3);            // child read via g: UB because ancestor tag 1 is Disabled!
+     return
+``` -/
+def bodyM : CapturedMir :=
+  witBody "lm_3_3_witness::protected_cell_chain_under_disabled_root" 4
+    [declOf u32T, declOf unsafeCellU32T,
+      refMutDecl unsafeCellU32T.kind, refDecl unsafeCellU32T.kind]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.assign (deref 2) (.use (cU32 10))),
+     stmt (.assign (loc 3) (.ref .shared (deref 2))),
+     stmt (.retag .fnEntry (loc 3)),
+     stmt (.assign (loc 1) (.use (cU32 55))),
+     stmt (.assign (loc 1) (.use (cU32 88))),
+     stmt (.assign (loc 0) (.use (.copy (deref 3))))]
+
+/-- Initial state of `bodyM`: `_1 = 1_u32`. -/
+def initM : MachineState :=
+  witInit [.uninit, .init (.scalar ⟨1, 4⟩), .uninit, .uninit]
+
+/-- **(m) `wit_lm3_3_protected_cell_chain_under_disabled_root_real_steps`**:
+1. Builds the 3-level chain `[entry 3 .cell (some 2) (some 1), entry 2 .cell (some 1),
+   entry 1 .unique]` with `activeProtectors = [1]` (`borrowListChain3ProtInv = true`);
+2. Executes `_1 = const 55_u32` (foreign write): disables unprotected root
+   `entry 1` (`.unique → .disabled`) while `entry 2` (`.cell`) and protected
+   `entry 3` (`.cell`, `protector = some 1`) survive untouched (`I-11`),
+   yielding `[.cell (prot), .cell, .disabled]` where unprotected
+   `treeBorrowsChain3Inv .cell .cell .disabled = false` yet inductive
+   `borrowListChain3ProtInv s₅.memory.borrows [1] = true`;
+3. Executes a second foreign write `_1 = const 88_u32` where Miri's
+   `SkipSelfAndChildren` prunes `.disabled` root `entry 1` in lockstep with
+   Anneal (`Completed` + `TreeBorrowsRel` + `borrowListChain3ProtInv = true`);
+4. Confirms that a subsequent child read `_0 = copy (*_3)` through `entry 3`
+   faults with `.fail .ub` in Anneal and `.TransitionError 2 (.ChildAccessForbidden .Disabled)`
+   in Miri because ancestor `entry 1` at node `2` is `.disabled` (`I-10`). -/
+theorem wit_lm3_3_protected_cell_chain_under_disabled_root_real_steps :
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+      stepMirFn bodyM initM = .step s₁ ∧
+      stepMirFn bodyM s₁ = .step s₂ ∧
+      stepMirFn bodyM s₂ = .step s₃ ∧
+      stepMirFn bodyM s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .cell (some 2) (some 1), entry 2 .cell (some 1), entry 1 .unique] ∧
+      s₄.memory.activeProtectors = [1] ∧
+      borrowListChain3ProtInv s₄.memory.borrows [1] = true ∧
+      stepMirFn bodyM s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 3 .cell (some 2) (some 1), entry 2 .cell (some 1), entry 1 .disabled] ∧
+      treeBorrowsChain3Inv .cell .cell .disabled = false ∧
+      borrowListChain3ProtInv s₅.memory.borrows [1] = true ∧
+      ((basedNormalTree s₄.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₅.memory.borrows [1]
+        ((basedNormalTree s₄.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      stepMirFn bodyM s₅ = .step s₆ ∧
+      s₆.memory.borrows = s₅.memory.borrows ∧
+      ((basedNormalTree s₅.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₆.memory.borrows [1]
+        ((basedNormalTree s₅.memory.borrows [1]).performAccess 3 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      stepMirFn bodyM s₆ = .fail .ub ∧
+      ((basedNormalTree s₆.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 2 (.ChildAccessForbidden .Disabled) := by
+  refine ⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, by decide,
+    rfl, rfl, rfl, by decide, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩,
+    rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩,
+    rfl, by decide⟩
 
 end LeanMiriSpec.Correspondence.WitnessLM3_3

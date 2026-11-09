@@ -944,69 +944,77 @@ def evalFnEntryRetag
   | .some ty =>
     match ty.kind with
     | .ref mutability pointee =>
-      let childPerm := fnEntryRetagPerm mutability pointee
-      let skipInitRead :=
-        match childPerm with
-        | .cell => true
-        | _ => rigidTyIsZeroSized 16 pointee
-      let tag := s.memory.nextTag
-      let readUB :=
-        match skipInitRead with
-        | true => false
-        | false =>
-          hasTreeReadUB
-            s.memory.borrows
-            s.memory.borrows
-            s.memory.activeProtectors
-            parentEntry.targetLocal
-            (.some ptrVal.tag)
-            parentEntry.targetProjection
-            parentEntry.rangeOffset
-            parentEntry.rangeLen
-      match readUB with
+      match rigidTyIsUninhabited 16 pointee with
       | true => MirStepNode.fail .ub
       | false =>
-        let borrowsAfterRead :=
+        let childPerm := fnEntryRetagPerm mutability pointee
+        let skipInitRead :=
+          match childPerm with
+          | .cell => true
+          | _ => rigidTyIsZeroSized 16 pointee
+        let tag := s.memory.nextTag
+        let readUB :=
           match skipInitRead with
-          | true => s.memory.borrows
+          | true => false
           | false =>
-            freezeTreeBorrowsOnReadAtProj
+            hasTreeReadUB
               s.memory.borrows
               s.memory.borrows
+              s.memory.activeProtectors
               parentEntry.targetLocal
               (.some ptrVal.tag)
               parentEntry.targetProjection
               parentEntry.rangeOffset
               parentEntry.rangeLen
-              s.memory.activeProtectors
-        let child : BorrowEntry := {
-          tag := tag
-          targetLocal := parentEntry.targetLocal
-          targetProjection := parentEntry.targetProjection
-          perm := childPerm
-          rangeOffset := parentEntry.rangeOffset
-          rangeLen := parentEntry.rangeLen
-          protector := .some protId
-          parentTag := .some ptrVal.tag
-        }
-        match place.projection with
-        | .nil =>
-          match
-            set? locals' place.local_
-              (.init (.ptr { allocId := tag, offsetBytes := ptrVal.offsetBytes } sz))
-          with
-          | .some locals'' =>
-            MirStepNode.step
-              (advanceStmt
-                s
-                locals''
-                { s.memory with
-                  borrows := child :: borrowsAfterRead
-                  nextTag := Nat.add tag 1
-                  activeProtectors := protId :: s.memory.activeProtectors
-                  nextProtector := Nat.add protId 1 })
-          | .none => MirStepNode.fail .ub
-        | _ :: _ => MirStepNode.unsupported
+        match readUB with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrowsAfterRead :=
+            match skipInitRead with
+            | true => s.memory.borrows
+            | false =>
+              freezeTreeBorrowsOnReadAtProj
+                s.memory.borrows
+                s.memory.borrows
+                parentEntry.targetLocal
+                (.some ptrVal.tag)
+                parentEntry.targetProjection
+                parentEntry.rangeOffset
+                parentEntry.rangeLen
+                s.memory.activeProtectors
+          let child : BorrowEntry := {
+            tag := tag
+            targetLocal := parentEntry.targetLocal
+            targetProjection := parentEntry.targetProjection
+            perm := childPerm
+            rangeOffset := parentEntry.rangeOffset
+            rangeLen := parentEntry.rangeLen
+            protector := .some protId
+            parentTag := .some ptrVal.tag
+          }
+          match place.projection with
+          | .nil =>
+            match
+              set?
+                locals'
+                place.local_
+                (.init
+                  (.ptr
+                    { allocId := tag, offsetBytes := ptrVal.offsetBytes }
+                    sz))
+            with
+            | .some locals'' =>
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals''
+                  { s.memory with
+                    borrows := child :: borrowsAfterRead
+                    nextTag := Nat.add tag 1
+                    activeProtectors := protId :: s.memory.activeProtectors
+                    nextProtector := Nat.add protId 1 })
+            | .none => MirStepNode.fail .ub
+          | _ :: _ => MirStepNode.unsupported
     | _ => attachOnly
 
 /--
@@ -1015,7 +1023,9 @@ Execute a non-function-entry MIR retag (`RetagKind.default`, `.twoPhase`, or
 existing non-disabled `parentEntry`.
 
 When `place` resolves in `localDecls` / `layouts` to a reference `&T` or
-`&mut T`, Miri's `tb_retag_ptr_value` / `tb_reborrow` allocates a fresh
+`&mut T`, an uninhabited `pointee` (`rigidTyIsUninhabited 16 pointee = true`)
+faults immediately with `MirStepNode.fail .ub`; otherwise Miri's
+`tb_retag_ptr_value` / `tb_reborrow` allocates a fresh
 unprotected child tag under `ptrVal.tag` with `retagPerm retagKind mutability
 pointee`, performs an initial child read through `ptrVal.tag` unless the new
 permission is `.cell` (`Permission::associated_access`) or the pointee is
@@ -1046,67 +1056,75 @@ def evalNonFnEntryRetag
   | .some ty =>
     match ty.kind with
     | .ref mutability pointee =>
-      let childPerm := retagPerm retagKind mutability pointee
-      let skipInitRead :=
-        match childPerm with
-        | .cell => true
-        | _ => rigidTyIsZeroSized 16 pointee
-      let tag := s.memory.nextTag
-      let readUB :=
-        match skipInitRead with
-        | true => false
-        | false =>
-          hasTreeReadUB
-            s.memory.borrows
-            s.memory.borrows
-            s.memory.activeProtectors
-            parentEntry.targetLocal
-            (.some ptrVal.tag)
-            parentEntry.targetProjection
-            parentEntry.rangeOffset
-            parentEntry.rangeLen
-      match readUB with
+      match rigidTyIsUninhabited 16 pointee with
       | true => MirStepNode.fail .ub
       | false =>
-        let borrowsAfterRead :=
+        let childPerm := retagPerm retagKind mutability pointee
+        let skipInitRead :=
+          match childPerm with
+          | .cell => true
+          | _ => rigidTyIsZeroSized 16 pointee
+        let tag := s.memory.nextTag
+        let readUB :=
           match skipInitRead with
-          | true => s.memory.borrows
+          | true => false
           | false =>
-            freezeTreeBorrowsOnReadAtProj
+            hasTreeReadUB
               s.memory.borrows
               s.memory.borrows
+              s.memory.activeProtectors
               parentEntry.targetLocal
               (.some ptrVal.tag)
               parentEntry.targetProjection
               parentEntry.rangeOffset
               parentEntry.rangeLen
-              s.memory.activeProtectors
-        let child : BorrowEntry := {
-          tag := tag
-          targetLocal := parentEntry.targetLocal
-          targetProjection := parentEntry.targetProjection
-          perm := childPerm
-          rangeOffset := parentEntry.rangeOffset
-          rangeLen := parentEntry.rangeLen
-          protector := .none
-          parentTag := .some ptrVal.tag
-        }
-        match place.projection with
-        | .nil =>
-          match
-            set? locals' place.local_
-              (.init (.ptr { allocId := tag, offsetBytes := ptrVal.offsetBytes } sz))
-          with
-          | .some locals'' =>
-            MirStepNode.step
-              (advanceStmt
-                s
-                locals''
-                { s.memory with
-                  borrows := child :: borrowsAfterRead
-                  nextTag := Nat.add tag 1 })
-          | .none => MirStepNode.fail .ub
-        | _ :: _ => MirStepNode.unsupported
+        match readUB with
+        | true => MirStepNode.fail .ub
+        | false =>
+          let borrowsAfterRead :=
+            match skipInitRead with
+            | true => s.memory.borrows
+            | false =>
+              freezeTreeBorrowsOnReadAtProj
+                s.memory.borrows
+                s.memory.borrows
+                parentEntry.targetLocal
+                (.some ptrVal.tag)
+                parentEntry.targetProjection
+                parentEntry.rangeOffset
+                parentEntry.rangeLen
+                s.memory.activeProtectors
+          let child : BorrowEntry := {
+            tag := tag
+            targetLocal := parentEntry.targetLocal
+            targetProjection := parentEntry.targetProjection
+            perm := childPerm
+            rangeOffset := parentEntry.rangeOffset
+            rangeLen := parentEntry.rangeLen
+            protector := .none
+            parentTag := .some ptrVal.tag
+          }
+          match place.projection with
+          | .nil =>
+            match
+              set?
+                locals'
+                place.local_
+                (.init
+                  (.ptr
+                    { allocId := tag, offsetBytes := ptrVal.offsetBytes }
+                    sz))
+            with
+            | .some locals'' =>
+              MirStepNode.step
+                (advanceStmt
+                  s
+                  locals''
+                  { s.memory with
+                    borrows := child :: borrowsAfterRead
+                    nextTag := Nat.add tag 1 })
+            | .none => MirStepNode.fail .ub
+          | _ :: _ => MirStepNode.unsupported
     | _ => MirStepNode.step (advanceStmt s locals')
 
 /--
@@ -1182,17 +1200,20 @@ def evalStmt
         | .raw => MirStepNode.step (advanceStmt s locals')
         | .default | .twoPhase | .fnEntry => MirStepNode.fail .ub
       | .some { kind := .ref _ pointee, .. } =>
-        match val with
-        | .ptr ptrVal sz => retagPtrVal ptrVal sz true
-        | .scalar sc =>
-          match
-            Bool.and
-              (rigidTyIsZeroSized 16 pointee)
-              (Bool.not (Nat.beq sc.bits 0))
-          with
-          | true => MirStepNode.step (advanceStmt s locals')
-          | false => MirStepNode.fail .ub
-        | _ => MirStepNode.fail .ub
+        match rigidTyIsUninhabited 16 pointee with
+        | true => MirStepNode.fail .ub
+        | false =>
+          match val with
+          | .ptr ptrVal sz => retagPtrVal ptrVal sz true
+          | .scalar sc =>
+            match
+              Bool.and
+                (rigidTyIsZeroSized 16 pointee)
+                (Bool.not (Nat.beq sc.bits 0))
+            with
+            | true => MirStepNode.step (advanceStmt s locals')
+            | false => MirStepNode.fail .ub
+          | _ => MirStepNode.fail .ub
       | .none =>
         match val with
         | .ptr ptrVal sz => retagPtrVal ptrVal sz false
