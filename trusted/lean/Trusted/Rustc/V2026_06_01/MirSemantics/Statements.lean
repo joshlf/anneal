@@ -864,6 +864,63 @@ def evalCopyNonOverlapping
       | .ok _ _ => MirStepNode.fail .ub
 
 /--
+Determine whether a structural `RigidTy` is statically known to have zero byte
+size (`()`, nested zero-sized tuples, zero-length arrays `[T; 0]`, arrays of
+zero-sized elements, or `fn` item types) in `Runtime(PostCleanup)` MIR on a
+64-bit target (`rustc 1.98.0-nightly (14210df0e 2026-05-31)`), using bounded
+recursion with `fuel`.
+
+Modeling choice vs. stable Rust Reference: For `RigidTy.adt` types, byte size is
+stored in `LayoutTable` (`Ty.layoutIdx`) rather than on `RigidTy` itself, so
+`rigidTyIsZeroSized` conservatively returns `false` on `RigidTy.adt` and
+identifies structural zero-sized pointee `RigidTy`s directly. During reference
+retagging (`evalFnEntryRetag`, `evalNonFnEntryRetag`, and `evalStmt` `.retag`),
+a zero-sized pointee covers an empty `[offset, offset + 0)` byte range, so Miri
+and MiniRust perform zero initial read accesses and accept non-null
+provenance-free dangling references without allocating a tag.
+
+Reference (The Rust Reference, "Type Layout", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#size-and-alignment>
+
+> "The size of a value is the offset in bytes between successive elements in an
+> array with that item type including alignment padding."
+
+Reference (MiniRust `spec/mem/tree_borrows/memory.md` at commit
+`5f78e227bbe30ae9fb5e1286a772d91a92e3622a`):
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L81-L86>
+<https://github.com/minirust/minirust/blob/5f78e227bbe30ae9fb5e1286a772d91a92e3622a/spec/mem/tree_borrows/memory.md#L116-L123>
+
+> "let Some((alloc_id, parent_path)) = ptr.provenance else {
+>     assert!(pointee_size.is_zero());
+>     // Pointers without provenance cannot access any memory, so giving them a new
+>     // tag makes no sense.
+>     return ret(ptr);
+> };"
+>
+> "// Perform a read access on all bytes inside the pointee whose permission requires such an access.
+> for (idx, perm) in settings.inside.iter().enumerate() {
+>     let idx = Int::from(idx); // FIXME: we need a version of `enumerate` that yields `Int`s.
+>     let idx = Size::from_bytes(idx).unwrap();
+>     if let Some(access) = perm.init_access() {
+>         allocation.extra.root.access(Some(child_path), access, offset+idx, Offset::from_bytes_const(1))?
+>     }
+> }"
+-/
+@[reducible]
+def rigidTyIsZeroSized : Nat → RigidTy → Bool
+  | .zero, _ => false
+  | .succ _, .tuple .nil => true
+  | .succ fuel, .tuple (k :: ks) =>
+    Bool.and (rigidTyIsZeroSized fuel k) (rigidTyIsZeroSized fuel (.tuple ks))
+  | .succ _, .array _ .zero => true
+  | .succ fuel, .array elem _ => rigidTyIsZeroSized fuel elem
+  | .succ _, .fnDef _ _ => true
+  | .succ _, k =>
+    match rigidTyKindByteSize k with
+    | .some .zero => true
+    | _ => false
+
+/--
 Execute a function-entry retag (`RetagKind::FnEntry`) of the reference stored
 in `place`, whose current value is `.ptr ptrVal sz` with live borrow entry
 `parentEntry`, after `evalOperand` produced `locals'`.
@@ -873,9 +930,10 @@ creates a fresh protected child tag exactly as Miri's `tb_reborrow` does:
 1. allocate tag `s.memory.nextTag` and protector `s.memory.nextProtector`;
 2. choose the child's permission with `fnEntryRetagPerm` (`.frozen` or
    `.cell` for shared references, `.reservedFrz false` for mutable ones);
-3. unless the child is `.cell` (whose associated access is `None`), perform
-   the initial child read through the parent's tag, rejecting it when it is
-   undefined behavior (`hasTreeReadUB`) and otherwise applying the foreign-read
+3. unless the child is `.cell` (whose associated access is `None`) or the
+   pointee is zero-sized (`rigidTyIsZeroSized 16 pointee`), perform the initial
+   child read through the parent's tag, rejecting it when it is undefined
+   behavior (`hasTreeReadUB`) and otherwise applying the foreign-read
    transitions with the active protectors (`freezeTreeBorrowsOnReadAtProj`);
 4. insert the child with `parentTag := .some ptrVal.tag` and the new
    protector, activate the protector, and store the retagged pointer back into
@@ -944,11 +1002,15 @@ def evalFnEntryRetag
     match ty.kind with
     | .ref mutability pointee =>
       let childPerm := fnEntryRetagPerm mutability pointee
+      let skipInitRead :=
+        match childPerm with
+        | .cell => true
+        | _ => rigidTyIsZeroSized 16 pointee
       let tag := s.memory.nextTag
       let readUB :=
-        match childPerm with
-        | .cell => false
-        | _ =>
+        match skipInitRead with
+        | true => false
+        | false =>
           hasTreeReadUB
             s.memory.borrows
             s.memory.borrows
@@ -962,9 +1024,9 @@ def evalFnEntryRetag
       | true => MirStepNode.fail .ub
       | false =>
         let borrowsAfterRead :=
-          match childPerm with
-          | .cell => s.memory.borrows
-          | _ =>
+          match skipInitRead with
+          | true => s.memory.borrows
+          | false =>
             freezeTreeBorrowsOnReadAtProj
               s.memory.borrows
               s.memory.borrows
@@ -1013,9 +1075,10 @@ When `place` resolves in `localDecls` / `layouts` to a reference `&T` or
 `&mut T`, Miri's `tb_retag_ptr_value` / `tb_reborrow` allocates a fresh
 unprotected child tag under `ptrVal.tag` with `retagPerm retagKind mutability
 pointee`, performs an initial child read through `ptrVal.tag` unless the new
-permission is `.cell` (`Permission::associated_access`), and writes the new
-provenance back into `place`. When `place`'s type is unknown or non-reference,
-falls back to advancing without creating a child tag.
+permission is `.cell` (`Permission::associated_access`) or the pointee is
+zero-sized (`rigidTyIsZeroSized 16 pointee`), and writes the new provenance
+back into `place`. When `place`'s type is unknown or non-reference, falls back
+to advancing without creating a child tag.
 
 Reference (Miri Tree Borrows implementation,
 `src/borrow_tracker/tree_borrows/mod.rs` at Miri commit
@@ -1041,11 +1104,15 @@ def evalNonFnEntryRetag
     match ty.kind with
     | .ref mutability pointee =>
       let childPerm := retagPerm retagKind mutability pointee
+      let skipInitRead :=
+        match childPerm with
+        | .cell => true
+        | _ => rigidTyIsZeroSized 16 pointee
       let tag := s.memory.nextTag
       let readUB :=
-        match childPerm with
-        | .cell => false
-        | _ =>
+        match skipInitRead with
+        | true => false
+        | false =>
           hasTreeReadUB
             s.memory.borrows
             s.memory.borrows
@@ -1059,9 +1126,9 @@ def evalNonFnEntryRetag
       | true => MirStepNode.fail .ub
       | false =>
         let borrowsAfterRead :=
-          match childPerm with
-          | .cell => s.memory.borrows
-          | _ =>
+          match skipInitRead with
+          | true => s.memory.borrows
+          | false =>
             freezeTreeBorrowsOnReadAtProj
               s.memory.borrows
               s.memory.borrows
@@ -1147,31 +1214,50 @@ def evalStmt
         s.memory.callerLocals
     with
     | .ok val locals' =>
-      let isRawPtrTy :=
-        match placeTy localDecls layouts place with
-        | .some { kind := .rawPtr _ _, .. } => true
-        | _ => false
-      match isRawPtrTy with
-      | true =>
+      let retagPtrVal (ptrVal : ProvenancePtr) (sz : Nat) (allowGlobal : Bool) : MirStepNode :=
+        match lookupBorrow s.memory.borrows ptrVal.tag with
+        | .some entry =>
+          match entry.perm with
+          | .disabled => MirStepNode.fail .ub
+          | _ =>
+            match retagKind with
+            | .fnEntry =>
+              evalFnEntryRetag s localDecls layouts place ptrVal sz entry locals'
+            | .default | .twoPhase | .raw =>
+              evalNonFnEntryRetag
+                retagKind s localDecls layouts place ptrVal sz entry locals'
+        | .none =>
+          match allowGlobal with
+          | true =>
+            match lookupGlobalAlloc s.memory.globals ptrVal.allocId with
+            | .some _ => MirStepNode.step (advanceStmt s locals')
+            | .none => MirStepNode.fail .ub
+          | false => MirStepNode.fail .ub
+      match placeTy localDecls layouts place with
+      | .some { kind := .rawPtr _ _, .. } =>
         match retagKind with
         | .raw => MirStepNode.step (advanceStmt s locals')
         | .default | .twoPhase | .fnEntry => MirStepNode.fail .ub
-      | false =>
+      | .some { kind := .ref _ pointee, .. } =>
         match val with
-        | .ptr ptrVal sz =>
-          match lookupBorrow s.memory.borrows ptrVal.tag with
-          | .some entry =>
-            match entry.perm with
-            | .disabled => MirStepNode.fail .ub
-            | _ =>
-              match retagKind with
-              | .fnEntry =>
-                evalFnEntryRetag s localDecls layouts place ptrVal sz entry locals'
-              | .default | .twoPhase | .raw =>
-                evalNonFnEntryRetag
-                  retagKind s localDecls layouts place ptrVal sz entry locals'
-          | .none => MirStepNode.fail .ub
+        | .ptr ptrVal sz => retagPtrVal ptrVal sz true
+        | .scalar sc =>
+          match
+            Bool.and
+              (rigidTyIsZeroSized 16 pointee)
+              (Bool.not (Nat.beq sc.bits 0))
+          with
+          | true => MirStepNode.step (advanceStmt s locals')
+          | false => MirStepNode.fail .ub
         | _ => MirStepNode.fail .ub
+      | .none =>
+        match val with
+        | .ptr ptrVal sz => retagPtrVal ptrVal sz false
+        | _ => MirStepNode.fail .ub
+      | .some _ =>
+        match val with
+        | .ptr ptrVal sz => retagPtrVal ptrVal sz true
+        | _ => MirStepNode.step (advanceStmt s locals')
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
   | .storageLive loc =>

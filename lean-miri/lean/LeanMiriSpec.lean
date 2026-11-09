@@ -112,22 +112,27 @@ import LeanMiriSpec.Audit
   (`evalRvalue_reborrow_simulation`), and the dangling-reborrow divergence.
 * `LeanMiriSpec.Correspondence.WitLM3_2`: `LM-3.2` witnesses, including end-to-end
   runs of `ValidityVisitor.validatePlace`.
-* `LeanMiriSpec.Correspondence.TreeBorrowsRel`: the exact six-state bijection
-  between Anneal's `TreeBorrowPerm` and `Miri.TreeBorrows.Permission`
-  (`TreeBorrowsBijection`), per-node and per-location transition lockstep
-  (`performAccess_permission_simulation`,
-  `nodeAccess_locationState_simulation`), interior mutability and the protector
-  conflict latch (`unsafeCell_permission_simulation`,
-  `reservedFrz_conflicted_bijection`), retag policy correspondence
-  (`retag_pipeline_simulation`), the `I-10` `parentTag`/ancestor-path
-  classification (`normalTree_relative_access_simulation`), and the
-  `TreeBorrowsRel` relation to `lean-miri` one-location trees (`LM-3.3`).
+* `LeanMiriSpec.Correspondence.TreeBorrowsRel`: exact six-state bijection
+  (`TreeBorrowsBijection`), per-node, `LocationState`, `BorrowTree`,
+  `RetagPipeline`, `MachineMemoryHooks`, `NormalTreeState`, and
+  `RangedNormalTreeState` correspondence (`performAccess_permission_simulation`,
+  `nodeAccess_locationState_simulation`, `unsafeCell_permission_simulation`,
+  `reservedFrz_conflicted_bijection`, `retag_pipeline_simulation`,
+  `retagPointerValue_8byte_reference_simulation`,
+  `machineMemoryHooks_beforeMemoryRead_simulation`,
+  `machineMemoryHooks_beforeMemoryWrite_simulation`,
+  `normalTree_relative_access_simulation`,
+  `basedNormalTree_performAccess_parent_child_simulation`,
+  `rangedNormalTree_performAccessRange_simulation`), and `TreeBorrowsRel`
+  (`LM-3.3`, certifying `I-10` & `I-11`).
 * `LeanMiriSpec.Correspondence.SimLM3_3`: end-to-end MIR step simulations of
-  dereferencing reads and writes against `lean-miri`'s normal-tree accesses,
-  exhaustive over all six permissions and both protector settings (`LM-3.3`).
+  dereferencing reads/writes, parent-child hierarchies, `StatementKind.retag`
+  (references, raw pointers, and ZSTs), and general 6-state
+  `Miri.Interpreter.Step.step` + `TreeBorrowsRel` lockstep (`LM-3.3`).
 * `LeanMiriSpec.Correspondence.WitLM3_3`: real-step safe and undefined-behavior
-  witnesses for reborrow hierarchies, protector conflicts, protected `Unique`
-  disables, and `UnsafeCell` vs. `Freeze` shared borrows (`LM-3.3`).
+  witnesses `(a)..(i)` for reborrow hierarchies, protector conflicts and return
+  release, protected `Unique` disables, `UnsafeCell` (`Cell` & `ReservedIM`) vs.
+  `Freeze`, non-`fnEntry`/raw retags, and ZST retags (`LM-3.3`).
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

@@ -32,6 +32,23 @@ one-location Tree Borrows access (`Tree.NormalTreeState.performAccess`) on the
   `Cell`, survives a foreign write, and still permits a child read, whereas
   `&u32` gets `Frozen`, is disabled by the same foreign write, and the
   subsequent child read is undefined behavior in both (certifying `I-11`).
+* (e) `wit_lm3_3_reservedIM_lifecycle_real_steps`: `&mut UnsafeCell<u32>` starts
+  in `ReservedIM`, survives foreign writes before activation, activates to
+  `Unique` on child write, and is disabled by subsequent foreign writes.
+* (f) `wit_lm3_3_cell_reborrow_preserves_unique_real_steps`: shared deref
+  reborrow `&(*_2)` on `&UnsafeCell<u32>` creates `Cell` without performing an
+  initial read, preserving a sibling `Unique` borrow.
+* (g) `wit_lm3_3_protector_release_on_return_real_steps`: `TerminatorKind.return_`
+  releases active function-entry protectors so a conflicted `ReservedFrz true`
+  borrow can subsequently activate to `Unique` in the caller.
+* (h) `wit_lm3_3_non_fnEntry_retag_and_raw_retag_real_steps`: `Retag([default])`,
+  `Retag([2phase])`, and `Retag([raw])` on a provenance-free scalar raw pointer,
+  followed by 3-level ancestor activation.
+* (i) `wit_lm3_3_zst_retag_skips_read_and_dangling_scalar_real_steps`:
+  `Retag([fn entry])` on zero-sized `&()` skips the 0-byte initial read (so a
+  protected `Unique` sibling survives without UB), and `Retag([default])` on a
+  non-null provenance-free dangling `&()` steps cleanly while null `&()` faults
+  with `.fail .ub`.
 -/
 
 namespace LeanMiriSpec.Correspondence.WitnessLM3_3
@@ -550,5 +567,82 @@ theorem wit_lm3_3_non_fnEntry_retag_and_raw_retag_real_steps :
           .VisitChildrenOfAccessed).tree := by
   refine ⟨_, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
     rfl, rfl, rfl, by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩
+
+/-! ## (i) Zero-sized `&()` retag skips initial read + provenance-free dangling `&()` -/
+
+/-- ```text
+bb0: _2 = &mut _1;               // tag 1: ReservedFrz false on _1 : ()
+     Retag([fn entry] _2);       // tag 2: protected ReservedFrz false, parent 1
+     (*_2) = copy _1;            // child write activates tags 2 & 1 to Unique (tag 2 protected!)
+     _3 = &_1;                   // tag 3: Frozen on _1 : ()
+     Retag([fn entry] _3);       // tag 4: protected Frozen, parent 3 — 0-byte ZST skips read!
+     Retag([default] _4);        // _4 : &() = 0x8 (non-null dangling ZST ref) -> steps cleanly!
+     return
+``` -/
+def bodyI : CapturedMir :=
+  witBody "lm_3_3_witness::zst_retag_and_dangling_scalar" 0
+    [declOf { kind := .tuple [], layoutIdx := 0 },
+      declOf { kind := .tuple [], layoutIdx := 0 },
+      refMutDecl (.tuple []),
+      refDecl (.tuple []), refDecl (.tuple [])]
+    [stmt (.assign (loc 2) (.ref (.mut false) (loc 1))),
+     stmt (.retag .fnEntry (loc 2)),
+     stmt (.assign (deref 2) (.use (.copy (loc 1)))),
+     stmt (.assign (loc 3) (.ref .shared (loc 1))),
+     stmt (.retag .fnEntry (loc 3)),
+     stmt (.retag .default (loc 4))]
+
+/-- Initial state of `bodyI` with `_1 = ()` and `_4 = 0x8 as &()` (non-null
+provenance-free dangling ZST reference, e.g. `NonNull::<()>::dangling().as_ref()`). -/
+def initI : MachineState :=
+  witInit [.uninit, .init .unit, .uninit, .uninit, .init (.scalar ⟨8, 8⟩)]
+
+/-- Null-reference variant of `initI` at `stmtIdx = 5` (`_4 = 0x0 as &()`). -/
+def initINullAt5 : MachineState :=
+  { frame :=
+      { blockIdx := 0
+        stmtIdx := 5
+        locals := [.uninit, .init .unit, .uninit, .uninit, .init (.scalar ⟨0, 8⟩)] }
+    memory := emptyMemory }
+
+/-- **(i) `wit_lm3_3_zst_retag_skips_read_and_dangling_scalar_real_steps`**:
+1. `_2 = &mut _1`, `Retag([fn entry] _2)`, and `(*_2) = copy _1` activate
+   protected child tag `2` (`protector = some 1`, `activeProtectors = [1]`) and
+   parent tag `1` to `Unique` on `_1 : ()`;
+2. `_3 = &_1` creates shared `Frozen` tag `3`, and `Retag([fn entry] _3)`
+   allocates protected `Frozen` child tag `4` (`parentTag = some 3`,
+   `protector = some 2`) while **skipping** the 0-byte initial child read — so
+   the protected `Unique` sibling tag `2` survives untouched without triggering
+   `ProtectedDisabled` UB (contrasting with 8-byte `bodyC`);
+3. `Retag([default] _4)` on the non-null provenance-free scalar ZST reference
+   `_4 = .scalar ⟨8, 8⟩` steps cleanly without allocating a tag (`nextTag = 5`),
+   whereas a null scalar ZST reference (`initINullAt5`, `_4 = .scalar ⟨0, 8⟩`)
+   faults with `.fail .ub`. -/
+theorem wit_lm3_3_zst_retag_skips_read_and_dangling_scalar_real_steps :
+    (∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+      stepMirFn bodyI initI = .step s₁ ∧
+      s₁.memory.borrows = [entry 1 .reserved] ∧
+      stepMirFn bodyI s₁ = .step s₂ ∧
+      s₂.memory.borrows = [entry 2 (.reservedFrz false) (some 1) (some 1), entry 1 .reserved] ∧
+      stepMirFn bodyI s₂ = .step s₃ ∧
+      s₃.memory.borrows = [entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyI s₃ = .step s₄ ∧
+      s₄.memory.borrows =
+        [entry 3 .frozen, entry 2 .unique (some 1) (some 1), entry 1 .unique] ∧
+      stepMirFn bodyI s₄ = .step s₅ ∧
+      s₅.memory.borrows =
+        [entry 4 .frozen (some 3) (some 2),
+          entry 3 .frozen,
+          entry 2 .unique (some 1) (some 1),
+          entry 1 .unique] ∧
+      s₅.memory.activeProtectors = [2, 1] ∧
+      s₅.memory.nextTag = 5 ∧
+      stepMirFn bodyI s₅ = .step s₆ ∧
+      s₆.memory = s₅.memory ∧
+      TreeBorrowsRel s₆.memory.borrows s₆.memory.activeProtectors
+        (basedNormalTree s₆.memory.borrows s₆.memory.activeProtectors)) ∧
+    stepMirFn bodyI initINullAt5 = .fail .ub := by
+  refine ⟨⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+      rfl, rfl, rfl, rfl, ⟨by decide, by decide, rfl, rfl, rfl⟩⟩, rfl⟩
 
 end LeanMiriSpec.Correspondence.WitnessLM3_3

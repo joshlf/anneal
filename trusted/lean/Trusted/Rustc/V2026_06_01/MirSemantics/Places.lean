@@ -691,8 +691,7 @@ again by later foreign accesses.
 
 Reference (Miri Tree Borrows implementation,
 `src/borrow_tracker/tree_borrows/tree.rs` at Miri commit
-`7fa591d7d4dd9af8154becbc8332f8096f8323b1`, mirrored by `skipIfKnownNoop` in
-`lean-miri/vendor/Miri/TreeBorrows/LocationState.lean`):
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
 <https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/tree.rs#L130-L162>
 
 > "fn perform_access(

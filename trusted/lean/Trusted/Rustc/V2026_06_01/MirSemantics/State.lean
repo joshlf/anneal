@@ -143,8 +143,7 @@ function over these states is `treeBorrowPermTransition` in `Places.lean`.
 
 Reference (Miri Tree Borrows implementation,
 `src/borrow_tracker/tree_borrows/perms.rs` at Miri commit
-`7fa591d7d4dd9af8154becbc8332f8096f8323b1`, the revision pinned by
-`lean-miri/UPSTREAM_PIN.json`):
+`7fa591d7d4dd9af8154becbc8332f8096f8323b1`):
 <https://github.com/rust-lang/miri/blob/7fa591d7d4dd9af8154becbc8332f8096f8323b1/src/borrow_tracker/tree_borrows/perms.rs#L10-L53>
 
 > "enum PermissionPriv {

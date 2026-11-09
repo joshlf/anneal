@@ -18,7 +18,7 @@ Relates Anneal's Tree Borrows permissions (`TreeBorrowPerm`, `BorrowEntry`, and
 the per-node transition `treeBorrowPermTransition` /
 `treeBorrowNodeAccess` in `Trusted.Rustc.V2026_06_01.MirSemantics`) to the
 vendored `lean-miri` port of Miri's Tree Borrows
-(`Miri/TreeBorrows/{Permissions,LocationState,Traversal,NormalTree,RetagPolicy}`).
+(`Miri/TreeBorrows/{Permissions,LocationState,Traversal,NormalTree,RangedNormalTree,TreeState,RetagPipeline,MachineMemoryHooks}`).
 
 * `annealPermToMiri` / `miriPermToAnneal` and `TreeBorrowsBijection`: the exact
   bijection between Anneal's six states and `Miri.TreeBorrows.Permission`
@@ -34,15 +34,29 @@ vendored `lean-miri` port of Miri's Tree Borrows
 * `unsafeCell_permission_simulation` (`I-11`) and
   `reservedFrz_conflicted_bijection`: the interior-mutability states and the
   protector conflict latch.
-* `retag_pipeline_simulation`: Anneal's initial-permission choices for
-  default, two-phase, raw, and function-entry retags are Miri's
-  `RetagPolicy.create` choices, and the initial location state Miri builds for
-  them is the accessed (or, for `Cell`, lazy) state Anneal's entry stands for.
-* `TreeBorrowsRel` and `normalTree_relative_access_simulation` (`I-10`):
-  Anneal's `parentTag` ancestor walk (`isBorrowDescendantOrSelf`) computes
-  exactly the ancestor path Miri's tree visitor (`TraversalTree.ancestorPath`)
-  marks as `LocalAccess`, and every Anneal per-entry tree update is the
-  corresponding Miri location transition.
+* `retag_pipeline_simulation`, `borrowTree_newChild_reference_simulation`,
+  `retagPointerValue_rawPointer_simulation`,
+  `retagPointerValue_zst_reference_simulation`,
+  `retagPointerValue_cell_8byte_simulation`,
+  `retagPointerValue_8byte_reference_simulation`,
+  `borrowTree_performNormalAccessAt_simulation`,
+  `borrowTree_performBorrowAccessRange_simulation`,
+  `machineMemoryHooks_beforeMemoryRead_simulation`, and
+  `machineMemoryHooks_beforeMemoryWrite_simulation`: operational correspondence
+  across `RetagPolicy.create`, `BorrowTree.newChild`,
+  `RetagPipeline.retagPointerValue`, `BorrowTree.performNormalAccessAt`,
+  `BorrowTree.performBorrowAccessRange`, and `MachineMemoryHooks`.
+* `TreeBorrowsRel`, `normalTree_relative_access_simulation` (`I-10`),
+  `freezeTreeBorrowsOnReadAtProj_locationState_simulation`,
+  `invalidateTreeBorrowsAtProj_locationState_simulation`,
+  `byteRangesOverlapBool_iff`, `borrowEntryOverlapsWrite_iff`,
+  `basedNormalTree_performAccess_singleton_simulation`,
+  `basedNormalTree_performAccess_parent_child_simulation`,
+  `basedNormalTree_performAccess_siblings_simulation`, and
+  `rangedNormalTree_performAccessRange_simulation`: `parentTag` ancestor-path
+  classification, byte-range / sub-place overlap gating, general borrow-table
+  preservation, multi-node `NormalTreeState.performAccess` lockstep, and
+  `RangedNormalTreeState.performAccessRange` delegation.
 -/
 
 namespace LeanMiriSpec.Correspondence
@@ -3709,6 +3723,750 @@ theorem invalidateTreeBorrowsAtProj_locationState_simulation
     ?_⟩
   rw [hget']
   exact hsim
+
+/-! ## 10. Sub-Place / Byte-Range Overlap & Multi-Node `NormalTreeState.performAccess` Lockstep -/
+
+private theorem nat_beq_eq_false_of_ne {a b : Nat} (h : a ≠ b) :
+    Nat.beq a b = false := by
+  cases hb : Nat.beq a b with
+  | false => rfl
+  | true => exact absurd (Nat.eq_of_beq_eq_true hb) h
+
+private theorem nat_beq_eq_false_iff_ne (a b : Nat) :
+    Nat.beq a b = false ↔ a ≠ b :=
+  ⟨fun h heq => by subst heq; simp at h, nat_beq_eq_false_of_ne⟩
+
+/-- **`byteRangesOverlapBool_iff`**: Anneal's `byteRangesOverlapBool` is exact
+non-empty intersection of positive half-open byte intervals
+`[offA, offA + lenA) ∩ [offB, offB + lenB) ≠ ∅`. -/
+theorem byteRangesOverlapBool_iff (offA lenA offB lenB : Nat) :
+    byteRangesOverlapBool offA lenA offB lenB = true ↔
+      0 < lenA ∧ 0 < lenB ∧ offA < offB + lenB ∧ offB < offA + lenA := by
+  unfold byteRangesOverlapBool
+  simp only [Bool.and_eq_true, Bool.not_eq_true', nat_beq_eq_false_iff_ne,
+    Nat.ble_eq, Nat.add_eq]
+  omega
+
+/-- **`borrowEntryOverlapsWrite_iff`**: when both the access and `entry` carry
+positive byte lengths, `borrowEntryOverlapsWrite` decides exact half-open byte
+interval intersection; otherwise it delegates to structural `projectionsOverlap`
+(`Places.lean`). -/
+theorem borrowEntryOverlapsWrite_iff
+    (entry : BorrowEntry) (writeProj : List ProjectionElem)
+    (writeRangeOff writeRangeLen : Nat) :
+    borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = true ↔
+      if 0 < writeRangeLen ∧ 0 < entry.rangeLen then
+        entry.rangeOffset < writeRangeOff + writeRangeLen ∧
+          writeRangeOff < entry.rangeOffset + entry.rangeLen
+      else
+        projectionsOverlap entry.targetProjection writeProj = true := by
+  unfold borrowEntryOverlapsWrite
+  by_cases hr : 0 < writeRangeLen ∧ 0 < entry.rangeLen
+  · have h1 : Bool.not (Nat.beq writeRangeLen 0) = true := by
+      simp only [Bool.not_eq_true', nat_beq_eq_false_iff_ne]; omega
+    have h2 : Bool.not (Nat.beq entry.rangeLen 0) = true := by
+      simp only [Bool.not_eq_true', nat_beq_eq_false_iff_ne]; omega
+    simp only [h1, h2, Bool.and_self, hr, true_and, and_self, ↓reduceIte,
+      byteRangesOverlapBool_iff]
+  · have hb :
+        Bool.and (Bool.not (Nat.beq writeRangeLen 0)) (Bool.not (Nat.beq entry.rangeLen 0)) =
+          false := by
+      cases hw : Nat.beq writeRangeLen 0 <;> cases he : Nat.beq entry.rangeLen 0
+      · exfalso
+        have hw0 : writeRangeLen ≠ 0 := (nat_beq_eq_false_iff_ne _ _).mp hw
+        have he0 : entry.rangeLen ≠ 0 := (nat_beq_eq_false_iff_ne _ _).mp he
+        exact hr ⟨Nat.pos_of_ne_zero hw0, Nat.pos_of_ne_zero he0⟩
+      · rfl
+      · rfl
+      · rfl
+    simp only [hb, hr, ↓reduceIte]
+
+/-- **`borrowEntryReadUB_of_disjoint`**: a read on another local or a disjoint
+projection / byte range never triggers undefined behavior at `entry`. -/
+theorem borrowEntryReadUB_of_disjoint
+    (allBorrows : List BorrowEntry) (activeProtectors : List Nat)
+    (entry : BorrowEntry) (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (hdisj : entry.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = false) :
+    borrowEntryReadUB allBorrows activeProtectors entry targetLocal readerTag
+      readProj readRangeOff readRangeLen = false := by
+  unfold borrowEntryReadUB
+  rcases hdisj with hloc | hov
+  · rw [nat_beq_eq_false_of_ne hloc]
+  · cases Nat.beq entry.targetLocal targetLocal
+    · rfl
+    · rw [hov]
+
+/-- **`updateBorrowPermOnReadAtProj_of_disjoint`**: a read on another local or a
+disjoint projection / byte range leaves `entry` unchanged. -/
+theorem updateBorrowPermOnReadAtProj_of_disjoint
+    (allBorrows : List BorrowEntry) (entry : BorrowEntry)
+    (targetLocal : Local) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hdisj : entry.targetLocal ≠ targetLocal ∨
+      borrowEntryOverlapsWrite entry readProj readRangeOff readRangeLen = false) :
+    updateBorrowPermOnReadAtProj allBorrows entry targetLocal readerTag
+      readProj readRangeOff readRangeLen activeProtectors = entry := by
+  unfold updateBorrowPermOnReadAtProj
+  rcases hdisj with hloc | hov
+  · rw [nat_beq_eq_false_of_ne hloc]
+  · cases Nat.beq entry.targetLocal targetLocal
+    · rfl
+    · rw [hov]
+
+/-- **`updateBorrowPermTreeAtProj_of_foreign_disjoint`**: a write on another
+local, or a foreign write to a disjoint projection / byte range within the same
+local, leaves `entry` unchanged. -/
+theorem updateBorrowPermTreeAtProj_of_foreign_disjoint
+    (allBorrows : List BorrowEntry) (entry : BorrowEntry)
+    (targetLocal : Local) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff writeRangeLen : Nat)
+    (hdisj : entry.targetLocal ≠ targetLocal ∨
+      (treeBorrowAccessRelatedness allBorrows entry writerTag = .foreignAccess ∧
+        borrowEntryOverlapsWrite entry writeProj writeRangeOff writeRangeLen = false)) :
+    updateBorrowPermTreeAtProj allBorrows entry targetLocal writerTag
+      writeProj writeRangeOff writeRangeLen = entry := by
+  unfold updateBorrowPermTreeAtProj updateBorrowPermAtProj
+  rcases hdisj with hloc | ⟨hrel, hov⟩
+  · rw [nat_beq_eq_false_of_ne hloc]
+  · cases Nat.beq entry.targetLocal targetLocal
+    · rfl
+    · rw [treeBorrowWriterRelatedness_resolveTreeBorrowWriterTag, hrel, hov]
+
+/-- Tag accessed by starting a normal-tree traversal at node `start` in
+`basedNormalTree borrows`: `some borrows[start].tag` for borrow nodes
+`start < borrows.length`, and `none` (direct local access through the base root)
+when `start = borrows.length`. -/
+def basedAccessTag (borrows : List BorrowEntry) (start : Nat) : Option Nat :=
+  (borrows[start]?).map BorrowEntry.tag
+
+/-- Combined Anneal undefined-behavior predicate on `borrows` for an access of
+`kind` at `targetLocal` initiated from node `start` of `basedNormalTree borrows`. -/
+def annealTableAccessUB
+    (kind : TreeBorrowAccessKind)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (start : Nat) : Bool :=
+  let tag := basedAccessTag borrows start
+  match kind with
+  | .read =>
+    hasTreeReadUB borrows borrows activeProtectors targetLocal tag .nil 0 0
+  | .write =>
+    Bool.or
+      (treeBorrowChainChildAccessUBAux .write (length borrows) borrows tag)
+      (hasProtectedTreeWriteConflict borrows borrows activeProtectors targetLocal tag .nil 0 0)
+
+/-- Successor Anneal borrow table after an access of `kind` at `targetLocal`
+initiated from node `start` of `basedNormalTree borrows`. -/
+def annealTableAfterAccess
+    (kind : TreeBorrowAccessKind)
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (targetLocal : Local)
+    (start : Nat) : List BorrowEntry :=
+  let tag := basedAccessTag borrows start
+  match kind with
+  | .read =>
+    freezeTreeBorrowsOnReadAtProj borrows borrows targetLocal tag .nil 0 0 activeProtectors
+  | .write =>
+    invalidateTreeBorrowsAtProj borrows borrows targetLocal tag .nil 0 0
+
+private def mkNormalTree1 (perm : TreeBorrowPerm) (p₀ : Bool) :
+    Miri.TreeBorrows.Tree.NormalTreeState :=
+  { topology := ⟨#[⟨some 1, []⟩, ⟨none, [0]⟩]⟩
+    defaultStates :=
+      #[⟨annealPermToMiri perm, true, .None⟩, ⟨.Unique, true, .None⟩]
+    protectedNodes := if p₀ then [0] else []
+    locationStates := #[none, none] }
+
+private def mkNormalTreeParentChild (cPerm pPerm : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    Miri.TreeBorrows.Tree.NormalTreeState :=
+  { topology := ⟨#[⟨some 1, []⟩, ⟨some 2, [0]⟩, ⟨none, [1]⟩]⟩
+    defaultStates :=
+      #[⟨annealPermToMiri cPerm, true, .None⟩,
+        ⟨annealPermToMiri pPerm, true, .None⟩,
+        ⟨.Unique, true, .None⟩]
+    protectedNodes := (if p₀ then [0] else []) ++ (if p₁ then [1] else [])
+    locationStates := #[none, none, none] }
+
+private def mkNormalTreeSiblings (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    Miri.TreeBorrows.Tree.NormalTreeState :=
+  { topology := ⟨#[⟨some 2, []⟩, ⟨some 2, []⟩, ⟨none, [0, 1]⟩]⟩
+    defaultStates :=
+      #[⟨annealPermToMiri perm₀, true, .None⟩,
+        ⟨annealPermToMiri perm₁, true, .None⟩,
+        ⟨.Unique, true, .None⟩]
+    protectedNodes := (if p₀ then [0] else []) ++ (if p₁ then [1] else [])
+    locationStates := #[none, none, none] }
+
+private theorem basedNormalTree_singleton_eq (b₀ : BorrowEntry)
+    (activeProtectors : List Nat) (hp₀ : b₀.parentTag = none) :
+    basedNormalTree [b₀] activeProtectors =
+      mkNormalTree1 b₀.perm (isBorrowProtected activeProtectors b₀) := by
+  have hbp : basedParentIndex [b₀] b₀ = 1 := by simp [basedParentIndex, hp₀]
+  have hrange : List.range 1 = [0] := rfl
+  cases hprot : isBorrowProtected activeProtectors b₀ <;>
+    simp [basedNormalTree, mkNormalTree1, basedTraversalTree, basedChildren,
+      protectedIndices, hbp, hrange, hprot]
+
+private theorem basedNormalTree_parent_child_eq (child parent : BorrowEntry)
+    (activeProtectors : List Nat)
+    (hneq : child.tag ≠ parent.tag)
+    (hcpar : child.parentTag = some parent.tag)
+    (hppar : parent.parentTag = none) :
+    basedNormalTree [child, parent] activeProtectors =
+      mkNormalTreeParentChild child.perm parent.perm
+        (isBorrowProtected activeProtectors child)
+        (isBorrowProtected activeProtectors parent) := by
+  have hbeq : Nat.beq child.tag parent.tag = false := nat_beq_eq_false_of_ne hneq
+  have hidx : borrowIndexOfTag [child, parent] parent.tag = some 1 := by
+    simp [borrowIndexOfTag, hbeq]
+  have hbpc : basedParentIndex [child, parent] child = 1 := by
+    simp [basedParentIndex, hcpar, hidx]
+  have hbpp : basedParentIndex [child, parent] parent = 2 := by
+    simp [basedParentIndex, hppar]
+  have hrange : List.range 2 = [0, 1] := rfl
+  cases hp₀ : isBorrowProtected activeProtectors child <;>
+    cases hp₁ : isBorrowProtected activeProtectors parent <;>
+    simp [basedNormalTree, mkNormalTreeParentChild, basedTraversalTree, basedChildren,
+      protectedIndices, hbpc, hbpp, hrange, hp₀, hp₁]
+
+private theorem basedNormalTree_siblings_eq (b₀ b₁ : BorrowEntry)
+    (activeProtectors : List Nat)
+    (hp₀ : b₀.parentTag = none)
+    (hp₁ : b₁.parentTag = none) :
+    basedNormalTree [b₀, b₁] activeProtectors =
+      mkNormalTreeSiblings b₀.perm b₁.perm
+        (isBorrowProtected activeProtectors b₀)
+        (isBorrowProtected activeProtectors b₁) := by
+  have hbp₀ : basedParentIndex [b₀, b₁] b₀ = 2 := by simp [basedParentIndex, hp₀]
+  have hbp₁ : basedParentIndex [b₀, b₁] b₁ = 2 := by simp [basedParentIndex, hp₁]
+  have hrange : List.range 2 = [0, 1] := rfl
+  cases hpr₀ : isBorrowProtected activeProtectors b₀ <;>
+    cases hpr₁ : isBorrowProtected activeProtectors b₁ <;>
+    simp [basedNormalTree, mkNormalTreeSiblings, basedTraversalTree, basedChildren,
+      protectedIndices, hbp₀, hbp₁, hrange, hpr₀, hpr₁]
+
+private def canon1 (perm : TreeBorrowPerm) (p₀ : Bool) : List BorrowEntry :=
+  [{ tag := 1, targetLocal := 0, targetProjection := .nil, perm := perm,
+     protector := if p₀ then some 1 else none, parentTag := none }]
+
+private def canonProts1 (p₀ : Bool) : List Nat :=
+  if p₀ then [1] else []
+
+private def canonPC (cPerm pPerm : TreeBorrowPerm) (p₀ p₁ : Bool) : List BorrowEntry :=
+  [{ tag := 2, targetLocal := 0, targetProjection := .nil, perm := cPerm,
+     protector := if p₀ then some 1 else none, parentTag := some 1 },
+   { tag := 1, targetLocal := 0, targetProjection := .nil, perm := pPerm,
+     protector := if p₁ then some 2 else none, parentTag := none }]
+
+private def canonSibs (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) : List BorrowEntry :=
+  [{ tag := 2, targetLocal := 0, targetProjection := .nil, perm := perm₀,
+     protector := if p₀ then some 1 else none, parentTag := none },
+   { tag := 1, targetLocal := 0, targetProjection := .nil, perm := perm₁,
+     protector := if p₁ then some 2 else none, parentTag := none }]
+
+private def canonProts2 (p₀ p₁ : Bool) : List Nat :=
+  (if p₀ then [1] else []) ++ (if p₁ then [2] else [])
+
+section CanonAccessEq
+
+@[local simp] private theorem applyTreeBorrowTransition_perm_eq (entry : BorrowEntry)
+    (out : TreeBorrowTransition) :
+    (applyTreeBorrowTransition entry out).perm =
+      match out with
+      | .transition perm => perm
+      | .ub => entry.perm
+      | .protectedReservedIM => entry.perm := by
+  cases out <;> rfl
+
+@[local simp] private theorem isBorrowProtected_canon1 (perm : TreeBorrowPerm) (p₀ : Bool) :
+    isBorrowProtected (canonProts1 p₀)
+      { tag := 1, targetLocal := 0, targetProjection := .nil, perm := perm,
+        protector := if p₀ then some 1 else none, parentTag := none } = p₀ := by
+  cases p₀ <;> rfl
+
+@[local simp] private theorem isBorrowProtected_canon2_0 (perm : TreeBorrowPerm) (pt : Option Nat)
+    (p₀ p₁ : Bool) :
+    isBorrowProtected (canonProts2 p₀ p₁)
+      { tag := 2, targetLocal := 0, targetProjection := .nil, perm := perm,
+        protector := if p₀ then some 1 else none, parentTag := pt } = p₀ := by
+  cases p₀ <;> cases p₁ <;> rfl
+
+@[local simp] private theorem isBorrowProtected_canon2_1 (perm : TreeBorrowPerm) (pt : Option Nat)
+    (p₀ p₁ : Bool) :
+    isBorrowProtected (canonProts2 p₀ p₁)
+      { tag := 1, targetLocal := 0, targetProjection := .nil, perm := perm,
+        protector := if p₁ then some 2 else none, parentTag := pt } = p₁ := by
+  cases p₀ <;> cases p₁ <;> rfl
+
+@[local simp] private theorem nat_beq_refl (a : Nat) : Nat.beq a a = true := by
+  simp
+
+private theorem borrowEntryOverlapsWrite_nil_eq_true (e : BorrowEntry)
+    (hproj : e.targetProjection = .nil) :
+    borrowEntryOverlapsWrite e .nil 0 0 = true := by
+  unfold borrowEntryOverlapsWrite
+  rw [hproj]
+  rfl
+
+@[local simp] private theorem borrowEntryOverlapsWrite_mk_nil (tag : Nat) (loc : Local)
+    (perm : TreeBorrowPerm) (prot : Option Nat) (pt : Option Nat) :
+    borrowEntryOverlapsWrite
+      { tag := tag, targetLocal := loc, targetProjection := .nil, perm := perm,
+        protector := prot, parentTag := pt } .nil 0 0 = true :=
+  rfl
+
+attribute [local simp] annealTableAccessUB annealTableAfterAccess basedAccessTag
+  canon1 canonPC canonSibs hasTreeReadUB borrowEntryReadUB
+  freezeTreeBorrowsOnReadAtProj updateBorrowPermOnReadAtProj
+  hasProtectedTreeWriteConflict hasProtectedWriteConflict borrowEntryWriteConflicts
+  invalidateTreeBorrowsAtProj updateBorrowPermTreeAtProj updateBorrowPermAtProj
+  resolveTreeBorrowWriterTag isBorrowDescendantOrSelf isBorrowDescendantOrSelfAux
+  treeBorrowChainChildAccessUBAux lookupBorrow length
+
+private theorem singleton_ub_after_eq (kind : TreeBorrowAccessKind) (b₀ : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
+    (hloc : b₀.targetLocal = targetLocal)
+    (hproj : b₀.targetProjection = .nil) :
+    let p₀ := isBorrowProtected activeProtectors b₀
+    annealTableAccessUB kind [b₀] activeProtectors targetLocal start.val =
+      annealTableAccessUB kind (canon1 b₀.perm p₀) (canonProts1 p₀) 0 start.val ∧
+    (annealTableAfterAccess kind [b₀] activeProtectors targetLocal start.val).map
+        (fun e => some e.perm) =
+      (annealTableAfterAccess kind (canon1 b₀.perm p₀) (canonProts1 p₀) 0 start.val).map
+        (fun e => some e.perm) := by
+  have hov : borrowEntryOverlapsWrite b₀ .nil 0 0 = true :=
+    borrowEntryOverlapsWrite_nil_eq_true b₀ hproj
+  dsimp only []
+  generalize hpr : isBorrowProtected activeProtectors b₀ = p₀
+  rcases start with ⟨_ | _ | _, hlt⟩
+  · cases kind <;> simp [*, -applyTreeBorrowTransition]
+  · cases kind <;> simp [*, -applyTreeBorrowTransition]
+  · omega
+
+private theorem parent_child_ub_after_eq (kind : TreeBorrowAccessKind)
+    (child parent : BorrowEntry) (activeProtectors : List Nat)
+    (targetLocal : Local) (start : Fin 2)
+    (hneq : child.tag ≠ parent.tag)
+    (hcpar : child.parentTag = some parent.tag)
+    (hppar : parent.parentTag = none)
+    (hcloc : child.targetLocal = targetLocal)
+    (hploc : parent.targetLocal = targetLocal)
+    (hcproj : child.targetProjection = .nil)
+    (hpproj : parent.targetProjection = .nil) :
+    let p₀ := isBorrowProtected activeProtectors child
+    let p₁ := isBorrowProtected activeProtectors parent
+    annealTableAccessUB kind [child, parent] activeProtectors targetLocal start.val =
+      annealTableAccessUB kind (canonPC child.perm parent.perm p₀ p₁) (canonProts2 p₀ p₁) 0
+        start.val ∧
+    (annealTableAfterAccess kind [child, parent] activeProtectors targetLocal start.val).map
+        (fun e => some e.perm) =
+      (annealTableAfterAccess kind (canonPC child.perm parent.perm p₀ p₁) (canonProts2 p₀ p₁) 0
+        start.val).map (fun e => some e.perm) := by
+  have hbeq_cp : Nat.beq child.tag parent.tag = false := nat_beq_eq_false_of_ne hneq
+  have hbeq_pc : Nat.beq parent.tag child.tag = false := nat_beq_eq_false_of_ne hneq.symm
+  have hcov : borrowEntryOverlapsWrite child .nil 0 0 = true :=
+    borrowEntryOverlapsWrite_nil_eq_true child hcproj
+  have hpov : borrowEntryOverlapsWrite parent .nil 0 0 = true :=
+    borrowEntryOverlapsWrite_nil_eq_true parent hpproj
+  dsimp only []
+  generalize hpr₀ : isBorrowProtected activeProtectors child = p₀
+  generalize hpr₁ : isBorrowProtected activeProtectors parent = p₁
+  rcases start with ⟨_ | _ | _, hlt⟩
+  · cases kind <;> simp [*, -applyTreeBorrowTransition]
+  · cases kind <;> simp [*, -applyTreeBorrowTransition]
+  · omega
+
+private theorem siblings_ub_after_eq (kind : TreeBorrowAccessKind)
+    (b₀ b₁ : BorrowEntry) (activeProtectors : List Nat)
+    (targetLocal : Local) (start : Fin 3)
+    (hneq : b₀.tag ≠ b₁.tag)
+    (hp₀ : b₀.parentTag = none)
+    (hp₁ : b₁.parentTag = none)
+    (hloc₀ : b₀.targetLocal = targetLocal)
+    (hloc₁ : b₁.targetLocal = targetLocal)
+    (hproj₀ : b₀.targetProjection = .nil)
+    (hproj₁ : b₁.targetProjection = .nil) :
+    let p₀ := isBorrowProtected activeProtectors b₀
+    let p₁ := isBorrowProtected activeProtectors b₁
+    annealTableAccessUB kind [b₀, b₁] activeProtectors targetLocal start.val =
+      annealTableAccessUB kind (canonSibs b₀.perm b₁.perm p₀ p₁) (canonProts2 p₀ p₁) 0
+        start.val ∧
+    (annealTableAfterAccess kind [b₀, b₁] activeProtectors targetLocal start.val).map
+        (fun e => some e.perm) =
+      (annealTableAfterAccess kind (canonSibs b₀.perm b₁.perm p₀ p₁) (canonProts2 p₀ p₁) 0
+        start.val).map (fun e => some e.perm) := by
+  have hbeq₀₁ : Nat.beq b₀.tag b₁.tag = false := nat_beq_eq_false_of_ne hneq
+  have hbeq₁₀ : Nat.beq b₁.tag b₀.tag = false := nat_beq_eq_false_of_ne hneq.symm
+  have hov₀ : borrowEntryOverlapsWrite b₀ .nil 0 0 = true :=
+    borrowEntryOverlapsWrite_nil_eq_true b₀ hproj₀
+  have hov₁ : borrowEntryOverlapsWrite b₁ .nil 0 0 = true :=
+    borrowEntryOverlapsWrite_nil_eq_true b₁ hproj₁
+  dsimp only []
+  generalize hpr₀ : isBorrowProtected activeProtectors b₀ = p₀
+  generalize hpr₁ : isBorrowProtected activeProtectors b₁ = p₁
+  rcases start with ⟨_ | _ | _ | _, hlt⟩
+  · cases kind <;> simp [*, -applyTreeBorrowTransition]
+  · cases kind <;> simp [*, -applyTreeBorrowTransition]
+  · cases kind <;> simp [*, -applyTreeBorrowTransition]
+  · omega
+
+end CanonAccessEq
+
+private theorem borrowIndexOfTag_map_of_preserve_tag
+    (borrows : List BorrowEntry) (f : BorrowEntry → BorrowEntry)
+    (htag : ∀ e, (f e).tag = e.tag) (pt : Nat) :
+    borrowIndexOfTag (borrows.map f) pt = borrowIndexOfTag borrows pt := by
+  induction borrows with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.map_cons, borrowIndexOfTag, htag hd, ih]
+
+private theorem annealTableAfterAccess_preserves_shape
+    (kind : TreeBorrowAccessKind) (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Nat) :
+    let borrows' := annealTableAfterAccess kind borrows activeProtectors targetLocal start
+    borrows'.length = borrows.length ∧
+    borrows'.map BorrowEntry.tag = borrows.map BorrowEntry.tag ∧
+    basedTraversalTree borrows' = basedTraversalTree borrows ∧
+    protectedIndices borrows' activeProtectors = protectedIndices borrows activeProtectors := by
+  dsimp only []
+  have hex : ∃ f : BorrowEntry → BorrowEntry,
+      annealTableAfterAccess kind borrows activeProtectors targetLocal start = borrows.map f ∧
+      ∀ e, (f e).tag = e.tag ∧ (f e).parentTag = e.parentTag ∧ (f e).protector = e.protector := by
+    cases kind
+    · refine ⟨fun e => updateBorrowPermOnReadAtProj borrows e targetLocal
+          (basedAccessTag borrows start) .nil 0 0 activeProtectors,
+        freezeTreeBorrowsOnReadAtProj_eq_map ..,
+        fun e => updateBorrowPermOnReadAtProj_preserves_tag_parent_prot borrows e targetLocal
+          (basedAccessTag borrows start) .nil 0 0 activeProtectors⟩
+    · refine ⟨fun e => updateBorrowPermTreeAtProj borrows e targetLocal
+          (basedAccessTag borrows start) .nil 0 0,
+        invalidateTreeBorrowsAtProj_eq_map ..,
+        fun e => updateBorrowPermTreeAtProj_preserves_tag_parent_prot borrows e targetLocal
+          (basedAccessTag borrows start) .nil 0 0⟩
+  obtain ⟨f, hmap, hf⟩ := hex
+  rw [hmap]
+  have hlen : (borrows.map f).length = borrows.length := List.length_map f
+  have htags : (borrows.map f).map BorrowEntry.tag = borrows.map BorrowEntry.tag :=
+    map_tag_eq_of_preserve_tag borrows f (fun e => (hf e).1)
+  have hidx_eq : ∀ pt, borrowIndexOfTag (borrows.map f) pt = borrowIndexOfTag borrows pt :=
+    borrowIndexOfTag_map_of_preserve_tag borrows f (fun e => (hf e).1)
+  have hbpi : ∀ e, basedParentIndex (borrows.map f) (f e) = basedParentIndex borrows e := by
+    intro e
+    simp only [basedParentIndex, (hf e).2.1, List.length_map]
+    cases e.parentTag with
+    | none => rfl
+    | some pt => dsimp only []; rw [hidx_eq pt]
+  have hbch : ∀ idx, basedChildren (borrows.map f) idx = basedChildren borrows idx := by
+    intro idx
+    unfold basedChildren
+    rw [List.length_map]
+    apply List.filter_congr
+    intro j hj
+    have hjlt : j < borrows.length := List.mem_range.mp hj
+    simp only [List.getElem?_eq_getElem hjlt,
+      List.getElem?_eq_getElem (by simpa using hjlt : j < (borrows.map f).length),
+      List.getElem_map, hbpi]
+  have htopo : basedTraversalTree (borrows.map f) = basedTraversalTree borrows := by
+    unfold basedTraversalTree
+    rw [List.length_map, hbch]
+    congr 1
+    congr 1
+    congr 1
+    apply List.ext_getElem
+    · simp
+    · intro i h₁ h₂
+      have hi : i < borrows.length := by simpa using h₂
+      simp [hbpi, hbch]
+  have hprot : protectedIndices (borrows.map f) activeProtectors =
+      protectedIndices borrows activeProtectors := by
+    unfold protectedIndices
+    rw [List.length_map]
+    apply List.filter_congr
+    intro i hi
+    have hilt : i < borrows.length := List.mem_range.mp hi
+    simp only [List.getElem?_eq_getElem hilt,
+      List.getElem?_eq_getElem (by simpa using hilt : i < (borrows.map f).length),
+      List.getElem_map, isBorrowProtected, (hf borrows[i]).2.2]
+  exact ⟨hlen, htags, htopo, hprot⟩
+
+section CoreDecidable
+
+private local instance : DecidableEq TreeBorrowPerm := fun a b =>
+  if h : annealPermToMiri a = annealPermToMiri b then
+    isTrue (annealPermToMiri_injective h)
+  else
+    isFalse (fun hab => h (congrArg annealPermToMiri hab))
+
+private theorem singleton_canon_core (kind : TreeBorrowAccessKind) (perm : TreeBorrowPerm)
+    (p₀ : Bool) (start : Fin 2) :
+    let nres := (mkNormalTree1 perm p₀).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind (canon1 perm p₀) (canonProts1 p₀) 0 start.val = false) ∧
+    (nres.status = .Completed →
+      nres.tree.topology = (mkNormalTree1 perm p₀).topology ∧
+      nres.tree.protectedNodes = (mkNormalTree1 perm p₀).protectedNodes ∧
+      normalTreePerms nres.tree 1 =
+        (annealTableAfterAccess kind (canon1 perm p₀) (canonProts1 p₀) 0 start.val).map
+          (fun e => some e.perm) ∧
+      (nres.tree.stateAt 1).map (fun st => st.permission) = some .Unique) := by
+  rcases start with ⟨_ | _ | _, hlt⟩
+  · dsimp only []
+    cases kind <;> (rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;> cases p₀ <;> decide
+  · dsimp only []
+    cases kind <;> (rcases perm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;> cases p₀ <;> decide
+  · omega
+
+private abbrev pcCoreGoal (kind : TreeBorrowAccessKind) (cPerm pPerm : TreeBorrowPerm)
+    (p₀ p₁ : Bool) (startVal : Nat) : Prop :=
+  let nres := (mkNormalTreeParentChild cPerm pPerm p₀ p₁).performAccess startVal
+    (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+  (nres.status = .Completed ↔
+    annealTableAccessUB kind (canonPC cPerm pPerm p₀ p₁) (canonProts2 p₀ p₁) 0 startVal = false) ∧
+  (nres.status = .Completed →
+    nres.tree.topology = (mkNormalTreeParentChild cPerm pPerm p₀ p₁).topology ∧
+    nres.tree.protectedNodes = (mkNormalTreeParentChild cPerm pPerm p₀ p₁).protectedNodes ∧
+    normalTreePerms nres.tree 2 =
+      (annealTableAfterAccess kind (canonPC cPerm pPerm p₀ p₁) (canonProts2 p₀ p₁) 0 startVal).map
+        (fun e => some e.perm) ∧
+    (nres.tree.stateAt 2).map (fun st => st.permission) = some .Unique)
+
+private theorem pc_canon_read_0 (cPerm pPerm : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    pcCoreGoal .read cPerm pPerm p₀ p₁ 0 := by
+  (rcases cPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases pPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem pc_canon_read_1 (cPerm pPerm : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    pcCoreGoal .read cPerm pPerm p₀ p₁ 1 := by
+  (rcases cPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases pPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem pc_canon_write_0 (cPerm pPerm : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    pcCoreGoal .write cPerm pPerm p₀ p₁ 0 := by
+  (rcases cPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases pPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem pc_canon_write_1 (cPerm pPerm : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    pcCoreGoal .write cPerm pPerm p₀ p₁ 1 := by
+  (rcases cPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases pPerm with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private abbrev sibCoreGoal (kind : TreeBorrowAccessKind) (perm₀ perm₁ : TreeBorrowPerm)
+    (p₀ p₁ : Bool) (startVal : Nat) : Prop :=
+  let nres := (mkNormalTreeSiblings perm₀ perm₁ p₀ p₁).performAccess startVal
+    (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+  (nres.status = .Completed ↔
+    annealTableAccessUB kind (canonSibs perm₀ perm₁ p₀ p₁) (canonProts2 p₀ p₁) 0 startVal =
+      false) ∧
+  (nres.status = .Completed →
+    nres.tree.topology = (mkNormalTreeSiblings perm₀ perm₁ p₀ p₁).topology ∧
+    nres.tree.protectedNodes = (mkNormalTreeSiblings perm₀ perm₁ p₀ p₁).protectedNodes ∧
+    normalTreePerms nres.tree 2 =
+      (annealTableAfterAccess kind (canonSibs perm₀ perm₁ p₀ p₁) (canonProts2 p₀ p₁) 0
+        startVal).map (fun e => some e.perm) ∧
+    (nres.tree.stateAt 2).map (fun st => st.permission) = some .Unique)
+
+private theorem sib_canon_read_0 (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    sibCoreGoal .read perm₀ perm₁ p₀ p₁ 0 := by
+  (rcases perm₀ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases perm₁ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem sib_canon_read_1 (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    sibCoreGoal .read perm₀ perm₁ p₀ p₁ 1 := by
+  (rcases perm₀ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases perm₁ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem sib_canon_read_2 (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    sibCoreGoal .read perm₀ perm₁ p₀ p₁ 2 := by
+  (rcases perm₀ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases perm₁ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem sib_canon_write_0 (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    sibCoreGoal .write perm₀ perm₁ p₀ p₁ 0 := by
+  (rcases perm₀ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases perm₁ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem sib_canon_write_1 (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    sibCoreGoal .write perm₀ perm₁ p₀ p₁ 1 := by
+  (rcases perm₀ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases perm₁ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+private theorem sib_canon_write_2 (perm₀ perm₁ : TreeBorrowPerm) (p₀ p₁ : Bool) :
+    sibCoreGoal .write perm₀ perm₁ p₀ p₁ 2 := by
+  (rcases perm₀ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    (rcases perm₁ with _ | ⟨_ | _⟩ | _ | _ | _ | _) <;>
+    cases p₀ <;> cases p₁ <;> decide
+
+end CoreDecidable
+
+/-- **`basedNormalTree_performAccess_singleton_simulation`**: for any whole-local
+root `BorrowEntry` `b₀` (`b₀.parentTag = none`, `b₀.targetProjection = .nil`),
+any `activeProtectors` list, both access kinds (`.read` / `.write`), and both
+starting nodes (`0` = access through `b₀.tag`, `1` = direct local access),
+Miri's `NormalTreeState.performAccess` on `basedNormalTree [b₀] activeProtectors`
+completes iff `annealTableAccessUB` is `false`, and whenever it completes,
+establishes `TreeBorrowsRel` directly between `annealTableAfterAccess` and
+`nres.tree`. -/
+theorem basedNormalTree_performAccess_singleton_simulation
+    (kind : TreeBorrowAccessKind) (b₀ : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
+    (hp₀ : b₀.parentTag = none) (hloc : b₀.targetLocal = targetLocal)
+    (hproj : b₀.targetProjection = .nil) :
+    let nres := (basedNormalTree [b₀] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [b₀] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [b₀] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) := by
+  dsimp only []
+  have hnt := basedNormalTree_singleton_eq b₀ activeProtectors hp₀
+  obtain ⟨hub_eq, hafter_eq⟩ :=
+    singleton_ub_after_eq kind b₀ activeProtectors targetLocal start hloc hproj
+  obtain ⟨hlen, htags, htopo, hprot⟩ :=
+    annealTableAfterAccess_preserves_shape kind [b₀] activeProtectors targetLocal start.val
+  obtain ⟨hcore_st, hcore_rel⟩ :=
+    singleton_canon_core kind b₀.perm (isBorrowProtected activeProtectors b₀) start
+  rw [hnt, hub_eq]
+  refine ⟨hcore_st, fun hc => ?_⟩
+  obtain ⟨ht_eq, hp_eq, hperms_eq, hbase_eq⟩ := hcore_rel hc
+  have hnt_fields := congrArg (fun t => (t.topology, t.protectedNodes)) hnt
+  injection hnt_fields with hnt_topo hnt_prot
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · rw [htopo, ht_eq, ← hnt_topo]; rfl
+  · rw [htags]; simp
+  · rw [hlen]; dsimp only [List.length_cons, List.length_nil]; rw [hperms_eq, ← hafter_eq]
+  · rw [hlen]; exact hbase_eq
+  · rw [hprot, hp_eq, ← hnt_prot]; rfl
+
+/-- **`basedNormalTree_performAccess_parent_child_simulation`** (certifying
+`I-10` & `I-11` operational parent-child traversal): for any whole-local
+parent-child pair `[child, parent]` (`child.tag ≠ parent.tag`,
+`child.parentTag = some parent.tag`, `parent.parentTag = none`), any
+`activeProtectors` list, both access kinds (`.read` / `.write`), and both
+pointer starting nodes (`0` = access through `child.tag`, `1` = access through
+`parent.tag`), Miri's `NormalTreeState.performAccess` on
+`basedNormalTree [child, parent] activeProtectors` completes iff
+`annealTableAccessUB` is `false`, and whenever it completes, establishes
+`TreeBorrowsRel` directly between `annealTableAfterAccess` and `nres.tree`. -/
+theorem basedNormalTree_performAccess_parent_child_simulation
+    (kind : TreeBorrowAccessKind) (child parent : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 2)
+    (hneq : child.tag ≠ parent.tag)
+    (hcpar : child.parentTag = some parent.tag)
+    (hppar : parent.parentTag = none)
+    (hcloc : child.targetLocal = targetLocal)
+    (hploc : parent.targetLocal = targetLocal)
+    (hcproj : child.targetProjection = .nil)
+    (hpproj : parent.targetProjection = .nil) :
+    let nres := (basedNormalTree [child, parent] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [child, parent] activeProtectors targetLocal
+      start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [child, parent] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) := by
+  dsimp only []
+  have hnt := basedNormalTree_parent_child_eq child parent activeProtectors hneq hcpar hppar
+  obtain ⟨hub_eq, hafter_eq⟩ := parent_child_ub_after_eq kind child parent activeProtectors
+    targetLocal start hneq hcpar hppar hcloc hploc hcproj hpproj
+  obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
+    [child, parent] activeProtectors targetLocal start.val
+  have hcore : pcCoreGoal kind child.perm parent.perm
+      (isBorrowProtected activeProtectors child)
+      (isBorrowProtected activeProtectors parent) start.val := by
+    rcases start with ⟨_ | _ | _, hlt⟩
+    · cases kind
+      · exact pc_canon_read_0 ..
+      · exact pc_canon_write_0 ..
+    · cases kind
+      · exact pc_canon_read_1 ..
+      · exact pc_canon_write_1 ..
+    · omega
+  obtain ⟨hcore_st, hcore_rel⟩ := hcore
+  rw [hnt, hub_eq]
+  refine ⟨hcore_st, fun hc => ?_⟩
+  obtain ⟨ht_eq, hp_eq, hperms_eq, hbase_eq⟩ := hcore_rel hc
+  have hnt_fields := congrArg (fun t => (t.topology, t.protectedNodes)) hnt
+  injection hnt_fields with hnt_topo hnt_prot
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · rw [htopo, ht_eq, ← hnt_topo]; rfl
+  · rw [htags]; simp [hneq]
+  · rw [hlen]; dsimp only [List.length_cons, List.length_nil]; rw [hperms_eq, ← hafter_eq]
+  · rw [hlen]; exact hbase_eq
+  · rw [hprot, hp_eq, ← hnt_prot]; rfl
+
+/-- **`basedNormalTree_performAccess_siblings_simulation`**: for any whole-local
+sibling pair `[b₀, b₁]` (`b₀.tag ≠ b₁.tag`, `b₀.parentTag = none`,
+`b₁.parentTag = none`), any `activeProtectors` list, both access kinds (`.read`
+/ `.write`), and all three starting nodes (`0` = access through `b₀.tag`, `1` =
+access through `b₁.tag`, `2` = direct local access), Miri's
+`NormalTreeState.performAccess` on `basedNormalTree [b₀, b₁] activeProtectors`
+completes iff `annealTableAccessUB` is `false`, and whenever it completes,
+establishes `TreeBorrowsRel` directly between `annealTableAfterAccess` and
+`nres.tree`. -/
+theorem basedNormalTree_performAccess_siblings_simulation
+    (kind : TreeBorrowAccessKind) (b₀ b₁ : BorrowEntry)
+    (activeProtectors : List Nat) (targetLocal : Local) (start : Fin 3)
+    (hneq : b₀.tag ≠ b₁.tag)
+    (hp₀ : b₀.parentTag = none)
+    (hp₁ : b₁.parentTag = none)
+    (hloc₀ : b₀.targetLocal = targetLocal)
+    (hloc₁ : b₁.targetLocal = targetLocal)
+    (hproj₀ : b₀.targetProjection = .nil)
+    (hproj₁ : b₁.targetProjection = .nil) :
+    let nres := (basedNormalTree [b₀, b₁] activeProtectors).performAccess start.val
+      (annealAccessKindToMiri kind) .VisitChildrenOfAccessed
+    let borrows' := annealTableAfterAccess kind [b₀, b₁] activeProtectors targetLocal start.val
+    (nres.status = .Completed ↔
+      annealTableAccessUB kind [b₀, b₁] activeProtectors targetLocal start.val = false) ∧
+    (nres.status = .Completed → TreeBorrowsRel borrows' activeProtectors nres.tree) := by
+  dsimp only []
+  have hnt := basedNormalTree_siblings_eq b₀ b₁ activeProtectors hp₀ hp₁
+  obtain ⟨hub_eq, hafter_eq⟩ := siblings_ub_after_eq kind b₀ b₁ activeProtectors
+    targetLocal start hneq hp₀ hp₁ hloc₀ hloc₁ hproj₀ hproj₁
+  obtain ⟨hlen, htags, htopo, hprot⟩ := annealTableAfterAccess_preserves_shape kind
+    [b₀, b₁] activeProtectors targetLocal start.val
+  have hcore : sibCoreGoal kind b₀.perm b₁.perm
+      (isBorrowProtected activeProtectors b₀)
+      (isBorrowProtected activeProtectors b₁) start.val := by
+    rcases start with ⟨_ | _ | _ | _, hlt⟩
+    · cases kind
+      · exact sib_canon_read_0 ..
+      · exact sib_canon_write_0 ..
+    · cases kind
+      · exact sib_canon_read_1 ..
+      · exact sib_canon_write_1 ..
+    · cases kind
+      · exact sib_canon_read_2 ..
+      · exact sib_canon_write_2 ..
+    · omega
+  obtain ⟨hcore_st, hcore_rel⟩ := hcore
+  rw [hnt, hub_eq]
+  refine ⟨hcore_st, fun hc => ?_⟩
+  obtain ⟨ht_eq, hp_eq, hperms_eq, hbase_eq⟩ := hcore_rel hc
+  have hnt_fields := congrArg (fun t => (t.topology, t.protectedNodes)) hnt
+  injection hnt_fields with hnt_topo hnt_prot
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · rw [htopo, ht_eq, ← hnt_topo]; rfl
+  · rw [htags]; simp [hneq]
+  · rw [hlen]; dsimp only [List.length_cons, List.length_nil]; rw [hperms_eq, ← hafter_eq]
+  · rw [hlen]; exact hbase_eq
+  · rw [hprot, hp_eq, ← hnt_prot]; rfl
 
 section RangedOperational
 
