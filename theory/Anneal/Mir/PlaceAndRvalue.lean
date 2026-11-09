@@ -58,15 +58,18 @@ soundness invariants, lens laws, and step correspondence/refinement against
      `.cast .intToInt op targetTy` for unsigned 4-byte `char` operands.
 
 3. **Section 3 — `Rvalue.nullaryOp` Formalization, Canonical Tuple `OffsetOf`, & Refinement**:
-   - Alignment rounding (`alignUp`), canonical tuple field-offset resolution
-     (`resolveTupleOffsetOf`), and `evalNullaryOp` (`.sizeOf`, `.alignOf`,
-     `.offsetOf`, `.ubChecks`).
+   - Alignment rounding (`alignUp`), Episode 1's canonical-byte-layout gate
+     (`rigidTyHasCanonicalByteLayout`, mirroring `Ty::has_canonical_byte_layout`),
+     canonical tuple field-offset resolution (`resolveTupleOffsetOf`), and
+     `evalNullaryOp` (`.sizeOf`, `.alignOf`, `.offsetOf`, `.ubChecks`).
    - Arithmetic and layout invariants (non-zero tuple variant rejection,
-     out-of-bounds field rejection, prefix offset monotonicity, field offset +
-     field size bounded by tuple size, `ubChecks` evaluating to `⟨1, 1⟩`), plus
-     unsupported-shrinking refinement against
-     `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue (.nullaryOp op ty)` and
-     agreement with `Terminators.lean`'s `.ubChecks` intrinsic.
+     out-of-bounds field rejection, non-canonical layout rejection, prefix offset
+     monotonicity, field offset + field size bounded by tuple size, field
+     alignment dividing the field offset, `ubChecks` evaluating to `⟨1, 1⟩`).
+   - Unsupported-shrinking refinement against
+     `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue (.nullaryOp op ty)`, and
+     value-level agreement with the Trusted `size_of_val` / `align_of_val` /
+     `ub_checks` intrinsics in `Terminators.lean`.
 
 4. **Section 4 — Stateful `LocalSlotState`, `D9` `PlaceMention`, `D13b` Partial Shells, `SetDiscriminant`, `Assume` & `Statements.lean` Correspondence**:
    - Per-field initialization slots (`FieldSlot`), partially initialized
@@ -75,9 +78,11 @@ soundness invariants, lens laws, and step correspondence/refinement against
      `uninit`, `partialShell`, `init`).
    - Partial-shell soundness theorems: unwritten `()` sibling fields and tagless
      enum shells never promote (`tryIntoValue? = .none`) and fault on reads
-     (eliminating `.unit`-placeholder false accepts), array element writes on
-     `.uninit` fault (`c6d2ad74`), and full field + tag initialization promotes
-     to `Value.aggregate variantIdx fields`.
+     (eliminating `.unit`-placeholder false accepts), `SetDiscriminant` to a
+     different variant resets previously written payload fields (no variant
+     reinterpretation), array element writes on `.uninit` fault (`c6d2ad74`),
+     and full field + tag initialization promotes to
+     `Value.aggregate variantIdx fields`.
    - Statement-level correspondence theorems with
      `Trusted.Rustc.V2026_06_01.MirSemantics` (`evalOperand` bare vs. projected
      `.move`, `placeMentionOperandsInit` / `evalStmt` `.placeMention`,
@@ -2228,22 +2233,169 @@ def sumPrefixFieldSizes
     | .some sz, .some restOff => .some (Nat.add sz restOff)
     | _, _ => .none
 
+/-! ### Canonical tuple byte layouts (`Ty::has_canonical_byte_layout` in `crates/anneal-mir/src/ir.rs`)
+
+Episode 1's `resolve_offset_of` only answers `OffsetOf` on containers with a
+*canonical byte layout*: `rustc`'s `repr(Rust)` layout is then the padding-free
+concatenation of the fields in declaration order, so the byte offset of field `i`
+is the unpadded prefix sum of the sizes of fields `0..i`. Without this gate the
+prefix sum is wrong whenever `rustc` inserts padding or reorders fields: e.g.
+`rustc 1.98` lays out `(u8, u32)` with the `u32` at byte `4`
+(`offset_of!((u8, u32), 1) = 4`), while the unpadded prefix sum is `1`. -/
+
+/-- Fuel-bounded trailing-zero count of `n` (`usize::trailing_zeros` for `n > 0`;
+`0` when `n = 0` or the fuel is exhausted). -/
+def natTrailingZerosAux : Nat → Nat → Nat
+  | .zero, _ => 0
+  | .succ fuel, n =>
+    match Nat.beq n 0, Nat.beq (Nat.mod n 2) 0 with
+    | false, true => Nat.succ (natTrailingZerosAux fuel (Nat.div n 2))
+    | _, _ => 0
+
+/-- `rustc`'s field-ordering alignment-group key `log2(max(align, size))`
+(`Ty::alignment_group_key`: `align.max(size).trailing_zeros()`). -/
+def alignmentGroupKey (size align : Nat) : Nat :=
+  let m :=
+    match Nat.ble align size with
+    | true => size
+    | false => align
+  natTrailingZerosAux m m
+
+mutual
+/-- Whether a type contains a niche-bearing scalar (`bool`, `char`, `&T`) whose
+in-tuple placement `rustc` may optimize (`Ty::contains_niche`). Kinds that
+`anneal-mir`'s `Ty` cannot express conservatively report a niche. -/
+def rigidTyContainsNiche : RigidTy → Bool
+  | .int _ => false
+  | .uint _ => false
+  | .rawPtr _ _ => false
+  | .never => false
+  | .array elem n =>
+    Bool.and (Bool.not (Nat.beq n 0)) (rigidTyContainsNiche elem)
+  | .tuple ks => rigidTyListContainsNiche ks
+  | _ => true
+
+/-- `rigidTyContainsNiche` over a list of tuple field kinds (`any`). -/
+def rigidTyListContainsNiche : List RigidTy → Bool
+  | .nil => false
+  | k :: ks => Bool.or (rigidTyContainsNiche k) (rigidTyListContainsNiche ks)
+end
+
+/-- Field-ordering keys `(align, alignmentGroupKey size align)` of the tuple fields
+`ks` in declaration order, or `.none` if any field size or alignment is unresolved
+or any alignment is `0`. -/
+def tupleFieldOrderKeys?
+    (fieldByteSize fieldAlign : RigidTy → Option Nat) :
+    List RigidTy → Option (List (Nat × Nat))
+  | .nil => .some .nil
+  | k :: ks =>
+    match fieldByteSize k, fieldAlign k, tupleFieldOrderKeys? fieldByteSize fieldAlign ks with
+    | .some sz, .some al, .some rest =>
+      match Nat.beq al 0 with
+      | true => .none
+      | false => .some ((al, alignmentGroupKey sz al) :: rest)
+    | _, _, _ => .none
+
+/-- Both the ABI alignments and the alignment-group keys are non-increasing in
+declaration order. -/
+def orderKeysNonIncreasing : List (Nat × Nat) → Bool
+  | a :: b :: rest =>
+    Bool.and (Nat.ble b.1 a.1)
+      (Bool.and (Nat.ble b.2 a.2) (orderKeysNonIncreasing (b :: rest)))
+  | _ => true
+
+/-- Lay out the fields `ks` in declaration order starting at byte `off` without
+inserting padding, requiring every field offset to be a multiple of the field's
+alignment; returns the unpadded end offset. -/
+def tupleDeclOrderAlignedEnd?
+    (fieldByteSize fieldAlign : RigidTy → Option Nat) :
+    Nat → List RigidTy → Option Nat
+  | off, .nil => .some off
+  | off, k :: ks =>
+    match fieldByteSize k, fieldAlign k with
+    | .some sz, .some al =>
+      match Nat.beq (Nat.mod off al) 0 with
+      | true => tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign (Nat.add off sz) ks
+      | false => .none
+    | _, _ => .none
+
+/-- All tuple field kinds are structurally equal (`rigidTyEq`) to their successor. -/
+def rigidTyListAllEq : List RigidTy → Bool
+  | a :: b :: rest => Bool.and (rigidTyEq a b) (rigidTyListAllEq (b :: rest))
+  | _ => true
+
+/-- Tuple-level conditions of `Ty::has_canonical_byte_layout`: the tuple has at
+most one field, or all fields have the same type, or no field contains a niche,
+both the field alignments and alignment-group keys are non-increasing in
+declaration order, every declaration-order field offset is aligned, and the
+unpadded size is a multiple of the tuple alignment (`tupleFieldsAlign`). -/
+def tupleDeclOrderIsCanonical
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
+    (ks : List RigidTy) : Bool :=
+  match Nat.ble (length ks) 1, rigidTyListAllEq ks with
+  | true, _ => true
+  | false, true => true
+  | false, false =>
+    match
+      rigidTyListContainsNiche ks,
+      tupleFieldOrderKeys? fieldByteSize fieldAlign ks,
+      tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign 0 ks,
+      tupleFieldsAlign fieldAlign ks
+    with
+    | false, .some keys, .some endOff, .some tupleAlign =>
+      Bool.and (orderKeysNonIncreasing keys) (Nat.beq (Nat.mod endOff tupleAlign) 0)
+    | _, _, _, _ => false
+
+mutual
+/-- `Ty::has_canonical_byte_layout`: scalars, thin/wide pointers, and `!` are
+canonical; arrays are canonical when their element is; tuples are canonical when
+every field is canonical and `tupleDeclOrderIsCanonical` holds. Every kind that
+`anneal-mir`'s `Ty` cannot express (ADTs, floats, slices, closures, ...) fails
+closed (`false`). -/
+def rigidTyHasCanonicalByteLayout
+    (fieldByteSize fieldAlign : RigidTy → Option Nat) : RigidTy → Bool
+  | .bool => true
+  | .char => true
+  | .int _ => true
+  | .uint _ => true
+  | .rawPtr _ _ => true
+  | .ref _ _ => true
+  | .never => true
+  | .array elem _ => rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign elem
+  | .tuple ks =>
+    Bool.and
+      (rigidTyListHasCanonicalByteLayout fieldByteSize fieldAlign ks)
+      (tupleDeclOrderIsCanonical fieldByteSize fieldAlign ks)
+  | _ => false
+
+/-- `rigidTyHasCanonicalByteLayout` over a list of tuple field kinds (`all`). -/
+def rigidTyListHasCanonicalByteLayout
+    (fieldByteSize fieldAlign : RigidTy → Option Nat) : List RigidTy → Bool
+  | .nil => true
+  | k :: ks =>
+    Bool.and
+      (rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign k)
+      (rigidTyListHasCanonicalByteLayout fieldByteSize fieldAlign ks)
+end
+
 /-- Resolve the byte offset of a `(variantIdx, fieldIdx)` projection chain inside
 a canonical tuple type (`resolve_offset_of` in `crates/anneal-mir/src/lower/rvalue.rs`).
-Fails closed (`.none`) if any container is not a tuple, if `variantIdx != 0`, or
-if `fieldIdx` is out of bounds. -/
+Fails closed (`.none`) if any container is not a tuple, if `variantIdx != 0`, if
+`fieldIdx` is out of bounds, or if a container lacks a canonical byte layout
+(`rigidTyHasCanonicalByteLayout`, Episode 1's `UnsupportedOffsetOfLayout`). -/
 def resolveTupleOffsetOf
-    (fieldByteSize : RigidTy → Option Nat) :
+    (fieldByteSize fieldAlign : RigidTy → Option Nat) :
     RigidTy → List (VariantIdx × FieldIdx) → Option Nat
   | _, .nil => .some 0
   | .tuple tupleFields, (variantIdx, fieldIdx) :: rest =>
     match
-      Nat.beq variantIdx 0,
+      Bool.and (Nat.beq variantIdx 0)
+        (rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields)),
       get? tupleFields fieldIdx,
       sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx
     with
     | true, .some childKind, .some stepOff =>
-      match resolveTupleOffsetOf fieldByteSize childKind rest with
+      match resolveTupleOffsetOf fieldByteSize fieldAlign childKind rest with
       | .some tailOff => .some (Nat.add stepOff tailOff)
       | .none => .none
     | _, _, _ => .none
@@ -2252,20 +2404,21 @@ def resolveTupleOffsetOf
 /-- Empty `OffsetOf` path resolves to byte offset `0`. -/
 @[simp]
 theorem resolveTupleOffsetOf_nil
-    (fieldByteSize : RigidTy → Option Nat)
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
     (kind : RigidTy) :
-    resolveTupleOffsetOf fieldByteSize kind .nil = .some 0 := by
+    resolveTupleOffsetOf fieldByteSize fieldAlign kind .nil = .some 0 := by
   cases kind <;> rfl
 
 /-- Any `OffsetOf` step on a tuple with a non-zero `variantIdx` fails closed (`.none`). -/
 theorem resolveTupleOffsetOf_nonzero_variant_eq_none
-    (fieldByteSize : RigidTy → Option Nat)
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
     (tupleFields : List RigidTy)
     (variantIdx : VariantIdx)
     (fieldIdx : FieldIdx)
     (rest : List (VariantIdx × FieldIdx))
     (hNonZero : variantIdx ≠ 0) :
-    resolveTupleOffsetOf fieldByteSize (.tuple tupleFields) ((variantIdx, fieldIdx) :: rest) =
+    resolveTupleOffsetOf fieldByteSize fieldAlign (.tuple tupleFields)
+        ((variantIdx, fieldIdx) :: rest) =
       .none := by
   have hBeq : Nat.beq variantIdx 0 = false := by
     cases h : Nat.beq variantIdx 0 with
@@ -2273,33 +2426,72 @@ theorem resolveTupleOffsetOf_nonzero_variant_eq_none
     | true => exact False.elim (hNonZero (Nat.eq_of_beq_eq_true h))
   unfold resolveTupleOffsetOf
   rw [hBeq]
+  rfl
 
 /-- Any `OffsetOf` step with an out-of-bounds `fieldIdx` (`get? tupleFields fieldIdx = .none`)
 fails closed (`.none`). -/
 theorem resolveTupleOffsetOf_oob_field_eq_none
-    (fieldByteSize : RigidTy → Option Nat)
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
     (tupleFields : List RigidTy)
     (variantIdx : VariantIdx)
     (fieldIdx : FieldIdx)
     (rest : List (VariantIdx × FieldIdx))
     (hOob : get? tupleFields fieldIdx = .none) :
-    resolveTupleOffsetOf fieldByteSize (.tuple tupleFields) ((variantIdx, fieldIdx) :: rest) =
+    resolveTupleOffsetOf fieldByteSize fieldAlign (.tuple tupleFields)
+        ((variantIdx, fieldIdx) :: rest) =
       .none := by
   unfold resolveTupleOffsetOf
   rw [hOob]
-  cases Nat.beq variantIdx 0 <;> rfl
+  cases Bool.and (Nat.beq variantIdx 0)
+    (rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields)) <;> rfl
+
+/-- **Canonical-Layout Gate (`resolveTupleOffsetOf_noncanonical_eq_none`)**:
+Any `OffsetOf` step on a tuple without a canonical byte layout (padding,
+alignment-increasing or niche-dependent field order, or a field kind outside
+`anneal-mir`'s `Ty`) fails closed (`.none`), matching Episode 1's
+`UnsupportedOffsetOfLayout`. -/
+theorem resolveTupleOffsetOf_noncanonical_eq_none
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
+    (tupleFields : List RigidTy)
+    (variantIdx : VariantIdx)
+    (fieldIdx : FieldIdx)
+    (rest : List (VariantIdx × FieldIdx))
+    (hNonCanonical :
+      rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields) = false) :
+    resolveTupleOffsetOf fieldByteSize fieldAlign (.tuple tupleFields)
+        ((variantIdx, fieldIdx) :: rest) =
+      .none := by
+  unfold resolveTupleOffsetOf
+  rw [hNonCanonical, Bool.and_false]
 
 /-- Any non-empty `OffsetOf` path on a non-tuple type fails closed (`.none`). -/
 theorem resolveTupleOffsetOf_non_tuple_eq_none
-    (fieldByteSize : RigidTy → Option Nat)
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
     (kind : RigidTy)
     (step : VariantIdx × FieldIdx)
     (rest : List (VariantIdx × FieldIdx))
     (hNotTuple : ∀ fs, kind ≠ .tuple fs) :
-    resolveTupleOffsetOf fieldByteSize kind (step :: rest) = .none := by
+    resolveTupleOffsetOf fieldByteSize fieldAlign kind (step :: rest) = .none := by
   cases kind with
   | tuple fs => exact False.elim (hNotTuple fs rfl)
   | _ => rfl
+
+/-- Regression (`rustc 1.98`: `offset_of!((u8, u32), 1) = 4`): the padded tuple
+`(u8, u32)` has no canonical byte layout, so `OffsetOf` fails closed instead of
+returning the unpadded prefix sum `1`. -/
+example :
+    resolveTupleOffsetOf (intrinsicRigidTyByteSize .nil emptyLayoutTable)
+      (intrinsicRigidTyAlign .nil emptyLayoutTable)
+      (.tuple [.uint .u8, .uint .u32]) [(0, 1)] = .none := by
+  rfl
+
+/-- Regression (`rustc 1.98`: `offset_of!((u32, u16, u16), 2) = 6`): the
+padding-free, alignment-sorted tuple `(u32, u16, u16)` is canonical. -/
+example :
+    resolveTupleOffsetOf (intrinsicRigidTyByteSize .nil emptyLayoutTable)
+      (intrinsicRigidTyAlign .nil emptyLayoutTable)
+      (.tuple [.uint .u32, .uint .u16, .uint .u16]) [(0, 2)] = .some 6 := by
+  rfl
 
 /-- Prefix sum + selected field size is bounded by the total tuple field byte sum
 (`tupleFieldsByteSum`). -/
@@ -2358,13 +2550,14 @@ resolves to `off`, the selected field has size `fieldSz`, and the tuple's
 unpadded field sum is `totalUnpadded`, the entire field `[off, off + fieldSz)`
 fits within the aligned tuple size `alignUp totalUnpadded align`. -/
 theorem resolveTupleOffsetOf_single_step_bound
-    (fieldByteSize : RigidTy → Option Nat)
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
     (tupleFields : List RigidTy)
     (fieldIdx : FieldIdx)
     (fieldKind : RigidTy)
     (off fieldSz totalUnpadded align : Nat)
     (hResolve :
-      resolveTupleOffsetOf fieldByteSize (.tuple tupleFields) [(0, fieldIdx)] = .some off)
+      resolveTupleOffsetOf fieldByteSize fieldAlign (.tuple tupleFields) [(0, fieldIdx)] =
+        .some off)
     (hGet : get? tupleFields fieldIdx = .some fieldKind)
     (hFieldSz : fieldByteSize fieldKind = .some fieldSz)
     (hTotal : tupleFieldsByteSum fieldByteSize tupleFields = .some totalUnpadded) :
@@ -2372,6 +2565,14 @@ theorem resolveTupleOffsetOf_single_step_bound
     off + fieldSz ≤ alignUp totalUnpadded align := by
   unfold resolveTupleOffsetOf at hResolve
   rw [hGet] at hResolve
+  cases hCan : rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields) with
+  | false =>
+    rw [hCan] at hResolve
+    nomatch hResolve
+  | true =>
+  rw [hCan] at hResolve
+  have h00 : (Nat.beq 0 0 && true) = true := rfl
+  rw [h00] at hResolve
   cases hPref : sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx with
   | none => rw [hPref] at hResolve; nomatch hResolve
   | some stepOff =>
@@ -2389,6 +2590,255 @@ theorem resolveTupleOffsetOf_single_step_bound
         hGet hFieldSz hPref hTotal
     have hLeAligned := alignUp_ge totalUnpadded align
     exact ⟨hLeUnpadded, Nat.le_trans hLeUnpadded hLeAligned⟩
+
+/-- In a padding-free declaration-order layout starting at byte `off`
+(`tupleDeclOrderAlignedEnd?` succeeds), the offset `off + p` of every field
+(`p` = its unpadded prefix sum) is a multiple of that field's alignment. -/
+theorem tupleDeclOrderAlignedEnd?_prefix_aligned
+    (fieldByteSize fieldAlign : RigidTy → Option Nat) :
+    ∀ (fs : List RigidTy) (off i : Nat) (k : RigidTy) (a p e : Nat),
+      tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign off fs = .some e →
+      get? fs i = .some k →
+      fieldAlign k = .some a →
+      sumPrefixFieldSizes fieldByteSize fs i = .some p →
+      (off + p) % a = 0 := by
+  intro fs
+  induction fs with
+  | nil =>
+    intro off i k a p e _ hGet
+    nomatch hGet
+  | cons k0 rest ih =>
+    intro off i k a p e hEnd hGet hAl hPref
+    unfold tupleDeclOrderAlignedEnd? at hEnd
+    cases hSz0 : fieldByteSize k0 with
+    | none => rw [hSz0] at hEnd; nomatch hEnd
+    | some s0 =>
+      cases hAl0 : fieldAlign k0 with
+      | none => rw [hSz0, hAl0] at hEnd; nomatch hEnd
+      | some a0 =>
+        rw [hSz0, hAl0] at hEnd
+        dsimp only at hEnd
+        cases hMod : Nat.beq (Nat.mod off a0) 0 with
+        | false => rw [hMod] at hEnd; nomatch hEnd
+        | true =>
+          rw [hMod] at hEnd
+          cases i with
+          | zero =>
+            simp only [get?_eq_getElem?, List.getElem?_cons_zero] at hGet
+            injection hGet with hK
+            subst hK
+            rw [hAl0] at hAl
+            injection hAl with hA
+            subst hA
+            unfold sumPrefixFieldSizes at hPref
+            injection hPref with hP
+            subst hP
+            have hOff : off % a0 = 0 := Nat.eq_of_beq_eq_true hMod
+            simpa using hOff
+          | succ i' =>
+            simp only [get?_eq_getElem?, List.getElem?_cons_succ] at hGet
+            unfold sumPrefixFieldSizes at hPref
+            rw [hSz0] at hPref
+            cases hRest : sumPrefixFieldSizes fieldByteSize rest i' with
+            | none => rw [hRest] at hPref; nomatch hPref
+            | some p' =>
+              rw [hRest] at hPref
+              injection hPref with hP
+              change s0 + p' = p at hP
+              have hIH := ih (Nat.add off s0) i' k a p' e hEnd hGet hAl hRest
+              change (off + s0 + p') % a = 0 at hIH
+              rw [← hP, ← Nat.add_assoc]
+              exact hIH
+
+/-- If consecutive tuple fields are `rigidTyEq` (`rigidTyListAllEq`) and byte
+sizes respect `rigidTyEq`, every field has the byte size of the first field. -/
+theorem rigidTyListAllEq_size_eq_head
+    (fieldByteSize : RigidTy → Option Nat)
+    (hSizeCongr : ∀ k₁ k₂, rigidTyEq k₁ k₂ = true → fieldByteSize k₁ = fieldByteSize k₂) :
+    ∀ (tl : List RigidTy) (hd : RigidTy) (j : Nat) (k : RigidTy),
+      rigidTyListAllEq (hd :: tl) = true →
+      get? (hd :: tl) j = .some k →
+      fieldByteSize k = fieldByteSize hd := by
+  intro tl
+  induction tl with
+  | nil =>
+    intro hd j k _ hGet
+    cases j with
+    | zero =>
+      simp only [get?_eq_getElem?, List.getElem?_cons_zero] at hGet
+      injection hGet with hK
+      subst hK
+      rfl
+    | succ j' =>
+      simp only [get?_eq_getElem?, List.getElem?_cons_succ] at hGet
+      nomatch hGet
+  | cons b rest ih =>
+    intro hd j k hAll hGet
+    have hAll' : rigidTyEq hd b = true ∧ rigidTyListAllEq (b :: rest) = true := by
+      unfold rigidTyListAllEq at hAll
+      exact Bool.and_eq_true_iff.mp hAll
+    cases j with
+    | zero =>
+      simp only [get?_eq_getElem?, List.getElem?_cons_zero] at hGet
+      injection hGet with hK
+      subst hK
+      rfl
+    | succ j' =>
+      simp only [get?_eq_getElem?, List.getElem?_cons_succ] at hGet
+      rw [ih b j' k hAll'.2 hGet]
+      exact (hSizeCongr hd b hAll'.1).symm
+
+/-- Unpadded prefix sums over uniformly sized fields (`fieldByteSize k = .some s`
+for every field) are `i * s`. -/
+theorem sumPrefixFieldSizes_uniform
+    (fieldByteSize : RigidTy → Option Nat)
+    (s : Nat) :
+    ∀ (fs : List RigidTy) (i p : Nat),
+      (∀ j k, get? fs j = .some k → fieldByteSize k = .some s) →
+      sumPrefixFieldSizes fieldByteSize fs i = .some p →
+      p = i * s := by
+  intro fs
+  induction fs with
+  | nil =>
+    intro i p _ hPref
+    nomatch hPref
+  | cons k0 rest ih =>
+    intro i p hUni hPref
+    cases i with
+    | zero =>
+      unfold sumPrefixFieldSizes at hPref
+      injection hPref with hP
+      omega
+    | succ i' =>
+      unfold sumPrefixFieldSizes at hPref
+      have hK0 : fieldByteSize k0 = .some s := hUni 0 k0 rfl
+      rw [hK0] at hPref
+      cases hRest : sumPrefixFieldSizes fieldByteSize rest i' with
+      | none => rw [hRest] at hPref; nomatch hPref
+      | some p' =>
+        rw [hRest] at hPref
+        injection hPref with hP
+        change s + p' = p at hP
+        have hUni' : ∀ j k, get? rest j = .some k → fieldByteSize k = .some s :=
+          fun j k h => hUni (j + 1) k h
+        have hP' := ih i' p' hUni' hRest
+        subst hP'
+        rw [Nat.succ_mul]
+        omega
+
+/-- **Tuple `OffsetOf` Alignment Invariant (`resolveTupleOffsetOf_single_step_aligned`)**:
+Whenever a 1-step `OffsetOf` query `[(0, fieldIdx)]` on `.tuple tupleFields`
+resolves to `off` and the selected field has alignment `fieldAlignBytes`, the
+offset is a multiple of the field alignment (`fieldAlignBytes ∣ off`), provided
+the layout functions are well formed: every resolved size is a multiple of the
+resolved alignment (`hSizeMulAlign`, "the size of a value is always a multiple
+of its alignment") and sizes respect structural type equality (`hSizeCongr`).
+This holds for each of the three canonical-layout cases (at most one field, all
+fields of the same type, or a padding-free alignment-sorted declaration order);
+without the canonical-layout gate it fails, e.g. `(u8, u32)` would place the
+`u32` at the unaligned unpadded offset `1`. -/
+theorem resolveTupleOffsetOf_single_step_aligned
+    (fieldByteSize fieldAlign : RigidTy → Option Nat)
+    (tupleFields : List RigidTy)
+    (fieldIdx : FieldIdx)
+    (fieldKind : RigidTy)
+    (off fieldAlignBytes : Nat)
+    (hSizeMulAlign :
+      ∀ k s a, fieldByteSize k = .some s → fieldAlign k = .some a → s % a = 0)
+    (hSizeCongr : ∀ k₁ k₂, rigidTyEq k₁ k₂ = true → fieldByteSize k₁ = fieldByteSize k₂)
+    (hResolve :
+      resolveTupleOffsetOf fieldByteSize fieldAlign (.tuple tupleFields) [(0, fieldIdx)] =
+        .some off)
+    (hGet : get? tupleFields fieldIdx = .some fieldKind)
+    (hAlign : fieldAlign fieldKind = .some fieldAlignBytes) :
+    off % fieldAlignBytes = 0 := by
+  unfold resolveTupleOffsetOf at hResolve
+  rw [hGet] at hResolve
+  cases hCan : rigidTyHasCanonicalByteLayout fieldByteSize fieldAlign (.tuple tupleFields) with
+  | false =>
+    rw [hCan] at hResolve
+    nomatch hResolve
+  | true =>
+  rw [hCan] at hResolve
+  have h00 : (Nat.beq 0 0 && true) = true := rfl
+  rw [h00] at hResolve
+  cases hPref : sumPrefixFieldSizes fieldByteSize tupleFields fieldIdx with
+  | none => rw [hPref] at hResolve; nomatch hResolve
+  | some stepOff =>
+  rw [hPref] at hResolve
+  dsimp only at hResolve
+  rw [resolveTupleOffsetOf_nil] at hResolve
+  injection hResolve with hOffEq
+  have hStepEq : off = stepOff := by
+    change stepOff + 0 = off at hOffEq
+    omega
+  subst hStepEq
+  have hTupCan : tupleDeclOrderIsCanonical fieldByteSize fieldAlign tupleFields = true := by
+    unfold rigidTyHasCanonicalByteLayout at hCan
+    exact (Bool.and_eq_true_iff.mp hCan).2
+  -- `fieldIdx = 0` always resolves to offset `0`.
+  cases hIdx : fieldIdx with
+  | zero =>
+    subst hIdx
+    cases tupleFields with
+    | nil => nomatch hGet
+    | cons _ _ =>
+      unfold sumPrefixFieldSizes at hPref
+      injection hPref with hP
+      subst hP
+      exact Nat.zero_mod _
+  | succ i' =>
+  subst hIdx
+  unfold tupleDeclOrderIsCanonical at hTupCan
+  cases hLen : Nat.ble (length tupleFields) 1 with
+  | true =>
+    -- At most one field: index `i' + 1` cannot be in bounds.
+    have hLe : tupleFields.length ≤ 1 := Nat.le_of_ble_eq_true hLen
+    have hLt : i' + 1 < tupleFields.length := by
+      simp only [get?_eq_getElem?] at hGet
+      exact (List.getElem?_eq_some_iff.mp hGet).1
+    omega
+  | false =>
+  rw [hLen] at hTupCan
+  cases hAll : rigidTyListAllEq tupleFields with
+  | true =>
+    -- All fields share one type: `off = (i' + 1) * size` and `align ∣ size`.
+    cases tupleFields with
+    | nil => nomatch hGet
+    | cons hd tl =>
+      unfold sumPrefixFieldSizes at hPref
+      cases hHd : fieldByteSize hd with
+      | none => rw [hHd] at hPref; nomatch hPref
+      | some s =>
+        have hUni : ∀ j k, get? (hd :: tl) j = .some k → fieldByteSize k = .some s := by
+          intro j k hGetJ
+          rw [rigidTyListAllEq_size_eq_head fieldByteSize hSizeCongr tl hd j k hAll hGetJ, hHd]
+        have hKindSz : fieldByteSize fieldKind = .some s := hUni (i' + 1) fieldKind hGet
+        have hSMod : s % fieldAlignBytes = 0 := hSizeMulAlign fieldKind s fieldAlignBytes hKindSz hAlign
+        have hPrefFull : sumPrefixFieldSizes fieldByteSize (hd :: tl) (i' + 1) = .some off := by
+          unfold sumPrefixFieldSizes
+          exact hPref
+        have hOffMul : off = (i' + 1) * s :=
+          sumPrefixFieldSizes_uniform fieldByteSize s (hd :: tl) (i' + 1) off hUni hPrefFull
+        rw [hOffMul, Nat.mul_mod, hSMod, Nat.mul_zero, Nat.zero_mod]
+  | false =>
+  rw [hAll] at hTupCan
+  dsimp only at hTupCan
+  cases hNiche : rigidTyListContainsNiche tupleFields with
+  | true => rw [hNiche] at hTupCan; nomatch hTupCan
+  | false =>
+  rw [hNiche] at hTupCan
+  cases hKeys : tupleFieldOrderKeys? fieldByteSize fieldAlign tupleFields with
+  | none => rw [hKeys] at hTupCan; nomatch hTupCan
+  | some keys =>
+  rw [hKeys] at hTupCan
+  cases hEnd : tupleDeclOrderAlignedEnd? fieldByteSize fieldAlign 0 tupleFields with
+  | none => rw [hEnd] at hTupCan; nomatch hTupCan
+  | some endOff =>
+  have hAligned :=
+    tupleDeclOrderAlignedEnd?_prefix_aligned fieldByteSize fieldAlign tupleFields 0 (i' + 1)
+      fieldKind fieldAlignBytes off endOff hEnd hGet hAlign hPref
+  simpa using hAligned
 
 /-- Prefix field offsets are monotonically increasing in `fieldIdx`: if `i <= j`
 and both `sumPrefixFieldSizes` calls succeed, then `offI <= offJ`. -/
@@ -2476,7 +2926,10 @@ def evalNullaryOp
   | .offsetOf fields =>
     match intrinsicRigidTyByteSize localDecls layouts argTy.kind with
     | .some sz =>
-      match resolveTupleOffsetOf (intrinsicRigidTyByteSize localDecls layouts) argTy.kind fields with
+      match
+        resolveTupleOffsetOf (intrinsicRigidTyByteSize localDecls layouts)
+          (intrinsicRigidTyAlign localDecls layouts) argTy.kind fields
+      with
       | .some offset =>
         match Bool.and (Nat.ble sz maxObjSize) (Nat.ble offset sz) with
         | true => .ok (.scalar ⟨offset, ptrBytes⟩) locals mem
@@ -2523,7 +2976,15 @@ theorem trusted_evalRvalue_nullaryOp_eq_unsupported
 /-- **Refinement Theorem (`evalNullaryOp_refines_trusted_evalRvalue`)**:
 `evalNullaryOp` is a sound unsupported-shrinking refinement of
 `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue (.nullaryOp op argTy)` and
-never introduces `.ub` on any input. -/
+never introduces `.ub` on any input. Because Trusted's `evalRvalue` is
+`.unsupported` on every `Rvalue.nullaryOp`, the refinement half holds for every
+possible result and constrains nothing by itself; the value Anneal returns is
+pinned to Trusted's own layout semantics by
+`evalNullaryOp_sizeOf_matches_size_of_val_intrinsic`,
+`evalNullaryOp_alignOf_matches_align_of_val_intrinsic`, and
+`evalNullaryOp_ubChecks_matches_intrinsic`, and `.offsetOf` by the
+canonical-layout gate (`resolveTupleOffsetOf_noncanonical_eq_none`,
+`resolveTupleOffsetOf_single_step_aligned`). -/
 theorem evalNullaryOp_refines_trusted_evalRvalue
     (locals : List LocalSlot)
     (op : NullOp)
@@ -2565,7 +3026,8 @@ theorem evalNullaryOp_refines_trusted_evalRvalue
     | none => intro h; nomatch h
     | some sz =>
       dsimp only
-      cases resolveTupleOffsetOf (intrinsicRigidTyByteSize localDecls layouts) kind fields with
+      cases resolveTupleOffsetOf (intrinsicRigidTyByteSize localDecls layouts)
+          (intrinsicRigidTyAlign localDecls layouts) kind fields with
       | none => intro h; nomatch h
       | some offset =>
         dsimp only
@@ -2601,6 +3063,165 @@ theorem evalNullaryOp_ubChecks_matches_intrinsic
       locals' destination targetBb =
       writeIntrinsicReturn s locals' destination targetBb (.scalar ⟨1, 1⟩) := by
   exact ⟨rfl, rfl⟩
+
+/-- **`SizeOf` Agreement With `size_of_val` (`evalNullaryOp_sizeOf_matches_size_of_val_intrinsic`)**:
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue` leaves `Rvalue.nullaryOp`
+unsupported, so `RvalueResultRefines` alone cannot constrain the value Anneal
+returns. This theorem pins it to the value Trusted itself computes for the
+equivalent intrinsic call: whenever `NullOp.sizeOf` on `argTy` returns
+`.ok (.scalar sc) ..` under a 64-bit layout table, the `size_of_val::<T>(ptr)`
+intrinsic (`evalNonSelectIntrinsicCall .sizeOfVal`, `Terminators.lean`) on a
+thin 8-byte pointer whose sized, non-extern pointee type is `argTy.kind` writes
+exactly the same `.scalar sc` to its destination (both read
+`intrinsicRigidTyByteSize`, and Anneal's `sz ≤ isize::MAX` bound coincides with
+the intrinsic's `sz < 2^63` check). -/
+theorem evalNullaryOp_sizeOf_matches_size_of_val_intrinsic
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (argTy : Ty)
+    (ptr : ProvenancePtr)
+    (sc : ScalarInt)
+    (hPtrBytes : layoutPointerBytes bodyLayouts = 8)
+    (hPointee :
+      resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps = .some argTy.kind)
+    (hNotSlice : ∀ elemTy, argTy.kind ≠ .slice elemTy)
+    (hNotStr : argTy.kind ≠ .str)
+    (hNotDyn : ∀ traitPath, argTy.kind ≠ .dynamic traitPath)
+    (hNotExtern : intrinsicTailIsExtern 8 argTy.kind = false)
+    (hEval :
+      evalNullaryOp locals' .sizeOf argTy s.memory bodyLocalDecls bodyLayouts =
+        .ok (.scalar sc) locals' s.memory) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalNonSelectIntrinsicCall
+        .sizeOfVal s target bodyLocalDecls bodyLayouts argOps [.ptr ptr 8]
+        locals' destination targetBb =
+      writeIntrinsicReturn s locals' destination targetBb (.scalar sc) := by
+  have hInv : ∃ sz, intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts argTy.kind = .some sz ∧
+      Nat.ble (signedHalfModulus 8) sz = false ∧ sc = ⟨sz, 8⟩ := by
+    unfold evalNullaryOp at hEval
+    dsimp only at hEval
+    cases hSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts argTy.kind with
+    | none => rw [hSz] at hEval; nomatch hEval
+    | some sz =>
+      rw [hSz] at hEval
+      dsimp only at hEval
+      cases hLe : Nat.ble sz
+          (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes bodyLayouts)) 2) 1) with
+      | false => rw [hLe] at hEval; nomatch hEval
+      | true =>
+        rw [hLe] at hEval
+        injection hEval with hVal _ _
+        injection hVal with hSc
+        refine ⟨sz, rfl, ?_, ?_⟩
+        · have hLeSz := Nat.le_of_ble_eq_true hLe
+          rw [hPtrBytes] at hLeSz
+          have h8 : scalarModulus 8 = 18446744073709551616 := rfl
+          have hHalf : signedHalfModulus 8 = 9223372036854775808 := rfl
+          rw [hHalf]
+          cases hB : Nat.ble 9223372036854775808 sz with
+          | false => rfl
+          | true =>
+            have hGe := Nat.le_of_ble_eq_true hB
+            simp only [nat_sub_eq, nat_div_eq, h8] at hLeSz
+            omega
+        · rw [← hSc, hPtrBytes]
+  obtain ⟨sz, hSz, hBle, rfl⟩ := hInv
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalNonSelectIntrinsicCall
+  dsimp only
+  rw [hPointee]
+  split
+  · rename_i heq
+    exact absurd (Option.some.inj heq) (hNotSlice _)
+  · rename_i heq
+    exact absurd (Option.some.inj heq) hNotStr
+  · rename_i heq
+    exact absurd (Option.some.inj heq) (hNotDyn _)
+  · rename_i heq
+    have hKind := Option.some.inj heq
+    rw [← hKind, hNotExtern]
+    dsimp only
+    rw [hSz]
+    dsimp only
+    rw [hBle]
+  · rename_i heq
+    nomatch heq
+
+/-- **`AlignOf` Agreement With `align_of_val` (`evalNullaryOp_alignOf_matches_align_of_val_intrinsic`)**:
+Whenever `NullOp.alignOf` on `argTy` returns `.ok (.scalar sc) ..` under a 64-bit
+layout table, the `align_of_val::<T>(ptr)` intrinsic
+(`evalNonSelectIntrinsicCall .alignOfVal`, `Terminators.lean`) on a thin 8-byte
+pointer whose sized, non-extern pointee type is `argTy.kind` writes exactly the
+same `.scalar sc` (both read `intrinsicRigidTyAlign`). -/
+theorem evalNullaryOp_alignOf_matches_align_of_val_intrinsic
+    (s : MachineState)
+    (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable)
+    (argOps : List Operand)
+    (locals' : List LocalSlot)
+    (destination : Place)
+    (targetBb : BasicBlockIdx)
+    (argTy : Ty)
+    (ptr : ProvenancePtr)
+    (sc : ScalarInt)
+    (hPtrBytes : layoutPointerBytes bodyLayouts = 8)
+    (hPointee :
+      resolveIntrinsicPointeeTy? target bodyLocalDecls bodyLayouts argOps = .some argTy.kind)
+    (hNotSlice : ∀ elemTy, argTy.kind ≠ .slice elemTy)
+    (hNotStr : argTy.kind ≠ .str)
+    (hNotDyn : ∀ traitPath, argTy.kind ≠ .dynamic traitPath)
+    (hNotExtern : intrinsicTailIsExtern 8 argTy.kind = false)
+    (hEval :
+      evalNullaryOp locals' .alignOf argTy s.memory bodyLocalDecls bodyLayouts =
+        .ok (.scalar sc) locals' s.memory) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalNonSelectIntrinsicCall
+        .alignOfVal s target bodyLocalDecls bodyLayouts argOps [.ptr ptr 8]
+        locals' destination targetBb =
+      writeIntrinsicReturn s locals' destination targetBb (.scalar sc) := by
+  have hInv : ∃ align, intrinsicRigidTyAlign bodyLocalDecls bodyLayouts argTy.kind = .some align ∧
+      sc = ⟨align, 8⟩ := by
+    unfold evalNullaryOp at hEval
+    dsimp only at hEval
+    cases hSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts argTy.kind with
+    | none => rw [hSz] at hEval; nomatch hEval
+    | some sz =>
+      cases hAl : intrinsicRigidTyAlign bodyLocalDecls bodyLayouts argTy.kind with
+      | none => rw [hSz, hAl] at hEval; nomatch hEval
+      | some align =>
+        rw [hSz, hAl] at hEval
+        dsimp only at hEval
+        cases hOk : Bool.and
+            (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes bodyLayouts)) 2) 1))
+            (Bool.not (Nat.beq align 0)) with
+        | false => rw [hOk] at hEval; nomatch hEval
+        | true =>
+          rw [hOk] at hEval
+          injection hEval with hVal _ _
+          injection hVal with hSc
+          exact ⟨align, rfl, by rw [← hSc, hPtrBytes]⟩
+  obtain ⟨align, hAl, rfl⟩ := hInv
+  unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalNonSelectIntrinsicCall
+  dsimp only
+  rw [hPointee]
+  split
+  · rename_i heq
+    exact absurd (Option.some.inj heq) (hNotSlice _)
+  · rename_i heq
+    exact absurd (Option.some.inj heq) hNotStr
+  · rename_i heq
+    exact absurd (Option.some.inj heq) (hNotDyn _)
+  · rename_i heq
+    have hKind := Option.some.inj heq
+    rw [← hKind, hNotExtern]
+    dsimp only
+    rw [hAl]
+  · rename_i heq
+    nomatch heq
 
 
 /-! ## Section 4: Stateful `LocalSlotState`, `D9` `PlaceMention`, `D13b` Partial Shells, `SetDiscriminant`, `Assume` & `Statements.lean` Correspondence -/
@@ -2886,19 +3507,34 @@ theorem readFromPartialShell_uninit_sibling_soundness
     rw [hInitSlot]
     exact hSubRead
 
+/-- Field slots of a `PartialAggregate` shell after `SetDiscriminant(variantIdx)`
+(`set_discriminant_in_slot` in `crates/anneal-mir/src/lower/rvalue.rs`):
+- unchanged when the written tag equals `shell.variantIdx`;
+- reset to `FieldSlot.uninit` (`shell.fields.fill(FieldSlot::Uninit)`) when the
+  tag switches to a different variant, because payload fields written through
+  `((_1 as A).i) = v` belong to variant `A` and never initialize variant `B`. -/
+def setDiscriminantFields
+    (shell : PartialAggregate)
+    (variantIdx : VariantIdx) :
+    List FieldSlot :=
+  match Nat.beq shell.variantIdx variantIdx with
+  | true => shell.fields
+  | false => replicateUninitFieldSlots shell.fields.length
+
 /-- Apply `StatementKind.setDiscriminant` at the root of a `PartialAggregate`
 shell, setting `variantIdx := variantIdx`, `isAdt := true`, and
-`discriminantSet := true`, and promoting to `LocalSlotState.init` if all
-variant fields are already initialized. -/
+`discriminantSet := true`, resetting the field slots when the tag switches to a
+different variant (`setDiscriminantFields`), and promoting to
+`LocalSlotState.init` if all variant fields are already initialized. -/
 def setDiscriminantOnShell
     (shell : PartialAggregate)
     (variantIdx : VariantIdx) :
     LocalSlotState :=
   let updated : PartialAggregate :=
-    { shell with
-      variantIdx := variantIdx
+    { variantIdx := variantIdx
       isAdt := true
-      discriminantSet := true }
+      discriminantSet := true
+      fields := setDiscriminantFields shell variantIdx }
   match updated.tryIntoValue? with
   | .some fullVal => .init fullVal
   | .none => .partialShell updated
@@ -2907,14 +3543,17 @@ def setDiscriminantOnShell
 In `rustc` MIR, enum initialization writes each payload field via
 `((_1 as V).i) = v_i` (leaving `discriminantSet = false`, so premature whole-enum
 reads fail with `.ub`) and then executes `discriminant(_1) = V`.
-Once all fields are `.init` (`shell.fields = vals.map FieldSlot.init`),
-`setDiscriminantOnShell shell variantIdx` promotes the shell to
-`LocalSlotState.init (.aggregate variantIdx vals)` (including 0-field unit enum
-variants when `vals = []`). -/
+Once all fields of variant `V = shell.variantIdx` are `.init`
+(`shell.fields = vals.map FieldSlot.init`), `setDiscriminantOnShell shell V`
+promotes the shell to `LocalSlotState.init (.aggregate V vals)` (including
+0-field unit enum variants when `vals = []`). The tag must name the variant whose
+fields were written (`hSameVariant`); see
+`setDiscriminantOnShell_switch_variant_resets_fields` for the switching case. -/
 theorem setDiscriminantOnShell_promotes_initialized_variant
     (shell : PartialAggregate)
     (variantIdx : VariantIdx)
     (vals : List Value)
+    (hSameVariant : shell.variantIdx = variantIdx)
     (hFields : shell.fields = vals.map FieldSlot.init) :
     (shell.isAdt = true →
       shell.discriminantSet = false →
@@ -2925,8 +3564,12 @@ theorem setDiscriminantOnShell_promotes_initialized_variant
   · intro hAdt hUntagged
     unfold readFromPartialShell
     rw [tryIntoValue?_eq_none_of_untagged_adt shell hAdt hUntagged]
-  · unfold setDiscriminantOnShell
+  · have hKeep : setDiscriminantFields shell variantIdx = shell.fields := by
+      unfold setDiscriminantFields
+      rw [hSameVariant, Nat.beq_refl]
+    unfold setDiscriminantOnShell
     dsimp only
+    rw [hKeep]
     have hProm :
         PartialAggregate.tryIntoValue?
           { variantIdx := variantIdx
@@ -2939,6 +3582,80 @@ theorem setDiscriminantOnShell_promotes_initialized_variant
       rw [hFields, tryFieldsIntoValues?_map_init]
       rfl
     rw [hProm]
+
+/-- **No Variant-Reinterpretation False Accept (`setDiscriminantOnShell_switch_variant_resets_fields`)**:
+If payload fields were written for variant `shell.variantIdx` (e.g. `((_1 as A).0) = x`)
+and `SetDiscriminant` then writes a *different* tag `variantIdx ≠ shell.variantIdx`
+(`discriminant(_1) = B`), every field slot is reset to `FieldSlot.uninit`, so the
+old payload is never reinterpreted as variant `B`'s payload: on a non-empty shell
+the result is a tagged `.partialShell` whose fields are all uninitialized, it is
+never promoted to `.init`, and a whole-local read faults with `.ub`
+(`UninitializedLocal`). -/
+theorem setDiscriminantOnShell_switch_variant_resets_fields
+    (shell : PartialAggregate)
+    (variantIdx : VariantIdx)
+    (hSwitch : shell.variantIdx ≠ variantIdx)
+    (hNonEmpty : shell.fields ≠ .nil) :
+    let reset : PartialAggregate :=
+      { variantIdx := variantIdx
+        isAdt := true
+        discriminantSet := true
+        fields := replicateUninitFieldSlots shell.fields.length }
+    setDiscriminantOnShell shell variantIdx = .partialShell reset ∧
+    (∀ i, i < shell.fields.length → get? reset.fields i = .some .uninit) ∧
+    (∀ v, setDiscriminantOnShell shell variantIdx ≠ .init v) ∧
+    readFromPartialShell .nil reset .nil = .ub := by
+  intro reset
+  have hBeq : Nat.beq shell.variantIdx variantIdx = false := by
+    cases h : Nat.beq shell.variantIdx variantIdx with
+    | false => rfl
+    | true => exact False.elim (hSwitch (Nat.eq_of_beq_eq_true h))
+  have hReset : setDiscriminantFields shell variantIdx =
+      replicateUninitFieldSlots shell.fields.length := by
+    unfold setDiscriminantFields
+    rw [hBeq]
+  have hPos : 0 < shell.fields.length := by
+    cases hF : shell.fields with
+    | nil => exact False.elim (hNonEmpty hF)
+    | cons _ _ => simp
+  have hUninit0 : get? reset.fields 0 = .some .uninit :=
+    get?_replicateUninitFieldSlots hPos
+  have hNone : reset.tryIntoValue? = .none :=
+    tryIntoValue?_eq_none_of_uninit_field reset 0 hUninit0
+  have hEq : setDiscriminantOnShell shell variantIdx = .partialShell reset := by
+    unfold setDiscriminantOnShell
+    dsimp only
+    rw [hReset]
+    change (match reset.tryIntoValue? with
+      | .some fullVal => LocalSlotState.init fullVal
+      | .none => LocalSlotState.partialShell reset) = _
+    rw [hNone]
+  refine ⟨hEq, ?_, ?_, ?_⟩
+  · intro i hLt
+    exact get?_replicateUninitFieldSlots hLt
+  · intro v hInit
+    rw [hEq] at hInit
+    nomatch hInit
+  · unfold readFromPartialShell
+    rw [hNone]
+
+/-- **0-Field Unit Variant Tagging (`setDiscriminantOnShell_zero_field_variant`)**:
+On a shell with no field slots (a 0-field unit enum variant), `SetDiscriminant(v)`
+promotes to `.init (.aggregate v [])` for every tag `v`. -/
+theorem setDiscriminantOnShell_zero_field_variant
+    (shell : PartialAggregate)
+    (variantIdx : VariantIdx)
+    (hEmpty : shell.fields = .nil) :
+    setDiscriminantOnShell shell variantIdx = .init (.aggregate variantIdx .nil) := by
+  have hFields : setDiscriminantFields shell variantIdx = .nil := by
+    unfold setDiscriminantFields
+    cases Nat.beq shell.variantIdx variantIdx with
+    | true => exact hEmpty
+    | false => rw [hEmpty]; rfl
+  unfold setDiscriminantOnShell
+  dsimp only
+  rw [hFields]
+  rfl
 
 /-- **Bare vs. Projected `Operand.move` Correspondence (`evalOperand_move_bare_vs_projected_correspondence`)**:
 1. Moving a bare local (`p.projection = .nil`) reads `v` and transitions `p.local_`
@@ -2984,6 +3701,223 @@ theorem evalOperand_move_bare_vs_projected_correspondence
       rw [hGet]
       dsimp only
       rw [hTrustedRead]
+
+/-- Pointwise lifting of a per-slot refinement relation `R` between Anneal
+`LocalSlotState`s and Trusted `LocalSlot`s to whole frames (equal lengths). -/
+def SlotsRefine (R : LocalSlotState → LocalSlot → Prop) :
+    List LocalSlotState → List LocalSlot → Prop
+  | .nil, .nil => True
+  | a :: as, t :: ts => R a t ∧ SlotsRefine R as ts
+  | _, _ => False
+
+/-- Related frames have equal lengths. -/
+theorem SlotsRefine.length_eq
+    {R : LocalSlotState → LocalSlot → Prop} :
+    ∀ {slots : List LocalSlotState} {locals : List LocalSlot},
+      SlotsRefine R slots locals → slots.length = locals.length
+  | .nil, .nil, _ => rfl
+  | _ :: _, .nil, h => nomatch h
+  | .nil, _ :: _, h => nomatch h
+  | _ :: as, _ :: ts, h => by
+    have := SlotsRefine.length_eq (slots := as) (locals := ts) h.2
+    simp [this]
+
+/-- Overwriting slot `i` on both sides with related slots preserves frame refinement. -/
+theorem SlotsRefine.set
+    {R : LocalSlotState → LocalSlot → Prop}
+    {a : LocalSlotState} {t : LocalSlot}
+    (hAT : R a t) :
+    ∀ {slots : List LocalSlotState} {locals : List LocalSlot} (i : Nat),
+      SlotsRefine R slots locals → SlotsRefine R (slots.set i a) (locals.set i t)
+  | .nil, .nil, _, _ => trivial
+  | _ :: _, .nil, _, h => nomatch h
+  | .nil, _ :: _, _, h => nomatch h
+  | _ :: _, _ :: _, 0, h => ⟨hAT, h.2⟩
+  | _ :: as, _ :: ts, i + 1, h => ⟨h.1, SlotsRefine.set hAT (slots := as) (locals := ts) i h.2⟩
+
+/-- Statement-level evaluator for `StatementKind.storageLive loc` over Anneal
+slots (`eval_lowered_statement` in `crates/anneal-mir/src/lower/rvalue.rs`):
+fails closed on an out-of-bounds local, and otherwise marks `loc` live and
+`.uninit`, discarding any previous value or partial shell. -/
+def evalStorageLive (slots : List LocalSlotState) (loc : Local) :
+    Option (List LocalSlotState) :=
+  match Nat.blt loc slots.length with
+  | true => .some (slots.set loc .uninit)
+  | false => .none
+
+/-- Statement-level evaluator for `StatementKind.storageDead loc` over Anneal
+slots: fails closed on an out-of-bounds local, and otherwise marks `loc` `.dead`. -/
+def evalStorageDead (slots : List LocalSlotState) (loc : Local) :
+    Option (List LocalSlotState) :=
+  match Nat.blt loc slots.length with
+  | true => .some (slots.set loc .dead)
+  | false => .none
+
+/-- Shared shape of the `StorageLive` / `StorageDead` correspondence: an in-bounds
+local is overwritten with `newAnneal` / `newTrusted` on both sides, and an
+out-of-bounds local faults on both sides. -/
+private theorem storage_stmt_correspondence_aux
+    (R : LocalSlotState → LocalSlot → Prop)
+    (newAnneal : LocalSlotState)
+    (newTrusted : LocalSlot)
+    (hNew : R newAnneal newTrusted)
+    (slots : List LocalSlotState)
+    (locals : List LocalSlot)
+    (loc : Local)
+    (hRel : SlotsRefine R slots locals) :
+    (loc < slots.length →
+      get? locals loc ≠ .none ∧
+      set? locals loc newTrusted = .some (locals.set loc newTrusted) ∧
+      SlotsRefine R (slots.set loc newAnneal) (locals.set loc newTrusted)) ∧
+    (¬ loc < slots.length → get? locals loc = .none) := by
+  have hLen := SlotsRefine.length_eq hRel
+  refine ⟨?_, ?_⟩
+  · intro hLt
+    have hLtT : loc < locals.length := hLen ▸ hLt
+    refine ⟨?_, set?_eq_some_iff.mpr ⟨hLtT, rfl⟩, SlotsRefine.set hNew loc hRel⟩
+    simp [hLtT]
+  · intro hGe
+    have hGeS : slots.length ≤ loc := Nat.le_of_not_lt hGe
+    have hGeT : locals.length ≤ loc := hLen ▸ hGeS
+    simp [hGeT]
+
+/-- **`StorageLive` Correspondence (`evalStorageLive_trusted_correspondence`)**:
+For every per-slot refinement relation `R` relating `.uninit` to `.uninit` and
+every Anneal frame `slots` related to the Trusted frame `s.frame.locals`:
+1. if `evalStorageLive slots loc = .some slots'`, then
+   `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt` on `.storageLive loc` steps
+   to `advanceStmt s locals'` (disabling the borrows minted from `loc`) for a
+   Trusted frame `locals'` that is again related to `slots'`;
+2. if `evalStorageLive` fails closed (out-of-bounds `loc`), Trusted faults with
+   `.ub`.
+`anneal-mir` does not model function-entry protectors (`Retag(FnEntry)`), so the
+theorem assumes no active protector (`s.memory.activeProtectors = []`); with an
+active protector Trusted may additionally fault on a protected borrow. -/
+theorem evalStorageLive_trusted_correspondence
+    (R : LocalSlotState → LocalSlot → Prop)
+    (hUninit : R .uninit .uninit)
+    (s : MachineState)
+    (slots : List LocalSlotState)
+    (loc : Local)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hRel : SlotsRefine R slots s.frame.locals)
+    (hNoProt : s.memory.activeProtectors = .nil) :
+    (∀ slots', evalStorageLive slots loc = .some slots' →
+      ∃ locals',
+        Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+            s ⟨.storageLive loc, span⟩ localDecls layouts =
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+        SlotsRefine R slots' locals') ∧
+    (evalStorageLive slots loc = .none →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.storageLive loc, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) := by
+  have hAux := storage_stmt_correspondence_aux R .uninit .uninit hUninit
+    slots s.frame.locals loc hRel
+  refine ⟨?_, ?_⟩
+  · intro slots' hEval
+    unfold evalStorageLive at hEval
+    cases hLt : Nat.blt loc slots.length with
+    | false => rw [hLt] at hEval; nomatch hEval
+    | true =>
+      rw [hLt] at hEval
+      injection hEval with hSlots
+      subst hSlots
+      have hLtN : loc < slots.length := by simpa using hLt
+      obtain ⟨hGet, hSet, hRel'⟩ := hAux.1 hLtN
+      refine ⟨s.frame.locals.set loc .uninit, ?_, hRel'⟩
+      cases hSlot : get? s.frame.locals loc with
+      | none => exact False.elim (hGet hSlot)
+      | some slot =>
+        dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+        rw [hSlot]
+        dsimp only
+        rw [hSet]
+        dsimp only
+        rw [hNoProt]
+  · intro hEval
+    unfold evalStorageLive at hEval
+    cases hLt : Nat.blt loc slots.length with
+    | true => rw [hLt] at hEval; nomatch hEval
+    | false =>
+      have hGe : ¬ loc < slots.length := by
+        intro hLtN
+        have hBlt : Nat.blt loc slots.length = true := by simpa using hLtN
+        rw [hLt] at hBlt
+        nomatch hBlt
+      have hNone := hAux.2 hGe
+      dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+      rw [hNone]
+
+/-- **`StorageDead` Correspondence (`evalStorageDead_trusted_correspondence`)**:
+For every per-slot refinement relation `R` relating `.dead` to `.dead` and every
+Anneal frame `slots` related to `s.frame.locals`, a successful
+`evalStorageDead slots loc = .some slots'` is matched by Trusted's `evalStmt` on
+`.storageDead loc` stepping to a related frame (absent active protectors), and an
+out-of-bounds `loc` faults on both sides. -/
+theorem evalStorageDead_trusted_correspondence
+    (R : LocalSlotState → LocalSlot → Prop)
+    (hDead : R .dead .dead)
+    (s : MachineState)
+    (slots : List LocalSlotState)
+    (loc : Local)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hRel : SlotsRefine R slots s.frame.locals)
+    (hNoProt : s.memory.activeProtectors = .nil) :
+    (∀ slots', evalStorageDead slots loc = .some slots' →
+      ∃ locals',
+        Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+            s ⟨.storageDead loc, span⟩ localDecls layouts =
+          MirStepNode.step
+            (advanceStmt s locals'
+              { s.memory with borrows := disableLocalBorrows s.memory.borrows loc }) ∧
+        SlotsRefine R slots' locals') ∧
+    (evalStorageDead slots loc = .none →
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.storageDead loc, span⟩ localDecls layouts =
+        MirStepNode.fail .ub) := by
+  have hAux := storage_stmt_correspondence_aux R .dead .dead hDead
+    slots s.frame.locals loc hRel
+  refine ⟨?_, ?_⟩
+  · intro slots' hEval
+    unfold evalStorageDead at hEval
+    cases hLt : Nat.blt loc slots.length with
+    | false => rw [hLt] at hEval; nomatch hEval
+    | true =>
+      rw [hLt] at hEval
+      injection hEval with hSlots
+      subst hSlots
+      have hLtN : loc < slots.length := by simpa using hLt
+      obtain ⟨hGet, hSet, hRel'⟩ := hAux.1 hLtN
+      refine ⟨s.frame.locals.set loc .dead, ?_, hRel'⟩
+      cases hSlot : get? s.frame.locals loc with
+      | none => exact False.elim (hGet hSlot)
+      | some slot =>
+        dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+        rw [hSlot]
+        dsimp only
+        rw [hSet]
+        dsimp only
+        rw [hNoProt]
+  · intro hEval
+    unfold evalStorageDead at hEval
+    cases hLt : Nat.blt loc slots.length with
+    | true => rw [hLt] at hEval; nomatch hEval
+    | false =>
+      have hGe : ¬ loc < slots.length := by
+        intro hLtN
+        have hBlt : Nat.blt loc slots.length = true := by simpa using hLtN
+        rw [hLt] at hBlt
+        nomatch hBlt
+      have hNone := hAux.2 hGe
+      dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
+      rw [hNone]
 
 /-- Statement-level evaluator for `StatementKind.placeMention` (`D9`). -/
 def evalPlaceMention (s : MachineState) (place : Place) : MirStepNode :=
@@ -3195,6 +4129,41 @@ theorem evalStmt_assign_uninit_array_proj_ub
   exact evalStmt_assign_uninit_non_aggregate_ub
     s dstLoc proj rest rv span localDecls layouts val locals₁ mem₁
     hNotDeref hRv hUninit hNoShell
+
+/-- **`D13b` Trusted Divergence on In-Place Enum Payload Writes (`evalStmt_assign_uninit_downcast_proj_ub`)**:
+`Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt` materializes a default shell
+for a projected write into a live but uninitialized local only when the first
+projection is `.field` (`uninitFieldWriteShell?`), so `rustc`'s in-place enum
+construction `((_1 as V).i) = rv` into an `.uninit` local faults with
+`MirStepNode.fail .ub`, whereas Episode 1 (`write_to_partial_slot`) builds an
+untagged ADT `PartialAggregate` shell (`isAdt = true`, `discriminantSet = false`)
+that `SetDiscriminant` later promotes. Because Trusted reports `.ub` here rather
+than `.unsupported`, the ADT partial-shell path lies outside the fragment on
+which Anneal's statement semantics can refine Trusted's, and no refinement claim
+may be made for it. -/
+theorem evalStmt_assign_uninit_downcast_proj_ub
+    (s : MachineState)
+    (dstLoc : Local)
+    (vName : Option String)
+    (variantIdx : VariantIdx)
+    (rest : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hUninit : get? locals₁ dstLoc = .some .uninit) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+      s ⟨.assign ⟨dstLoc, .downcast vName variantIdx :: rest⟩ rv, span⟩ localDecls layouts =
+      MirStepNode.fail .ub :=
+  evalStmt_assign_uninit_non_aggregate_ub
+    s dstLoc (.downcast vName variantIdx) rest rv span localDecls layouts val locals₁ mem₁
+    (by intro h; nomatch h) hRv hUninit rfl
 
 /-- **`D13b` Two-Field Tuple/Struct Initialization Equivalence (`evalStmt_two_field_init_promotion_correspondence`)**:
 When an uninitialized 2-field tuple or struct local `dstLoc` is initialized
