@@ -1626,8 +1626,8 @@ fn test_ep1_a1_partial_shell_and_uninit_projections_validate_field_types_and_tai
     let outer_ty = Ty::Tuple(vec![inner_ty.clone(), u8_ty()]);
     let arr_ty = Ty::Array(Box::new(u32_ty()), 2);
     let local_decls = vec![
-        outer_ty, // _0: ((u32, u8), u8)
-        arr_ty,   // _1: [u32; 2]
+        outer_ty,   // _0: ((u32, u8), u8)
+        arr_ty,     // _1: [u32; 2]
         usize_ty(), // _2: usize
     ];
     let mut state = StatementEvalState::from_local_decls(local_decls, PW);
@@ -1809,7 +1809,10 @@ fn test_ep1_a1_array_aggregates_of_unions_and_lowered_rvalue_runtime_type_guards
         Err(RvalueEvalError::TypeMismatch(_))
     ));
     let lowered_not = lower_rvalue(
-        &Rvalue::UnaryOp(anneal_mir::ir::UnOp::Not, Operand::Copy(Place::from_local(2))),
+        &Rvalue::UnaryOp(
+            anneal_mir::ir::UnOp::Not,
+            Operand::Copy(Place::from_local(2)),
+        ),
         &local_decls,
         PW,
     )
@@ -1826,3 +1829,353 @@ fn test_ep1_a1_array_aggregates_of_unions_and_lowered_rvalue_runtime_type_guards
     ));
 }
 
+// ---------------------------------------------------------------------------------------------
+// [adv B2] Projected reads cost O(path + result), not O(size of the local)
+// ---------------------------------------------------------------------------------------------
+
+/// A1 deep-checked the whole root value against its declaration on every
+/// `StatementEvalState::read_place`, and A0 deep-checked every intermediate tuple field, so
+/// reading each element of an `n`-element array (bare or inside a tuple) cost `O(n^2)`.
+/// Projected reads now check intermediate values by their outermost constructor and the
+/// returned value in full. This loop over 32768 elements is instant with that bound (and
+/// took on the order of a billion element comparisons before).
+///
+/// A projected read still rejects a malformed root constructor (wrong array element type)
+/// and a malformed returned element; a malformed element that the read does not select is
+/// detected by reads that return it, including a whole-local read.
+#[test]
+fn test_ep1_b2_projected_reads_do_not_traverse_the_whole_local() {
+    const N: usize = 1 << 15;
+    let arr_ty = Ty::Array(Box::new(u32_ty()), N);
+    let local_decls = vec![
+        arr_ty.clone(),                           // _0: [u32; N]
+        usize_ty(),                               // _1: index
+        Ty::Tuple(vec![arr_ty.clone(), u8_ty()]), // _2: ([u32; N], u8)
+    ];
+    let arr = MirValue::Array {
+        elements: (0..N).map(|i| u32v(i as u128)).collect(),
+        elem_ty: u32_ty(),
+    };
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[0] = LocalSlotState::Init(arr.clone());
+    state.slots[2] = LocalSlotState::Init(MirValue::Tuple(vec![arr.clone(), u8v(1)]));
+    let bare = proj(0, vec![ProjectionElem::Index(Local(1))]);
+    let nested = proj(
+        2,
+        vec![field(0, arr_ty.clone()), ProjectionElem::Index(Local(1))],
+    );
+    for i in 0..N {
+        state.slots[1] = LocalSlotState::Init(usizev(i as u128));
+        assert_eq!(state.read_place(&bare), Ok(u32v(i as u128)));
+        assert_eq!(state.read_place(&nested), Ok(u32v(i as u128)));
+    }
+
+    // Malformed root constructor: element type `u8` where `[u32; N]` is declared.
+    state.slots[0] = LocalSlotState::Init(MirValue::Array {
+        elements: vec![u8v(0); N],
+        elem_ty: u8_ty(),
+    });
+    state.slots[1] = LocalSlotState::Init(usizev(0));
+    assert!(matches!(
+        state.read_place(&bare),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // Malformed element `7` (a `u8`) inside a well-formed `[u32; N]` root.
+    let mut elements: Vec<MirValue> = (0..N).map(|i| u32v(i as u128)).collect();
+    elements[7] = u8v(7);
+    state.slots[0] = LocalSlotState::Init(MirValue::Array {
+        elements,
+        elem_ty: u32_ty(),
+    });
+    state.slots[1] = LocalSlotState::Init(usizev(7));
+    assert!(matches!(
+        state.read_place(&bare),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    state.slots[1] = LocalSlotState::Init(usizev(8));
+    assert_eq!(state.read_place(&bare), Ok(u32v(8)));
+    assert!(matches!(
+        state.read_place(&Place::from_local(0)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B2] `Assign` reads destination `Index` locals after the rvalue (`evalStmt` order)
+// ---------------------------------------------------------------------------------------------
+
+/// `Trusted.MirSemantics.evalStmt` on `.assign dst rv` evaluates `rv` first (threading the
+/// moved-out locals into `locals₁`) and then writes `dst` with `writeProjectedValue locals₁`,
+/// which reads `Index` locals of `dst` from `locals₁`. So `_0[_1] = move _1` faults on the
+/// uninitialized `_1` (and leaves `_0` unchanged), while `_0[_1] = copy _1` writes `_0[_1]`.
+#[test]
+fn test_ep1_b2_assign_reads_destination_index_locals_after_the_rvalue() {
+    let arr_ty = Ty::Array(Box::new(usize_ty()), 3);
+    let local_decls = vec![arr_ty.clone(), usize_ty()];
+    let arr = MirValue::Array {
+        elements: vec![usizev(0), usizev(0), usizev(0)],
+        elem_ty: usize_ty(),
+    };
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[0] = LocalSlotState::Init(arr.clone());
+    state.slots[1] = LocalSlotState::Init(usizev(2));
+    let dst = proj(0, vec![ProjectionElem::Index(Local(1))]);
+
+    run(
+        assign(dst.clone(), use_copy(Place::from_local(1))),
+        &mut state,
+    )
+    .unwrap();
+    let written = MirValue::Array {
+        elements: vec![usizev(0), usizev(0), usizev(2)],
+        elem_ty: usize_ty(),
+    };
+    assert_eq!(state.get_init(Local(0)), Some(&written));
+
+    assert_eq!(
+        run(assign(dst, use_move(Place::from_local(1))), &mut state),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(state.get_init(Local(0)), Some(&written));
+    assert_eq!(state.get_local(Local(1)), Some(&LocalSlotState::Uninit));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B2] Property test: union active-field reads and writes against a reference model
+// ---------------------------------------------------------------------------------------------
+
+/// Random sequences of whole-field writes, nested writes, whole-field and nested reads, and
+/// whole-union copies on a union local `U { a: u32, b: (u32, u8), c: [u8; 2] }`, checked
+/// against a reference model holding `(active_field, value)`:
+/// - a whole-field write of field `i` makes `i` active;
+/// - a nested write into the active field updates it in place, while a nested write into an
+///   inactive field is `UnsupportedPlaceProjection` and leaves the union unchanged;
+/// - reads of the active field (whole or nested) return the model's value, reads of an
+///   inactive field fail with `InactiveUnionField`;
+/// - `_1 = copy _0` copies the union value with its active field.
+#[test]
+fn test_ep1_b2_property_union_active_field_reads_and_writes_match_reference_model() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let arr_ty = Ty::Array(Box::new(u8_ty()), 2);
+    let field_tys = [u32_ty(), pair_ty.clone(), arr_ty.clone()];
+    let union_ty = Ty::Tuple(field_tys.to_vec());
+    let local_decls = vec![union_ty.clone(), union_ty.clone()];
+
+    // Nested sub-places of each field: (projection below the field, leaf type).
+    let nested: [Vec<(Vec<ProjectionElem>, Ty)>; 3] = [
+        vec![],
+        vec![
+            (vec![field(0, u32_ty())], u32_ty()),
+            (vec![field(1, u8_ty())], u8_ty()),
+        ],
+        vec![
+            (
+                vec![ProjectionElem::ConstantIndex {
+                    offset: 0,
+                    min_length: 2,
+                    from_end: false,
+                }],
+                u8_ty(),
+            ),
+            (
+                vec![ProjectionElem::ConstantIndex {
+                    offset: 1,
+                    min_length: 2,
+                    from_end: true,
+                }],
+                u8_ty(),
+            ),
+        ],
+    ];
+    let random_value = |rng: &mut Rng, ty: &Ty| -> MirValue {
+        match ty {
+            Ty::Uint(UintTy::U32) => u32v(u128::from(rng.below(1 << 32))),
+            Ty::Uint(UintTy::U8) => u8v(u128::from(rng.below(256))),
+            Ty::Tuple(_) => MirValue::Tuple(vec![
+                u32v(u128::from(rng.below(1 << 32))),
+                u8v(u128::from(rng.below(256))),
+            ]),
+            Ty::Array(_, _) => MirValue::Array {
+                elements: vec![
+                    u8v(u128::from(rng.below(256))),
+                    u8v(u128::from(rng.below(256))),
+                ],
+                elem_ty: u8_ty(),
+            },
+            other => panic!("unexpected field type {other:?}"),
+        }
+    };
+    let value_rvalue = |val: &MirValue| -> Rvalue {
+        match val {
+            MirValue::Int { bits, ty } => use_const(Constant::Int(*bits, ty.clone())),
+            MirValue::Tuple(vals) => Rvalue::Aggregate(
+                AggregateKind::Tuple,
+                vals.iter()
+                    .map(|v| match v {
+                        MirValue::Int { bits, ty } => {
+                            Operand::Constant(Constant::Int(*bits, ty.clone()))
+                        }
+                        other => panic!("unexpected tuple element {other:?}"),
+                    })
+                    .collect(),
+            ),
+            MirValue::Array { elements, elem_ty } => Rvalue::Aggregate(
+                AggregateKind::Array(elem_ty.clone()),
+                elements
+                    .iter()
+                    .map(|e| {
+                        Operand::Constant(Constant::Int(e.as_bits().unwrap(), elem_ty.clone()))
+                    })
+                    .collect(),
+            ),
+            other => panic!("unexpected value {other:?}"),
+        }
+    };
+    let sub = |val: &MirValue, path: &[ProjectionElem]| -> MirValue {
+        match (val, path) {
+            (v, []) => v.clone(),
+            (MirValue::Tuple(vals), [ProjectionElem::Field(i, _)]) => vals[*i].clone(),
+            (
+                MirValue::Array { elements, .. },
+                [
+                    ProjectionElem::ConstantIndex {
+                        offset, from_end, ..
+                    },
+                ],
+            ) => {
+                let idx = if *from_end {
+                    elements.len() - *offset as usize
+                } else {
+                    *offset as usize
+                };
+                elements[idx].clone()
+            }
+            other => panic!("unexpected sub-place {other:?}"),
+        }
+    };
+    let set_sub = |val: &mut MirValue, path: &[ProjectionElem], new: MirValue| match (val, path) {
+        (MirValue::Tuple(vals), [ProjectionElem::Field(i, _)]) => vals[*i] = new,
+        (
+            MirValue::Array { elements, .. },
+            [
+                ProjectionElem::ConstantIndex {
+                    offset, from_end, ..
+                },
+            ],
+        ) => {
+            let idx = if *from_end {
+                elements.len() - *offset as usize
+            } else {
+                *offset as usize
+            };
+            elements[idx] = new;
+        }
+        other => panic!("unexpected sub-place {other:?}"),
+    };
+
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    for _ in 0..60 {
+        let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+        let mut active = 0usize;
+        let mut model = random_value(&mut rng, &field_tys[0]);
+        run(
+            assign(
+                Place::from_local(0),
+                Rvalue::Aggregate(
+                    AggregateKind::Adt {
+                        def_path: "U".into(),
+                        variant_idx: 0,
+                        active_field: Some(0),
+                    },
+                    vec![Operand::Constant(Constant::Int(
+                        model.as_bits().unwrap(),
+                        u32_ty(),
+                    ))],
+                ),
+            ),
+            &mut state,
+        )
+        .unwrap();
+        for _ in 0..40 {
+            let i = rng.below(3) as usize;
+            let field_place = |extra: &[ProjectionElem]| {
+                let mut projection = vec![field(i, field_tys[i].clone())];
+                projection.extend_from_slice(extra);
+                proj(0, projection)
+            };
+            let before = state.get_local(Local(0)).cloned();
+            match rng.below(5) {
+                0 => {
+                    let v = random_value(&mut rng, &field_tys[i]);
+                    run(assign(field_place(&[]), value_rvalue(&v)), &mut state).unwrap();
+                    active = i;
+                    model = v;
+                }
+                1 if !nested[i].is_empty() => {
+                    let (path, leaf_ty) = &nested[i][rng.below(nested[i].len() as u64) as usize];
+                    let v = random_value(&mut rng, leaf_ty);
+                    let res = run(assign(field_place(path), value_rvalue(&v)), &mut state);
+                    if i == active {
+                        res.unwrap();
+                        set_sub(&mut model, path, v);
+                    } else {
+                        assert_eq!(
+                            res,
+                            Err(RvalueEvalError::UnsupportedPlaceProjection(field_place(
+                                path
+                            )))
+                        );
+                        assert_eq!(state.get_local(Local(0)).cloned(), before);
+                    }
+                }
+                2 if !nested[i].is_empty() => {
+                    let (path, _) = &nested[i][rng.below(nested[i].len() as u64) as usize];
+                    let got = state.read_place(&field_place(path));
+                    if i == active {
+                        assert_eq!(got, Ok(sub(&model, path)));
+                    } else {
+                        assert_eq!(
+                            got,
+                            Err(RvalueEvalError::InactiveUnionField {
+                                active_field: active,
+                                requested_field: i,
+                            })
+                        );
+                    }
+                }
+                3 => {
+                    run(
+                        assign(Place::from_local(1), use_copy(Place::from_local(0))),
+                        &mut state,
+                    )
+                    .unwrap();
+                    assert_eq!(state.get_local(Local(1)), state.get_local(Local(0)));
+                }
+                _ => {
+                    let got = state.read_place(&field_place(&[]));
+                    if i == active {
+                        assert_eq!(got, Ok(model.clone()));
+                    } else {
+                        assert_eq!(
+                            got,
+                            Err(RvalueEvalError::InactiveUnionField {
+                                active_field: active,
+                                requested_field: i,
+                            })
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                state.get_init(Local(0)),
+                Some(&MirValue::Adt {
+                    def_path: "U".into(),
+                    variant_idx: 0,
+                    active_field: Some(active),
+                    fields: vec![model.clone()],
+                })
+            );
+        }
+    }
+}

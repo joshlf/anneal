@@ -2626,6 +2626,48 @@ fn mir_value_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
     }
 }
 
+/// Checks only the outermost constructor of `val` against `expected_ty`: scalars in full, an
+/// array's element type and length, a tuple's or non-union ADT's field count, and a union's
+/// active-field index, without traversing nested elements or fields.
+fn mir_value_head_matches_ty(val: &MirValue, expected_ty: &Ty) -> bool {
+    match (val, expected_ty) {
+        (MirValue::Array { elements, elem_ty }, Ty::Array(expected_elem, expected_len)) => {
+            elem_ty == &**expected_elem && elements.len() == *expected_len
+        }
+        (MirValue::Tuple(vals), Ty::Tuple(field_tys)) => vals.len() == field_tys.len(),
+        (
+            MirValue::Adt {
+                active_field: None,
+                fields: vals,
+                ..
+            },
+            Ty::Tuple(field_tys),
+        ) => vals.len() == field_tys.len(),
+        (
+            MirValue::Adt {
+                variant_idx: 0,
+                active_field: Some(field_idx),
+                fields: vals,
+                ..
+            },
+            Ty::Tuple(field_tys),
+        ) => *field_idx < field_tys.len() && (vals.len() == 1 || vals.len() == field_tys.len()),
+        _ => mir_value_matches_ty(val, expected_ty),
+    }
+}
+
+/// Checks a value selected by a projection step against the step's type: in full when no
+/// later step selects a part of it (`rest` is empty or only `Downcast`s, so it is the value
+/// a read returns), otherwise only its outermost constructor
+/// ([`mir_value_head_matches_ty`]), since the later steps check the parts they select.
+fn projected_value_matches_ty(val: &MirValue, ty: &Ty, rest: &[ProjectionElem]) -> bool {
+    if rest.iter().all(|p| matches!(p, ProjectionElem::Downcast(_))) {
+        mir_value_matches_ty(val, ty)
+    } else {
+        mir_value_head_matches_ty(val, ty)
+    }
+}
+
 /// Validates that a remaining projection path `proj` is structurally compatible with `cur_ty`,
 /// returning `(leaf_ty, trailing_downcast)`. When `read_index` is `Some`, also checks dynamic
 /// `Index(idx_local)` bounds against `Ty::Array` length.
@@ -2794,6 +2836,13 @@ where
 }
 
 /// Traverses `proj` on `val` for a value-tree read.
+///
+/// Each step checks the value it selects against the step's expected type. A value that is
+/// only passed through to later steps is checked with [`mir_value_head_matches_ty`] (its
+/// outermost constructor), because the later steps check the parts of it they select; the
+/// value the read returns is checked in full with [`mir_value_matches_ty`]. A read therefore
+/// costs time proportional to the projection length plus the size of the returned value,
+/// not the size of the containing local.
 fn read_projected_mir_value(
     val: &MirValue,
     declared_ty: Option<&Ty>,
@@ -2889,7 +2938,7 @@ fn read_projected_mir_value(
                         field_count: fields.len(),
                     });
                 };
-                if !mir_value_matches_ty(field_val, expected_ty) {
+                if !projected_value_matches_ty(field_val, expected_ty, rest) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "projected tuple field runtime type does not match expected type",
                     ));
@@ -2937,7 +2986,7 @@ fn read_projected_mir_value(
                         field_count: fields.len(),
                     });
                 };
-                if !mir_value_matches_ty(field_val, expected_ty) {
+                if !projected_value_matches_ty(field_val, expected_ty, rest) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "projected ADT field runtime type does not match expected type",
                     ));
@@ -2996,7 +3045,7 @@ fn read_projected_mir_value(
                         field_count: fields.len(),
                     })?
                 };
-                if !mir_value_matches_ty(field_val, expected_ty) {
+                if !projected_value_matches_ty(field_val, expected_ty, rest) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "projected union field runtime type does not match expected type",
                     ));
@@ -3039,7 +3088,7 @@ fn read_projected_mir_value(
                     len: elements.len(),
                 });
             };
-            if !mir_value_matches_ty(elem_val, elem_ty) {
+            if !projected_value_matches_ty(elem_val, elem_ty, rest) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Array element runtime type does not match elem_ty",
                 ));
@@ -3094,7 +3143,7 @@ fn read_projected_mir_value(
                 *offset as usize
             };
             let elem_val = &elements[idx];
-            if !mir_value_matches_ty(elem_val, elem_ty) {
+            if !projected_value_matches_ty(elem_val, elem_ty, rest) {
                 return Err(RvalueEvalError::TypeMismatch(
                     "Array element runtime type does not match elem_ty",
                 ));
@@ -4474,7 +4523,10 @@ impl StatementEvalState {
                 Err(RvalueEvalError::UninitializedLocal(place.local))
             }
             Some(LocalSlotState::Init(root_val)) => {
-                if !mir_value_matches_ty(root_val, base_decl_ty) {
+                // A read returning the whole local checks it in full; a projected read checks
+                // only the root's outermost constructor here and leaves the selected parts to
+                // `read_projected_mir_value`, so it does not traverse the rest of the local.
+                if !projected_value_matches_ty(root_val, base_decl_ty, &place.projection) {
                     return Err(RvalueEvalError::TypeMismatch(
                         "initialized local runtime value does not match local declaration type",
                     ));
@@ -4742,7 +4794,7 @@ fn read_from_partial_shell(
                     None,
                 ),
                 FieldSlot::Init(field_val) => {
-                    if !mir_value_matches_ty(field_val, expected_ty) {
+                    if !projected_value_matches_ty(field_val, expected_ty, rest) {
                         return Err(RvalueEvalError::TypeMismatch(
                             "projected field runtime type does not match expected type",
                         ));
