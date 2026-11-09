@@ -2739,4 +2739,745 @@ theorem adt_primitive_nonZero_not_isFromZeros
     pk ⟨1, scalarModulus l.size.bytes - 1⟩ hLookup hInhab hVar hFields hRepr hNz hWidth
     (wrappingRangeContains_nonZeroRange_zero hPos)
 
+/-! ### 6.4 Single-Field Scalar-Wrapper Newtype ADTs (`FieldsShape.arbitrary [⟨0⟩]`) & Multi-Variant Fieldless Enums (`VariantsShape.multiple`) -/
+
+@[simp]
+theorem sliceAbstractBytes_zero_full
+    (bs : List AbstractByte) (sz : Nat)
+    (hLen : length bs = sz) :
+    sliceAbstractBytes bs 0 sz = some bs := by
+  unfold sliceAbstractBytes
+  have hBle : Nat.ble (Nat.add 0 sz) (length bs) = true := by
+    change Nat.ble (0 + sz) (length bs) = true
+    rw [Nat.zero_add, hLen]
+    exact Nat.ble_eq_true_of_le (Nat.le_refl sz)
+  rw [hBle]
+  dsimp only
+  rw [dropAbstractBytes_eq_drop, List.drop_zero, takeAbstractBytes_eq_take]
+  have hBsLen : bs.length = sz := hLen
+  rw [← hBsLen, List.take_length]
+
+/--
+Unfolding lemma for `decodeValueFromBytes` on an inhabited single-variant
+single-field scalar-wrapper newtype `.adt defPath []` (`l.fields = .arbitrary [⟨0⟩] memoryOrder`,
+`l.fieldLayouts = []`, `l.backendRepr = .scalar sl`, `scalarLayoutByteWidth sl = some l.size.bytes`),
+matching the layout emitted by `rustc` for `#[repr(transparent)]` scalar-niche wrappers
+such as `core::num::NonZero*`.
+-/
+theorem decodeValueFromBytes_adt_newtype_scalarLayout
+    (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx : Nat) (memoryOrder : List Nat) (sl : ScalarLayout)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar sl)
+    (hWidth : scalarLayoutByteWidth sl = some l.size.bytes)
+    (bs : List AbstractByte) :
+    decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath [], layoutIdx := idx } bs =
+      match Nat.beq (length bs) l.size.bytes with
+      | false => none
+      | true =>
+        match decodeScalarLayoutBytes sl bs with
+        | some v0 => some (.aggregate variantIdx [v0])
+        | none => none := by
+  unfold decodeValueFromBytes
+  dsimp only
+  rw [hLookup]
+  dsimp only
+  rw [hInhab]
+  cases hLen : Nat.beq (length bs) l.size.bytes
+  · rfl
+  · dsimp only [Bool.not, Bool.or]
+    rw [hVar, hFields, hNoFieldLayouts, hRepr]
+    dsimp only
+    have hBeqNil : Nat.beq (length ([] : List RigidTy)) (length ([{ bytes := 0 }] : List Size)) = false := rfl
+    have hBeqFl : Nat.beq (length ([] : List Nat)) (length ([{ bytes := 0 }] : List Size)) = false := rfl
+    rw [hBeqNil, hBeqFl]
+    dsimp only
+    rw [hWidth]
+    dsimp only
+    have hBsLen : length bs = l.size.bytes := Nat.eq_of_beq_eq_true hLen
+    rw [sliceAbstractBytes_zero_full bs l.size.bytes hBsLen]
+    rfl
+
+/--
+Exact evaluation of `decodeValueFromBytes` on `encodeLittleEndianBytes bits l.size.bytes prov`
+for a single-field scalar-wrapper newtype `.adt defPath []` with
+`ScalarLayout.initialized (.int bitsWidth signed) validRange`.
+-/
+theorem adt_newtype_scalarLayout_decode_encode_eq
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (bits : Nat) (prov : Option (Nat × Nat))
+    (hBits : bits < scalarModulus l.size.bytes) :
+    decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .adt defPath [], layoutIdx := idx }
+        (encodeLittleEndianBytes bits l.size.bytes prov) =
+      match wrappingRangeContains validRange bits with
+      | true => some (.aggregate variantIdx [.scalar ⟨bits, l.size.bytes⟩])
+      | false => none := by
+  have hPos : 0 < l.size.bytes := by
+    cases h : l.size.bytes with
+    | zero => rw [h] at hNz; nomatch hNz
+    | succ k => exact Nat.succ_pos k
+  have hBeqLen :
+      Nat.beq (length (encodeLittleEndianBytes bits l.size.bytes prov)) l.size.bytes = true := by
+    rw [length_encodeLittleEndianBytes]
+    exact Nat.beq_refl _
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_newtype_scalarLayout 15 layouts defPath idx l variantIdx
+        memoryOrder (.initialized (.int bitsWidth signed) validRange)
+        hLookup hInhab hVar hFields hNoFieldLayouts hRepr hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes _ hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarBytes_encodeLittleEndianBytes_of_lt l.size.bytes bits prov false hPos hBits]
+  dsimp only
+  cases wrappingRangeContains validRange bits <;> rfl
+
+/--
+A single-field scalar-wrapper newtype `.adt defPath []` with
+`ScalarLayout.initialized (.int bitsWidth signed) validRange` satisfies `IsFromBytes`
+whenever `validRange` covers all bit patterns `< scalarModulus l.size.bytes`.
+-/
+theorem adt_newtype_scalarLayout_isFromBytes_of_fullRange
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hAllValid : ∀ bits < scalarModulus l.size.bytes, wrappingRangeContains validRange bits = true) :
+    IsFromBytes layouts { kind := .adt defPath [], layoutIdx := idx } := by
+  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], ?_⟩
+  intro bs hLen hInit
+  have hBeqLen : Nat.beq (length bs) l.size.bytes = true := by
+    rw [hLen]; exact Nat.beq_refl _
+  rcases decodeScalarBytes_of_allBytesInitialized bs false (hLen ▸ hNz) hInit with
+    ⟨sv, prov, hDec⟩
+  have ⟨_, hBitsLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hDec
+  rw [hLen] at hBitsLt
+  have hValid : wrappingRangeContains validRange sv.bits = true :=
+    hAllValid sv.bits hBitsLt
+  refine ⟨.aggregate variantIdx [.scalar sv], ?_⟩
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_newtype_scalarLayout 15 layouts defPath idx l variantIdx
+        memoryOrder (.initialized (.int bitsWidth signed) validRange)
+        hLookup hInhab hVar hFields hNoFieldLayouts hRepr hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes bs hWidth]
+  simp [hBeqLen, hDec, hValid]
+
+/--
+Conversely, if any bit pattern `bits < scalarModulus l.size.bytes` falls outside
+`validRange`, then a single-field scalar-wrapper newtype `.adt defPath []` does NOT
+satisfy `IsFromBytes`.
+-/
+theorem adt_newtype_scalarLayout_not_isFromBytes_of_invalidBit
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange) (bits : Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hBits : bits < scalarModulus l.size.bytes)
+    (hInvalid : wrappingRangeContains validRange bits = false) :
+    ¬ IsFromBytes layouts { kind := .adt defPath [], layoutIdx := idx } := by
+  rintro ⟨sz, hSz, hDecAll⟩
+  simp [rigidTyByteSize, hLookup] at hSz
+  subst hSz
+  let bs := encodeLittleEndianBytes bits l.size.bytes none
+  rcases hDecAll bs (length_encodeLittleEndianBytes none l.size.bytes bits)
+    (allBytesInitialized_encodeLittleEndianBytes none l.size.bytes bits) with ⟨v, hDec⟩
+  rw [adt_newtype_scalarLayout_decode_encode_eq layouts defPath idx l variantIdx
+      bitsWidth memoryOrder signed validRange hLookup hInhab hVar hFields hNoFieldLayouts
+      hRepr hNz hWidth bits none hBits, hInvalid] at hDec
+  nomatch hDec
+
+/--
+Exact bidirectional characterization of `IsFromBytes` for single-field scalar-wrapper
+newtype ADTs (`FieldsShape.arbitrary [⟨0⟩]`): `IsFromBytes` holds if and only if
+`wrappingRangeContains validRange bits = true` for every `bits < scalarModulus l.size.bytes`.
+-/
+theorem adt_newtype_scalarLayout_isFromBytes_iff_allInRange
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes) :
+    IsFromBytes layouts { kind := .adt defPath [], layoutIdx := idx } ↔
+      (∀ bits < scalarModulus l.size.bytes, wrappingRangeContains validRange bits = true) := by
+  constructor
+  · intro hFrom bits hBits
+    cases hValid : wrappingRangeContains validRange bits
+    · exfalso
+      exact adt_newtype_scalarLayout_not_isFromBytes_of_invalidBit
+        layouts defPath idx l variantIdx bitsWidth memoryOrder signed validRange bits
+        hLookup hInhab hVar hFields hNoFieldLayouts hRepr hNz hWidth hBits hValid hFrom
+    · rfl
+  · exact adt_newtype_scalarLayout_isFromBytes_of_fullRange
+      layouts defPath idx l variantIdx bitsWidth memoryOrder signed validRange
+      hLookup hInhab hVar hFields hNoFieldLayouts hRepr hNz hWidth
+
+/--
+A single-field scalar-wrapper newtype `.adt defPath []` with
+`ScalarLayout.initialized (.int bitsWidth signed) validRange` satisfies `IsFromZeros`
+whenever `0` lies in `validRange`.
+-/
+theorem adt_newtype_scalarLayout_isFromZeros_of_zeroInRange
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hZeroValid : wrappingRangeContains validRange 0 = true) :
+    IsFromZeros layouts { kind := .adt defPath [], layoutIdx := idx } := by
+  refine ⟨l.size.bytes, .aggregate variantIdx [.scalar ⟨0, l.size.bytes⟩],
+    by simp [rigidTyByteSize, hLookup], ?_⟩
+  have hBeqLen : Nat.beq (length (zeroInitBytes l.size.bytes)) l.size.bytes = true := by
+    rw [length_zeroInitBytes]; exact Nat.beq_refl _
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_newtype_scalarLayout 15 layouts defPath idx l variantIdx
+        memoryOrder (.initialized (.int bitsWidth signed) validRange)
+        hLookup hInhab hVar hFields hNoFieldLayouts hRepr hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes
+        (zeroInitBytes l.size.bytes) hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarBytes_zeroInitBytes l.size.bytes false hNz]
+  dsimp only
+  rw [hZeroValid]
+
+/--
+A single-field scalar-wrapper newtype `.adt defPath []` with
+`ScalarLayout.initialized pk validRange` does NOT satisfy `IsFromZeros` whenever
+`wrappingRangeContains validRange 0 = false`.
+-/
+theorem adt_newtype_scalarLayout_not_isFromZeros
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx : Nat) (memoryOrder : List Nat)
+    (pk : PrimitiveKind) (validRange : WrappingRange)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hZeroInvalid : wrappingRangeContains validRange 0 = false) :
+    ¬ IsFromZeros layouts { kind := .adt defPath [], layoutIdx := idx } := by
+  rintro ⟨sz, v, hSz, hDec⟩
+  simp [rigidTyByteSize, hLookup] at hSz
+  subst hSz
+  have hBeqLen : Nat.beq (length (zeroInitBytes l.size.bytes)) l.size.bytes = true := by
+    rw [length_zeroInitBytes]; exact Nat.beq_refl _
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_newtype_scalarLayout 15 layouts defPath idx l variantIdx
+        memoryOrder (.initialized pk validRange)
+        hLookup hInhab hVar hFields hNoFieldLayouts hRepr hWidth,
+      hBeqLen] at hDec
+  dsimp only at hDec
+  unfold decodeScalarLayoutBytes scalarLayoutByteWidth at hDec
+  dsimp only at hDec
+  rw [hWidth] at hDec
+  dsimp only at hDec
+  rw [hBeqLen] at hDec
+  dsimp only at hDec
+  rw [decodeScalarBytes_zeroInitBytes l.size.bytes false hNz] at hDec
+  dsimp only at hDec
+  rw [hZeroInvalid] at hDec
+  nomatch hDec
+
+/--
+Exact bidirectional characterization of `IsFromZeros` for single-field scalar-wrapper
+newtype ADTs (`FieldsShape.arbitrary [⟨0⟩]`): `IsFromZeros` holds iff `0` lies in `validRange`.
+-/
+theorem adt_newtype_scalarLayout_isFromZeros_iff
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes) :
+    IsFromZeros layouts { kind := .adt defPath [], layoutIdx := idx } ↔
+      wrappingRangeContains validRange 0 = true := by
+  constructor
+  · intro hFz
+    cases hZ : wrappingRangeContains validRange 0
+    · exfalso
+      exact adt_newtype_scalarLayout_not_isFromZeros layouts defPath idx l variantIdx
+        memoryOrder (.int bitsWidth signed) validRange
+        hLookup hInhab hVar hFields hNoFieldLayouts hRepr hNz hWidth hZ hFz
+    · rfl
+  · exact adt_newtype_scalarLayout_isFromZeros_of_zeroInRange
+      layouts defPath idx l variantIdx bitsWidth memoryOrder signed validRange
+      hLookup hInhab hVar hFields hNoFieldLayouts hRepr hNz hWidth
+
+/--
+`IsTryFromBytes` characterization for single-field scalar-wrapper newtype ADTs
+(`FieldsShape.arbitrary [⟨0⟩]`): every decoded value has the form
+`.aggregate variantIdx [.scalar sv]` with `sv.sizeBytes = l.size.bytes`,
+`sv.bits < scalarModulus l.size.bytes`, and `wrappingRangeContains validRange sv.bits = true`.
+-/
+theorem adt_newtype_scalarLayout_isTryFromBytes
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr : l.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes) :
+    IsTryFromBytes layouts { kind := .adt defPath [], layoutIdx := idx }
+      (fun v =>
+        ∃ sv : ScalarVal,
+          v = .aggregate variantIdx [.scalar sv] ∧
+          sv.sizeBytes = l.size.bytes ∧
+          sv.bits < scalarModulus l.size.bytes ∧
+          wrappingRangeContains validRange sv.bits = true) := by
+  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], ?_⟩
+  intro bs v hDec
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_newtype_scalarLayout 15 layouts defPath idx l variantIdx
+        memoryOrder (.initialized (.int bitsWidth signed) validRange)
+        hLookup hInhab hVar hFields hNoFieldLayouts hRepr hWidth] at hDec
+  cases hLen : Nat.beq (length bs) l.size.bytes <;> rw [hLen] at hDec
+  · nomatch hDec
+  · dsimp only at hDec
+    rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes bs hWidth,
+        hLen] at hDec
+    dsimp only at hDec
+    cases hSc : decodeScalarBytes bs false <;> rw [hSc] at hDec
+    · nomatch hDec
+    case some pair =>
+      rcases pair with ⟨sv, prov⟩
+      dsimp only at hDec
+      cases hRange : wrappingRangeContains validRange sv.bits <;> rw [hRange] at hDec
+      · nomatch hDec
+      · injection hDec with hV
+        have hBsLen : length bs = l.size.bytes := Nat.eq_of_beq_eq_true hLen
+        have ⟨hSvSz, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
+        rw [hBsLen] at hSvSz hSvLt
+        exact ⟨sv, hV.symm, hSvSz, hSvLt, hRange⟩
+
+/--
+Concrete `IsTryFromBytes` theorem for real `rustc` `NonZero*` single-field newtype layouts
+(`FieldsShape.arbitrary [⟨0⟩] memoryOrder`, `validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`):
+every decoded value is `.aggregate variantIdx [.scalar sv]` with `0 < sv.bits < scalarModulus l.size.bytes`.
+-/
+theorem adt_newtype_nonZero_isTryFromBytes
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx bitsWidth : Nat) (memoryOrder : List Nat) (signed : Bool)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr :
+      l.backendRepr =
+        .scalar (.initialized (.int bitsWidth signed) ⟨1, scalarModulus l.size.bytes - 1⟩))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes) :
+    IsTryFromBytes layouts { kind := .adt defPath [], layoutIdx := idx }
+      (fun v =>
+        ∃ sv : ScalarVal,
+          v = .aggregate variantIdx [.scalar sv] ∧
+          sv.sizeBytes = l.size.bytes ∧
+          0 < sv.bits ∧
+          sv.bits < scalarModulus l.size.bytes) := by
+  have hPos : 0 < l.size.bytes := by
+    cases h : l.size.bytes with
+    | zero => rw [h] at hNz; nomatch hNz
+    | succ k => exact Nat.succ_pos k
+  rcases adt_newtype_scalarLayout_isTryFromBytes layouts defPath idx l variantIdx
+    bitsWidth memoryOrder signed ⟨1, scalarModulus l.size.bytes - 1⟩
+    hLookup hInhab hVar hFields hNoFieldLayouts hRepr hWidth with ⟨sz, hSz, hTry⟩
+  refine ⟨sz, hSz, fun bs v hDec => ?_⟩
+  rcases hTry bs v hDec with ⟨sv, rfl, hSvSz, _, hRange⟩
+  have ⟨hGt, hLt⟩ := (wrappingRangeContains_nonZeroRange_iff hPos sv.bits).mp hRange
+  exact ⟨sv, rfl, hSvSz, hGt, hLt⟩
+
+/--
+Every `NonZero*` single-field newtype layout (`FieldsShape.arbitrary [⟨0⟩] memoryOrder`,
+`validRange = ⟨1, scalarModulus l.size.bytes - 1⟩`) rejects all-zero bytes (`¬ IsFromZeros`).
+-/
+theorem adt_newtype_nonZero_not_isFromZeros
+    (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
+    (l : TypeLayout) (variantIdx : Nat) (memoryOrder : List Nat) (pk : PrimitiveKind)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNoFieldLayouts : l.fieldLayouts = [])
+    (hRepr :
+      l.backendRepr =
+        .scalar (.initialized pk ⟨1, scalarModulus l.size.bytes - 1⟩))
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth pk = some l.size.bytes) :
+    ¬ IsFromZeros layouts { kind := .adt defPath [], layoutIdx := idx } := by
+  have hPos : 0 < l.size.bytes := by
+    cases h : l.size.bytes with
+    | zero => rw [h] at hNz; nomatch hNz
+    | succ k => exact Nat.succ_pos k
+  exact adt_newtype_scalarLayout_not_isFromZeros layouts defPath idx l variantIdx
+    memoryOrder pk ⟨1, scalarModulus l.size.bytes - 1⟩
+    hLookup hInhab hVar hFields hNoFieldLayouts hRepr hNz hWidth
+    (wrappingRangeContains_nonZeroRange_zero hPos)
+
+/--
+Unfolding lemma for `decodeValueFromBytes` on an inhabited multi-variant enum
+`.adt defPath args` (`l.variants = .multiple tagLayout 0 variantShapes`,
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout = some l.size.bytes`),
+matching the layout emitted by `rustc` for multi-variant `#[repr(u8)]` / `#[repr(Int)]` enums.
+-/
+theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
+    (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (tagLayout : ScalarLayout) (variantShapes : List FieldsShape)
+    (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple tagLayout 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hWidth : scalarLayoutByteWidth tagLayout = some l.size.bytes)
+    (bs : List AbstractByte) :
+    decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx } bs =
+      match Nat.beq (length bs) l.size.bytes with
+      | false => none
+      | true =>
+        match decodeScalarLayoutBytes tagLayout bs with
+        | some (.scalar tagSc) =>
+          match get? variantShapes tagSc.bits with
+          | some (.arbitrary varOffsets _) =>
+            match decodeFieldsBySpan bs l.size.bytes varOffsets with
+            | some vals => some (.aggregate tagSc.bits vals)
+            | none => none
+          | _ => none
+        | _ => none := by
+  unfold decodeValueFromBytes
+  dsimp only
+  rw [hLookup]
+  dsimp only
+  rw [hInhab]
+  cases hLen : Nat.beq (length bs) l.size.bytes
+  · rfl
+  · dsimp only [Bool.not, Bool.or]
+    rw [hVar]
+    dsimp only
+    rw [hFields, hWidth]
+    dsimp only
+    have hGet0 : get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
+    rw [hGet0]
+    dsimp only
+    have hBsLen : length bs = l.size.bytes := Nat.eq_of_beq_eq_true hLen
+    rw [sliceAbstractBytes_zero_full bs l.size.bytes hBsLen]
+    rfl
+
+/--
+Exact evaluation of `decodeValueFromBytes` on `encodeLittleEndianBytes bits l.size.bytes prov`
+for a fieldless multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum
+(`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`,
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`) where every valid tag in `validRange` maps to a
+fieldless variant `.arbitrary [] _` in `variantShapes`.
+-/
+theorem adt_multiple_enum_scalarLayout_decode_encode_eq
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (bitsWidth : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hFieldless :
+      ∀ tag < scalarModulus l.size.bytes,
+        wrappingRangeContains validRange tag = true →
+        ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder))
+    (bits : Nat) (prov : Option (Nat × Nat))
+    (hBits : bits < scalarModulus l.size.bytes) :
+    decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .adt defPath args, layoutIdx := idx }
+        (encodeLittleEndianBytes bits l.size.bytes prov) =
+      match wrappingRangeContains validRange bits with
+      | true => some (.aggregate bits [])
+      | false => none := by
+  have hPos : 0 < l.size.bytes := by
+    cases h : l.size.bytes with
+    | zero => rw [h] at hNz; nomatch hNz
+    | succ k => exact Nat.succ_pos k
+  have hBeqLen :
+      Nat.beq (length (encodeLittleEndianBytes bits l.size.bytes prov)) l.size.bytes = true := by
+    rw [length_encodeLittleEndianBytes]
+    exact Nat.beq_refl _
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+        (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
+        hLookup hInhab hVar hFields hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes _ hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarBytes_encodeLittleEndianBytes_of_lt l.size.bytes bits prov false hPos hBits]
+  dsimp only
+  cases hW : wrappingRangeContains validRange bits
+  · rfl
+  · dsimp only
+    rcases hFieldless bits hBits hW with ⟨varMemOrder, hGet⟩
+    rw [hGet]
+
+/--
+A fieldless multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum satisfies `IsFromZeros`
+whenever `0` lies in `validRange` and variant `0` is fieldless (`.arbitrary [] _`).
+-/
+theorem adt_multiple_enum_scalarLayout_isFromZeros_of_zeroInRange
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (bitsWidth : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder varMemOrder0 : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hZeroValid : wrappingRangeContains validRange 0 = true)
+    (hVar0 : get? variantShapes 0 = some (.arbitrary [] varMemOrder0)) :
+    IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } := by
+  refine ⟨l.size.bytes, .aggregate 0 [], by simp [rigidTyByteSize, hLookup], ?_⟩
+  have hBeqLen : Nat.beq (length (zeroInitBytes l.size.bytes)) l.size.bytes = true := by
+    rw [length_zeroInitBytes]; exact Nat.beq_refl _
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+        (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
+        hLookup hInhab hVar hFields hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes
+        (zeroInitBytes l.size.bytes) hWidth,
+      hBeqLen]
+  dsimp only
+  rw [decodeScalarBytes_zeroInitBytes l.size.bytes false hNz]
+  dsimp only
+  rw [hZeroValid]
+  dsimp only
+  rw [hVar0]
+
+/--
+A multi-variant `#[repr(Int)]` / `#[repr(u8)]` enum does NOT satisfy `IsFromZeros`
+whenever `wrappingRangeContains validRange 0 = false` (e.g., when discriminant `0` is uninhabited).
+-/
+theorem adt_multiple_enum_scalarLayout_not_isFromZeros
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (pk : PrimitiveKind) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple (.initialized pk validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hNz : Nat.beq l.size.bytes 0 = false)
+    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hZeroInvalid : wrappingRangeContains validRange 0 = false) :
+    ¬ IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } := by
+  rintro ⟨sz, v, hSz, hDec⟩
+  simp [rigidTyByteSize, hLookup] at hSz
+  subst hSz
+  have hBeqLen : Nat.beq (length (zeroInitBytes l.size.bytes)) l.size.bytes = true := by
+    rw [length_zeroInitBytes]; exact Nat.beq_refl _
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+        (.initialized pk validRange) variantShapes memoryOrder
+        hLookup hInhab hVar hFields hWidth,
+      hBeqLen] at hDec
+  dsimp only at hDec
+  unfold decodeScalarLayoutBytes scalarLayoutByteWidth at hDec
+  dsimp only at hDec
+  rw [hWidth] at hDec
+  dsimp only at hDec
+  rw [hBeqLen] at hDec
+  dsimp only at hDec
+  rw [decodeScalarBytes_zeroInitBytes l.size.bytes false hNz] at hDec
+  dsimp only at hDec
+  rw [hZeroInvalid] at hDec
+  nomatch hDec
+
+/--
+`IsTryFromBytes` characterization for multi-variant `#[repr(Int)]` / `#[repr(u8)]` enums
+(`l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes`,
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`): every decoded value has the form
+`.aggregate tag vals` where `tag < scalarModulus l.size.bytes` and
+`wrappingRangeContains validRange tag = true` (and `vals = []` when all variants in `variantShapes`
+are fieldless).
+-/
+theorem adt_multiple_enum_scalarLayout_isTryFromBytes
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (bitsWidth : Nat) (signed : Bool) (validRange : WrappingRange)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple (.initialized (.int bitsWidth signed) validRange) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes) :
+    IsTryFromBytes layouts { kind := .adt defPath args, layoutIdx := idx }
+      (fun v =>
+        ∃ (tag : Nat) (vals : List Value) (varOffsets : List Size) (varMemOrder : List Nat),
+          v = .aggregate tag vals ∧
+          tag < scalarModulus l.size.bytes ∧
+          wrappingRangeContains validRange tag = true ∧
+          get? variantShapes tag = some (.arbitrary varOffsets varMemOrder)) := by
+  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], ?_⟩
+  intro bs v hDec
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+        (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
+        hLookup hInhab hVar hFields hWidth] at hDec
+  cases hLen : Nat.beq (length bs) l.size.bytes <;> rw [hLen] at hDec
+  · nomatch hDec
+  · dsimp only at hDec
+    rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes bs hWidth,
+        hLen] at hDec
+    dsimp only at hDec
+    cases hSc : decodeScalarBytes bs false <;> rw [hSc] at hDec
+    · nomatch hDec
+    case some pair =>
+      rcases pair with ⟨sv, prov⟩
+      dsimp only at hDec
+      cases hRange : wrappingRangeContains validRange sv.bits <;> rw [hRange] at hDec
+      · nomatch hDec
+      · dsimp only at hDec
+        cases hGet : get? variantShapes sv.bits <;> rw [hGet] at hDec
+        · nomatch hDec
+        case some varShape =>
+          cases varShape with
+          | arbitrary varOffsets varMemOrder =>
+            dsimp only at hDec
+            cases hSpan : decodeFieldsBySpan bs l.size.bytes varOffsets <;> rw [hSpan] at hDec
+            · nomatch hDec
+            case some vals =>
+              injection hDec with hV
+              have hBsLen : length bs = l.size.bytes := Nat.eq_of_beq_eq_true hLen
+              have ⟨_, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
+              rw [hBsLen] at hSvLt
+              exact ⟨sv.bits, vals, varOffsets, varMemOrder, hV.symm, hSvLt, hRange, hGet⟩
+          | _ => nomatch hDec
+
+/--
+A multi-variant fieldless enum (`VariantsShape.multiple tagLayout 0 variantShapes`,
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout = some l.size.bytes`,
+where every variant in `variantShapes` has empty field offsets `.arbitrary [] _`)
+satisfies `IsIntoBytes`: every valid variant encoding writes its `l.size.bytes`-byte
+discriminant tag at offset `0` with no uninitialized padding bytes.
+-/
+theorem adt_multiple_enum_fieldless_isIntoBytes
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
+    (l : TypeLayout) (tagLayout : ScalarLayout)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple tagLayout 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hWidth : scalarLayoutByteWidth tagLayout = some l.size.bytes)
+    (hFieldless :
+      ∀ (varIdx : Nat) (varOffsets : List Size) (varMemOrder : List Nat),
+        get? variantShapes varIdx = some (.arbitrary varOffsets varMemOrder) →
+        varOffsets = []) :
+    IsIntoBytes layouts { kind := .adt defPath args, layoutIdx := idx } := by
+  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], ?_⟩
+  intro v bs hEnc
+  unfold defaultCodecFuel encodeValueToBytes at hEnc
+  dsimp only at hEnc
+  rw [hLookup] at hEnc
+  dsimp only at hEnc
+  rw [hInhab, hVar] at hEnc
+  dsimp only at hEnc
+  cases v with
+  | aggregate varIdx fieldVals =>
+    dsimp only at hEnc
+    rw [hFields, hWidth] at hEnc
+    cases hGet : get? variantShapes varIdx <;> rw [hGet] at hEnc
+    · nomatch hEnc
+    case some varShape =>
+      cases varShape with
+      | arbitrary varOffsets varMemOrder =>
+        have hNil := hFieldless varIdx varOffsets varMemOrder hGet
+        subst hNil
+        dsimp only at hEnc
+        have hGet0 : get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
+        rw [hGet0] at hEnc
+        dsimp only at hEnc
+        cases hTagEnc : encodeScalarBytes ⟨varIdx, l.size.bytes⟩ none <;> rw [hTagEnc] at hEnc
+        · nomatch hEnc
+        case some tagBytes =>
+          dsimp only at hEnc
+          have ⟨hTagLen, hTagInit⟩ :=
+            encodeScalarBytes_length_and_init ⟨varIdx, l.size.bytes⟩ none tagBytes hTagEnc
+          dsimp only at hTagLen
+          have hWrite :
+              writeAbstractBytesAt (replicateUninitBytes l.size.bytes) 0 tagBytes =
+                some tagBytes := by
+            rw [replicateUninitBytes_eq_replicate]
+            have hRep :
+                List.replicate l.size.bytes AbstractByte.uninit =
+                  ([] : List AbstractByte) ++ List.replicate (tagBytes.length + 0) .uninit := by
+              change List.replicate l.size.bytes AbstractByte.uninit =
+                List.replicate (length tagBytes) AbstractByte.uninit
+              rw [hTagLen]
+            rw [hRep]
+            simpa using writeAbstractBytesAt_append_replicate [] tagBytes 0
+          rw [hWrite] at hEnc
+          dsimp only at hEnc
+          cases fieldVals with
+          | nil =>
+            injection hEnc with hBs
+            subst hBs
+            exact ⟨hTagLen, hTagInit⟩
+          | cons _ _ => nomatch hEnc
+      | _ => nomatch hEnc
+  | _ => nomatch hEnc
+
 end Anneal.BitValidity
