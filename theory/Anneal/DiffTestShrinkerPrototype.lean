@@ -639,6 +639,33 @@ theorem ddminLoop_one_eq_some_of_isOneMinimal (pred : List α → Bool) (fuel : 
   rw [hsweep]
   simp
 
+/-- Any 1-minimal chain `best` of length `1` or `2` (where the initial chunk size
+`(best.length + 1) / 2` is `1`) is a fixed point of `ddminReference` whenever
+`pred [] = false`. -/
+theorem ddminReference_eq_some_self_of_isOneMinimal_le_two (pred : List α → Bool)
+    (fuel : Nat) (best : List α) (h_min : IsOneMinimal pred best)
+    (h_nil : pred [] = false) (h_len : best.length ≤ 2) :
+    ddminReference pred (fuel + 1) best = some best := by
+  have h_pred : pred best = true := h_min.1
+  have h_ne_nil : best ≠ [] := by
+    intro h_eq
+    subst h_eq
+    rw [h_pred] at h_nil
+    contradiction
+  have h_not_empty : best.isEmpty = false := by
+    cases best with
+    | nil => contradiction
+    | cons _ _ => rfl
+  have h_pos_len : 1 ≤ best.length := by
+    cases best with
+    | nil => contradiction
+    | cons _ _ => simp
+  have h_chunk : (best.length + 1) / 2 = 1 := by omega
+  unfold ddminReference
+  rw [h_pred, h_not_empty, h_nil]
+  simp only [Bool.false_eq_true, ↓reduceIte, h_chunk]
+  exact ddminLoop_one_eq_some_of_isOneMinimal pred fuel best h_min
+
 theorem ddminLoop_spec (pred : List α → Bool) (h_nil : pred [] = false) :
     ∀ (fuel : Nat) (best : List α) (chunk : Nat) (r : List α),
       ddminLoop pred fuel best chunk = some r → pred best = true →
@@ -1173,6 +1200,38 @@ theorem bvAshrOverflowing_u64_eq_rust_mask (lhs rhs : BitVec 64) :
       (BitVec.sshiftRight lhs (rhs.toNat &&& 63), decide (64 ≤ rhs.toNat)) :=
   bvAshrOverflowing_eq_rust_mask (k := 6) lhs rhs
 
+/-- `u64::overflowing_shr` (logical): shift by `rhs & 63`, overflow iff `rhs ≥ 64`. -/
+theorem bvLshrOverflowing_u64_eq_rust_mask (lhs rhs : BitVec 64) :
+    bvLshrOverflowing lhs rhs = (lhs >>> (rhs.toNat &&& 63), decide (64 ≤ rhs.toNat)) :=
+  bvLshrOverflowing_eq_rust_mask (k := 6) lhs rhs
+
+/-- `u128::overflowing_shr` (logical): shift by `rhs & 127`, overflow iff `rhs ≥ 128`. -/
+theorem bvLshrOverflowing_u128_eq_rust_mask (lhs rhs : BitVec 128) :
+    bvLshrOverflowing lhs rhs = (lhs >>> (rhs.toNat &&& 127), decide (128 ≤ rhs.toNat)) :=
+  bvLshrOverflowing_eq_rust_mask (k := 7) lhs rhs
+
+/-- `i128::overflowing_shr` (arithmetic): shift by `rhs & 127`, overflow iff `rhs ≥ 128`. -/
+theorem bvAshrOverflowing_u128_eq_rust_mask (lhs rhs : BitVec 128) :
+    bvAshrOverflowing lhs rhs =
+      (BitVec.sshiftRight lhs (rhs.toNat &&& 127), decide (128 ≤ rhs.toNat)) :=
+  bvAshrOverflowing_eq_rust_mask (k := 7) lhs rhs
+
+/-- Sign-bit (`msb`) preservation for `bvAshrSafe`: arithmetic right shift preserves
+the sign bit of `lhs` on every in-bounds shift. -/
+theorem bvAshrSafe_msb_eq {w : Nat} {lhs rhs r : BitVec w}
+    (h : bvAshrSafe lhs rhs = some r) : r.msb = lhs.msb := by
+  obtain ⟨_, rfl⟩ := (bvAshrSafe_eq_some_iff lhs rhs r).mp h
+  exact BitVec.msb_sshiftRight
+
+/-- Sign-bit (`msb`) preservation for `bvAshrOverflowing` at every width `w`
+(including `w = 0`). -/
+theorem bvAshrOverflowing_fst_msb_eq {w : Nat} (lhs rhs : BitVec w) :
+    (bvAshrOverflowing lhs rhs).1.msb = lhs.msb := by
+  unfold bvAshrOverflowing
+  split
+  · exact BitVec.msb_sshiftRight
+  · rfl
+
 /-! ## Part 3: Concrete Kernel Regression Witnesses (Zero `native_decide`) -/
 
 /-- Wide `BitVec 64` shifts with exponent `2^32` (`4294967296`) evaluate cleanly
@@ -1467,6 +1526,7 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms ddminReference_one_minimal
 #print axioms ddminReference_total
 #print axioms ddminLoop_one_eq_some_of_isOneMinimal
+#print axioms ddminReference_eq_some_self_of_isOneMinimal_le_two
 #print axioms ddminReference_coupled_pair_witness
 #print axioms bvShlOverflowing_shift_bound
 #print axioms bvShlOverflowing_shift_lt_two_pow_32
@@ -1475,6 +1535,8 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms bvShlSafe_some_shift_lt_two_pow_32
 #print axioms bvShlOverflowing_snd_eq_true_iff
 #print axioms bvAshrOverflowing_snd_eq_true_iff
+#print axioms bvAshrSafe_msb_eq
+#print axioms bvAshrOverflowing_fst_msb_eq
 #print axioms bvShlSafe_u128_exp_2pow64_plus_13
 #print axioms bvShlOverflowing_u128_exp_2pow64_plus_13
 #print axioms bvAshrOverflowing_u128_exp_2pow64_plus_13_masks_to_13

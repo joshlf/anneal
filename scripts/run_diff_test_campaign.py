@@ -911,13 +911,19 @@ _DIAGNOSTIC_TEXT_FIELDS: tuple[str, ...] = (
 
 def _record_bucket(item: dict[str, Any]) -> str:
     """Returns the bucket a record classifies itself into: an explicit not-compared
-    reason / verdict when present (for example `miri_oracle_error` shadows an Anneal
-    `unsupported` outcome under the comparator's precedence), otherwise its Anneal
-    outcome and Lean tag."""
-    for key in ("not_compared_reason", "reason", "classification", "verdict"):
+    reason / classification when present (for example `miri_oracle_error` shadows an
+    Anneal `unsupported` outcome under the comparator's precedence), otherwise its
+    specific verdict or Anneal outcome and Lean tag."""
+    for key in ("not_compared_reason", "reason", "classification"):
         val = item.get(key)
         if isinstance(val, str) and val.strip():
             return val
+    verdict = item.get("verdict")
+    if isinstance(verdict, str) and verdict.strip() and verdict.strip().lower() != "not_compared":
+        return verdict
+    miri_out = str(item.get("miri_outcome", ""))
+    if miri_out.startswith("oracle_error"):
+        return "miri_oracle_error"
     return " ".join(str(item.get(k, "")) for k in ("anneal_outcome", "anneal_lean_tag"))
 
 
@@ -974,7 +980,17 @@ def validate_error_vs_unsupported_boundary(
     nc_oof = _int_field(nc_reasons, "out_of_fuel")
 
     # 1. Oracle-error budget over distinct errored items.
-    errored_items = max(nc_miri_err + nc_cap_err, miri_err, anneal_err)
+    item_outcomes_map = summary.get("item_outcomes")
+    item_errored_count = 0
+    if isinstance(item_outcomes_map, dict):
+        for entry in item_outcomes_map.values():
+            if not isinstance(entry, dict):
+                continue
+            m_tag = str(entry.get("miri_outcome", ""))
+            a_tag = str(entry.get("anneal_outcome", ""))
+            if m_tag.startswith("oracle_error") or a_tag.startswith("capture_error"):
+                item_errored_count += 1
+    errored_items = max(nc_miri_err + nc_cap_err, miri_err, anneal_err, item_errored_count)
     if errored_items > max_oracle_errors:
         reasons.append(
             f"oracle_errors_exceeded: {errored_items} errored items (miri_oracle_error="
@@ -1057,6 +1073,21 @@ def validate_error_vs_unsupported_boundary(
             if hit is not None:
                 reasons.append(
                     f"error_masked_as_unsupported: {list_key}[{idx}] ({label}) masks '{hit}' "
+                    f"under unsupported"
+                )
+
+    if isinstance(item_outcomes_map, dict):
+        for label, item in sorted(item_outcomes_map.items()):
+            if not isinstance(item, dict):
+                continue
+            classification = _record_bucket(item)
+            if "unsupported" not in classification.lower():
+                continue
+            text = " ".join(str(item.get(k, "")) for k in _DIAGNOSTIC_TEXT_FIELDS)
+            hit = _crash_marker(text)
+            if hit is not None:
+                reasons.append(
+                    f"error_masked_as_unsupported: item_outcomes[{label!r}] masks '{hit}' "
                     f"under unsupported"
                 )
 
@@ -1494,21 +1525,45 @@ def extract_manifest_eval_results_from_miri_summary(
 
 
 def _parse_src_pos(raw: str) -> tuple[str, int, int] | None:
-    """Parses `file:line:col` (`SourcePos::display_short`)."""
+    """Parses 1-based `file:line:col` (`SourcePos::parse_rustc_pos`)."""
     parts = [p.strip() for p in raw.rsplit(":", 2)]
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+    if len(parts) != 3 or not parts[0] or not parts[1].isdigit() or not parts[2].isdigit():
         return None
-    return parts[0], int(parts[1]), int(parts[2])
+    line, col = int(parts[1]), int(parts[2])
+    if line == 0 or col == 0:
+        return None
+    return parts[0], line, col
 
 
 def _parse_src_span(raw: str) -> tuple[str, int, int, int, int] | None:
-    """Parses `SourceSpan::display_short`, which the harness renders as
-    `file:start_line:start_col: end_line:end_col` (note the space); the compact
-    `file:start_line:start_col:end_line:end_col` form is accepted too."""
+    """Parses `SourceSpan::parse_anneal_span`: `file:start_line:start_col: end_line:end_col`
+    (with or without space after `:`) or a single point `file:line:col`."""
     parts = [p.strip() for p in raw.rsplit(":", 4)]
-    if len(parts) != 5 or not all(p.isdigit() for p in parts[1:]):
+    if len(parts) == 5 and parts[0] and all(p.isdigit() for p in parts[1:]):
+        s_line, s_col, e_line, e_col = (
+            int(parts[1]),
+            int(parts[2]),
+            int(parts[3]),
+            int(parts[4]),
+        )
+        if s_line > 0 and s_col > 0 and e_line > 0 and e_col > 0:
+            return parts[0], s_line, s_col, e_line, e_col
         return None
-    return parts[0], int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+    pos = _parse_src_pos(raw)
+    if pos is not None:
+        return pos[0], pos[1], pos[2], pos[1], pos[2]
+    return None
+
+
+def _is_valid_pass_scalar_tag(tag: str) -> bool:
+    """Returns `True` iff `tag` is `pass:scalar:<bits>:<size_bytes>` with valid integer
+    fields and `size_bytes > 0` (`MiriOutcome::PassScalar` / `AnnealOutcome::PassScalar`)."""
+    parts = tag.split(":")
+    if len(parts) != 4 or parts[0] != "pass" or parts[1] != "scalar":
+        return False
+    if not parts[2].isdigit() or not parts[3].isdigit():
+        return False
+    return int(parts[3]) > 0
 
 
 def _source_files_match(a: str, b: str) -> bool:
@@ -1564,7 +1619,7 @@ def classify_oracle_outcome_tags(miri_outcome: str, anneal_outcome: str) -> tupl
             return "diverge", "return_vs_panic"
         if a_kind == "ub":
             return "diverge", "false_positive_ub"
-        if a_kind.startswith("pass:") and m_kind == a_kind:
+        if m_kind == a_kind and (m_kind == "pass:unit" or _is_valid_pass_scalar_tag(m_kind)):
             return "agree", ""
         return "diverge", "wrong_value"
     if m_kind == "panic":
@@ -1603,6 +1658,16 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
     agree = 0
     classes: dict[str, int] = {}
     nc_counts: dict[str, int] = {}
+    miri_counts: dict[str, int] = {"pass": 0, "panic": 0, "ub": 0, "error": 0}
+    anneal_counts: dict[str, int] = {
+        "pass": 0,
+        "panic": 0,
+        "ub": 0,
+        "unsupported": 0,
+        "out_of_fuel": 0,
+        "external_call": 0,
+        "error": 0,
+    }
     error_reasons = ("miri_oracle_error", "capture_failed")
     for name, entry in sorted(items.items()):
         miri_tag = entry.get("miri_outcome") if isinstance(entry, dict) else None
@@ -1613,6 +1678,34 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
                 f"miri_outcome / anneal_outcome"
             )
             continue
+        m_prefix = miri_tag.partition("@")[0]
+        if miri_tag.startswith("oracle_error"):
+            miri_counts["error"] += 1
+        elif m_prefix.startswith("pass:"):
+            miri_counts["pass"] += 1
+        elif m_prefix in ("panic", "ub"):
+            miri_counts[m_prefix] += 1
+        else:
+            miri_counts["error"] += 1
+
+        a_prefix = anneal_tag.partition("@")[0]
+        if anneal_tag.startswith("capture_error"):
+            anneal_counts["error"] += 1
+        elif anneal_tag.startswith("externalCall"):
+            anneal_counts["external_call"] += 1
+        elif anneal_tag.startswith("unsupported"):
+            anneal_counts["unsupported"] += 1
+        elif anneal_tag.startswith("outOfFuel"):
+            anneal_counts["out_of_fuel"] += 1
+        elif a_prefix.startswith("pass:"):
+            anneal_counts["pass"] += 1
+        elif a_prefix in ("panic", "abort"):
+            anneal_counts["panic"] += 1
+        elif a_prefix == "ub":
+            anneal_counts["ub"] += 1
+        else:
+            anneal_counts["error"] += 1
+
         verdict, detail = classify_oracle_outcome_tags(miri_tag, anneal_tag)
         reported = str(entry.get("verdict", "")).strip().lower()
         if reported != verdict:
@@ -1670,6 +1763,32 @@ def audit_item_outcomes_against_summary(summary: dict[str, Any]) -> list[str]:
                 reasons.append(
                     f"{label}: not_compared_reasons.{reason} reported {rep} but item "
                     f"outcomes classify {rec}"
+                )
+    miri_map = summary.get("miri_verdicts")
+    if isinstance(miri_map, dict):
+        for k, rec in sorted(miri_counts.items()):
+            rep = _int_field(miri_map, k)
+            if rep != rec:
+                label = (
+                    "error_masked_as_unsupported"
+                    if k == "error" and rec > rep
+                    else "item_accounting_mismatch"
+                )
+                reasons.append(
+                    f"{label}: miri_verdicts.{k} reported {rep} but item outcomes classify {rec}"
+                )
+    anneal_map = summary.get("anneal_outcomes")
+    if isinstance(anneal_map, dict):
+        for k, rec in sorted(anneal_counts.items()):
+            rep = _int_field(anneal_map, k)
+            if rep != rec:
+                label = (
+                    "error_masked_as_unsupported"
+                    if k == "error" and rec > rep
+                    else "item_accounting_mismatch"
+                )
+                reasons.append(
+                    f"{label}: anneal_outcomes.{k} reported {rep} but item outcomes classify {rec}"
                 )
     return reasons
 

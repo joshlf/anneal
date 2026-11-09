@@ -836,7 +836,9 @@ pub fn candidate_replay_is_faithful(
         return false;
     }
     let replayed = replay_candidate_mutation_steps(cand, base_parsed, steps);
-    replayed.applied_mutators == cand.applied_mutators && replayed.fn_source == cand.fn_source
+    replayed.applied_mutators == cand.applied_mutators
+        && replayed.fn_source == cand.fn_source
+        && replayed.source == cand.source
 }
 
 fn unshrunk_result(
@@ -1165,12 +1167,11 @@ fn translate_span_to_repro(
     repro_start_line: u32,
 ) -> SourceSpan {
     if source_files_match(&span.file, "src/lib.rs") && span.start_line >= batch_start_line {
-        let delta = batch_start_line - repro_start_line;
         SourceSpan {
             file: "src/lib.rs".to_string(),
-            start_line: span.start_line - delta,
+            start_line: span.start_line - batch_start_line + repro_start_line,
             start_col: span.start_col,
-            end_line: span.end_line.saturating_sub(delta),
+            end_line: span.end_line.saturating_sub(batch_start_line) + repro_start_line,
             end_col: span.end_col,
         }
     } else {
@@ -2301,7 +2302,18 @@ mod tests {
         mismatched_seed_name.seed_name = "nonexistent_seed_fn".to_string();
         assert!(extract_candidate_mutation_steps(&mismatched_seed_name, &seed_refs).is_none());
 
-        for victim in [&tampered, &hand_built, &bad_seed, &mismatched_seed_name] {
+        // 5. Tampered standalone `source` with untouched `fn_source`: refuse.
+        let mut tampered_standalone = cand.clone();
+        tampered_standalone.source.push_str("\n// standalone tampered\n");
+        assert!(!candidate_replay_is_faithful(&tampered_standalone, &base, &steps));
+
+        for victim in [
+            &tampered,
+            &tampered_standalone,
+            &hand_built,
+            &bad_seed,
+            &mismatched_seed_name,
+        ] {
             let res = minimize_miri_candidate_mutations_with_compile_check(
                 victim,
                 &seed_refs,
@@ -2411,6 +2423,9 @@ mod tests {
             true,
         );
         assert!(!discrepancy_signatures_match(&width_u32, &width_u8));
+        // `translate_span_to_repro` must not underflow when `batch_start_line < repro_start_line`.
+        let translated = translate_span_to_repro(&lib_span(7), 5, 14);
+        assert_eq!((translated.start_line, translated.end_line), (16, 16));
     }
 
     #[test]

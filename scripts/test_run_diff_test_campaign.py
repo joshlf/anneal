@@ -730,6 +730,66 @@ class ErrorBoundaryAccountingTest(unittest.TestCase):
             campaign.classify_oracle_outcome_tags("ub@./src/lib.rs:3:1", "ub@src/lib.rs:2:5: 3:9"),
             ("agree", ""),
         )
+        # Single-point Anneal span (`SourceSpan::parse_anneal_span` fallback).
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags(
+                "panic@/tmp/x/src/lib.rs:12:7", "panic@src/lib.rs:12:7"
+            ),
+            ("agree", ""),
+        )
+        # Zero line/column or empty filename is rejected (`SourcePos::parse_rustc_pos`).
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("ub@src/lib.rs:0:5", "ub@src/lib.rs:0:1: 1:9"),
+            ("diverge", "ub_location_mismatch"),
+        )
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("ub@:3:5", "ub@:3:1: 3:9"),
+            ("diverge", "ub_location_mismatch"),
+        )
+        # `pass:other` is never classified as agreement (`compare_miri_and_anneal`).
+        self.assertEqual(
+            campaign.classify_oracle_outcome_tags("pass:other", "pass:other"),
+            ("diverge", "wrong_value"),
+        )
+
+    def test_item_outcomes_crash_marker_and_shadowed_capture_error_caught(self) -> None:
+        # 1. Crash marker masked inside an `item_outcomes` entry classified as `unsupported`.
+        summary = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        summary["item_outcomes"]["pass_direct_fn_call"]["anneal_outcome"] = (  # type: ignore[index]
+            "unsupported@src/lib.rs:50:5: 50:20 (SIGABRT: Nat.shiftl exponent is too big)"
+        )
+        ok, reasons = campaign.validate_error_vs_unsupported_boundary(summary, max_oracle_errors=5)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("item_outcomes['pass_direct_fn_call'] masks" in r for r in reasons),
+            reasons,
+        )
+
+        # 2. Item with both `oracle_error` and `capture_error`: `not_compared_reasons`
+        #    legitimately reports `miri_oracle_error=1, capture_failed=0`, but hiding the
+        #    Anneal capture error in `anneal_outcomes.unsupported=1, error=0` is caught.
+        shadowed = _with_consistent_item_outcomes(_make_valid_miri_summary())
+        shadowed["miri_verdicts"]["pass"] = 5  # type: ignore[index]
+        shadowed["miri_verdicts"]["error"] = 1  # type: ignore[index]
+        shadowed["not_compared_reasons"]["unsupported"] = 0  # type: ignore[index]
+        shadowed["not_compared_reasons"]["miri_oracle_error"] = 1  # type: ignore[index]
+        shadowed["item_outcomes"]["pass_direct_fn_call"] = {  # type: ignore[index]
+            "verdict": "not_compared",
+            "miri_outcome": "oracle_error:driver crashed",
+            "anneal_outcome": "capture_error:INTERNAL PANIC: Nat.shiftl exponent is too big",
+            "anneal_lean_tag": "none",
+        }
+        ok2, reasons2 = campaign.validate_error_vs_unsupported_boundary(
+            shadowed, max_oracle_errors=5
+        )
+        self.assertFalse(ok2)
+        self.assertTrue(
+            any(
+                r.startswith("error_masked_as_unsupported: anneal_outcomes.error reported 0")
+                for r in reasons2
+            ),
+            reasons2,
+        )
 
     def test_findings_with_not_compared_outcome_tags_are_rejected(self) -> None:
         for anneal_tag in (
