@@ -2812,6 +2812,28 @@ theorem FreezeOrSelf.targetProjection {f : BorrowEntry → BorrowEntry} (hf : Fr
     (e : BorrowEntry) : (f e).targetProjection = e.targetProjection := by
   rcases hf e with h | ⟨_, h⟩ <;> rw [h]
 
+theorem FreezeOrSelf.rangeOffset {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).rangeOffset = e.rangeOffset := by
+  rcases hf e with h | ⟨_, h⟩ <;> rw [h]
+
+theorem FreezeOrSelf.rangeLen {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).rangeLen = e.rangeLen := by
+  rcases hf e with h | ⟨_, h⟩ <;> rw [h]
+
+theorem FreezeOrSelf.protector {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).protector = e.protector := by
+  rcases hf e with h | ⟨_, h⟩ <;> rw [h]
+
+theorem FreezeOrSelf.parentTag {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).parentTag = e.parentTag := by
+  rcases hf e with h | ⟨_, h⟩ <;> rw [h]
+
+theorem FreezeOrSelf.perm_cases {f : BorrowEntry → BorrowEntry} (hf : FreezeOrSelf f)
+    (e : BorrowEntry) : (f e).perm = e.perm ∨ (e.perm = .active ∧ (f e).perm = .frozen) := by
+  rcases hf e with h | ⟨ha, h⟩
+  · exact .inl (by rw [h])
+  · exact .inr ⟨ha, by rw [h]⟩
+
 theorem FreezeOrSelf.eq_of_perm_ne_active {f : BorrowEntry → BorrowEntry}
     (hf : FreezeOrSelf f) {e : BorrowEntry} (h : e.perm ≠ .active) : f e = e :=
   (hf e).resolve_right fun ⟨ha, _⟩ => h ha
@@ -3069,6 +3091,28 @@ theorem evalRvalue_derefRead_freeze {locals : List LocalSlot} {rv : Rvalue} {p :
   · exact evalRvalue_use_deref (.inl rfl) hop hval
   · exact evalRvalue_use_deref (.inr rfl) hop hval
   · exact evalRvalue_copyForDeref_deref hop
+
+theorem evalRvalue_derefRead_ub {locals : List LocalSlot} {rv : Rvalue} {p : Nat}
+    {rest : List ProjectionElem} (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩))
+    {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
+      mem.callerLocals = .ub) :
+    evalRvalue locals rv mem decls layouts = .ub := by
+  rcases copyRv_eq_use_copy_deref hcrv with rfl | rfl | rfl
+  · exact evalRvalue_use_ub hop
+  · exact evalRvalue_use_ub hop
+  · exact evalRvalue_copyForDeref_ub hop
+
+theorem evalRvalue_derefRead_unsupported {locals : List LocalSlot} {rv : Rvalue} {p : Nat}
+    {rest : List ProjectionElem} (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩))
+    {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
+    (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
+      mem.callerLocals = .unsupported) :
+    evalRvalue locals rv mem decls layouts = .unsupported := by
+  rcases copyRv_eq_use_copy_deref hcrv with rfl | rfl | rfl
+  · exact evalRvalue_use_unsupported hop
+  · exact evalRvalue_use_unsupported hop
+  · exact evalRvalue_copyForDeref_unsupported hop
 
 theorem evalRvalue_frag {layouts : Layout.LayoutTable} (decls : List LocalDecl) (locals : List LocalSlot)
     (hslots : SlotsOk layouts decls locals) (hn : locals.length = decls.length)
@@ -6901,5 +6945,381 @@ theorem evalStmt_assume_anneal (s : MachineState) (decls : List LocalDecl)
   · simp [evalStmt, hmove, hAnone hnone, opWithLocals]
   · simp [evalStmt, hmove, hAok 0 h0, opWithLocals, u8Ty]
   · simp [evalStmt, hmove, hAok 1 h1, opWithLocals, u8Ty]
+
+/-! ## Thin-Pointer Projection Resolution, Tree Borrows Writes & Pointer Cast/Offset Helpers -/
+
+theorem appendProjections_nil_right (xs : List ProjectionElem) :
+    MirSemantics.appendProjections xs [] = xs := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih => simp [MirSemantics.appendProjections_cons, ih]
+
+theorem stripTransparentProjections_allFields {projs : List ProjectionElem}
+    (h : allFields projs = true) :
+    MirSemantics.stripTransparentProjections projs = projs := by
+  induction projs with
+  | nil => rfl
+  | cons e rest ih =>
+    cases e <;> simp [allFields] at h
+    simp [MirSemantics.stripTransparentProjections, ih h]
+
+theorem normalizeSubsliceProjectionsAux_allFields {projs : List ProjectionElem}
+    (h : allFields projs = true) :
+    MirSemantics.normalizeSubsliceProjectionsAux .none projs = projs := by
+  induction projs with
+  | nil => rfl
+  | cons e rest ih =>
+    cases e <;> simp [allFields] at h
+    simp [MirSemantics.normalizeSubsliceProjectionsAux, ih h]
+
+theorem normalizeSubsliceProjections_allFields {projs : List ProjectionElem}
+    (h : allFields projs = true) :
+    MirSemantics.normalizeSubsliceProjections projs = projs :=
+  normalizeSubsliceProjectionsAux_allFields h
+
+theorem endsWithSubslice_allFields {projs : List ProjectionElem}
+    (h : allFields projs = true) :
+    MirSemantics.endsWithSubslice projs = false := by
+  induction projs with
+  | nil => rfl
+  | cons e rest ih =>
+    cases e <;> simp [allFields] at h
+    exact ih h
+
+theorem needsThinPtrElemResolution_allFields {projs : List ProjectionElem} {off : Nat}
+    (h : allFields projs = true) (hoff : off = 0) :
+    MirSemantics.needsThinPtrElemResolution projs off = false := by
+  subst hoff
+  cases projs with
+  | nil => rfl
+  | cons e rest =>
+    have hstrip := stripTransparentProjections_allFields h
+    have hnorm := normalizeSubsliceProjections_allFields h
+    have hends := endsWithSubslice_allFields h
+    simp [MirSemantics.needsThinPtrElemResolution, hstrip, hnorm, hends]
+
+theorem resolveBorrowProjectionElems_allFields (locals : List LocalSlot)
+    {projs : List ProjectionElem} (h : allFields projs = true) :
+    MirSemantics.resolveBorrowProjectionElems locals projs = some projs := by
+  induction projs with
+  | nil => rfl
+  | cons e rest ih =>
+    cases e <;> simp [allFields] at h
+    simp [MirSemantics.resolveBorrowProjectionElems, ih h]
+
+theorem allFields_of_resolveFieldPath {layouts : Layout.LayoutTable}
+    {spec : TupleSpec} {projs : List ProjectionElem} {r : Nat × TupleSpec}
+    (h : resolveFieldPath layouts spec projs = some r) :
+    allFields projs = true := by
+  induction projs generalizing spec r with
+  | nil => rfl
+  | cons e rest ih =>
+    cases spec with
+    | scalar _ => simp [resolveFieldPath] at h
+    | tuple fields size align =>
+      cases e with
+      | field idx fieldTy =>
+        simp only [resolveFieldPath, Option.bind_eq_bind] at h
+        cases h1 : fields[idx]? with
+        | none => simp [h1] at h
+        | some pair =>
+          obtain ⟨off, subSpec⟩ := pair
+          cases h2 : specOfRigidTy layouts fieldTy.kind fieldTy.layoutIdx with
+          | none => simp [h1, h2] at h
+          | some expectedSpec =>
+            simp only [h1, h2, Option.bind_some] at h
+            split at h
+            · cases h3 : resolveFieldPath layouts subSpec rest with
+              | none => simp [h3] at h
+              | some r' => simp [allFields, ih h3]
+            · simp at h
+      | _ => simp [resolveFieldPath] at h
+
+theorem stripTransparentProjections_of_ptrTargetSpec {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} {place : Place} {it : Gen.IntType} {relOff : Nat}
+    (h : ptrTargetSpec layouts decls place = some (it, relOff)) :
+    MirSemantics.stripTransparentProjections place.projection = place.projection := by
+  rcases place with ⟨k, projs⟩
+  cases projs with
+  | nil => rfl
+  | cons e rest =>
+    cases e with
+    | constantIndex offset minLen fromEnd =>
+      cases rest with
+      | nil => rfl
+      | cons _ _ => simp [ptrTargetSpec] at h
+    | field idx fieldTy =>
+      simp only [ptrTargetSpec] at h
+      split at h
+      · cases hd : decls[k]? with
+        | none => simp [hd] at h
+        | some d =>
+          cases ht : tupleTypeOf layouts d.ty with
+          | none => simp [hd, ht] at h
+          | some tpair =>
+            obtain ⟨fields, size, align⟩ := tpair
+            cases hres : resolveFieldPath layouts (.tuple fields size align)
+                (.field idx fieldTy :: rest) with
+            | none => simp [hd, ht, hres] at h
+            | some rpair =>
+              exact stripTransparentProjections_allFields (allFields_of_resolveFieldPath hres)
+      · simp at h
+    | _ => simp [ptrTargetSpec] at h
+
+theorem normalizeSubsliceProjections_of_ptrTargetSpec {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} {place : Place} {it : Gen.IntType} {relOff : Nat}
+    (h : ptrTargetSpec layouts decls place = some (it, relOff)) :
+    MirSemantics.normalizeSubsliceProjections place.projection = place.projection := by
+  rcases place with ⟨k, projs⟩
+  cases projs with
+  | nil => rfl
+  | cons e rest =>
+    cases e with
+    | constantIndex offset minLen fromEnd =>
+      cases rest with
+      | nil => rfl
+      | cons _ _ => simp [ptrTargetSpec] at h
+    | field idx fieldTy =>
+      simp only [ptrTargetSpec] at h
+      split at h
+      · cases hd : decls[k]? with
+        | none => simp [hd] at h
+        | some d =>
+          cases ht : tupleTypeOf layouts d.ty with
+          | none => simp [hd, ht] at h
+          | some tpair =>
+            obtain ⟨fields, size, align⟩ := tpair
+            cases hres : resolveFieldPath layouts (.tuple fields size align)
+                (.field idx fieldTy :: rest) with
+            | none => simp [hd, ht, hres] at h
+            | some rpair =>
+              exact normalizeSubsliceProjections_allFields (allFields_of_resolveFieldPath hres)
+      · simp at h
+    | _ => simp [ptrTargetSpec] at h
+
+theorem endsWithSubslice_of_ptrTargetSpec {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} {place : Place} {it : Gen.IntType} {relOff : Nat}
+    (h : ptrTargetSpec layouts decls place = some (it, relOff)) :
+    MirSemantics.endsWithSubslice place.projection = false := by
+  rcases place with ⟨k, projs⟩
+  cases projs with
+  | nil => rfl
+  | cons e rest =>
+    cases e with
+    | constantIndex offset minLen fromEnd =>
+      cases rest with
+      | nil => rfl
+      | cons _ _ => simp [ptrTargetSpec] at h
+    | field idx fieldTy =>
+      simp only [ptrTargetSpec] at h
+      split at h
+      · cases hd : decls[k]? with
+        | none => simp [hd] at h
+        | some d =>
+          cases ht : tupleTypeOf layouts d.ty with
+          | none => simp [hd, ht] at h
+          | some tpair =>
+            obtain ⟨fields, size, align⟩ := tpair
+            cases hres : resolveFieldPath layouts (.tuple fields size align)
+                (.field idx fieldTy :: rest) with
+            | none => simp [hd, ht, hres] at h
+            | some rpair =>
+              exact endsWithSubslice_allFields (allFields_of_resolveFieldPath hres)
+      · simp at h
+    | _ => simp [ptrTargetSpec] at h
+
+theorem needsThinPtrElemResolution_of_ptrTargetSpec {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} {place : Place} {it : Gen.IntType} {relOff : Nat} {off : Nat}
+    (h : ptrTargetSpec layouts decls place = some (it, relOff)) (hoff : off = 0) :
+    MirSemantics.needsThinPtrElemResolution place.projection off = false := by
+  subst hoff
+  have hstrip := stripTransparentProjections_of_ptrTargetSpec h
+  have hnorm := normalizeSubsliceProjections_of_ptrTargetSpec h
+  have hends := endsWithSubslice_of_ptrTargetSpec h
+  rcases place with ⟨k, projs⟩
+  cases projs with
+  | nil => rfl
+  | cons e rest =>
+    simp [MirSemantics.needsThinPtrElemResolution, hstrip, hnorm, hends]
+
+theorem resolveDerefWriteFullProj_of_ptrTargetSpec {layouts : Layout.LayoutTable}
+    {decls : List LocalDecl} (indexLocals targetLocals : List LocalSlot)
+    (pv : ProvenancePtr) (sz : Nat) (entry : BorrowEntry) (callerLocals : List LocalSlot)
+    {it : Gen.IntType} {relOff : Nat}
+    (hspec : ptrTargetSpec layouts decls ⟨entry.targetLocal, entry.targetProjection⟩ = some (it, relOff))
+    (hoff : pv.offsetBytes = 0) :
+    MirSemantics.resolveDerefWriteFullProj indexLocals targetLocals (.ptr pv sz) entry [] callerLocals =
+      entry.targetProjection := by
+  have hneeds := needsThinPtrElemResolution_of_ptrTargetSpec hspec hoff
+  have hstrip := stripTransparentProjections_of_ptrTargetSpec hspec
+  have hnorm := normalizeSubsliceProjections_of_ptrTargetSpec hspec
+  unfold MirSemantics.resolveDerefWriteFullProj
+  simp only [hneeds]
+  cases htp : entry.targetProjection with
+  | nil => rfl
+  | cons ph pt =>
+    simp only [appendProjections_nil_right]
+    rw [← htp, hstrip, hnorm]
+
+theorem invalidateTreeBorrowsAtProj_eq_map (all bs : List BorrowEntry) (t : Nat)
+    (w : Option Nat) (proj : List ProjectionElem) (off len : Nat) :
+    MirSemantics.invalidateTreeBorrowsAtProj all bs t w proj off len =
+      bs.map (fun e => MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len) := by
+  induction bs with
+  | nil => rfl
+  | cons e rest ih => rw [MirSemantics.invalidateTreeBorrowsAtProj, ih, List.map_cons]
+
+theorem updateBorrowPermAtProj_fields (e : BorrowEntry) (t : Nat) (w : Option Nat)
+    (proj : List ProjectionElem) (off len : Nat) :
+    (MirSemantics.updateBorrowPermAtProj e t w proj off len).tag = e.tag ∧
+    (MirSemantics.updateBorrowPermAtProj e t w proj off len).targetLocal = e.targetLocal ∧
+    (MirSemantics.updateBorrowPermAtProj e t w proj off len).targetProjection = e.targetProjection ∧
+    (MirSemantics.updateBorrowPermAtProj e t w proj off len).rangeOffset = e.rangeOffset ∧
+    (MirSemantics.updateBorrowPermAtProj e t w proj off len).rangeLen = e.rangeLen ∧
+    (MirSemantics.updateBorrowPermAtProj e t w proj off len).protector = e.protector ∧
+    (MirSemantics.updateBorrowPermAtProj e t w proj off len).parentTag = e.parentTag := by
+  unfold MirSemantics.updateBorrowPermAtProj
+  cases Nat.beq e.targetLocal t <;> dsimp only
+  · exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · cases w <;> dsimp only
+    · cases MirSemantics.borrowEntryOverlapsWrite e proj off len <;> dsimp only
+      · exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      · cases e.perm <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    · rename_i tag
+      cases Nat.beq e.tag tag <;> dsimp only
+      · cases MirSemantics.borrowEntryOverlapsWrite e proj off len <;>
+          exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      · cases e.perm <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem updateBorrowPermTreeAtProj_fields (all : List BorrowEntry) (e : BorrowEntry)
+    (t : Nat) (w : Option Nat) (proj : List ProjectionElem) (off len : Nat) :
+    (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).tag = e.tag ∧
+    (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).targetLocal = e.targetLocal ∧
+    (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).targetProjection = e.targetProjection ∧
+    (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).rangeOffset = e.rangeOffset ∧
+    (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).rangeLen = e.rangeLen ∧
+    (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).protector = e.protector ∧
+    (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).parentTag = e.parentTag :=
+  updateBorrowPermAtProj_fields e t (MirSemantics.resolveTreeBorrowWriterTag all e w) proj off len
+
+theorem updateBorrowPermTreeAtProj_of_targetLocal_ne (all : List BorrowEntry)
+    {e : BorrowEntry} {t : Nat} (w : Option Nat) (proj : List ProjectionElem) (off len : Nat)
+    (h : e.targetLocal ≠ t) :
+    MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len = e := by
+  unfold MirSemantics.updateBorrowPermTreeAtProj MirSemantics.updateBorrowPermAtProj
+  cases hb : Nat.beq e.targetLocal t with
+  | false => rfl
+  | true => exact absurd (Nat.eq_of_beq_eq_true hb) h
+
+theorem updateBorrowPermTreeAtProj_of_descendant (all : List BorrowEntry) {e : BorrowEntry}
+    (t : Nat) {wTag : Nat} (proj : List ProjectionElem) (off len : Nat)
+    (h : MirSemantics.isBorrowDescendantOrSelf all wTag e.tag = true) :
+    MirSemantics.updateBorrowPermTreeAtProj all e t (some wTag) proj off len =
+      (if Nat.beq e.targetLocal t then
+        match e.perm with
+        | .reserved => { e with perm := .active }
+        | _ => e
+      else e) := by
+  unfold MirSemantics.updateBorrowPermTreeAtProj MirSemantics.resolveTreeBorrowWriterTag
+    MirSemantics.updateBorrowPermAtProj
+  simp only [h, Nat.beq_refl]
+  cases Nat.beq e.targetLocal t <;> rfl
+
+theorem evalRvalue_ptrToPtr_of_rawPtrPointeeOf (locals : List LocalSlot) (p : Nat)
+    (targetTy : MirAst.Ty) (mem : MirSemantics.Memory) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) {dp : LocalDecl}
+    {srcMutbl dstMutbl : MirAst.Mutability} {srcIt dstIt : Gen.IntType}
+    (hdp : decls[p]? = some dp)
+    (hsrc : ptrPointeeOf dp.ty = some (srcMutbl, srcIt))
+    (hdst : rawPtrPointeeOf targetTy = some (dstMutbl, dstIt)) :
+    (∀ pv sz, locals[p]? = some (.init (.ptr pv sz)) →
+      evalRvalue locals (.cast .ptrToPtr (.copy ⟨p, []⟩) targetTy) mem decls layouts =
+        .ok (.ptr pv sz) locals mem) ∧
+    ((locals[p]? = some .uninit ∨ locals[p]? = some .dead) →
+      evalRvalue locals (.cast .ptrToPtr (.copy ⟨p, []⟩) targetTy) mem decls layouts = .ub) := by
+  have hplTy : MirSemantics.placeTy decls layouts ⟨p, []⟩ = some dp.ty := by
+    simp [MirSemantics.placeTy, MirSemantics.resolveProjectedTy, get?, hdp]
+  refine ⟨fun pv sz hpv => ?_, fun hu => ?_⟩
+  · unfold rawPtrPointeeOf at hdst
+    unfold ptrPointeeOf at hsrc
+    rcases dp with ⟨dpMut, ⟨dpKind, dpLidx⟩, dpName⟩
+    dsimp only at hsrc hplTy
+    cases htk : targetTy.kind with
+    | rawPtr dm dstElem =>
+      rw [htk] at hdst
+      cases dstElem <;> simp [intTyBytes] at hdst <;>
+      · cases dpKind with
+        | rawPtr sm srcElem | ref sm srcElem =>
+          cases srcElem <;> simp [intTyBytes] at hsrc <;>
+            simp [evalRvalue, evalOperand, get?, hpv, readProjectedValue, htk, hplTy]
+        | _ => simp at hsrc
+    | _ => rw [htk] at hdst; cases hdst
+  · rcases hu with hu | hu <;>
+      simp [evalRvalue, evalOperand, get?, hu]
+
+theorem pointeeElemByteStride_of_ptrPointeeOf (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) {p : Nat} {dp : LocalDecl}
+    {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (hdp : decls[p]? = some dp) (hpt : ptrPointeeOf dp.ty = some (mutbl, it)) :
+    MirSemantics.pointeeElemByteStride decls layouts (.copy ⟨p, []⟩) = some it.size.bytes := by
+  have hopTy : MirSemantics.operandTy decls layouts (.copy ⟨p, []⟩) = some dp.ty := by
+    simp [MirSemantics.operandTy, MirSemantics.placeTy, MirSemantics.resolveProjectedTy, get?, hdp]
+  unfold ptrPointeeOf at hpt
+  cases hk : dp.ty.kind with
+  | rawPtr m pointee | ref m pointee =>
+    rw [hk] at hpt
+    obtain ⟨⟨sg, n⟩, hb, heq⟩ := Option.map_eq_some_iff.mp hpt
+    injection heq with _ hit
+    subst hit
+    have hcast : MirSemantics.intCastTargetBytes pointee = some n :=
+      intCastTargetBytes_of_intTypeOf (ty := ⟨pointee, 0⟩) (it := ⟨sg, ⟨n⟩⟩) (by simp [intTypeOf, hb])
+    cases pointee <;> simp [intTyBytes] at hb <;>
+      simp [MirSemantics.pointeeElemByteStride, hopTy, hk, MirSemantics.pointeeTyOf,
+        MirSemantics.rigidTyKindByteSize, hcast]
+  | _ => rw [hk] at hpt; cases hpt
+
+theorem evalBinOpOffset_zero (pv : ProvenancePtr) (elemStride : Nat)
+    (allocBoundOpt : Option Nat) (hoff : pv.offsetBytes = 0)
+    (hbound : ∀ b, allocBoundOpt = some b → b < 2 ^ 63) :
+    MirSemantics.evalBinOpOffset pv 8 ⟨0, 8⟩ elemStride allocBoundOpt = some pv := by
+  have hpv : { pv with offsetBytes := 0 } = pv := by cases pv; simp_all
+  have hmod : MirSemantics.wrapScalarBits 0 (MirSemantics.scalarModulus 8) = 0 := rfl
+  have hneg : MirSemantics.isSignedNegative 0 8 = false := rfl
+  have hhalf : MirSemantics.signedHalfModulus 8 = 2 ^ 63 := by decide
+  have hble0 : Nat.ble (MirSemantics.signedHalfModulus 8) 0 = false := by decide
+  unfold MirSemantics.evalBinOpOffset
+  simp only [Nat.beq_refl, Bool.and_self, hmod, hneg, Nat.mul_eq, Nat.add_eq,
+    Nat.zero_mul, hoff, Nat.add_zero, hble0]
+  cases hb : allocBoundOpt with
+  | none => simp [hpv]
+  | some b =>
+    have hlt := hbound b hb
+    have hbleB : Nat.ble (MirSemantics.signedHalfModulus 8) b = false := by
+      rw [hhalf]
+      cases h : Nat.ble (2 ^ 63) b
+      · rfl
+      · exact absurd (Nat.ble_eq.mp h) (by omega)
+    have h0le : Nat.ble 0 b = true := Nat.ble_eq.mpr (Nat.zero_le b)
+    simp [hbleB, h0le, Bool.or_true, hpv]
+
+theorem evalPtrOffsetBinOp_zero (locals : List LocalSlot) (mem : MirSemantics.Memory)
+    (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    {p : Nat} {dp : LocalDecl} {mutbl : MirAst.Mutability} {it : Gen.IntType}
+    (hdp : decls[p]? = some dp) (hpt : ptrPointeeOf dp.ty = some (mutbl, it))
+    (pv : ProvenancePtr) (hoff : pv.offsetBytes = 0)
+    (hndis : ∀ e, lookupBorrow mem.borrows pv.tag = some e → e.perm ≠ .disabled)
+    (hbound : ∀ b, MirSemantics.ptrAllocByteBound? locals mem decls layouts pv = some b → b < 2 ^ 63) :
+    MirSemantics.evalPtrOffsetBinOp locals mem decls layouts (.copy ⟨p, []⟩) pv 8 ⟨0, 8⟩ =
+      .ok (.ptr pv 8) locals mem := by
+  have hstride := pointeeElemByteStride_of_ptrPointeeOf decls layouts hdp hpt
+  have hoffOk := evalBinOpOffset_zero pv it.size.bytes
+    (MirSemantics.ptrAllocByteBound? locals mem decls layouts pv) hoff hbound
+  unfold MirSemantics.evalPtrOffsetBinOp
+  cases hlb : lookupBorrow mem.borrows pv.tag with
+  | none => simp [hstride, hoffOk]
+  | some e =>
+    have hne := hndis e hlb
+    rcases e with ⟨_, _, _, perm, _, _, _, _⟩
+    cases perm <;> simp_all
 
 end MiniRustSpec.Correspondence

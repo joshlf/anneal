@@ -3583,11 +3583,36 @@ def ptrTargetOk (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
   | some (it, _) => decide (it = pointeeIt)
   | none => false
 
-/-- Whether `c` is an integer constant encoding `0` (`Offset(p, 0)`). -/
+/-- Whether `c` is an 8-byte integer constant encoding `0` (`Offset(p, 0)`),
+matching `MirSemantics.evalBinOpOffset`'s 64-bit offset width check. -/
 def zeroOffsetConstOk (c : MirAst.ConstOperand) : Bool :=
   match c.val, intTypeOf c.ty with
-  | .scalar (.int ⟨0, sz⟩), some rIt => decide (sz = rIt.size.bytes)
+  | .scalar (.int ⟨0, sz⟩), some rIt => decide (sz = 8 ∧ rIt.size.bytes = 8)
   | _, _ => false
+
+theorem zeroOffsetConstOk_iff {c : MirAst.ConstOperand} :
+    zeroOffsetConstOk c = true ↔
+      ∃ rIt, c.val = .scalar (.int ⟨0, 8⟩) ∧ intTypeOf c.ty = some rIt ∧ rIt.size.bytes = 8 := by
+  unfold zeroOffsetConstOk
+  split
+  · next sz rIt hval hit =>
+    simp only [decide_eq_true_eq]
+    constructor
+    · rintro ⟨rfl, hr⟩
+      exact ⟨rIt, hval, hit, hr⟩
+    · rintro ⟨rIt', hval', hit', hr⟩
+      rw [hval] at hval'
+      rw [hit] at hit'
+      injection hval' with h1
+      injection h1 with h2
+      injection h2 with _ hsz
+      injection hit' with hrIt
+      subst hsz; subst hrIt
+      exact ⟨rfl, hr⟩
+  · next hne =>
+    simp only [Bool.false_eq_true, false_iff, not_exists, not_and]
+    intro rIt hval hit _
+    exact hne 8 rIt hval hit
 
 /-- Fragment rvalues producing a thin raw pointer (`isRef = false`) or reference
 (`isRef = true`) of mutability `mutbl` and pointee integer type `pointeeIt`
@@ -4202,6 +4227,14 @@ def reborrowParentOf : MirAst.Rvalue → Option Nat
   | .ref _ ⟨p, .deref :: _⟩ => some p
   | _ => none
 
+/-- Extract the source local `p` of a zero-offset pointer arithmetic rvalue
+`Offset(copy _p, _)` / `Offset(move _p, _)`, which `evalPtrOffsetBinOp` faults
+on when `_p`'s borrow tag is `.disabled`. -/
+def ptrOffsetSrcOf (rv : MirAst.Rvalue) : Option Nat :=
+  match copyRv rv with
+  | .binaryOp .offset (.copy ⟨p, []⟩) _ => some p
+  | _ => none
+
 /-- Extract the source pointer/reference local `p` of a tag-preserving copy,
 `CopyForDeref`, `PtrToPtr` cast, `Transmute` cast, or zero-offset `Offset`. -/
 def ptrCopySrcOf (decls : List MirAst.LocalDecl) (rv : MirAst.Rvalue) : Option Nat :=
@@ -4287,10 +4320,10 @@ def stepDerefWrite (n : Nat) (env : List PtrLocalState) (w : Nat) : List PtrLoca
           .disabled
 
 /-- Whether statement `s` never dereferences (for reading, reborrowing, or
-writing) or retags (`StatementKind::Retag`) a `.disabled` pointer or reference
-local. `.empty` (uninitialized or dead) is permitted because both Anneal and
-MiniRust raise UB when loading or validating an uninitialized or dead pointer
-local. -/
+writing), offsets (`BinOp::Offset`), or retags (`StatementKind::Retag`) a
+`.disabled` pointer or reference local. `.empty` (uninitialized or dead) is
+permitted because both Anneal and MiniRust raise UB when loading or validating
+an uninitialized or dead pointer local. -/
 def ptrStmtOk (env : List PtrLocalState) (s : MirAst.Statement) : Bool :=
   match s.kind with
   | .assign ⟨_, []⟩ rv =>
@@ -4299,7 +4332,10 @@ def ptrStmtOk (env : List PtrLocalState) (s : MirAst.Statement) : Bool :=
     | none =>
       match reborrowParentOf rv with
       | some p => env.getD p .disabled != .disabled
-      | none => true
+      | none =>
+        match ptrOffsetSrcOf rv with
+        | some p => env.getD p .disabled != .disabled
+        | none => true
   | .assign ⟨w, [.deref]⟩ rv =>
     env.getD w .disabled != .disabled &&
     match ptrDerefReadSrc rv with
@@ -6488,7 +6524,35 @@ private theorem progStatementOk_ptrStmtOk_initPtrEnv {decls : List MirAst.LocalD
         rfl
       | none =>
         cases hrb : reborrowParentOf rv with
-        | none => rfl
+        | none =>
+          cases hof : ptrOffsetSrcOf rv with
+          | none => rfl
+          | some p =>
+            exfalso
+            have hcr : ∃ r, copyRv rv = .binaryOp .offset (.copy ⟨p, []⟩) r := by
+              unfold ptrOffsetSrcOf at hof
+              split at hof
+              · next p' r heq => simp at hof; subst hof; exact ⟨r, heq⟩
+              · cases hof
+            obtain ⟨r, hcr⟩ := hcr
+            simp only [progStatementOk, statementOk] at hok
+            cases hd : decls[i]? with
+            | none => simp [hd] at hok
+            | some d =>
+              have hsc_d := hsc d (List.mem_of_getElem? hd)
+              simp only [hd, hcr] at hok
+              by_cases hb : isBoolTy d.ty
+              · simp [hb, rvalueOkB, translateRelOp, translateBoolBitOp] at hok
+              · by_cases ho : isOrderingTy d.ty
+                · simp [hb, ho, rvalueOkO] at hok
+                · simp only [hb, ho, Bool.false_eq_true, ↓reduceIte] at hok
+                  cases h1 : intBoolTupleOf d.ty with
+                  | some it => simp [h1, rvalueOkTuple, translateCheckedBinOp] at hok
+                  | none =>
+                    simp only [h1] at hok
+                    cases h2 : intTypeOf d.ty with
+                    | some it => simp [h2, rvalueOk, translateBinOp, ptrDerefReadOk] at hok
+                    | none => simp [scalarTypeOf, hb, ho, h1, h2] at hsc_d
         | some p =>
           exfalso
           simp only [progStatementOk, statementOk] at hok
