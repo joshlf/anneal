@@ -2139,15 +2139,19 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
       | d :: ds =>
         evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals (d :: ds)
     | _ =>
-      match get? locals p.local_ with
-      | .some (.init rootVal) =>
-        match readProjectedValue locals rootVal p.projection with
-        | .ok fieldVal => .ok fieldVal locals
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .some .uninit => .ub
-      | .some .dead => .ub
-      | .none => .ub
+      match placeTouchesUnion localDecls body.layouts p with
+      | true =>
+        evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals localDecls
+      | false =>
+        match get? locals p.local_ with
+        | .some (.init rootVal) =>
+          match readProjectedValue locals rootVal p.projection with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub
   | .move p =>
     match p.projection with
     | .nil =>
@@ -2160,15 +2164,19 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
       | .some .dead => .ub
       | .none => .ub
     | .field idx ty :: rest =>
-      match get? locals p.local_ with
-      | .some (.init rootVal) =>
-        match readProjectedValue locals rootVal (.field idx ty :: rest) with
-        | .ok fieldVal => .ok fieldVal locals
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .some .uninit => .ub
-      | .some .dead => .ub
-      | .none => .ub
+      match placeTouchesUnion localDecls body.layouts p with
+      | true =>
+        evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+      | false =>
+        match get? locals p.local_ with
+        | .some (.init rootVal) =>
+          match readProjectedValue locals rootVal (.field idx ty :: rest) with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub
     | _ => evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
 
 theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : Operand)
@@ -2183,15 +2191,47 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
   | copy p =>
     rcases p with ⟨loc, proj⟩
     cases proj with
-    | nil => rfl
-    | cons hd _ =>
-      cases hd <;> (try rfl)
+    | nil =>
       cases localDecls <;> rfl
+    | cons hd tl =>
+      cases hd with
+      | deref =>
+        cases localDecls <;> rfl
+      | field _ _ | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+      | opaqueCast _ | unwrapUnsafeBinder _ =>
+        dsimp only [evalOperandFast, evalOperand, evalOperandFallback]
+        cases hGet : get? locals loc with
+        | none =>
+          cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
+        | some s =>
+          cases s with
+          | uninit | dead =>
+            cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
+          | init rootVal =>
+            cases hU : placeTouchesUnion localDecls body.layouts ⟨loc, _⟩
+            · simp only [hGet, hU]; rfl
+            · simp only [hGet, hU]
   | move p =>
     rcases p with ⟨loc, proj⟩
     cases proj with
     | nil => rfl
-    | cons hd _ => cases hd <;> rfl
+    | cons hd tl =>
+      cases hd with
+      | field idx ty =>
+        dsimp only [evalOperandFast, evalOperand, evalOperandFallback]
+        cases hGet : get? locals loc with
+        | none =>
+          cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
+        | some s =>
+          cases s with
+          | uninit | dead =>
+            cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
+          | init rootVal =>
+            cases hU : placeTouchesUnion localDecls body.layouts ⟨loc, _⟩
+            · simp only [hGet, hU]; rfl
+            · simp only [hGet, hU]
+      | deref | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
+      | opaqueCast _ | unwrapUnsafeBinder _ => rfl
 
 def evalOperandsFast
     (body : CapturedMir) (locals : List LocalSlot) (ops : List Operand)
@@ -2273,19 +2313,21 @@ def evalByteCastAfterOperand
     (locals' : List LocalSlot)
     (mem : Memory) :
     RvalueEvalResult :=
-  match rigidTyByteSize body.layouts targetTy with
+  let rTargetTy := resolveTyWithLocalDecls body.localDecls body.layouts targetTy
+  match tyByteSize body.localDecls body.layouts rTargetTy with
   | .none => .unsupported
   | .some dstSize =>
     match operandTy body.localDecls body.layouts op with
     | .some srcTy =>
-      match rigidTyByteSize body.layouts srcTy with
+      let rSrcTy := resolveTyWithLocalDecls body.localDecls body.layouts srcTy
+      match tyByteSize body.localDecls body.layouts rSrcTy with
       | .none => .unsupported
       | .some srcSize =>
         match Nat.beq srcSize dstSize with
         | false => .unsupported
         | true =>
           let encodedOpt : Option (List AbstractByte) :=
-            match encodeValueToBytes defaultCodecFuel body.layouts srcTy v with
+            match encodeTypedValueToBytes body.layouts rSrcTy v with
             | .some bs => .some bs
             | .none => encodeUntypedValueToBytes defaultCodecFuel v
           match encodedOpt with
@@ -2294,7 +2336,7 @@ def evalByteCastAfterOperand
             match Nat.beq (length bs) dstSize with
             | false => .ub
             | true =>
-              match decodeValueFromBytes defaultCodecFuel body.layouts targetTy bs with
+              match decodeTypedValueFromBytes defaultCodecFuel body.layouts rTargetTy bs with
               | .some v' => .ok v' locals' mem
               | .none => .ub
     | .none =>
@@ -2304,7 +2346,7 @@ def evalByteCastAfterOperand
         match Nat.beq (length bs) dstSize with
         | false => .unsupported
         | true =>
-          match decodeValueFromBytes defaultCodecFuel body.layouts targetTy bs with
+          match decodeTypedValueFromBytes defaultCodecFuel body.layouts rTargetTy bs with
           | .some v' => .ok v' locals' mem
           | .none => .ub
 

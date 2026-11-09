@@ -950,7 +950,7 @@ private theorem evalRvalue_pure_eq_withMem_core
     dsimp only [isPureRvalue] at h_pure
     cases kind
     all_goals
-      dsimp only [evalRvalue, evalAggregateRawPtr]
+      dsimp only [evalRvalue, evalAggregateRawPtr, evalAggregateAdt]
       try rw [evalOperands_pure_eq locals ops mem.borrows mem.globals layouts mem.callerLocals h_pure]
       try rw [evalOperands_pure_eq locals ops emptyMemory.borrows emptyMemory.globals layouts emptyMemory.callerLocals h_pure]
       repeat' (first | exact rval_withMem_ub | exact rval_withMem_unsupported | exact rval_withMem_ok | split)
@@ -3074,13 +3074,17 @@ theorem evalSliceFatPtrDerefBorrow_pushBaseStack
     (locals : List LocalSlot) (mem : Memory) (parentPtr : ProvenancePtr)
     (ptrSz : Nat) (lenSc : ScalarInt) (restProj : List ProjectionElem)
     (perm : TreeBorrowPerm) (isMut : Bool) (pointeeTyOpt : Option Ty)
-    (layouts : LayoutTable) (checkPerm : Bool) :
+    (layouts : LayoutTable) (checkPerm : Bool)
+    (localDecls : List LocalDecl) (fullPlaceTyOpt : Option Ty)
+    (checkRefElemAlign : Bool) :
     evalSliceFatPtrDerefBorrow locals
         (Memory.pushBaseStack calleeBody baseStack mem)
-        parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm =
+        parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm
+        localDecls fullPlaceTyOpt checkRefElemAlign =
       RvalueEvalResult.pushBaseStack calleeBody baseStack
         (evalSliceFatPtrDerefBorrow locals mem
-          parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm) := by
+          parentPtr ptrSz lenSc restProj perm isMut pointeeTyOpt layouts checkPerm
+          localDecls fullPlaceTyOpt checkRefElemAlign) := by
   unfold evalSliceFatPtrDerefBorrow
   dsimp only [Memory.pushBaseStack]
   repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
@@ -3090,13 +3094,16 @@ theorem evalGlobalThinPtrDerefBorrow_pushBaseStack
     (locals : List LocalSlot) (mem : Memory) (alloc : CapturedAllocation)
     (parentPtr : ProvenancePtr) (ptrSz : Nat) (restProj : List ProjectionElem)
     (isMut : Bool) (pointeeTyOpt : Option Ty) (layouts : LayoutTable)
-    (localDecls : List LocalDecl) (rawPtrMode : Bool) :
+    (localDecls : List LocalDecl) (rawPtrMode : Bool)
+    (fullPlaceTyOpt : Option Ty) :
     evalGlobalThinPtrDerefBorrow locals
         (Memory.pushBaseStack calleeBody baseStack mem)
-        alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode =
+        alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode
+        fullPlaceTyOpt =
       RvalueEvalResult.pushBaseStack calleeBody baseStack
         (evalGlobalThinPtrDerefBorrow locals mem
-          alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode) := by
+          alloc parentPtr ptrSz restProj isMut pointeeTyOpt layouts localDecls rawPtrMode
+          fullPlaceTyOpt) := by
   unfold evalGlobalThinPtrDerefBorrow
   dsimp only [Memory.pushBaseStack]
   repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
@@ -3377,6 +3384,24 @@ theorem evalAggregateRawPtr_pushBaseStack
   dsimp only [evalAggregateRawPtr, Memory.pushBaseStack]
   repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
 
+theorem evalAggregateAdt_pushBaseStack
+    (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
+    (locals : List LocalSlot) (defPath : DefPath) (variantIdx : VariantIdx)
+    (activeField : Option FieldIdx) (ops : List Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalAggregateAdt locals defPath variantIdx activeField ops
+        (Memory.pushBaseStack calleeBody baseStack mem) localDecls layouts =
+      RvalueEvalResult.pushBaseStack calleeBody baseStack
+        (evalAggregateAdt locals defPath variantIdx activeField ops mem localDecls layouts) := by
+  unfold evalAggregateAdt
+  dsimp only [Memory.pushBaseStack]
+  cases evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls with
+  | ub => rfl
+  | unsupported => rfl
+  | ok vals locals' =>
+    dsimp only
+    repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
+
 /--
 `evalRvalue` is completely independent of `Memory.callStack` and
 `Memory.activeCallee`, commuting unconditionally with `Memory.pushBaseStack`.
@@ -3539,6 +3564,8 @@ theorem evalRvalue_pushBaseStack
     cases kind with
     | rawPtr pointeeTy _ =>
       exact evalAggregateRawPtr_pushBaseStack calleeBody baseStack locals pointeeTy ops mem localDecls layouts
+    | adt defPath variantIdx activeField =>
+      exact evalAggregateAdt_pushBaseStack calleeBody baseStack locals defPath variantIdx activeField ops mem localDecls layouts
     | _ =>
       dsimp only [evalRvalue, Memory.pushBaseStack]
       repeat' (first | exact rval_push_ub | exact rval_push_unsupported | exact rval_push_ok rfl | split)
