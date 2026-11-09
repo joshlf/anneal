@@ -203,8 +203,8 @@ def evalCopySingleDirect
             | true => .some copiedVal
             | false =>
               match
-                rigidTyByteSize layouts srcPt,
-                rigidTyByteSize layouts dstPt
+                rigidTyKindByteSize srcPt.kind,
+                rigidTyKindByteSize dstPt.kind
               with
               | .some sSz, .some dSz =>
                 match Nat.beq sSz dSz with
@@ -407,6 +407,7 @@ prechecks prior to live-allocation dereference.
 -/
 inductive CopyPrecheckResult where
   | ub
+  | unsupported
   | zero
   | nonZero (totalBytesOpt : Option Nat)
 
@@ -429,7 +430,10 @@ def ptrValueAligned (elemAlign : Nat) : Value → Bool
 Check `count * size_of::<T>() <= isize::MAX` (`9223372036854775807`), pointer
 alignment of both `srcVal` and `dstVal` to `align_of::<T>()` (including when
 `count == 0`), and zero-byte short-circuiting (`count == 0` or `size_of::<T>()
-== 0`).
+== 0`). Pointee size and alignment are resolved directly from `srcPt.kind` via
+`rigidTyKindByteSize` and `rigidTyKindAlignBytes` (never consulting
+`LayoutTable.lookup` on `pointeeTyOf`'s synthetic placeholder `layoutIdx := 0`),
+failing closed with `.unsupported` when unresolved.
 -/
 @[reducible]
 def copyPrecheck
@@ -440,38 +444,31 @@ def copyPrecheck
     (countBits : Nat) :
     CopyPrecheckResult :=
   match operandPointeeTy localDecls layouts src with
-  | .none =>
-    match Nat.beq countBits 0 with
-    | true => .zero
-    | false => .nonZero .none
+  | .none => .unsupported
   | .some srcPt =>
-    let totalRes : Option (Option Nat) :=
-      match rigidTyByteSize layouts srcPt with
-      | .none => .some .none
-      | .some elemBytes =>
-        let totalBytes := Nat.mul countBits elemBytes
-        match Nat.ble totalBytes 9223372036854775807 with
-        | false => .none
-        | true => .some (.some totalBytes)
-    match totalRes with
-    | .none => .ub
-    | .some totalBytesOpt =>
-      let alignOk : Bool :=
-        match rigidTyAlignBytes layouts srcPt with
-        | .some elemAlign =>
+    match
+      rigidTyKindByteSize srcPt.kind,
+      rigidTyKindAlignBytes srcPt.kind
+    with
+    | .some elemBytes, .some elemAlign =>
+      let totalBytes := Nat.mul countBits elemBytes
+      match Nat.ble totalBytes 9223372036854775807 with
+      | false => .ub
+      | true =>
+        let alignOk : Bool :=
           Bool.and
             (ptrValueAligned elemAlign srcVal)
             (ptrValueAligned elemAlign dstVal)
-        | .none => true
-      match alignOk with
-      | false => .ub
-      | true =>
-        match Nat.beq countBits 0 with
-        | true => .zero
-        | false =>
-          match totalBytesOpt with
-          | .some 0 => .zero
-          | _ => .nonZero totalBytesOpt
+        match alignOk with
+        | false => .ub
+        | true =>
+          match Nat.beq countBits 0 with
+          | true => .zero
+          | false =>
+            match Nat.beq totalBytes 0 with
+            | true => .zero
+            | false => .nonZero (.some totalBytes)
+    | _, _ => .unsupported
 
 /--
 Check that a borrow access of `totalBytes` starting at `ptr.offsetBytes` targets
@@ -741,6 +738,7 @@ def evalCopyNonOverlappingWithCount
     MirStepNode :=
   match copyPrecheck localDecls layouts src srcVal dstVal countBits with
   | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
   | .zero => MirStepNode.step (advanceStmt s locals₃)
   | .nonZero totalBytesOpt =>
     match srcVal, dstVal with
@@ -823,7 +821,9 @@ def evalCopyNonOverlappingWithCount
               Bool.and srcOk dstOk
           let isSingleDirect :=
             Bool.and
-              (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+              (Bool.and
+                (Nat.beq n 1)
+                (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0)))
               singleSizeMatches
           match isSingleDirect with
           | true =>
@@ -989,6 +989,13 @@ def evalCopyNonOverlappingWithCount
                     match dstLocalPlaceTy with
                     | .some t => .some t
                     | .none => operandPointeeTy localDecls layouts dst
+                  let dstTargetBytesOpt : Option Nat :=
+                    match dstLocalPlaceTy with
+                    | .some t => rigidTyByteSize layouts t
+                    | .none =>
+                      match operandPointeeTy localDecls layouts dst with
+                      | .some pt => rigidTyKindByteSize pt.kind
+                      | .none => .none
                   match srcSliceVal with
                   | .none => MirStepNode.fail .ub
                   | .some sVal =>
@@ -1032,7 +1039,7 @@ def evalCopyNonOverlappingWithCount
                       | _, _ =>
                         match dstTargetTyOpt with
                         | .some dstPt =>
-                          match rigidTyByteSize layouts dstPt with
+                          match dstTargetBytesOpt with
                           | .some dstBytes =>
                             match Nat.beq (length bs) dstBytes with
                             | true =>
@@ -1142,8 +1149,8 @@ def evalCopyNonOverlappingWithCount
                   | false =>
                     let elemBytesOpt : Option Nat :=
                       match operandPointeeTy localDecls layouts src with
-                      | .some pt => rigidTyByteSize layouts pt
-                      | .none => .some 1
+                      | .some pt => rigidTyKindByteSize pt.kind
+                      | .none => .none
                     match
                       elemBytesOpt,
                       rigidTyByteSize layouts srcFieldTy,

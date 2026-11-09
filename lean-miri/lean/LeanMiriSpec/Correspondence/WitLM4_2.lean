@@ -3639,6 +3639,140 @@ theorem wit_lm4_2_copy_nonoverlapping_perm_range_divergence :
   exact ⟨s₁, s₂, s₃, s₄, m₁, m₂, m₃, m₄, m₅,
     hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, ha₅, hm₅⟩
 
+/-! ## 14. Pointee `layoutIdx := 0` and `isSingleDirect` Regression Witnesses -/
+
+/-- Realistic `rustc-capture` layout table for a unit-returning function with an
+ADT `struct S(u32)` (`size = 4, align = 4`): `TypeLayout[0]` is `()` (`size = 0,
+align = 1`), `TypeLayout[1]` is `S`, and `TypeLayout[2]` is `*const S / *mut S`. -/
+def adtUnitFirstLayouts : LayoutTable :=
+  { pointerBits := 64
+    isLittleEndian := true
+    entries :=
+      [{ size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+         fields := .arbitrary .nil .nil, variants := .single 0, isUninhabited := false },
+       { size := { bytes := 4 }, align := { bytes := 4 }, backendRepr := .memory,
+         fields := .arbitrary [{ bytes := 0 }] [0], variants := .single 0, isUninhabited := false },
+       { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory,
+         fields := .primitive, variants := .single 0, isUninhabited := false }] }
+
+def sAdtK : RigidTy := .adt "S" []
+
+def adtDeclAt (k : RigidTy) (idx : Nat) : LocalDecl :=
+  { mutability := .mut, ty := { kind := k, layoutIdx := idx }, debugName := none }
+
+def adtPointeeDecls : List LocalDecl :=
+  [adtDeclAt unitK 0,
+   adtDeclAt sAdtK 1,
+   adtDeclAt sAdtK 1,
+   adtDeclAt (.rawPtr .not sAdtK) 2,
+   adtDeclAt (.rawPtr .mut sAdtK) 2,
+   adtDeclAt (.rawPtr .not sAdtK) 2]
+
+def adtPointeeState : MachineState :=
+  { frame := {
+      blockIdx := 0
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (.aggregate 0 [.scalar ⟨7, 4⟩]),
+         .init (.aggregate 0 [.scalar ⟨0, 4⟩]),
+         .init (.ptr ⟨1, 0⟩ 8),
+         .init (.ptr ⟨2, 0⟩ 8),
+         .uninit] }
+    memory := {
+      emptyMemory with
+      borrows :=
+        [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
+         { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
+      nextTag := 3 } }
+
+/-- **`wit_lm4_2_adt_pointee_copy_write_offset_unsupported`**: when the pointee
+type of `*const S` / `*mut S` is an ADT `S` (`struct S(u32)`) whose layout is
+not determined by `rigidTyKindByteSize` / `rigidTyKindAlignBytes`, none of
+`evalCopyNonOverlappingWithCount`, `evalWriteBytesCall`, or `evalArithOffsetCall`
+ever consults `LayoutTable[0]` (`()` of size `0`) on `pointeeTyOf`'s synthetic
+placeholder `layoutIdx := 0`; all three fail closed with `MirStepNode.unsupported`
+(including on `count = 1`, `count = 1000`, and dangling/null pointers). -/
+theorem wit_lm4_2_adt_pointee_copy_write_offset_unsupported :
+    evalCopyNonOverlappingWithCount adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      adtPointeeDecls adtUnitFirstLayouts (.ptr ⟨1, 0⟩ 8) (.ptr ⟨2, 0⟩ 8) 1
+      adtPointeeState.frame.locals = MirStepNode.unsupported ∧
+    evalCopyNonOverlappingWithCount adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      adtPointeeDecls adtUnitFirstLayouts (.ptr ⟨1, 0⟩ 8) (.ptr ⟨2, 0⟩ 8) 1000
+      adtPointeeState.frame.locals = MirStepNode.unsupported ∧
+    evalCopyNonOverlappingWithCount adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      adtPointeeDecls adtUnitFirstLayouts (.ptr ⟨99, 0⟩ 8) (.scalar ⟨0, 8⟩) 1
+      adtPointeeState.frame.locals = MirStepNode.unsupported ∧
+    evalWriteBytesCall adtPointeeState (.copy ⟨4, []⟩) (.scalar ⟨0, 8⟩) ⟨0xFF, 1⟩ ⟨1, 8⟩
+      adtPointeeState.frame.locals 1 adtPointeeDecls adtUnitFirstLayouts =
+      MirStepNode.unsupported ∧
+    evalWriteBytesCall adtPointeeState (.copy ⟨4, []⟩) (.ptr ⟨2, 0⟩ 8) ⟨0xFF, 1⟩ ⟨1, 8⟩
+      adtPointeeState.frame.locals 1 adtPointeeDecls adtUnitFirstLayouts =
+      MirStepNode.unsupported ∧
+    evalArithOffsetCall adtPointeeState (.copy ⟨3, []⟩) (.ptr ⟨1, 0⟩ 8) (.scalar ⟨1, 8⟩)
+      adtPointeeState.frame.locals ⟨5, []⟩ 1 adtPointeeDecls adtUnitFirstLayouts =
+      MirStepNode.unsupported :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+def u8Array4ToU32Decls : List LocalDecl :=
+  [declOf unitK,
+   declOf (.array u8K 4),
+   declOf u32K,
+   declOf rawConstU8K,
+   declOf rawMutU8K]
+
+def u8Array4ToU32PreState : MachineState :=
+  { frame := {
+      blockIdx := 0
+      stmtIdx := 0
+      locals :=
+        [.uninit,
+         .init (.aggregate 0 [.scalar ⟨1, 1⟩, .scalar ⟨2, 1⟩, .scalar ⟨3, 1⟩, .scalar ⟨4, 1⟩]),
+         .init (.scalar ⟨0, 4⟩),
+         .init (.ptr ⟨1, 0⟩ 8),
+         .init (.ptr ⟨2, 0⟩ 8)] }
+    memory := {
+      emptyMemory with
+      borrows :=
+        [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
+         { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
+      nextTag := 3 } }
+
+/-- **`wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok`**: copying `count = 4`
+`u8` bytes from `_1 : [u8; 4] = [1, 2, 3, 4]` into `_2 : u32 = 0` via
+`copy_nonoverlapping::<u8>(&raw const _1 as *const u8, &raw mut _2 as *mut u8, 4)`
+does not take `evalCopySingleDirect` (`Nat.beq 4 1 = false`), and instead
+decodes the 4 little-endian bytes into `_2 = .init (.scalar ⟨0x04030201, 4⟩)`
+(never placing an untyped `[u8; 4]` `.aggregate` into the `u32` local). -/
+theorem wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok :
+    ∃ s' : MachineState,
+      evalCopyNonOverlapping u8Array4ToU32PreState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (constInt usizeK 4 8)) u8Array4ToU32Decls emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x04030201, 4⟩)) :=
+  ⟨_, rfl, rfl⟩
+
+/-- **`wit_lm4_2_copy_nonoverlapping_count2_not_single_direct`**: a `count = 2`
+copy at offset `0` on single-element `bool` locals is rejected out-of-bounds
+with `MirStepNode.fail .ub` (`Nat.beq 2 1 = false`). -/
+theorem wit_lm4_2_copy_nonoverlapping_count2_not_single_direct :
+    let decls := [declOf unitK, declOf .bool, declOf .bool,
+      declOf (.rawPtr .not .bool), declOf (.rawPtr .mut .bool)]
+    let st : MachineState := {
+      frame := {
+        blockIdx := 0
+        stmtIdx := 0
+        locals := [.uninit, .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨0, 1⟩),
+          .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8)] }
+      memory := {
+        emptyMemory with
+        borrows :=
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen },
+           { tag := 2, targetLocal := 2, targetProjection := [], perm := .active }]
+        nextTag := 3 } }
+    evalCopyNonOverlapping st (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      (.constant (constInt usizeK 2 8)) decls emptyLayoutTable = MirStepNode.fail .ub := by
+  rfl
+
 end WitnessLM4_2
 
 end LeanMiriSpec.Correspondence

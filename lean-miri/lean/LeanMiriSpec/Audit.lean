@@ -9091,10 +9091,9 @@ example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
     {elemBytes : Nat}
     (helem_anneal :
-      operandPointeeBytes? body.localDecls body.layouts (.copy ⟨ptrIdx, []⟩) = some elemBytes)
+      rigidTyKindByteSize pointeeKind = some elemBytes)
     (helem_miri :
-      (layoutOfEncodedTyId (encodeTyId { kind := pointeeKind, layoutIdx := 0 })
-        body.layouts).layout.size.bytes.toNat = elemBytes)
+      (scalarLayoutOfRigidTy pointeeKind).map (·.size.bytes.toNat) = some elemBytes)
     (helem_lt : elemBytes < 2 ^ 63)
     (hrange : ∀ p countSc,
       get? s.frame.locals ptrIdx = some (.init (.ptr p 8)) →
@@ -9480,6 +9479,37 @@ example :
           .ok (.fromScalarInt msc)) :=
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_cross_type_ok
 
+open Trusted.Rustc.V2026_06_01.MirSemantics in
+example :
+    evalCopyNonOverlappingWithCount WitnessLM4_2.adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts (.ptr ⟨1, 0⟩ 8) (.ptr ⟨2, 0⟩ 8) 1
+      WitnessLM4_2.adtPointeeState.frame.locals = MirStepNode.unsupported ∧
+    evalCopyNonOverlappingWithCount WitnessLM4_2.adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts (.ptr ⟨1, 0⟩ 8) (.ptr ⟨2, 0⟩ 8) 1000
+      WitnessLM4_2.adtPointeeState.frame.locals = MirStepNode.unsupported ∧
+    evalCopyNonOverlappingWithCount WitnessLM4_2.adtPointeeState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+      WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts (.ptr ⟨99, 0⟩ 8) (.scalar ⟨0, 8⟩) 1
+      WitnessLM4_2.adtPointeeState.frame.locals = MirStepNode.unsupported ∧
+    evalWriteBytesCall WitnessLM4_2.adtPointeeState (.copy ⟨4, []⟩) (.scalar ⟨0, 8⟩) ⟨0xFF, 1⟩ ⟨1, 8⟩
+      WitnessLM4_2.adtPointeeState.frame.locals 1 WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts =
+      MirStepNode.unsupported ∧
+    evalWriteBytesCall WitnessLM4_2.adtPointeeState (.copy ⟨4, []⟩) (.ptr ⟨2, 0⟩ 8) ⟨0xFF, 1⟩ ⟨1, 8⟩
+      WitnessLM4_2.adtPointeeState.frame.locals 1 WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts =
+      MirStepNode.unsupported ∧
+    evalArithOffsetCall WitnessLM4_2.adtPointeeState (.copy ⟨3, []⟩) (.ptr ⟨1, 0⟩ 8) (.scalar ⟨1, 8⟩)
+      WitnessLM4_2.adtPointeeState.frame.locals ⟨5, []⟩ 1 WitnessLM4_2.adtPointeeDecls WitnessLM4_2.adtUnitFirstLayouts =
+      MirStepNode.unsupported :=
+  WitnessLM4_2.wit_lm4_2_adt_pointee_copy_write_offset_unsupported
+
+open Trusted.Rustc.V2026_06_01.MirSemantics in
+example :
+    ∃ s' : MachineState,
+      evalCopyNonOverlapping WitnessLM4_2.u8Array4ToU32PreState (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
+        (.constant (WitnessLM4_2.constInt WitnessLM4_2.usizeK 4 8)) WitnessLM4_2.u8Array4ToU32Decls
+        emptyLayoutTable = .step s' ∧
+      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x04030201, 4⟩)) :=
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok
+
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
   Trusted.Rustc.V2026_06_01.MirSemantics.sliceScalarBytes
@@ -9579,6 +9609,9 @@ open LeanMiriSpec.Correspondence in
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_perm_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_uninit_src_range_divergence
   WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_perm_range_divergence
+  WitnessLM4_2.wit_lm4_2_adt_pointee_copy_write_offset_unsupported
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_u8_array_to_u32_ok
+  WitnessLM4_2.wit_lm4_2_copy_nonoverlapping_count2_not_single_direct
 
 end StatementPins
 

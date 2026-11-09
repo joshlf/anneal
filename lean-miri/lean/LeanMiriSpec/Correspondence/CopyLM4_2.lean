@@ -146,12 +146,12 @@ theorem ValidCopyAlignPair.validCopyAlign {reqAlign : Miri.ABI.Align} {elemAlign
   · exact Or.inr (Or.inr (Or.inr (Or.inr rfl)))
 
 /-- Pointee type, byte size, and ABI alignment agreement across Anneal
-(`rigidTyByteSize`, `rigidTyAlignBytes`) and `lean-miri`
+(`rigidTyKindByteSize`, `rigidTyKindAlignBytes`) and `lean-miri`
 (`rawPtrPointeeEncodedTyId?`, `layoutOfEncodedTyId`). -/
 structure CopyPointee (ly : LayoutTable) (pointeeKind : RigidTy)
     (ptId : Miri.MIR.TyId) (elemBytes elemAlign : Nat) : Prop where
   wb : WriteBytesPointee ly pointeeKind ptId elemBytes
-  anneal_align : rigidTyAlignBytes ly { kind := pointeeKind, layoutIdx := 0 } = some elemAlign
+  anneal_align : rigidTyKindAlignBytes pointeeKind = some elemAlign
   align_pair : ValidCopyAlignPair (layoutOfEncodedTyId ptId ly).layout.align.abi elemAlign
 
 /-- Every primitive scalar type (`bool`, `char`, `i8`..`i128`, `isize`,
@@ -3175,13 +3175,10 @@ private theorem primScalar_size_of_writeBytesPointee
     rigidTyByteSize ly ty = some elemBytes ∧
     (translateTy ty ly).layout.size = translateSizeBytes elemBytes ∧
     ValidScalarBytes elemBytes := by
-  have hsz_eq : rigidTyByteSize ly ty = rigidTyByteSize ly { kind := ty.kind, layoutIdx := 0 } := by
-    rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩ <;>
-      simp [rigidTyByteSize, rigidTyKindByteSize, hk]
-    · cases it <;> rfl
-    · cases ut <;> rfl
   have hb := hwb.anneal_size
-  refine ⟨hsz_eq.trans hb, ?_⟩
+  have hsz : rigidTyByteSize ly ty = some elemBytes := by
+    unfold rigidTyByteSize; rw [hb]
+  refine ⟨hsz, ?_⟩
   rw [← hprim.translateTy_layoutIdx ly]
   rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
   · rw [hk] at hb ⊢; injection hb with h; subst h; exact ⟨rfl, Or.inl rfl⟩
@@ -3251,8 +3248,8 @@ private theorem copyPrecheck_eq
     {src : MirAst.Operand} {srcPt : Ty} {elemBytes elemAlign : Nat}
     (srcVal dstVal : Value) (countBits : Nat)
     (hop : operandPointeeTy localDecls layouts src = some srcPt)
-    (hsz : rigidTyByteSize layouts srcPt = some elemBytes)
-    (hal : rigidTyAlignBytes layouts srcPt = some elemAlign) :
+    (hsz : rigidTyKindByteSize srcPt.kind = some elemBytes)
+    (hal : rigidTyKindAlignBytes srcPt.kind = some elemAlign) :
     copyPrecheck localDecls layouts src srcVal dstVal countBits =
       if countBits * elemBytes ≤ isizeMaxBytes then
         if (ptrValueAligned elemAlign srcVal && ptrValueAligned elemAlign dstVal) = true then
@@ -3262,14 +3259,13 @@ private theorem copyPrecheck_eq
       else .ub := by
   unfold copyPrecheck
   rw [hop]; dsimp only
-  rw [hsz]; dsimp only
+  rw [hsz, hal]; dsimp only
   rw [show Nat.mul countBits elemBytes = countBits * elemBytes from rfl]
   have hmax : (9223372036854775807 : Nat) = isizeMaxBytes := rfl
   rw [hmax]
   by_cases hle : countBits * elemBytes ≤ isizeMaxBytes
   · rw [Nat.ble_eq.mpr hle]; dsimp only
     simp only [hle, ↓reduceIte]
-    rw [hal]; dsimp only
     rw [show Bool.and (ptrValueAligned elemAlign srcVal) (ptrValueAligned elemAlign dstVal) =
       (ptrValueAligned elemAlign srcVal && ptrValueAligned elemAlign dstVal) from rfl]
     cases hok : (ptrValueAligned elemAlign srcVal && ptrValueAligned elemAlign dstVal) with
@@ -3285,9 +3281,11 @@ private theorem copyPrecheck_eq
           · rfl
           · have hc := Nat.eq_of_beq_eq_true hb; simp [hc] at hz
         rw [hc0]; dsimp only
-        cases htot : countBits * elemBytes with
-        | zero => exact absurd htot hz
-        | succ _ => rfl
+        have htot0 : Nat.beq (countBits * elemBytes) 0 = false := by
+          cases hb : Nat.beq (countBits * elemBytes) 0
+          · rfl
+          · exact absurd (Nat.eq_of_beq_eq_true hb) hz
+        rw [htot0]
   · rw [copyBle_eq_false_of_gt hle]; simp [hle]
 
 private theorem lookupCopyBorrowChecked_root
@@ -3943,8 +3941,8 @@ private theorem evalCopyNonOverlappingWithCount_of_perm_or_single
     {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
     {decl_s decl_d : LocalDecl}
     (hopS : operandPointeeTy localDecls layouts src = some srcPt)
-    (hszPt : rigidTyByteSize layouts srcPt = some elemBytes)
-    (halPt : rigidTyAlignBytes layouts srcPt = some elemAlign)
+    (hszPt : rigidTyKindByteSize srcPt.kind = some elemBytes)
+    (halPt : rigidTyKindAlignBytes srcPt.kind = some elemAlign)
     (hle : elemBytes ≤ isizeMaxBytes)
     (hpos : 0 < elemBytes)
     (halS : ptrValueAligned elemAlign (.ptr srcPtr 8) = true)
@@ -3994,8 +3992,8 @@ private theorem evalCopyNonOverlappingWithCount_int_reduce
     {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
     {decl_s decl_d : LocalDecl}
     (hopS : operandPointeeTy localDecls layouts src = some srcPt)
-    (hszPt : rigidTyByteSize layouts srcPt = some elemBytes)
-    (halPt : rigidTyAlignBytes layouts srcPt = some elemAlign)
+    (hszPt : rigidTyKindByteSize srcPt.kind = some elemBytes)
+    (halPt : rigidTyKindAlignBytes srcPt.kind = some elemAlign)
     (hle : countBits * elemBytes ≤ isizeMaxBytes)
     (hpos : 0 < countBits * elemBytes)
     (halS : ptrValueAligned elemAlign (.ptr srcPtr 8) = true)
@@ -4041,8 +4039,8 @@ private theorem evalCopyNonOverlappingWithCount_nonint_dead_ub
     {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
     {decl_s decl_d : LocalDecl}
     (hopS : operandPointeeTy localDecls layouts src = some srcPt)
-    (hszPt : rigidTyByteSize layouts srcPt = some elemBytes)
-    (halPt : rigidTyAlignBytes layouts srcPt = some elemAlign)
+    (hszPt : rigidTyKindByteSize srcPt.kind = some elemBytes)
+    (halPt : rigidTyKindAlignBytes srcPt.kind = some elemAlign)
     (hle : countBits * elemBytes ≤ isizeMaxBytes)
     (hpos : 0 < countBits * elemBytes)
     (halS : ptrValueAligned elemAlign (.ptr srcPtr 8) = true)

@@ -621,6 +621,35 @@ theorem StateRelLM3_1.write_dead_return
 
 /-! ## 3. One-step `arith_offset` / `wrapping_offset` call simulation -/
 
+theorem layoutOfEncodedTyId_size_of_scalarLayoutOfRigidTy
+    {pointeeKind : RigidTy} {elemBytes : Nat} (layouts : LayoutTable)
+    (h : (scalarLayoutOfRigidTy pointeeKind).map (·.size.bytes.toNat) = some elemBytes) :
+    (layoutOfEncodedTyId (encodeTyId { kind := pointeeKind, layoutIdx := 0 })
+      layouts).layout.size.bytes.toNat = elemBytes := by
+  cases pointeeKind with
+  | bool => exact Option.some.inj h
+  | char => exact Option.some.inj h
+  | int it => cases it <;> exact Option.some.inj h
+  | uint ut => cases ut <;> exact Option.some.inj h
+  | float ft => cases ft <;> exact Option.some.inj h
+  | rawPtr _ inner =>
+    rw [← Option.some.inj h]
+    cases inner with
+    | tuple elems => cases elems <;> rfl
+    | int it => cases it <;> rfl
+    | uint ut => cases ut <;> rfl
+    | float ft => cases ft <;> rfl
+    | _ => rfl
+  | ref _ _ => exact Option.some.inj h
+  | fnPtr _ _ _ _ => exact Option.some.inj h
+  | never => exact Option.some.inj h
+  | tuple elems =>
+    cases elems with
+    | nil => exact Option.some.inj h
+    | cons _ _ => simp [scalarLayoutOfRigidTy] at h
+  | fnDef _ _ => exact Option.some.inj h
+  | _ => simp [scalarLayoutOfRigidTy] at h
+
 /-- **`call_intrinsic_offset_simulation` (`LM-4.2`)**: one real step of a
 translated call of `{core,std}::intrinsics::arith_offset::<T>(ptr, count)` or
 its `{core,std}::intrinsics::wrapping_offset::<T>(ptr, count)` alias
@@ -677,10 +706,9 @@ theorem call_intrinsic_offset_simulation
     (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx)
     {elemBytes : Nat}
     (helem_anneal :
-      operandPointeeBytes? body.localDecls body.layouts (.copy ⟨ptrIdx, []⟩) = some elemBytes)
+      rigidTyKindByteSize pointeeKind = some elemBytes)
     (helem_miri :
-      (layoutOfEncodedTyId (encodeTyId { kind := pointeeKind, layoutIdx := 0 })
-        body.layouts).layout.size.bytes.toNat = elemBytes)
+      (scalarLayoutOfRigidTy pointeeKind).map (·.size.bytes.toNat) = some elemBytes)
     (helem_lt : elemBytes < 2 ^ 63)
     (hrange : ∀ p countSc,
       get? s.frame.locals ptrIdx = some (.init (.ptr p 8)) →
@@ -689,6 +717,14 @@ theorem call_intrinsic_offset_simulation
       (p.offsetBytes + countSc.bits * elemBytes) % 2 ^ 64 < 2 ^ 32) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  have helem_anneal :
+      operandPointeeBytes? body.localDecls body.layouts (.copy ⟨ptrIdx, []⟩) = some elemBytes := by
+    simp [operandPointeeBytes?, operandTy, placeTy, hptrDecl, resolveProjectedTy,
+      pointeeTyOf, hptrTy, helem_anneal]
+  have helem_miri :
+      (layoutOfEncodedTyId (encodeTyId { kind := pointeeKind, layoutIdx := 0 })
+        body.layouts).layout.size.bytes.toNat = elemBytes :=
+    layoutOfEncodedTyId_size_of_scalarLayoutOfRigidTy body.layouts helem_miri
   obtain ⟨tf, hframes, _, _, hfr, hcal, _, _, _, _, _, _⟩ := id hstate
   have hk_arity : k.arity = 2 := by rcases hk with rfl | rfl <;> rfl
   have hk_ne : k ≠ .exactDiv := by rcases hk with rfl | rfl <;> nofun

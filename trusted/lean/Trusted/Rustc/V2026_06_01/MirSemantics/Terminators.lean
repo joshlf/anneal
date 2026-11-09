@@ -236,7 +236,9 @@ def integerOperandBytes?
 
 /--
 Byte size of the pointee `T` of an operand of type `*const T`, `*mut T`, `&T`,
-or `&mut T`, when its layout is known.
+or `&mut T`, resolved directly from `pointeeTy.kind` via `rigidTyKindByteSize`
+(never consulting `LayoutTable.lookup` on `pointeeTyOf`'s synthetic placeholder
+`layoutIdx := 0`).
 -/
 def operandPointeeBytes?
     (localDecls : List LocalDecl)
@@ -246,7 +248,7 @@ def operandPointeeBytes?
   match operandTy localDecls layouts op with
   | .some ptrTy =>
     match pointeeTyOf ptrTy with
-    | .some pointeeTy => rigidTyByteSize layouts pointeeTy
+    | .some pointeeTy => rigidTyKindByteSize pointeeTy.kind
     | .none => .none
   | .none => .none
 

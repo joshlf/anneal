@@ -83,7 +83,7 @@ theorem operandPointeeBytes?_copy_rawPtr {localDecls : List LocalDecl} {layouts 
     {elemBytes : Nat}
     (hdecl : get? localDecls ptrIdx = some ptrDecl)
     (hty : ptrDecl.ty.kind = .rawPtr mutability pointeeKind)
-    (hsize : rigidTyByteSize layouts { kind := pointeeKind, layoutIdx := 0 } = some elemBytes) :
+    (hsize : rigidTyKindByteSize pointeeKind = some elemBytes) :
     operandPointeeBytes? localDecls layouts (.copy ⟨ptrIdx, []⟩) = some elemBytes := by
   simp [operandPointeeBytes?, operandTy, placeTy, hdecl, resolveProjectedTy, pointeeTyOf, hty,
     hsize]
@@ -141,12 +141,12 @@ theorem evalWriteBytesCall_full_merge (oldBits fill targetBytes : Nat) :
 
 /-! ## 2. Pointee type and `lean-miri` operand / size extraction -/
 
-/-- Pointee type and byte-size agreement across Anneal (`rigidTyByteSize`) and
+/-- Pointee type and byte-size agreement across Anneal (`rigidTyKindByteSize`) and
 `lean-miri` (`rawPtrPointeeEncodedTyId?` / `layoutOfEncodedTyId`). -/
 structure WriteBytesPointee (ly : LayoutTable) (pointeeKind : RigidTy)
     (ptId : Miri.MIR.TyId) (elemBytes : Nat) : Prop where
   encoded_eq : rawPtrPointeeEncodedTyId? (encodeRawPtrTyId pointeeKind) = some ptId
-  anneal_size : rigidTyByteSize ly { kind := pointeeKind, layoutIdx := 0 } = some elemBytes
+  anneal_size : rigidTyKindByteSize pointeeKind = some elemBytes
   miri_size : (layoutOfEncodedTyId ptId ly).layout.size =
     Miri.ABI.Size.ofBytes (UInt64.ofNat elemBytes)
   lt_u64 : elemBytes < 2 ^ 64
@@ -2417,7 +2417,7 @@ private theorem wbCall_writeBytes_core
   have hcount_nm := (hcountOp tf hframes).translate_ne_move
   have hpt_m : ∀ st, annealPointeeTypeOf (translateTy ptrDecl.ty body.layouts).ty st = .ok ptId st :=
     annealPointeeTypeOf_rawPtr hptrTy hpt.encoded_eq
-  have hop_pt := operandPointeeBytes?_copy_rawPtr hptrDecl hptrTy hpt.anneal_size
+  have hop_pt := operandPointeeBytes?_copy_rawPtr (layouts := body.layouts) hptrDecl hptrTy hpt.anneal_size
   have mk_ub : ∀ {m' msg},
       stepMirFn body s = MirStepNode.fail .ub →
       wbMiriBodyAction body ptrIdx valOp countOp { m with stack := ⟨#[tf₁]⟩ } =
@@ -3115,7 +3115,7 @@ theorem call_intrinsic_write_bytes_perm_divergence
       s.memory.borrows s.memory.globals body.layouts s.memory.callerLocals =
       .ok [.ptr ptrVal 8, .scalar valSc, .scalar countSc] s.frame.locals := by
     simp only [evalOperands, ha₁, ha₂, ha₃]
-  have hop_pt := operandPointeeBytes?_copy_rawPtr hptrDecl hptrTy hpt.anneal_size
+  have hop_pt := operandPointeeBytes?_copy_rawPtr (layouts := body.layouts) hptrDecl hptrTy hpt.anneal_size
   have hbor_look : lookupBorrow s.memory.borrows ptrVal.tag =
       some { tag := e.tag, targetLocal := e.localIdx,
              targetProjection := [], perm := e.perm } := by
