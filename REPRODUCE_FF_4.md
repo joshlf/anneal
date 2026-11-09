@@ -22,24 +22,24 @@ For unit-level details, see `REPRODUCE_FF_4_1.md`, `REPRODUCE_FF_4_2.md`,
 > [!WARNING]
 > **`[diversity-reduced]` & Reserve-Fallback 3rd-Party Audit Notice**
 >
-> - **`FF-4.1` (`P0`, $N=4$)**: `ff41-a = gemini-launch-candidate-high`
->   (`Model Y`), `ff41-b = opus-5.5-max` (`Model X`) -> switched to
->   `gemini-pro-coordinator` (`Model Z`) on Pass `B4` (`[diversity-reduced]`).
-> - **`FF-4.2` (`P1`, $N=4$)**: `ff42-a = opus-5.5-max` (`Model X`),
->   `ff42-b = gemini-launch-candidate-high` (`Model Y`) -> switched to
->   `gemini-pro-coordinator` (`Model Z`) on Pass `B4` (`429` at `0.0%` `Model Y`
+> - **`FF-4.1` (`P0`, $N=4$)**: `ff41-a = model-family-y-primary`
+>   (`Model Y`), `ff41-b = model-family-x-primary` (`Model X`) -> switched to
+>   `supervisor-model-primary` (`Model Z`) on Pass `B4` (`[diversity-reduced]`).
+> - **`FF-4.2` (`P1`, $N=4$)**: `ff42-a = model-family-x-primary` (`Model X`),
+>   `ff42-b = model-family-y-primary` (`Model Y`) -> switched to
+>   `supervisor-model-primary` (`Model Z`) on Pass `B4` (`429` at `0.0%` `Model Y`
 >   quota). Cross-family `Claude <-> Gemini` diversity held across all 9 passes,
 >   with `diversity_reduced=true` recorded for reserve-pool fallback.
-> - **`FF-4.2b` (`P1`, $N=2$)**: `ff42b-a = opus-5.5-max` (`Model X`),
->   `ff42b-b = gemini-pro-coordinator` (`Model Z` substituting for `0.0%`
+> - **`FF-4.2b` (`P1`, $N=2$)**: `ff42b-a = model-family-x-primary` (`Model X`),
+>   `ff42b-b = supervisor-model-primary` (`Model Z` substituting for `0.0%`
 >   `Model Y`). Cross-family `Claude <-> Gemini` diversity held across all 5
 >   passes (`DIVERSITY_REDUCED=true` recorded for reserve-pool usage).
 > - **`FF-4.3` (`P2`, $N=4$)**: Because `Model X` (`4.5%`) and `Model Y`
 >   (`0.0%`) were below Tier `P2`'s `40%` reserve floor at spawn, both `ff43-a`
->   and `ff43-b` ran on `gemini-pro-coordinator` (`Family Z`, single-family
+>   and `ff43-b` ran on `supervisor-model-primary` (`Family Z`, single-family
 >   `DIVERSITY_REDUCED=true`).
 >
-> Both `Model X` (`opus-5.5-max`) and `Model Y` (`gemini-launch-candidate-high`)
+> Both `Model X` (`model-family-x-primary`) and `Model Y` (`model-family-y-primary`)
 > have since refreshed (`>99%`). Run an independent cross-family (`Model X`) or
 > human audit on the `[diversity-reduced]` units before merging `sup/ff-4` to
 > `main` or publishing `adv/ff-4-3-reference` to `google/zerocopy`.
@@ -108,13 +108,13 @@ the `6,588` proof lines removed).
 
 ## 3. End-to-End Verification Commands
 
-Run from `/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4`:
+Run from `<path/to/anneal>`:
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
 # 1. Hygiene, TCB diff vs sup/brief-4 (087b015b), and TrustedBoundary audit
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-4
+cd <path/to/anneal>
 ./ci/check_todo.sh
 git diff 087b015b..HEAD -- trusted/lean/
 python3 trusted/audit/check_trusted.py --fast
@@ -143,7 +143,7 @@ rm -rf examples/wireframe-demo/.anneal examples/wireframe-demo/Cargo.lock \
 test -z "$(git status --porcelain)"
 
 # 5. Local zerocopy-reference report, 18-theorem Lean probe, and no-push check
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference
+cd <path/to/zerocopy-reference>
 test "$(git rev-parse origin/reference)" = \
   "64e9b5c4d271fe3f3aadfea71f36bc784ff3391b"
 python3 \
@@ -163,19 +163,19 @@ of `adv/ff-4-3-reference` (`8ceec4bd6`), publish as a single linear fast-forward
 commit onto `origin/reference` (full details in `REPRODUCE_FF_4_3.md` §4):
 
 ```bash
-# On Capsule: stage report tarball to x20 at HEAD (never /google/data/rw/...)
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference
+# On Capsule: stage report tarball to remote-storage at HEAD (never /mnt/fuse/rw/...)
+cd <path/to/zerocopy-reference>
 tar -czf /tmp/ff43-reference-report.tar.gz \
   reports/anneal-fuel-free-mir-lifting-and-alias-erasure
-/usr/bin/fileutil --x20_force_client_creation_at_head cp -f \
+/usr/bin/remote-sync --force_client_creation_at_head cp -f \
   /tmp/ff43-reference-report.tar.gz \
-  /x20/teams/anneal-agent/markdittmer/ff43-reference-report.tar.gz
+  /remote/anneal-agent
 rm -f /tmp/ff43-reference-report.tar.gz
 
-# On Cloudtop google/zerocopy reference worktree:
+# On workstations google/zerocopy reference worktree:
 git fetch origin reference && git checkout -B reference-publish origin/reference
-/usr/bin/fileutil --x20_force_client_creation_at_head cp -f \
-  /x20/teams/anneal-agent/markdittmer/ff43-reference-report.tar.gz \
+/usr/bin/remote-sync --force_client_creation_at_head cp -f \
+  /remote/anneal-agent \
   /tmp/ff43-reference-report.tar.gz
 tar -xzf /tmp/ff43-reference-report.tar.gz
 rm -f /tmp/ff43-reference-report.tar.gz
