@@ -26,6 +26,9 @@ import LeanMiriSpec.Correspondence.LayoutLM2_2
 import LeanMiriSpec.Correspondence.ProjLM2_2
 import LeanMiriSpec.Correspondence.SimLM2_2
 import LeanMiriSpec.Correspondence.WitLM2_2
+import LeanMiriSpec.Correspondence.EnumLM2_3
+import LeanMiriSpec.Correspondence.SimLM2_3
+import LeanMiriSpec.Correspondence.WitLM2_3
 import LeanMiriSpec.Correspondence.UnionLM2_4
 import LeanMiriSpec.Correspondence.SimLM2_4
 import LeanMiriSpec.Correspondence.WitLM2_4
@@ -118,6 +121,31 @@ import LeanMiriSpec.Audit
   tuple/struct-returning root functions (`fn() -> PaddedOuter`), root `return`
   with live padded memory, and `> 64`-byte multi-block `InitMask` `#[repr(C)]`
   structs (`80` bytes across two 64-bit `InitMask` words).
+* `LeanMiriSpec.Correspondence.EnumLM2_3`: `LM-2.3` multi-variant direct-tagged
+  enum overlay (`annealStepHooksLM2_3`, proved conservatively extending
+  `annealStepHooks` via `step_LM2_3_eq_of_bodyFree`), `ValidEnumLayout`
+  (`Variants.Multiple` + `TagEncoding.Direct`), `EnumMemRel`,
+  `UninitEnumMemRel`, `EnumLocalByteUninit`, `StateRelLM2_3`, `StepRelLM2_3`,
+  and entry bridges (`StateRel.toLM2_3_empty`, `StateRel.toLM2_3`).
+* `LeanMiriSpec.Correspondence.SimLM2_3`: `LM-2.3` correspondence for
+  multi-variant enum `Rvalue.Aggregate`
+  (`evalRvalue_aggregate_enum_simulation`), `StatementKind.SetDiscriminant`
+  (`step_setDiscriminant_simulation` and `.uninit` divergence),
+  `Rvalue.Discriminant` (`evalRvalue_discriminant_simulation`), `Downcast` +
+  `Field` reads and writes (`evalProjection_downcast_field_simulation`,
+  `step_downcast_field_write_simulation`, plus inactive-initialized and
+  inactive/`.uninit` write boundaries), `Terminator.SwitchInt`
+  (`enum_match_switchInt_simulation`), `StorageLive`/`StorageDead`, whole-enum
+  `Copy`/`Move` (`step_enum_copy_move_simulation`,
+  `step_enum_self_move_simulation`,
+  `step_enum_self_copy_dead_or_uninit_simulation`, plus unconditional self-copy
+  `copyRangesOverlap` and `enumUninitInd` copy/move boundaries), and `Goto` plus
+  scalar and enum-returning root-frame `Return`
+  (`step_return_scalar_lm2_3_simulation`, `step_return_enum_lm2_3_simulation`,
+  and `step_return_enum_uninitInd_divergence`).
+* `LeanMiriSpec.Correspondence.WitLM2_3`: 19 kernel-checked `LM-2.3`
+  multi-variant `Lm23Enum` execution, lockstep-UB, divergence, and
+  `BodyFreeOfLM2_3` witnesses exercising every `SimLM2_3` theorem and boundary.
 * `LeanMiriSpec.Correspondence.UnionLM2_4`: the `LM-2.4` union and `Subslice`
   hooks (`annealStepHooksLM2_4`, a conservative extension of `annealStepHooks`),
   the union initialization masks of `I-11` (`unionPrefixMask`, certified against
