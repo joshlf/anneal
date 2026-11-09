@@ -3092,7 +3092,10 @@ theorem evalRvalue_derefRead_freeze {locals : List LocalSlot} {rv : Rvalue} {p :
   · exact evalRvalue_use_deref (.inr rfl) hop hval
   · exact evalRvalue_copyForDeref_deref hop
 
-theorem evalRvalue_derefRead_ub {locals : List LocalSlot} {rv : Rvalue} {p : Nat}
+/-- A dereference read (any `copyRv` form of `Use(copy (*_p).rest)`) is UB when
+evaluating `copy (*_p).rest` is UB (named apart from Episode 2's
+`PointerStep.evalRvalue_derefRead_ub`, which takes the uninit/dead slot instead). -/
+theorem evalRvalue_derefRead_ub_of_evalOperand {locals : List LocalSlot} {rv : Rvalue} {p : Nat}
     {rest : List ProjectionElem} (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩))
     {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
     (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
@@ -3103,8 +3106,9 @@ theorem evalRvalue_derefRead_ub {locals : List LocalSlot} {rv : Rvalue} {p : Nat
   · exact evalRvalue_use_ub hop
   · exact evalRvalue_copyForDeref_ub hop
 
-theorem evalRvalue_derefRead_unsupported {locals : List LocalSlot} {rv : Rvalue} {p : Nat}
-    {rest : List ProjectionElem} (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩))
+/-- A dereference read is unsupported when evaluating `copy (*_p).rest` is. -/
+theorem evalRvalue_derefRead_unsupported_of_evalOperand {locals : List LocalSlot} {rv : Rvalue}
+    {p : Nat} {rest : List ProjectionElem} (hcrv : copyRv rv = .use (.copy ⟨p, .deref :: rest⟩))
     {mem : MirSemantics.Memory} {decls : List LocalDecl} {layouts : Layout.LayoutTable}
     (hop : evalOperand locals (.copy ⟨p, .deref :: rest⟩) mem.borrows mem.globals layouts
       mem.callerLocals = .unsupported) :
@@ -6948,7 +6952,9 @@ theorem evalStmt_assume_anneal (s : MachineState) (decls : List LocalDecl)
 
 /-! ## Thin-Pointer Projection Resolution, Tree Borrows Writes & Pointer Cast/Offset Helpers -/
 
-theorem appendProjections_nil_right (xs : List ProjectionElem) :
+/-- `appendProjections xs [] = xs` (named apart from Episode 2's
+`Pointers.appendProjections_nil_right`, which this module must not redeclare). -/
+theorem appendProjections_append_nil (xs : List ProjectionElem) :
     MirSemantics.appendProjections xs [] = xs := by
   induction xs with
   | nil => rfl
@@ -7007,34 +7013,6 @@ theorem resolveBorrowProjectionElems_allFields (locals : List LocalSlot)
     cases e <;> simp [allFields] at h
     simp [MirSemantics.resolveBorrowProjectionElems, ih h]
 
-theorem allFields_of_resolveFieldPath {layouts : Layout.LayoutTable}
-    {spec : TupleSpec} {projs : List ProjectionElem} {r : Nat × TupleSpec}
-    (h : resolveFieldPath layouts spec projs = some r) :
-    allFields projs = true := by
-  induction projs generalizing spec r with
-  | nil => rfl
-  | cons e rest ih =>
-    cases spec with
-    | scalar _ => simp [resolveFieldPath] at h
-    | tuple fields size align =>
-      cases e with
-      | field idx fieldTy =>
-        simp only [resolveFieldPath, Option.bind_eq_bind] at h
-        cases h1 : fields[idx]? with
-        | none => simp [h1] at h
-        | some pair =>
-          obtain ⟨off, subSpec⟩ := pair
-          cases h2 : specOfRigidTy layouts fieldTy.kind fieldTy.layoutIdx with
-          | none => simp [h1, h2] at h
-          | some expectedSpec =>
-            simp only [h1, h2, Option.bind_some] at h
-            split at h
-            · cases h3 : resolveFieldPath layouts subSpec rest with
-              | none => simp [h3] at h
-              | some r' => simp [allFields, ih h3]
-            · simp at h
-      | _ => simp [resolveFieldPath] at h
-
 theorem stripTransparentProjections_of_ptrTargetSpec {layouts : Layout.LayoutTable}
     {decls : List LocalDecl} {place : Place} {it : Gen.IntType} {relOff : Nat}
     (h : ptrTargetSpec layouts decls place = some (it, relOff)) :
@@ -7062,7 +7040,7 @@ theorem stripTransparentProjections_of_ptrTargetSpec {layouts : Layout.LayoutTab
                 (.field idx fieldTy :: rest) with
             | none => simp [hd, ht, hres] at h
             | some rpair =>
-              exact stripTransparentProjections_allFields (allFields_of_resolveFieldPath hres)
+              exact stripTransparentProjections_allFields (resolveFieldPath_allFields hres)
       · simp at h
     | _ => simp [ptrTargetSpec] at h
 
@@ -7093,7 +7071,7 @@ theorem normalizeSubsliceProjections_of_ptrTargetSpec {layouts : Layout.LayoutTa
                 (.field idx fieldTy :: rest) with
             | none => simp [hd, ht, hres] at h
             | some rpair =>
-              exact normalizeSubsliceProjections_allFields (allFields_of_resolveFieldPath hres)
+              exact normalizeSubsliceProjections_allFields (resolveFieldPath_allFields hres)
       · simp at h
     | _ => simp [ptrTargetSpec] at h
 
@@ -7124,7 +7102,7 @@ theorem endsWithSubslice_of_ptrTargetSpec {layouts : Layout.LayoutTable}
                 (.field idx fieldTy :: rest) with
             | none => simp [hd, ht, hres] at h
             | some rpair =>
-              exact endsWithSubslice_allFields (allFields_of_resolveFieldPath hres)
+              exact endsWithSubslice_allFields (resolveFieldPath_allFields hres)
       · simp at h
     | _ => simp [ptrTargetSpec] at h
 
@@ -7158,7 +7136,7 @@ theorem resolveDerefWriteFullProj_of_ptrTargetSpec {layouts : Layout.LayoutTable
   cases htp : entry.targetProjection with
   | nil => rfl
   | cons ph pt =>
-    simp only [appendProjections_nil_right]
+    simp only [appendProjections_append_nil]
     rw [← htp, hstrip, hnorm]
 
 theorem invalidateTreeBorrowsAtProj_eq_map (all bs : List BorrowEntry) (t : Nat)
@@ -7169,7 +7147,9 @@ theorem invalidateTreeBorrowsAtProj_eq_map (all bs : List BorrowEntry) (t : Nat)
   | nil => rfl
   | cons e rest ih => rw [MirSemantics.invalidateTreeBorrowsAtProj, ih, List.map_cons]
 
-theorem updateBorrowPermAtProj_fields (e : BorrowEntry) (t : Nat) (w : Option Nat)
+/-- `updateBorrowPermAtProj` changes only `perm` (named apart from Episode 2's
+six-field `Pointers.updateBorrowPermAtProj_fields`). -/
+theorem updateBorrowPermAtProj_preserves_fields (e : BorrowEntry) (t : Nat) (w : Option Nat)
     (proj : List ProjectionElem) (off len : Nat) :
     (MirSemantics.updateBorrowPermAtProj e t w proj off len).tag = e.tag ∧
     (MirSemantics.updateBorrowPermAtProj e t w proj off len).targetLocal = e.targetLocal ∧
@@ -7200,7 +7180,8 @@ theorem updateBorrowPermTreeAtProj_fields (all : List BorrowEntry) (e : BorrowEn
     (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).rangeLen = e.rangeLen ∧
     (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).protector = e.protector ∧
     (MirSemantics.updateBorrowPermTreeAtProj all e t w proj off len).parentTag = e.parentTag :=
-  updateBorrowPermAtProj_fields e t (MirSemantics.resolveTreeBorrowWriterTag all e w) proj off len
+  updateBorrowPermAtProj_preserves_fields e t (MirSemantics.resolveTreeBorrowWriterTag all e w)
+    proj off len
 
 theorem updateBorrowPermTreeAtProj_of_targetLocal_ne (all : List BorrowEntry)
     {e : BorrowEntry} {t : Nat} (w : Option Nat) (proj : List ProjectionElem) (off len : Nat)
