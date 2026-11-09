@@ -11,7 +11,7 @@ those terms. -->
 This directory contains the agent skills used when working on `joshlf/anneal`
 or proving verification obligations with Anneal. See [`../AGENTS.md`](../AGENTS.md)
 for standing repository rules and [`../docs/agent-harness-setup.md`](../docs/agent-harness-setup.md)
-for configuring Claude Code, Gemini CLI, Jetski, and Codex to load these skills.
+for configuring Claude Code, Gemini CLI, Antigravity, and Codex to load these skills.
 
 ## Provenance
 

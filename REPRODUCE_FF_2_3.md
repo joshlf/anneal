@@ -11,7 +11,7 @@ This guide provides instructions to verify `MirSpecLift` and its tests against t
 
 1.  **Enter the workspace:**
     ```bash
-    cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-3
+    cd <path/to/anneal>
     export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
     ```
 
