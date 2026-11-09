@@ -4242,6 +4242,12 @@ fn eval_place_array_len(
 /// Supports arbitrary chains of `Field`, `Index`, `ConstantIndex`, `Subslice`, and `Downcast`
 /// projections over `MirValue::{Tuple, Array, Adt}`. Any `ProjectionElem::Deref` returns
 /// `Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()))`.
+///
+/// `locals` carries no declared types, so a `Field(i, ty)` annotation on an intermediate step
+/// is checked against the selected value's outermost constructor only, and the returned value
+/// is checked in full against the last step's type. Callers must type-check `place` against
+/// the local declarations first ([`resolve_place_ty`], as `lower_rvalue` does);
+/// [`StatementEvalState::read_place`] performs that check itself.
 pub fn eval_place_read(
     place: &Place,
     locals: &[MirValue],
@@ -4294,7 +4300,10 @@ pub fn eval_place_read(
 /// A projected write never changes the type of a container along `place`: the replaced value
 /// and `new_val` must both have the projected field or element type (a union write may switch
 /// the active field), and a `Subslice` write must supply an array of the window's exact length
-/// and element type. On any error `locals` is left unchanged.
+/// and element type. On any error `locals` is left unchanged. As with [`eval_place_read`],
+/// intermediate `Field` annotations are checked by outermost constructor only, and a bare-local
+/// write (empty projection) replaces the local without a type check, because `locals` carries
+/// no declared types; [`StatementEvalState::write_place`] checks both against `local_decls`.
 pub fn eval_place_write(
     place: &Place,
     new_val: MirValue,
@@ -4927,6 +4936,31 @@ impl StatementEvalState {
         }
     }
 
+    /// Checks every projection step of `place` against the declared type of its root local:
+    /// field indices and `Field` type annotations, array projections on array types,
+    /// `Downcast` on tuple types, and static `ConstantIndex` / `Subslice` bounds. Returns the
+    /// declared type of the place and any trailing `Downcast` variant.
+    ///
+    /// This is a type-level check whose cost depends on the projection and the declared types
+    /// only, not on the size of the local's value. Projection traversals check intermediate
+    /// values by their outermost constructor, so this check is what rejects a `Field`
+    /// annotation that differs from the declared field type below the outermost constructor.
+    fn check_place_against_decls(
+        &self,
+        place: &Place,
+    ) -> Result<(Ty, Option<usize>), RvalueEvalError> {
+        let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
+            return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
+        };
+        validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+            base_decl_ty,
+            &place.projection,
+            None,
+            place,
+            None,
+        )
+    }
+
     /// Reads the value at `place` from `self.slots` without moving it.
     pub fn read_place(&self, place: &Place) -> Result<MirValue, RvalueEvalError> {
         if place
@@ -4936,6 +4970,7 @@ impl StatementEvalState {
         {
             return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
         }
+        self.check_place_against_decls(place)?;
         let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
@@ -4943,16 +4978,7 @@ impl StatementEvalState {
         match self.slots.get(place.local.0) {
             None => Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
             Some(LocalSlotState::Dead) => Err(RvalueEvalError::DeadLocal(place.local)),
-            Some(LocalSlotState::Uninit) => {
-                validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
-                    base_decl_ty,
-                    &place.projection,
-                    None,
-                    place,
-                    None,
-                )?;
-                Err(RvalueEvalError::UninitializedLocal(place.local))
-            }
+            Some(LocalSlotState::Uninit) => Err(RvalueEvalError::UninitializedLocal(place.local)),
             Some(LocalSlotState::Init(root_val)) => {
                 // A read returning the whole local checks it in full; a projected read checks
                 // only the root's outermost constructor here and leaves the selected parts to
@@ -4995,6 +5021,12 @@ impl StatementEvalState {
         {
             return Err(RvalueEvalError::UnsupportedPlaceProjection(place.clone()));
         }
+        let (leaf_ty, trailing_downcast) = self.check_place_against_decls(place)?;
+        if trailing_downcast.is_some() || !matches!(leaf_ty, Ty::Array(_, _)) {
+            return Err(RvalueEvalError::TypeMismatch(
+                "Len target place must have array type",
+            ));
+        }
         let Some(base_decl_ty) = self.local_decls.get(place.local.0) else {
             return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
         };
@@ -5002,22 +5034,7 @@ impl StatementEvalState {
         match self.slots.get(place.local.0) {
             None => Err(RvalueEvalError::TypeMismatch("local index out of bounds")),
             Some(LocalSlotState::Dead) => Err(RvalueEvalError::DeadLocal(place.local)),
-            Some(LocalSlotState::Uninit) => {
-                let (leaf_ty, trailing_downcast) =
-                    validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
-                        base_decl_ty,
-                        &place.projection,
-                        None,
-                        place,
-                        None,
-                    )?;
-                if trailing_downcast.is_some() || !matches!(leaf_ty, Ty::Array(_, _)) {
-                    return Err(RvalueEvalError::TypeMismatch(
-                        "Len target place must have array type",
-                    ));
-                }
-                Err(RvalueEvalError::UninitializedLocal(place.local))
-            }
+            Some(LocalSlotState::Uninit) => Err(RvalueEvalError::UninitializedLocal(place.local)),
             Some(LocalSlotState::Init(root_val)) => {
                 if !mir_value_head_matches_ty(root_val, base_decl_ty) {
                     return Err(RvalueEvalError::TypeMismatch(
@@ -5118,6 +5135,7 @@ impl StatementEvalState {
             self.slots[place.local.0] = LocalSlotState::Init(val);
             return Ok(());
         }
+        self.check_place_against_decls(place)?;
 
         // Pre-validate any `Index(idx_local)` operands before mutating `self.slots[place.local.0]`.
         let mut index_cache: Vec<(Local, u128)> = Vec::new();
@@ -6331,6 +6349,37 @@ pub fn eval_lowered_statement(
                 Some(LocalSlotState::Dead) => return Err(RvalueEvalError::DeadLocal(place.local)),
                 Some(_) => {}
             }
+            // The mentioned place is never loaded, but it must type-check against the local
+            // declarations: the projection before the first `Deref` against the root's
+            // declared type, and the projection after it against the pointer's pointee type.
+            let first_deref = place
+                .projection
+                .iter()
+                .position(|p| matches!(p, ProjectionElem::Deref));
+            let prefix = Place {
+                local: place.local,
+                projection: place.projection[..first_deref.unwrap_or(place.projection.len())].to_vec(),
+            };
+            let (prefix_ty, trailing_downcast) = state.check_place_against_decls(&prefix)?;
+            if let Some(pos) = first_deref {
+                if trailing_downcast.is_some() {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Downcast projection must be followed by Field",
+                    ));
+                }
+                let Some(pointee_ty) = prefix_ty.pointee_ty() else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Deref projection requires a pointer-typed place",
+                    ));
+                };
+                validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
+                    pointee_ty,
+                    &place.projection[pos + 1..],
+                    None,
+                    place,
+                    None,
+                )?;
+            }
             // Validate every `Index(idx_local)` operand read while computing `place`.
             for elem in &place.projection {
                 if let ProjectionElem::Index(idx_local) = elem {
@@ -6405,6 +6454,7 @@ pub fn eval_lowered_statement(
             let Some(base_decl_ty) = state.local_decls.get(place.local.0).cloned() else {
                 return Err(RvalueEvalError::TypeMismatch("local index out of bounds"));
             };
+            state.check_place_against_decls(place)?;
             let mut index_cache: Vec<(Local, u128)> = Vec::new();
             for elem in &place.projection {
                 if let ProjectionElem::Index(idx_local) = elem {

@@ -2266,10 +2266,7 @@ fn test_ep1_a2_projected_writes_subslice_steps_and_len_are_linear_and_atomic() {
             .unwrap();
         state.write_place(&shell_idx, &u32_ty(), v.clone()).unwrap();
         state.write_place(&subslice_idx, &u32_ty(), v).unwrap();
-        assert_eq!(
-            state.read_place(&subslice_idx),
-            Ok(u32v((i + 100) as u128))
-        );
+        assert_eq!(state.read_place(&subslice_idx), Ok(u32v((i + 100) as u128)));
         if i < 64 {
             assert_eq!(
                 anneal_mir::lower::eval_lowered_rvalue_in_state(&lowered_len_subslice, &mut state),
@@ -2395,4 +2392,561 @@ fn test_ep1_a2_union_head_and_active_field_checks_reject_malformed_active_field(
         Err(RvalueEvalError::TypeMismatch(_))
     ));
     assert_eq!(state.get_init(Local(0)), Some(&bad_nested_union));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv B3] Differential property test: read / write / `Len` traversals vs. a reference model
+// ---------------------------------------------------------------------------------------------
+
+/// Value shapes for the differential test: scalars, `()`, fixed-size arrays, and tuples whose
+/// values are either `MirValue::Tuple` or enum-variant `MirValue::Adt`s (for `Downcast`).
+#[derive(Clone, Debug)]
+enum DShape {
+    U8,
+    U32,
+    Unit,
+    Arr(Box<DShape>, usize),
+    Tup(Vec<DShape>),
+}
+
+impl DShape {
+    fn random(rng: &mut Rng, depth: u32) -> DShape {
+        match rng.below(if depth == 0 { 3 } else { 5 }) {
+            0 => DShape::U8,
+            1 => DShape::U32,
+            2 => DShape::Unit,
+            3 => DShape::Arr(
+                Box::new(DShape::random(rng, depth - 1)),
+                rng.below(4) as usize,
+            ),
+            _ => DShape::Tup(
+                (0..1 + rng.below(3))
+                    .map(|_| DShape::random(rng, depth - 1))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn ty(&self) -> Ty {
+        match self {
+            DShape::U8 => u8_ty(),
+            DShape::U32 => u32_ty(),
+            DShape::Unit => Ty::unit(),
+            DShape::Arr(elem, n) => Ty::Array(Box::new(elem.ty()), *n),
+            DShape::Tup(fields) => Ty::Tuple(fields.iter().map(DShape::ty).collect()),
+        }
+    }
+
+    fn value(&self, rng: &mut Rng) -> MirValue {
+        match self {
+            DShape::U8 => u8v(u128::from(rng.below(256))),
+            DShape::U32 => u32v(u128::from(rng.below(1 << 32))),
+            DShape::Unit => MirValue::Unit,
+            DShape::Arr(elem, n) => MirValue::Array {
+                elements: (0..*n).map(|_| elem.value(rng)).collect(),
+                elem_ty: elem.ty(),
+            },
+            DShape::Tup(fields) => {
+                let vals: Vec<MirValue> = fields.iter().map(|f| f.value(rng)).collect();
+                if rng.below(3) == 0 {
+                    MirValue::Adt {
+                        def_path: "E".into(),
+                        variant_idx: rng.below(2) as usize,
+                        active_field: None,
+                        fields: vals,
+                    }
+                } else {
+                    MirValue::Tuple(vals)
+                }
+            }
+        }
+    }
+}
+
+/// Builds a random (possibly invalid) projection path below a value of shape `shape`.
+fn random_projection(rng: &mut Rng, shape: &DShape, out: &mut Vec<ProjectionElem>) {
+    if rng.below(4) == 0 {
+        return;
+    }
+    match shape {
+        DShape::Tup(fields) => {
+            if rng.below(3) == 0 {
+                out.push(ProjectionElem::Downcast(rng.below(2) as usize));
+            }
+            let i = rng.below(fields.len() as u64 + 1) as usize;
+            match fields.get(i) {
+                Some(f) => {
+                    let ty = if rng.below(12) == 0 { Ty::Bool } else { f.ty() };
+                    out.push(ProjectionElem::Field(i, ty));
+                    random_projection(rng, f, out);
+                }
+                None => out.push(ProjectionElem::Field(i, u8_ty())),
+            }
+        }
+        DShape::Arr(elem, n) => {
+            let n64 = *n as u64;
+            match rng.below(3) {
+                0 => {
+                    out.push(ProjectionElem::Index(Local(1)));
+                    random_projection(rng, elem, out);
+                }
+                1 => {
+                    out.push(ProjectionElem::ConstantIndex {
+                        offset: rng.below(n64 + 2),
+                        min_length: rng.below(n64 + 2),
+                        from_end: rng.below(2) == 1,
+                    });
+                    random_projection(rng, elem, out);
+                }
+                _ => {
+                    let (from, to, from_end) =
+                        (rng.below(n64 + 2), rng.below(n64 + 2), rng.below(2) == 1);
+                    out.push(ProjectionElem::Subslice { from, to, from_end });
+                    if let Some((s, e)) = subslice_bounds(n64, from, to, from_end) {
+                        random_projection(rng, &DShape::Arr(elem.clone(), e - s), out);
+                    }
+                }
+            }
+        }
+        DShape::U8 | DShape::U32 | DShape::Unit => {}
+    }
+}
+
+/// Reference read: `None` for every invalid path (wrong field/variant/type, out-of-bounds index,
+/// `Downcast` not followed by `Field`).
+fn ref_read(
+    val: &MirValue,
+    proj: &[ProjectionElem],
+    idx: u128,
+    downcast: Option<usize>,
+) -> Option<MirValue> {
+    let Some((first, rest)) = proj.split_first() else {
+        return downcast.is_none().then(|| val.clone());
+    };
+    match (first, val) {
+        (ProjectionElem::Downcast(v), _) => {
+            if downcast.is_some() || !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return None;
+            }
+            let actual = match val {
+                MirValue::Adt {
+                    variant_idx,
+                    active_field: None,
+                    ..
+                } => *variant_idx,
+                MirValue::Tuple(_) | MirValue::Unit => 0,
+                _ => return None,
+            };
+            (actual == *v).then_some(())?;
+            ref_read(val, rest, idx, Some(*v))
+        }
+        (ProjectionElem::Field(i, ty), MirValue::Tuple(fields)) => {
+            (downcast.unwrap_or(0) == 0).then_some(())?;
+            let f = fields.get(*i)?;
+            (f.ty() == *ty).then_some(())?;
+            ref_read(f, rest, idx, None)
+        }
+        (
+            ProjectionElem::Field(i, ty),
+            MirValue::Adt {
+                variant_idx,
+                active_field: None,
+                fields,
+                ..
+            },
+        ) => {
+            (downcast.unwrap_or(0) == *variant_idx).then_some(())?;
+            let f = fields.get(*i)?;
+            (f.ty() == *ty).then_some(())?;
+            ref_read(f, rest, idx, None)
+        }
+        (_, MirValue::Array { elements, elem_ty }) if downcast.is_none() => {
+            let len = elements.len() as u64;
+            match first {
+                ProjectionElem::Index(_) => {
+                    ref_read(elements.get(usize::try_from(idx).ok()?)?, rest, idx, None)
+                }
+                ProjectionElem::ConstantIndex {
+                    offset,
+                    min_length,
+                    from_end,
+                } => {
+                    let i = constant_index(len, *offset, *min_length, *from_end)?;
+                    ref_read(&elements[i], rest, idx, None)
+                }
+                ProjectionElem::Subslice { from, to, from_end } => {
+                    let (s, e) = subslice_bounds(len, *from, *to, *from_end)?;
+                    let window = MirValue::Array {
+                        elements: elements[s..e].to_vec(),
+                        elem_ty: elem_ty.clone(),
+                    };
+                    ref_read(&window, rest, idx, None)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Reference write: returns the updated root, or `None` if the write is invalid. The replaced
+/// leaf and `new` must have the same type.
+fn ref_write(
+    val: &MirValue,
+    proj: &[ProjectionElem],
+    idx: u128,
+    new: &MirValue,
+    downcast: Option<usize>,
+) -> Option<MirValue> {
+    let Some((first, rest)) = proj.split_first() else {
+        if downcast.is_some() || val.ty() != new.ty() {
+            return None;
+        }
+        return Some(new.clone());
+    };
+    match (first, val) {
+        (ProjectionElem::Downcast(v), _) => {
+            if downcast.is_some() || !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return None;
+            }
+            let actual = match val {
+                MirValue::Adt {
+                    variant_idx,
+                    active_field: None,
+                    ..
+                } => *variant_idx,
+                MirValue::Tuple(_) | MirValue::Unit => 0,
+                _ => return None,
+            };
+            (actual == *v).then_some(())?;
+            ref_write(val, rest, idx, new, Some(*v))
+        }
+        (ProjectionElem::Field(i, ty), MirValue::Tuple(fields)) => {
+            (downcast.unwrap_or(0) == 0).then_some(())?;
+            let f = fields.get(*i)?;
+            (f.ty() == *ty).then_some(())?;
+            let mut fields = fields.clone();
+            fields[*i] = ref_write(f, rest, idx, new, None)?;
+            Some(MirValue::Tuple(fields))
+        }
+        (
+            ProjectionElem::Field(i, ty),
+            MirValue::Adt {
+                def_path,
+                variant_idx,
+                active_field: None,
+                fields,
+            },
+        ) => {
+            (downcast.unwrap_or(0) == *variant_idx).then_some(())?;
+            let f = fields.get(*i)?;
+            (f.ty() == *ty).then_some(())?;
+            let mut fields = fields.clone();
+            fields[*i] = ref_write(f, rest, idx, new, None)?;
+            Some(MirValue::Adt {
+                def_path: def_path.clone(),
+                variant_idx: *variant_idx,
+                active_field: None,
+                fields,
+            })
+        }
+        (_, MirValue::Array { elements, elem_ty }) if downcast.is_none() => {
+            let len = elements.len() as u64;
+            let mut elements = elements.clone();
+            match first {
+                ProjectionElem::Index(_) => {
+                    let i = usize::try_from(idx).ok().filter(|i| *i < elements.len())?;
+                    elements[i] = ref_write(&elements[i], rest, idx, new, None)?;
+                }
+                ProjectionElem::ConstantIndex {
+                    offset,
+                    min_length,
+                    from_end,
+                } => {
+                    let i = constant_index(len, *offset, *min_length, *from_end)?;
+                    elements[i] = ref_write(&elements[i], rest, idx, new, None)?;
+                }
+                ProjectionElem::Subslice { from, to, from_end } => {
+                    let (s, e) = subslice_bounds(len, *from, *to, *from_end)?;
+                    let window = MirValue::Array {
+                        elements: elements[s..e].to_vec(),
+                        elem_ty: elem_ty.clone(),
+                    };
+                    let MirValue::Array {
+                        elements: updated, ..
+                    } = ref_write(&window, rest, idx, new, None)?
+                    else {
+                        return None;
+                    };
+                    elements.splice(s..e, updated);
+                }
+                _ => return None,
+            }
+            Some(MirValue::Array {
+                elements,
+                elem_ty: elem_ty.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// For random well-typed values (tuples, enum-variant ADTs, nested arrays) and random valid and
+/// invalid places, checks that every traversal agrees with an independent reference model:
+/// - `eval_place_read` and `StatementEvalState::read_place` return the reference value or an
+///   error exactly when the reference does;
+/// - `eval_place_write` and `StatementEvalState::write_place` produce the reference root value
+///   on success and leave the root unchanged on failure;
+/// - `Rvalue::Len` (pure and stateful) returns the reference array length whenever the place
+///   lowers;
+/// - a successful write followed by a read of the same place returns the written value.
+#[test]
+fn test_ep1_b3_property_traversals_agree_with_reference_model() {
+    let mut rng = Rng(0x94D0_49BB_1331_11EB);
+    let mut checked_writes = 0usize;
+    let mut checked_lens = 0usize;
+    for _ in 0..3000 {
+        let shape = DShape::Tup(vec![
+            DShape::random(&mut rng, 3),
+            DShape::random(&mut rng, 3),
+        ]);
+        let ty = shape.ty();
+        let root = shape.value(&mut rng);
+        let mut projection = Vec::new();
+        random_projection(&mut rng, &shape, &mut projection);
+        let place = proj(0, projection.clone());
+        let idx = u128::from(rng.below(4));
+        let local_decls = vec![ty.clone(), usize_ty()];
+        let locals = vec![root.clone(), usizev(idx)];
+        let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+        state.slots[0] = LocalSlotState::Init(root.clone());
+        state.slots[1] = LocalSlotState::Init(usizev(idx));
+
+        // Reads.
+        let expected = ref_read(&root, &projection, idx, None);
+        let pure = eval_place_read(&place, &locals, PW);
+        let stateful = state.read_place(&place);
+        assert_eq!(
+            pure.as_ref().ok(),
+            expected.as_ref(),
+            "pure read {place:?} of {root:?}"
+        );
+        assert_eq!(
+            stateful.as_ref().ok(),
+            expected.as_ref(),
+            "state read {place:?} of {root:?}"
+        );
+
+        // `Len` on places that lower with an array type.
+        if let Ok(lowered) = lower_rvalue(&Rvalue::Len(place.clone()), &local_decls, PW) {
+            let expected_len = expected.as_ref().map(|v| match v {
+                MirValue::Array { elements, .. } => usizev(elements.len() as u128),
+                other => panic!("Len target {other:?} must be an array"),
+            });
+            let mut tracker = ExposedProvenanceTracker::new();
+            let pure_len = eval_lowered_rvalue(
+                &lowered,
+                &locals,
+                PW,
+                TransmutePolicy::RejectPtrToInt,
+                &mut tracker,
+            );
+            let state_len = anneal_mir::lower::eval_lowered_rvalue_in_state(&lowered, &mut state);
+            assert_eq!(
+                pure_len.as_ref().ok(),
+                expected_len.as_ref(),
+                "pure Len {place:?} of {root:?}"
+            );
+            assert_eq!(
+                state_len.as_ref().ok(),
+                expected_len.as_ref(),
+                "state Len {place:?} of {root:?}"
+            );
+            checked_lens += 1;
+        }
+
+        // Writes of a fresh value with the type of the current leaf (when the read succeeds) or
+        // of a random shape (to exercise failing writes).
+        let new_val = match &expected {
+            Some(old) if rng.below(5) != 0 => {
+                let leaf_shape = shape_of(old);
+                leaf_shape.value(&mut rng)
+            }
+            _ => DShape::random(&mut rng, 2).value(&mut rng),
+        };
+        let expected_root = ref_write(&root, &projection, idx, &new_val, None);
+        let mut pure_locals = locals.clone();
+        let pure_res = eval_place_write(&place, new_val.clone(), &mut pure_locals, PW);
+        if projection.is_empty() {
+            // `eval_place_write` has no declared types: a bare-local write replaces the value.
+            assert_eq!(pure_res, Ok(()));
+            assert_eq!(pure_locals[0], new_val);
+        } else {
+            assert_eq!(
+                pure_res.is_ok(),
+                expected_root.is_some(),
+                "pure write {place:?} of {root:?} := {new_val:?}"
+            );
+            assert_eq!(
+                &pure_locals[0],
+                expected_root.as_ref().unwrap_or(&root),
+                "pure write result"
+            );
+        }
+        if let Ok(place_ty) = anneal_mir::lower::resolve_place_ty(&place, &local_decls) {
+            let state_res = state.write_place(&place, &place_ty, new_val.clone());
+            assert_eq!(
+                state_res.is_ok(),
+                expected_root.is_some(),
+                "state write {place:?} of {root:?} := {new_val:?}"
+            );
+            assert_eq!(
+                state.get_init(Local(0)),
+                Some(expected_root.as_ref().unwrap_or(&root)),
+                "state write result"
+            );
+            if state_res.is_ok() {
+                assert_eq!(state.read_place(&place), Ok(new_val.clone()));
+            }
+            checked_writes += 1;
+        }
+    }
+    assert!(
+        checked_writes > 500 && checked_lens > 50,
+        "{checked_writes} writes, {checked_lens} lens"
+    );
+}
+
+/// Since B2/A2, values passed through a projection step are checked by their outermost
+/// constructor only, so an intermediate `Field(i, ty)` annotation whose type differs from the
+/// declared field type *below* the outermost constructor (`Field(0, (u8, u8))` on a field of
+/// type `(u8, u32)`) was accepted whenever the rest of the path stayed consistent with the
+/// actual value. `StatementEvalState` knows every local's declared type, so reads, writes,
+/// `Len`, `SetDiscriminant`, and `PlaceMention` now check the whole projection against
+/// `local_decls` at the type level (time independent of the size of the local's value) and
+/// reject such places as static type errors without changing state.
+#[test]
+fn test_ep1_b3_stateful_accesses_reject_deep_field_annotation_mismatches() {
+    let inner = Ty::Tuple(vec![u8_ty(), u32_ty()]);
+    let wrong_inner = Ty::Tuple(vec![u8_ty(), u8_ty()]);
+    let arr2 = Ty::Array(Box::new(u32_ty()), 2);
+    let with_arr = Ty::Tuple(vec![u8_ty(), arr2.clone()]);
+    let wrong_with_arr = Ty::Tuple(vec![u16_ty(), arr2.clone()]);
+    let enum_ty = Ty::Tuple(vec![u32_ty()]);
+    let with_enum = Ty::Tuple(vec![u8_ty(), enum_ty.clone()]);
+    let wrong_with_enum = Ty::Tuple(vec![u16_ty(), enum_ty.clone()]);
+    let local_decls = vec![
+        Ty::Tuple(vec![inner.clone(), u8_ty()]), // _0: ((u8, u32), u8)
+        Ty::Tuple(vec![with_arr.clone()]),       // _1: ((u8, [u32; 2]),)
+        Ty::Tuple(vec![with_enum.clone()]),      // _2: ((u8, E),)
+    ];
+    let v0 = MirValue::Tuple(vec![MirValue::Tuple(vec![u8v(1), u32v(2)]), u8v(3)]);
+    let v1 = MirValue::Tuple(vec![MirValue::Tuple(vec![
+        u8v(4),
+        MirValue::Array {
+            elements: vec![u32v(5), u32v(6)],
+            elem_ty: u32_ty(),
+        },
+    ])]);
+    let v2 = MirValue::Tuple(vec![MirValue::Tuple(vec![
+        u8v(7),
+        MirValue::Adt {
+            def_path: "E".into(),
+            variant_idx: 0,
+            active_field: None,
+            fields: vec![u32v(8)],
+        },
+    ])]);
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[0] = LocalSlotState::Init(v0.clone());
+    state.slots[1] = LocalSlotState::Init(v1.clone());
+    state.slots[2] = LocalSlotState::Init(v2.clone());
+
+    // `_0.0.0` through `Field(0, (u8, u8))`: the path reaches the `u8` at `_0.0.0`.
+    let bad_read = proj(0, vec![field(0, wrong_inner), field(0, u8_ty())]);
+    assert!(matches!(
+        state.read_place(&bad_read),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.write_place(&bad_read, &u8_ty(), u8v(9)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_init(Local(0)), Some(&v0));
+    let good_read = proj(0, vec![field(0, inner), field(0, u8_ty())]);
+    assert_eq!(state.read_place(&good_read), Ok(u8v(1)));
+
+    // `Len(_1.0.1)` through `Field(0, (u16, [u32; 2]))`.
+    let bad_len = anneal_mir::lower::LoweredRvalue::Len {
+        place: proj(1, vec![field(0, wrong_with_arr), field(1, arr2.clone())]),
+        static_len: 2,
+        ty: usize_ty(),
+    };
+    assert!(matches!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(&bad_len, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // `discriminant(_2.0.1) = 1` through `Field(0, (u16, E))`.
+    let bad_set_discr = LoweredStatement::SetDiscriminant {
+        place: proj(
+            2,
+            vec![field(0, wrong_with_enum.clone()), field(1, enum_ty.clone())],
+        ),
+        place_ty: enum_ty.clone(),
+        variant_index: 1,
+    };
+    assert!(matches!(
+        eval_lowered_statement(&bad_set_discr, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_init(Local(2)), Some(&v2));
+
+    // `PlaceMention` of an ill-typed place is a static type error, not a no-op.
+    let bad_mention = LoweredStatement::PlaceMention {
+        place: proj(
+            2,
+            vec![field(0, wrong_with_enum), field(1, enum_ty.clone())],
+        ),
+        place_ty: enum_ty,
+    };
+    assert!(matches!(
+        eval_lowered_statement(&bad_mention, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_init(Local(1)), Some(&v1));
+}
+
+/// Recovers a `DShape` describing a well-typed value (used to generate same-typed values).
+fn shape_of(val: &MirValue) -> DShape {
+    match val {
+        MirValue::Int {
+            ty: Ty::Uint(UintTy::U8),
+            ..
+        } => DShape::U8,
+        MirValue::Int { .. } => DShape::U32,
+        MirValue::Unit => DShape::Unit,
+        MirValue::Array { elements, elem_ty } => {
+            let elem_shape = match elements.first() {
+                Some(e) => shape_of(e),
+                None => shape_of_ty(elem_ty),
+            };
+            DShape::Arr(Box::new(elem_shape), elements.len())
+        }
+        MirValue::Tuple(fields) | MirValue::Adt { fields, .. } => {
+            DShape::Tup(fields.iter().map(shape_of).collect())
+        }
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+fn shape_of_ty(ty: &Ty) -> DShape {
+    match ty {
+        Ty::Uint(UintTy::U8) => DShape::U8,
+        Ty::Uint(UintTy::U32) => DShape::U32,
+        Ty::Tuple(fields) if fields.is_empty() => DShape::Unit,
+        Ty::Tuple(fields) => DShape::Tup(fields.iter().map(shape_of_ty).collect()),
+        Ty::Array(elem, n) => DShape::Arr(Box::new(shape_of_ty(elem)), *n),
+        other => panic!("unexpected type {other:?}"),
+    }
 }
