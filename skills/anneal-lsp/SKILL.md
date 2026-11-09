@@ -22,7 +22,7 @@ worker pool (~11–25 ms incremental checks).
 
 1. **Map the Rust Item & Obligation (`anneal_item_bridge`)**:
    ```json
-   {"workspace": "/home/groupagent-anneal-bot/Projects/<ldap>/zerocopy/zerocopy/anneal-slice", "query": "BigEndianU16"}
+   {"workspace": "<path/to/zerocopy>/zerocopy/anneal-slice", "query": "BigEndianU16"}
    ```
    Inspects `.anneal/spec-lock.json`, `DefId`, stateful vs. stateless claim kind,
    and exact paths to `Mir`, `Obligations`, `Specs`, and `Proof` modules.
@@ -49,7 +49,7 @@ worker pool (~11–25 ms incremental checks).
      tactics in ~15 ms each with **zero disk writes**:
      ```json
      {
-       "file": "/home/groupagent-anneal-bot/Projects/<ldap>/.../Proof/Crate/Item.lean",
+       "file": "<path/to/workspace>/.../Proof/Crate/Item.lean",
        "line": 25,
        "tactics": [
          "rfl",
@@ -64,7 +64,7 @@ worker pool (~11–25 ms incremental checks).
 5. **Pre-Flight Kernel Axiom & Isolation Audit (`anneal_audit_preview`)**:
    - Before running the full workspace `cargo anneal agent-verify`, run:
      ```json
-     {"file": "/home/groupagent-anneal-bot/Projects/<ldap>/.../Proof/Crate/Item.lean"}
+     {"file": "<path/to/workspace>/.../Proof/Crate/Item.lean"}
      ```
    - Verifies in ~30 ms:
      1. `0` Lean compiler errors and `0` `sorry`/`admit` tokens,
