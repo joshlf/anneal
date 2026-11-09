@@ -2179,3 +2179,220 @@ fn test_ep1_b2_property_union_active_field_reads_and_writes_match_reference_mode
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv A2] Projected writes, `Subslice` steps, `Rvalue::Len`, and `SetDiscriminant` are O(path)
+//          and atomic on error, and leaf array writes validate replaced element runtime types
+// ---------------------------------------------------------------------------------------------
+
+/// In B2, `StatementEvalState::write_place`, `eval_place_write`, and `SetDiscriminant` cloned
+/// the entire root local and ran `mir_value_matches_ty` across the whole root container (and
+/// `PartialAggregate::try_into_mir_value` cloned initialized sibling fields before checking
+/// whether remaining fields were `Uninit`), `Subslice` cloned and scanned all `end - start`
+/// elements even when followed by `Index`/`ConstantIndex`, and `Rvalue::Len` cloned and
+/// deep-checked the entire target array. Additionally, leaf `Index`/`ConstantIndex` writes did
+/// not check `mir_value_matches_ty(elem_slot, elem_ty)` on the replaced array element.
+#[test]
+fn test_ep1_a2_projected_writes_subslice_steps_and_len_are_linear_and_atomic() {
+    const N: usize = 1 << 15;
+    let arr_ty = Ty::Array(Box::new(u32_ty()), N);
+    let inner_uninit_ty = Ty::Tuple(vec![u32_ty(), Ty::Array(Box::new(u32_ty()), 2)]);
+    let shell_tuple_ty = Ty::Tuple(vec![arr_ty.clone(), inner_uninit_ty.clone()]);
+    let local_decls = vec![
+        arr_ty.clone(),                           // _0: [u32; N]
+        usize_ty(),                               // _1: index / len target
+        Ty::Tuple(vec![arr_ty.clone(), u8_ty()]), // _2: ([u32; N], u8)
+        shell_tuple_ty.clone(),                   // _3: ([u32; N], (u32, [u32; 2])) partial shell
+    ];
+    let arr = MirValue::Array {
+        elements: (0..N).map(|i| u32v(i as u128)).collect(),
+        elem_ty: u32_ty(),
+    };
+    let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+    state.slots[0] = LocalSlotState::Init(arr.clone());
+    state.slots[2] = LocalSlotState::Init(MirValue::Tuple(vec![arr.clone(), u8v(1)]));
+    // Initialize `_3.0` to the N-element array while leaving `_3.1` uninitialized (`PartialShell`).
+    state
+        .write_place(&proj(3, vec![field(0, arr_ty.clone())]), &arr_ty, arr)
+        .unwrap();
+    assert!(matches!(
+        state.get_local(Local(3)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+
+    let bare_idx = proj(0, vec![ProjectionElem::Index(Local(1))]);
+    let nested_idx = proj(
+        2,
+        vec![field(0, arr_ty.clone()), ProjectionElem::Index(Local(1))],
+    );
+    let shell_idx = proj(
+        3,
+        vec![field(0, arr_ty.clone()), ProjectionElem::Index(Local(1))],
+    );
+    let subslice_idx = proj(
+        0,
+        vec![
+            ProjectionElem::Subslice {
+                from: 1,
+                to: (N - 1) as u64,
+                from_end: false,
+            },
+            ProjectionElem::Index(Local(1)),
+        ],
+    );
+    let subslice_place = proj(
+        0,
+        vec![ProjectionElem::Subslice {
+            from: 1,
+            to: (N - 1) as u64,
+            from_end: false,
+        }],
+    );
+    let lowered_len_subslice =
+        lower_rvalue(&Rvalue::Len(subslice_place), &local_decls, PW).unwrap();
+    let lowered_len_shell = lower_rvalue(
+        &Rvalue::Len(proj(3, vec![field(0, arr_ty.clone())])),
+        &local_decls,
+        PW,
+    )
+    .unwrap();
+
+    for i in 0..(N - 2) {
+        state.slots[1] = LocalSlotState::Init(usizev(i as u128));
+        let v = u32v((i + 100) as u128);
+        state.write_place(&bare_idx, &u32_ty(), v.clone()).unwrap();
+        state
+            .write_place(&nested_idx, &u32_ty(), v.clone())
+            .unwrap();
+        state.write_place(&shell_idx, &u32_ty(), v.clone()).unwrap();
+        state.write_place(&subslice_idx, &u32_ty(), v).unwrap();
+        assert_eq!(
+            state.read_place(&subslice_idx),
+            Ok(u32v((i + 100) as u128))
+        );
+        if i < 64 {
+            assert_eq!(
+                anneal_mir::lower::eval_lowered_rvalue_in_state(&lowered_len_subslice, &mut state),
+                Ok(usizev((N - 2) as u128))
+            );
+            assert_eq!(
+                anneal_mir::lower::eval_lowered_rvalue_in_state(&lowered_len_shell, &mut state),
+                Ok(usizev(N as u128))
+            );
+        }
+    }
+
+    // Failed nested writes into an uninitialized sub-field of `_3` must not materialize a child
+    // `PartialShell` on `_3.1` (`_3` must remain unchanged).
+    let shell_before = state.get_local(Local(3)).cloned();
+    let bad_uninit_arr_write = proj(
+        3,
+        vec![
+            field(1, inner_uninit_ty.clone()),
+            field(1, Ty::Array(Box::new(u32_ty()), 2)),
+            ProjectionElem::ConstantIndex {
+                offset: 0,
+                min_length: 2,
+                from_end: false,
+            },
+        ],
+    );
+    assert_eq!(
+        state.write_place(&bad_uninit_arr_write, &u32_ty(), u32v(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(3)))
+    );
+    assert_eq!(state.get_local(Local(3)).cloned(), shell_before);
+
+    // Leaf `Index` and `ConstantIndex` writes must check the replaced element's runtime type:
+    // if element 7 is malformed (`u8v(7)` in a `[u32; N]` array), replacing element 7 fails with
+    // `TypeMismatch` without modifying the array, while replacing well-formed element 8 succeeds.
+    let mut elements: Vec<MirValue> = (0..N).map(|i| u32v(i as u128)).collect();
+    elements[7] = u8v(7);
+    let malformed_arr = MirValue::Array {
+        elements,
+        elem_ty: u32_ty(),
+    };
+    state.slots[0] = LocalSlotState::Init(malformed_arr.clone());
+    state.slots[1] = LocalSlotState::Init(usizev(7));
+    assert!(matches!(
+        state.write_place(&bare_idx, &u32_ty(), u32v(99)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    let const_idx_7 = proj(
+        0,
+        vec![ProjectionElem::ConstantIndex {
+            offset: 7,
+            min_length: 8,
+            from_end: false,
+        }],
+    );
+    assert!(matches!(
+        state.write_place(&const_idx_7, &u32_ty(), u32v(99)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_init(Local(0)), Some(&malformed_arr));
+
+    state.slots[1] = LocalSlotState::Init(usizev(8));
+    state.write_place(&bare_idx, &u32_ty(), u32v(888)).unwrap();
+    assert_eq!(state.read_place(&bare_idx), Ok(u32v(888)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A2] Union head and active-field checks reject malformed active fields on all accesses
+// ---------------------------------------------------------------------------------------------
+
+/// When a union local's currently active field holds a malformed value (wrong head type or
+/// wrong nested field type), reading an inactive field or overwriting any field of the union
+/// must fail with `RvalueEvalError::TypeMismatch` rather than reporting `InactiveUnionField`,
+/// `UnsupportedPlaceProjection`, or silently overwriting the corrupted union.
+#[test]
+fn test_ep1_a2_union_head_and_active_field_checks_reject_malformed_active_field() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let union_ty = Ty::Tuple(vec![pair_ty.clone(), u32_ty()]);
+    let local_decls = vec![union_ty];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+
+    // 1. Active field 0 has wrong head constructor (`MirValue::Bool(true)` instead of `(u32, u8)`).
+    let bad_head_union = MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![MirValue::Bool(true)],
+    };
+    state.slots[0] = LocalSlotState::Init(bad_head_union.clone());
+    let f0 = proj(0, vec![field(0, pair_ty.clone())]);
+    let f1 = proj(0, vec![field(1, u32_ty())]);
+    assert!(matches!(
+        state.read_place(&f1),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.write_place(&f1, &u32_ty(), u32v(42)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_init(Local(0)), Some(&bad_head_union));
+
+    // 2. Active field 0 has matching outer `MirValue::Tuple` length (2) but a malformed inner
+    // element `(Bool(true), 7u8)` instead of `(u32, u8)`. Reading inactive field 1 or replacing
+    // field 0 or field 1 must still reject the malformed active field with `TypeMismatch`.
+    let bad_nested_union = MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![MirValue::Tuple(vec![MirValue::Bool(true), u8v(7)])],
+    };
+    state.slots[0] = LocalSlotState::Init(bad_nested_union.clone());
+    assert!(matches!(
+        state.read_place(&f1),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.write_place(&f1, &u32_ty(), u32v(42)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.write_place(&f0, &pair_ty, MirValue::Tuple(vec![u32v(1), u8v(2)])),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_init(Local(0)), Some(&bad_nested_union));
+}
