@@ -1,11 +1,11 @@
 # BRIEF-3.2 Reproduction Guide: Transitive `s.memory.callees` Population by Default and Explicit `#[external_spec]` Override + Default Well-Typed Spec Generation
 
-This document provides exact, copy-pasteable commands to reproduce and verify `BRIEF-3.2` in `/usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3-2`.
+This document provides exact, copy-pasteable commands to reproduce and verify `BRIEF-3.2` in `<path/to/anneal>`.
 
 ## 1. Environment Setup
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3-2
+cd <path/to/anneal>
 export PATH="$HOME/.cargo/bin:$HOME/.elan/bin:$PATH"
 ```
 
@@ -19,9 +19,9 @@ Build `Trusted` (`trusted/lean/Trusted/VerificationResult.lean`) and `Anneal`:
 - `MirSemantics` (both `V2026_06_01` and `V2026_08_01`) accepts polymorphic `CapturedMir` bodies in `s.memory.callees` (such as `core::slice::<impl [T]>::len` with `RigidTy.param` in `localDecls`) at reify and indirect-call sites only at the instantiation recorded in the call target's `typeArgs` (`rigidTyMatchesCalleeDecl`, including recursion into `.fnPtr`, `.fnDef`, `.closure`, and `.alias`, threaded through `calleeLocalDeclsCompatible` and `checkCalleeSig`), supports wide-pointer reborrows (`&*s` / `&mut *s` / `&raw *s`), wide-to-thin `CastKind.ptrToPtr` (as in `core::slice::<impl [T]>::as_ptr` / `as_mut_ptr`), wide-to-wide `CastKind.ptrToPtr` (while faulting with `.ub` on thin-to-wide `CastKind.ptrToPtr`), and array-to-slice `CastKind.pointerCoercion "Unsize"` in `evalRvalue` for word-sized metadata (`isWidePtrMetadata`: `.scalar` length or `.ptr` vtable) when backed by `mem.borrows` or `mem.globals` (validating source/target mutability via `pointerCoercionTypesCompatible`, element type equality, `n < scalarModulus 8`, and non-disabled Tree Borrows permission across both thin and wide `PointerCoercion` paths, faulting with `.ub` on thin-to-slice/`str` mismatches, shared-to-mutable coercions, wide-to-thin `PointerCoercion`, or `.disabled` tags, and returning `.unsupported` on unmodeled thin-to-`dyn Trait` vtable coercions).
 
 ```bash
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3-2/examples
+cd <path/to/anneal>/examples
 anneal-lean-run --mode build --concurrency 1 -- lake build Trusted Anneal
-cd /usr/local/google/Projects/anneal-workspace/anneal-wt-brief-3-2
+cd <path/to/anneal>
 ```
 
 ## 3. Macro Expansion & `rustc-capture` Sidecar Target Resolution

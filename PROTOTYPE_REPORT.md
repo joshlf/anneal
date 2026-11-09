@@ -12,7 +12,7 @@
 
 ## 1. Executive Summary
 
-This Track P prototype designs, implements, and kernel-verifies a 5-element decidable MIR fragment lattice (`MirFragment`) across both Lean 4 ([MirFragmentPrototype.lean](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/theory/Anneal/MirFragmentPrototype.lean)) and Rust ([scaffold.rs](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/crates/cargo-anneal/src/scaffold.rs)), converging Anneal's MIR verification pipeline with Zircon 2.1's declarative fragment lattice (`Zircon/IR/Fragment.lean` & `Zircon/Specs/FragmentSpec.lean`, cl/1016587495 & cl/1016618663).
+This Track P prototype designs, implements, and kernel-verifies a 5-element decidable MIR fragment lattice (`MirFragment`) across both Lean 4 ([MirFragmentPrototype.lean](file://<path/to/anneal>/theory/Anneal/MirFragmentPrototype.lean)) and Rust ([scaffold.rs](file://<path/to/anneal>/crates/cargo-anneal/src/scaffold.rs)), converging Anneal's MIR verification pipeline with Zircon 2.1's declarative fragment lattice (`Zircon/IR/Fragment.lean` & `Zircon/Specs/FragmentSpec.lean`, <internal-change> & <internal-change>).
 
 | Metric | Target | Measured Result (`[adv A2]`) |
 |---|---|---|
@@ -48,7 +48,7 @@ Rank `1` is a **pure CFG property**: `minBlockFragment_ne_pureBoundedLoop` prove
 
 ## 3. Construct-to-Fragment Parity Table (Lean $\leftrightarrow$ Rust)
 
-Both `checkBodyFragment` / `inferMinFragment` in [MirFragmentPrototype.lean](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/theory/Anneal/MirFragmentPrototype.lean) and `classify_mir_fragment` in [scaffold.rs](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/crates/cargo-anneal/src/scaffold.rs) classify every `Trusted.Rustc.V2026_06_01.MirAst` construct identically:
+Both `checkBodyFragment` / `inferMinFragment` in [MirFragmentPrototype.lean](file://<path/to/anneal>/theory/Anneal/MirFragmentPrototype.lean) and `classify_mir_fragment` in [scaffold.rs](file://<path/to/anneal>/crates/cargo-anneal/src/scaffold.rs) classify every `Trusted.Rustc.V2026_06_01.MirAst` construct identically:
 
 | # | `MirAst` Construct | Minimum `MirFragment` | Rust Escalation Reason (`escalation_reasons`) | Accepted by `checkPureMir`? |
 |---|---|---|---|---|
@@ -179,7 +179,7 @@ Lean level distribution of seed 11: 104 `pure_loop_free`, 267 `pure_bounded_loop
    - Use `checkBodyFragment_pureLoopFree_eq` / `inferMinFragment_eq_pureLoopFree_iff` as the `#mir_lift` precondition and emit a fragment diagnostic whenever `inferMinFragment` exceeds `.pureLoopFree`.
    - Decide explicitly between the sound-but-conservative index rule and `isCfgDag` for `.pureLoopFree` (Finding 5.2), and change Lean and Rust together.
 2. **Episode 2 (`ep2-cargo-anneal-fragment-certificates` on `unstable`)**:
-   - Wire `classify_mir_fragment`, `render_mir_fragment_diagnostic`, and `compute_prototype_fragment_spec_digest` into `.anneal/generated/Obligations/<Item>.lean` (`def fragment : MirFragment := ...` + `theorem fragment_sound : checkBodyFragment fragment Mir.<Item>.body = true := by rfl`) and `.anneal/spec-lock.json` (`mir_fragment` + `spec_digest`), mirroring Zircon 2.1 cl/1016618663. The `rfl` certificate makes Lean the arbiter, so a Rust misclassification can only cost a failed build, never a wrong certificate.
+   - Wire `classify_mir_fragment`, `render_mir_fragment_diagnostic`, and `compute_prototype_fragment_spec_digest` into `.anneal/generated/Obligations/<Item>.lean` (`def fragment : MirFragment := ...` + `theorem fragment_sound : checkBodyFragment fragment Mir.<Item>.body = true := by rfl`) and `.anneal/spec-lock.json` (`mir_fragment` + `spec_digest`), mirroring Zircon 2.1 <internal-change>. The `rfl` certificate makes Lean the arbiter, so a Rust misclassification can only cost a failed build, never a wrong certificate.
    - *(B2)* Prefer computing the fragment **structurally** at capture time: `trusted/rustc-capture/src/lean_emit.rs` already holds the typed `IrCapturedMir`, so a 1-to-1 port of `inferMinFragmentSinglePass` over the IR (emitted alongside `Mir/<Item>.lean`) removes every lexer / truncation trap by construction; keep `classify_mir_fragment` only as the fail-closed fallback for hand-written or stale `.lean` text.
    - Keep the fail-closed vocabulary validator and run the differential harness (`ANNEAL_MIR_FRAGMENT_CORPUS_DIR=<dir> cargo test -p cargo-anneal --lib mir_fragment_parity_corpus_dump -- --ignored`) against freshly captured MIR in CI.
    - Surface `render_mir_fragment_diagnostic` in `cargo anneal agent-context` whenever an item crosses `pure_bounded_loop`.

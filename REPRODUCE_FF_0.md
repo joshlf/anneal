@@ -25,11 +25,11 @@ For supervisor- and leaf-level reproduction guides, see `REPRODUCE_FF_1.md`
 > [!WARNING]
 > **`[diversity-reduced]` & Reserve-Fallback 3rd-Party Audit Notice**
 >
-> Under the `hierarchical-supervision` + `anneal-model-policy` quota reserve
+> Under the `hierarchical-supervision` + `model-policy-cli` quota reserve
 > policy (`P0 = 2%`, `P1 = 15%`, `P2 = 40%`), the following leaf units executed
 > either wholly or partially under `[diversity-reduced]` or `MODEL_Z_RESERVE`
-> (`gemini-pro-coordinator` / `gemini-3.1-pro-high`) fallback when `Model X`
-> (`opus-5.5-max`) or `Model Y` (`gemini-launch-candidate-high`) was below the
+> (`supervisor-model-primary` / `supervisor-model-fallback`) fallback when `Model X`
+> (`model-family-x-primary`) or `Model Y` (`model-family-y-primary`) was below the
 > tier reserve floor:
 >
 > - **Single-Family `[diversity-reduced]` Leaves (Require Cross-Family `Model X`
@@ -38,18 +38,18 @@ For supervisor- and leaf-level reproduction guides, see `REPRODUCE_FF_1.md`
 >   - `FF-2.1` (`259e4f94`), `FF-2.2` (`1568fef3`), `FF-2.3` (`51fd2dfe`)
 >   - `FF-3.1` (`9a48afb7`), `FF-3.2` (`c66b48f9`)
 >   - `FF-4.1` Pass `B4` (`a6bebfc2`; Rounds 1-3 ran cross-family `Claude <->
->     Gemini`, Pass `B4` switched `ff41-b` to `gemini-pro-coordinator`)
+>     Gemini`, Pass `B4` switched `ff41-b` to `supervisor-model-primary`)
 >   - `FF-4.3` (`adv/ff-4-3` @ `549ffba8` -> `sup/ff-4` @ `05763dcf`; local
 >     `zerocopy-reference` `adv/ff-4-3-reference` @ `8ceec4bd6`)
 > - **Cross-Family Leaves With `MODEL_Z_RESERVE` Substitution (True `Anthropic
 >   Claude <-> Google Gemini` Diversity Preserved Across All Passes)**:
->   - `FF-3.3` (`e4760a0e`: `opus-5.5-max` vs `gemini-launch-candidate-high`)
->   - `FF-4.2` (`60d08cac` -> `25814f93`: `opus-5.5-max` vs
->     `gemini-launch-candidate-high` -> `gemini-pro-coordinator` on Pass `B4`)
->   - `FF-4.2b` (`cfad3ee4` -> `9ec41a30`: `opus-5.5-max` vs
->     `gemini-pro-coordinator` across all 5 passes)
+>   - `FF-3.3` (`e4760a0e`: `model-family-x-primary` vs `model-family-y-primary`)
+>   - `FF-4.2` (`60d08cac` -> `25814f93`: `model-family-x-primary` vs
+>     `model-family-y-primary` -> `supervisor-model-primary` on Pass `B4`)
+>   - `FF-4.2b` (`cfad3ee4` -> `9ec41a30`: `model-family-x-primary` vs
+>     `supervisor-model-primary` across all 5 passes)
 >
-> Both frontier pools (`opus-5.5-max` and `gemini-launch-candidate-high`) have
+> Both frontier pools (`model-family-x-primary` and `model-family-y-primary`) have
 > now refreshed (`>96%` available). Run a cross-family (`Model X`) or human
 > review on the single-family `[diversity-reduced]` units listed above prior to
 > merging `sup/ff-0` to `main` or pushing `adv/ff-4-3-reference` to
@@ -104,13 +104,13 @@ For supervisor- and leaf-level reproduction guides, see `REPRODUCE_FF_1.md`
 
 ## 2. Reproducible Verification Receipts (`sup/ff-0`)
 
-Run from `/home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-0`:
+Run from `<path/to/anneal>`:
 
 ```bash
 export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
 # 1. Repository hygiene & TrustedBoundary kernel replay audit
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/anneal-wt-ff-0
+cd <path/to/anneal>
 ./ci/check_todo.sh
 git diff 087b015b..HEAD -- trusted/lean/
 python3 trusted/audit/check_trusted.py --fast
@@ -141,7 +141,7 @@ rm -rf examples/wireframe-demo/.anneal examples/wireframe-demo/Cargo.lock \
 test -z "$(git status --porcelain)"
 
 # 5. Local zerocopy-reference report package & no-push verification
-cd /home/groupagent-anneal-fuzz-bot/Projects/markdittmer/zerocopy-reference
+cd <path/to/zerocopy-reference>
 test "$(git rev-parse origin/reference)" = \
   "64e9b5c4d271fe3f3aadfea71f36bc784ff3391b"
 python3 \
@@ -160,4 +160,4 @@ test -z "$(git status --porcelain)"
 pushed. After human / cross-family review of `adv/ff-4-3-reference`
 (`8ceec4bd6`), follow `REPRODUCE_FF_4_3.md` §4 (or `REPRODUCE_FF_4.md` §4) to
 stage the report directory onto `origin/reference` as a single linear
-fast-forward commit and push `HEAD:refs/heads/reference` from Cloudtop.
+fast-forward commit and push `HEAD:refs/heads/reference` from workstations.
