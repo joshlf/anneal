@@ -1280,7 +1280,9 @@ def verify_no_stale_quarantine_or_known_bugs(
                                 continue
                             obs_t = t_bug.get("observed_anneal_tag")
                             reas_t = t_bug.get("summary") or t_bug.get("reason")
+                            metadata_ok = True
                             if not isinstance(obs_t, str) or not obs_t.strip():
+                                metadata_ok = False
                                 stale_quarantine.append(
                                     {
                                         "source": str(quarantine_file),
@@ -1289,6 +1291,7 @@ def verify_no_stale_quarantine_or_known_bugs(
                                     }
                                 )
                             if not isinstance(reas_t, str) or not reas_t.strip():
+                                metadata_ok = False
                                 stale_quarantine.append(
                                     {
                                         "source": str(quarantine_file),
@@ -1296,23 +1299,26 @@ def verify_no_stale_quarantine_or_known_bugs(
                                         "reason": "missing_known_anneal_bug_metadata: missing summary/reason",
                                     }
                                 )
+                            if not metadata_ok:
+                                # `load_quarantine_rules` never applies such an entry.
+                                checked_quarantine_count += 1
+                                continue
+                            # Audit exactly the tokens `load_quarantine_rules` applies for this
+                            # entry (`name`, plus `name:divergence_class` when present), with the
+                            # entry's own expiry; never a synthesized token that the loader does
+                            # not use (it could never be "observed").
                             div_cls = t_bug.get("divergence_class")
-                            fp_tok = (
-                                f"{clean_t_name}:{div_cls.strip()}"
-                                if isinstance(div_cls, str) and div_cls.strip()
-                                else clean_t_name
-                            )
-                            raw_entries.append(
-                                (
-                                    {"fingerprint": fp_tok, "expires": t_bug.get("expires")}
-                                    if ":" in fp_tok
-                                    else (
-                                        {"fingerprint": f"{fp_tok}:known_anneal_bug", "expires": t_bug["expires"]}
-                                        if "expires" in t_bug and ":" not in fp_tok
-                                        else fp_tok
-                                    )
+                            loader_tokens = [clean_t_name]
+                            if isinstance(div_cls, str) and div_cls.strip():
+                                loader_tokens.append(f"{clean_t_name}:{div_cls.strip()}")
+                            for tok in loader_tokens:
+                                raw_entries.append(
+                                    {
+                                        "fingerprint": tok,
+                                        "expires": t_bug.get("expires"),
+                                        "_loader_token": True,
+                                    }
                                 )
-                            )
                 if q_data and not recognized_key:
                     stale_quarantine.append(
                         {
@@ -1353,7 +1359,7 @@ def verify_no_stale_quarantine_or_known_bugs(
                     continue
 
                 if not _is_well_formed_quarantine_token(fp) or (
-                    isinstance(entry, dict) and ":" not in fp
+                    isinstance(entry, dict) and ":" not in fp and not entry.get("_loader_token")
                 ):
                     stale_quarantine.append(
                         {

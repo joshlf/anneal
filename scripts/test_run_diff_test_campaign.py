@@ -1182,6 +1182,52 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
                 audit["stale_quarantine_entries"][0]["reason"],
             )
 
+    def test_tests_entry_that_quarantined_a_finding_is_not_reported_unobserved(self) -> None:
+        # A `[[tests]]` known_anneal_bug entry with `expires` but no `divergence_class`
+        # is applied by `load_quarantine_rules` as the bare test name; the audit must check
+        # that same token (it quarantined the run's finding), not a synthesized one.
+        with tempfile.TemporaryDirectory() as tmp:
+            repro = Path(tmp) / "repro.rs"
+            repro.write_text("pub fn f() {}\n", encoding="utf-8")
+            q_file = Path(tmp) / "q.toml"
+            q_file.write_text(
+                '[[tests]]\n'
+                'name = "seed_x"\n'
+                '[tests.known_anneal_bug]\n'
+                'observed_anneal_tag = "MirDiffTag.ub"\n'
+                'summary = "tracked"\n'
+                'expires = "2099-01-01"\n',
+                encoding="utf-8",
+            )
+            finding = self._finding(repro)
+            finding["seed_name"] = "seed_x"
+            finding["fn_name"] = "seed_x__b0_c1"
+            finding["applied_mutators"] = []
+            rules = campaign.load_quarantine_rules(q_file)
+            self.assertEqual(rules, {"seed_x"})
+            _, unq, q = campaign.deduplicate_and_quarantine_findings([finding], set(), rules)
+            self.assertEqual((len(unq), len(q)), (0, 1))
+            fp, keys = campaign.quarantine_match_keys_for_miri_finding(finding, set())
+            audit = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=q_file,
+                evaluated_fingerprints=[fp],
+                observed_quarantine_keys=keys,
+                covered_harnesses={"miri"},
+                reference_date="2026-11-09",
+            )
+            self.assertTrue(audit["passed"], audit)
+            self.assertEqual(audit["checked_quarantine_count"], 1)
+            # Once it expires it is reported (and no longer applied by the loader).
+            expired = campaign.verify_no_stale_quarantine_or_known_bugs(
+                quarantine_file=q_file,
+                evaluated_fingerprints=[fp],
+                observed_quarantine_keys=keys,
+                covered_harnesses={"miri"},
+                reference_date="2099-06-01",
+            )
+            self.assertFalse(expired["passed"])
+            self.assertIn("expired_quarantine_entry", expired["stale_entries"][0]["reason"])
+
     def test_quarantine_tests_known_anneal_bug_entries_audited_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             q_file = Path(tmp) / "q_tests.toml"

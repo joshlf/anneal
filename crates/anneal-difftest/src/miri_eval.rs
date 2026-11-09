@@ -479,6 +479,10 @@ pub struct MiriCandidateShrinkResult {
     /// Number of replayed subsequences rejected by the `rustc` pre-check without
     /// invoking the oracle.
     pub compile_rejections: usize,
+    /// Number of oracle evaluations that actually executed. Equals `oracle_evaluations`
+    /// unless the evaluator is memoized ([`MemoizedOracle`]), in which case `ddmin`
+    /// re-queries of an identical program (common across chunk sweeps) are cache hits.
+    pub executed_oracle_runs: usize,
     /// Whether shrinking ran and what it concluded.
     pub status: MiriShrinkStatus,
     /// Minimized candidate with updated `applied_mutators`, `fn_source`, and `source`.
@@ -855,6 +859,7 @@ fn unshrunk_result(
         shrink_evaluations,
         oracle_evaluations,
         compile_rejections,
+        executed_oracle_runs: oracle_evaluations,
         status,
         minimized_candidate: cand.clone(),
         minimized_report: original_report.clone(),
@@ -998,6 +1003,7 @@ where
             shrink_evaluations,
             oracle_evaluations,
             compile_rejections,
+            executed_oracle_runs: oracle_evaluations,
             status: MiriShrinkStatus::Minimized,
             minimized_candidate: min_cand,
             minimized_report: min_rep,
@@ -1082,6 +1088,48 @@ pub fn evaluate_candidate_live(
     result
 }
 
+/// Oracle evaluator memoized by the evaluated program text (`fn_source`).
+///
+/// `ddmin` re-queries identical subsequences across sweeps (for example a chunk-2 window
+/// deletion and a later single-step deletion can both yield `[s2]`). The oracle is a
+/// deterministic function of the program text, so answering repeats from the cache is
+/// semantically transparent while avoiding duplicate Miri + Lean runs.
+pub struct MemoizedOracle<F> {
+    inner: F,
+    cache: BTreeMap<String, Option<ItemOracleReport>>,
+    /// Number of evaluations actually forwarded to the wrapped evaluator.
+    pub executed_runs: usize,
+    /// Number of evaluations answered from the cache.
+    pub cache_hits: usize,
+}
+
+impl<F> MemoizedOracle<F>
+where
+    F: FnMut(&GeneratedMiriCandidate) -> Option<ItemOracleReport>,
+{
+    /// Wrap `inner`.
+    pub fn new(inner: F) -> Self {
+        Self {
+            inner,
+            cache: BTreeMap::new(),
+            executed_runs: 0,
+            cache_hits: 0,
+        }
+    }
+
+    /// Evaluate `cand`, forwarding to the wrapped evaluator only for unseen programs.
+    pub fn eval(&mut self, cand: &GeneratedMiriCandidate) -> Option<ItemOracleReport> {
+        if let Some(hit) = self.cache.get(&cand.fn_source) {
+            self.cache_hits += 1;
+            return hit.clone();
+        }
+        self.executed_runs += 1;
+        let report = (self.inner)(cand);
+        self.cache.insert(cand.fn_source.clone(), report.clone());
+        report
+    }
+}
+
 /// Minimize a divergent [`GeneratedMiriCandidate`]'s mutator chain against the live
 /// Miri + Anneal oracle pipeline (`run_difftest_oracle_pipeline`).
 ///
@@ -1096,33 +1144,25 @@ pub fn minimize_miri_candidate_mutations(
     anneal_repo_root: Option<&Path>,
 ) -> Result<MiriCandidateShrinkResult, String> {
     let toolchain = MiriToolchain::resolve(None, None, None)?;
-    // Artifacts of signature-matching oracle runs, keyed by the evaluated `fn_source`,
-    // plus an evaluation cache so repeated `ddmin` queries on the same `fn_source`
-    // across sweeps do not re-run the live Miri + Lean oracle pipeline.
+    // Artifacts of signature-matching oracle runs, keyed by the evaluated `fn_source`.
     let mut artifacts_by_source: BTreeMap<String, (String, String)> = BTreeMap::new();
-    let mut report_cache: BTreeMap<String, Option<ItemOracleReport>> = BTreeMap::new();
 
     let eval_live = |sub_cand: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
-        if let Some(cached) = report_cache.get(&sub_cand.fn_source) {
-            return cached.clone();
-        }
-        let Some(live) = evaluate_candidate_live(sub_cand, &toolchain, anneal_repo_root).ok()
-        else {
-            report_cache.insert(sub_cand.fn_source.clone(), None);
-            return None;
-        };
+        let live = evaluate_candidate_live(sub_cand, &toolchain, anneal_repo_root).ok()?;
         if discrepancy_signatures_match(original_report, &live.report) {
             artifacts_by_source.insert(
                 sub_cand.fn_source.clone(),
                 (live.mir_neighborhood, live.kernel_confirm_theorems),
             );
         }
-        let rep = Some(live.report);
-        report_cache.insert(sub_cand.fn_source.clone(), rep.clone());
-        rep
+        Some(live.report)
     };
-
-    let mut res = minimize_miri_candidate_mutations_with(cand, seeds, original_report, eval_live);
+    // Repeated `ddmin` queries of an identical program never re-run Miri + Lean.
+    let mut memo = MemoizedOracle::new(eval_live);
+    let mut res =
+        minimize_miri_candidate_mutations_with(cand, seeds, original_report, |c| memo.eval(c));
+    res.executed_oracle_runs = memo.executed_runs;
+    drop(memo);
     if res.status == MiriShrinkStatus::Minimized
         && let Some((mir_neigh, confirm_thms)) =
             artifacts_by_source.remove(&res.minimized_candidate.fn_source)
@@ -2526,6 +2566,101 @@ mod tests {
         );
     }
 
+    /// [`MemoizedOracle`] (used by the live `minimize_miri_candidate_mutations`) is
+    /// semantically transparent: the memoized shrink reaches the same minimized chain,
+    /// program, report, and query counts as the unmemoized shrink, while forwarding each
+    /// distinct program to the wrapped oracle exactly once.
+    #[test]
+    fn memoized_oracle_is_transparent_and_runs_each_distinct_program_once() {
+        let seed_sources = corpus_seed_sources();
+        let seed_refs: Vec<&str> = seed_sources.iter().map(String::as_str).collect();
+        let (cand3, subsets) = find_candidate_with_distinct_subsets(3, &seed_refs);
+        let bool_ub = |b: u32| {
+            format!("constructing invalid value: encountered 0x0{b}, but expected a boolean")
+        };
+        let scalar = |bits: u128| AnnealOutcome::PassScalar {
+            bits,
+            size_bytes: 4,
+        };
+        let original = missed_ub_report(&cand3.fn_name, 88, &bool_ub(2), scalar(1), true);
+        // Same subset semantics as the bug-slippage test above.
+        let oracle = |sub: &GeneratedMiriCandidate| -> Option<ItemOracleReport> {
+            let name = sub.fn_name.as_str();
+            Some(match subsets[&sub.fn_source] {
+                0b000 => agree_report(name),
+                0b011 => missed_ub_report(
+                    name,
+                    60,
+                    &bool_ub(2),
+                    AnnealOutcome::Panic {
+                        span: Some(lib_span(61)),
+                    },
+                    true,
+                ),
+                0b101 => missed_ub_report(name, 52, &bool_ub(3), scalar(7), true),
+                _ => missed_ub_report(
+                    name,
+                    44,
+                    "memory access failed: alloc9 has been freed, so this pointer is dangling",
+                    scalar(1),
+                    true,
+                ),
+            })
+        };
+        let compiles = |sub: &GeneratedMiriCandidate| subsets[&sub.fn_source] != 0b001;
+
+        let mut queried: Vec<u32> = Vec::new();
+        let plain = minimize_miri_candidate_mutations_with_compile_check(
+            &cand3,
+            &seed_refs,
+            &original,
+            compiles,
+            |sub| {
+                queried.push(subsets[&sub.fn_source]);
+                oracle(sub)
+            },
+        );
+
+        let mut executed: Vec<u32> = Vec::new();
+        let mut memo = MemoizedOracle::new(|sub: &GeneratedMiriCandidate| {
+            executed.push(subsets[&sub.fn_source]);
+            oracle(sub)
+        });
+        let memoized = minimize_miri_candidate_mutations_with_compile_check(
+            &cand3,
+            &seed_refs,
+            &original,
+            compiles,
+            |sub| memo.eval(sub),
+        );
+        let (executed_runs, cache_hits) = (memo.executed_runs, memo.cache_hits);
+        drop(memo);
+
+        assert_eq!(plain.status, MiriShrinkStatus::Minimized);
+        assert_eq!(memoized.status, plain.status);
+        assert_eq!(memoized.minimized_mutator_chain, plain.minimized_mutator_chain);
+        assert_eq!(memoized.minimized_candidate, plain.minimized_candidate);
+        assert_eq!(memoized.minimized_report, plain.minimized_report);
+        assert_eq!(
+            (memoized.shrink_evaluations, memoized.oracle_evaluations, memoized.compile_rejections),
+            (plain.shrink_evaluations, plain.oracle_evaluations, plain.compile_rejections),
+        );
+        // Without a memo every query executes.
+        assert_eq!(plain.executed_oracle_runs, plain.oracle_evaluations);
+        assert_eq!(plain.oracle_evaluations, queried.len());
+
+        let distinct: std::collections::BTreeSet<u32> = queried.iter().copied().collect();
+        assert!(
+            distinct.len() < queried.len(),
+            "the scenario must re-query an identical program across ddmin sweeps: {queried:?}"
+        );
+        assert_eq!(executed.len(), distinct.len(), "a program was executed twice: {executed:?}");
+        assert_eq!(executed.iter().copied().collect::<std::collections::BTreeSet<u32>>(), distinct);
+        assert_eq!(executed_runs, distinct.len());
+        assert_eq!(cache_hits, queried.len() - distinct.len());
+        assert_eq!(executed_runs + cache_hits, memoized.oracle_evaluations);
+    }
+
     #[test]
     fn shrinks_3_mutator_chain_to_single_mutator_rejecting_compile_class_and_tag_changes() {
         let seed_sources = corpus_seed_sources();
@@ -2813,8 +2948,13 @@ mod tests {
             .expect("live shrink");
         assert_eq!(res.status, MiriShrinkStatus::AlreadyOneMinimal);
         assert_eq!(
-            (res.shrink_evaluations, res.oracle_evaluations, res.compile_rejections),
-            (1, 1, 0)
+            (
+                res.shrink_evaluations,
+                res.oracle_evaluations,
+                res.compile_rejections,
+                res.executed_oracle_runs
+            ),
+            (1, 1, 0, 1)
         );
     }
 

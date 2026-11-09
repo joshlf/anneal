@@ -1038,6 +1038,76 @@ theorem shrinkMutatorChain_eq_ddminReference_of_monotone_inf (pred : List α →
   have hsub_s := shrinkMutatorChain_sublist fuel_s pred xs
   exact isOneMinimal_unique_of_monotone_inf pred xs h_mono h_inf hsub_s hsub_r hmin_s hmin_r
 
+/-- On a chain of distinct steps, a sublist that keeps every trigger step of `req` that
+occurs in the chain keeps exactly the chain's trigger steps, in chain order. -/
+theorem filter_mem_eq_of_sublist_of_nodup [DecidableEq α] (req : List α) {ys xs : List α}
+    (hsub : ys.Sublist xs) (hnd : xs.Nodup) (hkeep : ∀ a ∈ xs, a ∈ req → a ∈ ys) :
+    ys.filter (fun a => decide (a ∈ req)) = xs.filter (fun a => decide (a ∈ req)) := by
+  revert hnd hkeep
+  induction hsub with
+  | slnil => intro _ _; rfl
+  | cons a h ih =>
+    intro hnd hkeep
+    have hnd' := List.nodup_cons.mp hnd
+    have ha : a ∉ req := fun ha => hnd'.1 (h.subset (hkeep a (by simp) ha))
+    have heq := ih hnd'.2 (fun b hb hbr => hkeep b (by simp [hb]) hbr)
+    simp [ha, heq]
+  | cons_cons a h ih =>
+    intro hnd hkeep
+    have hnd' := List.nodup_cons.mp hnd
+    have heq := ih hnd'.2 (fun b hb hbr => by
+      rcases List.mem_cons.mp (hkeep b (by simp [hb]) hbr) with rfl | h'
+      · exact absurd hb hnd'.1
+      · exact h')
+    simp only [List.filter_cons, heq]
+
+/-- Concrete instance of the lower-bound closure hypothesis `h_inf` above: on a chain of
+distinct steps (the Rust shrinker identifies steps by their distinct `pass_index`),
+"every trigger step in `req` is present" predicates have the common lower bound
+`xs.filter (· ∈ req)`. -/
+theorem containsAll_inf_closed [DecidableEq α] (req xs : List α) (hnd : xs.Nodup) :
+    ∀ y₁ y₂ : List α, y₁.Sublist xs → y₂.Sublist xs →
+      req.all (fun a => decide (a ∈ y₁)) = true → req.all (fun a => decide (a ∈ y₂)) = true →
+      ∃ w : List α, w.Sublist y₁ ∧ w.Sublist y₂ ∧ req.all (fun a => decide (a ∈ w)) = true := by
+  intro y₁ y₂ h₁ h₂ hp₁ hp₂
+  simp only [List.all_eq_true, decide_eq_true_eq] at hp₁ hp₂
+  have he₁ := filter_mem_eq_of_sublist_of_nodup req h₁ hnd (fun a _ ha => hp₁ a ha)
+  have he₂ := filter_mem_eq_of_sublist_of_nodup req h₂ hnd (fun a _ ha => hp₂ a ha)
+  refine ⟨y₁.filter (fun a => decide (a ∈ req)), List.filter_sublist .., ?_, ?_⟩
+  · rw [he₁, ← he₂]
+    exact List.filter_sublist ..
+  · simp only [List.all_eq_true, decide_eq_true_eq, List.mem_filter]
+    exact fun a ha => ⟨hp₁ a ha, by simpa using ha⟩
+
+/-- Non-vacuous instance of `shrinkMutatorChain_eq_ddminReference_of_monotone_inf`: on a
+chain of distinct steps, both shrinkers return the same witness for every "every trigger
+step is present" predicate. -/
+theorem containsAll_shrinkMutatorChain_eq_ddminReference [DecidableEq α] (req xs r : List α)
+    (fuel_s fuel_d : Nat) (hnd : xs.Nodup)
+    (h_ddmin : ddminReference (fun ys => req.all (fun a => decide (a ∈ ys))) fuel_d xs = some r)
+    (h_fuel : xs.length ≤ fuel_s) :
+    shrinkMutatorChain fuel_s (fun ys => req.all (fun a => decide (a ∈ ys))) xs = r :=
+  shrinkMutatorChain_eq_ddminReference_of_monotone_inf _ xs r fuel_s fuel_d
+    (containsAll_monotone req) (containsAll_inf_closed req xs hnd) h_ddmin h_fuel
+
+/-- Kernel witness of the instance: both shrinkers isolate exactly the trigger steps
+`[1, 4]` of a 6-step chain. -/
+theorem containsAll_shrinkers_agree_witness :
+    shrinkMutatorChain 6 (fun ys : List Nat => [1, 4].all (fun a => decide (a ∈ ys)))
+        [0, 1, 2, 3, 4, 5] = [1, 4] ∧
+      ddminReference (fun ys : List Nat => [1, 4].all (fun a => decide (a ∈ ys))) 16
+        [0, 1, 2, 3, 4, 5] = some [1, 4] := ⟨by rfl, by rfl⟩
+
+/-- The distinct-steps hypothesis of the instance cannot be dropped: on the chain
+`[1, 2, 1]` with a repeated step, the two shrinkers return different 1-minimal witnesses
+for "steps `1` and `2` are present" (`h_inf` fails: `[2, 1]` and `[1, 2]` have no common
+sublist containing both steps). -/
+theorem containsAll_shrinkers_disagree_on_repeated_step :
+    shrinkMutatorChain 3 (fun ys : List Nat => [1, 2].all (fun a => decide (a ∈ ys)))
+        [1, 2, 1] = [2, 1] ∧
+      ddminReference (fun ys : List Nat => [1, 2].all (fun a => decide (a ∈ ys))) 16
+        [1, 2, 1] = some [1, 2] := ⟨by rfl, by rfl⟩
+
 /-- Non-monotone (coupled) predicate: `[1, 2, 3]` is 1-minimal although the smaller
 `[3]` also satisfies it, so 1-minimality is not global minimality in general. -/
 theorem coupled_window_one_minimal_not_globally_minimal :
@@ -1766,6 +1836,9 @@ theorem shrinkMutatorChain_single_step_witness :
 #print axioms ddminReference_globally_minimal_of_monotone
 #print axioms isOneMinimal_unique_of_monotone_inf
 #print axioms shrinkMutatorChain_eq_ddminReference_of_monotone_inf
+#print axioms containsAll_inf_closed
+#print axioms containsAll_shrinkMutatorChain_eq_ddminReference
+#print axioms containsAll_shrinkers_disagree_on_repeated_step
 #print axioms coupled_window_one_minimal_not_globally_minimal
 #print axioms shrinkMutatorChain_fuel_bound_tight
 #print axioms bvAshrOverflowing_eq_bvLshrOverflowing_of_msb_false
