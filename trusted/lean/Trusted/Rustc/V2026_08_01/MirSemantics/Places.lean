@@ -6502,6 +6502,49 @@ def valueListHasEmptyAggregate : List Value → Bool
   | _ :: rest => valueListHasEmptyAggregate rest
 
 /--
+`true` when union slot value `v` has no faithful layout-free byte image (used
+when the union's `fieldLayouts` are absent): an aggregate with fields, a
+field-less non-zero variant (an enum tag), or a field-less variant `0` while
+`layouts` contains a non-zero-sized enum whose variant `0` is field-less (so `v`
+may be that enum's tag rather than a zero-sized value).
+-/
+def unionSlotLacksLayoutFreeImage (layouts : LayoutTable) : Value → Bool
+  | .aggregate 0 .nil => layoutEntriesHaveNonZstFieldlessEnum0 layouts.entries
+  | .aggregate _ .nil => true
+  | .aggregate _ (_ :: _) => true
+  | _ => false
+
+/--
+`true` when some value in `vals` satisfies `unionSlotLacksLayoutFreeImage`.
+-/
+def unionTypedSlotsLackLayoutFreeImage (layouts : LayoutTable) : List Value → Bool
+  | .nil => false
+  | v :: rest =>
+    match unionSlotLacksLayoutFreeImage layouts v with
+    | true => true
+    | false => unionTypedSlotsLackLayoutFreeImage layouts rest
+
+/--
+Count the typed slots among the first `count` entries of a union field list
+whose layout-free value may occupy storage: `.unit` placeholders are empty, and
+a field-less `.aggregate 0 .nil` is empty unless `hasNonZstFieldlessEnum0`
+(`layoutEntriesHaveNonZstFieldlessEnum0`), in which case it may be a
+non-zero-sized enum's tag.
+-/
+def unionLayoutFreeOccupiedSlotCount (hasNonZstFieldlessEnum0 : Bool) :
+    Nat → List Value → Nat
+  | .zero, _ => 0
+  | _, .nil => 0
+  | .succ k, .unit :: rest =>
+    unionLayoutFreeOccupiedSlotCount hasNonZstFieldlessEnum0 k rest
+  | .succ k, .aggregate 0 .nil :: rest =>
+    match hasNonZstFieldlessEnum0 with
+    | true => .succ (unionLayoutFreeOccupiedSlotCount hasNonZstFieldlessEnum0 k rest)
+    | false => unionLayoutFreeOccupiedSlotCount hasNonZstFieldlessEnum0 k rest
+  | .succ k, _ :: rest =>
+    .succ (unionLayoutFreeOccupiedSlotCount hasNonZstFieldlessEnum0 k rest)
+
+/--
 Encode a `count`-slot union field list `fieldVals` of byte size `unionSize`:
 starts from the trailing raw-byte overlay image (if any, else all `.uninit`)
 and merges every non-`.unit` typed slot image into it, failing (`.none`) when
@@ -6520,34 +6563,53 @@ def encodeUnionSlotsIntoBufAux
     Option (List AbstractByte) :=
   match splitUnionTypedAndOverlay count fieldVals with
   | .none => .none
-  | .some (typedVals, .none) =>
-    mergeUnionTypedSlotsAux
-      layouts
-      encodeSlot
-      fallbackLayoutIdx
-      false
-      unionSize
-      fieldLayouts
-      typedVals
-      (replicateUninitBytes unionSize)
-      (replicateBool unionSize false)
-  | .some (typedVals, .some rawVals) =>
-    match Nat.ble (unionNonUnitNonZstTypedSlotCount layouts count fieldLayouts typedVals) 1 with
-    | false => .none
-    | true =>
-      match overlayRawAbstractByteVals rawVals (replicateUninitBytes unionSize) with
-      | .none => .none
-      | .some rawImage =>
-        mergeUnionTypedSlotsAux
-          layouts
-          encodeSlot
-          fallbackLayoutIdx
-          true
-          unionSize
-          fieldLayouts
-          typedVals
-          rawImage
-          (replicateBool unionSize true)
+  | .some (typedVals, overlayOpt) =>
+    -- Without `fieldLayouts`, a slot holding an aggregate (or a field-less
+    -- variant that may be an enum tag) has no faithful layout-free image
+    -- (`unionSlotLacksLayoutFreeImage`), so its agreement with a second
+    -- storage-occupying slot cannot be checked: fail closed.
+    let layoutFreeAmbiguous : Bool :=
+      match fieldLayouts with
+      | _ :: _ => false
+      | .nil =>
+        Bool.and
+          (Nat.ble
+            2
+            (unionLayoutFreeOccupiedSlotCount
+              (layoutEntriesHaveNonZstFieldlessEnum0 layouts.entries)
+              count
+              typedVals))
+          (unionTypedSlotsLackLayoutFreeImage layouts typedVals)
+    match layoutFreeAmbiguous, overlayOpt with
+    | true, _ => .none
+    | false, .none =>
+      mergeUnionTypedSlotsAux
+        layouts
+        encodeSlot
+        fallbackLayoutIdx
+        false
+        unionSize
+        fieldLayouts
+        typedVals
+        (replicateUninitBytes unionSize)
+        (replicateBool unionSize false)
+    | false, .some rawVals =>
+      match Nat.ble (unionNonUnitNonZstTypedSlotCount layouts count fieldLayouts typedVals) 1 with
+      | false => .none
+      | true =>
+        match overlayRawAbstractByteVals rawVals (replicateUninitBytes unionSize) with
+        | .none => .none
+        | .some rawImage =>
+          mergeUnionTypedSlotsAux
+            layouts
+            encodeSlot
+            fallbackLayoutIdx
+            true
+            unionSize
+            fieldLayouts
+            typedVals
+            rawImage
+            (replicateBool unionSize true)
 
 /--
 `true` when a `count`-slot union field list may hold mutually inconsistent
@@ -17636,9 +17698,39 @@ def attachUnionActiveFieldOverlayIfNeeded
   | _, _ => typedFields
 
 /--
+`true` when the active value `v` of a freshly constructed union must be stored as
+the `.unit` placeholder: `v` has no faithful layout-free image
+(`unionSlotLacksLayoutFreeImage`, e.g. a field-less `.aggregate 0 .nil` while
+`layouts` holds a non-zero-sized enum with a field-less variant `0`) but its
+operand is statically zero-sized, so it contributes no storage bytes and must
+never be mistaken for an enum tag when the union's slots are merged (as
+zero-sized siblings are in `rebuildUnionFieldsAfterWriteAux`). Every other
+active value is stored as is.
+-/
+def unionActiveSlotIsZstPlaceholder
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (opTyOpt : Option Ty)
+    (v : Value) :
+    Bool :=
+  match unionSlotLacksLayoutFreeImage layouts v, opTyOpt with
+  | true, .some opTy =>
+    match tyByteSize localDecls layouts (resolveTyWithLocalDecls localDecls layouts opTy) with
+    | .some 0 => true
+    | _ => false
+  | _, _ => false
+
+/--
 Construct the union `Value` for `evalAggregateAdt` when `activeField = .some fIdx`
 (returning `.none` on UB: non-zero `variantIdx`, empty or out-of-bounds operand
-list, invalid active-field operand, or invalid union field index).
+list, invalid active-field operand, or invalid union field index). The active
+slot holds `.unit` instead of the operand value when
+`unionActiveSlotIsZstPlaceholder` holds. That choice is made by a `match` before
+the result is built (each branch applies the continuation `mk`), so a
+constructed union is the same closed term as without the check: kernel `rfl`
+re-checks of multi-step machine runs exhaust memory when the stored value keeps
+an unreduced application (even of an identity wrapper) over the operand
+context.
 -/
 def evalAggregateAdtUnionValue?
     (localDecls : List LocalDecl)
@@ -17667,19 +17759,27 @@ def evalAggregateAdtUnionValue?
         | .some (.some (count, unionLayout)) =>
           let prefixUnits := replicateValue fIdx .unit
           let suffixUnits := replicateValue (Nat.sub count (.succ fIdx)) .unit
-          let typedFields := appendValueList prefixUnits (v :: suffixUnits)
-          let fields :=
-            attachUnionActiveFieldOverlayIfNeeded
-              localDecls
-              layouts
-              unionLayout
-              typedFields
-              v
-              opTyOpt
-          .some (.aggregate 0 fields)
+          let mk : Value → Option Value := fun activeSlot =>
+            let typedFields := appendValueList prefixUnits (activeSlot :: suffixUnits)
+            let fields :=
+              attachUnionActiveFieldOverlayIfNeeded
+                localDecls
+                layouts
+                unionLayout
+                typedFields
+                v
+                opTyOpt
+            .some (.aggregate 0 fields)
+          match unionActiveSlotIsZstPlaceholder localDecls layouts opTyOpt v with
+          | true => mk .unit
+          | false => mk v
         | .none =>
-          let fields := appendValueList (replicateValue fIdx .unit) (v :: .nil)
-          .some (.aggregate 0 fields)
+          let mk : Value → Option Value := fun activeSlot =>
+            let fields := appendValueList (replicateValue fIdx .unit) (activeSlot :: .nil)
+            .some (.aggregate 0 fields)
+          match unionActiveSlotIsZstPlaceholder localDecls layouts opTyOpt v with
+          | true => mk .unit
+          | false => mk v
     | v₀ :: v₁ :: vRest =>
       let fullVals := v₀ :: v₁ :: vRest
       let nVals := length fullVals
@@ -17701,21 +17801,28 @@ def evalAggregateAdtUnionValue?
             | true =>
               let prefixUnits := replicateValue fIdx .unit
               let suffixUnits := replicateValue (Nat.sub count (.succ fIdx)) .unit
-              let typedFields := appendValueList prefixUnits (activeVal :: suffixUnits)
-              let fields :=
-                attachUnionActiveFieldOverlayIfNeeded
-                  localDecls
-                  layouts
-                  unionLayout
-                  typedFields
-                  activeVal
-                  activeOpTyOpt
-              .some (.aggregate 0 fields)
+              let mk : Value → Option Value := fun activeSlot =>
+                let typedFields := appendValueList prefixUnits (activeSlot :: suffixUnits)
+                let fields :=
+                  attachUnionActiveFieldOverlayIfNeeded
+                    localDecls
+                    layouts
+                    unionLayout
+                    typedFields
+                    activeVal
+                    activeOpTyOpt
+                .some (.aggregate 0 fields)
+              match unionActiveSlotIsZstPlaceholder localDecls layouts activeOpTyOpt activeVal with
+              | true => mk .unit
+              | false => mk activeVal
           | .none =>
             let prefixUnits := replicateValue fIdx .unit
             let suffixUnits := replicateValue (Nat.sub nVals (.succ fIdx)) .unit
-            let fields := appendValueList prefixUnits (activeVal :: suffixUnits)
-            .some (.aggregate 0 fields)
+            let mk : Value → Option Value := fun activeSlot =>
+              .some (.aggregate 0 (appendValueList prefixUnits (activeSlot :: suffixUnits)))
+            match unionActiveSlotIsZstPlaceholder localDecls layouts activeOpTyOpt activeVal with
+            | true => mk .unit
+            | false => mk activeVal
 
 @[reducible]
 def evalAggregateAdt
