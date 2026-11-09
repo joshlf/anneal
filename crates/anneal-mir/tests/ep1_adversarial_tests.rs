@@ -1289,3 +1289,540 @@ fn test_ep1_b1_place_mention_matrix_matches_place_mention_operands_init() {
     run(mention(proj(3, vec![field(1, u8_ty())])), &mut state).unwrap();
     run(mention(Place::from_local(3)), &mut state).unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv A1] `SetDiscriminant` through `Downcast` on nested enum shells & variant switching
+// ---------------------------------------------------------------------------------------------
+
+/// When an outer enum shell `_1` already has its discriminant tag set (`discriminant(_1) = 1`)
+/// and its sole field `(_1 as V1).0` is an inner enum shell whose field `(((_1 as V1).0 as V2).0)`
+/// has been written, running `SetDiscriminant { place: (_1 as V1).0, variant_index: 2 }`
+/// completes both the inner and outer enum shells, promoting `_1` to `LocalSlotState::Init`.
+/// (In B1, `set_discriminant_in_slot` cloned `outer_shell` into `temp` on `Downcast`, and when
+/// `temp` promoted to `FieldSlot::Init`, `if let FieldSlot::Partial(updated_shell) = temp` was
+/// false, silently discarding the `SetDiscriminant` update.)
+#[test]
+fn test_ep1_a1_set_discriminant_through_downcast_promotes_nested_and_outer_enum_shells() {
+    let inner_enum_ty = Ty::Tuple(vec![u32_ty()]);
+    let outer_enum_ty = Ty::Tuple(vec![inner_enum_ty.clone()]);
+    let local_decls = vec![
+        Ty::Int(IntTy::Isize), // _0: discriminant scratch
+        outer_enum_ty.clone(), // _1: outer enum
+        outer_enum_ty.clone(), // _2: copy target
+    ];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+
+    let inner_place = proj(
+        1,
+        vec![ProjectionElem::Downcast(1), field(0, inner_enum_ty)],
+    );
+    let inner_leaf = proj(
+        1,
+        vec![
+            ProjectionElem::Downcast(1),
+            field(0, Ty::Tuple(vec![u32_ty()])),
+            ProjectionElem::Downcast(2),
+            field(0, u32_ty()),
+        ],
+    );
+
+    // 1. Write the leaf payload of the inner enum variant.
+    run(
+        assign(inner_leaf, use_const(Constant::Int(42, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(1)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+
+    // 2. Write the outer enum's discriminant tag FIRST; `_1` stays a `PartialShell` because the
+    // inner enum's tag is still unwritten.
+    run(
+        Statement::SetDiscriminant {
+            place: Place::from_local(1),
+            variant_index: 1,
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        state.get_local(Local(1)),
+        Some(LocalSlotState::PartialShell(_))
+    ));
+    assert_eq!(
+        state.read_place(&Place::from_local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+
+    // 3. Write the inner enum's discriminant tag through `(_1 as V1).0`: both shells are now
+    // complete, so `_1` promotes to `LocalSlotState::Init`.
+    run(
+        Statement::SetDiscriminant {
+            place: inner_place.clone(),
+            variant_index: 2,
+        },
+        &mut state,
+    )
+    .unwrap();
+    let expected = MirValue::Adt {
+        def_path: String::new(),
+        variant_idx: 1,
+        active_field: None,
+        fields: vec![MirValue::Adt {
+            def_path: String::new(),
+            variant_idx: 2,
+            active_field: None,
+            fields: vec![u32v(42)],
+        }],
+    };
+    assert_eq!(state.get_init(Local(1)), Some(&expected));
+    run(
+        assign(Place::from_local(2), use_copy(Place::from_local(1))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.get_init(Local(2)), Some(&expected));
+    run(
+        assign(Place::from_local(0), Rvalue::Discriminant(inner_place)),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::signed(2, IntTy::Isize, PW))
+    );
+}
+
+/// If a shell's fields were written under `Downcast(v)` and `SetDiscriminant(w)` then sets a
+/// *different* variant `w != v`, those fields belong to variant `v` and must not initialize
+/// variant `w`: the shell's tag becomes `w` (`Rvalue::Discriminant` returns `w`), while reading
+/// the whole enum or variant `w`'s fields fails with `UninitializedLocal` until variant `w`'s
+/// fields are written. Also verifies that a `SetDiscriminant` target ending in `Downcast` is
+/// rejected with `TypeMismatch` in all slot states (`Uninit`, `PartialShell`, `Init`).
+#[test]
+fn test_ep1_a1_set_discriminant_variant_switch_on_partial_shell_clears_old_variant_fields() {
+    let enum_ty = Ty::Tuple(vec![u32_ty()]);
+    let local_decls = vec![Ty::Int(IntTy::Isize), enum_ty.clone()];
+    let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+
+    let v1_f0 = proj(1, vec![ProjectionElem::Downcast(1), field(0, u32_ty())]);
+    let v2_f0 = proj(1, vec![ProjectionElem::Downcast(2), field(0, u32_ty())]);
+
+    // Write variant 1's field, then set discriminant to variant 2 (`2 != 1`).
+    run(
+        assign(v1_f0.clone(), use_const(Constant::Int(42, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::SetDiscriminant {
+            place: Place::from_local(1),
+            variant_index: 2,
+        },
+        &mut state,
+    )
+    .unwrap();
+
+    // Tag is now 2, so `Discriminant(_1)` returns 2, and `Downcast(1)` fails with
+    // `InactiveVariantProjection`.
+    run(
+        assign(
+            Place::from_local(0),
+            Rvalue::Discriminant(Place::from_local(1)),
+        ),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::signed(2, IntTy::Isize, PW))
+    );
+    assert_eq!(
+        state.read_place(&v1_f0),
+        Err(RvalueEvalError::InactiveVariantProjection {
+            expected: 1,
+            actual: 2,
+        })
+    );
+    // Variant 2's field was never written, so reading `_1` or `(_1 as V2).0` must fail closed!
+    assert_eq!(state.get_init(Local(1)), None);
+    assert_eq!(
+        state.read_place(&Place::from_local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    assert_eq!(
+        state.read_place(&v2_f0),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+
+    // Writing `(_1 as V2).0 = 77` completes variant 2 and promotes `_1` to `Init`.
+    run(
+        assign(v2_f0.clone(), use_const(Constant::Int(77, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(1)),
+        Some(&MirValue::Adt {
+            def_path: String::new(),
+            variant_idx: 2,
+            active_field: None,
+            fields: vec![u32v(77)],
+        })
+    );
+
+    // A `SetDiscriminant` target ending in `Downcast` is rejected with `TypeMismatch` in all
+    // slot states (`Init`, `PartialShell`, `Uninit`).
+    let bad_set_discr = LoweredStatement::SetDiscriminant {
+        place: proj(1, vec![ProjectionElem::Downcast(2)]),
+        place_ty: enum_ty,
+        variant_index: 2,
+    };
+    assert!(matches!(
+        eval_lowered_statement(&bad_set_discr, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    state.slots[1] = LocalSlotState::Uninit;
+    assert!(matches!(
+        eval_lowered_statement(&bad_set_discr, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    run(
+        assign(v2_f0, use_const(Constant::Int(1, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(
+        eval_lowered_statement(&bad_set_discr, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A1] Union field bounds, declared field types, and inactive-field tail validation
+// ---------------------------------------------------------------------------------------------
+
+/// In `StatementEvalState`, an initialized union local (`MirValue::Adt { active_field: Some(_), .. }`)
+/// stores only its single active operand in `fields`, so field reads and writes must check the
+/// union local's declared `Ty::Tuple(union_field_tys)` to reject out-of-bounds field indices and
+/// mistyped `Field` projections without corrupting the local. Nested accesses through an
+/// inactive union field must also validate the remaining projection tail before reporting
+/// `InactiveUnionField` or `UnsupportedPlaceProjection`.
+#[test]
+fn test_ep1_a1_union_reads_and_writes_validate_declared_fields_and_inactive_tail_types() {
+    let pair_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let union_ty = Ty::Tuple(vec![u32_ty(), pair_ty.clone()]);
+    let local_decls = vec![union_ty];
+    let union_val = MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![u32v(0x1234)],
+    };
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[0] = LocalSlotState::Init(union_val.clone());
+
+    // 1. Out-of-bounds union field `_0.99` fails with `FieldOutOfBounds` on both read and write
+    // (B1 accepted the write and set `active_field = Some(99)`, and returned `InactiveUnionField`
+    // on read).
+    let oob_place = proj(0, vec![field(99, u32_ty())]);
+    assert_eq!(
+        state.read_place(&oob_place),
+        Err(RvalueEvalError::FieldOutOfBounds {
+            field_idx: 99,
+            field_count: 2,
+        })
+    );
+    assert_eq!(
+        state.write_place(&oob_place, &u32_ty(), u32v(7)),
+        Err(RvalueEvalError::FieldOutOfBounds {
+            field_idx: 99,
+            field_count: 2,
+        })
+    );
+    assert_eq!(state.get_init(Local(0)), Some(&union_val));
+
+    // 2. Mistyped union field `Field(1, Ty::Bool)` (declared field 1 is `(u32, u8)`) fails with
+    // `TypeMismatch` on both read and write without modifying `_0`.
+    let wrong_ty_place = proj(0, vec![field(1, Ty::Bool)]);
+    assert!(matches!(
+        state.read_place(&wrong_ty_place),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.write_place(&wrong_ty_place, &Ty::Bool, MirValue::Bool(true)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(state.get_init(Local(0)), Some(&union_val));
+
+    // 3. Ill-typed nested projections on an inactive union field are rejected with
+    // `TypeMismatch` / `FieldOutOfBounds` before `InactiveUnionField` / `UnsupportedPlaceProjection`.
+    let mut locals = vec![union_val.clone()];
+    let bad_nested_ty = proj(0, vec![field(1, u8_ty()), field(0, u32_ty())]);
+    assert!(matches!(
+        eval_place_read(&bad_nested_ty, &locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        eval_place_write(&bad_nested_ty, u32v(1), &mut locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    let bad_nested_oob = proj(0, vec![field(1, pair_ty.clone()), field(5, u32_ty())]);
+    assert_eq!(
+        eval_place_read(&bad_nested_oob, &locals, PW),
+        Err(RvalueEvalError::FieldOutOfBounds {
+            field_idx: 5,
+            field_count: 2,
+        })
+    );
+    assert_eq!(
+        eval_place_write(&bad_nested_oob, u32v(1), &mut locals, PW),
+        Err(RvalueEvalError::FieldOutOfBounds {
+            field_idx: 5,
+            field_count: 2,
+        })
+    );
+
+    let valid_nested_place = proj(0, vec![field(1, pair_ty), field(0, u32_ty())]);
+    assert!(matches!(
+        eval_place_write(&valid_nested_place, MirValue::Bool(true), &mut locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(locals[0], union_val);
+
+    // 4. An ill-formed union `MirValue::Adt` with `fields: vec![]` is rejected with `TypeMismatch`.
+    let empty_union = MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![],
+    };
+    let mut bad_locals = vec![empty_union];
+    assert!(matches!(
+        eval_place_write(
+            &proj(0, vec![field(0, u32_ty())]),
+            u32v(1),
+            &mut bad_locals,
+            PW
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A1] `PartialShell` and `Uninit` projection type & tail validation
+// ---------------------------------------------------------------------------------------------
+
+/// Reading, computing `Discriminant`, or running `SetDiscriminant` through a `PartialShell` or
+/// `Uninit` local must validate every `Field(idx, expected_ty)` against `local_decls` and
+/// validate trailing projections on uninitialized sub-places so static type errors are never
+/// misclassified as `UninitializedLocal` or falsely accepted.
+#[test]
+fn test_ep1_a1_partial_shell_and_uninit_projections_validate_field_types_and_tails() {
+    let inner_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let outer_ty = Ty::Tuple(vec![inner_ty.clone(), u8_ty()]);
+    let arr_ty = Ty::Array(Box::new(u32_ty()), 2);
+    let local_decls = vec![
+        outer_ty, // _0: ((u32, u8), u8)
+        arr_ty,   // _1: [u32; 2]
+        usize_ty(), // _2: usize
+    ];
+    let mut state = StatementEvalState::from_local_decls(local_decls, PW);
+    state.slots[2] = LocalSlotState::Init(usizev(0));
+
+    // Initialize `_0.0.0 = 10u32` and tag `_0.0` with variant 2 (`_0.0` is now a tagged
+    // `PartialShell` because `_0.0.1` is still `Uninit`).
+    let p00_v2_f0 = proj(
+        0,
+        vec![
+            field(0, inner_ty.clone()),
+            ProjectionElem::Downcast(2),
+            field(0, u32_ty()),
+        ],
+    );
+    run(
+        assign(p00_v2_f0, use_const(Constant::Int(10, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        Statement::SetDiscriminant {
+            place: proj(0, vec![field(0, inner_ty)]),
+            variant_index: 2,
+        },
+        &mut state,
+    )
+    .unwrap();
+
+    // 1. Reading `_0.0.0` through a mistyped outer `Field(0, Ty::Bool)` must fail with
+    // `TypeMismatch` (B1 ignored `expected_ty` on `FieldSlot::Partial` and returned `Ok(10u32)`!).
+    let mistyped_read = proj(
+        0,
+        vec![
+            field(0, Ty::Bool),
+            ProjectionElem::Downcast(2),
+            field(0, u32_ty()),
+        ],
+    );
+    assert!(matches!(
+        state.read_place(&mistyped_read),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // 2. `Rvalue::Discriminant` and `Statement::SetDiscriminant` through a mistyped
+    // `Field(0, Ty::Bool)` on a tagged `PartialShell` must fail with `TypeMismatch` (B1
+    // ignored `expected_ty` in `partial_shell_at` and `set_discriminant_in_slot` and succeeded!).
+    let mistyped_inner = proj(0, vec![field(0, Ty::Bool)]);
+    let bad_discr_stmt = LoweredStatement::Assign {
+        place: Place::from_local(2),
+        place_ty: Ty::Int(IntTy::Isize),
+        rvalue: anneal_mir::lower::LoweredRvalue::Discriminant {
+            place: mistyped_inner.clone(),
+            place_ty: Ty::Bool,
+            ty: Ty::Int(IntTy::Isize),
+        },
+    };
+    assert!(matches!(
+        eval_lowered_statement(&bad_discr_stmt, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    let bad_set_discr = LoweredStatement::SetDiscriminant {
+        place: mistyped_inner,
+        place_ty: Ty::Bool,
+        variant_index: 1,
+    };
+    assert!(matches!(
+        eval_lowered_statement(&bad_set_discr, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // 3. On an uninitialized field `_0.1` (`u8`) or uninitialized array `_1` (`[u32; 2]`),
+    // ill-typed trailing projections fail with `TypeMismatch` rather than `UninitializedLocal`.
+    let bad_uninit_field_index = proj(0, vec![field(1, u8_ty()), ProjectionElem::Index(Local(2))]);
+    assert!(matches!(
+        state.read_place(&bad_uninit_field_index),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    let bad_uninit_arr_elem_field =
+        proj(1, vec![ProjectionElem::Index(Local(2)), field(0, u32_ty())]);
+    assert!(matches!(
+        state.read_place(&bad_uninit_arr_elem_field),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        state.write_place(&bad_uninit_arr_elem_field, &u32_ty(), u32v(5)),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [adv A1] Array aggregates of unions & `LoweredRvalue` runtime operand type guards
+// ---------------------------------------------------------------------------------------------
+
+/// `Rvalue::Aggregate(AggregateKind::Array(union_ty), ...)` must accept union elements whose
+/// runtime `MirValue::Adt { active_field: Some(idx), fields: vec![val] }` has 1 active operand
+/// while `union_ty` is the multi-field `Ty::Tuple` of all declared union fields ( matching
+/// `Rvalue::Repeat`). Also checks that hand-built `LoweredRvalue`s with mismatched runtime
+/// operand types are rejected with `TypeMismatch`.
+#[test]
+fn test_ep1_a1_array_aggregates_of_unions_and_lowered_rvalue_runtime_type_guards() {
+    let union_ty = Ty::Tuple(vec![u32_ty(), u8_ty()]);
+    let arr_union_ty = Ty::Array(Box::new(union_ty.clone()), 2);
+    let local_decls = vec![union_ty.clone(), arr_union_ty.clone(), u32_ty()];
+    let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+
+    let init_u = assign(
+        Place::from_local(0),
+        Rvalue::Aggregate(
+            AggregateKind::Adt {
+                def_path: "U".into(),
+                variant_idx: 0,
+                active_field: Some(1),
+            },
+            vec![Operand::Constant(Constant::Int(0x7F, u8_ty()))],
+        ),
+    );
+    run(init_u, &mut state).unwrap();
+
+    // `_1 = [copy _0, copy _0]` via `AggregateKind::Array(union_ty)` must succeed and match
+    // `_1 = [copy _0; 2]` (`Rvalue::Repeat`).
+    let init_arr = assign(
+        Place::from_local(1),
+        Rvalue::Aggregate(
+            AggregateKind::Array(union_ty.clone()),
+            vec![
+                Operand::Copy(Place::from_local(0)),
+                Operand::Copy(Place::from_local(0)),
+            ],
+        ),
+    );
+    run(init_arr, &mut state).unwrap();
+    let elem0_f1 = proj(
+        1,
+        vec![
+            ProjectionElem::ConstantIndex {
+                offset: 0,
+                min_length: 2,
+                from_end: false,
+            },
+            field(1, u8_ty()),
+        ],
+    );
+    assert_eq!(state.read_place(&elem0_f1), Ok(u8v(0x7F)));
+
+    // Runtime operand type mismatches in `eval_lowered_rvalue` (`Use`, `BinaryOp`, `UnaryOp`,
+    // `Aggregate`) must fail closed with `TypeMismatch`.
+    let mut tracker = ExposedProvenanceTracker::new();
+    let policy = TransmutePolicy::RejectPtrToInt;
+    let lowered_use = lower_rvalue(&use_copy(Place::from_local(2)), &local_decls, PW).unwrap();
+    assert!(matches!(
+        eval_lowered_rvalue(
+            &lowered_use,
+            &[MirValue::Unit, MirValue::Unit, u8v(1)],
+            PW,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    let lowered_add = lower_rvalue(
+        &Rvalue::BinaryOp(
+            anneal_mir::ir::BinOp::Add,
+            Operand::Copy(Place::from_local(2)),
+            Operand::Copy(Place::from_local(2)),
+        ),
+        &local_decls,
+        PW,
+    )
+    .unwrap();
+    assert!(matches!(
+        eval_lowered_rvalue(
+            &lowered_add,
+            &[MirValue::Unit, MirValue::Unit, u8v(1)],
+            PW,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    let lowered_not = lower_rvalue(
+        &Rvalue::UnaryOp(anneal_mir::ir::UnOp::Not, Operand::Copy(Place::from_local(2))),
+        &local_decls,
+        PW,
+    )
+    .unwrap();
+    assert!(matches!(
+        eval_lowered_rvalue(
+            &lowered_not,
+            &[MirValue::Unit, MirValue::Unit, MirValue::Bool(true)],
+            PW,
+            policy,
+            &mut tracker
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}
+
