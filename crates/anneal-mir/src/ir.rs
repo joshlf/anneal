@@ -700,10 +700,26 @@ pub enum CastKind {
     PointerWithExposedProvenance,
     /// Direct integer numeric conversion (`u8 as u32`, `i64 as i32`).
     IntToInt,
+    /// Unicode scalar (`char`) to integer conversion (`'A' as u8`, `c as i32`).
+    CharToInt,
     /// Raw pointer type change (`*const u8 as *const i32`).
     PtrToPtr,
     /// Bitwise reinterpretation (`core::mem::transmute`).
     Transmute,
+}
+
+/// Nullary operation flavor for `Rvalue::NullaryOp`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NullOp {
+    /// `core::mem::size_of::<T>()` in bytes (`usize`).
+    SizeOf,
+    /// `core::mem::align_of::<T>()` in bytes (`usize`).
+    AlignOf,
+    /// `core::mem::offset_of!(T, fields)` in bytes (`usize`), where each step is
+    /// `(variant_idx, field_idx)`.
+    OffsetOf(Vec<(usize, usize)>),
+    /// Runtime undefined-behavior check query (`#[cfg(ub_checks)]`, `bool`).
+    UbChecks,
 }
 
 /// Binary operation flavor matching `rustc` MIR `BinOp`.
@@ -779,6 +795,7 @@ pub enum Rvalue {
     Cast(CastKind, Operand, Ty),
     BinaryOp(BinOp, Operand, Operand),
     CheckedBinaryOp(BinOp, Operand, Operand),
+    NullaryOp(NullOp, Ty),
     UnaryOp(UnOp, Operand),
     Discriminant(Place),
     Aggregate(AggregateKind, Vec<Operand>),
@@ -789,6 +806,12 @@ pub enum Rvalue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
     Assign(Place, Rvalue),
+    SetDiscriminant {
+        place: Place,
+        variant_index: usize,
+    },
+    PlaceMention(Place),
+    Assume(Operand),
     StorageLive(Local),
     StorageDead(Local),
     Nop,

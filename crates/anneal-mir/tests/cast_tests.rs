@@ -7,9 +7,9 @@ use anneal_mir::ir::{
 };
 use anneal_mir::lower::{
     AbstractByte, CastEvalError, CastLowerError, CastOp, ExposedProvenanceTracker, LoweredCast,
-    ProvenanceFrag, TransmutePolicy, TransmuteValue, eval_int_to_int, eval_int_to_ptr,
-    eval_ptr_to_int, eval_transmute, lower_cast_rvalue, lower_cast_rvalue_with_ptr_width,
-    lower_transmute,
+    MirValue, ProvenanceFrag, RvalueEvalError, TransmutePolicy, TransmuteValue, eval_char_to_int,
+    eval_int_to_int, eval_int_to_ptr, eval_lowered_cast, eval_ptr_to_int, eval_transmute,
+    lower_cast_rvalue, lower_cast_rvalue_with_ptr_width, lower_char_to_int, lower_transmute,
 };
 
 #[test]
@@ -1022,5 +1022,175 @@ fn test_a2_eval_transmute_identity_bypasses_pointer_leaf_budget_for_canonical_ar
         ),
         Ok(TransmuteValue::Bytes(zero_bytes))
     );
+    assert!(tracker.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Episode 1 (`ep1-rust-place-proj-nullary-stmt`): `CastKind::CharToInt` tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_ep1_char_to_int_lowering_and_evaluation_all_widths_and_boundaries() {
+    let mut tracker = ExposedProvenanceTracker::new();
+    let op = Operand::Constant(Constant::Char('A'));
+    assert_eq!(CastOp::CharToInt, CastOp::CharToInt);
+
+    let all_int_targets = [
+        Ty::Uint(UintTy::U8),
+        Ty::Uint(UintTy::U16),
+        Ty::Uint(UintTy::U32),
+        Ty::Uint(UintTy::U64),
+        Ty::Uint(UintTy::U128),
+        Ty::Uint(UintTy::Usize),
+        Ty::Int(IntTy::I8),
+        Ty::Int(IntTy::I16),
+        Ty::Int(IntTy::I32),
+        Ty::Int(IntTy::I64),
+        Ty::Int(IntTy::I128),
+        Ty::Int(IntTy::Isize),
+    ];
+
+    for ptr_width in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        for target_ty in &all_int_targets {
+            let lowered = lower_cast_rvalue_with_ptr_width(
+                CastKind::CharToInt,
+                &op,
+                &Ty::Char,
+                target_ty,
+                ptr_width,
+                TransmutePolicy::RejectPtrToInt,
+            )
+            .expect("Char -> integral target must lower cleanly");
+            assert_eq!(
+                lowered,
+                LoweredCast::CharToInt {
+                    operand: op.clone(),
+                    target_ty: target_ty.clone(),
+                }
+            );
+            assert_eq!(
+                lower_char_to_int(&op, &Ty::Char, target_ty, ptr_width),
+                Ok(lowered.clone())
+            );
+
+            // Boundary Unicode scalar values: '\0', 'A', '\u{00FF}', '\u{D7FF}', '\u{E000}',
+            // '\u{1F600}', '\u{10FFFF}'.
+            for ch in ['\0', 'A', '\u{00FF}', '\u{D7FF}', '\u{E000}', '\u{1F600}', '\u{10FFFF}'] {
+                let code = u128::from(u32::from(ch));
+                let expected_bits = code & target_ty.scalar_mask(ptr_width);
+                assert_eq!(
+                    eval_char_to_int(code, target_ty, ptr_width),
+                    Ok(expected_bits)
+                );
+                let val = eval_lowered_cast(
+                    &lowered,
+                    &MirValue::Char(ch),
+                    ptr_width,
+                    TransmutePolicy::RejectPtrToInt,
+                    &mut tracker,
+                )
+                .expect("eval_lowered_cast on valid MirValue::Char must succeed");
+                assert_eq!(
+                    val,
+                    MirValue::Int {
+                        bits: expected_bits,
+                        ty: target_ty.clone(),
+                    }
+                );
+            }
+        }
+
+        // Narrow target truncation & sign reinterpretation:
+        // '\u{00FF}' as i8 -> bits 0xFF (-1i8), 'A' as u8 -> 65, '\u{1F600}' as u16 -> 0xF600
+        let lowered_i8 = lower_char_to_int(&op, &Ty::Char, &Ty::Int(IntTy::I8), ptr_width).unwrap();
+        let val_i8 = eval_lowered_cast(
+            &lowered_i8,
+            &MirValue::Char('\u{00FF}'),
+            ptr_width,
+            TransmutePolicy::RejectPtrToInt,
+            &mut tracker,
+        )
+        .unwrap();
+        assert_eq!(
+            val_i8,
+            MirValue::Int {
+                bits: 0xFF,
+                ty: Ty::Int(IntTy::I8),
+            }
+        );
+        assert_eq!(val_i8.as_signed(ptr_width), Some(-1));
+
+        let lowered_u16 =
+            lower_char_to_int(&op, &Ty::Char, &Ty::Uint(UintTy::U16), ptr_width).unwrap();
+        let val_u16 = eval_lowered_cast(
+            &lowered_u16,
+            &MirValue::Char('\u{1F600}'),
+            ptr_width,
+            TransmutePolicy::RejectPtrToInt,
+            &mut tracker,
+        )
+        .unwrap();
+        assert_eq!(val_u16.as_bits(), Some(0xF600));
+
+        // Invalid bit patterns in `eval_char_to_int` (surrogates and > 0x10FFFF) must fail closed.
+        for bad_bits in [0xD800u128, 0xDABCu128, 0xDFFFu128, 0x11_0000u128, 1u128 << 32] {
+            assert_eq!(
+                eval_char_to_int(bad_bits, &Ty::Uint(UintTy::U32), ptr_width),
+                Err(CastEvalError::InvalidBitPattern {
+                    target_ty: Ty::Char,
+                    bits: bad_bits,
+                })
+            );
+        }
+
+        // Non-`Char` source or non-integral target rejected during lowering.
+        for bad_src in [
+            Ty::Bool,
+            Ty::Uint(UintTy::U8),
+            Ty::Uint(UintTy::U32),
+            Ty::Int(IntTy::I32),
+            Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+        ] {
+            assert_eq!(
+                lower_char_to_int(&op, &bad_src, &Ty::Uint(UintTy::U32), ptr_width),
+                Err(CastLowerError::InvalidSourceType {
+                    expected: "char",
+                    got: bad_src,
+                })
+            );
+        }
+        for bad_dst in [
+            Ty::Bool,
+            Ty::Char,
+            Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+            Ty::Ref(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+            Ty::unit(),
+            Ty::Never,
+        ] {
+            assert_eq!(
+                lower_char_to_int(&op, &Ty::Char, &bad_dst, ptr_width),
+                Err(CastLowerError::InvalidTargetType {
+                    expected: "integral type",
+                    got: bad_dst.clone(),
+                })
+            );
+            assert!(matches!(
+                eval_char_to_int(0x41, &bad_dst, ptr_width),
+                Err(CastEvalError::TypeMismatch(_))
+            ));
+        }
+
+        // Non-`MirValue::Char` runtime operand rejected by `eval_lowered_cast`.
+        assert!(matches!(
+            eval_lowered_cast(
+                &lowered_i8,
+                &MirValue::unsigned(0x41, UintTy::U32, ptr_width),
+                ptr_width,
+                TransmutePolicy::RejectPtrToInt,
+                &mut tracker,
+            ),
+            Err(RvalueEvalError::TypeMismatch(_))
+        ));
+    }
     assert!(tracker.is_empty());
 }
