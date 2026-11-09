@@ -7244,6 +7244,98 @@ theorem scalarTy_isTryFromBytes_validBits
   | rawPtr | refPtr => contradiction
 
 /--
+Every thin raw pointer `.rawPtr m pointee` (`isThinPointee pointee = true`) satisfies
+`IsTryFromBytes` with validity predicate characterizing the decoded `.ptr p 8` value
+(`ScalarTy.rawPtr.validBits .bits64 bits` and provenance/page-model reconstruction).
+-/
+theorem thin_rawPtr_isTryFromBytes
+    (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy)
+    (lIdx : LayoutIdx) (hThin : isThinPointee pointee = true) :
+    IsTryFromBytes layouts { kind := .rawPtr m pointee, layoutIdx := lIdx }
+      (fun v =>
+        ∃ (p : ProvenancePtr) (bits : Nat) (prov : Option (Nat × Nat)),
+          v = .ptr p 8 ∧
+          ScalarTy.rawPtr.validBits .bits64 bits ∧
+          p = match prov with
+              | some (allocId, _) => { allocId := allocId, offsetBytes := bits }
+              | none => addressToPtr bits) := by
+  refine ⟨8, trusted_rigidTyByteSize_thin_rawPtr layouts m pointee lIdx hThin, ?_⟩
+  intro bs v hDec
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      trusted_decodeValueFromBytes_thin_rawPtr_eq 15 layouts m pointee lIdx bs hThin] at hDec
+  cases hLen : Nat.beq (Trusted.Sequence.length bs) 8 <;> rw [hLen] at hDec
+  · nomatch hDec
+  · dsimp only at hDec
+    cases hSc : decodeScalarBytes bs false <;> rw [hSc] at hDec
+    · nomatch hDec
+    case some pair =>
+      rcases pair with ⟨sv, prov⟩
+      dsimp only at hDec
+      have hBsLen : Trusted.Sequence.length bs = 8 := Nat.eq_of_beq_eq_true hLen
+      have ⟨hSvSz, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
+      rw [hBsLen] at hSvSz hSvLt
+      cases prov with
+      | none =>
+        injection hDec with hV
+        exact ⟨addressToPtr sv.bits, sv.bits, none, hV.symm, ⟨hSvLt, trivial⟩, rfl⟩
+      | some ap =>
+        rcases ap with ⟨allocId, tag⟩
+        injection hDec with hV
+        exact ⟨{ allocId := allocId, offsetBytes := sv.bits }, sv.bits, some (allocId, tag),
+          hV.symm, ⟨hSvLt, trivial⟩, rfl⟩
+
+/--
+Every thin reference `.ref m pointee` (`isThinPointee pointee = true`) satisfies
+`IsTryFromBytes` with validity predicate characterizing the decoded `.ptr p 8` value:
+`bits < scalarModulus 8`, and whenever the bytes carry no provenance (`prov = none`),
+the non-null reference niche `ScalarTy.refPtr.validBits .bits64 bits` (`0 < bits`) holds.
+-/
+theorem thin_refPtr_isTryFromBytes
+    (layouts : LayoutTable) (m : Mutability) (pointee : RigidTy)
+    (lIdx : LayoutIdx) (hThin : isThinPointee pointee = true) :
+    IsTryFromBytes layouts { kind := .ref m pointee, layoutIdx := lIdx }
+      (fun v =>
+        ∃ (p : ProvenancePtr) (bits : Nat) (prov : Option (Nat × Nat)),
+          v = .ptr p 8 ∧
+          bits < scalarModulus 8 ∧
+          (prov = none → ScalarTy.refPtr.validBits .bits64 bits) ∧
+          p = match prov with
+              | some (allocId, _) => { allocId := allocId, offsetBytes := bits }
+              | none => addressToPtr bits) := by
+  refine ⟨8, trusted_rigidTyByteSize_thin_ref layouts m pointee lIdx hThin, ?_⟩
+  intro bs v hDec
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+      trusted_decodeValueFromBytes_thin_ref_eq 15 layouts m pointee lIdx bs hThin] at hDec
+  cases hLen : Nat.beq (Trusted.Sequence.length bs) 8 <;> rw [hLen] at hDec
+  · nomatch hDec
+  · dsimp only at hDec
+    cases hSc : decodeScalarBytes bs false <;> rw [hSc] at hDec
+    · nomatch hDec
+    case some pair =>
+      rcases pair with ⟨sv, prov⟩
+      dsimp only at hDec
+      have hBsLen : Trusted.Sequence.length bs = 8 := Nat.eq_of_beq_eq_true hLen
+      have ⟨hSvSz, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
+      rw [hBsLen] at hSvSz hSvLt
+      cases prov with
+      | none =>
+        dsimp only at hDec
+        cases hZero : Nat.beq sv.bits 0 <;> rw [hZero] at hDec
+        · have hPos : 0 < sv.bits := by
+            cases hb : sv.bits with
+            | zero => rw [hb] at hZero; nomatch hZero
+            | succ k => exact Nat.succ_pos k
+          injection hDec with hV
+          exact ⟨addressToPtr sv.bits, sv.bits, none, hV.symm, hSvLt,
+            fun _ => ⟨hSvLt, hPos⟩, rfl⟩
+        · nomatch hDec
+      | some ap =>
+        rcases ap with ⟨allocId, tag⟩
+        injection hDec with hV
+        exact ⟨{ allocId := allocId, offsetBytes := sv.bits }, sv.bits, some (allocId, tag),
+          hV.symm, hSvLt, (fun h => by nomatch h), rfl⟩
+
+/--
 **`try_transmute` instantiation for `u8 -> bool`**:
 Unifies `evalTransmuteSameSize`, `ScalarTy.bool.isValidBits`, `ScalarLayout` `wrappingRangeContains ⟨0, 1⟩`,
 `decodeScalarLayoutBytes`, and `decodeValueFromBytes` for candidate `u8` bit patterns `bits < 256`.
@@ -7953,5 +8045,146 @@ theorem tryTransmute_adt_multiple_enumRange_evalByteCast_iff
   · have hIn := hIff.mp hW
     simp only [reduceCtorEq, true_iff, false_iff]
     exact ⟨hIn, by omega⟩
+
+/--
+**Concrete `try_transmute` instantiation for multi-variant `#[repr(u8)]` contiguous enums (`VariantsShape.multiple`).**
+For any 1-byte multi-variant `#[repr(u8)]` enum `enumTy` with `ScalarLayout.initialized (.int 8 false) ⟨0, maxTag⟩`
+whose tags `0..=maxTag` index fieldless variants `.arbitrary [] _` in `variantShapes`, and any candidate
+`u8` bit pattern `bits < 256`:
+1. `decodeValueFromBytes` on the encoded `u8` bytes returns `some (.aggregate bits [])` iff `wrappingRangeContains ⟨0, maxTag⟩ bits = true` (equivalently `bits ≤ maxTag`), and `none` iff `maxTag < bits`.
+2. Step-level `evalByteCast` from `u8` to `enumTy` evaluates to `ok (.aggregate bits []) locals' mem` iff `bits ≤ maxTag`, and `ub` iff `maxTag < bits`.
+-/
+theorem tryTransmute_repr_u8_multiple_enum_validRange_iff
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (defPath : DefPath) (args : List RigidTy) (srcLIdx enumLIdx : LayoutIdx)
+    (l : TypeLayout) (maxTag bits : Nat)
+    (variantShapes : List FieldsShape) (memoryOrder : List Nat)
+    (hBits : bits < 256)
+    (hLookup : LayoutTable.lookup layouts enumLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple (.initialized (.int 8 false) ⟨0, maxTag⟩) 0 variantShapes)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hSz1 : l.size.bytes = 1)
+    (hFieldless :
+      ∀ tag < 256,
+        wrappingRangeContains ⟨0, maxTag⟩ tag = true →
+        ∃ varMemOrder, Trusted.Sequence.get? variantShapes tag = some (.arbitrary [] varMemOrder))
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok (.scalar ⟨bits, 1⟩) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := .uint .u8, layoutIdx := srcLIdx }) :
+    let enumTy : Ty := { kind := .adt defPath args, layoutIdx := enumLIdx }
+    let tBytes := (encodeCastBytes bits 1 none).map CastByte.toTrustedAbstractByte
+    (decodeValueFromBytes defaultCodecFuel layouts enumTy tBytes =
+      some (.aggregate bits []) ↔ wrappingRangeContains ⟨0, maxTag⟩ bits = true) ∧
+    (decodeValueFromBytes defaultCodecFuel layouts enumTy tBytes =
+      some (.aggregate bits []) ↔ bits ≤ maxTag) ∧
+    (decodeValueFromBytes defaultCodecFuel layouts enumTy tBytes = none ↔ maxTag < bits) ∧
+    (evalByteCast locals op enumTy mem localDecls layouts =
+      ok (.aggregate bits []) locals' mem ↔ bits ≤ maxTag) ∧
+    (evalByteCast locals op enumTy mem localDecls layouts = ub ↔ maxTag < bits) := by
+  intro enumTy tBytes
+  have hMap : tBytes = encodeLittleEndianBytes bits 1 none := by
+    unfold tBytes
+    rw [map_toTrustedAbstractByte_encodeCastBytes]
+    rfl
+  have hValidU8 : ScalarTy.u8.validBits .bits64 bits := ⟨hBits, trivial⟩
+  have hWidth : primitiveKindByteWidth (.int 8 false) = some l.size.bytes := by
+    rw [hSz1]
+  have hFieldless' :
+      ∀ tag < scalarModulus l.size.bytes,
+        wrappingRangeContains ⟨0, maxTag⟩ tag = true →
+        ∃ varMemOrder, Trusted.Sequence.get? variantShapes tag = some (.arbitrary [] varMemOrder) := by
+    intro tag hTagLt hIn
+    rw [hSz1] at hTagLt
+    exact hFieldless tag hTagLt hIn
+  have ⟨hDecEq, hBcEq⟩ := tryTransmute_adt_multiple_enum_scalarLayout_eq
+    locals locals' op mem localDecls layouts .not .bool .u8 srcLIdx defPath args enumLIdx l
+    8 bits false ⟨0, maxTag⟩ variantShapes memoryOrder rfl hValidU8 hLookup hInhab hVar hFields
+    hSz1 hWidth hFieldless' hOp hTy
+  have hWRange := wrappingRangeContains_zero_max_iff maxTag bits
+  rw [hMap, hDecEq, hBcEq]
+  cases hW : wrappingRangeContains ⟨0, maxTag⟩ bits
+  · have hGt : maxTag < bits := by
+      have : ¬ (bits ≤ maxTag) := fun hLe => by
+        rw [hWRange.mpr hLe] at hW; nomatch hW
+      omega
+    refine ⟨by simp, ?_, ?_, ?_, ?_⟩ <;> simp [hGt, show ¬ (bits ≤ maxTag) by omega]
+  · have hLe : bits ≤ maxTag := hWRange.mp hW
+    refine ⟨by simp, ?_, ?_, ?_, ?_⟩ <;> simp [hLe, show ¬ (maxTag < bits) by omega]
+
+/--
+**`try_transmute` on the `l.fieldLayouts` single-field wrapper path at the `Trusted` step level.**
+When a single-field `.adt defPath args` (`args.length ≠ 1`, in particular `args = []`) has
+`l.fields = .arbitrary [⟨0⟩] memoryOrder` and `l.fieldLayouts = [fIdx]` where the inner field layout
+`fl` at `fIdx` is a `.primitive` scalar-niche layout (`ScalarLayout.initialized (.int bitsWidth signed) validRange`),
+both `decodeValueFromBytes` and `Trusted.MirSemantics.evalByteCast` enforce `validRange`
+(producing `.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]` iff `wrappingRangeContains validRange bits = true`,
+and `none` / `ub` otherwise).
+-/
+theorem tryTransmute_adt_fieldLayout_inner_primitive_scalarLayout_eq
+    (locals locals' : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (m : Mutability) (pointee : RigidTy) (src : ScalarTy) (srcLIdx : LayoutIdx)
+    (defPath : DefPath) (args : List RigidTy) (dstLIdx fIdx : LayoutIdx)
+    (l fl : TypeLayout) (variantIdx innerVarIdx bitsWidth bits : Nat) (memoryOrder : List Nat)
+    (signed : Bool) (validRange : WrappingRange)
+    (hArgsNe1 : Nat.beq (Trusted.Sequence.length args) 1 = false)
+    (hSrcNp : src.isPtr = false)
+    (hValid : src.validBits .bits64 bits)
+    (hLookup : LayoutTable.lookup layouts dstLIdx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .single variantIdx)
+    (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
+    (hFieldLayouts : l.fieldLayouts = [fIdx])
+    (hFLookup : LayoutTable.lookup layouts fIdx = some fl)
+    (hFInhab : fl.isUninhabited = false)
+    (hFVar : fl.variants = .single innerVarIdx)
+    (hFFields : fl.fields = .primitive)
+    (hFSz : fl.size.bytes = l.size.bytes)
+    (hFRepr : fl.backendRepr = .scalar (.initialized (.int bitsWidth signed) validRange))
+    (hLSz : l.size.bytes = src.sizeBytes .bits64)
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some l.size.bytes)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals =
+      .ok (.scalar ⟨bits, src.sizeBytes .bits64⟩) locals')
+    (hTy : operandTy localDecls layouts op =
+      some { kind := src.toTrustedRigidTy m pointee, layoutIdx := srcLIdx }) :
+    let dstTy : Ty := { kind := .adt defPath args, layoutIdx := dstLIdx }
+    decodeValueFromBytes defaultCodecFuel layouts dstTy
+        (encodeLittleEndianBytes bits (src.sizeBytes .bits64) none) =
+      (match wrappingRangeContains validRange bits with
+       | true => some (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩])
+       | false => none) ∧
+    evalByteCast locals op dstTy mem localDecls layouts =
+      (match wrappingRangeContains validRange bits with
+       | true => ok (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩]) locals' mem
+       | false => ub) := by
+  intro dstTy
+  have hNz : Nat.beq l.size.bytes 0 = false := by
+    rw [hLSz]
+    exact ScalarTy.sizeBytes_bits64_beq_zero src
+  have hBits : bits < scalarModulus l.size.bytes := hLSz ▸ hValid.1
+  have hDec :
+      decodeValueFromBytes defaultCodecFuel layouts dstTy
+          (encodeLittleEndianBytes bits (src.sizeBytes .bits64) none) =
+        (match wrappingRangeContains validRange bits with
+         | true => some (.aggregate variantIdx [.scalar ⟨bits, src.sizeBytes .bits64⟩])
+         | false => none) := by
+    have h := adt_fieldLayout_path_inner_primitive_scalarLayout_decode_encode_eq
+      layouts defPath args dstLIdx fIdx l fl variantIdx innerVarIdx bitsWidth memoryOrder signed
+      validRange hArgsNe1 hLookup hInhab hVar hFields hFieldLayouts hFLookup hFInhab hFVar hFFields
+      hFSz hFRepr hNz hWidth bits none hBits
+    rw [hLSz] at h
+    exact h
+  have hDstSz : rigidTyByteSize layouts dstTy = some (src.sizeBytes .bits64) := by
+    simp [dstTy, rigidTyByteSize, hLookup, hLSz]
+  have hSrcSz := ScalarTy.rigidTyByteSize_toTrustedRigidTy_of_not_isPtr layouts m pointee src
+    srcLIdx hSrcNp
+  have hEnc := trusted_encodeValueToBytes_scalar 15 layouts m pointee src srcLIdx bits hSrcNp hValid
+  refine ⟨hDec, ?_⟩
+  rw [trusted_evalByteCast_of_encode locals locals' op mem localDecls layouts _ _ dstTy _ _
+    hOp hDstSz hTy hSrcSz hEnc (trusted_length_encodeLittleEndianBytes bits _ none), hDec]
+  cases wrappingRangeContains validRange bits <;> rfl
 
 end Anneal.Mir.Cast
