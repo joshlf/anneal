@@ -5522,7 +5522,7 @@ private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
   unfold Miri.Memory.InitMask.collectChunks
   have hiter0 : (Miri.Memory.InitChunkIter.mk
       (Miri.Memory.InitMask.new (translateSizeBytes n) false) false
-      ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok (some (.Uninit ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩, ⟨Miri.Memory.InitMask.new (translateSizeBytes n) false, false, ⟨UInt64.ofNat (off + total)⟩, ⟨UInt64.ofNat (off + total)⟩⟩)) := by
+      ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok (some (.Uninit ⟨UInt64.ofNat off⟩ ⟨UInt64.ofNat (off + total)⟩, ⟨Miri.Memory.InitMask.new (translateSizeBytes n) false, true, ⟨UInt64.ofNat (off + total)⟩, ⟨UInt64.ofNat (off + total)⟩⟩)) := by
     unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new
     dsimp only [bind, Except.bind, pure, Except.pure]
     have hcond1 :
@@ -5547,7 +5547,7 @@ private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
             have hnot_le : ¬ ((UInt64.ofNat (off + total)).toNat ≤ (UInt64.ofNat off).toNat) := by omega
             contradiction
   have hiter1 : (Miri.Memory.InitChunkIter.mk
-      (Miri.Memory.InitMask.new (translateSizeBytes n) false) false
+      (Miri.Memory.InitMask.new (translateSizeBytes n) false) true
       ⟨UInt64.ofNat (off + total)⟩ ⟨UInt64.ofNat (off + total)⟩).next? = .ok none := by
     unfold Miri.Memory.InitChunkIter.next? Miri.Memory.InitMask.new
     dsimp only [bind, Except.bind, pure, Except.pure]
@@ -5576,9 +5576,9 @@ private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
     have : UInt64.ofNat (off + total) - UInt64.ofNat off = UInt64.ofNat (off + total - off) := by
       rw [UInt64.ofNat_sub (by omega)]
     rw [this]; congr 1; omega
-  match htot : total with
-  | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 =>
-    unfold_private_collect
+  rcases total with _ | t
+  · omega
+  · unfold_private_collect
     conv => { lhs; rw [WellFounded.Nat.fix_eq] }
     dsimp only [bind, Except.bind, pure, Except.pure]
     with_unfolding_all erw [hiter0]
@@ -5587,9 +5587,8 @@ private theorem copyInitMask_prepareCopy_false_range {n off total : Nat}
     dsimp only [bind, Except.bind, pure, Except.pure]
     with_unfolding_all erw [hiter1]
     dsimp only [bind, Except.bind, pure, Except.pure, Array.append]
-    simp only [Miri.Memory.InitChunk.range, Miri.Memory.AllocRange.fromEndpoints, Miri.ABI.Size.sub, h_sub_false, ↓reduceIte, Except.mapError, bind, Except.bind, pure, Except.pure, Miri.ABI.Size.ofBytes, h_sub]
-  | 0 => omega
-  | _ + 17 => omega
+    simp only [Miri.Memory.InitChunk.isInit, Miri.Memory.InitChunk.range, Miri.Memory.AllocRange.fromEndpoints, Miri.ABI.Size.sub, h_sub_false, ↓reduceIte, Except.mapError, bind, Except.bind, pure, Except.pure, Miri.ABI.Size.ofBytes, h_sub, Bool.false_eq_true]
+    rfl
 
 lemma allocRange_size (start size : Miri.ABI.Size) :
   (Miri.Memory.allocRange start size).size = size := rfl
@@ -5618,9 +5617,12 @@ theorem StackScalarAllocShape.copyRepeatedly_range_uninit {E : Type}
   have hallocSize : (Miri.Memory.allocRange (Miri.ABI.Size.ofBytes (UInt64.ofNat srcStart)) (Miri.ABI.Size.ofBytes (UInt64.ofNat total))).size = (Miri.ABI.Size.ofBytes (UInt64.ofNat total)) := allocRange_size _ _
   have htot64 : total < 2 ^ 64 := Nat.lt_of_le_of_lt (Nat.le_add_left total srcStart) hltS
   have hz_decide : decide ((UInt64.ofNat total).toNat == 0) = false := by
-    cases hb : (UInt64.ofNat total == 0)
-    · rfl
-    · have := eq_of_beq hb; rw [this] at htot64; have htot_nat : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot64; simp at htot_nat; omega
+    have h1 : (UInt64.ofNat total).toNat = total := UInt64.toNat_ofNat_of_lt htot64
+    rw [h1]
+    rw [decide_eq_false_iff_not]
+    intro h
+    have h3 := eq_of_beq h
+    omega
   simp only [hallocSize, hz_decide, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure]
   dsimp only
   unfold Miri.Memory.Allocation.prepareCopy
