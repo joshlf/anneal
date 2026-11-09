@@ -5,7 +5,8 @@
 - **Track & Merge Policy**: `prototype` (`no_merge_prototype` — isolated off `unstable`)
 - **Paired Unstable Workstream**: `ws-mir-fragment-lattice-unstable` (currently held in `PROPOSED_HOLD`)
 - **Base `unstable` SHA (`BASE_SHA`)**: `b076d6a34d749f712a42fe700342f2d40140a2b5`
-- **Recommendation**: **GO** — Unhold `ws-mir-fragment-lattice-unstable` and boost priority from `P2` to **`P1`**.
+- **Adversarial history**: `[adv A0]` initial build → `[adv B1]` cross-family critique & hardening (this revision)
+- **Recommendation**: **GO (conditional)** — unhold `ws-mir-fragment-lattice-unstable` and boost priority from `P2` to **`P1`**, carrying over the B1 fail-closed scanner rules and the Lean-witness parity test (Section 7).
 
 ---
 
@@ -13,13 +14,17 @@
 
 This Track P prototype designs, implements, and kernel-verifies a 5-element decidable MIR fragment lattice (`MirFragment`) across both Lean 4 ([MirFragmentPrototype.lean](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/theory/Anneal/MirFragmentPrototype.lean)) and Rust ([scaffold.rs](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/crates/cargo-anneal/src/scaffold.rs)), converging Anneal's MIR verification pipeline with Zircon 2.1's declarative fragment lattice (`Zircon/IR/Fragment.lean` & `Zircon/Specs/FragmentSpec.lean`, cl/1016587495 & cl/1016618663).
 
-| Metric | Target | Measured Result |
+| Metric | Target | Measured Result (`[adv B1]`) |
 |---|---|---|
-| Lean 4 compiler errors / warnings | `0` / `0` | **`0` errors, `0` warnings** |
-| `sorry` / `admit` / `sorryAx` / `Lean.ofReduceBool` (`native_decide`) | `0` | **`0`** (verified via `anneal-lsp audit-preview`) |
-| `lake env lean theory/Anneal/MirFragmentPrototype.lean` wall time | `< 10s` | **`4.96s`** (`user 10.66s`, `sys 0.91s` with `W = 1`, including Section 9 single-pass isomorphism) |
-| Warm `anneal-lsp diagnostics` latency | `< 2s` | **`0.87s`** (`872.4 ms`) |
-| `cargo test -p cargo-anneal --lib --bins` suite | All pass | **`63 / 63` passed** (`0` failed; note `tests/end_to_end_demo_journeys.rs` has a pre-existing `b076d6a3` `disableLocalBorrows` `dsimp only` regression in `examples/wireframe-demo`) |
+| Lean 4 compiler errors / warnings | `0` / `0` | **`0` errors, `0` warnings** (`anneal-lsp diagnostics`) |
+| `sorry` / `admit` / `sorryAx` / `Lean.ofReduceBool` (`native_decide`) | `0` | **`0`** (`anneal-lsp audit-preview` + per-theorem `#print axioms` over all **168** theorems) |
+| Axioms used (all 168 theorems) | standard only | 71 axiom-free; 96 use a subset of `{propext, Quot.sound}`; **1** (`verifyMirNoPanic_of_inferMinFragment_le_pureBoundedLoop`) inherits `Classical.choice` from upstream `Anneal.PureMirExec.verifyMirNoPanic_of_pureExec` |
+| `lake env lean theory/Anneal/MirFragmentPrototype.lean` wall time | `< 10s` | **`4.13s`** (`user 13.41s`, `sys 0.80s`, `W = 1`; 2,295 lines; bash `time -p` — `/usr/bin/time` is absent on this capsule) |
+| `cargo test -p cargo-anneal --lib` | All pass | **`65` passed, `0` failed, `1` ignored** (opt-in parity harness) |
+| Full `cargo test -p cargo-anneal` | exit `0` | **exit `101`** (`170.69s`): lib `65` passed / `1` ignored, bins `0`, then `tests/end_to_end_demo_journeys.rs` fails — **identically on `BASE_SHA`** (Section 5, Finding 7) |
+| Other integration binaries (run separately with B1, `--no-fail-fast`) | pass | `end_to_end_pipeline` 1/1, `end_to_end_rust_only_adoption` 2/2, `end_to_end_tutor` 4/4, `end_to_end_difftest_oracles` 4/4, `end_to_end_itree_diff` 4/4; `end_to_end_minirust_correspondence` has one failure (`e2e_upstream_md_mutation_changes_generated_ops_and_breaks_lean_proof`, a MiniRust vendor/specr test with no `scaffold.rs` dependency; not investigated in B1); `miri_diff` / `trace_observer` not run |
+| Lean ↔ Rust parity, real `rustc`-captured MIR | `0` mismatches | **`0 / 64`** bodies (fragment, back-edge flag, block count) |
+| Lean ↔ Rust parity, differential fuzzing | `0` fail-open | **`0 / 1,400`** fail-open; exact agreement on all `1,267` inline bodies (Section 6.3) |
 
 ---
 
@@ -31,25 +36,27 @@ $$\texttt{pureLoopFree} \; (0) \;<\; \texttt{pureBoundedLoop} \; (1) \;<\; \text
 
 | Rank | Lean Constructor | Rust Variant / `spec-lock.json` Tag | Semantic Scope | Primary Anneal Proof Engine |
 |---|---|---|---|---|
-| `0` | `MirFragment.pureLoopFree` | `MirFragment::PureLoopFree` (`"pure_loop_free"`) | Alias-free, call-free `PureMirExec` MIR with no CFG back-edges (`hasCfgBackedge body = false`) | `#mir_lift`, `verifyMirNoPanic_of_pureExec`, `LiftBlock`, `LiftStmtsTerminator` |
+| `0` | `MirFragment.pureLoopFree` | `MirFragment::PureLoopFree` (`"pure_loop_free"`) | Exactly `checkPureMir body && !hasCfgBackedge body` (`checkBodyFragment_pureLoopFree_eq`) | `#mir_lift`, `verifyMirNoPanic_of_pureExec`, `LiftBlock`, `LiftStmtsTerminator` |
 | `1` | `MirFragment.pureBoundedLoop` | `MirFragment::PureBoundedLoop` (`"pure_bounded_loop"`) | Exact `Anneal.PureMirExec.checkPureMir` (`goto` / `switchInt` / `assert` / `drop` loops over pure values) | `Anneal.MirLoops` (`forRangeUp`, `mirWpConverges_whileRank`, `runCfgToBlock`) |
-| `2` | `MirFragment.treeBorrowsLocal` | `MirFragment::TreeBorrowsLocal` (`"tree_borrows_local"`) | Intraprocedural local borrows/pointers: `.deref`, `.unwrapUnsafeBinder`, `Rvalue.ref`, `Rvalue.rawPtr`, `Rvalue.copyForDeref`, `BinOp.offset`, `CastKind.{pointerCoercion,ptrToPtr}`, `StatementKind.retag` | `Anneal.SepLogicLenses` (`verifyStatefulMir_of_sepLenses`, `LiftLensBlock`) or stateful `runCfgToBlock` |
-| `3` | `MirFragment.intrinsicCopy` | `MirFragment::IntrinsicCopy` (`"intrinsic_copy"`) | Extends `treeBorrowsLocal` with `NonDivergingIntrinsic.copyNonOverlapping` and global memory constants (`ConstValue.indirect`, `ConstValue.slice (.ptr ..)`) | `Anneal.MirFuelFree` (`evalCopyNonOverlappingPermOk`, `verifyStatefulMirNoPanic_of_wpConverges`) |
-| `4` | `MirFragment.fullMir` | `MirFragment::FullMir` (`"full_mir"`) | Full `Runtime(PostCleanup)` MIR: `TerminatorKind.{call,tailCall,inlineAsm}`, `CastKind.fnPtrToPtr`, `Rvalue.{threadLocalRef,shallowInitBox}`, `StatementKind.backwardIncompatibleDropHint` | `PureMirModularConverges` (`verifyModularMir_of_pureModularExec_any`), `checkPureMirWithCallees`, or `#[spec(trusted)]` |
+| `2` | `MirFragment.treeBorrowsLocal` | `MirFragment::TreeBorrowsLocal` (`"tree_borrows_local"`) | Intraprocedural borrows/pointers: `.deref`, `.unwrapUnsafeBinder`, `Rvalue.ref`, `Rvalue.rawPtr`, `Rvalue.copyForDeref`, `BinOp.offset`, `CastKind.{pointerCoercion,ptrToPtr}`, `StatementKind.retag` | `Anneal.SepLogicLenses` (`verifyStatefulMir_of_sepLenses`, `LiftLensBlock`) or stateful `runCfgToBlock` |
+| `3` | `MirFragment.intrinsicCopy` | `MirFragment::IntrinsicCopy` (`"intrinsic_copy"`) | Adds `NonDivergingIntrinsic.copyNonOverlapping` and global-allocation constants (`ConstValue.indirect`, `ConstValue.slice (.ptr ..)`) | `Anneal.MirFuelFree` (`evalCopyNonOverlappingPermOk`, `verifyStatefulMirNoPanic_of_wpConverges`) |
+| `4` | `MirFragment.fullMir` | `MirFragment::FullMir` (`"full_mir"`, fail-closed `Default` / `Inhabited`) | Full `Runtime` MIR: `TerminatorKind.{call,tailCall,inlineAsm}`, `CastKind.fnPtrToPtr`, `Rvalue.{threadLocalRef,shallowInitBox}`, `StatementKind.backwardIncompatibleDropHint` | `PureMirModularConverges` (`verifyModularMir_of_pureModularExec_any`), `checkPureMirWithCallees`, or `#[spec(trusted)]` |
+
+Rank `1` is a **pure CFG property**: `minBlockFragment_ne_pureBoundedLoop` proves that no basic block (hence no single MIR construct) requires exactly `.pureBoundedLoop`; only `hasCfgBackedge` separates ranks `0` and `1`.
 
 ---
 
-## 3. Complete 20-Row Construct-to-Fragment Parity Table (Lean $\leftrightarrow$ Rust)
+## 3. Construct-to-Fragment Parity Table (Lean $\leftrightarrow$ Rust)
 
 Both `checkBodyFragment` / `inferMinFragment` in [MirFragmentPrototype.lean](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/theory/Anneal/MirFragmentPrototype.lean) and `classify_mir_fragment` in [scaffold.rs](file:///home/groupagent-anneal-maxwell-bot/Projects/markdittmer/anneal-worktrees/ws-proto-mir-fragment-lattice/crates/cargo-anneal/src/scaffold.rs) classify every `Trusted.Rustc.V2026_06_01.MirAst` construct identically:
 
 | # | `MirAst` Construct | Minimum `MirFragment` | Rust Escalation Reason (`escalation_reasons`) | Accepted by `checkPureMir`? |
 |---|---|---|---|---|
-| 1 | CFG back-edge (`succ ≤ bbIdx` in `terminatorTargets`) | `.pureBoundedLoop` (`1`) | `"CFG back-edge"` | Yes |
+| 1 | CFG back-edge (`succ ≤ bbIdx` in `terminatorTargets`; exact spec `hasCfgBackedge_eq_true_iff`) | `.pureBoundedLoop` (`1`) | `"CFG back-edge"` | Yes |
 | 2 | `ProjectionElem.deref` | `.treeBorrowsLocal` (`2`) | `"ProjectionElem.deref"` | No |
 | 3 | `ProjectionElem.unwrapUnsafeBinder` | `.treeBorrowsLocal` (`2`) | `"ProjectionElem.unwrapUnsafeBinder"` | No |
-| 4 | `Rvalue.ref` | `.treeBorrowsLocal` (`2`) | `"Rvalue.ref"` | No |
-| 5 | `Rvalue.rawPtr` | `.treeBorrowsLocal` (`2`) | `"Rvalue.rawPtr"` | No |
+| 4 | `Rvalue.ref` (`BorrowKind.shared` / `BorrowKind.mut b`; **not** `RigidTy.ref` / `Mutability.mut`) | `.treeBorrowsLocal` (`2`) | `"Rvalue.ref"` | No |
+| 5 | `Rvalue.rawPtr` (**not** `RigidTy.rawPtr` / `AggregateKind.rawPtr`) | `.treeBorrowsLocal` (`2`) | `"Rvalue.rawPtr"` | No |
 | 6 | `Rvalue.copyForDeref` | `.treeBorrowsLocal` (`2`) | `"Rvalue.copyForDeref"` | No |
 | 7 | `BinOp.offset` | `.treeBorrowsLocal` (`2`) | `"BinOp.offset"` | No |
 | 8 | `CastKind.pointerCoercion` | `.treeBorrowsLocal` (`2`) | `"CastKind.pointerCoercion"` | No |
@@ -57,7 +64,7 @@ Both `checkBodyFragment` / `inferMinFragment` in [MirFragmentPrototype.lean](fil
 | 10 | `StatementKind.retag` | `.treeBorrowsLocal` (`2`) | `"StatementKind.retag"` | No |
 | 11 | `NonDivergingIntrinsic.copyNonOverlapping` | `.intrinsicCopy` (`3`) | `"NonDivergingIntrinsic.copyNonOverlapping"` | No |
 | 12 | `ConstValue.indirect` | `.intrinsicCopy` (`3`) | `"ConstValue.indirect"` | No |
-| 13 | `ConstValue.slice (.ptr ..) _` | `.intrinsicCopy` (`3`) | `"ConstValue.slice (ConstScalar.ptr)"` | No |
+| 13 | `ConstValue.slice (.ptr ..) _` (e.g. every `&'static str` literal) | `.intrinsicCopy` (`3`) | `"ConstValue.slice (ConstScalar.ptr)"` | No |
 | 14 | `TerminatorKind.call` | `.fullMir` (`4`) | `"TerminatorKind.call"` | No |
 | 15 | `TerminatorKind.tailCall` | `.fullMir` (`4`) | `"TerminatorKind.tailCall"` | No |
 | 16 | `TerminatorKind.inlineAsm` | `.fullMir` (`4`) | `"TerminatorKind.inlineAsm"` | No |
@@ -65,93 +72,100 @@ Both `checkBodyFragment` / `inferMinFragment` in [MirFragmentPrototype.lean](fil
 | 18 | `Rvalue.threadLocalRef` | `.fullMir` (`4`) | `"Rvalue.threadLocalRef"` | No |
 | 19 | `Rvalue.shallowInitBox` | `.fullMir` (`4`) | `"Rvalue.shallowInitBox"` | No |
 | 20 | `StatementKind.backwardIncompatibleDropHint` | `.fullMir` (`4`) | `"StatementKind.backwardIncompatibleDropHint"` | No |
+| 21 | *(Rust-only, fail-closed)* non-inline / unscannable syntax inside `basicBlocks` (helper `def` refs, `let`/`fun`, `{ x with .. }`, positional `X.mk`, `⟨..⟩`) | `.fullMir` (`4`) $\ge$ Lean | ``"unscannable non-inline MIR syntax `<tok>` in basicBlocks (fail-closed)"`` | n/a (Lean sees through definitions) |
 
-All other `MirAst` constructs (`.zeroSized`, `.scalar`, `.slice (.int _)`, `.unevaluated`, `.field`, `.index`, `.constantIndex`, `.subslice`, `.downcast`, `.opaqueCast`, the 25 non-`offset` `BinOp`s, `UnOp`, `NullOp`, `Rvalue.{use,repeat,len,nullaryOp,unaryOp,discriminant,aggregate,wrapUnsafeBinder}`, `StatementKind.{assign,setDiscriminant,storageLive,storageDead,nop,coverage,constEvalCounter,placeMention,deinit}`, `NonDivergingIntrinsic.assume`, and `TerminatorKind.{goto,switchInt,return_,assert,drop,unreachable,unwindResume,unwindTerminate}`) belong to `.pureLoopFree` (`0`) whenever their sub-operands/places belong to `.pureLoopFree`.
+All other `MirAst` constructs (`.zeroSized`, `.scalar` — including `.scalar (.ptr ..)`, `.slice (.int _)`, `.unevaluated`, `.field`, `.index`, `.constantIndex`, `.subslice`, `.downcast`, `.opaqueCast`, the 25 non-`offset` `BinOp`s, `UnOp`, `NullOp`, the 8 remaining `CastKind`s, `Rvalue.{use,repeat,len,nullaryOp,unaryOp,discriminant,aggregate,wrapUnsafeBinder}`, `StatementKind.{assign,setDiscriminant,storageLive,storageDead,nop,coverage,constEvalCounter,placeMention,deinit}`, `NonDivergingIntrinsic.assume`, and `TerminatorKind.{goto,switchInt,return_,assert,drop,unreachable,unwindResume,unwindTerminate}`) belong to `.pureLoopFree` (`0`) whenever their sub-operands/places do.
+
+**Parity is now enforced mechanically**: the unit test `mir_fragment_rust_classifier_matches_lean_witness_theorems` `include_str!`s `MirFragmentPrototype.lean`, extracts the verbatim text of every Section 8 witness (`def <w> : CapturedMir := { protoBase with .. basicBlocks := [..] }`), runs `classify_mir_fragment` on it, and asserts the result equals the value proven by the kernel-checked theorem `inferMinFragment <w> = .<frag> := rfl` (11 witnesses, all 5 levels) and `hasCfgBackedge <w> = <b> := rfl` (5 witnesses). Editing either side without the other fails `cargo test`.
 
 ---
 
-## 4. Kernel-Checked Theorem Inventory (`theory/Anneal/MirFragmentPrototype.lean`)
+## 4. Kernel-Checked Theorem Inventory (`theory/Anneal/MirFragmentPrototype.lean`, 168 theorems)
 
 1. **Bounded Lattice Laws**:
    - `toRank_injective`, `fromStr?_asStr`, `fromStr?_leanCtor`, `ofRank?_toRank`, `toRank_lt_five`
    - `le_refl`, `le_trans`, `le_antisymm`, `le_total`, `lt_iff_le_not_le`, `bot_le`, `le_top`
    - `le_join_left`, `le_join_right`, `join_le`, `join_le_iff`, `join_comm`, `join_assoc`, `join_idem`
    - `meet_le_left`, `meet_le_right`, `le_meet`, `le_meet_iff`, `meet_comm`, `meet_assoc`, `meet_idem`
-2. **CFG Back-Edge & General DAG Acyclicity**:
-   - `cfgEdge_lt_of_hasCfgBackedge_false : hasCfgBackedge body = false → CfgEdge body u v → u < v`
-   - `cfgPath_lt_of_hasCfgBackedge_false : hasCfgBackedge body = false → CfgPath body u v → u < v`
-   - `no_cfg_cycle_of_hasCfgBackedge_false : hasCfgBackedge body = false → ∀ u, ¬ CfgPath body u u`
-   - `nonTopoDagWitness_backedge_vs_cycle`: concrete 3-block witness separating index back-edges (`hasCfgBackedge = true`) from general directed cycles (`hasCfgCycle = false`).
+2. **CFG Back-Edge Rule, Exact Spec & General DAG Acyclicity**:
+   - `cfgEdge_lt_of_hasCfgBackedge_false`, `cfgPath_lt_of_hasCfgBackedge_false`, `no_cfg_cycle_of_hasCfgBackedge_false` (soundness of the index-order rule)
+   - `hasCfgBackedge_eq_true_iff : hasCfgBackedge body = true ↔ ∃ u v, CfgEdge body u v ∧ v ≤ u` (exact spec of the rule `scaffold.rs` mirrors)
+   - Rank certificates: `cfgEdge_rank_lt_of_hasRankViolation_false`, `cfgPath_rank_lt_of_hasRankViolation_false`, `no_cfg_cycle_of_hasRankViolation_false` (for **any** `rank : Nat → Nat`), `hasRankViolation_id_eq_hasCfgBackedge` (index order = identity rank)
+   - `isCfgDag` ($O(n^2|E|)$ longest-path relaxation) with `no_cfg_cycle_of_isCfgDag`
+   - `nonTopoDagWitness_backedge_vs_dag`, `nonTopoDagWitness_acyclic`, `witnessRustcSharedReturn_pure_acyclic_but_pureBoundedLoop`, `witnessRustcSharedReturn_acyclic`, `witnessPureBoundedLoop_cycle` (genuine `bb1 → bb1` cycle, `isCfgDag = false`)
 3. **Monotonicity, Totality & Galois Lower-Adjoint Minimality**:
-   - `checkConstFragment_mono`, `checkProjElemFragment_mono`, `checkPlaceFragment_mono`, `checkOperandFragment_mono`, `checkBinOpFragment_mono`, `checkCastFragment_mono`, `checkRvalueFragment_mono`, `checkStmtFragment_mono`, `checkTerminatorFragment_mono`, `checkBlockFragment_mono`, `checkBodyFragment_mono`
-   - `checkBodyFragment_fullMir : ∀ body, checkBodyFragment .fullMir body = true`
-   - `checkBodyFragment_inferMinFragment : ∀ body, checkBodyFragment (inferMinFragment body) body = true`
-   - `inferMinFragment_minimal : ∀ body f, checkBodyFragment f body = true → inferMinFragment body ≤ f`
-   - `checkBodyFragment_iff_inferMinFragment_le : ∀ f body, checkBodyFragment f body = true ↔ inferMinFragment body ≤ f`
-   - `inferMinFragment_eq_filter_headD`
+   - `checkConstFragment_mono` … `checkBodyFragment_mono` (11 theorems)
+   - `checkBodyFragment_fullMir`, `checkBodyFragment_inferMinFragment`, `inferMinFragment_minimal`, `checkBodyFragment_iff_inferMinFragment_le`, `inferMinFragment_eq_filter_headD`
 4. **Structural Exclusion Theorems**:
    - `pureLoopFree_has_no_backedges`, `pureLoopFree_no_cfg_cycle`
-   - `no_deref_in_pureBoundedLoop`, `no_retag_in_pureBoundedLoop`, `no_retag_body_in_pureBoundedLoop`
-   - `no_copyNonOverlapping_in_treeBorrowsLocal`, `no_copyNonOverlapping_body_in_treeBorrowsLocal`
-   - `no_call_in_intrinsicCopy`, `no_call_body_in_intrinsicCopy`, `no_inlineAsm_in_intrinsicCopy`, `no_inlineAsm_body_in_intrinsicCopy`
+   - `no_deref_in_pureBoundedLoop`, `no_retag_in_pureBoundedLoop` (+ body form), `no_copyNonOverlapping_in_treeBorrowsLocal` (+ body form), `no_call_in_intrinsicCopy` (+ body form), `no_inlineAsm_in_intrinsicCopy` (+ body form)
+   - Downward-closed forms for **every** level below each threshold: `no_deref_below_treeBorrowsLocal`, `no_retag_below_treeBorrowsLocal`, `no_copyNonOverlapping_below_intrinsicCopy`, `no_call_below_fullMir` (`call` + `tailCall`), `no_inlineAsm_below_fullMir`
 5. **Exact `Anneal.PureMirExec` Bridge Theorems**:
-   - `checkBodyFragment_pureBoundedLoop_eq_checkPureMir : ∀ body, checkBodyFragment .pureBoundedLoop body = Anneal.PureMirExec.checkPureMir body`
-   - `checkPureMir_of_inferMinFragment_le_pureBoundedLoop`
-   - `inferMinFragment_le_pureBoundedLoop_iff_checkPureMir`
-   - `verifyMirNoPanic_of_inferMinFragment_le_pureBoundedLoop`
-6. **Polymorphic Generic Instantiation Invariance (`CapturedMir.instantiate`)**:
-   - `checkBodyFragment_instantiate : ∀ f body args, checkBodyFragment f (body.instantiate args) = checkBodyFragment f body`
-   - `inferMinFragment_instantiate : ∀ body args, inferMinFragment (body.instantiate args) = inferMinFragment body`
-7. **Single-Pass Bottom-Up Lattice Inference Isomorphism (`inferMinFragmentSinglePass`)**:
-   - `checkBodyFragment_eq_decide_singlePass : ∀ f body, checkBodyFragment f body = decide (inferMinFragmentSinglePass body ≤ f)`
-   - `inferMinFragmentSinglePass_eq_inferMinFragment : ∀ body, inferMinFragmentSinglePass body = inferMinFragment body` (proving that the single-pass `MirFragment.join` fold used by `scaffold.rs` is extensionally identical to the top-down cascade `inferMinFragment`).
+   - `checkBodyFragment_pureBoundedLoop_eq_checkPureMir`, `checkPureMir_of_inferMinFragment_le_pureBoundedLoop`, `inferMinFragment_le_pureBoundedLoop_iff_checkPureMir`, `verifyMirNoPanic_of_inferMinFragment_le_pureBoundedLoop`
+   - `checkBodyFragment_pureLoopFree_eq : checkBodyFragment .pureLoopFree body = (checkPureMir body && !hasCfgBackedge body)` and `inferMinFragment_eq_pureLoopFree_iff`
+6. **Polymorphic Instantiation Invariance**: `checkBodyFragment_instantiate`, `inferMinFragment_instantiate` (+ per-construct lemmas).
+7. **Single-Pass Bottom-Up Inference**: `checkBodyFragment_eq_decide_singlePass`, `inferMinFragmentSinglePass_eq_inferMinFragment` (the `MirFragment.join` fold used by `scaffold.rs` is extensionally identical to the top-down cascade).
+8. **Rank 1 is a CFG property**: `join_ne_pureBoundedLoop`, `joinList_ne_pureBoundedLoop`, `min*Fragment_ne_pureBoundedLoop` (9 lemmas), `minBlockFragment_ne_pureBoundedLoop`, `checkBlockFragment_pureLoopFree_eq_pureBoundedLoop`.
+9. **Witnesses** (`rfl` + `#guard`): 11 `inferMinFragment_<w>` and 5 `hasCfgBackedge_<w>` theorems over `witnessPureLoopFree`, `witnessPureBoundedLoop`, `witnessTreeBorrowsLocal`, `witnessIntrinsicCopy`, `witnessFullMir`, `nonTopoDagWitness`, `witnessRustcSharedReturn`, `witnessShorthandMutTypes`, `witnessQualifiedEmitterRawPtr`, `witnessIndirectConst`, `witnessFullMirNoCall`.
 
 ---
 
-## 5. Subtle Engineering Findings Discovered During Prototyping
+## 5. Subtle Engineering Findings
 
-1. **`CastKind` Wildcard Behavior in `Anneal.PureMirExec.isPureRvalue`**:
-   - In `theory/Anneal/PureMirExec.lean` (lines 361–367), `isPureRvalue` matches `.cast ck op _` by rejecting `.pointerCoercion _`, `.fnPtrToPtr`, and `.ptrToPtr`, and falling through to `_ => isPureOperand op` for the remaining 8 `CastKind` constructors—including `.pointerExposeProvenance` and `.pointerWithExposedProvenance` (because `evalRvalue` in `MirSemantics.lean` threads `mem` through unchanged on those casts).
-   - Because `.pureBoundedLoop` must equal `checkPureMir` AND satisfy `checkBodyFragment_mono` (`pureBoundedLoop ≤ treeBorrowsLocal`), `checkCastFragment` accepts those 8 `CastKind`s from `.pureLoopFree` upward, places `.pointerCoercion` and `.ptrToPtr` in `.treeBorrowsLocal`, and places `.fnPtrToPtr` in `.fullMir`.
-   - **Actionable Recommendation for `ws-mir-fragment-lattice-unstable`**: When landing Episode 1 on `unstable`, either keep this exact table (zero churn to existing `PureMirExec` proofs) or explicitly reject `.pointerExposeProvenance` and `.pointerWithExposedProvenance` in `PureMirExec.isPureRvalue` so they live at `.fullMir`.
-2. **Index-Order CFG Back-Edge (`hasCfgBackedge`) vs. General Cycle Detection (`hasCfgCycle`)**:
-   - `hasCfgBackedge` checks whether block `bbIdx` has a target `succ ≤ bbIdx`. By `no_cfg_cycle_of_hasCfgBackedge_false`, `hasCfgBackedge body = false` strictly implies general DAG acyclicity (`∀ u, ¬ CfgPath body u u`), which is the exact precondition needed by `#mir_lift` / forward block induction.
-   - As demonstrated by `nonTopoDagWitness` (`bb0 -> bb2 -> bb1 -> return`), a DAG whose blocks are not topologically ordered has `hasCfgBackedge = true` while `hasCfgCycle = false`. Because `rustc` emits `Runtime(PostCleanup)` MIR basic blocks in reverse postorder (RPO), genuine loop back-edges in `rustc` MIR always satisfy `succ ≤ bbIdx`.
-3. **Token-Exact Constructor Scanning & Field-Order Hardening in `scaffold.rs`**:
-   - Earlier substring/dot scanning (`has_dotted_ctor` without preceding token boundary and `.contains(tok)`) could false-trigger on identifier substrings (`local_call`, `recall`, `my_retag`) or module paths (`Mir.MyCrate.call`), and `detect_blocks_and_back_edges` used `.or_else` instead of `.min()` when finding the end of a terminator block.
-   - `scaffold.rs` now uses whitespace-token-exact `has_ast_ctor(norm_blocks, type_name, ctor_name)`, bounds `basicBlocks :=` and `localDecls :=` slices against all 12 `CapturedMir` record fields in any order, and fails closed to `MirFragment::FullMir` on non-inline alias definitions (`def body : CapturedMir := otherBody`).
-4. **Live Confirmation of the Problem Statement on `BASE_SHA` (`b076d6a3`, `ws-lm-div-statements`)**:
-   - Commit `b076d6a34d749f712a42fe700342f2d40140a2b5` (`Merge branch 'ws-lm-div-statements' into unstable`) added `disableLocalBorrows` to `StatementKind.storageDead` and `ensureNestedFieldShells` / `uninitFieldWriteShell?` to `finishAssignStmtNode`. While `tests/mir/SymbolicEvalTests.lean` was updated to add `disableLocalBorrows` to its `dsimp only [...]` list, `examples/wireframe-demo/anneal/proofs/Proof/WireframeDemo/{clamp_payload_window,frame_total_len,checksum_frame_safe}.lean` (exercised by `tests/end_to_end_demo_journeys.rs`) still use hardcoded `dsimp only [...]` lists without `disableLocalBorrows`, causing `repeat (dsimp only [...])` to stall at `storageDead`.
-   - Notably, `clamp_payload_window` and `frame_total_len` are both classified as `MirFragment.pureLoopFree` (`0`) by `inferMinFragment` / `classify_mir_fragment`—meaning they should be discharged via `Anneal.PureMirExec` / `MirLiftCore` (which encapsulates `evalStmt` / `disableLocalBorrows` behind `evalStmt_pure_eq_withMem`) rather than brittle 40-symbol `dsimp only` lists!
+1. **`CastKind` wildcard in `Anneal.PureMirExec.isPureRvalue`**: `isPureRvalue` rejects only `.pointerCoercion _`, `.fnPtrToPtr`, `.ptrToPtr`, so `.pointerExposeProvenance` / `.pointerWithExposedProvenance` are pure. Because `.pureBoundedLoop` must equal `checkPureMir` **and** satisfy `checkBodyFragment_mono`, those two casts sit at `.pureLoopFree`; `.pointerCoercion` / `.ptrToPtr` sit at `.treeBorrowsLocal`, `.fnPtrToPtr` at `.fullMir`. *Recommendation*: Episode 1 may move provenance-exposing casts to `.fullMir` only by changing `PureMirExec.isPureRvalue` first.
+2. **Index-order back-edges vs. real cycles — `rustc` MIR is *not* RPO-numbered** *(B1 correction)*. A0 claimed captured MIR is in reverse postorder so index back-edges coincide with loops. That is false: `ReorderBasicBlocks` is disabled by default, and the capture reads `tcx.optimized_mir`. In the real corpus (Section 6.1) **6 of 64** bodies (`core::cmp::PartialOrd::{le,lt}`, `core::ops::RangeBounds::contains`, two captures each) have index back-edges yet are certified acyclic by `isCfgDag` (e.g. `PartialOrd::le`: the shared return block `bb2` is numbered before the arms `bb4`/`bb5` that jump to it); only `wireframe_demo::checksum_frame_safe` contains a genuine loop. The index rule stays **sound** (`no_cfg_cycle_of_hasCfgBackedge_false`, a special case of rank certificates) but is **incomplete**: `witnessRustcSharedReturn` (that real CFG, call removed) is pure and acyclic yet classified `.pureBoundedLoop`. All 6 affected real bodies contain calls, so no real body changed fragment, but pure `match` lowering can hit this. *Recommendation*: if Episode 1 wants precision, switch `.pureLoopFree` to `isCfgDag` in **both** Lean and `scaffold.rs` (port the relaxation verbatim) — never in only one.
+3. **`Mutability.mut` vs. `BorrowKind.mut` token ambiguity** *(B1, fixed)*: A0's `has_ast_ctor(norm_blocks, "BorrowKind", "mut")` matched every shorthand `.mut` token, including `Mutability.mut` inside `&mut T` / `*mut T` type annotations (casts, field projections, constants) and the pure `AggregateKind.rawPtr _ .mut`. On a 600-body differential corpus, **49 of 300** shorthand bodies were mis-escalated to `tree_borrows_local` with a phantom `Rvalue.ref` (and `has_mut_borrow` was polluted for scaffold hints). B1 resolves `.mut` by its successor (`RigidTy` head ⇒ type; otherwise `BorrowKind.mut`) and pins it with `witnessShorthandMutTypes`.
+4. **Fail-open scanning of non-inline syntax** *(B1, fixed)*: the text scanner only sees what is literally inside `basicBlocks := [...]`. A0 classified `terminator := mkTerm .return_`, `(.use (u32ConstOperand 10))`, `basicBlocks := blocksOf x`, and `def body : CapturedMir := alias` followed by an unrelated inline body as **pure** whenever the hidden definitions were not. B1 adds (a) `bound_to_top_level_decl` (the body scan stops at the next top-level command) and (b) a closed-vocabulary validator (`MIR_BLOCK_CTOR_VOCAB`): any token in `basicBlocks` that is not a numeral, `""`, `true/false/some/none`, a record field name before `:=`, or a `MirAst` constructor forces `full_mir`, `has_unscannable_mir`, and a fail-closed `has_cfg_back_edge`. Real emitter output never trips it (0/64). Known residual gap: dotted shorthand tokens are checked against the *union* constructor vocabulary (the expected type is unknown to a text scanner), so a user `def` whose name collides with a `MirAst` constructor of another type (e.g. a hypothetical `def Operand.deref`) would not be flagged; the Episode 2 `rfl` certificate (Section 7) closes this gap.
+5. **Qualified-name robustness** *(B1, fixed)*: terminator heads, unwind actions, `Option.some`, `ConstValue.slice`/`ConstScalar.ptr`, and `StatementKind.intrinsic`/`NonDivergingIntrinsic.assume` are matched through `ast_ctor`, so fully-qualified `Trusted.Rustc.V2026_06_01.MirAst.TerminatorKind.goto` and `@TerminatorKind.goto` no longer hide CFG edges, and a fully-qualified `assume` is no longer mistaken for `copyNonOverlapping`.
+6. **`hasCfgCycle` was exponential and unverified** *(B1, replaced)*: A0's `canReachInSteps` expanded an undeduplicated frontier (`List.flatMap`), exponential on chains of diamonds, and had no correctness theorem. B1 replaces it with `isCfgDag` (polynomial, sound for **any** rank via `no_cfg_cycle_of_hasRankViolation_false`).
+7. **Full `cargo test -p cargo-anneal` exits `101` on `BASE_SHA` too** *(B1 receipt)*: `tests/end_to_end_demo_journeys.rs` fails in `examples/wireframe-demo` (`checksum_frame_safe.lean:255:10` invalid `⟨...⟩`, `clamp_payload_window.lean:30:0` and `frame_total_len.lean:66:9` `whnf` heartbeat timeouts). B1 swapped in the `BASE_SHA` `scaffold.rs`, re-ran the test, observed the **identical four errors**, and restored the file. The failure is independent of this prototype (consistent with A0's `disableLocalBorrows` / `dsimp only` diagnosis); `cargo test` stops at this first failing integration binary, so later integration binaries are not exercised by the receipt command.
+8. **`&'static str` constants land in `intrinsic_copy`**: every `ConstValue.slice (ConstScalar.ptr ..)` (string/slice literal) reads a global allocation, so trivial marker bodies (`__ANNEAL_MODEL_*`, `__ANNEAL_EXT_SPEC_TARGET_*`: `_0 = const "..."; return`) classify as `intrinsic_copy` (4 of 64 real bodies). Episode 1 should decide whether read-only global slices deserve a cheaper treatment.
+9. **Smaller parity fixes** *(B1)*: `MirFragment::from_str` no longer trims whitespace (exact parity with Lean `fromStr?`, `#guard MirFragment.fromStr? " pure_loop_free" == none`); `MirFragment::default()` and Lean `Inhabited` are now the fail-closed `FullMir` / `.fullMir` (an unanalyzed `MirLiftingProfile::default()` previously claimed `pure_loop_free`); `is_pure_call_free_candidate()` now provably agrees with `fragment_classification().is_pure_mir()` on every test fixture.
+10. **Audit-tool scope**: `anneal-lsp audit-preview` checks the *last* theorem only, and its statement-isolation rule targets `Proof/` files. Theory theorems such as the brief-mandated `checkBodyFragment_pureBoundedLoop_eq_checkPureMir` legitimately mention `Anneal.PureMirExec.checkPureMir`; B1 therefore also ran `#print axioms` over **all** 168 theorems (summary in Section 1).
 
 ---
 
-## 6. Empirical Fragment Classification Over Real Captured MIR & Worked Fixtures
+## 6. Empirical Fragment Classification
 
-| Source File / Fixture | Item `defPath` | Basic Blocks | `inferMinFragment` / `classify_mir_fragment` | Escalation Reasons |
+### 6.1 Real `rustc`-captured MIR (`trusted/rustc-capture` emitter output, 64 bodies)
+
+Corpus: every `Mir/**/*.lean` module produced by the `cargo-anneal` integration tests on this capsule (`wireframe-demo`, multi-crate transitive-callee / external-spec fixtures with `core` callees) plus `examples/tutor-ch1`. Lean ground truth = `#eval inferMinFragment` / `hasCfgBackedge` / `isCfgDag` / `checkPureMir`; Rust = `classify_mir_fragment` (opt-in harness `mir_fragment_parity_corpus_dump`).
+
+| Crate group | Bodies | `pure_loop_free` | `pure_bounded_loop` | `tree_borrows_local` | `intrinsic_copy` | `full_mir` | Lean ↔ Rust mismatches |
+|---|---|---|---|---|---|---|---|
+| `WireframeDemo` | 21 | 10 | 0 | 10 | 1 | 0 | 0 |
+| `Core` callees | 20 | 3 | 0 | 11 | 0 | 6 | 0 |
+| `CrateA` | 12 | 1 | 0 | 0 | 3 | 8 | 0 |
+| `CrateB` | 9 | 0 | 0 | 0 | 0 | 9 | 0 |
+| `FrameTutor` (`examples/tutor-ch1`) | 2 | 2 | 0 | 0 | 0 | 0 | 0 |
+| **Total** | **64** | **16** | **0** | **21** | **4** | **23** | **0** |
+
+Notable rows: `wireframe_demo::{clamp_payload_window, frame_total_len, decode_wire_header}` are `pure_loop_free` (`checkPureMir = true`, 4 / 2 / 10 blocks); `checksum_frame_safe` (12 blocks) is `tree_borrows_local` with the corpus's only genuine loop (`isCfgDag = false`); `checksum_frame_fast` (20 blocks) is `tree_borrows_local` and loop-free; `PartialOrd::{le,lt}` / `RangeBounds::contains` are `full_mir` with acyclic index back-edges (Finding 5.2).
+
+### 6.2 Hand-written fixtures (`examples/mir/MirVerification.lean`)
+
+Lean `inferMinFragment` re-verified in B1 for 12 of A0's rows (helpers + bodies extracted verbatim): `addU32UncheckedMirBody`, `eq42BoolSpecMirBody`, `branchObsMirBody`, `calleeAddOneMirBody`, `returnStubMirBody` → `pure_loop_free`; `countdownMirBody`, `infiniteLoopMirBody` → `pure_bounded_loop` (genuine loops, `isCfgDag = false`); `reborrowWriteMirBody`, `aliasingViolationMirBody`, `unalignSetMirBody` → `tree_borrows_local`; `ffiDoubleCallMirBody`, `callerAddTwoMirBody` → `full_mir`. *(B1 correction)*: A0's table attributed these values to `classify_mir_fragment` as well, but these bodies are built with `mkMirBody` / `mkTerm` / `mkStmt` helpers and contain no `basicBlocks :=` literal, so the Rust scanner returns the fail-closed `full_mir` for them — by design, `classify_mir_fragment` targets emitter output (Section 6.1).
+
+### 6.3 Differential fuzzing (Lean ground truth vs. Rust, 1,400 random bodies)
+
+Generator: random `CapturedMir` ASTs over **every** `MirAst` constructor (all 26 `BinOp`s, 11 `CastKind`s, 15 `Rvalue`s, 12 `StatementKind`s, 11 `TerminatorKind`s, 4 `UnwindAction`s, out-of-range targets, `u128::MAX` switch values), rendered both in emitter syntax (`List.cons`, fully qualified) and dot-shorthand syntax, with adversarial comments / string literals containing constructor names and `CapturedMir` field keywords.
+
+| Run | Bodies | Syntax variants | Fragment mismatches (A0 → B1) | Fail-open (Rust < Lean) |
 |---|---|---|---|---|
-| `examples/tutor-ch1/.anneal/generated/Mir/FrameTutor/magic_version.lean` | `frame_tutor::magic_version` | 1 | `pure_loop_free` (`0`) | `[]` |
-| `examples/tutor-ch1/.anneal/generated/Mir/FrameTutor/advance_offset.lean` | `frame_tutor::advance_offset` | 2 | `pure_loop_free` (`0`) | `[]` |
-| `examples/mir/MirVerification.lean` (`addU32UncheckedMirBody`) | `demo::add_u32_unchecked` | 1 | `pure_loop_free` (`0`) | `[]` |
-| `examples/mir/MirVerification.lean` (`eq42BoolSpecMirBody`) | `demo::__anodized_ensures_eq42` | 1 | `pure_loop_free` (`0`) | `[]` |
-| `examples/mir/MirVerification.lean` (`branchObsMirBody`) | `demo::branch_obs` | 3 | `pure_loop_free` (`0`) | `[]` |
-| `examples/mir/MirVerification.lean` (`polySwapPairMirBody`) | `demo::swap_pair` | 1 | `pure_loop_free` (`0`) | `[]` |
-| `examples/mir/MirVerification.lean` (`countdownMirBody`) | `demo::countdown_loop` | 3 | `pure_bounded_loop` (`1`) | `["CFG back-edge"]` |
-| `examples/mir/MirVerification.lean` (`infiniteLoopMirBody`) | `demo::infinite_loop` | 1 | `pure_bounded_loop` (`1`) | `["CFG back-edge"]` |
-| `examples/mir/MirVerification.lean` (`reborrowWriteMirBody`) | `demo::reborrow_write_ok` | 1 | `tree_borrows_local` (`2`) | `["ProjectionElem.deref", "Rvalue.ref"]` |
-| `examples/mir/MirVerification.lean` (`aliasingViolationMirBody`) | `demo::aliasing_violation_ub` | 1 | `tree_borrows_local` (`2`) | `["ProjectionElem.deref", "Rvalue.ref"]` |
-| `examples/mir/MirVerification.lean` (`unalignSetMirBody`) | `zerocopy::Unalign::set` | 1 | `tree_borrows_local` (`2`) | `["ProjectionElem.deref"]` |
-| `theory/Anneal/MirFragmentPrototype.lean` (`witnessIntrinsicCopy`) | `proto::witness_intrinsic_copy` | 1 | `intrinsic_copy` (`3`) | `["NonDivergingIntrinsic.copyNonOverlapping"]` |
-| `examples/mir/MirVerification.lean` (`ffiDoubleCallMirBody`) | `demo::ffi_double_call_assert_eq` | 4 | `full_mir` (`4`) | `["TerminatorKind.call"]` |
-| `examples/mir/MirVerification.lean` (`callerAddTwoMirBody`) | `app::add_two_u32` | 2 | `full_mir` (`4`) | `["TerminatorKind.call"]` |
+| seed 7 | 600 | 300 emitter + 300 shorthand | **49 → 0** | 0 |
+| seed 11 | 800 | 571 inline + 96 fully-qualified (`Trusted.Rustc.V2026_06_01.MirAst.*`) + 133 helper-`def` terminators | **0** on all 667 inline bodies; 106 helper bodies over-approximated to `full_mir` (fail-closed by design) | **0** |
+
+Lean level distribution of seed 11: 104 `pure_loop_free`, 267 `pure_bounded_loop`, 209 `tree_borrows_local`, 96 `intrinsic_copy`, 124 `full_mir`. Back-edge flags and block counts agree on every inline body.
 
 ---
 
-## 7. Integration Plan for `ws-mir-fragment-lattice-unstable` (Go / Priority Boost to `P1`)
+## 7. Integration Plan for `ws-mir-fragment-lattice-unstable` (GO / `P1`)
 
 1. **Episode 1 (`ep1-mir-fragment-lattice-lean` on `unstable`)**:
-   - Promote `theory/Anneal/MirFragmentPrototype.lean` to `theory/Anneal/MirFragment.lean` and export `Anneal.MirFragment` in `theory/Anneal.lean`.
-   - Connect `checkBodyFragment_pureBoundedLoop_eq_checkPureMir` and `pureLoopFree_has_no_backedges` directly to `Anneal.MirLift` (`#mir_lift` elaborator precondition check) so `#mir_lift` emits an immediate fragment diagnostic using `inferMinFragment` whenever applied to a body exceeding `.pureLoopFree`.
+   - Promote `theory/Anneal/MirFragmentPrototype.lean` to `theory/Anneal/MirFragment.lean`, export it from `theory/Anneal.lean`, and update the `include_str!` path in `mir_fragment_rust_classifier_matches_lean_witness_theorems`.
+   - Use `checkBodyFragment_pureLoopFree_eq` / `inferMinFragment_eq_pureLoopFree_iff` as the `#mir_lift` precondition and emit a fragment diagnostic whenever `inferMinFragment` exceeds `.pureLoopFree`.
+   - Decide explicitly between the sound-but-conservative index rule and `isCfgDag` for `.pureLoopFree` (Finding 5.2), and change Lean and Rust together.
 2. **Episode 2 (`ep2-cargo-anneal-fragment-certificates` on `unstable`)**:
-   - Wire `MirFragment`, `classify_mir_fragment`, `render_mir_fragment_diagnostic`, and `compute_prototype_fragment_spec_digest` from `crates/cargo-anneal/src/scaffold.rs` into `.anneal/generated/Obligations/<Item>.lean` (`def fragment : MirFragment := ...` + `theorem fragment_sound : checkBodyFragment fragment Mir.<Item>.body = true := by rfl`) and `.anneal/spec-lock.json` (`mir_fragment` + `spec_digest`), mirroring Zircon 2.1 cl/1016618663.
-   - Surface `render_mir_fragment_diagnostic` in `cargo anneal agent-context` whenever an item crosses `pure_bounded_loop` so agents and users immediately see which construct triggered stateful/modular escalation and which Anneal proof combinator to use.
+   - Wire `classify_mir_fragment`, `render_mir_fragment_diagnostic`, and `compute_prototype_fragment_spec_digest` into `.anneal/generated/Obligations/<Item>.lean` (`def fragment : MirFragment := ...` + `theorem fragment_sound : checkBodyFragment fragment Mir.<Item>.body = true := by rfl`) and `.anneal/spec-lock.json` (`mir_fragment` + `spec_digest`), mirroring Zircon 2.1 cl/1016618663. The `rfl` certificate makes Lean the arbiter, so a Rust misclassification can only cost a failed build, never a wrong certificate.
+   - Keep the fail-closed vocabulary validator and run the differential harness (`ANNEAL_MIR_FRAGMENT_CORPUS_DIR=<dir> cargo test -p cargo-anneal --lib mir_fragment_parity_corpus_dump -- --ignored`) against freshly captured MIR in CI.
+   - Surface `render_mir_fragment_diagnostic` in `cargo anneal agent-context` whenever an item crosses `pure_bounded_loop`.

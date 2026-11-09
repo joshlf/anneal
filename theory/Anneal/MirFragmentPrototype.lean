@@ -78,7 +78,13 @@ inductive MirFragment : Type where
   | intrinsicCopy : MirFragment
   /-- Full `Runtime(PostCleanup)` MIR including calls and inline assembly. -/
   | fullMir : MirFragment
-  deriving DecidableEq, Repr, Inhabited
+  deriving DecidableEq, Repr
+
+/--
+Fail-closed default: an unclassified body is only claimed to be in `.fullMir`
+(matching `MirFragment::default()` in `crates/cargo-anneal/src/scaffold.rs`).
+-/
+instance : Inhabited MirFragment := ⟨.fullMir⟩
 
 namespace MirFragment
 
@@ -395,30 +401,215 @@ theorem no_cfg_cycle_of_hasCfgBackedge_false
   have h_lt := cfgPath_lt_of_hasCfgBackedge_false h_no h_cycle
   exact Nat.lt_irrefl u h_lt
 
-/-- Computable lookup of outgoing targets for basic block `u` in `body`. -/
-def cfgSuccs (body : CapturedMir) (u : BasicBlockIdx) : List BasicBlockIdx :=
-  match Trusted.Sequence.get? body.basicBlocks u with
-  | some bb => blockTargets bb
-  | none => []
+/-! ### Exact specification of the index-order rule (`hasCfgBackedge`) -/
+
+theorem exists_backedge_of_hasCfgBackedgeAux
+    {start : Nat} {bbs : List BasicBlockData}
+    (h : hasCfgBackedgeAux start bbs = true) :
+    ∃ off bb v, Trusted.Sequence.get? bbs off = some bb ∧
+      v ∈ blockTargets bb ∧ v ≤ start + off := by
+  induction bbs generalizing start with
+  | nil => simp [hasCfgBackedgeAux] at h
+  | cons hd tl ih =>
+    simp only [hasCfgBackedgeAux, Bool.or_eq_true] at h
+    rcases h with h_hd | h_tl
+    · simp only [hasBlockBackedge, List.any_eq_true, decide_eq_true_eq] at h_hd
+      obtain ⟨v, h_mem, h_le⟩ := h_hd
+      exact ⟨0, hd, v, rfl, h_mem, h_le⟩
+    · obtain ⟨off, bb, v, h_get, h_mem, h_le⟩ := ih h_tl
+      refine ⟨off + 1, bb, v, h_get, h_mem, ?_⟩
+      have h_eq : start + 1 + off = start + (off + 1) := by omega
+      rw [← h_eq]
+      exact h_le
 
 /--
-Computable bounded reachability check testing whether `target` is reachable from
-any node in `frontier` within `fuel + 1` steps.
+**Exact specification of `hasCfgBackedge`** (the rule `scaffold.rs` mirrors in
+`detect_blocks_and_back_edges`): `hasCfgBackedge body = true` iff some CFG edge
+`u → v` of `body` satisfies `v ≤ u` (a self-loop or a jump to a block whose
+index is not larger).
 -/
-def canReachInSteps (body : CapturedMir) (target : BasicBlockIdx) :
-    Nat → List BasicBlockIdx → Bool
-  | 0, _ => false
-  | fuel + 1, frontier =>
-    let next := frontier.flatMap (cfgSuccs body)
-    next.any (fun v => decide (v = target)) || canReachInSteps body target fuel next
+theorem hasCfgBackedge_eq_true_iff (body : CapturedMir) :
+    hasCfgBackedge body = true ↔ ∃ u v, CfgEdge body u v ∧ v ≤ u := by
+  constructor
+  · intro h
+    obtain ⟨off, bb, v, h_get, h_mem, h_le⟩ := exists_backedge_of_hasCfgBackedgeAux h
+    rw [Nat.zero_add] at h_le
+    exact ⟨off, v, ⟨bb, h_get, h_mem⟩, h_le⟩
+  · rintro ⟨u, v, h_edge, h_le⟩
+    cases h_b : hasCfgBackedge body
+    · exact absurd h_le (Nat.not_le_of_lt (cfgEdge_lt_of_hasCfgBackedge_false h_b h_edge))
+    · rfl
+
+/-- The source block of every CFG edge is an in-range block index. -/
+theorem lt_length_of_cfgEdge {body : CapturedMir} {u v : BasicBlockIdx}
+    (h : CfgEdge body u v) : u < body.basicBlocks.length := by
+  rcases h with ⟨bb, h_get, _⟩
+  exact (List.getElem?_eq_some_iff.mp h_get).1
+
+/-- The source block of every non-empty CFG path is an in-range block index. -/
+theorem lt_length_of_cfgPath {body : CapturedMir} {u v : BasicBlockIdx}
+    (h : CfgPath body u v) : u < body.basicBlocks.length := by
+  cases h with
+  | single h_edge => exact lt_length_of_cfgEdge h_edge
+  | step h_edge _ => exact lt_length_of_cfgEdge h_edge
+
+/-!
+### General DAG acyclicity via verified rank certificates (`isCfgDag`)
+
+The index-order rule is *sound* for acyclicity (`no_cfg_cycle_of_hasCfgBackedge_false`)
+but *not complete*: `rustc`'s captured MIR is not reverse-postorder numbered (the
+`ReorderBasicBlocks` pass is off by default), so loop-free bodies routinely contain
+index back-edges (e.g. arms of a `match` jumping to a shared return block created
+before them; see `witnessRustcSharedReturn`, transcribed from the real captured
+`core::cmp::PartialOrd::le`). `isCfgDag` is a general, polynomial ($O(n^2 |E|)$)
+acyclicity check whose soundness is independent of how its rank function is
+computed: any `rank : Nat → Nat` strictly increasing along every in-range edge
+certifies that the CFG has no directed cycle.
+-/
 
 /--
-Computable general CFG cycle detector over `body.basicBlocks`: tests whether
-any block `u < body.basicBlocks.length` can reach `u` in `1..=n` steps.
+True iff block `bb` at index `u` has an in-range edge `u → v` (`v < n`) that
+violates `rank` (`rank v ≤ rank u`).
 -/
-def hasCfgCycle (body : CapturedMir) : Bool :=
-  let n := body.basicBlocks.length
-  (List.range n).any (fun u => canReachInSteps body u n [u])
+def hasBlockRankViolation (rank : Nat → Nat) (n u : Nat) (bb : BasicBlockData) : Bool :=
+  (blockTargets bb).any (fun v => decide (v < n) && decide (rank v ≤ rank u))
+
+/-- Helper scanning a suffix of `body.basicBlocks` starting at 0-based index `u`. -/
+def hasRankViolationAux (rank : Nat → Nat) (n : Nat) : Nat → List BasicBlockData → Bool
+  | _, [] => false
+  | u, bb :: rest => hasBlockRankViolation rank n u bb || hasRankViolationAux rank n (u + 1) rest
+
+/-- True iff some in-range CFG edge `u → v` of `body` has `rank v ≤ rank u`. -/
+def hasRankViolation (rank : Nat → Nat) (body : CapturedMir) : Bool :=
+  hasRankViolationAux rank body.basicBlocks.length 0 body.basicBlocks
+
+theorem hasBlockRankViolation_false_of_hasRankViolationAux_false
+    {rank : Nat → Nat} {n start : Nat} {bbs : List BasicBlockData} {off : Nat}
+    {bb : BasicBlockData}
+    (h_no : hasRankViolationAux rank n start bbs = false)
+    (h_get : Trusted.Sequence.get? bbs off = some bb) :
+    hasBlockRankViolation rank n (start + off) bb = false := by
+  induction bbs generalizing start off with
+  | nil => cases h_get
+  | cons hd tl ih =>
+    simp only [hasRankViolationAux, Bool.or_eq_false_iff] at h_no
+    cases off with
+    | zero =>
+      cases h_get
+      simpa using h_no.1
+    | succ off' =>
+      have h_step := ih h_no.2 h_get
+      have h_arith : start + 1 + off' = start + (off' + 1) := by omega
+      rw [← h_arith]
+      exact h_step
+
+/-- A violation-free `rank` strictly increases along every in-range CFG edge. -/
+theorem cfgEdge_rank_lt_of_hasRankViolation_false
+    {rank : Nat → Nat} {body : CapturedMir} {u v : BasicBlockIdx}
+    (h_no : hasRankViolation rank body = false)
+    (h_edge : CfgEdge body u v) (h_v : v < body.basicBlocks.length) :
+    rank u < rank v := by
+  rcases h_edge with ⟨bb, h_get, h_mem⟩
+  have h_blk := hasBlockRankViolation_false_of_hasRankViolationAux_false (start := 0) h_no h_get
+  simp only [Nat.zero_add, hasBlockRankViolation, List.any_eq_false, Bool.and_eq_true,
+    decide_eq_true_eq, not_and] at h_blk
+  exact Nat.lt_of_not_le (h_blk v h_mem h_v)
+
+/-- A violation-free `rank` strictly increases along every CFG path into an in-range block. -/
+theorem cfgPath_rank_lt_of_hasRankViolation_false
+    {rank : Nat → Nat} {body : CapturedMir} {u w : BasicBlockIdx}
+    (h_no : hasRankViolation rank body = false)
+    (h_path : CfgPath body u w) (h_w : w < body.basicBlocks.length) :
+    rank u < rank w := by
+  induction h_path with
+  | single h_edge => exact cfgEdge_rank_lt_of_hasRankViolation_false h_no h_edge h_w
+  | step h_edge h_rest ih =>
+    exact Nat.lt_trans
+      (cfgEdge_rank_lt_of_hasRankViolation_false h_no h_edge (lt_length_of_cfgPath h_rest))
+      (ih h_w)
+
+/--
+**Rank-certificate soundness**: for ANY `rank : Nat → Nat`, if no in-range CFG
+edge violates `rank`, then `body`'s CFG has no directed cycle.
+-/
+theorem no_cfg_cycle_of_hasRankViolation_false
+    {rank : Nat → Nat} {body : CapturedMir}
+    (h_no : hasRankViolation rank body = false) (u : BasicBlockIdx) :
+    ¬ CfgPath body u u := by
+  intro h_cycle
+  exact Nat.lt_irrefl _
+    (cfgPath_rank_lt_of_hasRankViolation_false h_no h_cycle (lt_length_of_cfgPath h_cycle))
+
+theorem hasRankViolationAux_id_eq_hasCfgBackedgeAux {n : Nat} :
+    ∀ (u : Nat) (bbs : List BasicBlockData), u + bbs.length ≤ n →
+      hasRankViolationAux (fun i => i) n u bbs = hasCfgBackedgeAux u bbs
+  | _, [], _ => rfl
+  | u, bb :: rest, h_len => by
+    have h_len' : u + 1 + rest.length ≤ n := by
+      simp only [List.length_cons] at h_len
+      omega
+    have h_u : u < n := by omega
+    simp only [hasRankViolationAux, hasCfgBackedgeAux,
+      hasRankViolationAux_id_eq_hasCfgBackedgeAux (u + 1) rest h_len']
+    congr 1
+    simp only [hasBlockRankViolation, hasBlockBackedge]
+    congr 1
+    funext v
+    by_cases h : v ≤ u
+    · simp [h, Nat.lt_of_le_of_lt h h_u]
+    · simp [h]
+
+/--
+`hasCfgBackedge` is exactly the identity-rank instance of the general certificate
+check (`rank = id`), so `no_cfg_cycle_of_hasCfgBackedge_false` is a special case
+of `no_cfg_cycle_of_hasRankViolation_false`.
+-/
+theorem hasRankViolation_id_eq_hasCfgBackedge (body : CapturedMir) :
+    hasRankViolation (fun i => i) body = hasCfgBackedge body :=
+  hasRankViolationAux_id_eq_hasCfgBackedgeAux 0 body.basicBlocks (by simp)
+
+/-- In-range CFG edges `(u, v)` (`v < n`) of a suffix of `body.basicBlocks` starting at `u`. -/
+def cfgEdgeListAux (n : Nat) : Nat → List BasicBlockData → List (Nat × Nat)
+  | _, [] => []
+  | u, bb :: rest =>
+    ((blockTargets bb).filter (fun v => decide (v < n))).map (fun v => (u, v)) ++
+      cfgEdgeListAux n (u + 1) rest
+
+/-- All in-range CFG edges of `body`. -/
+def cfgEdgeList (body : CapturedMir) : List (Nat × Nat) :=
+  cfgEdgeListAux body.basicBlocks.length 0 body.basicBlocks
+
+/-- One Bellman-Ford longest-path relaxation round over `edges`. -/
+def relaxRanks (edges : List (Nat × Nat)) (ranks : List Nat) : List Nat :=
+  edges.foldl (fun rs e => rs.set e.2 (max (rs.getD e.2 0) (rs.getD e.1 0 + 1))) ranks
+
+/--
+Longest-path ranks after `n = body.basicBlocks.length` relaxation rounds. On an
+acyclic CFG these are the exact longest-path depths (strictly increasing along
+every edge); on a cyclic CFG some edge of every cycle necessarily violates them.
+-/
+def dagRanks (body : CapturedMir) : List Nat :=
+  Nat.repeat (relaxRanks (cfgEdgeList body)) body.basicBlocks.length
+    (List.replicate body.basicBlocks.length 0)
+
+/-- Rank function induced by `dagRanks` (`0` outside the block range). -/
+def dagRank (body : CapturedMir) (i : Nat) : Nat :=
+  (dagRanks body).getD i 0
+
+/--
+Computable general CFG acyclicity check: `true` iff the longest-path ranks of
+`body` certify that every in-range edge strictly increases rank.
+-/
+def isCfgDag (body : CapturedMir) : Bool :=
+  !hasRankViolation (dagRank body) body
+
+/-- **Soundness of `isCfgDag`**: `isCfgDag body = true` rules out every directed CFG cycle. -/
+theorem no_cfg_cycle_of_isCfgDag {body : CapturedMir}
+    (h : isCfgDag body = true) (u : BasicBlockIdx) :
+    ¬ CfgPath body u u := by
+  have h_no : hasRankViolation (dagRank body) body = false := by
+    simpa [isCfgDag] using h
+  exact no_cfg_cycle_of_hasRankViolation_false h_no u
 
 /-! ## 3. Per-Construct Structural Fragment Checkers -/
 
@@ -1004,6 +1195,39 @@ theorem no_inlineAsm_body_in_intrinsicCopy
     simp [checkBlockFragment, h_tf]
   exact list_all_false_of_mem h_bb h_blk
 
+/-! ### Downward-closed exclusions (every level strictly below each threshold) -/
+
+/-- `ProjectionElem.deref` is rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_deref_below_treeBorrowsLocal (f : MirFragment) (hf : f < .treeBorrowsLocal) :
+    checkProjElemFragment f .deref = false := by
+  cases f <;> first | rfl | exact absurd hf (by decide)
+
+/-- `StatementKind.retag` is rejected at every level `f < .treeBorrowsLocal`. -/
+theorem no_retag_below_treeBorrowsLocal (f : MirFragment) (hf : f < .treeBorrowsLocal)
+    (rk : RetagKind) (p : Place) :
+    checkStmtFragment f (.retag rk p) = false := by
+  cases f <;> first | rfl | exact absurd hf (by decide)
+
+/-- `copyNonOverlapping` is rejected at every level `f < .intrinsicCopy`. -/
+theorem no_copyNonOverlapping_below_intrinsicCopy (f : MirFragment) (hf : f < .intrinsicCopy)
+    (src dst count : Operand) :
+    checkStmtFragment f (.intrinsic (.copyNonOverlapping src dst count)) = false := by
+  cases f <;> first | rfl | exact absurd hf (by decide)
+
+/-- `TerminatorKind.call` / `.tailCall` are rejected at every level `f < .fullMir`. -/
+theorem no_call_below_fullMir (f : MirFragment) (hf : f < .fullMir)
+    (func : Operand) (args : List Operand) (dest : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction) :
+    checkTerminatorFragment f (.call func args dest target unwind) = false ∧
+    checkTerminatorFragment f (.tailCall func args) = false := by
+  cases f <;> first | exact ⟨rfl, rfl⟩ | exact absurd hf (by decide)
+
+/-- `TerminatorKind.inlineAsm` is rejected at every level `f < .fullMir`. -/
+theorem no_inlineAsm_below_fullMir (f : MirFragment) (hf : f < .fullMir)
+    (template : String) (targets : List BasicBlockIdx) (unwind : UnwindAction) :
+    checkTerminatorFragment f (.inlineAsm template targets unwind) = false := by
+  cases f <;> first | rfl | exact absurd hf (by decide)
+
 /-! ## 6. Exact `Anneal.PureMirExec.checkPureMir` Bridge Theorems -/
 
 @[simp]
@@ -1326,107 +1550,235 @@ private def dummyFnAbi : FnAbi := {
   canUnwind := false
 }
 
-private def mkProtoBody (defPath : DefPath) (bbs : List BasicBlockData) : CapturedMir := {
-  defPath := defPath
+/--
+Shared non-`basicBlocks` fields of the synthetic witness bodies below. Every
+witness is written as `{ protoBase with defPath := .., basicBlocks := [..] }`
+with a fully inline `basicBlocks` literal (no helper identifiers), so that the
+`scaffold.rs` unit test `mir_fragment_rust_classifier_matches_lean_witness_theorems`
+can classify the *verbatim* text of each witness and compare it against the
+kernel-checked `inferMinFragment` / `hasCfgBackedge` theorems in this section.
+-/
+private def protoBase : CapturedMir := {
+  defPath := "proto::base"
   phase := .runtimePostCleanup
   role := .subject
   argCount := 0
   localDecls := [{ mutability := .mut, ty := dummyU32Ty, debugName := none }]
-  basicBlocks := bbs
+  basicBlocks := []
   fnAbi := dummyFnAbi
   layouts := emptyLayoutTable
   allocations := []
 }
 
-private def constZeroU32 : Operand :=
-  .constant { ty := dummyU32Ty, val := .scalar (.int { bits := 0, sizeBytes := 4 }) }
-
 /-- Level 0 witness (`.pureLoopFree`): single-block pure scalar assignment and return. -/
 def witnessPureLoopFree : CapturedMir :=
-  mkProtoBody "proto::witness_pure_loop_free"
-    [{ statements :=
-         [{ kind := .assign { local_ := 0, projection := [] } (.use constZeroU32)
-            span := "proto.rs:1:1" }]
-       terminator := { kind := .return_, span := "proto.rs:1:10" }
-       isCleanup := false }]
+  { protoBase with
+    defPath := "proto::witness_pure_loop_free"
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .assign { local_ := 0, projection := [] }
+                (.use (.constant { ty := { kind := .uint .u32, layoutIdx := 0 },
+                                   val := .scalar (.int { bits := 0, sizeBytes := 4 }) }))
+              span := "proto.rs:1:1" }]
+         terminator := { kind := .return_, span := "proto.rs:1:10" }
+         isCleanup := false }] }
 
 /-- Level 1 witness (`.pureBoundedLoop`): pure loop with CFG back-edge (`bb1 -> bb1`). -/
 def witnessPureBoundedLoop : CapturedMir :=
-  mkProtoBody "proto::witness_pure_bounded_loop"
-    [{ statements := []
-       terminator := { kind := .goto 1, span := "proto.rs:2:1" }
-       isCleanup := false },
-     { statements := []
-       terminator :=
-         { kind := .switchInt (.copy { local_ := 0, projection := [] })
-             { branches := [(0, 2)], otherwise := 1 }
-           span := "proto.rs:2:5" }
-       isCleanup := false },
-     { statements := []
-       terminator := { kind := .return_, span := "proto.rs:2:10" }
-       isCleanup := false }]
+  { protoBase with
+    defPath := "proto::witness_pure_bounded_loop"
+    basicBlocks :=
+      [{ statements := []
+         terminator := { kind := .goto 1, span := "proto.rs:2:1" }
+         isCleanup := false },
+       { statements := []
+         terminator :=
+           { kind := .switchInt (.copy { local_ := 0, projection := [] })
+               { branches := [(0, 2)], otherwise := 1 }
+             span := "proto.rs:2:5" }
+         isCleanup := false },
+       { statements := []
+         terminator := { kind := .return_, span := "proto.rs:2:10" }
+         isCleanup := false }] }
 
 /-- Level 2 witness (`.treeBorrowsLocal`): local shared reference and deref read. -/
 def witnessTreeBorrowsLocal : CapturedMir :=
-  mkProtoBody "proto::witness_tree_borrows_local"
-    [{ statements :=
-         [{ kind := .assign { local_ := 1, projection := [] }
-              (.ref .shared { local_ := 0, projection := [] })
-            span := "proto.rs:3:1" },
-          { kind := .retag .default { local_ := 1, projection := [] }
-            span := "proto.rs:3:5" },
-          { kind := .assign { local_ := 0, projection := [] }
-              (.use (.copy { local_ := 1, projection := [.deref] }))
-            span := "proto.rs:3:9" }]
-       terminator := { kind := .return_, span := "proto.rs:3:15" }
-       isCleanup := false }]
+  { protoBase with
+    defPath := "proto::witness_tree_borrows_local"
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .assign { local_ := 1, projection := [] }
+                (.ref .shared { local_ := 0, projection := [] })
+              span := "proto.rs:3:1" },
+            { kind := .retag .default { local_ := 1, projection := [] }
+              span := "proto.rs:3:5" },
+            { kind := .assign { local_ := 0, projection := [] }
+                (.use (.copy { local_ := 1, projection := [.deref] }))
+              span := "proto.rs:3:9" }]
+         terminator := { kind := .return_, span := "proto.rs:3:15" }
+         isCleanup := false }] }
 
 /-- Level 3 witness (`.intrinsicCopy`): `NonDivergingIntrinsic.copyNonOverlapping`. -/
 def witnessIntrinsicCopy : CapturedMir :=
-  mkProtoBody "proto::witness_intrinsic_copy"
-    [{ statements :=
-         [{ kind := .intrinsic
-              (.copyNonOverlapping
-                (.copy { local_ := 1, projection := [] })
-                (.copy { local_ := 2, projection := [] })
-                constZeroU32)
-            span := "proto.rs:4:1" }]
-       terminator := { kind := .return_, span := "proto.rs:4:10" }
-       isCleanup := false }]
+  { protoBase with
+    defPath := "proto::witness_intrinsic_copy"
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .intrinsic
+                (.copyNonOverlapping
+                  (.copy { local_ := 1, projection := [] })
+                  (.copy { local_ := 2, projection := [] })
+                  (.constant { ty := { kind := .uint .usize, layoutIdx := 0 },
+                               val := .scalar (.int { bits := 0, sizeBytes := 8 }) }))
+              span := "proto.rs:4:1" }]
+         terminator := { kind := .return_, span := "proto.rs:4:10" }
+         isCleanup := false }] }
 
 /-- Level 4 witness (`.fullMir`): interprocedural `TerminatorKind.call`. -/
 def witnessFullMir : CapturedMir :=
-  mkProtoBody "proto::witness_full_mir"
-    [{ statements := []
-       terminator :=
-         { kind := .call
-             (.constant { ty := { kind := .fnDef "proto::callee" [], layoutIdx := 0 }, val := .zeroSized })
-             []
-             { local_ := 0, projection := [] }
-             (some 1)
-             .continue_
-           span := "proto.rs:5:1" }
-       isCleanup := false },
-     { statements := []
-       terminator := { kind := .return_, span := "proto.rs:5:10" }
-       isCleanup := false }]
+  { protoBase with
+    defPath := "proto::witness_full_mir"
+    basicBlocks :=
+      [{ statements := []
+         terminator :=
+           { kind := .call
+               (.constant { ty := { kind := .fnDef "proto::callee" [], layoutIdx := 0 },
+                            val := .zeroSized })
+               []
+               { local_ := 0, projection := [] }
+               (some 1)
+               .continue_
+             span := "proto.rs:5:1" }
+         isCleanup := false },
+       { statements := []
+         terminator := { kind := .return_, span := "proto.rs:5:10" }
+         isCleanup := false }] }
 
 /--
-3-block non-topologically-sorted DAG (`bb0 -> bb2 -> bb1 -> return`):
-demonstrates a loop-free DAG whose block numbering has an index back-edge
-(`bb2 -> bb1` with `1 ≤ 2`), so `hasCfgBackedge = true` while `hasCfgCycle = false`.
+3-block non-topologically-numbered DAG (`bb0 -> bb2 -> bb1 -> return`): a loop-free
+CFG whose numbering has an index back-edge (`bb2 -> bb1`, `1 ≤ 2`), so
+`hasCfgBackedge = true` while `isCfgDag = true` certifies acyclicity.
 -/
 def nonTopoDagWitness : CapturedMir :=
-  mkProtoBody "proto::non_topo_dag_witness"
-    [{ statements := []
-       terminator := { kind := .goto 2, span := "proto.rs:6:1" }
-       isCleanup := false },
-     { statements := []
-       terminator := { kind := .return_, span := "proto.rs:6:5" }
-       isCleanup := false },
-     { statements := []
-       terminator := { kind := .goto 1, span := "proto.rs:6:9" }
-       isCleanup := false }]
+  { protoBase with
+    defPath := "proto::non_topo_dag_witness"
+    basicBlocks :=
+      [{ statements := []
+         terminator := { kind := .goto 2, span := "proto.rs:6:1" }
+         isCleanup := false },
+       { statements := []
+         terminator := { kind := .return_, span := "proto.rs:6:5" }
+         isCleanup := false },
+       { statements := []
+         terminator := { kind := .goto 1, span := "proto.rs:6:9" }
+         isCleanup := false }] }
+
+/--
+Real-`rustc` index-order witness, transcribed (minus its `partial_cmp` call) from
+the captured `Runtime` MIR of `core::cmp::PartialOrd::le`: the shared return block
+`bb1` is numbered *before* the `match` arms `bb3` / `bb4` that jump to it. The
+body is pure and acyclic (`checkPureMir`, `isCfgDag`), yet the index-order rule
+classifies it `.pureBoundedLoop` (sound but conservative).
+-/
+def witnessRustcSharedReturn : CapturedMir :=
+  { protoBase with
+    defPath := "proto::witness_rustc_shared_return"
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .assign { local_ := 4, projection := [] }
+                (.discriminant { local_ := 3, projection := [] })
+              span := "core/src/cmp.rs:1:1" }]
+         terminator :=
+           { kind := .switchInt (.move { local_ := 4, projection := [] })
+               { branches := [(0, 4), (1, 3)], otherwise := 2 }
+             span := "core/src/cmp.rs:1:2" }
+         isCleanup := false },
+       { statements := []
+         terminator := { kind := .return_, span := "core/src/cmp.rs:1:3" }
+         isCleanup := false },
+       { statements := []
+         terminator := { kind := .unreachable, span := "core/src/cmp.rs:1:4" }
+         isCleanup := false },
+       { statements :=
+           [{ kind := .assign { local_ := 0, projection := [] }
+                (.binaryOp .le (.move { local_ := 6, projection := [] })
+                  (.constant { ty := { kind := .int .i8, layoutIdx := 0 },
+                               val := .scalar (.int { bits := 0, sizeBytes := 1 }) }))
+              span := "core/src/cmp.rs:1:5" }]
+         terminator := { kind := .goto 1, span := "core/src/cmp.rs:1:6" }
+         isCleanup := false },
+       { statements :=
+           [{ kind := .assign { local_ := 0, projection := [] }
+                (.use (.constant { ty := { kind := .bool, layoutIdx := 0 },
+                                   val := .scalar (.int { bits := 0, sizeBytes := 1 }) }))
+              span := "core/src/cmp.rs:1:7" }]
+         terminator := { kind := .goto 1, span := "core/src/cmp.rs:1:8" }
+         isCleanup := false }] }
+
+/--
+Shorthand-syntax `Mutability.mut` witness (`.pureLoopFree`): `*mut` / `&mut` types
+in cast targets, field projections and constants, plus a pure
+`AggregateKind.rawPtr _ .mut` pointer-from-parts aggregate. None of these is a
+`BorrowKind.mut` borrow, so the body stays in `.pureLoopFree` (regression fixture
+for the `.mut` token ambiguity between `Mutability.mut` and `BorrowKind.mut`).
+-/
+def witnessShorthandMutTypes : CapturedMir :=
+  { protoBase with
+    defPath := "proto::witness_shorthand_mut_types"
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .assign { local_ := 1, projection := [] }
+                (.cast .pointerWithExposedProvenance (.copy { local_ := 2, projection := [] })
+                  { kind := .rawPtr .mut (.uint .u8), layoutIdx := 1 })
+              span := "proto.rs:7:1" },
+            { kind := .assign { local_ := 3, projection := [] }
+                (.aggregate (.rawPtr { kind := .uint .u8, layoutIdx := 0 } .mut)
+                  [.copy { local_ := 1, projection := [] }, .copy { local_ := 2, projection := [] }])
+              span := "proto.rs:7:2" },
+            { kind := .assign
+                { local_ := 4, projection := [.field 0 { kind := .ref .mut (.uint .u32), layoutIdx := 2 }] }
+                (.use (.constant { ty := { kind := .rawPtr .mut .bool, layoutIdx := 3 },
+                                   val := .scalar (.int { bits := 0, sizeBytes := 8 }) }))
+              span := "proto.rs:7:3" }]
+         terminator := { kind := .return_, span := "proto.rs:7:4" }
+         isCleanup := false }] }
+
+/--
+Fully-qualified `rustc-capture` emitter-syntax witness (`.treeBorrowsLocal`):
+`Rvalue.rawPtr Mutability.mut` written with `List.cons` / `List.nil` exactly as
+`trusted/rustc-capture/src/lean_emit.rs` renders it.
+-/
+def witnessQualifiedEmitterRawPtr : CapturedMir :=
+  { protoBase with
+    defPath := "proto::witness_qualified_emitter_raw_ptr"
+    basicBlocks := (List.cons { statements := (List.cons { kind := (StatementKind.assign { local_ := 1, projection := List.nil } (Rvalue.rawPtr Mutability.mut { local_ := 2, projection := List.nil })), span := "src/lib.rs:8:1" } List.nil), terminator := { kind := TerminatorKind.return_, span := "src/lib.rs:8:2" }, isCleanup := false } List.nil) }
+
+/-- Global-allocation constant witness (`.intrinsicCopy`) without `copyNonOverlapping`. -/
+def witnessIndirectConst : CapturedMir :=
+  { protoBase with
+    defPath := "proto::witness_indirect_const"
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .assign { local_ := 0, projection := [] }
+                (.use (.constant { ty := { kind := .uint .u32, layoutIdx := 0 }, val := .indirect 0 0 }))
+              span := "proto.rs:9:1" }]
+         terminator := { kind := .return_, span := "proto.rs:9:2" }
+         isCleanup := false }] }
+
+/-- Call-free `.fullMir` witness: `CastKind.fnPtrToPtr` and `Rvalue.threadLocalRef`. -/
+def witnessFullMirNoCall : CapturedMir :=
+  { protoBase with
+    defPath := "proto::witness_full_mir_no_call"
+    basicBlocks :=
+      [{ statements :=
+           [{ kind := .assign { local_ := 0, projection := [] }
+                (.cast .fnPtrToPtr (.copy { local_ := 1, projection := [] })
+                  { kind := .rawPtr .not .bool, layoutIdx := 0 })
+              span := "proto.rs:10:1" },
+            { kind := .assign { local_ := 2, projection := [] } (.threadLocalRef "proto::TLS")
+              span := "proto.rs:10:2" }]
+         terminator := { kind := .return_, span := "proto.rs:10:3" }
+         isCleanup := false }] }
 
 theorem inferMinFragment_witnessPureLoopFree :
     inferMinFragment witnessPureLoopFree = .pureLoopFree := rfl
@@ -1443,11 +1795,69 @@ theorem inferMinFragment_witnessIntrinsicCopy :
 theorem inferMinFragment_witnessFullMir :
     inferMinFragment witnessFullMir = .fullMir := rfl
 
-theorem nonTopoDagWitness_backedge_vs_cycle :
+theorem inferMinFragment_nonTopoDagWitness :
+    inferMinFragment nonTopoDagWitness = .pureBoundedLoop := rfl
+
+theorem inferMinFragment_witnessRustcSharedReturn :
+    inferMinFragment witnessRustcSharedReturn = .pureBoundedLoop := rfl
+
+theorem inferMinFragment_witnessShorthandMutTypes :
+    inferMinFragment witnessShorthandMutTypes = .pureLoopFree := rfl
+
+theorem inferMinFragment_witnessQualifiedEmitterRawPtr :
+    inferMinFragment witnessQualifiedEmitterRawPtr = .treeBorrowsLocal := rfl
+
+theorem inferMinFragment_witnessIndirectConst :
+    inferMinFragment witnessIndirectConst = .intrinsicCopy := rfl
+
+theorem inferMinFragment_witnessFullMirNoCall :
+    inferMinFragment witnessFullMirNoCall = .fullMir := rfl
+
+theorem hasCfgBackedge_witnessPureLoopFree : hasCfgBackedge witnessPureLoopFree = false := rfl
+
+theorem hasCfgBackedge_witnessPureBoundedLoop : hasCfgBackedge witnessPureBoundedLoop = true := rfl
+
+theorem hasCfgBackedge_witnessFullMir : hasCfgBackedge witnessFullMir = false := rfl
+
+theorem hasCfgBackedge_nonTopoDagWitness : hasCfgBackedge nonTopoDagWitness = true := rfl
+
+theorem hasCfgBackedge_witnessRustcSharedReturn :
+    hasCfgBackedge witnessRustcSharedReturn = true := rfl
+
+/--
+**Index-order vs. general DAG acyclicity**: `nonTopoDagWitness` has an index
+back-edge (`hasCfgBackedge = true`) but is certified acyclic (`isCfgDag = true`),
+so it is classified `.pureBoundedLoop` although no loop exists.
+-/
+theorem nonTopoDagWitness_backedge_vs_dag :
     hasCfgBackedge nonTopoDagWitness = true ∧
-    hasCfgCycle nonTopoDagWitness = false ∧
+    isCfgDag nonTopoDagWitness = true ∧
     inferMinFragment nonTopoDagWitness = .pureBoundedLoop :=
   ⟨rfl, rfl, rfl⟩
+
+/-- `nonTopoDagWitness` has no directed CFG cycle (kernel-checked via `isCfgDag`). -/
+theorem nonTopoDagWitness_acyclic (u : BasicBlockIdx) : ¬ CfgPath nonTopoDagWitness u u :=
+  no_cfg_cycle_of_isCfgDag rfl u
+
+/--
+The real-`rustc` shared-return pattern is pure and acyclic, yet classified
+`.pureBoundedLoop` by the (sound, conservative) index-order rule.
+-/
+theorem witnessRustcSharedReturn_pure_acyclic_but_pureBoundedLoop :
+    Anneal.PureMirExec.checkPureMir witnessRustcSharedReturn = true ∧
+    hasCfgBackedge witnessRustcSharedReturn = true ∧
+    isCfgDag witnessRustcSharedReturn = true ∧
+    inferMinFragment witnessRustcSharedReturn = .pureBoundedLoop :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+theorem witnessRustcSharedReturn_acyclic (u : BasicBlockIdx) :
+    ¬ CfgPath witnessRustcSharedReturn u u :=
+  no_cfg_cycle_of_isCfgDag rfl u
+
+/-- `witnessPureBoundedLoop` has a genuine self-loop `bb1 -> bb1` (and `isCfgDag` rejects it). -/
+theorem witnessPureBoundedLoop_cycle :
+    CfgPath witnessPureBoundedLoop 1 1 ∧ isCfgDag witnessPureBoundedLoop = false :=
+  ⟨.single ⟨_, rfl, by decide⟩, rfl⟩
 
 #guard inferMinFragment witnessPureLoopFree == .pureLoopFree
 #guard inferMinFragment witnessPureBoundedLoop == .pureBoundedLoop
@@ -1455,7 +1865,10 @@ theorem nonTopoDagWitness_backedge_vs_cycle :
 #guard inferMinFragment witnessIntrinsicCopy == .intrinsicCopy
 #guard inferMinFragment witnessFullMir == .fullMir
 #guard hasCfgBackedge nonTopoDagWitness == true
-#guard hasCfgCycle nonTopoDagWitness == false
+#guard isCfgDag nonTopoDagWitness == true
+#guard isCfgDag witnessPureBoundedLoop == false
+#guard MirFragment.fromStr? " pure_loop_free" == none
+#guard (default : MirFragment) == .fullMir
 
 /-! ## 9. Single-Pass Bottom-Up Lattice Inference (`inferMinFragmentSinglePass`) -/
 
@@ -1738,5 +2151,145 @@ theorem inferMinFragmentSinglePass_eq_inferMinFragment (body : CapturedMir) :
   · apply inferMinFragment_minimal
     rw [checkBodyFragment_eq_decide_singlePass, decide_eq_true_eq]
     exact MirFragment.le_refl _
+
+/-! ## 10. Rank 1 Is a Pure CFG Property (`.pureLoopFree` Characterization) -/
+
+theorem join_ne_pureBoundedLoop {a b : MirFragment}
+    (ha : a ≠ .pureBoundedLoop) (hb : b ≠ .pureBoundedLoop) :
+    a.join b ≠ .pureBoundedLoop := by
+  cases a <;> cases b <;> first | decide | exact absurd rfl ha | exact absurd rfl hb
+
+theorem joinList_ne_pureBoundedLoop {α : Type} {g : α → MirFragment}
+    (hg : ∀ x, g x ≠ .pureBoundedLoop) :
+    ∀ xs : List α, joinList g xs ≠ .pureBoundedLoop
+  | [] => nofun
+  | x :: xs => join_ne_pureBoundedLoop (hg x) (joinList_ne_pureBoundedLoop hg xs)
+
+theorem minConstFragment_ne_pureBoundedLoop (cv : ConstValue) :
+    minConstFragment cv ≠ .pureBoundedLoop := by
+  cases cv with
+  | slice sc _ => cases sc <;> nofun
+  | _ => nofun
+
+theorem minProjElemFragment_ne_pureBoundedLoop (pe : ProjectionElem) :
+    minProjElemFragment pe ≠ .pureBoundedLoop := by
+  cases pe <;> nofun
+
+theorem minPlaceFragment_ne_pureBoundedLoop (p : Place) :
+    minPlaceFragment p ≠ .pureBoundedLoop :=
+  joinList_ne_pureBoundedLoop minProjElemFragment_ne_pureBoundedLoop p.projection
+
+theorem minOperandFragment_ne_pureBoundedLoop (op : Operand) :
+    minOperandFragment op ≠ .pureBoundedLoop := by
+  cases op with
+  | copy p | move p => exact minPlaceFragment_ne_pureBoundedLoop p
+  | constant c => exact minConstFragment_ne_pureBoundedLoop c.val
+
+theorem minBinOpFragment_ne_pureBoundedLoop (op : BinOp) :
+    minBinOpFragment op ≠ .pureBoundedLoop := by
+  cases op <;> nofun
+
+theorem minCastFragment_ne_pureBoundedLoop (ck : CastKind) :
+    minCastFragment ck ≠ .pureBoundedLoop := by
+  cases ck <;> nofun
+
+theorem minRvalueFragment_ne_pureBoundedLoop (rv : Rvalue) :
+    minRvalueFragment rv ≠ .pureBoundedLoop := by
+  cases rv with
+  | use op | «repeat» op _ | unaryOp _ op | wrapUnsafeBinder op _ =>
+    exact minOperandFragment_ne_pureBoundedLoop op
+  | len p | discriminant p => exact minPlaceFragment_ne_pureBoundedLoop p
+  | nullaryOp _ _ | threadLocalRef _ => nofun
+  | ref _ p | rawPtr _ p | copyForDeref p =>
+    exact join_ne_pureBoundedLoop (by decide) (minPlaceFragment_ne_pureBoundedLoop p)
+  | cast ck op _ =>
+    exact join_ne_pureBoundedLoop (minCastFragment_ne_pureBoundedLoop ck)
+      (minOperandFragment_ne_pureBoundedLoop op)
+  | binaryOp op lhs rhs =>
+    exact join_ne_pureBoundedLoop (minBinOpFragment_ne_pureBoundedLoop op)
+      (join_ne_pureBoundedLoop (minOperandFragment_ne_pureBoundedLoop lhs)
+        (minOperandFragment_ne_pureBoundedLoop rhs))
+  | aggregate _ ops => exact joinList_ne_pureBoundedLoop minOperandFragment_ne_pureBoundedLoop ops
+  | shallowInitBox op _ =>
+    exact join_ne_pureBoundedLoop (by decide) (minOperandFragment_ne_pureBoundedLoop op)
+
+theorem minStmtFragment_ne_pureBoundedLoop (sk : StatementKind) :
+    minStmtFragment sk ≠ .pureBoundedLoop := by
+  cases sk with
+  | assign p r =>
+    exact join_ne_pureBoundedLoop (minPlaceFragment_ne_pureBoundedLoop p)
+      (minRvalueFragment_ne_pureBoundedLoop r)
+  | setDiscriminant p _ | placeMention p | deinit p => exact minPlaceFragment_ne_pureBoundedLoop p
+  | storageLive _ | storageDead _ | nop | coverage | constEvalCounter => nofun
+  | intrinsic intr =>
+    cases intr with
+    | assume op => exact minOperandFragment_ne_pureBoundedLoop op
+    | copyNonOverlapping src dst count =>
+      exact join_ne_pureBoundedLoop
+        (join_ne_pureBoundedLoop (by decide) (minOperandFragment_ne_pureBoundedLoop src))
+        (join_ne_pureBoundedLoop (minOperandFragment_ne_pureBoundedLoop dst)
+          (minOperandFragment_ne_pureBoundedLoop count))
+  | retag _ p | backwardIncompatibleDropHint p =>
+    exact join_ne_pureBoundedLoop (by decide) (minPlaceFragment_ne_pureBoundedLoop p)
+
+theorem minTerminatorFragment_ne_pureBoundedLoop (tk : TerminatorKind) :
+    minTerminatorFragment tk ≠ .pureBoundedLoop := by
+  cases tk with
+  | goto _ | return_ | unreachable | unwindResume | unwindTerminate | inlineAsm _ _ _ => nofun
+  | switchInt discr _ => exact minOperandFragment_ne_pureBoundedLoop discr
+  | assert cond _ _ _ => exact minOperandFragment_ne_pureBoundedLoop cond
+  | drop p _ _ => exact minPlaceFragment_ne_pureBoundedLoop p
+  | call func args dest _ _ =>
+    exact join_ne_pureBoundedLoop
+      (join_ne_pureBoundedLoop
+        (join_ne_pureBoundedLoop (by decide) (minOperandFragment_ne_pureBoundedLoop func))
+        (joinList_ne_pureBoundedLoop minOperandFragment_ne_pureBoundedLoop args))
+      (minPlaceFragment_ne_pureBoundedLoop dest)
+  | tailCall func args =>
+    exact join_ne_pureBoundedLoop
+      (join_ne_pureBoundedLoop (by decide) (minOperandFragment_ne_pureBoundedLoop func))
+      (joinList_ne_pureBoundedLoop minOperandFragment_ne_pureBoundedLoop args)
+
+/--
+**No basic block requires exactly `.pureBoundedLoop`**: rank 1 of the lattice is
+a pure CFG property (`hasCfgBackedge`), never a per-construct one.
+-/
+theorem minBlockFragment_ne_pureBoundedLoop (bb : BasicBlockData) :
+    minBlockFragment bb ≠ .pureBoundedLoop :=
+  join_ne_pureBoundedLoop
+    (joinList_ne_pureBoundedLoop (fun s => minStmtFragment_ne_pureBoundedLoop s.kind) bb.statements)
+    (minTerminatorFragment_ne_pureBoundedLoop bb.terminator.kind)
+
+theorem checkBlockFragment_pureLoopFree_eq_pureBoundedLoop (bb : BasicBlockData) :
+    checkBlockFragment .pureLoopFree bb = checkBlockFragment .pureBoundedLoop bb := by
+  rw [checkBlockFragment_eq_decide, checkBlockFragment_eq_decide]
+  have h := minBlockFragment_ne_pureBoundedLoop bb
+  generalize minBlockFragment bb = m at h ⊢
+  cases m <;> first | rfl | exact absurd rfl h
+
+/--
+**Exact characterization of `.pureLoopFree`**: membership is precisely
+`checkPureMir body && !hasCfgBackedge body`.
+-/
+theorem checkBodyFragment_pureLoopFree_eq (body : CapturedMir) :
+    checkBodyFragment .pureLoopFree body =
+      (checkPureMir body && !hasCfgBackedge body) := by
+  rw [← checkBodyFragment_pureBoundedLoop_eq_checkPureMir]
+  simp only [checkBodyFragment]
+  rw [congrArg body.basicBlocks.all (funext checkBlockFragment_pureLoopFree_eq_pureBoundedLoop)]
+
+/-- `inferMinFragment body = .pureLoopFree` iff `checkPureMir body` and no index back-edge. -/
+theorem inferMinFragment_eq_pureLoopFree_iff (body : CapturedMir) :
+    inferMinFragment body = .pureLoopFree ↔
+      checkPureMir body = true ∧ hasCfgBackedge body = false := by
+  have h_iff := checkBodyFragment_iff_inferMinFragment_le .pureLoopFree body
+  simp only [checkBodyFragment_pureLoopFree_eq, Bool.and_eq_true, Bool.not_eq_true'] at h_iff
+  constructor
+  · intro h
+    apply h_iff.mpr
+    rw [h]
+    exact MirFragment.le_refl _
+  · intro h
+    exact MirFragment.le_antisymm (h_iff.mp h) (MirFragment.bot_le _)
 
 end Anneal.MirFragmentPrototype
