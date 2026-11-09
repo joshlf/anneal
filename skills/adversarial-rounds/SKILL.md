@@ -15,7 +15,7 @@ description: >-
 
 Run a structured $N$-round adversarial build-critique-fix loop between
 **Agent A** (`agent-a`) and **Agent B** (`agent-b`) over shared git worktree(s),
-using Jetski's native `swarm` board for turn-by-turn handoffs and model pinning.
+using Antigravity's native `swarm` board for turn-by-turn handoffs and model pinning.
 
 ## 1. Validate or Assemble the Brief
 

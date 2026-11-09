@@ -1,7 +1,7 @@
 # Agent harness setup and anti-cheating configuration
 
 This guide explains how to configure AI coding agents (Claude Code, Gemini CLI,
-Jetski, and Codex) to discharge Anneal verification obligations rapidly using
+Antigravity, and Codex) to discharge Anneal verification obligations rapidly using
 the warm Lean 4 LSP server (`tools/anneal-lsp/`) while enforcing strict
 anti-cheating boundaries so agents can only succeed by writing valid proofs in
 `anneal/proofs/Proof/<Crate>/<Item>.lean`.
@@ -98,13 +98,13 @@ Configure `PreToolUse` and `PostToolUse` hooks in `.claude/settings.json`:
 }
 ```
 
-### Gemini CLI / Jetski (`~/.gemini/config/plugins/anneal-lean/`)
+### Gemini CLI / Antigravity (`~/.gemini/config/plugins/anneal-lean/`)
 
-In Gemini CLI or Jetski environments, `tools/anneal-lsp/` can be installed
+In Gemini CLI or Antigravity environments, `tools/anneal-lsp/` can be installed
 directly as a plugin bundle or registered in `settings.json` using the exact same
 `mcp_server.py`, `hooks/pre_tool_use.py`, and `hooks/post_tool_use.py` scripts
 (both hook scripts accept both Claude Code `tool_name`/`tool_input` and
-Jetski/Gemini `toolName`/`toolInput` JSON payloads).
+Antigravity/Gemini `toolName`/`toolInput` JSON payloads).
 
 ---
 
