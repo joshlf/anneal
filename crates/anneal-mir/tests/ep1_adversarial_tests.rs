@@ -3725,3 +3725,216 @@ fn test_ep1_b4_property_partial_shell_walker_matches_reference_model() {
         "{checked:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// [adv A4] In-place `SetDiscriminant`, 0-field `MirValue::Unit` enums, and union inactive fields
+// ---------------------------------------------------------------------------------------------
+
+/// Verifies three `SetDiscriminant` properties:
+/// 1. Projected `SetDiscriminant` (`discriminant(_0.0) = v`, `discriminant(_0.1[1..3][_1]) = v`)
+///    mutates the target enum discriminant in place in `O(proj.len())` time without cloning or
+///    scanning the enum's fields (even when the enum holds a `1 << 15`-element array).
+/// 2. A 0-field enum (`Ty::Tuple(vec![])`) initialized as `MirValue::Unit` (`()`) accepts
+///    `SetDiscriminant` on both bare and projected places, producing
+///    `MirValue::Adt { variant_idx: v, active_field: None, fields: vec![] }` just like
+///    `MirValue::Tuple(vec![])` and `Trusted.MirSemantics.Statements.evalStmt`.
+/// 3. `SetDiscriminant` through an inactive union field returns
+///    `RvalueEvalError::UnsupportedPlaceProjection` (matching `write_projected_mir_value`), while
+///    a malformed active union field or a malformed target `MirValue::Adt` field count is
+///    rejected with `RvalueEvalError::TypeMismatch`.
+#[test]
+fn test_ep1_a4_set_discriminant_in_place_unit_and_union_inactive_field() {
+    const N: usize = 1 << 15;
+    let big_arr_ty = Ty::Array(Box::new(u32_ty()), N);
+    let big_enum_ty = Ty::Tuple(vec![big_arr_ty.clone()]);
+    let unit_enum_ty = Ty::unit();
+    let unit_enum_arr_ty = Ty::Array(Box::new(unit_enum_ty.clone()), 4);
+    let container_ty = Ty::Tuple(vec![big_enum_ty.clone(), unit_enum_arr_ty.clone()]);
+    let union_ty = Ty::Tuple(vec![u32_ty(), Ty::Tuple(vec![unit_enum_ty.clone()])]);
+    let local_decls = vec![
+        container_ty.clone(), // _0: (BigEnum, [UnitEnum; 4])
+        usize_ty(),           // _1: usize index
+        unit_enum_ty.clone(), // _2: UnitEnum
+        union_ty.clone(),     // _3: union { f0: u32, f1: (UnitEnum,) }
+        big_enum_ty.clone(),  // _4: BigEnum
+    ];
+
+    let big_arr = MirValue::Array {
+        elements: (0..N).map(|i| u32v(i as u128)).collect(),
+        elem_ty: u32_ty(),
+    };
+    let big_enum = MirValue::Adt {
+        def_path: "BigE".into(),
+        variant_idx: 0,
+        active_field: None,
+        fields: vec![big_arr],
+    };
+    let unit_arr = MirValue::Array {
+        elements: vec![MirValue::Unit; 4],
+        elem_ty: unit_enum_ty.clone(),
+    };
+    let mut state = StatementEvalState::from_local_decls(local_decls.clone(), PW);
+    state.slots[0] = LocalSlotState::Init(MirValue::Tuple(vec![big_enum, unit_arr]));
+    state.slots[1] = LocalSlotState::Init(usizev(1));
+    state.slots[2] = LocalSlotState::Init(MirValue::Unit);
+
+    // 1. Projected `SetDiscriminant` on `_0.0` (holding a 32,768-element array) runs in O(1)
+    // per step without cloning or scanning the 32,768 array elements.
+    let set_big_enum = lower_statement(
+        &Statement::SetDiscriminant {
+            place: proj(0, vec![field(0, big_enum_ty.clone())]),
+            variant_index: 3,
+        },
+        &local_decls,
+        PW,
+    )
+    .unwrap();
+    for v in 0..4096 {
+        eval_lowered_statement(
+            &LoweredStatement::SetDiscriminant {
+                place: proj(0, vec![field(0, big_enum_ty.clone())]),
+                place_ty: big_enum_ty.clone(),
+                variant_index: v & 3,
+            },
+            &mut state,
+        )
+        .unwrap();
+    }
+    eval_lowered_statement(&set_big_enum, &mut state).unwrap();
+    let discr_big = lower_rvalue(
+        &Rvalue::Discriminant(proj(0, vec![field(0, big_enum_ty.clone())])),
+        &local_decls,
+        PW,
+    )
+    .unwrap();
+    assert_eq!(
+        anneal_mir::lower::eval_lowered_rvalue_in_state(&discr_big, &mut state),
+        Ok(MirValue::signed(3, IntTy::Isize, PW))
+    );
+
+    // 2. `SetDiscriminant` on 0-field `MirValue::Unit` enum (bare `_2` and projected
+    // `_0.1[1..3][_1]`, which selects index 2 of `_0.1`).
+    eval_lowered_statement(
+        &lower_statement(
+            &Statement::SetDiscriminant {
+                place: Place::from_local(2),
+                variant_index: 5,
+            },
+            &local_decls,
+            PW,
+        )
+        .unwrap(),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::Adt {
+            def_path: String::new(),
+            variant_idx: 5,
+            active_field: None,
+            fields: Vec::new(),
+        })
+    );
+
+    let subslice_unit_place = proj(
+        0,
+        vec![
+            field(1, unit_enum_arr_ty),
+            ProjectionElem::Subslice {
+                from: 1,
+                to: 3,
+                from_end: false,
+            },
+            ProjectionElem::Index(Local(1)),
+        ],
+    );
+    eval_lowered_statement(
+        &lower_statement(
+            &Statement::SetDiscriminant {
+                place: subslice_unit_place.clone(),
+                variant_index: 7,
+            },
+            &local_decls,
+            PW,
+        )
+        .unwrap(),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.read_place(&subslice_unit_place),
+        Ok(MirValue::Adt {
+            def_path: String::new(),
+            variant_idx: 7,
+            active_field: None,
+            fields: Vec::new(),
+        })
+    );
+
+    // 3. `SetDiscriminant` through an inactive union field returns `UnsupportedPlaceProjection`,
+    // and rejects a malformed active union field or malformed target `Adt` field count with
+    // `TypeMismatch`.
+    let inactive_union_enum = proj(
+        3,
+        vec![
+            field(1, Ty::Tuple(vec![unit_enum_ty.clone()])),
+            field(0, unit_enum_ty.clone()),
+        ],
+    );
+    state.slots[3] = LocalSlotState::Init(MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![u32v(42)],
+    });
+    assert_eq!(
+        eval_lowered_statement(
+            &LoweredStatement::SetDiscriminant {
+                place: inactive_union_enum.clone(),
+                place_ty: unit_enum_ty.clone(),
+                variant_index: 1,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::UnsupportedPlaceProjection(
+            inactive_union_enum.clone()
+        ))
+    );
+    state.slots[3] = LocalSlotState::Init(MirValue::Adt {
+        def_path: "U".into(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![MirValue::Bool(true)], // malformed active field 0 (declared u32)
+    });
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::SetDiscriminant {
+                place: inactive_union_enum,
+                place_ty: unit_enum_ty,
+                variant_index: 1,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    // Malformed `Adt` on `_4` (`BigEnum` expects 1 field, has 0 fields).
+    state.slots[4] = LocalSlotState::Init(MirValue::Adt {
+        def_path: "BigE".into(),
+        variant_idx: 0,
+        active_field: None,
+        fields: Vec::new(),
+    });
+    assert!(matches!(
+        eval_lowered_statement(
+            &LoweredStatement::SetDiscriminant {
+                place: Place::from_local(4),
+                place_ty: big_enum_ty,
+                variant_index: 2,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+}

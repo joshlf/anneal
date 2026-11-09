@@ -5370,6 +5370,434 @@ fn write_to_partial_slot(
     }
 }
 
+/// Updates the discriminant of a target `MirValue` inside an array window in place for
+/// `Statement::SetDiscriminant` in `O(proj.len())` time without cloning or scanning unselected
+/// elements.
+fn set_discriminant_array_window(
+    window: &mut [MirValue],
+    elem_ty: &Ty,
+    proj: &[ProjectionElem],
+    variant_index: usize,
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    full_place: &Place,
+) -> Result<(), RvalueEvalError> {
+    let Some((first, rest)) = proj.split_first() else {
+        return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
+    };
+    match first {
+        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
+            full_place.clone(),
+        )),
+        ProjectionElem::Index(idx_local) => {
+            let idx_bits = read_index(*idx_local)?;
+            let Ok(i) = usize::try_from(idx_bits) else {
+                return Err(RvalueEvalError::IndexOutOfBounds {
+                    index: idx_bits,
+                    len: window.len(),
+                });
+            };
+            let len = window.len();
+            let Some(elem_slot) = window.get_mut(i) else {
+                return Err(RvalueEvalError::IndexOutOfBounds {
+                    index: idx_bits,
+                    len,
+                });
+            };
+            if !mir_value_head_matches_ty(elem_slot, elem_ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Array element runtime type does not match elem_ty",
+                ));
+            }
+            set_discriminant_projected_mir_value(
+                elem_slot,
+                elem_ty,
+                rest,
+                variant_index,
+                read_index,
+                full_place,
+                None,
+            )
+        }
+        ProjectionElem::ConstantIndex {
+            offset,
+            min_length,
+            from_end,
+        } => {
+            let idx = resolve_constant_index(window.len(), *offset, *min_length, *from_end)?;
+            let elem_slot = &mut window[idx];
+            if !mir_value_head_matches_ty(elem_slot, elem_ty) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Array element runtime type does not match elem_ty",
+                ));
+            }
+            set_discriminant_projected_mir_value(
+                elem_slot,
+                elem_ty,
+                rest,
+                variant_index,
+                read_index,
+                full_place,
+                None,
+            )
+        }
+        ProjectionElem::Subslice {
+            from,
+            to,
+            from_end,
+        } => {
+            let (start, end) = resolve_subslice_range(window.len(), *from, *to, *from_end)?;
+            set_discriminant_array_window(
+                &mut window[start..end],
+                elem_ty,
+                rest,
+                variant_index,
+                read_index,
+                full_place,
+            )
+        }
+        ProjectionElem::Downcast(_) => {
+            if matches!(rest.first(), Some(ProjectionElem::Deref)) {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                ));
+            }
+            Err(RvalueEvalError::TypeMismatch(
+                "Downcast requires a non-union Adt or Tuple value",
+            ))
+        }
+        ProjectionElem::Field(..) => Err(RvalueEvalError::TypeMismatch(
+            "Field projection requires Tuple or Adt value",
+        )),
+    }
+}
+
+/// Updates the discriminant of the sub-value at `proj` inside `val` in place for
+/// `Statement::SetDiscriminant` in `O(proj.len())` time without cloning or scanning the target
+/// aggregate's fields.
+#[allow(clippy::too_many_arguments)]
+fn set_discriminant_projected_mir_value(
+    val: &mut MirValue,
+    declared_ty: &Ty,
+    proj: &[ProjectionElem],
+    variant_index: usize,
+    read_index: &impl Fn(Local) -> Result<u128, RvalueEvalError>,
+    full_place: &Place,
+    active_downcast: Option<usize>,
+) -> Result<(), RvalueEvalError> {
+    let Some((first, rest)) = proj.split_first() else {
+        if active_downcast.is_some() {
+            return Err(RvalueEvalError::TypeMismatch(
+                "SetDiscriminant target cannot end with Downcast",
+            ));
+        }
+        if !matches!(declared_ty, Ty::Tuple(_)) {
+            return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
+        }
+        return match val {
+            MirValue::Adt {
+                active_field: None, ..
+            } => {
+                if !mir_value_head_matches_ty(val, declared_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "SetDiscriminant target runtime value does not match declared type",
+                    ));
+                }
+                let MirValue::Adt { variant_idx, .. } = val else {
+                    unreachable!()
+                };
+                *variant_idx = variant_index;
+                Ok(())
+            }
+            MirValue::Tuple(_) => {
+                if !mir_value_head_matches_ty(val, declared_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "SetDiscriminant target runtime value does not match declared type",
+                    ));
+                }
+                let MirValue::Tuple(fields) = val else {
+                    unreachable!()
+                };
+                let moved = std::mem::take(fields);
+                *val = MirValue::Adt {
+                    def_path: String::new(),
+                    variant_idx: variant_index,
+                    active_field: None,
+                    fields: moved,
+                };
+                Ok(())
+            }
+            MirValue::Unit => {
+                if !mir_value_head_matches_ty(val, declared_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "SetDiscriminant target runtime value does not match declared type",
+                    ));
+                }
+                *val = MirValue::Adt {
+                    def_path: String::new(),
+                    variant_idx: variant_index,
+                    active_field: None,
+                    fields: Vec::new(),
+                };
+                Ok(())
+            }
+            _ => Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone())),
+        };
+    };
+
+    match first {
+        ProjectionElem::Deref => Err(RvalueEvalError::UnsupportedPlaceProjection(
+            full_place.clone(),
+        )),
+        ProjectionElem::Downcast(expected_variant) => {
+            if active_downcast.is_some() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "consecutive Downcast projections without Field",
+                ));
+            }
+            if matches!(rest.first(), Some(ProjectionElem::Deref)) {
+                return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                    full_place.clone(),
+                ));
+            }
+            if !matches!(rest.first(), Some(ProjectionElem::Field(..))) {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
+            }
+            match val {
+                MirValue::Adt {
+                    variant_idx,
+                    active_field: None,
+                    ..
+                } => {
+                    if *variant_idx != *expected_variant {
+                        return Err(RvalueEvalError::InactiveVariantProjection {
+                            expected: *expected_variant,
+                            actual: *variant_idx,
+                        });
+                    }
+                    set_discriminant_projected_mir_value(
+                        val,
+                        declared_ty,
+                        rest,
+                        variant_index,
+                        read_index,
+                        full_place,
+                        Some(*expected_variant),
+                    )
+                }
+                MirValue::Tuple(_) | MirValue::Unit => {
+                    if *expected_variant != 0 {
+                        return Err(RvalueEvalError::InactiveVariantProjection {
+                            expected: *expected_variant,
+                            actual: 0,
+                        });
+                    }
+                    set_discriminant_projected_mir_value(
+                        val,
+                        declared_ty,
+                        rest,
+                        variant_index,
+                        read_index,
+                        full_place,
+                        Some(0),
+                    )
+                }
+                _ => Err(RvalueEvalError::TypeMismatch(
+                    "Downcast requires a non-union Adt or Tuple value",
+                )),
+            }
+        }
+        ProjectionElem::Field(idx, expected_ty) => match val {
+            MirValue::Tuple(fields) => {
+                if let Some(v) = active_downcast {
+                    if v != 0 {
+                        return Err(RvalueEvalError::InactiveVariantProjection {
+                            expected: v,
+                            actual: 0,
+                        });
+                    }
+                }
+                let field_count = fields.len();
+                let Some(field_slot) = fields.get_mut(*idx) else {
+                    return Err(RvalueEvalError::FieldOutOfBounds {
+                        field_idx: *idx,
+                        field_count,
+                    });
+                };
+                if !mir_value_head_matches_ty(field_slot, expected_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "projected tuple field runtime type does not match expected type",
+                    ));
+                }
+                set_discriminant_projected_mir_value(
+                    field_slot,
+                    expected_ty,
+                    rest,
+                    variant_index,
+                    read_index,
+                    full_place,
+                    None,
+                )
+            }
+            MirValue::Unit => {
+                if let Some(v) = active_downcast {
+                    if v != 0 {
+                        return Err(RvalueEvalError::InactiveVariantProjection {
+                            expected: v,
+                            actual: 0,
+                        });
+                    }
+                }
+                Err(RvalueEvalError::FieldOutOfBounds {
+                    field_idx: *idx,
+                    field_count: 0,
+                })
+            }
+            MirValue::Adt {
+                variant_idx,
+                active_field: None,
+                fields,
+                ..
+            } => {
+                let expected_variant = active_downcast.unwrap_or(0);
+                if *variant_idx != expected_variant {
+                    return Err(RvalueEvalError::InactiveVariantProjection {
+                        expected: expected_variant,
+                        actual: *variant_idx,
+                    });
+                }
+                let field_count = fields.len();
+                let Some(field_slot) = fields.get_mut(*idx) else {
+                    return Err(RvalueEvalError::FieldOutOfBounds {
+                        field_idx: *idx,
+                        field_count,
+                    });
+                };
+                if !mir_value_head_matches_ty(field_slot, expected_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "projected ADT field runtime type does not match expected type",
+                    ));
+                }
+                set_discriminant_projected_mir_value(
+                    field_slot,
+                    expected_ty,
+                    rest,
+                    variant_index,
+                    read_index,
+                    full_place,
+                    None,
+                )
+            }
+            MirValue::Adt {
+                variant_idx,
+                active_field: Some(active),
+                fields,
+                ..
+            } => {
+                if active_downcast.is_some() || *variant_idx != 0 || fields.is_empty() {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "union ADT must have variant 0, at least one field, and cannot be downcast",
+                    ));
+                }
+                let active_val = if fields.len() == 1 {
+                    &fields[0]
+                } else {
+                    fields.get(*active).ok_or(RvalueEvalError::TypeMismatch(
+                        "union ADT active_field index out of bounds of fields",
+                    ))?
+                };
+                let Ty::Tuple(union_field_tys) = declared_ty else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "union ADT declared type must be Ty::Tuple",
+                    ));
+                };
+                let Some(active_ty) = union_field_tys.get(*active) else {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "union ADT active_field index out of bounds of declared fields",
+                    ));
+                };
+                if *idx >= union_field_tys.len() {
+                    return Err(RvalueEvalError::FieldOutOfBounds {
+                        field_idx: *idx,
+                        field_count: union_field_tys.len(),
+                    });
+                }
+                if union_field_tys[*idx] != *expected_ty {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "projected union field type does not match declared union field type",
+                    ));
+                }
+                if *active != *idx {
+                    if !mir_value_matches_ty(active_val, active_ty) {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "union ADT active field runtime value does not match declared type",
+                        ));
+                    }
+                    let leaf_ty = validate_projection_tail(
+                        expected_ty,
+                        rest,
+                        None,
+                        Some(read_index),
+                        full_place,
+                        None,
+                    )?;
+                    if !matches!(leaf_ty, Ty::Tuple(_)) {
+                        return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone()));
+                    }
+                    return Err(RvalueEvalError::UnsupportedPlaceProjection(
+                        full_place.clone(),
+                    ));
+                }
+                let active_slot = if fields.len() == 1 {
+                    &mut fields[0]
+                } else {
+                    &mut fields[*idx]
+                };
+                if !mir_value_head_matches_ty(active_slot, expected_ty) {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "projected union field runtime type does not match expected type",
+                    ));
+                }
+                set_discriminant_projected_mir_value(
+                    active_slot,
+                    expected_ty,
+                    rest,
+                    variant_index,
+                    read_index,
+                    full_place,
+                    None,
+                )
+            }
+            _ => Err(RvalueEvalError::TypeMismatch(
+                "Field projection requires Tuple or Adt value",
+            )),
+        },
+        ProjectionElem::Index(_)
+        | ProjectionElem::ConstantIndex { .. }
+        | ProjectionElem::Subslice { .. } => {
+            if active_downcast.is_some() {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Downcast projection must be followed by Field",
+                ));
+            }
+            let MirValue::Array { elements, elem_ty } = val else {
+                return Err(RvalueEvalError::TypeMismatch(
+                    "Array projection requires MirValue::Array",
+                ));
+            };
+            set_discriminant_array_window(
+                elements,
+                elem_ty,
+                proj,
+                variant_index,
+                read_index,
+                full_place,
+            )
+        }
+    }
+}
+
 /// Updates the discriminant of a target `FieldSlot` at `proj` for `Statement::SetDiscriminant`.
 #[allow(clippy::too_many_arguments)]
 fn set_discriminant_in_slot(
@@ -5383,6 +5811,22 @@ fn set_discriminant_in_slot(
     full_place: &Place,
     active_downcast: Option<usize>,
 ) -> Result<(), RvalueEvalError> {
+    if let FieldSlot::Init(existing_val) = slot {
+        if !mir_value_head_matches_ty(existing_val, declared_ty) {
+            return Err(RvalueEvalError::TypeMismatch(
+                "initialized slot runtime value does not match declared type",
+            ));
+        }
+        return set_discriminant_projected_mir_value(
+            existing_val,
+            declared_ty,
+            proj,
+            variant_index,
+            read_index,
+            full_place,
+            active_downcast,
+        );
+    }
     if proj.is_empty() {
         if active_downcast.is_some() {
             return Err(RvalueEvalError::TypeMismatch(
@@ -5410,77 +5854,8 @@ fn set_discriminant_in_slot(
                 }
                 Ok(())
             }
-            FieldSlot::Init(MirValue::Adt {
-                variant_idx,
-                active_field: None,
-                ..
-            }) => {
-                *variant_idx = variant_index;
-                Ok(())
-            }
-            FieldSlot::Init(MirValue::Tuple(fields)) => {
-                let moved = std::mem::take(fields);
-                *slot = FieldSlot::Init(MirValue::Adt {
-                    def_path: String::new(),
-                    variant_idx: variant_index,
-                    active_field: None,
-                    fields: moved,
-                });
-                Ok(())
-            }
-            FieldSlot::Init(_) => Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone())),
+            FieldSlot::Init(_) => unreachable!(),
         }
-    } else if let FieldSlot::Init(existing_val) = slot {
-        if matches!(proj.last(), Some(ProjectionElem::Downcast(_))) {
-            return Err(RvalueEvalError::TypeMismatch(
-                "SetDiscriminant target cannot end with Downcast",
-            ));
-        }
-        if !projected_value_matches_ty(existing_val, declared_ty, proj) {
-            return Err(RvalueEvalError::TypeMismatch(
-                "initialized slot runtime value does not match declared type",
-            ));
-        }
-        // Read the target sub-value, update its discriminant, and write it back.
-        let sub_val = read_projected_mir_value(
-            existing_val,
-            Some(declared_ty),
-            proj,
-            read_index,
-            ptr_width,
-            full_place,
-            active_downcast,
-        )?;
-        let updated_sub = match sub_val {
-            MirValue::Adt {
-                def_path,
-                active_field: None,
-                fields,
-                ..
-            } => MirValue::Adt {
-                def_path,
-                variant_idx: variant_index,
-                active_field: None,
-                fields,
-            },
-            MirValue::Tuple(fields) => MirValue::Adt {
-                def_path: String::new(),
-                variant_idx: variant_index,
-                active_field: None,
-                fields,
-            },
-            _ => return Err(RvalueEvalError::InvalidSetDiscriminant(full_place.clone())),
-        };
-        write_projected_mir_value(
-            existing_val,
-            Some(declared_ty),
-            proj,
-            updated_sub,
-            read_index,
-            ptr_width,
-            full_place,
-            active_downcast,
-        )
     } else if matches!(slot, FieldSlot::Uninit) {
         let leaf_ty = validate_projection_tail::<fn(Local) -> Result<u128, RvalueEvalError>>(
             declared_ty,
