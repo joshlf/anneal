@@ -2039,6 +2039,50 @@ def witnessOutOfOrderFieldsAndParenSpan : CapturedMir :=
          terminator := { span := ("proto.rs:11:2"), kind := .return_ }
          statements := [] }] }
 
+/--
+Raw-string lexer witness (`.fullMir`): `defPath` is the raw string literal
+`r#"proto"::raw"#` (an unescaped `"` inside), and a later `span` string contains
+the text `basicBlocks := []`. A lexer that treats `r#"..."#` as an ordinary string
+loses string polarity, exposes that `span` text as code, and would classify the
+body as an empty pure body; the real body ends in a `TerminatorKind.call`.
+-/
+def witnessRawStringDefPath : CapturedMir :=
+  { protoBase with
+    defPath := r#"proto"::raw"#
+    basicBlocks :=
+      [{ statements := []
+         terminator :=
+           { kind := .call
+               (.constant { ty := { kind := .fnDef "proto::callee" [], layoutIdx := 0 },
+                            val := .zeroSized })
+               [] { local_ := 0, projection := [] } (some 1) .continue_
+             span := " basicBlocks := [] fnAbi := " }
+         isCleanup := false },
+       { statements := []
+         terminator := { kind := .return_, span := "proto.rs:12:2" }
+         isCleanup := false }] }
+
+/--
+Named-argument witness (`.treeBorrowsLocal`): `.unevaluated (defPath := "..")`
+reuses the `CapturedMir` field name `defPath` inside `basicBlocks`; a scanner that
+ends the `basicBlocks` value at the first textual `defPath :=` would miss the
+later `ProjectionElem.deref` (the block lists `statements` last).
+-/
+def witnessNamedDefPathArg : CapturedMir :=
+  { protoBase with
+    defPath := "proto::witness_named_def_path_arg"
+    basicBlocks :=
+      [{ isCleanup := false
+         terminator := { kind := .return_, span := "proto.rs:13:1" }
+         statements :=
+           [{ kind := .assign { local_ := 0, projection := [] }
+                (.use (.constant { ty := { kind := .uint .u32, layoutIdx := 0 },
+                                   val := .unevaluated (defPath := "proto::C") }))
+              span := "proto.rs:13:2" },
+            { kind := .assign { local_ := 1, projection := [] }
+                (.use (.copy { local_ := 2, projection := [.deref] }))
+              span := "proto.rs:13:3" }] }] }
+
 theorem inferMinFragment_witnessPureLoopFree :
     inferMinFragment witnessPureLoopFree = .pureLoopFree := rfl
 
@@ -2074,6 +2118,12 @@ theorem inferMinFragment_witnessFullMirNoCall :
 
 theorem inferMinFragment_witnessOutOfOrderFieldsAndParenSpan :
     inferMinFragment witnessOutOfOrderFieldsAndParenSpan = .pureBoundedLoop := rfl
+
+theorem inferMinFragment_witnessRawStringDefPath :
+    inferMinFragment witnessRawStringDefPath = .fullMir := rfl
+
+theorem inferMinFragment_witnessNamedDefPathArg :
+    inferMinFragment witnessNamedDefPathArg = .treeBorrowsLocal := rfl
 
 theorem hasCfgBackedge_witnessPureLoopFree : hasCfgBackedge witnessPureLoopFree = false := rfl
 

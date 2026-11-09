@@ -2239,6 +2239,62 @@ fn bound_to_top_level_decl(decl_src: &str) -> &str {
     decl_src
 }
 
+/// `CapturedMir` structure field names (`Trusted.Rustc.V2026_06_01.MirAst.Body`).
+const CAPTURED_MIR_FIELDS: &[&str] = &[
+    "defPath", "phase", "role", "argCount", "localDecls", "basicBlocks", "fnAbi", "layouts",
+    "allocations", "typeParamCount", "genericParams", "traitImpls",
+];
+
+/// Return the extent of the `basicBlocks` field value that starts at
+/// `after_bb` (just past `basicBlocks :=`) in comment/string-stripped text.
+///
+/// The value ends at the first depth-0 `,`, the first unmatched closing
+/// bracket (the end of the enclosing `CapturedMir` literal), or a depth-0
+/// `<CapturedMir field> :=` (newline-separated fields). Returns `None` when the
+/// value is empty, brackets are mismatched, or the text ends while a bracket is
+/// still open (e.g. a declaration truncated by `bound_to_top_level_decl`).
+fn basic_blocks_value_extent(after_bb: &str) -> Option<&str> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut end = after_bb.len();
+    let mut prev: Option<char> = None;
+    for (idx, ch) in after_bb.char_indices() {
+        match ch {
+            '(' | '[' | '{' => stack.push(ch),
+            ')' | ']' | '}' => {
+                let Some(open) = stack.pop() else {
+                    end = idx;
+                    break;
+                };
+                if !matches!((open, ch), ('(', ')') | ('[', ']') | ('{', '}')) {
+                    return None;
+                }
+            }
+            ',' if stack.is_empty() => {
+                end = idx;
+                break;
+            }
+            _ if stack.is_empty()
+                && !prev.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                && CAPTURED_MIR_FIELDS.iter().any(|field| {
+                    after_bb[idx..]
+                        .strip_prefix(field)
+                        .is_some_and(|rest| rest.trim_start().starts_with(":="))
+                }) =>
+            {
+                end = idx;
+                break;
+            }
+            _ => {}
+        }
+        prev = Some(ch);
+    }
+    if end == after_bb.len() && !stack.is_empty() {
+        return None;
+    }
+    let value = &after_bb[..end];
+    (!value.trim().is_empty()).then_some(value)
+}
+
 fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
     let clean = strip_lean_comments_and_strings(mir_src);
     let body_clean = if let Some(idx) = clean.find("def body : CapturedMir") {
@@ -2288,24 +2344,12 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
         ""
     };
     let after_bb = &body_clean[bb + "basicBlocks :=".len()..];
-    let end_idx = [
-        "defPath :=",
-        "phase :=",
-        "role :=",
-        "argCount :=",
-        "localDecls :=",
-        "fnAbi :=",
-        "layouts :=",
-        "allocations :=",
-        "typeParamCount :=",
-        "genericParams :=",
-        "traitImpls :=",
-    ]
-    .iter()
-    .filter_map(|kw| after_bb.find(kw))
-    .min()
-    .unwrap_or(after_bb.len());
-    let blocks_slice = &after_bb[..end_idx];
+    // Delimit the `basicBlocks` value by bracket structure rather than by the
+    // first textual `<field> :=`, so named constructor arguments that reuse a
+    // `CapturedMir` field name (`.unevaluated (defPath := ..)`) cannot truncate
+    // the scan, and a truncated / unbalanced literal fails closed.
+    let blocks_value = basic_blocks_value_extent(after_bb);
+    let blocks_slice = blocks_value.unwrap_or(after_bb);
 
     let norm_decls = normalize_parens_and_ws(local_decls_slice);
     let norm_blocks = normalize_parens_and_ws(blocks_slice);
@@ -2313,8 +2357,11 @@ fn scan_captured_mir_body(mir_src: &str) -> MirBodyScan {
 
     let (basic_block_count, has_cfg_back_edge, malformed_blocks_reason) =
         detect_blocks_and_back_edges(blocks_slice, &block_toks);
-    let unscannable_token =
-        first_unscannable_block_token(&block_toks).or(malformed_blocks_reason);
+    let unscannable_token = blocks_value
+        .is_none()
+        .then(|| "unbalanced, truncated, or empty basicBlocks literal".to_string())
+        .or_else(|| first_unscannable_block_token(&block_toks))
+        .or(malformed_blocks_reason);
     let has_unscannable_syntax = unscannable_token.is_some();
 
     let has_deref_projection = has_ast_ctor(&norm_blocks, "ProjectionElem", "deref");
@@ -2516,7 +2563,41 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
             continue;
         }
 
+        // Guillemet-quoted identifiers (`«...»`) are opaque: their contents may
+        // contain `"`, `--`, or `/-` without starting a string or comment.
+        if src[i..].starts_with('«') {
+            let end = src[i..].find('»').map_or(src.len(), |p| i + p + '»'.len_utf8());
+            out.push_str(&src[i..end]);
+            i = end;
+            prev_ch = Some('»');
+            continue;
+        }
+
+        // Raw string literals (`r"..."`, `r#"..."#`) have no escapes and may
+        // contain unescaped `"` (e.g. `r#"a"b"#`), so they need their own
+        // delimiter matching to keep string polarity aligned.
+        if let Some(end) = lean_raw_string_end(bytes, i, prev_ch) {
+            out.push_str("\"\"");
+            i = end;
+            prev_ch = None;
+            continue;
+        }
+
         if bytes[i] == b'"' {
+            if prev_ch == Some('!') {
+                // Interpolated string (`s!"..{term}.."`, `m!"..."`): the `{..}`
+                // interpolations may nest string literals and braces. The whole
+                // literal (including its `s!` prefix) only produces a `String`
+                // value, so it is replaced by `""` like any other string.
+                out.pop();
+                while out.ends_with(|c: char| crate::agent::is_lean_ident_char(c) || c == '.') {
+                    out.pop();
+                }
+                i = lean_interpolated_string_end(bytes, i);
+                out.push_str("\"\"");
+                prev_ch = None;
+                continue;
+            }
             in_str = true;
             i += 1;
             prev_ch = None;
@@ -2554,6 +2635,94 @@ fn strip_lean_comments_and_strings(src: &str) -> String {
         }
     }
     out
+}
+
+/// If `bytes[i..]` starts a Lean raw string literal (`r"..."`, `r#"..."#`,
+/// `r##"..."##`, ...) that is not part of a longer identifier, return the byte
+/// index just past its closing delimiter (or `bytes.len()` if unterminated).
+fn lean_raw_string_end(bytes: &[u8], i: usize, prev_ch: Option<char>) -> Option<usize> {
+    if bytes.get(i) != Some(&b'r')
+        || prev_ch.is_some_and(|c| crate::agent::is_lean_ident_char(c) || matches!(c, '.' | '!' | '?'))
+    {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut hashes = 0usize;
+    while bytes.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() {
+        if bytes[j] == b'"' && bytes.get(j + 1..j + 1 + hashes).is_some_and(|h| h.iter().all(|&b| b == b'#')) {
+            return Some(j + 1 + hashes);
+        }
+        j += 1;
+    }
+    Some(bytes.len())
+}
+
+/// Return the byte index just past a plain Lean string literal whose opening
+/// quote is at `bytes[i]` (honouring `\` escapes).
+fn lean_plain_string_end(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Return the byte index just past a Lean interpolated string literal
+/// (`s!"..."`) whose opening quote is at `bytes[i]`, skipping `{..}`
+/// interpolations that may themselves contain strings and braces.
+fn lean_interpolated_string_end(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return j + 1,
+            b'{' => j = lean_interpolation_end(bytes, j + 1),
+            _ => j += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Skip Lean term syntax inside an interpolation starting at `bytes[j]` (just
+/// past `{`), returning the byte index just past the matching `}`.
+fn lean_interpolation_end(bytes: &[u8], mut j: usize) -> usize {
+    let mut depth = 0usize;
+    while j < bytes.len() {
+        let prev = (j > 0 && bytes[j - 1].is_ascii()).then(|| bytes[j - 1] as char);
+        if let Some(end) = lean_raw_string_end(bytes, j, prev) {
+            j = end;
+            continue;
+        }
+        match bytes[j] {
+            b'{' => {
+                depth += 1;
+                j += 1;
+            }
+            b'}' => {
+                if depth == 0 {
+                    return j + 1;
+                }
+                depth -= 1;
+                j += 1;
+            }
+            b'"' if prev == Some('!') => j = lean_interpolated_string_end(bytes, j),
+            b'"' => j = lean_plain_string_end(bytes, j),
+            _ => j += 1,
+        }
+    }
+    bytes.len()
 }
 
 fn normalize_parens_and_ws(src: &str) -> String {
@@ -2673,6 +2842,11 @@ const MIR_BLOCK_FIELD_VOCAB: &[&str] = &[
     "end_",
     "ty",
     "val",
+    // String-valued named constructor argument (`ConstValue.unevaluated`,
+    // `Rvalue.threadLocalRef`, `AggregateKind.adt`, `RigidTy.fnDef`, ...): its
+    // value is a (stripped) string literal, it feeds no positional detector, and
+    // `basic_blocks_value_extent` ignores it at bracket depth > 0.
+    "defPath",
 ];
 
 /// Validate that a namespace qualifier `qual` (the prefix before `.ctor`) is a
@@ -5196,6 +5370,76 @@ def body : CapturedMir :=
         assert_eq!(MirLiftingProfile::default().inferred_fragment, MirFragment::FullMir);
         assert!(" pure_loop_free".parse::<MirFragment>().is_err());
         assert!("pure_loop_free\n".parse::<MirFragment>().is_err());
+    }
+
+    /// B2 lexer & truncation traps. Each body's Lean ground truth was
+    /// established with `#eval Anneal.MirFragmentPrototype.inferMinFragment`
+    /// (see `PROTOTYPE_REPORT.md`, Finding 11); A1's scanner classified the
+    /// first four `pure_loop_free` (fail-open).
+    #[test]
+    fn mir_fragment_scanner_resists_lexer_and_truncation_traps() {
+        let call_block = "{ statements := [], terminator := { kind := .call (.constant { ty := { kind := .fnDef \"f\" [], layoutIdx := 0 }, val := .zeroSized }) [] { local_ := 0, projection := [] } (some 1) .continue_, span := \" basicBlocks := [] fnAbi := \" }, isCleanup := false }";
+        let ret_block = "{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }";
+        let body_with = |prefix: &str, def_path: &str| {
+            format!(
+                "import Trusted\n{prefix}def body : CapturedMir := {{\n  defPath := {def_path},\n  phase := .runtimePostCleanup,\n  role := .subject,\n  argCount := 0,\n  localDecls := [],\n  basicBlocks := [{call_block}, {ret_block}],\n  fnAbi := abi,\n  layouts := emptyLayoutTable,\n  allocations := []\n}}\n"
+            )
+        };
+        // 1-3. String-polarity traps before `basicBlocks`: a raw string with an
+        //      unescaped quote, an interpolated string nesting an escaped quote,
+        //      and a guillemet identifier containing `"`, `--`, and `/-`. Each
+        //      must keep lexing aligned so the real `TerminatorKind.call` is seen
+        //      (Lean: `full_mir`) instead of the `span` text `basicBlocks := []`.
+        for (label, src) in [
+            ("raw string", body_with("", "r#\"demo\"x\"#")),
+            ("interpolated string", body_with("", "s!\"demo{\"\\\"\"}x\"")),
+            ("guillemet identifier", body_with("def «weird\"name -- /-» : Nat := 0\n", "\"demo\"")),
+        ] {
+            let scan = scan_captured_mir_body(&src);
+            let class = classify_mir_fragment(&src);
+            assert!(scan.has_body && !scan.has_unscannable_syntax, "{label}: {class:?}");
+            assert_eq!(scan.basic_block_count, 2, "{label}");
+            assert_eq!(class.inferred_fragment, MirFragment::FullMir, "{label}: {class:?}");
+            assert!(
+                class.escalation_reasons.iter().any(|r| r == "TerminatorKind.call"),
+                "{label}: the call must be scanned, not hidden: {class:?}"
+            );
+        }
+
+        // 4-5. Term-level `open .. in` / `set_option .. in` lines inside the body
+        //      (Lean: `full_mir` / `pure_bounded_loop`). `bound_to_top_level_decl`
+        //      may truncate there, so the bracket-aware value extent must fail
+        //      closed instead of scanning an empty or partial block list.
+        let open_in = format!("def body : CapturedMir := {{\n  basicBlocks :=\n    open TerminatorKind in\n    [{call_block}]\n}}\n");
+        let set_option_in = format!("def body : CapturedMir := {{\n  basicBlocks := [\n    {{ statements := [], terminator := {{ kind := .goto 1, span := \"\" }}, isCleanup := false }},\n    set_option maxRecDepth 2000 in\n    {{ statements := [], terminator := {{ kind := .goto 1, span := \"\" }}, isCleanup := false }}\n  ]\n}}\n");
+        for (label, src) in [("open .. in", open_in), ("set_option .. in", set_option_in)] {
+            let class = classify_mir_fragment(&src);
+            assert_eq!(class.inferred_fragment, MirFragment::FullMir, "{label}: {class:?}");
+            assert!(scan_captured_mir_body(&src).has_cfg_back_edge, "{label}");
+        }
+
+        // 6. A named argument reusing a `CapturedMir` field name must not end
+        //    the `basicBlocks` value early (Lean: `tree_borrows_local`).
+        let named = lean_witness_def("witnessNamedDefPathArg");
+        let class = classify_mir_fragment(named);
+        assert_eq!(class.inferred_fragment, MirFragment::TreeBorrowsLocal, "{class:?}");
+        assert_eq!(class.escalation_reasons, vec!["ProjectionElem.deref".to_string()]);
+
+        // 7. Unbalanced or empty `basicBlocks` values fail closed.
+        for src in [
+            "def body : CapturedMir := { basicBlocks := [{ statements := [], terminator := { kind := .return_, span := \"\" }, isCleanup := false }",
+            "def body : CapturedMir := { basicBlocks := }",
+            "def body : CapturedMir := { basicBlocks := [{ statements := [), terminator := { kind := .return_, span := \"\" }, isCleanup := false }] }",
+        ] {
+            let class = classify_mir_fragment(src);
+            assert_eq!(class.inferred_fragment, MirFragment::FullMir, "{src}: {class:?}");
+        }
+        assert_eq!(basic_blocks_value_extent(" [] }"), Some(" [] "));
+        assert_eq!(basic_blocks_value_extent(" (List.cons a List.nil),\n fnAbi := x"), Some(" (List.cons a List.nil)"));
+        assert_eq!(basic_blocks_value_extent(" [a]\n  fnAbi := x"), Some(" [a]\n  "));
+        assert_eq!(basic_blocks_value_extent(" [f (defPath := \"\")]\n  fnAbi := x"), Some(" [f (defPath := \"\")]\n  "));
+        assert_eq!(basic_blocks_value_extent(" [a"), None);
+        assert_eq!(basic_blocks_value_extent("  \n "), None);
     }
 
     /// Differential Lean <-> Rust parity harness (opt-in, `#[ignore]`).
