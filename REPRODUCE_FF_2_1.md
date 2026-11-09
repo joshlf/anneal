@@ -4,7 +4,7 @@ This guide contains the step-by-step instructions for an independent adversary (
 
 ## Prerequisites
 
-1. Access to the Anneal workspace (`/usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-1`).
+1. Access to the Anneal workspace (`<path/to/anneal>`).
 2. Elan and Lean 4 installed in the standard environment.
 3. Access to `anneal-lean-run` wrapper (to prevent OOM/slowdowns during multi-worktree execution).
 
@@ -14,7 +14,7 @@ This guide contains the step-by-step instructions for an independent adversary (
    Open a terminal and set your PATH so that Elan and Cargo are prioritized:
    ```bash
    export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
-   cd /usr/local/google/Projects/anneal-workspace/anneal-wt-ff-2-1
+   cd <path/to/anneal>
    ```
 
 2. **Run Quick Code Quality Audits**
@@ -57,4 +57,4 @@ This guide contains the step-by-step instructions for an independent adversary (
 - The multi-block `pureAdtMultiBlockBody` witness discharges a `StatefulVerificationResult` strictly via structural equality on `mem₀` across blocks, without constructing memory maps or provenance.
 
 ## Audit Notes
-- `[diversity-reduced]`: This unit was evaluated under reduced model diversity (pinned to `gemini-pro-coordinator` / `gemini-3.1-pro-high`) due to quota constraints.
+- `[diversity-reduced]`: This unit was evaluated under reduced model diversity (pinned to `supervisor-model-primary` / `supervisor-model-fallback`) due to quota constraints.

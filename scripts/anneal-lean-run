@@ -35,7 +35,7 @@ Why this wrapper exists:
   from falsely throttling concurrent builds while still throttling when genuine
   anonymous working-set pressure rises.
 - Pre-export bundle verification (`--verify-bundle-ff` / `--check-unstable-ff`)
-  guards shared integration refs (`refs/heads/unstable`) in x20 Git bundles
+  guards shared integration refs (`refs/heads/unstable`) in remote Git bundles
   against accidental non-fast-forward rollbacks.
 """
 
@@ -59,8 +59,8 @@ from typing import Any, Iterator
 sys.dont_write_bytecode = True
 
 MIB = 1024 * 1024
-X20_FUSE_PREFIXES: tuple[str, ...] = ("/google/data/rw/", "/google/data/ro/")
-X20_URI_PREFIX = "/x20/"
+REMOTE_FUSE_PREFIXES: tuple[str, ...] = ("/mnt/fuse/rw/", "/mnt/fuse/ro/")
+REMOTE_URI_PREFIX = "/remote/"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -843,8 +843,8 @@ def run_bounded_command(
     return rc
 
 
-def is_x20_path(bundle_path: str | Path) -> bool:
-    """Returns True if `bundle_path` is an `/x20/` URI or `/google/data/r{w,o}/` path."""
+def is_remote_path(bundle_path: str | Path) -> bool:
+    """Returns True if `bundle_path` is an `/remote/` URI or `/mnt/fuse/r{w,o}/` path."""
     s = str(bundle_path).strip()
     if not s.startswith("/"):
         return False
@@ -852,30 +852,30 @@ def is_x20_path(bundle_path: str | Path) -> bool:
     if norm.startswith("//"):
         norm = "/" + norm.lstrip("/")
     return (
-        norm == "/x20"
-        or norm.startswith(X20_URI_PREFIX)
+        norm == "/remote"
+        or norm.startswith(REMOTE_URI_PREFIX)
         or any(
             norm == p.rstrip("/") or norm.startswith(p)
-            for p in X20_FUSE_PREFIXES
+            for p in REMOTE_FUSE_PREFIXES
         )
     )
 
 
-def to_x20_uri(bundle_path: str | Path) -> str:
-    """Translates `/google/data/r{w,o}/...` FUSE paths to normalized `/x20/...` URIs."""
+def to_remote_uri(bundle_path: str | Path) -> str:
+    """Translates `/mnt/fuse/r{w,o}/...` FUSE paths to normalized `/remote/...` URIs."""
     s = str(bundle_path).strip()
     if not s:
         return s
-    if is_x20_path(s):
+    if is_remote_path(s):
         norm = posixpath.normpath(s)
         if norm.startswith("//"):
             norm = "/" + norm.lstrip("/")
-        for prefix in X20_FUSE_PREFIXES:
+        for prefix in REMOTE_FUSE_PREFIXES:
             base = prefix.rstrip("/")
             if norm == base:
-                return "/x20"
+                return "/remote"
             if norm.startswith(prefix):
-                return posixpath.normpath(X20_URI_PREFIX + norm[len(prefix) :])
+                return posixpath.normpath(REMOTE_URI_PREFIX + norm[len(prefix) :])
         return norm
     return s
 
@@ -895,7 +895,7 @@ def normalize_git_ref(ref: str) -> str:
 # Repository-location variables that Git exports to hooks and aliases (see
 # `git rev-parse --local-env-vars` and githooks(5)). They are scrubbed from
 # every `git` subprocess so that `--repo-dir` stays authoritative even when this
-# guard runs inside a `pre-push` hook or `git x20-push` alias, where an inherited
+# guard runs inside a `pre-push` hook or `git bundle-push` alias, where an inherited
 # `GIT_DIR` / `GIT_INDEX_FILE` would otherwise silently redirect the ancestry
 # check, dirty-worktree check, and ref update to a different repository/index.
 _GIT_LOCAL_ENV_VARS: tuple[str, ...] = (
@@ -945,11 +945,11 @@ def _run_git(
         )
 
 
-FILEUTIL_CP_TIMEOUT_SEC = 300.0
-FILEUTIL_STAT_TIMEOUT_SEC = 60.0
+REMOTE_SYNC_CP_TIMEOUT_SEC = 300.0
+REMOTE_SYNC_STAT_TIMEOUT_SEC = 60.0
 
-# Any of these in `fileutil` output vetoes a "not found" classification.
-_X20_FATAL_ERROR_MARKERS: tuple[str, ...] = (
+# Any of these in `remote_sync` output vetoes a "not found" classification.
+_REMOTE_FATAL_ERROR_MARKERS: tuple[str, ...] = (
     "permission_denied",
     "permission denied",
     "deadline_exceeded",
@@ -962,12 +962,12 @@ _X20_FATAL_ERROR_MARKERS: tuple[str, ...] = (
 )
 
 
-def _is_x20_remote_not_found(output: str, x20_uri: str) -> bool:
-    """Returns True only for an x20 server-side NOT_FOUND that names `x20_uri`.
+def _is_remote_not_found(output: str, remote_uri: str) -> bool:
+    """Returns True only for an remote server-side NOT_FOUND that names `remote_uri`.
 
-    Real `fileutil` failures look like:
-      remote missing: `generic::not_found: /x20/<p>: File not found: /<p>
-                       [storage_x20.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }`
+    Real `remote_sync` failures look like:
+      remote missing: `generic::not_found: /remote/<p>: File not found: /<p>
+                       [storage_remote.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }`
       local failure : `generic::not_found: open failed for /tmp/<staged>:
                        No such file or directory`
     Generic "not found" / ENOENT text (e.g. a vanished local staging directory,
@@ -975,41 +975,41 @@ def _is_x20_remote_not_found(output: str, x20_uri: str) -> bool:
     bundle, because `no_remote_bundle` is a fail-open (`ok = True`) verdict.
     """
     lower = output.lower()
-    uri = x20_uri.strip().rstrip("/").lower()
-    if not uri.startswith("/x20/") or len(uri) <= len("/x20/"):
+    uri = remote_uri.strip().rstrip("/").lower()
+    if not uri.startswith("/remote/") or len(uri) <= len("/remote/"):
         return False
-    # `fileutil` echoes the URI (and its `/x20`-relative form) back in its
+    # `remote_sync` echoes the URI (and its `/remote`-relative form) back in its
     # messages; drop those echoes before looking for veto markers or protocol
     # tokens so that a path merely *named* e.g. `.../unavailable/...` or
-    # `.../storage_x20/no_such_file_or_directory/...` cannot misclassify errors.
-    rel = uri[len("/x20") :]
+    # `.../storage_remote/no_such_file_or_directory/...` cannot misclassify errors.
+    rel = uri[len("/remote") :]
     scrubbed = lower.replace(uri, " ").replace(rel, " ")
-    if any(marker in scrubbed for marker in _X20_FATAL_ERROR_MARKERS):
+    if any(marker in scrubbed for marker in _REMOTE_FATAL_ERROR_MARKERS):
         return False
     if f"not_found: {uri}:" in lower:
         return True
     return (
-        "storage_x20" in scrubbed
+        "storage_remote" in scrubbed
         and "no_such_file_or_directory" in scrubbed
         and uri in lower
     )
 
 
-def _x20_stat_exists(
-    fileutil_bin: str, x20_uri: str
+def _remote_stat_exists(
+    remote_sync_bin: str, remote_uri: str
 ) -> tuple[bool | None, str]:
-    """Independently probes `x20_uri` via `fileutil stat` (no local writes).
+    """Independently probes `remote_uri` via `remote_sync stat` (no local writes).
 
     Returns `(True, ...)` if the remote file exists, `(False, ...)` only for a
-    confirmed x20 NOT_FOUND naming `x20_uri`, and `(None, detail)` otherwise.
+    confirmed remote NOT_FOUND naming `remote_uri`, and `(None, detail)` otherwise.
     """
     try:
         res = subprocess.run(
             [
-                fileutil_bin,
-                "--x20_force_client_creation_at_head",
+                remote_sync_bin,
+                "--force_client_creation_at_head",
                 "stat",
-                x20_uri,
+                remote_uri,
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -1017,40 +1017,40 @@ def _x20_stat_exists(
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=FILEUTIL_STAT_TIMEOUT_SEC,
+            timeout=REMOTE_SYNC_STAT_TIMEOUT_SEC,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed on any error
-        return (None, f"fileutil stat could not run: {exc}")
+        return (None, f"remote_sync stat could not run: {exc}")
     if res.returncode == 0:
-        return (True, "fileutil stat reports the remote bundle exists")
+        return (True, "remote_sync stat reports the remote bundle exists")
     combined = f"{res.stderr}\n{res.stdout}"
-    if _is_x20_remote_not_found(combined, x20_uri):
-        return (False, "fileutil stat confirms the remote bundle does not exist")
+    if _is_remote_not_found(combined, remote_uri):
+        return (False, "remote_sync stat confirms the remote bundle does not exist")
     detail = res.stderr.strip() or res.stdout.strip() or f"exit code {res.returncode}"
-    return (None, f"fileutil stat failed: {detail}")
+    return (None, f"remote_sync stat failed: {detail}")
 
 
-def _x20_source_for(raw_str: str) -> str | None:
-    """Returns the x20 path to stage via `fileutil`, or None for plain local files.
+def _remote_source_for(raw_str: str) -> str | None:
+    """Returns the remote path to stage via `remote_sync`, or None for plain local files.
 
-    Besides literal `/x20/` URIs and `/google/data/r{w,o}/` paths, this also
-    catches local symlinks (e.g. `~/x20 -> /google/data/rw/users/...` or
-    `~/bundle.bundle -> /x20/teams/...`) whose target lives on x20 or the
-    `x20fsd` FUSE mount, so their contents are never read through FUSE's stale
+    Besides literal `/remote/` URIs and `/mnt/fuse/r{w,o}/` paths, this also
+    catches local symlinks (e.g. `~/remote -> /mnt/fuse/rw/users/...` or
+    `~/bundle.bundle -> /remote/teams/...`) whose target lives on remote or the
+    `remotefsd` FUSE mount, so their contents are never read through FUSE's stale
     cached `st_size`.
     """
-    if is_x20_path(raw_str):
+    if is_remote_path(raw_str):
         return raw_str
     try:
         cur = Path(raw_str)
         for _ in range(40):
             cur_str = str(cur)
-            if is_x20_path(cur_str):
+            if is_remote_path(cur_str):
                 return cur_str
             if not cur.is_symlink():
                 break
             target = os.readlink(cur)
-            if is_x20_path(target):
+            if is_remote_path(target):
                 return target
             cur = Path(
                 os.path.normpath(os.path.join(os.path.dirname(cur_str), target))
@@ -1058,15 +1058,15 @@ def _x20_source_for(raw_str: str) -> str | None:
         real = os.path.realpath(raw_str)
     except (OSError, ValueError):
         return None
-    return real if is_x20_path(real) else None
+    return real if is_remote_path(real) else None
 
 
 @contextmanager
 def stage_bundle_for_verification(
     bundle_path: str | Path,
-    fileutil_bin: str | None = None,
+    remote_sync_bin: str | None = None,
 ) -> Iterator[tuple[str, Path | None, str | None]]:
-    """Safely stages a local or x20 bundle for inspection, cleaning up temporary files.
+    """Safely stages a local or remote bundle for inspection, cleaning up temporary files.
 
     Yields exactly once: `("staged", path, None)`, `("no_remote_bundle", None,
     None)`, or `("bundle_error", None, detail)`.
@@ -1076,21 +1076,21 @@ def stage_bundle_for_verification(
         yield ("bundle_error", None, "Empty bundle path")
         return
 
-    x20_source = _x20_source_for(raw_str)
-    if x20_source is not None:
-        x20_uri = to_x20_uri(x20_source)
-        eff_fileutil = fileutil_bin
-        if eff_fileutil is None:
-            eff_fileutil = (
-                "/usr/bin/fileutil"
-                if Path("/usr/bin/fileutil").is_file()
-                else shutil.which("fileutil")
+    remote_source = _remote_source_for(raw_str)
+    if remote_source is not None:
+        remote_uri = to_remote_uri(remote_source)
+        eff_remote_sync = remote_sync_bin
+        if eff_remote_sync is None:
+            eff_remote_sync = (
+                "/usr/bin/remote-sync"
+                if Path("/usr/bin/remote-sync").is_file()
+                else shutil.which("remote-sync")
             )
-        if not eff_fileutil:
+        if not eff_remote_sync:
             yield (
                 "bundle_error",
                 None,
-                f"fileutil is required to stage x20 bundle {x20_uri} safely without FUSE",
+                f"remote_sync is required to stage remote bundle {remote_uri} safely without FUSE",
             )
             return
 
@@ -1100,7 +1100,7 @@ def stage_bundle_for_verification(
             yield (
                 "bundle_error",
                 None,
-                f"Cannot create a local staging directory for {x20_uri}: {exc}",
+                f"Cannot create a local staging directory for {remote_uri}: {exc}",
             )
             return
         try:
@@ -1111,11 +1111,11 @@ def stage_bundle_for_verification(
             try:
                 res = subprocess.run(
                     [
-                        eff_fileutil,
-                        "--x20_force_client_creation_at_head",
+                        eff_remote_sync,
+                        "--force_client_creation_at_head",
                         "cp",
                         "-f",
-                        x20_uri,
+                        remote_uri,
                         str(staged_file),
                     ],
                     stdin=subprocess.DEVNULL,
@@ -1124,11 +1124,11 @@ def stage_bundle_for_verification(
                     encoding="utf-8",
                     errors="replace",
                     check=False,
-                    timeout=FILEUTIL_CP_TIMEOUT_SEC,
+                    timeout=REMOTE_SYNC_CP_TIMEOUT_SEC,
                 )
             except Exception as exc:  # noqa: BLE001 - fail closed on any error
                 res = None
-                detail_msg = f"Failed executing fileutil for {x20_uri}: {exc}"
+                detail_msg = f"Failed executing remote_sync for {remote_uri}: {exc}"
 
             if res is not None and res.returncode != 0:
                 combined = f"{res.stderr}\n{res.stdout}"
@@ -1137,20 +1137,20 @@ def stage_bundle_for_verification(
                     or res.stdout.strip()
                     or f"exit code {res.returncode}"
                 )
-                if _is_x20_remote_not_found(combined, x20_uri):
-                    # Double-check with an independent `fileutil stat` before
+                if _is_remote_not_found(combined, remote_uri):
+                    # Double-check with an independent `remote_sync stat` before
                     # emitting the fail-open `no_remote_bundle` verdict.
-                    exists, stat_detail = _x20_stat_exists(eff_fileutil, x20_uri)
+                    exists, stat_detail = _remote_stat_exists(eff_remote_sync, remote_uri)
                     if exists is False:
                         status = "no_remote_bundle"
                     else:
                         detail_msg = (
-                            f"fileutil cp reported {x20_uri} as missing but the "
+                            f"remote_sync cp reported {remote_uri} as missing but the "
                             f"existence re-check disagreed ({stat_detail}); "
                             f"cp error: {cp_detail}"
                         )
                 else:
-                    detail_msg = f"fileutil cp failed for {x20_uri}: {cp_detail}"
+                    detail_msg = f"remote_sync cp failed for {remote_uri}: {cp_detail}"
             elif res is not None:
                 try:
                     size = (
@@ -1158,11 +1158,11 @@ def stage_bundle_for_verification(
                     )
                 except OSError as exc:
                     size = 0
-                    detail_msg = f"Cannot stat staged bundle from {x20_uri}: {exc}"
+                    detail_msg = f"Cannot stat staged bundle from {remote_uri}: {exc}"
                 if size > 0:
                     status, staged = "staged", staged_file
                 elif detail_msg is None:
-                    detail_msg = f"Staged bundle from {x20_uri} is missing or empty"
+                    detail_msg = f"Staged bundle from {remote_uri} is missing or empty"
 
             yield (status, staged, None if status != "bundle_error" else detail_msg)
         finally:
@@ -1245,7 +1245,7 @@ def parse_bundle_heads(
             )
         # `git bundle list-heads` happily prints a header that names the same
         # ref twice with different tips (`git bundle create` never writes one).
-        # Which tip a later `git fetch` / `git x20-pull` honors is ambiguous,
+        # Which tip a later `git fetch` / `git bundle-pull` honors is ambiguous,
         # so treat such a bundle as corrupt instead of silently keeping one.
         prior = heads.get(ref_name)
         if prior is not None and prior != sha:
@@ -1510,7 +1510,7 @@ def verify_bundle_ff(
     repo_dir: str | Path = ".",
     local_rev: str | None = None,
     sync_if_behind: bool = False,
-    fileutil_bin: str | None = None,
+    remote_sync_bin: str | None = None,
 ) -> dict[str, Any]:
     """Verifies that local `ref` (or `local_rev`) is a fast-forward descendant of `bundle_path`."""
     bundle_str = str(bundle_path)
@@ -1564,7 +1564,7 @@ def verify_bundle_ff(
         local_tip = None
 
     with stage_bundle_for_verification(
-        bundle_path, fileutil_bin=fileutil_bin
+        bundle_path, remote_sync_bin=remote_sync_bin
     ) as (stage_status, staged_path, stage_err):
         if stage_status == "no_remote_bundle":
             return _verdict(
@@ -1638,7 +1638,7 @@ def verify_bundle_ff(
                     message=(
                         f"{reason} while remote bundle {bundle_str} has "
                         f"{normalized_ref} at {remote_tip}. Remediation: run "
-                        "`git x20-pull` or pass `--sync-if-behind` before exporting."
+                        "`git bundle-pull` or pass `--sync-if-behind` before exporting."
                     ),
                 )
 
@@ -1748,7 +1748,7 @@ def verify_bundle_ff(
                         f"Remote bundle {bundle_str} has {normalized_ref} at "
                         f"{remote_tip}, which is not present in local repository "
                         f"{repo_path} (local tip: {local_tip}). Remediation: run "
-                        "`git x20-pull` or pass `--sync-if-behind` before exporting."
+                        "`git bundle-pull` or pass `--sync-if-behind` before exporting."
                     ),
                 )
 
@@ -1816,7 +1816,7 @@ def verify_bundle_ff(
                 message=(
                     f"Local {local_label} ({local_tip}) has diverged from "
                     f"remote bundle {bundle_str} tip ({remote_tip}); neither is "
-                    "an ancestor of the other. Remediation: run `git x20-pull` "
+                    "an ancestor of the other. Remediation: run `git bundle-pull` "
                     f"and rebase or merge {normalized_ref} before exporting."
                 ),
             )
@@ -1841,7 +1841,7 @@ def verify_bundle_ff(
                 message=(
                     f"Local {local_label} ({local_tip}) is stale "
                     f"({behind_count} commit(s) behind remote bundle {bundle_str} "
-                    f"tip {remote_tip}). Remediation: run `git x20-pull` or "
+                    f"tip {remote_tip}). Remediation: run `git bundle-pull` or "
                     "pass `--sync-if-behind` to fast-forward before exporting."
                 ),
             )
@@ -1861,7 +1861,7 @@ def verify_bundle_ff(
                     f"({behind_count} commit(s) behind remote bundle {bundle_str} "
                     f"tip {remote_tip}), and `--sync-if-behind` refused to "
                     f"update: {sync_err}. Remediation: clean the worktree or "
-                    "run `git x20-pull` before exporting."
+                    "run `git bundle-pull` before exporting."
                 ),
             )
 

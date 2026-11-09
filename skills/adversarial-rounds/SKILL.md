@@ -15,7 +15,7 @@ description: >-
 
 Run a structured $N$-round adversarial build-critique-fix loop between
 **Agent A** (`agent-a`) and **Agent B** (`agent-b`) over shared git worktree(s),
-using Jetski's native `swarm` board for turn-by-turn handoffs and model pinning.
+using Antigravity's native `swarm` board for turn-by-turn handoffs and model pinning.
 When orchestrating multiple leaf pairs under workstream supervisors, pair this
 skill with [`hierarchical-supervision`](../hierarchical-supervision/SKILL.md).
 
@@ -69,7 +69,7 @@ can re-read it at the start of every round:
 ### Step 2.1: Quota-Aware Random Model Assignment
 
 Resolve the abstract model slots from your environment's policy CLI
-(`anneal-model-policy`) or team rules:
+(`model-policy-cli`) or team rules:
 
 - **`<MODEL_X>`** and **`<MODEL_Y>`**: Distinct frontier model families
   (**Family X** and **Family Y**) for `agent-a` and `agent-b` (with same-family
@@ -84,13 +84,13 @@ Resolve the abstract model slots from your environment's policy CLI
 - **`<HELPER_MODEL>`**: Lightweight helper model for `monitor` and `narrator`
   workers only.
 
-Do not mentally pick which agent gets which model. Run `anneal-model-policy`
+Do not mentally pick which agent gets which model. Run `model-policy-cli`
 (falling back to a pure-Python RNG shuffle in environments without the policy
 CLI) via `run_command`:
 
 ```bash
-if command -v anneal-model-policy >/dev/null 2>&1; then
-  anneal-model-policy assign-pair --unit "<UNIT_ID>" --tier "<P0|P1|P2>" --scratch "<SCRATCH_DIR>"
+if command -v model-policy-cli >/dev/null 2>&1; then
+  model-policy-cli assign-pair --unit "<UNIT_ID>" --tier "<P0|P1|P2>" --scratch "<SCRATCH_DIR>"
 else
   python3 -c 'import random; m = ["<MODEL_X>", "<MODEL_Y>"]; random.shuffle(m); print(f"AGENT_A_MODEL={m[0]}\nAGENT_B_MODEL={m[1]}\nSUPERVISOR_MODEL=<SUPERVISOR_MODEL>\nHELPER_MODEL=<HELPER_MODEL>\nDIVERSITY_REDUCED=false")'
 fi
@@ -132,12 +132,12 @@ quota-monitoring rules throughout the run:
     `P1`), switch the affected worker at its turn boundary to `<MODEL_Z_RESERVE>`
     (or an available frontier model) and record the switch via:
     ```bash
-    anneal-model-policy record-switch --scratch "<SCRATCH_DIR>" --unit "<UNIT_ID>" \
+    model-policy-cli record-switch --scratch "<SCRATCH_DIR>" --unit "<UNIT_ID>" \
       --worker "<agent-a|agent-b>" --pass "<A0|B1|...>" \
       --from-model "<old_model>" --to-model "<new_model>"
     ```
   - **Automatic Restoration After Quota Reset**: At subsequent round or leaf
-    boundaries, run `anneal-model-policy check-restore --scratch "<SCRATCH_DIR>"`.
+    boundaries, run `model-policy-cli check-restore --scratch "<SCRATCH_DIR>"`.
     If a degraded worker's primary `<MODEL_X>` or `<MODEL_Y>` bucket has
     recovered (`>= 20%`), switch that worker back to its primary model at the
     handoff boundary before its turn begins.
@@ -256,10 +256,10 @@ In a single turn:
 5. Output the `[Open the Swarm UI](sidecar://swarm/swarm_board/)` link to the
   user and end your turn to wait for `@coordinator` notifications (`[QUOTA]`,
   `[stall]`, or `[A_N Final]`). Whenever woken by a `[QUOTA]` or `[stall]`
-  alert, inspect worker state and quota (`anneal-model-policy status` and
+  alert, inspect worker state and quota (`model-policy-cli status` and
   `swarm{action: "status"}`), switch **only the active turn owner's model** if
   needed to maintain progress, and record the switch via
-  `anneal-model-policy record-switch`.
+  `model-policy-cli record-switch`.
 
 ### Agent A Brief Template (`agent-a`)
 

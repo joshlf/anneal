@@ -6,7 +6,7 @@
 - **Objective ID**: `OBJ-1-SHRINK-UNSUPPORTED-MIR`
 - **Track**: `unstable`
 - **Priority**: `P0`
-- **Current Node**: `cpl-black-age-5796.c.googlers.com`
+- **Current Node**: `<build-host>`
 - **Posted By**: `markdittmer`
 - **Current State**: `MERGED_UNSTABLE`
 - **Active Branch**: `ws-diff-d-valid-range` (merged into `unstable`)
@@ -33,4 +33,4 @@
 - [x] Wave 1: Architectural design of typed load validity check completed.
 - [x] Wave 2: Implementation landed across V2026_06_01 and V2026_08_01.
 - [x] Wave 3: Verified with Lake builds and full workspace differential test suite (`cargo test --workspace`).
-- [x] Wave 4: Exported delta bundle to x20, merged into `markdittmer`'s `unstable`, and pushed to x20.
+- [x] Wave 4: Exported delta bundle to remote-storage, merged into `markdittmer`'s `unstable`, and pushed to remote-storage.

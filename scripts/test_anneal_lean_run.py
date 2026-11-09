@@ -401,7 +401,7 @@ class TestCgroupV2Probing(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cg_root = Path(tmp) / "cgroup"
             user_slice = cg_root / "user.slice"
-            svc = user_slice / "jetski.service"
+            svc = user_slice / "agent-host.service"
             leaf = svc / "server"
             leaf.mkdir(parents=True)
 
@@ -444,7 +444,7 @@ class TestCgroupV2Probing(unittest.TestCase):
 
             proc_cg = Path(tmp) / "proc_cgroup"
             proc_cg.write_text(
-                "0::/user.slice/jetski.service/server\n", encoding="utf-8"
+                "0::/user.slice/agent-host.service/server\n", encoding="utf-8"
             )
 
             cg = alr.probe_cgroup_v2_memory(
@@ -452,7 +452,7 @@ class TestCgroupV2Probing(unittest.TestCase):
             )
             self.assertTrue(cg["cgroup_v2"])
             self.assertEqual(
-                cg["cgroup_path"], "/user.slice/jetski.service/server"
+                cg["cgroup_path"], "/user.slice/agent-host.service/server"
             )
             self.assertEqual(cg["cgroup_anon_shmem_mib"], 1024)
             self.assertEqual(cg["cgroup_file_cache_mib"], 3072)
@@ -1138,7 +1138,7 @@ class TestVerifyBundleFF(unittest.TestCase):
             self.assertIn("1 commit(s) behind", v_behind["message"])
             self.assertIn(c1, v_behind["message"])
             self.assertIn(c2, v_behind["message"])
-            self.assertIn("git x20-pull", v_behind["message"])
+            self.assertIn("git bundle-pull", v_behind["message"])
             self.assertIn("--sync-if-behind", v_behind["message"])
             self.assertEqual(_rev(repo, "refs/heads/unstable"), c1)
 
@@ -1242,7 +1242,7 @@ class TestVerifyBundleFF(unittest.TestCase):
             )
             self.assertFalse(v_unfetched["ok"])
             self.assertEqual(v_unfetched["status"], "unfetched_remote_tip")
-            self.assertIn("git x20-pull", v_unfetched["message"])
+            self.assertIn("git bundle-pull", v_unfetched["message"])
             self.assertFalse(_has_object(local_repo, c2))
             self.assertEqual(_rev(local_repo, "refs/heads/unstable"), c1)
 
@@ -1781,30 +1781,30 @@ class TestVerifyBundleFF(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# x20 staging via `fileutil` (never through the `x20fsd` FUSE mount)
+# remote staging via `remote_sync` (never through the `remotefsd` FUSE mount)
 # ---------------------------------------------------------------------------
 
-# Verbatim `fileutil` messages captured on a Team Capsule (paths shortened).
-_URI = "/x20/teams/anneal-agent/u/anneal.bundle"
+# Verbatim `remote_sync` messages captured on a Shared Agent Host (paths shortened).
+_URI = "/remote/teams/anneal-agent/u/anneal.bundle"
 REAL_CP_REMOTE_NOT_FOUND = (
-    "E1108 19:40:48.692519 2132517 fileutil.cc:1786] couldn't copy "
+    "E1108 19:40:48.692519 2132517 remote_sync.cc:1786] couldn't copy "
     f"`{_URI}' to `/tmp/anneal-bundle-ff-x/remote.bundle': generic::not_found: "
     f"{_URI}: File not found: /teams/anneal-agent/u/anneal.bundle "
-    "[storage_x20.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }"
+    "[storage_remote.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }"
 )
 REAL_STAT_REMOTE_NOT_FOUND = (
-    "E1108 19:42:12.326550 2136735 fileutil.cc:6923] Failed to stat "
+    "E1108 19:42:12.326550 2136735 remote_sync.cc:6923] Failed to stat "
     f"{_URI}: NOT_FOUND: {_URI}: File not found: /teams/anneal-agent/u/anneal.bundle "
     "at version: 1794166930727722 [type.googleapis.com/util.MessageSetPayload="
-    "'[storage_x20.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }']"
+    "'[storage_remote.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }']"
 )
 REAL_CP_LOCAL_ENOENT = (
-    "E1108 19:41:18.402671 2134521 fileutil.cc:1786] couldn't copy "
+    "E1108 19:41:18.402671 2134521 remote_sync.cc:1786] couldn't copy "
     f"`{_URI}' to `/tmp/anneal-bundle-ff-x/remote.bundle': generic::not_found: "
     "open failed for /tmp/anneal-bundle-ff-x/remote.bundle: No such file or directory"
 )
 
-MOCK_FILEUTIL_SRC = r'''#!/usr/bin/env python3
+MOCK_REMOTE_SYNC_SRC = r'''#!/usr/bin/env python3
 import json, os, shutil, sys, time
 
 argv = sys.argv[1:]
@@ -1812,20 +1812,20 @@ try:
     stdin_is_devnull = os.path.samestat(os.fstat(0), os.stat(os.devnull))
 except OSError:
     stdin_is_devnull = False
-with open(os.environ["MOCK_FILEUTIL_LOG"], "a", encoding="utf-8") as f:
+with open(os.environ["MOCK_REMOTE_SYNC_LOG"], "a", encoding="utf-8") as f:
     f.write(json.dumps({"argv": argv, "stdin_is_devnull": stdin_is_devnull}) + "\n")
 
-mode = os.environ.get("MOCK_FILEUTIL_MODE", "ok")
+mode = os.environ.get("MOCK_REMOTE_SYNC_MODE", "ok")
 op = argv[1] if len(argv) > 1 else ""
 uri = argv[2] if op == "stat" else (argv[3] if len(argv) > 3 else "")
 dest = argv[4] if (op == "cp" and len(argv) > 4) else ""
-rel = uri[len("/x20"):] if uri.startswith("/x20/") else uri
-remote_nf_cp = ("E0000 fileutil.cc:1786] couldn't copy `%s' to `%s': generic::not_found: "
-                "%s: File not found: %s [storage_x20.pb.Error] "
+rel = uri[len("/remote"):] if uri.startswith("/remote/") else uri
+remote_nf_cp = ("E0000 remote_sync.cc:1786] couldn't copy `%s' to `%s': generic::not_found: "
+                "%s: File not found: %s [storage_remote.pb.Error] "
                 "{ code: NO_SUCH_FILE_OR_DIRECTORY }\n" % (uri, dest, uri, rel))
-remote_nf_stat = ("E0000 fileutil.cc:6923] Failed to stat %s: NOT_FOUND: %s: File not "
+remote_nf_stat = ("E0000 remote_sync.cc:6923] Failed to stat %s: NOT_FOUND: %s: File not "
                   "found: %s at version: 1 [type.googleapis.com/util.MessageSetPayload="
-                  "'[storage_x20.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }']\n"
+                  "'[storage_remote.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }']\n"
                   % (uri, uri, rel))
 
 def fail(msg):
@@ -1843,18 +1843,18 @@ if op == "stat":
 if op != "cp":
     fail("unexpected op %r\n" % op)
 if mode == "ok":
-    shutil.copyfile(os.environ["MOCK_FILEUTIL_SRC_BUNDLE"], dest)
+    shutil.copyfile(os.environ["MOCK_REMOTE_SYNC_SRC_BUNDLE"], dest)
     sys.exit(0)
 if mode in ("not_found", "cp_not_found_stat_exists", "cp_not_found_stat_rpc"):
     fail(remote_nf_cp)
 if mode == "local_enoent":
-    fail("E0000 fileutil.cc:1786] couldn't copy `%s' to `%s': generic::not_found: "
+    fail("E0000 remote_sync.cc:1786] couldn't copy `%s' to `%s': generic::not_found: "
          "open failed for %s: No such file or directory\n" % (uri, dest, dest))
 if mode == "rpc_err":
     fail("E0000 couldn't copy `%s': DEADLINE_EXCEEDED: RPC timed out\n" % uri)
 if mode == "perm_denied":
     fail("E0000 couldn't copy `%s': PERMISSION_DENIED: %s: No such file or directory "
-         "[storage_x20.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }\n" % (uri, uri))
+         "[storage_remote.pb.Error] { code: NO_SUCH_FILE_OR_DIRECTORY }\n" % (uri, uri))
 if mode == "empty":
     open(dest, "wb").close()
     sys.exit(0)
@@ -1897,71 +1897,71 @@ def _stdin_as_pipe() -> Iterator[None]:
             os.close(0)
 
 
-class TestX20Staging(unittest.TestCase):
-    """Tests `fileutil` staging, not-found classification, and FUSE bypass."""
+class TestRemoteStaging(unittest.TestCase):
+    """Tests `remote_sync` staging, not-found classification, and FUSE bypass."""
 
-    FUSE_PATH = "/google/data/rw/teams/anneal-agent/testuser/anneal.bundle"
-    X20_URI = "/x20/teams/anneal-agent/testuser/anneal.bundle"
+    FUSE_PATH = "/mnt/fuse/rw/teams/anneal-agent/testuser/anneal.bundle"
+    REMOTE_URI = "/remote/teams/anneal-agent/testuser/anneal.bundle"
 
-    def test_x20_path_translation(self) -> None:
+    def test_remote_path_translation(self) -> None:
         for path in (
-            "/google/data/rw/teams/anneal-agent/markdittmer/anneal.bundle",
-            "/google/data/ro/teams/anneal-agent/markdittmer/anneal.bundle",
-            "/x20/teams/anneal-agent/markdittmer/anneal.bundle",
-            "/google/data/rw//teams//anneal-agent/markdittmer//anneal.bundle",
-            "/x20//teams//anneal-agent/markdittmer/anneal.bundle",
+            "/mnt/fuse/rw/teams/anneal-agent/markdittmer/anneal.bundle",
+            "/mnt/fuse/ro/teams/anneal-agent/markdittmer/anneal.bundle",
+            "/remote/teams/anneal-agent/markdittmer/anneal.bundle",
+            "/mnt/fuse/rw//teams//anneal-agent/markdittmer//anneal.bundle",
+            "/remote//teams//anneal-agent/markdittmer/anneal.bundle",
         ):
-            self.assertTrue(alr.is_x20_path(path), path)
+            self.assertTrue(alr.is_remote_path(path), path)
             self.assertEqual(
-                alr.to_x20_uri(path),
-                "/x20/teams/anneal-agent/markdittmer/anneal.bundle",
+                alr.to_remote_uri(path),
+                "/remote/teams/anneal-agent/markdittmer/anneal.bundle",
             )
-        for path in ("/tmp/x.bundle", "x20/teams/a.bundle", "/google/data/rwx/a"):
-            self.assertFalse(alr.is_x20_path(path), path)
-            self.assertEqual(alr.to_x20_uri(path), path)
+        for path in ("/tmp/x.bundle", "remote/teams/a.bundle", "/mnt/fuse/rwx/a"):
+            self.assertFalse(alr.is_remote_path(path), path)
+            self.assertEqual(alr.to_remote_uri(path), path)
 
-    def test_remote_not_found_classifier_on_real_fileutil_messages(self) -> None:
-        self.assertTrue(alr._is_x20_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, _URI))
-        self.assertTrue(alr._is_x20_remote_not_found(REAL_STAT_REMOTE_NOT_FOUND, _URI))
+    def test_remote_not_found_classifier_on_real_remote_sync_messages(self) -> None:
+        self.assertTrue(alr._is_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, _URI))
+        self.assertTrue(alr._is_remote_not_found(REAL_STAT_REMOTE_NOT_FOUND, _URI))
         # Local staging-destination ENOENT is NOT a missing remote bundle.
-        self.assertFalse(alr._is_x20_remote_not_found(REAL_CP_LOCAL_ENOENT, _URI))
-        # NOT_FOUND for some other x20 path is not about our bundle.
+        self.assertFalse(alr._is_remote_not_found(REAL_CP_LOCAL_ENOENT, _URI))
+        # NOT_FOUND for some other remote path is not about our bundle.
         self.assertFalse(
-            alr._is_x20_remote_not_found(
-                REAL_CP_REMOTE_NOT_FOUND, "/x20/teams/anneal-agent/v/anneal.bundle"
+            alr._is_remote_not_found(
+                REAL_CP_REMOTE_NOT_FOUND, "/remote/teams/anneal-agent/v/anneal.bundle"
             )
         )
         for veto in ("PERMISSION_DENIED", "DEADLINE_EXCEEDED", "UNAVAILABLE"):
             self.assertFalse(
-                alr._is_x20_remote_not_found(f"{veto}: {REAL_CP_REMOTE_NOT_FOUND}", _URI)
+                alr._is_remote_not_found(f"{veto}: {REAL_CP_REMOTE_NOT_FOUND}", _URI)
             )
-        self.assertFalse(alr._is_x20_remote_not_found("No such file or directory", _URI))
-        self.assertFalse(alr._is_x20_remote_not_found("", _URI))
+        self.assertFalse(alr._is_remote_not_found("No such file or directory", _URI))
+        self.assertFalse(alr._is_remote_not_found("", _URI))
 
         # Veto markers that only occur inside the echoed path do not count...
-        odd_uri = "/x20/teams/unavailable-internal error/anneal.bundle"
+        odd_uri = "/remote/teams/unavailable-internal error/anneal.bundle"
         odd_msg = REAL_CP_REMOTE_NOT_FOUND.replace(_URI, odd_uri).replace(
-            "/teams/anneal-agent/u/anneal.bundle", odd_uri[len("/x20") :]
+            "/teams/anneal-agent/u/anneal.bundle", odd_uri[len("/remote") :]
         )
-        self.assertTrue(alr._is_x20_remote_not_found(odd_msg, odd_uri))
+        self.assertTrue(alr._is_remote_not_found(odd_msg, odd_uri))
         # ...but a real veto outside the path still fails closed.
         self.assertFalse(
-            alr._is_x20_remote_not_found(f"DEADLINE_EXCEEDED: rpc\n{odd_msg}", odd_uri)
+            alr._is_remote_not_found(f"DEADLINE_EXCEEDED: rpc\n{odd_msg}", odd_uri)
         )
-        # Conversely, a path containing `storage_x20` and `no_such_file_or_directory`
+        # Conversely, a path containing `storage_remote` and `no_such_file_or_directory`
         # must not spoof a missing-remote classification on a non-missing error.
         spoof_uri = (
-            "/x20/teams/storage_x20/no_such_file_or_directory/anneal.bundle"
+            "/remote/teams/storage_remote/no_such_file_or_directory/anneal.bundle"
         )
         self.assertFalse(
-            alr._is_x20_remote_not_found(
+            alr._is_remote_not_found(
                 f"E0000 couldn't copy `{spoof_uri}': generic::invalid_argument: bad request",
                 spoof_uri,
             )
         )
-        # Bare `/x20/` root is never a remote bundle file.
-        self.assertFalse(alr._is_x20_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, "/x20/"))
-        self.assertFalse(alr._is_x20_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, "/x20"))
+        # Bare `/remote/` root is never a remote bundle file.
+        self.assertFalse(alr._is_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, "/remote/"))
+        self.assertFalse(alr._is_remote_not_found(REAL_CP_REMOTE_NOT_FOUND, "/remote"))
 
     def _setup(self, tmp_p: Path) -> tuple[Path, Path, Path, str]:
         repo = tmp_p / "repo"
@@ -1969,17 +1969,17 @@ class TestX20Staging(unittest.TestCase):
         c1 = _commit_file(repo, "a.txt", "1\n", "c1")
         _git(repo, "branch", "unstable", c1)
         real_bundle = _make_bundle(repo, tmp_p / "real.bundle", "refs/heads/unstable")
-        mock_fileutil = tmp_p / "mock_fileutil.py"
-        mock_fileutil.write_text(MOCK_FILEUTIL_SRC, encoding="utf-8")
-        mock_fileutil.chmod(0o755)
-        return repo, real_bundle, mock_fileutil, c1
+        mock_remote_sync = tmp_p / "mock_remote_sync.py"
+        mock_remote_sync.write_text(MOCK_REMOTE_SYNC_SRC, encoding="utf-8")
+        mock_remote_sync.chmod(0o755)
+        return repo, real_bundle, mock_remote_sync, c1
 
     def _run_case(
         self,
         tmp_p: Path,
         repo: Path,
         real_bundle: Path,
-        mock_fileutil: Path,
+        mock_remote_sync: Path,
         mode: str,
         bundle_path: str,
         sync_if_behind: bool = False,
@@ -1989,30 +1989,30 @@ class TestX20Staging(unittest.TestCase):
         scratch = tmp_p / f"scratch-{mode}"
         scratch.mkdir(exist_ok=True)
         real_run = subprocess.run
-        fileutil_kwargs: list[dict[str, Any]] = []
+        remote_sync_kwargs: list[dict[str, Any]] = []
 
         def spy_run(*args: Any, **kwargs: Any) -> Any:
             cmd = args[0] if args else kwargs.get("args")
-            if cmd and str(cmd[0]) == str(mock_fileutil):
-                fileutil_kwargs.append(kwargs)
+            if cmd and str(cmd[0]) == str(mock_remote_sync):
+                remote_sync_kwargs.append(kwargs)
             return real_run(*args, **kwargs)
 
         env = {
-            "MOCK_FILEUTIL_MODE": mode,
-            "MOCK_FILEUTIL_LOG": str(log_file),
-            "MOCK_FILEUTIL_SRC_BUNDLE": str(real_bundle),
+            "MOCK_REMOTE_SYNC_MODE": mode,
+            "MOCK_REMOTE_SYNC_LOG": str(log_file),
+            "MOCK_REMOTE_SYNC_SRC_BUNDLE": str(real_bundle),
         }
         with mock.patch.dict(os.environ, env), mock.patch.object(
             alr.tempfile, "tempdir", str(scratch)
         ), mock.patch.object(
             alr.subprocess, "run", side_effect=spy_run
         ), mock.patch.object(
-            alr, "FILEUTIL_CP_TIMEOUT_SEC", 1.0
+            alr, "REMOTE_SYNC_CP_TIMEOUT_SEC", 1.0
         ), _stdin_as_pipe():
             verdict = alr.verify_bundle_ff(
                 bundle_path,
                 repo_dir=repo,
-                fileutil_bin=str(mock_fileutil),
+                remote_sync_bin=str(mock_remote_sync),
                 sync_if_behind=sync_if_behind,
             )
         calls = [
@@ -2022,11 +2022,11 @@ class TestX20Staging(unittest.TestCase):
         ] if log_file.exists() else []
         # Staged temp dirs are always removed, on every success/failure path.
         self.assertEqual(list(scratch.iterdir()), [], mode)
-        return verdict, calls, fileutil_kwargs
+        return verdict, calls, remote_sync_kwargs
 
-    def test_fileutil_staging_matrix(self) -> None:
+    def test_remote_sync_staging_matrix(self) -> None:
         cases = [
-            # (mode, expected status, expected ok, expected fileutil ops)
+            # (mode, expected status, expected ok, expected remote_sync ops)
             ("ok", "up_to_date", True, ["cp"]),
             ("not_found", "no_remote_bundle", True, ["cp", "stat"]),
             ("local_enoent", "bundle_error", False, ["cp"]),
@@ -2041,26 +2041,26 @@ class TestX20Staging(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
-            repo, real_bundle, mock_fileutil, c1 = self._setup(tmp_p)
+            repo, real_bundle, mock_remote_sync, c1 = self._setup(tmp_p)
             for mode, status, ok, ops in cases:
                 with self.subTest(mode=mode):
                     verdict, calls, kwargs_list = self._run_case(
-                        tmp_p, repo, real_bundle, mock_fileutil, mode, self.FUSE_PATH
+                        tmp_p, repo, real_bundle, mock_remote_sync, mode, self.FUSE_PATH
                     )
                     self.assertEqual(verdict["status"], status, verdict["message"])
                     self.assertEqual(verdict["ok"], ok)
                     self.assertEqual([c["argv"][1] for c in calls], ops)
                     for call in calls:
                         self.assertEqual(
-                            call["argv"][0], "--x20_force_client_creation_at_head"
+                            call["argv"][0], "--force_client_creation_at_head"
                         )
                         self.assertTrue(call["stdin_is_devnull"], call)
-                        # The FUSE path is never handed to fileutil.
+                        # The FUSE path is never handed to remote_sync.
                         self.assertNotIn(self.FUSE_PATH, call["argv"])
                     cp_argv = calls[0]["argv"]
-                    self.assertEqual(cp_argv[1:4], ["cp", "-f", self.X20_URI])
+                    self.assertEqual(cp_argv[1:4], ["cp", "-f", self.REMOTE_URI])
                     if "stat" in ops:
-                        self.assertEqual(calls[1]["argv"][1:], ["stat", self.X20_URI])
+                        self.assertEqual(calls[1]["argv"][1:], ["stat", self.REMOTE_URI])
                     self.assertEqual(len(kwargs_list), len(ops))
                     for kwargs in kwargs_list:
                         self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
@@ -2069,44 +2069,44 @@ class TestX20Staging(unittest.TestCase):
                     if mode == "local_enoent":
                         self.assertIn("open failed", verdict["message"])
 
-    def test_ro_and_x20_uris_and_fuse_symlinks_are_staged_via_fileutil(self) -> None:
+    def test_ro_and_remote_uris_and_fuse_symlinks_are_staged_via_remote_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
-            repo, real_bundle, mock_fileutil, _ = self._setup(tmp_p)
-            ro_path = "/google/data/ro/teams/anneal-agent/testuser/anneal.bundle"
+            repo, real_bundle, mock_remote_sync, _ = self._setup(tmp_p)
+            ro_path = "/mnt/fuse/ro/teams/anneal-agent/testuser/anneal.bundle"
             verdict, calls, _ = self._run_case(
-                tmp_p, repo, real_bundle, mock_fileutil, "ok", ro_path
+                tmp_p, repo, real_bundle, mock_remote_sync, "ok", ro_path
             )
             self.assertEqual(verdict["status"], "up_to_date")
-            self.assertEqual(calls[0]["argv"][3], self.X20_URI)
+            self.assertEqual(calls[0]["argv"][3], self.REMOTE_URI)
 
-            # A local symlink (or multi-hop symlink chain) whose target is an x20
-            # URI or FUSE path must be staged through fileutil without relying on
+            # A local symlink (or multi-hop symlink chain) whose target is an remote
+            # URI or FUSE path must be staged through remote_sync without relying on
             # `os.path.realpath` mocks.
-            link1 = tmp_p / "x20link1.bundle"
+            link1 = tmp_p / "remotelink1.bundle"
             link1.symlink_to(self.FUSE_PATH)
-            link2 = tmp_p / "x20link2.bundle"
-            link2.symlink_to("x20link1.bundle")
+            link2 = tmp_p / "remotelink2.bundle"
+            link2.symlink_to("remotelink1.bundle")
             verdict_link, calls_link, _ = self._run_case(
-                tmp_p, repo, real_bundle, mock_fileutil, "not_found", str(link2)
+                tmp_p, repo, real_bundle, mock_remote_sync, "not_found", str(link2)
             )
             self.assertEqual(verdict_link["status"], "no_remote_bundle")
-            self.assertEqual(calls_link[0]["argv"][1:4], ["cp", "-f", self.X20_URI])
+            self.assertEqual(calls_link[0]["argv"][1:4], ["cp", "-f", self.REMOTE_URI])
 
-            # Redundant slashes in a FUSE path normalize to the canonical `/x20/` URI.
-            slashed_fuse = "/google/data/rw//teams//anneal-agent/testuser//anneal.bundle"
+            # Redundant slashes in a FUSE path normalize to the canonical `/remote/` URI.
+            slashed_fuse = "/mnt/fuse/rw//teams//anneal-agent/testuser//anneal.bundle"
             verdict_slashed, calls_slashed, _ = self._run_case(
-                tmp_p, repo, real_bundle, mock_fileutil, "not_found", slashed_fuse
+                tmp_p, repo, real_bundle, mock_remote_sync, "not_found", slashed_fuse
             )
             self.assertEqual(verdict_slashed["status"], "no_remote_bundle")
-            self.assertEqual(calls_slashed[0]["argv"][1:4], ["cp", "-f", self.X20_URI])
+            self.assertEqual(calls_slashed[0]["argv"][1:4], ["cp", "-f", self.REMOTE_URI])
 
-    def test_x20_staged_bundle_supports_sync_end_to_end(self) -> None:
-        """`--sync-if-behind` fetches the unfetched tip from the fileutil-staged
+    def test_remote_staged_bundle_supports_sync_end_to_end(self) -> None:
+        """`--sync-if-behind` fetches the unfetched tip from the remote_sync-staged
         temp copy (still alive inside the `with` body), then cleans it up."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
-            repo, _, mock_fileutil, c1 = self._setup(tmp_p)
+            repo, _, mock_remote_sync, c1 = self._setup(tmp_p)
             other = tmp_p / "other"
             subprocess.run(
                 ["git", "clone", "-q", str(repo), str(other)],
@@ -2120,7 +2120,7 @@ class TestX20Staging(unittest.TestCase):
             self.assertFalse(_has_object(repo, c2))
 
             verdict, calls, _ = self._run_case(
-                tmp_p, repo, ahead, mock_fileutil, "ok", self.FUSE_PATH, sync_if_behind=True
+                tmp_p, repo, ahead, mock_remote_sync, "ok", self.FUSE_PATH, sync_if_behind=True
             )
             self.assertTrue(verdict["ok"], verdict["message"])
             self.assertTrue(verdict["synced"])
@@ -2130,14 +2130,14 @@ class TestX20Staging(unittest.TestCase):
             self.assertEqual([c["argv"][1] for c in calls], ["cp"])
             self.assertNotEqual(c1, c2)
 
-    def test_unrunnable_fileutil_fails_closed(self) -> None:
+    def test_unrunnable_remote_sync_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
             repo, _, _, _ = self._setup(tmp_p)
             verdict = alr.verify_bundle_ff(
                 self.FUSE_PATH,
                 repo_dir=repo,
-                fileutil_bin=str(tmp_p / "no-such-fileutil"),
+                remote_sync_bin=str(tmp_p / "no-such-remote_sync"),
             )
             self.assertFalse(verdict["ok"])
             self.assertEqual(verdict["status"], "bundle_error")
