@@ -2092,10 +2092,6 @@ def _merge_ratchet_snapshots(
         "per_suite_distinct_obs_paths": per_suite,
         "observed_paths": merged_obs,
     }
-    if baseline.get("baseline_missing") is True:
-        out["baseline_missing"] = True
-    if baseline.get("baseline_unmerged") is True:
-        out["baseline_unmerged"] = True
     return out
 
 
@@ -2369,6 +2365,7 @@ def update_coverage_ratchet(
     itree_seed: int,
     force_baseline_missing: bool = False,
     persist_baseline_unmerged: bool | None = None,
+    clear_baseline_unmerged: bool = False,
 ) -> tuple[Path, bool]:
     """Monotonically merges observation-path signatures from healthy suite(s)
     into `state/coverage_ratchet.json` and updates `ledger['cumulative_distinct_obs_paths']`.
@@ -2461,7 +2458,7 @@ def update_coverage_ratchet(
     if persist_baseline_unmerged is None:
         persist_baseline_unmerged = force_baseline_missing
     baseline_unmerged = persist_baseline_unmerged or (
-        ratchet.get("baseline_unmerged") is True
+        not clear_baseline_unmerged and ratchet.get("baseline_unmerged") is True
     )
     baseline_missing = below_floor or baseline_unmerged or force_baseline_missing
     if baseline_missing:
@@ -3511,6 +3508,7 @@ def main(argv: list[str] | None = None) -> int:
                 else BASELINE_RECOVERY_SKIPPED
             )
             configured_baseline_failed = recovery_status == BASELINE_RECOVERY_FAILED
+            configured_baseline_absent = recovery_status == BASELINE_RECOVERY_ABSENT
             unrecovered_local_corrupt = (
                 local_ratchet_corrupt
                 and recovery_status != BASELINE_RECOVERY_RECOVERED
@@ -3529,6 +3527,7 @@ def main(argv: list[str] | None = None) -> int:
                     configured_baseline_failed or unrecovered_local_corrupt
                 ),
                 persist_baseline_unmerged=configured_baseline_failed,
+                clear_baseline_unmerged=configured_baseline_absent,
             )
             try:
                 if ratchet_path.is_file():
