@@ -24,6 +24,7 @@ extern crate self as cargo_anneal;
 pub mod agent;
 pub mod correspondence_bugs;
 pub mod driver;
+pub mod fault_census_proto;
 pub mod minirust_sync;
 pub mod miri_diff;
 pub mod miri_oracle;
