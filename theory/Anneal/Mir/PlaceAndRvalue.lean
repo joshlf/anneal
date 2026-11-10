@@ -550,6 +550,54 @@ theorem tyIsNonUnionFieldBase_certFieldTy_of_not_adt
   unfold tyIsNonUnionFieldBase
   rw [certFieldTy_kind, hNotAdt]
 
+/-- A `.field` step whose annotation already carries a resolved non-union layout index
+(`layoutIdxIsNonUnion layouts fieldTy.layoutIdx = true`) preserves that index under
+`certFieldTy` and therefore reaches a non-union field base; e.g. it discharges the
+outer-field side condition of `evalStmt_assign_uninit_nonUnion_adt_nested_field_ok` when
+the outer struct field `fieldTy` has a directly resolved non-union ADT layout index. -/
+theorem tyIsNonUnionFieldBase_certFieldTy_of_layoutIdxIsNonUnion
+    (layouts : LayoutTable) (baseTy : Ty) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (hField : layoutIdxIsNonUnion layouts fieldTy.layoutIdx = true) :
+    tyIsNonUnionFieldBase layouts (certFieldTy layouts baseTy fieldIdx fieldTy) = true := by
+  have hRes := isUnresolvedLayoutIdx_eq_false_of_layoutIdxIsNonUnion layouts fieldTy.layoutIdx hField
+  unfold tyIsNonUnionFieldBase certFieldTy
+  rw [hRes]
+  dsimp only
+  cases rigidTyIsAdt fieldTy.kind with
+  | false => rfl
+  | true => exact hField
+
+/-- A `.field` step with an unresolved annotation layout index (`isUnresolvedLayoutIdx layouts
+fieldTy.layoutIdx = true`, such as `layoutIdx = 0`) out of a resolved single-variant container
+`baseTy` whose `fieldLayouts[fieldIdx]` records a non-union layout index `flIdx` resolves to
+`flIdx` under `certFieldTy` and therefore reaches a non-union field base. Together with
+`tyIsNonUnionFieldBase_certFieldTy_of_not_adt` and
+`tyIsNonUnionFieldBase_certFieldTy_of_layoutIdxIsNonUnion`, this covers every non-union outer
+field of `evalStmt_assign_uninit_nonUnion_adt_nested_field_ok`. -/
+theorem tyIsNonUnionFieldBase_certFieldTy_of_fieldLayouts
+    (layouts : LayoutTable) (baseTy : Ty) (fieldIdx : FieldIdx) (fieldTy : Ty)
+    (l : TypeLayout) (v flIdx : Nat)
+    (hUnresField : isUnresolvedLayoutIdx layouts fieldTy.layoutIdx = true)
+    (hBaseNonUnion : layoutIdxIsNonUnion layouts baseTy.layoutIdx = true)
+    (hLookup : LayoutTable.lookup layouts baseTy.layoutIdx = .some l)
+    (hVar : l.variants = .single v)
+    (hFl : get? l.fieldLayouts fieldIdx = .some flIdx)
+    (hFlNonUnion : layoutIdxIsNonUnion layouts flIdx = true) :
+    tyIsNonUnionFieldBase layouts (certFieldTy layouts baseTy fieldIdx fieldTy) = true := by
+  have hResBase :=
+    isUnresolvedLayoutIdx_eq_false_of_layoutIdxIsNonUnion layouts baseTy.layoutIdx hBaseNonUnion
+  rcases l with ⟨size, align, backendRepr, fields, variants, isUninhabited, fieldLayouts⟩
+  dsimp only at hVar hFl
+  subst hVar
+  unfold tyIsNonUnionFieldBase certFieldTy
+  rw [hUnresField, hResBase, hLookup]
+  dsimp only
+  rw [hFl]
+  dsimp only
+  cases rigidTyIsAdt fieldTy.kind with
+  | false => rfl
+  | true => exact hFlNonUnion
+
 /-- `certElemTy` only replaces the layout index. -/
 theorem certElemTy_kind (layouts : LayoutTable) (baseTy elemTy : Ty) :
     (certElemTy layouts baseTy elemTy).kind = elemTy.kind := by
@@ -14963,5 +15011,104 @@ theorem evalSetDiscriminantState_general_certified_nested_refines
     (setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt localDecls layouts loc (p :: rest)
       declTy defPath args lIdx hRootTy hCert hLeafTy)
     hGetS hNotUnit hOk
+
+/-- **Certified Projected Assignment Into an Initialized Sub-Slot of a Nested Partial Shell (`evalStmt_assign_partialShell_init_subslot_certified_nested_refines`)**:
+One-step wrapper around `evalStmt_assign_partialShell_init_subslot_nested_refines` that
+discharges `placeTouchesUnion localDecls layouts ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ = false`
+directly from a Section 0 `projFieldBasesNonUnion` certificate on `loc`'s declared type `declTy`. -/
+theorem evalStmt_assign_partialShell_init_subslot_certified_nested_refines
+    (s : MachineState)
+    (slots₁ slots₂ : List LocalSlotState)
+    (loc : Local)
+    (shell : PartialAggregate)
+    (i₀ : FieldIdx)
+    (ty₀ : Ty)
+    (restSteps : List (FieldIdx × Ty))
+    (tail : List ProjectionElem)
+    (rv : Rvalue)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (val w : Value)
+    (locals₁ : List LocalSlot)
+    (mem₁ : Memory)
+    (arityOf : Ty → VariantIdx → Bool → Option Nat)
+    (rootTy declTy : Ty)
+    (hRv :
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue
+        s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
+    (hRel : SlotsRefine NestedSlotStateRefines slots₁ locals₁)
+    (hSlot : get? slots₁ loc = .some (.partialShell shell))
+    (hChain : lookupFieldSlotChain shell.toFieldSlot ((i₀, ty₀) :: restSteps) = .some (.init w))
+    (hNoProt : mem₁.activeProtectors = .nil)
+    (hRootTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert :
+      projFieldBasesNonUnion layouts declTy
+        (.field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)) = true)
+    (hWrite :
+      writePlaceState arityOf slots₁
+        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ rootTy val = .ok slots₂) :
+    ∃ locals₂ mem₂,
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.assign ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ rv, span⟩
+          localDecls layouts =
+        MirStepNode.step (advanceStmt s locals₂ mem₂) ∧
+      SlotsRefine NestedSlotStateRefines slots₂ locals₂ :=
+  evalStmt_assign_partialShell_init_subslot_nested_refines s slots₁ slots₂ loc shell i₀ ty₀
+    restSteps tail rv span localDecls layouts val w locals₁ mem₁ arityOf rootTy hRv hRel hSlot
+    hChain hNoProt
+    (placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc
+      (.field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)) declTy hRootTy hCert)
+    hWrite
+
+/-- **Certified Arbitrary-Depth Partial-Shell `SetDiscriminant` Refinement (`evalSetDiscriminantState_partialShell_any_depth_certified_nested_refines`)**:
+One-step wrapper around `evalSetDiscriminantState_partialShell_any_depth_nested_refines`
+that discharges `SetDiscriminantDestOk localDecls layouts ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩`
+directly from a Section 0 `projFieldBasesNonUnion` certificate on `loc`'s declared type `declTy`
+together with an ADT destination `placeTy`. -/
+theorem evalSetDiscriminantState_partialShell_any_depth_certified_nested_refines
+    (s : MachineState)
+    (slots slots' : List LocalSlotState)
+    (loc : Local)
+    (shell : PartialAggregate)
+    (i₀ : FieldIdx)
+    (ty₀ : Ty)
+    (restSteps : List (FieldIdx × Ty))
+    (tail : List ProjectionElem)
+    (variantIdx : VariantIdx)
+    (w : Value)
+    (span : String)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (declTy : Ty)
+    (defPath : DefPath)
+    (args : List RigidTy)
+    (lIdx : LayoutIdx)
+    (hRel : SlotsRefine NestedSlotStateRefines slots s.frame.locals)
+    (hSlot : get? slots loc = .some (.partialShell shell))
+    (hChain : lookupFieldSlotChain shell.toFieldSlot ((i₀, ty₀) :: restSteps) = .some (.init w))
+    (hNotUnit : evalValueProjRead s.frame.locals w tail ≠ .ok .unit)
+    (hRootTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
+    (hCert :
+      projFieldBasesNonUnion layouts declTy
+        (.field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)) = true)
+    (hLeafTy :
+      placeTy localDecls layouts ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ =
+        .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hOk :
+      evalSetDiscriminantState slots
+        ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx = .ok slots') :
+    ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
+          s ⟨.setDiscriminant ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx,
+            span⟩ localDecls layouts =
+        MirStepNode.step (advanceStmt s locals') ∧
+      SlotsRefine NestedSlotStateRefines slots' locals' :=
+  evalSetDiscriminantState_partialShell_any_depth_nested_refines s slots slots' loc shell i₀ ty₀
+    restSteps tail variantIdx w span localDecls layouts hRel hSlot hChain hNotUnit
+    (setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt localDecls layouts loc
+      (.field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)) declTy defPath args lIdx
+      hRootTy hCert hLeafTy)
+    hOk
 
 end Anneal.Mir.PlaceAndRvalue
