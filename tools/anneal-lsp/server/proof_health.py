@@ -122,7 +122,9 @@ class PrivateDecl:
         "raw_header",
         "sig_fp",
         "body_start",
+        "decl_indent",
         "path",
+        "_rename_map",
     )
 
     def __init__(
@@ -136,6 +138,7 @@ class PrivateDecl:
         sig_fp: tuple[int, int, int, int] = (0, 0, 0, 0),
         body_start: int = -1,
         path: str = "",
+        decl_indent: int = 0,
     ) -> None:
         self.kind = kind
         self.name = name
@@ -145,12 +148,25 @@ class PrivateDecl:
         self.raw_header = raw_header
         self.sig_fp = sig_fp
         self.body_start = body_start
+        self.decl_indent = decl_indent
         self.path = path
+        self._rename_map: dict[str, str] | None = None
 
     def ensure_norm_sig(self) -> str:
         if not self.norm_sig and self.raw_header:
-            self.norm_sig = _normalize_signature(self.raw_header)
+            self.norm_sig, self._rename_map = _normalize_signature_with_map(self.raw_header)
         return self.norm_sig
+
+    def ensure_rename_map(self) -> dict[str, str]:
+        if self._rename_map is None:
+            if self.raw_header:
+                ns, rmap = _normalize_signature_with_map(self.raw_header)
+                if not self.norm_sig:
+                    self.norm_sig = ns
+                self._rename_map = rmap
+            else:
+                self._rename_map = {}
+        return self._rename_map
 
     def __repr__(self) -> str:
         return (
@@ -179,17 +195,13 @@ def _blank(seg: str) -> str:
     return "\n".join([" " * len(part) for part in seg.split("\n")])
 
 
-def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) -> str:
+def strip_lean_comments_and_strings(
+    text: str, *, keep_strings: bool = False, raw_utf8: bytes | None = None
+) -> str:
     """Blank out Lean 4 `--` line comments, nested `/- ... -/` block comments
     (docstrings included) and string literals, character for character: the result
     has the same length as `text` and keeps every `\\n`, so offsets and line
     numbers in it are exactly those of `text`.
-
-    String literals honour `\\"` / `\\\\` escapes; raw strings `r"..."` / `r#"..."#`
-    end at the matching `"#...`; the quote character literals `'"'` / `'\\"'` do not
-    open a string, and identifier primes (`st'`) are left untouched. With
-    `keep_strings=True` only comments are blanked. The scan jumps between delimiters
-    with `str.find`, about 3 ms per MB of Lean source.
     """
     n = len(text)
     if n == 0:
@@ -198,9 +210,10 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
     app = out.append  # bound once: the loop runs once per comment/string token
     find = text.find
     pos = 0
-    i_blk = find("/-", 0)
-    i_lin = find("--", 0)
-    i_str = find('"', 0)
+    i_blk = find("/-", 0) if (raw_utf8 is None or b"/-" in raw_utf8) else -1
+    i_lin = find("--", 0) if (raw_utf8 is None or b"--" in raw_utf8) else -1
+    i_str = find('"', 0) if (raw_utf8 is None or b'"' in raw_utf8) else -1
+    i_gui = find("«", 0) if (raw_utf8 is None or b"\xc2\xab" in raw_utf8) else -1
     while pos < n:
         if i_blk != -1 and i_blk < pos:
             i_blk = find("/-", pos)
@@ -208,6 +221,8 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
             i_lin = find("--", pos)
         if i_str != -1 and i_str < pos:
             i_str = find('"', pos)
+        if i_gui != -1 and i_gui < pos:
+            i_gui = find("«", pos)
 
         nxt = n
         kind = 0
@@ -220,12 +235,27 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
         if 0 <= i_str < nxt:
             nxt = i_str
             kind = 3
+        if 0 <= i_gui < nxt:
+            nxt = i_gui
+            kind = 4
 
         if kind == 0:
             app(text[pos:])
             break
         if nxt > pos:
             app(text[pos:nxt])
+
+        if kind == 4:
+            # Lean 4 guillemet identifier `«...»` (single-line): `--` or `/-` inside
+            # `«a--b»` is part of the identifier name, not a comment start.
+            g_end = find("»", nxt + 1)
+            if g_end != -1 and find("\n", nxt + 1, g_end) == -1:
+                app(text[nxt : g_end + 1])
+                pos = g_end + 1
+            else:
+                app("«")
+                pos = nxt + 1
+            continue
 
         if kind == 2:
             # `--` line comment up to (not including) the newline
@@ -259,25 +289,37 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
             continue
 
         # Raw string literal `r"..."` / `r#"..."#`: no escapes, closed by `"`
-        # followed by as many `#` as opened it.
+        # followed by as many `#` as opened it (reject `.r"..."` field projections).
         h = nxt
         while h > 0 and text[h - 1] == "#":
             h -= 1
-        if h > 0 and text[h - 1] == "r" and (h < 2 or not _is_ident_char(text[h - 2])):
+        if (
+            h > 0
+            and text[h - 1] == "r"
+            and (h < 2 or not (_is_ident_char(text[h - 2]) or text[h - 2] == "."))
+        ):
             closer = '"' + "#" * (nxt - h)
             c = find(closer, nxt + 1)
             cur = n if c == -1 else c + len(closer)
             app(text[nxt:cur] if keep_strings else _blank(text[nxt:cur]))
             pos = cur
             continue
-        # Quote character literals `'"'` and `'\"'` do not open a string.
+        # Quote character literals `'"'` and `'\"'` do not open a string, whereas an
+        # identifier prime before a string (`x'"'"`) is not a character literal.
         if (
             nxt > 0
             and nxt + 1 < n
             and text[nxt + 1] == "'"
             and (
-                text[nxt - 1] == "'"
-                or (nxt >= 2 and text[nxt - 2 : nxt] == "'\\")
+                (
+                    text[nxt - 1] == "'"
+                    and (nxt < 2 or not _is_ident_char(text[nxt - 2]))
+                )
+                or (
+                    nxt >= 2
+                    and text[nxt - 2 : nxt] == "'\\"
+                    and (nxt < 3 or not _is_ident_char(text[nxt - 3]))
+                )
             )
         ):
             app('"' if keep_strings else " ")
@@ -339,16 +381,8 @@ class _LineCounter:
 # Leading literal prefixes (`simp`, `unfold`, `delta`, `set_option`, `private`)
 # let CPython's `sre` skip ahead with a literal search instead of trying every offset.
 #
-# Header of a simp-family tactic, ending at the `[` of its lemma list: `simp`,
-# `simpa`, `simp_all`, `simp_arith`, `simp_all_arith` or `simp_rw` (`dsimp` is
-# recognised by looking one character back), optional `?` / `!` suffixes, then any
-# mix of `(config := ...)` / `(disch := ...)` arguments, `+opt` / `-opt` flags and
-# `only`.
-_SIMP_HEAD_RE = re.compile(
-    r"simp(a|_all_arith|_all|_arith|_rw)?([?!]{0,2})"
-    r"(?:\s*\((?:[^()]|\([^()]*\))*\)|\s+(?:only\b|[+-][^\W\d][\w.]*))*"
-    r"\s*\["
-)
+# Tactic suffix after `simp` (`dsimp` never accepts `a` / `_all` / `_arith` / `_rw`).
+_SIMP_VARIANT_TUPLE: tuple[str, ...] = ("_all_arith", "_all", "_arith", "_rw", "a")
 # Identifier boundaries follow Lean 4 (`\w` is Unicode-aware; `'`, `!`, `?` continue
 # an identifier; a `.` before or after means the match is only part of a longer name).
 _IDENT_BEFORE = r"(?<![\w'!?.])"
@@ -374,11 +408,8 @@ _RAW_BITWISE_RE = re.compile(
     _IDENT_BEFORE + _QUAL_PREFIX + r"(bitwise(?:And|Or)Bits)" + _UNFOLD_EQ_SUFFIX + _IDENT_AFTER
 )
 _EQ_SUFFIX_AT_RE = re.compile(r"\.(?:eq_def|eq_unfold|eq_\d+)(?![\w'!?.])")
-_UNFOLD_LIT_RE = re.compile(r"unfold([ \t]+[^\n;]+)")
-_DELTA_LIT_RE = re.compile(r"delta([ \t]+[^\n;]+)")
-_UNFOLD_STOP_RE = re.compile(r"\b(?:at|by|with|in|where|using)\b|:=")
 _PROFILER_THRESHOLD_RE = re.compile(
-    r"set_option\s+trace\.profiler\.threshold\s+(\d+)\b"
+    r"set_option\s+trace\.profiler\.threshold\s+(\d+(?:_\d+)*)(?![\w'!?])"
 )
 # Declaration names: dotted Lean 4 identifiers (`MirStepStar.mono`, `get?_set?_ne`)
 # or `«guillemet-quoted»` names. Modifiers may sit between `private` and the keyword.
@@ -388,13 +419,67 @@ _PRIVATE_LIT_RE = re.compile(
     + _DECL_NAME
     + r")"
 )
-# A line starting in column 0 begins a new top-level command; a line starting with
-# `|` begins a pattern-matching equation of the current declaration.
+# Top-level or indented Lean command boundaries (for `section` / `namespace` blocks).
 _TOPLEVEL_LINE_RE = re.compile(r"\n(?=\S)")
+_INDENTED_CMD_LINE_RE = re.compile(
+    r"\n([ \t]*)(?:@\[|"
+    r"(?:private|protected|public|scoped|local|noncomputable|partial|unsafe|"
+    r"theorem|lemma|def|abbrev|opaque|axiom|example|instance|class|structure|"
+    r"inductive|mutual|section|namespace|end|variable|open|universe|set_option)(?![\w'!?.])|"
+    r"#(?:check|eval|print|reduce)\b)"
+)
 _EQN_ALT_LINE_RE = re.compile(r"\n[ \t]*\|")
 _MATCH_OR_FUN_RE = re.compile(r"(?<![\w'!?.])(?:match|fun|λ)(?![\w'!?])")
 _HDR_TOKEN_RE = re.compile(r"[()\[\]{}]|:=|:|(?<![\w'!?.])where(?![\w'!?])")
 _RESERVED_TYPE_NAMES = frozenset(("Type", "Prop", "Sort", "Nat", "Bool", "True", "False"))
+_UNFOLD_STOP_WORDS = frozenset(
+    (
+        "at",
+        "by",
+        "with",
+        "in",
+        "where",
+        "using",
+        "fun",
+        "match",
+        "let",
+        "have",
+        "exact",
+        "apply",
+        "rw",
+        "simp",
+        "dsimp",
+        "simpa",
+        "simp_all",
+        "simp_arith",
+        "simp_all_arith",
+        "simp_rw",
+        "unfold",
+        "delta",
+        "cases",
+        "induction",
+        "rcases",
+        "obtain",
+        "intro",
+        "intros",
+        "refine",
+        "constructor",
+        "trivial",
+        "rfl",
+        "omega",
+        "decide",
+        "assumption",
+        "contradiction",
+        "nomatch",
+        "change",
+        "show",
+        "suffices",
+        "calc",
+        "conv",
+        "done",
+        "sorry",
+    )
+)
 
 
 def _has_simp_candidate(s: str) -> bool:
@@ -406,33 +491,52 @@ def _has_simp_candidate(s: str) -> bool:
     )
 
 
-def _is_erase_entry(content: str, start: int) -> bool:
-    """True when the lemma-list entry starting at `content[start]` is a simp-set
-    erasure `-name`, which removes the declaration from the simp set instead of
-    unfolding it."""
+def _is_simp_unfold_entry(content: str, start: int) -> bool:
+    """True when the match at `content[start]` stands at the head of a `dsimp`/`simp`
+    lemma-list entry (optionally preceded by `↓`/`↑`), rather than being an erasure
+    `-name`, a reverse-folding rewrite `← name` / `<- name`, or an argument to another
+    term (`simp [lookupBlock_zero Mir.X.body]`, `simp [h (Sequence.length bs)]`).
+    """
     j = start - 1
     while j >= 0 and content[j] in " \t\r\n":
         j -= 1
-    if j < 0 or content[j] != "-":
-        return False
-    j -= 1
-    while j >= 0 and content[j] in " \t\r\n":
+    if j >= 0 and content[j] in "↓↑":
         j -= 1
-    return j < 0 or content[j] == ","
+        while j >= 0 and content[j] in " \t\r\n":
+            j -= 1
+    if j < 0:
+        return True
+    if content[j] != ",":
+        return False
+    # Ensure the comma is a top-level entry separator inside `[...]`, not inside `f (a, sym)`.
+    return (
+        content.count("(", 0, j) == content.count(")", 0, j)
+        and content.count("{", 0, j) == content.count("}", 0, j)
+        and content.count("[", 0, j) == content.count("]", 0, j)
+    )
 
 
-def _active_simp_keywords(stripped: str) -> tuple[list[str], bool, bool]:
-    """Scan `stripped` once to determine active candidate keywords plus `(has_mir_body, has_bitwise)`."""
+def _active_simp_keywords(
+    stripped: str, raw_utf8: bytes | None = None
+) -> tuple[list[str], bool, bool]:
+    """Scan `stripped` once to determine active candidate keywords plus `(has_mir_body, has_bitwise)`.
+    When `raw_utf8` is available, 1-byte glibc `memmem` rejects absent ASCII keywords in
+    quarter the memory bandwidth of 2-byte `UCS-2` `str` scans.
+    """
     active_kws: list[str] = []
-    if "wpMirExecSym" in stripped:
+    if (raw_utf8 is None or b"wpMirExecSym" in raw_utf8) and "wpMirExecSym" in stripped:
         active_kws.append("wpMirExecSym")
-    if "Sequence.length" in stripped:
+    if (raw_utf8 is None or b"Sequence.length" in raw_utf8) and "Sequence.length" in stripped:
         active_kws.append("Sequence.length")
-    has_mir_body = ".body" in stripped and "Mir." in stripped
+    has_mir_body = (
+        (raw_utf8 is None or (b".body" in raw_utf8 and b"Mir." in raw_utf8))
+        and ".body" in stripped
+        and "Mir." in stripped
+    )
     if has_mir_body:
         active_kws.append(".body")
     has_bitwise = False
-    if "bitwise" in stripped:
+    if (raw_utf8 is None or b"bitwise" in raw_utf8) and "bitwise" in stripped:
         if "bitwiseAndBits" in stripped:
             active_kws.append("bitwiseAndBits")
             has_bitwise = True
@@ -454,6 +558,38 @@ def _is_symbol_end(stripped: str, end: int) -> bool:
     return not _is_ident_char(ch)
 
 
+def _step_back_simp_header_start(stripped: str, open_bracket: int) -> int:
+    """Walk backwards from `open_bracket` across `only`, `+opt`/`-opt`, and arbitrarily
+    nested `(...)` config/discharger arguments to find a safe window start for `simp`."""
+    cur = open_bracket
+    floor = open_bracket - 2048 if open_bracket > 2048 else 0
+    while cur > floor:
+        while cur > floor and stripped[cur - 1] in " \t\r\n":
+            cur -= 1
+        if cur <= floor:
+            break
+        if stripped[cur - 1] == ")":
+            depth = 1
+            cur -= 1
+            while cur > floor and depth > 0:
+                ch = stripped[cur - 1]
+                if ch == ")":
+                    depth += 1
+                elif ch == "(":
+                    depth -= 1
+                cur -= 1
+            continue
+        # Step back over an identifier/flag (`only`, `+arith`, `simp_all_arith?`)
+        end_tok = cur
+        while cur > floor and (
+            _is_ident_char(stripped[cur - 1]) or stripped[cur - 1] in ".+-"
+        ):
+            cur -= 1
+        if cur == end_tok:
+            break
+    return cur - 16 if cur > 16 else 0
+
+
 def _candidate_search_windows(
     stripped: str,
     active_kws: list[str] | None = None,
@@ -472,9 +608,6 @@ def _candidate_search_windows(
         check_before = kw[0] != "."
         pos = stripped.find(kw, 0)
         while pos != -1:
-            # Occurrences inside longer names (`Trusted.Sequence.length_append`,
-            # `bitwiseAndBitsFast`, `MySequence.length`) can never be findings; skip
-            # them before any bracket work so lemma-dense proofs stay cheap.
             if not _is_symbol_end(stripped, pos + klen) or (
                 check_before and pos > 0 and _is_ident_char(stripped[pos - 1])
             ):
@@ -484,9 +617,7 @@ def _candidate_search_windows(
             last_open = stripped.rfind("[", w_start, pos)
             if last_open != -1:
                 if stripped.find("]", last_open, pos) == -1:
-                    # Room for `(config := ...)` / `+opt` / `only` between the
-                    # tactic keyword and its `[`.
-                    hdr_start = last_open - 256 if last_open > 256 else 0
+                    hdr_start = _step_back_simp_header_start(stripped, last_open)
                     if stripped.find("simp", hdr_start, last_open) != -1:
                         raw_spans.append((hdr_start, last_open + 1))
                 elif stripped.find("simp", w_start, pos) != -1 and (
@@ -508,6 +639,69 @@ def _candidate_search_windows(
     return merged
 
 
+def _match_simp_head(stripped: str, s_idx: int, n: int) -> tuple[str, int] | None:
+    """If `stripped[s_idx:]` begins the `simp...` part of a simp-family tactic header
+    followed by `[`, return `(tactic_kind, open_bracket_idx)`; otherwise `None`.
+    Supports arbitrarily nested `(...)` inside `(config := ...)` / `(disch := ...)`.
+    """
+    is_dsimp = False
+    if s_idx > 0 and stripped[s_idx - 1] == "d":
+        if s_idx > 1 and (_is_ident_char(stripped[s_idx - 2]) or stripped[s_idx - 2] == "."):
+            return None
+        is_dsimp = True
+    elif s_idx > 0 and (_is_ident_char(stripped[s_idx - 1]) or stripped[s_idx - 1] == "."):
+        return None
+
+    cur = s_idx + 4
+    variant = ""
+    if not is_dsimp:
+        for cand in _SIMP_VARIANT_TUPLE:
+            if stripped.startswith(cand, cur):
+                variant = cand
+                cur += len(cand)
+                break
+    qbang_start = cur
+    while cur < n and cur - qbang_start < 2 and stripped[cur] in "!?":
+        cur += 1
+    if cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] == "."):
+        return None
+    tactic_kind = ("d" if is_dsimp else "") + "simp" + variant + stripped[qbang_start:cur]
+
+    while cur < n:
+        while cur < n and stripped[cur] in " \t\r\n":
+            cur += 1
+        if cur >= n:
+            return None
+        ch = stripped[cur]
+        if ch == "[":
+            return tactic_kind, cur
+        if ch == "(":
+            depth = 1
+            cur += 1
+            while cur < n and depth > 0:
+                c2 = stripped[cur]
+                if c2 == "(":
+                    depth += 1
+                elif c2 == ")":
+                    depth -= 1
+                cur += 1
+            if depth != 0:
+                return None
+            continue
+        if stripped.startswith("only", cur) and (
+            cur + 4 >= n or not (_is_ident_char(stripped[cur + 4]) or stripped[cur + 4] == ".")
+        ):
+            cur += 4
+            continue
+        if ch in "+-" and cur + 1 < n and (stripped[cur + 1].isalpha() or stripped[cur + 1] == "_"):
+            cur += 2
+            while cur < n and (_is_ident_char(stripped[cur]) or stripped[cur] == "."):
+                cur += 1
+            continue
+        return None
+    return None
+
+
 def _iter_simp_brackets(
     stripped: str,
     active_kws: list[str] | None = None,
@@ -520,31 +714,30 @@ def _iter_simp_brackets(
     n = len(stripped)
     seen_open: set[int] = set()
     for win_start, win_end in _candidate_search_windows(stripped, active_kws=active_kws):
-        for m in _SIMP_HEAD_RE.finditer(stripped, win_start, win_end):
-            s_idx = m.start()
-            prefix = ""
-            if s_idx > 0 and stripped[s_idx - 1] == "d":
-                if s_idx > 1 and (_is_ident_char(stripped[s_idx - 2]) or stripped[s_idx - 2] == "."):
-                    continue
-                prefix = "d"
-            elif s_idx > 0 and (_is_ident_char(stripped[s_idx - 1]) or stripped[s_idx - 1] == "."):
+        pos = stripped.find("simp", win_start, win_end)
+        while pos != -1:
+            matched = _match_simp_head(stripped, pos, n)
+            if matched is None:
+                pos = stripped.find("simp", pos + 4, win_end)
                 continue
-            tactic_kind = prefix + "simp" + (m.group(1) or "") + m.group(2)
-
-            open_idx = m.end() - 1
+            tactic_kind, open_idx = matched
             if open_idx in seen_open:
+                pos = stripped.find("simp", pos + 4, win_end)
                 continue
             seen_open.add(open_idx)
 
-            first_close = stripped.find("]", m.end())
+            body_start = open_idx + 1
+            first_close = stripped.find("]", body_start)
             if first_close == -1:
+                pos = stripped.find("simp", pos + 4, win_end)
                 continue
-            first_open = stripped.find("[", m.end(), first_close)
+            first_open = stripped.find("[", body_start, first_close)
             if first_open == -1:
-                yield tactic_kind, open_idx, first_close, stripped[open_idx + 1 : first_close]
+                yield tactic_kind, open_idx, first_close, stripped[body_start:first_close]
+                pos = stripped.find("simp", pos + 4, win_end)
                 continue
             depth = 1
-            i = m.end()
+            i = body_start
             while i < n and depth > 0:
                 ch = stripped[i]
                 if ch == "[":
@@ -554,32 +747,134 @@ def _iter_simp_brackets(
                 i += 1
             if depth == 0:
                 close_idx = i - 1
-                yield tactic_kind, open_idx, close_idx, stripped[open_idx + 1 : close_idx]
+                yield tactic_kind, open_idx, close_idx, stripped[body_start:close_idx]
+            pos = stripped.find("simp", pos + 4, win_end)
 
 
-def _decl_header_span(stripped: str, start_pos: int) -> tuple[str, int]:
-    """Locate the header (binders and `: <type>`) of the declaration whose name ends
-    at `start_pos` in comment-stripped text.
-
-    The header ends at the top-level `:=` or `where`, or at the first
-    pattern-matching equation line (`| ...` not preceded by a `match` / `fun` in the
-    header, so match arms inside a statement stay part of it), and must contain a
-    `:`. It never extends past the next column-0 command or 2,500 characters.
-    Returns `(header, body_start)` with `body_start` the offset where the body
-    begins, or `("", -1)` when no complete header is found.
+def _iter_unfold_targets(stripped: str) -> Iterable[tuple[str, int, str]]:
+    """Yield `(tactic_kw, token_offset, token)` for every identifier passed to an
+    `unfold` or `delta` tactic, across both single-line and indented multiline target
+    lists, while rejecting `.unfold`/`.delta` field projections and honoring Lean
+    identifier characters (`at'`, `in?`) on stop-word checks.
     """
     n = len(stripped)
-    limit = min(n, start_pos + 2500)
+    for kw in ("unfold", "delta"):
+        klen = len(kw)
+        pos = stripped.find(kw, 0)
+        while pos != -1:
+            end_kw = pos + klen
+            if (
+                (pos > 0 and (_is_ident_char(stripped[pos - 1]) or stripped[pos - 1] == "."))
+                or end_kw >= n
+                or stripped[end_kw] not in " \t\r\n"
+            ):
+                pos = stripped.find(kw, end_kw)
+                continue
+            line_start = stripped.rfind("\n", 0, pos) + 1
+            k_ind = line_start
+            while k_ind < pos and stripped[k_ind] in " \t":
+                k_ind += 1
+            line_indent = k_ind - line_start
+
+            cur = end_kw
+            while cur < n:
+                while cur < n and stripped[cur] in " \t\r":
+                    cur += 1
+                if cur >= n:
+                    break
+                if stripped[cur] == "\n":
+                    nxt_line = cur + 1
+                    k = nxt_line
+                    while k < n and stripped[k] in " \t":
+                        k += 1
+                    if k >= n:
+                        cur = k
+                        break
+                    if stripped[k] in "\r\n":
+                        cur = k
+                        continue
+                    if k - nxt_line <= line_indent:
+                        break
+                    cur = k
+                ch = stripped[cur]
+                if not (_is_ident_char(ch) or ch == "«"):
+                    break
+                tok_start = cur
+                while cur < n:
+                    c2 = stripped[cur]
+                    if c2 == "«":
+                        g_end = stripped.find("»", cur + 1)
+                        if g_end == -1 or stripped.find("\n", cur + 1, g_end) != -1:
+                            cur += 1
+                            break
+                        cur = g_end + 1
+                    elif _is_ident_char(c2) or c2 == ".":
+                        cur += 1
+                    else:
+                        break
+                tok = stripped[tok_start:cur]
+                if not tok or tok in _UNFOLD_STOP_WORDS:
+                    break
+                yield kw, tok_start, tok
+            pos = stripped.find(kw, end_kw)
+
+
+def _line_indent_at(stripped: str, pos: int) -> int:
+    line_start = stripped.rfind("\n", 0, pos) + 1
+    k = line_start
+    n = len(stripped)
+    while k < n and stripped[k] in " \t":
+        k += 1
+    return k - line_start
+
+
+def _next_decl_boundary(stripped: str, start_pos: int, max_end: int, decl_indent: int) -> int:
+    """Earliest offset in `stripped[start_pos:max_end]` where a new declaration or
+    section/namespace command begins (column 0 when `decl_indent == 0`, or any command
+    at indentation `<= decl_indent` inside an indented `section`/`namespace`).
+    """
+    if decl_indent <= 0:
+        m = _TOPLEVEL_LINE_RE.search(stripped, start_pos, max_end)
+        return m.start() if m is not None else max_end
+    limit = max_end
     m_top = _TOPLEVEL_LINE_RE.search(stripped, start_pos, limit)
     if m_top is not None:
         limit = m_top.start()
+    for m_ind in _INDENTED_CMD_LINE_RE.finditer(stripped, start_pos, limit):
+        if len(m_ind.group(1).expandtabs(2)) <= decl_indent and len(m_ind.group(1)) <= decl_indent:
+            return m_ind.start()
+    return limit
+
+
+def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tuple[str, int]:
+    """Locate the header (binders and `: <type>`) of the declaration whose name ends
+    at `start_pos` in comment-stripped text.
+    """
+    n = len(stripped)
+    max_end = min(n, start_pos + 2500)
+    # Fast C `str.find(":=")` path before running regexes across all 2,500 chars:
+    # check boundaries only on the short `[start_pos:first_ce]` slice when unambiguous.
+    first_ce = stripped.find(":=", start_pos, max_end)
+    if first_ce != -1:
+        cand0 = stripped[start_pos:first_ce]
+        if (
+            ":" in cand0
+            and "|" not in cand0
+            and "let " not in cand0
+            and "where" not in cand0
+            and cand0.count("(") == cand0.count(")")
+            and cand0.count("{") == cand0.count("}")
+            and cand0.count("[") == cand0.count("]")
+            and _next_decl_boundary(stripped, start_pos, first_ce, decl_indent) == first_ce
+        ):
+            return cand0, first_ce + 2
+
+    limit = _next_decl_boundary(stripped, start_pos, max_end, decl_indent)
     eqn_end = False
     m_alt = _EQN_ALT_LINE_RE.search(stripped, start_pos, limit)
     if m_alt is not None and _MATCH_OR_FUN_RE.search(stripped, start_pos, m_alt.start()) is None:
         eqn_end = True
         limit = m_alt.start()
-    # Fast C `str.find(":=")` + `str.count` delimiter balance check (skips `{ field := val }`
-    # structure literals inside binders/types while staying in C).
     search_pos = start_pos
     while search_pos < limit:
         colon_eq = stripped.find(":=", search_pos, limit)
@@ -621,19 +916,6 @@ def _decl_header_span(stripped: str, start_pos: int) -> tuple[str, int]:
     return "", -1
 
 
-def _decl_body_key(raw: str, stripped: str, body_start: int) -> str:
-    """Definition body from `body_start` to the next column-0 command, with comments
-    removed but string literals kept (`.adt "S"` and `.adt "U"` are different
-    bodies) and whitespace runs collapsed; empty when the body position is unknown.
-    `stripped` is `strip_lean_comments_and_strings(raw)`, so offsets agree."""
-    if body_start < 0 or body_start > len(stripped) or len(raw) != len(stripped):
-        return ""
-    m = _TOPLEVEL_LINE_RE.search(stripped, body_start)
-    end = m.start() if m is not None else len(stripped)
-    body = strip_lean_comments_and_strings(raw[body_start:end], keep_strings=True)
-    return " ".join(body.split())
-
-
 _SIG_PAD_CHARS: tuple[tuple[str, str], ...] = (
     ("(", " ( "),
     (")", " ) "),
@@ -649,7 +931,6 @@ _SIG_PAD_CHARS: tuple[tuple[str, str], ...] = (
     ("*", " * "),
 )
 
-
 _BINDER_IDENT_RE = re.compile(r"[^\W\d][\w'!?]*")
 
 
@@ -657,85 +938,215 @@ def _is_valid_binder_ident(tok: str) -> bool:
     return _BINDER_IDENT_RE.fullmatch(tok) is not None
 
 
+def _apply_rename_to_code_segment(segment: str, rename_map: dict[str, str]) -> str:
+    padded = segment
+    for ch, repl in _SIG_PAD_CHARS:
+        if ch in padded:
+            padded = padded.replace(ch, repl)
+    tokens = padded.split()
+    if not rename_map:
+        return " ".join(tokens)
+    out: list[str] = []
+    for tok in tokens:
+        mapped = rename_map.get(tok)
+        if mapped is not None:
+            out.append(mapped)
+        elif "." in tok and not tok.startswith("."):
+            head, dot, tail = tok.partition(".")
+            out.append(rename_map.get(head, head) + dot + tail)
+        else:
+            out.append(tok)
+    return " ".join(out)
+
+
+def _decl_body_key(
+    raw: str,
+    stripped: str,
+    body_start: int,
+    decl_indent: int = 0,
+    rename_map: dict[str, str] | None = None,
+) -> str:
+    """Canonicalized definition body from `body_start` to the next command boundary:
+    comments are stripped, string literals (`"..."` / `r#"..."#`) are preserved
+    verbatim (including internal spaces!), punctuation/whitespace in code is normalized,
+    and header binder variables are alpha-renamed via `rename_map`.
+    """
+    if body_start < 0 or body_start > len(stripped) or len(raw) != len(stripped):
+        return ""
+    end = _next_decl_boundary(stripped, body_start, len(stripped), decl_indent)
+    raw_slice = raw[body_start:end]
+    no_comments = strip_lean_comments_and_strings(raw_slice, keep_strings=True)
+    rmap = rename_map or {}
+    if '"' not in no_comments:
+        return _apply_rename_to_code_segment(no_comments, rmap)
+
+    parts: list[str] = []
+    n = len(no_comments)
+    pos = 0
+    while pos < n:
+        q = no_comments.find('"', pos)
+        if q == -1:
+            seg = _apply_rename_to_code_segment(no_comments[pos:], rmap)
+            if seg:
+                parts.append(seg)
+            break
+        # Check for raw string literal `r"..."` / `r#"..."#`
+        h = q
+        while h > pos and no_comments[h - 1] == "#":
+            h -= 1
+        if (
+            h > pos
+            and no_comments[h - 1] == "r"
+            and (h - 1 == pos or not (_is_ident_char(no_comments[h - 2]) or no_comments[h - 2] == "."))
+        ):
+            seg = _apply_rename_to_code_segment(no_comments[pos : h - 1], rmap)
+            if seg:
+                parts.append(seg)
+            closer = '"' + "#" * (q - h)
+            c = no_comments.find(closer, q + 1)
+            str_end = n if c == -1 else c + len(closer)
+            parts.append(no_comments[h - 1 : str_end])
+            pos = str_end
+            continue
+        # Quote char literals `'"'` / `'\"'`
+        if (
+            q > pos
+            and q + 1 < n
+            and no_comments[q + 1] == "'"
+            and (
+                (no_comments[q - 1] == "'" and (q - 1 == pos or not _is_ident_char(no_comments[q - 2])))
+                or (
+                    q - pos >= 2
+                    and no_comments[q - 2 : q] == "'\\"
+                    and (q - 2 == pos or not _is_ident_char(no_comments[q - 3]))
+                )
+            )
+        ):
+            seg = _apply_rename_to_code_segment(no_comments[pos : q - (1 if no_comments[q - 1] == "'" else 2)], rmap)
+            if seg:
+                parts.append(seg)
+            lit_start = q - (1 if no_comments[q - 1] == "'" else 2)
+            parts.append(no_comments[lit_start : q + 2])
+            pos = q + 2
+            continue
+        # Normal `"..."` string literal
+        seg = _apply_rename_to_code_segment(no_comments[pos:q], rmap)
+        if seg:
+            parts.append(seg)
+        cur = q + 1
+        while cur < n:
+            q2 = no_comments.find('"', cur)
+            if q2 == -1:
+                cur = n
+                break
+            bs = 0
+            k = q2 - 1
+            while k >= q + 1 and no_comments[k] == "\\":
+                bs += 1
+                k -= 1
+            cur = q2 + 1
+            if bs % 2 == 0:
+                break
+        parts.append(no_comments[q:cur])
+        pos = cur
+    return " ".join(parts)
+
+
 # `_normalize_signature` is pure; memoizing it lets the before/after scans of one
 # edit (and repeated scans in one process) normalize each distinct header once.
-_NORM_SIG_CACHE: dict[str, str] = {}
+_NORM_SIG_CACHE: dict[str, tuple[str, dict[str, str]]] = {}
+
+
+def _find_matching_binder_close(header: str, open_idx: int) -> tuple[int, int]:
+    """Given `header[open_idx]` in `'([{'`, return `(close_idx, top_colon_idx)` where
+    `close_idx` is the matching balanced closer and `top_colon_idx` is the first single
+    `:` (not `:=`) at relative nesting depth 0 inside the binder (or `-1` if none).
+    """
+    open_ch = header[open_idx]
+    close_ch = ")" if open_ch == "(" else ("}" if open_ch == "{" else "]")
+    n = len(header)
+    depth = 1
+    p_depth = 0
+    b_depth = 0
+    k_depth = 0
+    top_colon = -1
+    i = open_idx + 1
+    while i < n:
+        ch = header[i]
+        if ch == close_ch and p_depth == 0 and b_depth == 0 and k_depth == 0:
+            depth -= 1
+            if depth == 0:
+                return i, top_colon
+        if ch == "(":
+            p_depth += 1
+        elif ch == ")":
+            if p_depth > 0:
+                p_depth -= 1
+        elif ch == "{":
+            b_depth += 1
+        elif ch == "}":
+            if b_depth > 0:
+                b_depth -= 1
+        elif ch == "[":
+            k_depth += 1
+        elif ch == "]":
+            if k_depth > 0:
+                k_depth -= 1
+        elif (
+            top_colon == -1
+            and p_depth == 0
+            and b_depth == 0
+            and k_depth == 0
+            and ch == ":"
+            and (i + 1 >= n or header[i + 1] != "=")
+            and (i == open_idx + 1 or header[i - 1] != ":")
+        ):
+            top_colon = i
+        i += 1
+    return -1, -1
+
+
+def _normalize_signature_with_map(raw_header: str) -> tuple[str, dict[str, str]]:
+    """Return `(normalized_signature, rename_map)` for `raw_header`."""
+    if not raw_header or ":" not in raw_header:
+        return "", {}
+    cached = _NORM_SIG_CACHE.get(raw_header)
+    if cached is not None:
+        return cached
+    if len(_NORM_SIG_CACHE) >= 8192:
+        _NORM_SIG_CACHE.clear()
+    res = _normalize_signature_uncached(raw_header)
+    _NORM_SIG_CACHE[raw_header] = res
+    return res
 
 
 def _normalize_signature(raw_header: str) -> str:
     """Normalize whitespace/punctuation and alpha-rename binder variables for duplicate detection."""
-    if not raw_header or ":" not in raw_header:
-        return ""
-    cached = _NORM_SIG_CACHE.get(raw_header)
-    if cached is None:
-        if len(_NORM_SIG_CACHE) >= 8192:
-            _NORM_SIG_CACHE.clear()
-        cached = _NORM_SIG_CACHE[raw_header] = _normalize_signature_uncached(raw_header)
-    return cached
+    return _normalize_signature_with_map(raw_header)[0]
 
 
-def _normalize_signature_uncached(raw_header: str) -> str:
-    padded = raw_header
-    for ch, repl in _SIG_PAD_CHARS:
-        if ch in padded:
-            padded = padded.replace(ch, repl)
-    padded_tokens = padded.split()
-    if not padded_tokens:
-        return ""
-    if "(" not in raw_header and "{" not in raw_header:
-        return " ".join(padded_tokens)
+def _normalize_signature_uncached(raw_header: str) -> tuple[str, dict[str, str]]:
+    if "(" not in raw_header and "{" not in raw_header and "[" not in raw_header:
+        return _apply_rename_to_code_segment(raw_header, {}), {}
     rename_map: dict[str, str] = {}
     counter = 0
     n = len(raw_header)
-    pos = 0
-    # Next `(` / `{` at or after `pos`, re-searched only once `pos` passes them, so
-    # the binder walk stays linear in the header length.
-    p1 = raw_header.find("(")
-    p2 = raw_header.find("{")
-    while pos < n:
-        if p1 != -1 and p1 < pos:
-            p1 = raw_header.find("(", pos)
-        if p2 != -1 and p2 < pos:
-            p2 = raw_header.find("{", pos)
-        if p1 == -1 and p2 == -1:
-            break
-        open_idx = p1 if (p2 == -1 or (p1 != -1 and p1 < p2)) else p2
-        close_ch = ")" if raw_header[open_idx] == "(" else "}"
-        close_idx = raw_header.find(close_ch, open_idx + 1)
-        if close_idx == -1:
-            break
-        inner = raw_header[open_idx + 1 : close_idx]
-        if (
-            ":" in inner
-            and "(" not in inner
-            and ")" not in inner
-            and "{" not in inner
-            and "}" not in inner
-        ):
-            lhs = inner.partition(":")[0].strip()
-            if lhs:
-                tokens = lhs.split()
-                if all(_is_valid_binder_ident(t) for t in tokens):
-                    for vname in tokens:
-                        if vname not in rename_map and vname not in _RESERVED_TYPE_NAMES:
-                            rename_map[vname] = f"_v{counter}"
-                            counter += 1
-            pos = close_idx + 1
-        else:
-            pos = open_idx + 1
-    if not rename_map:
-        return " ".join(padded_tokens)
-    out_tokens: list[str] = []
-    for tok in padded_tokens:
-        mapped = rename_map.get(tok)
-        if mapped is not None:
-            out_tokens.append(mapped)
-        elif "." in tok and not tok.startswith("."):
-            head, dot, tail = tok.partition(".")
-            out_tokens.append(rename_map.get(head, head) + dot + tail)
-        else:
-            out_tokens.append(tok)
-    return " ".join(out_tokens)
+    for i in range(n):
+        if raw_header[i] not in "({[":
+            continue
+        close_idx, colon_idx = _find_matching_binder_close(raw_header, i)
+        if close_idx == -1 or colon_idx == -1:
+            continue
+        lhs = raw_header[i + 1 : colon_idx].strip()
+        if not lhs:
+            continue
+        tokens = lhs.split()
+        if all(_is_valid_binder_ident(t) for t in tokens):
+            for vname in tokens:
+                if vname not in rename_map and vname not in _RESERVED_TYPE_NAMES:
+                    rename_map[vname] = f"_v{counter}"
+                    counter += 1
+    return _apply_rename_to_code_segment(raw_header, rename_map), rename_map
 
 
 def _header_fingerprint(raw_header: str) -> tuple[int, int, int, int]:
@@ -774,7 +1185,8 @@ def extract_private_decls(
                     line = line_of(pos)
                 else:
                     line = _offset_to_line(newline_offsets, pos)
-                raw_header, body_start = _decl_header_span(stripped, m.end())
+                decl_indent = _line_indent_at(stripped, pos)
+                raw_header, body_start = _decl_header_span(stripped, m.end(), decl_indent)
                 sig_fp = _header_fingerprint(raw_header)
                 norm_sig = "" if lazy_norm else _normalize_signature(raw_header)
                 decls.append(
@@ -788,6 +1200,7 @@ def extract_private_decls(
                         sig_fp=sig_fp,
                         body_start=body_start,
                         path=file_path,
+                        decl_indent=decl_indent,
                     )
                 )
                 pos = stripped.find("private", m.end())
@@ -825,7 +1238,16 @@ def _index_entry(st: os.stat_result, decls: list[PrivateDecl]) -> list[Any]:
         st.st_mtime_ns,
         st.st_size,
         [
-            [d.kind, d.name, d.line, d.body_start, d.ensure_norm_sig(), list(d.sig_fp)]
+            [
+                d.kind,
+                d.name,
+                d.line,
+                d.body_start,
+                d.ensure_norm_sig(),
+                list(d.sig_fp),
+                d.decl_indent,
+                d.raw_header if d.kind == "def" else "",
+            ]
             for d in decls
         ],
     ]
@@ -840,7 +1262,14 @@ def _decls_from_index_entry(
         if entry[0] != st.st_mtime_ns or entry[1] != st.st_size:
             return None
         out: list[PrivateDecl] = []
-        for kind, name, line, body_start, norm_sig, fp in entry[2]:
+        for rec in entry[2]:
+            if len(rec) == 8:
+                kind, name, line, body_start, norm_sig, fp, decl_indent, raw_header = rec
+            elif len(rec) == 6:
+                kind, name, line, body_start, norm_sig, fp = rec
+                decl_indent, raw_header = 0, ""
+            else:
+                return None
             if kind not in ("theorem", "lemma", "def"):
                 return None
             out.append(
@@ -850,9 +1279,11 @@ def _decls_from_index_entry(
                     norm_sig=str(norm_sig),
                     line=int(line),
                     file=path.name,
+                    raw_header=str(raw_header),
                     sig_fp=(int(fp[0]), int(fp[1]), int(fp[2]), int(fp[3])),
                     body_start=int(body_start),
                     path=str(path),
+                    decl_indent=int(decl_indent),
                 )
             )
         return out
@@ -1017,10 +1448,12 @@ def _duplicate_private_findings(
         return (_sig_class(d.kind), ns) if ns else None
 
     # Definition bodies are compared in two steps: a cheap key (counts taken on the
-    # comment- and string-blanked body, independent of whitespace layout) rejects
-    # almost every pair, and only bodies with equal cheap keys are compared exactly,
-    # comments removed but string literals kept and whitespace collapsed.
-    quick_keys: dict[int, tuple[int, int, int] | None] = {}
+    # Definition bodies are compared in two steps: a rename-invariant delimiter-skeleton
+    # key rejects structurally distinct bodies cheaply, and only bodies with equal
+    # delimiter skeletons are compared after comment-stripping, string-literal
+    # preservation, and header-binder alpha-renaming.
+    BodyQuickKey = tuple[int, int, int, int, int]
+    quick_keys: dict[int, BodyQuickKey | None] = {}
     exact_keys: dict[int, str] = {}
 
     def body_span(d: PrivateDecl, local: bool) -> tuple[str, str, int, int] | None:
@@ -1030,19 +1463,24 @@ def _duplicate_private_findings(
         r, st = texts
         if d.body_start < 0 or d.body_start > len(st) or len(r) != len(st):
             return None
-        m = _TOPLEVEL_LINE_RE.search(st, d.body_start)
-        return r, st, d.body_start, (m.start() if m is not None else len(st))
+        end = _next_decl_boundary(st, d.body_start, len(st), d.decl_indent)
+        return r, st, d.body_start, end
 
-    def quick_key(d: PrivateDecl, local: bool) -> tuple[int, int, int] | None:
+    def quick_key(d: PrivateDecl, local: bool) -> BodyQuickKey | None:
         k = id(d)
         if k not in quick_keys:
-            key = None
+            key: BodyQuickKey | None = None
             span = body_span(d, local)
             if span is not None:
-                st, b, e = span[1], span[2], span[3]
-                visible = e - b - st.count(" ", b, e) - st.count("\n", b, e) - st.count("\t", b, e)
-                if visible > 0:
-                    key = (visible, st.count("(", b, e), st.count(":", b, e))
+                r, st, b, e = span
+                if b < e and r[b:e].strip():
+                    key = (
+                        st.count("(", b, e),
+                        st.count("{", b, e),
+                        st.count("[", b, e),
+                        st.count(":", b, e),
+                        st.count(",", b, e),
+                    )
             quick_keys[k] = key
         return quick_keys[k]
 
@@ -1051,18 +1489,26 @@ def _duplicate_private_findings(
         v = exact_keys.get(k)
         if v is None:
             span = body_span(d, local)
-            v = _decl_body_key(span[0], span[1], span[2]) if span is not None else ""
+            if span is not None:
+                v = _decl_body_key(
+                    span[0], span[1], span[2], d.decl_indent, d.ensure_rename_map()
+                )
+            else:
+                v = ""
             exact_keys[k] = v
         return v
 
     def match_in(
-        d: PrivateDecl, buckets: dict[tuple[int, int, int], list[PrivateDecl]], local: bool
+        d: PrivateDecl, buckets: dict[BodyQuickKey, list[PrivateDecl]], local: bool
     ) -> PrivateDecl | None:
         q = quick_key(d, True)
         if q is None:
             return None
+        target_exact = exact_key(d, True)
+        if not target_exact:
+            return None
         for c in buckets.get(q, ()):
-            if exact_key(c, local) == exact_key(d, True):
+            if exact_key(c, local) == target_exact:
                 return c
         return None
 
@@ -1081,9 +1527,9 @@ def _duplicate_private_findings(
             ext_by_sig.setdefault(k, []).append(d)
     # Sibling definitions of one signature, bucketed by cheap body key on first use
     # (so sibling texts are only re-read for signatures a local definition shares).
-    ext_def_buckets: dict[tuple[str, str], dict[tuple[int, int, int], list[PrivateDecl]]] = {}
+    ext_def_buckets: dict[tuple[str, str], dict[BodyQuickKey, list[PrivateDecl]]] = {}
 
-    def ext_def_bucket(k: tuple[str, str]) -> dict[tuple[int, int, int], list[PrivateDecl]]:
+    def ext_def_bucket(k: tuple[str, str]) -> dict[BodyQuickKey, list[PrivateDecl]]:
         b = ext_def_buckets.get(k)
         if b is None:
             b = {}
@@ -1097,7 +1543,7 @@ def _duplicate_private_findings(
     findings: list[ProofHealthFinding] = []
     seen_names: dict[str, PrivateDecl] = {}
     seen_props: dict[tuple[str, str], PrivateDecl] = {}
-    seen_def_buckets: dict[tuple[str, str], dict[tuple[int, int, int], list[PrivateDecl]]] = {}
+    seen_def_buckets: dict[tuple[str, str], dict[BodyQuickKey, list[PrivateDecl]]] = {}
     for d, k in zip(local_decls, local_keys):
         same = "signature and body" if d.kind == "def" else "signature"
         dup_reason: str | None = None
@@ -1165,13 +1611,14 @@ def scan_lean_text(
     file_path: str | Path | None = None,
     scan_siblings: bool = True,
     sibling_decls: list[PrivateDecl] | None = None,
+    raw_utf8: bytes | None = None,
 ) -> list[ProofHealthFinding]:
     """Scan Lean 4 source `text` and return all structural proof-health findings."""
-    stripped = strip_lean_comments_and_strings(text)
+    stripped = strip_lean_comments_and_strings(text, raw_utf8=raw_utf8)
     line_of = _LineCounter(stripped)
     findings: list[ProofHealthFinding] = []
 
-    active_kws, has_mir_body, has_bitwise = _active_simp_keywords(stripped)
+    active_kws, has_mir_body, has_bitwise = _active_simp_keywords(stripped, raw_utf8)
 
     # Rules 1, 2, 3 inside `dsimp [...]` / `simp [...]` bracket lists
     if active_kws and "simp" in stripped:
@@ -1183,13 +1630,13 @@ def scan_lean_text(
             base_offset = open_idx + 1
 
             # Rule 1: `dsimp_forbidden_sym`
-            # The rule is purely syntactic, as specified: any occurrence inside a
-            # `dsimp`/`simp` bracket list counts, whatever the `at` location or the
-            # other list entries (no identifier- or location-based exemptions). Only
-            # erasures `-name`, which keep the symbol folded, are not occurrences.
+            # Purely syntactic over unfolded simp-lemma entries (`[sym, ...]`), with no
+            # location- or neighbour-based exemptions; erasures (`-sym`), reverse-folding
+            # rewrites (`← sym`), and arguments passed to other lemmas (`[f sym]`) do not
+            # unfold `sym`.
             if "wpMirExecSym" in content or "Sequence.length" in content:
                 for sm in _FORBIDDEN_SIMP_SYM_RE.finditer(content):
-                    if _is_erase_entry(content, sm.start()):
+                    if not _is_simp_unfold_entry(content, sm.start()):
                         continue
                     sym = sm.group(1)
                     line = line_of(base_offset + sm.start(1))
@@ -1212,7 +1659,7 @@ def scan_lean_text(
             # Rule 2: `dsimp_mir_body_unfold` inside `dsimp` / `simp`
             if has_mir_body and "Mir." in content and ".body" in content:
                 for bm in _MIR_BODY_RE.finditer(content):
-                    if _is_erase_entry(content, bm.start()):
+                    if not _is_simp_unfold_entry(content, bm.start()):
                         continue
                     sym = bm.group(1)
                     line = line_of(base_offset + bm.start(1))
@@ -1235,7 +1682,7 @@ def scan_lean_text(
             # Rule 3: `raw_bitwise_unfold` inside `dsimp` / `simp`
             if has_bitwise and "bitwise" in content:
                 for rwm in _RAW_BITWISE_RE.finditer(content):
-                    if _is_erase_entry(content, rwm.start()):
+                    if not _is_simp_unfold_entry(content, rwm.start()):
                         continue
                     sym = rwm.group(1)
                     line = line_of(base_offset + rwm.start(1))
@@ -1255,67 +1702,57 @@ def scan_lean_text(
                         )
                     )
 
-    # Rules 2 & 3 inside `unfold` / `delta` tactics
-    if has_mir_body or has_bitwise:
-        tactic_regexes = []
-        if "unfold" in stripped:
-            tactic_regexes.append(_UNFOLD_LIT_RE)
-        if "delta" in stripped:
-            tactic_regexes.append(_DELTA_LIT_RE)
-        for rx in tactic_regexes:
-            for um in rx.finditer(stripped):
-                if um.start() > 0 and _is_ident_char(stripped[um.start() - 1]):
-                    continue
-                arg_span = um.group(1)
-                if ".body" not in arg_span and "bitwise" not in arg_span:
-                    continue
-                stop_m = _UNFOLD_STOP_RE.search(arg_span)
-                if stop_m is not None:
-                    arg_span = arg_span[: stop_m.start()]
-                arg_base = um.start(1)
-                for bm in _MIR_BODY_RE.finditer(arg_span):
+    # Rules 2 & 3 inside `unfold` / `delta` tactics (single-line and multiline)
+    if (has_mir_body or has_bitwise) and ("unfold" in stripped or "delta" in stripped):
+        for tactic_kw, tok_off, tok in _iter_unfold_targets(stripped):
+            if has_mir_body and ".body" in tok and "Mir." in tok:
+                bm = _MIR_BODY_RE.fullmatch(tok)
+                if bm is not None:
                     sym = bm.group(1)
-                    line = line_of(arg_base + bm.start(1))
+                    line = line_of(tok_off + bm.start(1))
                     findings.append(
                         ProofHealthFinding(
                             rule=RULE_DSIMP_MIR_BODY_UNFOLD,
                             line=line,
                             symbol=sym,
                             message=(
-                                f"Unfolding `{sym}` via `unfold` substitutes the full CFG basic-block "
+                                f"Unfolding `{sym}` via `{tactic_kw}` substitutes the full CFG basic-block "
                                 "table into the proof goal."
                             ),
                             suggestion=(
                                 "Pre-project basic blocks into top-level `itemBBk` definitions "
-                                "and rewrite with `lookupBlock` lemmas instead of unfolding `.body`."
+                                f"and rewrite with `lookupBlock` lemmas instead of `{tactic_kw} {sym}`."
                             ),
                         )
                     )
-                for rwm in _RAW_BITWISE_RE.finditer(arg_span):
+                    continue
+            if has_bitwise and "bitwise" in tok:
+                rwm = _RAW_BITWISE_RE.fullmatch(tok)
+                if rwm is not None:
                     sym = rwm.group(1)
-                    line = line_of(arg_base + rwm.start(1))
+                    line = line_of(tok_off + rwm.start(1))
                     findings.append(
                         ProofHealthFinding(
                             rule=RULE_RAW_BITWISE_UNFOLD,
                             line=line,
                             symbol=sym,
                             message=(
-                                f"Unfolding recursive `{sym}` via `unfold` unrolls bit-by-bit "
+                                f"Unfolding recursive `{sym}` via `{tactic_kw}` unrolls bit-by-bit "
                                 "`Nat.div` recursion over symbolic naturals."
                             ),
                             suggestion=(
-                                f"Do not `unfold {sym}`; use `{sym}Fast` or closed-form "
+                                f"Do not `{tactic_kw} {sym}`; use `{sym}Fast` or closed-form "
                                 "modular arithmetic lemmas."
                             ),
                         )
                     )
 
     # Rule 4: `low_profiler_threshold`
-    if "profiler.threshold" in stripped:
+    if (raw_utf8 is None or b"profiler.threshold" in raw_utf8) and "profiler.threshold" in stripped:
         for pm in _PROFILER_THRESHOLD_RE.finditer(stripped):
-            if pm.start() > 0 and _is_ident_char(stripped[pm.start() - 1]):
+            if pm.start() > 0 and (_is_ident_char(stripped[pm.start() - 1]) or stripped[pm.start() - 1] == "."):
                 continue
-            val = int(pm.group(1))
+            val = int(pm.group(1).replace("_", ""))
             if val < MIN_PROFILER_THRESHOLD:
                 line = line_of(pm.start())
                 findings.append(
@@ -1335,11 +1772,15 @@ def scan_lean_text(
                 )
 
     # Rule 5: `duplicate_private_lemma`
-    local_decls = extract_private_decls(
-        stripped,
-        file_label=Path(file_path).name if file_path else "",
-        lazy_norm=True,
-        line_of=line_of,
+    local_decls = (
+        extract_private_decls(
+            stripped,
+            file_label=Path(file_path).name if file_path else "",
+            lazy_norm=True,
+            line_of=line_of,
+        )
+        if (raw_utf8 is None or b"private" in raw_utf8)
+        else []
     )
     if local_decls:
         ext_decls: list[PrivateDecl] = []
@@ -1361,8 +1802,11 @@ def scan_lean_file(
     path = Path(file_path)
     # Bytes + decode skips text-mode newline translation; line numbers count `\n`
     # either way and a stray `\r` is whitespace to every rule.
-    text = path.read_bytes().decode("utf-8", errors="replace")
-    return scan_lean_text(text, file_path=path, scan_siblings=scan_siblings)
+    raw_bytes = path.read_bytes()
+    text = raw_bytes.decode("utf-8", errors="replace")
+    return scan_lean_text(
+        text, file_path=path, scan_siblings=scan_siblings, raw_utf8=raw_bytes
+    )
 
 
 def count_findings_by_rule(findings: Iterable[ProofHealthFinding]) -> dict[str, int]:
@@ -1400,11 +1844,16 @@ def _load_cache(cache_file: Path) -> dict[str, Any]:
     return {}
 
 
+_TMP_CACHE_SEQ = 0
+
+
 def _save_cache(cache_file: Path, data: dict[str, Any]) -> None:
     """Write the cache through a fresh `O_EXCL` temp file and `os.replace`, so
-    concurrent hook processes never read a torn file and a symlink planted at the
-    cache path (e.g. in a shared `/tmp`) is replaced rather than written through."""
-    tmp_path = f"{cache_file}.{os.getpid()}.tmp"
+    concurrent hook processes/threads never read a torn file and a symlink planted at
+    the cache path (e.g. in a shared `/tmp`) is replaced rather than written through."""
+    global _TMP_CACHE_SEQ
+    _TMP_CACHE_SEQ += 1
+    tmp_path = f"{cache_file}.{os.getpid()}.{_TMP_CACHE_SEQ}.tmp"
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1437,6 +1886,38 @@ def _extract_edit_args_list(payload: dict[str, Any] | None) -> list[dict[str, An
     return candidates
 
 
+_JETSKI_REPL_RESULT_RE = re.compile(
+    r"\bMade\s+(\d+)\s+replacements?\b(?:[^\n]*?\bstarting at line\s+(\d+)\b)?"
+)
+
+
+def _jetski_result_hint(payload: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    """Parse `(count, start_line)` from Jetski's `edit_file` result string if present."""
+    if not isinstance(payload, dict):
+        return None, None
+    res = payload.get("result")
+    if not isinstance(res, str) or "Made " not in res:
+        return None, None
+    m = _JETSKI_REPL_RESULT_RE.search(res)
+    if m is None:
+        return None, None
+    cnt = int(m.group(1))
+    sline = int(m.group(2)) if m.group(2) is not None else None
+    return cnt, sline
+
+
+def _line_start_offset(text: str, one_based_line: int) -> int:
+    if one_based_line <= 1:
+        return 0
+    off = 0
+    for _ in range(one_based_line - 1):
+        nl = text.find("\n", off)
+        if nl == -1:
+            return len(text)
+        off = nl + 1
+    return off
+
+
 def reconstruct_before_text_from_payload(
     after_text: str,
     payload: dict[str, Any] | None,
@@ -1446,6 +1927,7 @@ def reconstruct_before_text_from_payload(
     not contain reversible diff pairs (e.g. `write_file` / `Write`) or when `Replacement`
     occurs multiple times and cannot be unambiguously inverted without a cache.
     """
+    repl_cnt, repl_line = _jetski_result_hint(payload)
     for args in _extract_edit_args_list(payload):
         # Claude MultiEdit: `edits` list of `{old_string/Target, new_string/Replacement}`
         edits = args.get("edits")
@@ -1466,10 +1948,14 @@ def reconstruct_before_text_from_payload(
                 if not new_s or new_s not in cur:
                     ok = False
                     break
-                if cur.count(new_s) == 1:
+                occ = cur.count(new_s)
+                if occ == 1:
                     cur = cur.replace(new_s, old_s, 1)
-                else:
+                elif item.get("replace_all"):
                     cur = cur.replace(new_s, old_s)
+                else:
+                    ok = False
+                    break
             if ok:
                 return cur
 
@@ -1485,9 +1971,65 @@ def reconstruct_before_text_from_payload(
             if occ == 1:
                 return after_text.replace(new_s, old_s, 1)
             if occ > 1:
+                if repl_cnt == occ or args.get("replace_all"):
+                    return after_text.replace(new_s, old_s)
+                if repl_cnt == 1 and repl_line is not None:
+                    off = _line_start_offset(after_text, repl_line)
+                    idx = after_text.find(new_s, off)
+                    if idx != -1 and after_text.count("\n", off, idx) == 0:
+                        return after_text[:idx] + old_s + after_text[idx + len(new_s) :]
                 # Ambiguous multi-occurrence replacement: return None so caller prefers
-                # cached pre-edit counts if available, or falls back to full replacement.
+                # cached pre-edit counts if available, or falls back to count-accurate inversion.
                 return None
+    return None
+
+
+def _invert_ambiguous_without_cache(
+    after_text: str, payload: dict[str, Any] | None
+) -> str | None:
+    """Best-effort pre-edit text for rule-count baseline when no cache exists and
+    `Replacement` / `new_string` occurs multiple times in `after_text`.
+
+    Honours single-occurrence semantics for Claude `Edit` / `MultiEdit` (when
+    `replace_all` is not set) and Jetski's `Made <K> replacement(s)` result count, so
+    pre-existing identical lines elsewhere in the file are not falsely wiped from the
+    baseline.
+    """
+    repl_cnt, _ = _jetski_result_hint(payload)
+    for args in _extract_edit_args_list(payload):
+        edits = args.get("edits")
+        if isinstance(edits, list) and edits:
+            cur = after_text
+            ok = True
+            for item in reversed(edits):
+                if not isinstance(item, dict):
+                    ok = False
+                    break
+                old_s = item.get("old_string", item.get("Target"))
+                new_s = item.get("new_string", item.get("Replacement"))
+                if not isinstance(old_s, str) or not isinstance(new_s, str):
+                    ok = False
+                    break
+                if old_s == new_s:
+                    continue
+                if not new_s or new_s not in cur:
+                    ok = False
+                    break
+                if item.get("replace_all"):
+                    cur = cur.replace(new_s, old_s)
+                else:
+                    cur = cur.replace(new_s, old_s, 1)
+            if ok:
+                return cur
+
+        old_s = args.get("Target", args.get("old_string"))
+        new_s = args.get("Replacement", args.get("new_string"))
+        if isinstance(old_s, str) and isinstance(new_s, str) and new_s and new_s in after_text:
+            if repl_cnt is not None and repl_cnt >= 1:
+                return after_text.replace(new_s, old_s, repl_cnt)
+            if "old_string" in args and "Target" not in args and not args.get("replace_all"):
+                return after_text.replace(new_s, old_s, 1)
+            return after_text.replace(new_s, old_s)
     return None
 
 
@@ -1510,8 +2052,18 @@ def _replacement_strings(payload: dict[str, Any] | None) -> list[str]:
 
 
 def _is_pure_deletion(payload: dict[str, Any] | None) -> bool:
-    """True when the payload is a single edit whose replacement is empty."""
+    """True when the payload is an edit whose replacement(s) are all empty."""
     for args in _extract_edit_args_list(payload):
+        edits = args.get("edits")
+        if isinstance(edits, list) and edits:
+            if all(
+                isinstance(it, dict)
+                and isinstance(it.get("old_string", it.get("Target")), str)
+                and bool(it.get("old_string", it.get("Target")))
+                and it.get("new_string", it.get("Replacement")) == ""
+                for it in edits
+            ):
+                return True
         old_s = args.get("Target", args.get("old_string"))
         new_s = args.get("Replacement", args.get("new_string"))
         if isinstance(old_s, str) and old_s and isinstance(new_s, str) and not new_s:
@@ -1528,9 +2080,15 @@ def _write_file_args(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     return None
 
 
-def _line_spans_of_insertions(after_text: str, inserted: list[str]) -> list[tuple[int, int]]:
-    """1-based inclusive line ranges covered by every occurrence of each inserted
-    string in `after_text`."""
+def _line_spans_of_insertions(
+    after_text: str, inserted: list[str], payload: dict[str, Any] | None = None
+) -> list[tuple[int, int]]:
+    """1-based inclusive line ranges covered by inserted strings in `after_text`."""
+    repl_cnt, repl_line = _jetski_result_hint(payload)
+    if repl_cnt == 1 and repl_line is not None and len(inserted) == 1:
+        ins = inserted[0]
+        last = repl_line + ins.count("\n", 0, max(len(ins) - 1, 0))
+        return [(repl_line, last)]
     spans: list[tuple[int, int]] = []
     for ins in inserted:
         start = after_text.find(ins)
@@ -1559,7 +2117,9 @@ def _select_new_findings(
     """Attribute a rule's count increase to concrete findings: occurrences inside
     the edited line ranges first, then occurrences whose `(symbol, source line)`
     did not exist before the edit, and only as a last resort the last `delta`
-    occurrences."""
+    occurrences (never returning more than `delta` items)."""
+    if delta <= 0:
+        return []
     chosen = [f for f in rule_findings if any(a <= f.line <= b for a, b in spans)]
     if before_rule_findings is not None and before_lines is not None:
         remaining: dict[tuple[str, str], int] = {}
@@ -1581,8 +2141,12 @@ def _select_new_findings(
             for f in unmatched:
                 if f not in chosen:
                     chosen.append(f)
+                    if len(chosen) >= delta:
+                        break
     if not chosen:
-        chosen = rule_findings[-delta:] if delta > 0 else []
+        chosen = rule_findings[-delta:]
+    elif len(chosen) > delta:
+        chosen = chosen[-delta:]
     return sorted(chosen, key=lambda f: (f.line, f.symbol))
 
 
@@ -1595,20 +2159,7 @@ def evaluate_post_edit_proof_health(
     cache_path: str | Path | None = None,
     scan_siblings: bool = True,
 ) -> dict[str, Any]:
-    """Compute delta-only proof-health diagnostics for `target_file` after an edit.
-
-    The pre-edit text comes, in order of preference, from an explicit
-    `before_text`, from Claude Code's `tool_response.originalFile`, from inverting
-    the edit payload in memory, or from the edit shape itself (a `write_file` that
-    creates a new file starts from an empty file; a `write_file` with `Append`
-    starts from the text before the appended content). Its counts are taken from the
-    persisted per-file cache when the cached entry was recorded for exactly that
-    text (same length and CRC, same sibling declarations), which saves the second
-    scan on consecutive edits; otherwise the text is scanned. Without a pre-edit
-    text, the cached counts are the baseline. When neither is available (an
-    overwrite or a deletion of a file never seen before), the current counts become
-    the baseline and no increase is claimed.
-    """
+    """Compute delta-only proof-health diagnostics for `target_file` after an edit."""
     # Absolute (not symlink-resolved) path, so sibling-index keys do not depend on the
     # working directory of the hook process.
     path = Path(os.path.abspath(target_file))
@@ -1629,9 +2180,10 @@ def evaluate_post_edit_proof_health(
     if scan_siblings and "private" in after_text:
         index_file = sibling_index_path(cpath, path.parent)
         sibling_index = _load_sibling_index(index_file)
+        had_missing = any(not os.path.isfile(k) for k in sibling_index)
         before_ids = {k: id(v) for k, v in sibling_index.items()}
         sibling_decls = _collect_sibling_private_decls(path, persisted=sibling_index)
-        if {k: id(v) for k, v in sibling_index.items()} != before_ids:
+        if had_missing or {k: id(v) for k, v in sibling_index.items()} != before_ids:
             _save_sibling_index(index_file, sibling_index)
 
     def _scan(text: str) -> list[ProofHealthFinding]:
@@ -1648,9 +2200,14 @@ def evaluate_post_edit_proof_health(
     cached_entry = cache.get(resolved_key)
     if not isinstance(cached_entry, dict):
         cached_entry = None
-    sib_sig = _text_crc(
-        "\n".join(f"{d.file}:{d.line}:{d.kind}:{d.name}" for d in sibling_decls)
-    )
+    sib_parts: list[str] = []
+    for d in sibling_decls:
+        st_pair = _SIBLING_PRIVATE_CACHE.get(d.path)
+        stamp = f"{st_pair[0]}:{st_pair[1]}" if st_pair is not None else ""
+        sib_parts.append(
+            f"{d.file}:{d.line}:{d.kind}:{d.name}:{d.sig_fp}:{d.norm_sig}:{d.body_start}:{stamp}"
+        )
+    sib_sig = _text_crc("\n".join(sib_parts))
 
     def _cached_counts_for(text: str) -> dict[str, int] | None:
         """Cached counts if the entry was recorded for exactly `text`."""
@@ -1696,29 +2253,21 @@ def evaluate_post_edit_proof_health(
             first_new_line = before_text.count("\n") + 1 if before_text else 1
             spans = [(first_new_line, after_text.count("\n") + 1)]
         else:
-            spans = _line_spans_of_insertions(after_text, _replacement_strings(payload))
+            spans = _line_spans_of_insertions(after_text, _replacement_strings(payload), payload)
     elif cached_entry is not None:
         before_counts = {rule: _safe_int(cached_entry.get(rule, 0), 0) for rule in ALL_RULES}
-        spans = _line_spans_of_insertions(after_text, _replacement_strings(payload))
+        spans = _line_spans_of_insertions(after_text, _replacement_strings(payload), payload)
     elif _is_pure_deletion(payload):
         # Deleting text cannot add an occurrence; without a cached baseline the
         # current counts become the baseline.
         before_counts = dict(after_counts)
     else:
-        # A Jetski `edit_file` replaces every occurrence of `Target`, so an
-        # ambiguous replacement is inverted by reverting all occurrences.
-        ambiguous_before: str | None = None
-        for args in _extract_edit_args_list(payload):
-            old_s = args.get("Target", args.get("old_string"))
-            new_s = args.get("Replacement", args.get("new_string"))
-            if isinstance(old_s, str) and isinstance(new_s, str) and new_s and new_s in after_text:
-                ambiguous_before = after_text.replace(new_s, old_s)
-                break
+        ambiguous_before = _invert_ambiguous_without_cache(after_text, payload)
         if ambiguous_before is not None:
             before_findings = _scan(ambiguous_before)
             before_counts = count_findings_by_rule(before_findings)
             before_text = ambiguous_before
-            spans = _line_spans_of_insertions(after_text, _replacement_strings(payload))
+            spans = _line_spans_of_insertions(after_text, _replacement_strings(payload), payload)
         else:
             # Unknown pre-edit state (e.g. overwriting an unseen file): record the
             # baseline without claiming any increase.
@@ -1815,9 +2364,19 @@ _CREATED_COMPLETED_RE = re.compile(
 )
 
 
+def _is_finite_nonneg_number(val: Any) -> bool:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return False
+    import math
+
+    return math.isfinite(val) and val >= 0
+
+
 def _parse_iso_ts(ts: Any) -> float | None:
-    if isinstance(ts, (int, float)):
-        return float(ts)
+    if not isinstance(ts, bool) and isinstance(ts, (int, float)):
+        import math
+
+        return float(ts) if math.isfinite(ts) else None
     if not isinstance(ts, str) or not ts.strip():
         return None
     from datetime import datetime
@@ -1834,11 +2393,11 @@ def _parse_iso_ts(ts: Any) -> float | None:
 def _extract_duration_ms(obj: dict[str, Any]) -> float | None:
     for key in ("duration_ms", "latency_ms", "elapsed_ms", "time_ms"):
         val = obj.get(key)
-        if isinstance(val, (int, float)) and val >= 0:
+        if _is_finite_nonneg_number(val):
             return float(val)
     for key in ("duration_s", "latency_s", "elapsed_s"):
         val = obj.get(key)
-        if isinstance(val, (int, float)) and val >= 0:
+        if _is_finite_nonneg_number(val):
             return float(val) * 1000.0
     start_ts = _parse_iso_ts(
         obj.get("started_at") or obj.get("created_at") or obj.get("start_time")
@@ -1857,6 +2416,30 @@ def _extract_duration_ms(obj: dict[str, Any]) -> float | None:
             if t0 is not None and t1 is not None and t1 >= t0:
                 return (t1 - t0) * 1000.0
     return None
+
+
+def _is_jetski_tool_result_step(item: dict[str, Any]) -> bool:
+    if item.get("source") == "SYSTEM":
+        return False
+    stype = item.get("type")
+    if stype in (
+        "SYSTEM_MESSAGE",
+        "USER_INPUT",
+        "CHECKPOINT",
+        "ERROR_MESSAGE",
+        "PLANNER_RESPONSE",
+    ):
+        return False
+    return stype in ("GENERIC", "TOOL_RESPONSE", "TOOL_RESULT") or (
+        stype is None and ("content" in item or "output" in item)
+    )
+
+
+def _is_backgrounded_long_step(item: dict[str, Any]) -> bool:
+    if item.get("status") == "RUNNING":
+        return True
+    content = item.get("content") or item.get("output")
+    return isinstance(content, str) and "running as a background task" in content
 
 
 def _load_transcript_items(
@@ -1888,12 +2471,14 @@ def _load_transcript_items(
 def _batch_key(obj: dict[str, Any], fallback: str) -> Any:
     for key in ("batch_id", "step_index", "turn_id"):
         val = obj.get(key)
-        if val is not None:
+        if val is not None and val != "" and not isinstance(val, bool):
             return val
     return fallback
 
 
 def _safe_int(val: Any, default: int = 1) -> int:
+    if isinstance(val, bool):
+        return default
     try:
         return int(val)
     except (TypeError, ValueError):
@@ -1902,7 +2487,7 @@ def _safe_int(val: Any, default: int = 1) -> int:
 
 def _tool_name(obj: dict[str, Any]) -> str | None:
     name = obj.get("tool") or obj.get("name") or obj.get("tool_name")
-    return str(name) if name is not None else None
+    return str(name) if name is not None and str(name).strip() else None
 
 
 def compute_unbatched_tool_latencies(
@@ -1915,17 +2500,6 @@ def compute_unbatched_tool_latencies(
     separating calls that ran inside a multi-call batch containing a long-running call
     (`>= long_call_threshold_ms`, classified as `"batched_with_long_call"`) from
     standalone/unbatched calls (`"unbatched"`).
-
-    Accepted inputs:
-    - explicit latency events `{tool, duration_ms | latency_ms | started_at/completed_at,
-      batch_id | step_index | turn_id, batch_size?}`;
-    - step objects whose `tool_calls` entries carry their own timings;
-    - Jetski `transcript.jsonl` steps, where a `PLANNER_RESPONSE` step lists its
-      `tool_calls` (one batch) and the following result steps report, in order,
-      `Created At: ... / Completed At: ...` timestamps for each call. These
-      timestamps have one-second resolution, so such durations are whole seconds
-      (a sub-second call that straddles a second boundary reads as 1000 ms).
-    Entries without usable timings are skipped without raising.
     """
     import statistics
 
@@ -1937,6 +2511,7 @@ def compute_unbatched_tool_latencies(
         allowed_tools = set(tool_filter)
 
     raw_batches: dict[Any, list[dict[str, Any]]] = {}
+    long_marked_batches: set[Any] = set()
     auto_batch_seq = 0
     # Calls of the latest planner step still waiting for their result steps, as
     # `(tool, batch_key, number_of_calls_in_that_step)`.
@@ -1948,7 +2523,7 @@ def compute_unbatched_tool_latencies(
                 "tool": tool,
                 "duration_ms": float(dur),
                 "batch_id": batch_key,
-                "batch_size": batch_size,
+                "batch_size": max(1, batch_size),
                 "explicit_batched_long": bool(
                     src.get("batched_with_long_call")
                     or src.get("classification") == "batched_with_long_call"
@@ -1977,14 +2552,28 @@ def compute_unbatched_tool_latencies(
             continue
 
         tname = _tool_name(item)
+        if tname is None:
+            # Jetski result step: pop the matching pending call in lockstep EVEN when
+            # `dur is None` (e.g. `status == "RUNNING"` backgrounded tasks or `ERROR`
+            # steps without `Completed At:`), so subsequent siblings in the batch are
+            # never shifted onto the wrong tool name.
+            if pending and _is_jetski_tool_result_step(item):
+                ptool, pbatch, psize = pending.pop(0)
+                dur = _extract_duration_ms(item)
+                if dur is not None:
+                    _record(ptool, dur, pbatch, item, psize)
+                elif _is_backgrounded_long_step(item):
+                    # Backgrounded async tasks exceeded WaitMsBeforeAsync and must
+                    # mark multi-call batches as containing a long-running sibling.
+                    long_marked_batches.add(pbatch)
+            continue
+
         dur = _extract_duration_ms(item)
         if dur is None:
-            continue
-        if tname is None:
-            # Jetski result step: attribute it to the next pending call in order.
-            if pending and item.get("type") not in ("SYSTEM_MESSAGE", "USER_INPUT"):
-                ptool, pbatch, psize = pending.pop(0)
-                _record(ptool, dur, pbatch, item, psize)
+            if item.get("is_long_call") or _is_backgrounded_long_step(item):
+                bkey = _batch_key(item, "")
+                if bkey != "":
+                    long_marked_batches.add(bkey)
             continue
         batch_key = _batch_key(item, f"_single_{auto_batch_seq}")
         if batch_key == f"_single_{auto_batch_seq}":
@@ -1998,7 +2587,7 @@ def compute_unbatched_tool_latencies(
 
     for batch_key, batch in raw_batches.items():
         is_multi = len(batch) > 1 or any(r.get("batch_size", 1) > 1 for r in batch)
-        has_long = any(
+        has_long = (batch_key in long_marked_batches) or any(
             r["duration_ms"] >= long_call_threshold_ms
             or r.get("is_long_call")
             or r.get("explicit_batched_long")

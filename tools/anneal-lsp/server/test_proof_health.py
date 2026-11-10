@@ -144,6 +144,24 @@ class TestStripLeanCommentsAndStrings(unittest.TestCase):
         self.assertIn('r"also kept"', kept)
         self.assertNotIn("drop", kept)
 
+    def test_guillemets_field_r_and_prime_before_string(self) -> None:
+        # `--` inside `«foo--bar»` is part of the identifier, not a line comment.
+        # `.r"..."` is a field projection applied to a normal string (not raw `r"..."`).
+        # `x'"'"` is `x'` followed by string `"'"` (not a char literal `'"'`).
+        src = (
+            "private theorem «dup--id» : True := trivial\n"
+            "private theorem «dup--id» : True := trivial\n"
+            'def p := obj.r"\\" still inside normal string dsimp [wpMirExecSym]"\n'
+            'def q := f x\'"\'" -- closed string, then comment\n'
+            "theorem after_q : True := by dsimp [wpMirExecSym]\n"
+        )
+        stripped = proof_health.strip_lean_comments_and_strings(src)
+        self.assertEqual(len(stripped), len(src))
+        self.assertEqual(
+            scan(src),
+            [(R5, 2, "«dup--id»"), (R1, 5, "wpMirExecSym")],
+        )
+
 
 class TestFiveStructuralAntiPatterns(unittest.TestCase):
     def test_rule1_dsimp_forbidden_sym(self) -> None:
@@ -366,6 +384,72 @@ class TestFiveStructuralAntiPatterns(unittest.TestCase):
             "    | false => 1) ≤ 1 := by cases c <;> decide\n"
         )
         self.assertEqual(scan(src), [(R5, 4, "eqn_b")])
+
+    def test_deep_simp_configs_entry_heads_and_multiline_unfold(self) -> None:
+        src = (
+            "theorem deep_and_unfold : True := by\n"
+            "  simp (disch := by exact f (g (h x))) only [↓ wpMirExecSym]\n"
+            "  dsimpa [wpMirExecSym]\n"
+            "  dsimp_all [wpMirExecSym]\n"
+            "  simp only' [wpMirExecSym]\n"
+            "  simp [← Trusted.Sequence.length, lookupBlock_zero Mir.Crate.Item.body]\n"
+            "  simp [h (Trusted.Sequence.length bs)]\n"
+            "  unfold\n"
+            "    foo\n"
+            "    Mir.Crate.Item.body\n"
+            "  delta\n"
+            "    at'\n"
+            "    bitwiseAndBits\n"
+            "  have := Stream.unfold bitwiseOrBits\n"
+            "  have := (by unfold foo) Mir.Crate.Item.body\n"
+            "  set_option trace.profiler.threshold 4_9\n"
+            "  set_option trace.profiler.threshold 5_0\n"
+            "  Foo.set_option trace.profiler.threshold 1\n"
+        )
+        findings = proof_health.scan_lean_text(src, scan_siblings=False)
+        self.assertEqual(
+            [(f.rule, f.line, f.symbol) for f in findings],
+            [
+                (R1, 2, "wpMirExecSym"),
+                (R2, 10, "Mir.Crate.Item.body"),
+                (R3, 13, "bitwiseAndBits"),
+                (R4, 16, "trace.profiler.threshold=49"),
+            ],
+        )
+        self.assertIn("via `delta`", findings[2].message)
+
+    def test_rule5_alpha_normalized_def_bodies_nested_binders_and_indented_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            sibling = tmp_dir / "SibDef.lean"
+            sibling.write_text(
+                "private def addOne (x : Nat) : Nat := x + 1\n",
+                encoding="utf-8",
+            )
+            target = tmp_dir / "TargetDef.lean"
+            target.write_text(
+                "section Inner\n"
+                "  private def incVal (value : Nat) : Nat := value + 1\n"
+                '  private def strOne : String := "a  b"\n'
+                '  private def strTwo : String := "a b"\n'
+                '  private def strDup : String := "a  b"\n'
+                "  private theorem nested_one (xs : List (Nat × Nat)) [Decidable (xs = [])] :\n"
+                "      xs.length = xs.length := rfl\n"
+                "  private theorem nested_two (ys : List (Nat × Nat)) [Decidable (ys = [])] :\n"
+                "      ys.length = ys.length := rfl\n"
+                "end Inner\n",
+                encoding="utf-8",
+            )
+            clear_in_process_caches()
+            findings = proof_health.scan_lean_file(target, scan_siblings=True)
+            self.assertEqual(
+                [(f.line, f.symbol) for f in findings if f.rule == R5],
+                [
+                    (2, "incVal"),
+                    (5, "strDup"),
+                    (8, "nested_two"),
+                ],
+            )
 
 
 class TestDeltaOnlyPostEditCheck(unittest.TestCase):
@@ -691,6 +775,79 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
         elapsed_ms = best_of_ms(restore)
         self.assertLess(elapsed_ms, 5.0, f"sibling index restore took {elapsed_ms:.2f} ms")
 
+    def test_ambiguous_single_occurrence_edits_and_sibling_sig_invalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            # 1. Uncached Claude `Edit` (`replace_all` unset) where `new_string` already
+            # existed on L2: only 1 occurrence was added (+1 at L5, NOT +2).
+            claude_file = tmp_dir / "ClaudeAmbig.lean"
+            after = (
+                "theorem t1 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+                "theorem t2 : True := by\n"
+                "  dsimp [wpMirExecSym]\n"
+                "  trivial\n"
+            )
+            claude_file.write_text(after, encoding="utf-8")
+            claude_payload = {
+                "tool_input": {
+                    "file_path": str(claude_file),
+                    "old_string": "  skip\n",
+                    "new_string": "  dsimp [wpMirExecSym]\n",
+                }
+            }
+            res_c = proof_health.evaluate_post_edit_proof_health(
+                claude_file, claude_payload, cache_path=tmp_dir / "c_claude.json"
+            )
+            self.assertEqual(res_c["deltas"][R1], 1)
+            self.assertEqual(len(res_c["new_findings"]), 1)
+
+            # 2. Uncached Jetski `edit_file` carrying `Made 1 replacement ... starting at line 5`:
+            # exact line L5 reconstructed and attributed (+1 at L5).
+            jetski_file = tmp_dir / "JetskiAmbig.lean"
+            jetski_file.write_text(after, encoding="utf-8")
+            jetski_payload = {
+                "result": f"Made 1 replacement in {jetski_file} starting at line 5 (+1/-1 lines).",
+                **jetski_edit(jetski_file, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+            }
+            res_j = proof_health.evaluate_post_edit_proof_health(
+                jetski_file, jetski_payload, cache_path=tmp_dir / "c_jetski.json"
+            )
+            self.assertEqual(res_j["deltas"][R1], 1)
+            self.assertEqual([f.line for f in res_j["new_findings"]], [5])
+            self.assertIn("(+1 at L5)", res_j["feedback"])
+
+            # 3. Sibling signature edit in-place invalidates `_sib` cache on Target, and
+            # deleting the sibling prunes it from the persisted sibling index.
+            sib = tmp_dir / "Sib.lean"
+            sib.write_text("private theorem h (n : Nat) : n = 0 := sorry\n", encoding="utf-8")
+            tgt = tmp_dir / "Tgt.lean"
+            tgt_v1 = "private theorem g (m : Nat) : m = 1 := sorry\n"
+            tgt.write_text(tgt_v1, encoding="utf-8")
+            scache = tmp_dir / "scache.json"
+            clear_in_process_caches()
+            self.assertEqual(proof_health.check_post_edit_proof_health(tgt, None, cache_path=scache), "")
+            # Edit `Sib.lean` on the same line with the same name so its signature now matches `g`:
+            sib.write_text("private theorem h (n : Nat) : n = 1 := sorry\n", encoding="utf-8")
+            clear_in_process_caches()
+            tgt_v2 = tgt_v1 + "-- touch\n"
+            tgt.write_text(tgt_v2, encoding="utf-8")
+            # Pre-edit `tgt_v1` now ALREADY conflicted with updated `Sib.lean`, so adding a comment
+            # to `Tgt.lean` must NOT reuse the stale 0-count cache entry or claim a false +1!
+            fb_sib = proof_health.check_post_edit_proof_health(
+                tgt, jetski_edit(tgt, "sorry\n", "sorry\n-- touch\n"), cache_path=scache
+            )
+            self.assertEqual(fb_sib, "")
+            # Delete `Sib.lean` and verify persisted sibling index prunes it.
+            sib.unlink()
+            clear_in_process_caches()
+            proof_health.check_post_edit_proof_health(tgt, None, cache_path=scache)
+            idx_data = json.loads(
+                proof_health.sibling_index_path(scache, tmp_dir).read_text(encoding="utf-8")
+            )
+            self.assertNotIn(str(sib), idx_data)
+
 
 class TestPerformanceAndDogfood(unittest.TestCase):
     def test_synthetic_6000_line_file_under_5ms(self) -> None:
@@ -864,6 +1021,68 @@ class TestTranscriptLatencyTelemetry(unittest.TestCase):
         self.assertIsNone(empty["unbatched_mean_ms"])
         self.assertIsNone(empty["unbatched_median_ms"])
         self.assertEqual(empty["unbatched_count"], 0)
+
+    def test_running_background_tasks_error_steps_and_nonfinite_durations(self) -> None:
+        # Batch 1: `run_command` backgrounds (`status == "RUNNING"`, no `Completed At:`)
+        # alongside `lean_goal` (`0s`). `lean_goal` must keep its own tool name AND be
+        # classified as `batched_with_long_call` because its sibling backgrounded.
+        # Batch 2: `read_file` errors without timestamps alongside `lean_hover` (`0s`).
+        # `lean_hover` must NOT be misattributed to `read_file`.
+        steps = [
+            {
+                "step_index": 10,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": "run_command"}, {"name": "lean_goal"}],
+            },
+            {
+                "step_index": 11,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Created At: 2026-11-10T00:50:16Z\nTool is running as a background task",
+            },
+            {
+                "step_index": 12,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created At: 2026-11-10T00:50:16Z\nCompleted At: 2026-11-10T00:50:16Z\nok",
+            },
+            {
+                "step_index": 20,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": "read_file"}, {"name": "lean_hover"}],
+            },
+            {
+                "step_index": 21,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "ERROR",
+                "content": "Error: file not found",
+            },
+            {
+                "step_index": 22,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created At: 2026-11-10T00:51:00Z\nCompleted At: 2026-11-10T00:51:00Z\nok",
+            },
+            # Reject bool, NaN, Inf, and empty-string batch_id merging
+            {"tool": "bad_bool", "duration_ms": True},
+            {"tool": "bad_inf", "duration_ms": float("inf")},
+            {"tool": "bad_nan", "duration_ms": float("nan")},
+            {"tool": "solo_1", "duration_ms": 12.0, "batch_id": ""},
+            {"tool": "solo_2", "duration_ms": 2500.0, "batch_id": ""},
+        ]
+        stats = proof_health.compute_unbatched_tool_latencies(steps)
+        self.assertEqual([e["tool"] for e in stats["batched_with_long_call"]], ["lean_goal"])
+        self.assertEqual(
+            sorted(e["tool"] for e in stats["unbatched"]),
+            ["lean_hover", "solo_1", "solo_2"],
+        )
+        self.assertNotIn("bad_bool", stats["by_tool"])
+        self.assertNotIn("bad_inf", stats["by_tool"])
+        self.assertNotIn("bad_nan", stats["by_tool"])
 
 
 class TestPostToolUseHookIntegration(unittest.TestCase):
