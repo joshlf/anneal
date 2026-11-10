@@ -41,7 +41,9 @@ import datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -62,6 +64,39 @@ EXIT_DIVERGENCE_DETECTED = 4
 
 DEFAULT_MIN_ORACLE_ELAPSED_MS = 50.0
 DEFAULT_MAX_ORACLE_ERRORS = 0
+_MAX_SAFE_NONNEG_INT = (1 << 63) - 1
+
+_NON_ABSENT_RPC_STATUS_RE = re.compile(
+    r"(?:^|[\s(\[=])(?:"
+    r"cancelled|canceled|unknown|invalid_argument|deadline_exceeded|"
+    r"already_exists|permission_denied|resource_exhausted|failed_precondition|"
+    r"aborted|out_of_range|unimplemented|internal|unavailable|data_loss|"
+    r"unauthenticated"
+    r")(?:\s*:|[\])]|\s+desc\b|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _reject_json_constant(token: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {token!r}")
+
+
+def _strict_json_loads(raw_text: str) -> Any:
+    return json.loads(raw_text, parse_constant=_reject_json_constant)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".tmp_{os.getpid()}_{path.name}"
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 # Module-level diagnostic store populated by `run_harness` (preserving its
 # 4-positional-argument signature for unit-test monkey-patching).
@@ -261,7 +296,10 @@ def check_remote_uri(remote_uri: str) -> None:
             f"`{REMOTE_SYNC_BIN} {REMOTE_SYNC_FLAG}`."
         )
     if not remote_uri.startswith("/remote/"):
-        real = os.path.realpath(remote_uri)
+        try:
+            real = os.path.realpath(remote_uri)
+        except OSError:
+            real = norm
         if real == "/mnt/fuse/rw" or real.startswith("/mnt/fuse/rw/"):
             raise ValueError(
                 f"Refusing FUSE path `{remote_uri}` (resolves to `{real}`); always use "
@@ -271,23 +309,34 @@ def check_remote_uri(remote_uri: str) -> None:
 
 def _is_absent_remote_error(err_text: str) -> bool:
     lower = err_text.lower()
+    if _NON_ABSENT_RPC_STATUS_RE.search(lower):
+        return False
+    if (
+        "permission denied" in lower
+        or "access denied" in lower
+        or "deadline exceeded" in lower
+    ):
+        return False
     return any(
         tok in lower
-        for tok in ("not_found", "not found", "no files matched", "no such file")
+        for tok in ("not_found", "no files matched", "no such file")
     )
 
 
 def sync_state_from_remote(
     remote_uri: str, state_dir: Path, include_ratchet: bool = True
-) -> None:
+) -> bool:
     """Pulls the ledger (and coverage ratchet in live mode) from `/remote/` via `remote-sync` RPC.
 
     Each file is staged into a sibling temporary path and atomically moved into
     place only on success so transient remote read errors never clobber valid
     pre-existing files in a reused `--state-dir`.
+
+    Returns `False` if any remote state file failed to read with a non-absent
+    error so callers can avoid overwriting `/remote/.../state/` at upload time.
     """
     if not remote_uri or not has_remote_sync():
-        return
+        return True
     check_remote_uri(remote_uri)
     state_subdir = state_dir / "state"
     state_subdir.mkdir(parents=True, exist_ok=True)
@@ -296,6 +345,7 @@ def sync_state_from_remote(
         names.append("coverage_ratchet.json")
     base = remote_uri.rstrip("/")
     pid = os.getpid()
+    all_reads_ok = True
     for name in names:
         dst = state_subdir / name
         tmp_dst = state_subdir / f".sync_tmp_{pid}_{name}"
@@ -306,6 +356,7 @@ def sync_state_from_remote(
             tmp_dst.unlink(missing_ok=True)
             err_detail = (res.stderr or res.stdout or "").strip()
             if not err_detail or not _is_absent_remote_error(err_detail):
+                all_reads_ok = False
                 suffix = f": {err_detail}" if err_detail else ""
                 sys.stderr.write(
                     f"warning: failed to fetch `{remote_src}` (exit {res.returncode}){suffix}; "
@@ -313,6 +364,27 @@ def sync_state_from_remote(
                 )
         elif tmp_dst.is_file():
             os.replace(tmp_dst, dst)
+    return all_reads_ok
+
+
+def _filter_written_for_remote(
+    state_dir: Path, remote_uri: str, written: list[Path], remote_state_ok: bool
+) -> list[Path]:
+    if remote_state_ok or not remote_uri or not has_remote_sync():
+        return written
+    filtered: list[Path] = []
+    for p in written:
+        try:
+            in_state = p.relative_to(state_dir).parts[:1] == ("state",)
+        except ValueError:
+            in_state = False
+        if not in_state:
+            filtered.append(p)
+    if len(filtered) != len(written):
+        sys.stderr.write(
+            "warning: could not read shared remote state; skipping upload of state/\n"
+        )
+    return filtered
 
 
 def sync_state_to_remote(state_dir: Path, remote_uri: str, written: list[Path]) -> None:
@@ -340,11 +412,11 @@ def sync_state_to_remote(state_dir: Path, remote_uri: str, written: list[Path]) 
 
 
 def load_ledger(ledger_path: Path) -> dict[str, Any]:
-    if not ledger_path.is_file():
-        return {}
     try:
-        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        if not ledger_path.is_file():
+            return {}
+        ledger = _strict_json_loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as e:
         raise ValueError(f"cannot read {ledger_path}: {e}") from e
     if not isinstance(ledger, dict):
         raise ValueError(f"{ledger_path} is not a JSON object")
@@ -353,8 +425,8 @@ def load_ledger(ledger_path: Path) -> dict[str, Any]:
 
 def parse_seed_int(raw: str) -> int:
     clean = raw.strip().replace("_", "")
-    if not clean:
-        raise ValueError("empty seed")
+    if not clean or len(clean) > 66:
+        raise ValueError("empty or oversized seed")
     val = int(clean, 16) if clean.lower().startswith("0x") else int(clean, 10)
     if val < 0 or val > 0xFFFF_FFFF_FFFF_FFFF:
         raise ValueError(f"seed out of u64 range: {raw!r}")
@@ -374,7 +446,12 @@ def ledger_seed_int(ledger: dict[str, Any], key: str, default: str) -> int:
 
 def ledger_counter(ledger: dict[str, Any], key: str) -> int:
     raw = ledger.get(key, 0)
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, int)
+        or raw < 0
+        or raw > _MAX_SAFE_NONNEG_INT
+    ):
         raise ValueError(f"ledger field {key!r} must be a non-negative integer")
     return raw
 
@@ -384,7 +461,11 @@ def advance_seed(seed_val: int) -> int:
 
 
 def is_nonneg_int(val: Any) -> bool:
-    return not isinstance(val, bool) and isinstance(val, int) and val >= 0
+    return (
+        not isinstance(val, bool)
+        and isinstance(val, int)
+        and 0 <= val <= _MAX_SAFE_NONNEG_INT
+    )
 
 
 def is_int_map(val: Any, expected_keys: tuple[str, ...] | None = None) -> bool:
@@ -433,8 +514,8 @@ def run_harness(
         sys.stderr.write(f"{bin_name} failed (exit {res.returncode}):\n{res.stderr}\n")
         return None
     try:
-        summary = json.loads(json_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        summary = _strict_json_loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as e:
         LAST_HARNESS_DIAGNOSTICS[bin_name] = {
             "exit_code": res.returncode,
             "oracle_error_reason": f"unreadable_json: {e}",
@@ -1061,9 +1142,12 @@ def load_quarantine_rules(quarantine_file: Path | None) -> set[str]:
     """Loads quarantine tokens from a JSON or TOML file."""
     if quarantine_file is None:
         return set()
-    if not quarantine_file.is_file():
-        raise ValueError(f"quarantine file does not exist: {quarantine_file}")
-    text = quarantine_file.read_text(encoding="utf-8")
+    try:
+        if not quarantine_file.is_file():
+            raise ValueError(f"quarantine file does not exist: {quarantine_file}")
+        text = quarantine_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f"cannot read quarantine file {quarantine_file}: {e}") from e
     rules: set[str] = set()
     if quarantine_file.suffix.lower() == ".toml":
         try:
@@ -1083,8 +1167,8 @@ def load_quarantine_rules(quarantine_file: Path | None) -> set[str]:
                         rules.add(f"{name}:{bug['divergence_class']}")
     else:
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as e:
+            data = _strict_json_loads(text)
+        except ValueError as e:
             raise ValueError(f"invalid JSON in {quarantine_file}: {e}") from e
         if isinstance(data, list):
             for item in data:
@@ -1690,13 +1774,19 @@ def infer_fingerprint_suite(fp: str, entry: dict[str, Any] | None = None) -> str
 
 
 def _safe_nonneg_int(raw: Any, default: int = 0) -> int:
-    """Returns `raw` as a non-negative int, or `default` for corrupt values."""
+    """Returns `raw` as a bounded non-negative int, or `default` for corrupt values."""
     if isinstance(raw, bool):
         return default
     if isinstance(raw, int):
-        return raw if raw >= 0 else default
-    if isinstance(raw, str) and raw.strip().isdigit():
-        return int(raw.strip())
+        return raw if 0 <= raw <= _MAX_SAFE_NONNEG_INT else default
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.isascii() and s.isdigit() and len(s) <= 30:
+            try:
+                val = int(s, 10)
+            except ValueError:
+                return default
+            return val if 0 <= val <= _MAX_SAFE_NONNEG_INT else default
     return default
 
 
@@ -1877,11 +1967,11 @@ def update_suite_scoped_fingerprints(
 
 
 def load_coverage_ratchet(ratchet_path: Path) -> dict[str, Any]:
-    if not ratchet_path.is_file():
-        return {}
     try:
-        data = json.loads(ratchet_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        if not ratchet_path.is_file():
+            return {}
+        data = _strict_json_loads(ratchet_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as e:
         sys.stderr.write(
             f"warning: ignoring malformed or unreadable coverage ratchet {ratchet_path}: {e}\n"
         )
@@ -1904,7 +1994,7 @@ BASELINE_RECOVERY_SKIPPED = "skipped"
 def _merge_ratchet_snapshots(
     baseline: dict[str, Any], overlay: dict[str, Any]
 ) -> dict[str, Any]:
-    """Union-merges a recovered `baseline` ratchet with an incomplete local `overlay`."""
+    """Idempotently union-merges a recovered `baseline` ratchet with a local `overlay`."""
     merged_obs: dict[str, dict[str, Any]] = {}
     for src in (baseline, overlay):
         raw_obs = src.get("observed_paths", {})
@@ -1916,7 +2006,9 @@ def _merge_ratchet_snapshots(
             key = str(k)
             prev = merged_obs.get(key)
             if prev is None:
-                merged_obs[key] = copy.deepcopy(v)
+                entry = copy.deepcopy(v)
+                entry["hit_count"] = max(1, _safe_nonneg_int(entry.get("hit_count"), 1))
+                merged_obs[key] = entry
             else:
                 b_first = prev.get("first_seen_utc")
                 o_first = v.get("first_seen_utc")
@@ -1928,6 +2020,12 @@ def _merge_ratchet_snapshots(
                     prev["first_seen_utc"] = o_first
                     if isinstance(v.get("first_seen_seed"), str) and v["first_seen_seed"]:
                         prev["first_seen_seed"] = v["first_seen_seed"]
+                elif (
+                    not isinstance(prev.get("first_seen_seed"), str)
+                    or not prev.get("first_seen_seed")
+                ) and isinstance(v.get("first_seen_seed"), str) and v["first_seen_seed"]:
+                    prev["first_seen_seed"] = v["first_seen_seed"]
+
                 b_last = prev.get("last_seen_utc")
                 o_last = v.get("last_seen_utc")
                 if (
@@ -1938,8 +2036,23 @@ def _merge_ratchet_snapshots(
                     prev["last_seen_utc"] = o_last
                     if isinstance(v.get("last_seen_seed"), str) and v["last_seen_seed"]:
                         prev["last_seen_seed"] = v["last_seen_seed"]
-                prev["hit_count"] = _safe_nonneg_int(prev.get("hit_count"), 1) + _safe_nonneg_int(
-                    v.get("hit_count"), 1
+                elif (
+                    not isinstance(prev.get("last_seen_seed"), str)
+                    or not prev.get("last_seen_seed")
+                ) and isinstance(v.get("last_seen_seed"), str) and v["last_seen_seed"]:
+                    prev["last_seen_seed"] = v["last_seen_seed"]
+
+                if prev.get("suite") not in ("miri", "itree") and v.get("suite") in (
+                    "miri",
+                    "itree",
+                ):
+                    prev["suite"] = v["suite"]
+                if not (prev.get("derived") is True and v.get("derived") is True):
+                    prev.pop("derived", None)
+                prev["hit_count"] = max(
+                    1,
+                    _safe_nonneg_int(prev.get("hit_count"), 1),
+                    _safe_nonneg_int(v.get("hit_count"), 1),
                 )
 
     def suite_cnt(sk: str) -> int:
@@ -1967,15 +2080,22 @@ def _merge_ratchet_snapshots(
         sum(per_suite.values()),
         len(merged_obs),
     )
+    updated_candidates = [
+        s
+        for s in (baseline.get("updated_utc"), overlay.get("updated_utc"))
+        if isinstance(s, str) and s
+    ]
     out: dict[str, Any] = {
         "schema_version": 1,
-        "updated_utc": str(overlay.get("updated_utc") or baseline.get("updated_utc") or utc_now_iso()),
+        "updated_utc": max(updated_candidates) if updated_candidates else utc_now_iso(),
         "cumulative_distinct_obs_paths": total,
         "per_suite_distinct_obs_paths": per_suite,
         "observed_paths": merged_obs,
     }
     if baseline.get("baseline_missing") is True:
         out["baseline_missing"] = True
+    if baseline.get("baseline_unmerged") is True:
+        out["baseline_unmerged"] = True
     return out
 
 
@@ -1998,36 +2118,74 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
     check_remote_uri(clean_uri)
 
     incomplete_overlay: dict[str, Any] | None = None
-    if ratchet_path.is_symlink() and not ratchet_path.exists():
-        ratchet_path.unlink(missing_ok=True)
-    elif ratchet_path.exists():
-        if not ratchet_path.is_file():
-            sys.stderr.write(
-                f"warning: local coverage ratchet {ratchet_path} is not a regular file\n"
-            )
-            return BASELINE_RECOVERY_FAILED
-        try:
-            existing = json.loads(ratchet_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-            sys.stderr.write(
-                f"warning: local coverage ratchet {ratchet_path} is malformed or unreadable "
-                f"({e}); attempting recovery from baseline `{clean_uri}`\n"
-            )
-            ratchet_path.unlink(missing_ok=True)
-        else:
-            if not isinstance(existing, dict):
-                sys.stderr.write(
-                    f"warning: local coverage ratchet {ratchet_path} is not a JSON object "
-                    f"(got {type(existing).__name__}); attempting recovery from baseline "
-                    f"`{clean_uri}`\n"
-                )
-                ratchet_path.unlink(missing_ok=True)
-            elif existing.get("baseline_missing") is True:
-                incomplete_overlay = existing
-            else:
-                return BASELINE_RECOVERY_SKIPPED
+    try:
+        local_lstat = os.lstat(ratchet_path)
+    except FileNotFoundError:
+        local_lstat = None
+    except OSError as e:
+        sys.stderr.write(
+            f"warning: cannot access local coverage ratchet {ratchet_path}: {e}\n"
+        )
+        return BASELINE_RECOVERY_FAILED
 
-    ratchet_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_lstat is not None:
+        try:
+            local_stat = (
+                os.stat(ratchet_path)
+                if stat.S_ISLNK(local_lstat.st_mode)
+                else local_lstat
+            )
+        except OSError as e:
+            sys.stderr.write(
+                f"warning: local coverage ratchet {ratchet_path} is a broken symlink or "
+                f"inaccessible ({e}); attempting recovery from baseline `{clean_uri}`\n"
+            )
+            local_stat = None
+
+        if local_stat is not None:
+            if stat.S_ISDIR(local_stat.st_mode):
+                sys.stderr.write(
+                    f"warning: local coverage ratchet {ratchet_path} is a directory\n"
+                )
+                return BASELINE_RECOVERY_FAILED
+            if not stat.S_ISREG(local_stat.st_mode):
+                sys.stderr.write(
+                    f"warning: local coverage ratchet {ratchet_path} is not a regular file; "
+                    f"attempting recovery from baseline `{clean_uri}`\n"
+                )
+            else:
+                try:
+                    existing = _strict_json_loads(
+                        ratchet_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeDecodeError, ValueError) as e:
+                    sys.stderr.write(
+                        f"warning: local coverage ratchet {ratchet_path} is malformed or unreadable "
+                        f"({e}); attempting recovery from baseline `{clean_uri}`\n"
+                    )
+                else:
+                    if not isinstance(existing, dict):
+                        sys.stderr.write(
+                            f"warning: local coverage ratchet {ratchet_path} is not a JSON object "
+                            f"(got {type(existing).__name__}); attempting recovery from baseline "
+                            f"`{clean_uri}`\n"
+                        )
+                    elif (
+                        existing.get("baseline_missing") is True
+                        or existing.get("baseline_unmerged") is True
+                    ):
+                        incomplete_overlay = existing
+                    else:
+                        return BASELINE_RECOVERY_SKIPPED
+
+    try:
+        ratchet_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(
+            f"warning: cannot create parent directory for {ratchet_path}: {e}\n"
+        )
+        return BASELINE_RECOVERY_FAILED
+
     if clean_uri.startswith("/remote/"):
         if not has_remote_sync():
             sys.stderr.write(
@@ -2035,13 +2193,8 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
                 f"`{REMOTE_SYNC_BIN}` is not available\n"
             )
             return BASELINE_RECOVERY_FAILED
-        fetch_dst = (
-            ratchet_path.parent / f".baseline_tmp_{os.getpid()}_coverage_ratchet.json"
-            if incomplete_overlay is not None
-            else ratchet_path
-        )
-        if fetch_dst != ratchet_path:
-            fetch_dst.unlink(missing_ok=True)
+        fetch_dst = ratchet_path.parent / f".baseline_tmp_{os.getpid()}_coverage_ratchet.json"
+        fetch_dst.unlink(missing_ok=True)
         res = run_remote_sync(["cp", "-f", clean_uri, str(fetch_dst)])
         if res.returncode != 0:
             fetch_dst.unlink(missing_ok=True)
@@ -2061,47 +2214,72 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
             )
             return BASELINE_RECOVERY_FAILED
         try:
-            parsed = json.loads(fetch_dst.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            parsed = _strict_json_loads(fetch_dst.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as e:
             fetch_dst.unlink(missing_ok=True)
             sys.stderr.write(
                 f"warning: baseline coverage ratchet fetched from `{clean_uri}` is "
                 f"malformed or unreadable: {e}\n"
             )
             return BASELINE_RECOVERY_FAILED
+        fetch_dst.unlink(missing_ok=True)
         if not isinstance(parsed, dict):
-            fetch_dst.unlink(missing_ok=True)
             sys.stderr.write(
                 f"warning: baseline coverage ratchet fetched from `{clean_uri}` is not "
                 f"a JSON object (got {type(parsed).__name__})\n"
             )
             return BASELINE_RECOVERY_FAILED
-        if incomplete_overlay is not None:
-            fetch_dst.unlink(missing_ok=True)
-            merged = _merge_ratchet_snapshots(parsed, incomplete_overlay)
-            ratchet_path.write_text(
-                json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        merged = _merge_ratchet_snapshots(parsed, incomplete_overlay or {})
+        try:
+            _atomic_write_text(
+                ratchet_path, json.dumps(merged, indent=2, sort_keys=True) + "\n"
             )
+        except OSError as e:
+            sys.stderr.write(
+                f"warning: failed to write recovered baseline coverage ratchet to "
+                f"{ratchet_path}: {e}\n"
+            )
+            return BASELINE_RECOVERY_FAILED
         sys.stderr.write(
             f"info: populated missing {ratchet_path} from baseline `{clean_uri}`\n"
         )
         return BASELINE_RECOVERY_RECOVERED
 
     src_path = Path(clean_uri)
-    if not src_path.exists() and not src_path.is_symlink():
+    try:
+        src_lstat = os.lstat(src_path)
+    except FileNotFoundError:
         sys.stderr.write(
             f"warning: baseline coverage ratchet `{clean_uri}` does not exist\n"
         )
         return BASELINE_RECOVERY_ABSENT
-    if not src_path.is_file():
+    except OSError as e:
+        sys.stderr.write(
+            f"warning: cannot access baseline coverage ratchet `{clean_uri}`: {e}\n"
+        )
+        return BASELINE_RECOVERY_FAILED
+
+    try:
+        src_stat = (
+            os.stat(src_path) if stat.S_ISLNK(src_lstat.st_mode) else src_lstat
+        )
+    except OSError as e:
+        sys.stderr.write(
+            f"warning: baseline coverage ratchet `{clean_uri}` is a broken symlink or "
+            f"inaccessible: {e}\n"
+        )
+        return BASELINE_RECOVERY_FAILED
+
+    if not stat.S_ISREG(src_stat.st_mode):
         sys.stderr.write(
             f"warning: baseline coverage ratchet `{clean_uri}` is not a readable regular file\n"
         )
         return BASELINE_RECOVERY_FAILED
+
     try:
         raw_text = src_path.read_text(encoding="utf-8")
-        parsed = json.loads(raw_text)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        parsed = _strict_json_loads(raw_text)
+    except (OSError, UnicodeDecodeError, ValueError) as e:
         sys.stderr.write(
             f"warning: failed to read baseline coverage ratchet `{clean_uri}`: {e}\n"
         )
@@ -2112,17 +2290,12 @@ def recover_baseline_coverage_ratchet(baseline_uri: str, ratchet_path: Path) -> 
             f"(got {type(parsed).__name__})\n"
         )
         return BASELINE_RECOVERY_FAILED
+    merged = _merge_ratchet_snapshots(parsed, incomplete_overlay or {})
     try:
-        if incomplete_overlay is not None:
-            merged = _merge_ratchet_snapshots(parsed, incomplete_overlay)
-            ratchet_path.write_text(
-                json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-            )
-        else:
-            ratchet_path.write_text(raw_text, encoding="utf-8")
+        _atomic_write_text(
+            ratchet_path, json.dumps(merged, indent=2, sort_keys=True) + "\n"
+        )
     except OSError as e:
-        if incomplete_overlay is None:
-            ratchet_path.unlink(missing_ok=True)
         sys.stderr.write(
             f"warning: failed to write recovered baseline coverage ratchet to "
             f"{ratchet_path}: {e}\n"
@@ -2195,6 +2368,7 @@ def update_coverage_ratchet(
     itree: dict[str, Any] | None,
     itree_seed: int,
     force_baseline_missing: bool = False,
+    persist_baseline_unmerged: bool | None = None,
 ) -> tuple[Path, bool]:
     """Monotonically merges observation-path signatures from healthy suite(s)
     into `state/coverage_ratchet.json` and updates `ledger['cumulative_distinct_obs_paths']`.
@@ -2214,15 +2388,15 @@ def update_coverage_ratchet(
     """
     ratchet = load_coverage_ratchet(ratchet_path)
     raw_obs = ratchet.get("observed_paths", {})
-    observed_paths: dict[str, dict[str, Any]] = (
-        {
-            str(k): copy.deepcopy(v)
-            for k, v in raw_obs.items()
-            if isinstance(k, str) and isinstance(v, dict)
-        }
-        if isinstance(raw_obs, dict)
-        else {}
-    )
+    observed_paths: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_obs, dict):
+        for k, v in raw_obs.items():
+            if isinstance(k, str) and isinstance(v, dict):
+                entry_copy = copy.deepcopy(v)
+                entry_copy["hit_count"] = max(
+                    1, _safe_nonneg_int(entry_copy.get("hit_count"), 1)
+                )
+                observed_paths[str(k)] = entry_copy
     now_utc = utc_now_iso()
 
     for suite_key, is_healthy, summary, seed_val in (
@@ -2284,10 +2458,12 @@ def update_coverage_ratchet(
     below_floor = len(observed_paths) < new_total or any(
         suite_count(k) < per_suite[k] for k in ("miri", "itree")
     )
-    baseline_unmerged = force_baseline_missing or (
+    if persist_baseline_unmerged is None:
+        persist_baseline_unmerged = force_baseline_missing
+    baseline_unmerged = persist_baseline_unmerged or (
         ratchet.get("baseline_unmerged") is True
     )
-    baseline_missing = below_floor or baseline_unmerged
+    baseline_missing = below_floor or baseline_unmerged or force_baseline_missing
     if baseline_missing:
         if below_floor:
             sys.stderr.write(
@@ -2314,11 +2490,14 @@ def update_coverage_ratchet(
         updated_ratchet["baseline_missing"] = True
     if baseline_unmerged:
         updated_ratchet["baseline_unmerged"] = True
-    ratchet_path.parent.mkdir(parents=True, exist_ok=True)
-    ratchet_path.write_text(
-        json.dumps(updated_ratchet, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    try:
+        _atomic_write_text(
+            ratchet_path, json.dumps(updated_ratchet, indent=2, sort_keys=True) + "\n"
+        )
+    except OSError as e:
+        sys.stderr.write(
+            f"warning: failed to write updated coverage ratchet {ratchet_path}: {e}\n"
+        )
     ledger["cumulative_distinct_obs_paths"] = new_total
     return ratchet_path, baseline_missing
 
@@ -2829,7 +3008,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         LAST_HARNESS_DIAGNOSTICS.clear()
-        sync_state_from_remote(remote_uri, state_dir, include_ratchet=not args.compile_only)
+        remote_state_ok = sync_state_from_remote(
+            remote_uri, state_dir, include_ratchet=not args.compile_only
+        )
         (state_dir / "state").mkdir(parents=True, exist_ok=True)
         (state_dir / "reports").mkdir(parents=True, exist_ok=True)
 
@@ -2994,12 +3175,13 @@ def main(argv: list[str] | None = None) -> int:
                 ledger["next_miri_seed"] = f"0x{advance_seed(miri_seed):08x}"
                 if itree is not None:
                     ledger["next_itree_seed"] = f"0x{advance_seed(itree_seed):08x}"
-                    ledger["total_itree_candidates_generated"] = prev_itree_gen + int(
-                        itree.get("total_candidates", 0)
+                    ledger["total_itree_candidates_generated"] = (
+                        prev_itree_gen
+                        + _safe_nonneg_int(itree.get("total_candidates"), 0)
                     )
                 ledger["total_campaigns_run"] = prev_campaigns + 1
-                ledger["total_miri_candidates_generated"] = prev_miri_gen + int(
-                    miri.get("total_candidates", 0)
+                ledger["total_miri_candidates_generated"] = (
+                    prev_miri_gen + _safe_nonneg_int(miri.get("total_candidates"), 0)
                 )
                 ledger["last_run_utc"] = utc_now_iso()
                 ledger["last_profile"] = profile.name
@@ -3036,7 +3218,13 @@ def main(argv: list[str] | None = None) -> int:
                     elapsed_sec,
                 )
 
-            sync_state_to_remote(state_dir, remote_uri, written)
+            sync_state_to_remote(
+                state_dir,
+                remote_uri,
+                _filter_written_for_remote(
+                    state_dir, remote_uri, written, remote_state_ok
+                ),
+            )
             print(report_md)
             return EXIT_HARNESS_FAILED if harness_failed else EXIT_NOT_EVALUATED
 
@@ -3288,28 +3476,44 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             local_ratchet_corrupt = False
-            if ratchet_path.exists():
-                if not ratchet_path.is_file():
+            try:
+                local_lstat = os.lstat(ratchet_path)
+            except FileNotFoundError:
+                local_lstat = None
+            except OSError:
+                local_ratchet_corrupt = True
+                local_lstat = None
+            if local_lstat is not None:
+                try:
+                    local_stat = (
+                        os.stat(ratchet_path)
+                        if stat.S_ISLNK(local_lstat.st_mode)
+                        else local_lstat
+                    )
+                except OSError:
                     local_ratchet_corrupt = True
                 else:
-                    try:
-                        probe_obj = json.loads(ratchet_path.read_text(encoding="utf-8"))
-                        if not isinstance(probe_obj, dict):
-                            local_ratchet_corrupt = True
-                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    if not stat.S_ISREG(local_stat.st_mode):
                         local_ratchet_corrupt = True
+                    else:
+                        try:
+                            probe_obj = _strict_json_loads(
+                                ratchet_path.read_text(encoding="utf-8")
+                            )
+                            if not isinstance(probe_obj, dict):
+                                local_ratchet_corrupt = True
+                        except (OSError, UnicodeDecodeError, ValueError):
+                            local_ratchet_corrupt = True
 
             recovery_status = (
                 recover_baseline_coverage_ratchet(baseline_ratchet_uri, ratchet_path)
                 if baseline_ratchet_uri
                 else BASELINE_RECOVERY_SKIPPED
             )
-            force_baseline_missing = (
-                recovery_status == BASELINE_RECOVERY_FAILED
-                or (
-                    local_ratchet_corrupt
-                    and recovery_status != BASELINE_RECOVERY_RECOVERED
-                )
+            configured_baseline_failed = recovery_status == BASELINE_RECOVERY_FAILED
+            unrecovered_local_corrupt = (
+                local_ratchet_corrupt
+                and recovery_status != BASELINE_RECOVERY_RECOVERED
             )
 
             _, ratchet_baseline_missing = update_coverage_ratchet(
@@ -3321,9 +3525,16 @@ def main(argv: list[str] | None = None) -> int:
                 itree_suite_healthy,
                 itree if itree_performed else None,
                 itree_seed,
-                force_baseline_missing=force_baseline_missing,
+                force_baseline_missing=(
+                    configured_baseline_failed or unrecovered_local_corrupt
+                ),
+                persist_baseline_unmerged=configured_baseline_failed,
             )
-            written.append(ratchet_path)
+            try:
+                if ratchet_path.is_file():
+                    written.append(ratchet_path)
+            except OSError:
+                pass
 
             ledger["total_campaigns_run"] = prev_campaigns + 1
             ledger["last_run_utc"] = utc_now_iso()
@@ -3434,7 +3645,13 @@ def main(argv: list[str] | None = None) -> int:
                 elapsed_sec,
             )
 
-        sync_state_to_remote(state_dir, remote_uri, written)
+        sync_state_to_remote(
+            state_dir,
+            remote_uri,
+            _filter_written_for_remote(
+                state_dir, remote_uri, written, remote_state_ok
+            ),
+        )
         print(report_md)
 
         if harness_or_red_flag_failed:

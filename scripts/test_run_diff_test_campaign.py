@@ -2321,6 +2321,102 @@ class BaselineRatchetAdversarialTest(unittest.TestCase):
                 if label == "huge_int_literal":
                     self.assertIs(ratchet.get("baseline_missing"), True)
 
+    def test_boundary_4300_digit_ints_and_nan_in_baseline_do_not_crash_json_dumps(
+        self,
+    ) -> None:
+        """4300-digit ints (`+ 1` -> 4301 digits) and `NaN` constants must not crash `json.dumps`."""
+        sig = "miri:s01_checked_add@AddToSubMutator:pass_vs_pass:agree"
+        nines_4300 = "9" * 4300
+        cases = {
+            "boundary_4300_nines_hit_count": (
+                '{"schema_version": 1, "observed_paths": {"'
+                + sig
+                + '": {"suite": "miri", "hit_count": '
+                + nines_4300
+                + "}}}",
+                False,
+            ),
+            "nan_constant": (
+                '{"schema_version": 1, "cumulative_distinct_obs_paths": NaN, "observed_paths": {}}',
+                True,
+            ),
+        }
+        for label, (text, expect_missing) in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                state_dir = tmp_path / "state_dir"
+                state_dir.mkdir()
+                write_initial_ledger(state_dir, active_fingerprints=[])
+                baseline = tmp_path / "coverage_ratchet.json"
+                baseline.write_text(text, encoding="utf-8")
+                with mock.patch.object(
+                    campaign, "run_harness", side_effect=self._fake_run_harness(state_dir)
+                ), mock.patch("sys.stderr", io.StringIO()):
+                    rc = run_main(state_dir, "--baseline-ratchet-uri", str(baseline))
+                self.assertEqual(rc, campaign.EXIT_SUCCESS)
+                ratchet = json.loads(
+                    (state_dir / "state" / "coverage_ratchet.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(ratchet["observed_paths"][sig]["hit_count"], 2 if not expect_missing else 1)
+                if expect_missing:
+                    self.assertIs(ratchet.get("baseline_missing"), True)
+                else:
+                    self.assertNotIn("baseline_missing", ratchet)
+
+    def test_non_absent_remote_state_read_failure_skips_uploading_state_subdir(
+        self,
+    ) -> None:
+        """When initial `/remote/` state pull fails with a non-absent error, `state/` is not overwritten remotely."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            remote_uri = "/remote/teams/anneal-agent/difftest"
+            remote_calls: list[list[str]] = []
+
+            def flaky_remote_sync(args: list[str]) -> subprocess.CompletedProcess[str]:
+                remote_calls.append(list(args))
+                if args[:2] == ["cp", "-f"] and args[2].startswith(f"{remote_uri}/state/"):
+                    return subprocess.CompletedProcess(
+                        args, 1, "", "UNAVAILABLE: transient backend error"
+                    )
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            stderr_buf = io.StringIO()
+            with mock.patch.object(
+                campaign, "run_harness", side_effect=self._fake_run_harness(state_dir)
+            ), mock.patch.object(
+                campaign, "has_remote_sync", return_value=True
+            ), mock.patch.object(
+                campaign, "run_remote_sync", side_effect=flaky_remote_sync
+            ), mock.patch("sys.stderr", stderr_buf):
+                rc = campaign.main(
+                    [
+                        "--profile",
+                        "smoke",
+                        "--state-dir",
+                        str(state_dir),
+                        "--remote-uri",
+                        remote_uri,
+                    ]
+                )
+
+            self.assertEqual(rc, campaign.EXIT_SUCCESS)
+            self.assertIn("skipping upload of state/", stderr_buf.getvalue())
+            upload_dests = [
+                c[3]
+                for c in remote_calls
+                if c[:2] == ["cp", "-f"] and c[3].startswith(remote_uri)
+            ]
+            self.assertTrue(
+                any(d.endswith("/reports/LATEST_REPORT.md") for d in upload_dests),
+                upload_dests,
+            )
+            self.assertFalse(
+                any("/state/" in d for d in upload_dests),
+                f"state/ must not be uploaded after failed remote read: {upload_dests}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
