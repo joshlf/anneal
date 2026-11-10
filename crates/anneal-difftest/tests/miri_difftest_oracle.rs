@@ -22,6 +22,7 @@ use anneal_difftest::miri_eval::{evaluate_miri_batches, reproduce_miri_finding};
 use anneal_difftest::mutators_miri::{
     GeneratedMiriCandidate, build_standalone_candidate_source, generate_miri_corpus_batch,
 };
+use cargo_anneal::{CaptureDriverConfig, resolve_rustc_wrapper};
 
 struct TempDir(PathBuf);
 
@@ -597,5 +598,143 @@ pub fn neg_ctrl_helper_call_surrogate__b0_c1() -> u32 {
         0,
         "expected 0 helper_add_ten skips in seeded batch: {:?}",
         seeded_rep.unmodeled_external_calls
+    );
+}
+
+/// Real `lake` binary used behind the logging wrappers below (the pinned
+/// toolchain first, then the `elan` proxy).
+fn real_lake_binary() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    [
+        ".elan/toolchains/leanprover--lean4---v4.34.1/bin/lake",
+        ".elan/bin/lake",
+    ]
+    .into_iter()
+    .map(|rel| home.join(rel))
+    .find(|p| p.is_file())
+}
+
+/// Write an executable `lake` wrapper at `path` that records its subcommand
+/// (`build`, `env`, ...) in `log` and then `exec`s `real_lake`.
+#[cfg(unix)]
+fn write_logging_lake_wrapper(path: &Path, log: &Path, real_lake: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(path.parent().expect("wrapper parent")).expect("create wrapper dir");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"${{1:-}}\" >> '{}'\nexec '{}' \"$@\"\n",
+        log.display(),
+        real_lake.display()
+    );
+    fs::write(path, script).expect("write lake wrapper");
+    let mut perms = fs::metadata(path).expect("wrapper metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod lake wrapper");
+}
+
+fn logged_lake_subcommands(log: &Path) -> BTreeSet<String> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// The `.olean` files that `lake build` produces for `Mir` and `SymbolicEval`
+/// are only loadable by the same Lean toolchain, so the helper-linked oracle
+/// must run `lake build` and `lake env lean` (probe and confirm modules) with one
+/// and the same `lake` binary, whatever the environment selects.
+#[cfg(unix)]
+#[test]
+fn linked_oracle_runs_lake_build_and_lake_env_lean_with_the_same_lake_binary() {
+    use std::os::unix::fs::symlink;
+
+    let Some(real_lake) = real_lake_binary() else {
+        eprintln!("skipping: no lake toolchain found under $HOME/.elan");
+        return;
+    };
+    let dir = unique_temp_dir("lake_binary");
+    let bin = env!("CARGO_BIN_EXE_miri-difftest");
+    let cand_fn = "pub fn lake_binary_probe__b0_c0() -> u32 {\n    helper_add_ten() + 1u32\n}\n";
+    let repro = dir.join("repro.rs");
+    fs::write(&repro, build_standalone_candidate_source(cand_fn)).expect("write repro.rs");
+
+    // Scenario 1: an installed omnibus toolchain (`ANNEAL_TOOLCHAIN_DIR`), whose
+    // `lean/bin/lake` is what `run_lake_verify_targets` uses when `LAKE` is unset.
+    let toolchain = dir.join("omnibus");
+    let omnibus_log = dir.join("omnibus_lake.log");
+    write_logging_lake_wrapper(&toolchain.join("lean/bin/lake"), &omnibus_log, &real_lake);
+    let real_lean = real_lake.with_file_name("lean");
+    if real_lean.is_file() {
+        symlink(&real_lean, toolchain.join("lean/bin/lean")).expect("symlink lean");
+    } else {
+        fs::write(toolchain.join("lean/bin/lean"), "").expect("write lean stub");
+    }
+    fs::create_dir_all(toolchain.join("bin")).expect("create omnibus bin");
+    let capture = resolve_rustc_wrapper(&CaptureDriverConfig::new(dir.to_path_buf()));
+    if capture.is_file() {
+        symlink(&capture, toolchain.join("bin/anneal-rustc-capture")).expect("symlink capture");
+    } else {
+        fs::write(toolchain.join("bin/anneal-rustc-capture"), "").expect("write capture stub");
+    }
+    fs::create_dir_all(toolchain.join("rust/bin")).expect("create omnibus rust/bin");
+    fs::write(toolchain.join("rust/bin/rustc"), "").expect("write rustc stub");
+    fs::create_dir_all(toolchain.join("share/anneal/trusted/lean")).expect("create share dir");
+    fs::write(
+        toolchain.join("share/anneal/trusted/lean/foundation-lock.json"),
+        "{}\n",
+    )
+    .expect("write foundation lock stub");
+
+    let out1 = Command::new(bin)
+        .arg("--reproduce")
+        .arg(&repro)
+        .arg("--output-json")
+        .arg(dir.join("omnibus.json"))
+        .env("ANNEAL_TOOLCHAIN_DIR", &toolchain)
+        .env_remove("LAKE")
+        .env_remove("ANNEAL_LAKE")
+        .output()
+        .expect("run miri-difftest --reproduce with an omnibus toolchain");
+    let used1 = logged_lake_subcommands(&omnibus_log);
+    assert_eq!(
+        used1.contains("build"),
+        used1.contains("env"),
+        "`lake build` and `lake env lean` used different lake binaries with \
+         ANNEAL_TOOLCHAIN_DIR set (omnibus lake ran only {used1:?})\nstderr:\n{}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        out1.status.success(),
+        "--reproduce failed with an omnibus toolchain:\n{}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // Scenario 2: `ANNEAL_LAKE` set while `LAKE` is unset.
+    let anneal_lake_log = dir.join("anneal_lake.log");
+    let anneal_lake = dir.join("anneal_lake/lake");
+    write_logging_lake_wrapper(&anneal_lake, &anneal_lake_log, &real_lake);
+    let out2 = Command::new(bin)
+        .arg("--reproduce")
+        .arg(&repro)
+        .arg("--output-json")
+        .arg(dir.join("anneal_lake.json"))
+        .env("ANNEAL_LAKE", &anneal_lake)
+        .env_remove("LAKE")
+        .env_remove("ANNEAL_TOOLCHAIN_DIR")
+        .output()
+        .expect("run miri-difftest --reproduce with ANNEAL_LAKE");
+    let used2 = logged_lake_subcommands(&anneal_lake_log);
+    assert_eq!(
+        used2.contains("build"),
+        used2.contains("env"),
+        "`lake build` and `lake env lean` used different lake binaries with \
+         ANNEAL_LAKE set (ANNEAL_LAKE ran only {used2:?})\nstderr:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        out2.status.success(),
+        "--reproduce failed with ANNEAL_LAKE:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
     );
 }
