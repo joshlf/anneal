@@ -21,9 +21,9 @@ use anneal_mir::lower::{
     LoweredRvalue, LoweredStatement, LoweredTerminator, MirValue, PanicMessage, PartialAggregate,
     RvalueEvalError, RvalueLowerError, StatementEvalState, TerminatorLowerError, TransmutePolicy,
     TransmuteValue, eval_cfg_in_state, eval_lowered_body_cfg, eval_lowered_body_cfg_with_calls,
-    eval_lowered_rvalue, eval_lowered_rvalue_in_state, eval_lowered_statement, eval_transmute,
-    lower_body, lower_rvalue, lower_statement, lower_terminator, resolve_offset_of,
-    resolve_place_ty,
+    eval_lowered_rvalue, eval_lowered_rvalue_in_state, eval_lowered_statement, eval_place_read,
+    eval_place_write, eval_transmute, lower_body, lower_rvalue, lower_statement, lower_terminator,
+    resolve_offset_of, resolve_place_ty,
 };
 
 const PW: PtrWidth = PtrWidth::Bits64;
@@ -7502,5 +7502,339 @@ fn test_a2_layouts_agree_with_rustc_on_random_adts() {
         32,
         16,
         &[(0, 0, 4), (1, 0, 16), (2, 0, 8), (2, 1, 16)],
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Adversarial Round B3 Regression Tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_b3_eval_place_read_and_write_enforce_typed_adt_union_enum_and_struct_invariants() {
+    let (u_def, _) = adt(AdtDef::new_union("U2", vec![u32_ty(), u8_ty()]));
+    let (e_def, _) = repr_u8_enum();
+    let (s_def, _) = adt(AdtDef::new_struct("S2", vec![u32_ty(), u8_ty()]));
+
+    // 1. Typed union `MirValue::union_value` in stateless `eval_place_read` / `eval_place_write`
+    // (`declared_ty: None`) must enforce `AdtDef` field bounds and field types instead of
+    // reporting `InactiveUnionField` on out-of-bounds reads or corrupting `active_field` on writes.
+    let u_val = MirValue::union_value(&u_def, 0, u32v(10));
+    let mut locals = vec![u_val.clone()];
+    let oob_union_place = place(0, vec![field(5, Ty::Bool)]);
+    assert_eq!(
+        eval_place_read(&oob_union_place, &locals, PW),
+        Err(RvalueEvalError::FieldOutOfBounds {
+            field_idx: 5,
+            field_count: 2,
+        })
+    );
+    assert_eq!(
+        eval_place_write(&oob_union_place, MirValue::Bool(true), &mut locals, PW),
+        Err(RvalueEvalError::FieldOutOfBounds {
+            field_idx: 5,
+            field_count: 2,
+        })
+    );
+    assert_eq!(locals[0], u_val);
+
+    let bad_ty_union_place = place(0, vec![field(1, Ty::Bool)]);
+    assert!(matches!(
+        eval_place_write(&bad_ty_union_place, MirValue::Bool(true), &mut locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(locals[0], u_val);
+
+    // 2. Typed enum `MirValue::adt` must require `Downcast` before `Field` even when
+    // `variant_idx == 0`, and reject out-of-range `Downcast(99)` with `TypeMismatch`.
+    let e_val = MirValue::adt(&e_def, 0, vec![u8v(1), u32v(2)]);
+    let mut e_locals = vec![e_val.clone()];
+    let no_downcast = place(0, vec![field(0, u8_ty())]);
+    assert!(matches!(
+        eval_place_read(&no_downcast, &e_locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        eval_place_write(&no_downcast, u8v(9), &mut e_locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    let oob_downcast = place(0, vec![ProjectionElem::Downcast(99), field(0, u8_ty())]);
+    assert!(matches!(
+        eval_place_read(&oob_downcast, &e_locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        eval_place_write(&oob_downcast, u8v(9), &mut e_locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(e_locals[0], e_val);
+
+    // 3. Typed struct `MirValue::adt` must reject `Downcast(0)` with `TypeMismatch`.
+    let s_val = MirValue::adt(&s_def, 0, vec![u32v(7), u8v(8)]);
+    let mut s_locals = vec![s_val.clone()];
+    let struct_downcast = place(0, vec![ProjectionElem::Downcast(0), field(0, u32_ty())]);
+    assert!(matches!(
+        eval_place_read(&struct_downcast, &s_locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert!(matches!(
+        eval_place_write(&struct_downcast, u32v(9), &mut s_locals, PW),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+    assert_eq!(s_locals[0], s_val);
+}
+
+#[test]
+fn test_b3_legacy_multi_field_union_identity_transmute_and_well_formedness() {
+    let (nz_def, nz_ty) = non_zero_u32();
+    let union_tuple_ty = Ty::Tuple(vec![u32_ty(), nz_ty.clone()]);
+    // Legacy multi-field union `MirValue::Adt` with `active_field: Some(0)` (`u32` active) and
+    // an invalid `NonZeroU32(0)` sitting in the inactive slot `fields[1]`.
+    let legacy_union = MirValue::Adt {
+        def_path: "LegacyU".to_string(),
+        variant_idx: 0,
+        active_field: Some(0),
+        fields: vec![u32v(42), MirValue::adt(&nz_def, 0, vec![u32v(0)])],
+        adt_def: None,
+    };
+
+    // 1. Identity transmute on `union_tuple_ty` must accept the 2-element legacy union and
+    // normalize the active field `0`.
+    let mut state = state_with(vec![union_tuple_ty.clone()], PW);
+    state.slots[0] = LocalSlotState::Init(legacy_union.clone());
+    transmute(
+        &mut state,
+        0,
+        Operand::Copy(local(0)),
+        union_tuple_ty.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        state.read_place(&place(0, vec![field(0, u32_ty())])),
+        Ok(u32v(42))
+    );
+
+    // 2. Passing `legacy_union` as a CFG body argument checks only the active field (`u32v(42)`),
+    // not the inactive slot `fields[1]`.
+    let body = lower_ok(
+        &mk_body(
+            vec![u32_ty(), union_tuple_ty],
+            vec![blk(
+                vec![assign(
+                    local(0),
+                    Rvalue::Use(Operand::Copy(place(1, vec![field(0, u32_ty())]))),
+                )],
+                Terminator::Return,
+            )],
+        ),
+        PW,
+    );
+    assert_eq!(
+        eval_lowered_body_cfg(&body, &[legacy_union], 4),
+        Ok(CfgEvalOutcome::Returned(u32v(42)))
+    );
+}
+
+#[test]
+fn test_b3_shallow_init_box_wrap_unsafe_binder_and_canonical_layout_bounds() {
+    // 1. Hand-built `LoweredRvalue::ShallowInitBox` must reject `*const T` (`Mutability::Not`)
+    // and unrepresentable pointee types.
+    let ptr_u8 = raw(u8_ty(), Mutability::Mut);
+    let ptr_val = PointerValue::with_provenance(0x2000, 1, 1);
+    let mut state = state_with(vec![raw(u32_ty(), Mutability::Not)], PW);
+    let const_box = LoweredRvalue::ShallowInitBox {
+        operand: Operand::Constant(Constant::Ptr(ptr_val, ptr_u8.clone())),
+        operand_ty: ptr_u8.clone(),
+        ty: raw(u32_ty(), Mutability::Not),
+    };
+    assert!(matches!(
+        eval_lowered_rvalue_in_state(&const_box, &mut state),
+        Err(RvalueEvalError::TypeMismatch(_))
+    ));
+
+    let too_large_inner = Ty::Array(Box::new(u8_ty()), usize::MAX);
+    let too_large_box = LoweredRvalue::ShallowInitBox {
+        operand: Operand::Constant(Constant::Ptr(ptr_val, ptr_u8)),
+        operand_ty: raw(u8_ty(), Mutability::Mut),
+        ty: raw(too_large_inner.clone(), Mutability::Mut),
+    };
+    assert_eq!(
+        eval_lowered_rvalue_in_state(&too_large_box, &mut state),
+        Err(RvalueEvalError::CastEval(CastEvalError::LayoutTooLarge {
+            ty: too_large_inner.clone(),
+        }))
+    );
+
+    // 2. `Rvalue::WrapUnsafeBinder` must reject single-field structs with `repr(align)` overrides,
+    // and hand-built `LoweredRvalue::WrapUnsafeBinder` must validate `ty` representability.
+    let (_, over_aligned_wrapper) = adt(
+        AdtDef::new_struct("OverAligned", vec![u32_ty()]).with_repr(AdtRepr::c().with_align(8)),
+    );
+    assert!(matches!(
+        lower_rvalue(
+            &Rvalue::WrapUnsafeBinder(cint(1, u32_ty()), over_aligned_wrapper),
+            &[],
+            PW,
+        ),
+        Err(RvalueLowerError::InvalidWrapUnsafeBinder { .. })
+    ));
+
+    let (_, ill_formed_wrapper) = adt(
+        AdtDef::new_struct("BadAlignWrapper", vec![u32_ty()])
+            .with_repr(AdtRepr::rust().with_align(3)),
+    );
+    let hand_binder = LoweredRvalue::WrapUnsafeBinder {
+        operand: cint(1, u32_ty()),
+        operand_ty: u32_ty(),
+        ty: ill_formed_wrapper.clone(),
+    };
+    assert!(matches!(
+        eval_lowered_rvalue_in_state(&hand_binder, &mut state),
+        Err(RvalueEvalError::CastEval(CastEvalError::IllFormedType {
+            ty,
+            ..
+        })) if ty == ill_formed_wrapper
+    ));
+
+    // 3. `Ty::has_canonical_byte_layout` must return `false` on unrepresentable arrays and tuples.
+    assert!(!too_large_inner.has_canonical_byte_layout(PW));
+    let half_max_arr = Ty::Array(Box::new(u8_ty()), (isize::MAX as usize / 2) + 1);
+    let too_large_tuple = Ty::Tuple(vec![half_max_arr.clone(), half_max_arr]);
+    assert_eq!(too_large_tuple.layout_for(PW), Err(LayoutError::TooLarge));
+    assert!(!too_large_tuple.has_canonical_byte_layout(PW));
+}
+
+#[test]
+fn test_b3_eval_cfg_in_state_validates_state_switch_int_targets_and_unwind_actions() {
+    let lb = |terminator: Option<LoweredTerminator>, is_cleanup: bool| LoweredBasicBlock {
+        statements: vec![],
+        terminator,
+        is_cleanup,
+    };
+    let mk_lowered = |basic_blocks: Vec<LoweredBasicBlock>| LoweredBody {
+        local_decls: vec![u8_ty()],
+        basic_blocks,
+        ptr_width: PW,
+    };
+
+    // 1. `eval_cfg_in_state` rejects a `StatementEvalState` whose `ptr_width` or `local_decls`
+    // disagree with `LoweredBody`.
+    let simple_body = mk_lowered(vec![lb(
+        Some(LoweredTerminator::Return { ret_ty: u8_ty() }),
+        false,
+    )]);
+    let wrong_pw_state = state_with(vec![u8_ty()], PtrWidth::Bits32);
+    assert!(matches!(
+        eval_cfg_in_state(&simple_body, wrong_pw_state, 0, 4, None),
+        Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(_)
+        ))
+    ));
+    let wrong_decls_state = state_with(vec![u32_ty()], PW);
+    assert!(matches!(
+        eval_cfg_in_state(&simple_body, wrong_decls_state, 0, 4, None),
+        Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(_)
+        ))
+    ));
+
+    // 2. Hand-built `LoweredTerminator::SwitchInt` with duplicate or out-of-range target values
+    // fails closed even when the discriminant takes `otherwise`.
+    let oob_switch = mk_lowered(vec![lb(
+        Some(LoweredTerminator::SwitchInt {
+            discr: cbool(false),
+            discr_ty: Ty::Bool,
+            targets: SwitchTargets {
+                values: vec![2],
+                targets: vec![0],
+                otherwise: 0,
+            },
+        }),
+        false,
+    )]);
+    assert!(matches!(
+        eval_lowered_body_cfg(&oob_switch, &[], 4),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::TypeMismatch(_),
+        })
+    ));
+
+    let dup_switch = mk_lowered(vec![lb(
+        Some(LoweredTerminator::SwitchInt {
+            discr: cint(9, u8_ty()),
+            discr_ty: u8_ty(),
+            targets: SwitchTargets {
+                values: vec![1, 1],
+                targets: vec![0, 0],
+                otherwise: 0,
+            },
+        }),
+        false,
+    )]);
+    assert!(matches!(
+        eval_lowered_body_cfg(&dup_switch, &[], 4),
+        Err(CfgEvalError::Terminator {
+            bb: 0,
+            error: RvalueEvalError::TypeMismatch(_),
+        })
+    ));
+
+    // 3. Hand-built `Drop`, passing `Assert`, and returning `Call` validate their `unwind`
+    // actions/edges even when no panic occurs.
+    let mut init_state = state_with(vec![u8_ty()], PW);
+    init_state.slots[0] = LocalSlotState::Init(u8v(1));
+
+    let bad_drop = mk_lowered(vec![lb(
+        Some(LoweredTerminator::Drop {
+            place: local(0),
+            place_ty: u8_ty(),
+            target: 0,
+            unwind: UnwindAction::Cleanup(0), // bb0 is not a cleanup block
+        }),
+        false,
+    )]);
+    assert_eq!(
+        eval_cfg_in_state(&bad_drop, init_state.clone(), 0, 4, None),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 0 })
+    );
+
+    let bad_passing_assert = mk_lowered(vec![lb(
+        Some(LoweredTerminator::Assert {
+            cond: cbool(true),
+            expected: true,
+            msg: custom("ok"),
+            target: 0,
+            unwind: UnwindAction::Cleanup(99), // out-of-range block
+        }),
+        false,
+    )]);
+    assert_eq!(
+        eval_cfg_in_state(&bad_passing_assert, init_state.clone(), 0, 4, None),
+        Err(CfgEvalError::InvalidBlock { bb: 99 })
+    );
+
+    let bad_returning_call = mk_lowered(vec![lb(
+        Some(LoweredTerminator::Call {
+            func: Operand::Constant(Constant::Unit),
+            func_ty: unit(),
+            args: vec![],
+            arg_tys: vec![],
+            destination: local(0),
+            dest_ty: u8_ty(),
+            target: Some(0),
+            unwind: UnwindAction::Cleanup(0), // bb0 is not a cleanup block
+        }),
+        false,
+    )]);
+    let mut ok_handler = |_: usize, _: &MirValue, _: &[MirValue]| Ok(CallOutcome::Return(u8v(2)));
+    assert_eq!(
+        eval_cfg_in_state(
+            &bad_returning_call,
+            init_state,
+            0,
+            4,
+            Some(&mut ok_handler),
+        ),
+        Err(CfgEvalError::InvalidEdge { from: 0, to: 0 })
     );
 }

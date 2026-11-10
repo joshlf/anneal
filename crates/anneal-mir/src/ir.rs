@@ -1056,9 +1056,13 @@ impl Ty {
             | Ty::RawPtr(_, _)
             | Ty::Ref(_, _)
             | Ty::Never => true,
-            Ty::Array(elem, _) => elem.has_canonical_byte_layout(ptr_width),
+            Ty::Array(elem, _) => {
+                self.layout_for(ptr_width).is_ok() && elem.has_canonical_byte_layout(ptr_width)
+            }
             Ty::Tuple(fields) => {
-                if !fields.iter().all(|f| f.has_canonical_byte_layout(ptr_width)) {
+                if self.layout_for(ptr_width).is_err()
+                    || !fields.iter().all(|f| f.has_canonical_byte_layout(ptr_width))
+                {
                     return false;
                 }
                 if fields.len() <= 1 || fields.windows(2).all(|w| w[0] == w[1]) {

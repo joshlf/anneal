@@ -1260,13 +1260,16 @@ pub fn lower_rvalue_with_policy(
     }
 }
 
-/// Field type of a single-field struct `Ty::Adt` (the type a `WrapUnsafeBinder` wraps).
+/// Field type of a single-field struct `Ty::Adt` without an explicit `repr(align)` override
+/// (the type a `WrapUnsafeBinder` wraps).
 fn wrapped_field_ty(ty: &Ty) -> Option<&Ty> {
     match ty {
-        Ty::Adt(def) if def.is_struct() => match def.variant_fields(0) {
-            Some([field]) => Some(field),
-            _ => None,
-        },
+        Ty::Adt(def) if def.is_struct() && def.repr.align.is_none() => {
+            match def.variant_fields(0) {
+                Some([field]) => Some(field),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -2830,7 +2833,10 @@ pub(crate) fn check_scalar_ranges(val: &MirValue, ptr_width: PtrWidth) -> Result
             Ok(())
         }
         MirValue::Adt {
-            fields, adt_def, ..
+            active_field,
+            fields,
+            adt_def,
+            ..
         } => {
             if let Some(def) = adt_def
                 && def.scalar_valid_range.is_some()
@@ -2843,8 +2849,19 @@ pub(crate) fn check_scalar_ranges(val: &MirValue, ptr_width: PtrWidth) -> Result
                     bits,
                 }));
             }
-            for field in fields {
-                check_scalar_ranges(field, ptr_width)?;
+            if let Some(active) = active_field {
+                let active_val = if fields.len() == 1 {
+                    fields.first()
+                } else {
+                    fields.get(*active)
+                };
+                if let Some(field) = active_val {
+                    check_scalar_ranges(field, ptr_width)?;
+                }
+            } else {
+                for field in fields {
+                    check_scalar_ranges(field, ptr_width)?;
+                }
             }
             Ok(())
         }
@@ -2878,9 +2895,29 @@ pub(crate) fn check_value_well_formed(
             MirValue::Array { elements, .. } => elements
                 .iter()
                 .try_for_each(|element| check_leaves(element, ptr_width)),
-            MirValue::Tuple(fields) | MirValue::Adt { fields, .. } => fields
+            MirValue::Tuple(fields)
+            | MirValue::Adt {
+                active_field: None,
+                fields,
+                ..
+            } => fields
                 .iter()
                 .try_for_each(|field| check_leaves(field, ptr_width)),
+            MirValue::Adt {
+                active_field: Some(active),
+                fields,
+                ..
+            } => {
+                let active_val = if fields.len() == 1 {
+                    fields.first()
+                } else {
+                    fields.get(*active)
+                };
+                if let Some(field) = active_val {
+                    check_leaves(field, ptr_width)?;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -2989,13 +3026,18 @@ fn eval_identity_transmute_value(
                 fields: values,
                 adt_def: None,
             },
-        ) if values.len() == 1 => {
+        ) if values.len() == 1 || values.len() == fields.len() => {
             let Some(field_ty) = fields.get(*field_idx) else {
                 return Err(RvalueEvalError::TypeMismatch(
                     "union Adt active_field index out of bounds for union type",
                 ));
             };
-            let norm = eval_identity_transmute_value(&values[0], field_ty, ptr_width)?;
+            let active_val = if values.len() == 1 {
+                &values[0]
+            } else {
+                &values[*field_idx]
+            };
+            let norm = eval_identity_transmute_value(active_val, field_ty, ptr_width)?;
             Ok(MirValue::Adt {
                 def_path: def_path.clone(),
                 variant_idx: 0,
@@ -3991,8 +4033,16 @@ fn project_mir_value<'a>(
                 MirValue::Adt {
                     variant_idx,
                     active_field: None,
+                    adt_def,
                     ..
                 } => {
+                    if let Some(def) = adt_def
+                        && (!def.is_enum() || *expected_variant >= def.variant_count())
+                    {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Downcast requires an enum ADT with an in-range variant",
+                        ));
+                    }
                     if *variant_idx != *expected_variant {
                         return Err(RvalueEvalError::InactiveVariantProjection {
                             expected: *expected_variant,
@@ -4063,14 +4113,45 @@ fn project_mir_value<'a>(
                 variant_idx,
                 active_field: None,
                 fields,
+                adt_def,
                 ..
             } => {
+                if let Some(def) = adt_def
+                    && (def.is_union() || (def.is_enum() && active_downcast.is_none()))
+                {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Field projection on an enum ADT requires a preceding Downcast",
+                    ));
+                }
                 let expected_variant = active_downcast.unwrap_or(0);
                 if *variant_idx != expected_variant {
                     return Err(RvalueEvalError::InactiveVariantProjection {
                         expected: expected_variant,
                         actual: *variant_idx,
                     });
+                }
+                if let Some(def) = adt_def {
+                    let Some(decl_fields) = def.variant_fields(expected_variant) else {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "ADT runtime variant index out of range",
+                        ));
+                    };
+                    if fields.len() != decl_fields.len() {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "ADT runtime field count does not match its AdtDef",
+                        ));
+                    }
+                    let Some(decl_field_ty) = decl_fields.get(*idx) else {
+                        return Err(RvalueEvalError::FieldOutOfBounds {
+                            field_idx: *idx,
+                            field_count: decl_fields.len(),
+                        });
+                    };
+                    if decl_field_ty != expected_ty {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "projected ADT field type does not match declared field type",
+                        ));
+                    }
                 }
                 let Some(field_val) = fields.get(*idx) else {
                     return Err(RvalueEvalError::FieldOutOfBounds {
@@ -4089,6 +4170,7 @@ fn project_mir_value<'a>(
                 variant_idx,
                 active_field: Some(active),
                 fields,
+                adt_def,
                 ..
             } => {
                 if active_downcast.is_some() || *variant_idx != 0 || fields.is_empty() {
@@ -4103,12 +4185,23 @@ fn project_mir_value<'a>(
                         "union ADT active_field index out of bounds of fields",
                     ))?
                 };
-                if let Some(decl_ty) = declared_ty {
-                    let Some(union_field_tys) = union_fields_of(decl_ty) else {
-                        return Err(RvalueEvalError::TypeMismatch(
+                let union_field_tys = match (declared_ty, adt_def) {
+                    (Some(decl_ty), _) => Some(union_fields_of(decl_ty).ok_or(
+                        RvalueEvalError::TypeMismatch(
                             "union ADT declared type must be a Ty::Tuple or a union Ty::Adt",
-                        ));
-                    };
+                        ),
+                    )?),
+                    (None, Some(def)) => {
+                        if !def.is_union() {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "only union ADTs may have an active_field",
+                            ));
+                        }
+                        def.variant_fields(0)
+                    }
+                    (None, None) => None,
+                };
+                if let Some(union_field_tys) = union_field_tys {
                     let Some(active_ty) = union_field_tys.get(*active) else {
                         return Err(RvalueEvalError::TypeMismatch(
                             "union ADT active_field index out of bounds of declared fields",
@@ -4435,8 +4528,16 @@ fn write_projected_mir_value(
                 MirValue::Adt {
                     variant_idx,
                     active_field: None,
+                    adt_def,
                     ..
                 } => {
+                    if let Some(def) = adt_def
+                        && (!def.is_enum() || *expected_variant >= def.variant_count())
+                    {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "Downcast requires an enum ADT with an in-range variant",
+                        ));
+                    }
                     if *variant_idx != *expected_variant {
                         return Err(RvalueEvalError::InactiveVariantProjection {
                             expected: *expected_variant,
@@ -4545,14 +4646,45 @@ fn write_projected_mir_value(
                 variant_idx,
                 active_field: None,
                 fields,
+                adt_def,
                 ..
             } => {
+                if let Some(def) = adt_def
+                    && (def.is_union() || (def.is_enum() && active_downcast.is_none()))
+                {
+                    return Err(RvalueEvalError::TypeMismatch(
+                        "Field projection on an enum ADT requires a preceding Downcast",
+                    ));
+                }
                 let expected_variant = active_downcast.unwrap_or(0);
                 if *variant_idx != expected_variant {
                     return Err(RvalueEvalError::InactiveVariantProjection {
                         expected: expected_variant,
                         actual: *variant_idx,
                     });
+                }
+                if let Some(def) = adt_def {
+                    let Some(decl_fields) = def.variant_fields(expected_variant) else {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "ADT runtime variant index out of range",
+                        ));
+                    };
+                    if fields.len() != decl_fields.len() {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "ADT runtime field count does not match its AdtDef",
+                        ));
+                    }
+                    let Some(decl_field_ty) = decl_fields.get(*idx) else {
+                        return Err(RvalueEvalError::FieldOutOfBounds {
+                            field_idx: *idx,
+                            field_count: decl_fields.len(),
+                        });
+                    };
+                    if decl_field_ty != expected_ty {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "projected ADT field type does not match declared field type",
+                        ));
+                    }
                 }
                 let field_count = fields.len();
                 let Some(field_slot) = fields.get_mut(*idx) else {
@@ -4598,6 +4730,7 @@ fn write_projected_mir_value(
                 variant_idx,
                 active_field: Some(active),
                 fields,
+                adt_def,
                 ..
             } => {
                 if active_downcast.is_some() || *variant_idx != 0 || fields.is_empty() {
@@ -4612,12 +4745,23 @@ fn write_projected_mir_value(
                         "union ADT active_field index out of bounds of fields",
                     ))?
                 };
-                if let Some(decl_ty) = declared_ty {
-                    let Some(union_field_tys) = union_fields_of(decl_ty) else {
-                        return Err(RvalueEvalError::TypeMismatch(
+                let union_field_tys = match (declared_ty, adt_def.as_ref()) {
+                    (Some(decl_ty), _) => Some(union_fields_of(decl_ty).ok_or(
+                        RvalueEvalError::TypeMismatch(
                             "union ADT declared type must be a Ty::Tuple or a union Ty::Adt",
-                        ));
-                    };
+                        ),
+                    )?),
+                    (None, Some(def)) => {
+                        if !def.is_union() {
+                            return Err(RvalueEvalError::TypeMismatch(
+                                "only union ADTs may have an active_field",
+                            ));
+                        }
+                        def.variant_fields(0)
+                    }
+                    (None, None) => None,
+                };
+                if let Some(union_field_tys) = union_field_tys {
                     let Some(active_ty) = union_field_tys.get(*active) else {
                         return Err(RvalueEvalError::TypeMismatch(
                             "union ADT active_field index out of bounds of declared fields",
@@ -5404,8 +5548,16 @@ fn eval_shallow_init_box(
     ty: &Ty,
     ptr_width: PtrWidth,
 ) -> Result<MirValue, RvalueEvalError> {
+    let Ty::RawPtr(inner_ty, Mutability::Mut) = ty else {
+        return Err(RvalueEvalError::TypeMismatch(
+            "ShallowInitBox result type must be a mutable raw pointer *mut T",
+        ));
+    };
+    inner_ty.check_representable(ptr_width).map_err(|err| {
+        RvalueEvalError::CastEval(cast_eval_layout_error(inner_ty, err))
+    })?;
     match val {
-        MirValue::Ptr { ptr, ty: val_ty } if val_ty == operand_ty && val_ty.is_raw_ptr() && ty.is_raw_ptr() => {
+        MirValue::Ptr { ptr, ty: val_ty } if val_ty == operand_ty && val_ty.is_raw_ptr() => {
             Ok(MirValue::Ptr {
                 ptr: PointerValue {
                     addr: (u128::from(ptr.addr) & ptr_width.mask()) as u64,
@@ -5428,6 +5580,9 @@ fn eval_wrap_unsafe_binder(
     ty: &Ty,
     ptr_width: PtrWidth,
 ) -> Result<MirValue, RvalueEvalError> {
+    ty.check_representable(ptr_width).map_err(|err| {
+        RvalueEvalError::CastEval(cast_eval_layout_error(ty, err))
+    })?;
     if !mir_value_matches_ty(&val, operand_ty) {
         return Err(RvalueEvalError::TypeMismatch(
             "WrapUnsafeBinder operand runtime type does not match lowered type",

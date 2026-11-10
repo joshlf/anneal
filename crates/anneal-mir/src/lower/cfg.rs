@@ -736,6 +736,28 @@ fn switch_bits(val: &MirValue, ptr_width: PtrWidth) -> Result<u128, RvalueEvalEr
     }
 }
 
+/// Validates that `unwind` is well-formed for block `bb` (in or outside cleanup mode).
+fn check_unwind_action(
+    bb: usize,
+    unwind: UnwindAction,
+    in_cleanup: bool,
+    basic_blocks: &[ crate::lower::rvalue::LoweredBasicBlock ],
+) -> Result<(), CfgEvalError> {
+    match unwind {
+        UnwindAction::Unreachable | UnwindAction::Terminate => Ok(()),
+        UnwindAction::Continue if in_cleanup => Err(CfgEvalError::InvalidUnwind { bb }),
+        UnwindAction::Continue => Ok(()),
+        UnwindAction::Cleanup(_) if in_cleanup => Err(CfgEvalError::InvalidUnwind { bb }),
+        UnwindAction::Cleanup(target) => match basic_blocks.get(target) {
+            None => Err(CfgEvalError::InvalidBlock { bb: target }),
+            Some(target_block) if !target_block.is_cleanup => {
+                Err(CfgEvalError::InvalidEdge { from: bb, to: target })
+            }
+            Some(_) => Ok(()),
+        },
+    }
+}
+
 /// Evaluates `body` from block `start_bb` in `state` with at most `fuel` executed basic blocks,
 /// using `call_handler` (if any) for `Call` terminators. See the module documentation.
 pub fn eval_cfg_in_state(
@@ -745,6 +767,16 @@ pub fn eval_cfg_in_state(
     mut fuel: usize,
     mut call_handler: Option<&mut CallHandler<'_>>,
 ) -> Result<CfgEvalOutcome, CfgEvalError> {
+    if state.ptr_width != body.ptr_width
+        || state.local_decls != body.local_decls
+        || state.slots.len() != body.local_decls.len()
+    {
+        return Err(CfgEvalError::InvalidArguments(
+            RvalueEvalError::TypeMismatch(
+                "StatementEvalState local_decls, slots, or ptr_width do not match LoweredBody",
+            ),
+        ));
+    }
     let ptr_width = state.ptr_width;
     let mut bb = start_bb;
     match body.basic_blocks.get(bb) {
@@ -761,6 +793,7 @@ pub fn eval_cfg_in_state(
         }
         fuel -= 1;
         let block = &body.basic_blocks[bb];
+        let in_cleanup = block.is_cleanup || unwinding.is_some();
         for (index, stmt) in block.statements.iter().enumerate() {
             eval_lowered_statement(stmt, &mut state).map_err(|error| CfgEvalError::Statement {
                 bb,
@@ -790,10 +823,21 @@ pub fn eval_cfg_in_state(
                         "SwitchInt discriminant runtime type does not match lowered type",
                     )));
                 }
-                targets.target_for_value(switch_bits(&val, ptr_width).map_err(term_err)?)
+                let bits = switch_bits(&val, ptr_width).map_err(term_err)?;
+                let mut seen = BTreeSet::new();
+                for value in &targets.values {
+                    if !seen.insert(*value)
+                        || !discr_ty.is_valid_scalar_bits(*value, ptr_width)
+                    {
+                        return Err(term_err(RvalueEvalError::TypeMismatch(
+                            "SwitchInt targets contain duplicate or out-of-range values",
+                        )));
+                    }
+                }
+                targets.target_for_value(bits)
             }
             LoweredTerminator::Return { ret_ty } => {
-                if unwinding.is_some() {
+                if in_cleanup {
                     return Err(CfgEvalError::InvalidUnwind { bb });
                 }
                 if state.local_decls.first() != Some(ret_ty) || !ret_ty.is_inhabited_for(ptr_width)
@@ -812,12 +856,13 @@ pub fn eval_cfg_in_state(
                 place,
                 place_ty,
                 target,
-                ..
+                unwind,
             } => {
                 // No drop glue: the place must be live and well-formed; its value is unchanged.
                 state
                     .check_place_access(place, place_ty)
                     .map_err(term_err)?;
+                check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
                 *target
             }
             LoweredTerminator::Assert {
@@ -833,6 +878,7 @@ pub fn eval_cfg_in_state(
                     )));
                 };
                 if actual == *expected {
+                    check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
                     *target
                 } else {
                     let panic_msg = eval_panic_message(msg, &mut state).map_err(term_err)?;
@@ -881,6 +927,7 @@ pub fn eval_cfg_in_state(
                 };
                 match handler(bb, &func_val, &arg_vals).map_err(term_err)? {
                     CallOutcome::Return(ret_val) => {
+                        check_unwind_action(bb, *unwind, in_cleanup, &body.basic_blocks)?;
                         let Some(target) = target else {
                             return Err(CfgEvalError::UnreachableReached { bb });
                         };
