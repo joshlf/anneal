@@ -853,9 +853,13 @@ theorem transmute_u8x4_to_laidOutU16Pair_sound
 
 /-- Real single-field newtype `NonZeroU32` (`B3-1`): satisfies non-vacuous `IsTryFromBytes`
 (`v = .aggregate 0 [.scalar ⟨bits, 4⟩]` with `1 ≤ bits < 2^32`, `bits ≠ 0`), `¬ IsFromBytes`,
-`¬ IsFromZeros`, and well-typed/decoded transmutation `NonZeroU32 → u32`
-(`transmute_typed` and `transmute_sound_of_decoded`), while untyped `BitValidity.IsIntoBytes`
-fails on ill-typed `.aggregate 0 [.unit]` (`scalarNicheNewtype_untyped_unit_field_divergence`). -/
+`¬ IsFromZeros`, and well-typed/decoded `IntoBytes`-style transmutation `NonZeroU32 → u32`
+(`transmute_typed` and `transmute_sound_of_decoded`).
+
+**Divergence (Trusted untyped-field encoder fallback vs. `zerocopy::IntoBytes`):**
+In Rust / `zerocopy`, `NonZeroU32` *is* `IntoBytes`; here untyped `BitValidity.IsIntoBytes`
+fails solely because `Trusted`'s `args = []` encoder fallback accepts the ill-typed 0-byte
+field `.aggregate 0 [.unit]` (`scalarNicheNewtype_untyped_unit_field_divergence`). -/
 theorem mirNewtypeNonZeroU32_traits_and_transmute :
     let newtypeTy : Ty := { kind := .adt "core::num::NonZeroU32" [], layoutIdx := 4 }
     let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }

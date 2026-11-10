@@ -3082,17 +3082,22 @@ matching the newtype `NonZero*` shape analyzed in `Anneal.BitValidity` §6.4
 
 Values decode to and encode from `.aggregate varIdx [.scalar ⟨x.val, sz⟩]`.
 
-**Important note on monomorphized `NonZero<T>` (`args = [T]`) and untyped `IsIntoBytes`:**
-1. On the monomorphized type `.adt "core::num::NonZero" [.uint .u32]`, `args.length == offsets.length`,
-   so `Trusted`'s `decodeValueFromBytes` takes the `byArgs` type-argument path and decodes the field at
+**Divergence (monomorphized `NonZero<T>` type-argument niche & untyped `IsIntoBytes` on `.adt _ []` newtypes):**
+1. **Divergence (`args = [T]` monomorphized niche):** On the monomorphized type
+   `.adt "core::num::NonZero" [.uint .u32]`, `args.length == offsets.length`, so `Trusted`'s
+   `decodeValueFromBytes` takes the `byArgs` type-argument path and decodes the field at
    `.uint .u32` without inspecting `l.backendRepr` (`adt_generic_nonZero_typeArg_path_niche_unenforced`).
    Consequently, `zeroInitBytes 4` is accepted (`IsFromZeros` holds) and **no zero-rejecting niche
    `MirValueCodec` can exist** for `.adt defPath [.uint .u32]` (`monomorphized_nonZero_u32_forces_hasZeroValid`).
-2. On `.adt defPath []` (`args = []`), `decodeValueFromBytes` enforces the `l.backendRepr` niche,
-   and every well-typed/decoded value (`transmute_typed`, `transmute_sound_of_decoded`) encodes to `sz`
-   initialized bytes. However, `enforcesUntypedFieldWidths` is `false` because `encodeValueToBytes`
-   falls back to `encodeUntypedValueToBytes` when `args = []`, so an ill-typed 0-byte field
-   `.aggregate varIdx [.unit]` encodes to `replicateUninitBytes sz` (`scalarNicheNewtype_untyped_unit_field_divergence`).
+2. **Divergence (`args = []` untyped-field encoder fallback vs. `zerocopy::IntoBytes`):** In Rust /
+   `zerocopy`, `NonZeroU32` (and every `NonZero*`) *is* `IntoBytes` because it has no padding bytes.
+   On `.adt defPath []` (`args = []`), `decodeValueFromBytes` enforces the `l.backendRepr` niche,
+   and every well-typed/decoded value encodes to `sz` initialized bytes (`transmute_typed` and
+   `transmute_sound_of_decoded` model sound `IntoBytes` transmutation from `NonZero*`). However,
+   untyped `BitValidity.IsIntoBytes` fails (`enforcesUntypedFieldWidths = false`) solely because
+   `Trusted`'s `encodeValueToBytes` falls back to `encodeUntypedValueToBytes` when `args = []`,
+   allowing the ill-typed 0-byte field `.aggregate varIdx [.unit]` to encode to
+   `replicateUninitBytes sz` (`scalarNicheNewtype_untyped_unit_field_divergence`).
 -/
 def scalarNicheNewtypeNonPtr
     (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
@@ -3195,6 +3200,11 @@ def scalarNicheNewtypeNonPtr
 Integer specialization of `scalarNicheNewtypeNonPtr` for single-field scalar-niche
 newtype ADTs `.adt defPath []` (such as newtype `NonZeroU8` / `NonZeroU32` with
 `l.fields = .arbitrary [{ bytes := 0 }] memoryOrder` and `l.fieldLayouts = []`).
+
+See `scalarNicheNewtypeNonPtr` for the **Divergence** notes on monomorphized
+`NonZero<T>` (`args = [T]`) and `Trusted`'s `args = []` untyped-field encoder
+fallback versus `zerocopy::IntoBytes` (modeled for well-typed/decoded values via
+`transmute_typed` and `transmute_sound_of_decoded`).
 -/
 def scalarNicheNewtype
     (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
@@ -3215,13 +3225,14 @@ def scalarNicheNewtype
     memoryOrder range hNz rfl hLookup hInhab hSize hFields hNoFieldLayouts hVar hRepr hWidth
 
 /--
-Kernel divergence witness explaining why `scalarNicheNewtype` sets
-`enforcesUntypedFieldWidths := false`: on `.adt defPath []` with
-`l.fields = .arbitrary [{ bytes := 0 }] memoryOrder` and `0 < sz`, passing the
-ill-typed 0-byte field `.aggregate varIdx [.unit]` to `encodeValueToBytes` hits
-`encodeUntypedValueToBytes` and returns `some (replicateUninitBytes sz)`, so
-untyped `BitValidity.IsIntoBytes` does not hold (while well-typed transmutation
-holds via `transmute_typed` and `transmute_sound_of_decoded`).
+**Divergence (Trusted untyped-field encoder fallback vs. `zerocopy::IntoBytes`):**
+In Rust / `zerocopy`, single-field scalar-niche newtypes such as `NonZeroU32` *are*
+`IntoBytes` because they contain no padding bytes (modeled for well-typed/decoded
+values via `transmute_typed` and `transmute_sound_of_decoded`). In `Trusted`, on
+`.adt defPath []` with `l.fields = .arbitrary [{ bytes := 0 }] memoryOrder` and `0 < sz`,
+`encodeValueToBytes` falls back to `encodeUntypedValueToBytes` when `args = []`, so
+passing the ill-typed 0-byte field `.aggregate varIdx [.unit]` returns
+`some (replicateUninitBytes sz)` and falsifies untyped `BitValidity.IsIntoBytes`.
 -/
 theorem scalarNicheNewtype_untyped_unit_field_divergence
     (layouts : LayoutTable) (defPath : DefPath) (idx : LayoutIdx)
