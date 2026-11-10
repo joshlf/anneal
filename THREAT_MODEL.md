@@ -58,8 +58,10 @@ good-faith inputs.
 ### The end-to-end division of labor and the two senses of "trusted"
 
 No automated tool can defend against a compromised host operating system or know
-what specifications and assumptions exist only in a maintainer's head. Anneal
-therefore factors end-to-end assurance into an explicit division of labor:
+what specifications and assumptions exist only in a maintainer's head. Turning
+[`PRINCIPLES.md`](PRINCIPLES.md)'s promise into an end-to-end guarantee that
+code *behaves as the maintainer expects* therefore requires an explicit division
+of labor:
 
 - **If:**
   1. Verification runs in an **uncompromised execution environment** (such as an
@@ -72,8 +74,10 @@ therefore factors end-to-end assurance into an explicit division of labor:
 - **Then:** The verified code is sound (UB-free) and behaves as the maintainer
   expects.
 
-The two human-reviewed surfaces are "trusted" in fundamentally different ways
-that must not be conflated:
+Here, an **uncompromised execution environment** ensures that `cargo-anneal`'s
+"no errors" result and TCB audit log are genuine, while the two human-reviewed
+surfaces are "trusted" in fundamentally different ways that must not be
+conflated:
 
 1. **The stated specifications — trusted to define *what the user intended to
    prove*:**
@@ -83,20 +87,22 @@ that must not be conflated:
    - For properties beyond baseline soundness (as well as any stated
      preconditions or invariants under which code is verified, including caller
      safety preconditions on `unsafe` functions), the stated
-     specifications—together with any helper functions, constants, types, or
-     mathematical models that define their meaning—express *what the user is
-     asking Anneal to verify*.
+     specifications—together with any helper functions, trait implementations,
+     constants, types, or mathematical models that define their meaning—express
+     *what the user is asking Anneal to verify*.
    - Calling specifications "trusted" does **not** mean Anneal assumes they hold
      without proof: Anneal proves that the Rust code satisfies its stated
      specifications, while relying on human review to confirm that those
-     specifications state the intended property.
+     specifications state the intended property (bridging the gap from
+     *"satisfies any stated specifications"* to *"behaves as the maintainer
+     expects"*).
 2. **The TCB audit log — trusted to be *true without proof*:**
    - Covers Anneal's own Trusted Computing Base (Anneal, `rustc`, the Lean 4
      kernel, and their semantic models) together with any unproved assumptions
      or trust waivers in the verified crate or its dependencies.
    - Unlike stated specifications, Anneal assumes every entry in the TCB audit
-     log is valid without proving it, and relies on human review to decide
-     whether those assumptions are acceptable.
+     log is valid without proving it, and relies on human review to confirm that
+     the TCB's code and unproved assumptions are acceptable.
 
 **Bounded human-review corollary:** Because Anneal makes these two surfaces
 explicit and enforces total defenses (Section 3) over everything outside them, a
@@ -231,28 +237,31 @@ proved or assumed without appearing on the two surfaces a human reviewer audits:
 
 - **Indirect specification tampering (hidden specification dependencies):**
   Leaving a function's inline specification unchanged in a pull request diff
-  while modifying or shadowing a helper function, constant, type definition, or
-  mathematical model that the specification's meaning transitively depends
-  on—for example, modifying a helper predicate `is_sorted(result)` so it always
-  returns `true`. Anneal aims to ensure that every definition capable of
-  affecting the meaning of a stated specification is explicitly demarcated on
-  (or surfaced in) the human-reviewed specification surface, and that no code
-  outside that surface can shadow, redefine, or silently alter what a
-  specification means.
-- **Unlogged assumptions across compositional boundaries:** Bypassing
-  verification of an obligation without recording an entry in the TCB audit log.
-  Every assumption required for a verified unit's soundness or stated
-  specifications must either be **discharged by proof** at the boundary where it
+  while modifying or shadowing a helper function, trait implementation,
+  constant, type definition, or mathematical model that the specification's
+  meaning transitively depends on—for example, modifying a helper predicate
+  `is_sorted(result)` so it always returns `true`. Anneal aims to ensure that
+  every definition capable of affecting the meaning of a stated specification is
+  explicitly demarcated on (or surfaced in) the human-reviewed specification
+  surface, and that no code outside that surface can shadow, redefine, or
+  silently alter what a specification means.
+- **Unlogged assumptions across crate items and compositional boundaries:**
+  Bypassing verification of an obligation without recording an entry in the TCB
+  audit log. Every obligation or assumption required for the crate's soundness
+  or stated specifications must either be **discharged by proof** where it
   originates or be **recorded in the TCB audit log**—including across:
-  - *Functions, call sites, trait implementations, and trust waivers:* A
-    function or trait method is verified under its stated preconditions (which
-    are part of the human-reviewed specification surface). Every verified caller
-    must prove those preconditions—including `unsafe` function preconditions—at
-    the call site, every `unsafe` trait implementation must prove the trait's
-    safety contract, and relying on any trust waiver (such as
-    `#[anneal::trusted]`) or unverified function must be recorded in the TCB
-    audit log (surfacing the waived code or assumption so edits to waived code
-    cannot pass silently).
+  - *Functions, call sites, trait implementations, and trust waivers:* Because
+    baseline soundness is always on across the crate, skipping or waiving
+    verification of any function, method, trait implementation, or other item in
+    the crate (such as with `#[anneal::trusted]`)—even an uncalled entry
+    point—or calling any waived, unverified, or external (`extern`) function
+    must be recorded in the TCB audit log (surfacing the waived code or
+    assumption so edits to waived code cannot pass silently). Likewise, every
+    verified caller must prove a callee's stated preconditions—including
+    `unsafe` function preconditions (which are part of the human-reviewed
+    specification surface)—at the call site, and every trait implementation must
+    prove the trait's stated specifications (and, for `unsafe` traits, its
+    safety contract).
   - *Type invariants and encapsulation boundaries:* If verified code assumes a
     type invariant that relies on encapsulation, the type's visibility boundary
     must prevent unverified code from breaking it: *every* function within the
