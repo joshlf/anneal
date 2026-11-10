@@ -531,9 +531,10 @@ pub enum AdtKind {
 /// - **Structs**: `#[repr(C)]` places fields in declaration order, each at the next multiple of
 ///   its alignment, and rounds the size up to the struct's alignment (the `max` of the field and
 ///   `repr(align)` alignments, at least `1`). `#[repr(transparent)]` has the layout of its unique
-///   field that is not a 1-ZST (size `0`, alignment `1`), or size `0` / alignment `1` if all
-///   fields are 1-ZSTs; several non-1-ZST fields, a zero-sized field with alignment above `1`, or
-///   `repr(align)` are ill-formed (`E0690`, `E0691`, `E0692`). `#[repr(Rust)]` has the layout of
+///   field that is not a 1-ZST (size `0`, alignment `1`) — possibly a zero-sized field with a
+///   larger alignment, like `[u64; 0]` — or size `0` / alignment `1` if all fields are 1-ZSTs;
+///   several non-1-ZST fields or `repr(align)` are ill-formed (`E0690`, `E0692`); a field whose
+///   layout is unspecified counts as non-1-ZST. `#[repr(Rust)]` has the layout of
 ///   the [`Ty::Tuple`] of its fields (rounded up to `repr(align)`); its field offsets are only
 ///   determined when that tuple has a canonical byte layout ([`Ty::has_canonical_byte_layout`]).
 /// - **Unions** (at least one field, `E0784`): every field at offset `0`; alignment is the `max`
@@ -1144,6 +1145,10 @@ fn struct_like_field_offset(
     }
 }
 
+/// `E0690`: a `#[repr(transparent)]` ADT has more than one field that is not a 1-ZST.
+const TRANSPARENT_E0690: &str =
+    "repr(transparent) needs at most one field with non-trivial size or alignment (E0690)";
+
 /// Possibly inexact layout of a struct-like field list (a struct, or the present variant of an
 /// enum laid out without a tag) laid out with `kind` and minimum alignment `repr_align`.
 fn struct_like_layout(
@@ -1176,21 +1181,16 @@ fn struct_like_layout(
             Ok(info)
         }
         AdtReprKind::Transparent => {
+            // At most one field may have a non-trivial size or alignment (`E0690`); a
+            // zero-sized field with alignment above `1` (e.g. `[u64; 0]`) is that field.
             let mut inner: Option<LayoutInfo> = None;
             for field in fields {
                 let field_info = field.layout_info(ptr_width)?;
-                if field_info.exact && field_info.size == 0 {
-                    if field_info.align != 1 {
-                        return Err(LayoutError::IllFormed(
-                            "repr(transparent) zero-sized fields must have alignment 1 (E0691)",
-                        ));
-                    }
+                if field_info.is_one_zst() {
                     continue;
                 }
                 if inner.is_some() {
-                    return Err(LayoutError::IllFormed(
-                        "repr(transparent) allows at most one non-zero-sized field (E0690)",
-                    ));
+                    return Err(LayoutError::IllFormed(TRANSPARENT_E0690));
                 }
                 inner = Some(field_info);
             }
@@ -1664,20 +1664,10 @@ impl AdtDef {
                 let mut non_zst_fields = 0usize;
                 for field in fields {
                     let field_info = field.layout_info(ptr_width)?;
-                    if transparent {
-                        if field_info.exact && field_info.size == 0 {
-                            if field_info.align != 1 {
-                                return Err(LayoutError::IllFormed(
-                                    "repr(transparent) zero-sized fields must have alignment 1 (E0691)",
-                                ));
-                            }
-                        } else {
-                            non_zst_fields += 1;
-                            if non_zst_fields > 1 {
-                                return Err(LayoutError::IllFormed(
-                                    "repr(transparent) allows at most one non-zero-sized field (E0690)",
-                                ));
-                            }
+                    if transparent && !field_info.is_one_zst() {
+                        non_zst_fields += 1;
+                        if non_zst_fields > 1 {
+                            return Err(LayoutError::IllFormed(TRANSPARENT_E0690));
                         }
                     }
                     info.size = info.size.max(field_info.size);

@@ -547,7 +547,8 @@ fn test_ill_formed_adt_definitions_fail_closed() {
     // repr(align) must be a power of two.
     ill(AdtDef::new_struct("A3", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(3)));
     ill(AdtDef::new_struct("A0", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(0)));
-    // repr(transparent): at most one non-1-ZST field, ZST fields of align 1, no repr(align).
+    // repr(transparent): at most one field with non-trivial size or alignment (a zero-sized
+    // field with alignment above 1, like `[u64; 0]`, counts), and no repr(align).
     ill(AdtDef::new_struct("T2", vec![u32_ty(), u32_ty()]).with_repr(AdtRepr::transparent()));
     ill(
         AdtDef::new_struct("TZ", vec![u32_ty(), Ty::Array(Box::new(u64_ty()), 0)])
@@ -6539,8 +6540,12 @@ fn test_b2_univariant_enum_absent_variant_shell_discriminant_and_retag() {
         discriminant(&mut state, local(0)),
         Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 0 })
     );
-    let lowered_discr =
-        lower_rvalue(&Rvalue::Discriminant(local(0)), &[e8_ty.clone()], PW).unwrap();
+    let lowered_discr = lower_rvalue(
+        &Rvalue::Discriminant(local(0)),
+        std::slice::from_ref(&e8_ty),
+        PW,
+    )
+    .unwrap();
     assert_eq!(
         eval_lowered_rvalue(
             &lowered_discr,
@@ -6601,7 +6606,9 @@ fn test_b2_univariant_enum_absent_variant_shell_discriminant_and_retag() {
 #[test]
 fn test_b2_absent_variant_layout_validation_and_transmute_uninhabited_errors() {
     // 1. `#[repr(transparent)]` single-variant enums whose single variant is absent must still
-    // enforce E0691 (non-1-aligned ZST) and E0690 (>1 non-ZST field).
+    // enforce E0690 (more than one field with non-trivial size or alignment). A zero-sized
+    // field with alignment above 1 is allowed as the one non-trivial field (A2: rustc reports
+    // `#[repr(transparent)] enum ETransAlign { A([u64; 0], !) }` as size 0, alignment 8).
     let (_, bad_align_zst) = adt(AdtDef::new_enum(
         "ETransAlign",
         None,
@@ -6611,10 +6618,10 @@ fn test_b2_absent_variant_layout_validation_and_transmute_uninhabited_errors() {
         )],
     )
     .with_repr(AdtRepr::transparent()));
-    assert!(matches!(
+    assert_eq!(
         bad_align_zst.layout_for(PW),
-        Err(LayoutError::IllFormed(_))
-    ));
+        Ok(TyLayout { size: 0, align: 8 })
+    );
 
     let (_, bad_two_non_zst) = adt(AdtDef::new_enum(
         "ETransTwo",
@@ -6668,19 +6675,20 @@ fn test_b2_absent_variant_layout_validation_and_transmute_uninhabited_errors() {
         vec![VariantDef::new("A", vec![u32_ty(), Ty::Never])],
     ));
     let mut state = state_with(vec![e1.clone(), e2.clone()], PW);
-    let hand_transmute = |src_ty: Ty, target_ty: Ty, operand: Operand, op: CastOp, size_bytes: usize| {
-        LoweredRvalue::Cast {
-            cast: LoweredCast::Transmute {
-                src_ty,
-                target_ty: target_ty.clone(),
-                operand,
-                op,
-                size_bytes,
-                exposes_provenance: false,
-            },
-            ty: target_ty,
-        }
-    };
+    let hand_transmute =
+        |src_ty: Ty, target_ty: Ty, operand: Operand, op: CastOp, size_bytes: usize| {
+            LoweredRvalue::Cast {
+                cast: LoweredCast::Transmute {
+                    src_ty,
+                    target_ty: target_ty.clone(),
+                    operand,
+                    op,
+                    size_bytes,
+                    exposes_provenance: false,
+                },
+                ty: target_ty,
+            }
+        };
     assert_eq!(
         eval_lowered_rvalue_in_state(
             &hand_transmute(
@@ -6818,4 +6826,681 @@ fn test_b2_scalar_range_contains_validates_underlying_scalar_and_hand_built_aggr
             ..
         })) if ty == bad_align_ty
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A2 regressions: `repr(transparent)` over-aligned ZSTs, and a rustc-pinned layout table
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a2_transparent_allows_one_over_aligned_zero_sized_field() {
+    // rustc 1.98.0-nightly: the one field with non-trivial size *or alignment* may be a ZST
+    // (A0/B1/B2 rejected these as `E0691`):
+    // `#[repr(transparent)] struct S1([u64; 0], ());` is size 0, alignment 8;
+    // `#[repr(transparent)] struct S3([u32; 0]);` is size 0, alignment 4;
+    // `#[repr(transparent)] union U1 { a: [u64; 0], b: () }` is size 0, alignment 8.
+    let zst = |elem: Ty| Ty::Array(Box::new(elem), 0);
+    let (s1_def, s1) = adt(
+        AdtDef::new_struct("S1", vec![zst(u64_ty()), unit()]).with_repr(AdtRepr::transparent())
+    );
+    let (_, s3) =
+        adt(AdtDef::new_struct("S3", vec![zst(u32_ty())]).with_repr(AdtRepr::transparent()));
+    let (_, u1) =
+        adt(AdtDef::new_union("U1", vec![zst(u64_ty()), unit()]).with_repr(AdtRepr::transparent()));
+    for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        assert_eq!(layout(&s1, pw), TyLayout { size: 0, align: 8 });
+        assert_eq!(layout(&s3, pw), TyLayout { size: 0, align: 4 });
+        assert_eq!(layout(&u1, pw), TyLayout { size: 0, align: 8 });
+        assert_eq!(s1_def.field_offset(0, 0, pw), Ok(0));
+    }
+    // rustc: `struct S2(u32, [u64; 0])` has two such fields (`E0690`), as do unions.
+    for def in [
+        AdtDef::new_struct("S2", vec![u32_ty(), zst(u64_ty())]).with_repr(AdtRepr::transparent()),
+        AdtDef::new_struct("S4", vec![zst(u16_ty()), zst(u32_ty())])
+            .with_repr(AdtRepr::transparent()),
+        AdtDef::new_union("U2", vec![zst(u64_ty()), u8_ty()]).with_repr(AdtRepr::transparent()),
+    ] {
+        assert!(
+            matches!(def.validate(PW), Err(LayoutError::IllFormed(_))),
+            "{def:?}"
+        );
+    }
+}
+
+/// Layouts observed with rustc 1.98.0-nightly (`x86_64-unknown-linux-gnu`) for 30 randomly
+/// generated ADTs (repr(C)/repr(Int)/repr(C, Int) enums with explicit discriminants and
+/// `repr(align)`, repr(C)/repr(Rust)/transparent structs and unions, univariant enums, and
+/// nesting), produced by an out-of-tree rustc-vs-Anneal differential generator (seed 31; 5600+
+/// generated types agreed). Pins the sizes, alignments, and every field offset Anneal
+/// determines (the others are fail-closed `Unspecified`).
+#[test]
+fn test_a2_layouts_agree_with_rustc_on_random_adts() {
+    let check = |ty: &Ty, size: usize, align: usize, offsets: &[(usize, usize, usize)]| {
+        assert_eq!(layout(ty, PW), TyLayout { size, align }, "{ty:?}");
+        let Ty::Adt(def) = ty else { unreachable!() };
+        for &(v, i, off) in offsets {
+            assert_eq!(def.field_offset(v, i, PW), Ok(off), "{ty:?} v{v}.{i}");
+            assert_eq!(
+                resolve_offset_of(ty, &[(v, i)], PW),
+                Ok(off),
+                "{ty:?} v{v}.{i}"
+            );
+        }
+    };
+    // #[repr(C)] struct T0(u128, u16, u128);
+    let t0 = Ty::Adt(Arc::new(
+        AdtDef::new_struct(
+            "T0",
+            vec![
+                Ty::Uint(UintTy::U128),
+                Ty::Uint(UintTy::U16),
+                Ty::Uint(UintTy::U128),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(&t0, 48, 16, &[(0, 0, 0), (0, 1, 16), (0, 2, 32)]);
+    // #[repr(C)] union T1 { f0: u128, f1: u16, f2: u128 }
+    let t1 = Ty::Adt(Arc::new(
+        AdtDef::new_union(
+            "T1",
+            vec![
+                Ty::Uint(UintTy::U128),
+                Ty::Uint(UintTy::U16),
+                Ty::Uint(UintTy::U128),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(&t1, 16, 16, &[(0, 0, 0), (0, 1, 0), (0, 2, 0)]);
+    // #[repr(C, i32)] enum T2 { V0(u32) = 294, V1(i32, [u32; 0], bool) = 11, V2(u16, i8, i32) = 92, V3 = 171 }
+    let t2 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T2",
+            Some(ScalarTy::Int(IntTy::I32)),
+            vec![
+                VariantDef::new("V0", vec![Ty::Uint(UintTy::U32)]).with_discriminant(294),
+                VariantDef::new(
+                    "V1",
+                    vec![
+                        Ty::Int(IntTy::I32),
+                        Ty::Array(Box::new(Ty::Uint(UintTy::U32)), 0),
+                        Ty::Bool,
+                    ],
+                )
+                .with_discriminant(11),
+                VariantDef::new(
+                    "V2",
+                    vec![
+                        Ty::Uint(UintTy::U16),
+                        Ty::Int(IntTy::I8),
+                        Ty::Int(IntTy::I32),
+                    ],
+                )
+                .with_discriminant(92),
+                VariantDef::new("V3", vec![]).with_discriminant(171),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(
+        &t2,
+        12,
+        4,
+        &[
+            (0, 0, 4),
+            (1, 0, 4),
+            (1, 1, 8),
+            (1, 2, 8),
+            (2, 0, 4),
+            (2, 1, 6),
+            (2, 2, 8),
+        ],
+    );
+    //  enum T3 { V0(i32, bool, char) }
+    let t3 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T3",
+            None,
+            vec![VariantDef::new(
+                "V0",
+                vec![Ty::Int(IntTy::I32), Ty::Bool, Ty::Char],
+            )],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    check(&t3, 12, 4, &[]);
+    //  struct T4([u16; 3], u64, ());
+    let t4 = Ty::Adt(Arc::new(
+        AdtDef::new_struct(
+            "T4",
+            vec![
+                Ty::Array(Box::new(Ty::Uint(UintTy::U16)), 3),
+                Ty::Uint(UintTy::U64),
+                Ty::unit(),
+            ],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    check(&t4, 16, 8, &[]);
+    // #[repr(u64)] enum T5 { V0 = 14, V1(u64, ()), V2(T1) }
+    let t5 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T5",
+            Some(ScalarTy::Uint(UintTy::U64)),
+            vec![
+                VariantDef::new("V0", vec![]).with_discriminant(14),
+                VariantDef::new("V1", vec![Ty::Uint(UintTy::U64), Ty::unit()]),
+                VariantDef::new("V2", vec![t1.clone()]),
+            ],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    check(&t5, 32, 16, &[(1, 0, 8), (1, 1, 16), (2, 0, 16)]);
+    // #[repr(i8)] enum T7 { V0, V1((u8, u32), u16), V2(T5, (u8, u32), u8) = 95, V3(u8, T4, i8) }
+    let t7 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T7",
+            Some(ScalarTy::Int(IntTy::I8)),
+            vec![
+                VariantDef::new("V0", vec![]),
+                VariantDef::new(
+                    "V1",
+                    vec![
+                        Ty::Tuple(vec![Ty::Uint(UintTy::U8), Ty::Uint(UintTy::U32)]),
+                        Ty::Uint(UintTy::U16),
+                    ],
+                ),
+                VariantDef::new(
+                    "V2",
+                    vec![
+                        t5.clone(),
+                        Ty::Tuple(vec![Ty::Uint(UintTy::U8), Ty::Uint(UintTy::U32)]),
+                        Ty::Uint(UintTy::U8),
+                    ],
+                )
+                .with_discriminant(95),
+                VariantDef::new(
+                    "V3",
+                    vec![Ty::Uint(UintTy::U8), t4.clone(), Ty::Int(IntTy::I8)],
+                ),
+            ],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    check(
+        &t7,
+        64,
+        16,
+        &[
+            (1, 0, 4),
+            (1, 1, 12),
+            (2, 0, 16),
+            (2, 1, 48),
+            (2, 2, 56),
+            (3, 0, 1),
+            (3, 1, 8),
+            (3, 2, 24),
+        ],
+    );
+    // #[repr(u64, align(2))] enum T8 { V0(()), V1([u8; 0], T3, *const u8) }
+    let t8 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T8",
+            Some(ScalarTy::Uint(UintTy::U64)),
+            vec![
+                VariantDef::new("V0", vec![Ty::unit()]),
+                VariantDef::new(
+                    "V1",
+                    vec![
+                        Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0),
+                        t3.clone(),
+                        Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+                    ],
+                ),
+            ],
+        )
+        .with_repr(AdtRepr::rust().with_align(2)),
+    ));
+    check(&t8, 32, 8, &[(0, 0, 8), (1, 0, 8), (1, 1, 8), (1, 2, 24)]);
+    // #[repr(u16)] enum T10 { V0((), bool, char), V1 = 140 }
+    let t10 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T10",
+            Some(ScalarTy::Uint(UintTy::U16)),
+            vec![
+                VariantDef::new("V0", vec![Ty::unit(), Ty::Bool, Ty::Char]),
+                VariantDef::new("V1", vec![]).with_discriminant(140),
+            ],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    check(&t10, 8, 4, &[(0, 0, 2), (0, 1, 2), (0, 2, 4)]);
+    // #[repr(transparent)] struct T11([u32; 0]);
+    let t11 = Ty::Adt(Arc::new(
+        AdtDef::new_struct("T11", vec![Ty::Array(Box::new(Ty::Uint(UintTy::U32)), 0)])
+            .with_repr(AdtRepr::transparent()),
+    ));
+    check(&t11, 0, 4, &[(0, 0, 0)]);
+    // #[repr(C, i8)] enum T16 { V0, V1(bool) = 5, V2(u64, u16), V3(usize, T1, u16) }
+    let t16 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T16",
+            Some(ScalarTy::Int(IntTy::I8)),
+            vec![
+                VariantDef::new("V0", vec![]),
+                VariantDef::new("V1", vec![Ty::Bool]).with_discriminant(5),
+                VariantDef::new("V2", vec![Ty::Uint(UintTy::U64), Ty::Uint(UintTy::U16)]),
+                VariantDef::new(
+                    "V3",
+                    vec![Ty::Uint(UintTy::Usize), t1.clone(), Ty::Uint(UintTy::U16)],
+                ),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(
+        &t16,
+        64,
+        16,
+        &[
+            (1, 0, 16),
+            (2, 0, 16),
+            (2, 1, 24),
+            (3, 0, 16),
+            (3, 1, 32),
+            (3, 2, 48),
+        ],
+    );
+    //  enum T18 { V0(i32, u16) }
+    let t18 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T18",
+            None,
+            vec![VariantDef::new(
+                "V0",
+                vec![Ty::Int(IntTy::I32), Ty::Uint(UintTy::U16)],
+            )],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    // #[repr(align(16))] enum T19 { V0([u8; 0], !), V1(*const u8, T18) }
+    let t19 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T19",
+            None,
+            vec![
+                VariantDef::new(
+                    "V0",
+                    vec![Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0), Ty::Never],
+                ),
+                VariantDef::new(
+                    "V1",
+                    vec![
+                        Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+                        t18.clone(),
+                    ],
+                ),
+            ],
+        )
+        .with_repr(AdtRepr::rust().with_align(16)),
+    ));
+    check(&t19, 16, 16, &[(0, 0, 0), (0, 1, 0)]);
+    // #[repr(C, i32, align(16))] enum T20 { V0(usize, char), V1(i8, char, i8) = -45 }
+    let t20 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T20",
+            Some(ScalarTy::Int(IntTy::I32)),
+            vec![
+                VariantDef::new("V0", vec![Ty::Uint(UintTy::Usize), Ty::Char]),
+                VariantDef::new("V1", vec![Ty::Int(IntTy::I8), Ty::Char, Ty::Int(IntTy::I8)])
+                    .with_discriminant(340282366920938463463374607431768211411),
+            ],
+        )
+        .with_repr(AdtRepr::c().with_align(16)),
+    ));
+    check(
+        &t20,
+        32,
+        16,
+        &[(0, 0, 8), (0, 1, 16), (1, 0, 8), (1, 1, 12), (1, 2, 16)],
+    );
+    // #[repr(transparent)] union T24 { f0: i8, f1: () }
+    let t24 = Ty::Adt(Arc::new(
+        AdtDef::new_union("T24", vec![Ty::Int(IntTy::I8), Ty::unit()])
+            .with_repr(AdtRepr::transparent()),
+    ));
+    check(&t24, 1, 1, &[(0, 0, 0), (0, 1, 0)]);
+    //  enum T29 { V0(u32, T5, i8) }
+    let t29 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T29",
+            None,
+            vec![VariantDef::new(
+                "V0",
+                vec![Ty::Uint(UintTy::U32), t5.clone(), Ty::Int(IntTy::I8)],
+            )],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    // #[repr(align(4))] struct T30(u64, bool, (u8, u32));
+    let t30 = Ty::Adt(Arc::new(
+        AdtDef::new_struct(
+            "T30",
+            vec![
+                Ty::Uint(UintTy::U64),
+                Ty::Bool,
+                Ty::Tuple(vec![Ty::Uint(UintTy::U8), Ty::Uint(UintTy::U32)]),
+            ],
+        )
+        .with_repr(AdtRepr::rust().with_align(4)),
+    ));
+    check(&t30, 24, 8, &[]);
+    //  enum T36 { V0, V1(!, [u8; 0]), V2(std::convert::Infallible) }
+    let t36 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T36",
+            None,
+            vec![
+                VariantDef::new("V0", vec![]),
+                VariantDef::new(
+                    "V1",
+                    vec![Ty::Never, Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0)],
+                ),
+                VariantDef::new(
+                    "V2",
+                    vec![Ty::adt(AdtDef::new_enum("Infallible", None, vec![]))],
+                ),
+            ],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    // #[repr(transparent)] struct T40(u64);
+    let t40 = Ty::Adt(Arc::new(
+        AdtDef::new_struct("T40", vec![Ty::Uint(UintTy::U64)]).with_repr(AdtRepr::transparent()),
+    ));
+    // #[repr(C, u8)] enum T43 { V0 = 38, V1(()), V2(u16, usize), V3(T30, bool, u8) }
+    let t43 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T43",
+            Some(ScalarTy::Uint(UintTy::U8)),
+            vec![
+                VariantDef::new("V0", vec![]).with_discriminant(38),
+                VariantDef::new("V1", vec![Ty::unit()]),
+                VariantDef::new("V2", vec![Ty::Uint(UintTy::U16), Ty::Uint(UintTy::Usize)]),
+                VariantDef::new("V3", vec![t30.clone(), Ty::Bool, Ty::Uint(UintTy::U8)]),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(
+        &t43,
+        40,
+        8,
+        &[
+            (1, 0, 8),
+            (2, 0, 8),
+            (2, 1, 16),
+            (3, 0, 8),
+            (3, 1, 32),
+            (3, 2, 33),
+        ],
+    );
+    // #[repr(align(8))] struct T45((), [u8; 0], u64);
+    let t45 = Ty::Adt(Arc::new(
+        AdtDef::new_struct(
+            "T45",
+            vec![
+                Ty::unit(),
+                Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0),
+                Ty::Uint(UintTy::U64),
+            ],
+        )
+        .with_repr(AdtRepr::rust().with_align(8)),
+    ));
+    check(&t45, 8, 8, &[]);
+    //  enum T46 { V0 }
+    let t46 = Ty::Adt(Arc::new(
+        AdtDef::new_enum("T46", None, vec![VariantDef::new("V0", vec![])])
+            .with_repr(AdtRepr::rust()),
+    ));
+    // #[repr(C, i8, align(4))] enum T47 { V0([u16; 3]) = 125, V1([u8; 0], [u32; 0]) = -19, V2(T40) }
+    let t47 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T47",
+            Some(ScalarTy::Int(IntTy::I8)),
+            vec![
+                VariantDef::new("V0", vec![Ty::Array(Box::new(Ty::Uint(UintTy::U16)), 3)])
+                    .with_discriminant(125),
+                VariantDef::new(
+                    "V1",
+                    vec![
+                        Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0),
+                        Ty::Array(Box::new(Ty::Uint(UintTy::U32)), 0),
+                    ],
+                )
+                .with_discriminant(340282366920938463463374607431768211437),
+                VariantDef::new("V2", vec![t40.clone()]),
+            ],
+        )
+        .with_repr(AdtRepr::c().with_align(4)),
+    ));
+    check(&t47, 16, 8, &[(0, 0, 8), (1, 0, 8), (1, 1, 8), (2, 0, 8)]);
+    // #[repr(C)] struct T49([u16; 3], char);
+    let t49 = Ty::Adt(Arc::new(
+        AdtDef::new_struct(
+            "T49",
+            vec![Ty::Array(Box::new(Ty::Uint(UintTy::U16)), 3), Ty::Char],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(&t49, 12, 4, &[(0, 0, 0), (0, 1, 8)]);
+    // #[repr(transparent)] struct T50(u8, (), [u8; 0]);
+    let t50 = Ty::Adt(Arc::new(
+        AdtDef::new_struct(
+            "T50",
+            vec![
+                Ty::Uint(UintTy::U8),
+                Ty::unit(),
+                Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0),
+            ],
+        )
+        .with_repr(AdtRepr::transparent()),
+    ));
+    // #[repr(i8, align(2))] enum T54 { V0(usize) }
+    let t54 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T54",
+            Some(ScalarTy::Int(IntTy::I8)),
+            vec![VariantDef::new("V0", vec![Ty::Uint(UintTy::Usize)])],
+        )
+        .with_repr(AdtRepr::rust().with_align(2)),
+    ));
+    check(&t54, 16, 8, &[(0, 0, 8)]);
+    // #[repr(transparent)] struct T58(usize);
+    let t58 = Ty::Adt(Arc::new(
+        AdtDef::new_struct("T58", vec![Ty::Uint(UintTy::Usize)]).with_repr(AdtRepr::transparent()),
+    ));
+    // #[repr(C, u16)] enum T60 { V0((), u128, (u8, u32)), V1(T45) = 291, V2(char, char) }
+    let t60 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T60",
+            Some(ScalarTy::Uint(UintTy::U16)),
+            vec![
+                VariantDef::new(
+                    "V0",
+                    vec![
+                        Ty::unit(),
+                        Ty::Uint(UintTy::U128),
+                        Ty::Tuple(vec![Ty::Uint(UintTy::U8), Ty::Uint(UintTy::U32)]),
+                    ],
+                ),
+                VariantDef::new("V1", vec![t45.clone()]).with_discriminant(291),
+                VariantDef::new("V2", vec![Ty::Char, Ty::Char]),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(
+        &t60,
+        48,
+        16,
+        &[
+            (0, 0, 16),
+            (0, 1, 16),
+            (0, 2, 32),
+            (1, 0, 16),
+            (2, 0, 16),
+            (2, 1, 20),
+        ],
+    );
+    // #[repr(C, u64)] enum T62 { V0, V1 = 106, V2, V3(u16, [u8; 0], T29) }
+    let t62 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T62",
+            Some(ScalarTy::Uint(UintTy::U64)),
+            vec![
+                VariantDef::new("V0", vec![]),
+                VariantDef::new("V1", vec![]).with_discriminant(106),
+                VariantDef::new("V2", vec![]),
+                VariantDef::new(
+                    "V3",
+                    vec![
+                        Ty::Uint(UintTy::U16),
+                        Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0),
+                        t29.clone(),
+                    ],
+                ),
+            ],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    check(&t62, 80, 16, &[(3, 0, 16), (3, 1, 18), (3, 2, 32)]);
+    // #[repr(C, u64)] enum T80 { V0([u8; 0]) }
+    let t80 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T80",
+            Some(ScalarTy::Uint(UintTy::U64)),
+            vec![VariantDef::new(
+                "V0",
+                vec![Ty::Array(Box::new(Ty::Uint(UintTy::U8)), 0)],
+            )],
+        )
+        .with_repr(AdtRepr::c()),
+    ));
+    // #[repr(transparent)] union T84 { f0: (), f1: bool, f2: () }
+    let t84 = Ty::Adt(Arc::new(
+        AdtDef::new_union("T84", vec![Ty::unit(), Ty::Bool, Ty::unit()])
+            .with_repr(AdtRepr::transparent()),
+    ));
+    // #[repr(i8, align(16))] enum T91 { V0(()) = -39 }
+    let t91 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T91",
+            Some(ScalarTy::Int(IntTy::I8)),
+            vec![
+                VariantDef::new("V0", vec![Ty::unit()])
+                    .with_discriminant(340282366920938463463374607431768211417),
+            ],
+        )
+        .with_repr(AdtRepr::rust().with_align(16)),
+    ));
+    check(&t91, 16, 16, &[(0, 0, 1)]);
+    // #[repr(i32)] enum T92 { V0(u16, *const u8) = -86, V1(i32, u128) = -93 }
+    let t92 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T92",
+            Some(ScalarTy::Int(IntTy::I32)),
+            vec![
+                VariantDef::new(
+                    "V0",
+                    vec![
+                        Ty::Uint(UintTy::U16),
+                        Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+                    ],
+                )
+                .with_discriminant(340282366920938463463374607431768211370),
+                VariantDef::new("V1", vec![Ty::Int(IntTy::I32), Ty::Uint(UintTy::U128)])
+                    .with_discriminant(340282366920938463463374607431768211363),
+            ],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    check(&t92, 32, 16, &[(0, 0, 4), (0, 1, 8), (1, 0, 4), (1, 1, 16)]);
+    // #[repr(C, align(8))] struct T95(T84, bool, u32);
+    let t95 = Ty::Adt(Arc::new(
+        AdtDef::new_struct("T95", vec![t84.clone(), Ty::Bool, Ty::Uint(UintTy::U32)])
+            .with_repr(AdtRepr::c().with_align(8)),
+    ));
+    check(&t95, 8, 8, &[(0, 0, 0), (0, 1, 1), (0, 2, 4)]);
+    // #[repr(C, i32, align(2))] enum T114 { V0(()) = -70 }
+    let t114 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T114",
+            Some(ScalarTy::Int(IntTy::I32)),
+            vec![
+                VariantDef::new("V0", vec![Ty::unit()])
+                    .with_discriminant(340282366920938463463374607431768211386),
+            ],
+        )
+        .with_repr(AdtRepr::c().with_align(2)),
+    ));
+    check(&t114, 4, 4, &[(0, 0, 4)]);
+    // #[repr(i32, align(16))] enum T118 { V0(char) = 128, V1(bool, u128) = 120, V2, V3 }
+    let t118 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T118",
+            Some(ScalarTy::Int(IntTy::I32)),
+            vec![
+                VariantDef::new("V0", vec![Ty::Char]).with_discriminant(128),
+                VariantDef::new("V1", vec![Ty::Bool, Ty::Uint(UintTy::U128)])
+                    .with_discriminant(120),
+                VariantDef::new("V2", vec![]),
+                VariantDef::new("V3", vec![]),
+            ],
+        )
+        .with_repr(AdtRepr::rust().with_align(16)),
+    ));
+    check(&t118, 32, 16, &[(0, 0, 4), (1, 0, 4), (1, 1, 16)]);
+    // #[repr(C, align(2))] union T134 { f0: T58, f1: T50 }
+    let t134 = Ty::Adt(Arc::new(
+        AdtDef::new_union("T134", vec![t58.clone(), t50.clone()])
+            .with_repr(AdtRepr::c().with_align(2)),
+    ));
+    check(&t134, 8, 8, &[(0, 0, 0), (0, 1, 0)]);
+    // #[repr(C, align(8))] union T146 { f0: T36, f1: T46, f2: T80 }
+    let t146 = Ty::Adt(Arc::new(
+        AdtDef::new_union("T146", vec![t36.clone(), t46.clone(), t80.clone()])
+            .with_repr(AdtRepr::c().with_align(8)),
+    ));
+    check(&t146, 8, 8, &[(0, 0, 0), (0, 1, 0), (0, 2, 0)]);
+    // #[repr(u8)] enum T151 { V0((u8, u32)), V1(u128), V2(*const u8, bool) = 33 }
+    let t151 = Ty::Adt(Arc::new(
+        AdtDef::new_enum(
+            "T151",
+            Some(ScalarTy::Uint(UintTy::U8)),
+            vec![
+                VariantDef::new(
+                    "V0",
+                    vec![Ty::Tuple(vec![Ty::Uint(UintTy::U8), Ty::Uint(UintTy::U32)])],
+                ),
+                VariantDef::new("V1", vec![Ty::Uint(UintTy::U128)]),
+                VariantDef::new(
+                    "V2",
+                    vec![
+                        Ty::RawPtr(Box::new(Ty::Uint(UintTy::U8)), Mutability::Not),
+                        Ty::Bool,
+                    ],
+                )
+                .with_discriminant(33),
+            ],
+        )
+        .with_repr(AdtRepr::rust()),
+    ));
+    check(
+        &t151,
+        32,
+        16,
+        &[(0, 0, 4), (1, 0, 16), (2, 0, 8), (2, 1, 16)],
+    );
 }
