@@ -1007,12 +1007,13 @@ def advanceCursorMutMirBody : CapturedMir :=
         isCleanup := false } ]
 
 def advanceCursorMutPlan : TransPlan :=
-  .branch 3 (.jump 3 3) (.jump 3 2) (.ret 3) 8
+  .splitBranch (.seq 3 (.ret 3) 3) (.seq 3 (.ret 3) 2) 8
 
 /--
 `MutRefLocalSpec FrameCursor Bool` connecting `advanceCursorMutMirBody` to pure
-`FrameCursor.advancePure` while certifying that Tree Borrows tag `1` remains
-`.active` on local `1` at function exit.
+`FrameCursor.advancePure` while certifying the exact Tree Borrows tag `1`
+permission on local `1` at function exit (`.active` when the conditional field
+write executes, `.reservedFrz false` when no write occurs).
 -/
 def advanceCursorMutSpec : MutRefLocalSpec FrameCursor Bool where
   body := advanceCursorMutMirBody
@@ -1029,9 +1030,18 @@ def advanceCursorMutSpec : MutRefLocalSpec FrameCursor Bool where
     match extraArgs with
     | [.scalar ⟨delta, 4⟩] => FrameCursor.advancePure delta
     | _ => fun c => (c, false)
-  postMem _ _ _ mem' :=
+  postMem c extraArgs _ mem' :=
+    let wrote :=
+      match extraArgs with
+      | [.scalar ⟨delta, 4⟩] => (FrameCursor.advancePure delta c).2
+      | _ => false
     lookupBorrow mem'.borrows 1 =
-      some { tag := 1, targetLocal := 1, targetProjection := [], perm := .active }
+      some {
+        tag := 1
+        targetLocal := 1
+        targetProjection := []
+        perm := if wrote then .active else .reservedFrz false
+      }
 
 private def advanceCursorMutPreSwitchState
     (c : FrameCursor) (delta targetBb : Nat) : MachineState :=
@@ -1050,11 +1060,11 @@ private def advanceCursorMutPreSwitchState
     memory :=
       { emptyMemory with
         borrows :=
-          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .reservedFrz false }]
         nextTag := 2 } }
 
 private def advanceCursorMutBb3BranchState
-    (c : FrameCursor) (delta newPos : Nat) : MachineState :=
+    (c : FrameCursor) (delta newPos : Nat) (perm : TreeBorrowPerm) : MachineState :=
   { frame := {
       blockIdx := 3
       stmtIdx := 0
@@ -1070,7 +1080,7 @@ private def advanceCursorMutBb3BranchState
     memory :=
       { emptyMemory with
         borrows :=
-          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := perm }]
         nextTag := 2 } }
 
 private def advanceCursorMutPreSwitchRawState
@@ -1091,7 +1101,7 @@ private def advanceCursorMutPreSwitchRawState
     memory :=
       { emptyMemory with
         borrows :=
-          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+          [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .reservedFrz false }]
         nextTag := 2 } }
 
 private theorem advanceCursorMut_bb0_switch
@@ -1119,49 +1129,56 @@ private theorem advanceCursorMut_bb0_switch
 
 private theorem advanceCursorMut_bb1_join
     (c : FrameCursor) (delta : Nat) :
-    evalPlanToJoin advanceCursorMutMirBody (.jump 3 3)
+    runMirToBlock 3 advanceCursorMutMirBody 3
       (advanceCursorMutPreSwitchState c delta 1) =
-      some (advanceCursorMutBb3BranchState c delta (c.pos + delta)) :=
+      some (advanceCursorMutBb3BranchState c delta (c.pos + delta) .active) :=
   rfl
 
 private theorem advanceCursorMut_bb2_join
     (c : FrameCursor) (delta : Nat) :
-    evalPlanToJoin advanceCursorMutMirBody (.jump 3 2)
+    runMirToBlock 2 advanceCursorMutMirBody 3
       (advanceCursorMutPreSwitchState c delta 2) =
-      some (advanceCursorMutBb3BranchState c delta c.pos) :=
+      some (advanceCursorMutBb3BranchState c delta c.pos (.reservedFrz false)) :=
   rfl
 
 private theorem advanceCursorMut_wpTransPlan
     (c : FrameCursor) {delta : Nat} (h_add_lt : c.pos + delta < 4294967296) :
     wpTransPlan mirNoCallWP advanceCursorMutMirBody advanceCursorMutPlan
       (fun out =>
+        let res := FrameCursor.advancePure delta c
         out =
           .normal
-            ((ValueCodec.pair frameCursorCodec ValueCodec.rustBool).encode
-               (FrameCursor.advancePure delta c),
+            ((ValueCodec.pair frameCursorCodec ValueCodec.rustBool).encode res,
              { emptyMemory with
                borrows :=
-                 [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .active }]
+                 [{ tag := 1, targetLocal := 1, targetProjection := [],
+                    perm := if res.2 then .active else .reservedFrz false }]
                nextTag := 2 }))
       (initMachineStateWithMemory advanceCursorMutMirBody
         [frameCursorCodec.encode c, .scalar ⟨delta, 4⟩] emptyMemory) := by
   dsimp only [advanceCursorMutPlan]
-  rw [wpTransPlan, advanceCursorMut_bb0_switch c h_add_lt]
-  dsimp only []
-  rw [advanceCursorMut_bb1_join c delta,
-      advanceCursorMut_bb2_join c delta]
-  dsimp only [advanceCursorMutBb3BranchState, joinPlanMemConsistent]
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, trivial, trivial, ?_⟩
-  rw [wpTransPlan, zipLocalSlots_eq_ite _ (by rfl),
+  rw [wpTransPlan, advanceCursorMut_bb0_switch c h_add_lt,
       not_beq_toNat_zero (Nat.ble (c.pos + delta) c.len)]
-  dsimp only [FrameCursor.advancePure]
-  cases Nat.ble (c.pos + delta) c.len <;> exact (@Eq.refl MirOutcome _)
+  dsimp only []
+  constructor
+  · intro h_cond
+    rw [wpTransPlan, advanceCursorMut_bb1_join c delta]
+    dsimp only []
+    rw [wpTransPlan]
+    simp only [advanceCursorMutBb3BranchState, FrameCursor.advancePure, h_cond, ite_true]
+    exact (@Eq.refl MirOutcome _)
+  · intro h_cond
+    rw [wpTransPlan, advanceCursorMut_bb2_join c delta]
+    dsimp only []
+    rw [wpTransPlan]
+    simp only [advanceCursorMutBb3BranchState, FrameCursor.advancePure, h_cond, Bool.false_eq_true, ite_false]
+    exact (@Eq.refl MirOutcome _)
 
 /--
 Symbolic total & stateful verification of `advanceCursorMutMirBody` against
 `FrameCursor.advancePure` for all `c : FrameCursor` (`c.pos, c.len < 10000`) and
-`delta < 10000` — proved via `TransPlan.branch` without case-splitting during
-MIR diamond execution.
+`delta < 10000` — proved via `TransPlan.splitBranch` tracking the exact Tree
+Borrows `.reservedFrz false` → `.active` activation on the write branch.
 -/
 theorem advanceCursorMutSpec_total_and_stateful_verified :
     TotalVerificationResult advanceCursorMutSpec.toTotalClaim ∧

@@ -1402,7 +1402,7 @@ theorem wit_lm3_2_ref_deref_read_storageDead_real_steps :
       StateRelLM3_2 lm32RefBody s₃ m₃ [entry] ∧
       stepMirFn lm32RefBody s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_2 lm32RefBody s₄ m₄ [entry] ∧
+      StateRelLM3_2 lm32RefBody s₄ m₄ [{ entry with perm := .disabled }] ∧
       m₄.machine.memory.live.find? (fun x => x.1 == lm31AllocId1) = none := by
   have hphase : ∀ p, lm32RefBody.phase ≠ .other p := fun _ h => nomatch h
   let hooks := annealStepHooks lm32RefBody.localDecls lm32RefBody.layouts
@@ -1476,14 +1476,16 @@ theorem wit_lm3_2_ref_deref_read_storageDead_real_steps :
   have hsim₃ := step_storageDead_lm3_2_simulation hrel₂ hphase rfl rfl rfl (by decide)
   obtain ⟨m₃, hm₃, hrel₃⟩ := stepRelLM3_2_of_anneal_step hsim₃ hs₃
   -- Step 4: `StorageDead(_1)`
+  let entryDis : AllocMapEntry := { entry with perm := .disabled }
   let s₄ := mkWitStateLM32 lm32RefBody 7
-    [.init (.scalar ⟨42, 8⟩), .dead, .dead] borSh 2
+    [.init (.scalar ⟨42, 8⟩), .dead, .dead] [entryDis.toBorrowEntry] 2
   have hs₄ : stepMirFn lm32RefBody s₃ = .step s₄ := rfl
   have hsim₄ := step_storageDead_lm3_2_simulation hrel₃ hphase rfl rfl rfl (by decide)
   obtain ⟨m₄, hm₄, hrel₄⟩ := stepRelLM3_2_of_anneal_step hsim₄ hs₄
+  change StateRelLM3_2 lm32RefBody s₄ m₄ [entryDis] at hrel₄
   have hm₄_dead : m₄.machine.memory.live.find? (fun x => x.1 == lm31AllocId1) = none := by
     obtain ⟨tf₄, hframes₄, _, _, _, _, _, _, _, _, halloc₄, _⟩ := id hrel₄
-    exact (halloc₄.local_alloc_sync tf₄ hframes₄ entry (List.Mem.head _)).2 rfl
+    exact (halloc₄.local_alloc_sync tf₄ hframes₄ entryDis (List.Mem.head _)).2 rfl
   exact ⟨s₁, s₂, s₃, s₄, m₁, m₂, m₃, m₄,
     hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, rfl, hm₂_val, hs₃, hm₃, hrel₃, hs₄, hm₄, hrel₄, hm₄_dead⟩
 
@@ -1793,7 +1795,7 @@ theorem wit_lm3_2_mut_ref_move_write_read_reborrow_real_steps :
       | tail _ h => cases h
       | head _ =>
         subst hp'
-        refine ⟨(fun h => nomatch h), rfl, (fun h => nomatch h),
+        refine ⟨(fun h => nomatch h), (fun h => nomatch h), rfl, (fun h => nomatch h),
           (fun ⟨_, hne⟩ => hne rfl), fun d hd => ?_⟩
         dsimp only [entryAct, entry, refAllocMapEntry] at hd
         have h0 : get? lm32MutRefChainBody.localDecls 1 = some u64Decl := rfl
@@ -2020,7 +2022,7 @@ theorem lm32RawPtrIntReborrow_stateRel_pre :
    provenance-less scalar into `_2`
    (`evalRvalue_reborrow_rawPtr_int_divergence`). -/
 theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
-    (∃ (s₁ s₂ s₃ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
+    (∃ (s₁ s₂ : MachineState) (m₁ m₂ m₃ : AnnealStepState),
       let hooks := annealStepHooks lm32DanglingReborrowBody.localDecls
         lm32DanglingReborrowBody.layouts
       let entry := refAllocMapEntry lm32DanglingReborrowBody.localDecls
@@ -2030,8 +2032,8 @@ theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
       StateRelLM3_2 lm32DanglingReborrowBody s₁ m₁ [entry] ∧
       stepMirFn lm32DanglingReborrowBody s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_2 lm32DanglingReborrowBody s₂ m₂ [entry] ∧
-      stepMirFn lm32DanglingReborrowBody s₂ = .step s₃ ∧
+      StateRelLM3_2 lm32DanglingReborrowBody s₂ m₂ [{ entry with perm := .disabled }] ∧
+      stepMirFn lm32DanglingReborrowBody s₂ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₂ =
         (m₃, .error (.undefinedBehavior "dereferencing a dangling reference"))) ∧
     (stepMirFn lm32RawPtrIntReborrowBody lm32RawPtrIntReborrowAnnealPre = MirStepNode.fail .ub ∧
@@ -2046,6 +2048,7 @@ theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
   · have hphase : ∀ p, lm32DanglingReborrowBody.phase ≠ .other p := fun _ h => nomatch h
     let entry := refAllocMapEntry lm32DanglingReborrowBody.localDecls
       lm32DanglingReborrowBody.layouts .shared 1 1 lm31AllocId1
+    let entryDis : AllocMapEntry := { entry with perm := .disabled }
     let ptr1 := Value.ptr { allocId := 1, offsetBytes := 0 } 8
     let borSh := [entry.toBorrowEntry]
     have himm₀_all : ∀ tf, lm32DanglingReborrowMiriPre.stack.frames = #[tf] →
@@ -2073,22 +2076,22 @@ theorem wit_lm3_2_safeRef_dangling_reborrow_and_rawPtr_int_divergences :
       fun tf htf k hne =>
         himm₁_step lm32DanglingReborrowMiriFramePre tf rfl htf k hne (himm₀_all _ rfl k)
     let s₂ := mkWitStateLM32 lm32DanglingReborrowBody 2
-      [.uninit, .dead, .init ptr1, .uninit] borSh 2
+      [.uninit, .dead, .init ptr1, .uninit] [entryDis.toBorrowEntry] 2
     have hs₂ : stepMirFn lm32DanglingReborrowBody s₁ = .step s₂ := rfl
     have hsim₂ := step_storageDead_lm3_2_simulation hrel₁ hphase rfl rfl rfl (by decide)
     obtain ⟨m₂, hm₂, hrel₂⟩ := stepRelLM3_2_of_anneal_step hsim₂ hs₂
+    change StateRelLM3_2 lm32DanglingReborrowBody s₂ m₂ [entryDis] at hrel₂
     have himm₂_step := step_storageDead_lm3_2_preserves hrel₁ rfl rfl rfl (by decide) hm₂
     have himm₂_2 : ∀ tf, m₂.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 := by
       intro tf₂ htf₂
       obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
       exact himm₂_step tf₁ tf₂ htf₁ htf₂ 2 (himm₁_ne1 tf₁ htf₁ 2 (by decide))
-    obtain ⟨⟨s₃, hs₃, _⟩, m₃, hm₃⟩ := evalRvalue_reborrow_safeRef_dangling_divergence
+    obtain ⟨hs₃, m₃, hm₃⟩ := evalRvalue_reborrow_safeRef_dangling_divergence
       hrel₂ hphase (dstIdx := 3) (refIdx := 2) (bk := .shared)
       rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) himm₂_2
       (fun h => nomatch h) (ptrVal := { allocId := 1, offsetBytes := 0 }) rfl
-      (e := entry) (List.Mem.head _) rfl
-      ⟨(fun h => nomatch h), (fun ⟨_, hne⟩ => hne rfl)⟩ rfl
-    exact ⟨s₁, s₂, s₃, m₁, m₂, m₃, hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃⟩
+      (e := entryDis) (List.Mem.head _) rfl rfl
+    exact ⟨s₁, s₂, m₁, m₂, m₃, hs₁, hm₁, hrel₁, hs₂, hm₂, hrel₂, hs₃, hm₃⟩
   · have hphase : ∀ p, lm32RawPtrIntReborrowBody.phase ≠ .other p := fun _ h => nomatch h
     obtain ⟨hub, m', tf', msc, hrel_sc, _, hm', htf', hval'⟩ :=
       evalRvalue_reborrow_rawPtr_int_divergence
@@ -2382,7 +2385,7 @@ theorem wit_lm3_2_unit_zst_and_misaligned_ref_validity :
             layout := some (translateTy u64Ty) }) = (m₁, .ok true) ∧
       stepMirFn b s₁ = .step s₂ ∧
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
-      StateRelLM3_2 b s₂ m₂ [entry] ∧
+      StateRelLM3_2 b s₂ m₂ [{ entry with perm := .disabled }] ∧
       m₂.stack.frames = #[tf₂] ∧
       get? s₂.frame.locals 1 = some .dead ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
@@ -2453,6 +2456,7 @@ theorem wit_lm3_2_unit_zst_and_misaligned_ref_validity :
       (.immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
         (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩))
     let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1
+    let entryDis : AllocMapEntry := { entry with perm := .disabled }
     let s₁ := mkWitStateLM32 b 1
       [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
       [entry.toBorrowEntry] 2
@@ -2467,10 +2471,11 @@ theorem wit_lm3_2_unit_zst_and_misaligned_ref_validity :
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty hm₁
     let s₂ := mkWitStateLM32 b 2
       [.uninit, .dead, .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit]
-      [entry.toBorrowEntry] 2
+      [entryDis.toBorrowEntry] 2
     have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
     have hsim₂ := step_storageDead_lm3_2_simulation hrel₁ hphase rfl rfl rfl (by decide)
     obtain ⟨m₂, hm₂, hrel₂⟩ := stepRelLM3_2_of_anneal_step hsim₂ hs₂
+    change StateRelLM3_2 b s₂ m₂ [entryDis] at hrel₂
     have himm₂_step := step_storageDead_lm3_2_preserves hrel₁ rfl rfl rfl (by decide) hm₂
     obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
     obtain ⟨tf₂, htf₂, _, _, hfr₂, _⟩ := id hrel₂
@@ -2493,7 +2498,7 @@ theorem wit_lm3_2_unit_zst_and_misaligned_ref_validity :
           .live (.immediate (.scalar (.fromPointer annealTargetDataLayout mptr))) := by
         rw [hmls₂_eq, hm_ptr]
       have hval_ok := (validatePlace_ref_unit_zst_simulation hrel₂ htf₂ hlt₂
-        (refTy := refUnitTyLM32) (refMut := .not) rfl 3).2 hptrRel (List.Mem.head _) rfl hval₂
+        (refTy := refUnitTyLM32) (refMut := .not) rfl 3).2 (e := entryDis) hptrRel (List.Mem.head _) rfl hval₂
       exact ⟨b, s₁, s₂, m₁, m₂, tf₂, hs₁, hm₁, hs₂, hm₂, hrel₂, htf₂, rfl, hval_ok⟩
   · let b : CapturedMir :=
       { defPath := "lm_3_2_witness::misalign_ref_validity"
@@ -2590,40 +2595,36 @@ read/write divergence theorems:
 4. `step_safeRef_deref_write_misaligned_divergence` (`_1 : u64`, `_3 : &mut u16` at
    offset `1`, `*_3 = 7_u16`). -/
 theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
-    (∃ (b : CapturedMir) (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+    (∃ (b : CapturedMir) (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
       let hooks := annealStepHooks b.localDecls b.layouts
       stepMirFn b (mkPre4AnnealLM32 b (.init (.scalar ⟨7, 1⟩))) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks ()
         (mkPre4MiriLM32 b u64Ty
           { value := .live (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 7)))),
             layout := some (translateTy u8TyLM32) }) = (m₁, .ok true) ∧
-      stepMirFn b s₁ = .step s₂ ∧
-      get? s₂.frame.locals 0 = some (.init (.scalar ⟨7, 1⟩)) ∧
+      stepMirFn b s₁ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₁ =
         (m₂, .error (.undefinedBehavior "dereferencing a dangling reference"))) ∧
-    (∃ (b : CapturedMir) (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+    (∃ (b : CapturedMir) (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
       let hooks := annealStepHooks b.localDecls b.layouts
       stepMirFn b (mkPre4AnnealLM32 b (.init (.scalar ⟨7, 1⟩))) = .step s₁ ∧
       Miri.Interpreter.Step.step hooks ()
         (mkPre4MiriLM32 b u64Ty
           { value := .live (.immediate (.scalar (.fromScalarInt (Miri.Memory.ScalarInt.ofUInt8 7)))),
             layout := some (translateTy u8TyLM32) }) = (m₁, .ok true) ∧
-      stepMirFn b s₁ = .step s₂ ∧
-      get? s₂.frame.locals 1 = some (.init (.scalar ⟨99, 8⟩)) ∧
+      stepMirFn b s₁ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₁ =
         (m₂, .error (.undefinedBehavior "dereferencing a dangling reference"))) ∧
-    (∃ (b : CapturedMir) (s_mis s_out : MachineState) (m_mis m_out : AnnealStepState),
+    (∃ (b : CapturedMir) (s_mis : MachineState) (m_mis m_out : AnnealStepState),
       let entry := refAllocMapEntry b.localDecls b.layouts (.mut false) 1 1 lm31AllocId1
       StateRelLM3_2 b s_mis m_mis [entry] ∧
-      stepMirFn b s_mis = .step s_out ∧
-      get? s_out.frame.locals 0 = some (.init (.scalar ⟨42, 8⟩)) ∧
+      stepMirFn b s_mis = .fail .ub ∧
       Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m_mis =
         (m_out, .error (.undefinedBehavior "dereferencing an unaligned reference"))) ∧
-    (∃ (b : CapturedMir) (s_mis s_out : MachineState) (m_mis m_out : AnnealStepState),
+    (∃ (b : CapturedMir) (s_mis : MachineState) (m_mis m_out : AnnealStepState),
       let entry := refAllocMapEntry b.localDecls b.layouts (.mut false) 1 1 lm31AllocId1
       StateRelLM3_2 b s_mis m_mis [entry] ∧
-      stepMirFn b s_mis = .step s_out ∧
-      get? s_out.frame.locals 1 = some (.init (.scalar ⟨7, 2⟩)) ∧
+      stepMirFn b s_mis = .fail .ub ∧
       Miri.Interpreter.Step.step (annealStepHooks b.localDecls b.layouts) () m_mis =
         (m_out, .error (.undefinedBehavior "dereferencing an unaligned reference"))) := by
   have hrel7 : ScalarRel ⟨7, 1⟩ (Miri.Memory.ScalarInt.ofUInt8 7) :=
@@ -2663,12 +2664,12 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty hm₁
     have himm₁_2 : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 :=
       fun tf htf => himm₁_step _ tf rfl htf 2 (by decide) (himm₀ _ rfl 2)
-    obtain ⟨⟨s₂, hs₂, hs₂_0⟩, m₂, hm₂⟩ := step_safeRef_deref_read_oob_divergence hrel₁ hphase
+    obtain ⟨hs₂, m₂, hm₂⟩ := step_safeRef_deref_read_oob_divergence hrel₁ hphase
       (Or.inl rfl) rfl rfl (dstDecl := u64Decl) (refDecl := refMutU64Decl) (allocDecl := u8DeclLM32)
       rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) himm₁_2
       (ptrVal := { allocId := 1, offsetBytes := 0 }) (e := entry) (sc := ⟨7, 1⟩)
       rfl (List.Mem.head _) rfl (fun h => nomatch h) rfl rfl (by decide) (fun h => nomatch h)
-    exact ⟨b, s₁, s₂, m₁, m₂, hs₁, hm₁, hs₂, hs₂_0, hm₂⟩
+    exact ⟨b, s₁, m₁, m₂, hs₁, hm₁, hs₂, hm₂⟩
   · -- (2) OOB safe-ref deref write (`_1 : u8` = 1 byte, `_2 : &mut u64` = 8 bytes)
     let b : CapturedMir :=
       { defPath := "lm_3_2_witness::oob_deref_write"
@@ -2703,13 +2704,13 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty hm₁
     have himm₁_2 : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 :=
       fun tf htf => himm₁_step _ tf rfl htf 2 (by decide) (himm₀ _ rfl 2)
-    obtain ⟨⟨s₂, hs₂, hs₂_1⟩, m₂, hm₂⟩ := step_safeRef_deref_write_oob_divergence hrel₁ hphase
+    obtain ⟨hs₂, m₂, hm₂⟩ := step_safeRef_deref_write_oob_divergence hrel₁ hphase
       rfl rfl (refDecl := refMutU64Decl) (allocDecl := u8DeclLM32) (valTy := u64Ty)
       rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩)))
       (fun tf _ => constU64_wellTypedLM32 b tf 99 (by decide)) himm₁_2
       (ptrVal := { allocId := 1, offsetBytes := 0 }) (e := entry) (sc := ⟨99, 8⟩)
       rfl rfl (List.Mem.head _) rfl (Or.inr rfl) rfl rfl (fun h => nomatch h) (by decide)
-    exact ⟨b, s₁, s₂, m₁, m₂, hs₁, hm₁, hs₂, hs₂_1, hm₂⟩
+    exact ⟨b, s₁, m₁, m₂, hs₁, hm₁, hs₂, hm₂⟩
   · -- (3) Misaligned safe-ref deref read (`_1 : u64`, `_3 : &mut u16` at offset 1, `_0 = copy *_3`)
     let b : CapturedMir :=
       { defPath := "lm_3_2_witness::misalign_deref_read"
@@ -2792,14 +2793,14 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
         injection hmls with hmls'
         rw [← hmls'] at hmp
         cases hmp
-      obtain ⟨⟨s_out, hs_out, hs_out_0⟩, m_out, hm_out⟩ :=
+      obtain ⟨hs_out, m_out, hm_out⟩ :=
         step_safeRef_deref_read_misaligned_divergence hrel_mis hphase (Or.inl rfl) rfl rfl
           (dstDecl := u16DeclLM32) (refDecl := refMutU16DeclLM32) (allocDecl := u64Decl)
           rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u16, rfl⟩))) himm_mis_3
           (ptrVal := p_mis) (e := entry) (sc := ⟨42, 8⟩)
           rfl (List.Mem.head _) rfl (fun h => nomatch h) rfl rfl (by decide) lm32_misalign_u16_at_1
           (fun h => nomatch h)
-      exact ⟨b, _, s_out, _, m_out, hrel_mis, hs_out, hs_out_0, hm_out⟩
+      exact ⟨b, _, _, m_out, hrel_mis, hs_out, hm_out⟩
     · cases h
     · cases h
   · -- (4) Misaligned safe-ref deref write (`_1 : u64`, `_3 : &mut u16` at offset 1, `*_3 = 7_u16`)
@@ -2887,14 +2888,14 @@ theorem wit_lm3_2_oob_and_misaligned_deref_divergences :
       have hop_u16 : ∀ tf, WellTypedScalarOperand b tf (.constant (constU16LM32 7)) u16TyLM32 :=
         fun _ => .constScalar (constU16LM32 7) ⟨7, 2⟩ rfl (Or.inr (Or.inr (Or.inr ⟨.u16, rfl⟩)))
           (Or.inr (Or.inl rfl)) (by decide) rfl (fun h => nomatch h) (fun h => nomatch h)
-      obtain ⟨⟨s_out, hs_out, hs_out_1⟩, m_out, hm_out⟩ :=
+      obtain ⟨hs_out, m_out, hm_out⟩ :=
         step_safeRef_deref_write_misaligned_divergence hrel_mis hphase rfl rfl
           (refDecl := refMutU16DeclLM32) (allocDecl := u64Decl) (valTy := u16TyLM32)
           rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u16, rfl⟩))) (fun tf _ => hop_u16 tf) himm_mis_3
           (ptrVal := p_mis) (e := entry) (sc := ⟨7, 2⟩)
           rfl rfl (List.Mem.head _) rfl (Or.inr rfl) rfl rfl (by simp) (by decide)
           lm32_misalign_u16_at_1
-      exact ⟨b, _, s_out, _, m_out, hrel_mis, hs_out, hs_out_1, hm_out⟩
+      exact ⟨b, _, _, m_out, hrel_mis, hs_out, hm_out⟩
     · cases h
     · cases h
 
@@ -3722,7 +3723,7 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
       Miri.Interpreter.Step.step hooks () m₁ = (m₂, .ok true) ∧
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
-      StateRelLM3_2 b s₃ m₃ [entry] ∧
+      StateRelLM3_2 b s₃ m₃ [{ entry with perm := .disabled }] ∧
       m₃.stack.frames = #[tf₃] ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
         refU64Ty 4 ⟨.local 0 3 none tf₃.localsIdentity, translateTy refU64Ty b.layouts⟩
@@ -3731,7 +3732,7 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
           "validation: encountered a dangling reference (use-after-free)") m₃ ∧
       stepMirFn b s₃ = .step s₄ ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
-      StateRelLM3_2 b s₄ m₄ [entry] ∧
+      StateRelLM3_2 b s₄ m₄ [{ entry with perm := .disabled }] ∧
       m₄.stack.frames = #[tf₄] ∧
       Miri.Interpreter.ValidityVisitor.validatePlace (annealValidityHooks b.layouts)
         refU64Ty 4 ⟨.local 0 0 none tf₄.localsIdentity, translateTy refU64Ty b.layouts⟩
@@ -3798,6 +3799,7 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
       (.immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
         (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩))
     let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1
+    let entryDis : AllocMapEntry := { entry with perm := .disabled }
     let p0 : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
     let s₁ := mkWitStateLM32 b 1 [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p0 8), .uninit]
       [entry.toBorrowEntry] 2
@@ -3811,10 +3813,11 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
       rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) rfl hm₁
     let s₂ := mkWitStateLM32 b 2 [.uninit, .dead, .init (.ptr p0 8), .uninit]
-      [entry.toBorrowEntry] 2
+      [entryDis.toBorrowEntry] 2
     have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
     have hsim₂ := step_storageDead_lm3_2_simulation hrel₁ hphase rfl rfl rfl (by decide)
     obtain ⟨m₂, hm₂, hrel₂⟩ := stepRelLM3_2_of_anneal_step hsim₂ hs₂
+    change StateRelLM3_2 b s₂ m₂ [entryDis] at hrel₂
     obtain ⟨hsup₂, hnext₂⟩ := step_storageDead_supply hrel₁ rfl rfl rfl (by decide) hsup₁ hnext₁ hm₂
     have himm₂ : ∀ tf, m₂.stack.frames = #[tf] →
         IsImmediateFrameLocal tf 3 ∧ IsImmediateFrameLocal tf 2 :=
@@ -3824,9 +3827,9 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
     obtain ⟨s₃', m₃, tf₃, hs₃', hm₃, hrel₃, htf₃, _, _, hv₃⟩ :=
       step_safeRef_use_dangling_post_validity_divergence hrel₂ hphase (Or.inl rfl) rfl rfl
         (dstDecl := refU64Decl) (srcDecl := refU64Decl) (targetDecl := u64Decl)
-        rfl rfl rfl rfl himm₂ (p := p0) rfl (fun h => nomatch h) (List.Mem.head _) rfl rfl rfl
+        rfl rfl rfl rfl himm₂ (p := p0) (e := entryDis) rfl (fun h => nomatch h) (List.Mem.head _) rfl rfl rfl
     let s₃ := mkWitStateLM32 b 3 [.uninit, .dead, .init (.ptr p0 8), .init (.ptr p0 8)]
-      [entry.toBorrowEntry] 2
+      [entryDis.toBorrowEntry] 2
     have hs₃_eq : s₃' = s₃ := by
       have hs₃_step : stepMirFn b s₂ = .step s₃ := rfl
       rw [hs₃_step] at hs₃'; injection hs₃' with h; injection h with h'; exact h'.symm
@@ -3844,7 +3847,7 @@ theorem wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps :
     obtain ⟨s₄, m₄, tf₄, hs₄, hm₄, hrel₄, htf₄, _, _, hv₄⟩ :=
       step_safeRef_use_dangling_post_validity_divergence hrel₃ hphase (Or.inr rfl) rfl rfl
         (dstDecl := refU64Decl) (srcDecl := refU64Decl) (targetDecl := u64Decl)
-        rfl rfl rfl rfl himm₃ (p := p0) rfl (fun h => nomatch h) (List.Mem.head _) rfl rfl rfl
+        rfl rfl rfl rfl himm₃ (p := p0) (e := entryDis) rfl (fun h => nomatch h) (List.Mem.head _) rfl rfl rfl
     exact ⟨b, s₁, s₂, s₃, s₄, m₁, m₂, m₃, m₄, tf₃, tf₄,
       hs₁, hm₁, hs₂, hm₂, hs₃', hm₃, hrel₃, htf₃, hv₃ 3, hs₄, hm₄, hrel₄, htf₄, hv₄ 3⟩
   · -- (2a) `_2 = &_1 -> *_2 = 99_u64` (`step_safeRef_deref_write_perm_divergence`)
@@ -4282,6 +4285,7 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       (.immediate _ _ (some (translateTy u64Ty)) (fun _ h => Option.some.inj h.symm)
         (Or.inr ⟨_, rfl, .scalar _ _ lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩))
     let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1
+    let entryDis : AllocMapEntry := { entry with perm := .disabled }
     let p0 : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
     let s₁ := mkWitStateLM32 b 1
       [.uninit, .init (.scalar ⟨42, 8⟩), .init (.ptr p0 8), .uninit]
@@ -4297,10 +4301,11 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
       (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
       (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) rfl hm₁
     let s₂ := mkWitStateLM32 b 2 [.uninit, .dead, .init (.ptr p0 8), .uninit]
-      [entry.toBorrowEntry] 2
+      [entryDis.toBorrowEntry] 2
     have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
     have hsim₂ := step_storageDead_lm3_2_simulation hrel₁ hphase rfl rfl rfl (by decide)
     obtain ⟨m₂, hm₂, hrel₂⟩ := stepRelLM3_2_of_anneal_step hsim₂ hs₂
+    change StateRelLM3_2 b s₂ m₂ [entryDis] at hrel₂
     obtain ⟨hsup₂, hnext₂⟩ := step_storageDead_supply hrel₁ rfl rfl (decl := u64Decl) rfl
       (by decide) hsup₁ hnext₁ hm₂
     have himm₂_2 : ∀ tf, m₂.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 :=
@@ -4308,7 +4313,7 @@ theorem wit_lm3_2_placeMention_and_unified_return_ref_real_steps :
         (List.Mem.head _) rfl htf 2 (Or.inl rfl)
     obtain ⟨hs₃, m₃, msg, hm₃⟩ := step_placeMention_safeRef_deref_divergence hrel₂ hphase rfl rfl
       (refDecl := refU64Decl) rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) himm₂_2
-      (Or.inr (Or.inr (Or.inl ⟨p0, entry, rfl, List.Mem.head _, rfl, rfl⟩)))
+      (Or.inr (Or.inl ⟨p0, entryDis, rfl, List.Mem.head _, rfl, rfl⟩))
     exact ⟨b, s₁, s₂, m₁, m₂, m₃, msg, hs₁, hm₁, hs₂, hm₂, hs₃, hm₃⟩
 
 /-! ## 6. `&!` and Enum Validity, Invalid-`bool` Reads, and Tree Borrows Reborrow Chains -/
@@ -4544,7 +4549,7 @@ which `_1 : u8` holds `2`:
    function, while `lean-miri` rejects the typed load with
    `"reading invalid value"`. -/
 theorem wit_lm3_2_invalid_bool_deref_read_divergence_real_steps :
-    ∃ (s₁ s₂ : MachineState) (m₁ m₂ : AnnealStepState),
+    ∃ (s₁ : MachineState) (m₁ m₂ : AnnealStepState),
       let b := lm32InvalidBoolReadBody
       let hooks := annealStepHooks b.localDecls b.layouts
       ¬ AnnealScalarValid boolTyLM32 ⟨2, 1⟩ ∧
@@ -4553,9 +4558,7 @@ theorem wit_lm3_2_invalid_bool_deref_read_divergence_real_steps :
         (m₁, .ok true) ∧
       StateRelLM3_2 b s₁ m₁ [refAllocMapEntry b.localDecls b.layouts .shared 1 1 lm31AllocId1] ∧
       get? s₁.frame.locals 2 = some (.init (.ptr { allocId := 1, offsetBytes := 0 } 8)) ∧
-      stepMirFn b s₁ = .step s₂ ∧
-      get? s₂.frame.locals 0 = some (.init (.scalar ⟨2, 1⟩)) ∧
-      stepMirFn b s₂ = .retNormal (.scalar ⟨2, 1⟩) s₂.memory ∧
+      stepMirFn b s₁ = .fail .ub ∧
       Miri.Interpreter.Step.step hooks () m₁ =
         (m₂, .error (.undefinedBehavior "reading invalid value")) := by
   let b := lm32InvalidBoolReadBody
@@ -4585,25 +4588,13 @@ theorem wit_lm3_2_invalid_bool_deref_read_divergence_real_steps :
     (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty hm₁
   have himm₁_2 : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 2 :=
     fun tf htf => himm₁_step _ tf rfl htf 2 (by decide) (himm₀ _ rfl 2)
-  -- Step 2 (`stmtIdx = 1`): `_0 = copy *_2` diverges
-  obtain ⟨⟨s₂, hs₂, hs₂_0⟩, m₂, hm₂⟩ := step_safeRef_deref_read_invalid_scalar_divergence hrel₁
+  -- Step 2 (`stmtIdx = 1`): `_0 = copy *_2` both reject with UB
+  obtain ⟨hs₂, m₂, hm₂⟩ := step_safeRef_deref_read_invalid_scalar_divergence hrel₁
     hphase (Or.inl rfl) rfl rfl (dstDecl := boolDeclLM32) (refDecl := refBoolDeclLM32)
     (allocDecl := u8DeclLM32) rfl rfl rfl (Or.inl rfl) himm₁_2
     (ptrVal := p0) (e := entry) (sc := ⟨2, 1⟩)
     rfl (List.Mem.head _) rfl rfl (fun h => nomatch h) rfl rfl rfl hinvalid (fun h => nomatch h)
-  -- Step 3 (`return`): Anneal returns the invalid `bool` `2`
-  let s₂' := mkWitStateLM32 b 2
-    [.init (.scalar ⟨2, 1⟩), .init (.scalar ⟨2, 1⟩), .init (.ptr p0 8), .uninit]
-    [entry.toBorrowEntry] 2
-  have hs₂' : stepMirFn b s₁ = .step s₂' := rfl
-  have hs₂_eq : s₂ = s₂' := by
-    rw [hs₂'] at hs₂
-    injection hs₂ with h₁
-    injection h₁ with h₂
-    exact h₂.symm
-  subst hs₂_eq
-  have hs₃ : stepMirFn b s₂' = .retNormal (.scalar ⟨2, 1⟩) s₂'.memory := rfl
-  exact ⟨s₁, s₂', m₁, m₂, hinvalid, hs₁, hm₁, hrel₁, rfl, hs₂, hs₂_0, hs₃, hm₂⟩
+  exact ⟨s₁, m₁, m₂, hinvalid, hs₁, hm₁, hrel₁, rfl, hs₂, hm₂⟩
 
 private theorem stepRelLM3_2Tree_of_anneal_step
     {body : CapturedMir} {m : AnnealStepState} {treeMap : List ReborrowMapEntry}
@@ -4758,6 +4749,7 @@ theorem wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps :
       get? s₁.frame.locals 2 = some (.init (.ptr ptrVal 8)) →
       e ∈ [lm32TreeRoot .reserved] → e.tag = ptrVal.tag →
       get? s₁.frame.locals e.localIdx ≠ some .dead ∧
+      get? s₁.frame.locals e.localIdx ≠ some .uninit ∧
       ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧
       ¬(e.perm = .frozen ∧ BorrowKind.mut false ≠ .shared) ∧
       (∀ tgtDecl, get? b.localDecls e.localIdx = some tgtDecl →
@@ -4768,7 +4760,8 @@ theorem wit_lm3_2_reborrow_tree_write_and_parent_read_real_steps :
     cases he with
     | tail _ h => cases h
     | head _ =>
-      exact ⟨(fun h => nomatch h), rfl, (fun h => nomatch h), (fun ⟨h, _⟩ => nomatch h),
+      exact ⟨(fun h => nomatch h), (fun h => nomatch h), rfl, (fun h => nomatch h),
+        (fun ⟨h, _⟩ => nomatch h),
         (fun d hd => by injection hd with hd'; subst hd'; rfl)⟩
   have hanc₂ : ∀ (ptrVal : ProvenancePtr) (e : ReborrowMapEntry),
       get? s₁.frame.locals 2 = some (.init (.ptr ptrVal 8)) →

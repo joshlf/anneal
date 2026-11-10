@@ -33,24 +33,25 @@ fields at offset `0`), a body that writes, copies, and reads it, and reuses the
 5. `_1 = U { a: 5 }; _1.0 = 7; _2 = copy (_1.0: u8)` steps normally in both
    machines, the field write updating the union's allocation in place
    (`lm24_field_write_read_steps`);
-6. `_1.0 = 7` on the uninitialized `_1` is undefined behavior in Anneal but
-   writes byte `0` of a fresh allocation in `lean-miri`
-   (`lm24_field_write_uninit_divergence`);
+6. `_1.0 = 7` on the uninitialized `_1` steps normally in both machines,
+   initializing `_1` via `uninitFieldWriteShell?` + `writeProjectedForLocal` in
+   Anneal and writing byte `0` of a fresh allocation in `lean-miri`
+   (`lm24_field_write_uninit_simulation`);
 7. `_1 = U { a: 5 }; _4 = move _1; _2 = copy (_4.0: u8)` steps normally in both
    machines (`lm24_move_read_steps`);
 8. the operands `copy _1[1..3]` and `move _1[2..len - 2]` on the array agree,
    the first in value and place and the second as undefined behavior, as does
    `copy _1[1..3]` on the uninitialized array
    (`lm24_subslice_operand_witness`);
-9. `_1 = U { 0: 0x01020304_u32 }; _2 = copy (_1.1: u8)` steps the aggregate in
-   both machines, then diverges on the type-punning read: Anneal reports
-   undefined behavior while `lean-miri` reads the low byte `0x04_u8`
-   (`lm24_type_punning_read_divergence`);
-10. `_1 = U { a: 5 }; _1.1 = 0x01020304_u32` steps the aggregate in both
-    machines, then diverges on the nonzero-field write: Anneal retains `5_u8`
-    at field `0` alongside `0x01020304_u32` at field `1`, while `lean-miri`
-    overwrites bytes `[0, 4)` at offset `0`
-    (`lm24_nonzero_field_write_divergence`);
+9. `_1 = U { b: 0x01020304_u32 }; _2 = copy (_1.0: u8)` (`activeField = some 1`
+   via `evalRvalue_union_aggregate_activeField_simulation`) steps both the
+   aggregate and the type-punning read in lockstep, reading the low byte
+   `0x04_u8` (`lm24_rvalue_union_aggregate_activeField_witness`,
+   `lm24_type_punning_read_simulation`);
+10. `_1 = U { a: 5 }; _1.1 = 0x01020304_u32` steps both the aggregate and the
+    nonzero-field write in lockstep, updating `_1` to
+    `[.unit, .scalar ⟨0x01020304, 4⟩]` in Anneal and overwriting bytes `[0, 4)`
+    at offset `0` in `lean-miri` (`lm24_nonzero_field_write_simulation`);
 11. `_2 = move _1[1..3]; _3 = copy _1[1..1]` steps both `[u16; 2]` and
     `[u16; 0]` subslice assignments in lockstep while keeping `_1` initialized,
     whereas out-of-bounds `_3 = copy _1[2..len - 2]` and uninitialized
@@ -88,8 +89,8 @@ fields at offset `0`), a body that writes, copies, and reads it, and reuses the
 18. nested `Subslice` projections (`_1[0..3][1..2]` and out-of-bounds
     `_1[0..3][2..len - 2]`), in-place subslice destination overwrites
     (`_2 = move _1[1..3]; _2 = copy _1[0..2]`), and projected subslice element
-    writes (`_1[1..3][0 of 2] = 0x0099_u16`) match their proved simulations and
-    divergences (`lm24_nested_subslice_witness`,
+    writes (`_1[1..3][0 of 2] = 0x0099_u16`) all step in lockstep
+    (`lm24_nested_subslice_witness`,
     `lm24_subslice_overwrite_and_elem_write_witness`).
 
 Every Anneal step is computed exactly, by `rfl`.
@@ -138,9 +139,9 @@ def lm24ConstU32 (n : Nat) : ConstOperand := { ty := lm24U32Ty, val := .scalar (
 def lm24AggStmt (u n : Nat) : MirAst.Statement :=
   mkStmt (.assign (local_ u) (.aggregate (.adt "U" 0 (some 0)) [.constant (lm24ConstU8 n)]))
 
-/-- `_u = U { 0: const n_u32 }`. -/
+/-- `_u = U { b: const n_u32 }` (`activeField = some 1`). -/
 def lm24AggU32Stmt (u n : Nat) : MirAst.Statement :=
-  mkStmt (.assign (local_ u) (.aggregate (.adt "U" 0 (some 0)) [.constant (lm24ConstU32 n)]))
+  mkStmt (.assign (local_ u) (.aggregate (.adt "U" 0 (some 1)) [.constant (lm24ConstU32 n)]))
 
 /-- `_u.0 = const n_u8`. -/
 def lm24FieldWriteStmt (u n : Nat) : MirAst.Statement :=
@@ -156,6 +157,45 @@ theorem lm24_wt_U : WellTypedUnionTy lm24Layouts lm24UTy 4 where
   size_eq := rfl
   sized := rfl
   align_le := by decide
+  adt_spec := by
+    refine ⟨"U", [], lm24ULayout, 2, rfl, by decide, by decide, rfl, rfl, rfl, rfl, rfl, rfl,
+      rfl, rfl, ?_⟩
+    intro idx flIdx hget
+    match idx with
+    | 0 =>
+      injection hget with h; subst h
+      refine ⟨lm24U8Layout, rfl, rfl, Or.inl rfl, by decide, ?_⟩
+      intro fTy sc msc _ himm hsz fuel'
+      cases himm with
+      | scalar _ _ hrel _ _ _ =>
+        have hcan := hrel.canonical
+        cases sc with | mk bits sz =>
+        dsimp only [lm24U8Layout] at hsz; subst hsz
+        dsimp only at hcan
+        rw [scalarModulus_eq_two_pow] at hcan
+        have hle : Nat.ble bits 255 = true := Nat.ble_eq.mpr (by omega)
+        have hzle : Nat.ble 0 bits = true := Nat.ble_eq.mpr (Nat.zero_le bits)
+        unfold encodeByLayoutIdxAux
+        simp [LayoutTable.lookup, lm24Layouts, get?, lm24U8Layout, wrappingRangeContains,
+          hzle, hle]
+        rfl
+    | 1 =>
+      injection hget with h; subst h
+      refine ⟨lm24U32Layout, rfl, rfl, Or.inr (Or.inr (Or.inl rfl)), by decide, ?_⟩
+      intro fTy sc msc _ himm hsz fuel'
+      cases himm with
+      | scalar _ _ hrel _ _ _ =>
+        have hcan := hrel.canonical
+        cases sc with | mk bits sz =>
+        dsimp only [lm24U32Layout] at hsz; subst hsz
+        dsimp only at hcan
+        rw [scalarModulus_eq_two_pow] at hcan
+        have hle : Nat.ble bits 4294967295 = true := Nat.ble_eq.mpr (by omega)
+        have hzle : Nat.ble 0 bits = true := Nat.ble_eq.mpr (Nat.zero_le bits)
+        unfold encodeByLayoutIdxAux
+        simp [LayoutTable.lookup, lm24Layouts, get?, lm24U32Layout, wrappingRangeContains,
+          hzle, hle]
+    | _ + 2 => simp [lm24ULayout, get?] at hget
 
 theorem lm24_isPrim_u8 : IsPrimScalarTy lm24U8Ty := Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩))
 theorem lm24_isPrim_u32 : IsPrimScalarTy lm24U32Ty := Or.inr (Or.inr (Or.inr ⟨.u32, rfl⟩))
@@ -211,7 +251,7 @@ def lm24Body : CapturedMir where
       terminator := mkTerm .return_, isCleanup := false },
     { statements := [
         lm24AggU32Stmt 1 0x01020304,
-        mkStmt (.assign (local_ 2) (.use (unionFieldReadOperand false 1 1 lm24U8Ty)))],
+        mkStmt (.assign (local_ 2) (.use (unionFieldReadOperand false 1 0 lm24U8Ty)))],
       terminator := mkTerm .return_, isCleanup := false },
     { statements := [
         lm24AggStmt 1 5,
@@ -309,17 +349,24 @@ theorem lm24_constU8_wt (n : Nat) (hn : n < 256)
 `_2 = copy (_1.0: u8)`. -/
 def lm24Bb1S1 : MachineState :=
   { frame := { blockIdx := 1, stmtIdx := 1,
-               locals := [.uninit, .init (.aggregate 0 [.scalar ⟨5, 1⟩]), .uninit, .uninit, .uninit] }
+               locals := [.uninit, .init (.aggregate 0 [.scalar ⟨5, 1⟩, .unit]), .uninit, .uninit, .uninit] }
     memory := (initMachineState lm24Body []).memory }
 
 def lm24Bb1S2 : MachineState :=
   { frame := { blockIdx := 1, stmtIdx := 2,
-               locals := [.uninit, .init (.aggregate 0 [.scalar ⟨5, 1⟩]), .init (.scalar ⟨5, 1⟩),
+               locals := [.uninit, .init (.aggregate 0 [.scalar ⟨5, 1⟩, .unit]), .init (.scalar ⟨5, 1⟩),
                  .uninit, .uninit] }
     memory := (initMachineState lm24Body []).memory }
 
 theorem lm24_bb1_anneal₁ : stepMirFn lm24Body (lm24InitAnneal 1) = .step lm24Bb1S1 := rfl
 theorem lm24_bb1_anneal₂ : stepMirFn lm24Body lm24Bb1S1 = .step lm24Bb1S2 := rfl
+
+private theorem lm24_decls_adt :
+    ∀ l ∈ collectAdtLayoutsInDecls lm24Body.layouts "U" lm24Body.localDecls,
+      lm24Body.layouts.entries[(lm24Decl lm24UTy).ty.layoutIdx]? = some l := by
+  have hs : stringEq "U" "U" = true := by decide
+  simp [collectAdtLayoutsInDecls, collectAdtLayoutsInTyAux, hs, LayoutTable.lookup,
+    lm24Body, lm24Layouts, lm24Decl, lm24UTy, lm24U8Ty, lm24U32Ty, get?, eq_comm]
 
 /-- **Witness for `union_field_write_read_same_field_simulation`**: in `bb1`,
 `_1 = U { a: 5 }` and `_2 = copy (_1.0: u8)` both step normally in Anneal and in
@@ -337,8 +384,9 @@ theorem lm24_write_read_same_field_steps :
   obtain ⟨hrel₁, hpost⟩ := union_field_write_read_same_field_simulation
     (lm24_init_stateRel 1).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24_phase (u := 1) (r := 2) (bb := _) rfl rfl rfl rfl
-    rfl rfl lm24_wt_U rfl rfl rfl (lm24_init_frame_imm 1 1) (lm24_init_frame_imm 1 2)
+    rfl rfl lm24_wt_U rfl (by decide) rfl rfl rfl (lm24_init_frame_imm 1 1) (lm24_init_frame_imm 1 2)
     lm24_isPrim_u8 (fun tf _ => lm24_constU8_wt 5 (by decide) tf) (by decide)
+    (hdecls_adt := lm24_decls_adt)
   obtain ⟨m₁, _, hstep₁, _, hrel₂, _⟩ := hpost lm24Bb1S1 lm24_bb1_anneal₁
   rw [lm24_bb1_anneal₁, hstep₁] at hrel₁
   rw [lm24_bb1_anneal₂] at hrel₂
@@ -373,7 +421,7 @@ theorem lm24_agg_copy_chain (b : Nat) {bb : BasicBlockData}
           m₁ = (m₂, .ok true) ∧
       StateRelLM2_4 lm24Body S₂ m₂ ∧
       LiveAllocsNodup m₂.machine ∧
-      get? S₂.frame.locals 4 = some (.init (.aggregate 0 [.scalar ⟨5, 1⟩])) ∧
+      get? S₂.frame.locals 4 = some (.init (.aggregate 0 [.scalar ⟨5, 1⟩, .unit])) ∧
       S₂.frame.blockIdx = b ∧ S₂.frame.stmtIdx = 2 ∧
       m₂.stack.frames = #[tf₂] ∧
       (∃ c, tf₂.locals[4]? = some ⟨.live (.indirect mp_w), c⟩) ∧
@@ -381,9 +429,9 @@ theorem lm24_agg_copy_chain (b : Nat) {bb : BasicBlockData}
       IsImmediateFrameLocal tf₂ 2 ∧ IsImmediateFrameLocal tf₂ 3 := by
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24_init_stateRel b).toLM2_4
     lm24_nodup_empty
-    lm24_canReserve_empty lm24_phase (u := 1) hbb h0 rfl lm24_wt_U rfl rfl rfl
+    lm24_canReserve_empty lm24_phase (u := 1) hbb h0 rfl lm24_wt_U rfl (by decide) rfl rfl rfl
     (lm24_init_frame_imm b 1) lm24_isPrim_u8 (fun tf _ => lm24_constU8_wt 5 (by decide) tf)
-    (by decide)
+    (by decide) (hdecls_adt := lm24_decls_adt)
   obtain ⟨sc, mp, m₁, tf₁, hstep₁, hop₁, hst₁, hu_slot₁, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, hnodup₁,
     himm₁, hpres₁, hblk₁, hidx₁, hhw₁⟩ := hpost₁ S₁ hs₁
   have hsc : sc = ⟨5, 1⟩ := by
@@ -421,7 +469,8 @@ theorem lm24_agg_copy_chain (b : Nat) {bb : BasicBlockData}
   obtain ⟨s₂, m₂, mp_w, tf₂, hs₂', hstep₂, hst₂, hw_slot₂, _, hframes₂, ⟨c₂, hmls₂⟩, _,
     _, hmemw₂, hnodup₂, himm₂, hblk₂, hidx₂, _⟩ :=
     union_whole_copy_initMask_preservation_simulation hst₁ hnodup₁ hhw₁'.canReserveAllocId
-      lm24_phase hbb₁ hstmt₁ rfl rfl rfl lm24_wt_U hu_slot₁ hu_mls₁ hmem₁ hw_uninit₁ hw_imm₁
+      lm24_phase hbb₁ hstmt₁ rfl rfl rfl lm24_wt_U rfl (by decide) hu_slot₁ hu_mls₁ hmem₁
+      hw_uninit₁ hw_imm₁
   have hs₂'' := MirStepNode_step_inj (hs₂.symm.trans hs₂')
   subst hs₂''
   refine ⟨m₁, m₂, mp_w, tf₂, hstep₁, hst₁, hstep₂, hst₂, hnodup₂, hw_slot₂,
@@ -436,7 +485,7 @@ def lm24AnnealState (b k : Nat) (locals : List LocalSlot) : MachineState :=
     memory := (initMachineState lm24Body []).memory }
 
 /-- The Anneal value of `U { a: 5 }`. -/
-def lm24USlot : LocalSlot := .init (.aggregate 0 [.scalar ⟨5, 1⟩])
+def lm24USlot : LocalSlot := .init (.aggregate 0 [.scalar ⟨5, 1⟩, .unit])
 
 theorem lm24_bb0_anneal₁ : stepMirFn lm24Body (lm24InitAnneal 0) =
     .step (lm24AnnealState 0 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) := rfl
@@ -511,8 +560,8 @@ theorem lm24_copy_initMask_steps :
     subst h
     exact himm₂
   have hread := step_union_field_read_simulation hst₂ hnodup₂ lm24_phase (r := 2) (u := 4)
-    (bb := _) rfl rfl rfl rfl rfl lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl lm24_wt_U rfl
-    (by decide) hw_slot₂ hu_mls₂ hmemw₂ hr_imm₂
+    (bb := _) rfl rfl rfl rfl rfl lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl (f := 0) lm24_wt_U rfl
+    (by decide) (by decide) hw_slot₂ hu_mls₂ hmemw₂ hr_imm₂
   obtain ⟨hrel₃, _, _⟩ := hread.1 rfl rfl
   rw [lm24_bb0_anneal₃] at hrel₃
   generalize hr : Miri.Interpreter.Step.step
@@ -558,8 +607,8 @@ theorem lm24_copy_larger_field_ub :
     exact himm₃
   obtain ⟨hub_a, m₃, msg, hub_m⟩ := union_uninit_bytes_read_ub_simulation hst₂ hnodup₂ lm24_phase
     (r := 3) (u := 4) (j := 1) (bb := _) rfl rfl rfl rfl rfl lm24_isPrim_u32 (w := 4)
-    (Or.inr (Or.inr (Or.inl rfl))) rfl lm24_wt_U rfl (by decide) hw_slot₂ hu_mls₂ hmemw₂ hr_imm₂
-    (by decide) (by decide) (by decide)
+    (Or.inr (Or.inr (Or.inl rfl))) rfl (f := 0) lm24_wt_U rfl (by decide) (by decide) hw_slot₂
+    hu_mls₂ hmemw₂ hr_imm₂ (by decide) (by decide) (by decide)
   exact ⟨m₁, m₂, m₃, msg, hstep₁, hst₁, hstep₂, hst₂, hub_a, hub_m⟩
 
 /-! ## 5. `Subslice` Projections -/
@@ -613,9 +662,9 @@ theorem lm24_agg_step (b : Nat) {bb : BasicBlockData}
       (∀ j, j ≠ 1 → IsImmediateFrameLocal tf₁ j) := by
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24_init_stateRel b).toLM2_4
     lm24_nodup_empty
-    lm24_canReserve_empty lm24_phase (u := 1) hbb h0 rfl lm24_wt_U rfl rfl rfl
+    lm24_canReserve_empty lm24_phase (u := 1) hbb h0 rfl lm24_wt_U rfl (by decide) rfl rfl rfl
     (lm24_init_frame_imm b 1) lm24_isPrim_u8 (fun tf _ => lm24_constU8_wt 5 (by decide) tf)
-    (by decide)
+    (by decide) (hdecls_adt := lm24_decls_adt)
   obtain ⟨sc, mp, m₁, tf₁, hstep₁, hop₁, hst₁, _, hframes₁, hmls₁, hmem₁, hnodup₁, himm₁, _,
     _, _, hhw₁⟩ := hpost₁ S₁ hs₁
   have hsc : sc = ⟨5, 1⟩ := by
@@ -633,7 +682,7 @@ theorem lm24_agg_step (b : Nat) {bb : BasicBlockData}
     fun j hj => himm₁ (lm24InitMiriFrame b) rfl j hj (lm24_init_imm b j)⟩
 
 /-- The Anneal value of `U { a: 7 }`. -/
-def lm24U7Slot : LocalSlot := .init (.aggregate 0 [.scalar ⟨7, 1⟩])
+def lm24U7Slot : LocalSlot := .init (.aggregate 0 [.scalar ⟨7, 1⟩, .unit])
 
 theorem lm24_bb3_anneal₁ : stepMirFn lm24Body (lm24InitAnneal 3) =
     .step (lm24AnnealState 3 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) := rfl
@@ -644,7 +693,8 @@ theorem lm24_bb3_anneal₃ :
     stepMirFn lm24Body (lm24AnnealState 3 2 [.uninit, lm24U7Slot, .uninit, .uninit, .uninit]) =
       .step (lm24AnnealState 3 3
         [.uninit, lm24U7Slot, .init (.scalar ⟨7, 1⟩), .uninit, .uninit]) := rfl
-theorem lm24_bb4_anneal : stepMirFn lm24Body (lm24InitAnneal 4) = .fail .ub := rfl
+theorem lm24_bb4_anneal : stepMirFn lm24Body (lm24InitAnneal 4) =
+    .step (lm24AnnealState 4 1 [.uninit, lm24U7Slot, .uninit, .uninit, .uninit]) := rfl
 theorem lm24_bb5_anneal₁ : stepMirFn lm24Body (lm24InitAnneal 5) =
     .step (lm24AnnealState 5 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) := rfl
 theorem lm24_bb5_anneal₂ :
@@ -683,7 +733,7 @@ theorem lm24_field_write_read_steps :
     subst h
     exact ⟨c₁, hmls₁⟩
   obtain ⟨_, hpost₂⟩ := step_union_field_write_simulation hst₁ hnodup₁ lm24_phase (u := 1)
-    (bb := _) rfl rfl rfl lm24_wt_U rfl hu_mls₁ hmem₁
+    (bb := _) rfl rfl rfl lm24_wt_U rfl (by decide) rfl hu_mls₁ hmem₁
     (fun tf _ => lm24_constU8_wt 7 (by decide) tf)
   obtain ⟨sc', m₂, tf₂, hstep₂, hop₂, hst₂, hu_slot₂, _, hframes₂, ⟨c₂, hmls₂⟩, hmem₂, hnodup₂,
     himm₂, _, _, _⟩ := hpost₂ _ lm24_bb3_anneal₂
@@ -715,7 +765,7 @@ theorem lm24_field_write_read_steps :
     exact himm₂ tf₁ hframes₁ 2 (himm₁ 2 (by decide))
   have hread := step_union_field_read_simulation hst₂ hnodup₂ lm24_phase (r := 2) (u := 1)
     (bb := _) rfl rfl rfl rfl rfl lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl lm24_wt_U rfl
-    (by decide) hu_slot₂ hu_mls₂ hmem₂ hr_imm₂
+    (by decide) (by decide) hu_slot₂ hu_mls₂ hmem₂ hr_imm₂
   obtain ⟨hrel₃, _, _⟩ := hread.1 rfl rfl
   rw [lm24_bb3_anneal₃] at hrel₃
   generalize hr : Miri.Interpreter.Step.step
@@ -723,28 +773,38 @@ theorem lm24_field_write_read_steps :
   cases hrel₃ with
   | step _ m₃ hst₃ => exact ⟨m₁, m₂, m₃, hstep₁, hst₁, hstep₂, hst₂, hr, hst₃⟩
 
-/-- **Witness for `step_union_field_write_uninit_divergence`**: from block `4`,
-`_1.0 = 7` on the uninitialized union `_1` is undefined behavior in Anneal,
-while `lean-miri` moves `_1` to memory and writes byte `0`, leaving bytes
-`[1, 4)` uninitialized. -/
-theorem lm24_field_write_uninit_divergence :
-    stepMirFn lm24Body (lm24InitAnneal 4) = .fail .ub ∧
+/-- **Witness for `step_union_field_write_uninit_simulation`** (`D13b`): from
+block `4`, `_1.0 = 7` on the uninitialized union `_1` steps both machines in
+lockstep (`StateRelLM2_4`): Anneal materializes `lm24U7Slot` via
+`uninitFieldWriteShell?` + `writeProjectedForLocal`, and `lean-miri` moves `_1`
+to a fresh stack allocation and writes byte `0` (`UnionMemRel`, bytes `[1, 4)`
+uninitialized). -/
+theorem lm24_field_write_uninit_simulation :
+    stepMirFn lm24Body (lm24InitAnneal 4) =
+      .step (lm24AnnealState 4 1 [.uninit, lm24U7Slot, .uninit, .uninit, .uninit]) ∧
     ∃ (m' : AnnealStepState)
       (tf' : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
-      (mp : Miri.Interpreter.MemPlace AnnealProv) (allocId : Miri.Memory.AllocId)
-      (la : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
-        Miri.Memory.MiriMemoryKind),
+      (mp : Miri.Interpreter.MemPlace AnnealProv),
       Miri.Interpreter.Step.step (annealStepHooksLM2_4 lm24Body.localDecls lm24Body.layouts) ()
           (lm24InitMiri 4) = (m', .ok true) ∧
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 4 1 [.uninit, lm24U7Slot, .uninit, .uninit, .uninit]) m' ∧
       m'.stack.frames = #[tf'] ∧
       (∃ c', tf'.locals[1]? = some ⟨.live (.indirect mp), c'⟩) ∧
-      mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId = some allocId ∧
-      (allocId, la) ∈ m'.machine.memory.live.toList ∧
-      la.allocation.initializationMask = unionPrefixMask 4 1 ∧
-      (unionAllocRaw la.allocation).extract 0 1 = allocLeBytes 7 1 :=
-  step_union_field_write_uninit_divergence (lm24_init_stateRel 4).toLM2_4 lm24_canReserve_empty
-    lm24_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U rfl (lm24_init_frame_imm 4 1)
-    (sc := ⟨7, 1⟩) rfl rfl lm24_isPrim_u8 (Or.inl rfl) (by decide) (by decide)
+      UnionMemRel m'.machine lm24UTy lm24Layouts 4 lm24U8Ty ⟨7, 1⟩ mp := by
+  obtain ⟨_, hpost⟩ := step_union_field_write_uninit_simulation (lm24_init_stateRel 4).toLM2_4
+    lm24_nodup_empty lm24_canReserve_empty lm24_phase (u := 1) (j := 0) (bb := _)
+    rfl rfl rfl lm24_wt_U rfl (by decide) rfl (lm24_init_frame_imm 4 1) lm24_isPrim_u8
+    (fun tf _ => lm24_constU8_wt 7 (by decide) tf) (by decide)
+  obtain ⟨sc, mp, m', tf', hstep, hop, hst', _, _, hframes', hmls', hmem', _, _, _, _, _⟩ :=
+    hpost _ lm24_bb4_anneal
+  have hsc : sc = ⟨7, 1⟩ := by
+    have h : evalOperand (lm24InitAnneal 4).frame.locals (.constant (lm24ConstU8 7)) .nil
+        (lm24InitAnneal 4).memory.globals lm24Body.layouts .nil =
+        .ok (.scalar ⟨7, 1⟩) (lm24InitAnneal 4).frame.locals := rfl
+    rw [h] at hop; injection hop with h1 _; injection h1 with h1; exact h1.symm
+  subst hsc
+  exact ⟨lm24_bb4_anneal, m', tf', mp, hstep, hst', hframes', hmls', hmem'⟩
 
 /-- **Witness for `union_whole_move_initMask_preservation_simulation`**: from
 block `5`, `_1 = U { a: 5 }`, `_4 = move _1`, and `_2 = copy (_4.0: u8)` step
@@ -782,7 +842,8 @@ theorem lm24_move_read_steps :
   obtain ⟨s₂, m₂, mp_w, tf₂, hs₂, hstep₂, hst₂, hw_slot₂, _, _, hframes₂, ⟨c₂, hmls₂⟩, _,
     hmemw₂, hnodup₂, _, himm₂, _, _, _⟩ :=
     union_whole_move_initMask_preservation_simulation hst₁ hnodup₁ hcan₁ lm24_phase (w := 4)
-      (u := 1) (bb := _) rfl rfl rfl rfl rfl lm24_wt_U rfl hu_mls₁ hmem₁ rfl hw_imm₁
+      (u := 1) (bb := _) rfl rfl rfl rfl rfl (f := 0) lm24_wt_U rfl (by decide) rfl hu_mls₁ hmem₁
+      rfl hw_imm₁
   have hs₂' := MirStepNode_step_inj (lm24_bb5_anneal₂.symm.trans hs₂)
   subst hs₂'
   have hu_mls₂ : ∀ topFrame, m₂.stack.frames = #[topFrame] →
@@ -799,8 +860,8 @@ theorem lm24_move_read_steps :
     subst h
     exact himm₂ tf₁ hframes₁ 2 (by decide) (himm₁ 2 (by decide))
   have hread := step_union_field_read_simulation hst₂ hnodup₂ lm24_phase (r := 2) (u := 4)
-    (bb := _) rfl rfl rfl rfl rfl lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl lm24_wt_U rfl
-    (by decide) hw_slot₂ hu_mls₂ hmemw₂ hr_imm₂
+    (bb := _) rfl rfl rfl rfl rfl lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl (f := 0) lm24_wt_U rfl
+    (by decide) (by decide) hw_slot₂ hu_mls₂ hmemw₂ hr_imm₂
   obtain ⟨hrel₃, _, _⟩ := hread.1 rfl rfl
   rw [lm24_bb5_anneal₃] at hrel₃
   generalize hr : Miri.Interpreter.Step.step
@@ -862,7 +923,7 @@ theorem lm24_subslice_operand_witness :
   subst hmp
   exact ⟨hev₁, ⟨_, _, _, hmv₁, hst', rfl, rfl⟩, hev₂, ⟨_, msg₂, hmv₂⟩, hev₃, ⟨m₃, msg₃, hmv₃⟩⟩
 
-/-! ## 8. Union Type-Punning Read and Nonzero-Field Write Divergences -/
+/-! ## 8. Union Active-Field Overlay (`D13a`), Type-Punning Read, and Nonzero-Field Write Simulations -/
 
 theorem lm24_constU32_wt (n : Nat) (hn : n < 2 ^ 32)
     (tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit) :
@@ -870,17 +931,43 @@ theorem lm24_constU32_wt (n : Nat) (hn : n < 2 ^ 32)
   .constScalar (lm24ConstU32 n) ⟨n, 4⟩ rfl lm24_isPrim_u32
     (Or.inr (Or.inr (Or.inl rfl))) hn rfl (fun h => nomatch h) (fun h => nomatch h)
 
-def lm24UU32Slot : LocalSlot := .init (.aggregate 0 [.scalar ⟨0x01020304, 4⟩])
+def lm24UU32Slot : LocalSlot := .init (.aggregate 0 [.unit, .scalar ⟨0x01020304, 4⟩])
+
+/-- **Witness for `evalRvalue_union_aggregate_activeField_simulation`** (`D13a`):
+evaluating `U { b: 0x01020304_u32 }` (`activeField = some 1`) on `lm24Body`
+places the scalar at slot `1` (`unionSlotFields 2 1 = [.unit, .scalar ⟨0x01020304, 4⟩]`)
+rather than ignoring `activeField`. -/
+theorem lm24_rvalue_union_aggregate_activeField_witness :
+    evalRvalue (lm24InitAnneal 6).frame.locals
+        (.aggregate (.adt "U" 0 (some 1)) [.constant (lm24ConstU32 0x01020304)])
+        (lm24InitAnneal 6).memory lm24Body.localDecls lm24Body.layouts =
+      .ok (.aggregate 0 [.unit, .scalar ⟨0x01020304, 4⟩])
+        (lm24InitAnneal 6).frame.locals (lm24InitAnneal 6).memory := by
+  have himm : ImmediateRel lm24U32Ty lm24Layouts (.scalar ⟨0x01020304, 4⟩)
+      (.scalar (.fromScalarInt (extractExceptOk (translateScalarInt ⟨0x01020304, 4⟩) (by decide)))) :=
+    .scalar ⟨0x01020304, 4⟩ (extractExceptOk (translateScalarInt ⟨0x01020304, 4⟩) (by decide))
+      ⟨Or.inr (Or.inr (Or.inl rfl)), by rw [scalarModulus_eq_two_pow]; decide, by decide, by decide⟩
+      rfl (fun h => nomatch h) (fun h => nomatch h)
+  exact (evalRvalue_union_aggregate_activeField_simulation (body := lm24Body)
+    (u := 1) (n := 2) (f := 1) rfl rfl rfl ⟨[], rfl⟩
+    lm24_wt_U rfl (by decide) rfl lm24_isPrim_u32 rfl
+    (lm24_constU32_wt 0x01020304 (by decide) (lm24InitMiriFrame 6)) rfl himm
+    (hdecls_adt := lm24_decls_adt)).1
 
 theorem lm24_bb6_anneal₁ : stepMirFn lm24Body (lm24InitAnneal 6) =
     .step (lm24AnnealState 6 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) := rfl
 
-/-- **Witness for `step_union_type_punning_read_divergence`**: from block `6`,
-`_1 = U { 0: 0x01020304_u32 }` steps normally in both machines to related
-states, and the subsequent type-punning read `_2 = copy (_1.1: u8)` reports
-undefined behavior in Anneal while `lean-miri` steps normally and reads the
-little-endian low byte `0x04_u8` (`msc_w.data = 0x04`, `msc_w.size = 1`). -/
-theorem lm24_type_punning_read_divergence :
+theorem lm24_bb6_anneal₂ :
+    stepMirFn lm24Body (lm24AnnealState 6 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) =
+      .step (lm24AnnealState 6 2
+        [.uninit, lm24UU32Slot, .init (.scalar ⟨0x04, 1⟩), .uninit, .uninit]) := rfl
+
+/-- **Witness for `step_union_type_punning_read_simulation`**: from block `6`,
+`_1 = U { b: 0x01020304_u32 }` (`activeField = some 1`) and the subsequent
+type-punning read `_2 = copy (_1.0: u8)` both step normally in lockstep
+(`StateRelLM2_4`), reading the little-endian low byte `0x04_u8` (`msc_w.data = 0x04`,
+`msc_w.size = 1`). -/
+theorem lm24_type_punning_read_simulation :
     ∃ (m₁ m₂ : AnnealStepState)
       (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
       (msc_w : Miri.Memory.ScalarInt),
@@ -889,19 +976,25 @@ theorem lm24_type_punning_read_divergence :
       StateRelLM2_4 lm24Body
         (lm24AnnealState 6 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) m₁ ∧
       stepMirFn lm24Body
-        (lm24AnnealState 6 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) = .fail .ub ∧
+        (lm24AnnealState 6 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) =
+          .step (lm24AnnealState 6 2
+            [.uninit, lm24UU32Slot, .init (.scalar ⟨0x04, 1⟩), .uninit, .uninit]) ∧
       Miri.Interpreter.Step.step (annealStepHooksLM2_4 lm24Body.localDecls lm24Body.layouts) ()
           m₁ = (m₂, .ok true) ∧
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 6 2
+          [.uninit, lm24UU32Slot, .init (.scalar ⟨0x04, 1⟩), .uninit, .uninit]) m₂ ∧
       m₂.stack.frames = #[tf₂] ∧
       (∃ c, tf₂.locals[2]? = some ⟨.live (.immediate (.scalar (.fromScalarInt msc_w))), c⟩) ∧
       msc_w.data = 0x04 ∧
       msc_w.size = Miri.ABI.Size.ofBytes 1 := by
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24_init_stateRel 6).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
-    rfl rfl rfl (lm24_init_frame_imm 6 1) lm24_isPrim_u32
+    rfl (by decide) rfl rfl rfl (lm24_init_frame_imm 6 1) lm24_isPrim_u32
     (fun tf _ => lm24_constU32_wt 0x01020304 (by decide) tf) (by decide)
+    (hdecls_adt := lm24_decls_adt)
   obtain ⟨sc, mp, m₁, tf₁, hstep₁, hop₁, hst₁, hu_slot₁, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, hnodup₁,
-    himm₁, hpres₁, _, _, _⟩ := hpost₁ _ lm24_bb6_anneal₁
+    himm₁, _, _, _, _⟩ := hpost₁ _ lm24_bb6_anneal₁
   have hsc : sc = ⟨0x01020304, 4⟩ := by
     have h : evalOperand (lm24InitAnneal 6).frame.locals (.constant (lm24ConstU32 0x01020304)) .nil
         (lm24InitAnneal 6).memory.globals lm24Body.layouts .nil =
@@ -920,52 +1013,50 @@ theorem lm24_type_punning_read_divergence :
     intro tf htf; rw [hframes₁] at htf
     have h : tf₁ = tf := by simpa using htf
     subst h; exact himm₁ (lm24InitMiriFrame 6) rfl 2 (by decide) (lm24_init_imm 6 2)
-  have hr_live₁ :
-      get? (lm24AnnealState 6 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]).frame.locals 2 ≠
-        some .dead := fun h => nomatch h
-  obtain ⟨ha_ub, m₂, tf₂, msc_w, hstep₂, _, hframes₂, ⟨_, _, hsize, hdata⟩, hloc₂⟩ :=
-    step_union_type_punning_read_divergence hst₁ hnodup₁ lm24_phase (r := 2) (u := 1) (j := 1)
-      (bb := _) rfl rfl rfl rfl lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl lm24_wt_U rfl
-      (by decide) hu_slot₁ hu_mls₁ hmem₁ hr_live₁ hr_imm₁ (by decide) (by decide)
+  obtain ⟨_, _, hlive₂⟩ :=
+    step_union_type_punning_read_simulation hst₁ hnodup₁ lm24_phase (r := 2) (u := 1) (j := 0)
+      (bb := _) rfl rfl rfl rfl rfl lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl (f := 1) lm24_wt_U rfl
+      (by decide) (by decide) hu_slot₁ hu_mls₁ hmem₁ hr_imm₁ (by decide) (by decide)
+  obtain ⟨s₂, m₂, tf₂, msc_w, hs₂, hstep₂, hst₂, _, _, hframes₂, ⟨_, _, hsize, hdata⟩, hloc₂⟩ :=
+    hlive₂ (fun h => nomatch h)
+  have hs₂_eq := MirStepNode_step_inj (lm24_bb6_anneal₂.symm.trans hs₂)
+  subst hs₂_eq
   have hmod : 0x01020304 % scalarModulus 1 = 0x04 := by
     rw [scalarModulus_eq_two_pow]
   dsimp only at hdata
-  exact ⟨m₁, m₂, tf₂, msc_w, hstep₁, hst₁, ha_ub, hstep₂, hframes₂, hloc₂,
+  exact ⟨m₁, m₂, tf₂, msc_w, hstep₁, hst₁, lm24_bb6_anneal₂, hstep₂, hst₂, hframes₂, hloc₂,
     by rw [hdata, hmod]; rfl, hsize⟩
 
 theorem lm24_bb7_anneal₁ : stepMirFn lm24Body (lm24InitAnneal 7) =
     .step (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) := rfl
 
-/-- **Witness for `step_union_nonzero_field_write_divergence`**: from block `7`,
-`_1 = U { a: 5 }` steps normally in both machines to related states, and the
-subsequent nonzero-field write `_1.1 = 0x01020304_u32` steps Anneal to a state
-where `_1`'s aggregate still holds `5_u8` at index `0` alongside
-`0x01020304_u32` at index `1`, while `lean-miri` overwrites bytes `[0, 4)` at
-offset `0` with `allocLeBytes 0x01020304 4` and sets `IsUnionPrefixMask 4 4`. -/
-theorem lm24_nonzero_field_write_divergence :
-    ∃ (m₁ : AnnealStepState) (s₂ : MachineState) (fields' : List Value)
-      (m₂ : AnnealStepState)
+theorem lm24_bb7_anneal₂ :
+    stepMirFn lm24Body (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) =
+      .step (lm24AnnealState 7 2 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) := rfl
+
+/-- **Witness for `step_union_nonzero_field_write_simulation`**: from block `7`,
+`_1 = U { a: 5 }` and the subsequent nonzero-field write `_1.1 = 0x01020304_u32`
+both step normally in lockstep (`StateRelLM2_4`), updating `_1` to `lm24UU32Slot`
+(`[.unit, .scalar ⟨0x01020304, 4⟩]`) in Anneal and overwriting bytes `[0, 4)` at
+offset `0` with `UnionMemRel` for `(lm24U32Ty, ⟨0x01020304, 4⟩)` in `lean-miri`. -/
+theorem lm24_nonzero_field_write_simulation :
+    ∃ (m₁ m₂ : AnnealStepState)
       (tf₂ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
-      (mp : Miri.Interpreter.MemPlace AnnealProv) (allocId : Miri.Memory.AllocId)
-      (la : Miri.Memory.LocalAllocation AnnealProv (Option Miri.TreeBorrows.BorrowTree)
-        Miri.Memory.MiriMemoryKind),
+      (mp : Miri.Interpreter.MemPlace AnnealProv),
       Miri.Interpreter.Step.step (annealStepHooksLM2_4 lm24Body.localDecls lm24Body.layouts) ()
           (lm24InitMiri 7) = (m₁, .ok true) ∧
       StateRelLM2_4 lm24Body
         (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) m₁ ∧
       stepMirFn lm24Body
-        (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) = .step s₂ ∧
-      get? s₂.frame.locals 1 = some (.init (.aggregate 0 fields')) ∧
-      get? fields' 0 = some (.scalar ⟨5, 1⟩) ∧
-      get? fields' 1 = some (.scalar ⟨0x01020304, 4⟩) ∧
+        (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) =
+          .step (lm24AnnealState 7 2 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) ∧
       Miri.Interpreter.Step.step (annealStepHooksLM2_4 lm24Body.localDecls lm24Body.layouts) ()
           m₁ = (m₂, .ok true) ∧
+      StateRelLM2_4 lm24Body
+        (lm24AnnealState 7 2 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) m₂ ∧
       m₂.stack.frames = #[tf₂] ∧
       (∃ c, tf₂.locals[1]? = some ⟨.live (.indirect mp), c⟩) ∧
-      mp.ptr.provenance.bind Miri.Memory.Provenance.getAllocId = some allocId ∧
-      (allocId, la) ∈ m₂.machine.memory.live.toList ∧
-      IsUnionPrefixMask 4 4 la.allocation.initializationMask ∧
-      (unionAllocRaw la.allocation).extract 0 4 = allocLeBytes 0x01020304 4 := by
+      UnionMemRel m₂.machine lm24UTy lm24Layouts 4 lm24U32Ty ⟨0x01020304, 4⟩ mp := by
   obtain ⟨m₁, mp, tf₁, hstep₁, hst₁, hnodup₁, _, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, _⟩ :=
     lm24_agg_step 7 rfl rfl lm24_bb7_anneal₁
   have hu_mls₁ : ∀ topFrame, m₁.stack.frames = #[topFrame] →
@@ -973,14 +1064,24 @@ theorem lm24_nonzero_field_write_divergence :
     intro tf htf; rw [hframes₁] at htf
     have h : tf₁ = tf := by simpa using htf
     subst h; exact ⟨c₁, hmls₁⟩
-  obtain ⟨⟨s₂, fields', ha_step, hslot₂, hf0, hf1⟩, m₂, tf₂, allocId, la, hstep₂, hframes₂,
-    hloc₂, hprov, hlive, hmask, hraw⟩ :=
-    step_union_nonzero_field_write_divergence hst₁ hnodup₁ lm24_phase (u := 1) (j := 1)
-      (bb := _) rfl rfl rfl lm24_wt_U rfl (by decide) (by decide) rfl hu_mls₁ hmem₁
-      (sc' := ⟨0x01020304, 4⟩) rfl rfl lm24_isPrim_u32 (Or.inr (Or.inr (Or.inl rfl)))
-      (by rw [scalarModulus_eq_two_pow]; decide) (by decide)
-  exact ⟨m₁, s₂, fields', m₂, tf₂, mp, allocId, la, hstep₁, hst₁, ha_step, hslot₂, hf0, hf1,
-    hstep₂, hframes₂, hloc₂, hprov, hlive, hmask, hraw⟩
+  obtain ⟨_, hpost₂⟩ :=
+    step_union_nonzero_field_write_simulation hst₁ hnodup₁ lm24_phase (u := 1) (j := 1)
+      (bb := _) rfl rfl rfl (f := 0) lm24_wt_U rfl (by decide) (by decide) rfl hu_mls₁ hmem₁
+      lm24_isPrim_u32 (fun tf _ => lm24_constU32_wt 0x01020304 (by decide) tf)
+      (by decide) (by decide)
+  obtain ⟨sc', m₂, tf₂, hstep₂, hop₂, hst₂, _, _, hframes₂, hloc₂, hmem₂, _, _, _, _, _⟩ :=
+    hpost₂ _ lm24_bb7_anneal₂
+  have hsc' : sc' = ⟨0x01020304, 4⟩ := by
+    have h : evalOperand
+        (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]).frame.locals
+        (.constant (lm24ConstU32 0x01020304)) .nil
+        (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]).memory.globals
+        lm24Body.layouts .nil =
+        .ok (.scalar ⟨0x01020304, 4⟩)
+          (lm24AnnealState 7 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]).frame.locals := rfl
+    rw [h] at hop₂; injection hop₂ with h1 _; injection h1 with h1; exact h1.symm
+  subst hsc'
+  exact ⟨m₁, m₂, tf₂, mp, hstep₁, hst₁, lm24_bb7_anneal₂, hstep₂, hst₂, hframes₂, hloc₂, hmem₂⟩
 
 /-! ## 9. Statement-Level `Subslice` Assignments & `[T; 0]` Dichotomy -/
 
@@ -1002,7 +1103,7 @@ private theorem lm24_elemLayout_u16Arr2 :
 theorem lm24_wf_u16Arr2 : WellTypedArrayTy emptyLayoutTable lm24U16Arr2Ty (.uint .u16) 2 :=
   ⟨rfl, Or.inr (Or.inr (Or.inr ⟨.u16, rfl⟩)), rfl, rfl, rfl, rfl, rfl,
     lm24_elemLayout_u16Arr2,
-    show 0 < 2 by decide, show 2 ≤ 16 by decide, show 2 * 2 < 2 ^ 32 by decide⟩
+    show 0 < 2 by decide, show 2 ≤ 16 by decide, show 2 * 2 < 2 ^ 32 by decide, rfl⟩
 
 /-- Locals: `_0: u16`, `_1: [u16; 3]`, `_2: [u16; 2]`, `_3: [u16; 0]`.
 - `stmt 0`: `_2 = move _1[1..3]` (`fromEnd = false`, non-empty subslice,
@@ -1382,7 +1483,7 @@ private theorem lm24_elemLayout_u8Arr3 :
 theorem lm24_wf_u8Arr3 : WellTypedArrayTy lm24Layouts lm24U8Arr3Ty (.uint .u8) 3 :=
   ⟨rfl, Or.inr (Or.inr (Or.inr ⟨.u8, rfl⟩)), rfl, rfl, rfl, rfl, rfl,
     lm24_elemLayout_u8Arr3,
-    show 0 < 1 by decide, show 1 ≤ 16 by decide, show 3 * 1 < 2 ^ 32 by decide⟩
+    show 0 < 1 by decide, show 1 ≤ 16 by decide, show 3 * 1 < 2 ^ 32 by decide, rfl⟩
 
 /-- Locals: `_0: u32`, `_1: U`, `_2: u8`, `_3: [u8; 3]`, `_4: U`.
 - `bb0`: 8-step lifecycle & overwrite chain:
@@ -1444,6 +1545,14 @@ def lm24A2UnionBody : CapturedMir where
 
 theorem lm24A2_phase : ∀ p, lm24A2UnionBody.phase ≠ .other p := by
   intro p h; cases h
+
+private theorem lm24A2_decls_adt :
+    ∀ l ∈ collectAdtLayoutsInDecls lm24A2UnionBody.layouts "U" lm24A2UnionBody.localDecls,
+      lm24A2UnionBody.layouts.entries[(lm24Decl lm24UTy).ty.layoutIdx]? = some l := by
+  have hs : stringEq "U" "U" = true := by decide
+  simp [collectAdtLayoutsInDecls, collectAdtLayoutsInTyAux, hs, LayoutTable.lookup,
+    lm24A2UnionBody, lm24Layouts, lm24Decl, lm24UTy, lm24U8Ty, lm24U32Ty,
+    lm24U8Arr3Decl, lm24U8Arr3Ty, get?, eq_comm]
 
 def lm24A2InitAnneal (b : Nat) : MachineState :=
   { frame := { blockIdx := b, stmtIdx := 0,
@@ -1522,7 +1631,7 @@ theorem lm24A2_constU32_wt (n : Nat) (hn : n < scalarModulus 4)
   .constScalar (lm24ConstU32 n) ⟨n, 4⟩ rfl lm24_isPrim_u32
     (Or.inr (Or.inr (Or.inl rfl))) hn rfl (fun h => nomatch h) (fun h => nomatch h)
 
-def lm24UU32Slot2 : LocalSlot := .init (.aggregate 0 [.scalar ⟨0x05060708, 4⟩])
+def lm24UU32Slot2 : LocalSlot := .init (.aggregate 0 [.unit, .scalar ⟨0x05060708, 4⟩])
 
 theorem lm24A2_bb0_a₁ : stepMirFn lm24A2UnionBody (lm24A2InitAnneal 0) =
     .step (lm24A2AnnealState 0 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) := rfl
@@ -1608,8 +1717,9 @@ theorem lm24_overwrite_and_lifecycle_steps :
   -- Step 1: `_1 = U { a: 5 }`
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24A2_init_stateRel 0).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24A2_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
-    rfl rfl rfl (lm24A2_init_frame_imm 0 1) lm24_isPrim_u8
+    rfl (by decide) rfl rfl rfl (lm24A2_init_frame_imm 0 1) lm24_isPrim_u8
     (fun tf _ => lm24A2_constU8_wt 5 (by decide) tf) (by decide)
+    (hdecls_adt := lm24A2_decls_adt)
   obtain ⟨sc₁, mp₁, m₁, tf₁, hstep₁, hop₁, hst₁, _, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, hnodup₁,
     himm₁, _, _, _, hhw₁⟩ := hpost₁ _ lm24A2_bb0_a₁
   have hsc₁ : sc₁ = ⟨5, 1⟩ := by
@@ -1633,8 +1743,8 @@ theorem lm24_overwrite_and_lifecycle_steps :
   obtain ⟨s₂, m₂, mp₄, tf₂, hs₂, hstep₂, hst₂, _, _, hframes₂, ⟨c₄_2, hmls₄_2⟩,
     ⟨c₁_2, hmls₁_2⟩, hmem₁_2, hmem₄_2, hnodup₂, _, _, _, _⟩ :=
     union_whole_copy_initMask_preservation_simulation hst₁ hnodup₁ hhw₁'.canReserveAllocId
-      lm24A2_phase (w := 4) (u := 1) (bb := _) rfl rfl rfl rfl rfl lm24_wt_U rfl hu1_mls₁ hmem₁
-      rfl hw4_imm₁
+      lm24A2_phase (w := 4) (u := 1) (bb := _) rfl rfl rfl rfl rfl (f := 0) lm24_wt_U rfl
+      (by decide) rfl hu1_mls₁ hmem₁ rfl hw4_imm₁
   have hs₂_eq := MirStepNode_step_inj (lm24A2_bb0_a₂.symm.trans hs₂)
   subst hs₂_eq
   have hu1_mls₂ : ∀ tf, m₂.stack.frames = #[tf] →
@@ -1651,9 +1761,9 @@ theorem lm24_overwrite_and_lifecycle_steps :
   obtain ⟨s₃, m₃, tf₃, hs₃, hstep₃, hst₃, _, _, hframes₃, ⟨c₄_3, hmls₄_3⟩, hmem₄_3,
     hnodup₃, _⟩ :=
     (step_union_whole_copy_or_move_overwrite_simulation hst₂ hnodup₂ lm24A2_phase
-      (w := 4) (u := 1) (isMove := false) (bb := _) rfl rfl rfl rfl rfl lm24_wt_U).2.2
-      lm24U8Ty ⟨5, 1⟩ mp₁ lm24U8Ty ⟨5, 1⟩ mp₄ (by decide) rfl hu1_mls₂ hmem₁_2 rfl hw4_mls₂
-      hmem₄_2
+      (w := 4) (u := 1) (isMove := false) (bb := _) rfl rfl rfl rfl rfl lm24_wt_U (n := 2) rfl).2.2
+      0 0 lm24U8Ty ⟨5, 1⟩ mp₁ lm24U8Ty ⟨5, 1⟩ mp₄ (by decide) (by decide) (by decide) rfl
+      hu1_mls₂ hmem₁_2 rfl hw4_mls₂ hmem₄_2
   have hs₃_eq := MirStepNode_step_inj (lm24A2_bb0_a₃.symm.trans hs₃)
   subst hs₃_eq
   have hw4_mls₃ : ∀ tf, m₃.stack.frames = #[tf] →
@@ -1661,12 +1771,13 @@ theorem lm24_overwrite_and_lifecycle_steps :
     intro tf htf; rw [hframes₃] at htf
     have h : tf₃ = tf := by simpa using htf
     subst h; exact ⟨c₄_3, hmls₄_3⟩
-  -- Step 4: `_4 = U { 0: 0x05060708_u32 }` (in-place aggregate overwrite widening `1 -> 4` bytes)
+  -- Step 4: `_4 = U { b: 0x05060708_u32 }` (in-place aggregate overwrite widening `1 -> 4` bytes)
   obtain ⟨_, hpost₄⟩ :=
     (step_union_aggregate_overwrite_simulation hst₃ hnodup₃ lm24A2_phase (u := 4) (bb := _)
-      rfl rfl rfl lm24_wt_U rfl rfl lm24_isPrim_u32
+      rfl rfl rfl lm24_wt_U rfl (by decide) rfl rfl lm24_isPrim_u32
       (fun tf _ => lm24A2_constU32_wt 0x05060708 (by rw [scalarModulus_eq_two_pow]; decide) tf)
-      (by decide)).2 lm24U8Ty ⟨5, 1⟩ mp₄ rfl hw4_mls₃ hmem₄_3 (by decide)
+      (by decide) (hdecls_adt := lm24A2_decls_adt)).2 0 lm24U8Ty ⟨5, 1⟩ mp₄ (by decide) rfl
+      hw4_mls₃ hmem₄_3 (by decide)
   obtain ⟨sc₄, m₄, _, hstep₄, hst₄, hw4_slot₄, _, _, hmem₄_4, hnodup₄, _⟩ :=
     hpost₄ _ lm24A2_bb0_a₄
   have hsc₄ : sc₄ = ⟨0x05060708, 4⟩ := by
@@ -1674,8 +1785,14 @@ theorem lm24_overwrite_and_lifecycle_steps :
         (lm24A2AnnealState 0 4 [.uninit, lm24USlot, .uninit, .uninit, lm24UU32Slot2]).frame.locals
         4 = some lm24UU32Slot2 := rfl
     rw [h] at hw4_slot₄
-    injection hw4_slot₄ with h1; injection h1 with h1; injection h1 with _ h2
-    injection h2 with h2 _; injection h2 with h2; exact h2.symm
+    dsimp only [lm24UU32Slot2, unionSlotFields, replicateValue, appendValueList] at hw4_slot₄
+    injection hw4_slot₄ with h1
+    injection h1 with h1
+    injection h1 with _ h1
+    injection h1 with _ h1
+    injection h1 with h1 _
+    injection h1 with h1
+    exact h1.symm
   subst hsc₄
   -- Step 5: `StorageDead(_1)` (deallocates `_1`'s union stack allocation)
   obtain ⟨hrel₅, hpn₅, _⟩ := step_storageDead_LM2_4_simulation hst₄ hnodup₄ lm24A2_phase
@@ -1707,8 +1824,9 @@ theorem lm24_overwrite_and_lifecycle_steps :
         -- Step 8: `_1 = U { a: 9_u8 }` into `.dead` `_1` -> UB in both!
         have hrel₈ :=
           (step_union_aggregate_overwrite_simulation hst₇ hnodup₇ lm24A2_phase (u := 1) (bb := _)
-            rfl rfl rfl lm24_wt_U rfl rfl lm24_isPrim_u8
-            (fun tf _ => lm24A2_constU8_wt 9 (by decide) tf) (by decide)).1 rfl
+            rfl rfl rfl lm24_wt_U rfl (by decide) rfl rfl lm24_isPrim_u8
+            (fun tf _ => lm24A2_constU8_wt 9 (by decide) tf) (by decide)
+            (hdecls_adt := lm24A2_decls_adt)).1 rfl
         exact ⟨m₁, m₂, m₃, m₄, m₅, m₆, m₇, mp₁, mp₄, hstep₁, hmem₁, hstep₂, hstep₃, hmem₄_3,
           hstep₄, hmem₄_4, hstep₅, hst₅, hstep₆, hst₆, hstep₇, hrel₈⟩
 
@@ -1734,8 +1852,9 @@ theorem lm24_union_self_copy_overlap_divergence :
         (m₂, .error (.undefinedBehavior "whole-value copy between overlapping ranges")) := by
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24A2_init_stateRel 1).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24A2_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
-    rfl rfl rfl (lm24A2_init_frame_imm 1 1) lm24_isPrim_u8
+    rfl (by decide) rfl rfl rfl (lm24A2_init_frame_imm 1 1) lm24_isPrim_u8
     (fun tf _ => lm24A2_constU8_wt 5 (by decide) tf) (by decide)
+    (hdecls_adt := lm24A2_decls_adt)
   obtain ⟨sc₁, mp₁, m₁, tf₁, hstep₁, hop₁, hst₁, _, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, hnodup₁,
     _, _, _, _, _⟩ := hpost₁ _ lm24A2_bb1_a₁
   have hsc₁ : sc₁ = ⟨5, 1⟩ := by
@@ -1751,7 +1870,7 @@ theorem lm24_union_self_copy_overlap_divergence :
     subst h; exact ⟨c₁, hmls₁⟩
   obtain ⟨⟨s₂, hs₂, hslot₂⟩, m₂, hm₂⟩ :=
     step_union_self_copy_overlap_divergence hst₁ hnodup₁ lm24A2_phase (u := 1) (bb := _)
-      rfl rfl rfl lm24_wt_U rfl hu1_mls₁ hmem₁
+      rfl rfl rfl lm24_wt_U (n := 2) (f := 0) rfl hu1_mls₁ hmem₁
   exact ⟨m₁, m₂, s₂, hstep₁, hst₁, hs₂, hslot₂, hm₂⟩
 
 def lm24InitAlloc4 :
@@ -1896,7 +2015,7 @@ theorem lm24_union_agg_smaller_overwrite_divergence :
         (lm24A2AnnealState 3 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) m₁ ∧
       stepMirFn lm24A2UnionBody
         (lm24A2AnnealState 3 1 [.uninit, lm24UU32Slot, .uninit, .uninit, .uninit]) = .step s₂ ∧
-      get? s₂.frame.locals 1 = some (.init (.aggregate 0 [.scalar ⟨0x77, 1⟩])) ∧
+      get? s₂.frame.locals 1 = some (.init (.aggregate 0 [.scalar ⟨0x77, 1⟩, .unit])) ∧
       Miri.Interpreter.Step.step
           (annealStepHooksLM2_4 lm24A2UnionBody.localDecls lm24A2UnionBody.layouts) () m₁ =
         (m₂, .ok true) ∧
@@ -1909,9 +2028,9 @@ theorem lm24_union_agg_smaller_overwrite_divergence :
       (unionAllocRaw A').extract 1 4 = #[0x03, 0x02, 0x01] := by
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24A2_init_stateRel 3).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24A2_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
-    rfl rfl rfl (lm24A2_init_frame_imm 3 1) lm24_isPrim_u32
+    rfl (by decide) rfl rfl rfl (lm24A2_init_frame_imm 3 1) lm24_isPrim_u32
     (fun tf _ => lm24A2_constU32_wt 0x01020304 (by rw [scalarModulus_eq_two_pow]; decide) tf)
-    (by decide)
+    (by decide) (hdecls_adt := lm24A2_decls_adt)
   obtain ⟨sc₁, mp₁, m₁, tf₁, hstep₁, hop₁, hst₁, _, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, hnodup₁,
     _, _, _, _, _⟩ := hpost₁ _ lm24A2_bb3_a₁
   have hsc₁ : sc₁ = ⟨0x01020304, 4⟩ := by
@@ -1930,9 +2049,9 @@ theorem lm24_union_agg_smaller_overwrite_divergence :
   | mk allocId tag _ la_old _ hprov _ _ hlive_old _ _ _ _ hlen_old _ _ _ _ _ _ _ _ _ _ hraw_old =>
   obtain ⟨⟨s₂, hs₂, hslot₂⟩, m₂, msc, A', hstep₂, hrel, hlive', hmask, hread, hhigh⟩ :=
     step_union_aggregate_smaller_overwrite_divergence hst₁ hnodup₁ lm24A2_phase (u := 1)
-      (bb := _) rfl rfl rfl lm24_wt_U rfl rfl rfl hu1_mls₁ hprov hlive_old hmem₁_copy
-      lm24_isPrim_u8 (fun tf _ => lm24A2_constU8_wt 0x77 (by decide) tf) (by decide)
-      (sc := ⟨0x77, 1⟩) rfl
+      (bb := _) rfl rfl rfl lm24_wt_U rfl (by decide) rfl rfl (f_old := 1) rfl hu1_mls₁ hprov
+      hlive_old hmem₁_copy lm24_isPrim_u8 (fun tf _ => lm24A2_constU8_wt 0x77 (by decide) tf)
+      (by decide) (sc := ⟨0x77, 1⟩) rfl (hdecls_adt := lm24A2_decls_adt)
   have hextr_eq : (unionAllocRaw la_old.allocation).extract 0 4 = unionAllocRaw la_old.allocation := by
     have hsz : (unionAllocRaw la_old.allocation).size = 4 := hlen_old
     rw [← hsz, Array.extract_size]
@@ -1984,8 +2103,9 @@ theorem lm24_repeat_union_field_steps :
           (annealStepHooksLM2_4 lm24A2UnionBody.localDecls lm24A2UnionBody.layouts) () m₁_ub) := by
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24A2_init_stateRel 4).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24A2_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
-    rfl rfl rfl (lm24A2_init_frame_imm 4 1) lm24_isPrim_u8
+    rfl (by decide) rfl rfl rfl (lm24A2_init_frame_imm 4 1) lm24_isPrim_u8
     (fun tf _ => lm24A2_constU8_wt 5 (by decide) tf) (by decide)
+    (hdecls_adt := lm24A2_decls_adt)
   obtain ⟨sc₁, mp₁, m₁, tf₁, hstep₁, hop₁, hst₁, _, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, hnodup₁,
     himm₁, _, _, _, hhw₁⟩ := hpost₁ _ lm24A2_bb4_a₁
   have hsc₁ : sc₁ = ⟨5, 1⟩ := by
@@ -2008,14 +2128,15 @@ theorem lm24_repeat_union_field_steps :
   obtain ⟨s₂, m₂, mp_arr, _, hs₂, hstep₂, hst₂, hslot_arr₂, _, _, hmp_arr, _, _, _⟩ :=
     (step_repeat_union_field_simulation hst₁ hnodup₁ lm24A2_phase (arrIdx := 3) (u := 1)
       (j := 0) (fty := lm24U8Ty) (isMove := false) (count := 3) (bb := _)
-      rfl rfl rfl rfl lm24_wf_u8Arr3 lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl lm24_wt_U rfl
-      (by decide) rfl hu1_mls₁ hmem₁ rfl (fun h => nomatch h) (fun h => nomatch h)).2.2
+      rfl rfl rfl rfl lm24_wf_u8Arr3 lm24_isPrim_u8 (w := 1) (Or.inl rfl) rfl (f := 0) lm24_wt_U rfl
+      (by decide) (by decide) rfl hu1_mls₁ hmem₁ rfl (fun h => nomatch h) (fun h => nomatch h)).2.2
       rfl rfl rfl harr_imm₁ hhw₁'.canReserveAllocId
   -- `bb5`: wider uninitialized union field `Repeat` -> UB in both
   obtain ⟨_, hpost_ub⟩ := step_union_aggregate_simulation (lm24A2_init_stateRel 5).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24A2_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
-    rfl rfl rfl (lm24A2_init_frame_imm 5 1) lm24_isPrim_u8
+    rfl (by decide) rfl rfl rfl (lm24A2_init_frame_imm 5 1) lm24_isPrim_u8
     (fun tf _ => lm24A2_constU8_wt 5 (by decide) tf) (by decide)
+    (hdecls_adt := lm24A2_decls_adt)
   obtain ⟨sc_ub, mp_ub, m₁_ub, tf_ub, hstep_ub₁, hop_ub, hst_ub, _, hframes_ub, ⟨c_ub, hmls_ub⟩,
     hmem_ub, hnodup_ub, _, _, _, _, _⟩ := hpost_ub _ lm24A2_bb5_a₁
   have hsc_ub : sc_ub = ⟨5, 1⟩ := by
@@ -2033,8 +2154,8 @@ theorem lm24_repeat_union_field_steps :
     (step_repeat_union_field_simulation hst_ub hnodup_ub lm24A2_phase (arrIdx := 3) (u := 1)
       (j := 1) (fty := lm24U32Ty) (isMove := false) (count := 3) (bb := _)
       rfl rfl rfl rfl lm24_wf_u8Arr3 lm24_isPrim_u32 (w := 4)
-      (Or.inr (Or.inr (Or.inl rfl))) rfl lm24_wt_U rfl (by decide) rfl hu1_mls_ub hmem_ub
-      rfl (fun h => nomatch h) (fun h => nomatch h)).1 (by decide) (by decide) (by decide)
+      (Or.inr (Or.inr (Or.inl rfl))) rfl (f := 0) lm24_wt_U rfl (by decide) (by decide) rfl hu1_mls_ub
+      hmem_ub rfl (fun h => nomatch h) (fun h => nomatch h)).1 (by decide) (by decide) (by decide)
   exact ⟨m₁, m₂, m₁_ub, s₂, mp_arr, hstep₁, hs₂, hstep₂, hst₂, hslot_arr₂, hmp_arr,
     hstep_ub₁, rfl, hrel_ub⟩
 
@@ -2359,18 +2480,18 @@ private theorem lm24A2_subslice_uninit_stateRel (k : Nat) :
     simp [lm24A2SubsliceBody, get?] at hdecl
 
 /-- **Witness for `step_subslice_assign_overwrite_simulation` and
-`step_subslice_elem_write_characterization`**:
+`step_subslice_elem_write_simulation`**:
 1. In-place overwrite `_2 = copy _1[0..2]` on already memory-backed `_2`
    (`lm24A2TwoArrMiri 1`) steps in lockstep (`StateRelLM2_4`) to
    `_2 = [0x0102, 0x0304]` at the same `lm24Arr2MemPlace`;
 2. Writing `_2 = copy _1[0..2]` into `.dead` `_2` (`lm24A2DeadDstMiri`) reports
    undefined behavior in both machines (`StepRelLM2_4.ub`);
 3. Projected subslice element write `_1[1..3][0 of 2] = const 0x0099_u16` on
-   initialized `_1` returns `.unsupported` in Anneal while `lean-miri` updates
+   initialized `_1` steps both machines in lockstep (`StateRelLM2_4`), updating
    `_1` in place to `[0x0102, 0x0099, 0x0506]`, and on uninitialized `_1`
    reports undefined behavior in both machines (`StepRelLM2_4.ub`). -/
 theorem lm24_subslice_overwrite_and_elem_write_witness :
-    ∃ (s_ovw : MachineState) (m_ovw m_elem : AnnealStepState)
+    ∃ (s_ovw s_elem : MachineState) (m_ovw m_elem : AnnealStepState)
       (mp₁' : Miri.Interpreter.MemPlace AnnealProv),
       stepMirFn lm24A2SubsliceBody
         (lm24A2SubsliceAnneal 1 (.init (.aggregate 0 lm21ArrElems))
@@ -2390,10 +2511,13 @@ theorem lm24_subslice_overwrite_and_elem_write_witness :
           (annealStepHooksLM2_4 lm24A2SubsliceBody.localDecls lm24A2SubsliceBody.layouts) ()
           lm24A2DeadDstMiri) ∧
       stepMirFn lm24A2SubsliceBody
-        (lm24A2SubsliceAnneal 2 (.init (.aggregate 0 lm21ArrElems)) .uninit) = .unsupported ∧
+        (lm24A2SubsliceAnneal 2 (.init (.aggregate 0 lm21ArrElems)) .uninit) = .step s_elem ∧
       Miri.Interpreter.Step.step
           (annealStepHooksLM2_4 lm24A2SubsliceBody.localDecls lm24A2SubsliceBody.layouts) ()
           (lm24A2SubsliceMiri 2) = (m_elem, .ok true) ∧
+      StateRelLM2_4 lm24A2SubsliceBody s_elem m_elem ∧
+      get? s_elem.frame.locals 1 =
+        some (.init (.aggregate 0 [.scalar ⟨0x0102, 2⟩, .scalar ⟨0x0099, 2⟩, .scalar ⟨0x0506, 2⟩])) ∧
       MemPlaceRel m_elem.machine lm21U16Arr3Ty emptyLayoutTable
         (some (.aggregate 0 [.scalar ⟨0x0102, 2⟩, .scalar ⟨0x0099, 2⟩, .scalar ⟨0x0506, 2⟩]))
         mp₁' ∧
@@ -2439,22 +2563,22 @@ theorem lm24_subslice_overwrite_and_elem_write_witness :
     subst h
     have hmp_eq : mp = witnessMemPlace := by simp [lm24A2SubsliceFrame] at hmls; exact hmls.1.symm
     subst hmp_eq; decide
-  obtain ⟨hunsup, m_elem, mp₁', hm_elem, hmp₁', _, _⟩ :=
-    (step_subslice_elem_write_characterization (lm24A2_subslice_stateRel 2).toLM2_4 lm21_nodup_arr
+  obtain ⟨s_elem, m_elem, mp₁', hs_elem, hm_elem, hst_elem, hslot_elem, hmp₁', _, _⟩ :=
+    (step_subslice_elem_write_simulation (lm24A2_subslice_stateRel 2).toLM2_4 lm21_nodup_arr
       lm24A2_subslice_phase (arrIdx := 1) (fromIdx := 1) (toIdx := 3) (off := 0) (minLen := 2)
       (fromEnd := false) (c := lm24ConstU16 0x0099) (bb := _) rfl rfl rfl lm21_wf_u16Arr3
       (sc := ⟨0x0099, 2⟩) rfl rfl (Or.inr (Or.inl rfl)) (by rw [scalarModulus_eq_two_pow]; decide)
       rfl (fun h => nomatch h) (fun h => nomatch h)).2
       lm21ArrElems rfl (Or.inl ⟨rfl, by decide, by decide⟩) (by decide) (by decide) hovf_elem
   have huninit_elem_ub :=
-    (step_subslice_elem_write_characterization (lm24A2_subslice_uninit_stateRel 2).toLM2_4
+    (step_subslice_elem_write_simulation (lm24A2_subslice_uninit_stateRel 2).toLM2_4
       lm21_nodup_empty lm24A2_subslice_phase (arrIdx := 1) (fromIdx := 1) (toIdx := 3) (off := 0)
       (minLen := 2) (fromEnd := false) (c := lm24ConstU16 0x0099) (bb := _) rfl rfl rfl
       lm21_wf_u16Arr3 (sc := ⟨0x0099, 2⟩) rfl rfl (Or.inr (Or.inl rfl))
       (by rw [scalarModulus_eq_two_pow]; decide) rfl (fun h => nomatch h) (fun h => nomatch h)).1
       (Or.inr ⟨rfl, Or.inl (by decide)⟩)
-  exact ⟨s_ovw, m_ovw, m_elem, mp₁', hs_ovw, hm_ovw, hst_ovw, hd_ovw, hmp_ovw, hdead_ub,
-    hunsup, hm_elem, hmp₁', huninit_elem_ub⟩
+  exact ⟨s_ovw, s_elem, m_ovw, m_elem, mp₁', hs_ovw, hm_ovw, hst_ovw, hd_ovw, hmp_ovw, hdead_ub,
+    hs_elem, hm_elem, hst_elem, hslot_elem, hmp₁', huninit_elem_ub⟩
 
 
 theorem lm24A2_bb6_a₁ :
@@ -2475,8 +2599,9 @@ theorem lm24_union_self_move_steps :
       StateRelLM2_4 lm24A2UnionBody (lm24A2AnnealState 6 2 [.uninit, lm24USlot, .uninit, .uninit, .uninit]) m₂ := by
   obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation (lm24A2_init_stateRel 6).toLM2_4
     lm24_nodup_empty lm24_canReserve_empty lm24A2_phase (u := 1) (bb := _) rfl rfl rfl lm24_wt_U
-    rfl rfl rfl (lm24A2_init_frame_imm 6 1) lm24_isPrim_u8
+    rfl (by decide) rfl rfl rfl (lm24A2_init_frame_imm 6 1) lm24_isPrim_u8
     (fun tf _ => lm24A2_constU8_wt 5 (by decide) tf) (by decide)
+    (hdecls_adt := lm24A2_decls_adt)
   obtain ⟨sc₁, mp₁, m₁, tf₁, hstep₁, hop₁, hst₁, hmem_sz₁, hframes₁, ⟨c₁, hmls₁⟩, hmem₁, hnodup₁,
     hcan_res₁, hptr₁, hbase₁, hlive₁, hprov₁⟩ := hpost₁ _ lm24A2_bb6_a₁
   have hsc₁ : sc₁ = ⟨5, 1⟩ := by
@@ -2683,7 +2808,9 @@ theorem lm24_union_self_move_steps :
   have hnew_w : UnionLocalRel mach₃ (lm24Decl lm24UTy) lm24A2UnionBody.layouts lm24USlot
       { (deinitFrameLocal tf_u 1 hlt_u_size).locals[1]'hlt_w₁ with value := .live (.indirect mp_w) } := by
     have hlay_u : ((deinitFrameLocal tf_u 1 hlt_u_size).locals[1]'hlt_w₁).layout = some layU := hc_w₁
-    exact .union 4 lm24U8Ty ⟨5, 1⟩ mp_w _ (by intro l hl; rw [hlay_u] at hl; exact (Option.some.inj hl).symm) lm24_wt_U hmem_w
+    exact .union 4 2 0 lm24U8Ty ⟨5, 1⟩ mp_w _
+      (by intro l hl; rw [hlay_u] at hl; exact (Option.some.inj hl).symm)
+      lm24_wt_U rfl (by decide) hmem_w
 
   have hframe₂ : FrameRelLM2_4 lm24A2UnionBody mach₃
       (lm24A2AnnealState 6 1 [.uninit, lm24USlot, .uninit, .uninit, .uninit]).frame

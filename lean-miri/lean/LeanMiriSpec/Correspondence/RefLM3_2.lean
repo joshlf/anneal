@@ -4986,7 +4986,7 @@ theorem invalidateDerefWriteBorrows_map_toBorrowEntry_tree
     | cons b₂ rest₂ =>
       simp only [invalidateDerefWriteBorrows, hget, List.map_cons] at hlook_bor ⊢
       rw [hlook_bor]; dsimp only []
-      have hproj : appendProjections e.toBorrowEntry.targetProjection .nil = .nil := rfl
+      have hproj : resolveDerefWriteFullProj locals₁ locals₁ (Value.ptr ptrVal 8) e.toBorrowEntry .nil = .nil := rfl
       have hro : e.toBorrowEntry.rangeOffset = 0 := rfl
       have hrl : e.toBorrowEntry.rangeLen = 0 := rfl
       have htl : e.toBorrowEntry.targetLocal = e.localIdx := rfl

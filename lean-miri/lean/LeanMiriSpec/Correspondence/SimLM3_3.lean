@@ -831,7 +831,8 @@ theorem sim_lm3_3_interpreter_deref_read_step
     (hanc_read : ∀ ptrVal,
       get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
       ∀ e ∈ treeMap, e.tag = ptrVal.tag →
-        treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
+        treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false)
+    (hlay_coh : PrimLayoutsCoherent body.layouts := by exact ⟨rfl, fun _ _ h => nomatch h⟩) :
     let treeMap' := derefReadNextTreeMap s.frame.locals treeMap refIdx
     TreeBorrowsRel s.memory.borrows s.memory.activeProtectors
       (basedNormalTree s.memory.borrows s.memory.activeProtectors) ∧
@@ -848,7 +849,7 @@ theorem sim_lm3_3_interpreter_deref_read_step
   dsimp only []
   have hpre := (stateRelLM3_2Tree_treeBorrowsRel htree).2
   have hstep := step_safeRef_deref_read_tree_simulation htree hphase hopKind hbb hstmt
-    hdecl_dst hdecl_ref href_ty hdst_prim himm hlive_ref hanc_read
+    hdecl_dst hdecl_ref href_ty hdst_prim himm hlive_ref hanc_read hlay_coh
   refine ⟨hpre, hstep, fun s' hs' => ?_⟩
   generalize hm :
     Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mr at hstep ⊢
@@ -918,6 +919,35 @@ private theorem evalOperand_borrows_irrel_of_wtScalar
   | constScalar _ _ _ _ _ _ _ _ _ => rfl
   | copyLocal _ _ _ _ _ => rfl
 
+private theorem writeStackThinPtrTypedDeref_of_dead
+    {locals : List LocalSlot} {entry : BorrowEntry} {ptrVal : ProvenancePtr}
+    {val : Value} {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {pointeeTyOpt accessedTyOpt : Option Ty}
+    (hdead : get? locals entry.targetLocal = some .dead) :
+    writeStackThinPtrTypedDeref locals locals entry ptrVal .nil val localDecls layouts
+      pointeeTyOpt accessedTyOpt = .ub := by
+  unfold writeStackThinPtrTypedDeref
+  dsimp only []
+  rw [hdead]
+  dsimp only []
+  cases val <;> cases Bool.and _ _ <;> rfl
+
+private theorem writeStackThinPtrTypedDeref_of_same_target
+    {locals : List LocalSlot} {e₁ e₂ : BorrowEntry} {ptrVal : ProvenancePtr}
+    {val : Value} {d₀ : LocalDecl} {ds : List LocalDecl} {layouts : LayoutTable}
+    {pointeeTyOpt accessedTyOpt : Option Ty}
+    (htl : e₁.targetLocal = e₂.targetLocal)
+    (htp : e₁.targetProjection = e₂.targetProjection) :
+    writeStackThinPtrTypedDeref locals locals e₁ ptrVal .nil val (d₀ :: ds) layouts
+      pointeeTyOpt accessedTyOpt =
+    writeStackThinPtrTypedDeref locals locals e₂ ptrVal .nil val (d₀ :: ds) layouts
+      pointeeTyOpt accessedTyOpt := by
+  rcases e₁ with ⟨_, tl₁, tp₁, _, _, _⟩
+  rcases e₂ with ⟨_, tl₂, tp₂, _, _, _⟩
+  dsimp only at htl htp
+  subst htl htp
+  rfl
+
 /-- **`sim_lm3_3_interpreter_deref_write_step`**: general 3-way lockstep of
 Anneal's `stepMirFn`, `lean-miri`'s `Miri.Interpreter.Step.step`
 (`annealStepHooks`), and `TreeBorrowsRel` on `basedNormalTree` for safe-reference
@@ -954,7 +984,8 @@ theorem sim_lm3_3_interpreter_deref_write_step
     (hanc_write : ∀ ptrVal e,
       get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
       e ∈ treeMap → e.tag = ptrVal.tag →
-      treeBorrowAncestorsChildAccessUB .write s.memory.borrows e.parentTag = false) :
+      treeBorrowAncestorsChildAccessUB .write s.memory.borrows e.parentTag = false)
+    (hlay_coh : PrimLayoutsCoherent body.layouts := by exact ⟨rfl, fun _ _ h => nomatch h⟩) :
     let treeMap' := derefWriteNextTreeMap s.frame.locals treeMap refIdx
     TreeBorrowsRel s.memory.borrows s.memory.activeProtectors
       (basedNormalTree s.memory.borrows s.memory.activeProtectors) ∧
@@ -988,7 +1019,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
         intro ptrVal e' tgtDecl hget he' htag' hdecl_t hdead
         obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
         have hl := hlive_ref ptrVal e tgtDecl hget he htag' hdecl_t hdead
-        exact ⟨hl.1, Or.inl rfl, hl.2.2⟩)
+        exact ⟨hl.1, Or.inl rfl, hl.2.2⟩) hlay_coh
     obtain ⟨tf, hframes, _, _, hfr, hcal_e, _, hprot_e, hcaller_e, _, halloc_e, _⟩ :=
       id htree.erased_rel
     obtain ⟨_, _, _, _, _, hcal_a, _, hprot_a, hcaller_a, hbor_a, halloc_a, _⟩ := id hstate_act
@@ -1046,8 +1077,9 @@ theorem sim_lm3_3_interpreter_deref_write_step
           s_act.memory.callerLocals :=
       evalOperand_borrows_irrel_of_wtScalar hop_tf s.frame.locals
         s.memory.borrows s_act.memory.borrows s.memory.globals s.memory.callerLocals
-    have hrv_s := evalRvalue_use_scalarOperand_eq hop_tf s.frame.locals s.memory
-    have hrv_a := evalRvalue_use_scalarOperand_eq hop_tf s.frame.locals s_act.memory
+    have hrv_s := evalRvalue_use_scalarOperand_eq_lm3_2 htree.erased_rel hframes hop_tf s.memory
+    have hrv_a := evalRvalue_use_scalarOperand_eq_lm3_2 htree.erased_rel hframes hop_tf s_act.memory
+    rw [hfa] at hrv_s hrv_a
     cases hop_res : evalOperand s.frame.locals op s_act.memory.borrows s_act.memory.globals
         body.layouts s_act.memory.callerLocals with
     | ub =>
@@ -1083,13 +1115,15 @@ theorem sim_lm3_3_interpreter_deref_write_step
       obtain ⟨slot_r, mls_r, _, _, hslot_r, hmls_r, _, hloc_r⟩ := hfr.lookup_local hdecl_ref
       have hslot_r_s : get? s.frame.locals refIdx = some slot_r := hslot_r
       have hwp_eq :
-          writePlaceValue s.frame.locals s.memory.borrows ⟨refIdx, .cons .deref .nil⟩ val =
-          writePlaceValue s.frame.locals s_act.memory.borrows ⟨refIdx, .cons .deref .nil⟩ val := by
+          writePlaceValue s.frame.locals s.memory.borrows ⟨refIdx, .cons .deref .nil⟩ val
+            body.localDecls body.layouts =
+          writePlaceValue s.frame.locals s_act.memory.borrows ⟨refIdx, .cons .deref .nil⟩ val
+            body.localDecls body.layouts := by
         rcases hloc_r.ref_immediate_cases href_ty ((himm_ref tf hframes) mls_r hmls_r) with
           ⟨hsr, _⟩ | ⟨hsr, _⟩ | ⟨_, _, hsr, _⟩ | ⟨ptrVal, _, hsr, hptrRel, _⟩
-        · unfold writePlaceValue; dsimp only []; rw [hslot_r_s, hsr]
-        · unfold writePlaceValue; dsimp only []; rw [hslot_r_s, hsr]
-        · unfold writePlaceValue; dsimp only []; rw [hslot_r_s, hsr]
+        · unfold writePlaceValue; cases body.localDecls <;> simp only [hslot_r_s, hsr]
+        · unfold writePlaceValue; cases body.localDecls <;> simp only [hslot_r_s, hsr]
+        · unfold writePlaceValue; cases body.localDecls <;> simp only [hslot_r_s, hsr]
         · have hsr_full : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) :=
             hslot_r_s.trans (congrArg some hsr)
           obtain ⟨_, _, _, _, _, _, ⟨e_am, he_am, htag_am, _⟩⟩ := hptrRel
@@ -1104,23 +1138,57 @@ theorem sim_lm3_3_interpreter_deref_write_step
                 some (actAllocEntry e).toBorrowEntry := by
             rw [hbor_a, ← htag_am]
             exact lookupBorrow_map_toBorrowEntry_of_nodup halloc_a.tags_nodup he_act
-          unfold writePlaceValue; dsimp only []
-          rw [hsr_full]; dsimp only []
-          rw [hlook_s, hlook_a]
-          dsimp only [ReborrowMapEntry.toBorrowEntry, actAllocEntry,
-            AllocMapEntry.toBorrowEntry, ReborrowMapEntry.toAllocMapEntry]
-          by_cases hdead : get? s.frame.locals e.localIdx = some .dead
-          · rw [hdead]
-            cases e.perm <;> rfl
-          · obtain ⟨_, ⟨hne_frz, hne_dis⟩, _⟩ :=
-              hlive_ref ptrVal e tgtDecl hsr_full he htag_am hdecl_t.1 hdead
-            cases hp : e.perm <;>
-              first
-              | exact absurd hp hne_frz
-              | exact absurd hp hne_dis
-              | rfl
+          unfold writePlaceValue
+          cases hld : body.localDecls with
+          | nil =>
+            dsimp only []
+            rw [hsr_full]; dsimp only []
+            rw [hlook_s, hlook_a]
+            dsimp only [ReborrowMapEntry.toBorrowEntry, actAllocEntry,
+              AllocMapEntry.toBorrowEntry, ReborrowMapEntry.toAllocMapEntry]
+            by_cases hdead : get? s.frame.locals e.localIdx = some .dead
+            · rw [hdead]
+              cases e.perm <;> rfl
+            · obtain ⟨_, ⟨hne_frz, hne_dis⟩, _⟩ :=
+                hlive_ref ptrVal e tgtDecl hsr_full he htag_am hdecl_t.1 hdead
+              cases hp : e.perm <;>
+                first
+                | exact absurd hp hne_frz
+                | exact absurd hp hne_dis
+                | rfl
+          | cons d₀ ds =>
+            dsimp only []
+            rw [hsr_full]; dsimp only []
+            rw [hlook_s, hlook_a]
+            dsimp only []
+            by_cases hdead : get? s.frame.locals e.localIdx = some .dead
+            · have hdead_s : get? s.frame.locals e.toBorrowEntry.targetLocal = some .dead := hdead
+              have hdead_a :
+                  get? s.frame.locals (actAllocEntry e).toBorrowEntry.targetLocal = some .dead :=
+                hdead
+              rw [writeStackThinPtrTypedDeref_of_dead hdead_a,
+                writeStackThinPtrTypedDeref_of_dead hdead_s]
+              dsimp only [ReborrowMapEntry.toBorrowEntry]
+              cases e.perm <;> rfl
+            · obtain ⟨_, ⟨hne_frz, hne_dis⟩, _⟩ :=
+                hlive_ref ptrVal e tgtDecl hsr_full he htag_am hdecl_t.1 hdead
+              have hsame :
+                  ∀ ptOpt accOpt,
+                    writeStackThinPtrTypedDeref s.frame.locals s.frame.locals e.toBorrowEntry
+                      ptrVal .nil val (d₀ :: ds) body.layouts ptOpt accOpt =
+                    writeStackThinPtrTypedDeref s.frame.locals s.frame.locals
+                      (actAllocEntry e).toBorrowEntry ptrVal .nil val (d₀ :: ds) body.layouts
+                      ptOpt accOpt :=
+                fun _ _ => writeStackThinPtrTypedDeref_of_same_target rfl rfl
+              dsimp only [ReborrowMapEntry.toBorrowEntry, actAllocEntry,
+                AllocMapEntry.toBorrowEntry, ReborrowMapEntry.toAllocMapEntry] at hsame ⊢
+              cases hp : e.perm <;>
+                first
+                | exact absurd hp hne_frz
+                | exact absurd hp hne_dis
+                | exact hsame _ _
       cases hwp_res : writePlaceValue s.frame.locals s_act.memory.borrows
-          ⟨refIdx, .cons .deref .nil⟩ val with
+          ⟨refIdx, .cons .deref .nil⟩ val body.localDecls body.layouts with
       | ub =>
         have ha_s : stepMirFn body s = .fail .ub := by
           rw [hs_step]; unfold evalStmt; dsimp only []
@@ -1141,12 +1209,12 @@ theorem sim_lm3_3_interpreter_deref_write_step
       | ok locals₂ =>
         rcases hloc_r.ref_immediate_cases href_ty ((himm_ref tf hframes) mls_r hmls_r) with
           ⟨hsr, _⟩ | ⟨hsr, _⟩ | ⟨_, _, hsr, _⟩ | ⟨ptrVal, _, hsr, hptrRel, _⟩
-        · unfold writePlaceValue at hwp_res; dsimp only [] at hwp_res
-          rw [hslot_r_s, hsr] at hwp_res; cases hwp_res
-        · unfold writePlaceValue at hwp_res; dsimp only [] at hwp_res
-          rw [hslot_r_s, hsr] at hwp_res; cases hwp_res
-        · unfold writePlaceValue at hwp_res; dsimp only [] at hwp_res
-          rw [hslot_r_s, hsr] at hwp_res; cases hwp_res
+        · unfold writePlaceValue at hwp_res
+          cases body.localDecls <;> (simp only [hslot_r_s, hsr] at hwp_res; cases hwp_res)
+        · unfold writePlaceValue at hwp_res
+          cases body.localDecls <;> (simp only [hslot_r_s, hsr] at hwp_res; cases hwp_res)
+        · unfold writePlaceValue at hwp_res
+          cases body.localDecls <;> (simp only [hslot_r_s, hsr] at hwp_res; cases hwp_res)
         · have hsr_full : get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) :=
             hslot_r_s.trans (congrArg some hsr)
           obtain ⟨_, _, _, _, _, _, ⟨e_am, he_am, htag_am, _⟩⟩ := hptrRel
@@ -1170,7 +1238,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
             rw [hs_step]; unfold evalStmt; dsimp only []
             rw [hrv_s, hop_eq.trans hop_res]; dsimp only [evalPlaceWrite]
             rw [hprot]; dsimp only []; rw [hwp_eq.trans hwp_res]
-            simp only [hwub_s]
+            simp only [hwub_s, hcaller]
             rw [hinv_s]
           have ha_a :
               stepMirFn body s_act =
@@ -1181,7 +1249,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
             rw [ha_step]; unfold evalStmt; rw [hfa]; dsimp only []
             rw [hrv_a, hop_res]; dsimp only [evalPlaceWrite]
             rw [hprot_a]; dsimp only []; rw [hwp_res]
-            simp only [hwub_a]
+            simp only [hwub_a, hcaller_a]
           rw [ha_a] at hsim; rw [ha_s]
           cases hsim with
           | step _ m' hrel_a =>
@@ -1241,13 +1309,15 @@ theorem sim_lm3_3_interpreter_reborrow_step
       get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
       e ∈ treeMap → e.tag = ptrVal.tag →
       get? s.frame.locals e.localIdx ≠ some .dead ∧
+      get? s.frame.locals e.localIdx ≠ some .uninit ∧
       ptrVal.offsetBytes = 0 ∧ e.perm ≠ .disabled ∧ ¬(e.perm = .frozen ∧ bk ≠ .shared) ∧
       (∀ tgtDecl, get? body.localDecls e.localIdx = some tgtDecl →
         tgtDecl.ty.kind = pointeeKind))
     (hanc_read : ∀ ptrVal e,
       get? s.frame.locals refIdx = some (.init (.ptr ptrVal 8)) →
       e ∈ treeMap → e.tag = ptrVal.tag →
-      treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false) :
+      treeBorrowAncestorsChildAccessUB .read s.memory.borrows e.parentTag = false)
+    (hlay_coh : PrimLayoutsCoherent body.layouts := by exact ⟨rfl, fun _ _ h => nomatch h⟩) :
     let treeMap' :=
       reborrowTreeMapNext body.localDecls body.layouts bk s.frame.locals treeMap refIdx
         s.memory.nextTag
@@ -1266,7 +1336,7 @@ theorem sim_lm3_3_interpreter_reborrow_step
   dsimp only []
   have hpre := (stateRelLM3_2Tree_treeBorrowsRel htree).2
   have hstep := step_reborrow_safeRef_tree_simulation_explicit htree hphase hbb hstmt
-    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm hanc_read
+    hdecl_dst hdecl_ref href_ty hdst_ty hpk_prim himm hlive_zero_perm hanc_read hlay_coh
   refine ⟨hpre, hstep, fun s' hs' => ?_⟩
   generalize hm :
     Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = mr at hstep ⊢
