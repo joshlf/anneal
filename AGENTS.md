@@ -7,9 +7,10 @@ in the directory you change as well.
 ## Project principles
 
 Before designing, modifying, or reviewing repository artifacts, read and
-preserve [`PRINCIPLES.md`](PRINCIPLES.md) and
-[`THREAT_MODEL.md`](THREAT_MODEL.md), which define Anneal's mission,
-correctness promise, threat model, and decision-making principles.
+preserve [`META_PRINCIPLES.md`](META_PRINCIPLES.md),
+[`PRINCIPLES.md`](PRINCIPLES.md), and [`THREAT_MODEL.md`](THREAT_MODEL.md),
+which define Anneal's governing meta-principles, mission, correctness promise,
+threat model, and decision-making principles.
 
 ## Standing rules
 
@@ -75,8 +76,9 @@ Anneal verifies Rust programs (including unsafe code) by extracting typed
 `Runtime(PostCleanup)` MIR and compiler facts via a thin `rustc_driver` wrapper
 and checking per-item `VerificationResult` theorems inside the Lean 4 kernel.
 
-Start with [`PRINCIPLES.md`](PRINCIPLES.md),
-[`THREAT_MODEL.md`](THREAT_MODEL.md), [`DESIGN.md`](DESIGN.md),
+Start with [`META_PRINCIPLES.md`](META_PRINCIPLES.md),
+[`PRINCIPLES.md`](PRINCIPLES.md), [`THREAT_MODEL.md`](THREAT_MODEL.md),
+[`DESIGN.md`](DESIGN.md),
 [`README.md`](README.md), [`docs/design.md`](docs/design.md),
 [`docs/architecture.md`](docs/architecture.md), and
 [`docs/trust-model.md`](docs/trust-model.md) for the normative project
@@ -156,8 +158,10 @@ locked and audited.
 ## Commenting in `trusted/`
 
 Because auditing `trusted/` and its explicit, pinned dependency manifest must
-suffice to verify that Anneal upholds [`PRINCIPLES.md`](PRINCIPLES.md), all code
-in `trusted/` will undergo careful human review. Human understanding is
+suffice to verify that Anneal upholds
+[`META_PRINCIPLES.md`](META_PRINCIPLES.md), [`PRINCIPLES.md`](PRINCIPLES.md),
+and [`THREAT_MODEL.md`](THREAT_MODEL.md), all code in `trusted/` will undergo
+careful human review. Human understanding is
 therefore paramount in `trusted/`: comment liberally using
 [`comment-guidelines`](skills/comment-guidelines/SKILL.md) (and its companion
 writing skills in the table above) so a human auditor can verify the design

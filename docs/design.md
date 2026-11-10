@@ -15,11 +15,12 @@ those terms. -->
 
 Anneal is a formal verification framework for Rust. It allows engineers to
 prove that Rust crates—including crates that rely on `unsafe` pointers, custom
-memory layouts, interior mutability, and inline assembly—cannot trigger
-undefined behavior (UB) and satisfy their functional specifications.
+memory layouts, interior mutability, and inline assembly—are sound (cannot
+trigger undefined behavior (UB)) and satisfy any stated specifications.
 
 Anneal is designed around three commitments that implement
-[`PRINCIPLES.md`](../PRINCIPLES.md) and
+[`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+[`PRINCIPLES.md`](../PRINCIPLES.md), and
 [`THREAT_MODEL.md`](../THREAT_MODEL.md):
 
 1. **Verify the code `rustc` actually compiles.** Anneal does not ask users to
@@ -50,17 +51,21 @@ Anneal is designed around three commitments that implement
 
 For deeper coverage of specific subsystems, see:
 
+- [`META_PRINCIPLES.md`](../META_PRINCIPLES.md) for the invariant goals
+  governing [`PRINCIPLES.md`](../PRINCIPLES.md) and
+  [`THREAT_MODEL.md`](../THREAT_MODEL.md).
 - [`PRINCIPLES.md`](../PRINCIPLES.md) for Anneal's mission, correctness
   promise, and decision-making priority order.
-- [`THREAT_MODEL.md`](../THREAT_MODEL.md) for the threat model, why verification
-  assumes an uncompromised execution environment (CI vs. local dev), in-scope
-  threats from untrusted repository contents, and the TCB audit log
-  (`anneal-tcb.lock`).
+- [`THREAT_MODEL.md`](../THREAT_MODEL.md) for the threat model, bounded
+  human-review surfaces (stated specifications and the TCB audit log, such as
+  `anneal-tcb.lock`), and explicit assumptions vs. total defenses.
 - [`docs/architecture.md`](architecture.md) for the three-stage MIR pipeline,
   `rustc` extraction lifecycle, repository layout, and toolchain upgrade
   strategy.
 - [`docs/trust-model.md`](trust-model.md) for how `trusted/` and
-  `trusted/audit/` implement and enforce [`PRINCIPLES.md`](../PRINCIPLES.md) and
+  `trusted/audit/` implement and enforce
+  [`META_PRINCIPLES.md`](../META_PRINCIPLES.md),
+  [`PRINCIPLES.md`](../PRINCIPLES.md), and
   [`THREAT_MODEL.md`](../THREAT_MODEL.md).
 
 ## End-to-end verification workflow
@@ -103,8 +108,8 @@ flowchart LR
 2. **Statement generation (`trusted/lean/`):** `Trusted.CrateTheorem Mir.crate`
    combines the captured `Mir.crate` definition with Anneal's reference
    operational semantics for Rust MIR. It asserts that every targeted function
-   satisfies its specification and existential non-vacuity obligation, and that
-   all assumptions used in the verification appear explicitly in `Mir.crate`'s
+   is sound (UB-free) and satisfies any stated specifications, and that all
+   assumptions used in the verification appear explicitly in `Mir.crate`'s
    TCB waiver ledger.
 3. **Lowering and proof discharge (`theory/` and optional `Proof/*.lean`):** Raw
    `rustc` MIR contains low-level control-flow edges and `nop` statements that
