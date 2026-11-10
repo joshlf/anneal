@@ -2417,6 +2417,90 @@ class BaselineRatchetAdversarialTest(unittest.TestCase):
                 f"state/ must not be uploaded after failed remote read: {upload_dests}",
             )
 
+    def test_successful_merge_of_flagged_baseline_clears_unmerged_marker(self) -> None:
+        """`baseline_unmerged` tracks this ratchet's configured baseline, not the baseline's own.
+
+        A baseline snapshot that itself carries `baseline_unmerged` (e.g. a
+        backup of the shared ratchet taken after one transient failure) must not
+        re-set the marker on every successful merge, or the marker can never
+        clear. The baseline's floors still govern `baseline_missing`.
+        """
+        for label, floor in (("floors_met", 4), ("floors_unmet", 50)):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                state_dir = tmp_path / "state_dir"
+                state_dir.mkdir()
+                write_initial_ledger(state_dir, active_fingerprints=[])
+                flagged = self._prior_ratchet()
+                flagged["cumulative_distinct_obs_paths"] = floor
+                flagged["baseline_missing"] = True
+                flagged["baseline_unmerged"] = True
+                baseline = tmp_path / "baseline_ratchet.json"
+                baseline.write_text(json.dumps(flagged), encoding="utf-8")
+
+                self._run_twice_with_varied_reports(
+                    state_dir, "--baseline-ratchet-uri", str(baseline)
+                )
+
+                ratchet = json.loads(
+                    (state_dir / "state" / "coverage_ratchet.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(len(ratchet["observed_paths"]), 6)
+                self.assertNotIn("baseline_unmerged", ratchet)
+                if floor > 6:
+                    self.assertIs(ratchet.get("baseline_missing"), True)
+                    self.assertEqual(ratchet["cumulative_distinct_obs_paths"], floor)
+                else:
+                    self.assertNotIn("baseline_missing", ratchet)
+
+    def test_unmerged_marker_clears_once_configured_baseline_is_absent(self) -> None:
+        """Nothing is left to merge once the configured baseline is genuinely absent.
+
+        After a transient `UNAVAILABLE` failure sets `baseline_unmerged`, a
+        later `not_found` for the same URI (absent, as in the launcher's
+        `is_absent_error`) must drop the marker instead of pinning
+        `baseline_missing` forever; floors keep governing the flag.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            write_initial_ledger(state_dir, active_fingerprints=[])
+            uri = "/remote/teams/anneal-agent/difftest/state/coverage_ratchet.json"
+            responses = [
+                subprocess.CompletedProcess([], 1, "", "UNAVAILABLE: transient backend error"),
+                subprocess.CompletedProcess(
+                    [], 1, "", f"not_found: no such file or directory: {uri}"
+                ),
+            ]
+            for run_idx, response in enumerate(responses):
+
+                def fake_run_harness(repo_root, bin_name, harness_args, json_path, i=run_idx):
+                    healthy_diag(bin_name)
+                    if bin_name == "miri-difftest":
+                        return make_healthy_miri_report(state_dir, mutator_bonus=i)
+                    return make_healthy_itree_report(state_dir, mutator_bonus=i)
+
+                with mock.patch.object(
+                    campaign, "run_harness", side_effect=fake_run_harness
+                ), mock.patch.object(
+                    campaign, "has_remote_sync", return_value=True
+                ), mock.patch.object(
+                    campaign, "run_remote_sync", return_value=response
+                ), mock.patch("sys.stderr", io.StringIO()):
+                    rc = run_main(state_dir, "--baseline-ratchet-uri", uri)
+                self.assertEqual(rc, campaign.EXIT_SUCCESS)
+                ratchet = json.loads(
+                    (state_dir / "state" / "coverage_ratchet.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                if run_idx == 0:
+                    self.assertIs(ratchet.get("baseline_missing"), True)
+
+            self.assertNotIn("baseline_unmerged", ratchet)
+            self.assertNotIn("baseline_missing", ratchet)
+
 
 if __name__ == "__main__":
     unittest.main()
