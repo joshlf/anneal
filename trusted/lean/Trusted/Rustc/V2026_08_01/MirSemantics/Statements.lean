@@ -2624,10 +2624,20 @@ Truncate a resolved local projection path at the first `.field` projection whose
 container type resolves to a `FieldsShape.union` layout (`isUnionLayout`).
 
 Because all fields of a Rust `union` alias at byte offset `0` (`FieldsShape::Union`),
-a projected write into `_u.f` (or `(s.u).f` inside an outer struct/tuple `s`)
-overlaps the entire union sub-place (`[]` for `_u.f`, `[.field idxU unionTy]` for
-`(s.u).f`), invalidating or protector-conflicting with borrows of any sibling
-union field while preserving borrows of disjoint outer struct/tuple/array fields.
+a projected write into `_u.f` (or `(s.u).f` inside an outer struct/tuple `s`) is
+conservatively treated as overlapping the entire union sub-place (`[]` for
+`_u.f`, `[.field idxU unionTy]` for `(s.u).f`), invalidating or
+protector-conflicting with borrows of any sibling union field while preserving
+borrows of disjoint outer struct/tuple/array fields.
+
+This is exact for borrows of whole sibling fields of nonzero size (every union
+field starts at offset `0`, so any nonzero-sized write and any nonzero-sized
+sibling field share byte `0`). It over-approximates Miri's byte-range Tree
+Borrows access when the written or borrowed sub-place covers bytes disjoint from
+the other (for example a write to `_u.f.g` versus a borrow of `_u.f.h`, or a
+1-byte write to `_u.a` versus a borrow of byte `1` of a wider sibling field) and
+for zero-sized union fields: Anneal then disables, or reports a protector
+conflict on, a borrow that Miri's access leaves untouched.
 
 Reference (`compiler/rustc_abi/src/lib.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -2726,6 +2736,13 @@ non-union struct/tuple/enum/array writes, or when `localDecls` / `layouts` is
 empty), returns the dynamic-index-resolved projection path unchanged. When `true`,
 truncates at the enclosing union container via `truncateTyProjAtUnion` so writes
 to one union field overlap borrows of all sibling union fields.
+
+Scope: this truncation applies only to direct (non-dereferencing) projected local
+writes in `evalStmt`. Dereferencing writes (`invalidateDerefWriteBorrows` and
+`derefWriteTreeUB`, which compare the post-dereference projection with
+`projectionsOverlap`) are not truncated, so a write `(*p).f = v` into a union
+pointee does not yet disable, or report a protector conflict on, borrows of
+sibling union fields.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>

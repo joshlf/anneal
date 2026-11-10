@@ -77,9 +77,11 @@ local holding a pointer, so no state reached by taking an address satisfies it.
    with corresponding results. Remaining boundaries: `.disabled` parent borrow
    on `BinOp.Offset` (`step_binOp_offset_disabled_divergence`: Anneal raises
    `.ub` while `lean-miri` steps) and provenance-tracked pointer comparisons,
-   where Anneal orders stack addresses by `Local` index while `lean-miri` orders
-   by `AllocId` (agreeing on same-local comparisons and `.eq`/`.ne`, diverging on
-   cross-local ordering and threshold pointer-vs-integer comparisons).
+   where both machines step but the theorems do not relate the results: Anneal
+   orders stack addresses by `Local` index on 64-KiB pages while `lean-miri`
+   orders by `AllocId` (informally agreeing on same-local comparisons and on
+   in-page `.eq`/`.ne`, and able to disagree on cross-local ordering, threshold
+   pointer-vs-integer comparisons, and offsets of at least 64 KiB).
 4. **`CastKind.PtrToPtr` & Exposure Casts (`step_cast_ptrToPtr_simulation`,
    `step_cast_ptrToPtr_move_simulation`, `step_cast_ptrToPtr_scalar_correspondence`,
    `step_cast_ptrToPtr_move_scalar_correspondence`,
@@ -18461,15 +18463,17 @@ comparisons (`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`)
 2. `lean-miri`'s `Miri.Interpreter.Step.step` (`annealStepHooks`) stores
    `.fromScalarInt (.ofBool b)`, computed on `annealStackBaseAddr` addresses.
 
-The theorem does NOT relate `aRes` and `b` because the two address models
-differ: Anneal orders stack local addresses monotonically by MIR `Local` index
-(`(stackLocalAddrPageBase + localIdx) * 65536 + off`), whereas `lean-miri`
-assigns `annealStackBaseAddr allocId + off` (`(allocId.value <<< 32) + off`,
-ordered by allocation creation order). Consequently, same-local comparisons
-(`e₁.localIdx = e₂.localIdx`) and cross-local `.eq`/`.ne` agree (`aRes = b`),
-whereas cross-local ordering comparisons (`.lt`/`.le`/`.gt`/`.ge` when local
-index order differs from `AllocId` order) and pointer-vs-integer comparisons
-genuinely diverge (`aRes ≠ b`). -/
+The theorem does NOT relate `aRes` and `b`; it only establishes that both
+machines step. The two address models differ: Anneal places stack local
+`localIdx` on its own 64-KiB page (`(stackLocalAddrPageBase + localIdx) * 65536
++ off`, ordered by MIR `Local` index), whereas `lean-miri` uses
+`annealStackBaseAddr allocId + off` (`(allocId.value <<< 32) + off`, ordered by
+allocation creation order). Informally (not proven here): comparisons between
+pointers into the same local, and cross-local `.eq`/`.ne` while every offset
+stays below `65536`, should agree; cross-local ordering comparisons
+(`.lt`/`.le`/`.gt`/`.ge` when `Local` index order differs from `AllocId` order),
+pointer-vs-integer comparisons, and offsets reaching into the next local's
+64-KiB page (locals of at least 64 KiB) can disagree (`aRes ≠ b`). -/
 theorem step_rawPtr_cmp_ptr_divergence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -18822,11 +18826,13 @@ provenance-less 8-byte integer scalar `.init (.scalar sc₁)` (such as
 `.init (.ptr ptrVal₂ 8)`: Stage-1 closed the `MirStepNode.unsupported` gap, so
 BOTH machines step normally (Anneal storing `boolToScalar aRes` on its canonical
 address model, `lean-miri` storing `.fromScalarInt (.ofBool b)` on
-`annealStackBaseAddr` addresses). Because Anneal places stack locals at
-`(stackLocalAddrPageBase + localIdx) * 65536 + off` while `lean-miri` places
-them at `annealStackBaseAddr allocId + off`, `aRes` and `b` agree on null
-equality (`0 == p` / `0 != p`) and `0 < p`, but genuinely diverge (`aRes ≠ b`)
-for integer thresholds lying between the two machines' stack base addresses. -/
+`annealStackBaseAddr` addresses). The theorem does NOT relate `aRes` and `b`.
+Informally (not proven here): because both models place stack pointers at
+nonzero addresses (Anneal at `(stackLocalAddrPageBase + localIdx) * 65536 + off`,
+`lean-miri` at `annealStackBaseAddr allocId + off`), null comparisons
+(`0 == p`, `0 != p`, `0 < p`) should agree, whereas comparisons against integer
+thresholds lying between the two machines' stack addresses can disagree
+(`aRes ≠ b`). -/
 theorem step_rawPtr_cmp_scalar_ptr_divergence
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
