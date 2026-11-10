@@ -127,6 +127,7 @@ class PrivateDecl:
         "decl_indent",
         "path",
         "_rename_map",
+        "body_keys",
     )
 
     def __init__(
@@ -153,6 +154,10 @@ class PrivateDecl:
         self.decl_indent = decl_indent
         self.path = path
         self._rename_map: dict[str, str] | None = None
+        # `(key1, key2)` of a sibling definition's body (`_body_key1` / `_body_key2`),
+        # computed when the sibling is lexed and persisted in the sibling index, so a
+        # later process can compare bodies without re-reading the sibling.
+        self.body_keys: tuple[Any, Any] | None = None
 
     def ensure_norm_sig(self) -> str:
         if not self.norm_sig and self.raw_header:
@@ -295,8 +300,9 @@ def strip_lean_comments_and_strings(text: str, *, keep_strings: bool = False) ->
             pos = cur
             continue
 
-        # Raw string literal `r"..."` / `r#"..."#` and quote character literals `'"'` / `'\"'`
-        if nxt > 0 and text[nxt - 1] in "#r'":
+        # Raw string literal `r"..."` / `r#"..."#` and quote character literals `'"'` /
+        # `'\"'` (the character before the `"` is then `#`, `r`, `'` or a backslash).
+        if nxt > 0 and text[nxt - 1] in "#r'\\":
             h = nxt
             while h > 0 and text[h - 1] == "#":
                 h -= 1
@@ -393,9 +399,17 @@ class _LineCounter:
 # Leading literal prefixes (`simp`, `unfold`, `delta`, `set_option`, `private`)
 # let CPython's `sre` skip ahead with a literal search instead of trying every offset.
 # Cold-path regexes are compiled lazily on first use to keep fresh hook imports fast.
+#
+# Tactic suffix after `simp` (`dsimp` never accepts `a` / `_all` / `_arith` / `_rw`).
 _SIMP_VARIANT_TUPLE: tuple[str, ...] = ("_all_arith", "_all", "_arith", "_rw", "a")
+# Identifier boundaries follow Lean 4 (`\w` is Unicode-aware; `'`, `!`, `?` continue
+# an identifier; a `.` before or after means the match is only part of a longer name).
 _IDENT_BEFORE = r"(?<![\w'!?.])"
 _IDENT_AFTER = r"(?![\w'!?.])"
+# Optional namespace qualification (`Trusted.Sequence.length`,
+# `Anneal.Rustc.V2026_06_01.wpMirExecSym`) and optional unfolding-equation suffixes
+# (`.eq_def`, `.eq_unfold`, `.eq_<n>`) are part of the flagged symbol; any other
+# `.`-suffix (a lemma living in the symbol's namespace) is not.
 _QUAL_PREFIX = r"(?:[^\W\d][\w'!?]*\.)*"
 _UNFOLD_EQ_SUFFIX = r"(?:\.(?:eq_def|eq_unfold|eq_\d+))?"
 _FORBIDDEN_SIMP_SYM_RE = re.compile(
@@ -416,12 +430,16 @@ _EQ_SUFFIX_AT_RE = re.compile(r"\.(?:eq_def|eq_unfold|eq_\d+)(?![\w'!?.])")
 _PROFILER_THRESHOLD_RE = re.compile(
     r"set_option\s+trace\.profiler\.threshold\s+(\d+(?:_\d+)*)(?![\w'!?])"
 )
+# Declaration names: dotted Lean 4 identifiers (`MirStepStar.mono`, `get?_set?_ne`)
+# or `«guillemet-quoted»` names. Modifiers may sit between `private` and the keyword.
 _DECL_NAME = r"[^\W\d][\w'!?]*(?:\.[^\W\d][\w'!?]*)*|«[^»\n]*»"
 _PRIVATE_LIT_RE = re.compile(
     r"private\s+(?:(?:noncomputable|partial|unsafe|nonrec)\s+)*(theorem|lemma|def)\s+("
     + _DECL_NAME
     + r")"
 )
+# A line starting in column 0 begins a new top-level command; indented commands inside
+# an indented `section` / `namespace` are recognised by `_DECL_BOUNDARY_RE`.
 _TOPLEVEL_LINE_RE = re.compile(r"\n(?=\S)")
 _DECL_BOUNDARY_RE: re.Pattern[str] | None = None
 _EQN_ALT_LINE_RE: re.Pattern[str] | None = None
@@ -628,6 +646,7 @@ def _step_back_simp_header_start(stripped: str, open_bracket: int) -> int:
                     depth -= 1
                 cur -= 1
             continue
+        # Step back over an identifier/flag (`only`, `+arith`, `simp_all_arith?`)
         end_tok = cur
         while cur > floor and (
             _is_ident_char(stripped[cur - 1]) or stripped[cur - 1] in ".+-"
@@ -925,6 +944,8 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
     global _EQN_ALT_LINE_RE, _MATCH_OR_FUN_RE, _HDR_TOKEN_RE
     n = len(stripped)
     max_end = min(n, start_pos + 2500)
+    # Fast C `str.find(":=")` path before running regexes across all 2,500 chars:
+    # check boundaries only on the short `[start_pos:first_ce]` slice when unambiguous.
     first_ce = stripped.find(":=", start_pos, max_end)
     if first_ce != -1:
         cand0 = stripped[start_pos:first_ce]
@@ -948,7 +969,10 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
         _HDR_TOKEN_RE = re.compile(r"«[^»\n]*»|[()\[\]{}]|:=|:|(?<![\w'!?.])where(?![\w'!?])")
     eqn_end = False
     m_alt = _EQN_ALT_LINE_RE.search(stripped, start_pos, limit)
-    if m_alt is not None and _MATCH_OR_FUN_RE.search(stripped, start_pos, m_alt.start()) is None:  # type: ignore[union-attr]
+    if (
+        m_alt is not None
+        and _MATCH_OR_FUN_RE.search(stripped, start_pos, m_alt.start()) is None  # type: ignore[union-attr]
+    ):
         eqn_end = True
         limit = m_alt.start()
     if "«" not in stripped[start_pos:limit]:
@@ -968,6 +992,7 @@ def _decl_header_span(stripped: str, start_pos: int, decl_indent: int = 0) -> tu
                 return (candidate, colon_eq + 2) if ":" in candidate else ("", -1)
             search_pos = colon_eq + 2
 
+    # Token walk over guillemet names, brackets, `:=`, `:` and `where` only.
     depth = 0
     colon_pos = -1
     for tm in _HDR_TOKEN_RE.finditer(stripped, start_pos, limit):  # type: ignore[union-attr]
@@ -1084,6 +1109,33 @@ def _apply_rename_to_code_segment(segment: str, rename_map: dict[str, str]) -> s
     return " ".join(out)
 
 
+def _body_key1(r: str, st: str, b: int, e: int) -> tuple[int, ...] | None:
+    """Cheapest body key: punctuation counts on the comment/string-blanked body
+    (invariant under binder renaming and layout); `None` for an empty body."""
+    if b >= e:
+        return None
+    cand = (st.count(",", b, e), st.count("=", b, e), st.count(".", b, e))
+    if cand != (0, 0, 0) or r[b:e].strip():
+        return cand
+    return None
+
+
+def _body_key2(r: str, st: str, b: int, e: int, has_binders: bool) -> tuple[int, ...] | None:
+    """Finer body key, a CRC so it can be persisted. With header binders: the
+    blanked body with identifiers collapsed to `_` (rename-invariant). Without:
+    the comment-stripped body with string literals (no renaming needed). Whitespace
+    is dropped in both."""
+    import zlib
+
+    if has_binders:
+        comp = (
+            _BODY_IDENT_RE.sub("_", st[b:e]).encode("utf-8", "surrogatepass").translate(None, _WS_BYTES)
+        )
+        return (1, len(comp), zlib.crc32(comp))
+    comp = _strip_comments_fast(r[b:e]).encode("utf-8", "surrogatepass").translate(None, _WS_BYTES)
+    return (0, len(comp), zlib.crc32(comp)) if comp else None
+
+
 def _strip_comments_fast(raw_slice: str) -> str:
     if "--" not in raw_slice and "/-" not in raw_slice:
         return raw_slice
@@ -1179,6 +1231,8 @@ def _decl_body_key(
     return " ".join(parts)
 
 
+# `_normalize_signature` is pure; memoizing it lets the before/after scans of one
+# edit (and repeated scans in one process) normalize each distinct header once.
 _NORM_SIG_CACHE: dict[str, tuple[str, dict[str, str]]] = {}
 
 
@@ -1307,10 +1361,14 @@ _SIBLING_PRIVATE_CACHE: dict[str, tuple[int, int, int, list[PrivateDecl]]] = {}
 _DIR_LEAN_FILES_CACHE: dict[str, tuple[int, list[Path]]] = {}
 _FILE_TEXTS_CACHE: dict[str, tuple[int, int, str, str]] = {}
 
+# Each hook invocation is a fresh process, so sibling declarations are persisted per
+# directory (`sibling_index_path`) instead of re-reading and re-lexing every sibling
+# `.lean` file on every check. Counts stay in the small per-file count cache, which
+# keeps at most `COUNT_CACHE_MAX_FILES` entries (least recently checked dropped).
 COUNT_CACHE_MAX_FILES = 1024
 # Bump whenever rule semantics, signature normalization, or index layout change:
 # count entries and sibling indexes written under another version are ignored.
-CACHE_FORMAT_VERSION = 4
+CACHE_FORMAT_VERSION = 5
 
 
 def sibling_index_path(cache_path: str | Path, directory: str | Path) -> Path:
@@ -1338,6 +1396,9 @@ def _index_entry(st: os.stat_result, file_crc: int, decls: list[PrivateDecl]) ->
                 list(d.sig_fp),
                 d.decl_indent,
                 d.raw_header if d.kind == "def" else "",
+                [list(k) if k is not None else None for k in d.body_keys]
+                if d.body_keys is not None
+                else None,
             ]
             for d in decls
         ],
@@ -1355,10 +1416,9 @@ def _decls_from_index_entry(
         file_crc = int(entry[2])
         out: list[PrivateDecl] = []
         for rec in entry[3]:
-            if len(rec) == 8:
-                kind, name, line, body_start, norm_sig, fp, decl_indent, raw_header = rec
-            else:
+            if len(rec) != 9:
                 return None
+            kind, name, line, body_start, norm_sig, fp, decl_indent, raw_header, bkeys = rec
             if kind not in ("theorem", "lemma", "def"):
                 return None
             out.append(
@@ -1375,6 +1435,11 @@ def _decls_from_index_entry(
                     decl_indent=int(decl_indent),
                 )
             )
+            if bkeys is not None:
+                out[-1].body_keys = (
+                    tuple(int(x) for x in bkeys[0]) if bkeys[0] is not None else None,
+                    tuple(int(x) for x in bkeys[1]) if bkeys[1] is not None else None,
+                )
         return file_crc, out
     except (TypeError, ValueError, IndexError, KeyError):
         return None
@@ -1421,7 +1486,7 @@ def _extract_sibling_private_decls_fast(
     except OSError:
         return []
     file_crc = _text_crc(raw)
-    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size and cached[2] == file_crc:
+    if cached is not None and cached[:3] == (st.st_mtime_ns, st.st_size, file_crc):
         decls = cached[3]
         if persisted is not None and not racy:
             persisted[key] = _index_entry(st, file_crc, decls)
@@ -1435,6 +1500,15 @@ def _extract_sibling_private_decls_fast(
         decls = extract_private_decls(
             stripped, file_label=sibling_path.name, lazy_norm=True, file_path=key
         )
+        for d in decls:
+            if d.kind == "def" and d.body_start >= 0:
+                end = _next_decl_boundary(stripped, d.body_start, len(stripped), d.decl_indent)
+                d.body_keys = (
+                    _body_key1(raw, stripped, d.body_start, end),
+                    _body_key2(
+                        raw, stripped, d.body_start, end, "_v0" in d.ensure_norm_sig()
+                    ),
+                )
     _SIBLING_PRIVATE_CACHE[key] = (st.st_mtime_ns, st.st_size, file_crc, decls)
     if persisted is not None and not racy:
         persisted[key] = _index_entry(st, file_crc, decls)
@@ -1527,12 +1601,17 @@ def _load_sibling_index(index_file: Path) -> dict[str, Any]:
 
 
 def _save_sibling_index(index_file: Path, index: dict[str, Any]) -> None:
+    # Forget files that no longer exist (renamed or deleted siblings).
     for key in [k for k in index if not os.path.isfile(k)]:
         del index[key]
     _save_cache(index_file, index)
 
 
 def _sig_class(kind: str) -> str:
+    # A theorem's statement is its whole content (proof irrelevance), so two private
+    # theorems/lemmas with the same normalized statement are redundant. Two defs of
+    # the same type are only redundant when their bodies coincide too (`maxU8 : Nat`
+    # and `maxU16 : Nat` are different definitions).
     return "def" if kind == "def" else "prop"
 
 
@@ -1542,6 +1621,9 @@ def _duplicate_private_findings(
     raw: str,
     stripped: str,
 ) -> list[ProofHealthFinding]:
+    # Only run full alpha-renaming signature normalization on declarations whose
+    # 4-tuple structural fingerprint `(colons, parens, braces, equals)` collides
+    # with at least one other local or sibling declaration.
     fp_counts: dict[tuple[int, int, int, int], int] = {}
     has_legacy_decls = False
     for d in ext_decls + local_decls:
@@ -1586,41 +1668,32 @@ def _duplicate_private_findings(
     def key1(d: PrivateDecl, local: bool) -> BodyKey | None:
         k = id(d)
         if k not in key1_cache:
-            key: BodyKey | None = None
-            span = body_span(d, local)
-            if span is not None:
-                r, st, b, e = span
-                if b < e:
-                    cand = (st.count(",", b, e), st.count("=", b, e), st.count(".", b, e))
-                    if cand != (0, 0, 0) or r[b:e].strip():
-                        key = cand
-            key1_cache[k] = key
+            if not local and d.body_keys is not None:
+                key1_cache[k] = d.body_keys[0]
+            else:
+                span = body_span(d, local)
+                key1_cache[k] = _body_key1(*span) if span is not None else None
         return key1_cache[k]
 
     def key2(d: PrivateDecl, local: bool, has_binders: bool) -> BodyKey | None:
         k = id(d)
         if k in key2_cache:
             return key2_cache[k]
+        if not local and d.body_keys is not None:
+            key2_cache[k] = d.body_keys[1]
+            return d.body_keys[1]
         span = body_span(d, local)
         if span is None:
             key2_cache[k] = None
             return None
         r, st, b, e = span
-        if not has_binders:
-            noc = _strip_comments_fast(r[b:e])
-            comp = noc.encode("utf-8", "surrogatepass").translate(None, _WS_BYTES)
-            res: BodyKey | None = (0, len(comp), hash(comp)) if comp else None
-            key2_cache[k] = res
-            return res
-        if budget[0] <= 0:
-            return None
-        budget[0] -= e - b
-        comp = (
-            _BODY_IDENT_RE.sub("_", st[b:e])
-            .encode("utf-8", "surrogatepass")
-            .translate(None, _WS_BYTES)
-        )
-        res = (1, len(comp), hash(comp))
+        if has_binders:
+            # The identifier-collapsing regex is the costly step: budgeted (a
+            # skipped definition stays pending and is retried, never dropped).
+            if budget[0] <= 0:
+                return None
+            budget[0] -= e - b
+        res = _body_key2(r, st, b, e, has_binders)
         key2_cache[k] = res
         return res
 
@@ -1641,6 +1714,10 @@ def _duplicate_private_findings(
         exact_keys[k] = v
         return v
 
+    # Per signature, definitions are indexed level by level: `key1 -> [pending, by_key2]`
+    # and `key2 -> [pending, by_exact]`. A definition enters a deeper level (and pays
+    # for its finer key) only once a second definition reaches the same node, so
+    # every lookup is a dictionary probe and no pair is compared twice.
     DefIndex = dict[BodyKey, list[Any]]
 
     def match_in(d: PrivateDecl, index: DefIndex, local: bool, has_binders: bool) -> PrivateDecl | None:
@@ -1705,6 +1782,8 @@ def _duplicate_private_findings(
         k = sig_key(d)
         if k is not None:
             ext_by_sig.setdefault(k, []).append(d)
+    # Sibling definitions of one signature, indexed on first use (so sibling texts are
+    # only re-read for signatures a local definition shares).
     ext_def_indexes: dict[tuple[str, str], DefIndex] = {}
 
     def ext_def_index(k: tuple[str, str]) -> DefIndex:
@@ -1794,9 +1873,11 @@ def scan_lean_text(
     line_of = _LineCounter(stripped)
     findings: list[ProofHealthFinding] = []
 
+    # Rules 1-3 need a simp-family tactic, `unfold` or `delta` somewhere; rule-1
+    # symbols can only sit in a simp list after the first `simp`.
     first_simp = stripped.find("simp", 0)
-    has_unfold_kw = first_simp != -1 or "unfold" in stripped or "delta" in stripped
-    if has_unfold_kw:
+    has_tactic_kw = first_simp != -1 or "unfold" in stripped or "delta" in stripped
+    if has_tactic_kw:
         active_kws, has_mir_body, has_bitwise = _active_simp_keywords(
             stripped,
             simp_start=(first_simp + 4) if first_simp != -1 else 0,
@@ -1815,6 +1896,9 @@ def scan_lean_text(
             base_offset = open_idx + 1
 
             # Rule 1: `dsimp_forbidden_sym`
+            # Purely syntactic over unfolded simp-lemma entries, with no location- or
+            # neighbour-based exemptions; only entries that keep the symbol folded are
+            # skipped: erasures `-sym`, reverse rewrites `← sym`, arguments `[f sym]`.
             if "wpMirExecSym" in content or "Sequence.length" in content:
                 for sm in _FORBIDDEN_SIMP_SYM_RE.finditer(content):
                     if not _is_simp_unfold_entry(content, sm.start(), sm.end()):
@@ -2378,6 +2462,8 @@ def evaluate_post_edit_proof_health(
     replacements. When none is available (an overwrite or a deletion of a file never
     seen before), the current counts become the baseline and no increase is claimed.
     """
+    # Absolute (not symlink-resolved) path, so sibling-index keys do not depend on the
+    # working directory of the hook process.
     path = Path(os.path.abspath(target_file))
     try:
         resolved_key = str(path.resolve())
@@ -2390,6 +2476,8 @@ def evaluate_post_edit_proof_health(
     cpath = Path(cache_path) if cache_path is not None else default_cache_path()
     cache = _load_cache(cpath)
 
+    # Sibling declarations only matter when the edited file has private declarations
+    # after the edit (a count can only rise if they exist in `after_text`).
     sibling_decls: list[PrivateDecl] = []
     if scan_siblings and "private" in after_text:
         index_file = sibling_index_path(cpath, path.parent)
@@ -2438,6 +2526,8 @@ def evaluate_post_edit_proof_health(
         return {rule: _safe_int(cached_entry.get(rule, 0), 0) for rule in ALL_RULES}
 
     write_args = _write_file_args(payload)
+    # Claude Code reports the exact pre-edit text (`tool_response.originalFile`) for
+    # `Edit` / `MultiEdit`, and `type: "create"` when `Write` created the file.
     tool_response = payload.get("tool_response") if isinstance(payload, dict) else None
     if before_text is None and isinstance(tool_response, dict):
         original = tool_response.get("originalFile")
@@ -2452,6 +2542,7 @@ def evaluate_post_edit_proof_health(
         if write_args.get("Append") and isinstance(content, str) and after_text.endswith(content):
             before_text = after_text[: len(after_text) - len(content)]
         elif not write_args.get("Overwrite") and not write_args.get("Append"):
+            # `write_file` without `Overwrite` / `Append` only succeeds on a new file.
             before_text = ""
 
     spans: list[tuple[int, int]] = []
@@ -2472,6 +2563,8 @@ def evaluate_post_edit_proof_health(
         before_counts = {rule: _safe_int(cached_entry.get(rule, 0), 0) for rule in ALL_RULES}
         spans = _line_spans_of_insertions(after_text, _replacement_strings(payload), payload)
     elif _is_pure_deletion(payload):
+        # Deleting text cannot add an occurrence; without a cached baseline the
+        # current counts become the baseline.
         before_counts = dict(after_counts)
     else:
         ambiguous_before = _invert_ambiguous_without_cache(after_text, payload)
@@ -2481,6 +2574,8 @@ def evaluate_post_edit_proof_health(
             before_text = ambiguous_before
             spans = _line_spans_of_insertions(after_text, _replacement_strings(payload), payload)
         else:
+            # Unknown pre-edit state (e.g. overwriting an unseen file): record the
+            # baseline without claiming any increase.
             before_counts = dict(after_counts)
 
     entry: dict[str, int] = dict(after_counts)
@@ -2489,7 +2584,7 @@ def evaluate_post_edit_proof_health(
     entry["_sib"] = sib_sig
     entry["_ver"] = CACHE_FORMAT_VERSION
     cache.pop(resolved_key, None)
-    cache[resolved_key] = entry
+    cache[resolved_key] = entry  # most recently checked last
     for stale in list(cache)[: max(0, len(cache) - COUNT_CACHE_MAX_FILES)]:
         del cache[stale]
     _save_cache(cpath, cache)
@@ -2507,6 +2602,7 @@ def evaluate_post_edit_proof_health(
         }
 
     if before_findings is None and before_text is not None:
+        # Counts came from the cache; attribution may need the old occurrences.
         before_findings = _scan(before_text)
     after_lines = after_text.split("\n")
     before_lines = before_text.split("\n") if before_text is not None else None
@@ -2751,6 +2847,8 @@ def compute_unbatched_tool_latencies(
     raw_batches: dict[Any, list[dict[str, Any]]] = {}
     long_marked_batches: set[Any] = set()
     auto_batch_seq = 0
+    # Calls of the latest planner step still waiting for their result steps, as
+    # `(tool, batch_key, number_of_calls_in_that_step)`.
     pending: list[tuple[str, Any, int]] = []
 
     def _record(tool: str, dur: float, batch_key: Any, src: dict[str, Any], batch_size: int = 1) -> None:
@@ -2795,12 +2893,16 @@ def compute_unbatched_tool_latencies(
 
         tname = _tool_name(item)
         if tname is None:
+            # Jetski result step: pop the matching pending call in lockstep even when
+            # it has no `Completed At` (a backgrounded `RUNNING` call or an error), so
+            # later siblings of the batch are never shifted onto the wrong tool name.
             if pending and _is_jetski_tool_result_step(item):
                 ptool, pbatch, psize = pending.pop(0)
                 dur = _extract_duration_ms(item)
                 if dur is not None:
                     _record(ptool, dur, pbatch, item, psize)
                 elif _is_backgrounded_long_step(item):
+                    # The call outlived the tool's synchronous wait: a long call.
                     long_marked_batches.add(pbatch)
             continue
 

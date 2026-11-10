@@ -144,6 +144,20 @@ class TestStripLeanCommentsAndStrings(unittest.TestCase):
             [(R1, 3, "wpMirExecSym"), (R1, 7, "Trusted.Sequence.length")],
         )
 
+    def test_escaped_quote_character_literal(self) -> None:
+        # `'\"'` is a character literal (escaped double quote): the backslash, not a
+        # quote, precedes the `"`, which must not open a string swallowing lines 2-3.
+        src = (
+            "def c : Char := '\\\"'\n"
+            "theorem t : True := by\n"
+            "  simp [wpMirExecSym]\n"
+            'def s := "x"\n'
+        )
+        self.assertEqual(src.splitlines()[0], "def c : Char := '\\\"'")
+        self.assertEqual(scan(src), [(R1, 3, "wpMirExecSym")])
+        kept = proof_health.strip_lean_comments_and_strings(src, keep_strings=True)
+        self.assertEqual(kept, src)
+
     def test_keep_strings_blanks_only_comments(self) -> None:
         src = 'def x := "keep me" -- drop me\n/- drop too -/ def y := r"also kept"\n'
         kept = proof_health.strip_lean_comments_and_strings(src, keep_strings=True)
@@ -947,6 +961,63 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
             finally:
                 proof_health.scan_lean_text = original_scan
+
+    def test_persisted_body_keys_spare_sibling_reads(self) -> None:
+        # Sibling definition bodies are compared through body keys stored in the
+        # sibling index; the sibling text is read again only when keys match.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            cache_file = tmp_dir / "cache.json"
+            sibling = tmp_dir / "Sib.lean"
+            sibling.write_text(
+                'private def tyA : Ty := { kind := .adt "A" [], layoutIdx := 0 }\n'
+                'private def tyB : Ty := { kind := .adt "B" [], layoutIdx := 0 }\n',
+                encoding="utf-8",
+            )
+            settle(sibling)
+            target = tmp_dir / "Tgt.lean"
+            target.write_text(
+                'private def tyC : Ty := { kind := .adt "C" [], layoutIdx := 0 }\n',
+                encoding="utf-8",
+            )
+            clear_in_process_caches()
+            proof_health.check_post_edit_proof_health(target, None, cache_path=cache_file)
+            index = json.loads(
+                proof_health.sibling_index_path(cache_file, tmp_dir).read_text(encoding="utf-8")
+            )
+            records = index[str(sibling)][3]
+            self.assertTrue(all(rec[8] is not None for rec in records))
+
+            reads: list[str] = []
+            original_texts = proof_health._file_texts
+
+            def counting_texts(path_str):
+                reads.append(path_str)
+                return original_texts(path_str)
+
+            proof_health._file_texts = counting_texts
+            try:
+                clear_in_process_caches()
+                self.assertEqual(
+                    proof_health.check_post_edit_proof_health(target, None, cache_path=cache_file),
+                    "",
+                )
+                self.assertEqual(reads, [])
+
+                clear_in_process_caches()
+                target.write_text(
+                    'private def tyC : Ty := { kind := .adt "C" [], layoutIdx := 0 }\n'
+                    'private def tyA2 : Ty := { kind := .adt "A" [], layoutIdx := 0 }\n',
+                    encoding="utf-8",
+                )
+                fb = proof_health.check_post_edit_proof_health(
+                    target, {"toolCall": {"args": {"Path": str(target)}}}, cache_path=cache_file
+                )
+                self.assertIn("`duplicate_private_lemma` (+1 at L2)", fb)
+                self.assertIn("same normalized signature and body as `private def tyA`", fb)
+                self.assertEqual(reads, [str(sibling)])
+            finally:
+                proof_health._file_texts = original_texts
 
     def test_persisted_sibling_index_on_episode1_directory_under_5ms(self) -> None:
         bit_validity = REPO_ROOT / "theory" / "Anneal" / "BitValidity.lean"
