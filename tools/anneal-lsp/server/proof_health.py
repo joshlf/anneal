@@ -452,8 +452,8 @@ _EQ_SUFFIX_AT_RE = re.compile(r"\.(?:eq_def|eq_unfold|eq_\d+)(?![\w'!?.])")
 # The value is a Lean `numLit`: decimal, or `0x`/`0b`/`0o` prefixed.
 _PROFILER_THRESHOLD_RE = re.compile(
     r"set_option\s+trace\.profiler\.threshold\s+"
-    r"(0[xX][0-9a-fA-F]+(?:_[0-9a-fA-F]+)*|0[bB][01]+(?:_[01]+)*|0[oO][0-7]+(?:_[0-7]+)*"
-    r"|\d+(?:_\d+)*)(?![\w'!?])"
+    r"(0[xX][0-9a-fA-F]+(?:_[0-9a-fA-F]+)*|0[bB][01]+(?:_[01]+)*|0[oO][0-7]+(?:_[01234567]+)*"
+    r"|\d+(?:_\d+)*)(?![\w'!?.])"
 )
 # Declaration names: dotted Lean 4 identifiers (`MirStepStar.mono`, `get?_set?_ne`,
 # `Foo.«bar»`, `«guillemet-quoted»`). Modifiers may sit between `private` and the keyword.
@@ -1509,7 +1509,7 @@ def _extract_sibling_private_decls_fast(
     key = str(sibling_path)
     try:
         st = sibling_path.stat()
-    except OSError:
+    except (OSError, ValueError):
         return []
     racy = _is_racy(st)
     cached = _SIBLING_PRIVATE_CACHE.get(key)
@@ -1537,7 +1537,7 @@ def _extract_sibling_private_decls_fast(
 
     try:
         raw = sibling_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except (OSError, ValueError):
         return []
     file_crc = _text_crc(raw)
     if cached is not None and cached[:3] == (st.st_mtime_ns, st.st_size, file_crc):
@@ -1590,7 +1590,7 @@ def _file_texts(path_str: str) -> tuple[str, str] | None:
     p = Path(path_str)
     try:
         st = p.stat()
-    except OSError:
+    except (OSError, ValueError):
         return None
     if not _is_racy(st):
         cached = _FILE_TEXTS_CACHE.get(path_str)
@@ -1598,7 +1598,7 @@ def _file_texts(path_str: str) -> tuple[str, str] | None:
             return cached[2], cached[3]
     try:
         raw = p.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except (OSError, ValueError):
         return None
     cached = _FILE_TEXTS_CACHE.get(path_str)
     if cached is not None and cached[2] == raw:
@@ -1612,7 +1612,7 @@ def _list_dir_lean_files(parent: Path, max_files: int) -> list[Path]:
     key = str(parent)
     try:
         st = parent.stat()
-    except OSError:
+    except (OSError, ValueError):
         return []
     cached = _DIR_LEAN_FILES_CACHE.get(key)
     if cached is not None and cached[0] == st.st_mtime_ns:
@@ -1626,7 +1626,7 @@ def _list_dir_lean_files(parent: Path, max_files: int) -> list[Path]:
                 and e.name.endswith(".lean")
                 and e.is_file(follow_symlinks=False)
             )
-    except OSError:
+    except (OSError, ValueError):
         return []
     files = [parent / name for name in names[: max_files + 1]]
     _DIR_LEAN_FILES_CACHE[key] = (st.st_mtime_ns, files)
@@ -1652,14 +1652,21 @@ def _collect_sibling_private_decls(
     return out
 
 
+def _safe_isfile(path: str | Path) -> bool:
+    try:
+        return os.path.isfile(path)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _load_sibling_index(index_file: Path) -> dict[str, Any]:
     data = _load_cache(index_file)
     return data if isinstance(data, dict) else {}
 
 
 def _save_sibling_index(index_file: Path, index: dict[str, Any]) -> None:
-    # Forget files that no longer exist (renamed or deleted siblings).
-    for key in [k for k in index if not os.path.isfile(k)]:
+    # Forget files that no longer exist (renamed, deleted, or malformed sibling keys).
+    for key in [k for k in index if not _safe_isfile(k)]:
         del index[key]
     _save_cache(index_file, index)
 
@@ -2191,7 +2198,7 @@ def _save_cache(cache_file: Path, data: dict[str, Any]) -> None:
     except Exception:
         try:
             os.unlink(tmp_path)
-        except OSError:
+        except (OSError, ValueError):
             pass
 
 
@@ -2230,7 +2237,10 @@ def _jetski_result_hint(payload: dict[str, Any] | None) -> tuple[int | None, int
     if m is None:
         return None, None
     cnt = int(m.group(1))
-    sline = int(m.group(2)) if m.group(2) is not None else None
+    if cnt < 1:
+        return None, None
+    raw_line = int(m.group(2)) if m.group(2) is not None else None
+    sline = raw_line if raw_line is not None and raw_line >= 1 else None
     return cnt, sline
 
 
@@ -2544,7 +2554,7 @@ def evaluate_post_edit_proof_health(
     path = Path(os.path.abspath(target_file))
     try:
         resolved_key = str(path.resolve())
-    except OSError:
+    except (OSError, ValueError):
         resolved_key = str(path)
 
     if after_text is None:
@@ -2559,7 +2569,7 @@ def evaluate_post_edit_proof_health(
     if scan_siblings and "private" in after_text:
         index_file = sibling_index_path(cpath, path.parent)
         sibling_index = _load_sibling_index(index_file)
-        had_missing = any(not os.path.isfile(k) for k in sibling_index)
+        had_missing = any(not _safe_isfile(k) for k in sibling_index)
         before_ids = {k: id(v) for k, v in sibling_index.items()}
         sibling_decls = _collect_sibling_private_decls(path, persisted=sibling_index)
         if had_missing or {k: id(v) for k, v in sibling_index.items()} != before_ids:
@@ -2600,7 +2610,7 @@ def evaluate_post_edit_proof_health(
             or cached_entry.get("_crc") != _text_crc(text)
         ):
             return None
-        return {rule: _safe_int(cached_entry.get(rule, 0), 0) for rule in ALL_RULES}
+        return {rule: max(0, _safe_int(cached_entry.get(rule, 0), 0)) for rule in ALL_RULES}
 
     write_args = _write_file_args(payload)
     # Claude Code reports the exact pre-edit text (`tool_response.originalFile`) for
@@ -2637,7 +2647,9 @@ def evaluate_post_edit_proof_health(
         else:
             spans = _line_spans_of_insertions(after_text, _replacement_strings(payload), payload)
     elif cached_entry is not None:
-        before_counts = {rule: _safe_int(cached_entry.get(rule, 0), 0) for rule in ALL_RULES}
+        before_counts = {
+            rule: max(0, _safe_int(cached_entry.get(rule, 0), 0)) for rule in ALL_RULES
+        }
         spans = _line_spans_of_insertions(after_text, _replacement_strings(payload), payload)
     elif _is_pure_deletion(payload):
         # Deleting text cannot add an occurrence; without a cached baseline the
@@ -2843,6 +2855,11 @@ def _is_backgrounded_long_step(item: dict[str, Any]) -> bool:
 def _iter_transcript_items(
     source: str | Path | Iterable[dict[str, Any]],
 ) -> Iterable[dict[str, Any]]:
+    if isinstance(source, dict):
+        yield source
+        return
+    if isinstance(source, (bytes, bytearray)):
+        return
     if isinstance(source, (str, Path)):
         path = Path(source)
         try:
@@ -2904,8 +2921,13 @@ def _safe_int(val: Any, default: int = 1) -> int:
 
 
 def _tool_name(obj: dict[str, Any]) -> str | None:
-    name = obj.get("tool") or obj.get("name") or obj.get("tool_name")
-    return str(name) if name is not None and str(name).strip() else None
+    for key in ("tool", "name", "tool_name"):
+        val = obj.get(key)
+        if isinstance(val, str):
+            s = val.strip()
+            if s:
+                return s
+    return None
 
 
 def compute_unbatched_tool_latencies(
@@ -2933,6 +2955,9 @@ def compute_unbatched_tool_latencies(
     Entries without usable timings are skipped without raising.
     """
     import statistics
+
+    if not _is_finite_nonneg_number(long_call_threshold_ms):
+        long_call_threshold_ms = DEFAULT_LONG_CALL_THRESHOLD_MS
 
     allowed_tools: set[str] | None = None
     if isinstance(tool_filter, str):

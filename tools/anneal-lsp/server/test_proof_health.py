@@ -380,6 +380,8 @@ class TestFiveStructuralAntiPatterns(unittest.TestCase):
             "set_option trace.profiler.threshold 0xg\n"
             "set_option trace.profiler.threshold 0b1000000\n"
             "set_option trace.profiler.threshold 0o61\n"
+            "set_option trace.profiler.threshold 49.5\n"
+            "set_option trace.profiler.threshold 1.foo\n"
         )
         self.assertEqual(
             scan(src),
@@ -1383,6 +1385,72 @@ class TestDeltaOnlyPostEditCheck(unittest.TestCase):
                 self.assertEqual(res["deltas"][R1], 1)
                 self.assertEqual([f.line for f in res["new_findings"]], [2])
 
+    def test_negative_cached_counts_nul_paths_and_zero_hints_never_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            lean_file = tmp_dir / "NegCache.lean"
+            lean_file.write_text("private theorem clean : True := trivial\n", encoding="utf-8")
+            cache_file = tmp_dir / "cache.json"
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        str(lean_file.resolve()): {
+                            "_ver": proof_health.CACHE_FORMAT_VERSION,
+                            R1: -5,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Negative cached count clamps to 0 instead of raising `IndexError` on `shown[0]`.
+            res = proof_health.evaluate_post_edit_proof_health(
+                lean_file, {"Path": str(lean_file)}, cache_path=cache_file
+            )
+            self.assertEqual(res["deltas"][R1], 0)
+            self.assertEqual(res["feedback"], "")
+
+            # Embedded NULs in sibling-index keys, `cache_path`, or `target_file` never raise `ValueError`.
+            idx_file = proof_health.sibling_index_path(cache_file, tmp_dir)
+            idx_file.write_text(json.dumps({"bad\x00sib": [1, 2, 3, []]}), encoding="utf-8")
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(lean_file, None, cache_path=cache_file),
+                "",
+            )
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(
+                    lean_file, None, cache_path="bad\x00cache.json"
+                ),
+                "",
+            )
+            self.assertEqual(
+                proof_health.check_post_edit_proof_health(
+                    "bad\x00.lean", None, after_text="theorem t : True := trivial\n"
+                ),
+                "",
+            )
+
+            # Zero replacement counts / zero line hints are ignored as invalid 1-based hints.
+            zfile = tmp_dir / "ZeroHint.lean"
+            zfile.write_text(
+                "theorem a : True := trivial\n"
+                "theorem b : True := by\n"
+                "  dsimp [wpMirExecSym]\n",
+                encoding="utf-8",
+            )
+            for bad_hint in (
+                "Made 0 replacements starting at line 0.",
+                "Made 1 replacement starting at line 0.",
+            ):
+                zres = proof_health.evaluate_post_edit_proof_health(
+                    zfile,
+                    {
+                        "result": bad_hint,
+                        **jetski_edit(zfile, "  skip\n", "  dsimp [wpMirExecSym]\n"),
+                    },
+                    cache_path=tmp_dir / f"z_{len(bad_hint)}.json",
+                )
+                self.assertEqual([f.line for f in zres["new_findings"]], [3])
+
 
 class TestPerformanceAndDogfood(unittest.TestCase):
     def test_synthetic_6000_line_file_under_5ms(self) -> None:
@@ -1716,6 +1784,31 @@ class TestTranscriptLatencyTelemetry(unittest.TestCase):
         self.assertEqual(proof_health.compute_unbatched_tool_latencies(lines[0])["unbatched_count"], 1)
         for missing in ("x" * 5000, Path(tempfile.gettempdir()) / ("y" * 300)):
             self.assertEqual(proof_health.compute_unbatched_tool_latencies(missing)["total_count"], 0)
+
+    def test_oversized_int_and_container_tool_names_single_dict_and_nan_threshold(self) -> None:
+        events = [
+            # 5000-digit int tool name must not raise `ValueError` in `str(name)`.
+            {"tool": 10**5000, "duration_ms": 5.0},
+            # Non-string `tool` falls through to valid string `name` instead of `"True"`.
+            {"tool": True, "name": "lean_goal", "duration_ms": 15.0, "batch_id": "s1"},
+            # Container tool names are ignored rather than stringified to `"['x']"`.
+            {"tool": ["x"], "duration_ms": 5.0},
+            {"tool": {"k": 1}, "duration_ms": 5.0},
+            {
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{"name": 10**5000, "duration_ms": 20.0}],
+            },
+        ]
+        stats = proof_health.compute_unbatched_tool_latencies(
+            events, long_call_threshold_ms=float("nan")
+        )
+        self.assertEqual(stats["unbatched_count"], 2)
+        self.assertEqual(sorted(stats["by_tool"].keys()), ["lean_goal", "unknown"])
+        single = proof_health.compute_unbatched_tool_latencies(
+            {"tool": "lean_hover", "duration_ms": 8.0}
+        )
+        self.assertEqual(single["unbatched_count"], 1)
+        self.assertEqual(proof_health.compute_unbatched_tool_latencies(b"raw")["total_count"], 0)
 
 
 class TestPostToolUseHookIntegration(unittest.TestCase):
