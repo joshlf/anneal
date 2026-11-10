@@ -2633,6 +2633,38 @@ impl<'a> TokenCursor<'a> {
         }
     }
 
+    /// Skip a single atomic Lean term (a balanced `(...)`, `{...}`, or `[...]`, a
+    /// `.ctor` / identifier atom, or a literal) without consuming subsequent
+    /// sibling arguments in an outer application such as `List.cons head tail`.
+    fn skip_atomic_expr(&mut self) -> Result<(), CensusScanError> {
+        match self.peek() {
+            Some(LeanToken::LParen | LeanToken::LBrace | LeanToken::LBracket) => {
+                self.skip_balanced_expr()
+            }
+            Some(LeanToken::Dot) => {
+                self.next();
+                match self.next() {
+                    Some(LeanToken::Ident(_)) => Ok(()),
+                    other => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                        "expected identifier after `.`, found {other:?}"
+                    ))),
+                }
+            }
+            Some(
+                LeanToken::Ident(_)
+                | LeanToken::NatLit(_)
+                | LeanToken::StrLit(_)
+                | LeanToken::CharLit(_),
+            ) => {
+                self.next();
+                Ok(())
+            }
+            other => Err(CensusScanError::MalformedCapturedMirSyntax(format!(
+                "unexpected token while skipping atomic expression: {other:?}"
+            ))),
+        }
+    }
+
     fn parse_usize(&mut self) -> Result<usize, CensusScanError> {
         self.with_optional_parens(|cur| match cur.next() {
             Some(LeanToken::NatLit(v)) => usize::try_from(*v).map_err(|_| {
@@ -2836,7 +2868,7 @@ impl<'a> TokenCursor<'a> {
                     has_arg_count = true;
                 }
                 "localDecls" => {
-                    cur.skip_balanced_expr()?;
+                    let _ = cur.parse_list(|c| c.skip_atomic_expr())?;
                     has_local_decls = true;
                 }
                 "basicBlocks" => {
@@ -2851,11 +2883,14 @@ impl<'a> TokenCursor<'a> {
                     has_layouts = true;
                 }
                 "allocations" => {
-                    cur.skip_balanced_expr()?;
+                    let _ = cur.parse_list(|c| c.skip_atomic_expr())?;
                     has_allocations = true;
                 }
-                "typeParamCount" | "genericParams" | "traitImpls" => {
-                    cur.skip_balanced_expr()?;
+                "typeParamCount" => {
+                    let _ = cur.parse_usize()?;
+                }
+                "genericParams" | "traitImpls" => {
+                    let _ = cur.parse_list(|c| c.skip_atomic_expr())?;
                 }
                 other => {
                     return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
@@ -3174,6 +3209,7 @@ impl<'a> TokenCursor<'a> {
     }
 
     fn parse_const_operand(&mut self) -> Result<ProtoConstValue, CensusScanError> {
+        let mut has_ty = false;
         let mut fn_def_path: Option<String> = None;
         let mut val: Option<ProtoConstValue> = None;
 
@@ -3181,6 +3217,7 @@ impl<'a> TokenCursor<'a> {
             match field {
                 "ty" => {
                     fn_def_path = cur.parse_ty_extract_fn_def()?;
+                    has_ty = true;
                 }
                 "val" => {
                     val = Some(cur.parse_const_value()?);
@@ -3194,6 +3231,11 @@ impl<'a> TokenCursor<'a> {
             Ok(())
         })?;
 
+        if !has_ty {
+            return Err(CensusScanError::MalformedCapturedMirSyntax(
+                "ConstOperand missing `ty`".to_string(),
+            ));
+        }
         let mut cv = val.ok_or_else(|| {
             CensusScanError::MalformedCapturedMirSyntax("ConstOperand missing `val`".to_string())
         })?;
@@ -3214,14 +3256,18 @@ impl<'a> TokenCursor<'a> {
     }
 
     fn parse_ty_extract_fn_def(&mut self) -> Result<Option<String>, CensusScanError> {
+        let mut has_kind = false;
+        let mut has_layout_idx = false;
         let mut fn_def: Option<String> = None;
         self.parse_record(|field, cur| {
             match field {
                 "kind" => {
                     fn_def = cur.parse_rigid_ty_extract_fn_def()?;
+                    has_kind = true;
                 }
                 "layoutIdx" => {
                     let _ = cur.parse_usize()?;
+                    has_layout_idx = true;
                 }
                 other => {
                     return Err(CensusScanError::MalformedCapturedMirSyntax(format!(
@@ -3231,6 +3277,16 @@ impl<'a> TokenCursor<'a> {
             }
             Ok(())
         })?;
+        if !has_kind {
+            return Err(CensusScanError::MalformedCapturedMirSyntax(
+                "Ty missing `kind`".to_string(),
+            ));
+        }
+        if !has_layout_idx {
+            return Err(CensusScanError::MalformedCapturedMirSyntax(
+                "Ty missing `layoutIdx`".to_string(),
+            ));
+        }
         Ok(fn_def)
     }
 
@@ -3240,7 +3296,7 @@ impl<'a> TokenCursor<'a> {
             check_ctor_qualifier(&full, &short, "RigidTy")?;
             if short == "fnDef" {
                 let path = cur.parse_string()?;
-                cur.skip_balanced_expr()?; // typeArgs list
+                let _ = cur.parse_list(|c| c.skip_atomic_expr())?; // typeArgs list
                 Ok(Some(path))
             } else {
                 // Skip any remaining arguments inside this RigidTy constructor
@@ -3827,18 +3883,23 @@ fn shadows_mir_ast_name(name: &str) -> bool {
     name.split('.').any(|seg| MIR_AST_TYPE_NAMES.contains(&seg))
 }
 
-/// Strict `[adv B1]` / `[adv A1]` grammar check for an `anneal-rustc-capture`
-/// `Mir/<Item>.lean` module: only `import Trusted*`, `namespace`/`section`/`end`,
+/// Strict `[adv B1]` / `[adv A1]` / `[adv A2]` grammar check for an `anneal-rustc-capture`
+/// `Mir/<Item>.lean` module: only `import Trusted*`, balanced `namespace`/`section`/`end`,
 /// `open Trusted*` lists, `set_option`, and `def <name> : <type> := <single balanced term>`
 /// commands are accepted, no declaration or namespace may reuse a MIR AST type name
-/// (constructor shadowing), and exactly one bare `def body : CapturedMir := { ... }`
-/// must exist (rejecting qualified sub-namespace `def Sub.body`).
-fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusScanError> {
+/// (constructor shadowing), every `namespace`/`section` must be closed by a matching
+/// `end <name>` before EOF, and exactly one bare `def body : CapturedMir := { ... }`
+/// must exist directly inside the module's single top-level `namespace` (rejecting both
+/// qualified `def Sub.body` and nested `namespace Sub def body ... end Sub`).
+fn check_strict_mir_module_grammar<'a>(tokens: &'a [LeanToken]) -> Result<(), CensusScanError> {
     let malformed = |msg: String| CensusScanError::MalformedCapturedMirSyntax(msg);
-    let ident_at = |i: usize| match tokens.get(i) {
-        Some(LeanToken::Ident(s)) => Some(s.as_str()),
-        _ => None,
+    let ident_at = |i: usize| -> Option<&'a str> {
+        match tokens.get(i) {
+            Some(LeanToken::Ident(s)) => Some(s.as_str()),
+            _ => None,
+        }
     };
+    let mut scope_stack: Vec<(&'a str, &'a str)> = Vec::new();
     let mut body_defs = 0usize;
     let mut i = 0usize;
     while i < tokens.len() {
@@ -3859,18 +3920,42 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
                 }
                 i += 2;
             }
-            "namespace" | "section" | "end" => {
-                i += 1;
-                if let Some(name) = ident_at(i) {
-                    if !is_lean_command_start(&tokens[i]) {
-                        if shadows_mir_ast_name(name) {
-                            return Err(malformed(format!(
-                                "namespace `{name}` shadows a MIR AST type name"
-                            )));
-                        }
-                        i += 1;
+            "namespace" | "section" => {
+                let Some(name) = ident_at(i + 1) else {
+                    return Err(malformed(format!("`{kw}` without an explicit scope name")));
+                };
+                if is_lean_command_start(&tokens[i + 1]) {
+                    return Err(malformed(format!("`{kw}` without an explicit scope name")));
+                }
+                if shadows_mir_ast_name(name) {
+                    return Err(malformed(format!(
+                        "namespace `{name}` shadows a MIR AST type name"
+                    )));
+                }
+                scope_stack.push((kw, name));
+                i += 2;
+            }
+            "end" => {
+                let Some(name) = ident_at(i + 1) else {
+                    return Err(malformed("`end` without an explicit scope name".into()));
+                };
+                if is_lean_command_start(&tokens[i + 1]) {
+                    return Err(malformed("`end` without an explicit scope name".into()));
+                }
+                match scope_stack.pop() {
+                    Some((_, open_name)) if open_name == name => {}
+                    Some((open_kw, open_name)) => {
+                        return Err(malformed(format!(
+                            "mismatched `end {name}` for open `{open_kw} {open_name}`"
+                        )));
+                    }
+                    None => {
+                        return Err(malformed(format!(
+                            "unmatched `end {name}` with no open namespace or section"
+                        )));
                     }
                 }
+                i += 2;
             }
             "open" => {
                 i += 1;
@@ -3947,6 +4032,11 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
                     return Err(malformed(format!("`def {name}` has no `:=` body")));
                 }
                 if is_body {
+                    if scope_stack.len() != 1 || scope_stack[0].0 != "namespace" {
+                        return Err(malformed(
+                            "`def body : CapturedMir` must appear directly inside the module's single top-level `namespace`".into(),
+                        ));
+                    }
                     let ty_ok = j == ty_start + 1
                         && matches!(&tokens[ty_start], LeanToken::Ident(ty)
                             if ty == "CapturedMir" || ty.ends_with(".CapturedMir"));
@@ -3995,6 +4085,11 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
                 )));
             }
         }
+    }
+    if let Some((open_kw, open_name)) = scope_stack.last() {
+        return Err(malformed(format!(
+            "unclosed `{open_kw} {open_name}` at end of strict Mir module"
+        )));
     }
     if body_defs != 1 {
         return Err(CensusScanError::MissingOrDuplicateCapturedMirDef(format!(
@@ -4114,6 +4209,108 @@ pub fn reconcile_lean_mir_coverage(
             unemitted_classes: Vec::new(),
             unsupported_reasons: vec![format!("census scan failed closed: {err}")],
         },
+    }
+}
+
+/// `[adv A2]` Per-item coverage input for multi-item / multi-callee reconciliation
+/// (e.g., a subject function together with its verified callees or loop-invariant
+/// sub-obligations). Because `FaultSite` coordinates `(block_idx, stmt_idx, fault_class)`
+/// are body-relative (`0`-indexed within each `CapturedMir`), each item's `census`
+/// MUST be reconciled against its own `discharged` set so that a discharged site at
+/// `(0, 0)` in a caller can never mask an unmapped site at `(0, 0)` in a callee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemCoverageInput {
+    /// Canonical item `DefPath` (must be unique within a reconciliation batch).
+    pub def_path: String,
+    /// Independent `FaultSite` census for this item's `CapturedMir`.
+    pub census: Vec<FaultSite>,
+    /// Discharged `FaultSite` obligations emitted for this item.
+    pub discharged: Vec<FaultSite>,
+}
+
+/// `[adv A2]` Fail-closed verdict for a multi-item / multi-callee verification batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MultiItemCoverageVerdict {
+    /// Every item in the batch is non-empty, has a distinct `def_path`, and
+    /// reconciled to `CoverageVerdict::Verified`.
+    Verified,
+    /// Fail-closed downgrade when the batch is empty, contains duplicate
+    /// `def_path` entries, or at least one item failed reconciliation.
+    UnknownUnmappedFaultSite {
+        /// Per-item failures `(def_path, verdict)` for items that did not reconcile.
+        failed_items: Vec<(String, CoverageVerdict)>,
+        /// Aggregate human-readable diagnostic reasons across the batch.
+        unsupported_reasons: Vec<String>,
+    },
+}
+
+impl MultiItemCoverageVerdict {
+    /// True iff every item in the batch reconciled to `Verified`.
+    pub const fn is_verified(&self) -> bool {
+        matches!(self, MultiItemCoverageVerdict::Verified)
+    }
+
+    /// Canonical machine-readable status code (`"VERIFIED"` vs.
+    /// `"UNKNOWN(UNSUPPORTED_CONSTRUCT)"`).
+    pub const fn status_code(&self) -> &'static str {
+        match self {
+            MultiItemCoverageVerdict::Verified => "VERIFIED",
+            MultiItemCoverageVerdict::UnknownUnmappedFaultSite { .. } => {
+                "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+            }
+        }
+    }
+}
+
+/// `[adv A2]` Reconcile a multi-item / multi-callee verification batch under `registry`.
+/// Enforces per-item coordinate isolation (preventing `(bb, stmt)` collisions across
+/// caller and callee `CapturedMir` bodies), rejects empty batches, and rejects
+/// duplicate `def_path` entries.
+pub fn reconcile_multi_item_coverage(
+    items: &[ItemCoverageInput],
+    registry: &PropertyRegistry,
+) -> MultiItemCoverageVerdict {
+    if items.is_empty() {
+        return MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+            failed_items: Vec::new(),
+            unsupported_reasons: vec![
+                "multi-item coverage batch is empty (at least one subject item required)"
+                    .to_string(),
+            ],
+        };
+    }
+
+    let mut seen_paths = BTreeSet::new();
+    let mut failed_items = Vec::new();
+    let mut unsupported_reasons = Vec::new();
+
+    for item in items {
+        if !seen_paths.insert(item.def_path.clone()) {
+            unsupported_reasons.push(format!(
+                "duplicate item def_path `{}` in multi-item coverage batch",
+                item.def_path
+            ));
+        }
+        let verdict = reconcile_obligation_coverage(&item.census, &item.discharged, registry);
+        if let CoverageVerdict::UnknownUnmappedFaultSite {
+            unsupported_reasons: ref item_reasons,
+            ..
+        } = verdict
+        {
+            for r in item_reasons {
+                unsupported_reasons.push(format!("[{}] {r}", item.def_path));
+            }
+            failed_items.push((item.def_path.clone(), verdict));
+        }
+    }
+
+    if failed_items.is_empty() && unsupported_reasons.is_empty() {
+        MultiItemCoverageVerdict::Verified
+    } else {
+        MultiItemCoverageVerdict::UnknownUnmappedFaultSite {
+            failed_items,
+            unsupported_reasons,
+        }
     }
 }
 
@@ -5329,7 +5526,14 @@ def body : CapturedMir :=
                     ),
                     3 => IrAggregateKind::Closure(rng.pick(&FUZZ_TRAP_STRINGS).to_string()),
                     4 => IrAggregateKind::Coroutine(rng.pick(&FUZZ_TRAP_STRINGS).to_string()),
-                    _ => IrAggregateKind::RawPtr(fuzz_ty(rng, 1), IrMutability::Not),
+                    _ => IrAggregateKind::RawPtr(
+                        fuzz_ty(rng, 1),
+                        if rng.chance(50) {
+                            IrMutability::Not
+                        } else {
+                            IrMutability::Mut
+                        },
+                    ),
                 };
                 let ops = (0..rng.below(3)).map(|_| fuzz_operand(rng)).collect();
                 IrRvalue::Aggregate(kind, ops)
@@ -5365,13 +5569,21 @@ def body : CapturedMir :=
         for _ in 0..num_blocks {
             let mut statements = Vec::new();
             for _ in 0..rng.below(4) {
-                let kind = match rng.below(13) {
+                let kind = match rng.below(14) {
                     0 | 1 => IrStatementKind::Assign(fuzz_place(rng), fuzz_rvalue(rng)),
                     2 => IrStatementKind::SetDiscriminant(fuzz_place(rng), rng.below(3)),
                     3 => IrStatementKind::Deinit(fuzz_place(rng)),
                     4 => IrStatementKind::StorageLive(rng.below(5)),
                     5 => IrStatementKind::StorageDead(rng.below(5)),
-                    6 => IrStatementKind::Retag(IrRetagKind::FnEntry, fuzz_place(rng)),
+                    6 => IrStatementKind::Retag(
+                        match rng.below(4) {
+                            0 => IrRetagKind::FnEntry,
+                            1 => IrRetagKind::TwoPhase,
+                            2 => IrRetagKind::Raw,
+                            _ => IrRetagKind::Default,
+                        },
+                        fuzz_place(rng),
+                    ),
                     7 => IrStatementKind::PlaceMention(fuzz_place(rng)),
                     8 => IrStatementKind::Intrinsic(IrNonDivergingIntrinsic::Assume(fuzz_operand(
                         rng,
@@ -5382,7 +5594,8 @@ def body : CapturedMir :=
                         count: fuzz_operand(rng),
                     }),
                     10 => IrStatementKind::Coverage,
-                    11 => IrStatementKind::BackwardIncompatibleDropHint(fuzz_place(rng)),
+                    11 => IrStatementKind::ConstEvalCounter,
+                    12 => IrStatementKind::BackwardIncompatibleDropHint(fuzz_place(rng)),
                     _ => IrStatementKind::Nop,
                 };
                 statements.push(IrStatement {
@@ -5568,9 +5781,10 @@ def body : CapturedMir :=
 
     #[test]
     fn test_b2_truncated_real_modules_fail_closed() {
-        // `[adv B2]`: every prefix of a real `rustc`-captured module must either fail
-        // closed or (only once the whole `def body` record is present) yield exactly
-        // the full census — never a partial census from a truncated body.
+        // `[adv B2]` / `[adv A2]`: every proper prefix (`cut < module.trim_end().len()`)
+        // of a real `rustc`-captured module must fail closed because the top-level
+        // `namespace Mir.FrameTutor.<item>` is only closed by the final
+        // `end Mir.FrameTutor.<item>`.
         for module in [
             include_str!(
                 "../../../examples/tutor-ch1/.anneal/generated/Mir/FrameTutor/advance_offset.lean"
@@ -5580,21 +5794,22 @@ def body : CapturedMir :=
             ),
         ] {
             let full = census_lean_mir_module(module).expect("full module scans");
-            let body_start = module.find("def body : CapturedMir :=").expect("body def");
-            let body_end =
-                body_start + module[body_start..].find("\n  }\n").expect("record end") + 4;
+            let trimmed_len = module.trim_end().len();
             let mut accepted = 0usize;
             for (cut, _) in module.char_indices() {
                 match census_lean_mir_module(&module[..cut]) {
                     Ok(sites) => {
-                        assert!(cut >= body_end, "prefix ending at byte {cut} accepted");
+                        assert!(
+                            cut >= trimmed_len,
+                            "proper prefix ending at byte {cut} < {trimmed_len} accepted"
+                        );
                         assert_eq!(sites, full, "prefix ending at byte {cut}");
                         accepted += 1;
                     }
-                    Err(_) => assert!(cut < module.len()),
+                    Err(_) => assert!(cut < trimmed_len),
                 }
             }
-            assert!(accepted > 0);
+            assert_eq!(accepted, 1);
         }
     }
 
@@ -6441,5 +6656,212 @@ end Mir.Probe.item",
         assert!(census_lean_mir_module(&missing_def_path).is_err());
         let missing_is_cleanup = baseline.replace(", isCleanup := false", "");
         assert!(census_lean_mir_module(&missing_is_cleanup).is_err());
+    }
+
+    #[test]
+    fn test_a2_scope_stack_const_ty_multi_item_and_fuzz_completeness() {
+        let unreachable_block = single_terminator_block("TerminatorKind.unreachable");
+        let baseline = strict_module_with_blocks("", &unreachable_block);
+
+        // 1. `check_strict_mir_module_grammar` scope-stack enforcement:
+        //    - Unclosed `namespace Mir.Probe.item` (missing `end Mir.Probe.item`) fails closed.
+        //    - Mismatched `end Mir.Probe.wrong` fails closed.
+        //    - Nested `namespace Sub def body : CapturedMir := ... end Sub` inside `Mir.Probe.item`
+        //      (which defines `Mir.Probe.item.Sub.body`, not `Mir.Probe.item.body`) fails closed.
+        //    - Stray `end Mir.Probe.extra` fails closed.
+        let unclosed_ns = baseline
+            .strip_suffix("end Mir.Probe.item\n")
+            .expect("strip trailing end");
+        assert!(matches!(
+            census_lean_mir_module(unclosed_ns),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("unclosed")
+        ));
+        let mismatched_end = baseline.replace("end Mir.Probe.item", "end Mir.Probe.wrong");
+        assert!(matches!(
+            census_lean_mir_module(&mismatched_end),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("mismatched")
+        ));
+        let nested_ns_body = baseline
+            .replace(
+                "def body : CapturedMir :=",
+                "namespace Sub\ndef body : CapturedMir :=",
+            )
+            .replace(
+                "end Mir.Probe.item",
+                "end Sub\nend Mir.Probe.item",
+            );
+        assert!(matches!(
+            census_lean_mir_module(&nested_ns_body),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("single top-level")
+        ));
+        let stray_end = format!("{baseline}end Mir.Probe.extra\n");
+        assert!(matches!(
+            census_lean_mir_module(&stray_end),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("unmatched")
+        ));
+
+        // 2. `ConstOperand` missing `ty`, `Ty` missing `kind` or `layoutIdx`, and
+        //    non-inline list identifiers for `localDecls` / `allocations` / `RigidTy.fnDef`
+        //    `typeArgs` must fail closed instead of silently dropping callee `fnDef` paths.
+        let call_missing_ty = strict_module_with_blocks(
+            "",
+            &single_terminator_block(
+                "TerminatorKind.call (Operand.constant { val := ConstValue.zeroSized }) List.nil { local_ := 0, projection := List.nil } Option.none UnwindAction.continue_",
+            ),
+        );
+        assert!(matches!(
+            census_lean_mir_module(&call_missing_ty),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("ConstOperand missing `ty`")
+        ));
+        let call_missing_kind = strict_module_with_blocks(
+            "",
+            &single_terminator_block(
+                "TerminatorKind.call (Operand.constant { ty := { layoutIdx := 0 }, val := ConstValue.zeroSized }) List.nil { local_ := 0, projection := List.nil } Option.none UnwindAction.continue_",
+            ),
+        );
+        assert!(matches!(
+            census_lean_mir_module(&call_missing_kind),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("Ty missing `kind`")
+        ));
+        let call_missing_layout_idx = strict_module_with_blocks(
+            "",
+            &single_terminator_block(
+                "TerminatorKind.call (Operand.constant { ty := { kind := RigidTy.fnDef \"core::intrinsics::unreachable\" List.nil }, val := ConstValue.zeroSized }) List.nil { local_ := 0, projection := List.nil } Option.none UnwindAction.continue_",
+            ),
+        );
+        assert!(matches!(
+            census_lean_mir_module(&call_missing_layout_idx),
+            Err(CensusScanError::MalformedCapturedMirSyntax(msg)) if msg.contains("Ty missing `layoutIdx`")
+        ));
+        let call_non_list_type_args = strict_module_with_blocks(
+            "",
+            &single_terminator_block(
+                "TerminatorKind.call (Operand.constant { ty := { kind := RigidTy.fnDef \"core::intrinsics::unreachable\" externalTypeArgs, layoutIdx := 0 }, val := ConstValue.zeroSized }) List.nil { local_ := 0, projection := List.nil } Option.none UnwindAction.continue_",
+            ),
+        );
+        assert!(census_lean_mir_module(&call_non_list_type_args).is_err());
+        let non_inline_local_decls =
+            baseline.replace("localDecls := List.nil", "localDecls := externalDecls");
+        assert!(census_lean_mir_module(&non_inline_local_decls).is_err());
+        let non_inline_allocs =
+            baseline.replace("allocations := List.nil", "allocations := externalAllocs");
+        assert!(census_lean_mir_module(&non_inline_allocs).is_err());
+
+        // 3. `fuzz_captured_mir` completeness: verify that the fuzzer exercises
+        //    `IrStatementKind::ConstEvalCounter`, all 4 `IrRetagKind` variants
+        //    (`FnEntry`, `TwoPhase`, `Raw`, `Default`), and `IrAggregateKind::RawPtr(_, IrMutability::Mut)`.
+        let mut rng = FuzzRng(0xA2A2_A2A2_5555_1234);
+        let mut saw_const_eval_counter = false;
+        let mut retag_kinds = [false; 4];
+        let mut saw_mut_raw_ptr_agg = false;
+        for _ in 0..300 {
+            let ir = fuzz_captured_mir(&mut rng);
+            for bb in &ir.basic_blocks {
+                for stmt in &bb.statements {
+                    match &stmt.kind {
+                        IrStatementKind::ConstEvalCounter => saw_const_eval_counter = true,
+                        IrStatementKind::Retag(rk, _) => match rk {
+                            anneal_rustc_capture::lean_emit::IrRetagKind::FnEntry => {
+                                retag_kinds[0] = true;
+                            }
+                            anneal_rustc_capture::lean_emit::IrRetagKind::TwoPhase => {
+                                retag_kinds[1] = true;
+                            }
+                            anneal_rustc_capture::lean_emit::IrRetagKind::Raw => {
+                                retag_kinds[2] = true;
+                            }
+                            anneal_rustc_capture::lean_emit::IrRetagKind::Default => {
+                                retag_kinds[3] = true;
+                            }
+                        },
+                        IrStatementKind::Assign(
+                            _,
+                            IrRvalue::Aggregate(
+                                anneal_rustc_capture::lean_emit::IrAggregateKind::RawPtr(
+                                    _,
+                                    IrMutability::Mut,
+                                ),
+                                _,
+                            ),
+                        ) => {
+                            saw_mut_raw_ptr_agg = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(saw_const_eval_counter, "fuzzer must generate ConstEvalCounter");
+        assert_eq!(retag_kinds, [true, true, true, true], "fuzzer must generate all 4 RetagKind variants");
+        assert!(saw_mut_raw_ptr_agg, "fuzzer must generate AggregateKind::RawPtr(_, Mut)");
+
+        // 4. Multi-item / multi-callee reconciliation (`reconcile_multi_item_coverage`):
+        //    - Discharging `(0, 0, ArithOverflow)` in `caller` NEVER masks an undischarged
+        //      `(0, 0, ArithOverflow)` in `callee`.
+        //    - Empty batches and duplicate `def_path` entries fail closed.
+        let reg = PropertyRegistry::all_verified();
+        let site0 = FaultSite::new(0, 0, MirFaultClass::ArithOverflow);
+        let caller_ok = ItemCoverageInput {
+            def_path: String::from("crate::caller"),
+            census: vec![site0],
+            discharged: vec![site0],
+        };
+        let callee_missing = ItemCoverageInput {
+            def_path: String::from("crate::callee"),
+            census: vec![site0],
+            discharged: Vec::new(),
+        };
+        let callee_ok = ItemCoverageInput {
+            def_path: String::from("crate::callee"),
+            census: vec![site0],
+            discharged: vec![site0],
+        };
+        assert_eq!(
+            reconcile_multi_item_coverage(&[], &reg).status_code(),
+            "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+        );
+        let cross_item_mask_attempt =
+            reconcile_multi_item_coverage(&[caller_ok.clone(), callee_missing], &reg);
+        assert_eq!(
+            cross_item_mask_attempt.status_code(),
+            "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+        );
+        match cross_item_mask_attempt {
+            MultiItemCoverageVerdict::UnknownUnmappedFaultSite { failed_items, .. } => {
+                assert_eq!(failed_items.len(), 1);
+                assert_eq!(failed_items[0].0, "crate::callee");
+            }
+            MultiItemCoverageVerdict::Verified => panic!("expected callee missing site failure"),
+        }
+        assert_eq!(
+            reconcile_multi_item_coverage(&[caller_ok.clone(), callee_ok], &reg),
+            MultiItemCoverageVerdict::Verified
+        );
+        assert_eq!(
+            reconcile_multi_item_coverage(&[caller_ok.clone(), caller_ok], &reg).status_code(),
+            "UNKNOWN(UNSUPPORTED_CONSTRUCT)"
+        );
+
+        // 5. Verify new `[adv A2]` Lean theorems exist in `theory/Anneal/FaultSiteCensusPrototype.lean`.
+        for thm in [
+            "theorem evalOperand_unprojected_copy_ub_iff",
+            "theorem evalOperand_unprojected_move_ub_iff",
+            "theorem evalOperand_ub_implies_mem_censusOperand",
+            "theorem writePlaceValue_unprojected_ub_iff",
+            "theorem evalStmt_intrinsic_assume_ub_iff",
+            "theorem evalTerminator_assert_cleanup_or_terminate_ub_iff",
+            "theorem mirStepsIntra_preserves_validMirPc",
+            "theorem initMachineState_mirStepsIntra_exposesUb_in_census",
+            "theorem reconcileFaultCoverageWithRegistry_partial_site_rejected",
+            "theorem reconcileFaultCoverageWithRegistry_append_verified_iff",
+            "theorem reconcileFaultCoverageWithRegistry_mono",
+            "theorem initMachineState_mirStepsIntra_reconciled_safety",
+            "theorem initMachineState_mirStepsIntra_not_exposesUb_of_empty_census",
+        ] {
+            assert!(
+                LEAN_PROTOTYPE_SRC.contains(thm),
+                "missing `[adv A2]` Lean theorem `{thm}`"
+            );
+        }
     }
 }

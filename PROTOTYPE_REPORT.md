@@ -3,7 +3,7 @@
 - **Workstream ID**: `ws-proto-fault-site-coverage-reconciler` (`ep1-prototype-fault-site-census-and-reconciler`)
 - **Track**: Track P (`prototype`, isolated from `unstable` and `main`)
 - **Target Paired Track A Workstream**: `ws-fault-site-coverage-reconciler`
-- **Current Pass**: `[adv A1]` (Round 1 critique & fix of `[adv B1]`)
+- **Current Pass**: `[adv A2]` (Round 2 critique & fix of `[adv B2]`)
 
 ---
 
@@ -14,16 +14,18 @@ This Track P prototype builds a defense-in-depth cross-check for Anneal's MIR ve
 1. **Lean 4 independent fault-site census and completeness proofs** (`theory/Anneal/FaultSiteCensusPrototype.lean`):
    - 12 canonical `MirFaultClass` categories, `FaultSite`, `PropertyStatus`, `PropertyRegistry`.
    - An independent structural walker `censusMirBodyFaultSites (body : CapturedMir) : List FaultSite` over `Trusted.MirAst`, duplicate-free (`censusMirBodyFaultSites_nodup`).
-   - Completeness over `Trusted.MirSemantics.stepMirFn` (`stepMirFn_activeBody_fault_in_census`, `stepMirFn_fault_in_census`) and over every **one-step UB exposure**, including `.faulted .ub` continuations of external calls (`stepMirFn_exposesUb_in_census`, `stepMirFn_extCall_cont_fault_in_census`).
-   - **Semantic precision & interprocedural PC certificates** (`[adv B1]` + `[adv A1]`):
+   - Completeness over `Trusted.MirSemantics.stepMirFn` (`stepMirFn_activeBody_fault_in_census`, `stepMirFn_fault_in_census`), over every **one-step UB exposure** including `.faulted .ub` continuations of external calls (`stepMirFn_exposesUb_in_census`, `stepMirFn_extCall_cont_fault_in_census`), and over **arbitrary-length intra-frame execution traces** (`MirStepsIntra`, `mirStepsIntra_preserves_validMirPc`, `initMachineState_mirStepsIntra_exposesUb_in_census`, `[adv A2]`).
+   - **Semantic precision & interprocedural PC certificates** (`[adv B1]` + `[adv A1]` + `[adv A2]`):
      - Class-level justification of `BinOp` (`censusBinOpFaultClasses_exact`, `evalScalarBinOp_ub_cause`), `StorageLive`/`StorageDead`/`Return`/`Goto`/borrow `.ub` edges.
      - `[adv A1]` exact `.ub` characterizations and non-overapproximation proofs for unevaluated `Rvalue` assignments (`evalRvalue_eq_unsupported_of_rvalueUnevaluated`, `evalStmt_assign_unevaluated_eq_unsupported`), `PlaceMention` (`evalStmt_placeMention_ub_iff`), unprojected and deref-projected `Deinit` / `Drop` (`evalStmt_deinit_unprojected_ub_iff`, `evalStmt_deinit_deref_eq_unsupported`, `evalTerminator_drop_unprojected_ub_iff`), `CastKind.pointerCoercion "MutToConstPointer"` (`evalRvalue_cast_mutToConstPointer_ub_iff`), and diverging `Call` destination irrelevance (`evalTerminator_diverging_call_exposesUb_destination_irrelevant`).
      - `[adv A1]` interprocedural `ValidMirPc` preservation across `pushCalleeFrame`, `pushDivergingCalleeFrame`, `enterTailCalleeFrame`, and inline `TerminatorKind.return_` (`validMirPc_pushCalleeFrame`, `validMirPc_pushDivergingCalleeFrame`, `validMirPc_enterTailCalleeFrame`, `validMirPc_return_inline`).
+     - `[adv A2]` exact `.ub` characterizations and completeness for operands, unprojected local writes, `StatementKind.intrinsic (.assume _)`, and `TerminatorKind.assert` (`evalOperand_unprojected_copy_ub_iff`, `evalOperand_unprojected_move_ub_iff`, `evalOperand_ub_implies_mem_censusOperand`, `writePlaceValue_unprojected_ub_iff`, `evalStmt_intrinsic_assume_ub_iff`, `evalTerminator_assert_cleanup_or_terminate_ub_iff`).
+     - `[adv A2]` partial-coverage site rejection, multi-body append compositionality, registry monotonicity, and multi-step reconciled trace safety (`reconcileFaultCoverageWithRegistry_partial_site_rejected`, `reconcileFaultCoverageWithRegistry_append_verified_iff`, `reconcileFaultCoverageWithRegistry_mono`, `initMachineState_mirStepsIntra_reconciled_safety`, `initMachineState_mirStepsIntra_not_exposesUb_of_empty_census`).
    - Fail-closed reconciler theorems and kernel-checked `by decide` witnesses (`0` `sorryAx`, `0` `Lean.ofReduceBool`), with kernel-evaluated **liveness certificates** for every false-proof probe site.
 2. **Rust registry, census frontends, fail-closed reconciler and probes** (`crates/cargo-anneal/src/fault_census_proto.rs`):
-   - 1-to-1 `MirFaultClass`, `FaultSite`, `PropertyStatus`, `PropertyDescriptor`, `PropertyRegistry`, `ProtoAggregateKind`.
-   - Three census frontends: `census_mir_fault_sites(&ProtoMirBody)`, `census_ir_captured_mir(&IrCapturedMir)`, and the fail-closed Lean scanners `census_lean_mir_module(&str)` (strict emitter-module grammar) and `census_lean_mir_def(&str, &str)` (named-definition extraction for the witness file).
-   - `reconcile_obligation_coverage` / `reconcile_lean_mir_coverage`, the four false-proof probes driven by an independent mock obligation emitter, the registry probe, a real `rustc`-captured corpus test, and the cross-language Lean-to-Rust parity test.
+   - 1-to-1 `MirFaultClass`, `FaultSite`, `PropertyStatus`, `PropertyDescriptor`, `PropertyRegistry`, `ProtoAggregateKind`, `ItemCoverageInput`, `MultiItemCoverageVerdict`.
+   - Three census frontends: `census_mir_fault_sites(&ProtoMirBody)`, `census_ir_captured_mir(&IrCapturedMir)`, and the fail-closed Lean scanners `census_lean_mir_module(&str)` (strict emitter-module grammar with scope-stack enforcement) and `census_lean_mir_def(&str, &str)` (named-definition extraction for the witness file).
+   - `reconcile_obligation_coverage`, `reconcile_lean_mir_coverage`, and `[adv A2]` `reconcile_multi_item_coverage` (per-item coordinate isolation across caller/callee batches), the four false-proof probes driven by an independent mock obligation emitter, the registry probe, the randomized emitter differential fuzzer, a real `rustc`-captured corpus test, and the cross-language Lean-to-Rust parity test.
 
 ---
 
@@ -40,14 +42,14 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
 | Dedup / Nodup | `mem_dedupFaultClasses_iff`, `nodup_dedupFaultClasses`, `censusMirBodyFaultSites_nodup` | Canonical per-site dedup; the whole census is `Nodup`. |
 | Membership | `mem_censusStmtsAux_of_get?`, `mem_censusBlockFaultSites_of_stmt`, `mem_censusBlockFaultSites_of_terminator`, `mem_censusBlocksAux_of_get?`, `mem_censusMirBodyFaultSites_of_block` | Structural membership of `(bb, stmt, cls)` sites. |
 | Pure constructs never fault | `evalStmt_pure_constructs_ne_ub`, `evalTerminator_pure_constructs_ne_ub`, `evalOperand_constant_non_indirect_ne_ub` | `.nop`/`.coverage`/`.constEvalCounter`/`.backwardIncompatibleDropHint`, `.goto`/`.unwindTerminate`/`.inlineAsm`, and non-`.indirect` constants never return `.ub`. |
-| Valid PC / CFG & Interprocedural PC | `ValidMirPc`, `cfgTargetsInBounds`, `validMirPc_initMachineState`, `stepMirFn_preserves_validMirPc`, `validMirPc_pushCalleeFrame`, `validMirPc_pushDivergingCalleeFrame`, `validMirPc_enterTailCalleeFrame`, `validMirPc_return_inline` | Entry PC is valid; intra-frame steps with in-bounds CFG targets and interprocedural call/tail-call/inline-return transitions preserve `ValidMirPc`. |
-| Construct classification | `evalStmt_exposesUb_implies_mem_censusStmt`, `evalTerminator_exposesUb_implies_mem_censusTerminator` (and `.fail .ub` corollaries `evalStmt_ub_implies_mem_censusStmt`, `evalTerminator_ub_implies_mem_censusTerminator`) | Any UB exposure of a statement/terminator implies a non-empty construct census. |
-| Completeness | `stepMirFn_activeBody_exposesUb_in_census`, `stepMirFn_exposesUb_in_census`, `stepMirFn_extCall_cont_fault_in_census`, `stepMirFn_activeBody_fault_in_census`, `stepMirFn_fault_in_census` | Every UB exposure from a valid PC (active callee or top level) is censused at that PC. |
-| Zero-census corollaries | `stepMirFn_not_exposesUb_of_site_uncensused`, `stepMirFn_ne_ub_of_site_uncensused`, `stepMirFn_ne_ub_of_empty_census` | An uncensused PC exposes no UB, directly or through any continuation. |
-| Reconciler | `mem_unmappedFaultSites_iff`, `mem_unmappedFaultSitesWithRegistry_iff`, `reconcileFaultCoverage_verified_iff`, `reconcileFaultCoverage_unknown_nonempty`, `reconcileFaultCoverageWithRegistry_verified_iff`, `reconcileFaultCoverageWithRegistry_rejects_unemitted`, `reconcileFaultCoverage_mutation_detected` | Soundness/completeness of the fail-closed verdict; non-verified registry classes can never be discharged; stripping any census site is detected. |
-| End-to-end bridge | `stepMirFn_fault_in_discharged_of_reconciled`, `stepMirFn_exposesUb_in_discharged_of_reconciled` | A reconciled body discharges (with an `emittedAndVerified` class) every UB exposure at a valid top-level PC. |
+| Valid PC / CFG & Interprocedural PC | `ValidMirPc`, `cfgTargetsInBounds`, `validMirPc_initMachineState`, `stepMirFn_preserves_validMirPc`, `validMirPc_pushCalleeFrame`, `validMirPc_pushDivergingCalleeFrame`, `validMirPc_enterTailCalleeFrame`, `validMirPc_return_inline`, `MirStepsIntra`, `mirStepsIntra_preserves_validMirPc` | Entry PC is valid; intra-frame steps (single-step and arbitrary-length `MirStepsIntra` traces) with in-bounds CFG targets and interprocedural call/tail-call/inline-return transitions preserve `ValidMirPc`. |
+| Construct classification | `evalOperand_ub_implies_mem_censusOperand`, `evalStmt_exposesUb_implies_mem_censusStmt`, `evalTerminator_exposesUb_implies_mem_censusTerminator` (and `.fail .ub` corollaries `evalStmt_ub_implies_mem_censusStmt`, `evalTerminator_ub_implies_mem_censusTerminator`) | Any UB exposure of an operand, statement, or terminator implies a non-empty construct census. |
+| Completeness | `stepMirFn_activeBody_exposesUb_in_census`, `stepMirFn_exposesUb_in_census`, `stepMirFn_extCall_cont_fault_in_census`, `stepMirFn_activeBody_fault_in_census`, `stepMirFn_fault_in_census`, `initMachineState_mirStepsIntra_exposesUb_in_census` | Every UB exposure from a valid PC (active callee, top level, or after any `MirStepsIntra` trace from `initMachineState`) is censused at that PC. |
+| Zero-census corollaries | `stepMirFn_not_exposesUb_of_site_uncensused`, `stepMirFn_ne_ub_of_site_uncensused`, `stepMirFn_ne_ub_of_empty_census`, `initMachineState_mirStepsIntra_not_exposesUb_of_empty_census` | An uncensused PC (or a body with empty census along any intra-frame trace from entry) exposes no UB, directly or through any continuation. |
+| Reconciler | `mem_unmappedFaultSites_iff`, `mem_unmappedFaultSitesWithRegistry_iff`, `reconcileFaultCoverage_verified_iff`, `reconcileFaultCoverage_unknown_nonempty`, `reconcileFaultCoverageWithRegistry_verified_iff`, `reconcileFaultCoverageWithRegistry_rejects_unemitted`, `reconcileFaultCoverage_mutation_detected`, `reconcileFaultCoverageWithRegistry_partial_site_rejected`, `reconcileFaultCoverageWithRegistry_append_verified_iff`, `reconcileFaultCoverageWithRegistry_mono` | Soundness/completeness of the fail-closed verdict; non-verified registry classes can never be discharged; stripping any census site (even when other classes at the same `(bb, stmt)` are discharged) is detected; append compositionality and registry monotonicity. |
+| End-to-end bridge | `stepMirFn_fault_in_discharged_of_reconciled`, `stepMirFn_exposesUb_in_discharged_of_reconciled`, `initMachineState_mirStepsIntra_reconciled_safety` | A reconciled body discharges (with an `emittedAndVerified` class) every UB exposure at a valid top-level PC and along any `MirStepsIntra` trace from `initMachineState`. |
 
-### 2.1 Semantic Precision Certificates (`[adv B1]` + `[adv A1]`)
+### 2.1 Semantic Precision Certificates (`[adv B1]` + `[adv A1]` + `[adv A2]`)
 
 | Declaration | What it proves against `Trusted.MirSemantics` |
 | :--- | :--- |
@@ -64,6 +66,10 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
 | `evalStmt_deinit_unprojected_ub_iff`, `evalStmt_deinit_deref_eq_unsupported`, `evalTerminator_drop_unprojected_ub_iff` (`[adv A1]`) | Unprojected `Deinit`/`Drop` fault iff `loc` is out of bounds or `.dead` (`[.storageLiveProtected]`, succeeding on `.uninit` slots); projected `Deinit`/`Drop` run `readProjectedValue`, which has no `.deref` arm (`Places.lean:1666`: `.deref` returns `.unsupported` immediately). |
 | `evalRvalue_cast_mutToConstPointer_ub_iff` (`[adv A1]`) | `CastKind.pointerCoercion "MutToConstPointer"` never faults beyond evaluating its operand (`censusCastKindFaultClasses = []`). |
 | `evalTerminator_diverging_call_exposesUb_destination_irrelevant` (`[adv A1]`) | Diverging `TerminatorKind.call` (`target = none`) never writes to `destination` (nor in `resumeExternalDivergingCall`), so `StepNodeExposesUb` is invariant to `destination`. |
+| `evalOperand_unprojected_copy_ub_iff`, `evalOperand_unprojected_move_ub_iff`, `evalOperand_ub_implies_mem_censusOperand` (`[adv A2]`) | Unprojected `Operand.copy` and `Operand.move` fault with `.ub` iff the local is out of bounds, `.uninit`, or `.dead` (`[.uninitRead]`), and any `.ub` of `evalOperand` implies `∃ cls ∈ censusOperandFaultClasses op`. |
+| `writePlaceValue_unprojected_ub_iff` (`[adv A2]`) | Unprojected `writePlaceValue` faults with `.ub` iff the local is out of bounds or `.dead` (succeeding on both `.uninit` and `.init _`). |
+| `evalStmt_intrinsic_assume_ub_iff` (`[adv A2]`) | `StatementKind.intrinsic (.assume op)` faults with `.ub` iff `evalOperand` returns `.ub` or `op` evaluates to a value other than `.scalar ⟨1, 1⟩` (`[.scalarNicheInvalid]`). |
+| `evalTerminator_assert_cleanup_or_terminate_ub_iff` (`[adv A2]`) | When `unwind` is `.cleanup _` or `.terminate`, `TerminatorKind.assert` faults with `.ub` iff `evalOperand` on `cond` returns `.ub` or `cond` evaluates to a non-scalar value (`[.scalarNicheInvalid]`). |
 | `witness*_site_live` (4 probes) + `witnessWrappingArith_census_precise` | `stepMirFn witness... (concrete state) = MirStepNode.fail .ub` by kernel evaluation at the exact site each mutant strips, plus non-faulting contrast states and `stepMirFn witnessWrappingArithBody (0, 4) = MirStepNode.unsupported` (`rfl`). |
 
 ---
@@ -125,7 +131,7 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
 
 ---
 
-## 5. Adversarial Round History (`[adv A0]` → `[adv B1]` → `[adv A1]` → `[adv B2]`)
+## 5. Adversarial Round History (`[adv A0]` → `[adv B1]` → `[adv A1]` → `[adv B2]` → `[adv A2]`)
 
 ### `[adv B1]` findings against `[adv A0]` (fixed in `[adv B1]`)
 
@@ -192,34 +198,54 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
 6. **Truncation** (`test_b2_truncated_real_modules_fail_closed`): every prefix of both real `rustc`-captured tutor modules fails closed until the complete `def body` record is present, and from then on yields exactly the full census.
 7. **Report history**: restored the `[adv B1]` findings, semantic subtleties, and known limitations that the `[adv A1]` rewrite dropped.
 
-### Semantic subtleties (carried from `[adv A0]`, verified in `[adv B1]`)
+### `[adv A2]` critique & repair of `[adv B2]` (scope-stack grammar, `ConstOperand`/`Ty` field validation, fuzzer coverage, multi-step trace & multi-item reconciliation)
 
-- `ValidMirPc` is required because an out-of-bounds PC faults without any syntactic site; `stepMirFn_preserves_validMirPc` keeps it invariant for top-level frames with in-bounds CFG targets.
+1. **Unclosed/mismatched `namespace` & nested `namespace Sub def body` fail-open in `check_strict_mir_module_grammar` (`fault_census_proto.rs`)**:
+   - In `[adv B2]`, `check_strict_mir_module_grammar` did not maintain a scope stack for `namespace` / `section` / `end`. As a consequence:
+     - A truncated `Mir/<Item>.lean` module cut off after `def body : CapturedMir := { ... }` (dropping `def defaultClaim` and `end Mir.FrameTutor.<item>`) was accepted as `Ok(sites)`; in fact, `[adv B2]`'s `test_b2_truncated_real_modules_fail_closed` had to weaken its assertion to `assert!(cut >= body_end)` instead of requiring the full module because prefixes truncated before `end <ModName>` were accepted.
+     - A nested `namespace Sub def body : CapturedMir := ... end Sub` inside `namespace Mir.Probe.item` defines `Mir.Probe.item.Sub.body` (not `Mir.Probe.item.body`), yet bypassed the `name == "body"` check because scope nesting depth was not tracked.
+     - Mismatched `namespace A ... end B` or stray `end Foo` commands were silently accepted.
+   - *Fix*: `check_strict_mir_module_grammar` now maintains an explicit `scope_stack` of open `("namespace" | "section", name)` scopes, requires every `end <name>` to match and pop the top of `scope_stack`, requires `scope_stack.is_empty()` at EOF, and requires `def body : CapturedMir` to appear at `scope_stack.len() == 1 && scope_stack[0].0 == "namespace"`. `test_b2_truncated_real_modules_fail_closed` is tightened so that **every** proper prefix (`cut < module.trim_end().len()`) of both real `rustc`-captured modules fails closed (`accepted == 1`).
+2. **`ConstOperand` and `Ty` missing-field fail-opens (`parse_const_operand`, `parse_ty_extract_fn_def`, `parse_captured_mir`)**:
+   - In `[adv B2]`, `parse_const_operand` allowed `Operand.constant { val := ConstValue.zeroSized }` (omitting `ty`), and `parse_ty_extract_fn_def` allowed `{ layoutIdx := 0 }` (omitting `kind`) or `{ kind := RigidTy.fnDef "core::intrinsics::unreachable" [] }` (omitting `layoutIdx`), silently defaulting `fn_def_path` to `None` and dropping `UnreachableTerminator` or direct-intrinsic fault classes.
+   - Additionally, `parse_captured_mir` and `parse_rigid_ty_extract_fn_def` skipped `localDecls`, `allocations`, `genericParams`, `traitImpls`, and `RigidTy.fnDef` `typeArgs` with `skip_balanced_expr()` instead of `parse_list`, accepting non-inline helper identifiers (`localDecls := externalDecls`).
+   - *Fix*: `parse_const_operand` now requires both `ty` and `val`; `parse_ty_extract_fn_def` requires both `kind` and `layoutIdx`; and `localDecls`, `allocations`, `genericParams`, `traitImpls`, and `RigidTy.fnDef` `typeArgs` require inline list syntax via `parse_list`.
+3. **`fuzz_captured_mir` statement/retag/aggregate omissions (`fault_census_proto.rs`)**:
+   - Despite claiming coverage of every IR statement, `fuzz_captured_mir` in `[adv B2]` omitted `IrStatementKind::ConstEvalCounter` (only generating 11 of 12 `IrStatementKind` variants), hard-coded `IrRetagKind::FnEntry` (omitting `TwoPhase`, `Raw`, `Default`), and hard-coded `IrMutability::Not` in `IrAggregateKind::RawPtr`.
+   - *Fix*: `fuzz_captured_mir` and `fuzz_rvalue` now generate `IrStatementKind::ConstEvalCounter`, all 4 `IrRetagKind` variants, and both `IrMutability::Not` and `IrMutability::Mut` in `IrAggregateKind::RawPtr`, verified by `test_a2_scope_stack_const_ty_multi_item_and_fuzz_completeness`.
+4. **Operand/place/assume/assert semantic precision, multi-step `MirStepsIntra` trace safety, and multi-item reconciliation (`FaultSiteCensusPrototype.lean` & `fault_census_proto.rs`)**:
+   - Added `evalOperand_unprojected_copy_ub_iff`, `evalOperand_unprojected_move_ub_iff`, `evalOperand_ub_implies_mem_censusOperand`, `writePlaceValue_unprojected_ub_iff`, `evalStmt_intrinsic_assume_ub_iff`, and `evalTerminator_assert_cleanup_or_terminate_ub_iff` in Section 5.
+   - Added multi-step intra-frame execution relation `MirStepsIntra`, `mirStepsIntra_preserves_validMirPc`, and `initMachineState_mirStepsIntra_exposesUb_in_census` in Section 8, plus `reconcileFaultCoverageWithRegistry_partial_site_rejected`, `reconcileFaultCoverageWithRegistry_append_verified_iff`, `reconcileFaultCoverageWithRegistry_mono`, `initMachineState_mirStepsIntra_reconciled_safety`, and `initMachineState_mirStepsIntra_not_exposesUb_of_empty_census` in Section 9.
+   - Added `ItemCoverageInput`, `MultiItemCoverageVerdict`, and `reconcile_multi_item_coverage` in Rust so multi-item / multi-callee batches enforce per-item coordinate isolation (preventing a discharged `(bb, stmt)` in a caller from masking an unmapped `(bb, stmt)` in a callee).
+
+### Semantic subtleties (carried from `[adv A0]`, verified in `[adv B1]`–`[adv A2]`)
+
+- `ValidMirPc` is required because an out-of-bounds PC faults without any syntactic site; `stepMirFn_preserves_validMirPc` and `mirStepsIntra_preserves_validMirPc` keep it invariant for top-level frames with in-bounds CFG targets across arbitrary-length intra-frame traces.
 - `.return_` reads `_0` and, in an inline frame, writes into the *caller's* `destination`, so its classes are attributed to the callee's return site.
 - The `.ub` of an out-of-bounds `Goto` happens on the *next* step.
 
 ### Known limitations (for later rounds)
 
-- Completeness remains existential in the class for constructs outside §2.1; extending class-precise attribution to operand reads, places, calls, and `copyNonOverlapping` is open.
-- The strict module grammar targets `anneal-rustc-capture` output. It rejects anything outside the emitter's command set, `open`s, and constructor namespaces, but it does not model Lean elaboration in general.
+- Completeness remains existential in the class for constructs outside §2.1 (such as projected deref reads/writes, `copyNonOverlapping`, and complex calls).
+- The strict module grammar targets `anneal-rustc-capture` output. It enforces balanced `namespace`/`section`/`end` scopes and rejects anything outside the emitter's command set, `open`s, and constructor namespaces, but it does not model Lean elaboration in general.
 - The cross-language differential is a `#guard`-checked experiment over compiled evaluation (not kernel `decide`); kernel-checked parity is limited to the witness bodies.
 
 ---
 
-## 6. Verification Receipts (`[adv B2]`)
+## 6. Verification Receipts (`[adv A2]`)
 
 All commands run from the repository root with `W = 1`.
 
-1. **Primary command**, exit `0` (`34.2 s` wall-clock):
+1. **Primary command**, exit `0`:
    ```bash
    cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib fault_census_proto && \
    cargo test --manifest-path crates/cargo-anneal/Cargo.toml fault_census_proto && \
    (cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean ../theory/Anneal/FaultSiteCensusPrototype.lean)
    ```
-   `16 passed, 0 failed, 1 ignored` (the manual Lean differential harness) on both test targets, `0` Rust warnings, and Lean `0` errors / `0` warnings.
-2. **Kernel axiom audit**: a scratch copy with `#print axioms` over all `203` public `def`/`theorem` declarations (`125` theorems), run via `anneal-lean-run --mode file --concurrency 1` outside the worktree. Result: `0` `sorryAx`, `0` `Lean.ofReduceBool`, and `113/125` theorems `Classical.choice`-free.
+   `17 passed, 0 failed, 1 ignored` (the manual Lean differential harness) on both test targets, `0` Rust warnings, and Lean `0` errors / `0` warnings.
+2. **Kernel axiom audit**: a scratch copy with `#print axioms` over all `214` public `def`/`theorem` declarations (`138` public theorems; `239` total `def`/`theorem` declarations / `163` total theorems including `private`), run via `anneal-lean-run --mode file --concurrency 1` outside the worktree. Result: `0` `sorryAx`, `0` `Lean.ofReduceBool`, and `147/163` total theorems `Classical.choice`-free.
 3. **Proof health**: `python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/FaultSiteCensusPrototype.lean` exits `0` with `0` findings.
-4. **Cross-language differential** (`[adv B2]`, optional): `FAULT_CENSUS_DIFF_DIR=<dir> cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib dump_lean_census_differential_corpus -- --ignored`, then `(cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean <dir>/LeanCensusDifferential.lean)`. Exit `0`: `400` `#guard`s, `4990` sites, all 12 classes, `55 s`. A corrupted copy exits `1`.
+4. **Cross-language differential** (`[adv B2]`, optional): `FAULT_CENSUS_DIFF_DIR=<dir> cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib dump_lean_census_differential_corpus -- --ignored`, then `(cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean <dir>/LeanCensusDifferential.lean)`. Exit `0`: `400` `#guard`s, all 12 classes.
 5. **Hygiene**: `git status --porcelain` is empty after commit, and `git diff --name-only a5e12e5fac628cc71522b67a1b427e17e2927818..HEAD` ⊆ {`PROTOTYPE_REPORT.md`, `crates/cargo-anneal/src/fault_census_proto.rs`, `crates/cargo-anneal/src/lib.rs`, `theory/Anneal/FaultSiteCensusPrototype.lean`}. There are zero internal hostnames, user paths, LDAPs, CL numbers, or internal model names.
 
 ---

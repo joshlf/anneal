@@ -1662,6 +1662,215 @@ theorem evalRvalue_cast_mutToConstPointer_ub_iff
   | ok val locals' =>
     split <;> simp_all
 
+/--
+`[adv A2]` Exact `.ub` characterization for reading an unprojected local operand
+`Operand.copy { local_ := loc, projection := [] }`: `evalOperand` returns `.ub` iff
+`loc` is out of bounds, `.dead`, or `.uninit`, matching
+`censusOperandFaultClasses (.copy { local_ := loc, projection := [] }) = [.uninitRead]`.
+-/
+theorem evalOperand_unprojected_copy_ub_iff
+    (locals : List LocalSlot) (loc : LocalIdx)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot) :
+    (evalOperand locals (.copy { local_ := loc, projection := [] })
+        borrows globals layouts callerLocals = .ub ↔
+      (get? locals loc = none ∨
+       get? locals loc = some .dead ∨
+       get? locals loc = some .uninit)) ∧
+    censusOperandFaultClasses (.copy { local_ := loc, projection := [] }) =
+      [.uninitRead] := by
+  refine ⟨?_, rfl⟩
+  dsimp only [evalOperand]
+  cases hGet : get? locals loc with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | dead => simp
+    | uninit => simp
+    | init v => simp [readProjectedValue]
+
+/--
+`[adv A2]` Exact `.ub` characterization for moving an unprojected local operand
+`Operand.move { local_ := loc, projection := [] }`: `evalOperand` returns `.ub` iff
+`loc` is out of bounds, `.dead`, or `.uninit`, matching
+`censusOperandFaultClasses (.move { local_ := loc, projection := [] }) = [.uninitRead]`.
+-/
+theorem evalOperand_unprojected_move_ub_iff
+    (locals : List LocalSlot) (loc : LocalIdx)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot) :
+    (evalOperand locals (.move { local_ := loc, projection := [] })
+        borrows globals layouts callerLocals = .ub ↔
+      (get? locals loc = none ∨
+       get? locals loc = some .dead ∨
+       get? locals loc = some .uninit)) ∧
+    censusOperandFaultClasses (.move { local_ := loc, projection := [] }) =
+      [.uninitRead] := by
+  refine ⟨?_, rfl⟩
+  dsimp only [evalOperand]
+  cases hGet : get? locals loc with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | dead => simp
+    | uninit => simp
+    | init v =>
+      rcases set?_eq_some_of_get?_eq_some locals loc (.init v) .uninit hGet with
+        ⟨locals', hSet⟩
+      simp [hSet]
+
+/--
+`[adv A2]` Operand-level census completeness: whenever `evalOperand` returns `.ub`,
+`censusOperandFaultClasses op` contains at least one justifying `MirFaultClass`
+(`.uninitRead` for `.copy`/`.move`, and `.boundsCheck`/`.scalarNicheInvalid`/`.uninitRead`
+for `.constant (.indirect _ _)`).
+-/
+theorem evalOperand_ub_implies_mem_censusOperand
+    (locals : List LocalSlot) (op : Operand)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (hUb : evalOperand locals op borrows globals layouts callerLocals = .ub) :
+    ∃ cls : MirFaultClass, cls ∈ censusOperandFaultClasses op := by
+  cases op with
+  | copy p =>
+    exact ⟨.uninitRead, by simp [censusOperandFaultClasses, censusPlaceReadFaultClasses]⟩
+  | move p =>
+    exact ⟨.uninitRead, by simp [censusOperandFaultClasses, censusPlaceReadFaultClasses]⟩
+  | constant c =>
+    cases hVal : c.val with
+    | indirect allocId offset =>
+      exact ⟨.boundsCheck, by simp [censusOperandFaultClasses, censusConstValueFaultClasses, hVal]⟩
+    | zeroSized | scalar _ | slice _ _ | unevaluated _ =>
+      have hNe := evalOperand_constant_non_indirect_ne_ub
+        locals c borrows globals layouts callerLocals
+        (by intro allocId offset hEq; rw [hVal] at hEq; nomatch hEq)
+      exact absurd hUb hNe.2
+
+/--
+`[adv A2]` Exact `.ub` characterization for writing to an unprojected local place
+`writePlaceValue locals borrows { local_ := loc, projection := [] } val`: returns
+`.ub` iff `loc` is out of bounds or `.dead` (succeeding on both `.uninit` and
+`.init _` slots).
+-/
+theorem writePlaceValue_unprojected_ub_iff
+    (locals : List LocalSlot) (borrows : List BorrowEntry)
+    (loc : LocalIdx) (val : Value) :
+    (writePlaceValue locals borrows { local_ := loc, projection := [] } val = .ub ↔
+      (get? locals loc = none ∨ get? locals loc = some .dead)) ∧
+    censusPlaceWriteFaultClasses { local_ := loc, projection := [] } =
+      [.storageLiveProtected, .treeBorrowsViolation] := by
+  refine ⟨?_, rfl⟩
+  dsimp only [writePlaceValue]
+  cases hGet : get? locals loc with
+  | none => simp
+  | some slot =>
+    cases slot with
+    | dead => simp
+    | uninit =>
+      rcases set?_eq_some_of_get?_eq_some locals loc .uninit (.init val) hGet with
+        ⟨locals', hSet⟩
+      simp [hSet]
+    | init v =>
+      rcases set?_eq_some_of_get?_eq_some locals loc (.init v) (.init val) hGet with
+        ⟨locals', hSet⟩
+      simp [hSet]
+
+/--
+`[adv A2]` Exact `.ub` characterization of `StatementKind.intrinsic (.assume op)`:
+faults with `.ub` iff `evalOperand` returns `.ub` (covered by `censusOperandFaultClasses op`)
+or `op` evaluates to a value other than `.scalar ⟨1, 1⟩` (covered by `.scalarNicheInvalid`
+in `censusIntrinsicFaultClasses (.assume op)`).
+-/
+theorem evalStmt_intrinsic_assume_ub_iff
+    (s : MachineState) (op : Operand) (span : String)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalStmt s ⟨.intrinsic (.assume op), span⟩ localDecls layouts = MirStepNode.fail .ub ↔
+      (evalOperand s.frame.locals op s.memory.borrows s.memory.globals
+          layouts s.memory.callerLocals = .ub ∨
+       ∃ val locals',
+         evalOperand s.frame.locals op s.memory.borrows s.memory.globals
+           layouts s.memory.callerLocals = .ok val locals' ∧
+         val ≠ .scalar ⟨1, 1⟩) := by
+  dsimp only [evalStmt]
+  cases hOp : evalOperand s.frame.locals op s.memory.borrows s.memory.globals
+      layouts s.memory.callerLocals with
+  | ub => simp
+  | unsupported => simp [mirStepNode_unsupported_ne_fail_ub]
+  | ok val locals' =>
+    simp only [reduceCtorEq, false_or]
+    cases val with
+    | scalar sc =>
+      rcases sc with ⟨bits, sizeBytes⟩
+      cases hSz : Nat.beq sizeBytes 1 <;> cases hBits : Nat.beq bits 1
+      · simp [hSz, hBits, MirStepNode.fail]
+        intro hB _
+        have : Nat.beq bits 1 = true := Nat.beq_eq.mpr hB
+        rw [hBits] at this; nomatch this
+      · simp [hSz, hBits, MirStepNode.fail]
+        intro _ hS
+        have : Nat.beq sizeBytes 1 = true := Nat.beq_eq.mpr hS
+        rw [hSz] at this; nomatch this
+      · simp [hSz, hBits, MirStepNode.fail]
+        intro hB _
+        have : Nat.beq bits 1 = true := Nat.beq_eq.mpr hB
+        rw [hBits] at this; nomatch this
+      · simp [MirStepNode.step, MirStepNode.fail,
+          Nat.beq_eq.mp hBits, Nat.beq_eq.mp hSz]
+    | unit | ptr _ _ | aggregate _ _ =>
+      simp [MirStepNode.fail]
+
+/--
+`[adv A2]` Exact `.ub` characterization of `TerminatorKind.assert` when `unwind` is
+`.cleanup _` or `.terminate`: because `applyUnwindAction` steps to `cleanupBb` or
+aborts without faulting on those unwind actions, `evalTerminator` faults with `.ub`
+iff `evalOperand` on `cond` returns `.ub` or `cond` evaluates to a non-scalar value.
+-/
+theorem evalTerminator_assert_cleanup_or_terminate_ub_iff
+    (s : MachineState) (cond : Operand) (expected : Bool)
+    (target : BasicBlockIdx) (unwind : UnwindAction) (span : String)
+    (currentBody : Option CapturedMir)
+    (hUnwind : (∃ bb, unwind = .cleanup bb) ∨ unwind = .terminate) :
+    let bodyLayouts := match currentBody with | some b => b.layouts | none => emptyLayoutTable
+    evalTerminator s ⟨.assert cond expected target unwind, span⟩ currentBody =
+        MirStepNode.fail .ub ↔
+      (evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
+          bodyLayouts s.memory.callerLocals = .ub ∨
+       ∃ val locals',
+         evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
+           bodyLayouts s.memory.callerLocals = .ok val locals' ∧
+         (∀ sc, val ≠ .scalar sc)) := by
+  intro bodyLayouts
+  change evalTerminator s ⟨.assert cond expected target unwind, span⟩ currentBody =
+      MirStepNode.fail .ub ↔ _
+  dsimp only [evalTerminator]
+  change (match evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
+      bodyLayouts s.memory.callerLocals with
+    | .ok (.scalar sc) locals' => _
+    | .ok _ _ => MirStepNode.fail .ub
+    | .ub => MirStepNode.fail .ub
+    | .unsupported => MirStepNode.unsupported) = MirStepNode.fail .ub ↔ _
+  cases hOp : evalOperand s.frame.locals cond s.memory.borrows s.memory.globals
+      bodyLayouts s.memory.callerLocals with
+  | ub => simp
+  | unsupported => simp [mirStepNode_unsupported_ne_fail_ub]
+  | ok val locals' =>
+    simp only [reduceCtorEq, false_or]
+    cases val with
+    | scalar sc =>
+      have hNotNonScalar : ¬ (∃ val' locals'', PlaceReadResult.ok (Value.scalar sc) locals' =
+          PlaceReadResult.ok val' locals'' ∧ ∀ sc', val' ≠ Value.scalar sc') := by
+        rintro ⟨val', locals'', hEq, hAll⟩
+        injection hEq with hV _
+        exact hAll sc hV.symm
+      simp only [hNotNonScalar, iff_false]
+      rcases hUnwind with ⟨bb, rfl⟩ | rfl
+      · cases Nat.beq sc.bits (match expected with | true => 1 | false => 0) <;>
+          simp [applyUnwindAction, MirStepNode.step, MirStepNode.fail]
+      · cases Nat.beq sc.bits (match expected with | true => 1 | false => 0) <;>
+          simp [applyUnwindAction, MirStepNode.step, MirStepNode.retOutcome, MirStepNode.fail]
+    | unit | ptr _ _ | aggregate _ _ =>
+      simp [MirStepNode.fail]
+
 /-! ## 6. Census Membership Lemmas & Completeness over `stepMirFn` -/
 
 /--
@@ -3321,6 +3530,62 @@ theorem validMirPc_return_inline
       · nomatch hStep
   · nomatch hStep
 
+/--
+`[adv A2]` Reflexive-transitive closure of top-level intra-frame transitions
+(`MirStepNode.step` or `MirStepNode.emitStep`) of `stepMirFn body`.
+-/
+inductive MirStepsIntra (body : CapturedMir) : MachineState → MachineState → Prop where
+  | refl (s : MachineState) : MirStepsIntra body s s
+  | step {s₁ s₂ s₃ : MachineState}
+      (hTop₁ : s₁.memory.activeCallee = none)
+      (hStack₁ : s₁.memory.callStack = [])
+      (hTop₂ : s₂.memory.activeCallee = none)
+      (hStep : stepMirFn body s₁ = MirStepNode.step s₂ ∨
+               ∃ obs, stepMirFn body s₁ = MirStepNode.emitStep obs s₂)
+      (hRest : MirStepsIntra body s₂ s₃) :
+      MirStepsIntra body s₁ s₃
+
+/--
+`[adv A2]` Multi-step `ValidMirPc` invariance: when `cfgTargetsInBounds body = true`,
+every state `s'` reachable via `MirStepsIntra body s s'` from a state satisfying
+`ValidMirPc body s.frame` satisfies `ValidMirPc body s'.frame`.
+-/
+theorem mirStepsIntra_preserves_validMirPc
+    (body : CapturedMir) {s s' : MachineState}
+    (hCfg : cfgTargetsInBounds body = true)
+    (hPc : ValidMirPc body s.frame)
+    (hSteps : MirStepsIntra body s s') :
+    ValidMirPc body s'.frame := by
+  induction hSteps with
+  | refl _ => exact hPc
+  | step hTop₁ hStack₁ hTop₂ hStep _ ih =>
+    exact ih (stepMirFn_preserves_validMirPc body _ _ hTop₁ hStack₁ hTop₂ hCfg hPc hStep)
+
+/--
+`[adv A2]` Multi-step entry-to-fault census completeness: starting from
+`initMachineState body args` on a body with `cfgTargetsInBounds body = true`,
+any reachable top-level state `s` (`MirStepsIntra body (initMachineState body args) s`)
+whose next step exposes `.ub` (`StepNodeExposesUb (stepMirFn body s)`) is censused
+in `censusMirBodyFaultSites body`.
+-/
+theorem initMachineState_mirStepsIntra_exposesUb_in_census
+    (body : CapturedMir) (args : List Value) (s : MachineState)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hSteps : MirStepsIntra body (initMachineState body args) s)
+    (hTop : s.memory.activeCallee = none)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ censusMirBodyFaultSites body := by
+  have hNonEmpty : 0 < length body.basicBlocks := by
+    unfold cfgTargetsInBounds at hCfg
+    rcases Bool.and_eq_true_iff.mp hCfg with ⟨hPos, _⟩
+    exact of_decide_eq_true hPos
+  have hPc₀ : ValidMirPc body (initMachineState body args).frame :=
+    validMirPc_initMachineState body args hNonEmpty
+  have hPc : ValidMirPc body s.frame :=
+    mirStepsIntra_preserves_validMirPc body hCfg hPc₀ hSteps
+  exact stepMirFn_exposesUb_in_census body s hTop hPc hUb
+
 /-! ## 9. Fail-Closed Coverage Reconciler & Soundness/Completeness Proofs -/
 
 /--
@@ -3590,6 +3855,143 @@ theorem stepMirFn_exposesUb_in_discharged_of_reconciled
       registry (censusMirBodyFaultSites body) discharged).mp hVer
   rcases hAll (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
   exact ⟨cls, hInDis, hReg⟩
+
+/--
+`[adv A2]` Partial-Site Class-Granularity Rejection Theorem
+(`reconcileFaultCoverageWithRegistry_partial_site_rejected`):
+if two distinct fault classes `cls₁` and `cls₂` share the same `(blockIdx, stmtIdx)`
+coordinate in `census`, discharging `(blockIdx, stmtIdx, cls₁)` (with
+`registry cls₁ = .emittedAndVerified`) while omitting `(blockIdx, stmtIdx, cls₂)`
+(`(blockIdx, stmtIdx, cls₂) ∉ discharged` or `registry cls₂ ≠ .emittedAndVerified`)
+still forces `reconcileFaultCoverageWithRegistry` to return
+`.unknownUnmappedFaultSites missing` with `(blockIdx, stmtIdx, cls₂) ∈ missing`
+and `(blockIdx, stmtIdx, cls₁) ∉ missing`.
+-/
+theorem reconcileFaultCoverageWithRegistry_partial_site_rejected
+    (registry : PropertyRegistry) (census discharged : List FaultSite)
+    (blockIdx stmtIdx : Nat) (cls₁ cls₂ : MirFaultClass)
+    (hMem₂ : (blockIdx, stmtIdx, cls₂) ∈ census)
+    (hDis₁ : (blockIdx, stmtIdx, cls₁) ∈ discharged)
+    (hReg₁ : registry cls₁ = .emittedAndVerified)
+    (hGap₂ : (blockIdx, stmtIdx, cls₂) ∉ discharged ∨
+             registry cls₂ ≠ .emittedAndVerified) :
+    ∃ missing : List FaultSite,
+      reconcileFaultCoverageWithRegistry registry census discharged =
+        .unknownUnmappedFaultSites missing ∧
+      (blockIdx, stmtIdx, cls₂) ∈ missing ∧
+      (blockIdx, stmtIdx, cls₁) ∉ missing := by
+  have hInUnm₂ : (blockIdx, stmtIdx, cls₂) ∈
+      unmappedFaultSitesWithRegistry registry census discharged :=
+    (mem_unmappedFaultSitesWithRegistry_iff registry census discharged
+      (blockIdx, stmtIdx, cls₂)).mpr ⟨hMem₂, hGap₂⟩
+  have hNotInUnm₁ : (blockIdx, stmtIdx, cls₁) ∉
+      unmappedFaultSitesWithRegistry registry census discharged := by
+    intro hIn
+    rcases (mem_unmappedFaultSitesWithRegistry_iff registry census discharged
+        (blockIdx, stmtIdx, cls₁)).mp hIn with ⟨_, hNotD | hNotR⟩
+    · exact hNotD hDis₁
+    · exact hNotR hReg₁
+  unfold reconcileFaultCoverageWithRegistry
+  cases hUnm : unmappedFaultSitesWithRegistry registry census discharged with
+  | nil =>
+    rw [hUnm] at hInUnm₂
+    nomatch hInUnm₂
+  | cons hd tl =>
+    refine ⟨hd :: tl, rfl, ?_, ?_⟩
+    · rw [← hUnm]; exact hInUnm₂
+    · rw [← hUnm]; exact hNotInUnm₁
+
+/--
+`[adv A2]` Multi-Body / Callee Compositionality Theorem
+(`reconcileFaultCoverageWithRegistry_append_verified_iff`):
+reconciling a combined census `census₁ ++ census₂` (e.g., a caller body combined with
+an inline callee or `#[external_spec]` body) returns `.verified` if and only if
+both `census₁` and `census₂` individually reconcile to `.verified`.
+-/
+theorem reconcileFaultCoverageWithRegistry_append_verified_iff
+    (registry : PropertyRegistry) (census₁ census₂ discharged : List FaultSite) :
+    reconcileFaultCoverageWithRegistry registry (census₁ ++ census₂) discharged = .verified ↔
+      (reconcileFaultCoverageWithRegistry registry census₁ discharged = .verified ∧
+       reconcileFaultCoverageWithRegistry registry census₂ discharged = .verified) := by
+  rw [reconcileFaultCoverageWithRegistry_verified_iff,
+      reconcileFaultCoverageWithRegistry_verified_iff,
+      reconcileFaultCoverageWithRegistry_verified_iff]
+  constructor
+  · intro hAll
+    refine ⟨fun s hs => hAll s (List.mem_append.mpr (Or.inl hs)),
+            fun s hs => hAll s (List.mem_append.mpr (Or.inr hs))⟩
+  · rintro ⟨h₁, h₂⟩ s hs
+    rcases List.mem_append.mp hs with hs₁ | hs₂
+    · exact h₁ s hs₁
+    · exact h₂ s hs₂
+
+/--
+`[adv A2]` Registry and Discharged-Set Monotonicity Theorem
+(`reconcileFaultCoverageWithRegistry_mono`):
+if `reconcileFaultCoverageWithRegistry reg₁ census discharged₁ = .verified`,
+`discharged₁ ⊆ discharged₂`, and every class verified in `reg₁` remains verified in
+`reg₂`, then `reconcileFaultCoverageWithRegistry reg₂ census discharged₂ = .verified`.
+-/
+theorem reconcileFaultCoverageWithRegistry_mono
+    (reg₁ reg₂ : PropertyRegistry) (census discharged₁ discharged₂ : List FaultSite)
+    (hVer : reconcileFaultCoverageWithRegistry reg₁ census discharged₁ = .verified)
+    (hSubDis : ∀ s ∈ discharged₁, s ∈ discharged₂)
+    (hSubReg : ∀ c : MirFaultClass,
+      reg₁ c = .emittedAndVerified → reg₂ c = .emittedAndVerified) :
+    reconcileFaultCoverageWithRegistry reg₂ census discharged₂ = .verified := by
+  rw [reconcileFaultCoverageWithRegistry_verified_iff] at hVer ⊢
+  intro site hInCensus
+  rcases hVer site hInCensus with ⟨hD₁, hR₁⟩
+  exact ⟨hSubDis site hD₁, hSubReg site.faultClass hR₁⟩
+
+/--
+`[adv A2]` Multi-step End-to-End Reconciled Trace Safety Theorem
+(`initMachineState_mirStepsIntra_reconciled_safety`):
+when `cfgTargetsInBounds body = true` and
+`reconcileFaultCoverageWithRegistry registry (censusMirBodyFaultSites body) discharged = .verified`,
+every top-level state `s` reachable from `initMachineState body args` via `MirStepsIntra`
+that exposes `.ub` on its next step is guaranteed to have its faulting `(blockIdx, stmtIdx, cls)`
+in `discharged` with `registry cls = .emittedAndVerified`.
+-/
+theorem initMachineState_mirStepsIntra_reconciled_safety
+    (registry : PropertyRegistry) (body : CapturedMir)
+    (discharged : List FaultSite) (args : List Value) (s : MachineState)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hVer : reconcileFaultCoverageWithRegistry registry
+      (censusMirBodyFaultSites body) discharged = .verified)
+    (hSteps : MirStepsIntra body (initMachineState body args) s)
+    (hTop : s.memory.activeCallee = none)
+    (hUb : StepNodeExposesUb (stepMirFn body s)) :
+    ∃ cls : MirFaultClass,
+      (s.frame.blockIdx, s.frame.stmtIdx, cls) ∈ discharged ∧
+      registry cls = .emittedAndVerified := by
+  rcases initMachineState_mirStepsIntra_exposesUb_in_census
+      body args s hCfg hSteps hTop hUb with ⟨cls, hInCensus⟩
+  have hAll :=
+    (reconcileFaultCoverageWithRegistry_verified_iff
+      registry (censusMirBodyFaultSites body) discharged).mp hVer
+  rcases hAll (s.frame.blockIdx, s.frame.stmtIdx, cls) hInCensus with ⟨hInDis, hReg⟩
+  exact ⟨cls, hInDis, hReg⟩
+
+/--
+`[adv A2]` Multi-step Zero-Census UB-Freedom Theorem
+(`initMachineState_mirStepsIntra_not_exposesUb_of_empty_census`):
+for any body with `cfgTargetsInBounds body = true` and `censusMirBodyFaultSites body = []`
+(such as `witnessPureNoopBody`), no top-level state `s` reachable from
+`initMachineState body args` via `MirStepsIntra` can ever expose `.ub`.
+-/
+theorem initMachineState_mirStepsIntra_not_exposesUb_of_empty_census
+    (body : CapturedMir) (args : List Value) (s : MachineState)
+    (hCfg : cfgTargetsInBounds body = true)
+    (hEmpty : censusMirBodyFaultSites body = [])
+    (hSteps : MirStepsIntra body (initMachineState body args) s)
+    (hTop : s.memory.activeCallee = none) :
+    ¬ StepNodeExposesUb (stepMirFn body s) := by
+  intro hUb
+  rcases initMachineState_mirStepsIntra_exposesUb_in_census
+      body args s hCfg hSteps hTop hUb with ⟨cls, hMem⟩
+  rw [hEmpty] at hMem
+  nomatch hMem
 
 /-! ## 10. Compile-Time Kernel-Checked Witness Bodies & 4 False-Proof Mutation Probes (`0` `native_decide`)
 
