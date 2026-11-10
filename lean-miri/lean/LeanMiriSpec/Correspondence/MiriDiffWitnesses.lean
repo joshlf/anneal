@@ -56,12 +56,14 @@ agreeing whole-program facts.
    raw pointer), `w3_use_after_storageDead_ub`, `w3_arith_offset_returns` (a
    returned `arith_offset` pointer), and `w3_arith_offset_uninit_ub`.
 4. Tree Borrows: `w4_child_write_then_parent_read_returns` (`I-10`),
-   `w4_safe_ref_return` (a returned `&u64`), `w4_unsafe_cell_vs_freeze`
+   `w4_safe_ref_return` (a returned `&u64`, from entry), `w4_unsafe_cell_vs_freeze`
    (`I-11`), and `w4_protected_reservedFrz_conflict_ub`, the last two with the
    agreeing `lean-miri` Tree Borrows accesses (`TreeBorrowsRel`,
    `Tree.NormalTreeState.performAccess`), and the boundary witness
-   `w4_disabled_read_divergence` (whole-program `lean-miri` runs do not check
-   Tree Borrows permissions).
+   `w4_disabled_read_divergence` (from entry, a read through a `Disabled`
+   reference is undefined behavior in Anneal, while `lean-miri`'s whole program,
+   which does not check Tree Borrows permissions, is `System.Safe` and returns
+   the read value).
 5. Multi-frame calls: `w5_call_return`, `w5_protector_release_returns`
    (`GlobalState.endCall` releasing a live protector on the way to an agreeing
    root return), `w5_callee_unreachable_ub`, and `w5_callee_uninit_return_ub`.
@@ -983,36 +985,796 @@ theorem w4_child_write_then_parent_read_returns :
         (.refl _)))))
     hmret rfl (by change (annealControlHooks.returnOperand () m₄).2 = _; rw [hop])
 
-/-- A safe reference `&u64` returned from the root frame (`LM-3.2`,
-`wit_lm3_2_placeMention_and_unified_return_ref_real_steps`):
+/-! ### Reference bodies from the entry state
+
+The traces below start at `initMachineState` / `miriEntryState`. Kernel
+evaluation checks the allocation-free prefix of `StorageLive` and constant
+assignments, and the `LM-3.2` step theorems check every later step. The helpers
+track `lean-miri`'s allocation supply: the only allocation, id `1`, belongs to
+the borrowed local, so every other local stays immediate. -/
+
+/-- A `StepRelLM3_2` step whose Anneal side is a normal step has a normal
+`lean-miri` step to `StateRelLM3_2`-related states. -/
+private theorem stepRelLM3_2_step_of_anneal_step
+    {body : CapturedMir} {m : AnnealStepState} {allocMap : List AllocMapEntry}
+    {aRes : MirStepNode} {mRes : Miri.Interpreter.StepResult AnnealStepState Bool}
+    {s' : MachineState}
+    (hsim : StepRelLM3_2 body m allocMap aRes mRes)
+    (ha : aRes = .step s') :
+    ∃ m', mRes = (m', .ok true) ∧ StateRelLM3_2 body s' m' allocMap := by
+  generalize ha_eq : aRes = aNode at hsim
+  cases hsim with
+  | step s₁ m' hrel =>
+    rw [ha] at ha_eq; injection ha_eq with hrun; injection hrun with hs; subst hs
+    exact ⟨m', rfl, hrel⟩
+  | retRoot _ _ _ _ _ _ _ _ _ => rw [ha] at ha_eq; cases ha_eq
+  | ub _ _ => rw [ha] at ha_eq; cases ha_eq
+
+/-- After `_dst = &bk _target` from `StateRel`-related states with an empty
+`lean-miri` machine, `lean-miri`'s allocation supply is ready with next id `2`
+(the promoted target is allocation `1`). -/
+private theorem step_ref_nextAllocId_two
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    (hstate : StateRel body s m)
+    {bb : BasicBlockData} {dstIdx targetIdx : Local} {bk : BorrowKind} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨targetIdx, .nil⟩), span⟩)
+    {dstDecl targetDecl : LocalDecl}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdecl_tgt : get? body.localDecls targetIdx = some targetDecl)
+    (htgt_ty : IsPrimScalarTy targetDecl.ty)
+    (hne : dstIdx ≠ targetIdx)
+    (himm : ∀ topFrame, m.stack.frames = #[topFrame] →
+      IsImmediateFrameLocal topFrame dstIdx ∧ IsImmediateFrameLocal topFrame targetIdx)
+    (hm_empty : m.machine = AnnealMachine.empty)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    AllocIdSupplyReady m'.machine.memory ∧ m'.machine.memory.nextAllocId = 2 := by
+  have hsupply : AllocIdSupplyReady m.machine.memory := hm_empty ▸ AllocIdSupplyReady.empty
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _⟩ := id hstate
+  obtain ⟨himm_dst, himm_tgt⟩ := himm tf hframes
+  obtain ⟨_, mls_d, _, hlt_d, _, hmls_d, hmls_d_eq, hloc_d⟩ := hfr.lookup_local hdecl_dst
+  have hcache_d : ∀ l, (tf.locals[dstIdx]'hlt_d).layout = some l →
+      l = translateTy dstDecl.ty body.layouts := by
+    rw [hmls_d_eq]; exact hloc_d.layout_eq
+  have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+  let tfa := cacheFrameLocalLayout tf dstIdx hlt_d (translateTy dstDecl.ty body.layouts)
+  have hfra : FrameRel body m.machine s.frame tfa := hfr.cache_local_layout hdecl_dst hlt_d
+  obtain ⟨_, mls_t, _, hlt_t, _, hmls_t, hmls_t_eq, hloc_t⟩ := hfra.lookup_local hdecl_tgt
+  have hcache_t : ∀ l, (tfa.locals[targetIdx]'hlt_t).layout = some l →
+      l = translateTy targetDecl.ty body.layouts := by
+    rw [hmls_t_eq]; exact hloc_t.layout_eq
+  have htgt_eval := annealEvalPlace_unprojected (m := { m with stack := ⟨#[tfa]⟩ }) rfl hlt_t
+    hdecl_tgt hcache_t
+  let tfb := cacheFrameLocalLayout tfa targetIdx hlt_t (translateTy targetDecl.ty body.layouts)
+  have hm_stmt : Miri.Interpreter.Step.evalStatement
+      (annealStepHooks body.localDecls body.layouts) ()
+      (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨targetIdx, .nil⟩), span⟩) m =
+      Miri.Interpreter.runRvalue
+        (Miri.Interpreter.evalRvalueIntoPlace (annealRvalueHooks body.localDecls body.layouts) ()
+          (.Ref .Erased (translateBorrowKind bk) ⟨targetIdx, #[]⟩) ⟨dstIdx, #[]⟩) m := rfl
+  have hval_tb : (tfb.locals[targetIdx]'(by rw [cacheFrameLocalLayout_size]; exact hlt_t)).value =
+      mls_t.value := by
+    simp [tfb, cacheFrameLocalLayout, hmls_t_eq]
+  cases hloc_t with
+  | indirect _ mp _ _ _ _ =>
+    exact absurd rfl (himm_tgt.cache_layout hlt_d _ _ hmls_t mp)
+  | dead _ _ =>
+    have hforce := annealForceAllocation_dead_eq (ld := body.localDecls) (ly := body.layouts)
+      (m := { m with stack := ⟨#[tfb]⟩ }) rfl
+      (by rw [cacheFrameLocalLayout_size]; exact hlt_t) hval_tb
+      (translateTy targetDecl.ty body.layouts)
+    have hm_err : Miri.Interpreter.Step.evalStatement
+        (annealStepHooks body.localDecls body.layouts) ()
+        (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨targetIdx, .nil⟩), span⟩) m =
+        ({ m with stack := ⟨#[tfb]⟩ }, .error (.undefinedBehavior "address of dead local")) := by
+      rw [hm_stmt]; unfold Miri.Interpreter.runRvalue
+      rw [evalRvalueIntoPlace_ref_force_error (region := .Erased)
+        (borrow := translateBorrowKind bk) hdst_eval htgt_eval hforce]
+    rw [miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err] at hstep
+    cases hstep
+  | immediate _ imm _ _ hval =>
+    have hlt_tb : targetIdx < tfb.locals.size := by
+      rw [cacheFrameLocalLayout_size]; exact hlt_t
+    have hlay_tb : (tfb.locals[targetIdx]'hlt_tb).layout =
+        some (translateTy targetDecl.ty body.layouts) := by
+      simp [tfb, cacheFrameLocalLayout]
+    obtain ⟨hsized, allocation, htry⟩ := htgt_ty.layout_ok (layouts := body.layouts)
+    obtain ⟨mem', hres⟩ := hsupply.reserve_eq
+    let freshId : Miri.Memory.AllocId := ⟨m.machine.memory.nextAllocId, hsupply.nonzero⟩
+    obtain ⟨alloc', hfill⟩ :
+        ∃ alloc' : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree),
+          (imm = .uninit ∧ alloc' = allocation.withExtra none) ∨
+          ∃ sc, imm = .scalar sc ∧
+            Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+              (Miri.Memory.allocRange Miri.ABI.Size.ZERO sc.size) sc
+              (allocation.withExtra none) = .ok () alloc' := by
+      rcases hval with ⟨rfl, rfl⟩ | ⟨v, rfl, himmRel⟩
+      · exact ⟨allocation.withExtra none, Or.inl ⟨rfl, rfl⟩⟩
+      · obtain ⟨sc, msc, rfl, rfl, hrel, hsz, _, _⟩ := himmRel.of_primitive_scalar htgt_ty
+        have htry' : Miri.Memory.Allocation.tryNew (translateSizeBytes sc.sizeBytes)
+            (translateTy targetDecl.ty body.layouts).layout.align.abi .Uninit
+            annealZeroedStorage = .ok allocation := hsz ▸ htry
+        obtain ⟨alloc'', hw'', -⟩ := freshStackAlloc_writeScalar_readScalar hrel htry'
+        exact ⟨alloc'', Or.inr ⟨_, rfl, hw''⟩⟩
+    have hforce₀ := forceAllocation_promote_eq (m := { m with stack := ⟨#[tfb]⟩ }) rfl hdecl_tgt
+      hlt_tb hlay_tb hval_tb hsized htry hres hfill
+    have hforce : annealForceAllocation body.localDecls body.layouts
+        ⟨.local 0 targetIdx none tf.localsIdentity, translateTy targetDecl.ty body.layouts⟩
+        { m with stack := ⟨#[tfb]⟩ } =
+        .ok (stackAllocPlace freshId)
+          { stack := ⟨#[{ tfb with
+              locals := tfb.locals.set targetIdx
+                { tfb.locals[targetIdx]'hlt_tb with
+                  value := .live (.indirect (stackAllocPlace freshId)) }
+                hlt_tb }]⟩
+            machine := stackAllocMachine m.machine mem' freshId alloc' } := by
+      unfold annealForceAllocation; erw [hforce₀]
+    have hrv := evalRvalueIntoPlace_ref_ok (region := .Erased)
+      (borrow := translateBorrowKind bk) hdst_eval htgt_eval hforce (stackAllocPlace_toRef freshId)
+    let tfc : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+      { tfb with
+        locals := tfb.locals.set targetIdx
+          { tfb.locals[targetIdx]'hlt_tb with
+            value := .live (.indirect (stackAllocPlace freshId)) }
+          hlt_tb }
+    let machc := stackAllocMachine m.machine mem' freshId alloc'
+    have hdc_eq : tfc.locals[dstIdx]? =
+        some { mls_d with layout := some (translateTy dstDecl.ty body.layouts) } := by
+      simp only [tfc, tfb, tfa, cacheFrameLocalLayout]
+      rw [Array.getElem?_set_ne _ (Ne.symm hne), Array.getElem?_set_ne _ (Ne.symm hne),
+        Array.getElem?_set_self, hmls_d_eq]
+    obtain ⟨hlt_dc, -⟩ := Array.getElem?_eq_some_iff.mp hdc_eq
+    have hget_dc := frame_getLocal_of_getElem? tfc dstIdx _ hdc_eq
+    cases hloc_d with
+    | indirect _ mp _ _ _ _ => exact absurd rfl (himm_dst _ hmls_d mp)
+    | dead _ _ =>
+      have hm_err : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨targetIdx, .nil⟩), span⟩) m =
+          (⟨⟨#[tfc]⟩, machc⟩, .error (.undefinedBehavior "write to dead local")) := by
+        rw [hm_stmt]; unfold Miri.Interpreter.runRvalue
+        rw [hrv, annealWriteImmediate_dead (m := ⟨⟨#[tfc]⟩, machc⟩) (id0 := tf.localsIdentity)
+          rfl hget_dc]
+      rw [miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err] at hstep
+      cases hstep
+    | immediate _ _ _ _ _ =>
+      have hw := annealWriteImmediate_live
+        (val := .scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+          ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr freshId),
+            .concrete freshId Miri.Memory.BorTag.one⟩))
+        (m := ⟨⟨#[tfc]⟩, machc⟩) (id0 := tf.localsIdentity)
+        (dstLay := translateTy dstDecl.ty body.layouts) rfl hlt_dc hget_dc
+      have hm_ok : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.ref bk ⟨targetIdx, .nil⟩), span⟩) m =
+          ({ (⟨⟨#[tfc]⟩, machc⟩ : AnnealStepState) with
+              stack := ⟨#[{ tfc with
+                locals := tfc.locals.set dstIdx
+                  { tfc.locals[dstIdx]'hlt_dc with
+                    value := .live (.immediate (.scalar
+                      (Miri.Memory.Scalar.fromPointer annealTargetDataLayout
+                        ⟨Miri.ABI.Size.ofBytes (annealStackBaseAddr freshId),
+                          .concrete freshId Miri.Memory.BorTag.one⟩))) }
+                  hlt_dc }]⟩ },
+            .ok ()) := by
+        rw [hm_stmt]; unfold Miri.Interpreter.runRvalue; rw [hrv, hw]
+      rw [miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_ok rfl
+        hfr.location_eq] at hstep
+      injection hstep with hm' _
+      subst hm'
+      obtain ⟨hsup', hnext', _⟩ := hsupply.of_stackAllocMachine
+        (by rw [hm_empty]; decide) (by rw [hm_empty]; intro h; cases h) hres alloc'
+      exact ⟨hsup', by rw [hnext', hm_empty]; rfl⟩
+
+/-- A direct constant write to the promoted local of allocation `1` keeps
+`lean-miri`'s allocation supply ready with next id `2`. -/
+private theorem step_direct_write_promoted_const_nextAllocId_two
+    {body : CapturedMir} {s : MachineState} {m m' : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    {bb : BasicBlockData} {dstIdx : Local} {c : ConstOperand} {span : String}
+    (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
+    (hstmt : get? bb.statements s.frame.stmtIdx =
+      some ⟨.assign ⟨dstIdx, .nil⟩ (.use (.constant c)), span⟩)
+    {dstDecl : LocalDecl}
+    (hdecl_dst : get? body.localDecls dstIdx = some dstDecl)
+    (hdst_prim : IsPrimScalarTy dstDecl.ty)
+    (hval_kind : c.ty.kind = dstDecl.ty.kind)
+    (hop : ∀ topFrame, m.stack.frames = #[topFrame] →
+      WellTypedScalarOperand body topFrame (.constant c) c.ty)
+    {e₀ : AllocMapEntry} (he₀ : e₀ ∈ allocMap) (he₀_loc : e₀.localIdx = dstIdx)
+    (ha1 : e₀.allocId = Witness.lm31AllocId1)
+    (hsupply : AllocIdSupplyReady m.machine.memory)
+    (hnext2 : m.machine.memory.nextAllocId = 2)
+    (hstep : Miri.Interpreter.Step.step
+      (annealStepHooks body.localDecls body.layouts) () m = (m', .ok true)) :
+    AllocIdSupplyReady m'.machine.memory ∧ m'.machine.memory.nextAllocId = 2 := by
+  cases he₀_loc
+  obtain ⟨tf, hframes, _, _, hfr, _, _, _, _, _, _, _⟩ := id hstate
+  have hop_tf := hop tf hframes
+  have hval_prim : IsPrimScalarTy c.ty := by
+    rcases hdst_prim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
+    · exact Or.inl (hval_kind.trans hk)
+    · exact Or.inr (Or.inl (hval_kind.trans hk))
+    · exact Or.inr (Or.inr (Or.inl ⟨it, hval_kind.trans hk⟩))
+    · exact Or.inr (Or.inr (Or.inr ⟨ut, hval_kind.trans hk⟩))
+  have hm_stmt := evalStatement_assign_use_eq body.localDecls body.layouts
+    ⟨e₀.localIdx, .nil⟩ (.constant c) span m
+  have htr_dst : translatePlace ⟨e₀.localIdx, .nil⟩ = ⟨e₀.localIdx, #[]⟩ := rfl
+  obtain ⟨slot_d, mls_d, _, hlt_d, hslot_d, _, hmls_d_eq, hloc_d⟩ := hfr.lookup_local hdecl_dst
+  have hcache_d : ∀ l, (tf.locals[e₀.localIdx]'hlt_d).layout = some l →
+      l = translateTy dstDecl.ty body.layouts := by
+    rw [hmls_d_eq]; exact hloc_d.cachedLayout_eq
+  have hdst_eval := annealEvalPlace_unprojected hframes hlt_d hdecl_dst hcache_d
+  let tfa := cacheFrameLocalLayout tf e₀.localIdx hlt_d (translateTy dstDecl.ty body.layouts)
+  have hstate_a := hstate.cache_layout hframes hdecl_dst hlt_d
+  have hop_tfa := hop_tf.of_cacheFrameLocalLayout e₀.localIdx hlt_d
+    (translateTy dstDecl.ty body.layouts)
+  rcases evalOperand_scalar_lm3_2_simulation hstate_a rfl hop_tfa hval_prim
+      (some (translateTy dstDecl.ty body.layouts)) with
+    ⟨m_op, msg_op, _, hm_op_ub⟩ |
+    ⟨sc, msc, tf', _, hm_op_ok, hstate_tf', himm_sc, _, htf'_preserve⟩
+  · have hm_err : Miri.Interpreter.Step.evalStatement
+        (annealStepHooks body.localDecls body.layouts) ()
+        (translateStmt ⟨.assign ⟨e₀.localIdx, .nil⟩ (.use (.constant c)), span⟩) m =
+        (m_op, .error (.undefinedBehavior msg_op)) := by
+      rw [hm_stmt, htr_dst]; unfold Miri.Interpreter.runRvalue
+      rw [EStateM.bind_eq_ok hdst_eval]; dsimp only []
+      have hassoc : ∀ (f : Miri.Interpreter.RvalueImmTy AnnealProv →
+          Miri.Interpreter.RvalueM AnnealStepState Unit) st,
+          ((annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c))
+            (some (translateTy dstDecl.ty body.layouts)) >>= fun opv =>
+            annealReadImmediate opv >>= f) st) =
+          (((annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c))
+            (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) >>= f) st) := by
+        intro f st; simp only [Bind.bind, EStateM.bind]; cases annealEvalOperand
+          body.localDecls body.layouts (translateOperand (.constant c))
+          (some (translateTy dstDecl.ty body.layouts)) st <;> rfl
+      rw [hassoc, EStateM.bind_eq_error hm_op_ub]
+    rw [miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err]
+      at hstep
+    cases hstep
+  · obtain ⟨tf₀', hframes_tf', _, _, hfr_tf', _, _, _, _, _, halloc_tf', _⟩ := id hstate_tf'
+    injection hframes_tf' with h₁; injection h₁ with htf'; subst htf'
+    obtain ⟨_, mls_dc, _, _, _, hmls_dc, _, _⟩ := hfr_tf'.lookup_local hdecl_dst
+    have hd_tfa : (tfa.locals[e₀.localIdx]?).map Miri.Interpreter.LocalState.value =
+        some mls_d.value := by
+      simp [tfa, cacheFrameLocalLayout, Array.getElem?_set_self, hmls_d_eq]
+    have hd_Val : mls_dc.value = mls_d.value := by
+      have hp := htf'_preserve e₀.localIdx; rw [hd_tfa, hmls_dc] at hp; injection hp
+    by_cases hsd_dead : slot_d = .dead
+    · subst hsd_dead
+      have hmd_dead : mls_d.value = .dead := by
+        cases hloc_d with
+        | lm3_1 h1 =>
+          cases h1 with
+          | base hb =>
+            cases hb with
+            | dead _ _ => rfl
+            | immediate _ _ _ _ hv => rcases hv with ⟨h, _⟩ | ⟨_, h, _⟩ <;> cases h
+            | indirect _ _ _ _ hne _ => exact absurd rfl hne
+      have hdc_dead : tf'.locals[e₀.localIdx]? = some ⟨.dead, mls_dc.layout⟩ := by
+        rw [hmls_dc]; rcases mls_dc with ⟨vd, ld⟩; dsimp only at hd_Val; rw [hd_Val, hmd_dead]
+      have hget_dc := frame_getLocal_of_getElem? tf' e₀.localIdx _ hdc_dead
+      have hm_err : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨e₀.localIdx, .nil⟩ (.use (.constant c)), span⟩) m =
+          ({ m with stack := ⟨#[tf']⟩ }, .error (.undefinedBehavior "write to dead local")) := by
+        rw [hm_stmt, htr_dst]; unfold Miri.Interpreter.runRvalue
+        rw [EStateM.bind_eq_ok hdst_eval]; dsimp only []
+        have hassoc : ∀ (f : Miri.Interpreter.RvalueImmTy AnnealProv →
+            Miri.Interpreter.RvalueM AnnealStepState Unit) st,
+            ((annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c))
+              (some (translateTy dstDecl.ty body.layouts)) >>= fun opv =>
+              annealReadImmediate opv >>= f) st) =
+            (((annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c))
+              (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) >>= f) st) := by
+          intro f st; simp only [Bind.bind, EStateM.bind]; cases annealEvalOperand
+            body.localDecls body.layouts (translateOperand (.constant c))
+            (some (translateTy dstDecl.ty body.layouts)) st <;> rfl
+        rw [hassoc, EStateM.bind_eq_ok hm_op_ok,
+          annealWriteImmediate_dead (m := { m with stack := ⟨#[tf']⟩ }) (id0 := tf.localsIdentity)
+            rfl hget_dc]
+      rw [miri_step_at_statement_error _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_err]
+        at hstep
+      cases hstep
+    · obtain ⟨⟨lay_e, hlay_e⟩, _, hsh_e⟩ :=
+        (halloc_tf'.local_alloc_sync tf' rfl e₀ he₀).1 slot_d hslot_d hsd_dead
+      obtain ⟨localAlloc, hfind_la, _, _, hshape_la⟩ := hsh_e dstDecl hdecl_dst
+      obtain ⟨hid_lt, _, hbase_e⟩ := halloc_tf'.base_addr_valid e₀ he₀
+      obtain ⟨sc', msc', hsc_eq, hmsc_eq, hrel_sc, hsz_sc, hbool_val, hchar_val⟩ :=
+        (himm_sc.of_ty_kind_eq hval_prim hval_kind).of_primitive_scalar hdst_prim
+      injection hsc_eq with hsc'; subst hsc'
+      have hmsc' : msc = msc' := by
+        injection hmsc_eq with h1; unfold Miri.Memory.Scalar.fromScalarInt at h1
+        injection h1 with h2; injection h2
+      subst hmsc'
+      have hshape_sc : StackScalarAllocShape (translateSizeBytes sc.sizeBytes)
+          localAlloc.allocation := hsz_sc ▸ hshape_la
+      obtain ⟨alloc', hw_alloc, -⟩ := hshape_sc.writeScalar_readScalar hrel_sc
+      have hmsc_sz : msc.size = (translateTy dstDecl.ty body.layouts).layout.size := by
+        rw [hrel_sc.size_eq, ← hsz_sc]
+      have hw_alloc_lay : Miri.Memory.Allocation.writeScalar annealTargetDataLayout
+          (Miri.Memory.allocRange Miri.ABI.Size.ZERO
+            (translateTy dstDecl.ty body.layouts).layout.size)
+          (.fromScalarInt msc) localAlloc.allocation = .ok () alloc' := by
+        rw [← hmsc_sz]; exact hw_alloc
+      have hval_sc : annealValidateScalarForTyId (translateTy dstDecl.ty body.layouts).ty
+          (.fromScalarInt msc) = true :=
+        annealValidateScalarForTyId_of_scalarRel hdst_prim hrel_sc hbool_val hchar_val
+      have hget_dc := frame_getLocal_of_getElem? tf' e₀.localIdx _ hlay_e
+      have hw_ind := annealWriteImmediate_indirect
+        (val := .scalar (.fromScalarInt msc))
+        (m := { m with stack := ⟨#[tf']⟩ }) (id0 := tf.localsIdentity)
+        (dstLay := translateTy dstDecl.ty body.layouts) rfl hget_dc
+      have hw_m := annealWriteMemoryPlace_zero_offset_scalar_ok hdst_prim hid_lt hbase_e hfind_la
+        hshape_la.mutability_eq hshape_la.byteSize_eq hmsc_sz hval_sc hw_alloc_lay
+        (borTag := Miri.Memory.BorTag.one) (st := { m with stack := ⟨#[tf']⟩ })
+      have hm_ok : Miri.Interpreter.Step.evalStatement
+          (annealStepHooks body.localDecls body.layouts) ()
+          (translateStmt ⟨.assign ⟨e₀.localIdx, .nil⟩ (.use (.constant c)), span⟩) m =
+          ({ stack := ⟨#[tf']⟩
+             machine := { m.machine with
+               memory := { m.machine.memory with
+                 live := (m.machine.memory.live.filter (fun x => x.1 != e₀.allocId)).push
+                   (e₀.allocId, ⟨localAlloc.kind, alloc'⟩) } } }, .ok ()) := by
+        rw [hm_stmt, htr_dst]; unfold Miri.Interpreter.runRvalue
+        rw [EStateM.bind_eq_ok hdst_eval]; dsimp only []
+        have hassoc : ∀ (f : Miri.Interpreter.RvalueImmTy AnnealProv →
+            Miri.Interpreter.RvalueM AnnealStepState Unit) st,
+            ((annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c))
+              (some (translateTy dstDecl.ty body.layouts)) >>= fun opv =>
+              annealReadImmediate opv >>= f) st) =
+            (((annealEvalOperand body.localDecls body.layouts (translateOperand (.constant c))
+              (some (translateTy dstDecl.ty body.layouts)) >>= annealReadImmediate) >>= f) st) := by
+          intro f st; simp only [Bind.bind, EStateM.bind]; cases annealEvalOperand
+            body.localDecls body.layouts (translateOperand (.constant c))
+            (some (translateTy dstDecl.ty body.layouts)) st <;> rfl
+        rw [hassoc, EStateM.bind_eq_ok hm_op_ok, hw_ind, stackAllocPlace, hw_m]
+      rw [miri_step_at_statement_ok _ hframes hfr.body_eq hfr.location_eq hbb hstmt hm_ok rfl
+        hfr_tf'.location_eq] at hstep
+      injection hstep with hm' _
+      subst hm'
+      refine ⟨hsupply.of_setLive ?_ _, hnext2⟩
+      rw [ha1, hnext2]; decide
+
+/-- With next allocation id `2`, every local other than the owner of allocation
+`1` is immediate in `lean-miri`'s root frame. -/
+private theorem isImmediateFrameLocal_of_nextAllocId_two
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_2 body s m allocMap)
+    (hsupply : AllocIdSupplyReady m.machine.memory)
+    (hnext2 : m.machine.memory.nextAllocId = 2)
+    {e : AllocMapEntry} (he : e ∈ allocMap) (ha1 : e.allocId = Witness.lm31AllocId1)
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    (hframes : m.stack.frames = #[tf])
+    (k : Nat) ( hk_ne : k ≠ e.localIdx) :
+    IsImmediateFrameLocal tf k := by
+  intro mls hmls mp hmp
+  obtain ⟨tf₀, hframes₀, _, _, hfr, _, _, _, _, _, halloc, hdisj⟩ := id hstate
+  rw [hframes] at hframes₀; injection hframes₀ with h0; injection h0 with htf; subst htf
+  have hmls_ind : tf.locals[k]? = some ⟨.live (.indirect mp), mls.layout⟩ := by
+    rw [hmls]; rcases mls with ⟨v0, l0⟩; dsimp only at hmp; subst hmp; rfl
+  obtain ⟨a, la, hprov_a, hl_a⟩ := hfr.indirect_allocId hmls_ind
+  have ha_lt2 : a.value.toNat < 2 := by
+    have hlt := hsupply.live (a, la) (Array.mem_toList_iff.mp hl_a)
+    rw [hnext2] at hlt
+    exact hlt
+  have ha_eq : a = Witness.lm31AllocId1 := by
+    have hpos : 0 < a.value.toNat := Nat.pos_of_ne_zero fun h => a.nonzero (UInt64.toNat_inj.mp h)
+    have hnat1 : a.value.toNat = 1 := by omega
+    have h1 : a.value = 1 := UInt64.toNat_inj.mp hnat1
+    rcases a with ⟨v, nz⟩
+    subst h1; rfl
+  subst ha_eq
+  have hnot_dead : get? s.frame.locals e.localIdx ≠ some .dead := by
+    intro hdead
+    have hfind_none := (halloc.local_alloc_sync tf hframes e he).2 hdead
+    rw [ha1] at hfind_none
+    have hfalse := Array.find?_eq_none.mp hfind_none (Witness.lm31AllocId1, la)
+      (Array.mem_toList_iff.mp hl_a)
+    simp at hfalse
+  obtain ⟨tgtDecl, hdecl_e, _⟩ := halloc.target_decl e he
+  obtain ⟨slot_e, _, _, _, hslot_e, _, _, _⟩ := hfr.lookup_local hdecl_e
+  have hs_ne : slot_e ≠ .dead := fun hd => hnot_dead (hslot_e.trans (congrArg some hd))
+  obtain ⟨⟨lay_e, hlay_e⟩, _, _⟩ :=
+    (halloc.local_alloc_sync tf hframes e he).1 slot_e hslot_e hs_ne
+  rw [ha1] at hlay_e
+  have hprov_e : (stackAllocPlace Witness.lm31AllocId1).ptr.provenance.bind
+      Miri.Memory.Provenance.getAllocId = some Witness.lm31AllocId1 := rfl
+  exact hdisj k e.localIdx mp (stackAllocPlace Witness.lm31AllocId1) mls.layout lay_e hk_ne
+    hmls_ind hlay_e (hprov_a.trans hprov_e.symm)
+
+/-- Body of the safe-reference return witness `w4_safe_ref_return`
+(`_0 : &u64`, `_1 : u64`):
 ```text
-bb0: _2 = &mut _1; PlaceMention(_2); PlaceMention(*_2); *_2 = const 55_u64;
-     _0 = move _2; return
+bb0: StorageLive(_1); _1 = const 42_u64; _0 = &_1; return
 ```
-Both machines run from the pre-state to a normal return of the reference
-(`ImmediateRelLM3_2`-related to the `Active` reborrow of `_1`). -/
+-/
+def safeRefReturnBody : CapturedMir where
+  defPath := "lm_4_3_witness::safe_ref_return"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [Witness.refU64Decl, Witness.u64Decl]
+  basicBlocks := [
+    { statements := [
+        Witness.mkStmt (.storageLive 1),
+        Witness.mkStmt (.assign (Witness.local_ 1) (.use (.constant (Witness.constU64 42)))),
+        Witness.mkStmt (.assign (Witness.local_ 0) (.ref .shared (Witness.local_ 1)))]
+      terminator := Witness.mkTerm .return_
+      isCleanup := false }]
+  fnAbi := Witness.fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Anneal's state after the allocation-free prefix `StorageLive(_1);
+_1 = const 42_u64` of `safeRefReturnBody`. -/
+def safeRefPreAnneal : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 2, locals := [.uninit, .init (.scalar ⟨42, 8⟩)] }
+    memory := (initMachineState safeRefReturnBody []).memory }
+
+/-- `lean-miri`'s root frame after the same prefix. -/
+def safeRefPreMiriFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody safeRefReturnBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy Witness.refU64Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+        layout := some (translateTy Witness.u64Ty) }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 2⟩ }
+
+/-- `lean-miri`'s state after the same prefix. -/
+def safeRefPreMiri : AnnealStepState :=
+  { stack := ⟨#[safeRefPreMiriFrame]⟩, machine := AnnealMachine.empty }
+
+theorem safeRef_prefix_anneal :
+    runAnnealBounded safeRefReturnBody 2 (initMachineState safeRefReturnBody []) =
+      .running safeRefPreAnneal := rfl
+
+theorem safeRef_prefix_miri :
+    runLoopFuel (annealMiriHooks safeRefReturnBody) 2 (miriEntryState safeRefReturnBody) =
+      .running safeRefPreMiri := rfl
+
+theorem safeRef_pre_stateRel_and_imm :
+    StateRel safeRefReturnBody safeRefPreAnneal safeRefPreMiri ∧
+    (∀ tf, safeRefPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k) := by
+  have himm : ∀ tf, safeRefPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k := by
+    intro tf h k mls hmls mp hmp
+    injection h with h₁; injection h₁ with h₂; subst h₂
+    match k with
+    | 0 | 1 => simp [safeRefPreMiriFrame] at hmls; subst hmls; cases hmp
+    | _ + 2 => simp [safeRefPreMiriFrame] at hmls
+  refine ⟨StateRel.mk safeRefPreMiriFrame rfl rfl ⟨translateTy Witness.refU64Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (himm _ rfl)), himm⟩
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 =>
+    have hs : slot = .uninit := by simpa [safeRefPreAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [safeRefPreMiriFrame] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = Witness.u64Decl := by simpa [safeRefReturnBody, get?] using hdecl.symm
+    have hs : slot = .init (.scalar ⟨42, 8⟩) := by simpa [safeRefPreAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+                      layout := some (translateTy Witness.u64Ty) } := by
+      simpa [safeRefPreMiriFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ (some (translateTy Witness.u64Ty)) (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl (fun h => nomatch h)
+        (fun h => nomatch h)⟩)
+  | _ + 2 => simp [safeRefReturnBody, get?] at hdecl
+
+/-- A safe reference `&u64` returned from the root frame (`safeRefReturnBody`:
+`StorageLive(_1); _1 = const 42_u64; _0 = &_1; return`). From
+`initMachineState safeRefReturnBody []` / `miriEntryState safeRefReturnBody`
+both machines return the reference to `_1`: Anneal returns
+`.ptr { allocId := 1, offsetBytes := 0 } 8`, and `lean-miri` returns an
+immediate that is `ImmediateRelLM3_2`-related to it through the shared borrow
+entry of `_1`. The reference step is `evalRvalue_ref_simulation` and the root
+return is `step_terminator_goto_return_lm3_2_simulation`. -/
 theorem w4_safe_ref_return :
-    ∃ (b : CapturedMir) (decl0 : LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
-      AgreeReturns b (annealMiriHooks b) (Witness.mkPre4AnnealLM32 b .uninit)
-        (Witness.mkPre4MiriLM32 b Witness.refU64Ty
-          { value := .live (.immediate .uninit), layout := none })
+    ∃ (decl0 : LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns safeRefReturnBody (annealMiriHooks safeRefReturnBody)
+        (initMachineState safeRefReturnBody []) (miriEntryState safeRefReturnBody)
         (.ptr { allocId := 1, offsetBytes := 0 } 8) (.immediate imm0) ∧
-      get? b.localDecls 0 = some decl0 ∧
+      get? safeRefReturnBody.localDecls 0 = some decl0 ∧
       ImmediateRelLM3_2
-        [{ refAllocMapEntry b.localDecls b.layouts (.mut false) 1 1 Witness.lm31AllocId1 with
-            perm := .active }]
-        decl0.ty b.layouts (.ptr { allocId := 1, offsetBytes := 0 } 8) imm0 := by
-  obtain ⟨b, s₁, s₂, s₃, s₄, s₅, m₁, m₂, m₃, m₄, m₅, decl0, imm0, hs₁, hm₁, hs₂, hm₂, hs₃, hm₃,
-    hs₄, hm₄, hs₅, hm₅, _, _, hret, hmret, hdecl0, hop, himm⟩ :=
-    Witness.wit_lm3_2_placeMention_and_unified_return_ref_real_steps.1
-  refine ⟨b, decl0, imm0, ?_, hdecl0, himm⟩
-  exact agreeReturns_of_paths (p := 0) rfl rfl
-    (.step .silent hs₁ (.step .silent hs₂ (.step .silent hs₃ (.step .silent hs₄
-      (.step .silent hs₅ (.refl _)))))) hret
-    (.step hm₁ (frames_ne_of_step_ok_true hm₂) (.step hm₂ (frames_ne_of_step_ok_true hm₃)
-      (.step hm₃ (frames_ne_of_step_ok_true hm₄) (.step hm₄ (frames_ne_of_step_ok_true hm₅)
-        (.step hm₅ (frames_ne_of_step_ok_true hmret) (.refl _))))))
-    hmret rfl (by change (annealControlHooks.returnOperand () m₅).2 = _; rw [hop])
+        [refAllocMapEntry safeRefReturnBody.localDecls safeRefReturnBody.layouts .shared 1 1
+          Witness.lm31AllocId1]
+        decl0.ty safeRefReturnBody.layouts (.ptr { allocId := 1, offsetBytes := 0 } 8) imm0 := by
+  let b := safeRefReturnBody
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  obtain ⟨hrel₀, himm₀⟩ := safeRef_pre_stateRel_and_imm
+  let entry := refAllocMapEntry b.localDecls b.layouts .shared 1 1 Witness.lm31AllocId1
+  let s₁ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3,
+                 locals := [.init (.ptr { allocId := 1, offsetBytes := 0 } 8),
+                            .init (.scalar ⟨42, 8⟩)] }
+      memory := { (initMachineState b []).memory with
+        borrows := [entry.toBorrowEntry], nextTag := 2 } }
+  have hs₁ : stepMirFn b safeRefPreAnneal = .step s₁ := rfl
+  have hsim₁ := evalRvalue_ref_simulation hrel₀.toLM3_1.toLM3_2 hphase
+    (dstIdx := 0) (targetIdx := 1) (bk := .shared)
+    rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨himm₀ tf htf 0, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty
+  obtain ⟨m₁, hm₁, hrel₁⟩ := stepRelLM3_2_step_of_anneal_step hsim₁ hs₁
+  change StateRelLM3_2 b s₁ m₁ [entry] at hrel₁
+  obtain ⟨hsup₁, hnext₁⟩ := step_ref_nextAllocId_two hrel₀ (dstIdx := 0) (targetIdx := 1)
+    (bk := .shared) rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨himm₀ tf htf 0, himm₀ tf htf 1⟩) rfl hm₁
+  have himm₁ : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 :=
+    fun tf htf => isImmediateFrameLocal_of_nextAllocId_two hrel₁ hsup₁ hnext₁
+      (List.Mem.head _) rfl htf 0 (by decide)
+  have hret : stepMirFn b s₁ = .retNormal (.ptr { allocId := 1, offsetBytes := 0 } 8) s₁.memory :=
+    rfl
+  have hsim₂ := step_terminator_goto_return_lm3_2_simulation hrel₁ hphase rfl rfl rfl rfl
+    (Or.inr (Or.inl ⟨rfl, Witness.refU64Decl, rfl, by decide, himm₁⟩))
+  rw [hret] at hsim₂
+  generalize hm₂_eq : Miri.Interpreter.Step.step
+    (annealStepHooks b.localDecls b.layouts) () m₁ = mRes₂ at hsim₂
+  cases hsim₂ with
+  | retRoot decl0 _ imm0 _ m₂ hdecl0 hop0 himm0 hm₂ =>
+    refine ⟨decl0, imm0, ?_, hdecl0, himm0⟩
+    exact agreeReturns_of_paths safeRef_prefix_anneal safeRef_prefix_miri
+      (.step .silent hs₁ (.refl _)) hret
+      (.step hm₁ (frames_ne_of_step_ok_true hm₂_eq) (.refl _))
+      hm₂_eq (by rw [hm₂]) (by change (annealControlHooks.returnOperand () m₁).2 = _; rw [hop0])
+
+/-- Body of the Tree Borrows boundary witness `w4_disabled_read_divergence`
+(`_0 _1 : u64`, `_2 : &mut u64`):
+```text
+bb0: StorageLive(_1); StorageLive(_2);
+     _1 = const 42_u64;
+     _2 = &mut _1;
+     _1 = const 77_u64;
+     _0 = copy *_2;
+     return
+```
+-/
+def disabledReadEntryBody : CapturedMir where
+  defPath := "lm_4_3_witness::disabled_read"
+  phase := .runtimePostCleanup
+  role := .subject
+  argCount := 0
+  localDecls := [Witness.u64Decl, Witness.u64Decl, Witness.refMutU64Decl]
+  basicBlocks := [
+    { statements := [
+        Witness.mkStmt (.storageLive 1),
+        Witness.mkStmt (.storageLive 2),
+        Witness.mkStmt (.assign (Witness.local_ 1) (.use (.constant (Witness.constU64 42)))),
+        Witness.mkStmt (.assign (Witness.local_ 2) (.ref (.mut false) (Witness.local_ 1))),
+        Witness.mkStmt (.assign (Witness.local_ 1) (.use (.constant (Witness.constU64 77)))),
+        Witness.mkStmt (.assign (Witness.local_ 0) (.use (.copy (Witness.derefLocal 2))))]
+      terminator := Witness.mkTerm .return_
+      isCleanup := false }]
+  fnAbi := Witness.fnAbiU64
+  layouts := emptyLayoutTable
+  allocations := []
+
+/-- Anneal's state after the allocation-free prefix `StorageLive(_1);
+StorageLive(_2); _1 = const 42_u64` of `disabledReadEntryBody`. -/
+def disabledReadPreAnneal : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 3, locals := [.uninit, .init (.scalar ⟨42, 8⟩), .uninit] }
+    memory := (initMachineState disabledReadEntryBody []).memory }
+
+/-- `lean-miri`'s root frame after the same prefix. -/
+def disabledReadPreMiriFrame :
+    Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
+  { body := translateBody disabledReadEntryBody
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none (translateTy Witness.u64Ty) (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[
+      { value := .live (.immediate .uninit), layout := none },
+      { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+        layout := some (translateTy Witness.u64Ty) },
+      { value := .live (.immediate .uninit), layout := none }]
+    vaList := #[]
+    trackCallerArg := none
+    location := .mir ⟨0, 3⟩ }
+
+/-- `lean-miri`'s state after the same prefix. -/
+def disabledReadPreMiri : AnnealStepState :=
+  { stack := ⟨#[disabledReadPreMiriFrame]⟩, machine := AnnealMachine.empty }
+
+theorem disabledRead_prefix_anneal :
+    runAnnealBounded disabledReadEntryBody 3 (initMachineState disabledReadEntryBody []) =
+      .running disabledReadPreAnneal := rfl
+
+theorem disabledRead_prefix_miri :
+    runLoopFuel (annealMiriHooks disabledReadEntryBody) 3 (miriEntryState disabledReadEntryBody) =
+      .running disabledReadPreMiri := rfl
+
+theorem disabledRead_pre_stateRel_and_imm :
+    StateRel disabledReadEntryBody disabledReadPreAnneal disabledReadPreMiri ∧
+    (∀ tf, disabledReadPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k) := by
+  have himm : ∀ tf, disabledReadPreMiri.stack.frames = #[tf] → ∀ k, IsImmediateFrameLocal tf k := by
+    intro tf h k mls hmls mp hmp
+    injection h with h₁; injection h₁ with h₂; subst h₂
+    match k with
+    | 0 | 1 | 2 => simp [disabledReadPreMiriFrame] at hmls; subst hmls; cases hmp
+    | _ + 3 => simp [disabledReadPreMiriFrame] at hmls
+  refine ⟨StateRel.mk disabledReadPreMiriFrame rfl rfl ⟨translateTy Witness.u64Ty, rfl⟩ ?_
+    rfl rfl rfl rfl rfl (MemoryAllocDisjoint.of_no_indirect _ (himm _ rfl)), himm⟩
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  intro i decl slot mls hdecl hslot hmls
+  match i with
+  | 0 | 2 =>
+    have hs : slot = .uninit := by simpa [disabledReadPreAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
+      simpa [disabledReadPreMiriFrame] using hmls.symm
+    subst hs hm
+    exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
+  | 1 =>
+    have hd : decl = Witness.u64Decl := by simpa [disabledReadEntryBody, get?] using hdecl.symm
+    have hs : slot = .init (.scalar ⟨42, 8⟩) := by simpa [disabledReadPreAnneal, get?] using hslot.symm
+    have hm : mls = { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
+                      layout := some (translateTy Witness.u64Ty) } := by
+      simpa [disabledReadPreMiriFrame] using hmls.symm
+    subst hd hs hm
+    exact .immediate _ _ (some (translateTy Witness.u64Ty)) (fun _ h => Option.some.inj h.symm)
+      (Or.inr ⟨_, rfl, .scalar _ _ Witness.lm31_scalarRel42 rfl (fun h => nomatch h) (fun h => nomatch h)⟩)
+  | _ + 3 => simp [disabledReadEntryBody, get?] at hdecl
+
+/-- **Tree Borrows boundary witness** (`LM-3.2`,
+`step_safeRef_deref_read_disabled_divergence`): in `disabledReadEntryBody` the
+direct write `_1 = const 77_u64` disables the reborrow `_2`. From
+`initMachineState disabledReadEntryBody []`, Anneal's read `copy *_2` is
+undefined behavior, so Anneal's whole program is not `TreeSafe`. From
+`miriEntryState disabledReadEntryBody`, `lean-miri`'s memory accesses run no
+borrow-tracker hooks (`annealMemoryCopyHooks_access_ok`): the read succeeds and
+the whole program returns `77_u64`, so `miriSystem` is `System.Safe` and
+partially correct for that value. Hence `TreeSafe ↔ System.Safe` fails on this
+body, which lies outside every agreed fragment. For `lean-miri`'s read and
+return steps the proof relates its state to an Anneal state whose borrow table
+holds the reborrow before it was disabled
+(`StateRelLM3_2.replace_borrows_skeleton`); this changes only the Anneal side
+of the relation, not the `lean-miri` state. -/
+theorem w4_disabled_read_divergence :
+    MirReachesUB (mirCallTree disabledReadEntryBody []) ∧
+    ¬ TreeSafe (mirCallTree disabledReadEntryBody []) ∧
+    (miriSystem (annealMiriHooks disabledReadEntryBody)).Safe
+      (miriEntryState disabledReadEntryBody) ∧
+    (∃ msc, ScalarRel ⟨77, 8⟩ msc ∧
+      (miriSystem (annealMiriHooks disabledReadEntryBody)).ReachesOutcome
+        (miriEntryState disabledReadEntryBody)
+        (.returned (.immediate (.scalar (.fromScalarInt msc)))) ∧
+      (miriSystem (annealMiriHooks disabledReadEntryBody)).PartialCorrect
+        (miriEntryState disabledReadEntryBody)
+        (· = .immediate (.scalar (.fromScalarInt msc)))) ∧
+    ¬ (TreeSafe (mirCallTree disabledReadEntryBody []) ↔
+      (miriSystem (annealMiriHooks disabledReadEntryBody)).Safe
+        (miriEntryState disabledReadEntryBody)) := by
+  let b := disabledReadEntryBody
+  have ha := anneal_ub_of_obs (body := b) (N := 7) (s := initMachineState b []) (by decide)
+  have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
+  obtain ⟨hrel₀, himm₀⟩ := disabledRead_pre_stateRel_and_imm
+  let entry := refAllocMapEntry b.localDecls b.layouts (.mut false) 1 1 Witness.lm31AllocId1
+  let entryDis : AllocMapEntry := { entry with perm := .disabled }
+  let s₁ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 4,
+                 locals := [.uninit, .init (.scalar ⟨42, 8⟩),
+                            .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
+      memory := { (initMachineState b []).memory with borrows := [entry.toBorrowEntry], nextTag := 2 } }
+  have hs₁ : stepMirFn b disabledReadPreAnneal = .step s₁ := rfl
+  have hsim₁ := evalRvalue_ref_simulation hrel₀.toLM3_1.toLM3_2 hphase
+    (dstIdx := 2) (targetIdx := 1) (bk := .mut false)
+    rfl rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) AllocIdSupplyReady.empty
+  obtain ⟨m₁, hm₁, hrel₁⟩ := stepRelLM3_2_step_of_anneal_step hsim₁ hs₁
+  obtain ⟨hsup₁, hnext₁⟩ := step_ref_nextAllocId_two hrel₀ (dstIdx := 2) (targetIdx := 1)
+    (bk := .mut false) rfl rfl rfl rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (by decide)
+    (fun tf htf => ⟨himm₀ tf htf 2, himm₀ tf htf 1⟩) rfl hm₁
+  let s₂ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 5,
+                 locals := [.uninit, .init (.scalar ⟨77, 8⟩),
+                            .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
+      memory := { (initMachineState b []).memory with borrows := [entryDis.toBorrowEntry], nextTag := 2 } }
+  have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
+  have hc77 : ∀ tf, WellTypedScalarOperand b tf (.constant (Witness.constU64 77)) Witness.u64Ty :=
+    fun tf => .constScalar (Witness.constU64 77) ⟨77, 8⟩ rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) (Or.inr (Or.inr (Or.inr (Or.inl rfl)))) (by decide) rfl
+      (fun h => nomatch h) (fun h => nomatch h)
+  have hsim₂ := step_direct_write_promoted_lm3_2_simulation hrel₁ hphase rfl rfl
+    (dstDecl := Witness.u64Decl) (valTy := Witness.u64Ty) rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) rfl (fun tf _ => hc77 tf) ⟨entry, List.Mem.head _, rfl⟩
+  obtain ⟨m₂, hm₂, hrel₂⟩ := stepRelLM3_2_step_of_anneal_step hsim₂ hs₂
+  change StateRelLM3_2 b s₂ m₂ [entryDis] at hrel₂
+  obtain ⟨hsup₂, hnext₂⟩ := step_direct_write_promoted_const_nextAllocId_two hrel₁ rfl rfl
+    (dstDecl := Witness.u64Decl) rfl (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) rfl
+    (fun tf _ => hc77 tf) (List.Mem.head _) rfl rfl hsup₁ hnext₁ hm₂
+  have himm₂ : ∀ tf, m₂.stack.frames = #[tf] →
+      IsImmediateFrameLocal tf 0 ∧ IsImmediateFrameLocal tf 2 :=
+    fun tf htf =>
+      ⟨isImmediateFrameLocal_of_nextAllocId_two hrel₂ hsup₂ hnext₂ (List.Mem.head _) rfl htf 0 (by decide),
+       isImmediateFrameLocal_of_nextAllocId_two hrel₂ hsup₂ hnext₂ (List.Mem.head _) rfl htf 2 (by decide)⟩
+  obtain ⟨_, m₃, tf₃, msc, hsc, hm₃, htf₃, hv₃⟩ :=
+    step_safeRef_deref_read_disabled_divergence hrel₂ hphase (Or.inl rfl) rfl rfl
+      (dstDecl := Witness.u64Decl) (refDecl := Witness.refMutU64Decl) rfl rfl rfl
+      (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) himm₂
+      (ptrVal := { allocId := 1, offsetBytes := 0 }) (e := entryDis) (sc := ⟨77, 8⟩)
+      rfl (List.Mem.head _) rfl rfl rfl rfl
+      (fun d hd => by injection hd with hd'; subst hd'; rfl) (fun h => nomatch h)
+  -- Ghost-borrow swap on `(s₂, m₂)` (`entryDis ↦ entry`): `m₂` is unchanged!
+  let s₂_act : MachineState :=
+    { s₂ with memory := { s₂.memory with borrows := [entry.toBorrowEntry] } }
+  have hrel₂_act : StateRelLM3_2 b s₂_act m₂ [entry] :=
+    hrel₂.replace_borrows_skeleton (am₂ := [entry]) (.cons ⟨rfl, rfl, rfl⟩ .nil)
+  let s₃_act : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 6,
+                 locals := [.init (.scalar ⟨77, 8⟩), .init (.scalar ⟨77, 8⟩),
+                            .init (.ptr { allocId := 1, offsetBytes := 0 } 8)] }
+      memory := { (initMachineState b []).memory with borrows := [entry.toBorrowEntry], nextTag := 2 } }
+  have hs₃_act : stepMirFn b s₂_act = .step s₃_act := rfl
+  have hsim₃ := step_safeRef_deref_read_simulation_explicit hrel₂_act hphase (Or.inl rfl)
+    rfl rfl (dstDecl := Witness.u64Decl) (refDecl := Witness.refMutU64Decl) rfl rfl rfl
+    (Or.inr (Or.inr (Or.inr ⟨.u64, rfl⟩))) himm₂
+    (fun ptrVal hp e he _ _ => by
+      have hp' : ptrVal = { allocId := 1, offsetBytes := 0 } := by
+        dsimp only [s₂_act, s₂, get?] at hp
+        injection hp with h1; injection h1 with h2; injection h2 with h3 _; exact h3.symm
+      cases he with
+      | tail _ h => cases h
+      | head _ =>
+        subst hp'
+        refine ⟨rfl, (fun h => nomatch h), fun d hd => ?_⟩
+        dsimp only [entry, refAllocMapEntry, b, disabledReadEntryBody, get?] at hd
+        injection hd with hd'; subst hd'; rfl)
+  obtain ⟨m₃', hm₃', hrel₃⟩ := stepRelLM3_2_step_of_anneal_step hsim₃ hs₃_act
+  have hm₃_eq : m₃ = m₃' := by rw [hm₃] at hm₃'; injection hm₃'
+  cases hm₃_eq
+  have himm₃_0 : ∀ tf, m₃.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 := by
+    intro tf htf mls hmls mp hmp
+    rw [htf₃] at htf; injection htf with h1; injection h1 with h2; subst h2
+    rw [hmls] at hv₃; simp [hmp] at hv₃
+  have hret_act : stepMirFn b s₃_act = .retNormal (.scalar ⟨77, 8⟩) s₃_act.memory := rfl
+  have hsim₄ := step_terminator_goto_return_lm3_2_simulation hrel₃ hphase rfl rfl rfl rfl
+    (Or.inr (Or.inl ⟨rfl, Witness.u64Decl, rfl, by decide, himm₃_0⟩))
+  rw [hret_act] at hsim₄
+  generalize hm₄_eq :
+    Miri.Interpreter.Step.step
+      (annealStepHooks disabledReadEntryBody.localDecls disabledReadEntryBody.layouts) () m₃ = mRes₄
+    at hsim₄
+  cases hsim₄ with
+  | retRoot _ _ imm0 _ m₄ _ hop0 _ hm₄_empty =>
+    have hop_msc : imm0 = .scalar (.fromScalarInt msc) := by
+      rcases htf_opt : tf₃.locals[0]? with _ | ⟨val0, lay0⟩
+      · simp [htf_opt] at hv₃
+      · simp [htf_opt] at hv₃
+        subst hv₃
+        have hget_fn := frame_getLocal_of_getElem? tf₃ 0 _ htf_opt
+        have hop_sc := annealControlHooks_returnOperand_scalar htf₃ hget_fn
+        rw [hop_sc] at hop0
+        injection hop0 with _ h1; injection h1 with h2; injection h2 with h3; exact h3.symm
+    subst hop_msc
+    have hpathM : MiriPath (annealMiriHooks b) (miriEntryState b) m₃ :=
+      (MiriPath.of_runLoopFuel disabledRead_prefix_miri).trans
+        (.step hm₁ (frames_ne_of_step_ok_true hm₂)
+          (.step hm₂ (frames_ne_of_step_ok_true hm₃)
+            (.step hm₃ (frames_ne_of_eq_singleton htf₃) (.refl _))))
+    have hemp₄ : m₄.stack.frames = #[] := by rw [hm₄_empty]
+    obtain ⟨hsafe, hreach, huniq⟩ := miri_safe_of_path_return hpathM hm₄_eq hemp₄
+      (by change (annealControlHooks.returnOperand () m₃).2 = _; rw [hop0])
+    exact ⟨ha.1, ha.2, hsafe, ⟨msc, hsc, hreach, fun v' hv' => by have := huniq _ hv'; injection this⟩,
+      fun hiff => ha.2 (hiff.mpr hsafe)⟩
 
 
 /-- `runMiriBoundedLM2_2` returns transfer to `RunLoop` returns. -/
@@ -1179,7 +1941,8 @@ theorem w2_union_init_prefix_lockstep :
       (s := Witness.lm24InitAnneal 1) (by decide)).1⟩
 
 /-- Whole-program safe union witness body (`pass_uninit_union_write_then_read`):
-`bb0: _1 = U { a: 5_u8 }; _0 = copy (_1.0: u8); return` (`_0 : u8`, `_1 : union U { a: u8, b: u32 }`). -/
+`bb0: StorageLive(_1); _1 = U { a: 5_u8 }; _0 = copy (_1.0: u8); return`
+(`_0 : u8`, `_1 : union U { a: u8, b: u32 }`). -/
 def unionRetBody : CapturedMir where
   defPath := "lm_4_3_witness::union_init_prefix_return"
   phase := .runtimePostCleanup
@@ -1188,6 +1951,7 @@ def unionRetBody : CapturedMir where
   localDecls := [Witness.lm24Decl Witness.lm24U8Ty, Witness.lm24Decl Witness.lm24UTy]
   basicBlocks := [
     { statements := [
+        { kind := .storageLive 1, span := "lm-4.3-witness" },
         Witness.lm24AggStmt 1 5,
         { kind := .assign ⟨0, .nil⟩ (.use (unionFieldReadOperand false 1 0 Witness.lm24U8Ty))
           span := "lm-4.3-witness" }]
@@ -1198,11 +1962,14 @@ def unionRetBody : CapturedMir where
   layouts := Witness.lm24Layouts
   allocations := []
 
-def unionRetInitAnneal : MachineState :=
-  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+/-- Anneal's state after the `StorageLive(_1)` step of `unionRetBody` from
+`initMachineState unionRetBody []` (`unionRet_prefix_anneal`). -/
+def unionRetPreAnneal : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 1, locals := [.uninit, .uninit] }
     memory := (initMachineState unionRetBody []).memory }
 
-def unionRetInitMiriFrame :
+/-- `lean-miri`'s root frame after the `StorageLive(_1)` step of `unionRetBody`. -/
+def unionRetPreMiriFrame :
     Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit :=
   { body := translateBody unionRetBody
     bodyIdentity := .ofCanonicalIndex 0
@@ -1217,46 +1984,62 @@ def unionRetInitMiriFrame :
       { value := .live (.immediate .uninit), layout := none }]
     vaList := #[]
     trackCallerArg := none
-    location := .mir ⟨0, 0⟩ }
+    location := .mir ⟨0, 1⟩ }
 
-def unionRetInitMiri : AnnealStepState :=
-  { stack := ⟨#[unionRetInitMiriFrame]⟩, machine := AnnealMachine.empty }
+/-- `lean-miri`'s state after the `StorageLive(_1)` step of `unionRetBody` from
+`miriEntryState unionRetBody` (`unionRet_prefix_miri`). -/
+def unionRetPreMiri : AnnealStepState :=
+  { stack := ⟨#[unionRetPreMiriFrame]⟩, machine := AnnealMachine.empty }
 
-theorem unionRet_init_stateRel : StateRel unionRetBody unionRetInitAnneal unionRetInitMiri := by
-  refine StateRel.mk unionRetInitMiriFrame rfl rfl
+theorem unionRet_prefix_anneal :
+    runAnnealBounded unionRetBody 1 (initMachineState unionRetBody []) =
+      .running unionRetPreAnneal := rfl
+
+theorem unionRet_prefix_miri :
+    runLoopFuel
+      (.ofHooks (annealStepHooksLM2_4 unionRetBody.localDecls unionRetBody.layouts)
+        annealControlHooks) 1 (miriEntryState unionRetBody) =
+      .running unionRetPreMiri := rfl
+
+theorem unionRet_pre_stateRel : StateRel unionRetBody unionRetPreAnneal unionRetPreMiri := by
+  refine StateRel.mk unionRetPreMiriFrame rfl rfl
     ⟨translateTy Witness.lm24U8Ty Witness.lm24Layouts, rfl⟩ ?_ rfl rfl rfl rfl rfl (by
       intro i _ _ _ _ _ _ hi _
-      match i with | 0 | 1 | _ + 2 => simp [unionRetInitMiriFrame] at hi)
+      match i with | 0 | 1 | _ + 2 => simp [unionRetPreMiriFrame] at hi)
   refine ⟨rfl, rfl, rfl, rfl, ?_⟩
   intro i decl slot mls hdecl hslot hmls
   match i with
   | 0 | 1 =>
-    have hs : slot = .uninit := by simpa [unionRetInitAnneal, get?] using hslot.symm
+    have hs : slot = .uninit := by simpa [unionRetPreAnneal, get?] using hslot.symm
     have hm : mls = { value := .live (.immediate .uninit), layout := none } := by
-      simpa [unionRetInitMiriFrame] using hmls.symm
+      simpa [unionRetPreMiriFrame] using hmls.symm
     subst hs hm
     exact .immediate .uninit .uninit none (fun _ h => nomatch h) (Or.inl ⟨rfl, rfl⟩)
   | _ + 2 => simp [unionRetBody, get?] at hdecl
 
-theorem unionRet_init_imm (j : Nat) :
-    ∀ tf, unionRetInitMiri.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
+theorem unionRet_pre_imm (j : Nat) :
+    ∀ tf, unionRetPreMiri.stack.frames = #[tf] → IsImmediateFrameLocal tf j := by
   intro tf h mls hmls mp hv
-  have htf : unionRetInitMiriFrame = tf := by simpa [unionRetInitMiri] using h
+  have htf : unionRetPreMiriFrame = tf := by simpa [unionRetPreMiri] using h
   subst htf
   match j with
-  | 0 | 1 => simp [unionRetInitMiriFrame] at hmls; subst hmls; cases hv
-  | _ + 2 => simp [unionRetInitMiriFrame] at hmls
+  | 0 | 1 => simp [unionRetPreMiriFrame] at hmls; subst hmls; cases hv
+  | _ + 2 => simp [unionRetPreMiriFrame] at hmls
 
-/-- **Whole-program `AgreeReturns` safe union witness**: `_1 = U { a: 5_u8 };
-_0 = copy (_1.0: u8); return` runs from `StateRel`-related pre-states through
-`annealStepHooksLM2_4` to an agreeing root return of `5_u8` (`ImmediateRel`) while
-`_1` holds the partially initialized union (`IsUnionPrefixMask 4 1`). -/
+/-- **Whole-program `AgreeReturns` safe union witness**: `unionRetBody`
+(`StorageLive(_1); _1 = U { a: 5_u8 }; _0 = copy (_1.0: u8); return`) runs from
+the entry states `initMachineState unionRetBody []` / `miriEntryState unionRetBody`
+through `annealStepHooksLM2_4` to an agreeing root return of `5_u8`
+(`ImmediateRel`). The trace goes through `step_union_aggregate_simulation` and
+`step_union_field_read_simulation`: `_1` is read while only its `u8` prefix is
+initialized. -/
 theorem w2_union_init_prefix_returns :
     ∃ imm0,
       AgreeReturns unionRetBody
         (.ofHooks (annealStepHooksLM2_4 unionRetBody.localDecls unionRetBody.layouts)
           annealControlHooks)
-        unionRetInitAnneal unionRetInitMiri (.scalar ⟨5, 1⟩) (.immediate imm0) ∧
+        (initMachineState unionRetBody []) (miriEntryState unionRetBody)
+        (.scalar ⟨5, 1⟩) (.immediate imm0) ∧
       ImmediateRel Witness.lm24U8Ty Witness.lm24Layouts (.scalar ⟨5, 1⟩) imm0 := by
   let b := unionRetBody
   have hphase : ∀ p, b.phase ≠ .other p := fun _ h => nomatch h
@@ -1264,20 +2047,20 @@ theorem w2_union_init_prefix_returns :
     fun tf => .constScalar (Witness.lm24ConstU8 5) ⟨5, 1⟩ rfl Witness.lm24_isPrim_u8 (Or.inl rfl)
       (by decide) rfl (fun h => nomatch h) (fun h => nomatch h)
   let s₁ : MachineState :=
-    { frame := { blockIdx := 0, stmtIdx := 1,
+    { frame := { blockIdx := 0, stmtIdx := 2,
                  locals := [.uninit, .init (.aggregate 0 [.scalar ⟨5, 1⟩])] }
       memory := (initMachineState b []).memory }
   let s₂ : MachineState :=
-    { frame := { blockIdx := 0, stmtIdx := 2,
+    { frame := { blockIdx := 0, stmtIdx := 3,
                  locals := [.init (.scalar ⟨5, 1⟩), .init (.aggregate 0 [.scalar ⟨5, 1⟩])] }
       memory := (initMachineState b []).memory }
-  have hs₁ : stepMirFn b unionRetInitAnneal = .step s₁ := rfl
+  have hs₁ : stepMirFn b unionRetPreAnneal = .step s₁ := rfl
   have hs₂ : stepMirFn b s₁ = .step s₂ := rfl
   have hs₃ : stepMirFn b s₂ = .retNormal (.scalar ⟨5, 1⟩) s₂.memory := rfl
-  obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation unionRet_init_stateRel.toLM2_4
+  obtain ⟨_, hpost₁⟩ := step_union_aggregate_simulation unionRet_pre_stateRel.toLM2_4
     List.Pairwise.nil MemoryHighWater.empty.canReserveAllocId hphase
     (u := 1) (bb := _) rfl rfl rfl Witness.lm24_wt_U rfl rfl rfl
-    (unionRet_init_imm 1) Witness.lm24_isPrim_u8 (fun tf _ => hc5 tf) (by decide)
+    (unionRet_pre_imm 1) Witness.lm24_isPrim_u8 (fun tf _ => hc5 tf) (by decide)
   obtain ⟨sc, mp, m₁, tf₁, hm₁, hop_val, hstate₁, hu_slot₁, hframes₁, ⟨c₁, hmls_u₁⟩,
     hmem₁, hnodup₁, himm₁, _, _, _, hhw₁⟩ := hpost₁ s₁ hs₁
   have hsc : sc = ⟨5, 1⟩ := by injection hop_val with h _; injection h with h; exact h.symm
@@ -1289,7 +2072,7 @@ theorem w2_union_init_prefix_returns :
     subst h; exact ⟨c₁, hmls_u₁⟩
   have hr_imm₁ : ∀ tf, m₁.stack.frames = #[tf] → IsImmediateFrameLocal tf 0 := by
     intro tf htf; rw [hframes₁] at htf; have h : tf₁ = tf := by simpa using htf
-    subst h; exact himm₁ _ rfl 0 (by decide) (unionRet_init_imm 0 _ rfl)
+    subst h; exact himm₁ _ rfl 0 (by decide) (unionRet_pre_imm 0 _ rfl)
   obtain ⟨hrel₂, _, hmach₂⟩ := (step_union_field_read_simulation hstate₁ hnodup₁ hphase
     (r := 0) (u := 1) (j := 0) (fty := Witness.lm24U8Ty) (isMove := false)
     rfl rfl rfl rfl rfl Witness.lm24_isPrim_u8 (Or.inl rfl) rfl Witness.lm24_wt_U rfl (by decide)
@@ -1312,7 +2095,7 @@ theorem w2_union_init_prefix_returns :
       subst hsl₁
       rw [hmls₀] at hm₀; injection hm₀ with hm₀; subst hm₀
       rcases mls₀ with ⟨v₀, lay₀⟩; dsimp only at hmp₀; subst hmp₀
-      have hc_init : unionRetInitMiri.machine.memory.nextAllocId.toNat = 1 := rfl
+      have hc_pre : unionRetPreMiri.machine.memory.nextAllocId.toNat = 1 := rfl
       dsimp only at hhw₁' hnext₁
       have hid_eq1 : ∀ (id : Miri.Memory.AllocId) la,
           (id, la) ∈ m₂.machine.memory.live.toList → id.value.toNat = 1 := by
@@ -1367,15 +2150,14 @@ theorem w2_union_init_prefix_returns :
       (annealStepHooksLM2_4 b.localDecls b.layouts) () m₂ = mRes₃ at hsim₃
     cases hsim₃ with
     | retRoot decl0 _ imm0 _ m₃ hdecl0 hop0 himm0 hm₃ =>
-      subst hm₃
       have hd0 : decl0 = Witness.lm24Decl Witness.lm24U8Ty := Option.some.inj hdecl0.symm
       subst hd0
       refine ⟨imm0, ?_, himm0⟩
-      exact agreeReturns_of_paths (p := 0) rfl rfl
+      exact agreeReturns_of_paths unionRet_prefix_anneal unionRet_prefix_miri
         (.step .silent hs₁ (.step .silent hs₂ (.refl _))) hs₃
-        (.step hm₁ (frames_ne_of_step_ok_true hm₂_eq)
+        (.step hm₁ (frames_ne_of_eq_singleton hframes₁)
           (.step hm₂_eq (frames_ne_of_step_ok_true hm₃_eq) (.refl _)))
-        hm₃_eq rfl (by change (annealControlHooks.returnOperand () m₂).2 = _; rw [hop0])
+        hm₃_eq (by rw [hm₃]) (by change (annealControlHooks.returnOperand () m₂).2 = _; rw [hop0])
 
 /-! ## 6. Intrinsics (memory) -/
 
@@ -1458,34 +2240,6 @@ theorem w6_write_bytes_oob_ub :
   obtain ⟨tf₁, htf₁, _⟩ := id hrel₁
   exact agreeUB_of_paths (p := 0) rfl rfl (.step .silent hs₁ (.refl _)) hfail
     (.step hm₁ (frames_ne_of_eq_singleton htf₁) (.refl _)) herr rfl
-
-/-- **Tree Borrows boundary witness** (`LM-3.2`,
-`step_safeRef_deref_read_disabled_divergence`): in
-`_2 = &mut _1; _1 = 77_u64; _0 = copy *_2` the direct write to `_1` disables the
-reborrow `_2`, so Anneal's read through `_2` is undefined behavior, while
-`lean-miri`'s run, whose memory accesses run no borrow-tracker hooks
-(`annealMemoryCopyHooks_access_ok`), performs the read and continues with
-`_0 = 77`. -/
-theorem w4_disabled_read_divergence :
-    ∃ (b : CapturedMir) (m₃ : AnnealStepState) (msc : Miri.Memory.ScalarInt)
-      (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
-      MirReachesUB (mirTree b (Witness.mkPre4AnnealLM32 b (.init (.scalar ⟨42, 8⟩)))) ∧
-      ¬ TreeSafe (mirTree b (Witness.mkPre4AnnealLM32 b (.init (.scalar ⟨42, 8⟩)))) ∧
-      (miriSystem (annealMiriHooks b)).Reaches
-        (Witness.mkPre4MiriLM32 b Witness.u64Ty
-          { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
-            layout := some (translateTy Witness.u64Ty) }) m₃ ∧
-      ScalarRel ⟨77, 8⟩ msc ∧ m₃.stack.frames = #[tf₃] ∧
-      (tf₃.locals[0]?).map Miri.Interpreter.LocalState.value =
-        some (.live (.immediate (.scalar (.fromScalarInt msc)))) := by
-  obtain ⟨b, s₁, s₂, m₁, m₂, m₃, tf₃, msc, hs₁, hm₁, hs₂, hm₂, _, hfail, hsc, hm₃, htf₃, hv⟩ :=
-    Witness.wit_lm3_2_dangling_copy_move_and_perm_divergences_real_steps.2.2.2
-  have hA := anneal_fault_of_path (.step .silent hs₁ (.step .silent hs₂ (.refl _))) hfail
-  exact ⟨b, m₃, msc, tf₃, hA.2 rfl, hA.1,
-    (MiriPath.step hm₁ (frames_ne_of_step_ok_true hm₂)
-      (.step hm₂ (frames_ne_of_step_ok_true hm₃)
-        (.step hm₃ (frames_ne_of_eq_singleton htf₃) (.refl _)))).reaches,
-    hsc, htf₃, hv⟩
 
 /-- `I-11` (`pass_tb_unsafe_cell_shared_mutation`): through `&UnsafeCell<u32>`
 (a `Cell` tag), a foreign write through an unrelated raw pointer leaves the

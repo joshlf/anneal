@@ -117,7 +117,8 @@ Agreed fragments (kernel-certified per step, lifted here):
 * `LM-2.1` arrays (`Index`, `ConstantIndex`, `Len`, `Repeat`); `LM-2.2` structs
   and tuples with padding; `LM-2.3` multi-variant enums (`Downcast`,
   `SetDiscriminant`, `Discriminant`, `SwitchInt`); `LM-2.4` unions (initialized
-  prefixes, uninitialized bytes).
+  prefixes, uninitialized bytes) and in-bounds array `Subslice` projections
+  (`evalProjection_subslice_simulation`, `step_subslice_assign_simulation`).
 * `LM-3.1` raw pointers (`&raw`, `*ptr`, `Offset`, `StorageDead`
   use-after-free); `LM-3.2` references and the Tree Borrows hierarchy; `LM-3.3`
   6-state Tree Borrows (`I-10`, `I-11`, protectors) at the level of
@@ -215,7 +216,9 @@ Anneal's `activeMirBody`.
 
 Return correspondence: the certified single-frame root-return steps are
 `step_terminator_goto_return_simulation` (and its `LM-2.2`, `LM-3.1`, `LM-3.2`
-versions) for a sized scalar `_0`, `step_terminator_return_rawPtr_lm3_1_simulation`
+versions) for a sized immediate `_0`, `step_return_scalar_lm2_3_simulation`
+(`LM-2.3`) and `step_terminator_return_lm2_4_simulation` (`LM-2.4`, with live
+union locals) for a scalar `_0`, `step_terminator_return_rawPtr_lm3_1_simulation`
 for a raw-pointer `_0` (`StepObsRelLM3_1`, `PtrRetRel`), and the `LM-2.2` /
 `LM-2.3` aggregate returns; a zero-sized `()` root return is certified only
 for the `LM-4.1` interpreter (`wit_lm4_1_zst_unit_return_simulation`).
@@ -231,8 +234,9 @@ Further boundaries of the whole-program agreement:
   (`LM-3.3`), and a `miriSystem` run does not report the permission
   violations that make Anneal fault, Anneal's `TreeBorrowPerm` checks being
   stricter: `MiriDiffWitnesses.w4_disabled_read_divergence` reads through a
-  `Disabled` reference, which is undefined behavior in Anneal while
-  `lean-miri`'s run continues with the read value.
+  `Disabled` reference, which is undefined behavior in Anneal, while
+  `lean-miri`'s whole program is `System.Safe` and returns the read value, so
+  `TreeSafe ↔ System.Safe` fails on that body.
 * `CastKind.transmute` and `CastKind.pointerCoercion` step in Anneal but fail
   closed in `annealCastHooks` (`StepError.unsupported`):
   `MiriDiffWitnesses.w1_transmute_bool_divergence` (a valid `bool` transmute

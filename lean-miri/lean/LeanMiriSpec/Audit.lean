@@ -17960,7 +17960,8 @@ example :
       AgreeReturns unionRetBody
         (.ofHooks (annealStepHooksLM2_4 unionRetBody.localDecls unionRetBody.layouts)
           annealControlHooks)
-        unionRetInitAnneal unionRetInitMiri (.scalar ⟨5, 1⟩) (.immediate imm0) ∧
+        (initMachineState unionRetBody []) (miriEntryState unionRetBody)
+        (.scalar ⟨5, 1⟩) (.immediate imm0) ∧
       ImmediateRel Witness.lm24U8Ty Witness.lm24Layouts (.scalar ⟨5, 1⟩) imm0) ∧
     (∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
       AgreeReturns rawPtrReturnBody (annealMiriHooks rawPtrReturnBody)
@@ -18002,18 +18003,124 @@ example :
         ([Witness.lm32TreeChild .frozen, Witness.lm32TreeRoot .active].map
           ReborrowMapEntry.toAllocMapEntry)
         decl0.ty Witness.lm32ReborrowTreeBody.layouts (.scalar ⟨99, 8⟩) imm0) ∧
-    (∃ (b : CapturedMir) (m₃ : AnnealStepState) (msc : Miri.Memory.ScalarInt)
-      (tf₃ : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit),
-      MirReachesUB (mirTree b (Witness.mkPre4AnnealLM32 b (.init (.scalar ⟨42, 8⟩)))) ∧
-      ¬ TreeSafe (mirTree b (Witness.mkPre4AnnealLM32 b (.init (.scalar ⟨42, 8⟩)))) ∧
-      (miriSystem (annealMiriHooks b)).Reaches
-        (Witness.mkPre4MiriLM32 b Witness.u64Ty
-          { value := .live (.immediate (.scalar (.fromScalarInt Witness.lm31Scalar42))),
-            layout := some (translateTy Witness.u64Ty) }) m₃ ∧
-      ScalarRel ⟨77, 8⟩ msc ∧ m₃.stack.frames = #[tf₃] ∧
-      (tf₃.locals[0]?).map Miri.Interpreter.LocalState.value =
-        some (.live (.immediate (.scalar (.fromScalarInt msc))))) :=
+    (MirReachesUB (mirCallTree disabledReadEntryBody []) ∧
+      ¬ TreeSafe (mirCallTree disabledReadEntryBody []) ∧
+      (miriSystem (annealMiriHooks disabledReadEntryBody)).Safe
+        (miriEntryState disabledReadEntryBody) ∧
+      (∃ msc, ScalarRel ⟨77, 8⟩ msc ∧
+        (miriSystem (annealMiriHooks disabledReadEntryBody)).ReachesOutcome
+          (miriEntryState disabledReadEntryBody)
+          (.returned (.immediate (.scalar (.fromScalarInt msc)))) ∧
+        (miriSystem (annealMiriHooks disabledReadEntryBody)).PartialCorrect
+          (miriEntryState disabledReadEntryBody)
+          (· = .immediate (.scalar (.fromScalarInt msc)))) ∧
+      ¬ (TreeSafe (mirCallTree disabledReadEntryBody []) ↔
+        (miriSystem (annealMiriHooks disabledReadEntryBody)).Safe
+          (miriEntryState disabledReadEntryBody))) :=
   ⟨w4_child_write_then_parent_read_returns, w4_disabled_read_divergence⟩
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    ∃ (decl0 : MirAst.LocalDecl) (imm0 : Miri.Interpreter.Immediate AnnealProv),
+      AgreeReturns safeRefReturnBody (annealMiriHooks safeRefReturnBody)
+        (initMachineState safeRefReturnBody []) (miriEntryState safeRefReturnBody)
+        (.ptr { allocId := 1, offsetBytes := 0 } 8) (.immediate imm0) ∧
+      get? safeRefReturnBody.localDecls 0 = some decl0 ∧
+      ImmediateRelLM3_2
+        [refAllocMapEntry safeRefReturnBody.localDecls safeRefReturnBody.layouts .shared 1 1
+          Witness.lm31AllocId1]
+        decl0.ty safeRefReturnBody.layouts (.ptr { allocId := 1, offsetBytes := 0 } 8) imm0 :=
+  w4_safe_ref_return
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    ((TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD) ∧
+      ∃ tr mem, ReachesRet (mirTree (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD)
+        tr (.normal (.scalar ⟨7, 4⟩, mem))) ∧
+     ∃ s₂ s₃ : MachineState,
+      AnnealPath (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) WitnessLM3_3.initD s₂ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.unsafeCellU32T) s₂ = .step s₃ ∧
+      s₂.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .cell] ∧
+      s₃.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .cell] ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status = .Completed) ∧
+    ((MirReachesUB (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD) ∧
+      ¬ TreeSafe (mirTree (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD)) ∧
+     ∃ s₂ s₃ : MachineState,
+      AnnealPath (WitnessLM3_3.bodyD SimLM3_3.u32T) WitnessLM3_3.initD s₂ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.u32T) s₂ = .step s₃ ∧
+      stepMirFn (WitnessLM3_3.bodyD SimLM3_3.u32T) s₃ = .fail .ub ∧
+      s₂.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .frozen] ∧
+      s₃.memory.borrows = [SimLM3_3.entry 2 .unique, SimLM3_3.entry 1 .disabled] ∧
+      ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₃.memory.borrows []
+        ((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₂.memory.borrows []).performAccess 0 .Write
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Read
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden .Disabled)) :=
+  w4_unsafe_cell_vs_freeze
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (MirReachesUB (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC) ∧
+      ¬ TreeSafe (mirTree WitnessLM3_3.bodyB WitnessLM3_3.initBC)) ∧
+    ∃ s₂ s₃ s₄ : MachineState,
+      AnnealPath WitnessLM3_3.bodyB WitnessLM3_3.initBC s₂ ∧
+      stepMirFn WitnessLM3_3.bodyB s₂ = .step s₃ ∧ stepMirFn WitnessLM3_3.bodyB s₃ = .step s₄ ∧
+      stepMirFn WitnessLM3_3.bodyB s₄ = .fail .ub ∧
+      s₂.memory.activeProtectors = [1] ∧
+      s₄.memory.borrows =
+        [SimLM3_3.entry 3 .frozen, SimLM3_3.entry 2 (.reservedFrz true) (some 1) (some 1),
+          SimLM3_3.entry 1 .reserved] ∧
+      TreeBorrowsRel s₃.memory.borrows [1] (basedNormalTree s₃.memory.borrows [1]) ∧
+      ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).status = .Completed ∧
+      TreeBorrowsRel s₄.memory.borrows [1]
+        ((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree ∧
+      (((basedNormalTree s₃.memory.borrows [1]).performAccess 0 .Read
+          .VisitChildrenOfAccessed).tree.performAccess 1 .Write
+          .VisitChildrenOfAccessed).status =
+        .TransitionError 1 (.ChildAccessForbidden (.ReservedFrz true)) :=
+  w4_protected_reservedFrz_conflict_ub
+
+open Trusted.ITree LeanMiriSpec.Correspondence.Safety
+  LeanMiriSpec.Correspondence.MiriDiffWitnesses in
+example :
+    (TreeSafe (mirCallTree (transmuteBoolBody 1) []) ∧
+      (∃ tr mem, ReachesRet (mirCallTree (transmuteBoolBody 1) []) tr (.normal (.scalar ⟨1, 1⟩, mem))) ∧
+      (∃ e, (miriSystem (annealMiriHooks (transmuteBoolBody 1))).ReachesOutcome
+        (miriEntryState (transmuteBoolBody 1)) (.unsupported e)) ∧
+      ¬ (miriSystem (annealMiriHooks (transmuteBoolBody 1))).Safe
+        (miriEntryState (transmuteBoolBody 1))) ∧
+    (MirReachesUB (mirCallTree (transmuteBoolBody 2) []) ∧
+      (∃ e, (miriSystem (annealMiriHooks (transmuteBoolBody 2))).ReachesOutcome
+        (miriEntryState (transmuteBoolBody 2)) (.unsupported e)) ∧
+      ¬ (miriSystem (annealMiriHooks (transmuteBoolBody 2))).Safe
+        (miriEntryState (transmuteBoolBody 2))) :=
+  w1_transmute_bool_divergence
+
+open LeanMiriSpec.Correspondence.Safety in
+example :
+    (∀ mach memory a b c d e,
+      annealMemoryCopyHooks.beforeMemoryRead mach memory a b c d e =
+        { memory := memory, hooks := mach, outcome := .ok () }) ∧
+    (∀ mach memory a b c d e,
+      annealMemoryCopyHooks.beforeMemoryWrite mach memory a b c d e =
+        { memory := memory, hooks := mach, outcome := .ok () }) :=
+  annealMemoryCopyHooks_access_ok
 
 open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitnesses in
 #assert_standard_axioms
@@ -18278,11 +18385,22 @@ open LeanMiriSpec.Correspondence.Safety LeanMiriSpec.Correspondence.MiriDiffWitn
   step_terminator_return_lm2_4_simulation
   annealMemoryCopyHooks_access_ok
   unionRetBody
-  unionRet_init_stateRel
+  unionRet_prefix_anneal
+  unionRet_prefix_miri
+  unionRet_pre_stateRel
+  unionRet_pre_imm
   w2_union_init_prefix_returns
   transmuteBoolBody
   miri_unsupported_of_obs
   w1_transmute_bool_divergence
+  safeRefReturnBody
+  safeRef_prefix_anneal
+  safeRef_prefix_miri
+  safeRef_pre_stateRel_and_imm
+  disabledReadEntryBody
+  disabledRead_prefix_anneal
+  disabledRead_prefix_miri
+  disabledRead_pre_stateRel_and_imm
   w4_disabled_read_divergence
 
 end StatementPins
