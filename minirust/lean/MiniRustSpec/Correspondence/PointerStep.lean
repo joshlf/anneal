@@ -107,6 +107,7 @@ theorem PtrEnvOk.setPtrLocal {body : CapturedMir} {view : List LocalSlot}
     {borrows borrows' : List BorrowEntry} {env : List PtrLocalState}
     (hok : PtrEnvOk body view borrows env)
     (hext_lk : ∀ tag e, lookupBorrow borrows tag = some e → lookupBorrow borrows' tag = some e)
+    (hlen_le : borrows.length ≤ borrows'.length)
     (i : Nat) (slot' : LocalSlot) (st' : PtrLocalState)
     (hi_ok : i < body.localDecls.length → PtrLocalOk body (view.set i slot') borrows' i st') :
     PtrEnvOk body (view.set i slot') borrows'
@@ -129,17 +130,18 @@ theorem PtrEnvOk.setPtrLocal {body : CapturedMir} {view : List LocalSlot}
       exact hp_ok dp pv hdp hpty hv
     | disabled =>
       trivial
-    | live target peers =>
+    | live target peers hot =>
       rw [hst] at hp_ok
       dsimp only [removePeerFromState, PtrLocalOk]
       intro dp pv hdp hpty hv
       rw [List.getElem?_set_ne (Ne.symm hpi)] at hv
-      obtain ⟨⟨entry, hlk, hndis, hnf, ht⟩, hpeers⟩ := hp_ok dp pv hdp hpty hv
-      refine ⟨⟨entry, hext_lk pv.tag entry hlk, hndis, hnf, ht⟩, ?_⟩
+      obtain ⟨⟨entry, hlk, hndis, hnf, hnact, ht⟩, hpeers⟩ := hp_ok dp pv hdp hpty hv
+      refine ⟨⟨entry, hext_lk pv.tag entry hlk, hndis, hnf, hnact, ht⟩, ?_⟩
       intro r hr dr pv_r hdr hptr hvr
       simp only [List.mem_filter, bne_iff_ne, ne_eq] at hr
       rw [List.getElem?_set_ne (Ne.symm hr.2)] at hvr
-      exact hpeers r hr.1 dr pv_r hdr hptr hvr
+      exact isBorrowDescendantOrSelf_of_lookup_sub hext_lk hlen_le
+        (hpeers r hr.1 dr pv_r hdr hptr hvr)
 
 /-- `BorrowsOk` after `StorageLive(_i)`, `StorageDead(_i)`, or `Deinit(_i)` on a
 non-address-taken local `_i` (scalar or pointer/reference), under a locals map
@@ -183,7 +185,7 @@ theorem BorrowsOk.advance_storage {body : CapturedMir} {ctx : Ctx} {view : List 
       alias_ok := by
         simp only [advanceStmt]
         rw [Nat.add_eq, ptrEnvBefore_succ hbb hst, hstep]
-        refine hb0.alias_ok.setPtrLocal (fun _ _ h => h) i slot' .empty (fun _ dp pv hdp hpty hv => ?_)
+        refine hb0.alias_ok.setPtrLocal (fun _ _ h => h) (Nat.le_refl _) i slot' .empty (fun _ dp pv hdp hpty hv => ?_)
         by_cases hlt : i < view.length
         · rw [List.getElem?_set_self hlt] at hv
           injection hv with hs
@@ -275,7 +277,8 @@ theorem BorrowsOk.directBorrow {body : CapturedMir} {ctx : Ctx} {view : List Loc
     (hi_addr : i ∉ bodyAddrTakenLocals body) (locals' : List LocalSlot)
     {entry : BorrowEntry}
     (hentry : entry = rawPtrEntry s.memory.nextTag mutbl q ∨
-      (mutbl = .mut ∧ entry = { rawPtrEntry s.memory.nextTag .mut q with perm := .reserved })) :
+      (mutbl = .mut ∧ entry = { rawPtrEntry s.memory.nextTag .mut q with perm := .reserved }))
+    (hhot : borrowStartsHot rv = false → entry.perm ≠ .active) :
     BorrowsOk body ctx (view.set i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)))
       (advanceStmt s locals' { s.memory with
         borrows := entry :: s.memory.borrows,
@@ -341,11 +344,11 @@ theorem BorrowsOk.directBorrow {body : CapturedMir} {ctx : Ctx} {view : List Loc
         ptrStmtStep body.localDecls (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx) st =
           setPtrLocal body.localDecls.length
             (ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx) i
-            (.live (some (k, borrowProjSteps projs)) [i]) := by
+            (.live (some (k, borrowProjSteps projs)) [i] (borrowStartsHot rv)) := by
       simp [ptrStmtStep, hkind, hdecl_ptr, hdb]
     rw [hstep]
-    refine hb.alias_ok.setPtrLocal hext_lk i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8))
-      (.live (some (k, borrowProjSteps projs)) [i]) (fun hi_lt _ pv _ _ hv => ?_)
+    refine hb.alias_ok.setPtrLocal hext_lk (Nat.le_succ _) i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8))
+      (.live (some (k, borrowProjSteps projs)) [i] (borrowStartsHot rv)) (fun hi_lt _ pv _ _ hv => ?_)
     have hi_vlt : i < view.length := by rw [hlen]; exact hi_lt
     rw [List.getElem?_set_self hi_vlt] at hv
     simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hv
@@ -360,7 +363,7 @@ theorem BorrowsOk.directBorrow {body : CapturedMir} {ctx : Ctx} {view : List Loc
         cases mutbl <;> simp at hmut_i <;> rfl
       subst hmut
       rcases hentry with rfl | ⟨_, rfl⟩ <;> simp [rawPtrEntry, rawPtrPerm]
-    refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2, hnf_i,
+    refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2, hnf_i, hhot,
       fun q' hq' => by
         injection hq' with hq'
         rw [← hq', hentry_fields.2.1, hentry_fields.2.2.1]⟩, ?_⟩
@@ -370,7 +373,7 @@ theorem BorrowsOk.directBorrow {body : CapturedMir} {ctx : Ctx} {view : List Loc
     rw [List.getElem?_set_self hi_vlt] at hvr
     simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvr
     obtain ⟨rfl, -⟩ := hvr
-    rfl
+    exact isBorrowDescendantOrSelf_self _ _
   · intro p dp mutbl' pointeeIt' ptrVal hdp hpt hv
     by_cases hip : i = p
     · subst hip
@@ -416,6 +419,7 @@ theorem BorrowsOk.rawPtr {body : CapturedMir} {ctx : Ctx} {view : List LocalSlot
     simp [ptrTargetSpec] at hspec
   exact hb.directBorrow hlen hbb hst hdi hkind (directBorrowOf_rawPtr_of_nonDeref hnd)
     pointeeIt relOff hspec hpt_i hi_addr locals' (.inl rfl)
+    (by cases mutbl <;> simp [borrowStartsHot, rawPtrEntry, rawPtrPerm])
 
 theorem directBorrowOf_eq_none_of_reborrowParentOf {rv : Rvalue} {p : Nat}
     (hrb : reborrowParentOf rv = some p) : directBorrowOf rv = none := by
@@ -533,7 +537,8 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
     {entry : BorrowEntry}
     (hentry : entry = rawReborrowEntry s.memory.nextTag mutbl parentEntry parentPtr.tag ∨
       ∃ bkind, borrowKindMutbl bkind = mutbl ∧
-        entry = refReborrowEntry s.memory.nextTag bkind parentEntry parentPtr.tag) :
+        entry = refReborrowEntry s.memory.nextTag bkind parentEntry parentPtr.tag)
+    (hhot : borrowStartsHot rv = false → entry.perm ≠ .active) :
     BorrowsOk body ctx (view.set i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)))
       (advanceStmt s locals' { s.memory with
         borrows := entry :: borrowsAfterRead,
@@ -629,7 +634,8 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
     let env := ptrEnvBefore body s.frame.blockIdx s.frame.stmtIdx
     have hstep : ptrStmtStep body.localDecls env st =
         stepReborrow body.localDecls.length
-          (stepReborrowRead body.localDecls body.localDecls.length env rv) i p := by
+          (stepReborrowRead body.localDecls body.localDecls.length env rv) i p
+          (borrowStartsHot rv) := by
       simp [ptrStmtStep, hkind, hdecl_ptr, hdb_none, hrb]
     rw [hstep]
     let envRead := stepReborrowRead body.localDecls body.localDecls.length env rv
@@ -650,9 +656,11 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
         exact stepForeignRead_getD_self body.localDecls env p
           (List.getElem?_eq_some_iff.mp hdp).1
     unfold stepReborrow
+    have hentry_parent : entry.parentTag = some parentPtr.tag := by
+      rcases hentry with rfl | ⟨_, _, rfl⟩ <;> rfl
     have hp_lt : p < body.localDecls.length := (List.getElem?_eq_some_iff.mp hdp).1
     have hp_ok := henvRead_ok.1 p hp_lt
-    refine henvRead_ok.1.setPtrLocal hext_lk i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)) _
+    refine henvRead_ok.1.setPtrLocal hext_lk (Nat.le_succ _) i (.init (.ptr ⟨s.memory.nextTag, 0⟩ 8)) _
       (fun hi_lt => ?_)
     cases hst_p : envRead.getD p .disabled with
     | empty =>
@@ -660,11 +668,12 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
       exact False.elim (hp_ok dp parentPtr hdp hp_ptr hvp)
     | disabled =>
       trivial
-    | live target peers =>
+    | live target peers _ =>
       rw [hst_p] at hp_ok
+      obtain ⟨_, hpeers_p⟩ := hp_ok dp parentPtr hdp hp_ptr hvp
       have hp_ok_orig := hb.alias_ok p hp_lt
       rw [← henvRead_ok.2, hst_p] at hp_ok_orig
-      obtain ⟨⟨entry', hlk', _, _, ht_parent⟩, _⟩ := hp_ok_orig dp parentPtr hdp hp_ptr hvp
+      obtain ⟨⟨entry', hlk', _, _, _, ht_parent⟩, _⟩ := hp_ok_orig dp parentPtr hdp hp_ptr hvp
       rw [hlk_parent] at hlk'
       injection hlk' with heq
       subst heq
@@ -682,17 +691,21 @@ theorem BorrowsOk.reborrow {body : CapturedMir} {ctx : Ctx} {view : List LocalSl
           rw [hpt_i] at hmut_i
           cases mutbl <;> simp at hmut_i <;> rfl
         rcases hentry_fields.2.2.2.2.2.2.2 hmut with hperm | hperm <;> simp [hperm]
-      refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2.1, hnf_i,
+      refine ⟨⟨entry, hself_lk, hentry_fields.2.2.2.1, hnf_i, hhot,
         fun q' hq' => by
           rw [hentry_fields.2.1, hentry_fields.2.2.1]
           exact ht_parent q' hq'⟩, ?_⟩
-      intro r hr _ pv_r _ _ hvr
-      simp only [List.mem_singleton] at hr
-      subst hr
-      rw [List.getElem?_set_self hi_vlt] at hvr
-      simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvr
-      obtain ⟨rfl, -⟩ := hvr
-      rfl
+      intro r hr dr pv_r hdr hptr hvr
+      rcases List.mem_cons.mp hr with rfl | hrf
+      · rw [List.getElem?_set_self hi_vlt] at hvr
+        simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvr
+        obtain ⟨rfl, -⟩ := hvr
+        exact isBorrowDescendantOrSelf_self _ _
+      · simp only [List.mem_filter, bne_iff_ne, ne_eq] at hrf
+        rw [List.getElem?_set_ne (Ne.symm hrf.2)] at hvr
+        have hdesc_p := hpeers_p r hrf.1 dr pv_r hdr hptr hvr
+        rw [← hentry_fields.1]
+        exact isBorrowDescendantOrSelf_cons_child hentry_parent hext_lk hdesc_p
   · intro q dq mutbl' pointeeIt' ptrVal hdq hpt hv
     by_cases hiq : i = q
     · subst hiq
@@ -823,22 +836,23 @@ theorem PtrEnvOk.stepPtrCopy {body : CapturedMir} {view : List LocalSlot}
         exact False.elim (hp_ok dp pv hdp hp_ptr hvp)
       | disabled =>
         trivial
-      | live target peers =>
+      | live target peers pHot =>
         rw [hst_p] at hp_ok
-        obtain ⟨⟨entry_p, hlk_p, hndis_p, hnf_p, ht_p⟩, hpeers_p⟩ := hp_ok dp pv hdp hp_ptr hvp
+        obtain ⟨⟨entry_p, hlk_p, hndis_p, hnf_p, hnact_p, ht_p⟩, hpeers_p⟩ :=
+          hp_ok dp pv hdp hp_ptr hvp
         dsimp only [addPeerToState, PtrLocalOk]
         intro _ pv_q _ _ hvq
         rw [List.getElem?_set_self hq_vlt] at hvq
         simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvq
         obtain ⟨rfl, -⟩ := hvq
-        refine ⟨⟨entry_p, hlk_p, hndis_p, fun hm => hnf_p (hmut_ip hm), ht_p⟩,
+        refine ⟨⟨entry_p, hlk_p, hndis_p, fun hm => hnf_p (hmut_ip hm), hnact_p, ht_p⟩,
           fun r hr dr pv_r hdr hptr hvr => ?_⟩
         by_cases hri : r = q
         · subst hri
           rw [List.getElem?_set_self hq_vlt] at hvr
           simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvr
           obtain ⟨rfl, -⟩ := hvr
-          rfl
+          exact isBorrowDescendantOrSelf_self _ _
         · have hr_mem : r ∈ peers := by
             split at hr
             · exact hr
@@ -858,12 +872,13 @@ theorem PtrEnvOk.stepPtrCopy {body : CapturedMir} {view : List LocalSlot}
         exact hq_ok dq pv_q hdq hq_ptr hvq
       | disabled =>
         trivial
-      | live t ps =>
+      | live t ps qHot =>
         rw [hst_q] at hq_ok
         dsimp only [removePeerFromState]
         let ps' := ps.filter (· != i)
         change PtrLocalOk body (view.set i (.init (.ptr pv 8))) borrows q
-          (if ps'.contains p then .live t (if ps'.contains i then ps' else i :: ps') else .live t ps')
+          (if ps'.contains p then .live t (if ps'.contains i then ps' else i :: ps') qHot
+           else .live t ps' qHot)
         by_cases hcp : ps'.contains p = true
         · simp only [hcp, ↓reduceIte]
           have hp_ps : p ∈ ps := by
@@ -872,7 +887,8 @@ theorem PtrEnvOk.stepPtrCopy {body : CapturedMir} {view : List LocalSlot}
           intro dq pv_q hdq hq_ptr hvq
           rw [List.getElem?_set_ne (Ne.symm hqi)] at hvq
           obtain ⟨hent_q, hpeers_q⟩ := hq_ok dq pv_q hdq hq_ptr hvq
-          have hp_tag : pv.tag = pv_q.tag := hpeers_q p hp_ps dp pv hdp hp_ptr hvp
+          have hp_desc : MirSemantics.isBorrowDescendantOrSelf borrows pv_q.tag pv.tag = true :=
+            hpeers_q p hp_ps dp pv hdp hp_ptr hvp
           refine ⟨hent_q, fun r hr dr pv_r hdr hptr hvr => ?_⟩
           by_cases hri : r = i
           · subst hri
@@ -881,7 +897,7 @@ theorem PtrEnvOk.stepPtrCopy {body : CapturedMir} {view : List LocalSlot}
             rw [List.getElem?_set_self hi_vlt] at hvr
             simp only [Option.some.injEq, LocalSlot.init.injEq, Value.ptr.injEq] at hvr
             obtain ⟨rfl, -⟩ := hvr
-            exact hp_tag
+            exact hp_desc
           · have hr_ps' : r ∈ ps' := by
               split at hr
               · exact hr
@@ -1153,9 +1169,9 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
     intro q hq
     rw [getD_map_range _ _ _ hq]
     trivial
-  | live wTarget wPeers =>
+  | live wTarget wPeers _ =>
     rw [hst_w] at hw_ok
-    obtain ⟨⟨entry_w, hlk_w, _, _, hw_tgt⟩, hw_peers⟩ := hw_ok dw ptrVal hdw hw_ptr hvw
+    obtain ⟨⟨entry_w, hlk_w, _, _, _, hw_tgt⟩, hw_peers⟩ := hw_ok dw ptrVal hdw hw_ptr hvw
     rw [hlookup] at hlk_w
     injection hlk_w with heq_w
     subst heq_w
@@ -1168,12 +1184,12 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
       exact hq_ok
     | disabled =>
       trivial
-    | live qTarget qPeers =>
+    | live qTarget qPeers _ =>
       rw [hst_q] at hq_ok
       by_cases hkeep : (wPeers.contains q || targetsDefinitelyDisjoint qTarget wTarget) = true
       · simp only [hkeep, ↓reduceIte]
         intro dq pv_q hdq hq_ptr hvq
-        obtain ⟨⟨e_q, hlk_q, hndis_q, hnf_q, hq_tgt⟩, hq_peers⟩ := hq_ok dq pv_q hdq hq_ptr hvq
+        obtain ⟨⟨e_q, hlk_q, hndis_q, hnf_q, _, hq_tgt⟩, hq_peers⟩ := hq_ok dq pv_q hdq hq_ptr hvq
         obtain ⟨_, he_q_tag⟩ := lookupBorrow_mem_and_tag hlk_q
         have hkeep_q : upd e_q = e_q ∨ upd e_q = { e_q with perm := .active } := by
           apply updateBorrowPermTreeAtProj_self_or_disjoint_keep
@@ -1181,10 +1197,10 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
           have hkeep' : wPeers.contains q = true ∨ targetsDefinitelyDisjoint qTarget wTarget = true := by
             simpa only [Bool.or_eq_true] using hkeep
           rcases hkeep' with hpeer | hdisj
-          · have htag_eq := hw_peers q (List.contains_iff_mem.mp hpeer) dq pv_q hdq hq_ptr hvq
-            exact .inl (he_q_tag.trans htag_eq)
+          · have hdesc := hw_peers q (List.contains_iff_mem.mp hpeer) dq pv_q hdq hq_ptr hvq
+            exact .inl (he_q_tag.symm ▸ hdesc)
           · by_cases htag_eq : e_q.tag = ptrVal.tag
-            · exact .inl htag_eq
+            · exact .inl (htag_eq ▸ isBorrowDescendantOrSelf_self _ _)
             · right
               refine ⟨htag_eq, ?_⟩
               cases qTarget with
@@ -1203,7 +1219,11 @@ theorem BorrowsOk.derefWrite {body : CapturedMir} {ctx : Ctx} {view : List Local
                   simp only [targetsDefinitelyDisjoint, hloc, ne_eq, not_true_eq_false,
                     decide_false, Bool.false_or, Bool.not_eq_true'] at hdisj
                   rwa [← borrowProjOverlap_borrowProjSteps]
-        refine ⟨⟨upd e_q, ?_, ?_, ?_, ?_⟩, hq_peers⟩
+        refine ⟨⟨upd e_q, ?_, ?_, ?_, (fun h => by simp at h), ?_⟩,
+          fun r' hr' dr' pv_r' hdr' hptr' hvr' => by
+            rw [isBorrowDescendantOrSelf_map_eq (fun e => (hupd_fields e).1)
+              (fun e => (hupd_fields e).2.2.2.2.2.2)]
+            exact hq_peers r' hr' dr' pv_r' hdr' hptr' hvr'⟩
         · rw [lookupBorrow_map_eq (fun e => (hupd_fields e).1) pv_q.tag, hlk_q]
           rfl
         · rcases hkeep_q with hsame | hact_q

@@ -2934,9 +2934,9 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
       intro q hq
       rw [getD_map_range _ _ _ hq]
       trivial
-    | live wTarget wPeers =>
+    | live wTarget wPeers _wHot =>
       rw [hst_w] at hw_ok
-      obtain ⟨⟨entry_w, hlk_w, _, _, hw_tgt⟩, hw_peers⟩ := hw_ok dw ptrValW hdw hw_ptr hvw
+      obtain ⟨⟨entry_w, hlk_w, _, _, _, hw_tgt⟩, hw_peers⟩ := hw_ok dw ptrValW hdw hw_ptr hvw
       rw [hlkW'] at hlk_w
       injection hlk_w with heq_w
       subst heq_w
@@ -2949,12 +2949,12 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
         exact hq_ok
       | disabled =>
         trivial
-      | live qTarget qPeers =>
+      | live qTarget qPeers _qHot =>
         rw [hst_q] at hq_ok
         by_cases hkeep : (wPeers.contains q || targetsDefinitelyDisjoint qTarget wTarget) = true
         · simp only [hkeep, ↓reduceIte]
           intro dq pv_q hdq hq_ptr hvq
-          obtain ⟨⟨e_q, hlk_q, hndis_q, hnf_q, hq_tgt⟩, hq_peers⟩ := hq_ok dq pv_q hdq hq_ptr hvq
+          obtain ⟨⟨e_q, hlk_q, hndis_q, hnf_q, _, hq_tgt⟩, hq_peers⟩ := hq_ok dq pv_q hdq hq_ptr hvq
           obtain ⟨_, he_q_tag⟩ := lookupBorrow_mem_and_tag hlk_q
           have hkeep_q : upd e_q = e_q ∨ upd e_q = { e_q with perm := .active } := by
             apply updateBorrowPermTreeAtProj_self_or_disjoint_keep
@@ -2963,10 +2963,10 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
                 targetsDefinitelyDisjoint qTarget wTarget = true := by
               simpa only [Bool.or_eq_true] using hkeep
             rcases hkeep' with hpeer | hdisj
-            · have htag_eq := hw_peers q (List.contains_iff_mem.mp hpeer) dq pv_q hdq hq_ptr hvq
-              exact .inl (he_q_tag.trans htag_eq)
+            · have hdesc := hw_peers q (List.contains_iff_mem.mp hpeer) dq pv_q hdq hq_ptr hvq
+              exact .inl (he_q_tag.symm ▸ hdesc)
             · by_cases htag_eq : e_q.tag = ptrValW.tag
-              · exact .inl htag_eq
+              · exact .inl (htag_eq ▸ isBorrowDescendantOrSelf_self _ _)
               · right
                 refine ⟨htag_eq, ?_⟩
                 cases qTarget with
@@ -2985,7 +2985,11 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
                     simp only [targetsDefinitelyDisjoint, hloc, ne_eq, not_true_eq_false,
                       decide_false, Bool.false_or, Bool.not_eq_true'] at hdisj
                     rwa [← borrowProjOverlap_borrowProjSteps]
-          refine ⟨⟨upd e_q, ?_, ?_, ?_, ?_⟩, hq_peers⟩
+          refine ⟨⟨upd e_q, ?_, ?_, ?_, ?_, ?_⟩,
+            fun r' hr' dr' pv_r' hdr' hptr' hvr' => by
+              rw [isBorrowDescendantOrSelf_map_eq (fun e => (hupd_fields e).1)
+                (fun e => (hupd_fields e).2.2.2.2.2.2)]
+              exact hq_peers r' hr' dr' pv_r' hdr' hptr' hvr'⟩
           · rw [lookupBorrow_map_eq (fun e => (hupd_fields e).1) pv_q.tag, hlk_q]
             rfl
           · rcases hkeep_q with hsame | hact_q
@@ -2995,6 +2999,7 @@ private theorem BorrowsOk.derefWriteRead {body : CapturedMir} {ctx : Ctx} {view 
             rcases hkeep_q with hsame | hact_q
             · rw [hsame]; exact hnf_q hmut_q
             · simp [hact_q]
+          · intro h; cases h
           · intro qp hqp
             rw [(hupd_fields e_q).2.1, (hupd_fields e_q).2.2.1]
             exact hq_tgt qp hqp
@@ -3422,7 +3427,9 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     (retLive_set hrel.retLive i (by simp))
                     (hbo.reborrow hlo.nlocals hbb hst hdi hdp (by simp [isPtrTy, hp_pt]) rfl rfl
                       parentPtr hvp parentEntry hlookup hndis_p pointeeIt relOff htspec hpt
-                      hdst_addr _ (.inl ⟨rfl, rfl⟩) (.inl rfl))
+                      hdst_addr _ (.inl ⟨rfl, rfl⟩) (.inl rfl)
+                      (by cases mutbl <;> cases hp : parentEntry.perm <;>
+                        simp [borrowStartsHot, rawReborrowEntry, rawReborrowPerm, hp]))
                     rfl rfl rfl rfl
               · have hAub := evalStmt_assign_ub s body.localDecls body.layouts ⟨i, []⟩
                   (.rawPtr mutbl ⟨p, [.deref]⟩) span
@@ -3526,7 +3533,8 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                       (retLive_set hrel.retLive i (by simp))
                       (hbo.reborrow hlo.nlocals hbb hst hdi hdp (by simp [isPtrTy, hp_pt]) rfl rfl
                         parentPtr hvp parentEntry hlookup hndis_p pointeeIt relOff htspec hpt
-                        hdst_addr _ (.inr ⟨rfl, rfl⟩) (.inr ⟨bkind, rfl, rfl⟩))
+                        hdst_addr _ (.inr ⟨rfl, rfl⟩) (.inr ⟨bkind, rfl, rfl⟩)
+                        (by cases bkind <;> simp [refReborrowEntry, refReborrowPerm]))
                       rfl rfl rfl rfl
                 · have hAub := evalStmt_assign_ub s body.localDecls body.layouts ⟨i, []⟩
                     (.ref bkind ⟨p, [.deref]⟩) span
@@ -3581,7 +3589,21 @@ theorem step_correspondence_N (body : CapturedMir) (f : Gen.Function) (hfrag : i
                     (by rw [h4.allocs]; exact h3.locs) h3.nonScalar hstale
                     (retLive_set hrel.retLive i (by simp))
                     (hbo.directBorrow hlo.nlocals hbb hst hdi rfl hdb pointeeIt relOff htspec
-                      hpt hdst_addr _ (refBorrowEntry_cases _ _ _))
+                      hpt hdst_addr _ (refBorrowEntry_cases _ _ _)
+                      (by
+                        cases bkind with
+                        | shared => simp [refBorrowEntry, refBorrowPerm]
+                        | «mut» tp =>
+                          cases tp with
+                          | true => simp [refBorrowEntry, refBorrowPerm]
+                          | false =>
+                            rcases q with ⟨_, projs⟩
+                            cases projs with
+                            | nil => simp [borrowStartsHot]
+                            | cons ph pt =>
+                              cases ph with
+                              | deref => exact False.elim (hnd_qproj pt rfl)
+                              | _ => simp [borrowStartsHot]))
                     rfl rfl rfl rfl
             · by_cases hder : ∃ p rest, copyRv rv = .use (.copy ⟨p, .deref :: rest⟩)
               · ---------------------------------------------------- `_i = copy (*_p)` / `move (*_p)`

@@ -1791,12 +1791,9 @@ theorem disabledRefReborrow_minirust_direct :
 `b076d6a3`), so writing through `_3` is a local write for `_2` and the later read
 through `_2` succeeds (freezing the child) and returns `9`, as in Tree Borrows
 and `BasicMemory`. (Before `b076d6a3`, Anneal's flat borrow list disabled the
-parent and faulted here.) Whereas mutable
-reborrow + dereference write is admitted in-fragment when the invalidated parent
-is not subsequently dereferenced (`refMutReborrowWrite`,
-`refDisjointReborrowWrite`, `refLoopCountdown`), `ptrAliasingOk`'s flow-sensitive
-`stepDerefWrite` marks `_2` `.disabled` after `(*_3) = 9` and `ptrStmtOk`
-rejects the subsequent `copy (*_2)`. -/
+parent and faulted here.) Because `stepReborrow` tracks Tree Borrows ancestor
+sets (`i :: pPeers`) in `ptrAliasingOk`, `stepDerefWrite` preserves ancestor `_2`
+after `(*_3) = 9` and admits `childReborrowWriteDisablesParent` in `inFragment`. -/
 def childReborrowWriteDisablesParent : CapturedMir :=
   ptrBody "witness::child_reborrow_write_disables_parent"
     [u32Decl, u32Decl, refMutU32Decl, refMutU32Decl]
@@ -1806,8 +1803,8 @@ def childReborrowWriteDisablesParent : CapturedMir :=
      .assign (derefPlace 3) (.use (constU32 9)),
      .assign (local_ 0) (.use (.copy (derefPlace 2)))]
 
-theorem childReborrowWriteDisablesParent_notInFragment :
-    inFragment childReborrowWriteDisablesParent = false := by decide +kernel
+theorem childReborrowWriteDisablesParent_inFragment :
+    inFragment childReborrowWriteDisablesParent = true := by decide +kernel
 
 theorem childReborrowWriteDisablesParent_anneal_ret :
     ReachesRet (mirTree childReborrowWriteDisablesParent
@@ -2242,12 +2239,12 @@ theorem retagFnEntryProtectorWrite_minirust_direct :
   decide +kernel
 
 /-- Retagging a parent after a child write
-(`_2 = &mut _1; _3 = &mut (*_2); (*_3) = 9; Retag([default], _2)`): `ptrStmtOk`
-still rejects `Retag` on `_2` because `stepDerefWrite` conservatively marks
-`_2` `.disabled` after `(*_3) = 9`, but since unstable `b076d6a3` Anneal links
-`_3` to its parent `_2` (`parentTag`), the child write keeps `_2` active, and
-Anneal returns `9` like MiniRust's `BasicMemory` (before `b076d6a3`, Anneal's
-flat borrow list disabled `_2` and faulted at the `Retag`). -/
+(`_2 = &mut _1; _3 = &mut (*_2); (*_3) = 9; Retag([default], _2)`): since
+unstable `b076d6a3`, Anneal links `_3` to its parent `_2` (`parentTag`), the
+child write keeps `_2` active (and `stepReborrow` / `stepDerefWrite` preserve
+ancestor `_2` in `inFragment`), and Anneal returns `9` like MiniRust's
+`BasicMemory` and `MachTB` (before `b076d6a3`, Anneal's flat borrow list
+disabled `_2` and faulted at the `Retag`). -/
 def retagDisabledRefDiscrepancy : CapturedMir :=
   ptrBody "witness::retag_disabled_ref_discrepancy"
     [u32Decl, u32Decl, refMutU32Decl, refMutU32Decl]
@@ -2261,8 +2258,8 @@ def retagDisabledRefDiscrepancy : CapturedMir :=
 theorem retagDisabledRefDiscrepancy_translate :
     (translateFn retagDisabledRefDiscrepancy).isSome = true := by decide +kernel
 
-theorem retagDisabledRefDiscrepancy_notInFragment :
-    inFragment retagDisabledRefDiscrepancy = false := by decide +kernel
+theorem retagDisabledRefDiscrepancy_inFragment :
+    inFragment retagDisabledRefDiscrepancy = true := by decide +kernel
 
 theorem retagDisabledRefDiscrepancy_anneal_ret :
     ReachesRet (mirTree retagDisabledRefDiscrepancy

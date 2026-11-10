@@ -1738,4 +1738,219 @@ theorem int2ptrDeadAllocDerefUb_tb_direct :
       some (.ub "dereferencing pointer to dead allocation") := by
   decide +kernel
 
+/-! ## 9. Unstable (`b076d6a3`) Rebase-Delta Parity & Soundness Witnesses -/
+
+/-- `validateLoadedValue` invalid-`bool` dereference-load UB parity (without any
+subsequent `!` or `IntToInt` use of the loaded `bool` local `_4`):
+`_2 = &raw const _1; _3 = transmute(_2) -> &bool; _4 = copy (*_3); _0 = 0u32`.
+On input `2u8`, Anneal's `validateLoadedValue` rejects `2 ∉ {0, 1}` at the
+dereference load `_4 = copy (*_3)` itself, matching `Mach` and `MachTB`. -/
+def boolInvalidLoadDirectUb : CapturedMir :=
+  { ptrBody "witness::bool_invalid_load_direct_ub"
+      [u32Decl, u8Decl, ptrConstU8Decl, refSharedBoolDecl, boolDecl]
+      [.storageLive 2, .storageLive 3, .storageLive 4,
+       .assign (local_ 2) (.rawPtr .not (local_ 1)),
+       .assign (local_ 3) (.cast .transmute (.copy (local_ 2)) refSharedBoolTy),
+       .assign (local_ 4) (.use (.copy (derefPlace 3))),
+       .assign (local_ 0) (.use (constU32 0))] with
+    fnAbi := fnAbiBoolArg }
+
+theorem boolInvalidLoadDirectUb_translate :
+    (translateFn boolInvalidLoadDirectUb).isSome = true := by decide +kernel
+
+theorem boolInvalidLoadDirectUb_three_way_ub :
+    (∃ tr u, Reaches (mirTree boolInvalidLoadDirectUb
+      (initMachineState boolInvalidLoadDirectUb [.scalar ⟨2, 1⟩])) tr u ∧ FaultNow u) ∧
+    ubAfter boolInvalidLoadDirectUb [.scalar ⟨2, 1⟩] 7 =
+      some "load at type but the data in memory violates the language invariant" ∧
+    ubAfterTB boolInvalidLoadDirectUb [.scalar ⟨2, 1⟩] 7 =
+      some "load at type but the data in memory violates the language invariant" :=
+  ⟨faultsA_sound boolInvalidLoadDirectUb 20 _ (by decide),
+   by decide +kernel, by decide +kernel⟩
+
+/-- `D2` (`disableLocalBorrows`) tag-disabling correspondence across stack-slot
+cycling: `_3 = &raw mut _2` borrows temporary `_2`, then `StorageDead(_2);
+StorageLive(_2); _2 = 77` re-initializes `_2`'s slot to `77`, and `_0 = copy (*_3)`
+attempts to read through the stale pointer `_3`. Anneal's `disableLocalBorrows`
+disables `_3`'s tag at `StorageDead(_2)` so `(*_3)` faults with UB even after `_2`
+is live and initialized again, matching `Mach` and `MachTB`. -/
+def storageCycleDisablesBorrowUb : CapturedMir :=
+  ptrBody "witness::storage_cycle_disables_borrow_ub"
+    [u32Decl, u32Decl, u32Decl, ptrMutU32Decl]
+    [.storageLive 2, .storageLive 3,
+     .assign (local_ 2) (.use (constU32 5)),
+     .assign (local_ 3) (.rawPtr .mut (local_ 2)),
+     .storageDead 2,
+     .storageLive 2,
+     .assign (local_ 2) (.use (constU32 77)),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem storageCycleDisablesBorrowUb_notInFragment :
+    inFragment storageCycleDisablesBorrowUb = false := by decide +kernel
+
+theorem storageCycleDisablesBorrowUb_translate :
+    (translateFn storageCycleDisablesBorrowUb).isSome = true := by decide +kernel
+
+theorem storageCycleDisablesBorrowUb_three_way_ub :
+    (∃ tr u, Reaches (mirTree storageCycleDisablesBorrowUb
+      (initMachineState storageCycleDisablesBorrowUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    ubAfter storageCycleDisablesBorrowUb [.scalar ⟨5, 4⟩] 9 =
+      some "dereferencing pointer to dead allocation" ∧
+    ubAfterTB storageCycleDisablesBorrowUb [.scalar ⟨5, 4⟩] 9 =
+      some "dereferencing pointer to dead allocation" :=
+  ⟨faultsA_sound storageCycleDisablesBorrowUb 25 _ (by decide),
+   by decide +kernel, by decide +kernel⟩
+
+/-- Dereference-read Tree Borrows freezing (`freezeDerefReadBorrowsAt`):
+`_2 = &mut _1` followed by `(*_2) = 10` leaves `_2` `.active` (`hot = true`) in
+both Anneal and `MachTB`, `_3 = &raw const _1` creates a raw pointer without
+performing an initial read (keeping `_2` `.active` in both Anneal and `MachTB`),
+and the dereference read `_4 = copy (*_3)` freezes `_2` to `.frozen`, so the
+subsequent write `(*_2) = 99` raises UB in both Anneal and `MachTB` (while
+returning `99` on `BasicMemory`, and rejected by `inFragment` via
+`stepForeignRead`). -/
+def derefReadFreezesActiveMutUb : CapturedMir :=
+  ptrBody "witness::deref_read_freezes_active_mut_ub"
+    [u32Decl, u32Decl, refMutU32Decl, ptrConstU32Decl, u32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .assign (derefPlace 2) (.use (constU32 10)),
+     .assign (local_ 3) (.rawPtr .not (local_ 1)),
+     .assign (local_ 4) (.use (.copy (derefPlace 3))),
+     .assign (derefPlace 2) (.use (constU32 99)),
+     .assign (local_ 0) (.use (.copy (local_ 1)))]
+
+theorem derefReadFreezesActiveMutUb_notInFragment :
+    inFragment derefReadFreezesActiveMutUb = false := by decide +kernel
+
+theorem derefReadFreezesActiveMutUb_translate :
+    (translateFn derefReadFreezesActiveMutUb).isSome = true := by decide +kernel
+
+theorem derefReadFreezesActiveMutUb_three_way :
+    (∃ tr u, Reaches (mirTree derefReadFreezesActiveMutUb
+      (initMachineState derefReadFreezesActiveMutUb [.scalar ⟨5, 4⟩])) tr u ∧ FaultNow u) ∧
+    retAfter derefReadFreezesActiveMutUb [.scalar ⟨5, 4⟩] 11 =
+      some (some { retAlloc with data := scalarBytes u32 99 }, [1]) ∧
+    ubAfterTB derefReadFreezesActiveMutUb [.scalar ⟨5, 4⟩] 9 =
+      some "Tree Borrows: local write of Frozen reference" :=
+  ⟨faultsA_sound derefReadFreezesActiveMutUb 25 _ (by decide),
+   by decide +kernel, by decide +kernel⟩
+
+/-- In-fragment `.reserved` mutable reference reborrow (`_3 = &mut (*_2)`) across
+a foreign parent read (`_4 = copy (*_2)`) followed by child activation write
+(`(*_3) = _4 + 37`) and child read (`_0 = copy (*_3)`): because `&mut (*_2)`
+starts `.reserved` (`hot = false`), `freezeDerefReadBorrowsAt` and
+`stepForeignRead` keep `_3` live across `*_2`, so `inFragment = true` and all
+three semantics (`Anneal`, `Mach` via `mirCall_ret` + `mirCall_noUB`, and
+`MachTB`) return `42` on `5`. -/
+def mutReborrowForeignReadRoundTrip : CapturedMir :=
+  ptrBody "witness::mut_reborrow_foreign_read_round_trip"
+    [u32Decl, u32Decl, refMutU32Decl, refMutU32Decl, u32Decl]
+    [.storageLive 2, .storageLive 3, .storageLive 4,
+     .assign (local_ 2) (.ref (.mut false) (local_ 1)),
+     .assign (local_ 3) (.ref (.mut false) (derefPlace 2)),
+     .assign (local_ 4) (.use (.copy (derefPlace 2))),
+     .assign (derefPlace 3) (.binaryOp .add (.copy (local_ 4)) (constU32 37)),
+     .assign (local_ 0) (.use (.copy (derefPlace 3)))]
+
+theorem mutReborrowForeignReadRoundTrip_inFragment :
+    inFragment mutReborrowForeignReadRoundTrip = true := by decide +kernel
+
+def mutReborrowForeignReadRoundTripFn : Gen.Function where
+  locals := ⟨[
+    (localName 0, .Int u32), (localName 1, .Int u32),
+    (localName 2, refTy .mut u32), (localName 3, refTy .mut u32),
+    (localName 4, .Int u32)]⟩
+  args := [localName 1]
+  ret := localName 0
+  calling_convention := .Rust
+  blocks := ⟨[
+    (bbName 0, ⟨[
+      .StorageLive (localName 2), .StorageLive (localName 3), .StorageLive (localName 4),
+      .Assign (.Local (localName 2)) (.AddrOf (.Local (localName 1)) (refPtrType .mut u32)),
+      .Assign (.Local (localName 3))
+        (.AddrOf (.Deref (.Load (.Local (localName 2))) (.Int u32)) (refPtrType .mut u32)),
+      .Assign (.Local (localName 4)) (.Load (.Deref (.Load (.Local (localName 2))) (.Int u32))),
+      .Assign (.Deref (.Load (.Local (localName 3))) (.Int u32))
+        (.BinOp (.Int .Add) (.Load (.Local (localName 4))) (.Constant (.Int 37) (.Int u32))),
+      .Assign (.Local (localName 0)) (.Load (.Deref (.Load (.Local (localName 3))) (.Int u32)))],
+      .Return, .Regular⟩),
+    (bbName 1, ⟨[], .Goto (bbName 0), .Regular⟩)]⟩
+  start := bbName 1
+  implicit_writes := true
+
+theorem mutReborrowForeignReadRoundTrip_translate :
+    translateFn mutReborrowForeignReadRoundTrip = some mutReborrowForeignReadRoundTripFn := rfl
+
+def mutReborrowForeignReadRoundTripS0 : MachineState :=
+  initMachineState mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩]
+def mutReborrowForeignReadRoundTripMInit : Mach :=
+  machine mutReborrowForeignReadRoundTrip mutReborrowForeignReadRoundTripFn
+    mutReborrowForeignReadRoundTripS0.frame.locals mutReborrowForeignReadRoundTripFn.start
+
+theorem mutReborrowForeignReadRoundTrip_ctxOk : CtxOk mutReborrowForeignReadRoundTrip ctx0 where
+  baseLow := by unfold BaseLow; decide
+  addrs := by
+    intro i d hi hd
+    have hi1 : i ≤ 1 := hi
+    have hlay : mutReborrowForeignReadRoundTrip.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    match i, hd, hi1 with
+    | 0, hd, _ => simp [mutReborrowForeignReadRoundTrip, ptrBody] at hd; subst hd; decide
+    | 1, hd, _ => simp [mutReborrowForeignReadRoundTrip, ptrBody] at hd; subst hd; decide
+    | _ + 2, _, h => omega
+  ret := by
+    intro d hd
+    have hlay : mutReborrowForeignReadRoundTrip.layouts = emptyLayoutTable := rfl
+    rw [hlay]
+    simp [mutReborrowForeignReadRoundTrip, ptrBody] at hd; subst hd
+    exact ⟨0, retAlloc, rfl, rfl, rfl, rfl, rfl, by decide⟩
+
+theorem mutReborrowForeignReadRoundTrip_anneal_ret :
+    ∃ mem, ReachesRet (mirTree mutReborrowForeignReadRoundTrip mutReborrowForeignReadRoundTripS0) []
+      (.normal (.scalar ⟨42, 4⟩, mem)) :=
+  ⟨_, runA_sound mutReborrowForeignReadRoundTrip 30 _ _ _ rfl⟩
+
+theorem mutReborrowForeignReadRoundTrip_noUB :
+    MirNoUBTree (mirCallTree mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩]) :=
+  runA_noUB mutReborrowForeignReadRoundTrip 30 _ _ _ rfl
+
+theorem mutReborrowForeignReadRoundTrip_minirust_ret_from_start :
+    ∃ (n : Nat) (m' : Mach), Interp.steps n mutReborrowForeignReadRoundTripMInit = .ok m' ∧
+      m'.mem.memory.allocations[0]? = some { retAlloc with data := scalarBytes u32 42 } ∧
+      m'.threads = [thread1 ctx0 [{ callerFrame with next_block := bbName 7, next_stmt := 0 }]] := by
+  obtain ⟨mem, hretA⟩ := mutReborrowForeignReadRoundTrip_anneal_ret
+  obtain ⟨n, s', m', hsteps, hret⟩ :=
+    mirCall_ret mutReborrowForeignReadRoundTrip_inFragment
+      mutReborrowForeignReadRoundTrip_translate ctx0
+      mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide)
+      mutReborrowForeignReadRoundTripMInit rfl rfl rfl hretA
+  obtain ⟨r, a, d, R, hd, _hv, hp, hr, hthr, hallocs, _hR⟩ := hret
+  simp [mutReborrowForeignReadRoundTrip, ptrBody] at hd; subst hd
+  simp [retPtr, ctx0] at hp
+  have hr0 : r = 0 := by omega
+  subst hr0
+  simp [ctx0] at hr; subst hr
+  refine ⟨n, m', hsteps, ?_, hthr⟩
+  rw [hallocs]; rfl
+
+theorem mutReborrowForeignReadRoundTrip_minirust_noUB {n : Nat} {e : Stop}
+    (herr : Interp.steps n mutReborrowForeignReadRoundTripMInit = .error e) :
+    ∃ k s' mRet tr v mem, k < n ∧ Interp.steps k mutReborrowForeignReadRoundTripMInit = .ok mRet ∧
+      ReturnRel mutReborrowForeignReadRoundTrip ctx0 s' v mRet ∧
+      ReachesRet (mirCallTree mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩]) tr
+        (.normal (v, mem)) :=
+  mirCall_noUB mutReborrowForeignReadRoundTrip_inFragment
+    mutReborrowForeignReadRoundTrip_translate ctx0
+    mutReborrowForeignReadRoundTrip_ctxOk [.scalar ⟨5, 4⟩] (by decide)
+    mutReborrowForeignReadRoundTripMInit rfl rfl rfl mutReborrowForeignReadRoundTrip_noUB herr
+
+theorem mutReborrowForeignReadRoundTrip_three_way :
+    (∃ mem, ReachesRet (mirTree mutReborrowForeignReadRoundTrip mutReborrowForeignReadRoundTripS0) []
+      (.normal (.scalar ⟨42, 4⟩, mem))) ∧
+    retAfter mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩] 10 =
+      some (some { retAlloc with data := scalarBytes u32 42 }, [1]) ∧
+    retAfterTB mutReborrowForeignReadRoundTrip [.scalar ⟨5, 4⟩] 10 = tbRetU32 42 :=
+  ⟨mutReborrowForeignReadRoundTrip_anneal_ret, by decide +kernel, by decide +kernel⟩
+
 end MiniRustSpec.Correspondence.TbWitness

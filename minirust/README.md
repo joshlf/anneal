@@ -54,8 +54,8 @@ run of it.
 | `lean/MiniRustSpec/Correspondence/*.lean` | translation, relation, proofs, witnesses | yes |
 | `lean/MiniRustSpec/Audit.lean` | build-failing axiom audit | yes |
 
-The Lean library is built from `examples/` (`lakefile.toml` declares
-`MiniRustSpec` with `srcDir = "../minirust/lean"`).
+The Lean library is built from the repository root (`lakefile.toml` declares
+`MiniRustSpec` with `srcDir = "minirust/lean"`).
 
 ## Commands and receipts
 
@@ -71,7 +71,7 @@ cargo run -q -p anneal-minirust-gen -- generate --check
 
 # Build the generated model, the interpretation, the proofs, the witnesses,
 # and the axiom audit (which fails on any non-standard axiom).
-(cd examples && anneal-lean-run --mode build --concurrency 3 -- lake build MiniRustSpec)
+anneal-lean-run --mode build --concurrency 1 -- lake build MiniRustSpec
 
 # Translator tests: determinism, freshness of the checked-in output,
 # independent block/item/opaque-node recounts, tamper detection, and a check
@@ -734,34 +734,30 @@ programs, computing both semantics in the kernel (`decide`/`rfl`, no
   calls to these seven intrinsics (`translate_rs_intrinsic` has no arm for
   them); the witnesses relate Anneal to the MiniRust program that calls the
   fallback body instead.
-* `Correspondence/IntrinsicBoundary.lean` (MR-4.2): kernel-checked handler
-  correspondence (`mirHandledTree` / `handleMirExternalCalls`) and boundary
-  witnesses for compiler intrinsics. For `cold_path`, `ctpop`,
-  session-configured `ub_checks` calls, and per-`IntType` `exact_div`, concrete
-  `ExternalCallHandler`s (`coldPathHandler`, `ctpopHandler`, `ubChecksHandler`,
-  `exactDivHandler`) match `minimize`'s `translateRsIntrinsic` lowerings
-  (`bdColdPath_handled`, `bdCtpop_handled`, `bdUbChecksCall_handled`,
-  `bdExactDiv_handled`, `exactDivHandler_iff_minirust`), supported by a symbolic
-  proof that MiniRust's `UnOp::Int(CountOnes)` equals the unsigned bit-pattern
-  popcount at every signed and unsigned `IntType` width
-  (`evalCountOnes_intFromBits`, `evalCountOnes_signedness_indep`). Without type
-  specialization, Anneal's `MirCallReq` erases generic `IntType` signedness, so
-  `exact_div::<i32>(-6, 3)` and `exact_div::<u32>(4294967290, 3)` issue identical
-  requests even though MiniRust's `DivExact` returns `-2` for the first and
-  raises UB for the second (`bdExactDiv_same_request`, `bdExactDiv_minirust_i32`,
-  `bdExactDiv_minirust_u32`). For pointer/target intrinsics outside the fragment:
+* `Correspondence/IntrinsicBoundary.lean` (MR-4.2): kernel-checked inline and
+  external-handler correspondence (`mirHandledTree` / `handleMirExternalCalls`)
+  and boundary witnesses for compiler intrinsics. Compiler intrinsics modeled in
+  `evalDirectRustIntrinsic?` (`arith_offset`, `ctpop`, `exact_div`, `ub_checks`)
+  evaluate inline in `stepMirFn` using `MirCallReq.typeArgs` (`bdMirCallReq_fields`,
+  `bdArithOffset_anneal_ret`, `bdCtpop_anneal_ret`, `bdCtpop_inline`,
+  `bdExactDivI32_anneal_ret`, `bdExactDiv_typeArgs_distinct`, `bdExactDiv_inline`,
+  `bdUbChecksCall_anneal_ret`), and diverging `core::intrinsics::abort` returns
+  `MirOutcome.abort` (`bdAbort_anneal_abort`), while `cold_path`, `write_bytes`,
+  and `raw_eq` emit external `MirCallReq` requests (`bdColdPath_extCall`,
+  `bdColdPath_handled`, `bdWriteBytes_extCall`, `bdWriteBytes_unhandled_fault`,
+  `bdRawEq_extCall`, alongside `ctpopHandler`, `ubChecksHandler` /
+  `bdUbChecksCall_handled`, `exactDivHandler_iff_minirust`, and the symbolic
+  popcount proofs `evalCountOnes_intFromBits` and `evalCountOnes_signedness_indep`).
+  For pointer/target intrinsics and polymorphism outside the fragment:
   `Rvalue::NullaryOp(UbChecks)` is `unsupported` in Anneal (`bdUbChecks_step`)
-  but a session-fixed `bool` constant in `minimize` (whereas an unlowered call
-  to `core::intrinsics::ub_checks` emits `MirStepNode.extCall` and is handled by
-  `ubChecksHandler`); `CopyNonOverlapping` aborts `minimize` (`span_bug!`) while
-  Anneal executes it and returns normally even on a two-element `u32` copy
-  between 4-byte locals (`bdCopy2_noUB`); Anneal's `BinOp::Offset` adds the raw
-  count without pointee scaling or inbounds checks (`bdOffsetNeg1_noUB`);
-  `write_bytes` (`bdWriteBytes_extCall`, `bdWriteBytes_unhandled_fault`),
-  `raw_eq`, and `arith_offset` issue external calls; diverging `abort` (`target = none`) is `unsupported` in Anneal
-  (`bdAbort_unsupported`); and `core::hint::unreachable_unchecked()` faults with
-  UB in Anneal, matching `Terminator::Unreachable` (`bdUnreach_anneal_ub`,
-  `bd_minirust_unreachable_ub`).
+  but a session-fixed `bool` constant in `minimize`; `CopyNonOverlapping` aborts
+  `minimize` (`span_bug!`) while Anneal executes it (`bdCopy2_noUB`); Anneal's
+  `BinOp::Offset` scales the signed count by `size_of::<T>()` and enforces
+  in-bounds byte arithmetic (`bdOffset1_anneal_ret`, `bdOffsetNeg1_anneal_ub`,
+  `bdOffsetNeg1_not_noUB`); unmonomorphized `RigidTy.param`, `RigidTy.alias`, and
+  polymorphic `monoCallee?` calls fail closed (`bdPolymorphicCallee_rejected`);
+  and `core::hint::unreachable_unchecked()` faults with UB in Anneal, matching
+  `Terminator::Unreachable` (`bdUnreach_anneal_ub`, `bd_minirust_unreachable_ub`).
 * `tempMove`, `crossBlockMove`, `loopTempMove`, `storageLiveArgRet`,
   `diamondMoveJoin`, `tupleAggCastMove`, and `ordBoolCastTempMove` (MR-1.3):
   `tempMove` is
@@ -1133,12 +1129,17 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   integer local, to a `ConstantIndex` array element, or to a `TupleSpec` scalar
   field chain).
 * Outside the fragment (`*_notInFragment`), both semantics agree on
-  `arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`) and `dangling`
-  (UB on a read after `StorageDead` of the borrowed temporary), and they
-  disagree on the divergences listed under the gaps: `offsetDeref`
-  (`*p.offset(1)` reads `a[1] = 7` in MiniRust and `a[0] = 5` in Anneal;
-  `offset(2)` then a read, `offset(3)`, and `offset(usize::MAX)` are UB in
-  MiniRust and return `5` in Anneal), `misaligned` (UB in MiniRust only),
+  `arrayElemPtr` (`&raw mut a[1]` on a temporary array; `12`), `dangling`
+  (UB on a read after `StorageDead` of the borrowed temporary), and `offsetDeref`
+  (`offsetDeref 0` returns `a[0] = 5`, `offsetDeref 1` returns `a[1] = 7`, and
+  `offsetDeref 2`, `offsetDeref 3`, and `offsetDeref usizeMax` fault with UB in
+  both Anneal and MiniRust; `offsetDeref_anneal_ret`, `offsetDeref_anneal_ub`) —
+  while with `parentTag`-linked reborrows and ancestor-tracking `stepReborrow`,
+  `childReborrowWriteDisablesParent` and `retagDisabledRefDiscrepancy` are now
+  admitted in `inFragment` (`*_inFragment`) and return `9` across Anneal,
+  `BasicMemory`, and `MachTB` (`childReborrowWriteDisablesParent_anneal_ret`,
+  `retagDisabledRefDiscrepancy_anneal_ret`); they disagree on the remaining
+  divergences listed under the gaps: `misaligned` (UB in MiniRust only),
   `misalignedRef` (`"Value::Ptr: unaligned safe pointer"` on merely forming
   `&*q` without reading in MiniRust, vs returning `5` in Anneal), `danglingRef`
   (`"Value::Ptr: non-dereferenceable safe pointer"` on copying a dangling `&u32`
@@ -1159,15 +1160,10 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   both Anneal and `MachTB` — `"Tree Borrows: local write of Frozen reference"` —
   while returning `9` on `BasicMemory`, and `disabledRefReborrow` faults at the
   reborrow in both Anneal and `MachTB` while returning `9` on `BasicMemory`),
-  `childReborrowWriteDisablesParent` (UB in Anneal's flat `List BorrowEntry`
-  model because writing through a child `&mut` disables its parent entry, vs
-  returning `9` on both `BasicMemory` and `MachTB`),
-  `retagFnEntryProtectorWrite`, `retagDisabledRefDiscrepancy`,
+  `retagFnEntryProtectorWrite`,
   `retagTrulyDisabledRefUb`, `retagFnEntryLocalDeallocUb`, and
   `retagScalarDiscrepancy` (`retagFnEntryProtectorWrite` faulting at `_1 = 9` in
   both Anneal and `MachTB` while returning `9` on `BasicMemory`;
-  `retagDisabledRefDiscrepancy` faulting in Anneal after a child write while
-  returning `9` on both `BasicMemory` and `MachTB`, contrasted with
   `retagTrulyDisabledRefUb` where a foreign direct write disables `_2` so both
   Anneal and `MachTB` fault at `Retag(Default, _2)`;
   `retagFnEntryLocalDeallocUb` returning `5` in both Anneal and `BasicMemory`
@@ -1198,7 +1194,13 @@ and the statement-level lemmas of `Correspondence/PointerStep.lean` on which
   three), `exposeSharedRefWriteUb` (UB on Anneal and `MachTB` vs. `88` on `Mach`),
   `exposeTwoRefMutAngelicUnsupported` (`88` on Anneal and `Mach` vs.
   `Stop.unsupported` on `MachTB` when two live `&mut` tags meet at `int2ptr`),
-  `boolMutRefToggle` and `boolInvalidByteRefUb`, and two upstream MiniRust
+  `boolMutRefToggle` and `boolInvalidByteRefUb` (plus `boolInvalidLoadDirectUb`
+  verifying `validateLoadedValue` invalid-`bool` UB parity at the dereference load
+  itself, `storageCycleDisablesBorrowUb` verifying `disableLocalBorrows` across
+  `StorageDead`/`StorageLive` stack-slot reuse, `derefReadFreezesActiveMutUb`
+  verifying `freezeDerefReadBorrowsAt` on active `&mut`, and in-fragment
+  `mutReborrowForeignReadRoundTrip` verifying `.reserved` `&mut (*_2)` across a
+  foreign parent read), and two upstream MiniRust
   specification findings (`zstWrappingSubReborrow_tb_specPanic` /
   `nonZstWrappingSubReborrow_bm_and_tb_ub`, where reborrowing a negative-offset
   `ptr_offset_wrapping(-8)` pointer at ZST `&()` passes `BasicMemory::check_ptr`
@@ -1378,17 +1380,23 @@ These are deliberate and are the first things to lift:
   requires every borrowed local to be a parameter that is never written
   directly, deinitialized, storage-cycled, or moved, and computes the least
   fixed point (`ptrEnvAtEntry`, proved to converge unconditionally in
-  `B * n * (n + 3) + 1` iterations by `iterPtrAliasEntries_stabilizes`,
+  `B * n * (n + 4) + 1` iterations by `iterPtrAliasEntries_stabilizes`,
   characterized by `ptrAliasingOk_iff_blockPtrAliasOk`, and proved least by
   `ptrEnvAtEntry_least`) of the flow-sensitive join-semilattice `PtrLocalState`
-  (`.empty` `⊥`, `.live target peers`, `.disabled` `⊤`) across the CFG: direct
-  borrows set `.live (some (k, borrowProjSteps projs)) [i]`, copies/casts/zero-offsets
-  add the destination to the source's tag-peer set `peers`, reborrows allocate a
-  fresh singleton peer set `[i]` inheriting the parent's target, and dereference
-  writes keep every local in `wPeers` or with a provably disjoint target
-  (`targetsDefinitelyDisjoint`) `.live` while invalidating all other `.live`
-  locals to `.disabled`, admitting mutable reborrows followed by dereference
-  writes, NLL sequential shared/mutable borrows, and multi-block / loop borrows
+  (`.empty` `⊥`, `.live target peers hot`, `.disabled` `⊤`) across the CFG: direct
+  borrows set `.live (some (k, borrowProjSteps projs)) [i] (borrowStartsHot rv)`
+  (`hot = false` for `.reserved` / `.frozen` borrows such as `&two_phase mut`,
+  `&`, and `&raw const`, `hot = true` for `.active` `&mut` and `&raw mut`),
+  copies/casts/zero-offsets add the destination to the source's tag-peer/ancestor
+  set `peers`, reborrows inherit `i :: pPeers` on the parent's target (`hot = false`
+  on reference reborrows `&*_p` / `&mut *_p`) so reads and writes through a child
+  borrow keep its Tree Borrows ancestors live, foreign reads (`stepForeignRead`) disable only `hot = true` mutable borrows
+  that may be frozen while keeping `hot = false` `.reserved` borrows live, and
+  dereference writes keep every local in `wPeers` or with a provably disjoint
+  target (`targetsDefinitelyDisjoint`) `.live` (activating `hot = true`) while
+  invalidating all other `.live` locals to `.disabled`, admitting two-phase
+  borrows with foreign reads, mutable reborrows followed by dereference writes,
+  NLL sequential shared/mutable borrows, and multi-block / loop borrows
   without falsely invalidating disjoint sibling borrows. `AddrOk` requires parameter allocations to be non-null
   (`0 < a`), aligned, and in-bounds so every `PtrType::Ref` value satisfies
   MiniRust's safe-pointer validity invariant (`checkValue_refTy`, including
@@ -1404,16 +1412,14 @@ These are deliberate and are the first things to lift:
     (`misalignedRef`) or copying a dangling `&u32` (`danglingRef`) is
     immediate UB in MiniRust, whereas Anneal stores `(tag, offset)` pairs and
     checks liveness only on dereference.
-  - *Flat borrow list vs. Tree Borrows parent-child tree*: Anneal's
-    `MirSemantics` stores a flat `List BorrowEntry` without parent pointers;
-    reborrowing `(*_p)` appends an entry targeting `_p`'s root `(local, proj)`
-    after checking `parentEntry.perm`, and writing `(*_child) = rv` runs
-    `invalidateDerefWriteBorrows`, which disables every overlapping entry whose
-    `tag ≠ child.tag` — including the *parent* `&mut` entry
-    (`childReborrowWriteDisablesParent`, `retagDisabledRefDiscrepancy`), whereas
-    Tree Borrows (`MachTB` and `treeBorrowsChildWritePreservesParent`) and
-    `BasicMemory` permit parent reuse after child writes. Polymorphic
-    `Machine<M>` (`MemoryOps M`) in `Interp.lean` runs both `BasicMemory<x86_64>`
+  - *Tree Borrows `parentTag` hierarchy vs. remaining local-teardown and direct-write
+    gaps*: Anneal's `BorrowEntry` records `parentTag`, starts `&mut *_p` reborrows
+    in `.reserved`, freezes overlapping foreign `.active` entries on dereference
+    reads (`freezeDerefReadBorrowsAt`), and preserves ancestor entries across
+    descendant writes (`childReborrowWriteDisablesParent` and
+    `retagDisabledRefDiscrepancy` now return `9` across Anneal, `BasicMemory`,
+    and `MachTB`), while `disableLocalBorrows` disables borrows on explicit
+    `StorageLive` / `StorageDead`. Polymorphic `Machine<M>` (`MemoryOps M`) in `Interp.lean` runs both `BasicMemory<x86_64>`
     (`stepM_bm_eq` / `stepsM_bm_eq` proving unconditional equality with `step` /
     `steps`) and the full 6-module `TreeBorrowsMemory<x86_64>` (`MachTB`,
     `stepTB` / `stepsTB`, with `stepTB_wfLive` / `stepsTB_wfLive` /
@@ -1447,10 +1453,10 @@ These are deliberate and are the first things to lift:
     (`prevents_deallocation = false`) and succeeds while Anneal's
     `hasProtectedWriteConflict` over-approximates `writerTag = some _` as
     conflicting even for `!Freeze` `.reserved` entries.
-  - *Raw-pointer offsets, integer-to-pointer transmutes, and provenance exposure*:
-    Anneal ignores `offsetBytes`
-    on dereference (`offsetDeref 1`, `misaligned`, `offsetDeref 2`), does not
-    scale or bounds-check `Offset` (`offsetDeref 3`, `offsetDeref usizeMax`),
+  - *Misaligned sub-scalar offsets, integer-to-pointer transmutes, and provenance exposure*:
+    while stride-scaled `BinOp::Offset` and array element byte-offset dereferencing
+    agree with MiniRust (`offsetDeref`), Anneal reads the underlying scalar local
+    on misaligned sub-scalar byte offsets (`misaligned`),
     checks only `bits != 0` when decoding provenance-free integer bytes at `&T`
     (`transmuteDanglingIntToRefDiscrepancy`), and encodes
     `PointerExposeProvenance` as `tag * 65536 + offsetBytes` (`exposeTwice`;
@@ -1639,18 +1645,12 @@ These are deliberate and are the first things to lift:
   `IntrinsicFallback` proves full `mirCallWithCallees_ret` correspondence for
   callee-body fallbacks (`ctlz`, `cttz`, `bswap`, `bitreverse`,
   `saturating_add`, `saturating_sub`, `wrapping_shl`, `wrapping_shr`,
-  `black_box`). Compiler intrinsics called via `TerminatorKind.call` without a
-  callee body emit `MirCallE` external calls in Anneal (`MirStepNode.extCall`):
-  `IntrinsicBoundary` transcribes `minimize`'s `translateRsIntrinsic` (`raw_eq`,
-  `ctpop`, `exact_div`, `cold_path`, `abort`) and relates `cold_path`, `ctpop`,
-  and type-specialized `exact_div` under `mirHandledTree`
-  (`ExternalCallHandler`), while documenting why `MirCallReq`'s erased generic
-  types prevent a single type-blind handler from simultaneously matching signed
-  and unsigned `exact_div`, why diverging `abort` (`target = none`) is
-  `unsupported` in Anneal, and how `Rvalue::NullaryOp(UbChecks)`,
-  `CopyNonOverlapping`, `arith_offset`/`BinOp::Offset`, `write_bytes`, and
-  `raw_eq` behave outside the fragment (which admits only a zero constant
-  `Offset`).
+  `black_box`). For compiler intrinsics called via `TerminatorKind.call` without a
+  callee body, `evalDirectRustIntrinsic?` evaluates modeled intrinsics
+  (`arith_offset`, `ctpop`, `exact_div`, `ub_checks`) inline using
+  `MirCallReq.typeArgs`, `core::intrinsics::abort` returns `MirOutcome.abort`,
+  and unmodeled intrinsics (`cold_path`, `write_bytes`, `raw_eq`) emit `MirCallE`
+  external calls (`IntrinsicBoundary`).
 * **The interpretation is transcribed, not generated.** It is anchored to the
   generated model by token hashes and quotes the spec, but nothing proves it
   equal to the deep embedding, which has no executable semantics.

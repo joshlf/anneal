@@ -4209,16 +4209,36 @@ def borrowProjOverlap : List BorrowProjStep → List BorrowProjStep → Bool
 /-- Flow-sensitive abstract borrow state of a pointer or reference local `p`:
 * `.empty` (`⊥`): `p` holds no initialized pointer (`.dead` or `.uninit`, or `p`
   is not a pointer/reference local);
-* `.live target peers`: if `p` holds an initialized pointer `pv`, its Anneal
-  `BorrowEntry` is not `.disabled`, targets `target` (when `some`), and shares
-  its tag `pv.tag` with every initialized pointer/reference local in `peers`;
+* `.live target peers hot`: if `p` holds an initialized pointer `pv`, its Anneal
+  `BorrowEntry` is not `.disabled`, is not `.active` whenever `hot = false`
+  (two-phase borrows `&two_phase mut`, mutable reference reborrows `&mut *_p`,
+  and shared borrows start `.reserved` or `.frozen`, which foreign reads leave
+  unfrozen), targets `target` (when `some`), and shares its tag `pv.tag` with
+  every initialized pointer/reference local in `peers`;
 * `.disabled` (`⊤`): `p`'s tag may have been invalidated by a dereference write
-  through a distinct overlapping tag, so dereferencing `p` is forbidden. -/
+  through a distinct overlapping tag (or frozen on a hot mutable borrow by a
+  foreign read), so dereferencing `p` is forbidden. -/
 inductive PtrLocalState where
   | empty
-  | live (target : Option (Nat × List BorrowProjStep)) (peers : List Nat)
+  | live (target : Option (Nat × List BorrowProjStep)) (peers : List Nat) (hot : Bool := true)
   | disabled
   deriving DecidableEq, Repr
+
+/-- Whether a fresh borrow or reborrow rvalue creates an immediately `.active`
+entry (`&raw mut` or non-two-phase root `&mut`), as opposed to `.reserved` or
+`.frozen` (`&two_phase mut`, reference reborrows `&mut *_p`, `&`, `&raw const`). -/
+def borrowStartsHot : MirAst.Rvalue → Bool
+  | .rawPtr .mut _ => true
+  | .ref (.mut false) ⟨_, []⟩ => true
+  | .ref (.mut false) ⟨_, .deref :: _⟩ => false
+  | .ref (.mut false) ⟨_, _ :: _⟩ => true
+  | _ => false
+
+/-- Whether `st` may hold an `.active` Tree Borrows entry (which a foreign read
+would freeze). -/
+def isHotPtrState : PtrLocalState → Bool
+  | .live _ _ hot => hot
+  | _ => false
 
 /-- Extract the parent local `p` of a reborrow rvalue (`&*_p`, `&mut *_p`,
 `&raw const *_p`, `&raw mut *_p`). -/
@@ -4251,13 +4271,13 @@ def ptrCopySrcOf (decls : List MirAst.LocalDecl) (rv : MirAst.Rvalue) : Option N
 /-- Remove local `i` from a `PtrLocalState`'s peer set when `i` is overwritten. -/
 def removePeerFromState (i : Nat) : PtrLocalState → PtrLocalState
   | .empty => .empty
-  | .live t ps => .live t (ps.filter (· != i))
+  | .live t ps hot => .live t (ps.filter (· != i)) hot
   | .disabled => .disabled
 
 /-- Add local `i` to a `.live` state's peer set. -/
 def addPeerToState (i : Nat) : PtrLocalState → PtrLocalState
   | .empty => .empty
-  | .live t ps => .live t (if ps.contains i then ps else i :: ps)
+  | .live t ps hot => .live t (if ps.contains i then ps else i :: ps) hot
   | .disabled => .disabled
 
 /-- Update local `i` to `st` while removing `i` from all other locals' peer sets. -/
@@ -4267,12 +4287,14 @@ def setPtrLocal (n : Nat) (env : List PtrLocalState) (i : Nat) (st : PtrLocalSta
     if q == i then st else removePeerFromState i (env.getD q .disabled)
 
 /-- Abstract transfer for a reborrow `_i = &*_p` / `&mut *_p` / `&raw *_p`,
-which allocates a fresh tag inheriting `p`'s borrow target. -/
-def stepReborrow (n : Nat) (env : List PtrLocalState) (i p : Nat) : List PtrLocalState :=
+which allocates a fresh child tag inheriting `p`'s borrow target, `p`'s
+ancestor-local set (plus `i`), and initial hotness `hot`. -/
+def stepReborrow (n : Nat) (env : List PtrLocalState) (i p : Nat) (hot : Bool) :
+    List PtrLocalState :=
   let newSt :=
     match env.getD p .disabled with
     | .empty => .empty
-    | .live target _ => .live target [i]
+    | .live target pPeers _ => .live target (i :: pPeers.filter (· != i)) hot
     | .disabled => .disabled
   setPtrLocal n env i newSt
 
@@ -4287,9 +4309,9 @@ def stepPtrCopy (n : Nat) (env : List PtrLocalState) (i p : Nat) : List PtrLocal
       if q == i then srcSt
       else
         match removePeerFromState i (env.getD q .disabled) with
-        | .live t ps =>
-          if ps.contains p then .live t (if ps.contains i then ps else i :: ps)
-          else .live t ps
+        | .live t ps qHot =>
+          if ps.contains p then .live t (if ps.contains i then ps else i :: ps) qHot
+          else .live t ps qHot
         | other => other
 
 /-- Whether two static borrow targets are guaranteed not to overlap in Anneal's
@@ -4302,20 +4324,21 @@ def targetsDefinitelyDisjoint :
 
 /-- Abstract transfer for a dereference write `(*_w) = rv`: every `.live` local
 that shares `w`'s tag (`q ∈ wPeers`) or targets a provably non-overlapping place
-(`targetsDefinitelyDisjoint`) stays `.live`, and all other `.live` locals become
+(`targetsDefinitelyDisjoint`) stays `.live` (conservatively marked `hot = true`
+since writing activates `.reserved` entries), and all other `.live` locals become
 `.disabled`. -/
 def stepDerefWrite (n : Nat) (env : List PtrLocalState) (w : Nat) : List PtrLocalState :=
   match env.getD w .disabled with
   | .empty => (List.range n).map (fun q => env.getD q .disabled)
   | .disabled => (List.range n).map (fun _ => .disabled)
-  | .live wTarget wPeers =>
+  | .live wTarget wPeers _ =>
     (List.range n).map fun q =>
       match env.getD q .disabled with
       | .empty => .empty
       | .disabled => .disabled
-      | .live qTarget qPeers =>
+      | .live qTarget qPeers _ =>
         if wPeers.contains q || targetsDefinitelyDisjoint qTarget wTarget then
-          .live qTarget qPeers
+          .live qTarget qPeers true
         else
           .disabled
 
@@ -4339,24 +4362,24 @@ def foreignReadKeeps (env : List PtrLocalState) (r q : Nat) : Bool :=
   | .empty, _ => true
   | _, .empty => true
   | _, .disabled => true
-  | .live rTarget rPeers, .live qTarget _ =>
+  | .live rTarget rPeers _, .live qTarget _ _ =>
     rPeers.contains q || targetsDefinitelyDisjoint qTarget rTarget
-  | .disabled, .live _ _ => false
+  | .disabled, .live _ _ _ => false
 
 /-- Abstract transfer for a Tree Borrows read through `r`'s tag: a dereference
 read `*_r` (`freezeDerefReadBorrowsAt`) or the initial read of a reborrow
 `&*_r` / `&mut *_r` (`freezeTreeBorrowsOnReadAtProj`). Anneal freezes every
 foreign `.active` entry overlapping the read (MiniRust
-`PermissionUnprot::foreign_read`), after which writes and mutable reborrows
-through that entry are UB while MiniRust's `BasicMemory` accepts them, so every
-`.live` mutable pointer/reference local (`isMutPtrLocal`) that the read may
-freeze (`foreignReadKeeps = false`) becomes `.disabled`. Shared
-pointer/reference locals stay `.live`: the fragment only reads through them,
-which a frozen entry permits. -/
+`PermissionUnprot::foreign_read`), leaving `.reserved` and `.frozen` entries
+unchanged, so every hot (`isHotPtrState`) `.live` mutable pointer/reference local
+(`isMutPtrLocal`) that the read may freeze (`foreignReadKeeps = false`) becomes
+`.disabled`, while cold (`hot = false`) `.reserved` borrows and shared
+pointer/reference locals stay `.live`. -/
 def stepForeignRead (decls : List MirAst.LocalDecl) (n : Nat) (env : List PtrLocalState)
     (r : Nat) : List PtrLocalState :=
   (List.range n).map fun q =>
-    if isMutPtrLocal decls q && !foreignReadKeeps env r q then .disabled
+    if isMutPtrLocal decls q && isHotPtrState (env.getD q .disabled) && !foreignReadKeeps env r q then
+      .disabled
     else env.getD q .disabled
 
 /-- Extract the parent local `p` of a reference reborrow (`&*_p`, `&mut *_p`),
@@ -4410,10 +4433,10 @@ def ptrStmtStep (decls : List MirAst.LocalDecl) (env : List PtrLocalState)
     if isDeclPtrLocal decls i then
       match directBorrowOf rv with
       | some (_, ⟨k, projs⟩) =>
-        setPtrLocal n env i (.live (some (k, borrowProjSteps projs)) [i])
+        setPtrLocal n env i (.live (some (k, borrowProjSteps projs)) [i] (borrowStartsHot rv))
       | none =>
         match reborrowParentOf rv with
-        | some p => stepReborrow n (stepReborrowRead decls n env rv) i p
+        | some p => stepReborrow n (stepReborrowRead decls n env rv) i p (borrowStartsHot rv)
         | none =>
           match ptrCopySrcOf decls rv with
           | some p => stepPtrCopy n env i p
@@ -4445,10 +4468,10 @@ def blockPtrAliasOk (decls : List MirAst.LocalDecl) (env : List PtrLocalState) :
 def joinPtrLocalState : PtrLocalState → PtrLocalState → PtrLocalState
   | .empty, s => s
   | s, .empty => s
-  | .live t1 ps1, .live t2 ps2 =>
+  | .live t1 ps1 h1, .live t2 ps2 h2 =>
     let t := if t1 == t2 then t1 else none
     let ps := ps1.filter (fun r => ps2.contains r)
-    .live t ps
+    .live t ps (h1 || h2)
   | _, _ => .disabled
 
 /-- Pointwise join of two `PtrLocalState` environments of width `n`. -/
@@ -4461,7 +4484,8 @@ def joinPtrEnv (n : Nat) (e1 e2 : List PtrLocalState) : List PtrLocalState :=
 def subsumesPtrLocalState : PtrLocalState → PtrLocalState → Bool
   | .empty, _ => true
   | _, .disabled => true
-  | .live t1 ps1, .live t2 ps2 =>
+  | .live t1 ps1 h1, .live t2 ps2 h2 =>
+    (!h1 || h2) &&
     (match t2 with
      | none => true
      | some q2 => decide (t1 = some q2)) &&
@@ -4510,12 +4534,12 @@ def iterPtrAliasEntries :
     else iterPtrAliasEntries k decls bbs entries'
 
 /-- Abstract pointer/reference borrow state on entry to block `blk`. Each local's
-lattice chain has height at most `n + 3`, so `B * n * (n + 3) + 1` passes suffice
+lattice chain has height at most `n + 4`, so `B * n * (n + 4) + 1` passes suffice
 to reach the least fixed point on any CFG. -/
 def ptrEnvAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List PtrLocalState :=
   let n := body.localDecls.length
   let b := body.basicBlocks.length
-  let fuel := b * n * (n + 3) + 1
+  let fuel := b * n * (n + 4) + 1
   let init := initPtrEntries b n
   (iterPtrAliasEntries fuel body.localDecls body.basicBlocks init).getD blk (initPtrEnv n)
 
@@ -6059,12 +6083,12 @@ def ptrTermStep (decls : List MirAst.LocalDecl) (env : List PtrLocalState)
       else
         match env.getD q .disabled with
         | .empty => .empty
-        | .live _ _ | .disabled => .disabled
+        | .live _ _ _ | .disabled => .disabled
   | .call _ _ _ (some _) _ =>
     (List.range n).map fun q =>
       match env.getD q .disabled with
       | .empty => .empty
-      | .live _ _ | .disabled => .disabled
+      | .live _ _ _ | .disabled => .disabled
   | _ => env
 
 /-- One forward dataflow pass for `ptrAliasingProgOk`, composing `ptrStmtStep`
@@ -6100,7 +6124,7 @@ multi-function body (`ptrAliasingProgOk`). -/
 def ptrProgEnvAtEntry (body : MirAst.CapturedMir) (blk : Nat) : List PtrLocalState :=
   let n := body.localDecls.length
   let b := body.basicBlocks.length
-  let fuel := b * n * (n + 3) + 1
+  let fuel := b * n * (n + 4) + 1
   let init := initPtrEntries b n
   (iterPtrAliasProgEntries fuel body.localDecls body.basicBlocks init).getD blk (initPtrEnv n)
 

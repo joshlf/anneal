@@ -1814,15 +1814,15 @@ theorem int2ptrForgedTag_B3_divergence :
   ⟨by decide +kernel, by decide +kernel,
    int2ptrForgedTag_anneal_ret, int2ptrForgedTag_minirust_direct, int2ptrForgedTag_tb_direct⟩
 
-/-- `childReborrowWriteDisablesParent` under the B3 fragment. Before unstable
-`b076d6a3` this was a divergence (Anneal's flat borrow list faulted on the
-parent read while `BasicMemory` and Tree Borrows returned `9`); with
-parent-linked Tree Borrows entries Anneal now also returns `9`, so the program
-is accepted by B3, still rejected by the conservative standard fragment, and
-all three semantics agree. -/
+/-- `childReborrowWriteDisablesParent` under the B3 and unified fragments. Before
+unstable `b076d6a3` this was a divergence (Anneal's flat borrow list faulted on
+the parent read while `BasicMemory` and Tree Borrows returned `9`); with
+parent-linked Tree Borrows entries and ancestor-tracking `stepReborrow`, the
+program is accepted by both B3 and `progInFragmentWithIntrinsics`, and all three
+semantics return `9`. -/
 theorem childReborrowWriteDisablesParent_B3_divergence :
     progInFragmentWithIntrinsicsB3 childReborrowWriteDisablesParent [] = true ∧
-    progInFragmentWithIntrinsics childReborrowWriteDisablesParent [] = false ∧
+    progInFragmentWithIntrinsics childReborrowWriteDisablesParent [] = true ∧
     ReachesRet (mirTree childReborrowWriteDisablesParent
       (initMachineState childReborrowWriteDisablesParent [.scalar ⟨5, 4⟩])) []
       (.normal (.scalar ⟨9, 4⟩,

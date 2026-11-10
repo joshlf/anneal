@@ -425,7 +425,11 @@ open MiniRustSpec.Correspondence in
   rvBitsB_frame
   rvBitsO_frame
   rvTupleBits_frame
+  evalStmt_storageLive_disable
+  evalStmt_storageLive_protected
   evalStmt_storageLive
+  evalStmt_storageDead_disable
+  evalStmt_storageDead_protected
   evalStmt_storageDead
   evalStmt_deinit
   evalStmt_placeMention_dead
@@ -1698,7 +1702,11 @@ open MiniRustSpec.Correspondence in
   rvBitsB_frame
   rvBitsO_frame
   rvTupleBits_frame
+  evalStmt_storageLive_disable
+  evalStmt_storageLive_protected
   evalStmt_storageLive
+  evalStmt_storageDead_disable
+  evalStmt_storageDead_protected
   evalStmt_storageDead
   evalStmt_deinit
   evalStmt_placeMention_dead
@@ -2573,12 +2581,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   BorrowsOk.jump
   BorrowsOk.rawPtr
   BorrowsOk.derefWrite
-  BorrowsOk.derefWriteRead
+  BorrowsOk.derefRead
   LocalsOk.rawPtr_extend
   evalStmt_assign_rawPtr
-  evalStmt_assign_val_mem
+  BorrowsOk.freezeRead
   evalStmt_assign_derefWrite
-  evalStmt_assign_derefWrite_mem
+  evalStmt_assign_derefWrite_move
   evalOperand_deref_eq_target
   evalRvalue_ptrRvalue
   evalRvalue_derefRead_eq
@@ -2797,12 +2805,12 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness in
   BorrowsOk.jump
   BorrowsOk.rawPtr
   BorrowsOk.derefWrite
-  BorrowsOk.derefWriteRead
+  BorrowsOk.derefRead
   LocalsOk.rawPtr_extend
   evalStmt_assign_rawPtr
-  evalStmt_assign_val_mem
+  BorrowsOk.freezeRead
   evalStmt_assign_derefWrite
-  evalStmt_assign_derefWrite_mem
+  evalStmt_assign_derefWrite_move
   evalOperand_deref_eq_target
   evalRvalue_ptrRvalue
   evalRvalue_derefRead_eq
@@ -3066,6 +3074,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   borrowTargets_map_eq
   ctxWithBorrows_invalidateDerefWriteBorrows
   BorrowsOk.usable_of_not_disabled
+  PtrEnvOk.foreignRead
+  PtrEnvOk.derefRead
   PtrEnvOk.set_nonptr
   PtrEnvOk.setPtrLocal
   directBorrowOf_eq_none_of_reborrowParentOf
@@ -3074,8 +3084,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   statementOk_ref_false_of_scalar
   ptrTargetSpec_bound
   evalTargetPlace_deref
+  BorrowsOk.freezeRead
   BorrowsOk.directBorrow
   BorrowsOk.reborrow
+  BorrowsOk.derefRead
   evalStmt_assign_pushBorrow
   evalStmt_assign_ref
   evalStmt_assign_rawPtr_reborrow
@@ -3181,7 +3193,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   disabledRefReborrow_notInFragment
   disabledRefReborrow_anneal_ub
   disabledRefReborrow_minirust_direct
-  childReborrowWriteDisablesParent_notInFragment
+  childReborrowWriteDisablesParent_inFragment
   childReborrowWriteDisablesParent_anneal_ret
   childReborrowWriteDisablesParent_minirust_direct
   reborrowSettings_u32_examples
@@ -3274,7 +3286,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagFnEntryProtectorWrite_anneal_ub
   retagFnEntryProtectorWrite_minirust_direct
   retagDisabledRefDiscrepancy_translate
-  retagDisabledRefDiscrepancy_notInFragment
+  retagDisabledRefDiscrepancy_inFragment
   retagDisabledRefDiscrepancy_anneal_ret
   retagDisabledRefDiscrepancy_minirust_direct
   retagScalarDiscrepancy_translate
@@ -3487,6 +3499,8 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   borrowTargets_map_eq
   ctxWithBorrows_invalidateDerefWriteBorrows
   BorrowsOk.usable_of_not_disabled
+  PtrEnvOk.foreignRead
+  PtrEnvOk.derefRead
   PtrEnvOk.set_nonptr
   PtrEnvOk.setPtrLocal
   directBorrowOf_eq_none_of_reborrowParentOf
@@ -3495,8 +3509,10 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   statementOk_ref_false_of_scalar
   ptrTargetSpec_bound
   evalTargetPlace_deref
+  BorrowsOk.freezeRead
   BorrowsOk.directBorrow
   BorrowsOk.reborrow
+  BorrowsOk.derefRead
   evalStmt_assign_pushBorrow
   evalStmt_assign_ref
   evalStmt_assign_rawPtr_reborrow
@@ -3602,7 +3618,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   disabledRefReborrow_notInFragment
   disabledRefReborrow_anneal_ub
   disabledRefReborrow_minirust_direct
-  childReborrowWriteDisablesParent_notInFragment
+  childReborrowWriteDisablesParent_inFragment
   childReborrowWriteDisablesParent_anneal_ret
   childReborrowWriteDisablesParent_minirust_direct
   reborrowSettings_u32_examples
@@ -3695,7 +3711,7 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.PointerWitness Mini
   retagFnEntryProtectorWrite_anneal_ub
   retagFnEntryProtectorWrite_minirust_direct
   retagDisabledRefDiscrepancy_translate
-  retagDisabledRefDiscrepancy_notInFragment
+  retagDisabledRefDiscrepancy_inFragment
   retagDisabledRefDiscrepancy_anneal_ret
   retagDisabledRefDiscrepancy_minirust_direct
   retagScalarDiscrepancy_translate
@@ -3992,6 +4008,22 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   stdOrderingMutRefCmp_twenty_three_way
   unitTupleMutRefRoundTrip_translate
   unitTupleMutRefRoundTrip_three_way
+  boolInvalidLoadDirectUb_translate
+  boolInvalidLoadDirectUb_three_way_ub
+  storageCycleDisablesBorrowUb_notInFragment
+  storageCycleDisablesBorrowUb_translate
+  storageCycleDisablesBorrowUb_three_way_ub
+  derefReadFreezesActiveMutUb_notInFragment
+  derefReadFreezesActiveMutUb_translate
+  derefReadFreezesActiveMutUb_three_way
+  mutReborrowForeignReadRoundTrip_inFragment
+  mutReborrowForeignReadRoundTrip_translate
+  mutReborrowForeignReadRoundTrip_ctxOk
+  mutReborrowForeignReadRoundTrip_anneal_ret
+  mutReborrowForeignReadRoundTrip_noUB
+  mutReborrowForeignReadRoundTrip_minirust_ret_from_start
+  mutReborrowForeignReadRoundTrip_minirust_noUB
+  mutReborrowForeignReadRoundTrip_three_way
 
 open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
 #check_theorem_deps "[TB-AUDIT]"
@@ -4165,6 +4197,22 @@ open MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness in
   stdOrderingMutRefCmp_twenty_three_way
   unitTupleMutRefRoundTrip_translate
   unitTupleMutRefRoundTrip_three_way
+  boolInvalidLoadDirectUb_translate
+  boolInvalidLoadDirectUb_three_way_ub
+  storageCycleDisablesBorrowUb_notInFragment
+  storageCycleDisablesBorrowUb_translate
+  storageCycleDisablesBorrowUb_three_way_ub
+  derefReadFreezesActiveMutUb_notInFragment
+  derefReadFreezesActiveMutUb_translate
+  derefReadFreezesActiveMutUb_three_way
+  mutReborrowForeignReadRoundTrip_inFragment
+  mutReborrowForeignReadRoundTrip_translate
+  mutReborrowForeignReadRoundTrip_ctxOk
+  mutReborrowForeignReadRoundTrip_anneal_ret
+  mutReborrowForeignReadRoundTrip_noUB
+  mutReborrowForeignReadRoundTrip_minirust_ret_from_start
+  mutReborrowForeignReadRoundTrip_minirust_noUB
+  mutReborrowForeignReadRoundTrip_three_way
 
 open MiniRustSpec.Interp MiniRustSpec.Correspondence MiniRustSpec.Correspondence.TbWitness
   MiniRustSpec.Correspondence.ProvenanceWitness in
