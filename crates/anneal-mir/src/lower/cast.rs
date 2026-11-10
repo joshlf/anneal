@@ -455,17 +455,17 @@ fn collect_pointer_offsets(
 }
 
 /// The fields whose declaration-order concatenation forms a canonical, untagged ADT's byte
-/// image: a struct's fields, a single-field union's field, or a tagless single-variant (or
-/// variant-less) enum's fields. `None` for explicit-tag enums, whose image depends on the tag.
+/// image: a struct's fields, a single-field union's field, the only present variant's fields
+/// of an enum laid out without a tag ([`AdtDef::univariant_index`]), or none for a variant-less
+/// enum. `None` for enums that store a tag, whose image depends on it.
 pub(crate) fn canonical_untagged_fields(def: &AdtDef) -> Option<&[Ty]> {
     match &def.kind {
         AdtKind::Struct { fields } => Some(fields),
         AdtKind::Union { fields } => Some(&fields[..fields.len().min(1)]),
-        AdtKind::Enum {
-            tag_ty: None,
-            variants,
-        } if variants.len() <= 1 => Some(variants.first().map_or(&[][..], |v| &v.fields)),
-        AdtKind::Enum { .. } => None,
+        AdtKind::Enum { variants, .. } if variants.is_empty() => Some(&[]),
+        AdtKind::Enum { variants, .. } => def
+            .univariant_index()
+            .map(|v| variants[v].fields.as_slice()),
     }
 }
 

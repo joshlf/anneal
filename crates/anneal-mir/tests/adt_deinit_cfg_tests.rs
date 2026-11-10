@@ -3647,7 +3647,11 @@ fn test_cfg_collatz_and_fibonacci_loops_match_direct_computation() {
     let steps = |mut n: u64| {
         let mut steps = 0u32;
         while n != 1 {
-            n = if n.is_multiple_of(2) { n / 2 } else { 3 * n + 1 };
+            n = if n.is_multiple_of(2) {
+                n / 2
+            } else {
+                3 * n + 1
+            };
             steps += 1;
         }
         steps
@@ -5480,8 +5484,9 @@ fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_u
     // 1. `#[repr(transparent)]` structs and unions with a second non-1-ZST field whose layout is
     // `Unspecified` (`Option<u32>`) must be rejected as ill-formed (`E0690`), not treated as a
     // valid 1-field wrapper with an inexact layout.
-    let bad_trans_struct =
-        Ty::adt(AdtDef::new_struct("BadTS", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::transparent()));
+    let bad_trans_struct = Ty::adt(
+        AdtDef::new_struct("BadTS", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::transparent()),
+    );
     assert!(matches!(
         bad_trans_struct.layout_for(PW),
         Err(LayoutError::IllFormed(_))
@@ -5490,8 +5495,9 @@ fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_u
         bad_trans_struct.check_representable(PW),
         Err(LayoutError::IllFormed(_))
     ));
-    let bad_trans_union =
-        Ty::adt(AdtDef::new_union("BadTU", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::transparent()));
+    let bad_trans_union = Ty::adt(
+        AdtDef::new_union("BadTU", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::transparent()),
+    );
     assert!(matches!(
         bad_trans_union.layout_for(PW),
         Err(LayoutError::IllFormed(_))
@@ -5504,9 +5510,8 @@ fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_u
     // 2. `AdtDef::field_offset` and `resolve_offset_of` (including an empty path `&[]`) must
     // reject containers whose overall layout is `Unspecified`, even when querying an earlier
     // field whose offset would otherwise be known.
-    let (s_opt_def, s_opt_ty) = adt(
-        AdtDef::new_struct("SOpt", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::c()),
-    );
+    let (s_opt_def, s_opt_ty) =
+        adt(AdtDef::new_struct("SOpt", vec![u32_ty(), opt.clone()]).with_repr(AdtRepr::c()));
     assert_eq!(s_opt_ty.layout_for(PW), Err(LayoutError::Unspecified));
     assert_eq!(
         s_opt_def.field_offset(0, 0, PW),
@@ -5514,7 +5519,9 @@ fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_u
     );
     assert_eq!(
         resolve_offset_of(&s_opt_ty, &[(0, 0)], PW),
-        Err(RvalueLowerError::UnsupportedOffsetOfLayout(s_opt_ty.clone()))
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(
+            s_opt_ty.clone()
+        ))
     );
     assert_eq!(
         resolve_offset_of(&opt, &[], PW),
@@ -5536,8 +5543,7 @@ fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_u
     //   niche;
     // - 256 inhabited variants where variant 0 holds `bool` has a payload niche (`contains_niche`),
     //   so a union containing it is not canonical for transmutation.
-    let mut vars_with_never: Vec<VariantDef> =
-        vec![VariantDef::new("V0", vec![Ty::Never])];
+    let mut vars_with_never: Vec<VariantDef> = vec![VariantDef::new("V0", vec![Ty::Never])];
     for i in 1..256 {
         vars_with_never.push(VariantDef::new(format!("V{i}"), vec![]));
     }
@@ -5551,14 +5557,14 @@ fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_u
     let mut vars_with_bool: Vec<VariantDef> =
         vec![VariantDef::new("V0", vec![Ty::Bool]).with_discriminant(0)];
     for i in 1..256 {
-        vars_with_bool.push(
-            VariantDef::new(format!("V{i}"), vec![u8_ty()]).with_discriminant(i as u128),
-        );
+        vars_with_bool
+            .push(VariantDef::new(format!("V{i}"), vec![u8_ty()]).with_discriminant(i as u128));
     }
-    let (_, e256_bool) = adt(
-        AdtDef::new_enum("E256Bool", Some(ScalarTy::Uint(UintTy::U8)), vars_with_bool)
-            .with_repr(AdtRepr::c()),
-    );
+    let (_, e256_bool) =
+        adt(
+            AdtDef::new_enum("E256Bool", Some(ScalarTy::Uint(UintTy::U8)), vars_with_bool)
+                .with_repr(AdtRepr::c()),
+        );
     assert!(e256_bool.contains_niche_for(PW));
     let (_, union_e256_bool) =
         adt(AdtDef::new_union("UE256Bool", vec![e256_bool]).with_repr(AdtRepr::c()));
@@ -5567,17 +5573,15 @@ fn test_b1_adt_transparent_unspecified_fields_field_offset_and_enum_niche_with_u
     // 4. Transmuting bytes whose tag selects an uninhabited variant (`Dead(u8, !) = 0`) of an
     // inhabited `#[repr(C, u8)]` enum must fail with `InvalidBitPattern` for the enum type, not
     // `UninhabitedTarget { target_ty: Ty::Never }`.
-    let (_, e_dead_live) = adt(
-        AdtDef::new_enum(
-            "EDeadLive",
-            Some(ScalarTy::Uint(UintTy::U8)),
-            vec![
-                VariantDef::new("Dead", vec![u8_ty(), Ty::Never]).with_discriminant(0),
-                VariantDef::new("Live", vec![u8_ty()]).with_discriminant(1),
-            ],
-        )
-        .with_repr(AdtRepr::c()),
-    );
+    let (_, e_dead_live) = adt(AdtDef::new_enum(
+        "EDeadLive",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("Dead", vec![u8_ty(), Ty::Never]).with_discriminant(0),
+            VariantDef::new("Live", vec![u8_ty()]).with_discriminant(1),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
     let mut state = state_with(vec![e_dead_live.clone(), u16_ty()], PW);
     assert_eq!(
         transmute(&mut state, 0, cint(0x0000, u16_ty()), e_dead_live.clone()),
@@ -5606,12 +5610,12 @@ fn test_b1_place_access_checks_dynamic_index_bounds_and_active_variants_across_d
     ));
     let arr_ty = Ty::Array(Box::new(single_ty.clone()), 2);
     let decls = vec![
-        unit(),                  // _0
-        arr_ty.clone(),          // _1: [Single; 2]
-        usize_ty(),              // _2: usize index
-        enum_ty.clone(),         // _3: ReprU8
-        enum_single_ty.clone(),  // _4: ESingle
-        u8_ty(),                 // _5: discriminant scratch
+        unit(),                 // _0
+        arr_ty.clone(),         // _1: [Single; 2]
+        usize_ty(),             // _2: usize index
+        enum_ty.clone(),        // _3: ReprU8
+        enum_single_ty.clone(), // _4: ESingle
+        u8_ty(),                // _5: discriminant scratch
     ];
     let mut state = state_with(decls.clone(), PW);
     state.slots[1] = LocalSlotState::Init(MirValue::Array {
@@ -5716,10 +5720,7 @@ fn test_b1_place_access_checks_dynamic_index_bounds_and_active_variants_across_d
         &mk_body(
             decls.clone(),
             vec![
-                blk(
-                    vec![],
-                    drop_t(oob_elem.clone(), 1, UnwindAction::Continue),
-                ),
+                blk(vec![], drop_t(oob_elem.clone(), 1, UnwindAction::Continue)),
                 blk(vec![], Terminator::Return),
             ],
         ),
@@ -5779,13 +5780,7 @@ fn test_b1_place_access_checks_dynamic_index_bounds_and_active_variants_across_d
     let mut panic_handler =
         |_: usize, _: &MirValue, _: &[MirValue]| Ok(CallOutcome::Panic("boom".into()));
     assert_eq!(
-        eval_cfg_in_state(
-            &call_inactive_body,
-            state,
-            0,
-            4,
-            Some(&mut panic_handler),
-        ),
+        eval_cfg_in_state(&call_inactive_body, state, 0, 4, Some(&mut panic_handler),),
         Err(CfgEvalError::Terminator {
             bb: 0,
             error: RvalueEvalError::InactiveVariantProjection {
@@ -5817,11 +5812,11 @@ fn test_b1_set_discriminant_and_discriminant_variant_ordering_and_fieldless_arra
     ));
     let arr_e_ty = Ty::Array(Box::new(e_ty.clone()), 2);
     let decls = vec![
-        u8_ty(),           // _0
-        e_ty.clone(),      // _1: E
-        arr_e_ty.clone(),  // _2: [E; 2]
-        usize_ty(),        // _3: index
-        outer_ty.clone(),  // _4: Outer
+        u8_ty(),          // _0
+        e_ty.clone(),     // _1: E
+        arr_e_ty.clone(), // _2: [E; 2]
+        usize_ty(),       // _3: index
+        outer_ty.clone(), // _4: Outer
     ];
     let mut state = state_with(decls, PW);
 
@@ -5856,10 +5851,7 @@ fn test_b1_set_discriminant_and_discriminant_variant_ordering_and_fieldless_arra
         0,
         vec![MirValue::adt(&e_def, 1, vec![])],
     ));
-    let inactive_inner = place(
-        4,
-        vec![ProjectionElem::Downcast(1), field(0, e_ty.clone())],
-    );
+    let inactive_inner = place(4, vec![ProjectionElem::Downcast(1), field(0, e_ty.clone())]);
     assert_eq!(
         run(
             Statement::SetDiscriminant {
@@ -5894,10 +5886,7 @@ fn test_b1_set_discriminant_and_discriminant_variant_ordering_and_fieldless_arra
         &mut state,
     )
     .unwrap();
-    assert_eq!(
-        read(&state, &elem0),
-        Ok(MirValue::adt(&e_def, 1, vec![]))
-    );
+    assert_eq!(read(&state, &elem0), Ok(MirValue::adt(&e_def, 1, vec![])));
     assert_eq!(
         run(
             Statement::SetDiscriminant {
@@ -6025,7 +6014,9 @@ fn test_b1_hand_built_lowered_casts_rvalues_shells_and_cfg_terminators_fail_clos
     let (nz_def, nz_ty) = non_zero_u32();
     let (s1_def, s1_ty) = adt(AdtDef::new_struct("S1", vec![u32_ty(), u32_ty()]));
     let (s2_def, _) = adt(AdtDef::new_struct("S2", vec![u32_ty(), u32_ty()]));
-    let bad_adt = Ty::adt(AdtDef::new_struct("BadAlign", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(3)));
+    let bad_adt = Ty::adt(
+        AdtDef::new_struct("BadAlign", vec![u8_ty()]).with_repr(AdtRepr::c().with_align(3)),
+    );
 
     // 1. `Subtype` lowering rejects ill-formed ADTs.
     assert!(matches!(
@@ -6212,4 +6203,284 @@ fn test_b1_hand_built_lowered_casts_rvalues_shells_and_cfg_terminators_fail_clos
             error: RvalueEvalError::TypeMismatch(_),
         })
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A1 regressions: tagless `#[repr(C)]` enums, `E0084`, and `rustc`'s univariant enum layouts
+// ---------------------------------------------------------------------------------------------
+
+/// `core::convert::Infallible` (`enum Infallible {}`).
+fn infallible() -> Ty {
+    Ty::adt(AdtDef::new_enum("Infallible", None, vec![]))
+}
+
+#[test]
+fn test_a1_tagless_repr_c_enums_store_a_c_int_tag_even_with_one_variant() {
+    // rustc: `#[repr(C)] enum C1 { A(u32) }` is 8 bytes with `A.0` at offset 4 (a C `int` tag
+    // precedes the payload), and `#[repr(C)] enum C1u { A }` is 4 bytes. The tag size is the
+    // target's C `int` (not determined by the pointer width), so the layout is unspecified
+    // rather than the 4-byte struct layout A0 reported.
+    let (c1_def, c1) =
+        adt(
+            AdtDef::new_enum("C1", None, vec![VariantDef::new("A", vec![u32_ty()])])
+                .with_repr(AdtRepr::c()),
+        );
+    let (_, c1u) = adt(
+        AdtDef::new_enum("C1u", None, vec![VariantDef::new("A", vec![])]).with_repr(AdtRepr::c()),
+    );
+    for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        assert_eq!(c1.layout_for(pw), Err(LayoutError::Unspecified));
+        assert_eq!(c1u.layout_for(pw), Err(LayoutError::Unspecified));
+        assert_eq!(c1.check_representable(pw), Ok(()));
+        assert_eq!(c1_def.field_offset(0, 0, pw), Err(LayoutError::Unspecified));
+        assert!(!c1.has_canonical_byte_layout(pw));
+    }
+    assert_eq!(
+        resolve_offset_of(&c1, &[(0, 0)], PW),
+        Err(RvalueLowerError::UnsupportedOffsetOfLayout(c1.clone()))
+    );
+    // The C `int` tag is stored (and has invalid values), apart from the payload.
+    assert!(c1_def.requires_tag_write());
+    assert!(c1_def.tag_survives_field_deinit());
+    assert!(c1.contains_niche());
+    assert_eq!(c1_def.univariant_index(), None);
+
+    // `Discriminant` reads the tag: an uninitialized `C1` is UB (A0 returned `0` unread).
+    let mut state = state_with(vec![c1.clone(), u32_ty()], PW);
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    // Writing the field alone leaves the tag uninitialized; `SetDiscriminant` completes it.
+    let a0 = place(0, vec![ProjectionElem::Downcast(0), field(0, u32_ty())]);
+    run(
+        assign(a0.clone(), Rvalue::Use(cint(7, u32_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert!(matches!(state.slots[0], LocalSlotState::PartialShell(_)));
+    assert_eq!(
+        read(&state, &local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    run(
+        Statement::SetDiscriminant {
+            place: local(0),
+            variant_index: 0,
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        read(&state, &local(0)),
+        Ok(MirValue::adt(&c1_def, 0, vec![u32v(7)]))
+    );
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Ok(uint(0, Ty::Int(IntTy::Isize)))
+    );
+    // Deinitializing the payload keeps the separately stored tag.
+    run(deinit(a0.clone()), &mut state).unwrap();
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Ok(uint(0, Ty::Int(IntTy::Isize)))
+    );
+    assert_eq!(
+        read(&state, &a0),
+        Err(RvalueEvalError::UninitializedLocal(Local(0)))
+    );
+    // Multi-variant tagless `repr(C)` enums keep their tag across payload `Deinit` too.
+    let (c2_def, _) = adt(AdtDef::new_enum(
+        "C2",
+        None,
+        vec![
+            VariantDef::new("A", vec![u8_ty()]),
+            VariantDef::new("B", vec![u16_ty()]),
+        ],
+    )
+    .with_repr(AdtRepr::c()));
+    assert!(c2_def.requires_tag_write());
+    assert!(c2_def.tag_survives_field_deinit());
+}
+
+#[test]
+fn test_a1_zero_variant_enums_reject_non_rust_reprs_e0084() {
+    // rustc: `#[repr(u8)]`, `#[repr(C)]`, and `#[repr(align(8))]` on `enum E {}` are E0084.
+    let bad = [
+        AdtDef::new_enum("E", Some(ScalarTy::Uint(UintTy::U8)), vec![]),
+        AdtDef::new_enum("E", None, vec![]).with_repr(AdtRepr::c()),
+        AdtDef::new_enum("E", None, vec![]).with_repr(AdtRepr::rust().with_align(8)),
+    ];
+    for def in bad {
+        assert!(
+            matches!(def.validate(PW), Err(LayoutError::IllFormed(_))),
+            "{def:?}"
+        );
+        let ty = Ty::adt(def);
+        assert!(matches!(
+            lower_body(
+                &Body {
+                    local_decls: vec![ty],
+                    basic_blocks: vec![]
+                },
+                PW
+            ),
+            Err(RvalueLowerError::InvalidAdtDef { .. })
+        ));
+    }
+    // `enum Void {}` itself is fine: size 0, alignment 1, uninhabited.
+    let void = infallible();
+    assert_eq!(layout(&void, PW), TyLayout { size: 0, align: 1 });
+    assert!(!void.is_inhabited());
+}
+
+#[test]
+fn test_a1_tagless_enums_with_one_present_variant_use_rustc_univariant_layouts() {
+    let never = || Ty::Never;
+    let enum_of = |variants: Vec<VariantDef>| AdtDef::new_enum("E", None, variants);
+    // Expected layouts observed with rustc 1.98.0-nightly (x86_64-unknown-linux-gnu).
+    // `#[repr(align(8))] enum E1 { A(!) }`: laid out like `!`, ignoring `repr(align)`.
+    let (e1_def, e1) =
+        adt(enum_of(vec![VariantDef::new("A", vec![never()])])
+            .with_repr(AdtRepr::rust().with_align(8)));
+    // `#[repr(align(8))] enum E2 { A(u8), B(!) }`: the struct of `A`, aligned to 8.
+    let (e2_def, e2) = adt(enum_of(vec![
+        VariantDef::new("A", vec![u8_ty()]),
+        VariantDef::new("B", vec![never()]),
+    ])
+    .with_repr(AdtRepr::rust().with_align(8)));
+    // `#[repr(align(8))] enum E3 { A(!), B(!) }`: no present variant.
+    let (_, e3) = adt(enum_of(vec![
+        VariantDef::new("A", vec![never()]),
+        VariantDef::new("B", vec![never()]),
+    ])
+    .with_repr(AdtRepr::rust().with_align(8)));
+    // `enum E4 { A(!), B(u16, u8) }`: the struct of `B` (size 4, alignment 2).
+    let (e4_def, e4) = adt(enum_of(vec![
+        VariantDef::new("A", vec![never()]),
+        VariantDef::new("B", vec![u16_ty(), u8_ty()]),
+    ]));
+    // `enum E5 { A(u16, u8), B(Infallible) }`.
+    let (_, e5) = adt(enum_of(vec![
+        VariantDef::new("A", vec![u16_ty(), u8_ty()]),
+        VariantDef::new("B", vec![infallible()]),
+    ]));
+    // `enum E8 { A((), Infallible), B(u32) }`: `B.0` and the absent `A`'s fields at offset 0.
+    let (e8_def, e8) = adt(enum_of(vec![
+        VariantDef::new("A", vec![unit(), infallible()]),
+        VariantDef::new("B", vec![u32_ty()]),
+    ]));
+    // `enum E10 { A(!), B(bool) }`: 1 byte, exposing `bool`'s niche (`Option<E10>` is 1 byte).
+    let (_, e10) = adt(enum_of(vec![
+        VariantDef::new("A", vec![never()]),
+        VariantDef::new("B", vec![Ty::Bool]),
+    ]));
+    for pw in [PtrWidth::Bits32, PtrWidth::Bits64] {
+        assert_eq!(layout(&e1, pw), TyLayout { size: 0, align: 1 });
+        assert_eq!(layout(&e2, pw), TyLayout { size: 8, align: 8 });
+        assert_eq!(e2_def.field_offset(0, 0, pw), Ok(0));
+        assert_eq!(layout(&e3, pw), TyLayout { size: 0, align: 1 });
+        assert_eq!(layout(&e4, pw), TyLayout { size: 4, align: 2 });
+        assert_eq!(layout(&e5, pw), TyLayout { size: 4, align: 2 });
+        assert_eq!(layout(&e8, pw), TyLayout { size: 4, align: 4 });
+        assert_eq!(e8_def.field_offset(1, 0, pw), Ok(0));
+        assert_eq!(e8_def.field_offset(0, 0, pw), Ok(0));
+        assert_eq!(e8_def.field_offset(0, 1, pw), Ok(0));
+        assert_eq!(layout(&e10, pw), TyLayout { size: 1, align: 1 });
+    }
+    assert_eq!(e1_def.univariant_index(), None);
+    assert_eq!(e2_def.univariant_index(), Some(0));
+    assert_eq!(e4_def.univariant_index(), Some(1));
+    assert!(e10.contains_niche());
+    assert!(!e4.contains_niche());
+    assert!(e8.has_canonical_byte_layout(PW));
+    // Variants with a non-1-ZST field stay present even when uninhabited, so these keep a
+    // tag and an unspecified layout: `enum E6 { A([u32; 0], Infallible), B }` (4 bytes) and
+    // `enum E7 { A(u8, Infallible), B }` (2 bytes).
+    let (e6_def, e6) = adt(enum_of(vec![
+        VariantDef::new("A", vec![Ty::Array(Box::new(u32_ty()), 0), infallible()]),
+        VariantDef::new("B", vec![]),
+    ]));
+    let (e7_def, e7) = adt(enum_of(vec![
+        VariantDef::new("A", vec![u8_ty(), infallible()]),
+        VariantDef::new("B", vec![]),
+    ]));
+    for (def, ty) in [(&e6_def, &e6), (&e7_def, &e7)] {
+        assert_eq!(ty.layout_for(PW), Err(LayoutError::Unspecified));
+        assert_eq!(def.univariant_index(), None);
+        assert!(def.requires_tag_write());
+    }
+    // An explicit `tag_ty` inhibits the optimization: `#[repr(u8)] enum E11 { A(!), B(u32) }`
+    // is 8 bytes.
+    let (_, e11) = adt(AdtDef::new_enum(
+        "E11",
+        Some(ScalarTy::Uint(UintTy::U8)),
+        vec![
+            VariantDef::new("A", vec![never()]),
+            VariantDef::new("B", vec![u32_ty()]),
+        ],
+    ));
+    assert_eq!(layout(&e11, PW), TyLayout { size: 8, align: 4 });
+    // `#[repr(transparent)] struct TW(u32, AbsZ)` with `enum AbsZ { A, B(Infallible) }` is a
+    // valid 4-byte wrapper (AbsZ is a 1-ZST), not an E0690 error.
+    let absz = Ty::adt(enum_of(vec![
+        VariantDef::new("A", vec![]),
+        VariantDef::new("B", vec![infallible()]),
+    ]));
+    assert_eq!(layout(&absz, PW), TyLayout { size: 0, align: 1 });
+    let tw =
+        Ty::adt(AdtDef::new_struct("TW", vec![u32_ty(), absz]).with_repr(AdtRepr::transparent()));
+    assert_eq!(layout(&tw, PW), TyLayout { size: 4, align: 4 });
+
+    // Values: every `E4` is `B`, built without a tag write and with a constant discriminant
+    // (Miri reads no memory for `Variants::Single`).
+    assert!(!e4_def.requires_tag_write());
+    assert!(e4_def.tag_survives_field_deinit());
+    let mut state = state_with(vec![e4.clone(), u32_ty(), e8.clone()], PW);
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Ok(uint(1, Ty::Int(IntTy::Isize)))
+    );
+    let b = |i: usize, ty: Ty| place(0, vec![ProjectionElem::Downcast(1), field(i, ty)]);
+    run(
+        assign(b(0, u16_ty()), Rvalue::Use(cint(300, u16_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    run(
+        assign(b(1, u8_ty()), Rvalue::Use(cint(9, u8_ty()))),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        state.get_init(Local(0)),
+        Some(&MirValue::adt(&e4_def, 1, vec![u16v(300), u8v(9)]))
+    );
+    assert_eq!(
+        discriminant(&mut state, local(0)),
+        Ok(uint(1, Ty::Int(IntTy::Isize)))
+    );
+    // The absent variant cannot be selected.
+    assert_eq!(
+        run(
+            Statement::SetDiscriminant {
+                place: local(0),
+                variant_index: 0,
+            },
+            &mut state,
+        ),
+        Err(RvalueEvalError::UninhabitedEnumVariant { variant_index: 0 })
+    );
+    // Transmutes decode into (and encode from) the present variant.
+    transmute(&mut state, 2, cint(0xDEAD_BEEF, u32_ty()), e8.clone()).unwrap();
+    assert_eq!(
+        state.get_init(Local(2)),
+        Some(&MirValue::adt(&e8_def, 1, vec![u32v(0xDEAD_BEEF)]))
+    );
+    transmute(&mut state, 1, Operand::Copy(local(2)), u32_ty()).unwrap();
+    assert_eq!(state.get_init(Local(1)), Some(&u32v(0xDEAD_BEEF)));
 }

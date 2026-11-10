@@ -538,16 +538,23 @@ pub enum AdtKind {
 ///   determined when that tuple has a canonical byte layout ([`Ty::has_canonical_byte_layout`]).
 /// - **Unions** (at least one field, `E0784`): every field at offset `0`; alignment is the `max`
 ///   of the field and `repr(align)` alignments, size the largest field size rounded up to it.
-/// - **Enums**: no variants: size `0`, alignment `repr(align)` or `1`. With an explicit `tag_ty`
-///   (an integer type), `#[repr(Int)]` (RFC 2195) is a `repr(C)` union of one `repr(C)` struct
-///   `(tag, fields...)` per variant, and `#[repr(C, Int)]` is a `repr(C)` struct `(tag, payload)`
-///   whose `payload` is a `repr(C)` union of the variants' `repr(C)` field structs. Without a
-///   `tag_ty`, a single-variant enum is laid out like a struct of that variant's fields with the
-///   enum's `repr` (no tag is stored). A multi-variant enum without `tag_ty` has an
-///   **unspecified** layout (`repr(Rust)` niche/tag optimizations, or the target's C `int` tag
-///   of `repr(C)`): it is representable when an upper bound of its size fits in `isize::MAX`,
-///   but [`Ty::layout_for`] reports [`LayoutError::Unspecified`], so `size_of`, `align_of`,
-///   `offset_of!`, and transmutes through it fail closed.
+/// - **Enums**: no variants: size `0`, alignment `1` (any `repr` other than `Rust` is
+///   ill-formed, `E0084`). With an explicit `tag_ty` (an integer type), `#[repr(Int)]`
+///   (RFC 2195) is a `repr(C)` union of one `repr(C)` struct `(tag, fields...)` per variant, and
+///   `#[repr(C, Int)]` is a `repr(C)` struct `(tag, payload)` whose `payload` is a `repr(C)`
+///   union of the variants' `repr(C)` field structs. A tagless `#[repr(C)]` enum stores a tag
+///   of the target's C `int` size even with a single variant (`#[repr(C)] enum E { A(u32) }`
+///   is 8 bytes), which the pointer width does not determine, so its layout is **unspecified**.
+///   A tagless `repr(Rust)`/`repr(transparent)` enum follows `rustc`'s univariant rule: a
+///   variant is *absent* when some field is uninhabited and every field is a 1-ZST (e.g.
+///   `B(!)`, decided for both pointer widths); with no present variant the enum is laid out
+///   like `!` (size `0`, alignment `1`, ignoring `repr(align)`), and with exactly one present
+///   variant like a struct of that variant's fields with the enum's `repr` (no tag is stored;
+///   the absent variants' 1-ZST fields sit at offset `0`). Any other tagless enum has an
+///   **unspecified** layout (`repr(Rust)` niche/tag optimizations): it is representable when
+///   an upper bound of its size fits in `isize::MAX`, but [`Ty::layout_for`] reports
+///   [`LayoutError::Unspecified`], so `size_of`, `align_of`, `offset_of!`, and transmutes
+///   through it fail closed.
 ///
 /// A `scalar_valid_range` restricts the bit pattern of a struct whose only non-1-ZST field is a
 /// primitive scalar (`bool`, `char`, integers, pointers), e.g. `NonZeroU32` or `NonNull<T>`.
@@ -578,8 +585,9 @@ pub enum LayoutError {
     /// An array length exceeds the target's `usize::MAX`, or the size exceeds the target's
     /// `isize::MAX` ([`PtrWidth::max_object_size`]).
     TooLarge,
-    /// The type is representable but its layout is not determined by Anneal's layout model
-    /// (a multi-variant enum without an explicit `tag_ty`, or a type containing one).
+    /// The representable but not exactly determined layout of a type: a tagless enum with
+    /// more than one present variant, a tagless `#[repr(C)]` enum (see [`AdtDef`]), or a type
+    /// containing one.
     Unspecified,
     /// Ill-formed ADT definition (with the violated rule).
     IllFormed(&'static str),
@@ -1136,8 +1144,8 @@ fn struct_like_field_offset(
     }
 }
 
-/// Possibly inexact layout of a struct-like field list (a struct, or a tagless single-variant
-/// enum) laid out with `kind` and minimum alignment `repr_align`.
+/// Possibly inexact layout of a struct-like field list (a struct, or the present variant of an
+/// enum laid out without a tag) laid out with `kind` and minimum alignment `repr_align`.
 fn struct_like_layout(
     fields: &[Ty],
     kind: AdtReprKind,
@@ -1484,21 +1492,81 @@ impl AdtDef {
             .position(|d| *d == bits)
     }
 
-    /// Returns true if this is an enum whose value stores a tag (an explicit `tag_ty`, or more
-    /// than one variant): an enum value built field-by-field is only complete once
-    /// `SetDiscriminant` has written the tag. Tagless single-variant enums, structs, and
+    /// Returns true if `rustc` never represents a value of an enum variant with these `fields`
+    /// (an *absent* variant): some field is uninhabited and every field is a 1-ZST, under both
+    /// pointer widths (a variant absent under only one width conservatively counts as present).
+    fn is_absent_variant(fields: &[Ty]) -> bool {
+        const WIDTHS: [PtrWidth; 2] = [PtrWidth::Bits32, PtrWidth::Bits64];
+        fields
+            .iter()
+            .any(|f| WIDTHS.iter().all(|pw| !f.is_inhabited_for(*pw)))
+            && fields.iter().all(|f| {
+                WIDTHS
+                    .iter()
+                    .all(|pw| f.layout_info(*pw).is_ok_and(|l| l.is_one_zst()))
+            })
+    }
+
+    /// For a tagless, non-`#[repr(C)]` enum, the indices of its variants that are not absent
+    /// (see the layout model); `None` for explicit-tag or `#[repr(C)]` enums (which always
+    /// store a tag), structs, and unions.
+    fn untagged_present_variants(&self) -> Option<Vec<usize>> {
+        match &self.kind {
+            AdtKind::Enum {
+                tag_ty: None,
+                variants,
+            } if self.repr.kind != AdtReprKind::C => Some(
+                variants
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| !Self::is_absent_variant(&v.fields))
+                    .map(|(i, _)| i)
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Returns `Some(v)` if `rustc` lays this enum out as a struct of its only present variant
+    /// `v` without storing a tag (a tagless, non-`#[repr(C)]` enum whose other variants are all
+    /// absent, e.g. a single-variant enum or `enum { A(!), B(u32) }`): every value of the enum
+    /// is variant `v`, and its discriminant is a constant.
+    pub fn univariant_index(&self) -> Option<usize> {
+        match self.untagged_present_variants()?.as_slice() {
+            [v] => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is an enum whose value stores a tag: an explicit `tag_ty`, a
+    /// tagless `#[repr(C)]` enum (a C `int` tag, even for a single variant), or a tagless enum
+    /// with more than one present variant (see the layout model). An enum value built
+    /// field-by-field is only complete once `SetDiscriminant` has written the tag. Enums laid
+    /// out without a tag ([`AdtDef::univariant_index`], or no present variant), structs, and
     /// unions store no tag.
     pub fn requires_tag_write(&self) -> bool {
-        matches!(&self.kind, AdtKind::Enum { tag_ty, variants } if tag_ty.is_some() || variants.len() > 1)
+        match &self.kind {
+            AdtKind::Enum { tag_ty, variants } => {
+                tag_ty.is_some()
+                    || (self.repr.kind == AdtReprKind::C && !variants.is_empty())
+                    || self
+                        .untagged_present_variants()
+                        .is_some_and(|present| present.len() > 1)
+            }
+            AdtKind::Struct { .. } | AdtKind::Union { .. } => false,
+        }
     }
 
     /// Returns true if writing uninitialized bytes into a variant field leaves this ADT's tag
-    /// intact: an explicit `tag_ty` is stored apart from the variant fields, and a tagless
-    /// single-variant enum (or a struct/union) has no tag. A multi-variant enum without
-    /// `tag_ty` may encode its tag in a field's niche, so its tag is conservatively lost.
+    /// intact: an explicit `tag_ty` or the C `int` tag of a tagless `#[repr(C)]` enum is stored
+    /// apart from the variant fields, and an enum laid out without a tag (or a struct/union)
+    /// has none. A tagless `repr(Rust)` enum with several present variants may encode its tag
+    /// in a field's niche, so its tag is conservatively lost.
     pub fn tag_survives_field_deinit(&self) -> bool {
         match &self.kind {
-            AdtKind::Enum { tag_ty, variants } => tag_ty.is_some() || variants.len() <= 1,
+            AdtKind::Enum { tag_ty, .. } => {
+                tag_ty.is_some() || self.repr.kind == AdtReprKind::C || !self.requires_tag_write()
+            }
             AdtKind::Struct { .. } | AdtKind::Union { .. } => true,
         }
     }
@@ -1636,18 +1704,31 @@ impl AdtDef {
                     ));
                 }
                 if variants.is_empty() {
-                    return Ok(LayoutInfo::exact(0, repr_align));
+                    if tag_ty.is_some()
+                        || self.repr.kind == AdtReprKind::C
+                        || self.repr.align.is_some()
+                    {
+                        return Err(LayoutError::IllFormed(
+                            "unsupported representation for zero-variant enum (E0084)",
+                        ));
+                    }
+                    return Ok(LayoutInfo::exact(0, 1));
                 }
                 if let Some(tag) = tag_ty {
                     return tagged_layout(*tag, variants, self.repr.kind, repr_align, ptr_width);
                 }
-                if variants.len() == 1 {
-                    return struct_like_layout(
-                        &variants[0].fields,
-                        self.repr.kind,
-                        repr_align,
-                        ptr_width,
-                    );
+                match self.untagged_present_variants().as_deref() {
+                    // Only absent variants: laid out like `!` (`repr(align)` is ignored).
+                    Some([]) => return Ok(LayoutInfo::exact(0, 1)),
+                    Some([v]) => {
+                        return struct_like_layout(
+                            &variants[*v].fields,
+                            self.repr.kind,
+                            repr_align,
+                            ptr_width,
+                        );
+                    }
+                    _ => {}
                 }
                 // Unspecified layout: bound it by the tagged layout with the smallest tag that
                 // fits every discriminant (at least the 4-byte C `int` for `repr(C)`).
@@ -1673,7 +1754,8 @@ impl AdtDef {
     /// `#[repr(transparent)]` struct at `0`; `#[repr(Rust)]` struct fields at their
     /// declaration-order offsets only when the fields' tuple is canonical
     /// ([`Ty::has_canonical_byte_layout`]); enum variant fields per the tagged layouts of
-    /// [`AdtDef`] (or the struct rules for tagless single-variant enums). Every other case is
+    /// [`AdtDef`] (or the struct rules for the present variant of an enum laid out without a
+    /// tag, whose absent variants' fields sit at `0`). Every other case is
     /// [`LayoutError::Unspecified`]. Every `Ok(off)` satisfies
     /// `off + size_of(field) <= size_of(self)` and `off % align_of(field) == 0`.
     pub fn field_offset(
@@ -1700,12 +1782,18 @@ impl AdtDef {
             AdtKind::Enum {
                 tag_ty: None,
                 variants,
-            } => {
-                if variants.len() != 1 {
-                    return Err(LayoutError::Unspecified);
+            } => match self.univariant_index() {
+                Some(v) if v == variant_idx => {
+                    struct_like_field_offset(&variants[v].fields, field_idx, self.repr.kind, ptr_width)
                 }
-                struct_like_field_offset(&variants[0].fields, field_idx, self.repr.kind, ptr_width)
-            }
+                // `rustc` places the (1-ZST) fields of absent variants at offset `0`.
+                _ if self.repr.kind != AdtReprKind::C
+                    && Self::is_absent_variant(&variants[variant_idx].fields) =>
+                {
+                    Ok(0)
+                }
+                _ => Err(LayoutError::Unspecified),
+            },
             AdtKind::Enum {
                 tag_ty: Some(tag),
                 variants,
@@ -1780,11 +1868,15 @@ impl AdtDef {
                                 .iter()
                                 .any(|v| v.fields.iter().any(|f| f.contains_niche_for(ptr_width)))
                     }
-                    None if variants.len() == 1 => variants[0]
-                        .fields
-                        .iter()
-                        .any(|f| f.contains_niche_for(ptr_width)),
-                    None => true,
+                    None => match self.untagged_present_variants().as_deref() {
+                        Some([]) => false,
+                        Some([v]) => variants[*v]
+                            .fields
+                            .iter()
+                            .any(|f| f.contains_niche_for(ptr_width)),
+                        // A stored tag (C `int` or `repr(Rust)` tag/niche) has invalid values.
+                        _ => true,
+                    },
                 }
             }
         }
@@ -1798,8 +1890,9 @@ impl AdtDef {
     ///   `repr(align)` padding;
     /// - unions with exactly one field that is canonical, niche-free (so every initialized
     ///   byte pattern is a valid union value), inhabited, and as large as the union;
-    /// - enums without variants (like `!`), tagless single-variant enums under the struct
-    ///   rules, and explicit-tag enums whose every variant's byte image is exactly the tag
+    /// - enums without (present) variants (like `!`), enums laid out without a tag
+    ///   ([`AdtDef::univariant_index`]) under the struct rules for their present variant,
+    ///   and explicit-tag enums whose every variant's byte image is exactly the tag
     ///   followed by its canonical, pointer-free fields without any padding (so all variants
     ///   have the enum's full size).
     pub fn has_canonical_byte_layout(&self, ptr_width: PtrWidth) -> bool {
@@ -1824,10 +1917,13 @@ impl AdtDef {
             }
             AdtKind::Enum { tag_ty, variants } => match tag_ty {
                 _ if variants.is_empty() => true,
-                None if variants.len() == 1 => {
-                    struct_like_canonical(&variants[0].fields, self.repr.kind, info.size, ptr_width)
-                }
-                None => false,
+                None => match self.untagged_present_variants().as_deref() {
+                    Some([]) => true,
+                    Some([v]) => {
+                        struct_like_canonical(&variants[*v].fields, self.repr.kind, info.size, ptr_width)
+                    }
+                    _ => false,
+                },
                 Some(tag) => {
                     let tag_size = tag.size_bytes(ptr_width);
                     variants.iter().enumerate().all(|(v, variant)| {

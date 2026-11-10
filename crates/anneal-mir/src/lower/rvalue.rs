@@ -2756,9 +2756,18 @@ fn encode_mir_value(
                     out.extend(encode_int_bytes(bits, tag.size_bytes(ptr_width)));
                     variants[*variant_idx].fields.as_slice()
                 }
-                _ => canonical_untagged_fields(def).ok_or_else(|| {
-                    RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout { ty: ty.clone() })
-                })?,
+                _ => {
+                    if def.is_enum() && def.univariant_index() != Some(*variant_idx) {
+                        return Err(RvalueEvalError::TypeMismatch(
+                            "transmute operand enum value is not of its only present variant",
+                        ));
+                    }
+                    canonical_untagged_fields(def).ok_or_else(|| {
+                        RvalueEvalError::CastEval(CastEvalError::UnsupportedLayout {
+                            ty: ty.clone(),
+                        })
+                    })?
+                }
             };
             if values.len() != field_tys.len() {
                 return Err(RvalueEvalError::TypeMismatch(
@@ -3134,7 +3143,8 @@ fn decode_mir_value(
                             ty: ty.clone(),
                         })
                     })?;
-                    (0, 0, fields)
+                    // An enum laid out without a tag always holds its only present variant.
+                    (0, def.univariant_index().unwrap_or(0), fields)
                 }
             };
             let mut offset = start;
@@ -5230,8 +5240,8 @@ pub fn eval_lowered_rvalue(
             if let Ty::Adt(def) = place_ty
                 && !def.requires_tag_write()
             {
-                // Single-variant layouts store no tag: the discriminant is a constant, after
-                // validating the place projection over `locals`.
+                // Layouts without a tag (`AdtDef::univariant_index`) make the discriminant a
+                // constant, after validating the place projection over `locals`.
                 if place
                     .projection
                     .iter()
@@ -5261,7 +5271,7 @@ pub fn eval_lowered_rvalue(
                 )?;
                 return match target {
                     ProjectedRef::Value(val) if mir_value_head_matches_ty(val, place_ty) => {
-                        discriminant_value(def, 0, ptr_width)
+                        discriminant_value(def, def.univariant_index().unwrap_or(0), ptr_width)
                     }
                     _ => Err(RvalueEvalError::TypeMismatch(
                         "Discriminant place runtime value does not match lowered place_ty",
@@ -8746,13 +8756,14 @@ pub fn eval_lowered_rvalue_in_state(
             }
             if let Ty::Adt(def) = place_ty {
                 // `Rvalue::Discriminant` on a typed ADT reads only the tag (Miri's
-                // `read_discriminant`): single-variant layouts store none, so their
-                // discriminant is a constant; otherwise the tag must be initialized.
+                // `read_discriminant`): layouts without a tag (structs, unions, and
+                // `AdtDef::univariant_index` enums) make the discriminant a constant; otherwise
+                // the tag must be initialized.
                 let index_cache = state.prepare_place_access(place, place_ty)?;
                 let variant_idx = if def.requires_tag_write() {
                     state.typed_enum_variant(place, place_ty, &index_cache)?
                 } else {
-                    0
+                    def.univariant_index().unwrap_or(0)
                 };
                 return discriminant_value(def, variant_idx, state.ptr_width);
             }
