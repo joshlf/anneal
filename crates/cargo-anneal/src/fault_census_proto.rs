@@ -2316,12 +2316,28 @@ fn lex_interpolated_string(
 }
 
 /// Lean namespaces under which `Trusted` MIR AST constructors may be fully qualified.
-const MIR_AST_NAMESPACES: [&str; 5] = [
+/// `[adv B2]`: pinned to the `V2026_06_01` dialect that the census and
+/// `Trusted.MirSemantics` are defined over; a `Trusted.Rustc.V2026_08_01.MirAst`
+/// constructor has a different type and different semantics.
+const MIR_AST_NAMESPACES: [&str; 4] = [
     "MirAst",
     "Trusted.MirAst",
     "Trusted.Rustc.V2026_06_01.MirAst",
-    "Trusted.Rustc.V2026_08_01.MirAst",
     "_root_.Trusted.Rustc.V2026_06_01.MirAst",
+];
+
+/// `[adv B2]` Exact namespaces a strict `Mir/<Item>.lean` module may `open`: the
+/// four opened by `anneal-rustc-capture`'s `render_mir_module_header`, plus the
+/// default-dialect aliases. Opening any other namespace (another MIR dialect, or a
+/// namespace that could contribute look-alike `TerminatorKind.*` declarations)
+/// fails closed.
+const STRICT_MODULE_OPENS: [&str; 6] = [
+    "Trusted.Rustc.V2026_06_01.Layout",
+    "Trusted.Rustc.V2026_06_01.MirAst",
+    "Trusted.Rustc.V2026_06_01.MirSemantics",
+    "Trusted.VerificationResult",
+    "Trusted.MirAst",
+    "Trusted.MirSemantics",
 ];
 
 /// `Trusted` MIR AST type names whose constructors or fields the scanner
@@ -3834,7 +3850,8 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
         };
         match kw {
             "import" => {
-                let imp = ident_at(i + 1).ok_or_else(|| malformed("`import` without module".into()))?;
+                let imp =
+                    ident_at(i + 1).ok_or_else(|| malformed("`import` without module".into()))?;
                 if imp != "Trusted" && !imp.starts_with("Trusted.") {
                     return Err(malformed(format!(
                         "unsupported `import {imp}` in strict Mir module (only `Trusted` allowed)"
@@ -3865,7 +3882,7 @@ fn check_strict_mir_module_grammar(tokens: &[LeanToken]) -> Result<(), CensusSca
                     if matches!(name, "renaming" | "hiding" | "in" | "scoped") {
                         return Err(malformed(format!("`open ... {name}` is not supported")));
                     }
-                    if name != "Trusted" && !name.starts_with("Trusted.") && name != "MirAst" {
+                    if !STRICT_MODULE_OPENS.contains(&name) {
                         return Err(malformed(format!(
                             "unsupported `open {name}` in strict Mir module (only `Trusted` namespaces allowed)"
                         )));
@@ -4992,6 +5009,710 @@ def body : CapturedMir :=
         ));
     }
 
+    /// Deterministic xorshift64* generator for the differential fuzz tests.
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % (n as u64)) as usize
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.next_u64() % 100 < percent
+        }
+
+        fn pick<'b>(&mut self, items: &'b [&'b str]) -> &'b str {
+            items[self.below(items.len())]
+        }
+
+        /// Pick a trap string without line breaks, for identifier-like payloads
+        /// (variant names, thread-local paths) that the emitter echoes unsanitized
+        /// into its `-- bbN:` summary comment lines.
+        fn pick_line<'b>(&mut self, items: &'b [&'b str]) -> &'b str {
+            loop {
+                let s = self.pick(items);
+                if !s.contains('\n') && !s.contains('\r') {
+                    return s;
+                }
+            }
+        }
+    }
+
+    /// Strings that stress the Lean lexer when the emitter embeds them in string
+    /// literals (`span`, `defPath`, `debugName`, inline-asm templates) or in `--`
+    /// comment lines (`comment`).
+    const FUZZ_TRAP_STRINGS: [&str; 18] = [
+        "src/lib.rs:1:1: 1:9",
+        "quote \" inside",
+        "back\\slash \\u0061 \\x41",
+        "brace { open",
+        "brace } close {x}",
+        "line -- comment",
+        "block /- open",
+        "block -/ close",
+        "guillemet « and »",
+        "tab\tand\nnewline\r",
+        "def body : CapturedMir := { basicBlocks := List.nil }",
+        "s!\"{interp}\" m!\"{x}\"",
+        "r#\"raw\"#",
+        "char 'x' '\\''",
+        "unicode λ → ∀ ✓",
+        "ctrl \u{1}\u{7f}",
+        "{closure#0}",
+        "",
+    ];
+
+    const FUZZ_CALLEES: [&str; 14] = [
+        "core::intrinsics::unreachable",
+        "core::hint::unreachable_unchecked",
+        "std::hint::unreachable_unchecked",
+        "core::intrinsics::exact_div",
+        "std::intrinsics::exact_div",
+        "core::intrinsics::unchecked_add",
+        "std::intrinsics::unchecked_add",
+        "core::intrinsics::unchecked_shl",
+        "core::intrinsics::ctlz_nonzero",
+        "core::intrinsics::arith_offset",
+        "core::intrinsics::const_eval_select",
+        "core::intrinsics::size_of_val",
+        "crate::helper::{closure#0}",
+        "crate::quote\"d::fn",
+    ];
+
+    const FUZZ_COERCIONS: [&str; 7] = [
+        "Unsize",
+        "ArrayToPointer",
+        "MutToConstPointer",
+        "ReifyFnPointer",
+        "ClosureFnPointer(Safe)",
+        "UnsafeFnPointer",
+        "weird{\"tag",
+    ];
+
+    fn fuzz_ty(rng: &mut FuzzRng, depth: usize) -> anneal_rustc_capture::lean_emit::IrTy {
+        anneal_rustc_capture::lean_emit::IrTy {
+            kind: fuzz_rigid_ty(rng, depth),
+            layout_idx: rng.below(2),
+        }
+    }
+
+    fn fuzz_rigid_ty(
+        rng: &mut FuzzRng,
+        depth: usize,
+    ) -> anneal_rustc_capture::lean_emit::IrRigidTy {
+        use anneal_rustc_capture::lean_emit::{IrIntTy, IrMutability, IrRigidTy, IrUintTy};
+        let leaf = depth == 0 || rng.chance(50);
+        match if leaf { rng.below(5) } else { 5 + rng.below(6) } {
+            0 => IrRigidTy::Bool,
+            1 => IrRigidTy::Uint(IrUintTy::U32),
+            2 => IrRigidTy::Int(IrIntTy::I8),
+            3 => IrRigidTy::Str,
+            4 => IrRigidTy::Param {
+                index: 0,
+                name: rng.pick(&FUZZ_TRAP_STRINGS).to_string(),
+            },
+            5 => IrRigidTy::Tuple(vec![fuzz_rigid_ty(rng, depth - 1)]),
+            6 => IrRigidTy::Array(Box::new(fuzz_rigid_ty(rng, depth - 1)), rng.below(4) as u64),
+            7 => IrRigidTy::Ref(IrMutability::Mut, Box::new(fuzz_rigid_ty(rng, depth - 1))),
+            8 => IrRigidTy::RawPtr(IrMutability::Not, Box::new(fuzz_rigid_ty(rng, depth - 1))),
+            9 => IrRigidTy::Adt(
+                rng.pick(&FUZZ_TRAP_STRINGS).to_string(),
+                vec![fuzz_rigid_ty(rng, depth - 1)],
+            ),
+            _ => IrRigidTy::Other(rng.pick(&FUZZ_TRAP_STRINGS).to_string()),
+        }
+    }
+
+    fn fuzz_place(rng: &mut FuzzRng) -> anneal_rustc_capture::lean_emit::IrPlace {
+        use anneal_rustc_capture::lean_emit::{IrPlace, IrProjectionElem};
+        let mut projection = Vec::new();
+        for _ in 0..rng.below(4) {
+            projection.push(match rng.below(8) {
+                0 => IrProjectionElem::Deref,
+                1 => IrProjectionElem::Field(rng.below(3), fuzz_ty(rng, 1)),
+                2 => IrProjectionElem::Index(rng.below(4)),
+                3 => IrProjectionElem::ConstantIndex {
+                    offset: rng.below(4) as u64,
+                    min_length: rng.below(5) as u64,
+                    from_end: rng.chance(50),
+                },
+                4 => IrProjectionElem::Subslice {
+                    from_idx: rng.below(3) as u64,
+                    to_idx: rng.below(3) as u64,
+                    from_end: rng.chance(50),
+                },
+                5 => IrProjectionElem::Downcast(
+                    if rng.chance(50) {
+                        Some(rng.pick_line(&FUZZ_TRAP_STRINGS).to_string())
+                    } else {
+                        None
+                    },
+                    rng.below(3),
+                ),
+                6 => IrProjectionElem::OpaqueCast(fuzz_ty(rng, 1)),
+                _ => IrProjectionElem::UnwrapUnsafeBinder(fuzz_ty(rng, 1)),
+            });
+        }
+        IrPlace {
+            local_: rng.below(5),
+            projection,
+        }
+    }
+
+    fn fuzz_operand(rng: &mut FuzzRng) -> anneal_rustc_capture::lean_emit::IrOperand {
+        use anneal_rustc_capture::lean_emit::{
+            IrConstOperand, IrConstScalar, IrConstValue, IrOperand, IrProvenancePtr, IrRigidTy,
+            IrScalarInt, IrTy,
+        };
+        match rng.below(4) {
+            0 => IrOperand::Copy(fuzz_place(rng)),
+            1 => IrOperand::Move(fuzz_place(rng)),
+            2 => IrOperand::Constant(IrConstOperand {
+                ty: IrTy {
+                    kind: IrRigidTy::FnDef(
+                        rng.pick(&FUZZ_CALLEES).to_string(),
+                        vec![fuzz_rigid_ty(rng, 1)],
+                    ),
+                    layout_idx: 0,
+                },
+                val: IrConstValue::ZeroSized,
+            }),
+            _ => {
+                let scalar = if rng.chance(70) {
+                    IrConstScalar::Int(IrScalarInt {
+                        bits: rng.next_u64() as u128,
+                        size_bytes: [1, 4, 8][rng.below(3)],
+                    })
+                } else {
+                    IrConstScalar::Ptr(
+                        IrProvenancePtr {
+                            alloc_id: rng.below(3) as u64,
+                            offset_bytes: rng.below(9) as u64,
+                        },
+                        8,
+                    )
+                };
+                let val = match rng.below(5) {
+                    0 => IrConstValue::ZeroSized,
+                    1 => IrConstValue::Scalar(scalar),
+                    2 => IrConstValue::Slice {
+                        data: scalar,
+                        meta: rng.below(4) as u64,
+                    },
+                    3 => IrConstValue::Indirect {
+                        alloc_id: rng.below(3) as u64,
+                        offset_bytes: rng.below(9) as u64,
+                    },
+                    _ => IrConstValue::Unevaluated(rng.pick(&FUZZ_CALLEES).to_string()),
+                };
+                IrOperand::Constant(IrConstOperand {
+                    ty: fuzz_ty(rng, 2),
+                    val,
+                })
+            }
+        }
+    }
+
+    fn fuzz_rvalue(rng: &mut FuzzRng) -> anneal_rustc_capture::lean_emit::IrRvalue {
+        use anneal_rustc_capture::lean_emit::{
+            IrAggregateKind, IrBinOp, IrBorrowKind, IrCastKind, IrMutability, IrNullOp, IrRvalue,
+            IrUnOp,
+        };
+        const BIN_OPS: [IrBinOp; 26] = [
+            IrBinOp::Add,
+            IrBinOp::AddUnchecked,
+            IrBinOp::AddWithOverflow,
+            IrBinOp::Sub,
+            IrBinOp::SubUnchecked,
+            IrBinOp::SubWithOverflow,
+            IrBinOp::Mul,
+            IrBinOp::MulUnchecked,
+            IrBinOp::MulWithOverflow,
+            IrBinOp::Div,
+            IrBinOp::Rem,
+            IrBinOp::BitXor,
+            IrBinOp::BitAnd,
+            IrBinOp::BitOr,
+            IrBinOp::Shl,
+            IrBinOp::ShlUnchecked,
+            IrBinOp::Shr,
+            IrBinOp::ShrUnchecked,
+            IrBinOp::Eq,
+            IrBinOp::Lt,
+            IrBinOp::Le,
+            IrBinOp::Ne,
+            IrBinOp::Ge,
+            IrBinOp::Gt,
+            IrBinOp::Cmp,
+            IrBinOp::Offset,
+        ];
+        match rng.below(15) {
+            0 => IrRvalue::Use(fuzz_operand(rng)),
+            1 => IrRvalue::Repeat(fuzz_operand(rng), rng.below(4) as u64),
+            2 => IrRvalue::Ref(
+                if rng.chance(50) {
+                    IrBorrowKind::Shared
+                } else {
+                    IrBorrowKind::Mut {
+                        allow_two_phase: rng.chance(50),
+                    }
+                },
+                fuzz_place(rng),
+            ),
+            3 => IrRvalue::ThreadLocalRef(rng.pick_line(&FUZZ_TRAP_STRINGS).to_string()),
+            4 => IrRvalue::RawPtr(
+                if rng.chance(50) {
+                    IrMutability::Not
+                } else {
+                    IrMutability::Mut
+                },
+                fuzz_place(rng),
+            ),
+            5 => IrRvalue::Len(fuzz_place(rng)),
+            6 => {
+                let kind = match rng.below(11) {
+                    0 => IrCastKind::PointerExposeProvenance,
+                    1 => IrCastKind::PointerWithExposedProvenance,
+                    2 => IrCastKind::PointerCoercion(rng.pick(&FUZZ_COERCIONS).to_string()),
+                    3 => IrCastKind::IntToInt,
+                    4 => IrCastKind::FloatToInt,
+                    5 => IrCastKind::FloatToFloat,
+                    6 => IrCastKind::IntToFloat,
+                    7 => IrCastKind::PtrToPtr,
+                    8 => IrCastKind::FnPtrToPtr,
+                    9 => IrCastKind::Transmute,
+                    _ => IrCastKind::Subtype,
+                };
+                IrRvalue::Cast(kind, fuzz_operand(rng), fuzz_ty(rng, 1))
+            }
+            7 => IrRvalue::BinaryOp(
+                BIN_OPS[rng.below(BIN_OPS.len())],
+                fuzz_operand(rng),
+                fuzz_operand(rng),
+            ),
+            8 => IrRvalue::NullaryOp(
+                match rng.below(5) {
+                    0 => IrNullOp::SizeOf,
+                    1 => IrNullOp::AlignOf,
+                    2 => IrNullOp::OffsetOf(vec![(0, rng.below(3))]),
+                    3 => IrNullOp::UbChecks,
+                    _ => IrNullOp::ContractChecks,
+                },
+                fuzz_ty(rng, 1),
+            ),
+            9 => IrRvalue::UnaryOp(
+                [IrUnOp::Not, IrUnOp::Neg, IrUnOp::PtrMetadata][rng.below(3)],
+                fuzz_operand(rng),
+            ),
+            10 => IrRvalue::Discriminant(fuzz_place(rng)),
+            11 => {
+                let kind = match rng.below(6) {
+                    0 => IrAggregateKind::Array(fuzz_ty(rng, 1)),
+                    1 => IrAggregateKind::Tuple,
+                    2 => IrAggregateKind::Adt(
+                        rng.pick(&FUZZ_TRAP_STRINGS).to_string(),
+                        rng.below(3),
+                        if rng.chance(50) {
+                            Some(rng.below(3))
+                        } else {
+                            None
+                        },
+                    ),
+                    3 => IrAggregateKind::Closure(rng.pick(&FUZZ_TRAP_STRINGS).to_string()),
+                    4 => IrAggregateKind::Coroutine(rng.pick(&FUZZ_TRAP_STRINGS).to_string()),
+                    _ => IrAggregateKind::RawPtr(fuzz_ty(rng, 1), IrMutability::Not),
+                };
+                let ops = (0..rng.below(3)).map(|_| fuzz_operand(rng)).collect();
+                IrRvalue::Aggregate(kind, ops)
+            }
+            12 => IrRvalue::ShallowInitBox(fuzz_operand(rng), fuzz_ty(rng, 1)),
+            13 => IrRvalue::CopyForDeref(fuzz_place(rng)),
+            _ => IrRvalue::WrapUnsafeBinder(fuzz_operand(rng), fuzz_ty(rng, 1)),
+        }
+    }
+
+    fn fuzz_unwind(
+        rng: &mut FuzzRng,
+        num_blocks: usize,
+    ) -> anneal_rustc_capture::lean_emit::IrUnwindAction {
+        use anneal_rustc_capture::lean_emit::IrUnwindAction;
+        match rng.below(4) {
+            0 => IrUnwindAction::Cleanup(rng.below(num_blocks + 1)),
+            1 => IrUnwindAction::Unreachable,
+            2 => IrUnwindAction::Terminate,
+            _ => IrUnwindAction::Continue,
+        }
+    }
+
+    fn fuzz_captured_mir(rng: &mut FuzzRng) -> IrCapturedMir {
+        use anneal_rustc_capture::lean_emit::{
+            IrNonDivergingIntrinsic, IrRetagKind, IrStatement, IrStatementKind, IrSwitchTargets,
+            IrTerminator, IrTerminatorKind,
+        };
+        let num_blocks = 1 + rng.below(4);
+        // Targets may point one past the last block to exercise `targetOob`.
+        let target = |rng: &mut FuzzRng| rng.below(num_blocks + 1);
+        let mut basic_blocks = Vec::new();
+        for _ in 0..num_blocks {
+            let mut statements = Vec::new();
+            for _ in 0..rng.below(4) {
+                let kind = match rng.below(13) {
+                    0 | 1 => IrStatementKind::Assign(fuzz_place(rng), fuzz_rvalue(rng)),
+                    2 => IrStatementKind::SetDiscriminant(fuzz_place(rng), rng.below(3)),
+                    3 => IrStatementKind::Deinit(fuzz_place(rng)),
+                    4 => IrStatementKind::StorageLive(rng.below(5)),
+                    5 => IrStatementKind::StorageDead(rng.below(5)),
+                    6 => IrStatementKind::Retag(IrRetagKind::FnEntry, fuzz_place(rng)),
+                    7 => IrStatementKind::PlaceMention(fuzz_place(rng)),
+                    8 => IrStatementKind::Intrinsic(IrNonDivergingIntrinsic::Assume(fuzz_operand(
+                        rng,
+                    ))),
+                    9 => IrStatementKind::Intrinsic(IrNonDivergingIntrinsic::CopyNonOverlapping {
+                        src: fuzz_operand(rng),
+                        dst: fuzz_operand(rng),
+                        count: fuzz_operand(rng),
+                    }),
+                    10 => IrStatementKind::Coverage,
+                    11 => IrStatementKind::BackwardIncompatibleDropHint(fuzz_place(rng)),
+                    _ => IrStatementKind::Nop,
+                };
+                statements.push(IrStatement {
+                    kind,
+                    span: rng.pick(&FUZZ_TRAP_STRINGS).to_string(),
+                    comment: if rng.chance(50) {
+                        Some(rng.pick(&FUZZ_TRAP_STRINGS).to_string())
+                    } else {
+                        None
+                    },
+                });
+            }
+            let kind = match rng.below(11) {
+                0 => IrTerminatorKind::Goto(target(rng)),
+                1 => IrTerminatorKind::SwitchInt(
+                    fuzz_operand(rng),
+                    IrSwitchTargets {
+                        branches: (0..rng.below(3))
+                            .map(|v| (v as u128, target(rng)))
+                            .collect(),
+                        otherwise: target(rng),
+                    },
+                ),
+                2 => IrTerminatorKind::UnwindResume,
+                3 => IrTerminatorKind::UnwindTerminate,
+                4 => IrTerminatorKind::Return,
+                5 => IrTerminatorKind::Unreachable,
+                6 => IrTerminatorKind::Drop {
+                    place: fuzz_place(rng),
+                    target: target(rng),
+                    unwind: fuzz_unwind(rng, num_blocks),
+                },
+                7 => IrTerminatorKind::Call {
+                    func: fuzz_operand(rng),
+                    args: (0..rng.below(3)).map(|_| fuzz_operand(rng)).collect(),
+                    destination: fuzz_place(rng),
+                    target: if rng.chance(70) {
+                        Some(target(rng))
+                    } else {
+                        None
+                    },
+                    unwind: fuzz_unwind(rng, num_blocks),
+                },
+                8 => IrTerminatorKind::TailCall {
+                    func: fuzz_operand(rng),
+                    args: (0..rng.below(3)).map(|_| fuzz_operand(rng)).collect(),
+                },
+                9 => IrTerminatorKind::Assert {
+                    cond: fuzz_operand(rng),
+                    expected: rng.chance(50),
+                    target: target(rng),
+                    unwind: fuzz_unwind(rng, num_blocks),
+                },
+                _ => IrTerminatorKind::InlineAsm {
+                    template: rng.pick(&FUZZ_TRAP_STRINGS).to_string(),
+                    targets: (0..rng.below(3)).map(|_| target(rng)).collect(),
+                    unwind: fuzz_unwind(rng, num_blocks),
+                },
+            };
+            basic_blocks.push(IrBasicBlockData {
+                statements,
+                terminator: IrTerminator {
+                    kind,
+                    span: rng.pick(&FUZZ_TRAP_STRINGS).to_string(),
+                    comment: if rng.chance(50) {
+                        Some(rng.pick(&FUZZ_TRAP_STRINGS).to_string())
+                    } else {
+                        None
+                    },
+                },
+                is_cleanup: rng.chance(20),
+            });
+        }
+        let u32_layout = IrTypeLayout {
+            size: IrSize { bytes: 4 },
+            align: IrAlign { bytes: 4 },
+            backend_repr: IrBackendRepr::Scalar(IrScalarLayout::Initialized {
+                value: IrPrimitiveKind::Int {
+                    bits: 32,
+                    signed: false,
+                },
+                valid_range: IrWrappingRange {
+                    start: 0,
+                    end_: u32::MAX as u128,
+                },
+            }),
+            fields: IrFieldsShape::Primitive,
+            variants: IrVariantsShape::Single { index: 0 },
+            is_uninhabited: false,
+            field_layouts: Vec::new(),
+        };
+        IrCapturedMir {
+            // The emitter interpolates `def_path` unescaped into the header's `/-! ... -/`
+            // doc comment, so a path containing `-/` yields invalid Lean (which the strict
+            // scanner rejects); real `rustc` paths cannot contain `/`, so stay realistic.
+            def_path: rng.pick(&FUZZ_CALLEES).to_string(),
+            phase: IrMirPhaseTag::RuntimePostCleanup,
+            role: IrContractRole::Subject,
+            type_param_count: 0,
+            generic_params: Vec::new(),
+            trait_impls: Vec::new(),
+            arg_count: 1,
+            local_decls: (0..5)
+                .map(|_| IrLocalDecl {
+                    mutability: anneal_rustc_capture::lean_emit::IrMutability::Mut,
+                    ty: fuzz_ty(rng, 2),
+                    debug_name: if rng.chance(50) {
+                        Some(rng.pick(&FUZZ_TRAP_STRINGS).to_string())
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+            basic_blocks,
+            fn_abi: IrFnAbi {
+                args: vec![IrArgAbi {
+                    layout: u32_layout.clone(),
+                    mode: IrAbiPassMode::Direct,
+                }],
+                ret: IrArgAbi {
+                    layout: u32_layout.clone(),
+                    mode: IrAbiPassMode::Direct,
+                },
+                conv: IrCallConv::Rust,
+                can_unwind: rng.chance(50),
+            },
+            layouts: IrLayoutTable {
+                pointer_bits: 64,
+                is_little_endian: true,
+                entries: vec![u32_layout.clone(), u32_layout],
+            },
+            allocations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_b2_randomized_emitter_differential_parity() {
+        // `[adv B2]`: for randomized `IrCapturedMir` bodies covering every IR
+        // statement, terminator, rvalue, operand, constant, projection, cast,
+        // aggregate, unwind, and callee shape (with lexer-trap strings in spans,
+        // paths, debug names, inline-asm templates, and `--` comments), the strict
+        // scanner over the *real* `emit_mir_lean_module` output must reproduce the
+        // structured census exactly.
+        let mut rng = FuzzRng(0x9E37_79B9_7F4A_7C15);
+        let mut sites_seen = 0usize;
+        let mut classes_seen: BTreeSet<MirFaultClass> = BTreeSet::new();
+        for case in 0..400 {
+            let ir = fuzz_captured_mir(&mut rng);
+            let emitted = emit_mir_lean_module("Mir.Fuzz.item", &ir);
+            let direct = census_ir_captured_mir(&ir);
+            // Structural parity: the scanned body (including decoded spans, callee
+            // paths, constants, projections, and aggregate kinds) must equal the
+            // direct IR conversion, not merely produce the same census.
+            let parsed = parse_lean_captured_mir_def(&emitted, "body")
+                .unwrap_or_else(|e| panic!("case {case}: parse failed: {e}\n{emitted}"));
+            assert_eq!(
+                parsed,
+                ProtoMirBody::from_ir_captured_mir(&ir, true),
+                "case {case}: scanned ProtoMirBody diverged from IR conversion\n{emitted}"
+            );
+            match census_lean_mir_module(&emitted) {
+                Ok(scanned) => assert_eq!(
+                    scanned, direct,
+                    "case {case}: emitted-Lean census diverged from IR census\n{emitted}"
+                ),
+                Err(err) => {
+                    panic!("case {case}: strict scanner rejected emitter output: {err}\n{emitted}")
+                }
+            }
+            sites_seen += direct.len();
+            classes_seen.extend(direct.iter().map(|site| site.fault_class));
+        }
+        assert!(
+            sites_seen > 1000,
+            "fuzz corpus too small: {sites_seen} sites"
+        );
+        assert_eq!(
+            classes_seen.len(),
+            MirFaultClass::ALL.len(),
+            "fuzz corpus must exercise every fault class: {classes_seen:?}"
+        );
+    }
+
+    #[test]
+    fn test_b2_truncated_real_modules_fail_closed() {
+        // `[adv B2]`: every prefix of a real `rustc`-captured module must either fail
+        // closed or (only once the whole `def body` record is present) yield exactly
+        // the full census — never a partial census from a truncated body.
+        for module in [
+            include_str!(
+                "../../../examples/tutor-ch1/.anneal/generated/Mir/FrameTutor/advance_offset.lean"
+            ),
+            include_str!(
+                "../../../examples/tutor-ch1/.anneal/generated/Mir/FrameTutor/magic_version.lean"
+            ),
+        ] {
+            let full = census_lean_mir_module(module).expect("full module scans");
+            let body_start = module.find("def body : CapturedMir :=").expect("body def");
+            let body_end =
+                body_start + module[body_start..].find("\n  }\n").expect("record end") + 4;
+            let mut accepted = 0usize;
+            for (cut, _) in module.char_indices() {
+                match census_lean_mir_module(&module[..cut]) {
+                    Ok(sites) => {
+                        assert!(cut >= body_end, "prefix ending at byte {cut} accepted");
+                        assert_eq!(sites, full, "prefix ending at byte {cut}");
+                        accepted += 1;
+                    }
+                    Err(_) => assert!(cut < module.len()),
+                }
+            }
+            assert!(accepted > 0);
+        }
+    }
+
+    #[test]
+    fn test_b2_emitter_escape_and_comment_injection_findings() {
+        use anneal_rustc_capture::lean_emit::{
+            IrPlace, IrProjectionElem, IrStatement, IrStatementKind, IrTerminator, IrTerminatorKind,
+        };
+        let mut rng = FuzzRng(7);
+        let mut ir = fuzz_captured_mir(&mut rng);
+        ir.basic_blocks.truncate(1);
+        ir.basic_blocks[0].terminator = IrTerminator {
+            kind: IrTerminatorKind::Return,
+            span: String::from("s"),
+            comment: None,
+        };
+        let stmt = |kind, span: &str| IrStatement {
+            kind,
+            span: span.to_string(),
+            comment: None,
+        };
+
+        // (1) `escape_lean_str` encodes a multi-byte control character such as U+0085
+        //     as one `\xHH` escape per UTF-8 byte (`\xc2\x85`), which Lean decodes as
+        //     two code points. The scanner must mirror Lean's decoding (not the
+        //     emitter's intent); census parity is unaffected because no `DefPath`
+        //     the census classifies contains control characters.
+        ir.basic_blocks[0].statements = vec![stmt(IrStatementKind::Nop, "a\u{85}b")];
+        let emitted = emit_mir_lean_module("Mir.Escape.item", &ir);
+        assert!(emitted.contains(r"a\xc2\x85b"), "{emitted}");
+        let parsed = parse_lean_captured_mir_def(&emitted, "body").expect("parse escaped span");
+        assert_eq!(parsed.basic_blocks[0].statements[0].span, "a\u{c2}\u{85}b");
+        assert_eq!(
+            census_lean_mir_module(&emitted).expect("strict scan"),
+            census_ir_captured_mir(&ir)
+        );
+
+        // (2) A `DefPath` containing `-/` closes the emitter's `/-! ... -/` header doc
+        //     comment early, and (3) a newline inside a `Downcast` variant name escapes
+        //     the emitter's `-- bbN:` summary comment. Both produce Lean that does not
+        //     elaborate; the strict scanner must reject them rather than guess.
+        let mut doc_injection = ir.clone();
+        doc_injection.def_path = String::from("evil -/ def body : CapturedMir := x");
+        assert!(
+            census_lean_mir_module(&emit_mir_lean_module("Mir.Doc.item", &doc_injection)).is_err()
+        );
+        let mut line_injection = ir.clone();
+        line_injection.basic_blocks[0].statements = vec![stmt(
+            IrStatementKind::PlaceMention(IrPlace {
+                local_: 0,
+                projection: vec![IrProjectionElem::Downcast(
+                    Some(String::from("V\n) evil")),
+                    0,
+                )],
+            }),
+            "s",
+        )];
+        assert!(
+            census_lean_mir_module(&emit_mir_lean_module("Mir.Line.item", &line_injection))
+                .is_err()
+        );
+    }
+
+    /// `[adv B2]` Cross-language census differential harness (run manually):
+    /// writes randomized emitter modules plus the Rust census to
+    /// `$FAULT_CENSUS_DIFF_DIR` so the Lean `censusMirBodyFaultSites` can be
+    /// evaluated on the very same bodies and compared site-for-site.
+    /// `FAULT_CENSUS_DIFF_DIR=<dir> cargo test --lib dump_lean_census_differential_corpus -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_lean_census_differential_corpus() {
+        let Ok(dir) = std::env::var("FAULT_CENSUS_DIFF_DIR") else {
+            return;
+        };
+        // One self-checking Lean file: the prototype, 400 emitted modules, and one
+        // `#guard` per body asserting that the Lean census renders exactly like the
+        // Rust census of the same `IrCapturedMir`. Check it with
+        // `(cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean <dir>/LeanCensusDifferential.lean)`.
+        let mut rng = FuzzRng(0xD1B5_4A32_D192_ED03);
+        let mut out = String::from(LEAN_PROTOTYPE_SRC.trim_end());
+        out.push_str("\n\n");
+        let mut guards = String::from(
+            "open Anneal.FaultSiteCensusPrototype\n\n\
+             def renderFuzzSites (sites : List FaultSite) : String :=\n  \
+             String.intercalate \";\" (sites.map (fun s => s!\"({s.1},{s.2.1},{s.2.2.asStr})\"))\n\n",
+        );
+        let mut classes_seen: BTreeSet<MirFaultClass> = BTreeSet::new();
+        for case in 0..400 {
+            let ir = fuzz_captured_mir(&mut rng);
+            let emitted = emit_mir_lean_module(&format!("Mir.Fuzz.item{case}"), &ir);
+            classes_seen.extend(census_ir_captured_mir(&ir).iter().map(|s| s.fault_class));
+            out.push_str(emitted.trim_start_matches("import Trusted"));
+            out.push('\n');
+            let rendered: Vec<String> = census_ir_captured_mir(&ir)
+                .iter()
+                .map(|s| {
+                    format!(
+                        "({},{},{})",
+                        s.block_idx,
+                        s.stmt_idx,
+                        s.fault_class.as_str()
+                    )
+                })
+                .collect();
+            guards.push_str(&format!(
+                "#guard renderFuzzSites (censusMirBodyFaultSites Mir.Fuzz.item{case}.body) == \"{}\"\n",
+                rendered.join(";")
+            ));
+        }
+        assert_eq!(
+            classes_seen.len(),
+            MirFaultClass::ALL.len(),
+            "{classes_seen:?}"
+        );
+        out.push_str(&guards);
+        std::fs::write(format!("{dir}/LeanCensusDifferential.lean"), out).expect("write driver");
+    }
+
     #[test]
     fn test_ir_captured_mir_to_emitted_lean_roundtrip_parity() {
         let u32_ty = IrTy {
@@ -5177,6 +5898,15 @@ def body : CapturedMir :=
                 "Rust probe census vs. Lean `by decide` expected census mismatch for {probe:?}"
             );
             assert!(rust_probe_report.passed());
+            // `[adv B2]`: the brief requires `census_lean_mir_module` itself to parse the
+            // witness definitions, so re-host each witness record verbatim as the `body`
+            // of a canonical strict module and scan it with the strict grammar.
+            let strict = census_lean_mir_module(&witness_as_strict_module(lean_body_name))
+                .unwrap_or_else(|e| panic!("strict scan of {lean_body_name} failed: {e}"));
+            assert_eq!(
+                strict, lean_decide_expected,
+                "strict module scan for {probe:?}"
+            );
         }
 
         // 4. `[adv B1]` precision witness: the Lean `witnessWrappingArithBody` scan must
@@ -5215,6 +5945,28 @@ def body : CapturedMir :=
                 "missing Lean liveness certificate `{live}`"
             );
         }
+    }
+
+    /// Re-host the record of `def <def_name> : CapturedMir := { ... }` from
+    /// `FaultSiteCensusPrototype.lean` verbatim as the `body` of a canonical strict
+    /// `Mir/<Item>.lean` module.
+    fn witness_as_strict_module(def_name: &str) -> String {
+        let header = format!("def {def_name} : CapturedMir :=");
+        let start = LEAN_PROTOTYPE_SRC
+            .find(&header)
+            .unwrap_or_else(|| panic!("missing `{header}`"))
+            + header.len();
+        let rest = &LEAN_PROTOTYPE_SRC[start..];
+        let end = ["\n/--", "\n/-!", "\ndef ", "\ntheorem "]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .expect("witness record terminator");
+        format!(
+            "import Trusted\nnamespace Mir.Witness.item\nopen Trusted.Rustc.V2026_06_01.Layout\n\
+             open Trusted.Rustc.V2026_06_01.MirAst\ndef body : CapturedMir :=\n{}\nend Mir.Witness.item\n",
+            &rest[..end]
+        )
     }
 
     /// Wrap `blocks` (a Lean `List BasicBlockData` literal) in a canonical strict
@@ -5450,6 +6202,19 @@ end Mir.Probe.item",
             strict_module_with_blocks("def TerminatorKind.goto : Nat := 0", &unreachable_block);
         assert!(census_lean_mir_module(&shadow_def).is_err());
 
+        // (g2) `[adv B2]` Only the emitter's exact `open`s are allowed, and constructor
+        //      qualifiers are pinned to the `V2026_06_01` dialect.
+        let other_dialect_open =
+            strict_module_with_blocks("open Trusted.Rustc.V2026_08_01.MirAst", &unreachable_block);
+        assert!(census_lean_mir_module(&other_dialect_open).is_err());
+        let other_dialect_ctor = strict_module_with_blocks(
+            "",
+            &single_terminator_block("Trusted.Rustc.V2026_08_01.MirAst.TerminatorKind.goto 0"),
+        );
+        assert!(census_lean_mir_module(&other_dialect_ctor).is_err());
+        let foreign_open = strict_module_with_blocks("open Trusted.Evil", &unreachable_block);
+        assert!(census_lean_mir_module(&foreign_open).is_err());
+
         // (h) A `body` with a non-canonical type ascription (invisible to a naive
         //     `def body : CapturedMir :=` matcher) fails closed.
         let hidden =
@@ -5498,9 +6263,9 @@ end Mir.Probe.item",
         // 2. `PlaceMention` only checks root/index initialization (`[UninitRead]`), never
         //    dereferencing pointers or checking bounds/alignment/Tree Borrows.
         assert_eq!(
-            census_stmt_fault_classes(&ProtoStatementKind::PlaceMention(
-                ProtoPlace::deref_local(1)
-            )),
+            census_stmt_fault_classes(&ProtoStatementKind::PlaceMention(ProtoPlace::deref_local(
+                1
+            ))),
             vec![MirFaultClass::UninitRead]
         );
 
@@ -5555,7 +6320,10 @@ end Mir.Probe.item",
             ProtoCastKind::PointerCoercion(String::from("ArrayToPointer")),
         ] {
             let classes = census_cast_kind_fault_classes(&ck);
-            assert!(classes.contains(&MirFaultClass::TreeBorrowsViolation), "{ck:?}");
+            assert!(
+                classes.contains(&MirFaultClass::TreeBorrowsViolation),
+                "{ck:?}"
+            );
         }
         for ck in [
             ProtoCastKind::FnPtrToPtr,

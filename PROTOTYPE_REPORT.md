@@ -125,9 +125,30 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
 
 ---
 
-## 5. Adversarial Round History (`[adv A0]` → `[adv B1]` → `[adv A1]`)
+## 5. Adversarial Round History (`[adv A0]` → `[adv B1]` → `[adv A1]` → `[adv B2]`)
 
-### `[adv A1]` critique & repair of `[adv B1]` (all fixed in this pass)
+### `[adv B1]` findings against `[adv A0]` (fixed in `[adv B1]`)
+
+1. **Class labels were never checked against the semantics.** `stepMirFn_fault_in_census` is existential in the class, so it only needs a non-empty census at the faulting PC; every `[adv A0]` "precision theorem" was an `rfl` restatement of the definition. Consequences found by reading `Trusted.MirSemantics`:
+   - *Over-approximation*: wrapping/flagged/masked binops, comparisons and bitwise ops, `Neg`, `IntToInt`/exposed-provenance casts, `NullaryOp`, `ThreadLocalRef`, `ShallowInitBox`, `Repeat`/`Aggregate`, `CopyForDeref`, non-deref borrows, `Retag` alignment, and speculative `Assert` arithmetic labels emitted classes the evaluator can never trigger.
+   - *Under-approximation (class level)*: `Use(copy p)` lacked `scalarNicheInvalid` (`validateLoadedValue`), and `BinOp.offset` lacked `treeBorrowsViolation` (disabled-tag check in `evalPtrOffsetBinOp`).
+   - Fixed definitions plus the §2.1 certificates (`censusBinOpFaultClasses_exact`, `evalScalarBinOp_ub_cause`, exact edge theorems).
+2. **External-call continuations were outside the completeness theorem.** `resumeExternalCall` / `resumeExternalDivergingCall` return `.faulted .ub` *inside* the `MirStepNode.extCall` continuation (destination write, `.unreachable` unwind, normal return of a diverging callee); `stepMirFn` never returns `.fail .ub` for these. Fixed with `StepNodeExposesUb` and the exposure theorems.
+3. **`LoopUpdateOverflowProbe` stripped a semantically dead label.** The latch used wrapping `BinOp.add`, which `evalScalarBinOp` can never overflow-fault. The witness now uses `AddUnchecked`, keeps a wrapping accumulator as a precision contrast, and every probe has a liveness certificate.
+4. **Probes were set-difference tautologies** (baseline = census) — replaced by the mock emitter (§4).
+5. **Lean scanner fail-opens** (each has a regression test in `test_b1_lean_scanner_fail_open_regressions`):
+   - constructor heads matched only on the last segment, so `Evil.goto 0` / bare `goto 0` (arbitrary user definitions) were read as `TerminatorKind.goto` — now `check_ctor_qualifier` requires `.ctor` or `Type.ctor` (optionally under a known `Trusted` MIR AST namespace);
+   - anything applied to the `body` record (`{..} |> mutate`, `{..}.withBlocks evil`) was ignored — now rejected;
+   - duplicate record fields silently overwrote earlier ones — now rejected;
+   - unknown string escapes were mangled (`\u0061` became `u0061`), changing callee `DefPath`s such as `core::intrinsics::unreachable` — escapes now follow Lean exactly (`\\ \" \' \n \r \t \xHH \uHHHH`, string gaps, `\{` in interpolations) and fail closed otherwise;
+   - only `s!`/`f!` were interpolation prefixes, so `m!"{"def body ..."}"` leaked a decoy definition into the token stream — every `<ident>!"` now lexes as an interpolated string, and comments inside interpolations fail closed;
+   - `census_lean_mir_module` now enforces a strict emitter-module grammar (`import`/`namespace`/`section`/`end`/plain `open`/`set_option`/`def name : type := term` only, exactly one `def body : CapturedMir`, no declaration or namespace reusing a MIR AST type name), so syntax extensions (`notation`, `macro_rules`), attributes, `#eval`, instances, shadowing `def TerminatorKind.goto`, hidden `def body : (CapturedMir)` bodies, and brace-carrying strings or `!`-macros inside skipped definitions (where a Lean interpolation such as `throwError "{"..."}"` could desynchronize the token stream) fail closed; the lenient `census_lean_mir_def` keeps handling arbitrary surrounding Lean (comments, raw/interpolated strings, char literals, guillemets) for the witness file.
+6. **Rust/Lean parity bugs**: `std::intrinsics::*` was classified as an intrinsic only in Rust; `RigidTy.fnDef`-typed constants with non-zero-sized values lost their callee path (now rejected).
+7. **Witness bodies were ill-formed** (`localDecls := []` while mentioning locals `_0.._2`) — all witnesses now declare their locals.
+8. **This report** previously cited nonexistent theorems (for example `validMirPc_iff`, `censusStmtFaultClasses_intrinsic_assume`, `censusStmtFaultClasses_not_all_twelve`) and a construct matrix/probe table that contradicted the code; it now reflects the implementation.
+
+
+### `[adv A1]` critique & repair of `[adv B1]` (fixed in `[adv A1]`)
 
 1. **Unevaluated `Rvalue` over-approximation in `StatementKind.assign` and `Rvalue.aggregate (.coroutine _)`**:
    - In `Trusted.MirSemantics.evalRvalue` (`Places.lean:8243-8855`), five `Rvalue` forms have no evaluation arm and return `.unsupported` immediately without reading any operand: `.threadLocalRef _`, `.nullaryOp _ _`, `.shallowInitBox _ _`, `.cast kind _ _` with `castKindUnevaluated kind = true`, and `.aggregate (.coroutine _) _`.
@@ -156,22 +177,50 @@ Every declaration elaborates with **zero `sorryAx`** and **zero `Lean.ofReduceBo
    - *`check_strict_mir_module_grammar` accepted arbitrary `import EvilMod`, `open EvilNs`, and `def Sub.body : CapturedMir`*: Now restricts `import` and `open` to `Trusted` namespaces and requires `def body` to be declared with bare name `body`.
    - *Missing required record fields defaulted silently*: `parse_captured_mir`, `parse_basic_block`, `parse_statement`, `parse_terminator`, and `parse_const_scalar` now require all mandatory fields (`defPath`, `phase`, `role`, `argCount`, `localDecls`, `basicBlocks`, `fnAbi`, `layouts`, `allocations`, `isCleanup`, `span`, `bits`, `sizeBytes`, `allocId`, `offsetBytes`) and validate `MirPhaseTag` and `ContractRole` constructors.
 
+
+### `[adv B2]` critique & repair of `[adv A1]` (lexer/parser traps, differential parity, corpus)
+
+1. **Randomized real-emitter differential fuzz** (`test_b2_randomized_emitter_differential_parity`): 400 deterministic random `IrCapturedMir` bodies covering every IR statement, terminator, rvalue, operand, constant, projection, cast, aggregate and unwind kind plus the classified callee paths, with lexer-trap strings (quotes, backslashes, `\u0061`, braces, `--`, `/-`, `-/`, guillemets, tabs and newlines, a decoy `def body`, `s!`/`m!` interpolations, raw strings, char literals, Unicode, control characters) in spans, paths, debug names, inline-asm templates and `--` comments. Each body is rendered by the real `anneal_rustc_capture::lean_emit::emit_mir_lean_module`; `parse_lean_captured_mir_def` must equal `ProtoMirBody::from_ir_captured_mir` *structurally* (decoded strings included) and `census_lean_mir_module` must equal `census_ir_captured_mir`. The corpus must exercise all 12 classes. Result: `0` divergences.
+2. **Cross-language census differential** (`dump_lean_census_differential_corpus`, `#[ignore]`, run with `FAULT_CENSUS_DIFF_DIR=<dir>`): writes one self-checking Lean file containing the prototype, 400 emitted modules, and one `#guard` per module asserting that the Lean `censusMirBodyFaultSites` renders identically to the Rust census of the same IR body. `(cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean <dir>/LeanCensusDifferential.lean)` exits `0` (`4990` sites, all 12 classes, about `55 s`); corrupting a single expectation makes it fail.
+3. **Emitter robustness findings** (in trusted code, recorded for Track A; the scanner already fails closed or decodes exactly like Lean):
+   - `render_mir_module_header` interpolates `def_path` unescaped into a `/-! ... -/` doc comment, so a path containing `-/` closes the comment early.
+   - `summarize_basic_block` sanitizes user comments but not generated summaries, so a newline in a `Downcast` variant name (or a thread-local path) escapes the `-- bbN:` line comment.
+   - `escape_lean_str` writes multi-byte control characters as one `\xHH` per UTF-8 byte (`U+0085` becomes `\xc2\x85`), which Lean decodes as two code points. The scanner deliberately mirrors Lean, pinned by `test_b2_emitter_escape_and_comment_injection_findings`.
+   None of these can arise from `rustc` identifiers or paths.
+4. **Dialect pinning**: `[adv A1]` accepted any `open Trusted.*` (and bare `open MirAst`), and `MIR_AST_NAMESPACES` accepted `Trusted.Rustc.V2026_08_01.MirAst.*` constructors. Both have a different type and different semantics from the `V2026_06_01` dialect the census is proved over. Strict modules may now only `open` the emitter's namespaces (`STRICT_MODULE_OPENS`), and constructor qualifiers are pinned to `V2026_06_01`.
+5. **Brief §3 Part B.4 compliance**: the witness bodies are now also re-hosted verbatim as the `body` of canonical strict modules and scanned with `census_lean_mir_module` itself. Previously only the lenient `census_lean_mir_def` parsed them.
+6. **Truncation** (`test_b2_truncated_real_modules_fail_closed`): every prefix of both real `rustc`-captured tutor modules fails closed until the complete `def body` record is present, and from then on yields exactly the full census.
+7. **Report history**: restored the `[adv B1]` findings, semantic subtleties, and known limitations that the `[adv A1]` rewrite dropped.
+
+### Semantic subtleties (carried from `[adv A0]`, verified in `[adv B1]`)
+
+- `ValidMirPc` is required because an out-of-bounds PC faults without any syntactic site; `stepMirFn_preserves_validMirPc` keeps it invariant for top-level frames with in-bounds CFG targets.
+- `.return_` reads `_0` and, in an inline frame, writes into the *caller's* `destination`, so its classes are attributed to the callee's return site.
+- The `.ub` of an out-of-bounds `Goto` happens on the *next* step.
+
+### Known limitations (for later rounds)
+
+- Completeness remains existential in the class for constructs outside §2.1; extending class-precise attribution to operand reads, places, calls, and `copyNonOverlapping` is open.
+- The strict module grammar targets `anneal-rustc-capture` output. It rejects anything outside the emitter's command set, `open`s, and constructor namespaces, but it does not model Lean elaboration in general.
+- The cross-language differential is a `#guard`-checked experiment over compiled evaluation (not kernel `decide`); kernel-checked parity is limited to the witness bodies.
+
 ---
 
-## 6. Verification Receipts (`[adv A1]`)
+## 6. Verification Receipts (`[adv B2]`)
 
 All commands run from the repository root with `W = 1`.
 
-1. **Primary command** — exit `0`:
+1. **Primary command**, exit `0` (`34.2 s` wall-clock):
    ```bash
    cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib fault_census_proto && \
    cargo test --manifest-path crates/cargo-anneal/Cargo.toml fault_census_proto && \
    (cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean ../theory/Anneal/FaultSiteCensusPrototype.lean)
    ```
-   `13 passed, 0 failed` (library target), `0` Rust warnings, Lean `0` errors / `0` warnings.
-2. **Kernel axiom audit** — scratch copy with `#print axioms` over all `206` public declarations (`125` theorems), run via `anneal-lean-run --mode file --concurrency 1` outside the worktree: `0` `sorryAx`, `0` `Lean.ofReduceBool`.
-3. **Proof health** — `python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/FaultSiteCensusPrototype.lean`: exit `0`, `0` findings.
-4. **Hygiene** — `git status --porcelain` empty after commit; `git diff --name-only a5e12e5fac628cc71522b67a1b427e17e2927818..HEAD` ⊆ {`PROTOTYPE_REPORT.md`, `crates/cargo-anneal/src/fault_census_proto.rs`, `crates/cargo-anneal/src/lib.rs`, `theory/Anneal/FaultSiteCensusPrototype.lean`}; zero internal hostnames, user paths, LDAPs, CL numbers, or internal model names.
+   `16 passed, 0 failed, 1 ignored` (the manual Lean differential harness) on both test targets, `0` Rust warnings, and Lean `0` errors / `0` warnings.
+2. **Kernel axiom audit**: a scratch copy with `#print axioms` over all `203` public `def`/`theorem` declarations (`125` theorems), run via `anneal-lean-run --mode file --concurrency 1` outside the worktree. Result: `0` `sorryAx`, `0` `Lean.ofReduceBool`, and `113/125` theorems `Classical.choice`-free.
+3. **Proof health**: `python3 tools/anneal-lsp/server/proof_health.py theory/Anneal/FaultSiteCensusPrototype.lean` exits `0` with `0` findings.
+4. **Cross-language differential** (`[adv B2]`, optional): `FAULT_CENSUS_DIFF_DIR=<dir> cargo test --manifest-path crates/cargo-anneal/Cargo.toml --lib dump_lean_census_differential_corpus -- --ignored`, then `(cd examples && anneal-lean-run --mode file --concurrency 1 -- lake env lean <dir>/LeanCensusDifferential.lean)`. Exit `0`: `400` `#guard`s, `4990` sites, all 12 classes, `55 s`. A corrupted copy exits `1`.
+5. **Hygiene**: `git status --porcelain` is empty after commit, and `git diff --name-only a5e12e5fac628cc71522b67a1b427e17e2927818..HEAD` ⊆ {`PROTOTYPE_REPORT.md`, `crates/cargo-anneal/src/fault_census_proto.rs`, `crates/cargo-anneal/src/lib.rs`, `theory/Anneal/FaultSiteCensusPrototype.lean`}. There are zero internal hostnames, user paths, LDAPs, CL numbers, or internal model names.
 
 ---
 
