@@ -8693,3 +8693,83 @@ fn test_b4_eval_lowered_terminator_enforces_state_cleanup_mode_and_well_formed_b
         })
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// A4 regression tests
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn test_a4_raw_retag_rejects_out_of_width_pointers_and_rustc_niche_construction_stays_defined() {
+    // 1. `Retag([raw] _1)` accepts null, unaligned, and dangling raw pointers, but (like every
+    // other Episode 1 validity check since A3/B4) not an address beyond the target's width,
+    // which it used to accept on a 32-bit target.
+    let pw32 = PtrWidth::Bits32;
+    let const_u32 = raw(u32_ty(), Mutability::Not);
+    let mut state32 = state_with(vec![unit(), const_u32.clone()], pw32);
+    for addr in [0u64, 3, 0xFFFF_FFFC] {
+        state32.slots[1] = LocalSlotState::Init(MirValue::ptr(
+            PointerValue::without_provenance(addr),
+            const_u32.clone(),
+        ));
+        run(retag(RetagKind::Raw(Mutability::Not), local(1)), &mut state32).unwrap();
+    }
+    let wide = (1u64 << 32) + 0x10;
+    state32.slots[1] = LocalSlotState::Init(MirValue::ptr(
+        PointerValue::with_provenance(wide, 2, 1),
+        const_u32.clone(),
+    ));
+    assert_eq!(
+        run(retag(RetagKind::Raw(Mutability::Not), local(1)), &mut state32),
+        Err(RvalueEvalError::CastEval(CastEvalError::InvalidBitPattern {
+            target_ty: const_u32,
+            bits: u128::from(wide),
+        }))
+    );
+
+    // 2. The conservative niche rules (A3: no readable tag on an incomplete niche-capable
+    // shell; B4: a niche-capable value's discriminant needs a well-formed value) keep the order
+    // in which `rustc` builds such enums in place fully defined: fields first, then
+    // `SetDiscriminant`, then `Retag`/`Discriminant`.
+    let (opt_def, opt_ref) = option_of("OptRefA4", ref_ty(u32_ty()));
+    let decls = vec![unit(), opt_ref.clone(), u32_ty()];
+    let mut state = state_with(decls.clone(), PW);
+    state.slots[2] = LocalSlotState::Init(u32v(7));
+    let some0 = place(1, vec![ProjectionElem::Downcast(1), field(0, ref_ty(u32_ty()))]);
+    let set = |v: usize| Statement::SetDiscriminant {
+        place: local(1),
+        variant_index: v,
+    };
+    run(assign(some0, Rvalue::Ref(Mutability::Not, local(2))), &mut state).unwrap();
+    assert_eq!(
+        discriminant(&mut state, local(1)),
+        Err(RvalueEvalError::UninitializedLocal(Local(1)))
+    );
+    run(set(1), &mut state).unwrap();
+    let some = MirValue::adt(
+        &opt_def,
+        1,
+        vec![MirValue::ptr(
+            PointerValue::with_provenance(0x3000, 3, 1),
+            ref_ty(u32_ty()),
+        )],
+    );
+    assert_eq!(state.get_init(Local(1)), Some(&some));
+    for kind in [RetagKind::FnEntry, RetagKind::Default, RetagKind::TwoPhase] {
+        run(retag(kind, local(1)), &mut state).unwrap();
+    }
+    assert_eq!(
+        discriminant(&mut state, local(1)),
+        Ok(MirValue::signed(1, IntTy::Isize, PW))
+    );
+    // Writing the niche-tagged `None` completes the value right away.
+    run(set(0), &mut state).unwrap();
+    assert_eq!(
+        state.get_init(Local(1)),
+        Some(&MirValue::adt(&opt_def, 0, vec![]))
+    );
+    run(retag(RetagKind::Default, local(1)), &mut state).unwrap();
+    assert_eq!(
+        discriminant(&mut state, local(1)),
+        Ok(MirValue::signed(0, IntTy::Isize, PW))
+    );
+}

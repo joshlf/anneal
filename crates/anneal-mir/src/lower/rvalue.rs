@@ -6319,7 +6319,8 @@ impl StatementEvalState {
     /// Evaluates `Statement::Retag(kind, place)` (of declared type `place_ty`).
     ///
     /// Requires a live root local and reads the `Index` operands. `RetagKind::Raw(m)` reads the
-    /// raw pointer at `place` (it must be initialized; it may be null, unaligned, or dangling).
+    /// raw pointer at `place` (it must be initialized and its address must fit the target's
+    /// pointer width; it may be null, unaligned, or dangling).
     /// The other kinds validate every reference reachable in `place`'s value without
     /// indirection (see [`Ty::contains_ref`]): each must be initialized, non-null, within the
     /// target's pointer width, aligned to its pointee's alignment, point to an inhabited type,
@@ -6341,7 +6342,9 @@ impl StatementEvalState {
                 ));
             }
             return match self.read_place(place)? {
-                MirValue::Ptr { .. } => Ok(()),
+                // A raw pointer may be null, unaligned, or dangling, but its address must still
+                // be a valid bit pattern of the target's pointer width.
+                val @ MirValue::Ptr { .. } => check_value_well_formed(&val, self.ptr_width),
                 _ => Err(RvalueEvalError::TypeMismatch(
                     "Retag(Raw) place must hold a pointer value",
                 )),

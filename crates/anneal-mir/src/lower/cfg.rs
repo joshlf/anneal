@@ -792,10 +792,15 @@ pub enum CfgStep {
 
 /// Evaluates the terminator `term` of block `bb` of `body` (whose statements have run) in
 /// `state` and unwinding mode `unwinding`, using `call_handler` (if any) for a `Call`; see the
-/// module documentation. A panic updates `unwinding` when it enters a cleanup block, and
-/// `UnwindResume`/`UnwindTerminate` end the unwinding. A [`CfgStep::Goto`] target is checked
-/// to be a block of `body` that is a cleanup block iff the evaluation is unwinding afterwards
-/// (`InvalidBlock` / `InvalidEdge`).
+/// module documentation. `state` must match `body` (`ptr_width`, `local_decls`, one slot per
+/// local: `InvalidArguments`), and `bb` must be a block of `body` that is a cleanup block iff
+/// the evaluation is unwinding (`InvalidBlock` / `InvalidUnwind`). A panic updates `unwinding`
+/// when it enters a cleanup block, and `UnwindResume`/`UnwindTerminate` end the unwinding. A
+/// [`CfgStep::Goto`] target is checked to be a block of `body` that is a cleanup block iff the
+/// evaluation is unwinding afterwards (`InvalidBlock` / `InvalidEdge`), so consecutive steps
+/// preserve the entry requirement. Values crossing the body boundary (the returned `_0`, a
+/// callee and its arguments, a call's result, and evaluated panic-message operands) must be
+/// well formed.
 ///
 /// One iteration of [`eval_cfg_in_state`] is one unit of fuel, the statements of a block, and
 /// this function on its terminator.
